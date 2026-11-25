@@ -53,12 +53,14 @@
 //! Each request is read as 7.2's listing shows it, each race found in 7.2's words, and each reply written as 7.2 wrote
 //! it.
 
+pub(crate) mod chain_read;
 pub mod check;
 pub mod classify;
 pub mod commit;
 pub mod held;
 pub mod intake;
 pub mod made;
+pub(crate) mod manifest_row;
 pub mod reply;
 pub mod tree;
 pub mod verify;

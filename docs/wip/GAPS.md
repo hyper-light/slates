@@ -239,6 +239,25 @@
 > warm between the branch's versions, c refusing a's records, the branch's next push lands on a and b; red with part 4's
 > rebuild reverted in a scratch copy (`unable to commit`, b's `merge.recompute_mismatch` 1). Gate 16 (`v3_takeover` at
 > b7e65cc63, part 4 in) held: 40 of 40, release and debug.
+> **FIXED (A-912, w-shared, 2026-11-24; main 01a20182's rulings): a push made right after a member died was refused
+> `retry` for a second or more.** A home behind its sender held the put for its install, which needed the council's next
+> append on the very record session the put held, and the coordinator awaited its healer inline; and a home that died
+> stayed ranked past the push's 2 s homing budget. Now a behind home answers `Behind` at once and its sender asks again
+> after a council round, the coordinator's home passes run on their own lane, and a push's homing runs within a window
+> derived from detection, confirmation and the takeover's configuration steps, ranking its homes again at each install.
+> Red first (both `a912_` fleet tests). OWED (main): gate 17 (`v3_takeover`) and a lint diag.
+> **OPEN, w-shared's next piece (A-912's sibling; main 01a20182's ruling of 2026-11-24): a branch created during a
+> member's death refused `unable to commit` at the record barrier.** A-912's push test creates three branches at once
+> while c dies; their homing is accepted, but in 2 of 4 runs one was refused at the barrier: "greens owed (green,
+> version, placed) [(8c70…0003, 1, None)]; names log at Some(9), acknowledged by both; merge.inputs_unplaced 4; pending
+> [0, 1]", the new green's versions 0 and 1 never placed, their merge records waiting for their inputs to place while
+> the death moved the candidates. Red: that test asserting every created branch lands. To measure first: when versions 0
+> and 1's inputs place against the barrier window, across runs.
+> **OPEN, structural alternative, not built (A-912): a council session of its own per peer.** The council's replication
+> shares a node's one record session per peer with every exchange, each borrower taking it whole. A-912 removes the one
+> hold-and-wait found (a home holding a put across the install the council's next append brings) and counts any breach,
+> `fleet.council.session_lent`, held at 0 by A-912's tests; a council session never lent to another plane would make the
+> invariant structural. A piece if that counter ever moves.
 > **FIXED (A-909, w-shared, 2026-11-24): a branch made on a repository's successor after its owner died was refused
 > `unable to commit`.** The successor's own hold refused the new green's records `StaleEpoch { current: 2 }`: its one
 > owner acceptor had been fenced at the takeover's epoch by the registers it adopted, so at two survivors nothing it
@@ -1530,6 +1549,33 @@
 > restart of `hg_push_restart` (red: `Unheld` at rev 4281; green: the tip served after the restart).
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
+> C1 (2), second piece BUILT (main's ruling (B') of 2026-11-24): a push's manifest is taken a window a step and never
+> whole. Its text is made by `delta::Patching` over its base read front to back over its chain (`push::chain_read`, the
+> chain's deltas loaded: at most the base's length, A-729's bound); its lines checked and its written entries found as it
+> streams (`manifest::Checking`, `delta::Written`). Its row is kept by one rule (`push::manifest_row`), which the live
+> intake, a pushed segment's replay (`import::record`'s `append_over_given`, w-perf's written go) and a stale fork's
+> re-base all apply, so their rows agree by construction: the client's delta where its base is the manifest the fork
+> holds last and the chain allows; else its diff against that last one, a merge of the two sorted texts as they stream
+> (`manifest_diff::Diffing`, as 7.2's manifest fastdelta; a run cut into hunks of a window); else whole (the fork's
+> first, or a chain past its bound, made again in a second pass that checks nothing twice). No manifest is kept whole
+> otherwise, so a merge or a snapshot costs a diff, never a whole text. Held by
+> `a_line_of_long_manifests_is_taken_within_the_window_bound` (12 manifests of several 4 KiB windows: red 43,329 bytes of
+> text held at once on main, now within 4 windows and 3 lines, 16,528), `a_merge_heavy_push_keeps_its_manifests_as_diffs_
+> and_replays_to_its_rows` (merges kept as diffs, the replay's rows the fork's), the proptest
+> `a_manifest_diffed_as_it_streams_makes_its_text` (Diffing over generated sorted manifests, every piece and window size:
+> applied over the base it makes the new text, as `encode_lines`' delta does), `a_manifest_chain_read_in_ranges_is_its_text`,
+> `a_manifest_read_as_it_streams_finds_what_its_whole_text_finds`, and the three row-equality tests (segment replay,
+> moved-base replay, stale re-base) and `a_push_of_many_whole_manifest_snapshots_keeps_one_copy_of_their_entries`.
+> I was wrong when I told main a streaming diff of two manifests needs lookahead: their lines are sorted by path.
+> Found and closed with it, a leak of mine from C1 (2)'s first piece (4885954fa): a landed base whose windows were let go
+> was brought back for one revision (a file's by `held::bring_back_file`; a manifest's text put as a temporary object,
+> which content addressing makes the landed row's own again) and nothing let it go after, so each incremental push left
+> its bases' bytes resident. A revision now lets go again what it brought back once it ends, kept or given back. Held by
+> `a_file_delta_base_before_the_last_text_is_read_from_the_forks_rows` (red: the base still held after its revision) and
+> P5's daemon-edge let-go test (red: 1 manifest object of 288 bytes held). Sibling sweep (CLAUDE.md, main's order):
+> reported to main the same day, every bring-back site with its let-go or none.
+> Owed: changesets a window at a time; a let-go base's or last manifest's store answer arrives whole for one step; the
+> base's identity hashed by a second read.
 > Found by main's interop bench at ed71ac0be and closed (2026-11-24): after P5, `hg clone` of hg's 57k history ran past
 > 13.5 minutes (stock 7.2: 42.4 s; round 2 before P5: 10.1 s). A clone's changelog and manifest texts, let go once
 > landed, were asked of the changeset store one at a time, a row and then its text, and the store answered a row by

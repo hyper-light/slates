@@ -43,8 +43,11 @@ pub const HOME_STREAM: u64 = 30;
 /// 01a20182's ruling of 2026-11-24 01:36) adds a repository's rebuild ([`HomeMessage::Rebuilt`]) and its answer
 /// ([`HomeOutcome::Owed`]); a member of 0x82 is refused at once, typed, by the version rule. 0x84 (A-902, main
 /// 01a20182's order of 2026-11-24 06:01, agreed with w-git) adds to a put and a put's part the configuration version its
-/// sender ranked the object's homes by, so a member behind it waits for its own install rather than refusing.
-pub const VERSION: u8 = 0x84;
+/// sender ranked the object's homes by, so a member behind it waits for its own install rather than refusing. 0x85
+/// (A-912, main 01a20182's ruling of 2026-11-24) answers such a put at once, [`HomeOutcome::Behind`] with the member's
+/// installed version, rather than holding it: the hold kept its sender's record session across a wait only that session
+/// could end.
+pub const VERSION: u8 = 0x85;
 /// Format: the kind byte of a put.
 const KIND_PUT: u8 = 1;
 /// Format: the kind byte of a read.
@@ -94,6 +97,9 @@ const OUTCOME_MOVED: u8 = 7;
 const OUTCOME_NAMED: u8 = 8;
 /// Format: the outcome byte of a rebuild's answer: a resolution pass owed (version 0x83).
 const OUTCOME_OWED: u8 = 9;
+/// Format: the outcome byte of a put's answer from a member behind its sender's configuration, then its installed
+/// version (version 0x85, A-912).
+const OUTCOME_BEHIND: u8 = 10;
 
 /// The most bytes one part carries ([`HomeMessage::PutPart`], [`HomeOutcome::Part`]): the chunk cap a message's byte
 /// string is held to. Derived: `slates_archive::format::MAX_CHUNK_BYTES`.
@@ -243,6 +249,12 @@ pub enum HomeOutcome {
   },
   /// A rebuild's answer: the member owes itself a resolution pass (A-727 (d1a-3)); owing it twice is harmless.
   Owed,
+  /// A put's answer from a member behind the configuration its sender ranked the window's homes by (A-912): nothing
+  /// kept; the sender asks again once the council's next round has passed, which brings the member's install.
+  Behind {
+    /// The configuration version the member has installed.
+    installed: u64,
+  },
 }
 
 /// A home exchange's message (module docs).
@@ -465,6 +477,10 @@ impl HomeMessage {
             out.push(u8::from(*named));
           }
           HomeOutcome::Owed => out.push(OUTCOME_OWED),
+          HomeOutcome::Behind { installed } => {
+            out.push(OUTCOME_BEHIND);
+            out.extend_from_slice(&installed.to_le_bytes());
+          }
         }
       }
     }
@@ -542,6 +558,9 @@ impl HomeMessage {
           },
           OUTCOME_MOVED => HomeOutcome::Moved,
           OUTCOME_OWED => HomeOutcome::Owed,
+          OUTCOME_BEHIND => HomeOutcome::Behind {
+            installed: reader.long()?,
+          },
           OUTCOME_NAMED => HomeOutcome::Named {
             named: match reader.byte()? {
               0 => false,
@@ -738,6 +757,12 @@ mod tests {
         .prop_map(|identity| HomeMessage::Answer {
           identity,
           outcome: HomeOutcome::Owed,
+        })
+        .boxed(),
+      (identity, any::<u64>())
+        .prop_map(|(identity, installed)| HomeMessage::Answer {
+          identity,
+          outcome: HomeOutcome::Behind { installed },
         })
         .boxed(),
       (identity, any::<bool>())

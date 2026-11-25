@@ -197,14 +197,22 @@ pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
 
 /// Turns repository `id`'s derivation until every version's sets are known, yielding between turns (the module doc):
 /// what a fetch's request runs before it holds its generation. Returns at once where the shard's state is not lent.
+/// The windows it brought back are let go again once it ends, whichever way (`read_through::BroughtBack`).
 pub(crate) async fn derive_for_read(id: RepositoryId) {
+  let mut brought = super::read_through::BroughtBack::default();
+  derive_bringing_back(id, &mut brought).await;
+  brought.let_go();
+}
+
+/// [`derive_for_read`]'s turns, each window brought back kept in `brought`.
+async fn derive_bringing_back(id: RepositoryId, brought: &mut super::read_through::BroughtBack) {
   loop {
     match crate::state::with_state_counted(|state| turn(state, id)) {
       Some(Turned::More) => slates_rt::futures::yield_now().await,
       // A window brought back, turned again; one that brought nothing back (back already, or refused) would only meet the
       // same miss again, so the derivation stops there as a refused one does.
       Some(Turned::Waiting(waited)) => {
-        if !matches!(super::read_through::bring_back(waited).await, Ok(brought) if brought > 0) {
+        if brought.keep(&super::read_through::bring_back_window(waited).await) == 0 {
           return;
         }
       }

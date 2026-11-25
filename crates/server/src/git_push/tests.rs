@@ -1058,7 +1058,14 @@ fn derive_counts(state: &mut ShardState) -> DeriveCounts {
 /// A line of [`PACED_HISTORY`] commits pushed as one create to a new repository: the repository and the counts before
 /// its derivation.
 fn push_paced_line(state: &mut ShardState) -> (RepositoryId, DeriveCounts) {
-  let repository = git_repository(state, "paced");
+  let (repository, _) = paced_line_pushed(state, "paced");
+  (repository, derive_counts(state))
+}
+
+/// A line of [`PACED_HISTORY`] commits pushed as one create to a new repository `name`: the repository and the pack it
+/// landed.
+fn paced_line_pushed(state: &mut ShardState, name: &str) -> (RepositoryId, Vec<u8>) {
+  let repository = git_repository(state, name);
   let mut objects = Vec::new();
   let mut parent = None;
   for at in 0..PACED_HISTORY {
@@ -1068,13 +1075,82 @@ fn push_paced_line(state: &mut ShardState) -> (RepositoryId, DeriveCounts) {
   }
   let head = parent.unwrap().to_string();
   let created = [("", head.as_str(), b"refs/heads/main".as_slice())];
-  let received = pushed(
-    state,
-    repository,
-    &request(&created, CAPABILITIES, &pack_of_objects(&objects)),
-  );
+  let pack = pack_of_objects(&objects);
+  let received = pushed(state, repository, &request(&created, CAPABILITIES, &pack));
   assert_eq!(reasons(&received), [b"ok".to_vec()]);
-  (repository, derive_counts(state))
+  (repository, pack)
+}
+
+/// Lets go of every window of `pack` on this shard by hand, as a landed pack's let-go would (its home told first, each
+/// window marked landed; the commit's own let-go is withdrawn, `vcs_store::LANDED_LET_GO`): the windows.
+fn let_go_by_hand(state: &mut ShardState, pack: &[u8]) -> Vec<slates_vcs::ContentId> {
+  let window = state
+    .vcs_stores
+    .content()
+    .map_or(1 << 18, slates_vcs::ContentStore::window);
+  let ids: Vec<slates_vcs::ContentId> =
+    pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  crate::vcs_store::homes::landed_pack_here(state, slates_vcs::ContentId::of(pack));
+  crate::vcs_store::within_budget(state, 0, |stores| {
+    let content = stores.content_mut().expect("the content store");
+    for id in &ids {
+      content.mark_landed(id);
+    }
+  });
+  for id in &ids {
+    let _ = crate::vcs_store::let_go_read(state, id);
+  }
+  ids
+}
+
+/// How many of `windows` this shard holds (not let go).
+fn held_of(state: &ShardState, windows: &[slates_vcs::ContentId]) -> usize {
+  let content = state.vcs_stores.content();
+  windows
+    .iter()
+    .filter(|window| content.is_some_and(|content| !content.is_away(window)))
+    .count()
+}
+
+/// Windows brought back from the node's store, as this shard counts them.
+fn brought_back_count(state: &ShardState) -> u64 {
+  let name = crate::vcs_store::read_through::BROUGHT_BACK;
+  state.refusals.get(name).copied().unwrap_or(0)
+}
+
+/// Main 01a20182's ruling of 2026-11-24 (w-hg's sweep of the bring-back sites: a write path's bring-back never let go).
+/// Do: push a line of [`PACED_HISTORY`] commits, let its pack's windows go by hand before it is derived, then derive it
+/// as a fetch's request does (`git_derive::derive_for_read`). Expect: every window let go first; the derivation brought
+/// windows back to read them (so it is the bring-back this measures); and once it ended, none of the pack's windows held
+/// (its bring-backs let go again, `vcs_store.read_through.write_path_let_go`). Red before: the windows it brought back
+/// stayed held.
+#[test]
+fn a_derivation_lets_go_the_windows_it_brought_back_once_it_ends() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, windows, let_go_first) = crate::daemon::observe_first(&daemon, |state| {
+    let (repository, pack) = paced_line_pushed(state, "derive-brought-back");
+    let windows = let_go_by_hand(state, &pack);
+    let held = held_of(state, &windows);
+    (repository, windows, held)
+  });
+  let brought_before = crate::daemon::observe_first(&daemon, |state| brought_back_count(state));
+  derived_for_read(&daemon, repository);
+  let (brought, held_after) = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      brought_back_count(state) - brought_before,
+      held_of(state, &windows),
+    )
+  });
+  daemon.stop();
+  assert_eq!(let_go_first, 0, "every window let go first");
+  assert!(
+    brought > 0,
+    "the derivation brought windows back: {brought}"
+  );
+  assert_eq!(
+    held_after, 0,
+    "the windows it brought back let go again once it ended"
+  );
 }
 
 /// What a derivation's pace allowed: its wall time, the step's ceiling and quantum.

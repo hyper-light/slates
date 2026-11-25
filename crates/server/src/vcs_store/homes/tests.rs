@@ -1051,27 +1051,23 @@ fn a_stranded_tickets_wait_is_answered_not_durable_at_once_and_counted() {
   );
 }
 
-/// A-902 (gate 8 and 9's homing short: a fresh fleet's first push refused `HomedShort`, a home answering `NotAHome`
-/// about 1 ms into a 2 s budget while it had not installed the configuration its sender ranked by). One node plays the
-/// home, its shard's configuration installed by the test. Do: install a configuration (one past the node's own) that
-/// ranks every window at another member, then serve puts from the region:
-/// (a) from a member carrying the next version, installing that version (ranking this node) once the put waits;
-/// (b) from a member carrying a version this node never installs, under a short budget;
+/// A-902's rule under A-912 (main 01a20182's ruling of 2026-11-24: a home behind its sender answers at once, never holding
+/// the put). One node plays the home, its shard's configuration installed by the test. Do: install a configuration (one
+/// past the node's own) that ranks every window at another member, then serve puts from the region:
+/// (a) from a member carrying the next version;
+/// (b) from a member this node's configuration does not name, at this node's own version;
 /// (c) from a member carrying this node's own version;
-/// (d) from a sender this node's configuration does not name, at this node's own version, under a short budget.
-/// Expect: (a) kept once the install lands, the wait counted caught up; (b) refused `NotAHome` once its budget is spent,
-/// counted elapsed; (c) refused `NotAHome` at once, no wait begun; (d) waited for (the sender unknown here means this
-/// node has not installed the region's configuration) and refused `NotAHome` past its budget. Red before A-902: (a) and
-/// (d) refused at once, no wait begun.
+/// (d) after installing the carried version, ranking this node (its only member), the put of (a) again.
+/// Expect: (a) and (b) answered `Behind` with the installed version at once (within a tenth of the budget), counted
+/// answered behind; (c) refused `NotAHome` at once, not counted; (d) kept. Red before A-912: (a) and (b) held for this
+/// node's install (A-902's wait), answered only once it landed or the budget ran out.
 #[test]
-fn a_home_behind_its_senders_configuration_waits_for_its_install_and_refuses_at_once_when_not_behind()
- {
+fn a_home_behind_its_senders_configuration_answers_behind_at_once_and_keeps_once_it_installs() {
   use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal};
   let outcome = crate::test_store::run_on_first(
     &crate::daemon::audit_daemon_of(2),
     || async {
       let budget = crate::daemon::LIVENESS_BUDGET_NS;
-      let short = budget / 50;
       let mut outcome: Vec<String> = Vec::new();
       let Some((origin, local, own)) = crate::state::with_state(|state| {
         (
@@ -1084,16 +1080,15 @@ fn a_home_behind_its_senders_configuration_waits_for_its_install_and_refuses_at_
       };
       let other = slates_db::HostId(local.0 ^ 1);
       let stranger = slates_db::HostId(local.0 ^ 2);
-      let counts = || {
+      let answered = || {
         crate::state::with_state(|state| {
-          [
-            super::INSTALL_WAITS,
-            super::INSTALL_WAIT_CAUGHT_UP,
-            super::INSTALL_WAIT_ELAPSED,
-          ]
-          .map(|name| state.refusals.get(name).copied().unwrap_or(0))
+          state
+            .refusals
+            .get(super::BEHIND_ANSWERED)
+            .copied()
+            .unwrap_or(0)
         })
-        .unwrap_or_default()
+        .unwrap_or(0)
       };
       let install = |version: u64, members: Vec<slates_db::HostId>| {
         let mut configuration = own.clone();
@@ -1112,115 +1107,44 @@ fn a_home_behind_its_senders_configuration_waits_for_its_install_and_refuses_at_
         }
         .encode()
       };
-      let refused_not_a_home = |reply: &[u8]| {
-        matches!(
-          HomeMessage::decode(reply),
-          Ok(HomeMessage::Answer {
-            outcome: HomeOutcome::Refused(HomeRefusal::NotAHome),
-            ..
-          })
-        )
+      let outcome_of = |reply: &[u8]| match HomeMessage::decode(reply) {
+        Ok(HomeMessage::Answer { outcome, .. }) => Some(outcome),
+        _ => None,
       };
       let behind = own.version.saturating_add(1);
       let ahead = behind.saturating_add(1);
       install(behind, vec![other]);
-
-      // (a) One behind, the install landing within the budget.
-      let before = counts();
-      let (sent, got) = std::sync::mpsc::channel();
-      let request = put(0, ahead);
-      let Ok(serving) = slates_rt::futures::spawn(async move {
-        let _ = sent.send(super::serve_remote((origin, other), &request, budget).await);
-      }) else {
-        return vec!["the put's task".to_owned()];
-      };
-      // The put runs to its wait (or its answer) before the install: until its wait is counted or it has answered.
-      let mut answered = None;
-      let _ = slates_rt::futures::within(budget, async {
-        loop {
-          if let Ok(reply) = got.try_recv() {
-            answered = Some(reply);
-            break;
-          }
-          if counts()[0] > before[0] {
-            break;
-          }
-          slates_rt::futures::yield_now().await;
+      for (case, sender, carried) in [("(a)", other, ahead), ("(b)", stranger, behind)] {
+        let before = answered();
+        let began = slates_rt::futures::now_ns();
+        let reply = super::serve_remote((origin, sender), &put(0, carried), budget).await;
+        let took = slates_rt::futures::now_ns().saturating_sub(began);
+        let got = outcome_of(&reply);
+        if got != Some(HomeOutcome::Behind { installed: behind }) || took > budget / 10 {
+          outcome.push(format!(
+            "{case} not answered Behind at once: {got:?} in {took} ns"
+          ));
         }
-      })
-      .await;
+        if answered() != before + 1 {
+          outcome.push(format!("{case} not counted answered behind"));
+        }
+      }
+      let before = answered();
+      let reply = super::serve_remote((origin, other), &put(2, behind), budget).await;
+      if outcome_of(&reply) != Some(HomeOutcome::Refused(HomeRefusal::NotAHome))
+        || answered() != before
+      {
+        outcome.push(format!(
+          "(c) not refused NotAHome at once: {:?}",
+          outcome_of(&reply)
+        ));
+      }
       install(ahead, vec![local]);
-      let _ = slates_rt::futures::join(serving).await;
-      let reply = answered.or_else(|| got.try_recv().ok()).unwrap_or_default();
-      let after = counts();
-      if !matches!(
-        HomeMessage::decode(&reply),
-        Ok(HomeMessage::Answer {
-          outcome: HomeOutcome::Kept { .. },
-          ..
-        })
-      ) {
+      let reply = super::serve_remote((origin, other), &put(0, ahead), budget).await;
+      if !matches!(outcome_of(&reply), Some(HomeOutcome::Kept { .. })) {
         outcome.push(format!(
-          "(a) not kept once its install landed: {:?}",
-          HomeMessage::decode(&reply)
-        ));
-      }
-      if after[1] != before[1] + 1 {
-        outcome.push(format!(
-          "(a) the wait not counted caught up: {before:?} -> {after:?}"
-        ));
-      }
-
-      // (b) One behind, no install within the budget.
-      let stale = ahead.saturating_add(1);
-      install(stale, vec![other]);
-      let before = counts();
-      let began = slates_rt::futures::now_ns();
-      let reply =
-        super::serve_remote((origin, other), &put(1, stale.saturating_add(1)), short).await;
-      let waited = slates_rt::futures::now_ns().saturating_sub(began);
-      let after = counts();
-      if !refused_not_a_home(&reply) {
-        outcome.push(format!(
-          "(b) not refused NotAHome: {:?}",
-          HomeMessage::decode(&reply)
-        ));
-      }
-      if after[2] != before[2] + 1 || waited < short {
-        outcome.push(format!(
-          "(b) not refused past its budget ({waited} ns of {short}): {before:?} -> {after:?}"
-        ));
-      }
-
-      // (c) The same version: refused at once.
-      let before = counts();
-      let reply = super::serve_remote((origin, other), &put(2, stale), budget).await;
-      let after = counts();
-      if !refused_not_a_home(&reply) {
-        outcome.push(format!(
-          "(c) not refused NotAHome: {:?}",
-          HomeMessage::decode(&reply)
-        ));
-      }
-      if after[0] != before[0] {
-        outcome.push(format!(
-          "(c) a wait begun at the same version: {before:?} -> {after:?}"
-        ));
-      }
-
-      // (d) A sender this node's configuration does not name.
-      let before = counts();
-      let reply = super::serve_remote((origin, stranger), &put(3, stale), short).await;
-      let after = counts();
-      if !refused_not_a_home(&reply) {
-        outcome.push(format!(
-          "(d) not refused NotAHome: {:?}",
-          HomeMessage::decode(&reply)
-        ));
-      }
-      if after[0] != before[0] + 1 || after[2] != before[2] + 1 {
-        outcome.push(format!(
-          "(d) a sender unknown here not waited for: {before:?} -> {after:?}"
+          "(d) not kept once installed: {:?}",
+          outcome_of(&reply)
         ));
       }
       outcome

@@ -1961,6 +1961,8 @@ async fn serve_peer_records(
           })
           .unwrap_or_default(),
           CONFIG_STREAM => state::with_state(|s| {
+            // A round passed through this node, a voter (A-912).
+            s.council_rounds.passed();
             serve_council(
               s,
               s.learned_members
@@ -9034,6 +9036,7 @@ async fn drive_council_replication(
   let sessions = take_sessions("fleet.lent_to.drive_council_replication", |host| {
     others.contains(&host)
   });
+  count_council_sessions_lent(others, &sessions);
   if sessions.is_empty() {
     return;
   }
@@ -9085,6 +9088,8 @@ async fn drive_council_replication(
     LateReplies::Council,
   ));
   return_sessions(recovered);
+  // A round passed through this node, the leader (A-912): what a put's sender asks a home behind it again after.
+  let _ = state::with_state(|s| s.council_rounds.passed());
 }
 
 /// The consensus group a drive step addresses (§4.8 mechanism 2): the regional council or the root group.
@@ -10619,7 +10624,7 @@ pub(crate) struct Fanned {
   holding_generation: u64,
   /// The failover delay each other shard last received from the beat's own fan ([`fan_failover`], A-574). Bounded by
   /// the daemon's shards.
-  failover: std::collections::BTreeMap<u16, u64>,
+  failover: std::collections::BTreeMap<u16, (u64, u64)>,
 }
 
 impl Fanned {
@@ -10690,13 +10695,13 @@ impl Fanned {
 
   /// The failover delay `shard` is owed: `failover_ns`, the control shard's, when it is not what the shard last received
   /// ([`fan_failover`], A-574).
-  fn failover_owed(&self, failover_ns: u64, shard: u16) -> Option<u64> {
-    (self.failover.get(&shard) != Some(&failover_ns)).then_some(failover_ns)
+  fn failover_owed(&self, failover: (u64, u64), shard: u16) -> Option<(u64, u64)> {
+    (self.failover.get(&shard) != Some(&failover)).then_some(failover)
   }
 
-  /// Records that `shard`'s channel accepted a failover delay of `failover_ns`.
-  fn record_failover(&mut self, shard: u16, failover_ns: u64) {
-    self.failover.insert(shard, failover_ns);
+  /// Records that `shard`'s channel accepted a failover delay and a homing window of `failover`.
+  fn record_failover(&mut self, shard: u16, failover: (u64, u64)) {
+    self.failover.insert(shard, failover);
   }
 }
 
@@ -10811,26 +10816,30 @@ pub(crate) const FAILOVER_FAN_REFUSED: &str = "fleet.failover_fan.refused";
 /// shards read the delay their boot set, for good.
 pub(crate) fn fan_failover() {
   let Some((origin, owed)) = state::with_state(|s| {
-    let owed: Vec<(u16, u64)> = s
+    let owed: Vec<(u16, (u64, u64))> = s
       .shards
       .iter()
       .copied()
       .filter(|shard| *shard != s.shard)
       .filter_map(|shard| {
         s.fanned
-          .failover_owed(s.failover_ns, shard)
-          .map(|failover_ns| (shard, failover_ns))
+          .failover_owed((s.failover_ns, s.homing_window_ns), shard)
+          .map(|failover| (shard, failover))
       })
       .collect();
     (s.shard, owed)
   }) else {
     return;
   };
-  for (shard, failover_ns) in owed {
-    match run_on(origin, shard, move |s| s.failover_ns = failover_ns) {
+  for (shard, failover) in owed {
+    let (failover_ns, homing_window_ns) = failover;
+    match run_on(origin, shard, move |s| {
+      s.failover_ns = failover_ns;
+      s.homing_window_ns = homing_window_ns;
+    }) {
       Ok(()) => {
         let _ = state::with_state_counted(|s| {
-          s.fanned.record_failover(shard, failover_ns);
+          s.fanned.record_failover(shard, failover);
           count_refusal_in(s, FAILOVER_FAN_SENT);
         });
       }
@@ -10857,7 +10866,57 @@ fn refresh_failover(state: &mut ShardState) {
     .and_then(|plane| plane.detection(now_ns));
   let timing = state.council_timing;
   state.failover.refresh(detection, &timing, HEARTBEAT_NS);
+  state.homing_window_ns = homing_window(state).get();
   publish_failover(state);
+}
+
+/// The window a push's homing in the region must outlast for a member's death not to refuse it (A-912, main 01a20182's
+/// ruling of 2026-11-24): the failover estimate's detection and confirmation (A-363: the detector's periods to condemn a
+/// silent member, and the council's to confirm it), then the configuration changes one death makes, each a council
+/// round of the coordinator's measured period. A home that died stays ranked until the configuration drops it, and only
+/// then is a window homed again among the homes ranked without it (`vcs_store::homes::home_in_region`).
+pub(crate) fn homing_window(state: &ShardState) -> slates_machine::Derived<u64> {
+  let estimate = state.failover.estimate();
+  let condemned = estimate
+    .detection
+    .map_or(0, |term| term.ns)
+    .saturating_add(estimate.confirmation.map_or(0, |term| term.ns));
+  let members = u64::try_from(state.fleet.members().len()).unwrap_or(u64::MAX);
+  let period = state
+    .failover
+    .period_tail_ns()
+    .unwrap_or(HEARTBEAT_NS)
+    .max(HEARTBEAT_NS);
+  slates_machine::derived!(
+    condemned.saturating_add(takeover_steps(members).saturating_mul(period)),
+    "detection + confirmation + (2 + 2 (members − 1)) × coordinator period",
+    [
+      "failover detection (A-363)",
+      "failover confirmation (A-363)",
+      "members",
+      "coordinator period, measured (A-363)"
+    ]
+  )
+}
+
+/// The configuration changes one death makes at a council of `members` (A-912): the takeover, each survivor's settlement
+/// of the neighbourhood the takeover fixed and its confirmation of its share, and the council's seat of its voters
+/// without the dead. Derived: `2 + 2 (members − 1)`; measured 6 at three members (TakeOver, Settle, Settle, Confirm,
+/// Confirm, Seat: versions 7 to 12, A-912's timeline).
+pub(crate) fn takeover_steps(members: u64) -> u64 {
+  members
+    .saturating_sub(1)
+    .saturating_mul(2)
+    .saturating_add(2)
+}
+
+/// The budget a push's homing in the region runs within (A-912): the live commit's own deadline ([`live_budget`]), or
+/// this shard's homing window ([`homing_window`], fanned from the control shard) where that is longer; past it the push is
+/// refused `retry`, typed, as before.
+pub(crate) fn homing_budget() -> CommitBudget {
+  let live = live_budget();
+  let window = state::with_state(|s| s.homing_window_ns).unwrap_or(0);
+  CommitBudget::hard(live.max_deadline_ns().max(window), live.poll_interval_ns)
 }
 
 /// Reads this node's supervision for the beat (A-574): the widest window the watchdog judges this daemon's shards by
@@ -10915,6 +10974,8 @@ async fn run_record_plane(local: HostId) {
     return;
   };
   let mut owner_acceptor = Acceptor::new(local, authority);
+  // The home passes' lane (A-912): a child of this task, so it ends with it.
+  let mut home_passes = HomePassLane::default();
   // This shard (the control shard) holds the peer sessions and coordinates; every shard owns volumes, so
   // each period reaches every owner shard for its seals and heads (`xshard`).
   let (origin, shards) = state::with_state(|s| (s.shard, s.shards.clone())).unwrap_or_default();
@@ -10961,7 +11022,7 @@ async fn run_record_plane(local: HostId) {
       &shards,
       local,
       budget,
-      &mut owner_acceptor,
+      (&mut owner_acceptor, &mut home_passes),
       &mut in_flight,
     )
     .await;
@@ -11040,6 +11101,212 @@ async fn pace_running_merges(
   }
 }
 
+/// The council's rounds that passed through this node (A-912): on the leader, each replication round it drove; on a voter,
+/// each council message it served. A put's sender whose home answered [`slates_cluster::homes::HomeOutcome::Behind`]
+/// asks that home again once a round has passed here ([`CouncilRound`]): the round that carries the configuration the
+/// home lacks, whose append reached it on the record session the put had given back. An event, never a timer.
+#[derive(Default)]
+pub(crate) struct CouncilRounds {
+  /// The rounds passed so far, a count a waiter compares.
+  passed: u64,
+  /// The next waiter's token.
+  next_token: u64,
+  /// The tasks waiting for the next round, by token, each woken and dropped at it.
+  /// Derived: at most one a region exchange this shard runs, each holding one registration (`CouncilRound`).
+  waiters: std::collections::BTreeMap<u64, std::task::Waker>,
+  /// Each voter whose record session the leader's last replication round found out on another plane's loan, with that
+  /// loan's session and borrower ([`count_council_sessions_lent`]): what tells a loan held across a round from one that
+  /// merely overlapped it. Derived: at most one a council voter.
+  lent_at_last_round: std::collections::BTreeMap<
+    HostId,
+    (
+      Option<slates_transport::endpoint::ConnectionId>,
+      &'static str,
+    ),
+  >,
+}
+
+impl CouncilRounds {
+  /// Notes a round passed, waking every waiter.
+  pub(crate) fn passed(&mut self) {
+    self.passed = self.passed.wrapping_add(1);
+    for (_, waker) in std::mem::take(&mut self.waiters) {
+      waker.wake();
+    }
+  }
+
+  /// The rounds passed so far.
+  pub(crate) fn count(&self) -> u64 {
+    self.passed
+  }
+}
+
+/// A wait for the council's next round to pass through this node after `seen` rounds ([`CouncilRounds`]): ready `true`
+/// once one has, `false` off a shard; dropped, it takes its registration away, so none outlives it.
+pub(crate) struct CouncilRound {
+  /// The rounds counted when the wait began.
+  pub(crate) seen: u64,
+  /// This wait's registration, once made.
+  pub(crate) token: Option<u64>,
+}
+
+impl std::future::Future for CouncilRound {
+  type Output = bool;
+
+  fn poll(
+    self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<bool> {
+    let this = self.get_mut();
+    state::with_state(|s| {
+      let rounds = &mut s.council_rounds;
+      if rounds.passed != this.seen {
+        if let Some(token) = this.token.take() {
+          rounds.waiters.remove(&token);
+        }
+        return std::task::Poll::Ready(true);
+      }
+      let token = *this.token.get_or_insert_with(|| {
+        rounds.next_token = rounds.next_token.wrapping_add(1);
+        rounds.next_token
+      });
+      rounds.waiters.insert(token, cx.waker().clone());
+      std::task::Poll::Pending
+    })
+    .unwrap_or(std::task::Poll::Ready(false))
+  }
+}
+
+impl Drop for CouncilRound {
+  fn drop(&mut self) {
+    if let Some(token) = self.token.take() {
+      let _ = state::with_state(|s| s.council_rounds.waiters.remove(&token));
+    }
+  }
+}
+
+/// Counts each council voter whose record session the leader found out on the same loan to another plane at two of its
+/// replication rounds in a row (A-912): a loan held across a council round, the breach of A-902's invariant (no exchange
+/// holds a peer's record session across a wait that needs the council's next round), a bug signal. A loan seen at one
+/// round alone overlapped it, as any exchange's brief round may; a session out on the council's own earlier round (a
+/// voter gone silent) is the council's. Moving at all after A-912 makes a council session of its own per peer (GAPS) a
+/// piece.
+fn count_council_sessions_lent(others: &[HostId], taken: &[(HostId, Endpoint)]) {
+  let _ = state::with_state(|s| {
+    let mut lent_now = std::collections::BTreeMap::new();
+    for host in others {
+      if taken.iter().any(|(taken, _)| taken == host) {
+        continue;
+      }
+      let Some(link) = s.record_sessions.get(host) else {
+        continue;
+      };
+      if let (None, Some(borrower)) = (&link.endpoint, link.lent_to)
+        && borrower != "fleet.lent_to.drive_council_replication"
+      {
+        lent_now.insert(*host, (link.borrowed, borrower));
+      }
+    }
+    let held = lent_now
+      .iter()
+      .filter(|(host, loan)| s.council_rounds.lent_at_last_round.get(*host) == Some(*loan))
+      .count();
+    s.council_rounds.lent_at_last_round = lent_now;
+    if held > 0 {
+      s.count(
+        COUNCIL_SESSION_LENT,
+        u64::try_from(held).unwrap_or(u64::MAX),
+      );
+    }
+  });
+}
+
+/// Counter: a council voter's record session found out on the same loan to another plane at two of the leader's
+/// replication rounds in a row (A-912): held across a council round, a bug signal. Format: a counter name.
+pub(crate) const COUNCIL_SESSION_LENT: &str = "fleet.council.session_lent";
+
+/// The coordinator's home passes on a lane of their own (A-912): `vcs_store::homes::heal_region`, `resolve_ended`,
+/// `announce_rebuilt` and `credentials::heal_region`, in that order, as one child task of the record-plane coordinator,
+/// at most one in flight. The coordinator drives the configuration council in the same task as its period's passes, and
+/// it had awaited these inline: at a new configuration its heal offered a window to a home still behind it, which holds
+/// the put until it installs that configuration (A-902), and the install needs the coordinator's next council append, so
+/// neither moved until the put's budget ran out (A-908 part 4's fleet scene with a holder stopped: `heal_region` took
+/// 1.0 s and 2.0 s, no council round between, the home installing 15 to 85 ms after; a push in that second refused
+/// `retry`). Now each period begins a pass where none is in flight and goes on; the pass tells its end on a channel, and
+/// the coordinator joins it at its next period. The lane's task is the coordinator's child, so it ends with the
+/// coordinator, and a lane dropped with a pass in flight cancels it: never fire-and-forget.
+#[derive(Default)]
+struct HomePassLane {
+  /// The pass in flight: its task and the channel it tells its end on, with the nanoseconds it took.
+  running: Option<(slates_rt::TaskId, slates_rt::sync::ChannelReceiver<u64>)>,
+}
+
+impl HomePassLane {
+  /// One period: a pass that told its end is joined, then the next begins where none is in flight. Awaits no home
+  /// exchange: the join is of a task already ended.
+  async fn drive(&mut self, origin: u16, shards: &[u16], budget: CommitBudget) {
+    if let Some((task, ended)) = self.running.as_mut() {
+      let told = match ended.try_recv() {
+        Ok(None) => {
+          count_refusal(HOME_PASS_IN_FLIGHT);
+          return;
+        }
+        Ok(Some(took_ns)) => Some(took_ns),
+        // Its sender gone untold: the task ended without telling (cancelled with the shard's state).
+        Err(_) => None,
+      };
+      let task = *task;
+      self.running = None;
+      let _ = slates_rt::futures::join(task).await;
+      if let Some(took_ns) = told {
+        let _ = state::with_state(|s| s.count_max(HOME_PASS_LONGEST_NS, took_ns));
+      }
+    }
+    let Ok((tell, ended)) = slates_rt::sync::channel(1) else {
+      count_refusal(HOME_PASS_UNSPAWNED);
+      return;
+    };
+    let shards = shards.to_vec();
+    let spawned = slates_rt::futures::spawn_child(async move {
+      let began = futures::now_ns();
+      crate::vcs_store::homes::heal_region(origin, &shards, budget).await;
+      // The holds an attempt a crash left, once its process ended (A-727 (d1a-3)): resolved by the repository's
+      // holder, where a death, a new process, this node's start or a new configuration owes it.
+      crate::vcs_store::homes::resolve_ended(origin, &shards, budget).await;
+      // A repository rebuilt here is told to the other members until each answers (A-727 (d1a-3)).
+      crate::vcs_store::homes::announce_rebuilt(origin, &shards, budget).await;
+      // Credentials as fleet state (A-764): at a new configuration, every credential this node holds offered to every
+      // other member (`credentials::heal_region`).
+      crate::credentials::heal_region(origin, &shards, budget).await;
+      // The channel holds this one message, so a send fails only when the lane is gone, which then reads nothing.
+      let _ = tell.try_send(futures::now_ns().saturating_sub(began));
+    });
+    match spawned {
+      Ok(task) => self.running = Some((task, ended)),
+      Err(_) => {
+        count_refusal(HOME_PASS_UNSPAWNED);
+      }
+    }
+  }
+}
+
+impl Drop for HomePassLane {
+  fn drop(&mut self) {
+    if let Some((task, _)) = self.running.take() {
+      let _ = slates_rt::futures::cancel(task);
+    }
+  }
+}
+
+/// Counter: a coordinator period whose home passes were still in flight, so it went on without them (A-912): the
+/// council's rounds no longer wait on a home exchange. Format: a counter name.
+pub(crate) const HOME_PASS_IN_FLIGHT: &str = "fleet.home_passes.in_flight";
+/// Counter: the longest one pass of the home passes took, nanoseconds (A-912). Format: a counter name.
+pub(crate) const HOME_PASS_LONGEST_NS: &str = "fleet.home_passes.longest_ns";
+/// Counter: a pass of the home passes not begun, its task or channel refused (A-912); begun again the next period.
+/// Format: a counter name.
+pub(crate) const HOME_PASS_UNSPAWNED: &str = "fleet.home_passes.unspawned";
+
 /// One period of following the council's configuration on the coordinator (§4.8, D-14): install what the
 /// council has agreed into this node's placement view — taking over any object whose owner it retired —, fan
 /// the committed configurations to every other shard, report this node's neighbourhood change placed once it
@@ -11049,7 +11316,7 @@ async fn follow_configuration(
   shards: &[u16],
   local: HostId,
   budget: CommitBudget,
-  owner_acceptor: &mut Acceptor,
+  (owner_acceptor, home_passes): (&mut Acceptor, &mut HomePassLane),
   in_flight: &mut Vec<Dispatch>,
 ) {
   // Install the configuration the council has agreed into this node's placement view, and take over any
@@ -11065,17 +11332,8 @@ async fn follow_configuration(
   // period so a dispatch a full control channel refused self-heals; the receiving install/adopt are
   // version-gated, so an unchanged configuration is a no-op there (see `fan_configs_to_shards`).
   fan_configs_to_shards(origin, shards);
-  // Windows homed by identity in the region (A-724 piece 6): at a new configuration, offered to their homes and let go
-  // here once every home holds them, a turn a period (`vcs_store::homes::heal_region`).
-  crate::vcs_store::homes::heal_region(origin, shards, budget).await;
-  // The holds an attempt a crash left, once its process ended (A-727 (d1a-3)): resolved by the repository's holder,
-  // where a death, a new process, this node's start or a new configuration owes it.
-  crate::vcs_store::homes::resolve_ended(origin, shards, budget).await;
-  // A repository rebuilt here is told to the other members until each answers (A-727 (d1a-3)): the pass it owes them.
-  crate::vcs_store::homes::announce_rebuilt(origin, shards, budget).await;
-  // Credentials as fleet state (A-764): at a new configuration, every credential this node holds offered to every other
-  // member, so one that joined or came back with nothing holds what the region holds (`credentials::heal_region`).
-  crate::credentials::heal_region(origin, shards, budget).await;
+  // The home passes (heal, resolve, announce, credentials) run on their own lane, never awaited here (A-912).
+  home_passes.drive(origin, shards, budget).await;
   // Planned moves (A-291): each move this node's shards began is reported until the switch, routed to its new owner
   // from then on, and released once adopted; a destroyed moved volume's exception is reported forgotten.
   crate::moves::drive_outgoing(origin, local, owner_acceptor, budget, in_flight).await;
@@ -13662,22 +13920,23 @@ mod tests {
     });
   }
 
-  /// A-363, A-574. Do: ask what a shard is owed of the failover delay before any fan, record it delivered, move the
-  /// control shard's delay by a period, record that, and ask the configuration fan what the shard is owed. Expect the
-  /// delay owed at first; nothing once delivered; the moved delay owed; nothing once that is delivered; and no
-  /// configuration fan owed for a moved delay alone: every shard's waits read the control shard's estimate, sent only
-  /// when it moves, by the beat's own fan on every node, laptop or fleet.
+  /// A-363, A-574, A-912. Do: ask what a shard is owed of the failover delay and the homing window before any fan, record
+  /// it delivered, move the control shard's delay by a period, record that, move its homing window alone, and ask the
+  /// configuration fan what the shard is owed. Expect the pair owed at first; nothing once delivered; the moved delay
+  /// owed; the moved window owed alone too; nothing once delivered; and no configuration fan owed for either: every
+  /// shard's waits read the control shard's estimate, sent only when it moves.
   #[test]
   fn a_shard_is_fanned_the_failover_delay_when_it_moves() {
     crate::daemon::audit_on_shard(|s| {
+      let pair = |s: &ShardState| (s.failover_ns, s.homing_window_ns);
       assert_eq!(
-        s.fanned.failover_owed(s.failover_ns, OTHER_SHARD),
-        Some(s.failover_ns),
+        s.fanned.failover_owed(pair(s), OTHER_SHARD),
+        Some(pair(s)),
         "the first fan carries the delay"
       );
-      s.fanned.record_failover(OTHER_SHARD, s.failover_ns);
+      s.fanned.record_failover(OTHER_SHARD, pair(s));
       assert_eq!(
-        s.fanned.failover_owed(s.failover_ns, OTHER_SHARD),
+        s.fanned.failover_owed(pair(s), OTHER_SHARD),
         None,
         "nothing moved"
       );
@@ -13686,17 +13945,24 @@ mod tests {
       s.fanned.record(OTHER_SHARD, configuration.delivered());
       s.failover_ns = s.failover_ns.saturating_add(HEARTBEAT_NS);
       assert_eq!(
-        s.fanned.failover_owed(s.failover_ns, OTHER_SHARD),
-        Some(s.failover_ns),
+        s.fanned.failover_owed(pair(s), OTHER_SHARD),
+        Some(pair(s)),
         "the moved delay is owed"
       );
       assert!(
         s.fanned.owed(s, OTHER_SHARD).is_none(),
         "the configuration fan does not carry it"
       );
-      s.fanned.record_failover(OTHER_SHARD, s.failover_ns);
+      s.fanned.record_failover(OTHER_SHARD, pair(s));
+      s.homing_window_ns = s.homing_window_ns.saturating_add(HEARTBEAT_NS);
       assert_eq!(
-        s.fanned.failover_owed(s.failover_ns, OTHER_SHARD),
+        s.fanned.failover_owed(pair(s), OTHER_SHARD),
+        Some(pair(s)),
+        "a moved homing window is owed alone"
+      );
+      s.fanned.record_failover(OTHER_SHARD, pair(s));
+      assert_eq!(
+        s.fanned.failover_owed(pair(s), OTHER_SHARD),
         None,
         "delivered"
       );
