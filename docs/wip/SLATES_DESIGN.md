@@ -64124,6 +64124,13 @@ GAPS.
   (`a_judge_a_unit_a_step_is_refused_for_a_text_its_verdict_reads_unlent`; a step's unlent reads dropped fails it,
   which no test caught before); and a server batch staging that rename lent `a`'s text once by its judge
   (`a_staged_judge_is_lent_the_named_text_its_verdict_reads`).
+  **4b, the identity.** The work's identity, its record's BLAKE3 hash (`svn_commit::identity`), was 13.4 ms of the
+  build step whole; staging hashes it a slice a step (`staging::identified_in`, `hash_some`), each slice half the
+  step's quantum at the machine's measured BLAKE3 rate (`DaemonConfig::archive_slice_bytes_within`), until the step's
+  clock passes its quantum, a slice at least, before the build (`Staging::built_in`). The build step 25-27 ms →
+  13.6-13.8 ms (its rows, 12.3). Oracle: over records of up to 4 KiB, the empty one among them, in slices of 1 to 64
+  bytes, the identity hashed a slice a step is the identity whole, in as many steps as slices
+  (`a_records_identity_hashed_a_slice_a_step_is_its_identity_whole`).
 - **Piece 5, the records and the held tables** (29-31 ms at 9,000 files: the records' `apply` 13.0 ms, the held table
   after with the released fold 12.3, the holding fold 5.8, the held table before 0.5), in parts. **5a, the held
   tables.** The step that kept a revision applied the records and followed the batch's held table whole
