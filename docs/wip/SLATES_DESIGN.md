@@ -64244,7 +64244,24 @@ measured noise of the 100 figure, not a literal.
 > time), one past it refused `Busy` (`StartRefused::NoRoom` to a hook). The owner joins the spawner when it is dropped
 > at the stop, killing it with its group a liveness window later. Red: a spawn after the spawner's death gets its
 > child from a new spawner (`a_dead_spawner_is_restarted_and_a_spawn_asked_after_its_death_gets_its_child`); before,
-> every spawn after it was refused. Owed: the spawner's footprint, measured on a release daemon (main's).
+> every spawn after it was refused.
+>
+> **Fixed (2026-11-25): no wait on a shard.** 2b's restart reaped the dead spawner with a blocking `wait()` on the
+> control shard, and its owner joined the spawner on that shard's thread at the stop. A spawner whose ends closed
+> before the kernel made it waitable (a test binary naming no `spawner_role!()`, whose spawner ends at once, restarted
+> once a window; or an exit the kernel finished late under load) held the shard past its window, and the watchdog ended
+> the process: `reap_map` exit 4, "shard 3 is wedged, unmoved for 1140 ms … in task spawned at spawning.rs:668", and
+> main's watchdog A/B, 1 wedge in 4 rounds before A-924 against 120 at 2b. Now the dead spawner is reaped by a task of
+> its own awaiting its exit watch (`reaped`), so no dead spawner delays the next, and the owner hands its spawner to the
+> daemon's process thread at its drop (`Daemon::stop_parts` joins it, `join_spawner`, once the runtime has ended). Red:
+> a spawner that ends its conversation at once and lingers outside its group held its shard 3.07 s against a 1 s window
+> (`a_spawner_that_ends_its_conversation_and_lingers_is_reaped_while_its_shard_steps`, its bound kept off the shard).
+>
+> **Its cost** (main's measurements, 2026-11-25). macOS, release daemon at 5c7381734, idle: the spawner's footprint
+> 1,984K fresh and 2,000K 60 s later (RSS 6,576 KiB), against the daemon's 38M (RSS 49,568 KiB): about 5 %, flat; no
+> process of the binary left after the stop. Linux (diag 2, debug, 4-core runners), a start's median on the asking
+> thread through the spawner against direct: x86_64 94.3 / 102.7 / 96.1 µs at 100 / 10,000 / 65,527 descriptors
+> against 214.4 µs / 674.5 µs / 3.26 ms; arm64 94.5 / 94.8 / 80.5 µs against 272.7 / 354.3 / 670.2 µs.
 
 ### A-923 — The Aways family is keyed by let-go number, and every capped cut read counts each entry's page head (2026-11-25, w-perf for main 01a20182, its churn ruling (b) and its rulings on the format and the read cap; A-870, A-767 C1 step 2b)
 

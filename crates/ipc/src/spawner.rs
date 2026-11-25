@@ -553,6 +553,12 @@ macro_rules! spawner_role {
 /// Serves as the spawner when this process was started as one ([`ENDS_VARIABLE`] set): what serving ended with; none
 /// when it was not.
 pub fn serve_from_env() -> Option<io::Result<()>> {
+  Some(ends_from_env()?.and_then(serve))
+}
+
+/// The ends this process was handed as a spawner ([`ENDS_VARIABLE`] set), each marked close-on-exec again; none when it
+/// was not started as one. What [`serve_from_env`] serves, and what a test's stand-in for a failing spawner drops.
+pub fn ends_from_env() -> Option<io::Result<Vec<OwnedFd>>> {
   let count = std::env::var(ENDS_VARIABLE).ok()?.parse::<i32>().ok()?;
   let last = FIRST_HANDED.checked_add(count)?;
   let ends: Vec<OwnedFd> = (FIRST_HANDED..last)
@@ -567,7 +573,7 @@ pub fn serve_from_env() -> Option<io::Result<()>> {
       return Some(Err(io::Error::from(error)));
     }
   }
-  Some(serve(ends))
+  Some(Ok(ends))
 }
 
 /// The spawner's self-pipe's write end, for its `SIGCHLD` handler; negative before it is made.
