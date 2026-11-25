@@ -793,3 +793,12 @@
   fetch mid-derivation (446 -> 2 turns vs alone 1), listing during behind (old count 100->117, read_turns 0->0).
   Main's "listing red" was w-hg's pre-revert HEAD (confirmed). WAITING: main's diag 10 + git leg with the phase
   counters (49e4c377a) -> cut the biggest long-step phase.
+- 11-25 ~09:00 PST: LANDED d18da1adc (merge c059a8e28): the fetch's choose paced by A-783 Step::more_at, Costs<14> per
+  shard thread, negotiation marks next_unit; vcs_store.git_upload.choose_overran (past allowed_ns by more than the last
+  unit's misestimate, no unit alone past the quantum); rt.long_steps doc says it counts A-783's allowed spans. Red:
+  deterministic ChoosePace tests (old rule spent at 120/100 → overrun; paced 90; lone 300 to ceiling). Debug e2e can't
+  discriminate (units 10–50 µs vs 7 µs quantum). Main's unit table (b4aa00ef8): cut 7.9–10.3 ms one unit (= plain
+  clone's Selecting::begin painting every want/have tip), open_tree 0.45–0.59 ms, ~97 % of long units. NEXT: slice
+  the tip painting (own unit kind), then measure what open_tree spends (parse vs store read) before slicing it.
+  HOLD: derive changes until main's interleaved A/B (b4aa00ef8 clone 65 s first byte vs 38–40 s; suspects 59a168795
+  vs w-perf arena 2e85f9d61/259674f36/1a446416c).
