@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 35 (main 01a20182, 2026-11-24 21:53 PST): main past 2a5095c04 with w-perf's BENCHMARKS (f72985f75), w-svn's first-checkpoint
+# budget (964888c59) and the pace waiter test (1af90f6e4).
 # Run 34 (main 01a20182, 2026-11-24 21:24 PST): run 33 found git graph.rs:175's bare subtraction (A-911, 8c943afb1); main's commit
 # saturates it. With run 33's manifest alias (4b2430637).
 # Run 33 (main 01a20182, 2026-11-24 21:19 PST): run 32 found hg manifest.rs:171's callback type (105609857); main's commit names
