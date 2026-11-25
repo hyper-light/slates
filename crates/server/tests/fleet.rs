@@ -36891,6 +36891,51 @@ fn a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet() {
   assert_eq!(branch, Ok(()), "the new branch's push landed");
 }
 
+/// A-908 (the successor's half) and A-909 (an owner's own hold fenced per object). Do: on a three-node `f = 1` fleet
+/// with a git repository on a, push a history to `main`; kill a; once a survivor has taken the repository over, push a
+/// fresh history to a new branch through that successor's edge. Expect the branch's push to land: the successor
+/// branches the new green from the adopted `main`, and its own hold takes the new green's records beside the other
+/// survivor's, so each is placed at two. Red before A-909: the successor had written the adopted registers at the
+/// takeover's epoch 2 through its one owner acceptor, whose fence then refused the new green's records at its host
+/// epoch 1 (`StaleEpoch { current: 2 }`), so only the other survivor held them and the push was refused `unable to
+/// commit` at its barrier.
+#[test]
+fn a908_a_branch_is_made_on_a_repositorys_successor_after_its_owner_dies() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = git_fleet("branch-after-takeover");
+  let first = fleet.push(0, ("first.txt", b"main before its owner died\n"));
+  fleet.daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let repository = fleet.repository;
+  let taken = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(survivors.iter().any(|daemon| {
+      daemon
+        .repository_takeover(repository)
+        .is_ok_and(|(_, [_, rebuilt, _])| rebuilt >= 1)
+    }))
+  });
+  let successor = fleet.daemons.iter().position(|daemon| {
+    daemon
+      .repository_takeover(repository)
+      .is_ok_and(|(_, [_, rebuilt, _])| rebuilt >= 1)
+  });
+  let branched = successor.map(|node| {
+    fleet.push_to(
+      node,
+      ("branch.txt", b"a branch made on the successor\n"),
+      "after",
+    )
+  });
+  fleet.stop();
+  assert_eq!(first, Ok(()), "the push to main landed");
+  assert!(taken, "a survivor took the repository over");
+  assert_eq!(
+    branched,
+    Some(Ok(())),
+    "the successor took the new branch's push"
+  );
+}
+
 /// A-727 (d1a-3), a holder unreachable at first, and the rebuild that makes its answer exist (main 01a20182's ruling of
 /// 2026-11-24 01:36). Do: as the kill point after the entry, with every survivor's resolutions answering unresolved (as
 /// when the repository's holder cannot be reached) and every survivor's rebuild of the repository it takes over held;

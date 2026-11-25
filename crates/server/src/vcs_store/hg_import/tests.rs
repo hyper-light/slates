@@ -679,3 +679,150 @@ fn t_c1_2b_an_imports_bookmark_works_are_built_over_turns_before_its_landing() {
   assert!(!importing, "still importing after {TASK_WAIT:?}");
   assert!(turns > 3, "{turns} work turns for three bookmarks' works");
 }
+
+/// Shape: the red's history: one file of [`HELD_FILE_BYTES`] edited by a line put at its front in each of
+/// [`HELD_CHANGESETS`] changesets, so its whole texts ([`HELD_CHANGESETS`] times the file, no window shared) dwarf its
+/// deltas (a line each) and the segments they would fill.
+const HELD_CHANGESETS: usize = 64;
+/// Shape: the red's file's bytes before its first line is appended.
+const HELD_FILE_BYTES: usize = 1 << 20;
+
+/// `vcs_store`'s gauge `name` on the shard, 0 where it reads none.
+fn gauge(state: &ShardState, name: &str) -> u64 {
+  state
+    .vcs_stores
+    .memory_rows()
+    .into_iter()
+    .find(|(kind, _)| *kind == name)
+    .map_or(0, |(_, value)| value)
+}
+
+/// A Mercurial repository stock `hg` makes in a directory of its own beside the test binary: one file of
+/// [`HELD_FILE_BYTES`] and a line committed, then a line put at its front in each of the next changesets,
+/// [`HELD_CHANGESETS`] in all.
+/// None where `hg` does not run here.
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory and `hg`
+fn fronted_history(name: &str) -> Option<std::path::PathBuf> {
+  let hg = |dir: &std::path::Path, args: &[&str]| {
+    std::process::Command::new("hg")
+      .args(args)
+      .current_dir(dir)
+      .env("HGPLAIN", "1")
+      .env("HGUSER", "slates-test")
+      .env("HGRCPATH", "")
+      .output()
+      .ok()
+      .filter(|out| out.status.success())
+  };
+  let binary = std::env::current_exe().expect("the test binary's path");
+  let dir = binary
+    .parent()
+    .expect("the test binary's directory")
+    .join(format!("hg-import-{name}-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).expect("the repository's directory");
+  hg(&dir, &["init"])?;
+  let mut text: Vec<u8> = (0..HELD_FILE_BYTES)
+    .map(|at| {
+      if at % 64 == 63 {
+        b'\n'
+      } else {
+        b'a' + u8::try_from(at % 23).unwrap()
+      }
+    })
+    .collect();
+  for changeset in 0..HELD_CHANGESETS {
+    // At the front: every window of the file moves, so no two revisions share one (the content store keeps an object
+    // by its windows, and a line appended at the end would leave all but the last shared).
+    text.splice(0..0, format!("line {changeset}\n").bytes());
+    std::fs::write(dir.join("big.txt"), &text).expect("the file written");
+    let message = format!("changeset {changeset}");
+    let args: &[&str] = if changeset == 0 {
+      &["commit", "-q", "-A", "-m", &message]
+    } else {
+      &["commit", "-q", "-m", &message]
+    };
+    hg(&dir, args)?;
+  }
+  Some(dir)
+}
+
+/// Goal 93 hg, R (main 01a20182's order of 2026-11-24 15:21; w-perf's measurement of Mercurial's own history at
+/// 15e739357: peak RSS 1.03 GiB, set while one segment's file texts, about 600 MB whole, waited for their segment to be
+/// cut). An import keeps each file revision's whole text in the content store until the segment holding its delta lands,
+/// then lets it go (A-767 C1 step 2b); a segment is cut once its changegroup's bytes reach the segment's bound
+/// (`segment_bytes`). Derived bound: an import holds one segment at a time, so what it holds of a segment's file texts
+/// is held to the same bound as the segment: at most the bound plus the one text kept by the unit that crosses it, under
+/// twice the bound here (each text [`HELD_FILE_BYTES`] and its lines, under the bound). Do: make, with stock `hg`, one
+/// file of [`HELD_FILE_BYTES`] given a line at its front in each of [`HELD_CHANGESETS`] changesets (whole texts about
+/// 64 MiB, no window shared, deltas a line each); import it through the production host adapter a unit a turn, landing the segments each turn cut before
+/// the next as the shard's task does (`run`), and read after each landing the windows the content store holds
+/// (`mem.gauge.vcs_content.stored_bytes`); once every segment has landed, read them again (the changelog's and the
+/// manifests' texts, held until the import lands, P5). Expect: the most held after any turn at most what is held at the
+/// end plus twice the segment's bound; segments cut by their texts (`vcs_store.hg_import.segments_cut_by_texts`), so the
+/// bound is the cut's doing. Failing first: 46,162,339 bytes held after one turn against 8,950 at the end and a 2 MiB
+/// bound, the whole history's file texts in one segment, its deltas never reaching the bound before the stream's end. Skips, saying so, where `hg` is not installed.
+#[test]
+fn an_imports_file_texts_held_between_landings_are_bounded_by_its_segment() {
+  let Some(repository) = fronted_history("held") else {
+    eprintln!(
+      "SKIPPED an_imports_file_texts_held_between_landings_are_bounded_by_its_segment: no `hg` here"
+    );
+    return;
+  };
+  let path = repository.clone();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  // A task on the shard, a turn a step and its segments landed before the next, as the shard's own task runs an import
+  // (`run`): an import of this size in one step spins the shard past its window.
+  let (most, at_end, bound, by_texts) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      use crate::repository::svn_commit::tests::on;
+      let (id, _) = crate::test_store::created(
+        &owner(),
+        (
+          "hg",
+          VcsTool::Mercurial,
+          WireFormat::Sha1,
+          "branch:default:0",
+        ),
+      )
+      .await;
+      let (host, directory) = slates_base::OsHost::open_root(&path).expect("the repository opened");
+      assert_eq!(
+        on(|state| begin(state, id, (Box::new(host), directory))),
+        Ok(())
+      );
+      let bound = on(|state| u64::try_from(super::segment_bytes(state)).unwrap_or(u64::MAX));
+      let stored = || on(|state| gauge(state, "mem.gauge.vcs_content.stored_bytes"));
+      let mut clock = Ticking(0);
+      let mut most = 0_u64;
+      for turns in 1..=TURNS_AT_MOST {
+        let turned = on(|state| turn(state, id, (&mut clock, 1)));
+        assert_eq!(super::land_segments(id).await, Some(Ok(())));
+        most = most.max(stored());
+        match turned {
+          Some(Ok(Turned::More)) => {}
+          Some(Ok(Turned::Done(_))) => break,
+          Some(Err(failed)) => panic!("turn {turns} refused: {failed:?}"),
+          None => panic!("no import under way at turn {turns}"),
+        }
+        slates_rt::futures::yield_now().await;
+      }
+      let by_texts = on(|state| count(state, super::SEGMENTS_CUT_BY_TEXTS));
+      (most, stored(), bound, by_texts)
+    },
+    TASK_WAIT,
+  );
+  daemon.stop();
+  #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+  let _ = std::fs::remove_dir_all(&repository);
+  assert!(
+    most <= at_end.saturating_add(bound.saturating_mul(2)),
+    "held at most {most} bytes of windows after a turn, {at_end} at the end, the segment's bound {bound}"
+  );
+  assert!(
+    by_texts > 0,
+    "segments cut by their texts (`vcs_store.hg_import.segments_cut_by_texts`)"
+  );
+}

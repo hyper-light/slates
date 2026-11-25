@@ -234,12 +234,13 @@
 > lineage, a branch is branched from its source); a successor adopts a lineage whole. The push red
 > (`a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`) red at origin/main, green. OWED: part 4, a holder's
 > rebuild after a restart makes a member by its lineage (it stands alone until then, as before).
-> **IN FLIGHT (w-shared, 2026-11-24): a branch made on a repository's successor after its owner died is refused.** With
-> A-908 the successor adopts the lineage (`merge.takeover.lineage_adopted` 1) and makes the branch's green (no longer
-> `ContentUnavailable`, origin/main's red), and the other survivor branches its replica; but the push is refused `unable
-> to commit` (its barrier: the new green's version 1 unplaced, the names log at 6 acknowledged by none, no refusal counted
-> on either survivor), and a push of another new name 2.3 s later `cannot lock ref: it moved since the push read it`. Red
-> test kept off main until the fix.
+> **FIXED (A-909, w-shared, 2026-11-24): a branch made on a repository's successor after its owner died was refused
+> `unable to commit`.** The successor's own hold refused the new green's records `StaleEpoch { current: 2 }`: its one
+> owner acceptor had been fenced at the takeover's epoch by the registers it adopted, so at two survivors nothing it
+> made after a takeover was placed. An owner's hold now fences each object as its holders do (`Acceptor::accept_own`);
+> red first (`a908_a_branch_is_made_on_a_repositorys_successor_after_its_owner_dies`, and `slates-db`'s `a909_` tests).
+> OWED (main): gate 15 (`v3_takeover`) and a lint diag. Not checked: the second new branch's `cannot lock ref` 2.3 s
+> after the refused push; no test makes it.
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
@@ -1523,6 +1524,18 @@
 > restart of `hg_push_restart` (red: `Unheld` at rev 4281; green: the tip served after the restart).
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
+> R, the import's peak (w-perf, 2026-11-24, main's order of 15:21). Measured at 15e739357, Mercurial's own history
+> (57,036 changesets) imported on an in-process daemon (`hg_import_memory`, ignored, run by name with
+> `SLATES_HG_IMPORT_SOURCE`): peak RSS 1,076,144 KiB, from D's 5.73 GB. Named by the per-shard gauges: the content
+> object's high-water, set by one segment's file texts held whole until it landed (744 MB used before the first file
+> segment's cut, 628 MB let go at its landing). A segment was cut by its changegroup's bytes alone (`segment_bytes`, 2
+> MiB here), and a text runs to hundreds of times its delta. Now it is cut too once the whole file texts it keeps reach
+> the same bound (`Emitter::due`): the import holds under twice the segment's bound of file texts, counted
+> `vcs_store.hg_import.segments_cut_by_texts` apart from `_by_bytes`; held by
+> `an_imports_file_texts_held_between_landings_are_bounded_by_its_segment` (red: 46,162,339 bytes held after one turn,
+> 8,950 at the end, a 2 MiB bound). Owed: main's rerun of the 57k (segments, peak, time against 15e739357); the
+> changelog's and manifests' texts held until the import lands (about 90 MB of the 57k's), w-hg's after C1 (2)'s
+> manifest piece (the import's manifest keep reads the previous text in its step, with no ask between turns).
 > - a clone's file revisions served from the Texts rows.
 > **A-767 (2026-11-20, w-store; Ada's storage and changeset rulings).** DESIGNED: one unit, the changeset; RAM holds
 > the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the
