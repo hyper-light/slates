@@ -316,6 +316,9 @@
 >     below (a's hold rebuilt empty) or the owner's merge or state-log state after a warm restart. In that run the
 >     newcomer held 1 position: settle it against the start rule (adopted only within tolerance, stopping refused at the
 >     first position past it) and write the assertion as that rule.
+>   - **FIXED, its prerequisite (A-925):** each node announces its own edges (git HTTP or HTTPS, SSH) to its peers over
+>     stream 33, as a client reaches them, held only from its own authenticated session; an owner of no learned edge is
+>     the typed refusal naming its member id.
 >   - **OPEN, the product half (A-921 part 2), w-shared's next:** a, readmitted after its false death, still ran pushes
 >     as the repository's owner (the VCS edges route by the partition holding the repository, never by the
 >     configuration's owner), its records refused `Unauthorized` (38 at each holder) and the push `unable to commit`.

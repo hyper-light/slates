@@ -556,6 +556,11 @@ impl EdgeIdentity {
     EdgeIdentity { chain, key }
   }
 
+  /// The chain's leaf, DER: the certificate a client checks the edge's name against (A-925).
+  pub(crate) fn leaf(&self) -> Option<&[u8]> {
+    self.chain.first().map(Vec::as_slice)
+  }
+
   /// The edge's serving identity, refused when the key is no key rustls reads or the chain and key make no server
   /// configuration.
   pub(crate) fn serving(

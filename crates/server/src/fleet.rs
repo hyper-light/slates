@@ -1923,6 +1923,11 @@ async fn serve_peer_records(
             crate::takeover::serve_ledger_prepare(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
+          // A peer's version-control edges, held only where they name its authenticated anchor (A-925).
+          crate::edges::EDGES_STREAM => {
+            state::with_state(|s| crate::edges::serve_edges(s, peer_anchor, &request))
+              .unwrap_or_default()
+          }
           // A current candidate reads a register's ledger it lacks (A-919).
           crate::ledger_read::LEDGER_READ_STREAM => state::with_state(|s| {
             let peer_host = s
@@ -12805,7 +12810,7 @@ mod request_kind_tests {
   /// took none of it (2026-11-17, g230).
   #[test]
   fn every_request_kind_the_record_session_dispatches_is_its_own() {
-    let kinds: [(&str, u64); 28] = [
+    let kinds: [(&str, u64); 30] = [
       ("record", slates_cluster::RECORD_STREAM),
       (
         "content offer",
@@ -12843,6 +12848,8 @@ mod request_kind_tests {
       ("ledger promote", slates_cluster::LEDGER_PROMOTE_STREAM),
       ("takeover ledger", crate::takeover::TAKEOVER_LEDGER_STREAM),
       ("move", crate::moves::MOVE_STREAM),
+      ("ledger read", crate::ledger_read::LEDGER_READ_STREAM),
+      ("edges", crate::edges::EDGES_STREAM),
     ];
     let mut shared = Vec::new();
     for (at, (name, kind)) in kinds.iter().enumerate() {

@@ -63894,6 +63894,47 @@ owner's acceptor in the control shard's state), the state_log module doc (its ow
 `crates/server/src/{ledger_read,state_log,fleet,moves,merge_service,takeover,state,daemon,lib}.rs`,
 `crates/server/tests/fleet.rs`, `docs/wip/models/FencedLedger.tla` and its configurations, GAPS.
 
+### A-925 — A node announces its own version-control edges to its peers, as a client reaches them (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25; A-921 part 2's prerequisite)
+
+- **Why.** A-921's product half answers a request at a node that is not a repository's owner with where to go. A node
+  knew a repository's owner by member id, but not where a client reaches it. Its peers learn its probe and record
+  addresses at discovery (A-277), never its edges, which are its own: the operator binds each where it likes, and a test
+  binds them at port 0.
+- **The change.**
+  - Each node sends each peer one **edges record** over its own authenticated record session (stream 33,
+    `crate::edges`). It goes once a session and again when its edges change, as its epoch announcement rides.
+  - The record carries the node's git HTTP or HTTPS edge and its SSH edge, as a client reaches them. That is the
+    node's advertised host (A-277's reachable name, never a bind address such as `0.0.0.0` or `[::]`), each edge's
+    bound port (never 0), and its scheme.
+  - An HTTPS edge is announced only where its certificate names that host (`rustls::client::verify_server_name`). A
+    node with no reachable host, or none its certificate names, announces no edge. The daemon builds the record once
+    its edges are bound (the ports live on the `Daemon`) and sets it on the control shard. A laptop announces to nobody.
+  - Peers keep each record per anchor, bounded by the members. A departed member's record goes at the reaper's look
+    (`remote_attach::sweep_departed`).
+  - **Only its own** (main's condition 1). A record is held only where its anchor is the authenticated session's
+    anchor. Otherwise it is refused typed (`fleet.edges.refused.foreign`) and nothing is learned, so one member cannot
+    send another's clients elsewhere.
+  - **Bounded parsing** (condition 3). A record is at most 523 bytes, and each host is checked against a DNS name's 253
+    bytes before it is read. An oversized record, a cut, an unknown scheme, a bind address, port 0, trailing bytes and
+    another version are each a typed refusal.
+  - **Where to go:** `edges::owner_edge`, a member's edge of a kind, or the typed refusal naming the member where none
+    was learned (an older peer, a node serving no such edge). That is the one path, the same as a node with no edge.
+- **Why not discovery's `Announcement`** (main's ruling). `slates_wire` refuses trailing bytes and discovery maps any
+  decode error to `Malformed`, so a longer announcement would cost an older peer the whole enrollment exchange. An older
+  peer answers stream 33 empty, as any unknown kind: it learns nothing, and membership is untouched.
+- **Tests** (macOS arm64, debug, 2026-11-25).
+  - Fleet `a925_a_node_learns_its_peers_edges_as_each_bound_them`: three nodes, each with a git HTTP and an SSH edge at
+    port 0. a learned b's edges as b bound them (127.0.0.1:60773 HTTP, :60774 SSH in the run), and a member it holds no
+    record of got the typed refusal naming it.
+  - Unit `edges::tests::{an_edges_record_reads_back_whole_and_refuses_every_damaged_form,
+    a_node_announces_only_edges_a_client_reaches, an_https_edge_is_announced_only_at_a_name_its_certificate_carries,
+    a_record_naming_another_anchor_is_refused_and_teaches_nothing}`.
+  - `fleet::every_request_kind_the_record_session_dispatches_is_its_own`, with streams 32 and 33 added.
+- **Models.** None; the record is per-node fact, never consensus (D-14).
+
+Applied in the same change to: `crates/server/src/{edges,daemon,fleet,state,lib,member_task,remote_attach,config}.rs`,
+`crates/server/tests/fleet.rs`, GAPS.
+
 ### A-915 — Nothing acknowledged rests on a part only the dead owner held: a repository's creation answers once its root's join is at f + 1 too, and an adoption never waits for a join no owner is left to ship (2026-11-24, w-shared for main 01a20182, its ruling (1); a894's flake, my regression from A-908 part 4; amends A-894 and A-908)
 
 - **Why.** a894 (a repository's owner killed as its creation answers) failed under load, about 1 run in 3 at load 60 to

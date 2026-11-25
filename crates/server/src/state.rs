@@ -1374,6 +1374,9 @@ pub struct ShardState {
   /// The registers this node reads a ledger range of from its cohort, a part past its copy refused (A-919,
   /// `crate::ledger_read`). At most one a register.
   pub(crate) ledger_reads: crate::ledger_read::LedgerReads,
+  /// This node's version-control edges as a client reaches them, and its peers' as they announced them (A-925,
+  /// `crate::edges`), on the control shard. Bounded by the members.
+  pub(crate) edges: crate::edges::Edges,
   /// Test support (A-914): the nanoseconds each coordinator period waits before it runs
   /// (`Daemon::inject_period_stretch`), 0 in production.
   pub(crate) period_stretch_ns: u64,
