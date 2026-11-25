@@ -237,8 +237,10 @@ impl Emitter {
   /// Whether the segment being written has reached its bound: the import writes its record and cuts it
   /// ([`Emitter::cut`]). Its changegroup's bytes, or the whole file texts it keeps in the content store until it lands
   /// (goal 93 hg, R; main 01a20182's ruling of 2026-11-24): a text runs to hundreds of times its delta, so a segment cut
-  /// by its bytes alone held one of Mercurial's own segments' texts, about 600 MB, at once. Derived: an import holds one
-  /// segment at a time, so its texts are held to the segment's own bound, under twice it with the text that crosses it.
+  /// by its bytes alone held one of Mercurial's own segments' texts, about 600 MB, at once. Derived: a segment's texts
+  /// are held to the segment's own bound, under twice it with the text that crosses it (each text under the bound), and
+  /// its owner lets them go on the segment's own durable answer, with at most one segment's landing in flight while the
+  /// next is written (the server's `hg_import::step`): two segments, under four times the bound.
   pub(crate) fn due(&self) -> bool {
     self.segment.len() >= self.bound || self.kept >= to_u64(self.bound)
   }

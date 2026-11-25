@@ -1553,10 +1553,16 @@
 > object's high-water, set by one segment's file texts held whole until it landed (744 MB used before the first file
 > segment's cut, 628 MB let go at its landing). A segment was cut by its changegroup's bytes alone (`segment_bytes`, 2
 > MiB here), and a text runs to hundreds of times its delta. Now it is cut too once the whole file texts it keeps reach
-> the same bound (`Emitter::due`): the import holds under twice the segment's bound of file texts, counted
-> `vcs_store.hg_import.segments_cut_by_texts` apart from `_by_bytes`; held by
-> `an_imports_file_texts_held_between_landings_are_bounded_by_its_segment` (red: 46,162,339 bytes held after one turn,
-> 8,950 at the end, a 2 MiB bound). Owed: main's rerun of the 57k (segments, peak, time against 15e739357); the
+> the same bound (`Emitter::due`), counted `vcs_store.hg_import.segments_cut_by_texts` apart from `_by_bytes`
+> (0d05da26e). Main's 57k rerun at it: 2,087 segments (2,062 by texts), peak sampled 361,024 KiB; at 1227afcb1 the
+> landings' own wait was 20.3 s, about 18 % of the import (`segment_land_wait_ns`, 9.7 ms a landing), each awaited
+> before the next turn. Since then a segment's landing runs beside the next turns (`hg_import::step`, one in flight,
+> the next handed over once it answered, landings in order, texts let go on each one's own durable answer), counted
+> `segments_landed_overlapped` and the wait held against `segment_land_ns`. Derived bound: two segments' file texts,
+> the one in flight and the one being written, each under the bound plus the text that crosses it: under four times
+> the bound. Held by `an_imports_file_texts_held_between_landings_are_bounded_by_its_segment` on the production step
+> (red: 46,162,339 bytes held after one turn, 8,950 at the end, a 2 MiB bound; then no landing overlapped). Owed:
+> main's interleaved A/B of 0d05da26e^, 1227afcb1 and the pipelined landing over the 57k; the
 > changelog's and manifests' texts held until the import lands (about 90 MB of the 57k's), w-hg's after C1 (2)'s
 > manifest piece (the import's manifest keep reads the previous text in its step, with no ask between turns).
 > - a clone's file revisions served from the Texts rows.

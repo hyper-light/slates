@@ -763,21 +763,24 @@ fn fronted_history(name: &str) -> Option<std::path::PathBuf> {
 
 /// Goal 93 hg, R (main 01a20182's order of 2026-11-24 15:21; w-perf's measurement of Mercurial's own history at
 /// 15e739357: peak RSS 1.03 GiB, set while one segment's file texts, about 600 MB whole, waited for their segment to be
-/// cut). An import keeps each file revision's whole text in the content store until the segment holding its delta
-/// lands, then lets it go (A-767 C1 step 2b); a segment is cut once its changegroup's bytes reach the segment's bound
-/// (`segment_bytes`). Derived bound: an import holds one segment at a time, so what it holds of a segment's file texts
-/// is held to the same bound as the segment: at most the bound plus the one text kept by the unit that crosses it,
-/// under twice the bound here (each text [`HELD_FILE_BYTES`] and its lines, under the bound). Do: make, with stock
-/// `hg`, one file of [`HELD_FILE_BYTES`] given a line at its front in each of [`HELD_CHANGESETS`] changesets (whole
-/// texts about 64 MiB, no window shared, deltas a line each); import it through the production host adapter a unit a
-/// turn, landing the segments each turn cut before the next as the shard's task does (`run`), and read after each
-/// landing the windows the content store holds (`mem.gauge.vcs_content.stored_bytes`); once every segment has landed,
-/// read them again (the changelog's and the manifests' texts, held until the import lands, P5). Expect: the most held
-/// after any turn at most what is held at the end plus twice the segment's bound; segments cut by their texts
-/// (`vcs_store.hg_import.segments_cut_by_texts`), so the bound is the cut's doing; the landings' waits counted
-/// (`vcs_store.hg_import.segment_land_wait_ns`). Failing first: 46,162,339 bytes held after one turn against 8,950 at
-/// the end and a 2 MiB bound, the whole history's file texts in one segment, its deltas never reaching the bound before
-/// the stream's end. Skips, saying so, where `hg` is not installed.
+/// cut), and its landings pipelined (main's ruling of the same evening: at 1227afcb1 the 57k import waited 20.3 s, about
+/// 18 % of it, for 2,087 landings awaited one by one). An import keeps each file revision's whole text in the content
+/// store until the segment holding its delta lands, then lets it go (A-767 C1 step 2b); a segment is cut once its
+/// changegroup's bytes, or the whole file texts it keeps, reach the segment's bound (`segment_bytes`); its landing runs
+/// beside the next turns, and the next is handed over only once it answered. Derived bound: the import holds at most
+/// two segments' file texts, the one in flight and the one being written, each under the bound plus the one text kept
+/// by the unit that crosses it: under four times the bound here (each text [`HELD_FILE_BYTES`] and its lines, under the
+/// bound). Do: make, with stock `hg`, one file of [`HELD_FILE_BYTES`] given a line at its front in each of
+/// [`HELD_CHANGESETS`] changesets (whole texts about 64 MiB, no window shared, deltas a line each); import it through
+/// the production host adapter a unit a turn by the shard task's own step (`step`, as `run` takes it), reading after
+/// each step the windows the content store holds (`mem.gauge.vcs_content.stored_bytes`); once the last landing
+/// answered, read them again (the changelog's and the manifests' texts, held until the import lands, P5). Expect: the
+/// most held after any step at most what is held at the end plus four times the segment's bound; segments cut by
+/// their texts (`vcs_store.hg_import.segments_cut_by_texts`), so the bound is the cut's doing; landings answered while
+/// the import went on (`vcs_store.hg_import.segments_landed_overlapped`), and the import held for less than its
+/// landings took (`segment_land_wait_ns` against `segment_land_ns`). Failing first: 46,162,339 bytes held after one turn
+/// against 8,950 at the end and a 2 MiB bound, the whole history's file texts in one segment; then, cut by its texts,
+/// no landing overlapped, each awaited before the next turn. Skips, saying so, where `hg` is not installed.
 #[test]
 fn an_imports_file_texts_held_between_landings_are_bounded_by_its_segment() {
   let Some(repository) = fronted_history("held") else {
@@ -788,66 +791,104 @@ fn an_imports_file_texts_held_between_landings_are_bounded_by_its_segment() {
   };
   let path = repository.clone();
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  // A task on the shard, a turn a step and its segments landed before the next, as the shard's own task runs an import
-  // (`run`): an import of this size in one step spins the shard past its window.
-  let (most, at_end, bound, (by_texts, waited)) = crate::test_store::run_on_first(
-    &daemon,
-    move || async move {
-      use crate::repository::svn_commit::tests::on;
-      let (id, _) = crate::test_store::created(
-        &owner(),
-        (
-          "hg",
-          VcsTool::Mercurial,
-          WireFormat::Sha1,
-          "branch:default:0",
-        ),
-      )
-      .await;
-      let (host, directory) = slates_base::OsHost::open_root(&path).expect("the repository opened");
-      assert_eq!(
-        on(|state| begin(state, id, (Box::new(host), directory))),
-        Ok(())
-      );
-      let bound = on(|state| u64::try_from(super::segment_bytes(state)).unwrap_or(u64::MAX));
-      let stored = || on(|state| gauge(state, "mem.gauge.vcs_content.stored_bytes"));
-      let mut clock = Ticking(0);
-      let mut most = 0_u64;
-      for turns in 1..=TURNS_AT_MOST {
-        let turned = on(|state| turn(state, id, (&mut clock, 1)));
-        assert_eq!(super::land_segments(id).await, Some(Ok(())));
-        most = most.max(stored());
-        match turned {
-          Some(Ok(Turned::More)) => {}
-          Some(Ok(Turned::Done(_))) => break,
-          Some(Err(failed)) => panic!("turn {turns} refused: {failed:?}"),
-          None => panic!("no import under way at turn {turns}"),
-        }
-        slates_rt::futures::yield_now().await;
-      }
-      let by_texts = on(|state| {
-        (
-          count(state, super::SEGMENTS_CUT_BY_TEXTS),
-          count(state, super::SEGMENT_LAND_WAIT_NS),
-        )
-      });
-      (most, stored(), bound, by_texts)
-    },
-    TASK_WAIT,
-  );
+  // A task on the shard, a step a turn, as the shard's own task runs an import (`run`): an import of this size in one
+  // step spins the shard past its window.
+  let held = crate::test_store::run_on_first(&daemon, move || imported_held(path), TASK_WAIT);
   daemon.stop();
   #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
   let _ = std::fs::remove_dir_all(&repository);
   assert!(
-    most <= at_end.saturating_add(bound.saturating_mul(2)),
-    "held at most {most} bytes of windows after a turn, {at_end} at the end, the segment's bound {bound}"
+    held.most <= held.at_end.saturating_add(held.bound.saturating_mul(4)),
+    "held at most {} bytes of windows after a step, {} at the end, the segment's bound {}",
+    held.most,
+    held.at_end,
+    held.bound
   );
   assert!(
-    by_texts > 0,
+    held.by_texts > 0,
     "segments cut by their texts (`vcs_store.hg_import.segments_cut_by_texts`)"
   );
   assert!(
-    waited > 0,
-    "the landings' waits counted (`vcs_store.hg_import.segment_land_wait_ns`)"
+    held.overlapped > 0,
+    "landings answered while the import went on (`vcs_store.hg_import.segments_landed_overlapped`): {held:?}"
   );
+  assert!(
+    held.waited < held.landing,
+    "the import held for less than its landings took: {held:?}"
+  );
+}
+
+/// What [`imported_held`] read: the most windows held after a step and at the end, the segment's bound, the segments
+/// cut by their texts and landed overlapped, and the import's waits on its landings against their time.
+#[derive(Debug)]
+struct Held {
+  /// The most bytes of windows the content store held after a step.
+  most: u64,
+  /// The bytes it held once the last landing answered.
+  at_end: u64,
+  /// The segment's bound.
+  bound: u64,
+  /// Segments cut by their texts.
+  by_texts: u64,
+  /// Landings the store answered while the import went on.
+  overlapped: u64,
+  /// The nanoseconds the import was held waiting for landings.
+  waited: u64,
+  /// The nanoseconds the landings took.
+  landing: u64,
+}
+
+/// Imports the repository at `path` into a new Mercurial repository by the shard task's own step, reading the windows
+/// the content store holds after each: [`Held`].
+async fn imported_held(path: std::path::PathBuf) -> Held {
+  use crate::repository::svn_commit::tests::on;
+  let (id, _) = crate::test_store::created(
+    &owner(),
+    (
+      "hg",
+      VcsTool::Mercurial,
+      WireFormat::Sha1,
+      "branch:default:0",
+    ),
+  )
+  .await;
+  let (host, directory) = slates_base::OsHost::open_root(&path).expect("the repository opened");
+  assert_eq!(
+    on(|state| begin(state, id, (Box::new(host), directory))),
+    Ok(())
+  );
+  let most = stepped_to_its_end(id).await;
+  let stored = on(|state| gauge(state, "mem.gauge.vcs_content.stored_bytes"));
+  on(|state| Held {
+    most,
+    at_end: stored,
+    bound: u64::try_from(super::segment_bytes(state)).unwrap_or(u64::MAX),
+    by_texts: count(state, super::SEGMENTS_CUT_BY_TEXTS),
+    overlapped: count(state, super::SEGMENTS_LANDED_OVERLAPPED),
+    waited: count(state, super::SEGMENT_LAND_WAIT_NS),
+    landing: count(state, super::SEGMENT_LAND_NS),
+  })
+}
+
+/// Steps repository `id`'s import to its end a unit a turn (`step`), its last landing answered: the most bytes of
+/// windows the content store held after a step.
+async fn stepped_to_its_end(id: RepositoryId) -> u64 {
+  use crate::repository::svn_commit::tests::on;
+  let mut clock = Ticking(0);
+  let mut flight = None;
+  let mut most = 0_u64;
+  for turns in 1..=TURNS_AT_MOST {
+    let turned = super::step(id, &mut flight, (&mut clock, 1)).await;
+    most = most.max(on(|state| {
+      gauge(state, "mem.gauge.vcs_content.stored_bytes")
+    }));
+    match turned {
+      Some(Ok(Turned::More)) => {}
+      Some(Ok(Turned::Done(_))) => break,
+      Some(Err(failed)) => panic!("turn {turns} refused: {failed:?}"),
+      None => panic!("no import under way at turn {turns}"),
+    }
+  }
+  assert_eq!(super::landed_in_flight(id, &mut flight).await, Some(Ok(())));
+  most
 }
