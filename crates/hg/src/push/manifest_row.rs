@@ -38,7 +38,6 @@ pub(crate) struct Last {
 /// The manifest `index` holds last, if any.
 pub(crate) fn last(index: &HgIndex, store: &ContentStore) -> Option<Last> {
   let rev = index.len(store, Log::Manifest).checked_sub(1)?;
-  let rev = u32::try_from(rev).ok()?;
   let row = index.revision(store, Log::Manifest, rev)?;
   Some(Last {
     rev,

@@ -723,7 +723,7 @@ pub(crate) fn answer_wants_blocking(
                 Want::Texts { texts, most } => {
                   crate::vcs_store::hg_view::texts_made(&disk, repository, &texts, most)
                     .await
-                    .map(|made| match made {
+                    .map(|(made, _)| match made {
                       crate::vcs_store::hg_view::MadeTexts::Made(made) => {
                         slates_hg::serve::getbundle::Given::Texts(made)
                       }
