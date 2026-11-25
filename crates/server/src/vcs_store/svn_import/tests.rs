@@ -93,6 +93,16 @@ pub(crate) async fn imported(
   id: RepositoryId,
   dump: impl AsRef<[u8]>,
 ) -> (Result<Loaded, LoadFailed>, u64) {
+  imported_sampling(id, dump, &mut || {}).await
+}
+
+/// [`imported`], `sampled` run after each turn's landings and owed bases, before the next turn: what a test reads of
+/// the shard between turns.
+pub(crate) async fn imported_sampling(
+  id: RepositoryId,
+  dump: impl AsRef<[u8]>,
+  sampled: &mut dyn FnMut(),
+) -> (Result<Loaded, LoadFailed>, u64) {
   use crate::repository::svn_commit::tests::on;
   let (host, root) = host_holding(dump.as_ref());
   // The simulated host holds the dump now: the caller's copy goes, so a measurement counts one.
@@ -111,6 +121,7 @@ pub(crate) async fn imported(
     if let Some(Err(failed)) = super::supply_owed_base(id).await {
       return (Err(failed), turns);
     }
+    sampled();
     match on(|state| turn(state, id)) {
       Some(Ok(Turned::More)) => {}
       Some(Ok(Turned::Done(loaded))) => return (Ok(loaded), turns),
@@ -1030,5 +1041,87 @@ fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shar
   assert!(
     longest_ns < window_ns,
     "a step of {longest_ns} ns against the shard's window of {window_ns} ns"
+  );
+}
+
+/// Shape: the texts-bound red's rewritten file's bytes, and how many rewrites: each rewrite under the batch's texts
+/// bound (`staging::texts_bound`, 2 MiB on a 16 KiB page), together many times it.
+const BOUNDED_REWRITE_BYTES: usize = 256 << 10;
+/// Shape: see [`BOUNDED_REWRITE_BYTES`].
+const BOUNDED_REWRITES: usize = 64;
+
+/// The bytes of windows the shard's content store holds (`mem.gauge.vcs_content.stored_bytes`).
+fn stored_windows(state: &ShardState) -> u64 {
+  state
+    .vcs_stores
+    .memory_rows()
+    .into_iter()
+    .find(|(kind, _)| *kind == "mem.gauge.vcs_content.stored_bytes")
+    .map_or(0, |(_, bytes)| bytes)
+}
+
+/// What an import of [`rewrites`]'s [`BOUNDED_REWRITES`] rewrites of one [`BOUNDED_REWRITE_BYTES`]-byte file into a new
+/// repository `name` held and made: its youngest revision, the most windows the content store held after a turn, and
+/// the repository's history exported (`history`). With `unbounded`, the batch's texts bound is passed over, as an
+/// import was before it (`staging::TEXTS_UNBOUNDED`).
+async fn rewrites_imported(
+  name: &str,
+  unbounded: bool,
+) -> (Result<u64, LoadFailed>, u64, Option<(u64, Vec<u8>)>) {
+  let (svn, _) = subversion(name).await;
+  let unbound = &crate::repository::svn_commit::staging::TEXTS_UNBOUNDED;
+  unbound.with(|cell| cell.set(unbounded));
+  let mut most = 0_u64;
+  let (loaded, _) = imported_sampling(
+    svn,
+    rewrites(BOUNDED_REWRITES, BOUNDED_REWRITE_BYTES),
+    &mut || most = most.max(on(|state| stored_windows(state))),
+  )
+  .await;
+  unbound.with(|cell| cell.set(false));
+  (
+    loaded.map(|loaded| loaded.youngest),
+    most,
+    history(svn).await,
+  )
+}
+
+/// Goal 93 P7 (main 01a20182's ruling of 2026-11-24; w-perf's probe of git-2000: the content store's windows grew with
+/// the history, 41 MiB at revision 1 to 426 MiB at revision 2,000, none let go until the import's end, its 2,000
+/// revisions one batch, whose texts go only when it lands). Derived bound (`staging::texts_bound`): a batch lands once
+/// the texts it carries and the next revision's would pass the changeset store's unit, and the next revision's texts are
+/// put as the dump is read, so the import holds at most twice the larger of that unit and its largest revision's texts.
+/// Do: import [`rewrites`]'s [`BOUNDED_REWRITES`] rewrites of one [`BOUNDED_REWRITE_BYTES`]-byte file (each rewrite's
+/// lines numbered, so no two share a window; about 16 MiB of texts in all) through the shard's own turns, reading the
+/// windows the content store holds after each turn's landings; then import it again into another repository with the
+/// bound passed over. Expect: both imported to the same youngest revision; the most held at most what is held at the
+/// end plus twice the bound; batches landed for their texts (`repository.svn_import.flushed_texts`); and the two
+/// repositories' histories, exported whole, the same byte for byte (the oracle: the extra cuts change no revision).
+/// Failing first: every rewrite's text held at once, the 64 revisions one batch.
+#[test]
+fn an_imports_texts_are_held_a_batch_at_a_time_within_their_bound() {
+  let (bounded, unbounded, flushed, (bound, at_end)) = stored(|| async move {
+    let bounded = rewrites_imported("bounded", false).await;
+    let flushed = on(|state| count(state, crate::repository::svn_commit::staging::FLUSHED_TEXTS));
+    let unbounded = rewrites_imported("unbounded", true).await;
+    let ends = on(|state| {
+      (
+        crate::repository::svn_commit::staging::texts_bound(state),
+        stored_windows(state),
+      )
+    });
+    (bounded, unbounded, flushed, ends)
+  });
+  let youngest = u64::try_from(BOUNDED_REWRITES).unwrap_or(u64::MAX);
+  assert_eq!((&bounded.0, &unbounded.0), (&Ok(youngest), &Ok(youngest)));
+  assert!(
+    bounded.1 <= at_end.saturating_add(bound.saturating_mul(2)),
+    "held at most {} bytes of windows after a turn, {at_end} at the end, the bound {bound}",
+    bounded.1
+  );
+  assert!(flushed > 0, "batches landed for their texts");
+  assert!(
+    bounded.2 == unbounded.2,
+    "the same history with and without the texts bound"
   );
 }
