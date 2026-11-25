@@ -677,3 +677,9 @@ Waiting: main's route; arena-7 and arena-8.
 - Reported to main, not mine: the A-908 holder-rebuild test fails 4/5 alone under load (Later vs Installed(1)).
 - Run request to main: 57k push+restart and r618 intake_steps in release.
 - Next: C1 (2) piece 2, manifests a window at a time (Taker::last, read_of parsing every entry), then changesets.
+
+## 2026-11-24 ~21:30: hg clone regression (P5) fixed and landed
+- 4f9438625 (main f8fe97e5e): after P5 a clone asked each let-go changeset and manifest text alone, and the store's `texts_by_tools` scanned the log's tool-id prefix from its start a row a page per ask: quadratic (hg 57k clone past 13.5 min vs stock 42.4 s). Now each scan begins at the next asked id (store red: 200 reads → 1), and the fetch batches its log texts (clone red: 30 store asks → 6).
+- Main reruns the interop hg leg at f8fe97e5e.
+- Parked: C1 (2) manifests (B) as ~/.cache/w-hg-scratch/c1-2-manifests-wip.patch + chain_read.rs + intake_manifest.rs; its tests red, one hung (a loop). Pure pieces landed: 105609857 (manifest::Checking, delta::Written).
+- Next: resume manifests (B), the loop first.
