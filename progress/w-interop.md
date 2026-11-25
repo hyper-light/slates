@@ -660,3 +660,17 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
 - 7d4257124: BENCHMARKS, A-911's three arms. B lands; C (4x the slots) measured and rejected.
 - Left: main runs the two passes' CPU on hg-src and the 57k. w-hg's (b) keeps chunks stored from arrival and drops the
   per-stream compression. The changelog's generaldelta flag (stock 7.2 writes a new changelog without it) is owed, in GAPS.
+- 29221d5ab: the changelog without generaldelta (header 0x00000001; each delta against the revision before, its base the
+  chain's start; any other delta: no stream). Red: the render test's header check. hg_stream_compare.sh now compares
+  headers: at r400, 0 of 98 differ. GAPS closed. Streaming::sized is named owed to w-hg's (b).
+- 35f8a25b5 and 614fc9cad: BENCHMARKS, the 57k hg clone's memory from what_holds (in process; the harness's hg leg
+  supersedes it).
+- Left: main's queued run of the 57k stream's compress counters. Nothing else open.
+- ad36e5f09: hg-matrix.sh's evolution rows (evo-repository, evo-amend-push, evo-rebase-push, evo-clone, evo-verify,
+  evo-markers-back): 6 of 6 against stock hg 7.2.4. The same run's merge-push and rebase-push were refused
+  UnknownDeltaBase on manifest 41172a1e, a manifest base carried earlier in the same push. Sent to w-hg (theirs) and
+  main. Logs are kept in w-interop-scratch/hg-matrix-work/logs until w-hg has read them.
+- 387322d5c: GAPS shows hg-matrix.sh 30 of 30 at 0c4bd26fd, after w-hg's d33fc0b64.
+- 44db3dc17: BENCHMARKS, the 57k hg push A/B and the hg leg at 608930048.
+- f5b283016 (branch w-interop/hg-matrix-ci): the hg matrix CI job, pushed by main as diag-measurer-main-interop-linux-6
+  (2026-11-25 03:31 PST). Waiting for main to send results; any failed leg's row log comes back to me.

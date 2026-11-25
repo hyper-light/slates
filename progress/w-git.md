@@ -780,3 +780,10 @@
   PARKED agents/w-git-derive-behind 0552aca75 (derive a push's versions behind it; red/green done; t_a724 replay diff
   in a reach value open). WAITING: main's A/B verdict, the 57k read of tree_parse_bytes_most/long steps, git_derive.ns.
 - 11-25: CLOSED the 11-23 line "git_interop's per-step PATIENCE from the work (needs main's ratio over stock)": superseded by PATIENCE by progress, 0f40bfea3 (merge 719a296e1).
+- 11-25 ~06:00: LANDED d9af8b94f A-911 arm B (4-way; A/B: misses -65 %, first pack byte -7.4/-7.5/-5.7 s; C rejected),
+  92b74ac50 A-916 (server's dead reach-value copy deleted; oracle derive_settled; design A-647 amended; GAPS line),
+  608930048 derive_behind (12.15 s of a 40.3 s first clone's first pack byte was derivation; first fetch now derives
+  none), 0cd27990e (look-ahead lets go behind first: TSan diag 8's peak 4 vs 3), 49e4c377a (fetch step phases timed:
+  steps, long_steps.{refs,lend,work,settle,count}, phase_ns_most). Learned: arithmetic_side_effects denies bare ops.
+  Closed: git_interop PATIENCE line (superseded by 0f40bfea3); incremental fetch (client-side). WAITING: main's next
+  git leg's read of the phase counters, then cut the biggest phase.
