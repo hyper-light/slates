@@ -909,14 +909,90 @@ impl Index {
   /// changes nothing: the revision it makes, ready for [`Index::commit_planned`]. An owner checks a revision so
   /// before its log records it and commits it after, so a record the index refuses is never recorded (A-655).
   pub fn plan(&self, record: RevisionRecord, room: usize) -> Result<Planned, IndexRefusal> {
+    let mut planning = self.plan_begin(record, room)?;
+    loop {
+      match self.plan_step(planning, &mut || false)? {
+        PlanStep::More(more) => planning = *more,
+        PlanStep::Planned(planned) => return Ok(planned),
+      }
+    }
+  }
+
+  /// [`Index::plan`] begun (A-920 piece 2): the record's transaction name checked and its rows sorted, its revision's
+  /// new root made; its rows applied by [`Index::plan_step`], a slice at a time.
+  ///
+  /// # Errors
+  /// [`Index::plan`]'s, for the name, the rows' order and the youngest root.
+  pub fn plan_begin(&self, record: RevisionRecord, room: usize) -> Result<Planning, IndexRefusal> {
     let revision = self.youngest.checked_add(1).ok_or(IndexRefusal::Corrupt)?;
     check_transaction_name(&record.transaction)?;
     let changes = sorted_rows(record.changes)?;
-    let mut builder = Builder::new(self, revision)?;
-    for change in &changes {
+    let built = Builder::new(self, revision)?.detach();
+    Ok(Planning {
+      revision,
+      transaction: record.transaction,
+      changes,
+      at: 0,
+      room,
+      built,
+    })
+  }
+
+  /// One step of `planning` ([`Index::plan_begin`]): its rows applied, a row at least, until `spent` says the step's
+  /// slice is spent; once every row is, the revision built and checked as [`Index::plan`] checks it. The index stands
+  /// where the plan began between its steps: a revision appended since is refused out of date, as
+  /// [`Index::commit_planned`] refuses one.
+  ///
+  /// # Errors
+  /// [`Index::plan`]'s, and [`IndexRefusal::OutOfDate`] where a revision was appended since the plan began.
+  pub fn plan_step(
+    &self,
+    planning: Planning,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<PlanStep, IndexRefusal> {
+    let Planning {
+      revision,
+      transaction,
+      changes,
+      mut at,
+      room,
+      built,
+    } = planning;
+    let next = self.youngest.checked_add(1).ok_or(IndexRefusal::Corrupt)?;
+    if revision != next {
+      return Err(IndexRefusal::OutOfDate {
+        planned: revision,
+        next,
+      });
+    }
+    let mut builder = Builder::attach(self, built);
+    while let Some(change) = changes.get(at) {
       builder.apply(change)?;
+      at = at.saturating_add(1);
+      if at < changes.len() && spent() {
+        return Ok(PlanStep::More(Box::new(Planning {
+          revision,
+          transaction,
+          changes,
+          at,
+          room,
+          built: builder.detach(),
+        })));
+      }
     }
     let plan = builder.finish()?;
+    self.planned(plan, room).map(|plan| {
+      PlanStep::Planned(Planned {
+        revision,
+        plan,
+        transaction,
+        changes,
+      })
+    })
+  }
+
+  /// A revision's plan built ([`Index::plan_step`]) checked against the room and the index: the plan.
+  fn planned(&self, plan: Plan, room: usize) -> Result<Plan, IndexRefusal> {
     let needed = self
       .rows
       .len()
@@ -931,12 +1007,7 @@ impl Index {
       return Err(IndexRefusal::Room { needed, room });
     }
     self.check_plan(&plan)?;
-    Ok(Planned {
-      revision,
-      plan,
-      transaction: record.transaction,
-      changes,
-    })
+    Ok(plan)
   }
 
   /// Commits a revision [`Index::plan`] checked, and answers its number. Refused with nothing changed when a revision
@@ -1356,6 +1427,58 @@ impl Planned {
   }
 }
 
+/// A revision's record being planned a slice at a time ([`Index::plan_begin`], [`Index::plan_step`]; A-920 piece 2):
+/// its rows sorted, those before `at` applied to the revision being built.
+#[derive(Debug)]
+pub struct Planning {
+  /// The revision it makes.
+  revision: Revision,
+  /// The transaction's name.
+  transaction: String,
+  /// The changed-path rows, sorted by path.
+  changes: Vec<ChangedPath>,
+  /// The next row to apply.
+  at: usize,
+  /// The entries the index may hold with it.
+  room: usize,
+  /// The revision built so far.
+  built: Built,
+}
+
+/// What a step of [`Index::plan_step`] left.
+#[derive(Debug)]
+pub enum PlanStep {
+  /// Rows left to apply, at the next step.
+  More(Box<Planning>),
+  /// Every row applied: the revision planned, for [`Index::commit_planned`].
+  Planned(Planned),
+}
+
+/// A [`Builder`]'s revision without its index, held between a plan's steps ([`Builder::detach`]).
+#[derive(Debug)]
+struct Built {
+  /// The revision being built.
+  revision: Revision,
+  /// The revision it is built against.
+  previous: Revision,
+  /// The node-revisions made so far.
+  rows: Vec<Row>,
+  /// What has been done at each path so far.
+  staged: BTreeMap<String, Staged>,
+  /// The paths named so far that the index has not named, in number order.
+  new_paths: Vec<Box<str>>,
+  /// Their numbers.
+  new_numbers: BTreeMap<Box<str>, usize>,
+  /// The next node identity's number.
+  next_node: u64,
+  /// The next copy identity's number.
+  next_copy: u64,
+  /// The deletions made so far.
+  deletions: usize,
+  /// The children maps' nodes made so far, numbered after the index's (A-759).
+  maps: Vec<children::MapNode>,
+}
+
 /// A revision built and checked, ready to be committed.
 #[derive(Debug)]
 struct Plan {
@@ -1558,6 +1681,39 @@ impl<'index> Builder<'index> {
     let id = builder.push(root)?;
     builder.staged.entry(ROOT.to_owned()).or_default().node = Some(id);
     Ok(builder)
+  }
+
+  /// The revision built so far, its index let go, to be taken up again by [`Builder::attach`] against the same index.
+  fn detach(self) -> Built {
+    Built {
+      revision: self.revision,
+      previous: self.previous,
+      rows: self.rows,
+      staged: self.staged,
+      new_paths: self.new_paths,
+      new_numbers: self.new_numbers,
+      next_node: self.next_node,
+      next_copy: self.next_copy,
+      deletions: self.deletions,
+      maps: self.maps,
+    }
+  }
+
+  /// The revision [`Builder::detach`] let go, built on against `index`, the index it was built against.
+  fn attach(index: &'index Index, built: Built) -> Self {
+    Self {
+      index,
+      revision: built.revision,
+      previous: built.previous,
+      rows: built.rows,
+      staged: built.staged,
+      new_paths: built.new_paths,
+      new_numbers: built.new_numbers,
+      next_node: built.next_node,
+      next_copy: built.next_copy,
+      deletions: built.deletions,
+      maps: built.maps,
+    }
   }
 
   /// Applies one row, as FSFS applies the editor call it records.
