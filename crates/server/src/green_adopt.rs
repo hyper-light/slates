@@ -247,10 +247,12 @@ fn rebuild(state: &mut ShardState, object: ObjectId, through: u64, identity: [u8
     Ok(unheld) if !unheld.is_empty() => return Engine::Unheld(unheld),
     Ok(_) => {}
   }
-  match crate::merge_origin::rebuild_replica_through(state, object, through) {
-    Rebuild::Installed(at) if at == through => at_adopted(state, object, identity),
-    Rebuild::Nothing => Engine::RecordsShort(0),
-    Rebuild::Installed(_) | Rebuild::Later => Engine::Started,
+  match crate::merge_origin::rebuild_adopted_through(state, object, through) {
+    Ok(Rebuild::Installed(at)) if at == through => at_adopted(state, object, identity),
+    Ok(Rebuild::Nothing) => Engine::RecordsShort(0),
+    Ok(Rebuild::Installed(_) | Rebuild::Later) => Engine::Started,
+    // Never acknowledged as its repository's member (A-915): refused, so the attempts count and give it up typed.
+    Err(crate::merge_origin::Unjoined) => Engine::Refused,
   }
 }
 

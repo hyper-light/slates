@@ -36228,6 +36228,13 @@ struct GitFleet {
 
 /// [`GitFleet`] named `name`.
 fn git_fleet(name: &str) -> GitFleet {
+  let (daemons, stores, lease) = started_git_fleet(name);
+  founded_git_fleet(name, daemons, stores, (Some(lease), None))
+}
+
+/// The nodes of a [`git_fleet`] named `name`, formed, before its repository is made: their daemons and member ids, their
+/// stores and their serve ports' lease.
+fn started_git_fleet(name: &str) -> ((Vec<Daemon>, Vec<HostId>), Vec<NodeStore>, PortLease) {
   let names = ["a", "b", "c"];
   let n = names.len();
   let nodes: Vec<(MachineProfile, HostId, Identity)> = names
@@ -36267,7 +36274,7 @@ fn git_fleet(name: &str) -> GitFleet {
     .map(|daemon| daemon.member_identity().unwrap())
     .collect();
   assert_fleet_forms(&daemons, &hosts, &names);
-  founded_git_fleet(name, (daemons, hosts), stores, (Some(lease), None))
+  ((daemons, hosts), stores, lease)
 }
 
 /// [`git_fleet`] over anchors that outlive their daemons ([`AnchoredFleet`]), so a node can be stopped and started warm
@@ -37312,6 +37319,130 @@ fn a912_a_coordinators_home_passes_never_hold_its_council_through_a_takeover() {
     "no voter's session found lent to another exchange at a council round"
   );
 }
+
+/// A-915 (main 01a20182's ruling (1) of 2026-11-24: nothing acknowledged rests on a part only the dead owner held). Do:
+/// on a three-node `f = 1` git fleet, hold node a's state logs' shipping (`Daemon::hold_state_log_shipping`), so a
+/// creation's names-log part, its root's join, stays off the other members; create a repository on a; once a holds the
+/// creation's reply (`fleet.creation.awaited`), watch it over several of the fleet's periods; then kill a. Expect the
+/// creation unacknowledged through the watch (its record at f + 1, its join not); the client's retry of the creation at a
+/// survivor answered typed (made, or `AlreadyExists` naming the adopted repository); every survivor's adoption of the
+/// repository settled (rebuilt, or refused and dropped), none waiting; and a creation of the name again naming the one
+/// repository the retry left it to. Red before A-915: the creation answered once its record was at f + 1, and its successor's adoption
+/// waited for the join the dead owner held, forever ("waiting on its adoption", a894's flake at load).
+#[test]
+fn a915_a_creation_is_unacknowledged_while_its_roots_join_is_held_off_the_other_members() {
+  let _serial = serialize_fleet_tests();
+  let ((mut daemons, _hosts), _stores, _lease) = started_git_fleet("creation-join-held");
+  daemons[0].hold_state_log_shipping(true).unwrap();
+  let spec = slates_client::RepositorySpec {
+    name: "project".to_owned(),
+    tool: slates_ipc::protocol::VcsTool::Git,
+    format: slates_ipc::protocol::ObjectFormat::Sha1,
+    default_branch: "main".to_owned(),
+    green: None,
+  };
+  let (answered, answer) = std::sync::mpsc::channel();
+  let instance = daemons[0].instance().to_owned();
+  let asked = spec.clone();
+  let creating = std::thread::spawn(move || {
+    let mut client = common::client::connect(&instance);
+    let _ = answered.send(
+      client
+        .create_repository(&asked)
+        .map(|id| id.bytes)
+        .map_err(|refused| format!("{refused:?}")),
+    );
+  });
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let held = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    move_counter(&daemons[0], "fleet.creation.awaited").map(|awaited| awaited >= 1)
+  });
+  let mut early = None;
+  let answered_in_watch = poll_for_periods(
+    &observed,
+    PLACEMENT_DEADLINE,
+    CREATION_WATCH_PERIODS,
+    || {
+      early = answer.try_recv().ok();
+      Ok(early.is_some())
+    },
+  );
+  drop(observed);
+  daemons.remove(0).stop();
+  let _ = creating.join();
+  // The client's retry at a survivor answers typed: created afresh where it came before the takeover adopted the record
+  // (the adopted one, never acknowledged, is then refused at its rebuild and dropped), else `AlreadyExists` naming the
+  // adopted one (its name reserved until its rebuild). Either way, the name then names one repository.
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let mut first = None;
+  let answered = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    first = Some(repository_of_creation(survivors[0], &spec));
+    Ok(first.as_ref().is_some_and(Option::is_some))
+  });
+  let settled = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(survivors.iter().all(|daemon| {
+      move_counter(daemon, "fleet.takeover.repository_adopted").unwrap_or(0)
+        == move_counter(daemon, "fleet.takeover.repository_rebuilt").unwrap_or(0)
+          + move_counter(daemon, "fleet.takeover.repository_unrebuilt").unwrap_or(0)
+    }))
+  });
+  let again = repository_of_creation(survivors[0], &spec);
+  drop(survivors);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let first = first.flatten();
+  eprintln!(
+    "a creation with its join held: held {held}, answered in the watch {early:?}, the retry {first:?} ({answered}), \
+     adoptions settled {settled}, a creation again {again:?}"
+  );
+  assert!(held, "the owner held the creation's reply for its f + 1");
+  assert!(
+    !answered_in_watch,
+    "the creation unacknowledged while its root's join was held: {early:?}"
+  );
+  assert!(
+    answered,
+    "the client's retry of the creation answered typed: {first:?}"
+  );
+  assert!(
+    settled,
+    "every adoption of a repository settled, rebuilt or refused, none waiting"
+  );
+  assert!(
+    first
+      .zip(again)
+      .is_some_and(|(retried, named)| same_family(retried, named)),
+    "the name names one repository, the retry's (a creation answers its root green's id, `AlreadyExists` the \
+     repository's, one family): {first:?}, {again:?}"
+  );
+}
+
+/// Whether `a` and `b` are ids of one family (`ObjectId::family`): one creator and one family tag, as a repository and the
+/// root green its creation made are.
+fn same_family(a: [u8; 16], b: [u8; 16]) -> bool {
+  let (a, b) = (ObjectId(a), ObjectId(b));
+  a.family_tag().is_some() && a.family_tag() == b.family_tag() && a.creator() == b.creator()
+}
+
+/// What a creation of `spec` at `daemon` leaves the name to: the root green it made (a creation answers its root's id),
+/// or the repository `AlreadyExists` names; `None` for any other answer.
+fn repository_of_creation(
+  daemon: &Daemon,
+  spec: &slates_client::RepositorySpec,
+) -> Option<[u8; 16]> {
+  match common::client::connect(daemon.instance()).create_repository(spec) {
+    Ok(id) => Some(id.bytes),
+    Err(slates_client::ClientError::Refused(slates_ipc::protocol::Refusal::AlreadyExists {
+      existing,
+    })) => Some(existing.bytes),
+    Err(_) => None,
+  }
+}
+
+/// Shape: the coordinator periods A-915's test watches a held creation for: past the record's own f + 1 (76 ms, under one
+/// period at a heartbeat of 100 ms) many times over, so an answer the join was not waited for would come within it.
+const CREATION_WATCH_PERIODS: u64 = 20;
 
 /// A-727 (d1a-3), a holder unreachable at first, and the rebuild that makes its answer exist (main 01a20182's ruling of
 /// 2026-11-24 01:36). Do: as the kill point after the entry, with every survivor's resolutions answering unresolved (as

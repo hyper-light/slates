@@ -469,6 +469,8 @@ pub(crate) fn acknowledged(
     .acknowledged(register, sequence, &placement.acked);
   let remote = remote_candidates(state.fleet.configuration(), register, local);
   state.state_logs.let_go_held(register, &remote);
+  // A repository's creation held for its names log's parts may now be answered (A-915).
+  crate::live_ship::resolve_held_creations(state);
 }
 
 /// The candidates of `register`'s placement other than `local`.

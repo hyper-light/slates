@@ -4429,6 +4429,8 @@ fn record_merge_acks(
   // now — its completion recorded, its reply delivered (§4.16 "Commit"; AUD-11).
   if let Some(placed) = newly_placed {
     resolve_accepted(state, object, placed);
+    // A repository's creation held for its greens' versions may now be answered (A-915).
+    crate::live_ship::resolve_held_creations(state);
   }
 }
 
