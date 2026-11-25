@@ -1,5 +1,13 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
 
+## 2026-11-25 ~12:30 PST
+- LANDED 69f2875ae: P7 closed in GAPS on main's after arm (settled resident free within the keep in all three rounds).
+- LANDED c1ded2c5a: A-923, the Aways family keyed by let-go number (push of 20 let-goes: 47,887 -> 3,701 B
+  re-encoded); old images' aways renumbered at restore (svn + hg restart reds); every capped cut read counts its page
+  head (a read held up to 1.9x its cap); counters vcs_store.image.encoded_bytes.<family>.
+- OWED: the kind-15 reader removed once every daemon has published since A-923.
+- Next (main): the 32 MB texts.rs:708 holds after the 57k push (store test + text cache gauge in status); then the
+  clone's mantle scan churn (upkeep.rs:341 reserve under scan_inner, 55.8%).
 ## 2026-11-25 ~09:00 PST
 - LANDED 50b991d7f: (a) Region::residency_in_use; object_resident_bytes = mincore minus pages marked reusable (macOS).
   Red macos_residency: 32 MiB read resident after a purge, now 0.
