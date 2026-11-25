@@ -81,6 +81,11 @@ use crate::merge_service::{
 };
 use crate::state::ShardState;
 
+/// Counter: a rebuilt lineage root not installed because its repository already has a lineage on this holder without
+/// it (A-908 part 4): a bug signal, since a holder makes a lineage's members only from its root.
+/// Format: a counter name in the daemon's status report.
+pub(crate) const LINEAGE_FOUND_REFUSED: &str = "merge.replica.lineage_found_refused";
+
 /// Counted on an owner each time version 0's inputs of a green were made whole (A-286): the non-vacuity counter of the
 /// made-once path, one a green.
 /// Format: a refusal name in the daemon's status report.
@@ -781,9 +786,29 @@ pub(crate) fn rebuild_replica_through(
     state.count(REPLICA_RECORDS_SHORT, 1);
     return Rebuild::Later;
   };
+  // Version 0 by the green's membership of its repository's lineage (A-908 part 4), as a record's own version 0 is made
+  // (`merge_service::make_origin_replica`): a green with no origin inputs only, since one seeded from its inputs stands
+  // alone there too (`seed_version_zero`).
+  let mut lineage = None;
+  if zero.inputs.is_none() {
+    use slates_db::catalog::MemberOrigin;
+    match crate::merge_service::membership(state, crate::merge_service::replica_key(object)) {
+      Some(member) => match member.origin {
+        MemberOrigin::Root => lineage = Some(member.repository),
+        MemberOrigin::Branch { from, version } => {
+          return rebuild_branch(state, object, (from, version), zero.identity, through);
+        }
+      },
+      None if object.is_family() => {
+        state.count(crate::merge_service::MEMBER_UNKNOWN, 1);
+        return Rebuild::Later;
+      }
+      None => {}
+    }
+  }
   build(
     state,
-    ReplicaSeed::rebuild(object, zero.inputs, zero.identity, through),
+    ReplicaSeed::rebuild(object, zero.inputs, zero.identity, through).founding(lineage),
   );
   match state
     .merge
@@ -793,6 +818,97 @@ pub(crate) fn rebuild_replica_through(
     Some(replica) => Rebuild::Installed(replica.reached()),
     None => Rebuild::Later,
   }
+}
+
+/// Rebuilds a branch's replica (A-908 part 4) as its holder first made it (`merge_service::make_origin_replica`): branched
+/// from its source's replica at the version it was made at (`crate::greens::Greens::branch`: lent, nothing copied), its
+/// head checked against version 0's record `identity`, then advanced through `through` from the records this holder
+/// accepted ([`advance_replica`]). Before, a rebuild seeded every version 0 as an empty green, so a restarted holder's
+/// branch was a mismatch, refused on it for good. A source not there yet is made first ([`make_source`]); meanwhile the
+/// rebuild is `Later`, counted `merge.replica.branch_source_behind`, and its record retried by its sender.
+fn rebuild_branch(
+  state: &mut ShardState,
+  object: ObjectId,
+  (from, version): (DbVolumeId, u64),
+  identity: [u8; 32],
+  through: u64,
+) -> Rebuild {
+  let key = crate::merge_service::replica_key(object);
+  if !source_reached(state, from, version) && !make_source(state, from, version) {
+    state.count(crate::merge_service::BRANCH_SOURCE_BEHIND, 1);
+    return Rebuild::Later;
+  }
+  if state.merge.replicas.branch(&from, version, key).is_err() {
+    state.count(crate::merge_service::BRANCH_SOURCE_BEHIND, 1);
+    // A source owing its push (a created ref's, P2) is made through its door first (A-886), as a record's branch is.
+    let owes = state
+      .merge
+      .replicas
+      .lend(&from)
+      .is_some_and(|source| !source.is_materialized());
+    if owes {
+      crate::replica_build::wanted(state, ObjectId(from.bytes));
+    }
+    return Rebuild::Later;
+  }
+  state.count(crate::merge_service::MEMBER_BRANCHED, 1);
+  let agrees = state
+    .merge
+    .replicas
+    .lend_mut(&key)
+    .is_some_and(|mut replica| replica.head_identity() == identity);
+  if !agrees {
+    state.count(RECOMPUTE_MISMATCH, 1);
+    state.merge.refused.insert(object);
+    state.merge.replicas.drop_any(&key);
+    slates_machine::log_line!(
+      "slates-server: merge record for green {} version 0: the rebuilt branch's identity does not match the record; the green is refused on this holder",
+      hex(&object.0)
+    );
+    return Rebuild::Later;
+  }
+  if through == 0 {
+    crate::work_home::replica_reached(state, object);
+    return Rebuild::Installed(0);
+  }
+  advance_replica(state, object, through)
+}
+
+/// Whether this holder's replica of `from` has reached `version`.
+fn source_reached(state: &ShardState, from: DbVolumeId, version: u64) -> bool {
+  state
+    .merge
+    .replicas
+    .lend(&from)
+    .is_some_and(|source| source.reached() >= version)
+}
+
+/// Brings a branch's source `from` to `version` where it can be now: a replica behind is advanced from the records this
+/// holder accepted; a missing one is rebuilt, or, where its own source is missing too, the nearest missing ancestor whose
+/// source is here (or a root) is rebuilt instead, a level an ask, never by recursion, the walk bounded by the
+/// memberships this holder knows. Whether `from` is at `version` now.
+fn make_source(state: &mut ShardState, from: DbVolumeId, version: u64) -> bool {
+  use slates_db::catalog::MemberOrigin;
+  if state.merge.replicas.contains_key(&from) {
+    return matches!(
+      advance_replica(state, ObjectId(from.bytes), version),
+      Rebuild::Installed(head) if head >= version
+    );
+  }
+  let mut missing = from;
+  let bound = state.merge.memberships.len();
+  for _ in 0..bound {
+    match crate::merge_service::membership(state, missing).map(|member| member.origin) {
+      Some(MemberOrigin::Branch { from: above, .. })
+        if !state.merge.replicas.contains_key(&above) =>
+      {
+        missing = above;
+      }
+      _ => break,
+    }
+  }
+  let made = rebuild_replica(state, ObjectId(missing.bytes));
+  missing == from && matches!(made, Rebuild::Installed(head) if head >= version)
 }
 
 /// Advances this node's replica of `object` from its head to `through` (A-333): the versions after its head recomputed
@@ -1026,6 +1142,10 @@ pub(crate) struct ReplicaSeed {
   /// The head of the replica an advance began from (A-333), `None` for a build that seeds version 0: what its install
   /// counts.
   advanced_from: Option<u64>,
+  /// The repository whose lineage the built replica founds (A-908 part 4): a lineage's root, rebuilt, is installed as
+  /// its lineage's first member, as a record's version 0 founds it (`merge_service::make_origin_replica`). None for a
+  /// replica that stands alone or is already a member.
+  lineage: Option<slates_db::catalog::RepositoryId>,
   /// Where the build has reached.
   stage: SeedStage,
 }
@@ -1203,8 +1323,15 @@ impl ReplicaSeed {
       held: manifest,
       reached: 0,
       advanced_from: None,
+      lineage: None,
       stage: SeedStage::Begin,
     }
+  }
+
+  /// This build, its replica founding `lineage`'s lineage at its install when it is a repository's.
+  fn founding(mut self, lineage: Option<slates_db::catalog::RepositoryId>) -> ReplicaSeed {
+    self.lineage = lineage;
+    self
   }
 
   /// An advance of `object`'s `replica` from its head to version `through` (A-333): every version after the head
@@ -1220,6 +1347,7 @@ impl ReplicaSeed {
       held: None,
       reached: next,
       advanced_from: Some(head),
+      lineage: None,
       stage: SeedStage::Chain(Box::new(ChainStep {
         replica,
         version: next,
@@ -1516,7 +1644,25 @@ impl ReplicaSeed {
     if member {
       state.merge.replicas.put_back_any(&key, replica);
     } else if !state.merge.replicas.contains_key(&key) {
-      state.merge.replicas.insert(key, replica);
+      match self.lineage {
+        Some(repository) => {
+          if state
+            .merge
+            .replicas
+            .found(repository, key, replica)
+            .is_err()
+          {
+            // The repository has a lineage here without this root: nothing a holder makes leaves one (a branch is made
+            // only from a member), so counted as the bug it would be, and the replica not installed.
+            state.count(LINEAGE_FOUND_REFUSED, 1);
+            return;
+          }
+          state.count(crate::merge_service::MEMBER_FOUNDED, 1);
+        }
+        None => {
+          state.merge.replicas.insert(key, replica);
+        }
+      }
     }
     // What waited for this replica on this holder: a submit's settling (A-697 part d), a recovered work's replay (e).
     crate::work_home::replica_reached(state, self.object);
@@ -2018,6 +2164,220 @@ mod tests {
       "rebuilt a unit at a time ({units} units for {chunks} chunks and two versions)"
     );
     assert_eq!(counts, [1, 1, 2], "seeded, rebuilt, versions recomputed");
+  }
+
+  /// A repository family's id for A-908 part 4's tests: `number` 1 the repository's, others its greens'.
+  fn family(creator: u64, number: u32) -> ObjectId {
+    ObjectId::family(HostId(creator), 0, 7, number).expect("a family id")
+  }
+
+  /// Notes on `state` a names-log part of `repository` joining each of `members` (a green and its origin), as a holder
+  /// notes the parts it accepts (`merge_service::note_names_part`), with its memberships read.
+  fn note_joins(
+    state: &mut ShardState,
+    repository: slates_db::catalog::RepositoryId,
+    members: &[(ObjectId, slates_db::catalog::MemberOrigin)],
+  ) {
+    let changes: Vec<slates_db::catalog::LoggedChange> = members
+      .iter()
+      .map(|(green, origin)| slates_db::catalog::LoggedChange::Joined {
+        member: slates_db::catalog::MemberRecord {
+          repository,
+          green: DbVolumeId { bytes: green.0 },
+          origin: *origin,
+        },
+      })
+      .collect();
+    let record = slates_db::catalog::StateLogRecord {
+      repository,
+      log: slates_db::catalog::StateLog::Names,
+      from: 0,
+      to: u64::try_from(changes.len()).unwrap(),
+      identity: [3; 32],
+      spans: Vec::new(),
+      changes,
+    };
+    crate::merge_service::note_names_part(state, &crate::state_log::value_of(&record));
+    state.merge.memberships_built = true;
+  }
+
+  /// The identities an owner's greens reach (A-908 part 4): a root at versions 0 and 1 (`first` submitted), and a branch
+  /// made at the root's version 1 at its versions 0 and 1 (`second` submitted), each through the owner's own lineage.
+  fn lineage_identities(first: &Increment, second: &Increment) -> ([[u8; 32]; 2], [[u8; 32]; 2]) {
+    let repository = slates_db::catalog::RepositoryId {
+      bytes: family(1, 1).0,
+    };
+    let (root, branch) = (
+      DbVolumeId {
+        bytes: family(1, 2).0,
+      },
+      DbVolumeId {
+        bytes: family(2, 3).0,
+      },
+    );
+    let mut owner = crate::greens::Greens::default();
+    assert!(owner.found(repository, root, Green::new()).is_ok());
+    let mut identity = |owner: &mut crate::greens::Greens, id: &DbVolumeId| {
+      owner
+        .lend_mut(id)
+        .map(|mut green| green.head_identity())
+        .unwrap()
+    };
+    let root_zero = identity(&mut owner, &root);
+    let submitted = owner.lend_mut(&root).map(|mut green| green.submit(first));
+    assert!(matches!(submitted, Some(Outcome::Accepted { version: 1 })));
+    let root_one = identity(&mut owner, &root);
+    assert!(owner.branch(&root, 1, branch).is_ok());
+    let branch_zero = identity(&mut owner, &branch);
+    let submitted = owner
+      .lend_mut(&branch)
+      .map(|mut green| green.submit(second));
+    assert!(matches!(submitted, Some(Outcome::Accepted { version: 1 })));
+    (
+      [root_zero, root_one],
+      [branch_zero, identity(&mut owner, &branch)],
+    )
+  }
+
+  /// A-908 part 4, §4.16 "Apply on holders": a restarted holder rebuilds a branch by its lineage, as it first made it. Do:
+  /// give a holder with no replicas the records of a root (versions 0 and 1) and of a branch made at the root's version 1
+  /// (versions 0 and 1), their increments, and the names-log part joining both, as a warm restart leaves it; rebuild the
+  /// branch, as its next record arriving asks. Expect the branch installed at version 1 with the owner's identity, the
+  /// root rebuilt first and founding the lineage, the branch its member, counted founded and branched. Red before:
+  /// version 0 rebuilt as an empty green, a mismatch, the branch refused on the holder for good.
+  #[test]
+  fn a908_a_restarted_holder_rebuilds_a_branch_by_its_lineage() {
+    let first = creating("main-1", b"one", 1, 0);
+    let second = creating("branch-1", b"two", 2, 0);
+    let (roots, branches) = lineage_identities(&first, &second);
+    let (rebuilt, lineages, refused, counts) = crate::daemon::audit_on_shard(move |state| {
+      let repository = slates_db::catalog::RepositoryId {
+        bytes: family(1, 1).0,
+      };
+      let (root, branch) = (family(1, 2), family(2, 3));
+      note_joins(state, repository, &branch_joins(root, branch));
+      let first_inputs = hold_encoded(state, root, &first.encode());
+      let second_inputs = hold_encoded(state, branch, &second.encode());
+      accept_records(
+        state,
+        root,
+        &[(0, None, roots[0]), (1, Some(first_inputs), roots[1])],
+      );
+      accept_records(
+        state,
+        branch,
+        &[
+          (0, None, branches[0]),
+          (1, Some(second_inputs), branches[1]),
+        ],
+      );
+      let rebuilt = rebuild_replica(state, branch);
+      let identity = state
+        .merge
+        .replicas
+        .lend_mut(&crate::merge_service::replica_key(branch))
+        .map(|mut replica| replica.head_identity());
+      let lineages = [root, branch].map(|green| {
+        state
+          .merge
+          .replicas
+          .lineage_of(&crate::merge_service::replica_key(green))
+      });
+      let counts = [
+        count_of(state, crate::merge_service::MEMBER_FOUNDED),
+        count_of(state, crate::merge_service::MEMBER_BRANCHED),
+      ];
+      (
+        (rebuilt, identity),
+        (lineages, repository),
+        state.merge.refused.contains(&branch),
+        counts,
+      )
+    });
+    assert_eq!(rebuilt, (Rebuild::Installed(1), Some(branches[1])));
+    let (lineages, repository) = lineages;
+    assert_eq!(
+      lineages,
+      [Some(repository), Some(repository)],
+      "one lineage"
+    );
+    assert!(!refused, "the branch is not refused");
+    assert_eq!(counts, [1, 1], "founded, branched");
+  }
+
+  /// The joins of `root` and of `branch`, made at the root's version 1.
+  fn branch_joins(
+    root: ObjectId,
+    branch: ObjectId,
+  ) -> [(ObjectId, slates_db::catalog::MemberOrigin); 2] {
+    [
+      (root, slates_db::catalog::MemberOrigin::Root),
+      (
+        branch,
+        slates_db::catalog::MemberOrigin::Branch {
+          from: DbVolumeId { bytes: root.0 },
+          version: 1,
+        },
+      ),
+    ]
+  }
+
+  /// A-908 part 4: a branch of a branch whose sources are both missing is rebuilt a level an ask, never by recursion. Do:
+  /// as above, with a second branch made at the first branch's version 0, and rebuild the second branch twice, as its
+  /// records arriving twice ask. Expect the first ask `Later` (the root rebuilt, the first branch not yet), counted
+  /// `branch_source_behind`, and the second installed, the three one lineage.
+  #[test]
+  fn a908_a_branch_of_a_missing_branch_is_rebuilt_a_level_an_ask() {
+    let first = creating("main-1", b"one", 1, 0);
+    let second = creating("branch-1", b"two", 2, 0);
+    let (roots, branches) = lineage_identities(&first, &second);
+    let (asks, behind, lineages) = crate::daemon::audit_on_shard(move |state| {
+      let repository = slates_db::catalog::RepositoryId {
+        bytes: family(1, 1).0,
+      };
+      let (root, branch, twig) = (family(1, 2), family(2, 3), family(3, 4));
+      let mut joins = branch_joins(root, branch).to_vec();
+      joins.push((
+        twig,
+        slates_db::catalog::MemberOrigin::Branch {
+          from: DbVolumeId { bytes: branch.0 },
+          version: 0,
+        },
+      ));
+      note_joins(state, repository, &joins);
+      let first_inputs = hold_encoded(state, root, &first.encode());
+      let second_inputs = hold_encoded(state, branch, &second.encode());
+      accept_records(
+        state,
+        root,
+        &[(0, None, roots[0]), (1, Some(first_inputs), roots[1])],
+      );
+      accept_records(
+        state,
+        branch,
+        &[
+          (0, None, branches[0]),
+          (1, Some(second_inputs), branches[1]),
+        ],
+      );
+      accept_records(state, twig, &[(0, None, branches[0])]);
+      let asks = [rebuild_replica(state, twig), rebuild_replica(state, twig)];
+      let lineages = [root, branch, twig].map(|green| {
+        state
+          .merge
+          .replicas
+          .lineage_of(&crate::merge_service::replica_key(green))
+      });
+      (
+        asks,
+        count_of(state, crate::merge_service::BRANCH_SOURCE_BEHIND),
+        (lineages, repository),
+      )
+    });
+    assert_eq!(asks, [Rebuild::Later, Rebuild::Installed(0)]);
+    assert_eq!(behind, 1, "the first ask waited on its source");
+    let (lineages, repository) = lineages;
+    assert_eq!(lineages, [Some(repository); 3], "one lineage");
   }
 
   /// §4.16 "Apply on holders", D-27 "mismatch fatal-and-loud" (A-313): a rebuild installs a replica only from the whole
