@@ -183,6 +183,10 @@ pub fn apply_into(
 pub trait BaseRead {
   /// The base's length.
   fn len(&self) -> u64;
+  /// Whether the base has no bytes: a delta over it can only insert.
+  fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
   /// Appends the base's bytes `at..at + n` to `out`: none where the reader does not hold them now (a window let go),
   /// `out` then as it was.
   fn read_into(&mut self, at: u64, n: usize, out: &mut Vec<u8>) -> Option<()>;
@@ -329,6 +333,60 @@ impl Patching {
     self.data = Some((data_at, data_end, end));
     self.delta_at = data_end;
     Ok(())
+  }
+}
+
+/// Which ranges of the text a delta makes its hunks wrote, told from the delta alone (goal 93, C1 (2): a manifest's
+/// written entries found as its text streams, never from the text whole): asked of the text's ranges in order, each
+/// answered whether a hunk's bytes fall in it. A hunk that wrote nothing (a deletion) touches the range holding the
+/// place it deleted at, as a whole-text reader takes the line it cut. What it keeps is where it is in the delta and the
+/// hunk it is on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Written {
+  /// Where the next hunk begins in the delta.
+  delta_at: usize,
+  /// The text's bytes before the next hunk's place, as far as the hunks read so far tell.
+  made: u64,
+  /// The base byte after the last hunk read.
+  base_at: u64,
+  /// The hunk being met: its range in the text, a deletion's one byte long.
+  current: Option<(u64, u64)>,
+}
+
+impl Written {
+  /// Whether a hunk of `delta` wrote any byte of `range`, a range of the text after every range asked before it.
+  pub fn touches(&mut self, delta: &[u8], range: core::ops::Range<u64>) -> Result<bool, Refusal> {
+    loop {
+      if let Some((start, end)) = self.current {
+        if end <= range.start {
+          self.current = None;
+          continue;
+        }
+        return Ok(start < range.end);
+      }
+      let rest = delta.get(self.delta_at..).unwrap_or_default();
+      let Some(hunk) = hunks(rest).next() else {
+        return Ok(false);
+      };
+      let hunk = hunk?;
+      let (start, end) = (u64::from(hunk.start), u64::from(hunk.end));
+      let kept = start.checked_sub(self.base_at).ok_or(Refusal::OutOfOrder {
+        start,
+        previous_end: self.base_at,
+      })?;
+      let written_start = self.made.saturating_add(kept);
+      let written_end = written_start.saturating_add(to_u64(hunk.data.len()));
+      self.made = written_end;
+      self.base_at = end;
+      self.delta_at = self
+        .delta_at
+        .saturating_add(HUNK_HEADER_LEN)
+        .saturating_add(hunk.data.len());
+      self.current = Some((
+        written_start,
+        written_end.max(written_start.saturating_add(1)),
+      ));
+    }
   }
 }
 
@@ -493,19 +551,23 @@ mod tests {
     encode_lines, hunks, patched_len,
   };
 
-  /// The text `delta` makes of `base` by [`Patching`], `most` bytes a fill, and the longest fill.
-  fn patched_by_fills(base: &[u8], delta: &[u8], most: usize) -> Result<(Vec<u8>, usize), Refusal> {
+  /// The text `delta` makes of `base` by [`Patching`], `most` bytes a fill, or its refusal; and the longest fill. A slice
+  /// holds every byte, so a base read that stops fails the test.
+  fn patched_by_fills(base: &[u8], delta: &[u8], most: usize) -> (Result<Vec<u8>, Refusal>, usize) {
     let mut patching = Patching::default();
     let mut out = Vec::new();
     let mut longest = 0usize;
     let mut reader: &[u8] = base;
     loop {
       let before = out.len();
-      let filled = patching.fill((delta, &mut reader as &mut dyn BaseRead), most, &mut out)?;
+      let filled = match patching.fill((delta, &mut reader as &mut dyn BaseRead), most, &mut out) {
+        Ok(filled) => filled,
+        Err(refusal) => return (Err(refusal), longest),
+      };
       longest = longest.max(out.len().saturating_sub(before));
       match filled {
         Filled::More => {}
-        Filled::Done => return Ok((out, longest)),
+        Filled::Done => return (Ok(out), longest),
         Filled::Unread { at } => panic!("a slice holds every byte: unread at {at}"),
       }
     }
@@ -550,8 +612,8 @@ mod tests {
     for delta in &deltas {
       let expected = apply(&base, delta, &mut crate::Admission::new(u64::MAX)).unwrap();
       for most in [1usize, 3, 64, 1 << 20] {
-        let (made, longest) = patched_by_fills(&base, delta, most).unwrap();
-        assert_eq!(made, expected, "a fill of {most}");
+        let (made, longest) = patched_by_fills(&base, delta, most);
+        assert_eq!(made.unwrap(), expected, "a fill of {most}");
         assert!(longest <= most, "a fill of {most} made {longest}");
       }
     }
@@ -586,7 +648,7 @@ mod tests {
     .unwrap();
     for delta in [&out_of_order, &past] {
       assert_eq!(
-        patched_by_fills(&base, delta, 7).err(),
+        patched_by_fills(&base, delta, 7).0.err(),
         apply(&base, delta, &mut crate::Admission::new(u64::MAX)).err()
       );
     }

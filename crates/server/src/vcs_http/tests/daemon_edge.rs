@@ -5571,7 +5571,9 @@ fn landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a
   );
   let imported_clone = hg_getbundle_over(edge, &imported, (&null, &imported_heads));
   let line_clone = hg_getbundle_over(edge, &pushed, (&null, &before));
+  let clone_before = clone_reads(&daemon);
   let whole_clone = hg_getbundle_over(edge, &pushed, (&null, &tip));
+  let clone_read = clone_reads(&daemon);
   let whole_before = counted_on(
     &daemon,
     REPOSITORY,
@@ -5655,6 +5657,40 @@ fn landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a
   assert!(
     pulled_logs > 0,
     "the pull read its changeset's and manifests' texts whole from the store"
+  );
+  assert_clone_reads_its_texts_in_batches(clone_before, clone_read);
+}
+
+/// What a daemon's fetches have read of the changeset store so far: the changelog's and manifests' texts read whole
+/// (`vcs_store.hg_pull_log_texts`) and the store's asks (`vcs_store.hg_stream_store_asks`).
+fn clone_reads(daemon: &crate::daemon::Daemon) -> (u64, u64) {
+  (
+    counted_on(
+      daemon,
+      REPOSITORY,
+      crate::vcs_store::hg_view::PULL_LOG_TEXTS,
+    ),
+    counted_on(daemon, REPOSITORY, crate::vcs_store::hg_view::STORE_ASKS),
+  )
+}
+
+/// Goal 93 (main's interop bench at ed71ac0be: `hg clone` of the 57k history after P5 ran 13.5 minutes, stock's 42.4 s;
+/// the daemon's sample a store scan a text). A clone of the whole line, its changelog's and manifests' texts let go,
+/// reads each of the line's changesets and manifests once, and asks the store in batches: a want of rows and one of texts
+/// (a file's, its chunks) for each of the changelog, the manifests and the files, within the fetch's room. Red before:
+/// 30 asks, a want of a row and one of its text for every changeset and manifest.
+fn assert_clone_reads_its_texts_in_batches(before: (u64, u64), after: (u64, u64)) {
+  let texts = after.0.saturating_sub(before.0);
+  let asks = after.1.saturating_sub(before.1);
+  println!("a clone of {LET_GO_LINE} changesets read {texts} log texts in {asks} store asks");
+  assert_eq!(
+    texts,
+    2 * u64::try_from(LET_GO_LINE).unwrap(),
+    "each changeset's and manifest's text read once"
+  );
+  assert!(
+    asks <= 6,
+    "a clone asked the store {asks} times for {texts} texts: a batch of rows and of texts a log"
   );
 }
 
