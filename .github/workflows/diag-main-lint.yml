@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 37 (main 01a20182, 2026-11-24 22:26 PST): main at 040a3a69b, w-shared's A-912 (d44be7d64, b97c77c37) and w-git's write-path
+# let-go (a64f385b1), landed after run 36.
 # Run 36 (main 01a20182, 2026-11-24 22:18 PST): main at 5a773a49a, w-svn's crash-test evidence (ac3bf0650) and w-hg's (B') manifest
 # rule with the brought-back base let-go (b47217878), landed after run 35.
 # Run 35 (main 01a20182, 2026-11-24 21:53 PST): main past 2a5095c04 with w-perf's BENCHMARKS (f72985f75), w-svn's first-checkpoint
