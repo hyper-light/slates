@@ -1494,6 +1494,25 @@
 >   by the heads it began over (`TagsRead::same_heads`). Held by
 >   `a_branch_from_a_tag_whose_heads_manifests_were_let_go_reads_them_once_and_is_made` (red: refused
 >   `ContentUnavailable`).
+> Found and closed (main's orders of 2026-11-24 10:18, 14:26 and 14:32; w-git's written OK of 14:57): a push of a
+> history with many heads spun its landing's one step. Each head is a line green of its own, and the step made,
+> secured, judged, held and committed every new green: a 4,067-changeset history with 452 heads held shard 0 for 3,553
+> ms of CPU (debug, the daemon ended by its watchdog); 152 heads took 1.89 s. A new green is no reader's until its record
+> lands, so each create is now made by one function (`push::prepare_create`) a slice at a time before the step, under
+> the repository's landing turn (`hg_push::land_sliced`, `push::PreparedCreates`, w-svn's loop; counted
+> `repository.push.create_slices`): its id minted once and reserved (`ShardState::family_reserved_through`, every family
+> id minted through `verbs::fresh_family_id_at`), its retention charged to the push's room before the first slice
+> (refused `BudgetExceeded` past it), its chain entry encoded with it; the step takes each by name (misses counted,
+> `repository.push.create_misses`), and what it does not take is given back. git's pushes make their creates by the same
+> function within the step. After (debug): 152 heads, the step 166 ms, 151 slices of at most 23 ms; 452 heads, the step
+> 567 ms, 451 slices of at most 123 ms, the push accepted. Held by
+> `t_goal93_a_push_of_many_heads_lands_its_new_lines_outside_its_landing_step` (red: the step did 64 greens' works, now
+> 1), `creates_made_ahead_of_a_landing_and_not_taken_are_given_back` and
+> `creates_past_their_pushs_room_are_refused_before_any_is_made`. Owed: (1) a push that moves hundreds of existing heads
+> still does their works in the one step (an update's green is a reader's, so it is not made ahead); (2) the step's
+> record carries every new green's chain entry, so its write grows with heads times tree (377 ms of the 452-head step,
+> debug); (3) a slice makes one green whole, its tree's work (123 ms at 452 heads, debug); (4) git's pushes (git/git's
+> 1,027 refs) take the same slices once their driver hands its creates in (w-git's piece).
 > Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
 > restart, `Unheld { 00manifest, rev }` (r915, Mercurial's own 57k history, rev 4222; here its first 5,000, rev 4281),
 > so the edge answered 503. The row named the empty window (a manifest whose text is its parent's, kept as an empty
@@ -1694,12 +1713,14 @@
 > FIXED by w-shared's A-902 (d48863ddb: the put carries the sender's configuration version, and a home behind it waits
 > for its own install within the put's budget).
 >
-> A git push of many new refs makes every new green in its landing's one step, OWED (w-git, 2026-11-24, main's order of
-> 15:06): git/git's whole history creates about 1,027 refs, mostly tags, each a Create whose make, secure, judge, hold
-> and commit run in the step that appends the entry, the cost w-hg measured for Mercurial's heads (452 heads held a
-> shard 3.5 s, watchdog exit). The way is w-hg's prepared-creates seam in `repository/push.rs` (agreed in writing
-> 2026-11-24: `prepare_create`, `PreparedCreates` handed to `push_planned`, prepared in slices under the landing turn
-> before the step, ids reserved ahead): git's driver hands its Creates in as Mercurial's does, once that lands.
+> A git push of many new refs makes every new green in its landing's one step, TO MEASURE (w-git, 2026-11-24, main's
+> order of 15:06; corrected the same day): git/git's whole history creates about 1,027 refs, mostly tags. A git create
+> is P2's deferred one (`BranchChange::CreateDeferred`, planned as `Step::Create { work: None, deferred: Some(push) }`),
+> so in the step it is only made (`Greens::branch`, a green at a version by identity, no walk) and owes its push
+> (`Greens::defer`): none of the secure, judge, hold and commit that cost Mercurial's heads 3.5 s for 452 (w-hg). Whether
+> 1,027 makes and defers hold a step past its quantum is unmeasured: `repository.push.landing_step_works_most` and the
+> landing step's time in a git leg's push of git/git decide it. If they do, w-hg's prepared-creates seam
+> (`repository/push.rs`, `PreparedCreates`, landed fda5613a1) is the way, its plan taught deferred creates too.
 >
 > One push's reading spread over several shards, NOT IN THE DESIGN (for Ada; w-git, 2026-11-24, main's order of 09:50):
 > stock git's `index-pack` resolves one pack's deltas over threads; slates reads one push on one shard. §4.17.1 item 2
