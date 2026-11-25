@@ -1919,7 +1919,13 @@
 > shown by `the_owners_text_cache_is_seen_by_its_asker_and_a_read_left_partway_holds_its_bound`: a read left part-way
 > stays a walk in flight and holds the bound (3 reads of 300 KB left: 3 walks, 921,600 bytes walked, bound 2 MiB) until
 > it ends or more walks than the owner's room evict it. OWED: main's next 57k run reads the gauges; if the walks hold
-> the 32 MB, a walk left part-way is let go by a rule main rules on. The batch itself was sized by the fetch's room
+> the 32 MB, a walk left part-way is ended by its reader's handle as it drops (main's ruling (b)). The clone's scans of
+> the store's rows (hg's 57k at 35b155312: 2.08 GB of 3.72, `reserve` under mantle's `scan_inner`, 55.8%) laid each page
+> in buffers their caller made afresh, and an ask by tool id kept a set of the asks, a map of the found and two copies
+> of each row's id: the store now keeps one scan's buffers (`Store::scan_rows`), and the ask writes each version into
+> its answer as a page's rows pass its sorted asks, no map and no copy; mantle itself unchanged, its scan reusing
+> what its caller lends (`an_ask_by_tool_id_scans_into_the_stores_own_buffers`: an ask of 2,000 versions allocated
+> 1,406,209 bytes, 5.2 times its answer; now 305,865, the answer's 272,000 and its order). The batch itself was sized by the fetch's room
 > (`LogTexts::ask_batch`, gigabytes at 57k) and copied text by text on the owner: the status's other 5.25 GB is the
 > system allocator's, reserved and not in use (5.41 GB reserved, 157 MB in use), and an in-process clone of 2,000
 > changesets peaked at 111.6 MB of live heap, 83% the batch's copies (`crates/server/tests/hg_fetch_heap.rs`). Cut
