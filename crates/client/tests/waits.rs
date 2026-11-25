@@ -302,3 +302,8 @@ fn a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once() {
   );
   gone_at_once(|| sending.list(), "a send on a full ring");
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

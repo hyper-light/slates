@@ -332,7 +332,10 @@ pub(crate) async fn sweep_departed() {
     if state.shard != control {
       return None;
     }
-    Some((control, state.shards.clone(), departed_anchors(state)))
+    let gone = departed_anchors(state);
+    // A departed member's edges go with it (A-925).
+    state.edges.retain(|anchor| !gone.contains(&anchor.0));
+    Some((control, state.shards.clone(), gone))
   })
   .flatten() else {
     return;

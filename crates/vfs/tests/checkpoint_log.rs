@@ -86,7 +86,12 @@ fn a_checkpoint_and_its_deltas_recover_the_full_image() {
     journal
       .append(&mut log, &delta_of(&mut vol, &store), &mut Vec::new())
       .unwrap();
-    let (recovered, resumed) = Journal::recover(&checkpoints, &log).unwrap();
+    let (recovered, resumed) = Journal::recover(
+      &checkpoints,
+      &log,
+      slates_vfs::checkpoint_log::WrittenExtents::whole_of(&checkpoints, &log),
+    )
+    .unwrap();
     assert_eq!(recovered, Some(full(&vol, &store)), "after change {at}");
     assert_eq!(resumed.generation(), journal.generation());
   }
@@ -148,7 +153,12 @@ fn a_delta_torn_at_any_byte_recovers_the_state_before_or_after_it() {
       budget,
     };
     let _ = journal.clone().append(&mut torn, &delta, &mut Vec::new());
-    let (recovered, _) = Journal::recover(&checkpoints, &memory).unwrap();
+    let (recovered, _) = Journal::recover(
+      &checkpoints,
+      &memory,
+      slates_vfs::checkpoint_log::WrittenExtents::whole_of(&checkpoints, &memory),
+    )
+    .unwrap();
     let recovered = recovered.unwrap();
     if recovered == after {
       afters += 1;
@@ -191,7 +201,12 @@ fn frames_from_before_a_checkpoint_are_never_replayed_over_it() {
   journal
     .append(&mut log, &delta_of(&mut vol, &store), &mut Vec::new())
     .unwrap();
-  let (recovered, _) = Journal::recover(&checkpoints, &log).unwrap();
+  let (recovered, _) = Journal::recover(
+    &checkpoints,
+    &log,
+    slates_vfs::checkpoint_log::WrittenExtents::whole_of(&checkpoints, &log),
+  )
+  .unwrap();
   assert_eq!(recovered, Some(full(&vol, &store)));
 }
 
@@ -226,7 +241,12 @@ fn a_full_log_refuses_and_a_checkpoint_follows() {
     }
   }
   assert!(refused, "the small log filled");
-  let (recovered, _) = Journal::recover(&checkpoints, &log).unwrap();
+  let (recovered, _) = Journal::recover(
+    &checkpoints,
+    &log,
+    slates_vfs::checkpoint_log::WrittenExtents::whole_of(&checkpoints, &log),
+  )
+  .unwrap();
   assert_eq!(recovered, Some(full(&vol, &store)));
 }
 
@@ -392,8 +412,18 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
   by_value
     .append(&mut by_value_log, &value, &mut Vec::new())
     .unwrap();
-  let (recovered, _) = Journal::recover(&checkpoints, &log).unwrap();
-  let (expected, _) = Journal::recover(&checkpoints, &by_value_log).unwrap();
+  let (recovered, _) = Journal::recover(
+    &checkpoints,
+    &log,
+    slates_vfs::checkpoint_log::WrittenExtents::whole_of(&checkpoints, &log),
+  )
+  .unwrap();
+  let (expected, _) = Journal::recover(
+    &checkpoints,
+    &by_value_log,
+    slates_vfs::checkpoint_log::WrittenExtents::whole_of(&checkpoints, &by_value_log),
+  )
+  .unwrap();
   assert_eq!(recovered, expected, "what logging the value recovers");
   let recovered = recovered.unwrap();
   let keys: Vec<[u8; 16]> = recovered.volumes.iter().map(|keyed| keyed.key).collect();
@@ -610,8 +640,9 @@ proptest::proptest! {
     ..proptest::prelude::ProptestConfig::default()
   }))]
 
-  /// A-117, A-226 and A-270, the oracle: do run a generated history of checkpoints, appended deltas, held pieces put and
-  /// removed, give-backs and restarts over memories that record each byte written; expect after every step that the
+  /// A-117, A-226, A-270 and A-926, the oracle: do run a generated history of checkpoints, appended deltas, held pieces put
+  /// and removed, give-backs and restarts over memories that record each byte written, each restart over the extents its
+  /// predecessor's marks carry; expect after every step that the
   /// dead ranges name every written byte no restart reads, lie inside what no restart reads and end at the last such
   /// write, that every byte written since its last give-back lies inside the journal's written ranges (A-744's split),
   /// and that a restart recovers the volume's full image and the model's held pieces whatever was given back.
@@ -637,7 +668,8 @@ proptest::proptest! {
     let mut store = store();
     let mut vol = seeded(&mut store);
     let (mut checkpoints, mut log) = (Recorded::new(ORACLE_MEMORY), Recorded::new(ORACLE_MEMORY));
-    let mut journal = Journal::default();
+    // Memories a predecessor may have written whole, as an image before A-926 leaves them.
+    let mut journal = Journal::over(slates_vfs::checkpoint_log::WrittenExtents::whole(ORACLE_MEMORY, ORACLE_MEMORY));
     let mut held = std::collections::BTreeMap::new();
     journal.checkpoint(&mut checkpoints, &full_with(&vol, &store, &held)).unwrap();
     vol.mark_published(&store);
@@ -705,15 +737,16 @@ proptest::proptest! {
           }
         }
         JournalStep::Restart => {
-          let (image, recovered) = Journal::recover(&checkpoints, &log).unwrap();
+          // The successor opens over the extents its predecessor's marks carry (A-926): what it knows of the memories is
+          // what the predecessor knew, never less.
+          let (image, recovered) = Journal::recover(&checkpoints, &log, journal.written()).unwrap();
           proptest::prop_assert!(image.unwrap() == full_with(&vol, &store, &held), "the restart recovered the full image");
           journal = recovered;
-          unknown = Unknown::all(slot_offsets);
         }
       }
       check_dead_ranges(&journal, &checkpoints, &log, tail, &unknown);
       check_written_ranges(&journal, &checkpoints, &log);
-      let (image, _) = Journal::recover(&checkpoints, &log).unwrap();
+      let (image, _) = Journal::recover(&checkpoints, &log, slates_vfs::checkpoint_log::WrittenExtents::whole_of(&checkpoints, &log)).unwrap();
       proptest::prop_assert!(
         image.unwrap() == full_with(&vol, &store, &held),
         "step {at} ({step:?}): a restart recovers the full image, its held pieces with it"
@@ -775,7 +808,12 @@ fn a_delta_of_another_version_is_refused_not_read_as_torn() {
   let body = with_version(delta_of(&mut vol, &store).to_bytes(), older);
   journal.append_encoded(&mut log, &body).unwrap();
   assert_eq!(
-    Journal::recover(&checkpoints, &log).map(|_| ()),
+    Journal::recover(
+      &checkpoints,
+      &log,
+      slates_vfs::checkpoint_log::WrittenExtents::whole_of(&checkpoints, &log)
+    )
+    .map(|_| ()),
     Err(slates_vfs::VfsError::RecoveryVersion {
       found: older,
       expected: slates_vfs::checkpoint_log::DELTA_VERSION,
@@ -859,7 +897,12 @@ fn a_crash_at_every_byte_of_a_held_delta_recovers_the_old_pieces_or_the_new() {
         log[*earlier..*earlier + earlier_bytes.len()].copy_from_slice(earlier_bytes);
       }
       log[*offset..*offset + kept].copy_from_slice(&bytes[..kept]);
-      let (image, _) = Journal::recover(&checkpoints, &log).unwrap();
+      let (image, _) = Journal::recover(
+        &checkpoints,
+        &log,
+        slates_vfs::checkpoint_log::WrittenExtents::whole_of(&checkpoints, &log),
+      )
+      .unwrap();
       let held = image.unwrap().held;
       let whole = index == last && kept == bytes.len();
       assert_eq!(
@@ -984,7 +1027,12 @@ fn a_volumes_committed_record_is_what_a_recovery_rebuilds_for_it() {
       &mut Vec::new(),
     )
     .unwrap();
-  let (recovered, _) = Journal::recover(&checkpoints, &log).unwrap();
+  let (recovered, _) = Journal::recover(
+    &checkpoints,
+    &log,
+    slates_vfs::checkpoint_log::WrittenExtents::whole_of(&checkpoints, &log),
+  )
+  .unwrap();
   let recovered = recovered.unwrap();
   for key in &CARRIED_KEYS {
     let rebuilt = recovered

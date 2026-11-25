@@ -2174,6 +2174,25 @@ struct Resolved {
 }
 
 impl Resolved {
+  /// The resolution's end once every op is resolved ([`Green::resolve_some`]): each IPC node made at a path the work
+  /// also does anything else at is invalid, and the copies split from what lands in their trees.
+  fn finish_resolving(&mut self) {
+    for path in self.specials.keys() {
+      if self.creates.contains(path)
+        || self.content.contains_key(path)
+        || self.mkdirs.contains(path)
+        || self.symlinks.contains_key(path)
+        || self.hardlinks.contains_key(path)
+        || self.renames.contains_key(path)
+        || self.unlinks.contains(path)
+        || self.rmdirs.contains(path)
+      {
+        self.invalid.insert(path.clone());
+      }
+    }
+    self.split_copies();
+  }
+
   /// The paths this increment removes (unlinks, rmdirs and rename sources) — a directory removal's
   /// emptiness check consults this so a directory emptied within the same increment is removable.
   fn cleared(&self) -> BTreeSet<String> {
@@ -2378,6 +2397,12 @@ struct CommitRun {
   staged: Staged,
   delta: BTreeMap<String, Vec<Op>>,
   changed: BTreeSet<String>,
+  /// The hard links naming a changed path that was a special, found so far: changed with it (A-920 piece 1b).
+  links: Vec<String>,
+  /// The last changed path whose links were found.
+  links_after: Option<String>,
+  /// The version's change entries recorded so far, in path order.
+  entries: Vec<ChangeEntry>,
   phase: CommitPhase,
 }
 
@@ -2390,6 +2415,12 @@ enum CommitPhase {
   Removed,
   /// Setting the files staged with new bytes.
   Set,
+  /// Dropping the metadata of each path emptied where nothing stands there now.
+  Emptied,
+  /// Finding the hard links naming each changed path that was a special.
+  Links,
+  /// Recording each changed path in the change index.
+  Changes,
   /// Ended.
   Ended,
 }
@@ -4687,9 +4718,34 @@ impl Green {
   /// Resolves an increment's ops document into per-dimension groups by path.
   fn resolve(inc: &Increment) -> Resolved {
     let mut r = Resolved::default();
+    let mut at = 0;
+    while !Green::resolve_some(inc, (&mut r, &mut at), &mut || false) {}
+    r.finish_resolving();
+    r
+  }
+
+  /// [`Green::resolve`]'s walk of the ops from `at`, an op at least, until `spent`: whether every op is resolved into
+  /// `r`, which [`Resolved::finish_resolving`] then finishes (A-920 piece 3c).
+  fn resolve_some(
+    inc: &Increment,
+    (r, at): (&mut Resolved, &mut usize),
+    spent: &mut dyn FnMut() -> bool,
+  ) -> bool {
+    while let Some(op) = inc.doc.ops.get(*at) {
+      Green::resolve_op(inc, r, op);
+      *at = at.saturating_add(1);
+      if *at < inc.doc.ops.len() && spent() {
+        return false;
+      }
+    }
+    true
+  }
+
+  /// One op of [`Green::resolve`]'s walk, resolved into `r` by its dimension and path.
+  fn resolve_op(inc: &Increment, r: &mut Resolved, op: &Op) {
     // Resolve a path-table reference (a 64-bit index, A-621) to its name; an index the table does not hold names nothing.
     let name = |index: u64| inc.doc.paths.path(index).unwrap_or_default().to_owned();
-    for op in &inc.doc.ops {
+    {
       let path = name(op.path);
       match op.kind {
         _ if is_content(op.kind) => r.content.entry(path).or_default().push(*op),
@@ -4748,21 +4804,6 @@ impl Green {
         }
       }
     }
-    for path in r.specials.keys() {
-      if r.creates.contains(path)
-        || r.content.contains_key(path)
-        || r.mkdirs.contains(path)
-        || r.symlinks.contains_key(path)
-        || r.hardlinks.contains_key(path)
-        || r.renames.contains_key(path)
-        || r.unlinks.contains(path)
-        || r.rmdirs.contains(path)
-      {
-        r.invalid.insert(path.clone());
-      }
-    }
-    r.split_copies();
-    r
   }
 
   /// Whether any file, directory, symlink or hard link under `prefix` survives `cleared`: each map's keys under the
@@ -5530,46 +5571,6 @@ impl Green {
     position::verdict(units.into_units().0)
   }
 
-  /// Decides every dimension of an increment unit by unit into `units` (A-658, `position`): each unit one verdict
-  /// function over its own paths, in the order the whole verdict pushes its effects and windows, so the verdict reached
-  /// at one head is reached at a later one by judging again only the units the versions since changed.
-  fn decide_units(&self, inc: &Increment, r: &Resolved, units: &mut position::Units) {
-    // What the work and its base decide: an operation no verdict applies, an edit that does not fit what it edits. The
-    // head decides one thing of it, the file an edit declared at a link edits when the work hands that file's node on to
-    // the link (A-669), which turns only with the links naming the files the work removes or replaces.
-    let leaving: Vec<&str> = r
-      .unlinks
-      .iter()
-      .chain(r.renames.keys())
-      .map(String::as_str)
-      .collect();
-    units.unit(position::Footprint::links_naming(&leaving), |_| {
-      position::Unit::windows(
-        r.invalid
-          .iter()
-          .chain(self.unfit_content(inc, r).iter())
-          .map(|path| Green::window(path, MergeConflictClass::TypeChanged))
-          .collect(),
-      )
-    });
-    // Copies first, and what lands on their trees after them (A-586): their effects lead, as commit applies them.
-    if !r.copies.is_empty() {
-      units.copies(|| self.decide_copy_unit(inc, r));
-    }
-    for (path, node) in &r.specials {
-      units.unit(position::Footprint::path(path), |_| {
-        position::Unit::of(self.merge_special(path, inc.base, *node))
-      });
-    }
-    // The paths the increment removes itself: a rename over a file and a directory's removal read
-    // them.
-    let cleared = r.cleared();
-    self.decide_content(inc, (r, &cleared), units);
-    self.decide_directories((inc.base, r, &cleared), units);
-    self.decide_metadata(inc, r, units);
-    self.decide_node_exclusive(inc, units);
-  }
-
   /// A work's copies and what it does in their trees, one unit (A-586, A-626; `position`): the copied ops that do not
   /// fit what a copy brings, then each copy's verdict, then the copied ops'.
   fn decide_copy_unit(&self, inc: &Increment, r: &Resolved) -> position::Unit {
@@ -5587,161 +5588,12 @@ impl Green {
     unit
   }
 
-  /// The node-exclusive rule (§4.17.4 item 3, rules 1 and 2; A-542): a path an operation marked node-exclusive changes,
-  /// a move's source among them, that changed in any dimension after the increment's base is a conflict, however
-  /// disjoint the bytes and however identical the change, as FSFS's commit-time merge judges a node (`tree.c`
-  /// `merge()`: a file changed on both sides fails, "even an identical replacement", and two additions are "not
-  /// auto-mergeable"). The dimension verdicts have run and added their own windows; this pass refuses only what they
-  /// would accept. Each path is one lookup of its last change in the change index (`latest_change`), and is judged once,
-  /// a unit of its own.
-  fn decide_node_exclusive(&self, inc: &Increment, units: &mut position::Units) {
-    let mut judged: BTreeSet<&str> = BTreeSet::new();
-    for op in inc.doc.ops.iter().filter(|op| op.is_node_exclusive()) {
-      for (index, class) in node_exclusive_paths(op) {
-        let Some(path) = inc.doc.paths.path(index) else {
-          continue;
-        };
-        if judged.insert(path) {
-          units.unit(position::Footprint::path(path), |_| {
-            let changed = self.changed_after(path, inc.base);
-            position::Unit::windows(
-              changed
-                .then(|| Green::window(path, class))
-                .into_iter()
-                .collect(),
-            )
-          });
-        }
-      }
-    }
-  }
-
   /// Whether `path` changed in any dimension after version `base`: its last change in the change index, or the latest
   /// copy above it (A-586), is past it.
   fn changed_after(&self, path: &str, base: u64) -> bool {
     #[cfg(test)]
     scan_tests::count_examined();
     self.changed_last(self.latest_change.get(path), path) > base
-  }
-
-  /// The content dimension, a unit each: the writes a node takes to the link it passes to ([`Green::decide_handed`],
-  /// A-669); then renames, creates and unlinks ([`Green::decide_moves`]), so a rename refilling the node's old home is
-  /// restated after the writes handed on; then edits.
-  fn decide_content(
-    &self,
-    inc: &Increment,
-    (r, cleared): (&Resolved, &BTreeSet<String>),
-    units: &mut position::Units,
-  ) {
-    let homes = self.decide_handed(inc, (r, cleared), units);
-    self.decide_moves(inc, (r, cleared, &homes), units);
-    for (path, ops) in &r.content {
-      if r.creates.contains(path) || r.renames.contains_key(path) {
-        continue; // content of a created or renamed-into file is handled with that effect
-      }
-      units.unit(position::Footprint::path(path), |placed| {
-        // A link's writes go with the node handed on to it (`decide_handed`); only a change at the link turns that.
-        if self.handed_home(r, path, cleared).is_some() {
-          return position::Unit::default();
-        }
-        self.merge_content(inc, path, (ops, placed))
-      });
-    }
-  }
-
-  /// The writes a node takes to the link it passes to (A-669), a unit each: each link the increment declares writes at
-  /// whose node's home it removes or replaces ([`Green::handed_home`]), judged and handed on ([`Green::merge_handed`]).
-  /// Answers the homes handed on, which the removals read ([`Green::decide_moves`]); the content's unit for each such
-  /// link is empty. Whether a link stands at a path the work writes is the head's, while which units there are is the
-  /// work's alone (A-658, `position`), so a work that removes or replaces a file has a unit for every path it writes and
-  /// declares nothing else of, empty where no node passes: its footprint is the path, and the home its node passes from
-  /// when one does.
-  fn decide_handed(
-    &self,
-    inc: &Increment,
-    (r, cleared): (&Resolved, &BTreeSet<String>),
-    units: &mut position::Units,
-  ) -> BTreeSet<&str> {
-    let mut homes = BTreeSet::new();
-    if r.unlinks.is_empty() && r.renames.is_empty() {
-      return homes; // nothing removed or replaced: no node passes on
-    }
-    for (heir, ops) in &r.content {
-      if r.declares_more_than_writes(heir, cleared) {
-        continue;
-      }
-      let home = self.handed_home(r, heir, cleared);
-      homes.extend(home);
-      let footprint = home.map_or(position::Footprint::path(heir), |home| {
-        position::Footprint::pair(heir, home)
-      });
-      units.unit(footprint, |_| {
-        let Some(home) = home else {
-          return position::Unit::default();
-        };
-        let unlinked = r.unlinks.contains(home);
-        match self.merge_handed((heir, ops), (home, unlinked), (inc.base, inc.post())) {
-          Ok(effects) => position::Unit {
-            effects,
-            ..position::Unit::default()
-          },
-          Err(window) => position::Unit::windows(vec![window]),
-        }
-      });
-    }
-    homes
-  }
-
-  /// The content dimension's namespace, a unit each: renames, creates and unlinks. A removal, or a replacement by a
-  /// rename, of a file whose node a link the work's base never had now names is refused before it is merged, unless the
-  /// increment hands the node on itself (`homes`, [`Green::decide_handed`]): delete against modify, or rename against
-  /// rename for a replaced destination, as a change the work did not see is ([`Green::leaves_to_an_unseen_link`],
-  /// A-670). Such a unit reads the links naming its file, whose changes are recorded at the links' own names, never at
-  /// the file's, so its footprint names them (A-658, `position`).
-  fn decide_moves(
-    &self,
-    inc: &Increment,
-    (r, cleared, homes): (&Resolved, &BTreeSet<String>, &BTreeSet<&str>),
-    units: &mut position::Units,
-  ) {
-    let base = inc.base;
-    for (dst, from) in &r.renames {
-      let ops = r.content.get(dst).map(Vec::as_slice).unwrap_or(&[]);
-      let replaced = [dst.as_str()];
-      let footprint = position::Footprint::pair(dst, from).and_links_naming(&replaced);
-      units.unit(footprint, |_| {
-        let mut unit = position::Unit::default();
-        let unseen = !cleared.contains(dst) && self.leaves_to_an_unseen_link(dst, base, (r, homes));
-        let merged = if unseen {
-          Err(Green::window(dst, MergeConflictClass::RenameRename))
-        } else {
-          let source = (from.as_str(), cleared);
-          let moved = (base, inc.post());
-          self.merge_rename((dst, ops), moved, source, &mut unit.effects)
-        };
-        if let Err(window) = merged {
-          unit.windows.push(window);
-        }
-        unit
-      });
-    }
-    for path in &r.creates {
-      units.unit(position::Footprint::path(path), |_| {
-        let content = r.content.get(path).map(Vec::as_slice).unwrap_or(&[]);
-        position::Unit::of(self.merge_create(path, (content, inc.post())))
-      });
-    }
-    for path in &r.unlinks {
-      let removed = [path.as_str()];
-      let footprint = position::Footprint::path(path).and_links_naming(&removed);
-      units.unit(footprint, |_| {
-        position::Unit::of(if self.leaves_to_an_unseen_link(path, base, (r, homes)) {
-          Err(Green::window(path, MergeConflictClass::DeleteModify))
-        } else {
-          self.merge_unlink(path, base)
-        })
-      });
-    }
   }
 
   /// Whether removing or replacing the file at `path` would leave its node to a link the work never saw, without writes
@@ -5755,7 +5607,7 @@ impl Green {
     &self,
     path: &str,
     base: u64,
-    (r, homes): (&Resolved, &BTreeSet<&str>),
+    (r, homes): (&Resolved, &BTreeSet<String>),
   ) -> bool {
     self.content.contains_key(path) && !homes.contains(path) && self.links_unseen(path, base, r)
   }
@@ -5834,63 +5686,6 @@ impl Green {
       handed.push(Effect::RemoveContent(home.to_owned()));
     }
     Ok(handed)
-  }
-
-  /// The directory dimension: creation and removal (removal against the increment's own removals), a unit each.
-  fn decide_directories(
-    &self,
-    (base, r, cleared): (u64, &Resolved, &BTreeSet<String>),
-    units: &mut position::Units,
-  ) {
-    for path in &r.mkdirs {
-      units.unit(position::Footprint::path(path), |_| {
-        position::Unit::of(self.merge_mkdir(path))
-      });
-    }
-    for path in &r.rmdirs {
-      units.unit(position::Footprint::directory(path), |_| {
-        position::Unit::of(self.merge_rmdir(path, base, cleared))
-      });
-    }
-  }
-
-  /// The metadata dimensions: mode, symlink, hard link and xattrs, a unit each; a hard link's reads the node it names.
-  fn decide_metadata(&self, inc: &Increment, r: &Resolved, units: &mut position::Units) {
-    let base = inc.base;
-    for (path, mode) in &r.modes {
-      units.unit(position::Footprint::path(path), |_| {
-        position::Unit::of(self.merge_setmode(path, base, *mode, r.establishes(path)))
-      });
-    }
-    for (path, target) in &r.symlinks {
-      units.unit(position::Footprint::path(path), |_| {
-        position::Unit::of(self.merge_symlink(path, base, target))
-      });
-    }
-    for (path, target) in &r.hardlinks {
-      // The node the link names (A-646): a path at the base or one the work makes; none when the document names a
-      // node the work does not make, or links that never reach one.
-      let node = r.link_node(target);
-      let footprint = node.map_or(position::Footprint::path(path), |(home, _)| {
-        position::Footprint::pair(path, home)
-      });
-      units.unit(footprint, |_| {
-        position::Unit::of(match node {
-          Some(node) => self.merge_hardlink(path, base, node),
-          None => Err(Green::window(path, MergeConflictClass::TypeChanged)),
-        })
-      });
-    }
-    for (path, name, value) in &r.xattr_sets {
-      units.unit(position::Footprint::path(path), |_| {
-        position::Unit::of(self.merge_set_xattr(path, name, base, value, r.establishes(path)))
-      });
-    }
-    for (path, name) in &r.xattr_removes {
-      units.unit(position::Footprint::path(path), |_| {
-        position::Unit::of(self.merge_remove_xattr(path, name, base, r.establishes(path)))
-      });
-    }
   }
 
   /// Keep the superseded IPC value for pinned readers before setting the new value.
@@ -6101,6 +5896,9 @@ impl Green {
       staged: Staged::default(),
       delta: BTreeMap::new(),
       changed,
+      links: Vec::new(),
+      links_after: None,
+      entries: Vec::new(),
       phase: CommitPhase::Effects,
     }
   }
@@ -6141,10 +5939,18 @@ impl Green {
         CommitPhase::Set => match run.staged.set.pop() {
           Some(file) => self.set_file(file, run.version, &mut run.delta),
           None => {
-            self.commit_finish(run);
-            return true;
+            // The paths emptied in the order they were staged.
+            run.staged.emptied.reverse();
+            run.phase = CommitPhase::Emptied;
           }
         },
+        CommitPhase::Emptied => self.emptied_one(run),
+        CommitPhase::Links => self.links_one(run),
+        CommitPhase::Changes => {
+          if self.change_one(run) {
+            return true;
+          }
+        }
         CommitPhase::Ended => return true,
       }
       if spent() {
@@ -6153,22 +5959,81 @@ impl Green {
     }
   }
 
-  /// A commit's end: each path emptied takes its metadata with it once nothing stands there, then its delta and changes
-  /// are recorded.
-  fn commit_finish(&mut self, run: &mut CommitRun) {
-    // A file, a directory or a link this version removed takes its mode and attributes with it once nothing stands at
-    // its path (a rename or a file made again in the same version keeps them), as a special's do: they are the inode's,
-    // so a path made again later starts without them (A-618; a file a client deleted and pushed again kept the deleted
-    // one's mode 0755).
-    let version = run.version;
-    for path in core::mem::take(&mut run.staged.emptied) {
-      if !self.holds(&path) {
-        self.drop_metadata(&path, version);
+  /// A commit's end, a unit a step (A-920 piece 1b: 6.6 ms whole at 9,000 files, debug): a path emptied takes its mode
+  /// and attributes with it once nothing stands there. A file, a directory or a link this version removed takes them
+  /// once nothing stands at its path (a rename or a file made again in the same version keeps them), as a special's do:
+  /// they are the inode's, so a path made again later starts without them (A-618; a file a client deleted and pushed
+  /// again kept the deleted one's mode 0755). Once every one is, the version's delta is kept and its changes recorded.
+  fn emptied_one(&mut self, run: &mut CommitRun) {
+    match run.staged.emptied.pop() {
+      Some(path) => {
+        if !self.holds(&path) {
+          self.drop_metadata(&path, run.version);
+        }
+      }
+      None => {
+        self.deltas.push(core::mem::take(&mut run.delta));
+        run.phase = CommitPhase::Links;
       }
     }
-    self.deltas.push(core::mem::take(&mut run.delta));
-    self.record_changes(version, core::mem::take(&mut run.changed));
-    run.phase = CommitPhase::Ended;
+  }
+
+  /// The hard links naming the next changed path where it was a special, a path a unit: changed with it. Once every
+  /// changed path is looked at, they join the changed paths, and their recording begins.
+  fn links_one(&mut self, run: &mut CommitRun) {
+    let after = run.links_after.as_deref();
+    let bounds = (
+      after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+      std::ops::Bound::Unbounded,
+    );
+    let Some(path) = run.changed.range::<str, _>(bounds).next() else {
+      run.changed.extend(core::mem::take(&mut run.links));
+      run.phase = CommitPhase::Changes;
+      return;
+    };
+    if self.was_special(path) {
+      run
+        .links
+        .extend(self.links_to.get(path).into_iter().flatten().cloned());
+    }
+    run.links_after = Some(path.clone());
+  }
+
+  /// The next changed path recorded as changed at the commit's version, a path a unit: the path's last change, its
+  /// earlier version's entry no longer the last, its bytes charged. Once every one is, the version's list kept (none
+  /// for a version that changed nothing): whether the commit ended.
+  fn change_one(&mut self, run: &mut CommitRun) -> bool {
+    let version = run.version;
+    let Some(path) = run.changed.pop_first() else {
+      if !run.entries.is_empty() {
+        self
+          .changes
+          .insert(version, core::mem::take(&mut run.entries));
+      }
+      run.phase = CommitPhase::Ended;
+      return true;
+    };
+    let bytes = change_bytes(&path);
+    match self.latest_change.insert(path.clone(), version) {
+      None => self.changes_bytes = self.changes_bytes.saturating_add(bytes),
+      // The earlier version's entry is no longer the path's last: a seek in that version's sorted list.
+      Some(earlier) => {
+        if let Some(entries) = self.changes.get_mut(&earlier)
+          && let Ok(at) = entries.binary_search_by(|entry| entry.path.as_str().cmp(&path))
+          && let Some(entry) = entries.get_mut(at)
+        {
+          entry.last = false;
+        }
+      }
+    }
+    self.changes_bytes = self.changes_bytes.saturating_add(bytes);
+    let index = u32::try_from(run.entries.len()).unwrap_or(u32::MAX);
+    run.entries.push(ChangeEntry {
+      index,
+      path,
+      last: true,
+    });
+    false
   }
 
   /// The effects a version's node moves add to it (A-646: a hard link names its node, never a
@@ -6502,40 +6367,6 @@ impl Green {
       || self.hardlinks.contains_key(path)
   }
 
-  /// Records what version `version` changed in the change index (`changes`): every path an effect changed, and every
-  /// hard link naming one of them that is or was a special, as [`Green::changed_between`] counts a link changed with
-  /// the special it names. The cost of the version's own changes and their links.
-  fn record_changes(&mut self, version: u64, mut changed: BTreeSet<String>) {
-    let links: Vec<String> = changed
-      .iter()
-      .filter(|path| self.was_special(path))
-      .filter_map(|path| self.links_to.get(path))
-      .flatten()
-      .cloned()
-      .collect();
-    changed.extend(links);
-    if changed.is_empty() {
-      return;
-    }
-    for path in &changed {
-      let bytes = change_bytes(path);
-      match self.latest_change.insert(path.clone(), version) {
-        None => self.changes_bytes = self.changes_bytes.saturating_add(bytes),
-        // The earlier version's entry is no longer the path's last: a seek in that version's sorted list.
-        Some(earlier) => {
-          if let Some(entries) = self.changes.get_mut(&earlier)
-            && let Ok(at) = entries.binary_search_by(|entry| entry.path.as_str().cmp(path))
-            && let Some(entry) = entries.get_mut(at)
-          {
-            entry.last = false;
-          }
-        }
-      }
-      self.changes_bytes = self.changes_bytes.saturating_add(bytes);
-    }
-    self.changes.insert(version, numbered(changed));
-  }
-
   /// Each path's last change after the origin in any dimension, read off the histories' last entries.
   fn last_changes_after_origin(&self) -> BTreeMap<String, u64> {
     let mut last: BTreeMap<String, u64> = BTreeMap::new();
@@ -6818,52 +6649,12 @@ impl Green {
   /// A verdict that reads a file held by its object's name alone with no bytes lent it (A-760 (b) 4d, `crate::unlent`)
   /// is refused [`ComputeRefused::ContentUnread`] naming one such object; [`Green::unlent_reads`] names them all.
   pub fn compute(&self, inc: &Increment) -> Result<Computed, ComputeRefused> {
-    let (computed, unlent) = crate::unlent::scope(|| self.compute_read(inc));
-    match unlent.first() {
-      Some(identity) => Err(ComputeRefused::ContentUnread {
-        identity: *identity,
-      }),
-      None => computed,
+    let mut computing = self.begin_computing(inc);
+    loop {
+      if let Some(computed) = self.computing_step(inc, &mut computing, &mut || false) {
+        return computed;
+      }
     }
-  }
-
-  /// [`Green::compute`], its reads of unlent named blocks noted rather than refused (`crate::unlent`).
-  fn compute_read(&self, inc: &Increment) -> Result<Computed, ComputeRefused> {
-    let (at, floor) = (self.head(), self.floor());
-    let computed = |reached| Computed {
-      id: inc.id,
-      base: inc.base,
-      at,
-      floor,
-      reached,
-    };
-    if let Some(version) = self.accepted.get(&inc.id) {
-      return Ok(computed(Reached::Before(*version)));
-    }
-    if inc.base < self.deltas_from {
-      return Err(ComputeRefused::BaseUnavailable {
-        base: inc.base,
-        floor: self.deltas_from,
-      });
-    }
-    if inc.base > at {
-      return Err(ComputeRefused::BaseAhead {
-        base: inc.base,
-        head: at,
-      });
-    }
-    if let Some(run) = inc.unread() {
-      return Err(ComputeRefused::ContentUnread {
-        identity: run.identity,
-      });
-    }
-    let resolved = Green::resolve(inc);
-    if let Some((path, case)) = self.copy_refusal(&resolved) {
-      return Err(ComputeRefused::CopyRefused { path, case });
-    }
-    let mut units = position::Units::first();
-    self.decide_units(inc, &resolved, &mut units);
-    Ok(computed(Reached::of(units.into_units().0)))
   }
 
   /// The owner's take of a verdict computed anywhere (A-658; A-645 "committed by position"; A-635's rule): answered as a
@@ -6956,17 +6747,22 @@ impl Green {
     }
     match self.compute(inc) {
       Ok(computed) => self.hold_unlent(inc, computed, check_reads),
-      Err(ComputeRefused::BaseUnavailable { base, floor }) => {
-        Judgment::BaseUnavailable { base, floor }
-      }
+      Err(refused) => self.refused_judgment(refused),
+    }
+  }
+
+  /// The judgment of a verdict this green refused to compute ([`Green::compute`]).
+  fn refused_judgment(&self, refused: ComputeRefused) -> Judgment {
+    match refused {
+      ComputeRefused::BaseUnavailable { base, floor } => Judgment::BaseUnavailable { base, floor },
       // A base past the head names a version this green never made: unknown to it, as one below its checkpoint is,
       // never judged as if the work were based at the head (A-658; it was until 2026-11-19).
-      Err(ComputeRefused::BaseAhead { base, .. }) => Judgment::BaseUnavailable {
+      ComputeRefused::BaseAhead { base, .. } => Judgment::BaseUnavailable {
         base,
         floor: self.deltas_from,
       },
-      Err(ComputeRefused::CopyRefused { path, case }) => Judgment::CopyRefused { path, case },
-      Err(ComputeRefused::ContentUnread { identity }) => Judgment::ContentUnread { identity },
+      ComputeRefused::CopyRefused { path, case } => Judgment::CopyRefused { path, case },
+      ComputeRefused::ContentUnread { identity } => Judgment::ContentUnread { identity },
     }
   }
 
@@ -8628,6 +8424,11 @@ pub use copy::CopyRefusal;
 
 mod reserving;
 pub use reserving::Reserving;
+
+mod deciding;
+
+mod computing;
+pub use computing::{Computing, Judging};
 
 mod copy_checkpoint;
 

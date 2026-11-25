@@ -313,9 +313,10 @@ pub struct Daemon {
   vcs_svn_port: Option<u16>,
   /// How many times the start beat before the watchdog took the beat over ([`StartBeat`]).
   start_beats: u64,
-  /// The daemon's spawner (A-924), joined once the shards have ended and their ends closed with them.
+  /// Where the control shard's owner hands back the daemon's spawner at its drop, joined here once the shards have
+  /// ended (A-924).
   #[cfg(unix)]
-  spawner: Option<slates_ipc::confined_spawn::SpawnedChild>,
+  spawner_join: std::sync::mpsc::Receiver<slates_ipc::confined_spawn::SpawnedChild>,
 }
 
 /// The version-control servers' SSH edge as a daemon started it (§4.17.2 "Transports" item 2; A-684): the port it
@@ -1114,6 +1115,17 @@ impl Daemon {
     })?;
     #[cfg(unix)]
     let mut spawner_ends = spawner_ends.into_iter();
+    // The control shard owns it (`crate::spawning::own`): the one that restarts it, an end to each shard in this order.
+    // Where the owner hands the spawner back at its drop, for this process thread to join it once the shards have
+    // ended (`stop_parts`), never a shard's thread (a blocking wait there wedged a shard, 2026-11-25).
+    #[cfg(unix)]
+    let (spawner_join_send, spawner_join) = std::sync::mpsc::channel();
+    #[cfg(unix)]
+    let mut spawner_owner = Some((
+      spawner,
+      shards.iter().map(|shard| shard.0).collect::<Vec<u16>>(),
+      spawner_join_send,
+    ));
     // The lock ledger's entry for this daemon starts empty, before any shard recovers and reserves again.
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
     // What the anchor held across the restart (A-61, A-113): the devices (FUSE devices on Linux, Shards streams' resync
@@ -1202,6 +1214,11 @@ impl Daemon {
       let holds = ShardHolds {
         stop_watch,
         spawner: spawner_ends.next(),
+        spawner_owner: if index == 0 {
+          spawner_owner.take()
+        } else {
+          None
+        },
         devices: inherited_devices.next().unwrap_or_default(),
         #[cfg(target_os = "linux")]
         copies: inherited_copies.next().unwrap_or_default(),
@@ -1331,6 +1348,13 @@ impl Daemon {
     // pulse (`Pulse::progress`), which an observer reads directly under CPU load (no shard round-trip)
     // and which outlives the shard as its entry does — no allocation per boot (before 2026-09-14 an atomic
     // was leaked per daemon start). A laptop spawns no coordinator, so it stays zero.
+    // Where a client reaches this node: its advertised host (A-277), which its edges are announced at (A-925).
+    let advertised_host = fleet_transport
+      .as_ref()
+      .map(|transport| match &transport.advertise {
+        crate::deploy::NodeAddress::Ip(address) => address.ip().to_string(),
+        crate::deploy::NodeAddress::Name { host, .. } => host.clone(),
+      });
     if let Some(transport) = fleet_transport {
       runtime.spawn_on(control, async move {
         crate::fleet::run_membership(transport).await;
@@ -1355,7 +1379,7 @@ impl Daemon {
     // The svn:// listener, when the operator asked for one (§4.17.4 piece 7, A-689, A-695): on the control shard too,
     // every shard keeping its seats for the connections that move to their repository's owner.
     let vcs_svn_port = crate::vcs_svn::start(&runtime, control, &shards, &config)?;
-    Ok(Daemon {
+    let daemon = Daemon {
       stop_watch_send,
       runtime: Some(runtime),
       segment,
@@ -1370,8 +1394,32 @@ impl Daemon {
       vcs_svn_port,
       start_beats: start_beat.beats,
       #[cfg(unix)]
-      spawner: Some(spawner),
-    })
+      spawner_join,
+    };
+    // This node's edges as a client reaches them, set on the control shard for its peers (A-925): none on a laptop,
+    // which announces to nobody.
+    if let Some(host) = advertised_host {
+      let leaf = daemon
+        .config
+        .vcs_http
+        .as_ref()
+        .and_then(|edge| edge.identity.as_ref())
+        .and_then(crate::config::EdgeIdentity::leaf)
+        .map(<[u8]>::to_vec);
+      let http = daemon.vcs_http_port;
+      let ssh = daemon.vcs_ssh.as_ref().map(|edge| edge.port);
+      let set = daemon.observe(daemon.shards.first().copied(), move |s| {
+        let record =
+          crate::edges::local_record(s.origin_anchor, &host, (http, leaf.as_deref()), ssh);
+        s.edges.set_local(record);
+      });
+      if let Err(refused) = set {
+        slates_machine::log_line!(
+          "slates daemon: this node's edges were not set for its peers: {refused:?}"
+        );
+      }
+    }
+    Ok(daemon)
   }
 
   /// The loopback port the NFS transport (§4.6) is serving on, if the listener bound; a client mounts
@@ -2652,6 +2700,21 @@ impl Daemon {
     self.observe(self.shards.first().copied(), |s| s.council.debug_state())
   }
 
+  /// Test support (A-925): where this node would send a client of a repository `member` owns, as `member`'s edges
+  /// record taught it: its SSH edge (`ssh`) or its git HTTP edge, as `(scheme, host, port)`; or the typed refusal naming
+  /// `member`'s id where none was learned. A one-shot control-shard question.
+  pub fn peer_edge(
+    &self,
+    member: slates_db::HostId,
+    ssh: bool,
+  ) -> Result<Result<(&'static str, String, u16), slates_db::HostId>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      crate::edges::owner_edge(s, member, ssh)
+        .map(|edge| (edge.scheme.text(), edge.host, edge.port))
+        .map_err(|refused| refused.member)
+    })
+  }
+
   /// `host`'s fencing epoch in the regional configuration this node holds (§4.8: a takeover bumps it), `None` before any
   /// was recorded for it; and whether a kept retirement still names it (a re-admission waits on none naming it, A-919's
   /// test settling, A-921). A one-shot control-shard question; its typed refusal when it could not be made.
@@ -3894,7 +3957,7 @@ impl Daemon {
       .observe(shard, move |s| {
         // Only a shard with a committed image has dead memory to give back.
         let _ = crate::verbs::publish_shard(s);
-        s.journal.forget_what_was_given_back();
+        s.journal.forget_what_was_given_back(recovery_totals(s));
         s.give_back_rate = GiveBackRate::default();
         s.purge_seen_allocations = s.store.content.arena().allocations();
         if let Ok(task) = futures::spawn(probe_give_back(neighbour)) {
@@ -4565,10 +4628,11 @@ impl Daemon {
     {
       slates_machine::log_line!("slates-server: stopping the daemon's shards: {error}");
     }
-    // The spawner, once every shard's end closed with its shard: it kills what it still holds and exits (A-924).
+    // The spawner the control shard's owner handed back at its drop, joined on this thread now that every shard's end
+    // has closed with its shard (A-924).
     #[cfg(unix)]
-    if let Some(spawner) = self.spawner.take() {
-      join_spawner(spawner, log_window_ns);
+    while let Ok(spawner) = self.spawner_join.try_recv() {
+      crate::spawning::join_spawner(spawner);
     }
     // Last, so a draining daemon still beats while its shards step (A-228).
     if let Some(mut watchdog) = self.watchdog.take() {
@@ -4587,31 +4651,6 @@ impl Daemon {
 impl Drop for Daemon {
   fn drop(&mut self) {
     self.stop_parts();
-  }
-}
-
-/// Joins the daemon's spawner (A-924) after its shards ended, which closed every end it serves: it kills the groups it
-/// still holds and exits. One still running a window later (the shards' own, `window_ns`) is killed with its group and
-/// then waited for, so a stop never waits on it without end.
-#[cfg(unix)]
-fn join_spawner(mut spawner: slates_ipc::confined_spawn::SpawnedChild, window_ns: u64) {
-  if matches!(spawner.try_wait(), Ok(Some(_))) {
-    return;
-  }
-  if let Ok(watch) = slates_ipc::exit_watch::ExitWatch::on(spawner.id())
-    && let Some(readiness) = watch.readiness()
-    && let Ok(window) =
-      rustix::event::Timespec::try_from(std::time::Duration::from_nanos(window_ns))
-  {
-    let mut fds = [rustix::event::PollFd::new(
-      &readiness,
-      rustix::event::PollFlags::IN,
-    )];
-    let _ = rustix::event::poll(&mut fds, Some(&window));
-  }
-  if !matches!(spawner.try_wait(), Ok(Some(_))) {
-    spawner.kill_group();
-    let _ = spawner.wait();
   }
 }
 
@@ -4822,7 +4861,17 @@ fn content_slice(
       len: deltas.1.saturating_sub(deltas.0),
     },
   );
-  match crate::write_log::WriteLog::open(object, log_start, log_bytes, generation) {
+  // The journal's memories whole, as an image before A-926 leaves them: what a log of version 2 takes its marks as.
+  let journal_whole = slates_vfs::checkpoint_log::WrittenExtents::whole(
+    images.1.saturating_sub(images.0),
+    deltas.1.saturating_sub(deltas.0),
+  );
+  match crate::write_log::WriteLog::open(
+    object,
+    (log_start, log_bytes),
+    generation,
+    (config.page, journal_whole),
+  ) {
     Some((log, recovered)) => (images, Some(log), recovered),
     None => (images, None, crate::write_log::Recovered::default()),
   }
@@ -4878,6 +4927,9 @@ struct ShardHolds {
   stop_watch: Option<std::sync::mpsc::Receiver<StopWatch>>,
   /// This shard's end of the daemon's spawner (A-924).
   spawner: Option<std::os::fd::OwnedFd>,
+  /// The spawner itself, the shards it serves in its ends' order, and how long its start took: the control shard's
+  /// alone, which owns and restarts it (A-924 piece 2b).
+  spawner_owner: Option<SpawnerOwner>,
   /// The held devices.
   devices: Vec<crate::fuse_hold::HeldDevice>,
   /// The held writable copies.
@@ -4902,6 +4954,15 @@ struct ShardHolds {
   /// The held Shards streams' DAX sections (A-448).
   dax: Vec<crate::shards::dax_hold::InheritedDax>,
 }
+
+/// The spawner the control shard owns (A-924): the process, the shards it serves in its ends' order, and where its owner
+/// hands it back to be joined.
+#[cfg(unix)]
+type SpawnerOwner = (
+  slates_ipc::confined_spawn::SpawnedChild,
+  Vec<u16>,
+  std::sync::mpsc::Sender<slates_ipc::confined_spawn::SpawnedChild>,
+);
 
 /// A shard's start, run alone on its shard ([`futures::spawn_alone`]): its boot fault if the tests set one, then
 /// [`init_shard`], and the boot log's line of how long it took and in how many slices.
@@ -5156,6 +5217,29 @@ fn node_seal_recipient(
   }
 }
 
+/// This shard's conversation with the daemon's spawner (A-924), before anything on the shard can start a hook: the
+/// control shard owns the spawner too, and restarts it on its death (piece 2b).
+#[cfg(unix)]
+fn install_spawner(
+  owner: Option<SpawnerOwner>,
+  end: Option<std::os::fd::OwnedFd>,
+  config: &DaemonConfig,
+  (config_shards, partition): (&[u16], u16),
+) -> Result<(), ServerError> {
+  if let Some((spawner, served, join_to)) = owner {
+    crate::spawning::own(spawner, served, Some(join_to));
+  }
+  if let Some(end) = end {
+    let placement = crate::spawning::Placement {
+      generation: 0,
+      owner: config_shards.first().copied().unwrap_or(partition),
+      bound: config.runtime.tasks_per_shard,
+    };
+    crate::spawning::install(end, placement).map_err(ServerError::Runtime)?;
+  }
+  Ok(())
+}
+
 async fn init_shard(
   config: &DaemonConfig,
   env: &[(String, String)],
@@ -5177,11 +5261,13 @@ async fn init_shard(
   let inherited_dax = holds.dax;
   #[cfg(unix)]
   let stop_watch_install = holds.stop_watch;
-  // This shard's conversation with the daemon's spawner (A-924), before anything on the shard can start a hook.
   #[cfg(unix)]
-  if let Some(end) = holds.spawner {
-    crate::spawning::install(end).map_err(ServerError::Runtime)?;
-  }
+  install_spawner(
+    holds.spawner_owner,
+    holds.spawner,
+    config,
+    (config_shards, partition),
+  )?;
   // The carrier of what this shard sends other shards whose control channels are full (§4.3, `xshard::carrier`):
   // first, so nothing the shard sends is ever without it. Refused, the shard serves nothing: a typed initialization
   // failure, as a refused serve loop is below.
@@ -5602,6 +5688,7 @@ async fn init_shard(
     last_answers: std::collections::BTreeMap::new(),
     owner_hold: None,
     ledger_reads: crate::ledger_read::LedgerReads::default(),
+    edges: crate::edges::Edges::default(),
     period_stretch_ns: 0,
     attachment_paces: std::collections::BTreeMap::new(),
     council,
@@ -6098,6 +6185,16 @@ pub const RECOVERY_RETURNED: &str = "recovery.returned_bytes";
 /// give-back of memory a predecessor may have written (18 GB a shard on a 128 GiB Mac) holds the shard one quantum a
 /// step, not 18 to 21 ms. A busy shard never runs this. A range the object refuses stays owed and is asked for at the
 /// next give-back. The bytes given back, and whether any is left.
+/// The shard's recovery memories' lengths: its checkpoint memory's and its delta log's.
+fn recovery_totals(s: &ShardState) -> (usize, usize) {
+  let (slots_start, slots_end) = s.content_range;
+  let (log_start, log_end) = s.delta_range;
+  (
+    slots_end.saturating_sub(slots_start),
+    log_end.saturating_sub(log_start),
+  )
+}
+
 fn return_dead_recovery(s: &mut ShardState) -> (usize, bool) {
   return_dead_recovery_timed(s, &mut shard_thread_cpu_ns)
 }
@@ -6140,6 +6237,10 @@ fn return_dead_recovery_timed(
     stale_slot.map(|(from, _)| from.saturating_sub(dead.stale_slot.0)),
     log_past_tail.map(|(from, _)| from),
   );
+  // The marks fall with what was given back, after it (A-926): a crash between leaves them ahead, never behind.
+  if let (Some(log), Some(object)) = (s.write_log.as_mut(), s.content.as_mut()) {
+    let _lowered = log.lower_journal_marks(object, s.journal.written());
+  }
   learn_give_back_rate(s, slice.saturating_sub(left), spent_since(started, cpu()));
   let returned = stale_slot
     .map_or(0, |(_, bytes)| bytes)
@@ -11266,7 +11367,9 @@ mod tests {
   fn a_give_back_step_learns_its_slice_from_its_own_cpu_not_the_wall_clock() {
     let seen = audit_on_shard(|state| {
       let _ = crate::verbs::publish_shard(state);
-      state.journal.forget_what_was_given_back();
+      state
+        .journal
+        .forget_what_was_given_back(super::recovery_totals(state));
       state.give_back_rate = super::GiveBackRate::default();
       let quantum = slates_rt::futures::step_budget_ns()
         .unwrap_or(state.config.runtime.step_budget_ns)

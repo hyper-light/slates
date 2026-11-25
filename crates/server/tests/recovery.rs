@@ -6188,3 +6188,8 @@ fn a_file_removed_while_open_over_nfsv4_is_freed_when_its_clients_lease_lapses()
   daemon.stop();
   drop(anchor);
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

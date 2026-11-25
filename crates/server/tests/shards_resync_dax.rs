@@ -599,3 +599,8 @@ fn a_streams_dax_map_outlives_its_daemon_with_its_unsynced_stores() {
   drop(segment);
   drop(anchor);
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

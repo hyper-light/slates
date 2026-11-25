@@ -700,6 +700,7 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
       }
     }
     counters.trees = counters.trees.saturating_add(1);
+    graph.opening_tree(tree, admission);
     let mut ids = graph.entry_ids(tree);
     if ids.is_empty() {
       return Ok(());

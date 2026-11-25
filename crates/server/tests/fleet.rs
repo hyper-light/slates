@@ -36245,6 +36245,15 @@ fn started_git_fleet_of(
   name: &str,
   names: &[&str],
 ) -> ((Vec<Daemon>, Vec<HostId>), Vec<NodeStore>, PortLease) {
+  started_git_fleet_with(name, names, false)
+}
+
+/// [`started_git_fleet_of`], each node serving an SSH edge too where `ssh` (bound at port 0, its own host key).
+fn started_git_fleet_with(
+  name: &str,
+  names: &[&str],
+  ssh: bool,
+) -> ((Vec<Daemon>, Vec<HostId>), Vec<NodeStore>, PortLease) {
   let n = names.len();
   let nodes: Vec<(MachineProfile, HostId, Identity)> = names
     .iter()
@@ -36261,6 +36270,12 @@ fn started_git_fleet_of(
       address: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
       identity: None,
     });
+    if ssh {
+      config.vcs_ssh = Some(slates_server::config::VcsSshConfig {
+        address: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
+        identity: None,
+      });
+    }
     config.vcs_disk = handles.get(i).cloned();
   };
   let none = std::collections::BTreeMap::new();
@@ -37809,6 +37824,60 @@ const SCENE_RESTARTS: usize = 3;
 /// may be refused before it writes its records.
 const SCENE_PUSHES: usize = 3;
 
+/// A-925 (main 01a20182's rulings of 2026-11-25). Do: form a three-node git fleet whose nodes serve a git HTTP edge and
+/// an SSH edge, each bound at port 0; ask a where it would send a client of a repository b owns, over git's HTTP and over
+/// SSH; and of a member it holds no record of. Expect b's own edges as b bound them (127.0.0.1, its HTTP edge's port, its
+/// SSH edge's port; never port 0), each learned from b's edges record over b's authenticated session; and the typed
+/// refusal naming the member it knows none of. Red before A-925: no node knew another's edges, so a could name b's
+/// member id only.
+#[test]
+fn a925_a_node_learns_its_peers_edges_as_each_bound_them() {
+  let _serial = serialize_fleet_tests();
+  let ((daemons, hosts), _stores, _lease) = started_git_fleet_with("edges", &["a", "b", "c"], true);
+  let b_http = daemons[1].vcs_http_port();
+  let b_ssh = daemons[1].vcs_ssh().map(|edge| edge.port);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let learned = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(
+      daemons[0].peer_edge(hosts[1], false)?.is_ok()
+        && daemons[0].peer_edge(hosts[1], true)?.is_ok(),
+    )
+  });
+  let http = daemons[0].peer_edge(hosts[1], false);
+  let ssh = daemons[0].peer_edge(hosts[1], true);
+  let stranger = HostId(hosts[1].0 ^ 0x5a5a);
+  let none = daemons[0].peer_edge(stranger, false);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "edges: b bound http {b_http:?} ssh {b_ssh:?}; a learned http {http:?} ssh {ssh:?} ({learned}); none {none:?}"
+  );
+  assert!(learned, "a learned b's edges");
+  assert_eq!(
+    http,
+    Ok(Ok((
+      "http",
+      "127.0.0.1".to_owned(),
+      b_http.unwrap_or_default()
+    )))
+  );
+  assert_eq!(
+    ssh,
+    Ok(Ok((
+      "ssh",
+      "127.0.0.1".to_owned(),
+      b_ssh.unwrap_or_default()
+    )))
+  );
+  assert!(b_http.is_some_and(|port| port != 0) && b_ssh.is_some_and(|port| port != 0));
+  assert_eq!(
+    none,
+    Ok(Err(stranger)),
+    "a member of no record: the typed refusal naming it"
+  );
+}
+
 /// Shape: A-914's test's stretch of each coordinator period: a few heartbeats, past the pace the failover
 /// estimate measured before the death, as a host loaded several times over runs.
 const STRETCH_NS: u64 = 3 * HEARTBEAT_NS;
@@ -37890,3 +37959,8 @@ fn t_a727_d1a3_a_hold_whose_holder_is_unreachable_is_kept_then_resolved_on_the_n
     "resolved to the records by the rebuild's event alone: {held:?}; {state}"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

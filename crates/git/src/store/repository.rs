@@ -565,6 +565,9 @@ pub struct Repository {
   /// The buffers its objects are read from their packs with, and the objects read lately (`packed::Scratch`), held to
   /// its largest pack's length; in a cell because a read is a look, not a change.
   reading: RefCell<Scratch>,
+  /// The deltas its last read of a stored object applied (`Scratch::deltas_applied`; none for one held whole): what a
+  /// tree's open costs in the store, read by the fetch's walk ([`Repository::last_read_deltas`]).
+  last_deltas: std::cell::Cell<u64>,
   /// The first let-go piece a read met since its owner last asked ([`Repository::waiting`]): a read that meets one answers
   /// none, and its owner brings the piece back and takes the step again.
   waiting: Cell<Option<packed::Waited>>,
@@ -616,6 +619,7 @@ impl Repository {
       kinds: BTreeMap::new(),
       packs: BTreeMap::new(),
       reading: RefCell::new(Scratch::default()),
+      last_deltas: std::cell::Cell::new(0),
       waiting: Cell::new(None),
       largest: 0,
       landings_charged: 0,
@@ -663,6 +667,28 @@ impl Repository {
   /// (A-614 part 2's learned depth). What a store made again from its pushes' records must learn alike (A-662).
   pub fn learned_depth(&self) -> u64 {
     self.depth.limit()
+  }
+
+  /// Widens what its reads keep of the objects read lately (`packed::Recent`, git's delta base cache) for a tree of `len`
+  /// bytes about to be read: to its learned chain depth ([`Repository::learned_depth`]) times `len`, so the tree's chain,
+  /// each revision no longer than the tree being read, stays whole for the walk's next revisions; the growth alone
+  /// charged to `admission`, a fetch's own (main 01a20182's ruling of 2026-11-25: a fork a fetch reads through kept no
+  /// cache, so every tree read rebuilt its chain from its base, 78 deltas for a 13-tree chain). Refused room, it stays as
+  /// it is: whether it was widened or needed no more.
+  pub fn widen_read_cache(&self, len: u64, admission: &mut Admission) -> bool {
+    let wanted = self.learned_depth().saturating_mul(len);
+    let mut reading = self.reading.borrow_mut();
+    let have = to_u64(reading.recent().budget());
+    if wanted <= have {
+      return true;
+    }
+    if admission.charge(wanted.saturating_sub(have)).is_err() {
+      return false;
+    }
+    reading
+      .recent()
+      .set_budget(usize::try_from(wanted).unwrap_or(usize::MAX));
+    true
   }
 
   /// The bytes its reads keep of the objects read lately (`packed::Recent`, git's delta base cache).
@@ -743,6 +769,7 @@ impl Repository {
     stored: &StoredAt,
     len: u64,
   ) -> Option<Cow<'s, [u8]>> {
+    self.last_deltas.set(0);
     match stored {
       StoredAt::Whole(content) => stored_bytes(store, content, len),
       StoredAt::InPack(place) => {
@@ -760,6 +787,9 @@ impl Repository {
           &mut out,
         );
         self.note_waited(&read);
+        self
+          .last_deltas
+          .set(u64::try_from(reading.deltas_applied()).unwrap_or(u64::MAX));
         read.ok()?;
         (u64::try_from(out.len()).ok() == Some(len)).then_some(Cow::Owned(out))
       }
@@ -855,6 +885,12 @@ impl Repository {
     content: ContentId,
   ) -> Option<Cow<'s, [u8]>> {
     self.read_stored(store, &self.stored_of(row, content), row.len)
+  }
+
+  /// The deltas its last read of a stored object applied going back up the object's chain: none for one held whole or
+  /// kept lately (`packed::Scratch::deltas_applied`).
+  pub fn last_read_deltas(&self) -> u64 {
+    self.last_deltas.get()
   }
 
   /// The tail and runs of its index its lookups have visited since the index's merge rule last took them.
@@ -2043,6 +2079,7 @@ impl Repository {
       kinds: self.kinds.clone(),
       packs: self.packs.clone(),
       reading: RefCell::new(Scratch::default()),
+      last_deltas: std::cell::Cell::new(0),
       waiting: Cell::new(None),
       largest: self.largest,
       landings_charged: self.landings_charged,
@@ -2073,6 +2110,8 @@ impl Repository {
   /// Gives back everything the repository holds: its rows' holds, their tables, its versions' values and their charge.
   /// It goes on past a refusal and answers the first.
   pub fn release(self, store: &mut ContentStore) -> Result<(), StoreRefused> {
+    // The objects its reads kept (a fetch's fork widens its cache as its walk opens trees): given back with it.
+    self.reading.borrow_mut().recent().release(store);
     let mut first = self.index.release(store).map_err(StoreRefused::from);
     for kept in self.chains.values().flat_map(Chain::kept) {
       first = first.and(

@@ -578,3 +578,8 @@ fn a_copy_no_holder_claims_after_a_takeover_is_written_back_and_let_go() {
     .sum();
   assert_eq!(reclaimed, 1, "one holder's copy was reclaimed, counted");
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

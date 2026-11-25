@@ -629,7 +629,7 @@ impl TextSource for HeadTexts<'_> {
 pub(crate) type SvnView<'a> = slates_svn::migration::WithTexts<'a, HeadTexts<'a>>;
 
 /// A file's text identity and its path in the green, as a walk finds it.
-type FileText = (ContentIdentity, String);
+pub(crate) type FileText = (ContentIdentity, String);
 
 /// The files at and beneath `path` in `revision`, each with its text, appended to `out` in byte order; a file with no
 /// text (empty) is left out. A path the index cannot read adds nothing.
@@ -685,16 +685,27 @@ pub(crate) fn released_before(
   changes: &[ChangedPath],
   youngest: u64,
 ) -> Vec<FileText> {
-  let index = records.index();
   let mut released = Vec::new();
   for change in changes {
-    match change.action {
-      Action::Delete | Action::Replace => files_at(index, &change.path, youngest, &mut released),
-      Action::Modify => file_at(index, &change.path, youngest, &mut released),
-      Action::Add => {}
-    }
+    released_by(records, change, youngest, &mut released);
   }
   once_a_path(released)
+}
+
+/// [`released_before`]'s one row, `change`: the texts it lets go at `youngest`, added to `released` (A-920 piece 5, a
+/// row a unit of a staging step).
+pub(crate) fn released_by(
+  records: &SvnRecords,
+  change: &ChangedPath,
+  youngest: u64,
+  released: &mut Vec<FileText>,
+) {
+  let index = records.index();
+  match change.action {
+    Action::Delete | Action::Replace => files_at(index, &change.path, youngest, released),
+    Action::Modify => file_at(index, &change.path, youngest, released),
+    Action::Add => {}
+  }
 }
 
 /// The texts the paths `changes` changes hold at `revision`, once it applied: a modified file's, and every file's at or
@@ -704,16 +715,27 @@ pub(crate) fn held_after(
   changes: &[ChangedPath],
   revision: u64,
 ) -> Vec<FileText> {
-  let index = records.index();
   let mut held = Vec::new();
   for change in changes {
-    match change.action {
-      Action::Add | Action::Replace => files_at(index, &change.path, revision, &mut held),
-      Action::Modify => file_at(index, &change.path, revision, &mut held),
-      Action::Delete => {}
-    }
+    held_by(records, change, revision, &mut held);
   }
   once_a_path(held)
+}
+
+/// [`held_after`]'s one row, `change`: the texts it holds at `revision`, added to `held` (A-920 piece 5, a row a unit of
+/// a staging step).
+pub(crate) fn held_by(
+  records: &SvnRecords,
+  change: &ChangedPath,
+  revision: u64,
+  held: &mut Vec<FileText>,
+) {
+  let index = records.index();
+  match change.action {
+    Action::Add | Action::Replace => files_at(index, &change.path, revision, held),
+    Action::Modify => file_at(index, &change.path, revision, held),
+    Action::Delete => {}
+  }
 }
 
 /// `files` with each path once, in byte order: a path two rows reach (a file changed beneath a directory the same

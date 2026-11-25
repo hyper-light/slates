@@ -1366,7 +1366,7 @@ const SLOT_GEN_WIDTH: usize = size_of::<u64>();
 
 /// The two slots of image memory `total` bytes long: the first half and the rest.
 /// The two slots of image memory `total` bytes long, each as `(offset, len)` ([`slots_of`]).
-pub(crate) fn slots_of_memory(total: usize) -> ((usize, usize), (usize, usize)) {
+pub fn slots_of_memory(total: usize) -> ((usize, usize), (usize, usize)) {
   let (first, second) = slots_of(total);
   ((first.offset, first.len), (second.offset, second.len))
 }
@@ -1405,6 +1405,16 @@ impl CommittedSlot {
     let (first, second) = slots_of(total);
     let stale = if self.second { first } else { second };
     (stale.offset, stale.len)
+  }
+
+  /// This slot's place in the checkpoint memory: 0 for the first half, 1 for the second.
+  pub fn index(self) -> usize {
+    usize::from(self.second)
+  }
+
+  /// The other slot's place in the checkpoint memory ([`CommittedSlot::index`]).
+  pub fn stale_index(self) -> usize {
+    usize::from(!self.second)
   }
 
   /// This slot of image memory `total` bytes long, as `(offset, len)`.

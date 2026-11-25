@@ -46,3 +46,8 @@ fn a_give_back_leaves_the_rest_for_the_next_tick_when_another_task_is_running() 
     "a give-back beside another task leaves the rest for the next tick: {beside} steps (alone: {alone})"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

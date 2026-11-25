@@ -2290,6 +2290,56 @@ fn an_imports_files_land_as_chunks_the_clone_decodes() {
   assert!(decoded > 0, "the clone decoded the imported chunks");
 }
 
+/// Main's hg leg at 608930048 (2026-11-25: a stream's turns about 100 ms apart, near the daemon's heartbeat; count the gap
+/// from a turn's yield to its next poll before changing what wakes it). Do: through a two-shard daemon's edge, push one
+/// changeset whose file is twice a request's room, then ask `stream_out`. Expect: the answer streamed in turns, each
+/// reply run's yield counted with its gap to the next poll (`vcs_http.reply_yields` at least the stream's turns,
+/// `reply_yield_gap_ns` and its most moved). Red before: the gap was counted at a request body run's yield, which a
+/// stream (a GET) never takes, so none was counted.
+#[test]
+fn a_streamed_answers_reply_runs_count_their_yield_to_the_next_poll() {
+  let (identity, certificate) = identity();
+  let (daemon, instance) = daemon_named(Some(identity));
+  let config = crate::DaemonConfig::derive(&crate::daemon::test_profile(), &instance, Some(SHARDS));
+  let room = super::bounds_of(&config).room;
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let large: Vec<u8> = (0..usize::try_from(room * 2).expect("a size"))
+    .map(|at| b"abcdefgh"[at % 8] | 1)
+    .collect();
+  let large: &'static [u8] = Box::leak(large.into_boxed_slice());
+  let made = history_of(&[("large", "large", large, None, "default")]);
+  let pushed = hg_unbundle((port, &certificate), &name, &history_bundle(&made, &[0]));
+  let counted = |kind| counted_on(&daemon, REPOSITORY, kind);
+  let before = (
+    counted(crate::vcs_http::REPLY_YIELDS),
+    counted(crate::vcs_store::hg_view::STREAM_TURNS),
+  );
+  let request = format!(
+    "GET /{name}?cmd=stream_out HTTP/1.1\r\nHost: localhost\r\nAccept: application/mercurial-0.1\r\n{}\r\n\r\n",
+    owner_bearer()
+  );
+  let streamed = typed_exchange(port, &certificate, request.as_bytes());
+  let yields = counted(crate::vcs_http::REPLY_YIELDS) - before.0;
+  let turns = counted(crate::vcs_store::hg_view::STREAM_TURNS) - before.1;
+  let gap = (
+    counted(crate::vcs_http::REPLY_YIELD_GAP_NS),
+    counted(crate::vcs_http::REPLY_YIELD_GAP_MOST_NS),
+  );
+  daemon.stop();
+  assert_hg_answered(&pushed);
+  assert_eq!(streamed.0, 200, "the stream answered");
+  assert!(turns > 0, "the stream took turns");
+  assert!(
+    yields >= turns,
+    "a yield counted for each reply run: {yields} yields, {turns} turns"
+  );
+  assert!(gap.0 > 0 && gap.1 > 0, "the gaps counted: {gap:?}");
+  println!("reply yields {yields} over {turns} turns, gaps {gap:?}");
+}
+
 /// The answer to a clone of Mercurial repository `name` at `head` by its owner, as stock hg 7.2 asks one over HTTP
 /// (`getbundle` with bundle2's changegroup 02 and 03, nothing common, the answer uncompressed): its status,
 /// `Content-Type` and body.
@@ -7015,5 +7065,138 @@ fn a_fetchs_choosing_steps_end_within_the_span_their_pace_allowed() {
   assert_eq!(
     overran, 0,
     "no choosing step past the span its pace allowed"
+  );
+}
+
+/// Shape: the commits past the first in [`tree_chained_create`]'s line: enough that its trees' chain runs past one
+/// delta, as a directory's revisions do in `git pack-objects`' pack.
+const TREE_CHAIN: usize = 12;
+
+/// Stock git's request creating `main` at the last of `depth + 1` commits, each a child of the one before, commit `k`'s
+/// tree naming files `f000` to its own `k`, each a small blob of its own: each tree is the one before with one entry
+/// more, and the pack holds the first whole and each later one as an offset delta against the one before it, as
+/// `git pack-objects` stores a directory's revisions. The request, and the last commit.
+fn tree_chained_create(depth: usize) -> (Vec<u8>, ObjectId) {
+  use slates_git::entry::{self, Header, Representation};
+  use slates_git::object_name::Kind;
+  let blobs: Vec<Vec<u8>> = (0..=depth)
+    .map(|k| format!("file {k}\n").into_bytes())
+    .collect();
+  let mut trees: Vec<Vec<u8>> = Vec::new();
+  let mut tree = Vec::new();
+  for (k, blob) in blobs.iter().enumerate() {
+    tree.extend_from_slice(format!("100644 f{k:03}\0").as_bytes());
+    tree.extend_from_slice(git_name(Kind::Blob, blob).as_bytes());
+    trees.push(tree.clone());
+  }
+  let mut commits: Vec<Vec<u8>> = Vec::new();
+  let mut parent: Option<ObjectId> = None;
+  for tree in &trees {
+    let parent_line = parent
+      .map(|id| format!("parent {id}\n"))
+      .unwrap_or_default();
+    let commit = format!(
+      "tree {}\n{parent_line}author A <a@example.com> 1700000000 +0000\n\
+       committer A <a@example.com> 1700000000 +0000\n\ntree chained\n",
+      git_name(Kind::Tree, tree)
+    )
+    .into_bytes();
+    parent = Some(git_name(Kind::Commit, &commit));
+    commits.push(commit);
+  }
+  let count = u32::try_from(blobs.len() * 3).expect("a count");
+  let mut pack = Vec::new();
+  let mut writer = slates_git::pack::Writer::new(GitFormat::Sha1, count, &mut pack);
+  let mut at = entry::PACK_HEADER_LEN;
+  let mut put = |representation: Representation, data: &[u8], size: usize, at: &mut u64| {
+    let header = Header {
+      representation,
+      size: u64::try_from(size).expect("a size"),
+    };
+    let zlib = stored_zlib(data);
+    let began = *at;
+    entry::write(header, began, &mut writer).expect("the entry's header");
+    slates_git::out::Out::put(&mut writer, &zlib);
+    *at = began
+      + entry::written_len(header, began).expect("the header's length")
+      + u64::try_from(zlib.len()).expect("a length");
+    began
+  };
+  for blob in &blobs {
+    put(Representation::Whole(Kind::Blob), blob, blob.len(), &mut at);
+  }
+  let mut base = put(
+    Representation::Whole(Kind::Tree),
+    &trees[0],
+    trees[0].len(),
+    &mut at,
+  );
+  for k in 1..trees.len() {
+    let delta = slates_git::store::delta_of(&trees[k - 1], &trees[k]).expect("a delta");
+    base = put(
+      Representation::OfsDelta { base },
+      &delta,
+      delta.len(),
+      &mut at,
+    );
+  }
+  for commit in &commits {
+    put(
+      Representation::Whole(Kind::Commit),
+      commit,
+      commit.len(),
+      &mut at,
+    );
+  }
+  writer.finish().expect("the trailer");
+  let tip = parent.expect("a commit");
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {tip} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&pack);
+  (request, tip)
+}
+
+/// Main's order of 2026-11-25 (its git leg at b4aa00ef8: `open_tree` ran 0.45 to 0.59 ms a unit, about 97 % of the
+/// clone's long units; find what it spends, the parse or the store's read, before slicing it). Do: push
+/// [`tree_chained_create`] of [`TREE_CHAIN`], its trees an offset-delta chain in the pack the store keeps; fetch its
+/// last commit. Expect: `200`, the pack whole; the fetch's tree reads counted applying deltas going up their chains
+/// (`vcs_store.git_upload.tree_deltas` past zero, `tree_deltas_most` at least one), so a clone's `open_tree` can be read
+/// against what its reads apply; and the chain built once over the whole walk, at most [`TREE_CHAIN`] deltas, each tree
+/// after the first read found in the read cache (the walk reads the newest first, so that first read applies the whole
+/// chain). Red before the fetch's read cache: 78 deltas, 0+1+...+12, every tree's chain rebuilt from its base, since the
+/// fork a fetch reads through kept no cache.
+#[test]
+fn a_fetchs_tree_reads_count_the_deltas_they_apply_and_build_a_chain_once() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, tip) = tree_chained_create(TREE_CHAIN);
+  let pushed_pack_objects = {
+    let (_, commands_end) = packets_from(&request, 0);
+    ids_in(&request[commands_end..]).len()
+  };
+  assert_git_pushed(&pushed(edge, &name, &request));
+  let fetched = uploaded(edge, &name, &fetch_of(tip));
+  let deltas = counted_on(&daemon, REPOSITORY, crate::vcs_store::upload::TREE_DELTAS);
+  let most = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::upload::TREE_DELTAS_MOST,
+  );
+  daemon.stop();
+  eprintln!("tree reads: {deltas} deltas applied, at most {most} in one");
+  assert_eq!(fetched.0, 200);
+  assert_eq!(ids_in(&fetched_pack(&fetched.1)).len(), pushed_pack_objects);
+  assert!(deltas > 0, "the tree reads applied deltas: {deltas}");
+  assert!(most >= 1, "one tree read applied at least one: {most}");
+  assert!(
+    deltas <= u64::try_from(TREE_CHAIN).expect("a count"),
+    "the chain built once over the walk: {deltas} deltas against {TREE_CHAIN}"
   );
 }

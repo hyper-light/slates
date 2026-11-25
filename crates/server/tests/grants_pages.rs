@@ -494,3 +494,8 @@ fn a_grant_whose_issue_was_refused_covers_no_landing() {
     "a landing naming the refused grant's id is refused as one with no valid grant: {landed:?}"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

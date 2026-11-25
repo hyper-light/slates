@@ -2436,12 +2436,21 @@ impl ContentStore {
   /// Whether the store holds the object `identity` names whole in memory: held, and none of its windows let go
   /// ([`ContentStore::let_go`]). A reader that needs its bytes and finds it not whole reads it again from where it was
   /// landed, and its put brings the windows let go back.
+  ///
+  /// Its windows are walked in place, none collected: a look allocates nothing for an object of one window, and only its
+  /// walk's list stack for a longer one (main's churn of hg's 57k push at e51d998bf: 1.27 GB of window lists under this
+  /// look, one a call; `push_heap`'s `a_holds_whole_look_allocates_nothing`: 128 B a look before).
   pub fn holds_whole(&self, identity: &ContentId) -> bool {
-    self.contains(identity)
-      && self
-        .object_windows(identity)
-        .iter()
-        .all(|window| !self.is_away(window))
+    if !self.contains(identity) {
+      return false;
+    }
+    let mut walk = self.windows(identity);
+    while let Some(window) = walk.next_window() {
+      if self.is_away(&window) {
+        return false;
+      }
+    }
+    true
   }
 
   /// Whether the store holds the content `identity` names.
@@ -3552,7 +3561,7 @@ mod tests {
     let mut store = ContentStore::new(1 << 24, window).unwrap();
     for at in 0..64usize {
       let mut bytes = patterned(window * 3 + 10);
-      bytes[0] = at as u8;
+      bytes[0] = u8::try_from(at).unwrap_or(u8::MAX);
       let object = store.put_object(&bytes).unwrap();
       store.let_go_object(&object);
     }
@@ -3777,7 +3786,8 @@ mod tests {
     );
     before.clear_changes();
     let second = order[1];
-    let made_of = windows.iter().position(|id| *id == second).unwrap() as u8;
+    let made_of =
+      u8::try_from(windows.iter().position(|id| *id == second).unwrap()).unwrap_or(u8::MAX);
     let bytes = [made_of; 100];
     before.bring_back(&second, &bytes).unwrap();
     assert_eq!(

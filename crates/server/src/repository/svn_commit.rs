@@ -1645,10 +1645,10 @@ struct Building<'b> {
   records: &'b Repository,
   /// The repository's green, at the same head.
   engine: &'b Green,
-  /// The revision, checked.
+  /// The revision, checked: its rows sorted by path ([`before`] searches them).
   checked: &'b Checked,
-  /// Its rows, by path.
-  rows: BTreeMap<&'b str, &'b ChangedPath>,
+  /// The next row to build.
+  at: usize,
   /// The document.
   doc: OpsDoc,
   /// The post-state's inline bytes: the property lists' identities, and a text the revision or the records hold
@@ -1671,23 +1671,85 @@ struct Building<'b> {
   restores: BTreeMap<String, restore::Restore>,
 }
 
+/// A build's own state between its steps ([`Building::detach`]), without the records, the engine or the checked
+/// revision it borrows, which each step lends it again ([`Building::attach`]).
+pub(super) struct BuildState {
+  /// The next row to build.
+  at: usize,
+  /// The document.
+  doc: OpsDoc,
+  /// The post-state's inline bytes.
+  post: Vec<u8>,
+  /// The texts the increment names rather than carries.
+  runs: Vec<slates_merge::named::NamedRun>,
+  /// The named runs' bytes so far.
+  runs_len: u64,
+  /// The ops whose sources lie in the named runs.
+  run_ops: Vec<usize>,
+  /// The green paths the revision removes, unless a later row makes them again.
+  gone: BTreeMap<String, Stood>,
+  /// The restores of the revision's copies, by their rows' paths.
+  plans: restore::CopyPlans,
+  /// The green paths a copy from an older revision sets back.
+  restores: BTreeMap<String, restore::Restore>,
+}
+
+/// What a step of [`Building::step`] left.
+pub(super) enum BuildStep {
+  /// Rows left to build, at the next step.
+  More(Box<BuildState>),
+  /// Built: the increment.
+  Built(Increment),
+}
+
 impl<'b> Building<'b> {
+  /// The build so far, its borrows let go, to be taken up again by [`Building::attach`].
+  fn detach(self) -> BuildState {
+    BuildState {
+      at: self.at,
+      doc: self.doc,
+      post: self.post,
+      runs: self.runs,
+      runs_len: self.runs_len,
+      run_ops: self.run_ops,
+      gone: self.gone,
+      plans: self.plans,
+      restores: self.restores,
+    }
+  }
+
+  /// The build [`Building::detach`] let go, over the records, the engine and the checked revision it began on.
+  fn attach(
+    (records, engine, checked): (&'b Repository, &'b Green, &'b Checked),
+    state: BuildState,
+  ) -> Self {
+    Self {
+      records,
+      engine,
+      checked,
+      at: state.at,
+      doc: state.doc,
+      post: state.post,
+      runs: state.runs,
+      runs_len: state.runs_len,
+      run_ops: state.run_ops,
+      gone: state.gone,
+      plans: state.plans,
+      restores: state.restores,
+    }
+  }
+
   /// An empty increment for `checked` over `records` and `engine`.
   fn new(
     records: &'b Repository,
     engine: &'b Green,
     (checked, plans): (&'b Checked, restore::CopyPlans),
   ) -> Self {
-    let rows = checked
-      .changes()
-      .iter()
-      .map(|row| (row.path.as_str(), row))
-      .collect();
     Self {
       records,
       engine,
       checked,
-      rows,
+      at: 0,
       doc: OpsDoc::default(),
       post: Vec::new(),
       runs: Vec::new(),
@@ -1715,11 +1777,45 @@ impl<'b> Building<'b> {
     head: u64,
     id: [u8; 32],
   ) -> Result<Increment, Uncommitted> {
-    let checked = self.checked;
-    // The post-state holds each text the rows set that is not named (`Building::insert`): sized once at their length,
-    // so no append grows it (P7 finding (2): grown a text at a time it doubled). A copy's restored texts may still grow
-    // it past them.
-    let texts = checked
+    self.sized()?;
+    self.rows_some(&mut || false)?;
+    self.finish(head, id)
+  }
+
+  /// Begins building `checked`'s increment a slice at a time (A-920 piece 4c, [`Building::step`]): the post-state
+  /// sized, no row built yet.
+  pub(super) fn begin(
+    records: &'b Repository,
+    engine: &'b Green,
+    (checked, plans): (&'b Checked, restore::CopyPlans),
+  ) -> Result<BuildState, Uncommitted> {
+    let mut building = Building::new(records, engine, (checked, plans));
+    building.sized()?;
+    Ok(building.detach())
+  }
+
+  /// One step of the build `state` holds ([`Building::begin`]), over the records, the engine and the checked revision
+  /// it began on, unchanged since: its rows built a row a unit until `spent`, a row at least; once every row is, what
+  /// the revision removes and restores, and the increment based at `head`, identified by `id`.
+  pub(super) fn step(
+    (records, engine, checked): (&'b Repository, &'b Green, &'b Checked),
+    state: BuildState,
+    spent: &mut dyn FnMut() -> bool,
+    (head, id): (u64, [u8; 32]),
+  ) -> Result<BuildStep, Uncommitted> {
+    let mut building = Building::attach((records, engine, checked), state);
+    if !building.rows_some(spent)? {
+      return Ok(BuildStep::More(Box::new(building.detach())));
+    }
+    building.finish(head, id).map(BuildStep::Built)
+  }
+
+  /// The post-state sized once at the length of every text the rows set that is not named (`Building::insert`), so no
+  /// append grows it (P7 finding (2): grown a text at a time it doubled). A copy's restored texts may still grow it
+  /// past them.
+  fn sized(&mut self) -> Result<(), Uncommitted> {
+    let texts = self
+      .checked
       .changes()
       .iter()
       .filter_map(|row| row.text)
@@ -1733,10 +1829,25 @@ impl<'b> Building<'b> {
     self
       .post
       .try_reserve_exact(texts)
-      .map_err(|_| Uncommitted::Budget { available: 0 })?;
-    for row in checked.changes() {
+      .map_err(|_| Uncommitted::Budget { available: 0 })
+  }
+
+  /// The rows from the next built in path order, a row a unit until `spent`, a row at least: whether every one is.
+  fn rows_some(&mut self, spent: &mut dyn FnMut() -> bool) -> Result<bool, Uncommitted> {
+    let checked = self.checked;
+    while let Some(row) = checked.changes().get(self.at) {
       self.row(row)?;
+      self.at = self.at.saturating_add(1);
+      if self.at < checked.changes().len() && spent() {
+        return Ok(false);
+      }
     }
+    Ok(true)
+  }
+
+  /// The build's end once every row is built: what the revision restores and removes, each op sourced from a named run
+  /// moved past the inline bytes, and the increment based at `head`, identified by `id`.
+  fn finish(mut self, head: u64, id: [u8; 32]) -> Result<Increment, Uncommitted> {
     for (path, restore) in core::mem::take(&mut self.restores) {
       self.restored(&path, restore)?;
     }
@@ -1807,7 +1918,7 @@ impl<'b> Building<'b> {
   /// Where the node at `path` stood before the revision changed it (`slates_svn::migration::before`): its path and
   /// revision, none where nothing stood.
   fn place_before(&self, path: &str) -> Option<(String, u64)> {
-    match before(&self.rows, path) {
+    match before(self.checked.changes(), path) {
       Before::Head => Some((path.to_owned(), self.records.youngest())),
       Before::Copied { path, revision } => Some((path, revision)),
       Before::Absent => None,

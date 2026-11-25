@@ -147,6 +147,11 @@ pub struct PositionCounts {
   /// The longest tree the walk read and parsed in one unit, in bytes: what a unit reading a tree whole costs, a tree's
   /// size being its user's (main 01a20182's order of 2026-11-25: read on a whole clone against the step quantum's bytes).
   pub tree_bytes_most: u64,
+  /// The most deltas one tree's read applied going back up its chain in the store, and their sum over the walk's tree
+  /// reads (main 01a20182's order of 2026-11-25: what a 0.45 to 0.59 ms `open_tree` spends, its parse or its read).
+  pub tree_deltas_most: u64,
+  /// The deltas the walk's tree reads applied, summed.
+  pub tree_deltas: u64,
 }
 
 impl PositionCache {
@@ -353,7 +358,14 @@ impl<'r> StoreGraph<'r> {
     }
     let place = Place::Indexed { row, content };
     let named = match kind {
-      Kind::Tree => self.repository.tree_references(self.store, &id, &place),
+      Kind::Tree => {
+        let named = self.repository.tree_references(self.store, &id, &place);
+        let deltas = self.repository.last_read_deltas();
+        let mut positions = self.positions.borrow_mut();
+        positions.counts.tree_deltas_most = positions.counts.tree_deltas_most.max(deltas);
+        positions.counts.tree_deltas = positions.counts.tree_deltas.saturating_add(deltas);
+        named
+      }
       Kind::Tag => self
         .repository
         .tag_reference(self.store, &id, &place)
@@ -571,6 +583,12 @@ impl Graph for StoreGraph<'_> {
 
   fn commit_begun(&self, admission: &mut Admission) {
     self.positions.borrow_mut().commit_begun(admission);
+  }
+
+  fn opening_tree(&self, tree: u64, admission: &mut Admission) {
+    if let Some((_, row)) = self.row(tree) {
+      let _ = self.repository.widen_read_cache(row.len, admission);
+    }
   }
 
   fn named_entries(&self, tree: u64) -> impl Iterator<Item = (u64, Vec<u8>)> {

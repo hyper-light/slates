@@ -804,3 +804,8 @@ fn a_large_rewrite_is_refined_over_many_turns_off_the_submit() {
   assert!(submit_longest > 0, "the submit's steps were measured");
   prepared_and_taken(&counts);
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

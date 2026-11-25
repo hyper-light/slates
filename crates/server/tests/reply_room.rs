@@ -331,3 +331,8 @@ fn a_forwarded_answer_waits_for_room_on_its_clients_shard_rather_than_being_drop
     held.answer
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

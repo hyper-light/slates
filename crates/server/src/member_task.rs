@@ -907,6 +907,8 @@ pub(crate) async fn run(
   let mut buffer = vec![0u8; RECEIVE_BYTES];
   loop {
     announce_epochs().await;
+    // And this node's edges, once a session and again as they change (A-925).
+    crate::edges::announce_edges().await;
     resolve_peers(resolver).await;
     join_addressable();
     let now = slates_machine::clock::monotonic_ns();

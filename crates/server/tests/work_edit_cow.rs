@@ -238,3 +238,8 @@ fn a_rebased_works_log_holds_what_it_wrote_not_the_file() {
     "the rebased work's log held {peak} bytes for a {LOG_EDIT_BYTES}-byte write into a {LOG_FILE_BYTES}-byte file"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

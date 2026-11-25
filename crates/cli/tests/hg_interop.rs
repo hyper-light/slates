@@ -2302,3 +2302,8 @@ fn stock_hg_clones_a_large_file_whole_over_the_ssh_edge() {
   );
   hg_ok(&hg, &copy, &["verify"]);
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

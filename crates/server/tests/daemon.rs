@@ -5240,3 +5240,8 @@ fn the_new_works_edit_once_released(client: &mut Client, second: slates_ipc::pro
     "the new work's edit spliced the green's file"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

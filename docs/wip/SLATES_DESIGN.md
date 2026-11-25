@@ -63591,6 +63591,18 @@ Applied in the same change to: §4.8 (the owner's own hold, with a status line),
 Applied in the same change to: `crates/git/src/store/{graph,mod}.rs`, `crates/git/src/negotiation/{mod,objects}.rs`,
 `crates/git/src/upload/{answer,mod}.rs`, `crates/server/src/vcs_store/upload.rs` and its tests.
 
+> **The fork's read cache (2026-11-25, w-git for main 01a20182, its order on `open_tree` and its ruling on the shape).**
+> A fetch reads through a fork of its repository (A-745 rule 4), and the fork began with a read cache of no bytes
+> (`packed::Recent`, git's delta base cache), so every tree the walk opened rebuilt its chain from its base: 78 deltas
+> for a 13-tree chain, 0+1+...+12, O(depth²) over a walk; on git/git `open_tree` ran 0.45 to 0.59 ms a unit, about 97 %
+> of a clone's long units, while its parse stayed under 62,061 bytes. Now the walk tells its graph before each tree's
+> ids are read (`Graph::opening_tree`, a no-op by default), and the store widens the fork's cache to its learned chain
+> depth times that tree's length (`Repository::widen_read_cache`), the growth charged to the fetch's admission, as the
+> position cache is; refused room, the cache stays as it is. A chain whose revisions are no longer than the tree
+> being read stays whole for its next revisions; a longer one keeps its newest, the oldest given back first. The fork's release gives the cache back.
+> Counted: `vcs_store.git_upload.tree_deltas` and `tree_deltas_most`. Red: the 13-tree chain's fetch applied 78
+> deltas; now 12, the chain built once (the walk reads the newest first, whose read applies the whole chain).
+
 ### A-912 — A push during a member's death is accepted: no exchange holds a peer's record session across a wait that needs the council's next round, and a push's homing outlasts a death (2026-11-24, w-shared for main 01a20182, its rulings of 2026-11-24 ((i), (1), (a), (b)); found by A-908 part 4's fleet test; amends A-902; A-363, A-724 piece 6, A-727 (d1a), A-907)
 
 - **Why.** A git push made right after a member died was refused `retry` ("the push's objects were not kept by enough
@@ -63882,6 +63894,47 @@ owner's acceptor in the control shard's state), the state_log module doc (its ow
 `crates/server/src/{ledger_read,state_log,fleet,moves,merge_service,takeover,state,daemon,lib}.rs`,
 `crates/server/tests/fleet.rs`, `docs/wip/models/FencedLedger.tla` and its configurations, GAPS.
 
+### A-925 — A node announces its own version-control edges to its peers, as a client reaches them (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25; A-921 part 2's prerequisite)
+
+- **Why.** A-921's product half answers a request at a node that is not a repository's owner with where to go. A node
+  knew a repository's owner by member id, but not where a client reaches it. Its peers learn its probe and record
+  addresses at discovery (A-277), never its edges, which are its own: the operator binds each where it likes, and a test
+  binds them at port 0.
+- **The change.**
+  - Each node sends each peer one **edges record** over its own authenticated record session (stream 33,
+    `crate::edges`). It goes once a session and again when its edges change, as its epoch announcement rides.
+  - The record carries the node's git HTTP or HTTPS edge and its SSH edge, as a client reaches them. That is the
+    node's advertised host (A-277's reachable name, never a bind address such as `0.0.0.0` or `[::]`), each edge's
+    bound port (never 0), and its scheme.
+  - An HTTPS edge is announced only where its certificate names that host (`rustls::client::verify_server_name`). A
+    node with no reachable host, or none its certificate names, announces no edge. The daemon builds the record once
+    its edges are bound (the ports live on the `Daemon`) and sets it on the control shard. A laptop announces to nobody.
+  - Peers keep each record per anchor, bounded by the members. A departed member's record goes at the reaper's look
+    (`remote_attach::sweep_departed`).
+  - **Only its own** (main's condition 1). A record is held only where its anchor is the authenticated session's
+    anchor. Otherwise it is refused typed (`fleet.edges.refused.foreign`) and nothing is learned, so one member cannot
+    send another's clients elsewhere.
+  - **Bounded parsing** (condition 3). A record is at most 523 bytes, and each host is checked against a DNS name's 253
+    bytes before it is read. An oversized record, a cut, an unknown scheme, a bind address, port 0, trailing bytes and
+    another version are each a typed refusal.
+  - **Where to go:** `edges::owner_edge`, a member's edge of a kind, or the typed refusal naming the member where none
+    was learned (an older peer, a node serving no such edge). That is the one path, the same as a node with no edge.
+- **Why not discovery's `Announcement`** (main's ruling). `slates_wire` refuses trailing bytes and discovery maps any
+  decode error to `Malformed`, so a longer announcement would cost an older peer the whole enrollment exchange. An older
+  peer answers stream 33 empty, as any unknown kind: it learns nothing, and membership is untouched.
+- **Tests** (macOS arm64, debug, 2026-11-25).
+  - Fleet `a925_a_node_learns_its_peers_edges_as_each_bound_them`: three nodes, each with a git HTTP and an SSH edge at
+    port 0. a learned b's edges as b bound them (127.0.0.1:60773 HTTP, :60774 SSH in the run), and a member it holds no
+    record of got the typed refusal naming it.
+  - Unit `edges::tests::{an_edges_record_reads_back_whole_and_refuses_every_damaged_form,
+    a_node_announces_only_edges_a_client_reaches, an_https_edge_is_announced_only_at_a_name_its_certificate_carries,
+    a_record_naming_another_anchor_is_refused_and_teaches_nothing}`.
+  - `fleet::every_request_kind_the_record_session_dispatches_is_its_own`, with streams 32 and 33 added.
+- **Models.** None; the record is per-node fact, never consensus (D-14).
+
+Applied in the same change to: `crates/server/src/{edges,daemon,fleet,state,lib,member_task,remote_attach,config}.rs`,
+`crates/server/tests/fleet.rs`, GAPS.
+
 ### A-915 — Nothing acknowledged rests on a part only the dead owner held: a repository's creation answers once its root's join is at f + 1 too, and an adoption never waits for a join no owner is left to ship (2026-11-24, w-shared for main 01a20182, its ruling (1); a894's flake, my regression from A-908 part 4; amends A-894 and A-908)
 
 - **Why.** a894 (a repository's owner killed as its creation answers) failed under load, about 1 run in 3 at load 60 to
@@ -64048,6 +64101,17 @@ GAPS.
   1,000 cases); the svn import tests unchanged. The contended-flush test's hog holds the shard's flush measured by
   an import alone first, not 500 ms: every staging step waits a hold, and the first batch's 151 steps took it past its
   patience (61 s at 150 ms; 3.5-5.3 s at a flush, its await 0.45-1.1 s against `F` 5.6-9.8 ms).
+  **1b, the commit's end** (12.7-13.6 ms at 9,000 files after 4c: `commit_finish` 6.6-7.0, then the batch's
+  `finish_staged` 6.7). `commit_finish` and `record_changes` are now phases of the commit run (`CommitPhase::Emptied`,
+  `Links`, `Changes`), a unit each: the metadata of each emptied path where nothing stands there; the links naming
+  each changed path that was a special, then joined to the changed paths; then each changed path recorded (its last
+  change, its earlier version's entry no longer the last, its bytes), its entry numbered as it is taken from the
+  ordered set, so the version's list is the one `numbered` made, kept once every path is (none for a version that
+  changed nothing). The commit's end step 12.7-13.6 ms → 6.2-6.4 ms (`finish_staged`'s `encoded_len`, 1c). Oracles:
+  the applying oracle's greens, whole and a unit a step, now compare their change index too (each version's entries,
+  each path's last change, their bytes); `changed_since_reports_every_dimension_as_changed_between_does` and
+  `changed_since_reads_the_span_alone_and_folds_with_the_histories` (merge's integration tests) fail where an earlier
+  entry stays marked last, which no lib test caught; a version's list never kept fails 33 lib tests.
 - **Piece 2, the record check.** Its 101-106 ms at 9,000 files were the index's plan of the revision's rows
   (`Index::plan`, 96 ms: its builder's apply of each row 87, the rows' sort 3.9, the plan's finish 4.4), the fresh
   texts (9 ms), the record's encoding (4 ms) and the stored filter (1.6 ms). The plan is taken a slice at a time:
@@ -64062,6 +64126,17 @@ GAPS.
   and the indexes after each alike (`a_record_planned_a_row_a_step_is_the_record_planned_whole`,
   `every_revision_svnadmin_wrote_planned_a_row_a_step_is_the_revision_planned_whole`; a builder taken up without its
   next node number fails both); a plan's step after an append is refused out of date.
+  **2b, the rest of the check** (17 ms at 9,000 files after pieces 1 to 5: the fresh texts 9.1 ms, the record's
+  encoding 4.0, the rows' sort 3.6, the stored filter 1.5). `Repository::check_begin` checks the head and the lock
+  entries alone; `check_step` takes the rest on in phases, a unit at least a step and stopping between phases where
+  the step is spent: the texts and property lists the rows name, a row a unit (into the ordered set `named_as` made,
+  so they are taken in its order); those the records do not hold taken from what the revision brought or passed as
+  stored, a name a unit, then the room checked; the stored texts filtered, a text a unit, and the plan begun; then the
+  plan's rows. The check step 17 ms → under 5 ms (the probe's floor); still whole, each in a step of its own, the
+  record's encoding (4.0 ms) and the rows' sort (3.6). Oracle: every dump `svnadmin` wrote imported with every check
+  taken a unit a step holds `full.dump`'s history and exports it byte for byte
+  (`every_dump_svnadmin_wrote_imports_alike_with_every_check_a_unit_a_step`; a resumed naming that skips a row
+  fails it).
 - **Piece 3, the judge** (89-92 ms at 9,000 files after piece 1: the reservation's history walk 19.6 ms and changes
   walk 10.9, `resolve` 11.6, `decide_units` 24.5, `Reached::of` 1.5, `position::verdict` 2.6, `commit_reads` 15.3),
   in parts. **3a, the commit's reads.** `commit_reads` is the check the commit's own preparation makes a slice at a
@@ -64090,6 +64165,63 @@ GAPS.
   (`a_reservation_taken_a_unit_a_step_is_the_reservation_taken_whole`; a rename's source left uncharged, or a
   special's node, fails it). Still whole: the shares, 0.86 ms at 9,000 files with no copy or replace (their scans
   and the move into the member's numbering); `copy_entry_room` resolves the work whole where it copies.
+  **3c, the verdict.** The judge step's 47 ms after 3b were its verdict's compute: `resolve` 11.6 ms, `decide_units`
+  24.5 (the node-exclusive rule 11.1, the creates 9.4, the first unit's walk of the content 4.0), `Reached::of` 1.5,
+  `position::verdict` 2.6. `Green::compute` is now its steps carried to their end (`engine::computing`):
+  `begin_computing` answers at once what it answered before resolving anything; `computing_step` resolves the ops an
+  op a unit (`resolve_some`, then `Resolved::finish_resolving` and the copies' refusal), then decides the units a unit
+  at a time (`engine::deciding`: `decide_units` is seventeen phases over the resolution's maps, sets and lists, each
+  taken on from the key or the index after the last one decided, in the order the whole verdict pushes its units),
+  each step's unlent reads kept so that the verdict is refused naming the least of them, as the whole computation
+  refused it. A judge so (`Green::begin_judging`, `judging_step`, as `judge_named_reads_later`) is the rejected-result
+  cache's answer, the computation, then its one write, the verdict held or a conflict cached (`hold_unlent`), in its
+  last step. The import batch judges as a phase of its own (`ImportBatch::begin_judging_work`, `judge_step`, `judged`;
+  a refusal for unlent texts lent and judged again once, `judge_lent`). The judge's longest step 47 ms → 10-10.5 ms.
+  Still whole: the first unit (its walk of the content for edits that do not fit, run only when the unit is judged,
+  as A-658's again-judging needs), `Reached::of`, the verdict and the hold. Oracles: over generated works of every
+  kind and renames, each judged twice on two greens, whole and a unit a step, the same judgment every time and the
+  greens alike after each commit, a first judge of more than one op in more than one step
+  (`a_work_judged_a_unit_a_step_is_the_work_judged_whole`; a phase that keeps the last key of the one before fails
+  it); the named-texts history oracle's deferring green judges a unit a step; a rename of a file held by name alone,
+  unlent, refused `ContentUnread` naming its object whole and a unit a step, accepted once lent
+  (`a_judge_a_unit_a_step_is_refused_for_a_text_its_verdict_reads_unlent`; a step's unlent reads dropped fails it,
+  which no test caught before); and a server batch staging that rename lent `a`'s text once by its judge
+  (`a_staged_judge_is_lent_the_named_text_its_verdict_reads`).
+  **4b, the identity.** The work's identity, its record's BLAKE3 hash (`svn_commit::identity`), was 13.4 ms of the
+  build step whole; staging hashes it a slice a step (`staging::identified_in`, `hash_some`), each slice half the
+  step's quantum at the machine's measured BLAKE3 rate (`DaemonConfig::archive_slice_bytes_within`), until the step's
+  clock passes its quantum, a slice at least, before the build (`Staging::built_in`). The build step 25-27 ms →
+  13.6-13.8 ms (its rows, 12.3). Oracle: over records of up to 4 KiB, the empty one among them, in slices of 1 to 64
+  bytes, the identity hashed a slice a step is the identity whole, in as many steps as slices
+  (`a_records_identity_hashed_a_slice_a_step_is_its_identity_whole`).
+  **4c, the rows.** The build's walk of the revision's rows (12.3 ms of the 13.7-14.1 ms build step after 4b) is taken
+  a row a unit: `Building::begin` sizes the post-state, `Building::step` builds rows until the step's clock passes its
+  quantum, a row at least, and once every row is, finishes (what the revision restores and removes, the run ops moved
+  past the inline bytes, the increment); `build_unordered` is the three carried to their end. Between steps the build
+  holds its own state alone (`BuildState`, `Building::detach`, `attach`), each step lending it the records, the
+  scratch member and the checked revision again; it looked a path's row up in a map of borrowed rows, and now
+  searches the checked revision's rows, which are sorted by path and each path once (`migration::before`). The build
+  step 13.7-14.1 ms → under 5 ms (3 of 4 runs; the fourth under load 35-43). Still whole, in the build's last step:
+  the restores, the removals' ops and the runs. Oracle: the svn import tests, at a test quantum of a few
+  microseconds, build every golden dump's revisions a row about a step; a resumed build that skips a row fails four
+  of them.
+- **Piece 5, the records and the held tables** (29-31 ms at 9,000 files: the records' `apply` 13.0 ms, the held table
+  after with the released fold 12.3, the holding fold 5.8, the held table before 0.5), in parts. **5a, the held
+  tables.** The step that kept a revision applied the records and followed the batch's held table whole
+  (`Staging::recorded_in`); now `Staging::record_some` takes a `Recording` on in phases, each until the step's clock
+  passes its quantum, a unit at least, and stopping between phases where it is spent: the texts its rows let go
+  (`svn_texts::released_by`, a row a unit, before the records apply it), the records' apply (whole, 5b), the texts
+  its rows hold (`svn_texts::held_by`, a row a unit), then the held table followed a path a unit and the record kept.
+  Each walk gathers into an ordered map, so each path is kept once, its last row's, and the folds run in the order
+  `once_a_path` gave them; `released_before` and `held_after`, which a single commit takes whole, are the same rows'
+  walks. The records step 29-31 ms → 12.4 ms (the apply). Oracle: the svn import tests, whose shard quantum of a few
+  microseconds takes these walks a row a step over the golden dumps, hold the texts each batch lets go and keeps;
+  focused set 110 passed. Still whole: a row that adds or replaces a directory walks its tree in one unit.
+  **5a', the released fold** (main's order of 2026-11-25). The held table's fold looked a path up among the batch's
+  released texts by a scan of them (`released.iter().any`), so a batch removing N paths whose texts came from before
+  it cost N²: a revision removing 9,000 files took 246 ms of CPU over its fold's steps, its longest call 70 µs, once
+  its first import landed (`t_a920_a_revision_removing_thousands_of_files_imports_whole`). The released paths are now
+  a set beside the list (`Staging::released_paths`): 7.2-7.6 ms over the same steps, the longest call 10-28 µs.
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
@@ -64171,8 +64303,47 @@ measured noise of the 100 figure, not a literal.
 > are gone, and with them the yield the driver made between macOS's exit note and a readable status. The spawner's
 > death ends a run typed (`StartRefused::SpawnerGone`, worded as a server that could not start a process), the
 > hook's group killed. Red: a hook's parent is the spawner, not the shard's process
-> (`a_hook_is_started_by_the_shards_spawner_not_by_the_shard`). Owed, piece 2b: the spawner restarted on its death
-> (back-off, in-flight bound, restart wait, each derived) and its footprint measured.
+> (`a_hook_is_started_by_the_shards_spawner_not_by_the_shard`).
+>
+> **Piece 2b built (2026-11-25).** The control shard owns the spawner (`crate::spawning::own`, handed it by the
+> daemon's start with the measured length of that start). A shard whose end closes answers that generation's waiters
+> `SpawnerGone` and tells the owner; the owner restarts once per generation, after a back-off (`back_off_ns`: none
+> after one death, a whole liveness window after each later death within a window of its start, so a spawner that
+> cannot stay up starts at most twice a window; until 2026-11-25 it doubled a start's measured milliseconds, 12 starts
+> in a window and a half), and sends each shard its new end (`run_on_waiting`), or tells each
+> the attempt failed and tries again after a longer back-off. The restart wait is no timer: a spawn asked while a
+> restart is awaited waits for that attempt's answer, which always comes (the new end or the failure); between
+> attempts it is refused at once. Ids keep rising across generations and a handle of a gone generation answers
+> `SpawnerGone`, so no handle names a new spawner's child. A shard's spawns in flight (asked, running, not let go) are
+> at most its task bound (`RuntimeConfig::tasks_per_shard`, from the admission limit: each task asks for one child at a
+> time), one past it refused `Busy` (`StartRefused::NoRoom` to a hook). The owner joins the spawner when it is dropped
+> at the stop, killing it with its group a liveness window later. Red: a spawn after the spawner's death gets its
+> child from a new spawner (`a_dead_spawner_is_restarted_and_a_spawn_asked_after_its_death_gets_its_child`); before,
+> every spawn after it was refused.
+>
+> **Fixed (2026-11-25): no wait on a shard.** 2b's restart reaped the dead spawner with a blocking `wait()` on the
+> control shard, and its owner joined the spawner on that shard's thread at the stop. A spawner whose ends closed
+> before the kernel made it waitable (a test binary naming no `spawner_role!()`, whose spawner ends at once, restarted
+> once a window; or an exit the kernel finished late under load) held the shard past its window, and the watchdog ended
+> the process: `reap_map` exit 4, "shard 3 is wedged, unmoved for 1140 ms … in task spawned at spawning.rs:668", and
+> main's watchdog A/B, 1 wedge in 4 rounds before A-924 against 120 at 2b. Now the dead spawner is reaped by a task of
+> its own awaiting its exit watch (`reaped`), so no dead spawner delays the next, and the owner hands its spawner to the
+> daemon's process thread at its drop (`Daemon::stop_parts` joins it, `join_spawner`, once the runtime has ended). Red:
+> a spawner that ends its conversation at once and lingers outside its group held its shard 3.07 s against a 1 s window
+> (`a_spawner_that_ends_its_conversation_and_lingers_is_reaped_while_its_shard_steps`, its bound kept off the shard).
+>
+> **Every received descriptor close-on-exec (2026-11-25).** Main's diag run 45672799755 found a child started through
+> the spawner on both Linux lanes holding a descriptor a direct child did not (fd 6). The spawner received the child's
+> streams by `SCM_RIGHTS` without close-on-exec, and Linux's spawn hands a child every descriptor not so marked
+> (macOS's `POSIX_SPAWN_CLOEXEC_DEFAULT` hid it). Now `Inbound::read` receives with `MSG_CMSG_CLOEXEC` on Linux and
+> marks each descriptor just after elsewhere, and the spawner's self-pipe is made with `pipe2(O_CLOEXEC)` on Linux.
+> Red: `a_descriptor_riding_a_request_is_received_close_on_exec` (received without the flag on every platform).
+>
+> **Its cost** (main's measurements, 2026-11-25). macOS, release daemon at 5c7381734, idle: the spawner's footprint
+> 1,984K fresh and 2,000K 60 s later (RSS 6,576 KiB), against the daemon's 38M (RSS 49,568 KiB): about 5 %, flat; no
+> process of the binary left after the stop. Linux (diag 2, debug, 4-core runners), a start's median on the asking
+> thread through the spawner against direct: x86_64 94.3 / 102.7 / 96.1 µs at 100 / 10,000 / 65,527 descriptors
+> against 214.4 µs / 674.5 µs / 3.26 ms; arm64 94.5 / 94.8 / 80.5 µs against 272.7 / 354.3 / 670.2 µs.
 
 ### A-923 — The Aways family is keyed by let-go number, and every capped cut read counts each entry's page head (2026-11-25, w-perf for main 01a20182, its churn ruling (b) and its rulings on the format and the read cap; A-870, A-767 C1 step 2b)
 
@@ -64199,8 +64370,15 @@ measured noise of the 100 figure, not a literal.
   Counted `vcs_store.image.aways_renumbered`.
 - **Why not refuse them.** A refused away leaves its window absent. A list naming it is refused at the restore. An
   object brought back by its bytes (`bring_back_object`, a Mercurial named file's read) finds nothing to bring back and
-  stays unread: measured at the store. At the daemon, Subversion's whole-text read (which puts a text's pieces) and
-  Mercurial's named-file read both still read their texts back byte-equal with the old form refused. The reds
+  stays unread: measured at the store. At the daemon, with the old form refused, the texts still read back byte-equal,
+  by paths that are no guarantee. Subversion's whole-text read (`svn_texts::bring_whole`) puts a text's pieces, which
+  makes an absent window again. Mercurial's named files `a` and `b` came back through the recovery's segment replay
+  (`vcs_store::replay_answered`, A-636 part 2c-2). It asks the node's store for each text its records name that the
+  content store never knew, and puts it back, then lets it go (`vcs_store.hg_replay_unknown_asked` 6,
+  `vcs_store.hg_brought_back_let_go` 6, beside `vcs_store.nodes_unrestored` 6 for the refused aways' lists). That path
+  serves only texts a replayed segment names, and was made for a takeover's successor whose store never held them. The
+  bring-back by bytes a named file's later read takes (`slates_hg::push::held::bring_back_file`, then
+  `ContentStore::bring_back_object`) finds nothing to bring back where the window is absent. The reds
   (`a_restart_on_an_image_written_before_a923_numbers_its_aways_and_reads_every_text_whole`,
   `a_restart_on_an_image_written_before_a923_reads_every_named_pushed_file`) hold every old away renumbered, every text
   read back, and the successor's first publication carrying no kind-15 entry.
@@ -64225,3 +64403,67 @@ measured noise of the 100 figure, not a literal.
   `encoded_by_family`, the split's encoded bytes); `crates/server/src/vcs_store.rs` (`AWAYS_RENUMBERED`, the restore's
   plumbing); `crates/server/src/vcs_store/homes.rs` and `arena_windows.rs` (the cut readers' head);
   `crates/server/src/verbs.rs`; A-870's owed (b); GAPS.
+
+### A-926 — A shard slice's written memories keep high-water marks a successor reads, so a residency sweep walks what was written, not what may have been (2026-11-25, w-perf for main 01a20182, its rulings of 2026-11-25 on A-826's flaky sweep; amends A-744's split, A-226, A-68's journal and A-63's write log)
+
+- **Why.** `content_ranges`' status sweep failed in main's full server suite: (sweeps, idle slices, armed) (0, 3,348,409,
+  true) at its bound of sixty liveness budgets, passing alone in 29.7 s. No idle slice failed to advance. A fresh
+  1-shard audit daemon's sweep was 12,582,958 pages:
+  - the two checkpoint slots, 5,592,406, with 48 KiB resident;
+  - the delta log, 2,796,203, with 16 KiB;
+  - the write log, 699,051, with 32 KiB;
+  - the segment's log and snapshot regions, 3,495,255.
+
+  The journal and the write log were walked whole because their extents were unknown (`UNKNOWN_EXTENT`, "a predecessor
+  may have written"). Under in-process load (two spinning threads a core) each idle slice walked 4.1 pages against
+  10.6 alone, the live step quantum halved, so a sweep took 55.5 s of its 60 against 23.7 alone. The kernel's per-mapping
+  figures cannot split it: macOS answers per map entry (`mach_vm_region`), Linux per VMA (`/proc/self/smaps`), and the
+  content object is one mapping holding every shard's slice (main withdrew its ruling to skip ranges on the kernel's
+  word when shown this).
+- **The marks.**
+  - **Where:** a block in the last 40 bytes of the shard's write log region: a version word ("MARK", 1), then the
+    high-water mark of each written memory of the slice (`write_log::Marked`: the write log's region, the first and
+    second checkpoint slot, the delta log), bytes from its memory's start. No other offset moves.
+  - **Raised before the write:** the new end, rounded up to a page, is stored before the write that passes the mark,
+    with a release fence between, at the one write boundary each memory has (`WriteLog::append`; every checkpoint and
+    delta write through `verbs::ContentSlots`). A crash leaves the mark ahead of the bytes, never behind.
+  - **Falls after a give-back:** `WriteLog::purge`, and the journal's give-back (`daemon::return_dead_recovery`),
+    once the pages past it are given back.
+  - **Read at the open:** the journal is recovered over the extents (`checkpoint_log::WrittenExtents`, a slot's by its
+    place), and the write log over its own. `UNKNOWN_EXTENT` is gone: an extent is always a length.
+- **The format.** The write log's layout goes to version 3 ("WLOG", 3), its record area stopping before the block.
+  - **Version 2:** has no block, and its records may run to the region's end. It is read as before, every mark whole
+    (the assumption before A-926), until its first clear uncovers its records, writes the block, then the version 3
+    word. A crash between leaves an empty version 2 log, read whole again. Its scrub stops at the new record area,
+    since the block takes the old records' last 40 bytes.
+  - **A fresh slice:** every header word zero (no daemon opened it), so every mark is zero.
+  - **Counted** `content_range.marks.adopted`, `marks.raised` and `marks.appends`.
+  - **What a restart on an old image costs:** one sweep and one give-back of each memory whole, as before A-926, then
+    marks.
+- **Reds:**
+  - `a_version_2_log_filled_to_its_end_is_replayed_whole_then_cleared_into_version_3`: the record in the last 40 bytes
+    replayed byte for byte, every memory whole until the first clear, the append that did not fit refused full, then
+    version 3 with its marks read back. It found the first clear's scrub wiping the block it had written.
+  - `a_crash_after_a_records_bytes_leaves_the_mark_covering_them`: with the raise after the record's bytes, the
+    successor's mark read 8,192 against bytes written to 12,704.
+  - `a_growing_log_raises_its_mark_once_a_page`: one raise each of 4 pages over 116 appends; best of five interleaved
+    rounds 360 ns an append with the marks against 351 without (619 and 619 in another run): the write path's cost
+    unchanged.
+  - `a_fresh_daemons_sweep_walks_what_its_marks_cover_not_its_unwritten_journal`: the journal and write log plan 2
+    pages against 8,388,607 whole.
+  - `a_status_requests_sweep_completes_within_its_bound_under_load`.
+  - The journal's give-back oracle (`a_give_back_names_every_dead_written_byte_and_stops_at_the_last`): each restart
+    now opens over the extents its predecessor's marks carry, and every written byte stays inside the written ranges.
+- **Measured** (debug, the MacBook, 2026-11-25): the sweep 3,495,300 pages (12,582,958 before). Alone, 1.6 s over
+  40,988 idle slices (23.7 s, 1,185,392 before). Loaded, two hogs a core, 1.6 s over 40,730 (55.5 s, 3,075,443 before).
+- **Part 2, owed:** the segment's log and snapshot regions (3,495,255 pages, the anchor's format, the register's code)
+  get marks of their own, with their own migration.
+- **Applied in the same change to:**
+  - `crates/vfs/src/checkpoint_log.rs` (`WrittenExtents`, `Journal::over`, `Journal::recover`'s extents, the extents
+    a slot by place);
+  - `crates/vfs/src/recover.rs` (`CommittedSlot::index`, `stale_index`; `slots_of_memory` public);
+  - `crates/server/src/write_log.rs` (the marks block, version 3, the migration);
+  - `crates/server/src/verbs.rs` (`ContentSlots`' raise, `read_journal`'s extents);
+  - `crates/server/src/daemon.rs` (the open, the give-back's lowering);
+  - `crates/server/src/content_ranges.rs` (the block's page in the plan, the marks' rows);
+  - A-826's GAPS entry.

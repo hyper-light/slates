@@ -1095,3 +1095,8 @@ fn a_landing_under_a_grant_the_shard_does_not_hold_refused_before_its_plan_leave
   drop(client);
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

@@ -22065,11 +22065,51 @@ impl slates_vfs::recover::ImageRead for ContentView<'_> {
 }
 
 /// A shard's slice of the anchor content object, published by ranges (§4.8); only the frame written
-/// is backed.
+/// is backed. Where it names the write log that keeps the slice's marks, each write raises its memory's high-water mark
+/// before it is made (A-926): the one write boundary every checkpoint and delta passes.
 struct ContentSlots<'a> {
   object: &'a mut slates_mem::SparseObject,
   start: usize,
   len: usize,
+  marks: Option<(&'a mut crate::write_log::WriteLog, MarkedMemory)>,
+}
+
+/// Which journal memory a [`ContentSlots`] writes, for its marks (A-926).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkedMemory {
+  /// The checkpoint memory: its first slot's mark or its second's, by the write's place.
+  Checkpoints,
+  /// The delta log.
+  Deltas,
+}
+
+impl ContentSlots<'_> {
+  /// Raises the mark of the memory `[offset, offset + len)` lies in to cover it (A-926): before the write.
+  fn raise_mark(&mut self, offset: usize, len: usize) -> Result<(), slates_vfs::VfsError> {
+    let Some((log, memory)) = self.marks.as_mut() else {
+      return Ok(());
+    };
+    let end = offset
+      .checked_add(len)
+      .ok_or(slates_vfs::VfsError::NoSpace)?;
+    let (which, reach) = match memory {
+      MarkedMemory::Deltas => (crate::write_log::Marked::Deltas, end),
+      MarkedMemory::Checkpoints => {
+        let (_, second) = slates_vfs::recover::slots_of_memory(self.len);
+        if offset < second.0 {
+          (crate::write_log::Marked::FirstSlot, end)
+        } else {
+          (
+            crate::write_log::Marked::SecondSlot,
+            end.saturating_sub(second.0),
+          )
+        }
+      }
+    };
+    log
+      .raise_mark(self.object, which, reach)
+      .map_err(|_| slates_vfs::VfsError::NoSpace)
+  }
 }
 
 impl slates_vfs::recover::ImageRead for ContentSlots<'_> {
@@ -22089,6 +22129,8 @@ impl slates_vfs::recover::ImageWrite for ContentSlots<'_> {
     // A span past the slice, or memory the OS would not back (a Windows commit refused), is no space.
     let at = content_range(self.start, self.len, offset, from.len())
       .ok_or(slates_vfs::VfsError::NoSpace)?;
+    // The memory's mark first, so a crash between leaves it ahead of the bytes, never behind (A-926).
+    self.raise_mark(offset, from.len())?;
     self
       .object
       .write(at, from)
@@ -22133,9 +22175,15 @@ fn read_journal(
       0
     },
   };
+  // Over the extents the slice's marks record (A-926), every memory whole where the slice keeps none.
+  let written = state.write_log.as_ref().map_or_else(
+    || slates_vfs::checkpoint_log::WrittenExtents::whole_of(&checkpoints, &log),
+    crate::write_log::WriteLog::journal_extents,
+  );
   Some(slates_vfs::checkpoint_log::Journal::recover(
     &checkpoints,
     &log,
+    written,
   ))
 }
 
@@ -22697,6 +22745,10 @@ fn stream_checkpoint(
     object,
     start,
     len: end.saturating_sub(start),
+    marks: state
+      .write_log
+      .as_mut()
+      .map(|log| (log, MarkedMemory::Checkpoints)),
   };
   let mut stream = match state
     .journal
@@ -22962,6 +23014,10 @@ fn publish_delta_into(
         object,
         start,
         len: end.saturating_sub(start),
+        marks: state
+          .write_log
+          .as_mut()
+          .map(|log| (log, MarkedMemory::Deltas)),
       };
       state.journal.append_encoded(&mut log, encoded)
     }
@@ -25362,6 +25418,7 @@ mod tests {
         start: deltas.0,
         len: deltas.1 - deltas.0,
       },
+      slates_vfs::checkpoint_log::WrittenExtents::default(),
     )
     .unwrap();
     image.map_or_else(Vec::new, |image| image.volumes)
@@ -25374,6 +25431,7 @@ mod tests {
       object: state.content.as_mut().unwrap(),
       start,
       len: end - start,
+      marks: None,
     };
     super::ShardImage::read_from(&slots).unwrap().unwrap()
   }

@@ -256,6 +256,13 @@ fn plan_into(
   plan_into(high, (second, at.saturating_add(split)), limit, out);
 }
 
+/// Adds `len` encoded bytes to `family`'s tally ([`Turned::encoded_by_family`]).
+fn tally(by_family: &mut [u64; Family::ALL.len()], family: Family, len: usize) {
+  if let Some(tally) = by_family.get_mut(family.index()) {
+    *tally = tally.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+  }
+}
+
 /// Format: the version of a page piece's bytes.
 const PAGE_VERSION: u8 = 1;
 
@@ -630,68 +637,31 @@ impl Encoder {
       let Some((family, page)) = self.cut.as_mut().and_then(|cut| cut.remaining.pop_first()) else {
         break;
       };
-      let spent_before = spent;
       let stopped = read(&mut held, (family, page), cap);
       capped_most = capped_most.max(held.capacity());
       if let Some(stop) = stopped.filter(|_| page.halves().is_some()) {
-        // The read visited a cap's bytes at least, kept or passed over.
-        let read = bytes_of(&held).max(cap);
+        let (read, kept, encoded_len) =
+          self.turn_split((family, page), (&held, stop), (cap, page_bytes), encoded);
         spent = spent.saturating_add(read);
-        let (kept, encoded_len) =
-          self.split_at_stop((family, page), (&held, stop), page_bytes, encoded);
-        if let Some(tally) = by_family.get_mut(family.index()) {
-          *tally = tally.saturating_add(u64::try_from(encoded_len).unwrap_or(u64::MAX));
+        tally(&mut by_family, family, encoded_len);
+        if self.dirtied_paused.remove(&(family, page)) {
+          imposed = imposed.saturating_add(kept);
         }
         split_at_stop = (
           split_at_stop.0.saturating_add(1),
           split_at_stop.1.saturating_add(read.saturating_sub(kept)),
         );
-        if self.dirtied_paused.remove(&(family, page)) {
-          imposed = imposed.saturating_add(kept);
-        }
         continue;
       }
       // A page of one coordinate is read whole: its entries share their first eight bytes, so it cannot split.
       if stopped.is_some() {
         read(&mut held, (family, page), usize::MAX);
       }
-      encoded.push((family, page));
-      let planned = if bytes_of(&held) > page_bytes.saturating_mul(2) {
-        // Its own piece removed, its halves put.
-        self.pending.insert((family, page), None);
-        plan(&held, page, page_bytes)
-      } else {
-        vec![(page, 0..held.len())]
-      };
-      for (into, range) in &planned {
-        let bytes = held
-          .get(range.clone())
-          .filter(|held| !held.is_empty())
-          .map(encode_page);
-        let len = bytes.as_ref().map_or(0, Vec::len);
-        spent = spent.saturating_add(len);
-        if let Some(tally) = by_family.get_mut(family.index()) {
-          *tally = tally.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
-        }
-        self.pending.insert((family, *into), bytes);
-      }
-      let split: Vec<Page> = planned
-        .iter()
-        .map(|(page, _)| *page)
-        .filter(|into| *into != page)
-        .collect();
-      self
-        .working
-        .families
-        .entry(family)
-        .or_default()
-        .replace(page, planned.into_iter().map(|(page, _)| page));
-      // A change since the cut marked the page for the next cut; split, its halves are marked in its place.
-      if !split.is_empty() && self.dirty.remove(&(family, page)) {
-        self.dirty.extend(split.iter().map(|into| (family, *into)));
-      }
+      let len = self.reencode((family, page), &held, page_bytes, encoded);
+      spent = spent.saturating_add(len);
+      tally(&mut by_family, family, len);
       if self.dirtied_paused.remove(&(family, page)) {
-        imposed = imposed.saturating_add(spent.saturating_sub(spent_before));
+        imposed = imposed.saturating_add(len);
       }
     }
     // A whole read of a page of one coordinate may have grown the buffer past a capped read's: shrunk back, so what
@@ -709,6 +679,65 @@ impl Encoder {
       allocated: u64::try_from(allocated).unwrap_or(u64::MAX),
       encoded_by_family: by_family,
     }
+  }
+
+  /// A turn's split of `page` of `family`, whose read (`held`) stopped at `stop` past its cap ([`Encoder::split_at_stop`]):
+  /// the bytes the read spent (a cap's at least, kept or passed over), those it kept, and the bytes it encoded.
+  fn turn_split(
+    &mut self,
+    (family, page): (Family, Page),
+    (held, stop): (&[Entry], u64),
+    (cap, page_bytes): (usize, usize),
+    encoded: &mut Vec<(Family, Page)>,
+  ) -> (usize, usize, usize) {
+    let read = bytes_of(held).max(cap);
+    let (kept, encoded_len) = self.split_at_stop((family, page), (held, stop), page_bytes, encoded);
+    (read, kept, encoded_len)
+  }
+
+  /// Re-encodes `page` of `family` from its entries `held`, read whole: one past twice `page_bytes` split into the pages
+  /// it now fills, its own piece removed and theirs put, a change since the cut marked on its halves in its place; the
+  /// page noted in `encoded`. The bytes encoded.
+  fn reencode(
+    &mut self,
+    (family, page): (Family, Page),
+    held: &[Entry],
+    page_bytes: usize,
+    encoded: &mut Vec<(Family, Page)>,
+  ) -> usize {
+    encoded.push((family, page));
+    let planned = if bytes_of(held) > page_bytes.saturating_mul(2) {
+      // Its own piece removed, its halves put.
+      self.pending.insert((family, page), None);
+      plan(held, page, page_bytes)
+    } else {
+      vec![(page, 0..held.len())]
+    };
+    let mut spent = 0usize;
+    for (into, range) in &planned {
+      let bytes = held
+        .get(range.clone())
+        .filter(|held| !held.is_empty())
+        .map(encode_page);
+      spent = spent.saturating_add(bytes.as_ref().map_or(0, Vec::len));
+      self.pending.insert((family, *into), bytes);
+    }
+    let split: Vec<Page> = planned
+      .iter()
+      .map(|(page, _)| *page)
+      .filter(|into| *into != page)
+      .collect();
+    self
+      .working
+      .families
+      .entry(family)
+      .or_default()
+      .replace(page, planned.into_iter().map(|(page, _)| page));
+    // A change since the cut marked the page for the next cut; split, its halves are marked in its place.
+    if !split.is_empty() && self.dirty.remove(&(family, page)) {
+      self.dirty.extend(split.iter().map(|into| (family, *into)));
+    }
+    spent
   }
 
   /// The capacity, in entries, of the buffer the encoder keeps for its reads ([`Encoder::scratch`]).

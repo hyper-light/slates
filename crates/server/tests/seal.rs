@@ -400,3 +400,8 @@ fn a_lineage_key_is_handed_from_a_candidates_own_entry_and_kept_only_when_it_che
   assert!(garbage_refused, "bytes that are no hand-off are refused");
   assert!(none_handed, "a node with no entry of its own hands nothing");
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();
