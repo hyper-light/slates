@@ -1039,6 +1039,134 @@ fn a_batch_killed_between_its_changeset_and_its_entry_lands_again_whole() {
   assert!(exported == Some((FULL_LAST, FULL.to_vec())), "full.dump");
 }
 
+/// The cut import's oracle at one bound: the regimes its batches are cut at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CutAt {
+  /// Each batch one unit of the changeset store (`staging::texts_bound`'s floor; the room forced to it).
+  OneUnit,
+  /// The derived rent-or-buy bound: a shard's first batch one unit, its later ones what its measured flush buys.
+  Derived,
+}
+
+/// What repository `repository` recovered to after its import of [`rewrites`]'s rewrites was killed at `stage` of its
+/// second batch's landing, cut at `cut` (`staging::KILL_AT_STAGE`), the daemon and the store's owner stopped and started
+/// again: its youngest revision, and whether its history, exported whole, is byte for byte that of a reference import of
+/// the same dump's first revisions as far as that youngest.
+fn killed_at(stage: super::svn_commit::staging::LandStage, cut: CutAt) -> (u64, bool) {
+  use super::svn_commit::staging::{IMPORT_ROOM, KILL_AT_STAGE};
+  use crate::vcs_store::svn_import::tests::{
+    BOUNDED_REWRITE_BYTES, BOUNDED_REWRITES, history, imported, rewrites,
+  };
+  let instance = format!("vcs-store-svn-cut-{stage:?}-{cut:?}-{}", std::process::id());
+  let mut store = TestStore::start(&format!("svn-cut-{stage:?}-{cut:?}"));
+  let anchor = anchor_of(&instance);
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  daemon.bootstrap(true).unwrap();
+  let repository = created_subversion(&daemon, "cut");
+  crate::daemon::observe_first(&daemon, move |state| {
+    if cut == CutAt::OneUnit {
+      let unit = crate::vcs_store::hg_import::segment_bytes(state) as u64;
+      IMPORT_ROOM.with(|room| room.set(Some(unit)));
+    }
+    // The second batch's landing: one batch passes the stage first.
+    KILL_AT_STAGE.with(|kill| kill.set(Some((stage, 1))));
+    let task = slates_rt::futures::spawn(async move {
+      let _ = imported(
+        repository,
+        &rewrites(BOUNDED_REWRITES, BOUNDED_REWRITE_BYTES),
+      )
+      .await;
+    })
+    .expect("the import's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+  while crate::daemon::observe_first(&daemon, |_state| KILL_AT_STAGE.with(std::cell::Cell::get))
+    .is_some()
+  {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the kill at {stage:?} never fired"
+    );
+    std::thread::yield_now();
+  }
+  daemon.stop();
+  store.restart_owner();
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let wait = std::time::Duration::from_secs(120);
+  let recovered = crate::test_store::run_on_first(&daemon, move || history(repository), wait)
+    .expect("the recovered history");
+  let reference = created_subversion(&daemon, "reference");
+  let youngest = recovered.0;
+  let referenced = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let prefix = rewrites(usize::try_from(youngest).unwrap(), BOUNDED_REWRITE_BYTES);
+      let _ = imported(reference, &prefix).await;
+      history(reference).await
+    },
+    wait,
+  );
+  daemon.stop();
+  (
+    youngest,
+    referenced.is_some_and(|referenced| referenced.1 == recovered.1),
+  )
+}
+
+/// Goal 93 P7 (main's ruling of 2026-11-25: the cut import's crash oracle, at the derived rent-or-buy bound and at a
+/// forced one unit, so both regimes are proven). Do: for each regime and each stage of a batch's landing
+/// (`staging::LAND_STAGES`: before its changeset, before its entry, before its apply, before its tail, landed), import
+/// [`crate::vcs_store::svn_import::tests::rewrites`]'s rewrites, killing the second batch's landing at that stage; stop
+/// the daemon and the store's owner, start both again, and read the repository's history. Expect, in each regime: the
+/// history a reference import of the same dump's first revisions makes, byte for byte, at whatever youngest it recovered
+/// to; the two kills before the entry recovering the batch before (old), the three after it the batch itself (new); and
+/// old before new.
+#[test]
+fn a_cut_import_killed_at_every_stage_of_a_batch_recovers_old_or_new() {
+  use super::svn_commit::staging::{LAND_STAGES, LandStage};
+  for cut in [CutAt::OneUnit, CutAt::Derived] {
+    let recovered: Vec<(LandStage, u64, bool)> = LAND_STAGES
+      .iter()
+      .map(|stage| {
+        let (youngest, same) = killed_at(*stage, cut);
+        (*stage, youngest, same)
+      })
+      .collect();
+    println!(
+      "store_tests: a cut import at {cut:?} killed at each stage recovered to {recovered:?}"
+    );
+    assert!(
+      recovered.iter().all(|(_, _, same)| *same),
+      "every recovery the reference's history at its youngest ({cut:?}): {recovered:?}"
+    );
+    let at = |stage: LandStage| {
+      recovered
+        .iter()
+        .find(|(at, ..)| *at == stage)
+        .map(|(_, youngest, _)| *youngest)
+    };
+    let old = at(LandStage::BeforeChangeset);
+    let new = at(LandStage::BeforeApply);
+    assert_eq!(
+      at(LandStage::BeforeEntry),
+      old,
+      "before its entry, the batch before ({cut:?})"
+    );
+    assert_eq!(
+      at(LandStage::BeforeTail),
+      new,
+      "after its entry, the batch itself ({cut:?})"
+    );
+    assert_eq!(
+      at(LandStage::Landed),
+      new,
+      "landed, the batch itself ({cut:?})"
+    );
+    assert!(old < new, "old {old:?} before new {new:?} ({cut:?})");
+  }
+}
+
 /// How many distinct objects repository `repository`'s green's checkpoint names its files by (A-869), once the
 /// checkpoint covers the green's head `head`, waited for within a minute: the import answers before its batch's
 /// checkpoint commits, so a test that stops the daemon at once races it (w-hg's and w-shared's finding of 2026-11-22: 1
