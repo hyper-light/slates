@@ -11868,6 +11868,11 @@ nothing copied), a source that owes its push made first through A-886's door, an
 since the owner owes its names log to every holder of its greens (one placement: a family's ids share their line key).
 At a takeover the successor adopts a lineage whole, its members' engines with it, once every member's replica is at its
 adopted version (`green_adopt::take_engine`).
+A holder restarted warm keeps its records, not its replicas, and rebuilds a replica as it first made it (A-908 part 4,
+`merge_origin::rebuild_replica_through`): a root founds its lineage at the rebuild's install; a branch is branched from
+its source's replica and advanced from the records held. A source not rebuilt yet is rebuilt first, or the nearest
+missing ancestor whose own source is there, a level an ask (never by recursion), and the branch waits meanwhile
+(`merge.replica.branch_source_behind`). A green seeded from origin inputs stands alone, there as on a record's arrival.
 
 > **Status (A-247, 2026-11-08).** A green's works are served on the partitions their names hash to, and only the verdict
 > and a first read of a base file are the green's: a verb that needs either is parked on the work's shard and resumed
@@ -63385,11 +63390,22 @@ task), `crates/server/src/vcs_store/homes.rs`, `crates/server/src/credentials.rs
     source waiting; memberships read from held parts after a start. Focused lib set 100 green.
 - **Owed.** A branch made on a successor after its owner died: no longer refused `ContentUnavailable` (the lineage is
   adopted), but refused `unable to commit`, a retry `cannot lock ref` (fixed by A-909: the successor's own hold refused
-  the new green's records). Part 4: a holder's rebuild after
-  a restart makes a member's replica by its lineage (until then it stands alone, as before).
+  the new green's records).
+- **Part 4** (2026-11-24, w-shared for main 01a20182, its order after A-909). A holder restarted warm rebuilt every
+  replica's version 0 as an empty green (`ReplicaSeed::rebuild`), so a branch's rebuild was a mismatch and the branch
+  was refused on that holder for good. Now `rebuild_replica_through` makes version 0 by the green's membership, as a
+  record's version 0 is made: a root founds its lineage at the rebuild's install (`ReplicaSeed::founding`); a branch is
+  branched from its source's replica, its head checked against version 0's record, then advanced from the records held
+  (`advance_replica`). A missing source is rebuilt first, or the nearest missing ancestor whose own source is here, a
+  level an ask, the walk bounded by the memberships the holder knows: never a recursion. A green with origin inputs
+  stands alone, as on a record's arrival. Counter `merge.replica.lineage_found_refused`, a bug signal: a root not
+  installed because its repository already has a lineage without it. Tests (`merge_origin`, macOS arm64, debug):
+  `a908_a_restarted_holder_rebuilds_a_branch_by_its_lineage` (red before: `(Later, None)`, the branch refused) and
+  `a908_a_branch_of_a_missing_branch_is_rebuilt_a_level_an_ask` (red before: `[Later, Later]`).
 
 Applied in the same change to: §4.16 "Apply on holders", `crates/server/src/{merge_service,merge_origin,green_adopt,
-greens,fleet,verbs}.rs`, `crates/db/src/register.rs` (its test), `crates/server/tests/fleet.rs`, GAPS.
+greens,fleet,verbs}.rs`, `crates/db/src/register.rs` (its test), `crates/server/tests/fleet.rs`, GAPS. Part 4: §4.16
+"Apply on holders", `crates/server/src/merge_origin.rs`, GAPS.
 
 ### A-909 — An owner's own hold fences each object as its holders do, so what a successor makes after a takeover is placed (2026-11-24, w-shared for main 01a20182, its ruling of 2026-11-24 (B, at the source); found by A-908's successor test; the sibling of A-903; §4.8, D-16, AC-2.5)
 
@@ -63424,8 +63440,8 @@ greens,fleet,verbs}.rs`, `crates/db/src/register.rs` (its test), `crates/server/
     deposed owner's record after a takeover never placed, a raised promise refusing every object, and a laptop placing
     each object alone. Focused: `register` (109), `slates-cluster` `commit` (26), `slates-server` lib `takeover` and
     `state_log` (39), fleet `a894` and `a908` and the new branch's push (3).
-- **Found, not checked.** The retry A-908's GAPS noted (`cannot lock ref`, a second new branch 2.3 s after the refused
-  push) followed a refused push; no test here makes it.
+- **Unobserved since.** The retry A-908's GAPS noted (`cannot lock ref`, a second new branch 2.3 s after the refused
+  push) followed a refused push; no test makes it, and it is not chased by reading (main's ruling).
 
 Applied in the same change to: §4.8 (the owner's own hold, with a status line), `crates/db/src/register.rs`,
 `crates/cluster/src/lib.rs`, `crates/server/tests/fleet.rs`, the A-908 entry's owed line, GAPS.
