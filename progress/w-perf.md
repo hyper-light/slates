@@ -668,3 +668,12 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     sampler (command sent to main); (3) the P7 flush cut (w-svn passed it; their two requirements recorded: every land
     path's last batch before an acknowledgement durable, and the tail's let-go waits for the durable flush; oracle
     crashes after a non-durable batch's tail).
+- 2026-11-25 ~05:00 PST:
+  - LANDED d3057763e (fffd95f79 + merges): a fetch's batch of let-go log texts holds a step's copy budget
+    (Store::text_bytes_a_step = copy_slice_bytes; ask_batch asks min(room, step)); the owner copies at most a step a
+    request, a text past it in slices (StoreHandle/Store::text_slice; the cache's read takes its reach). Reds: hg
+    a_fetchs_wants_of_let_go_texts_hold_a_steps_bytes, server a_text_past_a_step_is_copied_a_step_a_request, store
+    a_text_read_in_slices_past_a_piece_leaves_no_walk_in_flight. Counter vcs_store.hg_text_copied_most_bytes.
+  - Reviewed (B) (w-hg, landed 123d8c280): OK, take_made's unpin-before-landing gap accepted (no reader in it).
+  - Left: main measures what_holds at d3057763e (57k); owed: replays' base asks one request a want (answer_wants_over,
+    vcs_store.rs callers), the 418 GB fresh-page churn split; next piece: the P7 flush cut (w-svn's two requirements).
