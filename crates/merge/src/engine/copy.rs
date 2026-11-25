@@ -449,6 +449,20 @@ pub(super) struct EntryCopies<'a> {
 }
 
 impl<'a> EntryCopies<'a> {
+  /// The copies `applied` records at `places`, each a `CopyTree` entry's place in it.
+  pub(super) fn at(applied: &'a [Applied], places: &[usize]) -> EntryCopies<'a> {
+    let copies = places
+      .iter()
+      .filter_map(|place| match applied.get(*place) {
+        Some(Applied::CopyTree { dst, from, fix, .. }) => {
+          Some((dst.as_str(), from.as_str(), fix.as_deref()))
+        }
+        _ => None,
+      })
+      .collect();
+    EntryCopies { copies }
+  }
+
   /// The copies `applied` records.
   pub(super) fn of(applied: &'a [Applied]) -> EntryCopies<'a> {
     let copies = applied

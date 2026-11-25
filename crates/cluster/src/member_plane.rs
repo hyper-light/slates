@@ -279,6 +279,8 @@ pub struct MemberPlane {
   /// ([`MemberPlane::period_probed`]): the failover estimate's detection term counts its tail ([`MemberPlane::detection`],
   /// A-363).
   periods: crate::failover::RunningDuration,
+  /// The detector's latest periods, their largest kept over a recent window (A-914).
+  recent_periods: crate::failover::RecentMax,
   /// When the detector last sent a period's probe, on the owner's clock.
   last_probe_ns: Option<u64>,
   /// The nonce and target of the period's probe now out, and whether an answer to it came, directly or through a relay
@@ -367,6 +369,7 @@ impl MemberPlane {
       due: Vec::new(),
       counts: PlaneCounts::default(),
       periods: crate::failover::RunningDuration::new(),
+      recent_periods: crate::failover::RecentMax::default(),
       last_probe_ns: None,
       period_probe: None,
       period_answered: false,
@@ -513,6 +516,25 @@ impl MemberPlane {
     &self.detector
   }
 
+  /// The detector's period tail and the largest of its recent periods (A-914), each `None` before one was timed.
+  pub fn period_reading(&self) -> (Option<u64>, Option<u64>) {
+    (self.periods.tail_ns(), self.recent_periods.max_ns())
+  }
+
+  /// Sets the window the detector's recent periods are kept over to the latest `periods` of them (A-914).
+  pub fn set_recent_window(&mut self, periods: usize) {
+    self.recent_periods.set_capacity(periods);
+  }
+
+  /// When `peer` last answered one of this member's probes, on the clock the plane is stepped at (A-914): where its
+  /// silence began, `None` for a peer the detector does not hold or that never answered.
+  pub fn last_answer_ns(&self, peer: HostId) -> Option<u64> {
+    self
+      .detector
+      .report(hyper_swim::HostId(peer.0))
+      .and_then(|report| report.last_answer_ns)
+  }
+
   /// The detection term of this node's failover estimate at `now_ns` (A-363, A-882): [`crate::failover::detection`] over
   /// the members the detector's view holds besides this one, its own `m`, the detector's period as this plane timed it,
   /// and the bound a pair still judged by its own retransmission timer is stated at ([`MemberPlane::timer_bound`]). Once
@@ -577,6 +599,7 @@ impl MemberPlane {
       && let Some(length) = now_ns.checked_sub(last)
     {
       self.periods.on_sample(length);
+      self.recent_periods.on_sample(length);
     }
     self.last_probe_ns = Some(now_ns);
     self.answered_lately = self.period_answered;
