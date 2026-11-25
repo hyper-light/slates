@@ -17178,8 +17178,17 @@ pub(crate) fn adopt_taken_over_green(
   id: DbVolumeId,
   adopted: crate::green_adopt::AdoptedGreen,
 ) -> Result<(), Box<crate::green_adopt::AdoptedGreen>> {
-  if state.greens.contains_key(&id) {
+  // Served already: a green this shard installed and recorded. A lineage's member installed with its lineage by another
+  // member's adoption (A-908) is installed but not yet recorded, and is recorded below.
+  if state.greens.contains_key(&id) && state.db.partition().volume(id).is_some() {
     return Ok(());
+  }
+  // A member gone with its lineage is recorded only once the lineage is installed here: before, it waits on the control
+  // shard for the next attempt.
+  if matches!(adopted.engine, crate::green_adopt::AdoptedEngine::InLineage)
+    && !state.greens.contains_key(&id)
+  {
+    return Err(Box::new(adopted));
   }
   if let Err(refusal) = record_adopted_green(state, id, &adopted) {
     state.count(GREEN_TAKEOVER_ADOPTION_REFUSED, 1);
@@ -17194,13 +17203,29 @@ pub(crate) fn adopt_taken_over_green(
     return Err(Box::new(adopted));
   };
   let crate::green_adopt::AdoptedGreen {
-    mut engine,
+    engine,
     completions,
     head,
     ..
   } = adopted;
-  engine.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
-  state.greens.insert(id, engine);
+  match engine {
+    crate::green_adopt::AdoptedEngine::Alone(mut engine) => {
+      engine.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
+      state.greens.insert(id, engine);
+    }
+    // The holder's lineage becomes this owner's (A-908), every member's engine with it; each member is recorded by its own
+    // adoption. A lineage of this repository already here (another adoption's) leaves this one's engines unused, counted.
+    crate::green_adopt::AdoptedEngine::Lineage(taken) => {
+      if state.greens.put_lineage(*taken).is_err() {
+        state.count(GREEN_TAKEOVER_LINEAGE_REFUSED, 1);
+      }
+    }
+    crate::green_adopt::AdoptedEngine::InLineage => {}
+  }
+  let budget = crate::merge_service::rejected_cache_budget(state);
+  if let Some(mut engine) = state.greens.get_mut(&id) {
+    engine.set_rejected_budget(budget);
+  }
   // The adopted replica holds every history in full; it is folded oldest-first to the budget and its retention charged,
   // as a recovered green's is (`install_green`). A retention the budget cannot hold fences the green.
   if let Err(short) = crate::merge_service::settle_green_retention(state, id) {
@@ -17221,6 +17246,11 @@ pub(crate) fn adopt_taken_over_green(
   state.count(GREEN_TAKEOVER_ADOPTED, 1);
   Ok(())
 }
+
+/// Counter: an adopted lineage this owner shard could not take, a lineage of its repository or an engine of one of its
+/// members already here (A-908).
+/// Format: a counter name in the daemon's status report.
+const GREEN_TAKEOVER_LINEAGE_REFUSED: &str = "merge.takeover.lineage_refused";
 
 /// Records green `id` by its adoption (A-333), or finds it recorded by this same adoption: `Err` with the refusal when
 /// the id or the name is another volume's here, or the partition refuses the record.
@@ -27062,7 +27092,7 @@ mod tests {
       identity,
       origin: None,
       epoch: 0,
-      engine,
+      engine: crate::green_adopt::AdoptedEngine::Alone(engine),
       completions: Vec::new(),
     }
   }
@@ -27098,7 +27128,10 @@ mod tests {
       let id = super::to_db_volume(wire);
       let answer = super::adopt_taken_over_green(state, id, adoption("green", &owner));
       (
-        answer.err().map(|back| back.engine.head()),
+        answer.err().and_then(|back| match back.engine {
+          crate::green_adopt::AdoptedEngine::Alone(engine) => Some(engine.head()),
+          _ => None,
+        }),
         state
           .refusals
           .get(super::GREEN_TAKEOVER_ADOPTION_REFUSED)

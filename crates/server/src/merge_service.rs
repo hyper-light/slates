@@ -62,6 +62,58 @@ pub(crate) fn replica_key(object: ObjectId) -> DbVolumeId {
   DbVolumeId { bytes: object.0 }
 }
 
+/// Notes the lineage memberships a held names-log part records (A-908): each green that joined, and each that left.
+/// A part of another log, or a value that is no part, changes nothing.
+pub(crate) fn note_names_part(state: &mut ShardState, value: &[u8]) {
+  let Some(part) = crate::state_log::record_of(value) else {
+    return;
+  };
+  if part.log != slates_db::catalog::StateLog::Names {
+    return;
+  }
+  for change in part.changes {
+    match change {
+      slates_db::catalog::LoggedChange::Joined { member } => {
+        state.merge.memberships.insert(member.green, member);
+      }
+      slates_db::catalog::LoggedChange::Left { green } => {
+        state.merge.memberships.remove(&green);
+      }
+      _ => {}
+    }
+  }
+}
+
+/// `green`'s membership of its repository's lineage as this holder's names logs record it (A-908), read from every
+/// names-log part held here the first time after a start ([`MergeShardState::memberships_built`]). `None` for a green
+/// no names log held here names.
+pub(crate) fn membership(
+  state: &mut ShardState,
+  green: DbVolumeId,
+) -> Option<slates_db::catalog::MemberRecord> {
+  if !state.merge.memberships_built {
+    let parts: Vec<Vec<u8>> = state
+      .holder_records
+      .iter()
+      .filter(|(object, _)| {
+        object.class()
+          == slates_db::register::RegisterClass::State(slates_db::catalog::StateLog::Names)
+      })
+      .flat_map(|(object, acceptor)| {
+        acceptor
+          .values(*object)
+          .map(<[u8]>::to_vec)
+          .collect::<Vec<_>>()
+      })
+      .collect();
+    for part in parts {
+      note_names_part(state, &part);
+    }
+    state.merge.memberships_built = true;
+  }
+  state.merge.memberships.get(&green).cloned()
+}
+
 /// The merge plane's per-shard state (§4.16): one field on [`ShardState`], so the join with the
 /// rest of the daemon is a single line there and a single line at init.
 #[derive(Default)]
@@ -100,6 +152,17 @@ pub struct MergeShardState {
   pub(crate) checkpoints_changed: BTreeSet<ObjectId>,
   /// The greens this holder refused for good after a recomputation mismatch (fatal-and-loud).
   pub refused: BTreeSet<ObjectId>,
+  /// On a holder: each green's membership of its repository's lineage, as the names-log parts this node holds record it
+  /// (A-908; `LoggedChange::Joined`, removed at `Left`): how a holder makes a member's replica as the owner makes the
+  /// member, a root founding its lineage, a branch branched from its source. One entry a member of a names log held here.
+  pub(crate) memberships: BTreeMap<DbVolumeId, slates_db::catalog::MemberRecord>,
+  /// Whether [`MergeShardState::memberships`] was read from every names-log part held here, once after a start; the parts
+  /// accepted since are noted as they come ([`note_names_part`]).
+  pub(crate) memberships_built: bool,
+  /// On a takeover successor's control shard: the greens whose engines went to their owner shard with their lineage, by
+  /// another member's adoption (A-908, `green_adopt::take_engine`), until their own adoption hands them on. Bounded by
+  /// the members of the lineages adopted here.
+  pub(crate) moved_with_lineage: BTreeSet<ObjectId>,
   /// The greens whose ledger inputs this holder is fetching from a record's sender, its replica behind its own ledger
   /// (A-412, `fleet::fetch_ledger_inputs`): one fetch a green at a time. Bounded by the greens this holder backs.
   pub catching_up: BTreeSet<ObjectId>,
@@ -4987,7 +5050,7 @@ pub(crate) fn accept_merge_record(
         state
           .merge
           .replicas
-          .remove(&crate::merge_service::replica_key(object));
+          .drop_any(&crate::merge_service::replica_key(object));
         slates_machine::log_line!(
           "slates-server: merge record for green {} version {} from {:?}: the recomputed identity does not match the record; the green is refused on this holder",
           hex(&object.0),
@@ -5077,27 +5140,29 @@ pub(crate) fn inputs_held(state: &ShardState, local: HostId, record: &Record) ->
 }
 
 /// Recomputes `value.version` into this holder's replica of `object` from `inputs` and compares the
-/// head identity with the record's. Version 0 here is a scratch green's, an empty replica (a green over a base seeds
-/// its version 0 from the origin a share at a time, `crate::merge_origin::seed_version_zero`, A-286); a later
-/// version submits the increment, which must accept as exactly that version. `Err` names the
-/// counter for the reason.
+/// head identity with the record's. Version 0 is made as its owner made the green ([`make_origin_replica`], A-908): a
+/// lineage's root founds the lineage, a branch is branched from its source's replica, a green of no repository is an
+/// empty replica (a green over a base seeds its version 0 from the origin a share at a time,
+/// `crate::merge_origin::seed_version_zero`, A-286); a later version submits the increment, which must accept as exactly
+/// that version. The replica is taken out for the step and put back ([`crate::greens::Greens::take_any`]), so a
+/// lineage's member is judged with its lineage's arenas. `Err` names the counter for the reason.
 fn recompute(
   state: &mut ShardState,
   object: ObjectId,
   value: &MergeRecordValue,
   inputs: Option<&[u8]>,
 ) -> Result<(), &'static str> {
-  let mut replica = if value.version == 0 {
-    Green::new()
-  } else {
+  let key = crate::merge_service::replica_key(object);
+  let made = value.version == 0 && !state.merge.replicas.contains_key(&key);
+  if made {
+    make_origin_replica(state, object)?;
+  }
+  let mut replica = state.merge.replicas.take_any(&key).ok_or(OUT_OF_ORDER)?;
+  if value.version > 0 {
     let Some(bytes) = inputs else {
+      state.merge.replicas.put_back_any(&key, replica);
       return Err(INPUTS_UNHELD);
     };
-    let mut replica = state
-      .merge
-      .replicas
-      .remove(&crate::merge_service::replica_key(object))
-      .ok_or(OUT_OF_ORDER)?;
     let started = slates_machine::clock::monotonic_ns();
     let applied = apply_inputs(&mut replica, bytes, value.version);
     count_phase(
@@ -5107,10 +5172,7 @@ fn recompute(
     );
     if let Err(reason) = applied {
       // Given back as it was: a later record or an adoption meets it again.
-      state
-        .merge
-        .replicas
-        .insert(crate::merge_service::replica_key(object), replica);
+      state.merge.replicas.put_back_any(&key, replica);
       // A replica owing its push is made from the repository's objects on this node, and the record judged once it is
       // (A-813's limit, `crate::replica_build`).
       if reason == REPLICA_OWES {
@@ -5118,32 +5180,16 @@ fn recompute(
       }
       return Err(reason);
     }
-    replica
-  };
+  }
   if replica.head_identity() != value.identity {
-    return Err(RECOMPUTE_MISMATCH);
-  }
-  // Version 0 of a green this holder already replicates: accepted only if it is the same origin.
-  if value.version == 0
-    && let Some(mut existing) = state
-      .merge
-      .replicas
-      .lend_mut(&crate::merge_service::replica_key(object))
-    && existing.head_identity() != value.identity
-  {
-    return Err(OUT_OF_ORDER);
-  }
-  if value.version == 0
-    && state
-      .merge
-      .replicas
-      .contains_key(&crate::merge_service::replica_key(object))
-  {
-    replica = state
-      .merge
-      .replicas
-      .remove(&crate::merge_service::replica_key(object))
-      .ok_or(OUT_OF_ORDER)?;
+    // Put back, so its caller drops it whatever its kind. Version 0 of a green this holder already replicated is another
+    // origin's, refused out of order as before; one made here now, or a later version, is a mismatch.
+    state.merge.replicas.put_back_any(&key, replica);
+    return Err(if value.version == 0 && !made {
+      OUT_OF_ORDER
+    } else {
+      RECOMPUTE_MISMATCH
+    });
   }
   // The version's provenance (A-321), as the record carries it: the replica a takeover adopts (A-333) answers it as the
   // owner judged it.
@@ -5155,14 +5201,82 @@ fn recompute(
   // Folded where the owner had folded when it made this record (A-385): nothing at or past the floor is lost, and no
   // later increment is based below it.
   fold_replica(state, &mut replica, value.folded_below);
-  state
-    .merge
-    .replicas
-    .insert(crate::merge_service::replica_key(object), replica);
+  state.merge.replicas.put_back_any(&key, replica);
   // A submit of a work on this holder node waits for its version here (A-697 part d).
   crate::work_home::replica_reached(state, object);
   Ok(())
 }
+
+/// Makes version 0 of this holder's replica of `object` as its owner made the green (A-908), from its membership of its
+/// repository's lineage as this holder's names logs record it ([`membership`]):
+/// - a lineage's root founds the lineage here, an empty green (`crate::greens::Greens::found`, the owner's);
+/// - a branch is branched from its source's replica at the version it was made at (`crate::greens::Greens::branch`, the
+///   owner's: lent, nothing copied), refused [`OUT_OF_ORDER`] (counted [`BRANCH_SOURCE_BEHIND`]) while the source's
+///   replica is missing or has not reached that version, a source that owes its push made first (A-886's door);
+/// - a green of a repository's family whose membership no names-log part held here records yet waits, [`OUT_OF_ORDER`]
+///   (counted [`MEMBER_UNKNOWN`]): its join is a part of the names log, which the owner owes every holder of the green
+///   (one placement: a family's greens and its names log share their line key), so it comes; the record stays with its
+///   sender, and nothing is kept here meanwhile;
+/// - a green of no repository is an empty green, standing alone, as before.
+fn make_origin_replica(state: &mut ShardState, object: ObjectId) -> Result<(), &'static str> {
+  use slates_db::catalog::MemberOrigin;
+  let key = crate::merge_service::replica_key(object);
+  match membership(state, key) {
+    Some(member) => match member.origin {
+      MemberOrigin::Root => {
+        if state
+          .merge
+          .replicas
+          .found(member.repository, key, Green::new())
+          .is_err()
+        {
+          return Err(OUT_OF_ORDER);
+        }
+        state.count(MEMBER_FOUNDED, 1);
+      }
+      MemberOrigin::Branch { from, version } => {
+        if state.merge.replicas.branch(&from, version, key).is_err() {
+          state.count(BRANCH_SOURCE_BEHIND, 1);
+          // A source whose replica owes its push (a created ref's, P2) is made first, through the door its owner made it
+          // by before branching it (A-886, `crate::replica_build`); the branch's record is retried meanwhile.
+          let owes = state
+            .merge
+            .replicas
+            .lend(&from)
+            .is_some_and(|source| !source.is_materialized());
+          if owes {
+            crate::replica_build::wanted(state, ObjectId(from.bytes));
+          }
+          return Err(OUT_OF_ORDER);
+        }
+        state.count(MEMBER_BRANCHED, 1);
+      }
+    },
+    None if object.is_family() => {
+      state.count(MEMBER_UNKNOWN, 1);
+      return Err(OUT_OF_ORDER);
+    }
+    None => {
+      state.merge.replicas.insert(key, Green::new());
+    }
+  }
+  Ok(())
+}
+
+/// Counter: a lineage's root whose replica founded its lineage on this holder (A-908).
+/// Format: a counter name in the daemon's status report.
+pub(crate) const MEMBER_FOUNDED: &str = "merge.replica.member_founded";
+/// Counter: a branch whose replica was branched from its source's on this holder, lent and nothing copied (A-908).
+/// Format: a counter name in the daemon's status report.
+pub(crate) const MEMBER_BRANCHED: &str = "merge.replica.member_branched";
+/// Counter: a branch's version 0 refused out of order because its source's replica here is missing or behind the
+/// version it was made at (A-908): retried by its sender.
+/// Format: a counter name in the daemon's status report.
+pub(crate) const BRANCH_SOURCE_BEHIND: &str = "merge.replica.branch_source_behind";
+/// Counter: a family green's version 0 refused out of order because no names-log part held here records its
+/// membership yet (A-908): retried by its sender until the join is held.
+/// Format: a counter name in the daemon's status report.
+pub(crate) const MEMBER_UNKNOWN: &str = "merge.replica.member_unknown";
 
 /// Counter: a record of a version after an owed one met a replica that still owes it (P2): refused, counted, the record
 /// left for a later attempt (GAPS A-812, a holder's replica is not made from its tool's objects yet).
@@ -6161,5 +6275,272 @@ mod tests {
       "C, answering nothing to the record alone, is offered the inputs again: {second:?}"
     );
     assert_eq!(progressed, Some(1), "one shipment's answers made progress");
+  }
+
+  /// A family's ids for A-908's tests: the repository's (its number 1), and greens minted to join it, each by another
+  /// creator and number, as branches made on other nodes' requests are.
+  fn family_id(creator: u64, number: u32) -> ObjectId {
+    ObjectId::family(slates_db::HostId(creator), 0, 7, number).expect("a family id")
+  }
+
+  /// A names-log part recording `changes`, as an owner ships one (A-636 part 2b).
+  fn names_part(
+    repository: slates_db::catalog::RepositoryId,
+    changes: Vec<slates_db::catalog::LoggedChange>,
+  ) -> Vec<u8> {
+    let to = u64::try_from(changes.len()).unwrap();
+    let record = slates_db::catalog::StateLogRecord {
+      repository,
+      log: slates_db::catalog::StateLog::Names,
+      from: 0,
+      to,
+      identity: [3u8; 32],
+      spans: Vec::new(),
+      changes,
+    };
+    crate::state_log::value_of(&record)
+  }
+
+  /// A lineage join as the names log records it.
+  fn joined(
+    repository: slates_db::catalog::RepositoryId,
+    green: ObjectId,
+    origin: slates_db::catalog::MemberOrigin,
+  ) -> slates_db::catalog::LoggedChange {
+    slates_db::catalog::LoggedChange::Joined {
+      member: slates_db::catalog::MemberRecord {
+        repository,
+        green: DbVolumeId { bytes: green.0 },
+        origin,
+      },
+    }
+  }
+
+  /// Version 0's record of a green whose head identity is `identity`.
+  fn version_zero(identity: [u8; 32]) -> MergeRecordValue {
+    MergeRecordValue {
+      version: 0,
+      increment: [0u8; 32],
+      base: 0,
+      inputs: None,
+      identity,
+      completion: None,
+      signature: None,
+      folded_below: 0,
+      checkpoint_floor: 0,
+      ..value()
+    }
+  }
+
+  /// What a holder counted under `name`.
+  fn counted(state: &ShardState, name: &str) -> u64 {
+    state.refusals.get(name).copied().unwrap_or(0)
+  }
+
+  /// A-908, §4.16 "Apply on holders": a holder makes a branch's replica as the owner makes the branch. Do: note a names-log
+  /// part joining a root and a branch made at the root's version 0, then recompute each one's version 0. Expect the root
+  /// to found its repository's lineage here and the branch to be branched from it (its member, lent, nothing copied),
+  /// each counted, both members of one lineage.
+  #[test]
+  fn a908_a_holder_founds_a_roots_lineage_and_branches_a_branch_from_it() {
+    let (outcomes, counts, lineages) = crate::daemon::audit_on_shard(|state| {
+      let repository = slates_db::catalog::RepositoryId {
+        bytes: family_id(1, 1).0,
+      };
+      let (root, branch) = (family_id(1, 2), family_id(2, 3));
+      let empty = Green::new().head_identity();
+      let part = names_part(
+        repository,
+        vec![
+          joined(repository, root, slates_db::catalog::MemberOrigin::Root),
+          joined(
+            repository,
+            branch,
+            slates_db::catalog::MemberOrigin::Branch {
+              from: DbVolumeId { bytes: root.0 },
+              version: 0,
+            },
+          ),
+        ],
+      );
+      note_names_part(state, &part);
+      state.merge.memberships_built = true;
+      let outcomes = [
+        recompute(state, root, &version_zero(empty), None),
+        recompute(state, branch, &version_zero(empty), None),
+      ];
+      let counts = [
+        counted(state, MEMBER_FOUNDED),
+        counted(state, MEMBER_BRANCHED),
+      ];
+      let lineages =
+        [root, branch].map(|green| state.merge.replicas.lineage_of(&replica_key(green)));
+      (outcomes, counts, (lineages, repository))
+    });
+    assert_eq!(outcomes, [Ok(()), Ok(())]);
+    assert_eq!(counts, [1, 1], "founded, branched");
+    let (lineages, repository) = lineages;
+    assert_eq!(
+      lineages,
+      [Some(repository), Some(repository)],
+      "one lineage"
+    );
+  }
+
+  /// A-908's ordering rule (main 01a20182's ruling of 2026-11-24 15:00): a family green's version 0 before its join waits,
+  /// and nothing is kept for it meanwhile. Do: with a root founded, recompute a branch's version 0 before any names-log
+  /// part names it, then note its join and recompute it again. Expect the first refused out of order, counted
+  /// `merge.replica.member_unknown`, no replica of it kept; the second branched.
+  #[test]
+  fn a908_a_version_zero_before_its_join_waits_and_is_judged_once_the_join_is_held() {
+    let (first, kept, unknown, second) = crate::daemon::audit_on_shard(|state| {
+      let repository = slates_db::catalog::RepositoryId {
+        bytes: family_id(1, 1).0,
+      };
+      let (root, branch) = (family_id(1, 2), family_id(2, 3));
+      let empty = Green::new().head_identity();
+      note_names_part(
+        state,
+        &names_part(
+          repository,
+          vec![joined(
+            repository,
+            root,
+            slates_db::catalog::MemberOrigin::Root,
+          )],
+        ),
+      );
+      state.merge.memberships_built = true;
+      let _ = recompute(state, root, &version_zero(empty), None);
+      let first = recompute(state, branch, &version_zero(empty), None);
+      let kept = state.merge.replicas.contains_key(&replica_key(branch));
+      let unknown = counted(state, MEMBER_UNKNOWN);
+      note_names_part(
+        state,
+        &names_part(
+          repository,
+          vec![joined(
+            repository,
+            branch,
+            slates_db::catalog::MemberOrigin::Branch {
+              from: DbVolumeId { bytes: root.0 },
+              version: 0,
+            },
+          )],
+        ),
+      );
+      let second = recompute(state, branch, &version_zero(empty), None);
+      (first, kept, unknown, second)
+    });
+    assert_eq!(first, Err(OUT_OF_ORDER), "waits for its join");
+    assert!(!kept, "nothing kept for it meanwhile");
+    assert_eq!(unknown, 1);
+    assert_eq!(second, Ok(()), "branched once the join is held");
+  }
+
+  /// A-908: a green of no repository is judged at once, as before. Do: recompute version 0 of a green whose id is no
+  /// family's, naming a head identity no empty green has. Expect a mismatch at once, no wait counted.
+  #[test]
+  fn a908_a_version_zero_of_a_green_of_no_repository_is_judged_at_once() {
+    let (outcome, unknown) = crate::daemon::audit_on_shard(|state| {
+      let green = ObjectId::new(slates_db::HostId(1), 9);
+      state.merge.memberships_built = true;
+      let outcome = recompute(state, green, &version_zero([7u8; 32]), None);
+      (outcome, counted(state, MEMBER_UNKNOWN))
+    });
+    assert_eq!(outcome, Err(RECOMPUTE_MISMATCH));
+    assert_eq!(unknown, 0);
+  }
+
+  /// A-908: a branch whose version 0 the holder's own branch does not reproduce is refused as a mismatch once its join
+  /// is held, and a branch whose source's replica is behind the version it was made at waits. Do: with a root founded at
+  /// version 0, recompute version 0 of one branch made at the root's version 0 naming another identity, and of one made
+  /// at the root's version 5. Expect the first a mismatch, the second refused out of order, counted
+  /// `merge.replica.branch_source_behind`.
+  #[test]
+  fn a908_a_branch_that_disagrees_is_a_mismatch_and_one_past_its_source_waits() {
+    let (disagrees, ahead, behind) = crate::daemon::audit_on_shard(|state| {
+      let repository = slates_db::catalog::RepositoryId {
+        bytes: family_id(1, 1).0,
+      };
+      let (root, wrong, early) = (family_id(1, 2), family_id(2, 3), family_id(3, 4));
+      let from = DbVolumeId { bytes: root.0 };
+      note_names_part(
+        state,
+        &names_part(
+          repository,
+          vec![
+            joined(repository, root, slates_db::catalog::MemberOrigin::Root),
+            joined(
+              repository,
+              wrong,
+              slates_db::catalog::MemberOrigin::Branch { from, version: 0 },
+            ),
+            joined(
+              repository,
+              early,
+              slates_db::catalog::MemberOrigin::Branch { from, version: 5 },
+            ),
+          ],
+        ),
+      );
+      state.merge.memberships_built = true;
+      let empty = Green::new().head_identity();
+      let _ = recompute(state, root, &version_zero(empty), None);
+      let disagrees = recompute(state, wrong, &version_zero([7u8; 32]), None);
+      let ahead = recompute(state, early, &version_zero(empty), None);
+      (disagrees, ahead, counted(state, BRANCH_SOURCE_BEHIND))
+    });
+    assert_eq!(disagrees, Err(RECOMPUTE_MISMATCH));
+    assert_eq!(ahead, Err(OUT_OF_ORDER));
+    assert_eq!(behind, 1);
+  }
+
+  /// A-908: after a start a holder reads its memberships from the names-log parts it holds. Do: hold a names-log part
+  /// joining a green in the shard's holder records, as a restart restores them, with nothing noted, and ask the green's
+  /// membership. Expect the join the part records.
+  #[test]
+  fn a908_a_holders_memberships_are_read_from_its_held_names_log_after_a_start() {
+    let found = crate::daemon::audit_on_shard(|state| {
+      let repository = slates_db::catalog::RepositoryId {
+        bytes: family_id(1, 1).0,
+      };
+      let green = family_id(1, 2);
+      let register = slates_db::catalog::LogName::State {
+        repository,
+        log: slates_db::catalog::StateLog::Names,
+      }
+      .register();
+      let owner = slates_db::HostId(5);
+      let mut acceptor = Acceptor::new(
+        state.fleet.host(),
+        slates_db::register::Authority {
+          generation: state.fleet.configuration().version,
+          owner,
+        },
+      );
+      let accepted = acceptor.accept(&Record {
+        owner,
+        object: register,
+        sequence: 1,
+        epoch: HostEpoch(1),
+        generation: state.fleet.configuration().version,
+        value: names_part(
+          repository,
+          vec![joined(
+            repository,
+            green,
+            slates_db::catalog::MemberOrigin::Root,
+          )],
+        ),
+      });
+      state.holder_records.insert(register, acceptor);
+      state.merge.memberships_built = false;
+      (
+        accepted.is_ok(),
+        membership(state, DbVolumeId { bytes: green.0 }).map(|member| member.origin),
+      )
+    });
+    assert_eq!(found, (true, Some(slates_db::catalog::MemberOrigin::Root)));
   }
 }

@@ -229,19 +229,17 @@
 > A-385, A-404) had this window; nothing written says whether a fleet is upgraded whole or rolling. A-908 avoids a
 > format change for this reason (a holder reads a green's lineage membership from the names log it already holds).
 > Nothing is built on either answer.
-> **IN FLIGHT (w-shared, 2026-11-24; main 01a20182's order of 12:36): a branch's green is never replicated, so a push
-> creating a branch in a fleet is refused `unable to commit`.** Red: `fleet a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`
-> (`GitFleet`: a push to `main`, then a fresh history to `refs/heads/after`), every run. Cause, by the holders' own log:
-> both count `merge.recompute_mismatch` and refuse the new green at version 0 ("the recomputed identity does not match the
-> record"). A branch's green is made at a version of its source (`Lineage::branch`, A-575), so its version 0 is the
-> source's state there, while a holder recomputes every version 0 as an empty green (`merge_service::recompute`) and the
-> record names no source. Its versions never place at f + 1, and the push's barrier gives up. Not git's push alone:
-> `CreateBranch` in a fleet meets the same. Fix in design with main: version 0's record names its source and the holder
-> makes the branch's replica from its own replica of the source at that version (recommended: holders keep a
-> repository's replicas in a `Lineage`, as the owner does, so a branch shares arenas and copies nothing). A-908, main's
-> ruling of 12:42: part 1 BUILT, the holder's replicas kept by the owner's own type (`crate::greens::Greens`), each
-> standing alone; part 2 owed: version 0's record names its membership, a holder founds and branches lineages,
-> adoption moves a lineage whole, and a branch is rebuilt by branching its source.
+> **BUILT, part 4 owed (A-908, w-shared, 2026-11-24): a branch's green is replicated by its lineage.** A holder reads a
+> green's membership from the names log it holds and makes version 0 as the owner made the green (a root founds its
+> lineage, a branch is branched from its source); a successor adopts a lineage whole. The push red
+> (`a_new_branchs_push_after_a_push_to_main_lands_in_a_fleet`) red at origin/main, green. OWED: part 4, a holder's
+> rebuild after a restart makes a member by its lineage (it stands alone until then, as before).
+> **IN FLIGHT (w-shared, 2026-11-24): a branch made on a repository's successor after its owner died is refused.** With
+> A-908 the successor adopts the lineage (`merge.takeover.lineage_adopted` 1) and makes the branch's green (no longer
+> `ContentUnavailable`, origin/main's red), and the other survivor branches its replica; but the push is refused `unable
+> to commit` (its barrier: the new green's version 1 unplaced, the names log at 6 acknowledged by none, no refusal counted
+> on either survivor), and a push of another new name 2.3 s later `cannot lock ref: it moved since the push read it`. Red
+> test kept off main until the fix.
 > **OPEN (A-727 (d1a-3), w-shared; main 01a20182's note of 2026-11-24 05:45): a takeover view and the rebuild's own watch
 > disagreed, cause unknown.** In the MacBook's group runs of the A-727 fleet tests (2026-11-24, branch
 > agents/w-shared-a727d1a3, `t_a727_d1a3_a_hold_whose_holder_is_unreachable_...` and `..._an_owner_killed_after_homing_...`,
