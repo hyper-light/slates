@@ -2243,6 +2243,105 @@ impl Resolved {
 /// What a commit applies once every other effect has landed ([`Green::commit`]): the files it removes, then the files it
 /// sets. Removals come first, so a rename's source removal never deletes a file the same increment recreates or renames
 /// into at that path.
+/// What [`Green::begin_applying`] makes of a recorded version: a run to take on a slice at a time, or the version its
+/// entry is answered with at once, nothing begun.
+pub enum Begun {
+  /// Begun: taken on by [`Green::apply_step`] until it ends.
+  Applying(Box<Applying>),
+  /// Answered at once: the version the green owing a push stands for, an accepted increment's, or the head.
+  Answered(u64),
+}
+
+/// What one [`Green::apply_step`] came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApplyStep {
+  /// More of the run is left.
+  More,
+  /// The run ended: the version it committed.
+  Done(u64),
+  /// The run ended committing nothing: the head (an apply with no owner to lend it texts, [`Green::apply_recorded`]).
+  Answered(u64),
+  /// The run waits for these texts, held by name alone with no bytes lent (A-760 (b) 4d), and has undone the slice that
+  /// met them: its owner lends them (`Green::lend`) and takes it on again, which makes that slice again. What the owner
+  /// learned by walking every effect first (`Green::recorded_unlent`), met a slice at a time instead.
+  Lend(BTreeSet<crate::named::Identity>),
+}
+
+/// A recorded version being applied a slice at a time ([`Green::begin_applying`]; its contract is there): the places of
+/// its entry's copies, the effects made so far and the next to make, then its commit under way.
+pub struct Applying {
+  id: [u8; 32],
+  copies: Vec<usize>,
+  effects: Vec<Effect>,
+  at: usize,
+  /// The commit's preparation, once every effect is made: a phase at a time, each a slice of the effects at a time.
+  prep: Prep,
+  /// The named runs' buffers, read for this apply (A-760), taken from the increment as the preparation begins.
+  read: Vec<Vec<u8>>,
+  commit: Option<CommitRun>,
+}
+
+/// Where an [`Applying`] run's commit preparation is: each phase an effect at a time ([`Green::apply_step`]).
+enum Prep {
+  /// The entry's effects still being made.
+  Effects,
+  /// Each effect's sole run ([`Green::sole_run_of`]) found, by the runs' places.
+  Sole {
+    places: BTreeMap<(u64, u64), usize>,
+    sole: Vec<(usize, usize)>,
+    at: usize,
+  },
+  /// Each effect's read of a text held by name alone checked ([`Green::note_unlent_read`]).
+  Reads {
+    names: Vec<(usize, crate::named::Identity)>,
+    wholes: Vec<(usize, usize)>,
+    at: usize,
+  },
+  /// Each mapped file made ([`Green::make_mapped_one`]).
+  Mapped {
+    names: Vec<(usize, crate::named::Identity)>,
+    wholes: Vec<(usize, usize)>,
+    at: usize,
+  },
+}
+
+impl core::fmt::Debug for Applying {
+  fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    formatter
+      .debug_struct("Applying")
+      .field("made", &self.effects.len())
+      .field("at", &self.at)
+      .field("committing", &self.commit.is_some())
+      .finish()
+  }
+}
+
+/// A commit under way ([`Green::commit_begin`], [`Green::commit_step`]): its version, the effects left to apply and the
+/// place of the next, the names of the files named whole, what it staged, its delta and the paths it changed.
+struct CommitRun {
+  version: u64,
+  effects: std::vec::IntoIter<Effect>,
+  place: usize,
+  names: Vec<(usize, crate::named::Identity)>,
+  staged: Staged,
+  delta: BTreeMap<String, Vec<Op>>,
+  changed: BTreeSet<String>,
+  phase: CommitPhase,
+}
+
+/// Where a [`CommitRun`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitPhase {
+  /// Applying its effects in order.
+  Effects,
+  /// Removing the files staged removed.
+  Removed,
+  /// Setting the files staged with new bytes.
+  Set,
+  /// Ended.
+  Ended,
+}
+
 #[derive(Default)]
 struct Staged {
   removed: Vec<String>,
@@ -5858,14 +5957,19 @@ impl Green {
   fn commit_reads(&self, effects: &[Effect], post: crate::named::Post<'_>) {
     let wholes = alone(self.sole_runs(effects, post));
     for (place, effect) in effects.iter().enumerate() {
-      if let Effect::SetContent(path, None, ops, ContentSource::Mapped | ContentSource::Copied(..)) =
-        effect
-        && !holds_place(&wholes, place)
-        && let Some(Content::Named(identity)) = self.content.get(path)
-        && keeps_base(identity.len, ops)
-      {
-        crate::unlent::note(identity);
-      }
+      self.note_unlent_read((place, effect), &wholes);
+    }
+  }
+
+  /// [`Green::commit_reads`]'s each effect: notes the unlent named file its making reads, unless a run makes it whole.
+  fn note_unlent_read(&self, (place, effect): (usize, &Effect), wholes: &[(usize, usize)]) {
+    if let Effect::SetContent(path, None, ops, ContentSource::Mapped | ContentSource::Copied(..)) =
+      effect
+      && !holds_place(wholes, place)
+      && let Some(Content::Named(identity)) = self.content.get(path)
+      && keeps_base(identity.len, ops)
+    {
+      crate::unlent::note(identity);
     }
   }
 
@@ -5882,42 +5986,65 @@ impl Green {
     wholes: &[(usize, usize)],
   ) {
     for (place, effect) in effects.iter_mut().enumerate() {
-      if holds_place(wholes, place) {
-        continue;
-      }
-      if let Effect::SetContent(path, bytes @ None, ops, source) = effect {
-        let made = match source {
-          // A created file is its declared ops over nothing (made lazily, `Green::merge_create`).
-          ContentSource::Created(declared) => apply(&[], declared, post_state),
-          // A named base the ops replace whole is made over with its length alone; any other unlent one reads as none,
-          // noted: the verdict is refused (`crate::unlent`).
-          ContentSource::Mapped | ContentSource::Copied(..) => {
-            match self.content.get(path.as_str()) {
-              Some(Content::Named(identity)) if !keeps_base(identity.len, ops) => {
-                apply_over((&[], identity.len), ops, post_state)
-              }
-              _ => apply(self.head_bytes(path).unwrap_or_default(), ops, post_state),
-            }
-          }
-        };
-        *bytes = Some(made);
-        self
-          .mapped_files_made
-          .set(self.mapped_files_made.get().saturating_add(1));
-      }
+      self.make_mapped_one((place, effect), post_state, wholes);
     }
   }
 
+  /// [`Green::make_mapped`]'s each effect: its file made, unless a run makes it whole or it is made already.
+  fn make_mapped_one(
+    &self,
+    (place, effect): (usize, &mut Effect),
+    post_state: crate::named::Post<'_>,
+    wholes: &[(usize, usize)],
+  ) {
+    if holds_place(wholes, place) {
+      return;
+    }
+    if let Effect::SetContent(path, bytes @ None, ops, source) = effect {
+      let made = match source {
+        // A created file is its declared ops over nothing (made lazily, `Green::merge_create`).
+        ContentSource::Created(declared) => apply(&[], declared, post_state),
+        // A named base the ops replace whole is made over with its length alone; any other unlent one reads as none,
+        // noted: the verdict is refused (`crate::unlent`).
+        ContentSource::Mapped | ContentSource::Copied(..) => {
+          match self.content.get(path.as_str()) {
+            Some(Content::Named(identity)) if !keeps_base(identity.len, ops) => {
+              apply_over((&[], identity.len), ops, post_state)
+            }
+            _ => apply(self.head_bytes(path).unwrap_or_default(), ops, post_state),
+          }
+        }
+      };
+      *bytes = Some(made);
+      self
+        .mapped_files_made
+        .set(self.mapped_files_made.get().saturating_add(1));
+    }
+  }
   ///
   /// `names` are the effects' places whose files are named for the object they are the whole of
-  /// ([`named_files`]).
+  /// ([`named_files`]). One run of [`Green::commit_begin`] and [`Green::commit_step`] carried to its end, the one path a
+  /// recorded version applied a slice at a time ([`Applying`]) takes too.
   fn commit(
+    &mut self,
+    effects: Vec<Effect>,
+    version: u64,
+    post_state: crate::named::Post<'_>,
+    names: &[(usize, crate::named::Identity)],
+  ) {
+    let mut run = self.commit_begin(effects, version, post_state, names);
+    while !self.commit_step(&mut run, &mut || false) {}
+  }
+
+  /// A commit's work before any effect is applied ([`Green::commit`]): the mapped files made from the head the verdict
+  /// judged, the node moves and copied links derived from it, and the copies applied, each before the head changes.
+  fn commit_begin(
     &mut self,
     mut effects: Vec<Effect>,
     version: u64,
     post_state: crate::named::Post<'_>,
     names: &[(usize, crate::named::Identity)],
-  ) {
+  ) -> CommitRun {
     // First, before a copy or a node move changes the head: each mapped file from the head the verdict judged.
     self.make_mapped(&mut effects, post_state, &[]);
     let moves = self.node_moves(&effects);
@@ -5928,34 +6055,82 @@ impl Green {
     effects.extend(linked);
     let mut changed: BTreeSet<String> = effects.iter().map(|e| e.path().to_owned()).collect();
     changed.extend(self.commit_copies(&effects, version));
-    let mut staged = Staged::default();
-    // The effects' places are where the verdict put them: the node moves and links are added after every one.
-    for (place, effect) in effects.into_iter().enumerate() {
-      let name = names
-        .binary_search_by_key(&place, |(named, _)| *named)
-        .ok()
-        .and_then(|at| names.get(at))
-        .map(|(_, identity)| *identity);
-      self.apply_effect(effect, version, &mut staged, name);
+    CommitRun {
+      version,
+      effects: effects.into_iter(),
+      place: 0,
+      names: names.to_vec(),
+      staged: Staged::default(),
+      delta: BTreeMap::new(),
+      changed,
+      phase: CommitPhase::Effects,
     }
-    for path in staged.removed {
-      self.remove_file_now(&path, version);
+  }
+
+  /// Takes `run` on an effect, a staged removal or a staged file at a time, at least one, until `spent` says its caller's
+  /// slice is spent: whether it has ended (its delta pushed and its changes recorded). No count of units: a file set
+  /// costs many times a removal, so the caller's clock, not a number, ends the slice.
+  fn commit_step(&mut self, run: &mut CommitRun, spent: &mut dyn FnMut() -> bool) -> bool {
+    loop {
+      match run.phase {
+        // The effects' places are where the verdict put them: the node moves and links are added after every one.
+        CommitPhase::Effects => match run.effects.next() {
+          Some(effect) => {
+            let place = run.place;
+            run.place = place.saturating_add(1);
+            let name = run
+              .names
+              .binary_search_by_key(&place, |(named, _)| *named)
+              .ok()
+              .and_then(|at| run.names.get(at))
+              .map(|(_, identity)| *identity);
+            self.apply_effect(effect, run.version, &mut run.staged, name);
+          }
+          None => {
+            // The files removed in the order they were staged.
+            run.staged.removed.reverse();
+            run.phase = CommitPhase::Removed;
+          }
+        },
+        CommitPhase::Removed => match run.staged.removed.pop() {
+          Some(path) => self.remove_file_now(&path, run.version),
+          None => {
+            // The files are set in the order they were staged.
+            run.staged.set.reverse();
+            run.phase = CommitPhase::Set;
+          }
+        },
+        CommitPhase::Set => match run.staged.set.pop() {
+          Some(file) => self.set_file(file, run.version, &mut run.delta),
+          None => {
+            self.commit_finish(run);
+            return true;
+          }
+        },
+        CommitPhase::Ended => return true,
+      }
+      if spent() {
+        return false;
+      }
     }
-    let mut delta: BTreeMap<String, Vec<Op>> = BTreeMap::new();
-    for file in staged.set {
-      self.set_file(file, version, &mut delta);
-    }
+  }
+
+  /// A commit's end: each path emptied takes its metadata with it once nothing stands there, then its delta and changes
+  /// are recorded.
+  fn commit_finish(&mut self, run: &mut CommitRun) {
     // A file, a directory or a link this version removed takes its mode and attributes with it once nothing stands at
     // its path (a rename or a file made again in the same version keeps them), as a special's do: they are the inode's,
     // so a path made again later starts without them (A-618; a file a client deleted and pushed again kept the deleted
     // one's mode 0755).
-    for path in staged.emptied {
+    let version = run.version;
+    for path in core::mem::take(&mut run.staged.emptied) {
       if !self.holds(&path) {
         self.drop_metadata(&path, version);
       }
     }
-    self.deltas.push(delta);
-    self.record_changes(version, changed);
+    self.deltas.push(core::mem::take(&mut run.delta));
+    self.record_changes(version, core::mem::take(&mut run.changed));
+    run.phase = CommitPhase::Ended;
   }
 
   /// The effects a version's node moves add to it (A-646: a hard link names its node, never a
@@ -7073,19 +7248,24 @@ impl Green {
     let places = post.run_places();
     let mut wanted: Vec<(usize, usize)> = Vec::new();
     for (place, effect) in effects.iter().enumerate() {
-      let Effect::SetContent(path, None, ops, source) = effect else {
-        continue;
-      };
-      let (base_len, ops) = match source {
-        ContentSource::Created(declared) => (0, declared.as_slice()),
-        ContentSource::Mapped => (self.content.len_of(path).unwrap_or(0), ops.as_slice()),
-        ContentSource::Copied(..) => continue,
-      };
-      if let Some(run) = sole_run(base_len, ops, &places) {
+      if let Some(run) = self.sole_run_of(effect, &places) {
         wanted.push((place, run));
       }
     }
     wanted
+  }
+
+  /// The one run `effect` takes whole, where its file is made of that run alone ([`Green::sole_runs`]'s each effect).
+  fn sole_run_of(&self, effect: &Effect, places: &BTreeMap<(u64, u64), usize>) -> Option<usize> {
+    let Effect::SetContent(path, None, ops, source) = effect else {
+      return None;
+    };
+    let (base_len, ops) = match source {
+      ContentSource::Created(declared) => (0, declared.as_slice()),
+      ContentSource::Mapped => (self.content.len_of(path).unwrap_or(0), ops.as_slice()),
+      ContentSource::Copied(..) => return None,
+    };
+    sole_run(base_len, ops, places)
   }
 
   /// Commits an accepted version as its chain entry recorded it, the next version after the head (§4.16, §4.8 recovery;
@@ -7099,56 +7279,225 @@ impl Green {
     inc: &mut Increment,
     applied: &[crate::chain_entry::Applied],
   ) -> u64 {
+    match self.begin_applying(inc, applied) {
+      Begun::Answered(version) => version,
+      Begun::Applying(mut run) => loop {
+        match self.apply_step(&mut run, inc, applied, &mut || false) {
+          ApplyStep::More => {}
+          ApplyStep::Done(version) | ApplyStep::Answered(version) => return version,
+          // No owner here to lend them: nothing commits, the head answered (its owner applies again once it has).
+          ApplyStep::Lend(_) => return self.head(),
+        }
+      },
+    }
+  }
+
+  /// Begins applying `applied` for `inc` as its chain entry records it, a slice at a time ([`Green::apply_step`]); what
+  /// [`Green::apply_recorded`] is, run to its end. Answered at once, nothing begun, for a green that owes a push (the
+  /// entry kept in order, its version answered), an increment accepted already (its version), or one naming a run not
+  /// read yet (the head, nothing committed).
+  ///
+  /// **Contract.** Between its begin and its end ([`ApplyStep::Done`]) no reader may read the green and nothing else may
+  /// change it: its histories hold the version's values before its head names the version. An import's batch (no
+  /// session served while it imports) and a recovery's replay (not served until rebuilt) keep it. A run dropped before
+  /// its end leaves the green part applied: its owner makes it again from its chain, which holds the version.
+  pub fn begin_applying(
+    &mut self,
+    inc: &mut Increment,
+    applied: &[crate::chain_entry::Applied],
+  ) -> Begun {
     // A green that owes a push takes a later recorded version in order, to apply once it is materialized (P2): the
     // version it stands for is answered, so a replay goes on.
     if let Some(owed) = &self.owed {
       let at = u64::try_from(self.owed_tail.len()).unwrap_or(u64::MAX);
       let version = owed.version().saturating_add(at).saturating_add(1);
       self.owed_tail.push((inc.clone(), applied.to_vec()));
-      return version;
+      return Begun::Answered(version);
     }
     // An increment already accepted is answered its version and commits nothing, as a submit would: a chain holding one
     // increment twice is corrupt, and its caller sees the version differ from the one the entry was recorded as.
     if let Some(version) = self.accepted.get(&inc.id) {
-      return *version;
+      return Begun::Answered(*version);
     }
     // A named run not read yet (A-760) is never applied as zeros: nothing commits, and the head answered differs from
     // the version the entry was recorded as, which its caller refuses as it refuses any chain that disagrees. A run the
     // apply names whole, which no op reads, is never read for it (A-887, [`Green::replay_reads`]).
     if inc.unread_among(&inc.replay_reads(applied)).is_some() {
-      return self.head();
+      return Begun::Answered(self.head());
     }
-    // Nor over a text held by name alone with no bytes lent it (A-760 (b) 4d): nothing commits, and its owner lends the
-    // objects [`Green::recorded_unlent`] names and applies the entry again.
-    let (mut effects, unlent) = crate::unlent::scope(|| self.recorded_effects(inc, applied));
-    if !unlent.is_empty() {
-      return self.head();
+    let copies = applied
+      .iter()
+      .enumerate()
+      .filter(|(_, effect)| matches!(effect, crate::chain_entry::Applied::CopyTree { .. }))
+      .map(|(place, _)| place)
+      .collect();
+    Begun::Applying(Box::new(Applying {
+      id: inc.id,
+      copies,
+      effects: Vec::with_capacity(applied.len()),
+      at: 0,
+      prep: Prep::Effects,
+      read: Vec::new(),
+      commit: None,
+    }))
+  }
+
+  /// Takes `run` on a unit of its work at a time, at least one, until `spent` says the caller's slice is spent: an effect
+  /// of the entry made, or one of its commit's ([`Green::commit_step`]); its version once it ends, or the head where a text it reads is held by name alone with no bytes lent
+  /// it (A-760 (b) 4d: nothing committed, its owner lends the objects [`Green::recorded_unlent`] names and applies the
+  /// entry again). `inc` and `applied` are the ones it began with.
+  pub fn apply_step(
+    &mut self,
+    run: &mut Applying,
+    inc: &mut Increment,
+    applied: &[crate::chain_entry::Applied],
+    spent: &mut dyn FnMut() -> bool,
+  ) -> ApplyStep {
+    let Some(commit) = run.commit.as_mut() else {
+      return self.apply_effects_step(run, inc, applied, spent);
+    };
+    if self.commit_step(commit, spent) {
+      let version = commit.version;
+      self.accepted.insert(run.id, version);
+      ApplyStep::Done(version)
+    } else {
+      ApplyStep::More
     }
-    // A file a named run makes whole takes the run's buffer, read for this apply (A-760), with no copy, as a judged
-    // verdict's commit does (`Green::commit_held`); every other file is made first, while every buffer is in place.
-    let mut read = core::mem::take(&mut inc.named.read.0);
-    let runs = &inc.named.runs;
-    let sole = self.sole_runs(
-      &effects,
-      crate::named::Post::of(&inc.post_state, &read, runs),
-    );
-    let names = named_files(&sole, runs);
-    let wholes = alone(sole);
-    self.make_mapped(
-      &mut effects,
-      crate::named::Post::of(&inc.post_state, &read, runs),
-      &wholes,
-    );
-    move_whole_runs(&mut effects, &mut read, &wholes);
-    let version = self.head().saturating_add(1);
-    self.commit(
-      effects,
-      version,
-      crate::named::Post::of(&inc.post_state, &read, runs),
-      &names,
-    );
-    self.accepted.insert(inc.id, version);
-    version
+  }
+
+  /// [`Green::apply_step`] before its commit: the entry's effects made one at a time, at least one, until `spent`, each
+  /// read the head checked for a text held by name alone with no bytes lent (`crate::unlent`); once every one is made,
+  /// its commit begun.
+  fn apply_effects_step(
+    &mut self,
+    run: &mut Applying,
+    inc: &mut Increment,
+    applied: &[crate::chain_entry::Applied],
+    spent: &mut dyn FnMut() -> bool,
+  ) -> ApplyStep {
+    if run.at < applied.len() {
+      let copies = copy::EntryCopies::at(applied, &run.copies);
+      let (from, made) = (run.at, run.effects.len());
+      let ((), unlent) = crate::unlent::scope(|| {
+        while let Some(effect) = applied.get(run.at) {
+          run
+            .effects
+            .push(self.effect_of(effect, (inc.post(), &copies)));
+          run.at = run.at.saturating_add(1);
+          if spent() {
+            break;
+          }
+        }
+      });
+      if !unlent.is_empty() {
+        // The slice undone, to be made again once its texts are lent.
+        run.effects.truncate(made);
+        run.at = from;
+        return ApplyStep::Lend(unlent);
+      }
+      return ApplyStep::More;
+    }
+    self.prepare_step(run, inc, spent)
+  }
+
+  /// [`Green::apply_step`] once every effect is made: the commit's preparation a phase at a time, each an effect at a
+  /// time until `spent` (A-917's owed phases, cut 3: it was one call of 30 ms at 9,000 files, debug): each effect's sole
+  /// run, then each one's read of a text held by name alone checked (a slice that meets one undone, and the texts asked
+  /// for, [`ApplyStep::Lend`]), then each mapped file made; then the commit begun ([`Green::commit_begin`]).
+  fn prepare_step(
+    &mut self,
+    run: &mut Applying,
+    inc: &mut Increment,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> ApplyStep {
+    loop {
+      match &mut run.prep {
+        Prep::Effects => {
+          // A file a named run makes whole takes the run's buffer, read for this apply (A-760), with no copy, as a
+          // judged verdict's commit does (`Green::commit_held`); every other file is made first, while every buffer
+          // is in place.
+          run.read = core::mem::take(&mut inc.named.read.0);
+          let post = crate::named::Post::of(&inc.post_state, &run.read, &inc.named.runs);
+          let places = if post.runs.is_empty() && post.declared.is_empty() {
+            BTreeMap::new()
+          } else {
+            post.run_places()
+          };
+          run.prep = Prep::Sole {
+            places,
+            sole: Vec::new(),
+            at: 0,
+          };
+        }
+        Prep::Sole { places, sole, at } => {
+          if !places.is_empty() {
+            while let Some(effect) = run.effects.get(*at) {
+              if let Some(found) = self.sole_run_of(effect, places) {
+                sole.push((*at, found));
+              }
+              *at = at.saturating_add(1);
+              if run.effects.get(*at).is_some() && spent() {
+                return ApplyStep::More;
+              }
+            }
+          }
+          let sole = core::mem::take(sole);
+          let names = named_files(&sole, &inc.named.runs);
+          let wholes = alone(sole);
+          run.prep = Prep::Reads {
+            names,
+            wholes,
+            at: 0,
+          };
+        }
+        Prep::Reads { names, wholes, at } => {
+          let from = *at;
+          let ((), unlent) = crate::unlent::scope(|| {
+            while let Some(effect) = run.effects.get(*at) {
+              self.note_unlent_read((*at, effect), wholes);
+              *at = at.saturating_add(1);
+              if spent() {
+                break;
+              }
+            }
+          });
+          if !unlent.is_empty() {
+            // The slice undone, to be checked again once its texts are lent.
+            *at = from;
+            return ApplyStep::Lend(unlent);
+          }
+          if run.effects.get(*at).is_some() {
+            return ApplyStep::More;
+          }
+          run.prep = Prep::Mapped {
+            names: core::mem::take(names),
+            wholes: core::mem::take(wholes),
+            at: 0,
+          };
+        }
+        Prep::Mapped { names, wholes, at } => {
+          let post = crate::named::Post::of(&inc.post_state, &run.read, &inc.named.runs);
+          while let Some(effect) = run.effects.get_mut(*at) {
+            self.make_mapped_one((*at, effect), post, wholes);
+            *at = at.saturating_add(1);
+            if run.effects.get(*at).is_some() && spent() {
+              return ApplyStep::More;
+            }
+          }
+          let mut effects = core::mem::take(&mut run.effects);
+          move_whole_runs(&mut effects, &mut run.read, wholes);
+          let version = self.head().saturating_add(1);
+          let names = core::mem::take(names);
+          run.commit = Some(self.commit_begin(
+            effects,
+            version,
+            crate::named::Post::of(&inc.post_state, &run.read, &inc.named.runs),
+            &names,
+          ));
+          return ApplyStep::More;
+        }
+      }
+    }
   }
 
   /// The effects a chain entry records for `inc`, with every read its commit makes of the head checked
@@ -8208,6 +8557,8 @@ mod node_exclusive_tests;
 #[cfg(test)]
 mod unseen_bytes_tests;
 
+#[cfg(test)]
+mod applying_tests;
 #[cfg(test)]
 mod fold_tests;
 #[cfg(test)]

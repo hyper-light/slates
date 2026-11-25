@@ -1173,6 +1173,150 @@ fn a_push_leaves_its_versions_derived_behind_it_so_the_first_fetch_derives_nothi
   );
 }
 
+/// Shape: the commits of [`tagged_line_request`]'s line, and every second one tagged: enough versions that their
+/// derivation takes many turns, so a fetch arrives while it is under way.
+const DERIVE_TAGGED_LINE: usize = 300;
+
+/// A request creating `main` at a line of [`DERIVE_TAGGED_LINE`] commits and a lightweight tag at every second one, each tag a
+/// version of its own to derive.
+fn tagged_line_request() -> Vec<u8> {
+  let mut objects = Vec::new();
+  let mut commits = Vec::new();
+  let mut parent = None;
+  for at in 0..DERIVE_TAGGED_LINE {
+    let (commit, made) = flat_commit(1, &format!("tagged line {at}"), parent);
+    objects.extend(made);
+    commits.push(commit.to_string());
+    parent = Some(commit);
+  }
+  let names: Vec<String> = (0..DERIVE_TAGGED_LINE / 2)
+    .map(|at| format!("refs/tags/v{at}"))
+    .collect();
+  let head = commits.last().expect("a head").clone();
+  let mut created: Vec<(&str, &str, &[u8])> =
+    vec![("", head.as_str(), b"refs/heads/main".as_slice())];
+  for (at, name) in names.iter().enumerate() {
+    created.push(("", commits[2 * at].as_str(), name.as_bytes()));
+  }
+  request(&created, CAPABILITIES, &pack_of_objects(&objects))
+}
+
+/// The derivation as this shard counted it: a reader's turns, the task behind's, handed over, and its nanoseconds.
+fn derive_driven(state: &mut ShardState) -> [u64; 4] {
+  use crate::vcs_store::git_derive::{BEHIND_HANDED, BEHIND_TURNS, NS, READ_TURNS};
+  let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+  [
+    count(READ_TURNS),
+    count(BEHIND_TURNS),
+    count(BEHIND_HANDED),
+    count(NS),
+  ]
+}
+
+/// A fetch's derivation of [`tagged_line_request`]'s repository `name` on `daemon`, the push made `behind` as the edge
+/// makes it (a task of the shard, so a derivation begins behind it as it ends) or not (in a step, so none does): the
+/// fetch's read turns, the hand-overs, and its own time.
+fn fetch_after_tagged_push(
+  daemon: &crate::Daemon,
+  name: &'static str,
+  behind: bool,
+) -> (u64, u64, u64) {
+  let repository = crate::daemon::observe_first(daemon, move |state| git_repository(state, name));
+  let request = tagged_line_request();
+  if behind {
+    let (created, _) = pushed_in_steps(daemon, repository, &request).unwrap();
+    assert!(reasons(&created).iter().all(|reason| reason == b"ok"));
+  } else {
+    let said = crate::daemon::observe_first(daemon, move |state| {
+      reasons(&pushed(state, repository, &request))
+    });
+    assert!(said.iter().all(|reason| reason == b"ok"));
+  }
+  let before = crate::daemon::observe_first(daemon, derive_driven);
+  let (took_ns, _, _) = derived_for_read(daemon, repository);
+  let after = crate::daemon::observe_first(daemon, derive_driven);
+  (after[0] - before[0], after[2] - before[2], took_ns)
+}
+
+/// Main 01a20182's ruling of 2026-11-25 (derive_behind withdrawn: a clone arriving mid-derivation ran it in slivers, the
+/// task behind and the fetch each yielding to the other at every unit, 721,260 turns against 338). Do: push
+/// [`tagged_line_request`] as the edge does, so a derivation begins behind it, and at once derive as the first fetch's
+/// request does; then the same to another repository pushed in a step, nothing behind it. Expect: the fetch handed the
+/// derivation (the task behind stopped, `vcs_store.git_derive.behind_handed`), so it is the arrival mid-derivation this
+/// measures; and the fetch no later than the one with nothing behind: no more of its own turns than it, but the
+/// hand-over's ([`PACED_TURNS`]: its first turns meet the task behind waiting until that task's next poll stops it),
+/// and no more than twice its time. Red before: the two yielding to each other, the fetch's turns many times the other's.
+/// The derivation by driver as this shard counted it from its start: [turns, ns, derived] for a reader, for the task
+/// behind, and in all; and the readers that left versions due.
+fn by_driver(state: &mut ShardState) -> ([[u64; 3]; 3], u64) {
+  use crate::vcs_store::git_derive::{
+    BEHIND_TURNS, BY_DRIVER, DERIVED, NS, READ_LEFT_DUE, READ_TURNS, TURNS,
+  };
+  let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+  (
+    [
+      [count(READ_TURNS), count(BY_DRIVER[0]), count(BY_DRIVER[1])],
+      [
+        count(BEHIND_TURNS),
+        count(BY_DRIVER[2]),
+        count(BY_DRIVER[3]),
+      ],
+      [count(TURNS), count(NS), count(DERIVED)],
+    ],
+    count(READ_LEFT_DUE),
+  )
+}
+
+/// Main 01a20182's order of 2026-11-25 (the clone after a push derived its units at twice the cost, 4,670 of its 5,110
+/// turns the task behind's, and the counters could not say whose time or which side of the hand-over). Do: push
+/// [`tagged_line_request`] as the edge does, a derivation begun behind it, and derive at once as the first fetch does.
+/// Expect: the reader's and the task behind's turns, nanoseconds and versions each sum to the derivation's own
+/// (`vcs_store.git_derive.{read,behind}_{ns,derived}` beside `turns`, `ns`, `derived`), whichever drove how much (the task
+/// behind may finish before the reader begins), and no reader left versions due (`vcs_store.git_derive.read_left_due`). Red before: no split counted.
+#[test]
+fn a_derivations_turns_time_and_versions_are_counted_by_who_drove_them() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let _ = fetch_after_tagged_push(&daemon, "by-driver", true);
+  let (counted, left_due) = crate::daemon::observe_first(&daemon, by_driver);
+  daemon.stop();
+  let [read, behind, all] = counted;
+  eprintln!(
+    "derive by driver [turns, ns, derived]: read {read:?}, behind {behind:?}, all {all:?}; left due {left_due}"
+  );
+  for at in 0..3 {
+    assert_eq!(
+      read[at] + behind[at],
+      all[at],
+      "reader and task behind sum to the whole: {counted:?}"
+    );
+  }
+  assert!(all[2] > 0, "the derivation ran: {counted:?}");
+  assert_eq!(left_due, 0, "no reader left versions due");
+}
+
+#[test]
+fn a_fetch_arriving_mid_derivation_is_no_later_than_one_with_nothing_behind() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (turns, handed, took) = fetch_after_tagged_push(&daemon, "mid-derivation", true);
+  let (alone_turns, _, alone_took) = fetch_after_tagged_push(&daemon, "nothing-behind", false);
+  daemon.stop();
+  eprintln!(
+    "mid-derivation: {turns} turns, {took} ns, {handed} handed; alone: {alone_turns} turns, {alone_took} ns"
+  );
+  assert!(
+    turns <= alone_turns + PACED_TURNS,
+    "no more turns than alone, but the hand-over's: {turns} against {alone_turns}"
+  );
+  assert!(
+    took <= 2 * alone_took,
+    "no later than alone: {took} ns against {alone_took}"
+  );
+  assert!(
+    handed >= 1,
+    "the fetch arrived mid-derivation and was handed it"
+  );
+}
+
 /// Lets go of every window of `pack` on this shard by hand, as a landed pack's let-go would (its home told first, each
 /// window marked landed; the commit's own let-go is withdrawn, `vcs_store::LANDED_LET_GO`): the windows.
 fn let_go_by_hand(state: &mut ShardState, pack: &[u8]) -> Vec<slates_vcs::ContentId> {

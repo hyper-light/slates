@@ -27,6 +27,11 @@ fn scratch(name: &str) -> PathBuf {
 /// Shape: a test's store as the daemon sizes it (`slates_api`'s `store_sizing`): a memtable of one trunk node, eight
 /// 64 KiB extents (512 KiB), 1 GiB of disk.
 fn start(dir: &Path) -> StoreOwner {
+  start_spinning(dir, 0)
+}
+
+/// [`start`], its owner spinning at most `spin_cap_ns` for work before it parks.
+fn start_spinning(dir: &Path, spin_cap_ns: u64) -> StoreOwner {
   let grant = StoreGrant {
     repository: 1,
     target: StoreRoot::identify(dir).unwrap(),
@@ -38,7 +43,12 @@ fn start(dir: &Path) -> StoreOwner {
     extent_bytes: 64 << 10,
     fanout: 8,
   };
-  StoreOwner::start(StoreRoot::open(dir, &grant).unwrap(), sizing, 16).unwrap()
+  StoreOwner::start(
+    StoreRoot::open(dir, &grant).unwrap(),
+    sizing,
+    (16, spin_cap_ns),
+  )
+  .unwrap()
 }
 
 /// Shape: one shard, a few tasks.
@@ -208,6 +218,7 @@ fn a_shard_reads_an_old_file_revision_through_the_owner_across_a_restart() {
         offset: 0,
         len: payload.len() as u64,
       },
+      form: slates_store::texts::Form::Raw,
     };
     changesets.push((payload, texts::encode(&[entry])));
   }
@@ -476,7 +487,7 @@ fn an_owner_whose_store_cannot_open_answers_every_request_why() {
     extent_bytes: 64 << 10,
     fanout: 8,
   };
-  let owner = StoreOwner::start(StoreRoot::open(&dir, &grant).unwrap(), refused, 16).unwrap();
+  let owner = StoreOwner::start(StoreRoot::open(&dir, &grant).unwrap(), refused, (16, 0)).unwrap();
   let handle = owner.handle();
   let runtime = runtime();
   let (landed, listed) = runtime
@@ -664,4 +675,78 @@ fn a_reads_wait_on_the_owner_is_split_into_parts_that_sum_to_it() {
   assert!(waits.disk_ns > 0, "the reads' disk time counted: {waits:?}");
   assert!(waits.most_ns > 0 && waits.most_ns <= waits.total_ns);
   assert_eq!(left.asks, 0, "none left after the take");
+}
+
+/// Shape: the owner's spin cap in [`back_to_back_reads_are_met_spinning_not_parked`], 2 ms: past this machine's wake
+/// (the 57k clone measured 178 us a request), so a gap between asks a task makes back to back fits inside it.
+const SPIN_CAP_NS: u64 = 2_000_000;
+
+/// Shape: the reads of [`back_to_back_reads_are_met_spinning_not_parked`], each one place of a landed payload.
+const BACK_TO_BACK: u64 = 64;
+
+/// Shape: three in four of those reads, met parked by the owner that never spins (some are queued behind a read, met
+/// neither way: 2 of 64 here). The spinning owner is held to more met spinning than parked, not to a share: on a loaded
+/// machine its asker's thread is descheduled past the window (46 of 64 met spinning at the MacBook's load beside a
+/// build, 61 alone).
+const SPUN_AT_LEAST: u64 = BACK_TO_BACK * 3 / 4;
+
+/// `BACK_TO_BACK` reads asked back to back of a payload landed through an owner spinning at most `spin_cap_ns`: the
+/// thread's read waits.
+fn reads_back_to_back(name: &str, spin_cap_ns: u64) -> slates_store::owner::AskWaits {
+  let dir = scratch(name);
+  let payload: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
+  let identity = *blake3::hash(&payload).as_bytes();
+  let owner = start_spinning(&dir, spin_cap_ns);
+  let handle = owner.handle();
+  let waits = runtime()
+    .block_on(async move {
+      handle
+        .land(header(1), vec![(SectionKind::Payload, payload)])
+        .await
+        .unwrap();
+      let _ = slates_store::owner::take_read_waits();
+      for at in 0..BACK_TO_BACK {
+        let place = slates_store::texts::Place {
+          payload: identity,
+          offset: at * 1_024,
+          len: 1_024,
+        };
+        handle.places(vec![place]).await.unwrap();
+      }
+      slates_store::owner::take_read_waits()
+    })
+    .unwrap();
+  owner.stop().unwrap();
+  let _ = std::fs::remove_dir_all(&dir);
+  waits
+}
+
+/// Goal 93, main's ruling of 2026-11-25 (the 57k clone's store wait 86.6% the owner's wake, 144.82 s over 812,896
+/// requests, about 178 us each). Do: read a landed payload by [`BACK_TO_BACK`] places asked one after another, through an
+/// owner that never spins, then through one that spins at most [`SPIN_CAP_NS`]. Expect: with no spin every read met
+/// parked (the red: a wake a request, at least [`SPUN_AT_LEAST`]); with the spin, more met spinning than parked (the
+/// window is learned from the gaps), and the owner's wake a read within the spin's window, the parts still summing to
+/// the whole.
+#[test]
+fn back_to_back_reads_are_met_spinning_not_parked() {
+  let parked = reads_back_to_back("spin-none", 0);
+  assert_eq!(parked.asks, BACK_TO_BACK);
+  assert_eq!(parked.spin_hits, 0, "no spin, no read met spinning");
+  assert!(
+    parked.parks >= SPUN_AT_LEAST,
+    "no spin: a wake a read, but those queued behind one: {parked:?}"
+  );
+  let spun = reads_back_to_back("spin-cap", SPIN_CAP_NS);
+  assert_eq!(spun.asks, BACK_TO_BACK);
+  assert!(
+    spun.spin_hits > spun.parks,
+    "more reads met spinning than parked: {spun:?}"
+  );
+  assert!(
+    spun.wake_ns / BACK_TO_BACK <= SPIN_CAP_NS,
+    "the wake within the window: {spun:?}"
+  );
+  let parts = spun.behind_ns + spun.wake_ns + spun.serve_ns + spun.disk_ns + spun.back_ns;
+  assert_eq!(parts, spun.total_ns);
+  println!("owner spin: none {parked:?}; capped {spun:?}");
 }

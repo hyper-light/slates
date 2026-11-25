@@ -63596,7 +63596,8 @@ Applied in the same change to: `crates/git/src/store/{graph,mod}.rs`, `crates/gi
     voter's session on the same loan to another plane at two of its replication rounds in a row, a hold across a round
     (a loan seen at one round only overlapped it; the council's own earlier round's loan not counted).
   - A push's homing runs within `fleet::homing_budget`: the live commit's deadline, or the homing window where that is
-    longer, `derived!` `detection + confirmation + (2 + 2 (members − 1)) × period` from the failover estimate (A-363)
+    longer, `derived!` `detection + confirmation + (2 + 2 (members − 1)) × period` from the failover estimate (A-363;
+  since A-914 (a), the learned silence to a takeover install in place of `detection + confirmation` once one is measured)
     and the coordinator's measured period, derived on the control shard and fanned with the failover delay. Within it
     `home_in_region` ranks the window's homes, puts to those that have not kept it (a round within the live deadline),
     and where one did not keep it waits for this node's next configuration install (A-902's install wake) and ranks
@@ -63656,6 +63657,101 @@ lane, and a status line), `crates/cluster/src/{homes,failover}.rs`,
     short under load (5 of 10 at about 48 on 18 cores, at the homing): A-912's follow-up, owed (GAPS).
 - **Applied in the same change to** §4.16 "Apply on holders", `crates/server/src/{merge_service,merge_origin}.rs`,
   `crates/server/tests/fleet.rs`, GAPS.
+
+### A-914 (a) — A push's homing window is the silence to a takeover install this deployment measured, once it has measured one (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-24 and 2026-11-25 ((1), and (a) of its split); A-912's follow-up; amends A-912 and A-363)
+
+- **Why.** A-912's homing window was `detection + confirmation + (2 + 2 (members − 1)) × period`, its first two terms
+  A-363's estimate from typical timings. At a load of about 48 on 18 cores, A-912's push test failed 5 of 10 at its
+  homing: the window (2.7 to 4.1 s) was short of a member's stop to its takeover (2.2 to 4.7 s). Load is the normal case
+  here, so the window is to come from the real thing on this deployment: a death's silence to its takeover install.
+- **The change.**
+  - Every member learns at the install, not only the round's successor. Once a coordinator period, the control shard
+    reads the regional configuration's fencing epochs (`takeover::note_takeover_installs`). A host whose epoch rose
+    since the last read was taken over by an install between (`RegionalConfiguration::take_over` bumps it). A host
+    absent from the last read is not one, so a newcomer's first epoch is no takeover.
+  - The silence runs from the host's last answer to this node's detector to that read, within a period of the install.
+    The last answers are kept each period (`ShardState::last_answers`, bounded by the members), because the detector
+    forgets a dead peer once its death stands, before a loaded council has taken it over. A first version read the
+    detector at the successor's round and found nothing.
+  - Each silence is folded into the failover estimator (`Failover::silence_to_install`). The homing window
+    (`fleet::homing_window`, still `derived!`) is its running tail plus the takeover's steps once there is one, and
+    the estimate's detection and confirmation before.
+  - Counted: `failover.silence_sampled`, `failover.silence_longest_ns`, `failover.silence_unmeasured` (a taken-over
+    host with no answer kept) and `fleet.homing_window.learned`. Each death is logged ("a death's silence to its
+    takeover install") beside the detector's and the coordinator's period tails, their maxima over a recent window
+    (`failover::RecentMax`, the failover delay's worth of periods), and the estimate's terms. Main's batch reads these
+    for (c).
+  - Test support: `Daemon::inject_period_stretch` sleeps before each coordinator period; `Daemon::homing_window` reads
+    the window and its terms.
+- **Measured** (macOS arm64, debug, 2026-11-25, 7 runs of a 4-node `f = 1` fleet, coordinator periods stretched 300 ms,
+  two deaths). Silence to a takeover install: 3.99 to 5.24 s, at every member, at both deaths.
+  - First death: the estimate's window was 3.3 to 3.8 s, and that push was refused `retry` at its homing in 4 of 7.
+    This is the red for a first death's prior, (c), which is still owed.
+  - Second death: the window was learned (16.9 to 18.7 s) in 7 of 7. Its push landed 4 of 7. Two were refused at the
+    record barrier: the new version's merge records were still unplaced 13 s after the takeover installed. That is
+    A-912's sibling, the next piece. One fell short at its homing, cause not yet seen. Once the test awaited each
+    death's unseating from the council, 2 of 6 landed and 4 were refused at the barrier. Without that wait, 2 runs in
+    11 never took the second death over: at `f = 1`, a second death before the first's voter was replaced leaves no
+    council majority. That is the fault model, not a defect.
+  - The learned tail from one sample is wide (about 13.3 s from a 4.5 s silence). Main's ruling: after (c), see
+    whether the estimator should weight its sample count.
+  - A detector stretched as well (a sleep each turn of its loop, one datagram a turn) starved its probes' answers and
+    stated a 949 s window: that is not a loaded host, so only the coordinator is stretched.
+- **Tests.**
+  - Fleet `a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first`. At the second death a's
+    window is learned (samples ≥ 1, its source logged as learned). The first death's measured silence beside the
+    estimate's window is recorded, not asserted.
+  - A named debt: the second push is not asserted to land until the barrier piece (GAPS). Red before: nothing was
+    learned, so the window was always the estimate's.
+  - `daemon::tests::a_takeover_install_learns_its_hosts_silence_from_the_answer_kept_for_it`: the kept peer's silence
+    is sampled, the peer with none kept is counted unmeasured, and a newcomer is never taken for a takeover.
+  - `slates-cluster` failover: `a_recent_maximum_forgets_a_slow_stretch_once_its_window_passes` and
+    `the_learned_silence_is_none_before_a_death_and_counts_its_deaths_after`.
+  - Focused fleet runs: a912, a894 and a915.
+- **Models.** None of `docs/wip/models/` models the failover estimate or a push's homing; no spec changed.
+
+Applied in the same change to: the A-912 entry's homing window (learned once measured), `crates/cluster/src/
+{failover,member_plane}.rs`, `crates/server/src/{fleet,takeover,state,daemon,lib}.rs`, `crates/server/tests/fleet.rs`,
+GAPS.
+
+### A-918 (i) — A holder behind a green's record answers it typed (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25 ((3), (2) and B; this is B's first piece); A-912's sibling; amends A-412)
+
+- **Why.** In a914's scene a push during a death was refused at its record barrier, `unable to commit` (2 of 7, then 4
+  of 6). The barrier refusal's log, now naming each pending version's waits, showed the cause. After a death at 3
+  members every member is a green's candidate, so a node that held none of the green joined its cohort. It refused
+  each record above v0 out of order (`record_standing`: no replica, no records), answered nothing, and was shipped the
+  same record every pass for good: `merge.out_of_order` reached 4006 in one red run of the A-918 fleet test. A-412
+  brings a holder up from its own ledger only, and the record plane never ships a placed version again.
+  - Durability held. A-546's settle certifies `f + 1` (`greens_placed_on_current_cohort`), met by the owner and the
+    old candidate.
+  - Liveness did not: once an `f + 1` for the next version needs the newcomer, the version never places.
+- **The change (i).**
+  - Every refusal is typed. A holder behind a record answers `ContentMessage::Behind { object, sequence, reached }`
+    (kind 11; `reached` is the newest version its replica holds, `None` for none of the green). It answers so where it
+    counted `OUT_OF_ORDER` and answered nothing: holding none of the green, or lacking a record its ledger cannot
+    bring it to (`catch_up`). Counted `merge.behind.answered`.
+  - The owner records each behind target on the pending version (`PendingMergeRecord::behind`, bounded by the
+    candidates; a target leaves once it acknowledges), counted `merge.behind.heard`. A refused barrier's log names it,
+    with the version's other waits and the placement: on the refusal's cold path, bounded by the pending versions
+    times the members.
+  - An owner whose build predates kind 11 refuses it typed (`ContentError::UnknownKind`) and reads it as no answer, as
+    it read the silence before. A flag byte past its two values is `ContentError::BadFlag`.
+- **What follows (main's order).** A-919 ships a state log's prefix to a candidate joining past parts every earlier
+  one held. Then B: on `Behind`, the newcomer rebuilds the green through a takeover successor's own path from a live
+  holder, never an owner-pushed second path. The owner holds no per-version records or inputs below a green's floor,
+  so it could not push the chain from v0 anyway.
+- **Tests.**
+  - `slates-cluster` content: `a_behind_answer_has_a_golden_encoding`, and `every_message_round_trips` with both
+    `reached` forms.
+  - `merge_service::tests::a_holder_holding_none_of_a_green_stands_behind_a_later_version_and_next_at_version_zero`.
+  - `merge_service::tests::an_owner_records_a_targets_behind_answer_on_its_pending_version`.
+  - The fleet test `a918_a_candidate_a_death_brings_in_is_shipped_the_greens_chain_and_holds_the_next_version` is red
+    until B and lands with it.
+- **Models.** None of `docs/wip/models/` models a holder's merge answers; no spec changed.
+
+Applied in the same change to: the A-412 note in `merge_service::catch_up`'s doc (it now answers behind),
+`crates/cluster/src/content.rs`, `crates/server/src/{merge_service,state_log}.rs`, `crates/server/tests/fleet.rs`
+(a914's wait factored out as `poll_taken_over_and_unseated`), GAPS.
 
 ### A-915 — Nothing acknowledged rests on a part only the dead owner held: a repository's creation answers once its root's join is at f + 1 too, and an adoption never waits for a join no owner is left to ship (2026-11-24, w-shared for main 01a20182, its ruling (1); a894's flake, my regression from A-908 part 4; amends A-894 and A-908)
 
@@ -63726,3 +63822,66 @@ GAPS.
 - **Evidence.** `git_push::tests::a916_a_fetch_derived_between_two_pushes_leaves_the_store_its_records_make_again`: red
   on main (the oracle differing), green with the write gone.
 
+### Deriving a push's versions behind it: built, withdrawn, returned (2026-11-25, w-git for main 01a20182; status)
+
+- **Built** (750d2bca3): `git_derive::derive_behind`, a task of the shard turning `derive_for_read` as a git push ended,
+  so the first fetch after it found its versions derived (git/git's first clone had spent 12.15 s of its 40.34 s first
+  pack byte deriving the 1,027 versions its push left unknown, `vcs_store.git_derive.ns`).
+- **Withdrawn** (main 01a20182's ruling, the revert after it): two failures. (1) A clone arriving mid-derivation ran the
+  shared derivation in slivers: the task behind and the fetch's own `derive_for_read` both runnable, `paced` stops a
+  turn where someone else waits, so each yielded to the other at every unit (main's git leg: 721,260 turns and 22.69 s
+  for 877 versions, against 338 turns and 12.15 s for 1,027 with nothing behind; the first pack byte 40.3 → 61.9 s).
+  (2) `vcs_http::daemon_edge::tests::a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding` failed under
+  ThreadSanitizer (diag 9, run 45595905963): a listing after the push waited behind the derivation.
+- **Returned** (the commit after the revert's, main 01a20182's go): the task behind a push stops before its next turn
+  wherever a reader drives the repository (`derive_for_read` marks it read-driven while it runs; counted
+  `vcs_store.git_derive.behind_handed`), so the reader turns the kept derivation alone at full turns and keeps what was
+  derived; and, being no reader, the task behind turns a quantum at most (its ceiling the quantum), so whatever comes to
+  the shard meets it within one. Turns are counted by driver (`vcs_store.git_derive.read_turns`, `behind_turns`): a
+  listing never derives (a request derives only where it fetches), and TSan diag 9's listing failure was the old count
+  taking the task behind's turns for the listing's (4 before it, 9 after, where a store with nothing behind counts 0).
+- **Evidence.** `git_push::tests::a_fetch_arriving_mid_derivation_is_no_later_than_one_with_nothing_behind`: red with the
+  task behind turning to the ceiling and never handing over, 446 turns against 1 alone; green, 2 turns and 42.9 ms
+  against 1 and 47.3 ms, handed once. `vcs_http::daemon_edge::tests::a_ref_listing_during_a_derivation_behind_a_push_drives_none_of_it`:
+  red with one count of every derive turn (100 → 117 across the listing); green, a reader's turns 0 → 0 while the task
+  behind turned 364, the listing answered in 14.8 ms (its patience scaled by `test_lane::slowdown`).
+
+### A-917 — A recorded version is applied a slice at a time, and `apply_recorded` is that run carried to its end (2026-11-25, w-svn for main 01a20182, goal 93's slicing piece 3; §4.16, A-760, A-910)
+
+- **Why.** An import's batch applies each recorded version to its green (`RecordedBatch::apply_slice`), a version in one
+  call of `Green::apply_recorded`: at a revision of 9,000 files that was one call of about 120 ms of a debug build's
+  shard (its effects made 14 ms, mapped files 15, effects applied 21, files set 63), the apply's longest slice 196 ms.
+  The call is linear in the version's files, so a larger revision holds its shard longer, without bound.
+- **The change.** `Green::begin_applying(inc, applied)` begins a run (`Applying`), or answers at once where
+  `apply_recorded` did (a green owing a push, an increment accepted already, a run not read); `Green::apply_step(run, inc,
+  applied, units)` takes it on by `units`: the entry's effects made a slice at a time (each slice's reads checked for a
+  text held by name alone with no bytes lent, `crate::unlent`), then the commit's preparation, then its effects applied,
+  its files removed and its files set a unit each (`Green::commit_begin`, `Green::commit_step`, `CommitRun`). One path:
+  `apply_recorded` is the run with no bound on its units, and `Green::commit`, every verdict's commit, is the commit's
+  run carried to its end. The server's batch takes units until its slice's budget is spent (no count: a unit's cost varies, a
+  file set against a file removed), carrying a version's run from one slice to the next.
+- **The contract.** Between a run's begin and its end no reader may read the green and nothing else may change it: its
+  histories hold the version's values before its head names the version. An import's batch keeps it (no session is
+  served while it imports, its landing turn held) and so does a recovery's replay (not served until rebuilt). A run
+  dropped before its end leaves the green part applied; its owner makes the green again from its chain, which holds the
+  version, as a kill between a batch's slices recovers today.
+- **The oracle.** `engine::applying_tests`: generated works in every dimension, submitted to a green, each committed
+  version replayed into one green whole and one a unit a step; after every version the two and the submitter read alike
+  (histories, recounted bytes, head, head identity). A counted test holds a version of 200 files to more steps than its
+  files; the 9,000-file import asserts its version took more than one call (`repository.import_batch.apply_steps`).
+- **Measured** (9,000 files, debug, load about 58): the apply's longest slice 196 ms before, 71 ms after.
+- **The three whole phases, cut (main's ruling (a) of 2026-11-25).** (1) The run takes units until its caller's slice is
+  spent, with no count of units, and the batch reads a version's named texts a copy slice a step before it begins it
+  (`InVersion::Reading`): 71 → 29-39 ms. (2) The run asks its owner to lend the texts it meets, a slice at a time
+  (`ApplyStep::Lend`, the slice made again once lent), so no walk of every effect learns them first: the named-texts
+  oracle replays a unit a step and asks for exactly what the walk names. (3) The commit's preparation is phases of
+  its own (`Prep`: each effect's sole run, its read checked, its mapped file made), and the batch's retention settle
+  and checkpoint take a slice apart from its last version's. By each slice's CPU time on its thread (wall time at load
+  30-60 measured the host as much): the apply's own longest slice 29-77 ms before the cuts, 7.3-7.7 ms after. The slice
+  of the retention and checkpoint alone is 0.3 ms, or up to 47 ms where the checkpoint's paced step runs to its ceiling
+  with no one waiting (A-579's design, ended within a quantum by a waiter's arrival).
+- **Still whole** (each linear in a version's files, about 4 ms of the 7 at 9,000): `Green::begin_applying`'s check that
+  every run the replay reads is read (`replay_reads`, `unread_among`), and the preparation's transitions (the runs'
+  places, `alone`, `named_files`, `commit_begin`'s node moves, links and changed set).
+- **Applied in the same change to** `crates/merge/src/engine.rs`, `engine/copy.rs`, `engine/applying_tests.rs`,
+  `crates/server/src/repository/push.rs`, `vcs_store/name_holds.rs` and the import's wide-revision test.

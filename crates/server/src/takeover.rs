@@ -1234,6 +1234,78 @@ async fn drive_host_takeover(
   dispatches
 }
 
+/// Measures each death's silence to its takeover install as this node installs it (A-914), once a coordinator period on
+/// the control shard: a host whose fencing epoch rose in the regional configuration since the last period's read was
+/// taken over by an install between (`RegionalConfiguration::take_over` bumps it; a host absent from that read is not
+/// one), and its silence runs from its last answer to this node's detector to now, within a period of the install.
+/// Every member installs the takeover, so every member learns, not only the round's successor. The last answers are
+/// kept here each period ([`ShardState::last_answers`]), since the detector forgets a dead peer once its death stands,
+/// before a loaded council has taken it over. Folded into the failover estimator's learned tail and logged once a death
+/// beside the detector's and the coordinator's period tails and their recent maxima, the numbers main 01a20182's batch
+/// reads. Counted [`SILENCE_SAMPLED`], its longest [`SILENCE_LONGEST_NS`]; a taken-over host this node never held an
+/// answer from is counted [`SILENCE_UNMEASURED`].
+pub(crate) fn note_takeover_installs(state: &mut ShardState) {
+  let configuration = state.council.configuration();
+  let epochs = configuration.epochs.clone();
+  let members = configuration.members.clone();
+  if let Some(seen) = state.takeover_epochs_seen.replace(epochs.clone()) {
+    for (host, epoch) in &epochs {
+      if seen.get(host).is_some_and(|before| before.0 < epoch.0) {
+        note_silence(state, *host);
+      }
+    }
+  }
+  let answers: Vec<(HostId, u64)> = state.plane.plane.as_ref().map_or_else(Vec::new, |plane| {
+    members
+      .iter()
+      .filter_map(|member| plane.last_answer_ns(*member).map(|last| (*member, last)))
+      .collect()
+  });
+  state.last_answers.retain(|host, _| members.contains(host));
+  for (member, last) in answers {
+    let kept = state.last_answers.entry(member).or_insert(last);
+    *kept = (*kept).max(last);
+  }
+}
+
+/// One taken-over host's silence to its takeover install, now (A-914): see [`note_takeover_installs`].
+fn note_silence(state: &mut ShardState, departed: HostId) {
+  let now = slates_machine::clock::monotonic_ns();
+  let Some(last) = state.last_answers.remove(&departed) else {
+    state.count(SILENCE_UNMEASURED, 1);
+    slates_machine::log_line!(
+      "slates-server: {departed:?} was taken over with no answer of its kept here: its silence unmeasured"
+    );
+    return;
+  };
+  let (detector_tail, detector_max) = state.plane.plane.as_ref().map_or(
+    (None, None),
+    slates_cluster::member_plane::MemberPlane::period_reading,
+  );
+  let silence = now.saturating_sub(last);
+  state.failover.silence_to_install(silence);
+  state.count(SILENCE_SAMPLED, 1);
+  state.count_max(SILENCE_LONGEST_NS, silence);
+  slates_machine::log_line!(
+    "slates-server: a death's silence to its takeover install: {silence} ns from {departed:?}'s last answer; detector \
+     period tail {detector_tail:?} recent max {detector_max:?}; coordinator period tail {:?} recent max {:?}; recent \
+     window {} periods; estimate detection {:?} confirmation {:?}",
+    state.failover.period_tail_ns(),
+    state.failover.recent_period_max_ns(),
+    state.failover.recent_window(),
+    state.failover.estimate().detection.map(|term| term.ns),
+    state.failover.estimate().confirmation.map(|term| term.ns),
+  );
+}
+
+/// Counter: a taken-over host whose silence this node could not measure, its detector holding no answer from it
+/// (A-914). Format: a counter name.
+pub(crate) const SILENCE_UNMEASURED: &str = "failover.silence_unmeasured";
+/// Counter: deaths whose silence to their takeover install this node measured (A-914). Format: a counter name.
+pub(crate) const SILENCE_SAMPLED: &str = "failover.silence_sampled";
+/// Counter: the longest such silence, nanoseconds (A-914). Format: a counter name.
+pub(crate) const SILENCE_LONGEST_NS: &str = "failover.silence_longest_ns";
+
 /// Readies this period's round of `departed`'s takeover: starts it (or starts it over, on a new configuration,
 /// above a fence a holder reported, or once `departed` is heard alive again after the round gave objects up, A-351),
 /// promises this node's own copies of the objects that fall to it, and

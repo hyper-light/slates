@@ -1014,25 +1014,34 @@ const WIDE_TEXT_BYTES: usize = 1024;
 fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shards_window() {
   // Made before the shard's history begins: the fixture's own work is no step of the import's.
   let dump = wide_revisions(WIDE_REVISION_FILES, WIDE_TEXT_BYTES, (1, false));
-  let (loaded, longest_ns, window_ns, (tail_slices, staging_steps)) = stored(move || async move {
-    let (svn, _green) = subversion("wide-revision").await;
-    let (loaded, _turns) = imported(svn, dump).await;
-    let tail_slices = on(|state| count(state, crate::repository::svn_commit::staging::TAIL_SLICES));
-    let staging_steps =
-      on(|state| count(state, crate::repository::svn_commit::staging::STAGING_STEPS));
-    let shard = slates_rt::registry::current_shard().expect("on a shard");
-    let longest_ns = slates_rt::registry::with_entry(shard, |entry| entry.pulse.longest_step_ns())
-      .expect("the shard's entry");
-    (
-      loaded.map(|loaded| loaded.youngest),
-      longest_ns,
-      crate::watchdog::own_window_ns(),
-      (tail_slices, staging_steps),
-    )
-  });
+  let (loaded, longest_ns, window_ns, (tail_slices, staging_steps, apply_steps)) =
+    stored(move || async move {
+      let (svn, _green) = subversion("wide-revision").await;
+      let (loaded, _turns) = imported(svn, dump).await;
+      let tail_slices =
+        on(|state| count(state, crate::repository::svn_commit::staging::TAIL_SLICES));
+      let staging_steps =
+        on(|state| count(state, crate::repository::svn_commit::staging::STAGING_STEPS));
+      let apply_steps = on(|state| count(state, crate::repository::push::BATCH_APPLY_STEPS));
+      let shard = slates_rt::registry::current_shard().expect("on a shard");
+      let longest_ns =
+        slates_rt::registry::with_entry(shard, |entry| entry.pulse.longest_step_ns())
+          .expect("the shard's entry");
+      (
+        loaded.map(|loaded| loaded.youngest),
+        longest_ns,
+        crate::watchdog::own_window_ns(),
+        (tail_slices, staging_steps, apply_steps),
+      )
+    });
   assert_eq!(loaded, Ok(1));
   // Non-vacuity: the landing's tail ran in slices, so no loop over its texts ran whole in one step.
   assert!(tail_slices > 2, "the tail took {tail_slices} slice(s)");
+  // Non-vacuity: the revision's version was applied a few units a call (goal 93 piece 3), never in one.
+  assert!(
+    apply_steps > 2,
+    "its version's apply took {apply_steps} call(s)"
+  );
   // Non-vacuity: the revision's staging was split, its check, build, reads and judge each a step of its own.
   assert!(
     staging_steps >= 4,
@@ -1218,6 +1227,130 @@ fn an_imports_room_bounds_its_batch_where_it_is_smaller() {
   assert!(
     capped > free,
     "the room of four units cuts more batches: {capped} in it, {free} without"
+  );
+}
+
+/// Shape: the bound, in units of the changeset store, the arena give-back test imports at: a batch of a few units, far
+/// fewer than the import's texts.
+const GIVE_BACK_UNITS: u64 = 2;
+
+/// Goal 93 P7 (main's ruling of 2026-11-25: A-742's rule, freed memory returns to the OS, for the content arena under an
+/// import; at git-2000 the bound arm's daemon held 268 MB of the arena resident, 204 MB of it free pages the idle purge
+/// never reached, against 2.3 MB of live texts). Do: import [`rewrites`]'s rewrites (16 MiB of texts) at a bound of
+/// [`GIVE_BACK_UNITS`] units (its flush forced, `staging::FLUSH_NS`), publishing the shard after each turn as its period
+/// would (so a landed batch's let-go windows, deferred while a published image names them, are released); read the
+/// content arena's resident free bytes as the import ends, as `slates status` reports them
+/// (`mem.gauge.content.arena_resident_free_bytes`). Expect the import whole, and the resident free bytes within the
+/// bound and one give-back slice (`daemon::purge_slice_blocks` blocks of the discard size), what a next batch refills;
+/// counted `repository.svn_import.purged_past_bound_bytes`. Red before: every released batch's texts still resident.
+#[test]
+fn an_imports_arena_keeps_no_more_resident_free_than_its_bound() {
+  use crate::repository::svn_commit::staging::{FLUSH_NS, PURGED_PAST_BOUND};
+  let (youngest, resident_free, keep, purged) = stored(|| async move {
+    let (svn, _) = subversion("given-back").await;
+    let (unit, memcpy) = on(|state| {
+      (
+        crate::vcs_store::hg_import::segment_bytes(state) as u64,
+        state.config.memcpy_bytes_per_second.max(1),
+      )
+    });
+    let flush_ns =
+      u64::try_from(u128::from(GIVE_BACK_UNITS * unit) * 1_000_000_000 / u128::from(memcpy))
+        .unwrap();
+    FLUSH_NS.with(|forced| forced.set(Some(flush_ns.max(1))));
+    let (loaded, _) = imported_sampling(
+      svn,
+      rewrites(BOUNDED_REWRITES, BOUNDED_REWRITE_BYTES),
+      &mut || {
+        on(|state| {
+          let _ = crate::verbs::publish_shard(state);
+        });
+      },
+    )
+    .await;
+    FLUSH_NS.with(|forced| forced.set(None));
+    on(|state| {
+      let slice =
+        crate::daemon::purge_slice_blocks(state) as u64 * state.config.discard_from_bytes as u64;
+      (
+        loaded.map(|loaded| loaded.youngest),
+        state.store.content.arena().resident_free_bytes() as u64,
+        GIVE_BACK_UNITS * unit + slice,
+        count(state, PURGED_PAST_BOUND),
+      )
+    })
+  });
+  let expected = u64::try_from(BOUNDED_REWRITES).unwrap_or(u64::MAX);
+  assert_eq!(youngest, Ok(expected), "the import whole");
+  println!(
+    "svn_import: the arena resident free {resident_free} B as the import ended (keep {keep} B), {purged} B given back"
+  );
+  assert!(
+    resident_free <= keep,
+    "{resident_free} B resident and free in the arena, past the bound and a slice, {keep} B"
+  );
+}
+
+/// Shape: how long the contended-flush test's hog holds its shard between yields: far past a device's flush, under the
+/// shard's watchdog window.
+const HOG_NS: u64 = 500_000_000;
+/// Shape: the contended-flush test's look at the import, between its waits.
+const LOOK_NS: u64 = 10_000_000;
+
+std::thread_local! {
+  /// Whether the contended-flush test's hog still holds its shard.
+  static HOGGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Holds the shard [`HOG_NS`] at a time without yielding, then yields, until [`HOGGING`] is cleared: what else a shard
+/// runs while a landing awaits the store, so the landing resumes late.
+async fn hog() {
+  while HOGGING.with(std::cell::Cell::get) {
+    let began = slates_rt::futures::now_ns();
+    while slates_rt::futures::now_ns().saturating_sub(began) < HOG_NS {
+      std::hint::spin_loop();
+    }
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// Goal 93 P7 (main's ruling of 2026-11-25: the rent-or-buy bound's `F` is the store's own durable flush, not a landing's
+/// await, which holds whatever the shard ran meanwhile, the owner's queue and the writes before the flush, and so
+/// overstates it, enlarging the bound past rent or buy). Do: on a shard that has landed nothing, run a hog that holds it
+/// [`HOG_NS`] between yields, and import `full.dump` beside it, so every answer its batch's landing awaits resumes late;
+/// read the shard's `F` once the batch lands, then stop the hog. Expect the import whole, and `F` the store's own flush:
+/// under half a hold. Red before: `F` the landing's await, a hold or more.
+#[test]
+fn an_imports_durable_flush_is_the_stores_own_not_its_await() {
+  use crate::repository::svn_commit::staging::durable_flush_ns;
+  let (flush_ns, youngest) = stored(|| async move {
+    let (svn, _) = subversion("contended").await;
+    HOGGING.with(|hogging| hogging.set(true));
+    let hogging = slates_rt::futures::spawn(hog()).expect("the hog's task");
+    slates_rt::futures::detach(hogging).expect("detached");
+    let importing = slates_rt::futures::spawn(async move {
+      let _ = imported(svn, FULL).await;
+    })
+    .expect("the import's task");
+    slates_rt::futures::detach(importing).expect("detached");
+    while durable_flush_ns().is_none() {
+      slates_rt::futures::sleep(LOOK_NS).await.expect("slept");
+    }
+    let flush_ns = durable_flush_ns();
+    HOGGING.with(|hogging| hogging.set(false));
+    let mut youngest = 0;
+    while youngest < FULL_LAST {
+      slates_rt::futures::sleep(LOOK_NS).await.expect("slept");
+      youngest = history(svn).await.map_or(0, |(youngest, _)| youngest);
+    }
+    (flush_ns, youngest)
+  });
+  println!("svn_import: F {flush_ns:?} ns, the shard held {HOG_NS} ns at a time");
+  assert_eq!(youngest, FULL_LAST, "the import whole");
+  let flush_ns = flush_ns.expect("a flush measured");
+  assert!(
+    flush_ns < HOG_NS / 2,
+    "F {flush_ns} ns, the store's own flush, not the landing's await behind a {HOG_NS} ns hold"
   );
 }
 

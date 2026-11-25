@@ -22,6 +22,13 @@
 //! this MacBook): 4,015 requests, 1.42 ms each, 85.5% of it the owner's wake from its blocking receive, 12.2% its
 //! service, 1.8% the hop back, 0.4% its log reads.
 //!
+//! **Spinning before it parks** (main's ruling of 2026-11-25: hg's 57k clone, 812,896 requests, waited 144.82 s of
+//! 167.27 s on the owner's wake, about 178 µs a request). A fetch asks again as soon as its shard has taken the last
+//! answer, so the owner, waiting for work, spins through the gap before it parks: for the gap it has learned (RFC 6298's
+//! smoothed mean and four mean deviations, [`Gaps`]), at most the machine's measured wake (`spin_before_park_ns`, which
+//! the daemon passes), so it spins only while asks arrive back to back. Counted, a request at a time: met spinning,
+//! met parked, and the nanoseconds spun ([`AskWaits`]).
+//!
 //! **A sliced landing** ([`StoreHandle::begin`], then [`SlicedLanding`]'s `section`, `part` and `commit`) lands a
 //! changeset too large to hold whole (an import, a large pack) one bounded part a request: each part is written where
 //! it belongs in the open record and let go, so the RAM it takes is a part, never the changeset; the record is visible
@@ -213,6 +220,21 @@ struct Served {
   disk_ns: u64,
   /// When it was answered.
   done_ns: u64,
+  /// How the owner, waiting for work, met it: spinning (a hit), parked, or neither (it was queued).
+  met: Met,
+}
+
+/// How the owner met a request while it waited for work (goal 93, main's ruling of 2026-11-25: the 57k clone's store
+/// wait was 86.6% the owner's wake, 144.82 s of 167.27 s over 812,896 requests).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Met {
+  /// It was queued: the owner was not waiting.
+  #[default]
+  Queued,
+  /// The owner spun for it, this long, and it came: no wake.
+  Spun(u64),
+  /// The owner spun this long, then parked, and woke for it.
+  Parked(u64),
 }
 
 /// What a handle's asks of the owner waited on, all told since it was last taken ([`StoreHandle::take_waits`]): each
@@ -235,6 +257,12 @@ pub struct AskWaits {
   pub back_ns: u64,
   /// The longest whole wait.
   pub most_ns: u64,
+  /// The asks the owner met spinning, no wake ([`StoreOwner::start`]'s spin).
+  pub spin_hits: u64,
+  /// The asks the owner met parked, woken for them.
+  pub parks: u64,
+  /// The nanoseconds the owner spun waiting for them, hits and misses.
+  pub spin_ns: u64,
 }
 
 impl AskWaits {
@@ -253,6 +281,17 @@ impl AskWaits {
       .back_ns
       .saturating_add(taken_ns.saturating_sub(served.done_ns));
     self.most_ns = self.most_ns.max(total);
+    match served.met {
+      Met::Queued => {}
+      Met::Spun(ns) => {
+        self.spin_hits = self.spin_hits.saturating_add(1);
+        self.spin_ns = self.spin_ns.saturating_add(ns);
+      }
+      Met::Parked(ns) => {
+        self.parks = self.parks.saturating_add(1);
+        self.spin_ns = self.spin_ns.saturating_add(ns);
+      }
+    }
   }
 }
 
@@ -269,6 +308,9 @@ std::thread_local! {
     disk_ns: 0,
     back_ns: 0,
     most_ns: 0,
+    spin_hits: 0,
+    parks: 0,
+    spin_ns: 0,
   }) };
 }
 
@@ -278,6 +320,24 @@ pub fn take_read_waits() -> AskWaits {
   READ_WAITS.with(core::cell::Cell::take)
 }
 
+std::thread_local! {
+  /// The flush of the last changeset this thread's asks landed ([`StoreHandle::land`], [`SlicedLanding::commit`]):
+  /// the store's own `sync_data` (`Located::flush_ns`), none since it was last taken.
+  static LANDED_FLUSH_NS: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
+}
+
+/// The device's durable flush as the last changeset this thread's asks landed took it, the store's own `sync_data`
+/// without the owner's queue or the hop back (goal 93 P7, main's ruling of 2026-11-25: the import's rent-or-buy bound
+/// prices a batch against it); none since it was last taken.
+pub fn take_landed_flush_ns() -> Option<u64> {
+  LANDED_FLUSH_NS.with(core::cell::Cell::take)
+}
+
+/// Notes `located`'s flush as the last this thread's asks landed ([`take_landed_flush_ns`]).
+fn landed_flush(located: &Located) {
+  LANDED_FLUSH_NS.with(|flush| flush.set(Some(located.flush_ns)));
+}
+
 /// The owner's timing of the request it serves ([`Served`]), sent before its answer.
 struct Timer {
   timed: Option<Sender<Served>>,
@@ -285,6 +345,7 @@ struct Timer {
   wake_ns: u64,
   dequeued_ns: u64,
   disk_before: u64,
+  met: Met,
 }
 
 impl Timer {
@@ -292,15 +353,15 @@ impl Timer {
   /// `idle_ns`: sent after it, its wait was the owner's wake; before, it queued behind the owner's other work.
   fn of(
     asked: (u64, Option<Sender<Served>>),
-    (idle_ns, dequeued_ns): (u64, u64),
+    (idle_ns, dequeued_ns, met): (u64, u64, Met),
     store: &Store,
   ) -> Self {
     let (sent_ns, timed) = asked;
     let waited = dequeued_ns.saturating_sub(sent_ns);
-    let (behind_ns, wake_ns) = if sent_ns >= idle_ns {
-      (0, waited)
+    let (behind_ns, wake_ns, met) = if sent_ns >= idle_ns {
+      (0, waited, met)
     } else {
-      (waited, 0)
+      (waited, 0, Met::Queued)
     };
     Timer {
       timed,
@@ -308,6 +369,7 @@ impl Timer {
       wake_ns,
       dequeued_ns,
       disk_before: store.log().read_ns(),
+      met,
     }
   }
 
@@ -321,6 +383,7 @@ impl Timer {
         serve_ns: done_ns.saturating_sub(self.dequeued_ns),
         disk_ns: store.log().read_ns().saturating_sub(self.disk_before),
         done_ns,
+        met: self.met,
       });
     }
     let _ = answer.try_send(value);
@@ -477,13 +540,18 @@ impl fmt::Debug for Request {
 
 impl StoreOwner {
   /// Opens the store in `root` on a thread of its own (the store recovers there before the first request is served),
-  /// with room for `waiting` requests at once.
-  pub fn start(root: StoreRoot, sizing: Sizing, waiting: usize) -> Result<Self, OwnerError> {
+  /// with room for `waiting` requests at once; waiting for work, it spins at most `spin_cap_ns` (the machine's
+  /// `spin_before_park_ns`: a wake's measured cost) before it parks ([`Gaps`]).
+  pub fn start(
+    root: StoreRoot,
+    sizing: Sizing,
+    (waiting, spin_cap_ns): (usize, u64),
+  ) -> Result<Self, OwnerError> {
     let grant = crate::store::grant_id(root.grant().target.device, root.grant().target.inode);
     let (requests, incoming) = sync::channel(waiting).map_err(|_| OwnerError::Busy)?;
     let thread = slates_rt::registry::spawn_waited(
       std::thread::Builder::new().name("slates-store".to_owned()),
-      move || serve(root, sizing, incoming, waiting),
+      move || serve(root, sizing, incoming, (waiting, spin_cap_ns)),
     )
     .map_err(|_| OwnerError::Gone)?;
     Ok(Self {
@@ -526,6 +594,77 @@ impl StoreOwner {
   }
 }
 
+/// The gaps the owner waited for work, learned as RFC 6298 learns a round trip (its smoothed mean and mean deviation,
+/// gains 1/8 and 1/4): from a request it met while waiting (spun for or parked for) to the request's taking. Its window
+/// is a retransmission timeout's (the mean and four deviations), capped (goal 93, main's ruling of 2026-11-25: the 57k
+/// clone's store wait was 86.6% the owner's wake, 178 µs a request; a fetch's next ask follows its answer by its shard's
+/// turn, so while asks arrive back to back the owner spins through the gap, and once they stop it parks).
+#[derive(Clone, Copy, Debug, Default)]
+struct Gaps {
+  /// The smoothed gap, none learned yet.
+  mean_ns: Option<u64>,
+  /// Its mean deviation.
+  deviation_ns: u64,
+}
+
+/// Format: RFC 6298's gain of a new sample into the smoothed mean (alpha = 1/8), as a shift.
+const MEAN_GAIN_SHIFT: u32 = 3;
+/// Format: RFC 6298's gain of a new sample's deviation into the mean deviation (beta = 1/4), as a shift.
+const DEVIATION_GAIN_SHIFT: u32 = 2;
+/// Format: RFC 6298's weight of the deviation in a timeout (K = 4).
+const DEVIATION_WEIGHT: u64 = 4;
+
+impl Gaps {
+  /// One gap more.
+  fn learn(&mut self, gap_ns: u64) {
+    match self.mean_ns {
+      None => {
+        self.mean_ns = Some(gap_ns);
+        self.deviation_ns = gap_ns / 2;
+      }
+      Some(mean) => {
+        let off = mean.abs_diff(gap_ns);
+        self.deviation_ns = self
+          .deviation_ns
+          .saturating_sub(self.deviation_ns >> DEVIATION_GAIN_SHIFT)
+          .saturating_add(off >> DEVIATION_GAIN_SHIFT);
+        self.mean_ns = Some(
+          mean
+            .saturating_sub(mean >> MEAN_GAIN_SHIFT)
+            .saturating_add(gap_ns >> MEAN_GAIN_SHIFT),
+        );
+      }
+    }
+  }
+
+  /// How long to spin before parking: the mean and four deviations, at most `cap_ns`; none before a gap is learned.
+  fn window(&self, cap_ns: u64) -> u64 {
+    self.mean_ns.map_or(0, |mean| {
+      mean
+        .saturating_add(self.deviation_ns.saturating_mul(DEVIATION_WEIGHT))
+        .min(cap_ns)
+    })
+  }
+}
+
+/// The next request, met spinning for at most `window_ns` and then parked for ([`Met`]); none once every sender is gone.
+fn waited_for(incoming: &mut ChannelReceiver<Asked>, window_ns: u64) -> Option<(Asked, Met)> {
+  let began = slates_machine::clock::monotonic_ns();
+  let mut spun = 0u64;
+  while spun < window_ns {
+    match incoming.try_recv() {
+      Ok(Some(asked)) => return Some((asked, Met::Spun(spun))),
+      Ok(None) => core::hint::spin_loop(),
+      Err(_) => return None,
+    }
+    spun = slates_machine::clock::monotonic_ns().saturating_sub(began);
+  }
+  incoming
+    .blocking_recv()
+    .ok()
+    .map(|asked| (asked, Met::Parked(spun)))
+}
+
 /// The refusal an unopened store answers a request with.
 fn unopened<T>(reason: &str) -> Result<T, StoreError> {
   Err(StoreError::Unopened(reason.into()))
@@ -565,8 +704,9 @@ fn serve(
   root: StoreRoot,
   sizing: Sizing,
   mut incoming: ChannelReceiver<Asked>,
-  waiting: usize,
+  (waiting, spin_cap_ns): (usize, u64),
 ) -> Result<(), StoreError> {
+  let mut gaps = Gaps::default();
   let at = root.target().key.clone();
   let mut store = match Store::open(root, sizing) {
     Ok(store) => store,
@@ -597,14 +737,17 @@ fn serve(
     landings.let_go_if_dropped(&mut store);
     // From here the owner waits for work: a request sent after it waited on the owner's wake, one before on its work.
     let idle_ns = slates_machine::clock::monotonic_ns();
-    let asked = match landings.next_held() {
-      Some(asked) => asked,
-      None => match incoming.blocking_recv() {
-        Ok(asked) => asked,
-        Err(_) => break,
+    let (asked, met) = match landings.next_held() {
+      Some(asked) => (asked, Met::Queued),
+      None => match waited_for(&mut incoming, gaps.window(spin_cap_ns)) {
+        Some(waited) => waited,
+        None => break,
       },
     };
     let dequeued_ns = slates_machine::clock::monotonic_ns();
+    if met != Met::Queued {
+      gaps.learn(dequeued_ns.saturating_sub(idle_ns));
+    }
     landings.let_go_if_dropped(&mut store);
     let Some(Asked {
       sent_ns,
@@ -614,7 +757,7 @@ fn serve(
     else {
       continue;
     };
-    let mut timer = Timer::of((sent_ns, timed), (idle_ns, dequeued_ns), &store);
+    let mut timer = Timer::of((sent_ns, timed), (idle_ns, dequeued_ns, met), &store);
     match request {
       Request::Begin {
         header,
@@ -983,7 +1126,7 @@ impl StoreHandle {
   /// applied; answered once it is durable.
   pub async fn land(&self, header: Header, parts: Vec<Part>) -> Result<Located, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
-    self
+    let landed = self
       .ask(
         Request::Land {
           header,
@@ -992,7 +1135,11 @@ impl StoreHandle {
         },
         answers,
       )
-      .await
+      .await;
+    if let Ok(located) = &landed {
+      landed_flush(located);
+    }
+    landed
   }
 
   /// The landed content `identity` (of `len` bytes) from `offset`, as far as one piece reaches ([`Store::piece`]).
@@ -1257,6 +1404,9 @@ impl SlicedLanding {
     let committed = self.handle.ask(request, answers).await;
     // Committed or refused, the owner let the record go: the drop has nothing to wake it for.
     self.alive = None;
+    if let Ok(located) = &committed {
+      landed_flush(located);
+    }
     committed
   }
 }

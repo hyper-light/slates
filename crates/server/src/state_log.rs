@@ -392,8 +392,11 @@ pub(crate) fn barrier_window_ns(state: &ShardState) -> u64 {
     .max(crate::fleet::live_budget().deadline_ns)
 }
 
-/// Logs what a push refused at the barrier still waited for: each green owed and the version placed of it, and the
-/// names log's position beside its holders' acknowledgements, so a refusal names its cause.
+/// Logs what a push refused at the barrier still waited for: each green owed and the version placed of it, the names
+/// log's position beside its holders' acknowledgements, each pending version's waits (its record's candidates,
+/// acknowledgements and joint cohorts, its inputs', the targets lacking inputs or building a replica, the holders owed;
+/// A-918, what named a fresh candidate's stall) and the placement this node holds, so a refusal names its cause. On the
+/// refusal's cold path only; bounded by this shard's pending versions times the members, and the members.
 pub(crate) fn log_uncommitted(state: &ShardState, repository: slates_db::catalog::RepositoryId) {
   let greens: Vec<(String, u64, Option<u64>)> = state
     .state_logs
@@ -438,15 +441,26 @@ pub(crate) fn log_uncommitted(state: &ShardState, repository: slates_db::catalog
     .filter(|(kind, _)| kind.starts_with("merge."))
     .map(|(kind, count)| (*kind, *count))
     .collect();
-  let pending: Vec<(String, Vec<u64>)> = state
+  let pending: Vec<(String, String)> = state
     .merge
     .pending
     .iter()
-    .map(|(object, green)| (format!("{object:?}"), green.versions()))
+    .map(|(object, green)| (format!("{object:?}"), green.waits()))
     .collect();
+  let configuration = state.fleet.configuration();
+  let placement = (
+    configuration.version,
+    configuration.neighbourhood.clone(),
+    configuration
+      .settled
+      .as_ref()
+      .map(|settled| settled.hosts.clone()),
+    state.fleet.members().to_vec(),
+  );
   slates_machine::log_line!(
     "slates-server: partition {}: a push was refused at its barrier: greens owed (green, version, placed) {greens:?}; \
-     names log at {position:?}, acknowledged {acked:?}; merge counters {merge:?}; pending {pending:?}",
+     names log at {position:?}, acknowledged {acked:?}; merge counters {merge:?}; pending {pending:?}; placement \
+     (version, neighbourhood, settled, members) {placement:?}",
     state.partition
   );
 }

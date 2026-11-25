@@ -88,10 +88,10 @@ thread_local! {
 ///
 /// `bound = clamp(F × M, U, max(U, R / 2))`
 ///
-/// - `F`, the device's durable flush ([`durable_flush_ns`]): what landing a batch costs, timed at each batch this shard
-///   lands durably (its changeset written and flushed on the node's store, `landing::land_changeset`), the least so far:
-///   the span includes what else the shard ran while it waited, which only adds, so the least is the closest to the
-///   device's own (w-svn's review). Until one has landed, unknown, and the bound is `U`.
+/// - `F`, the device's durable flush ([`durable_flush_ns`]): what landing a batch costs, the store's own `sync_data` as
+///   each batch this shard lands durably took it (`slates_store::owner::take_landed_flush_ns`; the landing's await holds
+///   the owner's queue and the writes before the flush, which would overstate it, main's ruling of 2026-11-25), the
+///   least so far (w-svn's review). Until one has landed, unknown, and the bound is `U`.
 /// - `M`, the machine's memcpy rate, bytes a second, the boot profile's figure as every derived value takes it
 ///   (`DaemonConfig::memcpy_bytes_per_second`; the profile prices a byte of RAM at the time it takes to move it,
 ///   `CodecPolicy::byte_worth_from_memcpy`). Holding `B` bytes of texts is worth `B / M` of time, so a batch grows while
@@ -171,9 +171,9 @@ std::thread_local! {
   static DURABLE_FLUSH_NS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
-/// The device's durable flush, nanoseconds ([`texts_bound`]'s `F`): the least this shard timed a batch's changeset
-/// landing durably; none before it has.
-fn durable_flush_ns() -> Option<u64> {
+/// The device's durable flush, nanoseconds ([`texts_bound`]'s `F`): the least the store's own flush took for a batch
+/// this shard landed; none before it has.
+pub(crate) fn durable_flush_ns() -> Option<u64> {
   #[cfg(test)]
   if let Some(forced) = FLUSH_NS.with(std::cell::Cell::get) {
     return Some(forced);
@@ -181,7 +181,7 @@ fn durable_flush_ns() -> Option<u64> {
   DURABLE_FLUSH_NS.with(std::cell::Cell::get)
 }
 
-/// Records `flush_ns`, a batch's changeset landed durably, as the device's flush where it is the least this shard timed.
+/// Records `flush_ns`, the store's flush of a batch's changeset, as the device's where it is the least this shard met.
 fn flushed_in(flush_ns: u64) {
   DURABLE_FLUSH_NS.with(|measured| {
     let least = measured
@@ -247,6 +247,22 @@ async fn kill_before_entry_where_set() {
     // A kill: nothing after it runs, as after a `kill -9` between the changeset and its entry.
     std::future::pending::<()>().await;
   }
+}
+
+/// Counter: the bytes of the content arena's resident free pages an import's batches gave back past their bound
+/// ([`give_back_past`]). Format: a counter name in the status report.
+pub(crate) const PURGED_PAST_BOUND: &str = "repository.svn_import.purged_past_bound_bytes";
+
+/// One step of a batch's give-back: the content arena's resident free pages past `keep` bytes given back, an idle
+/// purge's slice of blocks (`daemon::purge_slice_blocks`), counted. Whether more is left past `keep`.
+fn give_back_past(state: &mut ShardState, keep: usize) -> bool {
+  let slice = crate::daemon::purge_slice_blocks(state);
+  let purged = state.store.content.arena_mut().purge_past(keep, slice);
+  state.count(
+    PURGED_PAST_BOUND,
+    u64::try_from(purged.bytes).unwrap_or(u64::MAX),
+  );
+  purged.more && state.store.content.arena().resident_free_bytes() > keep
 }
 
 /// A stage of a batch's landing ([`Staging::land`]) a test may kill it at ([`KILL_AT_STAGE`]).
@@ -894,9 +910,12 @@ impl Staging {
     let landed =
       landing::land_changeset(&disk, (repository, sequence), records, &self.carried).await;
     let committing = slates_rt::futures::now_ns();
-    // The device's durable flush, the least this shard meets: the bound's `F` (`texts_bound`).
-    if landed.is_ok() {
-      flushed_in(committing.saturating_sub(flushing));
+    // The device's durable flush, the least this shard meets: the bound's `F` (`texts_bound`), as the store's own
+    // `sync_data` took it, never the landing's await, which holds the owner's queue and the writes before it.
+    if landed.is_ok()
+      && let Some(flush_ns) = slates_store::owner::take_landed_flush_ns()
+    {
+      flushed_in(flush_ns);
     }
     #[cfg(test)]
     kill_before_entry_where_set().await;
@@ -1000,6 +1019,15 @@ impl Staging {
       state.count(TAIL_SLICES, 1);
       give_back_put_some(state, &self.put, (&mut at, slice_deadline_ns()))
     })? {
+      slates_rt::futures::yield_now().await;
+    }
+    // The content arena's resident free pages past what the next batch refills given back, a slice a step (goal 93,
+    // main's ruling of 2026-11-25: A-742's rule for the content plane; an import never leaves its shard idle, so the idle
+    // purge never ran under it, and git-2000's let-go texts stayed resident as free pages, 204 MB of a 438 MB daemon).
+    // The keep is the batch's own bound: a batch takes at most that before it lands, so pages kept past it are pages no
+    // batch of this import refills (`texts_bound`).
+    let keep = usize::try_from(self.bound.bytes).unwrap_or(usize::MAX);
+    while crate::state::with_state(|state| give_back_past(state, keep))? {
       slates_rt::futures::yield_now().await;
     }
     crate::state::with_state(|state| {

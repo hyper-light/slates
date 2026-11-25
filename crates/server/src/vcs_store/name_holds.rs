@@ -273,9 +273,10 @@ pub(crate) fn commit_judged_lent(
   committed
 }
 
-/// Applies `applied` to green `green` for `inc` as its chain entry records it (`Green::apply_recorded`), the named texts
-/// its apply reads lent it from the content plane first and let go after (A-760 (b) 4d): the version it committed, or
-/// `None` for a green not here or a text the plane cannot give now.
+/// Applies `applied` to green `green` for `inc` as its chain entry records it (`Green::apply_recorded`'s run), each named
+/// text its apply reads that the green holds by name alone lent it from the content plane as the run meets it
+/// ([`lend_named`]) and let go after (A-760 (b) 4d): the version it committed, or `None` for a green not here or a text
+/// the plane cannot give now.
 pub(crate) fn apply_recorded_lent(
   state: &mut crate::state::ShardState,
   green: slates_db::catalog::VolumeId,
@@ -284,23 +285,50 @@ pub(crate) fn apply_recorded_lent(
     &[slates_merge::chain_entry::Applied],
   ),
 ) -> Option<u64> {
-  let engine = state.greens.get(&green)?;
-  let (unlent, head) = (engine.recorded_unlent(inc, applied), engine.head());
-  drop(engine);
-  if !unlent.is_empty()
-    && lend_from_plane(
-      state,
-      &ReadIn::applied(green, [head, inc.base], applied),
-      &unlent,
-    )
-    .is_err()
-  {
-    return None;
-  }
-  let mut engine = state.greens.get_mut(&green)?;
-  let version = engine.apply_recorded(inc, applied);
-  engine.let_named_bytes_go();
+  let begun = state.greens.get_mut(&green)?.begin_applying(inc, applied);
+  let slates_merge::engine::Begun::Applying(mut run) = begun else {
+    let slates_merge::engine::Begun::Answered(version) = begun else {
+      return None;
+    };
+    return Some(version);
+  };
+  let version = loop {
+    let stepped = state
+      .greens
+      .get_mut(&green)?
+      .apply_step(&mut run, inc, applied, &mut || false);
+    match stepped {
+      slates_merge::engine::ApplyStep::More => {}
+      slates_merge::engine::ApplyStep::Done(version)
+      | slates_merge::engine::ApplyStep::Answered(version) => break version,
+      slates_merge::engine::ApplyStep::Lend(unlent) => {
+        lend_named(state, green, (inc, applied), &unlent)?
+      }
+    }
+  };
+  state.greens.get_mut(&green)?.let_named_bytes_go();
   Some(version)
+}
+
+/// Lends green `green` each of `unlent`, texts its apply of `applied` for `inc` reads that it holds by name alone
+/// (`slates_merge::engine::ApplyStep::Lend`), from the content plane: kept until `Green::let_named_bytes_go`. `None`
+/// for a green not here or a text the plane cannot give now.
+pub(crate) fn lend_named(
+  state: &mut crate::state::ShardState,
+  green: slates_db::catalog::VolumeId,
+  (inc, applied): (
+    &slates_merge::engine::Increment,
+    &[slates_merge::chain_entry::Applied],
+  ),
+  unlent: &std::collections::BTreeSet<slates_merge::named::Identity>,
+) -> Option<()> {
+  let head = state.greens.get(&green)?.head();
+  lend_from_plane(
+    state,
+    &ReadIn::applied(green, [head, inc.base], applied),
+    unlent,
+  )
+  .ok()
 }
 
 /// Counted: the bytes of committed texts' windows a landing let go once its changeset was durable on the node's store

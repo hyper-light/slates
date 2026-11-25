@@ -130,6 +130,11 @@ pub enum StoreError {
   NoLanding,
   /// The owner's queue of landings waiting for an open sliced landing is full (the asker's `OwnerError::Busy`).
   Held,
+  /// A text's place holds a revlog chunk and the process installed no chunk decoder (`texts::install_chunk_decoder`):
+  /// refused, never read as raw.
+  NoChunkDecoder,
+  /// A text's place holds a revlog chunk that does not decode, or makes more than its text can be.
+  Undecodable,
   /// The store could not be opened when its owner started (goal 93; jupiter's red, 2026-11-21): the owner stays and
   /// answers every request with the open's reason, in its words, rather than ending with no word.
   Unopened(Box<str>),
@@ -147,6 +152,12 @@ impl fmt::Display for StoreError {
       Self::NotStaged => f.write_str("a section named a content that is not staged"),
       Self::Held => f.write_str("the store's owner holds as many landings as it may wait"),
       Self::NoLanding => f.write_str("no such landing is open (committed, abandoned or another's)"),
+      Self::NoChunkDecoder => {
+        f.write_str("a text held as a revlog chunk, and no chunk decoder installed")
+      }
+      Self::Undecodable => {
+        f.write_str("a text's revlog chunk that does not decode within its length")
+      }
       Self::Unopened(reason) => {
         write!(f, "the version-control store could not be opened: {reason}")
       }
@@ -751,6 +762,7 @@ fn sections_of<F: BlockFile>(
     header: crate::log::header_in(file, row.offset, end)?,
     identity: row.identity,
     len: row.len,
+    flush_ns: 0,
   };
   Ok(sections_in(file, &located)?)
 }

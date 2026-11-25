@@ -340,7 +340,13 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
     at,
     2,
     &mut unsorted,
-    (&mut held_put.clone(), &mut held_removed.clone()),
+    (
+      &mut held_put
+        .iter()
+        .map(slates_vfs::recover::HeldPiece::as_ref)
+        .collect::<Vec<_>>(),
+      &mut held_removed.clone(),
+    ),
     Some(&replies),
     (&mut calls.clone(), &mut calls_removed.clone()),
     (

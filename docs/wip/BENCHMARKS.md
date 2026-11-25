@@ -19802,3 +19802,105 @@ entry above. Slates' hg stream now sends stock's bytes (73.7 MB against 74.1) bu
   - The stream's time: 164 turns at about 100 ms each.
   - The clone's time: 117,848 changeset store asks at about 1 ms each.
 
+## The svn leg at 44db3dc17, the first since round 1: slates ahead of stock svnserve on every step but the two updates, which tie (goal 93 perf; main 01a20182's bench7, 2026-11-25 04:23 to 04:35 PST)
+
+- **Command.** The in-tree harness at 67ec37368, its svn leg: stock `svnserve` 1.15.0 against a release slates at main
+  44db3dc17, over git-2000.dump. One run each. Files: main's bench7 round.
+- **Machine and load.** The MacBook, load average about 30 to 35: loaded points, compared only with each other.
+
+| step | stock `svnserve` (s) | slates (s) | slates / stock | slates in round 1 (s) |
+|---|---|---|---|---|
+| load (stock `svnadmin load`) / import (slates) | 267.115 | 5.572 | 0.021x | 6.928 |
+| checkout | 15.344 | 9.758 | 0.636x | 12.473 |
+| log | 0.958 | 0.284 | 0.296x | 0.180 |
+| commit | 7.402 | 3.664 | 0.495x | 5.577 |
+| update | 0.934 | 0.957 | 1.025x | |
+| update `-r 1000` | 5.022 | 5.022 | 1.000x | 3.011 |
+
+- **The daemon's peak** was 716 MiB.
+- **Against round 1.** Each is one run at a different load, so the column is context, not an A/B. Import, checkout and
+  commit are faster now. Log (+0.104 s) and update `-r 1000` (+2.011 s) are slower, and are the steps to watch in the
+  next unloaded round.
+
+## Where a 57k hg clone's 167 s of store waiting goes: 87 % is the owner's wake (goal 93 perf; main 01a20182's bench7 part B, 2026-11-25)
+
+- **Command.** `hg_clone_store_wait`: a release build, in process, Mercurial's own history (57k changesets) cloned.
+  Load about 35.
+- **The clone took 225.733 s.** It made 812,896 requests of the changeset store's owner, which waited 167.27 s in all:
+  74.1 % of the clone, 0.206 ms a request on average, 66.0 ms at most.
+
+| part of the wait | seconds | share |
+|---|---|---|
+| wake: the owner waking to take the request | 144.82 | 86.6 % |
+| serve: the owner answering it | 12.45 | 7.4 % |
+| back: the answer's return to the asker | 8.27 | 4.9 % |
+| behind: queued behind another request | 1.31 | 0.8 % |
+| disk | 0.43 | 0.3 % |
+
+- **What it says.** The owner's own work (serve, disk) is under 8 % of the wait. Nearly all of it is waking a parked
+  owner. w-hg is building the owner's spin before it parks, from this split.
+
+## P7's true F: an svn import's text batches bounded by the machine's own drain time, three arms (goal 93 P7; main 01a20182's bench7, 2026-11-25 04:35 to 04:45 PST)
+
+**No verdict yet.** At this load the wall times do not separate the arms. The bound arm's resident set is about half the
+before arm's (0.50 to 0.63), but sits 155 to 245 MiB above the 2 MiB unit's. That excess is open with w-perf, and this
+entry makes no closing claim until it is explained.
+
+- **Command.** `~/slates-work/main-ship/p7-true-f.sh`: the `svn_import_storage` release test over git-2000.dump (2,000
+  revisions), each arm's binary built at its commit, three rounds interleaved. Logs: `~/.cache/main-rounds/bench7/`
+  (`p7tf-*.log`, `summary.txt`).
+- **Machine and load.** The MacBook (adas-macbook-pro-2, arm64), load average 21 to 23 with the fleet's agents
+  running: loaded points, compared only with each other.
+- **The arms.**
+  - before, a387b13c3: an import's texts held to its end.
+  - after, 084ffb65d: batches of a fixed 2 MiB unit ("A Subversion import's batches cut by their texts", above).
+  - bound, eedfd23e1: true F, a batch's bound `clamp(F x M, U, max(U, R/2))`.
+
+| arm | wall, rounds 1 / 2 / 3 (s) | median | resident after the import (MiB) | text batches |
+|---|---|---|---|---|
+| before | 6.06 / 8.67 / 6.84 | 6.84 | 680 / 685 / 685 | |
+| after | 7.58 / 14.41 / 9.67 | 9.67 | 182 / 184 / 186 | 179 |
+| bound | 10.17 / 8.28 / 6.80 | 8.28 | 427 / 359 / 341 | 4 / 5 / 7 |
+
+**The bound's inputs, by round:**
+
+| round | F (ms) | M (GB/s) | F x M (MB) | U | R/2 |
+|---|---|---|---|---|---|
+| 1 | 9.463 | 9.64 | 91.2 | 2 MiB | 11.45 GB |
+| 2 | 6.596 | 13.57 | 89.5 | 2 MiB | 11.45 GB |
+| 3 | 4.659 | 12.89 | 60.1 | 2 MiB | 11.45 GB |
+
+- **Wall.** Not separated at this load: the after arm alone spans 7.58 to 14.41 s.
+- **Resident.** The bound arm's is 0.63, 0.52 and 0.50 of the before arm's round by round, and 245, 175 and 155 MiB
+  above the after arm's. Its batches of 60 to 91 MB (4 to 7 of them, against 179 of 2 MiB) account for some of that
+  excess; how much is w-perf's to explain.
+- **The excess, explained (w-perf, from the same logs' gauges; main checked round 1).** It is the content arena's
+  retained free extents, not live texts and not malloc: A-742's rule is not yet applied to the content arena. Round 1:
+  `arena_mapped` 336 MB, `arena_free` 256 MB, `object_resident` 268 MB against the unit arm's 19. Rounds 2 and 3:
+  `object_resident` 198 and 183 MB, `arena_free` 175 and 161 MB. w-perf is fixing it, and main's rerun adds the fix as
+  a fourth arm.
+
+## The git leg at eedfd23e1, one loaded run: the clone's first pack byte 14.8 s later than at 2dd25afe6, the derivation's units slower (goal 93 perf; main 01a20182's bench7, 2026-11-25 04:53 to 04:59 PST)
+
+**A loaded point, no verdict.** At eedfd23e1 the clone's first pack byte came at 55.112 s, against 40.3 s at 2dd25afe6.
+The derivation took 21.8 ms a unit, against 11.8 ms there. That is open with w-git, and main has an interleaved A/B
+of e89adba55 against its parent queued. This entry makes no closing claim on `derive_behind`.
+
+- **Command.** `~/slates-work/main-ship/git-leg-counters.sh`, run from `p7-true-f.sh`: the in-tree harness's git leg,
+  slates alone, release at eedfd23e1. Record: `~/.cache/main-rounds/git-leg-eedfd23e1/work/interop-speed.txt`.
+- **Machine and load.** The MacBook (adas-macbook-pro-2), load average 18 to 25 with the fleet's agents running. One
+  run. The 2dd25afe6 column was measured at load 38 to 56, so the two are context for each other, not an A/B.
+
+| step | eedfd23e1 (s) | first pack bytes (s) | 2dd25afe6 (s) | its first pack bytes (s) |
+|---|---|---|---|---|
+| push, every branch and tag | 50.943 | | 47.6 | |
+| clone `--mirror` | 95.834 | 55.112 | 79.6 | 40.3 |
+| clone again | 61.220 | 33.437 | 63.4 | |
+| clone `--filter=blob:none` | 34.338 | 27.993 | 53.8 | |
+| incremental push | 0.162 | | | |
+| incremental fetch | 0.278 | | | |
+
+- **The daemon's peak** was 2,978 MiB.
+- **What moved.** The clone's first pack byte is 14.8 s later, the derivation's units running at 21.8 against 11.8 ms
+  each. The partial clone is 19.5 s sooner and the clone-again about even, both at different loads.
+

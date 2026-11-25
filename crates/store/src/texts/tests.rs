@@ -14,6 +14,7 @@ fn entry(path: &[u8], base: Option<[u8; 32]>) -> TextEntry {
       offset: 7,
       len: 23,
     },
+    form: super::Form::Raw,
   }
 }
 

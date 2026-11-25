@@ -264,6 +264,30 @@ pub struct RecordDialReport {
 /// held for.
 pub type RegionHold = ([u8; 32], Vec<slates_cluster::homes::HomeOwner>);
 
+/// A node's homing window as its control shard last derived it, with its terms (A-914, `Daemon::homing_window`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HomingWindowReading {
+  /// The deaths whose silence to their takeover install this node measured.
+  pub samples: u64,
+  /// The window a push's homing runs within, nanoseconds.
+  pub window_ns: u64,
+  /// Whether the window came from the learned silence rather than the failover estimate's terms.
+  pub learned: bool,
+  /// The learned silence's running tail, nanoseconds, `None` before a death.
+  pub silence_tail_ns: Option<u64>,
+  /// The longest death's silence to its takeover install this node measured, nanoseconds (`failover.silence_longest_ns`),
+  /// `None` before a death.
+  pub longest_silence_ns: Option<u64>,
+  /// The failover estimate's detection term, nanoseconds.
+  pub detection_ns: Option<u64>,
+  /// The failover estimate's confirmation term, nanoseconds.
+  pub confirmation_ns: Option<u64>,
+  /// The coordinator's measured period's running tail, nanoseconds.
+  pub period_tail_ns: Option<u64>,
+  /// The regional members this node holds.
+  pub members: usize,
+}
+
 /// The daemon.
 pub struct Daemon {
   /// Where [`Self::wait_for_stop`] hands the control shard its watch, taken in at the next heartbeat.
@@ -991,6 +1015,9 @@ impl Daemon {
     // An hg stream's chunk compression is timed on the shard's clock (goal 93 perf, `vcs_store.hg_stream_compress_*`);
     // a second daemon in this process finds it installed.
     slates_hg::revlog_chunk::install_clock(slates_rt::futures::now_ns);
+    // The changeset store reads a text kept as a revlog chunk through Mercurial's own decoder (goal 93, main's ruling (b)
+    // of 2026-11-25), which the store cannot build; a second daemon in this process finds it installed.
+    let _ = slates_store::texts::install_chunk_decoder(slates_hg::revlog_chunk::decode_within);
     let listener = Listener::open(&config.instance, adoption.as_ref())?;
     let mut segment = match source {
       SegmentSource::Create { name } => {
@@ -1750,6 +1777,33 @@ impl Daemon {
         counted(crate::vcs_store::homes::HEAL_OFFERED),
         counted(crate::vcs_store::homes::HEAL_ENDED_WITHHELD),
       ]
+    })
+  }
+
+  /// Test support (A-914): stretches every coordinator period of this node by `stretch_ns`
+  /// (`None` or zero: none), as a host whose steps run late under load: a death's silence then outruns the failover
+  /// estimate's terms measured before it. `Ok` once set on the control shard.
+  pub fn inject_period_stretch(&self, stretch_ns: Option<u64>) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.period_stretch_ns = stretch_ns.unwrap_or(0);
+    })
+  }
+
+  /// Test support (A-914): this node's homing window and the terms it was derived from ([`HomingWindowReading`]).
+  pub fn homing_window(&self) -> Result<HomingWindowReading, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      let estimate = s.failover.estimate();
+      HomingWindowReading {
+        samples: s.failover.silence_tail().map_or(0, |term| term.samples),
+        window_ns: s.homing_window_ns,
+        learned: s.homing_window_learned,
+        silence_tail_ns: s.failover.silence_tail().map(|term| term.ns),
+        longest_silence_ns: s.refusals.get(crate::takeover::SILENCE_LONGEST_NS).copied(),
+        detection_ns: estimate.detection.map(|term| term.ns),
+        confirmation_ns: estimate.confirmation.map(|term| term.ns),
+        period_tail_ns: s.failover.period_tail_ns(),
+        members: s.fleet.members().len(),
+      }
     })
   }
 
@@ -5458,6 +5512,10 @@ async fn init_shard(
     failover_ns,
     injected_failover_ns: None,
     homing_window_ns: 0,
+    homing_window_learned: false,
+    takeover_epochs_seen: None,
+    last_answers: std::collections::BTreeMap::new(),
+    period_stretch_ns: 0,
     attachment_paces: std::collections::BTreeMap::new(),
     council,
     consensus_ready: false,
@@ -6008,6 +6066,15 @@ fn return_dead_recovery_timed(
   (returned, more)
 }
 
+/// The free blocks one step of a give-back walks (A-226): an archive slice's bytes over the discard size, one at least.
+pub(crate) fn purge_slice_blocks(s: &ShardState) -> usize {
+  usize::try_from(s.config.archive_slice_bytes())
+    .unwrap_or(usize::MAX)
+    .checked_div(s.config.discard_from_bytes.max(1))
+    .unwrap_or(0)
+    .max(1)
+}
+
 /// Gives an idle shard's resident free content, and its emptied write log's pages, back to the OS (A-105): when the
 /// content arena allocated nothing since the last sweep pass (`crate::idle_sweep`), its free blocks are purged a slice at a time, yielding
 /// between slices so a request that arrives meanwhile is served first. Decay-based, as jemalloc purges dirty pages after
@@ -6033,11 +6100,7 @@ async fn purge_if_idle() -> GiveBack {
         return None;
       }
       s.count(TICKS_IDLE, 1);
-      let slice_blocks = usize::try_from(s.config.archive_slice_bytes())
-        .unwrap_or(usize::MAX)
-        .checked_div(s.config.discard_from_bytes.max(1))
-        .unwrap_or(0)
-        .max(1);
+      let slice_blocks = purge_slice_blocks(s);
       let purged = s.store.content.arena_mut().purge(slice_blocks);
       let (log, recovery_left) = if purged.more {
         (0, false)
@@ -10559,7 +10622,7 @@ mod tests {
             archive,
           )
           .unwrap();
-        let changes = crate::content_holder::held_changes(state);
+        let changes = crate::content_holder::held_changes_carried(state);
         carried.insert(
           changes
             .put
@@ -10801,7 +10864,7 @@ mod tests {
               state.holder_records.insert(object(which), fresh);
             }
             HeldStep::Delta => {
-              let changes = crate::content_holder::held_changes(state);
+              let changes = crate::content_holder::held_changes_carried(state);
               for piece in &changes.put {
                 proptest::prop_assert!(
                   !changes.removed.contains(&piece.key),
@@ -11260,6 +11323,81 @@ mod tests {
     );
   }
 
+  /// A-914 (a): a death's silence to its takeover install is learned where this node installs the takeover, from the
+  /// answer kept for it before the detector forgot it. Do: a region of this node and two peers; read once; keep an answer
+  /// of one peer a silence ago; take both peers over and admit a newcomer; read again. Expect the kept peer's silence
+  /// sampled (at least the silence), the peer with no answer kept counted unmeasured, the newcomer (absent from the last
+  /// read) never taken for a takeover, and the sampled answer no longer kept.
+  #[test]
+  fn a_takeover_install_learns_its_hosts_silence_from_the_answer_kept_for_it() {
+    use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+    use slates_db::HostId;
+    use slates_db::register::Quorum;
+    /// Shape: a silence long enough to tell from a read's own clock reads.
+    const SILENCE_NS: u64 = 5 * super::HEARTBEAT_NS;
+    let (sampled, unmeasured, longest, tail, kept) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let (answered, unanswered, newcomer) = (
+        HostId(local.0 ^ 0x40),
+        HostId(local.0 ^ 0x41),
+        HostId(local.0 ^ 0x42),
+      );
+      state.council = RegionalCouncil::new(
+        local,
+        vec![local, answered, unanswered],
+        vec![local],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        3,
+        false,
+      );
+      crate::takeover::note_takeover_installs(state);
+      let now = slates_machine::clock::monotonic_ns();
+      state
+        .last_answers
+        .insert(answered, now.saturating_sub(SILENCE_NS));
+      assert!(state.council.propose(Reconfiguration::TakeOver(answered)));
+      assert!(state.council.propose(Reconfiguration::TakeOver(unanswered)));
+      assert!(state.council.propose(Reconfiguration::Admit {
+        host: newcomer,
+        domain: None,
+      }));
+      crate::takeover::note_takeover_installs(state);
+      (
+        state
+          .refusals
+          .get(crate::takeover::SILENCE_SAMPLED)
+          .copied(),
+        state
+          .refusals
+          .get(crate::takeover::SILENCE_UNMEASURED)
+          .copied(),
+        state
+          .refusals
+          .get(crate::takeover::SILENCE_LONGEST_NS)
+          .copied(),
+        state.failover.silence_tail().map(|term| term.samples),
+        state.last_answers.contains_key(&answered),
+      )
+    });
+    assert_eq!(
+      sampled,
+      Some(1),
+      "the answered peer's silence was sampled once"
+    );
+    assert_eq!(
+      unmeasured,
+      Some(1),
+      "the peer with no answer kept is counted unmeasured, the newcomer never"
+    );
+    assert!(
+      longest.is_some_and(|longest| longest >= SILENCE_NS),
+      "the silence runs from the kept answer: {longest:?}"
+    );
+    assert_eq!(tail, Some(1), "the failover estimator learned it");
+    assert!(!kept, "a sampled answer is no longer kept");
+  }
+
   /// §4.8 "Leases and reads"; AUD-08: the successor's own copy counts toward a cohort's `f + 1` only once its
   /// gate is open, as a holder's answer does — while this node has answered the retired owner within the horizon
   /// its round learns nothing from itself; once it has not, its copy is learned.
@@ -11545,7 +11683,7 @@ mod tests {
         .collect();
       // The move, then the delta after it, folded as recovery folds it (`ShardImage::apply`: puts, then removals).
       crate::fleet::reconcile_held_authority(state);
-      let changes = crate::content_holder::held_changes(state);
+      let changes = crate::content_holder::held_changes_carried(state);
       let in_delta = changes.put.len();
       for piece in &changes.put {
         journal.insert(piece.key, piece.bytes.clone());
