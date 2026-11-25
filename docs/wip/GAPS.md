@@ -1921,6 +1921,18 @@
 > count at the body's yield: none). In process (debug, this MacBook, load about 30): 4 yields over 4 turns, 37 µs of gaps,
 > the longest 26 µs, so the yield is not what paces a turn there. Owed: the 57k's figures with it (main's), then what
 > lies between its turns by the counters beside it (`hg_stream_span_ns` against turns, store waits and writes).
+> An hg-over-SSH clone's session judged wedged at its first poll (main's watchdog A/B at a95b34dfa, 12 burners, load
+> about 54: 1,023 ms with no CPU progress, never runnable, in `a_mercurial_clone_larger_than_a_requests_room_is_answered_
+> over_ssh`'s task). That test's loop stepped its command without yielding, where the daemon's session yields after
+> every step (`vcs_ssh`'s `step`); it now yields too (2026-11-25, w-hg). Each SSH hg serving step is counted with its
+> thread CPU (`vcs_store.hg_ssh_steps`, `_step_most_cpu_ns`). Held by `a_clone_over_ssh_under_burners_holds_its_shard_a_
+> step_a_poll` (two spinners a core in process; the task's polls numbered and timed: no two steps in one poll; red with
+> the yield removed, 2 steps sharing one). Measured: the first poll 0.3 ms of CPU (2.1 ms cold), its wall time its CPU,
+> so the A/B's second was the thread blocked in the kernel (a cold page-in of the store's windows on that hour's
+> near-full disk is the likeliest, not shown), not the session's work. w-git's `an_ssh_clone_past_many_windows_is_
+> answered_whole` and `a_rekey_during_a_blocked_write_sends_no_byte_twice` run through the production edge and its
+> yields, so not this cause. Owed: the blocked first poll's call, if the A/B meets it again (the watchdog's log names
+> the poll, not the call).
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads
