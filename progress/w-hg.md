@@ -707,3 +707,6 @@ Waiting: main's route; arena-7 and arena-8.
 - Reviewed w-interop's 5114fd09e (codec + stream): OK; note `sized` grows with repository until (b).
 - (b) can start: codec at main 70fa2080f (revlog_chunk::chunk/decode).
 - Landed main 0351b043c: store-wait instrumentation (9699452d1): vcs_store.hg_owner_{requests,total,behind,wake,serve,disk,back,most}_ns; ignored measurement hg_clone_store_wait. Waiting: main's 57k split to choose spin vs pipelining; then (b).
+- Landed main 0c4bd26fd: d33fc0b64 (merge-push manifest base: ask the chain's let-go link, read over it; red a_pushs_manifest_reads_one_the_same_push_kept_over_a_let_go_chain) and bbcfe756e (pins within each paced step; counters hg_push.pin_{revisions,windows}_step_most; no unit red, main's 57k counter is the check).
+- (B) verified at 57k by main: 6/6 ok, pinned_away 0, at pre-(B) speed.
+- Next (main's order): stream turn pacing (~100 ms a turn, heartbeat?): log yield→next-poll gap as a counter first; then (b).
