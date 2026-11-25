@@ -164,10 +164,12 @@ impl BroughtBack {
   }
 }
 
-/// [`bring_back`], naming the window it brought back and its bytes; none where it is back already.
+/// [`bring_back`], naming the window it brought back and its bytes; none where it is back already. A window brought back
+/// is cached by the repository whose git store holds its pack, within its grant (`vcs_share::read_backs`).
 pub(crate) async fn bring_back_window(
   waited: Waited,
 ) -> Result<Option<(slates_vcs::ContentId, u64)>, ReadThroughRefused> {
+  let pack = waited.pack;
   let found = with_state(|state| {
     let disk = state.vcs_disk.clone().ok_or(ReadThroughRefused::NoDisk)?;
     let content = state
@@ -210,6 +212,14 @@ pub(crate) async fn bring_back_window(
     {
       state.count(BROUGHT_BACK, 1);
       state.count(BROUGHT_BACK_BYTES, brought);
+      crate::vcs_share::read_backs::brought_back(
+        state,
+        window,
+        brought,
+        crate::vcs_share::read_backs::Holder::Pack(pack),
+      );
+      #[cfg(test)]
+      crate::vcs_share::read_backs::let_go_after_bring_back_where_forced(state, &window);
     }
     put.map(|brought| (brought > 0).then_some((window, brought)))
   })

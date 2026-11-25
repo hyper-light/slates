@@ -336,17 +336,67 @@ pub(crate) fn named_lacking(
   state: &ShardState,
   green: slates_db::catalog::VolumeId,
 ) -> Vec<(ContentIdentity, u64)> {
-  let mut wanted: Vec<(ContentIdentity, u64)> = Vec::new();
+  named_texts(state, green)
+    .into_iter()
+    .filter(|(_, _, whole)| !whole)
+    .map(|(identity, len, _)| (identity, len))
+    .collect()
+}
+
+/// Lets go, after its replay, each landed text green `green`'s checkpoint and chain name that its recovery found held
+/// whole (`found_whole`, read before the replay; its windows restored resident with the shard's image): what the
+/// recovery did not bring back, so its give-back never lets it go (TSan diag 45557094379: the successor held the text
+/// whole at its start, fetched nothing, let nothing go, and kept it in RAM for good). Each is landed, its changeset
+/// durable on the node's store before any entry named it, so its first reader brings it back (main's ruling (B)).
+pub(crate) fn let_go_found_whole(state: &mut ShardState, found_whole: &[ContentIdentity]) {
+  if !found_whole.is_empty() {
+    state.count(
+      NAMED_FOUND_WHOLE,
+      u64::try_from(found_whole.len()).unwrap_or(u64::MAX),
+    );
+    crate::vcs_store::name_holds::let_go_landed_texts(state, found_whole);
+  }
+}
+
+/// The landed texts green `green`'s checkpoint and chain name that the content store holds whole now, for its recovery
+/// to let go once it has replayed ([`let_go_found_whole`]); none for a green of no Subversion repository.
+pub(crate) fn named_found_whole(
+  state: &ShardState,
+  green: slates_db::catalog::VolumeId,
+) -> Vec<ContentIdentity> {
+  if subversion_of(state, green).is_none() {
+    return Vec::new();
+  }
+  named_texts(state, green)
+    .into_iter()
+    .filter(|(_, _, whole)| *whole)
+    .map(|(identity, _, _)| identity)
+    .collect()
+}
+
+/// Counter: a named landed text a recovery found held whole and let go after its replay ([`let_go_found_whole`]).
+/// Format: a counter name in the daemon's status report.
+pub(crate) const NAMED_FOUND_WHOLE: &str = "vcs_store.svn_texts.named_found_whole";
+
+/// The texts green `green`'s checkpoint (A-869) and chain entries name, each once, with its length and whether the
+/// content store holds it whole.
+fn named_texts(
+  state: &ShardState,
+  green: slates_db::catalog::VolumeId,
+) -> Vec<(ContentIdentity, u64, bool)> {
+  let mut wanted: Vec<(ContentIdentity, u64, bool)> = Vec::new();
+  let mut seen: std::collections::BTreeSet<ContentIdentity> = std::collections::BTreeSet::new();
   // Held whole, or brought: a restored store keeps the name of a text whose window was let go, and the restore and the
   // replay read every byte (codex-review's restart of 2026-11-22: r1 fenced `ContentMissing` for one six-byte window).
   let mut want = |identity: slates_merge::named::Identity| {
+    if !seen.insert(identity.hash) {
+      return;
+    }
     let held = state
       .vcs_stores
       .content()
       .is_some_and(|content| content.holds_whole(&slates_vcs::ContentId(identity.hash)));
-    if !held && !wanted.iter().any(|(wanted, _)| *wanted == identity.hash) {
-      wanted.push((identity.hash, identity.len));
-    }
+    wanted.push((identity.hash, identity.len, held));
   };
   let partition = state.db.partition();
   if let Some((_, named)) = partition.green_checkpoint(green)

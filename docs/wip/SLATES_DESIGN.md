@@ -16841,6 +16841,18 @@ landed changeset on the node's store holds and no other holder keeps, each read 
 next read (A-851, replacing "compress cold content"); hold cold content only at its f+1 holders (§4.10), fetched by
 identity when read.
 
+> **Status (2026-11-25, w-perf; main 01a20182's rulings (b) and (i')): the cold trigger is wired for what reads bring
+> back.** Each window a read brings back from the node's store is attributed, at the one step it takes into the content
+> store, to the repository whose store holds its object (a Subversion text's, the git store holding its pack, a home's
+> landed note), never a map of its own (`vcs_share::read_backs`). At each division (`grants::current_at`, which a
+> read asks too, so a shard that only reads still divides at its cadence) each repository's read-backs past its grant
+> go, coldest by last read first; a read taking a repository past its grant plus the spare lets go at once. A window a
+> reader pins and one a home holds here stay; a window no store here claims goes at the next division. A reader that
+> reads once holds what it brought back until it has read it: a named read's pin, and a home's read as one task over
+> its object's windows pinned (main's ruling of 2026-11-25: a let-go between a home's bring-back and its read refused
+> it); a git reader reads again after a let-go and brings the window back again. Write paths let go what they brought
+> back at their own ends (w-git's `read_through::BroughtBack`), not through this cache.
+
 **Giant repositories** (pieces 5, 6). Load never moves ownership (§4.10). The owner keeps the repository's register (its
 refs and the ordered landing, §4.17.1 intake rule 4), its indexes' tails and fences and its hot set; everything else
 spreads. An intake's decoding, hashing and checks run on the shard its connection arrived at, and only its landing on

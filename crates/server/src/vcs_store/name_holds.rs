@@ -381,7 +381,10 @@ pub(crate) fn resident(store: &ContentStore, identity: [u8; 32], len: u64) -> bo
     let Some((window, start, width)) = store.window_holding(&root, len, at) else {
       return false;
     };
-    if !store.is_away(&window) {
+    // Held and not let go: `window_holding` names an object of one window by its root whether or not the store holds
+    // it, so an object the store holds nothing of read as resident (the crash test's `kept` and the copy-back red read
+    // it so).
+    if store.contains(&window) && !store.is_away(&window) {
       return true;
     }
     at = start.saturating_add(width.max(1));

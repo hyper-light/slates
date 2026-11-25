@@ -1274,6 +1274,80 @@ fn t_p2_an_unborn_default_branchs_first_push_owes_its_tree_and_reads_as_its_comm
   assert_eq!(read, expected, "made as the eager update made it");
 }
 
+/// Shape: the files of [`a_green_build_lets_go_the_windows_it_brought_back_once_it_is_made`]'s commit: a few, so its pack
+/// is one window or two and the test small.
+const BUILT_FILES: usize = 40;
+
+/// Repository `name`'s unborn default branch `main` pushed at a commit of [`BUILT_FILES`] files, so its green owes the
+/// push (P2): the repository, the green and the pack it landed.
+fn owed_default_pushed(
+  daemon: &crate::Daemon,
+  name: &'static str,
+) -> (RepositoryId, slates_db::catalog::VolumeId, Vec<u8>) {
+  let (head, objects) = flat_commit(BUILT_FILES, name, None);
+  let (repository, green) = crate::daemon::observe_first(daemon, move |state| {
+    let repository = git_repository(state, name);
+    let repositories = state.db.partition().repositories();
+    (repository, repositories.branch(repository, "main").unwrap())
+  });
+  let pack = pack_of_objects(&objects);
+  let create = request(
+    &[("", &head.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack,
+  );
+  let (created, _) = pushed_in_steps(daemon, repository, &create).unwrap();
+  assert_eq!(reasons(&created), [b"ok"]);
+  (repository, green, pack)
+}
+
+/// `green` reached through the door (`green_ready`) and waited for until it owes nothing: whether it was made in time.
+fn reached_and_made(daemon: &crate::Daemon, green: slates_db::catalog::VolumeId) -> bool {
+  crate::daemon::observe_first(daemon, move |state| {
+    crate::green_ready::green_ready(state, green);
+  });
+  let began = std::time::Instant::now();
+  while crate::daemon::observe_first(daemon, move |state| state.greens.is_owing(&green)) {
+    if began.elapsed() > std::time::Duration::from_secs(120) {
+      return false;
+    }
+  }
+  true
+}
+
+/// Main 01a20182's ruling of 2026-11-24 (w-hg's sweep: a write path's bring-back never let go; its red for the green
+/// build). Do: push the unborn default branch at a commit of [`BUILT_FILES`] files, so its green owes the push; let the
+/// pack's windows go by hand; then reach the green through the door and wait for it to be made. Expect: every window let
+/// go first; the build brought windows back to read the files (`merge.green.materialize_brought_back`, so it is the
+/// bring-back this measures); the green made; and none of the pack's windows held once it was
+/// (`vcs_store.read_through.write_path_let_go`). Red before: the windows it brought back stayed held.
+#[test]
+fn a_green_build_lets_go_the_windows_it_brought_back_once_it_is_made() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (_, green, pack) = owed_default_pushed(&daemon, "built-brought-back");
+  let (windows, held_first) = crate::daemon::observe_first(&daemon, move |state| {
+    let windows = let_go_by_hand(state, &pack);
+    let held = held_of(state, &windows);
+    (windows, held)
+  });
+  let made = reached_and_made(&daemon, green);
+  let (brought, held_after) = crate::daemon::observe_first(&daemon, move |state| {
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      count(crate::green_ready::MATERIALIZE_BROUGHT_BACK),
+      held_of(state, &windows),
+    )
+  });
+  daemon.stop();
+  assert_eq!(held_first, 0, "every window let go first");
+  assert!(made, "the green made");
+  assert!(brought > 0, "the build brought windows back: {brought}");
+  assert_eq!(
+    held_after, 0,
+    "the windows it brought back let go again once it was made"
+  );
+}
+
 /// `green`'s owed push as its record encodes it, and its head: what a replay of it must hold again (P2).
 fn owed_of(green: &slates_merge::engine::Green) -> (u64, Option<Vec<u8>>) {
   (
