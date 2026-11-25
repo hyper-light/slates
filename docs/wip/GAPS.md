@@ -1554,7 +1554,14 @@
 > its bases' bytes resident. A revision now lets go again what it brought back once it ends, kept or given back. Held by
 > `a_file_delta_base_before_the_last_text_is_read_from_the_forks_rows` (red: the base still held after its revision) and
 > P5's daemon-edge let-go test (red: 1 manifest object of 288 bytes held). Sibling sweep (CLAUDE.md, main's order):
-> reported to main the same day, every bring-back site with its let-go or none.
+> reported to main the same day, every bring-back site with its let-go or none. main's order on w-hg's own write-path sites
+> (2026-11-24): (1) `hg_push::brought_back`, a push's work reading a let-go file revision, measured, not a leak: it is
+> brought back under `vcs_store::within_budget`, lent for its step (P5's daemon-edge test: 7 texts read back, 0 file
+> objects held after the pushes; kept as a guard); (2) `hg_named::bring_back_named`'s group refused partway left what it
+> had brought out of the recovery's and the re-adoption's let-go: `bring_back_on` now notes each object as it comes
+> back, before any later one can refuse the group (`a_named_group_refused_partway_lets_go_what_it_brought_back`: red,
+> nothing returned and the base held); (3) a replay refused at its finish drops its brought-back list, but its refusal
+> releases the repository's store whole (`vcs_store::replayed`'s `release_charged`), its rows' holds with it: no leak.
 > Owed: changesets a window at a time; a let-go base's or last manifest's store answer arrives whole for one step; the
 > base's identity hashed by a second read.
 > Found by main's interop bench at ed71ac0be and closed (2026-11-24): after P5, `hg clone` of hg's 57k history ran past
