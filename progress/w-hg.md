@@ -683,3 +683,9 @@ Waiting: main's route; arena-7 and arena-8.
 - Main reruns the interop hg leg at f8fe97e5e.
 - Parked: C1 (2) manifests (B) as ~/.cache/w-hg-scratch/c1-2-manifests-wip.patch + chain_read.rs + intake_manifest.rs; its tests red, one hung (a loop). Pure pieces landed: 105609857 (manifest::Checking, delta::Written).
 - Next: resume manifests (B), the loop first.
+
+## 2026-11-24 ~23:30: C1 (2) manifests (B') and the write-path leak fixes landed
+- b47217878 (main 5a773a49a): manifests taken a window a step; one rule (`push::manifest_row`) for the live intake, segment replay and stale re-base; `manifest_diff::Diffing` (streaming sorted-merge diff, proptest). Red: 43,329 bytes held on main → within 16,528. Also fixed my 4885954fa leak (a let-go base brought back for one revision never let go).
+- 3e50c0aee (main 1aafd8f8e): main's three write-path items. hg_push work read-back: not a leak (within_budget step lend; guard added). hg_named partial group: fixed (red). record.rs finish error: not a leak (store released whole).
+- Sweep reported to main: svn and git write-path sites routed to their owners; read paths pending w-perf's division ruling.
+- Next: hg stream clone (4.7x stock) and the clone's let-go reads (~1.7x beyond load).
