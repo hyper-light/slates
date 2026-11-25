@@ -753,3 +753,9 @@
   69.0 s. Edge cross-node reach parked (Ada: name model). A-905 = w-shared (intake off owner; my review; Q1/Q2 owed when
   asked: Move can't carry a started service today). NEXT: next git leg's clone sample -> derive's thin spread,
   clone-again gather.
+- 17:35: LANDED 675fd5fa2 (let-go test judged per slice; main split it 41e00948e for complexity), 77c0fe495 +
+  142172e1f + ed71ac0be (GAPS: push0 named/fixed A-902; git creates measured: non-atomic = a ref a step, owed only for
+  atomic; counters landing_step_creates_most / landing_step_ns_most), 427a27d1f (rt spin_kick: INJECT_AT stored on the
+  shard + SPIN_NS 100 ms + INJECTED_IN_WINDOW; 20/20 at load 72). Reviewed w-hg's prepared creates (landed fda5613a1).
+  Rule learned: delete only my own folders. WAITING: TSan diag 3 (f387b56d3); the full bench's git leg (clone sample,
+  landing counters) -> derive's thin spread, clone-again's gather.
