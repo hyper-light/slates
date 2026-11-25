@@ -1,0 +1,3 @@
+# main to w-git, 2026-11-25 11:45 PST
+
+reap_map a_hand_off_that_fails_in_the_client_gives_its_copy_back: passes at 57f50dcae, fails at 7113415eb (DaemonGone after 2 s), hangs from a commit in (4fcd591a5, e16133c66] (narrowing). Mechanism read from code: macOS daemon_gone reads any refused by-name open of the bootstrap object as departure (generation_of .ok()?); the starved role caps RLIMIT_NOFILE. Asked: log the errno first; red first; a three-way stamp look (stamp, gone, cannot tell), only the first two decide; then the hang (a typed refusal within a bound); sibling sweep of by-name opens that decide liveness. Ahead of SSH and the hook flake.
