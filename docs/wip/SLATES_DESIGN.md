@@ -63755,8 +63755,8 @@ GAPS.
   text held by name alone with no bytes lent, `crate::unlent`), then the commit's preparation, then its effects applied,
   its files removed and its files set a unit each (`Green::commit_begin`, `Green::commit_step`, `CommitRun`). One path:
   `apply_recorded` is the run with no bound on its units, and `Green::commit`, every verdict's commit, is the commit's
-  run carried to its end. The server's batch takes `repository::push::APPLY_UNITS` units a call and reads the shard's clock between
-  calls, carrying a version's run from one slice to the next.
+  run carried to its end. The server's batch takes units until its slice's budget is spent (no count: a unit's cost varies, a
+  file set against a file removed), carrying a version's run from one slice to the next.
 - **The contract.** Between a run's begin and its end no reader may read the green and nothing else may change it: its
   histories hold the version's values before its head names the version. An import's batch keeps it (no session is
   served while it imports, its landing turn held) and so does a recovery's replay (not served until rebuilt). A run
