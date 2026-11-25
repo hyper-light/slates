@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 36 (main 01a20182, 2026-11-24 22:18 PST): main at 5a773a49a, w-svn's crash-test evidence (ac3bf0650) and w-hg's (B') manifest
+# rule with the brought-back base let-go (b47217878), landed after run 35.
 # Run 35 (main 01a20182, 2026-11-24 21:53 PST): main past 2a5095c04 with w-perf's BENCHMARKS (f72985f75), w-svn's first-checkpoint
 # budget (964888c59) and the pace waiter test (1af90f6e4).
 # Run 34 (main 01a20182, 2026-11-24 21:24 PST): run 33 found git graph.rs:175's bare subtraction (A-911, 8c943afb1); main's commit
