@@ -518,3 +518,18 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
   configuration from 7 to 13 within the push, and A-902's install wait on the restarted b elapsed. This is the window of
   a push during a takeover, reported to main.
 - Left: A-905 (parked on w-git's question 1).
+
+## 2026-11-24: A-912 landed (040a3a69b; commits d44be7d64, b97c77c37); flaky part 4 tests fixed (4f48e9717, fcb77e918)
+
+- A-912: a push during a member's death is accepted.
+  - The coordinator's home passes run on HomePassLane.
+  - A home behind its sender answers Behind at once (wire 0x85); the sender asks again after a CouncilRound.
+  - Invariant: no session is held across a council round. Its breach is counted as fleet.council.session_lent, held at 0.
+  - A push's homing budget is derived from detection + confirmation + (2 + 2(m-1)) x period, and the homing re-ranks
+    on each install.
+  - Both a912 fleet tests are green; red before (3 of 3).
+- Next piece (main's ruling): A-912's sibling. A branch created during a death can be refused at the record barrier
+  (the new green's merge-record inputs not placed). Measure first: when versions 0 and 1's inputs place against the
+  barrier window, across runs. Red: the a912 push test asserting every created branch lands.
+- a894 flakes 1 in 3 at origin/main without A-912; main bisects it (w-svn's 964888c59 / ac3bf0650 suspected).
+- Owed to w-perf: the A-912 hash (sent), before it touches homes.rs.
