@@ -1683,10 +1683,15 @@
 > `a_text_past_a_step_is_copied_a_step_a_request` (one request copying 11,290 B against a 1,024 B step; now 12 of at
 > most 1,024), and `a_text_read_in_slices_past_a_piece_leaves_no_walk_in_flight` (a slice's reach taken for a piece's:
 > bound 6,291,456 B; now 1,048,576). The request count is what the rule makes: about one a manifest at 57k (about
-> 57,000; 3,062 before, over 100,000 before 9a5587e78), main's to measure. Owed: a replay's base asks
-> (`hg_view::answer_wants_over`, recovery's) still copy a want in one request, swept once their callers in
-> `vcs_store.rs` name their shard's step; the 418 GB of fresh pages `mem.large.returned_bytes` counted by the 15b4f1061
-> clone's end, split between push and clone.
+> 57,000; 3,062 before, over 100,000 before 9a5587e78), main's to measure. A replay's base asks (recovery's and the
+> rebuild's, `hg_view::answer_wants_over`) are held to the same rule, each caller naming its replaying shard's step, and
+> counted alike (`vcs_store.hg_text_requests`, `vcs_store.hg_text_copied_most_bytes`); red
+> `a_replays_ask_past_a_step_is_copied_a_step_a_request` (one request copying 10,990 B against a 1,024 B step; now 11
+> of at most 1,024). The step bounds a request's copy, not what the shard holds: a want past it is one text, held whole
+> as the changegroup sends it. A sliced read that stops before its text's end (past the want's room, or the owner's
+> refusal) leaves that text's walk in flight in the owner's cache until its walks past `reads` push it out: bounded,
+> the shape 7c0ea35a1 closed for every read (w-hg's review). Owed: the 418 GB of fresh pages
+> `mem.large.returned_bytes` counted by the 15b4f1061 clone's end, split between push and clone.
 > Found by main's interop bench at ed71ac0be and closed (2026-11-24): after P5, `hg clone` of hg's 57k history ran past
 > 13.5 minutes (stock 7.2: 42.4 s; round 2 before P5: 10.1 s). A clone's changelog and manifest texts, let go once
 > landed, were asked of the changeset store one at a time, a row and then its text, and the store answered a row by

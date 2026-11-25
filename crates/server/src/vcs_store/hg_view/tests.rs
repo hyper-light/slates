@@ -687,6 +687,65 @@ fn a_text_past_a_step_is_copied_a_step_a_request() {
   });
 }
 
+/// Goal 93 (main's ruling of 2026-11-25, the fetch's step rule for a replay's base asks: a recovery asks the node's
+/// changeset store for the texts its predecessor let go, through `hg_view::answer_wants_over`, which made a want of them
+/// whole in one request of the owner whatever its bytes). Do: push a changeset adding a file of [`LONG_TEXT_LINES`]
+/// lines; answer a want of its text whole, as a replay's base ask is answered, within a step of [`SMALL_STEP`] bytes.
+/// Expect the text as pushed; no request copying more than the step; as many requests as its slices. Red before: one
+/// request copying the whole text.
+#[test]
+fn a_replays_ask_past_a_step_is_copied_a_step_a_request() {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
+    let hg = created(state, "hg", VcsTool::Mercurial);
+    let long: &'static [u8] = Box::leak(
+      (0..LONG_TEXT_LINES)
+        .flat_map(|line| format!("line {line} of a base a replay asks for\n").into_bytes())
+        .collect::<Vec<u8>>()
+        .into_boxed_slice(),
+    );
+    let made =
+      crate::repository::hg_push::tests::history_of(&[("base", "long", long, None, "default")]);
+    pushed(state, hg, &made, &[0]);
+    let identity = *blake3::hash(long).as_bytes();
+    let disk = state.vcs_disk.clone().expect("a store");
+    let repository = u128::from_be_bytes(hg.bytes);
+    let (asked, asks) = std::thread::scope(|scope| {
+      scope
+        .spawn(move || {
+          crate::test_store::waiting_runtime()
+            .block_on(async move {
+              let mut asked = AskedTexts {
+                want: Some(slates_hg::render::Want::Texts {
+                  texts: vec![identity],
+                  most: u64::MAX,
+                }),
+                given: None,
+              };
+              let asks = super::answer_wants_over(&disk, repository, &mut asked, SMALL_STEP).await;
+              (asked.given, asks)
+            })
+            .ok()
+        })
+        .join()
+        .unwrap()
+    })
+    .expect("the want answered");
+    let asks = asks.expect("every want answered");
+    let slices = (long.len() as u64).div_ceil(SMALL_STEP);
+    println!(
+      "hg_view: a replay's ask of {} B within a step of {SMALL_STEP} B: {asks:?} ({slices} slices)",
+      long.len()
+    );
+    assert_eq!(asked, Some(Some(vec![long.to_vec()])), "the text as pushed");
+    assert!(
+      asks.most_copied <= SMALL_STEP,
+      "a request copied {} B, past the step's {SMALL_STEP}",
+      asks.most_copied
+    );
+    assert!(asks.requests >= slices, "a request a slice: {asks:?}");
+  });
+}
+
 /// What a revision's text must be, as its writer kept it: a changeset's or a manifest's text whole; a file revision's
 /// by the identities its row names (its bytes' BLAKE3 and its metadata block's), since a landed file's text leaves the
 /// content store once its writer lands it (goal 93 item 2b(b)) and its row's names are what the writer kept.

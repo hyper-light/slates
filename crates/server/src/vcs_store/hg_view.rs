@@ -249,9 +249,10 @@ where
 /// counter name in the status report.
 pub(crate) const TEXT_REQUESTS: &str = "vcs_store.hg_text_requests";
 
-/// Counter: the most bytes one request of a fetch's texts copied on the store's owner (goal 93, main's ruling of
-/// 2026-11-25): held to a step's copy budget ([`text_bytes_a_step`]), a text past it copied in slices. Format: a counter
-/// name in the status report.
+/// Counter: the most bytes one request of a fetch's or a replay's texts copied on the store's owner (goal 93, main's
+/// ruling of 2026-11-25): held to a step's copy budget ([`text_bytes_a_step`]), a text past it copied in slices; the
+/// bytes a want past the step holds on the shard are still its one text, whole, as the changegroup sends it. Format: a
+/// counter name in the status report.
 pub(crate) const TEXT_COPIED_MOST_BYTES: &str = "vcs_store.hg_text_copied_most_bytes";
 
 /// Counter: the asks a push's intake (or its replay) made of the node's changeset store for a file delta's base landed
@@ -260,23 +261,22 @@ pub(crate) const TEXT_COPIED_MOST_BYTES: &str = "vcs_store.hg_text_copied_most_b
 pub(crate) const INTAKE_BASE_ASKS: &str = "vcs_store.hg_intake_base_asks";
 
 /// [`answer_store_wants`] over `disk` alone, touching no shard state (a recovery's replay holds the state across its
-/// waits): whether every want was answered. A want of texts is copied in one request of the owner, as before the step
-/// rule (goal 93, main's ruling of 2026-11-25, owed here: a replay's base asks, sized by its own room, are swept onto
-/// [`text_bytes_a_step`] once its callers can name their shard's step).
+/// waits), the owner copying at most `step` bytes a request (the replaying shard's [`text_bytes_a_step`]; goal 93,
+/// main's ruling of 2026-11-25, the fetch's rule for a replay's base asks too): what it asked of the owner, all its wants
+/// together; none where a want went unanswered.
 pub(crate) async fn answer_wants_over(
   disk: &slates_store::owner::StoreHandle,
   repository: u128,
   wants: &mut dyn slates_hg::render::StoreWants,
-) -> bool {
+  step: u64,
+) -> Option<TextAsks> {
+  let mut asked = TextAsks::default();
   while let Some(want) = wants.wants().cloned() {
-    if answer_one(disk, repository, (want, u64::MAX), wants)
-      .await
-      .is_none()
-    {
-      return false;
-    }
+    let (_, asks) = answer_one(disk, repository, (want, step), wants).await?;
+    asked.requests = asked.requests.saturating_add(asks.requests);
+    asked.most_copied = asked.most_copied.max(asks.most_copied);
   }
-  true
+  Some(asked)
 }
 
 /// Answers one `want` of `repository` from `disk` into `wants`, the owner copying at most `step` bytes a request: the
@@ -443,7 +443,7 @@ pub(crate) async fn texts_made(
 /// (`slates_hg::serve::getbundle::Store::text_bytes_a_step`; goal 93, main's ruling of 2026-11-25): the copy budget of
 /// one step on the calling shard, `copy_slice_bytes` (the machine's measured memcpy rate over the copy share of its
 /// step quantum; 94,797 B on main's bench), one byte at least.
-fn text_bytes_a_step(state: &ShardState) -> u64 {
+pub(crate) fn text_bytes_a_step(state: &ShardState) -> u64 {
   state.config.copy_slice_bytes().max(1)
 }
 
