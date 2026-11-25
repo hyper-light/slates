@@ -188,6 +188,8 @@ pub(super) struct Patched {
   writing: Option<Writing>,
   /// The stage after it.
   after: Stage,
+  /// A landed base's bytes and block brought back for it ([`Taker::base_brought_back`]): let go again once it ends.
+  brought: Vec<ContentId>,
 }
 
 impl Taker {
@@ -254,6 +256,7 @@ impl Taker {
       framing: Framing::Undecided(Vec::new()),
       writing: None,
       after,
+      brought: Vec::new(),
     }));
     Ok(false)
   }
@@ -454,6 +457,16 @@ impl Taker {
     crate::push::held::bring_back_file((&self.fork, store), (&path, &base), &text)
       .map_err(|refused| Refused::Unindexed(super::Unindexed::from(refused)))?;
     self.spares.give(text);
+    // Landed, its objects go again once this revision ends: a base brought back for one revision is no push's to keep.
+    let log = Log::File(&path);
+    let row = self
+      .fork
+      .rev(store, log, &base)
+      .and_then(|rev| self.fork.revision(store, log, rev));
+    if let (Some(row), Some(patched)) = (row, self.patched.as_mut()) {
+      patched.brought.push(row.bytes);
+      patched.brought.extend(row.block);
+    }
     Ok(None)
   }
 
@@ -504,8 +517,34 @@ impl Taker {
       framing,
       writing,
       after,
+      brought,
       ..
     } = *patched;
+    let kept = self.patched_kept(
+      (path, (node, p1, p2, link), place),
+      (
+        base_identity,
+        patching,
+        checking,
+        identity,
+        framing,
+        writing,
+      ),
+      (store, admission),
+    );
+    let_go_brought(store, &brought);
+    kept?;
+    self.stage = after;
+    Ok(Stepped::More)
+  }
+
+  /// [`Taker::patched_finish`]'s keep: its node checked, its bytes finished, its row kept.
+  fn patched_kept(
+    &mut self,
+    (path, (node, p1, p2, link), place): (Vec<u8>, (Node, Node, Node, Node), Range<u64>),
+    (base_identity, patching, checking, identity, framing, writing): Ending,
+    (store, admission): (&mut ContentStore, &mut Admission),
+  ) -> Result<(), Refused> {
     let log = Log::File(&path);
     // Taken out of the intake, the writer's windows are this step's to give back on any refusal.
     let give_back = |store: &mut ContentStore, writing: Option<Writing>| {
@@ -567,11 +606,32 @@ impl Taker {
       log,
       &revision,
       (text, base_identity, place),
-      (kept, Some(identity), Some(patching.made())),
+      super::Streamed {
+        kept,
+        identity: Some(identity),
+        len: Some(patching.made()),
+        ..super::Streamed::default()
+      },
       (store, admission),
-    )?;
-    self.stage = after;
-    Ok(Stepped::More)
+    )
+  }
+}
+
+/// What a file revision's last step keeps it by: its base's identity, the delta applied, its node's check, its identity's
+/// hash, its framing and its bytes' object being put.
+type Ending = (
+  Option<[u8; 32]>,
+  Patching,
+  node::Checking,
+  blake3::Hasher,
+  Framing,
+  Option<Writing>,
+);
+
+/// Lets go again the objects of a landed base brought back for one revision ([`Patched::brought`]).
+fn let_go_brought(store: &mut ContentStore, brought: &[ContentId]) {
+  for object in brought {
+    store.let_go_object(object);
   }
 }
 
@@ -594,4 +654,12 @@ fn put_bytes(
   store
     .put_window(writing, bytes)
     .map_err(|refused| Refused::Unindexed(super::Unindexed::from(refused)))
+}
+
+/// Gives back what a file revision being taken holds: its bytes' object being put.
+pub(super) fn give_back(store: &mut ContentStore, patched: Patched) {
+  if let Some(writing) = patched.writing {
+    store.abandon_object(writing);
+  }
+  let_go_brought(store, &patched.brought);
 }
