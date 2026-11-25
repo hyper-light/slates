@@ -10,9 +10,14 @@ description = "The version-control servers' one object store (§4.17.1 shared pi
 
 [dependencies]
 blake3 = { workspace = true }
+# Hardware-accelerated SHA-1 block compression (`sha1::block_api::compress`: ARMv8 SHA2, x86 SHA-NI, scalar) for
+# `sha1dc`, keeping zero `unsafe` in `slates-vcs`.
+sha1 = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Differential oracle for `sha1dc`: every generated input and every Stevens disturbance vector must match bit-for-bit.
+sha1-checked = { workspace = true }
 slates-test-seeds = { workspace = true }
 
 [lints]

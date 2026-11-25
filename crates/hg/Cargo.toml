@@ -15,10 +15,7 @@ description = "Mercurial's exchange formats and objects (§4.17.3, A-514, A-545,
 bzip2 = { workspace = true }
 flate2 = { workspace = true }
 zstd = { workspace = true }
-# The SHA-1 of a Mercurial node with collision detection, as 7.2's sha1dc computes it (A-588): the workspace's port of
-# sha1collisiondetection, which git's object names use (A-600; the workspace manifest says why this crate).
-sha1-checked = { workspace = true }
-# The shared object store's tables, which hold the repository's index (A-588 part 2, A-581).
+# The shared object store's tables and hardware-accelerated SHA-1DC (`slates_vcs::sha1dc`, A-893).
 slates-vcs = { workspace = true }
 # The merge engine a push becomes a work in (§4.17.1 shared piece 4, A-618): a push's trees, laid out from its flat
 # manifests, read by its builder (A-641 part 2), as slates-git's store is.

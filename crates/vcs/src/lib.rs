@@ -78,6 +78,7 @@ pub mod partition;
 pub mod rate;
 pub mod rows;
 pub mod rule;
+pub mod sha1dc;
 pub mod share;
 pub mod table;
 pub mod usage;

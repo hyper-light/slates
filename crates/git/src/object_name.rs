@@ -20,11 +20,13 @@
 //!
 //! **SHA-1 with collision detection.** git hashes SHA-1 through sha1collisiondetection ("moved to a hardened SHA-1
 //! implementation by default, which isn't vulnerable to the SHAttered attack" [B: hash-function-transition]). Here it is
-//! RustCrypto's `sha1-checked`, a pure-Rust port of the same detection, configured as git configures it: detection on,
-//! the safe hash off (`git_SHA1DCInit`). So an input in which a block shows a known attack's disturbance is refused
-//! ([`CollisionAttack`]) and named by its plain SHA-1, as `git_SHA1DCFinal` dies naming it ("SHA-1 appears to be part
-//! of a collision attack"). It is proven on git's own t0013 vector (`shattered-1.pdf`) and its SHAttered twin, each
-//! checked by its SHA-256 and cut to the 320 bytes that hold both colliding blocks.
+//! `slates_vcs::sha1dc` (A-893), pairing RustCrypto's hardware-accelerated `sha1::block_api::compress` with Marc
+//! Stevens's exact UBC filter and single-block recompression, configured as git configures it: detection on, the safe
+//! hash off (`git_SHA1DCInit`), and held bit-for-bit to `sha1-checked` in `slates-vcs`'s oracle tests. So an input in
+//! which a block shows a known attack's disturbance is refused ([`CollisionAttack`]) and named by its plain SHA-1, as
+//! `git_SHA1DCFinal` dies naming it ("SHA-1 appears to be part of a collision attack"). It is proven on git's own t0013
+//! vector (`shattered-1.pdf`) and its SHAttered twin, each checked by its SHA-256 and cut to the 320 bytes that hold
+//! both colliding blocks.
 //!
 //! **SHA-256** is hashed through aws-lc-rs, the workspace's one cryptographic library.
 //!
@@ -480,10 +482,8 @@ pub struct Hasher {
 
 /// The running hash of a [`Hasher`].
 enum State {
-  /// SHA-1 with collision detection, boxed so long-lived `Hasher` holders (`Upload`, `unpack::Reader`,
-  /// `Sealing`, which use [`Hasher::pack_checksum`]) stay 80 bytes instead of 824 bytes per connection;
-  /// one-shot [`name_of`] keeps `sha1_checked::Sha1` on the stack with zero heap allocation.
-  Sha1(Box<sha1_checked::Sha1>),
+  /// Hardware-accelerated SHA-1 with Marc Stevens collision detection (A-893): 96 bytes inline, zero heap allocation.
+  Sha1(slates_vcs::sha1dc::Hasher),
   /// Vetted hardware-accelerated hash (`aws-lc-rs`) for SHA-256 object names and pack/index transport checksums.
   Fast {
     format: ObjectFormat,
@@ -491,33 +491,29 @@ enum State {
   },
 }
 
-/// Builds a collision-detecting SHA-1 state configured as git configures it (`git_SHA1DCInit`).
-fn new_sha1_checked() -> sha1_checked::Sha1 {
-  sha1_checked::Sha1::builder()
-    .detect_collision(true)
-    .safe_hash(false)
-    .build()
+/// Converts a 20-byte SHA-1 digest into an [`ObjectId`].
+fn sha1_id(bytes: &[u8; slates_vcs::sha1dc::DIGEST_LEN]) -> ObjectId {
+  ObjectId::from_bytes(ObjectFormat::Sha1, bytes).unwrap_or(ObjectId {
+    format: ObjectFormat::Sha1,
+    bytes: [0; MAX_RAW_LEN],
+  })
 }
 
 /// Finalizes a collision-detecting SHA-1 state into an [`ObjectId`] or [`CollisionAttack`].
-fn finish_sha1_checked(hash: sha1_checked::Sha1) -> Result<ObjectId, CollisionAttack> {
-  let result = hash.try_finalize();
-  let name = ObjectId::from_bytes(ObjectFormat::Sha1, result.hash().as_slice());
-  let name = name.unwrap_or(ObjectId {
-    format: ObjectFormat::Sha1,
-    bytes: [0; MAX_RAW_LEN],
-  });
-  if result.has_collision() {
-    return Err(CollisionAttack { sha1: name });
+fn finish_sha1dc(hash: slates_vcs::sha1dc::Hasher) -> Result<ObjectId, CollisionAttack> {
+  match hash.finish() {
+    Ok(digest) => Ok(sha1_id(&digest)),
+    Err(attack) => Err(CollisionAttack {
+      sha1: sha1_id(&attack.sha1),
+    }),
   }
-  Ok(name)
 }
 
 impl Hasher {
   /// A hasher of raw bytes in `format`, with no header: what git's `test-tool sha1` hashes.
   pub fn raw(format: ObjectFormat) -> Hasher {
     let state = match format {
-      ObjectFormat::Sha1 => State::Sha1(Box::new(new_sha1_checked())),
+      ObjectFormat::Sha1 => State::Sha1(slates_vcs::sha1dc::Hasher::new()),
       ObjectFormat::Sha256 => State::Fast {
         format: ObjectFormat::Sha256,
         context: aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256),
@@ -554,7 +550,7 @@ impl Hasher {
   /// Hashes `bytes` next.
   pub fn update(&mut self, bytes: &[u8]) {
     match &mut self.state {
-      State::Sha1(hash) => sha1_checked::Digest::update(hash.as_mut(), bytes),
+      State::Sha1(hash) => hash.update(bytes),
       State::Fast { context, .. } => context.update(bytes),
     }
   }
@@ -562,7 +558,7 @@ impl Hasher {
   /// The name of what was hashed, or the attack SHA-1's detection found in it.
   pub fn finish(self) -> Result<ObjectId, CollisionAttack> {
     match self.state {
-      State::Sha1(hash) => finish_sha1_checked(*hash),
+      State::Sha1(hash) => finish_sha1dc(hash),
       State::Fast { format, context } => {
         let digest = context.finish();
         Ok(
@@ -589,15 +585,6 @@ pub fn empty_tree(format: ObjectFormat) -> Option<ObjectId> {
   name_of(format, Kind::Tree, &[]).ok()
 }
 
-/// Stack-allocated [`Out`] adapter over `sha1_checked::Sha1` for zero-alloc [`name_of`].
-struct Sha1Stack(sha1_checked::Sha1);
-
-impl Out for Sha1Stack {
-  fn put(&mut self, bytes: &[u8]) {
-    sha1_checked::Digest::update(&mut self.0, bytes);
-  }
-}
-
 /// The name of an object of `kind` whose whole content is `content`, in `format`.
 pub fn name_of(
   format: ObjectFormat,
@@ -608,19 +595,9 @@ pub fn name_of(
     kind,
     size: to_u64(content.len()),
   };
-  match format {
-    ObjectFormat::Sha1 => {
-      let mut hasher = Sha1Stack(new_sha1_checked());
-      write_header(header, &mut hasher);
-      sha1_checked::Digest::update(&mut hasher.0, content);
-      finish_sha1_checked(hasher.0)
-    }
-    ObjectFormat::Sha256 => {
-      let mut hasher = Hasher::object(format, header);
-      hasher.update(content);
-      hasher.finish()
-    }
-  }
+  let mut hasher = Hasher::object(format, header);
+  hasher.update(content);
+  hasher.finish()
 }
 
 #[cfg(test)]

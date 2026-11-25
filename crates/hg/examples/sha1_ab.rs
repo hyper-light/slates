@@ -41,6 +41,10 @@ fn sha1dc(detect: bool, piece: &[u8]) -> [u8; 20] {
   out
 }
 
+fn slates_sha1dc(piece: &[u8]) -> [u8; 20] {
+  slates_vcs::sha1dc::hash(piece).unwrap()
+}
+
 fn hardware(piece: &[u8]) -> [u8; 20] {
   let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY, piece);
   let mut out = [0; 20];
@@ -79,9 +83,10 @@ fn main() {
   for piece_len in PIECES {
     let pieces: Vec<&[u8]> = corpus.chunks(piece_len).collect();
     let reference: Vec<[u8; 20]> = pieces.iter().map(|piece| sha1dc(true, piece)).collect();
-    let ways: [Way<'_>; 4] = [
-      ("sha1dc (node.rs)", &|piece| sha1dc(true, piece)),
-      ("sha1dc, detection off", &|piece| sha1dc(false, piece)),
+    let ways: [Way<'_>; 5] = [
+      ("sha1-checked (old)", &|piece| sha1dc(true, piece)),
+      ("slates-vcs sha1dc (new)", &slates_sha1dc),
+      ("sha1-checked, det off", &|piece| sha1dc(false, piece)),
       ("aws-lc hardware", &hardware),
       ("hardware + sha1dc check", &|piece| {
         let fast = hardware(piece);

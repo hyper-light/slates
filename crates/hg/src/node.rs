@@ -11,16 +11,14 @@
 //! `sha1dc.cpython-314-darwin.so`; the fixtures' runs printed `<class 'sha1dc.sha1'>`), and its binding detects and
 //! never mends: `SHA1DCSetSafeHash(&(self->ctx), 0)`, "We don't want "safe" sha1s ... We just want to detect
 //! collisions", and a detection raises `OverflowError("sha1 collision attack detected")`, so a 7.2 server refuses the
-//! revision. Here it is RustCrypto's `sha1-checked`, the pure-Rust port of the same detection that git's object names
-//! use (A-600), configured as 7.2 configures it: an input in which a block shows a known attack's disturbance is
-//! refused ([`CollisionAttack`]) and named by its plain SHA-1. SHA-1 is Mercurial's name for a revision here, never
-//! slates' own integrity, which is BLAKE3's.
+//! revision. Here it is `slates_vcs::sha1dc` (A-893), pairing RustCrypto's hardware-accelerated `sha1` block
+//! compression with Marc Stevens's exact UBC filter and single-block recompression, configured as 7.2 configures it: an
+//! input in which a block shows a known attack's disturbance is refused ([`CollisionAttack`]) and named by its plain
+//! SHA-1. SHA-1 is Mercurial's name for a revision here, never slates' own integrity, which is BLAKE3's.
 //!
 //! No public collision has 7.2's framing: one would need the first forty bytes it hashes to be two parents in ascending
 //! order, and SHAttered's prefix begins with a higher twenty bytes than its second twenty. So the detection is proven
 //! on the hasher with SHAttered's two prefixes, and the framing on every node stock 7.2 stored (`tests/objects.rs`).
-
-use sha1_checked::{Digest, Sha1};
 
 use crate::out::Out;
 use crate::{NODE_LEN, Node};
@@ -56,42 +54,32 @@ impl From<CollisionAttack> for Refusal {
   }
 }
 
-/// SHA-1 as 7.2's `hashutil.sha1` computes it: collision detection on, the safe hash off. Its state, the detection's
-/// two expanded messages included, comes to about 830 bytes by its fields' sizes and lives on the caller's stack, so a
-/// node costs no allocation.
+/// SHA-1 as 7.2's `hashutil.sha1` computes it: collision detection on, the safe hash off (A-893). Its state is 96
+/// bytes on the caller's stack, so a node costs no allocation.
 struct Hasher {
-  /// The running hash.
-  state: Sha1,
+  /// The running hardware-accelerated collision-detecting hash.
+  state: slates_vcs::sha1dc::Hasher,
 }
 
 impl Hasher {
   /// A hasher configured as 7.2's binding configures sha1dc.
   fn new() -> Self {
     Self {
-      state: Sha1::builder()
-        .detect_collision(true)
-        .safe_hash(false)
-        .build(),
+      state: slates_vcs::sha1dc::Hasher::new(),
     }
   }
 
   /// Hashes `bytes` next.
   fn update(&mut self, bytes: &[u8]) {
-    Digest::update(&mut self.state, bytes);
+    self.state.update(bytes);
   }
 
   /// The SHA-1 of what was hashed, or the attack the detection found in it.
   fn finish(self) -> Result<Node, CollisionAttack> {
-    let result = self.state.try_finalize();
-    let mut sha1 = [0; NODE_LEN];
-    for (slot, byte) in sha1.iter_mut().zip(result.hash().iter()) {
-      *slot = *byte;
-    }
-    if result.has_collision() {
-      Err(CollisionAttack { sha1 })
-    } else {
-      Ok(sha1)
-    }
+    self
+      .state
+      .finish()
+      .map_err(|attack| CollisionAttack { sha1: attack.sha1 })
   }
 }
 
