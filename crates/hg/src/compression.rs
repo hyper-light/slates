@@ -395,6 +395,26 @@ pub fn inflate(
   }
 }
 
+/// The memory a decoder of `stream`, one whole stream of `engine`, holds: what [`inflate`] charges its admission before a
+/// byte is inflated (zlib's window; zstd's buffers as its frame header sizes them; none for no compression). For a caller
+/// that bounds the inflated bytes apart (a store reading a revlog chunk within its text's length).
+///
+/// # Errors
+/// As [`inflate`] refuses a zstd frame's header; bzip2 is never a revlog chunk's, refused `Unsupported`-like as its own.
+pub(crate) fn decoder_held(engine: Engine, stream: &[u8]) -> Result<u64, StreamRefusal> {
+  match engine {
+    Engine::Uncompressed => Ok(0),
+    Engine::Zlib => Ok(ZLIB_WINDOW),
+    Engine::Zstd => Ok(ZstdFrame::read(stream)?.held()),
+    Engine::Bzip2 => {
+      let mut measured = Admission::new(u64::MAX);
+      let before = measured.left();
+      let _ = Bzip2::new(stream, &mut measured)?;
+      Ok(before.saturating_sub(measured.left()))
+    }
+  }
+}
+
 /// `bundle` as the plain bundle of its kind: an uncompressed bundle as it is, borrowed; a bundle1's changegroup
 /// inflated behind `HG10UN`; a bundle2's stream inflated behind its stream parameters, `Compression` dropped from them
 /// (7.2's `_forwardchunks`). A bundle2's stream parameters are judged first, exactly as
