@@ -42,6 +42,9 @@ pub struct Segment {
   /// lets go of the content store once the segment is durable on the node's changeset store, which then serves them,
   /// and notes for a home's read once the import lands (goal 93 item 2b(b)).
   pub contents: Vec<crate::filerev::FileContents>,
+  /// Whether it was cut for the whole file texts kept since the last cut reaching the bound, its changegroup's bytes
+  /// short of it ([`Emitter::due`]): what its owner counts apart from a cut by its bytes.
+  pub by_texts: bool,
 }
 
 /// Why a revision could not be written.
@@ -111,6 +114,8 @@ pub struct Emitter {
   cut: u64,
   /// The file revisions the segment being written holds, as the content store keeps them ([`Segment::contents`]).
   contents: Vec<crate::filerev::FileContents>,
+  /// The bytes of those file revisions' whole texts, kept in the content store until the segment lands ([`Emitter::due`]).
+  kept: u64,
 }
 
 impl Emitter {
@@ -126,12 +131,16 @@ impl Emitter {
       ranges: Vec::new(),
       cut: 0,
       contents: Vec::new(),
+      kept: 0,
     }
   }
 
-  /// Notes a file revision of the segment being written as the content store keeps it ([`Segment::contents`]).
-  pub(crate) fn note_contents(&mut self, contents: crate::filerev::FileContents) {
+  /// Notes a revision of the segment being written as the content store keeps it ([`Segment::contents`]), `kept` the
+  /// bytes of its whole text the content store holds until the segment lands: a file revision's, let go once it is
+  /// durable; 0 for the changelog's and the manifests', which go once the import lands (goal 93, C1 (1) P5).
+  pub(crate) fn note_contents(&mut self, contents: crate::filerev::FileContents, kept: u64) {
     self.contents.push(contents);
+    self.kept = self.kept.saturating_add(kept);
   }
 
   /// A log opened: what the last one kept let go.
@@ -226,9 +235,12 @@ impl Emitter {
   }
 
   /// Whether the segment being written has reached its bound: the import writes its record and cuts it
-  /// ([`Emitter::cut`]).
+  /// ([`Emitter::cut`]). Its changegroup's bytes, or the whole file texts it keeps in the content store until it lands
+  /// (goal 93 hg, R; main 01a20182's ruling of 2026-11-24): a text runs to hundreds of times its delta, so a segment cut
+  /// by its bytes alone held one of Mercurial's own segments' texts, about 600 MB, at once. Derived: an import holds one
+  /// segment at a time, so its texts are held to the segment's own bound, under twice it with the text that crosses it.
   pub(crate) fn due(&self) -> bool {
-    self.segment.len() >= self.bound
+    self.segment.len() >= self.bound || self.kept >= to_u64(self.bound)
   }
 
   /// The revisions whose deltas the segment being written holds, each log's range, in the import's order.
@@ -289,13 +301,16 @@ impl Emitter {
 
   /// Cuts the segment being written with its `record` (module docs).
   pub(crate) fn cut(&mut self, record: Vec<u8>) {
+    let by_texts = self.segment.len() < self.bound && self.kept >= to_u64(self.bound);
     self.cut = self.cut.saturating_add(to_u64(self.segment.len()));
+    self.kept = 0;
     self.ranges.clear();
     self.ready.push_back(Segment {
       payload: core::mem::take(&mut self.segment),
       texts: core::mem::take(&mut self.texts),
       record,
       contents: core::mem::take(&mut self.contents),
+      by_texts,
     });
   }
 }

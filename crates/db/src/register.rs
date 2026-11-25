@@ -2222,6 +2222,44 @@ impl Acceptor {
   pub fn accept(&mut self, record: &Record) -> Result<Ack, RegisterError> {
     self.check(record)?;
     self.fence.accept(record.epoch)?;
+    Ok(self.store(record))
+  }
+
+  /// Accepts `record` into its owner's own hold (§4.8 "the owner among them"; A-909), fenced for its object alone, as
+  /// every other candidate fences it: a holder keeps one acceptor an object (the server's `holder_records`), while an
+  /// owner keeps one acceptor for every object it writes, so [`accept`](Acceptor::accept)'s fence, raised by any
+  /// object's record, would refuse one object's record for another's epoch. A successor that wrote a register it
+  /// adopted at the takeover's epoch then refused its own record of every object it made after, written at its host
+  /// epoch (`StaleEpoch`), and at two survivors that record never reached `f + 1`. The floor is the greater of the
+  /// promise this acceptor made ([`raise_fence`](Acceptor::raise_fence), [`prepare`](Acceptor::prepare)), which binds
+  /// every object as a holder's promise for a departed host does, and the epoch the object's highest position was
+  /// accepted under. The authority and position rules are [`check`](Acceptor::check)'s. The promise is not raised: an
+  /// owner's epoch is its configuration's to move, never its own record's.
+  ///
+  /// `StaleNeverCommits` is the holders': a deposed owner, still writing under its old epoch, passes its own floor for an
+  /// object it wrote under that epoch, and every other candidate refuses it (their fence for it was raised by the
+  /// successor's phase one), so it is short of `f + 1` for every `f > 0`, as it was before. At `f = 0` the owner's hold
+  /// is the object's only holder, so its floor for the object is the object's whole fence, and no takeover raises
+  /// another (one node takes nothing over): the same code refuses there exactly what a fence of one object would.
+  pub fn accept_own(&mut self, record: &Record) -> Result<Ack, RegisterError> {
+    self.check_against(record, self.own_floor(record.object))?;
+    Ok(self.store(record))
+  }
+
+  /// The epoch below which [`accept_own`](Acceptor::accept_own) refuses `object`'s record: this acceptor's promise, or
+  /// the epoch its highest position of `object` was accepted under where that is higher.
+  fn own_floor(&self, object: ObjectId) -> HostEpoch {
+    self
+      .accepted
+      .range((object, 0)..=(object, u64::MAX))
+      .next_back()
+      .map_or(self.fence.seen, |(_, (epoch, _))| {
+        (*epoch).max(self.fence.seen)
+      })
+  }
+
+  /// Keeps `record` as accepted at its position and acknowledges it: the step after a check passed.
+  fn store(&mut self, record: &Record) -> Ack {
     // Store the accepted value and the raised promise before acknowledging.
     self.accepted.insert(
       (record.object, record.sequence),
@@ -2231,13 +2269,13 @@ impl Acceptor {
     if let Some(changes) = self.changes.as_mut() {
       changes.note_written((record.object, record.sequence));
     }
-    Ok(Ack {
+    Ack {
       holder: self.id,
       object: record.object,
       sequence: record.sequence,
       generation: record.generation,
       identity: record.identity(),
-    })
+    }
   }
 
   /// Drops every accepted position of `object` below `sequence` (AUD-29-43). For a **single-value** register
@@ -2350,6 +2388,11 @@ impl Acceptor {
   /// A holder uses this before recomputing a merge record: a refused record cannot mutate its replica.
   /// The check and acceptance must run in the same owning-shard turn, with no intervening await.
   pub fn check(&self, record: &Record) -> Result<(), RegisterError> {
+    self.check_against(record, self.fence.seen)
+  }
+
+  /// [`check`](Acceptor::check) with `floor` as the epoch fence.
+  fn check_against(&self, record: &Record, floor: HostEpoch) -> Result<(), RegisterError> {
     if record.generation < self.authority.generation {
       return Err(RegisterError::ConfigurationStale {
         version: self.authority.generation,
@@ -2363,10 +2406,8 @@ impl Acceptor {
     if record.owner != self.authority.owner {
       return Err(RegisterError::Unauthorized);
     }
-    if record.epoch < self.fence.seen {
-      return Err(RegisterError::StaleEpoch {
-        current: self.fence.seen.0,
-      });
+    if record.epoch < floor {
+      return Err(RegisterError::StaleEpoch { current: floor.0 });
     }
     let position = (record.object, record.sequence);
     // One ballot proposes one value a position: a second value under the epoch the position already holds is refused. A
@@ -4908,6 +4949,146 @@ mod tests {
       fence.accept(HostEpoch(3)).is_ok(),
       "a higher epoch raises the fence"
     );
+  }
+
+  /// An owner's record of `object` (a small per-owner number) at `sequence` under `epoch`, for the A-909 tests.
+  fn own_record(owner: HostId, object: u64, sequence: u64, epoch: HostEpoch) -> Record {
+    Record {
+      owner,
+      object: ObjectId::new(owner, object),
+      sequence,
+      epoch,
+      generation: 0,
+      value: format!("{object} at {sequence}").into_bytes(),
+    }
+  }
+
+  /// A-909 (an owner's own hold fenced per object). Do: as a successor does, write one object's record at the takeover's
+  /// epoch 2 into the owner's acceptor, then a second object's at the host's epoch 1, then the first object's next
+  /// position at epoch 1. Expect the second accepted (red before A-909: `StaleEpoch { current: 2 }`, the first object's
+  /// epoch fencing the second) and the first's refused, its own epoch still its fence.
+  #[test]
+  fn a909_an_owners_hold_takes_a_second_objects_record_below_the_epoch_it_wrote_another_at() {
+    let owner = HostId(1);
+    let mut hold = Acceptor::new(
+      owner,
+      Authority {
+        generation: 0,
+        owner,
+      },
+    );
+    let adopted = own_record(owner, 1, 0, HostEpoch(2));
+    assert!(hold.accept_own(&adopted).is_ok(), "the adopted object at 2");
+    let made = own_record(owner, 2, 0, FIRST_EPOCH);
+    assert_eq!(
+      hold.accept_own(&made).map(|ack| ack.identity),
+      Ok(made.identity()),
+      "a second object at the host's epoch"
+    );
+    assert_eq!(
+      hold.accept_own(&own_record(owner, 1, 1, FIRST_EPOCH)),
+      Err(RegisterError::StaleEpoch { current: 2 }),
+      "the adopted object stays fenced at its own epoch"
+    );
+  }
+
+  /// A-909, `StaleNeverCommits` after the change. Do: an owner writes an object at epoch 1 to itself and two holders (f =
+  /// 1); a takeover raises both holders' fence for it to 2; the deposed owner, unaware, writes the object's next position
+  /// at epoch 1. Expect its own hold to take it (its floor for the object is 1) and both holders to refuse it, so it is
+  /// never placed: the holders' per-object fences keep it short of `f + 1`.
+  #[test]
+  fn a909_a_deposed_owners_record_after_a_takeover_never_places() {
+    let owner = HostId(1);
+    let authority = Authority {
+      generation: 0,
+      owner,
+    };
+    let candidates = [owner, HostId(2), HostId(3)];
+    let mut own = Acceptor::new(owner, authority);
+    let mut holders = [
+      Acceptor::new(HostId(2), authority),
+      Acceptor::new(HostId(3), authority),
+    ];
+    let before = own_record(owner, 1, 0, FIRST_EPOCH);
+    assert!(own.accept_own(&before).is_ok());
+    for holder in &mut holders {
+      assert!(holder.accept(&before).is_ok());
+      holder.raise_fence(HostEpoch(2));
+    }
+    let stale = own_record(owner, 1, 1, FIRST_EPOCH);
+    let mut acked = Vec::new();
+    acked.extend(own.accept_own(&stale).ok().map(|ack| ack.holder));
+    acked.extend(
+      holders
+        .iter_mut()
+        .filter_map(|holder| holder.accept(&stale).ok().map(|ack| ack.holder)),
+    );
+    assert_eq!(acked, vec![owner], "the holders refuse the deposed owner");
+    let placement = Placement {
+      acked,
+      ..Placement::of(&candidates)
+    };
+    assert!(
+      !placement.placed(Quorum { f: 1 }),
+      "short of f + 1: never placed"
+    );
+  }
+
+  /// A-909, a promise binds every object. Do: raise an owner's own acceptor's fence to 2, as a phase one or a bumped
+  /// configuration would, then write an object it never held at epoch 1. Expect `StaleEpoch { current: 2 }`: an owner told
+  /// it was deposed refuses its own records of every object, the floor being the promise where that is higher.
+  #[test]
+  fn a909_an_owners_hold_whose_fence_was_raised_refuses_every_objects_record_below_it() {
+    let owner = HostId(1);
+    let mut hold = Acceptor::new(
+      owner,
+      Authority {
+        generation: 0,
+        owner,
+      },
+    );
+    hold.raise_fence(HostEpoch(2));
+    assert_eq!(
+      hold.accept_own(&own_record(owner, 5, 0, FIRST_EPOCH)),
+      Err(RegisterError::StaleEpoch { current: 2 })
+    );
+    assert!(
+      hold
+        .accept_own(&own_record(owner, 5, 0, HostEpoch(2)))
+        .is_ok()
+    );
+  }
+
+  /// A-909 at f = 0 (R8, AC-2.5). Do: a laptop's owner, its own hold the only candidate, writes two objects through the
+  /// same per-object check, one after a record of the other at a higher epoch. Expect each placed at one: the same code
+  /// with f = 0, the owner's floor for an object that object's whole fence.
+  #[test]
+  fn a909_a_laptops_owner_places_each_object_alone_through_the_same_check() {
+    let owner = HostId(1);
+    let mut hold = Acceptor::new(
+      owner,
+      Authority {
+        generation: 0,
+        owner,
+      },
+    );
+    let laptop = Placement::of(&[owner]);
+    for record in [
+      own_record(owner, 1, 0, HostEpoch(2)),
+      own_record(owner, 2, 0, FIRST_EPOCH),
+    ] {
+      let acked: Vec<HostId> = hold
+        .accept_own(&record)
+        .ok()
+        .map(|ack| ack.holder)
+        .into_iter()
+        .collect();
+      let placement = Placement {
+        acked,
+        ..laptop.clone()
+      };
+      assert!(placement.placed(Quorum { f: 0 }), "placed at one");
+    }
   }
 
   /// The configuration version fences a stale request with the current version; at f=0 the
