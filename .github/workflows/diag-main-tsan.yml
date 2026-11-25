@@ -1,9 +1,10 @@
 name: diag-main-tsan
-# main 01a20182 (2026-11-24 16:22 PST): run 2, CI's TSan job at 8c0d8fce8 (current main) measured whole. Since run 1, 142e5f039
-# skips the content-range sweep in the server step (xtask SERVER_SKIPPED, 3 h 26 min of the server library's 13,127 s
-# under TSan) and sets ci.yml's TSan step to 95 minutes; and w-svn's 8c0d8fce8 makes the svn crash test wait for the
-# settled let-go. This run says whether the step fits 95 minutes and whether that test holds. The step is copied
-# unchanged but for a limit only a hang reaches. Run only from diag-measurer-main-tsan-* branches, never main.
+# main 01a20182 (2026-11-24 17:38 PST): run 3, CI's TSan job at f387b56d3 measured whole. Run 2 (8c0d8fce8) failed at 569 s in
+# slates-rt on spin_kick's injection race (the test thread named an ask after the 1 ms window had closed), before the
+# server step; w-git's 427a27d1f names the ask on the shard's own thread and widens the window to 100 ms. This run says
+# whether the lane is green, whether w-svn's crash test (8c0d8fce8) holds, and whether the step fits 95 minutes with
+# the sweep skipped. The step is copied unchanged but for a limit only a hang reaches. Run only from
+# diag-measurer-main-tsan-* branches, never main.
 on:
   push:
     branches: ["diag-measurer-main-tsan-*"]
