@@ -332,6 +332,12 @@ impl Failover {
     self.last_period_began_ns = Some(now_ns);
   }
 
+  /// The coordinator period's tail as measured between its periods ([`Failover::period_began`]), `None` before two were
+  /// seen: what a wait spanning several of the council's rounds is counted in (A-912, a push's homing window).
+  pub fn period_tail_ns(&self) -> Option<u64> {
+    self.periods.tail_ns()
+  }
+
   /// A takeover this node took part in confirmed its share after `duration_ns`.
   pub fn takeover_done(&mut self, duration_ns: u64) {
     self.recovery.takeover_done(duration_ns);

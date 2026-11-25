@@ -970,6 +970,9 @@ pub struct ShardState {
   pub(crate) callbacks: crate::callback::Callbacks,
   /// The forwards to each peer, multiplexed over its record session (`crate::forward_lane`; the control shard's).
   pub(crate) forward_lanes: crate::forward_lane::ForwardLanes,
+  /// The council's rounds that passed through this node, and the tasks waiting for the next (`crate::fleet::CouncilRounds`,
+  /// A-912; the control shard's).
+  pub(crate) council_rounds: crate::fleet::CouncilRounds,
   /// The staging buffers of edits too large for one request, for the works this shard owns (`crate::staging`).
   pub(crate) staging: crate::staging::Staging,
   /// This start's random nonce, announced with its derived member id on SWIM contact (§4.8).
@@ -1338,6 +1341,9 @@ pub struct ShardState {
   /// set by its refresh each period and fanned to every other shard (`fleet::Fan`) when it moves; the recovery prior
   /// until the first fan. Nothing sets it but the estimate (or a test's injection, [`ShardState::injected_failover_ns`]).
   pub failover_ns: u64,
+  /// The window a push's homing in the region runs within, as the control shard last derived it
+  /// (`crate::fleet::homing_window`, A-912) and fanned to every shard with the failover delay; 0 before the first.
+  pub(crate) homing_window_ns: u64,
   /// Test support: while `Some`, the control shard publishes this as its failover delay in place of its estimate, so a
   /// test can hold a wait's bound below a path's floor, or short enough to watch a give-up (`Daemon::inject_failover`).
   /// `None` in every deployment.

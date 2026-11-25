@@ -387,8 +387,19 @@ enum Step {
 }
 
 /// [`start`]'s task: a turn of the build at each of the shard's turns until it is done, then the commit; a build past its
-/// room waits for room and is made again within it ([`waited`], A-857).
+/// room waits for room and is made again within it ([`waited`], A-857). The windows it brought back are let go again once
+/// it ends, whichever way (`read_through::BroughtBack`).
 async fn materialize(green: DbVolumeId) {
+  let mut brought = crate::vcs_store::read_through::BroughtBack::default();
+  materialize_bringing_back(green, &mut brought).await;
+  brought.let_go();
+}
+
+/// [`materialize`]'s turns, each window brought back kept in `brought`.
+async fn materialize_bringing_back(
+  green: DbVolumeId,
+  brought: &mut crate::vcs_store::read_through::BroughtBack,
+) {
   let mut past: Option<(u64, u64)> = None;
   let mut held = None;
   loop {
@@ -420,7 +431,9 @@ async fn materialize(green: DbVolumeId) {
       // The window the build stopped at brought back (bounded by its patience, `read_through::PATIENCE_NS`), then the
       // unit taken again; refused, the build is: a window that cannot come back is never read again in a loop.
       Some(Step::BringBack(waited)) => {
-        match crate::vcs_store::read_through::bring_back(waited).await {
+        let back = crate::vcs_store::read_through::bring_back_window(waited).await;
+        brought.keep(&back);
+        match back {
           Ok(_) => {
             let _ = crate::state::with_state(|state| state.count(MATERIALIZE_BROUGHT_BACK, 1));
           }
