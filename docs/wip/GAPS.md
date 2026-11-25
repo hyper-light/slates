@@ -2826,6 +2826,16 @@
 > call: A-420's measure and guard). Windows' residency BUILT (2026-11-23, w-win for main 01a20182): `QueryWorkingSetEx`,
 > a page of entries a call, a page in RAM when it is in the working set, no written bit; it had been a typed refusal, so
 > `large::heap`'s `mapped_resident` read 0 there (CI run 45176536354, both Windows lanes).
+> The content arena under an import (goal 93 P7, w-perf; main's ruling of 2026-11-25): an import never leaves its shard
+> idle, so the idle purge (A-105) never ran under it, and git-2000's let-go texts stayed resident as free pages (bound
+> arm, round 1: `object_resident` 268 MB, `arena_resident_free` 204 MB, `arena_deferred` 73 MB, 2.3 MB of live texts).
+> Now each batch's tail gives back the arena's resident free pages past the batch's own bound, an idle purge's slice a
+> step (`ChunkArena::purge_past`, `daemon::purge_slice_blocks`): a batch takes at most its bound before it lands, so
+> pages kept past it are pages no batch of the import refills. Counted `repository.svn_import.purged_past_bound_bytes`.
+> Red `an_imports_arena_keeps_no_more_resident_free_than_its_bound` (16 MiB of rewrites at a bound of two units,
+> published each turn): 6,250,496 bytes resident and free as the import ended against a keep of 4,202,496; now
+> 2,449,408, 3,801,088 given back. OWED: main's fourth P7 arm; the deferred frees of the import's last batch wait for the
+> next publication and the idle purge, as any shard's do.
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);

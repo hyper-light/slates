@@ -63870,9 +63870,18 @@ GAPS.
   (histories, recounted bytes, head, head identity). A counted test holds a version of 200 files to more steps than its
   files; the 9,000-file import asserts its version took more than one call (`repository.import_batch.apply_steps`).
 - **Measured** (9,000 files, debug, load about 58): the apply's longest slice 196 ms before, 71 ms after.
-- **Owed.** Three phases are still whole within a slice: the named read at a version's begin (`svn_commit::read_named`,
-  where `read_named_slice` exists), the lend's walk of every effect (`Green::recorded_unlent`), and the commit's
-  preparation (`Green::commit_reads`, `sole_runs`, `make_mapped`, `commit_begin`'s node moves and copies). Each is linear
-  in a version's files; they are the next slices.
+- **The three whole phases, cut (main's ruling (a) of 2026-11-25).** (1) The run takes units until its caller's slice is
+  spent, with no count of units, and the batch reads a version's named texts a copy slice a step before it begins it
+  (`InVersion::Reading`): 71 → 29-39 ms. (2) The run asks its owner to lend the texts it meets, a slice at a time
+  (`ApplyStep::Lend`, the slice made again once lent), so no walk of every effect learns them first: the named-texts
+  oracle replays a unit a step and asks for exactly what the walk names. (3) The commit's preparation is phases of
+  its own (`Prep`: each effect's sole run, its read checked, its mapped file made), and the batch's retention settle
+  and checkpoint take a slice apart from its last version's. By each slice's CPU time on its thread (wall time at load
+  30-60 measured the host as much): the apply's own longest slice 29-77 ms before the cuts, 7.3-7.7 ms after. The slice
+  of the retention and checkpoint alone is 0.3 ms, or up to 47 ms where the checkpoint's paced step runs to its ceiling
+  with no one waiting (A-579's design, ended within a quantum by a waiter's arrival).
+- **Still whole** (each linear in a version's files, about 4 ms of the 7 at 9,000): `Green::begin_applying`'s check that
+  every run the replay reads is read (`replay_reads`, `unread_among`), and the preparation's transitions (the runs'
+  places, `alone`, `named_files`, `commit_begin`'s node moves, links and changed set).
 - **Applied in the same change to** `crates/merge/src/engine.rs`, `engine/copy.rs`, `engine/applying_tests.rs`,
   `crates/server/src/repository/push.rs`, `vcs_store/name_holds.rs` and the import's wide-revision test.

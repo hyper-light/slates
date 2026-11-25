@@ -582,6 +582,22 @@ impl RecordedBatch {
               self.applying = Some(InVersion::Running(step, version, run));
               false
             }
+            // Texts its slice met that the green holds by name alone: lent, and the slice made again next.
+            Some(slates_merge::engine::ApplyStep::Lend(unlent)) => {
+              let lent = crate::vcs_store::name_holds::lend_named(
+                state,
+                self.green,
+                (&step.increment, &step.applied),
+                &unlent,
+              );
+              if lent.is_some() {
+                self.applying = Some(InVersion::Running(step, version, run));
+                false
+              } else {
+                self.version_ended(state, (step, version), None);
+                true
+              }
+            }
             Some(
               slates_merge::engine::ApplyStep::Done(answered)
               | slates_merge::engine::ApplyStep::Answered(answered),
@@ -606,34 +622,28 @@ impl RecordedBatch {
     if !self.staged.is_empty() || self.applying.is_some() {
       return None;
     }
+    // The green's retention settled and its chain checkpointed in a slice of their own, never the tail of the last
+    // version's (its checkpoint's paced step took 45 ms of a debug build's slice at 9,000 files).
+    if taken > 0 {
+      return None;
+    }
     let _ = crate::merge_service::settle_green_retention(state, self.green);
     crate::merge_service::checkpoint_green(state, self.green);
     Some(std::mem::take(&mut self.made))
   }
 
-  /// Begins applying `step` as `version`, its named texts read ([`InVersion::Reading`]): those its apply reads that the
-  /// green holds by name alone lent it (A-760 (b) 4d), then its run begun (`Green::begin_applying`) and carried in
-  /// `applying`. A version answered at once, or one whose texts cannot be lent, ends here
-  /// ([`RecordedBatch::version_ended`]): whether it did.
+  /// Begins applying `step` as `version`, its named texts read ([`InVersion::Reading`]): its run begun
+  /// (`Green::begin_applying`) and carried in `applying`, lent the texts it holds by name alone as it meets them. A
+  /// version answered at once ends here ([`RecordedBatch::version_ended`]): whether it did.
   fn begin_version(
     &mut self,
     state: &mut ShardState,
     (mut step, version): (crate::import_batch::Staged, u64),
   ) -> bool {
-    let lent = crate::vcs_store::name_holds::lend_recorded(
-      state,
-      self.green,
-      (&step.increment, &step.applied),
-    )
-    .is_some();
-    let begun = lent
-      .then(|| {
-        state
-          .greens
-          .get_mut(&self.green)
-          .map(|mut engine| engine.begin_applying(&mut step.increment, &step.applied))
-      })
-      .flatten();
+    let begun = state
+      .greens
+      .get_mut(&self.green)
+      .map(|mut engine| engine.begin_applying(&mut step.increment, &step.applied));
     match begun {
       Some(slates_merge::engine::Begun::Applying(run)) => {
         self.applying = Some(InVersion::Running(step, version, run));
