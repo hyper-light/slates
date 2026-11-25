@@ -573,3 +573,13 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
   asserts the learned source, and the barrier sibling is asked about. The barrier floor at the homing window didn't
   help, so I reverted it.
 - Asked main for gate 17 release-3 and gate 10 debug-7's logs for the replica build Missing.
+
+## 2026-11-25: A-914 (a) landed (a455b1eac, commits d3ea8eb23 and fcdd682d5)
+
+- Main ruled: the test asserts the learned source at the second death, the first death's silence against the estimate
+  is recorded (the prior's red), and the second push's landing is a named debt in GAPS.
+- a914 now waits for each death's unseating from the council. Without that wait, 2 runs in 11 never took the second
+  death over (two voters gone at f = 1). With it, 6 of 6 green; the second push landed 2 of 6 and was refused at the
+  barrier 4 of 6.
+- Next (main's order): the record barrier during a death (A-912's sibling), red first with the stall's cause logged;
+  then (c), from main's batch; then the replica build's Missing (gate 18 logs in ~/.cache/main-rounds/gate18-logs).
