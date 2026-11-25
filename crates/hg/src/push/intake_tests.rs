@@ -2669,7 +2669,7 @@ fn taken_landing_after(
       Err(refused) => break Err(refused),
     };
     if pinned {
-      counted.count_kept(store, intake.kept_contents()).unwrap();
+      counted.count_kept(store, &intake).unwrap();
     }
     while let Some(segment) = intake.take_segment() {
       taken.push(segment);
@@ -2747,3 +2747,57 @@ fn a_landed_segments_let_go_never_takes_a_window_a_kept_revision_shares() {
     "no kept revision's window found let go as it was pinned"
   );
 }
+
+/// Main's 57k push at 2dd25afe6 (2026-11-25: 615,194 intake slices, 5 min 13 s of the daemon's CPU 10 minutes in, against
+/// 93.5 s for the whole push before ruling (B)). Do: take a push of one file's [`PIN_REVISIONS`] revisions, a delta each
+/// on the one before, cut at a bound past the whole push (every revision kept in the one open segment until the end),
+/// a step at a time, pinning what each step kept as the server does after each slice. Expect: each kept revision looked
+/// at once, its pins taken once; the pins given back at the end. Red before: every kept revision looked at again after
+/// every step, the push's revisions times its steps.
+#[test]
+fn a_pushs_pins_look_at_each_kept_revision_once_whatever_its_steps() {
+  let texts: Vec<Vec<u8>> = (0..PIN_REVISIONS)
+    .map(|at| {
+      format!("revision {at} of the file\n")
+        .repeat(4)
+        .into_bytes()
+    })
+    .collect();
+  let listed: Vec<(&[u8], Option<usize>)> = texts
+    .iter()
+    .enumerate()
+    .map(|(at, text)| (text.as_slice(), at.checked_sub(1)))
+    .collect();
+  let (payload, _) = file_push(&listed, (crate::NULL_NODE, crate::NULL_NODE, &[]));
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut intake = Intake::begin(
+    (crate::changegroup::Version::V03, payload.as_slice()),
+    &mut index,
+    &mut store,
+    &mut room(),
+  )
+  .unwrap()
+  .cutting(u64::MAX);
+  let mut counted = crate::push::pins::Counted::default();
+  let mut steps = 0_u64;
+  loop {
+    let stepped = intake.step(&payload, &mut store, &mut room()).unwrap();
+    counted.count_kept(&mut store, &intake).unwrap();
+    steps += 1;
+    if !more(&stepped) {
+      break;
+    }
+  }
+  let kept = intake.kept_contents().count() as u64;
+  assert!(
+    kept >= PIN_REVISIONS as u64 && steps > kept / 2,
+    "{kept} kept over {steps} steps"
+  );
+  assert_eq!(counted.visited(), kept, "each kept revision looked at once");
+  counted.release(&mut store);
+  assert!(counted.is_empty());
+}
+
+/// Shape: the revisions of [`a_pushs_pins_look_at_each_kept_revision_once_whatever_its_steps`]'s push.
+const PIN_REVISIONS: usize = 64;
