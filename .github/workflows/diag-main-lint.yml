@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 30 (main 01a20182, 2026-11-24 20:20 PST): run 29 (past the hg fix) found merge engine.rs:1522's stranded doc and
+# fold_tests.rs:66's counter loop (949ca8619); main's commit fixes both. Main at 4f48e9717 (w-shared's test fix).
 # Run 29 (main 01a20182, 2026-11-24 20:11 PST): runs 26-28 found hg delta.rs BaseRead without is_empty (f754c36f6), which hid
 # its dependents; main's commit adds it. Main at 09b2f0d3c.
 # Run 28 (main 01a20182, 2026-11-24 20:02 PST): main at 09b2f0d3c, w-svn's A-910 incremental fold (949ca8619), the svn tests
