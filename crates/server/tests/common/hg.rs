@@ -163,7 +163,7 @@ fn start_owner_sized(base: &str, sizing: Sizing) -> StoreOwner {
   StoreOwner::start(
     StoreRoot::open(&store_dir, &grant).unwrap(),
     sizing,
-    WAITING,
+    (WAITING, 0),
   )
   .unwrap()
 }

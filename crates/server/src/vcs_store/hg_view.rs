@@ -361,6 +361,15 @@ pub(crate) const OWNER_BACK_NS: &str = "vcs_store.hg_owner_back_ns";
 /// the status report.
 pub(crate) const OWNER_MOST_NS: &str = "vcs_store.hg_owner_most_ns";
 
+/// Counter: the requests the store's owner met spinning, no wake (`slates_store::owner::StoreOwner::start`'s spin;
+/// main's ruling of 2026-11-25, the 57k clone's wait 86.6% the owner's wake). Format: a counter name in the status report.
+pub(crate) const OWNER_SPIN_HITS: &str = "vcs_store.hg_owner_spin_hits";
+/// Counter: the requests the owner met parked, woken for them. Format: a counter name in the status report.
+pub(crate) const OWNER_PARKS: &str = "vcs_store.hg_owner_parks";
+/// Counter: the nanoseconds the owner spun waiting for those requests, hits and misses: the spin's price. Format: a
+/// counter name in the status report.
+pub(crate) const OWNER_SPIN_NS: &str = "vcs_store.hg_owner_spin_ns";
+
 /// Counts what a want's requests of the store's owner waited on, split by part ([`OWNER_REQUESTS`] and the counters
 /// after it).
 fn count_owner_waits(state: &mut ShardState, owner: &slates_store::owner::AskWaits) {
@@ -372,6 +381,9 @@ fn count_owner_waits(state: &mut ShardState, owner: &slates_store::owner::AskWai
   state.count(OWNER_DISK_NS, owner.disk_ns);
   state.count(OWNER_BACK_NS, owner.back_ns);
   state.count_max(OWNER_MOST_NS, owner.most_ns);
+  state.count(OWNER_SPIN_HITS, owner.spin_hits);
+  state.count(OWNER_PARKS, owner.parks);
+  state.count(OWNER_SPIN_NS, owner.spin_ns);
 }
 
 /// Counter: the requests a fetch's texts made of the node's changeset store's owner, each the texts of one want made
