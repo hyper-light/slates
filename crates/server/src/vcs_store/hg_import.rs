@@ -381,12 +381,19 @@ pub(crate) const SEGMENTS_UNLANDED: &str = "vcs_store.hg_import.segments_unlande
 pub(crate) const SEGMENTS_CUT_BY_TEXTS: &str = "vcs_store.hg_import.segments_cut_by_texts";
 /// Counter: a segment cut by its changegroup's bytes, or at the stream's end. Format: a counter name.
 pub(crate) const SEGMENTS_CUT_BY_BYTES: &str = "vcs_store.hg_import.segments_cut_by_bytes";
-/// Counter: the nanoseconds the import's task waited, summed, for the store to land its segments, each durable before
-/// the next turn (its one flush; main 01a20182's order of 2026-11-24: the landings' own share of an import's time).
-/// Format: a counter name in the status report.
+/// Counter: the nanoseconds the import's task was held, summed, waiting for the store to land a segment it could not
+/// overlap with its work: the one in flight when the next was cut, or the last (main 01a20182's order of 2026-11-24:
+/// the landings' own share of an import's time). Format: a counter name in the status report.
 pub(crate) const SEGMENT_LAND_WAIT_NS: &str = "vcs_store.hg_import.segment_land_wait_ns";
 /// Counter: the longest of those waits, nanoseconds. Format: a counter name.
 pub(crate) const SEGMENT_LAND_WAIT_MAX_NS: &str = "vcs_store.hg_import.segment_land_wait_max_ns";
+/// Counter: the nanoseconds each segment's landing took, summed, from its asking to the store's answer, the import
+/// waiting or not: what [`SEGMENT_LAND_WAIT_NS`] is held against. Format: a counter name.
+pub(crate) const SEGMENT_LAND_NS: &str = "vcs_store.hg_import.segment_land_ns";
+/// Counter: a segment's landing the store answered while the import went on with its turns, its wait overlapped with
+/// the import's work (`run`'s pipelined landing). Format: a counter name.
+pub(crate) const SEGMENTS_LANDED_OVERLAPPED: &str =
+  "vcs_store.hg_import.segments_landed_overlapped";
 
 /// A segment changeset to land: the store, its header, its sections, and its payload's identity.
 pub(crate) type SegmentLanding = (
@@ -1336,52 +1343,169 @@ fn landing_refusal(refused: AppendRefused) -> Refusal {
   }
 }
 
-/// Runs repository `id`'s import to its end on its owner shard, a turn at a time (the module doc): a yield, then one turn
-/// within the shard's quantum on its clock, so the shard serves its inbox and pulse between turns. What the import found
-/// once done, why it ended otherwise, or `None` when no import of `id` is under way or the shard's state is gone.
-/// Lands every segment repository `id`'s import has cut and not yet landed, oldest first, each awaited on the changeset
-/// store; none when the shard's state is gone.
-async fn land_segments(id: RepositoryId) -> Option<Result<(), ImportFailed>> {
-  loop {
-    let Some((disk, header, parts, identity)) =
-      crate::state::with_state(|state| segment_changeset(state, id))?
-    else {
-      return Some(Ok(()));
-    };
-    let sequence = header.sequence;
-    let began = slates_rt::futures::now_ns();
-    let landed = disk.land(header, parts).await.is_ok();
-    let waited = slates_rt::futures::now_ns().saturating_sub(began);
-    let counted = crate::state::with_state(|state| {
-      state.count(SEGMENT_LAND_WAIT_NS, waited);
-      state.count_max(SEGMENT_LAND_WAIT_MAX_NS, waited);
-      segment_landed(state, id, (sequence, identity), landed)
-    })?;
-    if let Err(failed) = counted {
-      return Some(Err(failed));
+/// A segment's landing on the changeset store under way while the import goes on (main 01a20182's ruling of 2026-11-24:
+/// the 57k import at 1227afcb1 waited 20.3 s, about 18 % of it, for 2,087 landings awaited one by one, each its one
+/// durable flush): the store's answer to come, the segment's sequence and payload identity, and when it was asked.
+pub(crate) struct SegmentInFlight {
+  /// Whether the store landed it, once it answers.
+  answer: core::pin::Pin<Box<dyn core::future::Future<Output = bool>>>,
+  /// Its changeset's sequence.
+  sequence: u64,
+  /// Its payload's identity.
+  identity: [u8; 32],
+  /// When it was asked, on the shard's clock.
+  began: u64,
+}
+
+/// Repository `id`'s next segment cut and not yet handed to the store, its landing begun; none where it has none, and
+/// `None` when the shard's state is gone.
+fn landing_begun(id: RepositoryId) -> Option<Option<SegmentInFlight>> {
+  let next = crate::state::with_state(|state| segment_changeset(state, id))?;
+  Some(next.map(|(disk, header, parts, identity)| SegmentInFlight {
+    sequence: header.sequence,
+    identity,
+    began: slates_rt::futures::now_ns(),
+    answer: Box::pin(async move { disk.land(header, parts).await.is_ok() }),
+  }))
+}
+
+/// `landing` answered `landed` (`segment_landed`): its time counted, and the time the import was held waiting for it,
+/// where `waited`, else counted overlapped with the import's work.
+fn landing_settled(
+  id: RepositoryId,
+  landing: &SegmentInFlight,
+  (landed, waited): (bool, Option<u64>),
+) -> Option<Result<(), ImportFailed>> {
+  let took = slates_rt::futures::now_ns().saturating_sub(landing.began);
+  crate::state::with_state(|state| {
+    state.count(SEGMENT_LAND_NS, took);
+    match waited {
+      Some(waited) => {
+        state.count(SEGMENT_LAND_WAIT_NS, waited);
+        state.count_max(SEGMENT_LAND_WAIT_MAX_NS, waited);
+      }
+      None => state.count(SEGMENTS_LANDED_OVERLAPPED, 1),
+    }
+    segment_landed(state, id, (landing.sequence, landing.identity), landed)
+  })
+}
+
+/// Waits for the landing in `flight`, if any, to answer, the import held meanwhile, and settles it.
+pub(crate) async fn landed_in_flight(
+  id: RepositoryId,
+  flight: &mut Option<SegmentInFlight>,
+) -> Option<Result<(), ImportFailed>> {
+  let Some(mut landing) = flight.take() else {
+    return Some(Ok(()));
+  };
+  let held = slates_rt::futures::now_ns();
+  let landed = landing.answer.as_mut().await;
+  let waited = slates_rt::futures::now_ns().saturating_sub(held);
+  landing_settled(id, &landing, (landed, Some(waited)))
+}
+
+/// Yields the shard, the landing in `flight` answering meanwhile if it can: settled then, overlapped with the import's
+/// work, and `flight` left empty.
+async fn yielded_beside(
+  id: RepositoryId,
+  flight: &mut Option<SegmentInFlight>,
+) -> Option<Result<(), ImportFailed>> {
+  let Some(landing) = flight.as_mut() else {
+    slates_rt::futures::yield_now().await;
+    return Some(Ok(()));
+  };
+  let raced =
+    slates_rt::futures::race2(landing.answer.as_mut(), slates_rt::futures::yield_now()).await;
+  match (raced, flight.take()) {
+    (slates_rt::futures::Either::First(landed), Some(landing)) => {
+      landing_settled(id, &landing, (landed, None))
+    }
+    (_, taken) => {
+      *flight = taken;
+      Some(Ok(()))
     }
   }
 }
 
-pub(crate) async fn run(id: RepositoryId) -> Option<Result<Box<Finished>, ImportFailed>> {
+/// Hands the store the segments repository `id`'s import has cut, oldest first, one in flight at a time (A-767 C1 step 3,
+/// pipelined): before the next is handed over, the one in flight is waited for, so the segments land in their order and
+/// their texts go a segment at a time, on each one's own durable answer; the last one cut is left in `flight` while the
+/// next turns run. Derived: the import then holds at most two segments' file texts, the one in flight and the one being
+/// written, each under its bound and the text that crosses it.
+async fn segments_handed(
+  id: RepositoryId,
+  flight: &mut Option<SegmentInFlight>,
+) -> Option<Result<(), ImportFailed>> {
   loop {
-    slates_rt::futures::yield_now().await;
-    let turned = crate::state::with_state(|state| {
-      let quantum_ns = quantum_of(state);
-      turn(state, id, (&mut ShardClock, quantum_ns))
-    })??;
-    if turned.is_ok() {
-      // The segments the turn cut land on the changeset store before the next turn (A-767 C1 step 3), each awaited.
-      if let Err(failed) = land_segments(id).await? {
-        return Some(Err(failed));
-      }
+    let cut = crate::state::with_state(|state| {
+      state
+        .vcs_stores
+        .imports
+        .get(&id)
+        .is_some_and(|importing| !importing.segments.is_empty())
+    })?;
+    if !cut {
+      return Some(Ok(()));
     }
-    match turned {
-      Ok(Turned::More) => {}
-      Ok(Turned::Done(finished)) => return finished_import(id, finished).await,
-      Err(failed) => return Some(Err(failed)),
+    if let Err(failed) = landed_in_flight(id, flight).await? {
+      return Some(Err(failed));
+    }
+    match landing_begun(id)? {
+      Some(landing) => *flight = Some(landing),
+      None => return Some(Ok(())),
     }
   }
+}
+
+/// One step of repository `id`'s import ([`run`]): a yield, the landing in `flight` answering meanwhile if it can; one
+/// turn on `clock` within `quantum_ns`; then the segments it cut handed to the store, the last left in flight. What the
+/// turn answered, or `None` when no import of `id` is under way or the shard's state is gone.
+pub(crate) async fn step(
+  id: RepositoryId,
+  flight: &mut Option<SegmentInFlight>,
+  (clock, quantum_ns): (&mut dyn Clock, u64),
+) -> Option<Result<Turned, ImportFailed>> {
+  if let Err(failed) = yielded_beside(id, flight).await? {
+    return Some(Err(failed));
+  }
+  let turned = crate::state::with_state(|state| turn(state, id, (clock, quantum_ns)))??;
+  if turned.is_ok()
+    && let Err(failed) = segments_handed(id, flight).await?
+  {
+    return Some(Err(failed));
+  }
+  Some(turned)
+}
+
+/// Runs repository `id`'s import to its end on its owner shard, a turn at a time (the module doc): each [`step`] yields,
+/// then runs one turn within the shard's quantum on its clock, so the shard serves its inbox and pulse between turns,
+/// and a segment's landing runs beside the turns after it. What the import found once done (its last landing answered
+/// first), why it ended otherwise, or `None` when no import of `id` is under way or the shard's state is gone.
+pub(crate) async fn run(id: RepositoryId) -> Option<Result<Box<Finished>, ImportFailed>> {
+  let mut flight = None;
+  loop {
+    let quantum_ns = crate::state::with_state(|state| quantum_of(state))?;
+    let turned = step(id, &mut flight, (&mut ShardClock, quantum_ns)).await?;
+    let landed = landed_in_flight_unless_more(id, &mut flight, &turned).await?;
+    match (turned, landed) {
+      (_, Err(failed)) | (Err(failed), _) => return Some(Err(failed)),
+      (Ok(Turned::More), Ok(())) => {}
+      (Ok(Turned::Done(finished)), Ok(())) => return finished_import(id, finished).await,
+    }
+  }
+}
+
+/// Waits for the landing in `flight` once `turned` ends the import, done or refused, so none is left unanswered behind
+/// it; nothing while it goes on.
+async fn landed_in_flight_unless_more(
+  id: RepositoryId,
+  flight: &mut Option<SegmentInFlight>,
+  turned: &Result<Turned, ImportFailed>,
+) -> Option<Result<(), ImportFailed>> {
+  if matches!(turned, Ok(Turned::More)) {
+    return Some(Ok(()));
+  }
+  landed_in_flight(id, flight).await
 }
 
 /// A finished import's last steps. Its bookmarks' works first, a unit a turn (2b, main's ruling of 2026-11-22 02:52):

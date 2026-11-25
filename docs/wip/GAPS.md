@@ -1530,6 +1530,16 @@
 > restart of `hg_push_restart` (red: `Unheld` at rev 4281; green: the tip served after the restart).
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
+> Found by main's interop bench at ed71ac0be and closed (2026-11-24): after P5, `hg clone` of hg's 57k history ran past
+> 13.5 minutes (stock 7.2: 42.4 s; round 2 before P5: 10.1 s). A clone's changelog and manifest texts, let go once
+> landed, were asked of the changeset store one at a time, a row and then its text, and the store answered a row by
+> scanning the log's tool id rows from the prefix's first in pages as large as the ask: one row a page up to the node,
+> half the log a text, a clone quadratic in its history. `slates_store::Store::texts_by_tools` now begins each scan at
+> the next asked id not yet passed (a lone ask reads at its own key; a whole log's ask is still one scan), and the fetch
+> asks a unit's text with the next units' in one batch within its room (`serve::getbundle`'s `LogTexts::ask_batch`).
+> Held by `a_lone_version_asked_by_tool_id_is_read_at_its_own_key` (store: 200 engine reads for a lone ask, now 1) and
+> P5's daemon-edge test (a clone of a 7-changeset line: 30 store asks, now 6). Owed: the bookmark and branch walks
+> still ask one text at a time (cheap since the store's fix); main's hg leg of the interop bench re-measures the clone.
 > C1 (2), first piece BUILT (main's order of 2026-11-24 16:10; main's r618 reading: a long revision rebuilt into one
 > buffer, the 57k intake's pending steps 51% of its time): a push's file revision is taken a window a step and never
 > whole. Its text is made from its delta over its base by `delta::Patching`, the base read in ranges (`delta::BaseRead`)
@@ -1553,10 +1563,16 @@
 > object's high-water, set by one segment's file texts held whole until it landed (744 MB used before the first file
 > segment's cut, 628 MB let go at its landing). A segment was cut by its changegroup's bytes alone (`segment_bytes`, 2
 > MiB here), and a text runs to hundreds of times its delta. Now it is cut too once the whole file texts it keeps reach
-> the same bound (`Emitter::due`): the import holds under twice the segment's bound of file texts, counted
-> `vcs_store.hg_import.segments_cut_by_texts` apart from `_by_bytes`; held by
-> `an_imports_file_texts_held_between_landings_are_bounded_by_its_segment` (red: 46,162,339 bytes held after one turn,
-> 8,950 at the end, a 2 MiB bound). Owed: main's rerun of the 57k (segments, peak, time against 15e739357); the
+> the same bound (`Emitter::due`), counted `vcs_store.hg_import.segments_cut_by_texts` apart from `_by_bytes`
+> (0d05da26e). Main's 57k rerun at it: 2,087 segments (2,062 by texts), peak sampled 361,024 KiB; at 1227afcb1 the
+> landings' own wait was 20.3 s, about 18 % of the import (`segment_land_wait_ns`, 9.7 ms a landing), each awaited
+> before the next turn. Since then a segment's landing runs beside the next turns (`hg_import::step`, one in flight,
+> the next handed over once it answered, landings in order, texts let go on each one's own durable answer), counted
+> `segments_landed_overlapped` and the wait held against `segment_land_ns`. Derived bound: two segments' file texts,
+> the one in flight and the one being written, each under the bound plus the text that crosses it: under four times
+> the bound. Held by `an_imports_file_texts_held_between_landings_are_bounded_by_its_segment` on the production step
+> (red: 46,162,339 bytes held after one turn, 8,950 at the end, a 2 MiB bound; then no landing overlapped). Owed:
+> main's interleaved A/B of 0d05da26e^, 1227afcb1 and the pipelined landing over the 57k; the
 > changelog's and manifests' texts held until the import lands (about 90 MB of the 57k's), w-hg's after C1 (2)'s
 > manifest piece (the import's manifest keep reads the previous text in its step, with no ask between turns).
 > - a clone's file revisions served from the Texts rows.

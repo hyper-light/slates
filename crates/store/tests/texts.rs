@@ -512,6 +512,50 @@ fn a_logs_versions_by_tool_id_are_read_in_one_scan() {
   let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Goal 93 (main's interop bench at ed71ac0be: `hg clone` of hg's 57k history after P5 ran 13.5 minutes, stock's
+/// 42.4 s; the daemon's sample in the engine's scans). A fetch asks a let-go changelog or manifest text by its node
+/// alone, and the log's tool id rows were scanned from the prefix's first in pages as large as the ask: one row a page
+/// until the node, half the log a text, a clone quadratic in its history. Do: land one changeset holding 200 versions
+/// of `f`; ask for the last in key order alone, then for every one. Expect the lone ask answered in one engine read
+/// (`Store::tool_reads`), its scan begun at its own key, and the whole log's ask still in one. Red before: 200 reads for
+/// the lone ask.
+#[test]
+fn a_lone_version_asked_by_tool_id_is_read_at_its_own_key() {
+  let dir = scratch("by-tool-lone");
+  let mut store = open(&dir);
+  let ids: Vec<Vec<u8>> = (0..200)
+    .map(|at| format!("n{at:03}").into_bytes())
+    .collect();
+  let texts: Vec<Vec<u8>> = (0..200)
+    .map(|at| format!("version {at} of f").into_bytes())
+    .collect();
+  let entries: Vec<(&str, &[u8], &[u8])> = ids
+    .iter()
+    .zip(&texts)
+    .map(|(id, text)| ("f", id.as_slice(), text.as_slice()))
+    .collect();
+  let payload: Vec<u8> = texts.concat();
+  land_texts(&mut store, 1, &payload, &entries);
+  let before = store.tool_reads();
+  let lone = store.texts_by_tools(1, b"f", &[b"n199".to_vec()]).unwrap();
+  assert_eq!(lone.len(), 1);
+  assert!(lone[0].is_some(), "the lone version found");
+  assert_eq!(
+    store.tool_reads() - before,
+    1,
+    "engine reads for the lone ask"
+  );
+  let before = store.tool_reads();
+  let every = store.texts_by_tools(1, b"f", &ids).unwrap();
+  assert!(every.iter().all(Option::is_some), "every version found");
+  assert_eq!(
+    store.tool_reads() - before,
+    1,
+    "engine reads for the whole log's ask"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Lands repository 1's changeset `sequence` with a record, the one `payload`, and a `Texts` section naming `entries`,
 /// each placed whole in the payload.
 fn land_texts(store: &mut Store, sequence: u64, payload: &[u8], entries: &[(&str, &[u8], &[u8])]) {

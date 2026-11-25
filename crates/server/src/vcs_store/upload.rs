@@ -752,6 +752,16 @@ pub(crate) fn learn_link(state: &mut ShardState, taught: (u64, u64)) {
   state.count(LINK_LEARNED, taught.1);
 }
 
+/// Counter: the ids a fetch's choice of its pack's objects resolved to positions through the index, a lookup each
+/// (A-911, `slates_git::store::PositionCounts::lookups`): near the objects it met, not their entries in every tree's
+/// version. Format: a counter name.
+pub(crate) const POSITION_LOOKUPS: &str = "vcs_store.git_upload.position_lookups";
+/// Counter: the ids the fetch's cache of positions answered itself (A-911). Format: a counter name.
+pub(crate) const POSITION_CACHE_HITS: &str = "vcs_store.git_upload.position_cache_hits";
+/// Counter: fetches whose cache of positions was refused the room its walk's work asked, each then as slow as with no
+/// cache (A-911: a cache costs time, never an answer). Format: a counter name.
+pub(crate) const POSITION_CACHE_UNROOMED: &str = "vcs_store.git_upload.position_cache_unroomed";
+
 /// A counter of a fetch's stream's paths ([`STREAM_COUNTED`]): its name and the stream's count it adds.
 pub(crate) type StreamCount = (&'static str, fn(&UploadCounters) -> u64);
 
@@ -819,6 +829,8 @@ pub(crate) struct ShardPacks {
   /// The stream's counters before this step's first write and after its last, for the shard to count what the step's
   /// writes added once it ends ([`STREAM_COUNTED`]); none where the step wrote none.
   counted: Option<(UploadCounters, UploadCounters)>,
+  /// What this step's choice of the pack's objects did resolving their ids (A-911).
+  chose: slates_git::store::PositionCounts,
 }
 
 impl ShardPacks {
@@ -828,6 +840,7 @@ impl ShardPacks {
       exchange: exchange(state),
       quantum_ns: state.config.step_quantum_ns(),
       counted: None,
+      chose: slates_git::store::PositionCounts::default(),
     }
   }
 
@@ -835,6 +848,15 @@ impl ShardPacks {
   /// shard thread made and took again ([`count_deflaters`]).
   fn count_on(&self, state: &mut ShardState) {
     count_deflaters(state);
+    for (name, by) in [
+      (POSITION_LOOKUPS, self.chose.lookups),
+      (POSITION_CACHE_HITS, self.chose.hits),
+      (POSITION_CACHE_UNROOMED, self.chose.unroomed),
+    ] {
+      if by > 0 {
+        state.count(name, by);
+      }
+    }
     let Some((before, after)) = self.counted else {
       return;
     };
@@ -894,6 +916,12 @@ impl PackSource for ShardPacks {
       .write(served, pack, admission, out, room);
     self.counted = Some((before, pack.counters()));
     written
+  }
+
+  fn chose(&mut self, counts: slates_git::store::PositionCounts) {
+    self.chose.lookups = self.chose.lookups.saturating_add(counts.lookups);
+    self.chose.hits = self.chose.hits.saturating_add(counts.hits);
+    self.chose.unroomed = self.chose.unroomed.saturating_add(counts.unroomed);
   }
 }
 
