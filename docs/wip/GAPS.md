@@ -2949,6 +2949,15 @@
 > daemon's own sweep publishes. Red `an_imports_arena_holds_its_keep_when_the_sweep_publishes_after_its_last_tail` (the
 > import's frees left deferred past its last tail, then a sweep pass): with `give_back_released`'s call taken out, the
 > sweep released 1,048,576 B and left 4,939,776 resident and free against 4,202,496; at 6e002e057, 786,432.
+> **P7 CLOSED (main's after arm, 2026-11-25 08:48-08:49 PST; main b8b3c741d, binary sha 46a0ed338b35; load 18 to 21;
+> three rounds interleaved with the bound arm; record `~/.cache/main-rounds/bench7/p7-after.txt`, `p7a-*.log`).** At
+> the settled reading (deferred 0 every round) the arena's resident free bytes were 14.8, 28.1 and 56.7 MB against
+> keeps (the bound, B) of 53.4, 28.2 and 125.8 MB: within the keep in all three, round 2 by 0.1 MB. The footprint
+> (macOS, `mem.gauge.process.footprint_bytes`) was 35.2 MB before the import, 223.1 MB at its end and 130.8 MB settled
+> in round 1; rounds 2 and 3 settled at 156.5 and 184.6 MB, the settled figure following each round's B, as the keep
+> should. `object_resident` settled at 20.0, 52.3 and 68.6 MB; `arena_free` at 79.8, 84.7 and 111.9 MB, mapped and
+> given back, so not in the footprint. The bound arm's binary has no footprint gauge, so there is no footprint A/B
+> against it, and its RSS across a purge is not comparable on macOS (BENCHMARKS' method note at its head).
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
