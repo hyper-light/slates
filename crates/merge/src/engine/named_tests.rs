@@ -677,6 +677,8 @@ struct NameCensus {
   /// Judges and replays refused over an unlent named text, then lent its object and run again (A-760 (b) 4d).
   judges_lent: u64,
   replays_lent: u64,
+  /// Commits whose check of their reads, left to them by their judge, asked for an unlent named text (A-920 piece 3a).
+  commits_lent: u64,
 }
 
 impl NameCensus {
@@ -690,6 +692,7 @@ impl NameCensus {
       && self.restored_below > 0
       && self.named_restored > 0
       && self.judges_lent > 0
+      && self.commits_lent > 0
       && self.replays_lent > 0
   }
 }
@@ -1013,8 +1016,18 @@ fn judge_lending(
   plane: &Plane,
   census: &mut NameCensus,
 ) -> super::Judgment {
+  judge_lending_by(green, (work, plane), census, Green::judge_named)
+}
+
+/// [`judge_lending`] by `judge`, one of the green's named judges.
+fn judge_lending_by(
+  green: &mut Green,
+  (work, plane): (&mut Increment, &Plane),
+  census: &mut NameCensus,
+  judge: fn(&mut Green, &mut Increment) -> super::Judgment,
+) -> super::Judgment {
   for _ in 0..3 {
-    let judgment = green.judge_named(work);
+    let judgment = judge(green, work);
     let super::Judgment::ContentUnread { identity } = judgment else {
       return judgment;
     };
@@ -1027,6 +1040,37 @@ fn judge_lending(
     census.judges_lent += 1;
   }
   panic!("a judge refused again with its objects lent");
+}
+
+/// `work` judged on `green` leaving its commit's reads to its commit ([`Green::judge_named_reads_later`]), lent as its
+/// judge refuses, then committed a unit a step, each text the commit's check asks for lent as it asks, then let go: the
+/// version it committed, none where it was not accepted. No text is asked for again once lent.
+fn committed_reads_later(
+  green: &mut Green,
+  work: &mut Increment,
+  (plane, census): (&Plane, &mut NameCensus),
+) -> Option<u64> {
+  let judgment = judge_lending_by(green, (work, plane), census, Green::judge_named_reads_later);
+  let super::Judgment::Accepted(judged) = judgment else {
+    return None;
+  };
+  let mut committing = green.begin_committing(judged);
+  let mut asked = BTreeSet::new();
+  loop {
+    match green.committing_step(&mut committing, &mut || true) {
+      super::CommitStep::More => {}
+      super::CommitStep::Lend(unlent) => {
+        assert!(unlent.is_disjoint(&asked), "asked again for {unlent:?}");
+        lend_all(green, &unlent, plane);
+        asked.extend(unlent);
+        census.commits_lent += 1;
+      }
+      super::CommitStep::Committed(version, _) => {
+        green.let_named_bytes_go();
+        return Some(version);
+      }
+    }
+  }
 }
 
 /// `applied` applied to `green` for `work` as its entry records it, a unit a step (`Green::apply_step`), each named text
@@ -1085,6 +1129,9 @@ struct History {
   identities: Vec<Identity>,
   judging: Green,
   replaying: Green,
+  /// A green judging each version as the judging one does but leaving its commit's reads to its commit, committed a
+  /// unit a step (A-920 piece 3a).
+  deferring: Green,
   /// Each green's content store's holds of the objects (A-760 (b) 4d).
   judging_holds: BTreeMap<Identity, u64>,
   replaying_holds: BTreeMap<Identity, u64>,
@@ -1105,6 +1152,7 @@ impl History {
       identities,
       judging,
       replaying,
+      deferring: Green::new(),
       judging_holds: BTreeMap::new(),
       replaying_holds: BTreeMap::new(),
       model: Model::new(),
@@ -1162,6 +1210,7 @@ impl History {
       ),
       number
     );
+    self.deferred(index, (version, number), census)?;
     count_names(&self.model, &after, version, census);
     let before = std::mem::replace(&mut self.model, after);
     self.committed.push(Committed {
@@ -1184,6 +1233,31 @@ impl History {
       "the replaying green",
     )?;
     prop_assert_eq!(self.replaying.head_identity(), self.judging.head_identity());
+    Ok(())
+  }
+
+  /// `version`, increment `index`, judged on the deferring green leaving its commit's reads to its commit and committed
+  /// a unit a step ([`committed_reads_later`]): the version `number` the judging green committed, and its head.
+  fn deferred(
+    &mut self,
+    index: usize,
+    (version, number): (&Version, u64),
+    census: &mut NameCensus,
+  ) -> Result<(), TestCaseError> {
+    let (mut work, _) = version_work(
+      index,
+      self.deferring.head(),
+      &self.model,
+      version,
+      &self.identities,
+    )
+    .ok_or_else(|| TestCaseError::fail(format!("version {index} changed nothing deferred")))?;
+    read_all(&mut work, &self.plane);
+    prop_assert_eq!(
+      committed_reads_later(&mut self.deferring, &mut work, (&self.plane, census)),
+      Some(number)
+    );
+    prop_assert_eq!(self.deferring.head_identity(), self.judging.head_identity());
     Ok(())
   }
 

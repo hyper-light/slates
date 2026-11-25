@@ -64062,3 +64062,17 @@ GAPS.
   and the indexes after each alike (`a_record_planned_a_row_a_step_is_the_record_planned_whole`,
   `every_revision_svnadmin_wrote_planned_a_row_a_step_is_the_revision_planned_whole`; a builder taken up without its
   next node number fails both); a plan's step after an append is refused out of date.
+- **Piece 3, the judge** (89-92 ms at 9,000 files after piece 1: the reservation's history walk 19.6 ms and changes
+  walk 10.9, `resolve` 11.6, `decide_units` 24.5, `Reached::of` 1.5, `position::verdict` 2.6, `commit_reads` 15.3),
+  in parts. **3a, the commit's reads.** `commit_reads` is the check the commit's own preparation makes a slice at a
+  time (`Prep::Sole`, `Prep::Reads`, A-917), which piece 1 left off since the judge had made it. The import's judge
+  (`Green::judge_named_reads_later`) leaves it to its commit: `Judged::reads_checked` says whether its judge made it,
+  `begin_committing` checks the reads where it did not (from `Prep::Reads` where `make_step` found the runs), and
+  `committing_step` answers `CommitStep::Lend` with the texts it met unlent, its slice undone, which the import batch
+  reads from the content plane and lends (`ImportBatch::lend_pending`, counted `repository.import_batch.commit_lent`;
+  a text asked for again once lent is refused, counted as a judge's second miss). The verdict is the same; only where
+  its check is made moves. The judge step 89-92 ms → 77 ms. Oracle: the named-texts history oracle commits every version
+  on a third green judged with its reads left to its commit, a unit a step, lending as asked: the same version and head
+  identity as the judging green, never a text asked for twice, a commit lent in the census
+  (`commits_lent`); and a server batch staging an append over a text its scratch member holds by name alone is lent
+  it once by its commit and makes the file (`a_staged_commit_is_lent_the_named_text_its_reads_meet`).

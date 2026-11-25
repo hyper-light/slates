@@ -2116,6 +2116,56 @@ fn stored_object(state: &mut ShardState, bytes: &[u8]) -> slates_merge::named::I
   }
 }
 
+/// A-920 piece 3a (the commit's check of its reads, left to it by its judge). Do: in one import batch on a green, stage a
+/// named work creating `a` from a stored object, whose bytes the scratch member lets go once it is staged, then a work
+/// appending five bytes to `a`, whose commit makes `a` over its base text. Expect both staged; the second's commit asked
+/// for `a`'s text and was lent it from the content store once (`STAGE_COMMIT_LENT` 1); and the scratch member holding
+/// `a` as the object's bytes then the five.
+#[test]
+fn a_staged_commit_is_lent_the_named_text_its_reads_meet() {
+  use slates_merge::increment::{Base, VolumeOp, compose_volume_planned};
+  crate::test_store::audit_on_stored_shard("stage-commit-lent", |state| {
+    let (_, green) = repository(state, "commit-lent");
+    let first = vec![b'1'; 20_000];
+    let object = stored_object(state, &first);
+    let mut batch = crate::import_batch::ImportBatch::begin(state, green).expect("a batch");
+    let mut create = named_create("a", object, (1, 0));
+    crate::repository::svn_commit::read_named(state, &mut create).expect("read");
+    assert_eq!(batch.stage(state, create), Ok(1));
+    let journal = [VolumeOp::Extend {
+      path: "a".to_owned(),
+      at: object.len,
+      len: 5,
+    }];
+    let (doc, _) = compose_volume_planned(
+      &Base::of_files(vec![("a".to_owned(), object.len)]),
+      &journal,
+    )
+    .expect("composed");
+    let append = Increment {
+      id: [2; 32],
+      base: 1,
+      doc,
+      post_state: b"tail!".to_vec(),
+      evidence: Vec::new(),
+      named: Default::default(),
+    };
+    assert_eq!(batch.stage(state, append), Ok(2));
+    let lent = state
+      .refusals
+      .get(crate::import_batch::STAGE_COMMIT_LENT)
+      .copied();
+    assert_eq!(lent, Some(1), "the commit asked for a's text once");
+    let made = batch.with_engine(state, |engine| {
+      engine.content_bytes("a").map(<[u8]>::to_vec)
+    });
+    let mut expected = first;
+    expected.extend_from_slice(b"tail!");
+    assert_eq!(made, Some(Some(expected)));
+    batch.abandon(state);
+  });
+}
+
 /// Goal 93, A-760's append (main 01a20182's ruling of 2026-11-22 ~13:30: a work reused after a refused append must be
 /// impossible by construction). `append` takes its changes by value and a refusal gives none back, so a caller retries
 /// only with a work it builds again, its runs read again; never one whose runs a refused verdict took. Do: append a named
