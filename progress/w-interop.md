@@ -674,3 +674,9 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
 - 44db3dc17: BENCHMARKS, the 57k hg push A/B and the hg leg at 608930048.
 - f5b283016 (branch w-interop/hg-matrix-ci): the hg matrix CI job, pushed by main as diag-measurer-main-interop-linux-6
   (2026-11-25 03:31 PST). Waiting for main to send results; any failed leg's row log comes back to me.
+- The hg matrix on CI is closed: run 6 passed Linux 30 of 30 on both arches (d2b06267b); run 8 (45624253901) passed
+  windows-latest too, after ade67baf3 (the workflow's hg path) and 0e73ff11d (evo-repository's slates path). GAPS
+  updated at 19cc73c9f.
+- BENCHMARKS entries landed for bench7: the svn leg and the hg store-wait split (f8d28d2f8), P7's true F (b42a4bbb6,
+  fed0b8164) and its fourth arm (e2dee55c5), and the git leg (b54e8a361) with its derive_behind A/B (e03925040).
+- Nothing open. Branch w-interop/hg-matrix-ci (diag only, never main) stays local.
