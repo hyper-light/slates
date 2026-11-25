@@ -654,3 +654,17 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - system_live by owner from main's r583 sent: greens 58.2 MB (make_mapped), index tables as content-store Here
     tables 41.0, entries 25.5, image pages 20.5, window records 11.5 (was 22.1).
   - Waiting on: r633 (refusals), the AC-2.1 run at e16be6d81.
+- 2026-11-25 ~02:30 PST:
+  - Earlier this session: LANDED the read-path cold trigger (read_backs, homes' pinned read; e6710411a P7; 084ffb65d
+    svn landing stage counters; f57e255d7 git re-bring test). Reviewed w-hg's push pins (7ad0c7931): asked for the
+    count-out at the let-go, not at take_segment; main replaced it with the content store's unlanded rule (B), which I
+    reviewed OK (asks: count windows away at pin, refuse NotHeld on an empty pin, document unpin-before-release).
+  - LANDED 7c0ea35a1: Store::text_whole; the owner's batch of a fetch's texts no longer leaves walks in flight in the
+    text cache (main's 15b4f1061 57k clone: 4,792 live chunks, 5.07 GB, after it). Red text_cache_heap
+    a_text_read_whole_leaves_no_walk_in_flight 6,291,456 -> 1,048,576. Also crates/server/tests/hg_fetch_heap.rs (live
+    heap by site at push end, clone peak, clone end; ignored).
+  - Left (in order): (1) the batch bound (LogTexts::ask_batch by room.left(); the system allocator's 5.25 GB) -- main's
+    call asked: a window a batch (~57k requests) or the mapped floor (~15k); (2) the 6 GB baseline at 57k with the
+    sampler (command sent to main); (3) the P7 flush cut (w-svn passed it; their two requirements recorded: every land
+    path's last batch before an acknowledgement durable, and the tail's let-go waits for the durable flush; oracle
+    crashes after a non-durable batch's tail).
