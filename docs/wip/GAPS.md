@@ -4562,6 +4562,11 @@
 >   ubuntu-latest and 30 of 30 on ubuntu-24.04-arm**, the six changeset evolution rows (ad36e5f09) among them.
 >   Windows pending: run 6's windows-latest leg failed every row at exit 127 on the workflow's own wrapper path (bash
 >   dropped `D:\a\_temp`'s backslashes), not slates; ade67baf3 passes it as a Unix path, for run 7.
+> - **Windows hg, CLOSED by use (2026-11-25):** run 8 (45624253901, `diag-measurer-main-interop-linux-8` at 8143c35a6,
+>   with 0e73ff11d) passed the hg matrix on windows-latest, ubuntu-latest and ubuntu-24.04-arm, the evolution rows
+>   included. Run 7 (45612515778) had passed 24 of 30 on Windows: `evo-repository` pasted the binary's Windows path into
+>   its shell's command, which took its backslashes, and the five rows after it failed on the missing repository;
+>   0e73ff11d passes the path through the environment.
 > - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
 >   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
