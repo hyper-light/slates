@@ -2937,6 +2937,13 @@
 > prints both in both readings, and BENCHMARKS' method note says why RSS across a purge on macOS compares nothing
 > (`the_control_shards_memory_status_names_the_processs_resident_and_on_macos_its_footprint`: red, no such rows). P7's
 > after arm is judged on the footprint on macOS against the bound arm's, at the settled reading (main).
+> A publication that releases deferred frees (A-64) gives back past the keep the arena's last give-back held, in the
+> same step (`staging::give_back_released`, `ShardState::give_back_keep`; main's ruling of 2026-11-25): a batch's
+> let-go texts were released by a publication after its tail, so round 1's settled reading held 103.7 MB resident and
+> free over the bound's 91.9. Its work is as many purge slices as the released bytes span and one more, what the
+> release scrubbed bounding it; an idle purge that settles clears the keep. Red
+> `an_imports_arena_holds_its_keep_once_a_publication_releases_its_deferred_texts` (each releasing publication read in
+> its own step): 6,021,120 B resident and free against a keep of 4,227,072; now at most 4,186,112 of 4,202,496.
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
