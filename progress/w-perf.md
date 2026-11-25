@@ -684,3 +684,11 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - Found at main (not mine): store_tests a_subversion_restart_replays_a_named_text_with_one_released_window fails 3/3,
     let_go_landed Err(Unlanded) at store_tests.rs:1363 after a55d7cfa6 -- sent to w-svn and main.
   - Next: the P7 flush cut (staging.rs; w-svn's two requirements; A-130 ordering; crash-at-every-step oracle).
+- 2026-11-25 ~09:30 PST:
+  - LANDED 93d7dca13: P7's batch bound rent or buy, clamp(F x M, U, max(U, R/2)) (F the least durable landing the
+    shard timed; M the profile's memcpy; U the store unit; R vcs_share::room), logged per import. Reds: batches fall
+    with F x M (8 -> 3), the room caps (4 vs 1); oracle a_cut_import_killed_at_every_stage_of_a_batch_recovers_old_or_new
+    at one unit and derived. w-svn reviewed (both points taken). Main's release A/B owed.
+  - LANDED 3a2561406 (in 93d7dca13): hg_fetch_heap names sites by the frames' crates/ files (line-tables builds).
+  - main's what_holds at d3057763e: the 57k clone added 27 MiB (was 5.7-6.0 GB, 10.4 GB at 15b4f1061).
+  - Next (main's order): the churn by site -- 64 GB of system allocation churn, 418 GB of fresh mapped pages.
