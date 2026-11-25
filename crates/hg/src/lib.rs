@@ -100,6 +100,7 @@ mod quote;
 mod read;
 pub mod render;
 pub mod revlog;
+pub mod revlog_chunk;
 pub mod serve;
 pub mod ssh;
 pub mod store;

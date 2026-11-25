@@ -168,9 +168,37 @@ pub(crate) const LOOKUP_STORE_ASKS: &str = "vcs_store.hg_lookup_store_asks";
 /// ([`STORE_ASKS`]). Format: a counter name in the status report.
 pub(crate) const STORE_WAIT_NS: &str = "vcs_store.hg_stream_store_wait_ns";
 
-/// Counts one turn of a fetch's streamed answer ([`STREAM_TURNS`]) on the shard serving it; nothing off a shard.
+/// Counter: the nanoseconds a stream's count pass spent compressing chunks to size them (goal 93 perf, main's ruling of
+/// 2026-11-25: each chunk compressed as stock's, at stream time until the store keeps it so; `slates_hg::revlog_chunk`).
+/// Format: a counter name in the status report.
+pub(crate) const COMPRESS_COUNT_NS: &str = "vcs_store.hg_stream_compress_count_ns";
+/// Counter: the nanoseconds a stream's send pass spent compressing the chunks it wrote ([`COMPRESS_COUNT_NS`]'s
+/// second pass). Format: a counter name in the status report.
+pub(crate) const COMPRESS_SEND_NS: &str = "vcs_store.hg_stream_compress_send_ns";
+/// Counter: the plain bytes of the chunks a stream's send pass compressed. Format: a counter name in the status report.
+pub(crate) const COMPRESS_SEND_PLAIN_BYTES: &str = "vcs_store.hg_stream_compress_send_plain_bytes";
+/// Counter: the bytes those chunks were stored as, headers in: against [`COMPRESS_SEND_PLAIN_BYTES`], the ratio the
+/// stream gained. Format: a counter name in the status report.
+pub(crate) const COMPRESS_SEND_STORED_BYTES: &str =
+  "vcs_store.hg_stream_compress_send_stored_bytes";
+
+/// Counts one turn of a fetch's streamed answer ([`STREAM_TURNS`]) on the shard serving it, and the chunks its thread
+/// compressed since the last turn ([`COMPRESS_COUNT_NS`] and its siblings); nothing off a shard.
 pub(crate) fn turn_taken() {
-  let _ = crate::state::with_state(|state| state.count(STREAM_TURNS, 1));
+  let chunks = slates_hg::revlog_chunk::take_counts();
+  let _ = crate::state::with_state(|state| {
+    state.count(STREAM_TURNS, 1);
+    for (name, by) in [
+      (COMPRESS_COUNT_NS, chunks.count.ns),
+      (COMPRESS_SEND_NS, chunks.send.ns),
+      (COMPRESS_SEND_PLAIN_BYTES, chunks.send.plain_bytes),
+      (COMPRESS_SEND_STORED_BYTES, chunks.send.stored_bytes),
+    ] {
+      if by > 0 {
+        state.count(name, by);
+      }
+    }
+  });
 }
 
 /// Answers what a stream's next step needs of the node's changeset store (goal 93 perf: each revision sent as the store

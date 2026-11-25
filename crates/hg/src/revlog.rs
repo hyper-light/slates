@@ -713,11 +713,8 @@ impl Outline {
       Mode::Inline => stored.first().copied(),
     };
     Ok(match route {
-      None | Some(RAW_NUL) => copy(&stored, admission)?,
-      Some(RAW) => copy(stored.get(1..).unwrap_or_default(), admission)?,
-      Some(ZLIB) => inflate(rev, Engine::Zlib, &stored, admission)?,
-      Some(ZSTD) => inflate(rev, Engine::Zstd, &stored, admission)?,
-      Some(header) => return Err(Refused::Compression { rev, header }.into()),
+      None => copy(&stored, admission)?,
+      Some(header) => decode_by(header, &stored, rev, admission)?,
     })
   }
 
@@ -1021,6 +1018,40 @@ fn mode(modes: u8, rev: u32) -> Result<Mode, Refused> {
 fn copy(stored: &[u8], admission: &mut Admission) -> Result<Vec<u8>, Refused> {
   admission.charge(crate::read::to_u64(stored.len()))?;
   Ok(stored.to_vec())
+}
+
+/// A version 1 chunk `stored` (revision `rev`'s, which a refusal names) decoded by its first byte as 7.2's
+/// `revlog.decompress` routes it: none, empty; a NUL, the bytes as they are; `u`, the bytes after it; `x`, a zlib stream;
+/// `(`, a zstd frame; any other header refused [`Refused::Compression`]. Every byte made is charged to `admission`.
+///
+/// # Errors
+/// [`Refused::Compression`] for an unknown header, [`Refused::Stream`] for a stream cut short or corrupt, and
+/// [`Refused::PastAdmission`] past `admission`.
+pub fn decode_chunk(
+  stored: &[u8],
+  rev: u32,
+  admission: &mut Admission,
+) -> Result<Vec<u8>, Refused> {
+  match stored.first() {
+    None => Ok(Vec::new()),
+    Some(header) => decode_by(*header, stored, rev, admission),
+  }
+}
+
+/// A chunk decoded as its `header` routes it ([`decode_chunk`]).
+fn decode_by(
+  header: u8,
+  stored: &[u8],
+  rev: u32,
+  admission: &mut Admission,
+) -> Result<Vec<u8>, Refused> {
+  match header {
+    RAW_NUL => copy(stored, admission),
+    RAW => copy(stored.get(1..).unwrap_or_default(), admission),
+    ZLIB => inflate(rev, Engine::Zlib, stored, admission),
+    ZSTD => inflate(rev, Engine::Zstd, stored, admission),
+    header => Err(Refused::Compression { rev, header }),
+  }
 }
 
 /// A compressed chunk inflated by the crate's one inflater, the one compressed bundles use ([`compression::inflate`]):
