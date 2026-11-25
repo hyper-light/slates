@@ -55,12 +55,15 @@ impl Grants {
   }
 }
 
-/// The shard's grants as of `now_ns`, divided again first when they are due (module docs, "When it is divided").
+/// The shard's grants as of `now_ns`, divided again first when they are due (module docs, "When it is divided"), and
+/// once divided, every repository's read-backs past its new grant let go (`read_backs`, §4.17.5 "The cold trigger").
 pub(crate) fn current_at(state: &mut ShardState, now_ns: u64) -> &Grants {
   if due(state, now_ns) {
     let divided = divide(state, now_ns);
     state.vcs_grants = divided;
     state.count(DIVIDED, 1);
+    // The cold trigger (§4.17.5, A-724 piece 4): what reads brought back past each repository's new grant goes now.
+    super::read_backs::let_go_past_grants(state);
   }
   &state.vcs_grants
 }
@@ -404,5 +407,206 @@ mod tests {
       assert_eq!(away, vec![1, 2, 3, 4, 5, 6]);
       assert_eq!(state.refusals.get(super::LET_GO_WINDOWS).copied(), Some(6));
     });
+  }
+
+  /// Shape: the brought-back test's texts: how many, and each one's bytes, one window each (under the content plane's
+  /// window), so a text is resident or let go whole.
+  const READ_TEXTS: usize = 16;
+  /// Shape: see [`READ_TEXTS`].
+  const READ_TEXT_BYTES: usize = 64 << 10;
+
+  /// Text `number` of the brought-back test: [`READ_TEXT_BYTES`] of its own lines, so no two share a window.
+  fn read_text(number: usize) -> Vec<u8> {
+    let line = format!("{number:07}\n");
+    line.repeat(READ_TEXT_BYTES / line.len()).into_bytes()
+  }
+
+  /// A format-2 dump whose revisions `1..=texts` each add a file `f<n>` holding [`read_text`]`(n)`.
+  fn read_texts_dump(texts: usize) -> Vec<u8> {
+    let section =
+      "K 10\nsvn:author\nV 5\nalice\nK 8\nsvn:date\nV 27\n2026-11-25T00:00:00.000000Z\nPROPS-END\n";
+    let zero = "K 8\nsvn:date\nV 27\n2026-11-25T00:00:00.000000Z\nPROPS-END\n";
+    let mut dump = format!(
+      "SVN-fs-dump-format-version: 2\n\nUUID: 00000000-0000-4000-8000-000000000724\n\nRevision-number: 0\n\
+       Prop-content-length: {0}\nContent-length: {0}\n\n{zero}\n",
+      zero.len()
+    )
+    .into_bytes();
+    for number in 1..=texts {
+      let text = read_text(number);
+      let empty = "PROPS-END\n";
+      dump.extend_from_slice(
+        format!(
+          "Revision-number: {number}\nProp-content-length: {0}\nContent-length: {0}\n\n{section}\n\
+           Node-path: f{number}\nNode-kind: file\nNode-action: add\nProp-content-length: {1}\n\
+           Text-content-length: {2}\nContent-length: {3}\n\n{empty}",
+          section.len(),
+          empty.len(),
+          text.len(),
+          empty.len() + text.len()
+        )
+        .as_bytes(),
+      );
+      dump.extend_from_slice(&text);
+      dump.extend_from_slice(b"\n\n");
+    }
+    dump
+  }
+
+  /// Text `number`'s identity, as the content store and a named read name it.
+  fn read_identity(number: usize) -> slates_merge::named::Identity {
+    let text = read_text(number);
+    slates_merge::named::Identity {
+      hash: *blake3::hash(&text).as_bytes(),
+      len: u64::try_from(text.len()).unwrap_or(u64::MAX),
+    }
+  }
+
+  /// The bytes of the [`READ_TEXTS`] texts the content store holds resident, not let go.
+  fn resident_read_texts(state: &ShardState) -> u64 {
+    let Some(content) = state.vcs_stores.content() else {
+      return 0;
+    };
+    (1..=READ_TEXTS)
+      .map(read_identity)
+      .filter(|identity| {
+        let root = slates_vcs::ContentId(identity.hash);
+        content.contains(&root) && !content.is_away(&root)
+      })
+      .fold(0u64, |held, identity| held.saturating_add(identity.len))
+  }
+
+  /// Imports [`READ_TEXTS`] texts into a new Subversion repository `name`, every one let go once its batch landed, then
+  /// reads each back whole through a named read (`named_objects::bring_back_range`, the path FUSE, NFS, virtio-fs and
+  /// WinFsp read a let-go object by), dropping its pin, text `pinned` kept pinned instead, and reads text 1 again last:
+  /// the repository, whether every text was let go before the reads, and the pin kept.
+  async fn read_back(
+    name: &str,
+    pinned: Option<usize>,
+  ) -> (
+    RepositoryId,
+    bool,
+    Option<crate::vcs_store::named_objects::ReadPin>,
+  ) {
+    use crate::repository::svn_commit::tests::on;
+    let (svn, _) = crate::vcs_store::svn_import::tests::subversion(name).await;
+    let (loaded, _) =
+      crate::vcs_store::svn_import::tests::imported(svn, read_texts_dump(READ_TEXTS)).await;
+    assert!(loaded.is_ok(), "imported: {loaded:?}");
+    let away_before = on(|state| resident_read_texts(state)) == 0;
+    let mut kept = None;
+    for number in (1..=READ_TEXTS).chain([1]) {
+      let identity = read_identity(number);
+      let pin = crate::vcs_store::named_objects::bring_back_range(identity, (0, identity.len))
+        .await
+        .expect("brought back");
+      if pinned == Some(number) {
+        kept = Some(pin);
+      }
+    }
+    (svn, away_before, kept)
+  }
+
+  /// Gives repository `svn` a usage row whose curve reads two one-window objects (`used`) and divides the shard's room
+  /// at the learning cadence (`current_at`), as admission asks it: the cold trigger runs. Its grant.
+  fn divided_for(state: &mut ShardState, svn: RepositoryId) -> u64 {
+    let from = slates_rt::futures::now_ns();
+    used(state, svn, (50, from), (2, 2_000));
+    let _ = current_at(state, from.saturating_add(50 * MILLISECOND));
+    state.vcs_grants.of(svn).unwrap_or(0)
+  }
+
+  /// Whether text `number` is resident.
+  fn read_text_resident(state: &ShardState, number: usize) -> bool {
+    let root = slates_vcs::ContentId(read_identity(number).hash);
+    state
+      .vcs_stores
+      .content()
+      .is_some_and(|content| content.contains(&root) && !content.is_away(&root))
+  }
+
+  /// Main 01a20182's question and ruling (b) of 2026-11-25 (w-hg's sweep: read paths bring a landed window back for a
+  /// reader and drop only its pin, and nothing let the window go): what a read brings back is a cache the memory
+  /// division bounds (§4.17.5 "The cold trigger", A-724 piece 4). Do: import a dump of [`READ_TEXTS`] revisions each
+  /// adding a text of [`READ_TEXT_BYTES`] (no window shared) into a Subversion repository, every text let go once its
+  /// batch landed (P3); read each back whole through a named read and drop its pin, text 1 read again last; give the
+  /// repository a usage row of two one-window objects and divide the shard's room at its cadence (`current_at`).
+  /// Expect: every text let go before the reads; after the division, the texts resident within the repository's grant;
+  /// text 1, read last, resident (hot), text 2 let go (cold); counted. Failing first: 1,048,576 B of the sixteen texts
+  /// resident against a grant of 131,072 B, the division's let-go having no caller outside tests.
+  #[test]
+  fn what_a_read_brings_back_is_let_go_past_its_repositorys_grant() {
+    use crate::repository::svn_commit::tests::{on, stored};
+    let (away_before, grant, resident, hot_cold, let_go) = stored(|| async move {
+      let (svn, away_before, _) = read_back("read-back", None).await;
+      let grant = on(|state| divided_for(state, svn));
+      on(|state| {
+        (
+          away_before,
+          grant,
+          resident_read_texts(state),
+          (read_text_resident(state, 1), read_text_resident(state, 2)),
+          state
+            .refusals
+            .get(super::super::read_backs::LET_GO)
+            .copied()
+            .unwrap_or(0),
+        )
+      })
+    });
+    assert!(away_before, "every text let go once landed");
+    assert!(grant > 0, "a grant divided");
+    assert!(
+      resident <= grant,
+      "{resident} bytes of read texts resident against a grant of {grant}"
+    );
+    assert_eq!(
+      hot_cold,
+      (true, false),
+      "the hot text kept, the cold let go"
+    );
+    assert!(let_go > 0, "counted `vcs_share.read_backs_let_go`");
+  }
+
+  /// Main 01a20182's ruling (b), condition 2: a pinned window is never let go, however cold. Do: as
+  /// [`what_a_read_brings_back_is_let_go_past_its_repositorys_grant`], text 2 (read once, early: cold) kept pinned by its
+  /// reader across the division. Expect: text 2 resident after it; the unpinned texts resident within the grant;
+  /// counted `vcs_share.read_backs_pinned_kept`. Then, its pin dropped and the room divided again at the next cadence,
+  /// text 2 let go.
+  #[test]
+  fn a_pinned_read_back_is_never_let_go_however_cold() {
+    use crate::repository::svn_commit::tests::{on, stored};
+    let (during, kept, after) = stored(|| async move {
+      let (svn, _, pin) = read_back("read-pinned", Some(2)).await;
+      let grant = on(|state| divided_for(state, svn));
+      let during = on(|state| {
+        (
+          read_text_resident(state, 2),
+          resident_read_texts(state).saturating_sub(read_identity(2).len) <= grant,
+        )
+      });
+      let kept = on(|state| {
+        state
+          .refusals
+          .get(super::super::read_backs::PINNED_KEPT)
+          .copied()
+          .unwrap_or(0)
+      });
+      drop(pin);
+      let after = on(|state| {
+        let cadence = state.vcs_grants.cadence_ns.unwrap_or(1);
+        let next = state.vcs_grants.at_ns.saturating_add(cadence);
+        let _ = current_at(state, next);
+        read_text_resident(state, 2)
+      });
+      (during, kept, after)
+    });
+    assert_eq!(
+      during,
+      (true, true),
+      "the pinned text kept, the rest within the grant"
+    );
+    assert!(kept > 0, "counted `vcs_share.read_backs_pinned_kept`");
+    assert!(!after, "let go once its pin dropped, at the next division");
   }
 }
