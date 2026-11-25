@@ -2414,7 +2414,7 @@ fn stream_into(
   slots: &mut Vec<u8>,
   store: &Store,
   volumes: &[([u8; 16], Volume)],
-  held: &mut Vec<slates_vfs::recover::HeldPiece>,
+  held: &mut [slates_vfs::recover::HeldPiece],
   (replies, calls, nfs_replies, nfs_states): (
     &mut Vec<slates_vfs::recover::HeldReply>,
     &mut Vec<slates_vfs::recover::HeldCall>,
@@ -2900,7 +2900,7 @@ fn a_borrowed_held_piece_encodes_byte_for_byte_as_an_owned_one() {
   use slates_vfs::recover::{HELD_PIECE_KEY_BYTES, HeldPiece, HeldPieceRef, encode_held_pieces};
   use slates_wire::Wire;
   let piece = |first: u8, bytes: &[u8]| HeldPiece {
-    key: core::array::from_fn(|at| first.wrapping_add(at as u8)),
+    key: core::array::from_fn(|at| first.wrapping_add(u8::try_from(at).unwrap_or(u8::MAX))),
     bytes: bytes.to_vec(),
   };
   let one = piece(9, b"a page's bytes");

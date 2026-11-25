@@ -141,8 +141,11 @@ row ssh-push bash -c "${HG[*]} clone -q a f && cd f && echo ssh >ssh.txt && ${HG
 # publishing, so pushed changesets stay draft and may be rewritten; every command with `experimental.evolution = all`.
 EVURL="http://127.0.0.1:$HTTP/evolve"
 EVO="${HG[*]} --config experimental.evolution=all"
-row evo-repository bash -c "$SLATES --instance $INSTANCE repository create evolve --tool hg >/dev/null \
-  && $SLATES --instance $INSTANCE repository policy evolve --hg-publish false >/dev/null"
+# The binary's path reaches the row's shell as an environment variable, expanded there quoted: pasted into the command's
+# text, a Windows path's backslashes were taken by that shell (CI run 45612515778, windows-latest: "D:aslatesslates...").
+export SLATES INSTANCE
+row evo-repository bash -c '"$SLATES" --instance "$INSTANCE" repository create evolve --tool hg >/dev/null \
+  && "$SLATES" --instance "$INSTANCE" repository policy evolve --hg-publish false >/dev/null'
 # Drafts `a` and `b` pushed, `b` amended and pushed again: the server tells its one new marker in 7.2's words.
 row evo-amend-push bash -c "$EVO init ev && cd ev && echo a >a && $EVO commit -qAm a && echo b >b \
   && $EVO commit -qAm b && $EVO push -q $EVURL && echo b2 >b && $EVO commit -q --amend -m 'b amended' \

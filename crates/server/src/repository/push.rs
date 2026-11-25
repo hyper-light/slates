@@ -570,46 +570,8 @@ impl RecordedBatch {
             }
           }
         }
-        Some(InVersion::Running(mut step, version, mut run)) => {
-          let stepped = state.greens.get_mut(&self.green).map(|mut engine| {
-            engine.apply_step(&mut run, &mut step.increment, &step.applied, &mut || {
-              spent()
-            })
-          });
-          state.count(BATCH_APPLY_STEPS, 1);
-          match stepped {
-            Some(slates_merge::engine::ApplyStep::More) => {
-              self.applying = Some(InVersion::Running(step, version, run));
-              false
-            }
-            // Texts its slice met that the green holds by name alone: lent, and the slice made again next.
-            Some(slates_merge::engine::ApplyStep::Lend(unlent)) => {
-              let lent = crate::vcs_store::name_holds::lend_named(
-                state,
-                self.green,
-                (&step.increment, &step.applied),
-                &unlent,
-              );
-              if lent.is_some() {
-                self.applying = Some(InVersion::Running(step, version, run));
-                false
-              } else {
-                self.version_ended(state, (step, version), None);
-                true
-              }
-            }
-            Some(
-              slates_merge::engine::ApplyStep::Done(answered)
-              | slates_merge::engine::ApplyStep::Answered(answered),
-            ) => {
-              self.version_ended(state, (step, version), Some(answered));
-              true
-            }
-            None => {
-              self.version_ended(state, (step, version), None);
-              true
-            }
-          }
+        Some(InVersion::Running(step, version, run)) => {
+          self.run_slice(state, (step, version, run), deadline)
         }
       };
       if ended {
@@ -630,6 +592,61 @@ impl RecordedBatch {
     let _ = crate::merge_service::settle_green_retention(state, self.green);
     crate::merge_service::checkpoint_green(state, self.green);
     Some(std::mem::take(&mut self.made))
+  }
+
+  /// Runs `version`'s recorded run a slice, until the step budget is spent at `deadline`: it goes on at the next slice
+  /// where the budget ends inside it, lends the texts its slice met that the green holds by name alone (the slice made
+  /// again next), or ends ([`RecordedBatch::version_ended`]). Whether the version ended.
+  fn run_slice(
+    &mut self,
+    state: &mut ShardState,
+    (mut step, version, mut run): (
+      crate::import_batch::Staged,
+      u64,
+      Box<slates_merge::engine::Applying>,
+    ),
+    deadline: u64,
+  ) -> bool {
+    let spent = || slates_rt::futures::now_ns() >= deadline;
+    let stepped = state.greens.get_mut(&self.green).map(|mut engine| {
+      engine.apply_step(&mut run, &mut step.increment, &step.applied, &mut || {
+        spent()
+      })
+    });
+    state.count(BATCH_APPLY_STEPS, 1);
+    match stepped {
+      Some(slates_merge::engine::ApplyStep::More) => {
+        self.applying = Some(InVersion::Running(step, version, run));
+        false
+      }
+      // Texts its slice met that the green holds by name alone: lent, and the slice made again next.
+      Some(slates_merge::engine::ApplyStep::Lend(unlent)) => {
+        let lent = crate::vcs_store::name_holds::lend_named(
+          state,
+          self.green,
+          (&step.increment, &step.applied),
+          &unlent,
+        );
+        if lent.is_some() {
+          self.applying = Some(InVersion::Running(step, version, run));
+          false
+        } else {
+          self.version_ended(state, (step, version), None);
+          true
+        }
+      }
+      Some(
+        slates_merge::engine::ApplyStep::Done(answered)
+        | slates_merge::engine::ApplyStep::Answered(answered),
+      ) => {
+        self.version_ended(state, (step, version), Some(answered));
+        true
+      }
+      None => {
+        self.version_ended(state, (step, version), None);
+        true
+      }
+    }
   }
 
   /// Begins applying `step` as `version`, its named texts read ([`InVersion::Reading`]): its run begun
