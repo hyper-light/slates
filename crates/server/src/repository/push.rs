@@ -1026,6 +1026,17 @@ fn plan_delete(
 /// watchdog's window). Format: a counter name in the daemon's status report.
 pub(crate) const LANDING_STEP_WORKS: &str = "repository.push.landing_step_works_most";
 
+/// Counted most: the creates one push's landing step made itself, a deferred one's too (P2's git creates, made and owing
+/// their push, no work): what [`LANDING_STEP_WORKS`] leaves out, so a git push of many new refs shows whether its creates
+/// still land in one step (w-git, 2026-11-24: git/git's ~1,027, main's order to measure before slicing them). Format: a
+/// counter name in the daemon's status report.
+pub(crate) const LANDING_STEP_CREATES: &str = "repository.push.landing_step_creates_most";
+
+/// Counted most: the nanoseconds one push's landing step took on the shard's clock, its plan's creates, works, entry and
+/// apply: what says whether a push's landing holds its shard past the step quantum, whatever it made. Format: a counter
+/// name in the daemon's status report.
+pub(crate) const LANDING_STEP_NS: &str = "repository.push.landing_step_ns_most";
+
 /// Counter: a create a push's driver prepared ahead of its landing's step that the step's plan did not name as planned
 /// (another name, base or version): prepared again within the step ([`prepare_create`]); zero where nothing moved
 /// between, as the landing turn holds it. Format: a counter name in the daemon's status report.
@@ -1144,6 +1155,7 @@ fn creates_made(
 ) -> Result<(Vec<bool>, Vec<Option<Verdict>>), AppendRefused> {
   let mut adopted = vec![false; steps.len()];
   let mut created: Vec<Option<Verdict>> = (0..steps.len()).map(|_| None).collect();
+  let mut made_here = 0u64;
   for (index, step) in steps.iter_mut().enumerate() {
     let Step::Create {
       name,
@@ -1164,6 +1176,7 @@ fn creates_made(
           state.count(CREATE_MISSES, 1);
         }
         let planned = core::mem::replace(step, placeholder());
+        made_here = made_here.saturating_add(1);
         prepare_create(state, planned, ahead).map_err(|refused| at_index(refused, index))?
       }
     };
@@ -1181,6 +1194,7 @@ fn creates_made(
       *created = verdict;
     }
   }
+  state.count_max(LANDING_STEP_CREATES, made_here);
   Ok((adopted, created))
 }
 
@@ -1355,8 +1369,33 @@ impl PreparedCreates {
 
 /// The push once planned (module docs, items 2 to 4, then the commit): what it held is in `held` until it is recorded.
 /// Each create is made by [`prepare_create`]: taken from `prepared` where its driver prepared it ahead of this step,
-/// else prepared here.
+/// else prepared here. Its time on the shard's clock counted most ([`LANDING_STEP_NS`]).
 fn push_planned(
+  state: &mut ShardState,
+  record: &RepositoryRecord,
+  (steps, parts): (Vec<Step>, EntryParts),
+  (held, ahead, prepared): (
+    &mut Held,
+    &[crate::held_ahead::HeldAhead],
+    Option<&mut PreparedCreates>,
+  ),
+  stored: Option<Stored<'_, '_>>,
+) -> Result<Appended, AppendRefused> {
+  let began = state.clock.monotonic_ns();
+  let landed = landed_planned(
+    state,
+    record,
+    (steps, parts),
+    (held, ahead, prepared),
+    stored,
+  );
+  let took = state.clock.monotonic_ns().saturating_sub(began);
+  state.count_max(LANDING_STEP_NS, took);
+  landed
+}
+
+/// [`push_planned`]'s step.
+fn landed_planned(
   state: &mut ShardState,
   record: &RepositoryRecord,
   (mut steps, parts): (Vec<Step>, EntryParts),

@@ -1714,14 +1714,16 @@
 > FIXED by w-shared's A-902 (d48863ddb: the put carries the sender's configuration version, and a home behind it waits
 > for its own install within the put's budget).
 >
-> A git push of many new refs makes every new green in its landing's one step, TO MEASURE (w-git, 2026-11-24, main's
-> order of 15:06; corrected the same day): git/git's whole history creates about 1,027 refs, mostly tags. A git create
-> is P2's deferred one (`BranchChange::CreateDeferred`, planned as `Step::Create { work: None, deferred: Some(push) }`),
-> so in the step it is only made (`Greens::branch`, a green at a version by identity, no walk) and owes its push
-> (`Greens::defer`): none of the secure, judge, hold and commit that cost Mercurial's heads 3.5 s for 452 (w-hg). Whether
-> 1,027 makes and defers hold a step past its quantum is unmeasured: `repository.push.landing_step_works_most` and the
-> landing step's time in a git leg's push of git/git decide it. If they do, w-hg's prepared-creates seam
-> (`repository/push.rs`, `PreparedCreates`, landed fda5613a1) is the way, its plan taught deferred creates too.
+> A git push of many new refs makes every new green in one landing step only under `atomic`, MEASURED (w-git,
+> 2026-11-24, main's order of 15:06; corrected the same day). A git create is P2's deferred one
+> (`BranchChange::CreateDeferred`: made by identity and owing its push, none of the secure, judge, hold and commit that
+> cost Mercurial's 452 heads 3.5 s), and a push without `atomic` appends each ref in an entry of its own, so git/git's
+> ~1,027 new refs, pushed as stock git pushes them, are ~1,027 small steps, never one
+> (`a_push_of_new_refs_counts_the_creates_its_landing_step_made_and_the_steps_time`: five new tags, one create the most
+> a step made; with `atomic`, five in one step). Counted from now (`repository.push.landing_step_creates_most`, the
+> creates a landing step made itself; `repository.push.landing_step_ns_most`, its time). OWED only for an `atomic` push
+> of many refs, should those counters show its step past the quantum: w-hg's prepared-creates seam
+> (`repository/push.rs`, `PreparedCreates`, fda5613a1), its plan taught deferred creates.
 >
 > One push's reading spread over several shards, NOT IN THE DESIGN (for Ada; w-git, 2026-11-24, main's order of 09:50):
 > stock git's `index-pack` resolves one pack's deltas over threads; slates reads one push on one shard. §4.17.1 item 2
