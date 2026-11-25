@@ -220,6 +220,8 @@ pub(crate) struct Batches {
   pub(crate) chain: u64,
   /// The import's end, or a record that moves no version.
   pub(crate) end: u64,
+  /// The texts the batch carried and the next revision's would have passed the batch's bound (goal 93 P7).
+  pub(crate) texts: u64,
 }
 
 impl Batches {
@@ -231,6 +233,7 @@ impl Batches {
       Flush::Retention => &mut self.retention,
       Flush::Chain => &mut self.chain,
       Flush::End => &mut self.end,
+      Flush::Texts => &mut self.texts,
     };
     *count = count.saturating_add(1);
   }
@@ -847,7 +850,7 @@ fn done(state: &ShardState, id: RepositoryId, importing: &Importing) -> Result<L
   let batches = importing.batches;
   slates_machine::log_line!(
     "slates-server: partition {}: a Subversion import ended at revision {youngest}, {} revisions in {} turns; its \
-     batches landed for admission {}, sections {}, retention {}, chain {}, end {}",
+     batches landed for admission {}, sections {}, retention {}, chain {}, texts {}, end {}",
     state.partition,
     importing.revisions,
     importing.turns,
@@ -855,6 +858,7 @@ fn done(state: &ShardState, id: RepositoryId, importing: &Importing) -> Result<L
     batches.sections,
     batches.retention,
     batches.chain,
+    batches.texts,
     batches.end
   );
   Ok(Loaded {
