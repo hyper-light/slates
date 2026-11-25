@@ -18972,3 +18972,138 @@ of 10 or better.
 Tried on the MacBook (2026-11-23, Apple M5 Max, load ~70, a 3-commit repository, `SERVERS="stock stock-http"`, one
 run): every step of both stock servers passed, each clone identical to the source in refs and objects. That only proves
 the harness runs; its seconds are no record.
+
+## Tip-to-Toe Meta-Scale Optimization & "Wreck It" Suite (Waves 7–10, FD Fix; 2026-11-24 to 2026-11-25)
+
+**Machine & toolchain:** `Mac17,6` (Apple M5 Max, 18 cores, 5 daemon shards, 128 GiB RAM, macOS 26.4.1), `rustc 1.98.1`,
+`git 2.56.1`, `hg 7.2.4`, `svn 1.15.0` / `svnserve 1.15.0`, `Apache/2.4.66` (`git-http-backend`; `mod_dav_svn` absent
+from `/usr/libexec/apache2`). Release binary at commit `56658a5e5` (includes Waves 7–10: `5e4fcc9fb`, `aa3f7a981`,
+`bd9712925`, `1d97b6793`, `5e5eef2c0`, `e03254380`, `b42ff020a`, `56658a5e5`). Note on load discipline: this host ran
+concurrent background sessions throughout (1-minute load average 31–77, sampled honestly per run); timings are therefore
+loaded-host points, not quiet-box floors.
+
+### 1. Interleaved Head-to-Head vs Stock Servers (`interop_speed.sh`, 2026-11-25 05:51 UTC)
+
+Command:
+`PATH=/opt/homebrew/bin:$PATH bash crates/cli/bench/interop_speed.sh slates-final WORK git-git.git /opt/homebrew/bin/hg hg-src git-2000.dump git-git.git master 2 900`
+
+Datasets: `git/git` at `f7de814569` (86,386 commits, 424,984 objects, 1,027 refs); `hg-src` at `57035:a933409955d2`
+(57,036 changesets, 308 tags); `git-2000.dump` (437 MiB, 2,000 revisions, 4,872 regular files). Every clone, verify,
+fsck, tree check (4,872/4,872 files), and log check (2,000/2,000 revisions) passed bit-exact. (Note: `svn_scale.sh`
+exits 1 solely because `stock` names its step `load` and `slates` names its step `import`; every actual operation passed
+2/2 runs.)
+
+| git (seconds, load 43–50) | stock (`git daemon`) 1..2 | best | stock-http (`httpd` CGI) 1..2 | best | slates 1..2 | best | ratio vs best stock |
+|---|---|---|---|---|---|---|---|
+| push, every branch & tag | 9.477, 10.021 | 9.477 | 10.171, 10.157 | 10.157 | 42.494, 42.480 | 42.480 | 0.22× (single-shard SHA-1DC) |
+| clone `--mirror` | 8.408, 8.236 | 8.236 | 8.465, 8.788 | 8.465 | 11.934, 11.844 | 11.844 | 0.70× (down from 27.6s pre-W7) |
+| clone again | 8.625, 8.068 | 8.068 | 8.597, 10.048 | 8.597 | **7.457, 7.467** | **7.457** | **1.08× faster** |
+| one-commit push | 0.106, 0.090 | 0.090 | 0.138, 0.192 | 0.138 | **0.084, 0.084** | **0.084** | **1.07× faster** |
+| incremental fetch | 0.182, 0.086 | 0.086 | 0.127, 0.217 | 0.127 | 0.169, 0.176 | 0.169 | 0.51× |
+| clone `--depth 1` | 0.893, 0.877 | 0.877 | 0.923, 0.996 | 0.923 | **0.437, 0.427** | **0.427** | **2.05× faster** |
+| clone `--filter=blob:none` | 4.691, 4.535 | 4.535 | 4.587, 5.753 | 4.587 | **4.388, 4.385** | **4.385** | **1.03× faster** |
+
+| Mercurial (seconds, load 47–63) | stock (`hg serve`) 1..2 | best | slates 1..2 | best | ratio vs stock |
+|---|---|---|---|---|---|
+| push, every changeset | 9.847, 9.663 | 9.663 | 48.815, 48.340 | 48.340 | 0.20× (BLAKE3+Mantle store) |
+| clone `-U` | 7.088, 7.089 | 7.088 | 7.496, 7.571 | 7.496 | 0.95× (down from 8.78s pre-W10) |
+| one-changeset push | 0.176, 0.184 | 0.176 | 0.179, 0.187 | 0.179 | 0.98× |
+| pull of it | 0.159, 0.152 | 0.152 | 0.158, 0.171 | 0.158 | 0.96× |
+| clone `--stream` | 0.775, 0.755 | 0.755 | **2.446, 2.622** | **2.446** | 0.31× (3.33× faster than 8.14s pre-W7) |
+
+| Subversion (seconds, load 40–60) | stock (`svnserve`) 1..2 | best | slates 1..2 | best | ratio vs stock |
+|---|---|---|---|---|---|
+| load / import (`git-2000.dump`) | 107.888 (once) | 107.888 | **3.496, 3.580** | **3.496** | **30.9× faster** |
+| checkout of trunk (4,872 files) | 4.452, 4.497 | 4.452 | **3.856, 4.038** | **3.856** | **1.15× faster** |
+| `log -q` (all 2,000 revs) | 0.188, 0.190 | 0.188 | **0.051, 0.058** | **0.051** | **3.69× faster** |
+| one-file commit | 2.372, 2.459 | 2.372 | **2.686, 2.010** | **2.010** | **1.18× faster** |
+| update to it | 0.980, 0.985 | 0.980 | 0.995, 1.002 | 0.995 | 0.98× |
+| update across 1,000 revisions | 2.000, 1.995 | 1.995 | 2.018, 1.999 | 1.999 | 1.00× |
+
+Per-instance daemon RSS measured directly on the benchmarked PIDs: Git `683–846 MiB` after full 86k push (`769–782 MiB`
+at end); Hg `386–414 MiB` after full 57k push (`502–511 MiB` at end); SVN **`432 MiB`** after 2,000-rev import (note:
+`interop_speed.sh`'s host-wide `ps` sampler summed an unrelated session's `slates daemon` on the shared MacBook,
+reading 6,169 MiB combined; `measure_svn_mem.sh` measured `mem.gauge.process.system_live_bytes` dropping from `77.7 MB`
+to **`31.3 MB`** — **2.48× lower live index heap**, `MALLOC_SMALL 125.2 → 89.0 MiB` — after Wave 10's 88B `Row` +
+`CompactEntries` + side-table compaction).
+
+### 2. Axis A1 — VCS High-Concurrency Storm (100 / 1,000 / 10,000 Clients, 4 Repos, 2 Rounds)
+
+Command: `python3 $SCRATCH/vcs-load-bench/run_load.py --slates slates-final --tools git,hg,svn,dav --rungs 100,1000,10000 --rounds 2 --repos 4` (2026-11-25, load 34–54; `kern.num_files: 13,883 before → 13,901 after`, 0 FD leaks across >40,000 TCP sockets):
+
+| protocol | N | ok | err | ops/s | RX MiB | p50 ms | p99 ms | daemon RSS (start→peak→end MiB) |
+|---|---|---|---|---|---|---|---|---|
+| `git-http` | 100 | 200 | 0 | 300.7 | 37.1 | 5.83 | 657.7 | 77.7 → 134.1 → 112.3 |
+| `git-http` | 1,000 | 2,000 | 0 | 350.7 | 371.3 | 44.54 | 5,520.2 | 79.0 → 158.6 → 145.5 |
+| `git-http` | 10,000 | 8,564 | 5,951* | 363.2 | 1,651.8 | 591.2 | 21,592 | 78.5 → **246.6** → 236.8 |
+| `hg-http` | 100 | 200 | 0 | **6,734.7** | 16.1 | 4.35 | 17.90 | 68.7 → 85.7 → 85.7 |
+| `hg-http` | 1,000 | 2,000 | 0 | **7,856.7** | 161.2 | 55.11 | 180.3 | 67.8 → 147.1 → 147.1 |
+| `hg-http` | 10,000 | 18,100 | 950* | 2,295.8 | 1,440.5 | 164.3 | 5,985 | 68.1 → 537.8 → 537.8 |
+| `svn-wire` | 100 | 200 | 0 | **19,532.3** | 1.7 | **2.10** | **3.81** | 431.4 → 431.6 → 431.6 |
+| `svn-wire` | 1,000 | 2,000 | 0 | **18,935.3** | 16.8 | **3.08** | **8.40** | 433.3 → 438.7 → 438.7 |
+| `svn-wire` | 10,000 | 9,380 | 5,310* | 1,192.2 | 78.5 | **5.43** | 162.8 | 433.5 → 453.3 → **216.1** |
+| `svn-dav` | 100 | 200 | 0 | **35,133.4** | 6.6 | **2.35** | **4.88** | 628.6 → 629.8 → 629.8 |
+| `svn-dav` | 1,000 | 2,000 | 0 | **15,199.6** | 65.8 | 9.78 | 127.5 | 627.0 → 630.8 → 630.8 |
+| `svn-dav` | 10,000 | 12,810 | 3,595* | 1,621.4 | 422.0 | 110.7 | 5,913 | 632.1 → 665.2 → **445.9** |
+
+*At N=10,000 on a single macOS loopback host, errors are host kernel limits (`connect_so_err_60` = `ETIMEDOUT` from
+`kern.ipc.somaxconn=128` SYN queue overflow, plus `write_errno_55` = `ENOBUFS` loopback mbuf exhaustion on `git-http`
+producing 2 truncated HTTP responses); daemon had 0 crashes/restarts and peak Git RSS stayed 246.6 MiB.
+
+**Measured and rejected (Wave 10 Git HTTP `take_fetch` concurrency A/B, 2026-11-24):**
+- **Arm A (kept, `limit=1` FIFO `take_fetch` + Wave 10 zero-fill-free inflate):** `git-http N=100` `wall=0.570s`,
+  `fetch-inc` p50 `257ms`/p99 `412ms`, RSS `134.1 MiB`; `N=1,000` `wall=4.954s`, `403.7 ops/s`, `fetch-inc` p50
+  `1,916ms`/p99 `3,800ms`, CPU `16.69s`, **RSS `160.0 MiB`**.
+- **Arm B (rejected — removed `take_fetch`):** `N=1,000` `wall=4.515s`, `fetch-inc` p50 `1,127ms`/p99 `1,223ms`
+  (3.11× lower p99), CPU `15.15s`, **but peak RSS exploded `160.0 → 377.2 MiB` (+217 MiB)** from 200 concurrent pack
+  encoders. Rejected to keep N=10,000 RSS bounded.
+- **Arm C (rejected — `FETCH_PIPELINE_DEPTH=2` double-buffered FIFO in `turns.rs`):** `N=100` `wall=0.636s`,
+  `fetch-inc` p50 `211ms`/p99 `370ms`, RSS `134.0 MiB`; `N=1,000` `wall=5.592s`, `fetch-inc` p50 `2,366ms`/p99
+  `4,618ms`, CPU `18.07s`, RSS `170.3 MiB`. Regressed wall, tail latency, CPU, and RSS vs Arm A; reverted.
+
+### 3. Axis B & C — Agentic EdenFS, Merge Engine, VFS, and Provisioning (`HEAD = 56658a5e5`)
+
+- **`verdict_bench` (`slates-merge`, Wave 8.1/8.2B):** O(1) independent of path count (754 → 75,400) and file size
+  (4 KiB → 1 MiB): at 75,400 paths × 1 MiB, `conflict_ns = 332 ns`, `converge_ns = 651 ns`, `accept_ns = 1,126 ns`
+  (down from `476.5 µs` pre-Wave 8.1 — **423× faster**).
+- **`history_layers_bench` (`slates-merge`, Wave 8.2B piece-tree history + O(1) overwrites):**
+  - `overwrites` (`h=100/1000/5000`): `1,217 / 1,422 / 1,377 ns/change`, `values_walked_per_change = 1.0` (vs `15,243 ns`
+    at 10k pre-Wave 8; retains O(1) per-overwrite space).
+  - `overwrite_insert_alternating` (`h=100/1000/5000`): **`2,997 / 4,629 / 7,442 ns/change`**,
+    `values_walked_per_change = 1.0` (vs `528 µs / 3,603 µs / 17,500–35,158 µs` pre-Wave 8 — **2,350–4,700× faster**).
+  - `sdk_replace` (`h=100/1000/5000`): `1,209 / 1,352 / 1,403 ns/change`, `values_walked_per_change = 1.0`.
+  - Historical `read_version_1_after_overwrites` (`m=10/100/1k/10k`): `1.58 / 1.96 / 3.88 / 10.25 µs`;
+    `read_version_1_after_alternating`: `0.50 / 2.50 / 7.63 / 23.04 µs`.
+- **`load_bench` (`--tree crates`, 4,158 files, 58 MiB, `--clients 100,1000,10000 --rounds 2 --per-connection 32 --idle-works 200 --preload 500 --lagged-submit`, load 71–78):**
+  - **100 clients:** `wall 36.2 ms`, `66,239 replies/s`, `17,766 verdicts/s`, `oracle_failures = 0`.
+  - **1,000 clients:** `wall 947.0 ms`, `65,760 replies/s`, **`23,703 verdicts/s`**, `29,458 rebases/s`, `oracle_failures = 0`.
+  - **10,000 clients:** `wall 19.445 s`, `54,724 replies/s`, **`24,070 verdicts/s`** (`9,117` accepts + `458,943` conflicts
+    = 468,060 verdicts), `merge.submit.longest_step_us = 783 µs`, mean `judge = 6.72 µs`, mean `append = 2.15 µs`,
+    `oracle_failures = 0`, `own_files_failures = 0`, all 14 `lost` counters = `0`, `kern.num_files: 13,871 → 13,866`.
+  - **`lagged_submit` (200 works 11,810 versions behind head):** `p50 83.3 µs`, `p99 126.3 µs`, `max 226.8 µs` (`24` total
+    values walked across all 200 submits).
+- **`edit_merge_bench` (`--quiet-only --files 10,1000,10000,100000 --form accept,identical,conflict,rebase,accept_one`, load 56–70, 0 watchdog kills):**
+  - `f10`: `accept` p50 `40.0`/p99 `66.0 µs`, `identical` `35.3`/`49.4 µs`, `conflict` `32.0`/`59.8 µs`, `rebase` `30.1`/`38.6 µs`, `accept_one` `20.3`/`35.8 µs`.
+  - `f1,000`: `accept` `42.0`/`68.9 µs`, `identical` `36.6`/`44.7 µs`, `conflict` `33.1`/`60.7 µs`, `rebase` `32.3`/`40.9 µs`, `accept_one` `23.4`/`38.9 µs`.
+  - `f10,000`: `accept` `42.8`/`73.9 µs`, `identical` `36.7`/`47.5 µs`, `conflict` `33.3`/`64.8 µs`, `rebase` `32.1`/`54.0 µs`, `accept_one` `32.7`/`53.3 µs`.
+  - **`f100,000`** (previously crashed with watchdog exit 4 before Wave 9): all 5 forms pass 3/3 runs with flat p50 —
+    `accept` p50 `44.2 µs` / p99 `1,046 µs`, `identical` `36.8` / `985 µs`, `conflict` `32.6` / `985 µs`, `rebase`
+    `32.0` / `983 µs`, `accept_one` `26.8` / `548 µs`.
+- **VFS & Provisioning (Wave 9 `e03254380`):** `vfs_bench` `create+unlink` `1,917 → 1,042 ns` (**1.84×**), `rename`
+  `3,750 → 2,125 ns` (**1.76×**), 190k create burst `1,430 → 920 ns/file`, 1M files built in `943 ms` (was `1,470 ms`);
+  `provision_bench` `spinning_1` p99 `49.3 → 45.3 µs` (and `45.9 µs` best / `51.2 µs` median under load 57.8, `own_shard`
+  p50 `6.4 µs` / p99 `31.6 µs`).
+
+### 4. Axis D — Tip-to-Toe Mixed Chaos on ONE Live Daemon & Full Compliance Matrices
+
+- **Mixed Chaos (`$SCRATCH/wreck_it_mixed.py`, 2026-11-25, load 32–44):** ONE daemon serving 2 git + 2 hg + 2 svn repos
+  (seeded in `8.96s`) under **800 simultaneous wire clients** (`200` each on Git HTTP, Hg HTTP, SVN `svn://`, SVN DAV;
+  2,400 ops total, **`err = 0`** across all 4 protocols: Git `145.7 ops/s` / 110.2 MiB, Hg `4,336.1 ops/s` / 48.4 MiB,
+  SVN DAV `5,797.5 ops/s`, SVN wire `9,352.6 ops/s` at p50 `3.08 ms` / p99 `9.14 ms`), PLUS `40/40` concurrent VFS CoW
+  clone+destroy cycles and `40/40` concurrent Merge green/work edit+submit cycles (`1.381s`), PLUS simultaneous real
+  stock `git clone + fsck` (`3.734s`), `hg clone --stream + verify` (`0.457s`), and `svn checkout + log` (`5.208s`,
+  9,636 files). Whole storm finished in **`5.281s`**, **0 daemon restarts**, RSS `37.2 → 546.3 peak → 300.8 MiB` at end,
+  `kern.num_files: 13,910 before → 14,661 peak → 13,981 after teardown`.
+- **VCS Interop Compliance Matrices (`slates-final`, 2026-11-25):** **117 / 117 PASS** (`git-matrix.sh` 27/27 peak RSS
+  71 MiB; `hg-matrix.sh` 24/24 peak RSS 58 MiB; `svn-matrix.sh ROUTE=svn` 33/33; `svn-matrix.sh ROUTE=http` 33/33;
+  `kern.num_files: 13,756 → 13,824`).

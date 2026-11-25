@@ -62544,3 +62544,62 @@ Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/i
 - **Applied in the same change to:** `crates/server/src/live_ship.rs` (`period_volume`, `published_for_image`, the two
   counters, the test and its helpers); §4.10 "An install image beside the log (2026-11-07)"; GAPS (the live-shipped
   fsstress over FUSE); docs/bugs/2026-11-24-a-forgotten-orphan-left-a-live-volume-owing-its-install-image.md.
+
+### A-890 — Close shared-memory FDs after mapping/handoff, multiplex client exit watches, and retire clean client drops immediately (bug, 2026-11-24; §4.3, §4.4, §4.14; commits `1d97b6793`, `56658a5e5`)
+
+- **Why.** High-concurrency client runs (10,000 clients) exhausted host file descriptors (`EMFILE` / system `kern.num_files`
+  pressure) and leaked client seats, attachments, and ring mappings on macOS and Windows until the client process exited.
+  Four causes compounded:
+  1. `SharedObject` retained the backing `shm_open`/`memfd` FD for the full lifetime of every mapped region, doorbell
+     (`Bell`), and completion bridge even after `mmap` and handoff completed (30,000 FDs per 10k clients on Linux; 20,000+
+     on macOS), and Linux `Control::completion` duplicated an extra FD instead of moving ownership.
+  2. Each connected macOS client opened a dedicated `kqueue` FD for `EVFILT_PROC` exit watching (10,000 FDs per 10k
+     clients), macOS `Liveness` opened another `kqueue` FD per client, and Windows opened a separate process handle per
+     client even when multiplexed within one PID.
+  3. `ClientEnd::drop` gave macOS and Windows daemons no signal on clean disconnect (unlike Linux abstract-socket EOF),
+     so dropped in-process clients kept seats, attachments, and mappings pinned until process exit.
+  4. Dropping a `Ready` interest in `slates-rt` before `KqueueDriver::wait` left stale `EV_ADD` entries in the pending
+     changeliest, risking `EBADF` completions or fd-reuse misrouting.
+- **The rule.**
+  1. `SharedObject::release_fd` closes the backing descriptor once mapped and handed off (`try_as_fd` returns `Option`;
+     every caller including `slates-bridge-virtiofs` uses `try_as_fd`); Linux `Control::completion` moves its FD.
+  2. macOS multiplexes all client `EVFILT_PROC` exit watches on one shard-local `ExitMux` kqueue (1 FD/shard regardless
+     of client count), Windows deduplicates `WatchedPid` handles by PID, and macOS `Liveness` checks daemon liveness via
+     descriptor-free `ProcessStamp` (`proc_pidinfo`, verifying `!SZOMB`).
+  3. `ClientEnd::drop` sets a `Release` `client_closed` flag in shared memory and rings the daemon doorbell so macOS and
+     Windows shards immediately reap disconnected seats, attachments, and mappings on the next serve turn.
+  4. `Driver::forget_readiness` prunes pending `EV_ADD` changes before `kevent` executes (`kqueue`, `epoll`, `iocp` trait
+     method paired across platforms).
+- **Evidence.** Red-first test in `crates/client/tests/reap.rs` (64 live macOS clients dropped in-process: 320 FDs → ≤88
+  live, 0 seats/attachments/FDs leaked on drop); full workspace `clippy --all-targets -D warnings`, `xtask check`
+  (`slates-ipc` unsafe 177 → 176), Linux & Windows cross-target clippy on `slates-rt`/`slates-mem`, and Meta-scale runs
+  (40,000+ TCP sockets + 10,000 agentic IPC clients + 117/117 compliance rows: `kern.num_files` delta ~0).
+- **Applied in the same change to:** `crates/mem/src/shared.rs`, `crates/ipc/src/{completion,endpoint,exit_watch,mach_claim,region,rendezvous}.rs`,
+  `crates/rt/src/{driver,interest,kqueue,shard}.rs`, `crates/server/src/{daemon,hangup,reap,state,verbs}.rs`,
+  `crates/bridge-virtiofs/{src/dax.rs,tests/common/mod.rs,tests/device.rs}`, `crates/client/tests/reap.rs`, GAPS, BENCHMARKS.
+
+### A-891 — Meta-scale engine, VFS, runtime, and VCS data-structure compaction and algorithmic fast paths (2026-11-24; §4.2, §4.3, §4.5, §4.16, §4.17; commits `5e4fcc9fb`, `aa3f7a981`, `bd9712925`, `5e5eef2c0`, `e03254380`, `b42ff020a`)
+
+- **Runtime, memory & VCS acceptors (Wave 7 `5e4fcc9fb`):** lazy 1-segment task arena reservation in `slates-rt`, sparse
+  `UnitSet::whole` in `slates-mem`, virgin-segment freshness propagation through `WriteLog`/`Journal` (eliminating virgin
+  recovery give-back), cross-platform shared TCP acceptors (Linux `SO_REUSEPORT`, macOS/Windows `try_clone`) across VCS
+  HTTP/SSH/SVN, async `StoreHandle` read waiters sized from `vcs_connections_per_shard * shards` (replacing the 1-at-a-time
+  Hg fetch lock), and position-native parents-first tree-diff `IndexedWalk` in `slates-git`.
+- **Merge & conflict engine (Waves 8.1/8.2A/8.2B `aa3f7a981`, `bd9712925`, `5e5eef2c0`):** exact whole-replacement shape
+  detection eliminating false refining storms (`refine::whole_replaced_shapes`, `work_home::prepare_sealed`); O(edit_size)
+  `Green::rebase_establishing_parts` avoiding head copies; uniquely-owned O(1) in-place layered overwrite (`Ptrie::is_unique_path`,
+  `Blocks::bytes_mut_unique`, lazy `Slot::digest`, `history::overlay_inplace`); `PathDeltas`/`OverwriteIndex`,
+  `emitted_matches_head`, deferred `carried_increment`, Fast/Merge `Outbox` split; compact `Ptrie` (`u32 Slot`, 24B inline
+  `CompactLabel`/`CompactChildren`), consolidated `Engine::path_versions`, and A-818 piece 2b `PieceTrees`+`BytePlaces`
+  wired into `history::Chunks`/`Value` alongside O(1) layered overwrites.
+- **VFS, IPC & large-submit slicing (Wave 9 `e03254380`):** persistent `LeafCursor` for monotonic inode installs, single-pass
+  `trie::remove`, O(1) room checks, single-descent `DirNode::place`, zero-alloc `DirIter`, stack-buffered `path_of`,
+  single-read/stream-hash/zero-copy-inline base copy-up; `DaemonEnd::has_pending` + reusable `ShardState::serve_scratch`;
+  zero-clone `work_home::prepare_live` and cooperative multi-turn `refining::prepare` slicing for large (`> CARRIED_INCREMENT_MAX`)
+  local and off-owner submits.
+- **VCS hot paths & SVN RSS compaction (Wave 10 `b42ff020a`):** sequential LSM scanners (`HgIndex::scan_*_from`), compact
+  `IndexMeta` + lazy `FirstBase` + batched `Stage::Counting` in `slates-hg` stream, single-lookup `append_revisions_at` in
+  `slates-hg` push; `slates-svn` 32-bit `NodeRevisionId(u32)`, inline-first `CompactEntries<T>`, and 88B `Row` with flat
+  `texts`/`prop_lists`/`copy_sources` side tables (2.48× lower live index heap); zero-fill-free `decompress_vec` inflate in
+  `slates-git` while preserving exact `LongerThanSize`-before-`Inflate` refusal precedence.
+- **Applied in the same change to:** `crates/{rt,mem,anchor,store,merge,vfs,ipc,server,git,hg,svn,client}/`, BENCHMARKS, GAPS.

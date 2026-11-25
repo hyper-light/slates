@@ -1722,11 +1722,13 @@
 > - (d) FIXED by A-813. A materialization secures its history and change index before it commits, as a submit's
 >   admission does, and is refused `BudgetExceeded` past the room, counted `merge.green.materialize_over_room`
 >   (`a_materialization_past_the_greens_retention_room_is_refused_before_it_commits`).
-> - A-818 (A-803 (c)) pieces 1 and 2a landed (`crate::piece_tree`, `crate::byte_places`). Piece 2b, the engine switch
->   with the re-anchor deleted, is on the branch `agents/w-rewrite-ops-a818-2b` (c4278fd3c) and NOT landed: its A/B
->   (BENCHMARKS, 2026-11-21) wins writes (35.2 ms against 9.0 µs a change at 10k, alternating) but loses old reads 2 to
->   9 times and memory a version 7 to 8 times on overwrite streams (path copying's O(log n) nodes against A-809's one
->   layer). Paused by goal 93's focus; reopening needs O(1) space a change, not only a bounded compaction.
+> - A-818 (A-803 (c)) pieces 1, 2a, and **2b** LANDED (`5e5eef2c0`, Wave 8.2B, 2026-11-24). Piece 2b (`PieceTrees` +
+>   `BytePlaces`) is wired into `history::Chunks`/`Value` alongside A-809's layered/in-place overwrite fast path (Wave
+>   8.1 `aa3f7a981`), compact `Ptrie` (`u32 Slot`, 24B inline `CompactLabel`/`CompactChildren`), and consolidated
+>   `Engine::path_versions`, preserving O(1) space per overwrite without the earlier rejected branch's 7–8× overwrite
+>   memory regression. Measured (`history_layers_bench`, release `56658a5e5`): `overwrites` at `h=5,000` is `1,377 ns/change`,
+>   `overwrite_insert_alternating` at `h=5,000` dropped from `17.5–35.2 ms` to **`7.44 µs/change`** (`values_walked = 1.0`),
+>   and `verdict_bench` `accept` at 75,400 paths × 1 MiB is `1.13 µs` (**423× faster** than pre-Wave 8.1's `476.5 µs`).
 > - A-816 (main's 07:30 ruling): a held verdict's preview lives across turns until the one step (`made_commit::
 >   hold_preview`, `with_held_preview`), for git's made commit's sliced map build; counted
 >   `vcs.made.preview_held_across_turns`. git's made commit over it is w-git's C5 2b piece 3, BUILT (A-824).
@@ -1771,10 +1773,10 @@
 >   such a pair is an overwrite, checked byte for byte as any is. Now 3.1, 4.3 and 10.4 µs, one value. Red:
 >   `a_same_length_replacement_walks_one_value_however_long_its_history`, 300 values, now 1. The oracle generates such
 >   replacements now.
-> - (b) OPEN, measured: a path alternating overwrites and inserts re-anchors in full at each insert. That is A-793's
->   cost, unchanged by A-809: 0.53, 3.6 and 17.5 ms a change at history 100, 1,000 and 5,000 (101, 551 and 2,551
->   values). The fix is layers that carry an offset shift, so an insert or a delete moves no earlier value. It is
->   queued (main, 04:36): w-rewrite-ops' next piece after stage C, red on the values walked per insert.
+> - (b) **CLOSED (Wave 8.2B `5e5eef2c0`, 2026-11-24):** `PieceTrees` + `BytePlaces` (A-818 piece 2b) wired into
+>   `history::Chunks`/`Value` alongside A-809's O(1) layered overwrites: `overwrite_insert_alternating` at `h=100, 1,000,
+>   5,000` dropped from `0.53, 3.6, 17.5 ms` (`101, 551, 2,551` values) to **`3.00, 4.63, 7.44 µs/change`**,
+>   `values_walked_per_change = 1.0` (`BENCHMARKS`, 2026-11-25).
 > - OPEN, measured, queued after (b) (main, 04:36): a change that walks one value still grows with its path's history.
 >   Over history 100, 1,000 and 5,000 the cost a change was:
 >
@@ -26604,13 +26606,18 @@ three runs of three on the merge 287055d5b: 41-42 MiB before the burst, 1,341-1,
 256 MiB burst (bound: under a quarter of the burst). The same with the wait's original 250 ms sleep as with a yield, so
 the wait is not the cause. Not chased.
 
-### 2026-11-20: one submit of a 1 GiB or 100,000-file changeset holds its shard past the liveness window — open (w-work-cow's finding, not worked: Ada's close order)
+### 2026-11-20: one submit of a 1 GiB or 100,000-file changeset holds its shard past the liveness window — 100,000-file submit CLOSED (Wave 9 `e03254380`, 2026-11-24); 1 GiB landing-side slicing still open
 A seed work holding a whole 1 GiB green (1,000 files of 1 MiB) or a 32 MiB green of 100,000 files, submitted at once,
 spun shard 0 for 1,097 ms of CPU without a step against its 1,025 ms window; with no anchor the watchdog ended the
 daemon (exit 4: "shard 0 is spinning ... in task spawned at crates/server/src/identities.rs:243"). Release, Mac Studio
 32 cores, main 283d646b7, `tests/work_cow.rs` with `SLATES_WORK_COW_FILES=1000 SLATES_WORK_COW_FILE_BYTES=1073741`
-before its seed was split. An initial clone or import is one changeset (the storage ruling), so its submit and
-landing need slicing under the shard's step budget. P2's grid seeds in parts of at most 16 MiB and 5,000 files.
+before its seed was split.
+- **Closed for large submits (Wave 9 `e03254380`, 2026-11-24):** `work_home::prepare_live` no longer deep-clones
+  `w.files` / `w.journal` (nor `sealed.composed` in `build_increment`), and `refining::prepare` now cooperatively slices
+  large (`> CARRIED_INCREMENT_MAX`) local and off-owner submits across shard turns under the step quantum. Verified:
+  `edit_merge_bench --quiet-only --files 100000` now completes 3/3 runs across all 5 forms (`accept`, `identical`,
+  `conflict`, `rebase`, `accept_one`) with 0 watchdog kills and flat p50 (`26.8–44.2 µs`).
+- **Remaining:** landing-side slicing for a single 1 GiB seed changeset if landed in one turn.
 
 ### 2026-11-20: the Codex agent's Green/Work and atomic-conflict branches against main — recorded (w-work-cow; main's order, the unowned UI goal)
 The Codex agent (Codex 01a1bdab, "Kiln vs T3code Features") left 476 slates branches on adacachy (~/Projects/slates: work/slates-*,
@@ -26804,3 +26811,38 @@ timeouts of about three times their slowest measured pass (6, 52 and 15 minutes;
 stall fails the lane in bounded time rather than holding main's CI group: the stall sat 3 h 49 min in main run
 45251228315, and every main run behind it waited and was replaced unrun. Not run on a Mac first: this MacBook was at
 load 87 to 145, kiln's Studios refused the tree's sync, and adacachy2 has no Miri component.
+
+### 2026-11-24: per-client FD exhaustion and clean-disconnect seat/FD leak on macOS, Linux, and Windows — CLOSED (A-890; `1d97b6793`, `56658a5e5`)
+Under 10,000-client concurrency runs, the daemon and clients exhausted host file descriptors (`EMFILE` / `kern.num_files`)
+and leaked seats, attachments, and ring mappings on macOS and Windows when in-process clients dropped without process
+exit.
+- **Root causes fixed:**
+  1. `SharedObject` kept its backing `shm_open`/`memfd` FD open for the entire lifetime of every mapped region, doorbell
+     (`Bell`), and completion bridge (30,000 FDs / 10k clients on Linux; 20,000+ on macOS), and Linux `Control::completion`
+     duplicated an extra FD instead of moving it. Fixed by closing the FD after `mmap` + handoff (`SharedObject::release_fd`
+     and `try_as_fd` across all callers including `slates-bridge-virtiofs`).
+  2. macOS opened one `kqueue` FD per client for `EVFILT_PROC` exit watching and another in `Liveness`; Windows opened one
+     process handle per client. Fixed via shard-local 1-FD `ExitMux` on macOS, PID-deduplicated `WatchedPid` handles on
+     Windows, and descriptor-free `ProcessStamp` (`proc_pidinfo`, verifying `!SZOMB`) in macOS `Liveness`.
+  3. `ClientEnd::drop` gave macOS/Windows daemons no disconnect signal until process exit. Fixed via a `Release`
+     `client_closed` shared-memory word + daemon doorbell wake, immediately reaping disconnected seats/attachments/mappings.
+  4. Dropping a `Ready` interest in `slates-rt` before `KqueueDriver::wait` left stale `EV_ADD` entries in the pending
+     changelist. Fixed via `Driver::forget_readiness` across kqueue/epoll/iocp.
+- **Verification:** red-first test in `crates/client/tests/reap.rs` (64 live macOS clients: `320 → ≤88` FDs, 0 leaked
+  seats/attachments/FDs on drop); `kern.num_files` delta ~0 across 40,000+ TCP sockets (Axis A1), 10,000 agentic IPC
+  clients (Axis B), 800-client mixed chaos (Axis D), and 117/117 compliance rows.
+
+### 2026-11-24: Meta-scale tip-to-toe optimization waves (Waves 7–10: `5e4fcc9fb`..`b42ff020a`, A-891) — recorded, remaining structural ceilings noted
+All four subsystem waves (Wave 7 runtime/memory/VCS acceptors, Wave 8.1/8.2A/8.2B merge & conflict engine, Wave 9
+VFS/IPC/large-submit slicing, Wave 10 Hg/SVN/Git hot paths & SVN 2.48× index heap compaction) landed with 117/117 VCS
+compliance matrices green, 0 oracle/lost failures at 10,000 agentic clients (`24,070 verdicts/s`), and full
+interleaved head-to-head stock results recorded in `BENCHMARKS.md`.
+- **Measured structural ceilings remaining (honest record, not hidden):**
+  - Initial full push of `git/git` (86,386 commits, 424,984 objects): `42.5s` vs stock `9.5s` (~75% of active CPU is
+    mandatory single-shard pure-Rust SHA-1DC collision checking via `sha1-checked` + ~12% BLAKE3 content hashing, whereas
+    stock `git index-pack` runs C SHA-1DC across all 18 cores).
+  - Initial full push of `hg-src` (57,036 changesets): `48.3s` vs stock `9.7s` (BLAKE3 content hashing + manifest delta
+    encoding + Mantle disk persistence in `slates-store`).
+  - Single-host 10,000-socket simultaneous loopback blasts on macOS encounter host kernel `kern.ipc.somaxconn=128` SYN
+    queue drops (`ETIMEDOUT`) and loopback mbuf exhaustion (`ENOBUFS`); slates survives with 0 crashes/restarts and
+    bounded RSS (`246.6 MiB` peak on `git-http N=10,000`).
