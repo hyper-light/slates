@@ -1,4 +1,7 @@
 name: diag-main-lint
+# Run 47 (main 01a20182, 2026-11-25 07:12 PST): main at b6c865a57+, w-hg's lint 46 fixes (taken_landing_after split,
+# the saved-texts type, the stand-in's refusal, the chunker test's casts) with the read-path cut (21f7f7743), A-919
+# (90cabe801), w-perf's arena fixes (2e85f9d61, 2a4cf8846, b4aa00ef8) and w-git's unit kinds (8d316c0c1).
 # Run 46 (main 01a20182, 2026-11-25 05:47 PST): main at ae4557eba, main's lint fix 85d220c50 for run 45's four sites and the
 # five more clippy found locally (staging land/land_tail, push apply_slice, hg_clone_store_wait's allows, fleet's two),
 # with A-919's and w-svn's landings since.
