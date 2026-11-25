@@ -63726,6 +63726,22 @@ GAPS.
 - **Evidence.** `git_push::tests::a916_a_fetch_derived_between_two_pushes_leaves_the_store_its_records_make_again`: red
   on main (the oracle differing), green with the write gone.
 
+### Deriving a push's versions behind it: built, withdrawn (2026-11-25, w-git for main 01a20182; status)
+
+- **Built** (750d2bca3): `git_derive::derive_behind`, a task of the shard turning `derive_for_read` as a git push ended,
+  so the first fetch after it found its versions derived (git/git's first clone had spent 12.15 s of its 40.34 s first
+  pack byte deriving the 1,027 versions its push left unknown, `vcs_store.git_derive.ns`).
+- **Withdrawn** (main 01a20182's ruling, the revert after it): two failures. (1) A clone arriving mid-derivation ran the
+  shared derivation in slivers: the task behind and the fetch's own `derive_for_read` both runnable, `paced` stops a
+  turn where someone else waits, so each yielded to the other at every unit (main's git leg: 721,260 turns and 22.69 s
+  for 877 versions, against 338 turns and 12.15 s for 1,027 with nothing behind; the first pack byte 40.3 → 61.9 s).
+  (2) `vcs_http::daemon_edge::tests::a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding` failed under
+  ThreadSanitizer (diag 9, run 45595905963): a listing after the push waited behind the derivation.
+- **Owed before it returns:** a fetch arriving while the derivation behind is under way reaches its first pack byte no
+  later than one with nothing behind (held by turns and nanoseconds); and a ref listing after a push waits for no
+  derivation, held under slow scheduling (the wait may borrow `test_lane::slowdown`, a bet on speed, not the rule). A
+  start on the first: the reader marks the repository read-driven and the task behind stops before its next turn
+  (`agents/w-git-derive-behind-2`, 014f477de, not landed).
 
 ### A-917 — A recorded version is applied a slice at a time, and `apply_recorded` is that run carried to its end (2026-11-25, w-svn for main 01a20182, goal 93's slicing piece 3; §4.16, A-760, A-910)
 
