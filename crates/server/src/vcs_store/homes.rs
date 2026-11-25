@@ -686,11 +686,12 @@ pub(crate) fn take_cut_counts() -> slates_vcs::preimage::PreimageCounts {
 }
 
 /// [`region_held_in`] as at the cut (F2): the holds now with their pre-images laid over them, read until their bytes
-/// (an identity and its owners) pass `cap`; where the read stopped short of the range, the coordinate it stopped at.
+/// (each `head`, an identity and its owners) pass `cap`; where the read stopped short of the range, the coordinate it
+/// stopped at. `head` as `slates_vcs::ContentStore::lists_at_cut`'s: what a page spends on an entry beyond its bytes.
 /// None read where a map is borrowed.
 pub(crate) fn region_held_at_cut(
   (lo, hi): (u64, u64),
-  cap: usize,
+  (cap, head): (usize, usize),
 ) -> (Vec<(ContentId, Vec<HomeOwner>)>, Option<u64>) {
   REGION_HELD.with(|held| {
     CUT_REGION.with(|cut| {
@@ -704,11 +705,13 @@ pub(crate) fn region_held_at_cut(
         (lo, hi),
         now,
         (cap, &|_, owners: &Vec<HomeOwner>| {
-          slates_vcs::content::IDENTITY_BYTES.saturating_add(
-            owners
-              .len()
-              .saturating_mul(core::mem::size_of::<HomeOwner>()),
-          )
+          head
+            .saturating_add(slates_vcs::content::IDENTITY_BYTES)
+            .saturating_add(
+              owners
+                .len()
+                .saturating_mul(core::mem::size_of::<HomeOwner>()),
+            )
         }),
       )
     })
@@ -718,7 +721,7 @@ pub(crate) fn region_held_at_cut(
 /// [`landed_in`] as at the cut (F2), read until their bytes pass `cap`, as [`region_held_at_cut`].
 pub(crate) fn landed_at_cut(
   (lo, hi): (u64, u64),
-  cap: usize,
+  (cap, head): (usize, usize),
 ) -> (Vec<(ContentId, Landed)>, Option<u64>) {
   LANDED.with(|landed| {
     CUT_LANDED.with(|cut| {
@@ -732,7 +735,9 @@ pub(crate) fn landed_at_cut(
         (lo, hi),
         now,
         (cap, &|_, landed: &Landed| {
-          slates_vcs::content::IDENTITY_BYTES.saturating_add(landed.image_bytes())
+          head
+            .saturating_add(slates_vcs::content::IDENTITY_BYTES)
+            .saturating_add(landed.image_bytes())
         }),
       )
     })

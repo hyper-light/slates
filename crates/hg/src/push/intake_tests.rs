@@ -2482,7 +2482,7 @@ fn a_manifest_chain_read_in_ranges_is_its_text() {
   let mut longest_chain = 0usize;
   for rev in 0..fork.len(&store, Log::Manifest) {
     let text = fork.revision_text(&store, Log::Manifest, rev).unwrap();
-    let chain = Chain::of(&fork, &store, rev).unwrap();
+    let chain = Chain::of(&fork, &store, rev, Default::default()).unwrap();
     assert_eq!(chain.len(), to_u64(text.len()));
     longest_chain = longest_chain.max(usize::from(chain.held() > 0));
     for piece in [1usize, 7, 64] {

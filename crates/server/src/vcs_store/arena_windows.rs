@@ -456,20 +456,23 @@ impl ChunkWindows {
   }
 
   /// [`ChunkWindows::pieces_in`] as at the cut: the pieces now with their pre-images laid over them (F2), read until
-  /// their bytes pass `cap`; where the read stopped short of the range, the handle it stopped at.
+  /// their bytes (each `head` and its piece's) pass `cap`; where the read stopped short of the range, the handle it
+  /// stopped at. `head` as `slates_vcs::ContentStore::lists_at_cut`'s: what a page spends on an entry beyond its bytes.
   pub(crate) fn pieces_at_cut(
     &self,
     (lo, hi): (u64, u64),
-    cap: usize,
+    (cap, head): (usize, usize),
   ) -> (Vec<(u64, Vec<u8>)>, Option<u64>) {
     let now = self
       .held
       .range(StoredWindow(lo)..=StoredWindow(hi))
       .filter(|(_, kept)| kept.named)
       .map(|(window, kept)| (window.0, piece_of(kept, self.placed_of(kept))));
-    self
-      .cut
-      .overlay_within((lo, hi), now, (cap, &|_, piece: &Vec<u8>| piece.len()))
+    self.cut.overlay_within(
+      (lo, hi),
+      now,
+      (cap, &|_, piece: &Vec<u8>| head.saturating_add(piece.len())),
+    )
   }
 
   /// The slabs' census (goal 93): chunks the windows lie in, and the windows let go from slabs still held.

@@ -303,6 +303,8 @@ enum Kept {
   Away {
     /// The window's length.
     len: usize,
+    /// Its let-go number ([`AwayAt::number`]), the Aways family's coordinate (A-923).
+    number: u64,
   },
 }
 
@@ -404,7 +406,7 @@ impl Held {
   fn len(&self) -> usize {
     match &self.kept {
       Kept::Here(bytes) => bytes.len(),
-      Kept::Stored { len, .. } | Kept::Away { len } => *len,
+      Kept::Stored { len, .. } | Kept::Away { len, .. } => *len,
     }
   }
 }
@@ -448,6 +450,23 @@ pub enum CutFamily {
   Aways,
 }
 
+/// A window let go, as the shard image's Aways family pages it (A-923; goal 93, main's churn ruling (b) of 2026-11-25):
+/// its let-go number, then its identity. Each let-go takes the store's next number, never reused, so a push's let-gos
+/// lie together at the family's tail: keyed by identity, a hash, they lay one a page, and every publication re-read and
+/// re-encoded each page a let-go or a bring-back touched (at 57k, about 4.3 GB of a push's 26.55 GB of system
+/// allocations). The image carries the number, so a restart keeps each away where its page has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AwayAt {
+  /// The let-go number: the Aways family's coordinate.
+  pub number: u64,
+  /// The window's identity.
+  pub identity: ContentId,
+}
+
+/// Format: an away's bytes in the shard image's Aways family (A-923): its identity, then its length and its let-go
+/// number, each a `u64`.
+pub const AWAY_BYTES: usize = IDENTITY_BYTES + 2 * size_of::<u64>();
+
 /// The content store's pre-images of an image cut, a family each ([`crate::preimage`]).
 #[derive(Debug, Default)]
 struct CutPreimages {
@@ -456,7 +475,7 @@ struct CutPreimages {
   /// The names' roots at the cut.
   names: Preimages<ContentId, ContentId>,
   /// The windows let go at the cut, by length.
-  aways: Preimages<ContentId, u64>,
+  aways: Preimages<AwayAt, u64>,
 }
 
 /// The content store (module docs).
@@ -472,9 +491,14 @@ pub struct ContentStore {
   lists_changed: BTreeSet<ContentId>,
   /// The objects named or unnamed since its owner last took the changes (A-727 slice a3b).
   names_changed: BTreeSet<ContentId>,
-  /// The windows let go, brought back or freed away since its owner last took the changes (A-767 C1 step 2b): the
-  /// shard image carries every window let go, so a restart keeps it as let go, never as absent.
-  away_changed: BTreeSet<ContentId>,
+  /// The let-go numbers of the windows let go, brought back or freed away since its owner last took the changes (A-767
+  /// C1 step 2b; A-923): the shard image carries every window let go, so a restart keeps it as let go, never as absent,
+  /// and the pages these numbers lie in are those it re-encodes.
+  away_changed: BTreeSet<u64>,
+  /// The windows let go, by let-go number (A-923): the Aways family in its coordinates' order.
+  aways_by_number: BTreeMap<u64, ContentId>,
+  /// The next let-go number (A-923): one past every number taken, restored ones included.
+  next_away: u64,
   /// The image cut's pre-images of the lists, names and windows let go (A-870 piece 2, F2; [`crate::preimage`]): each
   /// entry's value at the cut, kept before it changes in a page the cut has not yet encoded.
   cut: CutPreimages,
@@ -686,6 +710,8 @@ impl ContentStore {
       lists_changed: BTreeSet::new(),
       names_changed: BTreeSet::new(),
       away_changed: BTreeSet::new(),
+      aways_by_number: BTreeMap::new(),
+      next_away: 0,
       cut: CutPreimages::default(),
       storage: Box::new(HeapWindows::default()),
       window,
@@ -1280,8 +1306,8 @@ impl ContentStore {
     if list {
       self.before_list_change(*identity);
     }
-    if away {
-      self.before_away_change(*identity);
+    if away && let Some(at) = self.away_at(identity) {
+      self.before_away_change(at);
     }
     if let Some(named) = self.rooted.get(identity).copied() {
       self.before_name_change(named);
@@ -1289,8 +1315,9 @@ impl ContentStore {
     let Some(freed) = self.entries.remove(identity) else {
       return Err(ContentRefused::NotHeld);
     };
-    if matches!(freed.kept, Kept::Away { .. }) {
-      self.away_changed.insert(*identity);
+    if let Kept::Away { number, .. } = freed.kept {
+      self.aways_by_number.remove(&number);
+      self.away_changed.insert(number);
     }
     // A freed root takes its object's name with it (module docs, "The identity rule").
     if let Some(named) = self.rooted.remove(identity) {
@@ -1549,11 +1576,20 @@ impl ContentStore {
 
   /// Marks the window `identity` (kept as `window`, `len` bytes) let go, its storage given back: the bytes freed.
   fn released_away(&mut self, identity: ContentId, window: StoredWindow, len: usize) -> u64 {
-    self.before_away_change(identity);
+    let at = AwayAt {
+      number: self.next_away,
+      identity,
+    };
+    self.before_away_change(at);
     if let Some(held) = self.entries.get_mut(&identity) {
-      held.kept = Kept::Away { len };
+      held.kept = Kept::Away {
+        len,
+        number: at.number,
+      };
+      self.next_away = self.next_away.saturating_add(1);
+      self.aways_by_number.insert(at.number, identity);
+      self.away_changed.insert(at.number);
     }
-    self.away_changed.insert(identity);
     self.storage.release(window);
     let freed = u64::try_from(len).unwrap_or(u64::MAX);
     self.content_bytes = self.content_bytes.saturating_sub(freed);
@@ -1569,8 +1605,8 @@ impl ContentStore {
   /// refusal past it, as a put's.
   pub fn bring_back(&mut self, identity: &ContentId, bytes: &[u8]) -> Result<(), ContentRefused> {
     let identity = self.resolve(identity);
-    let len = match self.entries.get(&identity).map(|held| &held.kept) {
-      Some(Kept::Away { len }) => *len,
+    let (len, number) = match self.entries.get(&identity).map(|held| &held.kept) {
+      Some(Kept::Away { len, number }) => (*len, *number),
       _ => return Err(ContentRefused::NotHeld),
     };
     if bytes.len() != len || ContentId::named(Form::Window, bytes) != identity {
@@ -1580,11 +1616,12 @@ impl ContentStore {
     self.admit(need, 0)?;
     let window = self.storage.put(bytes)?;
     self.storage.named(window, &identity);
-    self.before_away_change(identity);
+    self.before_away_change(AwayAt { number, identity });
     if let Some(held) = self.entries.get_mut(&identity) {
       held.kept = Kept::Stored { window, len };
     }
-    self.away_changed.insert(identity);
+    self.aways_by_number.remove(&number);
+    self.away_changed.insert(number);
     self.content_bytes = self.content_bytes.saturating_add(need);
     self.counters.brought_back = self.counters.brought_back.saturating_add(1);
     Ok(())
@@ -1781,15 +1818,29 @@ impl ContentStore {
       .map(|(identity, root)| (*identity, *root))
   }
 
-  /// [`ContentStore::aways`] whose identities' first eight bytes lie in `lo..=hi` (A-870).
-  pub fn aways_in(&self, lo: u64, hi: u64) -> impl Iterator<Item = (ContentId, u64)> + '_ {
+  /// [`ContentStore::aways`] whose let-go numbers lie in `lo..=hi` (A-870; A-923), in their order.
+  pub fn aways_in(&self, lo: u64, hi: u64) -> impl Iterator<Item = (AwayAt, u64)> + '_ {
     self
-      .entries
-      .range(Self::identities_in(lo, hi))
-      .filter_map(|(identity, held)| match held.kept {
-        Kept::Away { len } => Some((*identity, u64::try_from(len).unwrap_or(u64::MAX))),
-        _ => None,
+      .aways_by_number
+      .range(lo..=hi)
+      .filter_map(|(number, identity)| {
+        let at = AwayAt {
+          number: *number,
+          identity: *identity,
+        };
+        Some((at, self.away_now(&at)?))
       })
+  }
+
+  /// The window `identity` let go, as the Aways family keys it ([`AwayAt`]): none where it is not let go.
+  fn away_at(&self, identity: &ContentId) -> Option<AwayAt> {
+    match self.entries.get(identity).map(|held| &held.kept) {
+      Some(Kept::Away { number, .. }) => Some(AwayAt {
+        number: *number,
+        identity: *identity,
+      }),
+      _ => None,
+    }
   }
 
   /// The list `identity` as [`ContentStore::lists_in`] reads it, its bytes copied: none where it is no list kept here.
@@ -1802,10 +1853,13 @@ impl ContentStore {
       .map(Box::from)
   }
 
-  /// The window `identity` let go, as [`ContentStore::aways_in`] reads it: its length, none where it is not let go.
-  fn away_now(&self, identity: &ContentId) -> Option<u64> {
-    match self.entries.get(identity).map(|held| &held.kept) {
-      Some(Kept::Away { len }) => Some(u64::try_from(*len).unwrap_or(u64::MAX)),
+  /// The window `at` names let go at its number, as [`ContentStore::aways_in`] reads it: its length, none where it is
+  /// not let go or was let go at another number.
+  fn away_now(&self, at: &AwayAt) -> Option<u64> {
+    match self.entries.get(&at.identity).map(|held| &held.kept) {
+      Some(Kept::Away { len, number }) if *number == at.number => {
+        Some(u64::try_from(*len).unwrap_or(u64::MAX))
+      }
       _ => None,
     }
   }
@@ -1822,14 +1876,14 @@ impl ContentStore {
     self.cut.names.before(identity, || now, |_| IDENTITY_BYTES);
   }
 
-  /// Before the window `identity` is let go, brought back or freed: whether it was let go at the cut, and its length,
-  /// kept where its page is frozen (F2).
-  fn before_away_change(&mut self, identity: ContentId) {
-    let now = self.away_now(&identity);
+  /// Before the window `at` names is let go at its number, brought back or freed: whether it was let go there at the
+  /// cut, and its length, kept where its page is frozen (F2).
+  fn before_away_change(&mut self, at: AwayAt) {
+    let now = self.away_now(&at);
     self
       .cut
       .aways
-      .before(identity, || now, |_| core::mem::size_of::<u64>());
+      .before(at, || now, |_| core::mem::size_of::<u64>());
   }
 
   /// Freezes `family`'s coordinates `lo..=hi`, a page of the shard image's cut (A-870 piece 2, F2): an entry there
@@ -1873,41 +1927,51 @@ impl ContentStore {
   }
 
   /// [`ContentStore::lists_in`] as at the cut: the lists now with their pre-images laid over them (F2), read until
-  /// their bytes (an identity and the list's) pass `cap`; where the read stopped short of the range, the coordinate it
-  /// stopped at (`crate::preimage::Preimages::overlay_within`).
-  pub fn lists_at_cut(&self, (lo, hi): (u64, u64), cap: usize) -> CutLists {
+  /// their bytes (each `head`, an identity and the list's) pass `cap`; where the read stopped short of the range, the
+  /// coordinate it stopped at (`crate::preimage::Preimages::overlay_within`). `head` is what the page an entry is
+  /// encoded into spends on it beyond its bytes: a read that left it out held more than its cap, 1.9 times it for the
+  /// windows let go (A-923, main's ruling of 2026-11-25: a broken bound).
+  pub fn lists_at_cut(&self, (lo, hi): (u64, u64), (cap, head): (usize, usize)) -> CutLists {
     self.cut.lists.overlay_within(
       (lo, hi),
       self
         .lists_in(lo, hi)
         .map(|(identity, bytes)| (identity, Box::from(bytes))),
-      (cap, &|_, bytes| IDENTITY_BYTES.saturating_add(bytes.len())),
+      (cap, &|_, bytes| {
+        head
+          .saturating_add(IDENTITY_BYTES)
+          .saturating_add(bytes.len())
+      }),
     )
   }
 
-  /// [`ContentStore::names_in`] as at the cut (F2), read until their bytes (two identities each) pass `cap`.
+  /// [`ContentStore::names_in`] as at the cut (F2), read until their bytes (each `head` and two identities) pass `cap`
+  /// (`head` as [`ContentStore::lists_at_cut`]'s).
   pub fn names_at_cut(
     &self,
     (lo, hi): (u64, u64),
-    cap: usize,
+    (cap, head): (usize, usize),
   ) -> (Vec<(ContentId, ContentId)>, Option<u64>) {
     self.cut.names.overlay_within(
       (lo, hi),
       self.names_in(lo, hi),
-      (cap, &|_, _| IDENTITY_BYTES.saturating_mul(2)),
+      (cap, &|_, _| {
+        head.saturating_add(IDENTITY_BYTES.saturating_mul(2))
+      }),
     )
   }
 
-  /// [`ContentStore::aways_in`] as at the cut (F2), read until their bytes (an identity and a length each) pass `cap`.
+  /// [`ContentStore::aways_in`] as at the cut (F2), read until their bytes (each `head` and [`AWAY_BYTES`]) pass `cap`
+  /// (`head` as [`ContentStore::lists_at_cut`]'s).
   pub fn aways_at_cut(
     &self,
     (lo, hi): (u64, u64),
-    cap: usize,
-  ) -> (Vec<(ContentId, u64)>, Option<u64>) {
+    (cap, head): (usize, usize),
+  ) -> (Vec<(AwayAt, u64)>, Option<u64>) {
     self.cut.aways.overlay_within(
       (lo, hi),
       self.aways_in(lo, hi),
-      (cap, &|_, _| IDENTITY_BYTES.saturating_add(size_of::<u64>())),
+      (cap, &|_, _| head.saturating_add(AWAY_BYTES)),
     )
   }
 
@@ -1961,51 +2025,41 @@ impl ContentStore {
 
   /// Every window let go ([`ContentStore::let_go`]) and not brought back, with its length: what a shard image carries
   /// whole, so a restart keeps each as let go (A-767 C1 step 2b, main's ruling (a) of 2026-11-22 02:52).
-  pub fn aways(&self) -> impl Iterator<Item = (ContentId, u64)> + '_ {
-    self
-      .entries
-      .iter()
-      .filter_map(|(identity, held)| match held.kept {
-        Kept::Away { len } => Some((*identity, u64::try_from(len).unwrap_or(u64::MAX))),
-        _ => None,
-      })
+  pub fn aways(&self) -> impl Iterator<Item = (AwayAt, u64)> + '_ {
+    self.aways_in(0, u64::MAX)
   }
 
-  /// The windows let go, brought back or freed since the owner last took the changes: each with its length while it is
-  /// let go, none once it is not (brought back, or freed): what a delta carries of [`ContentStore::aways`].
-  pub fn away_changes(&self) -> Vec<(ContentId, Option<u64>)> {
-    self
-      .away_changed
-      .iter()
-      .map(|identity| {
-        let away = match self.entries.get(identity).map(|held| &held.kept) {
-          Some(Kept::Away { len }) => Some(u64::try_from(*len).unwrap_or(u64::MAX)),
-          _ => None,
-        };
-        (*identity, away)
-      })
-      .collect()
+  /// The let-go numbers of the windows let go, brought back or freed since the owner last took the changes (A-923): the
+  /// Aways family's coordinates a delta re-encodes the pages of.
+  pub fn away_changes(&self) -> Vec<u64> {
+    self.away_changed.iter().copied().collect()
   }
 
   /// Takes back the windows let go that a shard image carried ([`ContentStore::aways`]), before its lists
   /// ([`ContentStore::restore_nodes`], which hold the nodes they name): each an entry of no bytes and its length, landed,
   /// held by no one until a list or a row holds it again, read as nothing until brought back by its own bytes. One the
   /// store holds already, or of no length or past a window, is left out: the image recorded it, so the store never
-  /// infers one (a window the image never named stays absent, a reader's typed `NotHeld`). The count left out.
-  pub fn restore_away(&mut self, aways: Vec<(ContentId, u64)>) -> u64 {
+  /// infers one (a window the image never named stays absent, a reader's typed `NotHeld`). Each keeps the let-go number
+  /// the image recorded (A-923), so it lies where its page has it; one whose number another holds is left out too, and
+  /// the next let-go takes a number past every one restored. The count left out.
+  pub fn restore_away(&mut self, aways: Vec<(AwayAt, u64)>) -> u64 {
     let mut refused = 0u64;
-    for (identity, len) in aways {
+    for (AwayAt { number, identity }, len) in aways {
       let len = usize::try_from(len)
         .ok()
         .filter(|len| *len > 0 && *len <= self.window.get());
-      let Some(len) = len.filter(|_| !self.entries.contains_key(&identity)) else {
+      let Some(len) = len.filter(|_| {
+        !self.entries.contains_key(&identity) && !self.aways_by_number.contains_key(&number)
+      }) else {
         refused = refused.saturating_add(1);
         continue;
       };
+      self.aways_by_number.insert(number, identity);
+      self.next_away = self.next_away.max(number.saturating_add(1));
       self.entries.insert(
         identity,
         Held {
-          kept: Kept::Away { len },
+          kept: Kept::Away { len, number },
           form: Form::Window,
           holders: 0,
           landed: true,
@@ -2013,6 +2067,31 @@ impl ContentStore {
           last_read: core::cell::Cell::new(0),
         },
       );
+    }
+    refused
+  }
+  /// Takes back the windows let go that an image written before A-923 carried, with no let-go number (main's ruling of
+  /// 2026-11-25: a migration, read at restore alone): each as [`ContentStore::restore_away`] takes one, numbered after
+  /// every away taken back so far in the order given, the image's, and noted changed at its number and at the
+  /// coordinate its entry had (its identity's, the Aways family's before A-923), so the next publication writes it in
+  /// the numbered form and removes the old entry's page. Refused away, a window brought back by bytes finds nothing to
+  /// bring back, and a list naming it is refused, so a text read through either is lost (measured before this pass).
+  /// After called with `restore_away`'s: the numbered come first. The count left out.
+  pub fn restore_away_renumbered(&mut self, aways: Vec<(ContentId, u64)>) -> u64 {
+    let mut refused = 0u64;
+    for (identity, len) in aways {
+      let at = AwayAt {
+        number: self.next_away,
+        identity,
+      };
+      if self.restore_away(vec![(at, len)]) > 0 {
+        refused = refused.saturating_add(1);
+        continue;
+      }
+      self.away_changed.insert(at.number);
+      self
+        .away_changed
+        .insert(crate::preimage::Paged::coordinate(&identity));
     }
     refused
   }
@@ -2270,7 +2349,7 @@ impl ContentStore {
     }
     let height = list_levels(windows, fanout)?;
     let identity = self.window_identity(root, (height, fanout), index)?;
-    let Kept::Away { len: away } = self.entries.get(&identity)?.kept else {
+    let Kept::Away { len: away, .. } = self.entries.get(&identity)?.kept else {
       return None;
     };
     let start = index.checked_mul(window)?;
@@ -3452,6 +3531,57 @@ mod tests {
     (0..len).map(|at| u8::try_from(at % 251).unwrap()).collect()
   }
 
+  /// Shape: what the cap test's pages spend on an entry beyond its bytes (a page piece's key and length).
+  const PAGE_HEAD: usize = 28;
+
+  /// Whether `held` entries, each costing `cost`, lie within `cap` and the one entry that crosses it.
+  fn within_cap<T>(held: &[T], cost: impl Fn(&T) -> usize, cap: usize) -> bool {
+    let bytes: usize = held.iter().map(&cost).sum();
+    let most = held.iter().map(&cost).max().unwrap_or(0);
+    bytes <= cap + most
+  }
+
+  /// A-923 (main's ruling of 2026-11-25: a capped read holding past its cap is a broken bound). Do: put objects longer
+  /// than a window (each a list and a name) and let their windows go; read the lists, names and windows let go at a
+  /// cut over every coordinate with a cap of a few entries and a page's head on each. Expect each read stopped short of
+  /// the range, and what it held, each entry's head and bytes, within the cap and the one entry that crosses it. Red
+  /// before: the heads uncounted, each read held its cap's worth of bytes alone, past the cap with their heads.
+  #[test]
+  fn a_capped_cut_read_holds_its_cap_counting_each_entrys_head() {
+    let window = 256usize;
+    let mut store = ContentStore::new(1 << 24, window).unwrap();
+    for at in 0..64usize {
+      let mut bytes = patterned(window * 3 + 10);
+      bytes[0] = at as u8;
+      let object = store.put_object(&bytes).unwrap();
+      store.let_go_object(&object);
+    }
+    let cap = 8 * (PAGE_HEAD + 2 * IDENTITY_BYTES);
+    let all = (0, u64::MAX);
+    let (lists, stopped) = store.lists_at_cut(all, (cap, PAGE_HEAD));
+    assert!(stopped.is_some(), "the lists' read stopped at its cap");
+    assert!(
+      within_cap(
+        &lists,
+        |(_, bytes)| PAGE_HEAD + IDENTITY_BYTES + bytes.len(),
+        cap
+      ),
+      "the lists held past their cap"
+    );
+    let (names, stopped) = store.names_at_cut(all, (cap, PAGE_HEAD));
+    assert!(stopped.is_some(), "the names' read stopped at its cap");
+    assert!(
+      within_cap(&names, |_| PAGE_HEAD + 2 * IDENTITY_BYTES, cap),
+      "the names held past their cap"
+    );
+    let (aways, stopped) = store.aways_at_cut(all, (cap, PAGE_HEAD));
+    assert!(stopped.is_some(), "the aways' read stopped at its cap");
+    assert!(
+      within_cap(&aways, |_| PAGE_HEAD + AWAY_BYTES, cap),
+      "the aways held past their cap"
+    );
+  }
+
   /// Goal 93, main's ruling (B) of 2026-11-24 (one rule at the one let-go every path uses: a landed object's let-go never
   /// takes a window an unlanded object names). Do: put a landed object A of two windows and an unlanded object B whose
   /// first window is A's; pin B unlanded; let A go as a landed segment's let-go does (whatever its holders), and as the
@@ -3514,7 +3644,7 @@ mod tests {
         storage.kept.push((*identity, stored, kept.len()));
       }
     }
-    let aways: Vec<(ContentId, u64)> = before.aways().collect();
+    let aways: Vec<(AwayAt, u64)> = before.aways().collect();
     let lists: Vec<(ContentId, Vec<u8>)> = before
       .lists()
       .map(|(identity, bytes)| (identity, bytes.to_vec()))
@@ -3627,6 +3757,65 @@ mod tests {
   }
 
   /// Each of `windows` marked landed and let go.
+  /// A-923. Do: put five windows and let them go in an order unlike their identities' ; bring the second back; take the
+  /// aways into a fresh store as a restart's image does, then let one more go there. Expect the aways in let-go order
+  /// by number (the pages a push fills lie at the family's tail), each number kept across the restore, a bring-back
+  /// changing only its own number, a number taken twice refused at the restore, and the next let-go past every number
+  /// restored.
+  #[test]
+  fn the_aways_lie_in_let_go_order_and_keep_their_numbers_across_a_restore() {
+    let mut before = ContentStore::new(1 << 20, 4096).unwrap();
+    let windows: Vec<ContentId> = (0..6u8).map(|at| before.put(&[at; 100]).unwrap()).collect();
+    let mut order: Vec<ContentId> = windows.iter().take(5).copied().collect();
+    order.sort_by_key(|identity| core::cmp::Reverse(*identity));
+    let_go_each(&mut before, &order);
+    let aways: Vec<AwayAt> = before.aways().map(|(at, _)| at).collect();
+    assert_eq!(
+      aways.iter().map(|at| at.identity).collect::<Vec<_>>(),
+      order,
+      "in let-go order"
+    );
+    before.clear_changes();
+    let second = order[1];
+    let made_of = windows.iter().position(|id| *id == second).unwrap() as u8;
+    let bytes = [made_of; 100];
+    before.bring_back(&second, &bytes).unwrap();
+    assert_eq!(
+      before.away_changes(),
+      vec![aways[1].number],
+      "its own number alone"
+    );
+    let kept: Vec<(AwayAt, u64)> = before.aways().collect();
+    let mut after = ContentStore::new(1 << 20, 4096).unwrap();
+    let mut doubled = kept.clone();
+    doubled.push((
+      AwayAt {
+        number: kept[0].0.number,
+        identity: windows[5],
+      },
+      100,
+    ));
+    assert_eq!(
+      after.restore_away(doubled),
+      1,
+      "a number taken twice refused"
+    );
+    assert_eq!(
+      after.aways().collect::<Vec<_>>(),
+      kept,
+      "each at its number"
+    );
+    let extra = after.put(&[9; 100]).unwrap();
+    let_go_each(&mut after, &[extra]);
+    let last = after.aways().last().map(|(at, _)| at);
+    let highest = kept.iter().map(|(at, _)| at.number).max().unwrap();
+    assert_eq!(
+      last.map(|at| (at.identity, at.number > highest)),
+      Some((extra, true)),
+      "the next let-go past every number restored"
+    );
+  }
+
   fn let_go_each(store: &mut ContentStore, windows: &[ContentId]) {
     for id in windows {
       assert!(store.mark_landed(id));
@@ -3776,15 +3965,18 @@ mod tests {
     for (object, _) in &objects {
       before.let_go_object(object);
     }
-    let aways: Vec<(ContentId, u64)> = before.aways().collect();
+    let aways: Vec<(AwayAt, u64)> = before.aways().collect();
     assert_eq!(
       aways.len(),
       5,
       "four windows of the first and the second whole"
     );
     assert!(
-      before.away_changes().iter().all(|(_, len)| len.is_some()),
-      "each let go, named with its length"
+      before
+        .away_changes()
+        .iter()
+        .all(|number| aways.iter().any(|(at, _)| at.number == *number)),
+      "each let go, named by its let-go number"
     );
     let lists: Vec<(ContentId, Vec<u8>)> = before
       .lists()
@@ -3850,7 +4042,7 @@ mod tests {
     assert!(!held.is_away(id), "the empty window held");
     assert_eq!(held.len_of(id), Some(0));
     assert_eq!(held.bytes_of(id).as_deref(), Some(&b""[..]));
-    let aways: Vec<(ContentId, u64)> = held.aways().collect();
+    let aways: Vec<(AwayAt, u64)> = held.aways().collect();
     assert!(aways.is_empty(), "nothing let go to carry: {aways:?}");
     let mut after = ContentStore::new(1 << 20, 4096).unwrap();
     assert_eq!(

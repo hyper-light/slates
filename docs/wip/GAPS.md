@@ -401,8 +401,23 @@
 > w-shared's review). The encoder's pages are handed to a delta and a checkpoint borrowed, never copied
 > (`slates_vfs::recover::HeldPieceRef`, encoded byte for byte as a `HeldPiece`, held by the golden vector
 > `a_borrowed_held_piece_encodes_byte_for_byte_as_an_owned_one` and `check_publication`; a delta's borrow ends with
-> its encoding, a checkpoint's encoder taken out of the state for its stream and put back as it ends). OWED: (b), the
-> away windows keyed by let-go order, should the 57k churn show the Aways family leading and growing with history.
+> its encoding, a checkpoint's encoder taken out of the state for its stream and put back as it ends). (b) DONE as
+> A-923 (w-perf; main's churn ruling of 2026-11-25: at 57k the Aways family's cut reads, `overlay_within`, were 1.92 GB
+> and `encode_page` 2.39 GB of a push's 26.55 GB of system allocations): each window let go takes the store's next
+> let-go number, the family's coordinate, so a push's let-gos fill the family's tail page; red
+> `a_pushs_let_goes_re_encode_the_aways_pages_they_fill_not_every_page_of_the_aways_held` (20 let-goes over 1,500 held
+> aways: 47,887 bytes of the family re-encoded, now 3,701; bound 9,732). Counted by family,
+> `vcs_store.image.encoded_bytes.<family>`. The image's away entry carries the number (piece kind 21); an image written
+> before A-923 (kind 15, no number) is migrated at its restore, never refused: each old away taken back numbered after
+> the numbered ones, its old and new pages re-encoded by the next publication (`vcs_store.image.aways_renumbered`;
+> reds `a_restart_on_an_image_written_before_a923_numbers_its_aways_and_reads_every_text_whole`, Subversion, and
+> `a_restart_on_an_image_written_before_a923_reads_every_named_pushed_file`, Mercurial: with the old form refused, none
+> renumbered; at the store, a refused away leaves an object brought back by its bytes unreadable). OWED: the kind-15
+> reader removed once every daemon has published since A-923 (images live in RAM alone, so none can carry the kind
+> then), with the two restart reds and `content_holder::AWAYS_BEFORE_A923`. Found beside it and fixed in the same
+> change: every capped cut read (lists, names, windows let go, windows, region holds, landed records) counted entries
+> without the page head each costs, so it held past its cap, 1.9 times it for the aways (a split's step encoded 14,814
+> bytes against a three-page bound of 12,288); red `a_capped_cut_read_holds_its_cap_counting_each_entrys_head`.
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
@@ -1846,7 +1861,22 @@
 > before this change (the same bytes with it): that binary's `a_pushs_churn_per_changeset_is_its_file_alone` (145,223 B
 > an edit at a 91,200 B manifest, 1.59 manifests, against its 16 KiB bound; 10,284 B when it landed) and
 > `a_cached_file_base_is_read_where_it_lies` (192,642 B a revision of a 160 KiB file, 1.18 files): the push's intake
-> churn main measured (`manifest_step`, `put_window`), owed next.
+> churn main measured (`manifest_step`, `put_window`). Bisected (2026-11-25, w-hg): the cached base's to 4885954fa (a
+> file revision taken a window a step: 14,007 B to 184,743 B a revision), whose object began its window's buffer empty
+> and grew it to the file's length each revision (`put_window` under `put_bytes`); the edit's to b47217878 (a manifest
+> taken a window a step: 17,899 B to 136,995 B), which copied each text of one window or less into a buffer grown from
+> empty (`Manifesting::small`, under `manifest_take`) and loaded each base chain's deltas into new buffers
+> (`object_bytes` under `Chain::of`). Since: a file revision's object begins over a buffer the push let go and gives it
+> back once kept; the small copy is taken from those, reserved to the text's length, and given back; a chain's deltas
+> lie in one such buffer; the let-go link is looked for only where the chain is not read. The cached base 28,578 B a
+> revision (0.17 files), passing; the edit 41,988 B at the 91,200 B manifest (145,223 B before), still past its 16 KiB.
+> Then (w-hg), attributed by allocation site under the test's allocator (each allocation's first `slates_hg` frames
+> summed over an 80-edit history): the push's file and manifest revisions were boxed anew each one, about 7 KB and 7.7 KB
+> (`Patched` and `Manifesting` carry BLAKE3 hashers), now held in the intake in place; a base's chain was looked over a
+> link at a time before it was read (`log_text_at_hand`, a window list a link), now read once, its root looked at alone;
+> a chain's readers and the bytes each level skips keep their buffers among the push's spares; a log's length is probed
+> with one key. Both tests pass: the edit 9,774 B at the 91,200 B manifest (11,059 B before either regression), the
+> cached base 11,851 B a revision (14,007 B before).
 > The owner spins before it parks (2026-11-25, w-hg; main's ruling on the 57k split at 44db3dc17, release: the clone
 > 225.7 s, 812,896 requests waiting 167.27 s, the owner's wake 144.82 s of it, 86.6%, about 178 µs a request; serve
 > 7.4%, back 4.9%, behind 0.8%, disk 0.3%): waiting for work, it polls its queue for the gap it has learned (RFC 6298's

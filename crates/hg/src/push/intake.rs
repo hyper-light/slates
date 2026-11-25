@@ -415,9 +415,9 @@ struct Taker {
   /// A changeset or manifest longer than one window, being taken a window a step.
   pending: Option<Box<Pending>>,
   /// A file revision being taken a window a step, its text never whole ([`patched`]).
-  patched: Option<Box<patched::Patched>>,
+  patched: Option<patched::Patched>,
   /// A manifest being taken a window a step, its text never whole ([`manifesting`]).
-  manifesting: Option<Box<manifesting::Manifesting>>,
+  manifesting: Option<manifesting::Manifesting>,
   /// The base of the manifest begun again because a window of its chain could not be read: asked of the store at its
   /// next begin ([`manifesting`]).
   base_asked: Option<Node>,
@@ -620,6 +620,10 @@ const SPARES: usize = 4;
 /// manifest's text once the next is kept, since no later delta rests on it; a base read whole for one step), at most
 /// [`SPARES`] of them and the cache's bound in bytes, so the intake's working set stays its step's and twice its room. A
 /// rebuild takes the largest, so a text no longer than one let go allocates nothing.
+///
+/// Beside them, the room a manifest's chain was loaded into and the readers of its text (main's churn of hg's 57k push at
+/// e51d998bf, bisected to b47217878: each manifest loaded its base's chain and began its readers anew, a revision's
+/// worth of lists a link), at most [`SPARES`] of each, so a manifest's steps allocate nothing once the push has them.
 #[derive(Debug, Default)]
 struct Spares {
   /// The buffers, each emptied.
@@ -628,6 +632,10 @@ struct Spares {
   bytes: u64,
   /// The most bytes they may hold.
   bound: u64,
+  /// Chains' rooms let go.
+  rooms: Vec<crate::push::chain_read::ChainRoom>,
+  /// Chain readers let go.
+  cursors: Vec<crate::push::chain_read::Cursor>,
 }
 
 impl Spares {
@@ -654,6 +662,32 @@ impl Spares {
         buffer
       }
       None => Vec::new(),
+    }
+  }
+
+  /// A chain's room let go, or a new one.
+  fn room(&mut self) -> crate::push::chain_read::ChainRoom {
+    self.rooms.pop().unwrap_or_default()
+  }
+
+  /// Keeps a chain's room for the next, while fewer than [`SPARES`] are kept.
+  fn give_room(&mut self, room: crate::push::chain_read::ChainRoom) {
+    if self.rooms.len() < SPARES {
+      self.rooms.push(room);
+    }
+  }
+
+  /// A chain reader let go, begun again; or a new one.
+  fn cursor(&mut self) -> crate::push::chain_read::Cursor {
+    let mut cursor = self.cursors.pop().unwrap_or_default();
+    cursor.reset();
+    cursor
+  }
+
+  /// Keeps a chain reader for the next, while fewer than [`SPARES`] are kept.
+  fn give_cursor(&mut self, cursor: crate::push::chain_read::Cursor) {
+    if self.cursors.len() < SPARES {
+      self.cursors.push(cursor);
     }
   }
 
@@ -1139,10 +1173,10 @@ impl Intake {
     }
     // A revision taken a window a step gives back its object being put, and a manifest the base the store gave it.
     if let Some(patched) = self.taker.patched.take() {
-      patched::give_back(store, *patched);
+      patched::give_back(store, patched);
     }
     if let Some(manifesting) = self.taker.manifesting.take() {
-      manifesting::give_back(store, *manifesting);
+      manifesting::give_back(store, manifesting, &mut self.taker.spares);
     }
     self.taker.fork.release(store)
   }

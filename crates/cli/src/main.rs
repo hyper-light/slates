@@ -60,6 +60,16 @@ const EXIT_FAILED: u8 = slates_server::watchdog::FAILED_EXIT_CODE;
 static ALLOCATOR: slates_mem::large::LargeMapped = slates_mem::large::LargeMapped;
 
 fn main() -> ExitCode {
+  // The daemon's spawner (A-924), started by the daemon as this executable with its ends handed: it serves before any
+  // argument is read, since the same arguments start a test binary's spawner role (`slates_ipc::spawner::role_args`).
+  #[cfg(unix)]
+  if let Some(served) = slates_ipc::spawner::serve_from_env() {
+    return if served.is_ok() {
+      ExitCode::SUCCESS
+    } else {
+      ExitCode::FAILURE
+    };
+  }
   let arguments: Vec<String> = std::env::args().skip(1).collect();
   // The daemon's WinFsp purge client, a role only a daemon starts (no daemon thread opens its own volume, §4.6), served
   // by the library's role entry as a host's executable serves it.
