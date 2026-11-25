@@ -939,7 +939,7 @@ fn a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_hi
     store.restart_owner();
     let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
     let folded = green_folded(&daemon, repository);
-    let brought = brought_back(&daemon);
+    let (brought, found) = brought_back(&daemon);
     let resumed = crate::test_store::run_on_first(
       &daemon,
       move || async move {
@@ -966,26 +966,31 @@ fn a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_hi
       exported == Some((FULL_LAST, FULL.to_vec())),
       "killed at {kill_at}: full.dump"
     );
-    assert!(
-      brought > 0,
-      "killed at {kill_at}: no named text brought back"
+    // The image restored every named text whole: none lacked, so none is brought back, and each is found whole and let
+    // go once the green is replayed.
+    assert_eq!(
+      (brought, found),
+      (0, FULL_NAMED),
+      "killed at {kill_at}: named texts brought back, found whole"
     );
   }
 }
 
-/// The named texts the daemon's recovery accounted for in its Subversion greens: brought back before the replay (A-760's
-/// pre-pass), or found held whole and let go after it (`svn_texts::let_go_found_whole`). Since the recovery makes the
-/// content store before it judges what is lacking (TSan diags 5 and 7), a text the image restored whole is found, not
-/// fetched again; before, with no store made yet, every named text read as lacking and was brought back.
-fn brought_back(daemon: &Daemon) -> u64 {
+/// Shape: the named texts `full.dump`'s history leaves its green's recovery (its checkpoint and chain), as measured.
+const FULL_NAMED: u64 = 13;
+
+/// The named texts the daemon's recovery accounted for in its Subversion greens, each way apart: brought back before the
+/// replay (A-760's pre-pass), and found held whole and let go after it (`svn_texts::let_go_found_whole`). Since the
+/// recovery makes the content store before it judges what is lacking (TSan diags 5 and 7), a text the image restored
+/// whole is found, not fetched again; before, with no store made yet, every named text read as lacking and was brought
+/// back. Apart, so a recovery fetching again what the image restored whole shows (main's ruling of 2026-11-25).
+fn brought_back(daemon: &Daemon) -> (u64, u64) {
   crate::daemon::observe_first(daemon, |state| {
-    [
-      crate::vcs_store::svn_texts::NAMED_BROUGHT_BACK,
-      crate::vcs_store::svn_texts::NAMED_FOUND_WHOLE,
-    ]
-    .into_iter()
-    .map(|name| state.refusals.get(name).copied().unwrap_or(0))
-    .sum()
+    let count = |name| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      count(crate::vcs_store::svn_texts::NAMED_BROUGHT_BACK),
+      count(crate::vcs_store::svn_texts::NAMED_FOUND_WHOLE),
+    )
   })
 }
 
@@ -1039,7 +1044,11 @@ fn a_batch_killed_between_its_changeset_and_its_entry_lands_again_whole() {
     std::time::Duration::from_secs(60),
   );
   daemon.stop();
-  assert_eq!(brought, 0, "a text brought back that no entry named");
+  assert_eq!(
+    brought,
+    (0, 0),
+    "a text brought back or let go that no entry named"
+  );
   assert_eq!(resumed, Ok((FULL_LAST, FULL_LAST)), "landed again");
   assert!(exported == Some((FULL_LAST, FULL.to_vec())), "full.dump");
 }
@@ -1117,9 +1126,11 @@ fn a_cleanly_restarted_import_brings_back_only_its_checkpoints_named_texts() {
   );
   daemon.stop();
   assert!(named > 0, "the checkpoint names no file");
+  // A clean stop's image restores every text the checkpoint names whole: none is brought back, each is found whole.
   assert_eq!(
-    brought, named,
-    "what was brought back is what the checkpoint names"
+    brought,
+    (0, named),
+    "named texts brought back, found whole: the checkpoint's"
   );
   assert!(exported == Some((FULL_LAST, FULL.to_vec())), "full.dump");
 }
@@ -1181,7 +1192,12 @@ fn a_region_held_window_is_restored_beside_the_named_texts_brought_back() {
   });
   let folded = green_folded(&daemon, repository);
   daemon.stop();
-  assert!(brought > 0, "the pre-pass brought nothing back");
+  // The pre-pass made the store, which took in the image's windows and region holds: every named text found whole.
+  assert_eq!(
+    brought,
+    (0, FULL_NAMED),
+    "named texts brought back, found whole"
+  );
   assert_eq!(region, (1, true), "the region's window after the restart");
   assert_eq!(folded, Some((FULL_LAST, FULL_LAST)), "recovered and folded");
 }
@@ -1423,7 +1439,7 @@ fn restart_with_two_named_texts(release_window: bool) {
   assert_eq!(
     reads.as_slice(),
     expected.as_slice(),
-    "first reads after reboot, {brought} named texts fetched"
+    "first reads after reboot, {brought:?} named texts brought back, found whole"
   );
 }
 
