@@ -63714,6 +63714,45 @@ Applied in the same change to: the A-912 entry's homing window (learned once mea
 {failover,member_plane}.rs`, `crates/server/src/{fleet,takeover,state,daemon,lib}.rs`, `crates/server/tests/fleet.rs`,
 GAPS.
 
+### A-918 (i) — A holder behind a green's record answers it typed (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25 ((3), (2) and B; this is B's first piece); A-912's sibling; amends A-412)
+
+- **Why.** In a914's scene a push during a death was refused at its record barrier, `unable to commit` (2 of 7, then 4
+  of 6). The barrier refusal's log, now naming each pending version's waits, showed the cause. After a death at 3
+  members every member is a green's candidate, so a node that held none of the green joined its cohort. It refused
+  each record above v0 out of order (`record_standing`: no replica, no records), answered nothing, and was shipped the
+  same record every pass for good: `merge.out_of_order` reached 4006 in one red run of the A-918 fleet test. A-412
+  brings a holder up from its own ledger only, and the record plane never ships a placed version again.
+  - Durability held. A-546's settle certifies `f + 1` (`greens_placed_on_current_cohort`), met by the owner and the
+    old candidate.
+  - Liveness did not: once an `f + 1` for the next version needs the newcomer, the version never places.
+- **The change (i).**
+  - Every refusal is typed. A holder behind a record answers `ContentMessage::Behind { object, sequence, reached }`
+    (kind 11; `reached` is the newest version its replica holds, `None` for none of the green). It answers so where it
+    counted `OUT_OF_ORDER` and answered nothing: holding none of the green, or lacking a record its ledger cannot
+    bring it to (`catch_up`). Counted `merge.behind.answered`.
+  - The owner records each behind target on the pending version (`PendingMergeRecord::behind`, bounded by the
+    candidates; a target leaves once it acknowledges), counted `merge.behind.heard`. A refused barrier's log names it,
+    with the version's other waits and the placement: on the refusal's cold path, bounded by the pending versions
+    times the members.
+  - An owner whose build predates kind 11 refuses it typed (`ContentError::UnknownKind`) and reads it as no answer, as
+    it read the silence before. A flag byte past its two values is `ContentError::BadFlag`.
+- **What follows (main's order).** A-919 ships a state log's prefix to a candidate joining past parts every earlier
+  one held. Then B: on `Behind`, the newcomer rebuilds the green through a takeover successor's own path from a live
+  holder, never an owner-pushed second path. The owner holds no per-version records or inputs below a green's floor,
+  so it could not push the chain from v0 anyway.
+- **Tests.**
+  - `slates-cluster` content: `a_behind_answer_has_a_golden_encoding`, and `every_message_round_trips` with both
+    `reached` forms.
+  - `merge_service::tests::a_holder_holding_none_of_a_green_stands_behind_a_later_version_and_next_at_version_zero`.
+  - `merge_service::tests::an_owner_records_a_targets_behind_answer_on_its_pending_version`.
+  - The fleet test `a918_a_candidate_a_death_brings_in_is_shipped_the_greens_chain_and_holds_the_next_version` is red
+    until B and lands with it.
+- **Models.** None of `docs/wip/models/` models a holder's merge answers; no spec changed.
+
+Applied in the same change to: the A-412 note in `merge_service::catch_up`'s doc (it now answers behind),
+`crates/cluster/src/content.rs`, `crates/server/src/{merge_service,state_log}.rs`, `crates/server/tests/fleet.rs`
+(a914's wait factored out as `poll_taken_over_and_unseated`), GAPS.
+
 ### A-915 — Nothing acknowledged rests on a part only the dead owner held: a repository's creation answers once its root's join is at f + 1 too, and an adoption never waits for a join no owner is left to ship (2026-11-24, w-shared for main 01a20182, its ruling (1); a894's flake, my regression from A-908 part 4; amends A-894 and A-908)
 
 - **Why.** a894 (a repository's owner killed as its creation answers) failed under load, about 1 run in 3 at load 60 to

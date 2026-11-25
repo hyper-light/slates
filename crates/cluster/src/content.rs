@@ -122,6 +122,12 @@ const KIND_FETCH_CHUNK: u8 = 8;
 const KIND_PIECE: u8 = 9;
 /// Format: the kind byte of a holder's answer to a merge record that waits on its replica's build (A-813's limit).
 const KIND_REPLICA_BUILDING: u8 = 10;
+/// Format: the kind byte of a holder's answer to a merge record it is behind (A-918).
+const KIND_BEHIND: u8 = 11;
+/// Format: the flag byte before a `Behind` answer's reached version: 0 for none held, 1 for a version that follows.
+const REACHED_NONE: u8 = 0;
+/// Format: see [`REACHED_NONE`].
+const REACHED_SOME: u8 = 1;
 /// Format: the width of a BLAKE3 identity on the wire.
 const HASH_BYTES: usize = 32;
 /// Format: the width of an object id on the wire.
@@ -220,6 +226,19 @@ pub enum ContentMessage {
     /// The turns the replica's build has done, rising while it runs.
     slices_done: u64,
   },
+  /// A holder's answer to a merge record it cannot judge because it lacks versions before it (A-918, main 01a20182's
+  /// ruling of 2026-11-25: every refusal typed): a candidate a death brought in holding none of the green, or a replica
+  /// short of the versions between whose records it lacks. Before, it answered nothing and refused every later version
+  /// for good. An owner of a build that predates the kind refuses it typed (`ContentError::UnknownKind`) and reads it as
+  /// no answer, as it read the silence before.
+  Behind {
+    /// The green whose record it is behind.
+    object: ObjectId,
+    /// The version the record is of.
+    sequence: u64,
+    /// The newest version this holder's replica holds, `None` when it holds none of the green.
+    reached: Option<u64>,
+  },
 }
 
 /// A holder's acknowledgement of content, bound to what was put so a reply for another object,
@@ -255,6 +274,11 @@ pub enum ContentError {
   },
   /// A declared count or length is larger than the bytes can hold, or bytes trail the message.
   BadLength,
+  /// A flag byte names neither of its two values (A-918's `Behind`).
+  BadFlag {
+    /// The byte found.
+    flag: u8,
+  },
 }
 
 impl std::fmt::Display for ContentError {
@@ -263,6 +287,7 @@ impl std::fmt::Display for ContentError {
       ContentError::Truncated => f.write_str("content message truncated"),
       ContentError::UnknownKind { kind } => write!(f, "unknown content message kind {kind}"),
       ContentError::BadLength => f.write_str("content message length does not fit its bytes"),
+      ContentError::BadFlag { flag } => write!(f, "content message flag {flag} names no value"),
     }
   }
 }
@@ -520,6 +545,22 @@ impl ContentMessage {
         out.extend_from_slice(&sequence.to_le_bytes());
         out.extend_from_slice(&slices_done.to_le_bytes());
       }
+      ContentMessage::Behind {
+        object,
+        sequence,
+        reached,
+      } => {
+        out.push(KIND_BEHIND);
+        out.extend_from_slice(&object.0);
+        out.extend_from_slice(&sequence.to_le_bytes());
+        match reached {
+          None => out.push(REACHED_NONE),
+          Some(reached) => {
+            out.push(REACHED_SOME);
+            out.extend_from_slice(&reached.to_le_bytes());
+          }
+        }
+      }
     }
     out
   }
@@ -580,6 +621,15 @@ impl ContentMessage {
         object: reader.object()?,
         sequence: reader.u64()?,
         slices_done: reader.u64()?,
+      },
+      KIND_BEHIND => ContentMessage::Behind {
+        object: reader.object()?,
+        sequence: reader.u64()?,
+        reached: match reader.u8()? {
+          REACHED_NONE => None,
+          REACHED_SOME => Some(reader.u64()?),
+          flag => return Err(ContentError::BadFlag { flag }),
+        },
       },
       kind => return Err(ContentError::UnknownKind { kind }),
     };
@@ -4047,7 +4097,54 @@ mod tests {
         sequence: SEQUENCE,
         slices_done: 3,
       },
+      ContentMessage::Behind {
+        object: OBJECT,
+        sequence: SEQUENCE,
+        reached: None,
+      },
+      ContentMessage::Behind {
+        object: OBJECT,
+        sequence: SEQUENCE,
+        reached: Some(1),
+      },
     ]
+  }
+
+  /// Golden vector (§4.9, A-918): a holder's behind answer's bytes are fixed (kind, object, sequence, then a flag and the
+  /// reached version only where one is held), and a flag past the two is refused typed, never read as either.
+  #[test]
+  fn a_behind_answer_has_a_golden_encoding() {
+    let none = ContentMessage::Behind {
+      object: ObjectId([0xBB; 16]),
+      sequence: 2,
+      reached: None,
+    }
+    .encode();
+    let mut expected = vec![KIND_BEHIND];
+    expected.extend_from_slice(&[0xBB; 16]);
+    expected.extend_from_slice(&2u64.to_le_bytes());
+    expected.push(REACHED_NONE);
+    assert_eq!(none, expected);
+    let some = ContentMessage::Behind {
+      object: ObjectId([0xBB; 16]),
+      sequence: 2,
+      reached: Some(0),
+    }
+    .encode();
+    expected.pop();
+    expected.push(REACHED_SOME);
+    expected.extend_from_slice(&0u64.to_le_bytes());
+    assert_eq!(some, expected);
+    let mut bad_flag = none;
+    if let Some(flag) = bad_flag.last_mut() {
+      *flag = REACHED_SOME.saturating_add(1);
+    }
+    assert_eq!(
+      ContentMessage::decode(&bad_flag),
+      Err(ContentError::BadFlag {
+        flag: REACHED_SOME.saturating_add(1)
+      })
+    );
   }
 
   /// Golden vector (§4.9): a replica build's progress answer's bytes are fixed (kind, object, sequence, the turns done),
@@ -4067,9 +4164,9 @@ mod tests {
     expected.extend_from_slice(&0x0506u64.to_le_bytes());
     assert_eq!(bytes, expected);
     assert_eq!(
-      ContentMessage::decode(&[KIND_REPLICA_BUILDING.saturating_add(1)]),
+      ContentMessage::decode(&[KIND_BEHIND.saturating_add(1)]),
       Err(ContentError::UnknownKind {
-        kind: KIND_REPLICA_BUILDING.saturating_add(1)
+        kind: KIND_BEHIND.saturating_add(1)
       })
     );
     let mut trailing = bytes;
