@@ -649,3 +649,14 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
 - Main's report at b61cdf8d1 (E200007, no PROPPATCH route on `!svn/rev/N`) was fixed by d843d2325
   (2026-11-21 23:46 PST). I told main and w-svn; the debug target is deleted.
 - Next: the A-911 arms A/B record when main sends it.
+
+## 2026-11-25: hg stream chunks as stock's (main's ruling (a)), and A-911's record: LANDED
+- 70fa2080f (commit 5114fd09e): slates_hg::revlog_chunk, the one chunk codec. chunk/chunk_len follow 7.2's
+  revlog.compress with zstd at level 3 and the 50-byte floor; decode reads every kind 7.2 reads; inline uses
+  _maxinline 131,072 and never the changelog. render and Streaming now use it: a count pass sizes each chunk
+  compressed, and a send pass writes it held to that length. revlog-compression-zstd is required. Status counters:
+  vcs_store.hg_stream_compress_count_ns, _send_ns, _send_plain_bytes, _send_stored_bytes.
+  r400: 99 files and 466 KB against stock's 102 and 470 KB (0.97x, 0.99x; was 195 and 813 KB). Stock hg verify clean.
+- 7d4257124: BENCHMARKS, A-911's three arms. B lands; C (4x the slots) measured and rejected.
+- Left: main runs the two passes' CPU on hg-src and the 57k. w-hg's (b) keeps chunks stored from arrival and drops the
+  per-stream compression. The changelog's generaldelta flag (stock 7.2 writes a new changelog without it) is owed, in GAPS.
