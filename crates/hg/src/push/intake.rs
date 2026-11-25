@@ -1142,7 +1142,7 @@ impl Intake {
       patched::give_back(store, *patched);
     }
     if let Some(manifesting) = self.taker.manifesting.take() {
-      manifesting::give_back(store, *manifesting);
+      manifesting::give_back(store, *manifesting, &mut self.taker.spares);
     }
     self.taker.fork.release(store)
   }

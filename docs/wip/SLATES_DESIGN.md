@@ -64062,6 +64062,103 @@ GAPS.
   and the indexes after each alike (`a_record_planned_a_row_a_step_is_the_record_planned_whole`,
   `every_revision_svnadmin_wrote_planned_a_row_a_step_is_the_revision_planned_whole`; a builder taken up without its
   next node number fails both); a plan's step after an append is refused out of date.
+- **Piece 3, the judge** (89-92 ms at 9,000 files after piece 1: the reservation's history walk 19.6 ms and changes
+  walk 10.9, `resolve` 11.6, `decide_units` 24.5, `Reached::of` 1.5, `position::verdict` 2.6, `commit_reads` 15.3),
+  in parts. **3a, the commit's reads.** `commit_reads` is the check the commit's own preparation makes a slice at a
+  time (`Prep::Sole`, `Prep::Reads`, A-917), which piece 1 left off since the judge had made it. The import's judge
+  (`Green::judge_named_reads_later`) leaves it to its commit: `Judged::reads_checked` says whether its judge made it,
+  `begin_committing` checks the reads where it did not (from `Prep::Reads` where `make_step` found the runs), and
+  `committing_step` answers `CommitStep::Lend` with the texts it met unlent, its slice undone, which the import batch
+  reads from the content plane and lends (`ImportBatch::lend_pending`, counted `repository.import_batch.commit_lent`;
+  a text asked for again once lent is refused, counted as a judge's second miss). The verdict is the same; only where
+  its check is made moves. The judge step 89-92 ms → 77 ms. Oracle: the named-texts history oracle commits every version
+  on a third green judged with its reads left to its commit, a unit a step, lending as asked: the same version and head
+  identity as the judging green, never a text asked for twice, a commit lent in the census
+  (`commits_lent`); and a server batch staging an append over a text its scratch member holds by name alone is lent
+  it once by its commit and makes the file (`a_staged_commit_is_lent_the_named_text_its_reads_meet`).
+  **3b, the reservation.** `Green::history_reservation` plus `changes_reservation` (30 ms whole, computed once since
+  piece 0) are walked a unit at a time (`engine::reserving`): `Green::begin_reserving` and `reserving_step` note each
+  op's path once in an owned map (its content ops, whether an op replaces it, whether the change index records it;
+  a work decoded from bytes is not taken to name a path once), then charge each path its history's and change
+  index's bytes (`superseded_bytes`, a special's node, its change bytes and the links naming a special); the copies'
+  and replaces' shares (`Green::reservation_shares`, whole, nothing for a work with neither) read versions and are
+  added once with the work moved into the scratch member's numbering. Each charge is a saturating sum of charges
+  that are never negative, so the order changes nothing. The import batch takes it as a phase of its own before the
+  judge (`ImportBatch::stage_begin` begins it; `stage_step` takes it on, then judges, `judge_reserved`). The judge
+  step 77 ms → 47 ms. Oracle: over generated works of every kind and renames, on the histories every earlier work
+  left, the reservation taken a unit a step equals the two whole, before each work is submitted and after
+  (`a_reservation_taken_a_unit_a_step_is_the_reservation_taken_whole`; a rename's source left uncharged, or a
+  special's node, fails it). Still whole: the shares, 0.86 ms at 9,000 files with no copy or replace (their scans
+  and the move into the member's numbering); `copy_entry_room` resolves the work whole where it copies.
+- **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
+  the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
+  document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
+  is it plus `canonicalize`, as every other commit takes it) and the staging puts it in order a slice a step
+  (`staging::canonical_in`, inside `readied_in` with the named texts' reads), driving A-752's paced canonicalize, owned
+  (`OpsDoc::canonicalized`), a `Pace` turn to each step's quantum. The build step 51-55 ms → 26-27 ms. Oracle: over
+  generated documents of every op kind with hard links, declared in random order, the document canonicalized a unit
+  a turn encodes as the one canonicalized whole, in more than one turn wherever it has more than one op
+  (`a_document_canonicalized_a_unit_a_turn_is_the_document_canonicalized_whole`).
+
+### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
+
+**Why.** One `posix_spawn` call costs its calling thread about 0.1 ms per 1,000 of the parent's open descriptors with
+`POSIX_SPAWN_CLOEXEC_DEFAULT`, which `confined_spawn` sets on macOS to close the pipe-to-`fcntl` window (GAPS
+8a-hook-exit; `~/.cache/w-git-spawnbench`, 7 reps, medians): 0.2 to 0.45 ms at 100 descriptors, 1.2 to 4.0 ms at
+10,000, 8.0 to 13.3 ms at 100,000 (max 32 ms); about the same for `/usr/bin/true` as for a 342 MB binary. A daemon
+serving tens of thousands of concurrent pushes holds that many sockets, so each hook it spawns was a step of 8 to
+13 ms on the shard that made it, against the 1 ms bar. Dropping the flag cuts the cost only 3 to 4 times and
+reopens the window (main's ruling). glibc's `posix_spawn` clones without `CLONE_FILES`, so Linux copies the table
+too; measured by a CI diag once this API stands.
+
+**What.** On Unix every `confined_spawn` is a request to the daemon's **spawner**, a process the daemon starts while
+it still holds few descriptors (the first step of its role's start, after `close_inherited_on_exec`), and owns:
+- **Its start.** The current executable in its spawner role (`slates spawner`; a test binary's gated role entry, as
+  the hook tests' `a_hook_role` is), with an empty environment, standard streams on the null device, and one end of
+  an anonymous message pair a shard (`slates_ipc::stream::message_pair`). Each shard holds its own end, so no lock is
+  shared between shards; the spawner holds one descriptor a shard, and spawns from that table.
+- **A request.** An id, the program, its arguments, its environment resolved on the daemon's side (`Inherited` is
+  the daemon's environment copied in, so the daemon's own variables never live in the spawner's), its directory,
+  whether it leads its own group, and its standard streams by `SCM_RIGHTS` (the null device opened by the spawner).
+  The spawner calls the same `confined_spawn::spawn` the daemon called, so the child is confined exactly as before:
+  the same file actions, signal mask and default, group and directory (confinement parity; a test holds a hook
+  confined the same through the spawner as before). It closes the streams it was handed and answers the id with the
+  child's pid, or with the spawn's error.
+- **An exit.** The spawner watches each child (`NOTE_EXIT` on a kqueue, a pidfd on Linux), reads its status with
+  `waitid(WNOWAIT)`, and answers the id with it. It reaps the child only when the daemon releases the id, so the pid
+  and the group name the child until its owner lets it go, as before ("never reaped behind its owner's back").
+  `kill_group` and `group_has_others` stay on the daemon's side (a group of the daemon's own user). The hook driver's
+  run waits on its id's exit answer rather than an exit watch and `waitid`: the status comes with the event, so the
+  gap between macOS's exit note and a readable status, which the driver works around today, is gone.
+- **Its death.** The daemon reads its end's end: every spawn in flight is refused `SpawnerGone`, and every running
+  child's exit answered `SpawnerGone`. The driver kills that child's group (its children are reparented to init) and
+  ends the run typed ("the spawner died"), never a hang. The daemon starts a new spawner; a spawn while it starts waits
+  its restart's bound, then is refused typed. Its back-off, the in-flight bound and the restart wait are each derived
+  on their constants.
+- **Bound to the daemon.** The spawner reads its ends; when every end has closed (the daemon exited or crashed), it
+  kills every group it holds and exits, so a dead daemon leaves no hook running. A warm restart's new daemon starts
+  its own spawner; the old one's children are gone with it, never seen on the new side.
+- **Its cost.** One more process; its resident size measured and stated here once built.
+- **Windows** keeps `CreateProcess` behind the same seam (paired `#[cfg]`): an explicit
+  `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` duplicates only the handles it lists, not the parent's table. Held to the same
+  red on Windows CI rather than assumed.
+
+**Red.** One spawn's time on its calling thread at 100, 10,000 and 100,000 open descriptors: today 0.2, 1.2 to 4,
+and 8 to 13 ms; through the spawner, the request's send alone, flat: the 100,000 figure within the same test's
+measured noise of the 100 figure, not a literal.
+
+> **Status (2026-11-25).** Piece 1 built: the spawner and its conversation (`slates_ipc::spawner`; `confined_spawn`'s
+> `Spawn::handed` places its ends). Its frames are a fixed header and a body; a body past five times `ARG_MAX` plus
+> two `PATH_MAX`, or more descriptors waiting than one request's streams, ends the conversation as if gone. Its exits
+> come by `SIGCHLD` to a self-pipe, installed before its first spawn, since it is every child's parent. Its ends are
+> marked close-on-exec at its start, where Linux's spawn closes nothing by default. The red, on the MacBook (debug,
+> load about 30; `spawner::tests::a_spawns_cost_on_its_calling_thread_is_flat_in_the_daemons_descriptors`), median a
+> spawn on the asking thread: through the spawner 79 to 89 µs at 100 descriptors, 73 to 79 at 10,000, 69 to 72 at
+> 100,000; direct 0.34 ms, 1.33 to 1.35 ms, 10.4 to 15.6 ms (worst 40 ms). Parity: a child through the spawner lists
+> the same descriptors as a direct one. Owed, piece 2: the daemon starts it at its role's start, hands each shard an
+> end, owns, joins and restarts it (back-off, in-flight bound and restart wait derived), and the hook driver and
+> `run_helper` ask it, their exits by its answers; the spawner's footprint measured; Linux's direct cost by a CI
+> diag.
 
 ### A-923 — The Aways family is keyed by let-go number, and every capped cut read counts each entry's page head (2026-11-25, w-perf for main 01a20182, its churn ruling (b) and its rulings on the format and the read cap; A-870, A-767 C1 step 2b)
 

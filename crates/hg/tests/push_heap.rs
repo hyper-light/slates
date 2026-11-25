@@ -31,7 +31,7 @@ static ALLOCATOR: LargeMapped = LargeMapped;
 /// them is counted as the reader's (the long push's test, run without it, failed the cached base's in 4 of 6 runs).
 // D-8 test harness: a lock held in turn by its owners, every test of this binary
 // (`a_pushs_churn_per_changeset_is_its_file_alone`, `a_views_manifest_read_is_one_text`,
-// `a_cached_file_base_is_read_where_it_lies` and `a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows`),
+// `a_views_read_of_a_let_go_manifest_allocates_no_text`, `a_cached_file_base_is_read_where_it_lies` and `a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows`),
 // poison recovered.
 #[allow(clippy::disallowed_types)]
 static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -470,6 +470,70 @@ fn a_views_manifest_read_is_one_text() {
   assert!(
     per_read <= manifest + SLACK_BYTES,
     "a manifest read allocated {per_read} B, past one {manifest} B manifest and {SLACK_BYTES} B"
+  );
+}
+
+/// Goal 93 (main's churn at e51d998bf, 2026-11-25: hg's 57k clone churned 5.51 GB in `object_text` under
+/// `revision_text` under the served view's manifest read, and 0.79 GB in `revision_text_over`'s chain, with no manifest
+/// rebuilt: the walk asks the view for each manifest before it sends the changeset store's delta, and a manifest let go
+/// once landed was read for a text it could not make). Do: take the same history into an index, let every manifest's
+/// object go as a landing does, view it, and read the first [`EDITS`] manifests, then all of them. Expect each read
+/// answered none (the text is not held) for at most [`SLACK_BYTES`] allocated: no text begun, no chain gathered. Red
+/// before: each read allocated its chain's whole text before finding its windows gone.
+#[test]
+fn a_views_read_of_a_let_go_manifest_allocates_no_text() {
+  let _alone = ALONE
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+  let (payload, manifest) = history(1_600, 64, 2 * EDITS);
+  let mut store = ContentStore::with_storage(u64::MAX, WINDOW, Box::new(Arena::new())).unwrap();
+  let index = taken(HgIndex::new(), &payload, &mut store);
+  let rows: Vec<_> = (0..index.len(&store, Log::Manifest))
+    .filter_map(|rev| index.revision(&store, Log::Manifest, rev))
+    .collect();
+  let freed: u64 = rows.iter().map(|row| store.let_go_object(&row.bytes)).sum();
+  assert!(freed > 0, "the manifests let go");
+  let reading = reading_cost();
+  let state = State {
+    roots: &[],
+    bookmarks: &[],
+    publishing: true,
+    markers: &[],
+  };
+  let view = Indexed::new(
+    &index,
+    &store,
+    state,
+    (u64::MAX, &mut Admission::new(u64::MAX)),
+  )
+  .unwrap();
+  let churn = |count: usize| {
+    let mut room = Admission::new(u64::MAX);
+    let before = heap().system_allocated;
+    let held = rows[..count]
+      .iter()
+      .filter(|row| view.manifest(&row.node, &mut room).unwrap().is_some())
+      .count();
+    let spent = heap()
+      .system_allocated
+      .saturating_sub(before)
+      .saturating_sub(reading);
+    (held, spent)
+  };
+  let (held_few, few) = churn(EDITS);
+  let (held_all, all) = churn(2 * EDITS);
+  let per_read = all.saturating_sub(few) / u64::try_from(EDITS).unwrap();
+  println!(
+    "push_heap: a view's read of a let-go manifest allocates {per_read} B (a manifest is {manifest} B)"
+  );
+  assert_eq!(
+    (held_few, held_all),
+    (0, 0),
+    "no let-go manifest read whole"
+  );
+  assert!(
+    per_read <= SLACK_BYTES,
+    "a let-go manifest's read allocated {per_read} B, past {SLACK_BYTES} B"
   );
 }
 

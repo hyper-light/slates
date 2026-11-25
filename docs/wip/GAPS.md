@@ -1736,7 +1736,11 @@
 > segment` (the production step's chunk turns counted, none past its copy slice). A made changeset's payload stays raw:
 > its record replays the changegroup itself (`write_made_record`), and no push lands whole any more (every push lands
 > as segments), so a stream compresses only a made changeset's places at stream time (`Streaming::sized` stays for
-> them). Owed: the count pass still reads a chunk place's bytes it could size by its length.
+> them). The count pass sizes a chunk place by its length since (2026-11-25, w-hg): its batch asks only raw places'
+> bytes, which it must compress to size, so a stream reads each chunk once, in its send pass. Held by
+> `a_streams_count_pass_sizes_a_chunk_place_by_its_length_never_reading_it` (the `states` stream from a store keeping
+> each revision as its chunk equals the stream from wholes byte for byte; the chunk bytes asked equal those sent, 907;
+> red: 1,814, each read by both passes).
 > Found by w-interop's matrix at 29221d5ab and fixed (2026-11-25): stock 7.2.4's merge-push and rebase-push were refused
 > `UnknownDeltaBase { log: Manifests }` on the manifest of a changeset the same push carried before the merge. That
 > manifest was kept as a client's delta on the repository's tip manifest, itself a delta landed and let go, so its chain
@@ -1845,7 +1849,30 @@
 > At r4000 in process: 3,392 stored deltas, 562 on a parent, 14 wholes, 32 whole from a made text (a delta on neither
 > the one before nor a parent sent); the owner's requests 1,248 to 80, the store wait 1.27 s, `hg verify` clean, every
 > manifest the source's. A pull's base in `::common` is not this walk's: a pull (`Named`) reads each manifest whole to
-> plan its files, so its text is made whatever is sent. Owed: the 32; the 57k churn rerun (main's).
+> plan its files, so its text is made whatever is sent. Main's 57k churn at e51d998bf (2026-11-25): the clone's system
+> churn 9.67 GB (40.89 at fed0b8164), 5.51 GB of it `object_text` under `revision_text` under the view's manifest read
+> and 0.79 GB `revision_text_over`'s chain, none rebuilt: the walk asks the view for each manifest before it sends the
+> stored delta, and a let-go manifest's read began its chain's whole text before finding its windows away (about a
+> manifest a changeset). Nothing of the file walk reads a manifest: a clone walks the file logs by position (A-745).
+> Since (w-hg): `revision_text_over` looks at its revision's own object first and stops where the store holds it with
+> its windows away, and `object_text` makes a text only once its first window is read. Held by
+> `a_views_read_of_a_let_go_manifest_allocates_no_text` (`crates/hg/tests/push_heap.rs`: 103,218 B a read of a let-go
+> 91,200 B manifest, none made; now 74 B). Owed: the 32; the 57k churn rerun (main's). Found beside it, failing on main
+> before this change (the same bytes with it): that binary's `a_pushs_churn_per_changeset_is_its_file_alone` (145,223 B
+> an edit at a 91,200 B manifest, 1.59 manifests, against its 16 KiB bound; 10,284 B when it landed) and
+> `a_cached_file_base_is_read_where_it_lies` (192,642 B a revision of a 160 KiB file, 1.18 files): the push's intake
+> churn main measured (`manifest_step`, `put_window`). Bisected (2026-11-25, w-hg): the cached base's to 4885954fa (a
+> file revision taken a window a step: 14,007 B to 184,743 B a revision), whose object began its window's buffer empty
+> and grew it to the file's length each revision (`put_window` under `put_bytes`); the edit's to b47217878 (a manifest
+> taken a window a step: 17,899 B to 136,995 B), which copied each text of one window or less into a buffer grown from
+> empty (`Manifesting::small`, under `manifest_take`) and loaded each base chain's deltas into new buffers
+> (`object_bytes` under `Chain::of`). Since: a file revision's object begins over a buffer the push let go and gives it
+> back once kept; the small copy is taken from those, reserved to the text's length, and given back; a chain's deltas
+> lie in one such buffer; the let-go link is looked for only where the chain is not read. The cached base 28,578 B a
+> revision (0.17 files), passing; the edit 41,988 B at the 91,200 B manifest (145,223 B before), still past its 16 KiB.
+> Owed: the rest, about 25 KB an edit at any manifest size, which grows with the chain's length: the chain reader's
+> per-manifest levels (`Cursor`) and the bytes a level skips, made into a new buffer a call (`read_level`'s
+> `dropped`), and `holds_whole`'s window list a link (`log_text_at_hand`).
 > The owner spins before it parks (2026-11-25, w-hg; main's ruling on the 57k split at 44db3dc17, release: the clone
 > 225.7 s, 812,896 requests waiting 167.27 s, the owner's wake 144.82 s of it, 86.6%, about 178 µs a request; serve
 > 7.4%, back 4.9%, behind 0.8%, disk 0.3%): waiting for work, it polls its queue for the gap it has learned (RFC 6298's
@@ -2964,6 +2991,15 @@
 > daemon's own sweep publishes. Red `an_imports_arena_holds_its_keep_when_the_sweep_publishes_after_its_last_tail` (the
 > import's frees left deferred past its last tail, then a sweep pass): with `give_back_released`'s call taken out, the
 > sweep released 1,048,576 B and left 4,939,776 resident and free against 4,202,496; at 6e002e057, 786,432.
+> **P7 CLOSED (main's after arm, 2026-11-25 08:48-08:49 PST; main b8b3c741d, binary sha 46a0ed338b35; load 18 to 21;
+> three rounds interleaved with the bound arm; record `~/.cache/main-rounds/bench7/p7-after.txt`, `p7a-*.log`).** At
+> the settled reading (deferred 0 every round) the arena's resident free bytes were 14.8, 28.1 and 56.7 MB against
+> keeps (the bound, B) of 53.4, 28.2 and 125.8 MB: within the keep in all three, round 2 by 0.1 MB. The footprint
+> (macOS, `mem.gauge.process.footprint_bytes`) was 35.2 MB before the import, 223.1 MB at its end and 130.8 MB settled
+> in round 1; rounds 2 and 3 settled at 156.5 and 184.6 MB, the settled figure following each round's B, as the keep
+> should. `object_resident` settled at 20.0, 52.3 and 68.6 MB; `arena_free` at 79.8, 84.7 and 111.9 MB, mapped and
+> given back, so not in the footprint. The bound arm's binary has no footprint gauge, so there is no footprint A/B
+> against it, and its RSS across a purge is not comparable on macOS (BENCHMARKS' method note at its head).
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
@@ -14409,6 +14445,56 @@ Open (w-svn): the same diag's one failure in 1,306 library tests,
 `daemon::tests::a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry` (daemon.rs:9662,
 `seen` other than `Some((true, 0, false))` under the instrumentation's slowdown). The lane cannot pass until it is
 fixed or explained.
+
+### 8a-hook-exit. Under load, a hook's exit completes seconds late, in batches, and the hook tests' fixed bounds fail on it (2026-11-25, open)
+
+Main's flake list (w-hg's parallel runs; w-git's loops under 8 to 24 CPU burners, full output kept in
+`~/.cache/w-git-ssh-flake-run*.log` and `~/.cache/w-git-hook-red-run*.log` on the MacBook, 18 cores). At load 35 to 48,
+these fail together in one run, never alone:
+- `hook_driver::tests::hooks_spawned_at_once_each_end_at_their_own_exit` (a refusing hook's run 2.2 to 9.4 s against
+  2 s);
+- `git_hooks::tests::a_git_hook_runs_in_its_view_at_each_of_receive_packs_points` ("the run answered within the
+  test's bound", 10 s);
+- `git_push::tests::t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update` and
+  `t_a665_an_update_hook_refuses_its_own_command_alone` ("the push went no further within the test's bound").
+
+What was measured (temporary instrumentation in `hook_driver`, since removed):
+- **A stranded run.** The run waits with its words ended, its exit unseen and no deadline (a first run has none; its
+  client leaving is its only end, by design). 16 to 29 strands a run under burners, none in quiet runs.
+- **Not a lost wake.** At the moment it strands, the hook's status is not readable (`waitid` with `NOWAIT | NOHANG`) in
+  79 of 82 strands; the 3 readable were within the kernel's microseconds between the exit note and the status. The
+  run's wait is not missing an event: the hook has closed its descriptors and not finished exiting.
+- **Not starved teardown.** `ps` on a lingering hook reads `?E` (exiting), wait channel `-`, 0 CPU time, 0 RSS, 4 to
+  9 s after its start: its threads and address space are already gone.
+- **Not the sleeping hooks.** Killing the test's sleeping hooks at 8 s instead of 4 s left no run over 1 s in 4 runs at
+  load 53 to 65; with the kill back at 4 s, stranded runs ended at 1.37 and 1.54 s, not at 4.
+- **Released in batches.** Nine refusing hooks' exits completed within 5 ms of each other (1.368 to 1.373 s), four
+  more within 0.5 ms: one process-wide hold, released at once.
+- **Same moments, same process: the SSH edge.** The four seat and client-gone tests in `vcs_ssh::tests::serve` and
+  the two hg-over-SSH tests (`a_rekey_during_a_blocked_write_sends_no_byte_twice`,
+  `an_ssh_clone_past_many_windows_is_answered_whole`) failed in the same runs, each with the server's close not seen
+  within the client's 4 s. `vcs_ssh` alone stayed green 6 of 6 under 24 burners (load about 32): its stalls come with
+  activity elsewhere in its own test process.
+
+**The tests' bounds stay.** They are liveness-derived Shapes (`hook_driver`'s `QUICK_RUN_NS`, half a holder's four
+windows; `git_hooks::tests::TEST_BOUND_NS`, ten windows), and they are what fails during the stall. A bound measured
+at a test's start cannot see an episode that begins mid-test, and a quiet exit (2 to 18 ms) would make it tighter, not
+safer (main's ruling, 2026-11-25). Re-judged once A-924's spawner lands: if the stall is the test process's own spawn
+bursts, the spawner takes them out of it.
+
+**Not named.** The object the exits wait on is unknown: no root on the machine, so no kernel stacks (`spindump`,
+`dtrace`). The hook driver is right to wait for the exit (git waits on a hook's exit, not its pipe; a deadline at
+words-end would cut hooks that close their output and work on). Next: a kernel stack of a stranded hook from a
+machine where one can be taken.
+
+**What it led to (a product finding).** One `posix_spawn` call costs its calling thread about 0.1 ms per 1,000 of the
+parent's open descriptors with `POSIX_SPAWN_CLOEXEC_DEFAULT`, which `slates_ipc::confined_spawn` sets on macOS
+(`~/.cache/w-git-spawnbench`, 7 reps, medians, load ~30): 0.2 to 0.45 ms at 100 descriptors, 1.2 to 4.0 ms at 10,000,
+8.0 to 13.3 ms at 100,000 (max 32 ms); without the flag, 0.5 ms at 10,000 and 1.9 to 3.2 ms at 100,000. The 342 MB
+debug test binary costs about what `/usr/bin/true` does. No measurable hold on the parent's other threads: a second
+thread's worst `dup` + `close` was 6.6 ms during the spawns and 6.0 ms with none. So a hook spawn is a long step on
+the shard that makes it, against the 1 ms bar, in a daemon holding its clients' sockets. Owed: the spawner, A-924 (w-git's
+next piece).
 
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 
