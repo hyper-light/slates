@@ -169,6 +169,14 @@ pub(crate) const PUSH_LANDED: &str = "hg_push.landed";
 /// Counter: the slices a push's intake took (A-783's paced turn): a slice that yielded at its first quantum took one
 /// step, so a push of hg-src's history was a slice a revision. Format: a counter name in the status report.
 pub(crate) const INTAKE_SLICES: &str = "hg_push.intake_slices";
+/// Counter: the most kept revisions one slice's pins looked at (`slates_hg::push::pins::Counted::count_kept`), kept as a
+/// maximum: the slice's new revisions, never every revision the push keeps unlanded (main's 57k push at 2dd25afe6: 615,194
+/// slices each looking at every kept revision, 5 min 13 s of CPU 10 minutes in). Format: a counter name in the status
+/// report.
+pub(crate) const PIN_REVISIONS_SLICE_MOST: &str = "hg_push.pin_revisions_slice_most";
+/// Counter: the most windows one slice's pins pinned (`ContentStore::pin_unlanded`), kept as a maximum. Format: a
+/// counter name in the status report.
+pub(crate) const PIN_WINDOWS_SLICE_MOST: &str = "hg_push.pin_windows_slice_most";
 /// Counter: pushes the changeset log refused, answered `UNLANDED`: nothing of them is in the register.
 pub(crate) const PUSH_UNLANDED: &str = "hg_push.unlanded";
 /// Slates' words for a push refused while a Mercurial hook is configured (module docs, "The hook gate"), before the
@@ -2811,17 +2819,21 @@ impl Taking {
         }
       };
       // What the slice kept pins the windows it names until its own segment lands (goal 93, main's ruling of
-      // 2026-11-24): a pin past the bound refused typed, never grown.
-      let pinned = counted
-        .count_kept(content, intake.kept_contents())
-        .map_err(|refused| {
-          IntakeRefused::Unindexed(slates_hg::push::commit::Unindexed::from(refused))
-        });
-      Some(pinned.and(stepped))
+      // 2026-11-24): a pin past the bound refused typed, never grown; the slice's new revisions alone looked at.
+      let pinned = counted.count_kept(content, intake).map_err(|refused| {
+        IntakeRefused::Unindexed(slates_hg::push::commit::Unindexed::from(refused))
+      });
+      Some(pinned.and_then(|look| stepped.map(|stepped| (stepped, look))))
     });
     paced.close(slates_rt::futures::now_ns(), costs);
     state.count(INTAKE_SLICES, 1);
-    sliced
+    sliced.map(|sliced| {
+      sliced.map(|(stepped, look)| {
+        state.count_max(PIN_REVISIONS_SLICE_MOST, look.revisions);
+        state.count_max(PIN_WINDOWS_SLICE_MOST, look.windows);
+        stepped
+      })
+    })
   }
 
   /// The fork once every unit is taken.
