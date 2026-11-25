@@ -1885,9 +1885,20 @@
 > (64 reads back to back: with no spin 64 parks, the red; with a 2 ms cap 61 met spinning, 3 parked while the window was
 > learned). Main's 57k split at b4aa00ef8 (release, load ~34) showed no spin: 461,484 parks, 0 hits, because the
 > measurement's daemon (`crates/server/tests/common/hg.rs`) started its owner with a cap of 0; a daemon takes the
-> profile's (9,385 ns on the MacBook at load 27, `slates profile --quick`), and the fixture now does too. Owed: the
-> split again with the real cap (main's), whether a probe's wake (about 9 µs) or the owner's loaded one (about 183 µs a
-> request there) should cap it, then the request count (593,413 at b4aa00ef8) with w-perf.
+> profile's (9,385 ns on the MacBook at load 27, `slates profile --quick`), and the fixture now does too. Main's split
+> with the real cap at 7a9cb385e: asks 12.7 ms apart, a park's wake 1.36 ms; 52 met spinning, 3,237 parked. Main's ruling
+> then: rent or buy, never a cap. Since (w-hg): the owner learns what a park's wake costs it where it runs (`Wake`: from
+> the later of a request's send and the park to its taking, gain 1/8, seeded by the profile's wake), and spins, at most
+> that wake, only where the next gap is predicted within it; else it parks at once. Held by
+> `reads_further_apart_than_a_wake_park_at_once` (16 reads 20 ms apart, the wake seeded at 2 ms: every read parked,
+> none spun; red under the capped rule: 40.56 ms spun, none met), and over fixed histories by `owner/tests.rs`
+> (`a_gap_predicted_past_the_wake_parks_at_once`, red under the capped rule; within the wake spun for at most it; a wake
+> cheaper than the gap parks; the learned wake displaces the seed; a burst after an idle gap spun again). Back to back the
+> owner spins where its asker's gap is within the wake (64 of 64 on the MacBook at load 30, five runs of eight) and parks
+> where the asker is descheduled as long as a wake (the rest): the machine decides, so that test holds the count and the
+> parts' sum alone. Found on the way: a gap learned to the request's taking holds the wake itself, so one park kept the
+> owner parked for good; the gap is learned to the request's send, and the owner's start is never one. Owed: the 57k split under the rule (main's); the request count (3,387 at
+> 7a9cb385e) with w-perf.
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads
@@ -1912,7 +1923,20 @@
 > 400 texts through a two-chunk cache; now 2). A text the owner answers in slices is assembled in the asker's buffer,
 > handed to the owner and back a request, no slice a buffer of its own (`StoreHandle::text_slice_into`; hg's 57k clone
 > allocated 6.2 GB in those answers, 15.3% of its system churn; `owner_slices_heap`: red, 331,464 bytes allocated for a
-> 307,200-byte text read in 64 KiB slices; now 24,264). The batch itself was sized by the fetch's room
+> 307,200-byte text read in 64 KiB slices; now 24,264). After the push at e51d998bf the cache's chunks held 32.0 MB
+> live (`texts.rs:708`), the same bytes through the clone, and nothing reported why: a memory status now names the
+> owner's text cache as the owner took the shard's last read (`mem.gauge.store.text_cache_reserved_bytes`,
+> `_bound_bytes`, `_walks`, `_walk_bytes`; `owner::text_cache_seen`, carried on each read's timing). The lead,
+> shown by `the_owners_text_cache_is_seen_by_its_asker_and_a_read_left_partway_holds_its_bound`: a read left part-way
+> stays a walk in flight and holds the bound (3 reads of 300 KB left: 3 walks, 921,600 bytes walked, bound 2 MiB) until
+> it ends or more walks than the owner's room evict it. OWED: main's next 57k run reads the gauges; if the walks hold
+> the 32 MB, a walk left part-way is ended by its reader's handle as it drops (main's ruling (b)). The clone's scans of
+> the store's rows (hg's 57k at 35b155312: 2.08 GB of 3.72, `reserve` under mantle's `scan_inner`, 55.8%) laid each page
+> in buffers their caller made afresh, and an ask by tool id kept a set of the asks, a map of the found and two copies
+> of each row's id: the store now keeps one scan's buffers (`Store::scan_rows`), and the ask writes each version into
+> its answer as a page's rows pass its sorted asks, no map and no copy; mantle itself unchanged, its scan reusing
+> what its caller lends (`an_ask_by_tool_id_scans_into_the_stores_own_buffers`: an ask of 2,000 versions allocated
+> 1,406,209 bytes, 5.2 times its answer; now 305,865, the answer's 272,000 and its order). The batch itself was sized by the fetch's room
 > (`LogTexts::ask_batch`, gigabytes at 57k) and copied text by text on the owner: the status's other 5.25 GB is the
 > system allocator's, reserved and not in use (5.41 GB reserved, 157 MB in use), and an in-process clone of 2,000
 > changesets peaked at 111.6 MB of live heap, 83% the batch's copies (`crates/server/tests/hg_fetch_heap.rs`). Cut

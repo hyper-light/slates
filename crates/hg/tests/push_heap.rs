@@ -31,7 +31,8 @@ static ALLOCATOR: LargeMapped = LargeMapped;
 /// them is counted as the reader's (the long push's test, run without it, failed the cached base's in 4 of 6 runs).
 // D-8 test harness: a lock held in turn by its owners, every test of this binary
 // (`a_pushs_churn_per_changeset_is_its_file_alone`, `a_views_manifest_read_is_one_text`,
-// `a_views_read_of_a_let_go_manifest_allocates_no_text`, `a_cached_file_base_is_read_where_it_lies` and `a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows`),
+// `a_views_read_of_a_let_go_manifest_allocates_no_text`, `a_holds_whole_look_allocates_nothing`,
+// `a_cached_file_base_is_read_where_it_lies` and `a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows`),
 // poison recovered.
 #[allow(clippy::disallowed_types)]
 static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -534,6 +535,37 @@ fn a_views_read_of_a_let_go_manifest_allocates_no_text() {
   assert!(
     per_read <= SLACK_BYTES,
     "a let-go manifest's read allocated {per_read} B, past {SLACK_BYTES} B"
+  );
+}
+
+/// Shape: how many times [`a_holds_whole_look_allocates_nothing`] asks, so a look's allocation shows above the readings'.
+const LOOKS: usize = 1_000;
+
+/// Goal 93 (main's churn of hg's 57k push at e51d998bf: `object_windows` under `holds_whole` 1.27 GB, a window list a
+/// look, under `log_text_at_hand` and `Chain::let_go_link`). Do: put a one-window object and ask whether the store holds
+/// it whole [`LOOKS`] times; let it go and ask again. Expect: held, then not; the looks allocating nothing on the system
+/// path. Red before: each look collected the object's windows into a list first.
+#[test]
+fn a_holds_whole_look_allocates_nothing() {
+  let _alone = ALONE
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+  let mut store = ContentStore::with_storage(u64::MAX, WINDOW, Box::new(Arena::new())).unwrap();
+  let object = store.put_object(&[7_u8; 4_096]).unwrap();
+  let reading = reading_cost();
+  let before = heap().system_allocated;
+  let held = (0..LOOKS).all(|_| store.holds_whole(&object));
+  let spent = heap()
+    .system_allocated
+    .saturating_sub(before)
+    .saturating_sub(reading);
+  println!("push_heap: {LOOKS} looks at a one-window object allocated {spent} B");
+  assert!(held, "the object held whole");
+  assert_eq!(spent, 0, "the looks allocated nothing");
+  assert!(store.let_go_object(&object) > 0, "the object let go");
+  assert!(
+    !store.holds_whole(&object),
+    "a let-go object is not held whole"
   );
 }
 

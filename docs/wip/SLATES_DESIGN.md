@@ -64090,6 +64090,40 @@ GAPS.
   (`a_reservation_taken_a_unit_a_step_is_the_reservation_taken_whole`; a rename's source left uncharged, or a
   special's node, fails it). Still whole: the shares, 0.86 ms at 9,000 files with no copy or replace (their scans
   and the move into the member's numbering); `copy_entry_room` resolves the work whole where it copies.
+  **3c, the verdict.** The judge step's 47 ms after 3b were its verdict's compute: `resolve` 11.6 ms, `decide_units`
+  24.5 (the node-exclusive rule 11.1, the creates 9.4, the first unit's walk of the content 4.0), `Reached::of` 1.5,
+  `position::verdict` 2.6. `Green::compute` is now its steps carried to their end (`engine::computing`):
+  `begin_computing` answers at once what it answered before resolving anything; `computing_step` resolves the ops an
+  op a unit (`resolve_some`, then `Resolved::finish_resolving` and the copies' refusal), then decides the units a unit
+  at a time (`engine::deciding`: `decide_units` is seventeen phases over the resolution's maps, sets and lists, each
+  taken on from the key or the index after the last one decided, in the order the whole verdict pushes its units),
+  each step's unlent reads kept so that the verdict is refused naming the least of them, as the whole computation
+  refused it. A judge so (`Green::begin_judging`, `judging_step`, as `judge_named_reads_later`) is the rejected-result
+  cache's answer, the computation, then its one write, the verdict held or a conflict cached (`hold_unlent`), in its
+  last step. The import batch judges as a phase of its own (`ImportBatch::begin_judging_work`, `judge_step`, `judged`;
+  a refusal for unlent texts lent and judged again once, `judge_lent`). The judge's longest step 47 ms → 10-10.5 ms.
+  Still whole: the first unit (its walk of the content for edits that do not fit, run only when the unit is judged,
+  as A-658's again-judging needs), `Reached::of`, the verdict and the hold. Oracles: over generated works of every
+  kind and renames, each judged twice on two greens, whole and a unit a step, the same judgment every time and the
+  greens alike after each commit, a first judge of more than one op in more than one step
+  (`a_work_judged_a_unit_a_step_is_the_work_judged_whole`; a phase that keeps the last key of the one before fails
+  it); the named-texts history oracle's deferring green judges a unit a step; a rename of a file held by name alone,
+  unlent, refused `ContentUnread` naming its object whole and a unit a step, accepted once lent
+  (`a_judge_a_unit_a_step_is_refused_for_a_text_its_verdict_reads_unlent`; a step's unlent reads dropped fails it,
+  which no test caught before); and a server batch staging that rename lent `a`'s text once by its judge
+  (`a_staged_judge_is_lent_the_named_text_its_verdict_reads`).
+- **Piece 5, the records and the held tables** (29-31 ms at 9,000 files: the records' `apply` 13.0 ms, the held table
+  after with the released fold 12.3, the holding fold 5.8, the held table before 0.5), in parts. **5a, the held
+  tables.** The step that kept a revision applied the records and followed the batch's held table whole
+  (`Staging::recorded_in`); now `Staging::record_some` takes a `Recording` on in phases, each until the step's clock
+  passes its quantum, a unit at least, and stopping between phases where it is spent: the texts its rows let go
+  (`svn_texts::released_by`, a row a unit, before the records apply it), the records' apply (whole, 5b), the texts
+  its rows hold (`svn_texts::held_by`, a row a unit), then the held table followed a path a unit and the record kept.
+  Each walk gathers into an ordered map, so each path is kept once, its last row's, and the folds run in the order
+  `once_a_path` gave them; `released_before` and `held_after`, which a single commit takes whole, are the same rows'
+  walks. The records step 29-31 ms → 12.4 ms (the apply). Oracle: the svn import tests, whose shard quantum of a few
+  microseconds takes these walks a row a step over the golden dumps, hold the texts each batch lets go and keeps;
+  focused set 110 passed. Still whole: a row that adds or replaces a directory walks its tree in one unit.
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
@@ -64171,8 +64205,22 @@ measured noise of the 100 figure, not a literal.
 > are gone, and with them the yield the driver made between macOS's exit note and a readable status. The spawner's
 > death ends a run typed (`StartRefused::SpawnerGone`, worded as a server that could not start a process), the
 > hook's group killed. Red: a hook's parent is the spawner, not the shard's process
-> (`a_hook_is_started_by_the_shards_spawner_not_by_the_shard`). Owed, piece 2b: the spawner restarted on its death
-> (back-off, in-flight bound, restart wait, each derived) and its footprint measured.
+> (`a_hook_is_started_by_the_shards_spawner_not_by_the_shard`).
+>
+> **Piece 2b built (2026-11-25).** The control shard owns the spawner (`crate::spawning::own`, handed it by the
+> daemon's start with the measured length of that start). A shard whose end closes answers that generation's waiters
+> `SpawnerGone` and tells the owner; the owner restarts once per generation, after a back-off (`back_off_ns`: none
+> after one death, then the measured start's length doubled for each death within a liveness window of its start,
+> capped at the liveness window, RFC 6298 §5.5), and sends each shard its new end (`run_on_waiting`), or tells each
+> the attempt failed and tries again after a longer back-off. The restart wait is no timer: a spawn asked while a
+> restart is awaited waits for that attempt's answer, which always comes (the new end or the failure); between
+> attempts it is refused at once. Ids keep rising across generations and a handle of a gone generation answers
+> `SpawnerGone`, so no handle names a new spawner's child. A shard's spawns in flight (asked, running, not let go) are
+> at most its task bound (`RuntimeConfig::tasks_per_shard`, from the admission limit: each task asks for one child at a
+> time), one past it refused `Busy` (`StartRefused::NoRoom` to a hook). The owner joins the spawner when it is dropped
+> at the stop, killing it with its group a liveness window later. Red: a spawn after the spawner's death gets its
+> child from a new spawner (`a_dead_spawner_is_restarted_and_a_spawn_asked_after_its_death_gets_its_child`); before,
+> every spawn after it was refused. Owed: the spawner's footprint, measured on a release daemon (main's).
 
 ### A-923 — The Aways family is keyed by let-go number, and every capped cut read counts each entry's page head (2026-11-25, w-perf for main 01a20182, its churn ruling (b) and its rulings on the format and the read cap; A-870, A-767 C1 step 2b)
 

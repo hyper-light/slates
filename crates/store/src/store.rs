@@ -232,6 +232,21 @@ pub struct Store {
   /// The engine reads (a lookup, or a page of a scan) that answered versions by their tool ids
   /// ([`Store::texts_by_tools`]): the counter its scan is held to.
   tool_reads: u64,
+  /// The buffers every scan of the rows reads into ([`Store::scan_rows`]), kept across scans.
+  scan: ScanScratch,
+}
+
+/// The buffers a scan of the engine's rows reads into, kept by the store across its scans (goal 93, main's ruling of
+/// 2026-11-25: hg's 57k clone's system churn was 3.72 GB, 55.8% of it `reserve` under the engine's `scan_inner`, each
+/// scan's rows laid in buffers its caller made afresh and grown from nothing). The engine costs a row no allocation once
+/// these have grown. They hold at most the largest page a scan read, which a request's asks bound (a fetch's batch, by
+/// its asker's room).
+#[derive(Debug, Default)]
+struct ScanScratch {
+  /// The page's rows.
+  rows: Rows,
+  /// The key the next page begins at.
+  next: Vec<u8>,
 }
 
 /// A standing grant as the store recorded it (its `G` row, A-767; R10's record of the human's grant): what a landing's
@@ -279,6 +294,7 @@ impl Store {
       value,
       place_reads: 0,
       tool_reads: 0,
+      scan: ScanScratch::default(),
       grant: GrantRow {
         id: 0,
         issued_ns: 0,
@@ -557,15 +573,35 @@ impl Store {
       Some(next) => changeset_key(next, 0).to_vec(),
       None => vec![CHANGESETS.saturating_add(1)],
     };
-    let mut rows = Rows::new();
-    let mut next = Vec::new();
-    self
+    let (decoded, _) = self.scan_rows((&start, Some(&end), limit), |rows, _| {
+      rows
+        .iter()
+        .map(|(key, value)| decode_changeset(key, value))
+        .collect::<Result<Vec<Changeset>, StoreError>>()
+    })?;
+    decoded
+  }
+
+  /// One page of the engine's rows from `from` (before `end`, at most `limit` rows), read into the store's own buffers
+  /// ([`ScanScratch`]) and given to `read` with the key the next page begins at: what `read` made of it, and whether
+  /// rows are left past it.
+  ///
+  /// # Errors
+  /// The engine's refusals.
+  pub(crate) fn scan_rows<R>(
+    &mut self,
+    (from, end, limit): (&[u8], Option<&[u8]>, usize),
+    read: impl FnOnce(&Rows, &[u8]) -> R,
+  ) -> Result<(R, bool), StoreError> {
+    let mut scan = core::mem::take(&mut self.scan);
+    scan.rows.clear();
+    let scanned = self
       .rows
-      .scan(&start, Some(&end), limit, &mut rows, &mut next)?;
-    rows
-      .iter()
-      .map(|(key, value)| decode_changeset(key, value))
-      .collect()
+      .scan(from, end, limit, &mut scan.rows, &mut scan.next);
+    let read = scanned.map(|more| (read(&scan.rows, &scan.next), more));
+    scan.rows.clear();
+    self.scan = scan;
+    Ok(read?)
   }
 
   /// Forgets a changeset no register named (A-767 C1, the abandoned push ruling of 2026-11-22).

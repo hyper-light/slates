@@ -309,7 +309,7 @@ impl Hook {
       drop(write);
       read
     });
-    let child = spawned.map_err(|refused| spawn_refused(refused))?;
+    let child = spawned.map_err(spawn_refused)?;
     let input = Some(OwnedFd::from(input_write));
     let words = OwnedFd::from(words_read);
     let output = output_read.map(OwnedFd::from);
@@ -609,6 +609,7 @@ fn hook_exit(status: std::process::ExitStatus) -> HookExit {
 fn spawn_refused(refused: SpawnRefused) -> StartRefused {
   match refused {
     SpawnRefused::NoSpawner | SpawnRefused::SpawnerGone => StartRefused::SpawnerGone,
+    SpawnRefused::Busy => StartRefused::NoRoom,
     SpawnRefused::Unrequestable => StartRefused::Other(rustix::io::Errno::TOOBIG.raw_os_error()),
     SpawnRefused::Os(number) => start_refused(&std::io::Error::from_raw_os_error(number)),
   }

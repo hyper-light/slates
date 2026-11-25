@@ -2166,6 +2166,51 @@ fn a_staged_commit_is_lent_the_named_text_its_reads_meet() {
   });
 }
 
+/// A-920 piece 3c (the judge taken a slice at a time, its lend kept). Do: in one import batch on a green, stage a named
+/// work creating `a` from a stored object, whose bytes the scratch member lets go once it is staged, then a work renaming
+/// `a` to `b`, whose verdict reads `a`'s bytes. Expect both staged; the rename's judge refused for `a`'s text, lent it
+/// from the content store and judged again once (`NAME_LENT_VERDICTS` 1); and the scratch member holding `b`, not `a`.
+#[test]
+fn a_staged_judge_is_lent_the_named_text_its_verdict_reads() {
+  use slates_merge::increment::{Base, VolumeOp, compose_volume_planned};
+  crate::test_store::audit_on_stored_shard("stage-judge-lent", |state| {
+    let (_, green) = repository(state, "judge-lent");
+    let object = stored_object(state, &[b'r'; 4_096]);
+    let mut batch = crate::import_batch::ImportBatch::begin(state, green).expect("a batch");
+    let mut create = named_create("a", object, (1, 0));
+    crate::repository::svn_commit::read_named(state, &mut create).expect("read");
+    assert_eq!(batch.stage(state, create), Ok(1));
+    let journal = [VolumeOp::Rename {
+      from: "a".to_owned(),
+      to: "b".to_owned(),
+    }];
+    let (doc, _) = compose_volume_planned(
+      &Base::of_files(vec![("a".to_owned(), object.len)]),
+      &journal,
+    )
+    .expect("composed");
+    let rename = Increment {
+      id: [2; 32],
+      base: 1,
+      doc,
+      post_state: Vec::new(),
+      evidence: Vec::new(),
+      named: Default::default(),
+    };
+    assert_eq!(batch.stage(state, rename), Ok(2));
+    let lent = state
+      .refusals
+      .get(crate::vcs_store::name_holds::NAME_LENT_VERDICTS)
+      .copied();
+    assert_eq!(lent, Some(1), "the judge lent a's text once");
+    let held = batch.with_engine(state, |engine| {
+      (engine.content("a").is_some(), engine.content("b").is_some())
+    });
+    assert_eq!(held, Some((false, true)));
+    batch.abandon(state);
+  });
+}
+
 /// Goal 93, A-760's append (main 01a20182's ruling of 2026-11-22 ~13:30: a work reused after a refused append must be
 /// impossible by construction). `append` takes its changes by value and a refusal gives none back, so a caller retries
 /// only with a work it builds again, its runs read again; never one whose runs a refused verdict took. Do: append a named

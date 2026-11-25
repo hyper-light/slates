@@ -20,6 +20,9 @@
 //!   regions' pages in RAM (`ChunkArena::residency`). Beside them the counter `content.purge_kept_short_bytes`: free
 //!   runs a purge left resident for being shorter than the discard size. A content object resident past what the arena
 //!   holds is told apart by them: frees not yet purged (an idle pass not yet run), short runs kept, or frees deferred.
+//! - `store.text_cache_*`: the store owner's text cache as the owner took this shard's last read of it, its chunks'
+//!   reserved bytes, its bound, and the walks in flight that hold the bound up with their texts' bytes
+//!   (`slates_store::owner::text_cache_seen`): a read left part-way is a walk until it ends or more walks evict it.
 //! - `process.*` (the control shard alone, the process's figures once): the system allocator's live bytes and the bytes
 //!   it ever allocated (its churn), and the
 //!   mapped blocks live and their resident bytes (`slates_mem::large::heap`). A resident set past the live bytes and
@@ -51,6 +54,7 @@ pub(crate) fn rows(state: &ShardState, memory: bool) -> Vec<RefusalCount> {
   rows.extend(green_rows(state));
   rows.extend(held_rows(state));
   rows.extend(content_rows(state));
+  rows.extend(text_cache_rows());
   if crate::verbs::is_control_shard(state) {
     let heap = slates_mem::large::heap();
     rows.extend([
@@ -92,6 +96,19 @@ pub(crate) fn rows(state: &ShardState, memory: bool) -> Vec<RefusalCount> {
       count,
     })
     .collect()
+}
+
+/// The store owner's text cache as the owner took this shard's last read of it (`slates_store::owner::text_cache_seen`):
+/// its chunks' reserved bytes, its bound, and the walks in flight that hold the bound up, with their texts' bytes (goal
+/// 93, main's ruling of 2026-11-25: after hg's 57k push the cache's chunks held 32 MB live and nothing said why).
+fn text_cache_rows() -> [(&'static str, u64); 4] {
+  let seen = slates_store::owner::text_cache_seen();
+  [
+    ("mem.gauge.store.text_cache_reserved_bytes", seen.reserved),
+    ("mem.gauge.store.text_cache_bound_bytes", seen.bound),
+    ("mem.gauge.store.text_cache_walks", seen.walks),
+    ("mem.gauge.store.text_cache_walk_bytes", seen.walk_bytes),
+  ]
 }
 
 /// The shard's chunk arena over the content object (main 01a20182's ruling of 2026-11-23: arena-12 found the content
