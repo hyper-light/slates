@@ -18,8 +18,11 @@ use slates_rt::futures;
 use slates_rt::registry;
 use slates_rt::runtime::{Runtime, RuntimeConfig};
 
-/// Shape: the idle spin window, short so the test's spin ends soon after the ring is injected.
-const SPIN_NS: u64 = 1_000_000;
+/// Shape: the idle spin window: long enough that a loaded machine's shard (a 4-core runner under ThreadSanitizer, or a Mac
+/// building beside it) reaches its spin and asks within it after the window task's step, which at 1 ms it did not (3 of
+/// 20 native runs at load, 2026-11-24: the shard parked after two asks, or asked only once the window had closed). The
+/// injecting ask holds its turn to the window's end, so this costs the test once.
+const SPIN_NS: u64 = 100_000_000;
 
 /// Shape: how long the test waits for the ring to be served. A served ring takes microseconds; a lost one is never served.
 /// Generous for a loaded machine, and the hang a lost wake causes is told apart from slowness by the shard's own state
@@ -51,6 +54,9 @@ static ASKED: AtomicU64 = AtomicU64::new(0);
 static INJECT_AT: AtomicU64 = AtomicU64::new(0);
 /// Set once the ring has been injected.
 static INJECTED: AtomicBool = AtomicBool::new(false);
+/// Whether the injecting ask came while the idle window was still open: the spin's ask, so the A-798 path is the one
+/// the test drives (the test's non-vacuity).
+static INJECTED_IN_WINDOW: AtomicBool = AtomicBool::new(false);
 /// How many times the serving task was woken: once at its start, once per served ring.
 static SERVED: AtomicU64 = AtomicU64::new(0);
 /// How many window-opening tasks have run.
@@ -72,6 +78,10 @@ fn ask() -> bool {
   let n = ASKED.fetch_add(1, Ordering::AcqRel) + 1;
   let rung = RUNG.swap(false, Ordering::AcqRel);
   if n == INJECT_AT.load(Ordering::Acquire) {
+    INJECTED_IN_WINDOW.store(
+      monotonic_ns() <= WINDOW_END_NS.load(Ordering::Acquire),
+      Ordering::Release,
+    );
     let shard = registry::current_shard().unwrap();
     std::thread::spawn(move || {
       RUNG.store(true, Ordering::Release);
@@ -133,6 +143,11 @@ fn a_kick_the_spins_harvest_takes_still_gets_its_ring_served() {
         Ordering::Release,
       );
     });
+    // The injection lands in the spin: the step that runs this task and the one after it each ask once; the asks after
+    // those are the spin's, which asks every turn. So name an ask two past this step's, counted here on the shard's own
+    // thread as it opens the window: named from the test's thread, it raced the window, and a thread descheduled past
+    // the window's 1 ms (TSan on a loaded runner, main's diag 45517552633) named an ask the parked shard never made.
+    INJECT_AT.store(ASKED.load(Ordering::Acquire) + 3, Ordering::Release);
     NOTED.fetch_add(1, Ordering::AcqRel);
   })
   .unwrap();
@@ -140,13 +155,14 @@ fn a_kick_the_spins_harvest_takes_still_gets_its_ring_served() {
     wait_until(BACKSTOP, || NOTED.load(Ordering::Acquire) >= 1),
     "the shard opened its idle window"
   );
-  // The injection lands in the spin: the step that ran the window's task and the one after it each ask once; the asks
-  // after those are the spin's, which asks every turn. Name an ask two past the present one.
-  INJECT_AT.store(ASKED.load(Ordering::Acquire) + 3, Ordering::Release);
   assert!(
     wait_until(BACKSTOP, || INJECTED.load(Ordering::Acquire)),
     "the poller injected the ring (asked {} times)",
     ASKED.load(Ordering::Acquire)
+  );
+  assert!(
+    INJECTED_IN_WINDOW.load(Ordering::Acquire),
+    "the ring was injected by the spin's ask, within the idle window"
   );
   let served = wait_until(BACKSTOP, || SERVED.load(Ordering::Acquire) >= 2);
   let parked = registry::with_entry(shard.0, |entry| entry.parking.parked()).unwrap_or(false);

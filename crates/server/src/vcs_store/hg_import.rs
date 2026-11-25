@@ -375,6 +375,12 @@ pub(crate) fn segment_bytes(state: &ShardState) -> usize {
 pub(crate) const SEGMENTS_LANDED: &str = "vcs_store.hg_import.segments_landed";
 /// Counter: a segment the store refused to land, its import given back. Format: a counter name.
 pub(crate) const SEGMENTS_UNLANDED: &str = "vcs_store.hg_import.segments_unlanded";
+/// Counter: a segment of an import's changegroup cut because the whole file texts it kept in the content store reached
+/// the segment's bound before its changegroup's bytes did (goal 93 hg, R; main 01a20182's ruling of 2026-11-24): its
+/// texts let go a segment at a time, never a history's at once. Format: a counter name in the status report.
+pub(crate) const SEGMENTS_CUT_BY_TEXTS: &str = "vcs_store.hg_import.segments_cut_by_texts";
+/// Counter: a segment cut by its changegroup's bytes, or at the stream's end. Format: a counter name.
+pub(crate) const SEGMENTS_CUT_BY_BYTES: &str = "vcs_store.hg_import.segments_cut_by_bytes";
 
 /// A segment changeset to land: the store, its header, its sections, and its payload's identity.
 pub(crate) type SegmentLanding = (
@@ -596,6 +602,7 @@ fn advance(
     }
     _ => None,
   };
+  let (mut by_texts, mut by_bytes) = (0_u64, 0_u64);
   if let Some(Importing {
     stage: Stage::Running { import, .. },
     segments,
@@ -603,10 +610,17 @@ fn advance(
   }) = stores.imports.get_mut(&id)
   {
     while let Some(segment) = import.take_segment() {
+      if segment.by_texts {
+        by_texts = by_texts.saturating_add(1);
+      } else {
+        by_bytes = by_bytes.saturating_add(1);
+      }
       segments.push_back(segment);
     }
   }
   drop(lent);
+  state.count(SEGMENTS_CUT_BY_TEXTS, by_texts);
+  state.count(SEGMENTS_CUT_BY_BYTES, by_bytes);
   grown_and_settled(state);
   true_up_holding(state, id);
   advanced

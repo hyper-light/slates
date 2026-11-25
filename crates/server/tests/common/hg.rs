@@ -80,6 +80,11 @@ impl Served {
     client.set_repository_policy("project", &policy).unwrap();
   }
 
+  /// A client of the daemon serving, as the test's principal.
+  pub(crate) fn client(&self) -> slates_client::Client {
+    connect(&self.instance)
+  }
+
   /// The daemon serving.
   pub(crate) fn daemon(&self) -> &Daemon {
     self

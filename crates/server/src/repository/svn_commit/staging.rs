@@ -33,6 +33,9 @@ use slates_db::catalog::{Principal, RepositoryId, VolumeId as DbVolumeId};
 use slates_svn::commit::revision::Revision;
 use slates_svn::index::ContentIdentity;
 
+use slates_merge::engine::Increment;
+use slates_svn::migration::Checked;
+
 use super::{Building, Uncommitted, brought, checked, green_of, grown, identity, landing, restore};
 use crate::import_batch::ImportBatch;
 use crate::repository::push::EntryParts;
@@ -213,6 +216,58 @@ fn give_back_put_some(
   *at >= put.len()
 }
 
+/// Counter: a step of an imported revision's staging ([`Staging::stage_in`]): its check, its build, each slice of its
+/// named texts' read, and its judge with the records' apply; four or more a revision shows its staging was split.
+/// Format: a counter name in the daemon's status report.
+pub(crate) const STAGING_STEPS: &str = "repository.svn_commit.staging_steps";
+
+/// One step of a revision's staging (`Staging::stage_in`) after a yield, counted: `step` within the records' room lent
+/// for `lent` bytes, the room settled after. None where the shard's state is gone.
+async fn within_records<T>(
+  repository: RepositoryId,
+  lent: u64,
+  step: impl FnOnce(&mut ShardState) -> Result<T, Uncommitted>,
+) -> Option<Result<T, Uncommitted>> {
+  slates_rt::futures::yield_now().await;
+  crate::state::with_state(|state| {
+    state.count(STAGING_STEPS, 1);
+    if !crate::vcs_store::lend_svn(state, repository, lent) {
+      return Err(Uncommitted::NotHeld);
+    }
+    let stepped = step(state);
+    crate::vcs_store::settle_svn(state, repository);
+    stepped
+  })
+}
+
+/// The increment of `checked`, its copies restored by `plans`, built against `batch`'s scratch member at its head and
+/// named `work_identity`: refused `Diverged` where the records moved past the batch's head.
+fn build_in(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  batch: &mut ImportBatch,
+  (checked, plans): (&Checked, restore::CopyPlans),
+  work_identity: [u8; 32],
+) -> Result<Increment, Uncommitted> {
+  let head = batch.head();
+  crate::vcs_store::lent_state(state, |state| {
+    let ShardState {
+      greens, vcs_stores, ..
+    } = state;
+    let records = vcs_stores
+      .subversion_records(repository)
+      .ok_or(Uncommitted::NotHeld)?;
+    if records.youngest() != head {
+      return Err(Uncommitted::Diverged);
+    }
+    batch
+      .with_engine_in(greens, |engine| {
+        Building::new(records, engine, (checked, plans)).build(head, work_identity)
+      })
+      .ok_or(Uncommitted::NotHeld)?
+  })
+}
+
 /// An import's revisions staged since its last landing (module docs).
 pub(crate) struct Staging {
   /// The repository's landing turn, held for the batch's life.
@@ -354,29 +409,13 @@ impl Staging {
     } = deferred;
     // A stored text a row names that the content store let go, and the texts its copies set back, are brought back
     // whole for the increment, and given back once it is built.
-    let brought_texts = match super::bring_stored(repository, &revision.record.changes).await? {
+    let BroughtForStaging {
+      texts: brought_texts,
+      plans,
+      restoring,
+    } = match brought_for_staging(repository, &revision).await? {
       Ok(brought) => brought,
       Err(refused) => {
-        self.put.extend(put);
-        self.carried.extend(carried);
-        return Some(Err(refused));
-      }
-    };
-    let plans = match restore::plan(repository, &revision.record.changes).await? {
-      Ok(plans) => plans,
-      Err(refused) => {
-        let _ = crate::state::with_state(|state| super::release_texts(state, None, &brought_texts));
-        self.put.extend(put);
-        self.carried.extend(carried);
-        return Some(Err(refused));
-      }
-    };
-    let restoring = match super::bring_texts(repository, restore::texts_of(&plans).into_iter())
-      .await?
-    {
-      Ok(restoring) => restoring,
-      Err(refused) => {
-        let _ = crate::state::with_state(|state| super::release_texts(state, None, &brought_texts));
         self.put.extend(put);
         self.carried.extend(carried);
         return Some(Err(refused));
@@ -388,12 +427,12 @@ impl Staging {
     // put its texts' last slice and staged in one poll of 952 ms on a debug build). The brought texts are held across
     // the yield, and the landing turn keeps every other commit out.
     slates_rt::futures::yield_now().await;
-    let staged = crate::state::with_state(|state| {
-      let staged = self.stage_in(state, repository, (revision, plans));
+    let staged = self.stage_in(repository, (revision, plans)).await;
+    let released = crate::state::with_state(|state| {
       super::release_texts(state, None, &brought_texts);
       super::release_texts(state, None, &restoring);
-      staged
-    })?;
+    });
+    let staged = released.and(staged)?;
     match staged {
       Ok(StagedIn::Staged) => {
         self.put.extend(put);
@@ -414,54 +453,73 @@ impl Staging {
     }
   }
 
-  /// [`Staging::stage`]'s step: the check, the increment built against the scratch member and staged, the records
-  /// applied, the record kept.
-  fn stage_in(
+  /// [`Staging::stage`]'s steps, each a step of the shard's own and counted ([`STAGING_STEPS`]; goal 93: a revision of
+  /// 9,000 files staged in one step of 476 ms on a debug build): the record checked; the increment built against the
+  /// scratch member; the texts it names read a copy slice a step; then the increment judged and staged, and the records
+  /// applied with the held table followed, together, so a drop between steps leaves nothing staged that the records do
+  /// not hold. Each step lends the records' room and settles it. The landing turn keeps every other commit out between
+  /// steps, and the build and the judge each check the records still stand where the batch does. None where the shard's
+  /// state is gone.
+  async fn stage_in(
     &mut self,
-    state: &mut ShardState,
     repository: RepositoryId,
     (revision, plans): (Revision, restore::CopyPlans),
-  ) -> Result<StagedIn, Uncommitted> {
-    // The records' room lent for the whole step, check to apply, as a landing's commit lends it.
+  ) -> Option<Result<StagedIn, Uncommitted>> {
     let lent = brought(&revision);
-    if !crate::vcs_store::lend_svn(state, repository, lent) {
-      return Err(Uncommitted::NotHeld);
+    let checked = within_records(repository, lent, |state| {
+      checked(state, repository, revision, None)
+    })
+    .await?;
+    let (checked, record) = match checked {
+      Ok(checked) => checked,
+      Err(refused) => return Some(Err(refused)),
+    };
+    let Some(batch) = self.batch.as_mut() else {
+      return Some(Err(Uncommitted::NotHeld));
+    };
+    let built = within_records(repository, lent, |state| {
+      build_in(
+        state,
+        repository,
+        batch,
+        (&checked, plans),
+        identity(&record),
+      )
+    })
+    .await?;
+    let mut built = match built {
+      Ok(built) => built,
+      Err(refused) => return Some(Err(refused)),
+    };
+    // The texts it names read before the scratch member judges it (A-760), a copy slice a step, held as its post-state
+    // is.
+    loop {
+      slates_rt::futures::yield_now().await;
+      let read = crate::state::with_state(|state| {
+        state.count(STAGING_STEPS, 1);
+        super::read_named_slice(state, &mut built)
+      })?;
+      match read {
+        Ok(true) => break,
+        Ok(false) => {}
+        Err(refused) => return Some(Err(refused)),
+      }
     }
-    let staged = self.staged_in(state, repository, (revision, plans));
-    crate::vcs_store::settle_svn(state, repository);
-    staged
+    within_records(repository, lent, |state| {
+      self.staged_in(state, repository, (checked, record, built))
+    })
+    .await
   }
 
-  /// [`Staging::stage_in`] within the records' lent room.
+  /// [`Staging::stage_in`]'s last step, within the records' lent room: the increment judged and staged, the records
+  /// applied, the held table followed, the record kept.
   fn staged_in(
     &mut self,
     state: &mut ShardState,
     repository: RepositoryId,
-    (revision, plans): (Revision, restore::CopyPlans),
+    (checked, record, built): (Checked, Vec<u8>, Increment),
   ) -> Result<StagedIn, Uncommitted> {
-    let (checked, record) = checked(state, repository, revision, None)?;
     let batch = self.batch.as_mut().ok_or(Uncommitted::NotHeld)?;
-    let head = batch.head();
-    let work_identity = identity(&record);
-    let built = crate::vcs_store::lent_state(state, |state| {
-      let ShardState {
-        greens, vcs_stores, ..
-      } = state;
-      let records = vcs_stores
-        .subversion_records(repository)
-        .ok_or(Uncommitted::NotHeld)?;
-      if records.youngest() != head {
-        return Err(Uncommitted::Diverged);
-      }
-      batch
-        .with_engine_in(greens, |engine| {
-          Building::new(records, engine, (&checked, plans)).build(head, work_identity)
-        })
-        .ok_or(Uncommitted::NotHeld)?
-    })?;
-    // The texts it names read before the scratch member judges it (A-760), and held as its post-state is.
-    let mut built = built;
-    super::read_named(state, &mut built)?;
     let named = built
       .named
       .runs
@@ -659,6 +717,47 @@ impl Staging {
     }
     if let Some(turn) = self.turn.take() {
       turn.give_back(state);
+    }
+  }
+}
+
+/// What a revision's staging brings back whole before it stages ([`brought_for_staging`]).
+struct BroughtForStaging {
+  /// The stored texts its rows name that the content store had let go.
+  texts: Vec<ContentIdentity>,
+  /// Its copies' restore plans.
+  plans: restore::CopyPlans,
+  /// The texts those plans set back.
+  restoring: Vec<ContentIdentity>,
+}
+
+/// What staging `revision` brings back whole first ([`Staging::stage_deferred`]): the stored texts its rows name that the
+/// content store let go, its copies' restore plans, and the texts those plans set back, in that order. A refusal gives
+/// back what was brought before it; `None` where the store went away.
+async fn brought_for_staging(
+  repository: RepositoryId,
+  revision: &Revision,
+) -> Option<Result<BroughtForStaging, Uncommitted>> {
+  let texts = match super::bring_stored(repository, &revision.record.changes).await? {
+    Ok(brought) => brought,
+    Err(refused) => return Some(Err(refused)),
+  };
+  let plans = match restore::plan(repository, &revision.record.changes).await? {
+    Ok(plans) => plans,
+    Err(refused) => {
+      let _ = crate::state::with_state(|state| super::release_texts(state, None, &texts));
+      return Some(Err(refused));
+    }
+  };
+  match super::bring_texts(repository, restore::texts_of(&plans).into_iter()).await? {
+    Ok(restoring) => Some(Ok(BroughtForStaging {
+      texts,
+      plans,
+      restoring,
+    })),
+    Err(refused) => {
+      let _ = crate::state::with_state(|state| super::release_texts(state, None, &texts));
+      Some(Err(refused))
     }
   }
 }
