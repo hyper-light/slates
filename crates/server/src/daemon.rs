@@ -1789,6 +1789,17 @@ impl Daemon {
     })
   }
 
+  /// Test support (A-919): the bytes of the state logs' parts this node's shards still hold as an owner, owed to some
+  /// candidate (`state_log::StateLogs::bytes`): a part is let go once every candidate holds it, so this falls back to
+  /// zero once each has caught up. Summed over the shards; the typed refusal when one could not be observed.
+  pub fn state_log_parts_bytes(&self) -> Result<usize, ObserveError> {
+    let mut bytes = 0usize;
+    for shard in self.shards.clone() {
+      bytes = bytes.saturating_add(self.observe(Some(shard), |s| s.state_logs.bytes())?);
+    }
+    Ok(bytes)
+  }
+
   /// Test support (A-914): this node's homing window and the terms it was derived from ([`HomingWindowReading`]).
   pub fn homing_window(&self) -> Result<HomingWindowReading, ObserveError> {
     self.observe(self.shards.first().copied(), |s| {
@@ -2619,6 +2630,22 @@ impl Daemon {
   /// membership commit. A one-shot control-shard observation.
   pub fn council_debug(&self) -> Result<String, ObserveError> {
     self.observe(self.shards.first().copied(), |s| s.council.debug_state())
+  }
+
+  /// `host`'s fencing epoch in the regional configuration this node holds (§4.8: a takeover bumps it), `None` before any
+  /// was recorded for it; and whether a kept retirement still names it (a re-admission waits on none naming it, A-919's
+  /// test settling, A-921). A one-shot control-shard question; its typed refusal when it could not be made.
+  pub fn council_host_standing(
+    &self,
+    host: slates_db::HostId,
+  ) -> Result<(Option<u64>, bool), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let configuration = s.council.configuration();
+      (
+        configuration.epochs.get(&host).map(|epoch| epoch.0),
+        configuration.retired.contains_key(&host),
+      )
+    })
   }
 
   /// The **regional membership** this daemon's configuration council has committed and applied so far
@@ -5515,6 +5542,8 @@ async fn init_shard(
     homing_window_learned: false,
     takeover_epochs_seen: None,
     last_answers: std::collections::BTreeMap::new(),
+    owner_hold: None,
+    ledger_reads: crate::ledger_read::LedgerReads::default(),
     period_stretch_ns: 0,
     attachment_paces: std::collections::BTreeMap::new(),
     council,

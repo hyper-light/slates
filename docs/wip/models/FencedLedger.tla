@@ -46,6 +46,18 @@
 (* TLC configurations: FencedLedger.cfg (two epochs), FencedLedger_3.cfg   *)
 (* (three epochs, symmetric holders), FencedLedger_register.cfg (the        *)
 (* register's rule, which must fail Continuity).                            *)
+(*                                                                          *)
+(* A-919 (main 01a20182's start rule, 2026-11-25): a holder may forget its  *)
+(* log (an owner's hold rebuilt empty at a restart, a candidate a death    *)
+(* brought in holding none of it), its holding then starting where it next *)
+(* accepts.  Phase one reports each holder's start beside its log, and a   *)
+(* report names nothing only from that start: below it the holder counts   *)
+(* toward the quorum's size, not its promises, so a position is adopted    *)
+(* only from a majority whose holdings reach down to it.                   *)
+(* FencedLedger_forget.cfg holds every invariant with the rule;            *)
+(* FencedLedger_forget_norule.cfg, without it, must fail Continuity (a     *)
+(* forgotten holder's silence taken as a promise of nothing, a lower       *)
+(* epoch's surviving value adopted over the committed one).                *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -54,14 +66,21 @@ CONSTANTS Acceptors,    \* the record holders, e.g. {a1, a2, a3}
           Values,       \* payloads, e.g. {v1, v2}
           MaxEpoch,     \* epochs 1..MaxEpoch
           MaxPos,       \* ledger positions 1..MaxPos
-          PerPosition   \* TRUE: adopt every position (§4.8); FALSE: the
+          PerPosition,  \* TRUE: adopt every position (§4.8); FALSE: the
                         \* register's rule, the highest record alone (the
                         \* server's round before GAP-A9-7's record half),
                         \* which the checker must refute (non-vacuity)
+          MaxForgets,   \* how many times any holder may forget its log
+                        \* (A-919; 0 is the model before it)
+          StartRule     \* TRUE: a report names nothing only from its start
+                        \* (A-919); FALSE: from the first position, which
+                        \* the checker must refute once a holder forgets
 
 ASSUME MaxEpoch \in Nat /\ MaxEpoch >= 1
 ASSUME MaxPos \in Nat /\ MaxPos >= 1
 ASSUME PerPosition \in BOOLEAN
+ASSUME MaxForgets \in Nat
+ASSUME StartRule \in BOOLEAN
 
 Majority == {Q \in SUBSET Acceptors : 2 * Cardinality(Q) > Cardinality(Acceptors)}
 
@@ -72,6 +91,8 @@ NoEntry == [epoch |-> 0, value |-> Nothing]
 AnyEntry == [epoch : 0..MaxEpoch, value : Values \cup {Nothing}]
 Proposals == [epoch : Epochs, pos : Positions, value : Values]
 EmptyLog == [p \in Positions |-> Nothing]
+\* A holding's start where it holds nothing: past every position.
+NoStart == MaxPos + 1
 
 \* The entry under the highest epoch among `S` (entries of one position); NoEntry for none.
 Highest(S) == IF S = {} THEN NoEntry
@@ -90,10 +111,13 @@ VARIABLES
   nextPos,      \* [Epochs -> 1..MaxPos+1]: the owner's next position
   issued,       \* SUBSET Proposals: phase-two proposals made
   stale,        \* SUBSET Proposals: made after a higher epoch's promotion majority
-  acks          \* [Proposals -> SUBSET Acceptors]: phase-two acceptances
+  acks,         \* [Proposals -> SUBSET Acceptors]: phase-two acceptances
+  start,        \* [Acceptors -> 1..NoStart]: the lowest position each holds (A-919)
+  promStart,    \* [Epochs -> [Acceptors -> 1..NoStart]]: the start each reported
+  forgets       \* how many forgets happened
 
 vars == <<epochOwner, nextEpoch, promise, accepted, promAcked, promVal, promoted,
-          adopted, log, nextPos, issued, stale, acks>>
+          adopted, log, nextPos, issued, stale, acks, start, promStart, forgets>>
 
 CommittedProposals == {r \in Proposals : acks[r] \in Majority}
 
@@ -115,13 +139,17 @@ Init ==
   /\ issued = {}
   /\ stale = {}
   /\ acks = [r \in Proposals |-> {}]
+  \* Every holder holds the register from its beginning until it forgets (A-919).
+  /\ start = [a \in Acceptors |-> 1]
+  /\ promStart = [e \in Epochs |-> [a \in Acceptors |-> NoStart]]
+  /\ forgets = 0
 
 MasterAssign(h) ==
   /\ nextEpoch <= MaxEpoch
   /\ epochOwner' = [epochOwner EXCEPT ![nextEpoch] = h]
   /\ nextEpoch' = nextEpoch + 1
   /\ UNCHANGED <<promise, accepted, promAcked, promVal, promoted, adopted, log,
-                 nextPos, issued, stale, acks>>
+                 nextPos, issued, stale, acks, start, promStart, forgets>>
 
 (***************************************************************************)
 (* Phase one, one holder at a time: it raises its promise to e and reports  *)
@@ -134,16 +162,21 @@ PromoteAck(e, a) ==
   /\ promise' = [promise EXCEPT ![a] = e]
   /\ promAcked' = [promAcked EXCEPT ![e] = promAcked[e] \cup {a}]
   /\ promVal' = [promVal EXCEPT ![e][a] = accepted[a]]
+  /\ promStart' = [promStart EXCEPT ![e][a] = start[a]]
   /\ UNCHANGED <<epochOwner, nextEpoch, accepted, promoted, adopted, log, nextPos,
-                 issued, stale, acks>>
+                 issued, stale, acks, start, forgets>>
 
 (***************************************************************************)
 (* The owner of epoch e adopts, at every position, the value accepted under *)
 (* the highest epoch among a majority's reports.                            *)
 (***************************************************************************)
-\* At every position, the value accepted under the highest epoch among e's reports.
+\* The holders whose report counts at position p: under the start rule, those whose holding reaches down to it (A-919);
+\* otherwise every one that reported.
+Counted(e, p) == IF StartRule THEN {a \in promAcked[e] : promStart[e][a] <= p} ELSE promAcked[e]
+
+\* At every position, the value accepted under the highest epoch among e's counted reports.
 PerPositionLog(e) ==
-  [p \in Positions |-> Highest({promVal[e][a][p] : a \in promAcked[e]} \ {NoEntry}).value]
+  [p \in Positions |-> Highest({promVal[e][a][p] : a \in Counted(e, p)} \ {NoEntry}).value]
 
 \* The register's rule: the highest record reported, its position alone.
 TopLog(e) ==
@@ -156,10 +189,12 @@ Adopt(e) ==
   /\ epochOwner[e] # "none"
   /\ ~promoted[e]
   /\ PromotionMajority(e)
+  \* Each position adopted within tolerance: a majority counted there (A-919's start rule).
+  /\ \A p \in Positions : Counted(e, p) \in Majority
   /\ adopted' = [adopted EXCEPT ![e] = IF PerPosition THEN PerPositionLog(e) ELSE TopLog(e)]
   /\ promoted' = [promoted EXCEPT ![e] = TRUE]
   /\ UNCHANGED <<epochOwner, nextEpoch, promise, accepted, promAcked, promVal, log,
-                 nextPos, issued, stale, acks>>
+                 nextPos, issued, stale, acks, start, promStart, forgets>>
 
 (***************************************************************************)
 (* Phase two, in order: the owner of e proposes its next position, the      *)
@@ -181,7 +216,7 @@ Propose(e, v) ==
         /\ log' = [log EXCEPT ![e][p] = value]
         /\ nextPos' = [nextPos EXCEPT ![e] = p + 1]
   /\ UNCHANGED <<epochOwner, nextEpoch, promise, accepted, promAcked, promVal,
-                 promoted, adopted, acks>>
+                 promoted, adopted, acks, start, promStart, forgets>>
 
 Accept(r, a) ==
   /\ r \in issued
@@ -190,8 +225,22 @@ Accept(r, a) ==
   /\ promise' = [promise EXCEPT ![a] = r.epoch]
   /\ accepted' = [accepted EXCEPT ![a][r.pos] = [epoch |-> r.epoch, value |-> r.value]]
   /\ acks' = [acks EXCEPT ![r] = acks[r] \cup {a}]
+  /\ start' = [start EXCEPT ![a] = IF r.pos < start[a] THEN r.pos ELSE start[a]]
   /\ UNCHANGED <<epochOwner, nextEpoch, promAcked, promVal, promoted, adopted, log,
-                 nextPos, issued, stale>>
+                 nextPos, issued, stale, promStart, forgets>>
+
+(***************************************************************************)
+(* A-919: a holder forgets its log (an owner's hold rebuilt empty at a     *)
+(* restart; a candidate holding none of it): its entries and its start go; *)
+(* its promise stays (a holder's fence is durable).                         *)
+(***************************************************************************)
+Forget(a) ==
+  /\ forgets < MaxForgets
+  /\ accepted' = [accepted EXCEPT ![a] = [p \in Positions |-> NoEntry]]
+  /\ start' = [start EXCEPT ![a] = NoStart]
+  /\ forgets' = forgets + 1
+  /\ UNCHANGED <<epochOwner, nextEpoch, promise, promAcked, promVal, promoted, adopted,
+                 log, nextPos, issued, stale, acks, promStart>>
 
 Next ==
   \/ \E h \in Hosts : MasterAssign(h)
@@ -199,6 +248,7 @@ Next ==
   \/ \E e \in Epochs : Adopt(e)
   \/ \E e \in Epochs, v \in Values : Propose(e, v)
   \/ \E r \in Proposals, a \in Acceptors : Accept(r, a)
+  \/ \E a \in Acceptors : Forget(a)
 
 Spec == Init /\ [][Next]_vars
 
@@ -233,6 +283,8 @@ TypeOK ==
   /\ \A e \in Epochs : nextPos[e] \in 1..(MaxPos + 1)
   /\ issued \subseteq Proposals
   /\ stale \subseteq issued
+  /\ \A a \in Acceptors : start[a] \in 1..NoStart
+  /\ forgets \in 0..MaxForgets
 
 \* Holders are interchangeable: TLC explores one ordering of them.
 Symmetric == Permutations(Acceptors)

@@ -431,6 +431,14 @@ pub enum RegisterError {
   /// value a position (§4.8, BUG-12). A higher epoch's different value replaces a held one, which never committed
   /// (A-373).
   ConflictingPosition,
+  /// A ledger position past what this holder holds of its register, which holds only a prefix of it (a state log's part
+  /// whose predecessor it lacks, A-919): `held` is the newest position it holds, `None` for none of the register. A
+  /// candidate a death brought in answers so where it answered nothing, and fetches the positions between from the
+  /// register's other candidates.
+  Behind {
+    /// The newest position this holder holds of the register, `None` for none.
+    held: Option<u64>,
+  },
 }
 
 /// What `await placed` waits for (§4.8 "Mirroring", D-18): the home region's commit, or the
@@ -1076,6 +1084,13 @@ impl Ack {
 /// piggyback rule). A `ConfigurationStale` reply is `[STALE_REFUSAL_TAG][version: u64 LE]` — nine bytes,
 /// which [`Ack::decode`] rejects on length ([`ACK_BYTES`] is 72), so the two reply shapes never collide.
 const STALE_REFUSAL_TAG: u8 = 1;
+/// Format: the tag byte of a carried `Behind` refusal (A-919): then a flag byte, [`HELD_NONE`] or [`HELD_SOME`] and the
+/// held position's eight bytes, so 2 or 10 bytes, which no [`Ack`] (72 bytes) or `ConfigurationStale` (9) matches.
+const BEHIND_REFUSAL_TAG: u8 = 2;
+/// Format: a `Behind` refusal's flag byte for no position held.
+const HELD_NONE: u8 = 0;
+/// Format: a `Behind` refusal's flag byte before the held position.
+const HELD_SOME: u8 = 1;
 
 /// A record refusal a *sender* acts on, decoded from a holder's reply that is not an [`Ack`]. The only
 /// refusal carried back on the record wire is [`ConfigurationStale`](RegisterError::ConfigurationStale): a
@@ -1090,11 +1105,18 @@ pub enum Refusal {
     /// The holder's current (newer) configuration version.
     version: u64,
   },
+  /// The holder holds a prefix of the register short of the record's predecessor (A-919, [`RegisterError::Behind`]):
+  /// it is fetching the positions between, so the sender keeps shipping as before.
+  Behind {
+    /// The newest position the holder holds, `None` for none of the register.
+    held: Option<u64>,
+  },
 }
 
 /// The wire form of a record refusal the sender acts on (§4.8 the piggyback rule). A
 /// [`ConfigurationStale`](RegisterError::ConfigurationStale) rides back so a sender on an older configuration
-/// refreshes and retries within its budget. Every other refusal encodes to an **empty** reply — the sender
+/// refreshes and retries within its budget, and a [`Behind`](RegisterError::Behind) so it learns the holder is fetching
+/// what it lacks (A-919). Every other refusal encodes to an **empty** reply — the sender
 /// counts no acknowledgement and retries as before: an [`Unauthorized`](RegisterError::Unauthorized) or
 /// [`ConflictingPosition`](RegisterError::ConflictingPosition) is not a staleness a refresh resolves, and a
 /// [`StaleEpoch`](RegisterError::StaleEpoch) on the record path is shadowed by this gate — a superseded owner
@@ -1109,6 +1131,16 @@ pub fn encode_refusal(error: &RegisterError) -> Vec<u8> {
       out.extend_from_slice(&version.to_le_bytes());
       out
     }
+    RegisterError::Behind { held } => match held {
+      None => vec![BEHIND_REFUSAL_TAG, HELD_NONE],
+      Some(held) => {
+        let mut out = Vec::with_capacity(size_of::<u64>().saturating_add(2));
+        out.push(BEHIND_REFUSAL_TAG);
+        out.push(HELD_SOME);
+        out.extend_from_slice(&held.to_le_bytes());
+        out
+      }
+    },
     _ => Vec::new(),
   }
 }
@@ -1119,12 +1151,21 @@ pub fn encode_refusal(error: &RegisterError) -> Vec<u8> {
 /// `ConfigurationStale` is exactly `1 + 8` bytes led by [`STALE_REFUSAL_TAG`], which no [`Ack`] (72 bytes)
 /// can match.
 pub fn decode_refusal(bytes: &[u8]) -> Option<Refusal> {
-  let (&tag, version) = bytes.split_first()?;
-  if tag != STALE_REFUSAL_TAG {
-    return None;
+  let (&tag, rest) = bytes.split_first()?;
+  match tag {
+    STALE_REFUSAL_TAG => {
+      let version = u64::from_le_bytes(rest.try_into().ok()?);
+      Some(Refusal::ConfigurationStale { version })
+    }
+    BEHIND_REFUSAL_TAG => match rest.split_first()? {
+      (&HELD_NONE, []) => Some(Refusal::Behind { held: None }),
+      (&HELD_SOME, held) => Some(Refusal::Behind {
+        held: Some(u64::from_le_bytes(held.try_into().ok()?)),
+      }),
+      _ => None,
+    },
+    _ => None,
   }
-  let version = u64::from_le_bytes(version.try_into().ok()?);
-  Some(Refusal::ConfigurationStale { version })
 }
 
 /// The highest record a holder has accepted for one object (§4.8 "reports the highest record it holds
@@ -1599,6 +1640,71 @@ impl LedgerPrepare {
   }
 }
 
+/// A current candidate's read of a ledger's positions (A-919, main 01a20182's ruling of 2026-11-25: the ledger question
+/// split into a read and a promise): every position the answering candidate holds of `object` in `from..to`, under the
+/// configuration `generation` both hold. It moves nothing: no authority installed, no fence raised. A candidate a death
+/// brought in reads the prefix it lacks from the others so; a takeover's [`LedgerPrepare`] is this read after its
+/// promise. Answered as a [`LedgerPromise`] that promises nothing ([`LEDGER_READ_EPOCH`], the asker in its `departed`
+/// slot), which [`LedgerRead::answers`] binds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerRead {
+  /// The candidate asking.
+  pub asker: HostId,
+  /// The configuration generation it asks under; a candidate on another refuses.
+  pub generation: u64,
+  /// The ledger asked about.
+  pub object: ObjectId,
+  /// The first position asked.
+  pub from: u64,
+  /// The position past the last asked.
+  pub to: u64,
+}
+
+/// Format: a [`LedgerRead`]'s bytes: asker, generation (u64 LE each), the object, then the range's ends (u64 LE each).
+pub const LEDGER_READ_BYTES: usize = 4 * size_of::<u64>() + OBJECT_BYTES;
+
+/// Format: the epoch a [`LedgerRead`]'s answer carries: none, since a read promises nothing (no epoch is 0, `FIRST_EPOCH`
+/// is 1).
+pub const LEDGER_READ_EPOCH: HostEpoch = HostEpoch(0);
+
+impl LedgerRead {
+  /// The canonical bytes, [`LEDGER_READ_BYTES`] of them.
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::with_capacity(LEDGER_READ_BYTES);
+    out.extend_from_slice(&self.asker.0.to_le_bytes());
+    out.extend_from_slice(&self.generation.to_le_bytes());
+    out.extend_from_slice(&self.object.0);
+    out.extend_from_slice(&self.from.to_le_bytes());
+    out.extend_from_slice(&self.to.to_le_bytes());
+    out
+  }
+
+  /// Reconstructs a read from its bytes, or [`RegisterError::MalformedRecord`] for anything short or long (hostile
+  /// input).
+  pub fn decode(bytes: &[u8]) -> Result<LedgerRead, RegisterError> {
+    let mut reader = WireReader::new(bytes);
+    let read = LedgerRead {
+      asker: HostId(reader.word()?),
+      generation: reader.word()?,
+      object: reader.object()?,
+      from: reader.word()?,
+      to: reader.word()?,
+    };
+    reader.finish()?;
+    Ok(read)
+  }
+
+  /// Whether `answer` answers this read: no promise ([`LEDGER_READ_EPOCH`], no fence), to this asker, under this
+  /// generation, of this ledger.
+  pub fn answers(&self, answer: &LedgerPromise) -> bool {
+    answer.departed == self.asker
+      && answer.epoch == LEDGER_READ_EPOCH
+      && answer.fenced.is_none()
+      && answer.generation == self.generation
+      && answer.object == self.object
+  }
+}
+
 /// A holder's answer to a [`LedgerPrepare`] (A-364): every position of the ledger it accepted in the asked range,
 /// ascending, each under the epoch it was accepted at, its fence raised to the round's epoch before the answer was
 /// formed; where the answer stopped when the range did not fit one frame (`next`, the next position to ask); or the
@@ -1622,13 +1728,16 @@ pub struct LedgerPromise {
   pub next: Option<u64>,
   /// The holder's fence above the epoch, when it could not promise; its positions are then empty.
   pub fenced: Option<HostEpoch>,
+  /// The lowest position the holder's acceptor holds of the ledger, `None` for none (A-919, main 01a20182's start
+  /// rule): its answer names nothing only from here; below it, it covers nothing.
+  pub held_from: Option<u64>,
 }
 
 /// Format: the widest [`LedgerPromise`] header: holder, departed, epoch, generation (u64 LE each), the object, the next
-/// position's and the fence's presence bytes and values (u64 LE each), and the position count (u32 LE). A holder pages
-/// against it, so an answer with either field absent stays within its frame too.
+/// position's, the fence's and the held start's presence bytes and values (u64 LE each, A-919 the third), and the
+/// position count (u32 LE). A holder pages against it, so an answer with any of them absent stays within its frame too.
 pub const LEDGER_PROMISE_HEADER_BYTES: usize =
-  4 * size_of::<u64>() + OBJECT_BYTES + 2 * (1 + size_of::<u64>()) + size_of::<u32>();
+  4 * size_of::<u64>() + OBJECT_BYTES + 3 * (1 + size_of::<u64>()) + size_of::<u32>();
 
 /// Format: one [`LedgerPromise`] position's fixed bytes: its sequence and epoch (u64 LE each) and its value's length
 /// (u32 LE).
@@ -1660,6 +1769,7 @@ impl LedgerPromise {
     out.extend_from_slice(&self.object.0);
     put_optional_word(&mut out, self.next);
     put_optional_word(&mut out, self.fenced.map(|fence| fence.0));
+    put_optional_word(&mut out, self.held_from);
     let count = u32::try_from(self.positions.len()).unwrap_or(u32::MAX);
     out.extend_from_slice(&count.to_le_bytes());
     for accepted in &self.positions {
@@ -1684,6 +1794,7 @@ impl LedgerPromise {
     let object = reader.object()?;
     let next = reader.optional_word()?;
     let fenced = reader.optional_word()?.map(HostEpoch);
+    let held_from = reader.optional_word()?;
     let count = usize::try_from(reader.half()?).map_err(|_| RegisterError::MalformedRecord)?;
     if count > reader.remaining() / LEDGER_POSITION_BYTES {
       return Err(RegisterError::MalformedRecord);
@@ -1711,6 +1822,7 @@ impl LedgerPromise {
       positions,
       next,
       fenced,
+      held_from,
     })
   }
 }
@@ -2278,6 +2390,29 @@ impl Acceptor {
     }
   }
 
+  /// Holds a ledger position a read adopted (A-919, `takeover::read_ledger`): a candidate that holds none of a register,
+  /// or a prefix of it short of what its owner ships, takes the positions between from its cohort, written under
+  /// earlier configurations, so without the generation and authority checks a shipped record passes; the read's fold
+  /// at its cohort's quorum vouches for each. Never over a position held at the same or a higher epoch (that value is
+  /// the newer, A-373). Whether it was held.
+  pub fn hold_read(&mut self, object: ObjectId, accepted: &Accepted) -> bool {
+    let position = (object, accepted.sequence);
+    if self
+      .accepted
+      .get(&position)
+      .is_some_and(|(epoch, _)| *epoch >= accepted.epoch)
+    {
+      return false;
+    }
+    self
+      .accepted
+      .insert(position, (accepted.epoch, accepted.value.clone()));
+    if let Some(changes) = self.changes.as_mut() {
+      changes.note_written(position);
+    }
+    true
+  }
+
   /// Drops every accepted position of `object` below `sequence` (AUD-29-43). For a **single-value** register
   /// — a volume's head, its catalog, a tombstone — phase one reports only the highest accepted position
   /// ([`prepare`](Acceptor::prepare)), so once `sequence` is accepted the older positions can never be adopted
@@ -2334,6 +2469,18 @@ impl Acceptor {
         epoch: *epoch,
         value: value.clone(),
       })
+  }
+
+  /// The lowest position of `object` this acceptor holds, `None` for none of it (A-919, main 01a20182's start rule): where
+  /// it began holding the object, or was rebuilt or compacted to. A holder's positions of a ledger are contiguous from it
+  /// (a holder refuses a part past its copy, an owner writes in order), so below it the acceptor knows nothing and its
+  /// silence names nothing there.
+  pub fn held_from(&self, object: ObjectId) -> Option<u64> {
+    self
+      .accepted
+      .range((object, 0)..=(object, u64::MAX))
+      .next()
+      .map(|((_, position), _)| *position)
   }
 
   /// The value accepted for `object` at `sequence`, if this acceptor holds that position: one lookup, where
@@ -5353,6 +5500,27 @@ mod tests {
     assert_eq!(decode_refusal(&[9, 0, 0, 0, 0, 0, 0, 0, 0]), None); // right length, unknown tag
   }
 
+  /// A-919: a `Behind` refusal rides back with the newest position the holder holds, or none, and decodes to exactly
+  /// that; a flag past its two values, or a short or long held position, decodes as nothing actionable.
+  #[test]
+  fn a_behind_refusal_rides_back_with_the_position_held() {
+    for held in [None, Some(0), Some(7)] {
+      let wire = encode_refusal(&RegisterError::Behind { held });
+      assert_eq!(decode_refusal(&wire), Some(Refusal::Behind { held }));
+    }
+    assert_eq!(
+      encode_refusal(&RegisterError::Behind { held: None }),
+      vec![BEHIND_REFUSAL_TAG, HELD_NONE]
+    );
+    assert_eq!(decode_refusal(&[BEHIND_REFUSAL_TAG]), None);
+    assert_eq!(
+      decode_refusal(&[BEHIND_REFUSAL_TAG, HELD_SOME.saturating_add(1)]),
+      None
+    );
+    assert_eq!(decode_refusal(&[BEHIND_REFUSAL_TAG, HELD_NONE, 0]), None);
+    assert_eq!(decode_refusal(&[BEHIND_REFUSAL_TAG, HELD_SOME, 1, 2]), None);
+  }
+
   /// AC (§4.8, A-9 — the per-host epoch fence): when the configuration group bumps a failed owner's fencing
   /// epoch, a holder raises its fence to it, and the owner's later records under the **old** epoch are
   /// refused `StaleEpoch` — the immediate fence a configuration install installs, before any per-object
@@ -7676,6 +7844,7 @@ mod tests {
       ],
       next: Some(5),
       fenced: None,
+      held_from: Some(3),
     }
   }
 

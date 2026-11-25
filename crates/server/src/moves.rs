@@ -677,7 +677,6 @@ fn capture(owner_acceptor: &Acceptor, object: ObjectId) -> Option<BTreeMap<Objec
 pub(crate) async fn drive_outgoing(
   origin: u16,
   local: HostId,
-  owner_acceptor: &mut Acceptor,
   budget: CommitBudget,
   in_flight: &mut Vec<Dispatch>,
 ) {
@@ -705,7 +704,8 @@ pub(crate) async fn drive_outgoing(
       Step::Thaw => crate::xshard::run_on_counted(origin, shard, move |s| thaw(s, object)),
       Step::Freeze => crate::xshard::run_on_counted(origin, shard, move |s| freeze(s, object)),
       Step::Report => {
-        let Some(records) = capture(owner_acceptor, object) else {
+        let Some(records) = crate::fleet::with_owner_hold(|hold| capture(hold, object)).flatten()
+        else {
           let _ = state::with_state_counted(|s| s.count(MOVE_UNCAPTURED, 1));
           continue;
         };
@@ -751,8 +751,10 @@ pub(crate) async fn drive_outgoing(
           .unwrap_or(true);
         if !adopted_back {
           crate::xshard::run_on_counted(origin, shard, move |s| release(s, object, owner));
-          owner_acceptor.forget_object(object);
-          owner_acceptor.forget_object(object.catalog());
+          crate::fleet::with_owner_hold(|hold| {
+            hold.forget_object(object);
+            hold.forget_object(object.catalog());
+          });
         }
         let _ = state::with_state_counted(|s| {
           s.move_records.remove(&object);

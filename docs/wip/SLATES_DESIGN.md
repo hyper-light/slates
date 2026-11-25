@@ -21623,6 +21623,12 @@ Status: built 2026-10-06. Windows was owed (A-105) and is built by A-205.
   - A recovery's claim forgets the record without a call. No mark can be on a claimed block: marks go only on free
     blocks; a block leaves the free lists only through an allocation, which clears it; and an image names only blocks
     live at its commit (A-64's deferred frees).
+- What reads residency (goal 93 P7, main's ruling of 2026-11-25): a marked page stays in `mincore`'s count and in the
+  process's resident size until the kernel takes it; only the physical footprint drops (measured,
+  `crates/mem/tests/macos_residency.rs`: 32 MiB given back, footprint 33 MiB to 1, `mincore` 32 before and after). So
+  the arena's residency (`mem.gauge.content.object_resident_bytes`) is `Region::residency_in_use`: `mincore` less the
+  pages the region records as marked, the pages the process still owns. On macOS a resident size compared across a
+  purge says nothing; the footprint does.
 - The purge, on every platform: it gave back every free block of the arena whenever anything had been freed, including
   never-touched ones. That had three costs:
   - on Linux, a `madvise` over the whole free arena after each free, and a count (`content.purged_bytes`) that counted
@@ -26091,6 +26097,11 @@ the record `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke
   against the shortened list.
 
 ### A-235 — The merge record plane runs when there is merge work, and a version's inputs go only to holders whose next record it is (accepted 2026-11-06)
+
+> **Amended by A-919 (2026-11-25):** the owner's acceptor no longer lives with the coordinator. It is in the control
+> shard's state (`ShardState::owner_hold`), borrowed briefly and never across an await, so a ledger read can answer
+> from it. This entry's reason for keeping it here, a second dispatcher contending for it and for the sessions, does
+> not apply to a read that moves nothing.
 
 §4.16 "Commit" ran the record plane only on the coordinator's period, so a submit at `f > 0`, answered once its record
 commits, waited one to two periods (208 to 647 ms at `f = 1`), against goal 4's 1 ms. Replace that: an owner shard
@@ -33888,6 +33899,10 @@ BENCHMARKS ("Windows' own window"), `crates/rt` (`iocp.rs`: `RaisedForWait`, `mo
   boosts the wake (an address of its parking word), which needs the parking protocol to name the object its kickers
   signal, and the loom model with it.
 ### A-364 — A ledger is adopted position by position: modelled, and the record half of GAP-A9-7 built on it (2026-11-18, kiln goal g250; §4.8 "Promotion and takeover", §4.16 "Commit"; GAP-A9-7, BUG-12)
+
+> **Amended by A-919 (2026-11-25):** an answer names nothing only from where its acceptor's holding begins (the
+> start rule). Below that, it counts toward a cohort's size, not its promises. The question is split into a read and a
+> promise, and the read is also answered under a live owner.
 
 - **The model.** `docs/wip/models/FencedLedger.tla` (text, configurations `FencedLedger.cfg`, `FencedLedger_3.cfg`,
   `FencedLedger_register.cfg`) models a green's merge-record log as §4.8 states its takeover: each holder keeps an
@@ -63762,6 +63777,111 @@ Applied in the same change to: the A-412 note in `merge_service::catch_up`'s doc
 `crates/cluster/src/content.rs`, `crates/server/src/{merge_service,state_log}.rs`, `crates/server/tests/fleet.rs`
 (a914's wait factored out as `poll_taken_over_and_unseated`), GAPS.
 
+### A-919 — A candidate a death brings in reads the ledger it lacks from its cohort, the owner among them, an answer naming nothing only from where its holding begins (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25: the split, (a) and the start rule; A-918's (iii); amends A-364, A-235 and state_log's owed list)
+
+- **Why.** After a death at three members every member is a candidate of every register, so a node that never held a
+  repository's state logs joined their placement.
+  - The owner shipped it each part, which continues the log from a position it lacked. It refused every one
+    (`Discontinuous`), with an empty reply.
+  - Nothing ships the prefix: the owner lets a part go once every candidate holds it.
+  - Worse, the newcomer's acknowledgement never came, so the owner kept every part from then on, toward the
+    partition's bound (`repository.state_log.parts_full`), past which every change to the repository is refused
+    `Overloaded`.
+  - Red, the fleet test below: a's parts stayed at 933 bytes after two pushes; the newcomer refused 12,002 parts.
+- **The change.**
+  - Every refusal is typed. A part past a holder's copy answers `RegisterError::Behind { held }` (register refusal
+    tag 2: the newest position it holds, or none), counted `fleet.record.refused.behind`, where it answered nothing.
+  - **The ledger question is split into a read and a promise.** The read is `slates_db::takeover::read_ledger` and
+    `LedgerRead`: `positions_between`, paged by `page_budget`, with where the answerer's holding begins. It is
+    answered only to a current candidate of the register under the installed generation (stream 32,
+    `ledger_read::serve_ledger_read`), and it moves nothing. A takeover's `answer_ledger` is the read after its
+    promise. One read serves a successor's takeover, a state log's newcomer, and A-918 B's green chains under a live
+    owner.
+  - **The owner answers too** (main's ruling (a)), from its own hold. §4.8 counts it among `f + 1` (":308", ":24277
+    once the owner and f of them hold it"), so a fold that left it out could miss a committed value.
+    - Its acceptor moved from the record plane's coordinator, where A-235 kept it, into the control shard's state
+      (`ShardState::owner_hold`).
+    - It is borrowed briefly, never across an await. The commits take it once, before they send, through
+      `slates_cluster::OwnerHold`.
+    - A-235's reason (a second dispatcher contending for it and for the sessions) does not apply to a read that
+      borrows it for one page and moves nothing.
+    - A read may see a record the owner accepted before its `f + 1`: the owner's own proposal at its epoch, one value
+      a position (A-373), so adopting it equals being shipped it.
+  - **The start rule** (main's condition, red first; amends A-364's fold).
+    - An answer names nothing only from where its acceptor's holding begins: `Acceptor::held_from`, for a state log
+      past its first part's `from`. Below that it covers nothing, and only its reports count there.
+    - Below its start a member counts as A-309 counts one gone: toward the cohort's size, not its promises.
+    - One rule for every answer, the asker's and a takeover successor's own included.
+    - Without it, an owner's hold rebuilt empty at a restart named nothing at every position it forgot. The fold then
+      met quorum on an old holder's lower-epoch value and adopted it.
+  - The newcomer reads `[its position, the refused part's from]` from the other candidates, folds the answers with
+    its own at the cohort's quorum (`ledger_positions_chained`), and holds each adopted position in order
+    (`Acceptor::hold_read`). Each part must continue the copy before it (`state_log::judge`). The routing view
+    learns the register then, as an accepted record makes it learn one, so each install raises the new acceptor with
+    the others. Without that, one run in six kept its acceptor at the read's generation, and every later part was
+    refused `ForeignGeneration` for good. Swept for a third holder of a new acceptor that skips routing (main's
+    ruling): the production sites are `fleet::hold_checked_record` (routes on accept),
+    `content_holder::restore_held_registers` (routes at restore), `takeover::commit_adopted_at` (the successor's own
+    copy, routed by `record_adoption`'s `track_owner_on_every_shard`) and this one; every other site is a test. The
+    owner's next shipment continues it.
+    - **Continuity is the fold's one rule, a parameter** (main's ruling). The fold passes over a position its cohorts
+      are ready at with no report: a quorum named nothing there, so nothing committed there. It adopts a reported
+      position only if it continues the last adopted, and stops at the first that is not ready or breaks the chain.
+    - A green's dense chain continues at the next position, which adopts exactly what the dense rule did: a hole
+      followed by a report now stops at the report, and its one caller's "whole" is unchanged.
+    - A state log's positions are sparse (each part is held at the position it leaves the log at), and a part
+      continues where its `from` is the last part's position. So a part past a missing one (parts at 10 and 30, 20
+      ready and empty) is a stray, never adopted.
+  - **Bounded.** One read in flight per register per node, one page a period. Counted: `fleet.ledger_read.asked`,
+    `answered`, `positions_held`, `bytes_held`, `past_tolerance`, `refused` and `discontinuous`.
+- **The open edge (named, not built).** A newcomer whose fold is past tolerance adopts nothing and is refused typed
+  (`fleet.ledger_read.past_tolerance`, logged): what committed is the owner's applied state, never the newest
+  surviving older value. The case is the owner's hold forgotten at its restart and the departed gone.
+  - It then pins the owner's let-go of the register's parts, as before.
+  - The answer is the configuration's: a candidate that cannot hold a register leaves its candidacy. Owed.
+- **The sibling (OPEN, found by A-919, owner main; not built here).** The owner's hold counts among `f + 1`, but no
+  restart recovers it: the record plane builds it empty, and "an owner's acceptor, whose positions no image carries"
+  (register.rs). A holder publishes each accept before it acknowledges and is rebuilt from that
+  (`Acceptor::recovered`).
+  - So an owner's warm restart spends one of `f`, unseen, on every record it counted itself in. Example: commit at
+    {owner, departed}, the owner restarts warm, the departed retires, and the record is gone after one failure anyone
+    saw. Traced from the code, not observed.
+  - The root fix: the owner's hold published and recovered as a holder's is. The start rule still guards compaction
+    and newcomers after that.
+- **Models.** `docs/wip/models/FencedLedger.tla` gains a holder that forgets its log (`Forget`, at most `MaxForgets`
+  times; its fence stays) and the start rule (`StartRule`; a report counted at a position only from its start;
+  adoption needs a majority counted at every position).
+  - `FencedLedger_forget.cfg` must hold every invariant.
+  - `FencedLedger_forget_norule.cfg` must fail Continuity: a forgotten holder's silence taken as a promise, and a
+    lower epoch's value adopted.
+  - The older configurations keep their meaning: no forget, and the rule changes nothing.
+  - The model's ledger is dense. A state log keeps AdoptedIsPrefix because the chain check makes it the dense case
+    over part indexes: a part is adopted only where it continues the last one, so the adopted parts are the first k
+    links of the chain. The dense spec's run covers it.
+  - Both TLC runs are in main's run-request queue (§8: no agent runs TLC).
+- **Tests** (macOS arm64, debug, 2026-11-25).
+  - Fleet `a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_their_parts_are_let_go`: red
+    before (933 bytes kept, 12,002 refusals). Green: the newcomer read once, held 2 positions (500 bytes), and a's
+    parts fell back to 0 bytes.
+  - Fleet `a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins` (a restarted warm before
+    the newcomer reads): the read is past tolerance and the newcomer holds nothing. Without the start rule it adopted
+    the old holder's prefix. Its scene fails to form about 1 run in 3: the surviving holder refuses a's records after
+    its warm restart, so no part reaches the newcomer. Since A-921 part 1 it asserts a was not taken over by its
+    restart (its fencing epoch unchanged) before it stops anyone, and forms the scene afresh, at most three times,
+    where a was. The rule's own guard is the unit red above.
+  - `slates_db::takeover::tests::an_answer_names_nothing_only_from_the_first_position_it_holds` (main's red: Ready
+    with epoch 1 before, past tolerance after), `a_read_lists_what_a_candidate_holds_with_its_start_and_moves_nothing`,
+    `a_state_logs_fold_adopts_only_parts_that_continue_the_last` (main's red: the part at 30 past a missing 20 never
+    adopted, stopped at 30);
+    `register::tests::a_behind_refusal_rides_back_with_the_position_held`; and fleet.rs's
+    `a_holder_answers_a_state_log_part_past_its_copy_behind_with_the_position_it_holds`.
+
+Applied in the same change to: A-364 (the fold's start rule; the question split into a read and a promise), A-235 (the
+owner's acceptor in the control shard's state), the state_log module doc (its owed transfer done; the open edge),
+`crates/db/src/{register,takeover}.rs`, `crates/cluster/src/lib.rs`,
+`crates/server/src/{ledger_read,state_log,fleet,moves,merge_service,takeover,state,daemon,lib}.rs`,
+`crates/server/tests/fleet.rs`, `docs/wip/models/FencedLedger.tla` and its configurations, GAPS.
+
 ### A-915 — Nothing acknowledged rests on a part only the dead owner held: a repository's creation answers once its root's join is at f + 1 too, and an adoption never waits for a join no owner is left to ship (2026-11-24, w-shared for main 01a20182, its ruling (1); a894's flake, my regression from A-908 part 4; amends A-894 and A-908)
 
 - **Why.** a894 (a repository's owner killed as its creation answers) failed under load, about 1 run in 3 at load 60 to
@@ -63913,3 +64033,18 @@ GAPS.
 - **Piece 0, the reservation once.** `ImportBatch::stage` computed the work's reservation for its room check
   (`reservation_of`), and `judge_staged` walked the same work at the same head again; the first result is passed
   through, the scratch member unchanged between but for the texts lent it. The judge step 262-265 ms → 227-228 ms.
+- **Piece 1, the scratch commit.** The accepted verdict is committed into the scratch member on A-917's run machinery
+  (`Green::begin_committing`, `committing_step` over `Prep` and `commit_step`, without the replay-reads check, which
+  the verdict made), `ImportBatch::stage_begin` judging and `stage_step` committing a slice until the step's clock
+  passes its quantum, a unit at least; `stage` is the two carried to their end. Staging's steps
+  (`Staging::staged_in`, `staging_step`) each do what their slice holds: the judge, the commit's slices, then the
+  records' apply in the step the commit ends in where its slice is not spent, else in one of their own, so a revision
+  that fits a slice stages in one step. A step with no commit begun is refused, never "more". At 9,000 files the judge
+  step 227-228 ms → 89-92 ms (the reservation 29, the verdict 57 and the commit's first unit), the commit's steps
+  under the quantum but two whole parts, the preparation's turn from its sole runs (`named_files`, `alone`: 6.8 ms) and
+  the commit's end (`commit_finish` 6.6 ms with the batch's keep, 12.9-13.6 ms in all), and the records' step 29-30 ms;
+  the record check (101-105 ms) and the build (51-53 ms) unchanged. Oracle: over generated works, a verdict committed
+  a unit a step equals the verdict committed whole (`a_verdict_committed_a_unit_a_step_is_the_verdict_committed_whole`,
+  1,000 cases); the svn import tests unchanged. The contended-flush test's hog holds the shard's flush measured by
+  an import alone first, not 500 ms: every staging step waits a hold, and the first batch's 151 steps took it past its
+  patience (61 s at 150 ms; 3.5-5.3 s at a flush, its await 0.45-1.1 s against `F` 5.6-9.8 ms).
