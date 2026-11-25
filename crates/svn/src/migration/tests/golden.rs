@@ -12,7 +12,7 @@ use super::support::{
 };
 use crate::commit::record::Record;
 use crate::dump::Format;
-use crate::index::{Action, ChangedPath, NodeKind};
+use crate::index::{Action, ChangedPath, NodeKind, RevisionRecord};
 use crate::migration::paths::{compare_paths, relative};
 use crate::migration::{Importer, Importing, MigrationRefusal, Standalone};
 
@@ -483,4 +483,33 @@ fn a_whole_text_is_written_in_the_pieces_its_caller_sizes() {
     "a call appended {largest} bytes"
   );
   assert!(out == vector("full.dump"), "the bytes svnadmin dump wrote");
+}
+
+/// A-920 piece 2 (golden). Do: import every dump `svnadmin` wrote (`full.dump`, `deltas.dump`, and `part1.dump` then
+/// `part2.dump`), and commit each revision's record as its index holds it on two empty indexes, one planning it whole,
+/// the other one row a step. Expect every revision committed on both, the same plan for each, and the two indexes
+/// alike after each.
+#[test]
+fn every_revision_svnadmin_wrote_planned_a_row_a_step_is_the_revision_planned_whole() {
+  for dumps in [
+    &["full.dump"][..],
+    &["deltas.dump"],
+    &["part1.dump", "part2.dump"],
+  ] {
+    let repository = imported(dumps);
+    let index = repository.records().index();
+    let records: Vec<RevisionRecord> = (1..=index.youngest())
+      .map(|revision| RevisionRecord {
+        transaction: index
+          .transaction(revision)
+          .unwrap()
+          .unwrap_or(crate::index::tests::TRANSACTION)
+          .to_owned(),
+        changes: index.changes(revision).unwrap().to_vec(),
+      })
+      .collect();
+    let committed = crate::index::tests::sliced_against_whole(records)
+      .unwrap_or_else(|why| panic!("{dumps:?}: {why}"));
+    assert_eq!(u64::try_from(committed), Ok(index.youngest()), "{dumps:?}");
+  }
 }

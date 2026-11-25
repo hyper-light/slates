@@ -2632,6 +2632,22 @@ impl Daemon {
     self.observe(self.shards.first().copied(), |s| s.council.debug_state())
   }
 
+  /// `host`'s fencing epoch in the regional configuration this node holds (§4.8: a takeover bumps it), `None` before any
+  /// was recorded for it; and whether a kept retirement still names it (a re-admission waits on none naming it, A-919's
+  /// test settling, A-921). A one-shot control-shard question; its typed refusal when it could not be made.
+  pub fn council_host_standing(
+    &self,
+    host: slates_db::HostId,
+  ) -> Result<(Option<u64>, bool), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let configuration = s.council.configuration();
+      (
+        configuration.epochs.get(&host).map(|epoch| epoch.0),
+        configuration.retired.contains_key(&host),
+      )
+    })
+  }
+
   /// The **regional membership** this daemon's configuration council has committed and applied so far
   /// (§4.8, D-14) — the members of the `RegionalConfiguration`, the region the council masters. A one-shot
   /// control-shard question ([`Self::observation`]); an observation the daemon could not make is its typed
@@ -5260,6 +5276,7 @@ async fn init_shard(
     peer_recipients: std::collections::BTreeMap::new(),
     content,
     purge_seen_allocations: 0,
+    give_back_keep: None,
     content_sweep: crate::content_ranges::Sweep::default(),
     push_turns: crate::git_push::PushTurns::default(),
     give_back_rate: GiveBackRate::default(),
@@ -6128,6 +6145,10 @@ async fn purge_if_idle() -> GiveBack {
         CONTENT_PURGE_KEPT_SHORT,
         u64::try_from(purged.kept_short).unwrap_or(u64::MAX),
       );
+      if !purged.more {
+        // Every free page given back: no give-back past a keep is owed (`ShardState::give_back_keep`, goal 93 P7).
+        s.give_back_keep = None;
+      }
       // While any give-back is left, the next turn gives back another (A-226).
       Some(purged.more || recovery_left)
     })

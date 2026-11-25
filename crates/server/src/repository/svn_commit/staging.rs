@@ -34,9 +34,9 @@ use slates_svn::commit::revision::Revision;
 use slates_svn::index::ContentIdentity;
 
 use slates_merge::engine::Increment;
-use slates_svn::migration::Checked;
+use slates_svn::migration::{CheckStep, Checked};
 
-use super::{Building, Uncommitted, brought, checked, green_of, grown, identity, landing, restore};
+use super::{Building, Uncommitted, brought, green_of, grown, identity, landing, restore};
 use crate::import_batch::ImportBatch;
 use crate::repository::push::EntryParts;
 use crate::state::ShardState;
@@ -283,6 +283,7 @@ async fn until_done(mut step: impl FnMut(&mut ShardState) -> bool) -> Option<()>
 /// One step of a batch's give-back: the content arena's resident free pages past `keep` bytes given back, an idle
 /// purge's slice of blocks (`daemon::purge_slice_blocks`), counted. Whether more is left past `keep`.
 fn give_back_past(state: &mut ShardState, keep: usize) -> bool {
+  state.give_back_keep = Some(keep);
   let slice = crate::daemon::purge_slice_blocks(state);
   let purged = state.store.content.arena_mut().purge_past(keep, slice);
   state.count(
@@ -294,6 +295,28 @@ fn give_back_past(state: &mut ShardState, keep: usize) -> bool {
     u64::try_from(purged.kept_short).unwrap_or(u64::MAX),
   );
   purged.more && state.store.content.arena().resident_free_bytes() > keep
+}
+
+/// A publication's give-back of the `released` bytes of deferred frees it released (A-64) past the keep the arena's last
+/// give-back held (`ShardState::give_back_keep`; goal 93 P7, main's ruling of 2026-11-25). An import's batch tail holds
+/// the arena's resident free pages to its bound, but its let-go texts are deferred while a published image names them,
+/// and the publication that releases them came after the tail: round 1's settled reading held 103.7 MB resident and
+/// free over a bound of 91.9 until the next tail or an idle pass. Run in the same step as the release, slices of an idle
+/// purge's walk ([`give_back_past`]), as many as the released bytes span and one more, so the work is bounded by what
+/// the release itself scrubbed. Nothing with no keep held.
+pub(crate) fn give_back_released(state: &mut ShardState, released: usize) {
+  let Some(keep) = state.give_back_keep else {
+    return;
+  };
+  let slice_bytes = crate::daemon::purge_slice_blocks(state)
+    .saturating_mul(state.config.discard_from_bytes)
+    .max(1);
+  let slices = released.div_ceil(slice_bytes).saturating_add(1);
+  for _ in 0..slices {
+    if !give_back_past(state, keep) {
+      break;
+    }
+  }
 }
 
 /// A stage of a batch's landing ([`Staging::land`]) a test may kill it at ([`KILL_AT_STAGE`]).
@@ -548,6 +571,127 @@ fn build_in(
   })
 }
 
+/// Where a revision's staging stands between its steps ([`Staging::staged_in`]).
+enum StagingAt {
+  /// Built, to be judged.
+  Judging(Increment),
+  /// Its verdict being committed into the scratch member.
+  Committing,
+  /// Kept in the batch, the records to apply.
+  Recording,
+}
+
+/// [`Staging::stage_in`]'s record check, a slice a step each lending the records' room (A-920 piece 2: the index's
+/// plan of a revision's rows one call of 87 ms at 9,000 files, debug): the record encoded and every other check made in
+/// the first, then the rows planned as far as each step's slice holds, so a revision that fits a slice is checked in
+/// one step. The landing turn keeps every other commit out between steps, and the index refuses a plan's step once a
+/// revision was committed since it began. None where the shard's state is gone.
+async fn checked_in(
+  repository: RepositoryId,
+  lent: u64,
+  revision: Revision,
+) -> Option<Result<(Checked, Vec<u8>), Uncommitted>> {
+  let mut at = CheckAt::Begin(revision);
+  let mut record = Vec::new();
+  loop {
+    let stepped = within_records(repository, lent, |state| {
+      check_slice(state, repository, (at, &mut record))
+    })
+    .await?;
+    match stepped {
+      Ok(CheckStep::Checked(checked)) => return Some(Ok((checked, record))),
+      Ok(CheckStep::More(more)) => at = CheckAt::Going(more),
+      Err(refused) => return Some(Err(refused)),
+    }
+  }
+}
+
+/// One of [`checked_in`]'s steps, from `at`, until the shard's clock passes its quantum: begun, the revision's record
+/// encoded into `record`.
+fn check_slice(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (at, record): (CheckAt, &mut Vec<u8>),
+) -> Result<CheckStep, Uncommitted> {
+  let records = state
+    .vcs_stores
+    .subversion_records(repository)
+    .ok_or(Uncommitted::NotHeld)?;
+  let deadline = slice_deadline_ns();
+  let checking = match at {
+    CheckAt::Begin(revision) => {
+      *record = slates_svn::commit::record::Record::revision_bytes(&revision);
+      records.check_begin(revision).map_err(Uncommitted::Step)?
+    }
+    CheckAt::Going(checking) => *checking,
+  };
+  records
+    .check_step(checking, &mut || slates_rt::futures::now_ns() >= deadline)
+    .map_err(Uncommitted::Step)
+}
+
+/// Where a revision's record check stands between its steps ([`checked_in`]).
+enum CheckAt {
+  /// Not begun.
+  Begin(Revision),
+  /// Begun, its rows planned in part.
+  Going(Box<slates_svn::migration::Checking>),
+}
+
+/// What a revision's judge or commit step left ([`Staging::judged_in`], [`Staging::commit_in`]).
+enum JudgedIn {
+  /// Kept in the batch, its commit ended.
+  Kept,
+  /// Its verdict's commit going on.
+  Committing,
+  /// Past the batch's room: nothing of it staged, for the next batch.
+  PastRoom(Flush),
+}
+
+/// What a refused staging of a revision comes to (`ImportBatch::stage_begin`, `stage_step`), its records' reservation
+/// `growth` given back: past the green's retention room, for the next batch, or refused alone past it; past the batch's
+/// chains' room, for the next batch; any other refusal logged and counted as the records' divergence.
+fn stage_refused(
+  state: &mut ShardState,
+  (repository, growth): (RepositoryId, u64),
+  refused: crate::import_batch::StageRefused,
+) -> Result<Flush, Uncommitted> {
+  crate::vcs_store::unreserve_svn(state, repository, growth);
+  match refused {
+    crate::import_batch::StageRefused::PastRoom {
+      reserved: 0,
+      work,
+      room,
+      ..
+    } => Err(Uncommitted::PastRetention {
+      reserved: work,
+      room,
+    }),
+    crate::import_batch::StageRefused::PastRoom { .. } => Ok(Flush::Retention),
+    crate::import_batch::StageRefused::PastChainRoom { .. } => Ok(Flush::Chain),
+    refused => {
+      slates_machine::log_line!(
+        "slates-server: partition {}: an imported revision's version was not staged: {refused:?}",
+        state.partition
+      );
+      state.count(super::DIVERGED, 1);
+      Err(Uncommitted::Diverged)
+    }
+  }
+}
+
+/// The post-state bytes `built` holds beside the content store's own charge: its inline bytes and its named runs'.
+fn post_bytes(built: &Increment) -> u64 {
+  let named = built
+    .named
+    .runs
+    .iter()
+    .fold(0u64, |total, run| total.saturating_add(run.len));
+  u64::try_from(built.post_state.len())
+    .unwrap_or(u64::MAX)
+    .saturating_add(named)
+}
+
 /// An import's revisions staged since its last landing (module docs).
 pub(crate) struct Staging {
   /// The repository's landing turn, held for the batch's life.
@@ -768,22 +912,19 @@ impl Staging {
 
   /// [`Staging::stage`]'s steps, each a step of the shard's own and counted ([`STAGING_STEPS`]; goal 93: a revision of
   /// 9,000 files staged in one step of 476 ms on a debug build): the record checked; the increment built against the
-  /// scratch member; the texts it names read a copy slice a step; then the increment judged and staged, and the records
-  /// applied with the held table followed, together, so a drop between steps leaves nothing staged that the records do
-  /// not hold. Each step lends the records' room and settles it. The landing turn keeps every other commit out between
-  /// steps, and the build and the judge each check the records still stand where the batch does. None where the shard's
-  /// state is gone.
+  /// scratch member; the texts it names read a copy slice a step; then the increment judged, its verdict committed into
+  /// the scratch member a slice a step, and the records applied with the held table followed (A-920). A drop between
+  /// steps drops the batch, its scratch member given back unread; a refusal abandons it. Each step lends the records'
+  /// room and settles it. The landing turn keeps every other commit out between steps, so the records stand unchanged
+  /// from the judge to their apply, and the build and the judge each check they still stand where the batch does. None
+  /// where the shard's state is gone.
   async fn stage_in(
     &mut self,
     repository: RepositoryId,
     (revision, plans): (Revision, restore::CopyPlans),
   ) -> Option<Result<StagedIn, Uncommitted>> {
     let lent = brought(&revision);
-    let checked = within_records(repository, lent, |state| {
-      checked(state, repository, revision, None)
-    })
-    .await?;
-    let (checked, record) = match checked {
+    let (checked, record) = match checked_in(repository, lent, revision).await? {
       Ok(checked) => checked,
       Err(refused) => return Some(Err(refused)),
     };
@@ -818,66 +959,115 @@ impl Staging {
         Err(refused) => return Some(Err(refused)),
       }
     }
-    within_records(repository, lent, |state| {
-      self.staged_in(state, repository, (checked, record, built))
-    })
-    .await
+    self
+      .staged_in(repository, lent, (checked, record, built))
+      .await
   }
 
-  /// [`Staging::stage_in`]'s last step, within the records' lent room: the increment judged and staged, the records
-  /// applied, the held table followed, the record kept.
-  fn staged_in(
+  /// [`Staging::stage_in`]'s last steps, each a slice of the shard's budget lending the records' room (A-920 piece 1:
+  /// the judge's commit one call of 110 ms at 9,000 files, debug): the increment judged, its verdict committed into the
+  /// scratch member a slice at a time, then the records applied and the held table followed, as many of them a step as
+  /// its slice holds, so a revision that fits one stages in one step. None where the shard's state is gone.
+  async fn staged_in(
+    &mut self,
+    repository: RepositoryId,
+    lent: u64,
+    (checked, record, built): (Checked, Vec<u8>, Increment),
+  ) -> Option<Result<StagedIn, Uncommitted>> {
+    let growth = grown(&checked);
+    let post = post_bytes(&built);
+    let mut at = StagingAt::Judging(built);
+    let mut recording = Some((checked, record, post));
+    loop {
+      let stepped = within_records(repository, lent, |state| {
+        self.staging_step(state, (repository, growth), (&mut at, &mut recording))
+      })
+      .await?;
+      if let Some(ended) = stepped.transpose() {
+        return Some(ended);
+      }
+    }
+  }
+
+  /// One of [`Staging::staged_in`]'s steps, from `at`: None while the revision is not yet staged, `at` where it goes
+  /// on; else staged, or past the batch's room. The records are applied in the step the commit ends in where its slice
+  /// is not spent, else in a step of their own.
+  fn staging_step(
+    &mut self,
+    state: &mut ShardState,
+    (repository, growth): (RepositoryId, u64),
+    (at, recording): (&mut StagingAt, &mut Option<(Checked, Vec<u8>, u64)>),
+  ) -> Result<Option<StagedIn>, Uncommitted> {
+    let deadline = slice_deadline_ns();
+    let (judged, recording_now) = match std::mem::replace(at, StagingAt::Committing) {
+      StagingAt::Judging(built) => (
+        self.judged_in(state, (repository, growth, deadline), built)?,
+        false,
+      ),
+      StagingAt::Committing => (
+        self.commit_in(state, (repository, growth, deadline))?,
+        false,
+      ),
+      StagingAt::Recording => (JudgedIn::Kept, true),
+    };
+    match judged {
+      JudgedIn::Committing => Ok(None),
+      JudgedIn::PastRoom(cause) => Ok(Some(StagedIn::PastRoom(cause))),
+      JudgedIn::Kept if !recording_now && slates_rt::futures::now_ns() >= deadline => {
+        *at = StagingAt::Recording;
+        Ok(None)
+      }
+      JudgedIn::Kept => {
+        let recorded = recording.take().ok_or(Uncommitted::NotHeld)?;
+        self.recorded_in(state, repository, recorded).map(Some)
+      }
+    }
+  }
+
+  /// [`Staging::staged_in`]'s judge, within the records' lent room: the records' room for the revision reserved and
+  /// its increment judged into the batch's scratch member, kept at once where it commits nothing, else its commit begun
+  /// and stepped until `deadline` ([`Staging::commit_in`]).
+  fn judged_in(
+    &mut self,
+    state: &mut ShardState,
+    (repository, growth, deadline): (RepositoryId, u64, u64),
+    built: Increment,
+  ) -> Result<JudgedIn, Uncommitted> {
+    let batch = self.batch.as_mut().ok_or(Uncommitted::NotHeld)?;
+    crate::vcs_store::reserve_svn(state, repository, growth)
+      .map_err(|available| Uncommitted::Budget { available })?;
+    match batch.stage_begin(state, built) {
+      Ok(Some(_)) => Ok(JudgedIn::Kept),
+      Ok(None) => self.commit_in(state, (repository, growth, deadline)),
+      Err(refused) => stage_refused(state, (repository, growth), refused).map(JudgedIn::PastRoom),
+    }
+  }
+
+  /// The scratch commit [`Staging::judged_in`] began, stepped until the shard's clock passes `deadline`, a unit at
+  /// least: whether it goes on, or ended, the work kept or past the batch's room.
+  fn commit_in(
+    &mut self,
+    state: &mut ShardState,
+    (repository, growth, deadline): (RepositoryId, u64, u64),
+  ) -> Result<JudgedIn, Uncommitted> {
+    let batch = self.batch.as_mut().ok_or(Uncommitted::NotHeld)?;
+    match batch.stage_step(state, &mut || slates_rt::futures::now_ns() >= deadline) {
+      None => Ok(JudgedIn::Committing),
+      Some(Ok(_)) => Ok(JudgedIn::Kept),
+      Some(Err(refused)) => {
+        stage_refused(state, (repository, growth), refused).map(JudgedIn::PastRoom)
+      }
+    }
+  }
+
+  /// [`Staging::stage_in`]'s last step, within the records' lent room: the records applied, the held table followed,
+  /// the record kept, its increment kept in the batch already.
+  fn recorded_in(
     &mut self,
     state: &mut ShardState,
     repository: RepositoryId,
-    (checked, record, built): (Checked, Vec<u8>, Increment),
+    (checked, record, post): (Checked, Vec<u8>, u64),
   ) -> Result<StagedIn, Uncommitted> {
-    let batch = self.batch.as_mut().ok_or(Uncommitted::NotHeld)?;
-    let named = built
-      .named
-      .runs
-      .iter()
-      .fold(0u64, |total, run| total.saturating_add(run.len));
-    let post = u64::try_from(built.post_state.len())
-      .unwrap_or(u64::MAX)
-      .saturating_add(named);
-    let growth = grown(&checked);
-    crate::vcs_store::reserve_svn(state, repository, growth)
-      .map_err(|available| Uncommitted::Budget { available })?;
-    match batch.stage(state, built) {
-      Ok(_) => {}
-      // Past the green's retention room: nothing of it staged or applied to the records, for the next batch; past it
-      // alone, refused naming its reservation and the room.
-      Err(crate::import_batch::StageRefused::PastRoom {
-        reserved,
-        work,
-        room,
-        ..
-      }) => {
-        crate::vcs_store::unreserve_svn(state, repository, growth);
-        if reserved == 0 {
-          return Err(Uncommitted::PastRetention {
-            reserved: work,
-            room,
-          });
-        }
-        return Ok(StagedIn::PastRoom(Flush::Retention));
-      }
-      // Its chain entry past the batch's chains' room: for the next batch, nothing of it staged.
-      Err(crate::import_batch::StageRefused::PastChainRoom { .. }) => {
-        crate::vcs_store::unreserve_svn(state, repository, growth);
-        return Ok(StagedIn::PastRoom(Flush::Chain));
-      }
-      Err(refused) => {
-        slates_machine::log_line!(
-          "slates-server: partition {}: an imported revision's version was not staged: {refused:?}",
-          state.partition
-        );
-        crate::vcs_store::unreserve_svn(state, repository, growth);
-        state.count(super::DIVERGED, 1);
-        return Err(Uncommitted::Diverged);
-      }
-    }
     let changes = checked.changes().to_vec();
     let before = state
       .vcs_stores

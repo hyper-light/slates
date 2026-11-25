@@ -79,7 +79,10 @@ pub struct Counters {
   /// Task polls.
   pub polls: u64,
   /// Polls past the step quantum that were their task's own — the bounded-work rule's bug signal (§4.3):
-  /// past it on the CPU, or waiting inside a call past it ([`Counters::blocked_steps`]).
+  /// past it on the CPU, or waiting inside a call past it ([`Counters::blocked_steps`]). A-783's paced steps count
+  /// here too: one that took more quanta while no one waited ran past one quantum within the span its pace allowed, so
+  /// this is no count of overruns. A paced path counts its own (a fetch's choosing: the server's
+  /// `vcs_store.git_upload.choose_overran`).
   pub long_steps: u64,
   /// Of `long_steps`, the polls that waited inside a call: blocked in the kernel (a voluntary context
   /// switch, counted per thread on Linux) or yielded by the runtime to a full peer ring.

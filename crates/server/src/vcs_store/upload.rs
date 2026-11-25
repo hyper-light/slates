@@ -613,9 +613,10 @@ pub(crate) const WORK_NS_MOST: [&str; 3] = [
 /// Counters: a fetch's choosing units past the step quantum on the shard's clock, by the negotiation's kind of unit
 /// (`slates_git::negotiation::UnitKind`, in its `ALL` order; main 01a20182's order of 2026-11-25: choosing was 82 % of a
 /// clone's long steps, the slowest 9.6 ms), each unit timed between the `spent` asks around it. Format: counter names.
-pub(crate) const LONG_UNITS: [&str; 14] = [
+pub(crate) const LONG_UNITS: [&str; slates_git::negotiation::KINDS] = [
   "vcs_store.git_upload.long_units.ready",
   "vcs_store.git_upload.long_units.cut",
+  "vcs_store.git_upload.long_units.tips",
   "vcs_store.git_upload.long_units.mark",
   "vcs_store.git_upload.long_units.open_tree",
   "vcs_store.git_upload.long_units.take_entry",
@@ -631,9 +632,10 @@ pub(crate) const LONG_UNITS: [&str; 14] = [
 ];
 
 /// Counted most: the longest unit of each kind, in nanoseconds, in [`LONG_UNITS`]'s order. Format: counter names.
-pub(crate) const UNIT_NS_MOST: [&str; 14] = [
+pub(crate) const UNIT_NS_MOST: [&str; slates_git::negotiation::KINDS] = [
   "vcs_store.git_upload.unit_ns_most.ready",
   "vcs_store.git_upload.unit_ns_most.cut",
+  "vcs_store.git_upload.unit_ns_most.tips",
   "vcs_store.git_upload.unit_ns_most.mark",
   "vcs_store.git_upload.unit_ns_most.open_tree",
   "vcs_store.git_upload.unit_ns_most.take_entry",
@@ -648,10 +650,127 @@ pub(crate) const UNIT_NS_MOST: [&str; 14] = [
   "vcs_store.git_upload.unit_ns_most.done",
 ];
 
+/// Counter: a fetch's choosing step that ran past the span its pace allowed (`slates_pace::Report::allowed_ns`: its
+/// quantum, or the quanta it took while nobody else waited, A-783) by more than its last unit ran past that kind's
+/// estimate, none of its units alone past the quantum: a unit granted though its estimate crossed the span (main's order
+/// of 2026-11-25). Zero where the choose
+/// is paced by fit. `rt.long_steps` counts every poll past one quantum, A-783's allowed spans among them, so it is no
+/// count of overruns; this and [`LONG_UNITS`] are. Format: a counter name.
+pub(crate) const CHOOSE_OVERRAN: &str = "vcs_store.git_upload.choose_overran";
+
 thread_local! {
   /// This shard thread's choosing units since its last count ([`count_units`]): by kind, those past the quantum and the
   /// longest, filled by the `spent` asks of [`ShardPacks`]'s turns.
-  static UNITS: core::cell::RefCell<[(u64, u64); 14]> = const { core::cell::RefCell::new([(0, 0); 14]) };
+  static UNITS: core::cell::RefCell<[(u64, u64); slates_git::negotiation::KINDS]> =
+    const { core::cell::RefCell::new([(0, 0); slates_git::negotiation::KINDS]) };
+  /// What each kind of choosing unit costs on this shard thread, learned across steps (`slates_pace::Costs`, A-783).
+  static CHOOSE_COSTS: core::cell::RefCell<slates_pace::Costs<{ slates_git::negotiation::KINDS }>> =
+    const { core::cell::RefCell::new(slates_pace::Costs::ZERO) };
+  /// This shard thread's choosing steps the pace let overrun since its last count ([`CHOOSE_OVERRAN`]).
+  static OVERRAN: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// The index of `kind` in `slates_git::negotiation::UnitKind::ALL`.
+fn kind_at(kind: slates_git::negotiation::UnitKind) -> usize {
+  slates_git::negotiation::UnitKind::ALL
+    .iter()
+    .position(|each| *each == kind)
+    .unwrap_or(0)
+}
+
+/// A choosing step's pace (A-783's `slates_pace::Step::more_at`, as every paced loop on a shard steps): asked before
+/// each unit but the first, the unit just run measured by its kind, whether the next fits the step's quantum by its
+/// own kind's estimate, another quantum taken while nobody waits; and, where it stops, judged against the span it
+/// allowed ([`CHOOSE_OVERRAN`]).
+struct ChoosePace {
+  /// The step.
+  step: slates_pace::Step,
+  /// When it began.
+  began: u64,
+  /// The last ask.
+  last: u64,
+  /// Whether it has granted its first unit.
+  granted: bool,
+  /// How far its last unit ran past its kind's estimate.
+  past_estimate: u64,
+  /// The longest unit of it.
+  longest: u64,
+}
+
+/// What one ask of a [`ChoosePace`] decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Asked {
+  /// Whether the step is spent: its next unit not granted.
+  spent: bool,
+  /// Whether, spent, it ran past the span its pace allowed ([`CHOOSE_OVERRAN`]).
+  overran: bool,
+}
+
+impl ChoosePace {
+  /// A step beginning at `began` on `env`'s clock.
+  fn begin(env: slates_pace::Env, began: u64) -> ChoosePace {
+    ChoosePace {
+      step: slates_pace::Step::begin(env, began),
+      began,
+      last: began,
+      granted: false,
+      past_estimate: 0,
+      longest: 0,
+    }
+  }
+
+  /// Whether the step is spent before its next unit (`slates_git::negotiation::next_unit`), `now` on the shard's clock:
+  /// the unit just run noted by its kind ([`note_unit`]), an overrun counted.
+  fn spent(
+    &mut self,
+    now: u64,
+    costs: &mut slates_pace::Costs<{ slates_git::negotiation::KINDS }>,
+    quantum_ns: u64,
+  ) -> bool {
+    use slates_git::negotiation::{last_unit, next_unit};
+    note_unit(now.saturating_sub(self.last), quantum_ns);
+    let kinds = (kind_at(last_unit()), kind_at(next_unit()));
+    let asked = self.ask(now, kinds, costs, quantum_ns);
+    if asked.overran {
+      OVERRAN.with(|overran| overran.set(overran.get().saturating_add(1)));
+    }
+    asked.spent
+  }
+
+  /// [`ChoosePace::spent`]'s decision at `now`, the unit of kind `finished` just run and one of kind `next` asked for
+  /// (indices into `slates_git::negotiation::UnitKind::ALL`).
+  fn ask(
+    &mut self,
+    now: u64,
+    (finished, next): (usize, usize),
+    costs: &mut slates_pace::Costs<{ slates_git::negotiation::KINDS }>,
+    quantum_ns: u64,
+  ) -> Asked {
+    let took = now.saturating_sub(self.last);
+    self.last = now;
+    let estimate = costs
+      .units
+      .get(finished)
+      .map_or(0, slates_pace::UnitCost::estimate_ns);
+    self.past_estimate = took.saturating_sub(estimate);
+    self.longest = self.longest.max(took);
+    if !self.granted {
+      self.granted = true;
+      let _ = self.step.more_at(self.began, finished, costs);
+    }
+    if self.step.more_at(now, next, costs) {
+      return Asked {
+        spent: false,
+        overran: false,
+      };
+    }
+    let span = now.saturating_sub(self.began);
+    let allowed = self.step.report().allowed_ns;
+    Asked {
+      spent: true,
+      overran: self.longest <= quantum_ns && span > allowed.saturating_add(self.past_estimate),
+    }
+  }
 }
 
 /// Notes a choosing unit of the kind the negotiation began last, `took` nanoseconds, against `quantum_ns`.
@@ -686,6 +805,10 @@ fn count_units(state: &mut ShardState) {
   let Some(noted) = noted else {
     return;
   };
+  let overran = OVERRAN.with(|overran| overran.replace(0));
+  if overran > 0 {
+    state.count(CHOOSE_OVERRAN, overran);
+  }
   for ((long, most), (long_name, most_name)) in noted
     .into_iter()
     .zip(LONG_UNITS.iter().zip(UNIT_NS_MOST.iter()))
@@ -1053,6 +1176,8 @@ pub(crate) struct ShardPacks {
   exchange: Exchange,
   /// The nanoseconds a turn may spend.
   quantum_ns: u64,
+  /// The shard's pacing environment (A-783, `git_push::shard_pace_env`), which the choosing steps are paced by.
+  env: slates_pace::Env,
   /// The stream's counters before this step's first write and after its last, for the shard to count what the step's
   /// writes added once it ends ([`STREAM_COUNTED`]); none where the step wrote none.
   counted: Option<(UploadCounters, UploadCounters)>,
@@ -1068,6 +1193,7 @@ impl ShardPacks {
     ShardPacks {
       exchange: exchange(state),
       quantum_ns: state.config.step_quantum_ns(),
+      env: crate::git_push::shard_pace_env(state),
       counted: None,
       chose: slates_git::store::PositionCounts::default(),
       staged_ns: [0, 0],
@@ -1119,14 +1245,16 @@ impl PackSource for ShardPacks {
   /// stops between units once it is spent.
   fn turn(&self) -> impl FnMut() -> bool + 'static {
     let began = slates_rt::futures::now_ns();
-    let quantum = self.quantum_ns;
-    let mut last = began;
-    // Each ask follows a unit: the time since the last ask is that unit's, noted by its kind ([`note_unit`]).
+    let quantum = self.env.quantum_ns;
+    let mut pace = ChoosePace::begin(self.env, began);
+    // Asked before each unit but the first: the unit just run timed by its kind ([`note_unit`]), and the next granted only
+    // where it fits by its own kind's estimate (A-783).
     move || {
       let now = slates_rt::futures::now_ns();
-      note_unit(now.saturating_sub(last), quantum);
-      last = now;
-      now.saturating_sub(began) >= quantum
+      CHOOSE_COSTS.with(|costs| match costs.try_borrow_mut() {
+        Ok(mut costs) => pace.spent(now, &mut costs, quantum),
+        Err(_) => now.saturating_sub(began) >= quantum,
+      })
     }
   }
 

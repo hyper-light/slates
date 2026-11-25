@@ -1442,17 +1442,16 @@ impl ChunkArena {
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released_total);
   }
 
-  /// What of the arena's regions is in RAM, each read from the kernel's page table ([`crate::resident::of_range`], the
-  /// reader the large path's `mapped_resident` uses), no byte touched: the memory status's
+  /// What of the arena's regions is in RAM and the process's still: each read from the kernel's page table
+  /// ([`crate::resident::of_range`], the reader the large path's `mapped_resident` uses), no byte touched, less the pages
+  /// the region holds marked reusable (macOS: `mincore` counts them until the kernel takes them, though they left the
+  /// process's footprint; [`Region::residency_in_use`], goal 93 P7). The memory status's
   /// `mem.gauge.content.object_resident_bytes` (main 01a20182's ruling of 2026-11-23). A walk of every region's pages, so
   /// only a memory status asks; a region the OS refuses to read is left out.
   pub fn residency(&self) -> crate::resident::Residency {
     let mut found = crate::resident::Residency::default();
     for slot in self.held() {
-      let bytes = slot.region.bytes();
-      if let Ok(residency) =
-        crate::resident::of_range(bytes.as_ptr(), bytes.len(), slot.region.page())
-      {
+      if let Ok(residency) = slot.region.residency_in_use() {
         found = found.plus(residency);
       }
     }
@@ -2302,63 +2301,84 @@ mod tests {
     };
     let (mut shrunk, mut committed_live) = (0usize, 0usize);
     for step in 0..3_000u32 {
-      let pick = |live: &Vec<Extent>, at: u64| (at as usize) % live.len();
-      match next() % 8 {
-        0..=2 => {
-          let len = p * (1 + (next() % 4) as usize);
-          match arena.alloc(len, Owner::Volume) {
-            Ok(extent) => live.push(extent),
-            Err(_) => {
-              arena.grow(len);
-              if let Ok(extent) = arena.alloc(len, Owner::Volume) {
-                live.push(extent);
-              }
-            }
-          }
-        }
-        3 | 4 if !live.is_empty() => {
-          let at = pick(&live, next());
-          arena.free(live.swap_remove(at)).unwrap();
-        }
-        5 if !live.is_empty() => {
-          arena.capture();
-          let at = pick(&live, next());
-          arena.free(live.swap_remove(at)).unwrap();
-          if next() % 2 == 0 {
-            arena.commit_capture();
-          } else {
-            arena.abandon_capture();
-          }
-        }
-        6 => {
-          arena.purge(1);
-        }
-        7 => {
-          if next() % 4 == 0 {
-            arena.commit_live();
-            committed_live += 1;
-          } else {
-            shrunk += arena.shrink(0);
-          }
-        }
-        _ => {}
-      }
-      let recorded: usize = arena.held().map(|slot| slot.dirty.recorded_bytes()).sum();
-      let counted = arena.resident_free_bytes();
-      assert_eq!(
-        counted, recorded,
-        "step {step}: the count is what the regions record"
-      );
-      assert!(
-        counted <= arena.free_bytes() && counted <= arena.capacity(),
-        "step {step}: {counted} resident free, past the free {} or the capacity {}",
-        arena.free_bytes(),
-        arena.capacity()
-      );
+      let kind = next() % 8;
+      let (shrank, committed) = resident_free_step(&mut arena, &mut live, (kind, &mut next), p);
+      shrunk += shrank;
+      committed_live += usize::from(committed);
+      assert_resident_free_is_recorded(&arena, step);
     }
     assert!(
       shrunk > 0 && committed_live > 0,
       "the mix shrank ({shrunk}) and committed live ({committed_live})"
+    );
+  }
+
+  /// One step of [`the_resident_free_count_is_what_the_regions_record_through_growth_and_shrink`]'s seeded mix, chosen by
+  /// `kind`: allocate (growing from the pool when refused), free, free under a capture then commit or abandon it, purge a
+  /// block, or commit the live blocks or shrink to what is held. What it shrank, and whether it committed the live blocks.
+  fn resident_free_step(
+    arena: &mut ChunkArena,
+    live: &mut Vec<Extent>,
+    (kind, next): (u64, &mut dyn FnMut() -> u64),
+    p: usize,
+  ) -> (usize, bool) {
+    let pick = |live: &Vec<Extent>, at: u64| usize::try_from(at).unwrap_or(usize::MAX) % live.len();
+    match kind {
+      0..=2 => {
+        let len = p * (1 + (next() % 4) as usize);
+        match arena.alloc(len, Owner::Volume) {
+          Ok(extent) => live.push(extent),
+          Err(_) => {
+            arena.grow(len);
+            if let Ok(extent) = arena.alloc(len, Owner::Volume) {
+              live.push(extent);
+            }
+          }
+        }
+      }
+      3 | 4 if !live.is_empty() => {
+        let at = pick(live, next());
+        arena.free(live.swap_remove(at)).unwrap();
+      }
+      5 if !live.is_empty() => {
+        arena.capture();
+        let at = pick(live, next());
+        arena.free(live.swap_remove(at)).unwrap();
+        if next() % 2 == 0 {
+          arena.commit_capture();
+        } else {
+          arena.abandon_capture();
+        }
+      }
+      6 => {
+        arena.purge(1);
+      }
+      7 => {
+        if next() % 4 == 0 {
+          arena.commit_live();
+          return (0, true);
+        }
+        return (arena.shrink(0), false);
+      }
+      _ => {}
+    }
+    (0, false)
+  }
+
+  /// After a step of the resident-free mix: the count is the bytes the regions record as freed and resident, and never
+  /// above the free bytes nor the capacity.
+  fn assert_resident_free_is_recorded(arena: &ChunkArena, step: u32) {
+    let recorded: usize = arena.held().map(|slot| slot.dirty.recorded_bytes()).sum();
+    let counted = arena.resident_free_bytes();
+    assert_eq!(
+      counted, recorded,
+      "step {step}: the count is what the regions record"
+    );
+    assert!(
+      counted <= arena.free_bytes() && counted <= arena.capacity(),
+      "step {step}: {counted} resident free, past the free {} or the capacity {}",
+      arena.free_bytes(),
+      arena.capacity()
     );
   }
 

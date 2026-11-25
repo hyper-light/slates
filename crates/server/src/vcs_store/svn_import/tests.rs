@@ -1245,40 +1245,14 @@ const GIVE_BACK_UNITS: u64 = 2;
 /// counted `repository.svn_import.purged_past_bound_bytes`. Red before: every released batch's texts still resident.
 #[test]
 fn an_imports_arena_keeps_no_more_resident_free_than_its_bound() {
-  use crate::repository::svn_commit::staging::{FLUSH_NS, PURGED_PAST_BOUND};
   let (youngest, resident_free, keep, purged) = stored(|| async move {
-    let (svn, _) = subversion("given-back").await;
-    let (unit, memcpy) = on(|state| {
-      (
-        crate::vcs_store::hg_import::segment_bytes(state) as u64,
-        state.config.memcpy_bytes_per_second.max(1),
-      )
-    });
-    let flush_ns =
-      u64::try_from(u128::from(GIVE_BACK_UNITS * unit) * 1_000_000_000 / u128::from(memcpy))
-        .unwrap();
-    FLUSH_NS.with(|forced| forced.set(Some(flush_ns.max(1))));
-    let (loaded, _) = imported_sampling(
-      svn,
-      rewrites(BOUNDED_REWRITES, BOUNDED_REWRITE_BYTES),
-      &mut || {
-        on(|state| {
-          let _ = crate::verbs::publish_shard(state);
-        });
+    imported_giving_back(
+      |state| {
+        let _ = crate::verbs::publish_shard(state);
       },
+      |state| state.store.content.arena().resident_free_bytes() as u64,
     )
-    .await;
-    FLUSH_NS.with(|forced| forced.set(None));
-    on(|state| {
-      let slice =
-        crate::daemon::purge_slice_blocks(state) as u64 * state.config.discard_from_bytes as u64;
-      (
-        loaded.map(|loaded| loaded.youngest),
-        state.store.content.arena().resident_free_bytes() as u64,
-        GIVE_BACK_UNITS * unit + slice,
-        count(state, PURGED_PAST_BOUND),
-      )
-    })
+    .await
   });
   let expected = u64::try_from(BOUNDED_REWRITES).unwrap_or(u64::MAX);
   assert_eq!(youngest, Ok(expected), "the import whole");
@@ -1291,9 +1265,86 @@ fn an_imports_arena_keeps_no_more_resident_free_than_its_bound() {
   );
 }
 
-/// Shape: how long the contended-flush test's hog holds its shard between yields: far past a device's flush, under the
-/// shard's watchdog window.
-const HOG_NS: u64 = 500_000_000;
+/// Goal 93 P7 (main's ruling of 2026-11-25, round 1's settled reading: the arena's resident free 103.7 MB over the
+/// bound's 91.9 once a publication had released the import's deferred texts). Do: import as
+/// [`an_imports_arena_keeps_no_more_resident_free_than_its_bound`] does, and at each turn's publication, which releases
+/// the let-go texts a published image named (A-64), read the arena's resident free bytes in the same step, as the
+/// storage test's settled reading does once the import's deferred bytes are zero. Expect publications that released
+/// deferred bytes, and after each the resident free bytes within the bound and one give-back slice: the purge has its
+/// turn past the keep when a publication releases frees. Red before: the released texts resident and free past the keep
+/// until a later batch's tail or an idle pass.
+#[test]
+fn an_imports_arena_holds_its_keep_once_a_publication_releases_its_deferred_texts() {
+  let (youngest, (releases, most), keep, _) = stored(|| async move {
+    let mut releases = 0u64;
+    let mut most = 0u64;
+    let (youngest, (), keep, purged) = imported_giving_back(
+      |state| {
+        let deferred = state.store.content.arena().deferred_bytes();
+        let _ = crate::verbs::publish_shard(state);
+        if state.store.content.arena().deferred_bytes() < deferred {
+          releases += 1;
+          most = most.max(state.store.content.arena().resident_free_bytes() as u64);
+        }
+      },
+      |_| (),
+    )
+    .await;
+    (youngest, (releases, most), keep, purged)
+  });
+  let expected = u64::try_from(BOUNDED_REWRITES).unwrap_or(u64::MAX);
+  assert_eq!(youngest, Ok(expected), "the import whole");
+  println!(
+    "svn_import: {releases} publications released deferred texts; the arena resident free after one at most {most} B (keep {keep} B)"
+  );
+  assert!(
+    releases > 0,
+    "publications released the import's deferred texts"
+  );
+  assert!(
+    most <= keep,
+    "{most} B resident and free in the arena after a publication released deferred texts, past the keep {keep} B"
+  );
+}
+
+/// The give-back tests' import: [`rewrites`]'s rewrites at a bound of [`GIVE_BACK_UNITS`] units (the flush forced),
+/// `publish` run on the shard after each turn (the shard's publication, as its period would), then `then` run on the
+/// shard as the import ends. Its youngest revision, what `then`
+/// read, the keep (the bound and one give-back slice), and the bytes the batches gave back past the bound.
+async fn imported_giving_back<R>(
+  mut publish: impl FnMut(&mut crate::state::ShardState),
+  then: impl FnOnce(&mut crate::state::ShardState) -> R,
+) -> (Result<u64, LoadFailed>, R, u64, u64) {
+  use crate::repository::svn_commit::staging::{FLUSH_NS, PURGED_PAST_BOUND};
+  let (svn, _) = subversion("given-back").await;
+  let (unit, memcpy) = on(|state| {
+    (
+      crate::vcs_store::hg_import::segment_bytes(state) as u64,
+      state.config.memcpy_bytes_per_second.max(1),
+    )
+  });
+  let flush_ns =
+    u64::try_from(u128::from(GIVE_BACK_UNITS * unit) * 1_000_000_000 / u128::from(memcpy)).unwrap();
+  FLUSH_NS.with(|forced| forced.set(Some(flush_ns.max(1))));
+  let (loaded, _) = imported_sampling(
+    svn,
+    rewrites(BOUNDED_REWRITES, BOUNDED_REWRITE_BYTES),
+    &mut || on(&mut publish),
+  )
+  .await;
+  FLUSH_NS.with(|forced| forced.set(None));
+  on(|state| {
+    let slice =
+      crate::daemon::purge_slice_blocks(state) as u64 * state.config.discard_from_bytes as u64;
+    (
+      loaded.map(|loaded| loaded.youngest),
+      then(state),
+      GIVE_BACK_UNITS * unit + slice,
+      count(state, PURGED_PAST_BOUND),
+    )
+  })
+}
+
 /// Shape: the contended-flush test's look at the import, between its waits.
 const LOOK_NS: u64 = 10_000_000;
 
@@ -1302,12 +1353,12 @@ std::thread_local! {
   static HOGGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Holds the shard [`HOG_NS`] at a time without yielding, then yields, until [`HOGGING`] is cleared: what else a shard
+/// Holds the shard `hold_ns` at a time without yielding, then yields, until [`HOGGING`] is cleared: what else a shard
 /// runs while a landing awaits the store, so the landing resumes late.
-async fn hog() {
+async fn hog(hold_ns: u64) {
   while HOGGING.with(std::cell::Cell::get) {
     let began = slates_rt::futures::now_ns();
-    while slates_rt::futures::now_ns().saturating_sub(began) < HOG_NS {
+    while slates_rt::futures::now_ns().saturating_sub(began) < hold_ns {
       std::hint::spin_loop();
     }
     slates_rt::futures::yield_now().await;
@@ -1316,9 +1367,9 @@ async fn hog() {
 
 /// Goal 93 P7 (main's ruling of 2026-11-25: the rent-or-buy bound's `F` is the store's own durable flush, not a landing's
 /// await, which holds whatever the shard ran meanwhile, the owner's queue and the writes before the flush, and so
-/// overstates it, enlarging the bound past rent or buy). Do: on a shard whose measured flush is forgotten, run a hog that
-/// holds it [`HOG_NS`] between yields, and import `full.dump` beside it, so every answer its batch's landing awaits
-/// resumes late; once the batch's changeset is durable, read the shard's `F` and that landing's await (as the task
+/// overstates it, enlarging the bound past rent or buy). Do: import `full.dump` alone and take the shard's measured
+/// flush as the hold; on the shard, that flush forgotten, run a hog that holds it a hold between yields, and import
+/// `full.dump` again beside it, so every answer its batch's landing awaits resumes late; once the batch's changeset is durable, read the shard's `F` and that landing's await (as the task
 /// awaited it), then stop the hog. Expect the import whole, and `F` under the await it is part of: the store's own
 /// flush, whatever else the shard ran, judged against the batch's own await rather than a time, so a loaded machine's
 /// slow flush is no failure. Red before: `F` the landing's await itself, equal to it (46,015,129,583 ns beside the hog).
@@ -1327,11 +1378,19 @@ fn an_imports_durable_flush_is_the_stores_own_not_its_await() {
   use crate::repository::svn_commit::staging::{
     LANDING_AWAITED_NS, durable_flush_ns, forget_durable_flush,
   };
-  let (flush_ns, awaited, youngest) = stored(|| async move {
+  let (flush_ns, awaited, youngest, hold_ns) = stored(|| async move {
+    // Derived: the hold is the device's flush as this shard measures it alone: the hogged landing's await then holds
+    // its flush and at least a hold, so `F`, the flush alone, is under it, and `F` read as the await is equal to it;
+    // every step of the import waits a hold, so a hold of a flush keeps the test's time near the import's own, far
+    // under the shard's watchdog window.
+    let (calm, _) = subversion("calm").await;
+    forget_durable_flush();
+    let _ = imported(calm, FULL).await;
+    let hold_ns = durable_flush_ns().expect("the shard's flush measured alone");
     let (svn, _) = subversion("contended").await;
     forget_durable_flush();
     HOGGING.with(|hogging| hogging.set(true));
-    let hogging = slates_rt::futures::spawn(hog()).expect("the hog's task");
+    let hogging = slates_rt::futures::spawn(hog(hold_ns)).expect("the hog's task");
     slates_rt::futures::detach(hogging).expect("detached");
     let importing = slates_rt::futures::spawn(async move {
       let _ = imported(svn, FULL).await;
@@ -1349,10 +1408,10 @@ fn an_imports_durable_flush_is_the_stores_own_not_its_await() {
       slates_rt::futures::sleep(LOOK_NS).await.expect("slept");
       youngest = history(svn).await.map_or(0, |(youngest, _)| youngest);
     }
-    (flush_ns, awaited, youngest)
+    (flush_ns, awaited, youngest, hold_ns)
   });
   println!(
-    "svn_import: F {flush_ns:?} ns, the landing awaited {awaited} ns, the shard held {HOG_NS} ns at a time"
+    "svn_import: F {flush_ns:?} ns, the landing awaited {awaited} ns, the shard held {hold_ns} ns at a time"
   );
   assert_eq!(youngest, FULL_LAST, "the import whole");
   let flush_ns = flush_ns.expect("a flush measured");

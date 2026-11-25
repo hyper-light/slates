@@ -1203,6 +1203,14 @@ pub(crate) fn fetched_pack_after(answer: &[u8]) -> Vec<u8> {
 /// that its answer takes many turns.
 pub(crate) const KEPT_ALIVE_HISTORY: usize = 300;
 
+/// The step ceiling the keepalive tests hold their repository's shard to (A-783's `set_step_ceiling_ns`): none, so a
+/// paced step's ceiling is its quantum (a shard's ceiling is never below it), each step ending there as when someone
+/// waits. A lone step otherwise takes quanta to the daemon's 100 ms ceiling, and a choose of
+/// [`KEPT_ALIVE_HISTORY`] commits may end within the two steps that decide and write the `packfile` head, leaving no
+/// silent step for a keepalive (red 3 of 6 in parallel at load ~42).
+/// Derived: zero, below every quantum.
+pub(crate) const KEPT_ALIVE_CEILING_NS: u64 = 0;
+
 /// A-722's keepalive (the load-only edge tests: a long push's answer wrote nothing until its report, and the client's
 /// read gave up on the silence at a load of 56 to 67; git's receive-pack writes `0005\1` every `receive.keepAlive`
 /// while it processes a push under side-band-64k). Do: start a daemon whose keepalive interval is none; push a history
@@ -1240,7 +1248,7 @@ fn a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report() {
 /// A-722's keepalive on the fetch (main's goal-93 piece, 2026-11-21: a fetch's answer wrote nothing from its
 /// `packfile` section's head until its pack's first packet while the pack's objects were chosen over many turns; git's
 /// upload-pack writes `0005\1` while `pack-objects` is silent, git 2.50.1's `create_pack_file`). Do: start a daemon
-/// whose keepalive interval is none; push a history of [`KEPT_ALIVE_HISTORY`] commits; fetch its last commit at
+/// whose keepalive interval is none, its repository's shard's steps held to one quantum ([`KEPT_ALIVE_CEILING_NS`]); push a history of [`KEPT_ALIVE_HISTORY`] commits; fetch its last commit at
 /// protocol v2 with `done`, as `git clone` asks. Expect: `200`; the `packfile` section's first packet git's keepalive
 /// (an empty band-1 packet), and the section's pack whole after the keepalives, every object pushed.
 /// Shape: how much of each of a fetch's first packets [`a_long_fetchs_answer_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen`]
@@ -1255,6 +1263,9 @@ fn a_long_fetchs_answer_is_kept_alive_with_gits_keepalive_while_its_pack_is_chos
   let name = name_on_the_repositorys_partition();
   create(&daemon, &name);
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    slates_rt::futures::set_step_ceiling_ns(KEPT_ALIVE_CEILING_NS)
+  });
   let edge = (port, &certificate);
   let (request, last) = long_history(KEPT_ALIVE_HISTORY);
   let created = pushed(edge, &name, &request);
@@ -2246,6 +2257,37 @@ fn a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes() {
     stream.windows(64).any(|window| window == &large[..64]),
     "the clone carries the file's bytes"
   );
+}
+
+/// Goal 93, main's ruling (b), its owed half (2026-11-25): an import's landings kept as stock's revlog chunks, as a push's
+/// segments are. Do: through a two-shard daemon's edge, import `fixtures/state`'s `states` repository and land it; clone
+/// its served head. Expect: the import's segments made into chunks as they landed (non-vacuity: plain bytes chunked); the
+/// clone answered, its file section decoding the imported chunks on the shard. Red before: an import's payload landed as
+/// the changegroup it cut, raw, so nothing was chunked and the clone decoded nothing.
+#[test]
+fn an_imports_files_land_as_chunks_the_clone_decodes() {
+  let (identity, certificate) = identity();
+  let (daemon, _) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_hg_from_states(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let chunked = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::COMPRESS_PLAIN_BYTES,
+  );
+  let head = STATES_SERVED_HEADS.trim_end();
+  let cloned = hg_getbundle((port, &certificate), &name, head);
+  let decoded = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_view::DECOMPRESS_PLAIN_BYTES,
+  );
+  daemon.stop();
+  assert!(chunked > 0, "the import's payloads made into chunks");
+  assert_eq!(cloned.0, 200, "the clone answered");
+  assert!(decoded > 0, "the clone decoded the imported chunks");
 }
 
 /// The answer to a clone of Mercurial repository `name` at `head` by its owner, as stock hg 7.2 asks one over HTTP
@@ -6738,7 +6780,9 @@ fn a_fetchs_long_steps_are_counted_by_the_phase_of_the_step_that_ran_longest() {
   let steps = steps_counted().saturating_sub(steps_before);
   let (long, most) = step_phases(&daemon);
   let (long_work, work_most) = work_stages(&daemon);
-  let units = |names: [&'static str; 14]| names.map(|name| counted_on(&daemon, REPOSITORY, name));
+  let units = |names: [&'static str; slates_git::negotiation::KINDS]| {
+    names.map(|name| counted_on(&daemon, REPOSITORY, name))
+  };
   let (long_units, unit_most) = (
     units(crate::vcs_store::upload::LONG_UNITS),
     units(crate::vcs_store::upload::UNIT_NS_MOST),
@@ -6880,10 +6924,11 @@ fn a_ref_listing_during_a_derivation_behind_a_push_drives_none_of_it() {
 /// unit's time is counted under its own kind.
 #[test]
 fn the_choosing_units_counters_follow_the_negotiations_kinds() {
-  use slates_git::negotiation::UnitKind;
-  let named = [
+  use slates_git::negotiation::{KINDS, UnitKind};
+  let named: [(UnitKind, &str); KINDS] = [
     (UnitKind::Ready, "ready"),
     (UnitKind::Cut, "cut"),
+    (UnitKind::Tips, "tips"),
     (UnitKind::Mark, "mark"),
     (UnitKind::OpenTree, "open_tree"),
     (UnitKind::TakeEntry, "take_entry"),
@@ -6902,4 +6947,73 @@ fn the_choosing_units_counters_follow_the_negotiations_kinds() {
     assert!(crate::vcs_store::upload::LONG_UNITS[at].ends_with(&format!(".{name}")));
     assert!(crate::vcs_store::upload::UNIT_NS_MOST[at].ends_with(&format!(".{name}")));
   }
+}
+
+/// Fetches at once of one history ([`a_fetchs_choosing_steps_end_within_the_span_their_pace_allowed`]): enough that
+/// each one's steps find the others waiting.
+/// Derived: four clients, three waiting behind any one's step.
+const FETCHERS: usize = 4;
+
+/// `request` sent on `FETCHERS` connections at once; each answer's status.
+fn fetched_at_once(
+  port: u16,
+  certificate: &CertificateDer<'static>,
+  name: &str,
+  request: &[u8],
+) -> Vec<u16> {
+  std::thread::scope(|scope| {
+    let asks: Vec<_> = (0..FETCHERS)
+      .map(|_| scope.spawn(|| uploaded((port, certificate), name, request).0))
+      .collect();
+    asks
+      .into_iter()
+      .map(|ask| ask.join().expect("a fetch"))
+      .collect()
+  })
+}
+
+/// A-783's pace for a fetch's choosing (main's order of 2026-11-25: a choose step asked whether it was spent only after
+/// each unit, so every step ran past its quantum by up to a unit, 82 % of a clone's polls). Do: start a store-backed
+/// daemon with its edge; push [`tagged_line_create`]; list its refs; fetch `main`'s head on [`FETCHERS`] connections at
+/// once, each one's steps finding the others waiting. Expect: every fetch `200`; the choosing units timed by kind; and
+/// no choosing step past the span its pace allowed (its quantum, or the quanta it took while nobody waited) by more than
+/// its last unit ran past that kind's estimate, unless one unit alone was past the quantum
+/// (`vcs_store.git_upload.choose_overran` zero; those units counted by kind, `long_units`). Red before: a step granted
+/// its next unit while its quantum had any time left, whatever the unit's kind cost.
+#[test]
+fn a_fetchs_choosing_steps_end_within_the_span_their_pace_allowed() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  assert_git_pushed(&pushed((port, &certificate), &name, &tagged_line_create()));
+  let listed = uploaded((port, &certificate), &name, &ls_refs_all());
+  let head = String::from_utf8_lossy(&listed.1)
+    .lines()
+    .find(|line| line.ends_with("refs/heads/main"))
+    .and_then(|line| line.get(4..44))
+    .map(named)
+    .expect("main listed");
+  let statuses = fetched_at_once(port, &certificate, &name, &fetch_of(head));
+  let overran = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::upload::CHOOSE_OVERRAN,
+  );
+  let most =
+    crate::vcs_store::upload::UNIT_NS_MOST.map(|name| counted_on(&daemon, REPOSITORY, name));
+  let long = crate::vcs_store::upload::LONG_UNITS.map(|name| counted_on(&daemon, REPOSITORY, name));
+  daemon.stop();
+  eprintln!("choose: {overran} overran; units past the quantum alone {long:?}; longest {most:?}");
+  assert!(
+    statuses.iter().all(|status| *status == 200),
+    "every fetch answered: {statuses:?}"
+  );
+  assert!(most.iter().any(|ns| *ns > 0), "the choosing units timed");
+  assert_eq!(
+    overran, 0,
+    "no choosing step past the span its pace allowed"
+  );
 }
