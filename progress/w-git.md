@@ -839,3 +839,15 @@
   released with the fork. Red 78 → 12 deltas (most stays 12: newest first). Freed 2.4 GiB of my target at main's ask.
   WAITING: main's watchdog A/B (SSH close/seats + hook_driver lingering-child flake, one piece), main's footprint run
   (A-924 cost line), main's git leg (real-clone tree_deltas before/after).
+- 11-25 ~16:30 PST: LANDED reap_map false departure 373ad47cb (three-way Stamp; EMFILE confirmed; bug record);
+  A-924 2b regression fix 84cd0b4f7 (merge 1948dbdcc: reap off the shard, join on the process thread; red 3.07 s gap →
+  0.10 s); (c) 1bda9a3c1 (spawner_role!() in 135 test binaries + api lib; serve_from_env() first in 11 examples +
+  api tests/start.rs; spawner.restarted counter; red 12 restarts → 0); fd-6 + back-off 991a7b19f/0b9a3f9e8 (received
+  descriptors CLOEXEC, pipe2; back-off 0 then a liveness window; spawner red's growth bound from the median).
+  LESSON: a test piped through grep reports grep's status — gate by the test's own exit code (pipefail); 373ad47cb
+  went out with reap_map at exit 4 (2b's). tree_deltas reading: the cache cut git/git's chain rebuilds only 2.1%
+  (2,047,136 → 2,004,133); the 6.4x wall cut is two non-interleaved legs at different loads, not attributable.
+  ASKED main: cache-effectiveness counters (hits, widen grants/refusals, budget) + multi-directory fixture, then an
+  interleaved A/B. QUEUED: SSH close/seats + hook flakes (lingering child, foreign holder) as one 8a-family piece;
+  reconnect bound for a client that truly loses its daemon while starved (reap_map step 4); Windows owned_object
+  sibling (reported). hg-over-SSH reds moved to w-hg.
