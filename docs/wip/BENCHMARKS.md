@@ -19874,4 +19874,9 @@ entry makes no closing claim until it is explained.
 - **Resident.** The bound arm's is 0.63, 0.52 and 0.50 of the before arm's round by round, and 245, 175 and 155 MiB
   above the after arm's. Its batches of 60 to 91 MB (4 to 7 of them, against 179 of 2 MiB) account for some of that
   excess; how much is w-perf's to explain.
+- **The excess, explained (w-perf, from the same logs' gauges; main checked round 1).** It is the content arena's
+  retained free extents, not live texts and not malloc: A-742's rule is not yet applied to the content arena. Round 1:
+  `arena_mapped` 336 MB, `arena_free` 256 MB, `object_resident` 268 MB against the unit arm's 19. Rounds 2 and 3:
+  `object_resident` 198 and 183 MB, `arena_free` 175 and 161 MB. w-perf is fixing it, and main's rerun adds the fix as
+  a fourth arm.
 
