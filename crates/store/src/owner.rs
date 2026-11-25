@@ -227,7 +227,7 @@ struct Served {
   done_ns: u64,
   /// How the owner, waiting for work, met it: spinning (a hit), parked, or neither (it was queued).
   met: Met,
-  /// The owner's text cache as it took the request ([`text_cache_seen`]).
+  /// The owner's text cache as the request left it ([`text_cache_seen`]).
   texts: TextCacheFigures,
 }
 
@@ -328,7 +328,7 @@ pub fn take_read_waits() -> AskWaits {
 }
 
 std::thread_local! {
-  /// The owner's text cache as it took this thread's last read ([`text_cache_seen`]).
+  /// The owner's text cache as this thread's last read left it ([`text_cache_seen`]).
   static TEXT_CACHE_SEEN: core::cell::Cell<TextCacheFigures> = const { core::cell::Cell::new(TextCacheFigures {
     reserved: 0,
     bound: 0,
@@ -337,8 +337,7 @@ std::thread_local! {
   }) };
 }
 
-/// The owner's text cache (its reserved bytes, its bound, its walks in flight) as the owner took this thread's last
-/// read: what the asking shard's memory status reports of it, the owner's state crossing to no other thread (goal 93,
+/// The owner's text cache (its reserved bytes, its bound, its walks in flight) as this thread's last read left it: what the asking shard's memory status reports of it, the owner's state crossing to no other thread (goal 93,
 /// main's ruling of 2026-11-25: the 32 MB the cache's chunks held after hg's 57k push, with nothing to say why).
 pub fn text_cache_seen() -> TextCacheFigures {
   TEXT_CACHE_SEEN.with(core::cell::Cell::get)
@@ -370,7 +369,6 @@ struct Timer {
   dequeued_ns: u64,
   disk_before: u64,
   met: Met,
-  texts: TextCacheFigures,
 }
 
 impl Timer {
@@ -379,7 +377,7 @@ impl Timer {
   fn of(
     asked: (u64, Option<Sender<Served>>),
     (idle_ns, dequeued_ns, met): (u64, u64, Met),
-    (store, texts): (&Store, TextCacheFigures),
+    store: &Store,
   ) -> Self {
     let (sent_ns, timed) = asked;
     let waited = dequeued_ns.saturating_sub(sent_ns);
@@ -395,12 +393,13 @@ impl Timer {
       dequeued_ns,
       disk_before: store.log().read_ns(),
       met,
-      texts,
     }
   }
 
-  /// Answers `value` on `answer`, its timing sent first so the asker finds it with the answer.
-  fn reply<T>(&mut self, store: &Store, answer: &Sender<T>, value: T) {
+  /// Answers `value` on `answer`, its timing sent first so the asker finds it with the answer: with the text cache as
+  /// the request left it, served (a figure taken as the owner took the request missed what that request made, so a
+  /// clone's last reads left the status a request behind).
+  fn reply<T>(&mut self, (store, texts): (&Store, &TextCache), answer: &Sender<T>, value: T) {
     if let Some(timed) = self.timed.take() {
       let done_ns = slates_machine::clock::monotonic_ns();
       let _ = timed.try_send(Served {
@@ -410,7 +409,7 @@ impl Timer {
         disk_ns: store.log().read_ns().saturating_sub(self.disk_before),
         done_ns,
         met: self.met,
-        texts: self.texts,
+        texts: texts.figures(),
       });
     }
     let _ = answer.try_send(value);
@@ -836,11 +835,7 @@ fn serve(
     else {
       continue;
     };
-    let mut timer = Timer::of(
-      (sent_ns, timed),
-      (idle_ns, dequeued_ns, met),
-      (&store, texts.figures()),
-    );
+    let mut timer = Timer::of((sent_ns, timed), (idle_ns, dequeued_ns, met), &store);
     match request {
       Request::Begin {
         header,
@@ -848,7 +843,7 @@ fn serve(
         answer,
       } => {
         let answered = landings.begin(&mut store, header, alive);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Section {
         landing,
@@ -860,7 +855,7 @@ fn serve(
           .check(landing)
           .and_then(|()| store.landing_section(kind, len));
         let answered = landings.failed_lets_go(&mut store, step);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Part {
         landing,
@@ -879,7 +874,7 @@ fn serve(
           bytes
         });
         let answered = given;
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Commit { landing, answer } => {
         // A commit that fails lets the record go (`commit_open` took it); a stranger's commit touches nothing.
@@ -888,7 +883,7 @@ fn serve(
           store.commit_landing()
         });
         let answered = committed;
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       // The daemon's stop: the loop ends here, and the open landing is let go and the checkpoint written below.
       Request::Stop => break,
@@ -903,7 +898,7 @@ fn serve(
           .map(|(kind, bytes)| (*kind, Contents::Bytes(bytes)))
           .collect();
         let answered = store.land(header, &sections, &staging);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Piece {
         identity,
@@ -915,7 +910,7 @@ fn serve(
           .piece(&staging, &identity, len, offset)
           .map(|piece| piece.map(std::borrow::Cow::into_owned));
         let answered = read;
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Changesets {
         repository,
@@ -924,11 +919,11 @@ fn serve(
         answer,
       } => {
         let answered = store.changesets(repository, from, limit);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Sections { row, answer } => {
         let answered = sections_of(&store, &row);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Text {
         repository,
@@ -950,7 +945,7 @@ fn serve(
             })
           });
         let answered = read;
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Texts {
         repository,
@@ -963,7 +958,7 @@ fn serve(
           repository,
           (&identities, most),
         );
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::TextRow {
         repository,
@@ -971,7 +966,7 @@ fn serve(
         answer,
       } => {
         let answered = store.text_row(repository, &identity);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Forget {
         repository,
@@ -979,7 +974,7 @@ fn serve(
         answer,
       } => {
         let answered = store.forget(repository, sequence);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::PathTexts {
         repository,
@@ -989,7 +984,7 @@ fn serve(
         answer,
       } => {
         let answered = store.path_texts(repository, &path, from, limit);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::TextsByTool {
         repository,
@@ -1001,11 +996,11 @@ fn serve(
           .map(|(path, tool_ids)| store.texts_by_tools(repository, path, tool_ids))
           .collect();
         let answered = found;
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Places { places, answer } => {
         let answered = store.places_bytes(&staging, &places);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Read {
         offset,
@@ -1013,7 +1008,7 @@ fn serve(
         answer,
       } => {
         let answered = store.read(offset, len);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
     }
   }

@@ -437,18 +437,19 @@ impl Repository {
   pub fn check(&self, revision: RevisionToCommit) -> Result<Checked, StepRefusal> {
     let mut checking = self.check_begin(revision)?;
     loop {
-      match self.check_step(checking, &mut || false)? {
+      match self.check_step(checking, &mut whole_check_spent)? {
         CheckStep::More(more) => checking = *more,
         CheckStep::Checked(checked) => return Ok(*checked),
       }
     }
   }
 
-  /// [`Repository::check`] begun (A-920 piece 2): every check but the index's of the revision's rows, which
-  /// [`Repository::check_step`] makes a slice at a time while the repository stands as it is.
+  /// [`Repository::check`] begun (A-920 pieces 2 and 2b): the revision's head and lock entries checked, every other
+  /// check made by [`Repository::check_step`] a slice at a time while the repository stands as it is.
   ///
   /// # Errors
-  /// [`Repository::check`]'s but the index's refusals of the rows past their order and the transaction's name.
+  /// [`StepRefusal::OutOfDate`] when the youngest revision is not the revision's head; [`StepRefusal::Lock`] for a lock
+  /// entry the table does not take.
   pub fn check_begin(&self, revision: RevisionToCommit) -> Result<Checking, StepRefusal> {
     let youngest = self.youngest();
     if revision.head != youngest {
@@ -461,58 +462,107 @@ impl Repository {
       .locks
       .check_entries(&revision.lock_entries)
       .map_err(StepRefusal::Lock)?;
-    let fresh = self.fresh(
-      &revision.record.changes,
-      revision.contents,
-      &revision.stored,
-    )?;
-    self.grown(&revision.properties, &fresh)?;
-    let stored = revision
-      .stored
-      .into_iter()
-      .filter(|(identity, _)| !self.holds(identity))
-      .collect();
-    let planning = self.index.plan_begin(revision.record, self.room.entries)?;
     Ok(Checking {
-      planning,
+      phase: CheckPhase::Naming(0),
+      record: Some(revision.record),
+      planning: None,
+      named: BTreeSet::new(),
+      brought: revision.contents,
+      stored_in: revision.stored,
       properties: revision.properties,
-      fresh,
-      stored,
+      fresh: BTreeMap::new(),
+      stored: BTreeMap::new(),
       lock_entries: revision.lock_entries,
     })
   }
 
-  /// One step of `checking` ([`Repository::check_begin`]): the index's plan of its rows a slice further, a row at
-  /// least, until `spent` says the step's slice is spent ([`Index::plan_step`]); checked once every row is.
+  /// One step of `checking` ([`Repository::check_begin`]), a unit at least, until `spent` says the step's slice is
+  /// spent, stopping between its phases where it is: the texts and property lists its rows name, a row a unit; those
+  /// the records do not hold taken from what the revision brought (or named stored), a name a unit, then the room
+  /// checked; the texts its commit stored that the records do not hold, a text a unit; then the index's plan of its
+  /// rows, a row a unit ([`Index::plan_step`]). Checked once every row is.
   ///
   /// # Errors
-  /// [`Index::plan_step`]'s, a revision committed since the check began among them.
+  /// [`Repository::check`]'s: [`StepRefusal::Corrupt`] for a text or property list the rows name that neither the
+  /// records nor the revision hold; [`StepRefusal::Room`] past the room's bytes; the index's refusals of the rows, a
+  /// revision committed since the check began among them.
   pub fn check_step(
     &self,
-    checking: Checking,
+    mut checking: Checking,
     spent: &mut dyn FnMut() -> bool,
   ) -> Result<CheckStep, StepRefusal> {
-    let Checking {
-      planning,
-      properties,
-      fresh,
-      stored,
-      lock_entries,
-    } = checking;
+    loop {
+      let ended = match checking.phase {
+        CheckPhase::Naming(at) => checking.name_some(at, spent),
+        CheckPhase::Fresh => self.fresh_some(&mut checking, spent)?,
+        CheckPhase::Stored => self.stored_some(&mut checking, spent)?,
+        CheckPhase::Planning => return self.plan_some(checking, spent),
+      };
+      if !ended || spent() {
+        return Ok(CheckStep::More(Box::new(checking)));
+      }
+    }
+  }
+
+  /// [`Repository::check_step`]'s names, a name a unit until `spent`: each the records do not hold taken from what the
+  /// revision brought, a text it names stored passed; then the room checked. Whether the phase ended.
+  fn fresh_some(
+    &self,
+    checking: &mut Checking,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<bool, StepRefusal> {
+    while let Some((identity, as_text)) = checking.named.pop_first() {
+      if !self.holds_as(&identity, as_text) && !checking.fresh.contains_key(&identity) {
+        checking.take_fresh(identity, as_text)?;
+      }
+      if !checking.named.is_empty() && spent() {
+        return Ok(false);
+      }
+    }
+    self.grown(&checking.properties, &checking.fresh)?;
+    checking.phase = CheckPhase::Stored;
+    Ok(true)
+  }
+
+  /// [`Repository::check_step`]'s stored texts, a text a unit until `spent`: those the records do not hold kept; then
+  /// the index's plan begun ([`Index::plan_begin`]). Whether the phase ended.
+  fn stored_some(
+    &self,
+    checking: &mut Checking,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<bool, StepRefusal> {
+    while let Some((identity, len)) = checking.stored_in.pop_first() {
+      if !self.holds(&identity) {
+        checking.stored.insert(identity, len);
+      }
+      if !checking.stored_in.is_empty() && spent() {
+        return Ok(false);
+      }
+    }
+    let record = checking.record.take().ok_or(StepRefusal::Corrupt)?;
+    checking.planning = Some(self.index.plan_begin(record, self.room.entries)?);
+    checking.phase = CheckPhase::Planning;
+    Ok(true)
+  }
+
+  /// [`Repository::check_step`]'s plan of the rows, until `spent`: checked once every row is.
+  fn plan_some(
+    &self,
+    mut checking: Checking,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<CheckStep, StepRefusal> {
+    let planning = checking.planning.take().ok_or(StepRefusal::Corrupt)?;
     Ok(match self.index.plan_step(planning, spent)? {
-      PlanStep::More(planning) => CheckStep::More(Box::new(Checking {
-        planning: *planning,
-        properties,
-        fresh,
-        stored,
-        lock_entries,
-      })),
+      PlanStep::More(planning) => {
+        checking.planning = Some(*planning);
+        CheckStep::More(Box::new(checking))
+      }
       PlanStep::Planned(planned) => CheckStep::Checked(Box::new(Checked {
         planned,
-        properties,
-        fresh,
-        stored,
-        lock_entries,
+        properties: checking.properties,
+        fresh: checking.fresh,
+        stored: checking.stored,
+        lock_entries: checking.lock_entries,
       })),
     })
   }
@@ -721,33 +771,6 @@ impl Repository {
     self.locks.apply_all(entries).map_err(StepRefusal::Lock)
   }
 
-  /// The texts and property lists `changes` name that the records do not hold, taken from `brought`; refused when one
-  /// is held by neither.
-  fn fresh(
-    &self,
-    changes: &[ChangedPath],
-    mut brought: BTreeMap<ContentIdentity, Vec<u8>>,
-    stored: &BTreeMap<ContentIdentity, u64>,
-  ) -> Result<BTreeMap<ContentIdentity, Vec<u8>>, StepRefusal> {
-    let mut fresh = BTreeMap::new();
-    for (identity, as_text) in named_as(changes) {
-      if self.holds_as(&identity, as_text) || fresh.contains_key(&identity) {
-        continue;
-      }
-      if as_text {
-        // A text its commit stored: the records name it, and hold none of its bytes. One the revision carries inline
-        // is refused (module docs, "Texts"): its caller stores it first (`Repository::take_texts`).
-        if stored.contains_key(&identity) {
-          continue;
-        }
-        return Err(StepRefusal::Corrupt);
-      }
-      let bytes = brought.remove(&identity).ok_or(StepRefusal::Corrupt)?;
-      fresh.insert(identity, bytes);
-    }
-    Ok(fresh)
-  }
-
   /// The bytes the records would hold with `properties` and `fresh` added, refused past the room.
   fn grown(
     &self,
@@ -812,8 +835,18 @@ struct Applied {
 /// [`Repository::check_step`]; A-920 piece 2): every check made but the index's plan of its rows, part made.
 #[derive(Debug)]
 pub struct Checking {
-  /// The index's plan of its rows, so far.
-  planning: Planning,
+  /// Where it stands.
+  phase: CheckPhase,
+  /// Its record, until the index's plan of it begins.
+  record: Option<RevisionRecord>,
+  /// The index's plan of its rows, once begun.
+  planning: Option<Planning>,
+  /// The texts (true) and property lists (false) its rows name, not yet taken.
+  named: BTreeSet<(ContentIdentity, bool)>,
+  /// The texts and property lists it brought, not yet taken.
+  brought: BTreeMap<ContentIdentity, Vec<u8>>,
+  /// The texts its commit stored, not yet filtered.
+  stored_in: BTreeMap<ContentIdentity, u64>,
   /// Its revision properties.
   properties: Properties,
   /// The texts and property lists its rows name that the repository does not hold.
@@ -822,6 +855,80 @@ pub struct Checking {
   stored: BTreeMap<ContentIdentity, u64>,
   /// Its lock entries.
   lock_entries: Vec<LockEntry>,
+}
+
+/// Where a [`Checking`] stands.
+#[derive(Clone, Copy, Debug)]
+enum CheckPhase {
+  /// Naming the texts and property lists of its rows, from this row.
+  Naming(usize),
+  /// Taking the names the records do not hold.
+  Fresh,
+  /// Filtering the texts its commit stored.
+  Stored,
+  /// The index planning its rows.
+  Planning,
+}
+
+impl Checking {
+  /// The texts and property lists the rows from `at` name, a row a unit until `spent`: whether the phase ended.
+  fn name_some(&mut self, mut at: usize, spent: &mut dyn FnMut() -> bool) -> bool {
+    let changes = self
+      .record
+      .as_ref()
+      .map_or(&[][..], |record| &record.changes);
+    while let Some(change) = changes.get(at) {
+      if let Some(text) = change.text {
+        self.named.insert((text.identity, true));
+      }
+      if let Some(PropertyList::Held { identity, .. }) = change.properties {
+        self.named.insert((identity, false));
+      }
+      at = at.saturating_add(1);
+      if at < changes.len() && spent() {
+        self.phase = CheckPhase::Naming(at);
+        return false;
+      }
+    }
+    self.phase = CheckPhase::Fresh;
+    true
+  }
+
+  /// `identity`, named as a text (`as_text`) or a property list and held by neither the records nor this check yet:
+  /// a text its commit stored passed, one it carries refused (module docs, "Texts": its caller stores it first,
+  /// `Repository::take_texts`); a property list taken from what the revision brought, refused where it brought none.
+  fn take_fresh(&mut self, identity: ContentIdentity, as_text: bool) -> Result<(), StepRefusal> {
+    if as_text {
+      return if self.stored_in.contains_key(&identity) {
+        Ok(())
+      } else {
+        Err(StepRefusal::Corrupt)
+      };
+    }
+    let bytes = self.brought.remove(&identity).ok_or(StepRefusal::Corrupt)?;
+    self.fresh.insert(identity, bytes);
+    Ok(())
+  }
+}
+
+/// Whether a whole check's step ([`Repository::check`]) is spent: never, but in the tests that take every check a unit
+/// a step ([`CHECK_A_UNIT_A_STEP`]).
+fn whole_check_spent() -> bool {
+  #[cfg(test)]
+  {
+    CHECK_A_UNIT_A_STEP.with(std::cell::Cell::get)
+  }
+  #[cfg(not(test))]
+  {
+    false
+  }
+}
+
+#[cfg(test)]
+std::thread_local! {
+  /// Test support: every [`Repository::check`] taken a unit a step, as a staging step whose slice is always spent
+  /// takes it (A-920 piece 2b's oracle).
+  pub(crate) static CHECK_A_UNIT_A_STEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// What a step of [`Repository::check_step`] left.
@@ -893,12 +1000,14 @@ pub enum Before {
   Absent,
 }
 
-/// Where the node at `path` stood before the revision whose rows are `changes`, by path, changed it ([`Before`]), as
+/// Where the node at `path` stood before the revision whose rows are `changes`, sorted by path and each path once (a
+/// checked revision's, `Checked::changes`), changed it ([`Before`]), each ancestor's row found by a search of them, as
 /// a dump's transaction reads its own tree (`Transaction::lookup`): beneath the deepest ancestor the rows add or replace, nowhere without a
 /// copy source and beneath the source with one; nowhere beneath a deleted ancestor; else at the path itself.
-pub fn before(changes: &BTreeMap<&str, &ChangedPath>, path: &str) -> Before {
+pub fn before(changes: &[ChangedPath], path: &str) -> Before {
   for (ancestor, rest) in ancestors_deepest_first(path) {
-    let Some(row) = changes.get(ancestor) else {
+    let found = changes.binary_search_by(|row| row.path.as_str().cmp(ancestor));
+    let Some(row) = found.ok().and_then(|at| changes.get(at)) else {
       continue;
     };
     match (row.action, &row.copy_from) {

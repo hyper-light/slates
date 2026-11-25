@@ -200,7 +200,7 @@ fn assert_the_clone_is_the_sources(served: &common::hg::Served, source: &str) {
 }
 
 /// Format: the counters of a streamed answer's turns and what lies between them.
-const STREAM_COUNTERS: [&str; 13] = [
+const STREAM_COUNTERS: [&str; 14] = [
   "vcs_store.hg_stream_span_ns",
   "vcs_store.hg_stream_steps",
   "vcs_store.hg_stream_turns_at_ceiling",
@@ -209,6 +209,7 @@ const STREAM_COUNTERS: [&str; 13] = [
   "vcs_store.hg_stream_write_ns",
   "vcs_store.hg_stream_write_most_ns",
   "vcs_store.hg_stream_write_waits",
+  "vcs_http.reply_yields",
   "vcs_http.reply_yield_gap_ns",
   "vcs_http.reply_yield_gap_most_ns",
   "vcs_store.hg_stream_store_asks",

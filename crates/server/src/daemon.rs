@@ -1354,6 +1354,13 @@ impl Daemon {
     // pulse (`Pulse::progress`), which an observer reads directly under CPU load (no shard round-trip)
     // and which outlives the shard as its entry does — no allocation per boot (before 2026-09-14 an atomic
     // was leaked per daemon start). A laptop spawns no coordinator, so it stays zero.
+    // Where a client reaches this node: its advertised host (A-277), which its edges are announced at (A-925).
+    let advertised_host = fleet_transport
+      .as_ref()
+      .map(|transport| match &transport.advertise {
+        crate::deploy::NodeAddress::Ip(address) => address.ip().to_string(),
+        crate::deploy::NodeAddress::Name { host, .. } => host.clone(),
+      });
     if let Some(transport) = fleet_transport {
       runtime.spawn_on(control, async move {
         crate::fleet::run_membership(transport).await;
@@ -1378,7 +1385,7 @@ impl Daemon {
     // The svn:// listener, when the operator asked for one (§4.17.4 piece 7, A-689, A-695): on the control shard too,
     // every shard keeping its seats for the connections that move to their repository's owner.
     let vcs_svn_port = crate::vcs_svn::start(&runtime, control, &shards, &config)?;
-    Ok(Daemon {
+    let daemon = Daemon {
       stop_watch_send,
       runtime: Some(runtime),
       segment,
@@ -1394,7 +1401,31 @@ impl Daemon {
       start_beats: start_beat.beats,
       #[cfg(unix)]
       spawner_join,
-    })
+    };
+    // This node's edges as a client reaches them, set on the control shard for its peers (A-925): none on a laptop,
+    // which announces to nobody.
+    if let Some(host) = advertised_host {
+      let leaf = daemon
+        .config
+        .vcs_http
+        .as_ref()
+        .and_then(|edge| edge.identity.as_ref())
+        .and_then(crate::config::EdgeIdentity::leaf)
+        .map(<[u8]>::to_vec);
+      let http = daemon.vcs_http_port;
+      let ssh = daemon.vcs_ssh.as_ref().map(|edge| edge.port);
+      let set = daemon.observe(daemon.shards.first().copied(), move |s| {
+        let record =
+          crate::edges::local_record(s.origin_anchor, &host, (http, leaf.as_deref()), ssh);
+        s.edges.set_local(record);
+      });
+      if let Err(refused) = set {
+        slates_machine::log_line!(
+          "slates daemon: this node's edges were not set for its peers: {refused:?}"
+        );
+      }
+    }
+    Ok(daemon)
   }
 
   /// The loopback port the NFS transport (§4.6) is serving on, if the listener bound; a client mounts
@@ -2673,6 +2704,21 @@ impl Daemon {
   /// membership commit. A one-shot control-shard observation.
   pub fn council_debug(&self) -> Result<String, ObserveError> {
     self.observe(self.shards.first().copied(), |s| s.council.debug_state())
+  }
+
+  /// Test support (A-925): where this node would send a client of a repository `member` owns, as `member`'s edges
+  /// record taught it: its SSH edge (`ssh`) or its git HTTP edge, as `(scheme, host, port)`; or the typed refusal naming
+  /// `member`'s id where none was learned. A one-shot control-shard question.
+  pub fn peer_edge(
+    &self,
+    member: slates_db::HostId,
+    ssh: bool,
+  ) -> Result<Result<(&'static str, String, u16), slates_db::HostId>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      crate::edges::owner_edge(s, member, ssh)
+        .map(|edge| (edge.scheme.text(), edge.host, edge.port))
+        .map_err(|refused| refused.member)
+    })
   }
 
   /// `host`'s fencing epoch in the regional configuration this node holds (§4.8: a takeover bumps it), `None` before any
@@ -5639,6 +5685,7 @@ async fn init_shard(
     last_answers: std::collections::BTreeMap::new(),
     owner_hold: None,
     ledger_reads: crate::ledger_read::LedgerReads::default(),
+    edges: crate::edges::Edges::default(),
     period_stretch_ns: 0,
     attachment_paces: std::collections::BTreeMap::new(),
     council,
