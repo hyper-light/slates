@@ -54,6 +54,7 @@ impl ImportTexts {
       store.abandon_object(writing);
     }
     for (identity, _) in std::mem::take(&mut self.sealed) {
+      store.unpin_unlanded(&ContentId(identity));
       let _ = store.release(&ContentId(identity));
     }
   }
@@ -134,6 +135,13 @@ impl TextSink for InStore<'_> {
         if made != ContentId(identity) {
           let _ = store.release(&made);
           return Err(TextRefused::Unknown);
+        }
+        // Unlanded until its batch lands: no landed text's let-go takes a window it shares meanwhile (main's ruling (B)
+        // of 2026-11-24), whoever lands then, its own import's batch or a client's commit between two batches. Unpinned
+        // where its hold is given back: its batch's landing, or however its write ends.
+        if let Err(refusal) = store.pin_unlanded(&made) {
+          let _ = store.release(&made);
+          return Err(refused(&refusal));
         }
         texts.sealed.push((identity, put));
         Ok(())

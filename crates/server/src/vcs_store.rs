@@ -288,10 +288,6 @@ pub(crate) struct VcsStores {
   /// The text pieces read through the node's store for drives waiting on them (C2 stage B part 2,
   /// [`svn_texts::Pieces`]).
   pub(crate) svn_pieces: svn_texts::Pieces,
-  /// The texts an import put for a revision not landed yet while a batch before it lands
-  /// ([`name_holds::keeping_unlanded`]): a landed text's let-go keeps every window they hold, since windows are named by
-  /// their bytes and a text that shares one with a landed text cannot bring it back until its own changeset lands.
-  pub(crate) svn_unlanded: Vec<slates_svn::index::ContentIdentity>,
   /// The generations git fetches hold, by repository (A-745 rule 4, [`upload::GitGeneration`]): one fork a stamp the
   /// repository stood at when a fetch began, shared by every fetch that began there, given back with its last holder;
   /// bounded by the fetches the shard's edges seat.
