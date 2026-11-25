@@ -94,6 +94,19 @@ pub(crate) const READ_TURNS: &str = "vcs_store.git_derive.read_turns";
 /// Counter: a derivation's turns the task behind a push drove ([`derive_behind`]), each a quantum at most. Format: a
 /// counter name.
 pub(crate) const BEHIND_TURNS: &str = "vcs_store.git_derive.behind_turns";
+/// Counters: the nanoseconds and the versions a reader's turns took and derived, and the task behind's, beside [`NS`] and
+/// [`DERIVED`] (main 01a20182's order of 2026-11-25: whether the clone's slower units were a reader's or the task behind's,
+/// and its turns' before or after the hand-over). Format: counter names, in the order read ns, read derived, behind ns,
+/// behind derived.
+pub(crate) const BY_DRIVER: [&str; 4] = [
+  "vcs_store.git_derive.read_ns",
+  "vcs_store.git_derive.read_derived",
+  "vcs_store.git_derive.behind_ns",
+  "vcs_store.git_derive.behind_derived",
+];
+/// Counter: a reader's derivation that ended with versions still due (a window it could not bring back, or a turn that
+/// found none to take while others remained): the reader went on without them. Format: a counter name.
+pub(crate) const READ_LEFT_DUE: &str = "vcs_store.git_derive.read_left_due";
 
 /// One turn of repository `id`'s derivation (the module doc), within the shard's quantum on its clock, as a reader turns
 /// it.
@@ -123,7 +136,16 @@ fn turn_as(state: &mut ShardState, id: RepositoryId, driver: Driver) -> Turned {
     },
     1,
   );
-  state.count(NS, slates_rt::futures::now_ns().saturating_sub(began));
+  let took = slates_rt::futures::now_ns().saturating_sub(began);
+  state.count(NS, took);
+  let [ns, kept] = match driver {
+    Driver::Reader => [BY_DRIVER[0], BY_DRIVER[1]],
+    Driver::Behind => [BY_DRIVER[2], BY_DRIVER[3]],
+  };
+  state.count(ns, took);
+  if derived > 0 {
+    state.count(kept, derived);
+  }
   if YIELDED.with(|yielded| yielded.replace(false)) {
     state.count(TURNS_YIELDED, 1);
   }
@@ -299,6 +321,15 @@ pub(crate) async fn derive_for_read(id: RepositoryId) {
   let mut brought = super::read_through::BroughtBack::default();
   derive_bringing_back(id, &mut brought, Driver::Reader).await;
   brought.let_go();
+  let _ = crate::state::with_state_counted(|state| {
+    let due = state
+      .vcs_stores
+      .git(id)
+      .is_some_and(|(_, store)| store.repository.derivations_due());
+    if due {
+      state.count(READ_LEFT_DUE, 1);
+    }
+  });
   let _ = crate::state::with_state_counted(|state| {
     let readers = &mut state.vcs_stores.derivings.2;
     let left = readers.get(&id).map_or(0, |count| count.saturating_sub(1));
