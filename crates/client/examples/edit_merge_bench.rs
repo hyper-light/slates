@@ -417,7 +417,15 @@ impl Fixture {
         let done = Instant::now();
         let submit_request = self.client.last_request().sequence;
         // An identical edit accepts at a new version with no effect: the model's bytes stay.
-        self.expect_accept(answer, "an identical edit behind the head");
+        let wanted = self.head + 1;
+        match answer {
+          Submitted::Accepted(version) | Submitted::Identical(version) if version == wanted => {
+            self.head = version;
+          }
+          other => wrong(&format!(
+            "an identical edit behind the head answered {other:?}, not Accepted/Identical({wanted})"
+          )),
+        }
         self.check(&path);
         Sample {
           edit: ns(edited - started),

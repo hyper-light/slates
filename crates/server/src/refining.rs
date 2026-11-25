@@ -136,6 +136,77 @@ fn compose_base(
   slates_merge::increment::Base::for_names(&named, &w.entries)
 }
 
+/// The `(base path, path)` pairs of `doc` that `refine_rewrites_paced` will actually refine (matching
+/// `slates_merge::refine::lent_whole` exactly: `plan.get(&laid_at) == Some(&0)`, base file length equals
+/// `shape.base_len`, and post file length when known equals `shape.post_len`; A-817, Wave 8A). Returns empty
+/// when already refined/given up under `(base_version, journal_len)` or when no candidate matches.
+pub(crate) fn owed_pairs(
+  state: &ShardState,
+  (work, base_version): (DbVolumeId, u64),
+  journal_len: usize,
+  base: &slates_merge::increment::Base,
+  (doc, plan): (&OpsDoc, &PostStatePlan),
+) -> Vec<(String, String)> {
+  let key = (base_version, journal_len);
+  if state
+    .refining
+    .done
+    .get(&work)
+    .is_some_and(|done| done.key == key)
+  {
+    return Vec::new();
+  }
+  let w = state.works.get(&work);
+  slates_merge::refine::whole_replaced_shapes(doc)
+    .into_iter()
+    .filter(|shape| {
+      if plan.get(&shape.laid_at).copied() != Some(0) {
+        return false;
+      }
+      let base_len = base
+        .files
+        .iter()
+        .find(|(file, _)| file == &shape.base)
+        .map(|(_, len)| *len);
+      if base_len != Some(shape.base_len) {
+        return false;
+      }
+      if let Some(work_state) = w {
+        let files_base = crate::work_files::Base {
+          green: None,
+          fetched: None,
+          version: base_version,
+          entries: Some(&work_state.entries),
+          plane: None,
+        };
+        if let Ok(Some(post_len)) = work_state.files.len(files_base, &shape.path)
+          && post_len != shape.post_len
+        {
+          return false;
+        }
+      }
+      true
+    })
+    .map(|shape| (shape.base, shape.path))
+    .collect()
+}
+
+/// Builds [`Owed`] from an already-composed `(doc, plan)` and non-empty `pairs` (Wave 8A: avoids re-composing
+/// in `work_home` when the caller already planned the journal).
+pub(crate) fn make_owed(
+  key: Key,
+  doc: OpsDoc,
+  plan: PostStatePlan,
+  pairs: Vec<(String, String)>,
+) -> Owed {
+  Owed {
+    key,
+    doc,
+    plan,
+    pairs,
+  }
+}
+
 /// The refinement `work`'s composition owes, at `base_version` over `journal`: none when it replaces nothing whole, when
 /// its refinement is kept already (or gave up) under this key, or when it does not compose (the verb refuses it typed).
 pub(crate) fn owed(
@@ -154,7 +225,13 @@ pub(crate) fn owed(
   }
   let base = compose_base(state, (work, green, base_version), journal)?;
   let (doc, plan) = slates_merge::increment::compose_volume_planned(&base, journal).ok()?;
-  let pairs = slates_merge::refine::whole_replaced(&doc);
+  let pairs = owed_pairs(
+    state,
+    (work, base_version),
+    journal.len(),
+    &base,
+    (&doc, &plan),
+  );
   (!pairs.is_empty()).then_some(Owed {
     key,
     doc,
@@ -609,8 +686,10 @@ pub(crate) const PREPARED: &str = "merge.refine.prepared";
 pub(crate) const PREPARE_SLICES: &str = "merge.submit.prepare_slices";
 /// Counter: a prepared increment compared whole with the one `verbs::compose_increment` composes (a debug build's
 /// oracle, A-821), and those that differed. Format: counter names in the daemon's status report.
+#[cfg(any(debug_assertions, test))]
 pub(crate) const PREPARED_CHECKED: &str = "merge.refine.prepared_checked";
 /// Counter: see [`PREPARED_CHECKED`].
+#[cfg(any(debug_assertions, test))]
 pub(crate) const PREPARED_MISMATCH: &str = "merge.refine.prepared_mismatch";
 /// Counter: a prepared increment, verdict or encoding the submit took (each part once). Format: a counter name in the
 /// daemon's status report.

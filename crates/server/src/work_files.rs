@@ -258,6 +258,175 @@ fn equal_tail(a: &[u8], b: &[u8], room: usize) -> usize {
   room
 }
 
+/// Normalizes and coalesces `keep_own` byte ranges clamped to `len` into sorted non-overlapping spans.
+fn merge_own_spans(keep_own: &[(u64, u64)], len: usize) -> Vec<(usize, usize)> {
+  let mut merged: Vec<(usize, usize)> = keep_own
+    .iter()
+    .filter_map(|&(start, end)| {
+      let lo = usize::try_from(start).unwrap_or(len).min(len);
+      let hi = usize::try_from(end).unwrap_or(len).min(len);
+      (lo < hi).then_some((lo, hi))
+    })
+    .collect();
+  merged.sort_unstable();
+  let mut spans: Vec<(usize, usize)> = Vec::with_capacity(merged.len());
+  for (lo, hi) in merged {
+    match spans.last_mut() {
+      Some((_, prev_hi)) if lo <= *prev_hi => *prev_hi = (*prev_hi).max(hi),
+      _ => spans.push((lo, hi)),
+    }
+  }
+  spans
+}
+
+/// Appends a [`PiecePart::Base`] run, coalescing with an adjacent base piece.
+fn push_base_piece(pieces: &mut Vec<PiecePart>, at: usize, run: usize) {
+  if run == 0 {
+    return;
+  }
+  let at_u = u64::try_from(at).unwrap_or(u64::MAX);
+  let run_u = u64::try_from(run).unwrap_or(u64::MAX);
+  if let Some(PiecePart::Base {
+    at: prev_at,
+    len: prev_len,
+  }) = pieces.last_mut()
+    && prev_at.saturating_add(*prev_len) == at_u
+  {
+    *prev_len = prev_len.saturating_add(run_u);
+    return;
+  }
+  pieces.push(PiecePart::Base {
+    at: at_u,
+    len: run_u,
+  });
+}
+
+/// Appends `run` to `written` as a [`PiecePart::Own`] piece, coalescing with an adjacent own piece.
+fn push_own_piece(pieces: &mut Vec<PiecePart>, written: &mut Vec<u8>, run: &[u8]) {
+  if run.is_empty() {
+    return;
+  }
+  let at_u = u64::try_from(written.len()).unwrap_or(u64::MAX);
+  let run_u = u64::try_from(run.len()).unwrap_or(u64::MAX);
+  written.extend_from_slice(run);
+  if let Some(PiecePart::Own {
+    at: prev_at,
+    len: prev_len,
+  }) = pieces.last_mut()
+    && prev_at.saturating_add(*prev_len) == at_u
+  {
+    *prev_len = prev_len.saturating_add(run_u);
+    return;
+  }
+  pieces.push(PiecePart::Own {
+    at: at_u,
+    len: run_u,
+  });
+}
+
+/// Emits base/own pieces across a same-length gap `[from..to)` outside required own spans.
+fn emit_same_len_gap(
+  (base, bytes): (&[u8], &[u8]),
+  (from, to): (usize, usize),
+  pieces: &mut Vec<PiecePart>,
+  written: &mut Vec<u8>,
+) {
+  let mut at = from;
+  let mut own_from = from;
+  while at < to {
+    let equal = equal_run(
+      base.get(at..to).unwrap_or_default(),
+      bytes.get(at..to).unwrap_or_default(),
+    );
+    if equal > PIECE_BYTES
+      || (at == from && equal > 0)
+      || (at.saturating_add(equal) == to && equal > 0)
+    {
+      push_own_piece(pieces, written, bytes.get(own_from..at).unwrap_or_default());
+      push_base_piece(pieces, at, equal);
+      at = at.saturating_add(equal);
+      own_from = at;
+    } else {
+      let differ = base
+        .get(at..to)
+        .unwrap_or_default()
+        .iter()
+        .zip(bytes.get(at..to).unwrap_or_default())
+        .skip(equal)
+        .take_while(|(a, b)| a != b)
+        .count();
+      at = at.saturating_add(equal.saturating_add(differ).max(1));
+    }
+  }
+  push_own_piece(pieces, written, bytes.get(own_from..to).unwrap_or_default());
+}
+
+/// Like [`parts_over_base`], guaranteeing that every range in `keep_own` (post-file offsets written by the work's
+/// restated journal) is emitted as [`PiecePart::Own`] rather than [`PiecePart::Base`] (Wave 8B: prevents matching
+/// runs inside a work's own write from turning into base pieces that fail off-owner composition with `BaseGone`).
+pub fn parts_over_base_keeping(
+  path: &str,
+  base: Option<&[u8]>,
+  bytes: Vec<u8>,
+  keep_own: &[(u64, u64)],
+) -> HeldParts {
+  if keep_own.is_empty() {
+    return parts_over_base(path, base, bytes);
+  }
+  let Some(base) = base else {
+    return HeldParts::whole(bytes);
+  };
+  let len = bytes.len();
+  let spans = merge_own_spans(keep_own, len);
+  if spans.is_empty() {
+    return parts_over_base(path, Some(base), bytes);
+  }
+  let mut pieces: Vec<PiecePart> = Vec::new();
+  let mut written: Vec<u8> = Vec::new();
+  if len == base.len() {
+    let mut cursor = 0usize;
+    for (lo, hi) in spans {
+      emit_same_len_gap((base, &bytes), (cursor, lo), &mut pieces, &mut written);
+      push_own_piece(
+        &mut pieces,
+        &mut written,
+        bytes.get(lo..hi).unwrap_or_default(),
+      );
+      cursor = hi;
+    }
+    emit_same_len_gap((base, &bytes), (cursor, len), &mut pieces, &mut written);
+  } else {
+    let first_lo = spans.first().map_or(len, |(lo, _)| *lo);
+    let last_hi = spans.last().map_or(0, |(_, hi)| *hi);
+    let prefix = equal_run(
+      base.get(..first_lo.min(base.len())).unwrap_or_default(),
+      bytes.get(..first_lo).unwrap_or_default(),
+    );
+    let max_suffix = len
+      .saturating_sub(last_hi)
+      .min(base.len().saturating_sub(prefix));
+    let suffix = equal_tail(base, &bytes, max_suffix);
+    push_base_piece(&mut pieces, 0, prefix);
+    push_own_piece(
+      &mut pieces,
+      &mut written,
+      bytes
+        .get(prefix..len.saturating_sub(suffix))
+        .unwrap_or_default(),
+    );
+    push_base_piece(&mut pieces, base.len().saturating_sub(suffix), suffix);
+  }
+  HeldParts {
+    origin: pieces
+      .iter()
+      .any(|piece| matches!(piece, PiecePart::Base { .. }))
+      .then(|| path.to_owned()),
+    pieces,
+    written,
+    len: u64::try_from(len).unwrap_or(u64::MAX),
+  }
+}
+
 /// `bytes`, a file's content at a work's new base, as parts over `base`, the same path's bytes at that base (A-806): the
 /// runs they share are base pieces, and only the runs that differ are written. The common prefix and suffix are found
 /// first; inside them, equal runs longer than a piece's own cost ([`PIECE_BYTES`]) are kept as base pieces when the two
@@ -582,6 +751,59 @@ impl Held {
     }
   }
 
+  /// Copies the file's bytes in `[from, to)` directly into `out`, returning the bytes copied (zero heap allocation).
+  fn copy_into(
+    &self,
+    base: Base<'_>,
+    (from, to): (u64, u64),
+    out: &mut [u8],
+  ) -> Result<usize, BaseGone> {
+    let to = to.min(self.len);
+    let mut logical = 0u64;
+    let mut written = 0usize;
+    for piece in &self.pieces {
+      let (start, end) = (logical, logical.saturating_add(piece.len()));
+      logical = end;
+      if end <= from || start >= to {
+        continue;
+      }
+      let part = piece.cut(
+        from.max(start).saturating_sub(start),
+        to.min(end).saturating_sub(start),
+      );
+      match part {
+        Piece::Own { at, len } => {
+          let (lo, hi) = (
+            usize::try_from(at).unwrap_or(usize::MAX),
+            usize::try_from(at.saturating_add(len)).unwrap_or(usize::MAX),
+          );
+          let src = self.written.get(lo..hi).unwrap_or_default();
+          let take = src.len().min(out.len().saturating_sub(written));
+          if let (Some(dst), Some(slice)) = (
+            out.get_mut(written..written.saturating_add(take)),
+            src.get(..take),
+          ) {
+            dst.copy_from_slice(slice);
+            written = written.saturating_add(take);
+          }
+        }
+        Piece::Base { at, len } => {
+          let origin = self.origin.as_deref().ok_or(BaseGone)?;
+          let src = base.range(origin, at, len)?;
+          let take = src.len().min(out.len().saturating_sub(written));
+          if let (Some(dst), Some(slice)) = (
+            out.get_mut(written..written.saturating_add(take)),
+            src.get(..take),
+          ) {
+            dst.copy_from_slice(slice);
+            written = written.saturating_add(take);
+          }
+        }
+      }
+    }
+    Ok(written)
+  }
+
   /// Appends the file's bytes in `[from, to)` (clamped to its length) to `out`: written bytes from `written`, base
   /// bytes from the base's range alone.
   fn read_into(
@@ -829,7 +1051,7 @@ impl WorkFiles {
   }
 
   /// Copies the file at `path`'s bytes from `from` into `out`, as far as the file reaches: the bytes copied, `None`
-  /// when the work sees no such file. Only the range is read (a submit's post-state takes each operation's bytes).
+  /// when the work sees no such file. Only the range is read directly into `out` without intermediate allocation.
   pub fn copy_range(
     &self,
     base: Base<'_>,
@@ -838,30 +1060,28 @@ impl WorkFiles {
     out: &mut [u8],
   ) -> Result<Option<usize>, BaseGone> {
     let want = u64::try_from(out.len()).unwrap_or(u64::MAX);
-    let bytes: Cow<'_, [u8]> = match self.changed.get(path) {
-      Some(None) => return Ok(None),
-      Some(Some(file)) => {
-        let mut bytes = Vec::with_capacity(out.len());
-        file.read_into(base, (from, from.saturating_add(want)), &mut bytes)?;
-        Cow::Owned(bytes)
-      }
+    match self.changed.get(path) {
+      Some(None) => Ok(None),
+      Some(Some(file)) => file
+        .copy_into(base, (from, from.saturating_add(want)), out)
+        .map(Some),
       None => match base.len(path)? {
-        None => return Ok(None),
+        None => Ok(None),
         Some(len) => {
           let to = from.saturating_add(want).min(len);
           if to <= from {
-            Cow::Borrowed(&[][..])
+            Ok(Some(0))
           } else {
-            base.range(path, from, to.saturating_sub(from))?
+            let bytes = base.range(path, from, to.saturating_sub(from))?;
+            let copied = bytes.len().min(out.len());
+            if let (Some(dst), Some(src)) = (out.get_mut(..copied), bytes.get(..copied)) {
+              dst.copy_from_slice(src);
+            }
+            Ok(Some(copied))
           }
         }
       },
-    };
-    let copied = bytes.len().min(out.len());
-    if let (Some(dst), Some(src)) = (out.get_mut(..copied), bytes.get(..copied)) {
-      dst.copy_from_slice(src);
     }
-    Ok(Some(copied))
   }
 
   /// Every file the work sees, sorted by path: the base's files it did not change and the files it holds. Without

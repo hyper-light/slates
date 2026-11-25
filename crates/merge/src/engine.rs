@@ -865,6 +865,91 @@ pub enum Rebased {
   },
 }
 
+/// One piece of a rebased file built directly from mapped ops without materializing the head file (Wave 8B).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RebasedPiece {
+  /// `len` bytes from the head file starting at `at`.
+  Base {
+    /// Offset in the head file.
+    at: u64,
+    /// Byte length.
+    len: u64,
+  },
+  /// `len` bytes from the file's `written` buffer starting at `at`.
+  Own {
+    /// Offset in `written`.
+    at: u64,
+    /// Byte length.
+    len: u64,
+  },
+}
+
+/// One changed file returned by [`Green::rebase_establishing_parts`]: either pre-built O(edit) pieces over the
+/// head file (so every restated journal write is guaranteed `Own` with zero full-file allocation/scan), or a whole
+/// buffer for copied/created/heir/named files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RebasedFile {
+  /// Whole materialized bytes (for created, copied, heir, or named-base files).
+  Whole(Vec<u8>),
+  /// Compact pieces over `origin` (the head path) plus only the written bytes.
+  Parts {
+    /// Head path referenced by `Base` pieces, if any.
+    origin: Option<String>,
+    /// Ordered pieces covering `0..len`.
+    pieces: Vec<RebasedPiece>,
+    /// Own bytes referenced by `Own` pieces.
+    written: Vec<u8>,
+    /// Total logical length after applying the restated ops.
+    len: u64,
+  },
+}
+
+/// The result of [`Green::rebase_establishing_parts`]: identical semantics to [`Rebased`], carrying [`RebasedFile`]
+/// so mapped edits stay O(edit_size) without copying or diffing the head file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RebasedParts {
+  /// Clean rebase onto `version`.
+  Rebased {
+    /// The head the work is now based on.
+    version: u64,
+    /// Changed files (or `None` for removals).
+    changed: BTreeMap<String, Option<RebasedFile>>,
+    /// Restated journal in head coordinates.
+    journal: Vec<crate::increment::VolumeOp>,
+  },
+  /// Conflicting windows.
+  Conflict {
+    /// The conflicting windows.
+    windows: Vec<ConflictWindow>,
+  },
+  /// Work's base is below the green's checkpoint floor.
+  BaseUnavailable {
+    /// The work's base.
+    base: u64,
+    /// The oldest base the green still maps.
+    floor: u64,
+  },
+  /// Work's base is past the green's head.
+  BaseAhead {
+    /// The work's base.
+    base: u64,
+    /// The green's head.
+    head: u64,
+  },
+  /// Copy refusal.
+  CopyRefused {
+    /// Refused path.
+    path: String,
+    /// Reason.
+    case: CopyRefusal,
+  },
+  /// Unlent named object read.
+  ContentUnread {
+    /// Object identity.
+    identity: crate::named::Identity,
+  },
+}
+
 /// A per-path content history: for each path, the versions at which its bytes changed and the bytes
 /// then (`None` when removed), so any base version's content can be reconstructed for the identity
 /// check. The design's chain shares these copy-on-write; here they are full copies (owed).
@@ -2016,6 +2101,9 @@ struct StagedFile {
   renamed: bool,
   /// The object its bytes are the whole of, when a named run made it so (A-760 (b), [`Green::name_of`]).
   name: Option<crate::named::Identity>,
+  /// True when `commit` verified this effect qualifies for uniquely-owned in-place layered overwrite (Wave 8C),
+  /// skipping `make_mapped`'s full-file allocation and copy.
+  inplace: bool,
 }
 
 /// One accepted per-path effect to apply at commit.
@@ -4054,6 +4142,12 @@ impl Green {
       .zip(content_history.get_mut(path))
       .filter(|(_, history)| history.last().is_some_and(|(_, latest)| latest.is_some()))
       .and_then(|(block, history)| {
+        if let Some((_, Some(latest))) = history.last_mut()
+          && let Some(overlaid) =
+            crate::history::overlay_latest(latest, chunks, content.blocks_mut(), (block, ops))
+        {
+          return Some(overlaid);
+        }
         let values = history
           .iter_mut()
           .filter_map(|(_, value)| value.as_mut())
@@ -4063,6 +4157,11 @@ impl Green {
     let Some(anchored) = anchored else {
       return self.named_value(path);
     };
+    self.record_reanchored(anchored)
+  }
+
+  /// Accounts for a re-anchor's counters and returns its new latest value.
+  fn record_reanchored(&mut self, anchored: crate::history::Reanchored) -> crate::history::Value {
     let crate::history::Reanchored {
       value,
       lists: (lists_before, lists_after),
@@ -5662,6 +5761,75 @@ impl Green {
     }
   }
 
+  /// Checks whether `effects[place]` qualifies for uniquely-owned in-place layered overwrite (Wave 8C): saves
+  /// O(file_size) allocation, memcpy, BLAKE3, and memcmp when an unnamed, unshared block receives pure
+  /// length-preserving overwrites.
+  fn can_overlay_inplace(
+    &self,
+    place: usize,
+    effects: &[Effect],
+    post_state: crate::named::Post<'_>,
+    names: &[(usize, crate::named::Identity)],
+  ) -> bool {
+    if !crate::history::layered_allowed() {
+      return false;
+    }
+    let Some(Effect::SetContent(path, None, ops, ContentSource::Mapped)) = effects.get(place)
+    else {
+      return false;
+    };
+    if names.iter().any(|(named, _)| *named == place) {
+      return false;
+    }
+    // Never mutate in place if another effect in this commit copies, removes, or also sets `path`.
+    for (other_place, other) in effects.iter().enumerate() {
+      match other {
+        Effect::CopyTree { .. } => return false,
+        Effect::RemoveContent(p) if p == path => return false,
+        Effect::SetContent(_, _, _, ContentSource::Copied(from, _)) if from == path => {
+          return false;
+        }
+        Effect::SetContent(p, ..) if other_place != place && p == path => return false,
+        _ => {}
+      }
+    }
+    if !self.content.is_unique_path(path.as_str()) {
+      return false;
+    }
+    let Some(old) = self.content.block_of(path.as_str()) else {
+      return false;
+    };
+    if self.content.blocks().name(old).is_some() {
+      return false;
+    }
+    let Some(before) = self.content.blocks().bytes(old) else {
+      return false;
+    };
+    let len = before.len();
+    if len == 0 {
+      return false;
+    }
+    let Some(ranges) = crate::history::overwritten(ops, len) else {
+      return false;
+    };
+    if ranges.first() == Some(&(0, len)) {
+      return false;
+    }
+    // Check block holder ownership: either unseeded (only `self.content` holds `old`, holders == 1) or seeded and
+    // current anchor in `content_history[path]` (only `self.content` + anchor hold `old`, holders == 2).
+    let expected_holders = match self.content_history.get(path.as_str()) {
+      None => 1u64,
+      Some(history) => match history.last() {
+        Some((_, Some(latest))) if latest.is_current_anchor(&self.chunks, old) => 2u64,
+        _ => return false,
+      },
+    };
+    if self.content.blocks().holders(old) != expected_holders {
+      return false;
+    }
+    crate::history::overwritten_differs(before, ops, post_state) == Some(true)
+  }
+
   ///
   /// `names` are the effects' places whose files are named for the object they are the whole of
   /// ([`named_files`]).
@@ -5672,8 +5840,13 @@ impl Green {
     post_state: crate::named::Post<'_>,
     names: &[(usize, crate::named::Identity)],
   ) {
+    // Identify uniquely-owned length-preserving overwrites that can patch in place via `overlay_inplace`
+    // without allocating/copying the entire file in `make_mapped` (Wave 8C).
+    let skip_inplace: Vec<usize> = (0..effects.len())
+      .filter(|&place| self.can_overlay_inplace(place, &effects, post_state, names))
+      .collect();
     // First, before a copy or a node move changes the head: each mapped file from the head the verdict judged.
-    self.make_mapped(&mut effects, post_state, &[]);
+    self.make_mapped(&mut effects, post_state, &skip_inplace);
     let moves = self.node_moves(&effects);
     effects.extend(moves);
     // A copied tree's hard links name the copy's nodes, or nodes of their own (`Green::copy_link_effects`), read from the
@@ -5689,14 +5862,15 @@ impl Green {
         .iter()
         .find(|(named, _)| *named == place)
         .map(|(_, identity)| *identity);
-      self.apply_effect(effect, version, &mut staged, name);
+      let inplace = skip_inplace.contains(&place);
+      self.apply_effect(effect, version, &mut staged, name, inplace);
     }
     for path in staged.removed {
       self.remove_file_now(&path, version);
     }
     let mut delta: BTreeMap<String, Vec<Op>> = BTreeMap::new();
     for file in staged.set {
-      self.set_file(file, version, &mut delta);
+      self.set_file(file, version, &mut delta, post_state);
     }
     // A file, a directory or a link this version removed takes its mode and attributes with it once nothing stands at
     // its path (a rename or a file made again in the same version keeps them), as a special's do: they are the inode's,
@@ -5845,19 +6019,21 @@ impl Green {
     version: u64,
     staged: &mut Staged,
     name: Option<crate::named::Identity>,
+    inplace: bool,
   ) {
     // Every key an effect touches is marked once; the identity is brought up to date only when it is read (A-202).
     self.mark_dirty(effect.identity_key());
     match effect {
       Effect::Special(path, node) => self.commit_special(path, node, version),
       Effect::RemoveSpecial(path) => self.remove_special(path, version),
-      // Every file's bytes are made by now (`Green::make_mapped`, the commit's first step).
+      // Every non-inplace file's bytes are made by now (`Green::make_mapped`, the commit's first step).
       Effect::SetContent(path, bytes, ops, source) => staged.set.push(StagedFile {
         path,
         bytes: bytes.unwrap_or_default(),
         ops,
         renamed: matches!(source, ContentSource::Copied(..)),
         name,
+        inplace,
       }),
       Effect::RemoveContent(path) => {
         staged.emptied.push(path.clone());
@@ -6002,13 +6178,20 @@ impl Green {
   }
 
   /// Sets a staged file to its new bytes at `version`, its delta recorded in `delta`.
-  fn set_file(&mut self, file: StagedFile, version: u64, delta: &mut BTreeMap<String, Vec<Op>>) {
+  fn set_file(
+    &mut self,
+    file: StagedFile,
+    version: u64,
+    delta: &mut BTreeMap<String, Vec<Op>>,
+    post_state: crate::named::Post<'_>,
+  ) {
     let StagedFile {
       path,
       bytes,
       ops,
       renamed,
       name,
+      inplace,
     } = file;
     // A rename onto a file removes it (A-612); onto a path this commit emptied, the removal is recorded already. A file
     // this version's own copy brought and its increment edited (A-586) was no other file: nothing was removed.
@@ -6019,6 +6202,50 @@ impl Green {
     // gains is the bytes the new value added, its piece list, and whatever the old one held that the new one does not,
     // the retention charged to the running totals.
     self.seed_content(&path, version);
+    if inplace {
+      let anchored = self
+        .content
+        .block_of(&path)
+        .filter(|&block| self.content.blocks().holders(block) == 2)
+        .and_then(|block| {
+          let Green {
+            content_history,
+            chunks,
+            content,
+            ..
+          } = self;
+          let latest = content_history
+            .get_mut(&path)
+            .and_then(|history| history.last_mut())
+            .and_then(|(_, value)| value.as_mut())?;
+          crate::history::overlay_inplace(
+            latest,
+            chunks,
+            content.blocks_mut(),
+            (block, &ops, post_state),
+          )
+        });
+      if let Some(anchored) = anchored {
+        self
+          .mapped_files_made
+          .set(self.mapped_files_made.get().saturating_add(1));
+        self.supersede_latest(&path);
+        let value = self.record_reanchored(anchored);
+        self.last_changed.insert(path.clone(), version);
+        self.push_content(path.clone(), version, Some(value));
+        delta.insert(path, ops);
+        return;
+      }
+      // Unreachable given `can_overlay_inplace`, but safe fallback: materialize from untouched head bytes.
+      let made = apply(self.head_bytes(&path).unwrap_or_default(), &ops, post_state);
+      self.content.insert(&path, made);
+      self.supersede_latest(&path);
+      let value = self.content_value(&path, &ops);
+      self.last_changed.insert(path.clone(), version);
+      self.push_content(path.clone(), version, Some(value));
+      delta.insert(path, ops);
+      return;
+    }
     // The file first, so the value names its block (A-728); the value it supersedes marked so before the path's history
     // is re-anchored on that block (A-793).
     // A file made whole of one named object holds it by its name alone (A-760 (b) 4d): its bytes, the run's, let go.
@@ -6805,12 +7032,14 @@ impl Green {
         (alone(sole.clone()), named_files(&sole, &runs))
       }
     };
-    let skip: Vec<usize> = wholes.iter().map(|(place, _)| *place).collect();
-    self.make_mapped(
-      &mut effects,
-      crate::named::Post::of(&post_state, &read),
-      &skip,
-    );
+    let post = crate::named::Post::of(&post_state, &read);
+    let mut skip: Vec<usize> = wholes.iter().map(|(place, _)| *place).collect();
+    for place in 0..effects.len() {
+      if !skip.contains(&place) && self.can_overlay_inplace(place, &effects, post, &names) {
+        skip.push(place);
+      }
+    }
+    self.make_mapped(&mut effects, post, &skip);
     move_whole_runs(&mut effects, &mut read, &wholes);
     self.commit(
       effects,
@@ -6889,12 +7118,14 @@ impl Green {
     let sole = self.sole_runs(&effects, &inc.post_state, &read);
     let names = named_files(&sole, &inc.named.runs);
     let wholes = alone(sole);
-    let skip: Vec<usize> = wholes.iter().map(|(place, _)| *place).collect();
-    self.make_mapped(
-      &mut effects,
-      crate::named::Post::of(&inc.post_state, &read),
-      &skip,
-    );
+    let post = crate::named::Post::of(&inc.post_state, &read);
+    let mut skip: Vec<usize> = wholes.iter().map(|(place, _)| *place).collect();
+    for place in 0..effects.len() {
+      if !skip.contains(&place) && self.can_overlay_inplace(place, &effects, post, &names) {
+        skip.push(place);
+      }
+    }
+    self.make_mapped(&mut effects, post, &skip);
     move_whole_runs(&mut effects, &mut read, &wholes);
     let version = self.head().saturating_add(1);
     self.commit(
@@ -7487,6 +7718,228 @@ impl Green {
     }
   }
 
+  /// Like [`Green::rebase_establishing`], returning [`RebasedParts`] so mapped edits over resident head files are
+  /// represented directly as O(edit_size) [`RebasedFile::Parts`] without copying or diffing the head file, and every
+  /// restated journal write stays `Own` (never turning matching tail bytes into `Base` pieces that break off-owner
+  /// composition; Wave 8B).
+  pub fn rebase_establishing_parts(
+    &self,
+    inc: &Increment,
+    established: BTreeSet<String>,
+  ) -> RebasedParts {
+    let (rebased, unlent) = crate::unlent::scope(|| self.rebase_read_parts(inc, established));
+    match unlent.first() {
+      Some(identity) => RebasedParts::ContentUnread {
+        identity: *identity,
+      },
+      None => rebased,
+    }
+  }
+
+  fn rebase_read_parts(&self, inc: &Increment, established: BTreeSet<String>) -> RebasedParts {
+    if inc.base < self.deltas_from {
+      return RebasedParts::BaseUnavailable {
+        base: inc.base,
+        floor: self.deltas_from,
+      };
+    }
+    let to = self.head();
+    if inc.base > to {
+      return RebasedParts::BaseAhead {
+        base: inc.base,
+        head: to,
+      };
+    }
+    if let Some(run) = inc.unread() {
+      return RebasedParts::ContentUnread {
+        identity: run.identity,
+      };
+    }
+    let mut resolved = Green::resolve(inc);
+    resolved.resolution_establishes = established;
+    if let Some((path, case)) = self.copy_refusal(&resolved) {
+      return RebasedParts::CopyRefused { path, case };
+    }
+    let fast_path_before = self.fast_path_hits.get();
+    let decision = self.decide(inc, &resolved);
+    self.fast_path_hits.set(fast_path_before);
+    match decision {
+      Err(windows) => RebasedParts::Conflict { windows },
+      Ok(effects) => self.rebased_from_parts(effects, to, inc.post()),
+    }
+  }
+
+  /// Like [`Green::rebased_from`], building O(edit_size) [`RebasedFile::Parts`] directly from mapped ops for every
+  /// resident head file so `make_mapped` never allocates or copies untouched head bytes.
+  fn rebased_from_parts(
+    &self,
+    mut effects: Vec<Effect>,
+    to: u64,
+    post_state: crate::named::Post<'_>,
+  ) -> RebasedParts {
+    let skip_parts: Vec<usize> = effects
+      .iter()
+      .enumerate()
+      .filter_map(|(place, effect)| {
+        let Effect::SetContent(path, None, _, ContentSource::Mapped) = effect else {
+          return None;
+        };
+        matches!(self.content.get(path.as_str()), Some(Content::Bytes(_))).then_some(place)
+      })
+      .collect();
+    self.make_mapped(&mut effects, post_state, &skip_parts);
+    let heirs = self.heirs_of(&effects);
+    let removed_links = removed_links(&effects);
+    let (handed, refilled) = self.handed_in(&effects);
+    let mut out = RestatePartsOut::default();
+    for effect in in_replay_order(effects) {
+      self.restate_part_effect(
+        effect,
+        post_state,
+        (&removed_links, &handed, &refilled),
+        &mut out,
+      );
+    }
+    for (heir, bytes) in heirs {
+      out.changed.insert(heir, bytes.map(RebasedFile::Whole));
+    }
+    self.prune_unchanged_rebased(&out.journal, &mut out.changed);
+    RebasedParts::Rebased {
+      version: to,
+      changed: out.changed,
+      journal: out.journal,
+    }
+  }
+
+  /// Restates one effect into `out` for [`Green::rebased_from_parts`].
+  fn restate_part_effect(
+    &self,
+    effect: Effect,
+    post_state: crate::named::Post<'_>,
+    (removed_links, handed, refilled): (&BTreeSet<String>, &BTreeSet<String>, &BTreeSet<String>),
+    out: &mut RestatePartsOut,
+  ) {
+    use crate::increment::VolumeOp;
+    let RestatePartsOut {
+      copies,
+      moved_from,
+      journal,
+      changed,
+    } = out;
+    match effect {
+      Effect::Special(path, node) => {
+        if self.specials.contains_key(&path) {
+          journal.push(VolumeOp::Unlink { path: path.clone() });
+        }
+        let mode = self.mode(&path).unwrap_or(0);
+        journal.push(VolumeOp::Mknod { path, node, mode });
+      }
+      Effect::RemoveSpecial(path) => journal.push(VolumeOp::Unlink { path }),
+      Effect::RemoveHardlink(path) | Effect::Mode(path, _) | Effect::SetXattr(path, ..)
+        if handed.contains(&path) => {}
+      Effect::SetContent(path, bytes, _, ContentSource::Copied(home, edits))
+        if handed.contains(&path) =>
+      {
+        let home_len = self.content.get(&home).map_or(0, |held| held.len());
+        journal.extend(content_volume_ops(&home, &edits, home_len));
+        changed.insert(path, Some(RebasedFile::Whole(bytes.unwrap_or_default())));
+      }
+      Effect::SetContent(path, bytes, _, ContentSource::Copied(from, edits)) => {
+        let mut whole_changed: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
+        self.restate_sourced(
+          (path, bytes.unwrap_or_default(), from, edits),
+          (copies, moved_from),
+          (journal, &mut whole_changed),
+        );
+        for (p, b) in whole_changed {
+          changed.insert(p, b.map(RebasedFile::Whole));
+        }
+      }
+      Effect::SetContent(path, None, ops, ContentSource::Mapped) => {
+        let head_len = self.content.get(&path).map_or(0, |head| head.len());
+        let restated = content_volume_ops(&path, &ops, head_len);
+        let has_journal = !restated.is_empty();
+        journal.extend(restated);
+        if has_journal {
+          let parts = parts_from_ops(&path, head_len, &ops, post_state);
+          changed.insert(path, Some(parts));
+        }
+      }
+      Effect::SetContent(path, bytes, ops, _) => {
+        if !self.content.contains_key(&path) {
+          journal.push(VolumeOp::Create { path: path.clone() });
+        }
+        let head_len = self.content.get(&path).map_or(0, |head| head.len());
+        journal.extend(content_volume_ops(&path, &ops, head_len));
+        changed.insert(path, Some(RebasedFile::Whole(bytes.unwrap_or_default())));
+      }
+      Effect::RemoveContent(path) => {
+        if !moved_from.remove(&path) && !refilled.contains(&path) {
+          journal.push(VolumeOp::Unlink { path: path.clone() });
+        }
+        changed.insert(path, None);
+      }
+      Effect::MakeDir(path) => journal.push(VolumeOp::Mkdir { path }),
+      Effect::RemoveDir(path) => journal.push(VolumeOp::Rmdir { path }),
+      Effect::Mode(path, mode) => journal.push(VolumeOp::SetMode { path, mode }),
+      Effect::Symlink(path, target) => journal.push(VolumeOp::Symlink { path, target }),
+      Effect::RemoveSymlink(path) | Effect::RemoveHardlink(path) => {
+        journal.push(VolumeOp::Unlink { path });
+      }
+      Effect::Hardlink(path, target) => {
+        if self.hardlinks.contains_key(&path) && !removed_links.contains(&path) {
+          journal.push(VolumeOp::Unlink { path: path.clone() });
+        }
+        journal.push(VolumeOp::Link { path, target });
+      }
+      Effect::SetXattr(path, name, value) => {
+        journal.push(VolumeOp::SetXattr { path, name, value });
+      }
+      Effect::RemoveXattr(path, name) => journal.push(VolumeOp::RemoveXattr { path, name }),
+      Effect::CopyTree {
+        dst,
+        from,
+        version,
+        replace,
+        ..
+      } => {
+        copies.push((dst.clone(), version));
+        journal.push(VolumeOp::Copy {
+          from,
+          to: dst,
+          version,
+          replace,
+        });
+      }
+    }
+  }
+
+  /// Drops unchanged whole files from `changed` unless their restated journal writes them (keeping `Own` bytes).
+  fn prune_unchanged_rebased(
+    &self,
+    journal: &[crate::increment::VolumeOp],
+    changed: &mut BTreeMap<String, Option<RebasedFile>>,
+  ) {
+    use crate::increment::VolumeOp;
+    let journal_content_paths: BTreeSet<&str> = journal
+      .iter()
+      .filter_map(|op| match op {
+        VolumeOp::Overwrite { path, .. }
+        | VolumeOp::Insert { path, .. }
+        | VolumeOp::Extend { path, .. } => Some(path.as_str()),
+        _ => None,
+      })
+      .collect();
+    changed.retain(|path, after| match after {
+      Some(RebasedFile::Parts { .. }) => true,
+      Some(RebasedFile::Whole(bytes)) => {
+        journal_content_paths.contains(path.as_str())
+          || !same_content(Some(bytes.as_slice()), self.content.get(path))
+      }
+      None => !same_content(None, self.content.get(path)),
+    });
+  }
+
   /// [`Green::rebase_establishing`], its reads of unlent named blocks noted rather than refused (`crate::unlent`).
   fn rebase_read(&self, inc: &Increment, established: BTreeSet<String>) -> Rebased {
     if inc.base < self.deltas_from {
@@ -7748,6 +8201,109 @@ fn removed_links(effects: &[Effect]) -> BTreeSet<String> {
     .collect()
 }
 
+/// Mutable outputs accumulated while restating effects for [`Green::rebased_from_parts`].
+#[derive(Default)]
+struct RestatePartsOut {
+  copies: Vec<(String, u64)>,
+  moved_from: BTreeSet<String>,
+  journal: Vec<crate::increment::VolumeOp>,
+  changed: BTreeMap<String, Option<RebasedFile>>,
+}
+
+/// Builds O(edit_size) [`RebasedFile::Parts`] directly from `ops` and `post_state` over a head file of `head_len`
+/// bytes, matching [`apply_over`]'s clamping rules byte for byte while keeping every added/overwritten run `Own`.
+fn parts_from_ops(
+  path: &str,
+  head_len: u64,
+  ops: &[Op],
+  post_state: crate::named::Post<'_>,
+) -> RebasedFile {
+  let mut pieces: Vec<RebasedPiece> =
+    Vec::with_capacity(ops.len().saturating_mul(2).saturating_add(1));
+  let mut written: Vec<u8> = Vec::new();
+  let mut has_base = false;
+  let mut total = 0u64;
+  let push_base =
+    |pieces: &mut Vec<RebasedPiece>, has_base: &mut bool, total: &mut u64, at: u64, len: u64| {
+      if len == 0 {
+        return;
+      }
+      *has_base = true;
+      *total = total.saturating_add(len);
+      if let Some(RebasedPiece::Base {
+        at: prev_at,
+        len: prev_len,
+      }) = pieces.last_mut()
+        && prev_at.saturating_add(*prev_len) == at
+      {
+        *prev_len = prev_len.saturating_add(len);
+        return;
+      }
+      pieces.push(RebasedPiece::Base { at, len });
+    };
+  let mut pos = 0u64;
+  for op in ops {
+    if op.at > pos {
+      let end = op.at.min(head_len);
+      if end > pos {
+        push_base(
+          &mut pieces,
+          &mut has_base,
+          &mut total,
+          pos,
+          end.saturating_sub(pos),
+        );
+      }
+      pos = op.at;
+    }
+    match op.kind {
+      OpKind::Delete => pos = pos.saturating_add(op.len),
+      OpKind::Truncate => pos = head_len,
+      OpKind::Overwrite | OpKind::Insert | OpKind::Extend => {
+        let span = post_state.span(op.src, op.len);
+        let span_len = u64::try_from(span.len()).unwrap_or(u64::MAX);
+        if span_len > 0 {
+          let own_at = u64::try_from(written.len()).unwrap_or(u64::MAX);
+          written.extend_from_slice(&span);
+          total = total.saturating_add(span_len);
+          if let Some(RebasedPiece::Own {
+            at: prev_at,
+            len: prev_len,
+          }) = pieces.last_mut()
+            && prev_at.saturating_add(*prev_len) == own_at
+          {
+            *prev_len = prev_len.saturating_add(span_len);
+          } else {
+            pieces.push(RebasedPiece::Own {
+              at: own_at,
+              len: span_len,
+            });
+          }
+        }
+        if op.kind == OpKind::Overwrite {
+          pos = pos.saturating_add(op.len);
+        }
+      }
+      _ => {}
+    }
+  }
+  if pos < head_len {
+    push_base(
+      &mut pieces,
+      &mut has_base,
+      &mut total,
+      pos,
+      head_len.saturating_sub(pos),
+    );
+  }
+  RebasedFile::Parts {
+    origin: has_base.then(|| path.to_owned()),
+    pieces,
+    written,
+    len: total,
+  }
+}
+
 /// Restates a file's mapped content ops as declared operations, in head coordinates. The ops are one pass over the
 /// head's `head_len` bytes ([`apply`]: each at its offset in the head, in order), while a journal is replayed one
 /// operation at a time over the file as the operations before it left it. So each op is restated where [`apply`] stands
@@ -7964,6 +8520,22 @@ mod tests {
       self
     }
 
+    /// `bytes` overwriting `path` at `at`.
+    fn overwrite(mut self, path: &str, at: u64, bytes: &[u8]) -> Steps {
+      let path = self.doc.paths.intern(path);
+      let src = self.post.len() as u64;
+      self.post.extend_from_slice(bytes);
+      self.doc.ops.push(Op {
+        kind: OpKind::Overwrite,
+        flags: 0,
+        path,
+        at,
+        len: bytes.len() as u64,
+        src,
+      });
+      self
+    }
+
     /// `path` created holding `bytes`.
     fn create(mut self, path: &str, bytes: &[u8]) -> Steps {
       let index = self.doc.paths.intern(path);
@@ -8062,5 +8634,251 @@ mod tests {
       Some(b"0123456789XY".as_slice()),
       "the replayed version lost the edit"
     );
+  }
+
+  /// Wave 8B oracle: `parts_from_ops` materialized over `head` equals `apply_over` byte for byte across every content
+  /// op kind (`Overwrite`, `Insert`, `Delete`, `Extend`, `Truncate`) and boundary clamp, while keeping every written
+  /// range `Own` even when the written bytes match `head`.
+  #[test]
+  fn parts_from_ops_matches_apply_across_edit_kinds_and_keeps_written_bytes_own() {
+    let head: Vec<u8> = (0u8..=255).cycle().take(512).collect();
+    let head_len = head.len() as u64;
+    let matching_tail = &head[100..164];
+    let cases: &[(&str, Vec<Op>, Vec<u8>)] = &[
+      (
+        "overwrite-matching-head",
+        vec![Op {
+          kind: OpKind::Overwrite,
+          flags: 0,
+          path: 0,
+          at: 100,
+          len: matching_tail.len() as u64,
+          src: 0,
+        }],
+        matching_tail.to_vec(),
+      ),
+      (
+        "mixed-insert-overwrite-delete-extend",
+        vec![
+          Op {
+            kind: OpKind::Insert,
+            flags: 0,
+            path: 0,
+            at: 0,
+            len: 5,
+            src: 0,
+          },
+          Op {
+            kind: OpKind::Overwrite,
+            flags: 0,
+            path: 0,
+            at: 32,
+            len: 16,
+            src: 5,
+          },
+          Op {
+            kind: OpKind::Delete,
+            flags: 0,
+            path: 0,
+            at: 80,
+            len: 40,
+            src: u64::MAX,
+          },
+          Op {
+            kind: OpKind::Extend,
+            flags: 0,
+            path: 0,
+            at: head_len,
+            len: 12,
+            src: 21,
+          },
+        ],
+        b"HEAD!0123456789abcdefTAIL_EXTEND!".to_vec(),
+      ),
+      (
+        "overwrite-then-truncate",
+        vec![
+          Op {
+            kind: OpKind::Overwrite,
+            flags: 0,
+            path: 0,
+            at: 10,
+            len: 4,
+            src: 0,
+          },
+          Op {
+            kind: OpKind::Truncate,
+            flags: 0,
+            path: 0,
+            at: 20,
+            len: 0,
+            src: u64::MAX,
+          },
+        ],
+        b"WXYZ".to_vec(),
+      ),
+      (
+        "empty-truncate-all",
+        vec![Op {
+          kind: OpKind::Truncate,
+          flags: 0,
+          path: 0,
+          at: 0,
+          len: 0,
+          src: u64::MAX,
+        }],
+        Vec::new(),
+      ),
+    ];
+
+    for (name, ops, post) in cases {
+      let post_view = crate::named::Post::of(post, &[]);
+      let expected = apply_over((&head, head_len), ops, post_view);
+      let built = parts_from_ops("f.bin", head_len, ops, post_view);
+      let RebasedFile::Parts {
+        pieces,
+        written,
+        len,
+        ..
+      } = built
+      else {
+        panic!("case {name}: expected RebasedFile::Parts");
+      };
+      assert_eq!(len, expected.len() as u64, "case {name}: len mismatch");
+      let mut materialized = Vec::with_capacity(expected.len());
+      for piece in &pieces {
+        match *piece {
+          RebasedPiece::Base { at, len } => {
+            let start = usize::try_from(at).expect("offset fits usize");
+            let end = start + usize::try_from(len).expect("len fits usize");
+            materialized.extend_from_slice(&head[start..end]);
+          }
+          RebasedPiece::Own { at, len } => {
+            let start = usize::try_from(at).expect("offset fits usize");
+            let end = start + usize::try_from(len).expect("len fits usize");
+            materialized.extend_from_slice(&written[start..end]);
+          }
+        }
+      }
+      assert_eq!(materialized, expected, "case {name}: bytes mismatch");
+      if *name == "overwrite-matching-head" {
+        assert_eq!(
+          written, matching_tail,
+          "matching head bytes written by an op must stay Own"
+        );
+        assert!(
+          pieces.iter().any(
+            |p| matches!(p, RebasedPiece::Own { at: 0, len } if *len == matching_tail.len() as u64)
+          ),
+          "expected Own piece for matching overwrite"
+        );
+      }
+    }
+  }
+
+  /// Wave 8C oracle: in-place overwrite on a uniquely-owned large file preserves historical reads and lazy BLAKE3
+  /// digests, and `Ptrie::is_unique_path` prevents mutating a shared leaf after `branch_at` so parent and branch
+  /// diverge cleanly across all versions.
+  #[test]
+  fn inplace_overwrite_preserves_fork_history_and_digests() {
+    let initial: Vec<u8> = (0u8..=255).cycle().take(65_536).collect();
+    let mut parent = Green::new();
+    let v1 = Steps::default().create("big.bin", &initial).at(1, 0);
+    assert_eq!(parent.submit(&v1), Outcome::Accepted { version: 1 });
+
+    // First overwrite on uniquely-owned block (triggers overlay_inplace).
+    let patch_a = b"PATCH_A_16_BYTES";
+    let v2 = Steps::default()
+      .overwrite("big.bin", 1024, patch_a)
+      .at(2, 1);
+    assert_eq!(parent.submit(&v2), Outcome::Accepted { version: 2 });
+
+    let mut expected_v2 = initial.clone();
+    expected_v2[1024..1024 + patch_a.len()].copy_from_slice(patch_a);
+    assert_eq!(
+      parent.content_at_bytes("big.bin", 1).as_deref(),
+      Some(initial.as_slice())
+    );
+    assert_eq!(
+      parent.content_at_bytes("big.bin", 2).as_deref(),
+      Some(expected_v2.as_slice())
+    );
+    assert_eq!(
+      parent.content_bytes("big.bin"),
+      Some(expected_v2.as_slice())
+    );
+
+    // Branch at v2 via Lineage: Ptrie root now has holders > 1, so neither parent nor branch may mutate the shared
+    // leaf in place.
+    let (mut lineage, parent_handle) = Lineage::new(parent);
+    let branch_handle = lineage.branch(parent_handle, 2).expect("branch at v2");
+
+    let patch_parent = b"PARENT_DIVERGED!";
+    let v3_parent = Steps::default()
+      .overwrite("big.bin", 4096, patch_parent)
+      .at(3, 2);
+    assert_eq!(
+      lineage
+        .with(parent_handle, |g| g.submit(&v3_parent))
+        .expect("submit parent"),
+      Outcome::Accepted { version: 3 }
+    );
+
+    let patch_branch = b"BRANCH_DIVERGED!";
+    let v1_branch = Steps::default()
+      .overwrite("big.bin", 4096, patch_branch)
+      .at(4, 0);
+    assert_eq!(
+      lineage
+        .with(branch_handle, |g| g.submit(&v1_branch))
+        .expect("submit branch"),
+      Outcome::Accepted { version: 1 }
+    );
+
+    let mut expected_parent = expected_v2.clone();
+    expected_parent[4096..4096 + patch_parent.len()].copy_from_slice(patch_parent);
+    let mut expected_branch = expected_v2.clone();
+    expected_branch[4096..4096 + patch_branch.len()].copy_from_slice(patch_branch);
+
+    let expected_parent_hash = *blake3::hash(&expected_parent).as_bytes();
+    let expected_branch_hash = *blake3::hash(&expected_branch).as_bytes();
+
+    lineage
+      .with(parent_handle, |parent| {
+        assert_eq!(
+          parent.content_at_bytes("big.bin", 1).as_deref(),
+          Some(initial.as_slice())
+        );
+        assert_eq!(
+          parent.content_at_bytes("big.bin", 2).as_deref(),
+          Some(expected_v2.as_slice())
+        );
+        assert_eq!(
+          parent.content_bytes("big.bin"),
+          Some(expected_parent.as_slice())
+        );
+        assert_eq!(
+          parent.content.digest_of("big.bin"),
+          Some((expected_parent.len() as u64, expected_parent_hash))
+        );
+      })
+      .expect("read parent");
+
+    lineage
+      .with(branch_handle, |branch| {
+        assert_eq!(
+          branch.content_at_bytes("big.bin", 0).as_deref(),
+          Some(expected_v2.as_slice())
+        );
+        assert_eq!(
+          branch.content_bytes("big.bin"),
+          Some(expected_branch.as_slice())
+        );
+        assert_eq!(
+          branch.content.digest_of("big.bin"),
+          Some((expected_branch.len() as u64, expected_branch_hash))
+        );
+      })
+      .expect("read branch");
   }
 }

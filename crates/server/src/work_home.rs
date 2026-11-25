@@ -566,15 +566,7 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
         return None;
       }
       let sealed = seal(state, work);
-      if let Some(need) = base_missing(state, &sealed) {
-        return Some(need);
-      }
-      if let Some(owed) = refine_owed(state, &sealed) {
-        return Some(Need::Refine(Box::new(owed)));
-      }
-      Some(Need::Rebase {
-        sealed: Box::new(composed(state, sealed, Vec::new())),
-      })
+      Some(prepare_rebase_need(state, sealed, None))
     }
     RequestBody::EditSubmit {
       path,
@@ -641,6 +633,88 @@ fn submitted(body: &RequestBody) -> Option<Submitted<'_>> {
   }
 }
 
+/// Plans `sealed` once against the work's kept entries (Wave 8A): computes `(base, (doc, plan))` a single time
+/// instead of up to 4 times across `base_missing` / `refine_owed` / `composed`, checks missing base files or
+/// whole-file refinements, and otherwise composes the increment on this shard.
+fn prepare_sealed(
+  state: &ShardState,
+  sealed: SealedWork,
+  evidence: Vec<[u8; 32]>,
+) -> Result<SealedWork, Box<Need>> {
+  if holds_copy(&sealed.journal) {
+    let mut sealed = sealed;
+    if state.works.contains_key(&sealed.work) {
+      sealed.composes_here = true;
+    }
+    return Ok(sealed);
+  }
+  let (planned_base, planned_doc) = match state.works.get(&sealed.work) {
+    Some(w) => {
+      let named: std::collections::BTreeSet<&str> = sealed
+        .journal
+        .iter()
+        .flat_map(VolumeOp::names)
+        .flatten()
+        .collect();
+      let base = slates_merge::increment::Base::for_names(&named, &w.entries);
+      let planned = base
+        .as_ref()
+        .and_then(|b| slates_merge::increment::compose_volume_planned(b, &sealed.journal).ok());
+      (base, planned)
+    }
+    None => (None, None),
+  };
+  if let Some(need) = base_missing_with(state, &sealed, planned_doc.as_ref().map(|(doc, _)| doc)) {
+    return Err(Box::new(need));
+  }
+  let own = state
+    .works
+    .get(&sealed.work)
+    .is_some_and(|w| w.journal.len() == sealed.journal.len());
+  let refine_pairs = if own && let (Some(base), Some((doc, plan))) = (&planned_base, &planned_doc) {
+    crate::refining::owed_pairs(
+      state,
+      (sealed.work, sealed.base_version),
+      sealed.journal.len(),
+      base,
+      (doc, plan),
+    )
+  } else {
+    Vec::new()
+  };
+  if !refine_pairs.is_empty()
+    && let Some((doc, plan)) = planned_doc
+  {
+    let owed = crate::refining::make_owed(
+      (sealed.base_version, sealed.journal.len()),
+      doc,
+      plan,
+      refine_pairs,
+    );
+    return Err(Box::new(Need::Refine(Box::new(owed))));
+  }
+  Ok(composed_with(
+    state,
+    sealed,
+    evidence,
+    planned_base.as_ref(),
+    planned_doc,
+  ))
+}
+
+/// Builds the rebase/merge need using [`prepare_sealed`] so the journal is planned at most once.
+fn prepare_rebase_need(state: &ShardState, sealed: SealedWork, ask: Option<MergeAsk>) -> Need {
+  match prepare_sealed(state, sealed, Vec::new()) {
+    Err(need) => *need,
+    Ok(mut prepared) => {
+      prepared.merge = ask;
+      Need::Rebase {
+        sealed: Box::new(prepared),
+      }
+    }
+  }
+}
+
 /// What a submit of `sealed` needs of the owner, once it has what it reads: its work's route first (A-298), then the
 /// base entries its composition lacks, then the verdict, carrying the work's merge mode and signed-work rules, read here
 /// where the work's record is, and the approval and the signature the submit carries (A-285, A-321).
@@ -658,17 +732,14 @@ fn verdict_need(
   if !route_committed(state, work) {
     return Need::Route;
   }
-  if let Some(need) = base_missing(state, &sealed) {
-    return need;
+  match prepare_sealed(state, sealed, evidence.to_vec()) {
+    Err(need) => *need,
+    Ok(prepared) => Need::Verdict {
+      evidence: evidence.to_vec(),
+      sealed: Box::new(prepared),
+      policy: crate::verbs::SubmitPolicy::of_work(state, work, (approval, signature, authorship)),
+    },
   }
-  if let Some(owed) = refine_owed(state, &sealed) {
-    return Need::Refine(Box::new(owed));
-  }
-  base_missing(state, &sealed).unwrap_or_else(|| Need::Verdict {
-    evidence: evidence.to_vec(),
-    sealed: Box::new(composed(state, sealed, evidence.to_vec())),
-    policy: crate::verbs::SubmitPolicy::of_work(state, work, (approval, signature, authorship)),
-  })
 }
 
 /// What a merge check or a resolution needs of the green's owner (A-796): a rebase's base and refinement first, then the
@@ -677,17 +748,8 @@ fn merge_need(state: &ShardState, work: DbVolumeId, ask: MergeAsk) -> Option<Nee
   if state.work_home.rebased.is_some() {
     return None;
   }
-  let mut sealed = seal(state, work);
-  if let Some(need) = base_missing(state, &sealed) {
-    return Some(need);
-  }
-  if let Some(owed) = refine_owed(state, &sealed) {
-    return Some(Need::Refine(Box::new(owed)));
-  }
-  sealed.merge = Some(ask);
-  Some(Need::Rebase {
-    sealed: Box::new(composed(state, sealed, Vec::new())),
-  })
+  let sealed = seal(state, work);
+  Some(prepare_rebase_need(state, sealed, Some(ask)))
 }
 
 fn page_if_unheld(
@@ -732,25 +794,6 @@ fn declare_need(fetched: bool, op: &WorkOp) -> Option<Need> {
   }
 }
 
-/// The refinement `sealed`'s composition on this shard owes (A-787 part 2): none for a journal its owner composes (a
-/// copy's), a sealed copy holding more than the work, or one that replaces nothing whole or whose refinement is kept.
-fn refine_owed(state: &ShardState, sealed: &SealedWork) -> Option<crate::refining::Owed> {
-  // The job reads the writer's bytes from the work: a sealed copy holding more than the work (an edit-and-submit's
-  // edit, applied to the copy alone) composes unrefined.
-  let own = state
-    .works
-    .get(&sealed.work)
-    .is_some_and(|w| w.journal.len() == sealed.journal.len());
-  if !own || holds_copy(&sealed.journal) {
-    return None;
-  }
-  crate::refining::owed(
-    state,
-    (sealed.work, sealed.green, sealed.base_version),
-    &sealed.journal,
-  )
-}
-
 /// What the owner sent `work`'s parked verb (A-247), for its refinement's copy (`crate::refining`): `None` when no verb
 /// of the work is parked or it fetched nothing.
 pub(crate) fn parked_fetched(state: &ShardState, work: DbVolumeId) -> Option<&FetchedBase> {
@@ -783,7 +826,11 @@ pub(crate) fn refined(state: &mut ShardState, work: DbVolumeId) {
 /// the work held was never fetched, so a work off its green's shard composed a whole-file save unrefined and conflicted
 /// with any edit of the file). `None` when it has all it needs: when this verb's fetch holds every such path (asked
 /// again when it does not, as one ask of the union, since the fetch is the verb's own), or the green is gone.
-fn base_missing(state: &ShardState, sealed: &SealedWork) -> Option<Need> {
+fn base_missing_with(
+  state: &ShardState,
+  sealed: &SealedWork,
+  planned_doc: Option<&slates_merge::ops_doc::OpsDoc>,
+) -> Option<Need> {
   // A journal holding a copy is composed by the owner, which holds the copied trees (`COPY_COMPOSED_BY_OWNER`).
   if holds_copy(&sealed.journal) {
     return None;
@@ -808,9 +855,8 @@ fn base_missing(state: &ShardState, sealed: &SealedWork) -> Option<Need> {
   // Only a replacement whose declared base length is the base file's (as the work's kept entry names it) is one the
   // refinement refines; any other it keeps as declared, so its base bytes would be asked for nothing (A-817: an overwrite
   // at offset 0 shorter than its file asked them at every rebase and submit).
-  let whole: Vec<String> = slates_merge::increment::Base::for_names(&named, &w.entries)
-    .and_then(|base| slates_merge::increment::compose_volume_planned(&base, &sealed.journal).ok())
-    .map(|(doc, _)| slates_merge::refine::whole_replaced_lengths(&doc))
+  let whole: Vec<String> = planned_doc
+    .map(slates_merge::refine::whole_replaced_lengths)
     .unwrap_or_default()
     .into_iter()
     .filter(|(path, base_len)| {
@@ -860,24 +906,26 @@ fn base_missing(state: &ShardState, sealed: &SealedWork) -> Option<Need> {
   }
 }
 
-/// `sealed` with its increment composed on this shard, from the entries the work fetched and its files (over the bytes
-/// this verb fetched, for a file it does not hold), and its journal and files left behind: the owner only judges it.
-/// Composed by the function the owner composes by (`verbs::compose_increment`), so the increment is the same.
-fn composed(state: &ShardState, mut sealed: SealedWork, evidence: Vec<[u8; 32]>) -> SealedWork {
-  let Some(w) = state.works.get(&sealed.work) else {
+/// `sealed` with its increment composed on this shard from the already-planned `(base, (doc, plan))` (Wave 8A),
+/// leaving its journal and files behind so the owner only judges it.
+fn composed_with(
+  state: &ShardState,
+  mut sealed: SealedWork,
+  evidence: Vec<[u8; 32]>,
+  planned_base: Option<&slates_merge::increment::Base>,
+  planned_doc: Option<(
+    slates_merge::ops_doc::OpsDoc,
+    slates_merge::increment::PostStatePlan,
+  )>,
+) -> SealedWork {
+  if !state.works.contains_key(&sealed.work) {
     return sealed;
-  };
+  }
   sealed.composes_here = true;
   if holds_copy(&sealed.journal) {
     return sealed;
   }
-  let named: std::collections::BTreeSet<&str> = sealed
-    .journal
-    .iter()
-    .flat_map(VolumeOp::names)
-    .flatten()
-    .collect();
-  let Some(base) = slates_merge::increment::Base::for_names(&named, &w.entries) else {
+  let Some(base) = planned_base else {
     return sealed;
   };
   let files_base = Base {
@@ -892,9 +940,10 @@ fn composed(state: &ShardState, mut sealed: SealedWork, evidence: Vec<[u8; 32]>)
     sealed.work,
     (sealed.base_version, sealed.journal.len()),
   );
+  let planned = kept.or(planned_doc);
   let Ok(inc) = crate::verbs::compose_increment(
     (sealed.work, sealed.base_version),
-    (&base, kept),
+    (base, planned),
     (&sealed.files, files_base),
     &sealed.journal,
     evidence,
@@ -1381,14 +1430,43 @@ struct AskItem {
   back: ReplyRoute,
 }
 
-/// A shard's asks to one owner shard: those waiting, and the batches out. At most [`BATCHES_OUT`] are out at a time, so a
-/// burst of asks rides a few messages, each carrying what gathered while the others were out, and an owner's channel
-/// holds at most that many messages from each asking shard (A-388).
+/// A shard's asks to one owner shard: those waiting, the batches out, and a data-derived batch size target (`aim`)
+/// adapted from observed owner answers and handbacks so bursts never bounce oversized batches back and forth. At most
+/// [`BATCHES_OUT`] are out at a time, so a burst of asks rides a few messages, each carrying what gathered while the
+/// others were out, and an owner's channel holds at most that many messages from each asking shard (A-388).
 #[derive(Default)]
 pub(crate) struct Outbox {
   waiting: VecDeque<AskItem>,
   /// The batches out to the owner now, one a sender task ([`send_batches`]).
   out: usize,
+  /// Data-derived batch size target (`0` = uninitialized, starts at `batch_bound`). Shrinks to `answered.max(1)`
+  /// whenever the owner hands back unfinished items, and doubles back toward `bound` once full batches finish cleanly.
+  aim: usize,
+}
+
+impl Outbox {
+  /// Number of items the next batch should drain from this outbox, clamped to `1..=bound`.
+  fn take_limit(&self, bound: usize) -> usize {
+    let cap = bound.max(1);
+    if self.aim == 0 {
+      cap
+    } else {
+      self.aim.clamp(1, cap)
+    }
+  }
+
+  /// Updates the batch target from one completed (or handed-back) owner batch.
+  fn note_batch(&mut self, answered: usize, handed_back: bool, bound: usize) {
+    let cap = bound.max(1);
+    if handed_back {
+      self.aim = answered.clamp(1, cap);
+    } else {
+      let current = self.take_limit(cap);
+      if answered >= current {
+        self.aim = current.saturating_mul(2).min(cap);
+      }
+    }
+  }
 }
 
 /// Shape: the batches a shard keeps out to one owner at once (A-388): two, so one waits at the owner while the one
@@ -2351,7 +2429,7 @@ async fn send_batches(here: u16, owner: u16) {
       here,
       owner,
       move |s| {
-        let step = s.config.runtime.step_budget_ns;
+        let step = slates_rt::futures::step_budget_ns().unwrap_or(s.config.runtime.step_budget_ns);
         answer_within(batch, step, slates_machine::clock::monotonic_ns, |item| {
           answer_on_owner(s, item)
         })
@@ -2361,19 +2439,29 @@ async fn send_batches(here: u16, owner: u16) {
     .await;
     let _ = state::with_state_counted(|s| match answers {
       Some((answers, rest)) => {
+        let answered = answers.len();
+        let handed_back = !rest.is_empty();
         for (queue, outcome) in keys.into_iter().zip(answers) {
           settle_outcome(s, queue, outcome);
         }
-        if !rest.is_empty() {
-          s.count(BATCH_HANDED_BACK, 1);
-          if let Some(outbox) = s.work_home.outboxes.get_mut(&owner) {
+        let bound = batch_bound(s);
+        if let Some(outbox) = s.work_home.outboxes.get_mut(&owner) {
+          outbox.note_batch(answered, handed_back, bound);
+          if handed_back {
             for item in rest.into_iter().rev() {
               outbox.waiting.push_front(item);
             }
           }
         }
+        if handed_back {
+          s.count(BATCH_HANDED_BACK, 1);
+        }
       }
       None => {
+        let bound = batch_bound(s);
+        if let Some(outbox) = s.work_home.outboxes.get_mut(&owner) {
+          outbox.note_batch(1, true, bound);
+        }
         for queue in keys {
           resolve(s, queue, None);
         }
@@ -2384,25 +2472,31 @@ async fn send_batches(here: u16, owner: u16) {
 
 /// The next batch of `owner`'s outbox, each ask checked to be durable first: a submit's pending record and a
 /// creation's committed before its ask goes (`stage_pending`, `create_need`); one whose verb's transaction did not
-/// commit is answered unanswered. An empty batch ends the sending.
+/// commit is answered unanswered. Loops past unstaged items so `outbox.out` is decremented whenever an empty batch
+/// ends this sender task.
 fn take_batch(state: &mut ShardState, owner: u16) -> Vec<AskItem> {
   let bound = batch_bound(state);
-  let Some(outbox) = state.work_home.outboxes.get_mut(&owner) else {
-    return Vec::new();
-  };
-  let take = outbox.waiting.len().min(bound);
-  let items: Vec<AskItem> = outbox.waiting.drain(..take).collect();
-  if items.is_empty() {
-    // This sender ends: its batch is no longer out.
-    outbox.out = outbox.out.saturating_sub(1);
-    return items;
+  loop {
+    let items: Vec<AskItem> = {
+      let Some(outbox) = state.work_home.outboxes.get_mut(&owner) else {
+        return Vec::new();
+      };
+      if outbox.waiting.is_empty() {
+        outbox.out = outbox.out.saturating_sub(1);
+        return Vec::new();
+      }
+      let take = outbox.waiting.len().min(outbox.take_limit(bound));
+      outbox.waiting.drain(..take).collect()
+    };
+    let (ready, unstaged): (Vec<AskItem>, Vec<AskItem>) =
+      items.into_iter().partition(|item| staged(state, item));
+    for item in unstaged {
+      resolve(state, item.queue, None);
+    }
+    if !ready.is_empty() {
+      return ready;
+    }
   }
-  let (ready, unstaged): (Vec<AskItem>, Vec<AskItem>) =
-    items.into_iter().partition(|item| staged(state, item));
-  for item in unstaged {
-    resolve(state, item.queue, None);
-  }
-  ready
 }
 
 /// Whether an ask's verb left what the owner's answer will be settled against: a submit's pending record, a creation's.
@@ -3283,7 +3377,7 @@ mod tests {
       let before = published(state);
       let mut accepted = Vec::new();
       for (n, work) in (1..=WORKS).zip(works) {
-        let sealed = super::composed(state, super::seal(state, work), Vec::new());
+        let sealed = super::composed_with(state, super::seal(state, work), Vec::new(), None, None);
         let policy = crate::verbs::SubmitPolicy::of_work(
           state,
           work,
@@ -3324,5 +3418,77 @@ mod tests {
       published, 0,
       "{WORKS} accepted owner submits cost {published} publications; A-825's parent paid none"
     );
+  }
+
+  /// Wave 8.1 outbox sender accounting: when every ask drained by `take_batch` is unstaged (no pending record in
+  /// the partition), `take_batch` returns empty and MUST release the sender's `outbox.out` slot so future asks can
+  /// still spawn a sender task instead of permanently leaking `out`.
+  #[test]
+  fn take_batch_releases_sender_slot_when_all_drained_items_are_unstaged() {
+    crate::daemon::audit_on_shard(|state| {
+      let owner = 1u16;
+      let work = DbVolumeId { bytes: [9; 16] };
+      let green = DbVolumeId { bytes: [3; 16] };
+      let outbox = state.work_home.outboxes.entry(owner).or_default();
+      outbox.out = 1;
+      outbox.waiting.push_back(super::AskItem {
+        queue: work,
+        need: super::Need::Admit {
+          green,
+          id: work,
+          name: "unstaged-work".to_owned(),
+        },
+        green,
+        version: 0,
+        origin: 1,
+        id: slates_wire::request::RequestId::from_word(1),
+        principal: slates_db::catalog::Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 1234,
+        },
+        back: crate::merge_service::ReplyRoute {
+          shard: state.shard,
+          client_index: 0,
+          request: 1,
+          through_work: true,
+        },
+      });
+      let batch = super::take_batch(state, owner);
+      assert!(batch.is_empty(), "unstaged admit must not be sent");
+      assert_eq!(
+        state.work_home.outboxes.get(&owner).map_or(0, |o| o.out),
+        0,
+        "empty batch returned to send_batches must release outbox.out"
+      );
+    });
+  }
+
+  /// Wave 8.1 adaptive batch sizing: an outbox starts at `bound`, snaps to the owner's actual per-step answer count
+  /// on handback (eliminating 60+ item bounce storms), and doubles back toward `bound` as full batches succeed cleanly.
+  #[test]
+  fn outbox_aim_adapts_to_owner_step_capacity() {
+    let mut outbox = super::Outbox::default();
+    let bound = 64;
+    assert_eq!(outbox.take_limit(bound), 64);
+    // Owner only finished 3 of 64 before step budget expired: snap aim straight to 3.
+    outbox.note_batch(3, true, bound);
+    assert_eq!(outbox.take_limit(bound), 3);
+    // Partial drain (only 2 items waited, both answered cleanly): do not inflate aim.
+    outbox.note_batch(2, false, bound);
+    assert_eq!(outbox.take_limit(bound), 3);
+    // Full batch of 3 finished cleanly: double to 6, then 12, clamping at bound.
+    outbox.note_batch(3, false, bound);
+    assert_eq!(outbox.take_limit(bound), 6);
+    outbox.note_batch(6, false, bound);
+    assert_eq!(outbox.take_limit(bound), 12);
+    outbox.note_batch(12, false, bound);
+    assert_eq!(outbox.take_limit(bound), 24);
+    outbox.note_batch(24, false, bound);
+    assert_eq!(outbox.take_limit(bound), 48);
+    outbox.note_batch(48, false, bound);
+    assert_eq!(outbox.take_limit(bound), 64);
+    // Zero answered + handback still clamps at 1 so progress never stalls.
+    outbox.note_batch(0, true, bound);
+    assert_eq!(outbox.take_limit(bound), 1);
   }
 }

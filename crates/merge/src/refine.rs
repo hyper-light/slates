@@ -1762,6 +1762,54 @@ async fn replacements(
   found
 }
 
+/// One candidate whole-file replacement in a document (`whole_replaced_shapes`), carrying every field that
+/// [`lent_whole`] checks before refining (`base_len`, `post_len`, `laid_at`) so callers filter out partial
+/// overwrites starting at offset 0 before spawning refinement jobs (A-817).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WholeReplacement {
+  /// The base file's path (the path itself, or its rename source).
+  pub base: String,
+  /// The replaced path in the document.
+  pub path: String,
+  /// The base byte length the replacement's ops delete/overwrite from offset 0.
+  pub base_len: u64,
+  /// The post byte length the replacement's ops insert/overwrite.
+  pub post_len: u64,
+  /// The post-state offset (`op.src`) whose entry in `PostStatePlan` must equal `0`.
+  pub laid_at: u64,
+}
+
+/// All candidate whole-file replacements in `doc` with their declared lengths and post-state layout offsets
+/// ([`WholeReplacement`]): callers check `base_len`, `post_len`, and `plan.get(&laid_at) == Some(&0)` before
+/// fetching base bytes or starting a refinement job.
+pub fn whole_replaced_shapes(doc: &OpsDoc) -> Vec<WholeReplacement> {
+  let mut found = Vec::new();
+  let mut start = 0;
+  while start < doc.ops.len() {
+    let path = doc.ops.get(start).map_or(0, |op| op.path);
+    let mut end = start;
+    while doc.ops.get(end).is_some_and(|op| op.path == path) {
+      end = end.saturating_add(1);
+    }
+    if let Some(shape) = whole_replacement(doc.ops.get(start..end).unwrap_or_default())
+      && let (Some(base), Some(name)) = (
+        doc.paths.path(shape.from.unwrap_or(path)),
+        doc.paths.path(path),
+      )
+    {
+      found.push(WholeReplacement {
+        base: base.to_owned(),
+        path: name.to_owned(),
+        base_len: shape.base_len,
+        post_len: shape.post_len,
+        laid_at: shape.laid_at,
+      });
+    }
+    start = end;
+  }
+  found
+}
+
 /// The whole-file replacements of `doc` as `(base path, path)`: the path replaced, and the base file its content is
 /// relative to (its own, or, under a rename over it, its source's, C2). What a refinement reads the bytes of. One walk
 /// of the document's ops, as its composition's own walks are.

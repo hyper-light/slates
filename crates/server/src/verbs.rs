@@ -10230,6 +10230,7 @@ pub(crate) fn compose_increment(
 /// The increment [`compose_increment`] composes whole for `work`'s journal over `refined`, its refinement's document and
 /// plan, at `base_version` on the green `green` holds here: the oracle a refinement job's sliced build is held to in a
 /// debug build (A-821). `None` where the work, the green or the composition is not there.
+#[cfg(any(debug_assertions, test))]
 pub(crate) fn composed_whole(
   state: &ShardState,
   (work, green, base_version): (DbVolumeId, DbVolumeId, u64),
@@ -12633,8 +12634,9 @@ fn rebase_answer(
   composes: bool,
 ) -> crate::work_home::RebaseAnswer {
   use crate::work_home::RebaseAnswer;
-  match engine.rebase_establishing(inc, established) {
-    slates_merge::engine::Rebased::Rebased {
+  use slates_merge::engine::{RebasedFile, RebasedParts, RebasedPiece};
+  match engine.rebase_establishing_parts(inc, established) {
+    RebasedParts::Rebased {
       version,
       changed,
       journal,
@@ -12659,17 +12661,53 @@ fn rebase_answer(
       } else {
         std::collections::BTreeMap::new()
       };
-      // Each changed file as its parts over the head's same path (A-806): what differs is written, the rest names the
-      // head, so neither the work nor its restatement holds the file.
+      // Each changed file as its parts over the head's same path (A-806, Wave 8B): mapped edits arrive directly
+      // as O(edit_size) `RebasedFile::Parts` without copying or diffing the head file; whole files (created,
+      // copied, heir, named) keep every restated journal write range as `Own` so off-owner composition never hits
+      // `BaseGone`.
       let changed = changed
         .into_iter()
-        .map(|(path, bytes)| {
-          // A head file held by its content-plane object alone (A-760 (b) 4b) is no base here: the changed file is
-          // held whole, its bytes the same, sharing nothing with the head.
-          let base = engine
-            .content(&path)
-            .and_then(|content| content.bytes().ok());
-          let parts = bytes.map(|bytes| crate::work_files::parts_over_base(&path, base, bytes));
+        .map(|(path, file)| {
+          let parts = file.map(|file| match file {
+            RebasedFile::Parts {
+              origin,
+              pieces,
+              written,
+              len,
+            } => crate::work_files::HeldParts {
+              origin,
+              pieces: pieces
+                .into_iter()
+                .map(|piece| match piece {
+                  RebasedPiece::Base { at, len } => crate::work_files::PiecePart::Base { at, len },
+                  RebasedPiece::Own { at, len } => crate::work_files::PiecePart::Own { at, len },
+                })
+                .collect(),
+              written,
+              len,
+            },
+            RebasedFile::Whole(bytes) => {
+              let base = engine
+                .content(&path)
+                .and_then(|content| content.bytes().ok());
+              let keep_own: Vec<(u64, u64)> = journal
+                .iter()
+                .filter_map(|op| match op {
+                  VolumeOp::Overwrite {
+                    path: p, at, len, ..
+                  }
+                  | VolumeOp::Insert {
+                    path: p, at, len, ..
+                  }
+                  | VolumeOp::Extend {
+                    path: p, at, len, ..
+                  } if p == &path => Some((*at, at.saturating_add(*len))),
+                  _ => None,
+                })
+                .collect();
+              crate::work_files::parts_over_base_keeping(&path, base, bytes, &keep_own)
+            }
+          });
           (path, parts)
         })
         .collect();
@@ -12680,7 +12718,7 @@ fn rebase_answer(
         entries,
       }
     }
-    slates_merge::engine::Rebased::Conflict { windows } => {
+    RebasedParts::Conflict { windows } => {
       // Every window, for the work's shard to keep with the work and carry as far as one reply holds
       // ([`kept_conflict`], A-267): this may be the green's owner, which holds no work on another shard.
       RebaseAnswer::Reply(ReplyBody::Rebased {
@@ -12692,19 +12730,16 @@ fn rebase_answer(
     }
     // A base below the green's checkpoint (W3), or past its head, a version it never made (A-658): unknown, as the
     // submit answers it.
-    slates_merge::engine::Rebased::BaseUnavailable { base, .. }
-    | slates_merge::engine::Rebased::BaseAhead { base, .. } => {
+    RebasedParts::BaseUnavailable { base, .. } | RebasedParts::BaseAhead { base, .. } => {
       RebaseAnswer::Reply(refused(Refusal::UnknownBase {
         green: to_wire_volume(green_id),
         version: base,
       }))
     }
-    slates_merge::engine::Rebased::CopyRefused { path, case } => {
+    RebasedParts::CopyRefused { path, case } => {
       RebaseAnswer::Reply(refused(copy_refused(path, case)))
     }
-    slates_merge::engine::Rebased::ContentUnread { .. } => {
-      RebaseAnswer::Reply(refused(Refusal::ContentUnavailable))
-    }
+    RebasedParts::ContentUnread { .. } => RebaseAnswer::Reply(refused(Refusal::ContentUnavailable)),
   }
 }
 

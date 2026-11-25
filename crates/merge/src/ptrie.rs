@@ -340,6 +340,37 @@ impl<V: Clone> Ptrie<V> {
     self.get(nodes, key).is_some()
   }
 
+  /// Whether `key` exists in this map and every node from the root down to `key`'s node has `holders == 1`
+  /// (so no fork, branch, or grafted subtree can reach `key`'s value through any shared ancestor).
+  pub fn is_unique_path(&self, nodes: &Nodes<V>, key: &[u8]) -> bool {
+    let Some(mut at) = self.root else {
+      return false;
+    };
+    let mut rest = key;
+    loop {
+      let Some(node) = nodes.node(at) else {
+        return false;
+      };
+      if node.holders != 1 {
+        return false;
+      }
+      let Some(first) = rest.first() else {
+        return node.value.is_some();
+      };
+      let Some((_, child)) = child_of(node, *first) else {
+        return false;
+      };
+      let Some(child_node) = nodes.node(child) else {
+        return false;
+      };
+      let Some(next) = rest.strip_prefix(child_node.label.as_slice()) else {
+        return false;
+      };
+      rest = next;
+      at = child;
+    }
+  }
+
   /// Another map holding exactly these values, sharing every node: O(1).
   pub fn fork(&self, nodes: &mut Nodes<V>) -> Self {
     if let Some(root) = self.root {

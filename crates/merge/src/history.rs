@@ -820,6 +820,30 @@ impl Value {
     }
   }
 
+  /// Whether this value is a single `CURRENT` piece naming `block` as its anchor chunk with layer room left,
+  /// ready for [`overlay_inplace`].
+  pub(crate) fn is_current_anchor(&self, chunks: &Chunks, block: Block) -> bool {
+    let [piece] = self.pieces.as_slice() else {
+      return false;
+    };
+    if piece.epoch != CURRENT || piece.at != 0 || piece.len != self.len {
+      return false;
+    }
+    let matches_block = matches!(
+      chunks.slots.get(piece.chunk),
+      Some(Some((Source::Block { block: named, len }, _)))
+        if *named == block && *len == self.len
+    );
+    if !matches_block {
+      return false;
+    }
+    let next = chunks
+      .layers
+      .get(&piece.chunk)
+      .map_or(0, |layers| layers.next);
+    next < CURRENT.saturating_sub(1)
+  }
+
   /// `bytes` as one new chunk the history owns, taken without a copy (none for no bytes): a value whose pieces outweigh
   /// its bytes, stored whole ([`reanchor`]).
   fn owned(chunks: &mut Chunks, bytes: Vec<u8>) -> Value {
@@ -1316,13 +1340,222 @@ thread_local! {
   pub(crate) static FULL_REANCHOR_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Whether a change may take the layered path ([`overlay`]): always, but in a test that asks for the full re-anchor.
-fn layered_allowed() -> bool {
+/// Whether a change may take the layered path ([`overlay`] / [`overlay_inplace`]): always, but in a test that asks
+/// for the full re-anchor.
+pub(crate) fn layered_allowed() -> bool {
   #[cfg(test)]
   if FULL_REANCHOR_ONLY.with(std::cell::Cell::get) {
     return false;
   }
   true
+}
+
+/// Whether `ops` (which must be pure length-preserving overwrites within `before.len()`) have every added byte
+/// present in `post_state` and actually change at least one byte of `before`: O(edit_size), never scanning the
+/// untouched body of the file.
+pub(crate) fn overwritten_differs(
+  before: &[u8],
+  ops: &[Op],
+  post_state: crate::named::Post<'_>,
+) -> Option<bool> {
+  let len = before.len();
+  let mut ops_iter = ops.iter().peekable();
+  let mut differs = false;
+  let mut last_start = 0usize;
+  let mut has_any = false;
+  while let Some(op) = ops_iter.next() {
+    let write_op = if replaced_here(op, ops_iter.peek().copied()) {
+      ops_iter.next()?
+    } else if op.kind == OpKind::Overwrite {
+      op
+    } else {
+      return None;
+    };
+    let start = usize::try_from(write_op.at).ok()?;
+    let op_len = usize::try_from(write_op.len).ok()?;
+    let end = start.checked_add(op_len)?;
+    if end > len {
+      return None;
+    }
+    if has_any && start < last_start {
+      return None;
+    }
+    last_start = start;
+    has_any = true;
+    if op_len == 0 {
+      continue;
+    }
+    let span = post_state.span(write_op.src, write_op.len);
+    if span.len() != op_len {
+      return None;
+    }
+    if before.get(start..end)? != &*span {
+      differs = true;
+    }
+  }
+  has_any.then_some(differs)
+}
+
+/// Copies the pre-edit bytes covered by `ranges` out of `before` into one packed buffer plus each range's start offset.
+fn copy_overwritten_ranges(
+  before: &[u8],
+  ranges: &[(usize, usize)],
+) -> Option<(Vec<u8>, Vec<usize>)> {
+  let copied_cap: usize = ranges
+    .iter()
+    .map(|(start, end)| end.saturating_sub(*start))
+    .sum();
+  let mut owned = Vec::with_capacity(copied_cap);
+  let mut places = Vec::with_capacity(ranges.len());
+  for (start, end) in ranges {
+    places.push(owned.len());
+    owned.extend_from_slice(before.get(*start..*end)?);
+  }
+  Some((owned, places))
+}
+
+/// Applies validated pure length-preserving overwrite ops from `post_state` directly into `buf`.
+fn patch_block_in_place(
+  buf: &mut [u8],
+  ops: &[Op],
+  post_state: crate::named::Post<'_>,
+) -> Option<()> {
+  let mut ops_iter = ops.iter().peekable();
+  while let Some(op) = ops_iter.next() {
+    let write_op = if replaced_here(op, ops_iter.peek().copied()) {
+      ops_iter.next()?
+    } else if op.kind == OpKind::Overwrite {
+      op
+    } else {
+      return None;
+    };
+    let start = usize::try_from(write_op.at).ok()?;
+    let op_len = usize::try_from(write_op.len).ok()?;
+    if op_len == 0 {
+      continue;
+    }
+    let end = start.checked_add(op_len)?;
+    let span = post_state.span(write_op.src, write_op.len);
+    if span.len() != op_len {
+      return None;
+    }
+    buf.get_mut(start..end)?.copy_from_slice(&span);
+  }
+  Some(())
+}
+
+/// Registers the owned pre-edit slice chunk `held` as layer `number` on `anchor` for `ranges`.
+fn record_inplace_layers(
+  chunks: &mut Chunks,
+  (anchor, held, number): (usize, usize, u32),
+  ranges: &[(usize, usize)],
+  places: Vec<usize>,
+) {
+  for ((start, end), place) in ranges.iter().zip(places) {
+    chunks.retain(held);
+    chunks.entries = chunks.entries.saturating_add(LAYER_BYTES);
+    let layers = chunks.layers.entry(anchor).or_default();
+    let layer_len = end.saturating_sub(*start);
+    layers.by_start.insert(
+      (*start, number),
+      Layer {
+        len: layer_len,
+        chunk: held,
+        at: place,
+      },
+    );
+    layers.by_number.entry(number).or_default().push(*start);
+    layers.longest = layers.longest.max(layer_len);
+    let at_start = layers.start_longest.entry(*start).or_default();
+    *at_start = (*at_start).max(layer_len);
+  }
+  let layers = chunks.layers.entry(anchor).or_default();
+  layers.next = number.saturating_add(1);
+  let count = layers.epochs.entry(number).or_default();
+  *count = count.saturating_add(1);
+}
+
+/// In-place layered overwrite for a uniquely-owned block (Wave 8C): saves the overwritten slices of `block` into
+/// a new history layer at `number`, patches `block`'s bytes in place from `(ops, post_state)`, and returns the
+/// new latest `Value` sharing the same `anchor` chunk (`CURRENT`) while the superseded latest reads at `number`.
+/// Cost: O(log layers + edit_size) — zero full-file allocation, zero full-file copy, zero full-file memcmp, zero
+/// BLAKE3. Caller must have already verified `Files::is_unique_path`, `blocks.holders(block) == 2` (content +
+/// this anchor only), `blocks.name(block).is_none()`, and `overwritten_differs == Some(true)`.
+pub(crate) fn overlay_inplace(
+  latest: &mut Value,
+  chunks: &mut Chunks,
+  blocks: &mut Blocks,
+  (block, ops, post_state): (Block, &[Op], crate::named::Post<'_>),
+) -> Option<Reanchored> {
+  let latest_list = latest.list_bytes();
+  let [piece] = latest.pieces.as_slice() else {
+    return None;
+  };
+  let anchor = piece.chunk;
+  let (old, len) = match chunks.slots.get(anchor) {
+    Some(Some((Source::Block { block: old, len }, _))) => (*old, *len),
+    _ => return None,
+  };
+  if piece.epoch != CURRENT
+    || piece.at != 0
+    || piece.len != latest.len
+    || len != latest.len
+    || old != block
+  {
+    return None;
+  }
+  let ranges = overwritten(ops, len)?;
+  let number = chunks.layers.get(&anchor).map_or(0, |layers| layers.next);
+  if ranges.first() == Some(&(0, len)) || number >= CURRENT.saturating_sub(1) {
+    return None;
+  }
+  let before = blocks.bytes(block).filter(|b| b.len() == len)?;
+  let (owned, places) = copy_overwritten_ranges(before, &ranges)?;
+  let buf = blocks.bytes_mut_unique(block)?;
+  patch_block_in_place(buf, ops, post_state)?;
+  let copied = owned.len();
+  let held = chunks.add(owned);
+  record_inplace_layers(chunks, (anchor, held, number), &ranges, places);
+  if let Some(piece) = latest.pieces.first_mut() {
+    piece.epoch = number;
+  }
+  let mut value = Value {
+    pieces: Vec::new(),
+    len: 0,
+    own: Some((anchor, len)),
+  };
+  value.push(
+    chunks,
+    Piece {
+      chunk: anchor,
+      at: 0,
+      len,
+      epoch: CURRENT,
+    },
+  );
+  Some(Reanchored {
+    value,
+    lists: (0, 0),
+    latest_list: (latest_list, latest_list),
+    blocks_cut: 1,
+    bytes_cut: copied,
+    values: 1,
+  })
+}
+
+/// Fast O(1) layered overlay on the path's `latest` value alone (without allocating a `Vec<&mut Value>` over the
+/// entire history): returns `None` if the change is not a pure length-preserving overwrite on a layered anchor.
+pub(crate) fn overlay_latest(
+  latest: &mut Value,
+  chunks: &mut Chunks,
+  blocks: &mut Blocks,
+  (block, ops): (Block, &[Op]),
+) -> Option<Reanchored> {
+  if !layered_allowed() {
+    return None;
+  }
+  let mut one = [latest];
+  overlay(&mut one, chunks, blocks, (block, ops))
 }
 
 /// Whether `before` and `after` (of one length) hold the same bytes everywhere outside `ranges` (sorted, disjoint):
@@ -1460,7 +1693,7 @@ fn overlay(
 /// The byte ranges `ops` overwrite in a file of `len` bytes, in order and merged where they touch: an overwrite's, or a
 /// same-length replacement's (a delete and an insert of its length at its offset, as an SDK edit composes it). `None`
 /// where an op is anything else or lies past the file, where the ops are out of order, or where they write nothing.
-fn overwritten(ops: &[Op], len: usize) -> Option<Vec<(usize, usize)>> {
+pub(crate) fn overwritten(ops: &[Op], len: usize) -> Option<Vec<(usize, usize)>> {
   let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(ops.len());
   let mut ops = ops.iter().peekable();
   while let Some(op) = ops.next() {

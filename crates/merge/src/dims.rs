@@ -92,6 +92,11 @@ impl<V: Clone> Dim<V> {
     self.root.contains_key(&self.nodes, key.as_ref())
   }
 
+  /// Whether `key` exists and every node on its path from the root has `holders == 1` (unshared with any fork/graft).
+  pub(crate) fn is_unique_path(&self, key: impl AsRef<[u8]>) -> bool {
+    self.root.is_unique_path(&self.nodes, key.as_ref())
+  }
+
   /// Sets `key` to `value`; the value it replaced.
   pub(crate) fn insert(&mut self, key: impl AsRef<[u8]>, value: V) -> Option<V> {
     self
@@ -175,14 +180,15 @@ pub(crate) struct Block(usize);
 /// entry for a file holds in place of its bytes. A named block holds no bytes (A-760 (b) 4d): its object holds them in
 /// the owner's content plane, held there for as long as the block stands ([`NameHold`]); its bytes are lent to it only
 /// for a judge that reads them ([`Blocks::lend`]), and let go after ([`Blocks::let_named_bytes_go`]). The digest is
-/// `None` only once a staged text's piece is appended, until it is read again.
+/// computed lazily on first [`Blocks::digest`] read (avoiding O(file_size) BLAKE3 on every edit when identity is not
+/// read) and cleared whenever a block's bytes are mutated in place or appended.
 #[derive(Debug)]
 struct Slot {
   bytes: Option<Vec<u8>>,
   len: u64,
   holders: u64,
   name: Option<crate::named::Identity>,
-  digest: Option<[u8; 32]>,
+  digest: std::cell::Cell<Option<[u8; 32]>>,
 }
 
 /// A hold the green's blocks take or give back on a content-plane object (A-760 (b) 4d): one for each block named for
@@ -244,16 +250,15 @@ impl Drop for Blocks {
 }
 
 impl Blocks {
-  /// A new block holding `bytes`, with one holder.
+  /// A new block holding `bytes`, with one holder; its BLAKE3 digest is deferred until [`Blocks::digest`] is asked.
   fn add(&mut self, bytes: Vec<u8>) -> Block {
-    let digest = *blake3::hash(&bytes).as_bytes();
     let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     self.place(Slot {
       bytes: Some(bytes),
       len,
       holders: 1,
       name: None,
-      digest: Some(digest),
+      digest: std::cell::Cell::new(None),
     })
   }
 
@@ -268,7 +273,7 @@ impl Blocks {
       len: name.len,
       holders: 1,
       name: Some(name),
-      digest: Some(name.hash),
+      digest: std::cell::Cell::new(Some(name.hash)),
     });
     self.named.entry(name).or_default().push(block.0);
     block
@@ -405,16 +410,33 @@ impl Blocks {
       .collect()
   }
 
-  /// A block's length and the plain BLAKE3 of its bytes (A-873): its digest made with it, a named block's its object's
-  /// identity, or its bytes hashed now for a staged block a piece was appended to. None for a block that is gone.
+  /// A block's length and the plain BLAKE3 of its bytes (A-873): cached on first read, a named block's its object's
+  /// identity, or its bytes hashed now and memoized for a newly added, appended, or in-place-patched block.
+  /// None for a block that is gone.
   pub(crate) fn digest(&self, block: Block) -> Option<(u64, [u8; 32])> {
     let slot = self.slots.get(block.0).and_then(Option::as_ref)?;
-    let digest = match (slot.digest, &slot.bytes) {
+    let digest = match (slot.digest.get(), &slot.bytes) {
       (Some(digest), _) => digest,
-      (None, Some(bytes)) => *blake3::hash(bytes).as_bytes(),
+      (None, Some(bytes)) => {
+        let computed = *blake3::hash(bytes).as_bytes();
+        slot.digest.set(Some(computed));
+        computed
+      }
       (None, None) => return None,
     };
     Some((slot.len, digest))
+  }
+
+  /// Mutable slice of an unnamed block's bytes for an in-place length-preserving overwrite once the caller has
+  /// verified unique ownership (both map path uniqueness and block holder count) and archived overwritten ranges
+  /// into the history layer. Clears the deferred digest so any subsequent `digest()` hashes the updated bytes.
+  pub(crate) fn bytes_mut_unique(&mut self, block: Block) -> Option<&mut [u8]> {
+    let slot = self.slots.get_mut(block.0).and_then(Option::as_mut)?;
+    if slot.name.is_some() {
+      return None;
+    }
+    slot.digest.set(None);
+    slot.bytes.as_deref_mut()
   }
 
   /// The bytes the blocks named for a content-plane object hold (A-760 (b) 4d): none between steps, since such a block
@@ -461,7 +483,7 @@ impl Blocks {
       held.extend_from_slice(bytes);
       slot.len = u64::try_from(held.len()).unwrap_or(u64::MAX);
       slot.name = None;
-      slot.digest = None;
+      slot.digest.set(None);
     }
   }
 
@@ -544,6 +566,11 @@ impl Files {
   /// Whether `path` is a file.
   pub(crate) fn contains_key(&self, path: impl AsRef<[u8]>) -> bool {
     self.map.contains_key(path)
+  }
+
+  /// Whether `path` exists in this map with no shared ancestor node in any fork or grafted subtree.
+  pub(crate) fn is_unique_path(&self, path: impl AsRef<[u8]>) -> bool {
+    self.map.is_unique_path(path)
   }
 
   /// Sets `path`'s bytes; the bytes it replaced are let go.

@@ -1771,3 +1771,145 @@ fn a_resolution_the_owner_composed_leaves_the_work_its_entries() {
     "the submit asked the owner for no file's bytes"
   );
 }
+
+/// A-817 / Wave 8A: a partial overwrite starting at offset 0 (shorter than the base file) is NOT a whole-file
+/// replacement and must NOT spawn a refinement job on either the green's own shard or an off-owner work shard; a true
+/// whole-file rewrite still refines. Do: seed a 1 KiB file, edit `[0..64)` on an off-owner work and an on-owner work,
+/// submit both, check `merge.refine.started == 0` and `merge.refine.gave_up == 0`; then rewrite all 1024 bytes on a
+/// third work and submit, checking `merge.refine.started > 0`.
+#[test]
+fn a_partial_overwrite_at_offset_zero_starts_no_refinement() {
+  let (daemon, instance) = daemon(MANY_SHARDS, "no-bogus-refine");
+  let mut client = connect(&instance);
+  let green = client.create_green("no-bogus-refine-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "no-bogus-refine-seed").unwrap();
+  client.edit(seed, "f", 0, 0, &[b'a'; FILE_BYTES]).unwrap();
+  assert!(submitted(&mut client, seed).starts_with("accepted"));
+
+  let green_shard = slates_server::verbs::owner_of(green);
+  let (mut off_client, off_work) = (0..64)
+    .map(|n| {
+      let mut other = connect(&instance);
+      let made = other
+        .create_work(green, &format!("no-bogus-refine-off-{n}"))
+        .unwrap()
+        .0;
+      (other, made)
+    })
+    .find(|(_, made)| slates_server::verbs::owner_of(*made) != green_shard)
+    .expect("a work off its green's shard");
+  let (on_work, _) = client.create_work(green, "no-bogus-refine-on").unwrap();
+
+  let before = daemon.refusals_on_every_shard().unwrap();
+  off_client.edit(off_work, "f", 0, 64, &[b'b'; 64]).unwrap();
+  assert!(submitted(&mut off_client, off_work).starts_with("accepted"));
+  client.edit(on_work, "f", 0, 64, &[b'c'; 64]).unwrap();
+  // On-owner work conflicts with off-owner work at [0..64), which still runs `refining::owed` before judging.
+  let _ = submitted(&mut client, on_work);
+  let after_partial = daemon.refusals_on_every_shard().unwrap();
+
+  let (whole_work, _) = client.create_work(green, "no-bogus-refine-whole").unwrap();
+  let mut whole = vec![b'a'; FILE_BYTES];
+  whole[FILE_BYTES - 8..].copy_from_slice(b"ZZZZZZZZ");
+  client
+    .edit(whole_work, "f", 0, FILE_BYTES as u64, &whole)
+    .unwrap();
+  assert!(submitted(&mut client, whole_work).starts_with("accepted"));
+  let after_whole = daemon.refusals_on_every_shard().unwrap();
+
+  drop(off_client);
+  drop(client);
+  daemon.stop();
+
+  let count = |counts: &std::collections::BTreeMap<&'static str, u64>, name: &str| {
+    counts.get(name).copied().unwrap_or(0)
+  };
+  assert_eq!(
+    count(&after_partial, "merge.refine.started") - count(&before, "merge.refine.started"),
+    0,
+    "partial overwrite at offset 0 must not start a refinement job"
+  );
+  assert_eq!(
+    count(&after_partial, "merge.refine.gave_up") - count(&before, "merge.refine.gave_up"),
+    0,
+    "partial overwrite at offset 0 must not give up a refinement job"
+  );
+  assert!(
+    count(&after_whole, "merge.refine.started") > count(&after_partial, "merge.refine.started"),
+    "a true whole-file replacement must still run refinement"
+  );
+}
+
+/// Wave 8B: resolving a conflict on a work off its green's shard when its kept 64-byte slot shares >24 trailing bytes
+/// with head must keep the restated journal's own ranges as `PiecePart::Own`, so subsequent resolutions and submits
+/// still compose on the work's own shard (`COMPOSED_BY_OWNER == 0`).
+#[test]
+fn resolving_a_conflict_with_matching_tail_bytes_still_composes_on_work_shard() {
+  use slates_client::{Rebased, Submitted, WorkChange};
+  let (daemon, instance) = daemon(MANY_SHARDS, "own-parts-compose");
+  let mut client = connect(&instance);
+  let green = client.create_green("own-parts-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "own-parts-seed").unwrap();
+  client.edit(seed, "f", 0, 0, &[b'.'; FILE_BYTES]).unwrap();
+  assert!(submitted(&mut client, seed).starts_with("accepted"));
+
+  let green_shard = slates_server::verbs::owner_of(green);
+  let (mut worker, work) = (0..64)
+    .map(|n| {
+      let mut other = connect(&instance);
+      let made = other
+        .create_work(green, &format!("own-parts-work-{n}"))
+        .unwrap()
+        .0;
+      (other, made)
+    })
+    .find(|(_, made)| slates_server::verbs::owner_of(*made) != green_shard)
+    .expect("a work off its green's shard");
+
+  // 64-byte slot with 53 trailing dots (> PIECE_BYTES = 24), matching the file's dot fill.
+  let mut mine = b"c000001r000".to_vec();
+  mine.resize(64, b'.');
+  worker.edit(work, "f", 0, 64, &mine).unwrap();
+  worker.edit(work, "f", 128, 64, &mine).unwrap();
+
+  for round in 1..=3usize {
+    let (rival, _) = client
+      .create_work(green, &format!("own-parts-rival-{round}"))
+      .unwrap();
+    let mut theirs = format!("r{round:010}").into_bytes();
+    theirs.resize(64, b'.');
+    client.edit(rival, "f", 128, 64, &theirs).unwrap();
+    assert!(submitted(&mut client, rival).starts_with("accepted"));
+    let Submitted::Conflict(windows) = worker.submit(work).unwrap() else {
+      panic!("round {round}: second slot must conflict");
+    };
+    let replacement = vec![WorkChange::Edit {
+      path: "f".to_owned(),
+      at: 128,
+      delete_len: 64,
+      bytes: mine.clone(),
+    }];
+    assert!(matches!(
+      worker.resolve_conflict(work, windows, replacement).unwrap(),
+      Rebased::Rebased(_)
+    ));
+  }
+  assert!(submitted(&mut worker, work).starts_with("accepted"));
+  let read = client.read(green, "f", ReadAt::Head).unwrap();
+  let counts = daemon.refusals_on_every_shard().unwrap();
+
+  drop(worker);
+  drop(client);
+  daemon.stop();
+
+  assert_eq!(
+    (&read[0..64], &read[128..192]),
+    (mine.as_slice(), mine.as_slice())
+  );
+  let on_work = counts.get(COMPOSED_ON_WORK).copied().unwrap_or(0);
+  let by_owner = counts.get(COMPOSED_BY_OWNER).copied().unwrap_or(0);
+  assert!(
+    on_work > 0 && by_owner == 0,
+    "all off-owner submits and resolutions must compose on the work's shard: on_work={on_work}, by_owner={by_owner}"
+  );
+}
