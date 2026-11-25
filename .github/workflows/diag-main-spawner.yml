@@ -1,0 +1,40 @@
+name: diag-main-spawner
+# Run 1 (main 01a20182, 2026-11-25 10:05 PST): A-924 piece 1's spawn-cost red on both Linux runners, at main 31f16d02f.
+# It prints each descriptor count's least, median and most spawn time on the asking thread, through the spawner and
+# direct. The direct column is the Linux posix_spawn-against-descriptors figure the design rests on (glibc's
+# clone without CLONE_FILES copies the descriptor table). The soft RLIMIT_NOFILE is raised to the hard limit first, since
+# the red holds 100,000 descriptors. A diagnostics branch, never main.
+on:
+  push:
+    branches: ["diag-measurer-main-spawner-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  spawner:
+    name: spawner cost (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: The spawner's tests, the spawn-cost red printing its rows
+        run: |
+          set +e
+          ulimit -n "$(ulimit -Hn)"
+          echo "nofile soft $(ulimit -n) hard $(ulimit -Hn), cores $(nproc), kernel $(uname -r)"
+          cargo test --locked -p slates-ipc --lib spawner -- --nocapture --test-threads 1 > "$RUNNER_TEMP/spawner.log" 2>&1
+          rc=$?
+          grep -aE 'test result|FAILED|panicked|nofile' "$RUNNER_TEMP/spawner.log" | head -20
+          rows=$(grep -aE '^[A-Za-z_-]*cost[A-Za-z_-]* [0-9]' "$RUNNER_TEMP/spawner.log" | head -6 | tr '\n' ';')
+          echo "::notice title=spawner ${{ matrix.runner }}::exit $rc; rows (count, spawner least/median/most ns, direct least/median/most ns): $rows"
+          cat "$RUNNER_TEMP/spawner.log" | tail -60
+          exit $rc
