@@ -64199,8 +64199,15 @@ measured noise of the 100 figure, not a literal.
   Counted `vcs_store.image.aways_renumbered`.
 - **Why not refuse them.** A refused away leaves its window absent. A list naming it is refused at the restore. An
   object brought back by its bytes (`bring_back_object`, a Mercurial named file's read) finds nothing to bring back and
-  stays unread: measured at the store. At the daemon, Subversion's whole-text read (which puts a text's pieces) and
-  Mercurial's named-file read both still read their texts back byte-equal with the old form refused. The reds
+  stays unread: measured at the store. At the daemon, with the old form refused, the texts still read back byte-equal,
+  by paths that are no guarantee. Subversion's whole-text read (`svn_texts::bring_whole`) puts a text's pieces, which
+  makes an absent window again. Mercurial's named files `a` and `b` came back through the recovery's segment replay
+  (`vcs_store::replay_answered`, A-636 part 2c-2). It asks the node's store for each text its records name that the
+  content store never knew, and puts it back, then lets it go (`vcs_store.hg_replay_unknown_asked` 6,
+  `vcs_store.hg_brought_back_let_go` 6, beside `vcs_store.nodes_unrestored` 6 for the refused aways' lists). That path
+  serves only texts a replayed segment names, and was made for a takeover's successor whose store never held them. The
+  bring-back by bytes a named file's later read takes (`slates_hg::push::held::bring_back_file`, then
+  `ContentStore::bring_back_object`) finds nothing to bring back where the window is absent. The reds
   (`a_restart_on_an_image_written_before_a923_numbers_its_aways_and_reads_every_text_whole`,
   `a_restart_on_an_image_written_before_a923_reads_every_named_pushed_file`) hold every old away renumbered, every text
   read back, and the successor's first publication carrying no kind-15 entry.
