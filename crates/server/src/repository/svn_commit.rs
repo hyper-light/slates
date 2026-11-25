@@ -931,6 +931,34 @@ pub(crate) fn read_named(state: &mut ShardState, work: &mut Increment) -> Result
   Ok(())
 }
 
+/// [`read_named`] a copy slice of the shard's a step (goal 93: an import's revision of thousands of texts read them in one
+/// step): whether every run is read. Counted once every one is ([`NAMED_READ_BYTES`]).
+pub(crate) fn read_named_slice(
+  state: &mut ShardState,
+  work: &mut Increment,
+) -> Result<bool, Uncommitted> {
+  let slice = state.config.copy_slice_bytes().max(1);
+  let done = {
+    let store = state.vcs_stores.content().ok_or(Uncommitted::NotHeld)?;
+    let objects = crate::vcs_store::named_objects::PlaneObjects {
+      store,
+      kept_in: &state.store.content,
+    };
+    work
+      .read_step(&objects, slice)
+      .map_err(|_| Uncommitted::Unstored)?
+  };
+  if done {
+    let total = work
+      .named
+      .runs
+      .iter()
+      .fold(0u64, |total, run| total.saturating_add(run.len));
+    state.count(NAMED_READ_BYTES, total);
+  }
+  Ok(done)
+}
+
 /// Counter: the bytes of the texts a Subversion increment names (A-760) read from the content store into its runs'
 /// buffers before it is judged ([`read_named`]): once a byte of each text a landing builds. Format: a counter name in
 /// the status report.
