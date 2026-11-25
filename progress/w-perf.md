@@ -698,3 +698,11 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     cut-import oracle pins F at the derived bound (one cut across its kills). Focused svn 105/105 on the landed tree
     (rerun after a merge I pushed before rerunning -- my slip, reported).
   - Next: the churn by site (64 GB of system allocation churn, 418 GB fresh mapped pages), with the fixed sampler.
+- 2026-11-25 ~13:30 PST:
+  - LANDED b5502db85: hg_fetch_heap tallies churn by site (system and mapped paths, push and clone apart; dependency
+    frames kept). At 2,000 changesets (debug): the push's 1.75 GB system churn ~65% the shard image's publications
+    (image_cut, encode_page, publish_checkpoint, family_entries, vcs_away_bytes, aways overlay); the clone's 0.73 GB its
+    texts made and sent whole; mapped churn the text cache's chunks.
+  - Hypothesis (unmeasured at scale): A-870's family pages, keyed by identity range, are all dirtied by let-goes spread
+    over the hash space, so each publication re-encodes (and the checkpoint copies) every away page: churn ~ history x
+    publications. Asked main for the 57k run of what_holds (prints churn by site); waiting on it before any cut.
