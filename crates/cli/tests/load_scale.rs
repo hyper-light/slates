@@ -537,3 +537,8 @@ fn many_clients_through_client_nodes_against_one_primary_and_two_replicas() {
     rung(&bench, &green, clients, &nodes, kill);
   }
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

@@ -1284,3 +1284,8 @@ fn a_held_connections_own_write_backs_are_never_refused_as_stale() {
   );
   assert!(file == page, "the file is the last page written back");
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

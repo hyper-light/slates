@@ -201,6 +201,11 @@ fn report_gone() {
 
 /// Counter: a shard's report of its spawner's end closing that could not reach the owner's shard (A-924).
 const SPAWNER_REPORT_REFUSED: &str = "spawner.report_refused";
+/// Counter: the spawners the owner started again after a death (A-924): none while the spawner serves. A test binary that
+/// names no `spawner_role!()`, or a host whose `main` does not serve first, starts a spawner that ends at once, which
+/// this counts once a window.
+pub(crate) const SPAWNER_RESTARTED: &str = "spawner.restarted";
+
 /// Counter: a dead spawner whose reaping task the shard could not start: left a zombie until the daemon's process ends
 /// (A-924).
 const SPAWNER_REAP_REFUSED: &str = "spawner.reap_refused";
@@ -715,6 +720,7 @@ async fn restart() {
     match slates_ipc::spawner::start_here(shards.len()) {
       Ok(started) => {
         hand_out(started, began, &shards);
+        count_on_shard(SPAWNER_RESTARTED);
         return;
       }
       Err(_) => {

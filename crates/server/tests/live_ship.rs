@@ -67,3 +67,8 @@ fn a_volume_is_turned_live_shipped_and_back_and_list_shows_it() {
     "a volume no one created is not found: {unknown:?}"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

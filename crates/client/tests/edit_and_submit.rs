@@ -475,3 +475,8 @@ fn two_works_race_on_the_new_head(client: &mut Client, green: VolumeId) {
     other => panic!("a racing work's edit over the changed bytes answered {other:?}"),
   }
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

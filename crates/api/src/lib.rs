@@ -463,3 +463,8 @@ mod contract_history {
     );
   }
 }
+
+// This test binary's spawner role (A-924): the role's tests that start a daemon in process start its spawner as this
+// binary, which runs this test alone and serves.
+#[cfg(all(test, unix))]
+slates_ipc::spawner_role!();

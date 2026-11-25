@@ -4057,3 +4057,8 @@ fn a_diffs_path_order_is_no_part_of_an_answer() {
   let changed = format!("{deep}{dir}{}", link.replace("-link a.txt", "-link b.txt"));
   assert_ne!(canonical_diff(&stock), canonical_diff(&changed));
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

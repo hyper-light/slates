@@ -248,6 +248,12 @@ fn report(kib: usize, arms: &Arms, direct: bool) {
 /// loudly.
 #[cfg(not(any(unix, windows)))]
 fn main() {
+  // The daemon's spawner (A-924): this binary started as one serves before anything else runs, or a daemon it starts
+  // in process would start this binary again, whole, as its spawner.
+  #[cfg(unix)]
+  if let Some(served) = slates_ipc::spawner::serve_from_env() {
+    std::process::exit(i32::from(served.is_err()));
+  }
   eprintln!(
     "skip: the copy-once-map-many bench needs `Client::map_read`, built for Unix and Windows"
   );

@@ -220,3 +220,8 @@ fn a_presentation_outlives_the_process_that_presented_it() {
   drop(owner);
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

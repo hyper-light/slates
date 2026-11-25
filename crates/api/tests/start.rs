@@ -40,6 +40,12 @@ const DAEMON_FAILS: &str = "API_START_TEST_DAEMON_FAILS";
 const DAEMON_FAILS_EXIT: u8 = slates_api::role::EXIT_FAILED;
 
 fn main() -> ExitCode {
+  // The daemon's spawner (A-924): this binary started as one serves before anything else runs, or a daemon it starts
+  // in process would start this binary again, whole, as its spawner.
+  #[cfg(unix)]
+  if let Some(served) = slates_ipc::spawner::serve_from_env() {
+    std::process::exit(i32::from(served.is_err()));
+  }
   let args: Vec<String> = std::env::args().skip(1).collect();
   if args.first().map(String::as_str) == Some(PREFIX) {
     let daemon = matches!(

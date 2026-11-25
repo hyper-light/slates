@@ -243,3 +243,8 @@ fn a_checkout_is_refused_for_a_base_that_is_not_the_greens_or_has_moved() {
   drop(client);
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

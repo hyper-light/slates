@@ -451,6 +451,24 @@ fn a_killed_clients_direct_maps_are_reaped_and_give_their_copies_back() {
   daemon.stop();
 }
 
+/// A-924 (main 01a20182's ruling of 2026-11-25: a test binary naming no `spawner_role!()` started a spawner that ran
+/// no test and ended at once, restarted once a window, which wedged shards under load). Do: start a one-shard daemon in
+/// this binary, and let a liveness window and more pass. Expect: its spawner never restarted (`spawner.restarted` none):
+/// this binary's own `spawner_role` serves it. Red before: the spawner ended at once and was restarted.
+#[test]
+fn a_daemon_started_in_this_binary_keeps_its_spawner() {
+  let (daemon, _instance, _volume, _) = daemon_with_a_file("keeps-spawner");
+  // A window and a half: the owner restarts a spawner that ended at once within one window of its death.
+  let until =
+    std::time::Instant::now() + Duration::from_nanos(LIVENESS_BUDGET_NS + LIVENESS_BUDGET_NS / 2);
+  while std::time::Instant::now() < until {
+    std::thread::park_timeout(until.saturating_duration_since(std::time::Instant::now()));
+  }
+  let restarted = counted(&daemon, "spawner.restarted");
+  daemon.stop();
+  assert_eq!(restarted, 0, "the daemon's spawner served, never restarted");
+}
+
 /// AC-A-174 (G-direct): a hand-off that fails in the client gives its copy back. Do: on a one-shard daemon, a
 /// re-invoked test binary connects, caps its descriptors at the lowest number free, so it can be given none (the copy's
 /// descriptor delivered on Linux, its claim's socket on macOS), then maps a 64 KiB file, and parks. Expect, while it
@@ -559,3 +577,8 @@ fn a_killed_clients_writable_map_has_its_stores_written_back() {
   );
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

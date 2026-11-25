@@ -719,3 +719,8 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
   drop(nodes);
   drop(scratch);
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

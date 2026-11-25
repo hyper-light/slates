@@ -4290,3 +4290,8 @@ fn a_member_down_through_a_voters_restart_is_still_taken_over() {
     "the survivors took the volume over though a voter restarted while the owner was down: {views:?}"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

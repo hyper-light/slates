@@ -110,3 +110,8 @@ fn a_rebase_keeps_a_run_written_after_a_length_change() {
   );
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

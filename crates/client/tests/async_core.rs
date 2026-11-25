@@ -292,3 +292,8 @@ fn assert_abandoned_replies_are_dropped(client: &mut Client, daemon: &Daemon) {
     (client.unawaited_dropped() != dropped_before).then_some(())
   });
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

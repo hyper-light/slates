@@ -243,3 +243,8 @@ fn a_landing_of_a_partly_edited_large_base_file_keeps_the_disk_bytes_it_did_not_
   drop(client);
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();
