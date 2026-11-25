@@ -1583,6 +1583,15 @@
 > releases the repository's store whole (`vcs_store::replayed`'s `release_charged`), its rows' holds with it: no leak.
 > Owed: changesets a window at a time; a let-go base's or last manifest's store answer arrives whole for one step; the
 > base's identity hashed by a second read.
+> Found by main's round 2 at f8fe97e5e (the clone about 1.7x its load's slowing past stock's) and cut (2026-11-24): a
+> fetch made each let-go changelog and manifest text by its own request of the store's owner, a piece a request
+> (`hg_view::texts_made`: 28 requests for a 7-changeset clone's 14 texts; over 100,000 for hg's 57k). A want's texts are
+> now made by one request (`slates_store::owner::StoreHandle::texts`, `MadeTexts`), counted
+> `vcs_store.hg_text_requests`. Measured in-process (debug, 800 files on a line, 16 MB of texts): the clone's store wait
+> 987 ms to 53 ms, the clone 2.15 s to 1.17 s (a stream of the same bytes: 0.35 s). Held by P5's daemon-edge clone check
+> (red: 28 requests for 6 asks, now 2). Owed: the walk's own cost beside the store's (the clone still 3.3x the stream's
+> time for the same bytes), and the stream clone's 4.7x on main's round, unexplained at this scale (3 store asks a
+> stream whatever its logs).
 > Found by main's interop bench at ed71ac0be and closed (2026-11-24): after P5, `hg clone` of hg's 57k history ran past
 > 13.5 minutes (stock 7.2: 42.4 s; round 2 before P5: 10.1 s). A clone's changelog and manifest texts, let go once
 > landed, were asked of the changeset store one at a time, a row and then its text, and the store answered a row by
