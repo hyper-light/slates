@@ -381,7 +381,8 @@ fn a745_a_long_historys_clone_over_ssh_is_answered_within_one_requests_room() {
 /// A-722's keepalive on the fetch over SSH (the HTTP edge's since 2ab402b95; GAPS: the SSH edge's upload wrote none, its
 /// answer silent from its `packfile` section's head until its pack's first packet while the objects were chosen; git's
 /// upload-pack writes `0005\1` while `pack-objects` is silent, git 2.50.1's `create_pack_file`). Do: on an audit
-/// daemon's shard, serve the SSH edge with the production site, git's keepalive interval none; push a history of
+/// daemon's shard, serve the SSH edge with the production site, git's keepalive interval none, the shard's steps held
+/// to one quantum (`vcs_http::daemon_edge_tests::KEPT_ALIVE_CEILING_NS`); push a history of
 /// `vcs_http::daemon_edge_tests::KEPT_ALIVE_HISTORY` commits over SSH; then clone it over SSH at protocol v2 (a `fetch`
 /// of its last commit with `done`, then a flush). Expect: both sessions exit 0; the answer after the advertisement a
 /// `packfile` section whose first packet is git's keepalive (an empty band-1 packet), its pack whole after the
@@ -393,6 +394,11 @@ fn a_long_fetchs_answer_over_ssh_is_kept_alive_with_gits_keepalive_while_its_pac
   };
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (_, address, _) = observe_first(&daemon, |state| serving_within(state, ROOM, 0));
+  observe_first(&daemon, |_| {
+    slates_rt::futures::set_step_ceiling_ns(
+      crate::vcs_http::daemon_edge_tests::KEPT_ALIVE_CEILING_NS,
+    )
+  });
   let (request, last) = long_history(KEPT_ALIVE_HISTORY);
   let pushed = pushed_patiently(address, &request);
   let fetched = fetched_over_ssh(address, &fetch_of(last));
