@@ -767,8 +767,9 @@ pub(crate) fn learn_link(state: &mut ShardState, taught: (u64, u64)) {
 pub(crate) const POSITION_LOOKUPS: &str = "vcs_store.git_upload.position_lookups";
 /// Counter: the ids the fetch's cache of positions answered itself (A-911). Format: a counter name.
 pub(crate) const POSITION_CACHE_HITS: &str = "vcs_store.git_upload.position_cache_hits";
-/// Counter: of [`POSITION_LOOKUPS`], those whose slot in the fetch's cache held another id (a direct-mapped conflict);
-/// the rest met an empty slot (`slates_git::store::PositionCounts::conflicts`). Format: a counter name.
+/// Counter: of [`POSITION_LOOKUPS`], those whose slot in the fetch's cache held another id: an upper bound on the ids
+/// lost to another's slot, since an id met the first time finds a taken slot too once the cache is warm
+/// (`slates_git::store::PositionCounts::conflicts`). Format: a counter name.
 pub(crate) const POSITION_CACHE_CONFLICTS: &str = "vcs_store.git_upload.position_cache_conflicts";
 /// Counter: fetches whose cache of positions was refused the room its walk's work asked, each then as slow as with no
 /// cache (A-911: a cache costs time, never an answer). Format: a counter name.

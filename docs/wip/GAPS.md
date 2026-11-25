@@ -367,6 +367,12 @@
 > (`a_derivation_lets_go_the_windows_it_brought_back_once_it_ends`,
 > `a_green_build_lets_go_the_windows_it_brought_back_once_it_is_made`) let windows go by hand, standing in for the gated
 > roots, which the lift makes real paths.
+> The lift must also keep `landed_let_go_may`'s wait on live intakes (`intakes_live(id) <= own`, `vcs_store.rs`): it is
+> what keeps a landed pack's windows while a later push of the repository, or the same push's later refs, still reads
+> them (main 01a20182's sibling sweep of 2026-11-25). A lift that drops it opens Mercurial's bug in git: a window let go
+> under a live push, its object then read as a missing delta base (`UnknownDeltaBase`, w-hg's 57k push 2 of 9 times),
+> and the rule it would need is w-hg's push pin (7ad0c7931): a push's kept, unlanded objects' windows held until they
+> land.
 > **LIFTED AGAIN (w-git, 2026-11-23, main 01a20182's order after r165):** `vcs_store::LANDED_LET_GO` on, one switch for
 > a commit's let-go and a recovery's or rebuild's (w-shared's `put_changeset`): the commit owes its pack and the push's
 > end or the repository's idle give-back lets it go a slice a turn (3e1588a54, the quantum alone ending a slice), every
