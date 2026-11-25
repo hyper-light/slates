@@ -2515,7 +2515,7 @@ fn bundle2_lists_stream_v2_only_while_a_stream_is_served() {
       roots: &roots,
       ..state_of(&imported)
     };
-    let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+    let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
     let _ = super::super::session::serve(
       &view,
@@ -2558,7 +2558,7 @@ fn stream2_of_states(publishing: bool) {
     publishing,
     ..state_of(&imported)
   };
-  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
   let caps = stream_caps(b"HG20\nbookmarks\nchangegroup=01,02,03\nstream=v2");
   let answer = answered_getbundle(
     &view,
@@ -2625,7 +2625,7 @@ fn a_stream_clone_over_bundle2_is_refused_without_a_common_version_or_a_served_s
     roots: &roots,
     ..state_of(&imported)
   };
-  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
   let old = stream_caps(b"HG20\nchangegroup=01,02,03");
   let refused = answered_getbundle(
     &view,
@@ -2638,7 +2638,7 @@ fn a_stream_clone_over_bundle2_is_refused_without_a_common_version_or_a_served_s
     roots: &roots,
     ..state_of(&imported)
   };
-  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
   let caps = stream_caps(b"HG20\nchangegroup=01,02,03\nstream=v2");
   let refused = answered_getbundle(
     &view,
