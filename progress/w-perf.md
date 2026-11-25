@@ -677,3 +677,10 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - Reviewed (B) (w-hg, landed 123d8c280): OK, take_made's unpin-before-landing gap accepted (no reader in it).
   - Left: main measures what_holds at d3057763e (57k); owed: replays' base asks one request a want (answer_wants_over,
     vcs_store.rs callers), the 418 GB fresh-page churn split; next piece: the P7 flush cut (w-svn's two requirements).
+- 2026-11-25 ~06:30 PST:
+  - LANDED 0e1c1c399: a replay's base asks (answer_wants_over; recovery's and rebuild's) hold the fetch's step, each
+    caller passing its shard's text_bytes_a_step; counted as a fetch's. Red a_replays_ask_past_a_step_is_copied_a_step_a_request.
+  - w-hg reviewed d3057763e OK (notes folded into GAPS and the commit).
+  - Found at main (not mine): store_tests a_subversion_restart_replays_a_named_text_with_one_released_window fails 3/3,
+    let_go_landed Err(Unlanded) at store_tests.rs:1363 after a55d7cfa6 -- sent to w-svn and main.
+  - Next: the P7 flush cut (staging.rs; w-svn's two requirements; A-130 ordering; crash-at-every-step oracle).
