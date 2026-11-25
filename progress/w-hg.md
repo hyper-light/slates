@@ -660,3 +660,13 @@ Waiting: main's route; arena-7 and arena-8.
 - Run request (main): stock 7.2 clone, pull and verify over an import and a push (hg_interop).
 - Process slip, owned: one bare `git reset -q`, which only unstaged files a `git apply --3way` had staged. Nothing was lost.
 - Next (main's order): the `hg_push::landing` poll of 3,553 ms at a 4,067-changeset merge-heavy DAG (debug, exit 4). Red first: a counter names the per-history work, then slice it. Then C1 (2), then stream and push speed.
+
+## 2026-11-24 ~16:00: P5's interop reds and the landing spin landed
+- 26d1b3846: a fetch's changelog and manifest texts read whole are counted apart (`vcs_store.hg_pull_log_texts`). main's hg_interop pull red (3 "sent whole") was a miscount; the pull's shape was right all along.
+- 9a6e470a8: a parked tag lookup's held read is judged by its heads (`TagsRead::same_heads`). `branch create --from v1` had hung, parked again forever once the heads' manifests were let go.
+- a1f055a5e: A-687's served repository reads a let-go changeset text through the changeset store (w-perf's find; a P5 slip my filters missed).
+- fda5613a1: the landing spin. A push's new line greens are made a slice at a time before the landing step (`push::prepare_create`, `PreparedCreates`, `hg_push::land_sliced`), agreed with main and w-git. 452 heads: 3.5 s+ watchdog exit → 567 ms step, accepted. 152 heads: 1.89 s → 166 ms.
+- Run requests to main: stock 7.2 hg_interop at ffad3c6ae (r981, queued); the 452-head DAG and the 57k history through hg_push_restart in the optimized profile.
+- Owed (GAPS): hundreds of existing heads moved in one push; the record's write grows with heads × tree; one green a slice; git's driver adopting PreparedCreates (w-git).
+- Process slips, owned: two git resets (one bare, one path-limited), neither touching work; one `cargo build --tests` that filled the shared disk (freed through kiln).
+- Next: C1 (2), the intake keeping no whole text; then stream and push speed, then pending steps.
