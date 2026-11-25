@@ -505,6 +505,9 @@ pub struct TextCache {
   pub decoded_most: u64,
   /// The changesets those places lie in, each recorded as a chain's place is read from it ([`Store::make_chain`]).
   pub changesets: std::collections::BTreeSet<u64>,
+  /// The chunks laid on fresh memory (a fresh mapping of the allocator's floor each, its pages faulted in): goal 93,
+  /// main's churn ruling of 2026-11-25 (hg's 57k push mapped 4.5 GB of them, 80.9% of its mapped churn).
+  pub chunks_mapped: u64,
 }
 
 /// One chunk of [`TextCache`]'s: its texts' bytes, laid end to end within the room it was reserved with.
@@ -553,6 +556,7 @@ impl TextCache {
       decoded: 0,
       decoded_most: 0,
       changesets: std::collections::BTreeSet::new(),
+      chunks_mapped: 0,
     }
   }
 
@@ -634,7 +638,7 @@ impl TextCache {
       self.bound = walked.saturating_add(len.max(chunk));
     }
     self.refresh(identity);
-    self.make_room(0);
+    self.make_room(0, false);
   }
 
   /// Moves `identity`'s text to the newest chunk where it lies in an older one and is shorter than a chunk.
@@ -675,7 +679,7 @@ impl TextCache {
       return;
     }
     if text.len() >= self.chunk_len() {
-      self.make_room(text.len());
+      self.make_room(text.len(), false);
       let mut whole = Vec::new();
       if whole.try_reserve_exact(text.len()).is_err() {
         return;
@@ -692,11 +696,22 @@ impl TextCache {
         });
       if room < text.len() {
         let len = self.chunk_len();
-        self.make_room(len);
-        let mut fresh = Vec::new();
-        if fresh.try_reserve_exact(len).is_err() {
-          return;
-        }
+        // The chunk the room was made from, when it was an ordinary one of this length, laid again: no fresh mapping
+        // faulted in and none unmapped (goal 93, main's churn ruling of 2026-11-25).
+        let fresh = match self.make_room(len, true) {
+          Some(mut kept) => {
+            kept.clear();
+            kept
+          }
+          None => {
+            let mut fresh = Vec::new();
+            if fresh.try_reserve_exact(len).is_err() {
+              return;
+            }
+            self.chunks_mapped = self.chunks_mapped.saturating_add(1);
+            fresh
+          }
+        };
         self.push_chunk(fresh, false);
       }
     }
@@ -729,15 +744,18 @@ impl TextCache {
 
   /// Gives back the oldest chunks, whole, until `len` bytes more fit the bound, forgetting the texts laid in them; a text
   /// whose walk is in flight is laid again in the newest chunk first, so the walk finds it at its next piece (the bound
-  /// counts it).
-  fn make_room(&mut self, len: usize) {
+  /// counts it). Where `reusing` (the room is for a fresh chunk of `len` bytes, laid at once), the first ordinary chunk
+  /// of that length given back is answered rather than unmapped, for the caller to lay again: kept for no longer than
+  /// that call, so the bound holds whatever the cache does next.
+  fn make_room(&mut self, len: usize, reusing: bool) -> Option<Vec<u8>> {
+    let mut kept: Option<Vec<u8>> = None;
     // At most every chunk held now is given back: a walked text laid again lies in a chunk laid after them, so a bound
     // that cannot hold the walks ends here, never in a loop.
     let mut passes = self.chunks.len();
     while self.reserved.saturating_add(to_u64(len)) > self.bound && passes > 0 {
       passes = passes.saturating_sub(1);
       let Some(oldest) = self.chunks.pop_front() else {
-        return;
+        return kept;
       };
       let number = self.first;
       self.first = self.first.saturating_add(1);
@@ -775,7 +793,11 @@ impl TextCache {
         }
         self.relaying = false;
       }
+      if reusing && kept.is_none() && !oldest.whole && oldest.bytes.capacity() == len {
+        kept = Some(oldest.bytes);
+      }
     }
+    kept
   }
 
   /// Gives back a chain buffer that took the mapped path (a text a floor long or longer made it so), before the next

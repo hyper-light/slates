@@ -1793,7 +1793,12 @@
 > piece and kept it in flight, its bound grown by the text, up to the owner's room for waiting reads (`clients_per_shard`
 > x shards) and never back. `slates_store::Store::text_whole` reads a text whole as its walk's end, and the owner's batch
 > reads through it (`a_text_read_whole_leaves_no_walk_in_flight`: red, the bound 6,291,456 bytes for 24 texts of 197,608
-> read whole against one chunk and a text, 1,246,184; now 1,048,576). The batch itself was sized by the fetch's room
+> read whole against one chunk and a text, 1,246,184; now 1,048,576). The cache's chunks churned: each a fresh mapping
+> of the allocator's floor, faulted in and unmapped as the oldest went (hg's 57k push mapped 4.5 GB of them, 80.9% of
+> its mapped churn; a fresh 1 MiB chunk 240 us against 85 us kept). Now the chunk the room was made from is laid again
+> when it is an ordinary one of the length wanted, held for no longer than that call so the bound holds
+> (`TextCache::chunks_mapped`; `a_cache_lays_its_next_chunk_in_the_one_it_gives_back`: red, 7 chunks mapped fresh for
+> 400 texts through a two-chunk cache; now 2). The batch itself was sized by the fetch's room
 > (`LogTexts::ask_batch`, gigabytes at 57k) and copied text by text on the owner: the status's other 5.25 GB is the
 > system allocator's, reserved and not in use (5.41 GB reserved, 157 MB in use), and an in-process clone of 2,000
 > changesets peaked at 111.6 MB of live heap, 83% the batch's copies (`crates/server/tests/hg_fetch_heap.rs`). Cut
