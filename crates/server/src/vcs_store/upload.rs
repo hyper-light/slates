@@ -591,7 +591,47 @@ pub(crate) const PHASE_NS_MOST: [&str; 5] = [
 /// Counts the phases of one fetch step from their bounds on the shard's clock, `bounds` the step's start then each
 /// phase's end: each phase's longest kept, and the step, where it ran past `quantum_ns`, counted long under its longest
 /// phase ([`LONG_STEPS_BY_PHASE`]).
-fn count_phases(state: &mut ShardState, bounds: [u64; 6], quantum_ns: u64) {
+/// Counters: a fetch step past the quantum by its answer's own work ([`LONG_STEPS_BY_PHASE`]'s work), counted again under
+/// the stage of that work that took longest (main 01a20182's order of 2026-11-25: bench7's clone, 256,298 of its 262,675
+/// steps long by their work, up to 15-17 ms against a 49.8 µs quantum, the fixed overhead never): choosing the pack's
+/// objects (choose: the negotiation and its walk, all of the work but the pack source's), the pack's plan begun (begin:
+/// `PackSource::begin`), and its bytes streamed (write: `PackSource::write`). Format: counter names.
+pub(crate) const LONG_WORK_BY_STAGE: [&str; 3] = [
+  "vcs_store.git_upload.long_work.choose",
+  "vcs_store.git_upload.long_work.begin",
+  "vcs_store.git_upload.long_work.write",
+];
+
+/// Counted most: the longest each stage of a fetch step's work took, in nanoseconds, in [`LONG_WORK_BY_STAGE`]'s order.
+/// Format: counter names.
+pub(crate) const WORK_NS_MOST: [&str; 3] = [
+  "vcs_store.git_upload.work_ns_most.choose",
+  "vcs_store.git_upload.work_ns_most.begin",
+  "vcs_store.git_upload.work_ns_most.write",
+];
+
+/// Counts the stages of a fetch step's `work` nanoseconds, `staged` the pack source's begin and write within it: each
+/// stage's longest kept, and the step, where `long` (past the quantum by its work), counted under its longest stage.
+fn count_work_stages(state: &mut ShardState, (work, staged): (u64, [u64; 2]), long: bool) {
+  let [begin, write] = staged;
+  let stages = [
+    work.saturating_sub(begin).saturating_sub(write),
+    begin,
+    write,
+  ];
+  for (name, took) in WORK_NS_MOST.iter().zip(stages) {
+    state.count_max(name, took);
+  }
+  if !long {
+    return;
+  }
+  let longest = (0..stages.len()).max_by_key(|at| stages.get(*at).copied().unwrap_or(0));
+  if let Some(name) = longest.and_then(|at| LONG_WORK_BY_STAGE.get(at)) {
+    state.count(name, 1);
+  }
+}
+
+fn count_phases(state: &mut ShardState, (bounds, staged): ([u64; 6], [u64; 2]), quantum_ns: u64) {
   let mut phases = [0_u64; 5];
   for (at, phase) in phases.iter_mut().enumerate() {
     let (Some(start), Some(end)) = (bounds.get(at), bounds.get(at.saturating_add(1))) else {
@@ -606,13 +646,14 @@ fn count_phases(state: &mut ShardState, bounds: [u64; 6], quantum_ns: u64) {
   let (Some(first), Some(last)) = (bounds.first(), bounds.last()) else {
     return;
   };
-  if last.saturating_sub(*first) <= quantum_ns {
-    return;
-  }
+  let long = last.saturating_sub(*first) > quantum_ns;
   let longest = (0..phases.len()).max_by_key(|at| phases.get(*at).copied().unwrap_or(0));
-  if let Some(name) = longest.and_then(|at| LONG_STEPS_BY_PHASE.get(at)) {
+  if long && let Some(name) = longest.and_then(|at| LONG_STEPS_BY_PHASE.get(at)) {
     state.count(name, 1);
   }
+  // The work's own stages, the step counted long by its work only where the work was its longest phase.
+  let work = phases.get(2).copied().unwrap_or(0);
+  count_work_stages(state, (work, staged), long && longest == Some(2));
 }
 
 /// Runs `step` over the generation `hold` holds, counted as [`lend_on`] counts a step; none when its fork is gone. Its
@@ -664,18 +705,15 @@ fn lend_held_in<R>(
   }
   let counted = now();
   let quantum_ns = state.config.step_quantum_ns();
-  count_phases(
-    state,
-    [
-      began,
-      made,
-      lent_at.max(made),
-      worked.max(lent_at),
-      settled,
-      counted,
-    ],
-    quantum_ns,
-  );
+  let bounds = [
+    began,
+    made,
+    lent_at.max(made),
+    worked.max(lent_at),
+    settled,
+    counted,
+  ];
+  count_phases(state, (bounds, packs.staged_ns), quantum_ns);
   lent
 }
 
@@ -933,6 +971,8 @@ pub(crate) struct ShardPacks {
   counted: Option<(UploadCounters, UploadCounters)>,
   /// What this step's choice of the pack's objects did resolving their ids (A-911).
   chose: slates_git::store::PositionCounts,
+  /// The nanoseconds this step's pack's plan begun and its bytes written took ([`LONG_WORK_BY_STAGE`]).
+  staged_ns: [u64; 2],
 }
 
 impl ShardPacks {
@@ -943,6 +983,7 @@ impl ShardPacks {
       quantum_ns: state.config.step_quantum_ns(),
       counted: None,
       chose: slates_git::store::PositionCounts::default(),
+      staged_ns: [0, 0],
     }
   }
 
@@ -1000,9 +1041,13 @@ impl PackSource for ShardPacks {
     plan: &PackPlan<'_>,
     admission: &mut Admission,
   ) -> Result<Streamed, PackRefused> {
-    self
+    let began = slates_rt::futures::now_ns();
+    let begun = self
       .fragments(&mut ShardClock)
-      .begin(served, plan, admission)
+      .begin(served, plan, admission);
+    let took = slates_rt::futures::now_ns().saturating_sub(began);
+    self.staged_ns[0] = self.staged_ns[0].saturating_add(took);
+    begun
   }
 
   fn write(
@@ -1016,9 +1061,12 @@ impl PackSource for ShardPacks {
     let before = self
       .counted
       .map_or_else(|| pack.counters(), |(before, _)| before);
+    let began = slates_rt::futures::now_ns();
     let written = self
       .fragments(&mut ShardClock)
       .write(served, pack, admission, out, room);
+    let took = slates_rt::futures::now_ns().saturating_sub(began);
+    self.staged_ns[1] = self.staged_ns[1].saturating_add(took);
     self.counted = Some((before, pack.counters()));
     written
   }

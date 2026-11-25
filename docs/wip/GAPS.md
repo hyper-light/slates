@@ -280,13 +280,27 @@
 >   assertion.
 > - **Noted, not to fix now (main's ruling):** the learned tail from one sample is wide (about 13.3 s from a 4.5 s
 >   silence; 11 to 14 s from two). After (c), whether the tail's estimator should weight its sample count.
-> **OPEN, w-shared's next piece (A-912's sibling; main 01a20182's ruling of 2026-11-25, before A-914 (c)): a push during
-> a death is refused at its record barrier, whatever the homing window.** In a914's scene, the second death's push
-> was refused `unable to commit` 2 of 7 with a learned window: "greens owed (green, version, placed) [(…, 3, Some(2))]",
-> the new version's merge records still unplaced 13 s after the dead member's takeover installed, the names log
-> acknowledged at 4 by the dead member and at 5 by the live one. Flooring the barrier's window at the homing window
-> left 2 refused (reverted): it is a stall, not a window. Red first, the stall's cause logged before any fix; then
-> a914's test asserts its second push lands.
+> **OPEN, w-shared's next pieces (A-918 and A-919; A-912's sibling; main 01a20182's rulings of 2026-11-25): a candidate a
+> death brings in holds none of a green and refuses every later version of it for good.** In a914's scene the second
+> death's push was refused `unable to commit` (2 of 7, then 4 of 6). Logged (the barrier refusal now names each pending
+> version's candidates, acknowledgements, joint cohorts, inputs, builds and behind targets, and the placement): after a
+> death at 3 members every member is a green's candidate, so a node that never held the green joined its cohort; it
+> answered each record out of order (`merge.out_of_order`, 4006 over one red run), untyped, and nothing ships a placed
+> version again (A-412), so it never reached v2. Durability held: A-546's settle certifies `f + 1`, met by the owner
+> and the old candidate. Liveness did not: an `f + 1` for the next version can need the newcomer. Red:
+> `a918_a_candidate_a_death_brings_in_is_shipped_the_greens_chain_and_holds_the_next_version` (newcomer at `None` after
+> 430 s). The pieces, in main's order:
+> - **(i) FIXED (A-918 (i)):** the holder answers typed, `ContentMessage::Behind { reached }` (kind 11), where it
+>   counted `OUT_OF_ORDER` and answered nothing; the owner records it on the pending version (`merge.behind.heard`)
+>   and the barrier's log names it.
+> - **(iii) OPEN (A-919):** a candidate joining a state log's placement past parts every earlier candidate held is
+>   shipped the log's prefix (state_log's own owed transfer); a repository green's v0 on a fresh candidate needs its
+>   join from it.
+> - **B OPEN (A-918):** on `Behind`, the newcomer rebuilds the green through a takeover successor's own path
+>   (`adopt_ledger_positions`, `rebuild_through`) from a live holder, paced and bounded as replica builds are; one
+>   mechanism for both. The owner cannot push it the chain from v0: below a green's floor (its checkpoint or adoption)
+>   it holds no per-version records or inputs. Then the red goes green, a914 asserts its second push lands, and
+>   GAP-A9-7's ledger-prefix transfer and AUD-14's new candidate set close.
 > **OPEN, a piece (A-912's (3); main 01a20182's rulings of 2026-11-24): a council session of its own per peer.** The
 > council's replication shares a node's one record session per peer with every exchange, each borrower taking it whole.
 > A-912 removed the hold found (a home holding a put across the install the council's next append brings) and counts any
