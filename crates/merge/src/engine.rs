@@ -8626,6 +8626,9 @@ pub use branch::{Lent, Lineage, LineageGreen, LineageRefused, Release};
 mod copy;
 pub use copy::CopyRefusal;
 
+mod reserving;
+pub use reserving::Reserving;
+
 mod copy_checkpoint;
 
 mod copy_restate;

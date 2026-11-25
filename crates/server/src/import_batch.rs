@@ -78,9 +78,22 @@ pub(crate) struct ImportBatch {
   chain_room: usize,
   /// What the staged versions' chain entries take of it.
   entries: usize,
+  /// The work whose reservation is being taken a slice at a time ([`ImportBatch::stage_step`], A-920 piece 3b): judged
+  /// once it is taken.
+  reserving: Option<ReservingWork>,
   /// The work whose accepted verdict is being committed into the scratch member a slice at a time
   /// ([`ImportBatch::stage_step`]): kept once its commit ends.
   pending: Option<Pending>,
+}
+
+/// A work whose reservation is being taken ([`ImportBatch::stage_begin`]).
+struct ReservingWork {
+  /// The work, in the green's numbering.
+  work: Increment,
+  /// Its reservation's walk so far (`Green::begin_reserving`).
+  reserving: slates_merge::engine::Reserving,
+  /// The batch's head it is based at, in the green's numbering.
+  head: u64,
 }
 
 /// A work judged and accepted into the scratch member, its verdict being committed a slice at a time (A-920 piece 1).
@@ -185,6 +198,7 @@ impl ImportBatch {
       base,
       preview: Some(preview),
       staged: Vec::new(),
+      reserving: None,
       pending: None,
       room: cap.saturating_sub(charged),
       reserved: 0,
@@ -243,9 +257,7 @@ impl ImportBatch {
     state: &mut ShardState,
     work: Increment,
   ) -> Result<u64, StageRefused> {
-    if let Some(version) = self.stage_begin(state, work)? {
-      return Ok(version);
-    }
+    self.stage_begin(state, work)?;
     loop {
       if let Some(staged) = self.stage_step(state, &mut || false) {
         return staged;
@@ -253,24 +265,68 @@ impl ImportBatch {
     }
   }
 
-  /// Begins staging `work` ([`ImportBatch::stage`]): judged into the scratch member; kept at once where nothing of it is
-  /// to commit (its version), else its verdict's commit begun and taken on by [`ImportBatch::stage_step`] (none).
+  /// Begins staging `work` ([`ImportBatch::stage`]): its reservation begun, taken a slice at a time by
+  /// [`ImportBatch::stage_step`], then the work judged into the scratch member, and kept where nothing of it is to
+  /// commit, else its verdict's commit taken on. Refused where it is not based at the batch's head.
   pub(crate) fn stage_begin(
     &mut self,
     state: &mut ShardState,
-    mut work: Increment,
-  ) -> Result<Option<u64>, StageRefused> {
+    work: Increment,
+  ) -> Result<(), StageRefused> {
     let head = self.head();
     if work.base != head {
       return Err(StageRefused::NotAtHead { head });
     }
     let preview = self.preview.as_ref().ok_or(StageRefused::Unavailable)?;
-    // Within the green's retention room before anything is judged: the batch lands first where the work would take it
-    // past, and a work past the room alone is refused.
-    let reservation = state
+    let reserving = state
       .greens
-      .with_preview(preview, |engine| reservation_of(engine, &mut work, head))
+      .with_preview(preview, |engine| engine.begin_reserving(&work))
       .map_err(|_| StageRefused::Unavailable)?;
+    self.reserving = Some(ReservingWork {
+      work,
+      reserving,
+      head,
+    });
+    Ok(())
+  }
+
+  /// One step of a work's reservation ([`ImportBatch::stage_begin`]), until `spent`: none while it goes on; once it
+  /// ends, the work judged ([`ImportBatch::judge_reserved`]).
+  fn reserve_step(
+    &mut self,
+    state: &mut ShardState,
+    mut at: ReservingWork,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Option<Result<u64, StageRefused>> {
+    let Some(preview) = self.preview.as_ref() else {
+      return Some(Err(StageRefused::Unavailable));
+    };
+    let stepped = state.greens.with_preview(preview, |engine| {
+      let walked = engine.reserving_step(&at.work, &mut at.reserving, spent)?;
+      Some(reservation_of(engine, &mut at.work, (at.head, walked)))
+    });
+    match stepped {
+      Err(_) => Some(Err(StageRefused::Unavailable)),
+      Ok(None) => {
+        self.reserving = Some(at);
+        None
+      }
+      Ok(Some(reservation)) => self
+        .judge_reserved(state, at.work, (at.head, reservation))
+        .transpose(),
+    }
+  }
+
+  /// `work`, its reservation taken, judged into the scratch member at the batch's head `head`: within the green's
+  /// retention room first (the batch lands first where the work would take it past, and a work past the room alone is
+  /// refused); then kept where nothing of it is to commit (its version), else its verdict's commit begun (none).
+  fn judge_reserved(
+    &mut self,
+    state: &mut ShardState,
+    mut work: Increment,
+    (head, reservation): (u64, usize),
+  ) -> Result<Option<u64>, StageRefused> {
+    let preview = self.preview.as_ref().ok_or(StageRefused::Unavailable)?;
     let work_reserves = u64::try_from(reservation).unwrap_or(u64::MAX);
     if self.reserved.saturating_add(work_reserves) > self.room {
       return Err(StageRefused::PastRoom {
@@ -350,7 +406,10 @@ impl ImportBatch {
     state: &mut ShardState,
     spent: &mut dyn FnMut() -> bool,
   ) -> Option<Result<u64, StageRefused>> {
-    // A step with no commit begun is refused, never "more": its caller steps until an end.
+    if let Some(reserving) = self.reserving.take() {
+      return self.reserve_step(state, reserving, spent);
+    }
+    // A step with nothing begun is refused, never "more": its caller steps until an end.
     let Some(mut pending) = self.pending.take() else {
       return Some(Err(StageRefused::Unavailable));
     };
@@ -538,16 +597,15 @@ enum Judging {
 }
 
 /// The history and change bytes `work`, based at the batch's head `head` (in the green's numbering), would reserve in
-/// the scratch member `engine`, read as [`judge_staged`] reads it: moved into the member's numbering and back, `work`
-/// as it was.
-fn reservation_of(engine: &Green, work: &mut Increment, head: u64) -> usize {
+/// the scratch member `engine`, its walks' `walked` taken already (`Green::reserving_step`) and its copies' and
+/// replaces' shares added, read as [`judge_staged`] reads it: moved into the member's numbering and back, `work` as it
+/// was.
+fn reservation_of(engine: &Green, work: &mut Increment, (head, walked): (u64, usize)) -> usize {
   let offset = head.saturating_sub(engine.head());
   let base = work.base;
   work.base = engine.head();
   in_numbering(work, |version| version.checked_sub(offset));
-  let reserved = engine
-    .history_reservation(work)
-    .saturating_add(engine.changes_reservation(work));
+  let reserved = engine.reservation_shares(work, walked);
   in_numbering(work, |version| version.checked_add(offset));
   work.base = base;
   reserved

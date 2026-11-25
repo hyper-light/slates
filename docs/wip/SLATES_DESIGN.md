@@ -64076,3 +64076,16 @@ GAPS.
   identity as the judging green, never a text asked for twice, a commit lent in the census
   (`commits_lent`); and a server batch staging an append over a text its scratch member holds by name alone is lent
   it once by its commit and makes the file (`a_staged_commit_is_lent_the_named_text_its_reads_meet`).
+  **3b, the reservation.** `Green::history_reservation` plus `changes_reservation` (30 ms whole, computed once since
+  piece 0) are walked a unit at a time (`engine::reserving`): `Green::begin_reserving` and `reserving_step` note each
+  op's path once in an owned map (its content ops, whether an op replaces it, whether the change index records it;
+  a work decoded from bytes is not taken to name a path once), then charge each path its history's and change
+  index's bytes (`superseded_bytes`, a special's node, its change bytes and the links naming a special); the copies'
+  and replaces' shares (`Green::reservation_shares`, whole, nothing for a work with neither) read versions and are
+  added once with the work moved into the scratch member's numbering. Each charge is a saturating sum of charges
+  that are never negative, so the order changes nothing. The import batch takes it as a phase of its own before the
+  judge (`ImportBatch::stage_begin` begins it; `stage_step` takes it on, then judges, `judge_reserved`). The judge
+  step 77 ms → 47 ms. Oracle: over generated works of every kind and renames, on the histories every earlier work
+  left, the reservation taken a unit a step equals the two whole, before each work is submitted and after
+  (`a_reservation_taken_a_unit_a_step_is_the_reservation_taken_whole`; a rename's source left uncharged, or a
+  special's node, fails it). Owed: the shares are whole, `copy_entry_room` resolving the work whole where it copies.
