@@ -34,8 +34,11 @@ const BINARY: &str = "owner-text-cache";
 /// Shape: the texts the walk test lands and leaves part-way, each [`TEXT`] bytes.
 const LEFT_TEXTS: usize = 3;
 
+/// The sections a landing carries, each with its kind.
+type Sections = Vec<(SectionKind, Vec<u8>)>;
+
 /// The texts of `count` distinct payloads of [`TEXT`] bytes landed as changeset `sequence`'s, with their identities.
-fn left_texts(count: usize) -> (Vec<[u8; 32]>, Vec<(SectionKind, Vec<u8>)>) {
+fn left_texts(count: usize) -> (Vec<[u8; 32]>, Sections) {
   let mut identities = Vec::new();
   let mut entries = Vec::new();
   let mut payload = Vec::new();
