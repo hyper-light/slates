@@ -5598,6 +5598,12 @@ fn landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a
   )
   .saturating_sub(logs_before);
   let held_after = ids.map(|id| log_windows_held(&daemon, id));
+  let files_after = file_windows_held(&daemon, ids[1]);
+  let work_texts = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::WORK_TEXTS_READ,
+  );
   let asked = counted_on(
     &daemon,
     REPOSITORY,
@@ -5615,17 +5621,7 @@ fn landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a
   );
   assert_hg_answered(&line);
   assert_hg_answered(&last);
-  for (rows, held, bytes) in held_before.iter().chain(&held_after) {
-    assert!(
-      *rows > 0,
-      "the repository keeps changelog and manifest rows"
-    );
-    assert_eq!(
-      (*held, *bytes),
-      (0, 0),
-      "no changelog or manifest text held"
-    );
-  }
+  assert_log_rows_kept_and_no_text_held(&held_before, &held_after);
   let nothing = NothingHeld;
   let imported_verified = verified_clone(&imported_clone, &nothing);
   assert!(
@@ -5659,11 +5655,48 @@ fn landed_changelog_and_manifest_texts_leave_the_content_store_and_a_clone_and_a
     "the pull read its changeset's and manifests' texts whole from the store"
   );
   assert_clone_reads_its_texts_in_batches(clone_before, clone_read);
+  assert_the_pushes_file_texts_let_go(work_texts, files_after);
+}
+
+/// Every repository keeps changelog and manifest rows, and holds none of their texts, before the clones and after
+/// (`log_windows_held`'s rows, windows held and bytes, one a repository).
+fn assert_log_rows_kept_and_no_text_held(
+  before: &[(usize, usize, u64)],
+  after: &[(usize, usize, u64)],
+) {
+  for (rows, held, bytes) in before.iter().chain(after) {
+    assert!(
+      *rows > 0,
+      "the repository keeps changelog and manifest rows"
+    );
+    assert_eq!(
+      (*held, *bytes),
+      (0, 0),
+      "no changelog or manifest text held"
+    );
+  }
+}
+
+/// The last push's work read a let-go file text back (`work_texts`, `hg_push::WORK_TEXTS_READ`), and no landed file
+/// text is held once the pushes end (`file_windows_held`'s windows and bytes).
+fn assert_the_pushes_file_texts_let_go(work_texts: u64, files_after: (usize, usize, u64)) {
+  println!(
+    "file objects held after the pushes {files_after:?}; the works read {work_texts} texts back"
+  );
+  assert!(
+    work_texts > 0,
+    "the last push's work read a let-go file text back"
+  );
+  assert_eq!(
+    (files_after.1, files_after.2),
+    (0, 0),
+    "no landed file text held once the pushes end"
+  );
 }
 
 /// What a daemon's fetches have read of the changeset store so far: the changelog's and manifests' texts read whole
 /// (`vcs_store.hg_pull_log_texts`) and the store's asks (`vcs_store.hg_stream_store_asks`).
-fn clone_reads(daemon: &crate::daemon::Daemon) -> (u64, u64) {
+fn clone_reads(daemon: &crate::daemon::Daemon) -> (u64, u64, u64) {
   (
     counted_on(
       daemon,
@@ -5671,18 +5704,27 @@ fn clone_reads(daemon: &crate::daemon::Daemon) -> (u64, u64) {
       crate::vcs_store::hg_view::PULL_LOG_TEXTS,
     ),
     counted_on(daemon, REPOSITORY, crate::vcs_store::hg_view::STORE_ASKS),
+    counted_on(daemon, REPOSITORY, crate::vcs_store::hg_view::TEXT_REQUESTS),
   )
 }
 
 /// Goal 93 (main's interop bench at ed71ac0be: `hg clone` of the 57k history after P5 ran 13.5 minutes, stock's 42.4 s;
 /// the daemon's sample a store scan a text). A clone of the whole line, its changelog's and manifests' texts let go,
 /// reads each of the line's changesets and manifests once, and asks the store in batches: a want of rows and one of texts
-/// (a file's, its chunks) for each of the changelog, the manifests and the files, within the fetch's room. Red before:
-/// 30 asks, a want of a row and one of its text for every changeset and manifest.
-fn assert_clone_reads_its_texts_in_batches(before: (u64, u64), after: (u64, u64)) {
+/// (a file's, its chunks) for each of the changelog, the manifests and the files, within the fetch's room, each want's
+/// texts made by one request of the store's owner (`vcs_store.hg_text_requests`). Red before: 30 asks, a want of a row
+/// and one of its text for every changeset and manifest; then a request of the owner a text.
+fn assert_clone_reads_its_texts_in_batches(before: (u64, u64, u64), after: (u64, u64, u64)) {
   let texts = after.0.saturating_sub(before.0);
   let asks = after.1.saturating_sub(before.1);
-  println!("a clone of {LET_GO_LINE} changesets read {texts} log texts in {asks} store asks");
+  let requests = after.2.saturating_sub(before.2);
+  println!(
+    "a clone of {LET_GO_LINE} changesets read {texts} log texts in {asks} store asks, {requests} owner requests"
+  );
+  assert!(
+    requests <= asks,
+    "the clone's texts made by {requests} requests of the store's owner: one a want, never one a text"
+  );
   assert_eq!(
     texts,
     2 * u64::try_from(LET_GO_LINE).unwrap(),
@@ -5821,6 +5863,42 @@ fn log_windows_held(
     })
   })
   .expect("the repository's rows")
+}
+
+/// `repository`'s file revisions on its shard: how many, how many of their bytes' objects with any bytes have a window
+/// held in its content store, and those objects' bytes (as [`log_windows_held`] counts the logs').
+fn file_windows_held(
+  daemon: &Daemon,
+  repository: slates_db::catalog::RepositoryId,
+) -> (usize, usize, u64) {
+  crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    crate::vcs_store::lent_state(state, |state| {
+      let (content, store) = state.vcs_stores.mercurial_ref(repository)?;
+      let index = &store.index;
+      let mut objects = Vec::new();
+      let paths: Vec<Vec<u8>> = index.file_logs(content).map(<[u8]>::to_vec).collect();
+      for path in &paths {
+        let log = slates_hg::index::Log::File(path);
+        for rev in 0..index.len(content, log) {
+          let row = index.revision(content, log, rev)?;
+          objects.push(row.bytes);
+        }
+      }
+      let held: Vec<u64> = objects
+        .iter()
+        .filter(|object| content.len_of(object).is_some_and(|len| len > 0))
+        .filter(|object| {
+          content
+            .object_layout(object)
+            .iter()
+            .any(|(window, _)| !content.is_away(window))
+        })
+        .map(|object| content.len_of(object).unwrap_or(0))
+        .collect();
+      Some((objects.len(), held.len(), held.iter().sum()))
+    })
+  })
+  .expect("the repository's file rows")
 }
 
 /// Lets go every object `repository`'s changelog and manifest rows name on its shard: how many of those with any bytes

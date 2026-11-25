@@ -1058,7 +1058,14 @@ fn derive_counts(state: &mut ShardState) -> DeriveCounts {
 /// A line of [`PACED_HISTORY`] commits pushed as one create to a new repository: the repository and the counts before
 /// its derivation.
 fn push_paced_line(state: &mut ShardState) -> (RepositoryId, DeriveCounts) {
-  let repository = git_repository(state, "paced");
+  let (repository, _) = paced_line_pushed(state, "paced");
+  (repository, derive_counts(state))
+}
+
+/// A line of [`PACED_HISTORY`] commits pushed as one create to a new repository `name`: the repository and the pack it
+/// landed.
+fn paced_line_pushed(state: &mut ShardState, name: &str) -> (RepositoryId, Vec<u8>) {
+  let repository = git_repository(state, name);
   let mut objects = Vec::new();
   let mut parent = None;
   for at in 0..PACED_HISTORY {
@@ -1068,13 +1075,82 @@ fn push_paced_line(state: &mut ShardState) -> (RepositoryId, DeriveCounts) {
   }
   let head = parent.unwrap().to_string();
   let created = [("", head.as_str(), b"refs/heads/main".as_slice())];
-  let received = pushed(
-    state,
-    repository,
-    &request(&created, CAPABILITIES, &pack_of_objects(&objects)),
-  );
+  let pack = pack_of_objects(&objects);
+  let received = pushed(state, repository, &request(&created, CAPABILITIES, &pack));
   assert_eq!(reasons(&received), [b"ok".to_vec()]);
-  (repository, derive_counts(state))
+  (repository, pack)
+}
+
+/// Lets go of every window of `pack` on this shard by hand, as a landed pack's let-go would (its home told first, each
+/// window marked landed; the commit's own let-go is withdrawn, `vcs_store::LANDED_LET_GO`): the windows.
+fn let_go_by_hand(state: &mut ShardState, pack: &[u8]) -> Vec<slates_vcs::ContentId> {
+  let window = state
+    .vcs_stores
+    .content()
+    .map_or(1 << 18, slates_vcs::ContentStore::window);
+  let ids: Vec<slates_vcs::ContentId> =
+    pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  crate::vcs_store::homes::landed_pack_here(state, slates_vcs::ContentId::of(pack));
+  crate::vcs_store::within_budget(state, 0, |stores| {
+    let content = stores.content_mut().expect("the content store");
+    for id in &ids {
+      content.mark_landed(id);
+    }
+  });
+  for id in &ids {
+    let _ = crate::vcs_store::let_go_read(state, id);
+  }
+  ids
+}
+
+/// How many of `windows` this shard holds (not let go).
+fn held_of(state: &ShardState, windows: &[slates_vcs::ContentId]) -> usize {
+  let content = state.vcs_stores.content();
+  windows
+    .iter()
+    .filter(|window| content.is_some_and(|content| !content.is_away(window)))
+    .count()
+}
+
+/// Windows brought back from the node's store, as this shard counts them.
+fn brought_back_count(state: &ShardState) -> u64 {
+  let name = crate::vcs_store::read_through::BROUGHT_BACK;
+  state.refusals.get(name).copied().unwrap_or(0)
+}
+
+/// Main 01a20182's ruling of 2026-11-24 (w-hg's sweep of the bring-back sites: a write path's bring-back never let go).
+/// Do: push a line of [`PACED_HISTORY`] commits, let its pack's windows go by hand before it is derived, then derive it
+/// as a fetch's request does (`git_derive::derive_for_read`). Expect: every window let go first; the derivation brought
+/// windows back to read them (so it is the bring-back this measures); and once it ended, none of the pack's windows held
+/// (its bring-backs let go again, `vcs_store.read_through.write_path_let_go`). Red before: the windows it brought back
+/// stayed held.
+#[test]
+fn a_derivation_lets_go_the_windows_it_brought_back_once_it_ends() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, windows, let_go_first) = crate::daemon::observe_first(&daemon, |state| {
+    let (repository, pack) = paced_line_pushed(state, "derive-brought-back");
+    let windows = let_go_by_hand(state, &pack);
+    let held = held_of(state, &windows);
+    (repository, windows, held)
+  });
+  let brought_before = crate::daemon::observe_first(&daemon, |state| brought_back_count(state));
+  derived_for_read(&daemon, repository);
+  let (brought, held_after) = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      brought_back_count(state) - brought_before,
+      held_of(state, &windows),
+    )
+  });
+  daemon.stop();
+  assert_eq!(let_go_first, 0, "every window let go first");
+  assert!(
+    brought > 0,
+    "the derivation brought windows back: {brought}"
+  );
+  assert_eq!(
+    held_after, 0,
+    "the windows it brought back let go again once it ended"
+  );
 }
 
 /// What a derivation's pace allowed: its wall time, the step's ceiling and quantum.
@@ -1196,6 +1272,80 @@ fn t_p2_an_unborn_default_branchs_first_push_owes_its_tree_and_reads_as_its_comm
     .collect();
   assert_eq!(materialized, 1, "made once, through the door");
   assert_eq!(read, expected, "made as the eager update made it");
+}
+
+/// Shape: the files of [`a_green_build_lets_go_the_windows_it_brought_back_once_it_is_made`]'s commit: a few, so its pack
+/// is one window or two and the test small.
+const BUILT_FILES: usize = 40;
+
+/// Repository `name`'s unborn default branch `main` pushed at a commit of [`BUILT_FILES`] files, so its green owes the
+/// push (P2): the repository, the green and the pack it landed.
+fn owed_default_pushed(
+  daemon: &crate::Daemon,
+  name: &'static str,
+) -> (RepositoryId, slates_db::catalog::VolumeId, Vec<u8>) {
+  let (head, objects) = flat_commit(BUILT_FILES, name, None);
+  let (repository, green) = crate::daemon::observe_first(daemon, move |state| {
+    let repository = git_repository(state, name);
+    let repositories = state.db.partition().repositories();
+    (repository, repositories.branch(repository, "main").unwrap())
+  });
+  let pack = pack_of_objects(&objects);
+  let create = request(
+    &[("", &head.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack,
+  );
+  let (created, _) = pushed_in_steps(daemon, repository, &create).unwrap();
+  assert_eq!(reasons(&created), [b"ok"]);
+  (repository, green, pack)
+}
+
+/// `green` reached through the door (`green_ready`) and waited for until it owes nothing: whether it was made in time.
+fn reached_and_made(daemon: &crate::Daemon, green: slates_db::catalog::VolumeId) -> bool {
+  crate::daemon::observe_first(daemon, move |state| {
+    crate::green_ready::green_ready(state, green);
+  });
+  let began = std::time::Instant::now();
+  while crate::daemon::observe_first(daemon, move |state| state.greens.is_owing(&green)) {
+    if began.elapsed() > std::time::Duration::from_secs(120) {
+      return false;
+    }
+  }
+  true
+}
+
+/// Main 01a20182's ruling of 2026-11-24 (w-hg's sweep: a write path's bring-back never let go; its red for the green
+/// build). Do: push the unborn default branch at a commit of [`BUILT_FILES`] files, so its green owes the push; let the
+/// pack's windows go by hand; then reach the green through the door and wait for it to be made. Expect: every window let
+/// go first; the build brought windows back to read the files (`merge.green.materialize_brought_back`, so it is the
+/// bring-back this measures); the green made; and none of the pack's windows held once it was
+/// (`vcs_store.read_through.write_path_let_go`). Red before: the windows it brought back stayed held.
+#[test]
+fn a_green_build_lets_go_the_windows_it_brought_back_once_it_is_made() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (_, green, pack) = owed_default_pushed(&daemon, "built-brought-back");
+  let (windows, held_first) = crate::daemon::observe_first(&daemon, move |state| {
+    let windows = let_go_by_hand(state, &pack);
+    let held = held_of(state, &windows);
+    (windows, held)
+  });
+  let made = reached_and_made(&daemon, green);
+  let (brought, held_after) = crate::daemon::observe_first(&daemon, move |state| {
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      count(crate::green_ready::MATERIALIZE_BROUGHT_BACK),
+      held_of(state, &windows),
+    )
+  });
+  daemon.stop();
+  assert_eq!(held_first, 0, "every window let go first");
+  assert!(made, "the green made");
+  assert!(brought > 0, "the build brought windows back: {brought}");
+  assert_eq!(
+    held_after, 0,
+    "the windows it brought back let go again once it was made"
+  );
 }
 
 /// `green`'s owed push as its record encodes it, and its head: what a replay of it must hold again (P2).
@@ -4012,4 +4162,62 @@ fn a_push_of_new_refs_counts_the_creates_its_landing_step_made_and_the_steps_tim
   assert_eq!(said, vec![b"ok".to_vec(); NEW_REFS]);
   let all = u64::try_from(NEW_REFS).unwrap();
   assert_eq!((creates, took > 0), (all, true), "all in one step, timed");
+}
+
+/// Main 01a20182's ruling of 2026-11-25 (b), from the readers' code: a git reader that holds no pin reads again after a
+/// let-go between its bring-back and its read, and brings the window back again, so a read-back's let-go there costs a
+/// second fetch, never the answer. Do: push the same line of [`PACED_HISTORY`] commits to two repositories (one pack,
+/// the same windows) and let its windows go by hand; derive the first as a fetch's request does
+/// (`git_derive::derive_for_read`), its windows let go again as it ends; then derive the second with the window its
+/// first bring-back puts back let go once more before the derivation's next turn reads it
+/// (`vcs_share::read_backs::FORCE_LET_GO_AFTER_BRING_BACK`). Expect: each derivation derives its one version; the
+/// second brought one window back once more than the first (the re-bring); and once both end, none of the pack's
+/// windows held.
+#[test]
+fn a_derivation_brings_a_window_let_go_under_it_back_again_and_derives_the_same() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (plain, forced, windows) = crate::daemon::observe_first(&daemon, |state| {
+    let (plain, _) = paced_line_pushed(state, "derive-plain");
+    let (forced, pack) = paced_line_pushed(state, "derive-forced");
+    (plain, forced, let_go_by_hand(state, &pack))
+  });
+  let counts = |daemon: &crate::Daemon| {
+    crate::daemon::observe_first(daemon, |state| {
+      (brought_back_count(state), derive_counts(state).1)
+    })
+  };
+  let before = counts(&daemon);
+  derived_for_read(&daemon, plain);
+  let between = counts(&daemon);
+  let held_between = crate::daemon::observe_first(&daemon, {
+    let windows = windows.clone();
+    move |state| held_of(state, &windows)
+  });
+  crate::daemon::observe_first(&daemon, |_| {
+    crate::vcs_share::read_backs::FORCE_LET_GO_AFTER_BRING_BACK.with(|force| force.set(true));
+  });
+  derived_for_read(&daemon, forced);
+  let after = counts(&daemon);
+  let held_after = crate::daemon::observe_first(&daemon, move |state| held_of(state, &windows));
+  daemon.stop();
+  let (plain_brought, forced_brought) = (between.0 - before.0, after.0 - between.0);
+  assert_eq!(
+    (between.1 - before.1, after.1 - between.1),
+    (1, 1),
+    "each derivation derived its version"
+  );
+  assert!(
+    plain_brought > 0,
+    "the plain derivation brought windows back"
+  );
+  assert_eq!(
+    forced_brought,
+    plain_brought + 1,
+    "the forced one brought the window let go under it back again"
+  );
+  assert_eq!(
+    (held_between, held_after),
+    (0, 0),
+    "the windows let go again"
+  );
 }

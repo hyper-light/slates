@@ -344,9 +344,18 @@ pub(crate) const BRING_BACK_PAST_PATIENCE: &str = "vcs_store.git_resident.bring_
 pub(crate) async fn bring_back_within(
   waited: slates_git::store::packed::Waited,
 ) -> Result<u64, super::read_through::ReadThroughRefused> {
+  bring_back_window_within(waited)
+    .await
+    .map(|brought| brought.map_or(0, |(_, len)| len))
+}
+
+/// [`bring_back_within`], naming the window it brought back and its bytes ([`super::read_through::bring_back_window`]).
+pub(crate) async fn bring_back_window_within(
+  waited: slates_git::store::packed::Waited,
+) -> Result<Option<(slates_vcs::ContentId, u64)>, super::read_through::ReadThroughRefused> {
   match slates_rt::futures::within(
     crate::vcs_share::wait::PATIENCE_NS,
-    super::read_through::bring_back(waited),
+    super::read_through::bring_back_window(waited),
   )
   .await
   {
@@ -758,6 +767,9 @@ pub(crate) fn learn_link(state: &mut ShardState, taught: (u64, u64)) {
 pub(crate) const POSITION_LOOKUPS: &str = "vcs_store.git_upload.position_lookups";
 /// Counter: the ids the fetch's cache of positions answered itself (A-911). Format: a counter name.
 pub(crate) const POSITION_CACHE_HITS: &str = "vcs_store.git_upload.position_cache_hits";
+/// Counter: of [`POSITION_LOOKUPS`], those whose slot in the fetch's cache held another id (a direct-mapped conflict);
+/// the rest met an empty slot (`slates_git::store::PositionCounts::conflicts`). Format: a counter name.
+pub(crate) const POSITION_CACHE_CONFLICTS: &str = "vcs_store.git_upload.position_cache_conflicts";
 /// Counter: fetches whose cache of positions was refused the room its walk's work asked, each then as slow as with no
 /// cache (A-911: a cache costs time, never an answer). Format: a counter name.
 pub(crate) const POSITION_CACHE_UNROOMED: &str = "vcs_store.git_upload.position_cache_unroomed";
@@ -851,6 +863,7 @@ impl ShardPacks {
     for (name, by) in [
       (POSITION_LOOKUPS, self.chose.lookups),
       (POSITION_CACHE_HITS, self.chose.hits),
+      (POSITION_CACHE_CONFLICTS, self.chose.conflicts),
       (POSITION_CACHE_UNROOMED, self.chose.unroomed),
     ] {
       if by > 0 {
@@ -921,6 +934,7 @@ impl PackSource for ShardPacks {
   fn chose(&mut self, counts: slates_git::store::PositionCounts) {
     self.chose.lookups = self.chose.lookups.saturating_add(counts.lookups);
     self.chose.hits = self.chose.hits.saturating_add(counts.hits);
+    self.chose.conflicts = self.chose.conflicts.saturating_add(counts.conflicts);
     self.chose.unroomed = self.chose.unroomed.saturating_add(counts.unroomed);
   }
 }

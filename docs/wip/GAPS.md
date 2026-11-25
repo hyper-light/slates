@@ -239,6 +239,36 @@
 > warm between the branch's versions, c refusing a's records, the branch's next push lands on a and b; red with part 4's
 > rebuild reverted in a scratch copy (`unable to commit`, b's `merge.recompute_mismatch` 1). Gate 16 (`v3_takeover` at
 > b7e65cc63, part 4 in) held: 40 of 40, release and debug.
+> **FIXED (A-912, w-shared, 2026-11-24; main 01a20182's rulings): a push made right after a member died was refused
+> `retry` for a second or more.** A home behind its sender held the put for its install, which needed the council's next
+> append on the very record session the put held, and the coordinator awaited its healer inline; and a home that died
+> stayed ranked past the push's 2 s homing budget. Now a behind home answers `Behind` at once and its sender asks again
+> after a council round, the coordinator's home passes run on their own lane, and a push's homing runs within a window
+> derived from detection, confirmation and the takeover's configuration steps, ranking its homes again at each install.
+> Red first (both `a912_` fleet tests). OWED (main): gate 17 (`v3_takeover`) and a lint diag.
+> **FIXED (A-913, w-shared, 2026-11-24; A-912's sibling): a branch created while a member died refused `unable to
+> commit` at its record barrier (3 of 25 runs).** The restarted holder held its source's records but no replica, and
+> the record path branched only from a replica already there; now it makes a missing source first, as a branch's
+> rebuild does (A-908 part 4). Red first (`merge_origin::tests::a913_...`, never acknowledged before), and A-912's
+> push test asserts no created branch is refused at its barrier. OWED (main): a gate and a lint diag; whether A-913
+> plays any part in the window below, main's interleaved batches.
+> **OPEN, w-shared's next piece (A-912's follow-up; main 01a20182's ruling of 2026-11-24): a push's homing window is
+> derived from typical terms, short under load.** With A-912's push test asserting every created branch lands, at a
+> load of about 48 on 18 cores it failed 5 of 10, then 1 of 3, then 0 of 6, each at its homing: "fell short: 1 of 2
+> homes kept it; budget 3247789232 ns", the other home the stopped member, still in the configuration. The window's
+> terms just before the stop (6 runs): detection 0.94 to 2.35 s and confirmation 1.14 to 1.17 s (A-363's typical
+> estimate), period about 105 ms, so 2.7 to 4.1 s; measured from a member's stop to its takeover proposed, 2.2 to 4.7
+> s. Load is the normal case here, so the budget is to be derived from the measured tail of a peer's silence to its
+> takeover install, learned from the detector's and the council's own timings on this deployment; past it, still the
+> typed `retry`. Red: that test asserting every created branch lands, at that load.
+> **OPEN, a piece (A-912's (3); main 01a20182's rulings of 2026-11-24): a council session of its own per peer.** The
+> council's replication shares a node's one record session per peer with every exchange, each borrower taking it whole.
+> A-912 removed the hold found (a home holding a put across the install the council's next append brings) and counts any
+> breach, `fleet.council.session_lent` (a voter's session on the same loan to another plane at two replication rounds in
+> a row). It moved after A-912: in A-912's push test at a load of about 48, 8 and 19 in 2 of 8 runs, "voter 877 held by
+> vcs_store.homes.exchange across rounds, liveness Alive", about 2 s, a put's answer held at a live voter (from reading
+> the code, its image publication behind A-727's `published` barrier: to be logged at its wait point before the piece).
+> The lane test, which pushes nothing during the death, asserts it 0; the piece's red takes back the push test's.
 > **FIXED (A-909, w-shared, 2026-11-24): a branch made on a repository's successor after its owner died was refused
 > `unable to commit`.** The successor's own hold refused the new green's records `StaleEpoch { current: 2 }`: its one
 > owner acceptor had been fenced at the takeover's epoch by the registers it adopted, so at two survivors nothing it
@@ -317,6 +347,26 @@
 > Red at the session: git_interop's whole session over SSH on a made history failed 3 of 3, every step held after.
 > Owed: a unit red at the edge (the single-shard edge tests reach no held answer); the SSH edge's wait for room
 > (A-855: an answer held for room is dropped the same way; the HTTP edge's `wait_for_room` has no SSH twin).
+> **PRECONDITION OF THE NEXT LIFT (w-git, 2026-11-25, main 01a20182's ruling): a holder's replica build reads a let-go
+> window as missing.** Found writing the red for main's ruling of 2026-11-24 (a write path's bring-back lets go at its
+> owner's end, a64f385b1). Scene (a three-node `f = 1` fleet, git repository on a): push `main`; push two new branches,
+> `first` and `second` (each holder's replica of each owing its push, P2); push a commit on top of `first` (each holder
+> builds its replica of `first`, making its store of the repository); let go every window b and c hold, each home told
+> first; push a commit on top of `second`. Both holders' replica builds refused `a holder's replica's owed push was
+> refused building: Object { path: "", id: …, why: Missing }`, and the push was refused `unable to commit`: the
+> holder's read answers Missing, never noting the window waited (`replica_build::turn`'s `Turned::Waiting` is never
+> reached), so nothing is brought back. Unreachable while `LANDED_LET_GO` is false: the only roots of a git window's
+> let-go are a commit's (`vcs_store::commit`) and a rebuild's or recovery's (`put_changeset`), both under it; the home's
+> let-go (`homes::landed_pack_here`) is reached only from their sliced let-go; every other let-go takes only windows a
+> read brought back (`vcs_share::read_backs`, the fetch's look-ahead, `read_through::BroughtBack`). So **the lift must
+> first make a holder's replica-store read note a let-go window as waiting and bring it back through its node store**,
+> red first with the scene above: `patches/w-git-replica-red.patch` on `agents/fanout-state` (the fleet test
+> `a_holders_replica_build_lets_go_the_windows_it_brought_back_once_it_is_made` and its `Daemon::let_go_vcs_windows` and
+> `vcs_windows_held` hooks), which then also proves the replica build's let-go of what it brought back. Every git
+> bring-back is dormant until the lift; the derivation's and green build's reds of that let-go
+> (`a_derivation_lets_go_the_windows_it_brought_back_once_it_ends`,
+> `a_green_build_lets_go_the_windows_it_brought_back_once_it_is_made`) let windows go by hand, standing in for the gated
+> roots, which the lift makes real paths.
 > **LIFTED AGAIN (w-git, 2026-11-23, main 01a20182's order after r165):** `vcs_store::LANDED_LET_GO` on, one switch for
 > a commit's let-go and a recovery's or rebuild's (w-shared's `put_changeset`): the commit owes its pack and the push's
 > end or the repository's idle give-back lets it go a slice a turn (3e1588a54, the quantum alone ending a slice), every
@@ -1530,6 +1580,49 @@
 > restart of `hg_push_restart` (red: `Unheld` at rev 4281; green: the tip served after the restart).
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
+> C1 (2), second piece BUILT (main's ruling (B') of 2026-11-24): a push's manifest is taken a window a step and never
+> whole. Its text is made by `delta::Patching` over its base read front to back over its chain (`push::chain_read`, the
+> chain's deltas loaded: at most the base's length, A-729's bound); its lines checked and its written entries found as it
+> streams (`manifest::Checking`, `delta::Written`). Its row is kept by one rule (`push::manifest_row`), which the live
+> intake, a pushed segment's replay (`import::record`'s `append_over_given`, w-perf's written go) and a stale fork's
+> re-base all apply, so their rows agree by construction: the client's delta where its base is the manifest the fork
+> holds last and the chain allows; else its diff against that last one, a merge of the two sorted texts as they stream
+> (`manifest_diff::Diffing`, as 7.2's manifest fastdelta; a run cut into hunks of a window); else whole (the fork's
+> first, or a chain past its bound, made again in a second pass that checks nothing twice). No manifest is kept whole
+> otherwise, so a merge or a snapshot costs a diff, never a whole text. Held by
+> `a_line_of_long_manifests_is_taken_within_the_window_bound` (12 manifests of several 4 KiB windows: red 43,329 bytes of
+> text held at once on main, now within 4 windows and 3 lines, 16,528), `a_merge_heavy_push_keeps_its_manifests_as_diffs_
+> and_replays_to_its_rows` (merges kept as diffs, the replay's rows the fork's), the proptest
+> `a_manifest_diffed_as_it_streams_makes_its_text` (Diffing over generated sorted manifests, every piece and window size:
+> applied over the base it makes the new text, as `encode_lines`' delta does), `a_manifest_chain_read_in_ranges_is_its_text`,
+> `a_manifest_read_as_it_streams_finds_what_its_whole_text_finds`, and the three row-equality tests (segment replay,
+> moved-base replay, stale re-base) and `a_push_of_many_whole_manifest_snapshots_keeps_one_copy_of_their_entries`.
+> I was wrong when I told main a streaming diff of two manifests needs lookahead: their lines are sorted by path.
+> Found and closed with it, a leak of mine from C1 (2)'s first piece (4885954fa): a landed base whose windows were let go
+> was brought back for one revision (a file's by `held::bring_back_file`; a manifest's text put as a temporary object,
+> which content addressing makes the landed row's own again) and nothing let it go after, so each incremental push left
+> its bases' bytes resident. A revision now lets go again what it brought back once it ends, kept or given back. Held by
+> `a_file_delta_base_before_the_last_text_is_read_from_the_forks_rows` (red: the base still held after its revision) and
+> P5's daemon-edge let-go test (red: 1 manifest object of 288 bytes held). Sibling sweep (CLAUDE.md, main's order):
+> reported to main the same day, every bring-back site with its let-go or none. main's order on w-hg's own write-path sites
+> (2026-11-24): (1) `hg_push::brought_back`, a push's work reading a let-go file revision, measured, not a leak: it is
+> brought back under `vcs_store::within_budget`, lent for its step (P5's daemon-edge test: 7 texts read back, 0 file
+> objects held after the pushes; kept as a guard); (2) `hg_named::bring_back_named`'s group refused partway left what it
+> had brought out of the recovery's and the re-adoption's let-go: `bring_back_on` now notes each object as it comes
+> back, before any later one can refuse the group (`a_named_group_refused_partway_lets_go_what_it_brought_back`: red,
+> nothing returned and the base held); (3) a replay refused at its finish drops its brought-back list, but its refusal
+> releases the repository's store whole (`vcs_store::replayed`'s `release_charged`), its rows' holds with it: no leak.
+> Owed: changesets a window at a time; a let-go base's or last manifest's store answer arrives whole for one step; the
+> base's identity hashed by a second read.
+> Found by main's round 2 at f8fe97e5e (the clone about 1.7x its load's slowing past stock's) and cut (2026-11-24): a
+> fetch made each let-go changelog and manifest text by its own request of the store's owner, a piece a request
+> (`hg_view::texts_made`: 28 requests for a 7-changeset clone's 14 texts; over 100,000 for hg's 57k). A want's texts are
+> now made by one request (`slates_store::owner::StoreHandle::texts`, `MadeTexts`), counted
+> `vcs_store.hg_text_requests`. Measured in-process (debug, 800 files on a line, 16 MB of texts): the clone's store wait
+> 987 ms to 53 ms, the clone 2.15 s to 1.17 s (a stream of the same bytes: 0.35 s). Held by P5's daemon-edge clone check
+> (red: 28 requests for 6 asks, now 2). Owed: the walk's own cost beside the store's (the clone still 3.3x the stream's
+> time for the same bytes), and the stream clone's 4.7x on main's round, unexplained at this scale (3 store asks a
+> stream whatever its logs).
 > Found by main's interop bench at ed71ac0be and closed (2026-11-24): after P5, `hg clone` of hg's 57k history ran past
 > 13.5 minutes (stock 7.2: 42.4 s; round 2 before P5: 10.1 s). A clone's changelog and manifest texts, let go once
 > landed, were asked of the changeset store one at a time, a row and then its text, and the store answered a row by
@@ -3381,11 +3474,26 @@
 > **A-724 piece 7 (A-849): the load proof's fetches** (`multi_repo_load.py --fetches`; harness daemons given a
 > `--vcs-store`, without which `repository create --tool git` failed since A-767 C5); hg and svn by their stock clients
 > (`multi_repo_stock.py`, main's 21:35 ruling (a)). Open: the rounds (main's).
-> **A-724 piece 4 (A-851): let go past the grant, built, no reader yet** (`ContentStore::let_go`/`bring_back`,
+> **A-724 piece 4 (A-851): let go past the grant, built** (`ContentStore::let_go`/`bring_back`,
 > `vcs_share::grants::let_go_past_grant`; tests `a_landed_window_is_let_go_and_brought_back_by_its_own_bytes`,
-> `t_a724_a_repositorys_coldest_windows_past_its_grant_are_let_go`). Open: git's and hg's read-through (w-git, w-hg:
-> red tests queued in their inboxes), landed marks and window lists from the tools; a restart's image no longer holding
-> a let-go window (recovery reads it back through the node's store, with the read-through).
+> `t_a724_a_repositorys_coldest_windows_past_its_grant_are_let_go`). Its reader WIRED (2026-11-25, w-perf; main
+> 01a20182's rulings (b) and (i'), from w-hg's sweep of the bring-back sites): what a read brings back is a cache the
+> division bounds (`vcs_share::read_backs`; §4.17.5's status). Each window attributed at the one bring-back step to the
+> repository whose store holds its object (`VcsStores::subversion_storing`, `VcsStores::git_holding_pack`: a scan of the
+> shard's git stores' packs, `O(repositories × packs)`, only on a bring-back; a home's landed note), let go past its
+> grant at each division (`grants::current_at`), coldest first, never a pinned window; one no store claims let go at
+> the division. A home's read is one task holding its object's windows from their bring-back to its read
+> (`homes::read_brought_back`, `named_objects::pin_windows`; red `a_homes_read_holds_its_windows_from_their_bring_back_
+> to_its_read`: `NotHeld` with the cold trigger forced between them, unpinned); a git reader brings a let-go window
+> back again. Counted `vcs_share.read_backs_attributed_{text,pack,hg}`, `_unattributed`,
+> `_let_go`, `_unattributed_let_go`, `_pinned_kept`, `_past_bound`. Held by
+> `what_a_read_brings_back_is_let_go_past_its_repositorys_grant` (red: 1,048,576 B of sixteen read-back texts resident
+> against a 196,608 B grant; the hot text kept, the cold let go), `a_pinned_read_back_is_never_let_go_however_cold`,
+> `a_read_back_no_store_claims_is_let_go_once_unpinned`, `a_homes_mercurial_window_is_attributed_to_its_revisions_
+> repository` (the hg clone's read-backs, w-interop's round 2 peak of 5,987 MiB in the hg leg) and
+> `a_packs_window_is_attributed_to_the_repository_whose_store_holds_it` (24 repositories, the scan's time printed).
+> Open: a pack-to-repository index, should the scan ever show beside the store read it follows; a restart's image no
+> longer holding a let-go window (recovery reads it back through the node's store, with the read-through).
 > **A-724 piece 6 DEFERRED (main 01a20182, 2026-11-21 21:35):** the fleet's placement of content by identity (amends
 > §4.10) waits until goal 93's servers are complete and correct; Ada asked for many repositories on a single server, and
 > the N=1 homes and the region rule exist (1729a9c5a, 58f756e0a, 9f57e4810).

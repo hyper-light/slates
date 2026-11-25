@@ -126,7 +126,7 @@ pub(crate) fn repository_of(state: &ShardState, green: VolumeId) -> Option<Repos
 }
 
 /// The changeset green `green` names at `version` (its root's head attribute then), if any.
-fn changeset_at(state: &ShardState, (green, version): (VolumeId, u64)) -> Option<Node> {
+pub(crate) fn changeset_at(state: &ShardState, (green, version): (VolumeId, u64)) -> Option<Node> {
   state
     .greens
     .get(&green)
@@ -199,17 +199,28 @@ pub(crate) async fn bring_back(
   let changeset = crate::state::with_state(|state| changeset_at(state, (green, version)))
     .flatten()
     .ok_or(HgNamedRefused::NoChangeset { green, version })?;
-  bring_back_on(&mut ThisShard, repository, changeset, wanted).await
+  // A read's bring-back stands while its pin holds (main's ruling of 2026-11-24 on read paths, pending w-perf's
+  // division): what it brought is not let go here.
+  bring_back_on(
+    &mut ThisShard,
+    repository,
+    changeset,
+    (wanted, &mut Vec::new()),
+  )
+  .await
 }
 
 /// Brings back every one of `wanted` (an object and the path it is the file at) that Mercurial repository `repository`
 /// let go, by the revision changeset `changeset` names for its path ([`resolve_at`]), over the shard's state as
-/// `lender` lends it a step at a time: this thread's, or a recovery's (`super::HeldShard`).
+/// `lender` lends it a step at a time: this thread's, or a recovery's (`super::HeldShard`). Each object it brought back
+/// noted in `brought` as it comes back, before any later one of the group can be refused, so its caller lets go what
+/// came back whether the group did or not (main's ruling of 2026-11-24: a write path's bring-back let go at its owner's
+/// end on every path; until then a group refused partway left what it had brought resident).
 pub(crate) async fn bring_back_on<L: ShardLender>(
   lender: &mut L,
   repository: RepositoryId,
   changeset: Node,
-  wanted: &[(Identity, String)],
+  (wanted, brought): (&[(Identity, String)], &mut Vec<[u8; 32]>),
 ) -> Result<(), HgNamedRefused> {
   let unlent = HgNamedRefused::NoStore { repository };
   let mut given: Vec<(Node, Vec<u8>)> = Vec::new();
@@ -249,10 +260,22 @@ pub(crate) async fn bring_back_on<L: ShardLender>(
       Resolution::Revisions(revisions) => revisions,
     };
     for (identity, path, node) in revisions {
-      let brought =
+      let back =
         crate::repository::hg_push::bring_back_on(lender, repository, (path.clone(), node)).await;
-      let why = match brought {
-        Ok(()) if lender.lend(|state| held_whole(state, identity)) == Some(true) => continue,
+      if back.is_ok() {
+        // Noted before it is checked whole: a part brought back is let go with it.
+        brought.push(identity.hash);
+      }
+      #[cfg(test)]
+      let refused_whole = NOT_WHOLE.with(|refuse| refuse.replace(false));
+      #[cfg(not(test))]
+      let refused_whole = false;
+      let why = match back {
+        Ok(())
+          if !refused_whole && lender.lend(|state| held_whole(state, identity)) == Some(true) =>
+        {
+          continue;
+        }
         Ok(()) => crate::repository::hg_push::BringBackRefused::NotWhole,
         Err(why) => why,
       };
@@ -266,6 +289,13 @@ pub(crate) async fn bring_back_on<L: ShardLender>(
   }
   // Every resolution either found the revisions or refused at the last, so none ends here.
   Err(unlent)
+}
+
+#[cfg(test)]
+thread_local! {
+  /// A test's group refused after its next revision came back, as a store that gave it back short would refuse it: the
+  /// partial group a recovery's let-go must still reach.
+  pub(crate) static NOT_WHOLE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 /// Whether the content store holds every window of `identity`'s object now.
@@ -298,13 +328,12 @@ pub(crate) async fn bring_back_named(
   let mut brought = Vec::new();
   for (changeset, wanted) in plan {
     let mut lender = super::HeldShard(&mut *state);
-    if bring_back_on(&mut lender, repository, changeset, &wanted)
+    if bring_back_on(&mut lender, repository, changeset, (&wanted, &mut brought))
       .await
       .is_ok()
     {
       let count = u64::try_from(wanted.len()).unwrap_or(u64::MAX);
       state.count(RECOVERY_BROUGHT_BACK, count);
-      brought.extend(wanted.iter().map(|(identity, _)| identity.hash));
     }
     slices.unit_done().await;
   }
@@ -323,13 +352,17 @@ pub(crate) async fn bring_back_named_live(green: VolumeId) -> Vec<[u8; 32]> {
   };
   let mut brought = Vec::new();
   for (changeset, wanted) in plan {
-    if bring_back_on(&mut ThisShard, repository, changeset, &wanted)
-      .await
-      .is_ok()
+    if bring_back_on(
+      &mut ThisShard,
+      repository,
+      changeset,
+      (&wanted, &mut brought),
+    )
+    .await
+    .is_ok()
     {
       let count = u64::try_from(wanted.len()).unwrap_or(u64::MAX);
       let _ = crate::state::with_state(|state| state.count(RECOVERY_BROUGHT_BACK, count));
-      brought.extend(wanted.iter().map(|(identity, _)| identity.hash));
     }
   }
   brought
