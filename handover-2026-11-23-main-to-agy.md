@@ -22,6 +22,35 @@ for tonight).
 Session pids change when kiln restarts a session. Find the current one with kiln `agents.get` → `state.starts[-1].runs.pid`.
 Pids at 04:59 on 11-24: w-git 93676, w-hg 38517, w-svn 92852 (restarted 04:54), w-perf 92158, w-shared 57324, w-interop 8242.
 
+Updates at 16:32 on 11-24:
+- Landed since 13:15, each on origin/main:
+  - w-hg ffad3c6ae (P5's two hg reds: 26d1b3846 and 9a6e470a8).
+  - w-svn 92516ced4 (the Linux E160004 fix: an edit's base text brought back on all three edges). The Linux svn
+    matrix (run 5, 45495209005) passed 33 of 33 on both routes; it was 26 of 33.
+  - Main 142e5f039 (TSan lane: the content-range sweep skipped in the server step, 3 h 26 min of 13,127 s; step 95 min).
+  - w-shared 9272195a6 (A-907's test flake, A-908 part 1).
+  - w-git 675fd5fa2 (the let-go test's flake).
+  - w-perf 15e739357 (every hg replay lets go what it brought back).
+  - w-shared 02bd0ec94 (A-908 steps 1-3: holder replicas by lineage, memberships from names-log parts). Gate 14
+    (45515243567) passed 40 of 40.
+  - w-svn 8c0d8fce8 (the svn crash test waits for the settled let-go under TSan).
+  - Main's lint fixes e8635a46b, 0daac6743, 41e00948e, 7193e4843. Lint diag 17 is green on Linux and Windows: the wall
+    is clean at 7193e4843.
+- In flight:
+  - w-shared: the successor's refusal of a new branch's push (a908_a_branch_is_made_on_a_repositorys_successor_after_its_owner_dies,
+    in GAPS), red first.
+  - w-hg: the landing-spin commit. The 452-head push lands in debug.
+  - w-perf: the 57k hg import's memory. Peak RSS is 1.03 GiB, was 5.73 GB; the per-shard rerun names the holder.
+  - w-svn: slicing 2a.
+  - w-git: waits on git leg 5. w-interop: waits on the big Studio.
+- Runs: TSan diag 2 (45517552633) at 8c0d8fce8 says whether the step fits 95 min and the crash test holds.
+- Blocked on runners only Ada can restart:
+  - The big Studio's runner (adas-mac-studio.local-2) has been offline since about 14:15. Waiting on it: git leg 5
+    (studio-git-leg-5.sh), the stock hg 7.2 rerun (studio-hg-interop-2.sh), the svn use round (studio-svn-use-5.sh) and
+    the 57k hg push and restart (studio-hg-restart-5.sh).
+  - adacachy2's runner is stuck (r954, r955, r990): the 84a Linux leg.
+  - Since 16:07 kiln's machines.list and runners time out; agents.list still answers.
+
 Updates at 13:15 on 11-24:
 - LANDED main's lint fixes, c890f5b6b: seven commits taking every site lint diags 1-7 found (lint diag 8 green on
   Linux and Windows; macOS clippy and the focused tests green on the Studio, r971). Lint diag 9 at main = 45488444050
