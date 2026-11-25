@@ -1620,6 +1620,30 @@
 > releases the repository's store whole (`vcs_store::replayed`'s `release_charged`), its rows' holds with it: no leak.
 > Owed: changesets a window at a time; a let-go base's or last manifest's store answer arrives whole for one step; the
 > base's identity hashed by a second read.
+> Found by main's push loop at 2ed3eb139 and closed (2026-11-24; main's ruling, w-perf's design, w-hg's build): hg's 57k
+> push refused `UnknownDeltaBase` on `i18n/da.po` (2 of 8 pushes; revs 103-106, one chain of a 260 KB text with small
+> deltas). A landed segment's let-go (`let_go_object_landed`, whatever its holders) took a window a later revision of the
+> same push still named, kept and not landed (an unchanged run of the file); the next delta on it found its base's window
+> away and asked the store, which keeps no row of an unlanded revision. The windowed intake (C1 (2)) exposed it, reading
+> a base's windows where it once held the base whole. Now one rule at the one let-go every path uses (main's ruling (B)):
+> the content store keeps beside each window how many unlanded objects name it, and no let-go takes a window while any
+> does (`ContentStore::pin_unlanded`/`unpin_unlanded`, refused `LetGoRefused::Unlanded`, counted
+> `vcs_store.content.kept_unlanded`; the count's width refused typed, `ContentRefused::CountExhausted`, never wrapped; a
+> pin of nothing refused `NotHeld`; a window found let go as it is pinned counted `vcs_store.content.pinned_away`, a bug
+> signal that must stay 0; an unpin comes before its holder releases the object). A
+> push pins each revision as its intake keeps it (`slates_hg::push::pins::Counted` over `Intake::kept_contents`, after
+> each slice), unpins a segment's own just before that segment's let-go (`landed_segment`; never at its taking, since its
+> record is written over turns before it lands), and the rest however the push ends (`Taking`'s drop). `landed_pin` asks
+> the reader's pin before a home's landed note (the note first let a read-pinned window go mid-read). Held by
+> `a_window_an_unlanded_object_names_is_never_let_go_until_it_is_unpinned` (the store's rule) and
+> `a_landed_segments_let_go_never_takes_a_window_a_kept_revision_shares` (without the pins: refused `UnknownDeltaBase`
+> for the kept revision, main's failure; with them: taken, `kept_unlanded` moved, `pinned_away` 0, nothing left pinned)
+> and `a_pin_that_finds_a_window_let_go_counts_it_and_a_pin_of_nothing_is_refused`. Sibling sweep:
+> git's push and hg's import not of this shape; svn's import batches were (fixed in d3539309d, to move onto the store's
+> pins). A made changeset's (`hg_made`, and the tests' `take_whole`) texts are unpinned at their intake's finish, before
+> the `disk.land` it awaits: nothing reads them between (its intake and record are made in one step), and once landed a
+> window let go meanwhile comes back from the store; a reader before the landing would need the pins kept to its let-go.
+> Owed: main's push loop re-run.
 > Found by main's round 2 at f8fe97e5e (the clone about 1.7x its load's slowing past stock's) and cut (2026-11-24): a
 > fetch made each let-go changelog and manifest text by its own request of the store's owner, a piece a request
 > (`hg_view::texts_made`: 28 requests for a 7-changeset clone's 14 texts; over 100,000 for hg's 57k). A want's texts are
@@ -1629,6 +1653,17 @@
 > (red: 28 requests for 6 asks, now 2). Owed: the walk's own cost beside the store's (the clone still 3.3x the stream's
 > time for the same bytes), and the stream clone's 4.7x on main's round, unexplained at this scale (3 store asks a
 > stream whatever its logs).
+> Found by main's round at 15b4f1061 and cut (2026-11-25, w-perf): with that request hg's 57k clone peaked at 10,416
+> MiB and held 10,013 MiB after it (2ed3eb139: 5.7-6.0 GB), 165.8 s; the status after it named 4,792 mapped blocks of
+> about a chunk each still live (5.07 GB mapped, 4.09 GB resident). The owner read each text of the batch once at its
+> start and took it whole, so the text cache took a text longer than a piece (a manifest, 100-250 KB) for a walk's first
+> piece and kept it in flight, its bound grown by the text, up to the owner's room for waiting reads (`clients_per_shard`
+> x shards) and never back. `slates_store::Store::text_whole` reads a text whole as its walk's end, and the owner's batch
+> reads through it (`a_text_read_whole_leaves_no_walk_in_flight`: red, the bound 6,291,456 bytes for 24 texts of 197,608
+> read whole against one chunk and a text, 1,246,184; now 1,048,576). Owed: the batch itself, sized by the fetch's room
+> (`LogTexts::ask_batch`, gigabytes at 57k) and copied text by text on the owner: the status's other 5.25 GB is the
+> system allocator's, reserved and not in use (5.41 GB reserved, 157 MB in use), and an in-process clone of 2,000
+> changesets peaked at 111.6 MB of live heap, 83% the batch's copies (`crates/server/tests/hg_fetch_heap.rs`).
 > Found by main's interop bench at ed71ac0be and closed (2026-11-24): after P5, `hg clone` of hg's 57k history ran past
 > 13.5 minutes (stock 7.2: 42.4 s; round 2 before P5: 10.1 s). A clone's changelog and manifest texts, let go once
 > landed, were asked of the changeset store one at a time, a row and then its text, and the store answered a row by
