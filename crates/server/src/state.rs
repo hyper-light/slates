@@ -305,6 +305,11 @@ pub struct ShardState {
   /// The content arena's allocation count at the last sweep pass: unchanged at the next means the shard allocated
   /// nothing in between, so its free blocks can go back to the OS (A-105, `daemon::purge_if_idle`).
   pub(crate) purge_seen_allocations: u64,
+  /// The resident free bytes the content arena's last give-back past a bound held it to (goal 93 P7: a Subversion
+  /// import's batch bound, `repository::svn_commit::staging::give_back_past`), so a publication that releases deferred
+  /// frees gives back past it too (`staging::give_back_released`); `None` until such a give-back, and again once an idle
+  /// purge settles, which gives back every free page.
+  pub(crate) give_back_keep: Option<usize>,
   /// The sweep of the shard's slice of the anchor content object that the status report advances (A-744,
   /// `crate::content_ranges`).
   pub(crate) content_sweep: crate::content_ranges::Sweep,

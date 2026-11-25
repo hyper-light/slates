@@ -283,6 +283,7 @@ async fn until_done(mut step: impl FnMut(&mut ShardState) -> bool) -> Option<()>
 /// One step of a batch's give-back: the content arena's resident free pages past `keep` bytes given back, an idle
 /// purge's slice of blocks (`daemon::purge_slice_blocks`), counted. Whether more is left past `keep`.
 fn give_back_past(state: &mut ShardState, keep: usize) -> bool {
+  state.give_back_keep = Some(keep);
   let slice = crate::daemon::purge_slice_blocks(state);
   let purged = state.store.content.arena_mut().purge_past(keep, slice);
   state.count(
@@ -294,6 +295,28 @@ fn give_back_past(state: &mut ShardState, keep: usize) -> bool {
     u64::try_from(purged.kept_short).unwrap_or(u64::MAX),
   );
   purged.more && state.store.content.arena().resident_free_bytes() > keep
+}
+
+/// A publication's give-back of the `released` bytes of deferred frees it released (A-64) past the keep the arena's last
+/// give-back held (`ShardState::give_back_keep`; goal 93 P7, main's ruling of 2026-11-25). An import's batch tail holds
+/// the arena's resident free pages to its bound, but its let-go texts are deferred while a published image names them,
+/// and the publication that releases them came after the tail: round 1's settled reading held 103.7 MB resident and
+/// free over a bound of 91.9 until the next tail or an idle pass. Run in the same step as the release, slices of an idle
+/// purge's walk ([`give_back_past`]), as many as the released bytes span and one more, so the work is bounded by what
+/// the release itself scrubbed. Nothing with no keep held.
+pub(crate) fn give_back_released(state: &mut ShardState, released: usize) {
+  let Some(keep) = state.give_back_keep else {
+    return;
+  };
+  let slice_bytes = crate::daemon::purge_slice_blocks(state)
+    .saturating_mul(state.config.discard_from_bytes)
+    .max(1);
+  let slices = released.div_ceil(slice_bytes).saturating_add(1);
+  for _ in 0..slices {
+    if !give_back_past(state, keep) {
+      break;
+    }
+  }
 }
 
 /// A stage of a batch's landing ([`Staging::land`]) a test may kill it at ([`KILL_AT_STAGE`]).
