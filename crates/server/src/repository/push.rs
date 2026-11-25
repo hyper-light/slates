@@ -502,18 +502,26 @@ pub(crate) struct RecordedBatch {
   staged: std::collections::VecDeque<crate::import_batch::Staged>,
   /// The versions applied.
   made: Vec<u64>,
-  /// The version being applied a slice at a time (`slates_merge::engine::Applying`): its staged work, its version and its
-  /// run, carried from one slice to the next until it ends.
-  applying: Option<(
+  /// The version being applied a slice at a time, its named texts read, then its run ([`InVersion`]), carried from one
+  /// slice to the next until it ends.
+  applying: Option<InVersion>,
+}
+
+/// The version a recorded batch is applying, carried from one slice to the next ([`RecordedBatch::apply_slice`]).
+enum InVersion {
+  /// Its named texts being read again from the content store a copy slice a step (`svn_commit::read_named_slice`).
+  Reading(crate::import_batch::Staged, u64),
+  /// Its run under way (`slates_merge::engine::Applying`).
+  Running(
     crate::import_batch::Staged,
     u64,
     Box<slates_merge::engine::Applying>,
-  )>,
+  ),
 }
 
 impl RecordedBatch {
   /// Applies the next versions until the shard's step budget is spent from now, each as its entry records it
-  /// (`Green::apply_recorded`'s run, what a recovery replays, taken a few units at a time, [`APPLY_UNITS`]: goal 93 piece
+  /// (`Green::apply_recorded`'s run, what a recovery replays, taken a unit at a time until the slice's budget is spent: goal 93 piece
   /// 3, a version of 9,000 files was one apply of 120 ms on a debug build), with its merge record enqueued; counted. A
   /// version's run goes on at the next slice where the budget ends inside it: nothing may read the green until the
   /// batch's last version ends (the run's contract, `Green::begin_applying`), as nothing does while an import lands. The
@@ -530,49 +538,68 @@ impl RecordedBatch {
     let most = usize::MAX;
     state.count(BATCH_APPLY_SLICES, 1);
     let mut taken = 0usize;
+    let spent = || slates_rt::futures::now_ns() >= deadline;
     while taken < most {
-      if self.applying.is_none() {
-        let Some(step) = self.staged.pop_front() else {
-          break;
-        };
-        let version = self.first;
-        self.first = version.saturating_add(1);
-        self.begin_version(state, (step, version));
-        if self.applying.is_none() {
-          taken = taken.saturating_add(1);
-          if slates_rt::futures::now_ns() >= deadline {
-            break;
-          }
-          continue;
-        }
-      }
-      let Some((step, _, run)) = self.applying.as_mut() else {
-        continue;
-      };
-      let stepped = state
-        .greens
-        .get_mut(&self.green)
-        .map(|mut engine| engine.apply_step(run, &mut step.increment, &step.applied, APPLY_UNITS));
-      state.count(BATCH_APPLY_STEPS, 1);
-      match stepped {
-        Some(slates_merge::engine::ApplyStep::More) => {}
-        Some(
-          slates_merge::engine::ApplyStep::Done(answered)
-          | slates_merge::engine::ApplyStep::Answered(answered),
-        ) => {
-          if let Some((step, version, _)) = self.applying.take() {
-            self.version_ended(state, (step, version), Some(answered));
-          }
-          taken = taken.saturating_add(1);
-        }
+      let ended = match self.applying.take() {
         None => {
-          if let Some((step, version, _)) = self.applying.take() {
-            self.version_ended(state, (step, version), None);
-          }
-          taken = taken.saturating_add(1);
+          let Some(step) = self.staged.pop_front() else {
+            break;
+          };
+          let version = self.first;
+          self.first = version.saturating_add(1);
+          self.applying = Some(InVersion::Reading(step, version));
+          false
         }
+        Some(InVersion::Reading(mut step, version)) => {
+          let mut read = Ok(false);
+          while read == Ok(false) {
+            read = crate::repository::svn_commit::read_named_slice(state, &mut step.increment);
+            if spent() {
+              break;
+            }
+          }
+          match read {
+            Ok(true) => self.begin_version(state, (step, version)),
+            Ok(false) => {
+              self.applying = Some(InVersion::Reading(step, version));
+              false
+            }
+            Err(_) => {
+              self.version_ended(state, (step, version), None);
+              true
+            }
+          }
+        }
+        Some(InVersion::Running(mut step, version, mut run)) => {
+          let stepped = state.greens.get_mut(&self.green).map(|mut engine| {
+            engine.apply_step(&mut run, &mut step.increment, &step.applied, &mut || {
+              spent()
+            })
+          });
+          state.count(BATCH_APPLY_STEPS, 1);
+          match stepped {
+            Some(slates_merge::engine::ApplyStep::More) => {
+              self.applying = Some(InVersion::Running(step, version, run));
+              false
+            }
+            Some(
+              slates_merge::engine::ApplyStep::Done(answered)
+              | slates_merge::engine::ApplyStep::Answered(answered),
+            ) => {
+              self.version_ended(state, (step, version), Some(answered));
+              true
+            }
+            None => {
+              self.version_ended(state, (step, version), None);
+              true
+            }
+          }
+        }
+      };
+      if ended {
+        taken = taken.saturating_add(1);
       }
-      if slates_rt::futures::now_ns() >= deadline {
+      if spent() {
         break;
       }
     }
@@ -584,23 +611,21 @@ impl RecordedBatch {
     Some(std::mem::take(&mut self.made))
   }
 
-  /// Begins applying `step` as `version`: its named texts read again from the content store, which holds them until the
-  /// batch's landing ends (`svn_commit::staging`), those its apply reads that the green holds by name alone lent it
-  /// (A-760 (b) 4d), then its run begun (`Green::begin_applying`). A version answered at once, or one whose texts cannot
-  /// be read or lent, ends here ([`RecordedBatch::version_ended`]); a begun one is carried in `applying`.
+  /// Begins applying `step` as `version`, its named texts read ([`InVersion::Reading`]): those its apply reads that the
+  /// green holds by name alone lent it (A-760 (b) 4d), then its run begun (`Green::begin_applying`) and carried in
+  /// `applying`. A version answered at once, or one whose texts cannot be lent, ends here
+  /// ([`RecordedBatch::version_ended`]): whether it did.
   fn begin_version(
     &mut self,
     state: &mut ShardState,
     (mut step, version): (crate::import_batch::Staged, u64),
-  ) {
-    let read = crate::repository::svn_commit::read_named(state, &mut step.increment).is_ok();
-    let lent = read
-      && crate::vcs_store::name_holds::lend_recorded(
-        state,
-        self.green,
-        (&step.increment, &step.applied),
-      )
-      .is_some();
+  ) -> bool {
+    let lent = crate::vcs_store::name_holds::lend_recorded(
+      state,
+      self.green,
+      (&step.increment, &step.applied),
+    )
+    .is_some();
     let begun = lent
       .then(|| {
         state
@@ -611,12 +636,17 @@ impl RecordedBatch {
       .flatten();
     match begun {
       Some(slates_merge::engine::Begun::Applying(run)) => {
-        self.applying = Some((step, version, run))
+        self.applying = Some(InVersion::Running(step, version, run));
+        false
       }
       Some(slates_merge::engine::Begun::Answered(answered)) => {
         self.version_ended(state, (step, version), Some(answered));
+        true
       }
-      None => self.version_ended(state, (step, version), None),
+      None => {
+        self.version_ended(state, (step, version), None);
+        true
+      }
     }
   }
 
@@ -650,13 +680,8 @@ impl RecordedBatch {
   }
 }
 
-/// Shape: the units of a version's run one call takes before the slice reads the shard's clock again
-/// ([`RecordedBatch::apply_slice`]): each an effect made, applied, a file removed or set, microseconds each, so a call of
-/// this many is well within a slice of the step budget and the clock is read a fraction of a unit's times.
-const APPLY_UNITS: usize = 64;
-
-/// Counter: a call of a recorded batch's version's run ([`RecordedBatch::apply_slice`], [`APPLY_UNITS`] units each):
-/// more than one a version shows its apply was taken a few units at a time. Format: a counter name in the daemon's
+/// Counter: a call of a recorded batch's version's run ([`RecordedBatch::apply_slice`], units until the slice's budget
+/// is spent): more than one a version shows its apply went on across slices. Format: a counter name in the daemon's
 /// status report.
 pub(crate) const BATCH_APPLY_STEPS: &str = "repository.import_batch.apply_steps";
 

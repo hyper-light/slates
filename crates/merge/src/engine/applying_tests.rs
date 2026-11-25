@@ -21,7 +21,8 @@ fn applied_a_unit_a_step(
       let mut steps = 0u64;
       loop {
         steps += 1;
-        match green.apply_step(&mut run, &mut inc, applied, 1) {
+        // Spent after every unit: one unit a step.
+        match green.apply_step(&mut run, &mut inc, applied, &mut || true) {
           ApplyStep::More => {}
           ApplyStep::Done(version) | ApplyStep::Answered(version) => return (version, steps),
         }
