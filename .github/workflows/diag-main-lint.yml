@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 20 (main 01a20182, 2026-11-24 18:09 PST): run 19 found staging.rs stage_deferred at 11 (30195b30e) and hg_push.rs land_in at 11
+# (main's ab8b230c8); main's commit splits the bring-backs and drops the branch. Main at 0d05da26e (A-909, spin_kick, import cut).
 # Run 19 (main 01a20182, 2026-11-24 17:24 PST): run 18 found hg_push.rs landed_after_builds at 11 and Landing::Unbuilt's
 # field unread (fda5613a1); main's commit splits the try and gives the fork back. Main at ed71ac0be (w-svn 2a, w-git counters).
 # Run 18 (main 01a20182, 2026-11-24 16:55 PST): main at 142172e1f, w-hg's landing-spin fda5613a1 (hg creates a slice at a time
