@@ -1595,6 +1595,16 @@
 > restart of `hg_push_restart` (red: `Unheld` at rev 4281; green: the tip served after the restart).
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
+> Found by w-interop's matrix at 29221d5ab and fixed (2026-11-25): stock 7.2.4's merge-push and rebase-push were refused
+> `UnknownDeltaBase { log: Manifests }` on the manifest of a changeset the same push carried before the merge. That
+> manifest was kept as a client's delta on the repository's tip manifest, itself a delta landed and let go, so its chain
+> was not at hand, and the intake asked the store for it, which keeps no row of a revision the push has not landed (since
+> this piece's windowed intake; before it the last manifest was held whole). Now the topmost link let go is asked
+> (`chain_read::Chain::let_go_link`) and the chain above it read over its given text from the fork
+> (`Chain::over`). Held by `a_pushs_manifest_reads_one_the_same_push_kept_over_a_let_go_chain` (a repository whose tip
+> manifest was pushed as a delta, let go; two more pushed in one changegroup, each manifest a client's delta, asks
+> answered from the store alone: red, refused on the first's manifest itself; now both taken). File revisions are not of
+> this shape: a file row holds its whole text, and one this push kept is pinned unlanded.
 > C1 (2), second piece BUILT (main's ruling (B') of 2026-11-24): a push's manifest is taken a window a step and never
 > whole. Its text is made by `delta::Patching` over its base read front to back over its chain (`push::chain_read`, the
 > chain's deltas loaded: at most the base's length, A-729's bound); its lines checked and its written entries found as it
