@@ -1141,6 +1141,60 @@ fn t_a864_a_fetchs_look_ahead_brings_back_a_turns_windows_never_its_pack() {
 /// `vcs_store::let_go_read` and let go again, counted (no home pins a window its shard does not hold for the region:
 /// main 01a20182's ruling of 2026-11-22 21:15), the resident set empty; the most held at once
 /// (`git_resident.peak_windows`) two.
+/// A-864 piece 3's bound held across turns (main 01a20182, 2026-11-25: TSan diag 8 held four windows at once, "(4, 4, 4)
+/// of 49", against a turn's look-ahead and the window it stopped at, three). Do: on a store-backed daemon, let a
+/// four-window pack go as the look-ahead test does; look ahead for a turn reading from the first byte (windows 0 and 1
+/// brought back); then look ahead for the next turn, which read through both and stopped at window 2. Expect: the most
+/// windows held at once (`git_resident.peak_windows`) no more than three, the two the cursor passed let go before the
+/// next turn's are brought back; and windows 2 and 3 held after. Red before: the look-ahead brought 2 and 3 while 0 and
+/// 1 were still held, four at once, and let 0 and 1 go only after.
+#[test]
+fn a864_a_turns_look_ahead_lets_go_what_its_cursor_passed_before_it_brings_back_more() {
+  use slates_git::store::packed::Waited;
+  use slates_vcs::ContentId;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (sent, got) = std::sync::mpsc::channel();
+  let (window, bytes, len, root) = landed_pack(&daemon, "behind-first");
+  crate::daemon::observe_first(&daemon, move |state| {
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().unwrap();
+      for id in bytes.chunks(window).map(ContentId::of) {
+        assert!(content.mark_landed(&id) && content.let_go(&id).is_ok());
+      }
+    });
+    let step = u64::try_from(window).unwrap();
+    let task = slates_rt::futures::spawn(async move {
+      let at = |offset| Waited {
+        pack: root,
+        len,
+        offset,
+      };
+      let mut resident = Vec::new();
+      let first = crate::vcs_http::git::upload::PackReads {
+        next: Some(at(0)),
+        stopped: None,
+      };
+      super::read_ahead(first, &mut resident).await;
+      let second = crate::vcs_http::git::upload::PackReads {
+        next: Some(at(2 * step)),
+        stopped: Some(at(2 * step)),
+      };
+      super::read_ahead(second, &mut resident).await;
+      let peak = crate::state::with_state(|state| state.refusals.get(super::PEAK_WINDOWS).copied());
+      let _ = sent.send((peak.flatten(), resident.len()));
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let (peak, held) = got.recv().expect("looked ahead twice");
+  daemon.stop();
+  assert!(
+    peak.is_some_and(|peak| peak <= 3),
+    "at most a turn's windows held at once: {peak:?}"
+  );
+  assert_eq!(held, 2, "windows 2 and 3 held after");
+}
+
 #[test]
 fn t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed() {
   use slates_git::store::packed::Waited;

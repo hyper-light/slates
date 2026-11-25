@@ -213,13 +213,19 @@ pub(crate) const AHEAD_BROUGHT: &str = "vcs_store.git_resident.ahead_brought";
 pub(crate) const STOPPED_BROUGHT: &str = "vcs_store.git_resident.stopped_brought";
 
 /// A fetch's look-ahead (A-864 piece 2; main 01a20182's ruling of 2026-11-22): before its next turn, off the turn, the
-/// let-go window its last turn stopped at, and those of the [`LOOK_AHEAD_WINDOWS`] its next turn reads first, brought
-/// back from the node's store; the turn then reads on without meeting one, and one reading past them stops cleanly at a
+/// windows its cursor has passed let go ([`let_go_behind`]), then the let-go window its last turn stopped at, and those
+/// of the [`LOOK_AHEAD_WINDOWS`] its next turn reads first, brought back from the node's store; the turn then reads on without meeting one, and one reading past them stops cleanly at a
 /// unit's boundary, nothing of it written (`slates_git::store::Upload::waiting`).
 pub(crate) async fn read_ahead(
   reads: crate::vcs_http::git::upload::PackReads,
   resident: &mut crate::vcs_http::git::upload::Resident,
 ) {
+  // What the cursor has passed is let go first, so the windows brought back for this turn never sit beside those of the
+  // last (main 01a20182, 2026-11-25: TSan diag 8 held four, the last turn's two and this one's two, against a turn's
+  // look-ahead and the window it stopped at).
+  if reads.next.is_some() {
+    let _ = crate::state::with_state_counted(|state| let_go_behind(state, resident, reads.next));
+  }
   // The window a read stopped at is pinned to the object under way (`Brought::pinned`): its read may need it wherever
   // it lies.
   if let Some(stopped) = reads.stopped

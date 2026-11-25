@@ -14,7 +14,8 @@
 //! and the text; none for an empty text). Its entry holds the chunk's offset among the chunks, the revision's flags,
 //! the chunk's and the text's lengths, the base, the link (a changeset's own number), the parents' numbers (-1 for
 //! none) and the node, all big-endian, the first four bytes the header (version 1 with the generaldelta flag, and the
-//! inline flag where inline). The file logs are named by the dotencode encoding ([`crate::store::encode_path`]) and
+//! inline flag where inline; the changelog's with neither, as 7.2 writes a new one, each delta in it against the revision
+//! before and its entry's base its chain's start). The file logs are named by the dotencode encoding ([`crate::store::encode_path`]) and
 //! listed in `store/fncache`, each file it has, as 7.2's opener lists every data file it writes. `store/phaseroots` holds each phase root (`<phase> <node>`), `.hg/bookmarks` each bookmark (`<node>
 //! <name>`), and `store/obsstore` the markers after their format's version byte, when there are any.
 //!
@@ -58,6 +59,10 @@ const HEADER: [u8; 4] = [0, 2, 0, 1];
 /// Format: the index header of an inline log: [`HEADER`] with the inline flag (`FLAG_INLINE_DATA`, bit 16), its chunks
 /// inside the index file. Module docs, "The shape".
 const INLINE_HEADER: [u8; 4] = [0, 3, 0, 1];
+/// Format: the changelog's index header: revlog version 1 with no flag, as 7.2 writes a new changelog (`changelog.py`
+/// clears `FLAG_GENERALDELTA`, "changelogs don't benefit from generaldelta"; never inline, `may_inline=False`). Without
+/// generaldelta a delta is against the revision before, and an entry's base names its delta chain's start.
+const CHANGELOG_HEADER: [u8; 4] = [0, 0, 0, 1];
 /// Format: a version 1 index entry's bytes: the node's field is 32 bytes, its last 12 zero.
 const ENTRY_BYTES: usize = 64;
 /// Format: the node field's padding after the node.
@@ -259,9 +264,7 @@ fn revlog(
     entry.write(&mut entries)?;
   }
   let inline = revlog_chunk::inline(may_inline(log), to_u64(data.len()));
-  if let Some(header) = entries.get_mut(..HEADER.len()) {
-    header.copy_from_slice(if inline { &INLINE_HEADER } else { &HEADER });
-  }
+  put_header(&mut entries, 0, header_of(log, inline));
   if !inline {
     return Ok((entries, Some(data)));
   }
@@ -543,6 +546,8 @@ pub struct Streaming {
   sized: VecDeque<SizedLog>,
   /// The chunk lengths of the log the count is sizing, so far.
   sizing: Vec<u32>,
+  /// The base the last entry written names: for the changelog, its delta chain's start ([`CHANGELOG_HEADER`]).
+  chain_base: u32,
 }
 
 /// A log the count pass sized, for the send pass: each revision's stored chunk length, their sum, and whether the log is
@@ -620,6 +625,7 @@ impl Default for Streaming {
       framing: Framing::V1,
       sized: VecDeque::new(),
       sizing: Vec::new(),
+      chain_base: 0,
     }
   }
 }
@@ -818,6 +824,10 @@ impl Streaming {
         .push(u32::try_from(length).map_err(|_| Refused::TooLong)?);
       return Ok(Stage::Counting(log, rev.saturating_add(1)));
     }
+    if log == Walked::Changelog && !self.held.front().is_some_and(changelog_servable) {
+      self.not_served = true;
+      return Ok(Stage::Head);
+    }
     let chunks = core::mem::take(&mut self.sizing);
     let data = chunks
       .iter()
@@ -965,8 +975,9 @@ impl Streaming {
     let at = out.len();
     entry.write(out)?;
     if rev == 0 {
-      put_header(out, at, inline);
+      put_header(out, at, header_of(log.log(), inline));
     }
+    self.chain_base = entry.base;
     if let Some(plain) = plain
       && revlog_chunk::chunk(&plain, Pass::Send, out)? != length
     {
@@ -1035,12 +1046,20 @@ impl Streaming {
     let based = row.base.is_some();
     let base = match row.base {
       None => rev,
-      Some(base) => stored
-        .first
-        .get(&base)
-        .copied()
-        .filter(|base| *base < rev)
-        .ok_or_else(unreadable)?,
+      Some(base) => {
+        let base = stored
+          .first
+          .get(&base)
+          .copied()
+          .filter(|base| *base < rev)
+          .ok_or_else(unreadable)?;
+        match log.log() {
+          // No generaldelta ([`CHANGELOG_HEADER`]): against the revision before, its entry naming the chain's start.
+          Log::Changelog if Some(base) == rev.checked_sub(1) => self.chain_base,
+          Log::Changelog => return Err(unreadable()),
+          _ => base,
+        }
+      }
     };
     let (parents, link) = numbers(index, store, log.log(), rev).ok_or_else(unreadable)?;
     let (node, flags, text) = match log.log() {
@@ -1106,11 +1125,33 @@ impl Streaming {
   }
 }
 
-/// Writes a log's header over the first four bytes of its first entry, written at `at`: inline or split.
-fn put_header(out: &mut [u8], at: usize, inline: bool) {
-  if let Some(header) = out.get_mut(at..at.saturating_add(HEADER.len())) {
-    header.copy_from_slice(if inline { &INLINE_HEADER } else { &HEADER });
+/// The header 7.2 writes for `log`: the changelog's without generaldelta, an inline log's, or a split one's.
+fn header_of(log: Log<'_>, inline: bool) -> &'static [u8; 4] {
+  if log == Log::Changelog {
+    &CHANGELOG_HEADER
+  } else if inline {
+    &INLINE_HEADER
+  } else {
+    &HEADER
   }
+}
+
+/// Writes `header` over the first four bytes of a log's first entry, written at `at`.
+fn put_header(out: &mut [u8], at: usize, header: &[u8; 4]) {
+  if let Some(over) = out.get_mut(at..at.saturating_add(header.len())) {
+    over.copy_from_slice(header);
+  }
+}
+
+/// Whether the changelog's stored rows can be sent without generaldelta ([`CHANGELOG_HEADER`]): each delta against
+/// the revision before it. Stock 7.2 sends its changelog whole, so a push's rows are; a store holding one delta
+/// against another revision serves no stream, and the client clones.
+fn changelog_servable(stored: &StoredLog) -> bool {
+  (0_u32..).zip(&stored.revisions).all(|(rev, row)| {
+    row
+      .base
+      .is_none_or(|base| stored.first.get(&base).copied() == rev.checked_sub(1))
+  })
 }
 
 /// A revision's node in `log`.
