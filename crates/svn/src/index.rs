@@ -1014,21 +1014,113 @@ impl Index {
   /// was appended since the plan was made ([`IndexRefusal::OutOfDate`]): the plan numbers its rows and paths after the
   /// index as it was then.
   pub fn commit_planned(&mut self, planned: Planned) -> Result<Revision, IndexRefusal> {
-    let next = self.youngest.checked_add(1).ok_or(IndexRefusal::Corrupt)?;
-    if planned.revision != next {
-      return Err(IndexRefusal::OutOfDate {
-        planned: planned.revision,
-        next,
-      });
+    let mut committing = self.commit_begin(planned)?;
+    loop {
+      if let Some(revision) = self.commit_step(&mut committing, &mut || false)? {
+        return Ok(revision);
+      }
     }
+  }
+
+  /// [`Index::commit_planned`] begun (A-920 piece 5b): refused with nothing changed where a revision was appended since
+  /// the plan was made; its paths and their events then added by [`Index::commit_step`] a slice at a time.
+  ///
+  /// # Errors
+  /// [`IndexRefusal::OutOfDate`] where a revision was appended since the plan was made.
+  pub fn commit_begin(&self, planned: Planned) -> Result<Committing, IndexRefusal> {
+    self.next_is(planned.revision)?;
     let Planned {
       revision,
       plan,
       transaction,
       changes,
     } = planned;
-    self.commit(revision, plan, transaction, changes);
-    Ok(revision)
+    Ok(Committing {
+      revision,
+      paths: plan.paths.into_iter(),
+      rows: Some((plan.rows, plan.maps)),
+      events: plan.events.into_iter(),
+      deletions: plan.deletions,
+      map_bytes: plan.map_bytes,
+      entry: Some(RevisionEntry {
+        transaction: Some(transaction.into_boxed_str()),
+        changes,
+      }),
+    })
+  }
+
+  /// One step of `committing` ([`Index::commit_begin`]), a unit at least, until `spent`: its new paths named, a path a
+  /// unit; its node-revisions and maps added; its events recorded at its paths, an event a unit; then, in its last
+  /// step, the revision itself, which no read reached before. Until then the index reads as it did before the commit
+  /// began: what a step adds is reached only through the revision, and every read is at or below the youngest. The
+  /// revision once committed; none while more remains.
+  ///
+  /// # Errors
+  /// [`IndexRefusal::OutOfDate`] where a revision was appended since the commit began.
+  pub fn commit_step(
+    &mut self,
+    committing: &mut Committing,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<Option<Revision>, IndexRefusal> {
+    self.next_is(committing.revision)?;
+    loop {
+      if !self.commit_unit(committing) {
+        return Ok(Some(self.commit_end(committing)));
+      }
+      if spent() {
+        return Ok(None);
+      }
+    }
+  }
+
+  /// The next unit of `committing`: a path named, its node-revisions and maps added, or an event recorded. Whether one
+  /// was left to take.
+  fn commit_unit(&mut self, committing: &mut Committing) -> bool {
+    if let Some(path) = committing.paths.next() {
+      self.numbers.insert(path.clone(), self.paths.len());
+      self.paths.push(PathEntry {
+        path,
+        history: Vec::new(),
+        shapes: Vec::new(),
+      });
+      return true;
+    }
+    if let Some((rows, maps)) = committing.rows.take() {
+      self.rows.extend(rows);
+      self.maps.extend(maps);
+      return true;
+    }
+    let Some((number, staged)) = committing.events.next() else {
+      return false;
+    };
+    if let Some(entry) = self.paths.get_mut(number) {
+      entry.record(committing.revision, staged);
+    }
+    true
+  }
+
+  /// `committing`'s last step: the revision, its deletions and its maps' bytes counted. The revision.
+  fn commit_end(&mut self, committing: &mut Committing) -> Revision {
+    if let Some(entry) = committing.entry.take() {
+      self.revisions.push(entry);
+    }
+    self.map_bytes = self.map_bytes.saturating_add(committing.map_bytes);
+    self.deletions = self.deletions.saturating_add(committing.deletions);
+    self.youngest = committing.revision;
+    committing.revision
+  }
+
+  /// Refused out of date unless `revision` is the next.
+  fn next_is(&self, revision: Revision) -> Result<(), IndexRefusal> {
+    let next = self.youngest.checked_add(1).ok_or(IndexRefusal::Corrupt)?;
+    if revision == next {
+      Ok(())
+    } else {
+      Err(IndexRefusal::OutOfDate {
+        planned: revision,
+        next,
+      })
+    }
   }
 
   /// The transaction `work` makes on revision `base` (§4.17.4 item 3), as FSFS builds it from the drive, never
@@ -1339,38 +1431,6 @@ impl Index {
       Err(IndexRefusal::Corrupt)
     }
   }
-
-  /// Applies a checked plan: nothing here can be refused.
-  fn commit(
-    &mut self,
-    revision: Revision,
-    plan: Plan,
-    transaction: String,
-    changes: Vec<ChangedPath>,
-  ) {
-    for path in plan.paths {
-      self.numbers.insert(path.clone(), self.paths.len());
-      self.paths.push(PathEntry {
-        path,
-        history: Vec::new(),
-        shapes: Vec::new(),
-      });
-    }
-    self.rows.extend(plan.rows);
-    self.maps.extend(plan.maps);
-    self.map_bytes = self.map_bytes.saturating_add(plan.map_bytes);
-    for (number, staged) in plan.events {
-      if let Some(entry) = self.paths.get_mut(number) {
-        entry.record(revision, staged);
-      }
-    }
-    self.revisions.push(RevisionEntry {
-      transaction: Some(transaction.into_boxed_str()),
-      changes,
-    });
-    self.youngest = revision;
-    self.deletions = self.deletions.saturating_add(plan.deletions);
-  }
 }
 
 impl PathEntry {
@@ -1413,6 +1473,16 @@ pub struct Planned {
   transaction: String,
   /// The changed-path rows, sorted by path.
   changes: Vec<ChangedPath>,
+}
+
+impl Committing {
+  /// The changed-path rows of the revision it commits, sorted by path.
+  pub fn changes(&self) -> &[ChangedPath] {
+    self
+      .entry
+      .as_ref()
+      .map_or(&[][..], |entry| entry.changes.as_slice())
+  }
 }
 
 impl Planned {
@@ -1477,6 +1547,26 @@ struct Built {
   deletions: usize,
   /// The children maps' nodes made so far, numbered after the index's (A-759).
   maps: Vec<children::MapNode>,
+}
+
+/// A planned revision being committed a slice at a time ([`Index::commit_begin`], [`Index::commit_step`]; A-920 piece
+/// 5b).
+#[derive(Debug)]
+pub struct Committing {
+  /// The revision it commits.
+  revision: Revision,
+  /// Its new paths, not yet named.
+  paths: std::vec::IntoIter<Box<str>>,
+  /// Its node-revisions and maps' nodes, until added.
+  rows: Option<(Vec<Row>, Vec<children::MapNode>)>,
+  /// Its events at its paths, not yet recorded.
+  events: std::vec::IntoIter<(usize, Staged)>,
+  /// Its deletions.
+  deletions: usize,
+  /// Its maps' bytes.
+  map_bytes: usize,
+  /// The revision's own entry, until its last step.
+  entry: Option<RevisionEntry>,
 }
 
 /// A revision built and checked, ready to be committed.

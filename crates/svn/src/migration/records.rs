@@ -574,6 +574,21 @@ impl Repository {
   /// [`StepRefusal::OutOfDate`] when a revision was committed since the check, and every refusal of the check's that a
   /// change since could bring (a lock entry, the room); refused, nothing changes.
   pub fn apply(&mut self, checked: Checked) -> Result<Revision, StepRefusal> {
+    let mut applying = self.apply_begin(checked)?;
+    loop {
+      if let Some(revision) = self.apply_step(&mut applying, &mut whole_check_spent)? {
+        return Ok(revision);
+      }
+    }
+  }
+
+  /// [`Repository::apply`] begun (A-920 piece 5b): the plan's revision still the next, its lock entries and the room
+  /// checked again, its property lists kept; then [`Repository::apply_step`] names its stored texts and commits its
+  /// rows a slice at a time. Refused, nothing changes.
+  ///
+  /// # Errors
+  /// [`Repository::apply`]'s.
+  pub fn apply_begin(&mut self, checked: Checked) -> Result<Applying, StepRefusal> {
     let Checked {
       planned,
       properties,
@@ -581,10 +596,72 @@ impl Repository {
       stored,
       lock_entries,
     } = checked;
-    let (revision, changes, held) = self.apply_rows(planned, &properties, &fresh, &lock_entries)?;
-    self.keep_lists(&changes, fresh);
-    self.finish_revision((stored, properties), held);
-    Ok(revision)
+    let held = self.apply_checks(planned.revision(), (&properties, &fresh), &lock_entries)?;
+    let committing = self.index.commit_begin(planned)?;
+    // Its property lists kept now: read only through its rows, which no read reaches until its last step.
+    self.keep_lists(committing.changes(), fresh);
+    Ok(Applying {
+      committing,
+      stored,
+      properties: Some(properties),
+      lock_entries,
+      held,
+    })
+  }
+
+  /// One step of `applying` ([`Repository::apply_begin`]), a unit at least, until `spent`: its stored texts named, a
+  /// text a unit; then its rows committed ([`Index::commit_step`]); in its last step, its lock entries applied, its
+  /// properties kept and what the records hold. Until then the records read as they did before it began: what a step
+  /// adds is reached only through the revision, and every read is at or below the youngest. The revision once applied;
+  /// none while more remains.
+  ///
+  /// # Errors
+  /// [`Index::commit_step`]'s, a revision committed since the apply began; a lock entry the table no longer takes.
+  pub fn apply_step(
+    &mut self,
+    applying: &mut Applying,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<Option<Revision>, StepRefusal> {
+    while let Some((identity, len)) = applying.stored.pop_first() {
+      self.stored.entry(identity).or_insert(len);
+      if spent() {
+        return Ok(None);
+      }
+    }
+    let Some(revision) = self.index.commit_step(&mut applying.committing, spent)? else {
+      return Ok(None);
+    };
+    self
+      .locks
+      .apply_all(&applying.lock_entries)
+      .map_err(StepRefusal::Lock)?;
+    self
+      .revision_properties
+      .push(applying.properties.take().unwrap_or_default());
+    self.held = applying.held;
+    Ok(Some(revision))
+  }
+
+  /// What applying a revision checks again of the records as they stand now: `planned` the next revision, its lock
+  /// entries taken, the room holding its properties and fresh contents; what the records then hold.
+  fn apply_checks(
+    &self,
+    planned: Revision,
+    (properties, fresh): (&Properties, &BTreeMap<ContentIdentity, Vec<u8>>),
+    lock_entries: &[LockEntry],
+  ) -> Result<u64, StepRefusal> {
+    let youngest = self.youngest();
+    if planned != youngest.checked_add(1).ok_or(StepRefusal::Corrupt)? {
+      return Err(StepRefusal::OutOfDate {
+        head: planned.saturating_sub(1),
+        youngest,
+      });
+    }
+    self
+      .locks
+      .check_entries(lock_entries)
+      .map_err(StepRefusal::Lock)?;
+    self.grown(properties, fresh)
   }
 
   /// [`Repository::apply`]'s first part: the plan's revision still the next, its lock entries and the room checked
@@ -597,18 +674,7 @@ impl Repository {
     fresh: &BTreeMap<ContentIdentity, Vec<u8>>,
     lock_entries: &[LockEntry],
   ) -> Result<(Revision, Vec<ChangedPath>, u64), StepRefusal> {
-    let youngest = self.youngest();
-    if planned.revision() != youngest.checked_add(1).ok_or(StepRefusal::Corrupt)? {
-      return Err(StepRefusal::OutOfDate {
-        head: planned.revision().saturating_sub(1),
-        youngest,
-      });
-    }
-    self
-      .locks
-      .check_entries(lock_entries)
-      .map_err(StepRefusal::Lock)?;
-    let held = self.grown(properties, fresh)?;
+    let held = self.apply_checks(planned.revision(), (properties, fresh), lock_entries)?;
     // Checked just above against these very records, so neither refuses; a refusal would still be answered, typed.
     let revision = self.index.commit_planned(planned)?;
     self
@@ -857,6 +923,22 @@ pub struct Checking {
   lock_entries: Vec<LockEntry>,
 }
 
+/// A checked revision being applied to the records a slice at a time ([`Repository::apply_begin`],
+/// [`Repository::apply_step`]; A-920 piece 5b).
+#[derive(Debug)]
+pub struct Applying {
+  /// Its rows' commit into the index.
+  committing: crate::index::Committing,
+  /// The texts its commit stored, not yet named.
+  stored: BTreeMap<ContentIdentity, u64>,
+  /// Its revision properties, until its last step.
+  properties: Option<Properties>,
+  /// Its lock entries.
+  lock_entries: Vec<LockEntry>,
+  /// What the records hold once it is applied.
+  held: u64,
+}
+
 /// Where a [`Checking`] stands.
 #[derive(Clone, Copy, Debug)]
 enum CheckPhase {
@@ -911,8 +993,8 @@ impl Checking {
   }
 }
 
-/// Whether a whole check's step ([`Repository::check`]) is spent: never, but in the tests that take every check a unit
-/// a step ([`CHECK_A_UNIT_A_STEP`]).
+/// Whether a whole check's or apply's step ([`Repository::check`], [`Repository::apply`]) is spent: never, but in the
+/// tests that take every one a unit a step ([`CHECK_A_UNIT_A_STEP`]).
 fn whole_check_spent() -> bool {
   #[cfg(test)]
   {
@@ -926,8 +1008,8 @@ fn whole_check_spent() -> bool {
 
 #[cfg(test)]
 std::thread_local! {
-  /// Test support: every [`Repository::check`] taken a unit a step, as a staging step whose slice is always spent
-  /// takes it (A-920 piece 2b's oracle).
+  /// Test support: every [`Repository::check`] and [`Repository::apply`] taken a unit a step, as a staging step whose
+  /// slice is always spent takes it (A-920 pieces 2b and 5b's oracle).
   pub(crate) static CHECK_A_UNIT_A_STEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
