@@ -259,15 +259,15 @@ impl Taker {
     }
     let every = revision.is_full_text() || revision.base == NULL_NODE;
     let base_hash = (!matches!(base, Base::Null) && base_identity.is_none())
-      .then(|| (blake3::Hasher::new(), Cursor::default(), 0u64));
-    self.manifesting = Some(Box::new(Manifesting {
+      .then(|| (blake3::Hasher::new(), self.spares.cursor(), 0u64));
+    self.manifesting = Some(Manifesting {
       meta: (revision.node, revision.p1, revision.p2, revision.link),
       at,
       place,
       base,
       base_identity,
       base_hash,
-      cursor: Cursor::default(),
+      cursor: self.spares.cursor(),
       patching: Patching::default(),
       made: false,
       len,
@@ -288,7 +288,7 @@ impl Taker {
       awaited: Vec::new(),
       keeping,
       after,
-    }));
+    });
     Ok(false)
   }
 
@@ -298,17 +298,32 @@ impl Taker {
   fn read_base(&mut self, store: &ContentStore, node: Node) -> Option<(Base, u64)> {
     let log = Log::Manifest;
     let rev = self.fork.rev(store, log, &node)?;
-    let (len, at_hand) = crate::push::held::log_text_at_hand((&self.fork, store), log, &node)?;
+    let len = self
+      .fork
+      .revision(store, log, rev)
+      .filter(|row| row.node == node)?
+      .len;
     let asked = self.base_asked.as_ref().is_some_and(|asked| *asked == node);
     if asked {
       self.base_asked = None;
     }
-    // At hand, read over its chain, its deltas into a buffer the push let go. Not at hand: the topmost link let go is asked
-    // of the store, which keeps a landed revision's text and none of one this push kept; the manifest itself where every
-    // link is held (a chain read before failed, `Out::Again`). The link is looked for only then.
-    let chain = (at_hand && !asked)
-      .then(|| Chain::of(&self.fork, store, rev, self.spares.take()))
-      .flatten();
+    // At hand where its chain loads, every delta read whole (into a buffer the push let go), and the whole text it rests
+    // on is held whole: `held::log_text_at_hand`'s rule, with each link's object read once rather than looked over first
+    // (2026-11-25: that look allocated a window list a link, 404,480 B of an 80-edit history in `push_heap`'s
+    // attribution). Not at hand: the topmost link let go is asked of the store, which keeps a landed revision's text and
+    // none of one this push kept; the manifest itself where every link is held (a chain read before failed,
+    // `Out::Again`). The link is looked for only then.
+    let chain = match (!asked)
+      .then(|| Chain::of(&self.fork, store, rev, self.spares.room()))
+      .flatten()
+    {
+      Some(chain) if store.holds_whole(&chain.root_object()) => Some(chain),
+      Some(chain) => {
+        self.spares.give_room(chain.into_room());
+        None
+      }
+      None => None,
+    };
     Some(match chain {
       Some(chain) => (Base::Chain { node, chain }, len),
       None => {
@@ -356,7 +371,7 @@ impl Taker {
     Keeping::Diff {
       last,
       prev,
-      cursor: Cursor::default(),
+      cursor: self.spares.cursor(),
       diffing: Diffing::within(store.window()),
       writing: None,
       put: 0,
@@ -383,7 +398,7 @@ impl Taker {
         Ok(stepped)
       }
       // Done: kept, or refused with what it held given back.
-      Ok(Out::Done) => self.manifest_finish(*manifesting, store, admission),
+      Ok(Out::Done) => self.manifest_finish(manifesting, store, admission),
       // A window of its base let go between its steps: what it took given back, and begun again at its next step, which
       // asks the store for its base's text.
       Ok(Out::Again) => {
@@ -394,11 +409,11 @@ impl Taker {
             .unread
             .unwrap_or_else(|| manifesting.base.node()),
         );
-        give_back(store, *manifesting, &mut self.spares);
+        give_back(store, manifesting, &mut self.spares);
         Ok(Stepped::More)
       }
       Err(refused) => {
-        give_back(store, *manifesting, &mut self.spares);
+        give_back(store, manifesting, &mut self.spares);
         Err(refused)
       }
     }
@@ -446,7 +461,7 @@ impl Taker {
       manifesting,
       (revision.data, &*store),
       window,
-      (&mut made, &mut hashed),
+      (&mut made, &mut hashed, &mut self.spares),
     );
     let chain_held = manifesting.base.chain().map_or(0, Chain::held);
     self.intaken.most_chain_held = self.intaken.most_chain_held.max(chain_held);
@@ -574,7 +589,7 @@ impl Taker {
         manifesting.remaking = true;
         manifesting.made = false;
         manifesting.patching = Patching::default();
-        manifesting.cursor = Cursor::default();
+        manifesting.cursor.reset();
         Ok(Out::Wait(Stepped::More))
       }
     }
@@ -636,7 +651,7 @@ impl Taker {
           &self.fork,
           store,
           (from_rev, (object, len)),
-          (rev, self.spares.take()),
+          (rev, self.spares.room()),
         )
       })
     };
@@ -890,7 +905,7 @@ fn fill(
   manifesting: &mut Manifesting,
   (delta, store): (&[u8], &ContentStore),
   window: usize,
-  (made, hashed): (&mut Vec<u8>, &mut Vec<u8>),
+  (made, hashed, spares): (&mut Vec<u8>, &mut Vec<u8>, &mut Spares),
 ) -> Result<Option<Node>, Refused> {
   let node = manifesting.base.node();
   let Manifesting {
@@ -927,7 +942,9 @@ fn fill(
     *at = at.saturating_add(to_u64(n));
     if *at >= len {
       *base_identity = Some(*hasher.finalize().as_bytes());
-      *base_hash = None;
+      if let Some((_, hash_cursor, _)) = base_hash.take() {
+        spares.give_cursor(hash_cursor);
+      }
     }
   }
   if !*done {
@@ -1003,12 +1020,16 @@ pub(super) fn give_back(
   if let Some(small) = manifesting.small.take() {
     spares.give(small);
   }
+  spares.give_cursor(manifesting.cursor);
+  if let Some((_, cursor, _)) = manifesting.base_hash {
+    spares.give_cursor(cursor);
+  }
   base_back(store, manifesting.base, spares);
-  if let Keeping::Diff {
-    prev: Some(prev), ..
-  } = manifesting.keeping
-  {
-    base_back(store, prev, spares);
+  if let Keeping::Diff { prev, cursor, .. } = manifesting.keeping {
+    spares.give_cursor(cursor);
+    if let Some(prev) = prev {
+      base_back(store, prev, spares);
+    }
   }
 }
 
@@ -1016,10 +1037,10 @@ pub(super) fn give_back(
 /// chain loaded.
 fn base_back(store: &mut ContentStore, base: Base, spares: &mut Spares) {
   match base {
-    Base::Chain { chain, .. } => spares.give(chain.into_buffer()),
+    Base::Chain { chain, .. } => spares.give_room(chain.into_room()),
     Base::Given { object, chain, .. } => {
       given_back(store, &object);
-      spares.give(chain.into_buffer());
+      spares.give_room(chain.into_room());
     }
     Base::Null | Base::Asked { .. } => {}
   }

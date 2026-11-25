@@ -147,17 +147,30 @@ impl Log<'_> {
     }
   }
 
-  /// The key of this log's row numbered `rev`.
+  /// The bytes [`Log::put_key`] appends.
+  fn key_len(&self) -> usize {
+    match self {
+      Self::Changelog | Self::Manifest => 1,
+      Self::File(path) => path.len().saturating_add(2),
+    }
+  }
+
+  /// The key of this log's row numbered `rev`, made at its length at once: a key grown from one byte was two allocations
+  /// a lookup, and a push's chain walks look up every link (main's churn of hg's 57k push at e51d998bf: 147 MB under
+  /// `put_key`).
   fn row_key(&self, rev: u32) -> Vec<u8> {
-    let mut key = vec![LOG_ROW];
+    let rev = rev.to_be_bytes();
+    let mut key = Vec::with_capacity(self.key_len().saturating_add(rev.len()).saturating_add(1));
+    key.push(LOG_ROW);
     self.put_key(&mut key);
-    key.extend_from_slice(&rev.to_be_bytes());
+    key.extend_from_slice(&rev);
     key
   }
 
-  /// The key of `node`'s row in this log.
+  /// The key of `node`'s row in this log, made at its length at once.
   fn node_key(&self, node: &Node) -> Vec<u8> {
-    let mut key = vec![NODE_ROW];
+    let mut key = Vec::with_capacity(self.key_len().saturating_add(node.len()).saturating_add(1));
+    key.push(NODE_ROW);
     key.extend_from_slice(node);
     self.put_key(&mut key);
     key
@@ -907,8 +920,23 @@ impl HgIndex {
 
   /// How many revisions `log` holds: the first number with no row.
   pub fn len(&self, store: &ContentStore, log: Log<'_>) -> u32 {
+    // One key, its number rewritten for each probe: a key a probe was the push's commonest allocation (18,455 for an
+    // 80-edit history in `push_heap`'s attribution, 2026-11-25).
+    let key = core::cell::RefCell::new(log.row_key(0));
+    let number_at = key
+      .borrow()
+      .len()
+      .saturating_sub(core::mem::size_of::<u32>());
     let held = |rev: u64| {
-      u32::try_from(rev).is_ok_and(|rev| self.rows.get(store, &log.row_key(rev)).is_some())
+      u32::try_from(rev).is_ok_and(|rev| {
+        let Ok(mut key) = key.try_borrow_mut() else {
+          return false;
+        };
+        for (to, from) in key.iter_mut().skip(number_at).zip(rev.to_be_bytes()) {
+          *to = from;
+        }
+        self.rows.get(store, &key).is_some()
+      })
     };
     u32::try_from(first_missing(u64::from(NONE), held)).unwrap_or(NONE)
   }

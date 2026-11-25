@@ -240,7 +240,7 @@ impl Taker {
       self.intaken.spread = self.intaken.spread.saturating_add(1);
     }
     admission.charge(to_u64(path.len()))?;
-    self.patched = Some(Box::new(Patched {
+    self.patched = Some(Patched {
       path: path.to_vec(),
       meta: (revision.node, revision.p1, revision.p2, revision.link),
       revisions: revisions.clone(),
@@ -257,7 +257,7 @@ impl Taker {
       writing: None,
       after,
       brought: Vec::new(),
-    }));
+    });
     Ok(false)
   }
 
@@ -519,7 +519,7 @@ impl Taker {
       after,
       brought,
       ..
-    } = *patched;
+    } = patched;
     let kept = self.patched_kept(
       (path, (node, p1, p2, link), place),
       (
