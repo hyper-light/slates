@@ -1846,7 +1846,18 @@
 > before this change (the same bytes with it): that binary's `a_pushs_churn_per_changeset_is_its_file_alone` (145,223 B
 > an edit at a 91,200 B manifest, 1.59 manifests, against its 16 KiB bound; 10,284 B when it landed) and
 > `a_cached_file_base_is_read_where_it_lies` (192,642 B a revision of a 160 KiB file, 1.18 files): the push's intake
-> churn main measured (`manifest_step`, `put_window`), owed next.
+> churn main measured (`manifest_step`, `put_window`). Bisected (2026-11-25, w-hg): the cached base's to 4885954fa (a
+> file revision taken a window a step: 14,007 B to 184,743 B a revision), whose object began its window's buffer empty
+> and grew it to the file's length each revision (`put_window` under `put_bytes`); the edit's to b47217878 (a manifest
+> taken a window a step: 17,899 B to 136,995 B), which copied each text of one window or less into a buffer grown from
+> empty (`Manifesting::small`, under `manifest_take`) and loaded each base chain's deltas into new buffers
+> (`object_bytes` under `Chain::of`). Since: a file revision's object begins over a buffer the push let go and gives it
+> back once kept; the small copy is taken from those, reserved to the text's length, and given back; a chain's deltas
+> lie in one such buffer; the let-go link is looked for only where the chain is not read. The cached base 28,578 B a
+> revision (0.17 files), passing; the edit 41,988 B at the 91,200 B manifest (145,223 B before), still past its 16 KiB.
+> Owed: the rest, about 25 KB an edit at any manifest size, which grows with the chain's length: the chain reader's
+> per-manifest levels (`Cursor`) and the bytes a level skips, made into a new buffer a call (`read_level`'s
+> `dropped`), and `holds_whole`'s window list a link (`log_text_at_hand`).
 > The owner spins before it parks (2026-11-25, w-hg; main's ruling on the 57k split at 44db3dc17, release: the clone
 > 225.7 s, 812,896 requests waiting 167.27 s, the owner's wake 144.82 s of it, 86.6%, about 178 µs a request; serve
 > 7.4%, back 4.9%, behind 0.8%, disk 0.3%): waiting for work, it polls its queue for the gap it has learned (RFC 6298's

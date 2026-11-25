@@ -22,7 +22,9 @@ use std::ops::Range;
 
 use slates_vcs::{ContentId, ContentStore, Writing};
 
-use super::{Frame, ReadAs, Refused, Stage, Stepped, StoreAsk, Streamed, Taker, log_of, to_u64};
+use super::{
+  Frame, ReadAs, Refused, Spares, Stage, Stepped, StoreAsk, Streamed, Taker, log_of, to_u64,
+};
 use crate::delta::{self, BaseRead, Filled, Patching, Written};
 use crate::framing::Source;
 use crate::index::Log;
@@ -244,6 +246,14 @@ impl Taker {
       place
     };
     let keeping = self.keeping_of(revision, len, store);
+    // A text of one window at most is kept as it is made, in a buffer the push let go, reserved to its length (main's
+    // churn of hg's 57k push at e51d998bf: 5.37 GB under `manifest_take`, this copy grown from empty a revision; bisected
+    // to b47217878), and given back once the revision ends ([`give_back`]).
+    let small = (len <= to_u64(store.window())).then(|| {
+      let mut buffer = self.spares.take();
+      buffer.reserve(usize::try_from(len).unwrap_or(0));
+      buffer
+    });
     if len > to_u64(store.window()) {
       self.intaken.spread = self.intaken.spread.saturating_add(1);
     }
@@ -271,7 +281,7 @@ impl Taker {
       stored: None,
       remaking: false,
       unread: None,
-      small: (len <= to_u64(store.window())).then(Vec::new),
+      small,
       lines: manifest::Checking::default(),
       written: Written::default(),
       every,
@@ -293,15 +303,19 @@ impl Taker {
     if asked {
       self.base_asked = None;
     }
-    // Not at hand: the topmost link let go is asked of the store, which keeps a landed revision's text and none of one
-    // this push kept; the manifest itself where every link is held (a chain read before failed, `Out::Again`).
-    let from = Chain::let_go_link(&self.fork, store, rev).unwrap_or((rev, node));
-    Some(
-      match Chain::of(&self.fork, store, rev).filter(|_| at_hand && !asked) {
-        Some(chain) => (Base::Chain { node, chain }, len),
-        None => (Base::Asked { node, from }, len),
-      },
-    )
+    // At hand, read over its chain, its deltas into a buffer the push let go. Not at hand: the topmost link let go is asked
+    // of the store, which keeps a landed revision's text and none of one this push kept; the manifest itself where every
+    // link is held (a chain read before failed, `Out::Again`). The link is looked for only then.
+    let chain = (at_hand && !asked)
+      .then(|| Chain::of(&self.fork, store, rev, self.spares.take()))
+      .flatten();
+    Some(match chain {
+      Some(chain) => (Base::Chain { node, chain }, len),
+      None => {
+        let from = Chain::let_go_link(&self.fork, store, rev).unwrap_or((rev, node));
+        (Base::Asked { node, from }, len)
+      }
+    })
   }
 
   /// How `revision`'s row keeps its content, `len` its text's length, by [`manifest_row`]'s rule: its client's delta;
@@ -380,11 +394,11 @@ impl Taker {
             .unread
             .unwrap_or_else(|| manifesting.base.node()),
         );
-        give_back(store, *manifesting);
+        give_back(store, *manifesting, &mut self.spares);
         Ok(Stepped::More)
       }
       Err(refused) => {
-        give_back(store, *manifesting);
+        give_back(store, *manifesting, &mut self.spares);
         Err(refused)
       }
     }
@@ -541,7 +555,9 @@ impl Taker {
             given_back(store, object);
           }
           let mut writing = None;
-          put_window(&mut writing, store, &small)?;
+          let put = put_window(&mut writing, store, &small);
+          self.spares.give(small);
+          put?;
           manifesting.keeping = Keeping::Whole { writing };
           manifesting.stored = Some(manifest_row::WHOLE);
           return Ok(Out::Done);
@@ -615,10 +631,14 @@ impl Taker {
     } else {
       // The link's text given, the rows above it read over it from the fork, which holds each (kept by this push, or
       // landed and held).
-      self
-        .fork
-        .rev(store, Log::Manifest, &node)
-        .and_then(|rev| Chain::over(&self.fork, store, (from_rev, (object, len)), rev))
+      self.fork.rev(store, Log::Manifest, &node).and_then(|rev| {
+        Chain::over(
+          &self.fork,
+          store,
+          (from_rev, (object, len)),
+          (rev, self.spares.take()),
+        )
+      })
     };
     let Some(chain) = chain else {
       let _ = store.release(&object);
@@ -785,7 +805,7 @@ impl Taker {
         Ok(kept) => kept,
         Err(refused) => {
           store.abandon_object(writing);
-          give_back(store, manifesting);
+          give_back(store, manifesting, &mut self.spares);
           return Err(Refused::Unindexed(Unindexed::from(refused)));
         }
       },
@@ -793,7 +813,7 @@ impl Taker {
       None => match store.put_object(&[]) {
         Ok(kept) => kept,
         Err(refused) => {
-          give_back(store, manifesting);
+          give_back(store, manifesting, &mut self.spares);
           return Err(Refused::Unindexed(Unindexed::from(refused)));
         }
       },
@@ -834,7 +854,7 @@ impl Taker {
     // The row holds its content again, and the put's own hold is given back with the keep's (`keep_one`); a given base's
     // and a given last manifest's are given back either way.
     let after = manifesting.after;
-    give_back(store, manifesting);
+    give_back(store, manifesting, &mut self.spares);
     kept_taken?;
     // Counted once kept, so a keep refused past its admission and taken again counts it once.
     if stored == manifest_row::WHOLE {
@@ -972,19 +992,36 @@ fn put_window(
 
 /// Gives back what a manifest being taken holds: its object being put, and the objects of a base and a last manifest the
 /// store gave.
-pub(super) fn give_back(store: &mut ContentStore, mut manifesting: Manifesting) {
+pub(super) fn give_back(
+  store: &mut ContentStore,
+  mut manifesting: Manifesting,
+  spares: &mut Spares,
+) {
   if let Some(writing) = manifesting.keeping.writing().take() {
     store.abandon_object(writing);
   }
-  if let Base::Given { object, .. } = manifesting.base {
-    given_back(store, &object);
+  if let Some(small) = manifesting.small.take() {
+    spares.give(small);
   }
+  base_back(store, manifesting.base, spares);
   if let Keeping::Diff {
-    prev: Some(Base::Given { object, .. }),
-    ..
+    prev: Some(prev), ..
   } = manifesting.keeping
   {
-    given_back(store, &object);
+    base_back(store, prev, spares);
+  }
+}
+
+/// Gives back what a base held: a given text's object ([`given_back`]), and its chain's buffer to `spares` for the next
+/// chain loaded.
+fn base_back(store: &mut ContentStore, base: Base, spares: &mut Spares) {
+  match base {
+    Base::Chain { chain, .. } => spares.give(chain.into_buffer()),
+    Base::Given { object, chain, .. } => {
+      given_back(store, &object);
+      spares.give(chain.into_buffer());
+    }
+    Base::Null | Base::Asked { .. } => {}
   }
 }
 

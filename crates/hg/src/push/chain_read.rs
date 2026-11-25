@@ -17,19 +17,31 @@ use crate::delta::{BaseRead, Filled, Patching};
 use crate::index::{HgIndex, Log, NONE};
 use crate::read::to_u64;
 
-/// A manifest's chain, loaded: the whole text it rests on and each delta above it, lowest first.
+/// A manifest's chain, loaded: the whole text it rests on and each delta above it, lowest first. The deltas lie end to
+/// end in one buffer the push hands from chain to chain ([`Chain::into_buffer`]), so loading a chain allocates nothing
+/// once the push has one (main's churn of hg's 57k push at e51d998bf: 2.49 GB of `object_bytes` under `Chain::of`, a
+/// new buffer a delta a revision; bisected to b47217878: 17,899 B to 136,995 B an edit at a 91,200 B manifest).
 #[derive(Debug)]
 pub(crate) struct Chain {
   /// The whole text the chain rests on: its object and length.
   root: (ContentId, u64),
-  /// Each delta above it, lowest first, with the length of the text it makes.
-  deltas: Vec<(Vec<u8>, u64)>,
+  /// The deltas' bytes, end to end, in the order they were read (the topmost first).
+  bytes: Vec<u8>,
+  /// Each delta above the root, lowest first: its range in `bytes`, with the length of the text it makes.
+  deltas: Vec<(core::ops::Range<usize>, u64)>,
 }
 
 impl Chain {
   /// The chain of the manifest row `rev` of `index`: none where a row or a delta's object is not held whole, or the
   /// chain does not end at a whole text.
-  pub(crate) fn of(index: &HgIndex, store: &ContentStore, rev: u32) -> Option<Chain> {
+  /// Its deltas are read into `buffer`, emptied first (a chain let go before's, [`Chain::into_buffer`]).
+  pub(crate) fn of(
+    index: &HgIndex,
+    store: &ContentStore,
+    rev: u32,
+    mut buffer: Vec<u8>,
+  ) -> Option<Chain> {
+    buffer.clear();
     let mut deltas = Vec::new();
     let mut at = rev;
     loop {
@@ -38,10 +50,14 @@ impl Chain {
         deltas.reverse();
         return Some(Chain {
           root: (row.bytes, row.len),
+          bytes: buffer,
           deltas,
         });
       }
-      deltas.push((store.object_bytes(&row.bytes, row.stored)?, row.len));
+      deltas.push((
+        read_object(store, (&row.bytes, row.stored), &mut buffer)?,
+        row.len,
+      ));
       if row.base >= at {
         return None;
       }
@@ -57,8 +73,9 @@ impl Chain {
     index: &HgIndex,
     store: &ContentStore,
     (from, root): (u32, (ContentId, u64)),
-    rev: u32,
+    (rev, mut buffer): (u32, Vec<u8>),
   ) -> Option<Chain> {
+    buffer.clear();
     let mut deltas = Vec::new();
     let mut at = rev;
     while at != from {
@@ -66,11 +83,18 @@ impl Chain {
       if row.base == NONE || row.base >= at {
         return None;
       }
-      deltas.push((store.object_bytes(&row.bytes, row.stored)?, row.len));
+      deltas.push((
+        read_object(store, (&row.bytes, row.stored), &mut buffer)?,
+        row.len,
+      ));
       at = row.base;
     }
     deltas.reverse();
-    Some(Chain { root, deltas })
+    Some(Chain {
+      root,
+      bytes: buffer,
+      deltas,
+    })
   }
 
   /// The topmost revision of manifest row `rev`'s chain (`rev` itself first) whose object `store` does not hold whole: what
@@ -98,6 +122,7 @@ impl Chain {
   pub(crate) fn whole(object: ContentId, len: u64) -> Chain {
     Chain {
       root: (object, len),
+      bytes: Vec::new(),
       deltas: Vec::new(),
     }
   }
@@ -113,6 +138,35 @@ impl Chain {
       held.saturating_add(to_u64(delta.len()))
     })
   }
+
+  /// Its `k`th delta above the root (0 the lowest): its bytes and the length of the text it makes.
+  fn delta(&self, k: usize) -> Option<(&[u8], u64)> {
+    let (range, len) = self.deltas.get(k)?;
+    Some((self.bytes.get(range.clone())?, *len))
+  }
+
+  /// Its deltas' buffer, for the next chain loaded ([`Chain::of`]).
+  pub(crate) fn into_buffer(self) -> Vec<u8> {
+    self.bytes
+  }
+}
+
+/// The object `root` names, `len` bytes, read through its windows onto the end of `buffer`: its range there; none where
+/// the store holds another length (a window let go), what was read of it dropped again.
+fn read_object(
+  store: &ContentStore,
+  (root, len): (&ContentId, u64),
+  buffer: &mut Vec<u8>,
+) -> Option<core::ops::Range<usize>> {
+  let start = buffer.len();
+  for window in store.windows(root) {
+    buffer.extend_from_slice(&window);
+  }
+  if to_u64(buffer.len().saturating_sub(start)) != len {
+    buffer.truncate(start);
+    return None;
+  }
+  Some(start..buffer.len())
 }
 
 /// Where one level of a chain's text stands: its delta applied so far and the bytes it has made.
@@ -182,7 +236,7 @@ fn read_level(
   };
   let (below, here) = levels.split_at_mut(above_root);
   let here = here.first_mut()?;
-  let (delta, _) = chain.deltas.get(above_root)?;
+  let (delta, _) = chain.delta(above_root)?;
   if at < here.made {
     return None;
   }
@@ -242,7 +296,7 @@ impl BaseRead for Lower<'_> {
   fn len(&self) -> u64 {
     match self.level.checked_sub(1) {
       None => self.chain.root.1,
-      Some(delta) => self.chain.deltas.get(delta).map_or(0, |(_, len)| *len),
+      Some(delta) => self.chain.delta(delta).map_or(0, |(_, len)| len),
     }
   }
 
