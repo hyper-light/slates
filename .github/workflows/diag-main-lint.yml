@@ -1,4 +1,6 @@
 name: diag-main-lint
+# Run 28 (main 01a20182, 2026-11-24 20:02 PST): main at 09b2f0d3c, w-svn's A-910 incremental fold (949ca8619), the svn tests
+# (2cb9633ba) and the tail's identity slices (2f340066f), landed after run 27.
 # Run 27 (main 01a20182, 2026-11-24 19:54 PST): main at 8894c0096, w-perf's svn storage measurement (75005ae26) and the miss-ratio
 # curve's re-read guard (567932413), landed after run 26.
 # Run 26 (main 01a20182, 2026-11-24 19:51 PST): main at 0283123dc, w-hg's C1 (2) first piece (4885954fa, f754c36f6) and w-shared's
