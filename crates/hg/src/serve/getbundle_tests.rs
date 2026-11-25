@@ -142,6 +142,9 @@ impl Store for Served {
   fn rows_a_step(&self) -> u64 {
     self.rows_a_step.unwrap_or(u64::MAX)
   }
+  fn text_bytes_a_step(&self) -> u64 {
+    u64::MAX
+  }
 
   /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole, its identity the
   /// plain BLAKE3 of its text, its place named by that identity, its chunk its raw text (a whole) or its delta; none where its text is

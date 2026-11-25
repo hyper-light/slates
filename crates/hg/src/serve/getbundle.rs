@@ -81,6 +81,13 @@ pub trait Store: Repository {
   /// history's rows in one batch and decided them in one 2 s step, CI 45117277400).
   fn rows_a_step(&self) -> u64;
 
+  /// Derived: the most bytes of texts one want of a fetch asks the changeset store to make and copy at once, one text at
+  /// least: the step's copy budget (the daemon's `copy_slice_bytes`, the machine's measured memcpy rate over the copy
+  /// share of its step quantum), so the store's owner copies no more for one request, a text past it in slices, and the
+  /// walk holds no more texts a batch however long the history (goal 93, main's ruling of 2026-11-25: a batch sized by
+  /// the fetch's room held gigabytes of hg's 57k clone's texts at once).
+  fn text_bytes_a_step(&self) -> u64;
+
   /// A changeset's text; `None` past the view, or where the store does not hold it whole.
   fn changeset_text(
     &self,
@@ -277,7 +284,9 @@ impl LogTexts {
   /// Asks the changeset store for the texts of `nodes` of `log` in one want of rows and one of texts (goal 93: a clone
   /// after P5 asked a row and a text a revision, two store asks a changeset and two a manifest, each a scan of the log's
   /// rows; main's interop bench: hg's 57k clone past 13.5 minutes). The first is the one its unit waits for; the rest
-  /// are the units' after it, as many as `most` bytes hold beside it. What the last batch was given and its units did not
+  /// are the units' after it, as many as `most` bytes hold beside it: the least of the walk's room and a step's bytes
+  /// ([`Store::text_bytes_a_step`]), so a batch is what one step copies, never the room's gigabytes (goal 93, main's
+  /// ruling of 2026-11-25). What the last batch was given and its units did not
   /// take is let go. Refused where the store gave nothing for the last one asked, or the log holds no row of the first.
   fn ask_batch(
     &mut self,
@@ -1522,14 +1531,15 @@ impl Walk {
           Cow::Owned(text)
         }
         None => {
-          // This changeset's text and the next missing ones', as the room holds them, in one batch.
+          // This changeset's text and the next missing ones', as a step's bytes and the room hold them, in one batch.
           let missing = &self.missing;
           let mut ahead =
             core::iter::successors(Some(rev), |at| missing.next_from(at.saturating_add(1)))
               .map_while(|at| store.node(at));
+          let most = room.left().min(store.text_bytes_a_step());
           self
             .logs
-            .ask_batch(store, WholeLog::Changelog, (&mut ahead, room.left()))?;
+            .ask_batch(store, WholeLog::Changelog, (&mut ahead, most))?;
           return Ok(Some(At::Changelog(from)));
         }
       },
@@ -1591,16 +1601,18 @@ impl Walk {
       )?;
     } else {
       let Some(text) = self.logs.take(&linked.node) else {
-        // This manifest's text and those of the next ones a missing changeset links, as the room holds them, in one
-        // batch.
+        // This manifest's text and those of the next ones a missing changeset links, as a step's bytes and the room
+        // hold them, in one batch.
         let missing = &self.missing;
         let mut ahead = (position..)
           .map_while(|at| store.manifest_linked(at))
           .filter(|linked| linked.link.is_some_and(|link| missing.contains(link)))
           .map(|linked| linked.node);
-        self
-          .logs
-          .ask_batch(store, WholeLog::Manifest, (&mut ahead, room.left()))?;
+        self.logs.ask_batch(
+          store,
+          WholeLog::Manifest,
+          (&mut ahead, room.left().min(store.text_bytes_a_step())),
+        )?;
         return Ok(Some(At::Manifests(position, sent)));
       };
       let entry = store.manifest_entry(&linked.node).ok_or_else(no_manifest)?;

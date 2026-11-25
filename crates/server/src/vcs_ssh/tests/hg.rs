@@ -295,6 +295,10 @@ impl Store for Probed {
     u64::MAX
   }
 
+  fn text_bytes_a_step(&self) -> u64 {
+    u64::MAX
+  }
+
   fn changeset_text(
     &self,
     _rev: Rev,
@@ -1494,6 +1498,10 @@ impl Repository for Grown {
 impl Store for Grown {
   /// A test's store keeps no changeset store rows to batch: as many as the room holds.
   fn rows_a_step(&self) -> u64 {
+    u64::MAX
+  }
+
+  fn text_bytes_a_step(&self) -> u64 {
     u64::MAX
   }
 

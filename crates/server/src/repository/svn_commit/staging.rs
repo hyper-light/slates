@@ -29,8 +29,6 @@
 //! (`ImportBatch::chain_room`): a revision whose entry would take it past is handed to the next batch whole
 //! ([`Flush::Chain`], A-895).
 
-use std::collections::BTreeSet;
-
 use slates_db::catalog::{Principal, RepositoryId, VolumeId as DbVolumeId};
 use slates_svn::commit::revision::Revision;
 use slates_svn::index::ContentIdentity;
@@ -272,17 +270,12 @@ fn identity_some(state: &mut ShardState, green: DbVolumeId, deadline_ns: u64) ->
 /// every one is.
 fn give_back_put_some(
   state: &mut ShardState,
-  (put, pinned): (&[ContentIdentity], &mut BTreeSet<ContentIdentity>),
+  put: &[ContentIdentity],
   (at, deadline_ns): (&mut usize, u64),
 ) -> bool {
   while let Some(text) = put.get(*at) {
     *at = at.saturating_add(1);
     let one = core::slice::from_ref(text);
-    // Landed now: unpinned before its hold goes (the store's precondition), so its let-go may take what no unlanded
-    // text still names.
-    if pinned.remove(text) {
-      crate::vcs_store::name_holds::unpin_texts(state, one);
-    }
     super::release_texts(state, None, one);
     crate::vcs_store::name_holds::let_go_landed_texts(state, one);
     if slates_rt::futures::now_ns() >= deadline_ns {
@@ -358,8 +351,8 @@ pub(crate) struct Staging {
   records: Vec<Vec<u8>>,
   /// The texts the batch put into the content store, one hold each, given back once it lands or is abandoned.
   put: Vec<ContentIdentity>,
-  /// Those of `put` the import's sink pinned unlanded (`svn_import::texts`): unpinned at the batch's landing, each just
-  /// before its hold goes, or as it is abandoned.
+  /// Those of `put` the import's sink pinned unlanded (`svn_import::texts`): unpinned once the batch's changeset is
+  /// durable (its texts landed), or as the batch is abandoned before.
   pinned: Vec<ContentIdentity>,
   /// What the changeset carries of them: a path and a length each.
   carried: Vec<landing::LandedText>,
@@ -734,6 +727,13 @@ impl Staging {
     #[cfg(test)]
     kill_before_entry_where_set().await;
     let recorded = crate::state::with_state(|state| {
+      // Landed: the changeset holding every text the batch put is durable on the node's store, so its texts are no
+      // unlanded holders now (ruling (B)), whatever the register answers next. Unpinned here, not at the tail: a kill
+      // after the entry never reaches the tail, and the texts are landed all the same (w-perf's red at a55d7cfa6,
+      // `store_tests::a_subversion_restart_replays_a_named_text_with_one_released_window`).
+      if landed.is_ok() {
+        crate::vcs_store::name_holds::unpin_texts(state, &std::mem::take(&mut self.pinned));
+      }
       landed.and_then(|()| {
         if landing::next_sequence(state, repository) != sequence {
           state.count(super::DIVERGED, 1);
@@ -814,15 +814,9 @@ impl Staging {
       slates_rt::futures::yield_now().await;
     }
     let mut at = 0usize;
-    let mut pinned: BTreeSet<ContentIdentity> =
-      std::mem::take(&mut self.pinned).into_iter().collect();
     while !crate::state::with_state(|state| {
       state.count(TAIL_SLICES, 1);
-      give_back_put_some(
-        state,
-        (&self.put, &mut pinned),
-        (&mut at, slice_deadline_ns()),
-      )
+      give_back_put_some(state, &self.put, (&mut at, slice_deadline_ns()))
     })? {
       slates_rt::futures::yield_now().await;
     }

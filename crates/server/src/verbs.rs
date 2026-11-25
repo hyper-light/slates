@@ -22237,6 +22237,14 @@ impl Published {
   }
 }
 
+#[cfg(test)]
+thread_local! {
+  /// A test's publications left on the shard's thread before every later one is refused (`publish_shard`): the shard's
+  /// last image older than its last steps, as a slow schedule leaves a stop to meet (TSan diags 5 and 7: the image the
+  /// commit's apply published, its checkpoint's never).
+  pub(crate) static PUBLICATIONS_LEFT: core::cell::Cell<Option<u32>> = const { core::cell::Cell::new(None) };
+}
+
 /// Publishes the shard's volumes as one recovery image into its slice of the anchor content object
 /// (§4.8), so a restart recovers their content from anchor-owned RAM. This is the **barrier** every
 /// acknowledgement of a mutation stands behind (D-18): a control verb publishes before its completion
@@ -22248,6 +22256,17 @@ impl Published {
 /// Efficiency gate: it re-images
 /// every volume on each call; an incremental publish is the owed refinement (docs/wip/recovery.md).
 pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::VfsError> {
+  #[cfg(test)]
+  if PUBLICATIONS_LEFT.with(|left| match left.get() {
+    Some(0) => true,
+    Some(more) => {
+      left.set(Some(more - 1));
+      false
+    }
+    None => false,
+  }) {
+    return Err(slates_vfs::VfsError::RecoveryIncomplete);
+  }
   let (start, end) = state.content_range;
   if state.content.is_none() || end <= start {
     return Err(slates_vfs::VfsError::RecoveryIncomplete);

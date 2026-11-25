@@ -506,3 +506,55 @@ fn a_text_read_whole_leaves_no_walk_in_flight() {
     "bound {largest_bound} or reserved {largest_reserved} past one chunk and a text, {most}, with every text read whole"
   );
 }
+
+/// Goal 93 (main's ruling of 2026-11-25: a fetch's text past a step's copy budget copied a slice of it a request,
+/// [`Store::text_slice`]). A slice reaches as far as its step, longer or shorter than a piece, so the walk must end at the
+/// slice that reaches the text's end, or the cache keeps it in flight as it kept a text read whole before 7c0ea35a1. Do:
+/// land [`WHOLE_TEXTS`] distinct texts of several pieces; on a cache made for [`MANY_READS`] reads at once, read each to
+/// its end in two slices, the last longer than a piece (so a walk judged by a piece's reach would not end there). Expect
+/// every text's bytes as landed; and, each time a text's last slice is read, the cache's bound and reserved bytes no
+/// more than one chunk and a text, no walk left in flight. Red with the read's reach taken for a piece's: the bound
+/// grown by every text.
+#[test]
+fn a_text_read_in_slices_past_a_piece_leaves_no_walk_in_flight() {
+  let dir = scratch("slices");
+  let mut store = open(&dir);
+  land_chain(&mut store);
+  let wholes = land_whole_texts(&mut store, VERSIONS + 1);
+  let staging = Staging::new(0);
+  let mut cache = TextCache::for_reads(MANY_READS);
+  let piece = slates_store::store::PIECE_BYTES;
+  // The first slice leaves a last one of a piece and a quarter: past a piece, within the step.
+  let step = (BIG_TEXT - piece - piece / 4) as u64;
+  let most = slates_mem::large::floor() as u64 + BIG_TEXT as u64;
+  let (mut largest_bound, mut largest_reserved) = (0, 0);
+  for identity in &wholes {
+    let mut text = Vec::new();
+    loop {
+      let slice = store
+        .text_slice(&staging, 1, (identity, text.len() as u64, step), &mut cache)
+        .unwrap()
+        .unwrap();
+      let len = slice.len() as u64;
+      text.extend_from_slice(slice);
+      if len < step {
+        break;
+      }
+    }
+    assert_eq!(
+      *blake3::hash(&text).as_bytes(),
+      *identity,
+      "a text's bytes as landed"
+    );
+    largest_bound = largest_bound.max(cache.bound());
+    largest_reserved = largest_reserved.max(cache.reserved_bytes());
+  }
+  println!(
+    "text_cache_heap: {WHOLE_TEXTS} texts read in slices of {step} B: bound at most {largest_bound}, reserved at most \
+     {largest_reserved} (at most {most})"
+  );
+  assert!(
+    largest_bound <= most && largest_reserved <= most,
+    "bound {largest_bound} or reserved {largest_reserved} past one chunk and a text, {most}, with every text read to its end"
+  );
+}

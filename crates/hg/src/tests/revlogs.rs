@@ -212,6 +212,63 @@ fn first_stored_byte(repository: &str, stem: &str, log: &Revlog<'_>, rev: u32) -
   }
 }
 
+/// Revision `rev`'s stored chunk in a version 1 repository's revlog, read from the fixture's bytes by its entry.
+fn stored_chunk(repository: &str, stem: &str, log: &Revlog<'_>, rev: u32) -> Vec<u8> {
+  let entry = log.entry(rev).unwrap();
+  let offset = usize::try_from(entry.offset).unwrap();
+  let length = usize::try_from(entry.compressed).unwrap();
+  let (bytes, start) = match find(&format!("{repository}-{stem}.d")) {
+    Some(data) => (data, offset),
+    None => (
+      file(&format!("{repository}-{stem}.i")),
+      offset + (usize::try_from(rev).unwrap() + 1) * 64,
+    ),
+  };
+  bytes[start..start + length].to_vec()
+}
+
+/// Goal 93 perf, the chunk codec (main's ruling of 2026-11-25: `crate::revlog_chunk`, which the stream and the changeset
+/// store's intake share). Do: read every stored chunk of every revlog of the three version 1 repositories stock 7.2
+/// wrote (zstd, zlib and split, raw chunks among them); decode each through `revlog_chunk::decode`; and encode each plain
+/// chunk of the zstd repository through `revlog_chunk::chunk`. Expect each decoded chunk the reader's own plain chunk,
+/// and each encoded one byte for byte the chunk stock 7.2 stored (its zstd frames at level 3, its raw and `u` chunks,
+/// its 50-byte floor); and, so the test is not vacuous, zstd, zlib, `u` and raw NUL chunks among those decoded.
+#[test]
+fn every_stock_chunk_decodes_and_a_zstd_stores_chunks_encode_byte_for_byte() {
+  use crate::revlog_chunk::{Pass, chunk, decode};
+  let mut headers = std::collections::BTreeSet::new();
+  for repository in V1_REPOSITORIES {
+    for (stem, _) in LOGS {
+      let log = open(repository, stem);
+      for rev in 0..log.len() {
+        let stored = stored_chunk(repository, stem, &log, rev);
+        let plain = log.chunk(rev, &mut room()).unwrap();
+        assert_eq!(
+          decode(&stored, rev, &mut room()).as_ref(),
+          Ok(&plain),
+          "{repository} {stem} {rev}"
+        );
+        headers.extend(stored.first().copied());
+        if repository != "zstd" {
+          continue;
+        }
+        let mut encoded = Vec::new();
+        chunk(&plain, Pass::Send, &mut encoded).unwrap();
+        assert_eq!(
+          encoded, stored,
+          "{repository} {stem} {rev}: encoded as stock stored it"
+        );
+      }
+    }
+  }
+  assert!(
+    [b'(', b'x', b'u', 0]
+      .iter()
+      .all(|header| headers.contains(header)),
+    "{headers:?}"
+  );
+}
+
 /// A-611: do read the dockets of the version 2 repositories. Expect each one's index and data ids eight bytes, its index
 /// end the `.idx` file's length and its data end the `.dat` file's, and zstd's `(` its default header.
 #[test]

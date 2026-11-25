@@ -123,6 +123,8 @@ enum Request {
     repository: u128,
     identity: Identity,
     offset: u64,
+    /// The most bytes the answer copies: a piece ([`PIECE_BYTES`]) or a caller's step ([`StoreHandle::text_slice`]).
+    most: u64,
     answer: Sender<Result<Option<Vec<u8>>, StoreError>>,
   },
   Texts {
@@ -519,19 +521,14 @@ fn serve(
         repository,
         identity,
         offset,
+        most,
         answer,
       } => {
-        // As far as one piece reaches from `offset`, as `piece` answers: a caller walks pieces of any length.
+        // As far as `most` reaches from `offset` (a piece, as `piece` answers, or a caller's step): a caller walks
+        // slices of any length.
         let read = store
-          .text_at(&staging, repository, &identity, offset, &mut texts)
-          .map(|text| {
-            text.map(|rest| {
-              rest
-                .get(..rest.len().min(PIECE_BYTES))
-                .unwrap_or(rest)
-                .to_vec()
-            })
-          });
+          .text_slice(&staging, repository, (&identity, offset, most), &mut texts)
+          .map(|text| text.map(<[u8]>::to_vec));
         let _ = answer.try_send(read);
       }
       Request::Texts {
@@ -855,6 +852,19 @@ impl StoreHandle {
     identity: Identity,
     offset: u64,
   ) -> Result<Option<Vec<u8>>, OwnerError> {
+    let piece = u64::try_from(PIECE_BYTES).unwrap_or(u64::MAX);
+    self.text_slice(repository, identity, (offset, piece)).await
+  }
+
+  /// At most `most` bytes of the text `identity` of `repository` from `offset`, made from its chain on the owner
+  /// ([`Store::text_slice`]): a fetch's text past its step's copy budget copied in slices of that budget, one a request
+  /// (goal 93, main's ruling of 2026-11-25). Empty at its end, none past it or for a text no landed changeset kept.
+  pub async fn text_slice(
+    &self,
+    repository: u128,
+    identity: Identity,
+    (offset, most): (u64, u64),
+  ) -> Result<Option<Vec<u8>>, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
     self
       .ask(
@@ -862,6 +872,7 @@ impl StoreHandle {
           repository,
           identity,
           offset,
+          most,
           answer,
         },
         answers,

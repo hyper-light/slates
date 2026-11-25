@@ -2087,8 +2087,9 @@ fn a_mercurial_clone_larger_than_one_ring_region_is_answered_through_the_daemons
 /// A-745 (§4.17.1 "A fetch's answer"; found by use, w-interop: `clone --stream` of Mercurial's own history refused
 /// `PastAdmission`). Do: start a two-shard daemon whose edge serves loopback TLS, each request admitted one ring region;
 /// push one changeset whose one file is twice that room; then ask `stream_out` as `hg clone --stream` asks it. Expect
-/// `200` in `application/mercurial-0.1`, the answer `0` and its counts, and the file's revlog carrying its bytes whole:
-/// the revlogs sent a row at a time, never rendered whole within one request's room.
+/// `200` in `application/mercurial-0.1`, the answer `0` and its counts, and the file's revlog carrying its chunk whole,
+/// as 7.2 stores it (`slates_hg::revlog_chunk`: every byte odd, the text compresses, so one zstd frame): the revlogs
+/// sent a row at a time, never rendered whole within one request's room.
 #[test]
 fn a_mercurial_stream_clone_larger_than_one_ring_region_is_answered_through_the_daemons_edge() {
   let (identity, certificate) = identity();
@@ -2135,12 +2136,19 @@ fn a_mercurial_stream_clone_larger_than_one_ring_region_is_answered_through_the_
     "{:?}",
     &streamed.2[..streamed.2.len().min(40)]
   );
+  let mut chunk = Vec::new();
+  slates_hg::revlog_chunk::chunk(large, slates_hg::revlog_chunk::Pass::Send, &mut chunk)
+    .expect("the file's chunk");
+  assert_eq!(chunk.first(), Some(&b'('), "a zstd frame");
   let found = streamed
     .2
     .windows(64)
-    .position(|window| window == &large[..64])
-    .expect("the file's bytes");
-  assert_eq!(streamed.2.get(found..found + large.len()), Some(large));
+    .position(|window| window == &chunk[..64])
+    .expect("the file's chunk");
+  assert_eq!(
+    streamed.2.get(found..found + chunk.len()),
+    Some(chunk.as_slice())
+  );
 }
 
 /// The answer to a clone of Mercurial repository `name` at `head` by its owner, as stock hg 7.2 asks one over HTTP

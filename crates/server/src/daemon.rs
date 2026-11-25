@@ -988,6 +988,9 @@ impl Daemon {
     slates_seal::install();
     // A dispatch's session whose stragglers were dropped goes back to its link, never to nobody (A-907).
     slates_cluster::on_orphaned_session(crate::fleet::orphaned_session);
+    // An hg stream's chunk compression is timed on the shard's clock (goal 93 perf, `vcs_store.hg_stream_compress_*`);
+    // a second daemon in this process finds it installed.
+    slates_hg::revlog_chunk::install_clock(slates_rt::futures::now_ns);
     let listener = Listener::open(&config.instance, adoption.as_ref())?;
     let mut segment = match source {
       SegmentSource::Create { name } => {
@@ -9564,6 +9567,12 @@ mod tests {
   /// recovery keeps it in RAM), and the text read back whole through the node's store. Before stage B the entry waited
   /// for the shard's image to keep the text (A-727 slice b's barrier); before part 2 (b) the recovery read every stored
   /// text back into the content store.
+  ///
+  /// The schedule ThreadSanitizer's lane met (diags 5 and 7), held natively: the first daemon publishes only the image
+  /// its commit's apply makes, the text whole in it, never its checkpoint's (`verbs::PUBLICATIONS_LEFT`). The successor
+  /// restores the text whole, and the chain names it as a run its replay never reads (a new file's whole text): the
+  /// recovery, with nothing to bring back, made no content store and found nothing whole, and the text stayed in RAM for
+  /// good. It now makes the store before it judges, and lets go every named text it finds whole.
   #[test]
   fn a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry() {
     use slates_anchor::AnchorSegment;
@@ -9627,6 +9636,10 @@ mod tests {
             locks: slates_svn::lock::CommitLocks::default(),
           };
           let owner = crate::repository::svn_commit::tests::owner();
+          // The schedule TSan's lane met (diags 5 and 7): the commit's apply publishes its image, with the text whole,
+          // and the stop comes before the checkpoint's: the successor restores the text whole, and the chain's entry
+          // names it whole, read by no replay.
+          crate::verbs::PUBLICATIONS_LEFT.with(|left| left.set(Some(1)));
           let landed =
             crate::repository::svn_commit::land_work((&owner, repository), work, &texts).await;
           let _ = sent.send((repository, landed.map(|landed| landed.map(|_| ()))));
@@ -9699,6 +9712,7 @@ mod tests {
         [
           crate::vcs_store::svn_texts::PIECE_FETCHED,
           crate::vcs_store::svn_texts::NAMED_BROUGHT_BACK,
+          crate::vcs_store::svn_texts::NAMED_FOUND_WHOLE,
           crate::vcs_store::name_holds::LANDED_TEXT_LET_GO_BYTES,
           crate::vcs_store::name_holds::LANDED_TEXT_PINNED_READER,
           crate::vcs_store::name_holds::LANDED_TEXT_PINNED_HOMES,

@@ -342,8 +342,8 @@ pub(crate) fn named_lacking(
 ) -> Vec<(ContentIdentity, u64)> {
   named_texts(state, green)
     .into_iter()
-    .filter(|(_, _, whole)| !whole)
-    .map(|(identity, len, _)| (identity, len))
+    .filter(|named| named.read && !named.whole)
+    .map(|named| (named.identity, named.len))
     .collect()
 }
 
@@ -363,18 +363,25 @@ pub(crate) fn let_go_found_whole(state: &mut ShardState, found_whole: &[ContentI
 }
 
 /// The landed texts green `green`'s checkpoint and chain name that the content store holds whole now, for its recovery
-/// to let go once it has replayed ([`let_go_found_whole`]); none for a green of no Subversion repository.
+/// to let go once it has replayed ([`let_go_found_whole`]); none for a green of no Subversion repository. The content
+/// store is made first where it is not yet, as [`to_bring`] makes it, over the image's windows the recovery restored
+/// before its replays: else a text the image restored whole reads as no text at all, and is never let go (TSan diags 5
+/// and 7: a recovery with nothing to bring back made no store, and the text was whole once the shard made one).
 pub(crate) fn named_found_whole(
-  state: &ShardState,
+  state: &mut ShardState,
   green: slates_db::catalog::VolumeId,
 ) -> Vec<ContentIdentity> {
   if subversion_of(state, green).is_none() {
     return Vec::new();
   }
+  let window = state.store.content.chunk_bytes();
+  if state.vcs_stores.content_made(window).is_err() {
+    return Vec::new();
+  }
   named_texts(state, green)
     .into_iter()
-    .filter(|(_, _, whole)| *whole)
-    .map(|(identity, _, _)| identity)
+    .filter(|named| named.whole)
+    .map(|named| named.identity)
     .collect()
 }
 
@@ -382,25 +389,45 @@ pub(crate) fn named_found_whole(
 /// Format: a counter name in the daemon's status report.
 pub(crate) const NAMED_FOUND_WHOLE: &str = "vcs_store.svn_texts.named_found_whole";
 
-/// The texts green `green`'s checkpoint (A-869) and chain entries name, each once, with its length and whether the
-/// content store holds it whole.
-fn named_texts(
-  state: &ShardState,
-  green: slates_db::catalog::VolumeId,
-) -> Vec<(ContentIdentity, u64, bool)> {
-  let mut wanted: Vec<(ContentIdentity, u64, bool)> = Vec::new();
-  let mut seen: std::collections::BTreeSet<ContentIdentity> = std::collections::BTreeSet::new();
+/// A text green `green`'s checkpoint or chain names ([`named_texts`]).
+struct Named {
+  /// Its identity.
+  identity: ContentIdentity,
+  /// Its length.
+  len: u64,
+  /// Whether the content store holds it whole.
+  whole: bool,
+  /// Whether the replay reads it: the checkpoint's, and a chain entry's run its apply does not name whole (A-887,
+  /// `Increment::replay_reads`). One no replay reads is never brought back, but is let go where it is found whole (TSan
+  /// diags 5 and 7: a new file's text, named whole by its entry, restored whole and never let go).
+  read: bool,
+}
+
+/// The texts green `green`'s checkpoint (A-869) and chain entries name, each once ([`Named`]).
+fn named_texts(state: &ShardState, green: slates_db::catalog::VolumeId) -> Vec<Named> {
+  let mut wanted: Vec<Named> = Vec::new();
+  let mut seen: std::collections::BTreeMap<ContentIdentity, usize> =
+    std::collections::BTreeMap::new();
   // Held whole, or brought: a restored store keeps the name of a text whose window was let go, and the restore and the
   // replay read every byte (codex-review's restart of 2026-11-22: r1 fenced `ContentMissing` for one six-byte window).
-  let mut want = |identity: slates_merge::named::Identity| {
-    if !seen.insert(identity.hash) {
+  let mut want = |identity: slates_merge::named::Identity, read: bool| {
+    if let Some(at) = seen.get(&identity.hash) {
+      if let Some(named) = wanted.get_mut(*at) {
+        named.read |= read;
+      }
       return;
     }
-    let held = state
+    let whole = state
       .vcs_stores
       .content()
       .is_some_and(|content| content.holds_whole(&slates_vcs::ContentId(identity.hash)));
-    wanted.push((identity.hash, identity.len, held));
+    seen.insert(identity.hash, wanted.len());
+    wanted.push(Named {
+      identity: identity.hash,
+      len: identity.len,
+      whole,
+      read,
+    });
   };
   let partition = state.db.partition();
   if let Some((_, named)) = partition.green_checkpoint(green)
@@ -408,7 +435,7 @@ fn named_texts(
     && let Ok(checkpoint) = slates_merge::checkpoint::Checkpoint::decode(&bytes)
   {
     for file in &checkpoint.named {
-      want(file.identity);
+      want(file.identity, true);
     }
   }
   for bytes in partition.green_chain(green).iter() {
@@ -428,12 +455,11 @@ fn named_texts(
     let Ok(entry) = slates_merge::chain_entry::decode(bytes, &increment) else {
       continue;
     };
-    // A run the replay's apply names whole is never read for it (A-887, `Increment::replay_reads`): nothing to bring.
+    // A run the replay's apply names whole is never read for it (A-887, `Increment::replay_reads`): nothing to bring,
+    // but named all the same.
     let reads = entry.increment.replay_reads(&entry.applied);
     for (at, run) in entry.increment.named.runs.iter().enumerate() {
-      if reads.get(at).copied().unwrap_or(true) {
-        want(run.identity);
-      }
+      want(run.identity, reads.get(at).copied().unwrap_or(true));
     }
   }
   wanted
