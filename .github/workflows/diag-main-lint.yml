@@ -1,4 +1,7 @@
 name: diag-main-lint
+# Run 52 (main 01a20182, 2026-11-25 11:15 PST): main at its latest past 42b3f2a85: main's lint 51 fix (3b335511a),
+# w-perf's A-923 splits (42b3f2a85), A-924 piece 2b, w-hg's spin rule (27312c9cf), w-git's open_tree counters
+# (4940e5433) and w-svn's A-920 piece 5a (7f1730fd7).
 # Run 51 (main 01a20182, 2026-11-25 10:25 PST): main at 3f61d5429 after run 50 came back clean (a0b1d570d): w-git's
 # A-924 piece 2a (the daemon's spawner), w-perf's A-923 (Aways numbered, kind-15 migration, the cap rule) and w-hg's
 # push reds (ce768f168).
