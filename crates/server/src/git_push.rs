@@ -1441,9 +1441,6 @@ impl<P> Drop for ReceivePack<P> {
     let repository = self.repository;
     let _ = crate::state::with_state(|state| {
       crate::vcs_store::let_go_owed_as_push_ends(state, repository);
-      // The versions it left unknown derived behind it, so the first fetch after it finds them known (main 01a20182,
-      // 2026-11-25).
-      crate::vcs_store::git_derive::derive_behind(state, repository);
     });
   }
 }

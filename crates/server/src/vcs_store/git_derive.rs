@@ -26,7 +26,7 @@
 //! **Cancellation.** The derivation lives in the map, keyed by its repository; a request dropped between turns leaks
 //! nothing, the next fetch carries it on, and freeing the repository drops it ([`abandon`]).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 
 use slates_db::catalog::RepositoryId;
@@ -52,14 +52,9 @@ pub(crate) const REFUSED: &str = "vcs_store.git_derive.refused";
 /// shard's other work asked for. Format: a counter name.
 pub(crate) const TURNS_YIELDED: &str = "vcs_store.git_derive.turns_yielded";
 
-/// The derivations under way, one a repository (the module doc's bounds), and the repositories a task derives behind a
-/// push ([`derive_behind`]).
+/// The derivations under way, one a repository (the module doc's bounds).
 #[derive(Default)]
-pub(crate) struct Derivings(BTreeMap<RepositoryId, Deriving>, BTreeSet<RepositoryId>);
-
-/// Counter: a derivation begun behind a push as it ended ([`derive_behind`]), so the repository's first fetch after it
-/// finds its versions' sets known. Format: a counter name.
-pub(crate) const BEHIND: &str = "vcs_store.git_derive.behind";
+pub(crate) struct Derivings(BTreeMap<RepositoryId, Deriving>);
 
 impl fmt::Debug for Derivings {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -215,37 +210,6 @@ fn paced(
 /// Drops repository `id`'s derivation under way, if any: its repository is freed.
 pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
   state.vcs_stores.derivings.0.remove(&id);
-}
-
-/// Derives repository `id`'s versions behind a push of it as the push ends (main 01a20182's order of 2026-11-25: a first
-/// clone after git/git's push spent about a third of its wait for its first pack byte deriving the 1,027 tags' versions
-/// the push left unknown): a task of the shard turning [`derive_for_read`], so the derivation is sliced as a fetch's is,
-/// each turn yielding to whoever waits on the shard. A fetch that arrives meanwhile turns the same derivation (it is kept
-/// under way between turns, one a repository): it picks up where the task stopped, never derives a version again, and
-/// waits no longer than it would have alone. None begun where every version is known, or one already derives it;
-/// counted [`BEHIND`].
-pub(crate) fn derive_behind(state: &mut ShardState, id: RepositoryId) {
-  let due = state
-    .vcs_stores
-    .git(id)
-    .is_some_and(|(_, store)| store.repository.derivations_due());
-  if !due || !state.vcs_stores.derivings.1.insert(id) {
-    return;
-  }
-  state.count(BEHIND, 1);
-  let behind = async move {
-    derive_for_read(id).await;
-    let _ = crate::state::with_state_counted(|state| state.vcs_stores.derivings.1.remove(&id));
-  };
-  match slates_rt::futures::spawn(behind) {
-    Ok(task) => {
-      let _ = slates_rt::futures::detach(task);
-    }
-    // No task to spare: the first fetch derives, as before.
-    Err(_) => {
-      state.vcs_stores.derivings.1.remove(&id);
-    }
-  }
 }
 
 /// Turns repository `id`'s derivation until every version's sets are known, yielding between turns (the module doc):
