@@ -2847,8 +2847,12 @@
 > 2026-11-25): taken out of the record with their pages resident, no later purge or coalesce saw them again, free space a
 > long-lived daemon lost without bound; recorded, a later free beside one joins it into a run a purge gives back
 > (`a_run_kept_short_stays_recorded_so_a_later_free_beside_it_goes_back`: red, the second purge gave back nothing; now
-> the joined two pages). An idle purge walks the kept runs again at each idle pass (sliced) while any stay recorded.
-> OWED: a grown region's never-used space, should the arm show it.
+> the joined two pages). An idle purge walks nothing while no recorded run reaches the discard size (main's ruling of
+> 2026-11-25: kept runs recorded made every idle pass walk them, an idle daemon's CPU and wakeups growing with
+> fragmentation): a mark that makes a run that long owes the next walk (`UnitSet::run_reaches`, a scan bounded by the
+> discard size), a walk's start clears it (`an_idle_purge_walks_nothing_while_no_recorded_run_reaches_the_discard_size`:
+> red, every pass walked the short run; now none, until a free joins it into a run the next pass gives back). OWED: a
+> grown region's never-used space, should the arm show it.
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
