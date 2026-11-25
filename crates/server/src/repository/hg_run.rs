@@ -565,6 +565,7 @@ pub(crate) fn texts_section(texts: &[KeptText], payload: [u8; 32]) -> Vec<u8> {
         offset: kept.place.start,
         len: kept.place.end.saturating_sub(kept.place.start),
       },
+      form: slates_store::texts::Form::Raw,
     })
     .collect();
   slates_store::texts::encode(&entries)

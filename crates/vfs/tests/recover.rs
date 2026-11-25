@@ -2431,7 +2431,10 @@ fn stream_into(
   }
   ShardImage::encode_finish(
     stream.buf(),
-    held,
+    &mut held
+      .iter()
+      .map(slates_vfs::recover::HeldPiece::as_ref)
+      .collect::<Vec<_>>(),
     (replies, calls, nfs_replies, nfs_states),
   );
   journal.finish_checkpoint(stream)
@@ -2887,3 +2890,43 @@ const GOLDEN_WITNESS: &str = concat!(
   "0700000000000000",         // witnessed at
   "00",                       // racy: false
 );
+
+/// Goal 93 (main's ruling of 2026-11-25: a publication encodes the server's image pages borrowed, with no format change).
+/// Golden vector: a held piece, and a list of them, encoded as `HeldPiece`s (`Wire`) and as `HeldPieceRef`s
+/// (`HeldPieceRef::encode`, `encode_held_pieces`). Expect the same bytes, the list's in key order whatever order it was
+/// given, and the borrowed encoding decoded back as the owned pieces.
+#[test]
+fn a_borrowed_held_piece_encodes_byte_for_byte_as_an_owned_one() {
+  use slates_vfs::recover::{HELD_PIECE_KEY_BYTES, HeldPiece, HeldPieceRef, encode_held_pieces};
+  use slates_wire::Wire;
+  let piece = |first: u8, bytes: &[u8]| HeldPiece {
+    key: core::array::from_fn(|at| first.wrapping_add(at as u8)),
+    bytes: bytes.to_vec(),
+  };
+  let one = piece(9, b"a page's bytes");
+  let mut owned = Vec::new();
+  one.encode(&mut owned);
+  let mut borrowed = Vec::new();
+  one.as_ref().encode(&mut borrowed);
+  assert_eq!(borrowed, owned, "one piece, byte for byte");
+  let mut expected = vec![9u8; 0];
+  expected.extend_from_slice(&one.key);
+  expected.extend_from_slice(&u32::try_from(one.bytes.len()).unwrap().to_le_bytes());
+  expected.extend_from_slice(&one.bytes);
+  assert_eq!(
+    owned, expected,
+    "the golden vector: its key, its length, its bytes"
+  );
+  let pieces = vec![piece(3, b""), piece(1, b"x"), piece(2, &[7u8; 300])];
+  let mut sorted = pieces.clone();
+  sorted.sort_by_key(|piece| piece.key);
+  let mut owned = Vec::new();
+  sorted.encode(&mut owned);
+  let mut refs: Vec<HeldPieceRef<'_>> = pieces.iter().map(HeldPiece::as_ref).collect();
+  let mut borrowed = Vec::new();
+  encode_held_pieces(&mut refs, &mut borrowed);
+  assert_eq!(borrowed, owned, "a list, byte for byte, in key order");
+  let decoded = Vec::<HeldPiece>::decode(&mut borrowed.as_slice()).unwrap();
+  assert_eq!(decoded, sorted, "read back as the owned pieces");
+  assert_eq!(HELD_PIECE_KEY_BYTES, one.key.len());
+}

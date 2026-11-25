@@ -1015,6 +1015,9 @@ impl Daemon {
     // An hg stream's chunk compression is timed on the shard's clock (goal 93 perf, `vcs_store.hg_stream_compress_*`);
     // a second daemon in this process finds it installed.
     slates_hg::revlog_chunk::install_clock(slates_rt::futures::now_ns);
+    // The changeset store reads a text kept as a revlog chunk through Mercurial's own decoder (goal 93, main's ruling (b)
+    // of 2026-11-25), which the store cannot build; a second daemon in this process finds it installed.
+    let _ = slates_store::texts::install_chunk_decoder(slates_hg::revlog_chunk::decode_within);
     let listener = Listener::open(&config.instance, adoption.as_ref())?;
     let mut segment = match source {
       SegmentSource::Create { name } => {
@@ -10614,7 +10617,7 @@ mod tests {
             archive,
           )
           .unwrap();
-        let changes = crate::content_holder::held_changes(state);
+        let changes = crate::content_holder::held_changes_carried(state);
         carried.insert(
           changes
             .put
@@ -10856,7 +10859,7 @@ mod tests {
               state.holder_records.insert(object(which), fresh);
             }
             HeldStep::Delta => {
-              let changes = crate::content_holder::held_changes(state);
+              let changes = crate::content_holder::held_changes_carried(state);
               for piece in &changes.put {
                 proptest::prop_assert!(
                   !changes.removed.contains(&piece.key),
@@ -11675,7 +11678,7 @@ mod tests {
         .collect();
       // The move, then the delta after it, folded as recovery folds it (`ShardImage::apply`: puts, then removals).
       crate::fleet::reconcile_held_authority(state);
-      let changes = crate::content_holder::held_changes(state);
+      let changes = crate::content_holder::held_changes_carried(state);
       let in_delta = changes.put.len();
       for piece in &changes.put {
         journal.insert(piece.key, piece.bytes.clone());

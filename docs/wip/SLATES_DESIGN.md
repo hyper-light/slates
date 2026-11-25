@@ -63714,6 +63714,45 @@ Applied in the same change to: the A-912 entry's homing window (learned once mea
 {failover,member_plane}.rs`, `crates/server/src/{fleet,takeover,state,daemon,lib}.rs`, `crates/server/tests/fleet.rs`,
 GAPS.
 
+### A-918 (i) — A holder behind a green's record answers it typed (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25 ((3), (2) and B; this is B's first piece); A-912's sibling; amends A-412)
+
+- **Why.** In a914's scene a push during a death was refused at its record barrier, `unable to commit` (2 of 7, then 4
+  of 6). The barrier refusal's log, now naming each pending version's waits, showed the cause. After a death at 3
+  members every member is a green's candidate, so a node that held none of the green joined its cohort. It refused
+  each record above v0 out of order (`record_standing`: no replica, no records), answered nothing, and was shipped the
+  same record every pass for good: `merge.out_of_order` reached 4006 in one red run of the A-918 fleet test. A-412
+  brings a holder up from its own ledger only, and the record plane never ships a placed version again.
+  - Durability held. A-546's settle certifies `f + 1` (`greens_placed_on_current_cohort`), met by the owner and the
+    old candidate.
+  - Liveness did not: once an `f + 1` for the next version needs the newcomer, the version never places.
+- **The change (i).**
+  - Every refusal is typed. A holder behind a record answers `ContentMessage::Behind { object, sequence, reached }`
+    (kind 11; `reached` is the newest version its replica holds, `None` for none of the green). It answers so where it
+    counted `OUT_OF_ORDER` and answered nothing: holding none of the green, or lacking a record its ledger cannot
+    bring it to (`catch_up`). Counted `merge.behind.answered`.
+  - The owner records each behind target on the pending version (`PendingMergeRecord::behind`, bounded by the
+    candidates; a target leaves once it acknowledges), counted `merge.behind.heard`. A refused barrier's log names it,
+    with the version's other waits and the placement: on the refusal's cold path, bounded by the pending versions
+    times the members.
+  - An owner whose build predates kind 11 refuses it typed (`ContentError::UnknownKind`) and reads it as no answer, as
+    it read the silence before. A flag byte past its two values is `ContentError::BadFlag`.
+- **What follows (main's order).** A-919 ships a state log's prefix to a candidate joining past parts every earlier
+  one held. Then B: on `Behind`, the newcomer rebuilds the green through a takeover successor's own path from a live
+  holder, never an owner-pushed second path. The owner holds no per-version records or inputs below a green's floor,
+  so it could not push the chain from v0 anyway.
+- **Tests.**
+  - `slates-cluster` content: `a_behind_answer_has_a_golden_encoding`, and `every_message_round_trips` with both
+    `reached` forms.
+  - `merge_service::tests::a_holder_holding_none_of_a_green_stands_behind_a_later_version_and_next_at_version_zero`.
+  - `merge_service::tests::an_owner_records_a_targets_behind_answer_on_its_pending_version`.
+  - The fleet test `a918_a_candidate_a_death_brings_in_is_shipped_the_greens_chain_and_holds_the_next_version` is red
+    until B and lands with it.
+- **Models.** None of `docs/wip/models/` models a holder's merge answers; no spec changed.
+
+Applied in the same change to: the A-412 note in `merge_service::catch_up`'s doc (it now answers behind),
+`crates/cluster/src/content.rs`, `crates/server/src/{merge_service,state_log}.rs`, `crates/server/tests/fleet.rs`
+(a914's wait factored out as `poll_taken_over_and_unseated`), GAPS.
+
 ### A-915 — Nothing acknowledged rests on a part only the dead owner held: a repository's creation answers once its root's join is at f + 1 too, and an adoption never waits for a join no owner is left to ship (2026-11-24, w-shared for main 01a20182, its ruling (1); a894's flake, my regression from A-908 part 4; amends A-894 and A-908)
 
 - **Why.** a894 (a repository's owner killed as its creation answers) failed under load, about 1 run in 3 at load 60 to
@@ -63783,7 +63822,7 @@ GAPS.
 - **Evidence.** `git_push::tests::a916_a_fetch_derived_between_two_pushes_leaves_the_store_its_records_make_again`: red
   on main (the oracle differing), green with the write gone.
 
-### Deriving a push's versions behind it: built, withdrawn (2026-11-25, w-git for main 01a20182; status)
+### Deriving a push's versions behind it: built, withdrawn, returned (2026-11-25, w-git for main 01a20182; status)
 
 - **Built** (750d2bca3): `git_derive::derive_behind`, a task of the shard turning `derive_for_read` as a git push ended,
   so the first fetch after it found its versions derived (git/git's first clone had spent 12.15 s of its 40.34 s first
@@ -63794,11 +63833,18 @@ GAPS.
   for 877 versions, against 338 turns and 12.15 s for 1,027 with nothing behind; the first pack byte 40.3 → 61.9 s).
   (2) `vcs_http::daemon_edge::tests::a_ref_listing_after_a_push_waits_for_no_derivation_or_encoding` failed under
   ThreadSanitizer (diag 9, run 45595905963): a listing after the push waited behind the derivation.
-- **Owed before it returns:** a fetch arriving while the derivation behind is under way reaches its first pack byte no
-  later than one with nothing behind (held by turns and nanoseconds); and a ref listing after a push waits for no
-  derivation, held under slow scheduling (the wait may borrow `test_lane::slowdown`, a bet on speed, not the rule). A
-  start on the first: the reader marks the repository read-driven and the task behind stops before its next turn
-  (`agents/w-git-derive-behind-2`, 014f477de, not landed).
+- **Returned** (the commit after the revert's, main 01a20182's go): the task behind a push stops before its next turn
+  wherever a reader drives the repository (`derive_for_read` marks it read-driven while it runs; counted
+  `vcs_store.git_derive.behind_handed`), so the reader turns the kept derivation alone at full turns and keeps what was
+  derived; and, being no reader, the task behind turns a quantum at most (its ceiling the quantum), so whatever comes to
+  the shard meets it within one. Turns are counted by driver (`vcs_store.git_derive.read_turns`, `behind_turns`): a
+  listing never derives (a request derives only where it fetches), and TSan diag 9's listing failure was the old count
+  taking the task behind's turns for the listing's (4 before it, 9 after, where a store with nothing behind counts 0).
+- **Evidence.** `git_push::tests::a_fetch_arriving_mid_derivation_is_no_later_than_one_with_nothing_behind`: red with the
+  task behind turning to the ceiling and never handing over, 446 turns against 1 alone; green, 2 turns and 42.9 ms
+  against 1 and 47.3 ms, handed once. `vcs_http::daemon_edge::tests::a_ref_listing_during_a_derivation_behind_a_push_drives_none_of_it`:
+  red with one count of every derive turn (100 → 117 across the listing); green, a reader's turns 0 → 0 while the task
+  behind turned 364, the listing answered in 14.8 ms (its patience scaled by `test_lane::slowdown`).
 
 ### A-917 — A recorded version is applied a slice at a time, and `apply_recorded` is that run carried to its end (2026-11-25, w-svn for main 01a20182, goal 93's slicing piece 3; §4.16, A-760, A-910)
 
