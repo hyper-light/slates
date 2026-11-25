@@ -1639,7 +1639,10 @@
 > does (`ContentStore::pin_unlanded`/`unpin_unlanded`, refused `LetGoRefused::Unlanded`, counted
 > `vcs_store.content.kept_unlanded`; the count's width refused typed, `ContentRefused::CountExhausted`, never wrapped; a
 > pin of nothing refused `NotHeld`; a window found let go as it is pinned counted `vcs_store.content.pinned_away`, a bug
-> signal that must stay 0; an unpin comes before its holder releases the object). A
+> signal that must stay 0; an unpin comes before its holder releases the object; the count is the live process's alone,
+> never in the shard image, so a restart after a crash with texts pinned finds every count at 0, since no pinning push or
+> import outlives the process: `a_windows_unlanded_count_is_never_carried_across_a_restart`, through the daemon's own
+> restore, red with the restore carrying a count). A
 > push pins each revision as its intake keeps it (`slates_hg::push::pins::Counted` over `Intake::kept_contents`, after
 > each slice), unpins a segment's own just before that segment's let-go (`landed_segment`; never at its taking, since its
 > record is written over turns before it lands), and the rest however the push ends (`Taking`'s drop). `landed_pin` asks
