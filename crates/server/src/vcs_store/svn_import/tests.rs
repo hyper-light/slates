@@ -1127,13 +1127,19 @@ fn copied_dir(to: &str, (from, rev): (&str, u64)) -> String {
 fn imported_whole_and_stepped(
   name: &'static str,
   dump: Vec<u8>,
-) -> (Result<u64, String>, u64, u64, (u64, u64)) {
+) -> (Result<u64, String>, u64, u64, (u64, u64, u64)) {
   let read = stored(move || {
     cpu_timed(async move {
       let (svn, green) = subversion(name).await;
       let (loaded, _turns) = imported(svn, dump).await;
       checkpoints_ended().await;
       let build_units = on(|state| count(state, crate::merge_service::CHECKPOINT_BUILD_UNITS));
+      let walk_most = on(|state| {
+        count(
+          state,
+          crate::repository::svn_commit::staging::RECORDING_WALK_MOST_FILES,
+        )
+      });
       let grafted = on(|state| {
         state
           .greens
@@ -1147,7 +1153,7 @@ fn imported_whole_and_stepped(
           .map_err(|failed| format!("{failed:?}")),
         longest_ns,
         crate::watchdog::own_window_ns(),
-        (grafted, build_units),
+        (grafted, build_units, walk_most),
         longest_task,
       )
     })
@@ -1155,13 +1161,14 @@ fn imported_whole_and_stepped(
   // Every run shows its numbers, so a probe judges each against the 1 ms bar, and names what held the longest.
   eprintln!(
     "{name}: youngest {:?}, the longest step {} us of a window of {} us ({}), {} copies grafted, {} checkpoint build \
-     units",
+     units, {} files at most a recording walk unit",
     read.0,
     read.1 / 1000,
     read.2 / 1000,
     read.4,
     read.3.0,
-    read.3.1
+    read.3.1,
+    read.3.2
   );
   (read.0, read.1, read.2, read.3)
 }
@@ -1384,9 +1391,16 @@ fn t_a920_a_revision_copying_a_tree_of_thousands_of_files_imports_with_every_ste
     WIDE_TEXT_BYTES,
     &[copied_dir("branch", ("trunk", 1))],
   );
-  let (loaded, longest_ns, window_ns, (grafted, _)) = imported_whole_and_stepped("wide-copy", dump);
+  let (loaded, longest_ns, window_ns, (grafted, _, walk_most)) =
+    imported_whole_and_stepped("wide-copy", dump);
   assert_eq!(loaded, Ok(2));
   assert!(grafted > 0, "no copy grafted");
+  // The copy's tree walked a file a unit in its revision's recording (A-920 9a: its 9,000 files in one unit, 23.5-30.6
+  // ms, debug).
+  assert!(
+    walk_most <= 1,
+    "a unit of the recording's walk found {walk_most} files"
+  );
   assert!(
     longest_ns < window_ns,
     "a step of {longest_ns} ns against the shard's window of {window_ns} ns"
@@ -1409,8 +1423,14 @@ fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step
     WIDE_TEXT_BYTES,
     &[copied_dir("branch", ("trunk", 1)), moved],
   );
-  let (loaded, longest_ns, window_ns, (grafted, build_units)) =
+  let (loaded, longest_ns, window_ns, (grafted, build_units, walk_most)) =
     imported_whole_and_stepped("wide-move", dump);
+  // The copies' and the move's trees walked a file a unit in their revisions' recordings (A-920 9a: a copied or
+  // deleted tree's 9,000 files in one unit, 21-31 ms, debug).
+  assert!(
+    walk_most <= 1,
+    "a unit of the recordings' walks found {walk_most} files"
+  );
   assert_eq!(loaded, Ok(3));
   assert!(grafted >= 2, "{grafted} copies grafted");
   // A checkpoint of the green holding the branch's and the move's trees built a unit at a time, a copied key a unit
@@ -1422,6 +1442,64 @@ fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step
   assert!(
     longest_ns < window_ns,
     "a step of {longest_ns} ns against the shard's window of {window_ns} ns"
+  );
+}
+
+/// Shape: the files of the trunk [`a_moves_recording_walked_a_node_a_step_finds_the_texts_the_whole_walk_finds`]
+/// moves: enough for the walk to stop inside a tree many times, few enough for a quick import.
+const WALKED_TRUNK_FILES: usize = 40;
+
+/// The texts of a walk's `found` files by path, each path once (its last).
+fn texts_by_path(
+  found: Vec<crate::vcs_store::svn_texts::FileText>,
+) -> std::collections::BTreeMap<String, slates_svn::index::ContentIdentity> {
+  found
+    .into_iter()
+    .map(|(identity, path)| (path, identity))
+    .collect()
+}
+
+/// A-920 9a. Do: import [`wide_trunk`]'s trunk of [`WALKED_TRUNK_FILES`] files, a revision 2 copying it and a revision 3
+/// moving it (a copy, then the trunk's delete); walk revision 3's rows a node a step, as a recording whose every step is
+/// spent walks them (`staging::walked_a_unit_a_step`), and whole (`svn_texts::released_before` at revision 2,
+/// `held_after` at 3). Expect: the same texts let go and held, by path: the trunk's every file let go, the moved
+/// tree's every file held.
+#[test]
+fn a_moves_recording_walked_a_node_a_step_finds_the_texts_the_whole_walk_finds() {
+  let moved = format!(
+    "{}Node-path: trunk\nNode-action: delete\n\n",
+    copied_dir("moved", ("trunk", 2))
+  );
+  let dump = wide_trunk(
+    WALKED_TRUNK_FILES,
+    WIDE_TEXT_BYTES,
+    &[copied_dir("branch", ("trunk", 1)), moved],
+  );
+  let (stepped, whole) = stored(move || async move {
+    let (svn, _green) = subversion("walked-move").await;
+    let (loaded, _turns) = imported(svn, dump).await;
+    assert_eq!(loaded.map(|loaded| loaded.youngest), Ok(3));
+    on(|state| {
+      use crate::vcs_store::svn_texts::{held_after, released_before};
+      let records = state
+        .vcs_stores
+        .subversion_records(svn)
+        .expect("the records");
+      let changes = records.index().changes(3).expect("revision 3").to_vec();
+      let stepped =
+        crate::repository::svn_commit::staging::walked_a_unit_a_step(records, &changes, (2, 3));
+      let whole = (
+        texts_by_path(released_before(records, &changes, 2)),
+        texts_by_path(held_after(records, &changes, 3)),
+      );
+      (stepped, whole)
+    })
+  });
+  assert_eq!(stepped, whole, "the texts let go and held");
+  assert_eq!(
+    (whole.0.len(), whole.1.len()),
+    (WALKED_TRUNK_FILES, WALKED_TRUNK_FILES),
+    "the trunk's files let go and the moved tree's held"
   );
 }
 
