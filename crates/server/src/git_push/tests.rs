@@ -328,31 +328,6 @@ fn started(state: &mut ShardState, repository: RepositoryId) -> (Vec<u8>, Receiv
   (advertised, push)
 }
 
-/// `request` handed to `push` a piece at a time as an edge hands it in, then its end, then its
-/// answer, a step at a time while its checks turn (A-719) under a presenter that shows no view:
-/// what the driver wrote, and what it received.
-fn answered(state: &mut ShardState, push: &mut ReceivePack, request: &[u8]) -> (Vec<u8>, Received) {
-  for piece in request.chunks(PIECE) {
-    push.input(state, piece).expect("taken");
-  }
-  push.end(state).expect("ended");
-  let mut answer = Vec::new();
-  loop {
-    match push.answer_step(state, &mut answer).expect("answered") {
-      Answering::Answered(received) => return (answer, *received),
-      Answering::Turned => carry_blocking(state, push),
-      #[cfg(unix)]
-      step @ Answering::Hook(_) => panic!("no hook runs where no view is shown: {step:?}"),
-    }
-  }
-}
-
-/// `request` pushed to `repository` by its owner: what was received.
-pub(crate) fn pushed(state: &mut ShardState, repository: RepositoryId, request: &[u8]) -> Received {
-  let (_, mut push) = started(state, repository);
-  answered(state, &mut push, request).1
-}
-
 /// Shape: how long an awaiting history ([`on_stored_shard_awaited`]) may run on its shard before the test fails: as long
 /// as `svn_commit`'s histories are held.
 const HISTORY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
@@ -361,7 +336,7 @@ const HISTORY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120
 /// allow-list): `history` runs as a task on the stored daemon's first shard ([`crate::test_store::run_on_first`]), with
 /// git repositories `names` made first from the test's thread, and reads and changes the shard's state between its awaits
 /// through [`crate::state::with_state`]; its pushes land on the store by awaiting ([`answered_awaited`]), never holding
-/// the shard through the store's commit, as [`answered`]'s [`carry_blocking`] does.
+/// the shard through the store's commit, as the synchronous driver's `carry_blocking` did (removed with it, 2026-11-25).
 pub(crate) fn on_stored_shard_awaited<T, F, const N: usize>(
   names: [&'static str; N],
   history: impl FnOnce([RepositoryId; N]) -> F + Clone + Send + 'static,
@@ -416,7 +391,7 @@ pub(crate) fn on_state<T>(f: impl FnOnce(&mut ShardState) -> T) -> T {
   crate::state::with_state(f).expect("the shard's state")
 }
 
-/// [`answered`] as an edge's task drives it: `request` a piece at a time, then its end, then its answer a step at a
+/// A push driven as an edge's task drives it: `request` a piece at a time, then its end, then its answer a step at a
 /// time, yielding after each turn and carrying what the push asks off the step ([`carry_awaited`]): what the driver
 /// wrote, and what it received.
 pub(crate) async fn answered_awaited(
@@ -446,8 +421,8 @@ pub(crate) fn dropped_in_a_step(push: ReceivePack) {
   on_state(|_| drop(push));
 }
 
-/// [`pushed`] awaited: `request` pushed to `repository` by its owner from a task of its shard ([`answered_awaited`]).
-/// The push is dropped where the shard's state is lent, as [`pushed`]'s step drops it, so what a push's end starts
+/// `request` pushed to `repository` by its owner from a task of its shard ([`answered_awaited`]). The push is dropped
+/// where the shard's state is lent, as a synchronous step dropped it, so what a push's end starts
 /// through the state (a derivation behind it, its owed let-gos) is not started: a test that measures a derivation
 /// drives it itself.
 pub(crate) async fn pushed_awaited(repository: RepositoryId, request: &[u8]) -> Received {
@@ -472,7 +447,21 @@ pub(crate) fn pushed_on(
   )
 }
 
-/// [`pushed_from_the_fixtures`] awaited ([`pushed_awaited`]).
+/// The fixtures' scenarios `names` pushed from a task of `daemon`'s first shard
+/// ([`pushed_from_the_fixtures_awaited`]), the test's thread waiting for it.
+pub(crate) fn pushed_from_the_fixtures_on(
+  daemon: &crate::Daemon,
+  repository: RepositoryId,
+  names: &'static [&'static str],
+) {
+  crate::test_store::run_on_first(
+    daemon,
+    move || async move { pushed_from_the_fixtures_awaited(repository, names).await },
+    HISTORY_PATIENCE,
+  );
+}
+
+/// Pushes the fixtures' scenarios `names` in order to `repository` ([`pushed_awaited`]), each answered `ok`.
 pub(crate) async fn pushed_from_the_fixtures_awaited(repository: RepositoryId, names: &[&str]) {
   let mut taken = Vec::new();
   for (scenario, _) in chain() {
@@ -559,28 +548,6 @@ fn assert_hold_the_second_text(state: &mut ShardState, repository: RepositoryId,
   for name in names {
     assert_eq!(files(state, repository, name), second, "{name}");
   }
-}
-
-/// Pushes the fixtures' scenarios `names` in order to `repository`, each answered `ok` for every command.
-pub(crate) fn pushed_from_the_fixtures(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  names: &[&str],
-) {
-  let mut taken = Vec::new();
-  for (scenario, _) in chain() {
-    if names.contains(&scenario.name) {
-      let received = pushed(state, repository, scenario.request);
-      assert!(
-        reasons(&received).iter().all(|reason| reason == b"ok"),
-        "{}: {:?}",
-        scenario.name,
-        received.outcomes
-      );
-      taken.push(scenario.name);
-    }
-  }
-  assert_eq!(taken, names);
 }
 
 /// A-654 part 2 (§4.17.2 "A push" items 1 to 7; golden vectors: six pushes stock git 2.50.1 made, captured by
@@ -2591,31 +2558,10 @@ fn t_a727_a_plain_push_then_its_update_are_made_again_with_the_same_holders() {
   });
 }
 
-/// The edge's carry as a test's synchronous driver stands in for it (C5 part 2b piece 2: a push whose homing no edge
-/// takes is refused): its names and pack kept for the region on this shard as their home keeps them
-/// (`crate::vcs_store::homes::keep_for_region`, the home's own step; a test's daemon is one node, and the crossing to
-/// other homes is held by the async drivers' tests, [`homed_drive`]), and its changeset landed on the node's store for
-/// real, from a thread of its own (`crate::test_store::land_answered_blocking`). Nothing to do where the push asked
-/// nothing.
-pub(crate) fn carry_blocking<P>(state: &mut ShardState, push: &mut ReceivePack<P>) {
-  // The shard's materializations run between the push's turns, as their tasks would (P2's door): a synchronous driver
-  // holds the shard, so a push waiting at the door for a green would otherwise wait forever.
-  crate::green_ready::make_building_now(state);
-  let Some(asked) = push.take_homing() else {
-    return;
-  };
-  // Allow-listed until git_push's tests carry a push in a task that awaits its landing (`test_store::
-  // SHARD_BLOCKING_ALLOWED`, w-git's to empty).
-  let carried =
-    crate::test_store::allowing_shard_blocking("git_push::tests::carry_blocking", || {
-      carried_blocking(state, asked)
-    });
-  push.homed(state, carried);
-}
-
-/// `carry` carried as [`carry_blocking`] stands in for the edge: content kept for the region on this shard as its home
-/// keeps it, a changeset landed on the node's store from a thread of its own. What a git commit the server makes is
-/// carried by in a test's synchronous driver too (`crate::vcs_store::commits::made_landing_now`).
+/// `carry` carried as a test's synchronous driver stands in for the edge (`vcs_store::commits::home_and_land_blocking`,
+/// allow-listed as w-hg's): content kept for the region on this shard as its home keeps it, a changeset landed on the
+/// node's store from a thread of its own. What a git commit the server makes is carried by in a test's synchronous
+/// driver too (`crate::vcs_store::commits::made_landing_now`).
 pub(crate) fn carried_blocking(state: &mut ShardState, carry: super::Carry) -> super::Carried {
   match carry {
     super::Carry::Home(bytes, owner) => {

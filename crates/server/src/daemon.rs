@@ -8461,11 +8461,10 @@ mod tests {
     // A repository beside the object, so the successor's recovery replays its records and then frees every restored
     // window nothing holds (`release_unheld`): the region hold must be what keeps the object.
     let beside = crate::git_push::tests::git_repository_on(&first, "beside");
+    crate::git_push::tests::pushed_from_the_fixtures_on(&first, beside, &["create"]);
     first
-      .observe(shard, move |state| {
-        let repository = beside;
-        crate::git_push::tests::pushed_from_the_fixtures(state, repository, &["create"]);
-        let _ = made.send(repository);
+      .observe(shard, move |_| {
+        let _ = made.send(beside);
       })
       .unwrap();
     let repository = repository.recv().expect("the repository made");
@@ -9809,12 +9808,9 @@ mod tests {
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
     let repository = crate::git_push::tests::git_repository_on(&first, "large");
+    let _ = crate::git_push::tests::pushed_on(&first, repository, &request);
     let unread = first
-      .observe(first.shards.first().copied(), move |state| {
-        let received = crate::git_push::tests::pushed(state, repository, &request);
-        let _ = received;
-        read(state)
-      })
+      .observe(first.shards.first().copied(), move |state| read(state))
       .unwrap();
     let before = until_read(&first);
     first.publish_every_shard().unwrap();
@@ -10317,9 +10313,9 @@ mod tests {
     first.bootstrap(true).unwrap();
     let shard = first.shards.first().copied();
     let repository = crate::git_push::tests::git_repository_on(&first, "kept");
+    crate::git_push::tests::pushed_from_the_fixtures_on(&first, repository, &["create", "update"]);
     let map_before = first
       .observe(shard, move |state| {
-        crate::git_push::tests::pushed_from_the_fixtures(state, repository, &["create", "update"]);
         crate::vcs_store::paths::whole_build::settle(state);
         let map = main_map(state).and_then(|(_, map)| map);
         // The greens' maps are derived data: a successor replays a created green owing its push again, and derives its

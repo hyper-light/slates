@@ -1158,7 +1158,7 @@
 >   bare runtime runs on the test's thread and is not refused. The fixtures still blocking are named in
 >   `test_store::SHARD_BLOCKING_ALLOWED`, each with its owner and how many sites reach it, and run their blocking body
 >   through `allowing_shard_blocking`; there is no global off-switch. The list only shrinks.
->   **The shard-blocking allow-list: 10 fixtures** (a test holds the list's length to this figure; edit both together):
+>   **The shard-blocking allow-list: 9 fixtures** (a test holds the list's length to this figure; edit both together):
 >   - `test_store::audit_on_stored_shard`: 114 sites. svn 0; git 0; hg 32 (`hg_push/tests.rs` 15, `hg_view/tests.rs`
 >     10, `hg_import/tests.rs` 7); other 82 (`push/tests.rs` 18, `vcs_store/tests.rs` 14, `paths/tests.rs` 11,
 >     `repository.rs` 10, `commits/tests.rs` 8, `identities/tests.rs` 8, `vcs_share/grants.rs` 4,
@@ -1173,12 +1173,14 @@
 >     tests refused with its allowance taken away: `vcs_http::daemon_edge` and `vcs_store::upload` reach it no more, and
 >     one `vcs_share` test's Mercurial creation (`hg_repository`, w-hg's) moved here from `audit_on_stored_shard` when
 >     its git creation left the shard.
->   - `git_push::tests::carry_blocking` (3 direct sites: `git_push::tests::answered`, the synchronous push driver every
->     remaining `pushed` reaches; `vcs_share/tests.rs` 1; `vcs_store/commits.rs` 1): w-git. `git_push/tests.rs`'s 50
->     tests push by awaiting now (`on_stored_shard_awaited`, `pushed_awaited`, `pushed_on`: a shard task that carries
->     with `carry_awaited` and drops its push where the state is lent, as a step does), 5 direct sites gone. (`git_push::tests::git_repository`, 41 sites, emptied and removed
->     by w-git: each caller makes its repository from the test's thread, `git_repository_on`, or through
->     `on_stored_shard_with`.)
+>   - (`git_push::tests::carry_blocking`, 8 direct sites, and `git_push::tests::git_repository`, 41 sites: both emptied
+>     and removed by w-git, 2026-11-25. Every test that pushed through the synchronous driver (`answered`, `pushed`,
+>     `pushed_from_the_fixtures`, removed with it) pushes by awaiting: `git_push::tests::on_stored_shard_awaited` and its
+>     configured and made forms run the history as a shard task, `pushed_awaited` and `answered_awaited` carry with
+>     `carry_awaited` and drop the push where the state is lent, as a step did, and `pushed_on` /
+>     `pushed_from_the_fixtures_on` push from the test's thread: `git_push/tests.rs`, `git_encode/tests.rs`,
+>     `vcs_share/tests.rs`, `replica.rs`, `daemon.rs`. Each caller of `git_repository` makes its repository from the
+>     test's thread, `git_repository_on`, or through `on_stored_shard_with`.)
 >   - w-hg's push and import helpers, counted by the tests refused without each once the entries above let them
 >     through: `repository::hg_push::land_stored` (2 tests, `vcs_ssh::tests::hg`),
 >     `repository::hg_push::land_in` (1, `hg_made`), `vcs_store::commits::home_and_land_blocking` (7: `commits` 6,
