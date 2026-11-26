@@ -72,8 +72,10 @@
 //! default branch is unborn, a create's push is over an empty green, made from the default branch's green, which must be
 //! empty at its version 0: the default branch itself owes the push as its next version (`BranchChange::UpdateDeferred`),
 //! any other ref is a new branch made at that empty version. A default branch that holds files no git commit names
-//! refuses it, typed: its commit is A-664's. A command reaches greens only through the door: one that owes its push is
-//! made first, the command waiting a turn at a time.
+//! refuses it, typed: its commit is A-664's. One whose green this node has not recovered (`ShardState::unrecovered`)
+//! refuses it naming the green and its cause, and one whose green or store is not made here yet (an adoption still
+//! materializing it) refuses it naming the green, to retry (A-927 part 1): neither is said to hold files. A command
+//! reaches greens only through the door: one that owes its push is made first, the command waiting a turn at a time.
 //!
 //! **A push's name** (A-618: two submits of one push carry one name, and every work's identity begins with it) is
 //! hashed from its repository and its commands, so a push sent again makes the same works, and A-635 answers each the
@@ -2446,7 +2448,7 @@ fn created(
       version,
     ),
     None => {
-      let empty = empty_default(state, record).ok_or_else(|| refused_at(at, NO_EMPTY_DEFAULT))?;
+      let empty = empty_default(state, record).map_err(|why| refused_at(at, &why.words()))?;
       let repositories = state.db.partition().repositories();
       if repositories.branch(record.id, &namespace) == Some(empty) {
         // The unborn default's first version owes the push too (P2): the green named already, so an update that defers.
@@ -2466,22 +2468,83 @@ fn created(
   Ok((change, (Target::Created(namespace), Some(new))))
 }
 
+/// Why the default branch has no unborn, empty green to create on (A-927, main 01a20182's ruling of 2026-11-25: every
+/// refusal says its own reason). Before, each was refused "the default branch holds files no commit names", a green a
+/// takeover gave up or had not yet materialized here included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoEmptyDefault {
+  /// The repository names no default branch, or it binds no green: [`NO_EMPTY_DEFAULT`].
+  Unbound,
+  /// Its green holds a git version, a file at its version 0, or owes a push (P2): [`NO_EMPTY_DEFAULT`].
+  NotEmpty,
+  /// Its green was not recovered here (`ShardState::unrecovered`, a takeover that gave it up among them): it answers
+  /// `NotRecovered`; named, with its cause's kind (`RecoveryCause::kind`).
+  NotRecovered(DbVolumeId, &'static str),
+  /// Its green, or the repository's store, is not made here yet (an adoption still materializing it): retry, named.
+  Unavailable(DbVolumeId),
+}
+
+impl NoEmptyDefault {
+  /// The words a create's refusal carries: the green named where it is not recovered or not made here yet.
+  fn words(self) -> Vec<u8> {
+    let named = |green: DbVolumeId| -> String {
+      green
+        .bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+    };
+    match self {
+      NoEmptyDefault::Unbound | NoEmptyDefault::NotEmpty => NO_EMPTY_DEFAULT.to_vec(),
+      NoEmptyDefault::NotRecovered(green, cause) => format!(
+        "the default branch's green {} is not recovered here ({cause})",
+        named(green)
+      )
+      .into_bytes(),
+      NoEmptyDefault::Unavailable(green) => format!(
+        "the default branch's green {} is not made here yet; retry",
+        named(green)
+      )
+      .into_bytes(),
+    }
+  }
+}
+
 /// The default branch's green while it is unborn and empty: no git version in the store, and at its version 0 holding
-/// no file (module docs, "A create").
-fn empty_default(state: &ShardState, record: &RepositoryRecord) -> Option<DbVolumeId> {
-  let name = record.default_branch.as_deref()?;
+/// no file (module docs, "A create"); else why not ([`NoEmptyDefault`]).
+fn empty_default(
+  state: &ShardState,
+  record: &RepositoryRecord,
+) -> Result<DbVolumeId, NoEmptyDefault> {
+  let name = record
+    .default_branch
+    .as_deref()
+    .ok_or(NoEmptyDefault::Unbound)?;
   let green = state
     .db
     .partition()
     .repositories()
-    .branch(record.id, name)?;
-  let (_, git) = state.vcs_stores.git_ref(record.id)?;
-  let unborn = git.repository.versions(green_key(green)) == 0;
-  let empty = state
+    .branch(record.id, name)
+    .ok_or(NoEmptyDefault::Unbound)?;
+  if let Some(cause) = state.unrecovered.get(&green) {
+    return Err(NoEmptyDefault::NotRecovered(green, cause.kind()));
+  }
+  let (_, git) = state
+    .vcs_stores
+    .git_ref(record.id)
+    .ok_or(NoEmptyDefault::Unavailable(green))?;
+  // Lent whether or not it owes a push (a create's lend, `Greens::lend`): one that owes holds that push's tree, not empty.
+  let engine = state
     .greens
-    .get(&green)
-    .is_some_and(|engine| engine.head() == 0 && engine.files().next().is_none());
-  (unborn && empty).then_some(green)
+    .lend(&green)
+    .ok_or(NoEmptyDefault::Unavailable(green))?;
+  let unborn = git.repository.versions(green_key(green)) == 0;
+  let empty = engine.is_materialized() && engine.head() == 0 && engine.files().next().is_none();
+  if unborn && empty {
+    Ok(green)
+  } else {
+    Err(NoEmptyDefault::NotEmpty)
+  }
 }
 
 /// A-635's refusal as receive-pack's (module docs, "Answering", item 5), `greens` naming the green each change moves,
