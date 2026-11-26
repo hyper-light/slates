@@ -3060,6 +3060,154 @@ pub(crate) fn hold_increment(
   }
 }
 
+/// [`hold_increment`] taken a unit at a time (A-920 6b: 23.6 ms whole for an import's revision of 9,000 files, debug, one
+/// step of its landing's entry): the encoding's chunks hashed into the inputs archive's manifest a chunk a unit, then its
+/// stage opened in the content store under the green's object, the chunks copied in a chunk a unit
+/// (`stage_lent_piece`, [`hold_lent`]'s piece at a time), and the stage completed. The same identity, charges and
+/// refusals as [`hold_increment`]; dropped part-way, it leaves only its stage, which the next hold of the green's object
+/// gives way to.
+///
+/// [`hold_lent`]: slates_cluster::content::ContentStore::hold_lent
+pub(crate) struct IncrementHold {
+  /// The green.
+  green: DbVolumeId,
+  /// The version whose inputs it holds.
+  version: u64,
+  /// The manifest's extents hashed so far, one a chunk in order.
+  extents: Vec<slates_archive::manifest::Extent>,
+  /// The encoding's bytes hashed so far.
+  hashed: usize,
+  /// The manifest's identity once its stage is open, and whether the store held it only from this hold.
+  staging: Option<([u8; 32], bool)>,
+  /// The chunks copied into the stage so far.
+  staged: usize,
+}
+
+impl IncrementHold {
+  /// A hold of `green`'s `version`'s increment, begun.
+  pub(crate) fn begin(green: DbVolumeId, version: u64) -> IncrementHold {
+    IncrementHold {
+      green,
+      version,
+      extents: Vec::new(),
+      hashed: 0,
+      staging: None,
+      staged: 0,
+    }
+  }
+
+  /// One unit of the hold of `increment`, the encoding: none while units are left; once it ends, [`hold_increment`]'s
+  /// answer.
+  pub(crate) fn unit(
+    &mut self,
+    state: &mut ShardState,
+    increment: &[u8],
+  ) -> Option<Result<HeldIncrement, Refusal>> {
+    let object = ObjectId(self.green.bytes);
+    let Some((manifest, fresh)) = self.staging else {
+      let chunk = crate::merge_origin::inputs_chunk_bytes().max(1);
+      let end = self.hashed.saturating_add(chunk).min(increment.len());
+      if let Some(piece) = increment
+        .get(self.hashed..end)
+        .filter(|piece| !piece.is_empty())
+      {
+        let offset = u64::try_from(self.hashed).unwrap_or(u64::MAX);
+        self
+          .extents
+          .push(crate::merge_origin::inputs_extent(offset, piece));
+        self.hashed = end;
+        return None;
+      }
+      // The extents cloned, as a checkpoint's hold does: one a chunk of the encoding, so few.
+      let archive = crate::merge_origin::inputs_manifest_archive_of(
+        self.extents.clone(),
+        u64::try_from(increment.len()).unwrap_or(u64::MAX),
+        0,
+        archive_page(state),
+      );
+      let identity = archive.manifest_identity();
+      let opened = state.held_content.stage_fetched(
+        &mut crate::content_holder::hold_space(&mut state.store),
+        object,
+        slates_cluster::content::Placed {
+          sequence: self.version,
+        },
+        &archive,
+      );
+      return match opened {
+        // Held already (the same increment held for this version before): nothing to copy, and nothing of it this
+        // hold's to give back.
+        Ok(None) => Some(Ok(held_increment(
+          state,
+          (identity, increment.len()),
+          false,
+        ))),
+        Ok(Some(_)) => {
+          self.staging = Some((identity, true));
+          None
+        }
+        Err(refused) => Some(Err(held_refusal(refused))),
+      };
+    };
+    let Some(extent) = self.extents.get(self.staged) else {
+      let completed = state.held_content.complete_stage(
+        &mut crate::content_holder::hold_space(&mut state.store),
+        object,
+      );
+      return Some(
+        completed
+          .map(|_| held_increment(state, (manifest, increment.len()), fresh))
+          .map_err(held_refusal),
+      );
+    };
+    let start = usize::try_from(extent.offset).unwrap_or(usize::MAX);
+    let end = usize::try_from(extent.len).map_or(usize::MAX, |len| start.saturating_add(len));
+    let staged = match increment.get(start..end) {
+      Some(piece) => state.held_content.stage_lent_piece(
+        &mut crate::content_holder::hold_space(&mut state.store),
+        object,
+        &manifest,
+        extent.chunk,
+        piece,
+      ),
+      None => Err(slates_cluster::content::ContentRefusal::Unstaged),
+    };
+    match staged {
+      Ok(_) => {
+        self.staged = self.staged.saturating_add(1);
+        None
+      }
+      Err(refused) => Some(Err(held_refusal(refused))),
+    }
+  }
+}
+
+/// A held increment of `identity` and `len` bytes, counted: what its chain entry names.
+fn held_increment(
+  state: &mut ShardState,
+  (identity, len): ([u8; 32], usize),
+  fresh: bool,
+) -> HeldIncrement {
+  state.count(INPUTS_HELD_BY_OWNER, 1);
+  HeldIncrement {
+    inputs: slates_merge::chain_entry::Inputs {
+      identity,
+      len: u64::try_from(len).unwrap_or(u64::MAX),
+    },
+    fresh,
+  }
+}
+
+/// The refusal a hold of an increment answers for the store's: the room's at its capacity, else the content's.
+fn held_refusal(refused: slates_cluster::content::ContentRefusal) -> Refusal {
+  match refused {
+    slates_cluster::content::ContentRefusal::NoCapacity { available, .. } => {
+      Refusal::BudgetExceeded { available }
+    }
+    _ => Refusal::ContentUnavailable,
+  }
+}
+
 /// What placing a version's increment `increment` in its chain entry did (format 7, A-854): nothing held, so nothing to
 /// give back (`fresh` false), named by the identity [`hold_increment`] would have held it under, so its merge record
 /// names its inputs alike whichever way they are kept. Counted.

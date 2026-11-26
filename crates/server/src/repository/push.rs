@@ -378,83 +378,101 @@ pub(crate) fn append_versions(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),
   green: DbVolumeId,
-  staged: Vec<crate::import_batch::Staged>,
+  (staged, prepared): (Vec<crate::import_batch::Staged>, Vec<Prepared>),
   parts: EntryParts,
 ) -> Result<RecordedBatch, AppendRefused> {
-  let record = state
+  let give_back = |state: &mut ShardState, prepared: Vec<Prepared>, refusal: AppendRefused| {
+    release_prepared(state, green, prepared);
+    Err(refusal)
+  };
+  let record = match state
     .db
     .partition()
     .repositories()
     .repository(repository)
     .cloned()
-    .ok_or(AppendRefused::Repository(Refusal::NotFound))?;
+  {
+    Some(record) => record,
+    None => {
+      return give_back(
+        state,
+        prepared,
+        AppendRefused::Repository(Refusal::NotFound),
+      );
+    }
+  };
   if &record.owner != principal {
-    return Err(AppendRefused::Repository(Refusal::Forbidden {
+    let forbidden = Refusal::Forbidden {
       verb: "push".to_owned(),
-    }));
+    };
+    return give_back(state, prepared, AppendRefused::Repository(forbidden));
   }
   if !is_member(state, repository, green) {
-    return Err(AppendRefused::Repository(Refusal::NotFound));
+    return give_back(
+      state,
+      prepared,
+      AppendRefused::Repository(Refusal::NotFound),
+    );
   }
   // A green this shard did not recover takes no versions, its engine lent or not (A-927's sweep).
-  state.recovered(green).map_err(AppendRefused::Repository)?;
-  let head = state
-    .greens
-    .get(&green)
-    .map(|engine| engine.head())
-    .ok_or(AppendRefused::Repository(Refusal::NotFound))?;
+  if let Err(unrecovered) = state.recovered(green) {
+    return give_back(state, prepared, AppendRefused::Repository(unrecovered));
+  }
+  let Some(head) = state.greens.get(&green).map(|engine| engine.head()) else {
+    return give_back(
+      state,
+      prepared,
+      AppendRefused::Repository(Refusal::NotFound),
+    );
+  };
   let at = |index: usize| {
     head
       .saturating_add(u64::try_from(index).unwrap_or(u64::MAX))
       .saturating_add(1)
   };
-  if staged
-    .iter()
-    .enumerate()
-    .any(|(index, step)| step.increment.base.saturating_add(1) != at(index))
+  // Each version made ready for this head, one for each staged (the landing's, [`Prepared`]): a head moved since, or a
+  // version not made ready, is refused, what was held given back.
+  if prepared.len() != staged.len()
+    || staged
+      .iter()
+      .enumerate()
+      .any(|(index, step)| step.increment.base.saturating_add(1) != at(index))
+    || prepared
+      .iter()
+      .enumerate()
+      .any(|(index, ready)| ready.version != at(index))
   {
-    return Err(AppendRefused::Entry(Refusal::ContentUnavailable));
+    return give_back(
+      state,
+      prepared,
+      AppendRefused::Entry(Refusal::ContentUnavailable),
+    );
   }
   let reserved: usize = staged
     .iter()
     .map(|step| step.reserved)
     .fold(0, usize::saturating_add);
   let secured = u64::try_from(reserved).unwrap_or(u64::MAX);
-  crate::verbs::secure_retention(state, green, secured)
-    .map_err(|available| AppendRefused::Entry(Refusal::BudgetExceeded { available }))?;
+  if let Err(available) = crate::verbs::secure_retention(state, green, secured) {
+    return give_back(
+      state,
+      prepared,
+      AppendRefused::Entry(Refusal::BudgetExceeded { available }),
+    );
+  }
   let mut entry = RepositoryEntry {
     repository,
     ..RepositoryEntry::default()
   };
-  // Each revision's increment held in the content store, where its chain entry names it (chain entry format 6), before
-  // anything is recorded; what was held is given back if the entry is refused.
-  let mut increments = Vec::with_capacity(staged.len());
-  for (index, step) in staged.iter().enumerate() {
-    let version = at(index);
-    let held =
-      match crate::merge_service::hold_increment(state, green, version, &step.increment.encode()) {
-        Ok(held) => held,
-        Err(refusal) => {
-          for held in increments {
-            crate::merge_service::release_refused_increment(state, green, held);
-          }
-          let _ = crate::merge_service::settle_green_retention(state, green);
-          return Err(AppendRefused::Entry(refusal));
-        }
-      };
-    increments.push(held);
-    let bytes = slates_merge::chain_entry::encode(
-      held.inputs,
-      &step.increment,
-      &step.applied,
-      None,
-      step.identity,
-      None,
-    );
+  // Each revision's increment held in the content store, where its chain entry names it (chain entry format 6), and its
+  // entry encoded, by the landing before the register's op, a unit a step (A-920 6b); given back if the entry is refused.
+  let mut increments = Vec::with_capacity(prepared.len());
+  for (index, ready) in prepared.into_iter().enumerate() {
+    increments.push(ready.held);
     entry.versions.push(GreenVersion {
       green,
-      version,
-      entry: bytes,
+      version: at(index),
+      entry: ready.entry,
     });
   }
   entry.checks.extend(parts.checks);
@@ -478,6 +496,27 @@ pub(crate) fn append_versions(
     made: Vec::new(),
     applying: None,
   })
+}
+
+/// A batch's version made ready for the register's op by its landing, a unit a step (A-920 6b: its increment's encoding
+/// 3.4 ms, its hold 23.6 and its chain entry's encoding 12.5, whole in one step at 9,000 files, debug): the version it was
+/// made ready as, its increment held where its entry names it, and the entry's bytes. [`append_versions`] records it
+/// at that version, or refuses it and gives its hold back.
+pub(crate) struct Prepared {
+  /// The version it was made ready as.
+  pub(crate) version: u64,
+  /// Its increment, held.
+  pub(crate) held: crate::merge_service::HeldIncrement,
+  /// Its chain entry.
+  pub(crate) entry: Vec<u8>,
+}
+
+/// Gives back every hold of `prepared`, versions of `green` the register did not take.
+pub(crate) fn release_prepared(state: &mut ShardState, green: DbVolumeId, prepared: Vec<Prepared>) {
+  for ready in prepared {
+    crate::merge_service::release_refused_increment(state, green, ready.held);
+  }
+  let _ = crate::merge_service::settle_green_retention(state, green);
 }
 
 /// Counter: a slice of a recorded batch's apply ([`RecordedBatch::apply_slice`]): more than one a batch shows its apply
