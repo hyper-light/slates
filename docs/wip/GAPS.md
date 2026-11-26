@@ -1174,12 +1174,12 @@
 >     (`git_push/tests.rs` 23, `vcs_share/tests.rs` 9, `vcs_share/wait.rs` 2, `vcs_store/tests.rs` 2, `replica.rs` 1,
 >     `named_objects.rs` 1) and `test_store::audit_on_stored_shard_made_all`, any tool's (`upload/tests.rs` 12,
 >     `git_hooks/tests.rs` 2).
->   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 31 tests. hg 14
->     (`hg_made` 10, `vcs_ssh` 4); other 17 (`daemon::tests` 5, `repository::push` 5,
->     `vcs_share` 3, `repository::import` 2, `identities` 1, `repository::tests` 1). Counted by w-git (2026-11-25) by the
->     tests refused with its allowance taken away: `vcs_http::daemon_edge` and `vcs_store::upload` reach it no more, and
->     one `vcs_share` test's Mercurial creation (`hg_repository`, w-hg's) moved here from `audit_on_stored_shard` when
->     its git creation left the shard.
+>   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 28 tests. hg 14
+>     (`hg_made` 10, `vcs_ssh` 4); other 14 (`daemon::tests` 5, `repository::push` 5, `repository::import` 2,
+>     `identities` 1, `repository::tests` 1). Counted by the tests refused with its allowance taken away (w-git,
+>     2026-11-25): `vcs_http::daemon_edge`, `vcs_store::upload` and `vcs_share` reach it no more, `vcs_share`'s three
+>     Mercurial creations made from the test's thread (`hg_on`, `test_store::create_on`), one inside
+>     `audit_on_stored_shard_made_all`.
 >   - (`git_push::tests::carry_blocking`, 8 direct sites, and `git_push::tests::git_repository`, 41 sites: both emptied
 >     and removed by w-git, 2026-11-25. Every test that pushed through the synchronous driver (`answered`, `pushed`,
 >     `pushed_from_the_fixtures`, removed with it) pushes by awaiting: `git_push::tests::on_stored_shard_awaited` and its
