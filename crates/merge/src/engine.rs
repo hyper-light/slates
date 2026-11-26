@@ -2109,11 +2109,15 @@ fn named_files(
 ) -> Vec<(usize, crate::named::Identity)> {
   sole
     .iter()
-    .filter_map(|(place, run)| {
-      let run = runs.get(*run)?;
-      (run.offset == 0 && run.len == run.identity.len).then_some((*place, run.identity))
-    })
+    .filter_map(|(place, run)| Some((*place, whole_object(runs, *run)?)))
     .collect()
+}
+
+/// The object run `run` of `runs` is whole, from its first byte, its length the object's: what a file made of it alone
+/// is named for ([`named_files`]); none for a run that is part of its object.
+fn whole_object(runs: &[crate::named::NamedRun], run: usize) -> Option<crate::named::Identity> {
+  let run = runs.get(run)?;
+  (run.offset == 0 && run.len == run.identity.len).then_some(run.identity)
 }
 
 /// [`apply`], for the history's oracle (`crate::history`'s tests).
@@ -2344,6 +2348,8 @@ impl Prep {
       return Prep::Sole {
         places: BTreeMap::new(),
         sole: Vec::new(),
+        files_of: BTreeMap::new(),
+        names: Vec::new(),
         at: 0,
       };
     }
@@ -2368,6 +2374,18 @@ enum Prep {
   Sole {
     places: BTreeMap<(u64, u64), usize>,
     sole: Vec<(usize, usize)>,
+    /// How many of the files found so far each run makes ([`alone`]'s count, kept as they are found).
+    files_of: BTreeMap<usize, usize>,
+    /// The files found so far named for their run's object ([`named_files`], kept as they are found).
+    names: Vec<(usize, crate::named::Identity)>,
+    at: usize,
+  },
+  /// The files whose run makes no other file kept ([`alone`]), a file a unit (A-920 piece 3e).
+  Alone {
+    names: Vec<(usize, crate::named::Identity)>,
+    sole: Vec<(usize, usize)>,
+    files_of: BTreeMap<usize, usize>,
+    wholes: Vec<(usize, usize)>,
     at: usize,
   },
   /// Each effect's read of a text held by name alone checked ([`Green::note_unlent_read`]).
@@ -7346,14 +7364,25 @@ impl Green {
           run.prep = Prep::Sole {
             places: core::mem::take(places),
             sole: Vec::new(),
+            files_of: BTreeMap::new(),
+            names: Vec::new(),
             at: 0,
           };
         }
-        Prep::Sole { places, sole, at } => {
+        Prep::Sole {
+          places,
+          sole,
+          files_of,
+          names,
+          at,
+        } => {
           if !places.is_empty() {
             while let Some(effect) = run.effects.get(*at) {
               if let Some(found) = self.sole_run_of(effect, places) {
                 sole.push((*at, found));
+                let count = files_of.entry(found).or_insert(0);
+                *count = count.saturating_add(1);
+                names.extend(whole_object(runs, found).map(|identity| (*at, identity)));
               }
               *at = at.saturating_add(1);
               if run.effects.get(*at).is_some() && spent() {
@@ -7361,9 +7390,31 @@ impl Green {
               }
             }
           }
-          let sole = core::mem::take(sole);
-          let names = named_files(&sole, runs);
-          let wholes = alone(sole);
+          run.prep = Prep::Alone {
+            names: core::mem::take(names),
+            sole: core::mem::take(sole),
+            files_of: core::mem::take(files_of),
+            wholes: Vec::new(),
+            at: 0,
+          };
+        }
+        Prep::Alone {
+          names,
+          sole,
+          files_of,
+          wholes,
+          at,
+        } => {
+          while let Some(&(place, found)) = sole.get(*at) {
+            if files_of.get(&found) == Some(&1) {
+              wholes.push((place, found));
+            }
+            *at = at.saturating_add(1);
+            if sole.get(*at).is_some() && spent() {
+              return ApplyStep::More;
+            }
+          }
+          let (names, wholes) = (core::mem::take(names), core::mem::take(wholes));
           run.prep = if run.check_reads {
             Prep::Reads {
               names,
