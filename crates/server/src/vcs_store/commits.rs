@@ -1006,8 +1006,7 @@ fn next_ask(
         return None;
       }
       sealed.pack_homed_as(packed);
-      let pack = crate::git_push::landed_pack(state, homed.bytes, packed)?;
-      let landing = crate::git_push::landing_of(state, sealed.repository(), (names, pack))?;
+      let landing = crate::git_push::landing_of(state, sealed.repository(), (names, packed))?;
       let sequence = landing.sequence();
       Some(Some((
         Carry::Land(Box::new(landing)),

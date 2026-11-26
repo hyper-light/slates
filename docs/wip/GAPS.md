@@ -2384,9 +2384,9 @@
 > does, and the record's hold on a pack named only then is taken once put. Red:
 > `t_c2_a_restarts_replay_reads_its_records_pack_a_piece_at_a_time_within_its_bound` (524,574 B held at once, the
 > whole pack, against a bound of 131,072; now 131,072); a rebuild cancelled between two pieces names no pack and the
-> next reads it back byte for byte (`t_c2_a_rebuild_cancelled_between_two_pieces_…`). The push's pack held once
-> BUILT (w-git, 2026-11-26, C3 (b), main's ruling: content once on arrival): a push puts its pack in the content store
-> a piece at a time as the client sends it (`Push::extend_pack`, the store's `Writing`, readable while under way:
+> next reads it back byte for byte (`t_c2_a_rebuild_cancelled_between_two_pieces_…`). The push's pack held once BUILT
+> (w-git, 2026-11-26, C3 (b), main's ruling: content once on arrival): a push puts its pack in the content store a piece
+> at a time as the client sends it (`Push::extend_pack`, the store's `Writing`, readable while under way:
 > `ContentStore::writing_piece`), its judge, its rows' CRC and raw lengths and its staging reading the entries where
 > they lie there, the staging finishing the put; `Push.pack: Vec<u8>` is gone, and a push refused before its staging
 > gives the put back, naming nothing. Its read cache's budget is widened within what the shard grants
@@ -2394,23 +2394,34 @@
 > `Store::admittable`; counted `git_push.read_cache_widened`, `_refused`, `_budget_most`), never the pack's length. Red:
 > `git_push::tests::a_pushs_pack_is_put_as_it_arrives_its_buffer_a_window_and_its_cache_its_chains` (a 2,213,177-byte
 > pack: the push held at most 262,143 B, within its window, `git_push.pack_buffer_most`, and its cache's budget 87,382
-> B; with the old shape both the pack's length); `a_pushs_read_cache_is_widened_within_its_grant_and_reads_past_it_whole`
-> (git crate: a one-byte grant refused, the budget as it was, every object read back whole). C5's resident reader is
-> now paired (`git_interop::resident_of`: macOS `phys_footprint`, `proc_pid_rusage`; Linux `ps`'s RSS). **b2 IN FLIGHT
-> (w-git, main's order of 2026-11-26, the next piece):** the homing and the landing still carry the pack as whole
-> buffers, `SealedPush::pack_to_home`'s copy into `Carry::Home(bytes, owner)` and `git_push::landing_of`'s parts built
-> from the homed bytes, each a whole-pack copy that grows with the push (main's reading: the likely reason C5's peak,
-> 551.6 MiB, sits far above its after-push figure). b2a BUILT (w-git, 2026-11-26): the pack is homed as
-> `homes::HomeSource::Held`, its identity and length in the content store it was put in; this node's keep, where the
-> origin is its home shard, is a hold by identity (`homes::keep_held_for_region`), no bytes; its bytes read once, and
-> only for another home shard or a remote home (counted `git_push.carry_buffer_most`); the landing reads it once for its
-> `Payload` (`git_push::landed_pack`, `git_push.land_buffer_most`). Red: the one-shard push of a 2,213,177-byte pack in
-> `a_pushs_pack_is_put_as_it_arrives_…`: the homing held 0 B of it, 4,426,354 B (two copies) in the old shape. b2b
-> OWED (w-git, main's ruling: the slates-store owner side included): the landing's `Payload` from the content store's
-> windows through a pieces landing (begin, append, finish) that is the whole landing's one path. Unmeasured, owed
-> (w-git) once a fleet RSS round measures it: `put_remote` ships the whole pack in one buffer to each remote home
-> (f ≥ 1); another shard of this node as the pack's home is handed its bytes too. Owed (w-git): a node whose store
-> lacks a record's changeset
+> B; with the old shape both the pack's length);
+> `a_pushs_read_cache_is_widened_within_its_grant_and_reads_past_it_whole` (git crate: a one-byte grant refused, the
+> budget as it was, every object read back whole). C5's resident reader is now paired (`git_interop::resident_of`: macOS
+> `phys_footprint`, `proc_pid_rusage`; Linux `ps`'s RSS). **b2 IN FLIGHT (w-git, main's order of 2026-11-26, the next
+> piece):** the homing and the landing still carry the pack as whole buffers, `SealedPush::pack_to_home`'s copy into
+> `Carry::Home(bytes, owner)` and `git_push::landing_of`'s parts built from the homed bytes, each a whole-pack copy that
+> grows with the push (main's reading: the likely reason C5's peak, 551.6 MiB, sits far above its after-push figure).
+> b2a BUILT (w-git, 2026-11-26): the pack is homed as `homes::HomeSource::Held`, its identity and length in the content
+> store it was put in; this node's keep, where the origin is its home shard, is a hold by identity
+> (`homes::keep_held_for_region`), no bytes; its bytes read once, and only for another home shard or a remote home
+> (counted `git_push.carry_buffer_most`); the landing read it once for its `Payload` then (`git_push.land_buffer_most`,
+> the copy b2b took out). Red: the one-shard push of a 2,213,177-byte pack in `a_pushs_pack_is_put_as_it_arrives_…`: the
+> homing held 0 B of it, 4,426,354 B (two copies) in the old shape. b2b BUILT (w-git, 2026-11-26): git's changeset lands
+> through the store's sliced landing (`git_push::landed_in_pieces`: `StoreHandle::begin`, its `Names` and then its
+> `Payload` a piece at a time, `PIECE_BYTES` each, read from the origin's content store into one buffer each part hands
+> back, then the commit), counted `git_push.land_buffer_most` (red: a 2,213,177-byte pack's landing held its whole
+> length at 0f3e49ab9, now within one piece). One landing path in the store (CLAUDE.md §2 item 7): `Store::land` is the
+> sliced landing's own steps (`open_landing`, each section's pieces, `commit_landing`), a whole landing every piece at
+> once, where it was a second append through `ChangesetLog::begin` with its rows applied inline; each payload is named
+> by the identity its pieces hashed to as they were written, so the commit reads none back. Oracle
+> (`crates/store/tests/store.rs`): `a_changeset_landed_in_pieces_is_the_changeset_landed_whole_byte_for_byte` (pieces of
+> 997 B and of `PIECE_BYTES`, the same log bytes and rows),
+> `a_landing_crashed_at_each_piece_recovers_to_the_changeset_before_and_lands_again_whole` (a crash after every count of
+> pieces: the changeset before alone, then landed again to the reference's log). The C5 test prints the daemon's gauges
+> beside its resident figure at each settled point. Owed: the names' rows still one buffer per landing (about 40 B an
+> object); and the Mac's footprint and Linux's RSS readings after b2b (main's). Unmeasured, owed (w-git) once a fleet
+> RSS round measures it: `put_remote` ships the whole pack in one buffer to each remote home (f ≥ 1); another shard of
+> this node as the pack's home is handed its bytes too. Owed (w-git): a node whose store lacks a record's changeset
 > reading its names from their region homes, held by a test of its own (the rebuild test now reads the node's store).
 > OPEN (goal 93, w-git; w-sessionlog's reduction 2026-11-21): a whole clone of git/git with 506 tags or more is aborted
 > "possible repository corruption on the remote side". The repository's encoding never finishes (its first version,
