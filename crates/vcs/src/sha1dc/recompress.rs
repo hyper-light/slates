@@ -213,14 +213,10 @@ fn record_dv_candidate(bit: u32, candidate: State) {
   });
 }
 
-/// Runs [`compress_and_check`] while recording every `(bit, candidate)` pair it evaluates, clearing the thread-local
-/// observer on exit or unwind.
+/// Runs `f` while recording every `(bit, candidate)` pair evaluated inside [`compress_and_check`], clearing the
+/// thread-local observer on exit or unwind.
 #[cfg(test)]
-pub(super) fn observe_compress_and_check(
-  ihv: &mut State,
-  block: &[u8; BLOCK_LEN],
-  ubc_mask: u32,
-) -> (bool, Vec<(u32, State)>) {
+pub(super) fn observe_dv_checks<R>(f: impl FnOnce() -> R) -> (R, Vec<(u32, State)>) {
   struct ResetObserver;
   impl Drop for ResetObserver {
     fn drop(&mut self) {
@@ -233,9 +229,9 @@ pub(super) fn observe_compress_and_check(
     *slot.borrow_mut() = Some(Vec::new());
   });
   let _guard = ResetObserver;
-  let hit = compress_and_check(ihv, block, ubc_mask);
+  let result = f();
   let observed = DV_OBSERVER.with(|slot| slot.borrow_mut().take().unwrap_or_default());
-  (hit, observed)
+  (result, observed)
 }
 
 /// Expands one 64-byte big-endian block into the full 80-word SHA-1 message schedule (FIPS 180-4 §6.1.2).

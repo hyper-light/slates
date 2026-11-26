@@ -13111,8 +13111,8 @@ fn a_real_anchors_hold_refusals_show_in_slates_status() {
 
 /// The release lane's first question of a built binary (`xtask/src/release.rs`, Appendix B.2; A-893): do run `slates
 /// version`, expect `slates` and the workspace version on stdout and exit 0, with no daemon asked; do run `slates
-/// version --licenses`, expect exit 0 and the bundled Stevens & Shumow MIT notice on stdout; do give `version` an
-/// unexpected argument, expect the usage refusal (exit 2).
+/// version --licenses`, expect exit 0 and the bundled `NOTICE` (carrying Stevens & Shumow and RustCrypto `sha1 0.11.0`
+/// MIT notices) byte-for-byte on stdout; do give `version` an unexpected argument, expect the usage refusal (exit 2).
 #[test]
 fn the_binary_names_its_version() {
   let slates = env!("CARGO_BIN_EXE_slates");
@@ -13123,18 +13123,33 @@ fn the_binary_names_its_version() {
     format!("slates {}\n", env!("CARGO_PKG_VERSION"))
   );
 
+  let expected_notice = include_str!("../../../NOTICE");
+  for required in [
+    "Marc Stevens",
+    "Dan Shumow",
+    "RustCrypto",
+    "sha1 0.11.0",
+    "The RustCrypto Project Developers",
+    "Artyom Pavlov",
+    "Mozilla Foundation",
+    "Graydon Hoare",
+    "Permission is hereby granted",
+  ] {
+    assert!(
+      expected_notice.contains(required),
+      "expected `{required}` in bundled NOTICE"
+    );
+  }
   let licenses = Command::new(slates)
     .args(["version", "--licenses"])
     .output()
     .unwrap();
   assert!(licenses.status.success(), "{licenses:?}");
-  let notices = String::from_utf8_lossy(&licenses.stdout);
-  for required in ["Marc Stevens", "Dan Shumow", "Permission is hereby granted"] {
-    assert!(
-      notices.contains(required),
-      "expected `{required}` in `slates version --licenses` output"
-    );
-  }
+  assert_eq!(
+    licenses.stdout.as_slice(),
+    expected_notice.as_bytes(),
+    "`slates version --licenses` stdout drifted from NOTICE"
+  );
 
   let refused = Command::new(slates)
     .args(["version", "extra"])

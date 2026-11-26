@@ -376,7 +376,9 @@ fn unperturbed_recompress_58_and_65_rebuild_post_compression_state() {
 fn assert_all_32_dvs_dispatched(step: usize, ihv: super::State, block: &[u8; BLOCK_LEN]) {
   let ref_states = oracle::compress_states_ref(ihv, block);
   let mut actual_ihv = ihv;
-  let (hit, observed) = recompress::observe_compress_and_check(&mut actual_ihv, block, u32::MAX);
+  let (hit, observed) = recompress::observe_dv_checks(|| {
+    recompress::compress_and_check(&mut actual_ihv, block, u32::MAX)
+  });
   assert!(!hit, "false-positive collision at step {step}");
   assert_eq!(actual_ihv, ref_states.ihv, "ihv mismatch at step {step}");
   assert_eq!(
@@ -444,6 +446,140 @@ fn compress_and_check_dispatches_all_32_disturbance_vectors_matching_oracle() {
     ),
     ref_states.ihv,
     "oracle reference_dv_candidate did not match SHAttered-1 block 5 at bit 27"
+  );
+}
+
+/// Independently pads `message` into 64-byte blocks per FIPS 180-4 §5.1.1.
+fn oracle_padded_blocks(message: &[u8]) -> Vec<[u8; BLOCK_LEN]> {
+  let mut padded = Vec::with_capacity(message.len() + 2 * BLOCK_LEN);
+  padded.extend_from_slice(message);
+  padded.push(0x80);
+  while padded.len() % BLOCK_LEN != 56 {
+    padded.push(0);
+  }
+  let bit_len = u64::try_from(message.len()).unwrap() * 8;
+  padded.extend_from_slice(&bit_len.to_be_bytes());
+  let (blocks, remainder) = padded.as_chunks::<BLOCK_LEN>();
+  assert!(remainder.is_empty(), "padded message not block-aligned");
+  blocks.to_vec()
+}
+
+/// Appends `(bit, candidate)` in ascending bit order for every bit set in `mask`.
+fn append_expected_dv_candidates(
+  ref_states: &oracle::RefStates,
+  mut mask: u32,
+  out: &mut Vec<(u32, super::State)>,
+) {
+  while mask != 0 {
+    let bit = mask.trailing_zeros();
+    mask &= mask.wrapping_sub(1);
+    let index = usize::try_from(bit).unwrap();
+    let candidate = oracle::reference_dv_candidate(
+      index,
+      &ref_states.w,
+      &ref_states.state_58,
+      &ref_states.state_65,
+    );
+    out.push((bit, candidate));
+  }
+}
+
+/// Independently computes the FIPS 180-4 SHA-1 digest and the exact ordered sequence of `(bit, candidate)` checks
+/// `oracle::ubc_check` triggers across all padded blocks of `message`.
+fn oracle_expected_dv_checks(message: &[u8]) -> ([u8; DIGEST_LEN], Vec<(u32, super::State)>) {
+  let blocks = oracle_padded_blocks(message);
+  let mut state = super::INITIAL_STATE;
+  let mut expected = Vec::new();
+  for block in &blocks {
+    let ref_states = oracle::compress_states_ref(state, block);
+    state = ref_states.ihv;
+    let mask = oracle::ubc_check(&ref_states.w);
+    append_expected_dv_candidates(&ref_states, mask, &mut expected);
+  }
+  let mut digest = [0u8; DIGEST_LEN];
+  for (dst, word) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+    *dst = word.to_be_bytes();
+  }
+  (digest, expected)
+}
+
+/// Builds a deterministic seeded corpus (~4,096 blocks plus any missing rare-bit blocks and an unaligned 29-byte tail)
+/// guaranteeing every one of the 32 Stevens DV bits triggers at least once across the corpus.
+fn build_full_32_bit_seam_corpus() -> Vec<u8> {
+  let mut rng = SplitMix64(0x5ea3_0001_51dc_2026);
+  let mut corpus = Vec::with_capacity(4_128 * BLOCK_LEN);
+  let mut seen_bits = 0u32;
+  for _ in 0..4_096usize {
+    let block = rng.next_block();
+    seen_bits |= oracle::ubc_check(&oracle::expand_ref(&block));
+    corpus.extend_from_slice(&block);
+  }
+  let mut scanned = 0u64;
+  while seen_bits != u32::MAX && scanned < 2_000_000 {
+    let block = rng.next_block();
+    let mask = oracle::ubc_check(&oracle::expand_ref(&block));
+    if mask & !seen_bits != 0 {
+      corpus.extend_from_slice(&block);
+      seen_bits |= mask;
+    }
+    scanned += 1;
+  }
+  assert_eq!(
+    seen_bits,
+    u32::MAX,
+    "corpus failed to cover all 32 DV bits: missing {:#010x}",
+    !seen_bits
+  );
+  let tail = rng.next_block();
+  corpus.extend_from_slice(&tail[..29]);
+  corpus
+}
+
+/// A-893 (public `Hasher -> process_triggered` 32-DV seam oracle): do stream a seeded ~262 KiB corpus covering all 32
+/// Stevens DV bits through public `Hasher::update`/`finish` in odd chunk splits driving the 8-lane octet, mixed-octet,
+/// trailing, and single-block stitch/padding paths under `recompress::observe_dv_checks`. Expect the exact digest,
+/// non-vacuous execution of every path and all 32 DV bits (`distinct_bits == u32::MAX`), and bit-for-bit equality with
+/// the independent FIPS 180-4 / 32-DV oracle sequence.
+#[test]
+fn hasher_public_seam_dispatches_all_32_dvs_matching_oracle() {
+  let corpus = build_full_32_bit_seam_corpus();
+  let (expected_digest, expected_checks) = oracle_expected_dv_checks(&corpus);
+  let splits = [13usize, 73, 199, 577, 1_117, 1_613];
+
+  let ((result, octets, fast, recomp), observed) = recompress::observe_dv_checks(|| {
+    let mut hasher = Hasher::new();
+    let mut pos = 0usize;
+    let mut split_idx = 0usize;
+    while pos < corpus.len() {
+      let step = splits[split_idx % splits.len()];
+      let end = pos.saturating_add(step).min(corpus.len());
+      hasher.update(&corpus[pos..end]);
+      pos = end;
+      split_idx += 1;
+    }
+    let octets = hasher.octet_batches();
+    let fast = hasher.fast_blocks();
+    let recomp = hasher.recompressed_blocks();
+    (hasher.finish(), octets, fast, recomp)
+  });
+
+  assert!(octets > 0, "8-lane octet path did not fire");
+  assert!(fast > 0, "hardware fast path did not fire");
+  assert!(recomp > 0, "recompression slow path did not fire");
+  assert_eq!(result, Ok(expected_digest));
+  assert!(!observed.is_empty(), "observer recorded zero DV checks");
+  assert_eq!(
+    observed, expected_checks,
+    "public Hasher seam DV check sequence diverged from independent oracle"
+  );
+  let distinct_bits = observed
+    .iter()
+    .fold(0u32, |acc, &(bit, _)| acc | (1u32 << bit));
+  assert_eq!(
+    distinct_bits,
+    u32::MAX,
+    "not all 32 DV bits executed through public Hasher seam: missing {:#010x}",
+    !distinct_bits
   );
 }
 

@@ -386,8 +386,14 @@ slates base rewitness ID [PATH ...] [--json]
 slates base pin ID [PATH ...] [--json]
 slates base capture ID [--json]
 slates profile [--quick] [--json]
+slates version [--licenses]
 slates mcp [--instance NAME] [--http PORT]
 ```
+
+`slates version [--licenses]` prints this binary's version (`slates VERSION`) without contacting a daemon, or with
+`--licenses` prints the bundled third-party cryptography copyright and license notices (`NOTICE`, including Marc
+Stevens & Dan Shumow's `sha1collisiondetection` and RustCrypto `sha1 0.11.0` MIT notices). Extra arguments or
+unaccepted flags exit with code 2.
 
 `slates live-ship ID [--off]` turns a volume's live shipping on (or off): in a fleet each of its publications
 is then shipped to its candidates, and a sync is answered once the owner and `f` of them hold it (design A-200).

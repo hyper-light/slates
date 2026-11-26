@@ -2251,6 +2251,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
       })
     }
     ["oci-check", source, mount_id, device] => {
+      taken.only(&NONE)?;
       let number = |what: &'static str, text: &str| {
         text.parse::<u64>().map_err(|e| ParseError::BadValue {
           what,
@@ -2263,7 +2264,10 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
         device: number("DEVICE", device)?,
       }))
     }
-    ["oci-runtime", runtime] => Ok(Command::OciRuntime((*runtime).to_owned())),
+    ["oci-runtime", runtime] => {
+      taken.only(&NONE)?;
+      Ok(Command::OciRuntime((*runtime).to_owned()))
+    }
     ["version"] => {
       taken.only(&Spec {
         values: &[],
@@ -4569,9 +4573,9 @@ mod tests {
     }
   }
 
-  /// A-893. Do: parse `version`, `version --licenses`, `version extra`, `version --licenses=yes`, and
-  /// `volume list --licenses`. Expect: `licenses` false by default, true with `--licenses`, extra words and inline
-  /// values refused as usage, and `--licenses` refused on unrelated verbs.
+  /// A-893. Do: parse `version`, `version --licenses`, `version extra`, `version --licenses=yes`, and `--licenses`
+  /// on unrelated verbs (`volume list`, `oci-check`, `oci-runtime`). Expect: `licenses` false by default, true with
+  /// `--licenses`, extra words and inline values refused as usage, and `--licenses` refused on unrelated verbs.
   #[test]
   fn version_accepts_optional_licenses_switch_and_refuses_misuse() {
     assert_eq!(
@@ -4593,9 +4597,16 @@ mod tests {
         reason: "`--licenses` takes no value".into(),
       })
     );
-    assert_eq!(
-      parse(&args("volume list --licenses")),
-      Err(ParseError::UnknownFlag("--licenses".into()))
-    );
+    for line in [
+      "volume list --licenses",
+      "oci-check /nonexistent 0 0 --licenses",
+      "oci-runtime docker --licenses",
+    ] {
+      assert_eq!(
+        parse(&args(line)),
+        Err(ParseError::UnknownFlag("--licenses".into())),
+        "{line}"
+      );
+    }
   }
 }
