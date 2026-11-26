@@ -828,6 +828,17 @@ pub struct Computed {
   reached: Reached,
 }
 
+/// A verdict being held a unit at a time ([`Green::hold_begin`], [`Green::holding_step`]): its units brought to the
+/// head, their effects and windows gathered so far.
+pub(crate) struct Holding {
+  units: std::vec::IntoIter<position::Unit>,
+  effects: Vec<Effect>,
+  windows: Vec<ConflictWindow>,
+  /// What the chain records of the effects, where it was reached at the head with nothing since.
+  reached: Option<Vec<crate::chain_entry::Applied>>,
+  check_reads: bool,
+}
+
 /// What a computed verdict reached ([`Computed`]).
 enum Reached {
   /// The green that computed it had accepted the same increment before, as this version.
@@ -6807,6 +6818,18 @@ impl Green {
   fn hold_unlent(&mut self, inc: &Increment, computed: Computed, check_reads: bool) -> Judgment {
     let (judgment, unlent) =
       crate::unlent::scope(|| self.hold_computed(inc, computed, check_reads));
+    self.unlent_rule(inc, judgment, &unlent)
+  }
+
+  /// `judgment`, held over reads of the unlent named blocks `unlent` ([`Green::hold_unlent`]): as it is where none was
+  /// read; else [`Judgment::ContentUnread`] naming the least, and a conflict judged so no verdict, its cached windows
+  /// let go.
+  pub(super) fn unlent_rule(
+    &mut self,
+    inc: &Increment,
+    judgment: Judgment,
+    unlent: &BTreeSet<crate::named::Identity>,
+  ) -> Judgment {
     match (unlent.first(), judgment) {
       (None, judgment) => judgment,
       (Some(identity), judgment) => {
@@ -6826,22 +6849,42 @@ impl Green {
   /// unknown), else brought to the head ([`Green::at_head`]) and held there, a conflict kept in the rejected-result
   /// cache as a submit keeps one. Its commit's reads checked where `check_reads` ([`Green::commit_reads`]).
   fn hold_computed(&mut self, inc: &Increment, computed: Computed, check_reads: bool) -> Judgment {
+    let mut holding = match self.hold_begin(inc, computed, check_reads) {
+      Ok(holding) => holding,
+      Err(answer) => return answer,
+    };
+    loop {
+      if let Some(judgment) = self.holding_step(inc, &mut holding, &mut || false) {
+        return judgment;
+      }
+    }
+  }
+
+  /// [`Green::hold_computed`] begun: answered at once where the cache or the green's checkpoint answers it, else the
+  /// units brought to the head ([`Green::at_head`]), to be gathered a unit at a time ([`Green::holding_step`]; A-920
+  /// piece 3g: `position::verdict` 2.26 ms whole at 9,000 files, debug, the judge's last step).
+  pub(super) fn hold_begin(
+    &mut self,
+    inc: &Increment,
+    computed: Computed,
+    check_reads: bool,
+  ) -> Result<Holding, Judgment> {
     if let Some(version) = self.accepted.get(&inc.id) {
-      return Judgment::AcceptedBefore { version: *version };
+      return Err(Judgment::AcceptedBefore { version: *version });
     }
     if let Some(windows) = self.rejected.get(&inc.id) {
-      return Judgment::Conflict {
+      return Err(Judgment::Conflict {
         windows: windows.clone(),
-      };
+      });
     }
     if inc.base < self.deltas_from {
-      return Judgment::BaseUnavailable {
+      return Err(Judgment::BaseUnavailable {
         base: inc.base,
         floor: self.deltas_from,
-      };
+      });
     }
     let (units, reached) = match computed.reached {
-      Reached::Before(version) => return Judgment::AcceptedBefore { version },
+      Reached::Before(version) => return Err(Judgment::AcceptedBefore { version }),
       Reached::Verdict { units, applied, .. } => {
         // Reached at the head, nothing since: its effects are the ones reached, and so what the chain records of them.
         let unchanged = self.since(computed.at, computed.floor).is_nothing();
@@ -6849,29 +6892,61 @@ impl Green {
         (units, unchanged.then_some(applied))
       }
     };
-    match position::verdict(units) {
-      Ok(effects) => {
-        if check_reads {
-          self.commit_reads(&effects, inc.post());
-        }
-        let applied = reached.unwrap_or_else(|| effects.iter().map(Effect::applied).collect());
-        Judgment::Accepted(Judged {
-          id: inc.id,
-          at: self.head(),
-          effects,
-          applied,
-          post_state: inc.post_state.clone(),
-          read: Vec::new(),
-          runs: inc.named.runs.clone(),
-          making: Making::default(),
-          reads_checked: check_reads,
-        })
-      }
-      Err(windows) => {
-        self.retain_rejected(inc.id, &windows);
-        Judgment::Conflict { windows }
+    Ok(Holding {
+      units: units.into_iter(),
+      effects: Vec::new(),
+      windows: Vec::new(),
+      reached,
+      check_reads,
+    })
+  }
+
+  /// One step of `holding` ([`Green::hold_begin`]): each unit's effects and windows gathered in order, a unit at least,
+  /// until `spent` ([`position::verdict`]'s walk); once every unit is, the verdict held, or a conflict cached, in this
+  /// last step alone ([`Green::hold_end`]).
+  pub(super) fn holding_step(
+    &mut self,
+    inc: &Increment,
+    holding: &mut Holding,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Option<Judgment> {
+    while let Some(unit) = holding.units.next() {
+      holding.effects.extend(unit.effects);
+      holding.windows.extend(unit.windows);
+      if holding.units.len() > 0 && spent() {
+        return None;
       }
     }
+    Some(self.hold_end(inc, holding))
+  }
+
+  /// `holding`'s verdict once every unit is gathered: accepted and held where no unit holds a window (its commit's reads
+  /// checked where its judge checks them), else a conflict kept in the rejected-result cache.
+  fn hold_end(&mut self, inc: &Increment, holding: &mut Holding) -> Judgment {
+    let windows = core::mem::take(&mut holding.windows);
+    if !windows.is_empty() {
+      self.retain_rejected(inc.id, &windows);
+      return Judgment::Conflict { windows };
+    }
+    let effects = core::mem::take(&mut holding.effects);
+    if holding.check_reads {
+      self.commit_reads(&effects, inc.post());
+    }
+    let applied = holding
+      .reached
+      .take()
+      .unwrap_or_else(|| effects.iter().map(Effect::applied).collect());
+    Judgment::Accepted(Judged {
+      id: inc.id,
+      at: self.head(),
+      effects,
+      applied,
+      post_state: inc.post_state.clone(),
+      read: Vec::new(),
+      runs: inc.named.runs.clone(),
+      making: Making::default(),
+      reads_checked: holding.check_reads,
+    })
   }
 
   /// The units of `inc`'s verdict reached at `at` over the fold floor `floor`, brought to the head (A-658, `position`):

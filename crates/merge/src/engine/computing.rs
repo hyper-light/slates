@@ -67,12 +67,24 @@ pub struct Judging {
 }
 
 /// Where a judge stands between its steps.
-#[derive(Debug)]
 enum JudgingPhase {
   /// The rejected-result cache answered it.
   Answered(Option<Box<Judgment>>),
   /// Its verdict being computed.
   Computing(Box<Computing>),
+  /// Its verdict being held, a unit at a time (A-920 piece 3g), with the unlent named blocks its hold has read.
+  Holding(Box<(super::Holding, BTreeSet<Identity>)>),
+}
+
+impl core::fmt::Debug for JudgingPhase {
+  /// Where it stands.
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      JudgingPhase::Answered(answer) => f.debug_tuple("Answered").field(answer).finish(),
+      JudgingPhase::Computing(computing) => f.debug_tuple("Computing").field(computing).finish(),
+      JudgingPhase::Holding(_) => f.write_str("Holding"),
+    }
+  }
 }
 
 impl Green {
@@ -254,13 +266,29 @@ impl Green {
     judging: &mut Judging,
     spent: &mut dyn FnMut() -> bool,
   ) -> Option<Judgment> {
-    let computed = match &mut judging.phase {
+    let mut judgment = match &mut judging.phase {
       JudgingPhase::Answered(answer) => return answer.take().map(|answer| *answer),
-      JudgingPhase::Computing(computing) => self.computing_step(inc, computing, spent)?,
-    };
-    let mut judgment = match computed {
-      Ok(computed) => self.hold_unlent(inc, computed, false),
-      Err(refused) => self.refused_judgment(refused),
+      JudgingPhase::Computing(computing) => match self.computing_step(inc, computing, spent)? {
+        Err(refused) => self.refused_judgment(refused),
+        Ok(computed) => {
+          let (begun, unlent) = crate::unlent::scope(|| self.hold_begin(inc, computed, false));
+          match begun {
+            Err(answer) => self.unlent_rule(inc, answer, &unlent),
+            Ok(holding) => {
+              judging.phase = JudgingPhase::Holding(Box::new((holding, unlent)));
+              return None;
+            }
+          }
+        }
+      },
+      JudgingPhase::Holding(held) => {
+        let (holding, unlent) = &mut **held;
+        let (stepped, more) = crate::unlent::scope(|| self.holding_step(inc, holding, spent));
+        unlent.extend(more);
+        let judgment = stepped?;
+        let unlent = core::mem::take(unlent);
+        self.unlent_rule(inc, judgment, &unlent)
+      }
     };
     if let Judgment::Accepted(held) = &mut judgment {
       held.read = core::mem::take(&mut inc.named.read.0);

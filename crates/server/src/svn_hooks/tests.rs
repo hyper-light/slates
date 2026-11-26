@@ -72,6 +72,7 @@ fn ended(outcome: Outcome, standard_output: Option<&[u8]>) -> Ended {
       kept: bytes.to_vec(),
       dropped: 0,
     }),
+    started_at_ns: None,
     exited_at_ns: None,
   }
 }

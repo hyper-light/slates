@@ -211,6 +211,9 @@ pub struct StoreCounters {
   pub deferred: u64,
   /// Versions whose sets a reader derived ([`Repository::derive_turn`]), each once while its memo is kept.
   pub derived: u64,
+  /// Versions [`Repository::derivations_due`] looked at to answer: what a derivation's every turn asks before it begins
+  /// one (main 01a20182's sample of 2026-11-25: the question took a third of a git/git encoding's time behind a push).
+  pub due_looked: u64,
   /// Bytes the versions' values added to the content store as their commits put them: what the store held new, never
   /// what it held already and was held once more by (A-647 part 4).
   pub value_bytes: u64,
@@ -324,6 +327,17 @@ struct Chain {
 }
 
 impl Chain {
+  /// How many of its versions hold no value of their own ([`Repository::unvalued`]).
+  fn unvalued(&self) -> u64 {
+    to_u64(
+      self
+        .versions
+        .iter()
+        .filter(|version| version.value.is_none())
+        .count(),
+    )
+  }
+
   fn head(&self) -> Option<u64> {
     self.versions.last().and_then(|version| version.head)
   }
@@ -551,6 +565,10 @@ pub struct Repository {
   index: Index,
   next_position: u64,
   chains: BTreeMap<u64, Chain>,
+  /// The versions its chains hold with no value of their own (each left for its first reader, A-614 amended), counted
+  /// as [`Repository::commit`] adds them: a version's value is never set after its commit, and the memo holds sets for
+  /// such versions alone, so the versions due are this count less the memo's ([`Repository::derivations_due`]).
+  unvalued: u64,
   /// For each commit some green's current head names, by its position, those greens.
   heads: BTreeMap<u64, BTreeSet<u64>>,
   /// For each commit a committed version's head peels to, by its position, the first such version (A-850): what a
@@ -623,6 +641,7 @@ impl Repository {
       index: Index::new(),
       next_position: 0,
       chains: BTreeMap::new(),
+      unvalued: 0,
       heads: BTreeMap::new(),
       peeled: BTreeMap::new(),
       holders: BTreeMap::new(),
@@ -1550,6 +1569,13 @@ impl Repository {
         })
       })
       .collect();
+    for (green, chain) in &chains {
+      let was = self.chains.get(green).map_or(0, Chain::unvalued);
+      self.unvalued = self
+        .unvalued
+        .saturating_sub(was)
+        .saturating_add(chain.unvalued());
+    }
     self.chains.extend(chains);
     self.heads = heads;
     self.next_position = next;
@@ -2103,6 +2129,7 @@ impl Repository {
       index,
       next_position: self.next_position,
       chains: self.chains.clone(),
+      unvalued: self.unvalued,
       heads: self.heads.clone(),
       peeled: self.peeled.clone(),
       holders: self.holders.clone(),

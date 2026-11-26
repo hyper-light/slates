@@ -631,6 +631,27 @@ pub(crate) const LONG_UNITS: [&str; slates_git::negotiation::KINDS] = [
   "vcs_store.git_upload.long_units.done",
 ];
 
+/// Counters: a fetch's choosing units of each kind, all of them, in [`LONG_UNITS`]'s order: what each kind's long units
+/// and the read cache's hits are a share of (main 01a20182's A/B of 2026-11-25: the long ones alone move with the
+/// shard's live quantum, so a total read from them was an inference). Format: counter names.
+pub(crate) const UNITS_BY_KIND: [&str; slates_git::negotiation::KINDS] = [
+  "vcs_store.git_upload.units.ready",
+  "vcs_store.git_upload.units.cut",
+  "vcs_store.git_upload.units.tips",
+  "vcs_store.git_upload.units.mark",
+  "vcs_store.git_upload.units.open_tree",
+  "vcs_store.git_upload.units.take_entry",
+  "vcs_store.git_upload.units.frame",
+  "vcs_store.git_upload.units.commits",
+  "vcs_store.git_upload.units.edges",
+  "vcs_store.git_upload.units.haves",
+  "vcs_store.git_upload.units.choose",
+  "vcs_store.git_upload.units.wants",
+  "vcs_store.git_upload.units.carried",
+  "vcs_store.git_upload.units.tags",
+  "vcs_store.git_upload.units.done",
+];
+
 /// Counted most: the longest unit of each kind, in nanoseconds, in [`LONG_UNITS`]'s order. Format: counter names.
 pub(crate) const UNIT_NS_MOST: [&str; slates_git::negotiation::KINDS] = [
   "vcs_store.git_upload.unit_ns_most.ready",
@@ -659,10 +680,10 @@ pub(crate) const UNIT_NS_MOST: [&str; slates_git::negotiation::KINDS] = [
 pub(crate) const CHOOSE_OVERRAN: &str = "vcs_store.git_upload.choose_overran";
 
 thread_local! {
-  /// This shard thread's choosing units since its last count ([`count_units`]): by kind, those past the quantum and the
-  /// longest, filled by the `spent` asks of [`ShardPacks`]'s turns.
-  static UNITS: core::cell::RefCell<[(u64, u64); slates_git::negotiation::KINDS]> =
-    const { core::cell::RefCell::new([(0, 0); slates_git::negotiation::KINDS]) };
+  /// This shard thread's choosing units since its last count ([`count_units`]): by kind, all of them, those past the
+  /// quantum and the longest, filled by the `spent` asks of [`ShardPacks`]'s turns.
+  static UNITS: core::cell::RefCell<[(u64, u64, u64); slates_git::negotiation::KINDS]> =
+    const { core::cell::RefCell::new([(0, 0, 0); slates_git::negotiation::KINDS]) };
   /// What each kind of choosing unit costs on this shard thread, learned across steps (`slates_pace::Costs`, A-783).
   static CHOOSE_COSTS: core::cell::RefCell<slates_pace::Costs<{ slates_git::negotiation::KINDS }>> =
     const { core::cell::RefCell::new(slates_pace::Costs::ZERO) };
@@ -784,8 +805,9 @@ fn note_unit(took: u64, quantum_ns: u64) {
   };
   UNITS.with(|units| {
     if let Ok(mut units) = units.try_borrow_mut()
-      && let Some((long, most)) = units.get_mut(at)
+      && let Some((all, long, most)) = units.get_mut(at)
     {
+      *all = all.saturating_add(1);
       if took > quantum_ns {
         *long = long.saturating_add(1);
       }
@@ -809,10 +831,15 @@ fn count_units(state: &mut ShardState) {
   if overran > 0 {
     state.count(CHOOSE_OVERRAN, overran);
   }
-  for ((long, most), (long_name, most_name)) in noted
-    .into_iter()
-    .zip(LONG_UNITS.iter().zip(UNIT_NS_MOST.iter()))
-  {
+  for ((all, long, most), ((all_name, long_name), most_name)) in noted.into_iter().zip(
+    UNITS_BY_KIND
+      .iter()
+      .zip(LONG_UNITS.iter())
+      .zip(UNIT_NS_MOST.iter()),
+  ) {
+    if all > 0 {
+      state.count(all_name, all);
+    }
     if long > 0 {
       state.count(long_name, long);
     }
