@@ -1,0 +1,56 @@
+name: diag-main-rss
+# Run 2 (main 01a20182, 2026-11-26 07:18 PST): after b2a (homed by identity) and b2b (landed in pieces), c701c0a27;
+# run 1 at 19f442f21 read after the push 291.1 (x86) and 331.3 (arm) MiB against bounds 204.7 and 198.1. Run 1: w-git's C5, the git daemon's resident memory after a push and a clone of
+# git/git's v2.0.0 cut (git_interop the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history),
+# after (b) (19f442f21: a push's pack put into the content store as it arrives, no push buffer, the judge's cache
+# within its grant). Linux's RSS is honest (a discard punches holes), so this is the lane the bound is judged on.
+# Release, ubuntu-latest and ubuntu-24.04-arm; git/git cloned bare from GitHub. Run only from diag-measurer-main-rss-*
+# branches, never main.
+on:
+  push:
+    branches: ["diag-measurer-main-rss-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  rss:
+    name: C5 RSS (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: git/git, bare
+        run: git clone -q --bare https://github.com/git/git.git "$RUNNER_TEMP/git-git.git" && git -C "$RUNNER_TEMP/git-git.git" rev-parse v2.0.0
+      - name: Build the test (release)
+        run: |
+          git log -1 --format='at %h %s' | cut -c1-120
+          cargo test --release --locked -p slates-cli --test git_interop --no-run
+      - name: The RSS test
+        run: |
+          set +e
+          SLATES_TEST_GIT_SOURCE="$RUNNER_TEMP/git-git.git" SLATES_TEST_GIT_CUT=v2.0.0 \
+            cargo test --release --locked -p slates-cli --test git_interop \
+            the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history -- --nocapture > "$RUNNER_TEMP/rss.log" 2>&1
+          rc=$?
+          line=$(grep -a '^resident MiB' "$RUNNER_TEMP/rss.log" | head -1 | cut -c1-400)
+          echo "::notice title=${{ matrix.os }} RSS (exit $rc)::$line"
+          grep -a -E "^resident MiB|panicked|test result|mem.gauge.process|vcs_content.stored|resident" "$RUNNER_TEMP/rss.log" | cut -c1-400 | head -60
+          exit 0
+      - name: Keep the log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: main-rss-${{ matrix.os }}
+          path: ${{ runner.temp }}/rss.log
+          if-no-files-found: warn
