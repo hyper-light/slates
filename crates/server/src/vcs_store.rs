@@ -2001,12 +2001,20 @@ impl SealedPush {
     self.attempt.homed(named.0);
   }
 
-  /// The push's pack to home in the region for a version 4 record (A-722's record v4): its bytes, and the identity and
-  /// length its staging put it in the store under; none for a push that put no pack. The bytes are copied for the
-  /// homing, which runs off the shard's step.
-  pub(crate) fn pack_to_home(&self) -> Option<(Vec<u8>, (slates_vcs::ContentId, u64))> {
+  /// The push's pack to home in the region for a version 4 record (A-722's record v4): its bytes, read from the content
+  /// store it was put in as it arrived, and the identity and length its staging finished it under; none for a push that
+  /// put no pack, or whose pack the store does not hold whole. The bytes are copied for the homing, which runs off the
+  /// shard's step: a whole-pack copy b2 owes (main's order of 2026-11-26, GAPS).
+  pub(crate) fn pack_to_home(
+    &self,
+    state: &mut ShardState,
+  ) -> Option<(Vec<u8>, (slates_vcs::ContentId, u64))> {
     let stored = self.push.stored_pack()?;
-    Some((self.push.pack().to_vec(), stored))
+    // Read with the shard's chunk store lent, where the content store keeps its windows (A-727).
+    let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+    let content = lent.stores.content()?;
+    let bytes = content.object_bytes(&content.root_of(&stored.0), stored.1)?;
+    Some((bytes, stored))
   }
 
   /// Keeps `packed`, the push's pack homed in the region under its identity and length: the record is version 5 while
@@ -2279,14 +2287,53 @@ impl GitPush {
     &self.push
   }
 
-  /// Keeps the pack the client sent as far as `sent` bytes, the push's objects' one copy (`Push::extend_pack`): what it
-  /// lacks of it is the end of `input`, the bytes of the call that brought them. The push's first record holds it in
-  /// place of its objects' bytes (A-723).
-  pub(crate) fn keep_pack_to(&mut self, sent: u64, input: &[u8]) {
-    let kept = u64::try_from(self.push.pack().len()).unwrap_or(u64::MAX);
-    let owed = usize::try_from(sent.saturating_sub(kept)).unwrap_or(usize::MAX);
+  /// Puts the pack the client sent as far as `sent` bytes in the content store as it arrives, the push's objects' one
+  /// copy (`Push::extend_pack`; main's order of 2026-11-26, C3: content once on arrival): what it lacks of it is the end
+  /// of `input`, the bytes of the call that brought them, put within the room the shard lends the step. The most the
+  /// push itself held of its pack then counted ([`PUSH_PACK_BUFFER_MOST`]). Refused (the budget, the storage), the push
+  /// keeps what it put, for its caller to abandon.
+  pub(crate) fn keep_pack_to(
+    &mut self,
+    state: &mut ShardState,
+    sent: u64,
+    input: &[u8],
+  ) -> Result<(), GitRefused> {
+    let owed = usize::try_from(sent.saturating_sub(self.push.pack_len())).unwrap_or(usize::MAX);
     let from = input.len().saturating_sub(owed);
-    self.push.extend_pack(input.get(from..).unwrap_or_default());
+    let piece = input.get(from..).unwrap_or_default();
+    let push = &mut self.push;
+    let put = within_budget(
+      state,
+      u64::try_from(piece.len()).unwrap_or(u64::MAX),
+      |stores| {
+        let content = stores.content_mut().ok_or(GitRefused::NoStore)?;
+        push.extend_pack(content, piece).map_err(content_refused)
+      },
+    );
+    state.count_max(
+      PUSH_PACK_BUFFER_MOST,
+      u64::try_from(self.push.pack_held()).unwrap_or(u64::MAX),
+    );
+    put
+  }
+
+  /// Widens what the push's reads keep of the objects read lately for the chains its pack carries, within what the
+  /// shard grants now (`Push::widen_reading`, the fetch's widening's rule): its growth asked of the room the shard can
+  /// admit (`Store::admittable`), never of the reading's own admission, which is the room its reader holds objects in;
+  /// what the cache keeps is charged on the store's room as it keeps it (A-861, `Push::true_up_recent`). Counted
+  /// [`PUSH_READ_CACHE_WIDENED`], [`PUSH_READ_CACHE_REFUSED`] past the grant, and the budget's most
+  /// ([`PUSH_READ_CACHE_BUDGET_MOST`]).
+  pub(crate) fn widen_reading(&self, state: &mut ShardState) {
+    let mut grant = slates_git::Admission::new(state.store.admittable());
+    match self.push.widen_reading(&mut grant) {
+      slates_git::store::Widening::Grown => state.count(PUSH_READ_CACHE_WIDENED, 1),
+      slates_git::store::Widening::Refused => state.count(PUSH_READ_CACHE_REFUSED, 1),
+      slates_git::store::Widening::Enough => {}
+    }
+    state.count_max(
+      PUSH_READ_CACHE_BUDGET_MOST,
+      u64::try_from(self.push.reading_budget()).unwrap_or(u64::MAX),
+    );
   }
 
   /// Admits `objects`, a pack's as its reader resolved them, each held where its entry lies in the push's pack
@@ -2341,9 +2388,9 @@ impl GitPush {
         .map(|incoming| (incoming.kind, incoming.content)),
     )
     .map_err(|_| GitRefused::Allocation)?;
-    let sent = u64::try_from(self.push.pack().len().saturating_add(pack.len())).unwrap_or(u64::MAX);
-    let base = u64::try_from(self.push.pack().len()).unwrap_or(u64::MAX);
-    self.keep_pack_to(sent, &pack);
+    let base = self.push.pack_len();
+    let sent = base.saturating_add(u64::try_from(pack.len()).unwrap_or(u64::MAX));
+    self.keep_pack_to(state, sent, &pack)?;
     within_budget(state, 0, |stores| {
       let (content, store) = stores.git(self.repository).ok_or(GitRefused::NoStore)?;
       for (incoming, offset) in objects.iter().zip(offsets) {
@@ -3280,8 +3327,11 @@ fn replay_pack(
       .map_err(ReplayRefused::Pack)?
   };
   // Each object is held where it lies in the record's pack, as the live push held it (A-722's record v4: rows by pack
-  // place), so the store made again from the log is the live one.
-  push.extend_pack(pack);
+  // place), so the store made again from the log is the live one; its windows a landed push let go brought back.
+  push.bringing_back();
+  push
+    .extend_pack(content, pack)
+    .map_err(|refused| ReplayRefused::Git(content_refused(refused)))?;
   for object in &unpacked.objects {
     let incoming = Incoming {
       kind: object.kind,
@@ -4027,6 +4077,19 @@ fn put_changeset(
 /// Counter: git changesets a recovery or rebuild read from the node's store before replaying the record naming them
 /// (A-767 C5). Format: a counter name.
 pub(crate) const CHANGESET_READ: &str = "vcs_store.git_changeset_read";
+
+/// Counted most: the most bytes a git push itself held of its own pack at once: its put's window being filled, the pack
+/// put in the content store as it arrives (main's order of 2026-11-26, C3; `Push::pack_held`). At most a window. Format: a
+/// counter name.
+pub(crate) const PUSH_PACK_BUFFER_MOST: &str = "git_push.pack_buffer_most";
+/// Counter: the times a git push's reads widened what they keep of the objects read lately (`Push::widen_reading`).
+/// Format: a counter name.
+pub(crate) const PUSH_READ_CACHE_WIDENED: &str = "git_push.read_cache_widened";
+/// Counter: the times a git push's admission refused its read cache the room its chains asked: its reads past the grant
+/// rebuilt from their bases, never refused. Format: a counter name.
+pub(crate) const PUSH_READ_CACHE_REFUSED: &str = "git_push.read_cache_refused";
+/// Counted most: the most bytes a git push's read cache was allowed to keep. Format: a counter name.
+pub(crate) const PUSH_READ_CACHE_BUDGET_MOST: &str = "git_push.read_cache_budget_most";
 
 /// Counted most: the most bytes of its record's pack a git replay held at once while reading it from the node's store
 /// (C2 of w-git's close list, main's order of 2026-11-26: read whole, one buffer as long as the pack, a working set
@@ -4839,24 +4902,10 @@ async fn recover_repository(
     let outcome = if record.tool == VcsTool::Mercurial {
       hg_record_replayed(state, (record.id, index), slices).await
     } else {
-      if !fetched_before_turn(state, (record.id, index), &mut read_index).await {
-        break;
-      }
-      // A git record carrying a pack is replayed a turn's units a unit of the recovery (A-722 part 4).
-      let ns = state.config.step_quantum_ns();
-      match record_turn(state, (record.id, index), ns) {
-        Some(RecordTurn::More) => {
-          slices.unit_done().await;
-          continue;
-        }
-        Some(RecordTurn::Wants) => {
-          if !filled_here(state, record.id).await {
-            break;
-          }
-          continue;
-        }
-        Some(RecordTurn::Replayed(outcome)) => Some(outcome),
-        None => None,
+      match git_recovery_turn(state, (record.id, index), &mut read_index, slices).await {
+        Recovering::Again => continue,
+        Recovering::Stopped => break,
+        Recovering::Turned(outcome) => outcome,
       }
     };
     let Some(outcome) = outcome else {
@@ -4874,6 +4923,46 @@ async fn recover_repository(
   // ([`put_changeset`]), once its greens' maps are made again: a warm restart leaves out of RAM what its predecessor
   // let go.
   let_go_owed(state, record.id);
+}
+
+/// What one turn of a git record's replay left its recovery ([`git_recovery_turn`]).
+enum Recovering {
+  /// The record replayed, or refused; none where it has no record there.
+  Turned(Option<Result<(), ReplayRefused>>),
+  /// More of the record to turn.
+  Again,
+  /// Its changeset's read or its pack's fill refused: the recovery stops.
+  Stopped,
+}
+
+/// One turn of repository `id`'s git record at `index` in its recovery: its changeset read from the node's store before
+/// its first turn ([`fetched_before_turn`]), then a turn's units a unit of the recovery (A-722 part 4), its pack's
+/// wanted range filled between two turns where it reads the pack a piece at a time (C2, [`filled_here`]).
+async fn git_recovery_turn(
+  state: &mut ShardState,
+  (id, index): (RepositoryId, usize),
+  read_index: &mut Option<usize>,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) -> Recovering {
+  if !fetched_before_turn(state, (id, index), read_index).await {
+    return Recovering::Stopped;
+  }
+  let ns = state.config.step_quantum_ns();
+  match record_turn(state, (id, index), ns) {
+    Some(RecordTurn::More) => {
+      slices.unit_done().await;
+      Recovering::Again
+    }
+    Some(RecordTurn::Wants) => {
+      if filled_here(state, id).await {
+        Recovering::Again
+      } else {
+        Recovering::Stopped
+      }
+    }
+    Some(RecordTurn::Replayed(outcome)) => Recovering::Turned(Some(outcome)),
+    None => Recovering::Turned(None),
+  }
 }
 
 /// Each of `record`'s greens' map of its head made again as the live store holds it (A-664 part 3), and a Subversion
@@ -4975,101 +5064,122 @@ fn rebuild_sliced_from(state: &mut ShardState, record: &RepositoryRecord) {
 /// finds them held. One that no home answers is left missing, and the replay refuses it typed.
 async fn rebuild_turns(id: RepositoryId, generation: u64) {
   loop {
-    // A version-5 record's names and pack read from the node's store where this node lacks them (A-767 C5).
-    if let Some(Some((wanted, disk))) = crate::state::with_state(|state| {
-      let under_way = state.vcs_stores.rebuild_turns.get(&id).copied()?;
-      if under_way.0 != generation || state.vcs_stores.git_replays.contains_key(&id) {
-        return None;
-      }
-      let wanted = changeset_wanted(state, id, under_way.1, false)?;
-      Some((wanted, state.vcs_disk.clone()?))
-    }) {
-      let read = read_changeset(&disk, &wanted).await;
-      let _ = crate::state::with_state(|state| {
-        read.and_then(|read| put_changeset(state, id, &wanted, read))
-      });
-    }
-    while let Some(Some((origin, shards, identity))) =
-      crate::state::with_state(|state| names_to_fetch(state, id, generation))
-    {
-      let fetched =
-        homes::read_in_region(origin, &shards, identity, crate::fleet::live_budget()).await;
-      let put = crate::state::with_state(|state| match fetched {
-        Some(bytes) if put_names_whole(state, &bytes) == Some(identity) => {
-          state.count(NAMES_FETCHED, 1);
-          true
-        }
-        _ => {
-          state.count(NAMES_UNFETCHED, 1);
-          false
-        }
-      });
-      if put != Some(true) {
-        break;
-      }
-    }
-    // A Subversion record is read back from the node's store before its replay (C2): the register names it alone.
-    let place = crate::state::with_state(|state| {
-      let (current, index) = state.vcs_stores.rebuild_turns.get(&id).copied()?;
-      (current == generation)
-        .then(|| svn_to_fetch(state, id, index).map(|place| (index, place)))
-        .flatten()
-    })
-    .flatten();
-    if let Some((index, place)) = place
-      && let Some(fetched) = fetch_svn(id, index, place).await
-    {
-      crate::state::with_state(|state| state.vcs_stores.svn_fetched.insert(id, fetched));
-    }
-    // A git record's pack read from the node's store a piece at a time: the range its last turn wanted, filled here,
-    // off the step (C2), and taken back only while this rebuild is still the repository's (a rebuild begun meanwhile
-    // gave this one's replay back).
-    #[cfg(test)]
-    while REPLAY_FILLS_BEFORE_HOLD.with(|left| left.get() == Some(0)) {
-      slates_rt::futures::yield_now().await;
-    }
-    let current = |state: &ShardState| {
-      state
-        .vcs_stores
-        .rebuild_turns
-        .get(&id)
-        .is_some_and(|(at, _)| *at == generation)
-    };
-    let wanting = crate::state::with_state(|state| {
-      let wants = current(state)
-        && state
-          .vcs_stores
-          .replay_packs
-          .get(&id)
-          .is_some_and(|pack| pack.wanted.is_some());
-      wants
-        .then(|| state.vcs_stores.replay_packs.remove(&id))
-        .flatten()
-    })
-    .flatten();
-    if let Some(pack) = wanting {
-      let left = filled(pack).await;
-      #[cfg(test)]
-      REPLAY_FILLS_BEFORE_HOLD.with(|left| left.set(left.get().map(|n| n.saturating_sub(1))));
-      let goes_on = crate::state::with_state(|state| {
-        if !current(state) {
-          return false;
-        }
-        let goes_on = pack_filled(state, id, left);
-        if !goes_on {
-          rebuild_ended(state, id);
-        }
-        goes_on
-      });
-      if goes_on != Some(true) {
-        return;
-      }
+    changeset_read_for_rebuild(id, generation).await;
+    names_fetched_for_rebuild(id, generation).await;
+    svn_fetched_for_rebuild(id, generation).await;
+    if !pack_filled_for_rebuild(id, generation).await {
+      return;
     }
     if crate::state::with_state(|state| rebuild_turn(state, id, generation)) != Some(true) {
       return;
     }
     slates_rt::futures::yield_now().await;
   }
+}
+
+/// A version-5 record's names and pack read from the node's store where this node lacks them, before its replay begins
+/// in repository `id`'s rebuild of `generation` (A-767 C5; [`read_changeset`], [`put_changeset`]).
+async fn changeset_read_for_rebuild(id: RepositoryId, generation: u64) {
+  let Some(Some((wanted, disk))) = crate::state::with_state(|state| {
+    let under_way = state.vcs_stores.rebuild_turns.get(&id).copied()?;
+    if under_way.0 != generation || state.vcs_stores.git_replays.contains_key(&id) {
+      return None;
+    }
+    let wanted = changeset_wanted(state, id, under_way.1, false)?;
+    Some((wanted, state.vcs_disk.clone()?))
+  }) else {
+    return;
+  };
+  let read = read_changeset(&disk, &wanted).await;
+  let _ =
+    crate::state::with_state(|state| read.and_then(|read| put_changeset(state, id, &wanted, read)));
+}
+
+/// A version-4 record's names and pack read from their region homes where this node does not hold them, before its
+/// replay begins in repository `id`'s rebuild of `generation` (A-724 piece 8c; [`names_to_fetch`]): each put into the
+/// content store, so the replay finds them held; one no home answers left missing, which the replay refuses typed.
+async fn names_fetched_for_rebuild(id: RepositoryId, generation: u64) {
+  while let Some(Some((origin, shards, identity))) =
+    crate::state::with_state(|state| names_to_fetch(state, id, generation))
+  {
+    let fetched =
+      homes::read_in_region(origin, &shards, identity, crate::fleet::live_budget()).await;
+    let put = crate::state::with_state(|state| match fetched {
+      Some(bytes) if put_names_whole(state, &bytes) == Some(identity) => {
+        state.count(NAMES_FETCHED, 1);
+        true
+      }
+      _ => {
+        state.count(NAMES_UNFETCHED, 1);
+        false
+      }
+    });
+    if put != Some(true) {
+      return;
+    }
+  }
+}
+
+/// A Subversion record read back from the node's store before its replay in repository `id`'s rebuild of `generation`
+/// (C2: the register names it alone).
+async fn svn_fetched_for_rebuild(id: RepositoryId, generation: u64) {
+  let place = crate::state::with_state(|state| {
+    let (current, index) = state.vcs_stores.rebuild_turns.get(&id).copied()?;
+    (current == generation)
+      .then(|| svn_to_fetch(state, id, index).map(|place| (index, place)))
+      .flatten()
+  })
+  .flatten();
+  if let Some((index, place)) = place
+    && let Some(fetched) = fetch_svn(id, index, place).await
+  {
+    crate::state::with_state(|state| state.vcs_stores.svn_fetched.insert(id, fetched));
+  }
+}
+
+/// A git record's pack read from the node's store a piece at a time (C2): the range its replay's last turn wanted in
+/// repository `id`'s rebuild of `generation`, filled here, off the step, and taken back only while this rebuild is
+/// still the repository's (a rebuild begun meanwhile gave this one's replay back). Whether the rebuild goes on.
+async fn pack_filled_for_rebuild(id: RepositoryId, generation: u64) -> bool {
+  #[cfg(test)]
+  while REPLAY_FILLS_BEFORE_HOLD.with(|left| left.get() == Some(0)) {
+    slates_rt::futures::yield_now().await;
+  }
+  let current = |state: &ShardState| {
+    state
+      .vcs_stores
+      .rebuild_turns
+      .get(&id)
+      .is_some_and(|(at, _)| *at == generation)
+  };
+  let wanting = crate::state::with_state(|state| {
+    let wants = current(state)
+      && state
+        .vcs_stores
+        .replay_packs
+        .get(&id)
+        .is_some_and(|pack| pack.wanted.is_some());
+    wants
+      .then(|| state.vcs_stores.replay_packs.remove(&id))
+      .flatten()
+  })
+  .flatten();
+  let Some(pack) = wanting else {
+    return true;
+  };
+  let left = filled(pack).await;
+  #[cfg(test)]
+  REPLAY_FILLS_BEFORE_HOLD.with(|left| left.set(left.get().map(|n| n.saturating_sub(1))));
+  crate::state::with_state(|state| {
+    if !current(state) {
+      return false;
+    }
+    let goes_on = pack_filled(state, id, left);
+    if !goes_on {
+      rebuild_ended(state, id);
+    }
+    goes_on
+  }) == Some(true)
 }
 
 /// Counter: a version-4 record's names or pack read from their region homes before its replay (A-724 piece 8c; A-722's

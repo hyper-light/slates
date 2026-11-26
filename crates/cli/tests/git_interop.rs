@@ -1118,8 +1118,26 @@ fn pack_bytes(git: &Git, dir: &str, cut: &str) -> u64 {
   counted.join().unwrap()
 }
 
-/// Process `pid`'s resident set, in bytes, as `ps` reports it.
-#[cfg(unix)]
+/// Process `pid`'s resident bytes as the kernel counts what it holds now, macOS: its physical footprint
+/// (`proc_pid_rusage`'s `ri_phys_footprint`). Its resident set keeps counting pages the allocator gave back
+/// (`MADV_FREE_REUSABLE`) until the kernel reclaims them, so a bound on it judged the allocator's keep, not the bytes
+/// held: w-perf's `crates/mem/tests/macos_residency.rs` (2026-11-25) wrote 32 MiB and purged it, its resident set 38 MiB,
+/// its footprint 1 MiB. Main's order of 2026-11-26 (C5's reader).
+#[cfg(target_os = "macos")]
+fn resident_of(pid: &str) -> u64 {
+  let pid: libc::pid_t = pid.parse().unwrap();
+  let mut info = std::mem::MaybeUninit::<libc::rusage_info_v0>::zeroed();
+  // SAFETY: `info` is a writable rusage_info_v0, the flavor asked for; `pid` is the daemon this test started, a child of
+  // this user's.
+  let rc = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V0, info.as_mut_ptr().cast()) };
+  assert_eq!(rc, 0, "proc_pid_rusage of {pid}");
+  // SAFETY: the call succeeded, so it filled the record.
+  unsafe { info.assume_init() }.ri_phys_footprint
+}
+
+/// Process `pid`'s resident set, in bytes, as `ps` reports it: the paired arm (Linux's resident set counts what the
+/// process holds, a page given back no more).
+#[cfg(all(unix, not(target_os = "macos")))]
 fn resident_of(pid: &str) -> u64 {
   let output = Command::new("ps")
     .args(["-o", "rss=", "-p", pid])
