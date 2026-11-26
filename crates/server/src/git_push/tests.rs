@@ -10,7 +10,7 @@ use slates_git::object_name::{ObjectFormat, ObjectId};
 use slates_git::pktline::{self, Packet};
 use slates_git::receive::{
   ATOMIC_FAILURE, ATOMIC_TRANSACTION_FAILED, Advertised, Declined, FAILED_TO_UPDATE, HIDDEN_DELETE,
-  Outcome, Received, protected, write_advertisement,
+  Outcome, REFNAME_CONFLICT, Received, protected, write_advertisement,
 };
 use slates_ipc::protocol::{
   HookConfig, HookPointName, ObjectFormat as WireFormat, PolicyEffect, PolicyNames, PolicyRight,
@@ -4251,13 +4251,23 @@ fn t_rt_git_storm_typed_unpack_refusal_is_emitted_on_sideband_two_preserving_sta
 // ---------------------------------------------------------------------------------------------------------------------
 // Red-team regression (`rt-git-df`): cross-push ref D/F namespace conflict enforcement.
 
-/// Asserts `received` refused its single command with `FAILED_TO_UPDATE` and a generic band-2
-/// conflict message naming `target` (`refname conflict`) while never disclosing `hidden` anywhere
-/// in the refusal reason or band-2 sideband output.
-fn assert_hidden_df_refused(received: &Received, target: &[u8], hidden: &[u8]) {
-  assert_eq!(reasons(received), [FAILED_TO_UPDATE]);
-  assert_first_line_names(received, target);
-  assert_first_line_names(received, b"refname conflict");
+/// Asserts `received` refused its single command with `expected_reason` and stock Git 2.56.1's
+/// generic band-2 conflict line (`cannot lock ref '<target>': refname conflict`) while never
+/// disclosing `hidden` anywhere in the refusal reason or band-2 sideband output.
+fn assert_hidden_df_refused(
+  received: &Received,
+  expected_reason: &[u8],
+  target: &[u8],
+  hidden: &[u8],
+) {
+  assert_eq!(reasons(received), [expected_reason]);
+  let expected_line = [
+    b"error: cannot lock ref '",
+    target,
+    b"': refname conflict\n",
+  ]
+  .concat();
+  assert_first_line_names(received, &expected_line);
   let mut sideband = Vec::new();
   slates_git::receive::write_report(received, &mut sideband).unwrap();
   assert!(
@@ -4277,20 +4287,34 @@ fn assert_hidden_df_refused(received: &Received, target: &[u8], hidden: &[u8]) {
   );
 }
 
-/// Asserts `received` refused its single command with `FAILED_TO_UPDATE` and a Git D/F band-2
-/// message naming `existing` (`exists; cannot create`).
+/// Asserts `received` refused its single non-atomic command with `REFNAME_CONFLICT` and stock Git
+/// 2.56.1's `cannot lock ref '<n>': '<existing>' exists; cannot create '<n>'` band-2 line.
 fn assert_df_refused(received: &Received, existing: &[u8]) {
-  assert_eq!(reasons(received), [FAILED_TO_UPDATE]);
+  assert_eq!(reasons(received), [REFNAME_CONFLICT]);
+  assert_first_line_names(received, b"cannot lock ref '");
   assert_first_line_names(received, existing);
   assert_first_line_names(received, b"exists; cannot create");
 }
 
-/// Asserts `received` refused an atomic two-command push (first sibling, second conflicting) with
-/// `[ATOMIC_FAILURE, FAILED_TO_UPDATE]` and a band-2 message naming `existing`.
+/// Asserts `received` refused an atomic two-command push with `[ATOMIC_TRANSACTION_FAILED,
+/// ATOMIC_TRANSACTION_FAILED]` and stock Git 2.56.1's band-2 line naming `existing` emitted once
+/// on command 0.
 fn assert_atomic_df_refused(received: &Received, existing: &[u8]) {
-  assert_eq!(reasons(received), [ATOMIC_FAILURE, FAILED_TO_UPDATE]);
+  assert_eq!(
+    reasons(received),
+    [ATOMIC_TRANSACTION_FAILED, ATOMIC_TRANSACTION_FAILED]
+  );
+  assert_first_line_names(received, b"cannot lock ref '");
   assert_first_line_names(received, existing);
   assert_first_line_names(received, b"exists; cannot create");
+  assert!(
+    matches!(
+      &received.outcomes[1],
+      Outcome::Ng(Declined { message: None, .. })
+    ),
+    "atomic D/F band-2 line must be emitted once: {:?}",
+    received.outcomes
+  );
 }
 
 /// Pushes `commands` with `capabilities` and `empty_pack()` on a stored shard and asserts every
@@ -4323,8 +4347,8 @@ fn seeded_df_repo(state: &mut ShardState, name: &str) -> RepositoryId {
 
 /// Red-team regression (`rt-git-df`, §4.17.2): Push 1 creates `refs/heads/topic`; Push 2
 /// (`--atomic`) pushes `[refs/heads/companion, refs/heads/topic/docs]`. Expect: Push 2 is refused
-/// atomically (`[ATOMIC_FAILURE, FAILED_TO_UPDATE]`), neither `companion` nor `topic/docs` lands,
-/// `refs/heads/topic` remains bound, and no register record is appended.
+/// atomically (`[ATOMIC_TRANSACTION_FAILED, ATOMIC_TRANSACTION_FAILED]`), neither `companion` nor
+/// `topic/docs` lands, `refs/heads/topic` remains bound, and no register record is appended.
 #[test]
 fn t_rt_git_df_cross_push_ancestor_blocks_atomic_descendant_push() {
   crate::test_store::audit_on_stored_shard("git-push-df", |state| {
@@ -4355,9 +4379,10 @@ fn t_rt_git_df_cross_push_ancestor_blocks_atomic_descendant_push() {
 }
 
 /// Red-team regression (`rt-git-df`, §4.17.2): Push 1 creates `refs/heads/topic/docs`; Push 2
-/// pushes `refs/heads/topic` (both non-atomic and `--atomic` with a sibling). Expect: both pushes
-/// are refused (`FAILED_TO_UPDATE` naming `refs/heads/topic/docs`), `refs/heads/topic` and
-/// `refs/heads/companion` never land, and `refs/heads/topic/docs` stays intact.
+/// pushes `refs/heads/topic` (both non-atomic and `--atomic` with a sibling). Expect: non-atomic
+/// is refused `REFNAME_CONFLICT` and `--atomic` is refused `ATOMIC_TRANSACTION_FAILED` (both
+/// naming `refs/heads/topic/docs`), `refs/heads/topic` and `refs/heads/companion` never land, and
+/// `refs/heads/topic/docs` stays intact.
 #[test]
 fn t_rt_git_df_cross_push_descendant_blocks_ancestor_push() {
   crate::test_store::audit_on_stored_shard("git-push-df", |state| {
@@ -4508,6 +4533,7 @@ fn assert_hidden_and_refs_branch_df(state: &mut ShardState, repository: Reposito
   );
   assert_hidden_df_refused(
     &secret_parent,
+    REFNAME_CONFLICT,
     b"refs/heads/secret",
     b"refs/heads/secret/child",
   );
@@ -4725,30 +4751,50 @@ impl DfRepoFixture {
     self.repositories.branch(self.repo_id, namespace).is_some()
   }
 
-  /// Drives real `slates_git::receive::{check, decide}` over `commands` using
-  /// `super::ref_conflict_in` and `hidden`.
-  fn receive_push_with_hidden<H: slates_git::receive::HiddenRefs>(
-    &mut self,
+  /// Prepares a checked push and [`slates_git::receive::Deciding`] instance over `commands` using
+  /// `hidden` without stepping it yet, so tests can interleave multiple concurrent decisions.
+  fn start_deciding<H: slates_git::receive::HiddenRefs>(
+    &self,
     commands: &[(&str, &str, &[u8])],
     capabilities: &[u8],
     hidden: &H,
-  ) -> Received {
+  ) -> (
+    slates_git::receive::Deciding<()>,
+    slates_git::unpack::Held,
+    slates_git::Admission,
+  ) {
     let wire = request(commands, capabilities, empty_pack());
     let mut admission = slates_git::Admission::new(u64::MAX);
     let mut reader = slates_git::receive::RequestReader::new(&OURS);
     reader.read(&wire, &mut admission).unwrap();
     let req = reader.request().unwrap();
     let held = slates_git::unpack::Held::default();
-    let checked = {
-      let indexed =
-        slates_git::store::views::IndexedObjects::new(&self.git, &self.content, u64::MAX);
-      slates_git::receive::check(req, None, (&indexed, &held), hidden, &mut admission).unwrap()
-    };
+    let indexed = slates_git::store::views::IndexedObjects::new(&self.git, &self.content, u64::MAX);
+    let checked =
+      slates_git::receive::check(req, None, (&indexed, &held), hidden, &mut admission).unwrap();
+    let deciding = slates_git::receive::Deciding::new(checked, &mut admission).unwrap();
+    (deciding, held, admission)
+  }
+
+  /// Drives real `slates_git::receive::{check, decide}` over `commands` using
+  /// `super::ref_conflict_in`, `super::append_df_guard`, and `hidden`.
+  fn receive_push_with_hidden<H: slates_git::receive::HiddenRefs>(
+    &mut self,
+    commands: &[(&str, &str, &[u8])],
+    capabilities: &[u8],
+    hidden: &H,
+  ) -> Received {
+    let (mut deciding, held, mut admission) = self.start_deciding(commands, capabilities, hidden);
     let mut judge = DfFixtureJudge {
       fixture: self,
       hidden,
+      pause_ready_once: false,
     };
-    slates_git::receive::decide(checked, Some(&held), &mut judge, &mut admission).unwrap()
+    while !deciding
+      .step(Some(&held), &mut judge, &mut admission)
+      .unwrap()
+    {}
+    deciding.received()
   }
 
   /// Drives real `slates_git::receive::{check, decide}` over `commands` with no hidden refs.
@@ -4770,16 +4816,31 @@ impl DfRepoFixture {
   }
 }
 
-/// Test `Judge` wiring `super::ref_conflict_in` directly to `DfRepoFixture`.
+/// Test `Judge` wiring `super::ref_conflict_in` and `super::append_df_guard` directly to
+/// `DfRepoFixture`.
 struct DfFixtureJudge<'a, H: slates_git::receive::HiddenRefs + ?Sized> {
   fixture: &'a mut DfRepoFixture,
   hidden: &'a H,
+  /// When true, the next `ready()` call returns `false` once to exercise cooperative yield races.
+  pause_ready_once: bool,
 }
 
 impl<H: slates_git::receive::HiddenRefs + ?Sized> slates_git::receive::Judge
   for DfFixtureJudge<'_, H>
 {
   type Accepted = ();
+
+  fn ready(
+    &mut self,
+    _command: &slates_git::receive::Command,
+    _pushed: &slates_git::receive::Pushed<'_>,
+  ) -> bool {
+    if self.pause_ready_once {
+      self.pause_ready_once = false;
+      return false;
+    }
+    true
+  }
 
   fn ref_conflict(
     &self,
@@ -4809,6 +4870,14 @@ impl<H: slates_git::receive::HiddenRefs + ?Sized> slates_git::receive::Judge
     command: &slates_git::receive::Command,
     _accepted: (),
   ) -> Result<Vec<slates_git::receive::Reported>, Declined> {
+    super::append_df_guard(
+      &self.fixture.repositories,
+      (&self.fixture.content, &self.fixture.git),
+      self.fixture.repo_id,
+      self.hidden,
+      command,
+      REFNAME_CONFLICT,
+    )?;
     if command.is_delete() {
       self.fixture.delete_live_ref(&command.name);
     } else {
@@ -4821,6 +4890,16 @@ impl<H: slates_git::receive::HiddenRefs + ?Sized> slates_git::receive::Judge
     &mut self,
     accepted: Vec<(&slates_git::receive::Command, ())>,
   ) -> Result<Vec<Vec<slates_git::receive::Reported>>, Declined> {
+    for &(command, _) in &accepted {
+      super::append_df_guard(
+        &self.fixture.repositories,
+        (&self.fixture.content, &self.fixture.git),
+        self.fixture.repo_id,
+        self.hidden,
+        command,
+        ATOMIC_TRANSACTION_FAILED,
+      )?;
+    }
     let count = accepted.len();
     for (command, _) in accepted {
       if command.is_delete() {
@@ -4835,8 +4914,8 @@ impl<H: slates_git::receive::HiddenRefs + ?Sized> slates_git::receive::Judge
 
 /// Red-team regression (`rt-git-df`, in-memory `Repositories` + `slates_git::store::Repository`):
 /// Push 1 creates `refs/heads/topic`; Push 2 (`--atomic`) pushes `[companion, topic/docs]`.
-/// Expect: refused atomically (`[ATOMIC_FAILURE, FAILED_TO_UPDATE]` naming `refs/heads/topic`),
-/// neither `companion` nor `topic/docs` applied, `topic` intact.
+/// Expect: refused atomically (`[ATOMIC_TRANSACTION_FAILED, ATOMIC_TRANSACTION_FAILED]` naming
+/// `refs/heads/topic` once), neither `companion` nor `topic/docs` applied, `topic` intact.
 #[test]
 fn t_rt_git_df_in_memory_cross_push_ancestor_blocks_atomic_descendant() {
   let mut fixture = DfRepoFixture::new();
@@ -4896,7 +4975,7 @@ fn t_rt_git_df_in_memory_cross_push_descendant_blocks_ancestor_and_partial_delet
   );
   assert_eq!(
     reasons(&non_atomic_partial),
-    [b"ok".as_slice(), FAILED_TO_UPDATE]
+    [b"ok".as_slice(), REFNAME_CONFLICT]
   );
   assert_first_line_names(&non_atomic_partial, b"refs/heads/topic/notes");
   assert_eq!(
@@ -5010,6 +5089,7 @@ fn t_rt_git_df_in_memory_tags_unborn_and_refs_branch_boundaries() {
     fixture.receive_push_with_hidden(&[("", &hex, b"refs/heads/secret")], CAPABILITIES, &hidden);
   assert_hidden_df_refused(
     &hidden_parent,
+    REFNAME_CONFLICT,
     b"refs/heads/secret",
     b"refs/heads/secret/child",
   );
@@ -5027,6 +5107,7 @@ fn t_rt_git_df_in_memory_tags_unborn_and_refs_branch_boundaries() {
     fixture.receive_push_with_hidden(&[("", &hex, b"refs/heads/vault/leaf")], ATOMIC, &hidden_anc);
   assert_hidden_df_refused(
     &hidden_child,
+    ATOMIC_TRANSACTION_FAILED,
     b"refs/heads/vault/leaf",
     b"'refs/heads/vault' exists",
   );
@@ -5060,7 +5141,11 @@ fn t_rt_git_df_in_memory_non_atomic_same_batch_ordering_and_three_level_chain() 
   );
   assert_eq!(
     reasons(&got),
-    [FAILED_TO_UPDATE, b"ok".as_slice(), b"ok".as_slice()]
+    [REFNAME_CONFLICT, b"ok".as_slice(), b"ok".as_slice()]
+  );
+  assert_first_line_names(
+    &got,
+    b"cannot process 'refs/heads/topic' and 'refs/heads/topic/docs/deep' at the same time",
   );
   assert_eq!(
     (
@@ -5083,7 +5168,11 @@ fn t_rt_git_df_in_memory_non_atomic_same_batch_ordering_and_three_level_chain() 
   );
   assert_eq!(
     reasons(&got),
-    [b"ok".as_slice(), FAILED_TO_UPDATE, b"ok".as_slice()]
+    [b"ok".as_slice(), REFNAME_CONFLICT, b"ok".as_slice()]
+  );
+  assert_first_line_names(
+    &got,
+    b"cannot process 'refs/heads/topic' and 'refs/heads/topic/docs/deep' at the same time",
   );
   assert_eq!(
     (
@@ -5106,7 +5195,7 @@ fn t_rt_git_df_in_memory_non_atomic_same_batch_ordering_and_three_level_chain() 
   );
   assert_eq!(
     reasons(&got),
-    [FAILED_TO_UPDATE, FAILED_TO_UPDATE, b"ok".as_slice()]
+    [REFNAME_CONFLICT, REFNAME_CONFLICT, b"ok".as_slice()]
   );
   assert_eq!(
     (
@@ -5156,6 +5245,235 @@ fn t_rt_git_intake_kind_uses_object_index_without_inflating_bytes() {
     (0, 0),
     "Intake::kind must read the object index without inflating object bytes"
   );
+}
+
+/// Drives `deciding` one step on `fixture` with `hidden`, optionally pausing `ready()` once.
+fn step_deciding<H: slates_git::receive::HiddenRefs>(
+  fixture: &mut DfRepoFixture,
+  hidden: &H,
+  deciding: &mut slates_git::receive::Deciding<()>,
+  held: &slates_git::unpack::Held,
+  admission: &mut slates_git::Admission,
+  pause_ready_once: bool,
+) -> bool {
+  let mut judge = DfFixtureJudge {
+    fixture,
+    hidden,
+    pause_ready_once,
+  };
+  deciding.step(Some(held), &mut judge, admission).unwrap()
+}
+
+/// Finishes stepping `deciding` to completion on `fixture` with `hidden`.
+fn finish_deciding<H: slates_git::receive::HiddenRefs>(
+  fixture: &mut DfRepoFixture,
+  hidden: &H,
+  mut deciding: slates_git::receive::Deciding<()>,
+  held: &slates_git::unpack::Held,
+  admission: &mut slates_git::Admission,
+) -> Received {
+  while !step_deciding(fixture, hidden, &mut deciding, held, admission, false) {}
+  deciding.received()
+}
+
+/// Verifies two interleaved atomic `Deciding` pushes (`refs/heads/x` vs `[refs/heads/z,
+/// refs/heads/x/y]`) that both clear `CheckingDf` before either commits cannot both commit.
+fn assert_interleaved_atomic_deciding_race() {
+  let mut fixture = DfRepoFixture::new();
+  let hex = fixture.commit_hex.clone();
+  let none = slates_git::receive::NoneHidden;
+  let (mut push_a, held_a, mut adm_a) =
+    fixture.start_deciding(&[("", &hex, b"refs/heads/x")], ATOMIC, &none);
+  let (mut push_b, held_b, mut adm_b) = fixture.start_deciding(
+    &[("", &hex, b"refs/heads/z"), ("", &hex, b"refs/heads/x/y")],
+    ATOMIC,
+    &none,
+  );
+  // Both pushes clear `CheckingDf` cooperatively while neither ref exists yet.
+  assert!(!step_deciding(
+    &mut fixture,
+    &none,
+    &mut push_a,
+    &held_a,
+    &mut adm_a,
+    false
+  ));
+  assert!(!step_deciding(
+    &mut fixture,
+    &none,
+    &mut push_b,
+    &held_b,
+    &mut adm_b,
+    false
+  ));
+  assert!(!step_deciding(
+    &mut fixture,
+    &none,
+    &mut push_b,
+    &held_b,
+    &mut adm_b,
+    false
+  ));
+  // Push A completes first and commits `refs/heads/x`; Push B's append-time guard must roll back.
+  let out_a = finish_deciding(&mut fixture, &none, push_a, &held_a, &mut adm_a);
+  let out_b = finish_deciding(&mut fixture, &none, push_b, &held_b, &mut adm_b);
+  assert_eq!(reasons(&out_a), [b"ok"]);
+  assert_atomic_df_refused(&out_b, b"refs/heads/x");
+  assert_eq!(
+    (
+      fixture.has_branch("x"),
+      fixture.has_branch("x/y"),
+      fixture.has_branch("z"),
+    ),
+    (true, false, false)
+  );
+}
+
+/// Verifies a non-atomic push that clears `non_atomic_df_conflict` and yields in `ready()` is
+/// refused `REFNAME_CONFLICT` at `append` if a concurrent push commits a conflicting ref first,
+/// and that an atomic append-time guard redacts a concurrently created hidden ref.
+fn assert_interleaved_non_atomic_and_hidden_race() {
+  let mut fixture = DfRepoFixture::new();
+  let hex = fixture.commit_hex.clone();
+  let none = slates_git::receive::NoneHidden;
+  let (mut plain, held_p, mut adm_p) =
+    fixture.start_deciding(&[("", &hex, b"refs/heads/p/q")], CAPABILITIES, &none);
+  // Step 1 clears `non_atomic_df_conflict` (`df_checked = true`) and yields on `ready() == false`.
+  assert!(!step_deciding(
+    &mut fixture,
+    &none,
+    &mut plain,
+    &held_p,
+    &mut adm_p,
+    true
+  ));
+  // Concurrent push commits `refs/heads/p` during the cooperative yield.
+  let winner = fixture.receive_push(&[("", &hex, b"refs/heads/p")], ATOMIC);
+  assert_eq!(reasons(&winner), [b"ok"]);
+  let loser = finish_deciding(&mut fixture, &none, plain, &held_p, &mut adm_p);
+  assert_df_refused(&loser, b"refs/heads/p");
+  assert_eq!(
+    (fixture.has_branch("p"), fixture.has_branch("p/q")),
+    (true, false)
+  );
+
+  let hidden = fixture.hidden_policy("refs/heads/secret/child");
+  let (mut secret_anc, held_s, mut adm_s) =
+    fixture.start_deciding(&[("", &hex, b"refs/heads/secret")], ATOMIC, &hidden);
+  assert!(!step_deciding(
+    &mut fixture,
+    &hidden,
+    &mut secret_anc,
+    &held_s,
+    &mut adm_s,
+    false
+  ));
+  fixture.add_live_ref(b"refs/heads/secret/child");
+  let hidden_out = finish_deciding(&mut fixture, &hidden, secret_anc, &held_s, &mut adm_s);
+  assert_hidden_df_refused(
+    &hidden_out,
+    ATOMIC_TRANSACTION_FAILED,
+    b"refs/heads/secret",
+    b"refs/heads/secret/child",
+  );
+  assert!(!fixture.has_branch("secret"));
+}
+
+/// Red-team regression (`rt-git-post3-claude`, append-time D/F race guard, in-memory):
+/// two interleaved `Deciding` instances creating `refs/heads/x` and `refs/heads/x/y` (atomic ×
+/// atomic, non-atomic `ready()`-yield × atomic, and hidden-ref race) cannot both commit.
+#[test]
+fn t_rt_git_df_in_memory_interleaved_deciding_cannot_both_commit() {
+  assert_interleaved_atomic_deciding_race();
+  assert_interleaved_non_atomic_and_hidden_race();
+}
+
+/// Steps one `ReceivePack` once, handling `Answering::Turned` via `carry_blocking`.
+fn step_receive_pack(state: &mut ShardState, push: &mut ReceivePack) -> Option<Received> {
+  let mut answer = Vec::new();
+  match push.answer_step(state, &mut answer).expect("stepped") {
+    Answering::Answered(received) => Some(*received),
+    Answering::Turned => {
+      carry_blocking(state, push);
+      None
+    }
+    #[cfg(unix)]
+    step @ Answering::Hook(_) => panic!("no hook configured: {step:?}"),
+  }
+}
+
+/// Asserts exactly one of the two interleaved pushes (`refs/heads/x` vs `[refs/heads/z,
+/// refs/heads/x/y]`) committed and the loser rolled back with `ATOMIC_TRANSACTION_FAILED`.
+fn assert_interleaved_receive_pack_outcome(
+  state: &ShardState,
+  repository: RepositoryId,
+  held: usize,
+  out_a: &Received,
+  out_b: &Received,
+) {
+  let (has_x, has_xy, has_z) = (
+    bound(state, repository, "x"),
+    bound(state, repository, "x/y"),
+    bound(state, repository, "z"),
+  );
+  assert_eq!(
+    (records(state, repository), has_x ^ has_xy),
+    (held + 1, true),
+    "x={has_x}, x/y={has_xy}"
+  );
+  if has_x {
+    assert_eq!((reasons(out_a), has_z), (vec![b"ok".to_vec()], false));
+    assert_atomic_df_refused(out_b, b"refs/heads/x");
+    return;
+  }
+  assert_eq!(
+    (reasons(out_b), reasons(out_a), has_z),
+    (
+      vec![b"ok".to_vec(), b"ok".to_vec()],
+      vec![ATOMIC_TRANSACTION_FAILED.to_vec()],
+      true,
+    )
+  );
+  assert_first_line_names(out_a, b"refs/heads/x/y");
+}
+
+/// Red-team regression (`rt-git-post3-claude`, stored shard): two real `ReceivePack` pushes
+/// creating `refs/heads/x` and `[refs/heads/z, refs/heads/x/y]` with `--atomic` interleaved one
+/// `answer_step` at a time on the same shard cannot both commit; the winner lands cleanly and the
+/// loser rolls back with `ATOMIC_TRANSACTION_FAILED`.
+#[test]
+fn t_rt_git_df_interleaved_receive_packs_cannot_both_commit() {
+  crate::test_store::audit_on_stored_shard("git-push-df-race", |state| {
+    let repository = seeded_df_repo(state, "df-interleave");
+    let held = records(state, repository);
+    let (_, mut push_a) = started(state, repository);
+    let (_, mut push_b) = started(state, repository);
+    let req_a = request(&[("", SECOND, b"refs/heads/x")], ATOMIC, empty_pack());
+    let req_b = request(
+      &[
+        ("", SECOND, b"refs/heads/z"),
+        ("", SECOND, b"refs/heads/x/y"),
+      ],
+      ATOMIC,
+      empty_pack(),
+    );
+    push_a.input(state, &req_a).unwrap();
+    push_a.end(state).unwrap();
+    push_b.input(state, &req_b).unwrap();
+    push_b.end(state).unwrap();
+    let (mut done_a, mut done_b) = (None, None);
+    while done_a.is_none() || done_b.is_none() {
+      done_a = done_a.or_else(|| step_receive_pack(state, &mut push_a));
+      done_b = done_b.or_else(|| step_receive_pack(state, &mut push_b));
+    }
+    assert_interleaved_receive_pack_outcome(
+      state,
+      repository,
+      held,
+      &done_a.unwrap(),
+      &done_b.unwrap(),
+    );
+  });
 }
 
 /// Shape: files in the unborn-default atomic regression test commit.

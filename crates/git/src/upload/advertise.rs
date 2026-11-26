@@ -5,8 +5,9 @@
 //! **What is advertised**, in `serve.c`'s order: `agent`, `ls-refs=unborn` (the one feature git lists for it; `symrefs`,
 //! `peel` and `ref-prefix` are its base arguments), `fetch` with every feature §4.17.2 names, in the order git lists
 //! them (`shallow wait-for-done filter ref-in-want sideband-all packfile-uris`), `server-option`, `object-format` (the
-//! repository's), `session-id` and `object-info`. `bundle-uri` is advertised once the repository offers a bundle list
-//! (A-624); none does yet, so it is not.
+//! repository's), `session-id` and `object-info=size type` (matching stock Git 2.56.1 `protocol-caps.c` so unmodified
+//! `git cat-file --batch-command` `remote-object-info` negotiates `size`, `type`, and default formats). `bundle-uri` is
+//! advertised once the repository offers a bundle list (A-624); none does yet, so it is not.
 //!
 //! **What a request is held to**, as `serve.c` holds it: its command is one advertised (`invalid command`), each
 //! capability it sends is one advertised that is no command (`unknown capability`: `promisor-remote` is not advertised),
@@ -35,7 +36,7 @@ const CAPABILITIES: [(&[u8], Option<&[u8]>); 7] = [
   (b"server-option", None),
   (OBJECT_FORMAT, None),
   (b"session-id", None),
-  (b"object-info", None),
+  (b"object-info", Some(b"size type")),
 ];
 
 /// Format: the commands advertised: those of [`CAPABILITIES`] a client may name in `command=`.

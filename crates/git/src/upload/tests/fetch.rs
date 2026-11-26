@@ -14,11 +14,11 @@ use crate::fixtures::{
   FETCH_SPARSE_TREE_RESPONSE, FETCH_SPARSE_URIS_REQUEST, FETCH_SPARSE_URIS_RESPONSE,
   FETCH_URIS_REQUEST,
 };
-use crate::object_name::{ObjectFormat, ObjectId};
+use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::served::{self, FIRST, SECOND, TAG, THIRD, id};
 use crate::upload::Refusal;
 use crate::v2::fetch::{Event, Section, WantedRef};
-use crate::v2::object_info::{self, ObjectSizes};
+use crate::v2::object_info::{self, ObjectInfo, ObjectMeta};
 use crate::v2::request::{self, Arguments};
 use crate::v2::{Ending, Line};
 
@@ -237,42 +237,44 @@ fn acknowledgments_alone_end_a_round_that_is_not_ready() {
   assert!(bytes.is_empty() && answer.refusal().is_none());
 }
 
-/// The sizes stock git's `cat-file -s` printed for the fixture's objects (`fixtures/objects.txt`).
-struct GitSizes(BTreeMap<ObjectId, u64>);
+/// The sizes and types stock git's `cat-file` printed for the fixture's objects (`fixtures/objects.txt`).
+struct GitObjects(BTreeMap<ObjectId, ObjectMeta>);
 
-impl ObjectSizes for GitSizes {
-  fn size(&self, id: &ObjectId) -> Option<u64> {
+impl ObjectInfo for GitObjects {
+  fn info(&self, id: &ObjectId) -> Option<ObjectMeta> {
     self.0.get(id).copied()
   }
 }
 
-/// A-640 part 2 (§4.17.2 "A fetch" item 4, A-624's answer over the store's rows): do ask the size of a blob, a tree, a
-/// commit, the tag and an object the repository lacks. Expect: the answer A-624 writes from the sizes stock git's
-/// `cat-file -s` printed, the lacking object's size unknown.
-#[test]
-fn object_info_answers_the_sizes_stock_git_printed() {
-  let fixture = served::served();
-  let printed = GitSizes(
+/// Parses `fixtures/objects.txt` into the metadata oracle stock git printed.
+fn fixture_objects() -> GitObjects {
+  GitObjects(
     include_str!("../../../fixtures/objects.txt")
       .lines()
       .map(|line| {
         let words: Vec<&str> = line.split(' ').collect();
-        (id(words[0]), words[2].parse().unwrap())
+        let meta = ObjectMeta {
+          kind: Kind::from_name(words[1].as_bytes()).unwrap(),
+          size: words[2].parse().unwrap(),
+        };
+        (id(words[0]), meta)
       })
       .collect(),
-  );
-  let asked = [
-    "4cdb2265d30204be5463b38174b2e8e717982405",
-    "0351da7889aaa5309979d9a4e742f54ac1750e44",
-    THIRD,
-    TAG,
-    "1111111111111111111111111111111111111111",
-  ];
-  let mut arguments = vec![b"size".to_vec()];
+  )
+}
+
+/// Verifies one `object-info` attribute request `attrs` for `asked` against `printed`.
+fn assert_object_info_mode(
+  fixture: &served::Served,
+  printed: &GitObjects,
+  asked: &[&str],
+  attrs: &[&[u8]],
+) {
+  let mut arguments: Vec<Vec<u8>> = attrs.iter().map(|attr| attr.to_vec()).collect();
   arguments.extend(asked.iter().map(|hex| naming("oid", hex)));
   let arguments: Vec<&[u8]> = arguments.iter().map(Vec::as_slice).collect();
   let request_bytes = command("object-info", &arguments);
-  let (bytes, answer) = answer_v2(&fixture, &request_bytes);
+  let (bytes, answer) = answer_v2(fixture, &request_bytes);
   assert_eq!(answer.refusal(), None);
   let request::Request::Command(decoded) =
     request::decode(&request_bytes, &mut Admission::new(u64::MAX)).unwrap()
@@ -283,8 +285,34 @@ fn object_info_answers_the_sizes_stock_git_printed() {
     panic!("not object-info");
   };
   let mut expected = Vec::new();
-  object_info::answer(&lines, ObjectFormat::Sha1, &printed, &mut expected).unwrap();
+  object_info::answer(&lines, ObjectFormat::Sha1, printed, &mut expected).unwrap();
   assert_eq!(bytes, expected);
+}
+
+/// A-640 part 2 (§4.17.2 "A fetch" item 4, A-624's answer over the store's rows): do ask the size,
+/// type, and size+type (in both request orders) of a blob, a tree, a commit, the tag and an object
+/// the repository lacks. Expect: the exact bytes A-624 writes from stock git's `cat-file` sizes and
+/// types, with the lacking object answered `<oid> ` in every mode.
+#[test]
+fn object_info_answers_the_sizes_stock_git_printed() {
+  let fixture = served::served();
+  let printed = fixture_objects();
+  let asked = [
+    "4cdb2265d30204be5463b38174b2e8e717982405",
+    "0351da7889aaa5309979d9a4e742f54ac1750e44",
+    THIRD,
+    TAG,
+    "1111111111111111111111111111111111111111",
+  ];
+  let modes: [&[&[u8]]; 4] = [
+    &[b"size"],
+    &[b"type"],
+    &[b"size", b"type"],
+    &[b"type", b"size"],
+  ];
+  for attrs in modes {
+    assert_object_info_mode(&fixture, &printed, &asked, attrs);
+  }
 }
 
 /// Format: the tree `main:dir` names, which a `sparse:oid` filter cannot read patterns from (`fixtures/objects.txt`).

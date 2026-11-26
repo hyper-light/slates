@@ -7,7 +7,7 @@ use super::{ADVERTISED, Repo, commit_text, pack_of, request, unbounded, zero};
 use crate::object_name::{Kind, ObjectFormat, ObjectId, name_of};
 use crate::receive::{
   ATOMIC_FAILURE, ATOMIC_TRANSACTION_FAILED, Command, Declined, FAILED_TO_UPDATE, Judge,
-  NoneHidden, Outcome, Pushed, Reported, message, receive,
+  NoneHidden, Outcome, Pushed, REFNAME_CONFLICT, Reported, message, receive,
 };
 
 /// Each ref's own log, as A-642 keeps it: a ref's position is how many entries its log holds. A
@@ -320,8 +320,19 @@ fn assert_declined_with_message(outcome: &Outcome, reason: &[u8], needle: &str) 
   }
 }
 
+/// Asserts every outcome of an atomic D/F refusal carries [`ATOMIC_TRANSACTION_FAILED`], with the
+/// band-2 message emitted once on command 0 and containing `needle`.
+fn assert_atomic_df_outcomes(outcomes: &[Outcome], count: usize, needle: &str) {
+  assert_eq!(outcomes.len(), count);
+  assert_declined_with_message(&outcomes[0], ATOMIC_TRANSACTION_FAILED, needle);
+  for outcome in &outcomes[1..] {
+    assert_eq!(*outcome, refused(ATOMIC_TRANSACTION_FAILED, None));
+  }
+}
+
 /// Verifies atomic intra-batch D/F conflicts roll back the entire batch in both ref orders,
-/// including across an ASCII-intervening sibling (`'-' < '/'`).
+/// including across an ASCII-intervening sibling (`'-' < '/'`), matching stock Git 2.56.1's
+/// `atomic transaction failed` and `cannot process '<ancestor>' and '<descendant>' at the same time`.
 fn assert_atomic_intra_batch_df_conflicts(fixture: &SingleCommitFixture) {
   let id = fixture.commit_id;
   let mut logs = Logs::default();
@@ -333,8 +344,11 @@ fn assert_atomic_intra_batch_df_conflicts(fixture: &SingleCommitFixture) {
     true,
     &mut logs,
   );
-  assert_eq!(outcomes[0], refused(ATOMIC_FAILURE, None));
-  assert_declined_with_message(&outcomes[1], FAILED_TO_UPDATE, "exists; cannot create");
+  assert_atomic_df_outcomes(
+    &outcomes,
+    2,
+    "error: cannot process 'refs/heads/topic' and 'refs/heads/topic/docs' at the same time\n",
+  );
   assert!(logs.appended.is_empty());
 
   let mut logs = Logs::default();
@@ -347,9 +361,11 @@ fn assert_atomic_intra_batch_df_conflicts(fixture: &SingleCommitFixture) {
     true,
     &mut logs,
   );
-  assert_eq!(outcomes[0], refused(ATOMIC_FAILURE, None));
-  assert_eq!(outcomes[1], refused(ATOMIC_FAILURE, None));
-  assert_declined_reason(&outcomes[2], FAILED_TO_UPDATE);
+  assert_atomic_df_outcomes(
+    &outcomes,
+    3,
+    "error: cannot process 'refs/heads/topic' and 'refs/heads/topic/docs' at the same time\n",
+  );
   assert!(logs.appended.is_empty());
 }
 
@@ -370,8 +386,8 @@ fn assert_non_conflicting_prefix_batch(fixture: &SingleCommitFixture) {
   assert_eq!(logs.appended.len(), 1);
 }
 
-/// Verifies non-atomic intra-batch D/F conflicts match stock Git 2.56.1 ordering in both wire
-/// orders (`[topic, topic/docs/deep, companion]` and `[topic/docs/deep, topic, companion]`),
+/// Verifies non-atomic intra-batch D/F conflicts match stock Git 2.56.1 ordering and wording in
+/// both wire orders (`[topic, topic/docs/deep, companion]` and `[topic/docs/deep, topic, companion]`),
 /// across an ASCII-intervening sibling (`'-' < '/'`), and on 3-level chains (`a`, `a/b`, `a/b/c`).
 fn assert_non_atomic_df_conflict_batch(fixture: &SingleCommitFixture) {
   let id = fixture.commit_id;
@@ -385,7 +401,11 @@ fn assert_non_atomic_df_conflict_batch(fixture: &SingleCommitFixture) {
     false,
     &mut forward_logs,
   );
-  assert_declined_with_message(&forward[0], FAILED_TO_UPDATE, "refs/heads/topic/docs/deep");
+  assert_declined_with_message(
+    &forward[0],
+    REFNAME_CONFLICT,
+    "error: cannot process 'refs/heads/topic' and 'refs/heads/topic/docs/deep' at the same time\n",
+  );
   assert_eq!(forward[1], Outcome::Ok(Vec::new()));
   assert_eq!(forward[2], Outcome::Ok(Vec::new()));
 
@@ -402,7 +422,11 @@ fn assert_non_atomic_df_conflict_batch(fixture: &SingleCommitFixture) {
   );
   assert_eq!(reversed[0], Outcome::Ok(Vec::new()));
   assert_eq!(reversed[1], Outcome::Ok(Vec::new()));
-  assert_declined_with_message(&reversed[2], FAILED_TO_UPDATE, "refs/heads/topic/docs/deep");
+  assert_declined_with_message(
+    &reversed[2],
+    REFNAME_CONFLICT,
+    "error: cannot process 'refs/heads/topic' and 'refs/heads/topic/docs/deep' at the same time\n",
+  );
   assert_eq!(reversed[3], Outcome::Ok(Vec::new()));
 
   let mut chain_logs = Logs::default();
@@ -415,8 +439,8 @@ fn assert_non_atomic_df_conflict_batch(fixture: &SingleCommitFixture) {
     false,
     &mut chain_logs,
   );
-  assert_declined_reason(&chain[0], FAILED_TO_UPDATE);
-  assert_declined_reason(&chain[1], FAILED_TO_UPDATE);
+  assert_declined_reason(&chain[0], REFNAME_CONFLICT);
+  assert_declined_reason(&chain[1], REFNAME_CONFLICT);
   assert_eq!(
     (&chain[2], chain_logs.appended.as_slice()),
     (
@@ -441,8 +465,8 @@ fn assert_non_atomic_existing_update_beats_create(fixture: &SingleCommitFixture)
   );
   assert_declined_with_message(
     &anc_update[0],
-    FAILED_TO_UPDATE,
-    "'refs/heads/topic' exists",
+    REFNAME_CONFLICT,
+    "error: cannot lock ref 'refs/heads/topic/docs': 'refs/heads/topic' exists; cannot create 'refs/heads/topic/docs'\n",
   );
   assert_eq!(
     (&anc_update[1], anc_update_logs.appended.as_slice()),
@@ -463,8 +487,8 @@ fn assert_non_atomic_existing_update_beats_create(fixture: &SingleCommitFixture)
   );
   assert_declined_with_message(
     &desc_update[0],
-    FAILED_TO_UPDATE,
-    "'refs/heads/topic/docs' exists",
+    REFNAME_CONFLICT,
+    "error: cannot lock ref 'refs/heads/topic': 'refs/heads/topic/docs' exists; cannot create 'refs/heads/topic'\n",
   );
   assert_eq!(
     (&desc_update[1], desc_update_logs.appended.as_slice()),
@@ -507,7 +531,7 @@ fn assert_non_atomic_declined_ref_does_not_block_child(fixture: &SingleCommitFix
     false,
     &mut parent_declined,
   );
-  assert_declined_reason(&outcomes[0], FAILED_TO_UPDATE);
+  assert_declined_reason(&outcomes[0], REFNAME_CONFLICT);
   assert_eq!(outcomes[1], Outcome::Ok(Vec::new()));
   assert_eq!(
     parent_declined.appended,
@@ -519,10 +543,11 @@ fn assert_non_atomic_declined_ref_does_not_block_child(fixture: &SingleCommitFix
 /// conflicting refs (`refs/heads/topic` and `refs/heads/topic/docs`, both orders, including an
 /// ASCII-intervening sibling `refs/heads/topic-1` where `'-' < '/'`), non-conflicting prefix
 /// shares (`refs/heads/topic` and `refs/heads/topic2`, `refs/tags/topic/docs`), and non-atomic
-/// sibling creates. Expect: conflicting pairs are refused `failed to update ref` with Git's
-/// `exists; cannot create` message, `--atomic` rolls back the entire batch with `atomic push
-/// failure`, non-conflicting names succeed, and without `--atomic` a declined first ref does not
-/// block the second.
+/// sibling creates. Expect: conflicting pairs are refused with stock Git 2.56.1's `refname
+/// conflict` (`cannot process` for same-batch creates, `cannot lock ref` for existing refs),
+/// `--atomic` rolls back the entire batch with `atomic transaction failed` (band-2 emitted once),
+/// non-conflicting names succeed, and without `--atomic` a declined first ref does not block the
+/// second.
 #[test]
 fn df_ref_namespace_conflicts_are_refused_and_atomic_batches_roll_back() {
   let fixture = SingleCommitFixture::new();
@@ -643,13 +668,20 @@ fn assert_atomic_cross_push_df_conflicts(fixture: &SingleCommitFixture) {
     true,
     &mut judge,
   );
-  assert_eq!(outcomes[0], refused(ATOMIC_FAILURE, None));
-  assert_declined_with_message(&outcomes[1], FAILED_TO_UPDATE, "'refs/heads/topic' exists");
+  assert_atomic_df_outcomes(
+    &outcomes,
+    2,
+    "error: cannot lock ref 'refs/heads/topic/docs': 'refs/heads/topic' exists; cannot create 'refs/heads/topic/docs'\n",
+  );
   assert!(judge.appended.is_empty());
 
   let mut judge = ExistingRefsJudge::with_existing(&[b"refs/heads/topic/docs"]);
   let outcomes = fixture.push(&[(zero(), id, b"refs/heads/topic")], true, &mut judge);
-  assert_declined_reason(&outcomes[0], FAILED_TO_UPDATE);
+  assert_atomic_df_outcomes(
+    &outcomes,
+    1,
+    "error: cannot lock ref 'refs/heads/topic': 'refs/heads/topic/docs' exists; cannot create 'refs/heads/topic'\n",
+  );
   assert!(judge.appended.is_empty());
 }
 
@@ -666,17 +698,20 @@ fn assert_atomic_single_delete_replace(fixture: &SingleCommitFixture) {
     true,
     &mut judge,
   );
-  assert_declined_with_message(&to_desc[1], FAILED_TO_UPDATE, "'refs/heads/topic' exists");
+  assert_atomic_df_outcomes(
+    &to_desc,
+    2,
+    "error: cannot lock ref 'refs/heads/topic/docs/deep': 'refs/heads/topic' exists; cannot create 'refs/heads/topic/docs/deep'\n",
+  );
   assert_eq!(
     (
-      &to_desc[0],
       judge.appended.is_empty(),
       judge.existing.contains(b"refs/heads/topic".as_slice()),
       judge
         .existing
         .contains(b"refs/heads/topic/docs/deep".as_slice()),
     ),
-    (&refused(ATOMIC_FAILURE, None), true, true, false)
+    (true, true, false)
   );
 
   let mut desc_judge = ExistingRefsJudge::with_existing(&[b"refs/heads/topic/docs/deep"]);
@@ -688,21 +723,20 @@ fn assert_atomic_single_delete_replace(fixture: &SingleCommitFixture) {
     true,
     &mut desc_judge,
   );
-  assert_declined_with_message(
-    &to_anc[1],
-    FAILED_TO_UPDATE,
-    "'refs/heads/topic/docs/deep' exists",
+  assert_atomic_df_outcomes(
+    &to_anc,
+    2,
+    "error: cannot lock ref 'refs/heads/topic': 'refs/heads/topic/docs/deep' exists; cannot create 'refs/heads/topic'\n",
   );
   assert_eq!(
     (
-      &to_anc[0],
       desc_judge.appended.is_empty(),
       desc_judge
         .existing
         .contains(b"refs/heads/topic/docs/deep".as_slice()),
       desc_judge.existing.contains(b"refs/heads/topic".as_slice()),
     ),
-    (&refused(ATOMIC_FAILURE, None), true, true, false)
+    (true, true, false)
   );
 }
 
@@ -720,11 +754,12 @@ fn assert_atomic_multi_child_delete_replace(fixture: &SingleCommitFixture) {
     true,
     &mut judge,
   );
-  assert_declined_reason(&partial[1], FAILED_TO_UPDATE);
-  assert_eq!(
-    (&partial[0], judge.appended.is_empty()),
-    (&refused(ATOMIC_FAILURE, None), true)
+  assert_atomic_df_outcomes(
+    &partial,
+    2,
+    "cannot lock ref 'refs/heads/topic': 'refs/heads/topic/",
   );
+  assert!(judge.appended.is_empty());
 
   let full_atomic = fixture.push(
     &[
@@ -735,22 +770,18 @@ fn assert_atomic_multi_child_delete_replace(fixture: &SingleCommitFixture) {
     true,
     &mut judge,
   );
-  assert_declined_reason(&full_atomic[2], FAILED_TO_UPDATE);
+  assert_atomic_df_outcomes(
+    &full_atomic,
+    3,
+    "cannot lock ref 'refs/heads/topic': 'refs/heads/topic/",
+  );
   assert_eq!(
     (
-      &full_atomic[0],
-      &full_atomic[1],
       judge.appended.is_empty(),
       judge.existing.contains(b"refs/heads/topic/a".as_slice()),
       judge.existing.contains(b"refs/heads/topic/b".as_slice()),
     ),
-    (
-      &refused(ATOMIC_FAILURE, None),
-      &refused(ATOMIC_FAILURE, None),
-      true,
-      true,
-      true
-    )
+    (true, true, true)
   );
 
   let full_non_atomic = fixture.push(
@@ -785,7 +816,11 @@ fn assert_non_atomic_cross_push_df_and_replace(fixture: &SingleCommitFixture) {
     &mut judge,
   );
   assert_eq!(outcomes[0], Outcome::Ok(Vec::new()));
-  assert_declined_reason(&outcomes[1], FAILED_TO_UPDATE);
+  assert_declined_with_message(
+    &outcomes[1],
+    REFNAME_CONFLICT,
+    "error: cannot lock ref 'refs/heads/topic/docs': 'refs/heads/topic' exists; cannot create 'refs/heads/topic/docs'\n",
+  );
 
   let mut judge = ExistingRefsJudge::with_existing(&[b"refs/heads/topic"]);
   let to_desc = fixture.push(
@@ -821,7 +856,7 @@ fn assert_non_atomic_cross_push_df_and_replace(fixture: &SingleCommitFixture) {
     &mut judge,
   );
   assert_eq!(outcomes[0], refused(b"hook declined", None));
-  assert_declined_reason(&outcomes[1], FAILED_TO_UPDATE);
+  assert_declined_reason(&outcomes[1], REFNAME_CONFLICT);
 }
 
 /// Verifies a read-denied (`RefConflict::Hidden`) existing ref still refuses D/F creation both
@@ -829,14 +864,14 @@ fn assert_non_atomic_cross_push_df_and_replace(fixture: &SingleCommitFixture) {
 fn assert_hidden_ref_conflict_redacts_name(fixture: &SingleCommitFixture) {
   let id = fixture.commit_id;
   let hidden_name = b"refs/heads/secret/child";
-  for atomic in [false, true] {
+  for (atomic, expected_reason) in [(false, REFNAME_CONFLICT), (true, ATOMIC_TRANSACTION_FAILED)] {
     let mut judge = ExistingRefsJudge::with_existing(&[hidden_name]);
     judge.hidden.insert(hidden_name.to_vec());
     let outcomes = fixture.push(&[(zero(), id, b"refs/heads/secret")], atomic, &mut judge);
     assert_declined_with_message(
       &outcomes[0],
-      FAILED_TO_UPDATE,
-      "cannot update ref 'refs/heads/secret': refname conflict",
+      expected_reason,
+      "error: cannot lock ref 'refs/heads/secret': refname conflict\n",
     );
     let Outcome::Ng(declined) = &outcomes[0] else {
       panic!("expected refusal");
@@ -897,6 +932,50 @@ fn cross_push_df_ref_namespace_conflicts_and_delete_replace() {
   assert_non_atomic_cross_push_df_and_replace(&fixture);
   assert_hidden_ref_conflict_redacts_name(&fixture);
   assert_funny_refname_precedes_df_conflict(&fixture);
+  assert_atomic_early_non_commit_precedes_df(&fixture);
+}
+
+/// Verifies `df_reason_parity_early.py` parity: under `--atomic`, an early non-commit branch
+/// refusal takes precedence over D/F conflicts regardless of command order, reporting
+/// `invalid new value provided` on the non-commit ref and `atomic push failure` on every sibling.
+fn assert_atomic_early_non_commit_precedes_df(fixture: &SingleCommitFixture) {
+  let id = fixture.commit_id;
+  let tree_id = name_of(ObjectFormat::Sha1, Kind::Tree, b"").unwrap();
+  let mut judge_first = ExistingRefsJudge::with_existing(&[b"refs/heads/x"]);
+  let first = fixture.push(
+    &[
+      (zero(), tree_id, b"refs/heads/t"),
+      (zero(), id, b"refs/heads/x/y"),
+    ],
+    true,
+    &mut judge_first,
+  );
+  assert_declined_with_message(
+    &first[0],
+    crate::receive::INVALID_NEW_VALUE,
+    &format!("error: trying to write non-commit object {tree_id} to branch 'refs/heads/t'\n"),
+  );
+  assert_eq!(first[1], refused(ATOMIC_FAILURE, None));
+  assert!(judge_first.appended.is_empty());
+
+  let mut judge_last = ExistingRefsJudge::with_existing(&[b"refs/heads/x"]);
+  let last = fixture.push(
+    &[
+      (zero(), id, b"refs/heads/a/x/y"),
+      (zero(), id, b"refs/heads/x/y"),
+      (zero(), tree_id, b"refs/heads/t"),
+    ],
+    true,
+    &mut judge_last,
+  );
+  assert_eq!(last[0], refused(ATOMIC_FAILURE, None));
+  assert_eq!(last[1], refused(ATOMIC_FAILURE, None));
+  assert_declined_with_message(
+    &last[2],
+    crate::receive::INVALID_NEW_VALUE,
+    &format!("error: trying to write non-commit object {tree_id} to branch 'refs/heads/t'\n"),
+  );
+  assert!(judge_last.appended.is_empty());
 }
 
 /// Shape: batch sizes tested for cooperative atomic D/F validation (`atomic-step.rs` repro).
@@ -1067,12 +1146,11 @@ fn assert_cooperative_atomic_df_refusal(
       first_df <= 1,
       max_df <= 1,
       judge.judge_calls,
-      judge.atomic_appends,
-      &outcomes[0],
+      judge.atomic_appends
     ),
-    (true, true, 0, 0, &refused(ATOMIC_FAILURE, None))
+    (true, true, 0, 0)
   );
-  assert_declined_with_message(&outcomes[1], FAILED_TO_UPDATE, expected_needle);
+  assert_atomic_df_outcomes(&outcomes, 2, expected_needle);
 }
 
 /// §4.3 & §4.17.2 (cooperative shard step bounds on atomic D/F validation; repro `atomic-step.rs`):
@@ -1101,7 +1179,7 @@ fn atomic_df_validation_steps_one_command_per_deciding_step() {
       },
     ],
     &[],
-    "'refs/tags/v000' exists",
+    "error: cannot process 'refs/tags/v000' and 'refs/tags/v000/child' at the same time\n",
   );
   assert_cooperative_atomic_df_refusal(
     vec![
@@ -1117,6 +1195,6 @@ fn atomic_df_validation_steps_one_command_per_deciding_step() {
       },
     ],
     &[b"refs/tags/topic"],
-    "'refs/tags/topic' exists",
+    "error: cannot lock ref 'refs/tags/topic/child': 'refs/tags/topic' exists; cannot create 'refs/tags/topic/child'\n",
   );
 }

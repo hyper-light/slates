@@ -50,7 +50,20 @@ fn the_advertisement_names_what_the_design_names_in_gits_order() {
   ] {
     assert!(ours.supports(b"fetch", feature));
   }
-  assert_eq!(ours.object_format(), Some(ObjectFormat::Sha1));
+  assert_eq!(
+    (
+      ours.object_format(),
+      ours.get(b"object-info"),
+      ours.supports(b"object-info", b"size"),
+      ours.supports(b"object-info", b"type"),
+    ),
+    (
+      Some(ObjectFormat::Sha1),
+      Some(Some(b"size type".as_slice())),
+      true,
+      true,
+    )
+  );
   assert!(
     ours
       .get(b"agent")

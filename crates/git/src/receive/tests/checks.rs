@@ -668,14 +668,20 @@ fn assert_outcome_reason(outcome: &Outcome, reason: &[u8]) {
   }
 }
 
-/// Asserts `outcome` at `case` was refused `failed to update ref` with Git's non-commit message.
+/// Asserts `outcome` at `case` was refused `invalid new value provided` with stock Git 2.56.1's
+/// `error: trying to write non-commit object ...` band-2 diagnostic.
 fn assert_non_commit_refusal(case: usize, outcome: &Outcome) {
   match outcome {
     Outcome::Ng(declined) => {
-      assert_eq!(declined.reason, b"failed to update ref", "case {case}");
-      let msg = declined.message.as_deref().unwrap_or_default();
+      assert_eq!(
+        declined.reason,
+        crate::receive::INVALID_NEW_VALUE,
+        "case {case}"
+      );
+      let msg = String::from_utf8_lossy(declined.message.as_deref().unwrap_or_default());
       assert!(
-        String::from_utf8_lossy(msg).contains("non-commit"),
+        msg.starts_with("error: trying to write non-commit object ")
+          && !msg.contains("cannot update ref"),
         "case {case}: {msg:?}"
       );
     }
@@ -732,7 +738,7 @@ fn assert_atomic_non_commit_rolls_back(
   let bytes = request(&[], &commands, b" report-status atomic", &[], &fixture.pack);
   let (outcomes, judged) = outcomes_hiding(&bytes, &fixture.repository, &NoneHidden);
   assert_eq!(outcomes[0], refused_with(b"atomic push failure"));
-  assert_outcome_reason(&outcomes[1], b"failed to update ref");
+  assert_non_commit_refusal(0, &outcomes[1]);
   assert!(judged.is_empty());
 }
 
@@ -793,12 +799,13 @@ fn assert_deep_wrong_kind_chain_refused(pack_blob_id: ObjectId, pack_blob: &[u8]
 }
 
 /// §4.17.2 "A push" (branch refs under `refs/heads/` must point to a commit, matching stock Git
-/// `refs.c` / `receive-pack.c`): do push non-commit targets (blob, tree, annotated tag — both in
-/// the incoming pack and already in the repository) to `refs/heads/*`, alongside valid branch
-/// commits and non-commit `refs/tags/*` refs, both non-atomic and `--atomic`, plus a branch delete.
-/// Expect: every non-delete `refs/heads/*` pointing to a non-commit is refused `failed to update
-/// ref` with Git's non-commit diagnostic and never judged; `--atomic` rolls back the entire batch
-/// with `atomic push failure`; valid branches, non-commit tags, and branch deletes succeed.
+/// 2.56.1 `refs.c` / `receive-pack.c`): do push non-commit targets (blob, tree, annotated tag —
+/// both in the incoming pack and already in the repository) to `refs/heads/*`, alongside valid
+/// branch commits and non-commit `refs/tags/*` refs, both non-atomic and `--atomic`, plus a branch
+/// delete. Expect: every non-delete `refs/heads/*` pointing to a non-commit is refused `invalid
+/// new value provided` with stock Git's `trying to write non-commit object` diagnostic and never
+/// judged; `--atomic` rolls back the entire batch with `atomic push failure`; valid branches,
+/// non-commit tags, and branch deletes succeed.
 #[test]
 fn branch_ref_pointing_to_non_commit_is_refused_atomic_and_non_atomic() {
   let fixture = NonCommitBranchFixture::new();
@@ -976,7 +983,7 @@ fn assert_branch_targets_pause_and_resume_on_away_kind(
   let bad_outcome = checked2.early[1]
     .as_ref()
     .expect("bad-repo must be refused");
-  assert_outcome_reason(bad_outcome, b"failed to update ref");
+  assert_non_commit_refusal(1, bad_outcome);
 }
 
 /// §4.17.2 "A push" (let-go pack window during `Walk` and `Stage::BranchTargets`):

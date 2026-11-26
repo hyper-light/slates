@@ -741,6 +741,14 @@ pub const FAILED_TO_UPDATE: &[u8] = b"failed to update ref";
 /// (`execute_commands_atomic`, the transaction's commit refused).
 pub const ATOMIC_TRANSACTION_FAILED: &[u8] = b"atomic transaction failed";
 
+/// Format: the reason a command refused for a files-backend ref directory/file conflict is given
+/// without `atomic` (stock Git 2.56.1 `refs.c` `TRANSACTION_NAME_CONFLICT`).
+pub const REFNAME_CONFLICT: &[u8] = b"refname conflict";
+
+/// Format: the reason a non-delete `refs/heads/*` command targeting a non-commit object is given
+/// (stock Git 2.56.1 `refs.c` `TRANSACTION_INVALID_NEW_VALUE` / `receive-pack.c`).
+pub const INVALID_NEW_VALUE: &[u8] = b"invalid new value provided";
+
 /// Format: git's `unpack_limit` (`receive-pack.c`, 72; `transfer.unpackLimit` "defaults to 100"):
 /// a pack of fewer objects is unpacked by `unpack-objects`, any other indexed by `index-pack`, and
 /// its refusal is worded after the one git ran.
@@ -1131,7 +1139,7 @@ fn each_step<A, J: Judge<Accepted = A> + ?Sized>(
   let early_outcome = early.get_mut(at).and_then(Option::take);
   let outcome = match (early_outcome, conflict) {
     (Some(refusal), _) => refusal,
-    (None, Some(conflict)) => Outcome::Ng(df_declined(&command.name, &conflict)),
+    (None, Some(conflict)) => Outcome::Ng(df_declined(REFNAME_CONFLICT, &command.name, &conflict)),
     (None, None) => apply_non_atomic(command, pushed, judge),
   };
   Ok(finish_non_atomic(commands, non_atomic, at, outcome))
@@ -1280,12 +1288,22 @@ fn fail_atomic_at(
   }));
 }
 
+/// Records an atomic transaction failure: every command carries `declined.reason`, with
+/// `declined.message` emitted once on the first command (matching `execute_commands_atomic`).
+fn fail_atomic_transaction(outcomes: &mut Vec<Outcome>, count: usize, declined: &Declined) {
+  outcomes.extend((0..count).map(|at| {
+    let message = declined.message.clone().filter(|_| at == 0);
+    refused(&declined.reason, message)
+  }));
+}
+
 /// One step of an atomic push: every command or none ("Either all refs are updated or none",
 /// gitprotocol-capabilities). A check's refusal leaves every other command `atomic push failure`,
-/// none judged; otherwise commands are D/F-checked one per step against already-seen batch refs
-/// and existing repository refs, then judged one per step until one is declined (leaving every
-/// other `atomic push failure`); then one append moves every ref or none, and a refused append
-/// gives every command its reason, its band-2 line once (git's `execute_commands_atomic`).
+/// none judged; otherwise commands are D/F-checked one per step against existing repository refs
+/// and already-seen batch refs (a conflict gives every command [`ATOMIC_TRANSACTION_FAILED`] with
+/// its band-2 line once), then judged one per step until one is declined (leaving every other
+/// `atomic push failure`); then one append moves every ref or none, and a refused append gives
+/// every command its reason, its band-2 line once (git's `execute_commands_atomic`).
 fn atomic_step<A, J: Judge<Accepted = A> + ?Sized>(
   commands: &[Command],
   early: &mut Vec<Option<Outcome>>,
@@ -1311,13 +1329,14 @@ fn atomic_step<A, J: Judge<Accepted = A> + ?Sized>(
   }
 }
 
-/// Checks one command (`at`) of an atomic push for intra-batch and existing-repository D/F
+/// Checks one command (`at`) of an atomic push for existing-repository and intra-batch D/F
 /// ref-namespace conflicts. Returns `true` if a conflict terminated the push, or `false` after
 /// advancing `atomic.phase` so the shard can yield cooperatively after every command.
 ///
 /// Matches stock Git 2.56.1 (`files-loose`, `files-packed`, and `reftable`): an atomic
 /// transaction rejects creating a ref that D/F-conflicts with an existing ref even when the
-/// conflicting ref is also deleted in the same batch, preserving the original ref.
+/// conflicting ref is also deleted in the same batch, preserving the original ref, and reports
+/// [`ATOMIC_TRANSACTION_FAILED`] on every command with the band-2 line emitted once.
 fn atomic_check_df_step<A, J: Judge<Accepted = A> + ?Sized>(
   commands: &[Command],
   atomic: &mut AtomicState<A>,
@@ -1331,8 +1350,8 @@ fn atomic_check_df_step<A, J: Judge<Accepted = A> + ?Sized>(
   if !command.is_delete() && request::refname_ok(&command.name, false) {
     if let Some(conflict) = atomic_command_df_conflict(commands, &atomic.seen_refs, command, judge)
     {
-      let declined = df_declined(&command.name, &conflict);
-      fail_atomic_at(&mut atomic.outcomes, commands.len(), at, &declined);
+      let declined = df_declined(ATOMIC_TRANSACTION_FAILED, &command.name, &conflict);
+      fail_atomic_transaction(&mut atomic.outcomes, commands.len(), &declined);
       return true;
     }
     insert_sorted_ref(commands, &mut atomic.seen_refs, at);
@@ -1346,18 +1365,19 @@ fn atomic_check_df_step<A, J: Judge<Accepted = A> + ?Sized>(
   false
 }
 
-/// Checks one valid non-delete command of an atomic batch against already-seen batch commands
-/// (`seen_refs`) and existing repository refs (`judge.ref_conflict` with empty `deleted`).
+/// Checks one valid non-delete command of an atomic batch against existing repository refs
+/// (`judge.ref_conflict` with empty `deleted`, checked first so existing visible and hidden refs
+/// take precedence) and already-seen batch commands (`seen_refs`).
 fn atomic_command_df_conflict<J: Judge + ?Sized>(
   commands: &[Command],
   seen_refs: &[usize],
   command: &Command,
   judge: &J,
-) -> Option<RefConflict> {
-  if let Some(existing) = applied_df_conflict(commands, seen_refs, &command.name) {
-    return Some(RefConflict::Visible(existing));
+) -> Option<DfConflict> {
+  if let Some(existing) = judge.ref_conflict(&command.name, &[]) {
+    return Some(DfConflict::Existing(existing));
   }
-  judge.ref_conflict(&command.name, &[])
+  applied_df_conflict(commands, seen_refs, &command.name)
 }
 
 /// Judges one command (`at`) of an atomic push once [`Judge::ready`] reports ready. Returns
@@ -1416,10 +1436,7 @@ fn finish_atomic<A, J: Judge<Accepted = A> + ?Sized>(
         .outcomes
         .extend((0..count).map(|_| Outcome::Ok(reports.next().unwrap_or_default())));
     }
-    Err(declined) => atomic.outcomes.extend((0..count).map(|at| {
-      let message = declined.message.clone().filter(|_| at == 0);
-      refused(&declined.reason, message)
-    })),
+    Err(declined) => fail_atomic_transaction(&mut atomic.outcomes, count, &declined),
   }
   Ok(())
 }
@@ -1486,12 +1503,33 @@ fn ancestor_in_sorted<'a>(name: &[u8], sorted: &[(&'a [u8], usize)]) -> Option<(
   None
 }
 
+/// Source of a files-backend ref directory/file namespace conflict detected while deciding a push.
+enum DfConflict {
+  /// Conflict against an existing repository ref (or an existing ref updated earlier in this push),
+  /// with read-denied refs redacted as [`RefConflict::Hidden`].
+  Existing(RefConflict),
+  /// Conflict against another newly created ref in the same push batch (never yet created before
+  /// this push).
+  Batch(Vec<u8>),
+}
+
+/// Classifies a D/F conflict against `commands[idx]` as a same-batch create conflict or an
+/// existing-ref conflict.
+fn batch_or_existing_conflict(commands: &[Command], idx: usize) -> Option<DfConflict> {
+  let other = commands.get(idx)?;
+  Some(if other.is_create() {
+    DfConflict::Batch(other.name.clone())
+  } else {
+    DfConflict::Existing(RefConflict::Visible(other.name.clone()))
+  })
+}
+
 /// Finds a D/F conflict for `name` against `applied_refs` (command indices sorted by name).
 fn applied_df_conflict(
   commands: &[Command],
   applied_refs: &[usize],
   name: &[u8],
-) -> Option<Vec<u8>> {
+) -> Option<DfConflict> {
   let name_of = |idx: usize| -> &[u8] {
     commands
       .get(idx)
@@ -1505,15 +1543,14 @@ fn applied_df_conflict(
     if let Ok(found) = applied_refs.binary_search_by(|&idx| name_of(idx).cmp(prefix))
       && let Some(&idx) = applied_refs.get(found)
     {
-      return Some(name_of(idx).to_vec());
+      return batch_or_existing_conflict(commands, idx);
     }
   }
   let pos = applied_refs.partition_point(|&idx| cmp_with_slash(name_of(idx), name).is_lt());
-  applied_refs
-    .get(pos)
-    .map(|&idx| name_of(idx))
-    .filter(|candidate| is_dir_prefix(name, candidate))
-    .map(ToOwned::to_owned)
+  let &idx = applied_refs.get(pos)?;
+  is_dir_prefix(name, name_of(idx))
+    .then(|| batch_or_existing_conflict(commands, idx))
+    .flatten()
 }
 
 /// Checks a non-atomic command against refs already applied in this push and existing repository
@@ -1524,15 +1561,19 @@ fn non_atomic_df_conflict<J: Judge + ?Sized>(
   command: &Command,
   judge: &J,
   admission: &mut Admission,
-) -> Result<Option<RefConflict>, Refusal> {
+) -> Result<Option<DfConflict>, Refusal> {
   if command.is_delete() || !request::refname_ok(&command.name, false) {
     return Ok(None);
   }
-  if let Some(existing) = applied_df_conflict(commands, &non_atomic.applied_refs, &command.name) {
-    return Ok(Some(RefConflict::Visible(existing)));
+  if let Some(conflict) = applied_df_conflict(commands, &non_atomic.applied_refs, &command.name) {
+    return Ok(Some(conflict));
   }
   if non_atomic.applied_deleted.is_empty() {
-    return Ok(judge.ref_conflict(&command.name, &[]));
+    return Ok(
+      judge
+        .ref_conflict(&command.name, &[])
+        .map(DfConflict::Existing),
+    );
   }
   let before = admission.left();
   let mut deleted = charged_vec::<&[u8]>(non_atomic.applied_deleted.len(), admission)?;
@@ -1542,7 +1583,9 @@ fn non_atomic_df_conflict<J: Judge + ?Sized>(
       deleted.push(cmd.name.as_slice());
     }
   }
-  let conflict = judge.ref_conflict(&command.name, &deleted);
+  let conflict = judge
+    .ref_conflict(&command.name, &deleted)
+    .map(DfConflict::Existing);
   drop(deleted);
   admission.release(hold);
   Ok(conflict)
@@ -1586,14 +1629,12 @@ fn record_applied(commands: &[Command], non_atomic: &mut NonAtomicState, at: usi
 }
 
 /// Refusal for a non-delete `refs/heads/*` command targeting a non-commit object, matching stock
-/// Git's `refs.c` / `receive-pack.c` wording.
+/// Git 2.56.1's `refs.c` / `receive-pack.c` wording.
 fn non_commit_branch(command: &Command) -> Declined {
   let mut hex = Vec::with_capacity(command.new.format().hex_len());
   command.new.write_hex(&mut hex);
   let line = [
-    b"cannot update ref '",
-    command.name.as_slice(),
-    b"': trying to write non-commit object ",
+    b"trying to write non-commit object ",
     hex.as_slice(),
     b" to branch '",
     command.name.as_slice(),
@@ -1601,21 +1642,21 @@ fn non_commit_branch(command: &Command) -> Declined {
   ]
   .concat();
   Declined {
-    reason: FAILED_TO_UPDATE.to_vec(),
+    reason: INVALID_NEW_VALUE.to_vec(),
     hook: Vec::new(),
     message: Some(message(&line)),
   }
 }
 
-/// Refusal for a files-backend ref directory/file namespace conflict: emits [`FAILED_TO_UPDATE`]
-/// (`failed to update ref`) with a band-2
-/// `cannot update ref '<name>': '<existing>' exists; cannot create '<name>'` line when the
-/// conflicting ref is readable, and `cannot update ref '<name>': refname conflict` without
+/// Refusal for a files-backend ref directory/file namespace conflict against an existing repository
+/// ref: emits `reason` ([`REFNAME_CONFLICT`] or [`ATOMIC_TRANSACTION_FAILED`]) with stock Git
+/// 2.56.1's `cannot lock ref '<name>': '<existing>' exists; cannot create '<name>'` band-2 line
+/// when the conflicting ref is readable, and `cannot lock ref '<name>': refname conflict` without
 /// disclosing the existing ref name when it is hidden.
-fn df_declined(name: &[u8], conflict: &RefConflict) -> Declined {
+pub fn df_conflict_declined(reason: &[u8], name: &[u8], conflict: &RefConflict) -> Declined {
   let line = match conflict {
     RefConflict::Visible(existing) => [
-      b"cannot update ref '",
+      b"cannot lock ref '",
       name,
       b"': '",
       existing.as_slice(),
@@ -1624,12 +1665,40 @@ fn df_declined(name: &[u8], conflict: &RefConflict) -> Declined {
       b"'",
     ]
     .concat(),
-    RefConflict::Hidden => [b"cannot update ref '", name, b"': refname conflict"].concat(),
+    RefConflict::Hidden => [b"cannot lock ref '", name, b"': refname conflict"].concat(),
   };
   Declined {
-    reason: FAILED_TO_UPDATE.to_vec(),
+    reason: reason.to_vec(),
     hook: Vec::new(),
     message: Some(message(&line)),
+  }
+}
+
+/// Refusal for a files-backend ref directory/file namespace conflict against either an existing
+/// repository ref or another newly created ref in the same push batch (stock Git 2.56.1 wording).
+fn df_declined(reason: &[u8], name: &[u8], conflict: &DfConflict) -> Declined {
+  match conflict {
+    DfConflict::Existing(existing) => df_conflict_declined(reason, name, existing),
+    DfConflict::Batch(other) => {
+      let (ancestor, descendant) = if is_dir_prefix(name, other) {
+        (name, other.as_slice())
+      } else {
+        (other.as_slice(), name)
+      };
+      let line = [
+        b"cannot process '",
+        ancestor,
+        b"' and '",
+        descendant,
+        b"' at the same time",
+      ]
+      .concat();
+      Declined {
+        reason: reason.to_vec(),
+        hook: Vec::new(),
+        message: Some(message(&line)),
+      }
+    }
   }
 }
 

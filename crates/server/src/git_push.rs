@@ -2167,6 +2167,30 @@ fn ref_conflict_in<H: HiddenRefs + ?Sized>(
   })
 }
 
+/// Re-checks live repository refs for a files-backend D/F conflict against `command` right before
+/// appending, closing the cooperative-yield window between `Deciding`'s D/F check and
+/// `push_sealed` while preserving stock Git 2.56.1 wording and hidden-ref redaction.
+fn append_df_guard<H: HiddenRefs + ?Sized>(
+  repositories: &slates_db::repository::Repositories,
+  store: (&ContentStore, &slates_git::store::Repository),
+  repository: RepositoryId,
+  hidden: &H,
+  command: &Command,
+  reason: &[u8],
+) -> Result<(), Declined> {
+  if command.is_delete() {
+    return Ok(());
+  }
+  match ref_conflict_in(repositories, store, repository, hidden, &command.name, &[]) {
+    Some(conflict) => Err(receive::df_conflict_declined(
+      reason,
+      &command.name,
+      &conflict,
+    )),
+    None => Ok(()),
+  }
+}
+
 /// The green the ref `name` names in `repository`'s namespace (module docs).
 fn bound(state: &ShardState, repository: RepositoryId, name: &[u8]) -> Option<DbVolumeId> {
   let namespace = namespace_of(name)?;
@@ -2767,6 +2791,7 @@ impl Judge for ServerJudge<'_> {
 
   fn append(&mut self, command: &Command, entry: Entry) -> Result<Vec<Reported>, Declined> {
     let declined = |unappended: Unappended| works::append_declined(&command.name, &unappended);
+    self.check_append_df(command, receive::REFNAME_CONFLICT)?;
     let planned = self.planned(command, entry, 0).map_err(declined)?;
     self.appended(vec![planned]).map_err(declined)?;
     Ok(Vec::new())
@@ -2784,6 +2809,7 @@ impl Judge for ServerJudge<'_> {
     let count = accepted.len();
     let mut planned = Vec::with_capacity(count);
     for (at, (command, entry)) in accepted.into_iter().enumerate() {
+      self.check_append_df(command, receive::ATOMIC_TRANSACTION_FAILED)?;
       planned.push(self.planned(command, entry, at).map_err(declined)?);
     }
     self.appended(planned).map_err(declined)?;
@@ -2805,6 +2831,23 @@ impl Judge for ServerJudge<'_> {
 }
 
 impl ServerJudge<'_> {
+  /// Re-checks live repository refs for a files-backend D/F conflict against `command` right
+  /// before calling `push_sealed` in the same synchronous owner-shard step.
+  fn check_append_df(&self, command: &Command, reason: &[u8]) -> Result<(), Declined> {
+    let Some((content, git)) = self.state.vcs_stores.git_ref(self.record.id) else {
+      return Ok(());
+    };
+    let repositories = self.state.db.partition().repositories();
+    append_df_guard(
+      repositories,
+      (content, &git.repository),
+      self.record.id,
+      self.hidden,
+      command,
+      reason,
+    )
+  }
+
   /// A turn of making the chains room for the command under way's entry before its append (A-238, moved off the
   /// append's step: git/git's whole-history push had an append meet `green_chains` at its cap and checkpoint the
   /// repository's every member green in its one step, about a thousand folds, 1,142 ms, and the watchdog killed the

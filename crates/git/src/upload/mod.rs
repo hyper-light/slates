@@ -13,7 +13,7 @@
 //!
 //! **One exchange a call.** [`Asked::Advertise`] is answered with the capability advertisement (§4.17.2 "The wire":
 //! `agent`, `ls-refs=unborn`, `fetch=shallow wait-for-done filter ref-in-want sideband-all packfile-uris`,
-//! `server-option`, `object-format`, `session-id` and `object-info`). [`Asked::Request`] is answered as
+//! `server-option`, `object-format`, `session-id` and `object-info=size type`). [`Asked::Request`] is answered as
 //! `git upload-pack --stateless-rpc` answers one `POST`, and as an SSH session answers each request it reads whole: a
 //! request is held to the advertisement first, as `serve.c` holds it, so a command or a capability not advertised
 //! (`bundle-uri` until the repository offers a bundle list, `promisor-remote`) and an object format other than the
@@ -497,17 +497,17 @@ fn command_answer<P: PackSource>(
   answered
 }
 
-/// Object sizes visible through `graph`: objects not reachable from any visible ref answer as absent
-/// so hidden refs cannot be probed via `object-info`.
-struct VisibleSizes<'g, 'r> {
+/// Object metadata visible through `graph`: objects not reachable from any visible ref answer as
+/// absent so hidden refs cannot be probed via `object-info` (`size` or `type`).
+struct VisibleObjects<'g, 'r> {
   /// The repository graph restricted to visible refs.
   graph: &'g StoreGraph<'r>,
-  /// The underlying store sizes.
+  /// The underlying store metadata.
   stored: object_info::Stored<'r>,
 }
 
-impl object_info::ObjectSizes for VisibleSizes<'_, '_> {
-  fn size(&self, id: &ObjectId) -> Option<u64> {
+impl object_info::ObjectInfo for VisibleObjects<'_, '_> {
+  fn info(&self, id: &ObjectId) -> Option<object_info::ObjectMeta> {
     if self.graph.fault().is_some() {
       return None;
     }
@@ -515,22 +515,22 @@ impl object_info::ObjectSizes for VisibleSizes<'_, '_> {
     if !self.graph.is_visible_want(node) {
       return None;
     }
-    self.stored.size(id)
+    self.stored.info(id)
   }
 }
 
-/// The `object-info` answer to `arguments`, each size from the store's rows (A-624's `Stored`),
-/// restricted to objects reachable from visible refs. Any store fault encountered while proving
-/// visibility (including a let-go pack window noted on the repository) refuses the answer with
-/// [`Refusal::Store`] so callers bring the window back and retry instead of reporting a visible
-/// object as unknown.
+/// The `object-info` answer to `arguments`, each size and type from the store's rows (A-624's
+/// `Stored`), restricted to objects reachable from visible refs. Any store fault encountered while
+/// proving visibility (including a let-go pack window noted on the repository) refuses the answer
+/// with [`Refusal::Store`] so callers bring the window back and retry instead of reporting a
+/// visible object as unknown.
 fn object_info_answer(
   graph: &StoreGraph<'_>,
   served: &Served<'_>,
   arguments: &[Line<object_info::Argument>],
   admission: &mut Admission,
 ) -> Result<Vec<u8>, Refusal> {
-  let sizes = VisibleSizes {
+  let objects = VisibleObjects {
     graph,
     stored: object_info::Stored {
       repository: served.repository,
@@ -542,7 +542,7 @@ fn object_info_answer(
   // `store/upload.rs`): clear stale waiting state before proving visibility.
   let _ = served.repository.waiting();
   let (bytes, ()) = charged(admission, |out| {
-    object_info::answer(arguments, format, &sizes, out).map_err(Refusal::Wire)?;
+    object_info::answer(arguments, format, &objects, out).map_err(Refusal::Wire)?;
     match graph.fault() {
       Some(fault) => Err(Refusal::Store(fault)),
       None => Ok(()),

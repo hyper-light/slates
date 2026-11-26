@@ -483,6 +483,39 @@ fn every_cut_and_flip_of_a_request_is_refused_or_answered_whole() {
   );
 }
 
+/// Verifies `object-info` with `attrs` returns `expected_first` for visible `FIRST` and unknown
+/// (`<oid> `) for hidden `THIRD`.
+fn assert_object_info_hides_hidden(
+  fixture: &served::Served,
+  visible: &[NamedRef<'_>],
+  attrs: &[&[u8]],
+  expected_first: &str,
+) {
+  let oid_third = naming("oid", THIRD);
+  let oid_first = naming("oid", FIRST);
+  let mut args: Vec<&[u8]> = attrs.to_vec();
+  args.push(&oid_third);
+  args.push(&oid_first);
+  let info = command("object-info", &args);
+  let (bytes, answer) = answer_of(
+    fixture,
+    visible,
+    b"refs/heads/side",
+    Version::V2,
+    Asked::Request(&info),
+  );
+  let text = String::from_utf8_lossy(&bytes);
+  assert_eq!(
+    (
+      answer.refusal(),
+      text.contains(&format!("{FIRST} {expected_first}")),
+      text.contains(&format!("002d{THIRD} ")),
+    ),
+    (None, true, true),
+    "attrs={attrs:?}: {text}"
+  );
+}
+
 /// §4.17.2 "Access" (hidden-ref reachability in upload-pack v2, v0, and object-info): hide `refs/heads/main` (whose
 /// tip is `THIRD`) while keeping `refs/heads/side` (`FIRST`) and `refs/tags/v1` (`SECOND`) visible. Expect: `THIRD`
 /// is refused `NotOurs` in both v2 and v0 fetch and omitted from `object-info`, while `SECOND` (reachable from the
@@ -536,26 +569,8 @@ fn objects_only_reachable_from_hidden_refs_are_refused_in_v2_v0_and_object_info(
       id: id(THIRD),
     }))
   );
-  // Protocol v2 `object-info` asking for `THIRD` and `FIRST`: `FIRST` gets its size, `THIRD` answers unknown (`<oid> `).
-  let info = command(
-    "object-info",
-    &[b"size", &naming("oid", THIRD), &naming("oid", FIRST)],
-  );
-  let (bytes, answer) = answer_of(
-    &fixture,
-    &visible,
-    b"refs/heads/side",
-    Version::V2,
-    Asked::Request(&info),
-  );
-  assert_eq!(answer.refusal(), None);
-  let text = String::from_utf8_lossy(&bytes);
-  assert!(
-    text.contains(&format!("{FIRST} 152")),
-    "visible object reports its size: {text}"
-  );
-  assert!(
-    text.contains(&format!("002d{THIRD} ")),
-    "hidden object answers unknown (no size): {text}"
-  );
+  // Protocol v2 `object-info` across `size`, `type`, and `size`+`type` (stock Git 2.56.1 default).
+  assert_object_info_hides_hidden(&fixture, &visible, &[b"size"], "152");
+  assert_object_info_hides_hidden(&fixture, &visible, &[b"type"], "commit");
+  assert_object_info_hides_hidden(&fixture, &visible, &[b"size", b"type"], "152 commit");
 }
