@@ -491,13 +491,18 @@ impl Repository {
     mut checking: Checking,
     spent: &mut dyn FnMut() -> bool,
   ) -> Result<CheckStep, StepRefusal> {
+    let mut first = true;
     loop {
       let ended = match checking.phase {
         CheckPhase::Naming(at) => checking.name_some(at, spent),
         CheckPhase::Fresh => self.fresh_some(&mut checking, spent)?,
         CheckPhase::Stored => self.stored_some(&mut checking, spent)?,
+        // A whole part begins a step, never ends one past its quantum (A-920 piece 2c).
+        CheckPhase::PlanBegin if !first => return Ok(CheckStep::More(Box::new(checking))),
+        CheckPhase::PlanBegin => self.plan_begin_now(&mut checking)?,
         CheckPhase::Planning => return self.plan_some(checking, spent),
       };
+      first = false;
       if !ended || spent() {
         return Ok(CheckStep::More(Box::new(checking)));
       }
@@ -524,8 +529,8 @@ impl Repository {
     Ok(true)
   }
 
-  /// [`Repository::check_step`]'s stored texts, a text a unit until `spent`: those the records do not hold kept; then
-  /// the index's plan begun ([`Index::plan_begin`]). Whether the phase ended.
+  /// [`Repository::check_step`]'s stored texts, a text a unit until `spent`: those the records do not hold kept, the
+  /// index's plan to begin next. Whether the phase ended.
   fn stored_some(
     &self,
     checking: &mut Checking,
@@ -539,6 +544,13 @@ impl Repository {
         return Ok(false);
       }
     }
+    checking.phase = CheckPhase::PlanBegin;
+    Ok(true)
+  }
+
+  /// [`Repository::check_step`]'s plan begun ([`Index::plan_begin`]: the rows sorted, the new root made; 3.4 ms whole at
+  /// 9,000 files, debug), the first unit of a step of its own: whether the phase ended.
+  fn plan_begin_now(&self, checking: &mut Checking) -> Result<bool, StepRefusal> {
     let record = checking.record.take().ok_or(StepRefusal::Corrupt)?;
     checking.planning = Some(self.index.plan_begin(record, self.room.entries)?);
     checking.phase = CheckPhase::Planning;
@@ -948,6 +960,8 @@ enum CheckPhase {
   Fresh,
   /// Filtering the texts its commit stored.
   Stored,
+  /// The index's plan to begin, the first unit of a step.
+  PlanBegin,
   /// The index planning its rows.
   Planning,
 }

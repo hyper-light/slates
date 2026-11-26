@@ -328,9 +328,9 @@ fn started(state: &mut ShardState, repository: RepositoryId) -> (Vec<u8>, Receiv
   (advertised, push)
 }
 
-/// Shape: how long an awaiting history ([`on_stored_shard_awaited`]) may run on its shard before the test fails: as long
-/// as `svn_commit`'s histories are held.
-const HISTORY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long an awaiting history ([`on_stored_shard_awaited`]) may run on its shard before the test fails
+/// ([`crate::test_store::HISTORY_PATIENCE`]).
+const HISTORY_PATIENCE: std::time::Duration = crate::test_store::HISTORY_PATIENCE;
 
 /// [`on_stored_shard_with`] for a history that awaits (main 01a20182's order of 2026-11-25, the shard-blocking
 /// allow-list): `history` runs as a task on the stored daemon's first shard ([`crate::test_store::run_on_first`]), with

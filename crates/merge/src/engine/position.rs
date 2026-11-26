@@ -113,42 +113,175 @@ fn advance(mapped: Mapped, deltas: &[&[Op]]) -> Mapped {
   }
 }
 
-/// One unit of a verdict (module docs): what one run of the verdict decided, in the order the whole verdict pushes it.
-#[derive(Default)]
-pub(super) struct Unit {
-  /// The accepted effects.
-  pub(super) effects: Vec<Effect>,
-  /// The conflict windows.
-  pub(super) windows: Vec<ConflictWindow>,
-  /// A content edit's ops, where each stood at the head the unit was judged at; empty for every other unit.
-  pub(super) placed: Vec<Placed>,
+/// Where one unit's parts end in its verdict's flat lists ([`Verdict`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct Ends {
+  effects: usize,
+  windows: usize,
+  placed: usize,
 }
 
-impl Unit {
-  /// The unit of one verdict function's answer: an effect, nothing, or a window.
-  pub(super) fn of(answer: Result<Option<Effect>, ConflictWindow>) -> Unit {
-    let mut unit = Unit::default();
-    super::record(&mut unit.effects, &mut unit.windows, answer);
-    unit
+/// A verdict's units, flat (module docs; A-920 3l): every unit's accepted effects, conflict windows and placements (a
+/// content edit's ops, where each stood at the head it was judged at) in three lists, in the order the whole verdict
+/// pushes them, and where each unit's parts end in them. A unit allocates nothing of its own: one list each had been
+/// freed a unit at a time as a held verdict was gathered, and the free that emptied the allocator's region cost one
+/// step 1.2 ms (debug probe, 18,001 units of 0 or 1 effect). The whole verdict is the lists taken whole.
+#[derive(Default)]
+pub(super) struct Verdict {
+  /// Every unit's accepted effects, in order.
+  pub(super) effects: Vec<Effect>,
+  /// Every unit's conflict windows, in order.
+  pub(super) windows: Vec<ConflictWindow>,
+  /// Every content edit's placements, in order.
+  pub(super) placed: Vec<Placed>,
+  /// Where each unit's parts end.
+  ends: Vec<Ends>,
+}
+
+/// One unit of a verdict, read in place ([`Verdict::units`]).
+pub(super) struct UnitRef<'v> {
+  /// Its accepted effects.
+  pub(super) effects: &'v [Effect],
+  /// Its conflict windows.
+  pub(super) windows: &'v [ConflictWindow],
+  /// A content edit's placements; empty for every other unit.
+  pub(super) placed: &'v [Placed],
+}
+
+/// What a unit's verdict writes into ([`Units::unit`]): its verdict's flat lists, appended to and never read.
+pub(super) struct UnitSink<'v> {
+  /// The accepted effects.
+  pub(super) effects: &'v mut Vec<Effect>,
+  /// The conflict windows.
+  pub(super) windows: &'v mut Vec<ConflictWindow>,
+  /// A content edit's placements.
+  pub(super) placed: &'v mut Vec<Placed>,
+  /// The effect lists a verdict function answered of its own ([`UnitSink::effect_list`]).
+  lists: &'v mut u64,
+}
+
+impl UnitSink<'_> {
+  /// One verdict function's answer: an effect, nothing, or a window.
+  pub(super) fn of(&mut self, answer: Result<Option<Effect>, ConflictWindow>) {
+    super::record(self.effects, self.windows, answer);
   }
 
-  /// The unit of a content edit's answer: an effect, nothing, or its windows.
-  pub(super) fn content(answer: Result<Option<Effect>, Vec<ConflictWindow>>) -> Unit {
+  /// A content edit's answer: an effect, nothing, or its windows.
+  pub(super) fn content(&mut self, answer: Result<Option<Effect>, Vec<ConflictWindow>>) {
     match answer {
-      Ok(effect) => Unit {
-        effects: effect.into_iter().collect(),
-        ..Unit::default()
-      },
-      Err(windows) => Unit::windows(windows),
+      Ok(effect) => self.effects.extend(effect),
+      Err(windows) => self.windows.extend(windows),
     }
   }
 
-  /// A unit of windows alone.
-  pub(super) fn windows(windows: Vec<ConflictWindow>) -> Unit {
-    Unit {
-      windows,
-      ..Unit::default()
+  /// Windows alone.
+  pub(super) fn windows(&mut self, windows: impl IntoIterator<Item = ConflictWindow>) {
+    self.windows.extend(windows);
+  }
+
+  /// Effects a verdict function answered as a list of its own (a node's writes handed on to a link): appended, and the
+  /// list counted where it allocated (`Green::unit_effect_lists`).
+  pub(super) fn effect_list(&mut self, effects: Vec<Effect>) {
+    if effects.capacity() > 0 {
+      *self.lists = self.lists.saturating_add(1);
     }
+    self.effects.extend(effects);
+  }
+}
+
+impl Verdict {
+  /// A verdict whose lists hold `(effects, windows, placed, units)` without growing.
+  fn with_capacity((effects, windows, placed, units): (usize, usize, usize, usize)) -> Verdict {
+    Verdict {
+      effects: Vec::with_capacity(effects),
+      windows: Vec::with_capacity(windows),
+      placed: Vec::with_capacity(placed),
+      ends: Vec::with_capacity(units),
+    }
+  }
+
+  /// The unit being written ends here.
+  fn end_unit(&mut self) {
+    self.ends.push(Ends {
+      effects: self.effects.len(),
+      windows: self.windows.len(),
+      placed: self.placed.len(),
+    });
+  }
+
+  /// A unit read back ([`super::computed_wire`]): its parts appended, the unit ended.
+  pub(super) fn push_unit(
+    &mut self,
+    (effects, windows, placed): (
+      impl IntoIterator<Item = Effect>,
+      &[ConflictWindow],
+      &[Placed],
+    ),
+  ) {
+    self.effects.extend(effects);
+    self.windows.extend_from_slice(windows);
+    self.placed.extend_from_slice(placed);
+    self.end_unit();
+  }
+
+  /// How many units it holds.
+  pub(super) fn len(&self) -> usize {
+    self.ends.len()
+  }
+
+  /// Its units, in order, each read in place.
+  pub(super) fn units(&self) -> impl Iterator<Item = UnitRef<'_>> {
+    let mut last = Ends::default();
+    self.ends.iter().map(move |end| {
+      let unit = UnitRef {
+        effects: self.effects.get(last.effects..end.effects).unwrap_or(&[]),
+        windows: self.windows.get(last.windows..end.windows).unwrap_or(&[]),
+        placed: self.placed.get(last.placed..end.placed).unwrap_or(&[]),
+      };
+      last = *end;
+      unit
+    })
+  }
+}
+
+/// The units reached at an earlier head, taken in order as the later head's are reached ([`Units::again`]): each unit
+/// that stands moves its parts across, and each judged again drops its effects and windows and hands its placements on.
+struct Prior {
+  effects: std::vec::IntoIter<Effect>,
+  windows: std::vec::IntoIter<ConflictWindow>,
+  placed: Vec<Placed>,
+  ends: std::vec::IntoIter<Ends>,
+  /// Where the last unit taken ended.
+  last: Ends,
+  since: Since,
+}
+
+impl Prior {
+  /// The next unit's span: where it begins and where it ends.
+  fn next(&mut self) -> Option<(Ends, Ends)> {
+    let end = self.ends.next()?;
+    let from = core::mem::replace(&mut self.last, end);
+    Some((from, end))
+  }
+
+  /// The unit spanning `(from, to)`, standing as reached: its parts moved into `done`.
+  fn stand(&mut self, (from, to): (Ends, Ends), done: &mut Verdict) {
+    let effects = to.effects.saturating_sub(from.effects);
+    done.effects.extend(self.effects.by_ref().take(effects));
+    let windows = to.windows.saturating_sub(from.windows);
+    done.windows.extend(self.windows.by_ref().take(windows));
+    done
+      .placed
+      .extend_from_slice(self.placed.get(from.placed..to.placed).unwrap_or(&[]));
+  }
+
+  /// The unit spanning `(from, to)`, judged again: its effects and windows dropped, its placements answered.
+  fn judged_again(&mut self, (from, to): (Ends, Ends)) -> &[Placed] {
+    let effects = to.effects.saturating_sub(from.effects);
+    self.effects.by_ref().take(effects).for_each(drop);
+    let windows = to.windows.saturating_sub(from.windows);
+    self.windows.by_ref().take(windows).for_each(drop);
+    self.placed.get(from.placed..to.placed).unwrap_or(&[])
   }
 }
 
@@ -285,45 +418,74 @@ impl Since {
 /// units reached at an earlier one, taking each unit nothing it reads changed since and judging the rest again.
 pub(super) struct Units {
   /// The units reached, in order.
-  done: Vec<Unit>,
+  done: Verdict,
   /// The units reached at the earlier head, in order, and what changed since: none on a first judgment.
-  prior: Option<(std::vec::IntoIter<Unit>, Since)>,
+  prior: Option<Prior>,
   /// The units judged again at the later head.
   again: u64,
+  /// The effect lists the units judged answered of their own (A-920 3l's non-vacuity counter, [`UnitSink::effect_list`]).
+  effect_lists: u64,
 }
 
 impl Units {
   /// A verdict reached for the first time.
   pub(super) fn first() -> Units {
     Units {
-      done: Vec::new(),
+      done: Verdict::default(),
       prior: None,
       again: 0,
+      effect_lists: 0,
     }
   }
 
   /// A verdict reached again from `units`, reached at `since`'s head for the same work.
-  pub(super) fn again(units: Vec<Unit>, since: Since) -> Units {
+  pub(super) fn again(units: Verdict, since: Since) -> Units {
+    let Verdict {
+      effects,
+      windows,
+      placed,
+      ends,
+    } = units;
+    let done = Verdict::with_capacity((effects.len(), windows.len(), placed.len(), ends.len()));
     Units {
-      done: Vec::with_capacity(units.len()),
-      prior: Some((units.into_iter(), since)),
+      done,
+      prior: Some(Prior {
+        effects: effects.into_iter(),
+        windows: windows.into_iter(),
+        placed,
+        ends: ends.into_iter(),
+        last: Ends::default(),
+        since,
+      }),
       again: 0,
+      effect_lists: 0,
     }
   }
 
   /// A work's copies: judged again whenever the green moved or its floor differs (module docs).
-  pub(super) fn copies(&mut self, judge: impl FnOnce() -> Unit) {
-    let unit = match self.prior.as_mut() {
-      None => judge(),
-      Some((units, since)) => match units.next() {
-        Some(unit) if !since.copies => unit,
-        _ => {
-          self.again = self.again.saturating_add(1);
-          judge()
+  pub(super) fn copies(&mut self, judge: impl FnOnce(&mut UnitSink<'_>)) {
+    let Units {
+      done,
+      prior,
+      again,
+      effect_lists,
+    } = self;
+    let reached = prior
+      .as_mut()
+      .map(|prior| (prior.next(), prior.since.copies));
+    match (prior.as_mut(), reached) {
+      (Some(prior), Some((Some(span), false))) => prior.stand(span, done),
+      (prior, reached) => {
+        if let (Some(prior), Some((Some(span), _))) = (prior, reached) {
+          prior.judged_again(span);
         }
-      },
-    };
-    self.done.push(unit);
+        if reached.is_some() {
+          *again = again.saturating_add(1);
+        }
+        judge(&mut sink(done, effect_lists));
+      }
+    }
+    done.end_unit();
   }
 
   /// Whether the next unit, whose verdict reads `footprint`, is judged ([`Units::unit`]): on a first judgment, where no
@@ -332,48 +494,66 @@ impl Units {
   pub(super) fn judges(&self, footprint: &Footprint<'_>) -> bool {
     match self.prior.as_ref() {
       None => true,
-      Some((units, since)) => units.as_slice().first().is_none() || since.meets(footprint),
+      Some(prior) => prior.ends.as_slice().is_empty() || prior.since.meets(footprint),
     }
   }
 
   /// A unit whose verdict reads `footprint`: taken as reached when nothing it reads changed since, else judged
-  /// (`judge`, handed the earlier head and where a content edit's ops stood there when it is judged again).
+  /// (`judge`, handed the earlier head and where a content edit's ops stood there when it is judged again), writing into
+  /// the verdict's lists.
   pub(super) fn unit(
     &mut self,
     footprint: Footprint<'_>,
-    judge: impl FnOnce(Option<(u64, Vec<Placed>)>) -> Unit,
+    judge: impl FnOnce(Option<(u64, &[Placed])>, &mut UnitSink<'_>),
   ) {
-    let unit = match self.prior.as_mut() {
-      None => judge(None),
-      Some((units, since)) => match units.next() {
-        Some(unit) if !since.meets(&footprint) => unit,
+    let Units {
+      done,
+      prior,
+      again,
+      effect_lists,
+    } = self;
+    match prior.as_mut() {
+      None => judge(None, &mut sink(done, effect_lists)),
+      Some(prior) => match prior.next() {
+        Some(span) if !prior.since.meets(&footprint) => prior.stand(span, done),
         reached => {
-          self.again = self.again.saturating_add(1);
-          judge(reached.map(|unit| (since.at, unit.placed)))
+          *again = again.saturating_add(1);
+          let at = prior.since.at;
+          let placed = reached.map(|span| (at, prior.judged_again(span)));
+          judge(placed, &mut sink(done, effect_lists));
         }
       },
-    };
-    self.done.push(unit);
+    }
+    done.end_unit();
+  }
+
+  /// The effect lists the units judged so far answered of their own.
+  pub(super) fn effect_lists(&self) -> u64 {
+    self.effect_lists
   }
 
   /// The units reached, in order, and how many were judged again.
-  pub(super) fn into_units(self) -> (Vec<Unit>, u64) {
+  pub(super) fn into_units(self) -> (Verdict, u64) {
     (self.done, self.again)
   }
 }
 
-/// The whole verdict of `units`: every effect, in order, when no unit holds a window, else every window, in order.
-pub(super) fn verdict(units: Vec<Unit>) -> Result<Vec<Effect>, Vec<ConflictWindow>> {
-  let mut effects = Vec::new();
-  let mut windows = Vec::new();
-  for unit in units {
-    effects.extend(unit.effects);
-    windows.extend(unit.windows);
+/// What a unit writes into: `done`'s lists, its own effect lists counted in `lists`.
+fn sink<'v>(done: &'v mut Verdict, lists: &'v mut u64) -> UnitSink<'v> {
+  UnitSink {
+    effects: &mut done.effects,
+    windows: &mut done.windows,
+    placed: &mut done.placed,
+    lists,
   }
-  if windows.is_empty() {
-    Ok(effects)
+}
+
+/// The whole verdict of `units`: every effect, in order, when no unit holds a window, else every window, in order.
+pub(super) fn verdict(units: Verdict) -> Result<Vec<Effect>, Vec<ConflictWindow>> {
+  if units.windows.is_empty() {
+    Ok(units.effects)
   } else {
-    Err(windows)
+    Err(units.windows)
   }
 }
 
