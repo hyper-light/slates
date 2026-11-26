@@ -297,8 +297,8 @@ impl Green {
         Ok(computed) => {
           let (begun, unlent) = crate::unlent::scope(|| self.hold_begin(inc, computed, false));
           match begun {
-            Err(answer) => self.unlent_rule(inc, answer, &unlent),
-            Ok(holding) => {
+            super::HoldBegun::Judged(answer) => self.unlent_rule(inc, answer, &unlent),
+            super::HoldBegun::Holding(holding) => {
               judging.phase = JudgingPhase::Holding(Box::new((holding, unlent)));
               return None;
             }

@@ -828,6 +828,15 @@ pub struct Computed {
   reached: Reached,
 }
 
+/// What [`Green::hold_begin`] begins: the hold of a verdict, or the judgment the cache or the checkpoint answers at once
+/// (an outcome, not a failure, so no `Result` carries it).
+pub(crate) enum HoldBegun {
+  /// Its units to gather ([`Green::holding_step`]).
+  Holding(Holding),
+  /// Answered at once.
+  Judged(Judgment),
+}
+
 /// A verdict being held a unit at a time ([`Green::hold_begin`], [`Green::holding_step`]): its units brought to the
 /// head, their effects and windows gathered so far.
 pub(crate) struct Holding {
@@ -2131,6 +2140,23 @@ fn named_files(
     .iter()
     .filter_map(|(place, run)| Some((*place, whole_object(runs, *run)?)))
     .collect()
+}
+
+/// The file at `place`, made of run `found` alone, kept as the preparation finds it ([`Prep::Sole`]): its run, its
+/// run's count of files ([`alone`]'s), and its name where the run is its object whole ([`named_files`]'s).
+fn note_sole(
+  (sole, files_of, names): (
+    &mut Vec<(usize, usize)>,
+    &mut BTreeMap<usize, usize>,
+    &mut Vec<(usize, crate::named::Identity)>,
+  ),
+  (place, found): (usize, usize),
+  runs: &[crate::named::NamedRun],
+) {
+  sole.push((place, found));
+  let count = files_of.entry(found).or_insert(0);
+  *count = count.saturating_add(1);
+  names.extend(whole_object(runs, found).map(|identity| (place, identity)));
 }
 
 /// The object run `run` of `runs` is whole, from its first byte, its length the object's: what a file made of it alone
@@ -6884,8 +6910,8 @@ impl Green {
   /// cache as a submit keeps one. Its commit's reads checked where `check_reads` ([`Green::commit_reads`]).
   fn hold_computed(&mut self, inc: &Increment, computed: Computed, check_reads: bool) -> Judgment {
     let mut holding = match self.hold_begin(inc, computed, check_reads) {
-      Ok(holding) => holding,
-      Err(answer) => return answer,
+      HoldBegun::Holding(holding) => holding,
+      HoldBegun::Judged(answer) => return answer,
     };
     loop {
       if let Some(judgment) = self.holding_step(inc, &mut holding, &mut || false) {
@@ -6902,23 +6928,23 @@ impl Green {
     inc: &Increment,
     computed: Computed,
     check_reads: bool,
-  ) -> Result<Holding, Judgment> {
+  ) -> HoldBegun {
     if let Some(version) = self.accepted.get(&inc.id) {
-      return Err(Judgment::AcceptedBefore { version: *version });
+      return HoldBegun::Judged(Judgment::AcceptedBefore { version: *version });
     }
     if let Some(windows) = self.rejected.get(&inc.id) {
-      return Err(Judgment::Conflict {
+      return HoldBegun::Judged(Judgment::Conflict {
         windows: windows.clone(),
       });
     }
     if inc.base < self.deltas_from {
-      return Err(Judgment::BaseUnavailable {
+      return HoldBegun::Judged(Judgment::BaseUnavailable {
         base: inc.base,
         floor: self.deltas_from,
       });
     }
     let (units, reached) = match computed.reached {
-      Reached::Before(version) => return Err(Judgment::AcceptedBefore { version }),
+      Reached::Before(version) => return HoldBegun::Judged(Judgment::AcceptedBefore { version }),
       Reached::Verdict { units, applied, .. } => {
         // Reached at the head, nothing since: its effects are the ones reached, and so what the chain records of them.
         let unchanged = self.since(computed.at, computed.floor).is_nothing();
@@ -6926,7 +6952,7 @@ impl Green {
         (units, unchanged.then_some(applied))
       }
     };
-    Ok(Holding {
+    HoldBegun::Holding(Holding {
       units: units.into_iter(),
       effects: Vec::new(),
       windows: Vec::new(),
@@ -7472,134 +7498,199 @@ impl Green {
     spent: &mut dyn FnMut() -> bool,
   ) -> ApplyStep {
     loop {
-      match &mut run.prep {
+      let stepped = match run.prep {
         // Begun by its owner ([`Prep::sole`]); never met here.
-        Prep::Effects => return ApplyStep::More,
-        Prep::Places { places, at } => {
-          let post = crate::named::Post::of(post_state, &run.read, runs);
-          while let Some(place) = post.run_place(*at) {
-            places.entry(place).or_insert(*at);
-            *at = at.saturating_add(1);
-            if post.run_place(*at).is_some() && spent() {
-              return ApplyStep::More;
-            }
-          }
-          run.prep = Prep::Sole {
-            places: core::mem::take(places),
-            sole: Vec::new(),
-            files_of: BTreeMap::new(),
-            names: Vec::new(),
-            at: 0,
-          };
-        }
-        Prep::Sole {
-          places,
-          sole,
-          files_of,
-          names,
-          at,
-        } => {
-          if !places.is_empty() {
-            while let Some(effect) = run.effects.get(*at) {
-              if let Some(found) = self.sole_run_of(effect, places) {
-                sole.push((*at, found));
-                let count = files_of.entry(found).or_insert(0);
-                *count = count.saturating_add(1);
-                names.extend(whole_object(runs, found).map(|identity| (*at, identity)));
-              }
-              *at = at.saturating_add(1);
-              if run.effects.get(*at).is_some() && spent() {
-                return ApplyStep::More;
-              }
-            }
-          }
-          run.prep = Prep::Alone {
-            names: core::mem::take(names),
-            sole: core::mem::take(sole),
-            files_of: core::mem::take(files_of),
-            wholes: Vec::new(),
-            at: 0,
-          };
-        }
-        Prep::Alone {
-          names,
-          sole,
-          files_of,
-          wholes,
-          at,
-        } => {
-          while let Some(&(place, found)) = sole.get(*at) {
-            if files_of.get(&found) == Some(&1) {
-              wholes.push((place, found));
-            }
-            *at = at.saturating_add(1);
-            if sole.get(*at).is_some() && spent() {
-              return ApplyStep::More;
-            }
-          }
-          let (names, wholes) = (core::mem::take(names), core::mem::take(wholes));
-          run.prep = if run.check_reads {
-            Prep::Reads {
-              names,
-              wholes,
-              at: 0,
-            }
-          } else {
-            Prep::Mapped {
-              names,
-              wholes,
-              at: 0,
-            }
-          };
-        }
-        Prep::Reads { names, wholes, at } => {
-          let from = *at;
-          let ((), unlent) = crate::unlent::scope(|| {
-            while let Some(effect) = run.effects.get(*at) {
-              self.note_unlent_read((*at, effect), wholes);
-              *at = at.saturating_add(1);
-              if spent() {
-                break;
-              }
-            }
-          });
-          if !unlent.is_empty() {
-            // The slice undone, to be checked again once its texts are lent.
-            *at = from;
-            return ApplyStep::Lend(unlent);
-          }
-          if run.effects.get(*at).is_some() {
-            return ApplyStep::More;
-          }
-          run.prep = Prep::Mapped {
-            names: core::mem::take(names),
-            wholes: core::mem::take(wholes),
-            at: 0,
-          };
-        }
-        Prep::Mapped { names, wholes, at } => {
-          let post = crate::named::Post::of(post_state, &run.read, runs);
-          while let Some(effect) = run.effects.get_mut(*at) {
-            self.make_mapped_one((*at, effect), post, wholes);
-            *at = at.saturating_add(1);
-            if run.effects.get(*at).is_some() && spent() {
-              return ApplyStep::More;
-            }
-          }
-          let mut effects = core::mem::take(&mut run.effects);
-          move_whole_runs(&mut effects, &mut run.read, wholes);
-          let version = self.head().saturating_add(1);
-          let names = core::mem::take(names);
-          run.commit = Some(self.commit_begin(
-            effects,
-            version,
-            crate::named::Post::of(post_state, &run.read, runs),
-            &names,
-          ));
-          return ApplyStep::More;
-        }
+        Prep::Effects => Some(ApplyStep::More),
+        Prep::Places { .. } => Green::places_some(run, (post_state, runs), spent),
+        Prep::Sole { .. } => self.sole_some(run, runs, spent),
+        Prep::Alone { .. } => Green::alone_some(run, spent),
+        Prep::Reads { .. } => self.reads_some(run, spent),
+        Prep::Mapped { .. } => Some(self.mapped_some(run, (post_state, runs), spent)),
+      };
+      if let Some(stepped) = stepped {
+        return stepped;
       }
     }
+  }
+
+  /// [`Prep::Places`]: the runs' places found, a run a unit, until `spent`: the step where it is spent, none where the
+  /// phase ended ([`Green::prepare_step`]).
+  fn places_some(
+    run: &mut Applying,
+    (post_state, runs): (&[u8], &crate::named::RunTable),
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Option<ApplyStep> {
+    let Prep::Places { places, at } = &mut run.prep else {
+      return Some(ApplyStep::More);
+    };
+    let post = crate::named::Post::of(post_state, &run.read, runs);
+    while let Some(place) = post.run_place(*at) {
+      places.entry(place).or_insert(*at);
+      *at = at.saturating_add(1);
+      if post.run_place(*at).is_some() && spent() {
+        return Some(ApplyStep::More);
+      }
+    }
+    run.prep = Prep::Sole {
+      places: core::mem::take(places),
+      sole: Vec::new(),
+      files_of: BTreeMap::new(),
+      names: Vec::new(),
+      at: 0,
+    };
+    None
+  }
+
+  /// [`Prep::Sole`]: each effect's sole run found, a file a unit, each file's name and its run's count of files kept as
+  /// found, until `spent`: the step where it is spent, none where the phase ended.
+  fn sole_some(
+    &self,
+    run: &mut Applying,
+    runs: &crate::named::RunTable,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Option<ApplyStep> {
+    let Prep::Sole {
+      places,
+      sole,
+      files_of,
+      names,
+      at,
+    } = &mut run.prep
+    else {
+      return Some(ApplyStep::More);
+    };
+    while !places.is_empty()
+      && let Some(effect) = run.effects.get(*at)
+    {
+      if let Some(found) = self.sole_run_of(effect, places) {
+        note_sole((sole, files_of, names), (*at, found), runs);
+      }
+      *at = at.saturating_add(1);
+      if run.effects.get(*at).is_some() && spent() {
+        return Some(ApplyStep::More);
+      }
+    }
+    run.prep = Prep::Alone {
+      names: core::mem::take(names),
+      sole: core::mem::take(sole),
+      files_of: core::mem::take(files_of),
+      wholes: Vec::new(),
+      at: 0,
+    };
+    None
+  }
+
+  /// [`Prep::Alone`]: the files whose run makes no other kept, a file a unit, until `spent`: the step where it is spent,
+  /// none where the phase ended (to its reads' check, or to the mapped files where its judge checked them).
+  fn alone_some(run: &mut Applying, spent: &mut dyn FnMut() -> bool) -> Option<ApplyStep> {
+    let Prep::Alone {
+      names,
+      sole,
+      files_of,
+      wholes,
+      at,
+    } = &mut run.prep
+    else {
+      return Some(ApplyStep::More);
+    };
+    while let Some(&(place, found)) = sole.get(*at) {
+      if files_of.get(&found) == Some(&1) {
+        wholes.push((place, found));
+      }
+      *at = at.saturating_add(1);
+      if sole.get(*at).is_some() && spent() {
+        return Some(ApplyStep::More);
+      }
+    }
+    let (names, wholes) = (core::mem::take(names), core::mem::take(wholes));
+    run.prep = if run.check_reads {
+      Prep::Reads {
+        names,
+        wholes,
+        at: 0,
+      }
+    } else {
+      Prep::Mapped {
+        names,
+        wholes,
+        at: 0,
+      }
+    };
+    None
+  }
+
+  /// [`Prep::Reads`]: each effect's read of a text held by name alone checked, until `spent`: the step where it is spent,
+  /// the texts to lend where its slice met one unlent (the slice undone), none where the phase ended.
+  fn reads_some(&self, run: &mut Applying, spent: &mut dyn FnMut() -> bool) -> Option<ApplyStep> {
+    let Prep::Reads { names, wholes, at } = &mut run.prep else {
+      return Some(ApplyStep::More);
+    };
+    let from = *at;
+    let ((), unlent) =
+      crate::unlent::scope(|| self.note_reads_from((&run.effects, at), wholes, spent));
+    if !unlent.is_empty() {
+      // The slice undone, to be checked again once its texts are lent.
+      *at = from;
+      return Some(ApplyStep::Lend(unlent));
+    }
+    if run.effects.get(*at).is_some() {
+      return Some(ApplyStep::More);
+    }
+    run.prep = Prep::Mapped {
+      names: core::mem::take(names),
+      wholes: core::mem::take(wholes),
+      at: 0,
+    };
+    None
+  }
+
+  /// Each effect's read from `at` of a text held by name alone noted ([`Green::note_unlent_read`]), an effect a unit,
+  /// until `spent`.
+  fn note_reads_from(
+    &self,
+    (effects, at): (&[Effect], &mut usize),
+    wholes: &[(usize, usize)],
+    spent: &mut dyn FnMut() -> bool,
+  ) {
+    while let Some(effect) = effects.get(*at) {
+      self.note_unlent_read((*at, effect), wholes);
+      *at = at.saturating_add(1);
+      if spent() {
+        break;
+      }
+    }
+  }
+
+  /// [`Prep::Mapped`]: each mapped file made, a file a unit, until `spent`; once every one is, the whole runs' buffers
+  /// moved into their files and the commit begun ([`Green::commit_begin`]).
+  fn mapped_some(
+    &mut self,
+    run: &mut Applying,
+    (post_state, runs): (&[u8], &crate::named::RunTable),
+    spent: &mut dyn FnMut() -> bool,
+  ) -> ApplyStep {
+    let Prep::Mapped { names, wholes, at } = &mut run.prep else {
+      return ApplyStep::More;
+    };
+    let post = crate::named::Post::of(post_state, &run.read, runs);
+    while let Some(effect) = run.effects.get_mut(*at) {
+      self.make_mapped_one((*at, effect), post, wholes);
+      *at = at.saturating_add(1);
+      if run.effects.get(*at).is_some() && spent() {
+        return ApplyStep::More;
+      }
+    }
+    let mut effects = core::mem::take(&mut run.effects);
+    move_whole_runs(&mut effects, &mut run.read, wholes);
+    let version = self.head().saturating_add(1);
+    let names = core::mem::take(names);
+    run.commit = Some(self.commit_begin(
+      effects,
+      version,
+      crate::named::Post::of(post_state, &run.read, runs),
+      &names,
+    ));
+    ApplyStep::More
   }
 
   /// The effects a chain entry records for `inc`, with every read its commit makes of the head checked
