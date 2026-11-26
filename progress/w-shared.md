@@ -636,3 +636,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - Fleet-wide name routing is OPEN, waiting for Ada.
 - My earlier exit-4 wedges were on an old base, before 1bda9a3c1 and 0b9a3f9e8; green through cargo on the merged base.
 - Next (main's order): the a894 "files no commit names" race, A-921's second mode, A-922, A-918 B, then A-914 (c).
+
+## 2026-11-25: A-927 part 1 landed (slates 25bc5a4d7, commit b42e503dd)
+- A create on a default green this node cannot read says why, naming the green: "not recovered here (<cause kind>)" or "not made here yet; retry". Never the false "holds files no commit names".
+- The red also caught a create landing on a green recorded unrecovered whose engine was still lent; it is now refused.
+- Next: A-927 part 2, an Unjoined adoption reading the join through A-919's read, with the deterministic fleet red (state-log shipping held to the successor-to-be). Then A-921's second mode, A-922, A-918 B and A-914 (c).
