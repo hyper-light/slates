@@ -372,7 +372,7 @@ impl Green {
       }
     };
     if let Judgment::Accepted(held) = &mut judgment {
-      held.read = core::mem::take(&mut inc.named.read.0);
+      held.read = core::mem::take(&mut inc.named.read);
     }
     Some(judgment)
   }

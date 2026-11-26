@@ -64564,6 +64564,27 @@ GAPS.
   `Green::commit_paths_made`, one a distinct path, so each String is made once
   (`a_commits_changed_paths_are_ordered_without_a_tree_each_made_once`). Planted: a merge that never ranks its second
   path fails fourteen oracles (position, copy, branch, fold, node-exclusive and replaced-node).
+  **3n, a work's named texts in one buffer.** Release probe 8 (198 runs at f930fe857, ambient and with 12 burners):
+  the commit's steps were the only ones over 1 ms, 71 of 202 ambient (1,012-1,473 µs) and 92 of 313 with burners,
+  one a run, each at a quantum of 4-10 µs, so each one unit. Debug passes named it:
+  - a Set unit, at a different file each run (the 2,096th, 2,579th, 3,550th), with no arena growing in it;
+  - all of it system time (`getrusage`: 947 of 959 µs, 1,226 of 1,237; one minor fault), so the allocator returning a
+    region to the kernel;
+  - for a file named for its run's object, `set_file` let go the run's own buffer, moved into the file's bytes: 9,000
+    frees of about 1 KiB, one a unit, and the free that emptied the region cost about 1 ms, whichever unit met it.
+    With those buffers kept instead of freed (a probe), the longest commit step was 364-410 µs in 3 of 3 runs.
+
+  A work's named runs are now read into one buffer (`named::Read`): each run takes its place as its first byte is read,
+  after the run before it (a read step finishes the first unread run before it begins the next), and the buffer's room
+  is reserved once at every run's total, its pages made only as bytes are read, so a run a replay leaves unread costs
+  none. A push's runs taken out of its inline bytes go into one buffer too (`push.rs`). A whole file named for its
+  run's object is given no bytes (`move_whole_runs`); any other takes a copy of its run's bytes, which it keeps. A held
+  verdict's copy of the runs is one buffer's copy (`Read::copied`), not a buffer each. Counter:
+  `Green::named_buffers_freed`, the byte buffers commits let go for named files, red at 8 for a work of eight named
+  texts with each given a copy, 0 now (`a_works_named_texts_commit_with_no_buffer_of_their_own_let_go`). The one free
+  left a work, of its one buffer, is measured by `crates/merge/examples/text_frees.rs` (a buffer each against one
+  buffer, every round printed; macOS debug: the longest single free of a buffer each median 8-37 µs, most 168-407 µs;
+  the one buffer's 0-1 µs; release on macOS and Linux is main's to run).
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
