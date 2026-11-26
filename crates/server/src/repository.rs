@@ -1718,7 +1718,23 @@ mod tests {
   }
 
   fn ask(state: &mut ShardState, principal: &Principal, body: RequestBody) -> ReplyBody {
-    crate::test_store::create(state, principal, body)
+    crate::verbs::dispatch(state, 1, principal, body)
+  }
+
+  /// What these tests ask a creation for: git repository `name`, its default `main`, made by [`owner`] from the test's
+  /// thread before the history that uses it (`test_store::create_on`, `audit_on_stored_shard_made`), never on the shard.
+  fn git(name: &str) -> crate::test_store::Asked<'_> {
+    (name, VcsTool::Git, ObjectFormat::Sha1, "main")
+  }
+
+  /// A made repository's root green, as the verbs name it.
+  fn root_of(
+    (_, root): (
+      slates_db::catalog::RepositoryId,
+      slates_db::catalog::VolumeId,
+    ),
+  ) -> VolumeId {
+    crate::verbs::to_wire_volume(root)
   }
 
   fn refusal(reply: ReplyBody) -> Refusal {
@@ -1733,20 +1749,6 @@ mod tests {
       ReplyBody::GreenCreated { id } => id,
       other => panic!("no green: {other:?}"),
     }
-  }
-
-  fn create(state: &mut ShardState, name: &str, default: &str) -> ReplyBody {
-    crate::test_store::create(
-      state,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: name.to_owned(),
-        tool: VcsTool::Git,
-        format: ObjectFormat::Sha1,
-        default_branch: default.to_owned(),
-        green: None,
-      },
-    )
   }
 
   fn branch(
@@ -1871,8 +1873,8 @@ mod tests {
   /// retired name leaves its green, and binding it again restores it; each wrong verb refused by its kind.
   #[test]
   fn branches_share_their_lineage_and_each_wrong_verb_is_refused_by_its_kind() {
-    crate::test_store::audit_on_stored_shard("repository", |state| {
-      let at_one = branches_read_their_versions(state);
+    crate::test_store::audit_on_stored_shard_made((&owner(), git("linux")), |state, made| {
+      let at_one = branches_read_their_versions(state, root_of(made));
       retired_and_bound_again(state, at_one);
       wrong_verbs_refused_by_kind(state);
       assert_eq!(state.greens.busy_lends(), 0);
@@ -1888,7 +1890,11 @@ mod tests {
   /// the name made again as a new, empty repository.
   #[test]
   fn a_destroyed_repository_goes_whole_and_leaves_every_other_untouched() {
-    crate::test_store::audit_on_stored_shard("repository-destroy", |state| {
+    // Each creation made from the test's thread, the made-again one between two looks at the shard.
+    let (store, daemon) = crate::test_store::audit_daemon_stored();
+    let made = [git("doomed"), git("kept")]
+      .map(|asked| crate::test_store::create_on(&daemon, 0, &owner(), asked));
+    let doomed = crate::daemon::observe_first(&daemon, move |state| {
       let destroy = |state: &mut ShardState, principal: &Principal| {
         ask(
           state,
@@ -1898,7 +1904,7 @@ mod tests {
           },
         )
       };
-      let (doomed_greens, kept_greens) = doomed_and_kept(state);
+      let (doomed_greens, kept_greens) = doomed_and_kept(state, made.map(root_of));
       let [doomed_root, doomed_branch, doomed_leaf] = doomed_greens;
       let (doomed, kept) = (repository(state, "doomed"), repository(state, "kept"));
 
@@ -1920,20 +1926,27 @@ mod tests {
         refusal(destroy(state, &owner())),
         Refusal::NotFound
       ));
-      let again = green_of(create(state, "doomed", "main"));
-      assert_eq!(file(state, again), None);
-      assert_ne!(repository(state, "doomed"), doomed);
+      doomed
     });
+    let again = crate::test_store::create_on(&daemon, 0, &owner(), git("doomed"));
+    crate::daemon::observe_first(&daemon, move |state| {
+      assert_eq!(file(state, root_of(again)), None);
+      assert_eq!(repository(state, "doomed"), again.0);
+    });
+    assert_ne!(again.0, doomed);
+    daemon.stop();
+    drop(store);
   }
 
   /// Repositories `doomed` (its root written, a branch of it and a branch of that) and `kept` (its root written and a
-  /// branch), each store held: `doomed`'s three greens and `kept`'s two.
-  fn doomed_and_kept(state: &mut ShardState) -> ([VolumeId; 3], (VolumeId, VolumeId)) {
-    let doomed_root = green_of(create(state, "doomed", "main"));
+  /// branch), made before with these `roots`, each store held: `doomed`'s three greens and `kept`'s two.
+  fn doomed_and_kept(
+    state: &mut ShardState,
+    [doomed_root, kept_root]: [VolumeId; 2],
+  ) -> ([VolumeId; 3], (VolumeId, VolumeId)) {
     assert_eq!(write(state, doomed_root, b"doomed", 1), 1);
     let doomed_branch = green_of(branch(state, ("doomed", "topic", "main"), None));
     let doomed_leaf = green_of(branch(state, ("doomed", "leaf", "topic"), None));
-    let kept_root = green_of(create(state, "kept", "main"));
     assert_eq!(write(state, kept_root, b"kept", 2), 1);
     let kept_branch = green_of(branch(state, ("kept", "topic", "main"), None));
     let (doomed, kept) = (repository(state, "doomed"), repository(state, "kept"));
@@ -1991,10 +2004,13 @@ mod tests {
     assert_eq!(write(state, branch, b"still", 3), 1);
   }
 
-  /// Repository `linux` made, its root written twice while a work holds version 1, and branched at version 1 and at
+  /// Repository `linux`'s `root` written twice while a work holds version 1, and branched at version 1 and at
   /// its head without a walk: each branch reads its version's bytes and the root its head's. The branch at version 1.
-  fn branches_read_their_versions(state: &mut crate::state::ShardState) -> VolumeId {
-    let root = held_root_written_twice(state);
+  fn branches_read_their_versions(
+    state: &mut crate::state::ShardState,
+    root: VolumeId,
+  ) -> VolumeId {
+    let root = held_root_written_twice(state, root);
     let repo = repository(state, "linux");
     let walked = state.greens.lineage_walked(repo);
     let at_one = green_of(branch(state, ("linux", "topic", "main"), Some(1)));
@@ -2013,10 +2029,9 @@ mod tests {
     at_one
   }
 
-  /// Repository `linux` made and its root written once, a work made at version 1 to hold it, and the root written
+  /// Repository `linux`'s `root` written once, a work made at version 1 to hold it, and the root written
   /// again: the root.
-  fn held_root_written_twice(state: &mut crate::state::ShardState) -> VolumeId {
-    let root = green_of(create(state, "linux", "main"));
+  fn held_root_written_twice(state: &mut crate::state::ShardState, root: VolumeId) -> VolumeId {
     assert_eq!(write(state, root, b"one", 1), 1);
     // A work based at version 1 holds it, as any reader does, so the root's checkpoint stays at or below it and a
     // branch can be made there; with no reader the checkpoint follows the head and an older version is refused.
@@ -2061,7 +2076,11 @@ mod tests {
   /// with a NUL, another principal, and a bind of a green outside the lineage.
   fn wrong_verbs_refused_by_kind(state: &mut crate::state::ShardState) {
     assert!(matches!(
-      refusal(create(state, "linux", "main")),
+      refusal(crate::test_store::routed_create(
+        state,
+        (&owner(), 1),
+        git("linux")
+      )),
       Refusal::AlreadyExists { .. }
     ));
     assert_eq!(
@@ -2121,8 +2140,11 @@ mod tests {
   /// adopted green's line, another one.
   #[test]
   fn a_repository_and_every_green_made_for_it_share_one_line() {
-    crate::test_store::audit_on_stored_shard("repository", |state| {
-      let root = green_of(create(state, "linux", "main"));
+    // Each creation made from the test's thread, the adopting one between two looks at the shard.
+    let (store, daemon) = crate::test_store::audit_daemon_stored();
+    let made = crate::test_store::create_on(&daemon, 0, &owner(), git("linux"));
+    let (first, alone) = crate::daemon::observe_first(&daemon, move |state| {
+      let root = root_of(made);
       let topic = green_of(branch(state, ("linux", "topic", "main"), None));
       let other = green_of(branch(state, ("linux", "other", "main"), None));
       let repo = repository(state, "linux");
@@ -2135,25 +2157,22 @@ mod tests {
           base: None,
         },
       ));
-      let adopted = green_of(ask(
-        state,
-        &owner(),
-        RequestBody::CreateRepository {
-          name: "adopter".to_owned(),
-          tool: VcsTool::Git,
-          format: ObjectFormat::Sha1,
-          default_branch: "main".to_owned(),
-          green: Some(alone),
-        },
-      ));
-      assert_eq!(adopted, alone, "the adopted green is the root");
-      let late = green_of(branch(state, ("adopter", "late", "main"), None));
-      let adopter = repository(state, "adopter");
       let first: Vec<[u8; 16]> = [root, topic, other]
         .map(|green| to_db_volume(green).bytes)
         .into_iter()
         .chain([repo.bytes])
         .collect();
+      (first, alone)
+    });
+    let (adopter, adopted) =
+      crate::test_store::create_adopting_on(&daemon, (0, &owner()), git("adopter"), Some(alone));
+    assert_eq!(
+      crate::verbs::to_wire_volume(adopted),
+      alone,
+      "the adopted green is the root"
+    );
+    crate::daemon::observe_first(&daemon, move |state| {
+      let late = green_of(branch(state, ("adopter", "late", "main"), None));
       let second: Vec<[u8; 16]> = [alone, late]
         .map(|green| to_db_volume(green).bytes)
         .into_iter()
@@ -2186,6 +2205,8 @@ mod tests {
         "two repositories' families are told apart"
       );
     });
+    daemon.stop();
+    drop(store);
   }
 
   /// A-603, A-642 (§4.17.1 shared piece 2: each green keeps its own log; the namespace is a log of its own). Do: create a
@@ -2198,8 +2219,8 @@ mod tests {
   /// move no log of the repository; and no verb or lone version is an atomic record.
   #[test]
   fn each_verb_moves_the_names_log_and_each_members_version_its_own_log() {
-    crate::test_store::audit_on_stored_shard("repository", |state| {
-      let root = green_of(create(state, "tree", "main"));
+    crate::test_store::audit_on_stored_shard_made((&owner(), git("tree")), |state, made| {
+      let root = root_of(made);
       let repo = repository(state, "tree");
       let names = |state: &ShardState| {
         state
@@ -2344,8 +2365,8 @@ mod tests {
   /// owed; no unit frees more than one node; once the release is done the lineage holds what the root alone held.
   #[test]
   fn a_destroyed_branch_is_released_a_node_a_unit_and_its_source_is_pinned_until_then() {
-    crate::test_store::audit_on_stored_shard("repository", |state| {
-      let root = green_of(create(state, "kernel", "main"));
+    crate::test_store::audit_on_stored_shard_made((&owner(), git("kernel")), |state, made| {
+      let root = root_of(made);
       write(state, root, b"root bytes", 1);
       let repo = repository(state, "kernel");
       let alone = state.greens.lineage_nodes(repo).expect("its lineage");
@@ -2432,8 +2453,8 @@ mod tests {
   /// none served.
   #[test]
   fn a_recovery_rebuilds_every_member_the_way_it_joined_and_fences_what_its_source_cannot_give() {
-    crate::test_store::audit_on_stored_shard("repository", |state| {
-      let members = members_made_past_a_held_checkpoint(state);
+    crate::test_store::audit_on_stored_shard_made((&owner(), git("tree")), |state, made| {
+      let members = members_made_past_a_held_checkpoint(state, root_of(made));
       assert_rebuilt_as_before(state, members);
       let [root, ..] = members;
       let corrupt = slates_db::op::Op::GreenAdvanced {
@@ -2455,8 +2476,7 @@ mod tests {
 
   /// Repository `tree`'s root branched at version 1 and written, the branch branched and retired, the root written on
   /// and its checkpoint forced: it stays at or below version 1. The root, the branch and the branch's branch.
-  fn members_made_past_a_held_checkpoint(state: &mut ShardState) -> [VolumeId; 3] {
-    let root = green_of(create(state, "tree", "main"));
+  fn members_made_past_a_held_checkpoint(state: &mut ShardState, root: VolumeId) -> [VolumeId; 3] {
     write(state, root, b"v1", 1);
     let topic = green_of(branch(state, ("tree", "topic", "main"), Some(1)));
     write(state, topic, b"topic", 2);
@@ -2512,8 +2532,7 @@ mod tests {
   #[test]
   fn a_repositorys_policy_is_its_owners_to_set_whole_from_the_version_read() {
     use slates_db::catalog::RepositoryPolicy;
-    crate::test_store::audit_on_stored_shard("repository", |state| {
-      green_of(create(state, "linux", "main"));
+    crate::test_store::audit_on_stored_shard_made((&owner(), git("linux")), |state, _| {
       let first = first_policy_held(state);
       assert_eq!(
         refusal(set_linux_policy(
@@ -2686,128 +2705,123 @@ mod tests {
       DatabaseRefusal, HookConfig, HookPointName, HooksEnvSection, HooksEnvVariable,
     };
     // A Subversion repository: a node keeping a store (C2; main's ruling of 2026-11-20).
-    crate::test_store::audit_on_stored_shard("vcs", |state| {
-      let svn = RequestBody::CreateRepository {
-        name: "svn".to_owned(),
-        tool: VcsTool::Subversion,
-        format: ObjectFormat::Sha1,
-        default_branch: "trunk".to_owned(),
-        green: None,
-      };
-      green_of(crate::test_store::create(state, &owner(), svn));
-      let program = std::env::current_exe()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-      let points = [
-        (
-          HookPointName::SvnStartCommit,
-          "start-commit",
-          Held::SvnStartCommit,
-        ),
-        (
-          HookPointName::SvnPostRevpropChange,
-          "post-revprop-change",
-          Held::SvnPostRevpropChange,
-        ),
-        (HookPointName::SvnPreLock, "pre-lock", Held::SvnPreLock),
-        (HookPointName::SvnPostLock, "post-lock", Held::SvnPostLock),
-        (
-          HookPointName::SvnPreUnlock,
-          "pre-unlock",
-          Held::SvnPreUnlock,
-        ),
-        (
-          HookPointName::SvnPostUnlock,
-          "post-unlock",
-          Held::SvnPostUnlock,
-        ),
-      ];
-      let hooks: Vec<HookConfig> = points
-        .iter()
-        .map(|(point, name, _)| HookConfig {
-          point: *point,
-          name: (*name).to_owned(),
-          program: program.clone(),
-        })
-        .collect();
-      let section = |name: &str, variable: &str, value: &[u8]| HooksEnvSection {
-        name: name.to_owned(),
-        variables: vec![HooksEnvVariable {
-          name: variable.to_owned(),
-          value: value.to_vec(),
-        }],
-      };
-      let env = vec![
-        section("default", "LANG", b"en_US.UTF-8"),
-        section("pre-lock", "ONLY", b"pre-lock"),
-      ];
-      let set = |state: &mut ShardState, repository: &str, read: u64, hooks, hooks_env| {
-        ask(
-          state,
-          &owner(),
-          RequestBody::SetRepositoryPolicy {
-            repository: repository.to_owned(),
-            read,
-            rules: Vec::new(),
-            hooks,
-            hooks_env,
-            signers: Vec::new(),
-            hg_publishing: true,
-          },
-        )
-      };
-      let held = |state: &ShardState, name: &str| {
-        state
-          .db
-          .partition()
-          .repositories()
-          .repository_named(name)
-          .map(|record| record.policy.clone())
+    let svn = ("svn", VcsTool::Subversion, ObjectFormat::Sha1, "trunk");
+    crate::test_store::audit_on_stored_shard_made_all(
+      (&owner(), [svn, git("linux")]),
+      |state, _| {
+        let program = std::env::current_exe()
           .unwrap()
-      };
-      assert_eq!(set(state, "svn", 0, hooks, env), ReplyBody::Acknowledged);
-      let first = held(state, "svn");
-      let points_held: Vec<Held> = first.hooks.iter().map(|hook| hook.point).collect();
-      let expected: Vec<Held> = points.iter().map(|(_, _, held)| *held).collect();
-      assert_eq!(points_held, expected);
-      let held_section =
-        |name: &str, variable: &str, value: &[u8]| slates_db::catalog::HooksEnvSection {
+          .to_string_lossy()
+          .into_owned();
+        let points = [
+          (
+            HookPointName::SvnStartCommit,
+            "start-commit",
+            Held::SvnStartCommit,
+          ),
+          (
+            HookPointName::SvnPostRevpropChange,
+            "post-revprop-change",
+            Held::SvnPostRevpropChange,
+          ),
+          (HookPointName::SvnPreLock, "pre-lock", Held::SvnPreLock),
+          (HookPointName::SvnPostLock, "post-lock", Held::SvnPostLock),
+          (
+            HookPointName::SvnPreUnlock,
+            "pre-unlock",
+            Held::SvnPreUnlock,
+          ),
+          (
+            HookPointName::SvnPostUnlock,
+            "post-unlock",
+            Held::SvnPostUnlock,
+          ),
+        ];
+        let hooks: Vec<HookConfig> = points
+          .iter()
+          .map(|(point, name, _)| HookConfig {
+            point: *point,
+            name: (*name).to_owned(),
+            program: program.clone(),
+          })
+          .collect();
+        let section = |name: &str, variable: &str, value: &[u8]| HooksEnvSection {
           name: name.to_owned(),
-          variables: vec![slates_db::catalog::HooksEnvVariable {
+          variables: vec![HooksEnvVariable {
             name: variable.to_owned(),
             value: value.to_vec(),
           }],
         };
-      let given = vec![
-        held_section("default", "LANG", b"en_US.UTF-8"),
-        held_section("pre-lock", "ONLY", b"pre-lock"),
-      ];
-      assert_eq!(first.hooks_env, given);
-      let bad = vec![
-        section("default", "LANG", b"C"),
-        section("pre-lock", "A=B", b"1"),
-      ];
-      assert_eq!(
-        refusal(set(state, "svn", 1, Vec::new(), bad)),
-        Refusal::Database {
-          refusal: DatabaseRefusal::PolicyHooksEnvMalformed { index: 1 }
-        }
-      );
-      green_of(create(state, "linux", "main"));
-      let git_env = vec![section("default", "LANG", b"C")];
-      assert_eq!(
-        refusal(set(state, "linux", 0, Vec::new(), git_env)),
-        Refusal::Database {
-          refusal: DatabaseRefusal::PolicyHooksEnvMalformed { index: 0 }
-        }
-      );
-      assert_eq!(
-        held(state, "svn"),
-        first,
-        "a refused setting changes nothing"
-      );
-    });
+        let env = vec![
+          section("default", "LANG", b"en_US.UTF-8"),
+          section("pre-lock", "ONLY", b"pre-lock"),
+        ];
+        let set = |state: &mut ShardState, repository: &str, read: u64, hooks, hooks_env| {
+          ask(
+            state,
+            &owner(),
+            RequestBody::SetRepositoryPolicy {
+              repository: repository.to_owned(),
+              read,
+              rules: Vec::new(),
+              hooks,
+              hooks_env,
+              signers: Vec::new(),
+              hg_publishing: true,
+            },
+          )
+        };
+        let held = |state: &ShardState, name: &str| {
+          state
+            .db
+            .partition()
+            .repositories()
+            .repository_named(name)
+            .map(|record| record.policy.clone())
+            .unwrap()
+        };
+        assert_eq!(set(state, "svn", 0, hooks, env), ReplyBody::Acknowledged);
+        let first = held(state, "svn");
+        let points_held: Vec<Held> = first.hooks.iter().map(|hook| hook.point).collect();
+        let expected: Vec<Held> = points.iter().map(|(_, _, held)| *held).collect();
+        assert_eq!(points_held, expected);
+        let held_section =
+          |name: &str, variable: &str, value: &[u8]| slates_db::catalog::HooksEnvSection {
+            name: name.to_owned(),
+            variables: vec![slates_db::catalog::HooksEnvVariable {
+              name: variable.to_owned(),
+              value: value.to_vec(),
+            }],
+          };
+        let given = vec![
+          held_section("default", "LANG", b"en_US.UTF-8"),
+          held_section("pre-lock", "ONLY", b"pre-lock"),
+        ];
+        assert_eq!(first.hooks_env, given);
+        let bad = vec![
+          section("default", "LANG", b"C"),
+          section("pre-lock", "A=B", b"1"),
+        ];
+        assert_eq!(
+          refusal(set(state, "svn", 1, Vec::new(), bad)),
+          Refusal::Database {
+            refusal: DatabaseRefusal::PolicyHooksEnvMalformed { index: 1 }
+          }
+        );
+        let git_env = vec![section("default", "LANG", b"C")];
+        assert_eq!(
+          refusal(set(state, "linux", 0, Vec::new(), git_env)),
+          Refusal::Database {
+            refusal: DatabaseRefusal::PolicyHooksEnvMalformed { index: 0 }
+          }
+        );
+        assert_eq!(
+          held(state, "svn"),
+          first,
+          "a refused setting changes nothing"
+        );
+      },
+    );
   }
 
   /// An `ssh-ed25519` public key in SSH wire form, `fill` in every byte of its key.
@@ -2901,37 +2915,40 @@ mod tests {
   fn protections_and_trusted_signers_are_a_git_repositorys_policy() {
     use slates_ipc::protocol::{PolicyNames, PolicyRight};
     // A Mercurial repository among them: a node keeping a store (main's ruling of 2026-11-20).
-    crate::test_store::audit_on_stored_shard("vcs", |state| {
-      green_of(create(state, "linux", "main"));
-      let rules = vec![
-        denying(
-          PolicyNames::Refs,
-          "refs/heads/main",
-          PolicyRight::MergeCommit,
-        ),
-        denying(
-          PolicyNames::Refs,
-          "refs/heads/main",
-          PolicyRight::UnsignedCommit,
-        ),
-      ];
-      let keys = vec![signer_key(1), signer_key(2), signer_key(1)];
-      let set = set_signed(state, ("linux", 0), rules, keys);
-      assert_eq!(set, ReplyBody::Acknowledged);
-      let policy = policy_of(state, "linux");
-      let rights: Vec<_> = policy.rules.iter().map(|rule| rule.right).collect();
-      use slates_db::catalog::PolicyRight as Held;
-      assert_eq!(rights, vec![Held::MergeCommit, Held::UnsignedCommit]);
-      assert_eq!(policy.signers, vec![signer_key(1), signer_key(2)]);
-      let malformed = set_signed(state, ("linux", 1), Vec::new(), vec![b"not a key".to_vec()]);
-      assert!(matches!(refusal(malformed), Refusal::BadRequest { .. }));
-      assert_eq!(
-        policy_of(state, "linux"),
-        policy,
-        "a refused setting changes nothing"
-      );
-      assert_mercurial_refuses_signers_and_protections(state);
-    });
+    let hg = ("hg", VcsTool::Mercurial, ObjectFormat::Sha1, "default");
+    crate::test_store::audit_on_stored_shard_made_all(
+      (&owner(), [git("linux"), hg]),
+      |state, _| {
+        let rules = vec![
+          denying(
+            PolicyNames::Refs,
+            "refs/heads/main",
+            PolicyRight::MergeCommit,
+          ),
+          denying(
+            PolicyNames::Refs,
+            "refs/heads/main",
+            PolicyRight::UnsignedCommit,
+          ),
+        ];
+        let keys = vec![signer_key(1), signer_key(2), signer_key(1)];
+        let set = set_signed(state, ("linux", 0), rules, keys);
+        assert_eq!(set, ReplyBody::Acknowledged);
+        let policy = policy_of(state, "linux");
+        let rights: Vec<_> = policy.rules.iter().map(|rule| rule.right).collect();
+        use slates_db::catalog::PolicyRight as Held;
+        assert_eq!(rights, vec![Held::MergeCommit, Held::UnsignedCommit]);
+        assert_eq!(policy.signers, vec![signer_key(1), signer_key(2)]);
+        let malformed = set_signed(state, ("linux", 1), Vec::new(), vec![b"not a key".to_vec()]);
+        assert!(matches!(refusal(malformed), Refusal::BadRequest { .. }));
+        assert_eq!(
+          policy_of(state, "linux"),
+          policy,
+          "a refused setting changes nothing"
+        );
+        assert_mercurial_refuses_signers_and_protections(state);
+      },
+    );
   }
 
   /// Repository `name`'s policy as its record holds it.
@@ -2943,22 +2960,10 @@ mod tests {
       .unwrap()
   }
 
-  /// A Mercurial repository made, its policy set with a signer and then with a rule denying merge commits: the signer
+  /// Mercurial repository `hg` (made before the history), its policy set with a signer and then with a rule denying merge commits: the signer
   /// refused `BadRequest` and the rule by the database's guard, naming it.
   fn assert_mercurial_refuses_signers_and_protections(state: &mut ShardState) {
     use slates_ipc::protocol::{DatabaseRefusal, PolicyNames, PolicyRight};
-    let created = crate::test_store::create(
-      state,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: "hg".to_owned(),
-        tool: VcsTool::Mercurial,
-        format: ObjectFormat::Sha1,
-        default_branch: "default".to_owned(),
-        green: None,
-      },
-    );
-    assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
     let signed = set_signed(state, ("hg", 0), Vec::new(), vec![signer_key(1)]);
     assert!(matches!(refusal(signed), Refusal::BadRequest { .. }));
     let merges = vec![denying(
@@ -2981,11 +2986,7 @@ mod tests {
   #[test]
   fn a_repositorys_policy_is_read_and_set_by_its_owner_alone() {
     use slates_ipc::protocol::{HookConfig, HookPointName};
-    crate::test_store::audit_on_stored_shard("repository", |state| {
-      assert!(matches!(
-        create(state, "policy", "main"),
-        ReplyBody::GreenCreated { .. }
-      ));
+    crate::test_store::audit_on_stored_shard_made((&owner(), git("policy")), |state, _| {
       let describe = |state: &mut ShardState, principal: &Principal| {
         ask(
           state,
@@ -3110,11 +3111,12 @@ mod tests {
     const LOOKS: usize = 10_000;
     // A git repository's history is kept on the node's changeset store: a store-backed audit daemon.
     let (_store, daemon) = crate::test_store::audit_daemon_stored();
-    let green = crate::daemon::observe_first(&daemon, |state| {
+    let made = crate::test_store::create_on(&daemon, 0, &owner(), git("tree"));
+    let green = crate::daemon::observe_first(&daemon, move |state| {
       // Someone waits: a task ready on this shard, polled only once this closure has returned.
       let waiting = slates_rt::futures::spawn(async {}).unwrap();
       let _ = slates_rt::futures::detach(waiting);
-      let root = green_of(create(state, "tree", "main"));
+      let root = root_of(made);
       let id = to_db_volume(root);
       let floor_before = state.db.partition().green_floor(id);
       write_files(state, root, FILES, 1);
