@@ -14699,6 +14699,14 @@ after the push, 0 handed before and 1 now. The DAV proppatch 500 of that loop wa
 from one fast run killed a slower second `post-revprop-change`. Main's ruling of 2026-11-25: no bound holds a run
 until `vcs_hooks::RUNS_FOR_A_BOUND` (99) runs support the 99th percentile it claims; until then the client's
 connection is the deadline (A-622 part 3, "The bound rests on enough runs").
+`daemon_edge.rs:418` ("the answer ended inside a line (WouldBlock)", in both arms of main's join A/B at load 52 to 99):
+the edge's test clients read at a fixed patience, ten liveness windows a read, and a push's answer has no deadline of
+its own. Main's ruling (a) of 2026-11-25: every client of `vcs_http::daemon_edge`'s connect helpers (`tls_client`,
+`cleartext_client`) reads through `PatientSocket`, which waits a liveness window for a byte, and only then looks at the
+steps of the daemon serving its port (`EDGE_SHARDS`, registered by `daemon_configured`; `slates_rt::registry`'s pulse),
+waits a heartbeat and looks again: stepped, it reads on; not, it gives up typed. Reds:
+`a_patient_read_waits_for_an_answer_while_its_daemon_steps` (a fixed patience of one look gives up where the patient read
+is answered three looks later) and `a_patient_read_gives_up_on_a_daemon_that_makes_no_step` (within a look and a beat).
 
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 
