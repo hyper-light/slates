@@ -494,8 +494,8 @@ pub(crate) fn create_adopting_on(
 pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   Allowed {
     fixture: "test_store::audit_on_stored_shard",
-    owner: "each history's (GAPS: svn 0, git 0, hg 15, other 47)",
-    reaching: 62,
+    owner: "each history's (GAPS: svn 0, git 0, hg 0, other 47)",
+    reaching: 47,
   },
   Allowed {
     fixture: "test_store::create",
@@ -720,32 +720,11 @@ pub(crate) fn audit_on_stored_shard_configured<T: Send + 'static>(
   answer
 }
 
-/// The tests that keep their landed packs resident by name ([`keep_landed_pinned`]), each until the piece that moves it
+/// The tests that keep their landed packs resident by name, each until the piece that moves it
 /// (main's ruling of 2026-11-26: the stored runners let packs go as production does, and a test that cannot yet is
 /// named here with its owner). The list only shrinks: its length is the figure GAPS records ("The landed-pack pins"),
 /// held by a test.
-pub(crate) const LANDED_KEPT_PINNED: &[Pinned] = &[
-  Pinned {
-    test: "repository::hg_push::tests::a_stock_push_lands_on_the_rebuilt_repository_as_7_2_answered_it",
-    owner: "w-hg",
-    until: "hg_push's 15 race histories moved to tasks",
-  },
-  Pinned {
-    test: "repository::hg_push::tests::a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race",
-    owner: "w-hg",
-    until: "hg_push's 15 race histories moved to tasks",
-  },
-  Pinned {
-    test: "repository::hg_push::tests::two_pushes_taken_side_by_side_both_land",
-    owner: "w-hg",
-    until: "hg_push's 15 race histories moved to tasks",
-  },
-  Pinned {
-    test: "repository::hg_push::tests::a_push_is_refused_when_a_green_it_only_checked_moved",
-    owner: "w-hg",
-    until: "hg_push's 15 race histories moved to tasks",
-  },
-];
+pub(crate) const LANDED_KEPT_PINNED: &[Pinned] = &[];
 
 /// A test keeping its landed packs resident by name ([`LANDED_KEPT_PINNED`]): its path, whose it is, and the piece that
 /// unpins it.
@@ -757,16 +736,6 @@ pub(crate) struct Pinned {
   pub(crate) owner: &'static str,
   /// The piece that unpins it.
   pub(crate) until: &'static str,
-}
-
-/// Keeps the landed packs of the shard this runs on resident (`vcs_store::KEEP_LANDED`) for `test`, one of
-/// [`LANDED_KEPT_PINNED`]: refused for a test not in it. Called at the start of the test's history on its shard.
-pub(crate) fn keep_landed_pinned(test: &'static str) {
-  assert!(
-    LANDED_KEPT_PINNED.iter().any(|pinned| pinned.test == test),
-    "{test} keeps its landed packs resident only by name (test_store::LANDED_KEPT_PINNED)"
-  );
-  crate::vcs_store::KEEP_LANDED.with(|keep| keep.set(true));
 }
 
 /// Keeps a push's landed pack resident on `daemon`'s first shard (`vcs_store::KEEP_LANDED`): for a test whose history
