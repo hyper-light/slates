@@ -1511,7 +1511,8 @@
 > - Staging BUILT (2026-11-22, w-hg; main 01a20182's rulings of 07:32 and 12:00): a push lands its segments apart from
 >   its repository's landing turn, at sequences its owner shard allocates (serialized with no lock), other landings
 >   between them; its entry names them as ranges (record v11, `record::write_push_runs_reference`, at most one range a
->   segment; golden `a_pushs_runs_reference_is_the_golden_bytes_and_reads_back_as_its_ranges`), and the turn is taken
+>   segment; golden `a_pushs_runs_reference_is_the_golden_bytes_and_reads_back_as_its_ranges`; since ruling R piece
+>   (i), 2026-11-26, A-929, withdrawn for record v12, one homed segment list, v11 no longer read), and the turn is taken
 >   for the entry's commit alone. A fork another landing made stale is re-based by node (`hg_push::rebase`) before its
 >   works are planned, off the turn; stale again once the turn is taken, re-based holding it, the turn held to the end,
 >   so at most one re-base off it and one in it (counted `vcs.hg.push_rebased`, `..._rebased_in_turn`). The live
@@ -2022,8 +2023,13 @@
 > source replica a test rebuilt from the owner's shipped records refused `merge.recompute_mismatch` (hg's named files).
 > A real holder meets it too: hg's texts are not homed for the region and its changeset segments are not replicated.
 > Main's ruling R (2026-11-26 ~09:55) homes the changeset through git's homing path and the A-727 barrier, the
-> record naming one homed segment list; w-hg's piece, with svn's holder red and an `#[ignore]`d fleet-takeover CLI test
-> for Mercurial, which no test drives yet.
+> record naming one homed segment list. Piece (i) BUILT (2026-11-26, w-hg; A-929's ruling R): each push segment's
+> `Record` and `Payload` homed at `f + 1` before it lands and let go at its home once landed, the entry naming one
+> homed list (record v12, v11 withdrawn), a homing short refusing the push with nothing recorded
+> (`a_push_whose_changeset_is_not_durable_at_its_homes_is_refused_and_records_nothing`). OPEN: (ii) a holder fetching
+> the segments by identity and its recompute accepted with the owner's identity, with svn's holder red and an
+> `#[ignore]`d fleet-takeover CLI test for Mercurial, which no test drives yet; then an import's run (v9) and a single
+> changeset (v7) homed the same way.
 > Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
 > restart, `Unheld { 00manifest, rev }` (r915, Mercurial's own 57k history, rev 4222; here its first 5,000, rev 4281),
 > so the edge answered 503. The row named the empty window (a manifest whose text is its parent's, kept as an empty

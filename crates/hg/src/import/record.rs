@@ -113,17 +113,20 @@ const PUSH_SEGMENT_VERSION: u32 = 10;
 /// Format: its number, 9.
 const RUN_VERSION: u32 = 9;
 
-/// Format: the version of a push's record in the repository's register once its segments are on the changeset log at
-/// sequences other landings may lie between (main 01a20182's rulings of 2026-11-22 07:32 and 12:00: a push lands its
-/// segments apart from its repository's landing turn, which it takes only for its entry's commit): the head, a push's
-/// source, then the count of ranges and each range's first and last sequence, ascending and apart
-/// ([`write_push_runs_reference`], [`run_of`]). Bound: at most one range a segment, so never past the push's segments.
-/// Format: its number, 11.
-const RUNS_VERSION: u32 = 11;
+/// Format: the version of a push's record in the repository's register once its segments are on the changeset log and
+/// homed in the region (main 01a20182's ruling R of 2026-11-26, with its corrections: the changeset homed, never each
+/// named text; the record O(1), naming one homed object, as A-722's v4 keeps git's O(moves)): the head, a push's source,
+/// then its segment list's identity (the plain BLAKE3 of its bytes, [`write_segment_list`]), its length, and the
+/// sequence of the changeset the list landed as ([`write_homed_run_reference`], [`homed_run_of`]). The list names each
+/// segment's sequence and its `Record` and `Payload` by identity and length, so a node that has not landed them fetches
+/// them from their region homes by identity. It replaces version 11 outright (each range of a push's segment sequences
+/// written into the register), which is no longer read (CLAUDE.md §2 item 7), as version 3 was not after 4.
+/// Format: its number, 12.
+const HOMED_RUNS_VERSION: u32 = 12;
 
 /// An import's or a push's run of segment changesets on the changeset log, as its register record names it: the
-/// sequences of its segments, as ranges ascending and apart, one for an import's ([`RUN_VERSION`]), as many as other
-/// landings cut it into for a push's ([`RUNS_VERSION`]).
+/// sequences of its segments, one range for an import's ([`RUN_VERSION`]); a push's names its segments by a homed list
+/// ([`HomedRun`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Run {
   /// Whose run it is: an import's or a push's.
@@ -163,23 +166,147 @@ pub fn write_run_reference(room: u64, (first, last): (u64, u64)) -> Vec<u8> {
   out
 }
 
-/// The register's record of a push landed as the segment changesets at `ranges`' sequences ([`RUNS_VERSION`]); none for
-/// no range, or ranges not ascending and apart. A made changeset lands as one changeset ([`write_made_reference`]).
-pub fn write_push_runs_reference(room: u64, ranges: &[(u64, u64)]) -> Option<Vec<u8>> {
-  if !apart(ranges) {
+/// A push's run of segment changesets as its register record names it ([`HOMED_RUNS_VERSION`]): the room its intake ran
+/// within, and its segment list ([`write_segment_list`]) by identity and length, landed as changeset `sequence`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HomedRun {
+  /// The room the push's intake ran within.
+  pub room: u64,
+  /// The segment list's identity: the plain BLAKE3 of its bytes.
+  pub list: [u8; 32],
+  /// Its length.
+  pub len: u64,
+  /// The sequence of the changeset it landed as: the run's last.
+  pub sequence: u64,
+}
+
+/// The register's record of a push landed as the segment changesets its segment list names, the list `list` (its
+/// identity and length) landed as changeset `sequence` ([`HOMED_RUNS_VERSION`]).
+pub fn write_homed_run_reference(
+  room: u64,
+  (list, len): ([u8; 32], u64),
+  sequence: u64,
+) -> Vec<u8> {
+  let mut out = Vec::new();
+  out.extend_from_slice(&MAGIC.to_le_bytes());
+  out.extend_from_slice(&HOMED_RUNS_VERSION.to_le_bytes());
+  out.push(Source::Push.byte());
+  out.extend_from_slice(&room.to_le_bytes());
+  out.extend_from_slice(&list);
+  out.extend_from_slice(&len.to_le_bytes());
+  out.extend_from_slice(&sequence.to_le_bytes());
+  out
+}
+
+/// The homed run a register record names, where it is a push's [`HOMED_RUNS_VERSION`] reference read whole; `None` for
+/// any other record.
+pub fn homed_run_of(bytes: &[u8]) -> Option<HomedRun> {
+  let mut reader = Reader { rest: bytes };
+  let (version, source, room) = head(&mut reader).ok()?;
+  if version != HOMED_RUNS_VERSION || source != Source::Push {
+    return None;
+  }
+  let list = <[u8; 32]>::try_from(reader.take(slates_vcs::content::IDENTITY_BYTES).ok()?).ok()?;
+  let len = reader.long().ok()?;
+  let sequence = reader.long().ok()?;
+  reader.rest.is_empty().then_some(HomedRun {
+    room: room.left(),
+    list,
+    len,
+    sequence,
+  })
+}
+
+/// Format: a segment list's magic, "SHGL" (a slates Mercurial list) little-endian ([`write_segment_list`]).
+const LIST_MAGIC: u32 = u32::from_le_bytes(*b"SHGL");
+/// Format: the segment list's version.
+const LIST_VERSION: u32 = 1;
+/// Format: one segment's entry in a segment list: its sequence, then its `Record`'s identity and length, then its
+/// `Payload`'s, each long little-endian.
+const SEGMENT_ENTRY_BYTES: usize = LONG_BYTES
+  + slates_vcs::content::IDENTITY_BYTES
+  + LONG_BYTES
+  + slates_vcs::content::IDENTITY_BYTES
+  + LONG_BYTES;
+
+/// One segment changeset of a push's run as its segment list names it ([`write_segment_list`]): its sequence, and its
+/// `Record` and `Payload` sections each by identity (the plain BLAKE3 of its bytes, the key the node's store and the
+/// region's homes keep it under) and length. Its `Texts` is named by neither: it is derived, as a node lands the segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentEntry {
+  /// The changeset's sequence in its repository.
+  pub sequence: u64,
+  /// Its `Record`'s identity and length.
+  pub record: ([u8; 32], u64),
+  /// Its `Payload`'s identity and length.
+  pub payload: ([u8; 32], u64),
+}
+
+/// A push's segment list (ruling R: one homed object naming its segments, so the register's record stays O(1)): the
+/// magic, the version, the count, then each [`SegmentEntry`] in sequence order. None for no segment, or sequences not
+/// ascending and apart.
+pub fn write_segment_list(entries: &[SegmentEntry]) -> Option<Vec<u8>> {
+  let ascending = entries
+    .windows(2)
+    .all(|pair| matches!(pair, [before, after] if after.sequence > before.sequence));
+  if entries.is_empty() || !ascending {
     return None;
   }
   let mut out = Vec::new();
-  out.extend_from_slice(&MAGIC.to_le_bytes());
-  out.extend_from_slice(&RUNS_VERSION.to_le_bytes());
-  out.push(Source::Push.byte());
-  out.extend_from_slice(&room.to_le_bytes());
-  out.extend_from_slice(&to_u64(ranges.len()).to_le_bytes());
-  for (first, last) in ranges {
-    out.extend_from_slice(&first.to_le_bytes());
-    out.extend_from_slice(&last.to_le_bytes());
+  out
+    .try_reserve_exact(
+      WORD_BYTES
+        .saturating_mul(2)
+        .saturating_add(LONG_BYTES)
+        .saturating_add(entries.len().saturating_mul(SEGMENT_ENTRY_BYTES)),
+    )
+    .ok()?;
+  out.extend_from_slice(&LIST_MAGIC.to_le_bytes());
+  out.extend_from_slice(&LIST_VERSION.to_le_bytes());
+  out.extend_from_slice(&to_u64(entries.len()).to_le_bytes());
+  for entry in entries {
+    out.extend_from_slice(&entry.sequence.to_le_bytes());
+    out.extend_from_slice(&entry.record.0);
+    out.extend_from_slice(&entry.record.1.to_le_bytes());
+    out.extend_from_slice(&entry.payload.0);
+    out.extend_from_slice(&entry.payload.1.to_le_bytes());
   }
   Some(out)
+}
+
+/// A segment list read back ([`write_segment_list`]): its entries; none for another magic or version, a count the bytes
+/// cannot hold (checked before anything is allocated), bytes left over, or sequences not ascending and apart.
+pub fn segment_list_of(bytes: &[u8]) -> Option<Vec<SegmentEntry>> {
+  let mut reader = Reader { rest: bytes };
+  if reader.word().ok()? != LIST_MAGIC || reader.word().ok()? != LIST_VERSION {
+    return None;
+  }
+  let count = usize::try_from(reader.long().ok()?).ok()?;
+  if count == 0 || count.checked_mul(SEGMENT_ENTRY_BYTES)? != reader.rest.len() {
+    return None;
+  }
+  let mut entries = Vec::new();
+  entries.try_reserve_exact(count).ok()?;
+  let identity = |reader: &mut Reader<'_>| {
+    <[u8; 32]>::try_from(reader.take(slates_vcs::content::IDENTITY_BYTES).ok()?).ok()
+  };
+  for _ in 0..count {
+    let sequence = reader.long().ok()?;
+    let record = (identity(&mut reader)?, reader.long().ok()?);
+    let payload = (identity(&mut reader)?, reader.long().ok()?);
+    if entries
+      .last()
+      .is_some_and(|before: &SegmentEntry| before.sequence >= sequence)
+    {
+      return None;
+    }
+    entries.push(SegmentEntry {
+      sequence,
+      record,
+      payload,
+    });
+  }
+  Some(entries)
 }
 
 /// Whether `ranges` are one at least, each first no later than its last, and each past the one before.
@@ -192,26 +319,15 @@ fn apart(ranges: &[(u64, u64)]) -> bool {
     })
 }
 
-/// The run a register record names, where it is an import's run reference ([`RUN_VERSION`]) or a push's
-/// ([`RUNS_VERSION`]); `None` for any other record (a push's [`RUN_VERSION`] among them: no push writes one), ranges
-/// not ascending and apart, and a reference that does not read whole.
+/// The run a register record names, where it is an import's run reference ([`RUN_VERSION`]); `None` for any other record
+/// (a push's [`RUN_VERSION`] among them: no push writes one; a push's run is a [`HomedRun`]), ranges not ascending and
+/// apart, and a reference that does not read whole.
 pub fn run_of(bytes: &[u8]) -> Option<Run> {
   let mut reader = Reader { rest: bytes };
   let (version, source, room) = head(&mut reader).ok()?;
   let ranges = match (version, source) {
     (RUN_VERSION, Source::Import) => {
       vec![(reader.long().ok()?, reader.long().ok()?)]
-    }
-    (RUNS_VERSION, Source::Push) => {
-      let count = usize::try_from(reader.long().ok()?).ok()?;
-      if count.checked_mul(LONG_BYTES.saturating_mul(2))? != reader.rest.len() {
-        return None;
-      }
-      let mut ranges = Vec::with_capacity(count);
-      for _ in 0..count {
-        ranges.push((reader.long().ok()?, reader.long().ok()?));
-      }
-      ranges
     }
     _ => return None,
   };
@@ -2731,7 +2847,7 @@ fn head(reader: &mut Reader<'_>) -> Result<(u32, Source, Admission), Refused> {
     SEGMENT_VERSION,
     RUN_VERSION,
     PUSH_SEGMENT_VERSION,
-    RUNS_VERSION,
+    HOMED_RUNS_VERSION,
   ]
   .contains(&version)
   {
