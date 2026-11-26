@@ -74,6 +74,10 @@ pub(crate) struct Ended {
   /// Its standard output where its point reads it, kept to the run's cap: `pre-lock`'s, the lock's token (A-648). `None`
   /// at every other point, whose standard output is part of its words or goes to the null device.
   pub(crate) standard_output: Option<Words>,
+  /// When the spawner answered the hook's exit, on the shard's clock (`futures::now_ns`): none for a run that ended
+  /// before it exited. What a run's end after its hook's exit is measured from: a words stream held past the exit by a
+  /// process the hook never started shows as that wait (main 01a20182's 8a loop of 2026-11-25).
+  pub(crate) exited_at_ns: Option<u64>,
 }
 
 /// Runs one hook to its outcome on this shard (the module doc), held to `bound_ns` (its hook's learned bound, none
@@ -92,6 +96,7 @@ pub(crate) async fn run(
         outcome: HookRun::unstartable(cause),
         lesson,
         standard_output: None,
+        exited_at_ns: None,
       };
     }
   };
@@ -99,6 +104,7 @@ pub(crate) async fn run(
   let mut client_gone = pin!(client_gone);
   // Once the client's future has answered it is never polled again (a finished future must not be).
   let mut client_left = false;
+  let mut exited_at_ns = None;
   loop {
     match step {
       Step::Done {
@@ -115,6 +121,7 @@ pub(crate) async fn run(
           outcome,
           lesson,
           standard_output: hook.standard_output.take(),
+          exited_at_ns,
         };
       }
       Step::Kill => {
@@ -131,18 +138,22 @@ pub(crate) async fn run(
             outcome: HookRun::unstartable(StartRefused::SpawnerGone),
             lesson,
             standard_output: None,
+            exited_at_ns,
           };
         }
         step = match &happened {
           Happened::Output(bytes) => run.on(Event::Output(bytes), &mut lesson),
           Happened::OutputEnded => run.on(Event::OutputEnded, &mut lesson),
-          Happened::Exited { status, at_ns } => run.on(
-            Event::Exited {
-              status: *status,
-              at_ns: *at_ns,
-            },
-            &mut lesson,
-          ),
+          Happened::Exited { status, at_ns } => {
+            exited_at_ns = Some(*at_ns);
+            run.on(
+              Event::Exited {
+                status: *status,
+                at_ns: *at_ns,
+              },
+              &mut lesson,
+            )
+          }
           Happened::Timer { now_ns } => run.on(Event::Timer { now_ns: *now_ns }, &mut lesson),
           Happened::ClientLeft => run.on(Event::ClientLeft, &mut lesson),
           Happened::SpawnerGone => Step::Wait { wake_at_ns: None },
@@ -812,8 +823,9 @@ mod tests {
   /// What a run answered: its outcome and lesson, and how long it took; `None` past the test's bound.
   type Ran = Option<(Outcome, Lesson, u64)>;
 
-  /// What a run answered whole, and how long it took; `None` past the test's bound.
-  type RanWhole = Option<(Ended, u64)>;
+  /// What a run answered whole, how long it took, and how long after its hook's exit was answered it ended (none for a
+  /// run whose hook never exited on its own); `None` past the test's bound.
+  type RanWhole = Option<(Ended, u64, Option<u64>)>;
 
   /// Runs `hook` (by `program`, `/` standing for the test binary) to its outcome, held to `bound_ns`, its client
   /// leaving after `leaves_after_ns` when given.
@@ -824,7 +836,7 @@ mod tests {
     leaves_after_ns: Option<u64>,
   ) -> Ran {
     drive_whole(program, hook, bound_ns, leaves_after_ns)
-      .map(|(ended, took)| (ended.outcome, ended.lesson, took))
+      .map(|(ended, took, _)| (ended.outcome, ended.lesson, took))
   }
 
   /// [`drive`], answering the run whole.
@@ -857,8 +869,12 @@ mod tests {
         };
         let began = slates_rt::futures::now_ns();
         let ran = slates_rt::futures::within(TEST_BOUND_NS, run(launch, bound_ns, client)).await;
-        let took = slates_rt::futures::now_ns().saturating_sub(began);
-        let _ = sent.send(ran.ok().flatten().map(|ended| (ended, took)));
+        let ended_ns = slates_rt::futures::now_ns();
+        let took = ended_ns.saturating_sub(began);
+        let _ = sent.send(ran.ok().flatten().map(|ended| {
+          let after_exit = ended.exited_at_ns.map(|at| ended_ns.saturating_sub(at));
+          (ended, took, after_exit)
+        }));
       })
       .expect("the run's task");
     runtime.run_until_idle();
@@ -1055,7 +1071,7 @@ mod tests {
   fn a_pre_lock_hooks_standard_output_comes_back_as_its_token() {
     let token = format!("{TAG}opaquelocktoken:from-the-hook");
     let hook = input(HookPoint::SvnPreLock, "token", &[], Vec::new());
-    let (ended, _) = drive_whole(None, hook, None, None).expect("the run ended");
+    let (ended, _, _) = drive_whole(None, hook, None, None).expect("the run ended");
     assert!(
       matches!(ended.outcome, Outcome::Accepted { .. }),
       "{:?}",
@@ -1070,7 +1086,7 @@ mod tests {
       "{words}"
     );
     let other = input(HookPoint::SvnPreCommit, "token", &[], Vec::new());
-    let (ended, _) = drive_whole(None, other, None, None).expect("the run ended");
+    let (ended, _, _) = drive_whole(None, other, None, None).expect("the run ended");
     assert_eq!(ended.standard_output, None);
   }
 
@@ -1151,17 +1167,21 @@ mod tests {
   /// Shape: how long a sleeping hook's client stays before it leaves (and its hook is killed with its group): what a
   /// refusing hook whose words stream leaked into it would wait for.
   const HOLDER_NS: u64 = 4 * LIVENESS_BUDGET_NS;
-  /// Shape: how long a refusing hook's run may take, spawn and words and exit: half a holder's life, so a run a leaked
-  /// stream held until its holder was killed is never inside it.
-  const QUICK_RUN_NS: u64 = HOLDER_NS / 2;
+  /// Derived: how long a refusing hook's run may go on after the spawner answered its hook's exit. A run its words
+  /// stream does not hold ends at that answer, after reading what is left in the stream, within a step of its shard, and
+  /// a shard that goes a liveness window without a step is judged stuck: so one window. A run a leaked stream held waits
+  /// out its holder's life after the exit ([`HOLDER_NS`], four windows). The run's whole length is not judged: it holds
+  /// two starts of this debug test binary (the spawner's and the hook's), which a loaded machine stretches past seconds
+  /// (main 01a20182's 8a loop of 2026-11-25: 3.26, 3.50 and 5.92 s, against a 2 s bound for the whole run).
+  const AFTER_EXIT_NS: u64 = LIVENESS_BUDGET_NS;
 
   /// main 01a20182's ruling of 2026-11-22 02:06 (the hook pipe race, (a)): a pipe made while another thread spawned leaked
   /// into that child (macOS has no `pipe2`), so a refusing hook's words stream stayed open past its exit, held by a
   /// stranger, and its first run, with no learned bound, waited until its client's read gave up. Do: [`ROUNDS`] times,
   /// spawn [`AT_ONCE`] hooks at once, each from a thread of its own, half refusing at once and half sleeping until their
   /// client leaves after [`HOLDER_NS`]. Expect: every refusing hook refused with its words, its run ended at its own exit
-  /// (within [`QUICK_RUN_NS`]), never held by a sleeping hook that inherited its words stream. Before, the driver spawned
-  /// through `std::process::Command`, which hands a child every descriptor not yet marked close-on-exec.
+  /// (within [`AFTER_EXIT_NS`] of it), never held by a sleeping hook that inherited its words stream. Before, the driver
+  /// spawned through `std::process::Command`, which hands a child every descriptor not yet marked close-on-exec.
   #[test]
   fn hooks_spawned_at_once_each_end_at_their_own_exit() {
     for _round in 0..ROUNDS {
@@ -1174,7 +1194,7 @@ mod tests {
             } else {
               ("sleep", Some(HOLDER_NS))
             };
-            let ran = drive(
+            let ran = drive_whole(
               None,
               input(HookPoint::SvnPreCommit, role, &[], Vec::new()),
               None,
@@ -1189,10 +1209,13 @@ mod tests {
         if !refusing {
           continue;
         }
-        let (outcome, _, took) = ran.expect("the refusing run ended");
+        let (ended, took, after_exit) = ran.expect("the refusing run ended");
         assert!(
-          text(&outcome).contains("refused by the hook") && took < QUICK_RUN_NS,
-          "a refusing hook's run took {took} ns (a sleeping hook holds its words for {HOLDER_NS} ns): {outcome:?}"
+          text(&ended.outcome).contains("refused by the hook")
+            && after_exit.is_some_and(|after| after < AFTER_EXIT_NS),
+          "a refusing hook's run ended {after_exit:?} ns after its exit, {took} ns in all (a sleeping hook holds its \
+           words for {HOLDER_NS} ns): {:?}",
+          ended.outcome
         );
       }
     }
@@ -1203,9 +1226,9 @@ mod tests {
   /// close-on-exec, and the hook's first run, with no deadline, waited until its client gave up). Do: run a refusing
   /// hook, with no learned bound and a client that never leaves, its words stream also held by a plain
   /// `std::process::Command` child that outlives it ([`super::HOLD_WORDS_ABROAD`], four liveness windows). Expect: the run
-  /// ended at the hook's own exit (within [`QUICK_RUN_NS`]), refused with every word the hook wrote. Failing first: the
-  /// run waited for the holder's end, four liveness windows. Only on macOS, where a pipe is made in two calls: elsewhere
-  /// no foreign spawn inherits one, and a holder past the exit is the hook's own, waited for.
+  /// ended at the hook's own exit (within [`AFTER_EXIT_NS`] of it), refused with every word the hook wrote. Failing
+  /// first: the run waited for the holder's end, four liveness windows. Only on macOS, where a pipe is made in two calls:
+  /// elsewhere no foreign spawn inherits one, and a holder past the exit is the hook's own, waited for.
   #[cfg(target_os = "macos")]
   #[test]
   fn a_hooks_run_ends_at_its_exit_whatever_another_spawner_holds() {
@@ -1214,10 +1237,13 @@ mod tests {
       super::HOLD_WORDS_ABROAD.to_owned(),
       EnvValue::Bytes(b"1".to_vec()),
     ));
-    let (outcome, _, took) = drive(None, hook, None, None).expect("the run ended");
+    let (ended, took, after_exit) = drive_whole(None, hook, None, None).expect("the run ended");
     assert!(
-      text(&outcome).contains("refused by the hook") && took < QUICK_RUN_NS,
-      "the run took {took} ns, its words held for {HOLDER_NS} ns by another spawner's child: {outcome:?}"
+      text(&ended.outcome).contains("refused by the hook")
+        && after_exit.is_some_and(|after| after < AFTER_EXIT_NS),
+      "the run ended {after_exit:?} ns after its exit, {took} ns in all, its words held for {HOLDER_NS} ns by another \
+       spawner's child: {:?}",
+      ended.outcome
     );
   }
 
