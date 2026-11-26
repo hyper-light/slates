@@ -3065,6 +3065,74 @@ fn a_dav_proppatch_of_a_revision_changes_its_property_through_its_revprop_hooks(
   );
 }
 
+/// Main 01a20182's ruling of 2026-11-25 on A-622 (its 8a loop: a `post-revprop-change` whose first run was a few
+/// milliseconds taught a bound of about a liveness window, and its next run under load was killed past it, the PROPPATCH
+/// answered 500 "did not exit cleanly ... exitcode was 9"). Do: through a repository whose `post-revprop-change` records
+/// its input, fast the first time and sleeping [`SLOWER_SECOND_RUN_NS`] the second, PROPPATCH `!svn/rev/1`'s `svn:log`
+/// twice. Expect: both `207`, the second run's input recorded: a bound learned from one run holds no run, so the slower
+/// run ends by its own exit inside its client's patience. Red before: the second answered `500`, its hook killed.
+#[cfg(unix)]
+#[test]
+fn a_revprop_hook_slower_than_its_one_fast_run_is_not_killed() {
+  use slates_ipc::protocol::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let at = dir.path.display().to_string();
+  let seconds = SLOWER_SECOND_RUN_NS.div_ceil(1_000_000_000);
+  let post = crate::vcs_svn::tests::hook_script(
+    &dir.path,
+    "post-revprop-change",
+    &format!(
+      // A run with no arguments is `hook_script`'s own, in place, before any revision's: no run of the hook's.
+      "[ -n \"$1\" ] || exit 0\nif [ -e {at}/post.ran ]; then sleep {seconds}; fi\ntouch {at}/post.ran\n\
+       cat > {at}/post.in"
+    ),
+  );
+  let pre = crate::vcs_svn::tests::hook_script(&dir.path, "pre-revprop-change", "cat > /dev/null");
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge serves");
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let name = svn_name_on_the_repositorys_partition();
+  create_svn_hooked(
+    &daemon,
+    &name,
+    vec![
+      (HookPointName::SvnPreRevpropChange, pre),
+      (HookPointName::SvnPostRevpropChange, post),
+    ],
+  );
+  let (_, _, merged, _) = dav_commit((port, &certificate), &name, b"hello\n");
+  let revision = format!("/{name}/!svn/rev/1");
+  let patch = |body: Vec<u8>| {
+    dav(
+      (port, &certificate),
+      ("PROPPATCH", &revision),
+      &["Content-Type: text/xml"],
+      &body,
+    )
+  };
+  let first = patch(log_proppatch("an edit", None));
+  let second = patch(log_proppatch("a second edit", Some("an edit")));
+  daemon.stop();
+  #[allow(clippy::disallowed_methods)]
+  // test code: what the hook recorded in its own scratch directory
+  let recorded = std::fs::read_to_string(dir.path.join("post.in")).unwrap_or_default();
+  assert_eq!(
+    (merged, first.0, second.0),
+    (200, 207, 207),
+    "first: {}\nsecond: {}",
+    first.2,
+    second.2
+  );
+  assert_eq!(recorded, "an edit", "the second run's input, the old value");
+}
+
+/// Shape: how long [`a_revprop_hook_slower_than_its_one_fast_run_is_not_killed`]'s hook sleeps on its second run: past
+/// the bound one fast run would teach (its tail of a few milliseconds and a liveness window), two windows, and inside
+/// its client's patience ([`PATIENCE_NS`], ten).
+#[cfg(unix)]
+const SLOWER_SECOND_RUN_NS: u64 = 2 * crate::daemon::LIVENESS_BUDGET_NS;
+
 /// A-733 (`mod_dav_svn`'s LOCK runs pre-lock through `svn_repos_fs_lock`, its refusal "Failed to create new lock." with
 /// the hook's error, `lock.c`). Do: commit a file over DAV, then LOCK it as stock svn does, through a repository whose
 /// policy runs a pre-lock hook that writes to standard error and exits 1. Expect: the LOCK refused, its error in

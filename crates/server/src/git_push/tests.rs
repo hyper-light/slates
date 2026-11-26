@@ -1215,7 +1215,11 @@ fn derive_driven(state: &mut ShardState) -> [u64; 4] {
 
 /// A fetch's derivation of [`tagged_line_request`]'s repository `name` on `daemon`, the push made `behind` as the edge
 /// makes it (a task of the shard, so a derivation begins behind it as it ends) or not (in a step, so none does): the
-/// fetch's read turns, the hand-overs, and its own time.
+/// fetch's read turns, the hand-overs, and its own time, timed on its shard. Behind a push, the read arrives
+/// mid-derivation by the shard's own state ([`read_on_the_shard`]), never by how soon the test's thread runs after the
+/// push: main 01a20182's 8a loop of 2026-11-25 found the task behind done before the thread's read arrived (0 turns,
+/// 0 handed). Red: with the test's thread held 3 s after the push, the thread's read arrived after it the same way
+/// (0 turns, 0 handed); the read waiting on the shard was handed the derivation held or not (1 handed).
 fn fetch_after_tagged_push(
   daemon: &crate::Daemon,
   name: &'static str,
@@ -1223,19 +1227,77 @@ fn fetch_after_tagged_push(
 ) -> (u64, u64, u64) {
   let repository = crate::daemon::observe_first(daemon, move |state| git_repository(state, name));
   let request = tagged_line_request();
-  if behind {
+  let before = crate::daemon::observe_first(daemon, derive_driven);
+  let read = if behind {
+    let pushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let read = read_on_the_shard(daemon, repository, Some(std::sync::Arc::clone(&pushed)));
     let (created, _) = pushed_in_steps(daemon, repository, &request).unwrap();
+    pushed.store(true, std::sync::atomic::Ordering::Release);
     assert!(reasons(&created).iter().all(|reason| reason == b"ok"));
+    read
   } else {
     let said = crate::daemon::observe_first(daemon, move |state| {
       reasons(&pushed(state, repository, &request))
     });
     assert!(said.iter().all(|reason| reason == b"ok"));
-  }
-  let before = crate::daemon::observe_first(daemon, derive_driven);
-  let (took_ns, _, _) = derived_for_read(daemon, repository);
+    read_on_the_shard(daemon, repository, None)
+  };
+  let took_ns = read
+    .recv()
+    .expect("the read answered")
+    .unwrap_or_else(|missed| panic!("{missed}"));
   let after = crate::daemon::observe_first(daemon, derive_driven);
   (after[0] - before[0], after[2] - before[2], took_ns)
+}
+
+/// A fetch's read of `repository` ([`git_derive::derive_for_read`]) as a task of the shard, timed there from its start to
+/// its end. Given `pushed` (set once the push behind which the read must arrive has answered), it waits first, a step
+/// quantum at a time, until the derivation behind that push has kept a turn under way while its task still runs, and
+/// begins in that same poll, so the task behind cannot finish between the look and the read. Refused where the task
+/// behind ended before a look found its derivation under way, or where none began behind a push that answered.
+///
+/// [`git_derive::derive_for_read`]: crate::vcs_store::git_derive::derive_for_read
+fn read_on_the_shard(
+  daemon: &crate::Daemon,
+  repository: RepositoryId,
+  pushed: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> std::sync::mpsc::Receiver<Result<u64, String>> {
+  use crate::vcs_store::git_derive::{BEHIND, behind_and_under_way, derive_for_read};
+  let (done, read) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(daemon, move |state| {
+    let begun_before = state.refusals.get(BEHIND).copied().unwrap_or(0);
+    let quantum_ns = state.config.step_quantum_ns();
+    let task = slates_rt::futures::spawn(async move {
+      while let Some(pushed) = pushed.as_ref() {
+        let look = crate::state::with_state_counted(|state| {
+          let begun = state.refusals.get(BEHIND).copied().unwrap_or(0) > begun_before;
+          (begun, behind_and_under_way(state, repository))
+        });
+        match look {
+          Some((true, (true, true))) => break,
+          Some((true, (false, _))) => {
+            let _ = done.send(Err(
+              "the derivation behind the push ended before a look found it under way".to_owned(),
+            ));
+            return;
+          }
+          Some((false, _)) if pushed.load(std::sync::atomic::Ordering::Acquire) => {
+            let _ = done.send(Err("no derivation began behind the push".to_owned()));
+            return;
+          }
+          _ => {
+            let _ = slates_rt::futures::sleep(quantum_ns).await;
+          }
+        }
+      }
+      let began = slates_rt::futures::now_ns();
+      derive_for_read(repository).await;
+      let _ = done.send(Ok(slates_rt::futures::now_ns().saturating_sub(began)));
+    })
+    .expect("the read's task");
+    slates_rt::futures::detach(task).expect("the read's task detached");
+  });
+  read
 }
 
 /// Main 01a20182's ruling of 2026-11-25 (derive_behind withdrawn: a clone arriving mid-derivation ran it in slivers, the

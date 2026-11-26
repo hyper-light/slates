@@ -1966,6 +1966,23 @@
 > other recursion in `slates-hg` or `slates-store` follows the data's depth (`render::next_log` recurses at most twice);
 > elsewhere git's `reach` recurses by its index's levels, svn's `children` by its tree's height, vcs's merge sort to lg k,
 > and svn's ra_svn items by a nesting depth its parser bounds (`Bounds::depth`).
+> The hg-over-SSH clone tests' fixture held its shard through the store's commit (main's 8a burner loop at 228d0dc97,
+> load about 50: exit 4 in 3 of 6 rounds and a fourth wedge, each `vcs_ssh/tests/hg.rs:1448` at its poll 1, 1,084 to
+> 1,156 ms with no CPU progress and never runnable). `one_file_history` landed its push inside an observation through
+> `test_store::land_blocking`, which joins a thread waiting on the owner's commit, so the shard's thread sat blocked
+> through an fsync (one landing served in 3.4 s at load about 45 in a run of the measurement). Since (w-hg), the fixture
+> pushes from a task on the shard through `hg_push::unbundle`, which awaits the store's landing, as a client's push does.
+> The fold of 459c07141 is not on this path (a one-changeset push reads no chain). No red reproduces a slow fsync on
+> demand; main's loop is the check.
+> The 57k clone's store asks and turns doubled at 459c07141 against the morning (2,508 and 1,326 against 1,140 and 669)
+> with every manifest path the same (main's table). A fetch's read-ahead and a text's slices are sized by the shard's
+> step bytes, half its step quantum at the memcpy rate, the quantum its live wake estimate, so asks grow as the shard's
+> measured wake shrinks; turns follow asks (a turn ends at an ask; two asks a turn in both runs). Now counted: each ask's
+> step bytes (`vcs_store.hg_store_ask_step_bytes`, its mean over the asks printed by `hg_clone_store_wait`; 34,829 bytes
+> over the 2,000-changeset history in debug), and the owner logs each request whose service passes twice the longest
+> it logged before, by kind and parts (`slates-store: the owner's longest service yet`), so a run's slowest request names
+> itself (the table's 863 ms one was unnamed; a landing of 3.4 s logged in a debug measurement). Owed: the 57k figures
+> with them (main's).
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads
@@ -14610,6 +14627,21 @@ asked of that now: a run answers when the spawner answered its hook's exit (`hoo
 refusing run must end within a liveness window of it (`AFTER_EXIT_NS`), where a leaked words stream holds it its
 holder's four windows. `a_hooks_run_ends_at_its_exit_whatever_another_spawner_holds` asks the same. If the loop still
 fails either, the message now prints the time after the exit, which tells a hold from a slow start.
+
+**The rest of that loop (2026-11-25, w-git).** Main's loop at 228d0dc97 had no wedge at hook_driver.rs:842 in 6 rounds
+and both hold tests green. The other hook tests that timed a run from before its spawn are judged from their own moment
+now (`Ended::started_at_ns` beside `exited_at_ns`): `a_hooks_first_run_ends_when_its_client_leaves_and_teaches_nothing`
+from its client's leaving (1.18 s "in" failed it against one window for the whole run),
+`a_hook_past_its_learned_bound_is_killed_with_its_group_and_reaped` and the lingering child's from the hook's start,
+where the bound runs from. `git_hooks::tests::ran` holds the hook to `TEST_BOUND_NS` from its start (its client leaves
+then) and the whole to twice that (`SPAWNED_AND_RUN_NS`: the spawner's start, a start of the same binary, before it).
+`git_push`'s `a_fetch_arriving_mid_derivation_is_no_later_than_one_with_nothing_behind` failed when the task behind the
+push finished before the test thread's read arrived (0 turns, 0 handed): its read now waits on the shard for the
+derivation under way (`git_derive::behind_and_under_way`) and begins in the poll that sees it; red, the thread held 3 s
+after the push, 0 handed before and 1 now. The DAV proppatch 500 of that loop was the product: A-622's bound learned
+from one fast run killed a slower second `post-revprop-change`. Main's ruling of 2026-11-25: no bound holds a run
+until `vcs_hooks::RUNS_FOR_A_BOUND` (99) runs support the 99th percentile it claims; until then the client's
+connection is the deadline (A-622 part 3, "The bound rests on enough runs").
 
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 
