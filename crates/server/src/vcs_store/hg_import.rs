@@ -535,9 +535,15 @@ pub(crate) async fn land_imported_awaited(id: RepositoryId) -> Result<(), Import
     crate::state::with_state(|state| segment_changeset(state, id)).ok_or_else(gone)?
   {
     let sequence = header.sequence;
+    let sections = crate::repository::hg_run::section_bytes(&parts);
     let landed = disk.land(header, parts).await.is_ok();
-    crate::state::with_state(|state| segment_landed(state, id, (sequence, identity), landed))
-      .ok_or_else(gone)??;
+    crate::state::with_state(|state| {
+      if landed {
+        crate::repository::hg_run::count_landed(state, sections);
+      }
+      segment_landed(state, id, (sequence, identity), landed)
+    })
+    .ok_or_else(gone)??;
   }
   built_works(id).await.ok_or_else(gone)??;
   crate::state::with_state(|state| {
@@ -1291,6 +1297,8 @@ pub(crate) struct SegmentInFlight {
   identity: [u8; 32],
   /// When it was asked, on the shard's clock.
   began: u64,
+  /// Its bytes by section, counted once it lands.
+  sections: crate::repository::hg_run::SectionBytes,
 }
 
 /// Repository `id`'s next segment cut and not yet handed to the store, its payload made into chunks a turn's steps at a
@@ -1318,6 +1326,7 @@ async fn landing_begun(id: RepositoryId) -> Option<Result<Option<SegmentInFlight
     sequence: header.sequence,
     identity,
     began: slates_rt::futures::now_ns(),
+    sections: crate::repository::hg_run::section_bytes(&parts),
     answer: Box::pin(async move { disk.land(header, parts).await.is_ok() }),
   })))
 }
@@ -1338,6 +1347,9 @@ fn landing_settled(
         state.count_max(SEGMENT_LAND_WAIT_MAX_NS, waited);
       }
       None => state.count(SEGMENTS_LANDED_OVERLAPPED, 1),
+    }
+    if landed {
+      crate::repository::hg_run::count_landed(state, landing.sections);
     }
     segment_landed(state, id, (landing.sequence, landing.identity), landed)
   })

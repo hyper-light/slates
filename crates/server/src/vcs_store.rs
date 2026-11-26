@@ -4651,15 +4651,65 @@ pub(crate) const HG_REPLAY_SEGMENTS: &str = "vcs_store.hg_replay_segments";
 /// counter name.
 pub(crate) const HG_REPLAY_RECORD_BYTES: &str = "vcs_store.hg_replay_record_bytes";
 
-/// Repository `id`'s record at `index` where it names an import's run of segment changesets (record v9, A-767 C1 step
-/// 3).
-fn hg_run(
-  state: &ShardState,
-  id: RepositoryId,
-  index: usize,
-) -> Option<slates_hg::import::record::Run> {
+/// A run of segment changesets a Mercurial record names (A-767 C1 step 3): an import's, by its sequences (record v9), or
+/// a push's, by its segment list homed and landed (record v12, ruling R).
+enum HgRun {
+  /// An import's run.
+  Import(slates_hg::import::record::Run),
+  /// A push's run.
+  Push(slates_hg::import::record::HomedRun),
+}
+
+/// Repository `id`'s record at `index` where it names a run of segment changesets ([`HgRun`]).
+fn hg_run(state: &ShardState, id: RepositoryId, index: usize) -> Option<HgRun> {
   let bytes = object_record(&state.db, &state.vcs_replica_records, id, index)?;
   slates_hg::import::record::run_of(bytes)
+    .map(HgRun::Import)
+    .or_else(|| slates_hg::import::record::homed_run_of(bytes).map(HgRun::Push))
+}
+
+/// The sequences of `run`'s segments in order, and the last sequence the run landed (a push's, its list's own): an
+/// import's from its record, a push's from its segment list read back from the node's store `disk` by its identity
+/// ([`keyed_bytes`]). None where the list is not there whole, or does not read as one.
+async fn run_sequences(
+  disk: &slates_store::owner::StoreHandle,
+  run: HgRun,
+) -> Option<(Vec<u64>, u64)> {
+  match run {
+    HgRun::Import(run) => Some((run.sequences().collect(), run.last()?)),
+    HgRun::Push(homed) => {
+      let bytes = keyed_bytes(disk, homed.list, homed.len).await?;
+      let entries = slates_hg::import::record::segment_list_of(&bytes)?;
+      Some((
+        entries.iter().map(|entry| entry.sequence).collect(),
+        homed.sequence,
+      ))
+    }
+  }
+}
+
+/// The `len` bytes the node's store `disk` keeps under `identity` (a keyed section: `SectionKind::keyed`), read a piece
+/// at a time and held to their identity before anyone decodes them; none where the store refuses or answers short, the
+/// heap refuses room for them, or they hash to another identity.
+pub(crate) async fn keyed_bytes(
+  disk: &slates_store::owner::StoreHandle,
+  identity: [u8; 32],
+  len: u64,
+) -> Option<Vec<u8>> {
+  let mut bytes = Vec::new();
+  bytes.try_reserve_exact(usize::try_from(len).ok()?).ok()?;
+  let mut offset = 0u64;
+  while offset < len {
+    let piece = disk.piece(identity, len, offset).await.ok()??;
+    if piece.is_empty() {
+      return None;
+    }
+    let want = usize::try_from(len.saturating_sub(offset)).ok()?;
+    let taken = piece.get(..want.min(piece.len()))?;
+    bytes.extend_from_slice(taken);
+    offset = offset.saturating_add(u64::try_from(taken.len()).ok()?);
+  }
+  (blake3::hash(&bytes).as_bytes() == &identity).then_some(bytes)
 }
 
 /// The `Record` section of repository `repository`'s changeset `sequence`, read back from the node's changeset log: its
@@ -4747,12 +4797,15 @@ fn hg_segment_step(
 async fn replay_hg_run(
   state: &mut ShardState,
   id: RepositoryId,
-  run: slates_hg::import::record::Run,
+  run: HgRun,
   slices: &mut crate::recovery_slices::RecoverySlices,
 ) -> Result<(), ReplayRefused> {
   let disk = state.vcs_disk.clone().ok_or(ReplayRefused::Unlanded)?;
   let repository = u128::from_be_bytes(id.bytes);
-  for sequence in run.sequences() {
+  let (sequences, last) = run_sequences(&disk, run)
+    .await
+    .ok_or(ReplayRefused::Unlanded)?;
+  for sequence in sequences {
     let bytes = segment_record(&disk, repository, sequence)
       .await
       .ok_or(ReplayRefused::Unlanded)?;
@@ -4781,14 +4834,12 @@ async fn replay_hg_run(
       }
     }
   }
-  if let Some(last) = run.last() {
-    state.vcs_stores.landed_changeset(id, last);
-  }
+  state.vcs_stores.landed_changeset(id, last);
   Ok(())
 }
 
 /// [`replay_hg_run`] for a rebuild's task, which reaches the shard's state a step at a time.
-async fn rebuild_hg_run(id: RepositoryId, run: slates_hg::import::record::Run) -> Unit {
+async fn rebuild_hg_run(id: RepositoryId, run: HgRun) -> Unit {
   let Some((disk, step)) = crate::state::with_state(|state| {
     let step = hg_view::text_bytes_a_step(state);
     state.vcs_disk.clone().map(|disk| (disk, step))
@@ -4797,7 +4848,10 @@ async fn rebuild_hg_run(id: RepositoryId, run: slates_hg::import::record::Run) -
     return Unit::Refused(ReplayRefused::Unlanded);
   };
   let repository = u128::from_be_bytes(id.bytes);
-  for sequence in run.sequences() {
+  let Some((sequences, last)) = run_sequences(&disk, run).await else {
+    return Unit::Refused(ReplayRefused::Unlanded);
+  };
+  for sequence in sequences {
     let Some(bytes) = segment_record(&disk, repository, sequence).await else {
       return Unit::Refused(ReplayRefused::Unlanded);
     };
@@ -4839,10 +4893,7 @@ async fn rebuild_hg_run(id: RepositoryId, run: slates_hg::import::record::Run) -
       slates_rt::futures::yield_now().await;
     }
   }
-  if let Some(last) = run.last() {
-    crate::state::with_state(|state| state.vcs_stores.landed_changeset(id, last))
-      .unwrap_or_default();
-  }
+  crate::state::with_state(|state| state.vcs_stores.landed_changeset(id, last)).unwrap_or_default();
   Unit::Replayed
 }
 
