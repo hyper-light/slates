@@ -550,6 +550,51 @@ pub(crate) enum ReplayRefused {
   SvnReference,
 }
 
+impl ReplayRefused {
+  /// Concise typed refusal diagnostic for HTTP `503 Service Unavailable` bodies when a repository failed recovery.
+  pub(crate) fn diagnostic(&self) -> &'static str {
+    match self {
+      Self::Unlanded => {
+        "repository recovery failed: Unlanded (changeset missing or damaged in store)"
+      }
+      Self::Record(_) => "repository recovery failed: Record (malformed push record)",
+      Self::Diverged => "repository recovery failed: Diverged (replayed objects differ)",
+      Self::Git(_) => "repository recovery failed: Git (store refused replayed commit)",
+      Self::Pack(_) => "repository recovery failed: Pack (pack unreadable or missing base)",
+      Self::Names(_) => "repository recovery failed: Names (object names unreadable)",
+      Self::Owed(_) => "repository recovery failed: Owed (malformed owed-commit record)",
+      Self::LfsRecord(_) | Self::Lfs(_) => {
+        "repository recovery failed: Lfs (LFS object record refused)"
+      }
+      Self::Released => "repository recovery failed: Released (index release mismatch)",
+      Self::Mercurial(_) => "repository recovery failed: Mercurial (Mercurial replay refused)",
+      Self::SvnRecord(_)
+      | Self::SvnCreated(_)
+      | Self::SvnStep(_)
+      | Self::SvnOrder
+      | Self::SvnTextsInline
+      | Self::SvnReference => "repository recovery failed: Subversion (Subversion replay refused)",
+    }
+  }
+}
+
+impl std::fmt::Display for ReplayRefused {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str(self.diagnostic())
+  }
+}
+
+/// Concise typed recovery refusal for repository `id` on the current shard, if its store failed recovery.
+pub(crate) fn unrecovered_reason(id: RepositoryId) -> Option<&'static str> {
+  crate::state::with_state(|state| {
+    state
+      .vcs_stores
+      .unrecovered(id)
+      .map(ReplayRefused::diagnostic)
+  })
+  .flatten()
+}
+
 /// The repository's objects as the bases a replayed pack's reference deltas may name (A-723), read through the index view
 /// a live push reads them by.
 struct StoreBases<'a>(slates_git::store::views::IndexedObjects<'a>);

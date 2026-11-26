@@ -4,8 +4,8 @@
 
 use super::{
   BlockFile, CHANGESET_ENTRY_BYTES, CHANGESETS, CONTENT_KEY_BYTES, CONTENT_VALUE_BYTES, CONTENTS,
-  Changeset, Identity, Rows, SectionKind, ShardDb, StoreError, U64, content_key, decode_changeset,
-  decode_content, field, identity_of_range, put, sections_of,
+  Changeset, Identity, LogError, Rows, SectionKind, ShardDb, StoreError, U64, content_key,
+  decode_changeset, decode_content, field, identity_of_range, put, sections_of,
 };
 
 /// Width of an alternate place's key. Its final field is the section's unique offset in the log.
@@ -140,9 +140,12 @@ pub(super) fn index_checkpoint<F: BlockFile>(
     let mut buffer = Vec::new();
     scan_table(rows, CHANGESETS, per_page, |rows, key, entry| {
       let row = decode_changeset(key, entry)?;
-      visit(file, applied, &row, &mut buffer, |identity, offset, len| {
+      match visit(file, applied, &row, &mut buffer, |identity, offset, len| {
         keep(rows, identity, offset, len, &mut value)
-      })
+      }) {
+        Ok(()) | Err(StoreError::Log(LogError::Corrupt(_))) => Ok(()),
+        Err(error) => Err(error),
+      }
     })?;
   }
   rows.put(&[CONTENTS], &[])?;

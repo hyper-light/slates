@@ -79,6 +79,12 @@ const LFS_RIGHTS: &[Right] = &[Right::Read, Right::Submit, Right::Rewrite];
 /// Format: the field a `405` names its methods in (RFC 9110 §10.2.1).
 const ALLOW: &[u8] = b"Allow";
 
+/// Format: the `Content-Type` header name (RFC 9110 §8.3).
+const CONTENT_TYPE: &[u8] = b"Content-Type";
+
+/// Format: plain UTF-8 media type for typed `503` diagnostic refusal bodies (RFC 9110 §8.3).
+const TEXT_PLAIN: &[u8] = b"text/plain; charset=utf-8";
+
 /// Format: the field `slates_git::lfs::serve` names a `401`'s challenge in, beside `WWW-Authenticate` (A-629 part 1).
 const LFS_AUTHENTICATE: &[u8] = b"LFS-Authenticate";
 
@@ -139,6 +145,11 @@ pub(crate) trait Repositories {
   fn locate(&self, name: &str) -> Located;
   /// The repository named `name` on this shard, if one is.
   fn find(&self, name: &str) -> Option<RepositoryRecord>;
+  /// Why repository `id`'s store failed recovery on this shard, if it did: defaults to querying the current shard's
+  /// `VcsStores::unrecovered` map (returning `None` off a shard thread).
+  fn unrecovered(&self, id: slates_db::catalog::RepositoryId) -> Option<&'static str> {
+    crate::vcs_store::unrecovered_reason(id)
+  }
 }
 
 /// Why git's site refused a request, by kind: each answered with its status and counted under its name (A-625 part 3).
@@ -492,12 +503,43 @@ impl<L: LfsService> Exchange for LfsExchange<L> {
   }
 }
 
-/// What git's site serves a request with: one of git's services, or Git LFS.
+/// A `503 Service Unavailable` exchange carrying a concise typed diagnostic body for a repository whose store failed
+/// recovery.
+pub(crate) struct UnavailableExchange {
+  /// The diagnostic line not yet sent.
+  body: Option<&'static str>,
+}
+
+impl Exchange for UnavailableExchange {
+  async fn body(&mut self, _run: &[u8]) -> Result<(), Failed> {
+    Ok(())
+  }
+
+  async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), Failed> {
+    Ok(())
+  }
+
+  fn reply_status(&self) -> Status {
+    Status::SERVICE_UNAVAILABLE
+  }
+
+  async fn reply(&mut self, out: &mut Vec<u8>, _gone: ClientGone<'_>) -> Result<bool, Failed> {
+    if let Some(reason) = self.body.take() {
+      out.extend_from_slice(reason.as_bytes());
+      out.push(b'\n');
+    }
+    Ok(false)
+  }
+}
+
+/// What git's site serves a request with: one of git's services, Git LFS, or a typed `503` diagnostic body.
 pub(crate) enum SiteExchange<E, L> {
   /// git's service.
   Git(GitExchange<E>),
   /// Git LFS, boxed: its exchange is by far the larger.
   Lfs(Box<LfsExchange<L>>),
+  /// A `503 Service Unavailable` refusal carrying a concise typed diagnostic body (e.g. an unrecovered store).
+  Unavailable(UnavailableExchange),
 }
 
 impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
@@ -505,6 +547,7 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
     match self {
       SiteExchange::Git(git) => git.body(run).await,
       SiteExchange::Lfs(lfs) => lfs.body(run).await,
+      SiteExchange::Unavailable(unavailable) => unavailable.body(run).await,
     }
   }
 
@@ -512,6 +555,7 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
     match self {
       SiteExchange::Git(git) => git.body_end(gone).await,
       SiteExchange::Lfs(lfs) => lfs.body_end(gone).await,
+      SiteExchange::Unavailable(unavailable) => unavailable.body_end(gone).await,
     }
   }
 
@@ -519,6 +563,7 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
     match self {
       SiteExchange::Git(git) => git.reply_status(),
       SiteExchange::Lfs(lfs) => lfs.reply_status(),
+      SiteExchange::Unavailable(unavailable) => unavailable.reply_status(),
     }
   }
 
@@ -526,6 +571,7 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
     match self {
       SiteExchange::Git(git) => git.reply_fields().await,
       SiteExchange::Lfs(lfs) => lfs.reply_fields().await,
+      SiteExchange::Unavailable(unavailable) => unavailable.reply_fields().await,
     }
   }
 
@@ -539,6 +585,7 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
     match self {
       SiteExchange::Git(git) => git.reply(out, gone).await,
       SiteExchange::Lfs(lfs) => lfs.reply(out, gone).await,
+      SiteExchange::Unavailable(unavailable) => unavailable.reply(out, gone).await,
     }
   }
 
@@ -847,8 +894,30 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
     refused_with(Status::UNAUTHORIZED, fields, false)
   }
 
+  /// `503 Service Unavailable` with `Content-Type: text/plain; charset=utf-8`, the cache fields, and `reason` as its
+  /// diagnostic body for an unrecovered repository, counted under [`Refused::Unavailable`].
+  fn unavailable_body(
+    &self,
+    reason: &'static str,
+    head_only: bool,
+  ) -> Decided<SiteExchange<S::Exchange, L>> {
+    crate::fleet::count_refusal(Refused::Unavailable.counter());
+    let mut fields = vec![(CONTENT_TYPE.to_vec(), TEXT_PLAIN.to_vec())];
+    fields.extend(cache_fields());
+    Decided {
+      answer: Answer::Serve {
+        fields,
+        head_only,
+        status: StatusMode::AfterBody,
+        exchange: SiteExchange::Unavailable(UnavailableExchange { body: Some(reason) }),
+      },
+      proven: true,
+    }
+  }
+
   /// Starts the service `asked` names for `principal` on `repository`: served with its reply's fields and its exchange,
-  /// or `503` while it has not landed or the repository's store is not here.
+  /// or `503` while it has not landed or the repository's store is not here (with a typed diagnostic body when the
+  /// store failed recovery).
   fn start(
     &mut self,
     asked: &Asked,
@@ -864,6 +933,12 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
     };
     let service = match self.services.start(&start) {
       Ok(service) => service,
+      Err(ServiceRefused::Unavailable) => {
+        if let Some(reason) = self.repositories.unrecovered(repository.id) {
+          return self.unavailable_body(reason, asked.head_only);
+        }
+        return self.refuse(Refused::Unavailable, true);
+      }
       Err(refused) => return self.refuse(refused.kind(), true),
     };
     let mut prelude = Vec::new();

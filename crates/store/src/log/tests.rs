@@ -200,3 +200,225 @@ fn out_of_order_appends_are_refused_and_commit_nothing() {
   let (_, found) = recovered(log.into_file());
   assert!(found.is_empty());
 }
+
+/// Appends a record for a specific `tool`, `repository`, and `sequence`.
+fn append_for(
+  log: &mut ChangesetLog<SimFile>,
+  tool: Tool,
+  repository: u128,
+  sequence: u64,
+  payload_bytes: &[u8],
+) -> Located {
+  let mut record = log
+    .begin(Header {
+      tool,
+      repository,
+      sequence,
+      judged_over: sequence.saturating_sub(1),
+      grant: 3,
+      work: 100 + sequence,
+      time_ns: 1_000 * sequence,
+      sections: 2,
+    })
+    .unwrap();
+  record.section(SectionKind::Record, 5).unwrap();
+  record.piece(b"heads").unwrap();
+  record
+    .section(
+      SectionKind::Payload,
+      u64::try_from(payload_bytes.len()).unwrap(),
+    )
+    .unwrap();
+  record.piece(payload_bytes).unwrap();
+  record.commit().unwrap()
+}
+
+/// Reads a committed record's payload section back whole.
+fn read_payload(log: &ChangesetLog<SimFile>, located: &Located) -> Vec<u8> {
+  let sections = log.sections(located).unwrap();
+  let payload_section = sections
+    .iter()
+    .find(|section| section.kind == SectionKind::Payload)
+    .unwrap();
+  let mut out = vec![0u8; usize::try_from(payload_section.len).unwrap()];
+  log.read_at(&mut out, payload_section.offset).unwrap();
+  out
+}
+
+/// SEAM-1: cross-protocol blast-radius isolation for a payload bit-flip.
+/// Do: commit records for Git (1), Mercurial (2), and Subversion (3); flip 1 bit in Git's payload;
+/// recover, read Hg and SVN back, append record 4, and recover again.
+/// Expect: Git's corrupt record is NOT indexed; Hg and SVN ARE recovered intact with exact bytes;
+/// `log.end()` is past record 3; record 4 appends past record 3 without overwriting Hg or SVN.
+#[test]
+fn mid_file_payload_bitflip_does_not_take_down_following_records() {
+  let (mut log, _) = recovered(file(70));
+  let git_bytes = payload(1, 4_096);
+  let hg_bytes = payload(2, 2_048);
+  let svn_bytes = payload(3, 3_072);
+  let r1 = append_for(&mut log, Tool::Git, 101, 1, &git_bytes);
+  let r2 = append_for(&mut log, Tool::Mercurial, 202, 1, &hg_bytes);
+  let r3 = append_for(&mut log, Tool::Subversion, 303, 1, &svn_bytes);
+  let r1_payload = log.sections(&r1).unwrap()[1];
+  let file = log.into_file();
+  file
+    .inject(Fault::BitFlip {
+      offset: r1_payload.offset + 512,
+      bit: 3,
+      stored: true,
+    })
+    .unwrap();
+  let (mut log, found) = recovered(file);
+  assert_eq!(found, vec![r2, r3]);
+  assert_eq!(log.end(), r3.end());
+  assert_eq!(log.skipped(), 1);
+  assert_eq!(read_payload(&log, &r2), hg_bytes);
+  assert_eq!(read_payload(&log, &r3), svn_bytes);
+  let r4_bytes = payload(4, 1_024);
+  let r4 = append_for(&mut log, Tool::Git, 101, 2, &r4_bytes);
+  assert_eq!(r4.offset, r3.end());
+  let (log, found) = recovered(log.into_file());
+  assert_eq!(found, vec![r2, r3, r4]);
+  assert_eq!(log.end(), r4.end());
+  assert_eq!(read_payload(&log, &r2), hg_bytes);
+  assert_eq!(read_payload(&log, &r3), svn_bytes);
+  assert_eq!(read_payload(&log, &r4), r4_bytes);
+}
+
+/// SEAM-1: cross-protocol isolation for mid-file header and trailer bit-flips, including a record
+/// whose follower starts right across a `VERIFY_PIECE` chunk boundary.
+/// Do: flip 1 bit in record 1's magic, header body, and commit trailer while valid Hg (2) and
+/// SVN (3) records follow (including when record 2's magic straddles `VERIFY_PIECE`).
+/// Expect: record 1 is never recovered, records 2 and 3 always recover whole with exact bytes,
+/// and `log.end()` advances to record 3's end.
+#[test]
+fn mid_file_header_and_trailer_bitflips_still_recover_following_records() {
+  #[derive(Clone, Copy)]
+  enum FlipTarget {
+    Magic,
+    HeaderField,
+    Trailer,
+  }
+  // Choose a payload size so record 2's `SLCS` magic straddles `VERIFY_PIECE` (65,536 bytes):
+  // header (72) + sec0 head (16) + 5 + sec1 head (16) + payload + trailer (48) = 157 + payload.
+  let straddle_len = VERIFY_PIECE - 159;
+  for (case_name, r1_len, flip_kind) in [
+    ("magic", 1_024usize, FlipTarget::Magic),
+    ("header-field", 1_024, FlipTarget::HeaderField),
+    ("trailer", 1_024, FlipTarget::Trailer),
+    ("chunk-boundary-magic", straddle_len, FlipTarget::Magic),
+  ] {
+    let (mut log, _) = recovered(file(71));
+    let git_bytes = payload(11, r1_len);
+    let hg_bytes = payload(12, 2_000);
+    let svn_bytes = payload(13, 1_500);
+    let r1 = append_for(&mut log, Tool::Git, 101, 1, &git_bytes);
+    let r2 = append_for(&mut log, Tool::Mercurial, 202, 1, &hg_bytes);
+    let r3 = append_for(&mut log, Tool::Subversion, 303, 1, &svn_bytes);
+    let flip_at = match flip_kind {
+      FlipTarget::Magic => r1.offset,
+      FlipTarget::HeaderField => r1.offset + 20,
+      FlipTarget::Trailer => r1.end() - 8,
+    };
+    let file = log.into_file();
+    file
+      .inject(Fault::BitFlip {
+        offset: flip_at,
+        bit: 2,
+        stored: true,
+      })
+      .unwrap();
+    let (log, found) = recovered(file);
+    assert_eq!(found, vec![r2, r3], "case {case_name}");
+    assert_eq!(log.end(), r3.end(), "case {case_name}");
+    assert_eq!(log.skipped(), 1, "case {case_name}");
+    assert_eq!(read_payload(&log, &r2), hg_bytes, "case {case_name}");
+    assert_eq!(read_payload(&log, &r3), svn_bytes, "case {case_name}");
+  }
+}
+
+/// SEAM-1: a torn uncommitted tail after valid records (even after an earlier skipped corrupt
+/// record) must stop `log.end()` right at the last valid committed record so the next append
+/// cleanly overwrites the uncommitted tail.
+#[test]
+fn torn_uncommitted_tail_after_valid_records_stops_at_last_valid_end() {
+  let (mut log, _) = recovered(file(72));
+  let r1 = append_for(&mut log, Tool::Git, 101, 1, &payload(21, 512));
+  let r2 = append_for(&mut log, Tool::Mercurial, 202, 1, &payload(22, 600));
+  let r3 = append_for(&mut log, Tool::Subversion, 303, 1, &payload(23, 700));
+  {
+    let mut torn = log
+      .begin(Header {
+        tool: Tool::Git,
+        repository: 101,
+        sequence: 2,
+        judged_over: 1,
+        grant: 3,
+        work: 104,
+        time_ns: 4_000,
+        sections: 2,
+      })
+      .unwrap();
+    torn.section(SectionKind::Record, 5).unwrap();
+    torn.piece(b"heads").unwrap();
+    torn.section(SectionKind::Payload, 1_200).unwrap();
+    torn.piece(&payload(24, 1_200)).unwrap();
+    // Dropped without commit: leaves an uncommitted torn tail past `r3.end()`.
+  }
+  let file = log.into_file();
+  file
+    .inject(Fault::BitFlip {
+      offset: r1.offset + 20,
+      bit: 1,
+      stored: true,
+    })
+    .unwrap();
+  let (mut log, found) = recovered(file);
+  assert_eq!(found, vec![r2, r3]);
+  assert_eq!(log.end(), r3.end());
+  assert_eq!(log.skipped(), 1);
+  let r4_bytes = payload(25, 400);
+  let r4 = append_for(&mut log, Tool::Git, 101, 2, &r4_bytes);
+  assert_eq!(r4.offset, r3.end());
+  let (log, found) = recovered(log.into_file());
+  assert_eq!(found, vec![r2, r3, r4]);
+  assert_eq!(log.end(), r4.end());
+  assert_eq!(read_payload(&log, &r4), r4_bytes);
+}
+
+/// SEAM-1: a mid-file corrupt header whose payload embeds multiple fake `SLCS` magic occurrences
+/// (e.g. a repository containing slates' own source) still resynchronizes cleanly onto the real
+/// following records, and skips consecutive damaged records in a single linear pass.
+#[test]
+fn mid_file_corrupt_header_with_embedded_magic_and_consecutive_damage_recovers_cleanly() {
+  let (mut log, _) = recovered(file(73));
+  let mut embedded = Vec::new();
+  for _ in 0..32 {
+    embedded.extend_from_slice(b"SLCS\x01\x00\x01\x00fake-header-bytes-not-a-valid-crc");
+  }
+  let r1 = append_for(&mut log, Tool::Git, 101, 1, &embedded);
+  let r2 = append_for(&mut log, Tool::Git, 101, 2, &payload(30, 1_024));
+  let hg_bytes = payload(31, 2_048);
+  let r3 = append_for(&mut log, Tool::Mercurial, 202, 1, &hg_bytes);
+  let r2_payload = log.sections(&r2).unwrap()[1];
+  let file = log.into_file();
+  // Corrupt r1's header AND r2's payload; r3 (Hg) must still recover whole.
+  file
+    .inject(Fault::BitFlip {
+      offset: r1.offset + 2,
+      bit: 0,
+      stored: true,
+    })
+    .unwrap();
+  file
+    .inject(Fault::BitFlip {
+      offset: r2_payload.offset + 100,
+      bit: 5,
+      stored: true,
+    })
+    .unwrap();
+  let (log, found) = recovered(file);
+  assert_eq!(found, vec![r3]);
+  assert_eq!(log.end(), r3.end());
+  assert_eq!(read_payload(&log, &r3), hg_bytes);
+}

@@ -1130,3 +1130,101 @@ fn an_lfs_request_at_its_remotes_dot_git_endpoint_reaches_the_repository_named_w
     assert!(said.contains(&format!("repo: {named}")), "{target}: {said}");
   }
 }
+
+/// Repositories stand-in whose `r.git` failed recovery with `reason`.
+struct UnrecoveredHeld {
+  inner: Held,
+  reason: &'static str,
+}
+
+impl Repositories for UnrecoveredHeld {
+  fn locate(&self, name: &str) -> Located {
+    self.inner.locate(name)
+  }
+
+  fn find(&self, name: &str) -> Option<RepositoryRecord> {
+    self.inner.find(name)
+  }
+
+  fn unrecovered(&self, id: RepositoryId) -> Option<&'static str> {
+    (id == RepositoryId { bytes: [0; 16] }).then_some(self.reason)
+  }
+}
+
+/// Deliverable 3: Do: ask for `GET`, `HEAD`, and `POST` on an unrecovered Git repository whose
+/// store failed recovery with `ReplayRefused::Unlanded`.
+/// Expect: `503 Service Unavailable` with `Content-Type: text/plain; charset=utf-8`, the cache
+/// fields, `StatusMode::AfterBody`, and a non-empty typed diagnostic body naming `Unlanded`
+/// (`head_only == true` for `HEAD`).
+#[test]
+fn an_unrecovered_git_repository_returns_503_with_typed_refusal_body() {
+  let reason = crate::vcs_store::ReplayRefused::Unlanded.diagnostic();
+  assert_eq!(
+    crate::vcs_store::ReplayRefused::Unlanded.to_string(),
+    reason
+  );
+  let mut site = GitSite::new(
+    REALM.to_owned(),
+    ROOM,
+    Tokens,
+    UnrecoveredHeld {
+      inner: Held { rules: Vec::new() },
+      reason,
+    },
+    Unserved,
+  );
+  let expected_fields = with_cache(&[("Content-Type", "text/plain; charset=utf-8")]);
+
+  let get_refs = request("GET", UPLOAD_ADVERTISEMENT, &[OWNER_BEARER]);
+  let (fields, head_only, status_mode, mut exchange, proven) =
+    served_lfs(ready(site.answer(&head(&get_refs), true)));
+  assert_eq!(
+    (fields, head_only, status_mode, proven),
+    (expected_fields.clone(), false, StatusMode::AfterBody, true)
+  );
+  ready(exchange.body_end(ClientGone::never())).unwrap();
+  assert_eq!(exchange.reply_status(), Status::SERVICE_UNAVAILABLE);
+  let body = String::from_utf8(replies(&mut exchange).concat()).unwrap();
+  assert!(
+    body.contains("Unlanded"),
+    "expected typed Unlanded body, got: {body:?}"
+  );
+  assert!(
+    body.ends_with('\n'),
+    "diagnostic body should end with newline: {body:?}"
+  );
+
+  let head_refs = request("HEAD", UPLOAD_ADVERTISEMENT, &[OWNER_BEARER]);
+  let (fields, head_only, status_mode, mut exchange, proven) =
+    served_lfs(ready(site.answer(&head(&head_refs), true)));
+  assert_eq!(
+    (fields, head_only, status_mode, proven),
+    (expected_fields.clone(), true, StatusMode::AfterBody, true)
+  );
+  ready(exchange.body_end(ClientGone::never())).unwrap();
+  assert_eq!(exchange.reply_status(), Status::SERVICE_UNAVAILABLE);
+
+  let post_upload = request(
+    "POST",
+    "/r.git/git-upload-pack",
+    &[
+      OWNER_BEARER,
+      "Content-Type: application/x-git-upload-pack-request",
+      "Content-Length: 4",
+    ],
+  );
+  let (fields, head_only, status_mode, mut exchange, proven) =
+    served_lfs(ready(site.answer(&head(&post_upload), true)));
+  assert_eq!(
+    (fields, head_only, status_mode, proven),
+    (expected_fields, false, StatusMode::AfterBody, true)
+  );
+  ready(exchange.body(b"0000")).unwrap();
+  ready(exchange.body_end(ClientGone::never())).unwrap();
+  assert_eq!(exchange.reply_status(), Status::SERVICE_UNAVAILABLE);
+  let body = String::from_utf8(replies(&mut exchange).concat()).unwrap();
+  assert!(
+    body.contains("Unlanded"),
+    "expected typed Unlanded body on POST, got: {body:?}"
+  );
+}

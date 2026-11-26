@@ -492,6 +492,12 @@ impl Store {
       &mut bytes,
       at.checked_add(offset).ok_or(StoreError::BadRow)?,
     )?;
+    if offset == 0
+      && u64::try_from(bytes.len()).ok() == Some(landed_len)
+      && *blake3::hash(&bytes).as_bytes() != *identity
+    {
+      return Err(StoreError::Log(LogError::Corrupt("a payload's bytes")));
+    }
     Ok(Some(Cow::Owned(bytes)))
   }
 
@@ -814,7 +820,7 @@ fn put_changeset<F: BlockFile>(
       std::cmp::Ordering::Equal => return Ok(true),
       std::cmp::Ordering::Less => {
         // A retried creation can reuse a sequence. Only the newly named record can keep payloads there.
-        payloads::visit(
+        match payloads::visit(
           file,
           located.offset,
           &previous,
@@ -823,7 +829,10 @@ fn put_changeset<F: BlockFile>(
             payloads::forget(rows, identity, offset, value)?;
             Ok(())
           },
-        )?;
+        ) {
+          Ok(()) | Err(StoreError::Log(LogError::Corrupt(_))) => {}
+          Err(error) => return Err(error),
+        }
       }
     }
   }
@@ -893,3 +902,6 @@ fn decode_changeset(key: &[u8], value: &[u8]) -> Result<Changeset, StoreError> {
     work: le(V_WORK)?,
   })
 }
+
+#[cfg(test)]
+mod tests;

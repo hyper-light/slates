@@ -63,15 +63,34 @@ pub fn log(line: fmt::Arguments<'_>) {
   }
 }
 
-/// [`write_line`] of an owned line: the sink a [`LogWriter`] writes with.
-fn write_owned(line: String) {
-  write_line(line);
+/// Formats `line` into one contiguous buffer before locking standard error, counting a refusal if
+/// formatting fails, and passes it to `deliver`.
+fn write_formatted(line: fmt::Arguments<'_>, deliver: impl FnOnce(String)) {
+  let mut buffer = String::new();
+  if fmt::write(&mut buffer, line).is_err() {
+    LOG_LINES_REFUSED.fetch_add(1, Ordering::Relaxed);
+    return;
+  }
+  deliver(buffer);
 }
 
-/// Writes `line` and a newline to standard error as one locked write, counting a refusal.
-fn write_line(line: impl fmt::Display) {
+/// [`write_owned_to`] on standard error: the sink a [`LogWriter`] writes with.
+fn write_owned(line: String) {
   let mut stderr = std::io::stderr().lock();
-  if writeln!(stderr, "{line}").is_err() {
+  write_owned_to(&mut stderr, line);
+}
+
+/// Writes `line` and a newline to standard error in one locked `write_all` call, counting a refusal.
+fn write_line(line: fmt::Arguments<'_>) {
+  write_formatted(line, write_owned);
+}
+
+/// Appends a trailing newline to `line` and writes it to `sink` in one single `write_all` call so
+/// concurrent processes sharing stderr (anchor and daemon) do not interleave mid-line; counts a
+/// refusal.
+fn write_owned_to(sink: &mut impl Write, mut line: String) {
+  line.push('\n');
+  if sink.write_all(line.as_bytes()).is_err() {
     LOG_LINES_REFUSED.fetch_add(1, Ordering::Relaxed);
   }
 }
@@ -414,5 +433,79 @@ mod tests {
       "a writer a held route keeps, with nothing to take, is given up"
     );
     assert!(took >= STOP_WINDOW, "after a still window: {took:?}");
+  }
+
+  /// Sink that records each individual `Write::write` slice (and can fail on demand) to prove a
+  /// log line is emitted in one single `write` call with its trailing newline.
+  struct RecordingSink {
+    writes: Vec<Vec<u8>>,
+    fail: bool,
+  }
+
+  impl Write for RecordingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      if self.fail {
+        return Err(std::io::Error::new(
+          std::io::ErrorKind::BrokenPipe,
+          "peer closed",
+        ));
+      }
+      self.writes.push(buf.to_vec());
+      Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+  }
+
+  /// SEAM-3: Do: write a formatted multi-argument log line and an owned log line to a recording
+  /// sink, then write to a failing sink.
+  /// Expect: each line arrives in ONE single `write` call including its trailing `\n` (never split
+  /// across fragments that could interleave between anchor and daemon), and each failed write
+  /// increments `log_lines_refused` without panicking.
+  #[test]
+  fn a_log_line_is_written_atomically_in_one_write_call_and_refusals_are_counted() {
+    let _gate = counter_gate();
+    let refused_before = log_lines_refused();
+
+    let mut formatted = RecordingSink {
+      writes: Vec::new(),
+      fail: false,
+    };
+    write_formatted(
+      format_args!(
+        "slates anchor: issuer surface: export {} inode {}",
+        "SLATES_ISSUER=token", 737_198_504_u64
+      ),
+      |buffer| write_owned_to(&mut formatted, buffer),
+    );
+    assert_eq!(
+      formatted.writes,
+      vec![b"slates anchor: issuer surface: export SLATES_ISSUER=token inode 737198504\n".to_vec()],
+      "formatted multi-arg line must arrive in a single write call"
+    );
+
+    let mut owned = RecordingSink {
+      writes: Vec::new(),
+      fail: false,
+    };
+    write_owned_to(&mut owned, "slates-server: partition 0: ready".to_owned());
+    assert_eq!(
+      owned.writes,
+      vec![b"slates-server: partition 0: ready\n".to_vec()],
+      "owned line must arrive in a single write call with its trailing newline"
+    );
+    assert_eq!(log_lines_refused(), refused_before);
+
+    let mut broken = RecordingSink {
+      writes: Vec::new(),
+      fail: true,
+    };
+    write_formatted(format_args!("line {}", 1), |buffer| {
+      write_owned_to(&mut broken, buffer);
+    });
+    write_owned_to(&mut broken, "line 2".to_owned());
+    assert_eq!(log_lines_refused(), refused_before + 2);
   }
 }
