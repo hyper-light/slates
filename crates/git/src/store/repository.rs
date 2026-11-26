@@ -716,10 +716,12 @@ impl Repository {
   /// (main's leg at 47de9566d): the directories read between two of one directory's revisions put its chain out.
   /// Refused room, it stays as it is.
   pub fn widen_read_cache(&self, breadth: u64, admission: &mut Admission) -> Widening {
-    let wanted = self
-      .learned_depth()
-      .saturating_add(1)
-      .saturating_mul(breadth);
+    let wanted = super::packed::Recent::budget_keeping(
+      self
+        .learned_depth()
+        .saturating_add(1)
+        .saturating_mul(breadth),
+    );
     let mut reading = self.reading.borrow_mut();
     let have = to_u64(reading.recent().budget());
     if wanted <= have {

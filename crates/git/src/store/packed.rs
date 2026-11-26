@@ -561,6 +561,37 @@ impl Recent {
     self.charged
   }
 
+  /// The budget that keeps `bytes` of objects whatever its chunks hold idle. At a moment two chunks keep nothing: the
+  /// oldest, given back whole to make room for the next, and the newest, whose room is not yet laid
+  /// ([`CHUNKS_A_BUDGET`]'s doc). Each is as long as the budget lays them ([`Recent::chunk_len`]): the mapped
+  /// allocation's floor where the budget is at least [`CHUNKS_A_BUDGET`] floors, so the budget is `bytes` and two
+  /// floors; else a [`CHUNKS_A_BUDGET`]th of the budget, so `bytes` is the rest of its chunks' share, `bytes` times
+  /// [`CHUNKS_A_BUDGET`] over its chunks less the two. Sized for what it keeps alone, a fetch's cache gave back a base
+  /// its revisions shared each time its chunks turned over (`a_fetchs_tree_reads_count_the_bases_they_inflate_whole`:
+  /// 23 bases inflated of 117 reads, 9 distinct).
+  ///
+  /// Derived: the idle chunks, the one going and the one laid; their length, the floor or the budget's share.
+  pub fn budget_keeping(bytes: u64) -> u64 {
+    let to_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    let (going, laid) = (1u64, 1u64);
+    let idle = going.saturating_add(laid);
+    let (floor, chunks) = (to_u64(slates_mem::large::floor()), to_u64(CHUNKS_A_BUDGET));
+    let floored = bytes.saturating_add(floor.saturating_mul(idle));
+    if floored.checked_div(chunks).unwrap_or(0) >= floor {
+      return floored;
+    }
+    // Rounded up, so the budget's share less its idle chunks is never a byte short of `bytes`.
+    let busy = u128::from(chunks.saturating_sub(idle).max(1));
+    u64::try_from(
+      u128::from(bytes)
+        .saturating_mul(u128::from(chunks))
+        .saturating_add(busy.saturating_sub(1))
+        .checked_div(busy)
+        .unwrap_or(u128::MAX),
+    )
+    .unwrap_or(u64::MAX)
+  }
+
   /// The most bytes it keeps.
   pub fn budget(&self) -> usize {
     self.budget
@@ -967,6 +998,29 @@ mod recent_tests {
     assert!(recent.get(at(3)).is_some());
     assert!(recent.chunks.get(1).is_some_and(|chunk| chunk.whole));
     assert!(recent.held <= 4 * chunk());
+  }
+
+  /// Main 01a20182's order of 2026-11-26 (the read cache's capacity: its budget sized for what it keeps alone). Do: size a
+  /// budget for byte counts from a few chunks' share to past [`super::CHUNKS_A_BUDGET`] floors with
+  /// [`Recent::budget_keeping`], and read the chunks it lays. Expect: the budget less two of its chunks (the one given
+  /// back and the one being laid) still holds the bytes; at or past the floors' regime, exactly the bytes and two floors.
+  #[test]
+  fn a_budget_sized_to_keep_its_bytes_holds_them_past_its_two_idle_chunks() {
+    let floor = chunk();
+    for bytes in [64, 4096, floor / 3, 6 * floor - 1, 6 * floor, 40 * floor] {
+      let budget = Recent::budget_keeping(u64::try_from(bytes).unwrap());
+      let mut recent = Recent::default();
+      recent.set_budget(usize::try_from(budget).unwrap());
+      let idle = 2 * recent.chunk_len();
+      assert!(
+        recent.budget() >= bytes + idle,
+        "{bytes} B asked a budget of {budget} B, its chunks {} B",
+        recent.chunk_len()
+      );
+      if bytes >= 6 * floor {
+        assert_eq!(budget, u64::try_from(bytes + 2 * floor).unwrap());
+      }
+    }
   }
 
   /// Main 01a20182's git/git leg of 2026-11-25 (the fork's read cache, kept oldest-laid first, hit about 2 % of a clone's
