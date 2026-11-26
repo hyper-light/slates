@@ -14946,10 +14946,11 @@ mod tests {
   /// Goal 93, the landing spin (main's order of 2026-11-24 10:18 and 14:26: a 4,067-changeset history with 452 heads
   /// spun shard 0 for 3,553 ms of CPU in one poll of `hg_push::landing`, the daemon ended by its watchdog). Do: push a
   /// root and [`MANY_HEADS`] - 1 changesets on it, each a head of its own, through the daemon's driver
-  /// (`hg_push::unbundle`). Expect the push accepted, a line green for every head, and the landing's one step doing the
-  /// work of the line that existed alone (`repository.push.landing_step_works_most` 1), each new line's made before it a
-  /// slice a step (`repository.push.create_slices` moved) and taken by it (`repository.push.create_misses` 0). Red
-  /// before: every head's work in the one step (64).
+  /// (`hg_push::unbundle`). Expect the push accepted, a line green for every head, and the landing's one step doing no
+  /// line's work itself (`repository.push.landing_step_works_most` 0: the existing line's judged ahead of it since
+  /// 2026-11-26, where it did that one alone), each new line's made before it a slice a step
+  /// (`repository.push.create_slices` moved) and taken by it (`repository.push.create_misses` 0). Red before: every
+  /// head's work in the one step (64).
   #[test]
   fn t_goal93_a_push_of_many_heads_lands_its_new_lines_outside_its_landing_step() {
     use crate::repository::hg_push::tests::history_of;
@@ -15022,8 +15023,8 @@ mod tests {
     );
     assert_eq!(lines, MANY_HEADS, "a line green for every head");
     assert_eq!(
-      in_step, 1,
-      "the landing's step did the existing line's work alone"
+      in_step, 0,
+      "the landing's step did no line's work itself (the existing line's judged ahead, as each new one's was made)"
     );
     assert!(slices > 0, "the new lines made a slice at a time: {slices}");
     assert_eq!(

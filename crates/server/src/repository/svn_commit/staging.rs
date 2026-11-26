@@ -272,12 +272,13 @@ pub(crate) const PURGED_PAST_BOUND: &str = "repository.svn_import.purged_past_bo
 pub(crate) const PURGE_KEPT_SHORT: &str = "repository.svn_import.purged_kept_short_bytes";
 
 /// Runs `step` a slice a step, yielding between slices, until it answers that it is done: each slice within the shard's
-/// budget, as the step bounds itself. None where the shard's state is gone.
+/// budget, as the step bounds itself. Its last slice yields too, so what the caller runs next begins a step of its own
+/// ([`super::section_yield`], A-920 7c). None where the shard's state is gone.
 async fn until_done(mut step: impl FnMut(&mut ShardState) -> bool) -> Option<()> {
   while !crate::state::with_state(&mut step)? {
     slates_rt::futures::yield_now().await;
   }
-  Some(())
+  super::section_yield().await
 }
 
 /// Unpins `texts` from `at`, a text a unit, until the shard's clock passes `deadline_ns`, at least one: whether every one
@@ -1827,6 +1828,10 @@ impl Staging {
       )
     })
     .await?;
+    // The greens' pending holds applied a slice at a time before the first text is given back, so that free decision
+    // applies none whole (A-920 7c: the batch's 9,000 named texts' holds, 7.8 ms of its first step, debug).
+    until_done(|state| crate::vcs_store::name_holds::apply_some(state, slice_deadline_ns()))
+      .await?;
     let mut at = 0usize;
     until_done(|state| {
       state.count(TAIL_SLICES, 1);

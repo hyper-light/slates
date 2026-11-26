@@ -658,9 +658,12 @@
 > task (debug, 9,000 files): the tail's `fold_to_readers` (7.6 ms), the register's op
 > (`publish_held_increments` and `record_all`, 8-9 ms), and the landing's other whole sections a probe named after 7b
 > (A-920 Piece 7: the changeset's storing and hand-over 14.2 ms, three paced steps run past their deadline 4.6-10.7
-> ms, `apply_slice` 4.5, `retire_begun` 4.5, a staging step 4.3, the text release 4.2), several to a poll with no
-> yield between them: the history's longest poll 29-30 ms of thread CPU. A turn is under 6 ms since 7a (an event a
-> unit) and 7b (the close a unit a step). Owed:
+> ms, `apply_slice` 4.5, `retire_begun` 4.5, a staging step 4.3, the text release 4.2). A turn is under 6 ms since 7a
+> (an event a unit) and 7b (the close a unit a step). Since 7c each section is a step of its own and every paced loop
+> stops at its deadline, but release probe 10 (after 7b) read every wide test past 1 ms: the landing's sections 3.0-4.2
+> ms of thread CPU (add, copy), and the checkpoint task's `CheckpointHold::begin` 5.3-7.8 ms (move), owed a file a
+> unit. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
+> 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
 > files): `made_commit.rs` (two calls), `vcs_store/svn_made.rs`, `vcs_store/hg_made.rs`, `greens.rs`'s own caller. A
@@ -1952,8 +1955,19 @@
 > 567 ms, 451 slices of at most 123 ms, the push accepted. Held by
 > `t_goal93_a_push_of_many_heads_lands_its_new_lines_outside_its_landing_step` (red: the step did 64 greens' works, now
 > 1), `creates_made_ahead_of_a_landing_and_not_taken_are_given_back` and
-> `creates_past_their_pushs_room_are_refused_before_any_is_made`. Owed: (1) a push that moves hundreds of existing heads
-> still does their works in the one step (an update's green is a reader's, so it is not made ahead); (2) the step's
+> `creates_past_their_pushs_room_are_refused_before_any_is_made`. (1) FIXED (w-hg, 2026-11-26, main's order): a push
+> that moved hundreds of existing heads did their works in the one step, since an update's green is a reader's and is
+> not made ahead. Now each update is secured and judged ahead of the step too, a slice a step under the repository's
+> landing turn (`PreparedCreates::judge_updates_some`, counted `repository.push.update_slices`), in place in the push's
+> own changes; nothing is committed ahead. The step takes each verdict only while its green is still at the head it
+> was judged at (`take_update`), else gives it back, judges the work itself and counts a miss
+> (`repository.push.update_misses`); its commit's own head check stands behind that. `secure` and `judge` are one
+> code path for both (`secure_one`, `judge_one`). Held by
+> `hg_push::tests::t_goal93_a_push_moving_many_heads_judges_their_works_ahead_of_its_landing_step` (32 lines pushed,
+> then all moved by one push: red, the step did 31 lines' works; now 0, misses 0, and the first push's root line's work
+> judged ahead too, so the many-heads test's step does 0 where it did 1); it prints the landing step's longest and the
+> shard's and the history's longest poll by the wall and the thread's CPU (`svn_import::tests::cpu_timed`,
+> `longest_poll`) for main's release probe. Owed still: (2) the step's
 > record carries every new green's chain entry, so its write grows with heads times tree (377 ms of the 452-head step,
 > debug); (3) a slice makes one green whole, its tree's work (123 ms at 452 heads, debug); (4) git's pushes (git/git's
 > 1,027 refs) take the same slices once their driver hands its creates in (w-git's piece).

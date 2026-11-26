@@ -1185,6 +1185,10 @@ struct WideCounts {
   pauses: u64,
   /// The import's calls stopped in a revision's close (`svn_import::IMPORT_CLOSE_STEPS`, 7b).
   close_steps: u64,
+  /// The yields between the landing's sections (`svn_commit::LANDING_SECTION_YIELDS`, 7c).
+  section_yields: u64,
+  /// The steps that applied the greens' pending holds (`name_holds::NAME_HOLD_APPLY_STEPS`, 7c).
+  hold_steps: u64,
 }
 
 /// The calling shard's [`WideCounts`] now.
@@ -1201,6 +1205,8 @@ fn wide_counts() -> WideCounts {
     in_turns: on(|state| count(state, crate::merge_service::CHECKPOINT_IN_TURNS)),
     pauses: on(|state| count(state, super::IMPORT_PAUSES)),
     close_steps: on(|state| count(state, super::IMPORT_CLOSE_STEPS)),
+    section_yields: on(|state| count(state, crate::repository::svn_commit::LANDING_SECTION_YIELDS)),
+    hold_steps: on(|state| count(state, crate::vcs_store::name_holds::NAME_HOLD_APPLY_STEPS)),
   }
 }
 
@@ -1218,6 +1224,8 @@ fn wide_landing_sliced(counts: &WideCounts) {
     prepares,
     inline,
     in_turns,
+    section_yields,
+    hold_steps,
     ..
   } = counts;
   // Non-vacuity: the landing's unpin of its 9,000 texts and its scratch member's release each ran in slices (A-920 6a:
@@ -1237,6 +1245,16 @@ fn wide_landing_sliced(counts: &WideCounts) {
   // piece: the first fold and hold steps inline were 16 ms of one poll, debug).
   assert_eq!(*inline, 0, "checkpoints begun in a landing's step");
   assert!(*in_turns > 0, "no checkpoint taken in turns");
+  // Each of the landing's sections begins a step of its own (A-920 7c: the storing's begin and the carried texts ran in
+  // one poll of 31 ms, debug), and the greens' 9,000 holds were applied a slice at a time, never at one free decision.
+  assert!(
+    *section_yields > 2,
+    "the landing yielded {section_yields} time(s) between sections"
+  );
+  assert!(
+    *hold_steps > 2,
+    "the greens' holds were applied in {hold_steps} step(s)"
+  );
 }
 
 /// The import's parse, staging, apply and tail in steps (A-920 7a, goal 93 piece 3).
@@ -1278,7 +1296,7 @@ std::thread_local! {
 
 /// A history whose every poll is timed by the wall clock and by its thread's CPU clock
 /// ([`slates_rt::registry::calling_thread_cpu`]), the longest kept in [`TIMED_LONGEST`].
-struct CpuTimed<F> {
+pub(crate) struct CpuTimed<F> {
   /// The history.
   future: std::pin::Pin<Box<F>>,
 }
@@ -1307,7 +1325,7 @@ impl<F: std::future::Future> std::future::Future for CpuTimed<F> {
 /// `history` with each of its polls timed by the wall and by its thread's CPU ([`CpuTimed`]; main's order after probe
 /// 9: the pulse's longest step is a poll's wall clock, which a preempted or waiting thread stretches as much as held
 /// work, so the CPU beside it tells the two apart). Made on the shard that polls it, whose longest so far it clears.
-fn cpu_timed<F: std::future::Future>(history: F) -> CpuTimed<F> {
+pub(crate) fn cpu_timed<F: std::future::Future>(history: F) -> CpuTimed<F> {
   TIMED_LONGEST.with(|longest| longest.set((0, 0)));
   CpuTimed {
     future: Box::pin(history),
@@ -1318,7 +1336,7 @@ fn cpu_timed<F: std::future::Future>(history: F) -> CpuTimed<F> {
 /// longest a green's checkpoint took in turns, from its first turn to its record (A-579's completion time, which the
 /// fold's bounded share past its deadline lengthens; `merge_service::CHECKPOINT_IN_TURNS_LONGEST_NS`), and the longest
 /// poll of its history by the wall and by its thread's CPU ([`cpu_timed`]).
-fn longest_poll() -> (u64, String) {
+pub(crate) fn longest_poll() -> (u64, String) {
   let shard = slates_rt::registry::current_shard().expect("on a shard");
   let checkpoint_ns =
     on(|state| count(state, crate::merge_service::CHECKPOINT_IN_TURNS_LONGEST_NS));
