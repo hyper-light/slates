@@ -1950,8 +1950,19 @@
 > 567 ms, 451 slices of at most 123 ms, the push accepted. Held by
 > `t_goal93_a_push_of_many_heads_lands_its_new_lines_outside_its_landing_step` (red: the step did 64 greens' works, now
 > 1), `creates_made_ahead_of_a_landing_and_not_taken_are_given_back` and
-> `creates_past_their_pushs_room_are_refused_before_any_is_made`. Owed: (1) a push that moves hundreds of existing heads
-> still does their works in the one step (an update's green is a reader's, so it is not made ahead); (2) the step's
+> `creates_past_their_pushs_room_are_refused_before_any_is_made`. (1) FIXED (w-hg, 2026-11-26, main's order): a push
+> that moved hundreds of existing heads did their works in the one step, since an update's green is a reader's and is
+> not made ahead. Now each update is secured and judged ahead of the step too, a slice a step under the repository's
+> landing turn (`PreparedCreates::judge_updates_some`, counted `repository.push.update_slices`), in place in the push's
+> own changes; nothing is committed ahead. The step takes each verdict only while its green is still at the head it
+> was judged at (`take_update`), else gives it back, judges the work itself and counts a miss
+> (`repository.push.update_misses`); its commit's own head check stands behind that. `secure` and `judge` are one
+> code path for both (`secure_one`, `judge_one`). Held by
+> `hg_push::tests::t_goal93_a_push_moving_many_heads_judges_their_works_ahead_of_its_landing_step` (32 lines pushed,
+> then all moved by one push: red, the step did 31 lines' works; now 0, misses 0, and the first push's root line's work
+> judged ahead too, so the many-heads test's step does 0 where it did 1); it prints the landing step's longest and the
+> shard's and the history's longest poll by the wall and the thread's CPU (`svn_import::tests::cpu_timed`,
+> `longest_poll`) for main's release probe. Owed still: (2) the step's
 > record carries every new green's chain entry, so its write grows with heads times tree (377 ms of the 452-head step,
 > debug); (3) a slice makes one green whole, its tree's work (123 ms at 452 heads, debug); (4) git's pushes (git/git's
 > 1,027 refs) take the same slices once their driver hands its creates in (w-git's piece).

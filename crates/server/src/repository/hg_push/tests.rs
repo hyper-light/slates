@@ -2944,3 +2944,102 @@ fn a_rooms_wait_whose_sleep_is_refused_ends_at_once_with_the_refusal() {
   );
   assert_eq!(counted, 1, "the refused sleep counted once");
 }
+
+/// Shape: the lines the moved-heads test pushes and then moves, each a line green of its own: enough that their works in
+/// one landing step show (about 12.5 ms a green's work, debug, 2026-11-24), few enough that the red's one step stays
+/// inside a debug build's watchdog window.
+const MOVED_HEADS: usize = 32;
+
+/// The moved-heads history: a root and [`MOVED_HEADS`] - 1 changesets on it, each a head of its own (so the push makes a
+/// line green for each), then a child on each of those heads, which moves its line: the history, the first push's
+/// revisions, and the second's.
+fn moved_heads_history() -> (Vec<Made>, Vec<usize>, Vec<usize>) {
+  let names: &'static [String] = Box::leak(
+    (0..MOVED_HEADS)
+      .map(|at| format!("head-{at}"))
+      .chain((1..MOVED_HEADS).map(|at| format!("moved-{at}")))
+      .collect::<Vec<_>>()
+      .into_boxed_slice(),
+  );
+  let commits: Vec<Commit> = names
+    .iter()
+    .enumerate()
+    .map(|(at, name)| {
+      let parent = match at {
+        0 => None,
+        at if at < MOVED_HEADS => Some(0),
+        at => Some(at + 1 - MOVED_HEADS),
+      };
+      (
+        name.as_str(),
+        name.as_str(),
+        name.as_bytes(),
+        parent,
+        "default",
+      )
+    })
+    .collect();
+  (
+    history_of(&commits),
+    (0..MOVED_HEADS).collect(),
+    (MOVED_HEADS..commits.len()).collect(),
+  )
+}
+
+/// Goal 93, the landing spin's owed (1) (main's order of 2026-11-26: a push moving hundreds of existing heads did their
+/// works in its landing's one step, since an update's green is a reader's and is not made ahead). Do: push a root and
+/// [`MOVED_HEADS`] - 1 heads on it, each a line green; then push a child on each of those heads, which moves every line,
+/// through the daemon's driver (`hg_push::unbundle`), the history's polls timed by the wall and by the thread's CPU.
+/// Expect both pushes accepted; neither landing step doing a line's work itself (`repository.push.landing_step_works_most`
+/// 0), each moved line's work judged before the step a slice at a time (`repository.push.update_slices` moved) and taken
+/// by it (`repository.push.update_misses` 0). The shard's and the history's longest poll printed, for main's release
+/// probe. Red before: the second push's step did 31 lines' works (`~/.local/state/w-hg-logs/2026-11-26-moved-heads-red.txt`).
+#[test]
+fn t_goal93_a_push_moving_many_heads_judges_their_works_ahead_of_its_landing_step() {
+  let (made, first, second) = moved_heads_history();
+  let first = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &first);
+  let second = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &second);
+  let seen = crate::test_store::run_on_stored_shard(move || {
+    crate::vcs_store::svn_import::tests::cpu_timed(async move {
+      let hg = Hg::made("moved-heads").await;
+      let made = pushed_bytes_to(hg.repository, &first).await;
+      let before = crate::repository::svn_commit::tests::on(|state| {
+        let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        count(crate::repository::push::LANDING_STEP_WORKS)
+      });
+      let moved = pushed_bytes_to(hg.repository, &second).await;
+      let counted = crate::repository::svn_commit::tests::on(|state| {
+        let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        (
+          count(crate::repository::push::LANDING_STEP_WORKS),
+          count(crate::repository::push::UPDATE_SLICES),
+          count(crate::repository::push::UPDATE_MISSES),
+          count(crate::repository::push::LANDING_STEP_NS),
+        )
+      });
+      let (longest_ns, polls) = crate::vcs_store::svn_import::tests::longest_poll();
+      (made, moved, before, counted, longest_ns, polls)
+    })
+  });
+  let (made, moved, before, (in_step, slices, misses, step_ns), longest_ns, polls) = seen;
+  eprintln!(
+    "moved heads: the landing step {} us at most, {in_step} works in it; the shard's longest poll {} us ({polls})",
+    step_ns / 1000,
+    longest_ns / 1000
+  );
+  assert!(matches!(made, Outcome::Accepted(_)), "{made:?}");
+  assert!(matches!(moved, Outcome::Accepted(_)), "{moved:?}");
+  assert_eq!(
+    (before, in_step),
+    (0, 0),
+    "neither push's step did a line's work itself (the first's root line moved by its work judged ahead too)"
+  );
+  assert!(
+    slices > 0,
+    "the moved lines' works judged a slice at a time: {slices}"
+  );
+  assert_eq!(
+    misses, 0,
+    "every work judged ahead taken by the landing's step"
+  );
+}

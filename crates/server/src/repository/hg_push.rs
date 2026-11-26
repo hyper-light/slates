@@ -3838,6 +3838,17 @@ async fn land_sliced(
       }
     }
   }
+  // The moved lines' works judged ahead of the step too, a slice a step (goal 93, the landing spin's owed (1)): the step
+  // commits each verdict while its green is still at the head it was judged at.
+  loop {
+    let judged = crate::state::with_state(|state| {
+      creates.judge_updates_some(state, (repository, &mut prepared.changes))
+    })?;
+    if judged {
+      break;
+    }
+    slates_rt::futures::yield_now().await;
+  }
   slates_rt::futures::yield_now().await;
   let landing_step = slates_rt::futures::doing("hg_push::landing");
   let landed = crate::state::with_state(|state| {
