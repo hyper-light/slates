@@ -14591,6 +14591,26 @@ thread's worst `dup` + `close` was 6.6 ms during the spawns and 6.0 ms with none
 the shard that makes it, against the 1 ms bar, in a daemon holding its clients' sockets. Owed: the spawner, A-924 (w-git's
 next piece).
 
+**After A-924 (main's 8a loop at 523c522c2, 2026-11-25, 12 burners, 6 rounds, load 30 to 65, logs
+`~/.cache/main-rounds/loop-8a/run-*.log` on the MacBook).** 8 wedges in 6 rounds against 120 in 4 at 5ce5e0b5f: the
+spawn storm is gone. Every wedge was "in task spawned at hook_driver.rs:842", no CPU progress and no wait for a CPU,
+1,011 to 1,031 ms, at the task's last poll (2, 4, 5 or 6 by test: the poll-2 one beside
+`a_hook_that_cannot_start_is_unstartable_by_its_cause`, which ends on its second). That poll drops the test's
+`TestSpawner`, which joined its spawner on the shard: `wait` for one installed, `join_spawner`'s liveness window and
+then the kill's `wait` for one owned, while a spawner still starting under load could not yet see its end close. Fixed:
+both joins run on a thread of their own (`spawning::join_off_the_shard`); reds
+`a_test_spawners_drop_never_joins_its_spawner_on_the_shard` (3.07 s on the shard before, a stopped spawner standing in
+for an unstarted one) and `an_owned_test_spawners_drop_never_joins_its_spawner_on_the_shard` (1.005 s, the window).
+Test-only: a daemon's owner hands its spawner to the process thread (A-924's start off the shard).
+
+`hooks_spawned_at_once_each_end_at_their_own_exit` failed 3 of 6 rounds (3.26, 3.50 and 5.92 s against `QUICK_RUN_NS`,
+2 s for the whole run). The whole run holds two starts of the 342 MB debug test binary, the spawner's and the hook's,
+which load stretches, so the bound raced the machine. Its question is whether a run ends at its hook's exit, so it is
+asked of that now: a run answers when the spawner answered its hook's exit (`hook_driver::Ended::exited_at_ns`), and a
+refusing run must end within a liveness window of it (`AFTER_EXIT_NS`), where a leaked words stream holds it its
+holder's four windows. `a_hooks_run_ends_at_its_exit_whatever_another_spawner_holds` asks the same. If the loop still
+fails either, the message now prints the time after the exit, which tells a hold from a slow start.
+
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 
 The only `RUSTDOCFLAGS` in the tree was in `xtask/src/tsan.rs`, for sanitizer flags. No lane, no xtask and no

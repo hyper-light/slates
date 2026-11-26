@@ -121,6 +121,10 @@ pub struct PositionCache {
   met: u64,
   /// The most ids one sent commit resolved.
   most: u64,
+  /// The bytes of the trees the walk opened since its last sent commit began.
+  trees_met: u64,
+  /// The most bytes of trees one sent commit opened: the read cache's breadth ([`Repository::widen_read_cache`]).
+  trees_most: u64,
   /// Whether a size the work asked for was refused room (counted once an answer).
   unroomed: bool,
   /// What it did since it was last asked.
@@ -226,6 +230,8 @@ impl PositionCache {
   fn commit_begun(&mut self, admission: &mut Admission) {
     self.most = self.most.max(self.met);
     self.met = 0;
+    self.trees_most = self.trees_most.max(self.trees_met);
+    self.trees_met = 0;
     self.grow_within(admission);
   }
 
@@ -600,9 +606,11 @@ impl Graph for StoreGraph<'_> {
     let Some((_, row)) = self.row(tree) else {
       return;
     };
-    let widening = self.repository.widen_read_cache(row.len, admission);
-    let budget = self.repository.read_cache_budget();
     let mut positions = self.positions.borrow_mut();
+    positions.trees_met = positions.trees_met.saturating_add(row.len);
+    let breadth = positions.trees_most.max(positions.trees_met);
+    let widening = self.repository.widen_read_cache(breadth, admission);
+    let budget = self.repository.read_cache_budget();
     let counts = &mut positions.counts;
     match widening {
       super::Widening::Grown => {

@@ -7307,13 +7307,14 @@ fn spread_chained_create(dirs: usize, depth: usize) -> (Vec<u8>, ObjectId, usize
 }
 
 /// Main 01a20182's reading of 2026-11-25: on git/git the fetch's read cache cut chain rebuilds by 2.1 % (2,047,136
-/// deltas against 2,004,133), where a one-directory fixture cut 85 %, so what the cache does on a real walk must be
-/// counted before its rule changes. Do: push [`spread_chained_create`] of [`SPREAD_DIRS`] directories [`SPREAD_DEPTH`]
-/// revisions deep; fetch its last commit. Expect: `200`, the pack whole; the read cache's work counted: widened at least
-/// once, never refused, its budget past zero, its hits and the deltas applied reported beside the trees read, so the
-/// budget's rule can be judged on a walk whose chains interleave. (Its hits there are the next piece's red.)
+/// deltas against 2,004,133; 6,702 hits, its budget at most 3.1 MB, never refused), where a one-directory fixture cut
+/// 85 %: sized for the longest tree's chain alone, every other directory's chain read between two of one directory's
+/// revisions put that chain out. Do: push [`spread_chained_create`] of [`SPREAD_DIRS`] directories [`SPREAD_DEPTH`]
+/// revisions deep; fetch its last commit. Expect: `200`, the pack whole; the read cache widened, never refused, and
+/// every directory's chain (and the root's) kept whole across the interleaved walk: each chain built once, by its first
+/// read, every later read a hit that applies no delta.
 #[test]
-fn a_fetchs_read_cache_counts_its_hits_widening_and_budget() {
+fn a_fetchs_read_cache_keeps_every_interleaved_chain_whole() {
   let (identity, certificate) = identity();
   let daemon = daemon(identity);
   let port = daemon.vcs_http_port().expect("the edge started");
@@ -7345,4 +7346,14 @@ fn a_fetchs_read_cache_counts_its_hits_widening_and_budget() {
   assert!(widened >= 1, "the read cache widened: {widened}");
   assert_eq!(refused, 0, "never refused room");
   assert!(budget > 0, "its budget counted: {budget}");
+  let chains = SPREAD_DIRS.saturating_add(1);
+  let later_reads = trees.saturating_sub(chains);
+  assert!(
+    hits >= u64::try_from(later_reads).expect("a count"),
+    "every read past each chain's first a hit: {hits} of {later_reads}"
+  );
+  assert!(
+    deltas <= u64::try_from(chains.saturating_mul(SPREAD_DEPTH)).expect("a count"),
+    "each chain built once: {deltas} deltas against {chains} chains {SPREAD_DEPTH} deep"
+  );
 }
