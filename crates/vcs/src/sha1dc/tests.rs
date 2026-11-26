@@ -430,8 +430,7 @@ fn compress_and_check_dispatches_all_32_disturbance_vectors_matching_oracle() {
   }
 
   let mut state = super::INITIAL_STATE;
-  for chunk in SHATTERED_1[..256].chunks_exact(BLOCK_LEN) {
-    let block: &[u8; BLOCK_LEN] = chunk.try_into().unwrap();
+  for block in SHATTERED_1[..256].as_chunks::<BLOCK_LEN>().0 {
     oracle::compress_ref(&mut state, block);
   }
   let colliding_block: &[u8; BLOCK_LEN] = SHATTERED_1[256..320].try_into().unwrap();
