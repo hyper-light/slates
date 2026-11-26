@@ -1167,7 +1167,7 @@
 >   bare runtime runs on the test's thread and is not refused. The fixtures still blocking are named in
 >   `test_store::SHARD_BLOCKING_ALLOWED`, each with its owner and how many sites reach it, and run their blocking body
 >   through `allowing_shard_blocking`; there is no global off-switch. The list only shrinks.
->   **The shard-blocking allow-list: 5 fixtures** (a test holds the list's length to this figure; edit both together):
+>   **The shard-blocking allow-list: 3 fixtures** (a test holds the list's length to this figure; edit both together):
 >   **Taken by w-git (2026-11-26, main's order: w-shared and w-perf held on a permission prompt since 18:03): their
 >   `audit_on_stored_shard` and `test_store::create` sites, a file at a time, each landing with its counts.** w-shared's:
 >   `repository/push/tests.rs`, `repository.rs`, `vcs_share/grants.rs`, `vcs_share/read_backs.rs`, `identities/tests.rs`,
@@ -1176,8 +1176,11 @@
 >   Edit none of them meanwhile; main assigns them back if either agent returns. **Passed to w-hg (2026-11-26, main's
 >   order: claimed in e15868057, not started):** `identities/tests.rs`, `vcs_store/index_upkeep.rs`,
 >   `repository/import/tests.rs` and `fleet.rs`; w-git keeps `vcs_store/paths/tests.rs` and `vcs_store/commits/tests.rs`.
->   - `test_store::audit_on_stored_shard`: 4 sites. svn 0; git 0; hg 0;
->     other 4 (`import/tests.rs` 2, `fleet.rs` 2). `vcs_store/commits/tests.rs`' 8 moved by w-git (2026-11-26) to
+>   - `test_store::audit_on_stored_shard`: 0 sites; the fixture and its allow-list entry are gone (w-hg, 2026-11-26).
+>     `repository/import/tests.rs`' 2 moved by w-hg (2026-11-26) to `audit_on_stored_shard_made` and `_made_all`, its
+>     repositories made from the test's thread. `fleet.rs`' 2 moved by w-hg (2026-11-26) to `run_on_stored_shard`
+>     tasks: the region of three set first, the repository made by `created().await`, its branch dispatched after.
+>     `vcs_store/commits/tests.rs`' 8 moved by w-git (2026-11-26) to
 >     `run_on_stored_shard` tasks: created with `created().await`, submitted with `paths::tests::version_awaited`,
 >     pushed with `push_through_awaited` or `push_unsettled_awaited`; the storm's build slices held to the test's own by
 >     `whole_build::DRIVEN_BY_TEST` (a test-only hold: awaiting its pushes' landings let the build's task finish it
@@ -1213,8 +1216,11 @@
 >     (`git_push/tests.rs` 23, `vcs_share/tests.rs` 9, `vcs_share/wait.rs` 2, `vcs_store/tests.rs` 2, `replica.rs` 1,
 >     `named_objects.rs` 1) and `test_store::audit_on_stored_shard_made_all`, any tool's (`upload/tests.rs` 12,
 >     `git_hooks/tests.rs` 2).
->   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 11 tests. hg 4
->     (`vcs_ssh` 4); other 7 (`daemon::tests` 5, `repository::import` 2). `identities`' 1 moved by w-hg (2026-11-26):
+>   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 9 tests. hg 4
+>     (`vcs_ssh` 4); other 5 (`daemon::tests` 5). `repository::import`'s 2 moved by w-hg (2026-11-26): their
+>     repositories made from the test's thread (`create_on`), and the A-687 test's read-back of let-go changeset texts
+>     awaited from a task (`served_awaited`, the store's answers by `hg_view::answer_store_wants`), so
+>     `repository::import::tests::served`'s allow-list entry is gone. `identities`' 1 moved by w-hg (2026-11-26):
 >     its session test's repository made from the test's thread (`create_on`). `repository::tests`' 1 moved
 >     by w-git (2026-11-26): its checkpoint test's repository made by `test_store::create_on` first.
 >     `repository::push`'s 5 moved by w-git (2026-11-26): each observation's repository made first by
@@ -1259,7 +1265,7 @@
 >   - w-hg's push and import helpers, counted by the tests refused without each once the entries above let them
 >     through: `repository::hg_push::land_stored` (2 tests, `vcs_ssh::tests::hg`),
 >     `vcs_store::commits::home_and_land_blocking` (7: `commits` 6, `upload` 1), and
->     `repository::import::tests::served`'s read-back (1).
+>     `repository::import::tests::served`'s read-back (1, gone 2026-11-26).
 >   Moved instead of listed: `daemon::tests::t_goal93_a_homes_landed_records_survive_a_restart…` lands between two
 >   observations. Shrunk: `repository/hg_push/tests.rs`' 17 daemon tests push through the daemon's own driver
 >   (`hg_push::unbundle`) from a task on the shard, their repositories made there (`created().await`), so
