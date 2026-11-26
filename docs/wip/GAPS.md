@@ -14707,6 +14707,13 @@ steps of the daemon serving its port (`EDGE_SHARDS`, registered by `daemon_confi
 waits a heartbeat and looks again: stepped, it reads on; not, it gives up typed. Reds:
 `a_patient_read_waits_for_an_answer_while_its_daemon_steps` (a fixed patience of one look gives up where the patient read
 is answered three looks later) and `a_patient_read_gives_up_on_a_daemon_that_makes_no_step` (within a look and a beat).
+The SSH seat tests' `ended: false` (the 8a loop at 228d0dc97, round 4: `a_slow_push_is_reaped_when_a_new_connection_needs_its_seat`,
+`a_passphrase_pause_is_not_cut_while_a_seat_is_free`, `a_slow_push_is_not_cut_while_a_seat_is_free`, each a whole session,
+`order [94, 98, 96, 97]`, status 0): the client judged its connection ended only where its close came within its patience,
+four liveness windows. Now `Peer::ended` reads until the close itself (`read_until_closed`), each timeout read again, as
+A-745's patient reads do: the SSH edge's phase waits close a stuck session, so a stuck server still ends it, and the seat
+tests count their reaps beside. Red: `a_connection_closed_past_the_clients_patience_is_seen_ended`, a fixed patience
+judging a connection closed three timeouts later not ended, the end itself seen.
 
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 
