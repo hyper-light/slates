@@ -486,6 +486,35 @@
 > arriving mid-derivation no later to its first pack byte than one with nothing behind; a listing after a push waiting
 > for no derivation, under slow scheduling too. The design's status says the same ("Deriving a push's versions behind
 > it").
+> **The fetch's read cache on git/git (w-git, 2026-11-26; main's ruling under Ada's freeze): OPEN, no piece of its own.**
+> Built: `tree_bases_inflated`, the roots a fetch's tree reads inflate, beside `tree_deltas`, the steps rebuilt over them
+> (38f37c8c4); `tree_deltas_past_one` summed at last (4d50698f4: the server's sum had dropped it, so it read 0); the
+> eviction order, a base found kept again laid again with the newest (`packed::Recent::refresh`, 2f8b9d9f9: kept, the
+> star fixture's roots inflated 44 -> 23, git/git neutral); the budget past the two chunks its turnover holds idle
+> (`Recent::budget_keeping`, aea6024e7, its git/git A/B queued). Measured on git/git (main's legs at 1e58953e0 and
+> 003e4d7c7, counters deterministic): read cache hits 31,620 -> 31,858 of `units.open_tree` 3,093,691 (1.02 % either
+> way), `tree_bases_inflated` 138,556 -> 138,318, `tree_deltas` 1,810,257 -> 1,810,435, `tree_deltas_past_one`
+> 1,648,331 -> 1,648,509, budget at most 10,150,020 B in both. Why, from the code:
+> (1) The budget rule is not small: `widen_read_cache` asks (learned depth + 1) x breadth, the breadth the most bytes of
+> trees one sent commit opens (`PositionCache::trees_most`), which the walk's dedup makes the first commit's whole
+> snapshot: 10,150,020 = 51 x 199,020, git's depth limit 50 and one snapshot's trees.
+> (2) Every tree in the pack is read exactly once: hits + roots inflated = 170,176 in both arms, the pack's trees (`git
+> verify-pack -v`: 162,542 deltas, 7,634 whole). 81 % of reads walk to a root no read kept; the reads applying a delta
+> (`tree_deltas` - `tree_deltas_past_one` = 161,926) rebuild about 11 steps each.
+> (3) The rule's model does not hold for git's packs: it keeps "every tree's chain the walk reads between two revisions
+> of one tree", a chain taken for one tree's revisions read close together, where `pack-objects` picks a delta's base in
+> a window sorted by type, name hash and size, so a chain's members spread across the history and two reads sharing a
+> prefix lie far apart in the walk. A step built survives only so many reads at any order, so the order cannot help:
+> the LRU's ±238 is that reuse distance, not noise. The 7,139 roots (of the 165,574 trees `git rev-list --objects
+> f7de81456940` reaches, whole in pack-c9d34d16) were each inflated about 19 times.
+> (4) The working set is the bytes built and still on an unread tree's chain, at most every tree inflated: on main's
+> git/git copy (2026-11-26 04:23, `git cat-file --batch-all-objects --batch-check='%(objecttype) %(objectsize)'`),
+> 170,176 trees, 2,633,099,758 B inflated (2,511.1 MiB; mean 15,473 B, largest 62,061 B; 79,879,040 B on disk), about
+> 250 x the 10 MB budget. No budget rule reaches it within a fetch's bounded working set.
+> The open path: a budget sized from the pack's own chains, or an enumeration that reads no trees at all. Stock git
+> answers a clone's object enumeration from reachability bitmaps, without walking trees, where a pack has them: git's
+> documentation, the bitmap format (`gitformat-bitmap`, https://git-scm.com/docs/bitmap-format) and `pack.useBitmaps`
+> in `git config` (https://git-scm.com/docs/git-config).
 > **PRECONDITION OF THE NEXT LIFT (w-git, 2026-11-25, main 01a20182's ruling): a holder's replica build reads a let-go
 > window as missing.** Found writing the red for main's ruling of 2026-11-24 (a write path's bring-back lets go at its
 > owner's end, a64f385b1). Scene (a three-node `f = 1` fleet, git repository on a): push `main`; push two new branches,
