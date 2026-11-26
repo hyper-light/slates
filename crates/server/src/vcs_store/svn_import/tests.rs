@@ -1051,6 +1051,7 @@ fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shar
       let (loaded, _turns) = imported(svn, dump).await;
       let counts = wide_counts();
       let (longest_ns, longest_task) = longest_poll();
+      print_phases("wide-add");
       eprintln!(
         "wide-add: the longest step {} us ({longest_task})",
         longest_ns / 1000
@@ -1149,6 +1150,7 @@ fn imported_whole_and_stepped(
           .map_or(0, |engine| engine.copies_grafted())
       });
       let (longest_ns, longest_task) = longest_poll();
+      print_phases(name);
       (
         loaded
           .map(|loaded| loaded.youngest)
@@ -1317,6 +1319,8 @@ fn wide_import_sliced(counts: &WideCounts) {
 std::thread_local! {
   /// The longest poll on this thread of a history [`cpu_timed`] times: its wall and its thread-CPU nanoseconds.
   static TIMED_LONGEST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+  /// That poll's spans in the import's phases, in order (`svn_import::phase`).
+  static TIMED_SPANS: std::cell::RefCell<Vec<super::phase::Span>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A history whose every poll is timed by the wall clock and by its thread's CPU clock
@@ -1324,6 +1328,8 @@ std::thread_local! {
 pub(crate) struct CpuTimed<F> {
   /// The history.
   future: std::pin::Pin<Box<F>>,
+  /// The phase its last poll ended in, which its next resumes.
+  phase: &'static str,
 }
 
 impl<F: std::future::Future> std::future::Future for CpuTimed<F> {
@@ -1334,13 +1340,17 @@ impl<F: std::future::Future> std::future::Future for CpuTimed<F> {
     context: &mut std::task::Context<'_>,
   ) -> std::task::Poll<F::Output> {
     let cpu_ns = || slates_rt::registry::calling_thread_cpu().map_or(0, |reading| reading.spent_ns);
+    super::phase::poll_begun(self.phase);
     let (wall_began, cpu_began) = (slates_rt::futures::now_ns(), cpu_ns());
     let polled = self.future.as_mut().poll(context);
     let wall = slates_rt::futures::now_ns().saturating_sub(wall_began);
     let spent = cpu_ns().saturating_sub(cpu_began);
+    let (spans, ended) = super::phase::poll_ended();
+    self.phase = ended;
     TIMED_LONGEST.with(|longest| {
       if wall > longest.get().0 {
         longest.set((wall, spent));
+        TIMED_SPANS.with(|kept| *kept.borrow_mut() = spans);
       }
     });
     polled
@@ -1352,8 +1362,10 @@ impl<F: std::future::Future> std::future::Future for CpuTimed<F> {
 /// work, so the CPU beside it tells the two apart). Made on the shard that polls it, whose longest so far it clears.
 pub(crate) fn cpu_timed<F: std::future::Future>(history: F) -> CpuTimed<F> {
   TIMED_LONGEST.with(|longest| longest.set((0, 0)));
+  TIMED_SPANS.with(|kept| kept.borrow_mut().clear());
   CpuTimed {
     future: Box::pin(history),
+    phase: "untagged",
   }
 }
 
@@ -1380,6 +1392,28 @@ pub(crate) fn longest_poll() -> (u64, String) {
     )
   })
   .expect("the shard's entry")
+}
+
+/// Prints the phases of `name`'s history's longest poll on this thread ([`cpu_timed`]): its spans in the import's
+/// phases, in order, each by the wall and by the thread's CPU ([`phases_line`]).
+pub(crate) fn print_phases(name: &str) {
+  let longest = TIMED_LONGEST.with(std::cell::Cell::get);
+  let spans = TIMED_SPANS.with(|kept| kept.borrow().clone());
+  eprintln!("{}", phases_line(name, longest, &spans));
+}
+
+/// The line naming the phases of `name`'s history's longest poll (`wall_ns` and `cpu_ns` long), for a probe's parser:
+/// `PHASES <name> wall_ns=<n> cpu_ns=<n> spans=<tag>:<wall_ns>:<cpu_ns>,...`, the spans in the order the poll ran
+/// them, a phase met twice in a row one span.
+fn phases_line(name: &str, (wall_ns, cpu_ns): (u64, u64), spans: &[super::phase::Span]) -> String {
+  let spans: Vec<String> = spans
+    .iter()
+    .map(|(tag, wall, cpu)| format!("{tag}:{wall}:{cpu}"))
+    .collect();
+  format!(
+    "PHASES {name} wall_ns={wall_ns} cpu_ns={cpu_ns} spans={}",
+    spans.join(",")
+  )
 }
 
 /// Goal 93 (main's order of 2026-11-26 after probe 8: no fixture copied or moved a wide tree, so the commit's copies

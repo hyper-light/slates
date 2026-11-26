@@ -533,9 +533,13 @@ impl ImportBatch {
     spent: &mut dyn FnMut() -> bool,
   ) -> Option<Result<u64, StageRefused>> {
     if let Some(reserving) = self.reserving.take() {
+      #[cfg(test)]
+      crate::vcs_store::svn_import::phase::tag("stage.reserving");
       return self.reserve_step(state, reserving, spent);
     }
     if let Some(judging) = self.judging.take() {
+      #[cfg(test)]
+      crate::vcs_store::svn_import::phase::tag("stage.judging");
       return self.judge_step(state, judging, spent);
     }
     // A step with nothing begun is refused, never "more": its caller steps until an end.
@@ -543,12 +547,16 @@ impl ImportBatch {
       return Some(Err(StageRefused::Unavailable));
     };
     if pending.measured.is_some() {
+      #[cfg(test)]
+      crate::vcs_store::svn_import::phase::tag("stage.measuring");
       return self.measure_pending(state, pending, spent);
     }
     let Some(preview) = self.preview.as_ref() else {
       return Some(Err(StageRefused::Unavailable));
     };
     let stepped = state.greens.with_preview_mut(preview, |engine| {
+      #[cfg(test)]
+      crate::vcs_store::svn_import::phase::tag("stage.committing");
       match engine.committing_step(&mut pending.committing, spent) {
         CommitStep::More => Stepped::More,
         CommitStep::Lend(unlent) => Stepped::Lend(unlent),
