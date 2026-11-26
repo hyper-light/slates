@@ -421,12 +421,20 @@ pub struct Writing {
   hasher: blake3::Hasher,
   /// The identities kept so far, in order.
   windows: Vec<ContentId>,
+  /// Whether each window it keeps that the store holds let go is brought back from its bytes
+  /// ([`ContentStore::begin_object_whole`]).
+  whole: bool,
 }
 
 impl Writing {
   /// The windows kept so far.
   pub fn windows_kept(&self) -> usize {
     self.windows.len()
+  }
+
+  /// The bytes of the window being filled: at most a window, what the writer itself holds.
+  pub fn pending_len(&self) -> usize {
+    self.pending.len()
   }
 
   /// The buffer the object's windows were filled in, taken out, emptied: what a writer that puts object after object
@@ -956,6 +964,34 @@ impl ContentStore {
     Writing::default()
   }
 
+  /// Starts an object put a window at a time as [`ContentStore::begin_object`] does, each window it keeps that the store
+  /// holds let go brought back from the bytes it is handed, as [`ContentStore::put_object_whole`] brings one back: what a
+  /// replay reading a let-go pack from the node's store puts, so the object it names reads whole by its identity.
+  pub fn begin_object_whole(&self) -> Writing {
+    Writing {
+      whole: true,
+      ..Writing::default()
+    }
+  }
+
+  /// The bytes of `writing`, an object put a window at a time and not yet finished, from `offset` to the end of the
+  /// window that holds them: lent from the window the store keeps (or copied out, as [`ContentStore::bytes_of`]), or
+  /// borrowed from its pending bytes. None past what it has taken, or where that window is let go.
+  pub fn writing_piece<'s>(&'s self, writing: &'s Writing, offset: u64) -> Option<Cow<'s, [u8]>> {
+    let offset = usize::try_from(offset).ok()?;
+    let window = self.window.get();
+    let (index, within) = (offset.checked_div(window)?, offset.checked_rem(window)?);
+    let piece = match writing.windows.get(index) {
+      Some(identity) => match self.bytes_of(identity)? {
+        Cow::Borrowed(bytes) => Cow::Borrowed(bytes.get(within..)?),
+        Cow::Owned(bytes) => Cow::Owned(bytes.get(within..)?.to_vec()),
+      },
+      None if index == writing.windows.len() => Cow::Borrowed(writing.pending.get(within..)?),
+      None => return None,
+    };
+    (!piece.is_empty()).then_some(piece)
+  }
+
   /// Starts an object of `len` bytes put a window at a time, as [`ContentStore::begin_object`] does, its window's buffer
   /// reserved once now at the window or `len` if shorter, so no piece grows or moves it (goal 93, svn finding (2)):
   /// begun empty, the buffer doubled from the first piece, and a 256 KiB text put in 65 KB copy slices made allocations
@@ -1006,12 +1042,24 @@ impl ContentStore {
       writing.pending.extend_from_slice(taken);
       rest = left;
       if writing.pending.len() == window {
-        let identity = self.put(&writing.pending)?;
+        let identity = self.put_kept(&writing.pending, writing.whole)?;
         writing.windows.push(identity);
         writing.pending.clear();
       }
     }
     Ok(())
+  }
+
+  /// [`ContentStore::put`] of a writer's window, brought back first where the store holds it let go and the writer is
+  /// whole ([`ContentStore::begin_object_whole`]).
+  fn put_kept(&mut self, bytes: &[u8], whole: bool) -> Result<ContentId, ContentRefused> {
+    if whole {
+      let identity = ContentId::of(bytes);
+      if self.is_away(&identity) {
+        self.bring_back(&identity, bytes)?;
+      }
+    }
+    self.put(bytes)
   }
 
   /// Ends the object: its last window kept, then the lists naming its windows, `fanout` a list, level by level, as
@@ -1029,7 +1077,7 @@ impl ContentStore {
   /// [`ContentStore::finish_object`]'s tree: its root.
   fn finish_root(&mut self, writing: &mut Writing) -> Result<ContentId, ContentRefused> {
     if !writing.pending.is_empty() || writing.windows.is_empty() {
-      let identity = self.put(&writing.pending)?;
+      let identity = self.put_kept(&writing.pending, writing.whole)?;
       writing.windows.push(identity);
       writing.pending.clear();
     }

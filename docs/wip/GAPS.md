@@ -653,10 +653,12 @@
 > (`docs/bugs/2026-11-20-a-shards-idle-spin-took-a-clients-kick.md`).
 
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
-> the landing's entry are sliced (A-920 pieces 1-6b), and the checkpoint's identity fold takes at most the step ceiling a
+> the landing's entry are sliced (A-920 pieces 1-6b, 7a), and the checkpoint's identity fold takes at most the step ceiling a
 > turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history
 > task (debug, 9,000 files): the tail's `fold_to_readers` (7.6 ms), the register's op
-> (`publish_held_increments` and `record_all`, 8 ms), and a turn (19 ms); its longest landing poll 28-76 ms a run. Owed:
+> (`publish_held_increments` and `record_all`, 8 ms), and a turn's close (`close_revision`, 20.4 ms whole; A-920 7b
+> next; its parse is an event a unit since 7a, a 68 KB slice a call having been 3.9-5.3 ms); its longest landing poll
+> 28-76 ms a run. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
 > files): `made_commit.rs` (two calls), `vcs_store/svn_made.rs`, `vcs_store/hg_made.rs`, `greens.rs`'s own caller. A
@@ -1301,8 +1303,9 @@
 >   (w-hg, 2026-11-26, main's order): its 12 callers' modules (`identities` 6, `repository::push` 1,
 >   `vcs_share::grants` 3, `vcs_store::paths` 1, `vcs_store::tests` 1) pass with production's let-go, 0 reds.
 >   - The test-only holds left in production code, each pausing a driver for a test, changing when and never what:
->     `hg_push::hold_next_landing` (the four race histories) and `whole_build::DRIVEN_BY_TEST` (the storm's build
->     slices). `refining::HELD_FOR_TEST` is gone (w-hg, 2026-11-26, main's ruling), with `HELD_JOBS`, `refined_now` and
+>     `hg_push::hold_next_landing` (the four race histories), `whole_build::DRIVEN_BY_TEST` (the storm's build
+>     slices) and `vcs_store::REPLAY_FILLS_BEFORE_HOLD` (w-git, C2: a rebuild held between two of its pack's pieces, so
+>     its cancellation there is the test's, `t_c2_a_rebuild_cancelled_between_two_pieces_…`). `refining::HELD_FOR_TEST` is gone (w-hg, 2026-11-26, main's ruling), with `HELD_JOBS`, `refined_now` and
 >     `refining::start`'s `cfg(test)` arm: it changed what refining answered. Red first,
 >     `refining::tests::a_refinement_whose_base_was_let_go_brings_it_back_and_refines` (a Subversion text of 2,000
 >     functions, every window let go, `test_store::a_text_whose_windows_are_away`, re-indented whole): under the task
@@ -2381,10 +2384,24 @@
 > does, and the record's hold on a pack named only then is taken once put. Red:
 > `t_c2_a_restarts_replay_reads_its_records_pack_a_piece_at_a_time_within_its_bound` (524,574 B held at once, the
 > whole pack, against a bound of 131,072; now 131,072); a rebuild cancelled between two pieces names no pack and the
-> next reads it back byte for byte (`t_c2_a_rebuild_cancelled_between_two_pieces_…`). Owed (w-git): the push's pack
-> held twice in RAM until it lands (its own
-> buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
-> region homes, held by a test of its own (the rebuild test now reads the node's store).
+> next reads it back byte for byte (`t_c2_a_rebuild_cancelled_between_two_pieces_…`). The push's pack held once
+> BUILT (w-git, 2026-11-26, C3 (b), main's ruling: content once on arrival): a push puts its pack in the content store
+> a piece at a time as the client sends it (`Push::extend_pack`, the store's `Writing`, readable while under way:
+> `ContentStore::writing_piece`), its judge, its rows' CRC and raw lengths and its staging reading the entries where
+> they lie there, the staging finishing the put; `Push.pack: Vec<u8>` is gone, and a push refused before its staging
+> gives the put back, naming nothing. Its read cache's budget is widened within what the shard grants
+> (`Push::widen_reading`: `Recent::budget_keeping` of its deepest chain and one times its longest object, asked of
+> `Store::admittable`; counted `git_push.read_cache_widened`, `_refused`, `_budget_most`), never the pack's length. Red:
+> `git_push::tests::a_pushs_pack_is_put_as_it_arrives_its_buffer_a_window_and_its_cache_its_chains` (a 2,213,177-byte
+> pack: the push held at most 262,143 B, within its window, `git_push.pack_buffer_most`, and its cache's budget 87,382
+> B; with the old shape both the pack's length); `a_pushs_read_cache_is_widened_within_its_grant_and_reads_past_it_whole`
+> (git crate: a one-byte grant refused, the budget as it was, every object read back whole). C5's resident reader is
+> now paired (`git_interop::resident_of`: macOS `phys_footprint`, `proc_pid_rusage`; Linux `ps`'s RSS). **b2 IN FLIGHT
+> (w-git, main's order of 2026-11-26, the next piece):** the homing and the landing still carry the pack as whole
+> buffers, `SealedPush::pack_to_home`'s copy into `Carry::Home(bytes, owner)` and `git_push::landing_of`'s parts built
+> from the homed bytes, each a whole-pack copy that grows with the push (main's reading: the likely reason C5's peak,
+> 551.6 MiB, sits far above its after-push figure). Owed (w-git): a node whose store lacks a record's changeset
+> reading its names from their region homes, held by a test of its own (the rebuild test now reads the node's store).
 > OPEN (goal 93, w-git; w-sessionlog's reduction 2026-11-21): a whole clone of git/git with 506 tags or more is aborted
 > "possible repository corruption on the remote side". The repository's encoding never finishes (its first version,
 > master's whole history, begun and never kept; each tag's first version is encoded over everything it reaches, so the

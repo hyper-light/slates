@@ -286,13 +286,29 @@ impl Importer {
     buffer: &[u8],
     ended: bool,
   ) -> Result<Importing, MigrationRefusal> {
+    self.import_within((repository, texts), (buffer, ended), &mut || false)
+  }
+
+  /// [`Importer::import`], stopping after any whole event once `spent` says the caller's slice is spent, at least one
+  /// event a call (A-920 7a: a call took every event of its buffer, a copy slice of 68 KB, 3.9-5.3 ms debug, since a
+  /// dump's parse costs far more than its bytes' copy): then it answers [`Importing::NeedMore`] with the bytes done
+  /// with and none more needed, so the caller drops them and calls again with what remains.
+  ///
+  /// # Errors
+  /// As [`Importer::import`].
+  pub fn import_within(
+    &mut self,
+    (repository, texts): (&mut Repository, &dyn TextSink),
+    (buffer, ended): (&[u8], bool),
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<Importing, MigrationRefusal> {
     if let Some(refusal) = &self.refused {
       return Err(refusal.clone());
     }
     if self.done {
       return Ok(Importing::Done);
     }
-    let result = self.run((repository, texts), buffer, ended);
+    let result = self.run((repository, texts), (buffer, ended), spent);
     if let Err(refusal) = &result {
       self.refused = Some(refusal.clone());
       self.revision = None;
@@ -305,8 +321,8 @@ impl Importer {
   fn run(
     &mut self,
     (repository, texts): (&mut Repository, &dyn TextSink),
-    buffer: &[u8],
-    ended: bool,
+    (buffer, ended): (&[u8], bool),
+    spent: &mut dyn FnMut() -> bool,
   ) -> Result<Importing, MigrationRefusal> {
     match self.pending.take() {
       Some(Pending::Begin { number, properties }) => {
@@ -338,6 +354,13 @@ impl Importer {
             return Ok(Importing::Base {
               consumed: offset,
               text,
+            });
+          }
+          // The caller's slice spent after a whole event: what is done with dropped, the rest read at the next call.
+          if spent() {
+            return Ok(Importing::NeedMore {
+              consumed: offset,
+              needed: 0,
             });
           }
         }

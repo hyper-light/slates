@@ -952,7 +952,7 @@ fn t_a626_p4_a_copy_of_nothing_is_refused_by_its_case() {
         },
       );
       let ReplyBody::WorkCreated { id: work, .. } = made else {
-        return Err(made);
+        return Err(Box::new(made));
       };
       let copy = WorkOp::Copy {
         from: "/nothing".to_owned(),
@@ -965,7 +965,7 @@ fn t_a626_p4_a_copy_of_nothing_is_refused_by_its_case() {
     });
     let work = match work {
       Ok(work) => work,
-      Err(made) => return Some(made),
+      Err(made) => return Some(*made),
     };
     Some(recorded_git_submit_awaited(crate::identities::authored(work, "copy nothing")).await)
   });

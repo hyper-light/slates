@@ -9672,9 +9672,7 @@ mod tests {
           );
           Some(work)
         });
-        let Some(work) = work else {
-          return None;
-        };
+        let work = work?;
         // A git green's submit is a client's recorded request (A-896), awaited from a task of the shard: its
         // refinement, made commit and whole build run as the shard's own tasks run them.
         let submitted =

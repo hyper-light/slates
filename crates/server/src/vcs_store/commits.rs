@@ -990,7 +990,7 @@ fn next_ask(
         return None;
       }
       sealed.homed_as((identity, count));
-      let (bytes, packed) = sealed.pack_to_home()?;
+      let (bytes, packed) = sealed.pack_to_home(state)?;
       if !super::hold_for_record(state, &packed.0) {
         return None;
       }

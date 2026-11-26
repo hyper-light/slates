@@ -4,14 +4,17 @@
 //! committer's date; its generation number waits for the push to be sealed ([`crate::store::Repository::seal`]), since
 //! a pack sends a commit before its parents as often as after.
 //!
-//! **Read in place while judged** (main's ruling B, part 2; Ada's storage ruling of 2026-11-20: changes live in RAM).
-//! A push whose objects arrive as a pack keeps the pack as the client sent it ([`Push::extend_pack`]) and each object as
-//! where its entry begins ([`Push::admit_placed`]), never inflated beside it: git/git's v1.5.0 pack is 9.4 MiB, its
-//! objects 304.6 MiB inflated. An object is read from the pack where it lies ([`Push::bytes`], `store::packed::read`),
-//! a chain resolved from the objects read lately ([`super::packed::Recent`], held to the pack's length). A push's
-//! staging puts the pack in the content store as one content, a window a unit ([`Push::set_stored_pack`]), and each
-//! object's row names where it lies there (A-722's record v4, rows by pack place): what lands is the pack, never its
-//! objects inflated.
+//! **Read in place while judged** (main's ruling B, part 2; Ada's storage ruling of 2026-11-20: changes live in RAM;
+//! main's order of 2026-11-26, C3: content once on arrival). A push whose objects arrive as a pack puts the pack in the
+//! content store as the client sends it, a piece at a time as one content ([`Push::extend_pack`], the store's
+//! `Writing`), never a buffer of its own that grows with the push, and keeps each object as where its entry begins
+//! ([`Push::admit_placed`]), never inflated beside it: git/git's v1.5.0 pack is 9.4 MiB, its objects 304.6 MiB
+//! inflated. An object is read from the pack where it lies ([`Push::bytes`], `store::packed::read`, the put's windows
+//! until it is finished, then the stored pack's), a chain resolved from the objects read lately
+//! ([`super::packed::Recent`], its budget widened within what the push's admission grants, [`Push::widen_reading`]). A
+//! push's staging finishes the put ([`Push::finish_pack`]), and each object's row names where it lies there (A-722's
+//! record v4, rows by pack place): what lands is the pack, never its objects inflated. A push refused or abandoned
+//! before then gives the put back, and nothing is named.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -176,10 +179,14 @@ pub struct Push {
   deepest: u64,
   /// The rows staged once the push was sealed (A-722 part 3).
   staged: Option<Staged>,
-  /// The pack as the client sent it (module docs, "Read in place while judged"). Kept because it is the push's objects'
-  /// one copy, compressed and with their deltas, and what its record writes; it grows by what each call of the client's
-  /// bytes brought.
-  pack: Vec<u8>,
+  /// The pack as the client sends it, put in the content store a piece at a time as one content (module docs, "Read in
+  /// place while judged"): the push's objects' one copy, compressed and with their deltas. None before the first piece,
+  /// and once finished ([`Push::stored_pack`]).
+  pack: Option<slates_vcs::Writing>,
+  /// The bytes of the pack put so far.
+  pack_len: u64,
+  /// Whether its pack's put brings back each window the store holds let go ([`Push::bringing_back`]).
+  pack_whole: bool,
   /// The objects of `pack`, by name. One entry an object: what names it to where it lies.
   placed: BTreeMap<ObjectId, Placed>,
   /// Where each entry of `pack` begins, every one its source sent, those the repository held already among them, and
@@ -193,7 +200,8 @@ pub struct Push {
   /// The longest object of its own pack: what a read of its objects, and once it lands its repository's, is held to.
   largest: u64,
   /// The buffers an object is read from the pack with, and the objects read lately (`packed::Scratch`): reused read
-  /// after read; what it keeps lately is held to the pack's length. In a cell because a read is a look, not a change.
+  /// after read; what it keeps lately is held to the budget its admission granted ([`Push::widen_reading`]). In a cell
+  /// because a read is a look, not a change.
   reading: RefCell<Scratch>,
 }
 
@@ -208,7 +216,9 @@ impl Push {
       sealed: false,
       deepest: 0,
       staged: None,
-      pack: Vec::new(),
+      pack: None,
+      pack_len: 0,
+      pack_whole: false,
       placed: BTreeMap::new(),
       entries: BTreeMap::new(),
       stored_pack: None,
@@ -325,11 +335,103 @@ impl Push {
     Ok((id, Admitted::New))
   }
 
-  /// Appends `bytes`, the next of the pack the client sent, to the push's own (module docs, "Read in place while
-  /// judged"); what the push keeps lately is held to the pack's length from now on.
-  pub fn extend_pack(&mut self, bytes: &[u8]) {
-    self.pack.extend_from_slice(bytes);
-    self.reading.get_mut().recent().set_budget(self.pack.len());
+  /// Puts `bytes`, the next of the pack the client sent, in the content store as the push's own pack's next piece
+  /// (module docs, "Read in place while judged"), the put begun at the first. Refused (the budget, the storage), what
+  /// the put kept so far stays the push's, given back with it.
+  ///
+  /// # Errors
+  /// The store's refusal of the put.
+  pub fn extend_pack(
+    &mut self,
+    store: &mut ContentStore,
+    bytes: &[u8],
+  ) -> Result<(), ContentRefused> {
+    if bytes.is_empty() {
+      return Ok(());
+    }
+    let whole = self.pack_whole;
+    let writing = self.pack.get_or_insert_with(|| {
+      if whole {
+        store.begin_object_whole()
+      } else {
+        store.begin_object()
+      }
+    });
+    store.put_window(writing, bytes)?;
+    self.pack_len = self.pack_len.saturating_add(crate::to_u64(bytes.len()));
+    Ok(())
+  }
+
+  /// Makes its pack's put bring back each window the store holds let go from the bytes it is handed
+  /// (`ContentStore::begin_object_whole`): a replay's, whose pack a landed push let go, so its objects read where they
+  /// lie. Before its first piece.
+  pub fn bringing_back(&mut self) {
+    self.pack_whole = true;
+  }
+
+  /// The bytes of its own pack put so far.
+  pub fn pack_len(&self) -> u64 {
+    self.pack_len
+  }
+
+  /// The bytes the push itself holds of its own pack: its put's window being filled, at most a window (module docs).
+  pub fn pack_held(&self) -> usize {
+    self
+      .pack
+      .as_ref()
+      .map_or(0, slates_vcs::Writing::pending_len)
+  }
+
+  /// Finishes its pack's put: the pack named in the content store as one content, held by the push until its rows hold
+  /// it ([`Push::stored_pack`]); refused, the put given back. A push whose pack is finished, or that brought none,
+  /// finishes nothing.
+  ///
+  /// # Errors
+  /// The store's refusal of the put's end.
+  pub(crate) fn finish_pack(&mut self, store: &mut ContentStore) -> Result<(), ContentRefused> {
+    if self.stored_pack.is_some() {
+      return Ok(());
+    }
+    let Some(mut writing) = self.pack.take() else {
+      return Ok(());
+    };
+    match store.finish_object(&mut writing) {
+      Ok(identity) => {
+        self.stored_pack = Some((identity, self.pack_len));
+        Ok(())
+      }
+      Err(refused) => {
+        store.abandon_object(writing);
+        Err(refused)
+      }
+    }
+  }
+
+  /// What its reads keep of the objects read lately, widened for the chains its pack carries: the deepest chain the
+  /// push's source carried, and one more for its base, times its longest object so far
+  /// ([`super::packed::Recent::budget_keeping`]), the growth charged to `admission`, the push's own. Refused room, it
+  /// stays as it is: past what the admission grants, a chain's reads are rebuilt from its base, slower, never refused.
+  pub fn widen_reading(&self, admission: &mut Admission) -> super::Widening {
+    let wanted = super::packed::Recent::budget_keeping(
+      self.deepest.saturating_add(1).saturating_mul(self.largest),
+    );
+    let mut reading = self.reading.borrow_mut();
+    let have = crate::to_u64(reading.recent().budget());
+    if wanted <= have {
+      return super::Widening::Enough;
+    }
+    if admission.charge(wanted.saturating_sub(have)).is_err() {
+      return super::Widening::Refused;
+    }
+    reading
+      .recent()
+      .set_budget(usize::try_from(wanted).unwrap_or(usize::MAX));
+    super::Widening::Grown
+  }
+
+  /// The most bytes its reads may keep of the objects read lately ([`Push::widen_reading`]).
+  pub fn reading_budget(&self) -> usize {
+    self.reading.borrow_mut().recent().budget()
   }
 
   /// Keeps `bytes`, the object of type `kind` whose entry begins at `offset` in the push's pack, as read lately (taken
@@ -337,11 +439,6 @@ impl Push {
   pub fn keep_read(&mut self, offset: u64, kind: Kind, bytes: Vec<u8>) {
     let place = self.own(offset);
     self.reading.get_mut().recent().keep(place, kind, bytes);
-  }
-
-  /// The push's own pack as the client sent it (A-723: what its record writes).
-  pub fn pack(&self) -> &[u8] {
-    &self.pack
   }
 
   /// The bytes the push's reading keeps lately ([`super::packed::Recent`]).
@@ -353,9 +450,18 @@ impl Push {
   fn own(&self, offset: u64) -> InPack {
     InPack {
       pack: OWN_PACK,
-      len: u64::try_from(self.pack.len()).unwrap_or(u64::MAX),
+      len: self.pack_len,
       offset,
     }
+  }
+
+  /// The bytes of its own pack from `offset` to the end of the window holding them, in `store`: the put's windows while
+  /// it is under way, the stored pack's once finished. None past what it put, or where that window is let go.
+  fn own_piece<'s>(&'s self, store: &'s ContentStore, offset: u64) -> Option<Cow<'s, [u8]>> {
+    if let Some((pack, len)) = self.stored_pack {
+      return store.piece(&pack, len, offset);
+    }
+    store.writing_piece(self.pack.as_ref()?, offset)
   }
 
   /// The bytes of the object held under `id`: lent from the content store where it is one window there, else copied
@@ -562,7 +668,7 @@ impl Push {
   }
 
   /// Where the object held under `id` is in the content store: its own content, for one held whole; where its entry
-  /// lies in the push's pack once the staging has put the pack there ([`Push::set_stored_pack`]); none before.
+  /// lies in the push's pack once the staging has put the pack there ([`Push::finish_pack`]); none before.
   pub(crate) fn stored(&self, id: &ObjectId) -> Option<StoredAt> {
     match self.placed.get(id) {
       Some(placed) => {
@@ -590,29 +696,42 @@ impl Push {
   /// next entry or the pack's trailer; the CRC32 of those raw bytes; and for a delta, the object it is a delta against
   /// (an offset delta's by the entry it names, a reference delta's by its name). None for an object not placed, or an
   /// entry whose header cannot be read, which a fetch then encodes.
-  pub(crate) fn entry_of(&self, id: &ObjectId) -> Option<(u64, u32, Option<ObjectId>)> {
+  pub(crate) fn entry_of(
+    &self,
+    store: &ContentStore,
+    id: &ObjectId,
+  ) -> Option<(u64, u32, Option<ObjectId>)> {
     let offset = self.placed.get(id)?.offset;
-    let trailer =
-      crate::to_u64(self.pack.len()).checked_sub(crate::to_u64(self.format.raw_len()))?;
+    let trailer = self
+      .pack_len
+      .checked_sub(crate::to_u64(self.format.raw_len()))?;
     let end = self
       .entries
       .range(offset.saturating_add(1)..)
       .next()
       .map_or(trailer, |(next, _)| *next);
-    let raw = self
-      .pack
-      .get(usize::try_from(offset).ok()?..usize::try_from(end).ok()?)?;
+    let raw_len = end.checked_sub(offset)?;
+    // Its header's bytes, read where it lies across the windows they span, at most the longest a header can be.
+    let source = PushSource { push: self, store };
+    let longest = crate::to_u64(crate::entry::longest_header(self.format)).min(raw_len);
+    let mut head = Vec::new();
+    while crate::to_u64(head.len()) < longest {
+      let at = offset.saturating_add(crate::to_u64(head.len()));
+      let piece = source.piece(&OWN_PACK, self.pack_len, at)?;
+      let want = usize::try_from(longest).ok()?.saturating_sub(head.len());
+      head.extend_from_slice(piece.get(..want).unwrap_or(&piece));
+    }
     let mut admission = Admission::new(u64::MAX);
-    let (header, _) = crate::entry::read(raw, offset, self.format, &mut admission).ok()??;
+    let (header, _) = crate::entry::read(&head, offset, self.format, &mut admission).ok()??;
     let base = match header.representation {
       crate::entry::Representation::Whole(_) => None,
       crate::entry::Representation::OfsDelta { base } => Some(*self.entries.get(&base)?),
       crate::entry::Representation::RefDelta { base } => Some(base),
     };
-    let crc = crc32fast::hash(raw);
+    let crc = packed::raw_crc(&source, self.own(offset), raw_len).ok()?;
     #[cfg(test)]
     let crc = crc ^ u32::from(MISKEEP_NEXT_CRC.with(|next| next.replace(false)));
-    Some((end.saturating_sub(offset), crc, base))
+    Some((raw_len, crc, base))
   }
 
   /// The longest object of the push's own pack.
@@ -623,12 +742,6 @@ impl Push {
   /// The pack as the staging put it in the content store, held by the push: its identity and length.
   pub fn stored_pack(&self) -> Option<(ContentId, u64)> {
     self.stored_pack
-  }
-
-  /// Keeps `identity`, the push's pack the staging put in the content store `len` bytes long, holding it (the put's
-  /// hold) until the push's rows hold it.
-  pub(crate) fn set_stored_pack(&mut self, identity: ContentId, len: u64) {
-    self.stored_pack = Some((identity, len));
   }
 
   /// Gives back the push's holds once its objects' rows hold them, leaving the push empty: the stored pack's one hold,
@@ -646,8 +759,12 @@ impl Push {
       Some((identity, _)) => store.release(&identity).map(drop),
       None => Ok(()),
     };
+    // A put not yet finished (a push refused or abandoned before its staging) is given back: nothing is named.
+    if let Some(writing) = self.pack.take() {
+      store.abandon_object(writing);
+    }
+    self.pack_len = 0;
     self.placed = BTreeMap::new();
-    self.pack = Vec::new();
     *self.reading.get_mut() = Scratch::default();
     given
   }
@@ -724,18 +841,6 @@ pub enum StoredAt {
   InPack(InPack),
 }
 
-/// The push's own pack, as its objects are read from it: a piece is the rest of the pack from `offset`.
-impl PackSource for Push {
-  fn piece(&self, _pack: &ContentId, _len: u64, offset: u64) -> Option<Cow<'_, [u8]>> {
-    let offset = usize::try_from(offset).ok()?;
-    self
-      .pack
-      .get(offset..)
-      .filter(|rest| !rest.is_empty())
-      .map(Cow::Borrowed)
-  }
-}
-
 /// Where a push's objects are read from: its own pack, and the packs the repository holds in the content store, which
 /// a thin pack's REF_DELTA base may lie in (A-722's record v4), each by its identity.
 struct PushSource<'a> {
@@ -746,7 +851,7 @@ struct PushSource<'a> {
 impl PackSource for PushSource<'_> {
   fn piece(&self, pack: &ContentId, len: u64, offset: u64) -> Option<Cow<'_, [u8]>> {
     if *pack == OWN_PACK {
-      return self.push.piece(pack, len, offset);
+      return self.push.own_piece(self.store, offset);
     }
     self.store.piece(pack, len, offset)
   }
