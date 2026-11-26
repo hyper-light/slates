@@ -280,6 +280,49 @@ async fn until_done(mut step: impl FnMut(&mut ShardState) -> bool) -> Option<()>
   Some(())
 }
 
+/// Unpins `texts` from `at`, a text a unit, until the shard's clock passes `deadline_ns`, at least one: whether every one
+/// is ([`Staging::land`]).
+fn unpin_some(
+  state: &mut ShardState,
+  texts: &[ContentIdentity],
+  (at, deadline_ns): (&mut usize, u64),
+) -> bool {
+  while let Some(text) = texts.get(*at) {
+    *at = at.saturating_add(1);
+    crate::vcs_store::name_holds::unpin_texts(state, core::slice::from_ref(text));
+    if slates_rt::futures::now_ns() >= deadline_ns {
+      break;
+    }
+  }
+  *at >= texts.len()
+}
+
+/// Steps `release`, a retired scratch member's in `lineage`, until the shard's clock passes `deadline_ns`, at least one
+/// unit: whether it is done ([`Staging::land`]); a lineage gone is done.
+fn released_some(
+  state: &mut ShardState,
+  (lineage, release): (RepositoryId, &mut slates_merge::engine::Release),
+  deadline_ns: u64,
+) -> bool {
+  loop {
+    match state.greens.release_step(lineage, release) {
+      Ok(true) => {}
+      Ok(false) | Err(_) => return true,
+    }
+    if slates_rt::futures::now_ns() >= deadline_ns {
+      return false;
+    }
+  }
+}
+
+/// Counter: a step of a landing's unpin of its texts ([`Staging::land`]): more than one a landing shows it was sliced.
+/// Format: a counter name in the daemon's status report.
+pub(crate) const LANDING_UNPIN_SLICES: &str = "repository.svn_commit.landing_unpin_slices";
+
+/// Counter: a step of a landing's release of its scratch member ([`Staging::land`]): more than one a landing shows it was
+/// sliced. Format: a counter name in the daemon's status report.
+pub(crate) const LANDING_RELEASE_STEPS: &str = "repository.svn_commit.landing_release_steps";
+
 /// One step of a batch's give-back: the content arena's resident free pages past `keep` bytes given back, an idle
 /// purge's slice of blocks (`daemon::purge_slice_blocks`), counted. Whether more is left past `keep`.
 fn give_back_past(state: &mut ShardState, keep: usize) -> bool {
@@ -1420,6 +1463,36 @@ impl Staging {
     let (landed, flushing, committing) = self
       .land_changeset_timed(&disk, (repository, sequence))
       .await;
+    // Landed: the changeset holding every text the batch put is durable on the node's store, so its texts are no
+    // unlanded holders now (ruling (B)), whatever the register answers next. Unpinned before the entry, not at the tail:
+    // a kill after the entry never reaches the tail, and the texts are landed all the same (w-perf's red at a55d7cfa6,
+    // `store_tests::a_subversion_restart_replays_a_named_text_with_one_released_window`). A text a unit, a slice of the
+    // shard's budget a step (A-920 6a: 9,000 texts unpinned in one step, 14.3 ms debug); a kill between slices leaves
+    // texts unpinned whose changeset is durable, which is what the landing makes true.
+    if landed.is_ok() {
+      let pinned = std::mem::take(&mut self.pinned);
+      let mut at = 0usize;
+      until_done(|state| {
+        state.count(LANDING_UNPIN_SLICES, 1);
+        unpin_some(state, &pinned, (&mut at, slice_deadline_ns()))
+      })
+      .await?;
+    }
+    // The scratch member let go a unit at a time before the append (A-920 6a: released whole in one step, 16.9 ms
+    // debug at 9,000 files): landed or not, its batch commits or abandons next, and neither retires it again.
+    let begun = crate::state::with_state(|state| {
+      self
+        .batch
+        .as_mut()
+        .and_then(|batch| batch.retire_begun(state))
+    })?;
+    if let Some((lineage, mut release)) = begun {
+      until_done(|state| {
+        state.count(LANDING_RELEASE_STEPS, 1);
+        released_some(state, (lineage, &mut release), slice_deadline_ns())
+      })
+      .await?;
+    }
     let recorded = crate::state::with_state(|state| {
       self.record_landed(state, landed, principal, (repository, sequence))
     })?;
@@ -1485,13 +1558,7 @@ impl Staging {
     principal: &Principal,
     (repository, sequence): (RepositoryId, u64),
   ) -> Result<crate::repository::push::RecordedBatch, Uncommitted> {
-    // Landed: the changeset holding every text the batch put is durable on the node's store, so its texts are no
-    // unlanded holders now (ruling (B)), whatever the register answers next. Unpinned here, not at the tail: a kill
-    // after the entry never reaches the tail, and the texts are landed all the same (w-perf's red at a55d7cfa6,
-    // `store_tests::a_subversion_restart_replays_a_named_text_with_one_released_window`).
-    if landed.is_ok() {
-      crate::vcs_store::name_holds::unpin_texts(state, &std::mem::take(&mut self.pinned));
-    }
+    // Its texts were unpinned once landed, and its scratch member retired, a unit at a time ([`Staging::land`]).
     landed?;
     if landing::next_sequence(state, repository) != sequence {
       state.count(super::DIVERGED, 1);

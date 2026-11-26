@@ -64594,6 +64594,18 @@ GAPS.
   generated documents of every op kind with hard links, declared in random order, the document canonicalized a unit
   a turn encodes as the one canonicalized whole, in more than one turn wherever it has more than one op
   (`a_document_canonicalized_a_unit_a_turn_is_the_document_canonicalized_whole`).
+- **Piece 6, the landing** (main's ruling of 2026-11-26: the import's landing is A-920's own). A runtime probe printing
+  every poll over 20 ms with its task's spawn site named the wide import's longest polls outside its staging steps
+  (debug, t_c2c at 9,000 files): the landing's entry, `Staging::record_landed`, 75 ms in one synchronous section, and
+  one poll of its versions' apply, 40 ms (the inline checkpoint's begin, the checkpoint's own piece, A-869). The entry's
+  parts: `unpin_texts` 14.3 ms over 9,000 texts, the scratch member's retire 16.9, then the append's increment encoding
+  3.4, its hold in the content store 23.6, its chain entry's encoding 12.5, and the register's op 8.5 (publish and
+  record). **6a, the unpin and the release.** The texts are unpinned a text a unit (`staging::unpin_some`), still
+  before the entry (a kill after the entry never reaches the tail; a kill between slices leaves texts unpinned whose
+  changeset is durable), and the scratch member is retired before the append, its release stepped a unit at a time
+  (`Greens::retire_preview_begun`, `staging::released_some`); the batch's commit and abandon then retire nothing more.
+  Counters: `LANDING_UNPIN_SLICES` and `LANDING_RELEASE_STEPS`, each more than two a wide landing in `t_c2c`; red with
+  both run whole (one slice each). Next, 6b: the append's encodings and hold a slice a step before the register's op.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 

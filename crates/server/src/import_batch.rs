@@ -704,6 +704,19 @@ impl ImportBatch {
     self.retire(state);
   }
 
+  /// Retires the scratch member, its release answered for the caller to step a unit at a time (A-920 6a); none where it
+  /// was retired already. The batch's commit and abandon then retire nothing more.
+  pub(crate) fn retire_begun(
+    &mut self,
+    state: &mut ShardState,
+  ) -> Option<(
+    slates_db::catalog::RepositoryId,
+    slates_merge::engine::Release,
+  )> {
+    let preview = self.preview.take()?;
+    state.greens.retire_preview_begun(preview)
+  }
+
   /// Retires the scratch member, once.
   fn retire(&mut self, state: &mut ShardState) {
     if let Some(preview) = self.preview.take() {
