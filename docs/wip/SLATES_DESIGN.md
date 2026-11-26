@@ -10255,7 +10255,10 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > neither wedge nor end a daemon serving held mounts (the rule A-213 set for a closed one). Every other thread writes as
 > before. Regressions: `a_lone_daemon_whose_log_stalls_lives_on_and_serves` (`crates/client/tests/lone_daemon.rs`:
 > standard error held three windows while each shard logs; exit 4 within the stall before) and
-> `a_routed_thread_never_waits_on_standard_error_and_a_full_queue_refuses` (`crates/machine/src/log.rs`).
+> `a_routed_thread_never_waits_on_standard_error_and_a_full_queue_refuses` (`crates/machine/src/log.rs`). Since
+> 2026-11-25 the watchdog's end line is written past that lock as well (`watchdog::write_end_line`, the system's own
+> write), so a thread holding it no longer costs the verdict of an exit 4
+> (`a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_log_is_held`).
 
 > **Status (2026-11-18, A-308): a wedge is judged only over a window the watchdog watched.** The rule calls a shard
 > wedged once a window passed with no CPU progress and never seen runnable, and "never seen" is sampled at each look. A
@@ -32161,6 +32164,14 @@ shard routed, stopped after them).
   without end.
 - **What it does not change.** The watchdog's verdicts, window and ends (A-228, A-232); the lines' text; the CLI's, the
   anchor's and every other thread's direct writes, whose order with their output stays as it was.
+- **The end's line (2026-11-25, main's order after w-hg's exit 4 with no verdict).** The watchdog's end line is written
+  past the process's standard-error lock too: its writer thread writes the line with the system's own write to the
+  descriptor (`rustix::io::write`; `WriteFile` on Windows), a part at a time, and the end still waits at most a beat for
+  it (`watchdog::write_end_line`). Through the lock the verdict was lost behind any thread holding it: w-hg's 28-module
+  run at loads 21 to 27 exited 4 with no end line, and the red
+  `a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_log_is_held` (`crates/client/tests/lone_daemon.rs`,
+  the lock held for good from the wedge) exited 4 without the line, 1 of 1, before; the line is read after. A pipe
+  nobody drains still blocks the write itself, which the beat bounds.
 
 ### A-308 — The watchdog judges a wedge only over a window it watched (2026-11-18, goal g251: every open slates bug fixed)
 Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 entry), `crates/server/src/watchdog.rs`

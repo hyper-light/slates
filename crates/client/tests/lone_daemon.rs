@@ -74,6 +74,9 @@ enum Hold {
   /// Not held: the role holds this process's standard error for [`STALL_FOR`] while each shard writes a log line
   /// ([`stall_the_log`]).
   LogStalled,
+  /// As [`Hold::Wedged`], with a thread of the role holding standard error's lock for good from just before the wedge
+  /// ([`hold_the_log_for_good`]): a writer starved while it held the lock, or one blocked in a write to a full pipe.
+  WedgedLogHeld,
 }
 
 impl Hold {
@@ -83,6 +86,7 @@ impl Hold {
       Hold::Spinning => "spinning",
       Hold::Starved => "starved",
       Hold::LogStalled => "log-stalled",
+      Hold::WedgedLogHeld => "wedged-log-held",
     }
   }
 
@@ -92,6 +96,7 @@ impl Hold {
       "spinning" => Hold::Spinning,
       "starved" => Hold::Starved,
       "log-stalled" => Hold::LogStalled,
+      "wedged-log-held" => Hold::WedgedLogHeld,
       other => panic!("no hold named {other:?}"),
     }
   }
@@ -166,7 +171,7 @@ fn hold_for_good(daemon: &Daemon, index: usize, hold: Hold) {
         std::sync::atomic::Ordering::Release,
       );
       match hold {
-        Hold::Wedged => {
+        Hold::Wedged | Hold::WedgedLogHeld => {
           let _ = std::io::Read::read_exact(&mut never, &mut byte);
         }
         Hold::Spinning => loop {
@@ -232,6 +237,9 @@ fn a_lone_daemon_role() {
   let mut line = String::new();
   std::io::stdin().read_line(&mut line).unwrap();
   let client_id: u32 = line.trim().parse().unwrap();
+  if hold == Hold::WedgedLogHeld {
+    hold_the_log_for_good();
+  }
   hold_for_good(&daemon, serving(&daemon, client_id), hold);
   loop {
     std::thread::park();
@@ -272,6 +280,21 @@ fn stall_the_log(daemon: &Daemon) {
   }
   holder.join().unwrap();
   println!("{STALL_OVER_TAG}");
+}
+
+/// Holds this process's standard error lock from a thread of its own until the process ends, once it is taken: every
+/// line written through the lock waits from then on, as behind a writer starved while it held the lock or one blocked
+/// in a write to a pipe nobody drains.
+fn hold_the_log_for_good() {
+  let (taken, locked) = channel();
+  std::thread::spawn(move || {
+    let _held = std::io::stderr().lock();
+    taken.send(()).unwrap();
+    loop {
+      std::thread::park();
+    }
+  });
+  locked.recv().unwrap();
 }
 
 /// Shape: the nice value the starved role takes, the lowest priority a process may give itself.
@@ -690,7 +713,7 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
     "{name}: the watchdog's exit code"
   );
   match hold {
-    Hold::Wedged => assert!(
+    Hold::Wedged | Hold::WedgedLogHeld => assert!(
       line_after <= rule,
       "{name}: the watchdog's verdict was read {line_after:?} after the wedge, past the rule's W + B + L = {rule:?}"
     ),
@@ -739,6 +762,16 @@ fn a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone() 
 #[test]
 fn a_lone_daemons_spinning_shard_ends_its_process_and_the_call_ends_daemon_gone() {
   a_lone_daemons_stuck_shard_ends_it("spinning", Hold::Spinning);
+}
+
+/// A-232, A-305 (main's order of 2026-11-25: an exit 4 at load 21 to 27 left no verdict line, so nobody could tell
+/// which shard or task stood still). Do: as the wedged case, with a thread of the daemon's process holding standard
+/// error's lock for good from just before the wedge, as a writer starved while it held it would. Expect: the process
+/// exits with the failed exit code, and the watchdog's end line is read, naming the wedged shard, within `W + B + L` of
+/// the wedge. Red before: the end's writer took the lock, waited its beat, and the exit came without the line.
+#[test]
+fn a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_log_is_held() {
+  a_lone_daemons_stuck_shard_ends_it("wedged-log-held", Hold::WedgedLogHeld);
 }
 
 /// Format: the environment variable that runs the starved case, and the words the watchdog's starved line carries.

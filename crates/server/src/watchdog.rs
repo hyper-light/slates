@@ -1128,9 +1128,14 @@ fn verdict_lateness_ns(now_ns: u64, still_after_ns: u64, window_ns: u64) -> Opti
 /// releases, and its clients see it as they see a kill.
 ///
 /// The verdict is logged first, but the end never waits on the log for longer than one beat: a shard can be wedged in a
-/// write to a standard error nobody drains, holding the lock every log line takes, and a watchdog that waited on that
-/// lock would never end anything. So the line is written by a thread of its own. The end joins it once it says the line
-/// is written, which it does as its last act, so the join returns at once; a writer still blocked after a beat cannot be
+/// write to a standard error nobody drains, and a watchdog that waited on that write would never end anything. So the
+/// line is written by a thread of its own, and written past the lock every other line of the process takes
+/// ([`write_end_line`]): a thread that holds that lock, starved while it writes or blocked in a write, cannot keep the
+/// verdict out of the log. Through the lock it was lost behind such a thread, the exit coming at the beat without it
+/// (main's 28-module run at loads 21 to 27, 2026-11-25; `a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_
+/// log_is_held` in `crates/client/tests/lone_daemon.rs` red 1 of 1 before, the line read after). A pipe nobody drains
+/// still blocks the write itself, which is what the beat bounds. The end joins the writer once it says the line is
+/// written, which it does as its last act, so the join returns at once; a writer still blocked after a beat cannot be
 /// joined, and the exit ends it, so the exit is its owner then. Joined, a written line leaves no thread that finished
 /// unjoined: ThreadSanitizer reported that one as a leak at the exit, after its own one-second exit sleep, and turned
 /// the exit code into its own 66 (diag-g218-tsan-2, run 44217144677: exit 66 seen 27.4 s after the hold, where the
@@ -1163,7 +1168,7 @@ fn end_process(cause: Cause, late_ns: u64, judged: Option<(Option<u64>, u64)>) -
   let writer = std::thread::Builder::new()
     .name("slates-watchdog-end".to_owned())
     .spawn(move || {
-      slates_machine::log_line!("{line}");
+      write_end_line(format!("{line}\n").as_bytes());
       let _ = written.send(());
     });
   if let Ok(writer) = writer
@@ -1175,6 +1180,55 @@ fn end_process(cause: Cause, late_ns: u64, judged: Option<(Option<u64>, u64)>) -
     let _ = writer.join();
   }
   std::process::exit(i32::from(FAILED_EXIT_CODE))
+}
+
+/// Writes `line` to standard error's descriptor with the system's own write, a part at a time until it is all written or
+/// a write is refused, never through the lock `std`'s handle takes for every other line of the process ([`end_process`]):
+/// the end's line must not wait on a thread that holds that lock. A refused write drops the rest; the process is ending.
+#[cfg(unix)]
+fn write_end_line(line: &[u8]) {
+  use std::os::fd::AsFd;
+  let stderr = std::io::stderr();
+  let mut left = line;
+  while !left.is_empty() {
+    match rustix::io::write(stderr.as_fd(), left) {
+      Ok(0) => return,
+      Ok(wrote) => left = left.get(wrote..).unwrap_or_default(),
+      Err(rustix::io::Errno::INTR) => {}
+      Err(_) => return,
+    }
+  }
+}
+
+/// [`write_end_line`] on Windows: `WriteFile` to the process's standard error handle, a part at a time.
+#[cfg(windows)]
+fn write_end_line(line: &[u8]) {
+  use std::os::windows::io::AsRawHandle;
+  use windows_sys::Win32::Storage::FileSystem::WriteFile;
+  let stderr = std::io::stderr();
+  let mut left = line;
+  while !left.is_empty() {
+    let asked = u32::try_from(left.len()).unwrap_or(u32::MAX);
+    let mut wrote: u32 = 0;
+    // SAFETY: the handle is this process's standard error, borrowed from `std`'s handle for the call; `left` is a live
+    // slice of at least `asked` bytes; `wrote` is a live `u32` the call writes; no overlapped structure, so the call is
+    // synchronous and keeps no pointer past its return.
+    let done = unsafe {
+      WriteFile(
+        stderr.as_raw_handle(),
+        left.as_ptr(),
+        asked,
+        &raw mut wrote,
+        core::ptr::null_mut(),
+      )
+    };
+    if done == 0 || wrote == 0 {
+      return;
+    }
+    left = left
+      .get(usize::try_from(wrote).unwrap_or(usize::MAX)..)
+      .unwrap_or_default();
+  }
 }
 
 /// A stuck verdict in the end's words, a wedge's against the shard's window `window_ns` ([`watch_window_ns`]), where the
