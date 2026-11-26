@@ -1,0 +1,56 @@
+name: diag-a305-nproc
+
+# main 01a20182 (2026-11-25 21:40 PST): w-hg's Linux-only red for A-305's end line (f582d50bf: the watchdog's end line
+# written by the watchdog's own thread behind poll(POLLOUT) within the beat, no thread started for it). The test
+# lone_daemon::a_lone_daemons_wedged_shard_ends_it_with_its_verdict_when_no_thread_can_start lowers the child's soft
+# RLIMIT_NPROC to its own task count just after the wedge. Green expected at f582d50bf; red expected with
+# crates/server/src/watchdog.rs as it was at 48e8f83a5 ("exited (exit status: 4) without the watchdog's end line").
+# The runner's user is not root, so the limit binds; where it doesn't, the test prints SKIPPED. Diagnostics only:
+# never main.
+
+on:
+  push:
+    branches: ["diag-a305-nproc"]
+
+env:
+  CARGO_TERM_COLOR: never
+  TEST: a_lone_daemons_wedged_shard_ends_it_with_its_verdict_when_no_thread_can_start
+  BEFORE: 48e8f83a5
+
+jobs:
+  red-green:
+    name: A-305 NPROC red/green (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: The machine
+        run: echo "runner cpus $(nproc) kernel $(uname -r) user $(id -un) uid $(id -u) nproc soft $(ulimit -u) hard $(ulimit -Hu)"
+      - name: Green at this commit, then red with the watchdog before f582d50bf
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs"
+          if cargo test --locked -p slates-client --test lone_daemon "$TEST" -- --nocapture > "$RUNNER_TEMP/logs/green.log" 2>&1; then green=0; else green=$?; fi
+          echo "GREEN exit $green: $(grep -E '^test result' "$RUNNER_TEMP/logs/green.log" | tail -1)"
+          grep -E 'SKIPPED|end line|exit status|panicked|^test ' "$RUNNER_TEMP/logs/green.log" | head -12
+          git show "$BEFORE:crates/server/src/watchdog.rs" > crates/server/src/watchdog.rs
+          git diff --stat
+          if cargo test --locked -p slates-client --test lone_daemon "$TEST" -- --nocapture > "$RUNNER_TEMP/logs/red.log" 2>&1; then red=0; else red=$?; fi
+          echo "RED exit $red: $(grep -E '^test result' "$RUNNER_TEMP/logs/red.log" | tail -1)"
+          grep -E 'SKIPPED|end line|exit status|panicked|^test ' "$RUNNER_TEMP/logs/red.log" | head -12
+          if grep -q SKIPPED "$RUNNER_TEMP/logs/green.log"; then echo "VERDICT skipped: the limit did not bind here"; exit 0; fi
+          if [ "$green" = 0 ] && [ "$red" != 0 ] && grep -q "without the watchdog's end line" "$RUNNER_TEMP/logs/red.log"; then
+            echo "VERDICT red-then-green holds"; exit 0
+          fi
+          echo "VERDICT does not hold (green $green, red $red)"; tail -40 "$RUNNER_TEMP/logs/red.log"; exit 1
