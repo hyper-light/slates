@@ -109,6 +109,11 @@ const REVISION_AUTHOR: &[u8] = b"svn:author";
 /// [`fold_to_readers`]): the versions it no longer keeps. Format: a counter name in the status report.
 pub(crate) const FOLDED_BYTES: &str = "repository.svn_commit.folded_bytes";
 
+/// Counter: a step of a green's fold to its reachable floor after an import's landing ([`fold_to_readers_some`], A-920
+/// 11a): many a wide landing shows its fold was taken a unit at a time, never whole in its tail's one step. Format: a
+/// counter name in the status report.
+pub(crate) const FOLD_STEPS: &str = "repository.svn_commit.fold_steps";
+
 /// Counter: a Subversion repository whose green was not at its records' youngest revision, or answered a version other
 /// than the revision's: zero in every correct use, since only the step moves the green. Format: a counter name.
 pub(crate) const DIVERGED: &str = "repository.svn.diverged";
@@ -1532,16 +1537,43 @@ fn land(
 /// records), and svn's reads are the records', so only a live reader's version (a work's base, a pinned attachment, a
 /// mount) is kept. Before, it folded only past its retention budget, so git-2000's import kept 440 MB of versions.
 pub(crate) fn fold_to_readers(state: &mut ShardState, green: DbVolumeId) {
+  fold_to_readers_begin(state, green);
+  fold_to_readers_some(state, green, u64::MAX);
+}
+
+/// [`fold_to_readers`] begun (A-920 11a): the green's fold to the oldest version a live reader can name begun
+/// (`slates_merge::engine::Green::fold_begin`), to be taken a unit at a time ([`fold_to_readers_some`]).
+pub(crate) fn fold_to_readers_begin(state: &mut ShardState, green: DbVolumeId) {
   let floor = crate::merge_service::reachable_floor(state, green);
-  let folded = state
+  if let Some(mut engine) = state.greens.get_mut(&green) {
+    engine.fold_begin(floor);
+  }
+}
+
+/// One step of the fold [`fold_to_readers_begin`] began, counted ([`FOLD_STEPS`]), its units taken until the shard's
+/// clock passes `deadline_ns`, a unit at least (A-920 11a: whole, 7.5-23.4 ms of a landing's tail step at 9,001
+/// paths, debug). Once it ends, the bytes it released are counted and the green's retention settled. Whether it ended.
+pub(crate) fn fold_to_readers_some(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  deadline_ns: u64,
+) -> bool {
+  state.count(FOLD_STEPS, 1);
+  let stepped = state
     .greens
     .get_mut(&green)
-    .map_or(0, |mut engine| engine.fold_history_before(floor));
+    .map(|mut engine| engine.fold_some(&mut || slates_rt::futures::now_ns() >= deadline_ns));
+  let folded = match stepped {
+    Some(None) => return false,
+    Some(Some(folded)) => folded,
+    None => 0,
+  };
   if folded > 0 {
     state.count(FOLDED_BYTES, u64::try_from(folded).unwrap_or(u64::MAX));
   }
   // A charge the budget cannot take leaves the fold, which only releases, and is charged again at the next settle.
   let _ = crate::merge_service::settle_green_retention(state, green);
+  true
 }
 
 /// The records once the entry recorded the revision: applied, as the check made certain; the answer `commit-info`
