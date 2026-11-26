@@ -64792,6 +64792,27 @@ GAPS.
     identity. Planted bug, red: a step that stops inside a tree drops the rest (the import is refused).
   - Move's commit steps were measured on revision 3 (`ImportBatch::stage_step`): reserve 12.3 ms in one call, judge
     6.0 and 4.8, a committing step 8.3. They are inside `slates-merge`, to be named there next.
+  - Named inside `slates-merge` (debug, revision 3), kept on file until a release read says which leads:
+    - the reserve's `Green::copy_entry_room`, 11.6-11.8 ms: the whole increment resolved and its `copy_fixes` taken
+      in one call;
+    - the judge's `Resolved::finish_resolving`, 5.8 ms, and one `decide_some` unit, 4.9 ms;
+    - the commit's `Prep::Beginning` unit, 7.7-7.9 ms, twice.
+  **The phase tag** (main's order after release probe 12, where 9a moved copy's p50 by 4-7% and move's not at all, so
+  release's longest unit is not debug's). `svn_import::phase` is test support: each step of the import's history tags
+  its phase as it begins (`phase::tag`), as follows:
+  - `parse`, `owed`;
+  - `storing`, `storing.carried`;
+  - `stage.check`, `.identify`, `.build`, `.ready`, `.canonical`, `.bringing`, `.judge`, `.reserving`, `.judging`,
+    `.measuring`, `.committing`, `.recording`;
+  - `landing.place`, `.changeset`, `.unpin`, `.release`, `.prepare`, `.record`, `.apply`, `.identity`, `.tail_end`,
+    `.follow`, `.holds`, `.give_back`, `.purge`.
+
+  The history's poll timer (`cpu_timed`) charges each poll's time to the phases set in it, in order, by the wall and
+  by the thread's CPU. Each poll resumes in the phase its last one ended in, so the checkpoint task's polls on the same
+  thread are not the history's. The wide tests print the longest poll's spans:
+  `PHASES <test> wall_ns=<n> cpu_ns=<n> spans=<tag>:<wall_ns>:<cpu_ns>,...`. In debug: add's and copy's longest poll
+  was `storing.carried` (13.2 and 18.2 ms) and then `stage.bringing` (1.2 ms) in the same poll; move's was
+  `landing.tail_end` (21.7 ms) between brief `landing.identity` and `landing.follow` spans.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 

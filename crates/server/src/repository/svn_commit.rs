@@ -614,6 +614,8 @@ async fn stage_texts(
   revision: &mut Revision,
   imported: Vec<ContentIdentity>,
 ) -> Option<Result<(Storing, Vec<landing::LandedText>), Uncommitted>> {
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("storing");
   let texts = crate::state::with_state(|state| take_texts(state, repository, revision))?;
   // Taking the texts and beginning their put are steps of their own (goal 93).
   slates_rt::futures::yield_now().await;
@@ -655,6 +657,8 @@ async fn stage_texts(
     }
   }
   // The bytes are the content store's now, until the landing ends.
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("storing.carried");
   drop(texts);
   section_yield().await?;
   let carried = texts_carried(&revision.record.changes, &storing.put);
