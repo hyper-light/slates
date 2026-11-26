@@ -64416,6 +64416,13 @@ GAPS.
   the whole and the sliced judge, which keeps every step's. The judge's last step 2.7 ms → under 1 ms (debug, 2 runs,
   load 22-26). Oracle: the applying and named oracles judge a unit a step; a resumed gathering that drops a unit fails
   two of them.
+  **3h, the judge's release of its resolution.** After 3g one release step was still past the bar: the judge's third
+  step, 1,107 µs (labelled release probe on 02602af52, run 2; run 1's steps all filled a learned quantum near 0.73
+  ms). It was no work but a drop: the resolution and the decision's sets let go whole as the decision ended (9,000
+  paths with their ops, and the node-exclusive rule's 9,000 judged paths), 1.53 ms debug. They are now let go a unit
+  at a time before the reach begins (`Resolved::release_one`, its copies' resolution last; `Deciding::release_one`),
+  until the step is spent. In debug the judge's third step over 1 ms is gone (2 runs, load 22-32): its steps past 1
+  ms are its first unit (3.9) and its second (1.1-1.2, 0.33 ms in release).
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`

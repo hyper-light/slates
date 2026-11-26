@@ -41,6 +41,8 @@ enum ComputePhase {
 
 /// The units decided, what they reach being found from the next ([`ComputePhase::Reaching`]).
 struct Reaching {
+  /// The resolution and the decision's sets, let go a unit a unit before any unit is reached (A-920 piece 3h).
+  releasing: Option<Box<(Resolved, Deciding)>>,
   units: Vec<position::Unit>,
   at: usize,
   windows: Vec<crate::ConflictWindow>,
@@ -186,8 +188,14 @@ impl Green {
         if !self.decide_some(inc, resolved, (units, cursor), spent) {
           return None;
         }
-        let units = core::mem::replace(units, position::Units::first());
+        let ComputePhase::Deciding(decided) =
+          core::mem::replace(&mut computing.phase, ComputePhase::Ended(None))
+        else {
+          return None;
+        };
+        let (resolved, cursor, units) = *decided;
         computing.phase = ComputePhase::Reaching(Box::new(Reaching {
+          releasing: Some(Box::new((resolved, cursor))),
           units: units.into_units().0,
           at: 0,
           windows: Vec::new(),
@@ -196,6 +204,21 @@ impl Green {
         None
       }
       ComputePhase::Reaching(reaching) => {
+        let released = match reaching.releasing.as_deref_mut() {
+          None => true,
+          Some((resolved, cursor)) => loop {
+            if !resolved.release_one() && !cursor.release_one() {
+              break true;
+            }
+            if spent() {
+              break false;
+            }
+          },
+        };
+        if !released {
+          return None;
+        }
+        reaching.releasing = None;
         while let Some(unit) = reaching.units.get(reaching.at) {
           Reached::reach_unit(unit, (&mut reaching.windows, &mut reaching.applied));
           reaching.at = reaching.at.saturating_add(1);
@@ -211,6 +234,7 @@ impl Green {
         } = core::mem::replace(
           &mut **reaching,
           Reaching {
+            releasing: None,
             units: Vec::new(),
             at: 0,
             windows: Vec::new(),
