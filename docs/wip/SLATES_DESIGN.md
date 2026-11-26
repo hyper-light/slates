@@ -64701,8 +64701,12 @@ GAPS.
   paced loops ran units past their deadline. Each now stops at it:
   - The preparation's hold hashed a content chunk a unit, up to 1 MiB (10.4 ms of one step, debug). It now hashes a
     copy slice a unit (`IncrementHold::chunk_hasher`, `merge_origin::inputs_extent_hashed`). Oracle:
-    `an_increment_held_a_slice_a_unit_names_the_inputs_held_whole` (the same inputs as `hold_increment`, in more units
-    than a hold that hashes a chunk a unit).
+    `an_increment_held_a_slice_a_unit_names_the_inputs_held_whole`, the same inputs as `hold_increment`. Since main's
+    finding of 2026-11-26, the hold takes its slice as an argument (`IncrementHold::unit`; the preparation passes
+    `copy_slice_bytes`), and the test passes a quarter chunk and asserts the exact count it makes, 15. Before, the
+    test read the shard's live copy slice: a loaded shard's slice is a chunk or more, so it took 8 units against
+    `> 8`, in w-hg's focused set at load 50-60. Red at 8 with a chunk's slice. The model is
+    `vcs_store/named_objects.rs`'s `read_step(&objects, slice)`.
   - The chain entry's encoding hashed the whole entry in its last unit (4.7 ms, debug). It now hashes what each unit
     writes (`chain_entry::Encoding::digest`). Oracle: `an_entry_encoded_a_unit_a_step_is_the_entry_encoded_whole`,
     unchanged.

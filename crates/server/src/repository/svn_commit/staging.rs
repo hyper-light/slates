@@ -372,7 +372,7 @@ fn prepare_some(
           None => PreparePhase::Encoding(encoding),
         }
       }
-      PreparePhase::Holding(encoded, mut hold) => match hold.unit(state, &encoded) {
+      PreparePhase::Holding(encoded, mut hold) => match hold.unit(state, (&encoded, chunk)) {
         Some(Ok(held)) => PreparePhase::Entry(
           held,
           slates_merge::chain_entry::encoding(held.inputs, staged.identity),

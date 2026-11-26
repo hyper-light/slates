@@ -3199,23 +3199,21 @@ impl IncrementHold {
     }
   }
 
-  /// One unit of the hold of `increment`, the encoding: none while units are left; once it ends, [`hold_increment`]'s
-  /// answer.
+  /// One unit of the hold of `increment`, the encoding, its chunks hashed `slice` bytes a unit (the caller's copy slice,
+  /// `DaemonConfig::copy_slice_bytes`, so a test chooses it): none while units are left; once it ends,
+  /// [`hold_increment`]'s answer.
   pub(crate) fn unit(
     &mut self,
     state: &mut ShardState,
-    increment: &[u8],
+    (increment, slice): (&[u8], usize),
   ) -> Option<Result<HeldIncrement, Refusal>> {
     let object = ObjectId(self.green.bytes);
     let Some((manifest, fresh)) = self.staging else {
       let chunk = crate::merge_origin::inputs_chunk_bytes().max(1);
       let chunk_end = self.chunk_start.saturating_add(chunk).min(increment.len());
       if self.hashed < chunk_end {
-        // A copy slice of the chunk hashed a unit; its extent named once the chunk's last slice is.
-        let slice = usize::try_from(state.config.copy_slice_bytes())
-          .unwrap_or(usize::MAX)
-          .max(1);
-        let end = self.hashed.saturating_add(slice).min(chunk_end);
+        // A slice of the chunk hashed a unit; its extent named once the chunk's last slice is.
+        let end = self.hashed.saturating_add(slice.max(1)).min(chunk_end);
         if let Some(piece) = increment.get(self.hashed..end) {
           self.chunk_hasher.update(piece);
         }
@@ -6608,13 +6606,16 @@ mod tests {
     assert_eq!(carried(Some(&ids[2..]), chunk), (ids[2..].to_vec(), true));
   }
 
-  /// A-920 7c. Do: hold an input of two and a half chunks through `IncrementHold`, a unit a call, and the same bytes
-  /// through `hold_increment` for another green. Expect: the same inputs named, identity and length, and more units
-  /// than a hold that hashed a chunk a unit takes (its chunks hashed a copy slice a unit: 10.4 ms of one step, debug,
-  /// with a chunk a unit).
+  /// A-920 7c. Do: hold an input of two and a half chunks through `IncrementHold`, a unit a call, its chunks hashed a
+  /// quarter chunk a unit (the slice the test chooses, never the shard's live quantum: a copy slice from a loaded
+  /// shard's quantum is a chunk or more, and the count then certified nothing, w-hg's focused set at load 50-60), and
+  /// the same bytes through `hold_increment` for another green. Expect: the same inputs named, identity and length, in
+  /// exactly the units the slice makes: each chunk's hashing a unit a slice (4, 4 and 2), the stage opened, each chunk
+  /// copied and the stage completed, 15.
   #[test]
   fn an_increment_held_a_slice_a_unit_names_the_inputs_held_whole() {
     let chunk = crate::merge_origin::inputs_chunk_bytes();
+    let slice = chunk / 4;
     let bytes: Vec<u8> = (0..chunk * 2 + chunk / 2)
       .map(|at| u8::try_from(at % 247).unwrap())
       .collect();
@@ -6623,7 +6624,7 @@ mod tests {
       let mut units = 0u64;
       let stepped = loop {
         units += 1;
-        if let Some(held) = hold.unit(state, &bytes) {
+        if let Some(held) = hold.unit(state, (&bytes, slice)) {
           break held.expect("room for the input");
         }
       };
@@ -6632,8 +6633,11 @@ mod tests {
       (stepped.inputs, whole.inputs, units)
     });
     assert_eq!(stepped, whole, "the inputs held a slice a unit");
-    // A chunk a unit: three to hash, the stage opened, three copied and the stage completed.
-    assert!(units > 8, "the hold took {units} unit(s)");
+    // Hashing: two whole chunks of four slices each and a half chunk of two; then the stage opened, three chunks
+    // copied and the stage completed.
+    let hashing = 2 * chunk.div_ceil(slice) + (chunk / 2).div_ceil(slice);
+    assert_eq!(units, (hashing + 1 + 3 + 1) as u64, "the hold's units");
+    assert_eq!(units, 15, "the hold's units at a quarter chunk a slice");
   }
 
   /// A later version's shipments cut as views of the owner's content store (chain entry format 6: its increment held as
