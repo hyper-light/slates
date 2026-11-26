@@ -64197,6 +64197,17 @@ GAPS.
   each path's last change, their bytes); `changed_since_reports_every_dimension_as_changed_between_does` and
   `changed_since_reads_the_span_alone_and_folds_with_the_histories` (merge's integration tests) fail where an earlier
   entry stays marked last, which no lib test caught; a version's list never kept fails 33 lib tests.
+  **1c, the entry's measure.** What was left of the commit's end step (6.2-6.7 ms) was the batch measuring its chain
+  entry whole (`chain_entry::encoded_len` in `finish_staged`). `chain_entry::measuring` and `measure_step` take it a
+  unit a step: what the work declares indexed an op a unit, its names held by the measure itself
+  (`DeclaredBy<String>`; `Declared` is the same index borrowing the work's names, both built by one `declare`), then
+  each effect's bytes added an effect a unit, then the same trailers (`tail_bytes`). The batch's commit ends in
+  `committed` (outcome, the head's identity, the copies' versions back in the green's numbering) and the measure is a
+  phase of the pending work (`ImportBatch::measure_pending`). The commit's end step 6.2-6.7 ms → under 5 ms (2 runs,
+  load 38-82). Oracle: over generated works of every kind, renames and edits, every accepted verdict's entry measured a
+  unit a step is `encoded_len`'s, with a head identity and without, and some verdict records a splice, the effect whose
+  length reads what the work declares (`an_entry_measured_a_unit_a_step_is_the_entry_measured_whole`; a resumed index
+  that skips an op fails it, which the first generator, with no edits, did not).
 - **Piece 2, the record check.** Its 101-106 ms at 9,000 files were the index's plan of the revision's rows
   (`Index::plan`, 96 ms: its builder's apply of each row 87, the rows' sort 3.9, the plan's finish 4.4), the fresh
   texts (9 ms), the record's encoding (4 ms) and the stored filter (1.6 ms). The plan is taken a slice at a time:
