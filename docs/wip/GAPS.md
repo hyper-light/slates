@@ -4660,6 +4660,12 @@
 > presenter, a read-only attachment the mount edges serve (a read-only volume whose base-plane host reads the
 > repository's content store, under the root mount): until it lands a push whose repository configures a git hook is
 > refused `hook not run`, as before; the edges' signal of a client gone; the hooks' learned times; the SSH channel's call.
+> **OPEN (test, found under battery throttling, 2026-11-26, main's B1b round; not worked now):** the A-665 hooks tests'
+> bound between two progress reports (`git_push::tests::pushed_with_hooks`, `git_hooks::tests::TEST_BOUND_NS`, ten
+> liveness budgets) failed 4 times in 3 of 8 runs of `git_push::` with 12 burners while the Mac ran on battery at 29 to
+> 22% (runs 21 to 88 s, against 8 to 21 s on AC): `t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_
+> the_update` once, then it, the pre-receive refusal and the update refusal of its own command together, each "the
+> push went no further within the test's bound after 20 / 21 / 48 steps". On AC, 8 of 8 at the same load passed.
 > **A-665 part 4a (2026-11-20, w-git):** the HTTP edge's signal of a client gone (`vcs_http::ClientGone`, the socket's
 > close after the body) ends a hook's run. Owed: the SSH edge's; a TLS `close_notify` ahead of the close is not seen.
 > **A-665 part 4b (2026-11-20, w-git):** git's hooks held to the bound each learned on the owner shard
