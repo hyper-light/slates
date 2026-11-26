@@ -871,25 +871,22 @@ mod tests {
     let (sent, got) = channel();
     let (binary, view) = program_and_view();
     let program = program.map_or(binary, PathBuf::from);
-    let left_at = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let left_at_client = std::sync::Arc::clone(&left_at);
     runtime
       .spawn(async move {
         let _spawner = crate::spawning::TestSpawner::installed();
+        // When the client left, on the shard's clock: the client's future and this task are one task, so it borrows.
+        let left_at = core::cell::Cell::new(0u64);
         let launch = Launch {
           program: &program,
           input: &hook,
           view_root: &view,
           words_cap: CAP,
         };
-        let client = async move {
+        let client = async {
           match leaves_after_ns {
             Some(ns) => {
               let _ = slates_rt::futures::sleep(ns).await;
-              left_at_client.store(
-                slates_rt::futures::now_ns(),
-                std::sync::atomic::Ordering::Relaxed,
-              );
+              left_at.set(slates_rt::futures::now_ns());
             }
             None => std::future::pending().await,
           }
@@ -898,7 +895,7 @@ mod tests {
         let ran = slates_rt::futures::within(TEST_BOUND_NS, run(launch, bound_ns, client)).await;
         let ended_ns = slates_rt::futures::now_ns();
         let before_end = |at: u64| ended_ns.saturating_sub(at);
-        let left = left_at.load(std::sync::atomic::Ordering::Relaxed);
+        let left = left_at.get();
         let _ = sent.send(ran.ok().flatten().map(|ended| Timed {
           took: before_end(began),
           after_start: ended.started_at_ns.map(before_end),

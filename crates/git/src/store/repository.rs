@@ -1559,6 +1559,26 @@ impl Repository {
     store.discharge(self.charged.saturating_sub(total))?;
     self.charged = total;
     self.count(|counters| counters.value_bytes = counters.value_bytes.saturating_add(added));
+    let versions = self.install_versions(store, moves, chains, (heads, next));
+    self.count(|counters| counters.positions = counters.positions.saturating_add(given));
+    self.depth.seen(push.deepest());
+    push.release_holds(store)?;
+    // The push's objects read lately go with it, their charge given back (A-861).
+    push.release_recent(store);
+    Ok(versions)
+  }
+
+  /// The versions `commit` makes, put in place once everything is charged and the stage adopted: `chains` (each moved
+  /// green's chain with its new version) installed, the versions with no value counted (`unvalued`), the head map and
+  /// the next position taken, each version's commit noted for a later create's search back (A-850) and its holders, and
+  /// each version committed with its value noted known. The versions made, one for each move, in order.
+  fn install_versions(
+    &mut self,
+    store: &ContentStore,
+    moves: &[Move],
+    chains: BTreeMap<u64, Chain>,
+    (heads, next): (HeadMap, u64),
+  ) -> Vec<u64> {
     let versions: Vec<u64> = moves
       .iter()
       .map(|movement| {
@@ -1606,12 +1626,7 @@ impl Repository {
         self.note_known(store, (movement.green(), version));
       }
     }
-    self.count(|counters| counters.positions = counters.positions.saturating_add(given));
-    self.depth.seen(push.deepest());
-    push.release_holds(store)?;
-    // The push's objects read lately go with it, their charge given back (A-861).
-    push.release_recent(store);
-    Ok(versions)
+    versions
   }
 
   /// Goal 93: each version `moves` committed (`versions`, in the same order) noted under its head in the holders' map,
