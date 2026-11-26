@@ -64146,6 +64146,16 @@ GAPS.
   against 1 and 47.3 ms, handed once. `vcs_http::daemon_edge::tests::a_ref_listing_during_a_derivation_behind_a_push_drives_none_of_it`:
   red with one count of every derive turn (100 → 117 across the listing); green, a reader's turns 0 → 0 while the task
   behind turned 364, the listing answered in 14.8 ms (its patience scaled by `test_lane::slowdown`).
+- **Whether any is due, from counts (2026-11-25, main 01a20182's sample).** A 3 s sample of git/git's clone waiting for
+  its first pack bytes found the encoding behind the push spending a third of its time in
+  `Repository::derivations_due` (309 of its 951 samples), which every derivation and encoding turn asks before it
+  begins one, and which walked every chain's versions to answer. It now looks at none: the repository counts the
+  versions it commits with no value of their own (`unvalued`, kept at `commit`'s one place versions are added; a
+  version's value is never set after), the memo holds derived sets for such versions alone, so derivations are due
+  while the memo holds fewer than that count. Red: `t_a614a_whether_derivations_are_due_is_answered_without_walking_the_versions`,
+  one ask after every version was derived looked at 9 of 9 versions (`StoreCounters::due_looked`); now 0, and due,
+  known and due again after `forget_derived` as before. The same sample's other third, the pace's I/O harvest on every
+  ask, awaits main's ruling on its period (A-783).
 
 ### A-917 — A recorded version is applied a slice at a time, and `apply_recorded` is that run carried to its end (2026-11-25, w-svn for main 01a20182, goal 93's slicing piece 3; §4.16, A-760, A-910)
 
