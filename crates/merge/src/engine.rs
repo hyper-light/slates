@@ -831,21 +831,17 @@ pub struct Computed {
 /// What [`Green::hold_begin`] begins: the hold of a verdict, or the judgment the cache or the checkpoint answers at once
 /// (an outcome, not a failure, so no `Result` carries it).
 pub(crate) enum HoldBegun {
-  /// Its units to gather ([`Green::holding_step`]).
+  /// Its verdict to hold ([`Green::hold_end`]).
   Holding(Holding),
   /// Answered at once.
   Judged(Judgment),
 }
 
-/// A verdict being held a unit at a time ([`Green::hold_begin`], [`Green::holding_step`]): its units brought to the
-/// head, their effects and windows gathered so far.
+/// A verdict being held ([`Green::hold_begin`], [`Green::hold_end`]): its units brought to the head, their effects
+/// and windows the verdict's flat lists (A-920 3l: gathered a unit at a time before, a list of each unit's moved and
+/// freed, and the free that emptied the allocator's region cost one step 1.2 ms).
 pub(crate) struct Holding {
-  units: std::vec::IntoIter<position::Unit>,
-  /// The effects of the unit being gathered not yet moved, an effect a unit of the walk (A-920 3k): one unit can hold
-  /// most of a work's effects (its copies' is one unit whole), and moved in one extend it was the gathering's step.
-  gathering: std::vec::IntoIter<Effect>,
-  effects: Vec<Effect>,
-  windows: Vec<ConflictWindow>,
+  verdict: position::Verdict,
   /// What the chain records of the effects, where it was reached at the head with nothing since.
   reached: Option<Vec<crate::chain_entry::Applied>>,
   check_reads: bool,
@@ -859,7 +855,7 @@ enum Reached {
   /// conflicts.
   Verdict {
     /// The units, in order.
-    units: Vec<position::Unit>,
+    units: position::Verdict,
     /// What the chain records of every effect, when no unit holds a window.
     applied: Vec<crate::chain_entry::Applied>,
     /// Every unit's windows, in order.
@@ -868,33 +864,18 @@ enum Reached {
 }
 
 impl Reached {
-  /// The verdict of `units`.
-  fn of(units: Vec<position::Unit>) -> Reached {
-    let (mut windows, mut applied) = (Vec::new(), Vec::new());
-    for unit in &units {
-      Reached::reach_unit(unit, (&mut windows, &mut applied));
-    }
+  /// The verdict of `units`: its windows, and what the chain records of its effects while it holds none.
+  fn of(units: position::Verdict) -> Reached {
+    let windows = units.windows.clone();
+    let applied = if windows.is_empty() {
+      units.effects.iter().map(Effect::applied).collect()
+    } else {
+      Vec::new()
+    };
     Reached::Verdict {
       units,
       applied,
       windows,
-    }
-  }
-
-  /// `unit` added to what a verdict reached ([`Reached::of`]; a unit a step where it is computed so, A-920 piece 3f):
-  /// its windows; and what the chain records of its effects while no unit so far held a window, none once one does.
-  fn reach_unit(
-    unit: &position::Unit,
-    (windows, applied): (
-      &mut Vec<ConflictWindow>,
-      &mut Vec<crate::chain_entry::Applied>,
-    ),
-  ) {
-    windows.extend(unit.windows.iter().cloned());
-    if windows.is_empty() {
-      applied.extend(unit.effects.iter().map(Effect::applied));
-    } else {
-      applied.clear();
     }
   }
 }
@@ -1425,6 +1406,10 @@ pub struct Green {
   /// The paths merged through the content fast path (the non-vacuity counter). A cell, so the verdict stays a function
   /// of an immutable green (A-658), as `deltas_visited` is.
   fast_path_hits: std::cell::Cell<u64>,
+  /// The effect lists a verdict's units allocated of their own (A-920 3l: none, since a unit writes into its verdict's
+  /// flat lists; one each had been freed a unit at a time, and the free that emptied the allocator's region cost a
+  /// gathering's step 1.2 ms). A cell, as `fast_path_hits` is.
+  unit_effect_lists: std::cell::Cell<u64>,
   /// The units of computed verdicts judged again because the green moved since they were computed
   /// ([`Green::judged_again`], A-658).
   judged_again: u64,
@@ -3999,6 +3984,21 @@ impl Green {
     })
   }
 
+  /// The effect lists a verdict's units allocated of their own ([`Green::unit_effect_lists`]'s field, A-920 3l).
+  pub fn unit_effect_lists(&self) -> u64 {
+    self.unit_effect_lists.get()
+  }
+
+  /// Counts what `units` allocated of their own as they were judged.
+  fn note_unit_lists(&self, units: &position::Units) {
+    self.unit_effect_lists.set(
+      self
+        .unit_effect_lists
+        .get()
+        .saturating_add(units.effect_lists()),
+    );
+  }
+
   /// The number of paths merged through the content fast path (the non-vacuity counter).
   pub fn fast_path_hits(&self) -> u64 {
     self.fast_path_hits.get()
@@ -5191,10 +5191,12 @@ impl Green {
     &self,
     inc: &Increment,
     path: &str,
-    (ops, placed): (&[Op], Option<(u64, Vec<position::Placed>)>),
-  ) -> position::Unit {
+    (ops, placed): (&[Op], Option<(u64, &[position::Placed])>),
+    sink: &mut position::UnitSink<'_>,
+  ) {
     if let Some(class) = self.content_refused(inc, path) {
-      return position::Unit::of(Err(Green::window(path, class)));
+      sink.of(Err(Green::window(path, class)));
+      return;
     }
     let base_changed = self.changed_last(self.last_changed.get(path), path);
     let unchanged = base_changed <= inc.base;
@@ -5203,17 +5205,18 @@ impl Green {
         .fast_path_hits
         .set(self.fast_path_hits.get().saturating_add(1));
     }
-    let placed: Vec<position::Placed> = match placed {
+    // Written into the verdict's placements, never a list of the unit's own (A-920 3l).
+    let start = sink.placed.len();
+    match placed {
       Some((at, placed)) if placed.len() == ops.len() => {
         let since = if unchanged {
           Vec::new()
         } else {
           self.intervening(path, at)
         };
-        placed
-          .into_iter()
-          .map(|place| place.advanced(&since))
-          .collect()
+        sink
+          .placed
+          .extend(placed.iter().map(|place| place.advanced(&since)));
       }
       _ => {
         let intervening = if unchanged {
@@ -5221,15 +5224,14 @@ impl Green {
         } else {
           self.intervening(path, inc.base)
         };
-        ops
-          .iter()
-          .map(|op| position::Placed::of(op, &intervening))
-          .collect()
+        sink
+          .placed
+          .extend(ops.iter().map(|op| position::Placed::of(op, &intervening)));
       }
-    };
-    let mut unit = position::Unit::content(self.content_at_head(inc, path, (ops, &placed)));
-    unit.placed = placed;
-    unit
+    }
+    let placed = sink.placed.get(start..).unwrap_or(&[]);
+    let answer = self.content_at_head(inc, path, (ops, placed));
+    sink.content(answer);
   }
 
   /// Why an edit of `path` is refused before its ops are placed, if it is: no file at the path (a type change, or delete
@@ -5679,24 +5681,23 @@ impl Green {
   fn decide(&self, inc: &Increment, r: &Resolved) -> Result<Vec<Effect>, Vec<ConflictWindow>> {
     let mut units = position::Units::first();
     self.decide_units(inc, r, &mut units);
+    self.note_unit_lists(&units);
     position::verdict(units.into_units().0)
   }
 
   /// A work's copies and what it does in their trees, one unit (A-586, A-626; `position`): the copied ops that do not
   /// fit what a copy brings, then each copy's verdict, then the copied ops'.
-  fn decide_copy_unit(&self, inc: &Increment, r: &Resolved) -> position::Unit {
+  fn decide_copy_unit(&self, inc: &Increment, r: &Resolved, sink: &mut position::UnitSink<'_>) {
     // Each copy's fix once (A-626 part 2): its copied tree is judged against it, and its effect carries it.
     let fixes = self.copy_fixes(r);
-    let mut unit = position::Unit::windows(
+    sink.windows(
       self
         .unfit_copied(inc, (r, &fixes))
         .iter()
-        .map(|path| Green::window(path, MergeConflictClass::TypeChanged))
-        .collect(),
+        .map(|path| Green::window(path, MergeConflictClass::TypeChanged)),
     );
-    self.decide_copies(inc, (r, &fixes), &mut unit.effects, &mut unit.windows);
-    self.decide_copied(inc, (r, &fixes), &mut unit.effects, &mut unit.windows);
-    unit
+    self.decide_copies(inc, (r, &fixes), sink.effects, sink.windows);
+    self.decide_copied(inc, (r, &fixes), sink.effects, sink.windows);
   }
 
   /// Whether `path` changed in any dimension after version `base`: its last change in the change index, or the latest
@@ -6914,20 +6915,15 @@ impl Green {
   /// unknown), else brought to the head ([`Green::at_head`]) and held there, a conflict kept in the rejected-result
   /// cache as a submit keeps one. Its commit's reads checked where `check_reads` ([`Green::commit_reads`]).
   fn hold_computed(&mut self, inc: &Increment, computed: Computed, check_reads: bool) -> Judgment {
-    let mut holding = match self.hold_begin(inc, computed, check_reads) {
-      HoldBegun::Holding(holding) => holding,
-      HoldBegun::Judged(answer) => return answer,
-    };
-    loop {
-      if let Some(judgment) = self.holding_step(inc, &mut holding, &mut || false) {
-        return judgment;
-      }
+    match self.hold_begin(inc, computed, check_reads) {
+      HoldBegun::Holding(mut holding) => self.hold_end(inc, &mut holding),
+      HoldBegun::Judged(answer) => answer,
     }
   }
 
   /// [`Green::hold_computed`] begun: answered at once where the cache or the green's checkpoint answers it, else the
-  /// units brought to the head ([`Green::at_head`]), to be gathered a unit at a time ([`Green::holding_step`]; A-920
-  /// piece 3g: `position::verdict` 2.26 ms whole at 9,000 files, debug, the judge's last step).
+  /// units brought to the head ([`Green::at_head`]), to be held in a step of their own ([`Green::hold_end`]; A-920 piece
+  /// 3g: `position::verdict` 2.26 ms whole at 9,000 files, debug, the judge's last step, before 3l made it the lists).
   pub(super) fn hold_begin(
     &mut self,
     inc: &Increment,
@@ -6957,58 +6953,22 @@ impl Green {
         (units, unchanged.then_some(applied))
       }
     };
-    // Sized once at every unit's effects: a list grown as they are gathered copied itself whole at each doubling, the
-    // unit that ran past the step's check (A-920 3i: probe 5's gather steps a median 0.27 ms past a 1.05 ms quantum).
-    let effects = units
-      .iter()
-      .map(|unit| unit.effects.len())
-      .fold(0usize, usize::saturating_add);
     HoldBegun::Holding(Holding {
-      units: units.into_iter(),
-      gathering: Vec::new().into_iter(),
-      effects: Vec::with_capacity(effects),
-      windows: Vec::new(),
+      verdict: units,
       reached,
       check_reads,
     })
   }
 
-  /// One step of `holding` ([`Green::hold_begin`]): each unit's windows and its effects gathered in order, an effect a
-  /// unit of the walk (an effectless unit one), until `spent` ([`position::verdict`]'s walk); once every unit is, the verdict held, or a conflict cached, in this
-  /// last step alone ([`Green::hold_end`]).
-  pub(super) fn holding_step(
-    &mut self,
-    inc: &Increment,
-    holding: &mut Holding,
-    spent: &mut dyn FnMut() -> bool,
-  ) -> Option<Judgment> {
-    loop {
-      for effect in holding.gathering.by_ref() {
-        holding.effects.push(effect);
-        if spent() {
-          return None;
-        }
-      }
-      let Some(unit) = holding.units.next() else {
-        return Some(self.hold_end(inc, holding));
-      };
-      holding.windows.extend(unit.windows);
-      holding.gathering = unit.effects.into_iter();
-      if holding.gathering.len() == 0 && spent() {
-        return None;
-      }
-    }
-  }
-
-  /// `holding`'s verdict once every unit is gathered: accepted and held where no unit holds a window (its commit's reads
-  /// checked where its judge checks them), else a conflict kept in the rejected-result cache.
-  fn hold_end(&mut self, inc: &Increment, holding: &mut Holding) -> Judgment {
-    let windows = core::mem::take(&mut holding.windows);
+  /// `holding`'s verdict, its flat lists taken whole (A-920 3l): accepted and held where no unit holds a window (its
+  /// commit's reads checked where its judge checks them), else a conflict kept in the rejected-result cache.
+  pub(super) fn hold_end(&mut self, inc: &Increment, holding: &mut Holding) -> Judgment {
+    let windows = core::mem::take(&mut holding.verdict.windows);
     if !windows.is_empty() {
       self.retain_rejected(inc.id, &windows);
       return Judgment::Conflict { windows };
     }
-    let effects = core::mem::take(&mut holding.effects);
+    let effects = core::mem::take(&mut holding.verdict.effects);
     if holding.check_reads {
       self.commit_reads(&effects, inc.post());
     }
@@ -7035,8 +6995,8 @@ impl Green {
     &mut self,
     inc: &Increment,
     (at, floor): (u64, u64),
-    units: Vec<position::Unit>,
-  ) -> Vec<position::Unit> {
+    units: position::Verdict,
+  ) -> position::Verdict {
     let since = self.since(at, floor);
     if since.is_nothing() {
       return units;
@@ -7044,6 +7004,7 @@ impl Green {
     let resolved = Green::resolve(inc);
     let mut again = position::Units::again(units, since);
     self.decide_units(inc, &resolved, &mut again);
+    self.note_unit_lists(&again);
     let (units, judged) = again.into_units();
     self.judged_again = self.judged_again.saturating_add(judged);
     units
