@@ -1348,8 +1348,8 @@ fn decided_units(
   }
   let units = units.into_units().0;
   let shapes = units
-    .iter()
-    .map(|unit| (unit.windows.clone(), unit.effects.len()))
+    .units()
+    .map(|unit| (unit.windows.to_vec(), unit.effects.len()))
     .collect();
   (shapes, steps)
 }
@@ -1415,4 +1415,38 @@ fn a_verdict_reached_an_effect_a_step_records_what_the_verdict_reached_whole_doe
   assert!(recorded.len() > FILES.len(), "{recorded:?}");
   assert_eq!(sliced.applied(), Some(recorded));
   assert!(steps as usize > recorded.len(), "{steps} steps");
+}
+
+/// A-920 3l (one flat effects list a verdict, each unit its range in it): a unit allocates no list of its own, since the
+/// gathering then freed one a unit, and the free that emptied the allocator's region cost one step 1.2 ms (debug probe,
+/// 18,001 units of 0 or 1 effect). Do: compute, whole and a unit a step, a work at the origin's version that writes into
+/// every file and makes one. Expect both accepted with what the chain records of each effect; no unit allocated an
+/// effect list of its own (`Green::unit_effect_lists`); and the edits judged (`Green::fast_path_hits` moved).
+#[test]
+fn a_verdicts_units_allocate_no_effect_list_of_their_own() {
+  let green = Green::with_origin(origin());
+  let mut draft = Draft::default();
+  for (at, path) in FILES.iter().enumerate() {
+    draft.content(OpKind::Insert, path, at as u64, b"+");
+  }
+  draft.alone(OpKind::Create, "made");
+  draft.content(OpKind::Insert, "made", 0, b"new");
+  let inc = increment(draft, green.head(), 1);
+  let hits = green.fast_path_hits();
+  let whole = green.compute(&inc).expect("computed whole");
+  let mut computing = green.begin_computing(&inc);
+  let sliced = loop {
+    if let Some(computed) = green.computing_step(&inc, &mut computing, &mut || true) {
+      break computed.expect("computed a unit a step");
+    }
+  };
+  let recorded = whole.applied().expect("accepted whole");
+  assert_eq!(recorded.len(), FILES.len() + 1, "{recorded:?}");
+  assert_eq!(sliced.applied(), Some(recorded));
+  assert!(green.fast_path_hits() > hits, "no edit judged");
+  assert_eq!(
+    green.unit_effect_lists(),
+    0,
+    "effect lists the units allocated of their own"
+  );
 }

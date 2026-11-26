@@ -64501,6 +64501,22 @@ GAPS.
   that dropped it failed no test, so `a_verdict_reached_an_effect_a_step_records_what_the_verdict_reached_whole_does`
   now compares what the chain records of a work computed whole and a unit a step: red with that drop (none against
   five), green without.
+  **3l, one flat list a verdict.** With the gathering an effect a step (3k), its one long step was a single free. A
+  debug probe timing each operation of a gather step (at 4e048d71d, load ~50) read `judge 1219 us q 3 [g_swap 1204]`,
+  and 1,397 µs with `g_swap` 1,380 before: `g_swap` dropped the drained list of the unit before, of capacity at most 4,
+  since the work's 18,001 units hold 0 or 1 effect each. About 9,000 such lists were freed a unit at a time, and the
+  free that emptied the system allocator's region cost 1.2 ms of thread CPU wherever it landed. Release probe 6 (99
+  runs at ad01a4a61 with each step's quantum, load 66-88): the judge's only steps over 1 ms, one a run, are the
+  gathering's, 1,046-2,136 µs (median 1,271), many at a quantum of 4-77 µs, so each is one unit. A verdict's units are
+  now flat (`position::Verdict`): every unit's effects, windows and placements in three lists in unit order, each unit
+  its ends in them, written by its verdict function through a `position::UnitSink`. A unit allocates nothing of its
+  own. The hold takes the lists whole (`Green::hold_end`, the gathering gone), the reach maps them an item a step, and
+  a verdict judged again at a later head moves each standing unit's parts across in order. The wire form's bytes are
+  unchanged (`put_unit` writes each unit from its ranges, `units_from` builds the lists; nothing persists it, since it
+  rides a sealed work to its owner in memory), so its golden test is the proof. Counter: `Green::unit_effect_lists`,
+  the effect lists units allocated of their own, red first at 10 for a work of five effects computed whole and a unit
+  a step, 0 after (`a_verdicts_units_allocate_no_effect_list_of_their_own`). Planted: a standing unit that moves one
+  effect too few fails three position oracles.
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`

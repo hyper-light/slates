@@ -616,7 +616,9 @@
 > so every step that filled it passed 1 ms. It is now held to `STEP_QUANTUM_CEILING` (bar / 2, 500 µs), since a step is
 > at most its quantum and the unit begun before its check. That premise, a unit within a quantum, did not hold for the
 > import judge's first unit (`Green::decide_first`: 557 µs median, past 1 ms in 39 of probe 5's steps). A-920 3j now
-> walks it a content path a step. Owed: main's macOS 84a round, release probe 6 with each step's quantum, and the loaded long-step counts.
+> walks it a content path a step. Probe 6 (99 release runs, quanta 2-500 µs): only the gathering's free (3l, now none)
+> and the check's last unit (2c, 15 steps, 1,368 µs at most) passed 1 ms; 802 steps ran past twice a 2-77 µs quantum, a
+> unit's own cost, so the premise holds only while every unit stays under the bar less the quantum. Owed: main's macOS 84a round, release probe 6 with each step's quantum, and the loaded long-step counts.
 
 > **Open (84a, g222, 2026-11-20): where a loaded edit and merge's tail waits — a 1 ms band on macOS and on Linux.**
 > A diagnostic (branches `diag-g222-hops*`, never main) stamped every request from its landing in the ring (A-559) to
