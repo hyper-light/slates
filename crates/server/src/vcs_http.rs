@@ -84,9 +84,11 @@ use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::task::Poll;
 
+use slates_db::catalog::{RepositoryRecord, VcsTool};
 use slates_http::head::Head;
 use slates_http::reply::Status;
 use slates_http_edge::connection::{Connection, Decision, Ended, Fields, Next, Phase, StatusMode};
+use slates_http_edge::credential::Credential;
 use slates_http_edge::tls::{HttpsSession, ServingIdentity};
 use slates_rt::TaskId;
 use slates_rt::error::RtError;
@@ -337,6 +339,20 @@ pub(crate) struct Decided<E> {
   pub(crate) proven: bool,
 }
 
+/// Where a request's repository-name routing stands across cross-shard connection moves
+/// ([`ToolSites`]): guarantees at most one hop to the first path segment's owner shard before
+/// falling back to protocol routing for slash-named Git/Mercurial repositories or `.git` LFS
+/// aliases, making shard ping-pong unrepresentable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RouteStage {
+  /// First attempt, or moving toward the first path segment's owner shard.
+  #[default]
+  Initial,
+  /// The first path segment was already checked on its owner shard and is not a registered
+  /// repository (or delegated onward from it); dispatch directly by protocol without bouncing back.
+  FirstAbsent,
+}
+
 /// A tool's site: what decides each request's head (git's, [`git::GitSite`]).
 pub(crate) trait Site {
   /// The exchange a served request runs.
@@ -346,6 +362,37 @@ pub(crate) trait Site {
   /// Basic and Bearer are taken alike over TLS and on the loopback cleartext edge, the only cleartext one [`serve`]
   /// serves (A-686).
   async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange>;
+
+  /// Decides `head` reusing `proven` credentials when [`ToolSites`] already authenticated the
+  /// request before inspecting the repository catalog, avoiding a second credential lookup.
+  async fn decide_proven(
+    &mut self,
+    head: &Head<'_>,
+    secure: bool,
+    _proven: &git::Proven,
+  ) -> Decided<Self::Exchange> {
+    self.decide(head, secure).await
+  }
+
+  /// Current cross-shard routing stage carried across [`Answer::Move`].
+  fn route_stage(&self) -> RouteStage {
+    RouteStage::Initial
+  }
+
+  /// Sets the cross-shard routing stage (restored on arrival after [`Answer::Move`] and reset to
+  /// [`RouteStage::Initial`] once a request is served or refused).
+  fn set_route_stage(&mut self, _stage: RouteStage) {}
+}
+
+/// Credential and repository catalog lookups [`ToolSites`] reads before dispatching by registered
+/// [`VcsTool`], implemented once on [`svn::SvnSite`] so no state is duplicated.
+pub(crate) trait ToolLookup {
+  /// Proves `credential` to a principal (or why not).
+  async fn prove_credential(&self, credential: &Credential) -> Result<git::Proven, git::Unproven>;
+  /// Where the repository named `name` lives.
+  fn locate_repository(&self, name: &str) -> git::Located;
+  /// The repository named `name` on this shard, if held here.
+  fn find_repository(&self, name: &str) -> Option<RepositoryRecord>;
 }
 
 impl<E> Decided<E> {
@@ -373,10 +420,17 @@ impl<E> Decided<E> {
   }
 }
 
-/// The daemon's sites on one edge (A-680 part 2, A-681): Mercurial's decides a wire request, whose query names a command
-/// ([`hg::wire_request`]); Subversion's a request of a method no other client sends or naming its special segment
-/// ([`svn::dav_request`]); and git's every other request, so each tool's clients reach their repositories at one
-/// address. A repository of another tool is answered as one that does not exist, by the site that was asked.
+/// The daemon's sites on one edge (A-680 part 2, A-681, SVN-5): routes by the repository's
+/// registered [`VcsTool`] after proving credentials, so Subversion paths ending in Git or Git LFS
+/// suffixes (`.../HEAD`, `.../info/refs`, `.../git-upload-pack`, `.../objects/info/packs`,
+/// `.../info/lfs/objects/...`) are never hijacked to `GitSite`, while Git smart/dumb HTTP, Git
+/// LFS, and Mercurial wire/hgweb continue to reach their own sites.
+///
+/// **Auth-before-existence (least privilege):** unauthenticated or invalid-credential requests
+/// never consult the repository catalog or move across shards; accepted Git smart HTTP / LFS
+/// routes challenge via `GitSite` (`401` with `WWW-Authenticate` and `LFS-Authenticate`) and every
+/// other request challenges via `SvnSite` (`401` with `WWW-Authenticate`), so nonexistent, private
+/// Subversion, and private Git repositories answer identically before authentication.
 pub(crate) struct ToolSites<G, H, S> {
   /// git's site.
   git: G,
@@ -384,14 +438,22 @@ pub(crate) struct ToolSites<G, H, S> {
   hg: H,
   /// Subversion's site.
   svn: S,
-  /// The room a request's query is read within to tell a Mercurial request: the edge's request room.
+  /// The room a request's query and path are read within.
   room: u64,
+  /// Cross-shard routing stage for the request currently being decided.
+  stage: RouteStage,
 }
 
 impl<G, H, S> ToolSites<G, H, S> {
   /// git's site `git`, Mercurial's `hg` and Subversion's `svn` on one edge, a query read within `room`.
   pub(crate) fn new(git: G, hg: H, svn: S, room: u64) -> Self {
-    Self { git, hg, svn, room }
+    Self {
+      git,
+      hg,
+      svn,
+      room,
+      stage: RouteStage::Initial,
+    }
   }
 }
 
@@ -508,8 +570,17 @@ enum SiteRoute {
   Git,
 }
 
-/// Picks the site for `head` within `room`, preserving exact protocol precedence:
-/// Mercurial wire -> Git LFS -> Subversion DAV -> Git HTTP -> public `GET`/`HEAD` to Subversion -> Git.
+/// Whether `head` parses as an accepted Git smart HTTP or Git LFS route (syntax only, never
+/// inspecting the repository catalog): unauthenticated requests to these endpoints receive Git/LFS
+/// `401` challenges and refusal counters, while dumb-Git and `405` suffixes fall through to
+/// uniform `401` without leaking repository existence or tool type.
+fn is_accepted_git_route(head: &Head<'_>, room: u64) -> bool {
+  slates_git::lfs::serve::route(head, &mut slates_http::Admission::new(room)).is_ok()
+    || slates_git::http::route(head, &mut slates_http::Admission::new(room)).is_ok()
+}
+
+/// Picks the site for `head` within `room` purely by protocol syntax (used when no first-segment
+/// repository exists on its owner shard, e.g. slash-named Git/Hg repos or `.git` LFS aliases).
 fn classify_route(head: &Head<'_>, room: u64) -> SiteRoute {
   if hg::wire_request(head, room) {
     SiteRoute::Hg
@@ -526,15 +597,181 @@ fn classify_route(head: &Head<'_>, room: u64) -> SiteRoute {
   }
 }
 
-impl<G: Site, H: Site, S: Site> Site for ToolSites<G, H, S> {
-  type Exchange = ToolExchange<G::Exchange, H::Exchange, S::Exchange>;
+impl<G: Site, H: Site, S: Site + ToolLookup> ToolSites<G, H, S> {
+  /// Proves `head`'s credentials before any repository lookup; returns `None` when missing,
+  /// malformed, unproven, or unanswered so the caller challenges without consulting the catalog.
+  async fn authenticate_before_lookup(&self, head: &Head<'_>) -> Option<git::Proven> {
+    let credential = slates_http_edge::credential::credential(head)
+      .ok()
+      .flatten()?;
+    self.svn.prove_credential(&credential).await.ok()
+  }
 
-  async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange> {
+  /// Challenges an unauthenticated or invalid-credential request without inspecting the repository
+  /// catalog (auth-before-existence).
+  async fn dispatch_unauthenticated(
+    &mut self,
+    head: &Head<'_>,
+    secure: bool,
+  ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
+    if is_accepted_git_route(head, self.room) {
+      self.git.decide(head, secure).await.map(ToolExchange::Git)
+    } else {
+      self.svn.decide(head, secure).await.map(ToolExchange::Svn)
+    }
+  }
+
+  /// Dispatches `head` by protocol syntax alone.
+  async fn dispatch_by_protocol(
+    &mut self,
+    head: &Head<'_>,
+    secure: bool,
+  ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
     match classify_route(head, self.room) {
       SiteRoute::Hg => self.hg.decide(head, secure).await.map(ToolExchange::Hg),
       SiteRoute::Svn => self.svn.decide(head, secure).await.map(ToolExchange::Svn),
       SiteRoute::Git => self.git.decide(head, secure).await.map(ToolExchange::Git),
     }
+  }
+
+  /// Dispatches an already-authenticated `head` by protocol syntax alone.
+  async fn dispatch_by_protocol_proven(
+    &mut self,
+    head: &Head<'_>,
+    secure: bool,
+    proven: &git::Proven,
+  ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
+    match classify_route(head, self.room) {
+      SiteRoute::Hg => self
+        .hg
+        .decide_proven(head, secure, proven)
+        .await
+        .map(ToolExchange::Hg),
+      SiteRoute::Svn => self
+        .svn
+        .decide_proven(head, secure, proven)
+        .await
+        .map(ToolExchange::Svn),
+      SiteRoute::Git => self
+        .git
+        .decide_proven(head, secure, proven)
+        .await
+        .map(ToolExchange::Git),
+    }
+  }
+
+  /// Dispatches an authenticated request for a repository whose registered `tool` is known here.
+  async fn dispatch_for_tool(
+    &mut self,
+    tool: VcsTool,
+    head: &Head<'_>,
+    secure: bool,
+    proven: &git::Proven,
+  ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
+    match tool {
+      VcsTool::Subversion => {
+        if svn::dav_request(head) || matches!(head.method, b"GET" | b"HEAD") {
+          self
+            .svn
+            .decide_proven(head, secure, proven)
+            .await
+            .map(ToolExchange::Svn)
+        } else {
+          // Non-`!svn` POST (e.g. Git LFS batch or git-upload-pack) against a Subversion
+          // repository: GitSite refuses it 404 because the repository is not a Git repository.
+          self
+            .git
+            .decide_proven(head, secure, proven)
+            .await
+            .map(ToolExchange::Git)
+        }
+      }
+      VcsTool::Git => self
+        .git
+        .decide_proven(head, secure, proven)
+        .await
+        .map(ToolExchange::Git),
+      VcsTool::Mercurial => self
+        .hg
+        .decide_proven(head, secure, proven)
+        .await
+        .map(ToolExchange::Hg),
+    }
+  }
+
+  /// Returns `head`'s first path segment when first-segment repository lookup is still active.
+  fn pending_first_segment(&self, head: &Head<'_>) -> Option<String> {
+    if self.stage == RouteStage::FirstAbsent {
+      return None;
+    }
+    svn::first_path_segment(head, self.room)
+  }
+
+  /// Dispatches an authenticated request whose first path segment belongs to this shard,
+  /// marking `FirstAbsent` if the site subsequently redirects to another shard.
+  async fn decide_local_segment(
+    &mut self,
+    first: &str,
+    head: &Head<'_>,
+    secure: bool,
+    proven: &git::Proven,
+  ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
+    let decided = match self.svn.find_repository(first) {
+      Some(record) => {
+        self
+          .dispatch_for_tool(record.tool, head, secure, proven)
+          .await
+      }
+      None => self.dispatch_by_protocol_proven(head, secure, proven).await,
+    };
+    if matches!(decided.answer, Answer::Move { .. }) {
+      self.stage = RouteStage::FirstAbsent;
+    }
+    decided
+  }
+
+  /// Authenticates `head` before lookup and dispatches it via its first path segment, moving to
+  /// the owning shard when `first` lives elsewhere.
+  async fn decide_first_segment(
+    &mut self,
+    first: &str,
+    head: &Head<'_>,
+    secure: bool,
+  ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
+    let Some(proven) = self.authenticate_before_lookup(head).await else {
+      return self.dispatch_unauthenticated(head, secure).await;
+    };
+    if let git::Located::Elsewhere(shard) = self.svn.locate_repository(first) {
+      return Decided {
+        answer: Answer::Move { shard },
+        proven: true,
+      };
+    }
+    self
+      .decide_local_segment(first, head, secure, &proven)
+      .await
+  }
+}
+
+impl<G: Site, H: Site, S: Site + ToolLookup> Site for ToolSites<G, H, S> {
+  type Exchange = ToolExchange<G::Exchange, H::Exchange, S::Exchange>;
+
+  fn route_stage(&self) -> RouteStage {
+    self.stage
+  }
+
+  fn set_route_stage(&mut self, stage: RouteStage) {
+    self.stage = stage;
+  }
+
+  async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange> {
+    if hg::wire_request(head, self.room) {
+      return self.hg.decide(head, secure).await.map(ToolExchange::Hg);
+    }
+    if let Some(first) = self.pending_first_segment(head) {
+      return self.decide_first_segment(&first, head, secure).await;
+    }
+    self.dispatch_by_protocol(head, secure).await
   }
 }
 
@@ -902,7 +1139,14 @@ where
     let seat = seat_for(state).await?;
     let slot = seat.slot;
     let tracker = Tracker::new(round_trip);
-    match spawn_child(drive(stream, connection, site.clone(), seat, tracker)) {
+    match spawn_child(drive(
+      stream,
+      connection,
+      site.clone(),
+      seat,
+      tracker,
+      RouteStage::Initial,
+    )) {
       Ok(task) => {
         let _ = state.with(|state| state.set_task(slot, task));
         if detach(task).is_err() {
@@ -1295,6 +1539,7 @@ impl<S: Site> Parts<S> {
         status,
         exchange,
       } => {
+        self.site.set_route_stage(RouteStage::Initial);
         self.service = Some(Started {
           exchange,
           head_only,
@@ -1308,6 +1553,7 @@ impl<S: Site> Parts<S> {
         });
       }
       Answer::Refuse { status, fields } => {
+        self.site.set_route_stage(RouteStage::Initial);
         self.service = None;
         connection.decide(Decision::Refuse { status, fields });
       }
@@ -1497,16 +1743,19 @@ async fn drive<S, M>(
   make: M,
   seat: Seat,
   tracker: Tracker,
+  stage: RouteStage,
 ) where
   S: Site + 'static,
   M: Fn() -> S + Clone + Send + 'static,
 {
+  let mut site = make();
+  site.set_route_stage(stage);
   let mut parts = Parts {
     socket: Socket { stream },
     state: seat.state,
     slot: seat.slot,
     tracker,
-    site: make(),
+    site,
     secure: connection.secure(),
     service: None,
     reply: Vec::new(),
@@ -1517,6 +1766,7 @@ async fn drive<S, M>(
       drop(seat);
     }
     Exit::Moved(shard) => {
+      let next_stage = parts.site.route_stage();
       let Parts {
         socket,
         tracker,
@@ -1534,6 +1784,7 @@ async fn drive<S, M>(
           connection,
           tracker,
           make,
+          stage: next_stage,
         },
       );
     }
@@ -1551,6 +1802,8 @@ struct Moving<M> {
   tracker: Tracker,
   /// What makes its site.
   make: M,
+  /// Cross-shard routing stage for the undecided head in `connection`.
+  stage: RouteStage,
 }
 
 /// Moves `moving` to runtime shard `shard`: one spawn on that shard's control channel carrying the connection, which
@@ -1587,13 +1840,14 @@ where
     connection,
     tracker,
     make,
+    stage,
   } = moving;
   let (Some(state), Ok(stream)) = (here(), TcpStream::from_owned(stream)) else {
     crate::fleet::count_refusal(ARRIVAL_LOST);
     return;
   };
   match slates_rt::futures::spawn(serve_arrival::<S, M>(
-    state, stream, connection, tracker, make,
+    state, stream, connection, tracker, make, stage,
   )) {
     Ok(task) => {
       if detach(task).is_err() {
@@ -1613,6 +1867,7 @@ async fn serve_arrival<S, M>(
   connection: Connection,
   tracker: Tracker,
   make: M,
+  stage: RouteStage,
 ) where
   S: Site + 'static,
   M: Fn() -> S + Clone + Send + 'static,
@@ -1631,7 +1886,7 @@ async fn serve_arrival<S, M>(
     }
     state.count(|counts| counts.arrived = counts.arrived.saturating_add(1));
   });
-  drive(stream, connection, make, seat, tracker).await;
+  drive(stream, connection, make, seat, tracker, stage).await;
 }
 
 /// Why a connection that moved here was not seated.

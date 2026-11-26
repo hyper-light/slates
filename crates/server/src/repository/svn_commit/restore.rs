@@ -19,9 +19,10 @@
 //! is counted ([`SLICES`]). The texts it names are brought through the node's store before the commit's step, as a row's
 //! are (`super::bring_stored`).
 //!
-//! **Not declared yet.** A node whose kind differs between the two revisions beneath the copy's root (a file where a
-//! directory stood) is refused `Unsupported`, as the increment's other changes of kind are; and a row of the same
-//! revision that adds or replaces a node the restore sets back.
+//! **Kind changes and boundaries.** A node whose kind differs between the copied revision and the head beneath the
+//! copy's root is restored directly (`compare_both` records `Restore::Set` with the head node's `brought` state and
+//! walks the live children on whichever side is a directory). A row of the same revision that adds, replaces, or
+//! deletes a restored directory over a path the restore sets back is refused `Unsupported` by `svn_commit`.
 
 use std::collections::BTreeMap;
 
@@ -98,8 +99,8 @@ struct Walk {
 
 /// Plans every copy `changes` make from a revision older than repository `repository`'s youngest (module docs), a
 /// slice at a time under the shard's step budget with a yield between, each slice counted. The caller holds the
-/// repository's landing turn. None where the shard's state is gone; refused where the records do not hold together, or
-/// `Unsupported` for a change of kind beneath a copy.
+/// repository's landing turn. None where the shard's state is gone; refused where the records do not hold together or
+/// the store is not held.
 pub(super) async fn plan(
   repository: RepositoryId,
   changes: &[ChangedPath],

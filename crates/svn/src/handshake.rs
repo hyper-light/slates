@@ -220,7 +220,7 @@ const SVN_ERR_BAD_URL: u32 = 125_002;
 
 /// `SVN_ERR_FS_CORRUPT`.
 /// Format: the FS category's start, 120,000 + 8 × 5,000 = 160,000, plus 4 (`svn_error_codes.h`).
-const SVN_ERR_FS_CORRUPT: u32 = 160_004;
+pub const SVN_ERR_FS_CORRUPT: u32 = 160_004;
 
 /// `SVN_ERR_RA_NOT_AUTHORIZED`.
 /// Format: the RA category's start, 120,000 + 10 × 5,000 = 170,000, plus 1 (`svn_error_codes.h`
@@ -1272,6 +1272,11 @@ fn quoted(prefix: &[u8], url: &[u8]) -> Vec<u8> {
   message.extend_from_slice(url);
   message.push(b'\'');
   message
+}
+
+/// The message for [`Unserved::StoreUnrecovered`]: names the repository whose store is absent.
+pub fn store_unrecovered_message(name: &str) -> String {
+  format!("Repository '{name}' store is unrecovered or corrupt")
 }
 
 /// The message for [`Unserved::StoreUnrecovered`]: names the repository whose store is absent.

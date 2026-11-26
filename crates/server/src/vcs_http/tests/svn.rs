@@ -25,7 +25,10 @@ use slates_svn::lock::{AprTime, LockTable};
 use slates_svn::mergeinfo::Contents;
 use slates_svn::reads::Repository;
 
-use super::super::git::{Authenticator, Located, Proven, Repositories, Unproven};
+use super::super::git::{
+  Authenticator, GitServices, GitSite, LfsService, Located, Proven, Repositories, ServiceRefused,
+  Start as GitStart, Unproven,
+};
 use slates_svn::dav::site::{self, Answer as SiteAnswer, ReportProgress};
 
 use super::{Lent, SvnExchange, SvnSite, SvnStores, served_of, xml_bounds};
@@ -53,6 +56,8 @@ const REPO: RepositoryId = RepositoryId { bytes: [1; 16] };
 const BARE: RepositoryId = RepositoryId { bytes: [2; 16] };
 /// Shape: the id of the git repository `r.git`.
 const GIT: RepositoryId = RepositoryId { bytes: [3; 16] };
+/// Shape: the id of the Mercurial repository `hg`.
+const HG: RepositoryId = RepositoryId { bytes: [4; 16] };
 /// Shape: a repository another runtime shard holds, and that shard.
 const AWAY: (&str, u16) = ("away", 3);
 /// Shape: the repository's UUID.
@@ -118,6 +123,7 @@ impl Repositories for Held {
       "repo" => (REPO, VcsTool::Subversion, ObjectFormat::Revisions),
       "bare" => (BARE, VcsTool::Subversion, ObjectFormat::Revisions),
       "r.git" => (GIT, VcsTool::Git, ObjectFormat::Sha1),
+      "hg" => (HG, VcsTool::Mercurial, ObjectFormat::Sha1),
       _ => return None,
     };
     Some(RepositoryRecord {
@@ -1329,9 +1335,9 @@ fn assert_tool_sites_move_and_git_repo_isolation(tools: &mut TestToolSites, owne
 
   let git_as_svn = request("GET", "/r.git/trunk/a.txt", &[owner]);
   let Answer::Refuse { status, .. } = ready(tools.decide(&head(&git_as_svn), false)).answer else {
-    panic!("GET on a git repository path must be refused 404");
+    panic!("GET on a git repository path must dispatch to the Git site, never SvnSite");
   };
-  assert_eq!(status.code, 404);
+  assert_eq!(status.code, 418);
 }
 
 fn assert_tool_sites_stub_status(
@@ -1375,7 +1381,7 @@ fn assert_tool_sites_protocol_isolation(tools: &mut TestToolSites, owner: &str) 
 /// - unshared principal `GET /repo/trunk/a.txt` -> `403`
 /// - missing file `GET /repo/trunk/missing.txt` -> `404`
 /// - cross-shard `GET /away/trunk/a.txt` -> `Answer::Move { shard: AWAY.1 }`
-/// - cross-protocol isolation: `GET /r.git/trunk/a.txt` -> `404` (Git repo never served as SVN),
+/// - cross-protocol isolation: `GET /r.git/trunk/a.txt` -> routed to Git site (never served as SVN),
 ///   `GET /r.git/info/refs?service=git-upload-pack` -> routed to Git site,
 ///   `GET /r.git/HEAD` -> routed to Git site (dumb protocol `403`),
 ///   `GET /repo?cmd=capabilities` -> routed to Hg site,
@@ -1392,4 +1398,416 @@ fn tool_sites_routes_public_get_and_head_to_svn_preserving_auth_move_and_protoco
   assert_tool_sites_svn_auth_and_missing(&mut tools, &owner, &stranger);
   assert_tool_sites_move_and_git_repo_isolation(&mut tools, &owner);
   assert_tool_sites_protocol_isolation(&mut tools, &owner);
+}
+
+/// Minimal Git service exchange for testing real `GitSite` inside [`ToolSites`].
+struct MockGitExchange;
+
+impl Exchange for MockGitExchange {
+  async fn body(&mut self, _run: &[u8]) -> Result<(), crate::vcs_http::Failed> {
+    Ok(())
+  }
+  async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), crate::vcs_http::Failed> {
+    Ok(())
+  }
+  async fn reply(
+    &mut self,
+    out: &mut Vec<u8>,
+    _gone: ClientGone<'_>,
+  ) -> Result<bool, crate::vcs_http::Failed> {
+    out.extend_from_slice(b"0000");
+    Ok(false)
+  }
+}
+
+/// Minimal `GitServices` serving every Git service for real `GitSite` routing tests.
+struct MockGitServices;
+
+impl GitServices for MockGitServices {
+  type Exchange = MockGitExchange;
+  fn start(&mut self, _start: &GitStart<'_>) -> Result<Self::Exchange, ServiceRefused> {
+    Ok(MockGitExchange)
+  }
+}
+
+/// Minimal `LfsService` serving every LFS endpoint with `200 OK` for real `GitSite` routing tests.
+#[derive(Clone, Copy)]
+struct MockLfs;
+
+impl LfsService for MockLfs {
+  fn serves(&self, _endpoint: &slates_git::lfs::serve::Endpoint) -> bool {
+    true
+  }
+  fn answer(&mut self, _call: &crate::lfs::LfsCall<'_>) -> slates_git::lfs::serve::Answer {
+    slates_git::lfs::serve::Answer {
+      status: Status::OK,
+      kind: slates_git::lfs::serve::Kind::Empty,
+      challenge: None,
+      body: b"{}".to_vec(),
+    }
+  }
+}
+
+/// Shape: 64-hex LFS OID used in SVN-5 path-suffix collision tests.
+const LFS_OID_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+/// Shape: 2+38 hex loose Git object path used in SVN-5 path-suffix collision tests.
+const LOOSE_OBJ_PATH: &str = "/trunk/objects/ab/0123456789abcdef0123456789abcdef012345";
+/// Shape: SVN file paths colliding with Git smart/dumb HTTP and Git LFS trailing suffixes.
+const SVN_SUFFIX_FILES: &[(&str, &[u8])] = &[
+  ("/trunk/HEAD", b"svn-head\n"),
+  ("/trunk/info/refs", b"svn-info-refs\n"),
+  ("/trunk/git-upload-pack", b"svn-upload-pack\n"),
+  ("/trunk/git-receive-pack", b"svn-receive-pack\n"),
+  ("/trunk/git-upload-archive", b"svn-upload-archive\n"),
+  ("/trunk/objects/info/packs", b"svn-packs\n"),
+  (LOOSE_OBJ_PATH, b"svn-loose\n"),
+  (
+    "/trunk/info/lfs/objects/0000000000000000000000000000000000000000000000000000000000000000",
+    b"svn-lfs-obj\n",
+  ),
+  ("/trunk/info/lfs/objects/batch", b"svn-lfs-batch\n"),
+];
+
+/// Builds a test SVN [`Repo`] populated with files whose names match Git/LFS trailing path
+/// suffixes plus an empty `/trunk/existing` directory (lacking `/trunk/existing/HEAD`).
+fn repo_with_git_suffix_files() -> Repo {
+  let dirs = [
+    "/trunk",
+    "/trunk/existing",
+    "/trunk/info",
+    "/trunk/info/lfs",
+    "/trunk/info/lfs/objects",
+    "/trunk/objects",
+    "/trunk/objects/info",
+    "/trunk/objects/ab",
+  ];
+  let mut changes: Vec<ChangedPath> = dirs
+    .iter()
+    .map(|path| added(path, NodeKind::Directory, None, None))
+    .collect();
+  let mut tree_r1 = BTreeMap::from([("/".to_owned(), true)]);
+  for dir in dirs {
+    tree_r1.insert(dir.to_owned(), true);
+  }
+  let mut texts = BTreeMap::new();
+  for (path, bytes) in SVN_SUFFIX_FILES {
+    let text = text_of(bytes);
+    texts.insert(text.identity, bytes.to_vec());
+    changes.push(added(path, NodeKind::File, Some(text), None));
+    tree_r1.insert((*path).to_owned(), false);
+  }
+  let mut index = Index::new();
+  index
+    .append(
+      RevisionRecord {
+        transaction: "0-1".to_owned(),
+        changes,
+      },
+      usize::try_from(ROOM).unwrap(),
+    )
+    .unwrap();
+  let date = |value: &str| (b"svn:date".to_vec(), value.as_bytes().to_vec());
+  Repo {
+    index,
+    trees: vec![BTreeMap::from([("/".to_owned(), true)]), tree_r1],
+    lists: BTreeMap::new(),
+    texts,
+    revisions: vec![
+      vec![date("2026-11-18T00:00:00.000000Z")],
+      vec![
+        (b"svn:author".to_vec(), b"alice".to_vec()),
+        date(DATE),
+        (b"svn:log".to_vec(), b"git-suffix files".to_vec()),
+      ],
+    ],
+    locks: LockTable::new(),
+    authz: Authz::parse(AUTHZ, None, authz::Bounds::of(AUTHZ, None)).unwrap(),
+  }
+}
+
+type RealToolSites = ToolSites<
+  GitSite<Tokens, Held, MockGitServices, MockLfs>,
+  StubSite,
+  SvnSite<Tokens, Held, Stores>,
+>;
+
+fn real_tool_sites_with_suffix_files() -> RealToolSites {
+  let repo: &'static Repo = Box::leak(Box::new(repo_with_git_suffix_files()));
+  let git = GitSite::new(REALM.to_owned(), ROOM, Tokens, Held, MockGitServices).with_lfs(MockLfs);
+  let svn = SvnSite::new(REALM.to_owned(), ROOM, Tokens, Held, Stores { repo });
+  ToolSites::new(git, StubSite(421), svn, ROOM)
+}
+
+fn assert_svn_get_returns_bytes(
+  tools: &mut RealToolSites,
+  owner: &str,
+  target: &str,
+  expected_bytes: &[u8],
+) {
+  let get_req = request("GET", target, &[owner]);
+  let Answer::Serve {
+    mut exchange,
+    head_only,
+    ..
+  } = ready(tools.decide(&head(&get_req), false)).answer
+  else {
+    panic!("GET {target} must be served by SvnSite");
+  };
+  assert!(!head_only, "GET {target} must not be head_only");
+  assert!(matches!(exchange, ToolExchange::Svn(_)));
+  ready(exchange.body_end(ClientGone::never())).unwrap();
+  assert_eq!(exchange.reply_status().code, 200, "GET {target}");
+  let _ = ready(exchange.reply_fields()).unwrap();
+  let mut body = Vec::new();
+  while ready(exchange.reply(&mut body, ClientGone::never())).unwrap() {}
+  assert_eq!(body.as_slice(), expected_bytes, "GET {target} body");
+}
+
+fn assert_svn_head_status(
+  tools: &mut RealToolSites,
+  owner: &str,
+  target: &str,
+  expected_status: u16,
+  serve_reason: &str,
+) {
+  let head_req = request("HEAD", target, &[owner]);
+  let Answer::Serve {
+    mut exchange,
+    head_only,
+    ..
+  } = ready(tools.decide(&head(&head_req), false)).answer
+  else {
+    panic!("{serve_reason}");
+  };
+  assert!(head_only, "HEAD {target} must be head_only");
+  assert!(matches!(exchange, ToolExchange::Svn(_)));
+  ready(exchange.body_end(ClientGone::never())).unwrap();
+  assert_eq!(
+    exchange.reply_status().code,
+    expected_status,
+    "HEAD {target}"
+  );
+}
+
+fn assert_svn_dav_routes_to_svn_site(tools: &mut RealToolSites, owner: &str) {
+  let trunk_lfs_object = format!("/repo/trunk/info/lfs/objects/{LFS_OID_HEX}");
+  let txn_lfs_object = format!("/repo/!svn/txr/1-1/trunk/info/lfs/objects/{LFS_OID_HEX}");
+  for (method, target) in [
+    ("PROPFIND", "/repo/trunk/HEAD"),
+    ("MKCOL", "/repo/trunk/existing/HEAD"),
+    ("PUT", trunk_lfs_object.as_str()),
+    ("PUT", txn_lfs_object.as_str()),
+  ] {
+    let req = request(method, target, &[owner]);
+    let Answer::Serve { exchange, .. } = ready(tools.decide(&head(&req), false)).answer else {
+      panic!("{method} {target} on SVN repo must route to SvnSite");
+    };
+    assert!(
+      matches!(exchange, ToolExchange::Svn(_)),
+      "{method} {target} must dispatch to SvnSite"
+    );
+  }
+}
+
+/// SVN-5: Do send authenticated `GET`, `HEAD`, and DAV requests on an SVN repository for files
+/// whose names match Git smart/dumb HTTP and Git LFS trailing path suffixes, plus an absent
+/// `HEAD /repo/trunk/existing/HEAD` (as `ra_serf` sends before `PUT`) and a `POST` to
+/// `/repo/info/lfs/objects/batch`. Expect: every existing SVN file returns `200 OK` with exact
+/// bytes on `GET` and `head_only == true` on `HEAD`; absent `HEAD /repo/trunk/existing/HEAD`
+/// returns `404` from `SvnSite` (not `403` from `GitSite`); DAV `PUT`/`MKCOL`/`PROPFIND` route to
+/// `SvnSite`; and `POST /repo/info/lfs/objects/batch` refuses `404` (never succeeds as LFS).
+#[test]
+fn svn5_tool_sites_serves_svn_paths_matching_git_and_lfs_suffixes() {
+  let mut tools = real_tool_sites_with_suffix_files();
+  let owner = basic("alice", OWNER_TOKEN);
+  for (path, expected_bytes) in SVN_SUFFIX_FILES {
+    let target = format!("/repo{path}");
+    assert_svn_get_returns_bytes(&mut tools, &owner, &target, expected_bytes);
+    assert_svn_head_status(
+      &mut tools,
+      &owner,
+      &target,
+      200,
+      &format!("HEAD {target} must be served by SvnSite"),
+    );
+  }
+
+  // Absent HEAD before DAV PUT (`svn commit` adding `trunk/existing/HEAD` via `ra_serf`).
+  assert_svn_head_status(
+    &mut tools,
+    &owner,
+    "/repo/trunk/existing/HEAD",
+    404,
+    "HEAD /repo/trunk/existing/HEAD must reach SvnSite, not GitSite 403",
+  );
+
+  // DAV PUT/MKCOL/PROPFIND on LFS/Git-suffix paths inside an SVN repo must go to SvnSite.
+  assert_svn_dav_routes_to_svn_site(&mut tools, &owner);
+
+  // POST LFS batch on an SVN repo must refuse cleanly (404), never succeed as LFS.
+  let lfs_batch = request(
+    "POST",
+    "/repo/info/lfs/objects/batch",
+    &[
+      &owner,
+      "Accept: application/vnd.git-lfs+json",
+      "Content-Type: application/vnd.git-lfs+json",
+    ],
+  );
+  let Answer::Refuse { status, .. } = ready(tools.decide(&head(&lfs_batch), false)).answer else {
+    panic!("POST /repo/info/lfs/objects/batch on SVN repo must be refused");
+  };
+  assert_eq!(status.code, 404);
+}
+
+fn assert_real_git_http_routing(tools: &mut RealToolSites, owner: &str) {
+  let info_refs = request("GET", "/r.git/info/refs?service=git-upload-pack", &[owner]);
+  let Answer::Serve { exchange, .. } = ready(tools.decide(&head(&info_refs), false)).answer else {
+    panic!("GET /r.git/info/refs must serve via GitSite");
+  };
+  assert!(matches!(exchange, ToolExchange::Git(_)));
+
+  for method in ["GET", "HEAD"] {
+    let dumb = request(method, "/r.git/HEAD", &[owner]);
+    let Answer::Refuse { status, .. } = ready(tools.decide(&head(&dumb), false)).answer else {
+      panic!("{method} /r.git/HEAD must be refused 403 by GitSite");
+    };
+    assert_eq!(status.code, 403);
+  }
+
+  let plain_git_get = request("GET", "/r.git/trunk/a.txt", &[owner]);
+  let Answer::Refuse { status, .. } = ready(tools.decide(&head(&plain_git_get), false)).answer
+  else {
+    panic!("GET /r.git/trunk/a.txt must be refused 404");
+  };
+  assert_eq!(status.code, 404);
+}
+
+fn assert_git_lfs_serves_200(
+  tools: &mut RealToolSites,
+  method: &str,
+  target: &str,
+  headers: &[&str],
+) {
+  let req = request(method, target, headers);
+  let Answer::Serve { mut exchange, .. } = ready(tools.decide(&head(&req), false)).answer else {
+    panic!("{method} {target} must serve via GitSite");
+  };
+  assert!(matches!(exchange, ToolExchange::Git(_)));
+  ready(exchange.body_end(ClientGone::never())).unwrap();
+  assert_eq!(exchange.reply_status().code, 200);
+}
+
+/// SVN-5: Do send Git smart HTTP, dumb HTTP, LFS (batch + basic PUT), and non-Git plain `GET`
+/// against a real `VcsTool::Git` repo, plus wire and hgweb requests against `VcsTool::Mercurial`.
+/// Expect: Git serves `info/refs` and LFS (`200`), refuses dumb `HEAD` (`403`), and rejects
+/// `/r.git/trunk/a.txt` (`404`); Hg routes both `?cmd=` and hgweb to `HgSite`.
+#[test]
+fn svn5_tool_sites_preserves_real_git_and_hg_routing() {
+  let mut tools = real_tool_sites_with_suffix_files();
+  let owner = basic("alice", OWNER_TOKEN);
+
+  assert_real_git_http_routing(&mut tools, &owner);
+
+  let lfs_put_target = format!("/r.git/info/lfs/objects/{LFS_OID_HEX}");
+  assert_git_lfs_serves_200(&mut tools, "PUT", &lfs_put_target, &[&owner]);
+  assert_git_lfs_serves_200(
+    &mut tools,
+    "POST",
+    "/r.git/info/lfs/objects/batch",
+    &[
+      &owner,
+      "Accept: application/vnd.git-lfs+json",
+      "Content-Type: application/vnd.git-lfs+json",
+    ],
+  );
+
+  for target in ["/hg?cmd=capabilities", "/hg"] {
+    let req = request("GET", target, &[&owner]);
+    assert!(
+      matches!(
+        ready(tools.decide(&head(&req), false)).answer,
+        Answer::Refuse { status, .. } if status.code == 421
+      ),
+      "GET {target} must route to HgSite"
+    );
+  }
+}
+
+/// SVN-5: Do send authenticated requests for a repository located on another shard (`AWAY`) across
+/// SVN suffix paths (`/trunk/HEAD`, `/trunk/existing/HEAD`) and Git/LFS paths (`/info/refs`,
+/// `/info/lfs/objects/...`), plus an unauthenticated request to `/away/trunk/HEAD`. Expect: every
+/// authenticated request returns `Answer::Move { shard: AWAY.1 }` with `proven == true`, and the
+/// unauthenticated request refuses `401` without moving.
+#[test]
+fn svn5_tool_sites_preserves_cross_shard_move_for_svn_and_git_suffix_paths() {
+  let mut tools = real_tool_sites_with_suffix_files();
+  let owner = basic("alice", OWNER_TOKEN);
+  let lfs_obj = format!("/away/info/lfs/objects/{LFS_OID_HEX}");
+  for (method, target) in [
+    ("GET", "/away/trunk/HEAD"),
+    ("HEAD", "/away/trunk/existing/HEAD"),
+    ("GET", "/away/info/refs?service=git-upload-pack"),
+    ("PUT", lfs_obj.as_str()),
+  ] {
+    let req = request(method, target, &[&owner]);
+    let decided = ready(tools.decide(&head(&req), false));
+    assert!(
+      decided.proven && matches!(decided.answer, Answer::Move { shard } if shard == AWAY.1),
+      "{method} {target} must Move to shard {} with proven=true",
+      AWAY.1
+    );
+  }
+
+  let unauth = request("GET", "/away/trunk/HEAD", &[]);
+  let decided = ready(tools.decide(&head(&unauth), false));
+  assert!(!decided.proven);
+  assert!(matches!(
+    decided.answer,
+    Answer::Refuse { status, .. } if status.code == 401
+  ));
+}
+
+/// SVN-5 (auth-before-existence): Do send unauthenticated and invalid-credential `GET` and `HEAD`
+/// requests across nonexistent (`no-such`), private SVN (`repo`), and private Git (`r.git`)
+/// repositories for plain paths and Git/LFS suffix paths. Expect: every single request refuses
+/// `401 Unauthorized` with `WWW-Authenticate` and `proven == false`, leaking neither repository
+/// existence nor registered VCS tool.
+#[test]
+fn svn5_tool_sites_unauthenticated_get_and_head_never_leak_existence_or_tool() {
+  let mut tools = real_tool_sites_with_suffix_files();
+  let lfs_obj = format!("/trunk/info/lfs/objects/{LFS_OID_HEX}");
+  let paths = [
+    "/trunk/HEAD",
+    "/HEAD",
+    "/trunk/info/refs",
+    "/trunk/git-upload-pack",
+    "/trunk/objects/info/packs",
+    lfs_obj.as_str(),
+    "/trunk/info/lfs/objects/batch",
+    "/trunk/a.txt",
+  ];
+  let bad_creds: &[&[&str]] = &[&[], &["Authorization: Bearer invalid-token"]];
+  for repo_name in ["no-such", "repo", "r.git"] {
+    for suffix in paths {
+      let target = format!("/{repo_name}{suffix}");
+      for method in ["GET", "HEAD"] {
+        for headers in bad_creds {
+          let req = request(method, &target, headers);
+          let decided = ready(tools.decide(&head(&req), false));
+          assert!(!decided.proven, "{method} {target} {headers:?}");
+          let Answer::Refuse { status, fields } = decided.answer else {
+            panic!("{method} {target} {headers:?} must refuse 401");
+          };
+          assert_eq!(status.code, 401, "{method} {target} {headers:?}");
+          assert!(
+            fields
+              .iter()
+              .any(|(name, _)| name.eq_ignore_ascii_case(b"WWW-Authenticate")),
+            "{method} {target} {headers:?} 401 must carry WWW-Authenticate"
+          );
+        }
+      }
+    }
+  }
 }

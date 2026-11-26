@@ -90,8 +90,8 @@ use slates_svn::lock::{HeadView, LockEntry, UUID_BYTES};
 use slates_svn::reads::Repository;
 use std::collections::BTreeMap;
 
-use super::git::{Authenticator, Located, Repositories, Unproven};
-use super::{Answer, ClientGone, Decided, Exchange, Failed, Site};
+use super::git::{Authenticator, Located, Proven, Repositories, Unproven};
+use super::{Answer, ClientGone, Decided, Exchange, Failed, Site, ToolLookup};
 use crate::vcs_policy::{self, Right};
 
 /// Format: the bytes an escape may not name in a repository's path: a slash, which would move a segment's boundary,
@@ -350,6 +350,17 @@ impl<A: Authenticator, R: Repositories, S: SvnStores + Clone> SvnSite<A, R, S> {
       Proof::Unauthorized => return self.unauthorized(),
       Proof::Refused(status) => return refused_with(status, Fields::new(), false),
     };
+    self.answer_with_principal(head, routed, principal)
+  }
+
+  /// Resolves the repository, policy, and exchange for a routed Subversion request whose
+  /// `principal` is already proved.
+  fn answer_with_principal(
+    &mut self,
+    head: &Head<'_>,
+    routed: Routed,
+    principal: Principal,
+  ) -> Decided<SvnExchange<S>> {
     if let Located::Elsewhere(shard) = self.repositories.locate(&routed.name) {
       return Decided {
         answer: Answer::Move { shard },
@@ -429,6 +440,42 @@ impl<A: Authenticator, R: Repositories, S: SvnStores + Clone> Site for SvnSite<A
   async fn decide(&mut self, head: &Head<'_>, _secure: bool) -> Decided<Self::Exchange> {
     self.answer(head).await
   }
+
+  async fn decide_proven(
+    &mut self,
+    head: &Head<'_>,
+    _secure: bool,
+    proven: &Proven,
+  ) -> Decided<Self::Exchange> {
+    let routed = match route(head, self.room) {
+      Ok(routed) => routed,
+      Err(status) => return refused_with(status, Fields::new(), true),
+    };
+    self.answer_with_principal(head, routed, proven.principal.clone())
+  }
+}
+
+impl<A: Authenticator, R: Repositories, S> ToolLookup for SvnSite<A, R, S> {
+  async fn prove_credential(
+    &self,
+    credential: &credential::Credential,
+  ) -> Result<Proven, Unproven> {
+    self.authenticator.prove(credential).await
+  }
+
+  fn locate_repository(&self, name: &str) -> Located {
+    self.repositories.locate(name)
+  }
+
+  fn find_repository(&self, name: &str) -> Option<RepositoryRecord> {
+    self.repositories.find(name)
+  }
+}
+
+/// Decodes the first path segment of `head` within `room` using the same path-decoding boundary
+/// as [`route`], returning `None` when the target names no valid repository segment.
+pub(crate) fn first_path_segment(head: &Head<'_>, room: u64) -> Option<String> {
+  route(head, room).ok().map(|routed| routed.name)
 }
 
 /// Format: the methods git's and Mercurial's clients send (git's smart HTTP and Git LFS: GET, HEAD and POST; hg's wire

@@ -1153,10 +1153,23 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     self.ends_with(CONNECTION_CLOSED, CLOSED_WORDS.as_bytes());
   }
 
-  /// Ends the tunnel because the repository's store is not held here: the site's not-served words, nothing more
-  /// written.
+  /// Ends the tunnel because the repository's store is not held here: mid-session (once a
+  /// repository is open) emits a typed `E160004` (`SVN_ERR_FS_CORRUPT`) failure frame on stdout
+  /// and `svnserve: E160004: ...` on stderr; before open falls back to the site's not-served words.
   fn not_held(&mut self) {
     crate::fleet::count_refusal(STORE_NOT_HELD);
+    if let Some(name) = self.opened.as_ref().map(|record| record.name.clone()) {
+      let message = handshake::store_unrecovered_message(&name);
+      if self
+        .connection
+        .fail_command(handshake::SVN_ERR_FS_CORRUPT, &message, &mut self.out)
+        .is_err()
+      {
+        crate::fleet::count_refusal(UNWORDED_END);
+      }
+      self.ends_with(handshake::SVN_ERR_FS_CORRUPT, message.as_bytes());
+      return;
+    }
     let refused = not_served(Service::Subversion);
     self.err.extend_from_slice(&refused.stderr);
     self.exit = Some(refused.exit_status);
@@ -1416,3 +1429,243 @@ fn item_words(error: ItemError) -> (u32, String) {
 #[cfg(test)]
 #[path = "tests/svn.rs"]
 pub(super) mod tests;
+
+#[cfg(test)]
+mod store_unrecovered_tests {
+  use std::cell::Cell;
+  use std::future::Future;
+  use std::task::{Context, Poll, Waker};
+
+  use slates_db::HostId;
+  use slates_db::catalog::{
+    ObjectFormat, Principal, RepositoryId, RepositoryPolicy, RepositoryRecord, VcsTool,
+  };
+  use slates_svn::authz;
+  use slates_svn::commit::drive::{TextSink, Work};
+  use slates_svn::commit::record::Record;
+  use slates_svn::dump::Uuid;
+  use slates_svn::lock::AprTime;
+  use slates_svn::migration::{Repository as Records, Room};
+  use slates_svn::report::exchange::Budget;
+  use slates_svn::serve::{Limits, Policy, Sources};
+
+  use super::{Opening, SvnCommand, SvnStores, TunnelBounds};
+  use crate::repository::svn_commit::{Committed, Uncommitted as Unlanded};
+  use crate::vcs_http::git::{Located, Repositories};
+  use crate::vcs_ssh::site::{ClientGone, Command, Next};
+
+  const REPO_ID: RepositoryId = RepositoryId { bytes: [9; 16] };
+  const OWNER_UID: u32 = 77;
+  const TEST_UUID: &str = "00000000-0000-4000-8000-00000000a617";
+
+  fn owner_principal() -> Principal {
+    Principal::Uid {
+      host: HostId(0),
+      uid: OWNER_UID,
+    }
+  }
+
+  fn ready<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    match future.as_mut().poll(&mut cx) {
+      Poll::Ready(out) => out,
+      Poll::Pending => panic!("expected immediate completion"),
+    }
+  }
+
+  struct OneRepo;
+
+  impl Repositories for OneRepo {
+    fn locate(&self, _name: &str) -> Located {
+      Located::Here
+    }
+    fn find(&self, name: &str) -> Option<RepositoryRecord> {
+      if name != "demo" {
+        return None;
+      }
+      Some(RepositoryRecord {
+        index_bits: 0,
+        id: REPO_ID,
+        name: "demo".to_owned(),
+        tool: VcsTool::Subversion,
+        format: ObjectFormat::Revisions,
+        default_branch: None,
+        owner: owner_principal(),
+        policy: RepositoryPolicy {
+          version: 1,
+          rules: Vec::new(),
+          hooks: Vec::new(),
+          hooks_env: Vec::new(),
+          signers: Vec::new(),
+          hg_publishing: true,
+        },
+      })
+    }
+  }
+
+  struct DroppableStore {
+    alive: &'static Cell<bool>,
+    records: &'static Records,
+  }
+
+  impl SvnStores for DroppableStore {
+    type Green<'a> = Records;
+    type Turn = ();
+
+    fn holds(&self, id: RepositoryId) -> bool {
+      id == REPO_ID && self.alive.get()
+    }
+
+    fn opening<T>(&mut self, id: RepositoryId, step: impl FnOnce(&Opening<'_>) -> T) -> Option<T> {
+      self.holds(id).then(|| {
+        step(&Opening {
+          uuid: TEST_UUID.as_bytes(),
+          realm: TEST_UUID.as_bytes(),
+          mergeinfo: true,
+          anonymous: false,
+          authenticated: true,
+          cram_md5: false,
+        })
+      })
+    }
+
+    async fn commit(
+      &mut self,
+      _id: RepositoryId,
+      _principal: &Principal,
+      _work: Work,
+      _texts: &dyn TextSink,
+    ) -> Option<Result<Committed, Unlanded>> {
+      None
+    }
+
+    async fn turn(&mut self, id: RepositoryId) -> Option<()> {
+      self.holds(id).then_some(())
+    }
+
+    async fn land_record(
+      &mut self,
+      _turn: (),
+      _id: RepositoryId,
+      _principal: &Principal,
+      _record: Record,
+    ) -> Option<Result<(), Unlanded>> {
+      None
+    }
+
+    fn hook_views(&self) -> crate::vcs_store::svn_presenter::HookViews {
+      crate::vcs_store::svn_presenter::HookViews::default()
+    }
+
+    fn lend<T>(
+      &mut self,
+      id: RepositoryId,
+      texts: &dyn TextSink,
+      step: impl FnOnce(&Sources<'_, Records>) -> T,
+    ) -> Option<T> {
+      if !self.holds(id) {
+        return None;
+      }
+      Some(step(&Sources {
+        index: self.records.index(),
+        repository: self.records,
+        locks: self.records.locks(),
+        now: AprTime(0),
+        policy: Policy {
+          anonymous: authz::Access::None,
+          authenticated: authz::Access::Write,
+          authz: None,
+          filesystem: "demo",
+        },
+        texts,
+      }))
+    }
+  }
+
+  /// Do establish an `svn+ssh://` tunnel session over `SvnCommand`, drop the backing store
+  /// mid-session, and send a `get-latest-rev` command. Expect: the tunnel emits a typed `E160004`
+  /// (`SVN_ERR_FS_CORRUPT`) failure frame on stdout AND `svnserve: E160004: Repository 'demo'
+  /// store is unrecovered or corrupt` on stderr, exiting 1 rather than dropping silently.
+  #[test]
+  fn mid_session_store_loss_over_ssh_emits_typed_e160004_on_stdout_and_stderr() {
+    let alive: &'static Cell<bool> = Box::leak(Box::new(Cell::new(true)));
+    let records: &'static Records = Box::leak(Box::new(
+      Records::new(
+        Uuid::parse(TEST_UUID.as_bytes()).unwrap(),
+        b"2026-11-19T00:00:00.000000Z",
+        Room {
+          entries: 1 << 10,
+          bytes: 1 << 20,
+        },
+      )
+      .unwrap(),
+    ));
+    let bounds = TunnelBounds {
+      limits: Limits {
+        item_bytes: 1 << 20,
+        report_room: 1 << 20,
+        most_open: 64,
+      },
+      budget: Budget {
+        room: 1 << 20,
+        steps: 1 << 16,
+        quantum: None,
+      },
+      commit_room: 1 << 20,
+    };
+    let mut cmd = SvnCommand::new(
+      OneRepo,
+      DroppableStore { alive, records },
+      &owner_principal(),
+      bounds,
+    )
+    .expect("tunnel starts");
+
+    let handshake =
+      b"( 2 ( edit-pipeline svndiff1 absent-entries depth mergeinfo log-revprops ) 22:svn+ssh://fixture/demo 8:SVN/1.15 ( ) ) \
+        ( EXTERNAL ( 0: ) ) ";
+    cmd.input(handshake).unwrap();
+    loop {
+      let step = ready(cmd.step(ClientGone::never())).unwrap();
+      let (err, out) = cmd.output();
+      let (err_len, out_len) = (err.len(), out.len());
+      cmd.sent(err_len, out_len);
+      if matches!(step.next, Next::Input) {
+        break;
+      }
+      assert!(
+        !matches!(step.next, Next::Exited(_)),
+        "handshake must establish before dropping store"
+      );
+    }
+
+    // Drop backing store mid-session and send a command.
+    alive.set(false);
+    cmd.input(b"( get-latest-rev ( ) ) ").unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit_code = loop {
+      let step = ready(cmd.step(ClientGone::never())).unwrap();
+      let (err, out) = cmd.output();
+      stderr.extend_from_slice(err);
+      stdout.extend_from_slice(out);
+      let (err_len, out_len) = (err.len(), out.len());
+      cmd.sent(err_len, out_len);
+      if let Next::Exited(code) = step.next {
+        break code;
+      }
+    };
+    let stdout_str = String::from_utf8_lossy(&stdout);
+    let stderr_str = String::from_utf8_lossy(&stderr);
+    assert_eq!(exit_code, 1);
+    assert!(
+      stdout_str.contains("( failure ( ( 160004 ") && stdout_str.contains("unrecovered"),
+      "ssh tunnel stdout must carry E160004 frame: {stdout_str:?}"
+    );
+    assert!(
+      stderr_str.contains("svnserve: E160004:") && stderr_str.contains("demo"),
+      "ssh tunnel stderr must carry E160004 message: {stderr_str:?}"
+    );
+  }
+}

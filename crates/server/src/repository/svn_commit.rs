@@ -47,10 +47,10 @@
 //!
 //! **Not declared yet** (refused typed, [`Uncommitted::Unsupported`], counted [`UNSUPPORTED`], nothing changed; GAPS
 //! §4.17.4): a directory deleted or replaced beneath a copy the same revision made from a revision older than the head,
-//! whose tree no public read of the engine lists at that version; a node of another kind beneath a copy from an older
-//! revision than the head holds there, a replacement by a copy of a source the head no longer holds, and an addition
-//! or replacement by a row of the same revision over a path the copy sets back ([`restore`]); and a replacement without
-//! history that changes a node's kind, which the engine refuses as `TypeChanged` (GAPS §8f).
+//! whose tree `Green::beneath` does not list at that version; and an addition, replacement, or directory deletion by a
+//! row of the same revision over a path that an older-revision copy's [`restore`] sets back. Atomic kind replacements
+//! (file <-> directory) via `Action::Replace` or `Action::Add` over a removed ancestor, older-revision copies whose
+//! source changed kind or was deleted since the copied revision, and cross-kind restores are declared and landed.
 //!
 //! **A client's work** ([`land_work`], A-698): what both ra_svn transports call with the work their connection
 //! accepted at `close-edit`, `svn://` and `svnserve -t` through the SSH tunnel sharing A-656's connection. The revision
@@ -165,8 +165,7 @@ pub(crate) enum Uncommitted {
 /// Format: `SVN_ERR_FS_GENERAL`, the filesystem category's start (160,000): the error a refusal of the step's own that
 /// FSFS has no closer error for is answered with (`svn_error_codes.h`).
 const SVN_ERR_FS_GENERAL: u32 = 160_000;
-/// Format: `SVN_ERR_FS_CORRUPT`, the filesystem category's start plus 4 (`svn_error_codes.h`).
-const SVN_ERR_FS_CORRUPT: u32 = 160_004;
+use slates_svn::handshake::SVN_ERR_FS_CORRUPT;
 /// Format: `SVN_ERR_UNSUPPORTED_FEATURE`, the miscellaneous category's start (200,000) plus 7 (`svn_error_codes.h`).
 const SVN_ERR_UNSUPPORTED_FEATURE: u32 = 200_007;
 

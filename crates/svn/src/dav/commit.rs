@@ -723,7 +723,8 @@ impl DavCommit {
     let path = relpath(path);
     let parent = self.open_parents(world, hooks, &path)?;
     let file = self.token(b'c');
-    let adds = start.version_name.is_none() && self.node_kind(world, &path) != Some(NodeKind::File);
+    let adds =
+      start.version_name.is_none() && self.node_kind(world, &path)? != Some(NodeKind::File);
     let command = if adds {
       EditCommand::AddFile {
         path: path.as_bytes(),
@@ -832,6 +833,7 @@ impl DavCommit {
     path: &str,
     copied_from: Option<CopiedFrom<'_>>,
   ) -> Result<(), HttpAnswer> {
+    self.close_open_directories_at(world, hooks, path)?;
     let parent = self.open_parents(world, hooks, path)?;
     let child = self.token(b'd');
     self.step(
@@ -881,6 +883,29 @@ impl DavCommit {
     Ok(())
   }
 
+  /// Each of `changes` made on a directory at `path` (opened at `revision`).
+  fn change_directory_properties<G: Green + ?Sized>(
+    &mut self,
+    world: &World<'_, G>,
+    hooks: Hooks<'_>,
+    (path, revision): (&str, Option<u64>),
+    changes: &[(Vec<u8>, Option<Vec<u8>>)],
+  ) -> Result<(), HttpAnswer> {
+    let token = self.open_directory(world, hooks, path, revision)?;
+    for (name, value) in changes {
+      self.step(
+        world,
+        hooks,
+        &EditCommand::ChangeDirProp {
+          directory: &token,
+          name,
+          value: value.as_deref(),
+        },
+      )?;
+    }
+    Ok(())
+  }
+
   /// Each of `changes` made on the node at `path`: a directory's on its open token, a file's on it opened for them.
   fn change_properties<G: Green + ?Sized>(
     &mut self,
@@ -889,21 +914,8 @@ impl DavCommit {
     (path, revision): (&str, Option<u64>),
     changes: &[(Vec<u8>, Option<Vec<u8>>)],
   ) -> Result<(), HttpAnswer> {
-    let directory = self.node_kind(world, path) == Some(NodeKind::Directory);
-    if directory {
-      let token = self.open_directory(world, hooks, path, revision)?;
-      for (name, value) in changes {
-        self.step(
-          world,
-          hooks,
-          &EditCommand::ChangeDirProp {
-            directory: &token,
-            name,
-            value: value.as_deref(),
-          },
-        )?;
-      }
-      return Ok(());
+    if self.node_kind(world, path)? == Some(NodeKind::Directory) {
+      return self.change_directory_properties(world, hooks, (path, revision), changes);
     }
     let parent = self.open_parents(world, hooks, path)?;
     let file = self.token(b'c');
@@ -945,12 +957,16 @@ impl DavCommit {
 
   /// The node kind currently visible at `path` inside the pending transaction: reflects pending
   /// adds, deletes, replaces, and inherited subtrees of copied directories before falling back to
-  /// the transaction's base revision (mirroring `Drive::view`).
-  fn node_kind<G: ?Sized>(&self, world: &World<'_, G>, path: &str) -> Option<NodeKind> {
+  /// the transaction's base revision (mirroring `Drive::view`), propagating index errors typed.
+  fn node_kind<G: ?Sized>(
+    &self,
+    world: &World<'_, G>,
+    path: &str,
+  ) -> Result<Option<NodeKind>, HttpAnswer> {
     let pending = self.drive.pending();
     let full = full_path(pending.base_path, path);
     if let Some(row) = pending.rows.get(&full) {
-      return (row.action != Action::Delete).then_some(row.kind);
+      return Ok((row.action != Action::Delete).then_some(row.kind));
     }
     let mut ancestor = full.as_str();
     while let Some(end) = ancestor.rfind('/') {
@@ -961,15 +977,10 @@ impl DavCommit {
       };
       if let Some(row) = pending.rows.get(ancestor) {
         match (row.action, &row.copy_from) {
-          (Action::Delete, _) | (Action::Add | Action::Replace, None) => return None,
+          (Action::Delete, _) | (Action::Add | Action::Replace, None) => return Ok(None),
           (Action::Add | Action::Replace, Some(source)) => {
             let inside = copied_source_path(&source.path, ancestor, &full);
-            return world
-              .index
-              .node(&inside, source.revision)
-              .ok()
-              .flatten()
-              .map(|node| node.kind());
+            return index_node_kind(world, &inside, source.revision);
           }
           (Action::Modify, _) => {}
         }
@@ -978,12 +989,7 @@ impl DavCommit {
         break;
       }
     }
-    world
-      .index
-      .node(&full, pending.base)
-      .ok()
-      .flatten()
-      .map(|node| node.kind())
+    index_node_kind(world, &full, pending.base)
   }
 
   /// Closes any open directory tokens at or beneath `path` (deepest first) before `path` is
@@ -1193,6 +1199,20 @@ pub fn unserved(what: &str) -> HttpAnswer {
     SVN_ERR_UNSUPPORTED_FEATURE,
     &format!("{what} is not served here"),
   )
+}
+
+/// Looks up the node kind at `path` and `revision` in `world.index`, turning any typed index
+/// refusal into a DAV error answer rather than masking it as absent.
+fn index_node_kind<G: ?Sized>(
+  world: &World<'_, G>,
+  path: &str,
+  revision: Revision,
+) -> Result<Option<NodeKind>, HttpAnswer> {
+  world
+    .index
+    .node(path, revision)
+    .map(|found| found.map(|node| node.kind()))
+    .map_err(|err| refusal(err.subversion_code(), &format!("{err:?}")))
 }
 
 /// Property changes in order: each name, and its new value or none for a removal.
@@ -1736,5 +1756,101 @@ mod redteam_tests {
       repo.text(&text.identity).as_deref(),
       Some(b"world!\n".as_slice())
     );
+  }
+
+  fn assert_non_canonical_node_kind_refused(commit: &DavCommit, world: &World<'_, Standalone>) {
+    // Index errors (e.g. non-canonical path) must propagate as typed DAV refusals, never `None`.
+    let refused = commit
+      .node_kind(world, "/trunk//bad")
+      .expect_err("non-canonical path must propagate IndexRefusal::PathSyntax");
+    let refused_body = String::from_utf8_lossy(&refused.body);
+    assert!(
+      refused_body.contains("160005"),
+      "expected SVN_ERR_FS_PATH_SYNTAX (160005) in DAV error body: {refused_body}"
+    );
+  }
+
+  fn assert_proppatch_delete_readd_directory_commits(repo: &mut Standalone, hooks: Hooks<'_>) {
+    let world = World {
+      index: repo.index(),
+      green: repo,
+      locks: repo.locks(),
+    };
+    let mut commit = DavCommit::begin(
+      setup("1-2"),
+      &world,
+      hooks,
+      Box::new(crate::commit::drive::HeldTexts::new()),
+    )
+    .unwrap();
+    assert_non_canonical_node_kind_refused(&commit, &world);
+
+    // Open `/trunk/sub` via PROPPATCH, delete it, then re-create `/trunk/sub` via MKCOL and add
+    // a nested child `/trunk/sub/fresh` (exercising open baton cleanup across delete + add + merge).
+    assert_eq!(
+      commit
+        .proppatch(
+          &world,
+          hooks,
+          ("/trunk/sub", None),
+          (PROPPATCH_PROP, &BOUNDS)
+        )
+        .status,
+      207
+    );
+    assert_eq!(commit.delete(&world, hooks, "/trunk/sub", None).status, 204);
+    assert_eq!(commit.mkcol(&world, hooks, "/trunk/sub").status, 201);
+    assert_eq!(commit.mkcol(&world, hooks, "/trunk/sub/fresh").status, 201);
+    let Merged::Accepted(work, sink) = commit.merge(&world, hooks) else {
+      panic!("merge after delete + mkcol must succeed");
+    };
+    assert_eq!(land(repo, *work, sink), 2);
+    assert_eq!(
+      repo
+        .index()
+        .node("/trunk/sub/fresh", 2)
+        .unwrap()
+        .unwrap()
+        .kind(),
+      NodeKind::Directory
+    );
+  }
+
+  fn assert_duplicate_mkcol_closes_existing_baton(repo: &Standalone, hooks: Hooks<'_>) {
+    // On a fresh transaction, MKCOL `/trunk/dup` opens its baton in `directories`; calling
+    // `add_directory` again at `/trunk/dup` must close that open baton before attempting AddDir
+    // rather than overwriting or leaking it.
+    let world2 = World {
+      index: repo.index(),
+      green: repo,
+      locks: repo.locks(),
+    };
+    let mut commit2 = DavCommit::begin(
+      setup("2-1"),
+      &world2,
+      hooks,
+      Box::new(crate::commit::drive::HeldTexts::new()),
+    )
+    .unwrap();
+    assert_eq!(commit2.mkcol(&world2, hooks, "/trunk/dup").status, 201);
+    assert!(commit2.directories.contains_key("trunk/dup"));
+    let dup = commit2.mkcol(&world2, hooks, "/trunk/dup");
+    assert_ne!(dup.status, 201);
+    assert!(!commit2.directories.contains_key("trunk/dup"));
+  }
+
+  /// Do: (a) open a directory baton via PROPPATCH, delete a descendant or the directory, and
+  /// re-add via `add_directory` (MKCOL/COPY) so `add_directory` closes any pre-existing open
+  /// directory baton before inserting the new one; and (b) call `node_kind` with a non-canonical
+  /// path (`//bad`) that `world.index.node` refuses with `IndexRefusal::PathSyntax`. Expect:
+  /// (a) MERGE commits cleanly without double-closing or leaking batons, and (b) `node_kind`
+  /// propagates the typed DAV refusal (`SVN_ERR_FS_PATH_SYNTAX` = 160005) rather than masking it
+  /// as `Ok(None)`.
+  #[test]
+  fn dav_add_directory_closes_existing_baton_and_node_kind_propagates_index_errors() {
+    let mut repo = seeded_repository();
+    let hooks: Hooks<'_> = &passed;
+    assert_proppatch_delete_readd_directory_commits(&mut repo, hooks);
+    assert_duplicate_mkcol_closes_existing_baton(&repo, hooks);
   }
 }

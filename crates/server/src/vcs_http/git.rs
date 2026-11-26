@@ -677,8 +677,31 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
     head: &Head<'_>,
     secure: bool,
   ) -> Decided<SiteExchange<S::Exchange, L>> {
+    self.answer_with(head, secure, None).await
+  }
+
+  /// Reuses `pre_proven` when a router already proved credentials, otherwise proves `head`.
+  async fn resolve_proof(
+    &self,
+    head: &Head<'_>,
+    pre_proven: Option<Proven>,
+  ) -> Result<Proven, Refused> {
+    match pre_proven {
+      Some(proven) => Ok(proven),
+      None => self.proof(head).await,
+    }
+  }
+
+  /// Like [`Self::answer`], reusing `pre_proven` when a router already proved the request's
+  /// credentials before inspecting the repository catalog.
+  async fn answer_with(
+    &mut self,
+    head: &Head<'_>,
+    secure: bool,
+    pre_proven: Option<Proven>,
+  ) -> Decided<SiteExchange<S::Exchange, L>> {
     match lfs_serve::route(head, &mut Admission::new(self.room)) {
-      Ok(routed) => return self.answer_lfs(head, secure, routed).await,
+      Ok(routed) => return self.answer_lfs(head, secure, routed, pre_proven).await,
       // Not an LFS path: git's own routes decide it.
       Err(RouteRefused::NotFound) => {}
       Err(refused) => return lfs_route_refused(refused, head.version),
@@ -687,14 +710,23 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
       Ok(route) => route,
       Err(refused) => {
         let (status, fields) = http::refusal_parts(refused, head.version);
-        return refused_with(status, owned(&fields), false);
+        return refused_with(status, owned(&fields), pre_proven.is_some());
       }
     };
-    let proven = match self.proof(head).await {
+    let proven = match self.resolve_proof(head, pre_proven).await {
       Ok(proven) => proven,
       Err(refused) => return self.refuse(refused, false),
     };
-    let asked = Asked::of(route);
+    self.answer_git_proven(Asked::of(route), &proven.principal)
+  }
+
+  /// Resolves the repository and policy for a routed Git smart HTTP request with `principal`
+  /// already proved.
+  fn answer_git_proven(
+    &mut self,
+    asked: Asked,
+    principal: &Principal,
+  ) -> Decided<SiteExchange<S::Exchange, L>> {
     if let Located::Elsewhere(shard) = self.repositories.locate(&asked.repository) {
       return Decided {
         answer: Answer::Move { shard },
@@ -708,8 +740,8 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
     else {
       return self.refuse(Refused::NoRepository, true);
     };
-    match vcs_policy::reaches(&repository, &proven.principal, rights(asked.service)) {
-      Ok(true) => self.start(&asked, &repository, &proven.principal),
+    match vcs_policy::reaches(&repository, principal, rights(asked.service)) {
+      Ok(true) => self.start(&asked, &repository, principal),
       Ok(false) => self.refuse(Refused::Forbidden, true),
       // A policy its tool cannot read is a damaged record (A-622's guard keeps such rules out): never judged without it.
       Err(_) => self.refuse(Refused::Unreadable, true),
@@ -725,11 +757,12 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
     head: &Head<'_>,
     secure: bool,
     routed: Routed,
+    pre_proven: Option<Proven>,
   ) -> Decided<SiteExchange<S::Exchange, L>> {
     let Some(authority) = authority(head) else {
-      return refused_with(Status::BAD_REQUEST, cache_fields(), false);
+      return refused_with(Status::BAD_REQUEST, cache_fields(), pre_proven.is_some());
     };
-    let proven = match self.proof(head).await {
+    let proven = match self.resolve_proof(head, pre_proven).await {
       Ok(proven) => proven,
       Err(refused) => return lfs_challenged(self.refuse(refused, false)),
     };
@@ -895,6 +928,15 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> S
 
   async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange> {
     self.answer(head, secure).await
+  }
+
+  async fn decide_proven(
+    &mut self,
+    head: &Head<'_>,
+    secure: bool,
+    proven: &Proven,
+  ) -> Decided<Self::Exchange> {
+    self.answer_with(head, secure, Some(proven.clone())).await
   }
 }
 

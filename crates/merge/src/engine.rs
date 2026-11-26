@@ -2201,41 +2201,58 @@ fn push_versioned<T>(history: &mut Vec<(u64, T)>, version: u64, value: T) {
   }
 }
 
-/// Paths in `effects` that remove one node kind and create the opposite kind (directory <->
-/// non-directory) in the same version: their old mode and attributes must be dropped before the
-/// replacement node's metadata effects apply.
+/// The node kind removed or created by an [`Effect`], used to detect any same-increment kind
+/// replacement whose old mode and attributes must be dropped before new metadata applies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EffectKind {
+  Content,
+  Directory,
+  Symlink,
+  Hardlink,
+  Special,
+}
+
+/// The path and kind removed by `effect`, if it removes a node.
+fn removed_kind(effect: &Effect) -> Option<(&str, EffectKind)> {
+  match effect {
+    Effect::RemoveContent(path) => Some((path.as_str(), EffectKind::Content)),
+    Effect::RemoveDir(path) => Some((path.as_str(), EffectKind::Directory)),
+    Effect::RemoveSymlink(path) => Some((path.as_str(), EffectKind::Symlink)),
+    Effect::RemoveHardlink(path) => Some((path.as_str(), EffectKind::Hardlink)),
+    Effect::RemoveSpecial(path) => Some((path.as_str(), EffectKind::Special)),
+    _ => None,
+  }
+}
+
+/// The path and kind created by `effect`, if it creates a node.
+fn created_kind(effect: &Effect) -> Option<(&str, EffectKind)> {
+  match effect {
+    Effect::SetContent(path, ..) => Some((path.as_str(), EffectKind::Content)),
+    Effect::MakeDir(path) => Some((path.as_str(), EffectKind::Directory)),
+    Effect::Symlink(path, _) => Some((path.as_str(), EffectKind::Symlink)),
+    Effect::Hardlink(path, _) => Some((path.as_str(), EffectKind::Hardlink)),
+    Effect::Special(path, _) => Some((path.as_str(), EffectKind::Special)),
+    _ => None,
+  }
+}
+
+/// Paths in `effects` that remove one node kind and create a different node kind in the same
+/// version (e.g. dir <-> file, symlink/hardlink/special <-> file/dir): their old mode and
+/// attributes must be dropped before the replacement node's metadata effects apply.
 fn kind_replaced_paths(effects: &[Effect]) -> BTreeSet<String> {
-  let mut removed_dirs: BTreeSet<&str> = BTreeSet::new();
-  let mut removed_non_dirs: BTreeSet<&str> = BTreeSet::new();
+  let mut removed: BTreeMap<&str, EffectKind> = BTreeMap::new();
   for effect in effects {
-    match effect {
-      Effect::RemoveDir(path) => {
-        removed_dirs.insert(path.as_str());
-      }
-      Effect::RemoveContent(path)
-      | Effect::RemoveSymlink(path)
-      | Effect::RemoveHardlink(path)
-      | Effect::RemoveSpecial(path) => {
-        removed_non_dirs.insert(path.as_str());
-      }
-      _ => {}
+    if let Some((path, kind)) = removed_kind(effect) {
+      removed.insert(path, kind);
     }
   }
   let mut replaced = BTreeSet::new();
   for effect in effects {
-    match effect {
-      Effect::SetContent(path, ..)
-      | Effect::Symlink(path, _)
-      | Effect::Hardlink(path, _)
-      | Effect::Special(path, _)
-        if removed_dirs.contains(path.as_str()) =>
-      {
-        replaced.insert(path.clone());
-      }
-      Effect::MakeDir(path) if removed_non_dirs.contains(path.as_str()) => {
-        replaced.insert(path.clone());
-      }
-      _ => {}
+    if let Some((path, new_kind)) = created_kind(effect)
+      && let Some(&old_kind) = removed.get(path)
+      && old_kind != new_kind
+    {
+      replaced.insert(path.to_owned());
     }
   }
   replaced
@@ -10393,6 +10410,45 @@ mod kind_replace_tests {
       self
     }
 
+    fn symlink(mut self, path: &str, target: &str) -> Self {
+      let path = self.doc.paths.intern(path);
+      let target = self.doc.paths.intern(target);
+      self.doc.ops.push(Op {
+        kind: OpKind::Symlink,
+        flags: 0,
+        path,
+        at: 0,
+        len: 0,
+        src: target,
+      });
+      self
+    }
+
+    fn fifo(mut self, path: &str) -> Self {
+      let path = self.doc.paths.intern(path);
+      let encoded = SpecialNode {
+        kind: crate::special::SpecialKind::Fifo,
+        uid: 0,
+        gid: 0,
+        atime: 0,
+        mtime: 0,
+        ctime: 0,
+        btime: 0,
+      }
+      .encode();
+      let src = self.post.len() as u64;
+      self.post.extend_from_slice(&encoded);
+      self.doc.ops.push(Op {
+        kind: OpKind::Mknod,
+        flags: 0,
+        path,
+        at: 0,
+        len: encoded.len() as u64,
+        src,
+      });
+      self
+    }
+
     fn at(self, id: u8, base: u64) -> Increment {
       Increment {
         id: [id; 32],
@@ -10715,5 +10771,112 @@ mod kind_replace_tests {
       MergeConflictClass::TypeChanged,
       "Mkdir over file without unlink must trigger TypeChanged",
     );
+  }
+
+  fn assert_non_dir_initial_state(green: &Green) {
+    assert!(green.special("fifo").is_some());
+    assert_eq!(green.mode("fifo"), Some(0o640));
+    assert_eq!(green.xattr("fifo", "user.old"), Some(b"special".as_slice()));
+    assert_eq!(
+      green.symlinks.get("link").map(String::as_str),
+      Some("target.txt")
+    );
+  }
+
+  fn assert_fifo_replaced_with_regular_file(green: &Green) {
+    assert!(green.special("fifo").is_none());
+    assert_eq!(
+      green.content_bytes("fifo"),
+      Some(b"now-regular\n".as_slice())
+    );
+    assert_eq!(green.mode("fifo"), None, "old special mode must drop");
+    assert_eq!(
+      green.xattr("fifo", "user.old"),
+      None,
+      "old special xattr must drop"
+    );
+    assert_eq!(green.xattr("fifo", "user.file"), Some(b"fresh".as_slice()));
+  }
+
+  fn assert_symlink_replaced_with_regular_file(green: &Green) {
+    assert_eq!(green.symlinks.get("link"), None);
+    assert_eq!(
+      green.content_bytes("link"),
+      Some(b"from-symlink\n".as_slice())
+    );
+    assert_eq!(
+      green.xattr("link", "user.file"),
+      Some(b"link-now-file".as_slice())
+    );
+  }
+
+  fn assert_cross_kind_effect_classification() {
+    // Cross-kind symlink/hardlink/special -> file are flagged; same-kind file -> file is not.
+    let effects = [
+      Effect::RemoveSymlink("sym".to_owned()),
+      Effect::SetContent(
+        "sym".to_owned(),
+        None,
+        Vec::new(),
+        ContentSource::Created(Vec::new()),
+      ),
+      Effect::RemoveHardlink("hl".to_owned()),
+      Effect::SetContent(
+        "hl".to_owned(),
+        None,
+        Vec::new(),
+        ContentSource::Created(Vec::new()),
+      ),
+      Effect::RemoveContent("same".to_owned()),
+      Effect::SetContent(
+        "same".to_owned(),
+        None,
+        Vec::new(),
+        ContentSource::Created(Vec::new()),
+      ),
+    ];
+    let replaced = kind_replaced_paths(&effects);
+    assert!(replaced.contains("sym"));
+    assert!(replaced.contains("hl"));
+    assert!(!replaced.contains("same"));
+  }
+
+  /// Do replace non-directory nodes of different kinds (a FIFO special node carrying mode + xattr,
+  /// and a symlink) with regular files in one increment, and replay on a second `Green`. Expect:
+  /// v2 accepts both replacements, the special node's old mode and xattr are dropped while new
+  /// file bytes and xattrs stand, the symlink becomes a regular file, `kind_replaced_paths` flags
+  /// all cross-kind transitions (including symlink/hardlink/special <-> file) while preserving
+  /// same-kind file replacement, and replay reaches the identical head identity.
+  #[test]
+  fn non_dir_kind_replacement_to_regular_file_drops_stale_metadata_and_replays() {
+    let v1 = Ops::default()
+      .fifo("fifo")
+      .mode("fifo", 0o640)
+      .xattr("fifo", "user.old", b"special")
+      .symlink("link", "target.txt")
+      .at(1, 0);
+    let mut green = Green::new();
+    let mut replayed = Green::new();
+    assert_eq!(green.submit(&v1), Outcome::Accepted { version: 1 });
+    assert_eq!(replayed.submit(&v1), Outcome::Accepted { version: 1 });
+    assert_non_dir_initial_state(&green);
+
+    let v2 = Ops::default()
+      .unlink("fifo")
+      .create("fifo", b"now-regular\n")
+      .xattr("fifo", "user.file", b"fresh")
+      .unlink("link")
+      .create("link", b"from-symlink\n")
+      .xattr("link", "user.file", b"link-now-file")
+      .at(2, 1);
+    let (outcome, applied) = green.submit_resolved(&v2);
+    assert_eq!(outcome, Outcome::Accepted { version: 2 });
+    let applied = applied.expect("accepted non-dir kind replace");
+    assert_fifo_replaced_with_regular_file(&green);
+    assert_symlink_replaced_with_regular_file(&green);
+    assert_cross_kind_effect_classification();
+
+    replay_chain_entry(&mut replayed, &v2, &applied, 2);
+    assert_eq!(replayed.head_identity(), green.head_identity());
   }
 }

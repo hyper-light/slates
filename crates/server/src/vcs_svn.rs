@@ -45,14 +45,16 @@
 //!
 //! **Opened.** On the owner, no Subversion repository of the name is "No repository found in '…'" (210005). Its records
 //! are read as the shared Subversion lender lends them there (`crate::vcs_store::svn_view::lend_in`, A-681): a
-//! repository whose records the shard does not hold closes the connection, counted. Otherwise the repository is opened
+//! repository whose records the shard does not hold answers a typed `SVN_ERR_FS_CORRUPT` (`E160004`) refusal naming the
+//! unrecovered/corrupt repository before closing, counted. Otherwise the repository is opened
 //! with its UUID (also its realm, `svnserve`'s default), its root URL as `find_repos` derives it, and CRAM-MD5 alone: a
 //! client that has not authenticated is no principal (§4.13), so no repository reads anonymously. The client names an
 //! enrolled token by its id in hex and answers the challenge with the token as its password; the key is the one the
 //! token's record keeps (A-692, `crate::credentials::cram_md5_key`), the session's principal the token's, and a user no
 //! live token's record keys is answered as `svnserve` answers a user it has no password for. From there each call is
 //! handed the repository's sources, lent afresh on the owner, with the principal's access: write where the repository's
-//! policy lets it reach the repository at all, nothing where not (`vcs_policy::reaches`). A commit's drive runs over
+//! policy grants any write right (`Submit`/`Rewrite`/`Delete`), read where it grants only `Read`, and nothing otherwise
+//! (`vcs_policy::reaches`). A commit's drive runs over
 //! those sources; a hook it waits for passes where the repository configures none at its point and is refused where one
 //! is (none runs yet); its accepted work lands through the owner's commit step (A-698's
 //! `repository::svn_commit::land_work`, which the `svn+ssh://` tunnel calls too), and `close-edit` is answered with
@@ -71,7 +73,9 @@ use slates_rt::{RtError, Runtime, ShardId, TaskId, futures};
 use slates_svn::commit::drive::{Due, Work};
 use slates_svn::dump::Uuid;
 use slates_svn::find::{Found, find_repository};
-use slates_svn::handshake::{Access, CramAccount, CramVerdict, Unserved};
+use slates_svn::handshake::{
+  Access, CramAccount, CramVerdict, SVN_ERR_FS_CORRUPT, Unserved, store_unrecovered_message,
+};
 use slates_svn::index::{ContentIdentity, Revision};
 use slates_svn::report::exchange::{Budget, Quantum};
 use slates_svn::serve::{CommitStart, Connection, Limits, Made, Policy, Sources, Turn};
@@ -110,13 +114,9 @@ const UNSERVED: &str = "vcs_svn.unserved";
 const NO_ACCESS: &str = "vcs_svn.no_access";
 /// Counter: a lookup a shard did not answer within the liveness budget: the connection closed, its repository unknown.
 const LOOKUP_UNANSWERED: &str = "vcs_svn.lookup_unanswered";
-/// Counter: a Subversion repository whose store its owner shard does not hold: the connection closed.
+/// Counter: a Subversion repository whose store its owner shard does not hold: emits a typed
+/// `E160004` (`SVN_ERR_FS_CORRUPT`) refusal before closing.
 const STORE_MISSING: &str = "vcs_svn.store_missing";
-/// `SVN_ERR_FS_CORRUPT`: typed refusal code when a repository's backing store is unrecovered or
-/// corrupt.
-/// Format: the filesystem category's start, 120,000 + 8 × 5,000 = 160,000, plus 4
-/// (`svn_error_codes.h`, `SVN_ERR_FS_CORRUPT = 160004`).
-const SVN_ERR_FS_CORRUPT: u32 = 160_004;
 /// Counter: a shard that could not keep its listener state, so a connection that moves there is lost.
 const NOT_KEPT: &str = "vcs_svn.not_kept";
 /// Counter: a move its target shard's control channel refused: the descriptor dropped with the spawn, so the
@@ -144,10 +144,9 @@ const READ_BYTES: usize = SVN_READ_PAGES * SVN_PAGE_BYTES;
 /// Format: the fewest bytes a path spends on one of its names: a name of one byte and its `/`.
 const NAME_BYTES: usize = 2;
 
-/// The rights some name of a repository must grant an authenticated principal for its session to write: any of the four,
-/// each command then judged by the session, as the `svn+ssh://` tunnel opens one.
-const SESSION_RIGHTS: [crate::vcs_policy::Right; 4] = [
-  crate::vcs_policy::Right::Read,
+/// The write rights some name of a repository must grant an authenticated principal for its
+/// `svn://` session to receive `Access::Write` (`auth-access = write`).
+const WRITE_RIGHTS: [crate::vcs_policy::Right; 3] = [
   crate::vcs_policy::Right::Submit,
   crate::vcs_policy::Right::Rewrite,
   crate::vcs_policy::Right::Delete,
@@ -1125,14 +1124,22 @@ fn answer(conversation: &mut Conversation, out: &mut Vec<u8>) -> Next {
     *held = crate::state::with_state(|state| hold_in(state, opened.id)).flatten();
   }
   lent.unwrap_or_else(|| {
-    crate::fleet::count_refusal(STORE_MISSING);
-    let message = format!(
-      "Repository '{}' store is unrecovered or corrupt",
-      opened.name
-    );
-    let _ = connection.fail_command(SVN_ERR_FS_CORRUPT, &message, out);
+    fail_store_missing(connection, &opened.name, out);
     Next::End
   })
+}
+
+/// Counts an unrecovered/missing backing store and encodes a typed `SVN_ERR_FS_CORRUPT` (`E160004`)
+/// command failure into `out`, counting any frame-encoding error rather than swallowing it.
+fn fail_store_missing(connection: &mut Connection, name: &str, out: &mut Vec<u8>) {
+  crate::fleet::count_refusal(STORE_MISSING);
+  let message = store_unrecovered_message(name);
+  if connection
+    .fail_command(SVN_ERR_FS_CORRUPT, &message, out)
+    .is_err()
+  {
+    crate::fleet::count_refusal(NOT_REFUSED);
+  }
 }
 
 /// Runs `step` over the sources of the repository `opened` names, lent afresh on its owner ([`lend_in`]) with
@@ -1178,30 +1185,38 @@ fn held_sources<T>(
   .flatten()
 }
 
-/// What an authenticated `principal` may do in repository `name` (`svnserve`'s `auth-access`): write where the
-/// repository's policy lets it reach the repository at all (A-597's `vcs_policy::reaches`; each command then judged by
-/// the session and, for a commit, by the owner's step), nothing where it does not.
+/// Evaluates `principal`'s `svn://` session access on `record` (`svnserve`'s `auth-access`):
+/// `Write` when the repository's policy grants any write right (`Submit`/`Rewrite`/`Delete`),
+/// `Read` when it grants only `Read`, and `None` otherwise.
+fn access_for_record(
+  record: &slates_db::catalog::RepositoryRecord,
+  principal: &Principal,
+) -> slates_svn::authz::Access {
+  if matches!(
+    crate::vcs_policy::reaches(record, principal, &WRITE_RIGHTS),
+    Ok(true)
+  ) {
+    slates_svn::authz::Access::Write
+  } else if matches!(
+    crate::vcs_policy::reaches(record, principal, &[crate::vcs_policy::Right::Read]),
+    Ok(true)
+  ) {
+    slates_svn::authz::Access::Read
+  } else {
+    slates_svn::authz::Access::None
+  }
+}
+
+/// What an authenticated `principal` may do in repository `name` (`svnserve`'s `auth-access`).
 fn authenticated_access(
   state: &crate::state::ShardState,
   name: &str,
   principal: &Principal,
 ) -> slates_svn::authz::Access {
-  let reaches = state
-    .db
-    .partition()
-    .repositories()
-    .repository_named(name)
-    .is_some_and(|record| {
-      matches!(
-        crate::vcs_policy::reaches(record, principal, &SESSION_RIGHTS),
-        Ok(true)
-      )
-    });
-  if reaches {
-    slates_svn::authz::Access::Write
-  } else {
-    slates_svn::authz::Access::None
-  }
+  let Some(record) = state.db.partition().repositories().repository_named(name) else {
+    return slates_svn::authz::Access::None;
+  };
+  access_for_record(record, principal)
 }
 
 /// What one of the connection's turns leads to (the module doc).
@@ -1241,12 +1256,13 @@ fn next_of(
   }
 }
 
-/// Writes `out` to `stream` after a step that `went` on or not: whether the conversation goes on.
+/// Flushes any bytes encoded in `out` to `stream` (including terminal refusal frames when `!went`),
+/// then continues only if `went` and the write succeeded.
 async fn written(stream: &TcpStream, went: bool, out: &[u8]) -> Stepped {
-  if !went || (!out.is_empty() && stream.write_all(out).await.is_err()) {
+  if !out.is_empty() && stream.write_all(out).await.is_err() {
     return Stepped::End;
   }
-  Stepped::Go
+  if went { Stepped::Go } else { Stepped::End }
 }
 
 /// Begins the commit the client asked for over the repository's sources, its transaction named as the `svn+ssh://`
@@ -1274,7 +1290,97 @@ fn begin_commit(conversation: &mut Conversation, out: &mut Vec<u8>) -> bool {
     };
     connection.commit(start, sources, out)
   });
-  matches!(begun, Some(Ok(())))
+  match begun {
+    Some(Ok(())) => true,
+    Some(Err(_)) => false,
+    None => {
+      fail_store_missing(connection, &opened.name, out);
+      false
+    }
+  }
+}
+
+/// Outcome of reading a lock verb over lent sources.
+enum LockCallStep {
+  /// The verb needs pre-lock/pre-unlock hooks and judging.
+  Call(Box<slates_svn::serve::LockHookCall>),
+  /// The verb already completed without hooks (e.g. refused at auth/args).
+  Done,
+  /// Fatal protocol or missing-store failure; end after flushing `out`.
+  End,
+}
+
+/// Reads the pending lock verb over lent sources, emitting typed `E160004` if the store vanished.
+fn lend_lock_call(conversation: &mut Conversation, out: &mut Vec<u8>) -> LockCallStep {
+  let Conversation {
+    connection,
+    opened,
+    principal,
+    ..
+  } = conversation;
+  let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
+    return LockCallStep::End;
+  };
+  match lent_sources(opened, principal, |sources| {
+    connection.lock_verb(sources, out)
+  }) {
+    Some(Ok(Some(call))) => LockCallStep::Call(Box::new(call)),
+    Some(Ok(None)) => LockCallStep::Done,
+    Some(Err(_)) => LockCallStep::End,
+    None => {
+      fail_store_missing(connection, &opened.name, out);
+      LockCallStep::End
+    }
+  }
+}
+
+/// Judges the lock verb with `verdicts` over lent sources, emitting typed `E160004` if the store
+/// vanished mid-command.
+fn lend_lock_judged(
+  conversation: &mut Conversation,
+  verdicts: Vec<slates_svn::serve::PreHooked>,
+  draw: &mut impl FnMut() -> [u8; slates_svn::lock::UUID_BYTES],
+  room: usize,
+  out: &mut Vec<u8>,
+) -> Option<Vec<slates_svn::lock::LockEntry>> {
+  let Conversation {
+    connection,
+    opened,
+    principal,
+    ..
+  } = conversation;
+  let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
+    return None;
+  };
+  match lent_sources(opened, principal, |sources| {
+    connection.lock_judged(sources, verdicts, draw, room)
+  }) {
+    Some(Ok(entries)) => Some(entries),
+    Some(Err(_)) => None,
+    None => {
+      fail_store_missing(connection, &opened.name, out);
+      None
+    }
+  }
+}
+
+/// Runs an optional post-lock/post-unlock hook and finishes the lock command.
+async fn finish_post_lock(
+  stream: &TcpStream,
+  conversation: &mut Conversation,
+  hooked: &Hooked,
+  post: Option<slates_svn::serve::LockHookCall>,
+  out: &mut Vec<u8>,
+) -> bool {
+  let room = conversation.limits.item_bytes;
+  let ended = match post {
+    Some(call) => match post_lock_hook(HookSite::Listener(stream), hooked, room, &call).await {
+      Some(verdict) => verdict,
+      None => return false,
+    },
+    None => Ok(()),
+  };
+  conversation.connection.locks_finished(ended, out).is_ok()
 }
 
 /// Judges the lock verb the client asked for over the repository's sources on its owner, lands the lock entries it
@@ -1287,27 +1393,17 @@ fn begin_commit(conversation: &mut Conversation, out: &mut Vec<u8>) -> bool {
 /// one item has bytes.
 async fn lock(stream: &TcpStream, conversation: &mut Conversation, out: &mut Vec<u8>) -> bool {
   let room = conversation.limits.item_bytes;
-  let Some(hooked) = conversation.opened.as_ref().map(Opened::hooked) else {
+  let Some((id, hooked)) = conversation
+    .opened
+    .as_ref()
+    .map(|opened| (opened.id, opened.hooked()))
+  else {
     return false;
   };
-  let called = {
-    let Conversation {
-      connection,
-      opened,
-      principal,
-      ..
-    } = &mut *conversation;
-    let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
-      return false;
-    };
-    lent_sources(opened, principal, |sources| {
-      connection.lock_verb(sources, out)
-    })
-  };
-  let call = match called {
-    Some(Ok(Some(call))) => call,
-    Some(Ok(None)) => return true,
-    Some(Err(_)) | None => return false,
+  let call = match lend_lock_call(conversation, out) {
+    LockCallStep::Call(call) => call,
+    LockCallStep::Done => return true,
+    LockCallStep::End => return false,
   };
   let Some(verdicts) = pre_lock_hooks(HookSite::Listener(stream), &hooked, room, &call).await
   else {
@@ -1315,9 +1411,6 @@ async fn lock(stream: &TcpStream, conversation: &mut Conversation, out: &mut Vec
   };
   // The repository's landing turn, held from the judgment to the entries' landing, so no other landing moves the lock
   // table between them (C2, `svn_commit::landing`).
-  let Some(id) = conversation.opened.as_ref().map(|opened| opened.id) else {
-    return false;
-  };
   let Some(turn) = svn_commit::landing::turn(id).await else {
     return false;
   };
@@ -1329,42 +1422,19 @@ async fn lock(stream: &TcpStream, conversation: &mut Conversation, out: &mut Vec
     }
     token
   };
-  let judged = {
-    let Conversation {
-      connection,
-      opened,
-      principal,
-      ..
-    } = &mut *conversation;
-    let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
-      return false;
-    };
-    lent_sources(opened, principal, |sources| {
-      connection.lock_judged(sources, verdicts, &mut draw, room)
-    })
-  };
-  let entries = match judged {
-    Some(Ok(entries)) => entries,
-    Some(Err(_)) | None => return false,
+  let Some(entries) = lend_lock_judged(conversation, verdicts, &mut draw, room, out) else {
+    return false;
   };
   let landed = land_locks(conversation, (turn, entries), undrawn.get()).await;
-  let post = match conversation.connection.locks_landed(landed, out) {
-    Ok(post) => post,
-    Err(_) => return false,
+  let Ok(post) = conversation.connection.locks_landed(landed, out) else {
+    return false;
   };
   // The paths answered go out before the post-hook runs, as `svnserve`'s callbacks write them (`lock_many_cb`).
   if !out.is_empty() && stream.write_all(out).await.is_err() {
     return false;
   }
   out.clear();
-  let ended = match post {
-    Some(call) => match post_lock_hook(HookSite::Listener(stream), &hooked, room, &call).await {
-      Some(verdict) => verdict,
-      None => return false,
-    },
-    None => Ok(()),
-  };
-  conversation.connection.locks_finished(ended, out).is_ok()
+  finish_post_lock(stream, conversation, &hooked, post, out).await
 }
 
 /// Lands a lock verb's `entries` through the owner's step (a `Record::Locks`): `Ok` for none, or the step's refusal;
@@ -1414,6 +1484,45 @@ async fn land_record(
     .map_err(|refused| refused.failure())
 }
 
+/// Outcome of judging a revision-property change over lent sources.
+enum RevPropStep {
+  /// Ready to land `record` through the owner's commit step.
+  Land(Box<slates_svn::commit::record::Record>),
+  /// Already completed without landing (e.g. refused or no-op).
+  Done,
+  /// Fatal protocol or missing-store failure; end after flushing `out`.
+  End,
+}
+
+/// Judges a revision-property change over lent sources, emitting typed `E160004` if the store
+/// vanished mid-command.
+fn lend_revision_property_hooked(
+  conversation: &mut Conversation,
+  verdict: Result<(), Vec<(u32, String)>>,
+  out: &mut Vec<u8>,
+) -> RevPropStep {
+  let Conversation {
+    connection,
+    opened,
+    principal,
+    ..
+  } = conversation;
+  let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
+    return RevPropStep::End;
+  };
+  match lent_sources(opened, principal, |sources| {
+    connection.revision_property_hooked(sources, verdict, out)
+  }) {
+    Some(Ok(Some(record))) => RevPropStep::Land(Box::new(record)),
+    Some(Ok(None)) => RevPropStep::Done,
+    Some(Err(_)) => RevPropStep::End,
+    None => {
+      fail_store_missing(connection, &opened.name, out);
+      RevPropStep::End
+    }
+  }
+}
+
 /// Runs the client's revision property change past its checks (A-702 part 2; `fs-wrap.c`
 /// `svn_repos_fs_change_rev_prop4`), `call` its pre-hook's: pre-revprop-change, whose refusal (165006 where none is
 /// configured) is the answer; then the change judged over the repository's sources and its record landed through the
@@ -1427,7 +1536,11 @@ async fn revision_property(
   out: &mut Vec<u8>,
 ) -> bool {
   let room = conversation.limits.item_bytes;
-  let Some(hooked) = conversation.opened.as_ref().map(Opened::hooked) else {
+  let Some((id, hooked)) = conversation
+    .opened
+    .as_ref()
+    .map(|opened| (opened.id, opened.hooked()))
+  else {
     return false;
   };
   let site = HookSite::Listener(stream);
@@ -1437,31 +1550,22 @@ async fn revision_property(
     return false;
   };
   // The landing turn, held from the judgment to the record's landing (C2): no other change lands in between.
-  let Some(id) = conversation.opened.as_ref().map(|opened| opened.id) else {
-    return false;
-  };
   let Some(turn) = svn_commit::landing::turn(id).await else {
     return false;
   };
-  let Conversation {
-    connection,
-    opened,
-    principal,
-    ..
-  } = &mut *conversation;
-  let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
+  let record = match lend_revision_property_hooked(conversation, verdict, out) {
+    RevPropStep::Land(record) => *record,
+    RevPropStep::Done => return true,
+    RevPropStep::End => return false,
+  };
+  let Some(principal) = conversation.principal.as_ref() else {
     return false;
   };
-  let judged = lent_sources(opened, principal, |sources| {
-    connection.revision_property_hooked(sources, verdict, out)
-  });
-  let record = match judged {
-    Some(Ok(Some(record))) => record,
-    Some(Ok(None)) => return true,
-    Some(Err(_)) | None => return false,
-  };
-  let landed = land_record(turn, (principal, opened.id), record).await;
-  let post = match connection.revision_property_landed(landed, out) {
+  let landed = land_record(turn, (principal, id), record).await;
+  let post = match conversation
+    .connection
+    .revision_property_landed(landed, out)
+  {
     Ok(Some(post)) => post,
     Ok(None) => return true,
     Err(_) => return false,
@@ -1672,7 +1776,11 @@ async fn answer_hook(
   match answered {
     Some(Ok(Turn::Accepted { work, .. })) => land(stream, conversation, *work, out).await,
     Some(Ok(_)) => true,
-    Some(Err(_)) | None => false,
+    Some(Err(_)) => false,
+    None => {
+      fail_store_missing(connection, &opened.name, out);
+      false
+    }
   }
 }
 
@@ -2659,8 +2767,8 @@ mod redteam_tests {
 
   /// SVN-2: Do authenticate over `svn://` with an enrolled owner token (wire username = token id
   /// hex), commit a file, and acquire a lock on it. Expect: `svn:author` on revision 1 AND the
-  /// lock's owner equal `crate::lfs::owner_name(&owner)` (`"0:1234"`, identical to HTTP & SSH),
-  /// NEVER the CRAM-MD5 wire token id hex.
+  /// lock's owner equal `crate::lfs::owner_name(&owner)` (`hex(principal.key())`, identical to
+  /// HTTP & SSH), NEVER the CRAM-MD5 wire token id hex.
   #[test]
   fn svn2_cram_session_records_canonical_principal_for_commit_author_and_lock_owner() {
     let daemon = start_daemon();
@@ -2781,6 +2889,252 @@ mod redteam_tests {
     assert!(
       combined.contains("( failure ( ( 160004 ") && combined.contains("unrecovered"),
       "unrecovered SVN store must emit typed E160004 frame instead of silent TCP drop: {combined:?}"
+    );
+  }
+
+  /// Opens `url`, authenticates over CRAM-MD5 as `(user, token)`, and returns the live stream.
+  fn establish_cram(port: u16, url: &str, user: &str, token: &[u8]) -> ClientStream {
+    let (mut stream, _) = connect_and_open(port, url);
+    stream.write_all(b"( CRAM-MD5 ( ) ) ").unwrap();
+    let step = read_items(&mut stream, 1);
+    let challenge = challenge_of(&step);
+    stream
+      .write_all(&cram_response(user, token, &challenge))
+      .unwrap();
+    let established = read_items(&mut stream, 2);
+    assert!(established.contains(url), "{established}");
+    stream
+  }
+
+  /// Do grant a non-owner principal `Right::Read` alone on a Subversion repository, authenticate
+  /// over `svn://`, and issue `get-latest-rev`, `commit`, and `lock-many`. Expect: `get-latest-rev`
+  /// succeeds (`Access::Read`), while `commit` and `lock-many` are refused `E170001`
+  /// (`SVN_ERR_RA_NOT_AUTHORIZED`) rather than promoted to `Access::Write`.
+  #[test]
+  fn read_only_principal_gets_read_access_and_is_refused_writes() {
+    use slates_ipc::protocol::{
+      PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyRule, PolicyWho,
+    };
+
+    let daemon = start_daemon();
+    let port = daemon.vcs_svn_port().expect("listener port");
+    let reader_user = enroll_token(&daemon, STRANGER, STRANGER_TOKEN);
+    let name = name_on("svn-readonly-", OTHER);
+    let asked = (
+      name.as_str(),
+      VcsTool::Subversion,
+      ObjectFormat::Sha1,
+      "trunk",
+    );
+    crate::test_store::create_on(&daemon, OTHER, &uid_principal(OWNER), asked);
+    let reply = crate::daemon::observe_at(&daemon, OTHER, {
+      let name = name.clone();
+      move |state| {
+        crate::verbs::dispatch(
+          state,
+          1,
+          &uid_principal(OWNER),
+          RequestBody::SetRepositoryPolicy {
+            repository: name,
+            read: 0,
+            rules: vec![PolicyRule {
+              names: PolicyNames::Paths,
+              pattern: "/".to_owned(),
+              right: PolicyRight::Read,
+              effect: PolicyEffect::Allow,
+              who: PolicyWho::AnyOf {
+                entries: vec![PolicyEntry::Is {
+                  principal: slates_ipc::protocol::Principal::Uid {
+                    host: 0,
+                    uid: STRANGER,
+                  },
+                }],
+              },
+            }],
+            hooks: Vec::new(),
+            hooks_env: Vec::new(),
+            signers: Vec::new(),
+            hg_publishing: true,
+          },
+        )
+      }
+    });
+    assert_eq!(reply, ReplyBody::Acknowledged);
+
+    let url = format!("svn://127.0.0.1:{port}/{name}");
+    let mut stream = establish_cram(port, &url, &reader_user, STRANGER_TOKEN);
+
+    stream.write_all(b"( get-latest-rev ( ) ) ").unwrap();
+    assert_eq!(
+      read_items(&mut stream, 2),
+      "( success ( ( ) 0: ) ) ( success ( 0 ) ) "
+    );
+
+    stream
+      .write_all(b"( commit ( 4:test ( ) false ( ( 7:svn:log 4:test ) ) ) ) ")
+      .unwrap();
+    let commit_reply = read_items(&mut stream, 1);
+    assert!(
+      commit_reply.contains("( failure ( ( 170001 "),
+      "read-only principal commit must be refused E170001: {commit_reply}"
+    );
+
+    stream
+      .write_all(b"( lock-many ( ( 4:mine ) false ( ( 5:a.txt ( ) ) ) ) ) ")
+      .unwrap();
+    let lock_reply = read_items(&mut stream, 1);
+    assert!(
+      lock_reply.contains("( failure ( ( 170001 "),
+      "read-only principal lock-many must be refused E170001: {lock_reply}"
+    );
+  }
+
+  /// Do establish authenticated owner sessions over `svn://`, drop the repository's in-memory store
+  /// mid-session (`vcs_store::free`), and then issue `commit` on one session and `lock-many` on a
+  /// second session. Expect: both sessions flush a typed `E160004` (`SVN_ERR_FS_CORRUPT`) failure
+  /// frame naming the unrecovered/corrupt repository before closing, never dropping silently.
+  #[test]
+  fn mid_session_store_loss_emits_typed_e160004_on_commit_and_lock() {
+    let daemon = start_daemon();
+    let port = daemon.vcs_svn_port().expect("listener port");
+    let owner_user = enroll_token(&daemon, OWNER, OWNER_TOKEN);
+    let name = name_on("svn-midloss-", OTHER);
+    let asked = (
+      name.as_str(),
+      VcsTool::Subversion,
+      ObjectFormat::Sha1,
+      "trunk",
+    );
+    crate::test_store::create_on(&daemon, OTHER, &uid_principal(OWNER), asked);
+    let url = format!("svn://127.0.0.1:{port}/{name}");
+
+    let mut commit_stream = establish_cram(port, &url, &owner_user, OWNER_TOKEN);
+    let mut lock_stream = establish_cram(port, &url, &owner_user, OWNER_TOKEN);
+
+    crate::daemon::observe_at(&daemon, OTHER, {
+      let name = name.clone();
+      move |state| {
+        let id = state
+          .db
+          .partition()
+          .repositories()
+          .repository_named(&name)
+          .expect("repo exists")
+          .id;
+        crate::vcs_store::free(state, id);
+      }
+    });
+
+    commit_stream
+      .write_all(b"( commit ( 4:test ( ) false ( ( 7:svn:log 4:test ) ) ) ) ")
+      .unwrap();
+    let mut commit_bytes = Vec::new();
+    let _ = commit_stream.read_to_end(&mut commit_bytes);
+    let commit_wire = String::from_utf8_lossy(&commit_bytes);
+    assert!(
+      commit_wire.contains("( failure ( ( 160004 ") && commit_wire.contains("unrecovered"),
+      "mid-session commit after store loss must flush E160004: {commit_wire:?}"
+    );
+
+    lock_stream
+      .write_all(b"( lock-many ( ( 4:mine ) false ( ( 5:a.txt ( ) ) ) ) ) ")
+      .unwrap();
+    let mut lock_bytes = Vec::new();
+    let _ = lock_stream.read_to_end(&mut lock_bytes);
+    let lock_wire = String::from_utf8_lossy(&lock_bytes);
+    assert!(
+      lock_wire.contains("( failure ( ( 160004 ") && lock_wire.contains("unrecovered"),
+      "mid-session lock-many after store loss must flush E160004: {lock_wire:?}"
+    );
+  }
+
+  /// Pure in-memory unit test (no TCP/store required): verifies `access_for_record` distinguishes
+  /// `Write`, `Read`, and `None` per policy rights and `fail_store_missing` writes a typed
+  /// `E160004` (`SVN_ERR_FS_CORRUPT`) wire frame and ends the connection.
+  #[test]
+  fn access_for_record_and_fail_store_missing_behave_accurately() {
+    use slates_db::catalog::{
+      ObjectFormat as DbObjectFormat, PolicyEffect, PolicyEntry, PolicyNames, PolicyRight,
+      PolicyRule, PolicyWho, RepositoryId, RepositoryPolicy, RepositoryRecord,
+      VcsTool as DbVcsTool,
+    };
+
+    const WRITER: u32 = 5000;
+    let reader = uid_principal(STRANGER);
+    let writer = uid_principal(WRITER);
+    let outsider = uid_principal(9999);
+    let record = RepositoryRecord {
+      index_bits: 0,
+      id: RepositoryId { bytes: [3; 16] },
+      name: "demo".to_owned(),
+      tool: DbVcsTool::Subversion,
+      format: DbObjectFormat::Revisions,
+      default_branch: None,
+      owner: uid_principal(OWNER),
+      policy: RepositoryPolicy {
+        version: 1,
+        rules: vec![
+          PolicyRule {
+            names: PolicyNames::Paths,
+            pattern: "/".to_owned(),
+            right: PolicyRight::Read,
+            effect: PolicyEffect::Allow,
+            who: PolicyWho::AnyOf {
+              entries: vec![PolicyEntry::Is {
+                principal: reader.clone(),
+              }],
+            },
+          },
+          PolicyRule {
+            names: PolicyNames::Paths,
+            pattern: "/".to_owned(),
+            right: PolicyRight::Submit,
+            effect: PolicyEffect::Allow,
+            who: PolicyWho::AnyOf {
+              entries: vec![PolicyEntry::Is {
+                principal: writer.clone(),
+              }],
+            },
+          },
+        ],
+        hooks: Vec::new(),
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+        hg_publishing: true,
+      },
+    };
+    assert_eq!(
+      super::access_for_record(&record, &uid_principal(OWNER)),
+      slates_svn::authz::Access::Write
+    );
+    assert_eq!(
+      super::access_for_record(&record, &reader),
+      slates_svn::authz::Access::Read
+    );
+    assert_eq!(
+      super::access_for_record(&record, &writer),
+      slates_svn::authz::Access::Write
+    );
+    assert_eq!(
+      super::access_for_record(&record, &outsider),
+      slates_svn::authz::Access::None
+    );
+
+    let mut out = Vec::new();
+    let limits = slates_svn::serve::Limits {
+      item_bytes: 1 << 20,
+      report_room: 1 << 20,
+      most_open: 64,
+    };
+    let mut connection = slates_svn::serve::Connection::new(limits, &mut out).unwrap();
+    out.clear();
+    super::fail_store_missing(&mut connection, "demo", &mut out);
+    assert_eq!(connection.waiting(), slates_svn::serve::Waiting::Ended);
+    let wire = String::from_utf8_lossy(&out);
+    assert!(
+      wire.contains("( failure ( ( 160004 ")
+        && wire.contains("Repository 'demo' store is unrecovered or corrupt"),
+      "fail_store_missing must write canonical E160004 frame: {wire:?}"
     );
   }
 }

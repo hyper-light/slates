@@ -598,8 +598,15 @@ enum Interrupted {
     /// The caller's start.
     start: CommitStart,
   },
-  /// `update`: its item.
-  Update {
+  /// A report command (`update`, `status`, `switch`, `diff`): its kind and item.
+  Report {
+    /// Which report command was interrupted.
+    kind: RequestKind,
+    /// The item.
+    command: Vec<u8>,
+  },
+  /// A replay command (`replay`, `replay-range`): its item.
+  Replay {
     /// The item.
     command: Vec<u8>,
   },
@@ -1327,38 +1334,11 @@ impl Connection {
   {
     let (name, params) = command_of(value).ok_or(Refused::Malformed)?;
     let item = input.get(..consumed).ok_or(Refused::Malformed)?;
-    if READ_COMMANDS.contains(&name) {
-      self.ask_for_read(established, item.to_vec(), &sources.policy, out)?;
+    if let Some(interrupted) = read_interrupted(name, item) {
+      self.ask_or_deny_read(established, interrupted, &sources.policy, out)?;
       return Ok(Turn::Took { consumed });
     }
-    if replays::is_replay(name) {
-      ReportFailure::NotAuthorized
-        .write(out)
-        .map_err(Refused::Report)?;
-      self.phase = Phase::Commands(established);
-      return Ok(Turn::Took { consumed });
-    }
-    if let Some(kind) = RequestKind::of(name) {
-      if kind == RequestKind::Update
-        && let Some(server) = self.ask(&established, &sources.policy, authz::Access::Read, out)?
-      {
-        let interrupted = Interrupted::Update {
-          command: item.to_vec(),
-        };
-        self.phase = Phase::Authenticating(established, server, Box::new(interrupted));
-      } else {
-        ReportFailure::NotAuthorized
-          .write(out)
-          .map_err(Refused::Report)?;
-        self.phase = Phase::Commands(established);
-      }
-      return Ok(Turn::Took { consumed });
-    }
-    if name == COMMIT
-      || name == REPARENT
-      || locks::is_lock_verb(name)
-      || revprops::is_revision_property_change(name)
-    {
+    if is_write_or_session_command(name) {
       return self.dispatch_elsewhere(established, sources, (name, params, item), consumed, out);
     }
     ReportFailure::UnknownCommand {
@@ -1481,7 +1461,8 @@ impl Connection {
       && !readable
       && let Some(server) = self.ask(established, &sources.policy, authz::Access::Read, out)?
     {
-      let interrupted = Interrupted::Update {
+      let interrupted = Interrupted::Report {
+        kind,
         command: item.to_vec(),
       };
       return Ok(Answered::Authenticating(server, Box::new(interrupted)));
@@ -1529,9 +1510,20 @@ impl Connection {
     policy: &Policy<'_>,
     out: &mut Vec<u8>,
   ) -> Result<(), Refused> {
+    self.ask_or_deny_read(established, Interrupted::Read { command }, policy, out)
+  }
+
+  /// Challenges an anonymous session for `Access::Read` to resume `interrupted`, or refuses
+  /// `SVN_ERR_RA_NOT_AUTHORIZED` when authentication cannot grant read access.
+  fn ask_or_deny_read(
+    &mut self,
+    established: Box<Established>,
+    interrupted: Interrupted,
+    policy: &Policy<'_>,
+    out: &mut Vec<u8>,
+  ) -> Result<(), Refused> {
     match self.ask(&established, policy, authz::Access::Read, out)? {
       Some(server) => {
-        let interrupted = Interrupted::Read { command };
         self.phase = Phase::Authenticating(established, server, Box::new(interrupted));
       }
       None => {
@@ -1645,23 +1637,69 @@ impl Connection {
       Interrupted::Commit { command, start } => {
         self.begin_commit(established, command, start, true, &sources.policy, out)?;
       }
-      Interrupted::Update { command } => {
-        let request = {
-          let value = self.whole_item(&command)?;
-          let (_, params) = command_of(&value).ok_or(Refused::Malformed)?;
-          Request::read(RequestKind::Update, params).map_err(Refused::Report)?
-        };
-        let target = join_fspath(&established.base, &request.target);
-        let readable = established.current_access(&sources.policy) >= authz::Access::Read
-          && authz::may_read(established.compiled_read_rules(&sources.policy), &target);
-        let begun = self.begin_report(&established, sources.index, request, readable, true, out)?;
-        self.phase = match begun {
-          Some(exchange) => Phase::Reporting(established, exchange),
-          None => Phase::Commands(established),
-        };
+      Interrupted::Report { kind, command } => {
+        self.resume_report(established, kind, &command, sources, out)?;
+      }
+      Interrupted::Replay { command } => {
+        self.resume_replay(established, &command, sources, out)?;
       }
     }
     Ok(Turn::Wrote)
+  }
+
+  /// Resumes a report command (`update`, `status`, `switch`, `diff`) after authentication.
+  fn resume_report<R>(
+    &mut self,
+    mut established: Box<Established>,
+    kind: RequestKind,
+    command: &[u8],
+    sources: &Sources<'_, R>,
+    out: &mut Vec<u8>,
+  ) -> Result<(), Refused>
+  where
+    R: reads::Repository + ?Sized,
+  {
+    let request = {
+      let value = self.whole_item(command)?;
+      let (_, params) = command_of(&value).ok_or(Refused::Malformed)?;
+      Request::read(kind, params).map_err(Refused::Report)?
+    };
+    let target = join_fspath(&established.base, &request.target);
+    let readable = established.current_access(&sources.policy) >= authz::Access::Read
+      && authz::may_read(established.compiled_read_rules(&sources.policy), &target);
+    let begun = self.begin_report(&established, sources.index, request, readable, true, out)?;
+    self.phase = match begun {
+      Some(exchange) => Phase::Reporting(established, exchange),
+      None => Phase::Commands(established),
+    };
+    Ok(())
+  }
+
+  /// Resumes a `replay` or `replay-range` command after authentication without emitting a second
+  /// trivial authentication request.
+  fn resume_replay<R>(
+    &mut self,
+    established: Box<Established>,
+    command: &[u8],
+    sources: &Sources<'_, R>,
+    out: &mut Vec<u8>,
+  ) -> Result<(), Refused>
+  where
+    R: reads::Repository + ?Sized,
+  {
+    if established.current_access(&sources.policy) < authz::Access::Read {
+      ReportFailure::NotAuthorized
+        .write(out)
+        .map_err(Refused::Report)?;
+      self.phase = Phase::Commands(established);
+      return Ok(());
+    }
+    let value = self.whole_item(command)?;
+    let (name, params) = command_of(&value).ok_or(Refused::Malformed)?;
+    let mut discard = Vec::new();
+    let replaying = self.begin_replay(name, params, &mut discard)?;
+    self.phase = Phase::Replaying(established, Box::new(replaying));
+    Ok(())
   }
 
   /// A commit begun through A-655's entry point, `authenticated_now` once the client has just
@@ -2020,6 +2058,31 @@ fn command_of<'v, 'a>(value: &'v Value<'a>) -> Option<(&'a str, &'v [Value<'a>])
   }
 }
 
+/// The [`Interrupted`] read/report/replay record for `name` when a session lacks read access.
+fn read_interrupted(name: &str, item: &[u8]) -> Option<Interrupted> {
+  if READ_COMMANDS.contains(&name) {
+    Some(Interrupted::Read {
+      command: item.to_vec(),
+    })
+  } else if replays::is_replay(name) {
+    Some(Interrupted::Replay {
+      command: item.to_vec(),
+    })
+  } else {
+    RequestKind::of(name).map(|kind| Interrupted::Report {
+      kind,
+      command: item.to_vec(),
+    })
+  }
+}
+
+/// Whether `name` is handled by write or session-control paths rather than read access.
+fn is_write_or_session_command(name: &str) -> bool {
+  matches!(name, COMMIT | REPARENT)
+    || locks::is_lock_verb(name)
+    || revprops::is_revision_property_change(name)
+}
+
 /// A repository's root URL as A-655 compares a copy source's with it, decoded as
 /// `svn_path_uri_decode` decodes it (`serve.c` 1551); `None` for one that names no UTF-8 path.
 fn decoded_url(root_url: &[u8]) -> Option<String> {
@@ -2124,7 +2187,9 @@ mod redteam_tests {
     let mut rest = command;
     loop {
       match connection.receive(Some(sources), rest, &mut out, BUDGET) {
-        Ok(Turn::Took { consumed }) => rest = &rest[consumed..],
+        Ok(Turn::Took { consumed } | Turn::Established { consumed, .. }) => {
+          rest = &rest[consumed..];
+        }
         Ok(Turn::Wrote) => {}
         Ok(Turn::NeedMore { .. }) => return String::from_utf8_lossy(&out).into_owned(),
         other => panic!(
@@ -2367,5 +2432,117 @@ mod redteam_tests {
     assert_cram_unauthorized_denies_with_e170001(&key);
     let mut authed = assert_cram_authorized_binds_canonical_principal(&key);
     assert_unrecovered_store_emits_typed_e160004(&mut authed);
+  }
+
+  /// Opens an anonymous session whose repository also offers `EXTERNAL` for `tunnel_user`.
+  fn anonymous_session_with_external(user: &[u8]) -> Connection {
+    let mut out = Vec::new();
+    let mut connection = Connection::new(LIMITS, &mut out).unwrap();
+    let Turn::Opened { .. } = connection
+      .receive(None::<&Sources<'_, Green>>, OPEN_ROOT, &mut out, BUDGET)
+      .unwrap()
+    else {
+      panic!("expected Opened");
+    };
+    let repository = Repository {
+      uuid: UUID,
+      root_url: ROOT_URL,
+      realm: UUID,
+      mergeinfo: true,
+      anonymous: true,
+      tunnel_user: Some(user),
+      cram_md5: false,
+    };
+    assert_eq!(connection.open(&repository, &mut out), Ok(Access::Asked));
+    let Turn::Established { .. } = connection
+      .receive(
+        None::<&Sources<'_, Green>>,
+        b"( ANONYMOUS ( 0: ) ) ",
+        &mut out,
+        BUDGET,
+      )
+      .unwrap()
+    else {
+      panic!("expected anonymous Established");
+    };
+    connection
+  }
+
+  /// Do send `status`, `switch`, `diff`, `replay`, and `replay-range` on an anonymous session
+  /// when `policy.anonymous == Access::None` and `policy.authenticated == Access::Read`, then
+  /// satisfy the challenge via `EXTERNAL`. Expect: each command emits an authentication challenge
+  /// naming `EXTERNAL` (rather than failing immediately) and resumes cleanly once authenticated.
+  #[test]
+  fn anonymous_report_and_replay_commands_challenge_and_resume_when_auth_grants_read() {
+    let (index, green) = repository();
+    let locks = LockTable::new();
+    let texts = crate::commit::drive::HeldTexts::new();
+    let sources = Sources {
+      index: &index,
+      repository: &green,
+      locks: &locks,
+      now: NOW,
+      policy: Policy {
+        anonymous: authz::Access::None,
+        authenticated: authz::Access::Read,
+        authz: None,
+        filesystem: "repo",
+      },
+      texts: &texts,
+    };
+
+    let cases: &[(&str, &[u8], bool)] = &[
+      ("status", b"( status ( 0: true ( 0 ) infinity ) ) ", true),
+      (
+        "switch",
+        b"( switch ( ( 0 ) 0: true 20:svn://127.0.0.1/repo infinity ) ) ",
+        true,
+      ),
+      (
+        "diff",
+        b"( diff ( ( 0 ) 0: true false 20:svn://127.0.0.1/repo false infinity ) ) ",
+        true,
+      ),
+      ("replay", b"( replay ( 0 0 true ) ) ", false),
+      ("replay-range", b"( replay-range ( 0 0 0 true ) ) ", false),
+    ];
+
+    for (label, command, is_report) in cases {
+      let mut conn = anonymous_session_with_external(b"alice");
+      let challenge = send_command(&mut conn, &sources, command);
+      assert!(
+        challenge.contains("EXTERNAL"),
+        "{label}: expected auth challenge, got {challenge}"
+      );
+      assert!(
+        !challenge.contains("170001"),
+        "{label}: must challenge before denying, got {challenge}"
+      );
+      let after_auth = send_command(&mut conn, &sources, EXTERNAL_AUTH);
+      assert!(
+        !after_auth.contains("170001"),
+        "{label}: resumed command must be authorized, got {after_auth}"
+      );
+      if *is_report {
+        let report_end = send_command(
+          &mut conn,
+          &sources,
+          b"( set-path ( 0: 0 false ( ) infinity ) ) ( finish-report ( ) ) ",
+        );
+        assert!(
+          report_end.contains("close-edit") && !report_end.contains("170001"),
+          "{label}: report must finish cleanly, got {report_end}"
+        );
+      } else {
+        assert!(
+          after_auth.contains("finish-replay") && after_auth.contains("( success ( ) )"),
+          "{label}: replay must finish cleanly without duplicate trivial auth, got {after_auth}"
+        );
+        assert!(
+          !after_auth.contains("( success ( ( ) 0: ) )"),
+          "{label}: resumed replay must not emit a redundant trivial auth request: {after_auth}"
+        );
+      }
+    }
   }
 }

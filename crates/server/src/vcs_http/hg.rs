@@ -483,6 +483,17 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
       Proof::Unauthorized => return self.unauthorized(),
       Proof::Refused(status) => return refused_with(status, Fields::new(), false),
     };
+    self.answer_with_principal(head, routed, principal)
+  }
+
+  /// Resolves the repository, policy, and exchange for a routed Mercurial request whose
+  /// `principal` is already proved.
+  fn answer_with_principal(
+    &mut self,
+    head: &Head<'_>,
+    routed: Routed,
+    principal: Principal,
+  ) -> Decided<HgExchange<S>> {
     if let Located::Elsewhere(shard) = self.repositories.locate(&routed.name) {
       return Decided {
         answer: Answer::Move { shard },
@@ -565,6 +576,22 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> Site for HgSite<A, 
   /// The site's answer, whatever the connection: no step of it reads whether the connection is TLS (A-686).
   async fn decide(&mut self, head: &Head<'_>, _secure: bool) -> Decided<Self::Exchange> {
     self.answer(head).await
+  }
+
+  async fn decide_proven(
+    &mut self,
+    head: &Head<'_>,
+    _secure: bool,
+    proven: &super::git::Proven,
+  ) -> Decided<Self::Exchange> {
+    let routed = match route(head, self.room) {
+      Ok(routed) => routed,
+      Err(status) => return refused_with(status, Fields::new(), true),
+    };
+    if routed.permission.is_some() && head.method != GET && head.method != PUSH_METHOD {
+      return refused_with(Status::METHOD_NOT_ALLOWED, allow(WIRE_METHODS), true);
+    }
+    self.answer_with_principal(head, routed, proven.principal.clone())
   }
 }
 

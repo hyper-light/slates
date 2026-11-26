@@ -2878,12 +2878,77 @@ fn a_mount_read_of_a_named_text_let_go_is_noted_brought_back_and_read_again() {
   });
 }
 
+fn assert_svn3_r2_green_state(state: &ShardState, green: DbVolumeId) {
+  let engine = state.greens.get(&green).expect("the green");
+  assert!(engine.xattr("trunk/del_dir", PROPS).is_none());
+  assert!(engine.xattr("trunk/del_file", PROPS).is_none());
+  assert!(engine.is_dir("trunk/box/sub"));
+  assert!(!engine.is_dir("trunk/box/nested"));
+  assert!(engine.xattr("trunk/box/sub", PROPS).is_none());
+  assert!(engine.xattr("trunk/box/nested", PROPS).is_none());
+  assert!(!engine.is_dir("trunk/removed"));
+}
+
+fn assert_svn3_r2_records_kinds(state: &ShardState, svn: RepositoryId) {
+  let records = state
+    .vcs_stores
+    .subversion_records(svn)
+    .expect("the records");
+  assert_eq!(records.index().youngest(), 2);
+  let dir_node = records.index().node("/trunk/dir", 2).unwrap().unwrap();
+  let swap_node = records.index().node("/trunk/swap", 2).unwrap().unwrap();
+  assert_eq!(dir_node.kind(), NodeKind::File);
+  assert_eq!(swap_node.kind(), NodeKind::Directory);
+  assert_eq!(
+    records
+      .index()
+      .node("/trunk/box/sub", 2)
+      .unwrap()
+      .unwrap()
+      .kind(),
+    NodeKind::Directory
+  );
+  assert_eq!(
+    records
+      .index()
+      .node("/trunk/box/nested", 2)
+      .unwrap()
+      .unwrap()
+      .kind(),
+    NodeKind::File
+  );
+}
+
+fn assert_svn3_r2_records_removed(state: &ShardState, svn: RepositoryId) {
+  let records = state
+    .vcs_stores
+    .subversion_records(svn)
+    .expect("the records");
+  assert!(records.index().node("/trunk/removed", 2).unwrap().is_none());
+  assert!(
+    records
+      .index()
+      .node("/trunk/dir/inner.txt", 2)
+      .unwrap()
+      .is_none()
+  );
+  assert!(
+    records
+      .index()
+      .node("/trunk/del_dir/sub/x.txt", 2)
+      .unwrap()
+      .is_none()
+  );
+}
+
 /// SVN-3: Do replace files with directories and non-empty directories with files in one commit —
-/// both via `Action::Replace` and via `Action::Delete` + `Action::Add`, with new children added
-/// under newly created directories and old properties cleared — then rebuild the store from
-/// persisted changesets. Expect: revision 2 commits cleanly (no `Uncommitted::Unsupported`),
-/// both directions hold the new kind, bytes, children, and properties (without leaking replaced
-/// node properties), and rebuild recovers revision 2 identically.
+/// via direct `Action::Replace`, via `Action::Add` over children queued in `self.gone` when their
+/// parent directory is replaced in the same revision, and alongside standalone `Action::Delete` +
+/// `Action::Add` rows, with new children added under newly created directories and old properties
+/// cleared — then rebuild the store from persisted changesets. Expect: revision 2 commits cleanly
+/// (no `Uncommitted::Unsupported`), every replaced path holds the new kind, bytes, children, and
+/// properties (without leaking replaced node properties), deleted paths vanish, and rebuild
+/// recovers revision 2 identically.
 #[test]
 fn t_svn3_atomic_file_to_dir_and_dir_to_file_replacements_succeed_and_recover() {
   stored(|| async move {
@@ -2907,6 +2972,18 @@ fn t_svn3_atomic_file_to_dir_and_dir_to_file_replacements_succeed_and_recover() 
       row("/trunk/del_dir", Action::Add, NodeKind::Directory),
       row("/trunk/del_dir/sub", Action::Add, NodeKind::Directory),
       file("/trunk/del_dir/sub/x.txt", Action::Add, b"x\n"),
+      row("/trunk/box", Action::Add, NodeKind::Directory),
+      ChangedPath {
+        properties: Some(held(&old_file_props)),
+        ..file("/trunk/box/sub", Action::Add, b"box-file\n")
+      },
+      ChangedPath {
+        properties: Some(held(&old_dir_props)),
+        ..row("/trunk/box/nested", Action::Add, NodeKind::Directory)
+      },
+      file("/trunk/box/nested/leaf.txt", Action::Add, b"leaf\n"),
+      row("/trunk/removed", Action::Add, NodeKind::Directory),
+      file("/trunk/removed/gone.txt", Action::Add, b"gone\n"),
     ];
     let r1 = revision(
       0,
@@ -2918,6 +2995,9 @@ fn t_svn3_atomic_file_to_dir_and_dir_to_file_replacements_succeed_and_recover() 
         b"inner\n",
         b"df\n",
         b"x\n",
+        b"box-file\n",
+        b"leaf\n",
+        b"gone\n",
       ],
     );
     assert_eq!(commit((&owner(), svn), r1, None).await, answered(1));
@@ -2939,6 +3019,15 @@ fn t_svn3_atomic_file_to_dir_and_dir_to_file_replacements_succeed_and_recover() 
       file("/trunk/del_file/k.txt", Action::Add, b"kid\n"),
       // Nested non-empty Dir -> File via Replace (no props).
       file("/trunk/del_dir", Action::Replace, b"flat\n"),
+      // Ancestor directory Replace queues children in `self.gone`, then Action::Add swaps their
+      // kinds (file -> dir and dir -> file) through `Building::add` -> `remake`.
+      row("/trunk/box", Action::Replace, NodeKind::Directory),
+      row("/trunk/box/sub", Action::Add, NodeKind::Directory),
+      file("/trunk/box/sub/k2.txt", Action::Add, b"kid2\n"),
+      file("/trunk/box/nested", Action::Add, b"flat-nested\n"),
+      // Standalone Action::Delete alongside sibling Action::Add.
+      row("/trunk/removed", Action::Delete, NodeKind::Directory),
+      file("/trunk/added_sibling", Action::Add, b"sib\n"),
     ];
     let r2 = revision(
       1,
@@ -2950,6 +3039,9 @@ fn t_svn3_atomic_file_to_dir_and_dir_to_file_replacements_succeed_and_recover() 
         b"now-file\n",
         b"kid\n",
         b"flat\n",
+        b"kid2\n",
+        b"flat-nested\n",
+        b"sib\n",
       ],
     );
     assert_eq!(commit((&owner(), svn), r2, None).await, answered(2));
@@ -2957,39 +3049,17 @@ fn t_svn3_atomic_file_to_dir_and_dir_to_file_replacements_succeed_and_recover() 
     // Verify both the green and the SVN records at r2.
     let (swap_dir, dir_is_dir, del_file_dir, del_dir_is_dir, dir_props_id, swap_props_id) =
       on(|state| {
+        assert_svn3_r2_green_state(state, green);
+        assert_svn3_r2_records_kinds(state, svn);
+        assert_svn3_r2_records_removed(state, svn);
         let engine = state.greens.get(&green).expect("the green");
-        assert!(engine.xattr("trunk/del_dir", PROPS).is_none());
-        assert!(engine.xattr("trunk/del_file", PROPS).is_none());
-        let records = state
-          .vcs_stores
-          .subversion_records(svn)
-          .expect("the records");
-        assert_eq!(records.index().youngest(), 2);
-        let dir_node = records.index().node("/trunk/dir", 2).unwrap().unwrap();
-        let swap_node = records.index().node("/trunk/swap", 2).unwrap().unwrap();
-        assert_eq!(dir_node.kind(), NodeKind::File);
-        assert_eq!(swap_node.kind(), NodeKind::Directory);
-        assert!(
-          records
-            .index()
-            .node("/trunk/dir/inner.txt", 2)
-            .unwrap()
-            .is_none()
-        );
-        assert!(
-          records
-            .index()
-            .node("/trunk/del_dir/sub/x.txt", 2)
-            .unwrap()
-            .is_none()
-        );
         (
           engine.is_dir("trunk/swap"),
           engine.is_dir("trunk/dir"),
           engine.is_dir("trunk/del_file"),
           engine.is_dir("trunk/del_dir"),
-          engine.xattr("trunk/dir", PROPS).map(|b| b.to_vec()),
-          engine.xattr("trunk/swap", PROPS).map(|b| b.to_vec()),
+          engine.xattr("trunk/dir", PROPS).map(<[u8]>::to_vec),
+          engine.xattr("trunk/swap", PROPS).map(<[u8]>::to_vec),
         )
       });
     assert_eq!(
@@ -3012,6 +3082,12 @@ fn t_svn3_atomic_file_to_dir_and_dir_to_file_replacements_succeed_and_recover() 
     let flat_bytes =
       crate::vcs_store::named_objects::read_file_brought(green, "trunk/del_dir").await;
     assert_eq!(flat_bytes.as_deref(), Some(&b"flat\n"[..]));
+    let box_nested_bytes =
+      crate::vcs_store::named_objects::read_file_brought(green, "trunk/box/nested").await;
+    assert_eq!(box_nested_bytes.as_deref(), Some(&b"flat-nested\n"[..]));
+    let sib_bytes =
+      crate::vcs_store::named_objects::read_file_brought(green, "trunk/added_sibling").await;
+    assert_eq!(sib_bytes.as_deref(), Some(&b"sib\n"[..]));
 
     // Rebuild the SVN store from persisted changesets and verify r2 recovers cleanly.
     on(|state| crate::vcs_store::rebuild(state, svn));
