@@ -962,6 +962,41 @@ impl Daemon {
     Self::start_with_fleet(profile, config, source, None)
   }
 
+  /// The anchor segment a start serves, from wherever `source` says it is (§4.7, A-114): made at its name with its
+  /// content region, attached from the environment an anchor across the spawn set, or attached from the handoff an
+  /// anchor in this process made, adopting the content object it handed over with it.
+  fn segment_from(
+    source: SegmentSource,
+    identity: &Identity,
+    config: &DaemonConfig,
+  ) -> Result<AnchorSegment, ServerError> {
+    match source {
+      SegmentSource::Create { name } => {
+        let content_name = content_name_of(&name);
+        Ok(
+          AnchorSegment::create(&name, identity, config.geometry)?
+            .with_content(&content_name, config.content_bytes())?,
+        )
+      }
+      SegmentSource::FromEnv => Ok(AnchorSegment::attach_from_env(identity)?),
+      SegmentSource::Handoff {
+        handoff,
+        len,
+        content,
+        rendezvous: _,
+      } => {
+        let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
+        if let Some((content_handoff, content_len)) = content {
+          let object =
+            slates_mem::SparseObject::open(&content_handoff, content_len, slates_mem::Words::new())
+              .map_err(slates_anchor::AnchorError::from)?;
+          segment.adopt_content(object);
+        }
+        Ok(segment)
+      }
+    }
+  }
+
   /// The observability gate (§2.6, §4.14): refused, naming what is missing, unless every chokepoint span has
   /// registered its emitter.
   fn chokepoints_ready() -> Result<(), ServerError> {
@@ -1023,29 +1058,7 @@ impl Daemon {
     // of 2026-11-25), which the store cannot build; a second daemon in this process finds it installed.
     let _ = slates_store::texts::install_chunk_decoder(slates_hg::revlog_chunk::decode_within);
     let listener = Listener::open(&config.instance, adoption.as_ref())?;
-    let mut segment = match source {
-      SegmentSource::Create { name } => {
-        let content_name = content_name_of(&name);
-        AnchorSegment::create(&name, &identity, config.geometry)?
-          .with_content(&content_name, config.content_bytes())?
-      }
-      SegmentSource::FromEnv => AnchorSegment::attach_from_env(&identity)?,
-      SegmentSource::Handoff {
-        handoff,
-        len,
-        content,
-        rendezvous: _,
-      } => {
-        let mut segment = AnchorSegment::attach(&handoff, len, &identity)?;
-        if let Some((content_handoff, content_len)) = content {
-          let object =
-            slates_mem::SparseObject::open(&content_handoff, content_len, slates_mem::Words::new())
-              .map_err(slates_anchor::AnchorError::from)?;
-          segment.adopt_content(object);
-        }
-        segment
-      }
-    };
+    let mut segment = Self::segment_from(source, &identity, &config)?;
     // The start beats from here until the watchdog takes the beat over (§2.6 boot step 2, A-312; [`StartBeat`]).
     let mut start_beat = StartBeat::new();
     start_beat.beat(&segment.supervision()?);

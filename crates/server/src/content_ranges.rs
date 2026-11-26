@@ -966,7 +966,7 @@ mod tests {
     // The plan read here and the one the sweep made at its start may differ by what moved between (the arena's held
     // runs, a client's ring): within a percent of it and a step a range.
     assert!(
-      walked as usize <= all_pages + all_pages / 100 + all_ranges,
+      usize::try_from(walked).unwrap() <= all_pages + all_pages / 100 + all_ranges,
       "the sweep walked {walked} pages, past its plan's {all_pages}"
     );
   }

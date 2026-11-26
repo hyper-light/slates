@@ -2409,7 +2409,7 @@ fn t_a927_a_submit_into_a_green_not_recovered_is_refused() {
       bytes: b"one".to_vec(),
     };
     let edited = dispatch(state, 1, &owner(), edit);
-    assert!(matches!(edited, ReplyBody::Edited { .. }), "{edited:?}");
+    assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
     given_up(state, &[green]);
     let submit = RequestBody::Submit {
       work,

@@ -1457,7 +1457,7 @@ mod tests {
   fn version_2_full(object: &mut SparseObject, stamp: u64) -> Vec<u8> {
     let area = LOG_BYTES - HEADER_BYTES;
     let bytes: Vec<u8> = (0..area - RECORD_HEAD - VOLUME_BYTES)
-      .map(|at| (at % 251) as u8)
+      .map(|at| u8::try_from(at % 251).unwrap())
       .collect();
     let mut record = Vec::new();
     record.extend_from_slice(&KIND_WRITE.to_le_bytes());
@@ -1525,17 +1525,22 @@ mod tests {
       Err(Refused::Full),
       "the append that does not fit forces the clear"
     );
-    log.clear(&mut shared, 6).unwrap();
+    assert_cleared_into_version_3(&mut log, &mut shared);
+  }
+
+  /// The second half of [`a_version_2_log_filled_to_its_end_is_replayed_whole_then_cleared_into_version_3`], after its
+  /// append was refused full: clear `log` as a publication does, append, open it again. Expect a version 3 log whose
+  /// marks block is in force and reads back, its marks the journal's extents, and the record after the clear replayed.
+  fn assert_cleared_into_version_3(log: &mut WriteLog, shared: &mut SparseObject) {
+    log.clear(shared, 6).unwrap();
     assert_eq!(
       log.marks_block(),
       Some((LOG_BYTES - MARKS_BYTES, MARKS_BYTES)),
       "version 3, its marks block in force"
     );
-    log
-      .append(&mut shared, (VOLUME, 4), 0, b"one more")
-      .unwrap();
+    log.append(shared, (VOLUME, 4), 0, b"one more").unwrap();
     let (again, replayed) =
-      WriteLog::open(&mut shared, (LOG_AT, LOG_BYTES), 6, (PAGE, journal_whole())).unwrap();
+      WriteLog::open(shared, (LOG_AT, LOG_BYTES), 6, (PAGE, journal_whole())).unwrap();
     assert_eq!(
       again.marks_counts().0,
       MarksFound::Read,
