@@ -245,44 +245,87 @@ fn a_verdict_moves_nothing_and_a_declined_atomic_push_appends_nothing() {
   assert!(logs.positions.is_empty());
 }
 
-/// §4.17.2 "A push" (files-backend ref directory/file namespace conflicts): do push intra-batch
-/// conflicting refs (`refs/heads/topic` and `refs/heads/topic/docs`, both orders, including an
-/// ASCII-intervening sibling `refs/heads/topic-1` where `'-' < '/'`), non-conflicting prefix
-/// shares (`refs/heads/topic` and `refs/heads/topic2`, `refs/tags/topic/docs`), and non-atomic
-/// sibling creates. Expect: conflicting pairs are refused `failed to update ref` with Git's
-/// `exists; cannot create` message, `--atomic` rolls back the entire batch with `atomic push
-/// failure`, non-conflicting names succeed, and without `--atomic` a declined first ref does not
-/// block the second.
-#[test]
-fn df_ref_namespace_conflicts_are_refused_and_atomic_batches_roll_back() {
-  let mut repository = Repo::default();
-  let tree = repository.with(Kind::Tree, b"");
-  let commit = commit_text(tree, &[]);
-  let id = name_of(ObjectFormat::Sha1, Kind::Commit, &commit).unwrap();
-  let pack = pack_of(&[(Kind::Commit, &commit)]);
+/// One-commit repository and matching pack shared by D/F ref-conflict scenarios.
+struct SingleCommitFixture {
+  /// Repository holding the empty tree.
+  repository: Repo,
+  /// Object id of the root commit carried in `pack`.
+  commit_id: ObjectId,
+  /// Single-object pack carrying the root commit.
+  pack: Vec<u8>,
+}
 
-  let push = |commands: &[(ObjectId, ObjectId, &[u8])], atomic: bool, logs: &mut Logs| {
-    let caps: &[u8] = if atomic {
+impl SingleCommitFixture {
+  /// Builds the empty-tree repository and single-commit pack.
+  fn new() -> Self {
+    let mut repository = Repo::default();
+    let tree = repository.with(Kind::Tree, b"");
+    let commit = commit_text(tree, &[]);
+    let commit_id = name_of(ObjectFormat::Sha1, Kind::Commit, &commit).unwrap();
+    let pack = pack_of(&[(Kind::Commit, &commit)]);
+    Self {
+      repository,
+      commit_id,
+      pack,
+    }
+  }
+
+  /// Runs `receive` for `commands` (`atomic` or not) through `judge` and returns the outcomes.
+  fn push<J: Judge>(
+    &self,
+    commands: &[(ObjectId, ObjectId, &[u8])],
+    atomic: bool,
+    judge: &mut J,
+  ) -> Vec<Outcome> {
+    let capabilities: &[u8] = if atomic {
       b" report-status atomic"
     } else {
       b" report-status"
     };
-    let bytes = request(&[], commands, caps, &[], &pack);
+    let bytes = request(&[], commands, capabilities, &[], &self.pack);
     receive(
       &bytes,
       &ADVERTISED,
-      &repository,
+      &self.repository,
       &NoneHidden,
-      logs,
+      judge,
       &mut unbounded(),
     )
     .unwrap()
     .outcomes
-  };
+  }
+}
 
-  // 1. Atomic: refs/heads/topic + refs/heads/topic/docs -> whole batch rolls back.
+/// Asserts `outcome` was refused for `reason`.
+fn assert_declined_reason(outcome: &Outcome, reason: &[u8]) {
+  match outcome {
+    Outcome::Ng(declined) => assert_eq!(declined.reason, reason),
+    other => panic!("expected refusal, got {other:?}"),
+  }
+}
+
+/// Asserts `outcome` was refused for `reason` with a band-2 message containing `needle`.
+fn assert_declined_with_message(outcome: &Outcome, reason: &[u8], needle: &str) {
+  match outcome {
+    Outcome::Ng(declined) => {
+      assert_eq!(declined.reason, reason);
+      let bytes = declined
+        .message
+        .as_deref()
+        .expect("expected band-2 message");
+      let text = String::from_utf8_lossy(bytes);
+      assert!(text.contains(needle), "expected {needle:?} in {text:?}");
+    }
+    other => panic!("expected refusal, got {other:?}"),
+  }
+}
+
+/// Verifies atomic intra-batch D/F conflicts roll back the entire batch in both ref orders,
+/// including across an ASCII-intervening sibling (`'-' < '/'`).
+fn assert_atomic_intra_batch_df_conflicts(fixture: &SingleCommitFixture) {
+  let id = fixture.commit_id;
   let mut logs = Logs::default();
-  let outcomes = push(
+  let outcomes = fixture.push(
     &[
       (zero(), id, b"refs/heads/topic"),
       (zero(), id, b"refs/heads/topic/docs"),
@@ -291,20 +334,11 @@ fn df_ref_namespace_conflicts_are_refused_and_atomic_batches_roll_back() {
     &mut logs,
   );
   assert_eq!(outcomes[0], refused(ATOMIC_FAILURE, None));
-  assert!(matches!(
-    &outcomes[1],
-    Outcome::Ng(declined)
-      if declined.reason == FAILED_TO_UPDATE
-        && declined
-          .message
-          .as_deref()
-          .is_some_and(|m| String::from_utf8_lossy(m).contains("exists; cannot create"))
-  ));
+  assert_declined_with_message(&outcomes[1], FAILED_TO_UPDATE, "exists; cannot create");
   assert!(logs.appended.is_empty());
 
-  // 2. Atomic reversed order with ASCII-between sibling `refs/heads/topic-1` ('-' < '/').
   let mut logs = Logs::default();
-  let outcomes = push(
+  let outcomes = fixture.push(
     &[
       (zero(), id, b"refs/heads/topic/docs"),
       (zero(), id, b"refs/heads/topic-1"),
@@ -315,15 +349,15 @@ fn df_ref_namespace_conflicts_are_refused_and_atomic_batches_roll_back() {
   );
   assert_eq!(outcomes[0], refused(ATOMIC_FAILURE, None));
   assert_eq!(outcomes[1], refused(ATOMIC_FAILURE, None));
-  assert!(matches!(
-    &outcomes[2],
-    Outcome::Ng(declined) if declined.reason == FAILED_TO_UPDATE
-  ));
+  assert_declined_reason(&outcomes[2], FAILED_TO_UPDATE);
   assert!(logs.appended.is_empty());
+}
 
-  // 3. Non-conflicting prefix shares MUST succeed: topic vs topic2, and refs/heads/topic vs refs/tags/topic/docs.
+/// Verifies non-conflicting prefix shares (`topic` vs `topic2` and `refs/tags/topic/docs`) succeed.
+fn assert_non_conflicting_prefix_batch(fixture: &SingleCommitFixture) {
+  let id = fixture.commit_id;
   let mut logs = Logs::default();
-  let outcomes = push(
+  let outcomes = fixture.push(
     &[
       (zero(), id, b"refs/heads/topic"),
       (zero(), id, b"refs/heads/topic2"),
@@ -334,10 +368,13 @@ fn df_ref_namespace_conflicts_are_refused_and_atomic_batches_roll_back() {
   );
   assert_eq!(outcomes, vec![Outcome::Ok(Vec::new()); 3]);
   assert_eq!(logs.appended.len(), 1);
+}
 
-  // 4. Non-atomic: first succeeds, conflicting second refused, unrelated third succeeds.
+/// Verifies non-atomic intra-batch D/F conflict refuses only the conflicting second ref.
+fn assert_non_atomic_df_conflict_batch(fixture: &SingleCommitFixture) {
+  let id = fixture.commit_id;
   let mut logs = Logs::default();
-  let outcomes = push(
+  let outcomes = fixture.push(
     &[
       (zero(), id, b"refs/heads/topic"),
       (zero(), id, b"refs/heads/topic/docs"),
@@ -347,22 +384,22 @@ fn df_ref_namespace_conflicts_are_refused_and_atomic_batches_roll_back() {
     &mut logs,
   );
   assert_eq!(outcomes[0], Outcome::Ok(Vec::new()));
-  assert!(matches!(
-    &outcomes[1],
-    Outcome::Ng(declined) if declined.reason == FAILED_TO_UPDATE
-  ));
+  assert_declined_reason(&outcomes[1], FAILED_TO_UPDATE);
   assert_eq!(outcomes[2], Outcome::Ok(Vec::new()));
   assert_eq!(
     logs.appended,
     [owned(&[b"refs/heads/topic"]), owned(&[b"refs/heads/other"])]
   );
+}
 
-  // 5. Non-atomic: when the first ref is declined by the judge, the second is not blocked.
+/// Verifies a non-atomic judge refusal on a parent ref leaves its child ref unblocked.
+fn assert_non_atomic_declined_ref_does_not_block_child(fixture: &SingleCommitFixture) {
+  let id = fixture.commit_id;
   let mut logs = Logs {
     declining: owned(&[b"refs/heads/topic"]),
     ..Logs::default()
   };
-  let outcomes = push(
+  let outcomes = fixture.push(
     &[
       (zero(), id, b"refs/heads/topic"),
       (zero(), id, b"refs/heads/topic/docs"),
@@ -375,6 +412,23 @@ fn df_ref_namespace_conflicts_are_refused_and_atomic_batches_roll_back() {
   assert_eq!(logs.appended, [owned(&[b"refs/heads/topic/docs"])]);
 }
 
+/// §4.17.2 "A push" (files-backend ref directory/file namespace conflicts): do push intra-batch
+/// conflicting refs (`refs/heads/topic` and `refs/heads/topic/docs`, both orders, including an
+/// ASCII-intervening sibling `refs/heads/topic-1` where `'-' < '/'`), non-conflicting prefix
+/// shares (`refs/heads/topic` and `refs/heads/topic2`, `refs/tags/topic/docs`), and non-atomic
+/// sibling creates. Expect: conflicting pairs are refused `failed to update ref` with Git's
+/// `exists; cannot create` message, `--atomic` rolls back the entire batch with `atomic push
+/// failure`, non-conflicting names succeed, and without `--atomic` a declined first ref does not
+/// block the second.
+#[test]
+fn df_ref_namespace_conflicts_are_refused_and_atomic_batches_roll_back() {
+  let fixture = SingleCommitFixture::new();
+  assert_atomic_intra_batch_df_conflicts(&fixture);
+  assert_non_conflicting_prefix_batch(&fixture);
+  assert_non_atomic_df_conflict_batch(&fixture);
+  assert_non_atomic_declined_ref_does_not_block_child(&fixture);
+}
+
 /// A test judge holding pre-existing repository ref names so cross-push D/F namespace conflict
 /// checks (including delete-then-create replacement and atomic rollback) are verified end to end.
 #[derive(Default)]
@@ -385,6 +439,16 @@ struct ExistingRefsJudge {
   declining: Vec<Vec<u8>>,
   /// Applied commands recorded as batches (one entry per non-atomic append, one vec per atomic).
   appended: Vec<Vec<Vec<u8>>>,
+}
+
+impl ExistingRefsJudge {
+  /// Builds a judge pre-populated with `existing` repository ref names.
+  fn with_existing(existing: &[&[u8]]) -> Self {
+    Self {
+      existing: existing.iter().map(|name| name.to_vec()).collect(),
+      ..Self::default()
+    }
+  }
 }
 
 impl Judge for ExistingRefsJudge {
@@ -443,76 +507,27 @@ impl Judge for ExistingRefsJudge {
   }
 }
 
-/// §4.17.2 "A push" (cross-push D/F ref namespace conflicts against pre-existing refs, including
-/// delete-then-create replacement and atomic rollback): do test `refs_conflict` boundary cases,
-/// existing `refs/heads/topic` vs creating `refs/heads/topic/docs` (and vice versa), atomic
-/// delete-then-create allowed, partial delete of multi-child directory refused, full delete of
-/// multi-child directory allowed, and non-atomic delete-then-create (both succeeding and when the
-/// delete is declined). Expect: every post-batch D/F conflict is rejected (rolling back `--atomic`
-/// batches cleanly), while clean replacements and non-conflicting names succeed.
-#[test]
-fn cross_push_df_ref_namespace_conflicts_and_delete_replace() {
-  assert!(crate::receive::refs_conflict(
-    b"refs/heads/topic",
-    b"refs/heads/topic/docs"
-  ));
-  assert!(crate::receive::refs_conflict(
-    b"refs/heads/topic/docs",
-    b"refs/heads/topic"
-  ));
-  assert!(crate::receive::refs_conflict(
-    b"refs/heads/topic",
-    b"refs/heads/topic/a/b"
-  ));
-  assert!(!crate::receive::refs_conflict(
-    b"refs/heads/topic",
-    b"refs/heads/topic2"
-  ));
-  assert!(!crate::receive::refs_conflict(
-    b"refs/heads/topic",
-    b"refs/heads/topic"
-  ));
-  assert!(!crate::receive::refs_conflict(
-    b"refs/heads/a/b",
-    b"refs/heads/a/c"
-  ));
-  assert!(!crate::receive::refs_conflict(
-    b"refs/heads/topic",
-    b"refs/tags/topic/docs"
-  ));
+/// Verifies `refs_conflict` boundary cases across ancestor/descendant and sibling prefixes.
+fn assert_refs_conflict_boundaries() {
+  let cases: [(&[u8], &[u8], bool); 7] = [
+    (b"refs/heads/topic", b"refs/heads/topic/docs", true),
+    (b"refs/heads/topic/docs", b"refs/heads/topic", true),
+    (b"refs/heads/topic", b"refs/heads/topic/a/b", true),
+    (b"refs/heads/topic", b"refs/heads/topic2", false),
+    (b"refs/heads/topic", b"refs/heads/topic", false),
+    (b"refs/heads/a/b", b"refs/heads/a/c", false),
+    (b"refs/heads/topic", b"refs/tags/topic/docs", false),
+  ];
+  for (left, right, expected) in cases {
+    assert_eq!(crate::receive::refs_conflict(left, right), expected);
+  }
+}
 
-  let mut repository = Repo::default();
-  let tree = repository.with(Kind::Tree, b"");
-  let commit = commit_text(tree, &[]);
-  let id = name_of(ObjectFormat::Sha1, Kind::Commit, &commit).unwrap();
-  let pack = pack_of(&[(Kind::Commit, &commit)]);
-
-  let run =
-    |commands: &[(ObjectId, ObjectId, &[u8])], atomic: bool, judge: &mut ExistingRefsJudge| {
-      let caps: &[u8] = if atomic {
-        b" report-status atomic"
-      } else {
-        b" report-status"
-      };
-      let bytes = request(&[], commands, caps, &[], &pack);
-      receive(
-        &bytes,
-        &ADVERTISED,
-        &repository,
-        &NoneHidden,
-        judge,
-        &mut unbounded(),
-      )
-      .unwrap()
-      .outcomes
-    };
-
-  // 1. Existing `refs/heads/topic`: atomic push of `good` + `topic/docs` rolls back whole batch.
-  let mut judge = ExistingRefsJudge {
-    existing: [b"refs/heads/topic".to_vec()].into_iter().collect(),
-    ..ExistingRefsJudge::default()
-  };
-  let outcomes = run(
+/// Verifies atomic pushes creating a child or parent of a pre-existing ref roll back cleanly.
+fn assert_atomic_cross_push_df_conflicts(fixture: &SingleCommitFixture) {
+  let id = fixture.commit_id;
+  let mut judge = ExistingRefsJudge::with_existing(&[b"refs/heads/topic"]);
+  let outcomes = fixture.push(
     &[
       (zero(), id, b"refs/heads/good"),
       (zero(), id, b"refs/heads/topic/docs"),
@@ -521,35 +536,20 @@ fn cross_push_df_ref_namespace_conflicts_and_delete_replace() {
     &mut judge,
   );
   assert_eq!(outcomes[0], refused(ATOMIC_FAILURE, None));
-  assert!(matches!(
-    &outcomes[1],
-    Outcome::Ng(declined)
-      if declined.reason == FAILED_TO_UPDATE
-        && declined
-          .message
-          .as_deref()
-          .is_some_and(|m| String::from_utf8_lossy(m).contains("'refs/heads/topic' exists"))
-  ));
+  assert_declined_with_message(&outcomes[1], FAILED_TO_UPDATE, "'refs/heads/topic' exists");
   assert!(judge.appended.is_empty());
 
-  // 2. Existing `refs/heads/topic/docs`: atomic push creating `refs/heads/topic` is refused.
-  let mut judge = ExistingRefsJudge {
-    existing: [b"refs/heads/topic/docs".to_vec()].into_iter().collect(),
-    ..ExistingRefsJudge::default()
-  };
-  let outcomes = run(&[(zero(), id, b"refs/heads/topic")], true, &mut judge);
-  assert!(matches!(
-    &outcomes[0],
-    Outcome::Ng(declined) if declined.reason == FAILED_TO_UPDATE
-  ));
+  let mut judge = ExistingRefsJudge::with_existing(&[b"refs/heads/topic/docs"]);
+  let outcomes = fixture.push(&[(zero(), id, b"refs/heads/topic")], true, &mut judge);
+  assert_declined_reason(&outcomes[0], FAILED_TO_UPDATE);
   assert!(judge.appended.is_empty());
+}
 
-  // 3. Existing `refs/heads/topic`: atomic delete `topic` + create `topic/docs` is ALLOWED.
-  let mut judge = ExistingRefsJudge {
-    existing: [b"refs/heads/topic".to_vec()].into_iter().collect(),
-    ..ExistingRefsJudge::default()
-  };
-  let outcomes = run(
+/// Verifies atomic delete of `refs/heads/topic` paired with creating `refs/heads/topic/docs` succeeds.
+fn assert_atomic_single_delete_replace(fixture: &SingleCommitFixture) {
+  let id = fixture.commit_id;
+  let mut judge = ExistingRefsJudge::with_existing(&[b"refs/heads/topic"]);
+  let outcomes = fixture.push(
     &[
       (id, zero(), b"refs/heads/topic"),
       (zero(), id, b"refs/heads/topic/docs"),
@@ -560,18 +560,14 @@ fn cross_push_df_ref_namespace_conflicts_and_delete_replace() {
   assert_eq!(outcomes, vec![Outcome::Ok(Vec::new()); 2]);
   assert!(!judge.existing.contains(b"refs/heads/topic".as_slice()));
   assert!(judge.existing.contains(b"refs/heads/topic/docs".as_slice()));
+}
 
-  // 4. Existing `topic/a` + `topic/b`: deleting only `topic/a` and creating `topic` is REFUSED.
-  let mut judge = ExistingRefsJudge {
-    existing: [
-      b"refs/heads/topic/a".to_vec(),
-      b"refs/heads/topic/b".to_vec(),
-    ]
-    .into_iter()
-    .collect(),
-    ..ExistingRefsJudge::default()
-  };
-  let outcomes = run(
+/// Verifies partial delete of a multi-child directory rolls back while deleting every child allows
+/// creating the parent ref.
+fn assert_atomic_multi_child_delete_replace(fixture: &SingleCommitFixture) {
+  let id = fixture.commit_id;
+  let mut judge = ExistingRefsJudge::with_existing(&[b"refs/heads/topic/a", b"refs/heads/topic/b"]);
+  let outcomes = fixture.push(
     &[
       (id, zero(), b"refs/heads/topic/a"),
       (zero(), id, b"refs/heads/topic"),
@@ -580,14 +576,10 @@ fn cross_push_df_ref_namespace_conflicts_and_delete_replace() {
     &mut judge,
   );
   assert_eq!(outcomes[0], refused(ATOMIC_FAILURE, None));
-  assert!(matches!(
-    &outcomes[1],
-    Outcome::Ng(declined) if declined.reason == FAILED_TO_UPDATE
-  ));
+  assert_declined_reason(&outcomes[1], FAILED_TO_UPDATE);
   assert!(judge.appended.is_empty());
 
-  // 5. Existing `topic/a` + `topic/b`: deleting BOTH and creating `topic` is ALLOWED.
-  let outcomes = run(
+  let outcomes = fixture.push(
     &[
       (id, zero(), b"refs/heads/topic/a"),
       (id, zero(), b"refs/heads/topic/b"),
@@ -598,13 +590,13 @@ fn cross_push_df_ref_namespace_conflicts_and_delete_replace() {
   );
   assert_eq!(outcomes, vec![Outcome::Ok(Vec::new()); 3]);
   assert!(judge.existing.contains(b"refs/heads/topic".as_slice()));
+}
 
-  // 6. Non-atomic: existing `topic`, push `good` + `topic/docs` -> `good` OK, `topic/docs` refused.
-  let mut judge = ExistingRefsJudge {
-    existing: [b"refs/heads/topic".to_vec()].into_iter().collect(),
-    ..ExistingRefsJudge::default()
-  };
-  let outcomes = run(
+/// Verifies non-atomic cross-push conflicts, clean delete-then-create, and declined-delete blocking.
+fn assert_non_atomic_cross_push_df_and_replace(fixture: &SingleCommitFixture) {
+  let id = fixture.commit_id;
+  let mut judge = ExistingRefsJudge::with_existing(&[b"refs/heads/topic"]);
+  let outcomes = fixture.push(
     &[
       (zero(), id, b"refs/heads/good"),
       (zero(), id, b"refs/heads/topic/docs"),
@@ -613,17 +605,10 @@ fn cross_push_df_ref_namespace_conflicts_and_delete_replace() {
     &mut judge,
   );
   assert_eq!(outcomes[0], Outcome::Ok(Vec::new()));
-  assert!(matches!(
-    &outcomes[1],
-    Outcome::Ng(declined) if declined.reason == FAILED_TO_UPDATE
-  ));
+  assert_declined_reason(&outcomes[1], FAILED_TO_UPDATE);
 
-  // 7. Non-atomic: delete `topic` then create `topic/docs` -> both succeed.
-  let mut judge = ExistingRefsJudge {
-    existing: [b"refs/heads/topic".to_vec()].into_iter().collect(),
-    ..ExistingRefsJudge::default()
-  };
-  let outcomes = run(
+  let mut judge = ExistingRefsJudge::with_existing(&[b"refs/heads/topic"]);
+  let outcomes = fixture.push(
     &[
       (id, zero(), b"refs/heads/topic"),
       (zero(), id, b"refs/heads/topic/docs"),
@@ -633,13 +618,12 @@ fn cross_push_df_ref_namespace_conflicts_and_delete_replace() {
   );
   assert_eq!(outcomes, vec![Outcome::Ok(Vec::new()); 2]);
 
-  // 8. Non-atomic: delete `topic` is declined by judge -> creating `topic/docs` MUST be refused.
   let mut judge = ExistingRefsJudge {
     existing: [b"refs/heads/topic".to_vec()].into_iter().collect(),
     declining: owned(&[b"refs/heads/topic"]),
     ..ExistingRefsJudge::default()
   };
-  let outcomes = run(
+  let outcomes = fixture.push(
     &[
       (id, zero(), b"refs/heads/topic"),
       (zero(), id, b"refs/heads/topic/docs"),
@@ -648,15 +632,14 @@ fn cross_push_df_ref_namespace_conflicts_and_delete_replace() {
     &mut judge,
   );
   assert_eq!(outcomes[0], refused(b"hook declined", None));
-  assert!(matches!(
-    &outcomes[1],
-    Outcome::Ng(declined) if declined.reason == FAILED_TO_UPDATE
-  ));
+  assert_declined_reason(&outcomes[1], FAILED_TO_UPDATE);
+}
 
-  // 9. Funny refname (`refs/heads/topic/`) must report `funny refname`, NOT D/F conflict,
-  // even alongside valid `refs/heads/topic`.
+/// Verifies `funny refname` (`refs/heads/topic/`) is reported ahead of D/F conflict checks.
+fn assert_funny_refname_precedes_df_conflict(fixture: &SingleCommitFixture) {
+  let id = fixture.commit_id;
   let mut judge = ExistingRefsJudge::default();
-  let outcomes = run(
+  let outcomes = fixture.push(
     &[
       (zero(), id, b"refs/heads/topic"),
       (zero(), id, b"refs/heads/topic/"),
@@ -665,12 +648,10 @@ fn cross_push_df_ref_namespace_conflicts_and_delete_replace() {
     &mut judge,
   );
   assert_eq!(outcomes[0], Outcome::Ok(Vec::new()));
-  assert!(matches!(
-    &outcomes[1],
-    Outcome::Ng(declined) if declined.reason == b"funny refname"
-  ));
+  assert_declined_reason(&outcomes[1], b"funny refname");
+
   let mut atomic_judge = ExistingRefsJudge::default();
-  let atomic_outcomes = run(
+  let atomic_outcomes = fixture.push(
     &[
       (zero(), id, b"refs/heads/topic"),
       (zero(), id, b"refs/heads/topic/"),
@@ -679,9 +660,24 @@ fn cross_push_df_ref_namespace_conflicts_and_delete_replace() {
     &mut atomic_judge,
   );
   assert_eq!(atomic_outcomes[0], refused(ATOMIC_FAILURE, None));
-  assert!(matches!(
-    &atomic_outcomes[1],
-    Outcome::Ng(declined) if declined.reason == b"funny refname"
-  ));
+  assert_declined_reason(&atomic_outcomes[1], b"funny refname");
   assert!(atomic_judge.appended.is_empty());
+}
+
+/// §4.17.2 "A push" (cross-push D/F ref namespace conflicts against pre-existing refs, including
+/// delete-then-create replacement and atomic rollback): do test `refs_conflict` boundary cases,
+/// existing `refs/heads/topic` vs creating `refs/heads/topic/docs` (and vice versa), atomic
+/// delete-then-create allowed, partial delete of multi-child directory refused, full delete of
+/// multi-child directory allowed, and non-atomic delete-then-create (both succeeding and when the
+/// delete is declined). Expect: every post-batch D/F conflict is rejected (rolling back `--atomic`
+/// batches cleanly), while clean replacements and non-conflicting names succeed.
+#[test]
+fn cross_push_df_ref_namespace_conflicts_and_delete_replace() {
+  assert_refs_conflict_boundaries();
+  let fixture = SingleCommitFixture::new();
+  assert_atomic_cross_push_df_conflicts(&fixture);
+  assert_atomic_single_delete_replace(&fixture);
+  assert_atomic_multi_child_delete_replace(&fixture);
+  assert_non_atomic_cross_push_df_and_replace(&fixture);
+  assert_funny_refname_precedes_df_conflict(&fixture);
 }

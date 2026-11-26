@@ -588,8 +588,8 @@ fn wrong_kind_object_edges_to_existing_repository_objects_are_refused() {
   let bytes = request(&[], &commands, b" report-status", &[], &pack);
   let (outcomes, judged) = outcomes_hiding(&bytes, &repository, &NoneHidden);
   let missing = refused_with(b"missing necessary objects");
-  for at in 0..5 {
-    assert_eq!(outcomes[at], missing, "case {at}");
+  for (at, outcome) in outcomes.iter().enumerate().take(5) {
+    assert_eq!(*outcome, missing, "case {at}");
   }
   assert_eq!(outcomes[5], Outcome::Ok(Vec::new()));
   assert_eq!(outcomes[6], Outcome::Ok(Vec::new()));
@@ -602,61 +602,110 @@ fn wrong_kind_object_edges_to_existing_repository_objects_are_refused() {
   );
 }
 
-/// §4.17.2 "A push" (branch refs under `refs/heads/` must point to a commit, matching stock Git
-/// `refs.c` / `receive-pack.c`): do push non-commit targets (blob, tree, annotated tag — both in
-/// the incoming pack and already in the repository) to `refs/heads/*`, alongside valid branch
-/// commits and non-commit `refs/tags/*` refs, both non-atomic and `--atomic`, plus a branch delete.
-/// Expect: every non-delete `refs/heads/*` pointing to a non-commit is refused `failed to update
-/// ref` with Git's non-commit diagnostic and never judged; `--atomic` rolls back the entire batch
-/// with `atomic push failure`; valid branches, non-commit tags, and branch deletes succeed.
-#[test]
-fn branch_ref_pointing_to_non_commit_is_refused_atomic_and_non_atomic() {
-  let mut repository = Repo::default();
-  let existing_blob = repository.with(Kind::Blob, b"existing repo blob\n");
-  let existing_tree = repository.with(Kind::Tree, b"");
+/// Repository and pack fixture shared across non-commit branch refusal scenarios.
+struct NonCommitBranchFixture {
+  /// Repository holding pre-existing blob and tree objects.
+  repository: Repo,
+  /// Pre-existing blob id in `repository`.
+  existing_blob: ObjectId,
+  /// Pre-existing tree id in `repository`.
+  existing_tree: ObjectId,
+  /// Raw bytes of the incoming blob carried in `pack`.
+  pack_blob: &'static [u8],
+  /// Blob id in `pack`.
+  pack_blob_id: ObjectId,
+  /// Tree id in `pack`.
+  pack_tree_id: ObjectId,
+  /// Valid commit id in `pack`.
+  commit_id: ObjectId,
+  /// Annotated tag id in `pack`.
+  tag_id: ObjectId,
+  /// Pack carrying the blob, tree, commit, and annotated tag.
+  pack: Vec<u8>,
+}
 
-  let pack_blob = b"incoming pack blob\n";
-  let pack_blob_id = id_of(Kind::Blob, pack_blob);
-  let pack_tree = tree_entry("100644", "a", pack_blob_id);
-  let pack_tree_id = id_of(Kind::Tree, &pack_tree);
-  let commit = commit_text(pack_tree_id, &[]);
-  let commit_id = id_of(Kind::Commit, &commit);
-  let tag = tag_text(commit_id, "commit", "v1");
-  let tag_id = id_of(Kind::Tag, &tag);
+impl NonCommitBranchFixture {
+  /// Builds the pre-existing repository and incoming four-object pack.
+  fn new() -> Self {
+    let mut repository = Repo::default();
+    let existing_blob = repository.with(Kind::Blob, b"existing repo blob\n");
+    let existing_tree = repository.with(Kind::Tree, b"");
 
-  let pack = pack_of(&[
-    (Kind::Blob, pack_blob),
-    (Kind::Tree, &pack_tree),
-    (Kind::Commit, &commit),
-    (Kind::Tag, &tag),
-  ]);
+    let pack_blob = b"incoming pack blob\n";
+    let pack_blob_id = id_of(Kind::Blob, pack_blob);
+    let pack_tree = tree_entry("100644", "a", pack_blob_id);
+    let pack_tree_id = id_of(Kind::Tree, &pack_tree);
+    let commit = commit_text(pack_tree_id, &[]);
+    let commit_id = id_of(Kind::Commit, &commit);
+    let tag = tag_text(commit_id, "commit", "v1");
+    let tag_id = id_of(Kind::Tag, &tag);
 
-  // Non-atomic: bad branches refused, good branch and non-commit tags applied.
-  let commands: [(ObjectId, ObjectId, &[u8]); 8] = [
-    (zero(), commit_id, b"refs/heads/good"),
-    (zero(), pack_blob_id, b"refs/heads/blob-pack"),
-    (zero(), pack_tree_id, b"refs/heads/tree-pack"),
-    (zero(), tag_id, b"refs/heads/tag-pack"),
-    (zero(), existing_blob, b"refs/heads/blob-repo"),
-    (zero(), existing_tree, b"refs/heads/tree-repo"),
-    (zero(), pack_blob_id, b"refs/tags/blob-ok"),
-    (zero(), tag_id, b"refs/tags/v1"),
-  ];
-  let bytes = request(&[], &commands, b" report-status side-band-64k", &[], &pack);
-  let (outcomes, judged) = outcomes_hiding(&bytes, &repository, &NoneHidden);
-  assert_eq!(outcomes[0], Outcome::Ok(Vec::new()));
-  for at in 1..6 {
-    match &outcomes[at] {
-      Outcome::Ng(declined) => {
-        assert_eq!(declined.reason, b"failed to update ref", "case {at}");
-        let msg = declined.message.as_deref().unwrap_or_default();
-        assert!(
-          String::from_utf8_lossy(msg).contains("non-commit"),
-          "case {at}: {msg:?}"
-        );
-      }
-      other => panic!("case {at} should be refused, got {other:?}"),
+    let pack = pack_of(&[
+      (Kind::Blob, pack_blob),
+      (Kind::Tree, &pack_tree),
+      (Kind::Commit, &commit),
+      (Kind::Tag, &tag),
+    ]);
+    Self {
+      repository,
+      existing_blob,
+      existing_tree,
+      pack_blob,
+      pack_blob_id,
+      pack_tree_id,
+      commit_id,
+      tag_id,
+      pack,
     }
+  }
+}
+
+/// Asserts `outcome` was refused for `reason`.
+fn assert_outcome_reason(outcome: &Outcome, reason: &[u8]) {
+  match outcome {
+    Outcome::Ng(declined) => assert_eq!(declined.reason, reason),
+    other => panic!("expected refusal, got {other:?}"),
+  }
+}
+
+/// Asserts `outcome` at `case` was refused `failed to update ref` with Git's non-commit message.
+fn assert_non_commit_refusal(case: usize, outcome: &Outcome) {
+  match outcome {
+    Outcome::Ng(declined) => {
+      assert_eq!(declined.reason, b"failed to update ref", "case {case}");
+      let msg = declined.message.as_deref().unwrap_or_default();
+      assert!(
+        String::from_utf8_lossy(msg).contains("non-commit"),
+        "case {case}: {msg:?}"
+      );
+    }
+    other => panic!("case {case} should be refused, got {other:?}"),
+  }
+}
+
+/// Verifies non-atomic mixed pushes refuse non-commit branches while allowing commits and tags.
+fn assert_non_atomic_non_commit_branches(fixture: &NonCommitBranchFixture) {
+  let commands: [(ObjectId, ObjectId, &[u8]); 8] = [
+    (zero(), fixture.commit_id, b"refs/heads/good"),
+    (zero(), fixture.pack_blob_id, b"refs/heads/blob-pack"),
+    (zero(), fixture.pack_tree_id, b"refs/heads/tree-pack"),
+    (zero(), fixture.tag_id, b"refs/heads/tag-pack"),
+    (zero(), fixture.existing_blob, b"refs/heads/blob-repo"),
+    (zero(), fixture.existing_tree, b"refs/heads/tree-repo"),
+    (zero(), fixture.pack_blob_id, b"refs/tags/blob-ok"),
+    (zero(), fixture.tag_id, b"refs/tags/v1"),
+  ];
+  let bytes = request(
+    &[],
+    &commands,
+    b" report-status side-band-64k",
+    &[],
+    &fixture.pack,
+  );
+  let (outcomes, judged) = outcomes_hiding(&bytes, &fixture.repository, &NoneHidden);
+  assert_eq!(outcomes[0], Outcome::Ok(Vec::new()));
+  for (at, outcome) in outcomes.iter().enumerate().take(6).skip(1) {
+    assert_non_commit_refusal(at, outcome);
   }
   assert_eq!(outcomes[6], Outcome::Ok(Vec::new()));
   assert_eq!(outcomes[7], Outcome::Ok(Vec::new()));
@@ -668,68 +717,55 @@ fn branch_ref_pointing_to_non_commit_is_refused_atomic_and_non_atomic() {
       b"refs/tags/v1".to_vec(),
     ]
   );
+}
 
-  // Atomic push with incoming-pack blob on refs/heads/bad -> rolls back refs/heads/good too.
-  let atomic_pack_cmds: [(ObjectId, ObjectId, &[u8]); 2] = [
-    (zero(), commit_id, b"refs/heads/good"),
-    (zero(), pack_blob_id, b"refs/heads/bad"),
+/// Verifies an `--atomic` push pairing a valid branch with `bad_ref -> bad_target` rolls back.
+fn assert_atomic_non_commit_rolls_back(
+  fixture: &NonCommitBranchFixture,
+  bad_target: ObjectId,
+  bad_ref: &[u8],
+) {
+  let commands: [(ObjectId, ObjectId, &[u8]); 2] = [
+    (zero(), fixture.commit_id, b"refs/heads/good"),
+    (zero(), bad_target, bad_ref),
   ];
-  let atomic_bytes = request(&[], &atomic_pack_cmds, b" report-status atomic", &[], &pack);
-  let (atomic_outcomes, atomic_judged) = outcomes_hiding(&atomic_bytes, &repository, &NoneHidden);
-  assert_eq!(atomic_outcomes[0], refused_with(b"atomic push failure"));
-  assert!(matches!(
-    &atomic_outcomes[1],
-    Outcome::Ng(declined) if declined.reason == b"failed to update ref"
-  ));
-  assert!(atomic_judged.is_empty());
+  let bytes = request(&[], &commands, b" report-status atomic", &[], &fixture.pack);
+  let (outcomes, judged) = outcomes_hiding(&bytes, &fixture.repository, &NoneHidden);
+  assert_eq!(outcomes[0], refused_with(b"atomic push failure"));
+  assert_outcome_reason(&outcomes[1], b"failed to update ref");
+  assert!(judged.is_empty());
+}
 
-  // Atomic push with already-stored repository blob on refs/heads/bad -> rolls back too.
-  let atomic_repo_cmds: [(ObjectId, ObjectId, &[u8]); 2] = [
-    (zero(), commit_id, b"refs/heads/good"),
-    (zero(), existing_blob, b"refs/heads/bad-repo"),
-  ];
-  let atomic_repo_bytes = request(&[], &atomic_repo_cmds, b" report-status atomic", &[], &pack);
-  let (atomic_repo_outcomes, atomic_repo_judged) =
-    outcomes_hiding(&atomic_repo_bytes, &repository, &NoneHidden);
-  assert_eq!(
-    atomic_repo_outcomes[0],
-    refused_with(b"atomic push failure")
-  );
-  assert!(matches!(
-    &atomic_repo_outcomes[1],
-    Outcome::Ng(declined) if declined.reason == b"failed to update ref"
-  ));
-  assert!(atomic_repo_judged.is_empty());
-
-  // Deleting a branch whose old value was a blob must still be permitted.
+/// Verifies deleting an old non-commit branch succeeds and `funny refname` is not masked.
+fn assert_branch_delete_and_funny_refname_precedence(fixture: &NonCommitBranchFixture) {
   let delete_bytes = request(
     &[],
-    &[(existing_blob, zero(), b"refs/heads/old-bad")],
+    &[(fixture.existing_blob, zero(), b"refs/heads/old-bad")],
     b" report-status",
     &[],
     &[],
   );
-  let (delete_outcomes, delete_judged) = outcomes_hiding(&delete_bytes, &repository, &NoneHidden);
+  let (delete_outcomes, delete_judged) =
+    outcomes_hiding(&delete_bytes, &fixture.repository, &NoneHidden);
   assert_eq!(delete_outcomes, [Outcome::Ok(Vec::new())]);
   assert_eq!(delete_judged, [b"refs/heads/old-bad".to_vec()]);
 
-  // A funny branch refname pointing to a blob must still report `funny refname` (not masked).
   let funny_bytes = request(
     &[],
-    &[(zero(), pack_blob_id, b"refs/heads/a..b")],
+    &[(zero(), fixture.pack_blob_id, b"refs/heads/a..b")],
     b" report-status",
     &[],
-    &pack,
+    &fixture.pack,
   );
-  let (funny_outcomes, funny_judged) = outcomes_hiding(&funny_bytes, &repository, &NoneHidden);
-  assert!(matches!(
-    &funny_outcomes[0],
-    Outcome::Ng(declined) if declined.reason == b"funny refname"
-  ));
+  let (funny_outcomes, funny_judged) =
+    outcomes_hiding(&funny_bytes, &fixture.repository, &NoneHidden);
+  assert_outcome_reason(&funny_outcomes[0], b"funny refname");
   assert!(funny_judged.is_empty());
+}
 
-  // Wrong-kind edge deep in a pushed chain (tag -> commit -> root tree -> dir `40000` -> blob)
-  // propagates back to the ref tip and rejects it.
+/// Verifies a wrong-kind edge deep in `tag -> commit -> root tree -> dir 40000 -> blob` rejects
+/// the pushed ref tip.
+fn assert_deep_wrong_kind_chain_refused(pack_blob_id: ObjectId, pack_blob: &[u8]) {
   let deep_bad_sub = tree_entry("40000", "leaf", pack_blob_id);
   let deep_bad_sub_id = id_of(Kind::Tree, &deep_bad_sub);
   let deep_root = tree_entry("40000", "nested", deep_bad_sub_id);
@@ -756,51 +792,90 @@ fn branch_ref_pointing_to_non_commit_is_refused_atomic_and_non_atomic() {
   assert!(deep_judged.is_empty());
 }
 
-/// §4.17.2 "A push" (let-go pack window during `Walk` and `Stage::BranchTargets`):
-/// do wrap a repository whose `kind` lookup returns `None` with `away() == Some(offset)` on the
-/// first probe, then bring the window back and retry `Session::check_turn`.
-/// Expect: both connectivity edge-kind checks and `refs/heads/*` branch-target checks pause on the
-/// first turn (`Ok(false)` with `away().is_some()`), then after bring-back complete with exact
-/// accept/refuse outcomes (no premature `missing necessary objects` or false non-commit refusal).
+/// §4.17.2 "A push" (branch refs under `refs/heads/` must point to a commit, matching stock Git
+/// `refs.c` / `receive-pack.c`): do push non-commit targets (blob, tree, annotated tag — both in
+/// the incoming pack and already in the repository) to `refs/heads/*`, alongside valid branch
+/// commits and non-commit `refs/tags/*` refs, both non-atomic and `--atomic`, plus a branch delete.
+/// Expect: every non-delete `refs/heads/*` pointing to a non-commit is refused `failed to update
+/// ref` with Git's non-commit diagnostic and never judged; `--atomic` rolls back the entire batch
+/// with `atomic push failure`; valid branches, non-commit tags, and branch deletes succeed.
 #[test]
-fn away_repository_kind_pauses_walk_and_branch_target_check_until_brought_back() {
-  struct AwayRepo<'a> {
-    inner: &'a Repo,
-    evicted: std::cell::Cell<Option<ObjectId>>,
-    away: std::cell::Cell<Option<u64>>,
-    pauses: std::cell::Cell<usize>,
+fn branch_ref_pointing_to_non_commit_is_refused_atomic_and_non_atomic() {
+  let fixture = NonCommitBranchFixture::new();
+  assert_non_atomic_non_commit_branches(&fixture);
+  assert_atomic_non_commit_rolls_back(&fixture, fixture.pack_blob_id, b"refs/heads/bad");
+  assert_atomic_non_commit_rolls_back(&fixture, fixture.existing_blob, b"refs/heads/bad-repo");
+  assert_branch_delete_and_funny_refname_precedence(&fixture);
+  assert_deep_wrong_kind_chain_refused(fixture.pack_blob_id, fixture.pack_blob);
+}
+
+/// Test repository wrapper whose `kind` lookup simulates one let-go pack window until brought back.
+struct AwayRepo<'a> {
+  /// Underlying in-memory repository.
+  inner: &'a Repo,
+  /// Object id whose `kind` lookup reports an away window.
+  evicted: std::cell::Cell<Option<ObjectId>>,
+  /// Synthetic offset reported by `away()` when an evicted id is probed.
+  away: std::cell::Cell<Option<u64>>,
+  /// Number of times `kind` paused on the evicted id.
+  pauses: std::cell::Cell<usize>,
+}
+
+impl<'a> AwayRepo<'a> {
+  /// Wraps `inner` with `evicted` initially reported as away.
+  fn new(inner: &'a Repo, evicted: ObjectId) -> Self {
+    Self {
+      inner,
+      evicted: std::cell::Cell::new(Some(evicted)),
+      away: std::cell::Cell::new(None),
+      pauses: std::cell::Cell::new(0),
+    }
   }
 
-  impl crate::receive::Repository for AwayRepo<'_> {
-    fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
-      self.inner.object(id)
-    }
+  /// Clears the simulated eviction so subsequent probes succeed.
+  fn bring_back(&self) {
+    self.evicted.set(None);
+    self.away.set(None);
+  }
+}
 
-    fn holds(&self, id: &ObjectId) -> bool {
-      self.inner.holds(id)
-    }
-
-    fn kind(&self, id: &ObjectId) -> Option<Kind> {
-      if self.evicted.get() == Some(*id) {
-        self.away.set(Some(42));
-        self.pauses.set(self.pauses.get() + 1);
-        return None;
-      }
-      self.away.set(None);
-      self.inner.kind(id)
-    }
-
-    fn away(&self) -> Option<u64> {
-      self.away.get()
-    }
+impl crate::receive::Repository for AwayRepo<'_> {
+  fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+    self.inner.object(id)
   }
 
-  let mut base = Repo::default();
-  let repo_tree = base.with(Kind::Tree, b"");
-  let repo_commit = base.with(Kind::Commit, &commit_text(repo_tree, &[]));
-  let repo_blob = base.with(Kind::Blob, b"not a commit\n");
+  fn holds(&self, id: &ObjectId) -> bool {
+    self.inner.holds(id)
+  }
 
-  // 1. Walk pauses when `repository.kind` hits a let-go window for a commit parent, then succeeds.
+  fn kind(&self, id: &ObjectId) -> Option<Kind> {
+    if self.evicted.get() == Some(*id) {
+      self.away.set(Some(42));
+      self.pauses.set(self.pauses.get() + 1);
+      return None;
+    }
+    self.away.set(None);
+    self.inner.kind(id)
+  }
+
+  fn away(&self) -> Option<u64> {
+    self.away.get()
+  }
+}
+
+/// Asserts `repo` paused on its evicted object at the synthetic away offset.
+fn assert_paused_away(repo: &AwayRepo<'_>) {
+  assert_eq!(repo.away.get(), Some(42));
+  assert!(repo.pauses.get() > 0);
+}
+
+/// Verifies `Walk` pauses when `repository.kind` hits a let-go window for a commit parent and
+/// resumes cleanly after bring-back.
+fn assert_walk_pauses_and_resumes_on_away_kind(
+  base: &Repo,
+  repo_tree: ObjectId,
+  repo_commit: ObjectId,
+) {
   let child_commit = commit_text(repo_tree, &[repo_commit]);
   let child_commit_id = id_of(Kind::Commit, &child_commit);
   let pack = pack_of(&[(Kind::Commit, &child_commit)]);
@@ -811,12 +886,7 @@ fn away_repository_kind_pauses_walk_and_branch_target_check_until_brought_back()
     &[],
     &pack,
   );
-  let repo = AwayRepo {
-    inner: &base,
-    evicted: std::cell::Cell::new(Some(repo_commit)),
-    away: std::cell::Cell::new(None),
-    pauses: std::cell::Cell::new(0),
-  };
+  let repo = AwayRepo::new(base, repo_commit);
   let mut session = crate::receive::Session::new(&ADVERTISED, NoneHidden);
   let mut admission = unbounded();
   assert_eq!(session.input(&bytes, &repo, &mut admission), Ok(true));
@@ -840,11 +910,8 @@ fn away_repository_kind_pauses_walk_and_branch_target_check_until_brought_back()
     Ok(false),
     "walk must pause when repository.kind reports a let-go window"
   );
-  assert_eq!(repo.away.get(), Some(42));
-  assert!(repo.pauses.get() > 0);
-  // Bring window back and retry.
-  repo.evicted.set(None);
-  repo.away.set(None);
+  assert_paused_away(&repo);
+  repo.bring_back();
   assert_eq!(
     session.check_turn(
       &repo,
@@ -855,8 +922,15 @@ fn away_repository_kind_pauses_walk_and_branch_target_check_until_brought_back()
   );
   let checked = session.checked().expect("checked after bring-back");
   assert_eq!(checked.early, [None]);
+}
 
-  // 2. Stage::BranchTargets pauses when `refs/heads/*` targets a repo object whose kind is away.
+/// Verifies `Stage::BranchTargets` pauses when `refs/heads/*` targets an evicted repo object and
+/// completes with exact accept/refuse outcomes after bring-back.
+fn assert_branch_targets_pause_and_resume_on_away_kind(
+  base: &Repo,
+  repo_commit: ObjectId,
+  repo_blob: ObjectId,
+) {
   let ref_bytes = request(
     &[],
     &[
@@ -867,12 +941,7 @@ fn away_repository_kind_pauses_walk_and_branch_target_check_until_brought_back()
     &[],
     &[],
   );
-  let repo2 = AwayRepo {
-    inner: &base,
-    evicted: std::cell::Cell::new(Some(repo_commit)),
-    away: std::cell::Cell::new(None),
-    pauses: std::cell::Cell::new(0),
-  };
+  let repo2 = AwayRepo::new(base, repo_commit);
   let mut checking = {
     let mut reader = crate::receive::RequestReader::new(&ADVERTISED);
     reader.read(&ref_bytes, &mut unbounded()).unwrap();
@@ -880,6 +949,7 @@ fn away_repository_kind_pauses_walk_and_branch_target_check_until_brought_back()
   };
   let empty_held = crate::unpack::Held::default();
   let mut adm2 = unbounded();
+  let mut stopped = crate::receive::connect::Stopped;
   assert_eq!(
     checking.turn(
       (&repo2, &empty_held),
@@ -889,10 +959,8 @@ fn away_repository_kind_pauses_walk_and_branch_target_check_until_brought_back()
     Ok(false),
     "BranchTargets must pause when repository.kind reports a let-go window"
   );
-  assert_eq!(repo2.away.get(), Some(42));
-  assert!(repo2.pauses.get() > 0);
-  repo2.evicted.set(None);
-  repo2.away.set(None);
+  assert_paused_away(&repo2);
+  repo2.bring_back();
   assert_eq!(
     checking.turn(
       (&repo2, &empty_held),
@@ -905,8 +973,24 @@ fn away_repository_kind_pauses_walk_and_branch_target_check_until_brought_back()
     .checked((&repo2, &empty_held), &NoneHidden, &mut adm2)
     .unwrap();
   assert_eq!(checked2.early[0], None);
-  assert!(matches!(
-    &checked2.early[1],
-    Some(Outcome::Ng(declined)) if declined.reason == b"failed to update ref"
-  ));
+  let bad_outcome = checked2.early[1]
+    .as_ref()
+    .expect("bad-repo must be refused");
+  assert_outcome_reason(bad_outcome, b"failed to update ref");
+}
+
+/// §4.17.2 "A push" (let-go pack window during `Walk` and `Stage::BranchTargets`):
+/// do wrap a repository whose `kind` lookup returns `None` with `away() == Some(offset)` on the
+/// first probe, then bring the window back and retry `Session::check_turn`.
+/// Expect: both connectivity edge-kind checks and `refs/heads/*` branch-target checks pause on the
+/// first turn (`Ok(false)` with `away().is_some()`), then after bring-back complete with exact
+/// accept/refuse outcomes (no premature `missing necessary objects` or false non-commit refusal).
+#[test]
+fn away_repository_kind_pauses_walk_and_branch_target_check_until_brought_back() {
+  let mut base = Repo::default();
+  let repo_tree = base.with(Kind::Tree, b"");
+  let repo_commit = base.with(Kind::Commit, &commit_text(repo_tree, &[]));
+  let repo_blob = base.with(Kind::Blob, b"not a commit\n");
+  assert_walk_pauses_and_resumes_on_away_kind(&base, repo_tree, repo_commit);
+  assert_branch_targets_pause_and_resume_on_away_kind(&base, repo_commit, repo_blob);
 }
