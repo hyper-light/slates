@@ -882,10 +882,11 @@ fn assert_funny_refname_precedes_df_conflict(fixture: &SingleCommitFixture) {
 /// §4.17.2 "A push" (cross-push D/F ref namespace conflicts against pre-existing refs, including
 /// delete-then-create replacement and atomic rollback): do test `refs_conflict` boundary cases,
 /// existing `refs/heads/topic` vs creating `refs/heads/topic/docs` (and vice versa), atomic
-/// delete-then-create allowed, partial delete of multi-child directory refused, full delete of
-/// multi-child directory allowed, and non-atomic delete-then-create (both succeeding and when the
-/// delete is declined). Expect: every post-batch D/F conflict is rejected (rolling back `--atomic`
-/// batches cleanly), while clean replacements and non-conflicting names succeed.
+/// delete-then-create refused (matching stock Git 2.56.1), partial and full atomic delete+create
+/// of a multi-child directory refused, non-atomic full delete+create allowed, hidden-ref
+/// redaction, and `funny refname` precedence. Expect: every post-batch D/F conflict is rejected
+/// (rolling back `--atomic` batches cleanly), while clean non-atomic replacements and
+/// non-conflicting names succeed.
 #[test]
 fn cross_push_df_ref_namespace_conflicts_and_delete_replace() {
   assert_refs_conflict_boundaries();
@@ -896,4 +897,226 @@ fn cross_push_df_ref_namespace_conflicts_and_delete_replace() {
   assert_non_atomic_cross_push_df_and_replace(&fixture);
   assert_hidden_ref_conflict_redacts_name(&fixture);
   assert_funny_refname_precedes_df_conflict(&fixture);
+}
+
+/// Shape: batch sizes tested for cooperative atomic D/F validation (`atomic-step.rs` repro).
+const COOPERATIVE_ATOMIC_COUNTS: [usize; 4] = [1, 8, 32, 128];
+
+/// A judge counting `ref_conflict`, `judge`, and `append_atomic` calls per
+/// [`crate::receive::Deciding::step`] while enforcing D/F checks against `existing` refs.
+#[derive(Default)]
+struct CountingAtomicJudge {
+  /// Pre-existing repository ref names checked by `ref_conflict`.
+  existing: std::collections::BTreeSet<Vec<u8>>,
+  /// Total `ref_conflict` invocations observed so far.
+  ref_conflict_calls: std::cell::Cell<usize>,
+  /// Total `judge` invocations observed so far.
+  judge_calls: usize,
+  /// Total `append_atomic` invocations observed so far.
+  atomic_appends: usize,
+}
+
+impl Judge for CountingAtomicJudge {
+  type Accepted = ();
+
+  fn ref_conflict(&self, name: &[u8], deleted: &[&[u8]]) -> Option<crate::receive::RefConflict> {
+    self
+      .ref_conflict_calls
+      .set(self.ref_conflict_calls.get() + 1);
+    self
+      .existing
+      .iter()
+      .find(|existing| {
+        !deleted.contains(&existing.as_slice())
+          && crate::receive::refs_conflict(existing.as_slice(), name)
+      })
+      .map(|existing| crate::receive::RefConflict::Visible(existing.clone()))
+  }
+
+  fn judge(&mut self, _command: &Command, _pushed: &Pushed<'_>) -> Result<(), Declined> {
+    self.judge_calls += 1;
+    Ok(())
+  }
+
+  fn append(&mut self, _command: &Command, (): ()) -> Result<Vec<Reported>, Declined> {
+    Ok(Vec::new())
+  }
+
+  fn append_atomic(
+    &mut self,
+    accepted: Vec<(&Command, ())>,
+  ) -> Result<Vec<Vec<Reported>>, Declined> {
+    self.atomic_appends += 1;
+    Ok(vec![Vec::new(); accepted.len()])
+  }
+}
+
+/// Drives an atomic `commands` batch through [`crate::receive::Deciding::step`] one step at a
+/// time, returning `(outcomes, first_step_df_calls, max_step_df_calls, max_step_judge_calls)`.
+fn drive_atomic_steps(
+  commands: Vec<Command>,
+  judge: &mut CountingAtomicJudge,
+) -> (Vec<Outcome>, usize, usize, usize) {
+  let empty_pack_trailer = ObjectId::from_hex(
+    ObjectFormat::Sha1,
+    b"029d08823bd8a8eab510ad6ac75c823cfd3ed31e",
+  )
+  .unwrap();
+  let mut repo = Repo::default();
+  let _ = repo.with(Kind::Blob, b"fixture");
+  let request = crate::receive::Request {
+    format: ObjectFormat::Sha1,
+    commands,
+    shallow: Vec::new(),
+    options: Vec::new(),
+    requested: crate::receive::Requested {
+      atomic: true,
+      ..Default::default()
+    },
+  };
+  let mut admission = unbounded();
+  let checked = crate::receive::check(
+    request,
+    Some(Ok(crate::unpack::Kept {
+      objects: Vec::new(),
+      checksum: empty_pack_trailer,
+    })),
+    (&repo, &crate::unpack::Held::default()),
+    &NoneHidden,
+    &mut admission,
+  )
+  .unwrap();
+  let mut deciding = crate::receive::Deciding::new(checked, &mut admission).unwrap();
+  let mut first_step_df = 0;
+  let mut max_step_df = 0;
+  let mut max_step_judge = 0;
+  let mut step_index = 0usize;
+  loop {
+    let df_before = judge.ref_conflict_calls.get();
+    let judge_before = judge.judge_calls;
+    let done = deciding.step(None, judge, &mut admission).unwrap();
+    let df_delta = judge.ref_conflict_calls.get() - df_before;
+    let judge_delta = judge.judge_calls - judge_before;
+    if step_index == 0 {
+      first_step_df = df_delta;
+    }
+    max_step_df = max_step_df.max(df_delta);
+    max_step_judge = max_step_judge.max(judge_delta);
+    step_index += 1;
+    if done {
+      break;
+    }
+  }
+  (
+    deciding.received().outcomes,
+    first_step_df,
+    max_step_df,
+    max_step_judge,
+  )
+}
+
+/// Verifies one atomic batch of `count` sibling tags stays O(1) namespace and verdict calls per
+/// step and commits atomically.
+fn assert_cooperative_atomic_batch(blob: ObjectId, count: usize) {
+  let commands = (0..count)
+    .map(|index| Command {
+      old: zero(),
+      new: blob,
+      name: format!("refs/tags/v{index:03}").into_bytes(),
+    })
+    .collect();
+  let mut judge = CountingAtomicJudge::default();
+  let (outcomes, first_df, max_df, max_judge) = drive_atomic_steps(commands, &mut judge);
+  assert_eq!(
+    (
+      first_df <= 1,
+      max_df <= 1,
+      max_judge <= 1,
+      judge.ref_conflict_calls.get(),
+      judge.judge_calls,
+      judge.atomic_appends,
+      outcomes,
+    ),
+    (
+      true,
+      true,
+      true,
+      count,
+      count,
+      1,
+      vec![Outcome::Ok(Vec::new()); count],
+    ),
+    "refs={count}: first_df={first_df}, max_df={max_df}, max_judge={max_judge}"
+  );
+}
+
+/// Verifies one two-command conflicting atomic batch fails atomically on command 1 with at most
+/// one namespace check per step and zero verdicts or appends.
+fn assert_cooperative_atomic_df_refusal(
+  commands: Vec<Command>,
+  existing: &[&[u8]],
+  expected_needle: &str,
+) {
+  let mut judge = CountingAtomicJudge {
+    existing: existing.iter().map(|name| name.to_vec()).collect(),
+    ..CountingAtomicJudge::default()
+  };
+  let (outcomes, first_df, max_df, _) = drive_atomic_steps(commands, &mut judge);
+  assert_eq!(
+    (
+      first_df <= 1,
+      max_df <= 1,
+      judge.judge_calls,
+      judge.atomic_appends,
+      &outcomes[0],
+    ),
+    (true, true, 0, 0, &refused(ATOMIC_FAILURE, None))
+  );
+  assert_declined_with_message(&outcomes[1], FAILED_TO_UPDATE, expected_needle);
+}
+
+/// §4.3 & §4.17.2 (cooperative shard step bounds on atomic D/F validation; repro `atomic-step.rs`):
+/// do step 1, 8, 32, and 128 valid atomic sibling tags plus intra-batch and existing-ref
+/// delete+create D/F conflict batches through [`crate::receive::Deciding::step`]. Expect: step 1
+/// and every subsequent step invoke `Judge::ref_conflict` at most once (`<= 1`), every step runs
+/// at most one `Judge::judge`, valid sibling batches commit atomically, and D/F conflicts roll
+/// back atomically before any verdict.
+#[test]
+fn atomic_df_validation_steps_one_command_per_deciding_step() {
+  let blob = name_of(ObjectFormat::Sha1, Kind::Blob, b"fixture").unwrap();
+  for count in COOPERATIVE_ATOMIC_COUNTS {
+    assert_cooperative_atomic_batch(blob, count);
+  }
+  assert_cooperative_atomic_df_refusal(
+    vec![
+      Command {
+        old: zero(),
+        new: blob,
+        name: b"refs/tags/v000".to_vec(),
+      },
+      Command {
+        old: zero(),
+        new: blob,
+        name: b"refs/tags/v000/child".to_vec(),
+      },
+    ],
+    &[],
+    "'refs/tags/v000' exists",
+  );
+  assert_cooperative_atomic_df_refusal(
+    vec![
+      Command {
+        old: blob,
+        new: zero(),
+        name: b"refs/tags/topic".to_vec(),
+      },
+      Command {
+        old: zero(),
+        new: blob,
+        name: b"refs/tags/topic/child".to_vec(),
+      },
+    ],
+    &[b"refs/tags/topic"],
+    "'refs/tags/topic' exists",
+  );
 }

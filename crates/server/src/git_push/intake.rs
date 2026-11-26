@@ -85,6 +85,7 @@ impl<'s> TrackedIndexed<'s> {
 
 impl Repository for TrackedIndexed<'_> {
   fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+    clear_waiting(self.repository);
     self.indexed.object(id)
   }
 
@@ -93,6 +94,7 @@ impl Repository for TrackedIndexed<'_> {
   }
 
   fn kind(&self, id: &ObjectId) -> Option<Kind> {
+    clear_waiting(self.repository);
     self.indexed.kind(id)
   }
 
@@ -123,6 +125,7 @@ impl Repository for Intake<'_> {
   }
 
   fn kind(&self, id: &ObjectId) -> Option<Kind> {
+    clear_waiting(self.quarantined.repository);
     self.indexed.kind(id)
   }
 
@@ -241,4 +244,81 @@ pub(super) fn admit_queued(
     admission.release(hold);
   }
   admitted
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use slates_git::object_name::ObjectFormat;
+
+  /// Shape: small in-memory content store budget for intake unit tests.
+  const TEST_BUDGET: u64 = 1 << 20;
+  /// Shape: small window size for intake unit tests.
+  const TEST_WINDOW: usize = 4096;
+  /// Shape: synthetic pack length for stale wait tests.
+  const STALE_PACK_LEN: u64 = 128;
+  /// Shape: synthetic byte offset for stale wait tests.
+  const STALE_WAIT_OFFSET: u64 = 16;
+  /// Format: synthetic 20-byte SHA-1 object id absent from the empty test repository.
+  const MISSING_SHA1_BYTES: [u8; 20] = [0x5a; 20];
+
+  /// Plants a stale let-go window wait on `repository`.
+  fn plant_stale_wait(repository: &GitRepository) {
+    repository.wait_for(Waited {
+      pack: ContentId::of(b"stale-pack"),
+      len: STALE_PACK_LEN,
+      offset: STALE_WAIT_OFFSET,
+    });
+  }
+
+  /// §4.17.2 (push intake let-go wait hygiene): do plant a stale let-go window wait on the
+  /// repository and call `TrackedIndexed::kind`, `Intake::kind`, and `TrackedIndexed::object` for
+  /// a missing object. Expect: each lookup clears the stale wait so `Repository::away` reports
+  /// `None` instead of inheriting the earlier read's window.
+  #[test]
+  fn kind_and_object_clear_stale_waiting_window() {
+    let store = ContentStore::new(TEST_BUDGET, TEST_WINDOW).unwrap();
+    let repository = GitRepository::new(ObjectFormat::Sha1);
+    let missing = ObjectId::from_bytes(ObjectFormat::Sha1, &MISSING_SHA1_BYTES).unwrap();
+
+    let tracked = TrackedIndexed::new(&repository, &store, u64::MAX);
+    plant_stale_wait(&repository);
+    assert_eq!(
+      (
+        tracked.kind(&missing),
+        Repository::away(&tracked),
+        repository.peek_waiting(),
+      ),
+      (None, None, None)
+    );
+
+    plant_stale_wait(&repository);
+    assert_eq!(
+      (
+        tracked.object(&missing),
+        Repository::away(&tracked),
+        repository.peek_waiting(),
+      ),
+      (None, None, None)
+    );
+
+    let intake = Intake {
+      indexed: IndexedObjects::new(&repository, &store, u64::MAX),
+      quarantined: Quarantined {
+        push: None,
+        store: &store,
+        repository: &repository,
+      },
+      queue: BTreeMap::new(),
+    };
+    plant_stale_wait(&repository);
+    assert_eq!(
+      (
+        intake.kind(&missing),
+        Repository::away(&intake),
+        repository.peek_waiting(),
+      ),
+      (None, None, None)
+    );
+  }
 }

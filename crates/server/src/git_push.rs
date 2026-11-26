@@ -547,30 +547,29 @@ impl<P> ReceivePack<P> {
 
   /// Brings back and pins the let-go window the push's last turn met, if any, so concurrent
   /// fetches cannot evict it before the push's next turn.
-  pub(crate) async fn bring_back_waited(&mut self) -> bool {
-    let first =
-      crate::vcs_store::upload::brought_back_waited_into(self.repository, &mut self.resident).await;
-    if !first {
-      return false;
+  pub(crate) async fn bring_back_waited(&mut self) {
+    if !crate::vcs_store::upload::brought_back_waited_into(self.repository, &mut self.resident)
+      .await
+    {
+      return;
     }
     // `brought_back_waited_into` drains a stopped background encoding before `Repository::waiting`;
     // if an encoding consumed the first call while this push's own let-go window is still noted on
     // the repository, drain it now so the next turn finds its window resident and pinned.
-    let still_waiting = crate::state::with_state(|state| {
+    match crate::state::with_state(|state| {
       state
         .vcs_stores
         .git_ref(self.repository)
         .and_then(|(_, store)| store.repository.peek_waiting())
-        .is_some()
-    })
-    .unwrap_or(false);
-    if still_waiting {
-      let drained_second =
-        crate::vcs_store::upload::brought_back_waited_into(self.repository, &mut self.resident)
-          .await;
-      return first || drained_second;
+    }) {
+      Some(Some(_waited)) => {
+        let _brought_back =
+          crate::vcs_store::upload::brought_back_waited_into(self.repository, &mut self.resident)
+            .await;
+      }
+      Some(None) => {}
+      None => {}
     }
-    first
   }
 
   /// Whether the client asked its answer multiplexed (`side-band-64k`), once its request is read.
