@@ -3306,8 +3306,11 @@
 > (0.97x and 0.99x; 195 files and 813 KB at b2888af84), each class's bytes and every chunk kind's count stock's. Held by
 > `a_rendered_revlog_stores_its_chunks_and_inlines_as_7_2_does` (red: no `revlog-compression-zstd`, every chunk `u`),
 > `every_stock_chunk_decodes_and_a_zstd_stores_chunks_encode_byte_for_byte` (stock's own zstd chunks re-encoded byte for
-> byte) and `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one` (stock `hg verify` clean, the
-> compression counters moving). Owed: the CPU of the two passes on hg-src and the 57k history (main's run), which w-hg's
+> byte) and `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one` (stock `hg verify` clean; the
+> compression counters moving until ruling (b), since which each stored chunk is copied as it lies: from 2026-11-26
+> (w-hg; main's hg_interop round at b8ba82ad3 read the three counters `[0, 0, 0]` before and after both clones, an
+> assertion stale since 3d9d08c9d) each clone's copy counted, `vcs_store.hg_stream_send_kept_bytes`, the compression's
+> counters unmoved). Owed: the CPU of the two passes on hg-src and the 57k history (main's run), which w-hg's
 > piece (b) removes by keeping each chunk in its stored form from arrival; and with it `Streaming::sized`, each log's
 > chunk lengths kept from the count to the send (4 bytes a revision, a few MB at the 57k's million revisions: the walk
 > holding more than its place, w-hg's review), which (b) deletes, the lengths then the places'. CLOSED (2026-11-25, w-interop; main's order):
