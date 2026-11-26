@@ -730,6 +730,24 @@
 > files): `made_commit.rs` (two calls), `vcs_store/svn_made.rs`, `vcs_store/hg_made.rs`, `greens.rs`'s own caller. A
 > probe of a wide made commit on each VCS would name any past the bar.
 
+> **Open (A-920's sweep, w-svn for main, 2026-11-26): four tests whose counts hold only in one load regime.** A test
+> that counts a step's units or turns against the shard's live quantum certifies nothing when the quantum moves. Each
+> of these is to be worked when it fails, by the 7c test's fix (the step takes its slice or budget as an argument, the
+> test chooses it, and the count is asserted from it; the model is `vcs_store/named_objects.rs`'s `read_step`):
+> - `image_pages.rs:1774`: it reads the live `copy_slice_bytes` and asserts it is past three pages ("or the test asks
+>   nothing"). That fails on a quiet shard with a small quantum, and the turns a slice takes move with it.
+> - `vcs_http/tests/daemon_edge.rs:5603` (`turns > 1`): the hg commit's let-go runs a turn until half the live
+>   quantum over 120 changesets' windows. A loaded quantum near 500 µs makes 250 µs turns, so it goes to one turn
+>   where every window lets go within that (release, likely).
+> - `vcs_store/svn_import/tests.rs:1019` (`slices >= 2`, w-svn's): `apply_slice` runs until the live
+>   `step_budget_ns`, against 400 revisions. It holds while their applies take more than the 500 µs ceiling: yes in
+>   debug, borderline in release.
+> - `refining/tests.rs:256` (`turns > 1`): the copy slice is `copy_slice_bytes_within(quantum / 2)`, live, against a
+>   fixed rewrite, and the refining pace is by the clock.
+> Not affected: `merge_origin.rs:2126` (a fixed chunk a unit of gathering already makes `units > chunks`) and
+> `daemon_edge.rs:5218` (the let-go's listing is a slice of its own, so `slices > 1` in any regime). Neither
+> certifies the live share's slicing.
+
 > **Held (A-928, w-svn, 2026-11-25; goal 93, 84a): a shard's step quantum stays under half the loaded bar.** The
 > quantum is the shard's wake estimate, and load grew it: A-920's release probe 5 read it at about 1.05 ms at load 38-56,
 > so every step that filled it passed 1 ms. It is now held to `STEP_QUANTUM_CEILING` (bar / 2, 500 µs), since a step is
@@ -2046,9 +2064,16 @@
 > line holding the same head eagerly: the same files and head identity), `an_owed_lines_build_dropped_mid_way_names_
 > nothing_and_is_made_again` (A-857's past-room drop: made once after one wait, its chain the debt alone), and the hg
 > crate's `a_lines_owed_push_materialized_is_the_eager_work_byte_for_byte`. Owed: (4) git's pushes (git/git's 1,027
-> refs) take the same slices once their driver hands its creates in (w-git's piece); a holder's replica of an owing
-> Mercurial line (`replica_build` lends no layout, so it is refused, counted); the release measure of a line's first
-> read on the 452-head history (main's).
+> refs) take the same slices once their driver hands its creates in (w-git's piece); the release measure of a line's
+> first read on the 452-head history (main's). The replica half CLOSED FOR AN EMPTY ROOT ONLY (same day): a holder's
+> replica of an owing line is laid out and lent as its owner's (`replica_build::laid_out`, through
+> `with_owed_push_objects`), held by `hg_push::tests::a_holders_replica_of_an_owed_line_is_made_and_reads_as_the_owners_line`
+> (red: made 0, refused 1) for a line made from `default`'s empty root. OPEN: a line made from a non-empty base, whose
+> source replica a test rebuilt from the owner's shipped records refused `merge.recompute_mismatch` (hg's named files).
+> A real holder meets it too: hg's texts are not homed for the region and its changeset segments are not replicated.
+> Main's ruling R (2026-11-26 ~09:55) homes the changeset through git's homing path and the A-727 barrier, the
+> record naming one homed segment list; w-hg's piece, with svn's holder red and an `#[ignore]`d fleet-takeover CLI test
+> for Mercurial, which no test drives yet.
 > Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
 > restart, `Unheld { 00manifest, rev }` (r915, Mercurial's own 57k history, rev 4222; here its first 5,000, rev 4281),
 > so the edge answered 503. The row named the empty window (a manifest whose text is its parent's, kept as an empty
@@ -3331,8 +3356,11 @@
 > (0.97x and 0.99x; 195 files and 813 KB at b2888af84), each class's bytes and every chunk kind's count stock's. Held by
 > `a_rendered_revlog_stores_its_chunks_and_inlines_as_7_2_does` (red: no `revlog-compression-zstd`, every chunk `u`),
 > `every_stock_chunk_decodes_and_a_zstd_stores_chunks_encode_byte_for_byte` (stock's own zstd chunks re-encoded byte for
-> byte) and `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one` (stock `hg verify` clean, the
-> compression counters moving). Owed: the CPU of the two passes on hg-src and the 57k history (main's run), which w-hg's
+> byte) and `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one` (stock `hg verify` clean; the
+> compression counters moving until ruling (b), since which each stored chunk is copied as it lies: from 2026-11-26
+> (w-hg; main's hg_interop round at b8ba82ad3 read the three counters `[0, 0, 0]` before and after both clones, an
+> assertion stale since 3d9d08c9d) each clone's copy counted, `vcs_store.hg_stream_send_kept_bytes`, the compression's
+> counters unmoved). Owed: the CPU of the two passes on hg-src and the 57k history (main's run), which w-hg's
 > piece (b) removes by keeping each chunk in its stored form from arrival; and with it `Streaming::sized`, each log's
 > chunk lengths kept from the count to the send (4 bytes a revision, a few MB at the 57k's million revisions: the walk
 > holding more than its place, w-hg's review), which (b) deletes, the lengths then the places'. CLOSED (2026-11-25, w-interop; main's order):

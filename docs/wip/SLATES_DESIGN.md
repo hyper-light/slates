@@ -64701,8 +64701,12 @@ GAPS.
   paced loops ran units past their deadline. Each now stops at it:
   - The preparation's hold hashed a content chunk a unit, up to 1 MiB (10.4 ms of one step, debug). It now hashes a
     copy slice a unit (`IncrementHold::chunk_hasher`, `merge_origin::inputs_extent_hashed`). Oracle:
-    `an_increment_held_a_slice_a_unit_names_the_inputs_held_whole` (the same inputs as `hold_increment`, in more units
-    than a hold that hashes a chunk a unit).
+    `an_increment_held_a_slice_a_unit_names_the_inputs_held_whole`, the same inputs as `hold_increment`. Since main's
+    finding of 2026-11-26, the hold takes its slice as an argument (`IncrementHold::unit`; the preparation passes
+    `copy_slice_bytes`), and the test passes a quarter chunk and asserts the exact count it makes, 15. Before, the
+    test read the shard's live copy slice: a loaded shard's slice is a chunk or more, so it took 8 units against
+    `> 8`, in w-hg's focused set at load 50-60. Red at 8 with a chunk's slice. The model is
+    `vcs_store/named_objects.rs`'s `read_step(&objects, slice)`.
   - The chain entry's encoding hashed the whole entry in its last unit (4.7 ms, debug). It now hashes what each unit
     writes (`chain_entry::Encoding::digest`). Oracle: `an_entry_encoded_a_unit_a_step_is_the_entry_encoded_whole`,
     unchanged.
@@ -64773,6 +64777,42 @@ GAPS.
     and move tests; red at 9,000 with a row a unit. Counter: `repository.svn_commit.recording_walk_units`.
   - After 9a (debug), the copy test's longest step is 14.2 ms (30-33 before) and the move test's 23.4 ms, now its
     build unit.
+  **9b, a deleted tree in the build a path a unit.** Named before the change (debug, the move test): the 20.2 ms build
+  unit was revision 3's last step. The `/trunk` Delete row (`Building::remove`, 13.7-14.4 ms) listed the green's
+  9,001 paths beneath it into `gone`; `engine.beneath` alone was 2.2 ms of that. Then, in the same unit, `finish`
+  made an Unlink or Rmdir op for each, 6.5-6.6 ms. Now a Delete row (`Building::remove_begin`) notes its own path and
+  lists the tree beneath, a unit, then notes it gone a path a unit (`Removing`, `gone_beneath_one`), the row ending
+  once its last path is. `Building::ends_some` then takes the restores and each gone path's op a unit each, before
+  `finish`'s tail. A replacement without history still notes its tree whole, since it remakes the node in the same
+  row (`replace`).
+  - Gauge: `repository.svn_commit.build_most_gone_a_unit`, the most gone paths one unit noted or made ops of. It is 1
+    in the move test, and 9,001 red with a Delete row noted whole.
+  - Oracle: `a_moves_build_a_unit_a_step_makes_the_green_its_build_whole_makes`. A move imported with every build
+    step spent after each unit, and with every build whole (`staging::BUILD_SPENT`), makes the same green, head and
+    identity. Planted bug, red: a step that stops inside a tree drops the rest (the import is refused).
+  - Move's commit steps were measured on revision 3 (`ImportBatch::stage_step`): reserve 12.3 ms in one call, judge
+    6.0 and 4.8, a committing step 8.3. They are inside `slates-merge`, to be named there next.
+  - Named inside `slates-merge` (debug, revision 3), kept on file until a release read says which leads:
+    - the reserve's `Green::copy_entry_room`, 11.6-11.8 ms: the whole increment resolved and its `copy_fixes` taken
+      in one call;
+    - the judge's `Resolved::finish_resolving`, 5.8 ms, and one `decide_some` unit, 4.9 ms;
+    - the commit's `Prep::Beginning` unit, 7.7-7.9 ms, twice.
+  **The phase tag** (main's order after release probe 12, where 9a moved copy's p50 by 4-7% and move's not at all, so
+  release's longest unit is not debug's). `svn_import::phase` is test support: each step of the import's history tags
+  its phase as it begins (`phase::tag`), as follows:
+  - `parse`, `owed`;
+  - `storing`, `storing.carried`;
+  - `stage.check`, `.identify`, `.build`, `.ready`, `.canonical`, `.bringing`, `.judge`, `.reserving`, `.judging`,
+    `.measuring`, `.committing`, `.recording`;
+  - `landing.place`, `.changeset`, `.unpin`, `.release`, `.prepare`, `.record`, `.apply`, `.identity`, `.tail_end`,
+    `.follow`, `.holds`, `.give_back`, `.purge`.
+
+  The history's poll timer (`cpu_timed`) charges each poll's time to the phases set in it, in order, by the wall and
+  by the thread's CPU. Each poll resumes in the phase its last one ended in, so the checkpoint task's polls on the same
+  thread are not the history's. The wide tests print the longest poll's spans:
+  `PHASES <test> wall_ns=<n> cpu_ns=<n> spans=<tag>:<wall_ns>:<cpu_ns>,...`. In debug: add's and copy's longest poll
+  was `storing.carried` (13.2 and 18.2 ms) and then `stage.bringing` (1.2 ms) in the same poll; move's was
+  `landing.tail_end` (21.7 ms) between brief `landing.identity` and `landing.follow` spans.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
@@ -65142,7 +65182,8 @@ Applied in the same change to:
   while held.
 - `crates/server/src/repository/push.rs`: a deferred create counts no miss; the record's version bytes counted most
   (`repository.push.entry_versions_bytes_most`).
-- `crates/server/src/replica_build.rs`: a holder lends no Mercurial layout yet (owed, GAPS).
+- `crates/server/src/replica_build.rs`: a holder's replica of an owing line laid out and lent as its owner's (`laid_out`,
+  `Turned::Asked`; the replica half, below); `begin`, the build `wanted` begins, apart from it.
 - GAPS (the landing spin's (2) and (3); A-812).
 
 - **Why.** A push of a history with many heads made each new line from the line it branched from at the version read
@@ -65184,6 +65225,10 @@ Applied in the same change to:
   `t_goal93_a_push_moving_many_heads_judges_their_works_ahead_of_its_landing_step` (the moved lines made through the
   door, then judged ahead), `daemon::tests::t_goal93_a_push_of_many_heads_lands_its_new_lines_outside_its_landing_step`,
   and the hg crate's oracle above.
-- **Owed.** A holder's replica of a Mercurial line that owes (`replica_build`): it lends no layout, so such a replica is
-  refused, counted; a takeover of an owing Mercurial line therefore needs its owner's build first. The release measure
-  of the first read's wait on the 452-head history (main's probe).
+- **The replica half** (same day, main's order): a holder's replica of a line that owes is made as its owner's line is.
+  `replica_build` lays the push's trees out before the build's first turn over the repository's store on the holder
+  (`laid_out`, `hg_push::owed_layout`, its store's replay waited for first), lends them each turn through
+  `with_owed_push_objects`, and brings a waited file text back from the changeset store. Red first:
+  `hg_push::tests::a_holders_replica_of_an_owed_line_is_made_and_reads_as_the_owners_line` (made 0, refused 1 before;
+  made 1, refused 0 after), its replica's files and head identity the owner's line's.
+- **Owed.** The release measure of the first read's wait on the 452-head history (main's probe).

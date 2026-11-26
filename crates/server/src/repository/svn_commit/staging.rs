@@ -372,7 +372,7 @@ fn prepare_some(
           None => PreparePhase::Encoding(encoding),
         }
       }
-      PreparePhase::Holding(encoded, mut hold) => match hold.unit(state, &encoded) {
+      PreparePhase::Holding(encoded, mut hold) => match hold.unit(state, (&encoded, chunk)) {
         Some(Ok(held)) => PreparePhase::Entry(
           held,
           slates_merge::chain_entry::encoding(held.inputs, staged.identity),
@@ -746,16 +746,45 @@ fn build_some_in(
         let BuildAt::Going(building) = at else {
           return Err(Uncommitted::NotHeld);
         };
-        let mut spent = || slates_rt::futures::now_ns() >= deadline;
-        Building::step(
+        let mut spent = || build_spent(slates_rt::futures::now_ns() >= deadline);
+        let stepped = Building::step(
           (records, engine, checked),
           building,
           &mut spent,
           (head, work_identity),
-        )
+        );
+        Ok((stepped, building.most_gone()))
       })
       .ok_or(Uncommitted::NotHeld)?
   })
+  .and_then(|(stepped, most_gone)| {
+    let most = state
+      .refusals
+      .entry(super::BUILD_MOST_GONE_A_UNIT)
+      .or_insert(0);
+    *most = (*most).max(most_gone);
+    stepped
+  })
+}
+
+/// Whether a build step's slice is spent ([`build_some_in`]): `by_clock`, but in the tests that take every build a unit a
+/// step or whole ([`BUILD_SPENT`]).
+fn build_spent(by_clock: bool) -> bool {
+  #[cfg(test)]
+  {
+    BUILD_SPENT.with(std::cell::Cell::get).unwrap_or(by_clock)
+  }
+  #[cfg(not(test))]
+  {
+    by_clock
+  }
+}
+
+#[cfg(test)]
+std::thread_local! {
+  /// Test support: every import build's step spent after each unit (`Some(true)`, a unit a step) or never (`Some(false)`,
+  /// the build whole in one step), whatever its clock says; none, by its clock (A-920 9b's oracle).
+  pub(crate) static BUILD_SPENT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// A revision's record's identity (`svn_commit::identity`), the record hashed a slice a step, each counted
@@ -763,6 +792,8 @@ fn build_some_in(
 /// of half its quantum at the machine's measured BLAKE3 rate (`DaemonConfig::archive_slice_bytes_within`, R3) until the
 /// step's clock passes its quantum, a slice at least. None where the shard's state is gone.
 async fn identified_in(record: &[u8]) -> Option<[u8; 32]> {
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("stage.identify");
   let mut hasher = blake3::Hasher::new_derive_key(super::IDENTITY_CONTEXT);
   let mut rest = record;
   loop {
@@ -808,6 +839,8 @@ pub(super) fn hash_some(
 /// canonical order ([`canonical_in`]), then the texts it names read (A-760), a copy slice a step, held as its post-state
 /// is. None where the shard's state is gone.
 async fn readied_in(mut built: Increment) -> Option<Result<Increment, Uncommitted>> {
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("stage.ready");
   built.doc = canonical_in(std::mem::take(&mut built.doc)).await?;
   loop {
     slates_rt::futures::yield_now().await;
@@ -827,6 +860,8 @@ async fn readied_in(mut built: Increment) -> Option<Result<Increment, Uncommitte
 /// a slice a step, each counted ([`STAGING_STEPS`]; A-920 piece 4a: 27 ms of the build step at 9,000 files, debug), a
 /// unit at least a step. None where the shard's state is gone.
 async fn canonical_in(doc: slates_merge::ops_doc::OpsDoc) -> Option<slates_merge::ops_doc::OpsDoc> {
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("stage.canonical");
   let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
   let mut canonical = core::pin::pin!(slates_merge::ops_doc::OpsDoc::canonicalized(doc));
   loop {
@@ -1052,6 +1087,8 @@ async fn checked_in(
   lent: u64,
   revision: Revision,
 ) -> Option<Result<(Checked, Vec<u8>), Uncommitted>> {
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("stage.check");
   let mut at = CheckAt::Begin(revision);
   let mut record = Vec::new();
   loop {
@@ -1421,6 +1458,8 @@ impl Staging {
       let Some(batch) = self.batch.as_mut() else {
         return Some(Err(Uncommitted::NotHeld));
       };
+      #[cfg(test)]
+      crate::vcs_store::svn_import::phase::tag("stage.build");
       let stepped = within_records(repository, lent, |state| {
         build_some_in(
           state,
@@ -1448,6 +1487,8 @@ impl Staging {
     lent: u64,
     (checked, record, built): (Checked, Vec<u8>, Increment),
   ) -> Option<Result<StagedIn, Uncommitted>> {
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("stage.judge");
     let growth = grown(&checked);
     let post = post_bytes(&built);
     let mut at = StagingAt::Judging(Box::new(built));
@@ -1547,6 +1588,8 @@ impl Staging {
     repository: RepositoryId,
     (recording, deadline): (&mut Recording, u64),
   ) -> Result<Option<StagedIn>, Uncommitted> {
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("stage.recording");
     let mut spent = || slates_rt::futures::now_ns() >= deadline;
     loop {
       match self.record_phase(state, repository, (recording, &mut spent))? {
@@ -1671,6 +1714,8 @@ impl Staging {
     &mut self,
     principal: &Principal,
   ) -> Option<Result<(crate::repository::push::RecordedBatch, (u64, u64)), Uncommitted>> {
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("landing.place");
     let repository = self.repository;
     let place = crate::state::with_state(|state| landing::landing_place(state, repository))?;
     let (disk, sequence) = match place {
@@ -1685,6 +1730,8 @@ impl Staging {
       Ok(prepared) => prepared,
       Err(refused) => return Some(Err(refused)),
     };
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("landing.record");
     let recorded = crate::state::with_state(|state| {
       self.record_landed(state, landed, principal, ((repository, sequence), prepared))
     })?;
@@ -1700,6 +1747,8 @@ impl Staging {
     // `store_tests::a_subversion_restart_replays_a_named_text_with_one_released_window`). A text a unit, a slice of the
     // shard's budget a step (A-920 6a: 9,000 texts unpinned in one step, 14.3 ms debug); a kill between slices leaves
     // texts unpinned whose changeset is durable, which is what the landing makes true.
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("landing.unpin");
     if landed {
       let pinned = std::mem::take(&mut self.pinned);
       let mut at = 0usize;
@@ -1711,6 +1760,8 @@ impl Staging {
     }
     // The scratch member let go a unit at a time before the append (A-920 6a: released whole in one step, 16.9 ms
     // debug at 9,000 files): landed or not, its batch commits or abandons next, and neither retires it again.
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("landing.release");
     let begun = crate::state::with_state(|state| {
       self
         .batch
@@ -1734,6 +1785,8 @@ impl Staging {
     &self,
     landed: &Result<(), Uncommitted>,
   ) -> Option<Result<Vec<crate::repository::push::Prepared>, Uncommitted>> {
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("landing.prepare");
     if landed.is_err() {
       return Some(Ok(Vec::new()));
     }
@@ -1750,6 +1803,8 @@ impl Staging {
     cause: Flush,
     (flushing, committing): (u64, u64),
   ) -> Option<()> {
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("landing.apply");
     let (applying, tailing) = apply_recorded(recorded).await?;
     self.land_tail(cause).await?;
     let ended = slates_rt::futures::now_ns();
@@ -1814,6 +1869,8 @@ impl Staging {
     disk: &slates_store::owner::StoreHandle,
     place: (RepositoryId, u64),
   ) -> (Result<(), Uncommitted>, u64, u64) {
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("landing.changeset");
     let records = std::mem::take(&mut self.records);
     #[cfg(test)]
     kill_at_stage_where_set(LandStage::BeforeChangeset).await;
@@ -1883,6 +1940,8 @@ impl Staging {
   /// tail in one step of 580 ms on a debug build): the green's held table follows the batch, then the batch's texts are
   /// given back and let go; then its landing turn given back. None where the shard's state is gone.
   async fn land_tail(&mut self, cause: Flush) -> Option<()> {
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("landing.identity");
     let green = self.green;
     // The green's identity brought to its head a slice of the shard's budget a step, counted, before the fold reads it
     // (A-910; goal 93: the fold brought 9,000 changed keys' identity to the head in one step of 482 ms, debug).
@@ -1891,12 +1950,16 @@ impl Staging {
       identity_some(state, green, slice_deadline_ns())
     })
     .await?;
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("landing.tail_end");
     crate::state::with_state(|state| {
       state.count(cause.counter(), 1);
       crate::vcs_store::svn_import::batch_landed(state, self.repository, (cause, self.bound));
       crate::merge_service::checkpoint_green_in_turns(state, green);
       super::fold_to_readers(state, green);
     })?;
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("landing.follow");
     let holding: Vec<(ContentIdentity, String)> = std::mem::take(&mut self.holding)
       .into_iter()
       .map(|(path, identity)| (identity, path))
@@ -1912,10 +1975,14 @@ impl Staging {
       )
     })
     .await?;
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("landing.holds");
     // The greens' pending holds applied a slice at a time before the first text is given back, so that free decision
     // applies none whole (A-920 7c: the batch's 9,000 named texts' holds, 7.8 ms of its first step, debug).
     until_done(|state| crate::vcs_store::name_holds::apply_some(state, slice_deadline_ns()))
       .await?;
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("landing.give_back");
     let mut at = 0usize;
     until_done(|state| {
       state.count(TAIL_SLICES, 1);
@@ -1927,6 +1994,8 @@ impl Staging {
     // purge never ran under it, and git-2000's let-go texts stayed resident as free pages, 204 MB of a 438 MB daemon).
     // The keep is the batch's own bound: a batch takes at most that before it lands, so pages kept past it are pages no
     // batch of this import refills (`texts_bound`).
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("landing.purge");
     let keep = usize::try_from(self.bound.bytes).unwrap_or(usize::MAX);
     until_done(|state| !give_back_past(state, keep)).await?;
     crate::state::with_state(|state| {
@@ -1973,6 +2042,8 @@ async fn brought_for_staging(
   repository: RepositoryId,
   revision: &Revision,
 ) -> Option<Result<BroughtForStaging, Uncommitted>> {
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("stage.bringing");
   let texts = match super::bring_stored(repository, &revision.record.changes).await? {
     Ok(brought) => brought,
     Err(refused) => return Some(Err(refused)),

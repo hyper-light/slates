@@ -414,6 +414,21 @@ pub(crate) async fn pushed_changegroup(id: RepositoryId, part: ChangegroupPart) 
   );
 }
 
+/// Bookmark `mark` pushed to repository `id` at `node` alone (a `bookmarks` part, as `hg push -B` sends one for a
+/// changeset the server holds): the push's answer.
+pub(crate) async fn pushed_bookmark(id: RepositoryId, mark: &[u8], node: Node) -> Outcome {
+  let unbundle = Unbundle {
+    parts: vec![taken(
+      0,
+      Asks::Bookmarks(vec![BookmarkAt {
+        name: mark.to_vec(),
+        node: Some(node),
+      }]),
+    )],
+  };
+  pushed_bytes_to(id, &bundled(&unbundle)).await
+}
+
 /// Mercurial repository `name` made on `daemon`'s first shard and `unbundle` pushed to it ([`pushed`]), from a task
 /// there, accepted: the repository.
 fn made_and_pushed_on(daemon: &crate::Daemon, name: &'static str, unbundle: Unbundle) -> Hg {
@@ -3329,4 +3344,128 @@ fn an_owed_lines_build_dropped_mid_way_names_nothing_and_is_made_again() {
         .all(|path| path == "a" || path == "b" || path == "c"),
     "{files:?}"
   );
+}
+
+/// A-929's replica half (main's order of 2026-11-26: P2 for Mercurial on a fleet). Do: push a root and two heads, the
+/// second a new line owing its push; make a holder's replica of that line as a holder's records make it (its source's
+/// replica at the version it was made from, the owner's shipped versions applied; the line branched there; the owner's shipped
+/// version 1, the line's owed push, applied, `merge_service::apply_inputs`), so the replica owes the push (the line made
+/// from `default`'s empty root, a holder's replica of which is an empty green; a base laid out is the owner's tests' same
+/// lend); begin its
+/// build as a holder does (`replica_build::begin`) and wait for it; then make the owner's line through the door. Expect:
+/// the replica made (`merge.replica_build.made` 1), none refused (`merge.replica_build.refused` 0), and its tree the
+/// owner's: the same files and head identity. Red before: refused, since a holder lent no Mercurial layout.
+#[test]
+fn a_holders_replica_of_an_owed_line_is_made_and_reads_as_the_owners_line() {
+  let commits: &'static [Commit] = &[
+    ("root", "a", b"alpha", None, "default"),
+    ("one", "b", b"beta", Some(0), "default"),
+    ("two", "c", b"gamma", Some(0), "default"),
+  ];
+  let made = history_of(commits);
+  let bundle = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0, 1, 2]);
+  let seen = crate::test_store::run_on_stored_shard(move || async move {
+    use crate::repository::svn_commit::tests::on;
+    let hg = Hg::made("replica-line").await;
+    let pushed = pushed_bytes_to(hg.repository, &bundle).await;
+    let line = on(|state| owing_lines(state, hg.repository))
+      .first()
+      .copied()
+      .expect("an owed line");
+    let key = crate::merge_service::replica_key(slates_db::register::ObjectId(line.bytes));
+    let owes = on(|state| {
+      let Some(slates_db::catalog::MemberOrigin::Branch { from, version }) = state
+        .db
+        .partition()
+        .repositories()
+        .member(line)
+        .map(|member| member.origin)
+      else {
+        return Err("no branch origin".to_owned());
+      };
+      // A push into the empty repository makes its new lines from `default` at version 0, its empty root: the line's
+      // version 0 is that root, so its replica there is a new green, as git's replica test makes one.
+      if version != 0 {
+        return Err(format!(
+          "the line made at {from:?}'s version {version}, not its root"
+        ));
+      }
+      state
+        .merge
+        .replicas
+        .put_back_any(&key, slates_merge::engine::Green::new());
+      let Some((inputs, _)) = crate::merge_service::shipped_for_test(state, line, 1) else {
+        return Err("no shipped record".to_owned());
+      };
+      let Some(mut replica) = state.merge.replicas.take_any(&key) else {
+        return Err("no replica".to_owned());
+      };
+      let applied = crate::merge_service::apply_inputs(&mut replica, &inputs, 1);
+      let owes = !replica.is_materialized();
+      state.merge.replicas.put_back_any(&key, replica);
+      match (applied, owes) {
+        (Ok(()), true) => Ok(()),
+        other => Err(format!("applied, owing: {other:?}")),
+      }
+    });
+    if let Err(why) = &owes {
+      return (
+        pushed,
+        Err(why.clone()),
+        (0, 0),
+        None,
+        (None, (Vec::new(), [0; 32])),
+      );
+    }
+    on(|state| {
+      crate::replica_build::begin(
+        state,
+        slates_db::register::ObjectId(line.bytes),
+        hg.repository,
+      )
+    });
+    let deadline = std::time::Instant::now() + NAMED_PATIENCE;
+    let counted = loop {
+      let counted = on(|state| {
+        let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        (
+          count(crate::replica_build::MADE),
+          count(crate::replica_build::REFUSED),
+        )
+      });
+      if counted != (0, 0) || std::time::Instant::now() > deadline {
+        break counted;
+      }
+      slates_rt::futures::yield_now().await;
+    };
+    let mut pinned = crate::green_ready::Pinned::default();
+    let owner_made = crate::green_ready::made_for(line, &mut pinned).await;
+    let reads = on(|state| {
+      let replica = state.merge.replicas.take_any(&key).map(|mut replica| {
+        let files: Vec<HeldFile> = replica
+          .files()
+          .map(|(path, content)| (path, content.digest()))
+          .collect();
+        let read = (files, replica.head_identity());
+        state.merge.replicas.put_back_any(&key, replica);
+        read
+      });
+      let owner = read_whole(state, line);
+      (replica, (owner.1, owner.2))
+    });
+    (pushed, owes, counted, owner_made, reads)
+  });
+  let (pushed, owes, (made, refused), owner_made, (replica, owner)) = seen;
+  assert!(matches!(pushed, Outcome::Accepted(_)), "{pushed:?}");
+  assert_eq!(owes, Ok(()), "the holder's replica owes the line's push");
+  assert_eq!((made, refused), (1, 0), "the replica made, none refused");
+  assert_eq!(owner_made, Some(true), "the owner's line made");
+  let replica = replica.expect("the replica");
+  assert_eq!(
+    replica.0.len(),
+    2,
+    "the root's file and the head's: {:?}",
+    replica.0
+  );
+  assert_eq!(replica, owner, "the replica's tree is the owner's");
 }

@@ -187,6 +187,11 @@ pub(crate) const COMPRESS_SEND_PLAIN_BYTES: &str = "vcs_store.hg_stream_compress
 /// stream gained. Format: a counter name in the status report.
 pub(crate) const COMPRESS_SEND_STORED_BYTES: &str =
   "vcs_store.hg_stream_compress_send_stored_bytes";
+/// Counter: the bytes of the chunks a stream's send pass copied as the changeset store keeps them, compressing nothing
+/// (goal 93, main's ruling (b): a place held as a revlog chunk is sent as it lies; `slates_hg::revlog_chunk::count_kept`).
+/// Against [`COMPRESS_SEND_PLAIN_BYTES`], the share of a stream the store kept as stock's chunks. Format: a counter name
+/// in the status report.
+pub(crate) const STREAM_SEND_KEPT_BYTES: &str = "vcs_store.hg_stream_send_kept_bytes";
 
 /// Counter: the nanoseconds a fetch's streamed answer spent inside its turns, summed (main's hg leg at 608930048: a
 /// 57k stream's 164 turns about 100 ms apart, its compression 1.6 s of 18 s; what a turn does, against what is between
@@ -262,6 +267,7 @@ pub(crate) fn turn_taken() {
       (COMPRESS_SEND_NS, chunks.send.ns),
       (COMPRESS_SEND_PLAIN_BYTES, chunks.send.plain_bytes),
       (COMPRESS_SEND_STORED_BYTES, chunks.send.stored_bytes),
+      (STREAM_SEND_KEPT_BYTES, chunks.kept.stored_bytes),
       (DECOMPRESS_NS, chunks.decode.ns),
       (DECOMPRESS_PLAIN_BYTES, chunks.decode.plain_bytes),
     ] {

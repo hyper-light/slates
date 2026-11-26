@@ -1,7 +1,7 @@
 //! Mercurial's pushes landed (A-657; §4.17.3 "Push" steps 3 to 7, decisions 1 to 3 and 6; A-641 part 3): a push's
 //! bundle, read and verified by slates-hg, placed by its classifier on the repository's lines and bookmarks (each a
 //! green of the repository's namespace), its race checks made positions the append compares (A-642), its phase roots
-//! moved in the same entry, one entry appended through A-635's [`RepositoryLogs::append`], its revisions kept in the
+//! moved in the same entry, one entry appended through A-635's [`push::RepositoryLogs::append`], its revisions kept in the
 //! repository's index once the entry commits, and its reply written as 7.2's server writes it.
 //!
 //! **The namespace (decided here).** A Mercurial repository's namespace holds two kinds of name, each its own range:
@@ -87,7 +87,7 @@ use slates_ipc::protocol::{DatabaseRefusal, Refusal};
 use slates_merge::engine::Increment;
 use slates_vcs::{ContentStore, IndexRefused};
 
-use super::push::{self, AppendRefused, BranchChange, ChangeRefusal, EntryParts, RepositoryLogs};
+use super::push::{self, AppendRefused, BranchChange, ChangeRefusal, EntryParts};
 #[cfg(unix)]
 use crate::hook_driver::{self, Launch};
 use crate::state::ShardState;
@@ -1279,7 +1279,14 @@ pub(crate) fn land(
     ..
   }) = forked
   else {
-    let appended = RepositoryLogs::append(state, principal, repository, changes, parts);
+    // A push bringing no changesets (`hg push -B` over changesets held) lands its creates made ahead too: their works
+    // were taken out of `changes` when they were planned.
+    let appended = push::push_unrecorded(
+      state,
+      (principal, repository),
+      (changes, &held_ahead, creates),
+      parts,
+    );
     return Landed {
       answer: appended
         .map(|_| Reply::accepted(&replied, wanted))
@@ -1310,7 +1317,12 @@ pub(crate) fn land(
       parts,
       record,
     ),
-    None => RepositoryLogs::append(state, principal, repository, changes, parts),
+    None => push::push_unrecorded(
+      state,
+      (principal, repository),
+      (changes, &held_ahead, creates),
+      parts,
+    ),
   };
   match appended {
     Ok(_) => Landed {

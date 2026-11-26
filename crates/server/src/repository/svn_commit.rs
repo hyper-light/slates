@@ -614,6 +614,8 @@ async fn stage_texts(
   revision: &mut Revision,
   imported: Vec<ContentIdentity>,
 ) -> Option<Result<(Storing, Vec<landing::LandedText>), Uncommitted>> {
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("storing");
   let texts = crate::state::with_state(|state| take_texts(state, repository, revision))?;
   // Taking the texts and beginning their put are steps of their own (goal 93).
   slates_rt::futures::yield_now().await;
@@ -655,6 +657,8 @@ async fn stage_texts(
     }
   }
   // The bytes are the content store's now, until the landing ends.
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("storing.carried");
   drop(texts);
   section_yield().await?;
   let carried = texts_carried(&revision.record.changes, &storing.put);
@@ -1653,6 +1657,24 @@ pub(crate) struct Stood {
   props: bool,
 }
 
+/// A deleted directory's tree being noted gone a path a unit ([`Building::remove_begin`], A-920 9b).
+#[derive(Debug, Default)]
+struct Removing {
+  /// The nodes beneath the place the directory stood, as the green held them, with whether each is a directory.
+  beneath: Vec<(String, bool)>,
+  /// The next of them to note.
+  next: usize,
+  /// The green path of the place it stood.
+  from: String,
+  /// The green path of the directory.
+  to: String,
+}
+
+/// Gauge: the most gone paths one unit of an increment's build noted or made ops of (A-920 9b), the shard's largest
+/// so far: one where a deleted tree is noted and removed a path a unit, its every path where a row or the build's end
+/// took them in one. Format: a counter name in the daemon's status report, its largest value.
+pub(crate) const BUILD_MOST_GONE_A_UNIT: &str = "repository.svn_commit.build_most_gone_a_unit";
+
 /// The increment under construction (module docs), as the deriver lays one out: paths interned, bytes in the post-state
 /// by offset, every operation node-exclusive.
 struct Building<'b> {
@@ -1684,6 +1706,10 @@ struct Building<'b> {
   plans: restore::CopyPlans,
   /// The green paths a copy from an older revision sets back, merged with the rows that change them, made at the end.
   restores: BTreeMap<String, restore::Restore>,
+  /// A deleted directory's tree being noted gone a path a unit (A-920 9b), where a step ended part-way through it.
+  removing: Option<Removing>,
+  /// The most gone paths one unit of the build noted or made ops of ([`BUILD_MOST_GONE_A_UNIT`]).
+  most_gone: u64,
 }
 
 /// A build's own state between its steps ([`Building::detach`]), without the records, the engine or the checked
@@ -1708,6 +1734,17 @@ pub(super) struct BuildState {
   plans: restore::CopyPlans,
   /// The green paths a copy from an older revision sets back.
   restores: BTreeMap<String, restore::Restore>,
+  /// A deleted directory's tree being noted gone.
+  removing: Option<Removing>,
+  /// The most gone paths one unit noted or made ops of.
+  most_gone: u64,
+}
+
+impl BuildState {
+  /// The most gone paths one unit of the build noted or made ops of so far ([`BUILD_MOST_GONE_A_UNIT`]).
+  pub(super) fn most_gone(&self) -> u64 {
+    self.most_gone
+  }
 }
 
 impl<'b> Building<'b> {
@@ -1723,6 +1760,8 @@ impl<'b> Building<'b> {
       gone: self.gone,
       plans: self.plans,
       restores: self.restores,
+      removing: self.removing,
+      most_gone: self.most_gone,
     }
   }
 
@@ -1744,6 +1783,8 @@ impl<'b> Building<'b> {
       gone: state.gone,
       plans: state.plans,
       restores: state.restores,
+      removing: state.removing,
+      most_gone: state.most_gone,
     }
   }
 
@@ -1766,6 +1807,8 @@ impl<'b> Building<'b> {
       gone: BTreeMap::new(),
       plans,
       restores: BTreeMap::new(),
+      removing: None,
+      most_gone: 0,
     }
   }
 
@@ -1813,10 +1856,11 @@ impl<'b> Building<'b> {
   ) -> Result<Option<Increment>, Uncommitted> {
     // The state stays where its owner keeps it between steps, taken up for this one and put back where rows remain.
     let mut building = Building::attach((records, engine, checked), core::mem::take(state));
-    if !building.rows_some(spent)? {
+    if !building.rows_some(spent)? || !building.ends_some(spent)? {
       *state = building.detach();
       return Ok(None);
     }
+    state.most_gone = building.most_gone;
     building.finish(head, id).map(Some)
   }
 
@@ -1842,33 +1886,84 @@ impl<'b> Building<'b> {
       .map_err(|_| Uncommitted::Budget { available: 0 })
   }
 
-  /// The rows from the next built in path order, a row a unit until `spent`, a row at least: whether every one is.
+  /// The rows from the next built in path order, a row a unit until `spent`, a row at least: whether every one is. A
+  /// deleted directory's row notes its tree gone a path a unit after it (A-920 9b), and ends once the last is.
   fn rows_some(&mut self, spent: &mut dyn FnMut() -> bool) -> Result<bool, Uncommitted> {
     let checked = self.checked;
-    while let Some(row) = checked.changes().get(self.at) {
-      self.row(row)?;
-      self.at = self.at.saturating_add(1);
-      if self.at < checked.changes().len() && spent() {
+    loop {
+      let gone = self.gone.len();
+      if self.removing.is_some() {
+        self.gone_beneath_one()?;
+      } else {
+        let Some(row) = checked.changes().get(self.at) else {
+          return Ok(true);
+        };
+        self.row(row)?;
+      }
+      self.noted(gone);
+      if self.removing.is_none() {
+        self.at = self.at.saturating_add(1);
+      }
+      if (self.at < checked.changes().len() || self.removing.is_some()) && spent() {
         return Ok(false);
       }
     }
-    Ok(true)
   }
 
-  /// The build's end once every row is built: what the revision restores and removes, each op sourced from a named run
-  /// moved past the inline bytes, and the increment based at `head`, identified by `id`.
-  fn finish(mut self, head: u64, id: [u8; 32]) -> Result<Increment, Uncommitted> {
-    for (path, restore) in core::mem::take(&mut self.restores) {
+  /// The paths a copy from an older revision sets back made (`restore`), then each path the revision removes made an
+  /// op, each a unit until `spent` (A-920 9b: every one in one unit, 6.6 ms for a deleted tree of 9,001 paths, debug):
+  /// whether every one is.
+  fn ends_some(&mut self, spent: &mut dyn FnMut() -> bool) -> Result<bool, Uncommitted> {
+    while let Some((path, restore)) = self.restores.pop_first() {
+      let gone = self.gone.len();
       self.restored(&path, restore)?;
+      self.noted(gone);
+      if spent() {
+        return Ok(false);
+      }
     }
-    for (path, stood) in core::mem::take(&mut self.gone) {
+    while let Some((path, stood)) = self.gone.pop_first() {
       let kind = if stood.directory {
         OpKind::Rmdir
       } else {
         OpKind::Unlink
       };
       self.op(kind, &path);
+      self.most_gone = self.most_gone.max(1);
+      if spent() {
+        return Ok(false);
+      }
     }
+    Ok(true)
+  }
+
+  /// The gone paths a unit noted, from `before` of them: the most a unit has, kept ([`BUILD_MOST_GONE_A_UNIT`]).
+  fn noted(&mut self, before: usize) {
+    let moved = u64::try_from(self.gone.len().abs_diff(before)).unwrap_or(u64::MAX);
+    self.most_gone = self.most_gone.max(moved);
+  }
+
+  /// One path of the deleted tree [`Building::removing`] holds noted gone; the tree done once its last is.
+  fn gone_beneath_one(&mut self) -> Result<(), Uncommitted> {
+    let Some(mut removing) = self.removing.take() else {
+      return Ok(());
+    };
+    if let Some((found, directory)) = removing.beneath.get(removing.next) {
+      let (place, stood) =
+        self.stood_beneath((found, *directory), (&removing.from, &removing.to))?;
+      self.gone.insert(place, stood);
+      removing.next = removing.next.saturating_add(1);
+    }
+    if removing.next < removing.beneath.len() {
+      self.removing = Some(removing);
+    }
+    Ok(())
+  }
+
+  /// The build's end once every row is built: what the revision restores and removes, each op sourced from a named run
+  /// moved past the inline bytes, and the increment based at `head`, identified by `id`.
+  fn finish(mut self, head: u64, id: [u8; 32]) -> Result<Increment, Uncommitted> {
+    self.ends_some(&mut || false)?;
     // A named run's bytes follow the inline ones in the post-state's one address space (`slates_merge::named`), so each
     // op sourced from a run is moved past them now that their length is known.
     let inline = u64::try_from(self.post.len()).map_err(|_| corrupt())?;
@@ -1903,7 +1998,7 @@ impl<'b> Building<'b> {
       return self.over_restore(row, restore);
     }
     match (row.action, &row.copy_from) {
-      (Action::Delete, _) => self.remove(row, true),
+      (Action::Delete, _) => self.remove_begin(row),
       (Action::Add | Action::Replace, Some(source)) => self.copy(row, source),
       (Action::Replace, None) => self.replace(row),
       (Action::Add, None) => self.add(row),
@@ -1955,10 +2050,43 @@ impl<'b> Building<'b> {
     Ok(())
   }
 
+  /// A node a deletion removes, noted gone (A-920 9b): what stands beneath a directory listed now and noted gone a path
+  /// a unit after it ([`Building::gone_beneath_one`]), never the tree in the row's one unit (13.7 ms for 9,001 paths,
+  /// debug). [`Building::remove`] for a replacement, which remakes the node in the same row, notes the tree whole.
+  fn remove_begin(&mut self, row: &ChangedPath) -> Result<(), Uncommitted> {
+    let stood = self.node_before(&row.path)?;
+    self.gone.insert(green_path(&row.path).to_owned(), stood);
+    if stood.directory {
+      let (from, to, beneath) = self.listed_beneath(&row.path)?;
+      if !beneath.is_empty() {
+        self.removing = Some(Removing {
+          beneath,
+          next: 0,
+          from,
+          to,
+        });
+      }
+    }
+    Ok(())
+  }
+
   /// Every node beneath the directory at `path` as the green holds it before the revision, at its green path: beneath
   /// the path at the head, or beneath a copy's source when the copy is of the head; a copy of an older revision is not
   /// listed (module docs, "Not declared yet").
   fn tree_beneath(&self, path: &str) -> Result<Vec<(String, Stood)>, Uncommitted> {
+    let (from, to, beneath) = self.listed_beneath(path)?;
+    beneath
+      .iter()
+      .map(|(found, directory)| self.stood_beneath((found, *directory), (&from, &to)))
+      .collect()
+  }
+
+  /// [`Building::tree_beneath`]'s listing: the green paths of the place `path` stood before the revision (`from`) and of
+  /// `path` itself (`to`), and every node the green holds beneath `from`, with whether it is a directory.
+  fn listed_beneath(
+    &self,
+    path: &str,
+  ) -> Result<(String, String, Vec<(String, bool)>), Uncommitted> {
     let (source, revision) = self.place_before(path).ok_or_else(corrupt)?;
     // The head in the records' numbering: the green's head, or an import batch's whose scratch member counts its own
     // versions from 0 (C2 stage C).
@@ -1967,23 +2095,26 @@ impl<'b> Building<'b> {
         path: path.to_owned(),
       });
     }
-    let (from, to) = (green_path(&source), green_path(path));
-    self
-      .engine
-      .beneath(from)
-      .into_iter()
-      .map(|(found, directory)| {
-        let len = self.engine.content(&found).map_or(0, |bytes| bytes.len());
-        let stood = Stood {
-          directory,
-          len,
-          props: self.engine.xattr(&found, PROPS).is_some(),
-        };
-        moved(&found, from, to)
-          .map(|place| (place, stood))
-          .ok_or_else(corrupt)
-      })
-      .collect()
+    let (from, to) = (green_path(&source).to_owned(), green_path(path).to_owned());
+    let beneath = self.engine.beneath(&from);
+    Ok((from, to, beneath))
+  }
+
+  /// The node `found` beneath `from`, a directory or not, as it stood, at its place beneath `to`.
+  fn stood_beneath(
+    &self,
+    (found, directory): (&str, bool),
+    (from, to): (&str, &str),
+  ) -> Result<(String, Stood), Uncommitted> {
+    let len = self.engine.content(found).map_or(0, |bytes| bytes.len());
+    let stood = Stood {
+      directory,
+      len,
+      props: self.engine.xattr(found, PROPS).is_some(),
+    };
+    moved(found, from, to)
+      .map(|place| (place, stood))
+      .ok_or_else(corrupt)
   }
 
   /// An addition or a replacement by copy: the source's tree at its revision copied by reference, with `REPLACE` where

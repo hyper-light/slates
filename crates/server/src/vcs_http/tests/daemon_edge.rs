@@ -2517,9 +2517,11 @@ fn a_mercurial_stream_clone_larger_than_one_ring_region_is_answered_through_the_
 /// edge, push one changeset whose file is twice a request's room and compresses (every byte odd); stream-clone it; clone
 /// it. Expect: the push's segment made into chunks as it landed, no step compressing past the copy slice it was given;
 /// the stream sending the file's chunk byte for byte with nothing compressed again (its count and send passes' zstd at
-/// zero); the clone's changegroup carrying the file's bytes whole, its chunk decoded on the shard (non-vacuity: the
-/// decoded bytes at least the file's). Red before: the stream compressed every chunk twice, and nothing was chunked at
-/// arrival.
+/// zero), its copy counted (`vcs_store.hg_stream_send_kept_bytes` at least the chunk's length); the clone's
+/// changegroup carrying the file's bytes whole, its chunk decoded on the shard (non-vacuity: the decoded bytes at least
+/// the file's). Red before: the stream compressed every chunk twice, and nothing was chunked at arrival; and, for the
+/// copy's count, nothing counted a chunk sent as it lies (main's hg_interop round at b8ba82ad3 read the compress
+/// counters at zero and could not tell a copy from a count dropped).
 #[test]
 fn a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes() {
   let (identity, certificate) = identity();
@@ -2568,6 +2570,11 @@ fn a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes() {
     REPOSITORY,
     crate::vcs_store::hg_view::COMPRESS_SEND_NS,
   );
+  let kept = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_view::STREAM_SEND_KEPT_BYTES,
+  );
   let tip = crate::verbs::hex_of(&made[0].node);
   let cloned = hg_getbundle(edge, &name, &tip);
   let decoded = counted_on(
@@ -2596,6 +2603,11 @@ fn a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes() {
     "the stream carries the file's chunk"
   );
   assert_eq!(recompressed, 0, "the stream compressed nothing again");
+  assert!(
+    kept >= chunk.len() as u64,
+    "the stream copied the file's chunk as the store keeps it: {kept} bytes counted, the chunk {}",
+    chunk.len()
+  );
   assert!(
     decoded >= large.len() as u64,
     "the clone decoded the file's chunk: {decoded}"

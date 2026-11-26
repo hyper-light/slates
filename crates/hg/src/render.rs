@@ -903,6 +903,7 @@ impl Streaming {
   ) -> Result<u64, Refused> {
     if self.chunk_place(seq, rev) {
       out.extend_from_slice(plain);
+      revlog_chunk::count_kept(to_u64(plain.len()));
       return Ok(to_u64(plain.len()));
     }
     Ok(revlog_chunk::chunk(plain, Pass::Send, out)?)

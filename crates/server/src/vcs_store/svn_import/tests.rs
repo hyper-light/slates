@@ -1051,6 +1051,7 @@ fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shar
       let (loaded, _turns) = imported(svn, dump).await;
       let counts = wide_counts();
       let (longest_ns, longest_task) = longest_poll();
+      print_phases("wide-add");
       eprintln!(
         "wide-add: the longest step {} us ({longest_task})",
         longest_ns / 1000
@@ -1127,7 +1128,7 @@ fn copied_dir(to: &str, (from, rev): (&str, u64)) -> String {
 fn imported_whole_and_stepped(
   name: &'static str,
   dump: Vec<u8>,
-) -> (Result<u64, String>, u64, u64, (u64, u64, u64)) {
+) -> (Result<u64, String>, u64, u64, (u64, u64, u64, u64)) {
   let read = stored(move || {
     cpu_timed(async move {
       let (svn, green) = subversion(name).await;
@@ -1140,6 +1141,8 @@ fn imported_whole_and_stepped(
           crate::repository::svn_commit::staging::RECORDING_WALK_MOST_FILES,
         )
       });
+      let gone_most =
+        on(|state| count(state, crate::repository::svn_commit::BUILD_MOST_GONE_A_UNIT));
       let grafted = on(|state| {
         state
           .greens
@@ -1147,13 +1150,14 @@ fn imported_whole_and_stepped(
           .map_or(0, |engine| engine.copies_grafted())
       });
       let (longest_ns, longest_task) = longest_poll();
+      print_phases(name);
       (
         loaded
           .map(|loaded| loaded.youngest)
           .map_err(|failed| format!("{failed:?}")),
         longest_ns,
         crate::watchdog::own_window_ns(),
-        (grafted, build_units, walk_most),
+        (grafted, build_units, walk_most, gone_most),
         longest_task,
       )
     })
@@ -1161,14 +1165,15 @@ fn imported_whole_and_stepped(
   // Every run shows its numbers, so a probe judges each against the 1 ms bar, and names what held the longest.
   eprintln!(
     "{name}: youngest {:?}, the longest step {} us of a window of {} us ({}), {} copies grafted, {} checkpoint build \
-     units, {} files at most a recording walk unit",
+     units, {} files at most a recording walk unit, {} gone paths at most a build unit",
     read.0,
     read.1 / 1000,
     read.2 / 1000,
     read.4,
     read.3.0,
     read.3.1,
-    read.3.2
+    read.3.2,
+    read.3.3
   );
   (read.0, read.1, read.2, read.3)
 }
@@ -1314,6 +1319,8 @@ fn wide_import_sliced(counts: &WideCounts) {
 std::thread_local! {
   /// The longest poll on this thread of a history [`cpu_timed`] times: its wall and its thread-CPU nanoseconds.
   static TIMED_LONGEST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+  /// That poll's spans in the import's phases, in order (`svn_import::phase`).
+  static TIMED_SPANS: std::cell::RefCell<Vec<super::phase::Span>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A history whose every poll is timed by the wall clock and by its thread's CPU clock
@@ -1321,6 +1328,8 @@ std::thread_local! {
 pub(crate) struct CpuTimed<F> {
   /// The history.
   future: std::pin::Pin<Box<F>>,
+  /// The phase its last poll ended in, which its next resumes.
+  phase: &'static str,
 }
 
 impl<F: std::future::Future> std::future::Future for CpuTimed<F> {
@@ -1331,13 +1340,17 @@ impl<F: std::future::Future> std::future::Future for CpuTimed<F> {
     context: &mut std::task::Context<'_>,
   ) -> std::task::Poll<F::Output> {
     let cpu_ns = || slates_rt::registry::calling_thread_cpu().map_or(0, |reading| reading.spent_ns);
+    super::phase::poll_begun(self.phase);
     let (wall_began, cpu_began) = (slates_rt::futures::now_ns(), cpu_ns());
     let polled = self.future.as_mut().poll(context);
     let wall = slates_rt::futures::now_ns().saturating_sub(wall_began);
     let spent = cpu_ns().saturating_sub(cpu_began);
+    let (spans, ended) = super::phase::poll_ended();
+    self.phase = ended;
     TIMED_LONGEST.with(|longest| {
       if wall > longest.get().0 {
         longest.set((wall, spent));
+        TIMED_SPANS.with(|kept| *kept.borrow_mut() = spans);
       }
     });
     polled
@@ -1349,8 +1362,10 @@ impl<F: std::future::Future> std::future::Future for CpuTimed<F> {
 /// work, so the CPU beside it tells the two apart). Made on the shard that polls it, whose longest so far it clears.
 pub(crate) fn cpu_timed<F: std::future::Future>(history: F) -> CpuTimed<F> {
   TIMED_LONGEST.with(|longest| longest.set((0, 0)));
+  TIMED_SPANS.with(|kept| kept.borrow_mut().clear());
   CpuTimed {
     future: Box::pin(history),
+    phase: "untagged",
   }
 }
 
@@ -1379,6 +1394,28 @@ pub(crate) fn longest_poll() -> (u64, String) {
   .expect("the shard's entry")
 }
 
+/// Prints the phases of `name`'s history's longest poll on this thread ([`cpu_timed`]): its spans in the import's
+/// phases, in order, each by the wall and by the thread's CPU ([`phases_line`]).
+pub(crate) fn print_phases(name: &str) {
+  let longest = TIMED_LONGEST.with(std::cell::Cell::get);
+  let spans = TIMED_SPANS.with(|kept| kept.borrow().clone());
+  eprintln!("{}", phases_line(name, longest, &spans));
+}
+
+/// The line naming the phases of `name`'s history's longest poll (`wall_ns` and `cpu_ns` long), for a probe's parser:
+/// `PHASES <name> wall_ns=<n> cpu_ns=<n> spans=<tag>:<wall_ns>:<cpu_ns>,...`, the spans in the order the poll ran
+/// them, a phase met twice in a row one span.
+fn phases_line(name: &str, (wall_ns, cpu_ns): (u64, u64), spans: &[super::phase::Span]) -> String {
+  let spans: Vec<String> = spans
+    .iter()
+    .map(|(tag, wall, cpu)| format!("{tag}:{wall}:{cpu}"))
+    .collect();
+  format!(
+    "PHASES {name} wall_ns={wall_ns} cpu_ns={cpu_ns} spans={}",
+    spans.join(",")
+  )
+}
+
 /// Goal 93 (main's order of 2026-11-26 after probe 8: no fixture copied or moved a wide tree, so the commit's copies
 /// and node moves never ran wide). Do: import [`wide_trunk`]'s revision 1 adding `trunk` and [`WIDE_REVISION_FILES`]
 /// files of [`WIDE_TEXT_BYTES`] under it, and a revision 2 copying `trunk` at revision 1 to `branch`. Expect the import
@@ -1391,7 +1428,7 @@ fn t_a920_a_revision_copying_a_tree_of_thousands_of_files_imports_with_every_ste
     WIDE_TEXT_BYTES,
     &[copied_dir("branch", ("trunk", 1))],
   );
-  let (loaded, longest_ns, window_ns, (grafted, _, walk_most)) =
+  let (loaded, longest_ns, window_ns, (grafted, _, walk_most, _)) =
     imported_whole_and_stepped("wide-copy", dump);
   assert_eq!(loaded, Ok(2));
   assert!(grafted > 0, "no copy grafted");
@@ -1423,8 +1460,14 @@ fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step
     WIDE_TEXT_BYTES,
     &[copied_dir("branch", ("trunk", 1)), moved],
   );
-  let (loaded, longest_ns, window_ns, (grafted, build_units, walk_most)) =
+  let (loaded, longest_ns, window_ns, (grafted, build_units, walk_most, gone_most)) =
     imported_whole_and_stepped("wide-move", dump);
+  // The move's delete of the trunk noted gone, and its paths made ops, a path a unit in its build (A-920 9b: the row
+  // 13.7 ms and the build's end 6.6 ms for 9,001 paths in one unit each, debug).
+  assert!(
+    gone_most <= 1,
+    "a unit of the move's build noted {gone_most} gone paths"
+  );
   // The copies' and the move's trees walked a file a unit in their revisions' recordings (A-920 9a: a copied or
   // deleted tree's 9,000 files in one unit, 21-31 ms, debug).
   assert!(
@@ -1501,6 +1544,42 @@ fn a_moves_recording_walked_a_node_a_step_finds_the_texts_the_whole_walk_finds()
     (WALKED_TRUNK_FILES, WALKED_TRUNK_FILES),
     "the trunk's files let go and the moved tree's held"
   );
+}
+
+/// The green's head and identity after importing `dump` into a fresh repository named `name`, every build step spent
+/// as `spent` says (`staging::BUILD_SPENT`).
+fn green_after_import(name: &'static str, dump: Vec<u8>, spent: bool) -> (u64, [u8; 32]) {
+  stored(move || async move {
+    crate::repository::svn_commit::staging::BUILD_SPENT.with(|cell| cell.set(Some(spent)));
+    let (svn, green) = subversion(name).await;
+    let (loaded, _turns) = imported(svn, dump).await;
+    crate::repository::svn_commit::staging::BUILD_SPENT.with(|cell| cell.set(None));
+    assert_eq!(loaded.map(|loaded| loaded.youngest), Ok(3));
+    on(|state| {
+      let mut engine = state.greens.get_mut(&green).expect("the green");
+      (engine.head(), engine.head_identity())
+    })
+  })
+}
+
+/// A-920 9b. Do: import [`wide_trunk`]'s trunk of [`WALKED_TRUNK_FILES`] files, a revision 2 copying it and a revision 3
+/// moving it (a copy, then the trunk's delete), once with every build step spent after each unit (the delete's tree
+/// noted gone and removed a path a unit) and once with every build whole in one step. Expect: the same green, its head
+/// and identity.
+#[test]
+fn a_moves_build_a_unit_a_step_makes_the_green_its_build_whole_makes() {
+  let moved = format!(
+    "{}Node-path: trunk\nNode-action: delete\n\n",
+    copied_dir("moved", ("trunk", 2))
+  );
+  let dump = wide_trunk(
+    WALKED_TRUNK_FILES,
+    WIDE_TEXT_BYTES,
+    &[copied_dir("branch", ("trunk", 1)), moved],
+  );
+  let stepped = green_after_import("built-stepped", dump.clone(), true);
+  let whole = green_after_import("built-whole", dump, false);
+  assert_eq!(stepped, whole, "the green built a unit a step");
 }
 
 /// Shape: the texts-bound red's rewritten file's bytes, and how many rewrites: each rewrite under the batch's texts

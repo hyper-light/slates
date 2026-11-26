@@ -349,6 +349,8 @@ pub(crate) const IMPORT_CLOSE_STEPS: &str = "vcs_store.svn_import.close_steps";
 /// while there is more, what the import holds then charged; at the stream's end what it did; refused, why. Ended either
 /// way, what it held is given back and its file closed. `None` when no import of `id` is under way.
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Option<Result<Turned, LoadFailed>> {
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("parse");
   let mut importing = state.vcs_stores.svn_imports.remove(&id)?;
   // A record owed its landing first, or a base owed: the import reads on only from the records it made.
   if importing.owed.is_some()
@@ -610,6 +612,8 @@ impl Importing {
 /// (`svn_commit::land_record`). Refused, the import ends as a refused turn ends it. None where no import of `id` is
 /// under way or the shard's state is gone.
 pub(crate) async fn land_owed(id: RepositoryId) -> Option<Result<(), LoadFailed>> {
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("owed");
   let owed = crate::state::with_state(|state| {
     let importing = state.vcs_stores.svn_imports.get_mut(&id)?;
     let flush = if core::mem::take(&mut importing.flush_admission) {
@@ -979,5 +983,88 @@ pub(crate) async fn run(id: RepositoryId) -> Option<Result<Loaded, LoadFailed>> 
       Ok(Turned::Done(loaded)) => return Some(Ok(loaded)),
       Err(failed) => return Some(Err(failed)),
     }
+  }
+}
+
+/// Test support (A-920, main's order after release probe 12): the phase the import's history is in, tagged as each of
+/// its steps begins ([`phase::tag`]), and the spans a poll of it spends in each, by the wall and by its thread's CPU,
+/// in order. The wide tests print them for their longest poll, so a probe names what holds it.
+#[cfg(test)]
+pub(crate) mod phase {
+  use std::cell::RefCell;
+
+  /// A span of a poll in one phase: its tag, and its wall and thread-CPU nanoseconds.
+  pub(crate) type Span = (&'static str, u64, u64);
+
+  /// The thread's phase now, when it began, and the spans the poll under way has closed.
+  struct Tags {
+    /// The phase now.
+    current: &'static str,
+    /// When it began: the shard clock and the thread's CPU clock, nanoseconds.
+    since: (u64, u64),
+    /// The poll's spans so far, in order.
+    spans: Vec<Span>,
+  }
+
+  std::thread_local! {
+    /// This shard thread's phase and its poll's spans.
+    static TAGS: RefCell<Tags> = const {
+      RefCell::new(Tags {
+        current: "untagged",
+        since: (0, 0),
+        spans: Vec::new(),
+      })
+    };
+  }
+
+  /// The shard clock and the thread's CPU clock now.
+  fn now() -> (u64, u64) {
+    (
+      slates_rt::futures::now_ns(),
+      slates_rt::registry::calling_thread_cpu().map_or(0, |reading| reading.spent_ns),
+    )
+  }
+
+  /// The span of the phase now closed at `at`, merged into the last where that was the same phase.
+  fn close(tags: &mut Tags, at: (u64, u64)) {
+    let wall = at.0.saturating_sub(tags.since.0);
+    let cpu = at.1.saturating_sub(tags.since.1);
+    match tags.spans.last_mut() {
+      Some(last) if last.0 == tags.current => {
+        last.1 = last.1.saturating_add(wall);
+        last.2 = last.2.saturating_add(cpu);
+      }
+      _ => tags.spans.push((tags.current, wall, cpu)),
+    }
+    tags.since = at;
+  }
+
+  /// The import's history enters phase `name` (a step of it begins).
+  pub(crate) fn tag(name: &'static str) {
+    TAGS.with(|tags| {
+      let mut tags = tags.borrow_mut();
+      close(&mut tags, now());
+      tags.current = name;
+    });
+  }
+
+  /// A poll of the history begins, in `resumed`, the phase its last poll ended in: another task's tags on the thread
+  /// meanwhile are not its.
+  pub(crate) fn poll_begun(resumed: &'static str) {
+    TAGS.with(|tags| {
+      let mut tags = tags.borrow_mut();
+      tags.spans.clear();
+      tags.current = resumed;
+      tags.since = now();
+    });
+  }
+
+  /// The poll under way ended: its spans in order, and the phase it ended in.
+  pub(crate) fn poll_ended() -> (Vec<Span>, &'static str) {
+    TAGS.with(|tags| {
+      let mut tags = tags.borrow_mut();
+      close(&mut tags, now());
+      (std::mem::take(&mut tags.spans), tags.current)
+    })
   }
 }
