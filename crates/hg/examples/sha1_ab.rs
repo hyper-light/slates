@@ -10,16 +10,7 @@
 //!
 //! Command: `cargo run --release -p slates-hg --example sha1_ab -- [<corpus MiB> [<rounds>]]`.
 
-#![allow(
-  clippy::unwrap_used,
-  clippy::expect_used,
-  clippy::indexing_slicing,
-  clippy::cast_possible_truncation,
-  clippy::cast_precision_loss,
-  clippy::print_stdout,
-  clippy::print_stderr,
-  clippy::disallowed_methods
-)]
+#![allow(clippy::cast_precision_loss)]
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
@@ -41,8 +32,26 @@ const DEFAULT_MIB: usize = 256;
 /// Shape: default interleaved benchmark round count when `<rounds>` is omitted.
 const DEFAULT_ROUNDS: usize = 5;
 
+/// Shape: number of hashing implementations timed in each interleaved round.
+const WAY_COUNT: usize = 5;
+
 /// Format: usage-error exit code, matching the `slates` CLI convention.
 const EXIT_USAGE: u8 = 2;
+
+/// Format: undelivered-output exit code, matching the `slates` CLI convention.
+const EXIT_OUTPUT: u8 = 4;
+
+/// A way of hashing a piece: its label and its hash function.
+type Way = (&'static str, fn(&[u8]) -> [u8; 20]);
+
+/// Shape: the five hashing implementations compared in every round.
+const WAYS: [Way; WAY_COUNT] = [
+  ("sha1-checked (old)", sha1dc_checked),
+  ("slates-vcs sha1dc (new)", slates_sha1dc),
+  ("sha1-checked, det off", sha1dc_unchecked),
+  ("aws-lc hardware", hardware),
+  ("hardware + sha1dc check", hardware_with_sha1dc_check),
+];
 
 /// Validated benchmark run configuration parsed once at the CLI boundary.
 struct Config {
@@ -72,6 +81,18 @@ fn parse_positive_usize(label: &str, raw: &str) -> Result<usize, String> {
   Ok(value)
 }
 
+/// Parses an optional positive integer OS argument, falling back to `default` when omitted.
+fn parse_optional_positive_usize(
+  label: &str,
+  raw: Option<&OsStr>,
+  default: usize,
+) -> Result<usize, String> {
+  match raw {
+    Some(value) => parse_positive_usize(label, decode_utf8_arg(value)?),
+    None => Ok(default),
+  }
+}
+
 /// Converts a corpus size in MiB to a non-zero byte count within Rust's `isize::MAX` allocation layout cap.
 fn corpus_bytes_from_mib(mib: usize) -> Result<usize, String> {
   let bytes = mib
@@ -85,25 +106,50 @@ fn corpus_bytes_from_mib(mib: usize) -> Result<usize, String> {
   Ok(bytes)
 }
 
+/// Validates that a round count fits within Rust's `isize::MAX` `Vec<f64>` allocation layout cap.
+fn validate_rounds_layout(rounds: usize) -> Result<usize, String> {
+  let fits = rounds
+    .checked_mul(std::mem::size_of::<f64>())
+    .is_some_and(|bytes| isize::try_from(bytes).is_ok());
+  if !fits {
+    return Err(format!("rounds `{rounds}` exceeds maximum allocation size"));
+  }
+  Ok(rounds)
+}
+
 /// Parses optional `[<corpus MiB> [<rounds>]]` OS arguments without panicking.
 fn parse_args(arguments: &[OsString]) -> Result<Config, String> {
   if let Some(extra) = arguments.get(2) {
     return Err(format!("unexpected argument `{}`", extra.to_string_lossy()));
   }
-  let mib = match arguments.first() {
-    Some(value) => parse_positive_usize("corpus MiB", decode_utf8_arg(value)?)?,
-    None => DEFAULT_MIB,
-  };
+  let mib = parse_optional_positive_usize(
+    "corpus MiB",
+    arguments.first().map(OsString::as_os_str),
+    DEFAULT_MIB,
+  )?;
   let corpus_bytes = corpus_bytes_from_mib(mib)?;
-  let rounds = match arguments.get(1) {
-    Some(value) => parse_positive_usize("rounds", decode_utf8_arg(value)?)?,
-    None => DEFAULT_ROUNDS,
-  };
+  let rounds = parse_optional_positive_usize(
+    "rounds",
+    arguments.get(1).map(OsString::as_os_str),
+    DEFAULT_ROUNDS,
+  )?;
+  let rounds = validate_rounds_layout(rounds)?;
   Ok(Config {
     mib,
     corpus_bytes,
     rounds,
   })
+}
+
+/// Fallibly pre-allocates one `rounds`-sample rate buffer per hashing way before output or work starts.
+fn allocate_rates(rounds: usize) -> Result<[Vec<f64>; WAY_COUNT], String> {
+  let mut rates = std::array::from_fn(|_| Vec::new());
+  for way_rates in &mut rates {
+    way_rates
+      .try_reserve_exact(rounds)
+      .map_err(|err| format!("cannot allocate {rounds} rate samples: {err}"))?;
+  }
+  Ok(rates)
 }
 
 /// Generates a deterministic `corpus_bytes`-byte text-like corpus of manifest lines (path, NUL, 40 hex digits).
@@ -130,8 +176,12 @@ fn build_corpus(corpus_bytes: usize) -> Result<Vec<u8>, String> {
   Ok(corpus)
 }
 
-/// A way of hashing a piece: its name and its hasher.
-type Way<'a> = (&'a str, &'a dyn Fn(&[u8]) -> [u8; 20]);
+/// Fallibly pre-allocates the rate buffers and corpus before printing any output or starting work.
+fn prepare_buffers(config: &Config) -> Result<(Vec<u8>, [Vec<f64>; WAY_COUNT]), String> {
+  let rates = allocate_rates(config.rounds)?;
+  let corpus = build_corpus(config.corpus_bytes)?;
+  Ok((corpus, rates))
+}
 
 fn sha1dc(detect: bool, piece: &[u8]) -> [u8; 20] {
   let mut state = Sha1::builder()
@@ -143,6 +193,14 @@ fn sha1dc(detect: bool, piece: &[u8]) -> [u8; 20] {
   let mut out = [0; 20];
   out.copy_from_slice(result.hash());
   out
+}
+
+fn sha1dc_checked(piece: &[u8]) -> [u8; 20] {
+  sha1dc(true, piece)
+}
+
+fn sha1dc_unchecked(piece: &[u8]) -> [u8; 20] {
+  sha1dc(false, piece)
 }
 
 fn slates_sha1dc(piece: &[u8]) -> [u8; 20] {
@@ -159,41 +217,83 @@ fn hardware(piece: &[u8]) -> [u8; 20] {
   out
 }
 
-fn run_benchmark(config: &Config, corpus: &[u8]) {
-  println!(
-    "corpus {} MiB; rounds {}; MB/s of each way, every round",
-    config.mib, config.rounds
-  );
-  for piece_len in PIECES {
-    let pieces: Vec<&[u8]> = corpus.chunks(piece_len).collect();
-    let reference: Vec<[u8; 20]> = pieces.iter().map(|piece| sha1dc(true, piece)).collect();
-    let ways: [Way<'_>; 5] = [
-      ("sha1-checked (old)", &|piece| sha1dc(true, piece)),
-      ("slates-vcs sha1dc (new)", &slates_sha1dc),
-      ("sha1-checked, det off", &|piece| sha1dc(false, piece)),
-      ("aws-lc hardware", &hardware),
-      ("hardware + sha1dc check", &|piece| {
-        let fast = hardware(piece);
-        assert_eq!(fast, sha1dc(true, piece));
-        fast
-      }),
-    ];
-    let mut rates: Vec<Vec<f64>> = vec![Vec::new(); ways.len()];
-    for _ in 0..config.rounds {
-      for ((_, way), way_rates) in ways.iter().zip(&mut rates) {
-        let started = Instant::now();
-        for (piece, expected) in pieces.iter().zip(&reference) {
-          assert_eq!(way(piece), *expected);
-        }
-        way_rates.push(corpus.len() as f64 / started.elapsed().as_secs_f64() / 1e6);
-      }
-    }
-    println!("pieces of {} KiB:", piece_len / 1024);
-    for ((name, _), rates) in ways.iter().zip(&rates) {
-      let shown: Vec<String> = rates.iter().map(|rate| format!("{rate:.0}")).collect();
-      println!("  {name:<26} {}", shown.join(" "));
+fn hardware_with_sha1dc_check(piece: &[u8]) -> [u8; 20] {
+  let fast = hardware(piece);
+  assert_eq!(fast, sha1dc(true, piece));
+  fast
+}
+
+fn time_way(
+  pieces: &[&[u8]],
+  reference: &[[u8; 20]],
+  corpus_len: usize,
+  way: fn(&[u8]) -> [u8; 20],
+) -> f64 {
+  let started = Instant::now();
+  for (piece, expected) in pieces.iter().zip(reference) {
+    assert_eq!(way(piece), *expected);
+  }
+  corpus_len as f64 / started.elapsed().as_secs_f64() / 1e6
+}
+
+fn measure_piece_size(
+  corpus: &[u8],
+  piece_len: usize,
+  rounds: usize,
+  rates: &mut [Vec<f64>; WAY_COUNT],
+) {
+  for way_rates in rates.iter_mut() {
+    way_rates.clear();
+  }
+  let pieces: Vec<&[u8]> = corpus.chunks(piece_len).collect();
+  let reference: Vec<[u8; 20]> = pieces.iter().map(|piece| sha1dc(true, piece)).collect();
+  for _ in 0..rounds {
+    for ((_, way), way_rates) in WAYS.iter().zip(rates.iter_mut()) {
+      way_rates.push(time_way(&pieces, &reference, corpus.len(), *way));
     }
   }
+}
+
+fn write_way_row(
+  stdout: &mut impl std::io::Write,
+  name: &str,
+  way_rates: &[f64],
+) -> std::io::Result<()> {
+  write!(stdout, "  {name:<26}")?;
+  for rate in way_rates {
+    write!(stdout, " {rate:.0}")?;
+  }
+  writeln!(stdout)
+}
+
+fn write_piece_report(
+  stdout: &mut impl std::io::Write,
+  piece_len: usize,
+  rates: &[Vec<f64>; WAY_COUNT],
+) -> std::io::Result<()> {
+  writeln!(stdout, "pieces of {} KiB:", piece_len / 1024)?;
+  for ((name, _), way_rates) in WAYS.iter().zip(rates) {
+    write_way_row(stdout, name, way_rates)?;
+  }
+  Ok(())
+}
+
+fn run_benchmark(
+  config: &Config,
+  corpus: &[u8],
+  rates: &mut [Vec<f64>; WAY_COUNT],
+) -> std::io::Result<()> {
+  let mut stdout = std::io::stdout().lock();
+  writeln!(
+    stdout,
+    "corpus {} MiB; rounds {}; MB/s of each way, every round",
+    config.mib, config.rounds
+  )?;
+  for piece_len in PIECES {
+    measure_piece_size(corpus, piece_len, config.rounds, rates);
+    write_piece_report(&mut stdout, piece_len, rates)?;
+  }
+  stdout.flush()
 }
 
 fn main() -> ExitCode {
@@ -207,13 +307,16 @@ fn main() -> ExitCode {
       return ExitCode::from(EXIT_USAGE);
     }
   };
-  let corpus = match build_corpus(config.corpus_bytes) {
-    Ok(corpus) => corpus,
+  let (corpus, mut rates) = match prepare_buffers(&config) {
+    Ok(buffers) => buffers,
     Err(message) => {
       let _ = writeln!(std::io::stderr(), "sha1_ab: {message}");
       return ExitCode::from(EXIT_USAGE);
     }
   };
-  run_benchmark(&config, &corpus);
+  if let Err(err) = run_benchmark(&config, &corpus, &mut rates) {
+    let _ = writeln!(std::io::stderr(), "sha1_ab: cannot write output: {err}");
+    return ExitCode::from(EXIT_OUTPUT);
+  }
   ExitCode::SUCCESS
 }
