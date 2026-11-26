@@ -64074,7 +64074,9 @@ daemon}.rs`, `crates/server/src/vcs_http/{git,hg,svn,daemon_edge}.rs`, `crates/s
   - Fleet `a925_a_node_learns_its_peers_edges_as_each_bound_them`: three nodes, each with a git HTTP and an SSH edge at
     port 0. a learned b's edges as b bound them (127.0.0.1:60773 HTTP, :60774 SSH in the run), and a member it holds no
     record of got the typed refusal naming it.
-  - Unit `edges::tests::{an_edges_record_reads_back_whole_and_refuses_every_damaged_form,
+  - Unit `edges::tests::{an_edges_record_reads_back_whole_and_refuses_every_cut_of_it,
+    an_edges_record_refuses_a_trailing_byte_an_oversized_record_and_another_version,
+    an_edges_record_refuses_an_unknown_scheme_and_a_host_past_a_dns_name, an_edges_record_refuses_a_bind_address_and_port_0,
     a_node_announces_only_edges_a_client_reaches, an_https_edge_is_announced_only_at_a_name_its_certificate_carries,
     a_record_naming_another_anchor_is_refused_and_teaches_nothing}`.
   - `fleet::every_request_kind_the_record_session_dispatches_is_its_own`, with streams 32 and 33 added.

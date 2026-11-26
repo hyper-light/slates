@@ -142,26 +142,28 @@ fn encoded_and_learned(state: &mut ShardState, id: RepositoryId) -> u64 {
 fn t_a724_a_repository_over_its_share_drops_fragments_only_where_rebuilding_costs_less_than_the_room()
  {
   use crate::vcs_store::git_encode::{DROPPED, kept_bytes, relieve};
-  crate::git_push::tests::on_stored_shard_with(["pushed"], |state, [pushed]| {
-    crate::git_push::tests::pushed_from_the_fixtures(state, pushed, &["create", "update"]);
-    let kept = encoded_and_learned(state, pushed);
-    let given = relieve(state, pushed, kept.saturating_mul(2), 2.0);
-    assert_eq!(given, kept, "every version's fragments given back, exactly");
-    assert_eq!(kept_bytes(state, pushed), 0);
-    assert!(counted(state, DROPPED) >= 1);
-    encoded(state, pushed);
-    // Encoded again: its size may differ, since the encoder's learned rules moved with its first encodings.
-    let kept_again = kept_bytes(state, pushed);
-    assert!(kept_again > 0, "encoded again");
-    for _ in 0..2_000 {
-      state.vcs_usage.begun(&pushed, &owner(), Work::Fetch, 10);
-    }
-    assert_eq!(
-      relieve(state, pushed, kept.saturating_mul(2), 2.0),
-      0,
-      "kept: reads make rebuilding dear"
-    );
-    assert_eq!(kept_bytes(state, pushed), kept_again);
+  crate::git_push::tests::on_stored_shard_awaited(["pushed"], |[pushed]| async move {
+    crate::git_push::tests::pushed_from_the_fixtures_awaited(pushed, &["create", "update"]).await;
+    crate::git_push::tests::on_state(|state| {
+      let kept = encoded_and_learned(state, pushed);
+      let given = relieve(state, pushed, kept.saturating_mul(2), 2.0);
+      assert_eq!(given, kept, "every version's fragments given back, exactly");
+      assert_eq!(kept_bytes(state, pushed), 0);
+      assert!(counted(state, DROPPED) >= 1);
+      encoded(state, pushed);
+      // Encoded again: its size may differ, since the encoder's learned rules moved with its first encodings.
+      let kept_again = kept_bytes(state, pushed);
+      assert!(kept_again > 0, "encoded again");
+      for _ in 0..2_000 {
+        state.vcs_usage.begun(&pushed, &owner(), Work::Fetch, 10);
+      }
+      assert_eq!(
+        relieve(state, pushed, kept.saturating_mul(2), 2.0),
+        0,
+        "kept: reads make rebuilding dear"
+      );
+      assert_eq!(kept_bytes(state, pushed), kept_again);
+    });
   });
 }
 
@@ -236,40 +238,47 @@ fn t_a724_a_repositorys_claim_follows_its_learned_demand_not_its_lifetime_mean()
 }
 
 /// Feeds `request` to a push of `repository`'s by its owner, piece by piece as an edge does: the first refusal, if any.
-fn first_refusal(
-  state: &mut ShardState,
+async fn first_refusal(
   repository: RepositoryId,
   request: &[u8],
 ) -> Option<crate::git_push::PushFailed> {
+  use crate::git_push::tests::{carry_awaited, dropped_in_a_step, on_state};
   let mut advertised = Vec::new();
-  let mut push = crate::git_push::ReceivePack::start(
-    state,
-    (&owner(), repository),
-    true,
-    &mut advertised,
-    crate::git_push::Unpresented,
-  )
+  let mut push = on_state(|state| {
+    crate::git_push::ReceivePack::start(
+      state,
+      (&owner(), repository),
+      true,
+      &mut advertised,
+      crate::git_push::Unpresented,
+    )
+  })
   .expect("started");
-  for piece in request.chunks(64) {
-    if let Err(refused) = push.input(state, piece) {
-      return Some(refused);
-    }
-  }
-  if let Err(refused) = push.end(state) {
-    return Some(refused);
-  }
-  let mut answer = Vec::new();
-  loop {
-    match push.answer_step(state, &mut answer) {
-      Err(refused) => return Some(refused),
-      Ok(crate::git_push::Answering::Answered(_)) => return None,
-      Ok(crate::git_push::Answering::Turned) => {
-        crate::git_push::tests::carry_blocking(state, &mut push)
+  let refused = 'pushed: {
+    for piece in request.chunks(64) {
+      if let Err(refused) = on_state(|state| push.input(state, piece)) {
+        break 'pushed Some(refused);
       }
-      #[cfg(unix)]
-      Ok(step @ crate::git_push::Answering::Hook(_)) => panic!("no hook: {step:?}"),
     }
-  }
+    if let Err(refused) = on_state(|state| push.end(state)) {
+      break 'pushed Some(refused);
+    }
+    let mut answer = Vec::new();
+    loop {
+      match on_state(|state| push.answer_step(state, &mut answer)) {
+        Err(refused) => break 'pushed Some(refused),
+        Ok(crate::git_push::Answering::Answered(_)) => break 'pushed None,
+        Ok(crate::git_push::Answering::Turned) => {
+          slates_rt::futures::yield_now().await;
+          carry_awaited(&mut push).await.expect("carried");
+        }
+        #[cfg(unix)]
+        Ok(step @ crate::git_push::Answering::Hook(_)) => panic!("no hook: {step:?}"),
+      }
+    }
+  };
+  dropped_in_a_step(push);
+  refused
 }
 
 /// A-724 piece 3b (§4.17.5 "Admission and backpressure": past its share, a work is refused typed and retryable, naming
@@ -281,18 +290,23 @@ fn first_refusal(
 /// server; alone, not refused for a share.
 #[test]
 fn t_a724_a_push_past_its_share_is_refused_retryable_naming_the_share() {
-  crate::git_push::tests::on_stored_shard_configured_with(
+  crate::git_push::tests::on_stored_shard_configured_awaited(
     ["monorepo", "toy"],
     |config| {
       // The slot shrunk so its room, divided, binds a push of a few hundred bytes (6,400 bytes less the partition's
       // state leaves 461 here).
       config.geometry.snapshot_bytes = 6_400;
     },
-    |state, [monorepo, toy]| {
+    |[monorepo, toy]| async move {
       let request = crate::git_push::tests::chain()[0].0.request;
       let pushing = Live::begin(monorepo);
-      assert!(matches!(room(state, toy).bound, Bound::Share { .. }));
-      let refused = first_refusal(state, toy, request).expect("refused past its share");
+      assert!(matches!(
+        crate::git_push::tests::on_state(|state| room(state, toy)).bound,
+        Bound::Share { .. }
+      ));
+      let refused = first_refusal(toy, request)
+        .await
+        .expect("refused past its share");
       assert!(
         matches!(refused, crate::git_push::PushFailed::PastShare { .. }),
         "typed as past its share: {refused:?}"
@@ -303,7 +317,7 @@ fn t_a724_a_push_past_its_share_is_refused_retryable_naming_the_share() {
         "a share's refusal names the share and says a retry may pass: {words:?}"
       );
       drop(pushing);
-      let alone = first_refusal(state, toy, request);
+      let alone = first_refusal(toy, request).await;
       assert!(
         !matches!(alone, Some(crate::git_push::PushFailed::PastShare { .. })),
         "alone, not refused for a share: {alone:?}"
@@ -319,20 +333,26 @@ fn t_a724_a_push_past_its_share_is_refused_retryable_naming_the_share() {
 /// path.
 #[test]
 fn t_a724_a_fetch_in_flight_is_a_claim_on_the_room() {
-  crate::git_push::tests::on_stored_shard_with(["fetched", "toy"], |state, [fetched, toy]| {
-    crate::git_push::tests::pushed_from_the_fixtures(state, fetched, &["create", "update"]);
-    let held = crate::vcs_store::upload::hold_in(state, fetched, &owner()).expect("held");
-    let divided = room(state, toy);
-    assert!(
-      matches!(divided.bound, Bound::Share { .. }),
-      "a fetch in flight divides the room: {divided:?}"
-    );
-    drop(held);
-    assert!(matches!(
-      room(state, toy).bound,
-      Bound::Shard | Bound::Snapshot { .. }
-    ));
-  });
+  crate::git_push::tests::on_stored_shard_awaited(
+    ["fetched", "toy"],
+    |[fetched, toy]| async move {
+      crate::git_push::tests::pushed_from_the_fixtures_awaited(fetched, &["create", "update"])
+        .await;
+      crate::git_push::tests::on_state(|state| {
+        let held = crate::vcs_store::upload::hold_in(state, fetched, &owner()).expect("held");
+        let divided = room(state, toy);
+        assert!(
+          matches!(divided.bound, Bound::Share { .. }),
+          "a fetch in flight divides the room: {divided:?}"
+        );
+        drop(held);
+        assert!(matches!(
+          room(state, toy).bound,
+          Bound::Shard | Bound::Snapshot { .. }
+        ));
+      });
+    },
+  );
 }
 
 /// A-724 piece 3d. Do: on a store-holding daemon, push stock git's fixtures into a repository; then, from a task on its
@@ -343,10 +363,7 @@ fn t_a724_a_fetchs_answer_is_counted_and_learned_on_its_repositorys_usage_row() 
   use crate::vcs_http::git::upload::StoreLender;
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let fetched = crate::git_push::tests::git_repository_on(&daemon, "fetched");
-  let fetched = crate::daemon::observe_first(&daemon, move |state| {
-    crate::git_push::tests::pushed_from_the_fixtures(state, fetched, &["create", "update"]);
-    fetched
-  });
+  crate::git_push::tests::pushed_from_the_fixtures_on(&daemon, fetched, &["create", "update"]);
   let (sent, done) = std::sync::mpsc::sync_channel(1);
   crate::daemon::observe_first(&daemon, move |_| {
     let task = slates_rt::futures::spawn(async move {

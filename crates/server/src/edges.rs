@@ -493,10 +493,9 @@ mod tests {
   }
 
   /// A-925 (main 01a20182's condition 3: bounded parsing). Do: encode a record and decode it; then decode every cut of
-  /// it, it with a trailing byte, an oversized one, an unknown scheme, a host longer than a DNS name, a bind address,
-  /// port 0, and another version. Expect the record back whole, and each damaged form refused typed.
+  /// it. Expect the record back whole, and every cut refused.
   #[test]
-  fn an_edges_record_reads_back_whole_and_refuses_every_damaged_form() {
+  fn an_edges_record_reads_back_whole_and_refuses_every_cut_of_it() {
     let bytes = record().encode();
     assert_eq!(EdgesRecord::decode(&bytes), Ok(record()));
     for cut in 0..bytes.len() {
@@ -505,6 +504,13 @@ mod tests {
         "a record cut at {cut} is refused"
       );
     }
+  }
+
+  /// A-925 (main 01a20182's condition 3: bounded parsing). Do: decode a record with a trailing byte, an oversized one,
+  /// and one of another version. Expect each refused typed: trailing, oversized, its version.
+  #[test]
+  fn an_edges_record_refuses_a_trailing_byte_an_oversized_record_and_another_version() {
+    let bytes = record().encode();
     let mut trailing = bytes.clone();
     trailing.push(0);
     assert_eq!(EdgesRecord::decode(&trailing), Err(EdgesRefused::Trailing));
@@ -512,7 +518,22 @@ mod tests {
       EdgesRecord::decode(&vec![EDGES_VERSION; EDGES_RECORD_BYTES + 1]),
       Err(EdgesRefused::Oversized)
     );
-    let mut scheme = bytes.clone();
+    let mut version = bytes;
+    if let Some(byte) = version.first_mut() {
+      *byte = 2;
+    }
+    assert_eq!(
+      EdgesRecord::decode(&version),
+      Err(EdgesRefused::Version { version: 2 })
+    );
+  }
+
+  /// A-925 (main 01a20182's condition 3: bounded parsing). Do: decode a record with an unknown scheme, one whose host is
+  /// a whole DNS name (253 bytes), and one whose host claims 254. Expect the scheme refused typed, the 253-byte host
+  /// whole, and the 254-byte one refused by its length.
+  #[test]
+  fn an_edges_record_refuses_an_unknown_scheme_and_a_host_past_a_dns_name() {
+    let mut scheme = record().encode();
     if let Some(byte) = scheme.get_mut(10) {
       *byte = 9;
     }
@@ -539,6 +560,12 @@ mod tests {
       EdgesRecord::decode(&too_long),
       Err(EdgesRefused::HostLength { len: 254 })
     );
+  }
+
+  /// A-925 (main 01a20182's condition 3: bounded parsing). Do: decode a record whose HTTP edge names a bind address, and
+  /// one whose SSH edge is at port 0. Expect the bind address refused as host text and port 0 refused as a port.
+  #[test]
+  fn an_edges_record_refuses_a_bind_address_and_port_0() {
     let bind = EdgesRecord {
       http: Some(Edge {
         scheme: Scheme::Http,
@@ -562,14 +589,6 @@ mod tests {
     assert_eq!(
       EdgesRecord::decode(&unbound.encode()),
       Err(EdgesRefused::Port)
-    );
-    let mut version = bytes;
-    if let Some(byte) = version.first_mut() {
-      *byte = 2;
-    }
-    assert_eq!(
-      EdgesRecord::decode(&version),
-      Err(EdgesRefused::Version { version: 2 })
     );
   }
 
