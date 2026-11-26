@@ -1249,7 +1249,9 @@ impl History {
       while !self.judging.make_step(&mut judged, 5).map_err(moved)?.done {}
       census.stepped += 1;
     }
+    let mapped_before = self.judging.mapped_files_made();
     let (number, applied) = self.judging.commit_judged(judged).map_err(moved)?;
+    let mapped = self.judging.mapped_files_made() - mapped_before;
     // Lent for the verdict and its commit, let go once it is committed.
     self.judging.let_named_bytes_go();
     let (mut recorded, _) = version_work(
@@ -1270,7 +1272,7 @@ impl History {
       ),
       number
     );
-    self.deferred(index, (version, number), census)?;
+    self.deferred(index, (version, (number, mapped)), census)?;
     count_names(&self.model, &after, version, census);
     let before = std::mem::replace(&mut self.model, after);
     self.committed.push(Committed {
@@ -1297,11 +1299,13 @@ impl History {
   }
 
   /// `version`, increment `index`, judged on the deferring green leaving its commit's reads to its commit and committed
-  /// a unit a step ([`committed_reads_later`]): the version `number` the judging green committed, and its head.
+  /// a unit a step ([`committed_reads_later`]): the version `number` the judging green committed, and its head; and,
+  /// where the judging green made none of its files in steps first, as many files made by copying as its commit made
+  /// (`mapped`, `Green::mapped_files_made`): a file whose run makes no other moves the run's buffer, sliced or whole.
   fn deferred(
     &mut self,
     index: usize,
-    (version, number): (&Version, u64),
+    (version, (number, mapped)): (&Version, (u64, u64)),
     census: &mut NameCensus,
   ) -> Result<(), TestCaseError> {
     let (mut work, _) = version_work(
@@ -1313,11 +1317,15 @@ impl History {
     )
     .ok_or_else(|| TestCaseError::fail(format!("version {index} changed nothing deferred")))?;
     read_all(&mut work, &self.plane);
+    let mapped_before = self.deferring.mapped_files_made();
     prop_assert_eq!(
       committed_reads_later(&mut self.deferring, &mut work, (&self.plane, census)),
       Some(number)
     );
     prop_assert_eq!(self.deferring.head_identity(), self.judging.head_identity());
+    if !version.stepped {
+      prop_assert_eq!(self.deferring.mapped_files_made() - mapped_before, mapped);
+    }
     Ok(())
   }
 

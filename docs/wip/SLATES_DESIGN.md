@@ -64318,7 +64318,10 @@ GAPS.
   lock entries, its properties and what the records hold; `apply` and `Index::commit_planned` are these carried to
   their end. Until that last step the records and the index read as before the apply began: what a step adds is
   reached only through the revision, and every read is at or below the youngest. The records step 12.2-12.5 ms →
-  under 5 ms (2 runs, load 33-48). Still whole: a recovery's replay of a revision, in its two stages. Oracles: over
+  under 5 ms (2 runs, load 33-48). Still whole: a recovery's replay of a revision, in its two stages
+  (`Repository::replay_step`: its rows, then its lists and stored texts). Its callers in the server's recovery drive
+  one stage a call with no budget of their own, so slicing it is a change to recovery's pacing, a piece of its own,
+  not the import's staging; it shares the apply's checks (`apply_checks`) and the index's commit. Oracles: over
   generated histories and every revision of every dump `svnadmin` wrote, a revision committed a unit a step equals it
   committed whole, and between every two of its steps every path at every revision reads as before the commit began
   (`a_record_planned_a_row_a_step_is_the_record_planned_whole` and its golden twin; a youngest moved at the first unit
@@ -64326,6 +64329,21 @@ GAPS.
   stored text dropped fails it). With it, the change index's rule stated on its own (main's order of 2026-11-25): after
   every generated work, each changed path has exactly one entry marked last, at its last change
   (`only_a_paths_newest_change_is_marked_last`; an earlier entry left marked last fails it, which no lib test caught).
+  **3d, the runs' places.** The import judge's last step (10.6 ms after 5b: the commit's begin 4.1, the hold 3.5,
+  `Reached::of` 1.5) began the verdict's commit with its preparation's first phase whole: the places of every named
+  run (`Post::run_places`, a map over 9,000 runs). They are now a phase of their own (`Prep::Places`), found a run a
+  unit (`Post::run_place`) until the step is spent, for every commit and apply that prepares so. The judge's last step
+  10.6 ms → 6.2-6.3 ms (2 runs, load 35-60). Still whole in it: the hold (the verdict, 2.6) and `Reached::of`.
+  Oracle: the named-texts history oracle's commits and applies prepare a unit a step; a resumed walk of the places that
+  skips a run fails it.
+  **3e, the preparation's turn.** The step a commit's preparation left its sole runs in (7.0-7.3 ms at 9,000 files)
+  named every file a run makes whole (`named_files`) and kept the files whose run makes no other (`alone`), each a
+  walk of every sole run. Each file's name and its run's count of files are now kept as the sole runs are found
+  (`whole_object`, shared with `named_files`), and the files kept are their own phase (`Prep::Alone`), a file a unit.
+  The step 7.0-7.3 ms → under 5 ms (2 runs, load 32-50). Oracle: the named-texts history oracle's deferring green, its
+  commits prepared a unit a step, makes as many files by copying as the judging green's whole commits
+  (`Green::mapped_files_made`, for every version not made in steps first); a resumed `Alone` that skips a file, which
+  moves no bytes differently and so passed every oracle before this count, fails it.
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`

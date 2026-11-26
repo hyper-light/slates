@@ -185,13 +185,24 @@ impl<'a> Post<'a> {
   /// exactly the `len` bytes at `src` is the one under `(src, len)`, what a whole text's file is made of. Made once for
   /// a version's files (`Green::sole_runs`), so each file's lookup is a logarithm of the runs, not a walk of them all.
   pub(crate) fn run_places(&self) -> std::collections::BTreeMap<(u64, u64), usize> {
-    let inline = self.inline_len();
     let mut places = std::collections::BTreeMap::new();
-    for (at, run) in self.declared.iter().enumerate() {
-      let start = inline.saturating_add(self.declared.start(at));
-      places.entry((start, run.len)).or_insert(at);
+    let mut at = 0;
+    while let Some(place) = self.run_place(at) {
+      places.entry(place).or_insert(at);
+      at = at.saturating_add(1);
     }
     places
+  }
+
+  /// The `at`th declared run's place in the post-state's one address space, its start and length: what
+  /// [`Post::run_places`] keys it by, found a run at a time where a commit's preparation is sliced (A-920 piece 3d);
+  /// none past the last run.
+  pub(crate) fn run_place(&self, at: usize) -> Option<(u64, u64)> {
+    let run = self.declared.get(at)?;
+    Some((
+      self.inline_len().saturating_add(self.declared.start(at)),
+      run.len,
+    ))
   }
 
   /// The `len` bytes at `src`, clamped to its length (as a slice of one buffer was); a run's bytes not read span none.
