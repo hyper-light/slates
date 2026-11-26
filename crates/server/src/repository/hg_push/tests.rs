@@ -414,6 +414,21 @@ pub(crate) async fn pushed_changegroup(id: RepositoryId, part: ChangegroupPart) 
   );
 }
 
+/// Bookmark `mark` pushed to repository `id` at `node` alone (a `bookmarks` part, as `hg push -B` sends one for a
+/// changeset the server holds): the push's answer.
+pub(crate) async fn pushed_bookmark(id: RepositoryId, mark: &[u8], node: Node) -> Outcome {
+  let unbundle = Unbundle {
+    parts: vec![taken(
+      0,
+      Asks::Bookmarks(vec![BookmarkAt {
+        name: mark.to_vec(),
+        node: Some(node),
+      }]),
+    )],
+  };
+  pushed_bytes_to(id, &bundled(&unbundle)).await
+}
+
 /// Mercurial repository `name` made on `daemon`'s first shard and `unbundle` pushed to it ([`pushed`]), from a task
 /// there, accepted: the repository.
 fn made_and_pushed_on(daemon: &crate::Daemon, name: &'static str, unbundle: Unbundle) -> Hg {

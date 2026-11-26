@@ -480,6 +480,66 @@ fn a_branch_from_a_tag_whose_heads_manifests_were_let_go_reads_them_once_and_is_
   });
 }
 
+/// A-575 with A-767 C1, by use (main's hg_interop round at b8ba82ad3: `stock_hg_pulls_by_a_tag_over_http_and_a_branch_is_
+/// made_from_the_tag` refused "a branch made at `v1` ... which no line or bookmark of the repository heads"). Do: push
+/// `first`, then `.hgtags` naming `v1` at `first`, then `third`, as the interop test's `hg tag --rev 0 v1` and commits
+/// make them; push bookmark `mark` at `first`, behind `default`'s head, as `hg push -B mark` sends it; then branch
+/// `from-tag` from `v1` through the verb's door. Expect the bookmark's push accepted and `mark` heading `first`, then the
+/// branch made at `first`.
+#[test]
+fn a_bookmark_pushed_at_a_tagged_changeset_behind_its_lines_head_heads_it_and_a_branch_is_made_from_the_tag()
+ {
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = created("hg", VcsTool::Mercurial).await;
+    let first = crate::repository::hg_push::tests::history_of(&[(
+      "first", "file", b"first\n", None, "default",
+    )]);
+    let tags = format!("{} v1\n", crate::verbs::hex_of(&first[0].node));
+    let tags: &'static [u8] = Box::leak(tags.into_bytes().into_boxed_slice());
+    let made = crate::repository::hg_push::tests::history_of(&[
+      ("first", "file", b"first\n", None, "default"),
+      ("Added tag v1", ".hgtags", tags, Some(0), "default"),
+      ("third", "third", b"third\n", Some(1), "default"),
+    ]);
+    pushed(hg, &made, &[0, 1, 2]).await;
+    let marked =
+      crate::repository::hg_push::tests::pushed_bookmark(hg, b"mark", made[0].node).await;
+    assert!(
+      matches!(marked, slates_hg::push::Outcome::Accepted(_)),
+      "push -B mark: {marked:?}"
+    );
+    let mark = on(|state| {
+      let green = state
+        .db
+        .partition()
+        .repositories()
+        .branch(hg, &crate::repository::hg_push::bookmark_name(b"mark"))?;
+      Some(crate::vcs_store::hg_made::head_of(state, green))
+    });
+    assert_eq!(mark, Some(Some(made[0].node)), "`mark` heads `first`");
+    let (from_tag, _) = crate::vcs_store::hg_tags::dispatch_awaited(
+      &owner(),
+      RequestBody::CreateBranch {
+        repository: "hg".to_owned(),
+        name: "from-tag".to_owned(),
+        from: "v1".to_owned(),
+        version: None,
+      },
+    )
+    .await;
+    assert!(
+      matches!(from_tag, ReplyBody::GreenCreated { .. }),
+      "{from_tag:?}"
+    );
+    let marks = on(|state| bookmarks_of(state, hg));
+    let at = marks
+      .iter()
+      .find(|(held, _)| held.as_slice() == b"from-tag")
+      .map(|(_, node)| *node);
+    assert_eq!(at, Some(made[0].node), "{marks:?}");
+  });
+}
+
 /// Whether repository `id`'s view advertises a stream clone (`stream`/`streamreqs` in its capabilities), lent now and
 /// lent over a held generation: both, which must agree.
 fn streams_of(state: &mut ShardState, id: RepositoryId) -> (bool, bool) {
