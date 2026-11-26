@@ -12,6 +12,8 @@ use slates_db::catalog::{
 use slates_db::op::Op;
 use slates_ipc::protocol::{ObjectFormat, Refusal, ReplyBody, RequestBody, VcsTool};
 use slates_merge::engine::Increment;
+
+use crate::repository::svn_commit::staging::prepared_whole;
 use slates_merge::push::{
   EntryKind, HEAD_ATTRIBUTE, ObjectKey, Push, PushObjects, ROOT, TreeEntry, Unavailable,
 };
@@ -1607,8 +1609,9 @@ fn an_import_batch_commits_its_revisions_as_one_entry_and_reads_as_one_by_one() 
         .expect("a revision, one entry");
       }
       let batch = staged_batch(state, batch_main, (&trees, &store));
+      let prepared = prepared_whole(state, &batch).expect("made ready");
       let mut recorded = batch
-        .commit(state, (&owner(), batched), reference(9))
+        .commit(state, (&owner(), batched), (reference(9), prepared))
         .expect("committed");
       // Applied a slice at a time after its record (`RecordedBatch::apply_slice`).
       let made = loop {
@@ -1673,8 +1676,14 @@ fn an_import_batch_refused_or_abandoned_leaves_its_green_as_it_was() {
       };
       staged_two(state).abandon(state);
       assert_eq!(green_reads(state, main), before, "abandoned: as it was");
-      let refused = staged_two(state)
-        .commit(state, (&stranger(), repo), EntryParts::default())
+      let batch = staged_two(state);
+      let prepared = prepared_whole(state, &batch).expect("made ready");
+      let refused = batch
+        .commit(
+          state,
+          (&stranger(), repo),
+          (EntryParts::default(), prepared),
+        )
         .err();
       assert!(
         matches!(
@@ -2331,7 +2340,8 @@ fn t_a927_an_import_batch_onto_a_green_not_recovered_is_refused() {
       given_up(state, &[main]);
       let entries = |state: &ShardState| state.db.partition().repositories().object_count(repo);
       let before = entries(state);
-      let committed = batch.commit(state, (&owner(), repo), EntryParts::default());
+      let prepared = prepared_whole(state, &batch).expect("made ready");
+      let committed = batch.commit(state, (&owner(), repo), (EntryParts::default(), prepared));
       assert_eq!(
         committed.map(|_| ()),
         Err(AppendRefused::Repository(not_recovered()))

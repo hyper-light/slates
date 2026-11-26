@@ -640,6 +640,15 @@
 > deterministic in `crates/rt/tests/spin_kick.rs` (3 of 3 hung, shard parked), green 3 of 3
 > (`docs/bugs/2026-11-20-a-shards-idle-spin-took-a-clients-kick.md`).
 
+> **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
+> the landing's entry are sliced (A-920 pieces 1-6b). Left: the checkpoint task's begin and its identity fold
+> (`merge_service.rs:359`: `CheckpointHold::begin` builds and encodes the green's checkpoint whole, 428 ms in one poll
+> debug at 9,000 files; `turn_budget_ns` past its deadline gives the fold everything left, 406 ms), the checkpoint's
+> own piece (A-869, A-579). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
+> steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
+> files): `made_commit.rs` (two calls), `vcs_store/svn_made.rs`, `vcs_store/hg_made.rs`, `greens.rs`'s own caller. A
+> probe of a wide made commit on each VCS would name any past the bar.
+
 > **Held (A-928, w-svn, 2026-11-25; goal 93, 84a): a shard's step quantum stays under half the loaded bar.** The
 > quantum is the shard's wake estimate, and load grew it: A-920's release probe 5 read it at about 1.05 ms at load 38-56,
 > so every step that filled it passed 1 ms. It is now held to `STEP_QUANTUM_CEILING` (bar / 2, 500 µs), since a step is
@@ -1196,7 +1205,7 @@
 >   bare runtime runs on the test's thread and is not refused. The fixtures still blocking are named in
 >   `test_store::SHARD_BLOCKING_ALLOWED`, each with its owner and how many sites reach it, and run their blocking body
 >   through `allowing_shard_blocking`; there is no global off-switch. The list only shrinks.
->   **The shard-blocking allow-list: 3 fixtures** (a test holds the list's length to this figure; edit both together):
+>   **The shard-blocking allow-list: 2 fixtures** (a test holds the list's length to this figure; edit both together):
 >   **Taken by w-git (2026-11-26, main's order: w-shared and w-perf held on a permission prompt since 18:03): their
 >   `audit_on_stored_shard` and `test_store::create` sites, a file at a time, each landing with its counts.** w-shared's:
 >   `repository/push/tests.rs`, `repository.rs`, `vcs_share/grants.rs`, `vcs_share/read_backs.rs`, `identities/tests.rs`,
@@ -1262,6 +1271,16 @@
 >   (`audit_on_stored_shard` and its configured, made and made-all forms, `run_on_stored_shard`) no longer set
 >   `vcs_store::KEEP_LANDED`, so a stored test's landed packs let go as production lets them go; a test whose point is
 >   residency keeps them by name (`test_store::keep_landed`, `keep_landed_pinned`). It brought 7 reds, all w-hg's.
+>   `test_store::on_a_stored_shard` (w-git's, for histories that wait on nothing) set it still, and no longer does
+>   (w-hg, 2026-11-26, main's order): its 12 callers' modules (`identities` 6, `repository::push` 1,
+>   `vcs_share::grants` 3, `vcs_store::paths` 1, `vcs_store::tests` 1) pass with production's let-go, 0 reds.
+>   - The test-only holds left in production code, each pausing a driver for a test: `hg_push::hold_next_landing`
+>     (the four race histories), `whole_build::DRIVEN_BY_TEST` (the storm's build slices), and
+>     `refining::HELD_FOR_TEST` (`refining::start` holds a job for `refined_now`, only `refining/tests.rs`'
+>     driver-equality test sets it). The last changes what refining answers, not only when: `refined_now` gives a job
+>     up where its turn meets a let-go window (`job.brought(state, None)`), where the job's task brings the windows
+>     back and copies the slice again; its doc's premise, that a test's shard keeps its landed packs, ended with A3.
+>     Owed: removed (main's ruling of 2026-11-26), w-hg's next piece.
 >   - Fixed, 3 in `vcs_store/hg_view/tests.rs`: the every-format oracle takes each changeset's and manifest's text from
 >     the same history imported in one call into a store of its own that lets nothing go, never from the store under
 >     test; the let-go tag test holds every object not held whole after its let-go, which its landing had already
@@ -1293,17 +1312,22 @@
 >     test's thread, `git_repository_on`, or through `on_stored_shard_with`.)
 >   - w-hg's push and import helpers, counted by the tests refused without each once the entries above let them
 >     through: `repository::hg_push::land_stored` (2 tests, `vcs_ssh::tests::hg`),
->     `vcs_store::commits::home_and_land_blocking` (9 tests: `repository::tests` 6, `daemon::tests` 3, each
->     through `vcs_store::paths::tests::recorded_git_submit`, whose held made commit is landed by `made_landing_now` on
->     the shard's thread). `vcs_store::upload::tests`' 12 and `git_hooks::tests`' 2 moved by w-hg (2026-11-26) to
+>     `vcs_store::commits::home_and_land_blocking` (0, gone 2026-11-26, w-hg, with `made_landing_now`,
+>     `made_before_step_blocking`, the test-only hold of made commits in `made_accepted` (`MADE_HELD_FOR_TEST`,
+>     `HELD_MADE`), `paths::tests::recorded_git_submit` and `_as`, and `git_push::tests::carried_blocking`: no caller
+>     left, so the lib compiles without them). Its last 9: `repository::tests`' 6 run as tasks
+>     (`run_on_stored_shard_made_all`, or `run_on_first` where a creation sits between two looks), each write's submit
+>     awaited (`paths::tests::submit_as_taken_awaited`); the 3 daemon tests that submit a git green
+>     (`t_goal93_a_recovery_keeps_a_landed_pack…`, `t_a727_a3b…`, `t_c1_windows_let_go…`) make it by `git_made().await`
+>     and submit by `recorded_git_submit_awaited`. The synchronous `submit_as_taken` now refuses a git green. Before
+>     that: `vcs_store::upload::tests`' 12 and `git_hooks::tests`' 2 moved by w-hg (2026-11-26) to
 >     `test_store::run_on_stored_shard_made_all` tasks pushing by `push_through_awaited` and `appended_awaited`
 >     (`upload::tests::made_pushing`; A-745's mid-answer push lands between the answer's steps, `InTurns`), and the
 >     synchronous `push_through` and `appended` were deleted; `commits::tests` 0 since t_a664's parked submit moved
->     to `pushed_three_awaited` (w-hg, 2026-11-26), `push_unsettled` deleted with it. Counted by w-hg's probes of
->     2026-11-26, the fixture and `made_landing_now` panicking in turn: `vcs_store::` and `git_hooks::` 0 failed;
->     `repository::tests` 6 and the 3 daemon tests that submit through `recorded_git_submit` failed at each. The first
->     probe of that day ran over `vcs_store::` and `git_hooks::` alone and counted 14, missing these 9; the 7 before it
->     was an undercount whose cause is not on record. Logs `~/.local/state/w-hg-logs/2026-11-26-probe{2,3}-*.txt`), and
+>     to `pushed_three_awaited`. Counts by w-hg's probes of 2026-11-26 (the fixture and `made_landing_now` panicking in
+>     turn): first 14 over `vcs_store::` and `git_hooks::` alone, then 9 more found in `repository::tests` and three
+>     daemon tests; the 7 before was an undercount whose cause is not on record. Logs
+>     `~/.local/state/w-hg-logs/2026-11-26-probe{2,3}-*.txt`), and
 >     `repository::import::tests::served`'s read-back (1, gone 2026-11-26).
 >   Moved instead of listed: `daemon::tests::t_goal93_a_homes_landed_records_survive_a_restart…` lands between two
 >   observations. Shrunk: `repository/hg_push/tests.rs`' 17 daemon tests push through the daemon's own driver

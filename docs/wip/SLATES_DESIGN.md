@@ -64594,6 +64594,36 @@ GAPS.
   generated documents of every op kind with hard links, declared in random order, the document canonicalized a unit
   a turn encodes as the one canonicalized whole, in more than one turn wherever it has more than one op
   (`a_document_canonicalized_a_unit_a_turn_is_the_document_canonicalized_whole`).
+- **Piece 6, the landing** (main's ruling of 2026-11-26: the import's landing is A-920's own). A runtime probe printing
+  every poll over 20 ms with its task's spawn site named the wide import's longest polls outside its staging steps
+  (debug, t_c2c at 9,000 files): the landing's entry, `Staging::record_landed`, 75 ms in one synchronous section, and
+  one poll of its versions' apply, 40 ms (the inline checkpoint's begin, the checkpoint's own piece, A-869). The entry's
+  parts: `unpin_texts` 14.3 ms over 9,000 texts, the scratch member's retire 16.9, then the append's increment encoding
+  3.4, its hold in the content store 23.6, its chain entry's encoding 12.5, and the register's op 8.5 (publish and
+  record). **6a, the unpin and the release.** The texts are unpinned a text a unit (`staging::unpin_some`), still
+  before the entry (a kill after the entry never reaches the tail; a kill between slices leaves texts unpinned whose
+  changeset is durable), and the scratch member is retired before the append, its release stepped a unit at a time
+  (`Greens::retire_preview_begun`, `staging::released_some`); the batch's commit and abandon then retire nothing more.
+  Counters: `LANDING_UNPIN_SLICES` and `LANDING_RELEASE_STEPS`, each more than two a wide landing in `t_c2c`; red with
+  both run whole (one slice each).
+  **6b, the append made ready before the register's op.** Each of the batch's versions is made ready by the landing a
+  unit a step (`Staging::prepared`, `push::Prepared`), at the version it takes after the green's head then: its
+  increment encoded (`Increment::encode_step`: its ops document a piece a unit, `OpsDoc::encode_piece`, its length
+  filled in after; its inline bytes a copy slice a unit; each evidence reference and named run a unit), held where its
+  chain entry names it (`merge_service::IncrementHold`: the encoding's chunks hashed a chunk a unit, the green
+  object's stage opened, each chunk copied in by `stage_lent_piece`, the stage completed; `hold_increment`'s identity,
+  charges and refusals), and its entry encoded (`chain_entry::encode_step`: the entry measured first a unit at a time,
+  `Measuring`, so its buffer is reserved once at its exact length, then an effect a unit). `append_versions` then
+  takes the versions made ready and does the register's one op alone (`publish_held_increments`, `record_all`); a
+  head moved since, a version not made ready, or any refusal before the op gives every hold back
+  (`push::release_prepared`). The wide tests print their longest poll's task (`registry::Pulse::longest_polling`, the
+  polling word copied only as a poll sets a new longest): after 6b it is the checkpoint task (`merge_service.rs:359`,
+  236-344 ms debug), the checkpoint's own piece (A-869, A-579). Oracles: an entry and an increment encoded a unit a
+  step are the ones encoded whole (`an_entry_encoded_a_unit_a_step_is_the_entry_encoded_whole`,
+  `an_increment_encoded_a_unit_a_step_is_the_increment_encoded_whole`), and the batch's commit tests through the same
+  preparation run whole (`staging::prepared_whole`). Counter: `LANDING_PREPARE_STEPS`, more than two a wide landing;
+  red with the preparation run whole (one step). `a_shards_longest_poll_names_its_task` (`slates-rt`): red with the
+  longest poll's task never recorded.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 

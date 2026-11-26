@@ -280,6 +280,164 @@ async fn until_done(mut step: impl FnMut(&mut ShardState) -> bool) -> Option<()>
   Some(())
 }
 
+/// Unpins `texts` from `at`, a text a unit, until the shard's clock passes `deadline_ns`, at least one: whether every one
+/// is ([`Staging::land`]).
+fn unpin_some(
+  state: &mut ShardState,
+  texts: &[ContentIdentity],
+  (at, deadline_ns): (&mut usize, u64),
+) -> bool {
+  while let Some(text) = texts.get(*at) {
+    *at = at.saturating_add(1);
+    crate::vcs_store::name_holds::unpin_texts(state, core::slice::from_ref(text));
+    if slates_rt::futures::now_ns() >= deadline_ns {
+      break;
+    }
+  }
+  *at >= texts.len()
+}
+
+/// Steps `release`, a retired scratch member's in `lineage`, until the shard's clock passes `deadline_ns`, at least one
+/// unit: whether it is done ([`Staging::land`]); a lineage gone is done.
+fn released_some(
+  state: &mut ShardState,
+  (lineage, release): (RepositoryId, &mut slates_merge::engine::Release),
+  deadline_ns: u64,
+) -> bool {
+  loop {
+    match state.greens.release_step(lineage, release) {
+      Ok(true) => {}
+      Ok(false) | Err(_) => return true,
+    }
+    if slates_rt::futures::now_ns() >= deadline_ns {
+      return false;
+    }
+  }
+}
+
+/// A batch's versions being made ready for the register's op ([`Staging::prepared`]): the green's head they follow, the
+/// versions ready so far, and where the next stands.
+struct Preparing {
+  head: u64,
+  ready: Vec<crate::repository::push::Prepared>,
+  phase: PreparePhase,
+}
+
+/// Where the next version of a [`Preparing`] stands.
+enum PreparePhase {
+  /// Its increment being encoded.
+  Encoding(slates_merge::engine::IncrementEncoding),
+  /// Its increment's encoding being held.
+  Holding(Vec<u8>, crate::merge_service::IncrementHold),
+  /// Its chain entry being encoded, its increment held.
+  Entry(
+    crate::merge_service::HeldIncrement,
+    slates_merge::chain_entry::Encoding,
+  ),
+}
+
+/// [`Staging::prepared`]'s units until the shard's clock passes `deadline_ns`, at least one: whether every version of
+/// `batch` is ready; what a hold was refused.
+fn prepare_some(
+  state: &mut ShardState,
+  (batch, green): (&ImportBatch, DbVolumeId),
+  preparing: &mut Preparing,
+  deadline_ns: u64,
+) -> Result<bool, slates_ipc::protocol::Refusal> {
+  let mut spent = || slates_rt::futures::now_ns() >= deadline_ns;
+  loop {
+    let index = preparing.ready.len();
+    let Some(staged) = batch.staged_works().get(index) else {
+      return Ok(true);
+    };
+    let version = preparing
+      .head
+      .saturating_add(u64::try_from(index).unwrap_or(u64::MAX))
+      .saturating_add(1);
+    let chunk = usize::try_from(state.config.copy_slice_bytes()).unwrap_or(usize::MAX);
+    preparing.phase = match core::mem::replace(
+      &mut preparing.phase,
+      PreparePhase::Encoding(slates_merge::engine::IncrementEncoding::default()),
+    ) {
+      PreparePhase::Encoding(mut encoding) => {
+        match staged
+          .increment
+          .encode_step(&mut encoding, chunk, &mut spent)
+        {
+          Some(encoded) => PreparePhase::Holding(
+            encoded,
+            crate::merge_service::IncrementHold::begin(green, version),
+          ),
+          None => PreparePhase::Encoding(encoding),
+        }
+      }
+      PreparePhase::Holding(encoded, mut hold) => match hold.unit(state, &encoded) {
+        Some(Ok(held)) => PreparePhase::Entry(
+          held,
+          slates_merge::chain_entry::encoding(held.inputs, staged.identity),
+        ),
+        Some(Err(refusal)) => return Err(refusal),
+        None => PreparePhase::Holding(encoded, hold),
+      },
+      PreparePhase::Entry(held, mut encoding) => {
+        match slates_merge::chain_entry::encode_step(
+          (&staged.increment, &staged.applied),
+          &mut encoding,
+          &mut spent,
+        ) {
+          Some(entry) => {
+            preparing.ready.push(crate::repository::push::Prepared {
+              version,
+              held,
+              entry,
+            });
+            PreparePhase::Encoding(slates_merge::engine::IncrementEncoding::default())
+          }
+          None => PreparePhase::Entry(held, encoding),
+        }
+      }
+    };
+    if spent() {
+      return Ok(false);
+    }
+  }
+}
+
+/// [`Staging::prepared`]'s units for `batch` run to their end in one call, for a test that commits a batch with no
+/// landing: the versions ready, or what a hold was refused, the holds made before it given back.
+#[cfg(test)]
+pub(crate) fn prepared_whole(
+  state: &mut ShardState,
+  batch: &ImportBatch,
+) -> Result<Vec<crate::repository::push::Prepared>, slates_ipc::protocol::Refusal> {
+  let green = batch.green();
+  let head = state.greens.get(&green).map_or(0, |engine| engine.head());
+  let mut preparing = Preparing {
+    head,
+    ready: Vec::new(),
+    phase: PreparePhase::Encoding(slates_merge::engine::IncrementEncoding::default()),
+  };
+  match prepare_some(state, (batch, green), &mut preparing, u64::MAX) {
+    Ok(_) => Ok(preparing.ready),
+    Err(refusal) => {
+      crate::repository::push::release_prepared(state, green, preparing.ready);
+      Err(refusal)
+    }
+  }
+}
+
+/// Counter: a step of a landing's making its versions ready for the register's op ([`Staging::prepared`]): more than one
+/// a landing shows it was sliced. Format: a counter name in the daemon's status report.
+pub(crate) const LANDING_PREPARE_STEPS: &str = "repository.svn_commit.landing_prepare_steps";
+
+/// Counter: a step of a landing's unpin of its texts ([`Staging::land`]): more than one a landing shows it was sliced.
+/// Format: a counter name in the daemon's status report.
+pub(crate) const LANDING_UNPIN_SLICES: &str = "repository.svn_commit.landing_unpin_slices";
+
+/// Counter: a step of a landing's release of its scratch member ([`Staging::land`]): more than one a landing shows it was
+/// sliced. Format: a counter name in the daemon's status report.
+pub(crate) const LANDING_RELEASE_STEPS: &str = "repository.svn_commit.landing_release_steps";
+
 /// One step of a batch's give-back: the content arena's resident free pages past `keep` bytes given back, an idle
 /// purge's slice of blocks (`daemon::purge_slice_blocks`), counted. Whether more is left past `keep`.
 fn give_back_past(state: &mut ShardState, keep: usize) -> bool {
@@ -1420,8 +1578,52 @@ impl Staging {
     let (landed, flushing, committing) = self
       .land_changeset_timed(&disk, (repository, sequence))
       .await;
+    // Landed: the changeset holding every text the batch put is durable on the node's store, so its texts are no
+    // unlanded holders now (ruling (B)), whatever the register answers next. Unpinned before the entry, not at the tail:
+    // a kill after the entry never reaches the tail, and the texts are landed all the same (w-perf's red at a55d7cfa6,
+    // `store_tests::a_subversion_restart_replays_a_named_text_with_one_released_window`). A text a unit, a slice of the
+    // shard's budget a step (A-920 6a: 9,000 texts unpinned in one step, 14.3 ms debug); a kill between slices leaves
+    // texts unpinned whose changeset is durable, which is what the landing makes true.
+    if landed.is_ok() {
+      let pinned = std::mem::take(&mut self.pinned);
+      let mut at = 0usize;
+      until_done(|state| {
+        state.count(LANDING_UNPIN_SLICES, 1);
+        unpin_some(state, &pinned, (&mut at, slice_deadline_ns()))
+      })
+      .await?;
+    }
+    // The scratch member let go a unit at a time before the append (A-920 6a: released whole in one step, 16.9 ms
+    // debug at 9,000 files): landed or not, its batch commits or abandons next, and neither retires it again.
+    let begun = crate::state::with_state(|state| {
+      self
+        .batch
+        .as_mut()
+        .and_then(|batch| batch.retire_begun(state))
+    })?;
+    if let Some((lineage, mut release)) = begun {
+      until_done(|state| {
+        state.count(LANDING_RELEASE_STEPS, 1);
+        released_some(state, (lineage, &mut release), slice_deadline_ns())
+      })
+      .await?;
+    }
+    // Each version made ready for the register's op a unit a step (A-920 6b): its increment encoded, held and its chain
+    // entry encoded, never whole in the entry's step.
+    let prepared = match landed {
+      Ok(()) => match self.prepared().await? {
+        Ok(prepared) => prepared,
+        Err(refused) => {
+          let _ = crate::state::with_state(|state| self.abandon(state));
+          return Some(Err(Uncommitted::Append(super::AppendRefused::Entry(
+            refused,
+          ))));
+        }
+      },
+      Err(_) => Vec::new(),
+    };
     let recorded = crate::state::with_state(|state| {
-      self.record_landed(state, landed, principal, (repository, sequence))
+      self.record_landed(state, landed, principal, ((repository, sequence), prepared))
     })?;
     let mut recorded = match recorded {
       Ok(recorded) => recorded,
@@ -1443,6 +1645,50 @@ impl Staging {
     #[cfg(test)]
     kill_at_stage_where_set(LandStage::Landed).await;
     Some(Ok(revisions))
+  }
+
+  /// Each of the batch's versions made ready for the register's op, a unit at a time, a slice of the shard's budget a
+  /// step (A-920 6b): its increment encoded ([`slates_merge::engine::Increment::encode_step`], its inline bytes a copy
+  /// slice a unit), held where its chain entry names it ([`crate::merge_service::IncrementHold`]) and its entry encoded
+  /// ([`slates_merge::chain_entry::encode_step`]), each version at the one it takes after the green's head now. What a
+  /// hold was refused, the holds made before it given back. None where the shard's state is gone.
+  async fn prepared(
+    &self,
+  ) -> Option<Result<Vec<crate::repository::push::Prepared>, slates_ipc::protocol::Refusal>> {
+    let green = self.green;
+    let head =
+      crate::state::with_state(|state| state.greens.get(&green).map(|engine| engine.head()))??;
+    let mut preparing = Preparing {
+      head,
+      ready: Vec::new(),
+      phase: PreparePhase::Encoding(slates_merge::engine::IncrementEncoding::default()),
+    };
+    let mut refused = None;
+    until_done(|state| {
+      state.count(LANDING_PREPARE_STEPS, 1);
+      let Some(batch) = self.batch.as_ref() else {
+        return true;
+      };
+      match prepare_some(state, (batch, green), &mut preparing, slice_deadline_ns()) {
+        Ok(done) => done,
+        Err(refusal) => {
+          refused = Some(refusal);
+          true
+        }
+      }
+    })
+    .await?;
+    if let Some(refusal) = refused {
+      let _ = crate::state::with_state(|state| {
+        crate::repository::push::release_prepared(
+          state,
+          green,
+          core::mem::take(&mut preparing.ready),
+        );
+      });
+      return Some(Err(refusal));
+    }
+    Some(Ok(preparing.ready))
   }
 
   /// Lands the batch's changeset at `place` on `disk`: every text the batch's entry names in its Payload is durable
@@ -1483,30 +1729,37 @@ impl Staging {
     state: &mut ShardState,
     landed: Result<(), Uncommitted>,
     principal: &Principal,
-    (repository, sequence): (RepositoryId, u64),
+    ((repository, sequence), prepared): (
+      (RepositoryId, u64),
+      Vec<crate::repository::push::Prepared>,
+    ),
   ) -> Result<crate::repository::push::RecordedBatch, Uncommitted> {
-    // Landed: the changeset holding every text the batch put is durable on the node's store, so its texts are no
-    // unlanded holders now (ruling (B)), whatever the register answers next. Unpinned here, not at the tail: a kill
-    // after the entry never reaches the tail, and the texts are landed all the same (w-perf's red at a55d7cfa6,
-    // `store_tests::a_subversion_restart_replays_a_named_text_with_one_released_window`).
-    if landed.is_ok() {
-      crate::vcs_store::name_holds::unpin_texts(state, &std::mem::take(&mut self.pinned));
+    let green = self.green;
+    let give_back = |state: &mut ShardState, prepared, refusal| {
+      crate::repository::push::release_prepared(state, green, prepared);
+      Err(refusal)
+    };
+    // Its texts were unpinned once landed, and its scratch member retired, a unit at a time ([`Staging::land`]).
+    if let Err(unlanded) = landed {
+      return give_back(state, prepared, unlanded);
     }
-    landed?;
     if landing::next_sequence(state, repository) != sequence {
       state.count(super::DIVERGED, 1);
-      return Err(Uncommitted::Diverged);
+      return give_back(state, prepared, Uncommitted::Diverged);
     }
     let reference = landing::reference(sequence);
-    crate::vcs_store::admit_objects(state, reference.len())
-      .map_err(|available| Uncommitted::Budget { available })?;
-    let batch = self.batch.take().ok_or(Uncommitted::NotHeld)?;
+    if let Err(available) = crate::vcs_store::admit_objects(state, reference.len()) {
+      return give_back(state, prepared, Uncommitted::Budget { available });
+    }
+    let Some(batch) = self.batch.take() else {
+      return give_back(state, prepared, Uncommitted::NotHeld);
+    };
     let parts = EntryParts {
       objects: reference,
       ..EntryParts::default()
     };
     batch
-      .commit(state, (principal, repository), parts)
+      .commit(state, (principal, repository), (parts, prepared))
       .map_err(Uncommitted::Append)
   }
 

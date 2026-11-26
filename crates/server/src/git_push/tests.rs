@@ -2557,30 +2557,6 @@ fn t_a727_a_plain_push_then_its_update_are_made_again_with_the_same_holders() {
   });
 }
 
-/// `carry` carried as a test's synchronous driver stands in for the edge (`vcs_store::commits::home_and_land_blocking`,
-/// allow-listed as w-hg's): content kept for the region on this shard as its home keeps it, a changeset landed on the
-/// node's store from a thread of its own. What a git commit the server makes is carried by in a test's synchronous
-/// driver too (`crate::vcs_store::commits::made_landing_now`).
-pub(crate) fn carried_blocking(state: &mut ShardState, carry: super::Carry) -> super::Carried {
-  match carry {
-    super::Carry::Home(bytes, owner) => {
-      let outcome = crate::vcs_store::homes::keep_for_region(state, &bytes, &[owner])
-        .map(|(identity, _)| identity);
-      super::Carried::Homed(crate::vcs_store::homes::Homed { outcome, bytes })
-    }
-    super::Carry::Land(landing) => {
-      let super::Landing {
-        disk,
-        header,
-        parts,
-      } = *landing;
-      super::Carried::Landed(crate::test_store::land_answered_blocking(
-        disk, header, parts,
-      ))
-    }
-  }
-}
-
 /// The edge's carry as a test's async driver runs it ([`super::carry`]): the homing or the landing the push asked,
 /// handed back. Refused only where the shard's state is not lent.
 pub(crate) async fn carry_awaited<P>(push: &mut ReceivePack<P>) -> Result<(), String> {

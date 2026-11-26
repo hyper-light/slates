@@ -683,7 +683,7 @@ impl ImportBatch {
     mut self,
     state: &mut ShardState,
     (principal, repository): (&Principal, RepositoryId),
-    parts: EntryParts,
+    (parts, prepared): (EntryParts, Vec<crate::repository::push::Prepared>),
   ) -> Result<crate::repository::push::RecordedBatch, AppendRefused> {
     let staged = std::mem::take(&mut self.staged);
     let green = self.green;
@@ -692,7 +692,7 @@ impl ImportBatch {
       state,
       (principal, repository),
       green,
-      staged,
+      (staged, prepared),
       parts,
     )?;
     state.count(COMMITTED, 1);
@@ -702,6 +702,29 @@ impl ImportBatch {
   /// Gives the batch up: nothing of it applied or recorded, the scratch member retired.
   pub(crate) fn abandon(mut self, state: &mut ShardState) {
     self.retire(state);
+  }
+
+  /// The works staged, in order: what the landing makes ready for the register's op ([`crate::repository::push::Prepared`]).
+  pub(crate) fn staged_works(&self) -> &[Staged] {
+    &self.staged
+  }
+
+  /// The batch's green.
+  pub(crate) fn green(&self) -> DbVolumeId {
+    self.green
+  }
+
+  /// Retires the scratch member, its release answered for the caller to step a unit at a time (A-920 6a); none where it
+  /// was retired already. The batch's commit and abandon then retire nothing more.
+  pub(crate) fn retire_begun(
+    &mut self,
+    state: &mut ShardState,
+  ) -> Option<(
+    slates_db::catalog::RepositoryId,
+    slates_merge::engine::Release,
+  )> {
+    let preview = self.preview.take()?;
+    state.greens.retire_preview_begun(preview)
   }
 
   /// Retires the scratch member, once.
