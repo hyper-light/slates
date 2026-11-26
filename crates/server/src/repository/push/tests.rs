@@ -2255,3 +2255,170 @@ fn a_refused_named_append_is_retried_only_with_a_work_built_again() {
     assert_eq!(cloned(state), 0, "read bytes cloned by a verdict");
   });
 }
+
+/// The cause a takeover that gave a green up records (`takeover::give_up`'s, A-304): what these tests record.
+fn given_up_cause() -> slates_ipc::protocol::RecoveryCause {
+  slates_ipc::protocol::RecoveryCause::TakeoverIncomplete {
+    waited_on: "inputs".to_owned(),
+  }
+}
+
+/// The refusal a verb naming a green recorded with [`given_up_cause`] answers.
+fn not_recovered() -> Refusal {
+  Refusal::NotRecovered {
+    cause: given_up_cause(),
+  }
+}
+
+/// Records `greens` not recovered on the shard, as a takeover that gave them up records them, their engines left lent
+/// as a holder's replica stays (A-908).
+fn given_up(state: &mut ShardState, greens: &[DbVolumeId]) {
+  for green in greens {
+    state.unrecovered.insert(*green, given_up_cause());
+  }
+}
+
+/// A-927's sweep (main's ruling of 2026-11-25: a create landed on a green recorded unrecovered, its engine still lent;
+/// every write naming such a green checked at the boundary it takes the green). Do: push to `main` at version 1 and make
+/// `topic`; record both not recovered; push an update of `main`, a create from it and a delete of `topic`. Expect: each
+/// change refused `NotRecovered` with the green's cause, named by its index, and nothing applied (before, all three
+/// were applied).
+#[test]
+fn t_a927_a_push_naming_greens_not_recovered_refuses_each_change() {
+  crate::test_store::audit_on_stored_shard("a927-push", |state| {
+    let (repo, [main, topic], mut store, one) = two_branches(state);
+    let two = store.put_tree(&[("f", b"two")]);
+    let update = BranchChange::Update {
+      green: main,
+      work: work(state, main, (1, Some(one)), (two, b"c2"), (&store, 2)),
+    };
+    given_up(state, &[main, topic]);
+    let changes = vec![
+      update,
+      create("made", main, 1),
+      BranchChange::Delete {
+        name: "topic".to_owned(),
+        version: 0,
+      },
+    ];
+    let pushed = push(state, &owner(), repo, changes, EntryParts::default());
+    let why = |index| ChangeRefused {
+      index,
+      why: ChangeRefusal::Refused(not_recovered()),
+    };
+    assert_eq!(
+      pushed.map(|pushed| pushed.changes),
+      Err(AppendRefused::Changes(vec![why(0), why(1), why(2)]))
+    );
+    assert_eq!(head(state, main), Some(b"c1".to_vec()), "main as it was");
+  });
+}
+
+/// A-927's sweep: an import batch's versions are appended past the push's plan (`append_versions`). Do: stage three
+/// revisions over `main` at version 1; record `main` not recovered; commit the batch. Expect: refused `NotRecovered`,
+/// no entry recorded (before, recorded and applied).
+#[test]
+fn t_a927_an_import_batch_onto_a_green_not_recovered_is_refused() {
+  crate::test_store::audit_on_stored_shard("a927-import-batch", |state| {
+    let (repo, main) = repository(state, "batch-given-up");
+    let mut store = Store::default();
+    let trees: Vec<ObjectKey> = [&b"zero"[..], &b"one"[..], &b"two"[..], &b"three"[..]]
+      .iter()
+      .map(|text| store.put_tree(&[("f", text)]))
+      .collect();
+    let first = work(state, main, (0, None), (trees[0], b"h0"), (&store, 1));
+    let update = BranchChange::Update {
+      green: main,
+      work: first,
+    };
+    push(state, &owner(), repo, vec![update], EntryParts::default()).expect("version 1");
+    let batch = staged_batch(state, main, (&trees, &store));
+    given_up(state, &[main]);
+    let entries = |state: &ShardState| state.db.partition().repositories().object_count(repo);
+    let before = entries(state);
+    let committed = batch.commit(state, (&owner(), repo), EntryParts::default());
+    assert_eq!(
+      committed.map(|_| ()),
+      Err(AppendRefused::Repository(not_recovered()))
+    );
+    assert_eq!(entries(state), before, "nothing recorded");
+  });
+}
+
+/// A-927's sweep: the owner's branch verbs name greens without a push. Do: make `topic` from `main`; record both not
+/// recovered; create a branch from `main`, bind a name to `topic`, retire `topic`. Expect: each refused `NotRecovered`
+/// (before, each was served).
+#[test]
+fn t_a927_the_branch_verbs_naming_a_green_not_recovered_are_refused() {
+  crate::test_store::audit_on_stored_shard("a927-branch-verbs", |state| {
+    let (_, main) = repository(state, "verbs-given-up");
+    let topic = branch(state, "verbs-given-up", ("topic", "main"));
+    given_up(state, &[main, topic]);
+    let repository = || "verbs-given-up".to_owned();
+    let bodies = [
+      RequestBody::CreateBranch {
+        repository: repository(),
+        name: "made".to_owned(),
+        from: "main".to_owned(),
+        version: None,
+      },
+      RequestBody::BindBranch {
+        repository: repository(),
+        name: "again".to_owned(),
+        green: crate::verbs::to_wire_volume(topic),
+      },
+      RequestBody::RetireBranch {
+        repository: repository(),
+        name: "topic".to_owned(),
+      },
+    ];
+    for body in bodies {
+      let reply = dispatch(state, 1, &owner(), body.clone());
+      let expected = ReplyBody::Refused {
+        refusal: not_recovered(),
+      };
+      assert_eq!(reply, expected, "{body:?}");
+    }
+  });
+}
+
+/// A-927's sweep: a submit merges into its green at the owner's half of the verdict (`verbs::judge_submission`). Do:
+/// make a work over a green and write a file in it; record the green not recovered; submit the work. Expect: refused
+/// `NotRecovered` (before, accepted).
+#[test]
+fn t_a927_a_submit_into_a_green_not_recovered_is_refused() {
+  crate::test_store::audit_on_stored_shard("a927-submit", |state| {
+    let green = lone_green(state);
+    let made = dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::CreateWork {
+        green: crate::verbs::to_wire_volume(green),
+        name: "given-up-work".to_owned(),
+      },
+    );
+    let ReplyBody::WorkCreated { id: work, .. } = made else {
+      panic!("no work: {made:?}")
+    };
+    let edit = RequestBody::Edit {
+      work,
+      path: "f".to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: b"one".to_vec(),
+    };
+    let edited = dispatch(state, 1, &owner(), edit);
+    assert!(matches!(edited, ReplyBody::Edited { .. }), "{edited:?}");
+    given_up(state, &[green]);
+    let submit = RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+      authorship: slates_ipc::protocol::Authorship::default(),
+    };
+    let expected = ReplyBody::Refused {
+      refusal: not_recovered(),
+    };
+    assert_eq!(dispatch(state, 1, &owner(), submit), expected);
+  });
+}

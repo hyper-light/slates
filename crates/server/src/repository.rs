@@ -1087,7 +1087,11 @@ pub(crate) fn create_branch(
     return reply;
   }
   let name = spelled(&record, name);
-  let source = match source_of(state, &record, from) {
+  // A source this shard did not recover is no branch's source, its engine lent or not (A-927's sweep).
+  let source = match source_of(state, &record, from).and_then(|source| {
+    state.recovered(source)?;
+    Ok(source)
+  }) {
     Ok(source) => source,
     Err(refusal) => return refused(refusal),
   };
@@ -1192,6 +1196,10 @@ pub(crate) fn bind_branch(
   if let Some(reply) = no_subversion_branch(&record) {
     return reply;
   }
+  // No name binds a green this shard did not recover (A-927's sweep).
+  if let Err(refusal) = state.recovered(to_db_volume(green)) {
+    return refused(refusal);
+  }
   // One entry of the repository's register (A-603), whose guard binds a member of this lineage only.
   let entry = next_entry(state, record.id).map(|mut entry| {
     entry.names.push(NameChange::Bind {
@@ -1231,6 +1239,16 @@ pub(crate) fn retire_branch(
   };
   if let Some(reply) = no_subversion_branch(&record) {
     return reply;
+  }
+  // No name of a green this shard did not recover is retired: the green is answered `NotRecovered` until it is, or its
+  // repository destroyed (A-927's sweep).
+  let bound = state
+    .db
+    .partition()
+    .repositories()
+    .branch(record.id, &spelled(&record, name));
+  if let Some(Err(refusal)) = bound.map(|green| state.recovered(green)) {
+    return refused(refusal);
   }
   // One entry of the repository's register (A-603).
   let entry = next_entry(state, record.id).map(|mut entry| {

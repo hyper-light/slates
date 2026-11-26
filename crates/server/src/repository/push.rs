@@ -396,6 +396,8 @@ pub(crate) fn append_versions(
   if !is_member(state, repository, green) {
     return Err(AppendRefused::Repository(Refusal::NotFound));
   }
+  // A green this shard did not recover takes no versions, its engine lent or not (A-927's sweep).
+  state.recovered(green).map_err(AppendRefused::Repository)?;
   let head = state
     .greens
     .get(&green)
@@ -925,6 +927,16 @@ fn plan(
   // Each new branch's id is minted at its own offset, since none is recorded before the entry (A-694).
   let mut minted = 0u64;
   for (index, change) in changes.into_iter().enumerate() {
+    // Every change's green first (A-927's sweep): one this shard did not recover is refused before its engine is read.
+    if let Some(Err(refusal)) =
+      named_green(state, record.id, &change).map(|green| state.recovered(green))
+    {
+      refused.push(ChangeRefused {
+        index,
+        why: ChangeRefusal::Refused(refusal),
+      });
+      continue;
+    }
     let planned = match change {
       BranchChange::Update { green, work } => {
         plan_update(state, record.id, (green, work), &mut greens)
@@ -997,6 +1009,21 @@ fn plan(
     Ok(steps)
   } else {
     Err(refused)
+  }
+}
+
+/// The green `change` writes or names: an update's, a create's source, a delete's (the green its name binds, if any).
+fn named_green(
+  state: &ShardState,
+  repository: RepositoryId,
+  change: &BranchChange,
+) -> Option<DbVolumeId> {
+  match change {
+    BranchChange::Update { green, .. } | BranchChange::UpdateDeferred { green, .. } => Some(*green),
+    BranchChange::Create { from, .. } | BranchChange::CreateDeferred { from, .. } => Some(*from),
+    BranchChange::Delete { name, .. } => {
+      state.db.partition().repositories().branch(repository, name)
+    }
   }
 }
 
