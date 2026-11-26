@@ -939,7 +939,8 @@ impl Index {
   }
 
   /// One step of `planning` ([`Index::plan_begin`]): its rows applied, a row at least, until `spent` says the step's
-  /// slice is spent; once every row is, the revision built and checked as [`Index::plan`] checks it. The index stands
+  /// slice is spent or the last is; once every row is, at the next step, the revision built and checked as
+  /// [`Index::plan`] checks it, the first unit of that step. The index stands
   /// where the plan began between its steps: a revision appended since is refused out of date, as
   /// [`Index::commit_planned`] refuses one.
   ///
@@ -969,7 +970,9 @@ impl Index {
     while let Some(change) = changes.get(at) {
       builder.apply(change)?;
       at = at.saturating_add(1);
-      if at < changes.len() && spent() {
+      // Its last row's step ends there: the plan's finish is a whole part, which begins a step of its own, never ends
+      // one past its quantum (A-920 piece 2c: 4.4 ms at 9,000 files, debug).
+      if at == changes.len() || spent() {
         return Ok(PlanStep::More(Box::new(Planning {
           revision,
           transaction,

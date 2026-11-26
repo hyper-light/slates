@@ -64328,6 +64328,15 @@ GAPS.
   taken a unit a step holds `full.dump`'s history and exports it byte for byte
   (`every_dump_svnadmin_wrote_imports_alike_with_every_check_a_unit_a_step`; a resumed naming that skips a row
   fails it).
+  **2c, the plan's two whole parts begin a step.** The plan's begin (`Index::plan_begin`: the rows sorted, the new
+  root made; 3.4 ms whole at 9,000 files, debug) ran in the step its stored filter's last text ended, and its finish
+  (the revision built and checked as `Index::plan` checks it; 4.4 ms, debug) in the step its last row was applied in,
+  each past that step's quantum: release probe 5's check steps reached 1,030 µs twice in 413, probe 6's 1,368 µs
+  (15 of 1,673 over 1 ms). Each is now the first unit of a step of its own: the stored filter leaves the plan to
+  begin next (`CheckPhase::PlanBegin`, begun only as a step's first unit), and the plan's last row ends its step, its
+  finish taken at the next. Each is still whole (3.4-4.4 ms a unit in debug at a 4 µs quantum); release probe 7 reads
+  them. No test observes which step a whole part runs in; the dump oracle with every check a unit a step holds the
+  history.
 - **Piece 3, the judge** (89-92 ms at 9,000 files after piece 1: the reservation's history walk 19.6 ms and changes
   walk 10.9, `resolve` 11.6, `decide_units` 24.5, `Reached::of` 1.5, `position::verdict` 2.6, `commit_reads` 15.3),
   in parts. **3a, the commit's reads.** `commit_reads` is the check the commit's own preparation makes a slice at a
