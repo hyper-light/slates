@@ -72,7 +72,8 @@ pub struct IndexedObjects<'a> {
   kept: Kept,
   /// What the view has lent.
   counters: Cell<ViewCounters>,
-  /// Where in its pack the last object asked met a window let go, its repository noting it (A-864's push readers).
+  /// The let-go, by the store's number for it, of the window the last object asked met, its repository noting it
+  /// (A-864's push readers; `crate::away`).
   away: Cell<Option<u64>>,
 }
 
@@ -144,7 +145,11 @@ impl receive::Repository for IndexedObjects<'_> {
       // A read of a let-go window is noted on the repository, for the push's driver to bring it back.
       self
         .away
-        .set(self.repository.peek_waiting().map(|waited| waited.offset));
+        .set(self.repository.peek_waiting().and_then(|waited| {
+          self
+            .store
+            .away_number(&waited.pack, waited.len, waited.offset)
+        }));
       return None;
     };
     let bytes = read.into_owned();

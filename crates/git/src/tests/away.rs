@@ -27,8 +27,8 @@ fn a_reader_waits_again_after_a_read_answered_and_for_each_other_window() {
   assert!(!rule.waits(Some(9)));
 }
 
-/// A read that met no let-go window. Do: ask the rule with no window named. Expect: no wait, the reader refuses at once,
-/// as it does for an object nothing holds.
+/// A read that met no let-go window. Do: ask the rule with no window named. Expect: no wait, the reader refuses at
+/// once, as it does for an object nothing holds.
 #[test]
 fn a_read_that_met_no_let_go_window_never_waits() {
   let rule = WaitOnce::<u64>::default();

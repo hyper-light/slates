@@ -86,9 +86,10 @@ pub trait Outside {
   /// The object named `id`, its type and content, if it is held outside the pack.
   fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])>;
 
-  /// Where in its pack the last object asked was not read because it lies in a window let go, to be brought back before
-  /// it is asked again (A-864's push readers; main 01a20182's ruling of 2026-11-22): the resolution stops there and is
-  /// taken again on its next turn. None by default, for an outside that lets nothing go.
+  /// The let-go, by the content store's number for it (`ContentStore::away_number`), of the window the last object
+  /// asked was not read from, to be brought back before it is asked again (A-864's push readers; main 01a20182's ruling
+  /// of 2026-11-22; [`crate::away`]): the resolution stops there and is taken again on its next turn. None by default,
+  /// for an outside that lets nothing go.
   fn away(&self) -> Option<u64> {
     None
   }
@@ -167,9 +168,9 @@ pub trait Contents {
   /// The content of the object kept at position `at` in pack order, named `id`; `None` when none is kept there.
   fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>>;
 
-  /// Where in its pack the let-go window lies that the last [`Contents::content`] to answer none met (goal 93 item 2b,
-  /// held on the node's store, its owner to bring it back: [`crate::away`]); none where it met none, as keepers in
-  /// memory never do.
+  /// The let-go, by the content store's number for it (`ContentStore::away_number`), of the window the last
+  /// [`Contents::content`] to answer none met (goal 93 item 2b, held on the node's store, its owner to bring it back:
+  /// [`crate::away`]); none where it met none, as keepers in memory never do.
   fn content_away(&self) -> Option<u64> {
     None
   }
@@ -608,7 +609,7 @@ struct Resolving {
   /// The next row of `waiting` looked at for a base outside the pack; its length once all are.
   outside: usize,
   /// The row of `waiting` whose base, outside the pack, lay in a let-go window when the turn last stopped there, and
-  /// where in its pack, until a unit resolves after it (A-864's push readers): met so again at the same place with
+  /// that let-go's number, until a unit resolves after it (A-864's push readers): met so again at the same place with
   /// nothing resolved between, it is refused as one not held, so a stop always makes progress or ends (an object across
   /// several let-go windows stops at each in turn; [`crate::away`]'s one rule).
   stopped: WaitOnce<(usize, u64)>,

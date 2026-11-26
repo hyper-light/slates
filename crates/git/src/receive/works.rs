@@ -229,9 +229,9 @@ pub struct Verdicts<'w, G: ?Sized, R: ?Sized, O> {
   room: u64,
   /// A command's work built over the turns before its verdict ([`Verdicts::prepare`]), which its verdict takes.
   prepared: Cell<Option<Preparing>>,
-  /// Where in its pack the let-go window a command's peel last stopped for lies ([`Verdicts::peel_away`]), kept by the
-  /// push across its turns: the same window met again, not brought back, lets the command go on to its refusal
-  /// ([`crate::away`]'s one rule).
+  /// The let-go, by the store's number for it, of the window a command's peel last stopped for
+  /// ([`Verdicts::peel_away`]), kept by the push across its turns: the same let-go met again, the window not brought
+  /// back between, lets the command go on to its refusal ([`crate::away`]'s one rule).
   away_seen: WaitOnce<u64>,
 }
 
@@ -351,7 +351,7 @@ where
     }
   }
 
-  /// Where the let-go window a peel stopped for lies, for the push to keep across its turns ([`Verdicts::peeled`]).
+  /// The let-go a peel stopped for, by its number, for the push to keep across its turns ([`Verdicts::peeled`]).
   pub fn away_seen(&self) -> Option<u64> {
     self.away_seen.last()
   }

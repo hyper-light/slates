@@ -9,12 +9,12 @@
 //! whole pack. A delta's base is read back from the queue or from the quarantine; a thin pack's
 //! from the repository's index.
 //!
-//! **Checked from the quarantine** ([`Quarantined`]): the pack's checks and a verdict read each
-//! object's bytes back by name, where it lies in the push's pack (main's ruling B part 2: the pack is
-//! kept as the client sent it, its objects never inflated beside it). A read that meets a let-go window (a thin pack's
-//! REF_DELTA against the repository's object, whose window a landed pack's let-go gave back) answers none with the
-//! window noted, on the repository for the push's driver to bring back and on the quarantine for its reader to stop at
-//! ([`Contents::content_away`]; goal 93 item 2b, precondition B1 of the landed let-go's lift, main's order of 2026-11-26).
+//! **Checked from the quarantine** ([`Quarantined`]): the pack's checks and a verdict read each object's bytes back by
+//! name, where it lies in the push's pack (main's ruling B part 2: the pack is kept as the client sent it, its objects
+//! never inflated beside it). A read that meets a let-go window (a thin pack's REF_DELTA against the repository's
+//! object, whose window a landed pack's let-go gave back) answers none with the window noted, on the repository for the
+//! push's driver to bring back and on the quarantine for its reader to stop at ([`Contents::content_away`]; goal 93
+//! item 2b, precondition B1 of the landed let-go's lift, main's order of 2026-11-26).
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -93,7 +93,8 @@ pub(crate) struct Quarantined<'s> {
   pub(crate) store: &'s ContentStore,
   /// The repository, whose index holds the objects a pack resends that the quarantine passed over (A-753).
   repository: &'s GitRepository,
-  /// Where the let-go window lies that the last read to answer none met ([`Contents::content_away`]).
+  /// The let-go, by the store's number for it, of the window the last read to answer none met
+  /// ([`Contents::content_away`]).
   away: Cell<Option<u64>>,
 }
 
@@ -117,7 +118,11 @@ impl<'s> Quarantined<'s> {
   fn noted(&self, waited: Option<packed::Waited>) {
     if let Some(waited) = waited {
       self.repository.wait_for(waited);
-      self.away.set(Some(waited.offset));
+      self.away.set(
+        self
+          .store
+          .away_number(&waited.pack, waited.len, waited.offset),
+      );
     }
   }
 }

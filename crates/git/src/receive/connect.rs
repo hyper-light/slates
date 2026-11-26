@@ -13,13 +13,13 @@
 //! known.
 //!
 //! **A let-go window** (goal 93 item 2b; w-git's read sweep, precondition B1 of the landed let-go's lift, main's order
-//! of 2026-11-26). A pushed object's bytes may be read through a base in a window of a landed pack that is let go
-//! (a thin pack's REF_DELTA against the repository's object), and the read answers none with the window named
-//! ([`crate::unpack::Contents::content_away`]). The walk then stops its turn at that object, in either pass, so the push's
-//! driver brings the window back, and reads it again next turn; met again with nothing read between, the object is
-//! `Missing`, as one that cannot be read is ([`crate::away`]'s one rule). Before, such an object was `Missing` at once
-//! in the first pass, and in the second its edges were taken as none, which could leave a tip `Complete` over an object
-//! nothing holds.
+//! of 2026-11-26). A pushed object's bytes may be read through a base in a window of a landed pack that is let go (a
+//! thin pack's REF_DELTA against the repository's object), and the read answers none with the window named
+//! ([`crate::unpack::Contents::content_away`]). The walk then stops its turn at that object, in either pass, so the
+//! push's driver brings the window back, and reads it again next turn; met again with nothing read between, the object
+//! is `Missing`, as one that cannot be read is ([`crate::away`]'s one rule). Before, such an object was `Missing` at
+//! once in the first pass, and in the second its edges were taken as none, which could leave a tip `Complete` over an
+//! object nothing holds.
 //!
 //! **Bounds** (A-719: a push's working set is the slice in flight, never its history). The first pass reads every
 //! pushed object once and judges its own edges out of the pack. When no object is incomplete, no tip can reach one, so
@@ -210,8 +210,8 @@ impl Walk {
     Ok(self.pass == Pass::Done)
   }
 
-  /// One unit of the walk: one object of the first pass, its end, or a frame of the propagation; whether it went on, not
-  /// stopped at an object whose read met a let-go window (the module docs).
+  /// One unit of the walk: one object of the first pass, its end, or a frame of the propagation; whether it went on,
+  /// not stopped at an object whose read met a let-go window (the module docs).
   fn unit<R: Repository + ?Sized>(
     &mut self,
     (request, pushed, repository): (&Request, &Pushed<'_>, &R),
@@ -227,8 +227,8 @@ impl Walk {
     }
   }
 
-  /// The first pass's object: its own edges out of the pack judged; or, its read stopped at a let-go window to wait for,
-  /// nothing judged and `false` (the module docs).
+  /// The first pass's object: its own edges out of the pack judged; or, its read stopped at a let-go window to wait
+  /// for, nothing judged and `false` (the module docs).
   fn judge<R: Repository + ?Sized>(
     &mut self,
     object: &Placed,

@@ -490,8 +490,11 @@
 > order of 2026-11-26).** Each is a push reader that refuses on a let-go window where it should stop and be brought
 > back; each lands alone, red first at the lowest level reaching it, through the store's own let-go, with
 > `read_through.brought_back` asserted moved. The one rule they share is `slates_git::away::WaitOnce` (stop once a
-> window, the driver brings it back, the same window again with nothing read between ends typed), with its own unit
-> tests; the tag peel (`Verdicts::peel_away`) and the unpack's outside bases (`Resolving::stopped`) moved onto it.
+> window, the driver brings it back, the same let-go again with nothing read between ends typed), with its own unit
+> tests; the tag peel (`Verdicts::peel_away`) and the unpack's outside bases (`Resolving::stopped`) moved onto it. A
+> stop is keyed by the let-go's number (`ContentStore::away_number`), not the window's place: a window another reader
+> brought back and let go again before this one read it is a new stop. Keyed by place, B1's red failed once in the
+> parallel run of `git_push`'s tests, passing alone.
 > (b), the shallow fetch's `Unreadable`, was BUILT at 050ef43c2 (2026-11-23, the entry below); its sweep of upload's
 > reads found no B: what an answer reads of a landed pack stops and is brought back, and the rest reads kept parts and
 > whole contents, which no landed let-go reaches (the C list).

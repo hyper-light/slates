@@ -10,8 +10,13 @@
 //! an object nothing holds. [`WaitOnce`] is that rule, kept once for every reader (CLAUDE.md §2 item 7: one path, not a
 //! retry copied into each site).
 //!
-//! What a stop is keyed by is the reader's: a window's offset in its pack for a peel or a check, and an unpack's row and
-//! offset for its outside bases, since two rows may wait on one window and each is taken again in its turn.
+//! A stop is keyed by the let-go it met, the content store's number for it (`ContentStore::away_number`), never by the
+//! window's place alone: a window brought back by another reader and let go again before this one reads it is a new
+//! let-go, waited for again, and only the same let-go met twice ends typed. Keyed by place, B1's red failed once in
+//! the parallel run of the server's `git_push` tests (declined `missing necessary objects`), passing alone; the
+//! window's read and its re-read lie either side of the driver's bring-back, and a derivation behind the first push,
+//! which lets go at its end the windows it brought back, is the reader that can let it go between. An unpack's outside
+//! bases key it by row and number too, since two rows may wait on one window and each is taken again in its turn.
 
 use core::cell::Cell;
 

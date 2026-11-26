@@ -106,8 +106,9 @@ pub trait Repository {
     self.object(id).is_some()
   }
 
-  /// Where in its pack the last object asked was not read because it lies in a window let go (A-864's push readers,
-  /// [`crate::unpack::Outside::away`]). None by default.
+  /// The let-go, by the content store's number for it (`ContentStore::away_number`), of the window the last object
+  /// asked was not read from (A-864's push readers, [`crate::unpack::Outside::away`]; [`crate::away`]). None by
+  /// default.
   fn away(&self) -> Option<u64> {
     None
   }
@@ -311,8 +312,8 @@ impl<'a> Pushed<'a> {
     self.contents?.content(at, &placed.id)
   }
 
-  /// Where in its pack the let-go window lies that the last read of these objects to answer none met, if one did
-  /// ([`Contents::content_away`]): what a reader of them stops for ([`crate::away`]).
+  /// The let-go, by the store's number for it, of the window the last read of these objects to answer none met, if one
+  /// did ([`Contents::content_away`]): what a reader of them stops for ([`crate::away`]).
   pub fn away(&self) -> Option<u64> {
     self.contents?.content_away()
   }

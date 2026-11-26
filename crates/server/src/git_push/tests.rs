@@ -1544,9 +1544,9 @@ const THIN_TREE_FILES: usize = 64;
 /// update it to a commit whose tree adds a file, sent as git sends a thin pack: the tree a REF_DELTA against the first
 /// tree, which the pack does not carry. Drive the update as an edge does, the window each turn met brought back
 /// ([`let_go_at_its_checks`]), and once its pack is read and its checks are due, let every window of the first push's
-/// pack go by hand, as a landed pack's let-go does. Expect: `ok`; the check read the new tree through its base's window,
-/// brought back after the let-go (`vcs_store.read_through.brought_back` moved past it). Red before: `missing necessary
-/// objects`, the check's read of the tree from the quarantine answering none.
+/// pack go by hand, as a landed pack's let-go does. Expect: `ok`; the check read the new tree through its base's
+/// window, brought back after the let-go (`vcs_store.read_through.brought_back` moved past it). Red before: `missing
+/// necessary objects`, the check's read of the tree from the quarantine answering none.
 #[test]
 fn b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands() {
   use slates_git::object_name::{Kind, name_of};
@@ -1627,9 +1627,9 @@ fn thin_tree_pack((commit, blob): (&[u8], &[u8]), (base, tree): (&[u8], &[u8])) 
 }
 
 /// `request` pushed to `repository` by its owner from a task of its shard, driven as an edge drives it (each turn's
-/// let-go window brought back at once, `upload::brought_back_waited`, then its homing carried), every window of `let_go` let go by
-/// hand ([`let_go_by_hand`]) once the push's pack is read and its checks are due: what was received, and the windows
-/// brought back at the let-go and at the end.
+/// let-go window brought back at once, `upload::brought_back_waited`, then its homing carried), every window of
+/// `let_go` let go by hand ([`let_go_by_hand`]) once the push's pack is read and its checks are due: what was received,
+/// and the windows brought back at the let-go and at the end.
 async fn let_go_at_its_checks(
   repository: RepositoryId,
   request: &[u8],

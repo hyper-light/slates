@@ -2404,6 +2404,19 @@ impl ContentStore {
     Some((identity, start, u64::try_from(away).ok()?))
   }
 
+  /// The number of the let-go that gave back the window holding byte `offset` of the object `root` names (`len` bytes
+  /// long), where that window is let go. Each let-go numbers its window afresh (`next_away`), so a window brought back
+  /// and let go again has a new number: a reader that met it once tells a second let-go from the same one met again
+  /// (`slates_git::away`, the push readers' one rule: the same let-go twice with nothing brought back between ends the
+  /// read typed). `None` where the window is held, or the store does not hold the path down to it.
+  pub fn away_number(&self, root: &ContentId, len: u64, offset: u64) -> Option<u64> {
+    let (identity, _, _) = self.away_window(root, len, offset)?;
+    match self.entries.get(&identity)?.kept {
+      Kept::Away { number, .. } => Some(number),
+      _ => None,
+    }
+  }
+
   /// The window holding byte `offset` of the object `root` names (`len` bytes long), let go or held: its identity and its
   /// range in the object, for a reader that keeps it while it reads (A-760 (b) 4d). `None` past the object's end, or
   /// where the store does not hold the path down to it.
@@ -3581,6 +3594,28 @@ mod tests {
     assert_eq!(store.bytes_of(id).as_deref(), Some(bytes));
     assert_eq!(store.counters.brought_back, 1);
     assert_eq!(store.content_bytes, before);
+  }
+
+  /// Goal 93 item 2b, the push readers' one rule (`slates_git::away`). Do: let a landed window go, read its let-go's
+  /// number, bring it back, let it go again. Expect: a number while it is away, none while it is held, and a new one
+  /// for the second let-go, so a reader that met the first tells the two apart.
+  #[test]
+  fn a_window_let_go_again_after_its_bring_back_has_a_new_let_go_number() {
+    let mut store = ContentStore::new(1 << 20, 4096).unwrap();
+    let bytes = vec![7u8; 1000];
+    let id = store.put(&bytes).unwrap();
+    assert!(store.mark_landed(&id));
+    store.let_go(&id).unwrap();
+    let first = store.away_number(&id, 1000, 0);
+    assert!(first.is_some(), "a number while away");
+    store.bring_back(&id, &bytes).unwrap();
+    assert_eq!(store.away_number(&id, 1000, 0), None, "none while held");
+    store.let_go(&id).unwrap();
+    let second = store.away_number(&id, 1000, 0);
+    assert!(
+      second.is_some() && second != first,
+      "{first:?} then {second:?}"
+    );
   }
 
   /// `len` bytes of a pattern that repeats every 251, so no two windows of a test's object are alike.
