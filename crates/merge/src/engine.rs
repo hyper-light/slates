@@ -1410,6 +1410,12 @@ pub struct Green {
   /// flat lists; one each had been freed a unit at a time, and the free that emptied the allocator's region cost a
   /// gathering's step 1.2 ms). A cell, as `fast_path_hits` is.
   unit_effect_lists: std::cell::Cell<u64>,
+  /// The changed paths a commit put in a tree set of its own (A-920 3m: none, since its paths are ordered a unit at a
+  /// time with no tree; 9,000 String clones and their nodes had been 0.73-0.78 ms of one step, debug).
+  commit_tree_paths: u64,
+  /// The changed paths' Strings a commit made, each the one its change entry keeps (A-920 3m's non-vacuity count: one a
+  /// distinct path the effects change, made once).
+  commit_paths_made: u64,
   /// The units of computed verdicts judged again because the green moved since they were computed
   /// ([`Green::judged_again`], A-658).
   judged_again: u64,
@@ -2472,6 +2478,216 @@ enum Prep {
     wholes: Vec<(usize, usize)>,
     at: usize,
   },
+  /// The whole runs' buffers moved into their files, a run a unit ([`move_whole_runs`]), once every other file is made.
+  Moving {
+    names: Vec<(usize, crate::named::Identity)>,
+    wholes: Vec<(usize, usize)>,
+    at: usize,
+  },
+  /// The commit begun over the effects, a part a step ([`Beginning`]).
+  Beginning(Box<Beginning>),
+}
+
+/// A commit being begun over its effects, a part a step (A-920 3m): whole, its beginning had been the commit's longest
+/// step, 1.2 ms at 9,000 effects (debug), and its changed-path set of String clones 0.73-0.78 ms of it. Each mapped file
+/// made from the head the verdict judged, a file a unit; the node moves, the copied trees' links and the copies each a
+/// whole part, beginning a step of its own; then the effects' paths put in order a unit at a time ([`PathOrder`]).
+struct Beginning {
+  names: Vec<(usize, crate::named::Identity)>,
+  stage: BeginStage,
+  /// The paths the copies changed, in path order, once they are committed.
+  copied: Vec<String>,
+  order: PathOrder,
+}
+
+/// Where a [`Beginning`] is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BeginStage {
+  /// Each mapped file made, from this effect.
+  Remapping(usize),
+  /// The node moves the version's effects add.
+  Moves,
+  /// The links a copied tree's hard links add.
+  Links,
+  /// The copies committed.
+  Copies,
+  /// The effects' paths' sorted runs found, from this effect.
+  Runs(usize),
+  /// The runs merged in path order, a path a unit.
+  Merging,
+}
+
+/// The effects' paths put in path order, each once, a unit at a time and with no tree (A-920 3m): the paths' sorted runs
+/// found an effect a unit (the verdict pushes each dimension's in path order), then merged by a heap of the runs, least
+/// path first, a path a unit, each distinct path ranked. A rank is where its String goes once its effect is applied
+/// ([`ChangedPaths`]), so each is made once, the one its change entry keeps.
+#[derive(Default)]
+struct PathOrder {
+  /// Each run's next place and its end.
+  runs: Vec<(usize, usize)>,
+  /// The runs' indices not yet merged out, a heap by each one's next path, least at the top.
+  heap: Vec<usize>,
+  /// Each effect's rank among the distinct paths, by place; `u32::MAX` where an effect earlier in the order has its path.
+  slot_of: Vec<u32>,
+  /// The distinct paths ranked.
+  ranked: u32,
+  /// The place of the last path ranked.
+  last: Option<usize>,
+  /// Where the run being found begins.
+  run_start: usize,
+}
+
+/// Format: no rank, for an effect whose path an earlier one in the order has ([`PathOrder::slot_of`]).
+const NO_RANK: u32 = u32::MAX;
+
+impl PathOrder {
+  /// The path of the next place of run `run`.
+  fn key<'e>(&self, effects: &'e [Effect], run: usize) -> Option<&'e str> {
+    let (next, _) = *self.runs.get(run)?;
+    effects.get(next).map(Effect::path)
+  }
+
+  /// Whether the heap's entry at `a` goes before the one at `b`.
+  fn before(&self, effects: &[Effect], (a, b): (usize, usize)) -> bool {
+    let (Some(&a), Some(&b)) = (self.heap.get(a), self.heap.get(b)) else {
+      return false;
+    };
+    self.key(effects, a) < self.key(effects, b)
+  }
+
+  /// Run `run` added to the heap.
+  fn push(&mut self, effects: &[Effect], run: usize) {
+    self.heap.push(run);
+    let mut at = self.heap.len().saturating_sub(1);
+    while at > 0 {
+      let parent = at.saturating_sub(1) / 2;
+      if !self.before(effects, (at, parent)) {
+        break;
+      }
+      self.heap.swap(at, parent);
+      at = parent;
+    }
+  }
+
+  /// The heap's top moved down to its place.
+  fn sift_down(&mut self, effects: &[Effect]) {
+    let mut at = 0usize;
+    loop {
+      let left = at.saturating_mul(2).saturating_add(1);
+      let right = left.saturating_add(1);
+      let mut least = at;
+      if left < self.heap.len() && self.before(effects, (left, least)) {
+        least = left;
+      }
+      if right < self.heap.len() && self.before(effects, (right, least)) {
+        least = right;
+      }
+      if least == at {
+        return;
+      }
+      self.heap.swap(at, least);
+      at = least;
+    }
+  }
+
+  /// The effect at `at` met in the runs' walk: a run ends before it where its path goes before the one before it.
+  /// Whether it was the last.
+  fn find_run(&mut self, effects: &[Effect], at: usize) -> bool {
+    if self.slot_of.len() != effects.len() {
+      self.slot_of = vec![NO_RANK; effects.len()];
+    }
+    let earlier = at.checked_sub(1).and_then(|before| effects.get(before));
+    if let (Some(earlier), Some(effect)) = (earlier, effects.get(at))
+      && effect.path() < earlier.path()
+    {
+      self.close_run(effects, at);
+    }
+    let last = at.saturating_add(1) >= effects.len();
+    if last {
+      self.close_run(effects, effects.len());
+    }
+    last
+  }
+
+  /// The run being found ends before `end`, a run of the heap where it holds any path.
+  fn close_run(&mut self, effects: &[Effect], end: usize) {
+    if end > self.run_start {
+      let run = self.runs.len();
+      self.runs.push((self.run_start, end));
+      self.push(effects, run);
+    }
+    self.run_start = end;
+  }
+
+  /// The least path left ranked, unless it is the last one's: whether any was left.
+  fn merge_one(&mut self, effects: &[Effect]) -> bool {
+    let Some(&top) = self.heap.first() else {
+      return false;
+    };
+    let Some(&(next, end)) = self.runs.get(top) else {
+      return false;
+    };
+    let path = effects.get(next).map(Effect::path);
+    let last = self
+      .last
+      .and_then(|last| effects.get(last))
+      .map(Effect::path);
+    if last != path
+      && let Some(slot) = self.slot_of.get_mut(next)
+    {
+      *slot = self.ranked;
+      self.ranked = self.ranked.saturating_add(1);
+      self.last = Some(next);
+    }
+    let after = next.saturating_add(1);
+    if let Some(run) = self.runs.get_mut(top) {
+      run.0 = after;
+    }
+    if after >= end {
+      self.heap.swap_remove(0);
+    }
+    self.sift_down(effects);
+    true
+  }
+}
+
+/// A commit's changed paths, each once, walked in path order with no tree (A-920 3m): the effects' distinct paths in the
+/// order [`PathOrder`] ranked them, each String made as its effect is applied, the one its change entry keeps; the
+/// paths the copies changed; and the hard links naming a changed special, once found.
+#[derive(Default)]
+struct ChangedPaths {
+  paths: Vec<String>,
+  /// Each effect's rank in `paths`, by place ([`PathOrder::slot_of`]).
+  slot_of: Vec<u32>,
+  copied: Vec<String>,
+  links: Vec<String>,
+  /// The walk's next of `paths`, `copied` and `links`.
+  at: [usize; 3],
+}
+
+impl ChangedPaths {
+  /// Its next path in path order, taken from whichever list holds it ([`Green::change_one`]): none once every one is.
+  fn take_next(&mut self) -> Option<String> {
+    let [paths, copied, links] = self.at;
+    let candidates = [
+      self.paths.get(paths),
+      self.copied.get(copied),
+      self.links.get(links),
+    ];
+    let (least, _) = candidates
+      .iter()
+      .enumerate()
+      .filter_map(|(list, path)| path.map(|path| (list, path)))
+      .min_by(|(_, a), (_, b)| a.cmp(b))?;
+    let (list, at) = match least {
+      0 => (&mut self.paths, &mut self.at[0]),
+      1 => (&mut self.copied, &mut self.at[1]),
+      _ => (&mut self.links, &mut self.at[2]),
+    };
+    let path = list.get_mut(*at).map(core::mem::take);
+    *at = at.saturating_add(1);
+    path
+  }
 }
 
 impl core::fmt::Debug for Applying {
@@ -2485,7 +2701,7 @@ impl core::fmt::Debug for Applying {
   }
 }
 
-/// A commit under way ([`Green::commit_begin`], [`Green::commit_step`]): its version, the effects left to apply and the
+/// A commit under way ([`Green::beginning_some`], [`Green::commit_step`]): its version, the effects left to apply and the
 /// place of the next, the names of the files named whole, what it staged, its delta and the paths it changed.
 struct CommitRun {
   version: u64,
@@ -2494,11 +2710,9 @@ struct CommitRun {
   names: Vec<(usize, crate::named::Identity)>,
   staged: Staged,
   delta: BTreeMap<String, Vec<Op>>,
-  changed: BTreeSet<String>,
-  /// The hard links naming a changed path that was a special, found so far: changed with it (A-920 piece 1b).
-  links: Vec<String>,
-  /// The last changed path whose links were found.
-  links_after: Option<String>,
+  /// The paths it changed, in path order with no tree (A-920 3m); the hard links naming one that was a special join them
+  /// once found (A-920 piece 1b).
+  changed: ChangedPaths,
   /// The version's change entries recorded so far, in path order.
   entries: Vec<ChangeEntry>,
   phase: CommitPhase,
@@ -3982,6 +4196,16 @@ impl Green {
           last: entry.last,
         })
     })
+  }
+
+  /// The changed paths commits put in a tree set of their own ([`Green::commit_tree_paths`]'s field, A-920 3m).
+  pub fn commit_tree_paths(&self) -> u64 {
+    self.commit_tree_paths
+  }
+
+  /// The changed paths' Strings commits made ([`Green::commit_paths_made`]'s field, A-920 3m).
+  pub fn commit_paths_made(&self) -> u64 {
+    self.commit_paths_made
   }
 
   /// The effect lists a verdict's units allocated of their own ([`Green::unit_effect_lists`]'s field, A-920 3l).
@@ -5981,40 +6205,6 @@ impl Green {
     }
   }
 
-  /// A commit's work before any effect is applied, its `names` the effects' places whose files are named for the object
-  /// they are the whole of ([`named_files`]): the mapped files made from the head the verdict judged, the node moves and copied links derived from it, and the copies applied, each before the head changes.
-  fn commit_begin(
-    &mut self,
-    mut effects: Vec<Effect>,
-    version: u64,
-    post_state: crate::named::Post<'_>,
-    names: &[(usize, crate::named::Identity)],
-  ) -> CommitRun {
-    // First, before a copy or a node move changes the head: each mapped file from the head the verdict judged.
-    self.make_mapped(&mut effects, post_state, &[]);
-    let moves = self.node_moves(&effects);
-    effects.extend(moves);
-    // A copied tree's hard links name the copy's nodes, or nodes of their own (`Green::copy_link_effects`), read from the
-    // head before the copies land and applied after them.
-    let linked = self.copy_link_effects(&effects);
-    effects.extend(linked);
-    let mut changed: BTreeSet<String> = effects.iter().map(|e| e.path().to_owned()).collect();
-    changed.extend(self.commit_copies(&effects, version));
-    CommitRun {
-      version,
-      effects: effects.into_iter(),
-      place: 0,
-      names: names.to_vec(),
-      staged: Staged::default(),
-      delta: BTreeMap::new(),
-      changed,
-      links: Vec::new(),
-      links_after: None,
-      entries: Vec::new(),
-      phase: CommitPhase::Effects,
-    }
-  }
-
   /// Takes `run` on an effect, a staged removal or a staged file at a time, at least one, until `spent` says its caller's
   /// slice is spent: whether it has ended (its delta pushed and its changes recorded). No count of units: a file set
   /// costs many times a removal, so the caller's clock, not a number, ends the slice.
@@ -6032,6 +6222,15 @@ impl Green {
               .ok()
               .and_then(|at| run.names.get(at))
               .map(|(_, identity)| *identity);
+            if let Some(slot) = run.changed.slot_of.get(place).copied()
+              && let Some(path) = run
+                .changed
+                .paths
+                .get_mut(usize::try_from(slot).unwrap_or(usize::MAX))
+            {
+              *path = effect.path().to_owned();
+              self.commit_paths_made = self.commit_paths_made.saturating_add(1);
+            }
             self.apply_effect(effect, run.version, &mut run.staged, name);
           }
           None => {
@@ -6093,22 +6292,33 @@ impl Green {
   /// The hard links naming the next changed path where it was a special, a path a unit: changed with it. Once every
   /// changed path is looked at, they join the changed paths, and their recording begins.
   fn links_one(&mut self, run: &mut CommitRun) {
-    let after = run.links_after.as_deref();
-    let bounds = (
-      after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
-      std::ops::Bound::Unbounded,
-    );
-    let Some(path) = run.changed.range::<str, _>(bounds).next() else {
-      run.changed.extend(core::mem::take(&mut run.links));
-      run.phase = CommitPhase::Changes;
-      return;
+    let changed = &mut run.changed;
+    let [paths, copied, _] = &mut changed.at;
+    let path = match changed.paths.get(*paths) {
+      Some(path) => {
+        *paths = paths.saturating_add(1);
+        path
+      }
+      None => match changed.copied.get(*copied) {
+        Some(path) => {
+          *copied = copied.saturating_add(1);
+          path
+        }
+        None => {
+          // Every changed path looked at: the links found join them, in path order, each once.
+          changed.links.sort_unstable();
+          changed.links.dedup();
+          changed.at = [0; 3];
+          run.phase = CommitPhase::Changes;
+          return;
+        }
+      },
     };
     if self.was_special(path) {
-      run
+      changed
         .links
         .extend(self.links_to.get(path).into_iter().flatten().cloned());
     }
-    run.links_after = Some(path.clone());
   }
 
   /// The next changed path recorded as changed at the commit's version, a path a unit: the path's last change, its
@@ -6116,7 +6326,14 @@ impl Green {
   /// for a version that changed nothing): whether the commit ended.
   fn change_one(&mut self, run: &mut CommitRun) -> bool {
     let version = run.version;
-    let Some(path) = run.changed.pop_first() else {
+    // The next changed path not the last one recorded: a path both an effect and a copy, or a link, change is one entry.
+    let next = loop {
+      match run.changed.take_next() {
+        Some(path) if run.entries.last().is_some_and(|entry| entry.path == path) => {}
+        next => break next,
+      }
+    };
+    let Some(path) = next else {
       if !run.entries.is_empty() {
         self
           .changes
@@ -7471,13 +7688,15 @@ impl Green {
   /// [`Green::apply_step`] once every effect is made: the commit's preparation a phase at a time, each an effect at a
   /// time until `spent` (A-917's owed phases, cut 3: it was one call of 30 ms at 9,000 files, debug): each effect's sole
   /// run, then each one's read of a text held by name alone checked (a slice that meets one undone, and the texts asked
-  /// for, [`ApplyStep::Lend`]), then each mapped file made; then the commit begun ([`Green::commit_begin`]).
+  /// for, [`ApplyStep::Lend`]), then each mapped file made; then the commit begun ([`Green::beginning_some`]).
   fn prepare_step(
     &mut self,
     run: &mut Applying,
     (post_state, runs): (&[u8], &crate::named::RunTable),
     spent: &mut dyn FnMut() -> bool,
   ) -> ApplyStep {
+    // Whether no unit has run in this step yet: a whole part runs only as a step's first (A-920 3m).
+    let mut fresh = true;
     loop {
       let stepped = match run.prep {
         // Begun by its owner ([`Prep::sole`]); never met here.
@@ -7487,10 +7706,13 @@ impl Green {
         Prep::Alone { .. } => Green::alone_some(run, spent),
         Prep::Reads { .. } => self.reads_some(run, spent),
         Prep::Mapped { .. } => Some(self.mapped_some(run, (post_state, runs), spent)),
+        Prep::Moving { .. } => Green::moving_some(run, spent),
+        Prep::Beginning(_) => self.beginning_some(run, (post_state, runs), (fresh, spent)),
       };
       if let Some(stepped) = stepped {
         return stepped;
       }
+      fresh = false;
     }
   }
 
@@ -7643,7 +7865,7 @@ impl Green {
   }
 
   /// [`Prep::Mapped`]: each mapped file made, a file a unit, until `spent`; once every one is, the whole runs' buffers
-  /// moved into their files and the commit begun ([`Green::commit_begin`]).
+  /// moved into their files and the commit begun ([`Green::beginning_some`]).
   fn mapped_some(
     &mut self,
     run: &mut Applying,
@@ -7661,17 +7883,149 @@ impl Green {
         return ApplyStep::More;
       }
     }
-    let mut effects = core::mem::take(&mut run.effects);
-    move_whole_runs(&mut effects, &mut run.read, wholes);
-    let version = self.head().saturating_add(1);
-    let names = core::mem::take(names);
-    run.commit = Some(self.commit_begin(
-      effects,
-      version,
-      crate::named::Post::of(post_state, &run.read, runs),
-      &names,
-    ));
+    let (names, wholes) = (core::mem::take(names), core::mem::take(wholes));
+    run.prep = Prep::Moving {
+      names,
+      wholes,
+      at: 0,
+    };
     ApplyStep::More
+  }
+
+  /// [`Prep::Moving`]: the whole runs' buffers moved into their files, a run a unit, until `spent`; once every one is,
+  /// the commit's beginning begun ([`Green::beginning_some`]).
+  fn moving_some(run: &mut Applying, spent: &mut dyn FnMut() -> bool) -> Option<ApplyStep> {
+    let Prep::Moving { names, wholes, at } = &mut run.prep else {
+      return Some(ApplyStep::More);
+    };
+    while let Some(whole) = wholes.get(*at) {
+      move_whole_runs(
+        &mut run.effects,
+        &mut run.read,
+        core::slice::from_ref(whole),
+      );
+      *at = at.saturating_add(1);
+      if wholes.get(*at).is_some() && spent() {
+        return Some(ApplyStep::More);
+      }
+    }
+    run.prep = Prep::Beginning(Box::new(Beginning {
+      names: core::mem::take(names),
+      stage: BeginStage::Remapping(0),
+      copied: Vec::new(),
+      order: PathOrder::default(),
+    }));
+    None
+  }
+
+  /// [`Prep::Beginning`]: the commit begun over the effects, a part a step ([`Beginning`]), until `spent`; a whole part
+  /// (the node moves, the copied trees' links, the copies) runs only as a step's first unit (`fresh`). Once the paths are
+  /// in order, the commit run made.
+  fn beginning_some(
+    &mut self,
+    run: &mut Applying,
+    (post_state, runs): (&[u8], &crate::named::RunTable),
+    (fresh, spent): (bool, &mut dyn FnMut() -> bool),
+  ) -> Option<ApplyStep> {
+    let Prep::Beginning(beginning) = &mut run.prep else {
+      return Some(ApplyStep::More);
+    };
+    let version = self.head().saturating_add(1);
+    let whole = matches!(
+      beginning.stage,
+      BeginStage::Moves | BeginStage::Links | BeginStage::Copies
+    );
+    if whole && !fresh {
+      return Some(ApplyStep::More);
+    }
+    match beginning.stage {
+      BeginStage::Remapping(at) => {
+        // Each mapped file from the head the verdict judged, before a copy or a node move changes it.
+        let post = crate::named::Post::of(post_state, &run.read, runs);
+        let mut at = at;
+        while let Some(effect) = run.effects.get_mut(at) {
+          self.make_mapped_one((at, effect), post, &[]);
+          at = at.saturating_add(1);
+          if run.effects.get(at).is_some() && spent() {
+            beginning.stage = BeginStage::Remapping(at);
+            return Some(ApplyStep::More);
+          }
+        }
+        beginning.stage = BeginStage::Moves;
+      }
+      BeginStage::Moves => {
+        let moves = self.node_moves(&run.effects);
+        run.effects.extend(moves);
+        beginning.stage = BeginStage::Links;
+      }
+      BeginStage::Links => {
+        // A copied tree's hard links name the copy's nodes, or nodes of their own (`Green::copy_link_effects`), read from
+        // the head before the copies land and applied after them.
+        let linked = self.copy_link_effects(&run.effects);
+        run.effects.extend(linked);
+        beginning.stage = BeginStage::Copies;
+      }
+      BeginStage::Copies => {
+        // The copies' changed paths come as their own set; counted as a tree's (A-920 3m).
+        beginning.copied = self
+          .commit_copies(&run.effects, version)
+          .into_iter()
+          .collect();
+        let copied = u64::try_from(beginning.copied.len()).unwrap_or(u64::MAX);
+        self.commit_tree_paths = self.commit_tree_paths.saturating_add(copied);
+        beginning.stage = BeginStage::Runs(0);
+      }
+      BeginStage::Runs(at) => {
+        let mut at = at;
+        loop {
+          if run.effects.is_empty() || beginning.order.find_run(&run.effects, at) {
+            beginning.stage = BeginStage::Merging;
+            break;
+          }
+          at = at.saturating_add(1);
+          if spent() {
+            beginning.stage = BeginStage::Runs(at);
+            return Some(ApplyStep::More);
+          }
+        }
+      }
+      BeginStage::Merging => {
+        while beginning.order.merge_one(&run.effects) {
+          if spent() {
+            return Some(ApplyStep::More);
+          }
+        }
+        let Prep::Beginning(begun) = core::mem::replace(&mut run.prep, Prep::Effects) else {
+          return Some(ApplyStep::More);
+        };
+        let Beginning {
+          names,
+          copied,
+          order,
+          ..
+        } = *begun;
+        let ranked = usize::try_from(order.ranked).unwrap_or(0);
+        run.commit = Some(CommitRun {
+          version,
+          effects: core::mem::take(&mut run.effects).into_iter(),
+          place: 0,
+          names,
+          staged: Staged::default(),
+          delta: BTreeMap::new(),
+          changed: ChangedPaths {
+            paths: std::iter::repeat_with(String::new).take(ranked).collect(),
+            slot_of: order.slot_of,
+            copied,
+            links: Vec::new(),
+            at: [0; 3],
+          },
+          entries: Vec::new(),
+          phase: CommitPhase::Effects,
+        });
+        return Some(ApplyStep::More);
+      }
+    }
+    None
   }
 
   /// The effects a chain entry records for `inc`, with every read its commit makes of the head checked

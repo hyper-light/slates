@@ -1450,3 +1450,37 @@ fn a_verdicts_units_allocate_no_effect_list_of_their_own() {
     "effect lists the units allocated of their own"
   );
 }
+
+/// A-920 3m (a commit's changed paths ordered a unit at a time, with no tree): a commit's paths took 0.73-0.78 ms of one
+/// step in a tree set of String clones (debug, 9,000 effects), its nodes made and freed. Do: submit, at the origin's
+/// version, a work that writes into every file, sets the first's mode (a second effect at one path) and makes a file.
+/// Expect it accepted; no changed path put in a tree set of the commit's own (`Green::commit_tree_paths`); and one
+/// String made for each distinct path its effects change, the one its change entry keeps (`Green::commit_paths_made`:
+/// five, the four files and the made one).
+#[test]
+fn a_commits_changed_paths_are_ordered_without_a_tree_each_made_once() {
+  let mut green = Green::with_origin(origin());
+  let mut draft = Draft::default();
+  for (at, path) in FILES.iter().enumerate() {
+    draft.content(OpKind::Insert, path, at as u64, b"+");
+  }
+  draft.op(
+    OpKind::SetMode,
+    FILES[0],
+    (0, u64::from(MODES[1]), u64::MAX),
+  );
+  draft.alone(OpKind::Create, "made");
+  draft.content(OpKind::Insert, "made", 0, b"new");
+  let inc = increment(draft, green.head(), 1);
+  assert!(matches!(green.submit(&inc), Outcome::Accepted { .. }));
+  assert_eq!(
+    green.commit_tree_paths(),
+    0,
+    "changed paths put in a tree set"
+  );
+  assert_eq!(
+    green.commit_paths_made(),
+    FILES.len() as u64 + 1,
+    "changed paths' Strings made"
+  );
+}
