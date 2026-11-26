@@ -1173,7 +1173,10 @@
 >     tests refused with its allowance taken away: `vcs_http::daemon_edge` and `vcs_store::upload` reach it no more, and
 >     one `vcs_share` test's Mercurial creation (`hg_repository`, w-hg's) moved here from `audit_on_stored_shard` when
 >     its git creation left the shard.
->   - `git_push::tests::carry_blocking` (8): w-git. (`git_push::tests::git_repository`, 41 sites, emptied and removed
+>   - `git_push::tests::carry_blocking` (3 direct sites: `git_push::tests::answered`, the synchronous push driver every
+>     remaining `pushed` reaches; `vcs_share/tests.rs` 1; `vcs_store/commits.rs` 1): w-git. `git_push/tests.rs`'s 50
+>     tests push by awaiting now (`on_stored_shard_awaited`, `pushed_awaited`, `pushed_on`: a shard task that carries
+>     with `carry_awaited` and drops its push where the state is lent, as a step does), 5 direct sites gone. (`git_push::tests::git_repository`, 41 sites, emptied and removed
 >     by w-git: each caller makes its repository from the test's thread, `git_repository_on`, or through
 >     `on_stored_shard_with`.)
 >   - w-hg's push and import helpers, counted by the tests refused without each once the entries above let them

@@ -408,8 +408,8 @@ pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   },
   Allowed {
     fixture: "git_push::tests::carry_blocking",
-    owner: "w-git",
-    reaching: 8,
+    owner: "w-git (git_push::tests::answered, vcs_share::tests 1, vcs_store::commits 1)",
+    reaching: 3,
   },
 ];
 
