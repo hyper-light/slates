@@ -9223,6 +9223,185 @@ mod tests {
     }
   }
 
+  /// Bytes no deflate shortens (a xorshift's stream), `len` of them: a file whose pack is as long as it.
+  fn incompressible(len: usize) -> Vec<u8> {
+    let mut word = 0x9e37_79b9_7f4a_7c15u64;
+    (0..len)
+      .map(|_| {
+        word ^= word << 13;
+        word ^= word >> 7;
+        word ^= word << 17;
+        word.to_le_bytes()[0]
+      })
+      .collect()
+  }
+
+  /// What keeps a restarted daemon's segment, rendezvous and store alive: dropped after the daemon stops.
+  type Restarted = (
+    crate::test_store::TestStore,
+    slates_anchor::AnchorSegment,
+    slates_ipc::HeldRendezvous,
+  );
+
+  /// A store-backed daemon `instance` over a fresh segment, `request` pushed to its repository `landed` as an edge
+  /// drives a push (`git_push::tests::homed_drive`), every window of the pushed pack let go (marked landed, as goal
+  /// 93's landed let-go leaves it: [`let_go_picked`]) and the image published, then stopped (a crash) and a successor
+  /// started over the same segment and store, its content store holding none of the pack: the successor, what keeps it
+  /// alive, and the repository.
+  fn pushed_and_restarted(
+    instance: &str,
+    request: Vec<u8>,
+  ) -> (super::Daemon, Restarted, slates_db::catalog::RepositoryId) {
+    let store = crate::test_store::TestStore::start(instance);
+    let profile = test_profile();
+    let instance = format!("{instance}-{}", std::process::id());
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
+    let segment =
+      slates_anchor::AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+        .unwrap()
+        .with_content(&super::content_name_of(&instance), config.content_bytes())
+        .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let repository = crate::git_push::tests::git_repository_on(&first, "landed");
+    let pack = request
+      .windows(4)
+      .position(|magic| magic == b"PACK")
+      .and_then(|at| request.get(at..))
+      .expect("the request's pack")
+      .to_vec();
+    let (sent, got) = std::sync::mpsc::channel();
+    first
+      .observe(first.shards.first().copied(), move |_| {
+        let task = slates_rt::futures::spawn(async move {
+          let answered = crate::git_push::tests::homed_drive(repository, &request).await;
+          let _ = sent.send(answered.map(|_| ()));
+        })
+        .unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      })
+      .unwrap();
+    got
+      .recv()
+      .expect("the push answered")
+      .expect("the push homed, landed and answered");
+    first
+      .observe(first.shards.first().copied(), move |state| {
+        let window = state
+          .vcs_stores
+          .content()
+          .map_or(1, slates_vcs::ContentStore::window);
+        let windows: Vec<_> = pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+        let_go_picked(state, &windows, &mut || true);
+      })
+      .unwrap();
+    first.publish_every_shard().unwrap();
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    (second, (store, segment, rendezvous), repository)
+  }
+
+  /// What a successor's recovery of `repository` read, once it ended (recovered, or a replay refused): whether it
+  /// recovered, the replays refused, the changesets read, the most of its pack a replay held at once, and the bound a
+  /// replay's read of its pack is held within ([`crate::vcs_store::replay_pack_bound`]).
+  fn recovered_reading(
+    daemon: &super::Daemon,
+    repository: slates_db::catalog::RepositoryId,
+  ) -> (bool, u64, u64, u64, usize) {
+    let (sent, got) = std::sync::mpsc::channel();
+    let watch = move |_: &mut crate::state::ShardState| {
+      let sent = sent.clone();
+      let task = slates_rt::futures::spawn(async move {
+        loop {
+          let seen = crate::state::with_state(|state| {
+            let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+            let recovered = state.vcs_stores.unrecovered(repository).is_none()
+              && !state.vcs_stores.rebuilding(repository)
+              && state.vcs_stores.holds(repository);
+            let quantum = state.config.step_quantum_ns();
+            (
+              recovered,
+              count(crate::vcs_store::REPLAY_REFUSED),
+              count(crate::vcs_store::CHANGESET_READ),
+              count(crate::vcs_store::REPLAY_PACK_HELD_MOST),
+              crate::vcs_store::replay_pack_bound(&state.config, quantum),
+            )
+          });
+          if let Some(seen) = seen
+            && (seen.0 || seen.1 > 0)
+          {
+            let _ = sent.send(seen);
+            break;
+          }
+          slates_rt::futures::yield_now().await;
+        }
+      });
+      if let Ok(task) = task {
+        let _ = slates_rt::futures::detach(task);
+      }
+    };
+    let shard = daemon.shards.first().copied();
+    let started = std::time::Instant::now();
+    let bound = std::time::Duration::from_nanos(10 * crate::daemon::LIVENESS_BUDGET_NS);
+    while daemon.observe(shard, watch.clone()).is_err() {
+      assert!(
+        started.elapsed() < bound,
+        "the successor's shard never took the watch"
+      );
+      std::thread::park_timeout(std::time::Duration::from_millis(50));
+    }
+    got.recv().expect("recovered")
+  }
+
+  /// Main's order of 2026-11-26 (C2 of w-git's close list: a replay read its record's pack whole from the node's store,
+  /// one buffer as long as the pack, a working set that grows with the push, §2 item 8). Do: push a create whose one
+  /// file is incompressible and [`REPLAY_PACKS`] times the bound a replay's read of its pack is held within, its pack
+  /// as long; start a successor over the same segment and store, which recovers the repository by reading the push's
+  /// changeset. Expect: recovered, no replay refused, one changeset read; the most of its pack the replay held at once
+  /// (`vcs_store.git_replay_pack_held_most`) within the bound, the pack past it. Red before: the whole pack in one
+  /// buffer.
+  #[test]
+  fn t_c2_a_restarts_replay_reads_its_records_pack_a_piece_at_a_time_within_its_bound() {
+    let profile = test_profile();
+    let config = crate::DaemonConfig::derive(&profile, "c2-replay-bound", Some(1));
+    let bound = crate::vcs_store::replay_pack_bound(&config, config.step_quantum_ns());
+    let file = incompressible(bound.saturating_mul(REPLAY_PACKS));
+    let (request, _) = crate::git_push::tests::create_of_file(file.clone());
+    let (successor, kept, repository) = pushed_and_restarted("c2-replay-bound", request);
+    let (recovered, refused, read, held_most, bound) = recovered_reading(&successor, repository);
+    successor.stop();
+    drop(kept);
+    eprintln!(
+      "replay held at most {held_most} B of a pack past {} B, bound {bound} B",
+      file.len()
+    );
+    assert!(file.len() > bound, "the pack past the bound");
+    assert_eq!(
+      (recovered, refused, read),
+      (true, 0, 1),
+      "recovered from its changeset"
+    );
+    assert!(
+      held_most > 0 && held_most <= u64::try_from(bound).unwrap(),
+      "the replay held {held_most} B of its pack at once, past the bound {bound} B"
+    );
+  }
+
+  /// Shape: how many times [`crate::vcs_store::replay_pack_bound`] the C2 test's pack is: past it by more than its
+  /// pieces' rounding.
+  const REPLAY_PACKS: usize = 4;
+
   /// A-767 C5 (git onto the changeset store; main's order of 2026-11-20 ~21:20: "red first: a stock git push lands as
   /// one changeset, and a daemon restarted with kill -9 replays it"). Do: on a daemon over a retained anchor segment
   /// holding a store (the one shared test store), create a git repository and push the fixtures' `create` as stock git

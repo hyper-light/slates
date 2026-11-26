@@ -2319,9 +2319,16 @@
 > the held verdict's preview, its changeset homed and landed, then recorded version 5 with its version in one step
 > (`t_c5b_p3_…`; counter `vcs_commits.made_landed`); a kill between the landing and the step recovers to before and the
 > retry lands once (`t_c5b_p3_a_kill_…`). Part 2 BUILT (A-824): every made commit lands, version 2 is written by no path and
-> refused `Retired` at replay with version 1; a made commit's map is put a slice a turn over the preview. Owed (w-git):
-> the replay reading the pack a piece at
-> a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
+> refused `Retired` at replay with version 1; a made commit's map is put a slice a turn over the preview. The replay
+> reading the pack a piece at a time through `StorePacks` BUILT (w-git, 2026-11-26, C2 of the close list): where the
+> content store does not hold it whole, a replay's turn reads its pack from the store's pieces (`vcs_store::ReplayPack`,
+> held within `replay_pack_bound`, the pieces covering a turn's chunk and one), a piece it lacks ending the turn
+> wanting it, filled off the step by its recovery's or rebuild's loop; the staging puts what lands as a live push's
+> does, and the record's hold on a pack named only then is taken once put. Red:
+> `t_c2_a_restarts_replay_reads_its_records_pack_a_piece_at_a_time_within_its_bound` (524,574 B held at once, the
+> whole pack, against a bound of 131,072; now 131,072); a rebuild cancelled between two pieces names no pack and the
+> next reads it back byte for byte (`t_c2_a_rebuild_cancelled_between_two_pieces_…`). Owed (w-git): the push's pack
+> held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).
 > OPEN (goal 93, w-git; w-sessionlog's reduction 2026-11-21): a whole clone of git/git with 506 tags or more is aborted
