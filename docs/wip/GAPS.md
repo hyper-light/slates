@@ -1954,6 +1954,18 @@
 > exit-status, EOF and close in order (`[94, 98, 96, 97]`) and the connection's end 3 µs to 47 ms after the close.
 > Since, a failure names which end it missed: the channel messages' order and the wait for the connection's end after
 > the close (`Adjusted::ending` in `vcs_ssh/tests/hg.rs`). Owed: the next red's line (main's whole runs).
+> A push's manifest chain read a stack frame a delta (2026-11-25, w-hg; main's order: a 2,000-changeset push overflowed
+> a debug shard's 2 MiB stack in `hg_clone_store_wait`): `chain_read` made the text level by level, each delta's
+> patching reading the level below, so a read of a line no delta touched recursed through every delta to the whole text,
+> its depth the chain's links (bounded by bytes, never by links). Since, the chain's deltas are folded once, lowest first,
+> into one list of pieces over the text (`mpatch`'s fold), each a range of the whole text or of a delta's bytes, on the
+> heap in the chain's room: nothing recurses, and a read is a search and copies. Held by
+> `a_deep_chain_is_read_on_a_shards_stack` (10,000 one-line deltas over a 1,000-line text read in pieces of 1 to 4,096
+> bytes, in a re-invoked child on a thread of a shard's 2 MiB: red, the child aborted on the overflow; now the text the
+> deltas make). The 2,000-changeset measurement now runs on 2 MiB stacks (46.6 s, 87.8 s at 8 MiB before). Swept: no
+> other recursion in `slates-hg` or `slates-store` follows the data's depth (`render::next_log` recurses at most twice);
+> elsewhere git's `reach` recurses by its index's levels, svn's `children` by its tree's height, vcs's merge sort to lg k,
+> and svn's ra_svn items by a nesting depth its parser bounds (`Bounds::depth`).
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads
