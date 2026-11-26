@@ -104,6 +104,23 @@ const HEAD: &[u8] = b"HEAD";
 /// Format: the `Depth` header's name (RFC 4918 §10.2).
 const DEPTH: &[u8] = b"depth";
 
+/// Policy right required for read-only Subversion WebDAV methods (`GET`, `HEAD`, `OPTIONS`,
+/// `PROPFIND`, `REPORT`).
+const READ_RIGHTS: &[Right] = &[Right::Read];
+
+/// Policy rights required for mutating Subversion WebDAV methods (`POST`, `MKACTIVITY`,
+/// `CHECKOUT`, `LOCK`, `UNLOCK`, `PROPPATCH`, `PUT`, `DELETE`, `MKCOL`, `COPY`, `MOVE`, `MERGE`).
+const WRITE_RIGHTS: &[Right] = &[Right::Submit, Right::Rewrite, Right::Delete];
+
+/// Returns the policy rights required for HTTP `method` on a Subversion WebDAV endpoint, failing
+/// closed to [`WRITE_RIGHTS`] for any non-read method before opening transactions or running hooks.
+fn required_rights(method: &[u8]) -> &'static [Right] {
+  match method {
+    b"GET" | b"HEAD" | b"OPTIONS" | b"PROPFIND" | b"REPORT" => READ_RIGHTS,
+    _ => WRITE_RIGHTS,
+  }
+}
+
 /// A count as `u64`, saturating where it could not fit (no target slates ships has a wider `usize`).
 fn to_u64(count: usize) -> u64 {
   u64::try_from(count).unwrap_or(u64::MAX)
@@ -374,7 +391,7 @@ impl<A: Authenticator, R: Repositories, S: SvnStores + Clone> SvnSite<A, R, S> {
     else {
       return refused_with(Status::NOT_FOUND, Fields::new(), true);
     };
-    match vcs_policy::reaches(&repository, &principal, &[Right::Read]) {
+    match vcs_policy::reaches(&repository, &principal, required_rights(head.method)) {
       Ok(true) => {}
       Ok(false) => return refused_with(Status::FORBIDDEN, Fields::new(), true),
       // A policy its tool cannot read is a damaged record (A-622's guard keeps such rules out): never judged without it.
@@ -452,6 +469,21 @@ impl<A: Authenticator, R: Repositories, S: SvnStores + Clone> Site for SvnSite<A
       Err(status) => return refused_with(status, Fields::new(), true),
     };
     self.answer_with_principal(head, routed, proven.principal.clone())
+  }
+
+  async fn decide_unauthenticated(
+    &mut self,
+    head: &Head<'_>,
+    _secure: bool,
+    refused: super::git::Refused,
+  ) -> Decided<Self::Exchange> {
+    if let Err(status) = route(head, self.room) {
+      return refused_with(status, Fields::new(), false);
+    }
+    if refused.status() == Status::UNAUTHORIZED {
+      return self.unauthorized();
+    }
+    refused_with(refused.status(), Fields::new(), false)
   }
 }
 
@@ -2148,11 +2180,13 @@ fn status_of(code: u16) -> Status {
     Status::BAD_REQUEST,
     Status::FORBIDDEN,
     Status::NOT_FOUND,
+    Status::METHOD_NOT_ALLOWED,
     Status::CONFLICT,
     Status::PRECONDITION_FAILED,
     Status::LOCKED,
     Status::CONTENT_TOO_LARGE,
     Status::NOT_IMPLEMENTED,
+    Status::SERVICE_UNAVAILABLE,
   ]
   .into_iter()
   .find(|status| status.code == code)

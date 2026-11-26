@@ -643,6 +643,18 @@ pub(crate) fn wire_request(head: &Head<'_>, room: u64) -> bool {
   hg_http::command(query, &mut Admission::new(room)).is_ok_and(|command| command.is_some())
 }
 
+/// Returns the decoded repository name targeted by a Mercurial wire (`?cmd=`) `GET`/`POST`
+/// request within `room`, or `None` when `head` is not a Mercurial wire request.
+pub(crate) fn wire_repo_candidate(head: &Head<'_>, room: u64) -> Option<String> {
+  if (head.method != GET && head.method != PUSH_METHOD) || !wire_request(head, room) {
+    return None;
+  }
+  route(head, room)
+    .ok()
+    .map(|routed| routed.name)
+    .filter(|name| !name.is_empty())
+}
+
 /// Routes `head` (the module doc's names): its repository's name and its command's permission, each read within
 /// `room`; refused `400` where the path's escapes cannot be read, `414` where the path or the query's fields are past
 /// `room`, and `404` where no repository could be named.

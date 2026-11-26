@@ -63,13 +63,19 @@ use slates_git::lfs::Timestamp;
 use slates_git::lfs::serve::{self as lfs_serve, Endpoint, RouteRefused, Routed};
 use slates_http::Admission;
 use slates_http::head::{Head, Target, Version as HttpVersion};
+use slates_http::percent::{self, Plus};
 use slates_http::reply::Status;
 use slates_http_edge::connection::{Fields, StatusMode};
 use slates_http_edge::credential::{self, Credential, CredentialRefused};
 
-use super::{Answer, ClientGone, Decided, Exchange, Failed, Site};
+use super::{Answer, ClientGone, Decided, Exchange, Failed, RouteStage, Site};
 use crate::lfs::LfsCall;
 use crate::vcs_policy::{self, Right};
+
+/// Format: bytes a percent-escape in a Git HTTP/LFS path may not decode to (slash or NUL).
+const PATH_REFUSED: &[u8] = b"/\0";
+/// Format: trailing segment pair separating repository name from Git LFS endpoints.
+const LFS_SUFFIX: &[u8] = b"/info/lfs";
 
 /// The rights a principal must hold on some name of a repository for Git LFS to answer it at all (the module doc): a
 /// download or a listing reads, an upload, a lock or a verification submits, releasing another's lock rewrites
@@ -631,6 +637,8 @@ pub(crate) struct GitSite<A, R, S, L = NoLfs> {
   services: S,
   /// Git LFS's service.
   lfs: L,
+  /// Monotonic cross-shard routing stage carried across [`Answer::Move`].
+  stage: RouteStage,
 }
 
 impl<A, R, S> GitSite<A, R, S, NoLfs> {
@@ -650,6 +658,7 @@ impl<A, R, S> GitSite<A, R, S, NoLfs> {
       repositories,
       services,
       lfs: NoLfs,
+      stage: RouteStage::Initial,
     }
   }
 }
@@ -664,6 +673,7 @@ impl<A, R, S, L> GitSite<A, R, S, L> {
       repositories: self.repositories,
       services: self.services,
       lfs,
+      stage: self.stage,
     }
   }
 }
@@ -692,6 +702,32 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
     }
   }
 
+  /// Refuses `head` using an authentication failure already classified by [`super::ToolSites`]
+  /// without parsing or proving credentials a second time.
+  fn answer_unauthenticated(
+    &self,
+    head: &Head<'_>,
+    refused: Refused,
+  ) -> Decided<SiteExchange<S::Exchange, L>> {
+    match lfs_serve::route(head, &mut Admission::new(self.room)) {
+      Ok(_) => {
+        if authority(head).is_none() {
+          return refused_with(Status::BAD_REQUEST, cache_fields(), false);
+        }
+        return lfs_challenged(self.refuse(refused, false));
+      }
+      Err(RouteRefused::NotFound) => {}
+      Err(route_refused) => return lfs_route_refused(route_refused, head.version, false),
+    }
+    match http::route(head, &mut Admission::new(self.room)) {
+      Ok(_) => self.refuse(refused, false),
+      Err(route_refused) => {
+        let (status, fields) = http::refusal_parts(route_refused, head.version);
+        refused_with(status, owned(&fields), false)
+      }
+    }
+  }
+
   /// Like [`Self::answer`], reusing `pre_proven` when a router already proved the request's
   /// credentials before inspecting the repository catalog.
   async fn answer_with(
@@ -704,7 +740,7 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
       Ok(routed) => return self.answer_lfs(head, secure, routed, pre_proven).await,
       // Not an LFS path: git's own routes decide it.
       Err(RouteRefused::NotFound) => {}
-      Err(refused) => return lfs_route_refused(refused, head.version),
+      Err(refused) => return lfs_route_refused(refused, head.version, pre_proven.is_some()),
     }
     let route = match http::route(head, &mut Admission::new(self.room)) {
       Ok(route) => route,
@@ -775,8 +811,12 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
           proven: true,
         };
       }
-      Gate::Refused(refused) => return self.refuse(refused, true),
+      Gate::Refused(refused) => {
+        self.stage = RouteStage::Initial;
+        return self.refuse(refused, true);
+      }
     }
+    self.stage = RouteStage::Initial;
     if !self.lfs.serves(&routed.endpoint) {
       return self.refuse(Refused::Unavailable, true);
     }
@@ -803,24 +843,42 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
     }
   }
 
-  /// How the repository named `name` stands with `principal` for Git LFS (the module doc, steps 3 and 4).
-  /// `routed` naming the repository git-lfs meant (main 01a20182's r28): its name as asked where a repository has it;
-  /// else, for one ending `.git`, the name without it, where a repository has that. git-lfs finds its server at the
-  /// remote's URL with `.git/info/lfs` appended where the URL does not end in `.git` [B: git-lfs,
-  /// `docs/api/server-discovery.md`], so a clone of `/project` asks `/project.git/info/lfs`. The exact name always wins:
-  /// a repository named `project.git` is reached at `/project.git/info/lfs` whatever `project` is.
-  fn lfs_named(&self, mut routed: Routed) -> Routed {
-    let known = |name: &str| {
-      matches!(self.repositories.locate(name), Located::Elsewhere(_))
-        || self.repositories.find(name).is_some()
-    };
-    if !known(&routed.repo)
-      && let Some(bare) = routed.repo.strip_suffix(".git")
-      && known(bare)
+  /// Resolves `routed`'s repository name for Git LFS, preserving exact `.git` repository names
+  /// while stripping `.git` to the bare repository when the exact `.git` name was confirmed absent
+  /// on its owning shard. Advances `self.stage` to [`RouteStage::LfsBareFallback`] before moving
+  /// to another shard for the bare name so arrival resolves the bare name directly without
+  /// bouncing back to the `.git` shard.
+  fn lfs_named(&mut self, mut routed: Routed) -> Routed {
+    if self.stage == RouteStage::LfsBareFallback {
+      if let Some(bare) = routed.repo.strip_suffix(".git") {
+        routed.repo = bare.to_owned();
+      }
+      return routed;
+    }
+    if matches!(self.repositories.locate(&routed.repo), Located::Here)
+      && self.repositories.find(&routed.repo).is_none()
     {
-      routed.repo = bare.to_owned();
+      self.lfs_strip_if_bare_known(&mut routed);
     }
     routed
+  }
+
+  /// Strips a trailing `.git` suffix from `routed.repo` when the bare repository lives elsewhere
+  /// (setting [`RouteStage::LfsBareFallback`]) or exists locally.
+  fn lfs_strip_if_bare_known(&mut self, routed: &mut Routed) {
+    let Some(bare) = routed.repo.strip_suffix(".git") else {
+      return;
+    };
+    match self.repositories.locate(bare) {
+      Located::Elsewhere(_) => {
+        self.stage = RouteStage::LfsBareFallback;
+        routed.repo = bare.to_owned();
+      }
+      Located::Here if self.repositories.find(bare).is_some() => {
+        routed.repo = bare.to_owned();
+      }
+      Located::Here => {}
+    }
   }
 
   fn lfs_gate(&self, name: &str, principal: &Principal) -> Gate {
@@ -938,6 +996,130 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> S
   ) -> Decided<Self::Exchange> {
     self.answer_with(head, secure, Some(proven.clone())).await
   }
+
+  async fn decide_unauthenticated(
+    &mut self,
+    head: &Head<'_>,
+    _secure: bool,
+    refused: Refused,
+  ) -> Decided<Self::Exchange> {
+    self.answer_unauthenticated(head, refused)
+  }
+
+  fn route_stage(&self) -> RouteStage {
+    self.stage
+  }
+
+  fn set_route_stage(&mut self, stage: RouteStage) {
+    self.stage = stage;
+  }
+}
+
+/// Decodes `head`'s path without its leading slash within `room`, rejecting malformed escapes and
+/// escaped slashes or NULs (matching `slates_git::http::route` and `slates_git::lfs::serve::route`).
+fn decode_relative_path(head: &Head<'_>, room: u64) -> Option<Vec<u8>> {
+  let Target::Path { path, .. } = head.target else {
+    return None;
+  };
+  let relative = path.strip_prefix(b"/")?;
+  if percent::names_any(relative, PATH_REFUSED) {
+    return None;
+  }
+  decode_charged(relative, room)
+}
+
+/// Charges `relative`'s decoded length against `room` and percent-decodes it.
+fn decode_charged(relative: &[u8], room: u64) -> Option<Vec<u8>> {
+  let length = percent::decoded_len(relative).ok()?;
+  Admission::new(room)
+    .charge(u64::try_from(length).ok()?)
+    .ok()?;
+  let mut decoded = Vec::new();
+  decoded.try_reserve_exact(length).ok()?;
+  percent::decode_into(relative, Plus::Plus, &mut decoded).ok()?;
+  Some(decoded)
+}
+
+/// Validates a decoded repository path prefix (non-empty UTF-8 with no empty, `.`, or `..` segments).
+fn valid_repo_name(bytes: &[u8]) -> Option<String> {
+  if bytes.is_empty()
+    || bytes
+      .split(|byte| *byte == b'/')
+      .any(|segment| matches!(segment, b"" | b"." | b".."))
+  {
+    return None;
+  }
+  String::from_utf8(bytes.to_vec()).ok()
+}
+
+/// Strips a Git smart/dumb HTTP endpoint suffix already validated by `slates_git::http::route`.
+fn strip_git_http_suffix(decoded: &[u8]) -> Option<&[u8]> {
+  let mut segments = decoded.rsplit(|byte| *byte == b'/');
+  let last = segments.next()?;
+  let second = segments.next();
+  let third = segments.next();
+  let span = match (third, second, last) {
+    (_, Some(b"info"), b"refs") => b"/info/refs".len(),
+    (_, _, b"HEAD" | b"git-upload-pack" | b"git-receive-pack" | b"git-upload-archive") => {
+      last.len().saturating_add(1)
+    }
+    (Some(b"objects"), Some(middle), file) => b"/objects/"
+      .len()
+      .saturating_add(middle.len())
+      .saturating_add(1)
+      .saturating_add(file.len()),
+    _ => return None,
+  };
+  let prefix_len = decoded.len().checked_sub(span)?;
+  decoded.get(..prefix_len)
+}
+
+/// Returns the syntactic repository name targeted by a valid-method Git LFS request within `room`,
+/// or `None` when `head` does not name a Git LFS endpoint or uses a non-LFS HTTP method.
+pub(crate) fn lfs_repo_candidate(head: &Head<'_>, room: u64) -> Option<String> {
+  match lfs_serve::route(head, &mut Admission::new(room)) {
+    Ok(routed) => Some(routed.repo),
+    Err(
+      RouteRefused::UnsupportedMediaType | RouteRefused::NotAcceptable | RouteRefused::Head(_),
+    ) => {
+      let decoded = decode_relative_path(head, room)?;
+      let at = decoded
+        .windows(LFS_SUFFIX.len())
+        .rposition(|window| window == LFS_SUFFIX)?;
+      valid_repo_name(decoded.get(..at)?)
+    }
+    Err(
+      RouteRefused::NotFound
+      | RouteRefused::MethodNotAllowed(_)
+      | RouteRefused::BadPath
+      | RouteRefused::PastRoom,
+    ) => None,
+  }
+}
+
+/// Returns the syntactic repository name targeted by a valid-method Git smart or dumb HTTP request
+/// within `room`, or `None` when `head` does not match a Git HTTP route or uses a non-Git method.
+pub(crate) fn http_repo_candidate(head: &Head<'_>, room: u64) -> Option<String> {
+  match http::route(head, &mut Admission::new(room)) {
+    Ok(Route::Advertise { repo, .. } | Route::Serve { repo, .. }) => Some(repo),
+    Err(
+      http::RouteRefused::DumbProtocol
+      | http::RouteRefused::UnsupportedService
+      | http::RouteRefused::ServiceNotServed
+      | http::RouteRefused::UnsupportedMediaType
+      | http::RouteRefused::LengthRequired
+      | http::RouteRefused::Head(_),
+    ) => {
+      let decoded = decode_relative_path(head, room)?;
+      valid_repo_name(strip_git_http_suffix(&decoded)?)
+    }
+    Err(
+      http::RouteRefused::NotFound
+      | http::RouteRefused::MethodNotAllowed(_)
+      | http::RouteRefused::BadPath
+      | http::RouteRefused::PastRoom,
+    ) => None,
+  }
 }
 
 /// The rights a principal must hold on some name of a repository for `service` to start (the module doc, step 4).
@@ -971,7 +1153,7 @@ fn owned(fields: &[Field]) -> Fields {
 
 /// An LFS route's refusal, whoever asks (the module doc): its status, `Allow` naming the endpoint's methods on a `405`,
 /// then the cache fields every refusal of the site carries, as git's own routes' do.
-fn lfs_route_refused<E>(refused: RouteRefused, version: HttpVersion) -> Decided<E> {
+fn lfs_route_refused<E>(refused: RouteRefused, version: HttpVersion, proven: bool) -> Decided<E> {
   let status = refused.status(version);
   let mut fields = match refused {
     RouteRefused::MethodNotAllowed(allow) if status == Status::METHOD_NOT_ALLOWED => {
@@ -980,7 +1162,7 @@ fn lfs_route_refused<E>(refused: RouteRefused, version: HttpVersion) -> Decided<
     _ => Fields::new(),
   };
   fields.extend(cache_fields());
-  refused_with(status, fields, false)
+  refused_with(status, fields, proven)
 }
 
 /// `decided`, a `401`'s every `WWW-Authenticate` challenge named again in `LFS-Authenticate` (the module doc).

@@ -1130,3 +1130,154 @@ fn an_lfs_request_at_its_remotes_dot_git_endpoint_reaches_the_repository_named_w
     assert!(said.contains(&format!("repo: {named}")), "{target}: {said}");
   }
 }
+
+/// Shape: shard owning `"alpha.git"` and `"ghost.git"` in the cross-shard LFS alias test.
+const SHARD_DOT_GIT: u16 = 0;
+/// Shape: shard owning `"alpha"` and `"ghost"` in the cross-shard LFS alias test.
+const SHARD_BARE: u16 = 1;
+/// Shape: upper bound on cross-shard hops before declaring an infinite ping-pong livelock.
+const MAX_ALIAS_HOPS: usize = 4;
+
+/// Two-shard repository view where `"alpha.git"` hashes to [`SHARD_DOT_GIT`] (absent) and
+/// `"alpha"` hashes to [`SHARD_BARE`] (present as `VcsTool::Git`).
+struct TwoShardLfs {
+  /// The shard currently executing `GitSite`.
+  shard: u16,
+}
+
+impl TwoShardLfs {
+  fn owner_of(name: &str) -> u16 {
+    if name.ends_with(".git") {
+      SHARD_DOT_GIT
+    } else {
+      SHARD_BARE
+    }
+  }
+}
+
+impl Repositories for TwoShardLfs {
+  fn locate(&self, name: &str) -> Located {
+    let owner = Self::owner_of(name);
+    if owner == self.shard {
+      Located::Here
+    } else {
+      Located::Elsewhere(owner)
+    }
+  }
+
+  fn find(&self, name: &str) -> Option<RepositoryRecord> {
+    if self.shard != SHARD_BARE || name != "alpha" {
+      return None;
+    }
+    Some(RepositoryRecord {
+      index_bits: 0,
+      id: RepositoryId { bytes: [9; 16] },
+      name: "alpha".to_owned(),
+      tool: VcsTool::Git,
+      format: ObjectFormat::Sha1,
+      default_branch: None,
+      owner: principal(OWNER),
+      policy: RepositoryPolicy {
+        version: 1,
+        rules: Vec::new(),
+        hooks: Vec::new(),
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+        hg_publishing: true,
+      },
+    })
+  }
+}
+
+/// Drives `head` across simulated shards `0` and `1` carrying `route_stage()` across every
+/// `Answer::Move`, returning `(hops, decided)` or panicking past `MAX_ALIAS_HOPS`.
+fn run_two_shard_lfs(
+  start_shard: u16,
+  asked: &[u8],
+) -> (usize, Decided<super::SiteExchange<NoExchange, Carried>>) {
+  let mut shard = start_shard;
+  let mut stage = crate::vcs_http::RouteStage::Initial;
+  for hops in 0..=MAX_ALIAS_HOPS {
+    let mut site =
+      GitSite::new(REALM, ROOM, Tokens, TwoShardLfs { shard }, Unserved).with_lfs(Carried);
+    site.set_route_stage(stage);
+    let decided = ready(site.decide(&head(asked), true));
+    match decided.answer {
+      Answer::Move { shard: next } => {
+        stage = site.route_stage();
+        shard = next;
+      }
+      _ => return (hops, decided),
+    }
+  }
+  panic!(
+    "cross-shard LFS .git alias ping-ponged past {MAX_ALIAS_HOPS} hops from shard {start_shard}"
+  );
+}
+
+fn assert_two_shard_lfs_serves_alpha(start: u16, max_hops: usize, asked: &[u8]) {
+  let (hops, decided) = run_two_shard_lfs(start, asked);
+  assert!(hops <= max_hops, "start={start} took {hops} hops");
+  let (_, _, status, mut exchange, proven) = served_lfs(decided);
+  assert_eq!((status, proven), (StatusMode::AfterBody, true));
+  ready(exchange.body(b"{}")).unwrap();
+  ready(exchange.body_end(ClientGone::never())).unwrap();
+  let said = String::from_utf8_lossy(&replies(&mut exchange).concat()).into_owned();
+  assert!(said.contains("repo: \"alpha\""), "start={start}: {said}");
+}
+
+/// Blocker 2: Do send `POST /alpha.git/info/lfs/objects/batch` across two distinct shards where
+/// `owner_shard("alpha.git") != owner_shard("alpha")` and only `"alpha"` exists, starting from
+/// both shards, plus `POST /ghost.git/info/lfs/objects/batch` where neither exists. Expect:
+/// `"alpha.git"` serves `"alpha"` in `<= 2` moves with zero ping-pong, and `"ghost.git"` refuses
+/// `404` in `<= 2` moves.
+#[test]
+fn blocker2_cross_shard_lfs_dot_git_alias_terminates_without_ping_pong() {
+  let asked = request(
+    "POST",
+    "/alpha.git/info/lfs/objects/batch",
+    &[LFS_BODY, OWNER_BEARER],
+  );
+  assert_two_shard_lfs_serves_alpha(SHARD_DOT_GIT, 1, &asked);
+  assert_two_shard_lfs_serves_alpha(SHARD_BARE, 2, &asked);
+
+  let ghost = request(
+    "POST",
+    "/ghost.git/info/lfs/objects/batch",
+    &[LFS_BODY, OWNER_BEARER],
+  );
+  let (hops, decided) = run_two_shard_lfs(SHARD_BARE, &ghost);
+  assert!(hops <= 2, "absent ghost.git took {hops} hops");
+  assert_eq!(refusal(&decided).0, Status::NOT_FOUND);
+}
+
+/// Gemini Nit 1: Do call `GitSite::decide_proven` on syntactically refused LFS requests
+/// (`405 Method Not Allowed` and `415 Unsupported Media Type`) with pre-proven credentials.
+/// Expect: `Decided::proven` stays `true` instead of dropping to `false`.
+#[test]
+fn nit1_lfs_route_refused_preserves_proven_flag() {
+  let mut site = lfs_site(Carried);
+  let proven = Proven {
+    principal: principal(OWNER),
+    bearer_expires_ns: None,
+  };
+  let cases = [
+    (
+      request("DELETE", LFS_LOCKS, &[OWNER_BEARER]),
+      Status::METHOD_NOT_ALLOWED,
+    ),
+    (
+      request(
+        "POST",
+        "/r.git/info/lfs/objects/batch",
+        &["Content-Type: text/plain", OWNER_BEARER],
+      ),
+      Status::UNSUPPORTED_MEDIA_TYPE,
+    ),
+  ];
+  for (asked, expected_status) in cases {
+    let decided = ready(site.decide_proven(&head(&asked), true, &proven));
+    let (status, _, was_proven) = refusal(&decided);
+    assert_eq!((status, was_proven), (expected_status, true));
+  }
+}

@@ -466,6 +466,52 @@ fn lent_of<T>(
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TunnelRecords;
 
+/// Derives `svn+ssh://` session access (`Write`/`Read`/`None`) for `principal` on `record` using
+/// the same policy check as `svn://` (`crate::vcs_svn::access_for_record`), failing closed to
+/// `Access::None` when no repository record is held.
+pub(crate) fn tunnel_access(
+  record: Option<&slates_db::catalog::RepositoryRecord>,
+  principal: &Principal,
+) -> slates_svn::authz::Access {
+  record.map_or(slates_svn::authz::Access::None, |record| {
+    crate::vcs_svn::access_for_record(record, principal)
+  })
+}
+
+impl TunnelRecords {
+  /// Lends repository `id`'s tunnel sources with session access computed by `access_of`.
+  fn lend_with_access<T>(
+    id: RepositoryId,
+    texts: &dyn slates_svn::commit::drive::TextSink,
+    access_of: impl FnOnce(Option<&slates_db::catalog::RepositoryRecord>) -> slates_svn::authz::Access,
+    step: impl FnOnce(&Sources<'_, SvnView<'_>>) -> T,
+  ) -> Option<T> {
+    crate::state::with_state(|state| {
+      let (name, authenticated) = {
+        let record = state.db.partition().repositories().repository(id);
+        let name = record.map(|record| record.name.clone()).unwrap_or_default();
+        (name, access_of(record))
+      };
+      lend_in(state, id, |lent| {
+        step(&Sources {
+          index: lent.index,
+          repository: lent.repository,
+          locks: lent.locks,
+          now: lent.now,
+          policy: Policy {
+            anonymous: slates_svn::authz::Access::None,
+            authenticated,
+            authz: None,
+            filesystem: &name,
+          },
+          texts,
+        })
+      })
+    })
+    .flatten()
+  }
+}
+
 /// Whether a repository keeps mergeinfo, which `repos-info` announces: every one does, as an FSFS repository of a
 /// format that records mergeinfo announces it (`svn_repos_has_capability`).
 const MERGEINFO_KEPT: bool = true;
@@ -479,6 +525,10 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
 
   fn holds(&self, id: RepositoryId) -> bool {
     crate::state::with_state(|state| served(state, id)).unwrap_or(false)
+  }
+
+  fn unrecovered(&self, id: RepositoryId) -> bool {
+    crate::state::with_state(|state| state.vcs_stores.unrecovered(id).is_some()).unwrap_or(false)
   }
 
   fn opening<T>(&mut self, id: RepositoryId, step: impl FnOnce(&Opening<'_>) -> T) -> Option<T> {
@@ -503,31 +553,17 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
     texts: &dyn slates_svn::commit::drive::TextSink,
     step: impl FnOnce(&Sources<'_, SvnView<'_>>) -> T,
   ) -> Option<T> {
-    crate::state::with_state(|state| {
-      let name = state
-        .db
-        .partition()
-        .repositories()
-        .repository(id)
-        .map(|record| record.name.clone())
-        .unwrap_or_default();
-      lend_in(state, id, |lent| {
-        step(&Sources {
-          index: lent.index,
-          repository: lent.repository,
-          locks: lent.locks,
-          now: lent.now,
-          policy: Policy {
-            anonymous: slates_svn::authz::Access::None,
-            authenticated: slates_svn::authz::Access::Write,
-            authz: None,
-            filesystem: &name,
-          },
-          texts,
-        })
-      })
-    })
-    .flatten()
+    Self::lend_with_access(id, texts, |_| slates_svn::authz::Access::None, step)
+  }
+
+  fn lend_for<T>(
+    &mut self,
+    id: RepositoryId,
+    principal: &Principal,
+    texts: &dyn slates_svn::commit::drive::TextSink,
+    step: impl FnOnce(&Sources<'_, SvnView<'_>>) -> T,
+  ) -> Option<T> {
+    Self::lend_with_access(id, texts, |record| tunnel_access(record, principal), step)
   }
 
   async fn commit(

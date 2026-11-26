@@ -916,8 +916,8 @@ async fn follow(
       Stepped::Go
     }
     Next::Again => return Stepped::Go,
-    Next::Fetch(wanted) => return fetch_piece(conversation, wanted).await,
-    Next::NeedText(need) => return bring_text(conversation, need).await,
+    Next::Fetch(wanted) => return fetch_piece(stream, conversation, wanted, out).await,
+    Next::NeedText(need) => return bring_text(stream, conversation, need, out).await,
     Next::End => return Stepped::End,
     Next::Challenge(consumed) => {
       consume(conversation, consumed);
@@ -971,12 +971,35 @@ async fn follow_write(
   written(stream, went, out).await
 }
 
-/// Fetches the next text piece a read drive waited on from the node's changeset store.
+/// Encodes a typed `E160004` (`SVN_ERR_FS_CORRUPT`) failure for the open repository, flushes it
+/// to `stream`, and ends the session.
+async fn end_store_missing(
+  stream: &TcpStream,
+  conversation: &mut Conversation,
+  name: &str,
+  out: &mut Vec<u8>,
+) -> Stepped {
+  out.clear();
+  fail_store_missing(&mut conversation.connection, name, out);
+  if !out.is_empty() {
+    let _ = written_timed(stream, out).await;
+  }
+  Stepped::End
+}
+
+/// Fetches the next text piece a read drive waited on from the node's changeset store, emitting
+/// typed `E160004` before closing if the store cannot supply it.
 async fn fetch_piece(
+  stream: &TcpStream,
   conversation: &mut Conversation,
   wanted: slates_svn::reads::Wanted,
+  out: &mut Vec<u8>,
 ) -> Stepped {
-  let Some(repository) = conversation.opened.as_ref().map(|opened| opened.id) else {
+  let Some((repository, name)) = conversation
+    .opened
+    .as_ref()
+    .map(|opened| (opened.id, opened.name.clone()))
+  else {
     return Stepped::End;
   };
   conversation.fetched = None;
@@ -984,18 +1007,25 @@ async fn fetch_piece(
   let fetched = FetchedPiece::fetch(repository, wanted).await;
   count_since(FETCH_WAIT_NS, fetching);
   let Some(piece) = fetched else {
-    return Stepped::End;
+    return end_store_missing(stream, conversation, &name, out).await;
   };
   conversation.fetched = Some(piece);
   Stepped::Go
 }
 
-/// Brings a landed base text back whole into the shard's content store for an open commit delta.
+/// Brings a landed base text back whole into the shard's content store for an open commit delta,
+/// emitting typed `E160004` before closing if the store cannot supply it.
 async fn bring_text(
+  stream: &TcpStream,
   conversation: &mut Conversation,
   need: slates_svn::commit::drive::NeedText,
+  out: &mut Vec<u8>,
 ) -> Stepped {
-  let Some(repository) = conversation.opened.as_ref().map(|opened| opened.id) else {
+  let Some((repository, name)) = conversation
+    .opened
+    .as_ref()
+    .map(|opened| (opened.id, opened.name.clone()))
+  else {
     return Stepped::End;
   };
   conversation.brought = None;
@@ -1003,7 +1033,7 @@ async fn bring_text(
   let brought = BroughtText::bring(repository, need).await;
   count_since(FETCH_WAIT_NS, fetching);
   let Some(brought) = brought else {
-    return Stepped::End;
+    return end_store_missing(stream, conversation, &name, out).await;
   };
   conversation.brought = Some(brought);
   Stepped::Go
@@ -1188,7 +1218,7 @@ fn held_sources<T>(
 /// Evaluates `principal`'s `svn://` session access on `record` (`svnserve`'s `auth-access`):
 /// `Write` when the repository's policy grants any write right (`Submit`/`Rewrite`/`Delete`),
 /// `Read` when it grants only `Read`, and `None` otherwise.
-fn access_for_record(
+pub(crate) fn access_for_record(
   record: &slates_db::catalog::RepositoryRecord,
   principal: &Principal,
 ) -> slates_svn::authz::Access {

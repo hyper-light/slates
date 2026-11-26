@@ -1370,7 +1370,7 @@ fn assert_tool_sites_protocol_isolation(tools: &mut TestToolSites, owner: &str) 
     owner,
     418,
   );
-  assert_tool_sites_stub_status(tools, "GET", "/repo?cmd=capabilities", owner, 421);
+  assert_tool_sites_stub_status(tools, "GET", "/hg?cmd=capabilities", owner, 421);
 }
 
 /// SVN-5: Do send public `GET` and `HEAD` requests (no `!svn/` segment) through the full
@@ -1384,7 +1384,7 @@ fn assert_tool_sites_protocol_isolation(tools: &mut TestToolSites, owner: &str) 
 /// - cross-protocol isolation: `GET /r.git/trunk/a.txt` -> routed to Git site (never served as SVN),
 ///   `GET /r.git/info/refs?service=git-upload-pack` -> routed to Git site,
 ///   `GET /r.git/HEAD` -> routed to Git site (dumb protocol `403`),
-///   `GET /repo?cmd=capabilities` -> routed to Hg site,
+///   `GET /hg?cmd=capabilities` -> routed to Hg site,
 ///   `PUT /r.git/info/lfs/objects/0000000000000000000000000000000000000000000000000000000000000000` -> routed to Git site.
 #[test]
 fn tool_sites_routes_public_get_and_head_to_svn_preserving_auth_move_and_protocol_isolation() {
@@ -1808,6 +1808,723 @@ fn svn5_tool_sites_unauthenticated_get_and_head_never_leak_existence_or_tool() {
           );
         }
       }
+    }
+  }
+}
+
+/// Shape: SVN-planted files under `/app/...` inside SVN repo `"team"` used to test dumb-HTTP
+/// forgery defense when Git repo `"team/app"` is also registered.
+const SPOOFED_SVN_FILES: &[(&str, &[u8])] = &[
+  ("/app/HEAD", b"ref: refs/heads/spoofed\n"),
+  (
+    "/app/info/refs",
+    b"0000000000000000000000000000000000000000\trefs/heads/spoofed\n",
+  ),
+  ("/app/objects/info/packs", b"P pack-spoofed.pack\n"),
+  (
+    "/app/info/lfs/objects/0000000000000000000000000000000000000000000000000000000000000000",
+    b"spoofed-lfs\n",
+  ),
+  ("/trunk/hello.txt", b"hello-svn-team\n"),
+];
+
+/// Shape: remote shard id hosting `"team/remote-app"` in the multi-segment routing tests.
+const REMOTE_APP_SHARD: u16 = 4;
+
+/// Builds a test SVN [`Repo`] representing SVN `"team"` with attacker-planted `/app/HEAD`,
+/// `/app/info/refs`, `/app/objects/info/packs`, `/app/info/lfs/objects/<64hex>`, and legitimate
+/// `/trunk/hello.txt`.
+fn repo_with_spoofed_git_paths() -> Repo {
+  let dirs = [
+    "/app",
+    "/app/info",
+    "/app/info/lfs",
+    "/app/info/lfs/objects",
+    "/app/objects",
+    "/app/objects/info",
+    "/trunk",
+  ];
+  let mut changes: Vec<ChangedPath> = dirs
+    .iter()
+    .map(|path| added(path, NodeKind::Directory, None, None))
+    .collect();
+  let mut tree_r1 = BTreeMap::from([("/".to_owned(), true)]);
+  for dir in dirs {
+    tree_r1.insert(dir.to_owned(), true);
+  }
+  let mut texts = BTreeMap::new();
+  for (path, bytes) in SPOOFED_SVN_FILES {
+    let text = text_of(bytes);
+    texts.insert(text.identity, bytes.to_vec());
+    changes.push(added(path, NodeKind::File, Some(text), None));
+    tree_r1.insert((*path).to_owned(), false);
+  }
+  let mut index = Index::new();
+  index
+    .append(
+      RevisionRecord {
+        transaction: "0-1".to_owned(),
+        changes,
+      },
+      usize::try_from(ROOM).unwrap(),
+    )
+    .unwrap();
+  let date = |value: &str| (b"svn:date".to_vec(), value.as_bytes().to_vec());
+  Repo {
+    index,
+    trees: vec![BTreeMap::from([("/".to_owned(), true)]), tree_r1],
+    lists: BTreeMap::new(),
+    texts,
+    revisions: vec![
+      vec![date("2026-11-18T00:00:00.000000Z")],
+      vec![
+        (b"svn:author".to_vec(), b"alice".to_vec()),
+        date(DATE),
+        (b"svn:log".to_vec(), b"spoofed git paths".to_vec()),
+      ],
+    ],
+    locks: LockTable::new(),
+    authz: Authz::parse(AUTHZ, None, authz::Bounds::of(AUTHZ, None)).unwrap(),
+  }
+}
+
+/// Catalog fixture containing overlapping first-segment and multi-segment repositories across
+/// SVN, Git, and Hg on a single shard (plus remote `"team/remote-app"` on [`REMOTE_APP_SHARD`]).
+struct NestedRepos;
+
+impl Repositories for NestedRepos {
+  fn locate(&self, name: &str) -> Located {
+    if name == "team/remote-app" {
+      Located::Elsewhere(REMOTE_APP_SHARD)
+    } else {
+      Located::Here
+    }
+  }
+
+  fn find(&self, name: &str) -> Option<RepositoryRecord> {
+    let (id, tool, format) = match name {
+      "team" => (REPO, VcsTool::Subversion, ObjectFormat::Revisions),
+      "team/app" => (
+        RepositoryId { bytes: [11; 16] },
+        VcsTool::Git,
+        ObjectFormat::Sha1,
+      ),
+      "hgroot" => (
+        RepositoryId { bytes: [12; 16] },
+        VcsTool::Mercurial,
+        ObjectFormat::Sha1,
+      ),
+      "hgroot/app" => (
+        RepositoryId { bytes: [13; 16] },
+        VcsTool::Git,
+        ObjectFormat::Sha1,
+      ),
+      "team/hgsub" => (
+        RepositoryId { bytes: [14; 16] },
+        VcsTool::Mercurial,
+        ObjectFormat::Sha1,
+      ),
+      "org/hgrepo" => (
+        RepositoryId { bytes: [15; 16] },
+        VcsTool::Mercurial,
+        ObjectFormat::Sha1,
+      ),
+      _ => return None,
+    };
+    Some(RepositoryRecord {
+      index_bits: 0,
+      id,
+      name: name.to_owned(),
+      tool,
+      format,
+      default_branch: None,
+      owner: principal(OWNER),
+      policy: RepositoryPolicy {
+        version: 1,
+        rules: Vec::new(),
+        hooks: Vec::new(),
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+        hg_publishing: true,
+      },
+    })
+  }
+}
+
+type NestedToolSites = ToolSites<
+  GitSite<Tokens, NestedRepos, MockGitServices, MockLfs>,
+  StubSite,
+  SvnSite<Tokens, NestedRepos, Stores>,
+>;
+
+fn nested_tool_sites() -> NestedToolSites {
+  let repo: &'static Repo = Box::leak(Box::new(repo_with_spoofed_git_paths()));
+  let git =
+    GitSite::new(REALM.to_owned(), ROOM, Tokens, NestedRepos, MockGitServices).with_lfs(MockLfs);
+  let svn = SvnSite::new(REALM.to_owned(), ROOM, Tokens, NestedRepos, Stores { repo });
+  ToolSites::new(git, StubSite(421), svn, ROOM)
+}
+
+fn assert_nested_git_serves(
+  tools: &mut NestedToolSites,
+  method: &str,
+  target: &str,
+  headers: &[&str],
+) {
+  let req = request(method, target, headers);
+  let Answer::Serve { exchange, .. } = ready(tools.decide(&head(&req), false)).answer else {
+    panic!("{method} {target} must serve via GitSite, not SVN/Hg");
+  };
+  assert!(
+    matches!(exchange, ToolExchange::Git(_)),
+    "{method} {target} must dispatch to GitSite"
+  );
+}
+
+fn assert_nested_git_dumb_refused_403(tools: &mut NestedToolSites, target: &str, owner: &str) {
+  let req = request("GET", target, &[owner]);
+  let Answer::Refuse { status, .. } = ready(tools.decide(&head(&req), false)).answer else {
+    panic!("GET {target} must be refused 403 by GitSite, never served from SVN");
+  };
+  assert_eq!(status.code, 403, "GET {target}");
+}
+
+fn assert_nested_hg_and_remote(tools: &mut NestedToolSites, owner: &str) {
+  let hg_sub = request("GET", "/team/hgsub?cmd=capabilities", &[owner]);
+  assert!(matches!(
+    ready(tools.decide(&head(&hg_sub), false)).answer,
+    Answer::Refuse { status, .. } if status.code == 421
+  ));
+
+  let remote = request(
+    "GET",
+    "/team/remote-app/info/refs?service=git-upload-pack",
+    &[owner],
+  );
+  assert!(matches!(
+    ready(tools.decide(&head(&remote), false)).answer,
+    Answer::Move { shard } if shard == REMOTE_APP_SHARD
+  ));
+}
+
+fn assert_nested_svn_file_200(tools: &mut NestedToolSites, target: &str, owner: &str) {
+  let svn_file = request("GET", target, &[owner]);
+  let Answer::Serve {
+    mut exchange,
+    head_only,
+    ..
+  } = ready(tools.decide(&head(&svn_file), false)).answer
+  else {
+    panic!("GET {target} must serve via SvnSite");
+  };
+  assert!(!head_only);
+  assert!(matches!(exchange, ToolExchange::Svn(_)));
+  ready(exchange.body_end(ClientGone::never())).unwrap();
+  assert_eq!(exchange.reply_status().code, 200);
+}
+
+/// Blocker 1: Do send Git smart HTTP, dumb HTTP, Git LFS (exact and `.git` alias), and Hg `?cmd=`
+/// requests targeting multi-segment repos (`team/app`, `hgroot/app`, `team/hgsub`,
+/// `team/remote-app`) while first-segment SVN `team` (holding attacker-planted `app/HEAD`,
+/// `app/info/refs`, `app/objects/info/packs`, `app/info/lfs/objects/<64hex>`) and Hg `hgroot`
+/// also exist. Expect: every multi-segment Git/LFS request routes to `GitSite` (never shadowed or
+/// spoofed by SVN `team` or Hg `hgroot`), `team/hgsub?cmd=capabilities` routes to `HgSite`,
+/// `team/remote-app` moves to shard 4, and non-repo `GET /team/trunk/hello.txt` stays on SVN.
+#[test]
+fn blocker1_multi_segment_git_lfs_and_hg_repos_not_shadowed_or_spoofed() {
+  let mut tools = nested_tool_sites();
+  let owner = basic("alice", OWNER_TOKEN);
+  let lfs_headers = [
+    owner.as_str(),
+    "Accept: application/vnd.git-lfs+json",
+    "Content-Type: application/vnd.git-lfs+json",
+  ];
+  let team_lfs_put = format!("/team/app/info/lfs/objects/{LFS_OID_HEX}");
+  let team_dot_git_lfs_put = format!("/team/app.git/info/lfs/objects/{LFS_OID_HEX}");
+  let hgroot_lfs_put = format!("/hgroot/app/info/lfs/objects/{LFS_OID_HEX}");
+
+  assert_nested_git_serves(
+    &mut tools,
+    "GET",
+    "/team/app/info/refs?service=git-upload-pack",
+    &[&owner],
+  );
+  assert_nested_git_serves(&mut tools, "PUT", &team_lfs_put, &[&owner]);
+  assert_nested_git_serves(
+    &mut tools,
+    "POST",
+    "/team/app/info/lfs/objects/batch",
+    &lfs_headers,
+  );
+  assert_nested_git_serves(&mut tools, "PUT", &team_dot_git_lfs_put, &[&owner]);
+  assert_nested_git_serves(
+    &mut tools,
+    "POST",
+    "/team/app.git/info/lfs/objects/batch",
+    &lfs_headers,
+  );
+  assert_nested_git_serves(
+    &mut tools,
+    "GET",
+    "/hgroot/app/info/refs?service=git-upload-pack",
+    &[&owner],
+  );
+  assert_nested_git_serves(&mut tools, "PUT", &hgroot_lfs_put, &[&owner]);
+
+  assert_nested_git_dumb_refused_403(&mut tools, "/team/app/HEAD", &owner);
+  assert_nested_git_dumb_refused_403(&mut tools, "/team/app/info/refs", &owner);
+  assert_nested_git_dumb_refused_403(&mut tools, "/team/app/objects/info/packs", &owner);
+
+  assert_nested_hg_and_remote(&mut tools, &owner);
+  assert_nested_svn_file_200(&mut tools, "/team/trunk/hello.txt", &owner);
+}
+
+fn assert_svn_propfind_207(tools: &mut RealToolSites, target: &str, owner: &str) {
+  let propfind = request("PROPFIND", target, &[owner, "Depth: 0"]);
+  let Answer::Serve { mut exchange, .. } = ready(tools.decide(&head(&propfind), false)).answer
+  else {
+    panic!("PROPFIND {target} must route to SvnSite");
+  };
+  assert!(matches!(exchange, ToolExchange::Svn(_)));
+  ready(exchange.body(PROPFIND_KIND)).unwrap();
+  ready(exchange.body_end(ClientGone::never())).unwrap();
+  assert_eq!(exchange.reply_status().code, 207);
+}
+
+fn assert_real_git_get_serves(tools: &mut RealToolSites, target: &str, owner: &str) {
+  let git_cmd = request("GET", target, &[owner]);
+  let Answer::Serve { exchange, .. } = ready(tools.decide(&head(&git_cmd), false)).answer else {
+    panic!("GET {target} must route to GitSite");
+  };
+  assert!(matches!(exchange, ToolExchange::Git(_)));
+}
+
+/// Gemini Suggestion 1: Do send `?cmd=capabilities` on SVN `GET`/`PROPFIND` and Git
+/// `info/refs?service=git-upload-pack&cmd=capabilities`, plus real Hg `org/hgrepo?cmd=capabilities`.
+/// Expect: SVN stays on `SvnSite`, Git stays on `GitSite`, and Hg still reaches `HgSite`.
+#[test]
+fn suggestion1_cmd_query_does_not_hijack_svn_or_git_while_hg_reaches_hg() {
+  let mut tools = real_tool_sites_with_suffix_files();
+  let owner = basic("alice", OWNER_TOKEN);
+
+  assert_svn_get_returns_bytes(
+    &mut tools,
+    &owner,
+    "/repo/trunk/HEAD?cmd=capabilities",
+    b"svn-head\n",
+  );
+  assert_svn_propfind_207(&mut tools, "/repo?cmd=capabilities", &owner);
+  assert_real_git_get_serves(
+    &mut tools,
+    "/r.git/info/refs?service=git-upload-pack&cmd=capabilities",
+    &owner,
+  );
+
+  let mut nested = nested_tool_sites();
+  let hg_multi = request("GET", "/org/hgrepo?cmd=capabilities", &[&owner]);
+  assert!(matches!(
+    ready(nested.decide(&head(&hg_multi), false)).answer,
+    Answer::Refuse { status, .. } if status.code == 421
+  ));
+}
+
+/// Counting authenticator to verify `ToolSites` proves credentials at most once per request.
+struct CountingTokens<'a>(&'a std::cell::Cell<usize>);
+
+impl Authenticator for CountingTokens<'_> {
+  async fn prove(&self, credential: &Credential) -> Result<Proven, Unproven> {
+    self.0.set(self.0.get().saturating_add(1));
+    Tokens.prove(credential).await
+  }
+}
+
+type CountingToolSites<'a> = ToolSites<
+  GitSite<CountingTokens<'a>, Held, MockGitServices, MockLfs>,
+  StubSite,
+  SvnSite<CountingTokens<'a>, Held, Stores>,
+>;
+
+fn assert_auth_calls_on_refusal(
+  tools: &mut CountingToolSites<'_>,
+  calls: &std::cell::Cell<usize>,
+  target: &str,
+  headers: &[&str],
+  expected: (u16, usize),
+) {
+  calls.set(0);
+  let req = request("GET", target, headers);
+  let decided = ready(tools.decide(&head(&req), false));
+  let Answer::Refuse { status, .. } = decided.answer else {
+    panic!("GET {target} must be refused");
+  };
+  assert_eq!((status.code, calls.get()), expected, "GET {target}");
+}
+
+/// Gemini Nit 2: Do send invalid-credential, missing-credential, and malformed-credential
+/// requests through `ToolSites` backed by a counting authenticator. Expect: invalid credentials
+/// invoke `prove()` exactly ONCE (never twice), and missing/malformed invoke `prove()` zero times.
+#[test]
+fn nit2_unauthenticated_tool_sites_authenticates_at_most_once() {
+  let calls = std::cell::Cell::new(0usize);
+  let repo: &'static Repo = Box::leak(Box::new(Repo::build()));
+  let git = GitSite::new(
+    REALM.to_owned(),
+    ROOM,
+    CountingTokens(&calls),
+    Held,
+    MockGitServices,
+  )
+  .with_lfs(MockLfs);
+  let svn = SvnSite::new(
+    REALM.to_owned(),
+    ROOM,
+    CountingTokens(&calls),
+    Held,
+    Stores { repo },
+  );
+  let mut tools = ToolSites::new(git, StubSite(421), svn, ROOM);
+
+  for target in [
+    "/repo/trunk/a.txt",
+    "/r.git/info/refs?service=git-upload-pack",
+  ] {
+    assert_auth_calls_on_refusal(
+      &mut tools,
+      &calls,
+      target,
+      &["Authorization: Bearer wrong-token"],
+      (401, 1),
+    );
+    assert_auth_calls_on_refusal(
+      &mut tools,
+      &calls,
+      target,
+      &["Authorization: Bearer a", "Authorization: Bearer b"],
+      (400, 0),
+    );
+  }
+}
+
+/// Gemini Suggestion 2: Do call `status_of` for `405` and `503`. Expect: `405 Method Not Allowed`
+/// and `503 Service Unavailable` are preserved instead of collapsing to `500`.
+#[test]
+fn suggestion2_status_of_preserves_405_and_503() {
+  assert_eq!(super::status_of(405), Status::METHOD_NOT_ALLOWED);
+  assert_eq!(super::status_of(503), Status::SERVICE_UNAVAILABLE);
+}
+
+/// Repository fixture granting `STRANGER` (`bob`) `PolicyRight::Read` only on `/`.
+struct ReadOnlyHeld;
+
+impl Repositories for ReadOnlyHeld {
+  fn locate(&self, _name: &str) -> Located {
+    Located::Here
+  }
+
+  fn find(&self, name: &str) -> Option<RepositoryRecord> {
+    use slates_db::catalog::{
+      PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyRule, PolicyWho,
+    };
+    if name != "repo" {
+      return None;
+    }
+    Some(RepositoryRecord {
+      index_bits: 0,
+      id: REPO,
+      name: "repo".to_owned(),
+      tool: VcsTool::Subversion,
+      format: ObjectFormat::Revisions,
+      default_branch: None,
+      owner: principal(OWNER),
+      policy: RepositoryPolicy {
+        version: 1,
+        rules: vec![PolicyRule {
+          names: PolicyNames::Paths,
+          pattern: "/".to_owned(),
+          right: PolicyRight::Read,
+          effect: PolicyEffect::Allow,
+          who: PolicyWho::AnyOf {
+            entries: vec![PolicyEntry::Is {
+              principal: principal(STRANGER),
+            }],
+          },
+        }],
+        hooks: Vec::new(),
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+        hg_publishing: true,
+      },
+    })
+  }
+}
+
+fn assert_dav_reads_allowed(svn: &mut SvnSite<Tokens, ReadOnlyHeld, Stores>, reader: &str) {
+  for (method, target) in [
+    ("GET", "/repo/trunk/a.txt"),
+    ("HEAD", "/repo/trunk/a.txt"),
+    ("OPTIONS", "/repo"),
+    ("PROPFIND", "/repo"),
+    ("REPORT", "/repo/!svn/me"),
+  ] {
+    let req = request(method, target, &[reader]);
+    assert!(
+      matches!(ready(svn.answer(&head(&req))).answer, Answer::Serve { .. }),
+      "read-only principal must be allowed {method} {target}"
+    );
+  }
+}
+
+fn assert_dav_writes_gated(
+  svn: &mut SvnSite<Tokens, ReadOnlyHeld, Stores>,
+  reader: &str,
+  owner: &str,
+) {
+  for (method, target) in [
+    ("POST", "/repo/!svn/me"),
+    ("MKACTIVITY", "/repo/!svn/act/act-1"),
+    ("CHECKOUT", "/repo/!svn/vcc/default"),
+    ("LOCK", "/repo/trunk/a.txt"),
+    ("UNLOCK", "/repo/trunk/a.txt"),
+    ("PROPPATCH", "/repo/!svn/rev/1"),
+    ("PUT", "/repo/!svn/txr/1-1/trunk/a.txt"),
+    ("DELETE", "/repo/!svn/txr/1-1/trunk/a.txt"),
+    ("MKCOL", "/repo/!svn/txr/1-1/trunk/newdir"),
+    ("COPY", "/repo/!svn/rvr/1/trunk/a.txt"),
+    ("MOVE", "/repo/trunk/a.txt"),
+    ("MERGE", "/repo"),
+  ] {
+    let req = request(method, target, &[reader]);
+    let Answer::Refuse { status, .. } = ready(svn.answer(&head(&req))).answer else {
+      panic!("read-only principal must be refused 403 on {method} {target}");
+    };
+    assert_eq!(status, Status::FORBIDDEN, "{method} {target}");
+    let owner_req = request(method, target, &[owner]);
+    assert!(
+      matches!(
+        ready(svn.answer(&head(&owner_req))).answer,
+        Answer::Serve { .. }
+      ),
+      "owner must be allowed {method} {target}"
+    );
+  }
+}
+
+/// Gemini Suggestion 3 (`http://` WebDAV): Do send read-side and write-side DAV methods as a
+/// principal granted only `PolicyRight::Read` (and compare against the owner). Expect: read-side
+/// methods (`GET`, `HEAD`, `OPTIONS`, `PROPFIND`, `REPORT`) succeed (`Serve`), while every
+/// write-side DAV method (`POST !svn/me`, `MKACTIVITY`, `CHECKOUT`, `LOCK`, `UNLOCK`, `PROPPATCH`,
+/// `PUT`, `DELETE`, `MKCOL`, `COPY`, `MOVE`, `MERGE`) is refused `403 Forbidden` before opening
+/// any transaction or exchange.
+#[test]
+fn suggestion3_read_only_principal_allowed_dav_reads_and_refused_403_on_dav_writes() {
+  let repo: &'static Repo = Box::leak(Box::new(Repo::build()));
+  let mut svn = SvnSite::new(
+    REALM.to_owned(),
+    ROOM,
+    Tokens,
+    ReadOnlyHeld,
+    Stores { repo },
+  );
+  let reader = basic("bob", STRANGER_TOKEN);
+  let owner = basic("alice", OWNER_TOKEN);
+  assert_dav_reads_allowed(&mut svn, &reader);
+  assert_dav_writes_gated(&mut svn, &reader, &owner);
+}
+
+/// Shape: upper bound on cross-shard hops through [`ToolSites`] before failing for ping-pong.
+const MAX_TOOL_SITES_HOPS: usize = 4;
+
+/// Two-shard catalog view for testing cross-shard [`ToolSites`] routing:
+/// - Shard `0` owns `"alpha.git"` (absent), `"team/app.git"` (absent), `"ghost.git"` (absent),
+///   and SVN `"team"` (present).
+/// - Shard `1` owns Git `"alpha"` (present), Git `"team/app"` (present), and `"ghost"` (absent).
+struct TwoShardToolCatalog {
+  shard: u16,
+}
+
+impl TwoShardToolCatalog {
+  fn owner_of(name: &str) -> u16 {
+    if name.ends_with(".git") || name == "team" {
+      0
+    } else {
+      1
+    }
+  }
+}
+
+impl Repositories for TwoShardToolCatalog {
+  fn locate(&self, name: &str) -> Located {
+    let owner = Self::owner_of(name);
+    if owner == self.shard {
+      Located::Here
+    } else {
+      Located::Elsewhere(owner)
+    }
+  }
+
+  fn find(&self, name: &str) -> Option<RepositoryRecord> {
+    let (id, tool, format) = match (self.shard, name) {
+      (0, "team") => (REPO, VcsTool::Subversion, ObjectFormat::Revisions),
+      (1, "alpha") => (
+        RepositoryId { bytes: [21; 16] },
+        VcsTool::Git,
+        ObjectFormat::Sha1,
+      ),
+      (1, "team/app") => (
+        RepositoryId { bytes: [22; 16] },
+        VcsTool::Git,
+        ObjectFormat::Sha1,
+      ),
+      _ => return None,
+    };
+    Some(RepositoryRecord {
+      index_bits: 0,
+      id,
+      name: name.to_owned(),
+      tool,
+      format,
+      default_branch: None,
+      owner: principal(OWNER),
+      policy: RepositoryPolicy {
+        version: 1,
+        rules: Vec::new(),
+        hooks: Vec::new(),
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+        hg_publishing: true,
+      },
+    })
+  }
+}
+
+type TwoShardTools = ToolSites<
+  GitSite<Tokens, TwoShardToolCatalog, MockGitServices, MockLfs>,
+  StubSite,
+  SvnSite<Tokens, TwoShardToolCatalog, Stores>,
+>;
+
+/// Drives `req` across simulated shards `0` and `1` through full [`ToolSites`] carrying
+/// `route_stage()` across every `Answer::Move`.
+fn run_two_shard_tool_sites(
+  start_shard: u16,
+  req: &[u8],
+  repo: &'static Repo,
+) -> (usize, Decided<<TwoShardTools as Site>::Exchange>) {
+  let mut shard = start_shard;
+  let mut stage = crate::vcs_http::RouteStage::Initial;
+  for hops in 0..=MAX_TOOL_SITES_HOPS {
+    let git = GitSite::new(
+      REALM.to_owned(),
+      ROOM,
+      Tokens,
+      TwoShardToolCatalog { shard },
+      MockGitServices,
+    )
+    .with_lfs(MockLfs);
+    let svn = SvnSite::new(
+      REALM.to_owned(),
+      ROOM,
+      Tokens,
+      TwoShardToolCatalog { shard },
+      Stores { repo },
+    );
+    let mut tools = ToolSites::new(git, StubSite(421), svn, ROOM);
+    tools.set_route_stage(stage);
+    let decided = ready(tools.decide(&head(req), false));
+    match decided.answer {
+      Answer::Move { shard: next } => {
+        stage = tools.route_stage();
+        shard = next;
+      }
+      _ => return (hops, decided),
+    }
+  }
+  panic!(
+    "ToolSites cross-shard routing ping-ponged past {MAX_TOOL_SITES_HOPS} hops from shard {start_shard}"
+  );
+}
+
+fn assert_two_shard_git_alias_serves(req: &[u8], repo: &'static Repo, label: &str) {
+  for start in [0_u16, 1_u16] {
+    let (hops, decided) = run_two_shard_tool_sites(start, req, repo);
+    assert!(hops <= 2, "{label} from shard {start} took {hops} hops");
+    assert!(matches!(
+      decided.answer,
+      Answer::Serve {
+        exchange: ToolExchange::Git(_),
+        ..
+      }
+    ));
+  }
+}
+
+/// Blocker 1 + Blocker 2 end-to-end across two shards in [`ToolSites`]:
+/// Do send single-segment LFS alias `POST /alpha.git/info/lfs/objects/batch`, multi-segment LFS
+/// alias `PUT /team/app.git/info/lfs/objects/<64hex>` while SVN `"team"` exists on Shard 0, and
+/// absent `POST /ghost.git/info/lfs/objects/batch` from both Shard 0 and Shard 1.
+/// Expect: every request terminates in `<= 2` moves with zero ping-pong, `"alpha.git"` and
+/// `"team/app.git"` serve via `ToolExchange::Git`, and `"ghost.git"` refuses `404`.
+#[test]
+fn blocker2_tool_sites_cross_shard_lfs_dot_git_alias_terminates_without_ping_pong() {
+  let repo: &'static Repo = Box::leak(Box::new(repo_with_spoofed_git_paths()));
+  let owner = basic("alice", OWNER_TOKEN);
+  let lfs_headers = [
+    owner.as_str(),
+    "Accept: application/vnd.git-lfs+json",
+    "Content-Type: application/vnd.git-lfs+json",
+  ];
+  let alpha_req = request("POST", "/alpha.git/info/lfs/objects/batch", &lfs_headers);
+  assert_two_shard_git_alias_serves(&alpha_req, repo, "alpha.git");
+
+  let nested_put_target = format!("/team/app.git/info/lfs/objects/{LFS_OID_HEX}");
+  let nested_req = request("PUT", &nested_put_target, &[&owner]);
+  assert_two_shard_git_alias_serves(&nested_req, repo, "team/app.git");
+
+  let ghost_req = request("POST", "/ghost.git/info/lfs/objects/batch", &lfs_headers);
+  let (hops, decided) = run_two_shard_tool_sites(1, &ghost_req, repo);
+  assert!(hops <= 2, "ghost.git took {hops} hops");
+  let Answer::Refuse { status, .. } = decided.answer else {
+    panic!("ghost.git must refuse 404");
+  };
+  assert_eq!(status, Status::NOT_FOUND);
+}
+
+fn assert_unauthenticated_401_with_challenge(
+  tools: &mut RealToolSites,
+  method: &str,
+  target: &str,
+) {
+  let req = request(method, target, &[]);
+  let decided = ready(tools.decide(&head(&req), false));
+  assert!(!decided.proven, "{method} {target}");
+  let Answer::Refuse { status, fields } = decided.answer else {
+    panic!("{method} {target} must refuse 401");
+  };
+  assert_eq!(status.code, 401, "{method} {target}");
+  assert!(
+    fields
+      .iter()
+      .any(|(name, _)| name.eq_ignore_ascii_case(b"WWW-Authenticate")),
+    "{method} {target} must carry WWW-Authenticate"
+  );
+}
+
+/// Auth-before-existence parity with `?cmd=capabilities`: Do send unauthenticated `GET`,
+/// `PROPFIND`, and Git `info/refs?service=git-upload-pack&cmd=capabilities` across nonexistent,
+/// SVN, Git, and Hg repositories. Expect: identical `401 Unauthorized` with `WWW-Authenticate`
+/// across all four repository states, leaking neither existence nor tool.
+#[test]
+fn suggestion1_unauthenticated_cmd_query_preserves_401_parity_across_all_repo_states() {
+  let mut tools = real_tool_sites_with_suffix_files();
+  let probes = [
+    ("GET", "/trunk/hello.txt?cmd=capabilities"),
+    ("PROPFIND", "?cmd=capabilities"),
+    ("GET", "/info/refs?service=git-upload-pack&cmd=capabilities"),
+  ];
+  for (method, suffix) in probes {
+    for repo_name in ["no-such", "repo", "r.git", "hg"] {
+      let target = format!("/{repo_name}{suffix}");
+      assert_unauthenticated_401_with_challenge(&mut tools, method, &target);
     }
   }
 }

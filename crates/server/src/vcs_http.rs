@@ -88,7 +88,7 @@ use slates_db::catalog::{RepositoryRecord, VcsTool};
 use slates_http::head::Head;
 use slates_http::reply::Status;
 use slates_http_edge::connection::{Connection, Decision, Ended, Fields, Next, Phase, StatusMode};
-use slates_http_edge::credential::Credential;
+use slates_http_edge::credential::{Credential, CredentialRefused};
 use slates_http_edge::tls::{HttpsSession, ServingIdentity};
 use slates_rt::TaskId;
 use slates_rt::error::RtError;
@@ -339,18 +339,30 @@ pub(crate) struct Decided<E> {
   pub(crate) proven: bool,
 }
 
-/// Where a request's repository-name routing stands across cross-shard connection moves
-/// ([`ToolSites`]): guarantees at most one hop to the first path segment's owner shard before
-/// falling back to protocol routing for slash-named Git/Mercurial repositories or `.git` LFS
-/// aliases, making shard ping-pong unrepresentable.
+/// Monotonic cross-shard routing stage carried across [`Answer::Move`] ([`ToolSites`],
+/// [`git::GitSite`]): guarantees every request resolves in bounded shard hops with zero ping-pong
+/// cycles, even across nested multi-segment repositories and cross-shard Git LFS `.git` aliases.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum RouteStage {
-  /// First attempt, or moving toward the first path segment's owner shard.
+  /// First attempt, or moving toward the exact multi-segment syntactic repository candidate's
+  /// owning shard (or first path segment's owning shard when no multi-segment candidate exists).
   #[default]
   Initial,
-  /// The first path segment was already checked on its owner shard and is not a registered
+  /// Exact multi-segment Git LFS candidate ending in `.git` (e.g. `team/app.git`) was already
+  /// checked on its owning shard and absent; now checking its `.git`-stripped multi-segment alias
+  /// (`team/app`).
+  ExactLfsBare,
+  /// Multi-segment syntactic repository candidate (and any `.git` LFS bare alias) was already
+  /// checked on its owning shard and did not match its tool; now checking the first path segment
+  /// on its owning shard (e.g. `project` for SVN-5 `/project/trunk/HEAD`).
+  ExactAbsent,
+  /// The first path segment was already checked on its owning shard and is not a registered
   /// repository (or delegated onward from it); dispatch directly by protocol without bouncing back.
   FirstAbsent,
+  /// `GitSite` already confirmed the exact `.git` LFS repository name absent on its owning shard,
+  /// stripped `.git`, and moved to the bare repository's owning shard; `GitSite` resolves the bare
+  /// name directly without re-checking the `.git` name.
+  LfsBareFallback,
 }
 
 /// A tool's site: what decides each request's head (git's, [`git::GitSite`]).
@@ -370,6 +382,17 @@ pub(crate) trait Site {
     head: &Head<'_>,
     secure: bool,
     _proven: &git::Proven,
+  ) -> Decided<Self::Exchange> {
+    self.decide(head, secure).await
+  }
+
+  /// Refuses `head` using an authentication failure already classified by [`ToolSites`] without
+  /// re-parsing or re-proving credentials.
+  async fn decide_unauthenticated(
+    &mut self,
+    head: &Head<'_>,
+    secure: bool,
+    _refused: git::Refused,
   ) -> Decided<Self::Exchange> {
     self.decide(head, secure).await
   }
@@ -597,40 +620,117 @@ fn classify_route(head: &Head<'_>, room: u64) -> SiteRoute {
   }
 }
 
+/// Outcome of proving `head`'s credentials once before consulting the repository catalog.
+enum PreAuth {
+  /// Credentials proved a principal.
+  Proven(git::Proven),
+  /// Credentials were missing, malformed, or did not prove a principal.
+  Refused(git::Refused),
+}
+
+/// Which tool a multi-segment syntactic repository candidate targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactKind {
+  /// Exact Git LFS repository path (may end in `.git`, falling back to bare alias if absent).
+  LfsExact,
+  /// `.git`-stripped Git LFS alias for a multi-segment repository.
+  LfsBare,
+  /// Exact Git smart or dumb HTTP repository path.
+  Git,
+  /// Exact Mercurial `?cmd=` wire repository path.
+  Hg,
+}
+
+impl ExactKind {
+  /// Expected registered [`VcsTool`] for this syntactic candidate.
+  const fn tool(self) -> VcsTool {
+    match self {
+      Self::LfsExact | Self::LfsBare | Self::Git => VcsTool::Git,
+      Self::Hg => VcsTool::Mercurial,
+    }
+  }
+}
+
+/// Multi-segment syntactic repository candidate extracted from an HTTP request head.
+struct ExactCandidate {
+  /// Decoded repository name containing at least one `/`.
+  name: String,
+  /// Protocol kind that matched `name`.
+  kind: ExactKind,
+}
+
+/// Extracts the exact multi-segment repository candidate targeted by Git LFS, Git smart/dumb
+/// HTTP, or Mercurial `?cmd=` wire protocol, if the targeted repository name contains `/`.
+fn exact_multi_segment_candidate(head: &Head<'_>, room: u64) -> Option<ExactCandidate> {
+  if let Some(repo) = git::lfs_repo_candidate(head, room) {
+    return repo.contains('/').then_some(ExactCandidate {
+      name: repo,
+      kind: ExactKind::LfsExact,
+    });
+  }
+  if let Some(repo) = git::http_repo_candidate(head, room) {
+    return repo.contains('/').then_some(ExactCandidate {
+      name: repo,
+      kind: ExactKind::Git,
+    });
+  }
+  let repo = hg::wire_repo_candidate(head, room)?;
+  repo.contains('/').then_some(ExactCandidate {
+    name: repo,
+    kind: ExactKind::Hg,
+  })
+}
+
+/// Extracts the `.git`-stripped multi-segment repository alias for a Git LFS request when its
+/// exact repository path ends with `.git` and the stripped name still contains `/`.
+fn exact_lfs_bare_candidate(head: &Head<'_>, room: u64) -> Option<ExactCandidate> {
+  let repo = git::lfs_repo_candidate(head, room)?;
+  let bare = repo.strip_suffix(".git")?;
+  bare.contains('/').then(|| ExactCandidate {
+    name: bare.to_owned(),
+    kind: ExactKind::LfsBare,
+  })
+}
+
 impl<G: Site, H: Site, S: Site + ToolLookup> ToolSites<G, H, S> {
-  /// Proves `head`'s credentials before any repository lookup; returns `None` when missing,
-  /// malformed, unproven, or unanswered so the caller challenges without consulting the catalog.
-  async fn authenticate_before_lookup(&self, head: &Head<'_>) -> Option<git::Proven> {
-    let credential = slates_http_edge::credential::credential(head)
-      .ok()
-      .flatten()?;
-    self.svn.prove_credential(&credential).await.ok()
+  /// Proves `head`'s credentials once before any repository lookup so malformed or invalid
+  /// credentials never trigger a second parse or lookup.
+  async fn authenticate_before_lookup(&self, head: &Head<'_>) -> PreAuth {
+    let credential = match slates_http_edge::credential::credential(head) {
+      Ok(Some(credential)) => credential,
+      Ok(None) | Err(CredentialRefused::UnknownScheme) => {
+        return PreAuth::Refused(git::Refused::NoCredentials);
+      }
+      Err(CredentialRefused::Repeated | CredentialRefused::Malformed) => {
+        return PreAuth::Refused(git::Refused::MalformedCredentials);
+      }
+    };
+    match self.svn.prove_credential(&credential).await {
+      Ok(proven) => PreAuth::Proven(proven),
+      Err(unproven) => PreAuth::Refused(git::Refused::Unproven(unproven)),
+    }
   }
 
   /// Challenges an unauthenticated or invalid-credential request without inspecting the repository
-  /// catalog (auth-before-existence).
+  /// catalog or re-proving credentials (auth-before-existence).
   async fn dispatch_unauthenticated(
     &mut self,
     head: &Head<'_>,
     secure: bool,
+    refused: git::Refused,
   ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
     if is_accepted_git_route(head, self.room) {
-      self.git.decide(head, secure).await.map(ToolExchange::Git)
+      self
+        .git
+        .decide_unauthenticated(head, secure, refused)
+        .await
+        .map(ToolExchange::Git)
     } else {
-      self.svn.decide(head, secure).await.map(ToolExchange::Svn)
-    }
-  }
-
-  /// Dispatches `head` by protocol syntax alone.
-  async fn dispatch_by_protocol(
-    &mut self,
-    head: &Head<'_>,
-    secure: bool,
-  ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
-    match classify_route(head, self.room) {
-      SiteRoute::Hg => self.hg.decide(head, secure).await.map(ToolExchange::Hg),
-      SiteRoute::Svn => self.svn.decide(head, secure).await.map(ToolExchange::Svn),
-      SiteRoute::Git => self.git.decide(head, secure).await.map(ToolExchange::Git),
+      self
+        .svn
+        .decide_unauthenticated(head, secure, refused)
+        .await
+        .map(ToolExchange::Svn)
     }
   }
 
@@ -699,57 +799,188 @@ impl<G: Site, H: Site, S: Site + ToolLookup> ToolSites<G, H, S> {
     }
   }
 
-  /// Returns `head`'s first path segment when first-segment repository lookup is still active.
-  fn pending_first_segment(&self, head: &Head<'_>) -> Option<String> {
-    if self.stage == RouteStage::FirstAbsent {
-      return None;
-    }
-    svn::first_path_segment(head, self.room)
-  }
-
-  /// Dispatches an authenticated request whose first path segment belongs to this shard,
-  /// marking `FirstAbsent` if the site subsequently redirects to another shard.
-  async fn decide_local_segment(
+  /// Dispatches an authenticated multi-segment candidate matched to its registered tool.
+  async fn dispatch_exact_match(
     &mut self,
-    first: &str,
+    kind: ExactKind,
     head: &Head<'_>,
     secure: bool,
     proven: &git::Proven,
   ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
-    let decided = match self.svn.find_repository(first) {
-      Some(record) => {
+    match kind {
+      ExactKind::LfsExact | ExactKind::Git => self
+        .git
+        .decide_proven(head, secure, proven)
+        .await
+        .map(ToolExchange::Git),
+      ExactKind::LfsBare => {
+        self.git.set_route_stage(RouteStage::LfsBareFallback);
         self
-          .dispatch_for_tool(record.tool, head, secure, proven)
+          .git
+          .decide_proven(head, secure, proven)
           .await
+          .map(ToolExchange::Git)
       }
-      None => self.dispatch_by_protocol_proven(head, secure, proven).await,
-    };
-    if matches!(decided.answer, Answer::Move { .. }) {
-      self.stage = RouteStage::FirstAbsent;
+      ExactKind::Hg => self
+        .hg
+        .decide_proven(head, secure, proven)
+        .await
+        .map(ToolExchange::Hg),
     }
+  }
+
+  /// Propagates `LfsBareFallback` or `FirstAbsent` when a delegated site returns `Answer::Move`.
+  fn advance_stage_on_move(
+    &mut self,
+    answer: &Answer<ToolExchange<G::Exchange, H::Exchange, S::Exchange>>,
+  ) {
+    if matches!(answer, Answer::Move { .. }) {
+      self.stage = if self.git.route_stage() == RouteStage::LfsBareFallback {
+        RouteStage::LfsBareFallback
+      } else {
+        RouteStage::FirstAbsent
+      };
+    }
+  }
+
+  /// Stage `LfsBareFallback`: dispatches directly to `GitSite` with bare-alias resolution forced.
+  async fn dispatch_lfs_bare_fallback(
+    &mut self,
+    head: &Head<'_>,
+    secure: bool,
+    proven: &git::Proven,
+  ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
+    self.git.set_route_stage(RouteStage::LfsBareFallback);
+    self
+      .git
+      .decide_proven(head, secure, proven)
+      .await
+      .map(ToolExchange::Git)
+  }
+
+  /// Stage `FirstAbsent`: dispatches by protocol syntax and preserves `LfsBareFallback` on move.
+  async fn dispatch_after_first_absent(
+    &mut self,
+    head: &Head<'_>,
+    secure: bool,
+    proven: &git::Proven,
+  ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
+    let decided = self.dispatch_by_protocol_proven(head, secure, proven).await;
+    self.advance_stage_on_move(&decided.answer);
     decided
   }
 
-  /// Authenticates `head` before lookup and dispatches it via its first path segment, moving to
-  /// the owning shard when `first` lives elsewhere.
-  async fn decide_first_segment(
+  /// Stage `ExactAbsent` (or `Initial` without a multi-segment candidate): resolves the first path
+  /// segment on its owning shard, advancing to `FirstAbsent` if absent or redirected onward.
+  async fn decide_first_segment_proven(
     &mut self,
-    first: &str,
     head: &Head<'_>,
     secure: bool,
+    proven: &git::Proven,
   ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
-    let Some(proven) = self.authenticate_before_lookup(head).await else {
-      return self.dispatch_unauthenticated(head, secure).await;
+    let Some(first) = svn::first_path_segment(head, self.room) else {
+      return self.dispatch_after_first_absent(head, secure, proven).await;
     };
-    if let git::Located::Elsewhere(shard) = self.svn.locate_repository(first) {
+    if let git::Located::Elsewhere(shard) = self.svn.locate_repository(&first) {
       return Decided {
         answer: Answer::Move { shard },
         proven: true,
       };
     }
-    self
-      .decide_local_segment(first, head, secure, &proven)
-      .await
+    let decided = match self.svn.find_repository(&first) {
+      Some(record) => {
+        self
+          .dispatch_for_tool(record.tool, head, secure, proven)
+          .await
+      }
+      None => {
+        self.stage = RouteStage::FirstAbsent;
+        self.dispatch_by_protocol_proven(head, secure, proven).await
+      }
+    };
+    self.advance_stage_on_move(&decided.answer);
+    decided
+  }
+
+  /// Stage `ExactLfsBare`: resolves a `.git`-stripped multi-segment LFS alias on its owning shard,
+  /// advancing to `ExactAbsent` (first-segment lookup) if absent.
+  async fn decide_exact_lfs_bare(
+    &mut self,
+    head: &Head<'_>,
+    secure: bool,
+    proven: &git::Proven,
+  ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
+    if let Some(candidate) = exact_lfs_bare_candidate(head, self.room) {
+      if let git::Located::Elsewhere(shard) = self.svn.locate_repository(&candidate.name) {
+        return Decided {
+          answer: Answer::Move { shard },
+          proven: true,
+        };
+      }
+      if self
+        .svn
+        .find_repository(&candidate.name)
+        .is_some_and(|record| record.tool == candidate.kind.tool())
+      {
+        return self
+          .dispatch_exact_match(candidate.kind, head, secure, proven)
+          .await;
+      }
+    }
+    self.stage = RouteStage::ExactAbsent;
+    self.decide_first_segment_proven(head, secure, proven).await
+  }
+
+  /// Stage `Initial`: checks any multi-segment syntactic repository candidate on its owning shard
+  /// before falling back to its `.git`-stripped LFS alias (`ExactLfsBare`) or the first path
+  /// segment (`ExactAbsent`).
+  async fn decide_initial_proven(
+    &mut self,
+    head: &Head<'_>,
+    secure: bool,
+    proven: &git::Proven,
+  ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
+    let Some(candidate) = exact_multi_segment_candidate(head, self.room) else {
+      return self.decide_first_segment_proven(head, secure, proven).await;
+    };
+    if let git::Located::Elsewhere(shard) = self.svn.locate_repository(&candidate.name) {
+      return Decided {
+        answer: Answer::Move { shard },
+        proven: true,
+      };
+    }
+    if self
+      .svn
+      .find_repository(&candidate.name)
+      .is_some_and(|record| record.tool == candidate.kind.tool())
+    {
+      return self
+        .dispatch_exact_match(candidate.kind, head, secure, proven)
+        .await;
+    }
+    if candidate.kind == ExactKind::LfsExact && exact_lfs_bare_candidate(head, self.room).is_some()
+    {
+      self.stage = RouteStage::ExactLfsBare;
+      return self.decide_exact_lfs_bare(head, secure, proven).await;
+    }
+    self.stage = RouteStage::ExactAbsent;
+    self.decide_first_segment_proven(head, secure, proven).await
+  }
+
+  /// Routes an authenticated request from the current monotonic [`RouteStage`].
+  async fn decide_proven_stage(
+    &mut self,
+    head: &Head<'_>,
+    secure: bool,
+    proven: &git::Proven,
+  ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
+    match self.stage {
+      RouteStage::LfsBareFallback => self.dispatch_lfs_bare_fallback(head, secure, proven).await,
+      RouteStage::FirstAbsent => self.dispatch_after_first_absent(head, secure, proven).await,
+      RouteStage::ExactAbsent => self.decide_first_segment_proven(head, secure, proven).await,
+      RouteStage::ExactLfsBare => self.decide_exact_lfs_bare(head, secure, proven).await,
+      RouteStage::Initial => self.decide_initial_proven(head, secure, proven).await,
+    }
   }
 }
 
@@ -762,16 +993,18 @@ impl<G: Site, H: Site, S: Site + ToolLookup> Site for ToolSites<G, H, S> {
 
   fn set_route_stage(&mut self, stage: RouteStage) {
     self.stage = stage;
+    self.git.set_route_stage(stage);
   }
 
   async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange> {
-    if hg::wire_request(head, self.room) {
-      return self.hg.decide(head, secure).await.map(ToolExchange::Hg);
+    let decided = match self.authenticate_before_lookup(head).await {
+      PreAuth::Proven(proven) => self.decide_proven_stage(head, secure, &proven).await,
+      PreAuth::Refused(refused) => self.dispatch_unauthenticated(head, secure, refused).await,
+    };
+    if !matches!(decided.answer, Answer::Move { .. }) {
+      self.set_route_stage(RouteStage::Initial);
     }
-    if let Some(first) = self.pending_first_segment(head) {
-      return self.decide_first_segment(&first, head, secure).await;
-    }
-    self.dispatch_by_protocol(head, secure).await
+    decided
   }
 }
 
