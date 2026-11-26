@@ -62,6 +62,12 @@ const FIRST_DATE: u64 = 1_700_000_000;
 const CAP: usize = 1 << 16;
 /// Shape: how long a test lets a run take before giving up on it: ten liveness windows.
 pub(crate) const TEST_BOUND_NS: u64 = 10 * LIVENESS_BUDGET_NS;
+/// Derived: how long [`ran`] waits for a run from before its spawner starts. The hook's own run is held to
+/// [`TEST_BOUND_NS`] from its start (its client leaves then), and before it comes the spawner's start, a start of this
+/// same test binary, which the hook's own bound already covers once: so twice [`TEST_BOUND_NS`]. Counted from before
+/// both starts, ten windows alone raced the machine (main 01a20182's 8a loop of 2026-11-25, round 2, the same round
+/// whose spawners took past a window to start).
+const SPAWNED_AND_RUN_NS: u64 = 2 * TEST_BOUND_NS;
 /// Shape: the most turns a view's sealing may take here, far past what these packs need a unit of
 /// work a turn.
 const TURNS: u32 = 1 << 20;
@@ -484,8 +490,10 @@ fn as_role(mut input: HookInput) -> HookInput {
 }
 
 /// Runs `input`'s hook under `policy` in `presented`, as the role, with no learned bound and a
-/// client that stays; the test gives up past [`TEST_BOUND_NS`]. None when the run's task could not
-/// be spawned or the run did not answer within the bound: the test fails on it.
+/// client that leaves [`TEST_BOUND_NS`] after the hook's start (its first look comes once the
+/// spawner has answered the start), which the test reads as the run abandoned; it gives up on the
+/// whole past [`SPAWNED_AND_RUN_NS`]. None when the run's task could not be spawned or the run did
+/// not answer within that: the test fails on it.
 fn ran(
   presented: &Presented,
   policy: &RepositoryPolicy,
@@ -502,8 +510,11 @@ fn ran(
         view: &presented,
         words_cap: CAP,
       };
-      let running = run(&site, &input, None, std::future::pending());
-      let answered = slates_rt::futures::within(TEST_BOUND_NS, running).await;
+      let client = async {
+        let _ = slates_rt::futures::sleep(TEST_BOUND_NS).await;
+      };
+      let running = run(&site, &input, None, client);
+      let answered = slates_rt::futures::within(SPAWNED_AND_RUN_NS, running).await;
       let _ = sent.send(answered.ok().flatten());
     })
     .ok()?;
