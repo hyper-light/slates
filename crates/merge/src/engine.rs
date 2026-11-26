@@ -1138,6 +1138,42 @@ pub enum Rebased {
 /// A per-path content history: for each path, the versions at which its bytes changed and the bytes
 /// then (`None` when removed), so any base version's content can be reconstructed for the identity
 /// check. The design's chain shares these copy-on-write; here they are full copies (owed).
+/// A green's checkpoint being built a unit at a time ([`Green::checkpoint_begin`], [`Green::checkpoint_unit`]; A-920 8a:
+/// built whole in one step, 52.5 ms of a wide import's checkpoint turn, debug, 48.3 of it its two copied trees' 18,002
+/// keys).
+#[derive(Debug)]
+pub struct CheckpointBuild {
+  /// The version it is the green's state at.
+  at: u64,
+  /// The copied trees' destinations whose keys it reads.
+  trees: Vec<String>,
+  /// The trees whose keys are gathered.
+  gathered: usize,
+  /// The gathered keys not yet read.
+  keys: BTreeSet<IdentityKey>,
+  /// The copied keys listed so far.
+  copied: crate::checkpoint::Tables,
+  /// The keys listed in [`CheckpointBuild::copied`].
+  listed: BTreeSet<IdentityKey>,
+}
+
+impl CheckpointBuild {
+  /// Whether its next unit is a whole part (a copied tree's keys gathered, or the checkpoint's rest made), which a
+  /// paced caller begins a step with, never ends one past its quantum (A-920 piece 2c's rule); else a key's read.
+  pub fn next_is_part(&self) -> bool {
+    self.gathered < self.trees.len() || self.keys.is_empty()
+  }
+}
+
+/// What a unit of [`Green::checkpoint_unit`] left.
+#[derive(Debug)]
+pub enum CheckpointStep {
+  /// Units are left.
+  More,
+  /// The checkpoint, built.
+  Built(Box<crate::checkpoint::Checkpoint>),
+}
+
 type ContentHistory = BTreeMap<String, Vec<(u64, Option<crate::history::Value>)>>;
 
 /// A per-path value history for a namespace dimension: the value at each version the path changed,
@@ -3233,11 +3269,51 @@ impl Green {
   /// values are no longer reconstructible). With the origin it restores ([`Green::restore`]) a green that answers as
   /// this one does for every version from `at` on.
   pub fn checkpoint(&self, at: u64) -> Option<crate::checkpoint::Checkpoint> {
-    // A green that owes a push has no content to fold into one (P2): nothing.
-    if self.owed.is_some() || at > self.head() || at < self.folded_below || at < self.deltas_from {
+    let mut build = self.checkpoint_begin(at)?;
+    loop {
+      if let CheckpointStep::Built(checkpoint) = self.checkpoint_unit(&mut build)? {
+        return Some(*checkpoint);
+      }
+    }
+  }
+
+  /// [`Green::checkpoint`] at `at` begun, to be built a unit at a time ([`Green::checkpoint_unit`], A-920 8a): none
+  /// where it would be none.
+  pub fn checkpoint_begin(&self, at: u64) -> Option<CheckpointBuild> {
+    if !self.checkpoint_available(at) {
       return None;
     }
-    let (copied, listed) = self.copied_at(at);
+    Some(CheckpointBuild {
+      at,
+      trees: self.copied_trees_at(at),
+      gathered: 0,
+      keys: BTreeSet::new(),
+      copied: crate::checkpoint::Tables::default(),
+      listed: BTreeSet::new(),
+    })
+  }
+
+  /// One unit of `build` ([`Green::checkpoint_begin`]): a copied tree's keys gathered, one of its keys read
+  /// (`copied_key`), or the rest made whole and the checkpoint built: every changed key's value and the increments, the
+  /// copies' records and the sum, the copied keys left out of the changed ones, canonical. Between units the green may
+  /// take versions past `at`, which change nothing a checkpoint at `at` reads; none where the checkpoint is no longer
+  /// available there (a fold past `at`, a push owed).
+  pub fn checkpoint_unit(&self, build: &mut CheckpointBuild) -> Option<CheckpointStep> {
+    let at = build.at;
+    if !self.checkpoint_available(at) {
+      return None;
+    }
+    if let Some(tree) = build.trees.get(build.gathered) {
+      build.keys.extend(self.every_key(tree));
+      build.gathered = build.gathered.saturating_add(1);
+      return Some(CheckpointStep::More);
+    }
+    if let Some(key) = build.keys.pop_first() {
+      self.copied_key(key, at, (&mut build.copied, &mut build.listed));
+      return Some(CheckpointStep::More);
+    }
+    let copied = std::mem::take(&mut build.copied);
+    let listed = std::mem::take(&mut build.listed);
     let copies = self.copy_records_at(at);
     // The sum stands for what the copies' entries hold beyond the restored state's own, so it travels beside a copy's
     // record alone: without one, a restore's own entries are the identity (A-626 part 3, continued (1)).
@@ -3282,7 +3358,13 @@ impl Green {
     };
     Green::leave_out_copied(&mut checkpoint, &listed);
     checkpoint.canonicalize();
-    Some(checkpoint)
+    Some(CheckpointStep::Built(Box::new(checkpoint)))
+  }
+
+  /// Whether a checkpoint at `at` is available: none where the green owes a push (P2: it has no content to fold into
+  /// one), or `at` is past the head or below the folded floor (its values are no longer reconstructible).
+  fn checkpoint_available(&self, at: u64) -> bool {
+    self.owed.is_none() && at <= self.head() && at >= self.folded_below && at >= self.deltas_from
   }
 
   /// A green restored from its `origin` and a `checkpoint` of it (§4.16, §4.8 recovery): the origin's state with every

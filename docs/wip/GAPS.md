@@ -670,8 +670,8 @@
 > ms, `apply_slice` 4.5, `retire_begun` 4.5, a staging step 4.3, the text release 4.2). A turn is under 6 ms since 7a
 > (an event a unit) and 7b (the close a unit a step). Since 7c each section is a step of its own and every paced loop
 > stops at its deadline, but release probe 10 (after 7b) read every wide test past 1 ms: the landing's sections 3.0-4.2
-> ms of thread CPU (add, copy), and the checkpoint task's `CheckpointHold::begin` 5.3-7.8 ms (move), owed a file a
-> unit. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
+> ms of thread CPU (add, copy), and the checkpoint task's `CheckpointHold::begin` 5.3-7.8 ms (move). Since 8a the
+> checkpoint is built a copied key a unit (debug: 52.5 ms whole before, the move test's longest step now the history's). Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's

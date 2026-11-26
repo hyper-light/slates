@@ -458,8 +458,11 @@ const IDENTITY_KEY: usize = 0;
 const CHUNK_HASHED: usize = 1;
 /// The pace kind of one chunk of a checkpoint's encoding copied into its content store stage ([`CheckpointHold::step`]).
 const CHUNK_STAGED: usize = 2;
-/// The pace kinds a checkpoint's work is measured in: [`IDENTITY_KEY`], [`CHUNK_HASHED`], [`CHUNK_STAGED`].
-pub(crate) const CHECKPOINT_KINDS: usize = CHUNK_STAGED + 1;
+/// The pace kind of one copied key read for a checkpoint's build ([`CheckpointHold::step`], A-920 8a).
+const CHECKPOINT_KEY: usize = 3;
+/// The pace kinds a checkpoint's work is measured in: [`IDENTITY_KEY`], [`CHUNK_HASHED`], [`CHUNK_STAGED`],
+/// [`CHECKPOINT_KEY`].
+pub(crate) const CHECKPOINT_KINDS: usize = CHECKPOINT_KEY + 1;
 
 /// Takes `green`'s checkpoint in turns (A-579): its identity's backlog folded a paced step a turn, then its encoding held
 /// in the content store a paced step a turn (`hold`, begun already when the identity was folded in the asking step),
@@ -533,7 +536,9 @@ fn checkpoint_turn(
 }
 
 /// A green's checkpoint on its way into the owner shard's content store (A-579's last step, chain entry format 6's rule):
-/// built and encoded, then its encoding's chunks hashed into the inputs archive's manifest a unit at a time, then copied
+/// built a unit at a time (A-920 8a: each copied tree's keys gathered, each of their keys read, then the rest whole,
+/// [`slates_merge::engine::Green::checkpoint_unit`]; built whole at its begin, 52.5 ms of one checkpoint turn, debug,
+/// for a green holding two copied trees of 9,000 files), encoded, then its encoding's chunks hashed into the inputs archive's manifest a unit at a time, then copied
 /// into the store's stage of that manifest a unit at a time, then the stage completed, the shard published and the
 /// checkpoint recorded by name ([`Op::GreenCheckpointed`]). Owned by the step or the task taking it, so dropping it
 /// mid-way leaves nothing but its stage, which the next checkpoint's stage replaces and recovery gives back
@@ -543,7 +548,9 @@ pub(crate) struct CheckpointHold {
   green: DbVolumeId,
   /// The version the checkpoint is the green's state at: its checkpoint floor when it was built.
   version: u64,
-  /// The checkpoint's encoding (`slates_merge::checkpoint`).
+  /// What is left to make before the encoding is hashed: the checkpoint's build, then its encoding; none once encoded.
+  making: Option<Making>,
+  /// The checkpoint's encoding (`slates_merge::checkpoint`), once made.
   encoding: Vec<u8>,
   /// The manifest's extents hashed so far, one a chunk in order.
   extents: Vec<slates_archive::manifest::Extent>,
@@ -553,6 +560,14 @@ pub(crate) struct CheckpointHold {
   staging: Option<[u8; 32]>,
   /// The chunks copied into the stage so far.
   staged: usize,
+}
+
+/// What a [`CheckpointHold`] makes before its encoding is hashed (A-920 8a).
+enum Making {
+  /// The checkpoint being built, and the head and its identity read when it began (A-257), which it records.
+  Building(Box<slates_merge::engine::CheckpointBuild>, (u64, [u8; 32])),
+  /// The checkpoint built, to be encoded in a unit of its own.
+  Encoding(Box<slates_merge::checkpoint::Checkpoint>),
 }
 
 /// What a step of a [`CheckpointHold`] left.
@@ -579,10 +594,9 @@ impl CheckpointHold {
     }
     let floor = inputs.floor;
     // The head's identity beside it (A-257): the amortized rule above bounds how often this reads the identity.
-    let Some(checkpoint) = state.greens.get_mut(&green).and_then(|mut engine| {
-      let mut checkpoint = engine.checkpoint(floor)?;
-      checkpoint.head_check = Some((engine.head(), engine.head_identity()));
-      Some(checkpoint)
+    let Some(building) = state.greens.get_mut(&green).and_then(|mut engine| {
+      let build = engine.checkpoint_begin(floor)?;
+      Some((Box::new(build), (engine.head(), engine.head_identity())))
     }) else {
       state.count(CHECKPOINT_UNAVAILABLE, 1);
       return None;
@@ -590,7 +604,8 @@ impl CheckpointHold {
     Some(CheckpointHold {
       green,
       version: floor,
-      encoding: checkpoint.into_encoded(),
+      making: Some(Making::Building(building.0, building.1)),
+      encoding: Vec::new(),
       extents: Vec::new(),
       hashed: 0,
       staging: None,
@@ -616,15 +631,18 @@ impl CheckpointHold {
         let mut step = slates_pace::Step::begin(env, (env.clock)());
         let mut taken = 0u32;
         let held = loop {
-          let kind = if self.staging.is_some() {
-            CHUNK_STAGED
-          } else {
-            CHUNK_HASHED
+          let kind = match (&self.making, self.staging.is_some()) {
+            (Some(_), _) => CHECKPOINT_KEY,
+            (None, true) => CHUNK_STAGED,
+            (None, false) => CHUNK_HASHED,
           };
-          let spent = match hold_units_a_step() {
-            Some(units) => taken >= units,
-            None => !step.more(kind, &mut costs),
-          };
+          // A whole part of the build begins a step, never ends one past its quantum (A-920 piece 2c's rule).
+          let part_after_units = taken > 0 && self.next_is_part();
+          let spent = part_after_units
+            || match hold_units_a_step() {
+              Some(units) => taken >= units,
+              None => !step.more(kind, &mut costs),
+            };
           if spent {
             break Held::More;
           }
@@ -648,9 +666,54 @@ impl CheckpointHold {
     held
   }
 
-  /// One unit: a chunk hashed, the stage opened once every chunk is, a chunk staged, or the stage completed and the
-  /// checkpoint recorded.
+  /// Whether the next unit is a whole part: a copied tree's keys gathered, the build's rest, or the encoding.
+  fn next_is_part(&self) -> bool {
+    match &self.making {
+      Some(Making::Building(build, _)) => build.next_is_part(),
+      Some(Making::Encoding(_)) => true,
+      None => false,
+    }
+  }
+
+  /// One unit of the checkpoint's making (A-920 8a): a unit of its build, its encoding once built. Unavailable part-way
+  /// (its floor folded past, a push owed), counted and ended.
+  fn making_unit(&mut self, state: &mut ShardState, making: Making) -> Held {
+    match making {
+      Making::Building(mut build, head_check) => {
+        state.count(CHECKPOINT_BUILD_UNITS, 1);
+        let step = state
+          .greens
+          .get(&self.green)
+          .and_then(|engine| engine.checkpoint_unit(&mut build));
+        match step {
+          Some(slates_merge::engine::CheckpointStep::More) => {
+            self.making = Some(Making::Building(build, head_check));
+            Held::More
+          }
+          Some(slates_merge::engine::CheckpointStep::Built(mut checkpoint)) => {
+            checkpoint.head_check = Some(head_check);
+            self.making = Some(Making::Encoding(checkpoint));
+            Held::More
+          }
+          None => {
+            state.count(CHECKPOINT_UNAVAILABLE, 1);
+            Held::Ended
+          }
+        }
+      }
+      Making::Encoding(checkpoint) => {
+        self.encoding = checkpoint.into_encoded();
+        Held::More
+      }
+    }
+  }
+
+  /// One unit: a unit of the checkpoint's making, a chunk hashed, the stage opened once every chunk is, a chunk staged,
+  /// or the stage completed and the checkpoint recorded.
   fn unit(&mut self, state: &mut ShardState) -> Held {
+    if let Some(making) = self.making.take() {
+      return self.making_unit(state, making);
+    }
     let object = checkpoint_object(self.green);
     let Some(manifest) = self.staging else {
       let chunk = crate::merge_origin::inputs_chunk_bytes().max(1);
@@ -991,6 +1054,11 @@ pub(crate) fn settle_checkpoints(state: &mut ShardState) {
     checkpoint_ended(state, green);
   }
 }
+
+/// Counter: a unit of a checkpoint's build ([`CheckpointHold`], A-920 8a): a copied tree's keys gathered, one of its
+/// keys read, or the rest made; many a checkpoint of a green holding a wide copy shows its build was taken a unit at a
+/// time, never whole at its begin. Format: a counter name in the daemon's status report.
+pub(crate) const CHECKPOINT_BUILD_UNITS: &str = "merge.checkpoint.build_units";
 
 /// Counter: a green's chain checkpointed (W3), the non-vacuity count of [`checkpoint_green`].
 pub(crate) const CHECKPOINT_TAKEN: &str = "merge.checkpoint.taken";
