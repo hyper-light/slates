@@ -504,14 +504,8 @@ pub(crate) struct Prepared {
   replied: Vec<Replied>,
   /// Whether the client asked for a reply (`replycaps`).
   wanted: bool,
-  /// The first and last changesets it adds, which its hooks name (`HG_NODE`, `HG_NODE_LAST`).
-  pub(crate) added: Option<(Node, Node)>,
   /// Each name it changes as its admission asks about it.
   pub(crate) asked: Vec<Ask>,
-  /// Its changegroup part's id, which a hook's `output` part names.
-  pub(crate) changegroup: Option<u32>,
-  /// Its transaction's id, which every hook of it reads (`HG_TXNID`; [`transaction_id`]).
-  pub(crate) transaction: String,
   /// Its works' increments held before its landing's step (`crate::held_ahead`): none for works built in that step.
   held_ahead: Vec<crate::held_ahead::HeldAhead>,
   /// The file revisions its works name by their stored bytes' object (A-887), brought back before a test's landing
@@ -548,19 +542,6 @@ impl Prepared {
         brings: None,
       })
       .collect()
-  }
-
-  /// Adds the `output` parts admission hooks wrote, after the changegroup's reply, as 7.2 writes them after the reply of
-  /// the part whose handler ran the hooks.
-  pub(crate) fn with_output(&mut self, output: Vec<Replied>) {
-    let at = self
-      .replied
-      .iter()
-      .position(|replied| matches!(replied, Replied::Changegroup { .. }))
-      .map_or(self.replied.len(), |at| at.saturating_add(1));
-    let tail = self.replied.split_off(at.min(self.replied.len()));
-    self.replied.extend(output);
-    self.replied.extend(tail);
   }
 }
 
@@ -601,10 +582,7 @@ pub(crate) fn prepare<V: Repository>(
     parts,
     replied: plan.replied.clone(),
     wanted: unbundle.reply_caps().is_some(),
-    added: plan.added,
     asked: asked(&plan, &read),
-    changegroup: unbundle.changegroup().map(|(id, _)| id),
-    transaction: transaction_id(&terms.1),
     forked: None,
     held_ahead: Vec::new(),
     #[cfg(test)]
@@ -1492,6 +1470,8 @@ async fn unbundled(
   };
   let outcome = match crate::state::with_state(|state| recorded(state, &mut forked, &run))? {
     Ok(()) => {
+      #[cfg(test)]
+      held_before_landing().await;
       landed_after_builds(repository, (principal, name), &unbundle, Some(forked), room).await
     }
     Err(outcome) => {
@@ -1501,6 +1481,64 @@ async fn unbundled(
   };
   settle_run(run, outcome.as_ref()).await;
   outcome
+}
+
+#[cfg(test)]
+std::thread_local! {
+  /// Set by a test on this shard's thread ([`hold_next_landing`]): the next push to reach its landing, its changegroup
+  /// taken and its segments landed, holds there until the test releases it ([`release_held_landing`]), so another push
+  /// can land between its intake and its landing. A test hold, since the product holds a push before its landing nowhere:
+  /// a green whose write policy asks for an approval refuses a push `ApprovalRequired` (`repository::push`), never
+  /// waiting on one, so a race between a push's read and its landing can be staged only so (main's ruling of
+  /// 2026-11-26 for hg_push's race histories).
+  static TEST_HOLD_NEXT_LANDING: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+  /// Whether a push is held at its landing now ([`landing_held`]).
+  static TEST_LANDING_HELD: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+  /// Set by [`release_held_landing`]: the held push goes on.
+  static TEST_LANDING_RELEASED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+  /// The held push's task, woken by its release.
+  static TEST_HELD_LANDING: core::cell::RefCell<Option<core::task::Waker>> =
+    const { core::cell::RefCell::new(None) };
+}
+
+/// Holds a push at its landing where a test asked for the next one to hold ([`TEST_HOLD_NEXT_LANDING`]), until the test
+/// releases it: woken by the release itself, no timed poll (R3).
+#[cfg(test)]
+async fn held_before_landing() {
+  if !TEST_HOLD_NEXT_LANDING.with(|hold| hold.replace(false)) {
+    return;
+  }
+  TEST_LANDING_HELD.with(|held| held.set(true));
+  core::future::poll_fn(|context| {
+    if TEST_LANDING_RELEASED.with(|released| released.replace(false)) {
+      return core::task::Poll::Ready(());
+    }
+    TEST_HELD_LANDING.with(|held| *held.borrow_mut() = Some(context.waker().clone()));
+    core::task::Poll::Pending
+  })
+  .await;
+  TEST_LANDING_HELD.with(|held| held.set(false));
+}
+
+/// Asks the next push to reach its landing on this shard's thread to hold there ([`held_before_landing`]).
+#[cfg(test)]
+pub(crate) fn hold_next_landing() {
+  TEST_HOLD_NEXT_LANDING.with(|hold| hold.set(true));
+}
+
+/// Whether a push is held at its landing on this shard's thread now.
+#[cfg(test)]
+pub(crate) fn landing_held() -> bool {
+  TEST_LANDING_HELD.with(core::cell::Cell::get)
+}
+
+/// Releases the push held at its landing on this shard's thread: its flag set and its task woken.
+#[cfg(test)]
+pub(crate) fn release_held_landing() {
+  TEST_LANDING_RELEASED.with(|released| released.set(true));
+  if let Some(waker) = TEST_HELD_LANDING.with(|held| held.borrow_mut().take()) {
+    waker.wake();
+  }
 }
 
 /// A push's run once its outcome stands. Committed, its file revisions are noted for a home and let go a turn at a time
@@ -3869,102 +3907,6 @@ fn recorded_segments(state: &mut ShardState, taking: &mut Taking) -> Option<Vec<
   Some(recorded)
 }
 
-/// A prepared push landed as the driver lands it once its intake is done: a fork another push made stale taken again
-/// from its changegroup, every slice at once (the driver takes it again inside its repository's landing turn,
-/// `hg_run`), then its segments landed on the store ([`store_blocking`]), then judged at landing and landed: the
-/// driver's steps for the tests, which land pushes side by side with no runtime.
-#[cfg(test)]
-pub(crate) fn land_in(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  (principal, bundle): (&Principal, &[u8]),
-  unbundle: &Unbundle,
-  forked: Option<Forked>,
-  room: &mut Admission,
-) -> Option<PushOutcome> {
-  let forked = match forked {
-    Some(stale) if is_stale(state, repository, &stale) => {
-      state.count(super::hg_run::REBASED, 1);
-      match rebase::rebase_whole(state, repository, stale)? {
-        Ok(rebased) => Some(rebased),
-        Err(outcome) => return Some(outcome),
-      }
-    }
-    fresh => fresh,
-  };
-  let mut forked = forked;
-  let mut run = None;
-  if let Some(fork) = forked.as_mut() {
-    match store_blocking(state, repository, fork) {
-      Ok(stored) => run = stored,
-      Err(outcome) => return Some(outcome),
-    }
-  }
-  // Its works planned as the landing judges them and built whole, as the driver plans and builds them a unit a turn.
-  let name = push_name(repository, bundle);
-  let mut plan = Vec::new();
-  let mut planning_room = *room;
-  let planned = vcs_store::lent_state(state, |state| {
-    judged_over(
-      state,
-      repository,
-      (principal, name),
-      unbundle,
-      forked.as_ref(),
-      (&mut Works::Planning(&mut plan), &mut planning_room),
-    )
-  });
-  let built = match planned {
-    Some(Ok(_)) => works_whole(state, repository, (forked.as_ref(), name), &plan, room)
-      .and_then(|(built, named)| {
-        bring_back_named_whole(state, repository, forked.as_ref(), &named)?;
-        Ok(built)
-      })
-      .map_err(|refused| PushOutcome::refused(&refused)),
-    Some(Err(outcome)) => Err(outcome),
-    None => Err(PushOutcome::refused(&abort(NO_STORE.to_vec()))),
-  };
-  let mut built = match built {
-    Ok(built) => built,
-    Err(outcome) => {
-      if let Some(forked) = forked
-        && release_index(state, forked.fork).is_err()
-      {
-        state.count(vcs_store::RELEASE_REFUSED, 1);
-      }
-      settled_whole(state, run, false);
-      return Some(outcome);
-    }
-  };
-  let mut uses = uses_of(&plan);
-  let mut works = Works::Built {
-    built: &mut built,
-    missed: false,
-    uses: &mut uses,
-    ahead: &[],
-  };
-  match landing(
-    state,
-    repository,
-    (principal, name),
-    unbundle,
-    forked,
-    (&mut works, room),
-  ) {
-    Landing::Done(outcome) => {
-      let accepted = matches!(outcome, Some(PushOutcome::Accepted(_)));
-      settled_whole(state, run, accepted);
-      outcome
-    }
-    // Built from the plan its landing judges, it misses no work; were it to, its fork goes back as a refusal's does.
-    Landing::Unbuilt(back) => {
-      give_back_in(state, *back);
-      settled_whole(state, run, false);
-      None
-    }
-  }
-}
-
 /// `moved`'s work begun for [`works_whole`], as [`begun_work`] begins it: a changeset or manifest its layout found not
 /// at hand (its text let go once landed, goal 93 C1 (1) P5) read whole from the node's changeset store on a thread of
 /// its own and given to the layout in its object's place, then laid out again, at most [`LAYOUT_TEXTS`].
@@ -4025,8 +3967,8 @@ fn log_text_read_blocking(
     .flatten()
 }
 
-/// The works `plan` names, built whole for a test that holds the shard's state through its push ([`land_in`],
-/// [`prepare_whole`], [`prepare_served`]): [`built_works`]' units at once over the push's fork (`forked`, else the
+/// The works `plan` names, built whole for a test that holds the shard's state through its push ([`prepare_whole`],
+/// [`prepare_served`]): [`built_works`]' units at once over the push's fork (`forked`, else the
 /// store's index), a text not at hand read from the node's changeset store on a thread of its own
 /// (`test_store::answer_wants_blocking`) and brought back, as the driver reads one between turns. With each file
 /// revision the works name by its stored bytes' object (A-887).
@@ -4164,43 +4106,6 @@ fn intake_outcome(refused: &IntakeRefused) -> PushOutcome {
   PushOutcome::refused(&intake_refused(refused))
 }
 
-/// [`prepare`] over `view` with `unbundle`'s changegroup taken whole into a fork first, the prepared push holding the
-/// fork: the driver's steps for the tests, which judge a push over a view of their own.
-#[cfg(test)]
-pub(crate) fn prepare_whole<V: Repository>(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  unbundle: &Unbundle,
-  view: &V,
-  terms: Terms,
-  room: &mut Admission,
-) -> Result<Prepared, Box<Refused>> {
-  let forked = forked_whole(state, repository, unbundle, room)?;
-  let over = (forked.as_ref(), terms.1);
-  let prepared = judged_whole(state, repository, over, room, |state, works, room| {
-    vcs_store::lent_state(state, |state| {
-      match state.vcs_stores.mercurial_ref(repository) {
-        None => Err(abort(NO_STORE.to_vec())),
-        Some((content, _)) => {
-          brought_of(forked.as_ref(), content, room).and_then(|(brought, held_changesets)| {
-            prepare(
-              state,
-              repository,
-              unbundle,
-              view,
-              (&brought, &held_changesets),
-              terms,
-              (works, room),
-            )
-          })
-        }
-      }
-    })
-  })
-  .and_then(named_onto);
-  attach(state, prepared, forked)
-}
-
 /// [`prepare_whole`] over the served view.
 #[cfg(test)]
 pub(crate) fn prepare_served(
@@ -4303,35 +4208,6 @@ fn brought_of(
     .map_err(|past| abort(unverified_words(&Unverified::PastAdmission(past))))?
     .ok_or_else(|| abort(UNREAD.to_vec()))?;
   Ok((read, forked.intaken.held_changesets.clone()))
-}
-
-/// The driver's last step (A-720) in one step: [`judged_landing`], then [`landed_judged`] making every create within it
-/// (a test's whole landing, which holds the shard through its push). Every refusal gives the fork back.
-fn landing(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  (principal, name): (&Principal, [u8; 32]),
-  unbundle: &Unbundle,
-  forked: Option<Forked>,
-  (works, room): (&mut Works<'_>, &mut Admission),
-) -> Landing {
-  match judged_landing(
-    state,
-    repository,
-    (principal, name),
-    unbundle,
-    forked,
-    (works, room),
-  ) {
-    Judging::Done(outcome) => Landing::Done(outcome),
-    Judging::Unbuilt(back) => Landing::Unbuilt(back),
-    Judging::Judged(prepared) => Landing::Done(landed_judged(
-      state,
-      (principal, repository),
-      *prepared,
-      None,
-    )),
-  }
 }
 
 /// A landing judged ([`judged_landing`]).
@@ -4484,14 +4360,6 @@ async fn land_sliced(
   landed.flatten()
 }
 
-/// What a landing came to ([`landing`]).
-enum Landing {
-  /// Its outcome; none when no view could be made.
-  Done(Option<PushOutcome>),
-  /// A work its plan names was not built before it ([`Works::Built`]): its fork, for its driver to build again.
-  Unbuilt(Box<Option<Forked>>),
-}
-
 /// The landing's judging, in 7.2's order (module docs, "The driver"): over the served view as it is at landing, the
 /// push's changesets read back from its fork, its texts read through it; prepared and admitted, or what refused it; none
 /// when no view could be made.
@@ -4542,18 +4410,8 @@ fn heads_hold(
 }
 
 /// A push's name (module docs, "The driver"; A-618: every work's identity begins with it), hashed from its repository
-/// and its bundle's bytes, whole: a test's, which holds the shard through its push ([`named_push`] hashes it a quantum
-/// at a time).
-#[cfg(test)]
-fn push_name(repository: RepositoryId, bundle: &[u8]) -> [u8; 32] {
-  let mut hasher = blake3::Hasher::new_derive_key(PUSH_NAME_CONTEXT);
-  hasher.update(&repository.bytes);
-  hasher.update(bundle);
-  *hasher.finalize().as_bytes()
-}
-
-/// A push's name as the tests' `push_name` hashes it, hashed once a quantum at a time (A-767 C1, the push spin: a 96 MiB
-/// bundle hashed in each judging's one step held the shard for seconds), so its judgings take it, never hash it again.
+/// and its bundle's bytes a quantum at a time (A-767 C1, the push spin: a 96 MiB bundle hashed in each judging's one
+/// step held the shard for seconds), so its judgings take it, never hash it again.
 async fn named_push(repository: RepositoryId, bundle: &[u8]) -> [u8; 32] {
   let mut hasher = blake3::Hasher::new_derive_key(PUSH_NAME_CONTEXT);
   hasher.update(&repository.bytes);

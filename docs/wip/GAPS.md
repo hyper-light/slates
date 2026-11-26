@@ -1174,7 +1174,7 @@
 >   `repository/import/tests.rs`, `fleet.rs`, `replica.rs`, `daemon::tests`; w-perf's: `vcs_store/tests.rs`,
 >   `vcs_store/paths/tests.rs`, `vcs_store/commits/tests.rs`, `vcs_store/index_upkeep.rs`, `vcs_store/named_objects.rs`.
 >   Edit none of them meanwhile; main assigns them back if either agent returns.
->   - `test_store::audit_on_stored_shard`: 90 sites. svn 0; git 0; hg 15 (`hg_push/tests.rs` 15);
+>   - `test_store::audit_on_stored_shard`: 75 sites. svn 0; git 0; hg 0;
 >     other 75 (`push/tests.rs` 18, `vcs_store/tests.rs` 14, `paths/tests.rs` 11,
 >     `repository.rs` 10, `commits/tests.rs` 8, `identities/tests.rs` 8, `index_upkeep.rs` 2, `import/tests.rs` 2,
 >     `fleet.rs` 2). `vcs_share/grants.rs`' 4 and `read_backs.rs`' 3 moved by w-git (2026-11-26): three histories that
@@ -1200,11 +1200,23 @@
 >     the same history imported in one call into a store of its own that lets nothing go, never from the store under
 >     test; the let-go tag test holds every object not held whole after its let-go, which its landing had already
 >     done; the name-lookup test holds each branch's door read, `mark`'s now its let-go manifest's.
->   - Pinned, 4 in `repository/hg_push/tests.rs`, each failing "push refused: its re-base asked for bytes of its
+>   - Pinned, 4 in `repository/hg_push/tests.rs` (unpinned 2026-11-26 when hg_push's race histories moved), each failing
+>     "push refused: its re-base asked for bytes of its
 >     changegroup" without the pin, since a synchronous audit history cannot bring a let-go base back. They are the
 >     15-race piece's reds, unpinned when those histories move to tasks.
->   **The landed-pack pins: 4 tests** (`test_store::LANDED_KEPT_PINNED`, a test holds its length to this figure; w-hg,
+>   **The landed-pack pins: 0 tests** (`test_store::LANDED_KEPT_PINNED`, a test holds its length to this figure; w-hg,
 >   until hg_push's 15 race histories move to tasks).
+> - **hg_push's race histories as tasks (main's ruling of 2026-11-26).** 13 of `repository/hg_push/tests.rs`' 15
+>   `audit_on_stored_shard` histories run as tasks on a store-backed daemon (`run_on_stored_shard`), each push through the
+>   daemon's own driver (`hg_push::unbundle`), their repositories not publishing (`Hg::made_non_publishing`, as the tests'
+>   prepared pushes were judged). The four races are staged by holding a push at its landing (`hg_push::hold_next_landing`,
+>   `cfg(test)`: the product holds a push before its landing nowhere, since an ask-mode write policy refuses a push
+>   `ApprovalRequired`), another push landing meanwhile, then releasing it: its stale fork re-based by awaiting the store.
+>   The four pinned tests are unpinned (their red: "push refused: its re-base asked for bytes of its changegroup"). The
+>   policy histories read `acl`'s words in the push's own refusal; the transaction-id one is a unit test; the test-only
+>   synchronous driver (`land_in`, `landing`, `rebase_whole`, `push_name`, `Prepared::transaction`) is gone. The
+>   hook-words history and `Prepared::with_output`, which no production path called, are deleted (main's ruling (b));
+>   the owed behaviour is recorded as its red under §4.17.3's pushes, the admission hook's words in the push's reply.
 >   - (`git_push::tests::carry_blocking`, 8 direct sites, and `git_push::tests::git_repository`, 41 sites: both emptied
 >     and removed by w-git, 2026-11-25. Every test that pushed through the synchronous driver (`answered`, `pushed`,
 >     `pushed_from_the_fixtures`, removed with it) pushes by awaiting: `git_push::tests::on_stored_shard_awaited` and its
@@ -4980,7 +4992,16 @@
 > step budget, and the index's kept heads in place of the walks over the whole view; (5, rest) pushes (A-657 part 4
 > built the policy before the verdict in `acl`'s words and the `pretxnchangegroup` and `changegroup` hooks through
 > the driver): the principal's Mercurial identity in `acl`'s words (§4.13);
-> part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
+> part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; an
+> admission hook's words in the push's reply: a push to a repository with a `pretxnchangegroup` hook is refused "the
+> repository's pretxnchangegroup.<name> hook cannot run here yet: its view of the push is not served" until the hooks'
+> repository is served, so no hook's output reaches a reply. Owed with it, as the red that work starts from (main's
+> ruling (b) of 2026-11-26, which deleted the test of `Prepared::with_output`, a method no production path called):
+> push stock `push-plain` to the rebuilt repository with an admission hook that accepts and prints
+> `pretxnchangegroup.words: checked`; expect its hooks handed the push's one changeset as first and last (`HG_NODE`,
+> `HG_NODE_LAST`), and the reply 7.2's `push-plain` reply with the hook's words as an `output` part in reply to the
+> changegroup part (`in-reply-to` its id), right after `reply:changegroup` (7.2's `bundle2._processpart` writes what a
+> part's handler printed after that handler's reply); a
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2
 > `check:phases` (one position for every phase) measured under concurrent pushes before it is kept; (6) the changesets

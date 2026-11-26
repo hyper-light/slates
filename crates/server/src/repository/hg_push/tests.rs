@@ -12,22 +12,19 @@ use slates_hg::changegroup::{Changegroup, Group, Revision, Version};
 use slates_hg::index::Log;
 use slates_hg::phases::{Phase, PhaseHead};
 use slates_hg::push::check::HeadsArgument;
-use slates_hg::push::reply::{Refused, Replied, Reply};
+use slates_hg::push::reply::{Refused, Reply};
 use slates_hg::push::{Asks, BookmarkAt, ChangegroupPart, Outcome, Taken, Unbundle, read};
-use slates_hg::serve::{Repository, Rev};
 use slates_hg::{Admission, NULL_NODE, Node, delta, node};
 use slates_ipc::protocol::{ObjectFormat, ReplyBody, RequestBody, VcsTool};
 use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
 
 use super::{
-  BOOKMARK_TAG, LINE_TAG, Landed, Prepared, bookmark_name, bookmark_of, branch_prefix, line_name,
-  line_of, transaction_id,
+  BOOKMARK_TAG, LINE_TAG, bookmark_name, bookmark_of, branch_prefix, line_name, line_of,
+  transaction_id,
 };
 use crate::state::ShardState;
-use crate::verbs::{dispatch, to_db_volume};
+use crate::verbs::dispatch;
 
-/// Shape: the room a test's work is built within, far past any of these trees.
-const ROOM: u64 = 1 << 20;
 /// Shape: how long a test waits for a shard's task (a rebuild) to end before it fails, as the import tests wait.
 const TASK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Shape: the push's name every test work's identity begins with.
@@ -37,13 +34,6 @@ const NAME: [u8; 32] = [7; 32];
 macro_rules! fixture {
   ($name:literal) => {
     include_bytes!(concat!("../../../../hg/fixtures/push/", $name))
-  };
-}
-
-/// A fixture listing of `crates/hg/fixtures/push`.
-macro_rules! listing {
-  ($name:literal) => {
-    include_str!(concat!("../../../../hg/fixtures/push/", $name))
   };
 }
 
@@ -62,129 +52,6 @@ fn room() -> Admission {
 /// A node's forty lower-case hexadecimal digits, as 7.2's `hex` writes them.
 fn hex(node: &Node) -> String {
   crate::verbs::hex_of(node)
-}
-
-/// A node from its forty hexadecimal digits, as 7.2's `bin` reads them.
-fn parsed(hex: &str) -> Node {
-  slates_hg::pushkey::hex_node(hex.as_bytes())
-    .unwrap()
-    .unwrap()
-}
-
-/// One changeset of a test's served view: its node, its parents' revisions, its branch and its phase.
-type ViewChangeset = (Node, [Option<Rev>; 2], Vec<u8>, Phase);
-
-/// A served view a test builds from a fixture's listings: `{rev} {node} {p1} {p2} {phase} {branch}` a line, and
-/// `{name} {node}` a bookmark.
-#[derive(Clone, Debug, Default)]
-struct View {
-  changesets: Vec<ViewChangeset>,
-  bookmarks: Vec<(Vec<u8>, Node)>,
-}
-
-impl View {
-  fn of(server: &str, bookmarks: &str) -> View {
-    let mut view = View::default();
-    for line in server.lines() {
-      let fields: Vec<&str> = line.split(' ').collect();
-      let parent = |hex: &str| (parsed(hex) != NULL_NODE).then(|| view.rev(&parsed(hex)).unwrap());
-      let parents = [parent(fields[2]), parent(fields[3])];
-      let phase = if fields[4] == "public" {
-        Phase::Public
-      } else {
-        Phase::Draft
-      };
-      view.changesets.push((
-        parsed(fields[1]),
-        parents,
-        fields[5].as_bytes().to_vec(),
-        phase,
-      ));
-    }
-    for line in bookmarks.lines() {
-      let (name, hex) = line.split_once(' ').unwrap();
-      view.bookmarks.push((name.as_bytes().to_vec(), parsed(hex)));
-    }
-    view
-  }
-
-  fn at(&self, rev: Rev) -> &(Node, [Option<Rev>; 2], Vec<u8>, Phase) {
-    &self.changesets[usize::try_from(rev).unwrap()]
-  }
-}
-
-impl Repository for View {
-  fn markers(&self) -> impl Iterator<Item = slates_hg::obsmarkers::Marker<'_>> {
-    core::iter::empty()
-  }
-
-  fn count(&self) -> Rev {
-    Rev::try_from(self.changesets.len()).unwrap()
-  }
-
-  fn node(&self, rev: Rev) -> Option<Node> {
-    self
-      .changesets
-      .get(usize::try_from(rev).ok()?)
-      .map(|held| held.0)
-  }
-
-  fn rev(&self, node: &Node) -> Option<Rev> {
-    let at = self.changesets.iter().position(|held| held.0 == *node)?;
-    Rev::try_from(at).ok()
-  }
-
-  fn parents(&self, rev: Rev) -> [Option<Rev>; 2] {
-    self.at(rev).1
-  }
-
-  fn branch(&self, rev: Rev) -> &[u8] {
-    &self.at(rev).2
-  }
-
-  fn closes(&self, _rev: Rev) -> bool {
-    false
-  }
-
-  fn phase(&self, rev: Rev) -> Phase {
-    self.at(rev).3
-  }
-
-  fn publishing(&self) -> bool {
-    false
-  }
-
-  fn bookmarks(&self) -> impl Iterator<Item = (&[u8], Node)> {
-    self
-      .bookmarks
-      .iter()
-      .map(|(name, node)| (name.as_slice(), *node))
-  }
-
-  /// The view hides nothing, so the roots its register would keep are its draft changesets none of whose parents is
-  /// draft.
-  fn draft_roots(&self) -> impl Iterator<Item = Node> {
-    self
-      .changesets
-      .iter()
-      .filter(|held| {
-        held.3 == Phase::Draft
-          && held
-            .1
-            .iter()
-            .flatten()
-            .all(|parent| self.phase(*parent) == Phase::Public)
-      })
-      .map(|held| held.0)
-  }
-
-  fn tags_file(
-    &self,
-    _rev: slates_hg::serve::Rev,
-    _admission: &mut slates_hg::Admission,
-  ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
-    Ok(None)
-  }
 }
 
 /// A changeset of the fixtures' repository as `make-push-fixtures.sh` made it with stock 7.2 (user `test`, date `0
@@ -368,72 +235,6 @@ struct Hg {
 }
 
 impl Hg {
-  /// A new Mercurial repository `name`, its first line `default`'s, empty.
-  fn new(state: &mut ShardState, name: &str) -> Hg {
-    let reply = crate::test_store::create(
-      state,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: name.to_owned(),
-        tool: VcsTool::Mercurial,
-        format: ObjectFormat::Sha1,
-        default_branch: line_name(b"default", 0),
-        green: None,
-      },
-    );
-    let ReplyBody::GreenCreated { id } = reply else {
-      panic!("no repository: {reply:?}")
-    };
-    let repository = state
-      .db
-      .partition()
-      .repositories()
-      .repository_named(name)
-      .unwrap()
-      .id;
-    Hg {
-      repository,
-      root: to_db_volume(id),
-    }
-  }
-
-  fn prepare(
-    &self,
-    state: &mut ShardState,
-    unbundle: &Unbundle,
-    view: &View,
-  ) -> Result<Prepared, Box<Refused>> {
-    super::prepare_whole(
-      state,
-      self.repository,
-      unbundle,
-      view,
-      (false, NAME, ROOM),
-      &mut room(),
-    )
-  }
-
-  fn land(&mut self, state: &mut ShardState, prepared: Prepared) -> Landed {
-    let landed = super::land_stored(state, (&owner(), self.repository), prepared);
-    assert_eq!(
-      landed.released,
-      Ok(()),
-      "the index let go of was not given back"
-    );
-    landed
-  }
-
-  /// Prepares and lands `unbundle` read against `view`: its answer.
-  fn push(
-    &mut self,
-    state: &mut ShardState,
-    unbundle: &Unbundle,
-    view: &View,
-  ) -> Result<Reply, Box<Refused>> {
-    let prepared = self.prepare(state, unbundle, view)?;
-    self.land(state, prepared).answer.map_err(Box::new)
-  }
-
   /// The green a name binds.
   fn bound(&self, state: &ShardState, name: &str) -> Option<DbVolumeId> {
     state
@@ -479,8 +280,8 @@ impl Hg {
 }
 
 impl Hg {
-  /// [`Hg::new`] from a task on the shard: the creation awaited, as a client's is answered
-  /// (`test_store::created`), never waited for on the shard's thread.
+  /// A new Mercurial repository `name`, its first line `default`'s, empty, made from a task on the shard: the creation
+  /// awaited, as a client's is answered (`test_store::created`), never waited for on the shard's thread.
   async fn made(name: &str) -> Hg {
     let line = line_name(b"default", 0);
     let asked = (name, VcsTool::Mercurial, ObjectFormat::Sha1, line.as_str());
@@ -489,25 +290,50 @@ impl Hg {
   }
 }
 
-/// `unbundle`'s parts as the bundle2 a client sends: its changegroup, phase-heads and bookmarks parts, each mandatory,
-/// in order. A part of another kind is no push these tests send whole.
+impl Hg {
+  /// [`Hg::made`], its policy then set not to publish (`hg_publishing` false, policy version 1), as the tests' own
+  /// prepared pushes judged it (`Terms`' publishing false): a push's changesets stay drafts unless its parts publish
+  /// them.
+  async fn made_non_publishing(name: &str) -> Hg {
+    let hg = Hg::made(name).await;
+    let owned = name.to_owned();
+    crate::repository::svn_commit::tests::on(move |state| {
+      set_policy(state, (&owned, 0), Vec::new())
+    });
+    hg
+  }
+}
+
+/// `unbundle`'s parts as the bundle2 a client sends: its replycaps, check:heads, changegroup, phase-heads and bookmarks
+/// parts, each mandatory, in order, each under its own id (a reply names a part by it). A part of another kind is no push these tests send whole.
 fn bundled(unbundle: &Unbundle) -> Vec<u8> {
   use slates_hg::bundle2::{Event, Param, Part};
-  let mut payloads: Vec<(&'static [u8], Vec<Param<'static>>, Vec<u8>)> = Vec::new();
+  let mut payloads: Vec<(u32, &'static [u8], Vec<Param<'static>>, Vec<u8>)> = Vec::new();
   for part in &unbundle.parts {
     match &part.asks {
+      Asks::ReplyCaps(caps) => payloads.push((part.id, b"REPLYCAPS", Vec::new(), caps.clone())),
+      Asks::CheckHeads(heads) => {
+        let mut payload = Vec::new();
+        slates_hg::heads::encode(heads, &mut payload);
+        payloads.push((part.id, b"CHECK:HEADS", Vec::new(), payload));
+      }
       Asks::Changegroup(group) => {
         assert_eq!(group.version, Version::V03, "a version-03 changegroup");
         let version = Param {
           key: b"version",
           value: b"03",
         };
-        payloads.push((b"CHANGEGROUP", vec![version], group.payload.clone()));
+        payloads.push((
+          part.id,
+          b"CHANGEGROUP",
+          vec![version],
+          group.payload.clone(),
+        ));
       }
       Asks::PhaseHeads(heads) => {
         let mut payload = Vec::new();
         slates_hg::phases::encode(heads, &mut payload);
-        payloads.push((b"PHASE-HEADS", Vec::new(), payload));
+        payloads.push((part.id, b"PHASE-HEADS", Vec::new(), payload));
       }
       Asks::Bookmarks(marks) => {
         let marks: Vec<_> = marks
@@ -519,17 +345,16 @@ fn bundled(unbundle: &Unbundle) -> Vec<u8> {
           .collect();
         let mut payload = Vec::new();
         slates_hg::bookmarks::encode(&marks, &mut payload).expect("a bookmarks payload");
-        payloads.push((b"BOOKMARKS", Vec::new(), payload));
+        payloads.push((part.id, b"BOOKMARKS", Vec::new(), payload));
       }
       other => panic!("no bundle2 written for {other:?}"),
     }
   }
   let parts = payloads
     .iter()
-    .zip(0_u32..)
-    .map(|((kind, params, _), id)| Part {
+    .map(|(id, kind, params, _)| Part {
       kind,
-      id,
+      id: *id,
       mandatory_params: params.len(),
       params: params.clone(),
       depth: 0,
@@ -538,7 +363,7 @@ fn bundled(unbundle: &Unbundle) -> Vec<u8> {
   let events = payloads
     .iter()
     .enumerate()
-    .flat_map(|(at, (_, _, payload))| [Event::Open(at), Event::Chunk(payload), Event::Close])
+    .flat_map(|(at, (_, _, _, payload))| [Event::Open(at), Event::Chunk(payload), Event::Close])
     .collect();
   let bundle = Bundle2 {
     params: Vec::new(),
@@ -623,6 +448,47 @@ fn pushed_unbundle_on(daemon: &crate::Daemon, hg: Hg, unbundle: Unbundle) {
   );
 }
 
+/// Shape: how long a race history waits for a push it spawned to reach its held landing or to answer.
+const RACE_PATIENCE_NS: u64 = 60_000_000_000;
+
+/// `bundle` pushed to `hg` from a task of its own on this shard ([`pushed_bytes`]): its answer arrives on the receiver.
+fn spawned_push(hg: Hg, bundle: Vec<u8>) -> std::sync::mpsc::Receiver<Outcome> {
+  let (sent, answer) = std::sync::mpsc::sync_channel(1);
+  let task = slates_rt::futures::spawn(async move {
+    let _ = sent.send(pushed_bytes(&hg, &bundle).await);
+  })
+  .expect("the push's task");
+  slates_rt::futures::detach(task).expect("detached");
+  answer
+}
+
+/// The answer `answer` brings, waited for a turn at a time within [`RACE_PATIENCE_NS`].
+async fn answered(answer: &std::sync::mpsc::Receiver<Outcome>) -> Outcome {
+  let deadline = slates_rt::futures::now_ns().saturating_add(RACE_PATIENCE_NS);
+  loop {
+    if let Ok(outcome) = answer.try_recv() {
+      return outcome;
+    }
+    assert!(
+      slates_rt::futures::now_ns() < deadline,
+      "the push never answered"
+    );
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// Waits a turn at a time, within [`RACE_PATIENCE_NS`], until a push holds at its landing (`hg_push::landing_held`).
+async fn until_held() {
+  let deadline = slates_rt::futures::now_ns().saturating_add(RACE_PATIENCE_NS);
+  while !super::landing_held() {
+    assert!(
+      slates_rt::futures::now_ns() < deadline,
+      "no push reached its landing"
+    );
+    slates_rt::futures::yield_now().await;
+  }
+}
+
 /// [`pushed_bytes`] from a task on `daemon`'s first shard, accepted.
 fn pushed_on(daemon: &crate::Daemon, hg: Hg, bundle: &'static [u8]) {
   let outcome = crate::test_store::run_on_first(
@@ -676,15 +542,6 @@ fn file(state: &ShardState, green: DbVolumeId, path: &str) -> Option<Vec<u8>> {
   crate::vcs_store::named_objects::read_file(state, green, path)
 }
 
-/// Rebuilds the fixtures' repository in `hg` as one push to its empty first line: `base` and `second`, the changesets
-/// `public` names published by a `phase-heads` part, bookmark `main` made at `mark`.
-fn rebuild(state: &mut ShardState, hg: &mut Hg, (public, mark): (&[usize], usize)) -> Vec<Made> {
-  let (made, unbundle) = rebuilding((public, mark));
-  let answer = hg.push(state, &unbundle, &View::default());
-  assert!(answer.is_ok(), "the rebuild was refused: {answer:?}");
-  made
-}
-
 /// [`rebuild`]'s push: the fixtures' history and the unbundle that makes it.
 fn rebuilding((public, mark): (&[usize], usize)) -> (Vec<Made>, Unbundle) {
   let made = history();
@@ -711,8 +568,8 @@ fn rebuilding((public, mark): (&[usize], usize)) -> (Vec<Made>, Unbundle) {
   (made, unbundle)
 }
 
-/// The rebuilt repository against 7.2's: every node 7.2's, `default`'s first line at `second` holding both files, and
-/// the index holding both changesets.
+/// The rebuilt repository against 7.2's: every node 7.2's, `default`'s first line at `second`, and the index holding both
+/// changesets ([`assert_rebuilt_awaited`] reads its files).
 fn assert_rebuilt(state: &ShardState, hg: &Hg, made: &[Made]) {
   assert_eq!(
     hex(&made[0].node),
@@ -732,8 +589,15 @@ fn assert_rebuilt(state: &ShardState, hg: &Hg, made: &[Made]) {
   );
   assert_eq!(hg.bound(state, &line_name(b"default", 0)), Some(hg.root));
   assert_eq!(head(state, hg.root), Some(made[1].node));
-  assert_eq!(file(state, hg.root, "b").as_deref(), Some(&b"b\n"[..]));
   assert!(hg.holds(state, &made[0].node) && hg.holds(state, &made[1].node));
+}
+
+/// [`assert_rebuilt`] from a task on the shard, and the root's `b` read through its name as a mount reads it
+/// (`named_objects::read_file_brought`): its text let go once its push landed, as production lets one go.
+async fn assert_rebuilt_awaited(hg: &Hg, made: &[Made]) {
+  crate::repository::svn_commit::tests::on(|state| assert_rebuilt(state, hg, made));
+  let read = crate::vcs_store::named_objects::read_file_brought(hg.root, "b").await;
+  assert_eq!(read.as_deref(), Some(&b"b\n"[..]));
 }
 
 /// A-887 (main 01a20182's order of 2026-11-23 on the greens' 56 MB: the 57k push's `Green::make_mapped` bytes, live at
@@ -743,30 +607,32 @@ fn assert_rebuilt(state: &ShardState, hg: &Hg, made: &[Made]) {
 /// held as bytes, the green's second copy of what the store holds.
 #[test]
 fn a_pushed_file_the_content_store_holds_whole_is_held_by_its_name() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let mut hg = Hg::new(state, "named");
-    let _ = rebuild(state, &mut hg, (&[1], 1));
-    let content = state.vcs_stores.content().unwrap();
-    let engine = state.greens.get(&hg.root).unwrap();
-    let (mut named, mut as_bytes) = (0usize, Vec::new());
-    for (path, held) in engine.files() {
-      match held {
-        slates_merge::engine::Content::Named(_) => named += 1,
-        slates_merge::engine::Content::Bytes(bytes) => {
-          if content.contains(&content.object_id(bytes)) {
-            as_bytes.push(path);
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = Hg::made_non_publishing("named").await;
+    let _ = rebuilt(&hg, (&[1], 1)).await;
+    crate::repository::svn_commit::tests::on(|state| {
+      let content = state.vcs_stores.content().unwrap();
+      let engine = state.greens.get(&hg.root).unwrap();
+      let (mut named, mut as_bytes) = (0usize, Vec::new());
+      for (path, held) in engine.files() {
+        match held {
+          slates_merge::engine::Content::Named(_) => named += 1,
+          slates_merge::engine::Content::Bytes(bytes) => {
+            if content.contains(&content.object_id(bytes)) {
+              as_bytes.push(path);
+            }
           }
         }
       }
-    }
-    assert!(
-      named + as_bytes.len() > 0,
-      "the push's files are in the content store (non-vacuity)"
-    );
-    assert!(
-      as_bytes.is_empty(),
-      "held as bytes though the content store holds them whole: {as_bytes:?} ({named} named)"
-    );
+      assert!(
+        named + as_bytes.len() > 0,
+        "the push's files are in the content store (non-vacuity)"
+      );
+      assert!(
+        as_bytes.is_empty(),
+        "held as bytes though the content store holds them whole: {as_bytes:?} ({named} named)"
+      );
+    });
   });
 }
 
@@ -1852,47 +1718,41 @@ fn a_second_work_naming_a_pushed_text_let_go_before_its_entry_reads_it_back() {
 /// changeset, which is a draft root and held by the index; sent again it is answered alike and records nothing.
 #[test]
 fn a_stock_push_lands_on_the_rebuilt_repository_as_7_2_answered_it() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    // Pinned by name until hg_push's 15 race histories move to tasks (test_store::LANDED_KEPT_PINNED): its stale fork's
-    // re-base wants a base its landing let go, which a synchronous audit history cannot bring back.
-    crate::test_store::keep_landed_pinned(
-      "repository::hg_push::tests::a_stock_push_lands_on_the_rebuilt_repository_as_7_2_answered_it",
-    );
-    let mut hg = Hg::new(state, "plain");
-    let made = rebuild(state, &mut hg, (&[1], 1));
-    assert_rebuilt(state, &hg, &made);
-    let main = hg.bound(state, &bookmark_name(b"main")).unwrap();
-    assert_eq!(head(state, main), Some(made[1].node));
-    assert!(hg.roots(state).is_empty());
-    let view = View::of(
-      listing!("push-plain-server.txt"),
-      listing!("push-plain-bookmarks.txt"),
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = Hg::made_non_publishing("plain").await;
+    let made = rebuilt(&hg, (&[1], 1)).await;
+    assert_rebuilt_awaited(&hg, &made).await;
+    crate::repository::svn_commit::tests::on(|state| {
+      let main = hg.bound(state, &bookmark_name(b"main")).unwrap();
+      assert_eq!(head(state, main), Some(made[1].node));
+      assert!(hg.roots(state).is_empty());
+    });
+    let answer = pushed_bytes(&hg, fixture!("push-plain.hg")).await;
+    let Outcome::Accepted(reply) = answer else {
+      panic!("not accepted: {answer:?}");
+    };
+    assert_eq!(encoded(&reply), fixture!("push-plain-reply.hg").to_vec());
+    let version = crate::repository::svn_commit::tests::on(|state| {
+      assert_plain_landed(state, &hg, &made);
+      state.db.partition().green_head(hg.root)
+    });
+    let read = crate::vcs_store::named_objects::read_file_brought(hg.root, "d").await;
+    assert_eq!(
+      read.as_deref(),
+      Some(&b"d\n"[..]),
+      "the pushed file read through its name"
     );
     let mut unbundle = stock(fixture!("push-plain.hg"));
-    let answer = hg.push(state, &unbundle, &view);
-    assert_eq!(
-      answer.map(|reply| encoded(&reply)),
-      Ok(fixture!("push-plain-reply.hg").to_vec())
-    );
-    assert_plain_landed(state, &hg, &made);
-    let version = state.db.partition().green_head(hg.root);
     unbundle
       .parts
       .retain(|part| !matches!(part.asks, Asks::CheckUpdatedHeads(_) | Asks::CheckPhases(_)));
-    let mut after = view;
-    after.changesets.push((
-      made[3].node,
-      [Some(1), None],
-      b"default".to_vec(),
-      Phase::Draft,
-    ));
-    let again = hg.push(state, &unbundle, &after);
+    let again = pushed(&hg, &unbundle).await;
+    let Outcome::Accepted(reply) = again else {
+      panic!("not accepted again: {again:?}");
+    };
+    assert_eq!(encoded(&reply), fixture!("push-plain-reply.hg").to_vec());
     assert_eq!(
-      again.map(|reply| encoded(&reply)),
-      Ok(fixture!("push-plain-reply.hg").to_vec())
-    );
-    assert_eq!(
-      state.db.partition().green_head(hg.root),
+      crate::repository::svn_commit::tests::on(|state| state.db.partition().green_head(hg.root)),
       version,
       "a push sent again recorded"
     );
@@ -2040,96 +1900,25 @@ fn assert_plain_landed(state: &ShardState, hg: &Hg, made: &[Made]) {
     "048741fabe422ed31728cd666c1e36b6c3f0a96d"
   );
   assert_eq!(head(state, hg.root), Some(made[3].node));
-  assert_eq!(file(state, hg.root, "d").as_deref(), Some(&b"d\n"[..]));
   assert_eq!(hg.roots(state), BTreeSet::from([made[3].node]));
   assert!(hg.holds(state, &made[3].node));
 }
 
-/// A-657 part 4 (`HG_TXNID`; 7.2's `localrepo.transaction`). Do: prepare stock `push-plain` on the rebuilt repository,
-/// and take the transaction ids of the push's name and of another. Expect: the prepared push's id is its name's, `TXN:`
-/// and forty lower-case hexadecimal digits; the same name gives the same id, another name another.
+/// A-657 part 4 (`HG_TXNID`; 7.2's `localrepo.transaction`). Do: take the transaction ids of a push's name, of the same
+/// name again and of another. Expect: `TXN:` and forty lower-case hexadecimal digits; the same name gives the same id,
+/// another name another. (A prepared push's id is its name's by construction, `prepare`; no store is needed to hold it.)
 #[test]
 fn a_push_names_its_transaction_as_7_2_does() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let mut hg = Hg::new(state, "transaction");
-    rebuild(state, &mut hg, (&[1], 1));
-    let view = View::of(
-      listing!("push-plain-server.txt"),
-      listing!("push-plain-bookmarks.txt"),
-    );
-    let prepared = hg
-      .prepare(state, &stock(fixture!("push-plain.hg")), &view)
-      .unwrap();
-    assert_eq!(prepared.transaction, transaction_id(&NAME));
-    let digits = prepared.transaction.strip_prefix("TXN:").unwrap();
-    assert_eq!(digits.len(), 40);
-    assert!(
-      digits
-        .bytes()
-        .all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'))
-    );
-    assert_eq!(transaction_id(&NAME), transaction_id(&[7; 32]));
-    assert_ne!(transaction_id(&NAME), transaction_id(&[8; 32]));
-  });
-}
-
-/// A reply part as a client reads it: its type, the part it answers (`in-reply-to`) and its payload.
-type ReplyPart = (Vec<u8>, Option<Vec<u8>>, Vec<u8>);
-
-/// A reply's parts as a client reads them.
-fn reply_parts(bytes: &[u8]) -> Vec<ReplyPart> {
-  let bundle = Bundle2::decode(bytes, &mut room()).unwrap();
-  bundle
-    .top_level()
-    .map(|(index, part)| {
-      let payload = bundle
-        .payload(index)
-        .flat_map(|chunk| chunk.iter().copied())
-        .collect();
-      let answers = part.param(b"in-reply-to").map(<[u8]>::to_vec);
-      (part.kind.to_vec(), answers, payload)
-    })
-    .collect()
-}
-
-/// A-657 part 4 (§4.17.3 "Hooks"; 7.2's `bundle2._processpart` writes what a part's handler printed, a
-/// `pretxnchangegroup` hook's words among it, as an `output` part right after that handler's reply, naming the part).
-/// Do: prepare stock `push-plain` on the rebuilt repository, hand it the words an admission hook printed as `run_hooks`
-/// hands them back (naming the push's changegroup part), and land it. Expect: its hooks are handed the push's one
-/// changeset as first and last; the reply is 7.2's `push-plain` reply with the hook's words as an `output` part in
-/// reply to the changegroup part, right after `reply:changegroup`.
-#[test]
-fn a_hooks_words_follow_the_changegroup_reply_naming_its_part() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let mut hg = Hg::new(state, "words");
-    let made = rebuild(state, &mut hg, (&[1], 1));
-    let view = View::of(
-      listing!("push-plain-server.txt"),
-      listing!("push-plain-bookmarks.txt"),
-    );
-    let unbundle = stock(fixture!("push-plain.hg"));
-    let (changegroup, _) = unbundle.changegroup().unwrap();
-    let mut prepared = hg.prepare(state, &unbundle, &view).unwrap();
-    assert_eq!(prepared.added, Some((made[3].node, made[3].node)));
-    let words = b"pretxnchangegroup.words: checked\n".to_vec();
-    let in_reply_to = prepared.changegroup;
-    prepared.with_output(vec![Replied::Output {
-      in_reply_to,
-      words: words.clone(),
-    }]);
-    let reply = hg.land(state, prepared).answer.unwrap();
-    let mut expected = reply_parts(fixture!("push-plain-reply.hg"));
-    let after = expected
-      .iter()
-      .position(|(kind, ..)| kind.as_slice() == b"reply:changegroup")
-      .unwrap();
-    let named = changegroup.to_string().into_bytes();
-    expected.insert(
-      after.saturating_add(1),
-      (b"output".to_vec(), Some(named), words),
-    );
-    assert_eq!(reply_parts(&encoded(&reply)), expected);
-  });
+  let transaction = transaction_id(&NAME);
+  let digits = transaction.strip_prefix("TXN:").unwrap();
+  assert_eq!(digits.len(), 40);
+  assert!(
+    digits
+      .bytes()
+      .all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'))
+  );
+  assert_eq!(transaction_id(&NAME), transaction_id(&[7; 32]));
+  assert_ne!(transaction_id(&NAME), transaction_id(&[8; 32]));
 }
 
 /// A-657, A-642 (a race found where the entry appends). Do: on the rebuilt repository, prepare stock `push-plain`
@@ -2138,52 +1927,35 @@ fn a_hooks_words_follow_the_changegroup_reply_naming_its_part() {
 /// `push-race` reply, and nothing of it is applied: `default` at `other`, its changeset not held, no root of it.
 #[test]
 fn a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    // Pinned by name until hg_push's 15 race histories move to tasks (test_store::LANDED_KEPT_PINNED): its stale fork's
-    // re-base wants a base its landing let go, which a synchronous audit history cannot bring back.
-    crate::test_store::keep_landed_pinned(
-      "repository::hg_push::tests::a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race",
-    );
-    let mut hg = Hg::new(state, "race");
-    let made = rebuild(state, &mut hg, (&[1], 1));
-    let view = View::of(
-      listing!("push-plain-server.txt"),
-      listing!("push-plain-bookmarks.txt"),
-    );
-    // The stock push's changegroup is taken into its fork first; then another push lands; then the stock push lands
-    // as the driver lands it, its stale fork re-based and the race judged at landing (A-720 part 2b).
-    let bundle = fixture!("push-plain.hg");
-    let unbundle = stock(bundle);
-    let (_, part) = unbundle.changegroup().unwrap();
-    let forked = super::take_whole(
-      state,
-      hg.repository,
-      (part.version, part.payload.clone()),
-      &mut room(),
-    )
-    .unwrap()
-    .unwrap();
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = Hg::made_non_publishing("race").await;
+    let made = rebuilt(&hg, (&[1], 1)).await;
+    // The stock push's changegroup is taken into its fork and its segments landed, and it holds at its landing; then
+    // another push lands; then the stock push lands as the driver lands it, its stale fork re-based by awaiting the
+    // store and the race judged at landing (A-720 part 2b).
+    super::hold_next_landing();
+    let stock_push = spawned_push(hg, fixture!("push-plain.hg").to_vec());
+    until_held().await;
     let other = Unbundle {
       parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[2])))],
     };
-    assert!(hg.push(state, &other, &view).is_ok());
-    assert_eq!(head(state, hg.root), Some(made[2].node));
-    let landed = super::land_in(
-      state,
-      hg.repository,
-      (&owner(), bundle),
-      &unbundle,
-      Some(forked),
-      &mut room(),
+    let landed = pushed(&hg, &other).await;
+    assert!(matches!(landed, Outcome::Accepted(_)), "{landed:?}");
+    assert_eq!(
+      crate::repository::svn_commit::tests::on(|state| head(state, hg.root)),
+      Some(made[2].node)
     );
-    let race = match landed {
-      Some(Outcome::Refused(reply)) => Err(encoded(&reply)),
+    super::release_held_landing();
+    let race = match answered(&stock_push).await {
+      Outcome::Refused(reply) => Err(encoded(&reply)),
       other => Ok(format!("{other:?}")),
     };
     assert_eq!(race, Err(fixture!("push-race-reply.hg").to_vec()));
-    assert_eq!(head(state, hg.root), Some(made[2].node));
-    assert!(!hg.holds(state, &made[3].node));
-    assert_eq!(hg.roots(state), BTreeSet::from([made[2].node]));
+    crate::repository::svn_commit::tests::on(|state| {
+      assert_eq!(head(state, hg.root), Some(made[2].node));
+      assert!(!hg.holds(state, &made[3].node));
+      assert_eq!(hg.roots(state), BTreeSet::from([made[2].node]));
+    });
   });
 }
 
@@ -2193,65 +1965,29 @@ fn a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race() {
 /// repository's index after: the second re-based by node, nothing of the first lost.
 #[test]
 fn two_pushes_taken_side_by_side_both_land() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    // Pinned by name until hg_push's 15 race histories move to tasks (test_store::LANDED_KEPT_PINNED): its stale fork's
-    // re-base wants a base its landing let go, which a synchronous audit history cannot bring back.
-    crate::test_store::keep_landed_pinned(
-      "repository::hg_push::tests::two_pushes_taken_side_by_side_both_land",
-    );
-    let mut hg = Hg::new(state, "side-by-side");
-    let made = rebuild(state, &mut hg, (&[1], 1));
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = Hg::made_non_publishing("side-by-side").await;
+    let made = rebuilt(&hg, (&[1], 1)).await;
     let first = Unbundle {
       parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[2])))],
     };
     let second = Unbundle {
       parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[3])))],
     };
-    let fork_of = |state: &mut ShardState, unbundle: &Unbundle| {
-      let (_, part) = unbundle.changegroup().unwrap();
-      super::take_whole(
-        state,
-        hg.repository,
-        (part.version, part.payload.clone()),
-        &mut room(),
-      )
-      .unwrap()
-      .unwrap()
-    };
-    let (first_fork, second_fork) = (fork_of(state, &first), fork_of(state, &second));
-    let principal = owner();
-    for (unbundle, forked) in [(&first, first_fork), (&second, second_fork)] {
-      let landed = super::land_in(
-        state,
-        hg.repository,
-        (&principal, b"side"),
-        unbundle,
-        Some(forked),
-        &mut room(),
-      );
-      assert!(matches!(landed, Some(Outcome::Accepted(_))), "{landed:?}");
-    }
-    assert!(hg.holds(state, &made[2].node) && hg.holds(state, &made[3].node));
+    // The second's changegroup taken into its fork from the index as it is, then held at its landing; the first lands;
+    // the second, its fork made stale, re-based by node and landed.
+    super::hold_next_landing();
+    let held = spawned_push(hg, bundled(&second));
+    until_held().await;
+    let landed = pushed(&hg, &first).await;
+    assert!(matches!(landed, Outcome::Accepted(_)), "{landed:?}");
+    super::release_held_landing();
+    let landed = answered(&held).await;
+    assert!(matches!(landed, Outcome::Accepted(_)), "{landed:?}");
+    crate::repository::svn_commit::tests::on(|state| {
+      assert!(hg.holds(state, &made[2].node) && hg.holds(state, &made[3].node))
+    });
   });
-}
-
-/// A view of the rebuilt repository's `base` and `second`, public, and the changesets `drafts` names after them, each
-/// a draft on its commit's parent and branch.
-fn view_with(made: &[Made], drafts: &[usize]) -> View {
-  let mut view = View::of(
-    listing!("push-plain-server.txt"),
-    listing!("push-plain-bookmarks.txt"),
-  );
-  for at in drafts {
-    let parent = COMMITS[*at]
-      .3
-      .and_then(|parent| view.rev(&made[parent].node));
-    let branch = COMMITS[*at].4.as_bytes().to_vec();
-    view
-      .changesets
-      .push((made[*at].node, [parent, None], branch, Phase::Draft));
-  }
-  view
 }
 
 /// A-657, A-642 (a check of a green the push does not move compares its position). Do: on the rebuilt repository, land
@@ -2263,57 +1999,50 @@ fn view_with(made: &[Made], drafts: &[usize]) -> View {
 /// is applied.
 #[test]
 fn a_push_is_refused_when_a_green_it_only_checked_moved() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    // Pinned by name until hg_push's 15 race histories move to tasks (test_store::LANDED_KEPT_PINNED): its stale fork's
-    // re-base wants a base its landing let go, which a synchronous audit history cannot bring back.
-    crate::test_store::keep_landed_pinned(
-      "repository::hg_push::tests::a_push_is_refused_when_a_green_it_only_checked_moved",
-    );
-    let mut hg = Hg::new(state, "heads");
-    let made = rebuild(state, &mut hg, (&[1], 1));
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = Hg::made_non_publishing("heads").await;
+    let made = rebuilt(&hg, (&[1], 1)).await;
     let first = Unbundle {
       parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[4])))],
     };
-    assert!(hg.push(state, &first, &view_with(&made, &[])).is_ok());
-    let stable = hg.bound(state, &line_name(b"stable", 0)).unwrap();
-    assert_eq!(head(state, stable), Some(made[4].node));
+    let landed = pushed(&hg, &first).await;
+    assert!(matches!(landed, Outcome::Accepted(_)), "{landed:?}");
+    let stable = crate::repository::svn_commit::tests::on(|state| {
+      let stable = hg.bound(state, &line_name(b"stable", 0)).unwrap();
+      assert_eq!(head(state, stable), Some(made[4].node));
+      stable
+    });
     let checked = Unbundle {
       parts: vec![
         taken(0, Asks::CheckHeads(vec![made[4].node])),
         taken(1, Asks::Changegroup(changegroup(&made, &[3]))),
       ],
     };
-    // Its changegroup taken into its fork first (A-720); another push moves `stable`; then it lands as the driver lands
-    // it, its stale fork re-based and `check:heads` judged at landing.
-    let (_, part) = checked.changegroup().unwrap();
-    let forked = super::take_whole(
-      state,
-      hg.repository,
-      (part.version, part.payload.clone()),
-      &mut room(),
-    )
-    .unwrap()
-    .unwrap();
+    // Its changegroup taken into its fork and held at its landing (A-720); another push moves `stable`; then it lands
+    // as the driver lands it, its stale fork re-based and `check:heads` judged at landing.
+    super::hold_next_landing();
+    let held = spawned_push(hg, bundled(&checked));
+    until_held().await;
     let again = Unbundle {
       parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[5])))],
     };
-    assert!(hg.push(state, &again, &view_with(&made, &[4])).is_ok());
-    assert_eq!(head(state, stable), Some(made[5].node));
-    let raced = super::land_in(
-      state,
-      hg.repository,
-      (&owner(), b"checked"),
-      &checked,
-      Some(forked),
-      &mut room(),
+    let moved = pushed(&hg, &again).await;
+    assert!(matches!(moved, Outcome::Accepted(_)), "{moved:?}");
+    assert_eq!(
+      crate::repository::svn_commit::tests::on(|state| head(state, stable)),
+      Some(made[5].node)
     );
+    super::release_held_landing();
+    let raced = answered(&held).await;
     let words = super::RACED.to_vec();
     assert_eq!(
       raced,
-      Some(Outcome::refused(&Refused::PushRaced { message: words }))
+      Outcome::refused(&Refused::PushRaced { message: words })
     );
-    assert_eq!(head(state, hg.root), Some(made[1].node));
-    assert!(!hg.holds(state, &made[3].node));
+    crate::repository::svn_commit::tests::on(|state| {
+      assert_eq!(head(state, hg.root), Some(made[1].node));
+      assert!(!hg.holds(state, &made[3].node));
+    });
   });
 }
 
@@ -2323,22 +2052,22 @@ fn a_push_is_refused_when_a_green_it_only_checked_moved() {
 /// phases log one position on.
 #[test]
 fn a_published_draft_leaves_the_roots_in_the_same_entry() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let mut hg = Hg::new(state, "phase");
-    let made = rebuild(state, &mut hg, (&[0], 1));
-    assert_eq!(hg.roots(state), BTreeSet::from([made[1].node]));
-    let position = hg.phases(state);
-    let view = View::of(
-      listing!("push-phase-server.txt"),
-      listing!("push-phase-bookmarks.txt"),
-    );
-    let answer = hg.push(state, &stock(fixture!("push-phase.hg")), &view);
-    assert_eq!(
-      answer.map(|reply| encoded(&reply)),
-      Ok(fixture!("push-phase-reply.hg").to_vec())
-    );
-    assert!(hg.roots(state).is_empty());
-    assert_eq!(hg.phases(state), position + 1);
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = Hg::made_non_publishing("phase").await;
+    let made = rebuilt(&hg, (&[0], 1)).await;
+    let position = crate::repository::svn_commit::tests::on(|state| {
+      assert_eq!(hg.roots(state), BTreeSet::from([made[1].node]));
+      hg.phases(state)
+    });
+    let answer = pushed_bytes(&hg, fixture!("push-phase.hg")).await;
+    let Outcome::Accepted(reply) = answer else {
+      panic!("not accepted: {answer:?}");
+    };
+    assert_eq!(encoded(&reply), fixture!("push-phase-reply.hg").to_vec());
+    crate::repository::svn_commit::tests::on(|state| {
+      assert!(hg.roots(state).is_empty());
+      assert_eq!(hg.phases(state), position + 1);
+    });
   });
 }
 
@@ -2348,25 +2077,30 @@ fn a_published_draft_leaves_the_roots_in_the_same_entry() {
 /// moved to `second`, holding `b`; `default`'s line untouched.
 #[test]
 fn a_bookmark_moves_on_its_own_green() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let mut hg = Hg::new(state, "bookmark");
-    let made = rebuild(state, &mut hg, (&[0], 0));
-    let main = hg.bound(state, &bookmark_name(b"main")).unwrap();
-    assert_eq!(head(state, main), Some(made[0].node));
-    assert_eq!(file(state, main, "b"), None);
-    let version = state.db.partition().green_head(hg.root);
-    let view = View::of(
-      listing!("push-bookmark-server.txt"),
-      listing!("push-bookmark-bookmarks.txt"),
-    );
-    let answer = hg.push(state, &stock(fixture!("push-bookmark.hg")), &view);
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = Hg::made_non_publishing("bookmark").await;
+    let made = rebuilt(&hg, (&[0], 0)).await;
+    let (main, version) = crate::repository::svn_commit::tests::on(|state| {
+      let main = hg.bound(state, &bookmark_name(b"main")).unwrap();
+      assert_eq!(head(state, main), Some(made[0].node));
+      assert_eq!(file(state, main, "b"), None);
+      (main, state.db.partition().green_head(hg.root))
+    });
+    let answer = pushed_bytes(&hg, fixture!("push-bookmark.hg")).await;
+    let Outcome::Accepted(reply) = answer else {
+      panic!("not accepted: {answer:?}");
+    };
+    assert_eq!(encoded(&reply), fixture!("push-bookmark-reply.hg").to_vec());
     assert_eq!(
-      answer.map(|reply| encoded(&reply)),
-      Ok(fixture!("push-bookmark-reply.hg").to_vec())
+      crate::repository::svn_commit::tests::on(|state| head(state, main)),
+      Some(made[1].node)
     );
-    assert_eq!(head(state, main), Some(made[1].node));
-    assert_eq!(file(state, main, "b").as_deref(), Some(&b"b\n"[..]));
-    assert_eq!(state.db.partition().green_head(hg.root), version);
+    let read = crate::vcs_store::named_objects::read_file_brought(main, "b").await;
+    assert_eq!(read.as_deref(), Some(&b"b\n"[..]));
+    assert_eq!(
+      crate::repository::svn_commit::tests::on(|state| state.db.partition().green_head(hg.root)),
+      version
+    );
   });
 }
 
@@ -2451,7 +2185,7 @@ fn stranger() -> slates_ipc::protocol::Principal {
   slates_ipc::protocol::Principal::Uid { host: 0, uid: 4321 }
 }
 
-/// Sets repository `name`'s policy to `rules`, from version `read`.
+/// Sets repository `name`'s policy to `rules`, from version `read`, not publishing (as the tests' pushes were judged).
 fn set_policy(
   state: &mut ShardState,
   (name, read): (&str, u64),
@@ -2468,13 +2202,14 @@ fn set_policy(
       hooks: Vec::new(),
       hooks_env: Vec::new(),
       signers: Vec::new(),
-      hg_publishing: true,
+      hg_publishing: false,
     },
   );
   assert_eq!(reply, ReplyBody::Acknowledged);
 }
 
-/// Configures repository `name`'s policy, from its first version, to run the `pretxnchangegroup` hook `hook`, its
+/// Configures repository `name`'s policy, from its version 1 ([`Hg::made_non_publishing`]'s), to run the
+/// `pretxnchangegroup` hook `hook`, not publishing, its
 /// program the test binary, a path absolute on the test's host, as the guard asks (A-622).
 fn set_hook(state: &mut ShardState, name: &str, hook: &str) {
   let reply = dispatch(
@@ -2483,7 +2218,7 @@ fn set_hook(state: &mut ShardState, name: &str, hook: &str) {
     &owner(),
     RequestBody::SetRepositoryPolicy {
       repository: name.to_owned(),
-      read: 0,
+      read: 1,
       rules: Vec::new(),
       hooks: vec![slates_ipc::protocol::HookConfig {
         point: slates_ipc::protocol::HookPointName::HgPretxnchangegroup,
@@ -2495,7 +2230,7 @@ fn set_hook(state: &mut ShardState, name: &str, hook: &str) {
       }],
       hooks_env: Vec::new(),
       signers: Vec::new(),
-      hg_publishing: true,
+      hg_publishing: false,
     },
   );
   assert_eq!(reply, ReplyBody::Acknowledged);
@@ -2510,70 +2245,40 @@ fn set_hook(state: &mut ShardState, name: &str, hook: &str) {
 /// store's index holding it.
 #[test]
 fn a_push_through_the_driver_lands_in_the_repositorys_store_unless_a_hook_waits() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let mut driven = Hg::new(state, "driven");
-    let made = rebuild(state, &mut driven, (&[1], 1));
-    let mut hooked = Hg::new(state, "hooked");
-    rebuild(state, &mut hooked, (&[1], 1));
-    set_hook(state, "hooked", "pretxnchangegroup.check");
-    let (principal, heads) = (owner(), HeadsArgument::Force);
-    let pushing = (&principal, &heads, &fixture!("push-plain.hg")[..]);
-    let version = state.db.partition().green_head(hooked.root);
-    let refused = drive(state, hooked.repository, pushing, &mut room());
+  crate::test_store::run_on_stored_shard(|| async move {
+    let driven = Hg::made_non_publishing("driven").await;
+    let made = rebuilt(&driven, (&[1], 1)).await;
+    let hooked = Hg::made_non_publishing("hooked").await;
+    let _ = rebuilt(&hooked, (&[1], 1)).await;
+    let version = crate::repository::svn_commit::tests::on(|state| {
+      set_hook(state, "hooked", "pretxnchangegroup.check");
+      state.db.partition().green_head(hooked.root)
+    });
+    let refused = pushed_bytes(&hooked, fixture!("push-plain.hg")).await;
     let message = b"the repository's pretxnchangegroup.check hook cannot run here yet: its view of the push is \
                     not served"
       .to_vec();
     assert_eq!(
       refused,
-      Some(Outcome::refused(&Refused::Abort {
+      Outcome::refused(&Refused::Abort {
         message,
         hint: None
-      }))
+      })
     );
-    assert_eq!(state.db.partition().green_head(hooked.root), version);
-    assert!(!hooked.holds(state, &made[3].node));
-    let accepted = drive(state, driven.repository, pushing, &mut room());
-    let Some(Outcome::Accepted(reply)) = accepted else {
+    crate::repository::svn_commit::tests::on(|state| {
+      assert_eq!(state.db.partition().green_head(hooked.root), version);
+      assert!(!hooked.holds(state, &made[3].node));
+    });
+    let accepted = pushed_bytes(&driven, fixture!("push-plain.hg")).await;
+    let Outcome::Accepted(reply) = accepted else {
       panic!("not accepted: {accepted:?}");
     };
     assert_eq!(encoded(&reply), fixture!("push-plain-reply.hg").to_vec());
-    assert_eq!(head(state, driven.root), Some(made[3].node));
-    assert!(driven.holds(state, &made[3].node));
+    crate::repository::svn_commit::tests::on(|state| {
+      assert_eq!(head(state, driven.root), Some(made[3].node));
+      assert!(driven.holds(state, &made[3].node));
+    });
   });
-}
-
-/// The push driver's steps in one call, for a test on a shard (the daemon's driver, `super::unbundle`, takes them a
-/// slice at a time between yields): `heads` judged and the bundle read, the changegroup taken whole, the push landed on
-/// the shard's store first and then judged and landed ([`super::land_in`], `super::land_stored`'s order, the one landing
-/// path).
-fn drive(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  (principal, heads, bundle): super::Pushing<'_>,
-  room: &mut Admission,
-) -> Option<Outcome> {
-  let fronted = crate::vcs_store::lent_state(state, |state| {
-    super::front(state, repository, (heads, bundle), room)
-  });
-  let mut unbundle = match fronted? {
-    Ok(unbundle) => unbundle,
-    Err(outcome) => return Some(outcome),
-  };
-  let forked = match unbundle.take_changegroup() {
-    None => None,
-    Some(changegroup) => match super::take_whole(state, repository, changegroup, room)? {
-      Ok(forked) => Some(forked),
-      Err(refused) => return Some(Outcome::refused(&refused)),
-    },
-  };
-  super::land_in(
-    state,
-    repository,
-    (principal, bundle),
-    &unbundle,
-    forked,
-    room,
-  )
 }
 
 /// A rule over `names` matching `pattern`, deciding a submit with `effect` for `who`.
@@ -2604,75 +2309,65 @@ fn rule(
 #[test]
 fn the_policy_refuses_before_the_verdict_in_acls_words() {
   use slates_ipc::protocol::{PolicyEffect, PolicyEntry, PolicyNames, PolicyWho};
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let mut plain = Hg::new(state, "acl-plain");
-    rebuild(state, &mut plain, (&[1], 1));
-    set_policy(
-      state,
-      ("acl-plain", 0),
-      vec![rule(
-        PolicyNames::Branches,
-        "default",
-        (PolicyEffect::Deny, PolicyWho::Anyone),
-      )],
-    );
-    let view = View::of(
-      listing!("push-plain-server.txt"),
-      listing!("push-plain-bookmarks.txt"),
-    );
-    let prepared = plain
-      .prepare(state, &stock(fixture!("push-plain.hg")), &view)
-      .unwrap();
+  crate::test_store::run_on_stored_shard(|| async move {
+    let plain = Hg::made_non_publishing("acl-plain").await;
+    let _ = rebuilt(&plain, (&[1], 1)).await;
+    crate::repository::svn_commit::tests::on(|state| {
+      set_policy(
+        state,
+        ("acl-plain", 1),
+        vec![rule(
+          PolicyNames::Branches,
+          "default",
+          (PolicyEffect::Deny, PolicyWho::Anyone),
+        )],
+      );
+    });
     let denied = format!(
       "acl: user \"{:?}\" denied on branch \"default\" (changeset \"048741fabe42\")",
       owner()
     );
     assert_eq!(
-      super::admitted(state, (&owner(), plain.repository), &prepared),
-      Err(Box::new(Refused::Abort {
+      pushed_bytes(&plain, fixture!("push-plain.hg")).await,
+      Outcome::refused(&Refused::Abort {
         message: denied.into_bytes(),
         hint: None
-      }))
+      })
     );
-    set_policy(state, ("acl-plain", 1), Vec::new());
-    assert_eq!(
-      super::admitted(state, (&owner(), plain.repository), &prepared),
-      Ok(())
-    );
-    let mut marks = Hg::new(state, "acl-mark");
-    rebuild(state, &mut marks, (&[0], 0));
+    crate::repository::svn_commit::tests::on(|state| {
+      set_policy(state, ("acl-plain", 2), Vec::new())
+    });
+    let admitted = pushed_bytes(&plain, fixture!("push-plain.hg")).await;
+    assert!(matches!(admitted, Outcome::Accepted(_)), "{admitted:?}");
+    let marks = Hg::made_non_publishing("acl-mark").await;
+    let _ = rebuilt(&marks, (&[0], 0)).await;
     let only = PolicyWho::AnyOf {
       entries: vec![PolicyEntry::Is {
         principal: stranger(),
       }],
     };
-    set_policy(
-      state,
-      ("acl-mark", 0),
-      vec![rule(
-        PolicyNames::Bookmarks,
-        "*",
-        (PolicyEffect::Allow, only),
-      )],
-    );
-    let view = View::of(
-      listing!("push-bookmark-server.txt"),
-      listing!("push-bookmark-bookmarks.txt"),
-    );
-    let prepared = marks
-      .prepare(state, &stock(fixture!("push-bookmark.hg")), &view)
-      .unwrap();
+    crate::repository::svn_commit::tests::on(|state| {
+      set_policy(
+        state,
+        ("acl-mark", 1),
+        vec![rule(
+          PolicyNames::Bookmarks,
+          "*",
+          (PolicyEffect::Allow, only),
+        )],
+      );
+    });
     let second = "59d5dc23f8786c06d0fae53e625be1cdd640a783";
     let listed = format!(
       "acl: user \"{:?}\" not allowed on bookmark \"main\" (changeset \"{second}\")",
       owner()
     );
     assert_eq!(
-      super::admitted(state, (&owner(), marks.repository), &prepared),
-      Err(Box::new(Refused::Abort {
+      pushed_bytes(&marks, fixture!("push-bookmark.hg")).await,
+      Outcome::refused(&Refused::Abort {
         message: listed.into_bytes(),
         hint: None
-      }))
+      })
     );
   });
 }
@@ -2684,24 +2379,22 @@ fn the_policy_refuses_before_the_verdict_in_acls_words() {
 #[test]
 fn a_bookmark_deleted_is_refused_naming_the_empty_changeset_acl_names() {
   use slates_ipc::protocol::{PolicyEffect, PolicyNames, PolicyRight, PolicyRule, PolicyWho};
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let mut marks = Hg::new(state, "acl-delete");
-    rebuild(state, &mut marks, (&[1], 1));
-    set_policy(
-      state,
-      ("acl-delete", 0),
-      vec![PolicyRule {
-        names: PolicyNames::Bookmarks,
-        pattern: "*".to_owned(),
-        right: PolicyRight::Delete,
-        effect: PolicyEffect::Deny,
-        who: PolicyWho::Anyone,
-      }],
-    );
-    let view = View::of(
-      listing!("push-plain-server.txt"),
-      listing!("push-plain-bookmarks.txt"),
-    );
+  crate::test_store::run_on_stored_shard(|| async move {
+    let marks = Hg::made_non_publishing("acl-delete").await;
+    let _ = rebuilt(&marks, (&[1], 1)).await;
+    crate::repository::svn_commit::tests::on(|state| {
+      set_policy(
+        state,
+        ("acl-delete", 1),
+        vec![PolicyRule {
+          names: PolicyNames::Bookmarks,
+          pattern: "*".to_owned(),
+          right: PolicyRight::Delete,
+          effect: PolicyEffect::Deny,
+          who: PolicyWho::Anyone,
+        }],
+      );
+    });
     let deleting = Unbundle {
       parts: vec![taken(
         0,
@@ -2711,17 +2404,16 @@ fn a_bookmark_deleted_is_refused_naming_the_empty_changeset_acl_names() {
         }]),
       )],
     };
-    let prepared = marks.prepare(state, &deleting, &view).unwrap();
     let denied = format!(
       "acl: user \"{:?}\" denied on bookmark \"main\" (changeset \"\")",
       owner()
     );
     assert_eq!(
-      super::admitted(state, (&owner(), marks.repository), &prepared),
-      Err(Box::new(Refused::Abort {
+      pushed(&marks, &deleting).await,
+      Outcome::refused(&Refused::Abort {
         message: denied.into_bytes(),
         hint: None
-      }))
+      })
     );
   });
 }
@@ -2733,26 +2425,23 @@ fn a_bookmark_deleted_is_refused_naming_the_empty_changeset_acl_names() {
 #[test]
 fn the_policy_names_the_branch_acl_meets_first() {
   use slates_ipc::protocol::{PolicyEffect, PolicyNames, PolicyWho};
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let mut two = Hg::new(state, "acl-order");
-    let made = rebuild(state, &mut two, (&[1], 1));
-    set_policy(
-      state,
-      ("acl-order", 0),
-      vec![rule(
-        PolicyNames::Branches,
-        "*",
-        (PolicyEffect::Deny, PolicyWho::Anyone),
-      )],
-    );
-    let view = View::of(
-      listing!("push-plain-server.txt"),
-      listing!("push-plain-bookmarks.txt"),
-    );
-    let pushed = Unbundle {
+  crate::test_store::run_on_stored_shard(|| async move {
+    let two = Hg::made_non_publishing("acl-order").await;
+    let made = rebuilt(&two, (&[1], 1)).await;
+    crate::repository::svn_commit::tests::on(|state| {
+      set_policy(
+        state,
+        ("acl-order", 1),
+        vec![rule(
+          PolicyNames::Branches,
+          "*",
+          (PolicyEffect::Deny, PolicyWho::Anyone),
+        )],
+      );
+    });
+    let pushing = Unbundle {
       parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[4, 3])))],
     };
-    let prepared = two.prepare(state, &pushed, &view).unwrap();
     let stable = hex(&made[4].node);
     let denied = format!(
       "acl: user \"{:?}\" denied on branch \"stable\" (changeset \"{}\")",
@@ -2760,11 +2449,11 @@ fn the_policy_names_the_branch_acl_meets_first() {
       stable.get(..12).unwrap()
     );
     assert_eq!(
-      super::admitted(state, (&owner(), two.repository), &prepared),
-      Err(Box::new(Refused::Abort {
+      pushed(&two, &pushing).await,
+      Outcome::refused(&Refused::Abort {
         message: denied.into_bytes(),
         hint: None
-      }))
+      })
     );
   });
 }
@@ -2992,13 +2681,9 @@ mod hooks {
 /// different. Before, the second new green was minted the first's id and the push was answered `error:abort`.
 #[test]
 fn t_a694_a_push_making_two_bookmarks_makes_two_greens() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let mut hg = Hg::new(state, "marks");
-    let made = rebuild(state, &mut hg, (&[1], 1));
-    let view = View::of(
-      listing!("push-plain-server.txt"),
-      listing!("push-plain-bookmarks.txt"),
-    );
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = Hg::made_non_publishing("marks").await;
+    let made = rebuilt(&hg, (&[1], 1)).await;
     let at = |name: &[u8]| BookmarkAt {
       name: name.to_vec(),
       node: Some(made[1].node),
@@ -3006,15 +2691,17 @@ fn t_a694_a_push_making_two_bookmarks_makes_two_greens() {
     let unbundle = Unbundle {
       parts: vec![taken(0, Asks::Bookmarks(vec![at(b"left"), at(b"right")]))],
     };
-    let answer = hg.push(state, &unbundle, &view);
-    assert!(answer.is_ok(), "{answer:?}");
-    let bound = |name: &[u8]| hg.bound(state, &bookmark_name(name));
-    let (main, left, right) = (bound(b"main"), bound(b"left"), bound(b"right"));
-    let greens: BTreeSet<DbVolumeId> = [main, left, right].into_iter().flatten().collect();
-    assert_eq!(greens.len(), 3, "{main:?} {left:?} {right:?}");
-    for green in [left, right].into_iter().flatten() {
-      assert_eq!(head(state, green), Some(made[1].node));
-    }
+    let answer = pushed(&hg, &unbundle).await;
+    assert!(matches!(answer, Outcome::Accepted(_)), "{answer:?}");
+    crate::repository::svn_commit::tests::on(|state| {
+      let bound = |name: &[u8]| hg.bound(state, &bookmark_name(name));
+      let (main, left, right) = (bound(b"main"), bound(b"left"), bound(b"right"));
+      let greens: BTreeSet<DbVolumeId> = [main, left, right].into_iter().flatten().collect();
+      assert_eq!(greens.len(), 3, "{main:?} {left:?} {right:?}");
+      for green in [left, right].into_iter().flatten() {
+        assert_eq!(head(state, green), Some(made[1].node));
+      }
+    });
   });
 }
 
@@ -3162,13 +2849,15 @@ fn a_dropped_run_is_forgotten_and_the_next_push_lands_past_it() {
 /// (`PAST_CEILING`) where they pass it by a byte. Red before: the second admitted the ceiling, its step left to wait.
 #[test]
 fn a_push_whose_keeping_and_its_widest_step_pass_its_repositorys_ceiling_is_refused_at_once() {
-  crate::test_store::audit_on_stored_shard("hg-least-step", |state| {
-    crate::vcs_share::wait::TEST_CEILING.with(|ceiling| ceiling.set(1_000));
-    let fits = super::need_of(state, (100, 400, 500), 2_000);
-    let passes = super::need_of(state, (100, 400, 501), 2_000);
-    crate::vcs_share::wait::TEST_CEILING.with(|ceiling| ceiling.set(0));
-    assert_eq!(fits.ok(), Some(1_000));
-    assert_eq!(passes.err(), Some(super::past_ceiling()));
+  crate::test_store::run_on_stored_shard(|| async move {
+    crate::repository::svn_commit::tests::on(|state| {
+      crate::vcs_share::wait::TEST_CEILING.with(|ceiling| ceiling.set(1_000));
+      let fits = super::need_of(state, (100, 400, 500), 2_000);
+      let passes = super::need_of(state, (100, 400, 501), 2_000);
+      crate::vcs_share::wait::TEST_CEILING.with(|ceiling| ceiling.set(0));
+      assert_eq!(fits.ok(), Some(1_000));
+      assert_eq!(passes.err(), Some(super::past_ceiling()));
+    });
   });
 }
 
