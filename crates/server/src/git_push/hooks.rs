@@ -458,6 +458,7 @@ fn admitted<P>(
     push: &mut hooking.sealed,
     record: &hooking.record,
     principal: &push.principal,
+    hidden: push.session.hidden(),
     name: hooking.name,
     hooks: &mut HookVerdicts::default(),
     admitting: &mut None,

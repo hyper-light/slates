@@ -769,3 +769,118 @@ fn deleting_a_tag_of_a_let_go_tag_waits_for_its_window_and_reaches_its_green() {
     "delete prepare must reach greens.read so an owing P2 green enters the door"
   );
 }
+
+/// Red-team regression (`rt-git-post-claude`, §4.17.2): when another branch (`refs/heads/other`)
+/// already holds the pushed commit while the default branch (`refs/heads/main`) is still unborn,
+/// `Verdicts::create` must emit `from: None` with `base_tree: None` for the unborn default branch
+/// (so the server emits `BranchChange::UpdateDeferred` on the empty default green rather than
+/// `BranchChange::CreateDeferred` -> `AlreadyExists` -> `Unappended::Moved`), while a sibling
+/// non-default create (`refs/heads/y`) still branches from `other`.
+#[test]
+fn unborn_default_branch_create_does_not_branch_from_existing_other_branch() {
+  struct UnbornDefaultWithOther<'s> {
+    served: &'s Served,
+  }
+  impl Greens for UnbornDefaultWithOther<'_> {
+    fn read<T>(&self, name: &[u8], with: impl FnOnce(GreenRead<'_>) -> T) -> Option<T> {
+      (name == b"refs/heads/other").then(|| {
+        with(GreenRead {
+          id: GREEN,
+          position: self.served.green.head(),
+          green: &self.served.green,
+        })
+      })
+    }
+
+    fn version_of(&self, green: u64, head: &ObjectId) -> Option<Version> {
+      (green == GREEN && *head == self.served.head).then_some(Version {
+        number: 1,
+        tree: self.served.tree,
+      })
+    }
+
+    fn base_of_create<T>(
+      &self,
+      parent: Option<&ObjectId>,
+      with: impl FnOnce(GreenRead<'_>, Version) -> T,
+    ) -> Option<T> {
+      let version = self.version_of(GREEN, parent?)?;
+      Some(with(
+        GreenRead {
+          id: GREEN,
+          position: self.served.green.head(),
+          green: &self.served.green,
+        },
+        version,
+      ))
+    }
+
+    fn holding_head<T>(
+      &self,
+      head: &ObjectId,
+      with: impl FnOnce(GreenRead<'_>, Version) -> T,
+    ) -> Option<T> {
+      let version = self.version_of(GREEN, head)?;
+      Some(with(
+        GreenRead {
+          id: GREEN,
+          position: self.served.green.head(),
+          green: &self.served.green,
+        },
+        version,
+      ))
+    }
+
+    fn is_unborn_default(&self, name: &[u8]) -> bool {
+      name == MAIN
+    }
+  }
+
+  let served = Served::new();
+  let greens = UnbornDefaultWithOther { served: &served };
+  let indexed = IndexedObjects::new(&served.repository, &served.store, ROOM);
+  let quarantine = Push::new(ObjectFormat::Sha1);
+  let objects = PushedObjects::new(&served.repository, &served.store, &quarantine);
+  let verdicts = crate::receive::works::Verdicts::new(&greens, &indexed, &objects, NAME, ROOM);
+  let pushed = crate::receive::Pushed::new(&[], None, &mut unbounded()).unwrap();
+
+  let main_cmd = crate::receive::Command {
+    old: zero(),
+    new: served.head,
+    name: MAIN.to_vec(),
+  };
+  let Entry::Create {
+    name: main_name,
+    from: main_from,
+    push: main_push,
+  } = verdicts.judge(&main_cmd, &pushed).unwrap()
+  else {
+    panic!("expected Create for unborn default branch");
+  };
+  assert_eq!(
+    (main_name.as_slice(), main_from, main_push.push().base_tree),
+    (MAIN, None, None)
+  );
+
+  let sibling_cmd = crate::receive::Command {
+    old: zero(),
+    new: served.head,
+    name: b"refs/heads/y".to_vec(),
+  };
+  let Entry::Create {
+    name: sibling_name,
+    from: sibling_from,
+    push: sibling_push,
+  } = verdicts.judge(&sibling_cmd, &pushed).unwrap()
+  else {
+    panic!("expected Create for sibling branch");
+  };
+  assert_eq!(
+    (
+      sibling_name.as_slice(),
+      sibling_from,
+      sibling_push.push().base_tree.is_some(),
+    ),
+    (b"refs/heads/y".as_slice(), Some((GREEN, 1)), true)
+  );
+}

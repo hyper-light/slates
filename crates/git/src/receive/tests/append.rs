@@ -370,32 +370,132 @@ fn assert_non_conflicting_prefix_batch(fixture: &SingleCommitFixture) {
   assert_eq!(logs.appended.len(), 1);
 }
 
-/// Verifies non-atomic intra-batch D/F conflict refuses only the conflicting second ref.
+/// Verifies non-atomic intra-batch D/F conflicts match stock Git 2.56.1 ordering in both wire
+/// orders (`[topic, topic/docs/deep, companion]` and `[topic/docs/deep, topic, companion]`),
+/// across an ASCII-intervening sibling (`'-' < '/'`), and on 3-level chains (`a`, `a/b`, `a/b/c`).
 fn assert_non_atomic_df_conflict_batch(fixture: &SingleCommitFixture) {
   let id = fixture.commit_id;
-  let mut logs = Logs::default();
+  let mut forward_logs = Logs::default();
+  let forward = fixture.push(
+    &[
+      (zero(), id, b"refs/heads/topic"),
+      (zero(), id, b"refs/heads/topic/docs/deep"),
+      (zero(), id, b"refs/heads/companion"),
+    ],
+    false,
+    &mut forward_logs,
+  );
+  assert_declined_with_message(&forward[0], FAILED_TO_UPDATE, "refs/heads/topic/docs/deep");
+  assert_eq!(forward[1], Outcome::Ok(Vec::new()));
+  assert_eq!(forward[2], Outcome::Ok(Vec::new()));
+
+  let mut reversed_logs = Logs::default();
+  let reversed = fixture.push(
+    &[
+      (zero(), id, b"refs/heads/topic/docs/deep"),
+      (zero(), id, b"refs/heads/topic-1"),
+      (zero(), id, b"refs/heads/topic"),
+      (zero(), id, b"refs/heads/companion"),
+    ],
+    false,
+    &mut reversed_logs,
+  );
+  assert_eq!(reversed[0], Outcome::Ok(Vec::new()));
+  assert_eq!(reversed[1], Outcome::Ok(Vec::new()));
+  assert_declined_with_message(&reversed[2], FAILED_TO_UPDATE, "refs/heads/topic/docs/deep");
+  assert_eq!(reversed[3], Outcome::Ok(Vec::new()));
+
+  let mut chain_logs = Logs::default();
+  let chain = fixture.push(
+    &[
+      (zero(), id, b"refs/heads/a"),
+      (zero(), id, b"refs/heads/a/b"),
+      (zero(), id, b"refs/heads/a/b/c"),
+    ],
+    false,
+    &mut chain_logs,
+  );
+  assert_declined_reason(&chain[0], FAILED_TO_UPDATE);
+  assert_declined_reason(&chain[1], FAILED_TO_UPDATE);
+  assert_eq!(
+    (&chain[2], chain_logs.appended.as_slice()),
+    (
+      &Outcome::Ok(Vec::new()),
+      &[owned(&[b"refs/heads/a/b/c"])][..]
+    )
+  );
+}
+
+/// Verifies an existing-ref update (`!is_create()`) beats a conflicting create in either
+/// ancestor/descendant direction in a non-atomic batch.
+fn assert_non_atomic_existing_update_beats_create(fixture: &SingleCommitFixture) {
+  let id = fixture.commit_id;
+  let mut anc_update_logs = Logs::default();
+  let anc_update = fixture.push(
+    &[
+      (zero(), id, b"refs/heads/topic/docs"),
+      (id, id, b"refs/heads/topic"),
+    ],
+    false,
+    &mut anc_update_logs,
+  );
+  assert_declined_with_message(
+    &anc_update[0],
+    FAILED_TO_UPDATE,
+    "'refs/heads/topic' exists",
+  );
+  assert_eq!(
+    (&anc_update[1], anc_update_logs.appended.as_slice()),
+    (
+      &Outcome::Ok(Vec::new()),
+      &[owned(&[b"refs/heads/topic"])][..]
+    )
+  );
+
+  let mut desc_update_logs = Logs::default();
+  let desc_update = fixture.push(
+    &[
+      (zero(), id, b"refs/heads/topic"),
+      (id, id, b"refs/heads/topic/docs"),
+    ],
+    false,
+    &mut desc_update_logs,
+  );
+  assert_declined_with_message(
+    &desc_update[0],
+    FAILED_TO_UPDATE,
+    "'refs/heads/topic/docs' exists",
+  );
+  assert_eq!(
+    (&desc_update[1], desc_update_logs.appended.as_slice()),
+    (
+      &Outcome::Ok(Vec::new()),
+      &[owned(&[b"refs/heads/topic/docs"])][..]
+    )
+  );
+}
+
+/// Verifies a non-atomic judge refusal on the descendant ref leaves its ancestor ref unblocked,
+/// and a refusal on the ancestor ref leaves its descendant unblocked.
+fn assert_non_atomic_declined_ref_does_not_block_child(fixture: &SingleCommitFixture) {
+  let id = fixture.commit_id;
+  let mut child_declined = Logs {
+    declining: owned(&[b"refs/heads/topic/docs"]),
+    ..Logs::default()
+  };
   let outcomes = fixture.push(
     &[
       (zero(), id, b"refs/heads/topic"),
       (zero(), id, b"refs/heads/topic/docs"),
-      (zero(), id, b"refs/heads/other"),
     ],
     false,
-    &mut logs,
+    &mut child_declined,
   );
   assert_eq!(outcomes[0], Outcome::Ok(Vec::new()));
-  assert_declined_reason(&outcomes[1], FAILED_TO_UPDATE);
-  assert_eq!(outcomes[2], Outcome::Ok(Vec::new()));
-  assert_eq!(
-    logs.appended,
-    [owned(&[b"refs/heads/topic"]), owned(&[b"refs/heads/other"])]
-  );
-}
+  assert_eq!(outcomes[1], refused(b"hook declined", None));
+  assert_eq!(child_declined.appended, [owned(&[b"refs/heads/topic"])]);
 
-/// Verifies a non-atomic judge refusal on a parent ref leaves its child ref unblocked.
-fn assert_non_atomic_declined_ref_does_not_block_child(fixture: &SingleCommitFixture) {
-  let id = fixture.commit_id;
-  let mut logs = Logs {
+  let mut parent_declined = Logs {
     declining: owned(&[b"refs/heads/topic"]),
     ..Logs::default()
   };
@@ -405,11 +505,14 @@ fn assert_non_atomic_declined_ref_does_not_block_child(fixture: &SingleCommitFix
       (zero(), id, b"refs/heads/topic/docs"),
     ],
     false,
-    &mut logs,
+    &mut parent_declined,
   );
-  assert_eq!(outcomes[0], refused(b"hook declined", None));
+  assert_declined_reason(&outcomes[0], FAILED_TO_UPDATE);
   assert_eq!(outcomes[1], Outcome::Ok(Vec::new()));
-  assert_eq!(logs.appended, [owned(&[b"refs/heads/topic/docs"])]);
+  assert_eq!(
+    parent_declined.appended,
+    [owned(&[b"refs/heads/topic/docs"])]
+  );
 }
 
 /// §4.17.2 "A push" (files-backend ref directory/file namespace conflicts): do push intra-batch
@@ -426,15 +529,19 @@ fn df_ref_namespace_conflicts_are_refused_and_atomic_batches_roll_back() {
   assert_atomic_intra_batch_df_conflicts(&fixture);
   assert_non_conflicting_prefix_batch(&fixture);
   assert_non_atomic_df_conflict_batch(&fixture);
+  assert_non_atomic_existing_update_beats_create(&fixture);
   assert_non_atomic_declined_ref_does_not_block_child(&fixture);
 }
 
 /// A test judge holding pre-existing repository ref names so cross-push D/F namespace conflict
-/// checks (including delete-then-create replacement and atomic rollback) are verified end to end.
+/// checks (including delete-then-create replacement, hidden-ref redaction, and atomic rollback)
+/// are verified end to end.
 #[derive(Default)]
 struct ExistingRefsJudge {
   /// Refs already present in the repository before the push.
   existing: std::collections::BTreeSet<Vec<u8>>,
+  /// Refs hidden from the pushing principal (read-denied by policy).
+  hidden: std::collections::BTreeSet<Vec<u8>>,
   /// Refs whose verdict declines.
   declining: Vec<Vec<u8>>,
   /// Applied commands recorded as batches (one entry per non-atomic append, one vec per atomic).
@@ -495,15 +602,16 @@ impl Judge for ExistingRefsJudge {
     Ok(Vec::new())
   }
 
-  fn ref_conflict(&self, name: &[u8], deleted: &[&[u8]]) -> Option<Vec<u8>> {
-    self
-      .existing
-      .iter()
-      .find(|existing| {
-        !deleted.contains(&existing.as_slice())
-          && crate::receive::refs_conflict(existing.as_slice(), name)
-      })
-      .cloned()
+  fn ref_conflict(&self, name: &[u8], deleted: &[&[u8]]) -> Option<crate::receive::RefConflict> {
+    let existing = self.existing.iter().find(|existing| {
+      !deleted.contains(&existing.as_slice())
+        && crate::receive::refs_conflict(existing.as_slice(), name)
+    })?;
+    Some(if self.hidden.contains(existing) {
+      crate::receive::RefConflict::Hidden
+    } else {
+      crate::receive::RefConflict::Visible(existing.clone())
+    })
   }
 }
 
@@ -545,29 +653,66 @@ fn assert_atomic_cross_push_df_conflicts(fixture: &SingleCommitFixture) {
   assert!(judge.appended.is_empty());
 }
 
-/// Verifies atomic delete of `refs/heads/topic` paired with creating `refs/heads/topic/docs` succeeds.
+/// Verifies `--atomic` delete+create D/F replacement is refused in both directions (matching
+/// stock Git 2.56.1 `files-loose`, `files-packed`, and `reftable`) and preserves the original ref.
 fn assert_atomic_single_delete_replace(fixture: &SingleCommitFixture) {
   let id = fixture.commit_id;
   let mut judge = ExistingRefsJudge::with_existing(&[b"refs/heads/topic"]);
-  let outcomes = fixture.push(
+  let to_desc = fixture.push(
     &[
       (id, zero(), b"refs/heads/topic"),
-      (zero(), id, b"refs/heads/topic/docs"),
+      (zero(), id, b"refs/heads/topic/docs/deep"),
     ],
     true,
     &mut judge,
   );
-  assert_eq!(outcomes, vec![Outcome::Ok(Vec::new()); 2]);
-  assert!(!judge.existing.contains(b"refs/heads/topic".as_slice()));
-  assert!(judge.existing.contains(b"refs/heads/topic/docs".as_slice()));
+  assert_declined_with_message(&to_desc[1], FAILED_TO_UPDATE, "'refs/heads/topic' exists");
+  assert_eq!(
+    (
+      &to_desc[0],
+      judge.appended.is_empty(),
+      judge.existing.contains(b"refs/heads/topic".as_slice()),
+      judge
+        .existing
+        .contains(b"refs/heads/topic/docs/deep".as_slice()),
+    ),
+    (&refused(ATOMIC_FAILURE, None), true, true, false)
+  );
+
+  let mut desc_judge = ExistingRefsJudge::with_existing(&[b"refs/heads/topic/docs/deep"]);
+  let to_anc = fixture.push(
+    &[
+      (id, zero(), b"refs/heads/topic/docs/deep"),
+      (zero(), id, b"refs/heads/topic"),
+    ],
+    true,
+    &mut desc_judge,
+  );
+  assert_declined_with_message(
+    &to_anc[1],
+    FAILED_TO_UPDATE,
+    "'refs/heads/topic/docs/deep' exists",
+  );
+  assert_eq!(
+    (
+      &to_anc[0],
+      desc_judge.appended.is_empty(),
+      desc_judge
+        .existing
+        .contains(b"refs/heads/topic/docs/deep".as_slice()),
+      desc_judge.existing.contains(b"refs/heads/topic".as_slice()),
+    ),
+    (&refused(ATOMIC_FAILURE, None), true, true, false)
+  );
 }
 
-/// Verifies partial delete of a multi-child directory rolls back while deleting every child allows
-/// creating the parent ref.
+/// Verifies `--atomic` rejects both partial and full delete+create of a multi-child directory
+/// while preserving all original refs (matching stock Git 2.56.1), whereas non-atomic full
+/// delete+create succeeds.
 fn assert_atomic_multi_child_delete_replace(fixture: &SingleCommitFixture) {
   let id = fixture.commit_id;
   let mut judge = ExistingRefsJudge::with_existing(&[b"refs/heads/topic/a", b"refs/heads/topic/b"]);
-  let outcomes = fixture.push(
+  let partial = fixture.push(
     &[
       (id, zero(), b"refs/heads/topic/a"),
       (zero(), id, b"refs/heads/topic"),
@@ -575,11 +720,13 @@ fn assert_atomic_multi_child_delete_replace(fixture: &SingleCommitFixture) {
     true,
     &mut judge,
   );
-  assert_eq!(outcomes[0], refused(ATOMIC_FAILURE, None));
-  assert_declined_reason(&outcomes[1], FAILED_TO_UPDATE);
-  assert!(judge.appended.is_empty());
+  assert_declined_reason(&partial[1], FAILED_TO_UPDATE);
+  assert_eq!(
+    (&partial[0], judge.appended.is_empty()),
+    (&refused(ATOMIC_FAILURE, None), true)
+  );
 
-  let outcomes = fixture.push(
+  let full_atomic = fixture.push(
     &[
       (id, zero(), b"refs/heads/topic/a"),
       (id, zero(), b"refs/heads/topic/b"),
@@ -588,11 +735,44 @@ fn assert_atomic_multi_child_delete_replace(fixture: &SingleCommitFixture) {
     true,
     &mut judge,
   );
-  assert_eq!(outcomes, vec![Outcome::Ok(Vec::new()); 3]);
-  assert!(judge.existing.contains(b"refs/heads/topic".as_slice()));
+  assert_declined_reason(&full_atomic[2], FAILED_TO_UPDATE);
+  assert_eq!(
+    (
+      &full_atomic[0],
+      &full_atomic[1],
+      judge.appended.is_empty(),
+      judge.existing.contains(b"refs/heads/topic/a".as_slice()),
+      judge.existing.contains(b"refs/heads/topic/b".as_slice()),
+    ),
+    (
+      &refused(ATOMIC_FAILURE, None),
+      &refused(ATOMIC_FAILURE, None),
+      true,
+      true,
+      true
+    )
+  );
+
+  let full_non_atomic = fixture.push(
+    &[
+      (id, zero(), b"refs/heads/topic/a"),
+      (id, zero(), b"refs/heads/topic/b"),
+      (zero(), id, b"refs/heads/topic"),
+    ],
+    false,
+    &mut judge,
+  );
+  assert_eq!(
+    (
+      full_non_atomic,
+      judge.existing.contains(b"refs/heads/topic".as_slice())
+    ),
+    (vec![Outcome::Ok(Vec::new()); 3], true)
+  );
 }
 
-/// Verifies non-atomic cross-push conflicts, clean delete-then-create, and declined-delete blocking.
+/// Verifies non-atomic cross-push conflicts, clean delete-then-create in both directions, and
+/// declined-delete blocking.
 fn assert_non_atomic_cross_push_df_and_replace(fixture: &SingleCommitFixture) {
   let id = fixture.commit_id;
   let mut judge = ExistingRefsJudge::with_existing(&[b"refs/heads/topic"]);
@@ -608,15 +788,24 @@ fn assert_non_atomic_cross_push_df_and_replace(fixture: &SingleCommitFixture) {
   assert_declined_reason(&outcomes[1], FAILED_TO_UPDATE);
 
   let mut judge = ExistingRefsJudge::with_existing(&[b"refs/heads/topic"]);
-  let outcomes = fixture.push(
+  let to_desc = fixture.push(
     &[
       (id, zero(), b"refs/heads/topic"),
-      (zero(), id, b"refs/heads/topic/docs"),
+      (zero(), id, b"refs/heads/topic/docs/deep"),
     ],
     false,
     &mut judge,
   );
-  assert_eq!(outcomes, vec![Outcome::Ok(Vec::new()); 2]);
+  assert_eq!(to_desc, vec![Outcome::Ok(Vec::new()); 2]);
+  let to_anc = fixture.push(
+    &[
+      (id, zero(), b"refs/heads/topic/docs/deep"),
+      (zero(), id, b"refs/heads/topic"),
+    ],
+    false,
+    &mut judge,
+  );
+  assert_eq!(to_anc, vec![Outcome::Ok(Vec::new()); 2]);
 
   let mut judge = ExistingRefsJudge {
     existing: [b"refs/heads/topic".to_vec()].into_iter().collect(),
@@ -633,6 +822,32 @@ fn assert_non_atomic_cross_push_df_and_replace(fixture: &SingleCommitFixture) {
   );
   assert_eq!(outcomes[0], refused(b"hook declined", None));
   assert_declined_reason(&outcomes[1], FAILED_TO_UPDATE);
+}
+
+/// Verifies a read-denied (`RefConflict::Hidden`) existing ref still refuses D/F creation both
+/// atomically and non-atomically without disclosing the hidden ref name in side-band-2 output.
+fn assert_hidden_ref_conflict_redacts_name(fixture: &SingleCommitFixture) {
+  let id = fixture.commit_id;
+  let hidden_name = b"refs/heads/secret/child";
+  for atomic in [false, true] {
+    let mut judge = ExistingRefsJudge::with_existing(&[hidden_name]);
+    judge.hidden.insert(hidden_name.to_vec());
+    let outcomes = fixture.push(&[(zero(), id, b"refs/heads/secret")], atomic, &mut judge);
+    assert_declined_with_message(
+      &outcomes[0],
+      FAILED_TO_UPDATE,
+      "cannot update ref 'refs/heads/secret': refname conflict",
+    );
+    let Outcome::Ng(declined) = &outcomes[0] else {
+      panic!("expected refusal");
+    };
+    let text = String::from_utf8_lossy(declined.message.as_deref().unwrap_or_default());
+    assert!(
+      !text.contains("secret/child") && !text.contains("exists; cannot create"),
+      "hidden ref name leaked in band-2 message: {text:?}"
+    );
+    assert!(judge.appended.is_empty());
+  }
 }
 
 /// Verifies `funny refname` (`refs/heads/topic/`) is reported ahead of D/F conflict checks.
@@ -679,5 +894,6 @@ fn cross_push_df_ref_namespace_conflicts_and_delete_replace() {
   assert_atomic_single_delete_replace(&fixture);
   assert_atomic_multi_child_delete_replace(&fixture);
   assert_non_atomic_cross_push_df_and_replace(&fixture);
+  assert_hidden_ref_conflict_redacts_name(&fixture);
   assert_funny_refname_precedes_df_conflict(&fixture);
 }

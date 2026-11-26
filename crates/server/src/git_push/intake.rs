@@ -33,13 +33,21 @@ use crate::vcs_store::{GitPush, GitRefused};
 /// 8-byte little-endian byte offset within that pack.
 const AWAY_TOKEN_INPUT_BYTES: usize = IDENTITY_BYTES + core::mem::size_of::<u64>();
 
-/// Hashes `waited`'s pack identity and byte offset into a `u64` progress token for `away()`
-/// callers (`unpack::Reader`, `receive::Checking`, `receive::Verdicts`).
+/// Clears any prior let-go pack window noted on `repository` before a new read or turn so a
+/// non-away miss cannot inherit an earlier read's window and so `note_waited` records only the
+/// current read's own miss.
+pub(super) fn clear_waiting(repository: &GitRepository) {
+  let _cleared = repository.waiting();
+}
+
+/// Hashes `waited`'s pack identity and byte offset into a 64-bit BLAKE3 prefix used as a progress
+/// token by `away()` callers (`unpack::Reader`, `receive::Checking`, `receive::Verdicts`).
 ///
-/// Distinct let-go packs placing objects at the exact same byte offset yield distinct tokens so
-/// multi-pack `REF_DELTA`, connectivity-walk, and tag-peel chains advance across bring-back turns,
-/// while an unchanged `(pack, offset)` after a failed bring-back yields the identical token so
-/// every progress guard still terminates cleanly.
+/// Using a 64-bit BLAKE3 prefix provides birthday-bound collision resistance across distinct
+/// `(pack, offset)` pairs (probabilistic rather than mathematically injective) so multi-pack
+/// `REF_DELTA`, connectivity-walk, and tag-peel chains advance across bring-back turns even when
+/// different packs place objects at the same byte offset, while an unchanged `(pack, offset)`
+/// after a failed bring-back yields the identical token so every progress guard still terminates.
 fn away_token(waited: Waited) -> u64 {
   let mut input = [0_u8; AWAY_TOKEN_INPUT_BYTES];
   if let Some((pack_slot, offset_slot)) = input.split_at_mut_checked(IDENTITY_BYTES) {
@@ -84,6 +92,10 @@ impl Repository for TrackedIndexed<'_> {
     self.indexed.holds(id)
   }
 
+  fn kind(&self, id: &ObjectId) -> Option<Kind> {
+    self.indexed.kind(id)
+  }
+
   fn away(&self) -> Option<u64> {
     let _ = Repository::away(&self.indexed)?;
     self.repository.peek_waiting().map(away_token)
@@ -102,14 +114,16 @@ pub(super) struct Intake<'s> {
 
 impl Repository for Intake<'_> {
   fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
-    // Clear any stale `waiting` left by a prior skipped delta in the same turn so a non-away miss
-    // never inherits an earlier read's window and so `note_waited` records this read's own.
-    let _ = self.quarantined.repository.waiting();
+    clear_waiting(self.quarantined.repository);
     self.indexed.object(id)
   }
 
   fn holds(&self, id: &ObjectId) -> bool {
     self.indexed.holds(id)
+  }
+
+  fn kind(&self, id: &ObjectId) -> Option<Kind> {
+    self.indexed.kind(id)
   }
 
   fn away(&self) -> Option<u64> {
@@ -119,7 +133,7 @@ impl Repository for Intake<'_> {
 
 impl Contents for Intake<'_> {
   fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
-    let _ = self.quarantined.repository.waiting();
+    clear_waiting(self.quarantined.repository);
     if let Some((object, _)) = self.queue.get(&at) {
       return (object.id == *id).then_some(Cow::Borrowed(object.content.as_slice()));
     }
@@ -160,7 +174,7 @@ pub(crate) struct Quarantined<'s> {
 
 impl Contents for Quarantined<'_> {
   fn content(&self, _at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
-    let _ = self.repository.waiting();
+    clear_waiting(self.repository);
     // The push's object is read where it is: in the store, lent with no copy where it is one window there (A-727 a1), or
     // where it lies in the push's pack (`Push::pack_bytes`, main's ruling B part 2, covering objects passed over by the
     // quarantine because the repository already indexed them so in-RAM pack/recent reads never hit let-go seed windows),

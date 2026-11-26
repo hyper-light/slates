@@ -195,14 +195,27 @@ pub trait Judge {
     accepted: Vec<(&Command, Self::Accepted)>,
   ) -> Result<Vec<Vec<Reported>>, Declined>;
 
-  /// Returns an existing repository ref name that has a files-backend directory/file namespace
+  /// Returns an existing repository ref that has a files-backend directory/file namespace
   /// conflict with `name` (per [`refs_conflict`]) and is not among `deleted`, if any.
   ///
   /// Receive-pack always checks intra-batch D/F conflicts itself; implementors holding a
-  /// repository's existing ref namespace override this to enforce cross-push D/F conflicts.
-  fn ref_conflict(&self, _name: &[u8], _deleted: &[&[u8]]) -> Option<Vec<u8>> {
+  /// repository's existing ref namespace override this to enforce cross-push D/F conflicts while
+  /// tagging read-denied refs as [`RefConflict::Hidden`] so hidden ref names are never disclosed.
+  fn ref_conflict(&self, _name: &[u8], _deleted: &[&[u8]]) -> Option<RefConflict> {
     None
   }
+}
+
+/// An existing repository ref that has a files-backend directory/file namespace conflict with a
+/// pushed ref ([`Judge::ref_conflict`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefConflict {
+  /// The conflicting existing ref is readable by the pushing principal and may be named in Git's
+  /// side-band-2 diagnostic (`'<existing>' exists; cannot create '<name>'`).
+  Visible(Vec<u8>),
+  /// The conflicting existing ref is hidden from the pushing principal (read-denied by policy);
+  /// the conflict is still refused without disclosing the hidden ref's name.
+  Hidden,
 }
 
 /// A command the judge refused.
@@ -908,10 +921,6 @@ impl<A> Deciding<A> {
     } else {
       let mut placed = charged_vec(count, admission)?;
       placed.extend((0..count).map(|_| None));
-      // The ranking's table, each command's rank and index, charged now so its step allocates nothing uncharged.
-      admission
-        .charge_items::<(u64, usize)>(count)
-        .map_err(Refusal::PastAdmission)?;
       let applied_refs = charged_vec(count, admission)?;
       let applied_deleted = charged_vec(count, admission)?;
       (Vec::new(), placed, applied_refs, applied_deleted)
@@ -987,6 +996,32 @@ impl<A> Deciding<A> {
   }
 }
 
+/// Initializes the non-atomic command order on the first step and returns the next command index.
+fn next_non_atomic_command<A, J: Judge<Accepted = A> + ?Sized>(
+  deciding: &mut Deciding<A>,
+  pushed: &Pushed<'_>,
+  judge: &mut J,
+  admission: &mut Admission,
+) -> Result<Option<usize>, Refusal> {
+  if deciding.order.is_none() {
+    let order = ranked(
+      &deciding.request.commands,
+      &deciding.early,
+      pushed,
+      judge,
+      admission,
+    )?;
+    deciding.order = Some(order);
+  }
+  Ok(
+    deciding
+      .order
+      .as_ref()
+      .and_then(|order| order.get(deciding.at))
+      .copied(),
+  )
+}
+
 /// One step of a push without `atomic`: the next command no check refused judged and, accepted,
 /// appended on its own, so one ref's refusal holds no other (git's `execute_commands_non_atomic`;
 /// A-642).
@@ -996,10 +1031,7 @@ fn each_step<A, J: Judge<Accepted = A> + ?Sized>(
   judge: &mut J,
   admission: &mut Admission,
 ) -> Result<(), Refusal> {
-  let order = deciding
-    .order
-    .get_or_insert_with(|| ranked(&deciding.request.commands, pushed, judge));
-  let Some(&at) = order.get(deciding.at) else {
+  let Some(at) = next_non_atomic_command(deciding, pushed, judge, admission)? else {
     deciding.done = true;
     return Ok(());
   };
@@ -1021,7 +1053,7 @@ fn each_step<A, J: Judge<Accepted = A> + ?Sized>(
   let early = deciding.early.get_mut(at).and_then(Option::take);
   let outcome = match (early, conflict) {
     (Some(refusal), _) => refusal,
-    (None, Some(existing)) => Outcome::Ng(df_declined(&command.name, &existing)),
+    (None, Some(conflict)) => Outcome::Ng(df_declined(&command.name, &conflict)),
     (None, None) => apply_non_atomic(command, pushed, judge),
   };
   finish_non_atomic(deciding, at, outcome);
@@ -1056,20 +1088,95 @@ fn apply_non_atomic<A, J: Judge<Accepted = A> + ?Sized>(
   }
 }
 
-/// The indices of `commands` in the order a push without `atomic` decides them (A-850, [`Judge::rank`]): by rank, lowest
-/// first, ties in the order sent. Its table was charged with the decision's ([`Deciding::new`]).
+/// Finds a descendant ref (`<name>/...`) present in `sorted` (sorted by name) via binary search.
+fn descendant_in_sorted<'a>(
+  name: &[u8],
+  sorted: &[(&'a [u8], usize)],
+) -> Option<(&'a [u8], usize)> {
+  let pos = sorted.partition_point(|&(entry, _)| cmp_with_slash(entry, name).is_lt());
+  sorted
+    .get(pos)
+    .copied()
+    .filter(|&(candidate, _)| is_dir_prefix(name, candidate))
+}
+
+/// Collects valid-named unrefused non-delete commands sorted by ref name.
+fn active_non_deletes<'a>(
+  commands: &'a [Command],
+  early: &[Option<Outcome>],
+  admission: &mut Admission,
+) -> Result<Vec<(&'a [u8], usize)>, Refusal> {
+  let mut active = charged_vec::<(&[u8], usize)>(commands.len(), admission)?;
+  active.extend(
+    commands
+      .iter()
+      .enumerate()
+      .filter(|&(at, cmd)| {
+        early.get(at).is_none_or(Option::is_none)
+          && !cmd.is_delete()
+          && request::refname_ok(&cmd.name, false)
+      })
+      .map(|(at, cmd)| (cmd.name.as_slice(), at)),
+  );
+  active.sort_unstable();
+  Ok(active)
+}
+
+/// Marks valid-named unrefused create commands that participate in an intra-batch D/F conflict
+/// against another active non-delete command in `commands`.
+fn df_conflicting_creates(
+  commands: &[Command],
+  early: &[Option<Outcome>],
+  admission: &mut Admission,
+) -> Result<Vec<bool>, Refusal> {
+  if commands.len() <= 1 {
+    return Ok(Vec::new());
+  }
+  let active = active_non_deletes(commands, early, admission)?;
+  let mut marked = charged_vec::<bool>(commands.len(), admission)?;
+  marked.resize(commands.len(), false);
+  for &(name, at) in &active {
+    let collides = commands.get(at).is_some_and(Command::is_create)
+      && (ancestor_in_sorted(name, &active).is_some()
+        || descendant_in_sorted(name, &active).is_some());
+    if collides && let Some(slot) = marked.get_mut(at) {
+      *slot = true;
+    }
+  }
+  Ok(marked)
+}
+
+/// The indices of `commands` in the order a push without `atomic` decides them (A-850,
+/// [`Judge::rank`]): non-conflicting commands, deletes, and existing-ref updates run first by
+/// rank (ties in wire order), followed by intra-batch D/F-conflicting creates ordered deepest /
+/// lexicographically greatest first (`Reverse(name)`), so existing-ref updates beat conflicting
+/// creates and descendant creates beat ancestor creates (matching stock Git 2.56.1 non-atomic
+/// batched ref transactions) without altering A-850 ordering on non-conflicting pushes.
 fn ranked<J: Judge + ?Sized>(
   commands: &[Command],
+  early: &[Option<Outcome>],
   pushed: &Pushed<'_>,
   judge: &mut J,
-) -> Vec<usize> {
-  let mut ranks: Vec<(u64, usize)> = commands
-    .iter()
-    .enumerate()
-    .map(|(at, command)| (judge.rank(command, pushed), at))
-    .collect();
-  ranks.sort_unstable();
-  ranks.into_iter().map(|(_, at)| at).collect()
+  admission: &mut Admission,
+) -> Result<Vec<usize>, Refusal> {
+  let marked = df_conflicting_creates(commands, early, admission)?;
+  let deferred_count = marked.iter().filter(|&&flag| flag).count();
+  let regular_count = commands.len().saturating_sub(deferred_count);
+  let mut regular = charged_vec::<(u64, usize)>(regular_count, admission)?;
+  let mut deferred = charged_vec::<(core::cmp::Reverse<&[u8]>, usize)>(deferred_count, admission)?;
+  for (at, command) in commands.iter().enumerate() {
+    if marked.get(at).copied().unwrap_or(false) {
+      deferred.push((core::cmp::Reverse(command.name.as_slice()), at));
+    } else {
+      regular.push((judge.rank(command, pushed), at));
+    }
+  }
+  regular.sort_unstable();
+  deferred.sort_unstable();
+  let mut order = charged_vec::<usize>(commands.len(), admission)?;
+  order.extend(regular.into_iter().map(|(_, at)| at));
+  order.extend(deferred.into_iter().map(|(_, at)| at));
+  Ok(order)
 }
 
 /// Records an atomic push failure with `declined` at index `failed_at` and [`ATOMIC_FAILURE`] on
@@ -1142,14 +1249,14 @@ fn check_atomic_df<A, J: Judge<Accepted = A> + ?Sized>(
   judge: &J,
   admission: &mut Admission,
 ) -> Result<bool, Refusal> {
-  let Some((bad_at, existing)) = atomic_df_conflict(&deciding.request.commands, judge, admission)?
+  let Some((bad_at, conflict)) = atomic_df_conflict(&deciding.request.commands, judge, admission)?
   else {
     return Ok(false);
   };
   let Some(bad_cmd) = deciding.request.commands.get(bad_at) else {
     return Ok(false);
   };
-  let declined = df_declined(&bad_cmd.name, &existing);
+  let declined = df_declined(&bad_cmd.name, &conflict);
   fail_atomic_at(
     &mut deciding.outcomes,
     deciding.request.commands.len(),
@@ -1296,51 +1403,25 @@ fn intra_batch_df_conflict(
   Ok(best)
 }
 
-/// Returns the names of valid-named delete commands in `commands` whose ref is not also created or
-/// updated in the same batch.
-fn atomic_deleted_refs<'a>(
-  commands: &'a [Command],
-  admission: &mut Admission,
-) -> Result<Vec<&'a [u8]>, Refusal> {
-  let mut non_deleted = charged_vec::<&[u8]>(commands.len(), admission)?;
-  non_deleted.extend(
-    commands
-      .iter()
-      .filter(|cmd| !cmd.is_delete() && request::refname_ok(&cmd.name, false))
-      .map(|cmd| cmd.name.as_slice()),
-  );
-  non_deleted.sort_unstable();
-  let mut deleted = charged_vec::<&[u8]>(commands.len(), admission)?;
-  deleted.extend(
-    commands
-      .iter()
-      .filter(|cmd| {
-        cmd.is_delete()
-          && request::refname_ok(&cmd.name, true)
-          && non_deleted.binary_search(&cmd.name.as_slice()).is_err()
-      })
-      .map(|cmd| cmd.name.as_slice()),
-  );
-  Ok(deleted)
-}
-
-/// Checks an atomic batch's proposed post-batch ref set (existing refs minus deleted refs plus
-/// created/updated refs) for D/F conflicts.
+/// Checks an atomic batch for intra-batch and existing-ref D/F conflicts.
+///
+/// Matches stock Git 2.56.1 (`files-loose`, `files-packed`, and `reftable`): an atomic
+/// transaction rejects creating a ref that D/F-conflicts with an existing ref even when the
+/// conflicting ref is also deleted in the same batch, preserving the original ref.
 fn atomic_df_conflict<J: Judge + ?Sized>(
   commands: &[Command],
   judge: &J,
   admission: &mut Admission,
-) -> Result<Option<(usize, Vec<u8>)>, Refusal> {
-  if let Some(conflict) = intra_batch_df_conflict(commands, admission)? {
-    return Ok(Some(conflict));
+) -> Result<Option<(usize, RefConflict)>, Refusal> {
+  if let Some((at, existing)) = intra_batch_df_conflict(commands, admission)? {
+    return Ok(Some((at, RefConflict::Visible(existing))));
   }
-  let deleted = atomic_deleted_refs(commands, admission)?;
   for (at, command) in commands.iter().enumerate() {
     if !command.is_delete()
       && request::refname_ok(&command.name, false)
-      && let Some(existing) = judge.ref_conflict(&command.name, &deleted)
+      && let Some(conflict) = judge.ref_conflict(&command.name, &[])
     {
-      return Ok(Some((at, existing)));
+      return Ok(Some((at, conflict)));
     }
   }
   Ok(None)
@@ -1383,7 +1464,7 @@ fn non_atomic_df_conflict<A, J: Judge + ?Sized>(
   command: &Command,
   judge: &J,
   admission: &mut Admission,
-) -> Result<Option<Vec<u8>>, Refusal> {
+) -> Result<Option<RefConflict>, Refusal> {
   if command.is_delete() || !request::refname_ok(&command.name, false) {
     return Ok(None);
   }
@@ -1392,7 +1473,7 @@ fn non_atomic_df_conflict<A, J: Judge + ?Sized>(
     &deciding.applied_refs,
     &command.name,
   ) {
-    return Ok(Some(existing));
+    return Ok(Some(RefConflict::Visible(existing)));
   }
   if deciding.applied_deleted.is_empty() {
     return Ok(judge.ref_conflict(&command.name, &[]));
@@ -1464,18 +1545,22 @@ fn non_commit_branch(command: &Command) -> Declined {
 }
 
 /// Refusal for a files-backend ref directory/file namespace conflict, matching stock Git's
-/// `refs.c` (`verify_refname_available`) wording.
-fn df_declined(name: &[u8], existing: &[u8]) -> Declined {
-  let line = [
-    b"cannot update ref '",
-    name,
-    b"': '",
-    existing,
-    b"' exists; cannot create '",
-    name,
-    b"'",
-  ]
-  .concat();
+/// `refs.c` (`verify_refname_available`) wording when the conflicting ref is readable, and
+/// emitting a generic conflict line without disclosing the existing ref name when it is hidden.
+fn df_declined(name: &[u8], conflict: &RefConflict) -> Declined {
+  let line = match conflict {
+    RefConflict::Visible(existing) => [
+      b"cannot update ref '",
+      name,
+      b"': '",
+      existing.as_slice(),
+      b"' exists; cannot create '",
+      name,
+      b"'",
+    ]
+    .concat(),
+    RefConflict::Hidden => [b"cannot update ref '", name, b"': refname conflict"].concat(),
+  };
   Declined {
     reason: FAILED_TO_UPDATE.to_vec(),
     hook: Vec::new(),

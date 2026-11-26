@@ -203,6 +203,11 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     }
   }
 
+  /// The hidden-ref policy the session started under.
+  pub fn hidden(&self) -> &H {
+    &self.hidden
+  }
+
   /// Writes the advertisement of `refs` (in git's order, by name) a pusher may see: every one
   /// `hidden` does not hide.
   pub fn advertise(&self, refs: &[(ObjectId, &[u8])], out: &mut impl Out) -> Result<(), Refusal> {
@@ -827,6 +832,10 @@ impl<S: Repository + ?Sized> Repository for Fscking<'_, S> {
 
   fn holds(&self, id: &ObjectId) -> bool {
     self.site.holds(id)
+  }
+
+  fn kind(&self, id: &ObjectId) -> Option<crate::object_name::Kind> {
+    self.site.kind(id)
   }
 
   fn away(&self) -> Option<u64> {

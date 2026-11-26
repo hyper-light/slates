@@ -4251,6 +4251,32 @@ fn t_rt_git_storm_typed_unpack_refusal_is_emitted_on_sideband_two_preserving_sta
 // ---------------------------------------------------------------------------------------------------------------------
 // Red-team regression (`rt-git-df`): cross-push ref D/F namespace conflict enforcement.
 
+/// Asserts `received` refused its single command with `FAILED_TO_UPDATE` and a generic band-2
+/// conflict message naming `target` (`refname conflict`) while never disclosing `hidden` anywhere
+/// in the refusal reason or band-2 sideband output.
+fn assert_hidden_df_refused(received: &Received, target: &[u8], hidden: &[u8]) {
+  assert_eq!(reasons(received), [FAILED_TO_UPDATE]);
+  assert_first_line_names(received, target);
+  assert_first_line_names(received, b"refname conflict");
+  let mut sideband = Vec::new();
+  slates_git::receive::write_report(received, &mut sideband).unwrap();
+  assert!(
+    !sideband
+      .windows(hidden.len())
+      .any(|window| window == hidden),
+    "hidden ref {:?} leaked in push report: {:?}",
+    String::from_utf8_lossy(hidden),
+    String::from_utf8_lossy(&sideband),
+  );
+  assert!(
+    !sideband
+      .windows(b"exists; cannot create".len())
+      .any(|window| window == b"exists; cannot create"),
+    "hidden ref conflict used visible wording: {:?}",
+    String::from_utf8_lossy(&sideband),
+  );
+}
+
 /// Asserts `received` refused its single command with `FAILED_TO_UPDATE` and a Git D/F band-2
 /// message naming `existing` (`exists; cannot create`).
 fn assert_df_refused(received: &Received, existing: &[u8]) {
@@ -4375,19 +4401,10 @@ fn t_rt_git_df_cross_push_descendant_blocks_ancestor_push() {
   });
 }
 
-/// Asserts `(bound("topic"), bound("topic/docs"))` matches `expected`.
-fn assert_topic_bounds(state: &ShardState, repository: RepositoryId, expected: (bool, bool)) {
-  assert_eq!(
-    (
-      bound(state, repository, "topic"),
-      bound(state, repository, "topic/docs")
-    ),
-    expected
-  );
-}
-
-/// Red-team regression (`rt-git-df`, §4.17.2): same-batch delete of a conflicting ref paired with
-/// creating its D/F counterpart succeeds in both directions under `--atomic` and without it.
+/// Red-team regression (`rt-git-df`, §4.17.2): same-batch delete+create D/F replacement is
+/// refused under `--atomic` (preserving the original ref, matching stock Git 2.56.1 across
+/// `files-loose`, `files-packed`, and `reftable`) and succeeds without `--atomic` in both
+/// directions.
 #[test]
 fn t_rt_git_df_same_batch_delete_and_replace_succeeds() {
   crate::test_store::audit_on_stored_shard("git-push-df", |state| {
@@ -4400,18 +4417,46 @@ fn t_rt_git_df_same_batch_delete_and_replace_succeeds() {
     );
     let to_desc = [
       (SECOND, "", b"refs/heads/topic".as_slice()),
-      ("", SECOND, b"refs/heads/topic/docs".as_slice()),
+      ("", SECOND, b"refs/heads/topic/docs/deep".as_slice()),
     ];
-    push_empty_ok(state, repository, &to_desc, ATOMIC);
-    assert_topic_bounds(state, repository, (false, true));
+    let atomic_desc = pushed(state, repository, &request(&to_desc, ATOMIC, empty_pack()));
+    assert_atomic_df_refused(&atomic_desc, b"refs/heads/topic");
+    assert_eq!(
+      (
+        bound(state, repository, "topic"),
+        bound(state, repository, "topic/docs/deep")
+      ),
+      (true, false)
+    );
+    push_empty_ok(state, repository, &to_desc, CAPABILITIES);
+    assert_eq!(
+      (
+        bound(state, repository, "topic"),
+        bound(state, repository, "topic/docs/deep")
+      ),
+      (false, true)
+    );
     let to_anc = [
-      (SECOND, "", b"refs/heads/topic/docs".as_slice()),
+      (SECOND, "", b"refs/heads/topic/docs/deep".as_slice()),
       ("", SECOND, b"refs/heads/topic".as_slice()),
     ];
-    push_empty_ok(state, repository, &to_anc, ATOMIC);
-    assert_topic_bounds(state, repository, (true, false));
-    push_empty_ok(state, repository, &to_desc, CAPABILITIES);
-    assert_topic_bounds(state, repository, (false, true));
+    let atomic_anc = pushed(state, repository, &request(&to_anc, ATOMIC, empty_pack()));
+    assert_atomic_df_refused(&atomic_anc, b"refs/heads/topic/docs/deep");
+    assert_eq!(
+      (
+        bound(state, repository, "topic"),
+        bound(state, repository, "topic/docs/deep")
+      ),
+      (false, true)
+    );
+    push_empty_ok(state, repository, &to_anc, CAPABILITIES);
+    assert_eq!(
+      (
+        bound(state, repository, "topic"),
+        bound(state, repository, "topic/docs/deep")
+      ),
+      (true, false)
+    );
   });
 }
 
@@ -4448,7 +4493,8 @@ fn assert_tag_df_conflicts(state: &mut ShardState, repository: RepositoryId) {
 }
 
 /// Verifies that a policy-hidden descendant ref (`refs/heads/secret/child`) still blocks D/F
-/// parent creation (`refs/heads/secret`), while creating `refs/heads/refs` succeeds alongside
+/// parent creation (`refs/heads/secret`) without disclosing `refs/heads/secret/child` in the
+/// refusal or sideband-2 output, while creating `refs/heads/refs` succeeds alongside
 /// `refs/tags/rel` (no false positive on `"refs/"`).
 fn assert_hidden_and_refs_branch_df(state: &mut ShardState, repository: RepositoryId) {
   let secret_parent = pushed(
@@ -4460,7 +4506,11 @@ fn assert_hidden_and_refs_branch_df(state: &mut ShardState, repository: Reposito
       empty_pack(),
     ),
   );
-  assert_df_refused(&secret_parent, b"refs/heads/secret/child");
+  assert_hidden_df_refused(
+    &secret_parent,
+    b"refs/heads/secret",
+    b"refs/heads/secret/child",
+  );
   push_empty_ok(
     state,
     repository,
@@ -4694,7 +4744,10 @@ impl DfRepoFixture {
         slates_git::store::views::IndexedObjects::new(&self.git, &self.content, u64::MAX);
       slates_git::receive::check(req, None, (&indexed, &held), hidden, &mut admission).unwrap()
     };
-    let mut judge = DfFixtureJudge { fixture: self };
+    let mut judge = DfFixtureJudge {
+      fixture: self,
+      hidden,
+    };
     slates_git::receive::decide(checked, Some(&held), &mut judge, &mut admission).unwrap()
   }
 
@@ -4718,18 +4771,26 @@ impl DfRepoFixture {
 }
 
 /// Test `Judge` wiring `super::ref_conflict_in` directly to `DfRepoFixture`.
-struct DfFixtureJudge<'a> {
+struct DfFixtureJudge<'a, H: slates_git::receive::HiddenRefs + ?Sized> {
   fixture: &'a mut DfRepoFixture,
+  hidden: &'a H,
 }
 
-impl slates_git::receive::Judge for DfFixtureJudge<'_> {
+impl<H: slates_git::receive::HiddenRefs + ?Sized> slates_git::receive::Judge
+  for DfFixtureJudge<'_, H>
+{
   type Accepted = ();
 
-  fn ref_conflict(&self, name: &[u8], deleted: &[&[u8]]) -> Option<Vec<u8>> {
+  fn ref_conflict(
+    &self,
+    name: &[u8],
+    deleted: &[&[u8]],
+  ) -> Option<slates_git::receive::RefConflict> {
     super::ref_conflict_in(
       &self.fixture.repositories,
       (&self.fixture.content, &self.fixture.git),
       self.fixture.repo_id,
+      self.hidden,
       name,
       deleted,
     )
@@ -4817,7 +4878,7 @@ fn t_rt_git_df_in_memory_cross_push_descendant_blocks_ancestor_and_partial_delet
     ],
     ATOMIC,
   );
-  assert_atomic_df_refused(&partial, b"refs/heads/topic/notes");
+  assert_atomic_df_refused(&partial, b"refs/heads/topic/docs");
   assert_eq!(
     (
       fixture.has_branch("topic"),
@@ -4826,57 +4887,102 @@ fn t_rt_git_df_in_memory_cross_push_descendant_blocks_ancestor_and_partial_delet
     ),
     (false, true, true)
   );
+  let non_atomic_partial = fixture.receive_push(
+    &[
+      (&hex, "", b"refs/heads/topic/docs"),
+      ("", &hex, b"refs/heads/topic"),
+    ],
+    CAPABILITIES,
+  );
+  assert_eq!(
+    reasons(&non_atomic_partial),
+    [b"ok".as_slice(), FAILED_TO_UPDATE]
+  );
+  assert_first_line_names(&non_atomic_partial, b"refs/heads/topic/notes");
+  assert_eq!(
+    (
+      fixture.has_branch("topic"),
+      fixture.has_branch("topic/docs"),
+      fixture.has_branch("topic/notes")
+    ),
+    (false, false, true)
+  );
 }
 
-/// Red-team regression (`rt-git-df`, in-memory): same-batch delete-and-replace succeeds in both
-/// directions under `--atomic` and without it.
+/// Red-team regression (`rt-git-df`, in-memory): same-batch delete+create D/F replacement is
+/// refused under `--atomic` (preserving the original ref, matching stock Git 2.56.1) and succeeds
+/// without `--atomic` in both directions.
 #[test]
 fn t_rt_git_df_in_memory_same_batch_delete_and_replace_succeeds() {
   let mut fixture = DfRepoFixture::new();
   let hex = fixture.commit_hex.clone();
   fixture.add_live_ref(b"refs/heads/topic");
-  let to_desc = fixture.receive_push(
+  let atomic_desc = fixture.receive_push(
     &[
       (&hex, "", b"refs/heads/topic"),
-      ("", &hex, b"refs/heads/topic/docs"),
+      ("", &hex, b"refs/heads/topic/docs/deep"),
     ],
     ATOMIC,
   );
-  let to_anc = fixture.receive_push(
+  assert_atomic_df_refused(&atomic_desc, b"refs/heads/topic");
+  assert_eq!(
+    (
+      fixture.has_branch("topic"),
+      fixture.has_branch("topic/docs/deep")
+    ),
+    (true, false)
+  );
+  let non_atomic_desc = fixture.receive_push(
     &[
-      (&hex, "", b"refs/heads/topic/docs"),
+      (&hex, "", b"refs/heads/topic"),
+      ("", &hex, b"refs/heads/topic/docs/deep"),
+    ],
+    CAPABILITIES,
+  );
+  assert_eq!(reasons(&non_atomic_desc), vec![b"ok".to_vec(); 2]);
+  assert_eq!(
+    (
+      fixture.has_branch("topic"),
+      fixture.has_branch("topic/docs/deep")
+    ),
+    (false, true)
+  );
+  let atomic_anc = fixture.receive_push(
+    &[
+      (&hex, "", b"refs/heads/topic/docs/deep"),
       ("", &hex, b"refs/heads/topic"),
     ],
     ATOMIC,
   );
-  let non_atomic = fixture.receive_push(
+  assert_atomic_df_refused(&atomic_anc, b"refs/heads/topic/docs/deep");
+  assert_eq!(
+    (
+      fixture.has_branch("topic"),
+      fixture.has_branch("topic/docs/deep")
+    ),
+    (false, true)
+  );
+  let non_atomic_anc = fixture.receive_push(
     &[
-      (&hex, "", b"refs/heads/topic"),
-      ("", &hex, b"refs/heads/topic/docs"),
+      (&hex, "", b"refs/heads/topic/docs/deep"),
+      ("", &hex, b"refs/heads/topic"),
     ],
     CAPABILITIES,
   );
+  assert_eq!(reasons(&non_atomic_anc), vec![b"ok".to_vec(); 2]);
   assert_eq!(
     (
-      reasons(&to_desc),
-      reasons(&to_anc),
-      reasons(&non_atomic),
       fixture.has_branch("topic"),
-      fixture.has_branch("topic/docs"),
+      fixture.has_branch("topic/docs/deep")
     ),
-    (
-      vec![b"ok".to_vec(), b"ok".to_vec()],
-      vec![b"ok".to_vec(), b"ok".to_vec()],
-      vec![b"ok".to_vec(), b"ok".to_vec()],
-      false,
-      true,
-    )
+    (true, false)
   );
 }
 
-/// Red-team regression (`rt-git-df`, in-memory): tag D/F conflicts and policy-hidden descendant
-/// refs are refused, while unborn branches (ancestor or descendant), `refs/heads/refs` alongside
-/// `refs/tags/*`, and sibling prefixes (`topic2`) are never falsely refused.
+/// Red-team regression (`rt-git-df`, in-memory): tag D/F conflicts and policy-hidden refs are
+/// refused (with hidden refs never disclosed in sideband-2 output), while unborn branches,
+/// `refs/heads/refs` alongside `refs/tags/*`, and sibling prefixes (`topic2`) are never falsely
+/// refused.
 #[test]
 fn t_rt_git_df_in_memory_tags_unborn_and_refs_branch_boundaries() {
   use slates_git::receive::HiddenRefs as _;
@@ -4902,7 +5008,29 @@ fn t_rt_git_df_in_memory_tags_unborn_and_refs_branch_boundaries() {
   assert_df_refused(&tag_parent, b"refs/tags/deep/1");
   let hidden_parent =
     fixture.receive_push_with_hidden(&[("", &hex, b"refs/heads/secret")], CAPABILITIES, &hidden);
-  assert_df_refused(&hidden_parent, b"refs/heads/secret/child");
+  assert_hidden_df_refused(
+    &hidden_parent,
+    b"refs/heads/secret",
+    b"refs/heads/secret/child",
+  );
+  assert!(!fixture.has_branch("secret"));
+  fixture.add_live_ref(b"refs/heads/vault");
+  let hidden_anc = fixture.hidden_policy("refs/heads/vaul?");
+  assert_eq!(
+    (
+      hidden_anc.is_hidden(b"refs/heads/vault"),
+      hidden_anc.is_hidden(b"refs/heads/vault/leaf")
+    ),
+    (true, false)
+  );
+  let hidden_child =
+    fixture.receive_push_with_hidden(&[("", &hex, b"refs/heads/vault/leaf")], ATOMIC, &hidden_anc);
+  assert_hidden_df_refused(
+    &hidden_child,
+    b"refs/heads/vault/leaf",
+    b"'refs/heads/vault' exists",
+  );
+  assert!(!fixture.has_branch("vault/leaf"));
   let allowed = fixture.receive_push(
     &[
       ("", &hex, b"refs/heads/unborn/child"),
@@ -4913,4 +5041,172 @@ fn t_rt_git_df_in_memory_tags_unborn_and_refs_branch_boundaries() {
     ATOMIC,
   );
   assert_eq!(reasons(&allowed), vec![b"ok".to_vec(); 4]);
+}
+
+/// Red-team regression (`rt-git-df`, in-memory): non-atomic same-batch D/F creates reject the
+/// ancestor (`topic`) and publish the descendant (`topic/docs/deep`) plus `companion` in both
+/// push orders, and 3-level chains (`a`, `a/b`, `a/b/c`) keep only `a/b/c`.
+#[test]
+fn t_rt_git_df_in_memory_non_atomic_same_batch_ordering_and_three_level_chain() {
+  let mut forward = DfRepoFixture::new();
+  let hex = forward.commit_hex.clone();
+  let got = forward.receive_push(
+    &[
+      ("", &hex, b"refs/heads/topic"),
+      ("", &hex, b"refs/heads/topic/docs/deep"),
+      ("", &hex, b"refs/heads/companion"),
+    ],
+    CAPABILITIES,
+  );
+  assert_eq!(
+    reasons(&got),
+    [FAILED_TO_UPDATE, b"ok".as_slice(), b"ok".as_slice()]
+  );
+  assert_eq!(
+    (
+      forward.has_branch("topic"),
+      forward.has_branch("topic/docs/deep"),
+      forward.has_branch("companion"),
+    ),
+    (false, true, true)
+  );
+
+  let mut reversed = DfRepoFixture::new();
+  let hex = reversed.commit_hex.clone();
+  let got = reversed.receive_push(
+    &[
+      ("", &hex, b"refs/heads/topic/docs/deep"),
+      ("", &hex, b"refs/heads/topic"),
+      ("", &hex, b"refs/heads/companion"),
+    ],
+    CAPABILITIES,
+  );
+  assert_eq!(
+    reasons(&got),
+    [b"ok".as_slice(), FAILED_TO_UPDATE, b"ok".as_slice()]
+  );
+  assert_eq!(
+    (
+      reversed.has_branch("topic"),
+      reversed.has_branch("topic/docs/deep"),
+      reversed.has_branch("companion"),
+    ),
+    (false, true, true)
+  );
+
+  let mut chain = DfRepoFixture::new();
+  let hex = chain.commit_hex.clone();
+  let got = chain.receive_push(
+    &[
+      ("", &hex, b"refs/heads/a"),
+      ("", &hex, b"refs/heads/a/b"),
+      ("", &hex, b"refs/heads/a/b/c"),
+    ],
+    CAPABILITIES,
+  );
+  assert_eq!(
+    reasons(&got),
+    [FAILED_TO_UPDATE, FAILED_TO_UPDATE, b"ok".as_slice()]
+  );
+  assert_eq!(
+    (
+      chain.has_branch("a"),
+      chain.has_branch("a/b"),
+      chain.has_branch("a/b/c"),
+    ),
+    (false, false, true)
+  );
+}
+
+/// Red-team regression (`rt-git-post-codex`, in-memory): `TrackedIndexed::kind` and `Intake::kind`
+/// answer from the object index without inflating or lending full object bytes.
+#[test]
+fn t_rt_git_intake_kind_uses_object_index_without_inflating_bytes() {
+  use slates_git::object_name::Kind;
+  use slates_git::receive::Repository as _;
+  let fixture = DfRepoFixture::new();
+  let tracked = super::intake::TrackedIndexed::new(&fixture.git, &fixture.content, u64::MAX);
+  assert_eq!(tracked.kind(&fixture.commit_id), Some(Kind::Commit));
+  assert_eq!(tracked.kind(&zero()), None);
+  let tracked_counters = tracked.inner().counters();
+  assert_eq!(
+    (tracked_counters.assembled, tracked_counters.lent_as_kept),
+    (0, 0),
+    "TrackedIndexed::kind must read the object index without inflating object bytes"
+  );
+
+  let intake = super::intake::Intake {
+    indexed: slates_git::store::views::IndexedObjects::new(
+      &fixture.git,
+      &fixture.content,
+      u64::MAX,
+    ),
+    quarantined: super::intake::Quarantined {
+      push: None,
+      store: &fixture.content,
+      repository: &fixture.git,
+    },
+    queue: std::collections::BTreeMap::new(),
+  };
+  assert_eq!(intake.kind(&fixture.commit_id), Some(Kind::Commit));
+  assert_eq!(intake.kind(&zero()), None);
+  let intake_counters = intake.indexed.counters();
+  assert_eq!(
+    (intake_counters.assembled, intake_counters.lent_as_kept),
+    (0, 0),
+    "Intake::kind must read the object index without inflating object bytes"
+  );
+}
+
+/// Shape: files in the unborn-default atomic regression test commit.
+const UNBORN_ATOMIC_FILES: usize = 3;
+
+/// Red-team regression (`rt-git-post-claude`, §4.17.2): pushing `--atomic HEAD:refs/heads/main
+/// HEAD:refs/heads/y` while `refs/heads/main` (default branch) is still unborn and
+/// `refs/heads/other` already exists (both materialized and owing) succeeds without
+/// `Unappended::Moved`, and materializing `main` yields the pushed tree intact.
+#[test]
+fn t_rt_git_atomic_unborn_default_branch_with_existing_other_branch() {
+  crate::test_store::audit_on_stored_shard("git-push-unborn-atomic", |state| {
+    let (commit, objects) = flat_commit(UNBORN_ATOMIC_FILES, "unborn-atomic", None);
+    let hex = commit.to_string();
+    let pack = pack_of_objects(&objects);
+    for (repo_name, materialize_other) in [("unborn-mat", true), ("unborn-owing", false)] {
+      let repository = git_repository(state, repo_name);
+      let first = pushed(
+        state,
+        repository,
+        &request(&[("", &hex, b"refs/heads/other")], CAPABILITIES, &pack),
+      );
+      assert_eq!(reasons(&first), [b"ok"]);
+      if materialize_other {
+        let other = state
+          .db
+          .partition()
+          .repositories()
+          .branch(repository, "other")
+          .unwrap();
+        crate::green_ready::made_now(state, other);
+      }
+      let atomic = pushed(
+        state,
+        repository,
+        &request(
+          &[("", &hex, b"refs/heads/main"), ("", &hex, b"refs/heads/y")],
+          ATOMIC,
+          empty_pack(),
+        ),
+      );
+      assert_eq!(reasons(&atomic), [b"ok", b"ok"]);
+      assert_eq!(
+        (
+          bound(state, repository, "main"),
+          bound(state, repository, "y"),
+          files(state, repository, "main").len(),
+          files(state, repository, "y").len(),
+        ),
+        (true, true, UNBORN_ATOMIC_FILES, UNBORN_ATOMIC_FILES)
+      );
+    }
+  });
 }

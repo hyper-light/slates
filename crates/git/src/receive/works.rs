@@ -132,6 +132,13 @@ pub trait Greens {
   ) -> Option<T> {
     None
   }
+
+  /// Whether `name` is the repository's unborn default branch, whose empty green already exists at
+  /// version 0 and must receive a deferred update over an empty base rather than branching from
+  /// another existing branch.
+  fn is_unborn_default(&self, _name: &[u8]) -> bool {
+    false
+  }
 }
 
 /// What a command's verdict carries to its append: one entry for a green's own log (A-642).
@@ -491,7 +498,9 @@ where
 
   /// Reaches the greens a create's verdict reads (`Verdicts::create`): the ref's own, then the one it would be made at.
   fn reach_create(&self, command: &Command, pushed: &Pushed<'_>) {
-    if self.greens.read(&command.name, |_| ()).is_some() {
+    if self.greens.read(&command.name, |_| ()).is_some()
+      || self.greens.is_unborn_default(&command.name)
+    {
       return;
     }
     if self.greens.holding_head(&command.new, |_, _| ()).is_none() {
@@ -513,6 +522,13 @@ where
         DeferredPush::of(&rebased)
       })
     };
+    if self.greens.is_unborn_default(&command.name) {
+      return Ok(Entry::Create {
+        name: command.name.clone(),
+        from: None,
+        push: owed(&Green::new(), None)?,
+      });
+    }
     let at = |read: GreenRead<'_>, version: Version| {
       owed(read.green, Some(version)).map(|push| (Some((read.id, version.number)), push))
     };

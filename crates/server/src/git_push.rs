@@ -565,11 +565,12 @@ impl<P> ReceivePack<P> {
     })
     .unwrap_or(false);
     if still_waiting {
-      let _ =
+      let drained_second =
         crate::vcs_store::upload::brought_back_waited_into(self.repository, &mut self.resident)
           .await;
+      return first || drained_second;
     }
-    true
+    first
   }
 
   /// Whether the client asked its answer multiplexed (`side-band-64k`), once its request is read.
@@ -921,7 +922,7 @@ impl<P> ReceivePack<P> {
             .vcs_stores
             .git_ref(*repository)
             .ok_or(PushFailed::NoStore)?;
-          let _ = git.repository.waiting();
+          intake::clear_waiting(&git.repository);
           let mut site = intake::Intake {
             indexed: IndexedObjects::new(&git.repository, content, admission.left()),
             quarantined: intake::Quarantined {
@@ -977,7 +978,7 @@ impl<P> ReceivePack<P> {
       let Some((content, git)) = state.vcs_stores.git_ref(*repository) else {
         return;
       };
-      let _ = git.repository.waiting();
+      intake::clear_waiting(&git.repository);
       let mut site = intake::Intake {
         indexed: IndexedObjects::new(&git.repository, content, admission.left()),
         quarantined: intake::Quarantined {
@@ -1013,7 +1014,7 @@ impl<P> ReceivePack<P> {
           .vcs_stores
           .git_ref(*repository)
           .ok_or(PushFailed::NoStore)?;
-        let _ = git.repository.waiting();
+        intake::clear_waiting(&git.repository);
         let mut site = intake::Intake {
           indexed: IndexedObjects::new(&git.repository, content, admission.left()),
           quarantined: intake::Quarantined {
@@ -1225,7 +1226,7 @@ impl<P> ReceivePack<P> {
         .vcs_stores
         .git_ref(*repository)
         .ok_or(PushFailed::NoStore)?;
-      let _ = git.repository.waiting();
+      intake::clear_waiting(&git.repository);
       let mut site = intake::Intake {
         indexed: IndexedObjects::new(&git.repository, content, admission.left()),
         quarantined: intake::Quarantined {
@@ -1290,7 +1291,7 @@ impl<P> ReceivePack<P> {
         .vcs_stores
         .git_ref(*repository)
         .ok_or(PushFailed::NoStore)?;
-      let _ = git.repository.waiting();
+      intake::clear_waiting(&git.repository);
       let indexed = intake::TrackedIndexed::new(&git.repository, content, admission.left());
       let quarantined = intake::Quarantined {
         push: quarantine.as_ref().map(GitPush::quarantine),
@@ -1462,6 +1463,7 @@ impl<P> ReceivePack<P> {
         push: sealed,
         record,
         principal: &self.principal,
+        hidden: self.session.hidden(),
         name: *name,
         hooks: verdicts,
         admitting,
@@ -2147,16 +2149,23 @@ fn descendant_ref_conflict(
 
 /// Returns an existing live ref in `repository` that has a files-backend directory/file conflict
 /// with `name` and is not among `deleted`, checking both `'/'`-delimited ancestors and descendants
-/// of `name` across all ref namespaces (including hidden refs).
-fn ref_conflict_in(
+/// of `name` across all ref namespaces (including hidden refs) and redacting any ref hidden by
+/// `hidden` as [`receive::RefConflict::Hidden`].
+fn ref_conflict_in<H: HiddenRefs + ?Sized>(
   repositories: &slates_db::repository::Repositories,
   store: (&ContentStore, &slates_git::store::Repository),
   repository: RepositoryId,
+  hidden: &H,
   name: &[u8],
   deleted: &[&[u8]],
-) -> Option<Vec<u8>> {
-  ancestor_ref_conflict(repositories, store, repository, name, deleted)
-    .or_else(|| descendant_ref_conflict(repositories, store, repository, name, deleted))
+) -> Option<receive::RefConflict> {
+  let existing = ancestor_ref_conflict(repositories, store, repository, name, deleted)
+    .or_else(|| descendant_ref_conflict(repositories, store, repository, name, deleted))?;
+  Some(if hidden.is_hidden(&existing) {
+    receive::RefConflict::Hidden
+  } else {
+    receive::RefConflict::Visible(existing)
+  })
 }
 
 /// The green the ref `name` names in `repository`'s namespace (module docs).
@@ -2684,6 +2693,8 @@ struct ServerJudge<'j> {
   record: &'j RepositoryRecord,
   /// Who pushes.
   principal: &'j Principal,
+  /// The hidden-ref policy the push started under, used to redact read-denied refs in D/F errors.
+  hidden: &'j PolicyHidden,
   /// The push's name.
   name: [u8; 32],
   /// What the push's hooks before the verdicts decided of its commands.
@@ -2780,13 +2791,14 @@ impl Judge for ServerJudge<'_> {
     Ok((0..count).map(|_| Vec::new()).collect())
   }
 
-  fn ref_conflict(&self, name: &[u8], deleted: &[&[u8]]) -> Option<Vec<u8>> {
+  fn ref_conflict(&self, name: &[u8], deleted: &[&[u8]]) -> Option<receive::RefConflict> {
     let (content, git) = self.state.vcs_stores.git_ref(self.record.id)?;
     let repositories = self.state.db.partition().repositories();
     ref_conflict_in(
       repositories,
       (content, &git.repository),
       self.record.id,
+      self.hidden,
       name,
       deleted,
     )
@@ -2899,7 +2911,7 @@ impl ServerJudge<'_> {
       };
       let (content, git) = store;
       let room = state.store.admittable();
-      let _ = git.repository.waiting();
+      intake::clear_waiting(&git.repository);
       let indexed = intake::TrackedIndexed::new(&git.repository, content, room);
       let objects = PushedObjects::new(&git.repository, content, push.quarantine());
       let greens = ShardGreens {
@@ -2964,7 +2976,7 @@ impl ServerJudge<'_> {
       };
       let (content, git) = store;
       let room = state.store.admittable();
-      let _ = git.repository.waiting();
+      intake::clear_waiting(&git.repository);
       let indexed = intake::TrackedIndexed::new(&git.repository, content, room);
       let objects = PushedObjects::new(&git.repository, content, push.quarantine());
       let greens = ShardGreens {
@@ -3305,6 +3317,14 @@ impl works::Greens for ShardGreens<'_, '_> {
   ) -> Option<T> {
     let (green, version) = self.holding(head)?;
     self.lent(green, |read| with(read, version))
+  }
+
+  fn is_unborn_default(&self, name: &[u8]) -> bool {
+    let Some(default) = self.default_green() else {
+      return false;
+    };
+    bound(self.state, self.record.id, name) == Some(default)
+      && empty_default(self.state, self.record) == Some(default)
   }
 }
 
