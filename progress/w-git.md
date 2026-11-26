@@ -858,3 +858,13 @@
   steps). WAITING: main's git/git leg with the four counters → choose the cache's budget rule (breadth × length for
   git's newest-whole order; breadth × depth × length for forward chains). NEXT: SSH seats/client-gone + hook flakes
   (8a family), reap_map reconnect bound, Windows owned_object sibling (reported).
+- 11-25 ~19:00 PST: LANDED at 228d0dc97 (merges 223e31cc7, 228d0dc97): read-cache rule 3f7285b11 ((learned depth+1) ×
+  the most tree bytes one sent commit opened, PositionCache trees_met/trees_most; Recent laid in ≥ 8 chunks,
+  CHUNKS_A_BUDGET; red spread fixture 12 hits/698 deltas → 108/108); reconnect bound b094228b6 (macOS starved client of
+  a daemon stopped in-process parked forever: Unknown stamp → ask holder_lives, a Mach lookup; red hung → typed
+  OsRefused in 0.47 ms); 8a wedge c113d42cd (TestSpawner/Owner drop joined the spawner on the shard; join_off_the_shard;
+  reds 3.07 s / 1.005 s → off); refusing-hook test 419132229 (judged by run end after the hook's exit,
+  Ended::exited_at_ns, AFTER_EXIT_NS one window). A-924 diag 3 recorded. Told main: sealing-unavailable line is typed and
+  expected; the server lib test binary never reserves the key region (main's to place). WAITING: main's interleaved
+  read-cache A/B on git/git; main's next 8a loop. NEXT: the loop's other failures (first-run client-leaves, git_hooks
+  receive-pack points, dav proppatch multistatus, git_push fetch mid-derivation); Windows owned_object (reported).
