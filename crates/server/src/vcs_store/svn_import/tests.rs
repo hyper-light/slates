@@ -1050,7 +1050,7 @@ fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shar
     longest_ns,
     window_ns,
     (tail_slices, staging_steps, apply_steps),
-    (unpins, releases),
+    (unpins, releases, prepares),
   ) = stored(move || async move {
     let (svn, _green) = subversion("wide-revision").await;
     let (loaded, _turns) = imported(svn, dump).await;
@@ -1070,15 +1070,23 @@ fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shar
         crate::repository::svn_commit::staging::LANDING_RELEASE_STEPS,
       )
     });
-    let shard = slates_rt::registry::current_shard().expect("on a shard");
-    let longest_ns = slates_rt::registry::with_entry(shard, |entry| entry.pulse.longest_step_ns())
-      .expect("the shard's entry");
+    let prepares = on(|state| {
+      count(
+        state,
+        crate::repository::svn_commit::staging::LANDING_PREPARE_STEPS,
+      )
+    });
+    let (longest_ns, longest_task) = longest_poll();
+    eprintln!(
+      "wide-add: the longest step {} us ({longest_task})",
+      longest_ns / 1000
+    );
     (
       loaded.map(|loaded| loaded.youngest),
       longest_ns,
       crate::watchdog::own_window_ns(),
       (tail_slices, staging_steps, apply_steps),
-      (unpins, releases),
+      (unpins, releases, prepares),
     )
   });
   assert_eq!(loaded, Ok(1));
@@ -1088,6 +1096,12 @@ fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shar
   assert!(
     releases > 2,
     "its scratch member's release took {releases} step(s)"
+  );
+  // Non-vacuity: its version made ready for the register's op in steps (A-920 6b: its increment's encoding, its hold and
+  // its chain entry's encoding, 3.4, 23.6 and 12.5 ms whole in the entry's one step, debug).
+  assert!(
+    prepares > 2,
+    "its version's making ready took {prepares} step(s)"
   );
   // Non-vacuity: the landing's tail ran in slices, so no loop over its texts ran whole in one step.
   assert!(tail_slices > 2, "the tail took {tail_slices} slice(s)");
@@ -1174,9 +1188,7 @@ fn imported_whole_and_stepped(
         .get(&green)
         .map_or(0, |engine| engine.copies_grafted())
     });
-    let shard = slates_rt::registry::current_shard().expect("on a shard");
-    let longest_ns = slates_rt::registry::with_entry(shard, |entry| entry.pulse.longest_step_ns())
-      .expect("the shard's entry");
+    let (longest_ns, longest_task) = longest_poll();
     (
       loaded
         .map(|loaded| loaded.youngest)
@@ -1184,17 +1196,31 @@ fn imported_whole_and_stepped(
       longest_ns,
       crate::watchdog::own_window_ns(),
       grafted,
+      longest_task,
     )
   });
-  // Every run shows its numbers, so a probe judges each against the 1 ms bar.
+  // Every run shows its numbers, so a probe judges each against the 1 ms bar, and names what held the longest.
   eprintln!(
-    "{name}: youngest {:?}, the longest step {} us of a window of {} us, {} copies grafted",
+    "{name}: youngest {:?}, the longest step {} us of a window of {} us ({}), {} copies grafted",
     read.0,
     read.1 / 1000,
     read.2 / 1000,
+    read.4,
     read.3
   );
-  read
+  (read.0, read.1, read.2, read.3)
+}
+
+/// The calling shard's longest poll and the task it polled (`registry::Pulse::longest_polling`, A-920 6b).
+fn longest_poll() -> (u64, String) {
+  let shard = slates_rt::registry::current_shard().expect("on a shard");
+  slates_rt::registry::with_entry(shard, |entry| {
+    (
+      entry.pulse.longest_step_ns(),
+      entry.pulse.longest_polling().to_string(),
+    )
+  })
+  .expect("the shard's entry")
 }
 
 /// Goal 93 (main's order of 2026-11-26 after probe 8: no fixture copied or moved a wide tree, so the commit's copies

@@ -2285,20 +2285,29 @@ impl ShardContext {
     self.current_task.set(None);
     let done = matches!(poll, Poll::Ready(()));
     let attributed = self.attribute_poll(start, ended);
-    let dropped = self.with_inner(|inner| {
-      after_poll(
+    let elapsed = ended.saturating_sub(start);
+    let polled = self.with_inner(|inner| {
+      let longest = elapsed > inner.counters.longest_step_ns;
+      let dropped = after_poll(
         inner,
         &self.local,
         PollDone {
           slot,
           future,
-          elapsed: ended.saturating_sub(start),
+          elapsed,
           done,
           attributed,
         },
-      )
+      );
+      (longest, dropped)
     });
-    drop(dropped);
+    // A new longest poll names its task beside it on the pulse (A-920 6b): only then, so no poll pays more.
+    if let Some((true, _)) = polled.as_ref()
+      && let Some(entry) = self.entry
+    {
+      entry.pulse.record_longest_polling();
+    }
+    drop(polled);
   }
 }
 

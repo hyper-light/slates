@@ -640,6 +640,15 @@
 > deterministic in `crates/rt/tests/spin_kick.rs` (3 of 3 hung, shard parked), green 3 of 3
 > (`docs/bugs/2026-11-20-a-shards-idle-spin-took-a-clients-kick.md`).
 
+> **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
+> the landing's entry are sliced (A-920 pieces 1-6b). Left: the checkpoint task's begin and its identity fold
+> (`merge_service.rs:359`: `CheckpointHold::begin` builds and encodes the green's checkpoint whole, 428 ms in one poll
+> debug at 9,000 files; `turn_budget_ns` past its deadline gives the fold everything left, 406 ms), the checkpoint's
+> own piece (A-869, A-579). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
+> steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
+> files): `made_commit.rs` (two calls), `vcs_store/svn_made.rs`, `vcs_store/hg_made.rs`, `greens.rs`'s own caller. A
+> probe of a wide made commit on each VCS would name any past the bar.
+
 > **Held (A-928, w-svn, 2026-11-25; goal 93, 84a): a shard's step quantum stays under half the loaded bar.** The
 > quantum is the shard's wake estimate, and load grew it: A-920's release probe 5 read it at about 1.05 ms at load 38-56,
 > so every step that filled it passed 1 ms. It is now held to `STEP_QUANTUM_CEILING` (bar / 2, 500 µs), since a step is

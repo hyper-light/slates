@@ -69,6 +69,34 @@ use crate::ops_doc::{NodeOrigin, Op, OpKind, OpsDoc};
 use crate::range::Range;
 use crate::verdict::MergeConflictClass;
 
+/// An increment's encoding under way ([`Increment::encode_step`]): its bytes so far and where it stands.
+#[derive(Debug, Default)]
+pub struct IncrementEncoding {
+  out: Vec<u8>,
+  stage: EncodeStage,
+  /// Where the header left the document's length to fill in.
+  at: usize,
+}
+
+/// Where an [`IncrementEncoding`] is.
+#[derive(Debug, Default)]
+enum EncodeStage {
+  /// Its id, base and the document length's place.
+  #[default]
+  Header,
+  /// Its ops document, from this piece.
+  Doc(usize),
+  /// Its inline bytes, from this offset.
+  Inline(usize),
+  /// Its evidence references, from this one.
+  Evidence(usize),
+  /// Its named runs, from this one.
+  Runs(usize),
+}
+
+/// Format: the bytes of an increment's encoded document length (a `u64`, [`Increment::encode`]).
+const DOC_LEN_BYTES: usize = 8;
+
 /// An increment submitted against a base version: the deriver's ops document and the sealed
 /// post-state its content operations' `src` offsets index into, and the evidence references the
 /// submitter attached (§4.16 `Increment.evidence`: "opaque to slates" — a green with
@@ -125,6 +153,87 @@ impl Increment {
       }
     }
     out
+  }
+
+  /// [`Increment::encode`] taken a slice at a time (A-920 6b: an import's revision of 9,000 files encoded whole in its
+  /// landing's entry step), from `encoding` ([`IncrementEncoding::default`]), a unit at least, until `spent`: its header,
+  /// its ops document a piece a unit ([`crate::ops_doc::OpsDoc::encode_piece`], its length filled in once every piece
+  /// is written), its inline bytes `chunk` a unit, then each evidence reference and named run a unit. Once it ends,
+  /// [`Increment::encode`]'s bytes.
+  pub fn encode_step(
+    &self,
+    encoding: &mut IncrementEncoding,
+    chunk: usize,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Option<Vec<u8>> {
+    loop {
+      if !self.encode_unit(encoding, chunk.max(1)) {
+        return Some(core::mem::take(&mut encoding.out));
+      }
+      if spent() {
+        return None;
+      }
+    }
+  }
+
+  /// One unit of [`Increment::encode_step`]: whether any is left.
+  fn encode_unit(&self, encoding: &mut IncrementEncoding, chunk: usize) -> bool {
+    let IncrementEncoding { out, stage, at } = encoding;
+    match stage {
+      EncodeStage::Header => {
+        out.extend_from_slice(&self.id);
+        out.extend_from_slice(&self.base.to_le_bytes());
+        *at = out.len();
+        out.extend_from_slice(&0u64.to_le_bytes());
+        *stage = EncodeStage::Doc(0);
+      }
+      EncodeStage::Doc(piece) => {
+        if self.doc.encode_piece(*piece, out) {
+          *piece = piece.saturating_add(1);
+        } else {
+          // The document's length, now that its pieces are written, where the header left its place.
+          let doc = out.len().saturating_sub(at.saturating_add(DOC_LEN_BYTES));
+          if let Some(place) = out.get_mut(*at..at.saturating_add(DOC_LEN_BYTES)) {
+            place.copy_from_slice(&(doc as u64).to_le_bytes());
+          }
+          let inline = self.inline_post_state();
+          out.extend_from_slice(&(inline.len() as u64).to_le_bytes());
+          *stage = EncodeStage::Inline(0);
+        }
+      }
+      EncodeStage::Inline(from) => {
+        let inline = self.inline_post_state();
+        let to = from.saturating_add(chunk).min(inline.len());
+        out.extend_from_slice(inline.get(*from..to).unwrap_or_default());
+        *from = to;
+        if to >= inline.len() {
+          out.extend_from_slice(&(self.evidence.len() as u64).to_le_bytes());
+          *stage = EncodeStage::Evidence(0);
+        }
+      }
+      EncodeStage::Evidence(next) => match self.evidence.get(*next) {
+        Some(reference) => {
+          out.extend_from_slice(reference);
+          *next = next.saturating_add(1);
+        }
+        None if self.named.is_empty() => return false,
+        None => {
+          out.extend_from_slice(&(self.named.runs.len() as u64).to_le_bytes());
+          *stage = EncodeStage::Runs(0);
+        }
+      },
+      EncodeStage::Runs(next) => {
+        let Some(run) = self.named.runs.get(*next) else {
+          return false;
+        };
+        out.extend_from_slice(&run.identity.hash);
+        out.extend_from_slice(&run.identity.len.to_le_bytes());
+        out.extend_from_slice(&run.offset.to_le_bytes());
+        out.extend_from_slice(&run.len.to_le_bytes());
+        *next = next.saturating_add(1);
+      }
+    }
+    true
   }
 
   /// The post-state's inline bytes: the post-state itself, since a named run's bytes are read into a buffer of their
