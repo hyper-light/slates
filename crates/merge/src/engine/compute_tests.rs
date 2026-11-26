@@ -1387,3 +1387,32 @@ fn a_works_first_unit_walked_a_content_path_a_step_is_its_first_unit_decided_who
   assert_eq!(unfit, expected);
   assert!(steps > 5, "{steps} steps");
 }
+
+/// A-920 3k (`Reached::reach_unit`, an effect at a time): what the chain records of an accepted verdict's effects is
+/// mapped an effect a step, since one unit can hold most of a work's effects. Do: compute, whole and a unit a step, a
+/// work at the origin's version that writes into every file and makes one. Expect both accepted with the same list of
+/// what the chain records, one for each effect, in order; and the sliced computation taking more steps than that list.
+#[test]
+fn a_verdict_reached_an_effect_a_step_records_what_the_verdict_reached_whole_does() {
+  let green = Green::with_origin(origin());
+  let mut draft = Draft::default();
+  for (at, path) in FILES.iter().enumerate() {
+    draft.content(OpKind::Insert, path, at as u64, b"+");
+  }
+  draft.alone(OpKind::Create, "made");
+  draft.content(OpKind::Insert, "made", 0, b"new");
+  let inc = increment(draft, green.head(), 1);
+  let whole = green.compute(&inc).expect("computed whole");
+  let mut computing = green.begin_computing(&inc);
+  let mut steps = 1u32;
+  let sliced = loop {
+    if let Some(computed) = green.computing_step(&inc, &mut computing, &mut || true) {
+      break computed.expect("computed a unit a step");
+    }
+    steps = steps.saturating_add(1);
+  };
+  let recorded = whole.applied().expect("accepted whole");
+  assert!(recorded.len() > FILES.len(), "{recorded:?}");
+  assert_eq!(sliced.applied(), Some(recorded));
+  assert!(steps as usize > recorded.len(), "{steps} steps");
+}

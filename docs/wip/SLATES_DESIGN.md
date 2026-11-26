@@ -64476,6 +64476,15 @@ GAPS.
   sliced. Oracle: `a_works_first_unit_walked_a_content_path_a_step_is_its_first_unit_decided_whole` decides a work
   with fitting and unfitting writes whole and a unit a step. A walk that drops the path a step ends on fails it, and
   no other test.
+  **3k, a unit's effects an effect at a time.** With each step's quantum printed (a debug probe at 4e048d71d, where the
+  test daemon's quantum is 4 µs, so every step is one unit), the gathering's one long step was one unit, 1,058 µs:
+  a unit can hold most of a work's effects (its copies' is one unit whole), and the hold moved them in one extend
+  and the reach mapped them in one go (probe 5's reach: 592 µs median, 978 at most). Both now walk a unit's effects
+  an effect a unit (`Holding::gathering`, `Reaching::effect_at`), a unit's windows taken as it is begun. Oracles: the
+  applying and named oracles' judges a unit a step fail when the gathering drops the effect a step ends on. A reach
+  that dropped it failed no test, so `a_verdict_reached_an_effect_a_step_records_what_the_verdict_reached_whole_does`
+  now compares what the chain records of a work computed whole and a unit a step: red with that drop (none against
+  five), green without.
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`

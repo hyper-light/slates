@@ -841,6 +841,9 @@ pub(crate) enum HoldBegun {
 /// head, their effects and windows gathered so far.
 pub(crate) struct Holding {
   units: std::vec::IntoIter<position::Unit>,
+  /// The effects of the unit being gathered not yet moved, an effect a unit of the walk (A-920 3k): one unit can hold
+  /// most of a work's effects (its copies' is one unit whole), and moved in one extend it was the gathering's step.
+  gathering: std::vec::IntoIter<Effect>,
   effects: Vec<Effect>,
   windows: Vec<ConflictWindow>,
   /// What the chain records of the effects, where it was reached at the head with nothing since.
@@ -6962,6 +6965,7 @@ impl Green {
       .fold(0usize, usize::saturating_add);
     HoldBegun::Holding(Holding {
       units: units.into_iter(),
+      gathering: Vec::new().into_iter(),
       effects: Vec::with_capacity(effects),
       windows: Vec::new(),
       reached,
@@ -6969,8 +6973,8 @@ impl Green {
     })
   }
 
-  /// One step of `holding` ([`Green::hold_begin`]): each unit's effects and windows gathered in order, a unit at least,
-  /// until `spent` ([`position::verdict`]'s walk); once every unit is, the verdict held, or a conflict cached, in this
+  /// One step of `holding` ([`Green::hold_begin`]): each unit's windows and its effects gathered in order, an effect a
+  /// unit of the walk (an effectless unit one), until `spent` ([`position::verdict`]'s walk); once every unit is, the verdict held, or a conflict cached, in this
   /// last step alone ([`Green::hold_end`]).
   pub(super) fn holding_step(
     &mut self,
@@ -6978,14 +6982,22 @@ impl Green {
     holding: &mut Holding,
     spent: &mut dyn FnMut() -> bool,
   ) -> Option<Judgment> {
-    while let Some(unit) = holding.units.next() {
-      holding.effects.extend(unit.effects);
+    loop {
+      for effect in holding.gathering.by_ref() {
+        holding.effects.push(effect);
+        if spent() {
+          return None;
+        }
+      }
+      let Some(unit) = holding.units.next() else {
+        return Some(self.hold_end(inc, holding));
+      };
       holding.windows.extend(unit.windows);
-      if holding.units.len() > 0 && spent() {
+      holding.gathering = unit.effects.into_iter();
+      if holding.gathering.len() == 0 && spent() {
         return None;
       }
     }
-    Some(self.hold_end(inc, holding))
   }
 
   /// `holding`'s verdict once every unit is gathered: accepted and held where no unit holds a window (its commit's reads
