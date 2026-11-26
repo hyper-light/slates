@@ -641,10 +641,12 @@
 > (`docs/bugs/2026-11-20-a-shards-idle-spin-took-a-clients-kick.md`).
 
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
-> the landing's entry are sliced (A-920 pieces 1-6b). Left: the checkpoint task's begin and its identity fold
-> (`merge_service.rs:359`: `CheckpointHold::begin` builds and encodes the green's checkpoint whole, 428 ms in one poll
-> debug at 9,000 files; `turn_budget_ns` past its deadline gives the fold everything left, 406 ms), the checkpoint's
-> own piece (A-869, A-579). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
+> the landing's entry are sliced (A-920 pieces 1-6b), and the checkpoint's identity fold takes at most the step ceiling a
+> turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history
+> task (debug, 9,000 files): the apply's last slice's inline checkpoint (`checkpoint_green`, 16 ms: its begin's build
+> 1.6 and encode 1.2 ms, then its first fold and hold steps), the tail's `fold_to_readers` (7.6 ms), the register's op
+> (`publish_held_increments` and `record_all`, 8 ms), and a turn (19 ms); its longest landing poll 28-76 ms a run. Owed:
+> the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
 > files): `made_commit.rs` (two calls), `vcs_store/svn_made.rs`, `vcs_store/hg_made.rs`, `greens.rs`'s own caller. A
 > probe of a wide made commit on each VCS would name any past the bar.

@@ -384,28 +384,36 @@ fn checkpoint_ended(state: &mut ShardState, green: DbVolumeId) {
 /// (`left_ns`), spread over the turns left before its deadline, a turn every `gap_ns` (the time since the last turn, the
 /// shard's measured cycle through its ready tasks). The deadline is the doubling interval (`interval_ns`, the time the
 /// increments it folds took to come, from `began_ns`): the next checkpoint is due after as much again, so this one
-/// ends within it. Never under the quantum; past the deadline, what is left at once (a step stops at its ceiling). A
-/// first checkpoint's interval is nothing, so it has no deadline to spread over: the quantum a turn, as the hold's share
-/// is (goal 93: an import's first checkpoint folded 8,991 keys in one poll of 495 ms, debug, its deadline passed at its
+/// ends within it. Never under the quantum, and never over the step ceiling ([`crate::config::STEP_QUANTUM_CEILING_NS`],
+/// A-928's cap, half 84a's loaded bar): past the deadline a turn takes the ceiling, not everything left (main 01a20182's
+/// ruling of 2026-11-26, A-920's checkpoint piece: everything left at once folded a 7,441-key backlog in one step of
+/// 406 ms, debug), so the checkpoint lands later, by its backlog over a ceiling-turn's keys; the chain's cap stays the
+/// hard bound (`Doubling::Now` at the cap), so nothing grows without end. A turn of the quantum alone was measured and
+/// rejected (A-579: one key a trip round the owner's ready queue, 7.2-13.0 s under steady contention). A first
+/// checkpoint's interval is nothing, so it has no deadline to spread over: the quantum a turn, as the hold's share is
+/// (goal 93: an import's first checkpoint folded 8,991 keys in one poll of 495 ms, debug, its deadline passed at its
 /// first turn).
 fn turn_budget_ns(
   left_ns: u64,
   (gap_ns, quantum_ns): (u64, u64),
   (began_ns, interval_ns, now_ns): (u64, u64, u64),
 ) -> u64 {
+  let ceiling = crate::config::STEP_QUANTUM_CEILING_NS.max(quantum_ns);
   if interval_ns == 0 {
     return quantum_ns;
   }
   let deadline = began_ns.saturating_add(interval_ns);
   let remaining = deadline.saturating_sub(now_ns);
   if remaining <= gap_ns {
-    return left_ns.max(quantum_ns);
+    return ceiling;
   }
   let share = u128::from(left_ns)
     .saturating_mul(u128::from(gap_ns))
     .checked_div(u128::from(remaining))
     .unwrap_or(u128::from(left_ns));
-  u64::try_from(share).unwrap_or(u64::MAX).max(quantum_ns)
+  u64::try_from(share)
+    .unwrap_or(u64::MAX)
+    .clamp(quantum_ns, ceiling)
 }
 
 /// Folds `green`'s identity backlog a key a unit in one paced step (`slates_pace::Step`, A-579): whether it is all
@@ -5641,11 +5649,14 @@ mod checkpoint_hold_tests;
 mod tests {
   use super::*;
 
-  /// A-579 (a checkpoint's identity fold paced to end within its doubling interval). Do: ask a turn's budget for 80 ms
+  /// A-579 (a checkpoint's identity fold paced to end within its doubling interval) and A-920's checkpoint piece (main
+  /// 01a20182's ruling of 2026-11-26: a share past the deadline that stays bounded). Do: ask a turn's budget for 80 ms
   /// of fold left, a turn every 0.5 ms, at several points of a 1 s interval; and past its end; and for almost nothing
-  /// left. Expect: the fold spread evenly over the turns left (80 ms x 0.5 / 1000 = 40 us at the start, twice that half
-  /// way), all of it once the deadline has passed, the quantum for a first checkpoint (its interval nothing, so no
-  /// deadline), and never less than the quantum.
+  /// left; and for 1.6 s left at the start, whose share (800 us) passes the step ceiling. Expect: the fold spread evenly over
+  /// the turns left (80 ms x 0.5 / 1000 = 40 us at the start, twice that half way); the step ceiling once the deadline
+  /// has passed, never everything left (A-928's cap, half 84a's loaded bar: past it, a 7,441-key backlog folded in one
+  /// step of 406 ms, debug); the ceiling too where the share passes it; the quantum for a first checkpoint (its interval
+  /// nothing, so no deadline) and for almost nothing left.
   #[test]
   fn a_folds_turn_budget_spreads_what_is_left_over_the_turns_before_its_deadline() {
     const MS: u64 = 1_000_000;
@@ -5662,7 +5673,12 @@ mod tests {
     );
     assert_eq!(
       turn_budget_ns(left, (gap, QUANTUM), (0, 1_000 * MS, 1_000 * MS)),
-      left
+      crate::config::STEP_QUANTUM_CEILING_NS
+    );
+    assert_eq!(
+      turn_budget_ns(20 * left, (gap, QUANTUM), (0, 1_000 * MS, 0)),
+      crate::config::STEP_QUANTUM_CEILING_NS,
+      "a share past the ceiling"
     );
     // A first checkpoint's interval is nothing: no deadline to spread over, so a quantum a turn.
     assert_eq!(turn_budget_ns(left, (gap, QUANTUM), (0, 0, 7)), QUANTUM);
