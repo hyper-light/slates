@@ -107,7 +107,7 @@ pub(super) fn visit<F: BlockFile>(
   mut each: impl FnMut(&Identity, u64, u64) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
   for section in sections_of(file, end, row)? {
-    if section.kind == SectionKind::Payload {
+    if section.kind.keyed() {
       let identity = identity_of_range(file, section.offset, section.len, buffer)?;
       each(&identity, section.offset, section.len)?;
     }

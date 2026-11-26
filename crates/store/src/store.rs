@@ -417,7 +417,7 @@ impl Store {
   pub fn landing_section(&mut self, kind: SectionKind, len: u64) -> Result<(), StoreError> {
     self.log.open_section(kind, len)?;
     self.open_payloads.end_section();
-    if kind == SectionKind::Payload {
+    if kind.keyed() {
       self.open_payloads.hashing = Some(blake3::Hasher::new());
     }
     Ok(())
@@ -648,7 +648,7 @@ impl Store {
     let mut buffer = Vec::new();
     for section in self.sections(&row)? {
       match section.kind {
-        SectionKind::Payload => {
+        SectionKind::Payload | SectionKind::Record => {
           let identity =
             identity_of_range(self.log.file(), section.offset, section.len, &mut buffer)?;
           forgotten = forgotten.saturating_add(payloads::forget(
@@ -854,7 +854,7 @@ fn put_rows_from_log<F: BlockFile>(
   }
   let mut known = known.map(<[Identity]>::iter);
   for section in sections_in(file, located)? {
-    if section.kind == SectionKind::Payload {
+    if section.kind.keyed() {
       // Named by the identity its pieces hashed to as the landing wrote them, else read back and hashed (a replay).
       let identity = match known.as_mut().and_then(Iterator::next) {
         Some(identity) => *identity,
