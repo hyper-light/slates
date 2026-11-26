@@ -58875,7 +58875,9 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > `Payload` its slice of the changegroup, `Texts` its texts; what the texts charged the push's admission is given back
 > once each lands. Segments land at the repository's next sequences, which its owner shard allocates, other landings
 > between them; the push's entry names them as ranges (record v11), and a restart replays exactly those, each record's
-> rows by node over the index as it stands then. The repository's landing turn (Subversion's, which Mercurial's made
+> rows by node over the index as it stands then. Since ruling R piece (i) (2026-11-26, A-929) each segment's `Record`
+> and `Payload` are homed in the region before it lands and the entry names one homed segment list (record v12), which
+> replaced v11 outright: v11 is no longer read. The repository's landing turn (Subversion's, which Mercurial's made
 > changesets hold too) is taken for the entry's commit alone: a fork another landing made stale is re-based by node
 > first, off the turn, and once more holding it at most. Readers see only what an entry names. A run no entry names
 > is forgotten as it ends. The store drops its rows and retains every payload another changeset still holds (C3).
@@ -65263,4 +65265,45 @@ Applied in the same change to:
   `with_owed_push_objects`, and brings a waited file text back from the changeset store. Red first:
   `hg_push::tests::a_holders_replica_of_an_owed_line_is_made_and_reads_as_the_owners_line` (made 0, refused 1 before;
   made 1, refused 0 after), its replica's files and head identity the owner's line's.
+- **Ruling R, piece (i)** (main 01a20182's ruling of 2026-11-26 ~09:55 with its corrections of 10:50: a holder replica
+  can only be made of a changeset the region holds, so the changeset is homed, through git's homing path and A-727's
+  barrier, never each named text; shipping bytes inline, S, rejected). Applied in the same change to:
+  - `crates/store`: a changeset's `Record` section keyed by its identity as its `Payload` is (`SectionKind::keyed`):
+    hashed as written, kept on replay, forgotten with the changeset, read back by `Store::piece`.
+  - `crates/hg/src/import/record.rs`: record v12 (`write_homed_run_reference`, `homed_run_of`): the head, then the
+    segment list's identity, length and the sequence it landed at. The segment list (`write_segment_list`,
+    `segment_list_of`: "SHGL", version 1, a count, then each segment's sequence and its `Record` and `Payload` by
+    identity and length, 88 bytes a segment). v11 (ranges) is withdrawn, no longer written or read (CLAUDE.md §2
+    item 7).
+  - `crates/server/src/repository/hg_run.rs`: a segment's `Record` and `Payload` are put whole in the content store,
+    their buffers dropped (`segment_held`), and each is homed at `f + 1` for the push's attempt (`homed_for`). It then
+    lands from the content store a piece at a time (`HeldSegment::landed`), and each section is let go at its home as
+    a landed git pack is (`Landed::Pack`, brought back by `disk.piece`). `Texts` is not homed: it is an index derived
+    from the other two. At the entry, the list is homed, landed as a changeset of its own and let go (`list_landed`);
+    it is never held for the region past its landing (correction 3). A homing short refuses the push (`hg_push`'s
+    `HOMED_SHORT`) with nothing recorded and the attempt's holds let go (A-727 (d1a)); committed, they move to the
+    repository's records.
+  - `crates/server/src/vcs_store.rs`: a v12 record's replay reads its list back from the node's store by identity
+    (`keyed_bytes`, held to its BLAKE3 before it is decoded) and replays the sequences it names.
+  - Each landed segment is counted by section (`vcs.hg.segment_landed_{record,payload,texts}_bytes`, for a push and an
+    import), so main reads the held bytes from status.
+- **Held by.**
+  - `hg_push::tests::a_push_whose_changeset_is_not_durable_at_its_homes_is_refused_and_records_nothing`. A successor
+    daemon over the same segment, its anchor's content object gone, publishes no image, so no home can make anything
+    durable. The push is refused `HOMED_SHORT`, its homing counted short, with nothing in the register and nothing held
+    for the region. Red with the homing bypassed: accepted, its entry naming segments no home held.
+  - `a_pushs_landed_segments_are_counted_by_section` (red: 0 payload bytes against 410 chunked).
+  - The store's `a_landed_record_is_read_back_by_its_identity_until_its_changeset_is_forgotten` (red: the record read
+    `None`).
+  - The hg crate's golden and hostile tests of v12 and the list, and `a_dropped_run_is_forgotten_and_the_next_push_lands_past_it`,
+    which now reads the run's first sequence from the list.
+  - Conditions tried for the red that the product cannot reach: a daemon with no content object refuses the
+    repository's create (`ContentUnavailable`) before any push, and the homing budget has no input a configuration can
+    shorten (`fleet::homing_budget`: the live commit's deadline or the homing window, whichever is longer).
+- **Owed** (ruling R, piece by piece). (ii): a holder fetches the segments its store lacks by identity from the region
+  before each replay, and its recompute of an hg line's second version is accepted with the owner's identity (today
+  `merge.recompute_mismatch`); svn's holder path red in the same piece; the Mercurial fleet-takeover CLI test
+  `#[ignore]`d with its command. Then an import's run (v9) and a single pushed or made changeset (v7), homed the same
+  way, before unit 43. Settling an attempt's holds is one region exchange an object, two a segment (about 4,200 for the
+  57k), and `homes`' settle queue is unbounded by its own size (it was two a git push).
 - **Owed.** The release measure of the first read's wait on the 452-head history (main's probe).

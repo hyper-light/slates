@@ -429,6 +429,60 @@ fn forgetting_a_duplicate_payload_keeps_the_surviving_changesets_bytes() {
   }
 }
 
+/// Ruling R (main 01a20182's of 2026-11-26: a Mercurial segment's `Record` is homed by its identity and let go at its
+/// home once landed, brought back from the store by that identity, as git's pack is). Do: land a changeset of a
+/// `Record` and a `Payload`; read each back by its identity; restart the store (its rows rebuilt from the log) and read
+/// again; forget the changeset. Expect: each section's bytes by its identity, before and after the restart, and none of
+/// either once forgotten. Red before: the `Record` had no lookup by identity (`piece` answered none).
+#[test]
+fn a_landed_record_is_read_back_by_its_identity_until_its_changeset_is_forgotten() {
+  use slates_store::staging::Staging;
+  use slates_store::store::Contents;
+
+  let record = b"a segment's rows by node";
+  let payload = b"a segment's chunks";
+  let staging = Staging::new(0);
+  let dir = scratch("keyed-record");
+  let mut store = open(&dir);
+  store
+    .land(
+      Header {
+        tool: Tool::Mercurial,
+        repository: 3,
+        sequence: 1,
+        judged_over: 0,
+        grant: 1,
+        work: 0,
+        time_ns: 0,
+        sections: 2,
+      },
+      &[
+        (SectionKind::Record, Contents::Bytes(record)),
+        (SectionKind::Payload, Contents::Bytes(payload)),
+      ],
+      &staging,
+    )
+    .unwrap();
+  let read = |store: &mut Store, bytes: &[u8]| {
+    let identity = *blake3::hash(bytes).as_bytes();
+    store
+      .piece(&staging, &identity, u64::try_from(bytes.len()).unwrap(), 0)
+      .unwrap()
+  };
+  assert_eq!(read(&mut store, record).as_deref(), Some(&record[..]));
+  assert_eq!(read(&mut store, payload).as_deref(), Some(&payload[..]));
+  drop(store);
+  let mut store = open(&dir);
+  assert_eq!(
+    read(&mut store, record).as_deref(),
+    Some(&record[..]),
+    "after a restart"
+  );
+  assert!(store.forget(3, 1).unwrap() > 0);
+  assert_eq!(read(&mut store, record), None, "the record forgotten");
+  assert_eq!(read(&mut store, payload), None, "the payload forgotten");
+}
+
 /// A-767 C3. Replay two copies and a replacement for one at the same sequence. Forget the
 /// other copy. Only the replacement's new payload remains readable after the next checkpoint.
 #[test]

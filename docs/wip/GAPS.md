@@ -486,6 +486,56 @@
 > stall is not the lift's (main's r229, 2026-11-23: 2 of 2 at a patience of 360 s, the HTTP mirror clone 97.9 and 107.7
 > s, CPU-bound at 97% of a core in blake3, `Index::get` and the content store's reads): slowness, a P line below, off
 > the lift's preconditions.
+> **The read sweep's B items, preconditions of the flip (w-git's sweep, inbox main-from-w-git-read-sweep.md; main's
+> order of 2026-11-26).** Each is a push reader that refuses on a let-go window where it should stop and be brought
+> back; each lands alone, red first at the lowest level reaching it, through the store's own let-go, with
+> `read_through.brought_back` asserted moved. The one rule they share is `slates_git::away::WaitOnce` (stop once a
+> window, the driver brings it back, the same let-go again with nothing read between ends typed), with its own unit
+> tests; the tag peel (`Verdicts::peel_away`) and the unpack's outside bases (`Resolving::stopped`) moved onto it. A
+> stop is keyed by the let-go's number (`ContentStore::away_number`), not the window's place: a window another reader
+> brought back and let go again before this one read it is a new stop. Keyed by place, B1's red failed once in the
+> parallel run of `git_push`'s tests, passing alone.
+> (b), the shallow fetch's `Unreadable`, was BUILT at 050ef43c2 (2026-11-23, the entry below); its sweep of upload's
+> reads found no B: what an answer reads of a landed pack stops and is brought back, and the rest reads kept parts and
+> whole contents, which no landed let-go reaches (the C list).
+> - **B1 BUILT (w-git, 2026-11-26): the push's quarantine reads.** A thin pack's REF_DELTA against the repository's
+>   object is read back through its base's window (`Push::bytes`, `IndexBases`); let go, the read answered none with
+>   nothing noted, and the connectivity check took the object as unreadable: `missing necessary objects`. Now the
+>   quarantine notes the window (`PackedRefused::Away`, on the repository for the driver and as
+>   `Contents::content_away` for the reader), and the walk stops its turn there in either pass; its second pass took an
+>   unread object's edges as none before, which could leave a tip `Complete`, and now takes it as `Missing`. Red:
+>   `git_push::tests::b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands` (the base's window let go
+>   once the pack is read and its checks are due). The A-753 resend path cannot miss now: a resent object is read from
+>   the push's own pack (A-864's noted entry). The fsck stage's read is reached by no push (a session's fsck is made
+>   as each object is kept, from its bytes), so it keeps its refusal. Owed as B1b: unpack's read of an in-pack base
+>   back from the quarantine (`Reader::applied`, `DeltaBaseMissing`), reached where that base is itself a thin
+>   delta over a let-go window. Its failures under load (main's 4 of 4 at b95e9ddb1, then 3 of 16 at the diagnostic
+>   branch agents/w-git-b1-debug, 884538b14) had two causes, each named by main's lines and fixed red first:
+>   - a stop ends the check's whole turn (`Walk::stopped`; `Checking::unit` and `Checking::turn` return not done).
+>     The check's own turn loop took the walk again at once after its stop, while its quantum was unspent, and the
+>     same let-go met twice with nothing brought back refused the object (`receive::tests::session::
+>     a_checks_turn_ends_at_its_walks_stop_on_a_let_go_window_and_is_whole_once_it_is_back`, a quantum never
+>     spent: done and `Missing` in the first turn before);
+>   - a push's wait is its own (`slates_git::away::Waits` on `ReceivePack`, taken by its HTTP, SSH and test drivers,
+>     `upload::brought_back_own`). Its readers (the quarantine, `IndexedObjects`, `PushedObjects`) note there alone and
+>     no longer on the repository's one slot, where a derivation's turn clears "a miss an earlier step left noted" at
+>     its start (`git_derive::turn`), so the driver found nothing to bring back and the push was refused (main's run
+>     15). `Repository::read_stored_waited` answers the let-go a read met and writes no slot, so each reader notes its
+>     own and never a stale one. Red: `b1_a_note_cleared_on_the_repository_between_a_pushs_stop_and_its_driver_leaves_
+>     the_push_its_own` (`missing necessary objects` before).
+> **OPEN (w-git, 2026-11-26): the repository's one wait slot is still shared by every owner but a push**, and each can
+> lose another's note of a let-go window: a derivation's turn clears it at its start (`git_derive::turn`), the
+> encoding's read clears it (`store/encoding.rs`) and takes it, a fetch's stream clears it before every read
+> (`store/upload.rs` `read_or_stop`) and its edges and answer take it, and a green build and a replica build take it
+> (`green_ready`, `replica_build`). A lost note is a window not brought back, so that owner's read refuses typed where
+> it should have waited. The fix is B1's: each owner its own `Waits`. Also still on the repository's slot from inside a
+> push: the admission's peel and references (B3), which refuse anyway until B3 moves them onto the push's slot. The
+> upload stream's and the encoding's stop rules are their own copies of the one rule, keyed by a window's place, not
+> its let-go's number (`Upload::stop_at`; the encoding's `stopped_at` set never waits twice for one window in a whole
+> encoding): owed onto `slates_git::away::WaitOnce`, as B1's readers are.
+> - OPEN: B2 (the server's tag-headed green, `ShardGreens::tree_of`), B3 (the admission's peel and references), B4 (the
+>   policy's reads), B5 (`PushedObjects::bytes` of a pushed object, `Malformed`), B6 (a verdict's one-call build), B7
+>   (`push_of`'s peel at judge time, after `prepare`'s), B8 (the encoding's tree walk: time, not correctness).
 > **P OPEN (w-git; main's r229, 2026-11-23): git/git's HTTP mirror clone takes about 100 s** (97.9 and 107.7 s, 556 MB
 > against stock git's 612 MB; the work clone 92.9 and 97.2 s), the daemon CPU-bound at 97% of one core: blake3,
 > `Index::get`, `ContentStore::get` / `len_of` / `window_at_in`, `Positions::settle`. No stall; to be profiled.
@@ -1513,7 +1563,8 @@
 > - Staging BUILT (2026-11-22, w-hg; main 01a20182's rulings of 07:32 and 12:00): a push lands its segments apart from
 >   its repository's landing turn, at sequences its owner shard allocates (serialized with no lock), other landings
 >   between them; its entry names them as ranges (record v11, `record::write_push_runs_reference`, at most one range a
->   segment; golden `a_pushs_runs_reference_is_the_golden_bytes_and_reads_back_as_its_ranges`), and the turn is taken
+>   segment; golden `a_pushs_runs_reference_is_the_golden_bytes_and_reads_back_as_its_ranges`; since ruling R piece
+>   (i), 2026-11-26, A-929, withdrawn for record v12, one homed segment list, v11 no longer read), and the turn is taken
 >   for the entry's commit alone. A fork another landing made stale is re-based by node (`hg_push::rebase`) before its
 >   works are planned, off the turn; stale again once the turn is taken, re-based holding it, the turn held to the end,
 >   so at most one re-base off it and one in it (counted `vcs.hg.push_rebased`, `..._rebased_in_turn`). The live
@@ -2024,8 +2075,13 @@
 > source replica a test rebuilt from the owner's shipped records refused `merge.recompute_mismatch` (hg's named files).
 > A real holder meets it too: hg's texts are not homed for the region and its changeset segments are not replicated.
 > Main's ruling R (2026-11-26 ~09:55) homes the changeset through git's homing path and the A-727 barrier, the
-> record naming one homed segment list; w-hg's piece, with svn's holder red and an `#[ignore]`d fleet-takeover CLI test
-> for Mercurial, which no test drives yet.
+> record naming one homed segment list. Piece (i) BUILT (2026-11-26, w-hg; A-929's ruling R): each push segment's
+> `Record` and `Payload` homed at `f + 1` before it lands and let go at its home once landed, the entry naming one
+> homed list (record v12, v11 withdrawn), a homing short refusing the push with nothing recorded
+> (`a_push_whose_changeset_is_not_durable_at_its_homes_is_refused_and_records_nothing`). OPEN: (ii) a holder fetching
+> the segments by identity and its recompute accepted with the owner's identity, with svn's holder red and an
+> `#[ignore]`d fleet-takeover CLI test for Mercurial, which no test drives yet; then an import's run (v9) and a single
+> changeset (v7) homed the same way.
 > Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
 > restart, `Unheld { 00manifest, rev }` (r915, Mercurial's own 57k history, rev 4222; here its first 5,000, rev 4281),
 > so the edge answered 503. The row named the empty window (a manifest whose text is its parent's, kept as an empty

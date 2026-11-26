@@ -161,6 +161,10 @@ const UNREAD: &[u8] = b"the push's changesets could not be read back";
 const UNRECORDED: &[u8] = b"the push's record could not be written";
 /// Format: slates' words for a push the node's changeset log refused (its owner busy or gone, or its write failed).
 const UNLANDED: &[u8] = b"the push could not be landed on the repository's changeset log";
+/// Format: slates' words for a push whose changeset fell short of its homes in the region within its budget (ruling R;
+/// A-727's rule: no record names content not durable at `f + 1`): nothing of it is recorded, so it may be sent again.
+const HOMED_SHORT: &[u8] =
+  b"the push's changeset was not made durable at its homes in the region in time: send it again";
 
 /// Counter: pushes landed as a changeset on the node's changeset log (A-767 C4).
 pub(crate) const PUSH_LANDED: &str = "hg_push.landed";
@@ -1500,11 +1504,12 @@ async fn unbundled(
   };
   // Taken, its segments landed as they are cut, apart from the landing turn (`hg_run`); its entry committed in one step
   // under the turn, its fork re-based first where another landing replaced its index meanwhile (`Committing`).
-  let (mut forked, run) = match take_sliced(repository, changegroup, lend_of(bundle), room).await? {
-    Ok(taken) => taken,
-    Err(outcome) => return Some(outcome),
-  };
-  let outcome = match crate::state::with_state(|state| recorded(state, &mut forked, &run))? {
+  let (mut forked, mut run) =
+    match take_sliced(repository, changegroup, lend_of(bundle), room).await? {
+      Ok(taken) => taken,
+      Err(outcome) => return Some(outcome),
+    };
+  let outcome = match recorded(repository, &mut forked, &mut run).await? {
     Ok(()) => {
       #[cfg(test)]
       held_before_landing().await;
@@ -2670,25 +2675,40 @@ fn held_over<'s>(
   Some(IndexHeld::with_given(index, content, given))
 }
 
-/// A push's record once its run of segment changesets landed ([`hg_run`](super::hg_run); main's ruling (b1)): the run's
-/// reference (record v9), so its entry names the run, counted landed. A push that kept no revision records none; one
-/// that kept some with no run landed is refused `UNLANDED`, nothing of it in the register (main's ruling of 2026-11-20,
-/// decision 1: no changeset store, no history).
-fn recorded(
-  state: &mut ShardState,
+/// A push's record once its run of segment changesets landed ([`hg_run`](super::hg_run); main's ruling (b1)): its
+/// segment list homed in the region and landed ([`hg_run::list_landed`](super::hg_run::list_landed); ruling R), and the
+/// register's reference naming it (record v12), so its entry names the run by one homed object, counted landed. A push
+/// that kept no revision records none; one that kept some with no list landed is refused, `HOMED_SHORT` where the list's
+/// homing fell short and `UNLANDED` otherwise, nothing of it in the register (main's ruling of 2026-11-20, decision 1: no
+/// changeset store, no history). None when the shard's state is gone.
+async fn recorded(
+  repository: RepositoryId,
   forked: &mut Forked,
-  run: &super::hg_run::Run,
-) -> Result<(), PushOutcome> {
+  run: &mut super::hg_run::Run,
+) -> Option<Result<(), PushOutcome>> {
   if forked.record.is_some() || forked.intaken.logs.is_empty() {
-    return Ok(());
+    return Some(Ok(()));
   }
-  let Some(reference) = run.reference(forked.room) else {
-    state.count(PUSH_UNLANDED, 1);
-    return Err(PushOutcome::refused(&abort(UNLANDED.to_vec())));
-  };
-  state.count(PUSH_LANDED, 1);
-  forked.record = Some(reference);
-  Ok(())
+  let listed = super::hg_run::list_landed(run, repository).await?;
+  crate::state::with_state(|state| match listed {
+    Ok((list, len, sequence)) => {
+      state.count(PUSH_LANDED, 1);
+      forked.record = Some(slates_hg::import::record::write_homed_run_reference(
+        forked.room,
+        (list.0, len),
+        sequence,
+      ));
+      Ok(())
+    }
+    Err(unlanded) => {
+      state.count(PUSH_UNLANDED, 1);
+      let words = match unlanded {
+        super::hg_run::ListUnlanded::HomedShort => HOMED_SHORT,
+        _ => UNLANDED,
+      };
+      Err(PushOutcome::refused(&abort(words.to_vec())))
+    }
+  })
 }
 
 /// A push's changeset as the node's store lands it (A-767 C4): the store's handle, the header at the repository's next
@@ -2776,7 +2796,7 @@ pub(crate) fn changeset_landing(
 fn landed_segment(
   state: &mut ShardState,
   (run, segment): (&mut super::hg_run::Run, &PushSegment),
-  (sequence, ok): (u64, bool),
+  (entry, ok): (slates_hg::import::record::SegmentEntry, bool),
   counted: Option<&mut slates_hg::push::pins::Counted>,
 ) -> Result<(), PushOutcome> {
   if !ok {
@@ -2784,7 +2804,7 @@ fn landed_segment(
     return Err(PushOutcome::refused(&abort(UNLANDED.to_vec())));
   }
   state.count(super::hg_run::SEGMENTS_LANDED, 1);
-  run.landed(sequence, &segment.contents);
+  run.landed(entry, &segment.contents);
   // Durable on the node's changeset store, which serves them from here: its file texts leave the content store, their
   // entries kept, each brought back by the read that meets it (`hg_run`, "Let go"). What the push held just before,
   // its admission and its texts resident, is its high-water's sample.
@@ -3196,9 +3216,12 @@ async fn segments_landed(
   Some(Ok(()))
 }
 
-/// `segment` of `taking` landed on the node's store as a changeset at its repository's next sequence
-/// ([`hg_run::segment_changeset`](super::hg_run::segment_changeset)), noted in `run` ([`landed_segment`]); `UNLANDED`
-/// where it could not be made or the store refused it; none where the store went away.
+/// `segment` of `taking` landed on the node's store as a changeset at its repository's next sequence, noted in `run`
+/// ([`landed_segment`]): its `Record` and `Payload` put whole in the content store
+/// ([`hg_run::segment_held`](super::hg_run::segment_held)), each homed in the region at `f + 1` for the push's attempt
+/// ([`hg_run::homed_for`](super::hg_run::homed_for); ruling R, A-727's rule), then landed from there a piece at a time and
+/// let go. `HOMED_SHORT` where a homing fell short; `UNLANDED` where it could not be made or the store refused it; none
+/// where the store went away.
 async fn segment_landed(
   repository: RepositoryId,
   taking: &mut Taking,
@@ -3239,16 +3262,28 @@ async fn segment_landed(
   let Some(chunks) = chunked_paced((&segment.texts, slice), &mut costs).await? else {
     return unlanded();
   };
-  let changeset = crate::state::with_state(|state| {
-    super::hg_run::segment_changeset(state, repository, segment, (written, chunks))
+  let held = crate::state::with_state(|state| {
+    super::hg_run::segment_held(state, repository, segment, (written, chunks))
   })?;
-  let Some(Ok((disk, header, parts))) = changeset else {
-    return Some(Err(PushOutcome::refused(&abort(UNLANDED.to_vec()))));
+  let Some(Ok(held)) = held else {
+    return unlanded();
   };
-  let sequence = header.sequence;
-  let ok = disk.land(header, parts).await.is_ok();
+  for (identity, len) in [held.record, held.payload] {
+    let source = crate::vcs_store::homes::HomeSource::Held(identity, len);
+    let (homed, _) = super::hg_run::homed_for(run, source).await?;
+    if homed.is_err() {
+      crate::state::with_state(|state| held.given_back(state, (false, &[])))?;
+      return Some(Err(PushOutcome::refused(&abort(HOMED_SHORT.to_vec()))));
+    }
+  }
+  let ok = held.landed().await.is_ok();
   crate::state::with_state(|state| {
-    landed_segment(state, (run, segment), (sequence, ok), Some(counted))
+    let shards = state.shards.clone();
+    held.given_back(state, (ok, &shards));
+    if ok {
+      super::hg_run::count_landed(state, held.section_bytes());
+    }
+    landed_segment(state, (run, segment), (held.entry(), ok), Some(counted))
   })
 }
 

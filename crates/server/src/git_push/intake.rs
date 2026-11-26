@@ -9,17 +9,22 @@
 //! whole pack. A delta's base is read back from the queue or from the quarantine; a thin pack's
 //! from the repository's index.
 //!
-//! **Checked from the quarantine** ([`Quarantined`]): the pack's checks and a verdict read each
-//! object's bytes back by name, where it lies in the push's pack (main's ruling B part 2: the pack is
-//! kept as the client sent it, its objects never inflated beside it).
+//! **Checked from the quarantine** ([`Quarantined`]): the pack's checks and a verdict read each object's bytes back by
+//! name, where it lies in the push's pack (main's ruling B part 2: the pack is kept as the client sent it, its objects
+//! never inflated beside it). A read that meets a let-go window (a thin pack's REF_DELTA against the repository's
+//! object, whose window a landed pack's let-go gave back) answers none with the window noted, on the repository for the
+//! push's driver to bring back and on the quarantine for its reader to stop at ([`Contents::content_away`]; goal 93
+//! item 2b, precondition B1 of the landed let-go's lift, main's order of 2026-11-26).
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
+use slates_git::away::Waits;
 use slates_git::object_name::{Kind, ObjectId};
 use slates_git::receive::Repository;
 use slates_git::store::views::IndexedObjects;
-use slates_git::store::{IndexBases, Push, Repository as GitRepository};
+use slates_git::store::{IndexBases, Push, Repository as GitRepository, packed};
 use slates_git::unpack::{self, Contents, Keep, Object};
 use slates_git::{Admission, Hold};
 use slates_vcs::ContentStore;
@@ -58,6 +63,10 @@ impl Contents for Intake<'_> {
     }
     self.quarantined.content(at, id)
   }
+
+  fn content_away(&self) -> Option<u64> {
+    self.quarantined.content_away()
+  }
 }
 
 impl Keep for Intake<'_> {
@@ -84,11 +93,52 @@ pub(crate) struct Quarantined<'s> {
   /// The store its objects are in.
   pub(crate) store: &'s ContentStore,
   /// The repository, whose index holds the objects a pack resends that the quarantine passed over (A-753).
-  pub(crate) repository: &'s GitRepository,
+  repository: &'s GitRepository,
+  /// The let-go, by the store's number for it, of the window the last read to answer none met
+  /// ([`Contents::content_away`]).
+  away: Cell<Option<u64>>,
+  /// Its owner's own slot for that window (a push's, `slates_git::away::Waits`); none for an owner that reads the
+  /// repository's (a replay).
+  notes: Option<&'s Waits>,
+}
+
+impl<'s> Quarantined<'s> {
+  /// The quarantine `push` (none before its first object) over `repository`'s objects in `store`, read only, the
+  /// let-go windows its reads meet noted in `notes`, its owner's own slot, where it has one, else on the repository's.
+  pub(crate) fn new(
+    push: Option<&'s Push>,
+    store: &'s ContentStore,
+    (repository, notes): (&'s GitRepository, Option<&'s Waits>),
+  ) -> Self {
+    Self {
+      push,
+      store,
+      repository,
+      away: Cell::new(None),
+      notes,
+    }
+  }
+
+  /// `waited`, the let-go window a read met, noted for its owner's driver to bring back (its own slot, else the
+  /// repository's: one slot, never both) and here, by its let-go's number, for the reader to stop at.
+  fn noted(&self, waited: Option<packed::Waited>) {
+    if let Some(waited) = waited {
+      match self.notes {
+        Some(waits) => waits.note(waited),
+        None => self.repository.wait_for(waited),
+      }
+      self.away.set(
+        self
+          .store
+          .away_number(&waited.pack, waited.len, waited.offset),
+      );
+    }
+  }
 }
 
 impl Contents for Quarantined<'_> {
   fn content(&self, _at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
+    self.away.set(None);
     // The push's object is read where it is: in the store, lent with no copy where it is one window there (A-727 a1), or
     // where it lies in the push's pack (`Push::bytes`, main's ruling B part 2), a REF_DELTA's base outside the push read
     // from the index.
@@ -98,13 +148,21 @@ impl Contents for Quarantined<'_> {
         store: self.store,
       };
       if let Some(read) = push.bytes(self.store, &outside, id) {
-        return read.ok();
+        return read.map_err(|refused| self.noted(refused.waited())).ok();
       }
     }
     // An object the repository indexed already is passed over by the quarantine as it arrives (`admit_object`): a pack
     // that resends it is read back from the index (A-753; git's receive-pack takes such a pack).
     let (_, stored, len) = self.repository.stored(self.store, id)?;
-    self.repository.read_stored(self.store, &stored, len)
+    self
+      .repository
+      .read_stored_waited(self.store, &stored, len)
+      .map_err(|waited| self.noted(waited))
+      .ok()
+  }
+
+  fn content_away(&self) -> Option<u64> {
+    self.away.get()
   }
 }
 

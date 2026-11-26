@@ -107,7 +107,10 @@ impl Checking {
         clock: &mut *clock,
         ns: ns.saturating_sub(spent),
       };
-      self.unit((repository, contents), admission, left)?;
+      // A unit stopped at a let-go window ends the turn, for its driver to bring the window back (`crate::away`).
+      if !self.unit((repository, contents), admission, left)? {
+        break;
+      }
       if clock.now_ns().saturating_sub(begun) >= ns {
         break;
       }
@@ -116,13 +119,14 @@ impl Checking {
   }
 
   /// One unit of the checks: one object checked as git checks a push, the objects indexed, or a
-  /// turn of the walk for what is `left` of the quantum.
+  /// turn of the walk for what is `left` of the quantum. Whether it went on: not where the walk's turn stopped at an
+  /// object whose read met a let-go window ([`Walk::stopped`]), which ends the checks' turn too.
   fn unit<R: Repository + ?Sized, C: Contents>(
     &mut self,
     (repository, contents): (&R, &C),
     admission: &mut Admission,
     left: Quantum<'_>,
-  ) -> Result<(), Refusal> {
+  ) -> Result<bool, Refusal> {
     let Checking {
       request,
       unpacked,
@@ -165,6 +169,7 @@ impl Checking {
           contents: Some(contents),
         };
         let done = walk.turn((request, &pushed, repository), admission, left);
+        let went = !(matches!(done, Ok(false)) && walk.stopped());
         let connected = match done {
           Ok(true) => Some(walk.connected(request, &pushed, repository)),
           Ok(false) => None,
@@ -177,10 +182,11 @@ impl Checking {
             connected: connected?,
           };
         }
+        return Ok(went);
       }
       Stage::Connected { .. } | Stage::Refused => {}
     }
-    Ok(())
+    Ok(true)
   }
 
   /// The checked push, every check made first in one turn with no end ([`super::check`]'s), each

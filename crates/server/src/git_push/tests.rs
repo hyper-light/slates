@@ -1534,6 +1534,352 @@ fn brought_back_count(state: &ShardState) -> u64 {
   state.refusals.get(name).copied().unwrap_or(0)
 }
 
+/// Shape: the files of the first tree [`b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands`] pushes:
+/// enough that the second tree's delta against it is shorter than the tree, as git sends it.
+const THIN_TREE_FILES: usize = 64;
+
+/// Precondition B1 of the landed let-go's lift (main's order of 2026-11-26; w-git's read sweep: the push's quarantine
+/// reads, `intake::Quarantined::content`, answered none on a let-go window and noted nothing, so the connectivity check
+/// took the object as unreadable). Do: create `main` at a commit of a flat tree of [`THIN_TREE_FILES`] files; then
+/// update it to a commit whose tree adds a file, sent as git sends a thin pack: the tree a REF_DELTA against the first
+/// tree, which the pack does not carry. Drive the update as an edge does, the window each turn met brought back
+/// ([`let_go_at_its_checks`]), and once its pack is read and its checks are due, let every window of the first push's
+/// pack go by hand, as a landed pack's let-go does. Expect: `ok`; the check read the new tree through its base's
+/// window, brought back after the let-go (`vcs_store.read_through.brought_back` moved past it). Red before: `missing
+/// necessary objects`, the check's read of the tree from the quarantine answering none.
+#[test]
+fn b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, update, pack) = thin_update_over_a_create(&daemon, "thin-check-away");
+  let (updated, (at_let_go, after), _) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move { let_go_at_its_checks(repository, &update, (&pack, Meddle::Not)).await },
+    HISTORY_PATIENCE,
+  )
+  .unwrap();
+  let refused = crate::daemon::observe_first(&daemon, bring_backs_refused);
+  daemon.stop();
+  assert_eq!(
+    reasons(&updated),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    updated.outcomes
+  );
+  assert!(
+    after > at_let_go,
+    "the base's window brought back after its let-go: {at_let_go} -> {after}"
+  );
+}
+
+/// B1's one rule keyed by the let-go met, not the window's place (main's order of 2026-11-26: the interleaving forced,
+/// not met by luck in a concurrent run). Do: [`b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands`]'s
+/// update, but at the push's first stop on the let-go base, another reader brings that window back first (so the
+/// push's driver finds it back and brings nothing), then lets it go again before the push's next step
+/// ([`another_reader_brings_back_and_lets_go`]): the push meets the window let go with nothing read between. Expect:
+/// `ok`, the window waited for again and brought back by the push's driver. Red with the stop keyed by the window's
+/// offset (489aab9a1): `missing necessary objects`, the second let-go taken for the first met twice.
+#[test]
+fn b1_a_window_brought_back_and_let_go_again_by_another_reader_is_waited_for_again() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, update, pack) = thin_update_over_a_create(&daemon, "thin-let-go-again");
+  let (updated, (at_let_go, after), again) =
+    crate::test_store::run_on_first(
+      &daemon,
+      move || async move {
+        let_go_at_its_checks(repository, &update, (&pack, Meddle::LetGoAgain)).await
+      },
+      HISTORY_PATIENCE,
+    )
+    .unwrap();
+  let refused = crate::daemon::observe_first(&daemon, bring_backs_refused);
+  daemon.stop();
+  assert!(
+    again,
+    "another reader brought the window back and let it go again"
+  );
+  assert_eq!(
+    reasons(&updated),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    updated.outcomes
+  );
+  assert!(
+    after > at_let_go.saturating_add(1),
+    "the other reader's bring-back and the push's own after it: {at_let_go} -> {after}"
+  );
+}
+
+/// What this shard's bring-backs of let-go windows were refused, by its counters: refused (by the node's store, or with
+/// no store: `upload::RESIDENT_REFUSED`), past their patience (`upload::BRING_BACK_PAST_PATIENCE`), and a piece the
+/// store never answered (`read_through::UNANSWERED`); so a B1 test whose window was never brought back says why.
+fn bring_backs_refused(state: &mut ShardState) -> (u64, u64, u64) {
+  let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+  (
+    count(crate::vcs_store::upload::RESIDENT_REFUSED),
+    count(crate::vcs_store::upload::BRING_BACK_PAST_PATIENCE),
+    count(crate::vcs_store::read_through::UNANSWERED),
+  )
+}
+
+/// B1's second cause under load (main's lines of agents/w-git-b1-debug, run 15: "derivation turn cleared the
+/// repository's note" between the push's stop and its driver): the push's wait is its own, not the repository's one
+/// slot. Do: [`b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands`]'s update, but at the push's first stop
+/// on the let-go base, the repository's note of a miss is cleared before the push's driver looks, as a derivation's turn
+/// clears it at its start (`git_derive::turn`). Expect: `ok`, the push's driver bringing back the window its own slot
+/// noted. Red with the push's waits noted on the repository's slot (1c4ecec27): `missing necessary objects`, the driver
+/// finding nothing to bring back and the walk meeting the same let-go again.
+#[test]
+fn b1_a_note_cleared_on_the_repository_between_a_pushs_stop_and_its_driver_leaves_the_push_its_own()
+{
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, update, pack) = thin_update_over_a_create(&daemon, "thin-note-cleared");
+  let (updated, (at_let_go, after), cleared) =
+    crate::test_store::run_on_first(
+      &daemon,
+      move || async move {
+        let_go_at_its_checks(repository, &update, (&pack, Meddle::NoteCleared)).await
+      },
+      HISTORY_PATIENCE,
+    )
+    .unwrap();
+  let refused = crate::daemon::observe_first(&daemon, bring_backs_refused);
+  daemon.stop();
+  assert!(cleared, "the repository's note cleared at the push's stop");
+  assert_eq!(
+    reasons(&updated),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    updated.outcomes
+  );
+  assert!(
+    after > at_let_go,
+    "the base's window brought back after its let-go: {at_let_go} -> {after}"
+  );
+}
+
+/// On a repository `name` of `daemon`: `main` created, `ok`, at a commit of a flat tree of [`THIN_TREE_FILES`] files,
+/// then the request updating it to a commit whose tree adds a file, sent as git sends a thin pack (the tree a REF_DELTA
+/// against the first tree, which the pack does not carry): the repository, that request, and the create's pack.
+fn thin_update_over_a_create(
+  daemon: &crate::Daemon,
+  name: &str,
+) -> (RepositoryId, Vec<u8>, Vec<u8>) {
+  use slates_git::object_name::{Kind, name_of};
+  let repository = git_repository_on(daemon, name);
+  let (first, objects) = flat_commit(THIN_TREE_FILES, "base", None);
+  let pack = pack_of_objects(&objects);
+  let create = request(
+    &[("", &first.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack,
+  );
+  let (created, _) = pushed_in_steps(daemon, repository, &create).unwrap();
+  assert_eq!(reasons(&created), [b"ok"]);
+  let base_tree = objects[1].1.clone();
+  let blob = b"added\n".to_vec();
+  let mut tree = base_tree.clone();
+  tree.extend_from_slice(b"100644 zz\0");
+  tree.extend_from_slice(
+    name_of(ObjectFormat::Sha1, Kind::Blob, &blob)
+      .unwrap()
+      .as_bytes(),
+  );
+  let tree_id = name_of(ObjectFormat::Sha1, Kind::Tree, &tree).unwrap();
+  let commit = format!(
+    "tree {tree_id}\nparent {first}\nauthor A <a@example.com> 1700000001 +0000\n\
+     committer A <a@example.com> 1700000001 +0000\n\nadded\n"
+  )
+  .into_bytes();
+  let second = name_of(ObjectFormat::Sha1, Kind::Commit, &commit).unwrap();
+  let thin = thin_tree_pack((&commit, &blob), (&base_tree, &tree));
+  let update = request(
+    &[(&first.to_string(), &second.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &thin,
+  );
+  (repository, update, pack)
+}
+
+/// A thin pack of `commit` and `blob` whole and `tree` a REF_DELTA against `base`, which it does not carry, its data in
+/// stored zlib blocks, as git's client sends a push over a history the server holds.
+fn thin_tree_pack((commit, blob): (&[u8], &[u8]), (base, tree): (&[u8], &[u8])) -> Vec<u8> {
+  use slates_git::entry::{self, Header, Representation};
+  use slates_git::object_name::{Kind, name_of};
+  let delta = slates_git::store::delta_of(base, tree).expect("a delta shorter than the tree");
+  let base = name_of(ObjectFormat::Sha1, Kind::Tree, base).unwrap();
+  let entries = [
+    (Representation::Whole(Kind::Commit), commit.to_vec()),
+    (Representation::RefDelta { base }, delta),
+    (Representation::Whole(Kind::Blob), blob.to_vec()),
+  ];
+  let mut pack = Vec::new();
+  let mut writer = slates_git::pack::Writer::new(ObjectFormat::Sha1, 3, &mut pack);
+  let mut at = entry::PACK_HEADER_LEN;
+  for (representation, data) in &entries {
+    let header = Header {
+      representation: *representation,
+      size: u64::try_from(data.len()).unwrap(),
+    };
+    let zlib = stored_zlib(data);
+    entry::write(header, at, &mut writer).unwrap();
+    slates_git::out::Out::put(&mut writer, &zlib);
+    at += entry::written_len(header, at).unwrap() + u64::try_from(zlib.len()).unwrap();
+  }
+  writer.finish().unwrap();
+  pack
+}
+
+/// What another reader of the repository does at the push's first stop after its let-go, in [`let_go_at_its_checks`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Meddle {
+  /// Nothing: the push's driver brings the window back, as an edge's.
+  Not,
+  /// It brings the window back first and lets it go again before the push's next step
+  /// ([`another_reader_brings_back_and_lets_go`]).
+  LetGoAgain,
+  /// It clears the repository's note of a miss, as a derivation's turn does at its start (`git_derive::turn`, "a miss
+  /// an earlier step left noted is not this turn's"), before the push's driver looks.
+  NoteCleared,
+}
+
+/// `request` pushed to `repository` by its owner from a task of its shard, driven as an edge drives it (each turn's
+/// let-go window brought back at once, [`driven_bring_back`], then its homing carried), every window of `let_go` let
+/// go by hand ([`let_go_by_hand`]) once the push's pack is read and its checks are due, and the first stop after that
+/// met by `meddle`. What was received, the windows brought back at the let-go and at the end, and whether the meddling
+/// was done at a stop.
+async fn let_go_at_its_checks(
+  repository: RepositoryId,
+  request: &[u8],
+  (let_go, meddle): (&[u8], Meddle),
+) -> Result<(Received, (u64, u64), bool), String> {
+  let (_, mut push) = on_state(|state| started(state, repository));
+  for piece in request.chunks(PIECE) {
+    on_state(|state| push.input(state, piece)).map_err(|failed| format!("{failed:?}"))?;
+  }
+  on_state(|state| push.end(state)).map_err(|failed| format!("{failed:?}"))?;
+  let mut at_let_go = None;
+  let mut meddled = meddle == Meddle::Not;
+  let mut answer = Vec::new();
+  let received = loop {
+    if at_let_go.is_none() && push.session.is_checking() && !push.session.is_resolving() {
+      at_let_go = Some(on_state(|state| {
+        let _ = let_go_by_hand(state, let_go);
+        brought_back_count(state)
+      }));
+    }
+    let step = on_state(|state| push.answer_step(state, &mut answer))
+      .map_err(|failed| format!("a step failed: {failed:?}"))?;
+    match step {
+      Answering::Answered(received) => break *received,
+      Answering::Turned => {
+        if at_let_go.is_some() && !meddled {
+          meddled = meddled_at_a_stop(&mut push, repository, meddle).await;
+        } else {
+          logged_bring_back(&mut push, repository).await;
+        }
+        slates_rt::futures::yield_now().await;
+        carry_awaited(&mut push).await?;
+      }
+      #[cfg(unix)]
+      step @ Answering::Hook(_) => return Err(format!("no hook runs here: {step:?}")),
+    }
+  };
+  dropped_in_a_step(push);
+  let at_let_go = at_let_go.ok_or("the push's checks were never due")?;
+  let after = on_state(|state| brought_back_count(state));
+  Ok((
+    received,
+    (at_let_go, after),
+    meddled && meddle != Meddle::Not,
+  ))
+}
+
+/// The let-go window the push's last step met and noted for its driver in the push's own slot, left as it is.
+fn noted_wait(
+  push: &ReceivePack,
+  _repository: RepositoryId,
+) -> Option<slates_git::store::packed::Waited> {
+  push.waits.peek()
+}
+
+/// The push's driver's bring-back after a step, as the edges do it: the window the step met brought back at once from
+/// the push's own slot, before anything else on the shard runs.
+async fn driven_bring_back(push: &mut ReceivePack, _repository: RepositoryId) {
+  crate::vcs_store::upload::brought_back_own(push.take_waited()).await;
+}
+
+/// [`driven_bring_back`], each stop printed (libtest shows it for a failing test alone: what main's runs under load
+/// read; main's order of 2026-11-26, a cause shown, never guessed): its offset and let-go number, and the windows
+/// brought back before and after with the bring-backs refused.
+async fn logged_bring_back(push: &mut ReceivePack, repository: RepositoryId) {
+  let noted = noted_wait(push, repository).map(|waited| {
+    on_state(|state| {
+      let number = state
+        .vcs_stores
+        .content()
+        .and_then(|content| content.away_number(&waited.pack, waited.len, waited.offset));
+      (waited.offset, number)
+    })
+  });
+  let before = on_state(|state| brought_back_count(state));
+  driven_bring_back(push, repository).await;
+  if noted.is_some() {
+    let after = on_state(|state| (brought_back_count(state), bring_backs_refused(state)));
+    eprintln!("b1 stop: (offset, let-go number) {noted:?}; brought back {before} -> {after:?}");
+  }
+}
+
+/// `meddle` done at the push's stop, then its driver's bring-back: whether the step stopped (a window noted for the
+/// driver), so the meddling met a stop; where it did not, the driver's bring-back alone, as an edge's.
+async fn meddled_at_a_stop(
+  push: &mut ReceivePack,
+  repository: RepositoryId,
+  meddle: Meddle,
+) -> bool {
+  let Some(waited) = noted_wait(push, repository) else {
+    driven_bring_back(push, repository).await;
+    return false;
+  };
+  match meddle {
+    Meddle::Not => driven_bring_back(push, repository).await,
+    Meddle::LetGoAgain => another_reader_brings_back_and_lets_go(push, repository, waited).await,
+    Meddle::NoteCleared => {
+      on_state(|state| {
+        if let Some((_, store)) = state.vcs_stores.git(repository) {
+          let _ = store.repository.waiting();
+        }
+      });
+      driven_bring_back(push, repository).await;
+    }
+  }
+  true
+}
+
+/// The interleaving a concurrent reader makes (a derivation, which lets go at its end the windows it brought back),
+/// forced: `waited`, the window the push's step met and noted, is brought back by another reader first
+/// (`read_through::bring_back_window`); the push's driver then finds it back and brings nothing
+/// ([`driven_bring_back`]); then the other reader lets it go again, as a landed window (`vcs_store::let_go_read`).
+async fn another_reader_brings_back_and_lets_go(
+  push: &mut ReceivePack,
+  repository: RepositoryId,
+  waited: slates_git::store::packed::Waited,
+) {
+  let brought = crate::vcs_store::read_through::bring_back_window(waited).await;
+  let Ok(Some((window, _))) = brought else {
+    panic!("the other reader brought the window back: {brought:?}");
+  };
+  driven_bring_back(push, repository).await;
+  let let_go = on_state(|state| {
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      if let Some(content) = stores.content_mut() {
+        content.mark_landed(&window);
+      }
+    });
+    crate::vcs_store::let_go_read(state, &window).is_ok()
+  });
+  assert!(let_go, "the other reader let the window go again");
+}
+
 /// Main 01a20182's ruling of 2026-11-24 (w-hg's sweep of the bring-back sites: a write path's bring-back never let go).
 /// Do: push a line of [`PACED_HISTORY`] commits, let its pack's windows go by hand before it is derived, then derive it
 /// as a fetch's request does (`git_derive::derive_for_read`). Expect: every window let go first; the derivation brought
@@ -2693,9 +3039,10 @@ pub(crate) async fn homed_drive(
     match step {
       Answering::Answered(received) => return Ok(*received),
       Answering::Turned => {
+        // As the edges do (goal 93 item 2b(b), push reader (b)): the window a step met let go, brought back from the
+        // push's own slot at once, then the turn yielded.
+        crate::vcs_store::upload::brought_back_own(push.take_waited()).await;
         slates_rt::futures::yield_now().await;
-        // As the edges do (goal 93 item 2b(b), push reader (b)): the window a step met let go, brought back.
-        crate::vcs_store::upload::brought_back_waited(repository).await;
         if let Some(asked) = push.take_homing() {
           let (origin, shards) =
             with_state(|state| (state.shard, state.shards.clone())).ok_or("no state")?;
@@ -3492,7 +3839,7 @@ async fn stepped_drive(repository: RepositoryId, request: &[u8]) -> Result<Vec<V
     match step {
       Answering::Answered(received) => return Ok(reasons(&received)),
       Answering::Turned => {
-        crate::vcs_store::upload::brought_back_waited(repository).await;
+        crate::vcs_store::upload::brought_back_own(push.take_waited()).await;
         carry_awaited(&mut push).await?;
       }
       #[cfg(unix)]

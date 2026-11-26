@@ -12,6 +12,15 @@
 //! `Missing` otherwise. An object that cannot be read is `Missing`, since what it names cannot be
 //! known.
 //!
+//! **A let-go window** (goal 93 item 2b; w-git's read sweep, precondition B1 of the landed let-go's lift, main's order
+//! of 2026-11-26). A pushed object's bytes may be read through a base in a window of a landed pack that is let go (a
+//! thin pack's REF_DELTA against the repository's object), and the read answers none with the window named
+//! ([`crate::unpack::Contents::content_away`]). The walk then stops its turn at that object, in either pass, so the
+//! push's driver brings the window back, and reads it again next turn; met again with nothing read between, the object
+//! is `Missing`, as one that cannot be read is ([`crate::away`]'s one rule). Before, such an object was `Missing` at
+//! once in the first pass, and in the second its edges were taken as none, which could leave a tip `Complete` over an
+//! object nothing holds.
+//!
 //! **Bounds** (A-719: a push's working set is the slice in flight, never its history). The first pass reads every
 //! pushed object once and judges its own edges out of the pack. When no object is incomplete, no tip can reach one, so
 //! every pushed tip is complete and the walk ends there, its one table a state an object: the common case, every push
@@ -27,6 +36,7 @@
 
 use super::{Pushed, Refusal, Repository, Request, reserve};
 use crate::Admission;
+use crate::away::WaitOnce;
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::objects::{self, ObjectRefused, commit::Commit, tag::Tag, tree::Tree};
 use crate::store::hook_view::Quantum;
@@ -147,6 +157,11 @@ pub(crate) struct Walk {
   stack: Vec<Frame>,
   /// Where each object's propagation stands; empty unless the propagation runs.
   marks: Vec<Mark>,
+  /// The let-go window the walk last stopped at, kept across its turns ([`crate::away`]'s one rule).
+  wait: WaitOnce<u64>,
+  /// Whether its last turn ended at an object whose read met a let-go window, for the window to be brought back before
+  /// it is taken again ([`Walk::stopped`]).
+  stopped: bool,
 }
 
 impl Walk {
@@ -172,6 +187,8 @@ impl Walk {
       at: 0,
       stack: Vec::new(),
       marks: Vec::new(),
+      wait: WaitOnce::default(),
+      stopped: false,
     })
   }
 
@@ -185,8 +202,13 @@ impl Walk {
   ) -> Result<bool, Refusal> {
     let Quantum { clock, ns } = quantum;
     let begun = clock.now_ns();
+    self.stopped = false;
     while self.pass != Pass::Done {
-      self.unit((request, pushed, repository), admission)?;
+      // A unit that met a let-go window ends the turn, for the window to be brought back (the module docs).
+      if !self.unit((request, pushed, repository), admission)? {
+        self.stopped = true;
+        break;
+      }
       if clock.now_ns().saturating_sub(begun) >= ns {
         break;
       }
@@ -194,28 +216,30 @@ impl Walk {
     Ok(self.pass == Pass::Done)
   }
 
-  /// One unit of the walk: one object of the first pass, its end, or a frame of the propagation.
+  /// One unit of the walk: one object of the first pass, its end, or a frame of the propagation; whether it went on,
+  /// not stopped at an object whose read met a let-go window (the module docs).
   fn unit<R: Repository + ?Sized>(
     &mut self,
     (request, pushed, repository): (&Request, &Pushed<'_>, &R),
     admission: &mut Admission,
-  ) -> Result<(), Refusal> {
+  ) -> Result<bool, Refusal> {
     match self.pass {
       Pass::States => match pushed.objects().get(self.at) {
         Some(object) => self.judge(object, (request, pushed, repository)),
-        None => self.propagation_begun(admission),
+        None => self.propagation_begun(admission).map(|()| true),
       },
       Pass::Propagate => self.propagation_unit((request, pushed), admission),
-      Pass::Done => Ok(()),
+      Pass::Done => Ok(true),
     }
   }
 
-  /// The first pass's object: its own edges out of the pack judged.
+  /// The first pass's object: its own edges out of the pack judged; or, its read stopped at a let-go window to wait
+  /// for, nothing judged and `false` (the module docs).
   fn judge<R: Repository + ?Sized>(
     &mut self,
     object: &Placed,
     (request, pushed, repository): (&Request, &Pushed<'_>, &R),
-  ) -> Result<(), Refusal> {
+  ) -> Result<bool, Refusal> {
     let shallow_commit = self.shallow.binary_search(&object.id).is_ok();
     let mut state = Connected::Complete;
     let read = edges_of(
@@ -231,13 +255,18 @@ impl Walk {
         }
       },
     )?;
+    if read {
+      self.wait.answered();
+    } else if self.wait.waits(pushed.away()) {
+      return Ok(false);
+    }
     let state = if read { state } else { Connected::Missing };
     self.incomplete |= state != Connected::Complete;
     if let Some(slot) = self.states.get_mut(self.at) {
       *slot = state;
     }
     self.at = self.at.saturating_add(1);
-    Ok(())
+    Ok(true)
   }
 
   /// The first pass ended: done when no object is incomplete of its own (the module docs), else the propagation begun
@@ -259,12 +288,13 @@ impl Walk {
   }
 
   /// One unit of the propagation: the top frame handled; with none, the next command's pushed tip entered; with no
-  /// command left, the propagation done and its tables given back.
+  /// command left, the propagation done and its tables given back. Whether it went on, not stopped at an object whose
+  /// read met a let-go window ([`Walk::enter`]).
   fn propagation_unit(
     &mut self,
     (request, pushed): (&Request, &Pushed<'_>),
     admission: &mut Admission,
-  ) -> Result<(), Refusal> {
+  ) -> Result<bool, Refusal> {
     match self.stack.pop() {
       Some(Frame::Enter { node, parent }) => {
         self.enter(node, parent, (request.format, pushed), admission)
@@ -285,49 +315,53 @@ impl Walk {
           *mark = Mark::Done;
         }
         self.fold(parent, state);
-        Ok(())
+        Ok(true)
       }
       None => {
         let Some(command) = request.commands.get(self.at) else {
           self.stack = Vec::new();
           self.marks = Vec::new();
           self.pass = Pass::Done;
-          return Ok(());
+          return Ok(true);
         };
         self.at = self.at.saturating_add(1);
         match pushed.position(&command.new) {
-          Some(tip) if !command.is_delete() => self.push(
-            Frame::Enter {
-              node: tip,
-              parent: None,
-            },
-            admission,
-          ),
-          _ => Ok(()),
+          Some(tip) if !command.is_delete() => self
+            .push(
+              Frame::Enter {
+                node: tip,
+                parent: None,
+              },
+              admission,
+            )
+            .map(|()| true),
+          _ => Ok(true),
         }
       }
     }
   }
 
   /// `node`, reached from the exit frame at `parent`: folded into it when already done; else opened, its exit frame
-  /// pushed and each child not yet done entered after it, a done child folded at once.
+  /// pushed and each child not yet done entered after it, a done child folded at once. An object whose read met a
+  /// let-go window to wait for is left as it was, its frame put back to be entered again, and `false` answered (the
+  /// module docs); one that cannot be read otherwise is `Missing`.
   fn enter(
     &mut self,
     node: usize,
     parent: Option<usize>,
     (format, pushed): (ObjectFormat, &Pushed<'_>),
     admission: &mut Admission,
-  ) -> Result<(), Refusal> {
+  ) -> Result<bool, Refusal> {
     match self.marks.get(node) {
       Some(Mark::New) => {}
       Some(Mark::Done) => {
         let state = self.states.get(node).copied().unwrap_or(Connected::Missing);
         self.fold(parent, state);
-        return Ok(());
+        return Ok(true);
       }
       // An object open on the path below cannot be reached again, its names being its children's hashes; nothing
       // to fold.
-      Some(Mark::Open) | None => return Ok(()),
+      Some(Mark::Open) | None => return Ok(true),
     }
     if let Some(mark) = self.marks.get_mut(node) {
       *mark = Mark::Open;
@@ -343,7 +377,7 @@ impl Walk {
       admission,
     )?;
     let Some(object) = pushed.objects().get(node) else {
-      return Ok(());
+      return Ok(true);
     };
     let mut worst = own;
     let mut refused = None;
@@ -353,7 +387,7 @@ impl Walk {
       states,
       ..
     } = self;
-    edges_of((node, object), (format, pushed), &mut |target, _| {
+    let read = edges_of((node, object), (format, pushed), &mut |target, _| {
       let Some(child) = pushed.position(&target) else {
         return;
       };
@@ -374,10 +408,23 @@ impl Walk {
         _ => {}
       }
     })?;
+    if read {
+      self.wait.answered();
+    } else if self.wait.waits(pushed.away()) {
+      // Nothing was entered under it: its exit frame goes, and its own frame takes the place again.
+      self.stack.truncate(exit);
+      if let Some(mark) = self.marks.get_mut(node) {
+        *mark = Mark::New;
+      }
+      self.push(Frame::Enter { node, parent }, admission)?;
+      return Ok(false);
+    } else {
+      worst = Connected::Missing;
+    }
     if let Some(Frame::Exit { worst: folded, .. }) = self.stack.get_mut(exit) {
       *folded = (*folded).max(worst);
     }
-    refused.map_or(Ok(()), Err)
+    refused.map_or(Ok(true), Err)
   }
 
   /// `state` folded into the exit frame at `parent`, if any.
@@ -392,6 +439,13 @@ impl Walk {
     grown(&mut self.stack, admission)?;
     self.stack.push(frame);
     Ok(())
+  }
+
+  /// Whether the walk's last turn ended at an object whose read met a let-go window: its caller's turn ends there too,
+  /// so the window is brought back before the walk meets the object again (main's lines of agents/w-git-b1-debug: the
+  /// check's own turn loop took the walk again at once, and the same let-go met twice refused the object).
+  pub(crate) fn stopped(&self) -> bool {
+    self.stopped
   }
 
   /// Each command's connectivity once the walk is done ([`connectivity`]'s answer), charged a

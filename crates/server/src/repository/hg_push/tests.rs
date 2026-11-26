@@ -414,6 +414,129 @@ pub(crate) async fn pushed_changegroup(id: RepositoryId, part: ChangegroupPart) 
   );
 }
 
+/// Ruling R, piece (i) (main 01a20182's ruling of 2026-11-26: a push's changeset is homed in the region, its record
+/// naming one homed list, and no record names content not durable at its homes, A-727's rule). Do: start a daemon over
+/// an anchor segment that holds no content object, so no shard of it can publish an image (`verbs::publish_shard`
+/// refuses `RecoveryIncomplete`) and no home can make what it keeps durable; push two changesets to a Mercurial
+/// repository there. Expect: the push refused in slates' words that its changeset was not made durable at its homes
+/// (`HOMED_SHORT`), its homing counted short (`vcs.hg.push_homed_short`), nothing of it in the repository's register,
+/// and nothing held for the region once its attempt's holds are settled. Red before: the push landed and its entry
+/// committed, naming segments no home held.
+#[test]
+fn a_push_whose_changeset_is_not_durable_at_its_homes_is_refused_and_records_nothing() {
+  use crate::repository::store_tests::{anchor_of, daemon_over};
+  let profile = crate::daemon::test_profile();
+  let instance = format!("hg-unhomed-{}", std::process::id());
+  let store = crate::test_store::TestStore::start("hg-unhomed");
+  let anchor = anchor_of(&instance);
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  daemon.bootstrap(true).unwrap();
+  let hg = made_on(&daemon, "unhomed");
+  crate::daemon::observe_first(&daemon, |state| {
+    crate::verbs::publish_shard(state).unwrap();
+  });
+  daemon.stop();
+  // Its successor over the same segment, its anchor's content object gone: its shards keep no recovery image.
+  let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+  config.vcs_disk = Some(store.handle());
+  let (handoff, len) = anchor.0.handoff().unwrap();
+  let source = crate::daemon::SegmentSource::Handoff {
+    handoff,
+    len,
+    content: None,
+    rendezvous: anchor.1.adoption(),
+  };
+  let daemon = crate::Daemon::start(&profile, config, source).unwrap();
+
+  let repository = hg.repository;
+  let made = history_of(&[
+    ("one", "one", b"one\n", None, "default"),
+    ("two", "two", b"two\n", Some(0), "default"),
+  ]);
+  let bundle = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0, 1]);
+  let outcome = crate::test_store::run_on_first(
+    &daemon,
+    move || async move { pushed_bytes_to(repository, &bundle).await },
+    NAMED_PATIENCE,
+  );
+  let settled = until(&daemon, |_| {
+    crate::vcs_store::homes::region_held_here().is_empty()
+  });
+  let (records, short) = crate::daemon::observe_first(&daemon, move |state| {
+    let records = (0..)
+      .map_while(|index| {
+        state
+          .db
+          .partition()
+          .repositories()
+          .object_record(repository, index)
+      })
+      .count();
+    let short = state
+      .refusals
+      .get(super::super::hg_run::HOMED_SHORT)
+      .copied()
+      .unwrap_or(0);
+    (records, short)
+  });
+  daemon.stop();
+  let words = match &outcome {
+    Outcome::Refused(reply) => encoded(reply),
+    other => panic!("the push was not refused: {other:?}"),
+  };
+  assert!(
+    words
+      .windows(super::HOMED_SHORT.len())
+      .any(|at| at == super::HOMED_SHORT),
+    "refused in slates' words for a changeset not durable at its homes: {}",
+    String::from_utf8_lossy(&words)
+  );
+  assert!(short > 0, "its homing counted short");
+  assert_eq!(records, 0, "nothing of the push in the register");
+  assert!(
+    settled,
+    "nothing held for the region once its holds settled"
+  );
+}
+
+/// Ruling R, its first piece's counter (main's order of 2026-11-26: a segment's bytes by section, read from the status
+/// report). Do: on a stored shard push three changesets, each adding a file. Expect: the push accepted and its segments'
+/// landed bytes counted by section: the `Payload` bytes exactly the bytes its deltas' chunks took
+/// (`vcs.hg.segment_compress_stored_bytes`, counted as the chunks were made), and the `Record` and `Texts` bytes moved.
+/// Red before: nothing counted a landed segment's sections.
+#[test]
+fn a_pushs_landed_segments_are_counted_by_section() {
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = Hg::made("sections").await;
+    let made = history_of(&[
+      ("base", "a", b"alpha\n", None, "default"),
+      ("second", "b", b"beta\n", Some(0), "default"),
+      ("third", "c", b"gamma\n", Some(1), "default"),
+    ]);
+    let outcome = pushed_bytes_to(
+      hg.repository,
+      &crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0, 1, 2]),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Accepted(_)), "{outcome:?}");
+    let counted = crate::repository::svn_commit::tests::on(|state| {
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        count(crate::repository::hg_run::LANDED_RECORD_BYTES),
+        count(crate::repository::hg_run::LANDED_PAYLOAD_BYTES),
+        count(crate::repository::hg_run::LANDED_TEXTS_BYTES),
+        count(super::COMPRESS_STORED_BYTES),
+      )
+    });
+    let (record, payload, texts, chunked) = counted;
+    assert_eq!(payload, chunked, "the payload is its chunks: {counted:?}");
+    assert!(
+      record > 0 && payload > 0 && texts > 0,
+      "each section counted: {counted:?}"
+    );
+  });
+}
+
 /// Bookmark `mark` pushed to repository `id` at `node` alone (a `bookmarks` part, as `hg push -B` sends one for a
 /// changeset the server holds): the push's answer.
 pub(crate) async fn pushed_bookmark(id: RepositoryId, mark: &[u8], node: Node) -> Outcome {
@@ -2807,7 +2930,12 @@ async fn run_held_until_dropped(repository: RepositoryId) {
   let sequence = header.sequence;
   if disk.land(header, parts).await.is_ok() {
     STAND_IN_LANDED.with(|landed| landed.set(true));
-    run.landed(sequence, &[]);
+    let entry = slates_hg::import::record::SegmentEntry {
+      sequence,
+      record: ([0; 32], 0),
+      payload: ([0; 32], 0),
+    };
+    run.landed(entry, &[]);
   }
   std::future::pending::<()>().await;
   drop(run);
@@ -2872,14 +3000,29 @@ fn a_dropped_run_is_forgotten_and_the_next_push_lands_past_it() {
     parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[0, 1])))],
   };
   pushed_unbundle_on(&daemon, hg, unbundle);
-  let (run, tip) = crate::daemon::observe_first(&daemon, move |state| {
-    let records = state.db.partition().repositories();
-    let run = (0..)
-      .map_while(|index| records.object_record(repository, index))
-      .filter_map(slates_hg::import::record::run_of)
-      .last();
+  // The push's entry names its segment list (record v12, ruling R), read back from the node's store by its identity.
+  let first = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let (homed, disk) = crate::repository::svn_commit::tests::on(|state| {
+        let records = state.db.partition().repositories();
+        let homed = (0..)
+          .map_while(|index| records.object_record(repository, index))
+          .filter_map(slates_hg::import::record::homed_run_of)
+          .last();
+        (homed, state.vcs_disk.clone())
+      });
+      let (homed, disk) = (homed?, disk?);
+      let list = crate::vcs_store::keyed_bytes(&disk, homed.list, homed.len).await?;
+      slates_hg::import::record::segment_list_of(&list)?
+        .first()
+        .map(|entry| entry.sequence)
+    },
+    NAMED_PATIENCE,
+  );
+  let tip = crate::daemon::observe_first(&daemon, move |state| {
     crate::vcs_store::rebuild(state, repository);
-    (run, made[1].node)
+    made[1].node
   });
   let rebuilt = until(&daemon, move |state| {
     !state.vcs_stores.rebuilding(repository)
@@ -2889,11 +3032,10 @@ fn a_dropped_run_is_forgotten_and_the_next_push_lands_past_it() {
   assert!(landed, "the task's run landed a changeset at a sequence");
   assert!(forgotten, "the dropped run's rows forgotten");
   assert_eq!(abandoned, 1);
-  let run = run.expect("the push's entry names its run");
   assert_eq!(
-    run.first(),
+    first,
     Some(named + 2),
-    "the push's run past the abandoned sequence"
+    "the push's entry names its run, past the abandoned sequence"
   );
   assert!(rebuilt, "still rebuilding after {TASK_WAIT:?}");
   assert_eq!(head, Some(tip), "the rebuild replayed the push's run");

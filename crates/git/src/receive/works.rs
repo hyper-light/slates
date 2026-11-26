@@ -47,6 +47,8 @@ use slates_merge::push::{
 use slates_merge::{ConflictWindow, Green, Increment};
 use std::cell::Cell;
 
+use crate::away::WaitOnce;
+
 use super::{
   ATOMIC_TRANSACTION_FAILED, Command, Declined, FAILED_TO_UPDATE, Judge, MISSING_OBJECTS, Pushed,
   Reported, Repository, message,
@@ -227,9 +229,10 @@ pub struct Verdicts<'w, G: ?Sized, R: ?Sized, O> {
   room: u64,
   /// A command's work built over the turns before its verdict ([`Verdicts::prepare`]), which its verdict takes.
   prepared: Cell<Option<Preparing>>,
-  /// Where in its pack the let-go window a command's peel last stopped for lies ([`Verdicts::peel_away`]), kept by the
-  /// push across its turns: the same window met again, not brought back, lets the command go on to its refusal.
-  away_seen: Cell<Option<u64>>,
+  /// The let-go, by the store's number for it, of the window a command's peel last stopped for
+  /// ([`Verdicts::peel_away`]), kept by the push across its turns: the same let-go met again, the window not brought
+  /// back between, lets the command go on to its refusal ([`crate::away`]'s one rule).
+  away_seen: WaitOnce<u64>,
 }
 
 /// A command's work built a unit at a time over the turns before its verdict (A-752; §4.3's step budget): a push over
@@ -336,19 +339,21 @@ where
       name,
       room,
       prepared: Cell::new(None),
-      away_seen: Cell::new(None),
+      away_seen: WaitOnce::default(),
     }
   }
 
   /// These verdicts, the let-go window a peel last stopped for `away_seen` ([`Verdicts::away_seen`]).
   pub fn peeled(self, away_seen: Option<u64>) -> Self {
-    self.away_seen.set(away_seen);
-    self
+    Self {
+      away_seen: WaitOnce::after(away_seen),
+      ..self
+    }
   }
 
-  /// Where the let-go window a peel stopped for lies, for the push to keep across its turns ([`Verdicts::peeled`]).
+  /// The let-go a peel stopped for, by its number, for the push to keep across its turns ([`Verdicts::peeled`]).
   pub fn away_seen(&self) -> Option<u64> {
-    self.away_seen.get()
+    self.away_seen.last()
   }
 
   /// These verdicts, taking the work `prepared` built for its command, where it is done and still that command's.
@@ -617,17 +622,10 @@ where
   /// so a window that cannot be brought back ends the push typed, never holds it.
   fn peel_away(&self, command: &Command, pushed: &Pushed<'_>) -> bool {
     if self.tree_of(&command.new, pushed, &command.name).is_ok() {
-      self.away_seen.set(None);
+      self.away_seen.answered();
       return false;
     }
-    let Some(at) = self.repository.away() else {
-      return false;
-    };
-    if self.away_seen.get() == Some(at) {
-      return false;
-    }
-    self.away_seen.set(Some(at));
-    true
+    self.away_seen.waits(self.repository.away())
   }
 
   /// The tree the object `head` names, as git peels a ref (A-836: a ref may name any object): a commit's; a tree itself;
