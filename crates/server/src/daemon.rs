@@ -9672,9 +9672,7 @@ mod tests {
           );
           Some(work)
         });
-        let Some(work) = work else {
-          return None;
-        };
+        let work = work?;
         // A git green's submit is a client's recorded request (A-896), awaited from a task of the shard: its
         // refinement, made commit and whole build run as the shard's own tasks run them.
         let submitted =
@@ -14835,34 +14833,21 @@ mod tests {
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
     let at = crash.unwrap_or(0);
-    let repository = first
-      .observe(first.shards.first().copied(), move |state| {
+    first
+      .observe(first.shards.first().copied(), move |_state| {
         crate::repository::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(B1_SEGMENT_BYTES));
         crate::repository::hg_run::TEST_PARK_AFTER_SEGMENTS.with(|park| park.set(at));
-        let reply = crate::test_store::create(
-          state,
-          &b1_owner(),
-          slates_ipc::protocol::RequestBody::CreateRepository {
-            name: "oracle".to_owned(),
-            tool: slates_ipc::protocol::VcsTool::Mercurial,
-            format: slates_ipc::protocol::ObjectFormat::Sha1,
-            default_branch: crate::repository::hg_push::line_name(b"default", 0),
-            green: None,
-          },
-        );
-        assert!(
-          matches!(reply, slates_ipc::protocol::ReplyBody::GreenCreated { .. }),
-          "{reply:?}"
-        );
-        state
-          .db
-          .partition()
-          .repositories()
-          .repository_named("oracle")
-          .unwrap()
-          .id
       })
       .unwrap();
+    // Made as a client's creation is, from the test's thread, the shard never held through its commit.
+    let line = crate::repository::hg_push::line_name(b"default", 0);
+    let asked = (
+      "oracle",
+      slates_ipc::protocol::VcsTool::Mercurial,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      line.as_str(),
+    );
+    let (repository, _) = crate::test_store::create_on(&first, 0, &b1_owner(), asked);
     let (sent, answered) = std::sync::mpsc::channel();
     b1_push(&first, repository, bundle, sent);
     let (outcome, unnamed) = match crash {
@@ -14999,32 +14984,15 @@ mod tests {
     )
     .unwrap();
     daemon.bootstrap(true).unwrap();
-    let repository = daemon
-      .observe(daemon.shards.first().copied(), move |state| {
-        let reply = crate::test_store::create(
-          state,
-          &b1_owner(),
-          slates_ipc::protocol::RequestBody::CreateRepository {
-            name: "many-heads".to_owned(),
-            tool: slates_ipc::protocol::VcsTool::Mercurial,
-            format: slates_ipc::protocol::ObjectFormat::Sha1,
-            default_branch: crate::repository::hg_push::line_name(b"default", 0),
-            green: None,
-          },
-        );
-        assert!(
-          matches!(reply, slates_ipc::protocol::ReplyBody::GreenCreated { .. }),
-          "{reply:?}"
-        );
-        state
-          .db
-          .partition()
-          .repositories()
-          .repository_named("many-heads")
-          .unwrap()
-          .id
-      })
-      .unwrap();
+    // Made as a client's creation is, from the test's thread, the shard never held through its commit.
+    let line = crate::repository::hg_push::line_name(b"default", 0);
+    let asked = (
+      "many-heads",
+      slates_ipc::protocol::VcsTool::Mercurial,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      line.as_str(),
+    );
+    let (repository, _) = crate::test_store::create_on(&daemon, 0, &b1_owner(), asked);
     let (sent, answered) = std::sync::mpsc::channel();
     b1_push(&daemon, repository, &bundle, sent);
     let outcome = answered.recv().ok().flatten();

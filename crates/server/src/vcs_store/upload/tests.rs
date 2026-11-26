@@ -359,7 +359,7 @@ fn git(name: &str) -> crate::test_store::Asked<'_> {
 }
 
 /// Runs `history` on a stored shard with the repositories `asked` made first from the test's thread, never on the shard
-/// (`test_store::SHARD_BLOCKING_ALLOWED`): their ids and root greens, in order. For a history that pushes nothing.
+/// (`test_store::refuse_on_a_shard`): their ids and root greens, in order. For a history that pushes nothing.
 fn made<T: Send + 'static, const N: usize>(
   asked: [crate::test_store::Asked<'static>; N],
   history: impl FnOnce(&mut ShardState, [(RepositoryId, DbVolumeId); N]) -> T + Clone + Send + 'static,
@@ -829,7 +829,7 @@ impl InTurns {
   }
 
   /// Its steps to its end ([`InTurns::step`]): its bytes.
-  fn to_end(
+  fn stepped_to_end(
     mut self,
     state: &mut ShardState,
     lent: (RepositoryId, &super::GitGeneration, bool),
@@ -880,9 +880,9 @@ fn a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile
     .await;
     tagged((id, root, version), first, "v2").await;
     on_state(move |state| {
-      let held = turns.to_end(state, (id, &began, true));
+      let held = turns.stepped_to_end(state, (id, &began, true));
       let hold = super::hold_in(state, id, &owner()).expect("held");
-      let unheld = InTurns::begun(state, &hold, &wants).to_end(state, (id, &hold, false));
+      let unheld = InTurns::begun(state, &hold, &wants).stepped_to_end(state, (id, &hold, false));
       (start, held, unheld)
     })
   });

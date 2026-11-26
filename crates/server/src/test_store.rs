@@ -405,7 +405,7 @@ pub(crate) async fn imported_through_the_verb(
 const IMPORT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `history` run as a task on the first shard of a daemon keeping a store, its landed packs let go as production lets
-/// them go, with every store wait in it awaited, never the shard's thread held through one ([`SHARD_BLOCKING_ALLOWED`]).
+/// them go, with every store wait in it awaited, never the shard's thread held through one ([`refuse_on_a_shard`]).
 pub(crate) fn run_on_stored_shard<
   T: Send + 'static,
   F: std::future::Future<Output = T> + 'static,
@@ -485,70 +485,19 @@ pub(crate) fn create_adopting_on(
   }
 }
 
-/// The fixtures that may still block a shard's own thread on the store, by name, each until its callers move to the
-/// awaiting forms (main's order of 2026-11-25: `audit_on_stored_shard_made`, [`created`] in a task, [`create_on`] from
-/// the test's thread). The list only shrinks: its length is the figure GAPS records ("The shard-blocking allow-list"),
-/// held by a test, so an entry added is a GAPS edit too. A fixture in it runs its blocking body through
-/// [`allowing_shard_blocking`]; any other blocking call on a shard's thread is refused ([`refuse_on_a_shard`]).
-pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
-  Allowed {
-    fixture: "test_store::create",
-    owner: "each caller's (GAPS: hg 4, other 5)",
-    reaching: 9,
-  },
-  Allowed {
-    fixture: "repository::hg_push::land_stored",
-    owner: "w-hg (vcs_ssh::tests::hg 2)",
-    reaching: 2,
-  },
-];
-
-/// A fixture allowed to block a shard's thread on the store for now ([`SHARD_BLOCKING_ALLOWED`]): its name, whose tests
-/// reach it, and how many do, counted when it was listed (GAPS says whether by call site or by test).
-#[derive(Debug)]
-pub(crate) struct Allowed {
-  /// The fixture, as [`allowing_shard_blocking`] names it.
-  pub(crate) fixture: &'static str,
-  /// Whose tests reach it, to move them.
-  pub(crate) owner: &'static str,
-  /// How many call sites reach it.
-  pub(crate) reaching: u32,
-}
-
-std::thread_local! {
-  /// The allow-listed fixture this thread runs the body of now, if any ([`allowing_shard_blocking`]).
-  static ALLOWED_HERE: core::cell::Cell<Option<&'static str>> = const { core::cell::Cell::new(None) };
-}
-
-/// Runs `body`, which may block this shard's thread on the store, for `fixture`, one of [`SHARD_BLOCKING_ALLOWED`]:
-/// refused for a fixture not in it.
-pub(crate) fn allowing_shard_blocking<T>(fixture: &'static str, body: impl FnOnce() -> T) -> T {
-  assert!(
-    SHARD_BLOCKING_ALLOWED
-      .iter()
-      .any(|allowed| allowed.fixture == fixture),
-    "{fixture} is not allowed to block a shard's thread (test_store::SHARD_BLOCKING_ALLOWED)"
-  );
-  let before = ALLOWED_HERE.with(|allowed| allowed.replace(Some(fixture)));
-  let done = body();
-  ALLOWED_HERE.with(|allowed| allowed.set(before));
-  done
-}
-
 /// Refuses `blocking`, a wait on the store a test helper makes by joining a thread of its own, when it is called on a
 /// daemon shard's own thread (one the runtime names `slates-shard-N`): there the wait holds the shard through the store's
 /// commit, and under load that alone passes the watchdog's window, which judges a shard neither running nor runnable
 /// wedged (main's 8a burner loop at 228d0dc97: exit 4 in 3 of 6 rounds, a fixture's landing in an observation). So the
 /// shape fails every test that has it, on any machine, naming `instead`, never only under a slow fsync. A bare runtime
-/// runs on the test's own thread and is not refused; neither is an allow-listed fixture's body
-/// ([`allowing_shard_blocking`]).
+/// runs on the test's own thread and is not refused. No fixture is allowed it (the shard-blocking allow-list emptied
+/// and removed, w-hg, 2026-11-26).
 fn refuse_on_a_shard(blocking: &str, instead: &str) {
   let on_a_shard = std::thread::current()
     .name()
     .is_some_and(|name| name.starts_with("slates-shard-"));
-  let allowed = ALLOWED_HERE.with(core::cell::Cell::get);
   assert!(
-    !on_a_shard || allowed.is_some(),
+    !on_a_shard,
     "{blocking} on a daemon shard's own thread holds the shard through the store's commit: {instead}"
   );
 }
@@ -738,38 +687,6 @@ pub(crate) fn audit_daemon_of_stored(shards: u16) -> (TestStore, crate::Daemon) 
   (store, daemon)
 }
 
-/// A `CreateRepository` request served in a test's synchronous history on a shard of a node keeping a store, answered
-/// once its changeset 0 is landed and it is recorded (`repository::create_blocking`, A-767 item 7): the verb's own
-/// creation answers by its reply route from a task, which a history holding the shard cannot wait for ([`created`] and
-/// [`create_on`] serve a history that runs as a task, or the test's thread). On a node with no store, and for any other
-/// request, the verb as a client's dispatch serves it.
-pub(crate) fn create(
-  state: &mut crate::state::ShardState,
-  principal: &slates_db::catalog::Principal,
-  request: slates_ipc::protocol::RequestBody,
-) -> slates_ipc::protocol::ReplyBody {
-  let Some(disk) = state.vcs_disk.clone() else {
-    return crate::verbs::dispatch(state, 1, principal, request);
-  };
-  match request {
-    slates_ipc::protocol::RequestBody::CreateRepository {
-      name,
-      tool,
-      format,
-      default_branch,
-      green,
-    } => allowing_shard_blocking("test_store::create", || {
-      crate::repository::create_blocking(
-        state,
-        (disk, principal),
-        (&name, tool, format, &default_branch),
-        green,
-      )
-    }),
-    other => crate::verbs::dispatch(state, 1, principal, other),
-  }
-}
-
 /// A store-holding daemon over `owner`'s repository `name`, whose revision 1 adds `/trunk/a.bin` with `bytes` (a stored text, which
 /// its changeset carries), every hold RAM has on the text let go after: the green's held table's and the content
 /// store's (C2 stage B part 2). The store's guard comes first; keep it alive past the daemon's stop. The repository's id
@@ -910,111 +827,6 @@ pub(crate) fn noise(len: usize) -> Vec<u8> {
       state.to_le_bytes()[0]
     })
     .collect()
-}
-
-/// Answers what a streamed answer asks of the changeset store (`slates_hg::render::StoreWants`), each want asked of
-/// `disk` for `repository` and waited for on a thread of its own ([`land_blocking`]'s way), for a test's synchronous
-/// history on a shard: what `vcs_store::hg_view::answer_store_wants` answers between a daemon's turns. Whether every
-/// want was answered.
-pub(crate) fn answer_wants_blocking(
-  disk: &StoreHandle,
-  repository: u128,
-  wants: &mut dyn slates_hg::render::StoreWants,
-) -> bool {
-  use slates_hg::render::{StoredPlace, StoredRevision, Want};
-  refuse_on_a_shard(
-    "the changeset store's answers waited for on its thread (test_store::answer_wants_blocking)",
-    "answer the wants from the test's thread, or await them in a task on the shard (hg_view::answer_wants_over)",
-  );
-  while let Some(want) = wants.wants().cloned() {
-    let disk = disk.clone();
-    let given = std::thread::scope(|scope| {
-      scope
-        .spawn(move || {
-          waiting_runtime()
-            .block_on(async move {
-              match want {
-                Want::Rows { logs } => {
-                  let asked = logs
-                    .into_iter()
-                    .map(|(log, nodes)| (log, nodes.iter().map(|node| node.to_vec()).collect()))
-                    .collect();
-                  disk
-                    .texts_by_tool(repository, asked)
-                    .await
-                    .ok()
-                    .map(|found| {
-                      slates_hg::serve::getbundle::Given::Rows(
-                        found
-                          .into_iter()
-                          .map(|log| {
-                            log
-                              .into_iter()
-                              .map(|row| {
-                                row.map(|(text, row)| StoredRevision {
-                                  text,
-                                  base: row.base,
-                                  place: StoredPlace {
-                                    payload: row.place.payload,
-                                    offset: row.place.offset,
-                                    len: row.place.len,
-                                    chunk: row.form == slates_store::texts::Form::Chunk,
-                                  },
-                                })
-                              })
-                              .collect()
-                          })
-                          .collect(),
-                      )
-                    })
-                }
-                Want::Chunks { places } => {
-                  let asked = places
-                    .iter()
-                    .map(|place| slates_store::texts::Place {
-                      payload: place.payload,
-                      offset: place.offset,
-                      len: place.len,
-                    })
-                    .collect();
-                  disk
-                    .places(asked)
-                    .await
-                    .ok()
-                    .map(slates_hg::serve::getbundle::Given::Chunks)
-                }
-                Want::Texts { texts, most } => {
-                  // A test's synchronous answer copies a want in one request: its step the want's own bytes.
-                  crate::vcs_store::hg_view::texts_made(&disk, repository, &texts, (most, most))
-                    .await
-                    .ok()
-                    .map(|(made, _)| match made {
-                      crate::vcs_store::hg_view::MadeTexts::Made(made) => {
-                        slates_hg::serve::getbundle::Given::Texts(made)
-                      }
-                      crate::vcs_store::hg_view::MadeTexts::Past => {
-                        slates_hg::serve::getbundle::Given::TextsPast
-                      }
-                    })
-                }
-              }
-            })
-            .ok()
-            .flatten()
-        })
-        .join()
-        .ok()
-        .flatten()
-    });
-    match given {
-      Some(slates_hg::serve::getbundle::Given::Rows(rows)) => wants.give_rows(rows),
-      Some(slates_hg::serve::getbundle::Given::Chunks(chunks)) => wants.give_chunks(chunks),
-      Some(slates_hg::serve::getbundle::Given::Texts(texts)) => wants.give_texts(texts),
-      Some(slates_hg::serve::getbundle::Given::TextsPast) => wants.texts_past(),
-      None => return false,
-    }
-  }
-  true
 }
 
 /// The principal the Subversion helpers below act as: uid 1234 on host 0, as the store tests' owner.
@@ -1213,35 +1025,6 @@ fn the_landed_pack_pins_hold_the_figure_gaps_records() {
     assert!(
       !pinned.owner.is_empty() && !pinned.until.is_empty(),
       "{pinned:?} carries its owner and its piece"
-    );
-  }
-}
-
-#[test]
-fn the_shard_blocking_allow_list_holds_the_figure_gaps_records() {
-  const GAPS: &str = include_str!("../../../docs/wip/GAPS.md");
-  const LINE: &str = "**The shard-blocking allow-list: ";
-  let recorded = GAPS
-    .lines()
-    .find_map(|line| line.split_once(LINE))
-    .and_then(|(_, rest)| rest.split_once(" fixtures**"))
-    .map(|(figure, _)| figure.parse::<usize>())
-    .expect("GAPS records the allow-list's figure")
-    .expect("a whole number");
-  assert_eq!(
-    SHARD_BLOCKING_ALLOWED.len(),
-    recorded,
-    "edit the list and GAPS together"
-  );
-  for allowed in SHARD_BLOCKING_ALLOWED {
-    let named = SHARD_BLOCKING_ALLOWED
-      .iter()
-      .filter(|other| other.fixture == allowed.fixture)
-      .count();
-    assert_eq!(named, 1, "{allowed:?} listed once");
-    assert!(
-      !allowed.owner.is_empty() && allowed.reaching > 0,
-      "{allowed:?} carries its owner and reach"
     );
   }
 }

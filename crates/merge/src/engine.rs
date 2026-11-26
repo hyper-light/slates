@@ -2199,13 +2199,20 @@ fn sole_run(base_len: u64, ops: &[Op], places: &BTreeMap<(u64, u64), usize>) -> 
   places.get(&(op.src, op.len)).copied()
 }
 
+/// [`move_whole_runs`]' two lists: each whole file's place with its run, and each file named for its run's object with
+/// that object's identity.
+type WholesAndNames<'lists> = (
+  &'lists [(usize, usize)],
+  &'lists [(usize, crate::named::Identity)],
+);
+
 /// Gives each of `wholes`' files its run's bytes (A-760, [`alone`]): last, once every other file is made. A file named
 /// for its run's object (`names`, [`named_files`]) holds it by its name alone and takes no bytes, so nothing is made for
 /// it, nor let go at its commit (A-920 3n); any other takes a copy of its run's bytes, which it keeps.
 fn move_whole_runs(
   effects: &mut [Effect],
   read: &crate::named::Read,
-  (wholes, names): (&[(usize, usize)], &[(usize, crate::named::Identity)]),
+  (wholes, names): WholesAndNames<'_>,
 ) {
   for &(place, run) in wholes {
     if let Some(Effect::SetContent(_, bytes @ None, ..)) = effects.get_mut(place) {
