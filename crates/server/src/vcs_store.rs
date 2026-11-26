@@ -5138,8 +5138,8 @@ async fn svn_fetched_for_rebuild(id: RepositoryId, generation: u64) {
 }
 
 /// A git record's pack read from the node's store a piece at a time (C2): the range its replay's last turn wanted in
-/// repository `id`'s rebuild of `generation`, filled here, off the step, and taken back only while this rebuild is still
-/// the repository's (a rebuild begun meanwhile gave this one's replay back). Whether the rebuild goes on.
+/// repository `id`'s rebuild of `generation`, filled here, off the step, and taken back only while this rebuild is
+/// still the repository's (a rebuild begun meanwhile gave this one's replay back). Whether the rebuild goes on.
 async fn pack_filled_for_rebuild(id: RepositoryId, generation: u64) -> bool {
   #[cfg(test)]
   while REPLAY_FILLS_BEFORE_HOLD.with(|left| left.get() == Some(0)) {
