@@ -7672,7 +7672,8 @@ fn spread_create(dirs: usize, depth: usize, deltas: Deltas) -> (Vec<u8>, ObjectI
 /// and every read that found nothing kept inflating its root (a star's chain is one step, so a read either finds its
 /// tree or its base kept, or inflates the base), its headroom over the floor those reads past each base's first. Red
 /// before the count: 0. Kept oldest-laid first it read 44 (9 first reads and 35 bases given back while their
-/// revisions were still read).
+/// revisions were still read); with a base found kept again laid again with the newest (`packed::Recent::refresh`), 23
+/// (94 hits), the rest the budget's turnover, its capacity and not its order.
 #[test]
 fn a_fetchs_tree_reads_count_the_bases_they_inflate_whole() {
   let (identity, certificate) = identity();
