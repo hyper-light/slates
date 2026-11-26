@@ -156,6 +156,10 @@ pub struct PositionCounts {
   pub tree_deltas_most: u64,
   /// The deltas the walk's tree reads applied, summed.
   pub tree_deltas: u64,
+  /// Of those, each read's past its first, summed: what a read cache that kept every chain whole could have spared, since
+  /// a read of a tree stored as a delta applies that delta itself whatever is kept (main 01a20182's A/B of 2026-11-25:
+  /// 1,811,031 deltas over about 1.4 million reads, so whether the cache's order can gain is this share).
+  pub tree_deltas_past_one: u64,
   /// The walk's tree reads that found the tree, or an entry of its chain, kept by the read cache.
   pub read_cache_hits: u64,
   /// The times the walk widened the read cache before a tree's read (`Repository::widen_read_cache`).
@@ -378,6 +382,10 @@ impl<'r> StoreGraph<'r> {
         let mut positions = self.positions.borrow_mut();
         positions.counts.tree_deltas_most = positions.counts.tree_deltas_most.max(deltas);
         positions.counts.tree_deltas = positions.counts.tree_deltas.saturating_add(deltas);
+        positions.counts.tree_deltas_past_one = positions
+          .counts
+          .tree_deltas_past_one
+          .saturating_add(deltas.saturating_sub(1));
         if self.repository.last_read_found_kept() {
           positions.counts.read_cache_hits = positions.counts.read_cache_hits.saturating_add(1);
         }

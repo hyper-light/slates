@@ -1142,6 +1142,10 @@ pub(crate) const TREE_DELTAS_MOST: &str = "vcs_store.git_upload.tree_deltas_most
 /// Counter: the deltas a fetch's tree reads applied, summed: against the walk's trees opened, a tree's mean chain read.
 /// Format: a counter name.
 pub(crate) const TREE_DELTAS: &str = "vcs_store.git_upload.tree_deltas";
+/// Counter: of [`TREE_DELTAS`], each tree read's past its first, summed (`slates_git::store::PositionCounts::
+/// tree_deltas_past_one`): the most a read cache keeping every chain could spare, a read of a delta applying its own.
+/// Format: a counter name.
+pub(crate) const TREE_DELTAS_PAST_ONE: &str = "vcs_store.git_upload.tree_deltas_past_one";
 /// Counter: a fetch's tree reads that found the tree, or an entry of its chain, kept by its fork's read cache
 /// (`slates_git::store::PositionCounts::read_cache_hits`; main 01a20182's reading of 2026-11-25: on git/git the cache cut
 /// chain rebuilds by 2.1 % where a one-directory fixture cut 85 %). Format: a counter name.
@@ -1259,6 +1263,7 @@ impl ShardPacks {
       (POSITION_CACHE_CONFLICTS, self.chose.conflicts),
       (POSITION_CACHE_UNROOMED, self.chose.unroomed),
       (TREE_DELTAS, self.chose.tree_deltas),
+      (TREE_DELTAS_PAST_ONE, self.chose.tree_deltas_past_one),
       (READ_CACHE_HITS, self.chose.read_cache_hits),
       (READ_CACHE_WIDENED, self.chose.read_cache_widened),
       (READ_CACHE_REFUSED, self.chose.read_cache_refused),
