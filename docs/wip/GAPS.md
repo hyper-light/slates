@@ -14622,7 +14622,9 @@ then) and the whole to twice that (`SPAWNED_AND_RUN_NS`: the spawner's start, a 
 push finished before the test thread's read arrived (0 turns, 0 handed): its read now waits on the shard for the
 derivation under way (`git_derive::behind_and_under_way`) and begins in the poll that sees it; red, the thread held 3 s
 after the push, 0 handed before and 1 now. The DAV proppatch 500 of that loop was the product: A-622's bound learned
-from one fast run killed a slower second `post-revprop-change` (main's ruling of 2026-11-25, the next piece).
+from one fast run killed a slower second `post-revprop-change`. Main's ruling of 2026-11-25: no bound holds a run
+until `vcs_hooks::RUNS_FOR_A_BOUND` (99) runs support the 99th percentile it claims; until then the client's
+connection is the deadline (A-622 part 3, "The bound rests on enough runs").
 
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 

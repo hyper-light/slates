@@ -912,12 +912,12 @@ mod tests {
     got.recv().expect("the run answered")
   }
 
-  /// A hook's times after eight quick runs finished, each as long as [`quick_run`]'s: a bound a liveness window past a
-  /// hook that exits at once.
+  /// A hook's times after [`crate::vcs_hooks::RUNS_FOR_A_BOUND`] quick runs finished (the fewest a bound rests on),
+  /// each as long as [`quick_run`]'s: a bound a liveness window past a hook that exits at once.
   fn learned() -> HookTimes {
     let quick = quick_run();
     let mut times = HookTimes::default();
-    for _ in 0..8 {
+    for _ in 0..crate::vcs_hooks::RUNS_FOR_A_BOUND {
       quick.teach(&mut times);
     }
     times

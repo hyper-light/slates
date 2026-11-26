@@ -46619,6 +46619,20 @@ Applied in the same change to:
   (unstartable, not found). Red on a mutated copy, each caught by its test: no kill at the runner's kill (the deadline
   test ran to the test's own bound), no kill of leftovers (the child outlived the run), the client's leaving never seen
   (the first run never ended).
+- **The bound rests on enough runs (2026-11-25, w-git for main 01a20182, its ruling on A-622).** A hook's learned
+  bound held its second run: one finished run taught the tail of that one sample plus a liveness window. Main's 8a
+  loop showed the cost: a `post-revprop-change` (`cat > post.in`) whose first run took a few milliseconds was held to
+  about a window, its next run under load was killed past it (exit 9), and the PROPPATCH answered 500. A kill before
+  the client's own deadline saves the client nothing and fails its verb. Now `HookTimes::bound_ns` answers no bound
+  until `RUNS_FOR_A_BOUND` runs have finished: the bound claims the 99th percentile of its hook's runs
+  (`BOUND_QUANTILE_PERCENT`), and with `n` runs the largest is at best about the `n/(n+1)` quantile, so `q/(1 − q)` =
+  99 runs. Until then a run's deadline is its operation's own, its client's connection: every hook here runs inside its
+  client's request (git's `post-receive`, Subversion's `post-commit` and `post-revprop-change` answer it). Once the runs
+  are in, the learned bound cuts as before, backing off on each cut. Red:
+  `vcs_http::daemon_edge::tests::a_revprop_hook_slower_than_its_one_fast_run_is_not_killed`, a `post-revprop-change`
+  fast once and two windows slower the second time: the second PROPPATCH 500, "exitcode was 9", under the one-sample
+  rule; 207 now. The hung hook's red stays (`a_hook_past_its_learned_bound_is_killed_with_its_group_and_reaped`, its
+  times taught the full count).
 - **Owed:** the Windows driver (a job object for the hook's descendants and `slates_ipc::win_spawn`'s handle-list
   spawn); the launcher's namespace for a hook on Linux (§4.6); the push pieces' calls, each with its view and its tool's
   words for the outcomes; the hook times' table on the owner shard, one a configured hook.
