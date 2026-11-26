@@ -3662,6 +3662,35 @@ pub mod platform {
     Ok((owned_object(instance)?, owner))
   }
 
+  /// What an owner does with its open of its bootstrap object's name (Windows' [`owned_object`], A-176): a dead owner's
+  /// object found is taken over; none under the name ([`NO_SUCH_OBJECT`]), one is made; any other refusal (access
+  /// denied, an object of the name another made, a size or a layout the open refused, this process short of handles)
+  /// is the open's own refusal, never taken for absence, since an object made over it is not the one its clients map.
+  #[derive(Debug)]
+  #[cfg_attr(not(windows), allow(dead_code))]
+  enum Owning<T> {
+    /// The dead owner's object, to take over.
+    TakeOver(T),
+    /// None under the name: one is made.
+    MakeNew,
+    /// The open's refusal, the caller's to see.
+    Refused(slates_mem::MemError),
+  }
+
+  /// [`Owning`] for `opened`, an open of the bootstrap object's name: a pure decision over the refusal's kind, decided
+  /// and tested on every host; Windows' arm alone takes it, since macOS makes its object new (its create unlinking a
+  /// dead owner's).
+  #[cfg_attr(not(windows), allow(dead_code))]
+  fn owning<T>(opened: Result<T, slates_mem::MemError>) -> Owning<T> {
+    match opened {
+      Ok(left) => Owning::TakeOver(left),
+      Err(slates_mem::MemError::OsRefused {
+        code: Some(code), ..
+      }) if code == NO_SUCH_OBJECT => Owning::MakeNew,
+      Err(refused) => Owning::Refused(refused),
+    }
+  }
+
   /// macOS: the object made new. `SharedObject::create` unlinks the name first, and the object it unlinks is a dead
   /// owner's: this process holds the owner's token, so no live owner holds the object.
   #[cfg(not(windows))]
@@ -3673,23 +3702,27 @@ pub mod platform {
     )?)
   }
 
-  /// Windows: the object a dead owner left while its clients still map it, taken over; else one made new. This
-  /// process holds the owner's token, so no live owner holds the object, and no other owner makes one by its name
-  /// meanwhile.
+  /// Windows: the object a dead owner left while its clients still map it, taken over; one made new only where none is
+  /// under the name, any other refusal of the open answered as itself ([`owning`]). This process holds the owner's
+  /// token, so no live owner holds the object, and no other owner makes one by its name meanwhile.
   #[cfg(windows)]
   fn owned_object(instance: &str) -> Result<SharedObject, IpcError> {
     let handoff =
       SharedObject::handoff_for_name(&rendezvous_name(instance)).ok_or(IpcError::Unsupported {
         feature: "rendezvous by name",
       })?;
-    match SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words()) {
-      Ok(left) => take_over(left),
-      // None to open: one is made. Whatever kept the open from finding one, a creation that fails too says why.
-      Err(_) => initialized(SharedObject::create(
+    match owning(SharedObject::open(
+      &handoff,
+      OBJECT_BYTES,
+      bootstrap_words(),
+    )) {
+      Owning::TakeOver(left) => take_over(left),
+      Owning::MakeNew => initialized(SharedObject::create(
         &rendezvous_name(instance),
         OBJECT_BYTES,
         bootstrap_words(),
       )?),
+      Owning::Refused(refused) => Err(refused.into()),
     }
   }
 
@@ -4702,6 +4735,55 @@ pub mod platform {
       assert_eq!(refused_stamp(&refused(out_of_descriptors)), Stamp::Unknown);
       assert_eq!(refused_stamp(&refused(table_full)), Stamp::Unknown);
       assert_eq!(refused_stamp(&refused(NO_SUCH_OBJECT)), Stamp::Gone);
+    }
+
+    /// Main 01a20182's order of 2026-11-26 (Windows' `owned_object` made a new bootstrap object over any refused open).
+    /// Do: decide an owner's open of its bootstrap object's name ([`owning`]) found, refused for no object under the
+    /// name, and refused for access denied, for want of a handle, by the OS with no code, for a size past the object
+    /// and for a layout. Expect: found taken over; no object made new; every other refusal answered as itself, none
+    /// made new. Red before: every refused open made a new object over the name.
+    #[test]
+    fn an_owners_open_makes_a_new_object_only_where_none_is_under_the_name() {
+      let refused = |code| slates_mem::MemError::OsRefused {
+        call: "open",
+        code: Some(code),
+      };
+      #[cfg(not(windows))]
+      let (denied, out_of_handles) = (libc::EACCES, libc::EMFILE);
+      #[cfg(windows)]
+      let (denied, out_of_handles) = (
+        windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED.cast_signed(),
+        windows_sys::Win32::Foundation::ERROR_TOO_MANY_OPEN_FILES.cast_signed(),
+      );
+      assert!(matches!(owning(Ok(7u8)), Owning::TakeOver(7)));
+      assert!(matches!(
+        owning::<u8>(Err(refused(NO_SUCH_OBJECT))),
+        Owning::MakeNew
+      ));
+      let others = [
+        refused(denied),
+        refused(out_of_handles),
+        slates_mem::MemError::OsRefused {
+          call: "open",
+          code: None,
+        },
+        slates_mem::MemError::OutOfRange {
+          offset: OBJECT_BYTES,
+          len: 0,
+        },
+        slates_mem::MemError::LayoutRefused {
+          offset: 0,
+          len: 8,
+          reason: slates_mem::LayoutRefusal::Overlap,
+        },
+      ];
+      for other in others {
+        let shown = format!("{other:?}");
+        assert!(
+          matches!(owning::<u8>(Err(other)), Owning::Refused(_)),
+          "{shown} made a new object"
+        );
+      }
     }
 
     fn instance(tag: &str) -> String {
