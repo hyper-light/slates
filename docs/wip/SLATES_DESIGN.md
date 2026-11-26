@@ -32139,6 +32139,10 @@ materialization; an unrecovered volume is answered on its owner shard, never for
   rule); a given-up object keeps the share unconfirmed (A-272), so the retirement stays kept and its holders keep their
   copies; a new configuration judges it afresh, so a member retired late (detection past the SLO under load) costs a
   refusal, never the object.
+- **Amended by A-927 part 1b** (2026-11-25): "every verb on it" now includes the writes that name a given-up green
+  through its repository, not by its volume id: a push's changes, an import batch, the owner's branch verbs and a
+  submit's verdict. Each asks `ShardState::recovered` where it takes the green. Before, they read only whether the
+  engine was lent, and a holder's replica stays lent after its give-up.
 
 ### A-305 — A daemon's shards write their log lines through an owned writer and never wait on standard error (2026-11-18, goal g251: every open slates bug fixed)
 Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 entry), `crates/machine/src/log.rs`
@@ -64656,3 +64660,35 @@ measured noise of the 100 figure, not a literal.
 - **Models.** None of `docs/wip/models/` models a push's create; no spec changed.
 - **Applied in the same change to:** `crates/server/src/git_push.rs` (the module docs' "A create", `NoEmptyDefault`,
   `empty_default`), its tests, A-915's entry, GAPS (A-915's entry).
+
+### A-927 part 1b — Every write naming a green this shard did not recover is refused `NotRecovered`, by one check where the write takes the green (2026-11-25, w-shared for main 01a20182, its ruling of 2026-11-25 on part 1's second bug; amends A-304)
+
+- **Why.** Part 1's red found a create landing on a green recorded unrecovered whose engine was still lent. A takeover
+  that gives a green up records it in `ShardState::unrecovered` and leaves `state.greens` as it was, and a holder's
+  replica (A-908) is lent there. A verb addressed by the green's volume id answers `NotRecovered` (`verbs::find`,
+  `merge_service::find_record`). A write addressed by the green's repository read only whether the engine was lent, and
+  wrote to state this node had not recovered.
+- **The sweep** (every path that writes a green or a repository's name for one, followed to where it takes the green):
+  - `repository::push::plan`: the one interface for git's receive-pack, Mercurial's unbundle and import, the LFS locks
+    and a Subversion commit (`RepositoryLogs::append`). Each change's green is checked before its own rules: an
+    update's, a deferred update's, a create's source and a delete's (the green its name binds).
+  - `repository::push::append_versions`: an import batch's versions, appended past the plan.
+  - `repository::{create_branch, bind_branch, retire_branch}`: the owner's branch verbs (the source, the green bound,
+    the green the retired name binds).
+  - `verbs::judge_submission`: a submit's verdict, the owner's half, local or asked by `work_home` (`owner_judge`).
+  - Part 1's `git_push::empty_default`, already landed, keeps its own words, which name the green.
+  - Not a boundary: a work's edits, reads and conflicts (`merge_service::require_work`), which write the work and not
+    its green; `DestroyRepository`, still served, as `verbs::destroy_unrecovered` serves a volume's destroy; the
+    store's internal holds (`vcs_store::name_holds`, `svn_texts`), which run under the verbs above.
+- **The check.** One method, `ShardState::recovered(green) -> Result<(), Refusal>`: `NotRecovered` with the recorded
+  cause, or `Ok`. Each boundary above calls it before it reads the engine, and `merge_service::find_record` now calls
+  it too.
+- **Tests.** Red on the code before, each for one boundary (`repository::push::tests`):
+  - `t_a927_a_push_naming_greens_not_recovered_refuses_each_change`: an update, a create from it and a delete, each
+    refused by index (before, all three applied);
+  - `t_a927_an_import_batch_onto_a_green_not_recovered_is_refused` (before, recorded);
+  - `t_a927_the_branch_verbs_naming_a_green_not_recovered_are_refused` (before, `CreateBranch` made the green);
+  - `t_a927_a_submit_into_a_green_not_recovered_is_refused` (before, accepted at version 1).
+- **Models.** None of `docs/wip/models/` models a give-up's record or a verb's refusal of it; no spec changed.
+- **Applied in the same change to:** `crates/server/src/{state,repository,merge_service,verbs}.rs`,
+  `crates/server/src/repository/push.rs` and its tests, A-304's entry, GAPS (A-915's entry).

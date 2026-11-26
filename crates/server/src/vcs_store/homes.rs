@@ -2231,12 +2231,6 @@ pub(crate) fn resolve_owed() {
   RESOLVE_OWED.with(|owed| owed.set(true));
 }
 
-/// Whether a resolution pass is owed (test support, A-921 part 2): a pass its deadline cut short leaves one owed.
-#[cfg(test)]
-pub(crate) fn resolution_owed() -> bool {
-  RESOLVE_OWED.with(std::cell::Cell::get)
-}
-
 /// An attempt's holds in the region (A-727 (d1a), (d1a-3)): the owner they are for, made at the attempt's first homing,
 /// and the objects homed for it. Ended once, by its record's commit ([`AttemptHolds::committed`]: each moved to the
 /// records) or its refusal ([`AttemptHolds::released`]: each let go); dropped before either (its push's task gone), it
