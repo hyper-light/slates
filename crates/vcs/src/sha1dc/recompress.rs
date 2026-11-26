@@ -171,6 +171,7 @@ pub(super) fn compress_and_check(ihv: &mut State, block: &[u8; BLOCK_LEN], ubc_m
 pub(super) fn dv_entry(bit: usize) -> Option<(&'static [u32; SCHEDULE_LEN], u32)> {
   let dv = *DVS.get(bit)?;
   let dm = dv.dm_words()?;
+  // Format: Marc Stevens disturbance-vector test step numbers (58 and 65).
   let step = match dv.test_step {
     TestStep::T58 => 58,
     TestStep::T65 => 65,
