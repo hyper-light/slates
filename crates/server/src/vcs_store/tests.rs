@@ -1637,6 +1637,35 @@ pub(crate) fn assert_made_again_whole(
       .expect("the store made again");
     facts(content, store, greens)
   };
+  if made != live {
+    let (content, _) = state.vcs_stores.git_ref(repository).unwrap();
+    let lc: std::collections::BTreeSet<_> = live.contents.iter().map(|c| c.0).collect();
+    let mc: std::collections::BTreeSet<_> = made.contents.iter().map(|c| c.0).collect();
+    for id in mc.symmetric_difference(&lc) {
+      eprintln!(
+        "DBG {} {:?} form {:?} len {:?} holders {} away {}",
+        if mc.contains(id) { "made" } else { "live" },
+        &id.0[..4],
+        content.form(id),
+        content.len_of(id),
+        content.holders(id),
+        content.is_away(id)
+      );
+    }
+    let counted: Vec<_> = state
+      .refusals
+      .iter()
+      .filter(|(k, _)| {
+        k.contains("let_go")
+          || k.contains("derive")
+          || k.contains("idle")
+          || k.contains("encod")
+          || k.contains("whole_build")
+          || k.contains("paths")
+      })
+      .collect();
+    eprintln!("DBG counters {counted:?}");
+  }
   assert_eq!(made, live);
   assert_eq!(
     state.refusals.get(super::REPLAYED).copied(),
