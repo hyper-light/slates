@@ -507,10 +507,9 @@
 >   `git_push::tests::b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands` (the base's window let go
 >   once the pack is read and its checks are due). The A-753 resend path cannot miss now: a resent object is read from
 >   the push's own pack (A-864's noted entry). The fsck stage's read is reached by no push (a session's fsck is made
->   as each object is kept, from its bytes), so it keeps its refusal. Owed as B1b: unpack's read of an in-pack base
->   back from the quarantine (`Reader::applied`, `DeltaBaseMissing`), reached where that base is itself a thin
->   delta over a let-go window. Its failures under load (main's 4 of 4 at b95e9ddb1, then 3 of 16 at the diagnostic
->   branch agents/w-git-b1-debug, 884538b14) had two causes, each named by main's lines and fixed red first:
+>   as each object is kept, from its bytes), so it keeps its refusal. Its failures under load (main's 4 of 4 at
+>   b95e9ddb1, then 3 of 16 at the diagnostic branch agents/w-git-b1-debug, 884538b14) had two causes, each named by
+>   main's lines and fixed red first:
 >   - a stop ends the check's whole turn (`Walk::stopped`; `Checking::unit` and `Checking::turn` return not done).
 >     The check's own turn loop took the walk again at once after its stop, while its quantum was unspent, and the
 >     same let-go met twice with nothing brought back refused the object (`receive::tests::session::
@@ -533,6 +532,15 @@
 > upload stream's and the encoding's stop rules are their own copies of the one rule, keyed by a window's place, not
 > its let-go's number (`Upload::stop_at`; the encoding's `stopped_at` set never waits twice for one window in a whole
 > encoding): owed onto `slates_git::away::WaitOnce`, as B1's readers are.
+> - **B1b BUILT (w-git, 2026-11-26): unpack's read of an in-pack base back from the quarantine** (`Reader::applied`),
+>   reached where that base is itself a thin delta over a let-go window and the two resolve in different turns. Its
+>   miss was taken for a base held nowhere (`DeltaBaseMissing`, the pack refused `unpacker error`). Now `applied`
+>   answers the base read through a let-go window (`Applied::BaseAway`): in the read the delta waits, and in a
+>   resolution turn the turn stops with the pair put back, by the one rule (`Stop::Base`, keyed apart from the outside
+>   bases' rows, `Stop::Outside`). Reds: `unpack::tests::b1b_a_deltas_in_pack_base_read_back_through_a_let_go_window_
+>   stops_the_resolution_until_it_is_back` and `git_push::tests::b1b_a_thin_pushs_delta_on_a_delta_whose_base_was_
+>   let_go_is_resolved_once_it_is_back` (a nanosecond step budget, the first push's pack let go once the middle tree
+>   is admitted).
 > - OPEN: B2 (the server's tag-headed green, `ShardGreens::tree_of`), B3 (the admission's peel and references), B4 (the
 >   policy's reads), B5 (`PushedObjects::bytes` of a pushed object, `Malformed`), B6 (a verdict's one-call build), B7
 >   (`push_of`'s peel at judge time, after `prepare`'s), B8 (the encoding's tree walk: time, not correctness).

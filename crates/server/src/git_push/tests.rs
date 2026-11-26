@@ -1657,6 +1657,112 @@ fn b1_a_note_cleared_on_the_repository_between_a_pushs_stop_and_its_driver_leave
   );
 }
 
+/// B1b of the landed let-go's lift (main's order of 2026-11-26; w-git's read sweep: unpack's read of an in-pack base
+/// back from the quarantine). Do: on a daemon whose step budget is a nanosecond, so a resolution turn takes one unit,
+/// create `main` at a commit of a flat tree of [`THIN_TREE_FILES`] files; then update it to a commit whose tree is an
+/// OFS_DELTA on a second tree, itself a REF_DELTA on the first tree, which the pack does not carry. Once the second
+/// tree is resolved and admitted to the quarantine, let every window of the first push's pack go by hand
+/// ([`let_go_when`]): the third tree's base is then read back from the quarantine through the first tree's let-go
+/// window. Expect: `ok`, that window brought back after the let-go (`vcs_store.read_through.brought_back` moved).
+/// Red before: `unpacker error`, the pack refused, the read back's miss taken for a base held nowhere (unpack's
+/// `DeltaBaseMissing`, its unit red `b1b_a_deltas_in_pack_base_read_back_through_a_let_go_window_stops_the_resolution_
+/// until_it_is_back`).
+#[test]
+fn b1b_a_thin_pushs_delta_on_a_delta_whose_base_was_let_go_is_resolved_once_it_is_back() {
+  let (_store, daemon) =
+    crate::test_store::audit_daemon_stored_configured(|config| config.runtime.step_budget_ns = 1);
+  let (repository, update, pack, middle) =
+    thin_chain_update_over_a_create(&daemon, "thin-chain-away");
+  let (updated, (at_let_go, after), _) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let_go_when(
+        repository,
+        &update,
+        (&pack, LetGoAt::Admitted(middle), Meddle::Not),
+      )
+      .await
+    },
+    HISTORY_PATIENCE,
+  )
+  .unwrap();
+  let refused = crate::daemon::observe_first(&daemon, bring_backs_refused);
+  daemon.stop();
+  assert_eq!(
+    reasons(&updated),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    updated.outcomes
+  );
+  assert!(
+    after > at_let_go,
+    "the first tree's window brought back after its let-go: {at_let_go} -> {after}"
+  );
+}
+
+/// [`thin_update_over_a_create`]'s create, then the request updating `main` to a commit whose tree adds two files, sent
+/// as a chain: that tree an OFS_DELTA on a tree adding the first file, itself a REF_DELTA on the first tree, which the
+/// pack does not carry. The repository, that request, the create's pack, and the middle tree's name.
+fn thin_chain_update_over_a_create(
+  daemon: &crate::Daemon,
+  name: &str,
+) -> (RepositoryId, Vec<u8>, Vec<u8>, ObjectId) {
+  use slates_git::object_name::{Kind, name_of};
+  let repository = git_repository_on(daemon, name);
+  let (first, objects) = flat_commit(THIN_TREE_FILES, "base", None);
+  let pack = pack_of_objects(&objects);
+  let create = request(
+    &[("", &first.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack,
+  );
+  let (created, _) = pushed_in_steps(daemon, repository, &create).unwrap();
+  assert_eq!(reasons(&created), [b"ok"]);
+  let base_tree = objects[1].1.clone();
+  let (one, two) = (b"added\n".to_vec(), b"added again\n".to_vec());
+  let mut middle = base_tree.clone();
+  middle.extend_from_slice(b"100644 zz\0");
+  middle.extend_from_slice(
+    name_of(ObjectFormat::Sha1, Kind::Blob, &one)
+      .unwrap()
+      .as_bytes(),
+  );
+  let mut top = middle.clone();
+  top.extend_from_slice(b"100644 zzz\0");
+  top.extend_from_slice(
+    name_of(ObjectFormat::Sha1, Kind::Blob, &two)
+      .unwrap()
+      .as_bytes(),
+  );
+  let commit = format!(
+    "tree {}\nparent {first}\nauthor A <a@example.com> 1700000001 +0000\n\
+     committer A <a@example.com> 1700000001 +0000\n\nadded twice\n",
+    name_of(ObjectFormat::Sha1, Kind::Tree, &top).unwrap()
+  )
+  .into_bytes();
+  let second = name_of(ObjectFormat::Sha1, Kind::Commit, &commit).unwrap();
+  let thin = entries_pack(&[
+    (Entry::Whole(Kind::Commit), commit),
+    (
+      Entry::Ref(name_of(ObjectFormat::Sha1, Kind::Tree, &base_tree).unwrap()),
+      slates_git::store::delta_of(&base_tree, &middle).expect("a delta shorter than the tree"),
+    ),
+    (
+      Entry::Ofs(1),
+      slates_git::store::delta_of(&middle, &top).expect("a delta shorter than the tree"),
+    ),
+    (Entry::Whole(Kind::Blob), one),
+    (Entry::Whole(Kind::Blob), two),
+  ]);
+  let update = request(
+    &[(&first.to_string(), &second.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &thin,
+  );
+  let middle = name_of(ObjectFormat::Sha1, Kind::Tree, &middle).unwrap();
+  (repository, update, pack, middle)
+}
+
 /// On a repository `name` of `daemon`: `main` created, `ok`, at a commit of a flat tree of [`THIN_TREE_FILES`] files,
 /// then the request updating it to a commit whose tree adds a file, sent as git sends a thin pack (the tree a REF_DELTA
 /// against the first tree, which the pack does not carry): the repository, that request, and the create's pack.
@@ -1703,24 +1809,49 @@ fn thin_update_over_a_create(
 /// A thin pack of `commit` and `blob` whole and `tree` a REF_DELTA against `base`, which it does not carry, its data in
 /// stored zlib blocks, as git's client sends a push over a history the server holds.
 fn thin_tree_pack((commit, blob): (&[u8], &[u8]), (base, tree): (&[u8], &[u8])) -> Vec<u8> {
-  use slates_git::entry::{self, Header, Representation};
   use slates_git::object_name::{Kind, name_of};
   let delta = slates_git::store::delta_of(base, tree).expect("a delta shorter than the tree");
   let base = name_of(ObjectFormat::Sha1, Kind::Tree, base).unwrap();
-  let entries = [
-    (Representation::Whole(Kind::Commit), commit.to_vec()),
-    (Representation::RefDelta { base }, delta),
-    (Representation::Whole(Kind::Blob), blob.to_vec()),
-  ];
+  entries_pack(&[
+    (Entry::Whole(Kind::Commit), commit.to_vec()),
+    (Entry::Ref(base), delta),
+    (Entry::Whole(Kind::Blob), blob.to_vec()),
+  ])
+}
+
+/// How [`entries_pack`] writes an entry.
+#[derive(Clone, Copy)]
+enum Entry {
+  /// Whole, of this type.
+  Whole(slates_git::object_name::Kind),
+  /// A REF_DELTA against the object of this name.
+  Ref(ObjectId),
+  /// An OFS_DELTA against the entry written this many places before it in the list.
+  Ofs(usize),
+}
+
+/// A pack of `entries`, each its data in stored zlib blocks, in order.
+fn entries_pack(entries: &[(Entry, Vec<u8>)]) -> Vec<u8> {
+  use slates_git::entry::{self, Header, Representation};
   let mut pack = Vec::new();
-  let mut writer = slates_git::pack::Writer::new(ObjectFormat::Sha1, 3, &mut pack);
+  let count = u32::try_from(entries.len()).unwrap();
+  let mut writer = slates_git::pack::Writer::new(ObjectFormat::Sha1, count, &mut pack);
   let mut at = entry::PACK_HEADER_LEN;
-  for (representation, data) in &entries {
+  let mut begun: Vec<u64> = Vec::new();
+  for (written, data) in entries {
+    let representation = match *written {
+      Entry::Whole(kind) => Representation::Whole(kind),
+      Entry::Ref(base) => Representation::RefDelta { base },
+      Entry::Ofs(back) => Representation::OfsDelta {
+        base: begun[begun.len() - back],
+      },
+    };
     let header = Header {
-      representation: *representation,
+      representation,
       size: u64::try_from(data.len()).unwrap(),
     };
     let zlib = stored_zlib(data);
+    begun.push(at);
     entry::write(header, at, &mut writer).unwrap();
     slates_git::out::Out::put(&mut writer, &zlib);
     at += entry::written_len(header, at).unwrap() + u64::try_from(zlib.len()).unwrap();
@@ -1752,6 +1883,24 @@ async fn let_go_at_its_checks(
   request: &[u8],
   (let_go, meddle): (&[u8], Meddle),
 ) -> Result<(Received, (u64, u64), bool), String> {
+  let_go_when(repository, request, (let_go, LetGoAt::Checks, meddle)).await
+}
+
+/// When [`let_go_when`] lets the first push's pack go.
+#[derive(Clone, Copy)]
+enum LetGoAt {
+  /// Once the push's pack is read and its checks are due.
+  Checks,
+  /// Once the object of this name is admitted to the push's quarantine.
+  Admitted(ObjectId),
+}
+
+/// [`let_go_at_its_checks`], the pack let go at `at`.
+async fn let_go_when(
+  repository: RepositoryId,
+  request: &[u8],
+  (let_go, at, meddle): (&[u8], LetGoAt, Meddle),
+) -> Result<(Received, (u64, u64), bool), String> {
   let (_, mut push) = on_state(|state| started(state, repository));
   for piece in request.chunks(PIECE) {
     on_state(|state| push.input(state, piece)).map_err(|failed| format!("{failed:?}"))?;
@@ -1761,7 +1910,7 @@ async fn let_go_at_its_checks(
   let mut meddled = meddle == Meddle::Not;
   let mut answer = Vec::new();
   let received = loop {
-    if at_let_go.is_none() && push.session.is_checking() && !push.session.is_resolving() {
+    if at_let_go.is_none() && is_due(&push, at) {
       at_let_go = Some(on_state(|state| {
         let _ = let_go_by_hand(state, let_go);
         brought_back_count(state)
@@ -1792,6 +1941,17 @@ async fn let_go_at_its_checks(
     (at_let_go, after),
     meddled && meddle != Meddle::Not,
   ))
+}
+
+/// Whether `push` is where `at` lets the first push's pack go.
+fn is_due(push: &ReceivePack, at: LetGoAt) -> bool {
+  match at {
+    LetGoAt::Checks => push.session.is_checking() && !push.session.is_resolving(),
+    LetGoAt::Admitted(id) => push
+      .quarantine
+      .as_ref()
+      .is_some_and(|quarantine| quarantine.quarantine().object(&id).is_some()),
+  }
 }
 
 /// The let-go window the push's last step met and noted for its driver in the push's own slot, left as it is.
