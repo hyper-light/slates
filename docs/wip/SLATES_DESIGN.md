@@ -64382,6 +64382,16 @@ GAPS.
   after the head moved fails three tests. A list kept after a window appears fails none: no reader takes a conflicted
   verdict's list (`Computed::applied` answers none for it, the wire form writes the units, the hold reuses it only
   for an accepted verdict).
+  **3g, the verdict's gathering.** In release the judge's last step was the only one past 84a's 1 ms loaded bar
+  (1.32-1.52 ms, labelled release probe on bcb1e4106; 2.7 ms debug), and in it `position::verdict`'s gathering of
+  every unit's effects and windows into one list was 2.26 of the hold's 2.34 ms (debug; `since` and `at_head` 6 and 1
+  µs with nothing since, the held verdict built in 53). The hold is now `Green::hold_begin` (the cache's and the
+  checkpoint's answers, the units brought to the head), `holding_step` (each unit's effects and windows gathered, a unit
+  at least a step) and `hold_end` (the verdict held, or a conflict cached: the judge's one write, in its last step);
+  `hold_computed` is the three carried to their end, and `Green::unlent_rule` applies a hold's unlent reads alike to
+  the whole and the sliced judge, which keeps every step's. The judge's last step 2.7 ms → under 1 ms (debug, 2 runs,
+  load 22-26). Oracle: the applying and named oracles judge a unit a step; a resumed gathering that drops a unit fails
+  two of them.
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
