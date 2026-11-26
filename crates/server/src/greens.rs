@@ -265,6 +265,13 @@ impl Greens {
     holds
   }
 
+  /// Puts `holds`, taken by [`Greens::take_name_holds`] and not yet applied, back before any owed since, in order: the
+  /// next free decision applies them first (`vcs_store::name_holds::apply_some`, A-920 7c).
+  pub fn put_back_name_holds(&mut self, mut holds: Vec<slates_merge::engine::NameHold>) {
+    holds.append(&mut self.given_back);
+    self.given_back = holds;
+  }
+
   /// Installs a lone engine for `id`; the engine it replaced, its holds given back (it is the caller's, untracked).
   pub fn insert(&mut self, id: VolumeId, green: Green) -> Option<Green> {
     let mut replaced = self.alone.insert(id, green)?;

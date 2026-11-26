@@ -658,9 +658,12 @@
 > task (debug, 9,000 files): the tail's `fold_to_readers` (7.6 ms), the register's op
 > (`publish_held_increments` and `record_all`, 8-9 ms), and the landing's other whole sections a probe named after 7b
 > (A-920 Piece 7: the changeset's storing and hand-over 14.2 ms, three paced steps run past their deadline 4.6-10.7
-> ms, `apply_slice` 4.5, `retire_begun` 4.5, a staging step 4.3, the text release 4.2), several to a poll with no
-> yield between them: the history's longest poll 29-30 ms of thread CPU. A turn is under 6 ms since 7a (an event a
-> unit) and 7b (the close a unit a step). Owed:
+> ms, `apply_slice` 4.5, `retire_begun` 4.5, a staging step 4.3, the text release 4.2). A turn is under 6 ms since 7a
+> (an event a unit) and 7b (the close a unit a step). Since 7c each section is a step of its own and every paced loop
+> stops at its deadline, but release probe 10 (after 7b) read every wide test past 1 ms: the landing's sections 3.0-4.2
+> ms of thread CPU (add, copy), and the checkpoint task's `CheckpointHold::begin` 5.3-7.8 ms (move), owed a file a
+> unit. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
+> 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
 > files): `made_commit.rs` (two calls), `vcs_store/svn_made.rs`, `vcs_store/hg_made.rs`, `greens.rs`'s own caller. A

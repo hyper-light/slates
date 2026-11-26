@@ -1620,6 +1620,10 @@ pub(crate) fn assert_made_again_whole(
   // memo, never recorded (a fetch's read, or the derivation behind a push), which the store made again derives when it is
   // asked; each side is derived whole first (A-916).
   derive_settled(state, repository);
+  // And its index's upkeep: a merge begun by a fetch's first lookups (`index_upkeep::looked_up`) or a rebuild's end
+  // (`index_upkeep::built`) runs as a task of its own, so either side's tables are read merged whole, never mid-merge
+  // (docs/bugs/2026-11-26-a-made-again-compare-read-the-index-mid-upkeep.md).
+  super::index_upkeep::merged_whole(state, repository);
   let live = {
     let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
     facts(content, store, greens)
@@ -1630,6 +1634,7 @@ pub(crate) fn assert_made_again_whole(
   super::settle_rebuild(state, repository);
   assert_eq!(state.vcs_stores.unrecovered(repository), None);
   derive_settled(state, repository);
+  super::index_upkeep::merged_whole(state, repository);
   let made = {
     let (content, store) = state
       .vcs_stores
@@ -2905,5 +2910,53 @@ fn t_c2_a_rebuild_cancelled_between_two_pieces_names_no_pack_and_the_next_reads_
       Some(bytes),
       "the pack read back whole"
     );
+  });
+}
+
+/// The made-again flake (main's 100-a-side A/B of 2026-11-26: 5 and 4 in 100 under load, before and after C3 (b); its
+/// diagnostic run: the made-again store holding two index tables the live one did not, and lacking one it held; docs/bugs/
+/// 2026-11-26-a-made-again-compare-read-the-index-mid-upkeep.md). Do: push three commits, the repository's index three
+/// runs; merge the live index whole first, as a fetch's first lookups merge it by a task of its own
+/// (`index_upkeep::looked_up`), the shape the flake met when that task had ended; then make the store again from the log
+/// and compare (`assert_made_again_whole`). Expect: the store made again the live one, its index tables too, and both
+/// merges counted (`vcs_store.index_upkeep.merged`). Red before the compare merged each side's index whole: the made-again
+/// store's merge, begun by its rebuild's end (`index_upkeep::built`), was a task the compare's one step never ran, its
+/// runs' tables beside the live store's one merged run.
+#[test]
+fn t_a664_a_store_made_again_compares_its_index_tables_merged_whole_on_both_sides() {
+  crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = crate::test_store::created(&owner(), git("merged")).await;
+    let mut parent: Option<(ObjectId, ObjectId)> = None;
+    for push in 0..3u64 {
+      let files = [(b"README".to_vec(), format!("push {push}\n").into_bytes())];
+      let parents: Vec<ObjectId> = parent.iter().map(|(commit, _)| *commit).collect();
+      let (objects, commit) = commit_of(&files, &parents, FIRST_DATE.saturating_add(push));
+      let tree = tree_of(&objects);
+      push_through_awaited(
+        (repository, root),
+        &objects,
+        (parent.map(|(_, tree)| tree), commit, tree),
+      )
+      .await;
+      parent = Some((commit, tree));
+    }
+    on_state(|state| {
+      let merged = |state: &ShardState| {
+        state
+          .refusals
+          .get(super::index_upkeep::MERGED)
+          .copied()
+          .unwrap_or(0)
+      };
+      let before = merged(state);
+      super::index_upkeep::merged_whole(state, repository);
+      assert_eq!(merged(state), before + 1, "the live index merged whole");
+      assert_made_again_whole(state, repository, &[green_key(root)]);
+      assert_eq!(
+        merged(state),
+        before + 2,
+        "the made-again index merged whole too"
+      );
+    });
   });
 }

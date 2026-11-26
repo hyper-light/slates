@@ -321,3 +321,14 @@ mod tests {
     an_index_built_whole_is_merged_into_one_run(VcsTool::Git, WireFormat::Sha1);
   }
 }
+
+/// Repository `id`'s index merged whole now, in this step: a merge under way driven to its end, then every run the
+/// index alone holds merged and driven to its end (a no-op below two runs). What a test that compares two stores' index
+/// tables does first, so each is read at the same settled point, never mid-merge or before a timed merge began (the
+/// made-again flake, `docs/bugs/2026-11-26-a-made-again-compare-read-the-index-mid-upkeep.md`).
+#[cfg(test)]
+pub(crate) fn merged_whole(state: &mut ShardState, id: RepositoryId) {
+  while slice(state, id, u64::MAX) {}
+  begin(state, id, usize::MAX);
+  while slice(state, id, u64::MAX) {}
+}

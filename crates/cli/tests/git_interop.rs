@@ -1191,8 +1191,9 @@ fn peak_while<T>(pid: &str, work: impl FnOnce() -> T) -> (T, u64) {
 /// its memory by its own accounting at each reading, so a resident set past the bound names its holders (main
 /// 01a20182's ask of 2026-11-22 06:28) and tells bytes held from the allocator's keep.
 #[cfg(unix)]
-fn print_gauges(instance: &str, (when, resident): (&str, u64)) {
+fn print_gauges(instance: &str, (when, resident): (&str, u64)) -> u64 {
   let (_, report, _) = slates(instance, &[], &["status", "--memory"]);
+  let held = held_of(&report);
   let rows: Vec<&str> = report
     .lines()
     .filter(|line| {
@@ -1207,7 +1208,7 @@ fn print_gauges(instance: &str, (when, resident): (&str, u64)) {
   // Beside the resident figure the bound judges, so a red tells bytes held (`mem.gauge.process.system_live_bytes`,
   // `mapped_resident_bytes`, `vcs_content.stored_bytes`) from the allocator's keep (main's order of 2026-11-26).
   eprintln!(
-    "gauges at {when}, resident {resident} bytes ({}):\n  {}",
+    "gauges at {when}, held {held} bytes, resident {resident} bytes ({}):\n  {}",
     if cfg!(target_os = "macos") {
       "phys_footprint"
     } else {
@@ -1215,6 +1216,31 @@ fn print_gauges(instance: &str, (when, resident): (&str, u64)) {
     },
     rows.join("\n  ")
   );
+  held
+}
+
+/// The bytes the daemon holds by its own accounting, read from a `slates status --memory` report's rows: the system
+/// allocator's live bytes and its mapped blocks' resident bytes (`mem.gauge.process.system_live_bytes`,
+/// `mapped_resident_bytes`, the control shard's, the process's once), and each shard's content store windows kept in its
+/// window storage (`mem.gauge.vcs_content.stored_bytes`, the arena over the content object). They do not overlap: the
+/// content store's other entries (windows held in its own memory, lists, tables, derived nodes) are among the system
+/// allocator's live bytes, and the mapped blocks (`slates_mem::large`) are neither (main's order of 2026-11-26: C5
+/// judges held bytes, so a red is what the daemon holds, never what the allocator kept of what it freed).
+fn held_of(report: &str) -> u64 {
+  report
+    .lines()
+    .filter_map(|line| {
+      let (name, value) = line.trim().rsplit_once(": ")?;
+      let counted = [
+        "mem.gauge.process.system_live_bytes",
+        "mem.gauge.process.mapped_resident_bytes",
+        "mem.gauge.vcs_content.stored_bytes",
+      ]
+      .iter()
+      .any(|gauge| name.ends_with(gauge));
+      counted.then(|| value.trim().parse::<u64>().ok()).flatten()
+    })
+    .sum()
 }
 
 /// What one round of the memory test measured: the pack's bytes, the daemon's peak resident set while its push and its
@@ -1225,6 +1251,8 @@ struct Measured {
   peak: u64,
   pushed: u64,
   cloned: u64,
+  /// The bytes held settled after the push and after the clone ([`held_of`]).
+  held: (u64, u64),
 }
 
 /// Ada's MEMORY SIZING ruling (2026-11-20; A-830, A-767 item 1: "changes in RAM, the repository's history on disk"):
@@ -1236,10 +1264,11 @@ struct Measured {
 /// and a clone cost and the noise of reading them, whatever they bring. Then make [`REPOSITORY`] and push to it a
 /// history of [`HISTORY_FILES`] files and [`HISTORY_COMMITS`] commits each rewriting one line of one file, or, where
 /// [`HISTORY_SOURCE_VARIABLE`] and [`HISTORY_CUT_VARIABLE`] name them, a real repository's cut (its pack `N` bytes),
-/// and clone it back. Expect: the push and the clone succeed, the clone at the pushed head; and the daemon's resident
-/// set at its peak while they ran, settled after the push and settled after the clone, each at most the warm-up's end
-/// plus `2N + W`: the pack held once as the change in flight and once more as derived data cached by identity (A-767
-/// item 1). Red where the daemon keeps the history expanded, or something per object or per path of every version. The
+/// and clone it back. Expect: the push and the clone succeed, the clone at the pushed head; the daemon at its peak, settled
+/// after the push and settled after the clone, each at most the warm-up's end plus `2N + W`: the pack held once as the change landed and once more as derived data cached by identity (A-767 item 1;
+/// A-718's fragments), judged for now by its resident set (macOS's physical footprint, Linux's RSS) at its peak and
+/// settled, the bytes it holds by its own gauges ([`held_of`]) printed beside it at each settled point until the
+/// landed let-go's flip judges them (main's ruling B of 2026-11-26). Red where the daemon keeps the history expanded, or something per object or per path of every version. The
 /// made history is a focused run's size (passed on current main, this Mac, debug, 2026-11-21: N 258,770 bytes, the peak
 /// and the settled sets at most 68.2 MiB against a bound of 90.5 MiB); git/git's cut is main's measurement run
 /// (run-requests.md). Unix (`ps`); skips loudly without stock git.
@@ -1290,7 +1319,7 @@ fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the
       git.ok(&source, &["push", "-q", &url, &refspec]);
     });
     let pushed = settled_resident(&pid);
-    print_gauges(&leg.instance, (&format!("{name} after the push"), pushed));
+    let held_pushed = print_gauges(&leg.instance, (&format!("{name} after the push"), pushed));
     let clone = git.copy(&format!("{name}-clone"));
     let ((), clone_peak) = peak_while(&pid, || {
       git.ok(&git.scratch, &["clone", "-q", &url, &clone]);
@@ -1304,25 +1333,32 @@ fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the
       pushed_head,
       "the clone of {name} stands at the pushed head"
     );
+    let cloned = settled_resident(&pid);
+    let held_cloned = print_gauges(&leg.instance, (&format!("{name} after the clone"), cloned));
     Measured {
       pack,
       peak: push_peak.max(clone_peak),
       pushed,
-      cloned: {
-        let cloned = settled_resident(&pid);
-        print_gauges(&leg.instance, (&format!("{name} after the clone"), cloned));
-        cloned
-      },
+      cloned,
+      held: (held_pushed, held_cloned),
     }
   };
   let start = settled_resident(&pid);
-  print_gauges(&leg.instance, ("the start", start));
+  let held_start = print_gauges(&leg.instance, ("the start", start));
   let warm = round("warm", WARM_COMMITS, None);
   // W: the range the warm-up's resident set moved over, from its least (the start or its settled end, whichever the
   // idle give-back left lower) to its peak: what a push and a clone cost, and the noise of reading them, whatever
   // they bring.
   let warm_cost = warm.peak.saturating_sub(start.min(warm.cloned));
   let measured = round(REPOSITORY, HISTORY_COMMITS, real.as_ref());
+  // The design's claim, judged in held bytes once the landed let-go lifts (main's ruling B of 2026-11-26: the held
+  // assertion goes on in the flip's landing, its bound then with the change's objects as a term): printed now, beside
+  // the resident figure the bound judges until then.
+  let warm_held = warm
+    .held
+    .0
+    .max(warm.held.1)
+    .saturating_sub(held_start.min(warm.held.1));
   let bound = warm.cloned + 2 * measured.pack + warm_cost;
   let mib = |bytes: u64| format!("{}.{}", bytes >> 20, ((bytes % (1 << 20)) * 10) >> 20);
   eprintln!(
@@ -1338,6 +1374,16 @@ fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the
     mib(measured.pushed),
     mib(measured.cloned),
     mib(bound)
+  );
+  eprintln!(
+    "held MiB: start {}; the warm-up's after the push {}, after the clone {} (W {}); after the push {}, after the clone \
+     {}",
+    mib(held_start),
+    mib(warm.held.0),
+    mib(warm.held.1),
+    mib(warm_held),
+    mib(measured.held.0),
+    mib(measured.held.1)
   );
   assert!(
     measured.pushed <= bound && measured.cloned <= bound && measured.peak <= bound,
@@ -2934,3 +2980,16 @@ fn stock_git_carries_windows_paths_byte_identically() {
 // this test alone and serves.
 #[cfg(unix)]
 slates_ipc::spawner_role!();
+
+/// [`held_of`]'s reading of a `slates status --memory` report (main's order of 2026-11-26). Do: read a report of two
+/// shards' rows, the process's gauges on the control shard alone, other gauges among them. Expect: the system
+/// allocator's live bytes and mapped blocks' resident bytes once, and each shard's content windows stored, summed; no
+/// other row.
+#[test]
+fn the_held_bytes_are_the_live_heap_the_mapped_blocks_and_each_shards_stored_windows() {
+  let report = "memory:\n  shard 0 refused mem.gauge.process.system_live_bytes: 1000\n  shard 0 refused \
+                mem.gauge.process.mapped_resident_bytes: 200\n  shard 0 refused mem.gauge.vcs_content.stored_bytes: 30\n  \
+                shard 0 refused mem.gauge.vcs_content.list_bytes: 7\n  shard 1 refused \
+                mem.gauge.vcs_content.stored_bytes: 4\n  shard 1 refused mem.gauge.process.resident_bytes: 99999\n";
+  assert_eq!(held_of(report), 1234);
+}

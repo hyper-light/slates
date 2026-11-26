@@ -3089,7 +3089,8 @@ pub(crate) fn hold_increment(
 }
 
 /// [`hold_increment`] taken a unit at a time (A-920 6b: 23.6 ms whole for an import's revision of 9,000 files, debug, one
-/// step of its landing's entry): the encoding's chunks hashed into the inputs archive's manifest a chunk a unit, then its
+/// step of its landing's entry): the encoding's chunks hashed into the inputs archive's manifest a copy slice a unit
+/// (A-920 7c: a chunk a unit, up to 1 MiB, was 10.4 ms of one step, debug), then its
 /// stage opened in the content store under the green's object, the chunks copied in a chunk a unit
 /// (`stage_lent_piece`, [`hold_lent`]'s piece at a time), and the stage completed. The same identity, charges and
 /// refusals as [`hold_increment`]; dropped part-way, it leaves only its stage, which the next hold of the green's object
@@ -3105,6 +3106,10 @@ pub(crate) struct IncrementHold {
   extents: Vec<slates_archive::manifest::Extent>,
   /// The encoding's bytes hashed so far.
   hashed: usize,
+  /// Where the chunk being hashed begins in the encoding.
+  chunk_start: usize,
+  /// The chunk being hashed, its bytes from [`IncrementHold::chunk_start`] to [`IncrementHold::hashed`] so far.
+  chunk_hasher: blake3::Hasher,
   /// The manifest's identity once its stage is open, and whether the store held it only from this hold.
   staging: Option<([u8; 32], bool)>,
   /// The chunks copied into the stage so far.
@@ -3119,6 +3124,8 @@ impl IncrementHold {
       version,
       extents: Vec::new(),
       hashed: 0,
+      chunk_start: 0,
+      chunk_hasher: blake3::Hasher::new(),
       staging: None,
       staged: 0,
     }
@@ -3134,16 +3141,28 @@ impl IncrementHold {
     let object = ObjectId(self.green.bytes);
     let Some((manifest, fresh)) = self.staging else {
       let chunk = crate::merge_origin::inputs_chunk_bytes().max(1);
-      let end = self.hashed.saturating_add(chunk).min(increment.len());
-      if let Some(piece) = increment
-        .get(self.hashed..end)
-        .filter(|piece| !piece.is_empty())
-      {
-        let offset = u64::try_from(self.hashed).unwrap_or(u64::MAX);
-        self
-          .extents
-          .push(crate::merge_origin::inputs_extent(offset, piece));
+      let chunk_end = self.chunk_start.saturating_add(chunk).min(increment.len());
+      if self.hashed < chunk_end {
+        // A copy slice of the chunk hashed a unit; its extent named once the chunk's last slice is.
+        let slice = usize::try_from(state.config.copy_slice_bytes())
+          .unwrap_or(usize::MAX)
+          .max(1);
+        let end = self.hashed.saturating_add(slice).min(chunk_end);
+        if let Some(piece) = increment.get(self.hashed..end) {
+          self.chunk_hasher.update(piece);
+        }
         self.hashed = end;
+        if end == chunk_end {
+          let offset = u64::try_from(self.chunk_start).unwrap_or(u64::MAX);
+          let identity = *self.chunk_hasher.finalize().as_bytes();
+          self.extents.push(crate::merge_origin::inputs_extent_hashed(
+            offset,
+            chunk_end.saturating_sub(self.chunk_start),
+            identity,
+          ));
+          self.chunk_hasher.reset();
+          self.chunk_start = chunk_end;
+        }
         return None;
       }
       // The extents cloned, as a checkpoint's hold does: one a chunk of the encoding, so few.
@@ -6519,6 +6538,34 @@ mod tests {
     );
     assert_eq!(carried(None, u64::MAX), (ids.clone(), true));
     assert_eq!(carried(Some(&ids[2..]), chunk), (ids[2..].to_vec(), true));
+  }
+
+  /// A-920 7c. Do: hold an input of two and a half chunks through `IncrementHold`, a unit a call, and the same bytes
+  /// through `hold_increment` for another green. Expect: the same inputs named, identity and length, and more units
+  /// than a hold that hashed a chunk a unit takes (its chunks hashed a copy slice a unit: 10.4 ms of one step, debug,
+  /// with a chunk a unit).
+  #[test]
+  fn an_increment_held_a_slice_a_unit_names_the_inputs_held_whole() {
+    let chunk = crate::merge_origin::inputs_chunk_bytes();
+    let bytes: Vec<u8> = (0..chunk * 2 + chunk / 2)
+      .map(|at| u8::try_from(at % 247).unwrap())
+      .collect();
+    let (stepped, whole, units) = crate::daemon::audit_on_shard(move |state| {
+      let mut hold = IncrementHold::begin(DbVolumeId { bytes: [45; 16] }, 1);
+      let mut units = 0u64;
+      let stepped = loop {
+        units += 1;
+        if let Some(held) = hold.unit(state, &bytes) {
+          break held.expect("room for the input");
+        }
+      };
+      let whole = hold_increment(state, DbVolumeId { bytes: [46; 16] }, 1, &bytes)
+        .expect("room for the input");
+      (stepped.inputs, whole.inputs, units)
+    });
+    assert_eq!(stepped, whole, "the inputs held a slice a unit");
+    // A chunk a unit: three to hash, the stage opened, three copied and the stage completed.
+    assert!(units > 8, "the hold took {units} unit(s)");
   }
 
   /// A later version's shipments cut as views of the owner's content store (chain entry format 6: its increment held as

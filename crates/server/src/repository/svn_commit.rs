@@ -590,6 +590,19 @@ pub(crate) async fn land_revision(
   landed
 }
 
+/// Counter: a yield between two of a landing's sections ([`section_yield`], A-920 7c), so the second begins a step of
+/// its own, never the first's tail in one poll. Format: a counter name in the daemon's status report.
+pub(crate) const LANDING_SECTION_YIELDS: &str = "repository.svn_commit.landing_section_yields";
+
+/// A yield between two of a landing's sections, counted (A-920 7c: the storing's begin and the carried texts, 15.4 and
+/// 14.3 ms in debug, ran in one poll of 31 ms at 9,000 files; and each paced loop's last slice ran on into the next
+/// section). None where the shard's state is gone.
+pub(crate) async fn section_yield() -> Option<()> {
+  crate::state::with_state(|state| state.count(LANDING_SECTION_YIELDS, 1))?;
+  slates_rt::futures::yield_now().await;
+  Some(())
+}
+
 /// Stages the texts `revision` brings for its landing (C2 stage B part 2 (b)): each taken out of its contents and named
 /// stored ([`take_texts`]), put through repository `repository`'s content store a copy slice a step, as a client's
 /// commit's are, so its changeset carries them as Payload with Texts rows and the records keep none in RAM; and the
@@ -621,6 +634,7 @@ async fn stage_texts(
     Ok(storing) => storing,
     Err(refused) => return Some(Err(refused)),
   };
+  section_yield().await?;
   // Each piece lent from the text the landing holds, never copied out (P7's finding (2)).
   let piece = |identity: &ContentIdentity, offset: u64, len: usize| {
     let bytes = texts.get(identity)?;
@@ -642,6 +656,7 @@ async fn stage_texts(
   }
   // The bytes are the content store's now, until the landing ends.
   drop(texts);
+  section_yield().await?;
   let carried = texts_carried(&revision.record.changes, &storing.put);
   Some(Ok((storing, carried)))
 }

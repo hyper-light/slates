@@ -684,7 +684,8 @@ pub fn measure_step(
 /// signature (A-920 6b: 12.5 ms whole for an import's revision of 9,000 files, debug, one step of its landing's entry):
 /// the entry measured first ([`Measuring`]: what the increment declares indexed an op a unit, then each effect's bytes
 /// added an effect a unit), so its buffer is reserved once at its exact length; then its header, each effect an effect a
-/// unit, and its trailers and digest. Its bytes are [`encode`]'s.
+/// unit, and its trailers and digest, the digest hashed as each unit writes (A-920 7c: hashed whole in the last unit, 4.7
+/// ms of one step, debug). Its bytes are [`encode`]'s.
 pub struct Encoding {
   /// What it names the increment's inputs by.
   inputs: Inputs,
@@ -696,6 +697,10 @@ pub struct Encoding {
   out: Option<Vec<u8>>,
   /// The next effect to write.
   at: usize,
+  /// The digest of the entry's bytes written so far, up to [`Encoding::hashed`].
+  digest: blake3::Hasher,
+  /// How many of the entry's bytes [`Encoding::digest`] has hashed.
+  hashed: usize,
 }
 
 /// Begins encoding an entry as [`encode`] does with no completion or signature ([`encode_step`]).
@@ -706,6 +711,8 @@ pub fn encoding(inputs: Inputs, identity: Option<[u8; HASH_BYTES]>) -> Encoding 
     measuring: measuring(identity.is_some()),
     out: None,
     at: 0,
+    digest: blake3::Hasher::new(),
+    hashed: 0,
   }
 }
 
@@ -722,6 +729,8 @@ pub fn encode_step(
     measuring,
     out,
     at,
+    digest,
+    hashed,
   } = encoding;
   if out.is_none() {
     let exact = measure_step((increment, applied), measuring, spent)?;
@@ -740,6 +749,8 @@ pub fn encode_step(
   let written = out.as_mut()?;
   while let Some(effect) = applied.get(*at) {
     put_applied(written, &measuring.declared, effect);
+    digest.update(written.get(*hashed..).unwrap_or_default());
+    *hashed = written.len();
     *at = at.saturating_add(1);
     if *at < applied.len() && spent() {
       return None;
@@ -755,7 +766,8 @@ pub fn encode_step(
     None => entry.push(ABSENT),
   }
   put_signature(&mut entry, None);
-  let digest = *blake3::hash(&entry).as_bytes();
+  digest.update(entry.get(*hashed..).unwrap_or_default());
+  let digest = *digest.finalize().as_bytes();
   entry.extend_from_slice(&digest);
   Some(entry)
 }
