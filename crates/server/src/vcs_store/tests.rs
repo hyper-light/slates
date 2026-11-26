@@ -1465,40 +1465,13 @@ pub(crate) fn work_of(
     .expect("the work")
 }
 
-/// `changes` appended with `sealed`'s objects and `moves` through A-635's append.
-pub(crate) fn appended(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  changes: Vec<BranchChange>,
-  sealed: (&mut super::SealedPush, &[StoreMove]),
-) -> Result<Appended, crate::repository::push::AppendRefused> {
-  // Its names and pack homed and landed first, as a client's edge carries them (C5 part 2b: no record carries a push's
-  // objects); nothing to carry where it brings none.
-  let _ = crate::vcs_store::commits::home_and_land_blocking(state, sealed.0);
-  let (pushing, moves) = sealed;
-  let appended = crate::repository::push::push_sealed(
-    state,
-    (&owner(), repository),
-    changes,
-    EntryParts::default(),
-    (&mut *pushing, moves),
-  );
-  // Refused, its homing's holds are given back, as a refused push gives them back.
-  if appended.is_err() {
-    pushing.release_homed(state);
-  }
-  // A push's whole map is built by a task of the shard (A-664's live whole builds), which a test's step never runs:
-  // driven to its end here, so the test reads the store as the build leaves it.
-  crate::vcs_store::paths::whole_build::settle(state);
-  appended
-}
-
 /// The shard's state for `f`, in an awaiting history (a task of the shard: [`push_through_awaited`]).
 pub(crate) fn on_state<T>(f: impl FnOnce(&mut ShardState) -> T) -> T {
   crate::state::with_state(f).expect("the shard's state")
 }
 
-/// [`appended`] from a task of the shard: its names and pack homed and landed by awaiting
+/// `changes` appended with `sealed`'s objects and `moves` through A-635's append, from a task of the shard: its names
+/// and pack homed and landed by awaiting
 /// (`vcs_store::commits::home_and_land`), never holding the shard through the store's commit as
 /// `home_and_land_blocking` does (main 01a20182's order of 2026-11-26, the shard-blocking allow-list).
 pub(crate) async fn appended_awaited(
@@ -1523,7 +1496,8 @@ pub(crate) async fn appended_awaited(
   })
 }
 
-/// [`push_through`] from a task of the shard ([`appended_awaited`]): the version it made.
+/// One push through the shard, from a task of it: `objects` admitted, the work from `base` to the commit's tree, the
+/// push sealed with its move and appended ([`appended_awaited`]). The version it made.
 pub(crate) async fn push_through_awaited(
   (repository, green): (RepositoryId, DbVolumeId),
   objects: &[Brought],
@@ -1548,7 +1522,7 @@ pub(crate) async fn push_through_awaited(
   }
 }
 
-/// [`push_through`] with the push's whole map left to its build's task (A-664's live whole builds), as a push leaves it
+/// [`push_through_awaited`] with the push's whole map left to its build's task (A-664's live whole builds), as a push leaves it
 /// when it is answered (the build is under way, not driven), from a task of the shard: its names and pack homed and
 /// landed by awaiting
 /// (`vcs_store::commits::home_and_land`), never holding the shard through the store's commit.
@@ -1577,29 +1551,6 @@ pub(crate) async fn push_unsettled_awaited(
     .expect("appended");
     sealed.abandon(state);
   });
-}
-
-/// One push through the shard: `objects` admitted, the work from `base` to the commit's tree, the push sealed with its
-/// move and appended. The version it made.
-pub(crate) fn push_through(
-  state: &mut ShardState,
-  (repository, green): (RepositoryId, DbVolumeId),
-  objects: &[Brought],
-  (base, head, tree_id): (Option<ObjectId>, ObjectId, ObjectId),
-) -> u64 {
-  let push = begun(state, repository, objects);
-  let version = state.greens.get(&green).expect("the green's engine").head();
-  let built = work_of(state, (&push, green), (version, base), (head, tree_id));
-  let mut sealed = push.seal(state).expect("sealed");
-  let changes = vec![BranchChange::Update { green, work: built }];
-  let moves = [(Target::Green(green), Some(head))];
-  let made = appended(state, repository, changes, (&mut sealed, &moves)).expect("appended");
-  // Committed, the push holds nothing: giving it back gives back nothing.
-  sealed.abandon(state);
-  match made.changes.first() {
-    Some(BranchAppended::Moved { version, .. }) => *version,
-    other => panic!("not moved: {other:?}"),
-  }
 }
 
 /// The root tree a commit's content names.
