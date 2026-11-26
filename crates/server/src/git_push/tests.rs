@@ -1534,6 +1534,144 @@ fn brought_back_count(state: &ShardState) -> u64 {
   state.refusals.get(name).copied().unwrap_or(0)
 }
 
+/// Shape: the files of the first tree [`b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands`] pushes:
+/// enough that the second tree's delta against it is shorter than the tree, as git sends it.
+const THIN_TREE_FILES: usize = 64;
+
+/// Precondition B1 of the landed let-go's lift (main's order of 2026-11-26; w-git's read sweep: the push's quarantine
+/// reads, `intake::Quarantined::content`, answered none on a let-go window and noted nothing, so the connectivity check
+/// took the object as unreadable). Do: create `main` at a commit of a flat tree of [`THIN_TREE_FILES`] files; then
+/// update it to a commit whose tree adds a file, sent as git sends a thin pack: the tree a REF_DELTA against the first
+/// tree, which the pack does not carry. Drive the update as an edge does, the window each turn met brought back
+/// ([`let_go_at_its_checks`]), and once its pack is read and its checks are due, let every window of the first push's
+/// pack go by hand, as a landed pack's let-go does. Expect: `ok`; the check read the new tree through its base's window,
+/// brought back after the let-go (`vcs_store.read_through.brought_back` moved past it). Red before: `missing necessary
+/// objects`, the check's read of the tree from the quarantine answering none.
+#[test]
+fn b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands() {
+  use slates_git::object_name::{Kind, name_of};
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository = git_repository_on(&daemon, "thin-check-away");
+  let (first, objects) = flat_commit(THIN_TREE_FILES, "base", None);
+  let pack = pack_of_objects(&objects);
+  let create = request(
+    &[("", &first.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack,
+  );
+  let (created, _) = pushed_in_steps(&daemon, repository, &create).unwrap();
+  let base_tree = objects[1].1.clone();
+  let blob = b"added\n".to_vec();
+  let mut tree = base_tree.clone();
+  tree.extend_from_slice(b"100644 zz\0");
+  tree.extend_from_slice(
+    name_of(ObjectFormat::Sha1, Kind::Blob, &blob)
+      .unwrap()
+      .as_bytes(),
+  );
+  let tree_id = name_of(ObjectFormat::Sha1, Kind::Tree, &tree).unwrap();
+  let commit = format!(
+    "tree {tree_id}\nparent {first}\nauthor A <a@example.com> 1700000001 +0000\n\
+     committer A <a@example.com> 1700000001 +0000\n\nadded\n"
+  )
+  .into_bytes();
+  let second = name_of(ObjectFormat::Sha1, Kind::Commit, &commit).unwrap();
+  let thin = thin_tree_pack((&commit, &blob), (&base_tree, &tree));
+  let update = request(
+    &[(&first.to_string(), &second.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &thin,
+  );
+  let (updated, (at_let_go, after)) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move { let_go_at_its_checks(repository, &update, &pack).await },
+    HISTORY_PATIENCE,
+  )
+  .unwrap();
+  daemon.stop();
+  assert_eq!(reasons(&created), [b"ok"]);
+  assert_eq!(reasons(&updated), [b"ok"], "{:?}", updated.outcomes);
+  assert!(
+    after > at_let_go,
+    "the base's window brought back after its let-go: {at_let_go} -> {after}"
+  );
+}
+
+/// A thin pack of `commit` and `blob` whole and `tree` a REF_DELTA against `base`, which it does not carry, its data in
+/// stored zlib blocks, as git's client sends a push over a history the server holds.
+fn thin_tree_pack((commit, blob): (&[u8], &[u8]), (base, tree): (&[u8], &[u8])) -> Vec<u8> {
+  use slates_git::entry::{self, Header, Representation};
+  use slates_git::object_name::{Kind, name_of};
+  let delta = slates_git::store::delta_of(base, tree).expect("a delta shorter than the tree");
+  let base = name_of(ObjectFormat::Sha1, Kind::Tree, base).unwrap();
+  let entries = [
+    (Representation::Whole(Kind::Commit), commit.to_vec()),
+    (Representation::RefDelta { base }, delta),
+    (Representation::Whole(Kind::Blob), blob.to_vec()),
+  ];
+  let mut pack = Vec::new();
+  let mut writer = slates_git::pack::Writer::new(ObjectFormat::Sha1, 3, &mut pack);
+  let mut at = entry::PACK_HEADER_LEN;
+  for (representation, data) in &entries {
+    let header = Header {
+      representation: *representation,
+      size: u64::try_from(data.len()).unwrap(),
+    };
+    let zlib = stored_zlib(data);
+    entry::write(header, at, &mut writer).unwrap();
+    slates_git::out::Out::put(&mut writer, &zlib);
+    at += entry::written_len(header, at).unwrap() + u64::try_from(zlib.len()).unwrap();
+  }
+  writer.finish().unwrap();
+  pack
+}
+
+/// `request` pushed to `repository` by its owner from a task of its shard, driven as an edge drives it (each turn's
+/// let-go window brought back at once, `upload::brought_back_waited`, then its homing carried), every window of `let_go` let go by
+/// hand ([`let_go_by_hand`]) once the push's pack is read and its checks are due: what was received, and the windows
+/// brought back at the let-go and at the end.
+async fn let_go_at_its_checks(
+  repository: RepositoryId,
+  request: &[u8],
+  let_go: &[u8],
+) -> Result<(Received, (u64, u64)), String> {
+  let (_, mut push) = on_state(|state| started(state, repository));
+  for piece in request.chunks(PIECE) {
+    on_state(|state| push.input(state, piece)).map_err(|failed| format!("{failed:?}"))?;
+  }
+  on_state(|state| push.end(state)).map_err(|failed| format!("{failed:?}"))?;
+  let mut at_let_go = None;
+  let mut answer = Vec::new();
+  let received = loop {
+    if at_let_go.is_none() && push.session.is_checking() && !push.session.is_resolving() {
+      at_let_go = Some(on_state(|state| {
+        let _ = let_go_by_hand(state, let_go);
+        brought_back_count(state)
+      }));
+    }
+    let step = on_state(|state| push.answer_step(state, &mut answer))
+      .map_err(|failed| format!("a step failed: {failed:?}"))?;
+    match step {
+      Answering::Answered(received) => break *received,
+      Answering::Turned => {
+        // As the edges do: the window the step met brought back at once, before anything else on the shard runs and
+        // clears the repository's note of it (a derivation's or an encoding's turn).
+        crate::vcs_store::upload::brought_back_waited(repository).await;
+        slates_rt::futures::yield_now().await;
+        carry_awaited(&mut push).await?;
+      }
+      #[cfg(unix)]
+      step @ Answering::Hook(_) => return Err(format!("no hook runs here: {step:?}")),
+    }
+  };
+  dropped_in_a_step(push);
+  let at_let_go = at_let_go.ok_or("the push's checks were never due")?;
+  Ok((
+    received,
+    (at_let_go, on_state(|state| brought_back_count(state))),
+  ))
+}
+
 /// Main 01a20182's ruling of 2026-11-24 (w-hg's sweep of the bring-back sites: a write path's bring-back never let go).
 /// Do: push a line of [`PACED_HISTORY`] commits, let its pack's windows go by hand before it is derived, then derive it
 /// as a fetch's request does (`git_derive::derive_for_read`). Expect: every window let go first; the derivation brought

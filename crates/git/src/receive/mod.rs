@@ -311,6 +311,12 @@ impl<'a> Pushed<'a> {
     self.contents?.content(at, &placed.id)
   }
 
+  /// Where in its pack the let-go window lies that the last read of these objects to answer none met, if one did
+  /// ([`Contents::content_away`]): what a reader of them stops for ([`crate::away`]).
+  pub fn away(&self) -> Option<u64> {
+    self.contents?.content_away()
+  }
+
   /// The position in pack order of the object named `id`, if the pack brought it.
   pub fn position(&self, id: &ObjectId) -> Option<usize> {
     self
@@ -389,6 +395,10 @@ impl<S: Repository + ?Sized> Outside for Thin<'_, S> {
 impl<S: Contents + ?Sized> Contents for Thin<'_, S> {
   fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
     self.0.content(at, id)
+  }
+
+  fn content_away(&self) -> Option<u64> {
+    self.0.content_away()
   }
 }
 

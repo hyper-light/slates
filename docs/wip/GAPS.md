@@ -486,6 +486,30 @@
 > stall is not the lift's (main's r229, 2026-11-23: 2 of 2 at a patience of 360 s, the HTTP mirror clone 97.9 and 107.7
 > s, CPU-bound at 97% of a core in blake3, `Index::get` and the content store's reads): slowness, a P line below, off
 > the lift's preconditions.
+> **The read sweep's B items, preconditions of the flip (w-git's sweep, inbox main-from-w-git-read-sweep.md; main's
+> order of 2026-11-26).** Each is a push reader that refuses on a let-go window where it should stop and be brought
+> back; each lands alone, red first at the lowest level reaching it, through the store's own let-go, with
+> `read_through.brought_back` asserted moved. The one rule they share is `slates_git::away::WaitOnce` (stop once a
+> window, the driver brings it back, the same window again with nothing read between ends typed), with its own unit
+> tests; the tag peel (`Verdicts::peel_away`) and the unpack's outside bases (`Resolving::stopped`) moved onto it.
+> (b), the shallow fetch's `Unreadable`, was BUILT at 050ef43c2 (2026-11-23, the entry below); its sweep of upload's
+> reads found no B: what an answer reads of a landed pack stops and is brought back, and the rest reads kept parts and
+> whole contents, which no landed let-go reaches (the C list).
+> - **B1 BUILT (w-git, 2026-11-26): the push's quarantine reads.** A thin pack's REF_DELTA against the repository's
+>   object is read back through its base's window (`Push::bytes`, `IndexBases`); let go, the read answered none with
+>   nothing noted, and the connectivity check took the object as unreadable: `missing necessary objects`. Now the
+>   quarantine notes the window (`PackedRefused::Away`, on the repository for the driver and as
+>   `Contents::content_away` for the reader), and the walk stops its turn there in either pass; its second pass took an
+>   unread object's edges as none before, which could leave a tip `Complete`, and now takes it as `Missing`. Red:
+>   `git_push::tests::b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands` (the base's window let go
+>   once the pack is read and its checks are due). The A-753 resend path cannot miss now: a resent object is read from
+>   the push's own pack (A-864's noted entry). The fsck stage's read is reached by no push (a session's fsck is made
+>   as each object is kept, from its bytes), so it keeps its refusal. Owed as B1b: unpack's read of an in-pack base
+>   back from the quarantine (`Reader::applied`, `DeltaBaseMissing`), reached where that base is itself a thin
+>   delta over a let-go window.
+> - OPEN: B2 (the server's tag-headed green, `ShardGreens::tree_of`), B3 (the admission's peel and references), B4 (the
+>   policy's reads), B5 (`PushedObjects::bytes` of a pushed object, `Malformed`), B6 (a verdict's one-call build), B7
+>   (`push_of`'s peel at judge time, after `prepare`'s), B8 (the encoding's tree walk: time, not correctness).
 > **P OPEN (w-git; main's r229, 2026-11-23): git/git's HTTP mirror clone takes about 100 s** (97.9 and 107.7 s, 556 MB
 > against stock git's 612 MB; the work clone 92.9 and 97.2 s), the daemon CPU-bound at 97% of one core: blake3,
 > `Index::get`, `ContentStore::get` / `len_of` / `window_at_in`, `Positions::settle`. No stall; to be profiled.

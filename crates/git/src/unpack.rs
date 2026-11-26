@@ -51,6 +51,7 @@ use std::borrow::Cow;
 
 use flate2::{Decompress, FlushDecompress, Status};
 
+use crate::away::WaitOnce;
 use crate::delta;
 use crate::entry::{self, PACK_HEADER_LEN, Representation};
 use crate::object_name::{CollisionAttack, Hasher, Kind, ObjectFormat, ObjectId, name_of};
@@ -165,6 +166,13 @@ pub trait Keep: Contents {
 pub trait Contents {
   /// The content of the object kept at position `at` in pack order, named `id`; `None` when none is kept there.
   fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>>;
+
+  /// Where in its pack the let-go window lies that the last [`Contents::content`] to answer none met (goal 93 item 2b,
+  /// held on the node's store, its owner to bring it back: [`crate::away`]); none where it met none, as keepers in
+  /// memory never do.
+  fn content_away(&self) -> Option<u64> {
+    None
+  }
 }
 
 /// A keeper that holds every object's bytes itself, each charged for as long as the reader's admission lasts: the pack
@@ -602,8 +610,8 @@ struct Resolving {
   /// The row of `waiting` whose base, outside the pack, lay in a let-go window when the turn last stopped there, and
   /// where in its pack, until a unit resolves after it (A-864's push readers): met so again at the same place with
   /// nothing resolved between, it is refused as one not held, so a stop always makes progress or ends (an object across
-  /// several let-go windows stops at each in turn).
-  stopped: Option<(usize, u64)>,
+  /// several let-go windows stops at each in turn; [`crate::away`]'s one rule).
+  stopped: WaitOnce<(usize, u64)>,
 }
 
 impl<'index, L: Locate + ?Sized> Reader<'index, L> {
@@ -1151,7 +1159,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
           pending,
           next: 0,
           outside: 0,
-          stopped: None,
+          stopped: WaitOnce::default(),
         }
       }
     };
@@ -1164,7 +1172,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       units = units.saturating_add(1);
       if let Some((parent, child)) = resolving.pending.pop() {
         if self.resolve_child(parent, child, (admission, &mut *keep))? {
-          resolving.stopped = None;
+          resolving.stopped.answered();
           self.list_children(child, &resolving.waiting, &mut resolving.pending)?;
         }
         continue;
@@ -1179,14 +1187,11 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
         let row = resolving.outside;
         resolving.outside = resolving.outside.saturating_add(1);
         if self.resolve_outside(key, child, (admission, &mut *keep))? {
-          resolving.stopped = None;
+          resolving.stopped.answered();
           self.list_children(child, &resolving.waiting, &mut resolving.pending)?;
-        } else if let Some(at) = keep.away()
-          && resolving.stopped != Some((row, at))
-        {
+        } else if resolving.stopped.waits(keep.away().map(|at| (row, at))) {
           // Its base lies in a let-go window: the turn stops here, the base to be brought back, the row taken again.
           resolving.outside = row;
-          resolving.stopped = Some((row, at));
           self.resolving = Some(resolving);
           return Ok(false);
         }

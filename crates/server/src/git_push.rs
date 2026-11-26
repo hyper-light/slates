@@ -795,11 +795,11 @@ impl<P> ReceivePack<P> {
         .ok_or(PushFailed::NoStore)?;
       let mut site = intake::Intake {
         indexed: IndexedObjects::new(&git.repository, content, admission.left()),
-        quarantined: intake::Quarantined {
-          push: quarantine.as_ref().map(GitPush::quarantine),
-          store: content,
-          repository: &git.repository,
-        },
+        quarantined: intake::Quarantined::new(
+          quarantine.as_ref().map(GitPush::quarantine),
+          content,
+          &git.repository,
+        ),
         queue: BTreeMap::new(),
       };
       let called = call(session, &mut site, admission);
@@ -866,11 +866,11 @@ impl<P> ReceivePack<P> {
         .git_ref(*repository)
         .ok_or(PushFailed::NoStore)?;
       let indexed = IndexedObjects::new(&git.repository, content, admission.left());
-      let quarantined = intake::Quarantined {
-        push: quarantine.as_ref().map(GitPush::quarantine),
-        store: content,
-        repository: &git.repository,
-      };
+      let quarantined = intake::Quarantined::new(
+        quarantine.as_ref().map(GitPush::quarantine),
+        content,
+        &git.repository,
+      );
       let mut clock = ShardClock;
       let quantum = Quantum {
         clock: &mut clock,
