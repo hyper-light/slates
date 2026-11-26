@@ -289,6 +289,27 @@ fn a_named_texts_file_is_its_name_alone() {
   holds_its_name_alone(&mut green, (object, &plane), &bytes);
 }
 
+/// Each of `files` in `green` named for its text alone, and its bytes, read through `plane`, the text's own.
+fn assert_named_for_their_texts(
+  green: &Green,
+  files: &[(String, Identity)],
+  texts: &[Vec<u8>],
+  plane: &Plane,
+) {
+  for ((path, object), bytes) in files.iter().zip(texts) {
+    assert_eq!(
+      green.content(path),
+      Some(super::Content::Named(*object)),
+      "{path} named for its text"
+    );
+    assert_eq!(
+      read_through(green, path, plane).as_deref(),
+      Some(bytes.as_slice()),
+      "{path}'s bytes"
+    );
+  }
+}
+
 /// A-920 3n (a work's named texts read into one buffer, and a file named for its text given no bytes). Do: name eight
 /// texts of 1 KiB a work creates, each its own file, read them, judge the work with `judge_named` and commit the verdict.
 /// Expect: accepted as version 1; every file its text's name alone, each text's bytes the plane's; and no byte buffer
@@ -323,18 +344,7 @@ fn a_works_named_texts_commit_with_no_buffer_of_their_own_let_go() {
     green.commit_judged(judged).map(|(version, _)| version),
     Ok(1)
   );
-  for ((path, object), bytes) in files.iter().zip(&texts) {
-    assert_eq!(
-      green.content(path),
-      Some(super::Content::Named(*object)),
-      "{path} named for its text"
-    );
-    assert_eq!(
-      read_through(&mut green, path, &plane).as_deref(),
-      Some(bytes.as_slice()),
-      "{path}'s bytes"
-    );
-  }
+  assert_named_for_their_texts(&green, &files, &texts, &plane);
   assert_eq!(
     green.named_buffers_freed(),
     0,
