@@ -32180,7 +32180,7 @@ shard routed, stopped after them).
   nobody drains still blocks the write itself, which the beat bounds.
 - **The end's line from the watchdog's own thread (2026-11-25, main's ruling after the line was lost at load 124).**
   The writer thread was not scheduled within its beat at load 124, and the line was lost again (w-hg's guarded run,
-  `~/.cache/w-hg-logs/2026-11-25-guarded-modules-exit4-b.log`); a writer that could not be spawned was skipped. So on
+  `~/.local/state/w-hg-logs/2026-11-25-guarded-modules-exit4-b.log`); a writer that could not be spawned was skipped. So on
   Unix the watchdog's own thread, already running as it judges, writes the line in parts of at most `PIPE_BUF` bytes,
   each behind `poll` for `POLLOUT` bounded by what is left of the beat (an interrupted wait or write taken again), and
   then exits: no thread is started for it. Red where it is deterministic:
