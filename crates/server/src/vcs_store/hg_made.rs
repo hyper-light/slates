@@ -696,13 +696,20 @@ fn made_at(state: &ShardState, green: DbVolumeId, version: u64) -> Option<Node> 
     .map(|(_, node)| *node)
 }
 
-/// The changeset `green`'s head attribute names (a push's).
+/// The changeset `green`'s head attribute names (a push's); for a line that owes its push (P2, a new line a push made,
+/// main's ruling (A) of 2026-11-26), the head that push sets, read from the debt without building it, so a push or a
+/// read that lists the lines never materializes one.
 fn named_head(state: &ShardState, green: DbVolumeId) -> Option<Node> {
-  state.greens.get(&green).and_then(|engine| {
-    engine
+  let lent = state.greens.lend(&green)?;
+  match lent.deferred() {
+    Some(owed) => owed
+      .push()
+      .head
+      .and_then(|bytes| Node::try_from(bytes).ok()),
+    None => lent
       .xattr(ROOT, HEAD_ATTRIBUTE)
-      .and_then(|bytes| Node::try_from(bytes).ok())
-  })
+      .and_then(|bytes| Node::try_from(bytes).ok()),
+  }
 }
 
 /// The Mercurial repository `green` is the green of.

@@ -77,7 +77,8 @@ pub(crate) enum BranchChange {
   /// A new branch `name`, made at `version` of the member `from` as [`BranchChange::Create`] makes one, whose green owes
   /// `push` as its version 1 instead of holding its built work (P2; `slates_merge::push::DeferredPush`): the push's tree
   /// is built a unit a turn when the green is first reached (`crate::green_ready`), and the entry records the push, not
-  /// the work. A tool whose create would compose a whole tree (git's tags) makes this one.
+  /// the work. A tool whose create would compose a whole tree makes this one: git's created refs (A-823) and Mercurial's
+  /// new lines (A-929).
   CreateDeferred {
     /// The new branch's name.
     name: String,
@@ -1272,6 +1273,12 @@ pub(crate) const CREATE_MISSES: &str = "repository.push.create_misses";
 /// report.
 pub(crate) const CREATE_SLICES: &str = "repository.push.create_slices";
 
+/// Counted most: the bytes of the versions one push's landing record carries (each moved green's chain entry, each owed
+/// push's record): what grew with a push's new lines times their tree while each new line's work was built eagerly
+/// (goal 93, the landing spin's (2): 329,007 bytes for 32 lines of a 200-file tree, debug), and no longer does since a new
+/// Mercurial line owes its push (P2). Format: a counter name in the daemon's status report.
+pub(crate) const ENTRY_VERSIONS_BYTES_MOST: &str = "repository.push.entry_versions_bytes_most";
+
 /// Counter: a slice of a push's updates judged ahead of its landing's step ([`PreparedUpdates::prepare_some`]): more than
 /// one a push shows its moved lines' works were judged a slice at a time (goal 93, the landing spin's owed (1)). Format:
 /// a counter name in the daemon's status report.
@@ -1396,18 +1403,21 @@ fn creates_made(
       name,
       from,
       version,
+      deferred,
       ..
     } = step
     else {
       continue;
     };
+    // A deferred create builds no work (P2): it is made here, owing its push, and is never made ahead.
+    let owes = deferred.is_some();
     let found = prepared
       .as_deref_mut()
       .and_then(|prepared| prepared.take(name, *from, *version));
     let made = match found {
       Some(made) => made,
       None => {
-        if prepared.is_some() {
+        if prepared.is_some() && !owes {
           state.count(CREATE_MISSES, 1);
         }
         let planned = core::mem::replace(step, placeholder());
@@ -1972,6 +1982,10 @@ fn apply_planned(
     }
   };
   let entry = recorded_entry(state, entry, (steps, &mut encoded), &committed, &increments);
+  let versions_bytes = entry.versions.iter().fold(0u64, |total, version| {
+    total.saturating_add(u64::try_from(version.entry.len()).unwrap_or(u64::MAX))
+  });
+  state.count_max(ENTRY_VERSIONS_BYTES_MOST, versions_bytes);
   let mut ops: Vec<Op> = made
     .into_iter()
     .map(|record| Op::VolumeCreated { record })

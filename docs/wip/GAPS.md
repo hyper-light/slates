@@ -1964,10 +1964,27 @@
 > then all moved by one push: red, the step did 31 lines' works; now 0, misses 0, and the first push's root line's work
 > judged ahead too, so the many-heads test's step does 0 where it did 1); it prints the landing step's longest and the
 > shard's and the history's longest poll by the wall and the thread's CPU (`svn_import::tests::cpu_timed`,
-> `longest_poll`) for main's release probe. Owed still: (2) the step's
-> record carries every new green's chain entry, so its write grows with heads times tree (377 ms of the 452-head step,
-> debug); (3) a slice makes one green whole, its tree's work (123 ms at 452 heads, debug); (4) git's pushes (git/git's
-> 1,027 refs) take the same slices once their driver hands its creates in (w-git's piece).
+> `longest_poll`) for main's release probe. (2) and (3) CLOSED (w-hg, 2026-11-26, main's ruling (A); A-929, P2's
+> Mercurial half): they were one cause. Each new line was made from the line it branched from as read before the push,
+> in a fresh history the empty `default`, so its work was its whole tree: (2) its chain entry carried the tree into the
+> landing's record, which grew with heads times tree (377 ms of the 452-head step, debug; w-hg's probe: 32 lines of a
+> 200-file tree, 329,007 bytes of versions, about 10 KB a line for a one-file change); (3) a slice made one green whole,
+> its tree's work (123 ms at 452 heads). A new line now owes its push (`BranchChange::CreateDeferred`, its trees named
+> by their changesets), made in the step with no work, its record the debt's (about 150 bytes); its tree is built a
+> unit a turn when first reached (`crate::green_ready`), over the trees laid out then and lent through
+> `with_owed_push_objects` (`hg_push::owed_layout`, `slates_hg::push::tree::Layout::lend`), let-go texts awaited from
+> the changeset store. A line's head is read from its debt (`hg_made::head_of`), and a push moving an owing line makes
+> it through the door first, pinned until the push ends (`green_ready::made_for`). Measured (debug): the fixture's
+> record 14,335 bytes of versions (red 329,007), no line's work in the step, a line's first read 156 ms for its build
+> (`merge.green.materialize_wait_ns_most`, printed with the longest poll for main's release probe on the 452-head
+> history). Held by `hg_push::tests::t_goal93_a_push_of_many_new_lines_records_each_as_its_owed_push_not_its_tree`,
+> `an_owed_line_made_after_a_restart_reads_as_the_eager_line` (made after a restart that replays the debt, reading as a
+> line holding the same head eagerly: the same files and head identity), `an_owed_lines_build_dropped_mid_way_names_
+> nothing_and_is_made_again` (A-857's past-room drop: made once after one wait, its chain the debt alone), and the hg
+> crate's `a_lines_owed_push_materialized_is_the_eager_work_byte_for_byte`. Owed: (4) git's pushes (git/git's 1,027
+> refs) take the same slices once their driver hands its creates in (w-git's piece); a holder's replica of an owing
+> Mercurial line (`replica_build` lends no layout, so it is refused, counted); the release measure of a line's first
+> read on the 452-head history (main's).
 > Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
 > restart, `Unheld { 00manifest, rev }` (r915, Mercurial's own 57k history, rev 4222; here its first 5,000, rev 4281),
 > so the edge answered 503. The row named the empty window (a manifest whose text is its parent's, kept as an empty

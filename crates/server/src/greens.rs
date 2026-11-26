@@ -188,7 +188,8 @@ impl Greens {
     self.owing_reached.get()
   }
 
-  /// `id`'s engine, lent whether or not it owes a push: the materializer's, a replay's and a create's lend alone (P2).
+  /// `id`'s engine, lent whether or not it owes a push: the materializer's, a replay's and a create's lend alone (P2), and
+  /// a Mercurial line's head read from its debt (`vcs_store::hg_made::head_of`, A-929), which reads no content.
   pub fn lend(&self, id: &VolumeId) -> Option<GreenRef<'_>> {
     if let Some(green) = self.alone.get(id) {
       return Some(GreenRef::Alone(green));
