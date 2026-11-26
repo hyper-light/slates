@@ -865,7 +865,24 @@ struct Recording {
   before: std::collections::BTreeMap<String, ContentIdentity>,
   /// The texts it holds, each path once, found once they do.
   after: std::collections::BTreeMap<String, ContentIdentity>,
+  /// The units its walks took ([`RECORDING_WALK_UNITS`]).
+  walked: u64,
+  /// The most files one unit of its walks found ([`RECORDING_WALK_MOST_FILES`]).
+  most_found: u64,
+  /// The walk of the row the phase stands at, where a step ended part-way through it.
+  walking: Option<crate::vcs_store::svn_texts::FilesWalk>,
 }
+
+/// Counter: a unit of a kept revision's walks of the texts its rows let go and hold ([`Staging::record_some`], A-920
+/// 9a): many a wide copy's or move's revision shows its walk was taken a file a unit, never a copied or deleted tree in
+/// one. Format: a counter name in the daemon's status report.
+pub(crate) const RECORDING_WALK_UNITS: &str = "repository.svn_commit.recording_walk_units";
+
+/// Gauge: the most files one unit of a kept revision's walks found (A-920 9a), the shard's longest so far: one where a
+/// tree is walked a node a unit, a copied or deleted tree's every file where a row was one unit. Format: a counter name
+/// in the daemon's status report, its largest value.
+pub(crate) const RECORDING_WALK_MOST_FILES: &str =
+  "repository.svn_commit.recording_walk_most_files";
 
 /// Where a [`Recording`] stands.
 #[derive(Clone, Copy)]
@@ -913,32 +930,55 @@ impl Recording {
       phase: RecordPhase::Before(0),
       before: std::collections::BTreeMap::new(),
       after: std::collections::BTreeMap::new(),
+      walked: 0,
+      most_found: 0,
+      walking: None,
     }
   }
 
-  /// The phase's walk of the rows from `at`, over `records` at `revision`, a row a unit until `spent`: the texts each
-  /// lets go (before the records apply it) or holds (after), each path once, its last row's.
+  /// The phase's walk of the rows from `at`, over `records` at `revision`, a node a unit until `spent` (A-920 9a: a row a
+  /// unit walked a copied or deleted tree's every file in one): the texts each lets go (before the records apply it) or
+  /// holds (after), each path once, its last row's. A row's walk left part-way is taken up where it stopped.
   fn walk(
     &mut self,
     (records, revision, mut at): (&slates_svn::migration::Repository, u64, usize),
     spent: &mut dyn FnMut() -> bool,
   ) -> Recorded {
+    use crate::vcs_store::svn_texts::{held_walk, released_walk};
     let applied = matches!(self.phase, RecordPhase::After(..));
     let mut found = Vec::new();
     while let Some(change) = self.changes.get(at) {
-      if applied {
-        crate::vcs_store::svn_texts::held_by(records, change, revision, &mut found);
-      } else {
-        crate::vcs_store::svn_texts::released_by(records, change, revision, &mut found);
-      }
+      let walk = self.walking.take().or_else(|| {
+        if applied {
+          held_walk(change, revision)
+        } else {
+          released_walk(change, revision)
+        }
+      });
+      let row_done = match walk {
+        None => true,
+        Some(mut walk) => {
+          let ended = walk.step(records.index(), &mut found);
+          if !ended {
+            self.walking = Some(walk);
+          }
+          ended
+        }
+      };
+      self.most_found = self
+        .most_found
+        .max(u64::try_from(found.len()).unwrap_or(u64::MAX));
       let into = if applied {
         &mut self.after
       } else {
         &mut self.before
       };
       into.extend(found.drain(..).map(|(identity, path)| (path, identity)));
-      at = at.saturating_add(1);
-      if at < self.changes.len() && spent() {
+      self.walked = self.walked.saturating_add(1);
+      if row_done {
+        at = at.saturating_add(1);
+      }
+      if (at < self.changes.len() || self.walking.is_some()) && spent() {
         self.phase = if applied {
           RecordPhase::After(at, revision)
         } else {
@@ -954,6 +994,42 @@ impl Recording {
     };
     Recorded::after(spent)
   }
+}
+
+/// A kept revision's walks of `changes` taken a unit a step, as [`Staging::record_some`] takes them with every step
+/// spent: the texts they let go over `records` at `youngest`, then those they hold at `revision`, each path once, its
+/// last row's. For a test that holds them to the whole walks (`svn_texts::released_before`, `held_after`; A-920 9a).
+#[cfg(test)]
+pub(crate) fn walked_a_unit_a_step(
+  records: &slates_svn::migration::Repository,
+  changes: &[slates_svn::index::ChangedPath],
+  (youngest, revision): (u64, u64),
+) -> (
+  std::collections::BTreeMap<String, ContentIdentity>,
+  std::collections::BTreeMap<String, ContentIdentity>,
+) {
+  let mut recording = Recording {
+    checked: None,
+    applying: None,
+    changes: changes.to_vec(),
+    record: Vec::new(),
+    post: 0,
+    phase: RecordPhase::Before(0),
+    before: std::collections::BTreeMap::new(),
+    after: std::collections::BTreeMap::new(),
+    walked: 0,
+    most_found: 0,
+    walking: None,
+  };
+  let mut spent = || true;
+  while let RecordPhase::Before(at) = recording.phase {
+    recording.walk((records, youngest, at), &mut spent);
+  }
+  recording.phase = RecordPhase::After(0, revision);
+  while let RecordPhase::After(at, revision) = recording.phase {
+    recording.walk((records, revision, at), &mut spent);
+  }
+  (recording.before, recording.after)
 }
 
 /// Where a revision's staging stands between its steps ([`Staging::staged_in`]).
@@ -1494,15 +1570,23 @@ impl Staging {
         .subversion_records(repository)
         .ok_or(Uncommitted::NotHeld)
     };
-    match recording.phase {
+    let walked = recording.walked;
+    let phase = match recording.phase {
       RecordPhase::Before(at) => {
         let records = records()?;
-        Ok(recording.walk((records, records.youngest(), at), spent))
+        recording.walk((records, records.youngest(), at), spent)
       }
-      RecordPhase::Apply => self.apply_records(state, repository, (recording, spent)),
-      RecordPhase::After(at, revision) => Ok(recording.walk((records()?, revision, at), spent)),
-      RecordPhase::Fold => Ok(self.fold_some(recording, spent)),
-    }
+      RecordPhase::Apply => self.apply_records(state, repository, (recording, spent))?,
+      RecordPhase::After(at, revision) => recording.walk((records()?, revision, at), spent),
+      RecordPhase::Fold => self.fold_some(recording, spent),
+    };
+    state.count(
+      RECORDING_WALK_UNITS,
+      recording.walked.saturating_sub(walked),
+    );
+    let most = state.refusals.entry(RECORDING_WALK_MOST_FILES).or_insert(0);
+    *most = (*most).max(recording.most_found);
+    Ok(phase)
   }
 
   /// The records applied with `recording`'s checked revision a slice at a time until `spent`, a unit at least (A-920
