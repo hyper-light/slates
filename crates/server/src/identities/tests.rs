@@ -83,23 +83,68 @@ fn edited_work(state: &mut ShardState, green: VolumeId, name: &str) -> VolumeId 
   work
 }
 
-/// A work holding one edit over the root green of a new `tool` repository named `name`.
-fn repository_work(state: &mut ShardState, name: &str, tool: VcsTool) -> VolumeId {
+/// A work holding one edit over the root green of a new `tool` repository named `name`, from a task on the shard: the
+/// repository made as a client's creation is answered
+/// (`test_store::created`), never waited for on the shard's thread.
+async fn repository_work_awaited(name: &str, tool: VcsTool) -> VolumeId {
   let default_branch = match tool {
     VcsTool::Subversion => "trunk",
     VcsTool::Git | VcsTool::Mercurial => "main",
   };
-  let green = created(
-    state,
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool,
-      format: ObjectFormat::Sha1,
-      default_branch: default_branch.to_owned(),
-      green: None,
-    },
-  );
-  edited_work(state, green, name)
+  let asked = (name, tool, ObjectFormat::Sha1, default_branch);
+  let (_, green) = crate::test_store::created(&owner(), asked).await;
+  on(|state| edited_work(state, crate::verbs::to_wire_volume(green), name))
+}
+
+/// A work holding one edit over the root green of a new `tool` repository named `name` on `daemon`'s first shard, the
+/// repository made from the test's thread ([`stored_greens`]).
+fn repository_work_on(daemon: &crate::Daemon, name: &'static str, tool: VcsTool) -> VolumeId {
+  let [(_, green)] = stored_greens(daemon, [(name, tool)]);
+  crate::daemon::observe_first(daemon, move |state| edited_work(state, green, name))
+}
+
+/// The shard's state for `step`, from a task on the shard.
+fn on<T>(step: impl FnOnce(&mut ShardState) -> T) -> T {
+  crate::state::with_state(step).expect("the shard's state")
+}
+
+/// Format: the client a test's awaited submits are made as ([`recorded_git_submit_awaited`]), apart from the clients
+/// tests name.
+const AWAITED_CLIENT: u32 = 9_002;
+/// Shape: how long an awaited submit waits for its recorded answer: far past a debug build's made commit (seconds).
+const AWAITED_PATIENCE_NS: u64 = 60_000_000_000;
+
+/// `body`, a submit to a git green, run as [`AWAITED_CLIENT`]'s request `sequence` from a task on the shard, as a
+/// client's recorded request runs: its made commit landed by its own task, every store wait awaited (never
+/// `commits::made_landing_now`, which carries on the shard's thread), and its answer read where the request recorded it,
+/// waited for a turn at a time.
+async fn recorded_git_submit_awaited(body: RequestBody, sequence: u32) -> Option<ReplyBody> {
+  let id = RequestId {
+    client: AWAITED_CLIENT,
+    sequence,
+  };
+  let origin = u64::from(AWAITED_CLIENT);
+  let answered =
+    on(|state| crate::verbs::run_recorded_for_test(state, (origin, id), &owner(), body));
+  if answered.is_some() {
+    return answered;
+  }
+  let deadline = slates_rt::futures::now_ns().saturating_add(AWAITED_PATIENCE_NS);
+  loop {
+    let seen = on(|state| {
+      state
+        .db
+        .partition()
+        .completion(origin, id.client, id.sequence)
+    });
+    if let Seen::Completed(bytes) = seen {
+      return <ReplyBody as slates_wire::Wire>::from_bytes(&bytes).ok();
+    }
+    if slates_rt::futures::now_ns() >= deadline {
+      return None;
+    }
+    slates_rt::futures::yield_now().await;
+  }
 }
 
 /// The root greens of new repositories `tools` (each a name and a tool) on a store-backed daemon's one shard, each made
@@ -355,7 +400,7 @@ fn t_a664_a_repositorys_green_refuses_a_submit_with_no_identity_in_its_tool() {
 /// identity. Expect: accepted at version 1.
 #[test]
 fn t_a664_a_plain_green_takes_a_submit_with_neither() {
-  let answered = crate::test_store::audit_on_stored_shard("vcs", |state| {
+  let answered = crate::test_store::on_a_stored_shard(|state| {
     let work = plain_work(state);
     accepted_version(&ask(state, submit(work, None, ToolIdentities::default())))
   });
@@ -386,9 +431,8 @@ fn set_at_once(
 /// Do: set the owner's identities from an agent's own channel, with the launcher's proof. Expect: `Forbidden`.
 #[test]
 fn t_a664_an_agent_never_sets_identities_even_with_the_launchers_proof() {
-  let answer = crate::test_store::audit_on_stored_shard("vcs", |state| {
-    set_at_once(state, &agent(), both("Ada"), None)
-  });
+  let answer =
+    crate::test_store::on_a_stored_shard(|state| set_at_once(state, &agent(), both("Ada"), None));
   assert!(
     matches!(answer, Some(Refusal::Forbidden { .. })),
     "{answer:?}"
@@ -399,7 +443,7 @@ fn t_a664_an_agent_never_sets_identities_even_with_the_launchers_proof() {
 /// secret made. Expect: `GrantIssuerUnverified`.
 #[test]
 fn t_a664_identities_set_without_the_launchers_proof_are_refused() {
-  let answer = crate::test_store::audit_on_stored_shard("vcs", |state| {
+  let answer = crate::test_store::on_a_stored_shard(|state| {
     set_at_once(state, &owner(), both("Ada"), Some([0; 32]))
   });
   assert_eq!(answer, Some(Refusal::GrantIssuerUnverified));
@@ -414,9 +458,8 @@ fn refused_naming(answer: Option<&Refusal>, part: &str) -> bool {
 /// git name with a leading space, with the launcher's proof. Expect: `BadRequest` naming git's identity.
 #[test]
 fn t_a664_a_git_identity_git_would_change_is_refused() {
-  let answer = crate::test_store::audit_on_stored_shard("vcs", |state| {
-    set_at_once(state, &owner(), both(" Ada"), None)
-  });
+  let answer =
+    crate::test_store::on_a_stored_shard(|state| set_at_once(state, &owner(), both(" Ada"), None));
   assert!(
     refused_naming(answer.as_ref(), "git identity"),
     "{answer:?}"
@@ -429,7 +472,7 @@ fn t_a664_a_git_identity_git_would_change_is_refused() {
 /// proof. Expect: each `BadRequest` naming Mercurial's user, so no record holds a user Mercurial would refuse or change.
 #[test]
 fn t_a664_a_mercurial_user_mercurial_would_refuse_or_change_is_refused() {
-  let answers = crate::test_store::audit_on_stored_shard("vcs", |state| {
+  let answers = crate::test_store::on_a_stored_shard(|state| {
     [
       "Ada\n<ada@example.com>",
       "",
@@ -457,7 +500,7 @@ fn t_a664_a_mercurial_user_mercurial_would_refuse_or_change_is_refused() {
 /// `PolicyChanged { current: 1 }`, the record unchanged.
 #[test]
 fn t_a664_identities_are_recorded_as_the_version_after_the_one_read() {
-  let answered = crate::test_store::audit_on_stored_shard("vcs", |state| {
+  let answered = crate::test_store::on_a_stored_shard(|state| {
     let first = record(state, owner(), both("Ada"), 0);
     let stale = record(state, owner(), both("Eve"), 0);
     let kept = state
@@ -573,8 +616,8 @@ fn next_answer(end: &mut slates_ipc::ClientEnd) -> Option<(u32, ReplyBody)> {
 #[test]
 fn t_a664_a_session_reads_its_identities_once_and_its_clients_claim_never_reaches_the_green() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (work, index, first_behind, first) = crate::daemon::observe_first(&daemon, |state| {
-    let work = repository_work(state, "agents", VcsTool::Git);
+  let work = repository_work_on(&daemon, "agents", VcsTool::Git);
+  let (work, index, first_behind, first) = crate::daemon::observe_first(&daemon, move |state| {
     let (seat, region) = seat(state, FIRST_SESSION, owner());
     let claimed = submit(work, Some("the change"), git_only("Mallory"));
     let (behind, _) = sent(state, (seat, FIRST_SESSION), (1, &owner()), claimed);
@@ -679,15 +722,52 @@ fn t_a664_a_submit_waiting_for_its_sessions_read_is_refused_when_its_channel_is_
 /// session's kept none and refused `IdentityRequired`; the session still keeps none.
 #[test]
 fn t_a664_a_later_read_never_replaces_the_identities_a_session_keeps() {
-  let answered = crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let work = repository_work(state, "agents", VcsTool::Git);
-    let (seat, _client) = seat(state, FIRST_SESSION, owner());
-    if let Ok(slot) = state.clients.get_mut(seat) {
-      slot.identities = Some(ToolIdentities::default());
-    }
+  let answered = crate::test_store::run_on_stored_shard(|| async move {
+    let work = repository_work_awaited("agents", VcsTool::Git).await;
+    on(|state| {
+      let (seat, _client) = seat(state, FIRST_SESSION, owner());
+      if let Ok(slot) = state.clients.get_mut(seat) {
+        slot.identities = Some(ToolIdentities::default());
+      }
+      let id = RequestId {
+        client: FIRST_SESSION,
+        sequence: 2,
+      };
+      let resumed = Resumed {
+        client_index: seat.index(),
+        request: id.word(),
+        key: (state.origin_anchor.0, id, FIRST_SESSION),
+        principal: owner(),
+      };
+      let body = submit(work, Some("the change"), ToolIdentities::default());
+      let answer = match resumed.route(state, body, git_only("Ada")) {
+        Served::Reply(reply) => refusal(reply),
+        Served::Forwarded => None,
+      };
+      let kept = state
+        .clients
+        .get(seat)
+        .ok()
+        .and_then(|slot| slot.identities.clone());
+      (answer, kept)
+    })
+  });
+  let refused = Some(Refusal::IdentityRequired { tool: VcsTool::Git });
+  assert_eq!(answered, (refused, Some(ToolIdentities::default())));
+}
+
+/// A read of git's identity returning for [`FIRST_SESSION`]'s submit of an edited work over a new git repository named
+/// `name` to the seat `seat` is now: what the submit is answered and what the seat then keeps; then the version the
+/// owner's own submit of the work is accepted at, which says whether the returning submit built anything.
+async fn returned_to(
+  (name, seat): (&str, Handle<ClientSlot>),
+  sequence: u32,
+) -> (Option<Refusal>, Option<ToolIdentities>, Option<u64>) {
+  let work = repository_work_awaited(name, VcsTool::Git).await;
+  let (answer, kept) = on(|state| {
     let id = RequestId {
       client: FIRST_SESSION,
-      sequence: 2,
+      sequence: 1,
     };
     let resumed = Resumed {
       client_index: seat.index(),
@@ -707,44 +787,10 @@ fn t_a664_a_later_read_never_replaces_the_identities_a_session_keeps() {
       .and_then(|slot| slot.identities.clone());
     (answer, kept)
   });
-  let refused = Some(Refusal::IdentityRequired { tool: VcsTool::Git });
-  assert_eq!(answered, (refused, Some(ToolIdentities::default())));
-}
-
-/// A read of git's identity returning for [`FIRST_SESSION`]'s submit of an edited work over a new git repository named
-/// `name` to the seat `seat` is now: what the submit is answered and what the seat then keeps; then the version the
-/// owner's own submit of the work is accepted at, which says whether the returning submit built anything.
-fn returned_to(
-  state: &mut ShardState,
-  (name, seat): (&str, Handle<ClientSlot>),
-) -> (Option<Refusal>, Option<ToolIdentities>, Option<u64>) {
-  let work = repository_work(state, name, VcsTool::Git);
-  let id = RequestId {
-    client: FIRST_SESSION,
-    sequence: 1,
-  };
-  let resumed = Resumed {
-    client_index: seat.index(),
-    request: id.word(),
-    key: (state.origin_anchor.0, id, FIRST_SESSION),
-    principal: owner(),
-  };
-  let body = submit(work, Some("the change"), ToolIdentities::default());
-  let answer = match resumed.route(state, body, git_only("Ada")) {
-    Served::Reply(reply) => refusal(reply),
-    Served::Forwarded => None,
-  };
-  let kept = state
-    .clients
-    .get(seat)
-    .ok()
-    .and_then(|slot| slot.identities.clone());
   // The owner's own submit, a client's recorded request, as a git green takes one (main 01a20182's ruling of 2026-11-24
-  // 01:36).
-  let owners = crate::vcs_store::paths::tests::recorded_git_submit(
-    state,
-    submit(work, Some("the change"), git_only("Ada")),
-  );
+  // 01:36), its made commit landed by its own task.
+  let owners =
+    recorded_git_submit_awaited(submit(work, Some("the change"), git_only("Ada")), sequence).await;
   (answer, kept, owners.as_ref().and_then(accepted_version))
 }
 
@@ -755,15 +801,21 @@ fn returned_to(
 /// read counted; each owner's submit accepted at version 1, so neither returning submit built anything.
 #[test]
 fn t_a664_a_read_returning_to_a_seat_its_session_left_is_kept_by_no_one_and_runs_nothing() {
-  let answered = crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (taken, _taken_region) = seat(state, SECOND_SESSION, agent());
-    let (retiring, _retiring_region) = seat(state, FIRST_SESSION, owner());
-    if let Ok(slot) = state.clients.get_mut(retiring) {
-      slot.retiring = true;
-    }
-    let returned = [("taken", taken), ("retiring", retiring)]
-      .map(|(name, seat)| returned_to(state, (name, seat)));
-    (returned, state.refusals.get(READ).copied())
+  let answered = crate::test_store::run_on_stored_shard(|| async move {
+    // The seats' regions held to the history's end, as their clients would hold them.
+    let (taken, retiring, _regions) = on(|state| {
+      let (taken, taken_region) = seat(state, SECOND_SESSION, agent());
+      let (retiring, retiring_region) = seat(state, FIRST_SESSION, owner());
+      if let Ok(slot) = state.clients.get_mut(retiring) {
+        slot.retiring = true;
+      }
+      (taken, retiring, (taken_region, retiring_region))
+    });
+    let returned = [
+      returned_to(("taken", taken), 1).await,
+      returned_to(("retiring", retiring), 2).await,
+    ];
+    (returned, on(|state| state.refusals.get(READ).copied()))
   });
   let each = (Some(Refusal::NotFound), None, Some(1));
   assert_eq!(answered, ([each.clone(), each], None));
