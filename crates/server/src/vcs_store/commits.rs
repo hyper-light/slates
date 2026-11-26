@@ -1118,7 +1118,12 @@ pub(crate) fn home_and_land_blocking(
   let mut ask = first_ask(state, sealed)?;
   loop {
     let (carry, homing) = ask;
-    let carried = crate::git_push::tests::carried_blocking(state, carry);
+    // Each carry waits for the store on the shard's thread: allow-listed until its tests run the task that awaits it
+    // (`home_and_land`; test_store::SHARD_BLOCKING_ALLOWED).
+    let carried = crate::test_store::allowing_shard_blocking(
+      "vcs_store::commits::home_and_land_blocking",
+      || crate::git_push::tests::carried_blocking(state, carry),
+    );
     match next_ask(state, sealed, homing, carried)? {
       Some(next) => ask = next,
       None => return Some(()),

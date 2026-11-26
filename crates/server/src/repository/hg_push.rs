@@ -2660,9 +2660,23 @@ fn settled_whole(state: &mut ShardState, run: Option<super::hg_run::Run>, accept
 
 /// [`land`] for a test on a shard (main's ruling of 2026-11-20: the one landing path, the store first): `prepared`'s
 /// push landed on the shard's store ([`store_blocking`]), then landed as the driver lands it; a refused store landing
-/// leaves the fork naming no changeset, which [`land`] refuses.
+/// leaves the fork naming no changeset, which [`land`] refuses. Its segments and the texts its works name wait for the
+/// store on the shard's thread: allow-listed until its tests push from a task (`unbundle`;
+/// test_store::SHARD_BLOCKING_ALLOWED).
 #[cfg(test)]
 pub(crate) fn land_stored(
+  state: &mut ShardState,
+  held: (&Principal, RepositoryId),
+  prepared: Prepared,
+) -> Landed {
+  crate::test_store::allowing_shard_blocking("repository::hg_push::land_stored", || {
+    land_stored_held(state, held, prepared)
+  })
+}
+
+/// [`land_stored`]'s steps, on the shard's thread.
+#[cfg(test)]
+fn land_stored_held(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),
   mut prepared: Prepared,
@@ -3760,7 +3774,10 @@ fn stored_now(state: &mut ShardState, repository: RepositoryId, taking: &mut Tak
   let (Some(disk), Some(intake)) = (state.vcs_disk.clone(), taking.intake.as_mut()) else {
     return false;
   };
-  crate::test_store::answer_wants_blocking(&disk, u128::from_be_bytes(repository.bytes), intake)
+  // Waited for on the shard's thread: allow-listed until its tests push from a task (test_store::SHARD_BLOCKING_ALLOWED).
+  crate::test_store::allowing_shard_blocking("repository::hg_push::stored_now", || {
+    crate::test_store::answer_wants_blocking(&disk, u128::from_be_bytes(repository.bytes), intake)
+  })
 }
 
 /// The intake's want of the store, met by a caller that cannot wait between steps: a made changeset's, which sends
@@ -3773,9 +3790,26 @@ fn stored_now(_state: &mut ShardState, _repository: RepositoryId, _taking: &mut 
 /// A prepared push landed as the driver lands it once its intake is done: a fork another push made stale taken again
 /// from its changegroup, every slice at once (the driver takes it again inside its repository's landing turn,
 /// `hg_run`), then its segments landed on the store ([`store_blocking`]), then judged at landing and landed: the
-/// driver's steps for the tests, which land pushes side by side with no runtime.
+/// driver's steps for the tests, which land pushes side by side with no runtime. Its segments and the texts its works
+/// want wait for the store on the shard's thread: allow-listed until its tests push from a task (`unbundle`;
+/// test_store::SHARD_BLOCKING_ALLOWED).
 #[cfg(test)]
 pub(crate) fn land_in(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  pushed: (&Principal, &[u8]),
+  unbundle: &Unbundle,
+  forked: Option<Forked>,
+  room: &mut Admission,
+) -> Option<PushOutcome> {
+  crate::test_store::allowing_shard_blocking("repository::hg_push::land_in", || {
+    land_in_held(state, repository, pushed, unbundle, forked, room)
+  })
+}
+
+/// [`land_in`]'s steps, on the shard's thread.
+#[cfg(test)]
+fn land_in_held(
   state: &mut ShardState,
   repository: RepositoryId,
   (principal, bundle): (&Principal, &[u8]),
@@ -4066,9 +4100,26 @@ fn intake_outcome(refused: &IntakeRefused) -> PushOutcome {
 }
 
 /// [`prepare`] over `view` with `unbundle`'s changegroup taken whole into a fork first, the prepared push holding the
-/// fork: the driver's steps for the tests, which judge a push over a view of their own.
+/// fork: the driver's steps for the tests, which judge a push over a view of their own. The texts its works want wait
+/// for the store on the shard's thread: allow-listed until its tests push from a task (`unbundle`;
+/// test_store::SHARD_BLOCKING_ALLOWED).
 #[cfg(test)]
 pub(crate) fn prepare_whole<V: Repository>(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  unbundle: &Unbundle,
+  view: &V,
+  terms: Terms,
+  room: &mut Admission,
+) -> Result<Prepared, Box<Refused>> {
+  crate::test_store::allowing_shard_blocking("repository::hg_push::prepare_whole", || {
+    prepare_whole_held(state, repository, unbundle, view, terms, room)
+  })
+}
+
+/// [`prepare_whole`]'s steps, on the shard's thread.
+#[cfg(test)]
+fn prepare_whole_held<V: Repository>(
   state: &mut ShardState,
   repository: RepositoryId,
   unbundle: &Unbundle,

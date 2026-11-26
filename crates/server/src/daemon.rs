@@ -8850,7 +8850,7 @@ mod tests {
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
     let shard = first.shards.first().copied();
-    let (pack, bytes, before) = first
+    let (pack, bytes, landing) = first
       .observe(shard, |state| {
         let window = state.store.content.chunk_bytes();
         state.vcs_stores.content_made(window).unwrap();
@@ -8878,11 +8878,19 @@ mod tests {
           sections: 0,
         };
         let parts = vec![(slates_store::log::SectionKind::Payload, bytes.clone())];
-        assert!(crate::test_store::land_blocking(
-          state.vcs_disk.clone().unwrap(),
-          header,
-          parts
-        ));
+        (
+          pack,
+          bytes,
+          (state.vcs_disk.clone().unwrap(), header, parts),
+        )
+      })
+      .unwrap();
+    // Landed from the test's thread, between observations: waited for on the shard's own thread, the store's commit
+    // would hold the shard (test_store::refuse_on_a_shard).
+    let (disk, header, parts) = landing;
+    assert!(crate::test_store::land_blocking(disk, header, parts));
+    let before = first
+      .observe(shard, move |state| {
         let here = state.shard;
         crate::vcs_store::let_go_landed_pack_among(state, &pack, &[here]);
         crate::verbs::publish_shard(state).unwrap();
@@ -8893,7 +8901,7 @@ mod tests {
             .filter(|(window, _)| content.is_away(window))
             .count()
         });
-        (pack, bytes, (records, gone))
+        (records, gone)
       })
       .unwrap();
     first.stop();

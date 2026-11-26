@@ -442,10 +442,13 @@ fn served(state: &mut ShardState, id: RepositoryId) -> Served {
           row.node,
           row.len,
         );
-        assert!(
-          crate::test_store::answer_wants_blocking(&disk, u128::from_be_bytes(id.bytes), &mut ask),
-          "the changeset store answered"
-        );
+        // Read on the shard's thread: allow-listed until the read moves to the test's thread
+        // (test_store::SHARD_BLOCKING_ALLOWED).
+        let answered =
+          crate::test_store::allowing_shard_blocking("repository::import::tests::served", || {
+            crate::test_store::answer_wants_blocking(&disk, u128::from_be_bytes(id.bytes), &mut ask)
+          });
+        assert!(answered, "the changeset store answered");
         ask.taken().map(|(_, _, text)| text).expect("its text")
       })
     })

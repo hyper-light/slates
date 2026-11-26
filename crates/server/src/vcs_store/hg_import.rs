@@ -528,8 +528,12 @@ pub(crate) const FILE_TEXTS_PINNED: &str = "vcs_store.hg_import.file_texts_pinne
 /// ([`land_segments_blocking`]), as [`run`] lands them between turns.
 #[cfg(test)]
 pub(crate) fn land_imported(state: &mut ShardState, id: RepositoryId) -> Result<(), ImportFailed> {
-  land_segments_blocking(state, id)?;
-  built_works_whole(state, id)?;
+  // Its segments and the texts its works want wait for the store on the shard's thread: allow-listed until its callers
+  // move to `land_imported_on` (test_store::SHARD_BLOCKING_ALLOWED).
+  crate::test_store::allowing_shard_blocking("vcs_store::hg_import::land_imported", || {
+    land_segments_blocking(state, id)?;
+    built_works_whole(state, id)
+  })?;
   // A test holds the shard's state through its landing: its revisions let go at once.
   let contents = land(state, id)?;
   let (freed, pinned) = crate::repository::hg_run::let_go_windows(state, Some(id), &contents);
@@ -573,7 +577,10 @@ pub(crate) fn land_imported_on(
     })?;
   }
   crate::daemon::observe_at(daemon, partition, move |state| {
-    built_works_whole(state, id)?;
+    // A text not at hand is read from the store on the shard's thread: allow-listed until the works build in a task.
+    crate::test_store::allowing_shard_blocking("vcs_store::hg_import::land_imported_on", || {
+      built_works_whole(state, id)
+    })?;
     let contents = land(state, id)?;
     let (freed, pinned) = crate::repository::hg_run::let_go_windows(state, Some(id), &contents);
     state.count(FILE_TEXT_BYTES_LET_GO, freed);

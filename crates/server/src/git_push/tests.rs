@@ -241,18 +241,22 @@ pub(crate) fn git_repository_on(daemon: &crate::Daemon, name: &str) -> Repositor
 }
 
 /// Makes git repository `name`, SHA-1, its default branch `main`, on the shard: its id.
+/// Blocks the shard on the store's commit, allow-listed until git_push's tests move to [`git_repository_on`]
+/// (`test_store::SHARD_BLOCKING_ALLOWED`, w-git's to empty).
 pub(crate) fn git_repository(state: &mut ShardState, name: &str) -> RepositoryId {
-  let reply = crate::test_store::create(
-    state,
-    &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool: VcsTool::Git,
-      format: WireFormat::Sha1,
-      default_branch: "main".to_owned(),
-      green: None,
-    },
-  );
+  let reply = crate::test_store::allowing_shard_blocking("git_push::tests::git_repository", || {
+    crate::test_store::create(
+      state,
+      &owner(),
+      RequestBody::CreateRepository {
+        name: name.to_owned(),
+        tool: VcsTool::Git,
+        format: WireFormat::Sha1,
+        default_branch: "main".to_owned(),
+        green: None,
+      },
+    )
+  });
   assert!(
     matches!(reply, ReplyBody::GreenCreated { .. }),
     "no repository: {reply:?}"
@@ -2436,7 +2440,12 @@ pub(crate) fn carry_blocking<P>(state: &mut ShardState, push: &mut ReceivePack<P
   let Some(asked) = push.take_homing() else {
     return;
   };
-  let carried = carried_blocking(state, asked);
+  // Allow-listed until git_push's tests carry a push in a task that awaits its landing (`test_store::
+  // SHARD_BLOCKING_ALLOWED`, w-git's to empty).
+  let carried =
+    crate::test_store::allowing_shard_blocking("git_push::tests::carry_blocking", || {
+      carried_blocking(state, asked)
+    });
   push.homed(state, carried);
 }
 
