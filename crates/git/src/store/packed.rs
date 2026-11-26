@@ -229,6 +229,13 @@ impl Scratch {
   }
 }
 
+/// Derived: the fewest chunks a [`Recent`]'s budget is laid in. The oldest chunk goes whole to make room for the next,
+/// so at any moment up to two chunks' share (the one given back, the newest's room not yet laid) is not kept: an
+/// eighth each leaves at least three quarters of the budget keeping the newest objects. A chunk as long as the budget
+/// (one chunk) gave everything back each time it filled: a fetch walking eight directories' chains interleaved found
+/// 94 of 108 later reads kept where every one fits.
+const CHUNKS_A_BUDGET: usize = 8;
+
 /// Objects read lately, by where their entries begin (module docs, "Objects read lately"): none kept past `budget`
 /// bytes, the oldest given back first. Their bytes lie in chunks of the mapped allocation's floor, laid end to end, the
 /// oldest chunk given back whole (goal 93, main 01a20182's ruling of 2026-11-22 04:56): kept as a buffer each, a git/git
@@ -329,9 +336,12 @@ impl Recent {
   }
 
   /// A chunk's length: the mapped allocation's floor, so each is given back whole when it goes (`slates_mem::large`), or
-  /// the budget where that is shorter.
+  /// a [`CHUNKS_A_BUDGET`]th of the budget where that is shorter, so the oldest chunk's going gives back that share of
+  /// what is kept, never the whole.
   fn chunk_len(&self) -> usize {
-    slates_mem::large::floor().min(self.budget).max(1)
+    slates_mem::large::floor()
+      .min(self.budget.checked_div(CHUNKS_A_BUDGET).unwrap_or(0))
+      .max(1)
   }
 
   /// Copies `bytes` to the end of the newest chunk, or of a new one where it has no room.
@@ -909,8 +919,8 @@ mod recent_tests {
   }
 
   /// A-861's charge (main 01a20182, 2026-11-22 05:17: an uncharged holder makes the admission's numbers lie). Do: with a
-  /// budget of four chunks over a store whose room is four and a half, keep objects until four chunks' worth and true
-  /// up; then take the store's room down to one and a half chunks' worth of charge and true up again; then release.
+  /// budget laid in chunks of the mapped floor ([`CHUNKS_A_BUDGET`] of them) over a store whose room is four and a half,
+  /// keep objects until four chunks' worth and true up; then take the store's room down to one and a half chunks' worth of charge and true up again; then release.
   /// Expect: the store charged exactly the chunks held after each true-up, the second giving back the oldest chunks
   /// until the charge fits the room (two chunks kept); none charged and none held after the release.
   #[test]
@@ -918,7 +928,7 @@ mod recent_tests {
     let room = u64::try_from(9 * chunk() / 2).unwrap();
     let mut store = slates_vcs::ContentStore::new(room, 4096).unwrap();
     let mut recent = Recent::default();
-    recent.set_budget(4 * chunk());
+    recent.set_budget(super::CHUNKS_A_BUDGET * chunk());
     for n in 0..16 {
       recent.keep(at(n), Kind::Blob, vec![1; chunk() / 4]);
     }

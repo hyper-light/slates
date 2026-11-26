@@ -63602,6 +63602,19 @@ Applied in the same change to: `crates/git/src/store/{graph,mod}.rs`, `crates/gi
 > being read stays whole for its next revisions; a longer one keeps its newest, the oldest given back first. The fork's release gives the cache back.
 > Counted: `vcs_store.git_upload.tree_deltas` and `tree_deltas_most`. Red: the 13-tree chain's fetch applied 78
 > deltas; now 12, the chain built once (the walk reads the newest first, whose read applies the whole chain).
+>
+> **Its size: every chain one commit's walk reads (2026-11-25, main's git/git leg at 47de9566d).** Sized for the tree
+> being read, the cache kept one chain: on git/git's clone it widened 13 times to at most 3,103,050 B, was never
+> refused, and hit 6,702 times while the walk applied 2,004,133 deltas, every clone alike (the cache lives with the
+> fetch's fork). A clone's walk reads every directory's chain interleaved, so the directories read between two of one
+> directory's revisions put its chain out. Now the walk's graph sums the bytes of the trees it opens for each sent
+> commit (`PositionCache`'s `trees_met`, its most `trees_most`, measured as the position cache measures ids), and the
+> cache widens to a chain's entries (the learned depth's deltas and their base) times the most of those: the first
+> commit opens every tree, so every directory's chain fits. And the cache is laid in at least eight chunks
+> (`packed::CHUNKS_A_BUDGET`): under the mapped floor its one chunk was its whole budget, and gave everything back each
+> time it filled. Red: `a_fetchs_read_cache_keeps_every_interleaved_chain_whole`, eight directories and the root 12
+> revisions deep, 117 tree reads: 12 hits and 698 deltas before (budget 4,992 B); 94 hits and 187 deltas with the size
+> alone (budget 46,488 B); 108 hits, every read past each chain's first, and 108 deltas with the chunks.
 
 ### A-912 — A push during a member's death is accepted: no exchange holds a peer's record session across a wait that needs the council's next round, and a push's homing outlasts a death (2026-11-24, w-shared for main 01a20182, its rulings of 2026-11-24 ((i), (1), (a), (b)); found by A-908 part 4's fleet test; amends A-902; A-363, A-724 piece 6, A-727 (d1a), A-907)
 
@@ -64367,7 +64380,14 @@ measured noise of the 100 figure, not a literal.
 > 1,984K fresh and 2,000K 60 s later (RSS 6,576 KiB), against the daemon's 38M (RSS 49,568 KiB): about 5 %, flat; no
 > process of the binary left after the stop. Linux (diag 2, debug, 4-core runners), a start's median on the asking
 > thread through the spawner against direct: x86_64 94.3 / 102.7 / 96.1 µs at 100 / 10,000 / 65,527 descriptors
-> against 214.4 µs / 674.5 µs / 3.26 ms; arm64 94.5 / 94.8 / 80.5 µs against 272.7 / 354.3 / 670.2 µs.
+> against 214.4 µs / 674.5 µs / 3.26 ms; arm64 94.5 / 94.8 / 80.5 µs against 272.7 / 354.3 / 670.2 µs. Diag 3 (run
+> 45711714350 at 0b9a3f9e8, after the close-on-exec fix): `slates-ipc --lib spawner` 8 of 8 on both Linux lanes,
+> `a_child_started_through_the_spawner_holds_what_a_direct_one_holds` included, so the parity condition is met on
+> Linux. Through the spawner against direct, least / median / most: x86_64 at 100 descriptors 68.6 / 74.1 / 90.2 µs
+> against 178.3 / 188.7 / 243.2 µs; at 10,000, 66.2 / 68.5 / 76.8 against 506.2 / 534.0 / 578.3 µs; at 65,527, 65.7 /
+> 65.8 / 74.5 µs against 2.32 / 2.34 / 2.36 ms. arm64 at 100, 89.5 / 105.2 / 117.7 against 270.9 / 313.3 / 394.5 µs; at
+> 10,000, 84.4 / 100.3 / 152.6 against 371.3 / 390.7 / 424.6 µs; at 65,527, 80.9 / 91.5 / 157.9 against 674.7 / 705.9 /
+> 746.9 µs. A start through the spawner stays at 66 to 105 µs at the median whatever the daemon holds open.
 
 ### A-923 — The Aways family is keyed by let-go number, and every capped cut read counts each entry's page head (2026-11-25, w-perf for main 01a20182, its churn ruling (b) and its rulings on the format and the read cap; A-870, A-767 C1 step 2b)
 
