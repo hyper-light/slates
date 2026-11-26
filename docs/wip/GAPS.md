@@ -1994,9 +1994,10 @@
 > line holding the same head eagerly: the same files and head identity), `an_owed_lines_build_dropped_mid_way_names_
 > nothing_and_is_made_again` (A-857's past-room drop: made once after one wait, its chain the debt alone), and the hg
 > crate's `a_lines_owed_push_materialized_is_the_eager_work_byte_for_byte`. Owed: (4) git's pushes (git/git's 1,027
-> refs) take the same slices once their driver hands its creates in (w-git's piece); a holder's replica of an owing
-> Mercurial line (`replica_build` lends no layout, so it is refused, counted); the release measure of a line's first
-> read on the 452-head history (main's).
+> refs) take the same slices once their driver hands its creates in (w-git's piece); the release measure of a line's
+> first read on the 452-head history (main's). The replica half CLOSED (same day): a holder's replica of an owing line
+> is laid out and lent as its owner's (`replica_build::laid_out`, through `with_owed_push_objects`), held by
+> `hg_push::tests::a_holders_replica_of_an_owed_line_is_made_and_reads_as_the_owners_line` (red: made 0, refused 1).
 > Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
 > restart, `Unheld { 00manifest, rev }` (r915, Mercurial's own 57k history, rev 4222; here its first 5,000, rev 4281),
 > so the edge answered 503. The row named the empty window (a manifest whose text is its parent's, kept as an empty

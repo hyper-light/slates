@@ -65118,7 +65118,8 @@ Applied in the same change to:
   while held.
 - `crates/server/src/repository/push.rs`: a deferred create counts no miss; the record's version bytes counted most
   (`repository.push.entry_versions_bytes_most`).
-- `crates/server/src/replica_build.rs`: a holder lends no Mercurial layout yet (owed, GAPS).
+- `crates/server/src/replica_build.rs`: a holder's replica of an owing line laid out and lent as its owner's (`laid_out`,
+  `Turned::Asked`; the replica half, below); `begin`, the build `wanted` begins, apart from it.
 - GAPS (the landing spin's (2) and (3); A-812).
 
 - **Why.** A push of a history with many heads made each new line from the line it branched from at the version read
@@ -65160,6 +65161,10 @@ Applied in the same change to:
   `t_goal93_a_push_moving_many_heads_judges_their_works_ahead_of_its_landing_step` (the moved lines made through the
   door, then judged ahead), `daemon::tests::t_goal93_a_push_of_many_heads_lands_its_new_lines_outside_its_landing_step`,
   and the hg crate's oracle above.
-- **Owed.** A holder's replica of a Mercurial line that owes (`replica_build`): it lends no layout, so such a replica is
-  refused, counted; a takeover of an owing Mercurial line therefore needs its owner's build first. The release measure
-  of the first read's wait on the 452-head history (main's probe).
+- **The replica half** (same day, main's order): a holder's replica of a line that owes is made as its owner's line is.
+  `replica_build` lays the push's trees out before the build's first turn over the repository's store on the holder
+  (`laid_out`, `hg_push::owed_layout`, its store's replay waited for first), lends them each turn through
+  `with_owed_push_objects`, and brings a waited file text back from the changeset store. Red first:
+  `hg_push::tests::a_holders_replica_of_an_owed_line_is_made_and_reads_as_the_owners_line` (made 0, refused 1 before;
+  made 1, refused 0 after), its replica's files and head identity the owner's line's.
+- **Owed.** The release measure of the first read's wait on the 452-head history (main's probe).

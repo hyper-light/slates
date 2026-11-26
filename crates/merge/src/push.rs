@@ -497,7 +497,10 @@ impl DeferredPush {
     Building::new(&self.push(), room, pace)
   }
 
-  /// Its record: the magic, the version, the push, and the digest of them.
+  /// Its record: the magic, the version, the push, and the digest of them. The push is recorded as owed, based at the
+  /// new green's version 0, so the work its build makes hashes that base (A-618's identity: the push's name and base,
+  /// then the document and post-state): a create whose eager work was hashed at its source's version and rebased to 0
+  /// (Mercurial's new lines before A-929) made the same files, head and head identity under another work id.
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&DEFERRED_MAGIC.to_le_bytes());
