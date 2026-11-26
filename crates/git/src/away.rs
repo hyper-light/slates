@@ -20,6 +20,8 @@
 
 use core::cell::Cell;
 
+use crate::store::packed::Waited;
+
 /// The window a reader last stopped for, so it stops at most once a window before its refusal (the module docs).
 /// Kept by the reader across its turns; `K` is what names a stop.
 #[derive(Clone, Debug)]
@@ -66,6 +68,36 @@ impl<K: Copy + PartialEq> WaitOnce<K> {
   /// The stop last waited for, for a reader made again next turn to carry ([`WaitOnce::after`]).
   pub fn last(&self) -> Option<K> {
     self.last.get()
+  }
+}
+
+/// The let-go window a reader met, noted in its owner's own slot for that owner's driver alone to bring back (B1's
+/// second cause under load: a push noted its window on the repository's one slot, which a derivation's turn clears at
+/// its start, so its driver found nothing to bring back and the push was refused; main's lines of
+/// agents/w-git-b1-debug, run 15). A reader given one notes there and nowhere else; one given none notes on its
+/// repository's slot, which the owners without one of their own share (a green build, a replay, a derivation).
+#[derive(Debug, Default)]
+pub struct Waits {
+  /// The window noted first since it was last taken.
+  noted: Cell<Option<Waited>>,
+}
+
+impl Waits {
+  /// Notes `waited`, where nothing is noted since the slot was last taken: a turn stops at its first.
+  pub fn note(&self, waited: Waited) {
+    if self.noted.get().is_none() {
+      self.noted.set(Some(waited));
+    }
+  }
+
+  /// The window noted, taken: what the owner's driver brings back after the turn.
+  pub fn take(&self) -> Option<Waited> {
+    self.noted.take()
+  }
+
+  /// The window noted, left as it is.
+  pub fn peek(&self) -> Option<Waited> {
+    self.noted.get()
   }
 }
 

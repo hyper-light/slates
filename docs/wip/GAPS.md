@@ -516,6 +516,23 @@
 >     same let-go met twice with nothing brought back refused the object (`receive::tests::session::
 >     a_checks_turn_ends_at_its_walks_stop_on_a_let_go_window_and_is_whole_once_it_is_back`, a quantum never
 >     spent: done and `Missing` in the first turn before);
+>   - a push's wait is its own (`slates_git::away::Waits` on `ReceivePack`, taken by its HTTP, SSH and test drivers,
+>     `upload::brought_back_own`). Its readers (the quarantine, `IndexedObjects`, `PushedObjects`) note there alone and
+>     no longer on the repository's one slot, where a derivation's turn clears "a miss an earlier step left noted" at
+>     its start (`git_derive::turn`), so the driver found nothing to bring back and the push was refused (main's run
+>     15). `Repository::read_stored_waited` answers the let-go a read met and writes no slot, so each reader notes its
+>     own and never a stale one. Red: `b1_a_note_cleared_on_the_repository_between_a_pushs_stop_and_its_driver_leaves_
+>     the_push_its_own` (`missing necessary objects` before).
+> **OPEN (w-git, 2026-11-26): the repository's one wait slot is still shared by every owner but a push**, and each can
+> lose another's note of a let-go window: a derivation's turn clears it at its start (`git_derive::turn`), the
+> encoding's read clears it (`store/encoding.rs`) and takes it, a fetch's stream clears it before every read
+> (`store/upload.rs` `read_or_stop`) and its edges and answer take it, and a green build and a replica build take it
+> (`green_ready`, `replica_build`). A lost note is a window not brought back, so that owner's read refuses typed where
+> it should have waited. The fix is B1's: each owner its own `Waits`. Also still on the repository's slot from inside a
+> push: the admission's peel and references (B3), which refuse anyway until B3 moves them onto the push's slot. The
+> upload stream's and the encoding's stop rules are their own copies of the one rule, keyed by a window's place, not
+> its let-go's number (`Upload::stop_at`; the encoding's `stopped_at` set never waits twice for one window in a whole
+> encoding): owed onto `slates_git::away::WaitOnce`, as B1's readers are.
 > - OPEN: B2 (the server's tag-headed green, `ShardGreens::tree_of`), B3 (the admission's peel and references), B4 (the
 >   policy's reads), B5 (`PushedObjects::bytes` of a pushed object, `Malformed`), B6 (a verdict's one-call build), B7
 >   (`push_of`'s peel at judge time, after `prepare`'s), B8 (the encoding's tree walk: time, not correctness).

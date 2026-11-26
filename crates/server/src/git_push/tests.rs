@@ -1553,7 +1553,7 @@ fn b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands() {
   let (repository, update, pack) = thin_update_over_a_create(&daemon, "thin-check-away");
   let (updated, (at_let_go, after), _) = crate::test_store::run_on_first(
     &daemon,
-    move || async move { let_go_at_its_checks(repository, &update, (&pack, false)).await },
+    move || async move { let_go_at_its_checks(repository, &update, (&pack, Meddle::Not)).await },
     HISTORY_PATIENCE,
   )
   .unwrap();
@@ -1582,12 +1582,15 @@ fn b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands() {
 fn b1_a_window_brought_back_and_let_go_again_by_another_reader_is_waited_for_again() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (repository, update, pack) = thin_update_over_a_create(&daemon, "thin-let-go-again");
-  let (updated, (at_let_go, after), again) = crate::test_store::run_on_first(
-    &daemon,
-    move || async move { let_go_at_its_checks(repository, &update, (&pack, true)).await },
-    HISTORY_PATIENCE,
-  )
-  .unwrap();
+  let (updated, (at_let_go, after), again) =
+    crate::test_store::run_on_first(
+      &daemon,
+      move || async move {
+        let_go_at_its_checks(repository, &update, (&pack, Meddle::LetGoAgain)).await
+      },
+      HISTORY_PATIENCE,
+    )
+    .unwrap();
   let refused = crate::daemon::observe_first(&daemon, bring_backs_refused);
   daemon.stop();
   assert!(
@@ -1616,6 +1619,42 @@ fn bring_backs_refused(state: &mut ShardState) -> (u64, u64, u64) {
     count(crate::vcs_store::upload::BRING_BACK_PAST_PATIENCE),
     count(crate::vcs_store::read_through::UNANSWERED),
   )
+}
+
+/// B1's second cause under load (main's lines of agents/w-git-b1-debug, run 15: "derivation turn cleared the
+/// repository's note" between the push's stop and its driver): the push's wait is its own, not the repository's one
+/// slot. Do: [`b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands`]'s update, but at the push's first stop
+/// on the let-go base, the repository's note of a miss is cleared before the push's driver looks, as a derivation's turn
+/// clears it at its start (`git_derive::turn`). Expect: `ok`, the push's driver bringing back the window its own slot
+/// noted. Red with the push's waits noted on the repository's slot (1c4ecec27): `missing necessary objects`, the driver
+/// finding nothing to bring back and the walk meeting the same let-go again.
+#[test]
+fn b1_a_note_cleared_on_the_repository_between_a_pushs_stop_and_its_driver_leaves_the_push_its_own()
+{
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, update, pack) = thin_update_over_a_create(&daemon, "thin-note-cleared");
+  let (updated, (at_let_go, after), cleared) =
+    crate::test_store::run_on_first(
+      &daemon,
+      move || async move {
+        let_go_at_its_checks(repository, &update, (&pack, Meddle::NoteCleared)).await
+      },
+      HISTORY_PATIENCE,
+    )
+    .unwrap();
+  let refused = crate::daemon::observe_first(&daemon, bring_backs_refused);
+  daemon.stop();
+  assert!(cleared, "the repository's note cleared at the push's stop");
+  assert_eq!(
+    reasons(&updated),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    updated.outcomes
+  );
+  assert!(
+    after > at_let_go,
+    "the base's window brought back after its let-go: {at_let_go} -> {after}"
+  );
 }
 
 /// On a repository `name` of `daemon`: `main` created, `ok`, at a commit of a flat tree of [`THIN_TREE_FILES`] files,
@@ -1690,15 +1729,28 @@ fn thin_tree_pack((commit, blob): (&[u8], &[u8]), (base, tree): (&[u8], &[u8])) 
   pack
 }
 
+/// What another reader of the repository does at the push's first stop after its let-go, in [`let_go_at_its_checks`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Meddle {
+  /// Nothing: the push's driver brings the window back, as an edge's.
+  Not,
+  /// It brings the window back first and lets it go again before the push's next step
+  /// ([`another_reader_brings_back_and_lets_go`]).
+  LetGoAgain,
+  /// It clears the repository's note of a miss, as a derivation's turn does at its start (`git_derive::turn`, "a miss
+  /// an earlier step left noted is not this turn's"), before the push's driver looks.
+  NoteCleared,
+}
+
 /// `request` pushed to `repository` by its owner from a task of its shard, driven as an edge drives it (each turn's
-/// let-go window brought back at once, `upload::brought_back_waited`, then its homing carried), every window of
-/// `let_go` let go by hand ([`let_go_by_hand`]) once the push's pack is read and its checks are due; with `again`, the
-/// first stop after that met by [`another_reader_brings_back_and_lets_go`] in the driver's stead. What was received, the
-/// windows brought back at the let-go and at the end, and whether another reader let the window go again.
+/// let-go window brought back at once, [`driven_bring_back`], then its homing carried), every window of `let_go` let
+/// go by hand ([`let_go_by_hand`]) once the push's pack is read and its checks are due, and the first stop after that
+/// met by `meddle`. What was received, the windows brought back at the let-go and at the end, and whether the meddling
+/// was done at a stop.
 async fn let_go_at_its_checks(
   repository: RepositoryId,
   request: &[u8],
-  (let_go, again): (&[u8], bool),
+  (let_go, meddle): (&[u8], Meddle),
 ) -> Result<(Received, (u64, u64), bool), String> {
   let (_, mut push) = on_state(|state| started(state, repository));
   for piece in request.chunks(PIECE) {
@@ -1706,7 +1758,7 @@ async fn let_go_at_its_checks(
   }
   on_state(|state| push.end(state)).map_err(|failed| format!("{failed:?}"))?;
   let mut at_let_go = None;
-  let mut let_go_again = false;
+  let mut meddled = meddle == Meddle::Not;
   let mut answer = Vec::new();
   let received = loop {
     if at_let_go.is_none() && push.session.is_checking() && !push.session.is_resolving() {
@@ -1720,22 +1772,10 @@ async fn let_go_at_its_checks(
     match step {
       Answering::Answered(received) => break *received,
       Answering::Turned => {
-        if again && at_let_go.is_some() && !let_go_again {
-          let_go_again = another_reader_brings_back_and_lets_go(repository).await;
+        if at_let_go.is_some() && !meddled {
+          meddled = meddled_at_a_stop(&mut push, repository, meddle).await;
         } else {
-          // As the edges do: the window the step met brought back at once, before anything else on the shard runs
-          // and clears the repository's note of it (a derivation's or an encoding's turn).
-          let (noted, before) =
-            on_state(|state| (noted_stop(state, repository), brought_back_count(state)));
-          crate::vcs_store::upload::brought_back_waited(repository).await;
-          if noted.is_some() {
-            // Printed by libtest only for a failing test: what main's runs under load read (main's order of
-            // 2026-11-26, the cause of B1's failure in a concurrent run shown, never guessed).
-            let after = on_state(|state| (brought_back_count(state), bring_backs_refused(state)));
-            eprintln!(
-              "b1 stop: (offset, let-go number) {noted:?}; brought back {before} -> {after:?}"
-            );
-          }
+          logged_bring_back(&mut push, repository).await;
         }
         slates_rt::futures::yield_now().await;
         carry_awaited(&mut push).await?;
@@ -1747,49 +1787,97 @@ async fn let_go_at_its_checks(
   dropped_in_a_step(push);
   let at_let_go = at_let_go.ok_or("the push's checks were never due")?;
   let after = on_state(|state| brought_back_count(state));
-  Ok((received, (at_let_go, after), let_go_again))
-}
-
-/// The window `repository`'s reads noted as met let go, for its driver to bring back: its offset in its pack and the
-/// content store's number for that let-go (`ContentStore::away_number`; none once it is back).
-fn noted_stop(state: &mut ShardState, repository: RepositoryId) -> Option<(u64, Option<u64>)> {
-  let (content, store) = state.vcs_stores.git(repository)?;
-  let waited = store.repository.peek_waiting()?;
-  Some((
-    waited.offset,
-    content.away_number(&waited.pack, waited.len, waited.offset),
+  Ok((
+    received,
+    (at_let_go, after),
+    meddled && meddle != Meddle::Not,
   ))
 }
 
-/// The interleaving a concurrent reader makes (a derivation, which lets go at its end the windows it brought back),
-/// forced: the window the push's step met and noted is brought back by another reader first
-/// (`read_through::bring_back_window`); the push's driver then finds it back and brings nothing
-/// (`upload::brought_back_waited`); then the other reader lets it go again, as a landed window
-/// (`vcs_store::let_go_read`). Whether it did; where the step noted no window, the driver's bring-back alone, as an edge's.
-async fn another_reader_brings_back_and_lets_go(repository: RepositoryId) -> bool {
-  let noted = on_state(|state| {
-    state
-      .vcs_stores
-      .git(repository)
-      .and_then(|(_, store)| store.repository.peek_waiting())
+/// The let-go window the push's last step met and noted for its driver in the push's own slot, left as it is.
+fn noted_wait(
+  push: &ReceivePack,
+  _repository: RepositoryId,
+) -> Option<slates_git::store::packed::Waited> {
+  push.waits.peek()
+}
+
+/// The push's driver's bring-back after a step, as the edges do it: the window the step met brought back at once from
+/// the push's own slot, before anything else on the shard runs.
+async fn driven_bring_back(push: &mut ReceivePack, _repository: RepositoryId) {
+  crate::vcs_store::upload::brought_back_own(push.take_waited()).await;
+}
+
+/// [`driven_bring_back`], each stop printed (libtest shows it for a failing test alone: what main's runs under load
+/// read; main's order of 2026-11-26, a cause shown, never guessed): its offset and let-go number, and the windows
+/// brought back before and after with the bring-backs refused.
+async fn logged_bring_back(push: &mut ReceivePack, repository: RepositoryId) {
+  let noted = noted_wait(push, repository).map(|waited| {
+    on_state(|state| {
+      let number = state
+        .vcs_stores
+        .content()
+        .and_then(|content| content.away_number(&waited.pack, waited.len, waited.offset));
+      (waited.offset, number)
+    })
   });
-  let Some(waited) = noted else {
-    crate::vcs_store::upload::brought_back_waited(repository).await;
+  let before = on_state(|state| brought_back_count(state));
+  driven_bring_back(push, repository).await;
+  if noted.is_some() {
+    let after = on_state(|state| (brought_back_count(state), bring_backs_refused(state)));
+    eprintln!("b1 stop: (offset, let-go number) {noted:?}; brought back {before} -> {after:?}");
+  }
+}
+
+/// `meddle` done at the push's stop, then its driver's bring-back: whether the step stopped (a window noted for the
+/// driver), so the meddling met a stop; where it did not, the driver's bring-back alone, as an edge's.
+async fn meddled_at_a_stop(
+  push: &mut ReceivePack,
+  repository: RepositoryId,
+  meddle: Meddle,
+) -> bool {
+  let Some(waited) = noted_wait(push, repository) else {
+    driven_bring_back(push, repository).await;
     return false;
   };
+  match meddle {
+    Meddle::Not => driven_bring_back(push, repository).await,
+    Meddle::LetGoAgain => another_reader_brings_back_and_lets_go(push, repository, waited).await,
+    Meddle::NoteCleared => {
+      on_state(|state| {
+        if let Some((_, store)) = state.vcs_stores.git(repository) {
+          let _ = store.repository.waiting();
+        }
+      });
+      driven_bring_back(push, repository).await;
+    }
+  }
+  true
+}
+
+/// The interleaving a concurrent reader makes (a derivation, which lets go at its end the windows it brought back),
+/// forced: `waited`, the window the push's step met and noted, is brought back by another reader first
+/// (`read_through::bring_back_window`); the push's driver then finds it back and brings nothing
+/// ([`driven_bring_back`]); then the other reader lets it go again, as a landed window (`vcs_store::let_go_read`).
+async fn another_reader_brings_back_and_lets_go(
+  push: &mut ReceivePack,
+  repository: RepositoryId,
+  waited: slates_git::store::packed::Waited,
+) {
   let brought = crate::vcs_store::read_through::bring_back_window(waited).await;
   let Ok(Some((window, _))) = brought else {
     panic!("the other reader brought the window back: {brought:?}");
   };
-  crate::vcs_store::upload::brought_back_waited(repository).await;
-  on_state(|state| {
+  driven_bring_back(push, repository).await;
+  let let_go = on_state(|state| {
     crate::vcs_store::within_budget(state, 0, |stores| {
       if let Some(content) = stores.content_mut() {
         content.mark_landed(&window);
       }
     });
     crate::vcs_store::let_go_read(state, &window).is_ok()
-  })
+  });
+  assert!(let_go, "the other reader let the window go again");
 }
 
 /// Main 01a20182's ruling of 2026-11-24 (w-hg's sweep of the bring-back sites: a write path's bring-back never let go).
@@ -2951,9 +3039,10 @@ pub(crate) async fn homed_drive(
     match step {
       Answering::Answered(received) => return Ok(*received),
       Answering::Turned => {
+        // As the edges do (goal 93 item 2b(b), push reader (b)): the window a step met let go, brought back from the
+        // push's own slot at once, then the turn yielded.
+        crate::vcs_store::upload::brought_back_own(push.take_waited()).await;
         slates_rt::futures::yield_now().await;
-        // As the edges do (goal 93 item 2b(b), push reader (b)): the window a step met let go, brought back.
-        crate::vcs_store::upload::brought_back_waited(repository).await;
         if let Some(asked) = push.take_homing() {
           let (origin, shards) =
             with_state(|state| (state.shard, state.shards.clone())).ok_or("no state")?;
@@ -3750,7 +3839,7 @@ async fn stepped_drive(repository: RepositoryId, request: &[u8]) -> Result<Vec<V
     match step {
       Answering::Answered(received) => return Ok(reasons(&received)),
       Answering::Turned => {
-        crate::vcs_store::upload::brought_back_waited(repository).await;
+        crate::vcs_store::upload::brought_back_own(push.take_waited()).await;
         carry_awaited(&mut push).await?;
       }
       #[cfg(unix)]

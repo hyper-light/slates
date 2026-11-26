@@ -386,6 +386,13 @@ pub(crate) async fn brought_back_waited(id: RepositoryId) -> bool {
     })
   })
   .flatten();
+  brought_back_own(waited).await
+}
+
+/// Brings back `waited`, the let-go window a reader with a slot of its own met (a push's,
+/// `git_push::ReceivePack::take_waited`), within its patience; whether there was one. A bring-back refused is counted
+/// [`RESIDENT_REFUSED`], and the read that met it refuses typed next turn (`slates_git::away`).
+pub(crate) async fn brought_back_own(waited: Option<slates_git::store::packed::Waited>) -> bool {
   let Some(waited) = waited else {
     return false;
   };

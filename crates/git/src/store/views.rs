@@ -35,10 +35,12 @@ use slates_merge::push::{
 };
 use slates_vcs::{ContentId, ContentStore};
 
+use crate::away::Waits;
 use crate::object_name::{Kind, ObjectId};
 use crate::objects::Refusal;
 use crate::objects::tree::{Mode, Tree};
 use crate::receive;
+use crate::store::packed;
 use crate::{Admission, PastAdmission, to_u64};
 
 use super::naming::kind_of;
@@ -72,9 +74,11 @@ pub struct IndexedObjects<'a> {
   kept: Kept,
   /// What the view has lent.
   counters: Cell<ViewCounters>,
-  /// The let-go, by the store's number for it, of the window the last object asked met, its repository noting it
-  /// (A-864's push readers; `crate::away`).
+  /// The let-go, by the store's number for it, of the window the last object asked met (A-864's push readers;
+  /// `crate::away`).
   away: Cell<Option<u64>>,
+  /// Where that window is noted for its owner's driver: the owner's own slot, else the repository's ([`noted_for`]).
+  notes: Option<&'a Waits>,
 }
 
 impl<'a> IndexedObjects<'a> {
@@ -89,6 +93,16 @@ impl<'a> IndexedObjects<'a> {
       kept: Kept::default(),
       counters: Cell::new(ViewCounters::default()),
       away: Cell::new(None),
+      notes: None,
+    }
+  }
+
+  /// The view noting the let-go windows its reads meet in `waits`, its owner's own slot, and not on the repository's
+  /// (`crate::away::Waits`: a push's).
+  pub fn noting(self, waits: &'a Waits) -> Self {
+    Self {
+      notes: Some(waits),
+      ..self
     }
   }
 
@@ -141,16 +155,18 @@ impl receive::Repository for IndexedObjects<'_> {
     if !self.charge(row.len.saturating_add(kept_overhead())) {
       return None;
     }
-    let Some(read) = self.repository.read_stored(self.store, &stored, row.len) else {
-      // A read of a let-go window is noted on the repository, for the push's driver to bring it back.
-      self
-        .away
-        .set(self.repository.peek_waiting().and_then(|waited| {
-          self
-            .store
-            .away_number(&waited.pack, waited.len, waited.offset)
-        }));
-      return None;
+    let read = match self
+      .repository
+      .read_stored_waited(self.store, &stored, row.len)
+    {
+      Ok(read) => read,
+      Err(waited) => {
+        // A read of a let-go window is noted for its owner's driver to bring it back.
+        self
+          .away
+          .set(noted_for((self.repository, self.store, self.notes), waited));
+        return None;
+      }
     };
     let bytes = read.into_owned();
     count(&self.counters, |counters| &mut counters.assembled);
@@ -176,6 +192,9 @@ pub struct PushedObjects<'a> {
   push: &'a Push,
   /// What the view has lent.
   counters: Cell<ViewCounters>,
+  /// Where a let-go window its reads meet is noted for its owner's driver: the owner's own slot, else the
+  /// repository's ([`noted_for`]).
+  notes: Option<&'a Waits>,
 }
 
 impl<'a> PushedObjects<'a> {
@@ -186,6 +205,16 @@ impl<'a> PushedObjects<'a> {
       store,
       push,
       counters: Cell::new(ViewCounters::default()),
+      notes: None,
+    }
+  }
+
+  /// The view noting the let-go windows its reads meet in `waits`, its owner's own slot, and not on the repository's
+  /// (`crate::away::Waits`: a push's).
+  pub fn noting(self, waits: &'a Waits) -> Self {
+    Self {
+      notes: Some(waits),
+      ..self
     }
   }
 
@@ -221,13 +250,13 @@ impl<'a> PushedObjects<'a> {
     Ok((kind, at, held.len))
   }
 
-  /// Why a stored read of the repository's answered none: `NotYet` where it met a window let go (goal 93 item 2b,
-  /// `Repository::waiting`, noted again so the build's owner finds it and brings it back before the unit is taken
-  /// again); else `Malformed`, bytes that are not the object.
-  fn unread(&self) -> Unavailable {
-    match self.repository.waiting() {
+  /// Why a stored read of the repository's answered none: `NotYet` where it met `waited`, a window let go (goal 93
+  /// item 2b, noted for the build's owner to bring it back before the unit is taken again, [`noted_for`]); else
+  /// `Malformed`, bytes that are not the object.
+  fn unread(&self, waited: Option<packed::Waited>) -> Unavailable {
+    match waited {
       Some(waited) => {
-        self.repository.wait_for(waited);
+        let _ = noted_for((self.repository, self.store, self.notes), Some(waited));
         Unavailable::NotYet
       }
       None => Unavailable::Malformed,
@@ -244,8 +273,8 @@ impl<'a> PushedObjects<'a> {
         count(&self.counters, |counters| &mut counters.assembled);
         return self
           .repository
-          .read_stored(self.store, stored, len)
-          .ok_or_else(|| self.unread());
+          .read_stored_waited(self.store, stored, len)
+          .map_err(|waited| self.unread(waited));
       }
       At::Pushed(id) => {
         let outside = IndexBases {
@@ -493,6 +522,22 @@ impl Kept {
     let (kind, bytes) = slot.get()?;
     Some((*kind, bytes))
   }
+}
+
+/// Notes `waited`, the let-go window a read met, for its owner's driver to bring back: in `notes`, the owner's own
+/// slot, where it has one (a push's, `crate::away::Waits`), else on `repository`'s slot, which the owners without one
+/// share; one slot a reader, never both. The let-go's number in `store` (`ContentStore::away_number`), the key its
+/// reader stops by (`crate::away`); none where the read met no let-go window.
+fn noted_for(
+  (repository, store, notes): (&Repository, &ContentStore, Option<&Waits>),
+  waited: Option<packed::Waited>,
+) -> Option<u64> {
+  let waited = waited?;
+  match notes {
+    Some(waits) => waits.note(waited),
+    None => repository.wait_for(waited),
+  }
+  store.away_number(&waited.pack, waited.len, waited.offset)
 }
 
 #[cfg(test)]

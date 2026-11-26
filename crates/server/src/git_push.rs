@@ -283,6 +283,10 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   /// ([`ReceivePack::refused_report`]), since the request itself moves on through the answer. None under side-band,
   /// whose refusal is band 3's words alone.
   refusal_names: Option<Vec<Vec<u8>>>,
+  /// The let-go window its last step's readers met, noted in its own slot for its driver alone to bring back
+  /// ([`ReceivePack::take_waited`]; B1's second cause under load, main's lines of agents/w-git-b1-debug: on the
+  /// repository's one slot, a derivation's turn cleared the note before the push's driver looked).
+  waits: slates_git::away::Waits,
 }
 
 /// Counter: a member green checkpointed in a push's turn before its append, making the chains room for the append's
@@ -574,6 +578,12 @@ impl<P> ReceivePack<P> {
     self.repository
   }
 
+  /// The let-go window the push's last step met, taken: what its driver brings back before the next step
+  /// (`vcs_store::upload::brought_back_own`). None where the step met none.
+  pub(crate) fn take_waited(&self) -> Option<slates_git::store::packed::Waited> {
+    self.waits.take()
+  }
+
   /// Whether the client asked its answer multiplexed (`side-band-64k`), once its request is read: kept after the session
   /// lets the request go, so a refusal while the push is answered goes on git's band 3.
   pub(crate) fn side_band(&self) -> bool {
@@ -645,6 +655,7 @@ impl<P> ReceivePack<P> {
       quarantine: GitPush::begin(&state.vcs_stores, repository),
       unadmitted: None,
       refusal_names: None,
+      waits: slates_git::away::Waits::default(),
       #[cfg(unix)]
       presenter,
       #[cfg(not(unix))]
@@ -786,6 +797,7 @@ impl<P> ReceivePack<P> {
       session,
       admission,
       quarantine,
+      waits,
       ..
     } = self;
     let (called, queue) = with_room(state, |state| {
@@ -794,11 +806,11 @@ impl<P> ReceivePack<P> {
         .git_ref(*repository)
         .ok_or(PushFailed::NoStore)?;
       let mut site = intake::Intake {
-        indexed: IndexedObjects::new(&git.repository, content, admission.left()),
+        indexed: IndexedObjects::new(&git.repository, content, admission.left()).noting(waits),
         quarantined: intake::Quarantined::new(
           quarantine.as_ref().map(GitPush::quarantine),
           content,
-          &git.repository,
+          (&git.repository, Some(waits)),
         ),
         queue: BTreeMap::new(),
       };
@@ -858,6 +870,7 @@ impl<P> ReceivePack<P> {
       session,
       admission,
       quarantine,
+      waits,
       ..
     } = self;
     with_room(state, |state| {
@@ -865,11 +878,11 @@ impl<P> ReceivePack<P> {
         .vcs_stores
         .git_ref(*repository)
         .ok_or(PushFailed::NoStore)?;
-      let indexed = IndexedObjects::new(&git.repository, content, admission.left());
+      let indexed = IndexedObjects::new(&git.repository, content, admission.left()).noting(waits);
       let quarantined = intake::Quarantined::new(
         quarantine.as_ref().map(GitPush::quarantine),
         content,
-        &git.repository,
+        (&git.repository, Some(waits)),
       );
       let mut clock = ShardClock;
       let quantum = Quantum {
@@ -1040,6 +1053,7 @@ impl<P> ReceivePack<P> {
         peel_away,
         making_room,
         door,
+        waits: &self.waits,
       };
       deciding
         .step(None, &mut judge, &mut self.admission)
@@ -2120,6 +2134,8 @@ struct ServerJudge<'j> {
   making_room: &'j mut Option<Vec<DbVolumeId>>,
   /// The green owing its push that the command under way waits at the door for (P2).
   door: &'j mut Option<DbVolumeId>,
+  /// The push's own slot for the let-go window its readers meet ([`ReceivePack::take_waited`]).
+  waits: &'j slates_git::away::Waits,
 }
 
 impl Judge for ServerJudge<'_> {
@@ -2302,6 +2318,7 @@ impl ServerJudge<'_> {
       record,
       name,
       preparing,
+      waits,
       ..
     } = self;
     let (entry, examined) = with_room(state, |state| {
@@ -2313,8 +2330,8 @@ impl ServerJudge<'_> {
       };
       let (content, git) = store;
       let room = state.store.admittable();
-      let indexed = IndexedObjects::new(&git.repository, content, room);
-      let objects = PushedObjects::new(&git.repository, content, push.quarantine());
+      let indexed = IndexedObjects::new(&git.repository, content, room).noting(waits);
+      let objects = PushedObjects::new(&git.repository, content, push.quarantine()).noting(waits);
       let greens = ShardGreens {
         state,
         record,
@@ -2359,6 +2376,7 @@ impl ServerJudge<'_> {
       name,
       preparing,
       peel_away,
+      waits,
       ..
     } = self;
     let quantum = state.config.step_quantum_ns();
@@ -2377,8 +2395,8 @@ impl ServerJudge<'_> {
       };
       let (content, git) = store;
       let room = state.store.admittable();
-      let indexed = IndexedObjects::new(&git.repository, content, room);
-      let objects = PushedObjects::new(&git.repository, content, push.quarantine());
+      let indexed = IndexedObjects::new(&git.repository, content, room).noting(waits);
+      let objects = PushedObjects::new(&git.repository, content, push.quarantine()).noting(waits);
       let greens = ShardGreens {
         state,
         record,

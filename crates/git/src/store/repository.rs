@@ -814,11 +814,29 @@ impl Repository {
     stored: &StoredAt,
     len: u64,
   ) -> Option<Cow<'s, [u8]>> {
+    self
+      .read_stored_waited(store, stored, len)
+      .map_err(|waited| {
+        if let Some(waited) = waited {
+          self.wait_for(waited);
+        }
+      })
+      .ok()
+  }
+
+  /// [`Repository::read_stored`] noting nothing: the bytes, or the let-go window the read met (none for any other
+  /// refusal), for a reader with a slot of its own to note it there alone (`crate::away::Waits`).
+  pub fn read_stored_waited<'s>(
+    &self,
+    store: &'s ContentStore,
+    stored: &StoredAt,
+    len: u64,
+  ) -> Result<Cow<'s, [u8]>, Option<packed::Waited>> {
     self.last_deltas.set(0);
     self.last_found_kept.set(false);
     self.last_inflated_base.set(false);
     match stored {
-      StoredAt::Whole(content) => stored_bytes(store, content, len),
+      StoredAt::Whole(content) => stored_bytes(store, content, len).ok_or(None),
       StoredAt::InPack(place) => {
         let bases = IndexBases {
           repository: self,
@@ -833,14 +851,15 @@ impl Repository {
           (&mut *reading, self.largest.max(len)),
           &mut out,
         );
-        self.note_waited(&read);
         self
           .last_deltas
           .set(u64::try_from(reading.deltas_applied()).unwrap_or(u64::MAX));
         self.last_found_kept.set(reading.found_kept());
         self.last_inflated_base.set(reading.base_inflated());
-        read.ok()?;
-        (u64::try_from(out.len()).ok() == Some(len)).then_some(Cow::Owned(out))
+        read.map_err(|refused| refused.waited())?;
+        (u64::try_from(out.len()).ok() == Some(len))
+          .then_some(Cow::Owned(out))
+          .ok_or(None)
       }
     }
   }

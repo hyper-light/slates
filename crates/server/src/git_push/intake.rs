@@ -20,6 +20,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 
+use slates_git::away::Waits;
 use slates_git::object_name::{Kind, ObjectId};
 use slates_git::receive::Repository;
 use slates_git::store::views::IndexedObjects;
@@ -96,28 +97,36 @@ pub(crate) struct Quarantined<'s> {
   /// The let-go, by the store's number for it, of the window the last read to answer none met
   /// ([`Contents::content_away`]).
   away: Cell<Option<u64>>,
+  /// Its owner's own slot for that window (a push's, `slates_git::away::Waits`); none for an owner that reads the
+  /// repository's (a replay).
+  notes: Option<&'s Waits>,
 }
 
 impl<'s> Quarantined<'s> {
-  /// The quarantine `push` (none before its first object) over `repository`'s objects in `store`, read only.
+  /// The quarantine `push` (none before its first object) over `repository`'s objects in `store`, read only, the
+  /// let-go windows its reads meet noted in `notes`, its owner's own slot, where it has one, else on the repository's.
   pub(crate) fn new(
     push: Option<&'s Push>,
     store: &'s ContentStore,
-    repository: &'s GitRepository,
+    (repository, notes): (&'s GitRepository, Option<&'s Waits>),
   ) -> Self {
     Self {
       push,
       store,
       repository,
       away: Cell::new(None),
+      notes,
     }
   }
 
-  /// `waited`, the let-go window a read met, noted on the repository for the push's driver to bring back
-  /// (`upload::brought_back_waited`) and here for the reader to stop at.
+  /// `waited`, the let-go window a read met, noted for its owner's driver to bring back (its own slot, else the
+  /// repository's: one slot, never both) and here, by its let-go's number, for the reader to stop at.
   fn noted(&self, waited: Option<packed::Waited>) {
     if let Some(waited) = waited {
-      self.repository.wait_for(waited);
+      match self.notes {
+        Some(waits) => waits.note(waited),
+        None => self.repository.wait_for(waited),
+      }
       self.away.set(
         self
           .store
@@ -145,12 +154,11 @@ impl Contents for Quarantined<'_> {
     // An object the repository indexed already is passed over by the quarantine as it arrives (`admit_object`): a pack
     // that resends it is read back from the index (A-753; git's receive-pack takes such a pack).
     let (_, stored, len) = self.repository.stored(self.store, id)?;
-    let read = self.repository.read_stored(self.store, &stored, len);
-    if read.is_none() {
-      // A stored read notes the window it met on the repository itself.
-      self.noted(self.repository.peek_waiting());
-    }
-    read
+    self
+      .repository
+      .read_stored_waited(self.store, &stored, len)
+      .map_err(|waited| self.noted(waited))
+      .ok()
   }
 
   fn content_away(&self) -> Option<u64> {
