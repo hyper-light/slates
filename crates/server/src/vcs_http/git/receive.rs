@@ -364,9 +364,21 @@ impl<L: ShardLender> Receive<L> {
     let _ = self
       .lender
       .lend(|state| state.count(PUSH_REFUSED_AFTER_BODY, 1));
-    let words = match cut {
-      Cut::Failed(failure) => words::failed(&failure, &self.name),
-      Cut::Unserved => NOT_SERVED.to_owned(),
+    let words = match &cut {
+      Cut::Failed(failure) => {
+        slates_machine::log_line!(
+          "slates-server: a git push to repository {:?} was refused after body: {failure:?}",
+          self.push.repository()
+        );
+        words::failed(failure, &self.name)
+      }
+      Cut::Unserved => {
+        slates_machine::log_line!(
+          "slates-server: a git push to repository {:?} was refused after body: unserved",
+          self.push.repository()
+        );
+        NOT_SERVED.to_owned()
+      }
     };
     if self.push.side_band() {
       sideband::write(Band::Error, words.as_bytes(), &mut self.given);

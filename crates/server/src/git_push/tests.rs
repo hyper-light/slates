@@ -1413,7 +1413,6 @@ async fn driven(
 
 /// Each packet of `answer` in order, as its band and payload: band 0 for a packet not multiplexed,
 /// none for a flush.
-#[cfg(unix)]
 fn bands(answer: &[u8]) -> Vec<(u8, Vec<u8>)> {
   let mut packets = Vec::new();
   let mut rest = answer;
@@ -1431,7 +1430,6 @@ fn bands(answer: &[u8]) -> Vec<(u8, Vec<u8>)> {
 }
 
 /// The text of `answer`'s band-2 packets, in order: what a stock client prints after `remote: `.
-#[cfg(unix)]
 fn band_two(answer: &[u8]) -> String {
   let said: Vec<u8> = bands(answer)
     .into_iter()
@@ -3809,4 +3807,443 @@ fn t_a727_d1a_a_refused_push_leaves_another_repositorys_hold_of_the_same_object(
     owners.iter().all(|owners| owners == &vec![records]),
     "every hold a's records' alone: {owners:?}"
   );
+}
+
+/// Builds a commit adding `file_index` to `prior_entries` (sorted tree entries `(name, blob_id)`),
+/// keeping the commit message fixed-width so consecutive commits occupy identical byte lengths.
+/// Returns `(commit_id, commit_bytes, tree_id, tree_bytes, blob_id, blob_bytes)`.
+fn storm_commit(
+  step: usize,
+  parent: Option<ObjectId>,
+  entries: &mut Vec<(String, ObjectId)>,
+) -> (ObjectId, Vec<u8>, ObjectId, Vec<u8>, ObjectId, Vec<u8>) {
+  use slates_git::object_name::{Kind, name_of};
+  let blob = format!("storm-payload-{step:02}\n").into_bytes();
+  let blob_id = name_of(ObjectFormat::Sha1, Kind::Blob, &blob).unwrap();
+  entries.push((format!("f{step:02}.txt"), blob_id));
+  entries.sort_by(|left, right| left.0.cmp(&right.0));
+  let mut tree = Vec::new();
+  for (name, id) in entries.iter() {
+    tree.extend_from_slice(format!("100644 {name}\0").as_bytes());
+    tree.extend_from_slice(id.as_bytes());
+  }
+  let tree_id = name_of(ObjectFormat::Sha1, Kind::Tree, &tree).unwrap();
+  let parent_line = parent
+    .map(|id| format!("parent {id}\n"))
+    .unwrap_or_default();
+  let commit = format!(
+    "tree {tree_id}\n{parent_line}author Storm <storm@example.com> 1700000000 +0000\n\
+     committer Storm <storm@example.com> 1700000000 +0000\n\nstorm step {step:02}\n"
+  )
+  .into_bytes();
+  let commit_id = name_of(ObjectFormat::Sha1, Kind::Commit, &commit).unwrap();
+  (commit_id, commit, tree_id, tree, blob_id, blob)
+}
+
+/// Builds a thin pack containing `commit` whole, `tree` as a `REF_DELTA` against `(base_tree_id,
+/// base_tree_bytes)`, and `blob` whole (matching the 3-object thin pack stock `git push` sends on
+/// every concurrent storm round). Returns `(pack_bytes, tree_entry_offset)`.
+fn thin_storm_pack(
+  commit: &[u8],
+  (base_tree_id, base_tree): (ObjectId, &[u8]),
+  tree: &[u8],
+  blob: &[u8],
+) -> (Vec<u8>, u64) {
+  use slates_git::entry::{self, Header, Representation};
+  use slates_git::object_name::Kind;
+  let delta = slates_git::store::delta_of(base_tree, tree).expect("tree delta");
+  let mut pack = Vec::new();
+  let mut writer = slates_git::pack::Writer::new(ObjectFormat::Sha1, 3, &mut pack);
+  let mut at = entry::PACK_HEADER_LEN;
+
+  let commit_header = Header {
+    representation: Representation::Whole(Kind::Commit),
+    size: u64::try_from(commit.len()).unwrap(),
+  };
+  let commit_zlib = stored_zlib(commit);
+  entry::write(commit_header, at, &mut writer).unwrap();
+  slates_git::out::Out::put(&mut writer, &commit_zlib);
+  at += entry::written_len(commit_header, at).unwrap() + u64::try_from(commit_zlib.len()).unwrap();
+
+  let tree_offset = at;
+  let tree_header = Header {
+    representation: Representation::RefDelta { base: base_tree_id },
+    size: u64::try_from(delta.len()).unwrap(),
+  };
+  let tree_zlib = stored_zlib(&delta);
+  entry::write(tree_header, at, &mut writer).unwrap();
+  slates_git::out::Out::put(&mut writer, &tree_zlib);
+  at += entry::written_len(tree_header, at).unwrap() + u64::try_from(tree_zlib.len()).unwrap();
+
+  let blob_header = Header {
+    representation: Representation::Whole(Kind::Blob),
+    size: u64::try_from(blob.len()).unwrap(),
+  };
+  let blob_zlib = stored_zlib(blob);
+  entry::write(blob_header, at, &mut writer).unwrap();
+  slates_git::out::Out::put(&mut writer, &blob_zlib);
+  writer.finish().unwrap();
+  (pack, tree_offset)
+}
+
+/// Drives a push over `daemon`'s first shard using the pipelined HTTP receive path
+/// (`input_pipelined` + `end_pipelined` + `resolve_step_pipelined` + `answer_step` +
+/// `bring_back_waited`), returning `(answer_bytes, received)`.
+fn pushed_pipelined_in_steps(
+  daemon: &crate::Daemon,
+  repository: RepositoryId,
+  request: &[u8],
+) -> Result<(Vec<u8>, Received), String> {
+  let (sent, got) = std::sync::mpsc::channel();
+  let request = request.to_vec();
+  crate::daemon::observe_first(daemon, move |_| {
+    let task = slates_rt::futures::spawn(async move {
+      let _ = sent.send(pipelined_drive(repository, &request).await);
+    })
+    .expect("the push's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  got
+    .recv_timeout(std::time::Duration::from_secs(60))
+    .unwrap_or_else(|_| Err("pipelined push timed out".to_owned()))
+}
+
+/// Async body of [`pushed_pipelined_in_steps`].
+async fn pipelined_drive(
+  repository: RepositoryId,
+  request: &[u8],
+) -> Result<(Vec<u8>, Received), String> {
+  use crate::state::with_state;
+  let mut lender = crate::vcs_http::git::ThisShard;
+  let mut push = with_state(|state| {
+    ReceivePack::start(
+      state,
+      (&owner(), repository),
+      false,
+      &mut Vec::new(),
+      Unpresented,
+    )
+  })
+  .ok_or("no state to start")?
+  .map_err(|failed| format!("not started: {failed:?}"))?;
+  for piece in request.chunks(4096) {
+    push
+      .input_pipelined(&mut lender, piece)
+      .await
+      .ok_or("no state for input_pipelined")?
+      .map_err(|failed| format!("input_pipelined failed: {failed:?}"))?;
+  }
+  push
+    .end_pipelined(&mut lender)
+    .await
+    .ok_or("no state for end_pipelined")?
+    .map_err(|failed| format!("end_pipelined failed: {failed:?}"))?;
+  while push.is_resolving() {
+    push
+      .resolve_step_pipelined(&mut lender)
+      .await
+      .ok_or("no state for resolve_step_pipelined")?
+      .map_err(|failed| format!("resolve_step_pipelined failed: {failed:?}"))?;
+  }
+  let mut answer = Vec::new();
+  loop {
+    let step = with_state(|state| push.answer_step(state, &mut answer))
+      .ok_or("no state for answer_step")?
+      .map_err(|failed| format!("answer_step failed: {failed:?}"))?;
+    match step {
+      Answering::Answered(received) => return Ok((answer, *received)),
+      Answering::Turned => {
+        push.bring_back_waited().await;
+        carry_awaited(&mut push).await?;
+        slates_rt::futures::yield_now().await;
+      }
+      #[cfg(unix)]
+      Answering::Hook(_) => return Err("no hook configured".to_owned()),
+    }
+  }
+}
+
+/// Drives a push over `daemon`'s first shard using the non-pipelined receive path
+/// (`input` + `end` + `answer_step` + `bring_back_waited`), returning `(answer_bytes, received)`.
+fn pushed_sync_path_in_steps(
+  daemon: &crate::Daemon,
+  repository: RepositoryId,
+  request: &[u8],
+) -> Result<(Vec<u8>, Received), String> {
+  let (sent, got) = std::sync::mpsc::channel();
+  let request = request.to_vec();
+  crate::daemon::observe_first(daemon, move |_| {
+    let task = slates_rt::futures::spawn(async move {
+      let _ = sent.send(sync_path_drive(repository, &request).await);
+    })
+    .expect("the push's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  got
+    .recv_timeout(std::time::Duration::from_secs(60))
+    .unwrap_or_else(|_| Err("non-pipelined push timed out".to_owned()))
+}
+
+/// Async body of [`pushed_sync_path_in_steps`].
+async fn sync_path_drive(
+  repository: RepositoryId,
+  request: &[u8],
+) -> Result<(Vec<u8>, Received), String> {
+  use crate::state::with_state;
+  let mut push = with_state(|state| {
+    ReceivePack::start(
+      state,
+      (&owner(), repository),
+      false,
+      &mut Vec::new(),
+      Unpresented,
+    )
+  })
+  .ok_or("no state to start")?
+  .map_err(|failed| format!("not started: {failed:?}"))?;
+  for piece in request.chunks(4096) {
+    with_state(|state| push.input(state, piece))
+      .ok_or("no state for input")?
+      .map_err(|failed| format!("input failed: {failed:?}"))?;
+    slates_rt::futures::yield_now().await;
+  }
+  with_state(|state| push.end(state))
+    .ok_or("no state for end")?
+    .map_err(|failed| format!("end failed: {failed:?}"))?;
+  let mut answer = Vec::new();
+  loop {
+    let step = with_state(|state| push.answer_step(state, &mut answer))
+      .ok_or("no state for answer_step")?
+      .map_err(|failed| format!("answer_step failed: {failed:?}"))?;
+    match step {
+      Answering::Answered(received) => return Ok((answer, *received)),
+      Answering::Turned => {
+        push.bring_back_waited().await;
+        carry_awaited(&mut push).await?;
+        slates_rt::futures::yield_now().await;
+      }
+      #[cfg(unix)]
+      Answering::Hook(_) => return Err("no hook configured".to_owned()),
+    }
+  }
+}
+
+/// Counts how many landed pack windows in `packs` are currently let go (`away`) in the shard's
+/// `ContentStore`.
+fn count_away_pack_windows(daemon: &crate::Daemon, packs: Vec<Vec<u8>>) -> usize {
+  crate::daemon::observe_first(daemon, move |state| {
+    let Some(content) = state.vcs_stores.content() else {
+      return 0;
+    };
+    let window = content.window();
+    packs
+      .iter()
+      .flat_map(|pack| pack.chunks(window))
+      .map(slates_vcs::ContentId::of)
+      .filter(|id| content.is_away(id))
+      .count()
+  })
+}
+
+/// Red-team regression (`rt-git-storm`, `storm_push_stuck.py`): multi-pack thin `REF_DELTA` chains
+/// across distinct let-go landed packs whose entries sit at the exact same byte offset.
+///
+/// Do: push a base commit (`step 00`) creating `refs/heads/storm`, then push two consecutive thin
+/// packs (`step 01`, `step 02`) whose `REF_DELTA` tree entries lie at the identical pack byte
+/// offset `O` in two distinct landed packs, letting every pack's windows go to the node store when
+/// each push drops; then push `step 03` (pipelined HTTP path) and a new branch `refs/heads/retry`
+/// (non-pipelined path) as thin packs whose `REF_DELTA` chains walk `pack 2 @ O -> pack 1 @ O ->
+/// pack 0`.
+///
+/// Expect: every landed pack window is away before `step 03`; both `step 03` and `refs/heads/retry`
+/// succeed (`ok`), and `storm` holds all 4 files byte-for-byte. Failing before the fix:
+/// `Intake::away()` / `IndexedObjects::away()` returned `waited.offset` without `waited.pack`, so
+/// walking `pack 2 @ O -> pack 1 @ O` collided on `resolving.stopped == Some((Outside, row, O))`
+/// and falsely returned `DeltaBaseMissing` (`unpacker error`) permanently on every subsequent push.
+#[test]
+fn t_rt_git_storm_thin_pack_delta_chain_across_let_go_packs_at_same_offset_resolves() {
+  use slates_git::object_name::Kind;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository = crate::daemon::observe_first(&daemon, |state| git_repository(state, "storm"));
+  let mut entries = Vec::new();
+  let (c0, c0_bytes, t0, t0_bytes, _, b0_bytes) = storm_commit(0, None, &mut entries);
+  let pack0 = pack_of_objects(&[
+    (Kind::Commit, c0_bytes),
+    (Kind::Tree, t0_bytes.clone()),
+    (Kind::Blob, b0_bytes),
+  ]);
+  let req0 = request(
+    &[("", &c0.to_string(), b"refs/heads/storm")],
+    CAPABILITIES,
+    &pack0,
+  );
+  let (_, rec0) = pushed_pipelined_in_steps(&daemon, repository, &req0).expect("push 0");
+  assert_eq!(
+    reasons(&rec0),
+    [b"ok"],
+    "push 0 failed: {:?}",
+    rec0.unpacked
+  );
+
+  let (c1, c1_bytes, t1, t1_bytes, _, b1_bytes) = storm_commit(1, Some(c0), &mut entries);
+  let (pack1, offset1) = thin_storm_pack(&c1_bytes, (t0, &t0_bytes), &t1_bytes, &b1_bytes);
+  let req1 = request(
+    &[(&c0.to_string(), &c1.to_string(), b"refs/heads/storm")],
+    CAPABILITIES,
+    &pack1,
+  );
+  let (_, rec1) = pushed_pipelined_in_steps(&daemon, repository, &req1).expect("push 1");
+  assert_eq!(
+    reasons(&rec1),
+    [b"ok"],
+    "push 1 failed: {:?}",
+    rec1.unpacked
+  );
+
+  let (c2, c2_bytes, t2, t2_bytes, _, b2_bytes) = storm_commit(2, Some(c1), &mut entries);
+  let (pack2, offset2) = thin_storm_pack(&c2_bytes, (t1, &t1_bytes), &t2_bytes, &b2_bytes);
+  assert_eq!(
+    offset1, offset2,
+    "precondition: pack1 and pack2 must place their REF_DELTA trees at the exact same byte offset"
+  );
+  let req2 = request(
+    &[(&c1.to_string(), &c2.to_string(), b"refs/heads/storm")],
+    CAPABILITIES,
+    &pack2,
+  );
+  let (_, rec2) = pushed_pipelined_in_steps(&daemon, repository, &req2).expect("push 2");
+  assert_eq!(
+    reasons(&rec2),
+    [b"ok"],
+    "push 2 failed: {:?}",
+    rec2.unpacked
+  );
+
+  // Non-vacuity: all three landed packs' windows must actually be away before pushing step 3.
+  let away_before = count_away_pack_windows(&daemon, vec![pack0, pack1, pack2]);
+  assert!(
+    away_before >= 3,
+    "expected all 3 landed packs' windows to be let go (away), got {away_before}"
+  );
+
+  // Push 3 via pipelined HTTP path: resolves pack 2 @ offset -> pack 1 @ offset -> pack 0.
+  let (c3, c3_bytes, t3, t3_bytes, _, b3_bytes) = storm_commit(3, Some(c2), &mut entries);
+  let (pack3, offset3) = thin_storm_pack(&c3_bytes, (t2, &t2_bytes), &t3_bytes, &b3_bytes);
+  assert_eq!(offset3, offset2, "pack3 shares the same tree delta offset");
+  let req3 = request(
+    &[(&c2.to_string(), &c3.to_string(), b"refs/heads/storm")],
+    CAPABILITIES,
+    &pack3,
+  );
+  let (_, rec3) = pushed_pipelined_in_steps(&daemon, repository, &req3).expect("push 3");
+  assert_eq!(
+    reasons(&rec3),
+    [b"ok"],
+    "pipelined push 3 across colliding let-go pack offsets refused: {:?}",
+    rec3.unpacked
+  );
+
+  // Push 4 to a brand-new branch via non-pipelined path (`resolve_turn_into`), walking the same
+  // multi-pack colliding-offset chain after push 3 dropped and let all packs go again.
+  let mut branch_entries = entries.clone();
+  let (c4, c4_bytes, _, t4_bytes, _, b4_bytes) = storm_commit(4, Some(c3), &mut branch_entries);
+  let (pack4, _) = thin_storm_pack(&c4_bytes, (t3, &t3_bytes), &t4_bytes, &b4_bytes);
+  let req4 = request(
+    &[("", &c4.to_string(), b"refs/heads/retry")],
+    CAPABILITIES,
+    &pack4,
+  );
+  let (_, rec4) = pushed_sync_path_in_steps(&daemon, repository, &req4).expect("push 4");
+  assert_eq!(
+    reasons(&rec4),
+    [b"ok"],
+    "non-pipelined new-branch push across colliding let-go pack offsets refused: {:?}",
+    rec4.unpacked
+  );
+
+  let storm_files =
+    crate::daemon::observe_first(&daemon, move |state| files(state, repository, "storm"));
+  daemon.stop();
+  let expected: Vec<(String, Vec<u8>)> = (0..4)
+    .map(|step| {
+      (
+        format!("f{step:02}.txt"),
+        format!("storm-payload-{step:02}\n").into_bytes(),
+      )
+    })
+    .collect();
+  assert_eq!(storm_files, expected);
+}
+
+/// Red-team diagnostic check (`rt-git-storm` Requirement 2): when pack intake genuinely refuses a
+/// push (here, a `REF_DELTA` referencing a nonexistent base OID), emit a concise typed
+/// `error: <reason>\n` line on side-band 2 when `side-band-64k` is active, while keeping the
+/// band-1 protocol status lines (`unpack unpack-objects abnormal exit` / `ng <ref> unpacker error`)
+/// and non-side-band wire framing exact.
+#[test]
+fn t_rt_git_storm_typed_unpack_refusal_is_emitted_on_sideband_two_preserving_status_lines() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository =
+    crate::daemon::observe_first(&daemon, |state| git_repository(state, "unpack-diag"));
+  let missing_base = named("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+  let mut entries = Vec::new();
+  let (c0, _, _, t0_bytes, _, _) = storm_commit(0, None, &mut entries);
+  let (c1, c1_bytes, _, t1_bytes, _, b1_bytes) = storm_commit(1, Some(c0), &mut entries);
+  let (bad_pack, tree_offset) =
+    thin_storm_pack(&c1_bytes, (missing_base, &t0_bytes), &t1_bytes, &b1_bytes);
+
+  // 1. With side-band-64k: band 2 carries the typed reason; band 1 keeps exact git status lines.
+  let req_sb = request(
+    &[("", &c1.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &bad_pack,
+  );
+  let (answer_sb, received_sb) =
+    pushed_pipelined_in_steps(&daemon, repository, &req_sb).expect("sideband push answered");
+  assert_eq!(reasons(&received_sb), [b"unpacker error"]);
+  let sb2 = band_two(&answer_sb);
+  let expected_diag = format!("error: delta at offset {tree_offset} missing base {missing_base}\n");
+  assert_eq!(
+    sb2, expected_diag,
+    "band 2 should carry concise typed unpack refusal, got: {sb2:?}"
+  );
+  let sb1: Vec<u8> = bands(&answer_sb)
+    .into_iter()
+    .filter(|(band, _)| *band == 1)
+    .flat_map(|(_, payload)| payload)
+    .collect();
+  let mut expected_status = Vec::new();
+  pktline::write(
+    Packet::Data(b"unpack unpack-objects abnormal exit\n"),
+    &mut expected_status,
+  )
+  .unwrap();
+  pktline::write(
+    Packet::Data(b"ng refs/heads/main unpacker error\n"),
+    &mut expected_status,
+  )
+  .unwrap();
+  pktline::write(Packet::Flush, &mut expected_status).unwrap();
+  assert_eq!(
+    sb1, expected_status,
+    "band 1 status lines must remain byte-exact"
+  );
+
+  // 2. Without side-band-64k: plain status lines only, byte-exact.
+  let req_plain = request(
+    &[("", &c1.to_string(), b"refs/heads/main")],
+    b"report-status",
+    &bad_pack,
+  );
+  let (answer_plain, received_plain) =
+    pushed_pipelined_in_steps(&daemon, repository, &req_plain).expect("plain push answered");
+  assert_eq!(reasons(&received_plain), [b"unpacker error"]);
+  assert_eq!(
+    answer_plain, expected_status,
+    "non-side-band answer must stay byte-exact without band-2 packets"
+  );
+
+  let committed = crate::daemon::observe_first(&daemon, move |state| records(state, repository));
+  daemon.stop();
+  assert_eq!(committed, 0, "refused pack must commit nothing");
 }

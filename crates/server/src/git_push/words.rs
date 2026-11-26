@@ -89,3 +89,94 @@ fn past_room(past: &slates_git::PastAdmission) -> String {
     past.asked, past.left
   )
 }
+
+/// Concise single-line diagnostic for a refused pack's `PackRefusal::Unpack` variant to emit on
+/// side-band 2 (`error: <reason>\n`), returning `None` when `slates_git::receive::write_report`
+/// already emits its own band-2 lines (`PackRefusal::Fsck` or `past_room`).
+pub(crate) fn pack_refusal_sideband(refused: &slates_git::receive::PackRefused) -> Option<String> {
+  let slates_git::receive::PackRefusal::Unpack(refusal) = &refused.why else {
+    return None;
+  };
+  if is_past_room(refusal) {
+    return None;
+  }
+  Some(unpack_refusal_reason(refusal))
+}
+
+/// Whether `refusal` is an admission-limit refusal that `slates_git::receive::write_report`
+/// already reports on side-band 2 (`fatal: pack exceeds maximum allowed size`).
+fn is_past_room(refusal: &slates_git::unpack::Refusal) -> bool {
+  matches!(
+    refusal,
+    slates_git::unpack::Refusal::PastAdmission(_)
+      | slates_git::unpack::Refusal::Entry(slates_git::entry::Refusal::PastAdmission(_))
+      | slates_git::unpack::Refusal::Delta {
+        refusal: slates_git::delta::Refusal::PastAdmission(_),
+        ..
+      }
+  )
+}
+
+/// Concise typed explanation of `refusal` for side-band 2 progress reporting.
+fn unpack_refusal_reason(refusal: &slates_git::unpack::Refusal) -> String {
+  if let Some(delta) = unpack_delta_reason(refusal) {
+    return delta;
+  }
+  if let Some(stream) = unpack_stream_reason(refusal) {
+    return stream;
+  }
+  unpack_framing_reason(refusal)
+}
+
+/// Delta-resolution variants of [`slates_git::unpack::Refusal`].
+fn unpack_delta_reason(refusal: &slates_git::unpack::Refusal) -> Option<String> {
+  use slates_git::unpack::Refusal as Unpack;
+  match refusal {
+    Unpack::DeltaBaseMissing { at, base } => {
+      Some(format!("delta at offset {at} missing base {base}"))
+    }
+    Unpack::BaseNotAnEntry { at, base } => Some(format!(
+      "delta at offset {at} names non-entry base offset {base}"
+    )),
+    Unpack::BaseMisplaced { at, base, found } => Some(format!(
+      "delta at offset {at} expected base {base}, found {found}"
+    )),
+    Unpack::Cycle { at } => Some(format!("delta cycle starting at offset {at}")),
+    Unpack::Delta { at, refusal } => Some(format!("delta at offset {at} refused ({refusal:?})")),
+    _ => None,
+  }
+}
+
+/// Stream and inflation variants of [`slates_git::unpack::Refusal`].
+fn unpack_stream_reason(refusal: &slates_git::unpack::Refusal) -> Option<String> {
+  use slates_git::unpack::Refusal as Unpack;
+  match refusal {
+    Unpack::Inflate { at } => Some(format!("inflate failed at pack offset {at}")),
+    Unpack::LongerThanSize { at, size } => Some(format!(
+      "entry at offset {at} inflated past declared size {size}"
+    )),
+    Unpack::ShorterThanSize { at, size, inflated } => Some(format!(
+      "entry at offset {at} ended at {inflated} bytes (expected {size})"
+    )),
+    Unpack::Truncated { at } => Some(format!("truncated pack at offset {at}")),
+    Unpack::TrailingBytes { at } => {
+      Some(format!("trailing bytes after pack trailer at offset {at}"))
+    }
+    _ => None,
+  }
+}
+
+/// Framing, collision, and resource variants of [`slates_git::unpack::Refusal`].
+fn unpack_framing_reason(refusal: &slates_git::unpack::Refusal) -> String {
+  use slates_git::unpack::Refusal as Unpack;
+  match refusal {
+    Unpack::Pack(why) => format!("pack framing refused ({why:?})"),
+    Unpack::Entry(why) => format!("pack entry refused ({why:?})"),
+    Unpack::Collision { at, attack } => {
+      format!("SHA-1 collision attack at offset {at} ({attack:?})")
+    }
+    Unpack::AllocationRefused { bytes } => format!("allocation of {bytes} bytes refused"),
+    Unpack::PastAdmission(past) => past_room(past),
+    other => format!("pack unpack refused ({other:?})"),
+  }
+}

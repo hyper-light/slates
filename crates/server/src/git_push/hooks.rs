@@ -49,7 +49,7 @@ use slates_git::Admission;
 use slates_git::out::Out;
 use slates_git::receive::{
   self, Checked, Command, Outcome as Answered, Received, Requested, protected, write_hook_words,
-  write_report_end, write_report_held,
+  write_report_end,
 };
 
 use super::{
@@ -405,7 +405,7 @@ pub(super) fn reported<P: PresentView>(
   (received, mut hooks): (Received, PushHooks),
   out: &mut impl Out,
 ) -> Result<Answering, PushFailed> {
-  write_report_held(&received, out).map_err(PushFailed::Exchange)?;
+  super::report_received(push.repository, &received, out, true)?;
   hooks.at = At::PostReceive;
   observe(push, state, Observing { received, hooks }, out)
 }

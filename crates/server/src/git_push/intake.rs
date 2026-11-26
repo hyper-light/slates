@@ -18,14 +18,77 @@ use std::collections::BTreeMap;
 
 use slates_git::object_name::{Kind, ObjectId};
 use slates_git::receive::Repository;
+use slates_git::store::packed::Waited;
 use slates_git::store::views::IndexedObjects;
 use slates_git::store::{IndexBases, Push, Repository as GitRepository};
 use slates_git::unpack::{self, Contents, Keep, Object};
 use slates_git::{Admission, Hold};
-use slates_vcs::ContentStore;
+use slates_vcs::content::IDENTITY_BYTES;
+use slates_vcs::{ContentId, ContentStore};
 
 use crate::state::ShardState;
 use crate::vcs_store::{GitPush, GitRefused};
+
+/// Format: input bytes hashed by [`away_token`]: the 32-byte pack [`ContentId`] followed by the
+/// 8-byte little-endian byte offset within that pack.
+const AWAY_TOKEN_INPUT_BYTES: usize = IDENTITY_BYTES + core::mem::size_of::<u64>();
+
+/// Hashes `waited`'s pack identity and byte offset into a `u64` progress token for `away()`
+/// callers (`unpack::Reader`, `receive::Checking`, `receive::Verdicts`).
+///
+/// Distinct let-go packs placing objects at the exact same byte offset yield distinct tokens so
+/// multi-pack `REF_DELTA`, connectivity-walk, and tag-peel chains advance across bring-back turns,
+/// while an unchanged `(pack, offset)` after a failed bring-back yields the identical token so
+/// every progress guard still terminates cleanly.
+fn away_token(waited: Waited) -> u64 {
+  let mut input = [0_u8; AWAY_TOKEN_INPUT_BYTES];
+  if let Some((pack_slot, offset_slot)) = input.split_at_mut_checked(IDENTITY_BYTES) {
+    pack_slot.copy_from_slice(&waited.pack.0);
+    offset_slot.copy_from_slice(&waited.offset.to_le_bytes());
+  }
+  let digest = ContentId::of(&input);
+  let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = digest.0;
+  u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7])
+}
+
+/// [`IndexedObjects`] paired with its repository so [`Repository::away`] reports [`away_token`]
+/// (combining `Waited::pack` and `Waited::offset`) instead of the raw byte offset alone.
+pub(super) struct TrackedIndexed<'s> {
+  /// The repository's indexed object view.
+  indexed: IndexedObjects<'s>,
+  /// The repository whose `waiting` cell carries the full [`Waited`] pack identity and offset.
+  repository: &'s GitRepository,
+}
+
+impl<'s> TrackedIndexed<'s> {
+  /// Constructs a tracked index view over `repository` and `store` within `room` bytes.
+  pub(super) fn new(repository: &'s GitRepository, store: &'s ContentStore, room: u64) -> Self {
+    Self {
+      indexed: IndexedObjects::new(repository, store, room),
+      repository,
+    }
+  }
+
+  /// Borrows the underlying [`IndexedObjects`] view.
+  pub(super) fn inner(&self) -> &IndexedObjects<'s> {
+    &self.indexed
+  }
+}
+
+impl Repository for TrackedIndexed<'_> {
+  fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+    self.indexed.object(id)
+  }
+
+  fn holds(&self, id: &ObjectId) -> bool {
+    self.indexed.holds(id)
+  }
+
+  fn away(&self) -> Option<u64> {
+    let _ = Repository::away(&self.indexed)?;
+    self.repository.peek_waiting().map(away_token)
+  }
+}
 
 /// The session's site while it reads a pack into the quarantine (the module docs).
 pub(super) struct Intake<'s> {
@@ -39,6 +102,9 @@ pub(super) struct Intake<'s> {
 
 impl Repository for Intake<'_> {
   fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+    // Clear any stale `waiting` left by a prior skipped delta in the same turn so a non-away miss
+    // never inherits an earlier read's window and so `note_waited` records this read's own.
+    let _ = self.quarantined.repository.waiting();
     self.indexed.object(id)
   }
 
@@ -47,12 +113,13 @@ impl Repository for Intake<'_> {
   }
 
   fn away(&self) -> Option<u64> {
-    Repository::away(&self.indexed).or_else(|| self.quarantined.away())
+    self.quarantined.repository.peek_waiting().map(away_token)
   }
 }
 
 impl Contents for Intake<'_> {
   fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
+    let _ = self.quarantined.repository.waiting();
     if let Some((object, _)) = self.queue.get(&at) {
       return (object.id == *id).then_some(Cow::Borrowed(object.content.as_slice()));
     }
@@ -60,7 +127,7 @@ impl Contents for Intake<'_> {
   }
 
   fn away(&self) -> Option<u64> {
-    Repository::away(&self.indexed).or_else(|| self.quarantined.away())
+    self.quarantined.repository.peek_waiting().map(away_token)
   }
 }
 
@@ -93,6 +160,7 @@ pub(crate) struct Quarantined<'s> {
 
 impl Contents for Quarantined<'_> {
   fn content(&self, _at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
+    let _ = self.repository.waiting();
     // The push's object is read where it is: in the store, lent with no copy where it is one window there (A-727 a1), or
     // where it lies in the push's pack (`Push::pack_bytes`, main's ruling B part 2, covering objects passed over by the
     // quarantine because the repository already indexed them so in-RAM pack/recent reads never hit let-go seed windows),
@@ -119,7 +187,7 @@ impl Contents for Quarantined<'_> {
   }
 
   fn away(&self) -> Option<u64> {
-    self.repository.peek_waiting().map(|waited| waited.offset)
+    self.repository.peek_waiting().map(away_token)
   }
 }
 

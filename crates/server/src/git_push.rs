@@ -548,7 +548,28 @@ impl<P> ReceivePack<P> {
   /// Brings back and pins the let-go window the push's last turn met, if any, so concurrent
   /// fetches cannot evict it before the push's next turn.
   pub(crate) async fn bring_back_waited(&mut self) -> bool {
-    crate::vcs_store::upload::brought_back_waited_into(self.repository, &mut self.resident).await
+    let first =
+      crate::vcs_store::upload::brought_back_waited_into(self.repository, &mut self.resident).await;
+    if !first {
+      return false;
+    }
+    // `brought_back_waited_into` drains a stopped background encoding before `Repository::waiting`;
+    // if an encoding consumed the first call while this push's own let-go window is still noted on
+    // the repository, drain it now so the next turn finds its window resident and pinned.
+    let still_waiting = crate::state::with_state(|state| {
+      state
+        .vcs_stores
+        .git_ref(self.repository)
+        .and_then(|(_, store)| store.repository.peek_waiting())
+        .is_some()
+    })
+    .unwrap_or(false);
+    if still_waiting {
+      let _ =
+        crate::vcs_store::upload::brought_back_waited_into(self.repository, &mut self.resident)
+          .await;
+    }
+    true
   }
 
   /// Whether the client asked its answer multiplexed (`side-band-64k`), once its request is read.
@@ -900,6 +921,7 @@ impl<P> ReceivePack<P> {
             .vcs_stores
             .git_ref(*repository)
             .ok_or(PushFailed::NoStore)?;
+          let _ = git.repository.waiting();
           let mut site = intake::Intake {
             indexed: IndexedObjects::new(&git.repository, content, admission.left()),
             quarantined: intake::Quarantined {
@@ -955,6 +977,7 @@ impl<P> ReceivePack<P> {
       let Some((content, git)) = state.vcs_stores.git_ref(*repository) else {
         return;
       };
+      let _ = git.repository.waiting();
       let mut site = intake::Intake {
         indexed: IndexedObjects::new(&git.repository, content, admission.left()),
         quarantined: intake::Quarantined {
@@ -990,6 +1013,7 @@ impl<P> ReceivePack<P> {
           .vcs_stores
           .git_ref(*repository)
           .ok_or(PushFailed::NoStore)?;
+        let _ = git.repository.waiting();
         let mut site = intake::Intake {
           indexed: IndexedObjects::new(&git.repository, content, admission.left()),
           quarantined: intake::Quarantined {
@@ -1201,6 +1225,7 @@ impl<P> ReceivePack<P> {
         .vcs_stores
         .git_ref(*repository)
         .ok_or(PushFailed::NoStore)?;
+      let _ = git.repository.waiting();
       let mut site = intake::Intake {
         indexed: IndexedObjects::new(&git.repository, content, admission.left()),
         quarantined: intake::Quarantined {
@@ -1265,7 +1290,8 @@ impl<P> ReceivePack<P> {
         .vcs_stores
         .git_ref(*repository)
         .ok_or(PushFailed::NoStore)?;
-      let indexed = IndexedObjects::new(&git.repository, content, admission.left());
+      let _ = git.repository.waiting();
+      let indexed = intake::TrackedIndexed::new(&git.repository, content, admission.left());
       let quarantined = intake::Quarantined {
         push: quarantine.as_ref().map(GitPush::quarantine),
         store: content,
@@ -1362,12 +1388,16 @@ impl<P> ReceivePack<P> {
     out: &mut impl Out,
   ) -> Result<Answering, PushFailed> {
     let Self {
-      session, admission, ..
+      repository,
+      session,
+      admission,
+      ..
     } = self;
     let received = session
-      .answer_with(declining, None, out, admission)
+      .decide_with(declining, None, admission)
       .map_err(PushFailed::Exchange)?
       .ok_or(PushFailed::Unchecked)?;
+    report_received(*repository, &received, out, false)?;
     Ok(Answering::Answered(Box::new(received)))
   }
 
@@ -1781,7 +1811,7 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
       None => Ok(Answering::Turned),
       Some((received, Some(hooks))) => hooks::reported(self, state, (received, hooks), out),
       Some((received, None)) => {
-        write_report(&received, out).map_err(PushFailed::Exchange)?;
+        report_received(self.repository, &received, out, false)?;
         Ok(Answering::Answered(Box::new(received)))
       }
     }
@@ -1911,7 +1941,7 @@ impl<P> ReceivePack<P> {
     match self.decision_turn(state, decision)? {
       None => Ok(Answering::Turned),
       Some((received, ())) => {
-        write_report(&received, out).map_err(PushFailed::Exchange)?;
+        report_received(self.repository, &received, out, false)?;
         Ok(Answering::Answered(Box::new(received)))
       }
     }
@@ -2781,13 +2811,14 @@ impl ServerJudge<'_> {
       };
       let (content, git) = store;
       let room = state.store.admittable();
-      let indexed = IndexedObjects::new(&git.repository, content, room);
+      let _ = git.repository.waiting();
+      let indexed = intake::TrackedIndexed::new(&git.repository, content, room);
       let objects = PushedObjects::new(&git.repository, content, push.quarantine());
       let greens = ShardGreens {
         state,
         record,
         store,
-        indexed: &indexed,
+        indexed: indexed.inner(),
         owing: std::cell::Cell::new(None),
         examined: std::cell::Cell::new(0),
       };
@@ -2845,13 +2876,14 @@ impl ServerJudge<'_> {
       };
       let (content, git) = store;
       let room = state.store.admittable();
-      let indexed = IndexedObjects::new(&git.repository, content, room);
+      let _ = git.repository.waiting();
+      let indexed = intake::TrackedIndexed::new(&git.repository, content, room);
       let objects = PushedObjects::new(&git.repository, content, push.quarantine());
       let greens = ShardGreens {
         state,
         record,
         store,
-        indexed: &indexed,
+        indexed: indexed.inner(),
         owing: std::cell::Cell::new(None),
         examined: std::cell::Cell::new(0),
       };
@@ -3092,6 +3124,36 @@ struct ShardGreens<'s, 'v> {
   owing: std::cell::Cell<Option<DbVolumeId>>,
   /// The greens [`ShardGreens::holding`] examined, counted [`HOLDING_EXAMINED`] once the reader is done.
   examined: std::cell::Cell<u64>,
+}
+
+/// Logs any typed pack intake refusal on `received`, emits a concise `error: <reason>\n` line on
+/// side-band 2 when `side-band-64k` is active and `write_report` does not already emit its own
+/// band-2 line, then writes git's report (leaving band-1 status lines verbatim).
+fn report_received(
+  repository: RepositoryId,
+  received: &Received,
+  out: &mut impl Out,
+  held: bool,
+) -> Result<(), PushFailed> {
+  if let Some(Err(refused)) = &received.unpacked {
+    slates_machine::log_line!(
+      "slates-server: a git push to repository {repository:?} failed pack intake (objects={:?}): {:?}",
+      refused.objects,
+      refused.why
+    );
+    if received.request.requested.side_band_64k
+      && !received.request.commands.is_empty()
+      && let Some(reason) = words::pack_refusal_sideband(refused)
+    {
+      let line = slates_git::receive::message(reason.as_bytes());
+      slates_git::sideband::write(slates_git::sideband::Band::Progress, &line, out);
+    }
+  }
+  if held {
+    slates_git::receive::write_report_held(received, out).map_err(PushFailed::Exchange)
+  } else {
+    write_report(received, out).map_err(PushFailed::Exchange)
+  }
 }
 
 /// Format: why each command of a push whose records were not held at `f + 1` within its barrier's window is reported
