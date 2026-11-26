@@ -311,6 +311,49 @@ where
   L: crate::vcs_http::git::ShardLender,
   W: slates_hg::render::StoreWants + ?Sized,
 {
+  answered_store_wants_on(lender, wants, id).await.is_ok()
+}
+
+/// Why a want of the node's changeset store went unanswered ([`answered_store_wants_on`]): the caller's typed refusal,
+/// never taken for another (a made changeset's intake once answered a store's refusal as its version not the head).
+pub(crate) enum StoreUnanswered {
+  /// The shard's state could not be lent to read the store's handle.
+  ShardGone,
+  /// The daemon keeps no changeset store, and the want is one only a store answers.
+  NoStore,
+  /// The store's owner refused the request, in its own words: busy past its queue's bound, gone, or the store's own
+  /// refusal.
+  Owner(slates_store::owner::OwnerError),
+  /// The store keeps no text of an identity asked.
+  Missing,
+  /// A text's length or the texts' count past what this platform's sizes hold.
+  Unsized,
+}
+
+/// Written out rather than derived, as `Unmade`'s is (`vcs_store::hg_made`): a refusal's words are all that read its
+/// fields, and dead-code analysis ignores derived impls; the output is the derived one's.
+impl std::fmt::Debug for StoreUnanswered {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      StoreUnanswered::ShardGone => formatter.write_str("ShardGone"),
+      StoreUnanswered::NoStore => formatter.write_str("NoStore"),
+      StoreUnanswered::Owner(refused) => formatter.debug_tuple("Owner").field(refused).finish(),
+      StoreUnanswered::Missing => formatter.write_str("Missing"),
+      StoreUnanswered::Unsized => formatter.write_str("Unsized"),
+    }
+  }
+}
+
+/// [`answer_store_wants_on`] with its refusal typed: every want answered, or why one was not.
+pub(crate) async fn answered_store_wants_on<L, W>(
+  lender: &mut L,
+  wants: &mut W,
+  id: RepositoryId,
+) -> Result<(), StoreUnanswered>
+where
+  L: crate::vcs_http::git::ShardLender,
+  W: slates_hg::render::StoreWants + ?Sized,
+{
   use slates_hg::render::Want;
   let repository = u128::from_be_bytes(id.bytes);
   while let Some(want) = wants.wants().cloned() {
@@ -318,12 +361,12 @@ where
     let Some((disk, step)) =
       lender.lend(|state| (state.vcs_disk.clone(), text_bytes_a_step(state)))
     else {
-      return false;
+      return Err(StoreUnanswered::ShardGone);
     };
     let Some(disk) = disk else {
       // A daemon holding no store keeps no revision: a rows' want is answered none, any other refused.
       let Want::Rows { logs } = want else {
-        return false;
+        return Err(StoreUnanswered::NoStore);
       };
       wants.give_rows(
         logs
@@ -335,9 +378,7 @@ where
     };
     // Read before the answer, which ends the want it names.
     let logs = wants.reads_logs();
-    let Some((whole, asks)) = answer_one(&disk, repository, (want, step), wants).await else {
-      return false;
-    };
+    let (whole, asks) = answer_one(&disk, repository, (want, step), wants).await?;
     let waited = slates_rt::futures::now_ns().saturating_sub(asked_at);
     let owner = slates_store::owner::take_read_waits();
     let (tags, bases) = (wants.reads_tags(), wants.reads_bases());
@@ -359,7 +400,7 @@ where
       }
     });
   }
-  true
+  Ok(())
 }
 
 /// Counter: the requests a fetch's store asks ([`STORE_ASKS`]) made of the node's changeset store's owner, each one
@@ -449,7 +490,9 @@ pub(crate) async fn answer_wants_over(
 ) -> Option<TextAsks> {
   let mut asked = TextAsks::default();
   while let Some(want) = wants.wants().cloned() {
-    let (_, asks) = answer_one(disk, repository, (want, step), wants).await?;
+    let (_, asks) = answer_one(disk, repository, (want, step), wants)
+      .await
+      .ok()?;
     asked.requests = asked.requests.saturating_add(asks.requests);
     asked.most_copied = asked.most_copied.max(asks.most_copied);
   }
@@ -464,7 +507,7 @@ async fn answer_one<W: slates_hg::render::StoreWants + ?Sized>(
   repository: u128,
   (want, step): (slates_hg::render::Want, u64),
   wants: &mut W,
-) -> Option<(u64, TextAsks)> {
+) -> Result<(u64, TextAsks), StoreUnanswered> {
   use slates_hg::render::{StoredPlace, StoredRevision, Want};
   match want {
     Want::Rows { logs } => {
@@ -477,7 +520,10 @@ async fn answer_one<W: slates_hg::render::StoreWants + ?Sized>(
           )
         })
         .collect();
-      let found = disk.texts_by_tool(repository, asked).await.ok()?;
+      let found = disk
+        .texts_by_tool(repository, asked)
+        .await
+        .map_err(StoreUnanswered::Owner)?;
       wants.give_rows(
         found
           .into_iter()
@@ -500,7 +546,7 @@ async fn answer_one<W: slates_hg::render::StoreWants + ?Sized>(
           })
           .collect(),
       );
-      Some((0, TextAsks::default()))
+      Ok((0, TextAsks::default()))
     }
     Want::Chunks { places } => {
       let asked = places
@@ -511,20 +557,20 @@ async fn answer_one<W: slates_hg::render::StoreWants + ?Sized>(
           len: place.len,
         })
         .collect();
-      let chunks = disk.places(asked).await.ok()?;
+      let chunks = disk.places(asked).await.map_err(StoreUnanswered::Owner)?;
       wants.give_chunks(chunks);
-      Some((0, TextAsks::default()))
+      Ok((0, TextAsks::default()))
     }
     Want::Texts { texts, most } => {
       match texts_made(disk, repository, &texts, (most, step)).await? {
         (MadeTexts::Past, asks) => {
           wants.texts_past();
-          Some((0, asks))
+          Ok((0, asks))
         }
         (MadeTexts::Made(made), asks) => {
           let whole = u64::try_from(made.len()).unwrap_or(u64::MAX);
           wants.give_texts(made);
-          Some((whole, asks))
+          Ok((whole, asks))
         }
       }
     }
@@ -561,53 +607,63 @@ impl TextAsks {
 /// C1: a fetch's let-go changelog and manifest texts, a pull's revision sent whole, a lookup's `.hgtags`), together at
 /// most `most` bytes: past them the reading stops, so a hostile or huge text is never held whole ([`MadeTexts::Past`]).
 /// The owner copies at most `step` bytes a request (a step's copy budget, [`text_bytes_a_step`]; goal 93, main's ruling
-/// of 2026-11-25). None where the store keeps no such text. What it asked, beside them.
+/// of 2026-11-25). What it asked, beside them; refused where the store's owner refused, or keeps no such text
+/// ([`StoreUnanswered`]).
 pub(crate) async fn texts_made(
   disk: &slates_store::owner::StoreHandle,
   repository: u128,
   texts: &[[u8; 32]],
   (most, step): (u64, u64),
-) -> Option<(MadeTexts, TextAsks)> {
+) -> Result<(MadeTexts, TextAsks), StoreUnanswered> {
   let step = step.max(1);
   let mut asks = TextAsks::default();
   if most <= step {
     // The want within one step (a fetch's batch, `LogTexts::ask_batch`, holds a step's bytes): one request of the
     // store's owner for all of it (goal 93: a request a text and a piece before, over 100,000 trips to the owner for hg's
     // 57k clone), counted ([`TEXT_REQUESTS`]).
-    let made = match disk.texts(repository, texts.to_vec(), most).await.ok()? {
+    let made = match disk
+      .texts(repository, texts.to_vec(), most)
+      .await
+      .map_err(StoreUnanswered::Owner)?
+    {
       slates_store::owner::MadeTexts::Made(made) => made,
       slates_store::owner::MadeTexts::Past => {
         asks.asked(0);
-        return Some((MadeTexts::Past, asks));
+        return Ok((MadeTexts::Past, asks));
       }
-      slates_store::owner::MadeTexts::Missing => return None,
+      slates_store::owner::MadeTexts::Missing => return Err(StoreUnanswered::Missing),
     };
     let copied = made
       .iter()
       .map(|text| u64::try_from(text.len()).unwrap_or(u64::MAX))
       .fold(0, u64::saturating_add);
     asks.asked(copied);
-    return Some((MadeTexts::Made(made), asks));
+    return Ok((MadeTexts::Made(made), asks));
   }
   // Past a step: each text copied a step's slice a request, to its end (an empty slice, or one short of the step), each
   // slice appended by the owner to the text's own buffer, handed to it and back a request (goal 93, main's churn ruling
   // of 2026-11-25: each slice a buffer of its own, copied again into the text, 6.2 GB of hg's 57k clone).
   let mut made = Vec::new();
-  made.try_reserve_exact(texts.len()).ok()?;
+  made
+    .try_reserve_exact(texts.len())
+    .map_err(|_| StoreUnanswered::Unsized)?;
   let mut total = 0_u64;
   for identity in texts {
     let mut text = Vec::new();
     loop {
-      let at = u64::try_from(text.len()).ok()?;
+      let at = u64::try_from(text.len()).map_err(|_| StoreUnanswered::Unsized)?;
       text = disk
         .text_slice_into(repository, *identity, (at, step), text)
         .await
-        .ok()??;
-      let len = u64::try_from(text.len()).ok()?.saturating_sub(at);
+        .map_err(StoreUnanswered::Owner)?
+        .ok_or(StoreUnanswered::Missing)?;
+      let len = u64::try_from(text.len())
+        .map_err(|_| StoreUnanswered::Unsized)?
+        .saturating_sub(at);
       asks.asked(len);
       total = total.saturating_add(len);
       if total > most {
-        return Some((MadeTexts::Past, asks));
+        return Ok((MadeTexts::Past, asks));
       }
       if len < step {
         break;
@@ -615,7 +671,7 @@ pub(crate) async fn texts_made(
     }
     made.push(text);
   }
-  Some((MadeTexts::Made(made), asks))
+  Ok((MadeTexts::Made(made), asks))
 }
 
 /// The most bytes of texts one want of a fetch over the shard's view asks the store's owner to make and copy at once

@@ -93,6 +93,10 @@ enum Unmade {
   /// The parent changeset's or its manifest's text, let go once landed, could not be read back from the node's
   /// changeset store (goal 93, C1 (1)).
   ParentUnread,
+  /// The node's changeset store left a want of the changeset's intake unanswered, in its own typed words (the owner busy
+  /// past its bound, gone, or the store's refusal): never taken for the version not being the head (docs/bugs/
+  /// 2026-11-25-a-made-changeset-over-a-let-go-parent-was-never-made.md).
+  Store(super::hg_view::StoreUnanswered),
 }
 
 /// Written out rather than derived, as a derived `Debug` is all that reads the refusals and dead-code analysis ignores
@@ -109,6 +113,7 @@ impl std::fmt::Debug for Unmade {
       Unmade::Stale => formatter.write_str("Stale"),
       Unmade::Named(unread) => formatter.debug_tuple("Named").field(unread).finish(),
       Unmade::ParentUnread => formatter.write_str("ParentUnread"),
+      Unmade::Store(why) => formatter.debug_tuple("Store").field(why).finish(),
     }
   }
 }
@@ -444,7 +449,11 @@ type Prepared = (
 async fn landed(
   made: Made,
 ) -> Option<Result<(Made, (crate::repository::hg_push::Forked, Vec<u8>)), Unmade>> {
-  let prepared = crate::state::with_state(|state| prepared(state, &made))?;
+  let forked = match taken(&made).await? {
+    Ok(forked) => forked,
+    Err(why) => return Some(Err(why)),
+  };
+  let prepared = crate::state::with_state(|state| prepared(state, &made, forked))?;
   let (forked, (disk, header, parts, reference)) = match prepared {
     Ok(prepared) => prepared,
     Err(why) => return Some(Err(why)),
@@ -456,27 +465,48 @@ async fn landed(
   Some(Err(Unmade::Unlanded))
 }
 
-/// [`landed`]'s first half: the changegroup taken into a fork and the changeset made, its sequence taken now.
-fn prepared(state: &mut ShardState, made: &Made) -> Result<Prepared, Unmade> {
+/// [`landed`]'s first part: `made`'s changegroup taken into a fork by the push's own intake from the task
+/// (`hg_push::take_made`), a want of the node's changeset store awaited. None where the shard's state is gone.
+async fn taken(made: &Made) -> Option<Result<crate::repository::hg_push::Forked, Unmade>> {
   #[cfg(test)]
   if fault_at(Fault::Prepared) {
-    return Err(Unmade::Record);
+    return Some(Err(Unmade::Record));
   }
-  let room = crate::vcs_share::room(state, made.repository).bytes;
-  let changegroup =
+  let room =
+    crate::state::with_state(|state| crate::vcs_share::room(state, made.repository).bytes)?;
+  let Ok(changegroup) =
     slates_hg::push::made::changegroup(&made.verified, &mut slates_hg::Admission::new(room))
-      .map_err(|_| Unmade::Record)?;
+  else {
+    return Some(Err(Unmade::Record));
+  };
   let taken = crate::repository::hg_push::take_made(
-    state,
     made.repository,
     (slates_hg::push::made::CHANGEGROUP_VERSION, changegroup),
     &mut slates_hg::Admission::new(room),
-  );
-  let mut forked = match taken {
-    Some(Ok(forked)) => forked,
-    Some(Err(_)) => return Err(Unmade::Record),
-    None => return Err(Unmade::NotHead),
-  };
+  )
+  .await;
+  Some(taken.map_err(|why| match why {
+    crate::repository::hg_push::MadeTake::Refused(refused) => {
+      let _ = crate::state::with_state(|state| {
+        slates_machine::log_line!(
+          "slates-server: partition {}: a made changeset's intake refused it: {refused:?}",
+          state.partition
+        );
+      });
+      Unmade::Record
+    }
+    crate::repository::hg_push::MadeTake::Store(why) => Unmade::Store(why),
+    crate::repository::hg_push::MadeTake::Gone => Unmade::NotHead,
+  }))
+}
+
+/// [`landed`]'s second part, in one step: the changeset made of `forked` with its made record and reference, its
+/// sequence taken now.
+fn prepared(
+  state: &mut ShardState,
+  made: &Made,
+  mut forked: crate::repository::hg_push::Forked,
+) -> Result<Prepared, Unmade> {
   let made_key = (green_key(made.green), made.version);
   // A made changeset's payload is named whole, as its intake takes it whole (`hg_push::take_made`; owed, GAPS).
   let name = slates_hg::import::record::PayloadName::of(&forked.changegroup.1);
@@ -785,7 +815,7 @@ fn branch_of(
 pub(crate) enum Fault {
   /// [`inputs`] refuses.
   Inputs,
-  /// [`prepared`] refuses.
+  /// [`taken`] refuses.
   Prepared,
   /// [`commit_made`] refuses.
   CommitMade,

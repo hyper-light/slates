@@ -1158,7 +1158,7 @@
 >   bare runtime runs on the test's thread and is not refused. The fixtures still blocking are named in
 >   `test_store::SHARD_BLOCKING_ALLOWED`, each with its owner and how many sites reach it, and run their blocking body
 >   through `allowing_shard_blocking`; there is no global off-switch. The list only shrinks.
->   **The shard-blocking allow-list: 7 fixtures** (a test holds the list's length to this figure; edit both together):
+>   **The shard-blocking allow-list: 5 fixtures** (a test holds the list's length to this figure; edit both together):
 >   - `test_store::audit_on_stored_shard`: 97 sites. svn 0; git 0; hg 15 (`hg_push/tests.rs` 15);
 >     other 82 (`push/tests.rs` 18, `vcs_store/tests.rs` 14, `paths/tests.rs` 11,
 >     `repository.rs` 10, `commits/tests.rs` 8, `identities/tests.rs` 8, `vcs_share/grants.rs` 4,
@@ -1167,8 +1167,8 @@
 >     (`git_push/tests.rs` 23, `vcs_share/tests.rs` 9, `vcs_share/wait.rs` 2, `vcs_store/tests.rs` 2, `replica.rs` 1,
 >     `named_objects.rs` 1) and `test_store::audit_on_stored_shard_made_all`, any tool's (`upload/tests.rs` 12,
 >     `git_hooks/tests.rs` 2).
->   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 31 tests. hg 14
->     (`hg_made` 10, `vcs_ssh` 4); other 17 (`daemon::tests` 5, `repository::push` 5,
+>   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 21 tests. hg 4
+>     (`vcs_ssh` 4); other 17 (`daemon::tests` 5, `repository::push` 5,
 >     `vcs_share` 3, `repository::import` 2, `identities` 1, `repository::tests` 1). Counted by w-git (2026-11-25) by the
 >     tests refused with its allowance taken away: `vcs_http::daemon_edge` and `vcs_store::upload` reach it no more, and
 >     one `vcs_share` test's Mercurial creation (`hg_repository`, w-hg's) moved here from `audit_on_stored_shard` when
@@ -1183,8 +1183,7 @@
 >     test's thread, `git_repository_on`, or through `on_stored_shard_with`.)
 >   - w-hg's push and import helpers, counted by the tests refused without each once the entries above let them
 >     through: `repository::hg_push::land_stored` (2 tests, `vcs_ssh::tests::hg`),
->     `repository::hg_push::land_in` (1, `hg_made`), `vcs_store::commits::home_and_land_blocking` (7: `commits` 6,
->     `upload` 1), `repository::hg_push::stored_now` (1, `hg_made`), and
+>     `vcs_store::commits::home_and_land_blocking` (7: `commits` 6, `upload` 1), and
 >     `repository::import::tests::served`'s read-back (1).
 >   Moved instead of listed: `daemon::tests::t_goal93_a_homes_landed_records_survive_a_restart…` lands between two
 >   observations. Shrunk: `repository/hg_push/tests.rs`' 17 daemon tests push through the daemon's own driver
@@ -1200,7 +1199,10 @@
 >   and its 2 shard creations, and `daemon::tests`' A-729 import, run as tasks, their imports turned by hand, then
 >   landed by `hg_import::land_imported_awaited` (each segment's store landing awaited, the bookmark works built a
 >   unit a turn by `built_works`); `land_imported_on` is that landing run as a task, so `land_imported`,
->   `land_segments_blocking` and `built_works_whole` are gone with both their entries. The pattern to move to is `audit_on_stored_shard_made`, `created().await` in a task
+>   `land_segments_blocking` and `built_works_whole` are gone with both their entries. And `vcs_store/hg_made/tests.rs`'
+>   10: each repository made from the test's thread (`create_on`), and the client's push on a made changeset sent
+>   through `hg_push::unbundle` from a task (`pushed_changegroup`), so `land_in`'s and `stored_now`'s entries are gone
+>   (`hg_push`'s race histories still reach both, under `audit_on_stored_shard`'s). The pattern to move to is `audit_on_stored_shard_made`, `created().await` in a task
 >   (`run_on_first`), `create_on` from the test's thread, or `hg_push::unbundle` from a shard task.
 > **The piece-reading replay (A-767 C1; R2's replay half). CLOSED.** A changeset's payload is read back a piece at a
 > time as its replay wants it, never whole. `slates_hg::framing` is the one walk of a changegroup's chunks over a
@@ -1890,8 +1892,10 @@
 > and `a_pin_that_finds_a_window_let_go_counts_it_and_a_pin_of_nothing_is_refused`. Sibling sweep:
 > git's push and hg's import not of this shape; svn's import batches were (fixed in d3539309d, to move onto the store's
 > pins). A made changeset's (`hg_made`, and the tests' `take_whole`) texts are unpinned at their intake's finish, before
-> the `disk.land` it awaits: nothing reads them between (its intake and record are made in one step), and once landed a
-> window let go meanwhile comes back from the store; a reader before the landing would need the pins kept to its let-go.
+> the `disk.land` it awaits: nothing reads them between (since 2026-11-25 its intake is taken a slice a step by its
+> task, which holds the repository's landing turn throughout, its store wants awaited; docs/bugs/2026-11-25-a-made-
+> changeset-over-a-let-go-parent-was-never-made.md), and once landed a window let go meanwhile comes back from the
+> store; a reader before the landing would need the pins kept to its let-go.
 > Owed: main's push loop re-run.
 > Found by main's round 2 at f8fe97e5e (the clone about 1.7x its load's slowing past stock's) and cut (2026-11-24): a
 > fetch made each let-go changelog and manifest text by its own request of the store's owner, a piece a request

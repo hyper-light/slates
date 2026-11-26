@@ -471,8 +471,8 @@ pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   },
   Allowed {
     fixture: "test_store::create",
-    owner: "each caller's (GAPS: hg 14, other 17)",
-    reaching: 31,
+    owner: "each caller's (GAPS: hg 4, other 17)",
+    reaching: 21,
   },
   Allowed {
     fixture: "vcs_store::commits::home_and_land_blocking",
@@ -483,16 +483,6 @@ pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
     fixture: "repository::hg_push::land_stored",
     owner: "w-hg (vcs_ssh::tests::hg 2)",
     reaching: 2,
-  },
-  Allowed {
-    fixture: "repository::hg_push::land_in",
-    owner: "w-hg (vcs_store::hg_made 1)",
-    reaching: 1,
-  },
-  Allowed {
-    fixture: "repository::hg_push::stored_now",
-    owner: "w-hg (vcs_store::hg_made 1)",
-    reaching: 1,
   },
   Allowed {
     fixture: "repository::import::tests::served",
@@ -959,6 +949,7 @@ pub(crate) fn answer_wants_blocking(
                   // A test's synchronous answer copies a want in one request: its step the want's own bytes.
                   crate::vcs_store::hg_view::texts_made(&disk, repository, &texts, (most, most))
                     .await
+                    .ok()
                     .map(|(made, _)| match made {
                       crate::vcs_store::hg_view::MadeTexts::Made(made) => {
                         slates_hg::serve::getbundle::Given::Texts(made)

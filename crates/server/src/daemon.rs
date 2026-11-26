@@ -10513,7 +10513,7 @@ mod tests {
     first.bootstrap(true).unwrap();
     let (id, before) = crate::test_store::run_on_first(
       &first,
-      || a729_imported_and_landed(),
+      a729_imported_and_landed,
       std::time::Duration::from_secs(60),
     );
     first.publish_every_shard().unwrap();

@@ -15409,7 +15409,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    pushback (decision 8). Status (A-731): a version a work submits to a line's green is the changeset the server
    makes of it (`vcs_store::hg_made`, as 7.2's `commit` writes one), recorded in the submit's transaction
    (`Source::Made`) and its line's head until a push on top is the newer version; merged requests, rebases and
-   pushback owed.
+   pushback owed. Its changegroup is taken by the push's own intake in the made commit's task, a slice a step, a want
+   of the node's changeset store (a parent's text a push let go) answered by awaiting the store, and a store that
+   answers nothing refuses the version in the store's own words (`Unmade::Store`), never `NotHead`
+   (docs/bugs/2026-11-25-a-made-changeset-over-a-let-go-parent-was-never-made.md).
 7. Markers and their exchange; topics as review requests.
 8. Access and hooks: the repository's rules, acl's, the narrow ACL, the admission and observing hooks, the built-in
    ones.
