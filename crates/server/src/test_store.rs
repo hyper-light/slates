@@ -363,13 +363,13 @@ pub(crate) fn create_on(
 pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   Allowed {
     fixture: "test_store::audit_on_stored_shard",
-    owner: "each history's (GAPS: svn 0, git 2, hg 32, other 94)",
-    reaching: 128,
+    owner: "each history's (GAPS: svn 0, git 0, hg 32, other 82)",
+    reaching: 114,
   },
   Allowed {
     fixture: "test_store::create",
-    owner: "each caller's (GAPS: hg 16, other 23)",
-    reaching: 39,
+    owner: "each caller's (GAPS: hg 16, other 18)",
+    reaching: 34,
   },
   Allowed {
     fixture: "vcs_store::commits::home_and_land_blocking",
@@ -547,6 +547,31 @@ pub(crate) fn audit_on_stored_shard_made<T: Send + 'static>(
   let (store, daemon) = audit_daemon_stored();
   keep_landed(&daemon);
   let made = create_on(&daemon, 0, principal, asked);
+  let answer = crate::daemon::observe_first(&daemon, move |state| history(state, made));
+  daemon.stop();
+  drop(store);
+  answer
+}
+
+/// [`audit_on_stored_shard_made`] for a history that begins by making several repositories: each of `asked` made first,
+/// by `principal`, from the test's thread ([`create_on`]), in order; then `history` runs on the shard with their ids and
+/// root greens, in `asked`'s order. The shard is never held through a creation's commit.
+pub(crate) fn audit_on_stored_shard_made_all<T: Send + 'static, const N: usize>(
+  (principal, asked): (&slates_db::catalog::Principal, [Asked<'_>; N]),
+  history: impl FnOnce(
+    &mut crate::state::ShardState,
+    [(
+      slates_db::catalog::RepositoryId,
+      slates_db::catalog::VolumeId,
+    ); N],
+  ) -> T
+  + Clone
+  + Send
+  + 'static,
+) -> T {
+  let (store, daemon) = audit_daemon_stored();
+  keep_landed(&daemon);
+  let made = asked.map(|asked| create_on(&daemon, 0, principal, asked));
   let answer = crate::daemon::observe_first(&daemon, move |state| history(state, made));
   daemon.stop();
   drop(store);
