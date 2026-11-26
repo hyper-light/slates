@@ -508,6 +508,9 @@ struct VisibleSizes<'g, 'r> {
 
 impl object_info::ObjectSizes for VisibleSizes<'_, '_> {
   fn size(&self, id: &ObjectId) -> Option<u64> {
+    if self.graph.fault().is_some() {
+      return None;
+    }
     let node = crate::negotiation::Graph::node(self.graph, id)?;
     if !self.graph.is_visible_want(node) {
       return None;
@@ -517,7 +520,10 @@ impl object_info::ObjectSizes for VisibleSizes<'_, '_> {
 }
 
 /// The `object-info` answer to `arguments`, each size from the store's rows (A-624's `Stored`),
-/// restricted to objects reachable from visible refs.
+/// restricted to objects reachable from visible refs. Any store fault encountered while proving
+/// visibility (including a let-go pack window noted on the repository) refuses the answer with
+/// [`Refusal::Store`] so callers bring the window back and retry instead of reporting a visible
+/// object as unknown.
 fn object_info_answer(
   graph: &StoreGraph<'_>,
   served: &Served<'_>,
@@ -532,10 +538,17 @@ fn object_info_answer(
     },
   };
   let format = served.repository.format();
-  charged(admission, |out| {
-    object_info::answer(arguments, format, &sizes, out).map_err(Refusal::Wire)
-  })
-  .map(|(bytes, ())| bytes)
+  // A note an earlier read left is not this request's (matching `upload/answer.rs` and
+  // `store/upload.rs`): clear stale waiting state before proving visibility.
+  let _ = served.repository.waiting();
+  let (bytes, ()) = charged(admission, |out| {
+    object_info::answer(arguments, format, &sizes, out).map_err(Refusal::Wire)?;
+    match graph.fault() {
+      Some(fault) => Err(Refusal::Store(fault)),
+      None => Ok(()),
+    }
+  })?;
+  Ok(bytes)
 }
 
 /// Where an answer's bytes go while it is made: a count first, then the bytes, so they are charged before they are made.
@@ -575,3 +588,7 @@ fn charged<T>(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/object_info_visibility.rs"]
+mod object_info_visibility_tests;

@@ -156,6 +156,14 @@ impl receive::Repository for IndexedObjects<'_> {
     self.repository.indexed_position(self.store, id).is_some()
   }
 
+  fn kind(&self, id: &ObjectId) -> Option<Kind> {
+    let position = self.repository.indexed_position(self.store, id)?;
+    self
+      .repository
+      .kind_at(position)
+      .or_else(|| self.repository.object(self.store, id).map(|row| row.kind))
+  }
+
   fn away(&self) -> Option<u64> {
     self
       .away

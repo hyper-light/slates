@@ -397,22 +397,11 @@ impl<'r> StoreGraph<'r> {
 
   /// Whether any head in `heads` reaches `target` (used only for visible refs whose reach sets have
   /// not yet been derived). For a commit target, prunes by generation number; for any other object
-  /// (tag, tree, blob), walks commits, tags and trees iteratively.
+  /// (tag, tree, blob), walks commits, tags and trees iteratively. Stops early if a read faults or
+  /// waits on a let-go pack window so the caller can bring the window back and retry.
   fn heads_reach(&self, heads: &[u64], target: u64) -> bool {
     if self.kind(target) == Kind::Commit {
-      return heads.iter().any(|&head| {
-        let mut current = head;
-        while self.kind(current) == Kind::Tag {
-          if current == target {
-            return true;
-          }
-          let Some(next) = self.target(current) else {
-            return false;
-          };
-          current = next;
-        }
-        self.reaches(current, target)
-      });
+      return self.heads_reach_commit(heads, target);
     }
     let mut seen = BTreeSet::new();
     let mut stack = heads.to_vec();
@@ -423,19 +412,55 @@ impl<'r> StoreGraph<'r> {
       if !seen.insert(current) {
         continue;
       }
-      match self.kind(current) {
-        Kind::Commit => {
-          if let Some(row) = self.commit(current) {
-            stack.push(row.tree);
-          }
-          stack.extend(self.parents(current));
-        }
-        Kind::Tree => stack.extend(self.entries(current)),
-        Kind::Tag => stack.extend(self.target(current)),
-        Kind::Blob => {}
+      self.push_children(current, &mut stack);
+      if self.fault.get().is_some() {
+        return false;
       }
     }
     false
+  }
+
+  /// Whether any head in `heads` peels to a commit reaching `target`, bailing early on a fault or
+  /// let-go pack window.
+  fn heads_reach_commit(&self, heads: &[u64], target: u64) -> bool {
+    for &head in heads {
+      if self.head_reaches_commit(head, target) {
+        return true;
+      }
+      if self.fault.get().is_some() {
+        return false;
+      }
+    }
+    false
+  }
+
+  /// Whether one `head` peels through tags to a commit reaching `target`.
+  fn head_reaches_commit(&self, mut current: u64, target: u64) -> bool {
+    while self.kind(current) == Kind::Tag {
+      if current == target {
+        return true;
+      }
+      let Some(next) = self.target(current) else {
+        return false;
+      };
+      current = next;
+    }
+    self.kind(current) == Kind::Commit && self.reaches(current, target)
+  }
+
+  /// Pushes the direct children of `node` onto `stack` during reachability walks.
+  fn push_children(&self, node: u64, stack: &mut Vec<u64>) {
+    match self.kind(node) {
+      Kind::Commit => {
+        if let Some(row) = self.commit(node) {
+          stack.push(row.tree);
+        }
+        stack.extend(self.parents(node));
+      }
+      Kind::Tree => stack.extend(self.entries(node)),
+      Kind::Tag => stack.extend(self.target(node)),
+      Kind::Blob => {}
+    }
   }
 
   /// Whether the commit at `later` is the commit at `earlier` or reaches it, searched back through parents no lower

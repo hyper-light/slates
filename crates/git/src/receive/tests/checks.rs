@@ -386,3 +386,527 @@ fn special_dotfile_blobs_are_checked_on_push_as_git_checks_them() {
     }))
   );
 }
+
+/// Builds an annotated tag targeting `target` with declared type `declared_type`.
+fn tag_text(target: ObjectId, declared_type: &str, name: &str) -> Vec<u8> {
+  format!(
+    "object {target}\ntype {declared_type}\ntag {name}\ntagger A <a@example.com> 1 +0000\n\nm\n"
+  )
+  .into_bytes()
+}
+
+/// §4.17.2 "A push" item 5 (connectivity edge-kind parity with stock Git): do push every
+/// wrong-kind edge shape inside the incoming pack (tag `type commit` -> blob, commit `tree` ->
+/// blob, tree `40000` -> blob, tree `100644`/`100755`/`120000` -> tree, commit `parent` -> blob
+/// both normal and shallow), plus a valid gitlink `160000` to an absent commit and an atomic batch
+/// pairing a valid branch with a wrong-kind edge. Expect: every wrong-kind edge is refused
+/// `missing necessary objects` (never admitted, never `shallow update not allowed`, and rolling
+/// back atomic batches), while the gitlink succeeds.
+#[test]
+fn wrong_kind_object_edges_in_pack_are_refused() {
+  let blob_bytes = b"hello blob\n";
+  let blob_id = id_of(Kind::Blob, blob_bytes);
+  let empty_tree_id = id_of(Kind::Tree, b"");
+  let valid_commit = commit_text(empty_tree_id, &[]);
+  let valid_commit_id = id_of(Kind::Commit, &valid_commit);
+
+  // 1. Tag whose `type` header says `commit` while its target is a `blob`.
+  let bad_tag_blob = tag_text(blob_id, "commit", "bad-tag-blob");
+  let bad_tag_blob_id = id_of(Kind::Tag, &bad_tag_blob);
+  // 1b. Tag whose `type` header says `blob` while its target is a `tree`.
+  let bad_tag_tree = tag_text(empty_tree_id, "blob", "bad-tag-tree");
+  let bad_tag_tree_id = id_of(Kind::Tag, &bad_tag_tree);
+
+  // 2. Commit whose `tree` points to a `blob`.
+  let bad_commit_tree = commit_text(blob_id, &[]);
+  let bad_commit_tree_id = id_of(Kind::Commit, &bad_commit_tree);
+
+  // 3. Tree entry with mode `40000` (tree) pointing to a `blob`.
+  let dir_to_blob_tree = tree_entry("40000", "sub", blob_id);
+  let dir_to_blob_tree_id = id_of(Kind::Tree, &dir_to_blob_tree);
+  let dir_to_blob_commit = commit_text(dir_to_blob_tree_id, &[]);
+  let dir_to_blob_commit_id = id_of(Kind::Commit, &dir_to_blob_commit);
+
+  // 4. Tree entries with blob modes (`100644`, `100755`, `120000`) pointing to a `tree`.
+  let file_to_tree = tree_entry("100644", "f", empty_tree_id);
+  let file_to_tree_commit = commit_text(id_of(Kind::Tree, &file_to_tree), &[]);
+  let file_to_tree_commit_id = id_of(Kind::Commit, &file_to_tree_commit);
+
+  let exec_to_tree = tree_entry("100755", "x", empty_tree_id);
+  let exec_to_tree_commit = commit_text(id_of(Kind::Tree, &exec_to_tree), &[]);
+  let exec_to_tree_commit_id = id_of(Kind::Commit, &exec_to_tree_commit);
+
+  let link_to_tree = tree_entry("120000", "l", empty_tree_id);
+  let link_to_tree_commit = commit_text(id_of(Kind::Tree, &link_to_tree), &[]);
+  let link_to_tree_commit_id = id_of(Kind::Commit, &link_to_tree_commit);
+
+  // 5. Commit whose `parent` points to a `blob`.
+  let bad_parent_commit = commit_text(empty_tree_id, &[blob_id]);
+  let bad_parent_commit_id = id_of(Kind::Commit, &bad_parent_commit);
+
+  // Positive control: tree entry with mode `160000` (gitlink) pointing to an absent commit.
+  let absent_sub = id_of(Kind::Commit, b"external submodule commit");
+  let gitlink_tree = tree_entry("160000", "mod", absent_sub);
+  let gitlink_commit = commit_text(id_of(Kind::Tree, &gitlink_tree), &[]);
+  let gitlink_commit_id = id_of(Kind::Commit, &gitlink_commit);
+
+  let pack = pack_of(&[
+    (Kind::Blob, blob_bytes),
+    (Kind::Tree, b""),
+    (Kind::Commit, &valid_commit),
+    (Kind::Tag, &bad_tag_blob),
+    (Kind::Tag, &bad_tag_tree),
+    (Kind::Commit, &bad_commit_tree),
+    (Kind::Tree, &dir_to_blob_tree),
+    (Kind::Commit, &dir_to_blob_commit),
+    (Kind::Tree, &file_to_tree),
+    (Kind::Commit, &file_to_tree_commit),
+    (Kind::Tree, &exec_to_tree),
+    (Kind::Commit, &exec_to_tree_commit),
+    (Kind::Tree, &link_to_tree),
+    (Kind::Commit, &link_to_tree_commit),
+    (Kind::Commit, &bad_parent_commit),
+    (Kind::Tree, &gitlink_tree),
+    (Kind::Commit, &gitlink_commit),
+  ]);
+  let commands: [(ObjectId, ObjectId, &[u8]); 9] = [
+    (zero(), bad_tag_blob_id, b"refs/tags/bad-tag-blob"),
+    (zero(), bad_tag_tree_id, b"refs/tags/bad-tag-tree"),
+    (zero(), bad_commit_tree_id, b"refs/heads/bad-commit-tree"),
+    (zero(), dir_to_blob_commit_id, b"refs/heads/dir-to-blob"),
+    (zero(), file_to_tree_commit_id, b"refs/heads/file-to-tree"),
+    (zero(), exec_to_tree_commit_id, b"refs/heads/exec-to-tree"),
+    (zero(), link_to_tree_commit_id, b"refs/heads/link-to-tree"),
+    (zero(), bad_parent_commit_id, b"refs/heads/bad-parent"),
+    (zero(), gitlink_commit_id, b"refs/heads/gitlink-ok"),
+  ];
+  let bytes = request(
+    &[bad_parent_commit_id],
+    &commands,
+    b" report-status",
+    &[],
+    &pack,
+  );
+  let (outcomes, judged) = outcomes_hiding(&bytes, &Repo::default(), &NoneHidden);
+  let missing = refused_with(b"missing necessary objects");
+  for (at, (_, _, name)) in commands.iter().take(8).enumerate() {
+    assert_eq!(
+      outcomes[at],
+      missing,
+      "expected missing necessary objects for {}",
+      String::from_utf8_lossy(name)
+    );
+  }
+  assert_eq!(outcomes[8], Outcome::Ok(Vec::new()));
+  assert_eq!(judged, [b"refs/heads/gitlink-ok".to_vec()]);
+
+  // Atomic push pairing a valid branch with a wrong-kind edge must reject the entire batch.
+  let atomic_cmds: [(ObjectId, ObjectId, &[u8]); 2] = [
+    (zero(), valid_commit_id, b"refs/heads/good"),
+    (zero(), bad_tag_blob_id, b"refs/tags/bad-tag"),
+  ];
+  let atomic_bytes = request(&[], &atomic_cmds, b" report-status atomic", &[], &pack);
+  let (atomic_outcomes, atomic_judged) =
+    outcomes_hiding(&atomic_bytes, &Repo::default(), &NoneHidden);
+  assert_eq!(
+    atomic_outcomes,
+    [refused_with(b"atomic push failure"), missing]
+  );
+  assert!(atomic_judged.is_empty());
+}
+
+/// §4.17.2 "A push" item 5 (wrong-kind edges targeting objects ALREADY stored in the repository):
+/// do push tags, commits, and trees referencing pre-existing repository objects of the wrong kind.
+/// Expect: every wrong-kind edge is refused `missing necessary objects`, while matching-kind edges
+/// to the same repository objects succeed.
+#[test]
+fn wrong_kind_object_edges_to_existing_repository_objects_are_refused() {
+  let mut repository = Repo::default();
+  let existing_blob = repository.with(Kind::Blob, b"already stored blob\n");
+  let existing_tree = repository.with(Kind::Tree, b"");
+  let existing_commit = repository.with(Kind::Commit, &commit_text(existing_tree, &[]));
+
+  // Wrong-kind edges referencing existing repository objects (targets NOT resent in pack).
+  let bad_tag = tag_text(existing_blob, "commit", "bad-tag-existing");
+  let bad_commit_tree = commit_text(existing_blob, &[]);
+  let bad_dir_tree = tree_entry("40000", "d", existing_blob);
+  let bad_dir_commit = commit_text(id_of(Kind::Tree, &bad_dir_tree), &[]);
+  let bad_file_tree = tree_entry("100644", "f", existing_tree);
+  let bad_file_commit = commit_text(id_of(Kind::Tree, &bad_file_tree), &[]);
+  let bad_parent_commit = commit_text(existing_tree, &[existing_tree]);
+
+  // Valid matching-kind edges referencing the exact same existing repository objects.
+  let ok_tag = tag_text(existing_commit, "commit", "ok-tag-existing");
+  let ok_tree = [
+    tree_entry("40000", "d", existing_tree),
+    tree_entry("100644", "f", existing_blob),
+  ]
+  .concat();
+  let ok_commit = commit_text(id_of(Kind::Tree, &ok_tree), &[existing_commit]);
+
+  let pack = pack_of(&[
+    (Kind::Tag, &bad_tag),
+    (Kind::Commit, &bad_commit_tree),
+    (Kind::Tree, &bad_dir_tree),
+    (Kind::Commit, &bad_dir_commit),
+    (Kind::Tree, &bad_file_tree),
+    (Kind::Commit, &bad_file_commit),
+    (Kind::Commit, &bad_parent_commit),
+    (Kind::Tag, &ok_tag),
+    (Kind::Tree, &ok_tree),
+    (Kind::Commit, &ok_commit),
+  ]);
+  let commands: [(ObjectId, ObjectId, &[u8]); 7] = [
+    (zero(), id_of(Kind::Tag, &bad_tag), b"refs/tags/bad-tag"),
+    (
+      zero(),
+      id_of(Kind::Commit, &bad_commit_tree),
+      b"refs/heads/bad-tree",
+    ),
+    (
+      zero(),
+      id_of(Kind::Commit, &bad_dir_commit),
+      b"refs/heads/bad-dir",
+    ),
+    (
+      zero(),
+      id_of(Kind::Commit, &bad_file_commit),
+      b"refs/heads/bad-file",
+    ),
+    (
+      zero(),
+      id_of(Kind::Commit, &bad_parent_commit),
+      b"refs/heads/bad-parent",
+    ),
+    (zero(), id_of(Kind::Tag, &ok_tag), b"refs/tags/ok-tag"),
+    (
+      zero(),
+      id_of(Kind::Commit, &ok_commit),
+      b"refs/heads/ok-commit",
+    ),
+  ];
+  let bytes = request(&[], &commands, b" report-status", &[], &pack);
+  let (outcomes, judged) = outcomes_hiding(&bytes, &repository, &NoneHidden);
+  let missing = refused_with(b"missing necessary objects");
+  for at in 0..5 {
+    assert_eq!(outcomes[at], missing, "case {at}");
+  }
+  assert_eq!(outcomes[5], Outcome::Ok(Vec::new()));
+  assert_eq!(outcomes[6], Outcome::Ok(Vec::new()));
+  assert_eq!(
+    judged,
+    [
+      b"refs/tags/ok-tag".to_vec(),
+      b"refs/heads/ok-commit".to_vec()
+    ]
+  );
+}
+
+/// §4.17.2 "A push" (branch refs under `refs/heads/` must point to a commit, matching stock Git
+/// `refs.c` / `receive-pack.c`): do push non-commit targets (blob, tree, annotated tag — both in
+/// the incoming pack and already in the repository) to `refs/heads/*`, alongside valid branch
+/// commits and non-commit `refs/tags/*` refs, both non-atomic and `--atomic`, plus a branch delete.
+/// Expect: every non-delete `refs/heads/*` pointing to a non-commit is refused `failed to update
+/// ref` with Git's non-commit diagnostic and never judged; `--atomic` rolls back the entire batch
+/// with `atomic push failure`; valid branches, non-commit tags, and branch deletes succeed.
+#[test]
+fn branch_ref_pointing_to_non_commit_is_refused_atomic_and_non_atomic() {
+  let mut repository = Repo::default();
+  let existing_blob = repository.with(Kind::Blob, b"existing repo blob\n");
+  let existing_tree = repository.with(Kind::Tree, b"");
+
+  let pack_blob = b"incoming pack blob\n";
+  let pack_blob_id = id_of(Kind::Blob, pack_blob);
+  let pack_tree = tree_entry("100644", "a", pack_blob_id);
+  let pack_tree_id = id_of(Kind::Tree, &pack_tree);
+  let commit = commit_text(pack_tree_id, &[]);
+  let commit_id = id_of(Kind::Commit, &commit);
+  let tag = tag_text(commit_id, "commit", "v1");
+  let tag_id = id_of(Kind::Tag, &tag);
+
+  let pack = pack_of(&[
+    (Kind::Blob, pack_blob),
+    (Kind::Tree, &pack_tree),
+    (Kind::Commit, &commit),
+    (Kind::Tag, &tag),
+  ]);
+
+  // Non-atomic: bad branches refused, good branch and non-commit tags applied.
+  let commands: [(ObjectId, ObjectId, &[u8]); 8] = [
+    (zero(), commit_id, b"refs/heads/good"),
+    (zero(), pack_blob_id, b"refs/heads/blob-pack"),
+    (zero(), pack_tree_id, b"refs/heads/tree-pack"),
+    (zero(), tag_id, b"refs/heads/tag-pack"),
+    (zero(), existing_blob, b"refs/heads/blob-repo"),
+    (zero(), existing_tree, b"refs/heads/tree-repo"),
+    (zero(), pack_blob_id, b"refs/tags/blob-ok"),
+    (zero(), tag_id, b"refs/tags/v1"),
+  ];
+  let bytes = request(&[], &commands, b" report-status side-band-64k", &[], &pack);
+  let (outcomes, judged) = outcomes_hiding(&bytes, &repository, &NoneHidden);
+  assert_eq!(outcomes[0], Outcome::Ok(Vec::new()));
+  for at in 1..6 {
+    match &outcomes[at] {
+      Outcome::Ng(declined) => {
+        assert_eq!(declined.reason, b"failed to update ref", "case {at}");
+        let msg = declined.message.as_deref().unwrap_or_default();
+        assert!(
+          String::from_utf8_lossy(msg).contains("non-commit"),
+          "case {at}: {msg:?}"
+        );
+      }
+      other => panic!("case {at} should be refused, got {other:?}"),
+    }
+  }
+  assert_eq!(outcomes[6], Outcome::Ok(Vec::new()));
+  assert_eq!(outcomes[7], Outcome::Ok(Vec::new()));
+  assert_eq!(
+    judged,
+    [
+      b"refs/heads/good".to_vec(),
+      b"refs/tags/blob-ok".to_vec(),
+      b"refs/tags/v1".to_vec(),
+    ]
+  );
+
+  // Atomic push with incoming-pack blob on refs/heads/bad -> rolls back refs/heads/good too.
+  let atomic_pack_cmds: [(ObjectId, ObjectId, &[u8]); 2] = [
+    (zero(), commit_id, b"refs/heads/good"),
+    (zero(), pack_blob_id, b"refs/heads/bad"),
+  ];
+  let atomic_bytes = request(&[], &atomic_pack_cmds, b" report-status atomic", &[], &pack);
+  let (atomic_outcomes, atomic_judged) = outcomes_hiding(&atomic_bytes, &repository, &NoneHidden);
+  assert_eq!(atomic_outcomes[0], refused_with(b"atomic push failure"));
+  assert!(matches!(
+    &atomic_outcomes[1],
+    Outcome::Ng(declined) if declined.reason == b"failed to update ref"
+  ));
+  assert!(atomic_judged.is_empty());
+
+  // Atomic push with already-stored repository blob on refs/heads/bad -> rolls back too.
+  let atomic_repo_cmds: [(ObjectId, ObjectId, &[u8]); 2] = [
+    (zero(), commit_id, b"refs/heads/good"),
+    (zero(), existing_blob, b"refs/heads/bad-repo"),
+  ];
+  let atomic_repo_bytes = request(&[], &atomic_repo_cmds, b" report-status atomic", &[], &pack);
+  let (atomic_repo_outcomes, atomic_repo_judged) =
+    outcomes_hiding(&atomic_repo_bytes, &repository, &NoneHidden);
+  assert_eq!(
+    atomic_repo_outcomes[0],
+    refused_with(b"atomic push failure")
+  );
+  assert!(matches!(
+    &atomic_repo_outcomes[1],
+    Outcome::Ng(declined) if declined.reason == b"failed to update ref"
+  ));
+  assert!(atomic_repo_judged.is_empty());
+
+  // Deleting a branch whose old value was a blob must still be permitted.
+  let delete_bytes = request(
+    &[],
+    &[(existing_blob, zero(), b"refs/heads/old-bad")],
+    b" report-status",
+    &[],
+    &[],
+  );
+  let (delete_outcomes, delete_judged) = outcomes_hiding(&delete_bytes, &repository, &NoneHidden);
+  assert_eq!(delete_outcomes, [Outcome::Ok(Vec::new())]);
+  assert_eq!(delete_judged, [b"refs/heads/old-bad".to_vec()]);
+
+  // A funny branch refname pointing to a blob must still report `funny refname` (not masked).
+  let funny_bytes = request(
+    &[],
+    &[(zero(), pack_blob_id, b"refs/heads/a..b")],
+    b" report-status",
+    &[],
+    &pack,
+  );
+  let (funny_outcomes, funny_judged) = outcomes_hiding(&funny_bytes, &repository, &NoneHidden);
+  assert!(matches!(
+    &funny_outcomes[0],
+    Outcome::Ng(declined) if declined.reason == b"funny refname"
+  ));
+  assert!(funny_judged.is_empty());
+
+  // Wrong-kind edge deep in a pushed chain (tag -> commit -> root tree -> dir `40000` -> blob)
+  // propagates back to the ref tip and rejects it.
+  let deep_bad_sub = tree_entry("40000", "leaf", pack_blob_id);
+  let deep_bad_sub_id = id_of(Kind::Tree, &deep_bad_sub);
+  let deep_root = tree_entry("40000", "nested", deep_bad_sub_id);
+  let deep_commit = commit_text(id_of(Kind::Tree, &deep_root), &[]);
+  let deep_commit_id = id_of(Kind::Commit, &deep_commit);
+  let deep_tag = tag_text(deep_commit_id, "commit", "deep-bad");
+  let deep_tag_id = id_of(Kind::Tag, &deep_tag);
+  let deep_pack = pack_of(&[
+    (Kind::Blob, pack_blob),
+    (Kind::Tree, &deep_bad_sub),
+    (Kind::Tree, &deep_root),
+    (Kind::Commit, &deep_commit),
+    (Kind::Tag, &deep_tag),
+  ]);
+  let deep_bytes = request(
+    &[],
+    &[(zero(), deep_tag_id, b"refs/tags/deep-bad")],
+    b" report-status",
+    &[],
+    &deep_pack,
+  );
+  let (deep_outcomes, deep_judged) = outcomes_hiding(&deep_bytes, &Repo::default(), &NoneHidden);
+  assert_eq!(deep_outcomes, [refused_with(b"missing necessary objects")]);
+  assert!(deep_judged.is_empty());
+}
+
+/// §4.17.2 "A push" (let-go pack window during `Walk` and `Stage::BranchTargets`):
+/// do wrap a repository whose `kind` lookup returns `None` with `away() == Some(offset)` on the
+/// first probe, then bring the window back and retry `Session::check_turn`.
+/// Expect: both connectivity edge-kind checks and `refs/heads/*` branch-target checks pause on the
+/// first turn (`Ok(false)` with `away().is_some()`), then after bring-back complete with exact
+/// accept/refuse outcomes (no premature `missing necessary objects` or false non-commit refusal).
+#[test]
+fn away_repository_kind_pauses_walk_and_branch_target_check_until_brought_back() {
+  struct AwayRepo<'a> {
+    inner: &'a Repo,
+    evicted: std::cell::Cell<Option<ObjectId>>,
+    away: std::cell::Cell<Option<u64>>,
+    pauses: std::cell::Cell<usize>,
+  }
+
+  impl crate::receive::Repository for AwayRepo<'_> {
+    fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+      self.inner.object(id)
+    }
+
+    fn holds(&self, id: &ObjectId) -> bool {
+      self.inner.holds(id)
+    }
+
+    fn kind(&self, id: &ObjectId) -> Option<Kind> {
+      if self.evicted.get() == Some(*id) {
+        self.away.set(Some(42));
+        self.pauses.set(self.pauses.get() + 1);
+        return None;
+      }
+      self.away.set(None);
+      self.inner.kind(id)
+    }
+
+    fn away(&self) -> Option<u64> {
+      self.away.get()
+    }
+  }
+
+  let mut base = Repo::default();
+  let repo_tree = base.with(Kind::Tree, b"");
+  let repo_commit = base.with(Kind::Commit, &commit_text(repo_tree, &[]));
+  let repo_blob = base.with(Kind::Blob, b"not a commit\n");
+
+  // 1. Walk pauses when `repository.kind` hits a let-go window for a commit parent, then succeeds.
+  let child_commit = commit_text(repo_tree, &[repo_commit]);
+  let child_commit_id = id_of(Kind::Commit, &child_commit);
+  let pack = pack_of(&[(Kind::Commit, &child_commit)]);
+  let bytes = request(
+    &[],
+    &[(zero(), child_commit_id, b"refs/heads/child")],
+    b" report-status",
+    &[],
+    &pack,
+  );
+  let repo = AwayRepo {
+    inner: &base,
+    evicted: std::cell::Cell::new(Some(repo_commit)),
+    away: std::cell::Cell::new(None),
+    pauses: std::cell::Cell::new(0),
+  };
+  let mut session = crate::receive::Session::new(&ADVERTISED, NoneHidden);
+  let mut admission = unbounded();
+  assert_eq!(session.input(&bytes, &repo, &mut admission), Ok(true));
+  let mut stopped = crate::receive::connect::Stopped;
+  while session.is_resolving() {
+    assert_eq!(
+      session.check_turn(
+        &repo,
+        &mut admission,
+        crate::receive::connect::unbounded(&mut stopped),
+      ),
+      Ok(false)
+    );
+  }
+  assert_eq!(
+    session.check_turn(
+      &repo,
+      &mut admission,
+      crate::receive::connect::unbounded(&mut stopped),
+    ),
+    Ok(false),
+    "walk must pause when repository.kind reports a let-go window"
+  );
+  assert_eq!(repo.away.get(), Some(42));
+  assert!(repo.pauses.get() > 0);
+  // Bring window back and retry.
+  repo.evicted.set(None);
+  repo.away.set(None);
+  assert_eq!(
+    session.check_turn(
+      &repo,
+      &mut admission,
+      crate::receive::connect::unbounded(&mut stopped),
+    ),
+    Ok(true)
+  );
+  let checked = session.checked().expect("checked after bring-back");
+  assert_eq!(checked.early, [None]);
+
+  // 2. Stage::BranchTargets pauses when `refs/heads/*` targets a repo object whose kind is away.
+  let ref_bytes = request(
+    &[],
+    &[
+      (zero(), repo_commit, b"refs/heads/ok-repo"),
+      (zero(), repo_blob, b"refs/heads/bad-repo"),
+    ],
+    b" report-status",
+    &[],
+    &[],
+  );
+  let repo2 = AwayRepo {
+    inner: &base,
+    evicted: std::cell::Cell::new(Some(repo_commit)),
+    away: std::cell::Cell::new(None),
+    pauses: std::cell::Cell::new(0),
+  };
+  let mut checking = {
+    let mut reader = crate::receive::RequestReader::new(&ADVERTISED);
+    reader.read(&ref_bytes, &mut unbounded()).unwrap();
+    crate::receive::Checking::new(reader.request().unwrap(), None)
+  };
+  let empty_held = crate::unpack::Held::default();
+  let mut adm2 = unbounded();
+  assert_eq!(
+    checking.turn(
+      (&repo2, &empty_held),
+      &mut adm2,
+      crate::receive::connect::unbounded(&mut stopped),
+    ),
+    Ok(false),
+    "BranchTargets must pause when repository.kind reports a let-go window"
+  );
+  assert_eq!(repo2.away.get(), Some(42));
+  assert!(repo2.pauses.get() > 0);
+  repo2.evicted.set(None);
+  repo2.away.set(None);
+  assert_eq!(
+    checking.turn(
+      (&repo2, &empty_held),
+      &mut adm2,
+      crate::receive::connect::unbounded(&mut stopped),
+    ),
+    Ok(true)
+  );
+  let checked2 = checking
+    .checked((&repo2, &empty_held), &NoneHidden, &mut adm2)
+    .unwrap();
+  assert_eq!(checked2.early[0], None);
+  assert!(matches!(
+    &checked2.early[1],
+    Some(Outcome::Ng(declined)) if declined.reason == b"failed to update ref"
+  ));
+}

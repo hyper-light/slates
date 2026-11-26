@@ -253,26 +253,14 @@ impl Walk {
     let (read, state) = if object.kind == Kind::Tree {
       judge_tree(self.at, (request.format, pushed, repository))
     } else {
-      let shallow_commit =
-        !self.shallow.is_empty() && self.shallow.binary_search(&object.id).is_ok();
-      let mut state = Connected::Complete;
-      let read = edges_of(
-        (self.at, object),
-        (request.format, pushed),
-        &mut |target, parent| {
-          if pushed.position(&target).is_none() && !repository.holds(&target) {
-            state = state.max(if parent && shallow_commit {
-              Connected::Shallow
-            } else {
-              Connected::Missing
-            });
-          }
-        },
-      )?;
-      (read, state)
+      let shallow = self.is_shallow(object);
+      judge_object(
+        (self.at, object, shallow),
+        (request.format, pushed, repository),
+      )?
     };
     if !read
-      && let Some(away) = pushed.away()
+      && let Some(away) = pushed.away().or_else(|| repository.away())
       && self.stopped != Some((Pass::States, self.at, away))
     {
       self.stopped = Some((Pass::States, self.at, away));
@@ -286,6 +274,13 @@ impl Walk {
     }
     self.at = self.at.saturating_add(1);
     Ok(WalkStep::More)
+  }
+
+  /// Whether `object` is a commit the client marked shallow.
+  fn is_shallow(&self, object: &Placed) -> bool {
+    object.kind == Kind::Commit
+      && !self.shallow.is_empty()
+      && self.shallow.binary_search(&object.id).is_ok()
   }
 
   /// The first pass ended: done when no object is incomplete of its own (the module docs), else the propagation begun
@@ -494,9 +489,54 @@ fn grown(stack: &mut Vec<Frame>, admission: &mut Admission) -> Result<(), Refusa
   reserve(stack, more)
 }
 
+/// Judges a pushed commit or tag at `at` by checking every outgoing edge's presence and expected
+/// [`Kind`] against `pushed` then `repository`.
+fn judge_object<R: Repository + ?Sized>(
+  (at, object, shallow_commit): (usize, &Placed, bool),
+  (format, pushed, repository): (ObjectFormat, &Pushed<'_>, &R),
+) -> Result<(bool, Connected), Refusal> {
+  let mut state = Connected::Complete;
+  let mut repo_away = false;
+  let read = edges_of((at, object), (format, pushed), &mut |target, expected| {
+    if repo_away {
+      return;
+    }
+    match judge_edge(target, expected, shallow_commit, pushed, repository) {
+      Some(edge_state) => state = state.max(edge_state),
+      None => repo_away = true,
+    }
+  })?;
+  Ok((read && !repo_away, state))
+}
+
+/// Checks one outgoing edge `(target, expected)` against `pushed` then `repository`.
+/// Returns `None` when the lookup met a let-go pack window in `repository`.
+fn judge_edge<R: Repository + ?Sized>(
+  target: ObjectId,
+  expected: Kind,
+  shallow_commit: bool,
+  pushed: &Pushed<'_>,
+  repository: &R,
+) -> Option<Connected> {
+  if let Some(pos) = pushed.position(&target) {
+    return Some(if pushed.kind_at(pos) == Some(expected) {
+      Connected::Complete
+    } else {
+      Connected::Missing
+    });
+  }
+  match repository.kind(&target) {
+    Some(actual) if actual == expected => Some(Connected::Complete),
+    Some(_) => Some(Connected::Missing),
+    None if repository.away().is_some() => None,
+    None if expected == Kind::Commit && shallow_commit => Some(Connected::Shallow),
+    None => Some(Connected::Missing),
+  }
+}
+
 /// Judges one pushed tree at `at` directly from raw entry digests against `pushed` before
 /// constructing an [`ObjectId`] or probing `repository`, avoiding 40M enum copies on large pushes
-/// while keeping exact malformed-tree and submodule handling.
+/// while enforcing exact entry-kind, malformed-tree, and gitlink handling.
 fn judge_tree<R: Repository + ?Sized>(
   at: usize,
   (format, pushed, repository): (ObjectFormat, &Pushed<'_>, &R),
@@ -509,24 +549,49 @@ fn judge_tree<R: Repository + ?Sized>(
     let Ok(entry) = entry else {
       return (false, Connected::Missing);
     };
-    if entry.kind() == Kind::Commit || pushed.contains_raw(entry.id) {
-      continue;
-    }
-    match entry.object_id(format) {
-      Some(id) if repository.holds(&id) => {}
-      Some(_) => state = Connected::Missing,
+    match judge_tree_entry(entry, format, pushed, repository) {
+      Some(entry_state) => state = state.max(entry_state),
       None => return (false, Connected::Missing),
     }
   }
   (true, state)
 }
 
-/// The edges of the object at position `at`, as `pushed` lends its bytes, handed to `each`: whether it could be read.
-/// A blob names nothing, so its bytes are not read; an object whose bytes are not lent could not be read.
+/// Checks one raw tree entry against `pushed` then `repository`, skipping gitlinks
+/// (`Kind::Commit`). Returns `None` on a malformed digest or a let-go window in `repository`.
+fn judge_tree_entry<R: Repository + ?Sized>(
+  entry: crate::objects::tree::Entry<'_>,
+  format: ObjectFormat,
+  pushed: &Pushed<'_>,
+  repository: &R,
+) -> Option<Connected> {
+  let expected = entry.kind();
+  if expected == Kind::Commit {
+    return Some(Connected::Complete);
+  }
+  if let Some(pos) = pushed.position_raw(entry.id) {
+    return Some(if pushed.kind_at(pos) == Some(expected) {
+      Connected::Complete
+    } else {
+      Connected::Missing
+    });
+  }
+  let id = entry.object_id(format)?;
+  match repository.kind(&id) {
+    Some(actual) if actual == expected => Some(Connected::Complete),
+    Some(_) => Some(Connected::Missing),
+    None if repository.away().is_some() => None,
+    None => Some(Connected::Missing),
+  }
+}
+
+/// The edges of the object at position `at`, as `pushed` lends its bytes, handed to `each` with
+/// the expected target [`Kind`]: whether it could be read. A blob names nothing, so its bytes are
+/// not read; an object whose bytes are not lent could not be read.
 fn edges_of(
   (at, placed): (usize, &Placed),
   (format, pushed): (ObjectFormat, &Pushed<'_>),
-  each: &mut impl FnMut(ObjectId, bool),
+  each: &mut impl FnMut(ObjectId, Kind),
 ) -> Result<bool, Refusal> {
   if placed.kind == Kind::Blob {
     return Ok(true);
@@ -549,31 +614,35 @@ fn sorted(ids: &[ObjectId], admission: &mut Admission) -> Result<Vec<ObjectId>, 
   Ok(sorted)
 }
 
-/// Hands each object an object of `kind` holding `content` names to `each`, with whether it is a
-/// commit's parent: whether the object could be read. The read's transient structures, bounded by the object's own bytes, take a
-/// scratch admission of their own (this module's **Bounds**).
+/// Hands each object an object of `kind` holding `content` names to `each`, paired with the
+/// expected [`Kind`] git requires at that edge: whether the object could be read. The read's
+/// transient structures, bounded by the object's own bytes, take a scratch admission of their own
+/// (this module's **Bounds**).
 fn for_each_edge(
   (kind, content): (Kind, &[u8]),
   format: ObjectFormat,
-  each: &mut impl FnMut(ObjectId, bool),
+  each: &mut impl FnMut(ObjectId, Kind),
 ) -> Result<bool, Refusal> {
   let mut scratch = Admission::new(u64::MAX);
   let read = match kind {
     Kind::Commit => Commit::parse(content, &mut scratch).map(|commit| {
       let tree = commit.tree(format);
       if let Some(tree) = tree {
-        each(tree, false);
+        each(tree, Kind::Tree);
       }
-      commit.parents(format).for_each(|parent| each(parent, true));
+      commit
+        .parents(format)
+        .for_each(|parent| each(parent, Kind::Commit));
       tree.is_some()
     }),
     Kind::Tree => tree_edges_raw(content, format, each),
     Kind::Tag => Tag::parse(content, &mut scratch).map(|tag| {
-      let target = tag.object(format);
-      if let Some(target) = target {
-        each(target, false);
+      if let (Some(target), Some(expected)) = (tag.object(format), tag.kind()) {
+        each(target, expected);
+        true
+      } else {
+        false
       }
-      target.is_some()
     }),
     Kind::Blob => Ok(true),
   };
@@ -587,22 +656,24 @@ fn for_each_edge(
   }
 }
 
-/// Hands each object raw tree bytes `content` name to `each`, skipping submodule commits
-/// (`Kind::Commit`), in a single zero-allocation streaming pass matching [`objects::tree::Tree::parse`]:
-/// returns whether every non-submodule entry's id decoded cleanly, or `Err` on a malformed entry.
+/// Hands each object raw tree bytes `content` name to `each` with its mode-implied [`Kind`],
+/// skipping submodule commits (`Kind::Commit`), in a single zero-allocation streaming pass
+/// matching [`objects::tree::Tree::parse`]: returns whether every non-submodule entry's id
+/// decoded cleanly, or `Err` on a malformed entry.
 fn tree_edges_raw(
   content: &[u8],
   format: ObjectFormat,
-  each: &mut impl FnMut(ObjectId, bool),
+  each: &mut impl FnMut(ObjectId, Kind),
 ) -> Result<bool, ObjectRefused> {
   let mut whole = true;
   for entry in crate::objects::tree::entries(content, format) {
     let entry = entry?;
-    if entry.kind() == Kind::Commit {
+    let expected = entry.kind();
+    if expected == Kind::Commit {
       continue;
     }
     match entry.object_id(format) {
-      Some(id) => each(id, false),
+      Some(id) => each(id, expected),
       None => whole = false,
     }
   }

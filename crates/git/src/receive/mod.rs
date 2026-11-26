@@ -108,6 +108,12 @@ pub trait Repository {
     self.object(id).is_some()
   }
 
+  /// The [`Kind`] of the object named `id`, if the repository holds it. Implementors backed by an
+  /// object index can answer without inflating object bytes.
+  fn kind(&self, id: &ObjectId) -> Option<Kind> {
+    self.object(id).map(|(kind, _)| kind)
+  }
+
   /// Where in its pack the last object asked was not read because it lies in a window let go (A-864's push readers,
   /// [`crate::unpack::Outside::away`]). None by default.
   fn away(&self) -> Option<u64> {
@@ -188,6 +194,15 @@ pub trait Judge {
     &mut self,
     accepted: Vec<(&Command, Self::Accepted)>,
   ) -> Result<Vec<Vec<Reported>>, Declined>;
+
+  /// Returns an existing repository ref name that has a files-backend directory/file namespace
+  /// conflict with `name` (per [`refs_conflict`]) and is not among `deleted`, if any.
+  ///
+  /// Receive-pack always checks intra-batch D/F conflicts itself; implementors holding a
+  /// repository's existing ref namespace override this to enforce cross-push D/F conflicts.
+  fn ref_conflict(&self, _name: &[u8], _deleted: &[&[u8]]) -> Option<Vec<u8>> {
+    None
+  }
 }
 
 /// A command the judge refused.
@@ -287,6 +302,9 @@ pub(crate) struct IdIndex {
   buckets: Vec<u32>,
   /// Packed 20-byte SHA-1 digests indexed by pack position (`at`), populated for SHA-1 packs.
   sha1_ids: Vec<[u8; SHA1_RAW_BYTES]>,
+  /// Object kinds indexed by pack position (`at`), keeping tree edge-kind checks L2-resident
+  /// without touching the 104-byte `Placed` slice.
+  kinds: Vec<Kind>,
 }
 
 impl IdIndex {
@@ -325,6 +343,11 @@ impl IdIndex {
     admission
       .charge_items::<u32>(cap)
       .map_err(Refusal::PastAdmission)?;
+    admission
+      .charge_items::<Kind>(objects.len())
+      .map_err(Refusal::PastAdmission)?;
+    let mut kinds = Vec::new();
+    reserve(&mut kinds, objects.len())?;
     let mut sha1_ids = Vec::new();
     if all_sha1 {
       admission
@@ -337,6 +360,7 @@ impl IdIndex {
     buckets.resize(cap, EMPTY_SLOT);
     let mask = cap.saturating_sub(1);
     for (at, placed) in objects.iter().enumerate() {
+      kinds.push(placed.kind);
       if all_sha1 {
         let raw: [u8; SHA1_RAW_BYTES] = placed
           .id
@@ -347,7 +371,11 @@ impl IdIndex {
       }
       Self::insert_one(&mut buckets, &sha1_ids, objects, mask, at, &placed.id);
     }
-    Ok(Self { buckets, sha1_ids })
+    Ok(Self {
+      buckets,
+      sha1_ids,
+      kinds,
+    })
   }
 
   /// Inserts one `(at, id)` entry into `buckets`, skipping duplicate object ids.
@@ -393,6 +421,11 @@ impl IdIndex {
   /// Returns the pack order position of `id` in `objects`, if present.
   pub(crate) fn position(&self, objects: &[Placed], id: &ObjectId) -> Option<usize> {
     self.position_raw(objects, id.as_bytes())
+  }
+
+  /// Returns the cached [`Kind`] at pack order position `at`, if present.
+  pub(crate) fn kind(&self, at: usize) -> Option<Kind> {
+    self.kinds.get(at).copied()
   }
 
   /// Returns the pack order position of raw digest bytes `raw` in `objects`, if present.
@@ -487,10 +520,18 @@ impl<'a> Pushed<'a> {
     self.by_id.position(self.objects, id)
   }
 
-  /// Whether the pack brought an object with raw digest bytes `raw` (avoids constructing an
-  /// [`ObjectId`] during high-fanout tree connectivity walks).
-  pub(crate) fn contains_raw(&self, raw: &[u8]) -> bool {
-    self.by_id.position_raw(self.objects, raw).is_some()
+  /// Returns the pack order position of raw digest bytes `raw`, if the pack brought it (avoids
+  /// constructing an [`ObjectId`] during high-fanout tree connectivity walks).
+  pub(crate) fn position_raw(&self, raw: &[u8]) -> Option<usize> {
+    self.by_id.position_raw(self.objects, raw)
+  }
+
+  /// Returns the [`Kind`] of the pushed object at pack order position `at`.
+  pub(crate) fn kind_at(&self, at: usize) -> Option<Kind> {
+    self
+      .by_id
+      .kind(at)
+      .or_else(|| self.objects.get(at).map(|placed| placed.kind))
   }
 
   /// The objects' places, in pack order.
@@ -515,6 +556,10 @@ impl<R: Repository + ?Sized> Repository for InMemory<'_, R> {
 
   fn holds(&self, id: &ObjectId) -> bool {
     self.repository.holds(id)
+  }
+
+  fn kind(&self, id: &ObjectId) -> Option<Kind> {
+    self.repository.kind(id)
   }
 
   fn away(&self) -> Option<u64> {
@@ -828,6 +873,16 @@ pub struct Deciding<A> {
   at: usize,
   /// Under `atomic`, each command accepted so far with its verdict.
   accepted: Vec<(usize, A)>,
+  /// Under `atomic`, whether the batch D/F ref-namespace conflict check has already passed;
+  /// without `atomic`, whether the current command (`at`) has already passed its D/F check across
+  /// `judge.ready` turns.
+  df_checked: bool,
+  /// Without `atomic`, command indices of applied creates/updates kept sorted by ref name so later
+  /// commands in the same push detect intra-push D/F conflicts in O(depth * log N).
+  applied_refs: Vec<usize>,
+  /// Without `atomic`, command indices of applied deletes so cross-push D/F checks allow replacing
+  /// a ref deleted earlier in the same push.
+  applied_deleted: Vec<usize>,
   /// Whether every outcome is made.
   done: bool,
 }
@@ -843,8 +898,13 @@ impl<A> Deciding<A> {
     } = checked;
     let count = request.commands.len();
     let outcomes = charged_vec(count, admission)?;
-    let (accepted, placed) = if request.requested.atomic {
-      (charged_vec(count, admission)?, Vec::new())
+    let (accepted, placed, applied_refs, applied_deleted) = if request.requested.atomic {
+      (
+        charged_vec(count, admission)?,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+      )
     } else {
       let mut placed = charged_vec(count, admission)?;
       placed.extend((0..count).map(|_| None));
@@ -852,7 +912,9 @@ impl<A> Deciding<A> {
       admission
         .charge_items::<(u64, usize)>(count)
         .map_err(Refusal::PastAdmission)?;
-      (Vec::new(), placed)
+      let applied_refs = charged_vec(count, admission)?;
+      let applied_deleted = charged_vec(count, admission)?;
+      (Vec::new(), placed, applied_refs, applied_deleted)
     };
     Ok(Self {
       request,
@@ -864,6 +926,9 @@ impl<A> Deciding<A> {
       order: None,
       at: 0,
       accepted,
+      df_checked: false,
+      applied_refs,
+      applied_deleted,
       done: count == 0,
     })
   }
@@ -893,8 +958,7 @@ impl<A> Deciding<A> {
     let stepped = if self.request.requested.atomic {
       atomic_step(self, &pushed, judge, admission)
     } else {
-      each_step(self, &pushed, judge);
-      Ok(())
+      each_step(self, &pushed, judge, admission)
     };
     self.by_id = pushed.by_id;
     self.unpacked = unpacked;
@@ -930,38 +994,66 @@ fn each_step<A, J: Judge<Accepted = A> + ?Sized>(
   deciding: &mut Deciding<A>,
   pushed: &Pushed<'_>,
   judge: &mut J,
-) {
+  admission: &mut Admission,
+) -> Result<(), Refusal> {
   let order = deciding
     .order
     .get_or_insert_with(|| ranked(&deciding.request.commands, pushed, judge));
   let Some(&at) = order.get(deciding.at) else {
     deciding.done = true;
-    return;
+    return Ok(());
   };
-  // A command no check refused: one with no early outcome, its slot empty or past the checks' table.
+  let Some(command) = deciding.request.commands.get(at) else {
+    deciding.done = true;
+    return Ok(());
+  };
   let unrefused = deciding.early.get(at).is_none_or(Option::is_none);
-  if unrefused
-    && let Some(command) = deciding.request.commands.get(at)
-    && !judge.ready(command, pushed)
-  {
-    return;
+  let conflict = if unrefused && !deciding.df_checked {
+    let found = non_atomic_df_conflict(deciding, command, judge, admission)?;
+    deciding.df_checked = found.is_none();
+    found
+  } else {
+    None
+  };
+  if unrefused && conflict.is_none() && !judge.ready(command, pushed) {
+    return Ok(());
   }
   let early = deciding.early.get_mut(at).and_then(Option::take);
-  let outcome = match (early, deciding.request.commands.get(at)) {
+  let outcome = match (early, conflict) {
     (Some(refusal), _) => refusal,
-    (None, Some(command)) => match verdict(command, pushed, judge) {
-      Ok(accepted) => judge
-        .append(command, accepted)
-        .map_or_else(Outcome::Ng, Outcome::Ok),
-      Err(declined) => Outcome::Ng(declined),
-    },
-    (None, None) => return deciding.done = true,
+    (None, Some(existing)) => Outcome::Ng(df_declined(&command.name, &existing)),
+    (None, None) => apply_non_atomic(command, pushed, judge),
   };
+  finish_non_atomic(deciding, at, outcome);
+  Ok(())
+}
+
+/// Records `outcome` for non-atomic command `at` and advances to the next command.
+fn finish_non_atomic<A>(deciding: &mut Deciding<A>, at: usize, outcome: Outcome) {
+  let applied = matches!(outcome, Outcome::Ok(_));
   if let Some(slot) = deciding.placed.get_mut(at) {
     *slot = Some(outcome);
   }
+  if applied {
+    record_applied(deciding, at);
+  }
+  deciding.df_checked = false;
   deciding.at = deciding.at.saturating_add(1);
   deciding.done = deciding.at >= deciding.request.commands.len();
+}
+
+/// Judges and appends one non-atomic command.
+fn apply_non_atomic<A, J: Judge<Accepted = A> + ?Sized>(
+  command: &Command,
+  pushed: &Pushed<'_>,
+  judge: &mut J,
+) -> Outcome {
+  match verdict(command, pushed, judge) {
+    Ok(accepted) => judge
+      .append(command, accepted)
+      .map_or_else(Outcome::Ng, Outcome::Ok),
+    Err(declined) => Outcome::Ng(declined),
+  }
 }
 
 /// The indices of `commands` in the order a push without `atomic` decides them (A-850, [`Judge::rank`]): by rank, lowest
@@ -980,11 +1072,29 @@ fn ranked<J: Judge + ?Sized>(
   ranks.into_iter().map(|(_, at)| at).collect()
 }
 
+/// Records an atomic push failure with `declined` at index `failed_at` and [`ATOMIC_FAILURE`] on
+/// every other command.
+fn fail_atomic_at(
+  outcomes: &mut Vec<Outcome>,
+  count: usize,
+  failed_at: usize,
+  declined: &Declined,
+) {
+  outcomes.extend((0..count).map(|other| {
+    if other == failed_at {
+      Outcome::Ng(declined.clone())
+    } else {
+      refused(ATOMIC_FAILURE, None)
+    }
+  }));
+}
+
 /// One step of an atomic push: every command or none ("Either all refs are updated or none",
-/// gitprotocol-capabilities). A check's refusal leaves every other command `atomic push failure`,
-/// none judged; otherwise one command is judged a step until one is declined, which leaves every
-/// other `atomic push failure`; then one append moves every ref or none, and a refused append gives
-/// every command its reason, its band-2 line once (git's `execute_commands_atomic`).
+/// gitprotocol-capabilities). A check's refusal or ref D/F namespace conflict leaves every other
+/// command `atomic push failure`, none judged; otherwise one command is judged a step until one is
+/// declined, which leaves every other `atomic push failure`; then one append moves every ref or
+/// none, and a refused append gives every command its reason, its band-2 line once (git's
+/// `execute_commands_atomic`).
 fn atomic_step<A, J: Judge<Accepted = A> + ?Sized>(
   deciding: &mut Deciding<A>,
   pushed: &Pushed<'_>,
@@ -1000,6 +1110,12 @@ fn atomic_step<A, J: Judge<Accepted = A> + ?Sized>(
     deciding.outcomes.extend(early.into_iter().map(others));
     return Ok(());
   }
+  if !deciding.df_checked {
+    deciding.df_checked = true;
+    if check_atomic_df(deciding, judge, admission)? {
+      return Ok(());
+    }
+  }
   if let Some(command) = deciding.request.commands.get(deciding.at) {
     let at = deciding.at;
     if !judge.ready(command, pushed) {
@@ -1012,16 +1128,44 @@ fn atomic_step<A, J: Judge<Accepted = A> + ?Sized>(
         deciding.at = at.saturating_add(1);
         deciding.done = false;
       }
-      Err(declined) => deciding.outcomes.extend((0..count).map(|other| {
-        if other == at {
-          Outcome::Ng(declined.clone())
-        } else {
-          refused(ATOMIC_FAILURE, None)
-        }
-      })),
+      Err(declined) => fail_atomic_at(&mut deciding.outcomes, count, at, &declined),
     }
     return Ok(());
   }
+  finish_atomic(deciding, judge, admission)
+}
+
+/// Checks an atomic batch for D/F conflicts; if one is found, fills `deciding.outcomes` with the
+/// refusal and `ATOMIC_FAILURE` on every other command and returns `Ok(true)`.
+fn check_atomic_df<A, J: Judge<Accepted = A> + ?Sized>(
+  deciding: &mut Deciding<A>,
+  judge: &J,
+  admission: &mut Admission,
+) -> Result<bool, Refusal> {
+  let Some((bad_at, existing)) = atomic_df_conflict(&deciding.request.commands, judge, admission)?
+  else {
+    return Ok(false);
+  };
+  let Some(bad_cmd) = deciding.request.commands.get(bad_at) else {
+    return Ok(false);
+  };
+  let declined = df_declined(&bad_cmd.name, &existing);
+  fail_atomic_at(
+    &mut deciding.outcomes,
+    deciding.request.commands.len(),
+    bad_at,
+    &declined,
+  );
+  Ok(true)
+}
+
+/// Appends every accepted command of an atomic push in one transaction.
+fn finish_atomic<A, J: Judge<Accepted = A> + ?Sized>(
+  deciding: &mut Deciding<A>,
+  judge: &mut J,
+  admission: &mut Admission,
+) -> Result<(), Refusal> {
+  let count = deciding.request.commands.len();
   let accepted = core::mem::take(&mut deciding.accepted);
   let mut appended = charged_vec(accepted.len(), admission)?;
   let commands = &deciding.request.commands;
@@ -1045,10 +1189,12 @@ fn atomic_step<A, J: Judge<Accepted = A> + ?Sized>(
   Ok(())
 }
 
-/// A command's refusal before any judging, in git's order: its connectivity, then a hidden ref.
+/// A command's refusal before any judging, in git's order: its connectivity, then a hidden ref,
+/// then a branch ref (`refs/heads/*`) targeting a non-commit object.
 fn early_refusal<H: HiddenRefs + ?Sized>(
   command: &Command,
   connected: Connected,
+  non_commit: bool,
   hidden: &H,
 ) -> Option<Outcome> {
   match connected {
@@ -1062,7 +1208,278 @@ fn early_refusal<H: HiddenRefs + ?Sized>(
       };
       Some(refused(reason, None))
     }
+    Connected::Complete if non_commit => Some(Outcome::Ng(non_commit_branch(command))),
     Connected::Complete => None,
+  }
+}
+
+/// Whether `left` and `right` collide in a files-backed ref namespace (`a` vs `a/...`, separated
+/// by `/`, so `refs/heads/topic` conflicts with `refs/heads/topic/docs` and `refs/heads/topic/a/b`,
+/// but not with `refs/heads/topic` itself or `refs/heads/topic2`).
+pub fn refs_conflict(left: &[u8], right: &[u8]) -> bool {
+  is_dir_prefix(left, right) || is_dir_prefix(right, left)
+}
+
+/// Whether `prefix` is a strict `/`-separated path component prefix of `full`.
+fn is_dir_prefix(prefix: &[u8], full: &[u8]) -> bool {
+  full
+    .strip_prefix(prefix)
+    .is_some_and(|rest| rest.starts_with(b"/"))
+}
+
+/// Lexicographical comparison of `name` against `prefix` followed by `'/'` without allocation.
+fn cmp_with_slash(name: &[u8], prefix: &[u8]) -> core::cmp::Ordering {
+  name
+    .iter()
+    .cmp(prefix.iter().chain(core::iter::once(&b'/')))
+}
+
+/// Finds an ancestor component prefix of `name` present in `sorted` (sorted by name) via binary
+/// search.
+fn ancestor_in_sorted<'a>(name: &[u8], sorted: &[(&'a [u8], usize)]) -> Option<(&'a [u8], usize)> {
+  for (at, &byte) in name.iter().enumerate() {
+    if byte != b'/' {
+      continue;
+    }
+    let prefix = name.get(..at).unwrap_or_default();
+    if let Ok(found) = sorted.binary_search_by_key(&prefix, |(entry, _)| *entry)
+      && let Some(&hit) = sorted.get(found)
+    {
+      return Some(hit);
+    }
+  }
+  None
+}
+
+/// Chooses which of two D/F-conflicting commands `(first, second)` is reported as failing and
+/// which name is reported as already existing.
+fn pick_df_offender(commands: &[Command], first: usize, second: usize) -> Option<(usize, Vec<u8>)> {
+  let a = commands.get(first)?;
+  let b = commands.get(second)?;
+  if a.is_create() && !b.is_create() {
+    return Some((first, b.name.clone()));
+  }
+  if !a.is_create() && b.is_create() {
+    return Some((second, a.name.clone()));
+  }
+  if first < second {
+    Some((second, a.name.clone()))
+  } else {
+    Some((first, b.name.clone()))
+  }
+}
+
+/// Detects any intra-batch D/F conflict among valid-named non-delete commands in O(N * depth * log N),
+/// returning the offending command index (lowest index on ties) and the conflicting ref name.
+fn intra_batch_df_conflict(
+  commands: &[Command],
+  admission: &mut Admission,
+) -> Result<Option<(usize, Vec<u8>)>, Refusal> {
+  let mut active = charged_vec::<(&[u8], usize)>(commands.len(), admission)?;
+  active.extend(
+    commands
+      .iter()
+      .enumerate()
+      .filter(|(_, cmd)| !cmd.is_delete() && request::refname_ok(&cmd.name, false))
+      .map(|(at, cmd)| (cmd.name.as_slice(), at)),
+  );
+  active.sort_unstable();
+  let mut best: Option<(usize, Vec<u8>)> = None;
+  for &(name, at) in &active {
+    if let Some((_, ancestor_at)) = ancestor_in_sorted(name, &active)
+      && let Some(candidate) = pick_df_offender(commands, at, ancestor_at)
+      && best.as_ref().is_none_or(|(prev, _)| candidate.0 < *prev)
+    {
+      best = Some(candidate);
+    }
+  }
+  Ok(best)
+}
+
+/// Returns the names of valid-named delete commands in `commands` whose ref is not also created or
+/// updated in the same batch.
+fn atomic_deleted_refs<'a>(
+  commands: &'a [Command],
+  admission: &mut Admission,
+) -> Result<Vec<&'a [u8]>, Refusal> {
+  let mut non_deleted = charged_vec::<&[u8]>(commands.len(), admission)?;
+  non_deleted.extend(
+    commands
+      .iter()
+      .filter(|cmd| !cmd.is_delete() && request::refname_ok(&cmd.name, false))
+      .map(|cmd| cmd.name.as_slice()),
+  );
+  non_deleted.sort_unstable();
+  let mut deleted = charged_vec::<&[u8]>(commands.len(), admission)?;
+  deleted.extend(
+    commands
+      .iter()
+      .filter(|cmd| {
+        cmd.is_delete()
+          && request::refname_ok(&cmd.name, true)
+          && non_deleted.binary_search(&cmd.name.as_slice()).is_err()
+      })
+      .map(|cmd| cmd.name.as_slice()),
+  );
+  Ok(deleted)
+}
+
+/// Checks an atomic batch's proposed post-batch ref set (existing refs minus deleted refs plus
+/// created/updated refs) for D/F conflicts.
+fn atomic_df_conflict<J: Judge + ?Sized>(
+  commands: &[Command],
+  judge: &J,
+  admission: &mut Admission,
+) -> Result<Option<(usize, Vec<u8>)>, Refusal> {
+  if let Some(conflict) = intra_batch_df_conflict(commands, admission)? {
+    return Ok(Some(conflict));
+  }
+  let deleted = atomic_deleted_refs(commands, admission)?;
+  for (at, command) in commands.iter().enumerate() {
+    if !command.is_delete()
+      && request::refname_ok(&command.name, false)
+      && let Some(existing) = judge.ref_conflict(&command.name, &deleted)
+    {
+      return Ok(Some((at, existing)));
+    }
+  }
+  Ok(None)
+}
+
+/// Finds a D/F conflict for `name` against `applied_refs` (command indices sorted by name).
+fn applied_df_conflict(
+  commands: &[Command],
+  applied_refs: &[usize],
+  name: &[u8],
+) -> Option<Vec<u8>> {
+  let name_of = |idx: usize| -> &[u8] {
+    commands
+      .get(idx)
+      .map_or(&[], |command| command.name.as_slice())
+  };
+  for (at, &byte) in name.iter().enumerate() {
+    if byte != b'/' {
+      continue;
+    }
+    let prefix = name.get(..at).unwrap_or_default();
+    if let Ok(found) = applied_refs.binary_search_by(|&idx| name_of(idx).cmp(prefix))
+      && let Some(&idx) = applied_refs.get(found)
+    {
+      return Some(name_of(idx).to_vec());
+    }
+  }
+  let pos = applied_refs.partition_point(|&idx| cmp_with_slash(name_of(idx), name).is_lt());
+  applied_refs
+    .get(pos)
+    .map(|&idx| name_of(idx))
+    .filter(|candidate| is_dir_prefix(name, candidate))
+    .map(ToOwned::to_owned)
+}
+
+/// Checks a non-atomic command against refs already applied in this push and existing repository
+/// refs (minus refs deleted earlier in this push).
+fn non_atomic_df_conflict<A, J: Judge + ?Sized>(
+  deciding: &Deciding<A>,
+  command: &Command,
+  judge: &J,
+  admission: &mut Admission,
+) -> Result<Option<Vec<u8>>, Refusal> {
+  if command.is_delete() || !request::refname_ok(&command.name, false) {
+    return Ok(None);
+  }
+  if let Some(existing) = applied_df_conflict(
+    &deciding.request.commands,
+    &deciding.applied_refs,
+    &command.name,
+  ) {
+    return Ok(Some(existing));
+  }
+  if deciding.applied_deleted.is_empty() {
+    return Ok(judge.ref_conflict(&command.name, &[]));
+  }
+  let before = admission.left();
+  let mut deleted = charged_vec::<&[u8]>(deciding.applied_deleted.len(), admission)?;
+  let hold = admission.held_since(before);
+  for &idx in &deciding.applied_deleted {
+    if let Some(cmd) = deciding.request.commands.get(idx) {
+      deleted.push(cmd.name.as_slice());
+    }
+  }
+  let conflict = judge.ref_conflict(&command.name, &deleted);
+  drop(deleted);
+  admission.release(hold);
+  Ok(conflict)
+}
+
+/// Updates `applied_refs` (kept sorted by ref name) and `applied_deleted` after command `at`
+/// applied in a non-atomic push.
+fn record_applied<A>(deciding: &mut Deciding<A>, at: usize) {
+  let Some(command) = deciding.request.commands.get(at) else {
+    return;
+  };
+  let name = command.name.as_slice();
+  let is_delete = command.is_delete();
+  let commands = &deciding.request.commands;
+  let name_of =
+    |idx: usize| -> &[u8] { commands.get(idx).map_or(&[], |entry| entry.name.as_slice()) };
+  if is_delete {
+    if let Ok(pos) = deciding
+      .applied_refs
+      .binary_search_by(|&idx| name_of(idx).cmp(name))
+    {
+      deciding.applied_refs.remove(pos);
+    }
+    deciding.applied_deleted.push(at);
+  } else {
+    deciding.applied_deleted.retain(|&idx| name_of(idx) != name);
+    if let Err(pos) = deciding
+      .applied_refs
+      .binary_search_by(|&idx| name_of(idx).cmp(name))
+    {
+      deciding.applied_refs.insert(pos, at);
+    }
+  }
+}
+
+/// Refusal for a non-delete `refs/heads/*` command targeting a non-commit object, matching stock
+/// Git's `refs.c` / `receive-pack.c` wording.
+fn non_commit_branch(command: &Command) -> Declined {
+  let mut hex = Vec::with_capacity(command.new.format().hex_len());
+  command.new.write_hex(&mut hex);
+  let line = [
+    b"cannot update ref '",
+    command.name.as_slice(),
+    b"': trying to write non-commit object ",
+    hex.as_slice(),
+    b" to branch '",
+    command.name.as_slice(),
+    b"'",
+  ]
+  .concat();
+  Declined {
+    reason: FAILED_TO_UPDATE.to_vec(),
+    hook: Vec::new(),
+    message: Some(message(&line)),
+  }
+}
+
+/// Refusal for a files-backend ref directory/file namespace conflict, matching stock Git's
+/// `refs.c` (`verify_refname_available`) wording.
+fn df_declined(name: &[u8], existing: &[u8]) -> Declined {
+  let line = [
+    b"cannot update ref '",
+    name,
+    b"': '",
+    existing,
+    b"' exists; cannot create '",
+    name,
+    b"'",
+  ]
+  .concat();
+  Declined {
+    reason: FAILED_TO_UPDATE.to_vec(),
+    hook: Vec::new(),
+    message: Some(message(&line)),
   }
 }
 
