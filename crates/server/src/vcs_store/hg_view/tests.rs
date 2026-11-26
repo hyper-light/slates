@@ -15,9 +15,6 @@ use crate::verbs::dispatch;
 
 /// Shape: room enough for the view of every fixture these tests import.
 const ROOM: u64 = 1 << 24;
-/// Shape: how long a test's history may run on its shard: far past a debug build's (seconds), so only one that never
-/// ends reaches it.
-const PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
 /// Shape: the changesets stock 7.2's `served` filter serves of the `states` repository (`fixtures/state/states-served.txt`,
 /// three lines): what its view serves once the import has landed its phase roots and bookmarks in the register (A-687).
 const STATES_SERVED: u32 = 3;
@@ -28,19 +25,6 @@ fn owner() -> Principal {
     host: slates_db::HostId(0),
     uid: 1234,
   }
-}
-
-/// `history` run as a task on the first shard of a daemon keeping a store, its landed packs kept resident: every store
-/// wait in it awaited, never the shard's thread held through one (`test_store::SHARD_BLOCKING_ALLOWED`).
-fn on_stored_shard<T: Send + 'static, F: std::future::Future<Output = T> + 'static>(
-  history: impl FnOnce() -> F + Clone + Send + 'static,
-) -> T {
-  let (store, daemon) = crate::test_store::audit_daemon_stored();
-  crate::test_store::keep_landed(&daemon);
-  let answer = crate::test_store::run_on_first(&daemon, history, PATIENCE);
-  daemon.stop();
-  drop(store);
-  answer
 }
 
 /// Creates repository `name` of `tool` as a client's request does, from a task on the shard (`test_store::created`): its
@@ -70,7 +54,7 @@ fn lent_count(state: &mut ShardState, id: RepositoryId, room: u64) -> Option<u32
 /// nothing past the room, counted as a view not made.
 #[test]
 fn t_a680_a_view_is_lent_from_the_store_or_not_at_all() {
-  on_stored_shard(|| async move {
+  crate::test_store::run_on_stored_shard(|| async move {
     let hg = created("hg", VcsTool::Mercurial).await;
     let git = created("git", VcsTool::Git).await;
     let while_importing = on(|state| {
@@ -120,7 +104,7 @@ fn bookmarks_of(state: &mut ShardState, id: RepositoryId) -> Vec<(Vec<u8>, slate
 /// bookmark at `one`'s node once created, gone once retired, and back at it once bound; `one` and `two` unmoved.
 #[test]
 fn a_branch_the_owner_creates_retires_and_binds_is_a_bookmark_by_the_same_name() {
-  on_stored_shard(|| async move {
+  crate::test_store::run_on_stored_shard(|| async move {
     let hg = created("hg", VcsTool::Mercurial).await;
     imported(2, ("hg", hg), STATES).await;
     on(|state| {
@@ -208,7 +192,7 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
       }
     }
   }
-  on_stored_shard(|| async move {
+  crate::test_store::run_on_stored_shard(|| async move {
     let hg = created("hg", VcsTool::Mercurial).await;
     let made = crate::repository::hg_push::tests::history_of(&[
       ("base", "a", b"a\n", None, "default"),
@@ -305,7 +289,7 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
 #[test]
 fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
   use slates_ipc::protocol::Refusal;
-  on_stored_shard(|| async move {
+  crate::test_store::run_on_stored_shard(|| async move {
     let hg = created("hg", VcsTool::Mercurial).await;
     let first = crate::repository::hg_push::tests::history_of(&[
       ("base", "a", b"a\n", None, "default"),
@@ -409,7 +393,7 @@ fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
 /// and the verb was refused (in the daemon, parked again, for ever).
 #[test]
 fn a_branch_from_a_tag_whose_heads_manifests_were_let_go_reads_them_once_and_is_made() {
-  on_stored_shard(|| async move {
+  crate::test_store::run_on_stored_shard(|| async move {
     let hg = created("hg", VcsTool::Mercurial).await;
     let first = crate::repository::hg_push::tests::history_of(&[
       ("base", "a", b"a\n", None, "default"),
@@ -500,7 +484,7 @@ fn streams_of(state: &mut ShardState, id: RepositoryId) -> (bool, bool) {
 /// whether it streams. Expect both to, either way.
 #[test]
 fn a_stream_clone_is_advertised_only_where_the_store_keeps_the_repositorys_logs() {
-  on_stored_shard(|| async move {
+  crate::test_store::run_on_stored_shard(|| async move {
     let imported_id = created("imported", VcsTool::Mercurial).await;
     imported(2, ("imported", imported_id), FILE_INDEX).await;
     let pushed_id = created("pushed", VcsTool::Mercurial).await;
@@ -555,7 +539,7 @@ impl slates_hg::render::StoreWants for AskedTexts {
 /// was pushed, then the read refused past its room: a whole a push keeps is its raw text, as the store makes it.
 #[test]
 fn the_store_makes_a_pushed_mercurial_text_whole() {
-  on_stored_shard(|| async move {
+  crate::test_store::run_on_stored_shard(|| async move {
     let hg = created("hg", VcsTool::Mercurial).await;
     let made = crate::repository::hg_push::tests::history_of(&[
       ("base", "a", b"a\n", None, "default"),
@@ -598,7 +582,7 @@ const LONG_TEXT_LINES: usize = 300;
 /// more than the step; as many requests as its slices. Red before: one request copying the whole text.
 #[test]
 fn a_text_past_a_step_is_copied_a_step_a_request() {
-  on_stored_shard(|| async move {
+  crate::test_store::run_on_stored_shard(|| async move {
     let hg = created("hg", VcsTool::Mercurial).await;
     let long: &'static [u8] = Box::leak(
       (0..LONG_TEXT_LINES)
@@ -641,7 +625,7 @@ fn a_text_past_a_step_is_copied_a_step_a_request() {
 /// request copying the whole text.
 #[test]
 fn a_replays_ask_past_a_step_is_copied_a_step_a_request() {
-  on_stored_shard(|| async move {
+  crate::test_store::run_on_stored_shard(|| async move {
     let hg = created("hg", VcsTool::Mercurial).await;
     let long: &'static [u8] = Box::leak(
       (0..LONG_TEXT_LINES)
@@ -896,7 +880,7 @@ async fn cloned_changegroup(id: RepositoryId) -> slates_hg::push::ChangegroupPar
 #[test]
 fn every_text_both_writers_keep_is_made_whole_by_the_store_in_every_format() {
   use crate::hg_base::tests::{DOT, FILE_INDEX, HYBRID, LEGACY, V2};
-  on_stored_shard(|| async move {
+  crate::test_store::run_on_stored_shard(|| async move {
     let formats = [
       ("dot", DOT),
       ("hybrid", HYBRID),

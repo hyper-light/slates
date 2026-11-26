@@ -10435,21 +10435,35 @@ mod tests {
   /// The `states` repository imported into a Mercurial repository a unit a turn and landed, as segment changesets
   /// whose records hold its rows by identity (A-767 C1 step 3), the register naming the import's run: the repository
   /// and its index's rows.
-  fn a729_imported_and_landed(
+  async fn a729_imported_and_landed() -> (
+    slates_db::catalog::RepositoryId,
+    crate::vcs_store::hg_import::tests::Rows,
+  ) {
+    use crate::repository::svn_commit::tests::on;
+    use crate::vcs_store::hg_import::tests::{created, directory, to_its_end};
+    let id = created("hg", slates_ipc::protocol::VcsTool::Mercurial).await;
+    on(|state| {
+      let laid = directory(crate::hg_base::tests::STATES.iter().copied());
+      assert_eq!(crate::vcs_store::hg_import::begin(state, id, laid), Ok(()));
+      assert!(to_its_end(state, id).1.is_ok(), "imported");
+    });
+    assert_eq!(
+      crate::vcs_store::hg_import::land_imported_awaited(id).await,
+      Ok(())
+    );
+    on(|state| a729_landed(state, id))
+  }
+
+  /// [`a729_imported_and_landed`]'s landing as the test reads it: segment changesets landed, the register naming the
+  /// import's run once; the repository and its index's rows.
+  fn a729_landed(
     state: &mut crate::state::ShardState,
+    id: slates_db::catalog::RepositoryId,
   ) -> (
     slates_db::catalog::RepositoryId,
     crate::vcs_store::hg_import::tests::Rows,
   ) {
-    use crate::vcs_store::hg_import::tests::{created, directory, rows_of, to_its_end};
-    let id = created(state, "hg", slates_ipc::protocol::VcsTool::Mercurial);
-    let laid = directory(crate::hg_base::tests::STATES.iter().copied());
-    assert_eq!(crate::vcs_store::hg_import::begin(state, id, laid), Ok(()));
-    assert!(to_its_end(state, id).1.is_ok(), "imported");
-    assert_eq!(
-      crate::vcs_store::hg_import::land_imported(state, id),
-      Ok(())
-    );
+    use crate::vcs_store::hg_import::tests::rows_of;
     let segments = state
       .refusals
       .get(crate::vcs_store::hg_import::SEGMENTS_LANDED)
@@ -10497,8 +10511,11 @@ mod tests {
     };
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
-    let shard = first.shards.first().copied();
-    let (id, before) = first.observe(shard, a729_imported_and_landed).unwrap();
+    let (id, before) = crate::test_store::run_on_first(
+      &first,
+      || a729_imported_and_landed(),
+      std::time::Duration::from_secs(60),
+    );
     first.publish_every_shard().unwrap();
     first.stop();
     let second = super::Daemon::start(&profile, config, source()).unwrap();

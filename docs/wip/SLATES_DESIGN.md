@@ -32181,7 +32181,9 @@ shard routed, stopped after them).
   each behind `poll` for `POLLOUT` bounded by what is left of the beat (an interrupted wait or write taken again), and
   then exits: no thread is started for it. Red where it is deterministic:
   `a_lone_daemons_wedged_shard_ends_it_with_its_verdict_when_no_thread_can_start` (Linux, new threads refused by
-  `RLIMIT_NPROC` from just after the wedge). Windows has no wait for a pipe's write side, so its arm keeps a writer
+  `RLIMIT_NPROC` from just after the wedge). Measured on CI run 45762765907 (diag-a305-nproc, ubuntu-latest and
+  ubuntu-24.04-arm, uid 1001, the limit bound on both): green at f582d50bf in 2.53 s and 2.71 s; red with 48e8f83a5's
+  `watchdog.rs`, "exited (exit status: 4) without the watchdog's end line", on both. Windows has no wait for a pipe's write side, so its arm keeps a writer
   thread bounded by the same beat.
 
 ### A-308 — The watchdog judges a wedge only over a window it watched (2026-11-18, goal g251: every open slates bug fixed)
