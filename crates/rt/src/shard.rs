@@ -383,6 +383,8 @@ pub struct ShardContext {
   idle_floor_ns: u64,
   /// The longest one idle spin may run, window and holds alike, while tracking (A-361).
   idle_ceiling_ns: u64,
+  /// The longest the step quantum may be, while tracking (A-928, [`crate::runtime::WakeTracking::quantum_ceiling_ns`]).
+  quantum_ceiling_ns: u64,
   /// The configured step budget and idle spin, the quantum and the spin when not tracking.
   fixed_quantum_ns: u64,
   /// The most a paced step runs while no one waits ([`ShardContext::step_ceiling_ns`], A-783): none set, a quantum.
@@ -601,6 +603,11 @@ impl ShardContext {
         .wake_tracking
         .map_or(crate::runtime::NO_IDLE_CEILING_NS, |tracking| {
           tracking.idle_ceiling_ns
+        }),
+      quantum_ceiling_ns: config
+        .wake_tracking
+        .map_or(crate::runtime::NO_QUANTUM_CEILING_NS, |tracking| {
+          tracking.quantum_ceiling_ns
         }),
       fixed_quantum_ns: config.step_budget_ns,
       step_ceiling_ns: Cell::new(None),
@@ -1791,14 +1798,11 @@ impl ShardContext {
   }
 
   /// The step quantum now (§4.3, "a step longer than a peer's wake starves the shard"): the online wake
-  /// estimate while the shard tracks one, else the configured step budget. What the I/O harvest cadence,
-  /// the long-step count and the daemon's cooperative slices ([`crate::futures::step_budget_ns`]) read.
+  /// estimate while the shard tracks one, at most its quantum ceiling (A-928: a wake learned under load passes
+  /// the bar a step is held to), else the configured step budget. What the I/O harvest cadence, the long-step count
+  /// and the daemon's cooperative slices ([`crate::futures::step_budget_ns`]) read.
   pub fn quantum_ns(&self) -> u64 {
-    self
-      .wake
-      .get()
-      .map_or(self.fixed_quantum_ns, |estimate| estimate.mean_ns())
-      .max(1)
+    self.wake_cost_ns().min(self.quantum_ceiling_ns).max(1)
   }
 
   /// The idle spin window now, while the shard tracks an estimate: the online wake estimate times the configured
@@ -1820,9 +1824,14 @@ impl ShardContext {
     })
   }
 
-  /// The online wake estimate now, nanoseconds (the configured step budget when not tracking).
+  /// The online wake estimate now, nanoseconds (the configured step budget when not tracking): what a wake costs,
+  /// never bent by the quantum's ceiling.
   pub fn wake_cost_ns(&self) -> u64 {
-    self.quantum_ns()
+    self
+      .wake
+      .get()
+      .map_or(self.fixed_quantum_ns, |estimate| estimate.mean_ns())
+      .max(1)
   }
 
   /// Folds a park's measured wake into the online estimate (§4.3): the kick-to-running latency of a park

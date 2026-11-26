@@ -45,6 +45,9 @@ struct Reaching {
   releasing: Option<Box<(Resolved, Deciding)>>,
   units: Vec<position::Unit>,
   at: usize,
+  /// The next effect of unit `at` to map, an effect a unit of the walk (A-920 3k): one unit can hold most of a work's
+  /// effects (its copies' is one unit whole), and mapped whole it was the reach's step.
+  effect_at: usize,
   windows: Vec<crate::ConflictWindow>,
   applied: Vec<crate::chain_entry::Applied>,
 }
@@ -194,12 +197,20 @@ impl Green {
           return None;
         };
         let (resolved, cursor, units) = *decided;
+        let units = units.into_units().0;
+        // Sized once at every unit's effects, as a held verdict's are ([`Green::hold_begin`]): grown, it copied itself
+        // whole at each doubling.
+        let effects = units
+          .iter()
+          .map(|unit| unit.effects.len())
+          .fold(0usize, usize::saturating_add);
         computing.phase = ComputePhase::Reaching(Box::new(Reaching {
           releasing: Some(Box::new((resolved, cursor))),
-          units: units.into_units().0,
+          units,
           at: 0,
+          effect_at: 0,
           windows: Vec::new(),
-          applied: Vec::new(),
+          applied: Vec::with_capacity(effects),
         }));
         None
       }
@@ -219,9 +230,26 @@ impl Green {
           return None;
         }
         reaching.releasing = None;
+        // `Reached::reach_unit`, an effect at a time: each unit's windows as it is begun, and while none is held, what
+        // the chain records of each of its effects.
         while let Some(unit) = reaching.units.get(reaching.at) {
-          Reached::reach_unit(unit, (&mut reaching.windows, &mut reaching.applied));
+          if reaching.effect_at == 0 {
+            reaching.windows.extend(unit.windows.iter().cloned());
+            if !reaching.windows.is_empty() {
+              reaching.applied.clear();
+            }
+          }
+          if reaching.windows.is_empty() {
+            while let Some(effect) = unit.effects.get(reaching.effect_at) {
+              reaching.applied.push(effect.applied());
+              reaching.effect_at = reaching.effect_at.saturating_add(1);
+              if spent() {
+                return None;
+              }
+            }
+          }
           reaching.at = reaching.at.saturating_add(1);
+          reaching.effect_at = 0;
           if reaching.at < reaching.units.len() && spent() {
             return None;
           }
@@ -237,6 +265,7 @@ impl Green {
             releasing: None,
             units: Vec::new(),
             at: 0,
+            effect_at: 0,
             windows: Vec::new(),
             applied: Vec::new(),
           },

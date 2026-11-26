@@ -915,21 +915,25 @@ impl Drop for Owner {
 
 /// Joins `child` ([`join_spawner`]) on a thread of its own, never the shard's: the join may wait a liveness window, and
 /// then the kill's `wait`, on a spawner the machine has not yet run (main 01a20182's 8a loop at 523c522c2: a test's
-/// shard wedged just past its window in the join). Joined here only where no thread can be made.
+/// shard wedged just past its window in the join). The thread is made first and handed the child after, over a
+/// channel, so the child is never lost to a thread that could not be made: it is joined here then, as it is where the
+/// thread has gone before it could be sent.
 fn join_off_the_shard(child: SpawnedChild) {
-  let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
-  let theirs = std::sync::Arc::clone(&slot);
+  let (hand, handed) = std::sync::mpsc::channel::<SpawnedChild>();
   let joiner = std::thread::Builder::new()
     .name("spawner-join".to_owned())
     .spawn(move || {
-      if let Some(child) = theirs.lock().ok().and_then(|mut held| held.take()) {
+      if let Ok(child) = handed.recv() {
         join_spawner(child);
       }
     });
-  if joiner.is_err()
-    && let Some(child) = slot.lock().ok().and_then(|mut held| held.take())
-  {
-    join_spawner(child);
+  match joiner {
+    Ok(_) => {
+      if let Err(unsent) = hand.send(child) {
+        join_spawner(unsent.0);
+      }
+    }
+    Err(_) => join_spawner(child),
   }
 }
 

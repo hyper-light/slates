@@ -611,6 +611,13 @@
 > deterministic in `crates/rt/tests/spin_kick.rs` (3 of 3 hung, shard parked), green 3 of 3
 > (`docs/bugs/2026-11-20-a-shards-idle-spin-took-a-clients-kick.md`).
 
+> **Held (A-928, w-svn, 2026-11-25; goal 93, 84a): a shard's step quantum stays under half the loaded bar.** The
+> quantum is the shard's wake estimate, and load grew it: A-920's release probe 5 read it at about 1.05 ms at load 38-56,
+> so every step that filled it passed 1 ms. It is now held to `STEP_QUANTUM_CEILING` (bar / 2, 500 µs), since a step is
+> at most its quantum and the unit begun before its check. That premise, a unit within a quantum, did not hold for the
+> import judge's first unit (`Green::decide_first`: 557 µs median, past 1 ms in 39 of probe 5's steps). A-920 3j now
+> walks it a content path a step. Owed: main's macOS 84a round, release probe 6 with each step's quantum, and the loaded long-step counts.
+
 > **Open (84a, g222, 2026-11-20): where a loaded edit and merge's tail waits — a 1 ms band on macOS and on Linux.**
 > A diagnostic (branches `diag-g222-hops*`, never main) stamped every request from its landing in the ring (A-559) to
 > its shard taking it and to its reply: under two spinners a CPU the daemon's part is the queue, not the service
@@ -1167,12 +1174,12 @@
 >     (`git_push/tests.rs` 23, `vcs_share/tests.rs` 9, `vcs_share/wait.rs` 2, `vcs_store/tests.rs` 2, `replica.rs` 1,
 >     `named_objects.rs` 1) and `test_store::audit_on_stored_shard_made_all`, any tool's (`upload/tests.rs` 12,
 >     `git_hooks/tests.rs` 2).
->   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 21 tests. hg 4
->     (`vcs_ssh` 4); other 17 (`daemon::tests` 5, `repository::push` 5,
->     `vcs_share` 3, `repository::import` 2, `identities` 1, `repository::tests` 1). Counted by w-git (2026-11-25) by the
->     tests refused with its allowance taken away: `vcs_http::daemon_edge` and `vcs_store::upload` reach it no more, and
->     one `vcs_share` test's Mercurial creation (`hg_repository`, w-hg's) moved here from `audit_on_stored_shard` when
->     its git creation left the shard.
+>   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 18 tests. hg 4
+>     (`vcs_ssh` 4); other 14 (`daemon::tests` 5, `repository::push` 5, `repository::import` 2,
+>     `identities` 1, `repository::tests` 1). Counted by the tests refused with its allowance taken away (w-git,
+>     2026-11-25): `vcs_http::daemon_edge`, `vcs_store::upload` and `vcs_share` reach it no more, `vcs_share`'s three
+>     Mercurial creations made from the test's thread (`hg_on`, `test_store::create_on`), one inside
+>     `audit_on_stored_shard_made_all`; and `hg_made`'s 10 made from the test's thread (w-hg, `create_on`).
 >   - (`git_push::tests::carry_blocking`, 8 direct sites, and `git_push::tests::git_repository`, 41 sites: both emptied
 >     and removed by w-git, 2026-11-25. Every test that pushed through the synchronous driver (`answered`, `pushed`,
 >     `pushed_from_the_fixtures`, removed with it) pushes by awaiting: `git_push::tests::on_stored_shard_awaited` and its

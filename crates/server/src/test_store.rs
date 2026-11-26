@@ -471,8 +471,8 @@ pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   },
   Allowed {
     fixture: "test_store::create",
-    owner: "each caller's (GAPS: hg 4, other 17)",
-    reaching: 21,
+    owner: "each caller's (GAPS: hg 4, other 14)",
+    reaching: 18,
   },
   Allowed {
     fixture: "vcs_store::commits::home_and_land_blocking",

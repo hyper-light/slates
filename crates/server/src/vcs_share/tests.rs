@@ -395,31 +395,22 @@ fn t_a724_a_fetchs_answer_is_counted_and_learned_on_its_repositorys_usage_row() 
   assert_eq!(row, Some((1, Some(5_000))));
 }
 
-/// Makes Mercurial repository `name`, empty, on the shard: its id.
-fn hg_repository(state: &mut ShardState, name: &str) -> RepositoryId {
-  use slates_ipc::protocol::{ObjectFormat, RequestBody, VcsTool};
-  let reply = crate::test_store::create(
-    state,
+/// Mercurial repository `name` made on `daemon`'s first shard from the test's thread (`test_store::create_on`), its
+/// default line as a client's creation names it; the shard never held through the creation's commit.
+fn hg_on(daemon: &crate::Daemon, name: &str) -> RepositoryId {
+  let default = crate::repository::hg_push::line_name(b"default", 0);
+  crate::test_store::create_on(
+    daemon,
+    0,
     &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool: VcsTool::Mercurial,
-      format: ObjectFormat::Sha1,
-      default_branch: crate::repository::hg_push::line_name(b"default", 0),
-      green: None,
-    },
-  );
-  assert!(
-    matches!(reply, slates_ipc::protocol::ReplyBody::GreenCreated { .. }),
-    "{reply:?}"
-  );
-  state
-    .db
-    .partition()
-    .repositories()
-    .repository_named(name)
-    .expect("made")
-    .id
+    (
+      name,
+      slates_ipc::protocol::VcsTool::Mercurial,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      &default,
+    ),
+  )
+  .0
 }
 
 /// A-724 piece 3d for Mercurial (w-hg's leave, 2026-11-21). Do: make a Mercurial repository and hold its generation as a
@@ -427,21 +418,38 @@ fn hg_repository(state: &mut ShardState, name: &str) -> RepositoryId {
 /// once it is given back. Expect: while the fetch is in flight, the other's room divided with it; once it ends, alone.
 #[test]
 fn t_a724_a_mercurial_fetch_in_flight_is_a_claim_on_the_room() {
-  crate::git_push::tests::on_stored_shard_with(["toy"], |state, [toy]| {
-    let fetched = hg_repository(state, "fetched");
-    let mut held_room = slates_hg::Admission::new(u64::MAX);
-    let held = crate::vcs_store::hg_view::hold_in(state, fetched, &mut held_room).expect("held");
-    let divided = room(state, toy);
-    assert!(
-      matches!(divided.bound, Bound::Share { .. }),
-      "a Mercurial fetch in flight divides the room: {divided:?}"
-    );
-    drop(held);
-    assert!(matches!(
-      room(state, toy).bound,
-      Bound::Shard | Bound::Snapshot { .. }
-    ));
-  });
+  let default = crate::repository::hg_push::line_name(b"default", 0);
+  let asked = [
+    (
+      "fetched",
+      slates_ipc::protocol::VcsTool::Mercurial,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      default.as_str(),
+    ),
+    (
+      "toy",
+      slates_ipc::protocol::VcsTool::Git,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      "main",
+    ),
+  ];
+  crate::test_store::audit_on_stored_shard_made_all(
+    (&owner(), asked),
+    |state, [(fetched, _), (toy, _)]| {
+      let mut held_room = slates_hg::Admission::new(u64::MAX);
+      let held = crate::vcs_store::hg_view::hold_in(state, fetched, &mut held_room).expect("held");
+      let divided = room(state, toy);
+      assert!(
+        matches!(divided.bound, Bound::Share { .. }),
+        "a Mercurial fetch in flight divides the room: {divided:?}"
+      );
+      drop(held);
+      assert!(matches!(
+        room(state, toy).bound,
+        Bound::Shard | Bound::Snapshot { .. }
+      ));
+    },
+  );
 }
 
 /// A-724 piece 3d for Mercurial. Do: on a store-holding daemon, make a Mercurial repository; from a task on its shard,
@@ -452,7 +460,7 @@ fn t_a724_a_mercurial_fetch_in_flight_is_a_claim_on_the_room() {
 fn t_a724_a_mercurial_fetchs_answer_is_learned_and_a_lookups_hold_teaches_nothing() {
   use crate::vcs_http::hg::HgStores;
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let fetched = crate::daemon::observe_first(&daemon, |state| hg_repository(state, "fetched"));
+  let fetched = hg_on(&daemon, "fetched");
   let (sent, done) = std::sync::mpsc::sync_channel(1);
   crate::daemon::observe_first(&daemon, move |_| {
     let task = slates_rt::futures::spawn(async move {
@@ -499,7 +507,7 @@ fn t_a724_a_mercurial_push_past_its_share_is_refused_naming_the_share() {
     config.geometry.snapshot_bytes = 6_400;
   });
   let other = crate::git_push::tests::git_repository_on(&daemon, "other");
-  let pushed = crate::daemon::observe_first(&daemon, |state| hg_repository(state, "pushed"));
+  let pushed = hg_on(&daemon, "pushed");
   let (sent, outcome) = std::sync::mpsc::sync_channel(1);
   crate::daemon::observe_first(&daemon, move |_| {
     let task = slates_rt::futures::spawn(async move {
