@@ -64749,6 +64749,30 @@ GAPS.
   longest step is the history's (a staging step, 30-33 ms in debug), not the checkpoint task's (54 ms before). With the
   import's own longest poll at 14.9 ms, the add test's longest step is now the daemon's shard start
   (`daemon.rs:1274`'s `start_shard`, its sixth poll, 32.6 ms in debug), outside the import.
+  **Release probe 11** (main, at bdfcb33ff with 7c and 8a; 99 runs at load 43-58, then 99 with 12 burners at load
+  55-64, all rc 0; `~/.local/state/main-01a20182/rounds/svn-probe11/summary.txt`). The longest step's p50, p90 and p99
+  in ms, quiet then loaded:
+  - add: 1.59, 1.72, 2.31, then 1.60, 1.83, 2.09;
+  - copy: 2.87, 3.40, 4.11, then 2.83, 3.28, 4.02;
+  - move: 3.55, 4.16, 5.24, then 3.49, 4.11, 6.07.
+  The history's thread CPU is within 1-3% of its wall time. The longest step is almost always the history's own poll,
+  no longer the checkpoint task's on move.
+- **Piece 9, the staging's units on a copy and a move** (main's order after 8a: name the 29-33 ms staging step first).
+  Measured before any change (debug): on copy and on move it was the recording phase, `Recording::walk`'s row a unit.
+  An added or replaced directory's row (`svn_texts::held_by`) and a deleted or replaced one's (`released_by`) ran
+  `files_at` over the whole tree beneath it, 9,000 files in one unit: `After(0)` 21.6-30.6 ms, the move's `Before(1)`
+  21.4 ms. Move also had a build unit of 20.2 ms and commit steps of 4.9-12.1 ms, named next, before any change.
+  **9a, the walk a node a unit.** `svn_texts::FilesWalk` (`tree`, `file`) visits a node a unit: a file's text found, or
+  a directory's children put next in byte order. `files_at` and `file_at` run it to its end, and `held_walk` and
+  `released_walk` give a row's walk. The recording keeps a row's walk left part-way (`Recording::walking`) and takes it
+  up where it stopped. A directory's listing is still one unit, its children named at once by `Index::children`.
+  - Oracle: `a_moves_recording_walked_a_node_a_step_finds_the_texts_the_whole_walk_finds`. A move's rows walked a
+    node a step (`staging::walked_a_unit_a_step`) let go and hold the texts the whole walks do (`released_before`,
+    `held_after`), by path. Planted bug, red: a stop that ends its row.
+  - Gauge: `repository.svn_commit.recording_walk_most_files`, the most files one unit found, at most one in the copy
+    and move tests; red at 9,000 with a row a unit. Counter: `repository.svn_commit.recording_walk_units`.
+  - After 9a (debug), the copy test's longest step is 14.2 ms (30-33 before) and the move test's 23.4 ms, now its
+    build unit.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 

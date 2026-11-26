@@ -632,45 +632,86 @@ pub(crate) type SvnView<'a> = slates_svn::migration::WithTexts<'a, HeadTexts<'a>
 pub(crate) type FileText = (ContentIdentity, String);
 
 /// The files at and beneath `path` in `revision`, each with its text, appended to `out` in byte order; a file with no
-/// text (empty) is left out. A path the index cannot read adds nothing.
+/// text (empty) is left out. A path the index cannot read adds nothing. [`FilesWalk::tree`] run to its end.
 fn files_at(index: &Index, path: &str, revision: u64, out: &mut Vec<FileText>) {
-  let mut stack = vec![path.to_owned()];
-  while let Some(at) = stack.pop() {
-    let Ok(Some(node)) = index.node(&at, revision) else {
-      continue;
+  FilesWalk::tree(path, revision).run(index, out);
+}
+
+/// A walk of the files a path holds in a revision, a node a unit (A-920 9a: a copied or deleted tree's 9,000 files
+/// walked in one unit of a staging step, 21-31 ms, debug): [`files_at`]'s and [`file_at`]'s, resumable between units.
+#[derive(Debug)]
+pub(crate) struct FilesWalk {
+  /// The revision it reads.
+  revision: u64,
+  /// The paths left to visit, the next last.
+  stack: Vec<String>,
+  /// Whether a directory's children are walked: a tree's walk, not a single file's.
+  tree: bool,
+}
+
+impl FilesWalk {
+  /// The walk of the files at and beneath `path` in `revision`, in byte order ([`files_at`]).
+  pub(crate) fn tree(path: &str, revision: u64) -> FilesWalk {
+    FilesWalk {
+      revision,
+      stack: vec![path.to_owned()],
+      tree: true,
+    }
+  }
+
+  /// The walk of the file at `path` in `revision` alone ([`file_at`]): a directory there adds nothing.
+  pub(crate) fn file(path: &str, revision: u64) -> FilesWalk {
+    FilesWalk {
+      revision,
+      stack: vec![path.to_owned()],
+      tree: false,
+    }
+  }
+
+  /// One node of the walk: a file's text appended to `out` (none for an empty file or a path the index cannot read),
+  /// or a directory's children put next, in byte order. Whether the walk has ended.
+  pub(crate) fn step(&mut self, index: &Index, out: &mut Vec<FileText>) -> bool {
+    if let Some(at) = self.stack.pop()
+      && let Ok(Some(node)) = index.node(&at, self.revision)
+    {
+      match node.kind() {
+        NodeKind::File => {
+          if let Some(text) = node.text() {
+            out.push((text.identity, green_path(&at).to_owned()));
+          }
+        }
+        NodeKind::Directory if self.tree => self.stack_children(index, &at),
+        NodeKind::Directory => {}
+      }
+    }
+    self.stack.is_empty()
+  }
+
+  /// The walk run to its end.
+  fn run(mut self, index: &Index, out: &mut Vec<FileText>) {
+    while !self.step(index, out) {}
+  }
+
+  /// The children of the directory at `at` put next on the walk, the first in byte order last.
+  fn stack_children(&mut self, index: &Index, at: &str) {
+    let Ok(Some(mut names)) = index.children(at, self.revision) else {
+      return;
     };
-    match node.kind() {
-      NodeKind::File => {
-        if let Some(text) = node.text() {
-          out.push((text.identity, green_path(&at).to_owned()));
-        }
-      }
-      NodeKind::Directory => {
-        let Ok(Some(mut names)) = index.children(&at, revision) else {
-          continue;
-        };
-        names.sort_unstable_by(|left, right| right.cmp(left));
-        for name in names {
-          stack.push(if at == "/" {
-            format!("/{name}")
-          } else {
-            format!("{at}/{name}")
-          });
-        }
-      }
+    names.sort_unstable_by(|left, right| right.cmp(left));
+    for name in names {
+      self.stack.push(if at == "/" {
+        format!("/{name}")
+      } else {
+        format!("{at}/{name}")
+      });
     }
   }
 }
 
 /// The file at `path` in `revision` with its text, appended to `out`; a directory (whose property change changes no
-/// file beneath it), an empty file or a path the index cannot read adds nothing.
+/// file beneath it), an empty file or a path the index cannot read adds nothing. [`FilesWalk::file`] run.
 fn file_at(index: &Index, path: &str, revision: u64, out: &mut Vec<FileText>) {
-  if let Ok(Some(node)) = index.node(path, revision)
-    && node.kind() == NodeKind::File
-    && let Some(text) = node.text()
-  {
-    out.push((text.identity, green_path(path).to_owned()));
-  }
+  FilesWalk::file(path, revision).run(index, out);
 }
 
 /// A Subversion path's place in the green: without its leading `/`.
@@ -700,11 +741,18 @@ pub(crate) fn released_by(
   youngest: u64,
   released: &mut Vec<FileText>,
 ) {
-  let index = records.index();
+  if let Some(walk) = released_walk(change, youngest) {
+    walk.run(records.index(), released);
+  }
+}
+
+/// [`released_by`]'s walk of `change` at `youngest`, a node a unit (A-920 9a): every file at or beneath a deleted or
+/// replaced path, a modified file alone, none for an addition.
+pub(crate) fn released_walk(change: &ChangedPath, youngest: u64) -> Option<FilesWalk> {
   match change.action {
-    Action::Delete | Action::Replace => files_at(index, &change.path, youngest, released),
-    Action::Modify => file_at(index, &change.path, youngest, released),
-    Action::Add => {}
+    Action::Delete | Action::Replace => Some(FilesWalk::tree(&change.path, youngest)),
+    Action::Modify => Some(FilesWalk::file(&change.path, youngest)),
+    Action::Add => None,
   }
 }
 
@@ -730,11 +778,18 @@ pub(crate) fn held_by(
   revision: u64,
   held: &mut Vec<FileText>,
 ) {
-  let index = records.index();
+  if let Some(walk) = held_walk(change, revision) {
+    walk.run(records.index(), held);
+  }
+}
+
+/// [`held_by`]'s walk of `change` at `revision`, a node a unit (A-920 9a): every file at or beneath an added or
+/// replaced path, a modified file alone, none for a deletion.
+pub(crate) fn held_walk(change: &ChangedPath, revision: u64) -> Option<FilesWalk> {
   match change.action {
-    Action::Add | Action::Replace => files_at(index, &change.path, revision, held),
-    Action::Modify => file_at(index, &change.path, revision, held),
-    Action::Delete => {}
+    Action::Add | Action::Replace => Some(FilesWalk::tree(&change.path, revision)),
+    Action::Modify => Some(FilesWalk::file(&change.path, revision)),
+    Action::Delete => None,
   }
 }
 
