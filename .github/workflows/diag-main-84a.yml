@@ -1,0 +1,74 @@
+name: diag-main-84a
+# Run linux-1 (main 01a20182, 2026-11-26 03:40 PST): goal 84a's Linux legs at current main (add48743f) with the account
+# granted a real-time priority, the condition the round-robin arm takes the class under (crates/machine/src/round_robin.rs:
+# "grant or skip, never a privilege"; on main since 84a's Linux half). The runner's admin grants RLIMIT_RTPRIO to the
+# step's shell (sudo prlimit), as /etc/security/limits.conf grants it to an account on adacachy2; slates itself asks for
+# no privilege. First a control: one loaded invocation before the grant, whose shards must each log "runs time-share: no
+# round-robin real-time class" (the fair-class tick GitHub's runners showed on 2026-11-24). Then the grant, checked by
+# `ulimit -r`, and the recipe of run 1 (three loaded invocations with 2 spinners a core, then two quiet; 10 files; both
+# forms), each log's declined-shard lines counted (0 expected: every shard took the class). Each form's `goal` line
+# carries its verdict (p99 and p999 against 1 ms) and is an annotation here. Run only from diag-measurer-main-84a-*
+# branches, never main.
+on:
+  push:
+    branches: ["diag-measurer-main-84a-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  tails:
+    name: 84a tails (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Build the bench (release)
+        run: |
+          git log -1 --format='at %h %s' | cut -c1-120
+          cargo build --release --locked -p slates-client --example edit_merge_bench
+      - name: A control without the grant, then the grant, three loaded invocations and two quiet
+        run: |
+          set +e
+          L="$RUNNER_TEMP/84a"; mkdir -p "$L"
+          B=target/release/examples/edit_merge_bench
+          echo "cores: $(nproc); kernel: $(uname -r); rtprio soft before: $(ulimit -r); rttime: $(prlimit --pid $$ --rttime --output SOFT --noheadings)"
+          timeout 1500 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null > "$L/control-loaded.log" 2>&1
+          rc=$?
+          declined=$(grep -a -c 'runs time-share: no round-robin real-time class' "$L/control-loaded.log")
+          echo "::notice title=${{ matrix.os }} control loaded, no grant (exit $rc, declined shards $declined)::$(grep -a '^goal	merge\.' "$L/control-loaded.log" | cut -f2 | cut -c1-400 | tr '\n' ' ')"
+          grep -a '^goal	merge\.' "$L/control-loaded.log" | cut -c1-400
+          sudo prlimit --pid $$ --rtprio=99:99
+          echo "rtprio soft after the grant: $(ulimit -r); hard: $(ulimit -Hr)"
+          for n in 1 2 3; do
+            timeout 1500 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null > "$L/loaded-$n.log" 2>&1
+            rc=$?
+            declined=$(grep -a -c 'runs time-share: no round-robin real-time class' "$L/loaded-$n.log")
+            echo "::notice title=${{ matrix.os }} granted loaded $n (exit $rc, declined shards $declined)::$(grep -a '^goal	merge\.' "$L/loaded-$n.log" | cut -f2 | cut -c1-400 | tr '\n' ' ')"
+            grep -a '^goal	merge\.' "$L/loaded-$n.log" | cut -c1-400
+          done
+          for n in 1 2; do
+            timeout 1200 "$B" --quiet-only --files 10 --form accept --form conflict </dev/null > "$L/quiet-$n.log" 2>&1
+            rc=$?
+            declined=$(grep -a -c 'runs time-share: no round-robin real-time class' "$L/quiet-$n.log")
+            echo "::notice title=${{ matrix.os }} granted quiet $n (exit $rc, declined shards $declined)::$(grep -a '^goal	merge\.' "$L/quiet-$n.log" | cut -f2 | cut -c1-400 | tr '\n' ' ')"
+            grep -a '^goal	merge\.' "$L/quiet-$n.log" | cut -c1-400
+          done
+          exit 0
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: main-84a-${{ matrix.os }}
+          path: ${{ runner.temp }}/84a
+          if-no-files-found: warn
