@@ -1766,7 +1766,13 @@ fn name_runs(increment: &mut Increment, mut named: Vec<(usize, crate::named::Ide
   };
   let old = core::mem::take(&mut increment.post_state);
   let mut inline = Vec::with_capacity(old.len());
-  let mut buffers = Vec::with_capacity(kept.len());
+  // The runs' bytes in one buffer, sized at their total (A-920 3n: never a buffer a run, each let go at its commit).
+  let runs_bytes = kept
+    .iter()
+    .map(|(_, _, start, end)| usize::try_from(end.saturating_sub(*start)).unwrap_or(0))
+    .fold(0usize, usize::saturating_add);
+  let mut buffer = Vec::with_capacity(runs_bytes);
+  let mut lens = Vec::with_capacity(kept.len());
   let mut at = 0usize;
   for (_, _, start, end) in &kept {
     let (start, end) = (
@@ -1774,7 +1780,9 @@ fn name_runs(increment: &mut Increment, mut named: Vec<(usize, crate::named::Ide
       usize::try_from(*end).unwrap_or(usize::MAX),
     );
     inline.extend_from_slice(old.get(at..start).unwrap_or_default());
-    buffers.push(old.get(start..end).unwrap_or_default().to_vec());
+    let run = old.get(start..end).unwrap_or_default();
+    buffer.extend_from_slice(run);
+    lens.push(run.len());
     at = end;
   }
   inline.extend_from_slice(old.get(at..).unwrap_or_default());
@@ -1796,7 +1804,7 @@ fn name_runs(increment: &mut Increment, mut named: Vec<(usize, crate::named::Ide
       op.src = src;
     }
   }
-  increment.named.read.0 = buffers;
+  increment.named.read = crate::named::Read::whole(buffer, lens);
   to_u64(kept.len())
 }
 

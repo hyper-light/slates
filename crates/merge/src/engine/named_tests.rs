@@ -281,15 +281,68 @@ fn a_named_texts_file_is_its_name_alone() {
     super::Judgment::Accepted(judged) => judged,
     other => panic!("not accepted: {other:?}"),
   };
-  assert!(
-    work.post().runs.iter().all(Vec::is_empty),
-    "the work kept its bytes"
-  );
+  assert!(work.post().runs.is_empty(), "the work kept its bytes");
   assert_eq!(
     green.commit_judged(judged).map(|(version, _)| version),
     Ok(1)
   );
   holds_its_name_alone(&mut green, (object, &plane), &bytes);
+}
+
+/// A-920 3n (a work's named texts read into one buffer, and a file named for its text given no bytes). Do: name eight
+/// texts of 1 KiB a work creates, each its own file, read them, judge the work with `judge_named` and commit the verdict.
+/// Expect: accepted as version 1; every file its text's name alone, each text's bytes the plane's; and no byte buffer
+/// let go for a named file at the commit (`Green::named_buffers_freed`: each had been a text's own buffer, one freed a
+/// commit unit, and the free that emptied the allocator's region cost a unit about 1 ms of the kernel's time).
+#[test]
+fn a_works_named_texts_commit_with_no_buffer_of_their_own_let_go() {
+  const TEXTS: usize = 8;
+  const TEXT: usize = 1024;
+  let mut plane = Plane::default();
+  let texts: Vec<Vec<u8>> = (0..TEXTS)
+    .map(|text| {
+      (0..TEXT)
+        .map(|at| u8::try_from((at + text) % 241).unwrap())
+        .collect()
+    })
+    .collect();
+  let files: Vec<(String, Identity)> = texts
+    .iter()
+    .enumerate()
+    .map(|(at, bytes)| (format!("f{at}"), plane.put(bytes.clone())))
+    .collect();
+  let mut work = named_creates(&files);
+  while !work.read_step(&plane, 1 << 12).unwrap() {}
+  let mut green = Green::new();
+  assert!(green.track_name_holds().is_empty());
+  let judged = match green.judge_named(&mut work) {
+    super::Judgment::Accepted(judged) => judged,
+    other => panic!("not accepted: {other:?}"),
+  };
+  assert_eq!(
+    green.commit_judged(judged).map(|(version, _)| version),
+    Ok(1)
+  );
+  for ((path, object), bytes) in files.iter().zip(&texts) {
+    assert_eq!(
+      green.content(path),
+      Some(super::Content::Named(*object)),
+      "{path} named for its text"
+    );
+    assert_eq!(
+      read_through(&mut green, path, &plane).as_deref(),
+      Some(bytes.as_slice()),
+      "{path}'s bytes"
+    );
+  }
+  assert_eq!(
+    green.named_buffers_freed(),
+    0,
+    "buffers let go for named files"
+  );
+  // Its holds taken and given back, as an owner drains them, so no tracked green is dropped holding one.
+  assert_eq!(green.take_name_holds().len(), TEXTS);
+  assert_eq!(green.give_back_name_holds().len(), TEXTS);
 }
 
 /// A-920 piece 3c (a verdict computed a slice at a time reads what it read whole). Do: commit a named work creating
