@@ -910,3 +910,92 @@ fn a_work_over_manifests_not_at_hand_asks_for_each_and_lays_out_again() {
   };
   assert_eq!(built.unwrap(), whole);
 }
+
+/// The clock a test's owed build is paced by: none, so a turn holds the whole of its deadline's quantum.
+fn no_clock() -> u64 {
+  0
+}
+
+/// `green` owes the push moving it from `base` (its version and head changeset) to `head` (P2), its trees named by their
+/// changesets (`tree::changeset_tree`), then is materialized as the server materializes a line: both changesets laid out
+/// over `revisions` (`Layout::lay_out_owed`), the green's own owed build advanced over them as the materializer lends them
+/// (`Layout::lend`) and the
+/// work committed (`Green::materialize`). The work it committed.
+fn materialized(
+  green: &mut Green,
+  base: Option<(u64, &Node)>,
+  head: &Node,
+  revisions: (&Verified, &Kept),
+) -> slates_merge::Increment {
+  let push = slates_merge::push::Push {
+    name: NAME,
+    base_version: base.map_or(0, |(version, _)| version),
+    base_tree: base.and_then(|(_, node)| tree::changeset_tree(node)),
+    tree: tree::changeset_tree(head).unwrap(),
+    head: Some(head.as_slice()),
+  };
+  let owed = slates_merge::push::DeferredPush::of(&push);
+  assert_eq!(green.defer(owed), Some(push.base_version + 1));
+  let mut layout = tree::Layout::default();
+  if let Some((_, node)) = base {
+    layout.lay_out_owed(node, revisions, &mut room()).unwrap();
+  }
+  layout.lay_out_owed(head, revisions, &mut room()).unwrap();
+  assert!(layout.laid_out(head));
+  let mut building = green
+    .materializing(slates_merge::pace::Pace::new(no_clock), WORK_ROOM)
+    .unwrap();
+  let built = loop {
+    building.pace().turn(u64::MAX);
+    let mut advanced = None;
+    layout.lend(revisions, &mut |objects| {
+      advanced = building.advance(green, objects)
+    });
+    if let Some(built) = advanced {
+      break built.unwrap();
+    }
+  };
+  assert_eq!(green.materialize(&built.increment).map(|_| ()), Ok(()));
+  built.increment
+}
+
+/// Whether two works are the same bytes: their identity, base, document and post-state.
+fn same_work(owed: &slates_merge::Increment, eager: &slates_merge::Increment) -> bool {
+  owed.id == eager.id
+    && owed.base == eager.base
+    && owed.doc.encode() == eager.doc.encode()
+    && owed.post_state == eager.post_state
+}
+
+/// P2 for Mercurial (main's ruling (A) of 2026-11-26, the many-heads push's (2) and (3)): a line's push owed rather
+/// than built when it lands, its trees named by their changesets. Do: for each of stock 7.2's heads (`default`'s revision
+/// 7, `stable`'s 2), owe an empty green the line's push and materialize it (`materialized`); make the same work eagerly
+/// (`tree::work`) on another empty green. Then on two greens holding revision 1, owe one the move to revision 3 and
+/// materialize it, and make the other's eagerly. Expect: each owed work the eager one byte for byte (its identity,
+/// base, document and post-state), each green holding what `hg cat` recorded, and both greens' identities alike.
+#[test]
+fn a_lines_owed_push_materialized_is_the_eager_work_byte_for_byte() {
+  let verified = verify::verify(&stock_part(Version::V03), &Kept::default(), &mut room()).unwrap();
+  let revisions = (&verified, &Kept::default());
+  for rev in [7, 2] {
+    let (mut owed, mut eager) = (Green::new(), Green::new());
+    let made = materialized(&mut owed, None, &log_node(rev), revisions);
+    let built = land(&mut eager, None, &log_node(rev), revisions);
+    assert!(same_work(&made, &built.increment), "revision {rev}");
+    holds_checkout(&owed, rev);
+    assert_eq!(
+      owed.head_identity(),
+      eager.head_identity(),
+      "revision {rev}"
+    );
+  }
+  let (mut owed, mut eager) = (Green::new(), Green::new());
+  land(&mut owed, None, &log_node(1), revisions);
+  land(&mut eager, None, &log_node(1), revisions);
+  let base = (owed.head(), &log_node(1));
+  let made = materialized(&mut owed, Some(base), &log_node(3), revisions);
+  let built = land(&mut eager, Some(base), &log_node(3), revisions);
+  assert!(same_work(&made, &built.increment), "the move from 1 to 3");
+  holds_checkout(&owed, 3);
+  assert_eq!(owed.head_identity(), eager.head_identity());
+}

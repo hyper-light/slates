@@ -208,7 +208,9 @@ fn turn(state: &mut ShardState, green: ObjectId) -> Turned {
       .replicas
       .lend(&crate::merge_service::replica_key(green))?;
     let mut turned = None;
-    crate::vcs_store::with_owed_push_objects(state, Some(repository), &mut |objects| {
+    // No Mercurial layout on a holder yet: an owed Mercurial line's replica is refused here, counted (GAPS, P2 for
+    // Mercurial's holders).
+    crate::vcs_store::with_owed_push_objects(state, (Some(repository), None), &mut |objects| {
       turned = Some(building.advance(&replica, objects));
     });
     turned

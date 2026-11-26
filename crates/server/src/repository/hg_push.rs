@@ -559,7 +559,7 @@ pub(crate) fn prepare<V: Repository>(
     CheckRefusal::View(_) => abort(VIEW_REFUSED.to_vec()),
   })?;
   let read = Read::of(state, repository, unbundle);
-  let (publishing, ..) = terms;
+  let (publishing, name, _) = terms;
   let plan = classify::classify(
     unbundle,
     (brought, held_changesets),
@@ -569,7 +569,7 @@ pub(crate) fn prepare<V: Repository>(
     admission,
   )
   .map_err(|refused| refused.refused())?;
-  let changes = changes((&plan, &read), works)?;
+  let changes = changes((&plan, &read), (name, works))?;
   let parts = entry_parts(unbundle, &plan, &read);
   Ok(Prepared {
     changes,
@@ -681,10 +681,11 @@ fn work((named, head): (&Named, &Node), works: &mut Works<'_>) -> Result<Increme
   }
 }
 
-/// The branches the plan changes, as A-635's append takes them.
+/// The branches the plan changes, as A-635's append takes them: each moved line's work, and each new line owing its push
+/// ([`owed_line`]), so no new line's work is built before its green is first reached.
 fn changes(
   (plan, read): (&Plan, &Read),
-  works: &mut Works<'_>,
+  (name, works): ([u8; 32], &mut Works<'_>),
 ) -> Result<Vec<BranchChange>, Box<Refused>> {
   let mut changes = Vec::new();
   for moved in &plan.lines {
@@ -707,17 +708,48 @@ fn changes(
   }
   for made in &plan.created {
     let base = read.line(made.base)?;
-    changes.push(BranchChange::Create {
+    changes.push(BranchChange::CreateDeferred {
       name: line_name(&made.branch, made.number),
       from: base.green,
       version: base.version,
-      work: Some(work((base, &made.head), works)?),
+      push: owed_line(name, base, &made.head)?,
     });
   }
   for moved in &plan.bookmarks {
     changes.push(mark_change((moved, read), works)?);
   }
   Ok(changes)
+}
+
+/// The push a new line owes from `base`, the line it is made from as the push read it, to changeset `head` (P2 for
+/// Mercurial, main's ruling (A) of 2026-11-26; the many-heads push's (2) and (3)): based at the new green's version 0,
+/// which holds `base`'s version, its trees named by their changesets (`slates_hg::push::tree::changeset_tree`), its head
+/// the changeset. Its work is built, a unit a turn, only when the green is first reached (`crate::green_ready`), over the
+/// trees laid out then: the work its eager create would have made, the same builder over the same trees, though the
+/// work's identity hashes its base (0 here; the eager create hashed `base`'s version and was rebased to 0). Before, every
+/// new line's work was built ahead of the landing and committed in it, its whole tree when its base was empty (a fresh
+/// history's every line), and its chain entry carried that tree into the landing's one record.
+fn owed_line(
+  name: [u8; 32],
+  base: &Named,
+  head: &Node,
+) -> Result<slates_merge::push::DeferredPush, Box<Refused>> {
+  let tree =
+    slates_hg::push::tree::changeset_tree(head).ok_or_else(|| abort(NOT_AVAILABLE.to_vec()))?;
+  let base_tree = base
+    .head
+    .filter(|node| *node != slates_hg::NULL_NODE)
+    .as_ref()
+    .and_then(slates_hg::push::tree::changeset_tree);
+  Ok(slates_merge::push::DeferredPush::of(
+    &slates_merge::push::Push {
+      name,
+      base_version: 0,
+      base_tree,
+      tree,
+      head: Some(head.as_slice()),
+    },
+  ))
 }
 
 /// One bookmark's change as A-635's append takes it: a move on its own green, a green made from a line's version (no
@@ -1565,13 +1597,15 @@ async fn landed_after_builds(
 ) -> Option<PushOutcome> {
   let mut last_plan: Option<Vec<WorkKey>> = None;
   let mut committing = Committing::default();
+  // The lines owing their pushes this push moves, made through the door and held until it ends (P2).
+  let mut pinned = crate::green_ready::Pinned::default();
   loop {
     let held = fresh_works_held_ahead(
       repository,
       (principal, name),
       unbundle,
       (&mut committing, &mut forked),
-      room,
+      (room, &mut pinned),
     )
     .await?;
     let (plan, (mut built, named), ahead) = match held {
@@ -1810,7 +1844,7 @@ async fn fresh_works_held_ahead(
   (principal, name): (&Principal, [u8; 32]),
   unbundle: &Unbundle,
   (committing, forked): (&mut Committing, &mut Option<Forked>),
-  room: &Admission,
+  (room, pinned): (&Admission, &mut crate::green_ready::Pinned),
 ) -> Option<Result<(Vec<WorkKey>, BuiltWorks, Vec<crate::held_ahead::HeldAhead>), PushOutcome>> {
   if let Err(outcome) = committing.fresh(repository, forked).await? {
     return Some(Err(outcome));
@@ -1820,7 +1854,7 @@ async fn fresh_works_held_ahead(
     (principal, name),
     unbundle,
     forked.as_ref(),
-    room,
+    (room, pinned),
   )
   .await
 }
@@ -1834,13 +1868,20 @@ async fn works_held_ahead(
   (principal, name): (&Principal, [u8; 32]),
   unbundle: &Unbundle,
   forked: Option<&Forked>,
-  room: &Admission,
+  (room, pinned): (&Admission, &mut crate::green_ready::Pinned),
 ) -> Option<Result<(Vec<WorkKey>, BuiltWorks, Vec<crate::held_ahead::HeldAhead>), PushOutcome>> {
-  let (plan, built) =
-    match built_works(repository, (principal, name), unbundle, forked, room).await? {
-      Ok(planned) => planned,
-      Err(outcome) => return Some(Err(outcome)),
-    };
+  let (plan, built) = match built_works(
+    repository,
+    (principal, name),
+    unbundle,
+    forked,
+    (room, pinned),
+  )
+  .await?
+  {
+    Ok(planned) => planned,
+    Err(outcome) => return Some(Err(outcome)),
+  };
   let Ok(ahead) = held_ahead_waiting(repository, &built.0).await? else {
     return Some(Err(PushOutcome::refused(&abort(UNHELD.to_vec()))));
   };
@@ -1903,7 +1944,7 @@ async fn built_works(
   (principal, name): (&Principal, [u8; 32]),
   unbundle: &Unbundle,
   forked: Option<&Forked>,
-  room: &Admission,
+  (room, pinned): (&Admission, &mut crate::green_ready::Pinned),
 ) -> Option<Result<(Vec<WorkKey>, BuiltWorks), PushOutcome>> {
   // A-740: a shard stuck in a work's turn names it.
   let _doing = slates_rt::futures::doing("hg_push::works");
@@ -1924,6 +1965,14 @@ async fn built_works(
   .flatten()?;
   if let Err(outcome) = planned {
     return Some(Err(outcome));
+  }
+  // Each line the push moves that owes its push (P2: a line an earlier push made) is made through the door first, as a
+  // command reaches any green, and held made until the push ends: its work is built on its content.
+  let moved: BTreeSet<DbVolumeId> = plan.iter().map(|(green, ..)| *green).collect();
+  for green in moved {
+    if !crate::green_ready::made_for(green, pinned).await? {
+      return Some(Err(PushOutcome::refused(&abort(NOT_AVAILABLE.to_vec()))));
+    }
   }
   let mut built = BTreeMap::new();
   let mut named: Vec<NamedRevision> = Vec::new();
@@ -2194,7 +2243,18 @@ fn brought_back(
   forked: Option<&Forked>,
   building: &mut tree::WorkBuild,
 ) -> Option<()> {
-  let (path, node, text) = building.take_given()?;
+  let given = building.take_given()?;
+  text_brought_back(state, (id, forked), given)
+}
+
+/// The text `given` for a file revision (its path, node and text), brought back into repository `id`'s content store
+/// by the identities the index names (`forked`'s, else the store's): [`brought_back`]'s, and a new line's owed build's
+/// at its materialization (`crate::green_ready`). None where the store refused it. Called outside any `lent_state`.
+pub(crate) fn text_brought_back(
+  state: &mut ShardState,
+  (id, forked): (RepositoryId, Option<&Forked>),
+  (path, node, text): (Vec<u8>, Node, Vec<u8>),
+) -> Option<()> {
   // Brought back within the room its bytes take, lent to the content store for the step.
   let lend = u64::try_from(text.len()).unwrap_or(u64::MAX);
   vcs_store::within_budget(state, lend, |stores| {
@@ -2513,6 +2573,75 @@ fn held_whole(
       slates_hg::push::held::file_text_held((index, content), (path, node))
     })
   })
+}
+
+/// The trees a new line's owed push reads, laid out for its materialization (P2 for Mercurial, main's ruling (A) of
+/// 2026-11-26; `crate::green_ready`): its base's changeset and its head's, as the push names them
+/// (`slates_hg::push::tree::changeset_tree`), a turn each over the repository's committed index, within its room now. A
+/// changeset's or manifest's text let go once landed is read whole from the node's changeset store and given in its
+/// object's place, then the layout made again, as a push's work's layout reads one ([`begun_work`]), each text once, at
+/// most [`LAYOUT_TEXTS`]. The layout, or slates' words for why not; none when the shard's state went away.
+pub(crate) async fn owed_layout(
+  repository: RepositoryId,
+  owed: &slates_merge::push::DeferredPush,
+) -> Option<Result<tree::Layout, Vec<u8>>> {
+  let push = owed.push();
+  let changesets: Vec<Node> = [push.base_tree, Some(push.tree)]
+    .into_iter()
+    .flatten()
+    .filter_map(|key| Node::try_from(key.as_bytes()).ok())
+    .collect();
+  let verified = Verified::default();
+  let mut layout = tree::Layout::default();
+  let mut given: Vec<(Node, Vec<u8>)> = Vec::new();
+  for changeset in &changesets {
+    loop {
+      let laid = crate::state::with_state(|state| {
+        let mut room = Admission::new(crate::vcs_share::room(state, repository).bytes);
+        let held = held_over(state, repository, None, &given)?;
+        Some(layout.lay_out_owed(changeset, (&verified, &held), &mut room))
+      })
+      .flatten()?;
+      match laid {
+        Ok(()) => break,
+        Err(tree::LayoutRefusal::NotAtHand { log, node })
+          if given.len() < LAYOUT_TEXTS && !given.iter().any(|(read, _)| *read == node) =>
+        {
+          match log_text_read(&mut ThisShard, (repository, Committed), (log, node)).await {
+            Some(text) => {
+              let _ = crate::state::with_state(|state| state.count(OWED_LOG_TEXTS_READ, 1));
+              given.push((node, text));
+            }
+            None => return Some(Err(WORK_TEXT_UNREAD.to_vec())),
+          }
+        }
+        Err(refused) => return Some(Err(refused_words(&refused))),
+      }
+    }
+    slates_rt::futures::yield_now().await;
+  }
+  Some(Ok(layout))
+}
+
+/// Counter: a changeset's or a manifest's text a new line's owed build read from the node's changeset store, let go once
+/// landed, before its trees were laid out at its materialization ([`owed_layout`]). Format: a counter name in the status
+/// report.
+pub(crate) const OWED_LOG_TEXTS_READ: &str = "vcs.hg.owed_log_texts_read";
+
+/// `layout`, a new line's owed push's trees ([`owed_layout`]), over repository `id`'s committed index and content store,
+/// handed to `read` as the objects its owed build reads this turn: the Mercurial half of
+/// `vcs_store::with_owed_push_objects`. Whether the repository's store is held here.
+pub(crate) fn lend_owed(
+  state: &ShardState,
+  id: RepositoryId,
+  layout: &mut tree::Layout,
+  read: &mut dyn FnMut(&dyn slates_merge::push::PushObjects),
+) -> bool {
+  let Some(held) = held_over(state, id, None, &[]) else {
+    return false;
+  };
+  layout.lend((&Verified::default(), &held), read);
+  true
 }
 
 /// What repository `id` holds as a push's works read it: through the push's fork where it has one, else the store's

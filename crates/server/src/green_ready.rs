@@ -10,7 +10,8 @@
 //! - [`green_ready`] answers [`Ready`](GreenReady::Ready) for a green that holds its content, and for one that owes a
 //!   push starts (or joins) its materialization and answers [`Materializing`](GreenReady::Materializing).
 //! - The materialization is a task of the shard: the owed push's `Building` advanced a turn at a time over the objects
-//!   the green's tool gives ([`PushObjects`], lent from the tool's store by [`with_objects`]; git's over its store), then
+//!   the green's tool gives ([`PushObjects`], lent from the tool's store by [`with_objects`]; git's over its store,
+//!   Mercurial's over the line's trees laid out before its first turn, A-929), then
 //!   `Green::materialize` commits the built work as the owed version. It is today's eager create, deferred: one builder
 //!   over one input.
 //! - A recorded request on an owing green, or on a work over one, parks (`verbs::run_recorded` through
@@ -61,6 +62,14 @@ pub(crate) const MATERIALIZE_BROUGHT_BACK: &str = "merge.green.materialize_broug
 /// (`vcs_store::read_through::ReadThroughRefused`), its parked requests answered `ContentUnavailable`. Format: a
 /// counter name.
 pub(crate) const MATERIALIZE_UNREAD: &str = "merge.green.materialize_unread";
+/// Counter: a file revision's text a Mercurial line's owed build waited for, read from the node's changeset store and
+/// brought back into the content store before the build took its unit again (P2 for Mercurial, main's ruling (A) of
+/// 2026-11-26). Format: a counter name.
+pub(crate) const MATERIALIZE_TEXTS_ASKED: &str = "merge.green.materialize_texts_asked";
+/// Counted most: the nanoseconds from a green's materialization's start, its first read's, to its commit, by the
+/// runtime's clock: how long a new line's first read waited for its build (P2's rule), main's release probe's size of it.
+/// Format: a counter name.
+pub(crate) const MATERIALIZE_WAIT_NS_MOST: &str = "merge.green.materialize_wait_ns_most";
 /// Counter: a request parked on a green's materialization. Format: a counter name.
 pub(crate) const PARKED: &str = "merge.green.materialize_parked";
 /// Counter: a request refused `Overloaded` at the parked bound, or with no route to park on. Format: a counter name.
@@ -99,7 +108,10 @@ pub(crate) type TestObjects = fn() -> Box<dyn PushObjects>;
 /// there were any.
 fn with_objects(
   state: &ShardState,
-  repository: Option<RepositoryId>,
+  owed: (
+    Option<RepositoryId>,
+    Option<&mut slates_hg::push::tree::Layout>,
+  ),
   read: &mut dyn FnMut(&dyn PushObjects),
 ) -> bool {
   #[cfg(test)]
@@ -107,7 +119,7 @@ fn with_objects(
     read(&*objects());
     return true;
   }
-  crate::vcs_store::with_owed_push_objects(state, repository, read)
+  crate::vcs_store::with_owed_push_objects(state, owed, read)
 }
 
 /// The shard's materializations: the builds under way and the requests parked on each green.
@@ -123,6 +135,71 @@ pub(crate) struct Materializations {
   /// The greens whose build ran past its room and waits for room (A-857): their materialization is under way, its
   /// task holding the wait, so a request reaching one parks on it rather than starting another.
   waiting: std::collections::BTreeSet<DbVolumeId>,
+  /// A Mercurial line's owed push's trees, laid out once at its materialization's start (`hg_push::owed_layout`), each
+  /// lent its build's turns (`vcs_store::with_owed_push_objects`); dropped when the materialization ends, whichever way.
+  layouts: BTreeMap<DbVolumeId, slates_hg::push::tree::Layout>,
+  /// When each materialization under way began, by the runtime's clock: its first read's wait, counted most at its commit
+  /// ([`MATERIALIZE_WAIT_NS_MOST`]).
+  began: BTreeMap<DbVolumeId, u64>,
+  /// The greens a command made through the door and holds until it ends ([`Pinned`]), each with how many hold it: never
+  /// dropped back to owing meanwhile ([`keep_within_bound`]), so a push that moves more lines than the bound keeps every
+  /// one it built on until its landing judges them.
+  pinned: BTreeMap<DbVolumeId, u32>,
+}
+
+/// The greens a command made through the door and holds while it runs ([`made_for`]): unpinned when it is dropped,
+/// whichever way the command ends, and each then dropped back to owing by the bound as any other materialized green.
+#[derive(Default)]
+pub(crate) struct Pinned(Vec<DbVolumeId>);
+
+impl Drop for Pinned {
+  fn drop(&mut self) {
+    let greens = core::mem::take(&mut self.0);
+    let _ = crate::state::with_state(|state| {
+      for green in greens {
+        if let Some(holds) = state.materializations.pinned.get_mut(&green) {
+          *holds = holds.saturating_sub(1);
+          if *holds == 0 {
+            state.materializations.pinned.remove(&green);
+          }
+        }
+      }
+    });
+  }
+}
+
+/// Holds `green` pinned for `pinned`'s command, then waits until it holds its content (P2's door for a command that
+/// reaches a green from a task: a Mercurial push moving a line that owes its push, main's ruling (A) of 2026-11-26): its
+/// materialization started the first time and awaited a turn at a time. Whether it holds its content now: false where
+/// the build it waited for ended without making it (refused, counted there), so the command is refused rather than
+/// start the build again every turn; none when the shard's state went away.
+pub(crate) async fn made_for(green: DbVolumeId, pinned: &mut Pinned) -> Option<bool> {
+  crate::state::with_state(|state| {
+    let holds = state.materializations.pinned.entry(green).or_default();
+    *holds = holds.saturating_add(1);
+  })?;
+  pinned.0.push(green);
+  let mut started = false;
+  loop {
+    let ready = crate::state::with_state(|state| {
+      if !state.greens.is_owing(&green) {
+        return Some(true);
+      }
+      if is_building(state, green) {
+        return None;
+      }
+      if started {
+        return Some(false);
+      }
+      green_ready(state, green);
+      None
+    })?;
+    if let Some(ready) = ready {
+      return Some(ready);
+    }
+    started = true;
+    slates_rt::futures::yield_now().await;
+  }
 }
 
 /// Whether a green's content can be read now ([`green_ready`]).
@@ -197,8 +274,8 @@ fn begin_build(state: &mut ShardState, green: DbVolumeId, room: u64) -> bool {
 }
 
 /// The green owing a push that `body` reaches, if any: its volume when that is such a green, or the green of the work it
-/// names; for a branch made from another, the green it is made from, named by its repository and branch (git's names:
-/// only a git create owes its push).
+/// names; for a branch made from another, the green it is made from, named by its repository and branch (a git ref's
+/// or a Mercurial line's: each tool's create owes its push, A-823, A-929).
 pub(crate) fn owing_green_of(state: &ShardState, body: &RequestBody) -> Option<DbVolumeId> {
   if let RequestBody::CreateBranch {
     repository, from, ..
@@ -303,6 +380,15 @@ pub(crate) fn make_building_now(state: &mut ShardState) {
           );
           break;
         }
+        // Nor ask the node's changeset store for a Mercurial text.
+        Turned::Asked(..) => {
+          unread(
+            state,
+            green,
+            &crate::vcs_store::read_through::ReadThroughRefused::Missing { at: 0 },
+          );
+          break;
+        }
         Turned::Done => break,
         Turned::PastRoom { asked, room } => waited(state, green, &mut wait, (asked, room)),
       };
@@ -312,7 +398,7 @@ pub(crate) fn make_building_now(state: &mut ShardState) {
           give_up(state, green);
           break;
         }
-        Step::End | Step::BringBack(_) => break,
+        Step::End | Step::BringBack(_) | Step::Ask(..) => break,
       }
     }
   }
@@ -334,6 +420,10 @@ fn start(state: &mut ShardState, green: DbVolumeId) {
   if !begin_build(state, green, room) {
     return;
   }
+  state
+    .materializations
+    .began
+    .insert(green, slates_rt::futures::now_ns());
   let started = slates_rt::futures::spawn(materialize(green))
     .and_then(slates_rt::futures::detach)
     .is_ok();
@@ -354,6 +444,10 @@ enum Turned {
   /// Stopped at a window of its repository's pack let go (goal 93 item 2b; `slates_merge::push::Unavailable::NotYet`
   /// from git's views): the window to bring back from the node's store before the build takes the unit again.
   Waiting(slates_git::store::packed::Waited),
+  /// Stopped at a Mercurial file revision whose text was let go once landed (`NotYet` from the line's trees): the ask of
+  /// the node's changeset store for it, its text brought back into the content store before the build takes the unit
+  /// again, of its repository.
+  Asked(slates_hg::push::held::TextAsk, RepositoryId),
 }
 
 /// Refuses `green`'s build, a window it read not brought back (`refused`): logged and counted
@@ -382,6 +476,9 @@ enum Step {
   Wait(u64),
   /// Brings back the window of its repository's pack the build stopped at, then turns again.
   BringBack(slates_git::store::packed::Waited),
+  /// Asks the node's changeset store for the Mercurial file revision the build stopped at, brings its text back, then
+  /// turns again.
+  Ask(slates_hg::push::held::TextAsk, RepositoryId),
   /// Is done.
   End,
 }
@@ -391,8 +488,52 @@ enum Step {
 /// it ends, whichever way (`read_through::BroughtBack`).
 async fn materialize(green: DbVolumeId) {
   let mut brought = crate::vcs_store::read_through::BroughtBack::default();
-  materialize_bringing_back(green, &mut brought).await;
+  if laid_out(green).await {
+    materialize_bringing_back(green, &mut brought).await;
+  }
   brought.let_go();
+  // Ended, whichever way: what it laid out and when it began go with it; a refused one names nothing, and the next read
+  // begins it again.
+  let _ = crate::state::with_state(|state| {
+    state.materializations.layouts.remove(&green);
+    state.materializations.began.remove(&green);
+  });
+}
+
+/// A Mercurial line's owed push's trees laid out before its build's first turn (P2 for Mercurial, main's ruling (A) of
+/// 2026-11-26; `hg_push::owed_layout`): its base's and its head's, a turn each, a text let go once landed awaited from
+/// the node's changeset store. Kept for the build's turns. Whether the build may go on: true for a green of any other
+/// tool, which lays nothing out; false where the layout was refused, the build dropped and its parked requests answered
+/// `ContentUnavailable`, the green still owing, so a retry starts it again.
+async fn laid_out(green: DbVolumeId) -> bool {
+  let owed = crate::state::with_state(|state| {
+    let repository = crate::vcs_store::hg_made::mercurial_repository_of(state, green)?;
+    let owed = state.greens.lend(&green)?.deferred()?.clone();
+    Some((repository, owed))
+  })
+  .flatten();
+  let Some((repository, owed)) = owed else {
+    return true;
+  };
+  match crate::repository::hg_push::owed_layout(repository, &owed).await {
+    Some(Ok(layout)) => crate::state::with_state(|state| {
+      state.materializations.layouts.insert(green, layout);
+    })
+    .is_some(),
+    Some(Err(words)) => {
+      let _ = crate::state::with_state(|state| {
+        state.materializations.building.remove(&green);
+        slates_machine::log_line!(
+          "slates-server: partition {}: a Mercurial line's owed push was refused laying out its trees: {}",
+          state.partition,
+          String::from_utf8_lossy(&words)
+        );
+        refuse_parked(state, green, Refusal::ContentUnavailable);
+      });
+      false
+    }
+    None => false,
+  }
 }
 
 /// [`materialize`]'s turns, each window brought back kept in `brought`.
@@ -410,6 +551,7 @@ async fn materialize_bringing_back(
       match turn(state, green) {
         Turned::More => Step::Yield,
         Turned::Waiting(waited) => Step::BringBack(waited),
+        Turned::Asked(ask, repository) => Step::Ask(ask, repository),
         Turned::Done => Step::End,
         Turned::PastRoom { asked, room } => {
           past = Some((asked, room));
@@ -441,6 +583,28 @@ async fn materialize_bringing_back(
             let _ = crate::state::with_state(|state| unread(state, green, &refused));
             return;
           }
+        }
+      }
+      // The file revision the line's build stopped at asked of the node's changeset store and its text brought back into
+      // the content store, then the unit taken again; refused, the build is, as a window that cannot come back is.
+      Some(Step::Ask(mut ask, repository)) => {
+        let answered = crate::vcs_store::hg_view::answer_store_wants(&mut ask, repository).await;
+        let brought = crate::state::with_state(|state| {
+          let given = ask.taken().filter(|_| answered)?;
+          crate::repository::hg_push::text_brought_back(state, (repository, None), given)?;
+          state.count(MATERIALIZE_TEXTS_ASKED, 1);
+          Some(())
+        })
+        .flatten();
+        if brought.is_none() {
+          let _ = crate::state::with_state(|state| {
+            unread(
+              state,
+              green,
+              &crate::vcs_store::read_through::ReadThroughRefused::Missing { at: 0 },
+            );
+          });
+          return;
         }
       }
       Some(Step::End) | None => return,
@@ -509,6 +673,8 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> Turned {
     return Turned::Done;
   };
   let repository = repository_of(state, green);
+  // A Mercurial line's trees, laid out once (`laid_out`), lent this turn and kept for the next.
+  let mut layout = state.materializations.layouts.remove(&green);
   let quantum = state.config.step_quantum_ns() / 2;
   building
     .pace()
@@ -520,7 +686,7 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> Turned {
     crate::vcs_store::with_room(state, |state| match state.greens.lend(&green) {
       Some(engine) => {
         let mut turned = None;
-        let found = with_objects(state, repository, &mut |objects| {
+        let found = with_objects(state, (repository, layout.as_mut()), &mut |objects| {
           turned = Some(building.advance(&engine, objects));
         });
         match turned {
@@ -532,16 +698,35 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> Turned {
       }
       None => Some(Err(Failed::Other("the green is not here".to_owned()))),
     });
+  // The line's trees kept for the build's next turn, whatever this one came to: a build begun again past its room reads
+  // them too, and the materialization's end drops them.
+  let asked = match (&advanced, &layout, repository) {
+    (None, Some(layout), Some(repository)) => {
+      let most = crate::vcs_share::room(state, repository).bytes;
+      layout
+        .waited(&building, most)
+        .map(|ask| Turned::Asked(ask, repository))
+    }
+    _ => None,
+  };
+  if let Some(layout) = layout {
+    state.materializations.layouts.insert(green, layout);
+  }
   match advanced {
     None => {
-      // A unit that met a window let go: the window its read noted on the repository, brought back before the next turn.
+      // A unit that met a window let go: the window its read noted on the repository, brought back before the next turn;
+      // a Mercurial line's, its file revision asked of the node's changeset store.
       let waited = building
         .waiting()
         .and(repository)
         .and_then(|repository| state.vcs_stores.git(repository))
         .and_then(|(_, store)| store.repository.waiting());
       state.materializations.building.insert(green, building);
-      waited.map_or(Turned::More, Turned::Waiting)
+      match (waited, asked) {
+        (Some(waited), _) => Turned::Waiting(waited),
+        (None, Some(asked)) => asked,
+        (None, None) => Turned::More,
+      }
     }
     Some(Ok(built)) => {
       // Secured before it commits, as a submit's admission secures a work's history and change index
@@ -563,6 +748,10 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> Turned {
         .map(|mut engine| engine.materialize(&built.increment));
       if let Some(Ok(_)) = made {
         state.count(MATERIALIZED, 1);
+        if let Some(began) = state.materializations.began.remove(&green) {
+          let waited = slates_rt::futures::now_ns().saturating_sub(began);
+          state.count_max(MATERIALIZE_WAIT_NS_MOST, waited);
+        }
         let _ = crate::merge_service::settle_green_retention(state, green);
         // Its tool's derived data follows its first read (P2): a git green's map of paths, in the whole build's slices.
         crate::vcs_store::paths::derive_once_made(state, green);
@@ -642,14 +831,21 @@ fn keep_within_bound(state: &mut ShardState) {
   let derived = TEST_KEEP_BOUND
     .with(std::cell::Cell::get)
     .unwrap_or(derived);
+  // A pinned green stays materialized and in the queue: its command still builds on it ([`Pinned`]).
+  let mut held = Vec::new();
   while state.materializations.kept.len() > derived {
     let Some(green) = state.materializations.kept.pop_front() else {
-      return;
+      break;
     };
+    if state.materializations.pinned.contains_key(&green) {
+      held.push(green);
+      continue;
+    }
     if dematerialize(state, green) {
       state.count(DEMATERIALIZED, 1);
     }
   }
+  state.materializations.kept.extend(held);
 }
 
 /// `green` dropped back to owing the push its chain records, its content let go: where nobody wrote to it since it was
