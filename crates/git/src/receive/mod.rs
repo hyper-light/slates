@@ -204,6 +204,18 @@ pub trait Judge {
   fn ref_conflict(&self, _name: &[u8], _deleted: &[&[u8]]) -> Option<RefConflict> {
     None
   }
+
+  /// Monotonic shard-local revision of the repository's live ref namespace, read in O(1).
+  ///
+  /// Under `atomic`, [`Deciding`] snapshots this before its cooperative D/F check pass and
+  /// compares it right before [`Judge::append_atomic`]. When equal in the same synchronous shard
+  /// step, no ref changed since `CheckingDf` and `append_atomic` needs zero namespace lookups;
+  /// when changed, [`Deciding`] runs one cooperative single-command-per-step recheck pass before
+  /// appending (failing closed if the namespace moves a second time). Stateless test judges return
+  /// `0` by default.
+  fn namespace_revision(&self) -> u64 {
+    0
+  }
 }
 
 /// An existing repository ref that has a files-backend directory/file namespace conflict with a
@@ -873,7 +885,11 @@ pub fn decide<J: Judge + ?Sized>(
 /// Explicit lifecycle phase of an atomic push's cooperative decision steps.
 enum AtomicPhase {
   /// Refusing every command because at least one command failed early protocol checks.
-  EarlyRefused,
+  EarlyRefused {
+    /// Whether the pack itself was refused (`unpacker error` on every command); otherwise only the
+    /// first early-refused command keeps its reason and every sibling reports `atomic push failure`.
+    pack_refused: bool,
+  },
   /// Checking command `at` for intra-batch and existing-repository D/F ref-namespace conflicts,
   /// one command per [`Deciding::step`], before judging any command.
   CheckingDf {
@@ -885,8 +901,18 @@ enum AtomicPhase {
     /// Index of the command judged on the next step.
     at: usize,
   },
-  /// Appending all accepted commands in one atomic transaction.
-  Appending,
+  /// Re-checking command `at` against live repository refs (one command per [`Deciding::step`])
+  /// after the repository namespace revision moved between `CheckingDf` and `Appending`.
+  RecheckingDf {
+    /// Index of the command rechecked on the next step.
+    at: usize,
+  },
+  /// Appending all accepted commands in one atomic transaction once `df_revision` matches.
+  Appending {
+    /// Whether this push already completed its single cooperative [`AtomicPhase::RecheckingDf`]
+    /// pass (a second concurrent namespace change fails closed to prevent livelock).
+    rechecked: bool,
+  },
 }
 
 /// Decision state specific to an `atomic` push.
@@ -900,22 +926,26 @@ struct AtomicState<A> {
   /// Valid non-delete command indices already D/F-checked, kept sorted by ref name so each
   /// cooperative step detects intra-batch D/F conflicts in O(depth * log N).
   seen_refs: Vec<usize>,
+  /// Repository namespace revision snapshotted at the start of the most recent D/F check pass.
+  df_revision: u64,
 }
 
 impl<A> AtomicState<A> {
   /// Allocates and charges atomic decision buffers for `count` commands.
   fn new(
     count: usize,
+    pack_refused: bool,
     early: &[Option<Outcome>],
     admission: &mut Admission,
   ) -> Result<Self, Refusal> {
     let outcomes = charged_vec(count, admission)?;
     if early.iter().any(Option::is_some) {
       return Ok(Self {
-        phase: AtomicPhase::EarlyRefused,
+        phase: AtomicPhase::EarlyRefused { pack_refused },
         outcomes,
         accepted: Vec::new(),
         seen_refs: Vec::new(),
+        df_revision: 0,
       });
     }
     let accepted = charged_vec(count, admission)?;
@@ -925,9 +955,14 @@ impl<A> AtomicState<A> {
       outcomes,
       accepted,
       seen_refs,
+      df_revision: 0,
     })
   }
 }
+
+/// Precomputed stock Git 2.56.1 batch-D/F diagnostic entry for one non-atomic conflicting create:
+/// `(command_index, lock_prefix, peer_command_index)`.
+type BatchDfEntry = (usize, bool, usize);
 
 /// Decision state specific to a push without `atomic`.
 struct NonAtomicState {
@@ -945,6 +980,9 @@ struct NonAtomicState {
   /// Command indices of applied deletes so cross-push D/F checks allow replacing a ref deleted
   /// earlier in the same push.
   applied_deleted: Vec<usize>,
+  /// Stock Git 2.56.1 `files_transaction_prepare` batch-conflict diagnostics sorted by command
+  /// index; empty whenever a push has no intra-batch D/F-conflicting creates.
+  batch_df: Vec<BatchDfEntry>,
 }
 
 impl NonAtomicState {
@@ -961,6 +999,7 @@ impl NonAtomicState {
       df_checked: false,
       applied_refs,
       applied_deleted,
+      batch_df: Vec::new(),
     })
   }
 }
@@ -1002,8 +1041,9 @@ impl<A> Deciding<A> {
       by_id,
     } = checked;
     let count = request.commands.len();
+    let pack_refused = matches!(unpacked, Some(Err(_)));
     let mode = if request.requested.atomic {
-      DecidingMode::Atomic(AtomicState::new(count, &early, admission)?)
+      DecidingMode::Atomic(AtomicState::new(count, pack_refused, &early, admission)?)
     } else {
       DecidingMode::NonAtomic(NonAtomicState::new(count, admission)?)
     };
@@ -1095,8 +1135,9 @@ fn next_non_atomic_command<J: Judge + ?Sized>(
   admission: &mut Admission,
 ) -> Result<Option<usize>, Refusal> {
   if non_atomic.order.is_none() {
-    let order = ranked(commands, early, pushed, judge, admission)?;
+    let (order, batch_df) = ranked(commands, early, pushed, judge, admission)?;
     non_atomic.order = Some(order);
+    non_atomic.batch_df = batch_df;
   }
   Ok(
     non_atomic
@@ -1127,7 +1168,7 @@ fn each_step<A, J: Judge<Accepted = A> + ?Sized>(
   };
   let unrefused = early.get(at).is_none_or(Option::is_none);
   let conflict = if unrefused && !non_atomic.df_checked {
-    let found = non_atomic_df_conflict(commands, non_atomic, command, judge, admission)?;
+    let found = non_atomic_df_conflict(commands, non_atomic, at, command, judge, admission)?;
     non_atomic.df_checked = found.is_none();
     found
   } else {
@@ -1179,11 +1220,19 @@ fn apply_non_atomic<A, J: Judge<Accepted = A> + ?Sized>(
   }
 }
 
+/// Borrowed ref name paired with its wire-order command index in a push batch.
+type RefSlot<'a> = (&'a [u8], usize);
+
+/// Active non-delete commands and intra-batch D/F-conflict flags for create commands in one push.
+struct DfCreatePlan<'a> {
+  /// Per-command flag marking valid-named unrefused creates that D/F-conflict inside the batch.
+  marked: Vec<bool>,
+  /// Valid-named unrefused non-delete commands sorted by ref name.
+  active: Vec<RefSlot<'a>>,
+}
+
 /// Finds a descendant ref (`<name>/...`) present in `sorted` (sorted by name) via binary search.
-fn descendant_in_sorted<'a>(
-  name: &[u8],
-  sorted: &[(&'a [u8], usize)],
-) -> Option<(&'a [u8], usize)> {
+fn descendant_in_sorted<'a>(name: &[u8], sorted: &[RefSlot<'a>]) -> Option<RefSlot<'a>> {
   let pos = sorted.partition_point(|&(entry, _)| cmp_with_slash(entry, name).is_lt());
   sorted
     .get(pos)
@@ -1196,8 +1245,8 @@ fn active_non_deletes<'a>(
   commands: &'a [Command],
   early: &[Option<Outcome>],
   admission: &mut Admission,
-) -> Result<Vec<(&'a [u8], usize)>, Refusal> {
-  let mut active = charged_vec::<(&[u8], usize)>(commands.len(), admission)?;
+) -> Result<Vec<RefSlot<'a>>, Refusal> {
+  let mut active = charged_vec::<RefSlot<'a>>(commands.len(), admission)?;
   active.extend(
     commands
       .iter()
@@ -1215,13 +1264,16 @@ fn active_non_deletes<'a>(
 
 /// Marks valid-named unrefused create commands that participate in an intra-batch D/F conflict
 /// against another active non-delete command in `commands`.
-fn df_conflicting_creates(
-  commands: &[Command],
+fn df_conflicting_creates<'a>(
+  commands: &'a [Command],
   early: &[Option<Outcome>],
   admission: &mut Admission,
-) -> Result<Vec<bool>, Refusal> {
+) -> Result<DfCreatePlan<'a>, Refusal> {
   if commands.len() <= 1 {
-    return Ok(Vec::new());
+    return Ok(DfCreatePlan {
+      marked: Vec::new(),
+      active: Vec::new(),
+    });
   }
   let active = active_non_deletes(commands, early, admission)?;
   let mut marked = charged_vec::<bool>(commands.len(), admission)?;
@@ -1234,30 +1286,123 @@ fn df_conflicting_creates(
       *slot = true;
     }
   }
-  Ok(marked)
+  Ok(DfCreatePlan { marked, active })
+}
+
+/// Returns the first D/F conflict for `name` in `sorted` (shortest ancestor before lexicographically
+/// smallest descendant, matching stock Git 2.56.1's `refs_verify_refname_available`).
+fn first_df_in_sorted<'a>(name: &[u8], sorted: &[RefSlot<'a>]) -> Option<RefSlot<'a>> {
+  ancestor_in_sorted(name, sorted).or_else(|| descendant_in_sorted(name, sorted))
+}
+
+/// Inserts `(name, at)` into `sorted` (kept sorted by ref name) if not already present.
+fn insert_sorted_pair<'a>(sorted: &mut Vec<RefSlot<'a>>, name: &'a [u8], at: usize) {
+  if let Err(pos) = sorted.binary_search_by_key(&name, |(entry, _)| *entry) {
+    sorted.insert(pos, (name, at));
+  }
+}
+
+/// Removes the slot for `name` from `sorted` (kept sorted by ref name) if present.
+fn remove_sorted_pair(sorted: &mut Vec<RefSlot<'_>>, name: &[u8]) {
+  if let Ok(pos) = sorted.binary_search_by_key(&name, |(entry, _)| *entry) {
+    sorted.remove(pos);
+  }
+}
+
+/// Runs stock Git 2.56.1's lock phase over colliding creates in wire order: any command whose
+/// descendant already locked earlier fails with `cannot lock ref` against its first conflict in
+/// `remaining`, and is removed from `remaining`.
+fn lock_phase_df_diags<'a>(
+  wire: &[RefSlot<'a>],
+  remaining: &mut Vec<RefSlot<'_>>,
+  locked: &mut Vec<RefSlot<'a>>,
+  diags: &mut Vec<BatchDfEntry>,
+) {
+  for &(name, at) in wire {
+    if descendant_in_sorted(name, locked).is_none() {
+      insert_sorted_pair(locked, name, at);
+      continue;
+    }
+    if let Some((_, peer)) = first_df_in_sorted(name, remaining) {
+      diags.push((at, true, peer));
+    }
+    remove_sorted_pair(remaining, name);
+  }
+}
+
+/// Runs stock Git 2.56.1's post-lock verify phase over remaining colliding creates in wire order:
+/// each surviving ref that still conflicts in `remaining` fails without `cannot lock ref` and is
+/// removed from `remaining`.
+fn verify_phase_df_diags(
+  wire: &[RefSlot<'_>],
+  remaining: &mut Vec<RefSlot<'_>>,
+  diags: &mut Vec<BatchDfEntry>,
+) {
+  for &(name, at) in wire {
+    let still_active = remaining.binary_search_by_key(&name, |(e, _)| *e).is_ok();
+    if still_active && let Some((_, peer)) = first_df_in_sorted(name, remaining) {
+      diags.push((at, false, peer));
+      remove_sorted_pair(remaining, name);
+    }
+  }
+}
+
+/// Simulates stock Git 2.56.1's `files_transaction_prepare` lock and verify phases over the
+/// intra-batch D/F-conflicting creates in `plan` so each refused non-atomic create emits stock's
+/// exact `cannot lock ref` prefix and conflicting peer pair.
+fn plan_batch_df_diags(
+  plan: &DfCreatePlan<'_>,
+  deferred_count: usize,
+  admission: &mut Admission,
+) -> Result<Vec<BatchDfEntry>, Refusal> {
+  if deferred_count == 0 {
+    return Ok(Vec::new());
+  }
+  let mut diags = charged_vec::<BatchDfEntry>(deferred_count, admission)?;
+  let before = admission.left();
+  let mut remaining = charged_vec::<RefSlot<'_>>(deferred_count, admission)?;
+  let mut wire = charged_vec::<RefSlot<'_>>(deferred_count, admission)?;
+  let mut locked = charged_vec::<RefSlot<'_>>(deferred_count, admission)?;
+  let hold = admission.held_since(before);
+  remaining.extend(
+    plan
+      .active
+      .iter()
+      .copied()
+      .filter(|&(_, at)| plan.marked.get(at).copied().unwrap_or(false)),
+  );
+  wire.extend_from_slice(&remaining);
+  wire.sort_unstable_by_key(|&(_, at)| at);
+  lock_phase_df_diags(&wire, &mut remaining, &mut locked, &mut diags);
+  verify_phase_df_diags(&wire, &mut remaining, &mut diags);
+  drop((remaining, wire, locked));
+  admission.release(hold);
+  diags.sort_unstable_by_key(|&(at, _, _)| at);
+  Ok(diags)
 }
 
 /// The indices of `commands` in the order a push without `atomic` decides them (A-850,
-/// [`Judge::rank`]): non-conflicting commands, deletes, and existing-ref updates run first by
-/// rank (ties in wire order), followed by intra-batch D/F-conflicting creates ordered deepest /
+/// [`Judge::rank`]) plus precomputed stock Git 2.56.1 batch-D/F diagnostics when conflicting
+/// creates exist: non-conflicting commands, deletes, and existing-ref updates run first by rank
+/// (ties in wire order), followed by intra-batch D/F-conflicting creates ordered deepest /
 /// lexicographically greatest first (`Reverse(name)`), so existing-ref updates beat conflicting
 /// creates and descendant creates beat ancestor creates — matching stock Git 2.56.1's
-/// `files-loose` backend (`reftable` and `files-packed` differ on reverse-order and
-/// packed-parent cases) — without altering A-850 ordering on non-conflicting pushes.
+/// `files-loose` backend — without altering A-850 ordering on non-conflicting pushes.
 fn ranked<J: Judge + ?Sized>(
   commands: &[Command],
   early: &[Option<Outcome>],
   pushed: &Pushed<'_>,
   judge: &mut J,
   admission: &mut Admission,
-) -> Result<Vec<usize>, Refusal> {
-  let marked = df_conflicting_creates(commands, early, admission)?;
-  let deferred_count = marked.iter().filter(|&&flag| flag).count();
+) -> Result<(Vec<usize>, Vec<BatchDfEntry>), Refusal> {
+  let plan = df_conflicting_creates(commands, early, admission)?;
+  let deferred_count = plan.marked.iter().filter(|&&flag| flag).count();
+  let batch_df = plan_batch_df_diags(&plan, deferred_count, admission)?;
   let regular_count = commands.len().saturating_sub(deferred_count);
   let mut regular = charged_vec::<(u64, usize)>(regular_count, admission)?;
   let mut deferred = charged_vec::<(core::cmp::Reverse<&[u8]>, usize)>(deferred_count, admission)?;
   for (at, command) in commands.iter().enumerate() {
-    if marked.get(at).copied().unwrap_or(false) {
+    if plan.marked.get(at).copied().unwrap_or(false) {
       deferred.push((core::cmp::Reverse(command.name.as_slice()), at));
     } else {
       regular.push((judge.rank(command, pushed), at));
@@ -1268,7 +1413,7 @@ fn ranked<J: Judge + ?Sized>(
   let mut order = charged_vec::<usize>(commands.len(), admission)?;
   order.extend(regular.into_iter().map(|(_, at)| at));
   order.extend(deferred.into_iter().map(|(_, at)| at));
-  Ok(order)
+  Ok((order, batch_df))
 }
 
 /// Records an atomic push failure with `declined` at index `failed_at` and [`ATOMIC_FAILURE`] on
@@ -1297,13 +1442,41 @@ fn fail_atomic_transaction(outcomes: &mut Vec<Outcome>, count: usize, declined: 
   }));
 }
 
+/// Populates atomic `outcomes` when at least one command failed early protocol checks: a refused
+/// pack keeps every command's `unpacker error`, whereas per-command early refusals blame only the
+/// first refused command and mark every sibling `atomic push failure` (matching stock Git 2.56.1).
+fn finish_atomic_early(
+  outcomes: &mut Vec<Outcome>,
+  early: &mut Vec<Option<Outcome>>,
+  pack_refused: bool,
+) {
+  let early = core::mem::take(early);
+  if pack_refused {
+    let fill = |outcome: Option<Outcome>| outcome.unwrap_or_else(|| refused(ATOMIC_FAILURE, None));
+    outcomes.extend(early.into_iter().map(fill));
+    return;
+  }
+  let mut blamed = false;
+  for slot in early {
+    match slot {
+      Some(outcome) if !blamed => {
+        blamed = true;
+        outcomes.push(outcome);
+      }
+      _ => outcomes.push(refused(ATOMIC_FAILURE, None)),
+    }
+  }
+}
+
 /// One step of an atomic push: every command or none ("Either all refs are updated or none",
 /// gitprotocol-capabilities). A check's refusal leaves every other command `atomic push failure`,
 /// none judged; otherwise commands are D/F-checked one per step against existing repository refs
 /// and already-seen batch refs (a conflict gives every command [`ATOMIC_TRANSACTION_FAILED`] with
 /// its band-2 line once), then judged one per step until one is declined (leaving every other
-/// `atomic push failure`); then one append moves every ref or none, and a refused append gives
-/// every command its reason, its band-2 line once (git's `execute_commands_atomic`).
+/// `atomic push failure`); before appending, if the repository's namespace revision moved since
+/// `CheckingDf`, one cooperative single-command-per-step `RecheckingDf` pass verifies no
+/// concurrent ref created a D/F conflict (failing closed if the namespace moves a second time);
+/// then one append moves every ref or none with zero namespace lookups in `append_atomic`.
 fn atomic_step<A, J: Judge<Accepted = A> + ?Sized>(
   commands: &[Command],
   early: &mut Vec<Option<Outcome>>,
@@ -1313,18 +1486,15 @@ fn atomic_step<A, J: Judge<Accepted = A> + ?Sized>(
   admission: &mut Admission,
 ) -> Result<bool, Refusal> {
   match atomic.phase {
-    AtomicPhase::EarlyRefused => {
-      let others =
-        |outcome: Option<Outcome>| outcome.unwrap_or_else(|| refused(ATOMIC_FAILURE, None));
-      let early = core::mem::take(early);
-      atomic.outcomes.extend(early.into_iter().map(others));
+    AtomicPhase::EarlyRefused { pack_refused } => {
+      finish_atomic_early(&mut atomic.outcomes, early, pack_refused);
       Ok(true)
     }
     AtomicPhase::CheckingDf { at } => Ok(atomic_check_df_step(commands, atomic, at, judge)),
     AtomicPhase::Judging { at } => Ok(atomic_judge_step(commands, atomic, at, pushed, judge)),
-    AtomicPhase::Appending => {
-      finish_atomic(commands, atomic, judge, admission)?;
-      Ok(true)
+    AtomicPhase::RecheckingDf { at } => Ok(atomic_recheck_df_step(commands, atomic, at, judge)),
+    AtomicPhase::Appending { rechecked } => {
+      atomic_append_step(commands, atomic, rechecked, judge, admission)
     }
   }
 }
@@ -1343,6 +1513,9 @@ fn atomic_check_df_step<A, J: Judge<Accepted = A> + ?Sized>(
   at: usize,
   judge: &J,
 ) -> bool {
+  if at == 0 {
+    atomic.df_revision = judge.namespace_revision();
+  }
   let Some(command) = commands.get(at) else {
     atomic.phase = AtomicPhase::Judging { at: 0 };
     return false;
@@ -1365,6 +1538,112 @@ fn atomic_check_df_step<A, J: Judge<Accepted = A> + ?Sized>(
   false
 }
 
+/// Re-checks one command (`at`) of an atomic push against live repository refs after the
+/// repository's namespace revision changed between `CheckingDf` and `Appending` (strictly `<= 1`
+/// `ref_conflict` lookup per cooperative step).
+fn atomic_recheck_df_step<A, J: Judge<Accepted = A> + ?Sized>(
+  commands: &[Command],
+  atomic: &mut AtomicState<A>,
+  at: usize,
+  judge: &J,
+) -> bool {
+  if at == 0 {
+    atomic.df_revision = judge.namespace_revision();
+  }
+  let Some(command) = commands.get(at) else {
+    atomic.phase = AtomicPhase::Appending { rechecked: true };
+    return false;
+  };
+  if !command.is_delete()
+    && request::refname_ok(&command.name, false)
+    && let Some(existing) = judge.ref_conflict(&command.name, &[])
+  {
+    let declined = df_conflict_declined(ATOMIC_TRANSACTION_FAILED, &command.name, &existing);
+    fail_atomic_transaction(&mut atomic.outcomes, commands.len(), &declined);
+    return true;
+  }
+  let next = at.saturating_add(1);
+  atomic.phase = if next < commands.len() {
+    AtomicPhase::RecheckingDf { at: next }
+  } else {
+    AtomicPhase::Appending { rechecked: true }
+  };
+  false
+}
+
+/// Verifies `judge.namespace_revision()` has not moved since the last D/F pass before calling
+/// [`finish_atomic`]. On the first detected revision change, yields into one cooperative
+/// [`AtomicPhase::RecheckingDf`] pass; on a second concurrent change, fails closed with
+/// [`ATOMIC_TRANSACTION_FAILED`] to avoid livelock without retry constants.
+fn atomic_append_step<A, J: Judge<Accepted = A> + ?Sized>(
+  commands: &[Command],
+  atomic: &mut AtomicState<A>,
+  rechecked: bool,
+  judge: &mut J,
+  admission: &mut Admission,
+) -> Result<bool, Refusal> {
+  if !atomic.seen_refs.is_empty() && judge.namespace_revision() != atomic.df_revision {
+    if !rechecked {
+      atomic.phase = AtomicPhase::RecheckingDf { at: 0 };
+      return Ok(false);
+    }
+    let declined = Declined {
+      reason: ATOMIC_TRANSACTION_FAILED.to_vec(),
+      hook: Vec::new(),
+      message: None,
+    };
+    fail_atomic_transaction(&mut atomic.outcomes, commands.len(), &declined);
+    return Ok(true);
+  }
+  finish_atomic(commands, atomic, judge, admission)?;
+  Ok(true)
+}
+
+/// Finds the shortest valid non-delete command in `commands` that is a strict `'/'`-delimited
+/// ancestor of `name` (used only on the atomic batch-D/F abort path).
+fn shortest_ancestor_in_commands<'a>(commands: &'a [Command], name: &[u8]) -> Option<&'a [u8]> {
+  commands
+    .iter()
+    .filter(|cmd| !cmd.is_delete() && request::refname_ok(&cmd.name, false))
+    .map(|cmd| cmd.name.as_slice())
+    .filter(|candidate| is_dir_prefix(candidate, name))
+    .min_by_key(|candidate| candidate.len())
+}
+
+/// Finds the lexicographically smallest valid non-delete command in `commands` that is a strict
+/// `'/'`-delimited descendant of `name` (used only on the atomic batch-D/F abort path).
+fn smallest_descendant_in_commands<'a>(commands: &'a [Command], name: &[u8]) -> Option<&'a [u8]> {
+  commands
+    .iter()
+    .filter(|cmd| !cmd.is_delete() && request::refname_ok(&cmd.name, false))
+    .map(|cmd| cmd.name.as_slice())
+    .filter(|candidate| is_dir_prefix(name, candidate))
+    .min()
+}
+
+/// Refines an intra-batch atomic D/F conflict between `command.name` and an earlier batch ref
+/// `other` to match stock Git 2.56.1's `files_transaction_prepare` wording (descendant-first
+/// carries `cannot lock ref '<name>': ` and checks ancestors before descendants; ancestor-first
+/// pairs the ancestor with its lexicographically smallest descendant).
+fn atomic_batch_df_conflict(commands: &[Command], name: &[u8], other: &[u8]) -> DfConflict {
+  if is_dir_prefix(name, other) {
+    let second = shortest_ancestor_in_commands(commands, name)
+      .or_else(|| smallest_descendant_in_commands(commands, name))
+      .unwrap_or(other);
+    return DfConflict::Batch {
+      lock_prefix: true,
+      first: name.to_vec(),
+      second: second.to_vec(),
+    };
+  }
+  let second = smallest_descendant_in_commands(commands, other).unwrap_or(name);
+  DfConflict::Batch {
+    lock_prefix: false,
+    first: other.to_vec(),
+    second: second.to_vec(),
+  }
+}
+
 /// Checks one valid non-delete command of an atomic batch against existing repository refs
 /// (`judge.ref_conflict` with empty `deleted`, checked first so existing visible and hidden refs
 /// take precedence) and already-seen batch commands (`seen_refs`).
@@ -1377,7 +1656,12 @@ fn atomic_command_df_conflict<J: Judge + ?Sized>(
   if let Some(existing) = judge.ref_conflict(&command.name, &[]) {
     return Some(DfConflict::Existing(existing));
   }
-  applied_df_conflict(commands, seen_refs, &command.name)
+  match applied_df_conflict(commands, seen_refs, &command.name)? {
+    DfConflict::Existing(existing) => Some(DfConflict::Existing(existing)),
+    DfConflict::Batch { second, .. } => {
+      Some(atomic_batch_df_conflict(commands, &command.name, &second))
+    }
+  }
 }
 
 /// Judges one command (`at`) of an atomic push once [`Judge::ready`] reports ready. Returns
@@ -1390,7 +1674,7 @@ fn atomic_judge_step<A, J: Judge<Accepted = A> + ?Sized>(
   judge: &mut J,
 ) -> bool {
   let Some(command) = commands.get(at) else {
-    atomic.phase = AtomicPhase::Appending;
+    atomic.phase = AtomicPhase::Appending { rechecked: false };
     return false;
   };
   if !judge.ready(command, pushed) {
@@ -1403,7 +1687,7 @@ fn atomic_judge_step<A, J: Judge<Accepted = A> + ?Sized>(
       atomic.phase = if next < commands.len() {
         AtomicPhase::Judging { at: next }
       } else {
-        AtomicPhase::Appending
+        AtomicPhase::Appending { rechecked: false }
       };
       false
     }
@@ -1488,7 +1772,7 @@ fn cmp_with_slash(name: &[u8], prefix: &[u8]) -> core::cmp::Ordering {
 
 /// Finds an ancestor component prefix of `name` present in `sorted` (sorted by name) via binary
 /// search.
-fn ancestor_in_sorted<'a>(name: &[u8], sorted: &[(&'a [u8], usize)]) -> Option<(&'a [u8], usize)> {
+fn ancestor_in_sorted<'a>(name: &[u8], sorted: &[RefSlot<'a>]) -> Option<RefSlot<'a>> {
   for (at, &byte) in name.iter().enumerate() {
     if byte != b'/' {
       continue;
@@ -1510,15 +1794,27 @@ enum DfConflict {
   Existing(RefConflict),
   /// Conflict against another newly created ref in the same push batch (never yet created before
   /// this push).
-  Batch(Vec<u8>),
+  Batch {
+    /// Whether an earlier wire-order command was a descendant of the failing ref, causing stock
+    /// Git's files backend to emit `cannot lock ref '<name>': ` before `cannot process ...`.
+    lock_prefix: bool,
+    /// First ref named in `cannot process '<first>' and '<second>' at the same time`.
+    first: Vec<u8>,
+    /// Second ref named in `cannot process '<first>' and '<second>' at the same time`.
+    second: Vec<u8>,
+  },
 }
 
-/// Classifies a D/F conflict against `commands[idx]` as a same-batch create conflict or an
-/// existing-ref conflict.
-fn batch_or_existing_conflict(commands: &[Command], idx: usize) -> Option<DfConflict> {
+/// Classifies a D/F conflict for `name` against `commands[idx]` as a same-batch create conflict or
+/// an existing-ref conflict.
+fn batch_or_existing_conflict(commands: &[Command], name: &[u8], idx: usize) -> Option<DfConflict> {
   let other = commands.get(idx)?;
   Some(if other.is_create() {
-    DfConflict::Batch(other.name.clone())
+    DfConflict::Batch {
+      lock_prefix: false,
+      first: name.to_vec(),
+      second: other.name.clone(),
+    }
   } else {
     DfConflict::Existing(RefConflict::Visible(other.name.clone()))
   })
@@ -1543,14 +1839,34 @@ fn applied_df_conflict(
     if let Ok(found) = applied_refs.binary_search_by(|&idx| name_of(idx).cmp(prefix))
       && let Some(&idx) = applied_refs.get(found)
     {
-      return batch_or_existing_conflict(commands, idx);
+      return batch_or_existing_conflict(commands, name, idx);
     }
   }
   let pos = applied_refs.partition_point(|&idx| cmp_with_slash(name_of(idx), name).is_lt());
   let &idx = applied_refs.get(pos)?;
   is_dir_prefix(name, name_of(idx))
-    .then(|| batch_or_existing_conflict(commands, idx))
+    .then(|| batch_or_existing_conflict(commands, name, idx))
     .flatten()
+}
+
+/// Resolves the precomputed stock Git 2.56.1 batch-D/F diagnostic for non-atomic command `at`, if
+/// available.
+fn planned_batch_df(
+  commands: &[Command],
+  batch_df: &[BatchDfEntry],
+  at: usize,
+  name: &[u8],
+) -> Option<DfConflict> {
+  let pos = batch_df
+    .binary_search_by_key(&at, |&(idx, _, _)| idx)
+    .ok()?;
+  let &(_, lock_prefix, peer_idx) = batch_df.get(pos)?;
+  let peer = commands.get(peer_idx)?;
+  Some(DfConflict::Batch {
+    lock_prefix,
+    first: name.to_vec(),
+    second: peer.name.clone(),
+  })
 }
 
 /// Checks a non-atomic command against refs already applied in this push and existing repository
@@ -1558,6 +1874,7 @@ fn applied_df_conflict(
 fn non_atomic_df_conflict<J: Judge + ?Sized>(
   commands: &[Command],
   non_atomic: &NonAtomicState,
+  at: usize,
   command: &Command,
   judge: &J,
   admission: &mut Admission,
@@ -1566,7 +1883,13 @@ fn non_atomic_df_conflict<J: Judge + ?Sized>(
     return Ok(None);
   }
   if let Some(conflict) = applied_df_conflict(commands, &non_atomic.applied_refs, &command.name) {
-    return Ok(Some(conflict));
+    let resolved = match conflict {
+      DfConflict::Batch { .. } => {
+        planned_batch_df(commands, &non_atomic.batch_df, at, &command.name).unwrap_or(conflict)
+      }
+      existing => existing,
+    };
+    return Ok(Some(resolved));
   }
   if non_atomic.applied_deleted.is_empty() {
     return Ok(
@@ -1679,20 +2002,24 @@ pub fn df_conflict_declined(reason: &[u8], name: &[u8], conflict: &RefConflict) 
 fn df_declined(reason: &[u8], name: &[u8], conflict: &DfConflict) -> Declined {
   match conflict {
     DfConflict::Existing(existing) => df_conflict_declined(reason, name, existing),
-    DfConflict::Batch(other) => {
-      let (ancestor, descendant) = if is_dir_prefix(name, other) {
-        (name, other.as_slice())
-      } else {
-        (other.as_slice(), name)
-      };
-      let line = [
+    DfConflict::Batch {
+      lock_prefix,
+      first,
+      second,
+    } => {
+      let body = [
         b"cannot process '",
-        ancestor,
+        first.as_slice(),
         b"' and '",
-        descendant,
+        second.as_slice(),
         b"' at the same time",
       ]
       .concat();
+      let line = if *lock_prefix {
+        [b"cannot lock ref '", name, b"': ", body.as_slice()].concat()
+      } else {
+        body
+      };
       Declined {
         reason: reason.to_vec(),
         hook: Vec::new(),

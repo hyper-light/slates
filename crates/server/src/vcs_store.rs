@@ -401,6 +401,9 @@ pub(crate) struct GitStore {
   /// (046628f88), then each push's, taken in turn on this shard ([`VcsStores::next_changeset`]) and read back from the
   /// register's records at recovery, so the next push after a crash lands at the last one named + 1.
   pub(crate) landed: u64,
+  /// Monotonic shard-local revision bumped on Git store creation and every `commit_moves`
+  /// application so atomic pushes detect concurrent ref-head or rebuild changes in O(1).
+  pub(crate) store_rev: u64,
 }
 
 impl GitStore {
@@ -419,6 +422,7 @@ impl GitStore {
       lfs: LfsObjects::new(),
       owed: BTreeMap::new(),
       landed: 0,
+      store_rev: 1,
     }
   }
 
@@ -1124,6 +1128,7 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
     VcsTool::Git => {
       let format = git_format(record.format).ok_or(Unmade)?;
       let mut git = GitStore::new(format, window);
+      git.store_rev = stores.next_generation();
       // The map, the trees and the commits split by the content store's own window, which their types' names carry
       // (A-647, A-664 part 2).
       git.paths = paths::declare(window);
@@ -1408,6 +1413,7 @@ fn release(stores: &mut VcsStores, id: RepositoryId) -> bool {
   };
   match entry {
     RepositoryStore::Git(store) => {
+      stores.generations = stores.generations.max(store.store_rev);
       let versions = content.discharge(store.charged).is_ok();
       let values = store.derivations.release(content).is_ok();
       // Every head's map is released, whichever fails: no short circuit.
@@ -3162,6 +3168,7 @@ fn commit_moves(
     return Err(GitRefused::Store(refused));
   }
   store.charged = store.charged.saturating_add(cost);
+  store.store_rev = store.store_rev.saturating_add(1);
   for (key, version, _) in keyed {
     store.versions.entry(*key).or_default().push(*version);
     // A made commit's move of its green to the version a commit was owed of settles it ([`owed`]).

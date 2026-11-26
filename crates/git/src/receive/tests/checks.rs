@@ -812,8 +812,66 @@ fn branch_ref_pointing_to_non_commit_is_refused_atomic_and_non_atomic() {
   assert_non_atomic_non_commit_branches(&fixture);
   assert_atomic_non_commit_rolls_back(&fixture, fixture.pack_blob_id, b"refs/heads/bad");
   assert_atomic_non_commit_rolls_back(&fixture, fixture.existing_blob, b"refs/heads/bad-repo");
+  assert_atomic_multi_non_commit_blames_only_first(&fixture);
+  assert_atomic_pack_refusal_marks_every_command_unpacker_error(&fixture);
   assert_branch_delete_and_funny_refname_precedence(&fixture);
   assert_deep_wrong_kind_chain_refused(fixture.pack_blob_id, fixture.pack_blob);
+}
+
+/// Verifies stock Git 2.56.1 first-ref blame under `--atomic` when multiple branch commands target
+/// non-commit objects: only the first early-refused command carries `invalid new value provided`
+/// and its band-2 line; every sibling carries `atomic push failure` with `message: None`.
+fn assert_atomic_multi_non_commit_blames_only_first(fixture: &NonCommitBranchFixture) {
+  let bad_first: [(ObjectId, ObjectId, &[u8]); 3] = [
+    (zero(), fixture.pack_tree_id, b"refs/heads/t"),
+    (zero(), fixture.pack_blob_id, b"refs/heads/b"),
+    (zero(), fixture.commit_id, b"refs/heads/ok"),
+  ];
+  let bytes_first = request(
+    &[],
+    &bad_first,
+    b" report-status atomic",
+    &[],
+    &fixture.pack,
+  );
+  let (outcomes_first, judged_first) =
+    outcomes_hiding(&bytes_first, &fixture.repository, &NoneHidden);
+  assert_non_commit_refusal(0, &outcomes_first[0]);
+  assert_eq!(outcomes_first[1], refused_with(b"atomic push failure"));
+  assert_eq!(outcomes_first[2], refused_with(b"atomic push failure"));
+  assert!(judged_first.is_empty());
+
+  let ok_first: [(ObjectId, ObjectId, &[u8]); 3] = [
+    (zero(), fixture.commit_id, b"refs/heads/ok"),
+    (zero(), fixture.pack_tree_id, b"refs/heads/t"),
+    (zero(), fixture.pack_blob_id, b"refs/heads/b"),
+  ];
+  let bytes_mid = request(&[], &ok_first, b" report-status atomic", &[], &fixture.pack);
+  let (outcomes_mid, judged_mid) = outcomes_hiding(&bytes_mid, &fixture.repository, &NoneHidden);
+  assert_eq!(outcomes_mid[0], refused_with(b"atomic push failure"));
+  assert_non_commit_refusal(1, &outcomes_mid[1]);
+  assert_eq!(outcomes_mid[2], refused_with(b"atomic push failure"));
+  assert!(judged_mid.is_empty());
+}
+
+/// Verifies an atomic push whose pack fails unpacking still reports `unpacker error` on EVERY
+/// command (never collapsing siblings into `atomic push failure`).
+fn assert_atomic_pack_refusal_marks_every_command_unpacker_error(fixture: &NonCommitBranchFixture) {
+  let commands: [(ObjectId, ObjectId, &[u8]); 2] = [
+    (zero(), fixture.commit_id, b"refs/heads/one"),
+    (zero(), fixture.commit_id, b"refs/heads/two"),
+  ];
+  let bad_pack = b"NOPE00000000";
+  let bytes = request(&[], &commands, b" report-status atomic", &[], bad_pack);
+  let (outcomes, judged) = outcomes_hiding(&bytes, &fixture.repository, &NoneHidden);
+  assert_eq!(
+    outcomes,
+    [
+      refused_with(b"unpacker error"),
+      refused_with(b"unpacker error"),
+    ]
+  );
+  assert!(judged.is_empty());
 }
 
 /// Test repository wrapper whose `kind` lookup simulates one let-go pack window until brought back.

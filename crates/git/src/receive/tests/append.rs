@@ -364,7 +364,7 @@ fn assert_atomic_intra_batch_df_conflicts(fixture: &SingleCommitFixture) {
   assert_atomic_df_outcomes(
     &outcomes,
     3,
-    "error: cannot process 'refs/heads/topic' and 'refs/heads/topic/docs' at the same time\n",
+    "error: cannot lock ref 'refs/heads/topic': cannot process 'refs/heads/topic' and 'refs/heads/topic/docs' at the same time\n",
   );
   assert!(logs.appended.is_empty());
 }
@@ -425,7 +425,7 @@ fn assert_non_atomic_df_conflict_batch(fixture: &SingleCommitFixture) {
   assert_declined_with_message(
     &reversed[2],
     REFNAME_CONFLICT,
-    "error: cannot process 'refs/heads/topic' and 'refs/heads/topic/docs/deep' at the same time\n",
+    "error: cannot lock ref 'refs/heads/topic': cannot process 'refs/heads/topic' and 'refs/heads/topic/docs/deep' at the same time\n",
   );
   assert_eq!(reversed[3], Outcome::Ok(Vec::new()));
 
@@ -1197,4 +1197,332 @@ fn atomic_df_validation_steps_one_command_per_deciding_step() {
     &[b"refs/tags/topic"],
     "error: cannot lock ref 'refs/tags/topic/child': 'refs/tags/topic' exists; cannot create 'refs/tags/topic/child'\n",
   );
+}
+
+/// Verifies non-atomic 3-level chain D/F wording in both forward and reverse wire orders against
+/// stock Git 2.56.1 (`df_band2_desc_first.py`).
+fn assert_non_atomic_chain3_df_wording(fixture: &SingleCommitFixture) {
+  let id = fixture.commit_id;
+  let mut fwd_logs = Logs::default();
+  let fwd = fixture.push(
+    &[
+      (zero(), id, b"refs/heads/a"),
+      (zero(), id, b"refs/heads/a/b"),
+      (zero(), id, b"refs/heads/a/b/c"),
+    ],
+    false,
+    &mut fwd_logs,
+  );
+  assert_declined_with_message(
+    &fwd[0],
+    REFNAME_CONFLICT,
+    "error: cannot process 'refs/heads/a' and 'refs/heads/a/b' at the same time\n",
+  );
+  assert_declined_with_message(
+    &fwd[1],
+    REFNAME_CONFLICT,
+    "error: cannot process 'refs/heads/a/b' and 'refs/heads/a/b/c' at the same time\n",
+  );
+  assert_eq!(fwd[2], Outcome::Ok(Vec::new()));
+
+  let mut rev_logs = Logs::default();
+  let rev = fixture.push(
+    &[
+      (zero(), id, b"refs/heads/a/b/c"),
+      (zero(), id, b"refs/heads/a/b"),
+      (zero(), id, b"refs/heads/a"),
+    ],
+    false,
+    &mut rev_logs,
+  );
+  assert_eq!(rev[0], Outcome::Ok(Vec::new()));
+  assert_declined_with_message(
+    &rev[1],
+    REFNAME_CONFLICT,
+    "error: cannot lock ref 'refs/heads/a/b': cannot process 'refs/heads/a/b' and 'refs/heads/a' at the same time\n",
+  );
+  assert_declined_with_message(
+    &rev[2],
+    REFNAME_CONFLICT,
+    "error: cannot lock ref 'refs/heads/a': cannot process 'refs/heads/a' and 'refs/heads/a/b/c' at the same time\n",
+  );
+}
+
+/// Verifies atomic descendant-first (`a/b`, `a`), reversed 3-chain (`a/b/c`, `a/b`, `a`), and
+/// multi-child ancestor-first (`t`, `t/z`, `t/a`) match stock Git 2.56.1 band-2 lines.
+fn assert_atomic_descendant_first_df_wording(fixture: &SingleCommitFixture) {
+  let id = fixture.commit_id;
+  let mut logs = Logs::default();
+  let ab_a = fixture.push(
+    &[
+      (zero(), id, b"refs/heads/a/b"),
+      (zero(), id, b"refs/heads/a"),
+    ],
+    true,
+    &mut logs,
+  );
+  assert_atomic_df_outcomes(
+    &ab_a,
+    2,
+    "error: cannot lock ref 'refs/heads/a': cannot process 'refs/heads/a' and 'refs/heads/a/b' at the same time\n",
+  );
+  let rev3 = fixture.push(
+    &[
+      (zero(), id, b"refs/heads/a/b/c"),
+      (zero(), id, b"refs/heads/a/b"),
+      (zero(), id, b"refs/heads/a"),
+    ],
+    true,
+    &mut logs,
+  );
+  assert_atomic_df_outcomes(
+    &rev3,
+    3,
+    "error: cannot lock ref 'refs/heads/a/b': cannot process 'refs/heads/a/b' and 'refs/heads/a' at the same time\n",
+  );
+  let multi = fixture.push(
+    &[
+      (zero(), id, b"refs/heads/t"),
+      (zero(), id, b"refs/heads/t/z"),
+      (zero(), id, b"refs/heads/t/a"),
+    ],
+    true,
+    &mut logs,
+  );
+  assert_atomic_df_outcomes(
+    &multi,
+    3,
+    "error: cannot process 'refs/heads/t' and 'refs/heads/t/a' at the same time\n",
+  );
+  assert!(logs.appended.is_empty());
+}
+
+/// §4.17.2 "A push" (stock Git 2.56.1 descendant-first D/F band-2 parity; `df_band2_desc_first.py`):
+/// do push 3-level forward/reverse chains and descendant-first pairs both non-atomically and
+/// atomically. Expect: descendant-first carries `cannot lock ref '<name>': ` and selects the exact
+/// stock Git 2.56.1 ancestor/descendant pair.
+#[test]
+fn descendant_first_and_chain_df_wording_matches_stock_git_2_56() {
+  let fixture = SingleCommitFixture::new();
+  assert_non_atomic_chain3_df_wording(&fixture);
+  assert_atomic_descendant_first_df_wording(&fixture);
+}
+
+/// Judge with a controllable monotonic `namespace_revision` and injectable concurrent ref changes
+/// to test `AtomicPhase::RecheckingDf` pacing, non-conflicting commit, conflicting refusal, and
+/// double-race fail-closed termination without livelock.
+#[derive(Default)]
+struct RevisionAtomicJudge {
+  /// Pre-existing repository ref names checked by `ref_conflict`.
+  existing: std::collections::BTreeSet<Vec<u8>>,
+  /// Refs hidden from the pushing principal.
+  hidden: std::collections::BTreeSet<Vec<u8>>,
+  /// Current O(1) namespace revision reported by `namespace_revision`.
+  revision: u64,
+  /// Total `ref_conflict` calls observed.
+  ref_conflict_calls: std::cell::Cell<usize>,
+  /// Total `append_atomic` calls observed.
+  atomic_appends: usize,
+}
+
+impl Judge for RevisionAtomicJudge {
+  type Accepted = ();
+
+  fn namespace_revision(&self) -> u64 {
+    self.revision
+  }
+
+  fn ref_conflict(&self, name: &[u8], deleted: &[&[u8]]) -> Option<crate::receive::RefConflict> {
+    self
+      .ref_conflict_calls
+      .set(self.ref_conflict_calls.get() + 1);
+    let hit = self.existing.iter().find(|existing| {
+      !deleted.contains(&existing.as_slice())
+        && crate::receive::refs_conflict(existing.as_slice(), name)
+    })?;
+    Some(if self.hidden.contains(hit) {
+      crate::receive::RefConflict::Hidden
+    } else {
+      crate::receive::RefConflict::Visible(hit.clone())
+    })
+  }
+
+  fn judge(&mut self, _command: &Command, _pushed: &Pushed<'_>) -> Result<(), Declined> {
+    Ok(())
+  }
+
+  fn append(&mut self, _command: &Command, (): ()) -> Result<Vec<Reported>, Declined> {
+    Ok(Vec::new())
+  }
+
+  fn append_atomic(
+    &mut self,
+    accepted: Vec<(&Command, ())>,
+  ) -> Result<Vec<Vec<Reported>>, Declined> {
+    self.atomic_appends += 1;
+    Ok(vec![Vec::new(); accepted.len()])
+  }
+}
+
+/// Starts a checked atomic `Deciding<()>` over `names` pointing to `blob`.
+fn start_atomic_deciding(
+  blob: ObjectId,
+  names: &[&[u8]],
+) -> (crate::receive::Deciding<()>, crate::Admission) {
+  let empty_pack_trailer = ObjectId::from_hex(
+    ObjectFormat::Sha1,
+    b"029d08823bd8a8eab510ad6ac75c823cfd3ed31e",
+  )
+  .unwrap();
+  let mut repo = Repo::default();
+  let _ = repo.with(Kind::Blob, b"fixture");
+  let commands = names
+    .iter()
+    .map(|name| Command {
+      old: zero(),
+      new: blob,
+      name: name.to_vec(),
+    })
+    .collect();
+  let request = crate::receive::Request {
+    format: ObjectFormat::Sha1,
+    commands,
+    shallow: Vec::new(),
+    options: Vec::new(),
+    requested: crate::receive::Requested {
+      atomic: true,
+      ..Default::default()
+    },
+  };
+  let mut admission = unbounded();
+  let checked = crate::receive::check(
+    request,
+    Some(Ok(crate::unpack::Kept {
+      objects: Vec::new(),
+      checksum: empty_pack_trailer,
+    })),
+    (&repo, &crate::unpack::Held::default()),
+    &NoneHidden,
+    &mut admission,
+  )
+  .unwrap();
+  let deciding = crate::receive::Deciding::new(checked, &mut admission).unwrap();
+  (deciding, admission)
+}
+
+/// Advances `deciding` by `steps`, asserting it does not finish early and every step does `<= 1`
+/// `ref_conflict` lookup.
+fn step_n_bounded(
+  deciding: &mut crate::receive::Deciding<()>,
+  judge: &mut RevisionAtomicJudge,
+  admission: &mut crate::Admission,
+  steps: usize,
+) {
+  for _ in 0..steps {
+    let before = judge.ref_conflict_calls.get();
+    let done = deciding.step(None, judge, admission).unwrap();
+    assert!(!done);
+    assert!(judge.ref_conflict_calls.get() - before <= 1);
+  }
+}
+
+/// Finishes `deciding` one step at a time, returning `(outcomes, max_df_per_step)`.
+fn finish_bounded(
+  mut deciding: crate::receive::Deciding<()>,
+  judge: &mut RevisionAtomicJudge,
+  admission: &mut crate::Admission,
+) -> (Vec<Outcome>, usize) {
+  let mut max_step = 0usize;
+  loop {
+    let before = judge.ref_conflict_calls.get();
+    let done = deciding.step(None, judge, admission).unwrap();
+    max_step = max_step.max(judge.ref_conflict_calls.get() - before);
+    if done {
+      return (deciding.received().outcomes, max_step);
+    }
+  }
+}
+
+/// Verifies a concurrent non-conflicting revision bump triggers one bounded `RecheckingDf` pass
+/// (`<= 1` lookup/step) and still commits cleanly.
+fn assert_recheck_non_conflicting_commits(blob: ObjectId) {
+  let (mut deciding, mut admission) =
+    start_atomic_deciding(blob, &[b"refs/tags/a", b"refs/tags/b"]);
+  let mut judge = RevisionAtomicJudge {
+    revision: 1,
+    ..RevisionAtomicJudge::default()
+  };
+  // 2 CheckingDf steps + 2 Judging steps -> paused at Appending { rechecked: false }.
+  step_n_bounded(&mut deciding, &mut judge, &mut admission, 4);
+  judge.existing.insert(b"refs/tags/other".to_vec());
+  judge.revision = 2;
+  let (outcomes, max_step) = finish_bounded(deciding, &mut judge, &mut admission);
+  assert_eq!(
+    (
+      outcomes,
+      max_step <= 1,
+      judge.ref_conflict_calls.get(),
+      judge.atomic_appends
+    ),
+    (vec![Outcome::Ok(Vec::new()); 2], true, 4, 1)
+  );
+}
+
+/// Verifies a concurrent conflicting (including hidden) revision bump is caught during
+/// `RecheckingDf` with `<= 1` lookup/step and zero `append_atomic` calls.
+fn assert_recheck_conflicting_and_hidden_refuse(blob: ObjectId) {
+  let (mut deciding, mut admission) =
+    start_atomic_deciding(blob, &[b"refs/tags/keep", b"refs/tags/secret"]);
+  let mut judge = RevisionAtomicJudge {
+    revision: 10,
+    ..RevisionAtomicJudge::default()
+  };
+  step_n_bounded(&mut deciding, &mut judge, &mut admission, 4);
+  judge.existing.insert(b"refs/tags/secret/child".to_vec());
+  judge.hidden.insert(b"refs/tags/secret/child".to_vec());
+  judge.revision = 11;
+  let (outcomes, max_step) = finish_bounded(deciding, &mut judge, &mut admission);
+  assert_eq!((max_step <= 1, judge.atomic_appends), (true, 0));
+  assert_atomic_df_outcomes(
+    &outcomes,
+    2,
+    "error: cannot lock ref 'refs/tags/secret': refname conflict\n",
+  );
+}
+
+/// Verifies a second concurrent namespace revision move during `RecheckingDf` fails closed with
+/// `ATOMIC_TRANSACTION_FAILED` (no livelock, no retry constants, zero `append_atomic`).
+fn assert_recheck_double_race_fails_closed(blob: ObjectId) {
+  let (mut deciding, mut admission) =
+    start_atomic_deciding(blob, &[b"refs/tags/a", b"refs/tags/b"]);
+  let mut judge = RevisionAtomicJudge {
+    revision: 1,
+    ..RevisionAtomicJudge::default()
+  };
+  // Complete CheckingDf (2) + Judging (2).
+  step_n_bounded(&mut deciding, &mut judge, &mut admission, 4);
+  // First move -> Appending transitions to RecheckingDf { at: 0 } (1 step) + checks at=0 (1 step).
+  judge.revision = 2;
+  step_n_bounded(&mut deciding, &mut judge, &mut admission, 2);
+  // Second move during RecheckingDf -> after at=1 finishes, Appending { rechecked: true } fails closed.
+  judge.revision = 3;
+  let (outcomes, max_step) = finish_bounded(deciding, &mut judge, &mut admission);
+  assert_eq!(
+    (outcomes, max_step <= 1, judge.atomic_appends),
+    (vec![refused(ATOMIC_TRANSACTION_FAILED, None); 2], true, 0)
+  );
+}
+
+/// §4.3 & §4.17.2 (O(1) namespace-revision check + cooperative `RecheckingDf` pass):
+/// do drive atomic pushes through `Deciding::step` when `namespace_revision` moves between
+/// `CheckingDf` and `Appending` (non-conflicting, conflicting hidden ref, and double race during
+/// `RecheckingDf`). Expect: `<= 1` `ref_conflict` lookup per step in every case, non-conflicting
+/// commits cleanly, conflicting hidden ref refuses without disclosing its name, and a second
+/// concurrent move fails closed with `ATOMIC_TRANSACTION_FAILED` without livelock.
+#[test]
+fn atomic_namespace_revision_recheck_handles_race_cleanly_and_bounds_work() {
+  let blob = name_of(ObjectFormat::Sha1, Kind::Blob, b"fixture").unwrap();
+  assert_recheck_non_conflicting_commits(blob);
+  assert_recheck_conflicting_and_hidden_refuse(blob);
+  assert_recheck_double_race_fails_closed(blob);
 }

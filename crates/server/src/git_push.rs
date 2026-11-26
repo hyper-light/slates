@@ -2146,6 +2146,19 @@ fn descendant_ref_conflict(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+  /// Number of `ref_conflict_in` lookups performed on this thread (non-vacuity & pacing counter
+  /// for `ServerJudge` tests; zero production overhead).
+  static REF_CONFLICT_IN_CALLS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Returns the total number of `ref_conflict_in` calls observed on this test thread.
+#[cfg(test)]
+fn ref_conflict_in_calls() -> usize {
+  REF_CONFLICT_IN_CALLS.with(core::cell::Cell::get)
+}
+
 /// Returns an existing live ref in `repository` that has a files-backend directory/file conflict
 /// with `name` and is not among `deleted`, checking both `'/'`-delimited ancestors and descendants
 /// of `name` across all ref namespaces (including hidden refs) and redacting any ref hidden by
@@ -2158,6 +2171,8 @@ fn ref_conflict_in<H: HiddenRefs + ?Sized>(
   name: &[u8],
   deleted: &[&[u8]],
 ) -> Option<receive::RefConflict> {
+  #[cfg(test)]
+  REF_CONFLICT_IN_CALLS.with(|count| count.set(count.get().saturating_add(1)));
   let existing = ancestor_ref_conflict(repositories, store, repository, name, deleted)
     .or_else(|| descendant_ref_conflict(repositories, store, repository, name, deleted))?;
   Some(if hidden.is_hidden(&existing) {
@@ -2806,10 +2821,12 @@ impl Judge for ServerJudge<'_> {
       .map(|&(command, _)| command.name.as_slice())
       .collect();
     let declined = |unappended: Unappended| works::atomic_declined(&names, &unappended);
+    if self.state.vcs_stores.git_ref(self.record.id).is_none() {
+      return Err(declined(refused_at(0, &words(&GitRefused::NoStore))));
+    }
     let count = accepted.len();
     let mut planned = Vec::with_capacity(count);
     for (at, (command, entry)) in accepted.into_iter().enumerate() {
-      self.check_append_df(command, receive::ATOMIC_TRANSACTION_FAILED)?;
       planned.push(self.planned(command, entry, at).map_err(declined)?);
     }
     self.appended(planned).map_err(declined)?;
@@ -2828,14 +2845,35 @@ impl Judge for ServerJudge<'_> {
       deleted,
     )
   }
+
+  fn namespace_revision(&self) -> u64 {
+    let Some((_, git)) = self.state.vcs_stores.git_ref(self.record.id) else {
+      return 0;
+    };
+    let Some(names) = self
+      .state
+      .db
+      .partition()
+      .repositories()
+      .log_position(self.record.id, slates_db::catalog::StateLog::Names)
+    else {
+      return 0;
+    };
+    let revision = names.wrapping_add(git.store_rev);
+    if revision == 0 { 1 } else { revision }
+  }
 }
 
 impl ServerJudge<'_> {
   /// Re-checks live repository refs for a files-backend D/F conflict against `command` right
-  /// before calling `push_sealed` in the same synchronous owner-shard step.
+  /// before calling `push_sealed` in the same synchronous owner-shard step (used by single-command
+  /// non-atomic [`Judge::append`]; fails closed if the Git store is unavailable/rebuilding).
   fn check_append_df(&self, command: &Command, reason: &[u8]) -> Result<(), Declined> {
-    let Some((content, git)) = self.state.vcs_stores.git_ref(self.record.id) else {
+    if command.is_delete() {
       return Ok(());
+    }
+    let Some((content, git)) = self.state.vcs_stores.git_ref(self.record.id) else {
+      return Err(refused_declined(&command.name, words(&GitRefused::NoStore)));
     };
     let repositories = self.state.db.partition().repositories();
     append_df_guard(

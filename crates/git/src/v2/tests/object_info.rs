@@ -630,8 +630,8 @@ fn expected_infos(
   }
   expected.extend(ids.iter().map(|&id| {
     let values = match (asked_size, asked_type, store.info(&id)) {
-      (false, false, _) => Values::NotAsked,
       (_, _, None) => Values::Unknown,
+      (false, false, Some(_)) => Values::NotAsked,
       (true, true, Some(meta)) => Values::SizeType(meta.size, meta.kind),
       (true, false, Some(meta)) => Values::Size(meta.size),
       (false, true, Some(meta)) => Values::Type(meta.kind),
@@ -639,6 +639,83 @@ fn expected_infos(
     Info::Object { id, values }
   }));
   expected
+}
+
+/// Stock Git 2.56.1 bare `object-info` (neither `size` nor `type` requested) wire parity:
+/// do answer a bare request naming a visible object, a missing object, and a hidden object
+/// (invisible via `ObjectInfo` returning `None`), and decode/re-encode the response including a
+/// missing-first bare response. Expect: present objects emit bare `<oid>` (`002c<oid>`), missing
+/// and hidden objects emit `<oid> ` (`002d<oid> `), and both decode and encode round-trip cleanly.
+#[test]
+fn bare_object_info_reports_missing_and_hidden_objects_with_trailing_space() {
+  let blob_hex = "814f4a422927b82f5f8a43f8fab6d3839e3983f2";
+  let hidden_hex = "2e01529673a750e4b001c538bc95d5a4b7c9d7e3";
+  let blob = id(ObjectFormat::Sha1, blob_hex);
+  let hidden = id(ObjectFormat::Sha1, hidden_hex);
+  let missing = id(ObjectFormat::Sha1, UNKNOWN);
+  // Visibility-filtered view holding only `blob` (hiding `hidden` as `VisibleObjects` does).
+  let visible = Objects(vec![(
+    blob,
+    ObjectMeta {
+      size: 8,
+      kind: Kind::Blob,
+    },
+  )]);
+
+  let bare_args = [
+    Line::lf(Argument::Oid(blob)),
+    Line::lf(Argument::Oid(missing)),
+    Line::lf(Argument::Oid(hidden)),
+  ];
+  let response = answered(&bare_args, ObjectFormat::Sha1, &visible);
+  let expected_wire = format!("002c{blob_hex}002d{UNKNOWN} 002d{hidden_hex} 0000");
+  assert_eq!(response, expected_wire.as_bytes());
+
+  let decoded = decode_answer(&response, ObjectFormat::Sha1, &mut room()).unwrap();
+  assert_eq!(
+    decoded.iter().map(|line| line.value).collect::<Vec<_>>(),
+    [
+      Info::Object {
+        id: blob,
+        values: Values::NotAsked,
+      },
+      Info::Object {
+        id: missing,
+        values: Values::Unknown,
+      },
+      Info::Object {
+        id: hidden,
+        values: Values::Unknown,
+      },
+    ]
+  );
+  let mut reencoded = Vec::new();
+  encode_answer(&decoded, ObjectFormat::Sha1, &mut reencoded).unwrap();
+  assert_eq!(reencoded, response);
+
+  // Bare answer starting with a missing object (`Stage::Start` -> `Stage::ObjectsBare`).
+  let missing_first = format!("002d{UNKNOWN} 002c{blob_hex}0000");
+  let decoded_missing_first =
+    decode_answer(missing_first.as_bytes(), ObjectFormat::Sha1, &mut room()).unwrap();
+  assert_eq!(
+    decoded_missing_first
+      .iter()
+      .map(|line| line.value)
+      .collect::<Vec<_>>(),
+    [
+      Info::Object {
+        id: missing,
+        values: Values::Unknown,
+      },
+      Info::Object {
+        id: blob,
+        values: Values::NotAsked,
+      },
+    ]
+  );
+  let mut roundtrip = Vec::new();
+  encode_answer(&decoded_missing_first, ObjectFormat::Sha1, &mut roundtrip).unwrap();
+  assert_eq!(roundtrip, missing_first.as_bytes());
 }
 
 proptest! {

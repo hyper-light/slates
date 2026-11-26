@@ -19,10 +19,11 @@
 //! obj-info = obj-id [SP [obj-val *(SP obj-val)]]
 //! ```
 //!
-//! **As stock Git 2.56.1 answers** (`send_info`): no attribute line and each id alone when neither `size` nor `type`
-//! was asked for, and every line without an LF (`packet_writer_write`), where the document's grammar ends each with
-//! one. A reader takes either ending and records it, as every v2 line does, so a decoded answer writes back to its
-//! bytes.
+//! **As stock Git 2.56.1 answers** (`send_info`): no attribute line when neither `size` nor `type`
+//! was asked for, writing each present object as its bare `<oid>` and each missing or hidden object
+//! as `<oid> ` (trailing space), and every line without an LF (`packet_writer_write`), where the
+//! document's grammar ends each with one. A reader takes either ending and records it, as every v2
+//! line does, so a decoded answer writes back to its bytes.
 //!
 //! **Where git departs, and why this does.** git answers an argument it does not know with an `ERR` line and goes on,
 //! and an id it cannot read with another; a request with either is refused here by kind before any answer, as `fetch`'s
@@ -208,7 +209,7 @@ enum Stage {
   HeaderSizeType,
   /// Header announced `type`, then `size`.
   HeaderTypeSize,
-  /// Object lines after no attribute header: ids alone.
+  /// Object lines after no attribute header: bare ids for present objects, `<oid> ` for missing or hidden.
   ObjectsBare,
   /// Object lines after `size`.
   ObjectsSize,
@@ -262,7 +263,7 @@ impl Stage {
       (
         Stage::Start | Stage::ObjectsBare,
         Info::Object {
-          values: Values::NotAsked,
+          values: Values::NotAsked | Values::Unknown,
           ..
         },
       ) => Ok(Stage::ObjectsBare),
@@ -470,9 +471,6 @@ fn object_values(
   id: &ObjectId,
   objects: &impl ObjectInfo,
 ) -> Values {
-  if !asked_size && !asked_type {
-    return Values::NotAsked;
-  }
   let Some(meta) = objects.info(id) else {
     return Values::Unknown;
   };

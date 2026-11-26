@@ -4857,6 +4857,14 @@ impl<H: slates_git::receive::HiddenRefs + ?Sized> slates_git::receive::Judge
     )
   }
 
+  fn namespace_revision(&self) -> u64 {
+    self
+      .fixture
+      .repositories
+      .log_position(self.fixture.repo_id, slates_db::catalog::StateLog::Names)
+      .unwrap_or(0)
+  }
+
   fn judge(
     &mut self,
     _command: &slates_git::receive::Command,
@@ -4890,16 +4898,6 @@ impl<H: slates_git::receive::HiddenRefs + ?Sized> slates_git::receive::Judge
     &mut self,
     accepted: Vec<(&slates_git::receive::Command, ())>,
   ) -> Result<Vec<Vec<slates_git::receive::Reported>>, Declined> {
-    for &(command, _) in &accepted {
-      super::append_df_guard(
-        &self.fixture.repositories,
-        (&self.fixture.content, &self.fixture.git),
-        self.fixture.repo_id,
-        self.hidden,
-        command,
-        ATOMIC_TRANSACTION_FAILED,
-      )?;
-    }
     let count = accepted.len();
     for (command, _) in accepted {
       if command.is_delete() {
@@ -5472,6 +5470,431 @@ fn t_rt_git_df_interleaved_receive_packs_cannot_both_commit() {
       held,
       &done_a.unwrap(),
       &done_b.unwrap(),
+    );
+  });
+}
+
+/// Shape: sibling refs pushed atomically to verify O(1) per-step pacing on `ServerJudge`.
+const ATOMIC_PACE_REFS: usize = 8;
+
+/// Drives `push` to completion one `answer_step` at a time, returning `(received, max_df_per_step,
+/// final_step_df, total_df)` counted via `super::ref_conflict_in_calls`.
+fn drive_receive_pack_counting_df(
+  state: &mut ShardState,
+  push: &mut ReceivePack,
+) -> (Received, usize, usize, usize) {
+  let mut max_step = 0usize;
+  let mut total = 0usize;
+  loop {
+    let before = super::ref_conflict_in_calls();
+    let done = step_receive_pack(state, push);
+    let delta = super::ref_conflict_in_calls().saturating_sub(before);
+    max_step = max_step.max(delta);
+    total = total.saturating_add(delta);
+    if let Some(received) = done {
+      return (received, max_step, delta, total);
+    }
+  }
+}
+
+/// Red-team regression (`rt-git-post4`, `atomic-pace.py`, §4.3 & §4.17.2): an N-ref `--atomic`
+/// push driven through real `ReceivePack` / `ServerJudge` MUST perform `<= 1` `ref_conflict_in`
+/// lookup per step and **0** `ref_conflict_in` lookups in the final `ServerJudge::append_atomic`
+/// step (exact total == N across `CheckingDf` alone when uncontended).
+#[test]
+fn t_rt_git_server_judge_atomic_pacing_zero_lookups_in_append() {
+  crate::test_store::audit_on_stored_shard("git-push-atomic-pace", |state| {
+    let repository = seeded_df_repo(state, "atomic-pace");
+    let names: Vec<Vec<u8>> = (0..ATOMIC_PACE_REFS)
+      .map(|index| format!("refs/heads/pace-{index:02}").into_bytes())
+      .collect();
+    let commands: Vec<(&str, &str, &[u8])> = names
+      .iter()
+      .map(|name| ("", SECOND, name.as_slice()))
+      .collect();
+    let (_, mut push) = started(state, repository);
+    let wire = request(&commands, ATOMIC, empty_pack());
+    push.input(state, &wire).unwrap();
+    push.end(state).unwrap();
+    let (received, max_step, final_step, total) = drive_receive_pack_counting_df(state, &mut push);
+    assert_eq!(
+      (reasons(&received), max_step <= 1, final_step, total,),
+      (
+        vec![b"ok".to_vec(); ATOMIC_PACE_REFS],
+        true,
+        0,
+        ATOMIC_PACE_REFS,
+      ),
+      "max_step={max_step}, final_step={final_step}, total={total}"
+    );
+  });
+}
+
+/// Thin wrapper over real [`super::ServerJudge`] that returns `false` from `ready()` once so a
+/// test can pause a non-atomic `Deciding` right between `non_atomic_df_conflict` (`df_checked =
+/// true`) and `ServerJudge::append`, exercising `ServerJudge::check_append_df` directly.
+struct PauseReadyOnce<'j> {
+  /// Underlying production judge.
+  inner: super::ServerJudge<'j>,
+  /// Whether the next `ready()` call should yield once.
+  pause_once: bool,
+}
+
+impl slates_git::receive::Judge for PauseReadyOnce<'_> {
+  type Accepted = slates_git::receive::works::Entry;
+
+  fn rank(
+    &mut self,
+    command: &slates_git::receive::Command,
+    pushed: &slates_git::receive::Pushed<'_>,
+  ) -> u64 {
+    self.inner.rank(command, pushed)
+  }
+
+  fn ready(
+    &mut self,
+    command: &slates_git::receive::Command,
+    pushed: &slates_git::receive::Pushed<'_>,
+  ) -> bool {
+    if self.pause_once {
+      self.pause_once = false;
+      return false;
+    }
+    self.inner.ready(command, pushed)
+  }
+
+  fn judge(
+    &mut self,
+    command: &slates_git::receive::Command,
+    pushed: &slates_git::receive::Pushed<'_>,
+  ) -> Result<Self::Accepted, Declined> {
+    self.inner.judge(command, pushed)
+  }
+
+  fn append(
+    &mut self,
+    command: &slates_git::receive::Command,
+    accepted: Self::Accepted,
+  ) -> Result<Vec<slates_git::receive::Reported>, Declined> {
+    self.inner.append(command, accepted)
+  }
+
+  fn append_atomic(
+    &mut self,
+    accepted: Vec<(&slates_git::receive::Command, Self::Accepted)>,
+  ) -> Result<Vec<Vec<slates_git::receive::Reported>>, Declined> {
+    self.inner.append_atomic(accepted)
+  }
+
+  fn ref_conflict(
+    &self,
+    name: &[u8],
+    deleted: &[&[u8]],
+  ) -> Option<slates_git::receive::RefConflict> {
+    self.inner.ref_conflict(name, deleted)
+  }
+
+  fn namespace_revision(&self) -> u64 {
+    self.inner.namespace_revision()
+  }
+}
+
+/// Steps `push` until `target_df_calls` `ref_conflict_in` lookups have run (proving `CheckingDf`
+/// completed) without finishing the push, asserting each step performs `<= 1` lookup.
+fn step_until_df_checked(state: &mut ShardState, push: &mut ReceivePack, target_df_calls: usize) {
+  let mut observed = 0usize;
+  while observed < target_df_calls {
+    let before = super::ref_conflict_in_calls();
+    assert!(
+      step_receive_pack(state, push).is_none(),
+      "push must still be in flight after {observed}/{target_df_calls} D/F checks"
+    );
+    let delta = super::ref_conflict_in_calls().saturating_sub(before);
+    assert!(delta <= 1, "expected <= 1 lookup per step, got {delta}");
+    observed = observed.saturating_add(delta);
+  }
+}
+
+/// Drives `push` through checking, sealing, and homing without stepping `Deciding` yet, returning
+/// the extracted `DecidingPush` poised before step 0 so tests can drive [`super::ServerJudge`]
+/// directly on `state`.
+fn take_ready_deciding(state: &mut ShardState, push: &mut ReceivePack) -> Box<super::DecidingPush> {
+  while !push.check_turn(state).unwrap() {}
+  let mut sink = Vec::new();
+  let super::Begun::Sealing(mut sealing) = push.begin(state, false, &mut sink).unwrap() else {
+    panic!("expected Sealing from begin");
+  };
+  loop {
+    match push.seal_turn(state, *sealing).unwrap() {
+      super::Sealed::Turned => {
+        let super::AnswerState::Sealing(next) =
+          core::mem::replace(&mut push.answer, super::AnswerState::Done)
+        else {
+          panic!("expected Sealing after Turned");
+        };
+        sealing = next;
+      }
+      super::Sealed::Deciding(mut decision) => {
+        assert!(push.homing_turn(state, &mut decision).unwrap());
+        return decision;
+      }
+      other => panic!(
+        "unexpected seal outcome: {:?}",
+        core::mem::discriminant(&other)
+      ),
+    }
+  }
+}
+
+/// Runs one `Deciding::step` over `decision` using a real [`super::ServerJudge`], optionally
+/// pausing once in `ready()`.
+fn step_direct_server_judge(
+  state: &mut ShardState,
+  push: &mut ReceivePack,
+  decision: &mut super::DecidingPush,
+  pause_ready_once: bool,
+) -> bool {
+  let super::DecidingPush {
+    record,
+    sealed,
+    name,
+    verdicts,
+    deciding,
+    admitting,
+    restaging,
+    preparing,
+    peel_away,
+    making_room,
+    door,
+    ..
+  } = decision;
+  let inner = super::ServerJudge {
+    state,
+    push: sealed,
+    record,
+    principal: &push.principal,
+    hidden: push.session.hidden(),
+    name: *name,
+    hooks: verdicts,
+    admitting,
+    restaging,
+    preparing,
+    peel_away,
+    making_room,
+    door,
+  };
+  let mut judge = PauseReadyOnce {
+    inner,
+    pause_once: pause_ready_once,
+  };
+  deciding
+    .step(None, &mut judge, &mut push.admission)
+    .unwrap()
+}
+
+/// Verifies atomic interleaved D/F race on real `ServerJudge`: session 2 completes `CheckingDf`
+/// for `[keep, topic/sub]`, session 1 commits `topic`, and session 2 catches `topic` during
+/// `RecheckingDf` with `<= 1` lookup/step and rolls back atomically.
+fn assert_server_judge_interleaved_atomic_df_race(state: &mut ShardState) {
+  let repository = seeded_df_repo(state, "sj-atomic-df-race");
+  let (_, mut push_b) = started(state, repository);
+  let req_b = request(
+    &[
+      ("", SECOND, b"refs/heads/keep"),
+      ("", SECOND, b"refs/heads/topic/sub"),
+    ],
+    ATOMIC,
+    empty_pack(),
+  );
+  push_b.input(state, &req_b).unwrap();
+  push_b.end(state).unwrap();
+  step_until_df_checked(state, &mut push_b, 2);
+
+  push_empty_ok(
+    state,
+    repository,
+    &[("", SECOND, b"refs/heads/topic")],
+    CAPABILITIES,
+  );
+  let (received, max_step, _, recheck_calls) = drive_receive_pack_counting_df(state, &mut push_b);
+  assert_atomic_df_refused(&received, b"refs/heads/topic");
+  assert_eq!(
+    (
+      max_step <= 1,
+      recheck_calls >= 1,
+      bound(state, repository, "topic"),
+      bound(state, repository, "keep"),
+      bound(state, repository, "topic/sub"),
+    ),
+    (true, true, true, false, false)
+  );
+}
+
+/// Verifies non-atomic mid-decision D/F race directly against real `ServerJudge`: session 2 passes
+/// `non_atomic_df_conflict` (`df_checked = true`) and yields once in `ready()`, session 1 commits
+/// `refs/heads/topic`, and session 2's `ServerJudge::append` -> `check_append_df` refuses
+/// `refs/heads/topic/sub` with `REFNAME_CONFLICT`.
+fn assert_server_judge_direct_non_atomic_df_race(state: &mut ShardState) {
+  let repository = seeded_df_repo(state, "sj-plain-df-race");
+  let (_, mut push_b) = started(state, repository);
+  let req_b = request(
+    &[("", SECOND, b"refs/heads/topic/sub")],
+    CAPABILITIES,
+    empty_pack(),
+  );
+  push_b.input(state, &req_b).unwrap();
+  push_b.end(state).unwrap();
+  let mut decision = take_ready_deciding(state, &mut push_b);
+
+  let df_before = super::ref_conflict_in_calls();
+  let step1_done = step_direct_server_judge(state, &mut push_b, &mut decision, true);
+  assert_eq!(
+    (
+      step1_done,
+      super::ref_conflict_in_calls().saturating_sub(df_before)
+    ),
+    (false, 1)
+  );
+
+  // Concurrent push commits `refs/heads/topic` while `df_checked == true` on session 2.
+  push_empty_ok(
+    state,
+    repository,
+    &[("", SECOND, b"refs/heads/topic")],
+    CAPABILITIES,
+  );
+
+  while !step_direct_server_judge(state, &mut push_b, &mut decision, false) {}
+  decision.sealed.abandon(state);
+  let received = decision.deciding.received();
+  assert_df_refused(&received, b"refs/heads/topic");
+  assert_eq!(
+    (
+      bound(state, repository, "topic"),
+      bound(state, repository, "topic/sub"),
+    ),
+    (true, false)
+  );
+}
+
+/// Verifies real `ServerJudge` fails closed when `vcs_stores.git_ref(id)` returns `None` (store
+/// unavailable/rebuilding): `namespace_revision() == 0`, `check_append_df` returns `Err`, and
+/// `append_atomic` returns `Err`.
+fn assert_server_judge_fails_closed_without_git_store(state: &mut ShardState) {
+  use slates_git::receive::Judge as _;
+  let repository = seeded_df_repo(state, "sj-no-store");
+  let (_, mut push) = started(state, repository);
+  let req = request(
+    &[("", SECOND, b"refs/heads/after-free")],
+    CAPABILITIES,
+    empty_pack(),
+  );
+  push.input(state, &req).unwrap();
+  push.end(state).unwrap();
+  let mut decision = take_ready_deciding(state, &mut push);
+  crate::vcs_store::free(state, repository);
+
+  let cmd = slates_git::receive::Command {
+    old: ObjectId::null(ObjectFormat::Sha1),
+    new: ObjectId::from_hex(ObjectFormat::Sha1, SECOND.as_bytes()).unwrap(),
+    name: b"refs/heads/after-free".to_vec(),
+  };
+  let (rev, df_err, atomic_err) = {
+    let super::DecidingPush {
+      record,
+      sealed,
+      name,
+      verdicts,
+      admitting,
+      restaging,
+      preparing,
+      peel_away,
+      making_room,
+      door,
+      ..
+    } = &mut *decision;
+    let mut judge = super::ServerJudge {
+      state,
+      push: sealed,
+      record,
+      principal: &push.principal,
+      hidden: push.session.hidden(),
+      name: *name,
+      hooks: verdicts,
+      admitting,
+      restaging,
+      preparing,
+      peel_away,
+      making_room,
+      door,
+    };
+    (
+      judge.namespace_revision(),
+      judge.check_append_df(&cmd, REFNAME_CONFLICT).is_err(),
+      judge.append_atomic(Vec::new()).is_err(),
+    )
+  };
+  decision.sealed.abandon(state);
+  assert_eq!((rev, df_err, atomic_err), (0, true, true));
+}
+
+/// Red-team regression (`rt-git-post4`, direct production `ServerJudge` tests):
+/// verifies (a) interleaved atomic and direct non-atomic `Deciding` sessions over real
+/// `ServerJudge` refuse concurrent D/F conflicts, and (b) `ServerJudge` fails closed when
+/// `git_ref` returns `None`.
+#[test]
+fn t_rt_git_server_judge_interleaved_atomic_and_non_atomic_df_race() {
+  crate::test_store::audit_on_stored_shard("git-push-sj-df-race", |state| {
+    assert_server_judge_interleaved_atomic_df_race(state);
+    assert_server_judge_direct_non_atomic_df_race(state);
+    assert_server_judge_fails_closed_without_git_store(state);
+  });
+}
+
+/// Red-team regression (`rt-git-post4`, real `ServerJudge` non-conflicting recheck):
+/// two interleaved non-conflicting `--atomic` pushes (`refs/heads/a` and `[refs/heads/b1,
+/// refs/heads/b2]`) where session 2 finishes `CheckingDf`, session 1 commits `refs/heads/a`
+/// (moving `namespace_revision`), and session 2 runs `RecheckingDf` (`<= 1` lookup/step, `0`
+/// lookups in `append_atomic`) and still commits cleanly.
+#[test]
+fn t_rt_git_server_judge_interleaved_non_conflicting_atomic_rechecks_and_commits() {
+  crate::test_store::audit_on_stored_shard("git-push-sj-recheck-ok", |state| {
+    let repository = seeded_df_repo(state, "sj-recheck-ok");
+    let (_, mut push_b) = started(state, repository);
+    let req_b = request(
+      &[
+        ("", SECOND, b"refs/heads/b1"),
+        ("", SECOND, b"refs/heads/b2"),
+      ],
+      ATOMIC,
+      empty_pack(),
+    );
+    push_b.input(state, &req_b).unwrap();
+    push_b.end(state).unwrap();
+    step_until_df_checked(state, &mut push_b, 2);
+
+    push_empty_ok(state, repository, &[("", SECOND, b"refs/heads/a")], ATOMIC);
+    let (received, max_step, final_step, recheck_calls) =
+      drive_receive_pack_counting_df(state, &mut push_b);
+    assert_eq!(
+      (
+        reasons(&received),
+        max_step <= 1,
+        final_step,
+        recheck_calls,
+        bound(state, repository, "a"),
+        bound(state, repository, "b1"),
+        bound(state, repository, "b2"),
+      ),
+      (
+        vec![b"ok".to_vec(), b"ok".to_vec()],
+        true,
+        0,
+        2,
+        true,
+        true,
+        true,
+      )
     );
   });
 }
