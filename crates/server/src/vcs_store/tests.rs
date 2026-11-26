@@ -1476,9 +1476,8 @@ pub(crate) fn on_state<T>(f: impl FnOnce(&mut ShardState) -> T) -> T {
 }
 
 /// `changes` appended with `sealed`'s objects and `moves` through A-635's append, from a task of the shard: its names
-/// and pack homed and landed by awaiting
-/// (`vcs_store::commits::home_and_land`), never holding the shard through the store's commit as
-/// `home_and_land_blocking` does (main 01a20182's order of 2026-11-26, the shard-blocking allow-list).
+/// and pack homed and landed by awaiting (`vcs_store::commits::home_and_land`), never holding the shard through the
+/// store's commit (main 01a20182's order of 2026-11-26, the shard-blocking allow-list).
 pub(crate) async fn appended_awaited(
   repository: RepositoryId,
   changes: Vec<BranchChange>,

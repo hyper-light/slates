@@ -760,44 +760,6 @@ fn recorded_after_landing(
   }
 }
 
-/// [`create_repository`] for a test's synchronous history on a shard of a node keeping a store (A-767 item 7's one
-/// landing order): the creation's changeset landed and waited for on a thread of its own
-/// (`crate::test_store::land_blocking`), then recorded, so the repository stands when this returns, as a client's
-/// creation stands when it is answered.
-#[cfg(test)]
-pub(crate) fn create_blocking(
-  state: &mut ShardState,
-  (disk, principal): (slates_store::owner::StoreHandle, &Principal),
-  asked: (&str, VcsTool, ObjectFormat, &str),
-  green: Option<VolumeId>,
-) -> ReplyBody {
-  let adopted = match green.map(|volume| adoptable(state, principal, volume)) {
-    Some(Ok(id)) => Some(id),
-    Some(Err(refusal)) => return refused(refusal),
-    None => None,
-  };
-  let ids = match creation_ids(state, adopted) {
-    Ok(ids) => ids,
-    Err(refusal) => return refused(refusal),
-  };
-  let (header, parts, svn_created) = match creation_changeset(state, (&disk, principal), asked, ids)
-  {
-    Ok(changeset) => changeset,
-    Err(reply) => return *reply,
-  };
-  let landed = crate::test_store::land_answered_blocking(disk, header, parts)
-    .map(drop)
-    .map_err(|error| refusal_of_owner(state, &error));
-  recorded_after_landing(
-    state,
-    principal,
-    asked,
-    (adopted, ids),
-    (landed, None, svn_created),
-  )
-  .0
-}
-
 /// Format: a repository's creation record in its store (A-767): one line each of a marker, the name, the default
 /// branch, the tool and the object format, as the client asked for them.
 fn creation_record(

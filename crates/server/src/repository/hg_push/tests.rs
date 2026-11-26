@@ -434,6 +434,30 @@ fn made_and_pushed_on(daemon: &crate::Daemon, name: &'static str, unbundle: Unbu
   hg
 }
 
+/// Mercurial repository `name` made on `daemon`'s first shard, not publishing ([`Hg::made_non_publishing`]), and
+/// `unbundle` pushed to it as a client pushes it ([`pushed`]), from a task there, every store wait awaited, accepted:
+/// the repository's id. For another module's daemon test that needs a history landed draft before its own steps.
+pub(crate) fn made_non_publishing_and_pushed_on(
+  daemon: &crate::Daemon,
+  name: &'static str,
+  unbundle: Unbundle,
+) -> RepositoryId {
+  let (hg, outcome) = crate::test_store::run_on_first(
+    daemon,
+    move || async move {
+      let hg = Hg::made_non_publishing(name).await;
+      let outcome = pushed(&hg, &unbundle).await;
+      (hg, outcome)
+    },
+    NAMED_PATIENCE,
+  );
+  assert!(
+    matches!(outcome, Outcome::Accepted(_)),
+    "the push was refused: {outcome:?}"
+  );
+  hg.repository
+}
+
 /// Mercurial repository `name` made on `daemon`'s first shard from a task there (`test_store::created`).
 fn made_on(daemon: &crate::Daemon, name: &'static str) -> Hg {
   crate::test_store::run_on_first(

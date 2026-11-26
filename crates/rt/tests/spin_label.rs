@@ -142,6 +142,7 @@ const LONG_POLL: Duration = Duration::from_millis(20);
 /// pulse names the long task's spawn site, this file at its spawning line, as its longest poll's task, with the
 /// shorter polls before and after it leaving that name as it is.
 #[test]
+#[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
 fn a_shards_longest_poll_names_its_task() {
   let runtime = Runtime::start(&config()).unwrap();
   let shard = *runtime.shard_ids().first().unwrap();

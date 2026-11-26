@@ -22,7 +22,7 @@ fn on<R>(step: impl FnOnce(&mut ShardState) -> R) -> R {
 
 /// `body` asked of `state` as the owner, outside a recorded request.
 fn ask(state: &mut ShardState, body: RequestBody) -> ReplyBody {
-  crate::test_store::create(state, &crate::vcs_store::tests::owner(), body)
+  crate::verbs::dispatch(state, 1, &crate::vcs_store::tests::owner(), body)
 }
 
 /// The file the green holds, a generated function a line pair.

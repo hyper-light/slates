@@ -60650,6 +60650,25 @@ Applied in the same change to:
   to 47.6-52.6 s at 1,000 clients (hot files change several times a second), past its doubling deadline, where a turn's
   share is all that is left: steps of up to the ceiling for the rest of the run. Reverted; owed again with a slice that
   keeps a hot file's partial short and a share past the deadline that stays bounded (main's 23:50 ruling).
+- **The share past the deadline, bounded (A-920's checkpoint piece, w-svn for main 01a20182, its ruling of 2026-11-26).**
+  A wide import's checkpoint task (`merge_service.rs:359`) held its shard 400,899-405,990 µs in one fold step (debug, a
+  7,441-key backlog), its turn's budget everything left once the deadline had passed (`left.max(quantum)`), and its
+  spread share 40-44 ms before it. `turn_budget_ns` now clamps the share to between the quantum and the step ceiling
+  (`config::STEP_QUANTUM_CEILING_NS`, A-928's cap, half 84a's loaded bar), and past the deadline a turn takes the
+  ceiling, never everything left. A key's hash stays the unit (no slicing inside a key: d4c7e1f42's lesson), so a turn
+  takes keys until the next would pass its budget, at least one. The checkpoint then lands later, by its backlog over a
+  ceiling-turn's keys; the chain's cap stays the hard bound (`Doubling::Now` at the cap), so nothing grows without end.
+  Measured after (debug, the three wide tests): no checkpoint task's poll is the shard's longest any more, and a
+  checkpoint took 477-686 ms in turns (`in_turns_longest_ns`, which the wide tests print). Red first:
+  `a_folds_turn_budget_spreads_what_is_left_over_the_turns_before_its_deadline` expects the ceiling past the deadline
+  and for a share past it (red: 80 ms, everything left). The begin's build and encode (`CheckpointHold::begin`), first
+  taken for the 428 ms, are 1.6 and 1.2 ms (debug, 9,000 files, 512 KB): the 428 ms poll was the fold in the same task.
+  Main's A/B at A-579's Z, before and after, is owed (completion must not fall back into seconds).
+  An import's landing begins its checkpoints in their task's turns (`checkpoint_green_in_turns`), at its versions'
+  apply's end and its tail: `checkpoint_green` took the first fold and hold steps in its caller's step, 16 ms of one
+  landing poll (debug, 9,000 files), since a paced step with no one waiting runs on past its quantum (A-783). Other
+  callers keep the inline first steps. Counter `merge.checkpoint.begun_inline`: none from a wide landing in `t_c2c`
+  (red: one, before).
 - **The checkpoint by name, held in turns (A-579's last step, piece 1; main's order of 15:00, goal 93's, since it
   scales).** w-work-cow measured a 1 GiB green's checkpoint right after its sliced submit at 650-1,063 ms in one step:
   build 52, encode 71, record 527 ms of `db.mutate_owned`. That stalls the watchdog for any green that large, a big

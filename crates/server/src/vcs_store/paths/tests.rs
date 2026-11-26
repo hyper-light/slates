@@ -39,27 +39,7 @@ fn owner() -> Principal {
 
 /// `body` asked of `state` as the owner.
 pub(crate) fn ask(state: &mut ShardState, body: RequestBody) -> ReplyBody {
-  crate::test_store::create(state, &owner(), body)
-}
-
-/// A git repository named `name`: its id and its root green.
-pub(crate) fn git_repository(state: &mut ShardState, name: &str) -> (RepositoryId, VolumeId) {
-  let reply = ask(
-    state,
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool: VcsTool::Git,
-      format: ObjectFormat::Sha1,
-      default_branch: "main".to_owned(),
-      green: None,
-    },
-  );
-  let ReplyBody::GreenCreated { id } = reply else {
-    panic!("no repository: {reply:?}")
-  };
-  let repositories = state.db.partition().repositories();
-  let record = repositories.repository_named(name).expect("the record");
-  (record.id, id)
+  crate::verbs::dispatch(state, 1, &owner(), body)
 }
 
 /// What these tests ask a creation for: git repository `name`, its default `main`, made by [`owner`] as a client's

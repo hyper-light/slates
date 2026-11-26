@@ -641,10 +641,11 @@
 > (`docs/bugs/2026-11-20-a-shards-idle-spin-took-a-clients-kick.md`).
 
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
-> the landing's entry are sliced (A-920 pieces 1-6b). Left: the checkpoint task's begin and its identity fold
-> (`merge_service.rs:359`: `CheckpointHold::begin` builds and encodes the green's checkpoint whole, 428 ms in one poll
-> debug at 9,000 files; `turn_budget_ns` past its deadline gives the fold everything left, 406 ms), the checkpoint's
-> own piece (A-869, A-579). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
+> the landing's entry are sliced (A-920 pieces 1-6b), and the checkpoint's identity fold takes at most the step ceiling a
+> turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history
+> task (debug, 9,000 files): the tail's `fold_to_readers` (7.6 ms), the register's op
+> (`publish_held_increments` and `record_all`, 8 ms), and a turn (19 ms); its longest landing poll 28-76 ms a run. Owed:
+> the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
 > files): `made_commit.rs` (two calls), `vcs_store/svn_made.rs`, `vcs_store/hg_made.rs`, `greens.rs`'s own caller. A
 > probe of a wide made commit on each VCS would name any past the bar.
@@ -1205,7 +1206,19 @@
 >   bare runtime runs on the test's thread and is not refused. The fixtures still blocking are named in
 >   `test_store::SHARD_BLOCKING_ALLOWED`, each with its owner and how many sites reach it, and run their blocking body
 >   through `allowing_shard_blocking`; there is no global off-switch. The list only shrinks.
->   **The shard-blocking allow-list: 2 fixtures** (a test holds the list's length to this figure; edit both together):
+>   **The shard-blocking allow-list: emptied and removed (w-hg, 2026-11-26).** No fixture may block a shard's thread on
+>   the store: `test_store::refuse_on_a_shard` refuses every such wait on a `slates-shard-N` thread, with no allowance
+>   left to lift it, so `SHARD_BLOCKING_ALLOWED`, `Allowed`, `allowing_shard_blocking` and the figure's test are gone. Its
+>   last two entries went in one landing: `test_store::create` (reach re-counted by probe at 11 tests, not the 9
+>   recorded: `vcs_store::commits::tests` 5, `vcs_ssh::tests::hg` 4, `daemon::tests` 2, `t_b1_a_crash…` and
+>   `t_goal93_a_push_of_many_heads…`; logs `~/.local/state/w-hg-logs/2026-11-26-probe-create-*.txt`), its creations
+>   now made by `paths::tests::git_made().await` in tasks or `test_store::create_on` from the test's thread, so `create`,
+>   `paths::tests::git_repository` and `repository::create_blocking` were deleted and their callers dispatch; and
+>   `repository::hg_push::land_stored` (2: `vcs_ssh::tests::hg`'s `drafted_history`, now made and pushed from a task by
+>   `hg_push::tests::made_non_publishing_and_pushed_on`, then set publishing again as 7.2's server was), with the whole
+>   test-only synchronous driver it held up (`prepare_served`, `judged_whole`, `works_whole`, `take_whole`,
+>   `taken_whole`, `store_blocking`, `test_store::answer_wants_blocking` and their kin). A probe after, the creation's
+>   blocking arm panicking over the same modules, found 0. History of the list, as it was kept:
 >   **Taken by w-git (2026-11-26, main's order: w-shared and w-perf held on a permission prompt since 18:03): their
 >   `audit_on_stored_shard` and `test_store::create` sites, a file at a time, each landing with its counts.** w-shared's:
 >   `repository/push/tests.rs`, `repository.rs`, `vcs_share/grants.rs`, `vcs_share/read_backs.rs`, `identities/tests.rs`,
@@ -1254,8 +1267,9 @@
 >     (`git_push/tests.rs` 23, `vcs_share/tests.rs` 9, `vcs_share/wait.rs` 2, `vcs_store/tests.rs` 2, `replica.rs` 1,
 >     `named_objects.rs` 1) and `test_store::audit_on_stored_shard_made_all`, any tool's (`upload/tests.rs` 12,
 >     `git_hooks/tests.rs` 2).
->   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 9 tests. hg 4
->     (`vcs_ssh` 4); other 5 (`daemon::tests` 5). `repository::import`'s 2 moved by w-hg (2026-11-26): their
+>   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 0, gone (see
+>     above; the probe's 11 before its last move). Recorded before as 9 tests, hg 4 (`vcs_ssh` 4), other 5
+>     (`daemon::tests` 5). `repository::import`'s 2 moved by w-hg (2026-11-26): their
 >     repositories made from the test's thread (`create_on`), and the A-687 test's read-back of let-go changeset texts
 >     awaited from a task (`served_awaited`, the store's answers by `hg_view::answer_store_wants`), so
 >     `repository::import::tests::served`'s allow-list entry is gone. `identities`' 1 moved by w-hg (2026-11-26):
@@ -1315,7 +1329,8 @@
 >     `vcs_share/tests.rs`, `replica.rs`, `daemon.rs`. Each caller of `git_repository` makes its repository from the
 >     test's thread, `git_repository_on`, or through `on_stored_shard_with`.)
 >   - w-hg's push and import helpers, counted by the tests refused without each once the entries above let them
->     through: `repository::hg_push::land_stored` (2 tests, `vcs_ssh::tests::hg`),
+>     through: `repository::hg_push::land_stored` (0, gone 2026-11-26 with the synchronous driver; was 2 tests,
+>     `vcs_ssh::tests::hg`),
 >     `vcs_store::commits::home_and_land_blocking` (0, gone 2026-11-26, w-hg, with `made_landing_now`,
 >     `made_before_step_blocking`, the test-only hold of made commits in `made_accepted` (`MADE_HELD_FOR_TEST`,
 >     `HELD_MADE`), `paths::tests::recorded_git_submit` and `_as`, and `git_push::tests::carried_blocking`: no caller
