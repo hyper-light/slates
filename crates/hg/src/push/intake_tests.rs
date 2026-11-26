@@ -3057,3 +3057,34 @@ fn saved_and_let_go_logs(
   assert!(let_go > 0, "objects let go");
   saved
 }
+
+/// A-767 C1 (docs/bugs/2026-11-25-a-made-changeset-over-a-let-go-parent-was-never-made.md, siblings: main's ruling A2 of
+/// 2026-11-26). Do: push one file's first revision into a fork; let its bytes go, as a landing lets a landed text go;
+/// write the record of a second push whose revision is a delta against the first, holding its changegroup whole
+/// (`record::write_changegroup`), and replay it whole over the fork (`record::replay`). Expect the replay refused as a
+/// whole replay refuses a want of the store it cannot wait on (`Refused::StoreWanted`), the ask left pending for a replay
+/// that waits. Red before: a `#[cfg(test)]` arm answered the want from the fork's own texts, so the tests saw
+/// `UnknownDeltaBase` where production refuses `StoreWanted`.
+#[test]
+fn a_whole_records_replay_wanting_a_base_let_go_is_refused_as_production_refuses_it() {
+  use crate::import::record;
+  let (first, after) = file_push(&[(b"a\n", None)], (crate::NULL_NODE, crate::NULL_NODE, &[]));
+  let mut store = store();
+  let (mut fork, _, _) = taken_counting(&first, &mut HgIndex::new(), &mut store);
+  let (node, _) = after.2.first().cloned().unwrap();
+  let rev = fork.rev(&store, Log::File(b"f"), &node).unwrap();
+  let row = fork.revision(&store, Log::File(b"f"), rev).unwrap();
+  assert!(
+    store.let_go_object(&row.bytes) > 0,
+    "the first revision's bytes let go"
+  );
+  let (second, _) = file_push(&[(b"a\nb\n", Some(0))], (after.0, after.1, &after.2));
+  let whole =
+    record::write_changegroup(1 << 20, (crate::changegroup::Version::V03, &second), 3).unwrap();
+  let refused = record::replay(&whole, &mut fork, &mut store).err();
+  assert!(
+    matches!(refused, Some(record::Refused::StoreWanted)),
+    "{refused:?}"
+  );
+  fork.release(&mut store).unwrap();
+}

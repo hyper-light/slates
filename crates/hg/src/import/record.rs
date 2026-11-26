@@ -1829,15 +1829,8 @@ impl Retaken {
       Progress::Done => Ok(false),
       // A record holds its changegroup whole: a want names bytes past its end.
       Progress::Wanted(_) => Err(Refused::Truncated),
-      // A test keeps no store: the fork's own texts stand in for it.
-      #[cfg(test)]
-      Progress::Store => {
-        self.intake.answer_from_fork(store);
-        Ok(true)
-      }
       // The intake's ask stays pending: a replay that waits between units answers it ([`Replay::store_wants`]); a whole
       // replay refuses it (`replay`).
-      #[cfg(not(test))]
       Progress::Store => Ok(true),
     }
   }
