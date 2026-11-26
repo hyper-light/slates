@@ -2288,3 +2288,173 @@ fn corrupt_node_and_dangling_parent_wire_refusals_format_40_hex_nodes() {
     assert_formatted_hex_refusals(orphan_node, stranger);
   });
 }
+
+/// Builds a synthetic nested file path of exact byte length `len` using path characters only.
+fn path_of_len(len: usize) -> Vec<u8> {
+  let mut path = Vec::with_capacity(len);
+  while path.len().saturating_add(4) < len {
+    path.extend_from_slice(b"dir/");
+  }
+  while path.len() < len {
+    path.push(b'f');
+  }
+  assert_eq!(path.len(), len);
+  path
+}
+
+/// Encodes `words` into a real bundle2 `ERROR:ABORT` reply, decodes it back, and verifies the
+/// 255-byte parameter cap holds while every expected 40-hex node ID stays complete and untruncated.
+fn assert_bundle2_abort_preserves_hex(words: Vec<u8>, expected_nodes: &[Node]) {
+  let reply = Reply::refused(&[], &super::abort(words));
+  let parts = error_parts(&encoded(&reply));
+  assert_eq!(parts.len(), 1);
+  assert_eq!(parts[0].0, b"ERROR:ABORT");
+  let message = parts[0].1.as_deref().expect("abort message");
+  assert!(
+    message.len() <= 255,
+    "bundle2 parameter exceeded 255 bytes: {}",
+    message.len()
+  );
+  assert_hex_wire_refusal(message, expected_nodes);
+}
+
+/// Post-review blocker 1 (AC-HG.9): do encode file-path wire refusals at path lengths 119, 120,
+/// 210, and 1024 bytes through the real bundle2 `Reply::refused` encoder. Expect every encoded
+/// `ERROR:ABORT` `message` parameter (`<= 255` bytes) to preserve ALL 40-char lowercase hex node
+/// IDs complete and untruncated regardless of filename length.
+#[test]
+fn long_filename_wire_refusals_preserve_both_40_hex_nodes_within_bundle2_limit() {
+  let claimed: Node = [
+    0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+    0x0c, 0x0d, 0x0e, 0x0f,
+  ];
+  let computed: Node = [
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xa0, 0xb1, 0xc2, 0xd3, 0xe4, 0xf5, 0x16,
+    0x27, 0x38, 0x49, 0x5a,
+  ];
+  for len in [119usize, 120, 210, 1024] {
+    let path = path_of_len(len);
+    let cases = [
+      (
+        slates_hg::push::verify::Unverified::Node {
+          log: slates_hg::push::verify::LogOf::File(path.clone()),
+          node: claimed,
+          fault: node::Refusal::Mismatch { claimed, computed },
+        },
+        vec![claimed, computed],
+      ),
+      (
+        slates_hg::push::verify::Unverified::Node {
+          log: slates_hg::push::verify::LogOf::File(path.clone()),
+          node: claimed,
+          fault: node::Refusal::CollisionAttack(node::CollisionAttack { sha1: computed }),
+        },
+        vec![claimed, computed],
+      ),
+      (
+        slates_hg::push::verify::Unverified::UnknownParent {
+          log: slates_hg::push::verify::LogOf::File(path.clone()),
+          node: claimed,
+          parent: computed,
+        },
+        vec![claimed, computed],
+      ),
+      (
+        slates_hg::push::verify::Unverified::UnknownDeltaBase {
+          log: slates_hg::push::verify::LogOf::File(path.clone()),
+          node: claimed,
+          base: computed,
+        },
+        vec![claimed, computed],
+      ),
+      (
+        slates_hg::push::verify::Unverified::UnknownLink {
+          log: slates_hg::push::verify::LogOf::File(path.clone()),
+          node: claimed,
+          link: computed,
+        },
+        vec![claimed, computed],
+      ),
+      (
+        slates_hg::push::verify::Unverified::NotWhole {
+          log: slates_hg::push::verify::LogOf::File(path.clone()),
+          node: claimed,
+        },
+        vec![claimed],
+      ),
+      (
+        slates_hg::push::verify::Unverified::Flags {
+          log: slates_hg::push::verify::LogOf::File(path.clone()),
+          node: claimed,
+          flags: 0x0001,
+        },
+        vec![claimed],
+      ),
+      (
+        slates_hg::push::verify::Unverified::Delta {
+          log: slates_hg::push::verify::LogOf::File(path.clone()),
+          node: claimed,
+          fault: delta::Refusal::Undecodable { at: 4 },
+        },
+        vec![claimed],
+      ),
+      (
+        slates_hg::push::verify::Unverified::FileRevision {
+          path: path.clone(),
+          node: claimed,
+          fault: slates_hg::filerev::Refusal::Unclosed,
+        },
+        vec![claimed],
+      ),
+      (
+        slates_hg::push::verify::Unverified::MissingFile {
+          path,
+          node: claimed,
+        },
+        vec![claimed],
+      ),
+    ];
+    for (fault, expected_nodes) in &cases {
+      assert_bundle2_abort_preserves_hex(super::unverified_words(fault), expected_nodes);
+    }
+    let long_path_str = String::from_utf8(path_of_len(len)).unwrap();
+    let object_id = slates_merge::push::ObjectKey::new(&claimed).unwrap();
+    let work_fault =
+      slates_hg::push::tree::WorkRefused::Push(slates_merge::push::PushRefused::Object {
+        path: long_path_str,
+        id: object_id,
+        why: slates_merge::push::Unavailable::Missing,
+      });
+    assert_bundle2_abort_preserves_hex(super::work_refused_words(&work_fault), &[claimed]);
+  }
+}
+
+/// Post-review cleanliness fix (AC-HG.5, no-hidden-flow-control): do encode all three
+/// `HoldRefusal` outcomes (`Raced`, `Capacity`, `Corrupt`) into bundle2 replies. Expect `Raced`
+/// alone to emit `ERROR:PUSHRACED` with stock 7.2's `RACED` message, `Capacity` to emit
+/// `ERROR:ABORT` with `UNHELD`, and `Corrupt` to emit a non-retryable `ERROR:ABORT` with
+/// `HOLD_CORRUPT` (never `ERROR:PUSHRACED`).
+#[test]
+fn hold_refused_outcome_maps_only_race_to_pushraced_and_corrupt_to_abort() {
+  let decode = |refusal: super::HoldRefusal| {
+    let Outcome::Refused(reply) = super::hold_refused_outcome(refusal) else {
+      panic!("expected refused outcome for {refusal:?}");
+    };
+    error_parts(&encoded(&reply))
+  };
+  assert_eq!(
+    decode(super::HoldRefusal::Raced),
+    vec![(
+      b"ERROR:PUSHRACED".to_vec(),
+      Some(slates_hg::push::check::RACED.to_vec()),
+    )]
+  );
+  assert_eq!(
+    decode(super::HoldRefusal::Capacity),
+    vec![(b"ERROR:ABORT".to_vec(), Some(super::UNHELD.to_vec()))]
+  );
+  assert_eq!(
+    decode(super::HoldRefusal::Corrupt),
+    vec![(b"ERROR:ABORT".to_vec(), Some(super::HOLD_CORRUPT.to_vec()))]
+  );
+}

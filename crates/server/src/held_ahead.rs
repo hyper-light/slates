@@ -27,7 +27,6 @@
 use slates_cluster::content::{ContentRefusal, Placed};
 use slates_db::catalog::VolumeId as DbVolumeId;
 use slates_db::register::ObjectId;
-use slates_ipc::protocol::Refusal;
 use slates_merge::chain_entry::Inputs;
 
 use crate::state::ShardState;
@@ -61,6 +60,22 @@ pub(crate) enum Ahead {
   More,
   /// Held whole.
   Held(HeldAhead),
+}
+
+/// Why [`AheadHold::unit`] refused to stage an increment ahead of its push's landing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AheadRefusal {
+  /// The content store lacked room for the stage or chunk; `available` is what it could hold.
+  NoCapacity {
+    /// Bytes available when the store refused.
+    available: u64,
+  },
+  /// Another placement on the green's object superseded or dropped this hold's stage
+  /// (`ContentRefusal::StaleStage` or `ContentRefusal::Unstaged`).
+  Raced,
+  /// A non-race integrity or extent-bounds fault (`Malformed`, `Incomplete`, `IdentityMismatch`,
+  /// `Unreferenced`, or an extent outside the encoded buffer).
+  Corrupt,
 }
 
 /// One work's increment being held ahead (module docs): its encoding, the extents hashed so far, and, once its stage is
@@ -115,8 +130,8 @@ impl AheadHold {
   }
 
   /// One unit (module docs); refused typed where the content store refuses the stage or a chunk (its room, a newer
-  /// placement on the green's object), nothing of this hold kept.
-  pub(crate) fn unit(&mut self, state: &mut ShardState) -> Result<Ahead, Refusal> {
+  /// placement on the green's object, or an integrity fault), nothing of this hold kept.
+  pub(crate) fn unit(&mut self, state: &mut ShardState) -> Result<Ahead, AheadRefusal> {
     state.count(AHEAD_UNITS, 1);
     let object = ObjectId(self.green.bytes);
     let Some(manifest) = self.staging else {
@@ -134,10 +149,7 @@ impl AheadHold {
     };
     let start = usize::try_from(extent.offset).unwrap_or(usize::MAX);
     let end = usize::try_from(extent.len).map_or(usize::MAX, |len| start.saturating_add(len));
-    let piece = self
-      .encoding
-      .get(start..end)
-      .ok_or(Refusal::ContentUnavailable)?;
+    let piece = self.encoding.get(start..end).ok_or(AheadRefusal::Corrupt)?;
     state
       .held_content
       .stage_lent_piece(
@@ -154,7 +166,11 @@ impl AheadHold {
 
   /// A chunk hashed into the manifest's extents; or, every chunk hashed, the stage opened on the green's object (held
   /// already: nothing to copy, and nothing of it this hold's to give back).
-  fn hash_or_open(&mut self, state: &mut ShardState, object: ObjectId) -> Result<Ahead, Refusal> {
+  fn hash_or_open(
+    &mut self,
+    state: &mut ShardState,
+    object: ObjectId,
+  ) -> Result<Ahead, AheadRefusal> {
     let chunk = crate::merge_origin::inputs_chunk_bytes().max(1);
     let end = self.hashed.saturating_add(chunk).min(self.encoding.len());
     if let Some(piece) = self
@@ -209,17 +225,21 @@ impl AheadHold {
   }
 }
 
-/// The content store's refusal of a hold, in the push's words: its room `BudgetExceeded`, any other (a newer placement
-/// took the green's stage) `ContentUnavailable`.
-fn refused(refusal: ContentRefusal) -> Refusal {
+/// The content store's refusal of a hold, classified exhaustively: capacity exhaustion waits,
+/// stage races (`StaleStage` / `Unstaged`) report `Raced`, and integrity faults report `Corrupt`.
+fn refused(refusal: ContentRefusal) -> AheadRefusal {
   // Named in the daemon's log, so a run that meets it says which (main 01a20182's order of 2026-11-22 03:50: a fresh
   // repository's first push refused on CI's runners, not reproduced on a Mac).
   slates_machine::log_line!(
     "slates-server: a push's increment held ahead was refused by the content store: {refusal:?}"
   );
   match refusal {
-    ContentRefusal::NoCapacity { available, .. } => Refusal::BudgetExceeded { available },
-    _ => Refusal::ContentUnavailable,
+    ContentRefusal::NoCapacity { available, .. } => AheadRefusal::NoCapacity { available },
+    ContentRefusal::StaleStage | ContentRefusal::Unstaged => AheadRefusal::Raced,
+    ContentRefusal::Malformed(_)
+    | ContentRefusal::Incomplete { .. }
+    | ContentRefusal::IdentityMismatch
+    | ContentRefusal::Unreferenced => AheadRefusal::Corrupt,
   }
 }
 
@@ -247,5 +267,39 @@ pub(crate) fn give_back(state: &mut ShardState, ahead: &[HeldAhead]) {
         fresh: held.fresh,
       },
     );
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Post-review cleanliness fix (no-hidden-flow-control): do classify every `ContentRefusal`
+  /// variant through `refused`. Expect `StaleStage` and `Unstaged` to classify distinctly from
+  /// non-race integrity faults (`Malformed`, `Incomplete`, `IdentityMismatch`, `Unreferenced`) so
+  /// integrity faults never map to a retryable push-race refusal.
+  #[test]
+  fn integrity_refusals_do_not_collide_with_stale_stage_race() {
+    assert_eq!(
+      refused(ContentRefusal::NoCapacity {
+        requested: 64,
+        available: 16,
+      }),
+      AheadRefusal::NoCapacity { available: 16 }
+    );
+    assert_eq!(refused(ContentRefusal::StaleStage), AheadRefusal::Raced);
+    assert_eq!(refused(ContentRefusal::Unstaged), AheadRefusal::Raced);
+    for integrity in [
+      ContentRefusal::Malformed(slates_archive::format::ArchiveError::BadMagic),
+      ContentRefusal::Incomplete { missing: 1 },
+      ContentRefusal::IdentityMismatch,
+      ContentRefusal::Unreferenced,
+    ] {
+      assert_eq!(
+        refused(integrity),
+        AheadRefusal::Corrupt,
+        "integrity refusal {integrity:?} must map to AheadRefusal::Corrupt, never Raced"
+      );
+    }
   }
 }

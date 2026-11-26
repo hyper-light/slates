@@ -20,9 +20,13 @@
 //! 5. The policy. A principal the policy lets read none of the repository is `403`, for every request, as hgweb's
 //!    `checkauthz` reads `deny_read` and `allow_read` first. A push (`unbundle`, `pushkey`) also needs `POST` (`405`
 //!    with `Allow: POST`, hgweb's "push requires POST request") and a right to submit, rewrite or delete (`403`).
-//! 6. The service. An unknown or empty wire command (`?cmd=rt_unknown`, `?cmd=`, `?cmd`) is `400`, matching stock
-//!    hgweb (`wireprotoserver.handlewsgirequest`). hgweb's pages (a request with no `cmd` parameter: the repository's
-//!    browsing URLs, §4.17.3 piece 12) are `503`, and so is a repository whose served view this shard does not lend
+//! 6. The service. An unknown `cmd` (not in 7.2's wire command table or `webcommands.__all__`, e.g.
+//!    `?cmd=rt_unknown`) is `400`, matching stock `hgweb_mod._runwsgi` (`method not found`). An empty or bare
+//!    `cmd` (`?cmd=`, `?cmd`) is also `400`, a Slates boundary choice rather than stock hgweb's `200` default page.
+//!    Stock hgweb browsing views (`?cmd=changelog`, `?cmd=shortlog`, `?cmd=graph`, and the rest of
+//!    `webcommands.__all__` not intercepted by the wire protocol, plus direct `HgSite` requests with no `cmd` —
+//!    on the daemon edge bare no-query repository URLs are routed by [`super::ToolSites`] rather than `HgSite`)
+//!    are `503` until §4.17.3 piece 12 lands, and so is a repository whose served view this shard does not lend
 //!    ([`HgStores`]: A-662 keeps each repository's store on its owner shard, and the daemon's lender makes the view
 //!    over it, A-680 part 2).
 //!
@@ -101,6 +105,32 @@ const SLASH: u8 = b'/';
 /// Format: the prefix of the fields a Mercurial request carries its arguments and what it reads in (`X-HgArg-<N>`,
 /// `X-HgArgs-Post`, `X-HgProto-<N>`), compared without regard to case.
 const HG_FIELDS: &[u8] = b"x-hg";
+
+/// Format: stock Mercurial 7.2's hgweb browsing commands (`mercurial/hgweb/webcommands.py`,
+/// `webcommands.__all__` \[C\]), omitting `branches` which `wireprotoserver.handlewsgirequest`
+/// intercepts as a wire command first. Refused `503` until §4.17.3 piece 12 lands.
+const HGWEB_COMMANDS: &[&[u8]] = &[
+  b"annotate",
+  b"archive",
+  b"bookmarks",
+  b"changelog",
+  b"changeset",
+  b"comparison",
+  b"diff",
+  b"file",
+  b"filediff",
+  b"filelog",
+  b"graph",
+  b"help",
+  b"log",
+  b"manifest",
+  b"rawfile",
+  b"rev",
+  b"shortlog",
+  b"static",
+  b"summary",
+  b"tags",
+];
 
 /// Derived: `httpheader`, the longest header line a client may split its arguments into: the edge's line bound, RFC
 /// 9112 §3's 8000 octets (`slates_http::MAX_LINE`). A client's count holds the line's name, `: `, value and line end, and
@@ -416,9 +446,9 @@ impl Compressor for LearnedCompressor {
 /// What kind of Mercurial HTTP request a query string names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommandKind {
-  /// No `cmd` query parameter: an hgweb browsing URL, refused `503`.
+  /// An hgweb browsing request (no `cmd`, or a stock `webcommands.__all__` view name): refused `503`.
   WebPage,
-  /// A `cmd` query parameter whose value is empty or not in 7.2's wire command table: refused `400`.
+  /// A `cmd` query parameter that is empty or neither a 7.2 wire command nor a stock hgweb view: refused `400`.
   UnknownWire,
   /// A wire command in 7.2's table, with the permission it requires.
   Wire(Permission),
@@ -648,11 +678,19 @@ pub(crate) fn wire_request(head: &Head<'_>, room: u64) -> bool {
   hg_http::command(query, &mut Admission::new(room)).is_ok_and(|command| command.is_some())
 }
 
-/// Classifies a query's `cmd` parameter into an hgweb page, an unknown/empty wire command, or a known wire command.
+/// Classifies a query's `cmd` parameter into an hgweb browsing view, an unknown/empty command, or a known wire command.
 fn command_kind(command: Option<&[u8]>) -> CommandKind {
   match command {
     None => CommandKind::WebPage,
-    Some(name) => hg_http::permission(name).map_or(CommandKind::UnknownWire, CommandKind::Wire),
+    Some(name) => {
+      if let Some(permission) = hg_http::permission(name) {
+        CommandKind::Wire(permission)
+      } else if HGWEB_COMMANDS.contains(&name) {
+        CommandKind::WebPage
+      } else {
+        CommandKind::UnknownWire
+      }
+    }
   }
 }
 

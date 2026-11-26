@@ -1152,3 +1152,142 @@ fn unknown_and_empty_wire_commands_are_refused_400_while_pages_and_unheld_stores
     .unzip();
   assert_eq!(judged, expected);
 }
+
+/// Post-review blocker 2 (§4.17.3 piece 12, AC-HG.9): do send every stock Mercurial 7.2.4 hgweb
+/// browsing view (`?cmd=changelog`, `?cmd=shortlog`, `?cmd=graph`, and the rest of
+/// `webcommands.__all__` not intercepted by the wire protocol), alongside `?cmd=branches` (wire
+/// command precedence per `wireprotoserver.handlewsgirequest`), unknown/empty commands
+/// (`?cmd=rt_unknown`, `?cmd=`, `?cmd`), and auth/policy/404/405 precedence checks. Expect `503`
+/// for stock hgweb views, `400` for unknown/empty `cmd`, served (`None`) for wire commands, and
+/// preserved `401`/`403`/`404`/`405` precedence.
+#[test]
+fn stock_hgweb_view_commands_stay_503_while_unknown_and_empty_cmd_return_400() {
+  let mut open = site(vec![stranger_may(PolicyRight::Read)]);
+  let mut strict = site(Vec::new());
+  let web_views = [
+    "annotate",
+    "archive",
+    "bookmarks",
+    "changelog",
+    "changeset",
+    "comparison",
+    "diff",
+    "file",
+    "filediff",
+    "filelog",
+    "graph",
+    "help",
+    "log",
+    "manifest",
+    "rawfile",
+    "rev",
+    "shortlog",
+    "static",
+    "summary",
+    "tags",
+  ];
+  for view in web_views {
+    let target = format!("/hg?cmd={view}");
+    assert_eq!(
+      refused_status(&mut open, "GET", &target, &[OWNER_BEARER]),
+      Some(Status::SERVICE_UNAVAILABLE),
+      "stock hgweb view {target} must stay 503"
+    );
+  }
+  let cases: [StepCase; 12] = [
+    ("open", "GET", "/hg?cmd=branches", &[OWNER_BEARER], None),
+    (
+      "open",
+      "GET",
+      "/hg?cmd=rt_unknown",
+      &[OWNER_BEARER],
+      Some(Status::BAD_REQUEST),
+    ),
+    (
+      "open",
+      "GET",
+      "/hg?cmd=",
+      &[OWNER_BEARER],
+      Some(Status::BAD_REQUEST),
+    ),
+    (
+      "open",
+      "GET",
+      "/hg?cmd",
+      &[OWNER_BEARER],
+      Some(Status::BAD_REQUEST),
+    ),
+    (
+      "open",
+      "GET",
+      "/hg?cmd=heads&cmd=changelog",
+      &[OWNER_BEARER],
+      Some(Status::SERVICE_UNAVAILABLE),
+    ),
+    (
+      "open",
+      "GET",
+      "/hg?cmd=changelog&cmd=rt_unknown",
+      &[OWNER_BEARER],
+      Some(Status::BAD_REQUEST),
+    ),
+    (
+      "open",
+      "GET",
+      "/hg?cmd=changelog&cmd=heads",
+      &[OWNER_BEARER],
+      None,
+    ),
+    (
+      "open",
+      "GET",
+      "/hg?cmd=changelog",
+      &[],
+      Some(Status::UNAUTHORIZED),
+    ),
+    (
+      "strict",
+      "GET",
+      "/hg?cmd=shortlog",
+      &[STRANGER_BEARER],
+      Some(Status::FORBIDDEN),
+    ),
+    (
+      "open",
+      "GET",
+      "/nothing?cmd=graph",
+      &[OWNER_BEARER],
+      Some(Status::NOT_FOUND),
+    ),
+    (
+      "open",
+      "PUT",
+      "/hg?cmd=heads",
+      &[OWNER_BEARER],
+      Some(Status::METHOD_NOT_ALLOWED),
+    ),
+    (
+      "open",
+      "GET",
+      "/hg?cmd=unbundle",
+      &[OWNER_BEARER],
+      Some(Status::METHOD_NOT_ALLOWED),
+    ),
+  ];
+  let (judged, expected): (Vec<_>, Vec<_>) = cases
+    .into_iter()
+    .map(|(which, method, target, fields, expected)| {
+      let site = if which == "strict" {
+        &mut strict
+      } else {
+        &mut open
+      };
+      let status = refused_status(site, method, target, fields);
+      (
+        (which, method, target, fields, status),
+        (which, method, target, fields, expected),
+      )
+    })
+    .unzip();
+  assert_eq!(judged, expected);
+}

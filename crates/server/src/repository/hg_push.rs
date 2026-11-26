@@ -625,31 +625,32 @@ fn refused_message(detail: &str) -> Vec<u8> {
   words
 }
 
-/// Plain-English label for the revlog named by `log` in a wire refusal.
-fn log_name(log: &LogOf) -> String {
+/// Formats a revlog refusal with its revlog kind and `detail` first, placing any file path last so
+/// 40-char lowercase hex node IDs always precede arbitrary-length paths inside bundle2's 255-byte cap.
+fn log_message(log: &LogOf, detail: &str) -> String {
   match log {
-    LogOf::Changelog => "changelog".to_owned(),
-    LogOf::Manifests => "manifest".to_owned(),
-    LogOf::File(path) => format!("file '{}'", String::from_utf8_lossy(path)),
+    LogOf::Changelog => format!("changelog {detail}"),
+    LogOf::Manifests => format!("manifest {detail}"),
+    LogOf::File(path) => format!("file {detail} for '{}'", String::from_utf8_lossy(path)),
   }
 }
 
-/// Plain-English wire text for a node-integrity refusal (`node::Refusal`), formatting every node as 40-char lowercase
-/// hex so both claimed and computed hashes fit untruncated inside a 255-byte bundle2 parameter value.
+/// Plain-English wire text for a node-integrity refusal (`node::Refusal`), placing 40-char lowercase
+/// hex node IDs before any file path so both hashes fit untruncated inside a 255-byte bundle2 parameter value.
 fn node_fault_words(log: &LogOf, node: &Node, fault: &slates_hg::node::Refusal) -> String {
-  let log = log_name(log);
-  match fault {
+  let detail = match fault {
     slates_hg::node::Refusal::Mismatch { claimed, computed } => format!(
-      "{log} node mismatch: claimed {}, computed {}",
+      "node mismatch: claimed {}, computed {}",
       hex_of(claimed),
       hex_of(computed)
     ),
     slates_hg::node::Refusal::CollisionAttack(attack) => format!(
-      "{log} sha1 collision attack detected on {} (sha1 {})",
+      "sha1 collision attack detected on {} (sha1 {})",
       hex_of(node),
       hex_of(&attack.sha1)
     ),
-  }
+  };
+  log_message(log, &detail)
 }
 
 /// Plain-English wire text for a changegroup framing refusal, formatting any node as 40-char lowercase hex.
@@ -695,49 +696,47 @@ fn path_fault_words(path: &[u8], fault: &PathFault) -> String {
 }
 
 /// Plain-English wire text for revlog graph and flag variants of [`Unverified`], formatting every node in 40-char
-/// lowercase hex.
+/// lowercase hex before any file path.
 fn unverified_graph_words(fault: &Unverified) -> Option<String> {
   match fault {
-    Unverified::UnknownParent { log, node, parent } => Some(format!(
-      "{} unknown parent {} of {}",
-      log_name(log),
-      hex_of(parent),
-      hex_of(node)
+    Unverified::UnknownParent { log, node, parent } => Some(log_message(
+      log,
+      &format!("unknown parent {} of {}", hex_of(parent), hex_of(node)),
     )),
-    Unverified::UnknownDeltaBase { log, node, base } => Some(format!(
-      "{} unknown delta base {} of {}",
-      log_name(log),
-      hex_of(base),
-      hex_of(node)
+    Unverified::UnknownDeltaBase { log, node, base } => Some(log_message(
+      log,
+      &format!("unknown delta base {} of {}", hex_of(base), hex_of(node)),
     )),
-    Unverified::UnknownLink { log, node, link } => Some(format!(
-      "{} unknown link changeset {} for {}",
-      log_name(log),
-      hex_of(link),
-      hex_of(node)
+    Unverified::UnknownLink { log, node, link } => Some(log_message(
+      log,
+      &format!(
+        "unknown link changeset {} of {}",
+        hex_of(link),
+        hex_of(node)
+      ),
     )),
-    Unverified::NotWhole { log, node } => Some(format!(
-      "{} revision {} is not a whole text",
-      log_name(log),
-      hex_of(node)
+    Unverified::NotWhole { log, node } => Some(log_message(
+      log,
+      &format!("revision {} is not a whole text", hex_of(node)),
     )),
-    Unverified::Flags { log, node, flags } => Some(format!(
-      "{} revision {} has unsupported flags 0x{flags:04x}",
-      log_name(log),
-      hex_of(node)
+    Unverified::Flags { log, node, flags } => Some(log_message(
+      log,
+      &format!(
+        "revision {} has unsupported flags 0x{flags:04x}",
+        hex_of(node)
+      ),
     )),
     _ => None,
   }
 }
 
 /// Plain-English wire text for object-decoding and integrity variants of [`Unverified`], formatting every node in
-/// 40-char lowercase hex.
+/// 40-char lowercase hex before any file path.
 fn unverified_object_words(fault: &Unverified) -> Option<String> {
   match fault {
-    Unverified::Delta { log, node, fault } => Some(format!(
-      "{} delta for {} failed: {fault:?}",
-      log_name(log),
-      hex_of(node)
+    Unverified::Delta { log, node, fault } => Some(log_message(
+      log,
+      &format!("delta for {} failed ({fault:?})", hex_of(node)),
     )),
     Unverified::Node { log, node, fault } => Some(node_fault_words(log, node, fault)),
     Unverified::Changeset { node, fault } => {
@@ -747,9 +746,9 @@ fn unverified_object_words(fault: &Unverified) -> Option<String> {
       Some(format!("invalid manifest {}: {fault:?}", hex_of(node)))
     }
     Unverified::FileRevision { path, node, fault } => Some(format!(
-      "invalid file revision '{}' at {}: {fault:?}",
-      String::from_utf8_lossy(path),
-      hex_of(node)
+      "invalid file revision {} ({fault:?}) for '{}'",
+      hex_of(node),
+      String::from_utf8_lossy(path)
     )),
     _ => None,
   }
@@ -770,9 +769,9 @@ fn unverified_other_words(fault: &Unverified) -> String {
       hex_of(changeset)
     ),
     Unverified::MissingFile { path, node } => format!(
-      "missing file data for '{}' at {}",
-      String::from_utf8_lossy(path),
-      hex_of(node)
+      "missing file data {} for '{}'",
+      hex_of(node),
+      String::from_utf8_lossy(path)
     ),
     Unverified::PastAdmission(past) => format!("exceeds admission limit ({past:?})"),
     _ => format!("{fault:?}"),
@@ -850,7 +849,7 @@ fn layout_refused_words(fault: &LayoutRefusal) -> String {
 fn push_refused_path_words(fault: &slates_merge::push::PushRefused) -> Option<String> {
   match fault {
     slates_merge::push::PushRefused::Object { path, id, why } => Some(format!(
-      "object {} at '{path}' unavailable: {why:?}",
+      "object {} unavailable ({why:?}) for '{path}'",
       hex_of(id.as_bytes())
     )),
     slates_merge::push::PushRefused::NameNotHeld { path } => Some(format!(
@@ -924,6 +923,11 @@ pub(crate) enum Works<'a> {
 /// Format: slates' words for a push whose works' increments the content store lacked room to hold before its landing:
 /// nothing of it is kept, and the client may push again.
 const UNHELD: &[u8] = b"push refused: the content store could not hold its increments; push again";
+
+/// Format: slates' words for a push whose staged increment failed content-store integrity checks while held ahead:
+/// nothing of it is kept, and it is not a retryable push race.
+const HOLD_CORRUPT: &[u8] =
+  b"push refused: staged increment failed content-store integrity verification";
 
 /// Format: slates' words for a push whose works, built before its landing, are not those its landing's plan names.
 const UNBUILT: &[u8] = b"push refused: its works were built for another plan than its landing's";
@@ -2167,28 +2171,33 @@ async fn built_works(
 enum HoldRefusal {
   /// The content store did not have room even after waiting for space to free.
   Capacity,
-  /// A competing stage superseded or invalidated the target green's placement while this push held ahead
-  /// (`ContentRefusal::StaleStage` / `Unstaged`, surfaced by `crate::held_ahead` as `Refusal::ContentUnavailable`).
+  /// A competing stage superseded or dropped the target green's placement while this push held ahead
+  /// (`ContentRefusal::StaleStage` or `ContentRefusal::Unstaged`).
   Raced,
+  /// A non-race integrity or extent-bounds fault (`Malformed`, `Incomplete`, `IdentityMismatch`,
+  /// `Unreferenced`, or an out-of-range extent).
+  Corrupt,
 }
 
-/// The bundle2 refusal for [`HoldRefusal`]: stock 7.2's `error:pushraced` when another placement raced the stage, and
-/// `error:abort` with [`UNHELD`] only when the content store genuinely lacked capacity.
+/// The bundle2 refusal for [`HoldRefusal`]: stock 7.2's `error:pushraced` only when another placement raced the
+/// stage, `error:abort` with [`UNHELD`] on capacity exhaustion, and a non-retryable `error:abort` with
+/// [`HOLD_CORRUPT`] on integrity faults.
 fn hold_refused_outcome(refusal: HoldRefusal) -> PushOutcome {
   match refusal {
     HoldRefusal::Capacity => PushOutcome::refused(&abort(UNHELD.to_vec())),
     HoldRefusal::Raced => PushOutcome::refused(&Refused::PushRaced {
       message: RACED.to_vec(),
     }),
+    HoldRefusal::Corrupt => PushOutcome::refused(&abort(HOLD_CORRUPT.to_vec())),
   }
 }
 
 /// [`held_ahead`], waiting for room where the content store cannot hold the increments for now (the content store giving
 /// windows back, or others releasing theirs; main 01a20182's order of 2026-11-22 03:35): what the earlier works held is
 /// given back, the wait shared with git's sees the room grow past what the store could hold, and the increments are held
-/// again. `Err(HoldRefusal::Raced)` where a competing stage invalidated the hold (`Refusal::ContentUnavailable`),
-/// `Err(HoldRefusal::Capacity)` where the room wait gives up or another refusal occurs; none where the shard's state is
-/// gone.
+/// again. `Err(HoldRefusal::Raced)` where a competing stage invalidated the hold (`AheadRefusal::Raced`),
+/// `Err(HoldRefusal::Corrupt)` on a non-race integrity fault (`AheadRefusal::Corrupt`), and `Err(HoldRefusal::Capacity)`
+/// where the room wait gives up; none where the shard's state is gone.
 async fn held_ahead_waiting(
   repository: RepositoryId,
   built: &BTreeMap<WorkKey, Increment>,
@@ -2196,17 +2205,19 @@ async fn held_ahead_waiting(
   loop {
     match held_ahead(built).await? {
       Ok(ahead) => return Some(Ok(ahead)),
-      Err(slates_ipc::protocol::Refusal::BudgetExceeded { available }) => {
+      Err(crate::held_ahead::AheadRefusal::NoCapacity { available }) => {
         let _ = crate::state::with_state(|state| state.count(HELD_AHEAD_ROOM_WAITS, 1));
         // What the store could hold when it refused is what the wait must see the room grow past.
         if room_after_wait(repository, available, None).await?.is_err() {
           return Some(Err(HoldRefusal::Capacity));
         }
       }
-      Err(slates_ipc::protocol::Refusal::ContentUnavailable) => {
+      Err(crate::held_ahead::AheadRefusal::Raced) => {
         return Some(Err(HoldRefusal::Raced));
       }
-      Err(_) => return Some(Err(HoldRefusal::Capacity)),
+      Err(crate::held_ahead::AheadRefusal::Corrupt) => {
+        return Some(Err(HoldRefusal::Corrupt));
+      }
     }
   }
 }
@@ -2218,11 +2229,11 @@ async fn held_ahead_waiting(
 /// nothing, and what the earlier works held is given back.
 async fn held_ahead(
   built: &BTreeMap<WorkKey, Increment>,
-) -> Option<Result<Vec<crate::held_ahead::HeldAhead>, slates_ipc::protocol::Refusal>> {
+) -> Option<Result<Vec<crate::held_ahead::HeldAhead>, crate::held_ahead::AheadRefusal>> {
   let _doing = slates_rt::futures::doing("hg_push::held_ahead");
   #[cfg(test)]
   if TEST_HOLD_REFUSED.with(|refused| refused.replace(false)) {
-    return Some(Err(slates_ipc::protocol::Refusal::BudgetExceeded {
+    return Some(Err(crate::held_ahead::AheadRefusal::NoCapacity {
       available: 0,
     }));
   }
