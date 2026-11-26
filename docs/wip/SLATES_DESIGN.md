@@ -64701,8 +64701,12 @@ GAPS.
   paced loops ran units past their deadline. Each now stops at it:
   - The preparation's hold hashed a content chunk a unit, up to 1 MiB (10.4 ms of one step, debug). It now hashes a
     copy slice a unit (`IncrementHold::chunk_hasher`, `merge_origin::inputs_extent_hashed`). Oracle:
-    `an_increment_held_a_slice_a_unit_names_the_inputs_held_whole` (the same inputs as `hold_increment`, in more units
-    than a hold that hashes a chunk a unit).
+    `an_increment_held_a_slice_a_unit_names_the_inputs_held_whole`, the same inputs as `hold_increment`. Since main's
+    finding of 2026-11-26, the hold takes its slice as an argument (`IncrementHold::unit`; the preparation passes
+    `copy_slice_bytes`), and the test passes a quarter chunk and asserts the exact count it makes, 15. Before, the
+    test read the shard's live copy slice: a loaded shard's slice is a chunk or more, so it took 8 units against
+    `> 8`, in w-hg's focused set at load 50-60. Red at 8 with a chunk's slice. The model is
+    `vcs_store/named_objects.rs`'s `read_step(&objects, slice)`.
   - The chain entry's encoding hashed the whole entry in its last unit (4.7 ms, debug). It now hashes what each unit
     writes (`chain_entry::Encoding::digest`). Oracle: `an_entry_encoded_a_unit_a_step_is_the_entry_encoded_whole`,
     unchanged.
@@ -64773,6 +64777,21 @@ GAPS.
     and move tests; red at 9,000 with a row a unit. Counter: `repository.svn_commit.recording_walk_units`.
   - After 9a (debug), the copy test's longest step is 14.2 ms (30-33 before) and the move test's 23.4 ms, now its
     build unit.
+  **9b, a deleted tree in the build a path a unit.** Named before the change (debug, the move test): the 20.2 ms build
+  unit was revision 3's last step. The `/trunk` Delete row (`Building::remove`, 13.7-14.4 ms) listed the green's
+  9,001 paths beneath it into `gone`; `engine.beneath` alone was 2.2 ms of that. Then, in the same unit, `finish`
+  made an Unlink or Rmdir op for each, 6.5-6.6 ms. Now a Delete row (`Building::remove_begin`) notes its own path and
+  lists the tree beneath, a unit, then notes it gone a path a unit (`Removing`, `gone_beneath_one`), the row ending
+  once its last path is. `Building::ends_some` then takes the restores and each gone path's op a unit each, before
+  `finish`'s tail. A replacement without history still notes its tree whole, since it remakes the node in the same
+  row (`replace`).
+  - Gauge: `repository.svn_commit.build_most_gone_a_unit`, the most gone paths one unit noted or made ops of. It is 1
+    in the move test, and 9,001 red with a Delete row noted whole.
+  - Oracle: `a_moves_build_a_unit_a_step_makes_the_green_its_build_whole_makes`. A move imported with every build
+    step spent after each unit, and with every build whole (`staging::BUILD_SPENT`), makes the same green, head and
+    identity. Planted bug, red: a step that stops inside a tree drops the rest (the import is refused).
+  - Move's commit steps were measured on revision 3 (`ImportBatch::stage_step`): reserve 12.3 ms in one call, judge
+    6.0 and 4.8, a committing step 8.3. They are inside `slates-merge`, to be named there next.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
