@@ -48,6 +48,7 @@ const OVERRUNS_ASKED: u64 = 20;
 /// waiting; the asks many more than the harvests, and the harvests no more than the time asked over the least period,
 /// and one. Red before: every ask harvested.
 #[test]
+#[cfg_attr(miri, ignore)] // a shard's runtime polls the OS driver (kqueue, epoll), which Miri cannot call
 fn a_loaded_shards_asks_harvest_io_once_its_overrun() {
   let runtime = runtime();
   let (sent, got) = std::sync::mpsc::channel();
@@ -94,6 +95,7 @@ const QUIET_ASKS: u64 = 64;
 /// as before the period). Do: on a shard alone, hold its scheduler overrun at zero and ask [`QUIET_ASKS`] times, each a
 /// harvest period after the last ask returned. Expect: every ask harvested.
 #[test]
+#[cfg_attr(miri, ignore)] // a shard's runtime polls the OS driver (kqueue, epoll), which Miri cannot call
 fn a_quiet_shards_asks_a_harvests_cost_apart_each_harvest() {
   let runtime = runtime();
   let (sent, got) = std::sync::mpsc::channel();
