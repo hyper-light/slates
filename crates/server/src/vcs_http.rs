@@ -498,22 +498,42 @@ fn git_http_route(head: &Head<'_>, room: u64) -> bool {
   )
 }
 
+/// Which VCS site handles an incoming HTTP request head.
+enum SiteRoute {
+  /// Mercurial wire-protocol site.
+  Hg,
+  /// Subversion WebDAV and public `GET`/`HEAD` site.
+  Svn,
+  /// Git smart HTTP, dumb HTTP, and LFS site.
+  Git,
+}
+
+/// Picks the site for `head` within `room`, preserving exact protocol precedence:
+/// Mercurial wire -> Git LFS -> Subversion DAV -> Git HTTP -> public `GET`/`HEAD` to Subversion -> Git.
+fn classify_route(head: &Head<'_>, room: u64) -> SiteRoute {
+  if hg::wire_request(head, room) {
+    SiteRoute::Hg
+  } else if lfs_transfer(head, room) {
+    SiteRoute::Git
+  } else if svn::dav_request(head) {
+    SiteRoute::Svn
+  } else if git_http_route(head, room) {
+    SiteRoute::Git
+  } else if matches!(head.method, b"GET" | b"HEAD") {
+    SiteRoute::Svn
+  } else {
+    SiteRoute::Git
+  }
+}
+
 impl<G: Site, H: Site, S: Site> Site for ToolSites<G, H, S> {
   type Exchange = ToolExchange<G::Exchange, H::Exchange, S::Exchange>;
 
   async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange> {
-    if hg::wire_request(head, self.room) {
-      self.hg.decide(head, secure).await.map(ToolExchange::Hg)
-    } else if lfs_transfer(head, self.room) {
-      self.git.decide(head, secure).await.map(ToolExchange::Git)
-    } else if svn::dav_request(head) {
-      self.svn.decide(head, secure).await.map(ToolExchange::Svn)
-    } else if git_http_route(head, self.room) {
-      self.git.decide(head, secure).await.map(ToolExchange::Git)
-    } else if matches!(head.method, b"GET" | b"HEAD") {
-      self.svn.decide(head, secure).await.map(ToolExchange::Svn)
-    } else {
-      self.git.decide(head, secure).await.map(ToolExchange::Git)
+    match classify_route(head, self.room) {
+      SiteRoute::Hg => self.hg.decide(head, secure).await.map(ToolExchange::Hg),
+      SiteRoute::Svn => self.svn.decide(head, secure).await.map(ToolExchange::Svn),
+      SiteRoute::Git => self.git.decide(head, secure).await.map(ToolExchange::Git),
     }
   }
 }

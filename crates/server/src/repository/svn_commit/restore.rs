@@ -188,6 +188,123 @@ type Seen = (
   PropertyList,
 );
 
+/// Reads `path` at `revision` from `records`, returning its comparison fields.
+fn seen_at(records: &Repository, path: &str, revision: u64) -> Result<Option<Seen>, Uncommitted> {
+  let node = records
+    .index()
+    .node(path, revision)
+    .map_err(|refusal| Uncommitted::Step(StepRefusal::Index(refusal)))?;
+  Ok(node.map(|node| (node.id(), node.kind(), node.text(), node.properties())))
+}
+
+/// Lists the direct child names of `path` at `revision` in `records`.
+fn child_names(
+  records: &Repository,
+  path: &str,
+  revision: u64,
+) -> Result<Vec<String>, Uncommitted> {
+  Ok(
+    records
+      .index()
+      .children(path, revision)
+      .map_err(|refusal| Uncommitted::Step(StepRefusal::Index(refusal)))?
+      .unwrap_or_default(),
+  )
+}
+
+/// Builds a [`Restore::Set`] for `old` over what the copy from head `brought`.
+fn restore_set(old: Seen, brought: Option<Stood>) -> Restore {
+  Restore::Set {
+    brought,
+    directory: old.1 == NodeKind::Directory,
+    text: old.2,
+    props: old.3,
+  }
+}
+
+/// Records the restore and child visits when both the copied revision and head hold a node at `pair.0`.
+fn compare_both(
+  records: &Repository,
+  walk: &mut Walk,
+  pair: (&str, &str),
+  old: Seen,
+  new: Seen,
+) -> Result<(), Uncommitted> {
+  if old.0 == new.0 {
+    return Ok(());
+  }
+  let to = green_path(pair.1).to_owned();
+  let directory = old.1 == NodeKind::Directory;
+  if old.1 != new.1 {
+    let brought = Some(stood_of(new.1, new.2, new.3));
+    walk.plan.restores.push((to, restore_set(old, brought)));
+    let revision = if directory { walk.revision } else { walk.head };
+    push_children(
+      &mut walk.stack,
+      pair,
+      &child_names(records, pair.0, revision)?,
+    );
+    return Ok(());
+  }
+  let differs =
+    old.2.map(|text| text.identity) != new.2.map(|text| text.identity) || old.3 != new.3;
+  if differs {
+    let brought = Some(stood_of(new.1, new.2, new.3));
+    walk.plan.restores.push((to, restore_set(old, brought)));
+  }
+  if directory {
+    let mut all = child_names(records, pair.0, walk.revision)?;
+    all.extend(child_names(records, pair.0, walk.head)?);
+    all.sort_unstable();
+    all.dedup();
+    push_children(&mut walk.stack, pair, &all);
+  }
+  Ok(())
+}
+
+/// Records the restore (if any) for one `(source, dest)` path and queues its children.
+fn compare_entry(
+  records: &Repository,
+  walk: &mut Walk,
+  pair: (&str, &str),
+  nodes: (Option<Seen>, Option<Seen>),
+) -> Result<(), Uncommitted> {
+  match nodes {
+    (None, None) => Ok(()),
+    (Some(old), Some(new)) => compare_both(records, walk, pair, old, new),
+    (Some(old), None) => {
+      let directory = old.1 == NodeKind::Directory;
+      walk
+        .plan
+        .restores
+        .push((green_path(pair.1).to_owned(), restore_set(old, None)));
+      if directory {
+        push_children(
+          &mut walk.stack,
+          pair,
+          &child_names(records, pair.0, walk.revision)?,
+        );
+      }
+      Ok(())
+    }
+    (None, Some(new)) => {
+      let directory = new.1 == NodeKind::Directory;
+      walk
+        .plan
+        .restores
+        .push((green_path(pair.1).to_owned(), Restore::Remove { directory }));
+      if directory {
+        push_children(
+          &mut walk.stack,
+          pair,
+          &child_names(records, pair.0, walk.head)?,
+        );
+      }
+      Ok(())
+    }
+  }
+}
+
 /// Compares paths of `walk` until it is whole (true) or `deadline_ns` passes (false), at least one. `root` says the
 /// next path is the copy's own, which sets whether the copy is made from the head.
 fn step(
@@ -195,109 +312,19 @@ fn step(
   (walk, root): (&mut Walk, &mut bool),
   deadline_ns: u64,
 ) -> Result<bool, Uncommitted> {
-  let index = records.index();
-  let refused = |refusal| Uncommitted::Step(StepRefusal::Index(refusal));
-  let seen = |path: &str, revision: u64| -> Result<Option<Seen>, Uncommitted> {
-    let node = index.node(path, revision).map_err(refused)?;
-    Ok(node.map(|node| (node.id(), node.kind(), node.text(), node.properties())))
-  };
-  let names = |path: &str, revision: u64| -> Result<Vec<String>, Uncommitted> {
-    Ok(
-      index
-        .children(path, revision)
-        .map_err(refused)?
-        .unwrap_or_default(),
-    )
-  };
   loop {
     let Some((source, dest)) = walk.stack.pop() else {
       return Ok(true);
     };
-    let old = seen(&source, walk.revision)?;
-    let mut new = seen(&source, walk.head)?;
-    let at_root = core::mem::replace(root, false);
-    if at_root {
+    let old = seen_at(records, &source, walk.revision)?;
+    let mut new = seen_at(records, &source, walk.head)?;
+    if core::mem::replace(root, false) {
       walk.plan.from_head = matches!((&old, &new), (Some(old), Some(new)) if old.1 == new.1);
       if !walk.plan.from_head {
         new = None;
       }
     }
-    let to = green_path(&dest).to_owned();
-    match (old, new) {
-      (None, None) => {}
-      (Some(old), Some(new)) if old.0 == new.0 => {}
-      (Some(old), Some(new)) if old.1 != new.1 => {
-        let old_dir = old.1 == NodeKind::Directory;
-        walk.plan.restores.push((
-          to,
-          Restore::Set {
-            brought: Some(stood_of(new.1, new.2, new.3)),
-            directory: old_dir,
-            text: old.2,
-            props: old.3,
-          },
-        ));
-        let children = if old_dir {
-          names(&source, walk.revision)?
-        } else {
-          names(&source, walk.head)?
-        };
-        push_children(&mut walk.stack, (&source, &dest), &children);
-      }
-      (Some(old), Some(new)) => {
-        let differs =
-          old.2.map(|text| text.identity) != new.2.map(|text| text.identity) || old.3 != new.3;
-        let directory = old.1 == NodeKind::Directory;
-        if differs {
-          walk.plan.restores.push((
-            to,
-            Restore::Set {
-              brought: Some(stood_of(new.1, new.2, new.3)),
-              directory,
-              text: old.2,
-              props: old.3,
-            },
-          ));
-        }
-        if directory {
-          let mut all = names(&source, walk.revision)?;
-          all.extend(names(&source, walk.head)?);
-          all.sort_unstable();
-          all.dedup();
-          push_children(&mut walk.stack, (&source, &dest), &all);
-        }
-      }
-      (Some(old), None) => {
-        let directory = old.1 == NodeKind::Directory;
-        walk.plan.restores.push((
-          to,
-          Restore::Set {
-            brought: None,
-            directory,
-            text: old.2,
-            props: old.3,
-          },
-        ));
-        if directory {
-          push_children(
-            &mut walk.stack,
-            (&source, &dest),
-            &names(&source, walk.revision)?,
-          );
-        }
-      }
-      (None, Some(new)) => {
-        let directory = new.1 == NodeKind::Directory;
-        walk.plan.restores.push((to, Restore::Remove { directory }));
-        if directory {
-          push_children(
-            &mut walk.stack,
-            (&source, &dest),
-            &names(&source, walk.head)?,
-          );
-        }
-      }
-    }
+    compare_entry(records, walk, (&source, &dest), (old, new))?;
     if slates_rt::futures::now_ns() >= deadline_ns {
       return Ok(walk.stack.is_empty());
     }

@@ -2259,22 +2259,12 @@ mod redteam_tests {
     (connection, out)
   }
 
-  /// SVN-1 + SVN-2 + Bonus: Do CRAM-MD5 `key_as` with (a) wrong password on an unauthorized user,
-  /// (b) valid password on an unauthorized user, (c) valid password on an authorized token whose
-  /// canonical principal differs from the wire token id, and (d) `Unserved::StoreUnrecovered` +
-  /// `Connection::fail_command`. Expect: (a) `WrongPassword` with no authorization oracle,
-  /// (b) `Denied` with `( success ( ) )` followed by `E170001 "No access allowed to this
-  /// repository"`, (c) `Established(Principal::User(b"uid:1000"))`, and (d) typed `E160004` frames.
-  #[test]
-  fn cram_key_as_enforces_authz_binds_canonical_principal_and_unrecovered_store_fails_typed() {
-    let key = CramKey::from_secret(b"correct-secret");
-
-    // (a) Wrong password on an unauthorized account must fail WrongPassword, not Denied.
+  fn assert_cram_wrong_password_hides_authz(key: &CramKey) {
     let (mut wrong, mut out) = cram_handshake_until_key(b"tok-stranger", b"wrong-secret");
     let verdict = wrong
       .key_as(
         Some(CramAccount {
-          key: &key,
+          key,
           principal: Some(b"uid:4242"),
           authorized: false,
         }),
@@ -2291,13 +2281,14 @@ mod redteam_tests {
       !wire.contains("170001"),
       "wrong password must not leak authz: {wire}"
     );
+  }
 
-    // (b) Valid password on an unauthorized account ends with E170001 after auth success.
+  fn assert_cram_unauthorized_denies_with_e170001(key: &CramKey) {
     let (mut denied, mut out) = cram_handshake_until_key(b"tok-stranger", b"correct-secret");
     let verdict = denied
       .key_as(
         Some(CramAccount {
-          key: &key,
+          key,
           principal: Some(b"uid:4242"),
           authorized: false,
         }),
@@ -2314,13 +2305,14 @@ mod redteam_tests {
       wire,
       "( success ( ) ) ( failure ( ( 170001 36:No access allowed to this repository 0: 0 ) ) ) "
     );
+  }
 
-    // (c) Valid password on an authorized token binds canonical principal, not token id hex.
+  fn assert_cram_authorized_binds_canonical_principal(key: &CramKey) -> Connection {
     let (mut authed, mut out) = cram_handshake_until_key(b"deadbeef01", b"correct-secret");
     let verdict = authed
       .key_as(
         Some(CramAccount {
-          key: &key,
+          key,
           principal: Some(b"uid:1000"),
           authorized: true,
         }),
@@ -2335,8 +2327,10 @@ mod redteam_tests {
       authed.session().map(|session| &session.principal),
       Some(&Principal::User(b"uid:1000".to_vec()))
     );
+    authed
+  }
 
-    // (d) Bonus: Unserved::StoreUnrecovered & Connection::fail_command emit typed E160004.
+  fn assert_unrecovered_store_emits_typed_e160004(authed: &mut Connection) {
     let (code, message) = Unserved::StoreUnrecovered { name: b"repo" }.failure();
     assert_eq!(code, 160_004);
     assert!(
@@ -2344,7 +2338,7 @@ mod redteam_tests {
       "{}",
       String::from_utf8_lossy(&message)
     );
-    out.clear();
+    let mut out = Vec::new();
     authed
       .fail_command(
         160_004,
@@ -2358,5 +2352,20 @@ mod redteam_tests {
       wire.contains("160004") && wire.contains("unrecovered"),
       "{wire}"
     );
+  }
+
+  /// SVN-1 + SVN-2 + Bonus: Do CRAM-MD5 `key_as` with (a) wrong password on an unauthorized user,
+  /// (b) valid password on an unauthorized user, (c) valid password on an authorized token whose
+  /// canonical principal differs from the wire token id, and (d) `Unserved::StoreUnrecovered` +
+  /// `Connection::fail_command`. Expect: (a) `WrongPassword` with no authorization oracle,
+  /// (b) `Denied` with `( success ( ) )` followed by `E170001 "No access allowed to this
+  /// repository"`, (c) `Established(Principal::User(b"uid:1000"))`, and (d) typed `E160004` frames.
+  #[test]
+  fn cram_key_as_enforces_authz_binds_canonical_principal_and_unrecovered_store_fails_typed() {
+    let key = CramKey::from_secret(b"correct-secret");
+    assert_cram_wrong_password_hides_authz(&key);
+    assert_cram_unauthorized_denies_with_e170001(&key);
+    let mut authed = assert_cram_authorized_binds_canonical_principal(&key);
+    assert_unrecovered_store_emits_typed_e160004(&mut authed);
   }
 }

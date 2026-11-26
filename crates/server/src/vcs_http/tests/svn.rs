@@ -29,7 +29,10 @@ use super::super::git::{Authenticator, Located, Proven, Repositories, Unproven};
 use slates_svn::dav::site::{self, Answer as SiteAnswer, ReportProgress};
 
 use super::{Lent, SvnExchange, SvnSite, SvnStores, served_of, xml_bounds};
-use crate::vcs_http::{Answer, Bounds, ClientGone, Decided, EdgeState, Exchange, Fields, serve};
+use crate::vcs_http::{
+  Answer, Bounds, ClientGone, Decided, EdgeState, Exchange, Fields, Site, Status, ToolExchange,
+  ToolSites, serve,
+};
 use crate::vcs_store::svn_view::ServedRecords;
 
 /// Shape: room enough for every request these tests send.
@@ -1203,75 +1206,56 @@ fn a_request_is_subversions_by_its_method_or_its_special_segment() {
   assert_eq!((svn, others), ([true; 6], [false; 5]));
 }
 
-/// SVN-5: Do send public `GET` and `HEAD` requests (no `!svn/` segment) through the full
-/// [`crate::vcs_http::ToolSites`] router wrapping Git, Hg, and SVN sites. Expect:
-/// - authenticated `GET /repo/trunk/a.txt` -> `200` with exact bytes `A_TEXT`
-/// - authenticated `HEAD /repo/trunk/a.txt` -> `200` with `head_only == true`
-/// - unauthenticated `GET /repo/trunk/a.txt` -> `401` with `WWW-Authenticate`
-/// - unshared principal `GET /repo/trunk/a.txt` -> `403`
-/// - missing file `GET /repo/trunk/missing.txt` -> `404`
-/// - cross-shard `GET /away/trunk/a.txt` -> `Answer::Move { shard: AWAY.1 }`
-/// - cross-protocol isolation: `GET /r.git/trunk/a.txt` -> `404` (Git repo never served as SVN),
-///   `GET /r.git/info/refs?service=git-upload-pack` -> routed to Git site,
-///   `GET /r.git/HEAD` -> routed to Git site (dumb protocol `403`),
-///   `GET /repo?cmd=capabilities` -> routed to Hg site,
-///   `PUT /r.git/info/lfs/objects/0000000000000000000000000000000000000000000000000000000000000000` -> routed to Git site.
-#[test]
-fn tool_sites_routes_public_get_and_head_to_svn_preserving_auth_move_and_protocol_isolation() {
-  use crate::vcs_http::{Site, Status, ToolExchange, ToolSites};
+/// Minimal stub site that marks which protocol site [`ToolSites`] dispatched to.
+struct StubSite(u16);
 
-  /// Minimal stub site that marks which protocol site `ToolSites` dispatched to.
-  struct StubSite(u16);
-  struct StubExchange(u16);
+struct StubExchange(u16);
 
-  impl Exchange for StubExchange {
-    async fn body(&mut self, _run: &[u8]) -> Result<(), crate::vcs_http::Failed> {
-      Ok(())
-    }
-    async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), crate::vcs_http::Failed> {
-      Ok(())
-    }
-    async fn reply_fields(&mut self) -> Result<Fields, crate::vcs_http::Failed> {
-      Ok(Vec::new())
-    }
-    fn reply_status(&self) -> Status {
-      Status {
-        code: self.0,
-        reason: "Stub",
-      }
-    }
-    async fn reply(
-      &mut self,
-      _out: &mut Vec<u8>,
-      _gone: ClientGone<'_>,
-    ) -> Result<bool, crate::vcs_http::Failed> {
-      Ok(false)
+impl Exchange for StubExchange {
+  async fn body(&mut self, _run: &[u8]) -> Result<(), crate::vcs_http::Failed> {
+    Ok(())
+  }
+  async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), crate::vcs_http::Failed> {
+    Ok(())
+  }
+  async fn reply_fields(&mut self) -> Result<Fields, crate::vcs_http::Failed> {
+    Ok(Vec::new())
+  }
+  fn reply_status(&self) -> Status {
+    Status {
+      code: self.0,
+      reason: "Stub",
     }
   }
+  async fn reply(
+    &mut self,
+    _out: &mut Vec<u8>,
+    _gone: ClientGone<'_>,
+  ) -> Result<bool, crate::vcs_http::Failed> {
+    Ok(false)
+  }
+}
 
-  impl Site for StubSite {
-    type Exchange = StubExchange;
-    async fn decide(&mut self, _head: &Head<'_>, _secure: bool) -> Decided<Self::Exchange> {
-      Decided {
-        answer: Answer::Refuse {
-          status: Status {
-            code: self.0,
-            reason: "Stub",
-          },
-          fields: Vec::new(),
+impl Site for StubSite {
+  type Exchange = StubExchange;
+  async fn decide(&mut self, _head: &Head<'_>, _secure: bool) -> Decided<Self::Exchange> {
+    Decided {
+      answer: Answer::Refuse {
+        status: Status {
+          code: self.0,
+          reason: "Stub",
         },
-        proven: false,
-      }
+        fields: Vec::new(),
+      },
+      proven: false,
     }
   }
+}
 
-  // Distinct sentinel statuses for Git (418) and Hg (421) stub sites so we verify routing cleanly.
-  let mut tools = ToolSites::new(StubSite(418), StubSite(421), site(), ROOM);
-  let owner = basic("alice", OWNER_TOKEN);
-  let stranger = basic("bob", STRANGER_TOKEN);
+type TestToolSites = ToolSites<StubSite, StubSite, SvnSite<Tokens, Held, Stores>>;
 
-  // 1. Authenticated GET of existing SVN file -> 200 + exact bytes.
-  let get_req = request("GET", "/repo/trunk/a.txt", &[&owner]);
+fn assert_tool_sites_svn_get(tools: &mut TestToolSites, owner: &str) {
+  let get_req = request("GET", "/repo/trunk/a.txt", &[owner]);
   let Answer::Serve {
     mut exchange,
     head_only,
@@ -1288,9 +1272,10 @@ fn tool_sites_routes_public_get_and_head_to_svn_preserving_auth_move_and_protoco
   let mut body = Vec::new();
   while ready(exchange.reply(&mut body, ClientGone::never())).unwrap() {}
   assert_eq!(body.as_slice(), A_TEXT);
+}
 
-  // 2. Authenticated HEAD of existing SVN file -> 200 + head_only == true.
-  let head_req = request("HEAD", "/repo/trunk/a.txt", &[&owner]);
+fn assert_tool_sites_svn_head(tools: &mut TestToolSites, owner: &str) {
+  let head_req = request("HEAD", "/repo/trunk/a.txt", &[owner]);
   let Answer::Serve {
     mut exchange,
     head_only,
@@ -1303,8 +1288,9 @@ fn tool_sites_routes_public_get_and_head_to_svn_preserving_auth_move_and_protoco
   assert!(matches!(exchange, ToolExchange::Svn(_)));
   ready(exchange.body_end(ClientGone::never())).unwrap();
   assert_eq!(exchange.reply_status().code, 200);
+}
 
-  // 3. Unauthenticated GET -> 401 with WWW-Authenticate.
+fn assert_tool_sites_svn_auth_and_missing(tools: &mut TestToolSites, owner: &str, stranger: &str) {
   let unauth_req = request("GET", "/repo/trunk/a.txt", &[]);
   let Answer::Refuse { status, fields } = ready(tools.decide(&head(&unauth_req), false)).answer
   else {
@@ -1318,60 +1304,92 @@ fn tool_sites_routes_public_get_and_head_to_svn_preserving_auth_move_and_protoco
     "401 must carry WWW-Authenticate: {fields:?}"
   );
 
-  // 4. Unshared principal GET -> 403.
-  let forbidden_req = request("GET", "/repo/trunk/a.txt", &[&stranger]);
+  let forbidden_req = request("GET", "/repo/trunk/a.txt", &[stranger]);
   let Answer::Refuse { status, .. } = ready(tools.decide(&head(&forbidden_req), false)).answer
   else {
     panic!("unshared principal GET must be refused 403");
   };
   assert_eq!(status.code, 403);
 
-  // 5. Missing file GET -> 404.
-  let missing_req = request("GET", "/repo/trunk/no-such.txt", &[&owner]);
+  let missing_req = request("GET", "/repo/trunk/no-such.txt", &[owner]);
   let Answer::Serve { mut exchange, .. } = ready(tools.decide(&head(&missing_req), false)).answer
   else {
     panic!("missing file GET must reach SVN exchange and answer 404");
   };
   ready(exchange.body_end(ClientGone::never())).unwrap();
   assert_eq!(exchange.reply_status().code, 404);
+}
 
-  // 6. Cross-shard GET -> Answer::Move { shard: AWAY.1 }.
-  let away_req = request("GET", "/away/trunk/a.txt", &[&owner]);
+fn assert_tool_sites_move_and_git_repo_isolation(tools: &mut TestToolSites, owner: &str) {
+  let away_req = request("GET", "/away/trunk/a.txt", &[owner]);
   assert!(matches!(
     ready(tools.decide(&head(&away_req), false)).answer,
     Answer::Move { shard } if shard == AWAY.1
   ));
 
-  // 7. Cross-protocol isolation: Git repo on SVN public path -> 404 from SVN site.
-  let git_as_svn = request("GET", "/r.git/trunk/a.txt", &[&owner]);
+  let git_as_svn = request("GET", "/r.git/trunk/a.txt", &[owner]);
   let Answer::Refuse { status, .. } = ready(tools.decide(&head(&git_as_svn), false)).answer else {
     panic!("GET on a git repository path must be refused 404");
   };
   assert_eq!(status.code, 404);
+}
 
-  // 8. Git smart HTTP, Git dumb HTTP, Git LFS, and Hg wire requests stay on Git/Hg sites.
-  let git_refs = request("GET", "/r.git/info/refs?service=git-upload-pack", &[&owner]);
+fn assert_tool_sites_stub_status(
+  tools: &mut TestToolSites,
+  method: &str,
+  target: &str,
+  owner: &str,
+  expected_code: u16,
+) {
+  let req = request(method, target, &[owner]);
   assert!(matches!(
-    ready(tools.decide(&head(&git_refs), false)).answer,
-    Answer::Refuse { status, .. } if status.code == 418
+    ready(tools.decide(&head(&req), false)).answer,
+    Answer::Refuse { status, .. } if status.code == expected_code
   ));
-  let git_dumb = request("GET", "/r.git/HEAD", &[&owner]);
-  assert!(matches!(
-    ready(tools.decide(&head(&git_dumb), false)).answer,
-    Answer::Refuse { status, .. } if status.code == 418
-  ));
-  let git_lfs = request(
+}
+
+fn assert_tool_sites_protocol_isolation(tools: &mut TestToolSites, owner: &str) {
+  assert_tool_sites_stub_status(
+    tools,
+    "GET",
+    "/r.git/info/refs?service=git-upload-pack",
+    owner,
+    418,
+  );
+  assert_tool_sites_stub_status(tools, "GET", "/r.git/HEAD", owner, 418);
+  assert_tool_sites_stub_status(
+    tools,
     "PUT",
     "/r.git/info/lfs/objects/0000000000000000000000000000000000000000000000000000000000000000",
-    &[&owner],
+    owner,
+    418,
   );
-  assert!(matches!(
-    ready(tools.decide(&head(&git_lfs), false)).answer,
-    Answer::Refuse { status, .. } if status.code == 418
-  ));
-  let hg_caps = request("GET", "/repo?cmd=capabilities", &[&owner]);
-  assert!(matches!(
-    ready(tools.decide(&head(&hg_caps), false)).answer,
-    Answer::Refuse { status, .. } if status.code == 421
-  ));
+  assert_tool_sites_stub_status(tools, "GET", "/repo?cmd=capabilities", owner, 421);
+}
+
+/// SVN-5: Do send public `GET` and `HEAD` requests (no `!svn/` segment) through the full
+/// [`crate::vcs_http::ToolSites`] router wrapping Git, Hg, and SVN sites. Expect:
+/// - authenticated `GET /repo/trunk/a.txt` -> `200` with exact bytes `A_TEXT`
+/// - authenticated `HEAD /repo/trunk/a.txt` -> `200` with `head_only == true`
+/// - unauthenticated `GET /repo/trunk/a.txt` -> `401` with `WWW-Authenticate`
+/// - unshared principal `GET /repo/trunk/a.txt` -> `403`
+/// - missing file `GET /repo/trunk/missing.txt` -> `404`
+/// - cross-shard `GET /away/trunk/a.txt` -> `Answer::Move { shard: AWAY.1 }`
+/// - cross-protocol isolation: `GET /r.git/trunk/a.txt` -> `404` (Git repo never served as SVN),
+///   `GET /r.git/info/refs?service=git-upload-pack` -> routed to Git site,
+///   `GET /r.git/HEAD` -> routed to Git site (dumb protocol `403`),
+///   `GET /repo?cmd=capabilities` -> routed to Hg site,
+///   `PUT /r.git/info/lfs/objects/0000000000000000000000000000000000000000000000000000000000000000` -> routed to Git site.
+#[test]
+fn tool_sites_routes_public_get_and_head_to_svn_preserving_auth_move_and_protocol_isolation() {
+  // Distinct sentinel statuses for Git (418) and Hg (421) stub sites so we verify routing cleanly.
+  let mut tools = ToolSites::new(StubSite(418), StubSite(421), site(), ROOM);
+  let owner = basic("alice", OWNER_TOKEN);
+  let stranger = basic("bob", STRANGER_TOKEN);
+
+  assert_tool_sites_svn_get(&mut tools, &owner);
+  assert_tool_sites_svn_head(&mut tools, &owner);
+  assert_tool_sites_svn_auth_and_missing(&mut tools, &owner, &stranger);
+  assert_tool_sites_move_and_git_repo_isolation(&mut tools, &owner);
+  assert_tool_sites_protocol_isolation(&mut tools, &owner);
 }
