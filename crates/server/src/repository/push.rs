@@ -831,6 +831,29 @@ pub(crate) fn push_hg(
   )
 }
 
+/// [`push`] of a Mercurial push that keeps no revisions (a bookmark moved or made over changesets the repository holds,
+/// or a changegroup of changesets it held): its creates taken from `prepared` where its driver made them ahead of the
+/// landing's step, as [`push_hg`] takes a recorded push's. The plan that made them took each create's work out of
+/// `changes`, so a create not taken from `prepared` is made from its base with no work.
+pub(crate) fn push_unrecorded(
+  state: &mut ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  (changes, ahead, prepared): (
+    Vec<BranchChange>,
+    &[crate::held_ahead::HeldAhead],
+    Option<&mut PreparedCreates>,
+  ),
+  parts: EntryParts,
+) -> Result<Appended, AppendRefused> {
+  push_holding(
+    state,
+    (principal, repository),
+    (changes, ahead, prepared),
+    parts,
+    None,
+  )
+}
+
 /// A Git LFS object an upload brings (A-629 part 3): its oid and bytes, and why the repository's LFS index refused it,
 /// once it has.
 pub(crate) struct LfsUpload<'u> {
