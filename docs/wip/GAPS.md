@@ -266,6 +266,12 @@
 > or refused `AlreadyExists` naming the adopted one, whose name is reserved until its rebuild (before, the retry made
 > a second repository of the name). Red first (`a915_...`, the kill held between the record and the join). OWED
 > (main): gate 19 at 40 + 40 with each failed run's daemon log.
+> **FIXED in part (A-927 part 1, w-shared, 2026-11-25; main 01a20182's ruling): after A-915, a894's loop refused the
+> first push "the default branch holds files no commit names" on a successor that had given the root green up.** A
+> create on a default green this node has not recovered now says so, naming the green and its cause, and one not made
+> here yet says to retry; before, both read as files, and a green not recovered whose engine was still lent took the
+> create. Red first (`t_a927_...`). OPEN (A-927 part 2, w-shared): the `Unjoined` adoption reads the join from its
+> cohort before giving the green up.
 > **FIXED (A-913, w-shared, 2026-11-24; A-912's sibling): a branch created while a member died refused `unable to
 > commit` at its record barrier (3 of 25 runs).** The restarted holder held its source's records but no replica, and
 > the record path branched only from a replica already there; now it makes a missing source first, as a branch's
@@ -330,12 +336,15 @@
 >   - **FIXED, its prerequisite (A-925):** each node announces its own edges (git HTTP or HTTPS, SSH) to its peers over
 >     stream 33, as a client reaches them, held only from its own authenticated session; an owner of no learned edge is
 >     the typed refusal naming its member id.
->   - **OPEN, the product half (A-921 part 2), w-shared's next:** a, readmitted after its false death, still ran pushes
->     as the repository's owner (the VCS edges route by the partition holding the repository, never by the
->     configuration's owner), its records refused `Unauthorized` (38 at each holder) and the push `unable to commit`.
->     Red (written, held for its fix): `a921_a_push_to_an_owner_readmitted_after_a_false_death_lands_through_its_successor`.
->     Fix: every protocol's first request routed by owner, git over HTTP answered 307 to the owner, each other client's
->     handling of a redirect measured, and a typed refusal naming the owner where it does not follow.
+>   - **FIXED, the product half (A-921 part 2):** a readmitted node answers a request for a repository a takeover moved
+>     from it with where it went: `307` to the adopter's announced edge (git, Mercurial over HTTP; Subversion names the
+>     target and stops), a typed `503` naming the owner where it announced no edge, "moved, owner unknown here" where
+>     none claimed it; SSH refused typed. Found by the one owner lookup (`owner_location::locate_owner`), shared with the
+>     volume forward and the homes' resolution. For a cross-node `307`, git needs a credential helper answering every
+>     node's edge (curl drops a custom `Authorization` field on an origin change).
+>   - **OPEN, waits for Ada's word: fleet-wide repository name routing.** A node holding no copy of a repository answers
+>     `404` (the fleet test: the third node's `ls-remote` "not found"): a name resolves only where a partition holds it
+>     (D-12, no directory; D-14, no global catalog), so it cannot even form the owner's query. Not started.
 >   - **OPEN, A-922:** a node whose authority over a repository moved forgets its partition's copy, sliced and bounded,
 >     as `forget_owned_by` does for volumes (AUD-08).
 > - **OPEN (found by A-919, owner main): an owner's hold is never recovered at a restart.** It counts among `f + 1`,
@@ -1942,6 +1951,18 @@
 > exit-status, EOF and close in order (`[94, 98, 96, 97]`) and the connection's end 3 µs to 47 ms after the close.
 > Since, a failure names which end it missed: the channel messages' order and the wait for the connection's end after
 > the close (`Adjusted::ending` in `vcs_ssh/tests/hg.rs`). Owed: the next red's line (main's whole runs).
+> A push's manifest chain read a stack frame a delta (2026-11-25, w-hg; main's order: a 2,000-changeset push overflowed
+> a debug shard's 2 MiB stack in `hg_clone_store_wait`): `chain_read` made the text level by level, each delta's
+> patching reading the level below, so a read of a line no delta touched recursed through every delta to the whole text,
+> its depth the chain's links (bounded by bytes, never by links). Since, the chain's deltas are folded once, lowest first,
+> into one list of pieces over the text (`mpatch`'s fold), each a range of the whole text or of a delta's bytes, on the
+> heap in the chain's room: nothing recurses, and a read is a search and copies. Held by
+> `a_deep_chain_is_read_on_a_shards_stack` (10,000 one-line deltas over a 1,000-line text read in pieces of 1 to 4,096
+> bytes, in a re-invoked child on a thread of a shard's 2 MiB: red, the child aborted on the overflow; now the text the
+> deltas make). The 2,000-changeset measurement now runs on 2 MiB stacks (46.6 s, 87.8 s at 8 MiB before). Swept: no
+> other recursion in `slates-hg` or `slates-store` follows the data's depth (`render::next_log` recurses at most twice);
+> elsewhere git's `reach` recurses by its index's levels, svn's `children` by its tree's height, vcs's merge sort to lg k,
+> and svn's ra_svn items by a nesting depth its parser bounds (`Bounds::depth`).
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads

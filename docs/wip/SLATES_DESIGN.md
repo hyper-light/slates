@@ -6973,6 +6973,17 @@ version.
 > beside two spinners a CPU: 1 or 2 calls refused in every false death under one liveness budget of wall time). The
 > operator's failover SLO caps the whole on the wall. Counted: `fleet.owner_location.gave_up`, and the budget's two
 > ends, `budget_spent` and `slo_ended`.
+>
+> **Amended by A-921 part 2 (2026-11-25, AUD-08's rule for every object).** That loop is now the one owner lookup,
+> `owner_location::locate_owner(query, bound)`, called by the volume forward, the version-control edges and the homes'
+> resolution (`vcs_store::homes::resolve_elsewhere`, whose own sequence, routing then lineage then one region-0 round
+> with no filter and no budget, is gone).
+> - A caller's bound only stops the one sequence sooner: the home healer passes what is left of its pass, and the
+>   forward and the edges pass none.
+> - The query is at the object's home region (`owner_location::home_query`).
+> - The direct route never offers a first owner the configuration keeps a retirement or a completed takeover of: a host
+>   readmitted after a false death is a member again, but not the owner of what it held then. The location round finds
+>   the adopter, which claims while it serves, so letting the takeover's records go (A-309) opens no gap.
 
 > **Status (2026-11-06, A-236: a clone's name at its name's partition).** Within a daemon a name routes by its hash to
 > one partition (`owner_of_name`), where it is looked up and where its uniqueness is decided. A clone lives beside its
@@ -63907,6 +63918,80 @@ owner's acceptor in the control shard's state), the state_log module doc (its ow
 `crates/server/src/{ledger_read,state_log,fleet,moves,merge_service,takeover,state,daemon,lib}.rs`,
 `crates/server/tests/fleet.rs`, `docs/wip/models/FencedLedger.tla` and its configurations, GAPS.
 
+### A-921 part 2 — A repository a takeover moved from a node is answered there with where it went, found by the one owner lookup (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25; amends AUD-08's lookup status)
+
+- **Why.** A node readmitted after a false death kept serving pushes as the repository's owner. The VCS edges route by
+  the partition that holds a repository's name, never by its owner. Its records were refused `Unauthorized` (38 at each
+  holder) and every push `unable to commit`. Red: `a921_a_push_to_an_owner_readmitted_after_a_false_death_lands_through_its_successor`.
+- **The change.**
+  - **The moved set.** At a re-admission (`readmission::install_placement`'s readmitted branch, beside the volumes'
+    `yield_catalogued`), each shard marks every repository its partition holds as yielded
+    (`ShardState::yielded_repositories`, counted `fleet.readmission.repositories_yielded`). It is bounded by the
+    partition's repositories; A-922 releases the copies.
+  - **The one owner lookup.** A yielded repository's owner is found on the control shard by
+    `owner_location::locate_owner`: the volume forward's loop, lifted so the forward, the edges and the homes'
+    resolution share it (AUD-08's status, amended). The query is at the object's home region. The direct route never
+    offers a creator retired by a kept takeover, so the location round finds the adopter.
+  - **The answer, git and Mercurial over HTTP.** `307 Temporary Redirect` to the owner's announced edge (A-925), with
+    the request's path and query, counted `vcs_http.git.moved_redirected`. It is temporary because a takeover may move
+    the repository again. Two typed `503`s carry the answer in `Slates-Repository-Owner`: "member <id>" where the owner
+    announced no edge (`moved_no_edge`), and "moved, owner unknown here" where no owner claimed it within the lookup's
+    budget (`moved_owner_unknown`, the existing `OwnerUnreachable`, not a new variant).
+  - **Subversion over HTTP** gets the same answers.
+  - **SSH** has no redirect; a moved repository is refused typed ("moved to another node by a takeover; this node no
+    longer serves it", `vcs_ssh.moved_refused`). The SSH dispatch is synchronous, so it does not name the owner.
+    svnserve's vocabulary has no move, so it answers no repository there, counted and logged.
+  - **The home healer** passes what is left of its pass to the shared lookup. A pass over unclaimed attempts ends
+    within its budget; an attempt left unasked stays kept, and the pass is owed again.
+- **Measured, clients' redirects** (stock clients against a local `307`, macOS arm64, 2026-11-25):
+  - **git** follows a `307` at its first request (`http.followRedirects`'s default, `initial`).
+  - **Mercurial 7.2.4** follows it at its first request (`capabilities`).
+  - **Subversion 1.15** does not follow. It stops with `E170011: Repository moved temporarily to '<url>'`, naming the
+    target for its user to `svn relocate` to.
+  - **Credentials (git):** curl drops a custom `Authorization` field, here git's `http.extraHeader` bearer, once a
+    redirect changes origin, and a different port is a different origin. The owner then answers `401`, and git asks
+    its credential helper for the new origin.
+  - **What a user must configure for a `307` across nodes:** a credential helper that answers the fleet's token for
+    every node's edge (keyed by host and port, or one entry for the fleet's host with `credential.useHttpPath`
+    unset). A bearer in `http.extraHeader` alone reaches only the first node. The fleet tests' push helpers carry one
+    (`token_helper`).
+- **The window before a node learns it was taken over.** A readmitted node learns it lost its repositories when it
+  installs the configuration that bumped its epoch, which can come after every council names it a member again. Until
+  then it serves as their owner, its records are refused, and a push there is refused `unable to commit`, typed. The
+  fleet test waits for its yield before it pushes; a run on the merged base that did not wait met that window once.
+  **The client's contract:** that refusal is retryable. Nothing the push wrote is acknowledged, since a push is answered
+  only once its barrier holds. The window ends when the node installs its committed configuration, which it fetches every
+  coordinator period. So a client retries after the failover delay the fleet publishes (`failover_ns`, the bound its
+  takeover is held to). The retry finds the node knowing its takeover and is answered `307` to the adopter, or `503`
+  typed.
+- **Not reproduced end to end: the stale-creator window** (main's ruling).
+  - Across three fleet scenes (a cold four-node fleet, and one with the non-holder restarted warm after a's
+    readmission), the direct route never named a with the skip turned off. The non-holder's routing, learned again,
+    named the adopter before a became eligible again.
+  - The skip guards the window between them. Its red is the unit test on the exact state.
+- **Fleet-wide name routing is not in this piece** (main's ruling (a)). A node holding no copy of a repository answers
+  `404` as before: a name resolves only where a partition holds it (D-12, no directory). It is in GAPS, owed, waiting
+  for Ada's word.
+- **Tests** (macOS arm64, debug, 2026-11-25).
+  - Fleet `a921_a_push_to_an_owner_readmitted_after_a_false_death_lands_through_its_successor`: green, the push at a
+    redirected and landed at the adopter. The adopter alone serves the repository, and the node that never held it
+    answers not found.
+  - Fleet `a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it` and
+    `a921_a_warm_restarted_node_never_names_a_false_death_victim_its_old_volumes_owner`: served forwards, never a.
+  - Unit `owner_location::tests::the_direct_route_never_names_a_creator_a_kept_takeover_retired`: red without the skip
+    (the creator named).
+  - Unit `vcs_http::git::tests::a_request_for_a_moved_repository_is_answered_with_where_it_went`: `307` with its path,
+    the `503` naming the owner, and the `503` unknown.
+  - `git_push::tests::a_resolution_pass_over_unclaimed_attempts_ends_within_its_budget`.
+  - Fleet runs were made directly, past the A-924 2b spawner's wedges (`spawning.rs:668`), which ended about 2 runs in
+    3 at their start.
+- **Models.** None; routing and lookups are outside the register's state machine.
+
+Applied in the same change to: AUD-08's lookup status (§4.8), `crates/server/src/{owner_location,verbs,readmission,state,
+daemon}.rs`, `crates/server/src/vcs_http/{git,hg,svn,daemon_edge}.rs`, `crates/server/src/vcs_ssh/{site,svn}.rs`,
+`crates/server/src/vcs_store/homes.rs`, `crates/http/src/reply.rs`, `crates/server/tests/fleet.rs` and
+`crates/server/src/{vcs_http/tests/git,git_push/tests}.rs`, GAPS.
+
 ### A-925 — A node announces its own version-control edges to its peers, as a client reaches them (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25; A-921 part 2's prerequisite)
 
 - **Why.** A-921's product half answers a request at a node that is not a repository's owner with where to go. A node
@@ -63994,6 +64079,9 @@ Applied in the same change to: `crates/server/src/{edges,daemon,fleet,state,lib,
   - a894, its own flake's scene, green.
 - **Models.** None of `docs/wip/models/` models a creation's answer, the names log or an adoption's wait; no spec
   changed.
+- **Amended by A-927 part 1** (2026-11-25): the green an adoption gives up is not said to hold files. A create on it
+  is refused naming the green and its cause (`NotRecovered`'s kind), where before it was refused "the default branch
+  holds files no commit names" (a894's loop after A-915).
 
 Applied in the same change to: §4.16 "Apply on holders", the A-894 entry, `crates/server/src/{live_ship,state_log,
 merge_service,merge_origin,green_adopt,fleet,state,daemon,repository,takeover}.rs`, `crates/server/tests/fleet.rs`,
@@ -64125,6 +64213,17 @@ GAPS.
   each path's last change, their bytes); `changed_since_reports_every_dimension_as_changed_between_does` and
   `changed_since_reads_the_span_alone_and_folds_with_the_histories` (merge's integration tests) fail where an earlier
   entry stays marked last, which no lib test caught; a version's list never kept fails 33 lib tests.
+  **1c, the entry's measure.** What was left of the commit's end step (6.2-6.7 ms) was the batch measuring its chain
+  entry whole (`chain_entry::encoded_len` in `finish_staged`). `chain_entry::measuring` and `measure_step` take it a
+  unit a step: what the work declares indexed an op a unit, its names held by the measure itself
+  (`DeclaredBy<String>`; `Declared` is the same index borrowing the work's names, both built by one `declare`), then
+  each effect's bytes added an effect a unit, then the same trailers (`tail_bytes`). The batch's commit ends in
+  `committed` (outcome, the head's identity, the copies' versions back in the green's numbering) and the measure is a
+  phase of the pending work (`ImportBatch::measure_pending`). The commit's end step 6.2-6.7 ms → under 5 ms (2 runs,
+  load 38-82). Oracle: over generated works of every kind, renames and edits, every accepted verdict's entry measured a
+  unit a step is `encoded_len`'s, with a head identity and without, and some verdict records a splice, the effect whose
+  length reads what the work declares (`an_entry_measured_a_unit_a_step_is_the_entry_measured_whole`; a resumed index
+  that skips an op fails it, which the first generator, with no edits, did not).
 - **Piece 2, the record check.** Its 101-106 ms at 9,000 files were the index's plan of the revision's rows
   (`Index::plan`, 96 ms: its builder's apply of each row 87, the rows' sort 3.9, the plan's finish 4.4), the fresh
   texts (9 ms), the record's encoding (4 ms) and the stored filter (1.6 ms). The plan is taken a slice at a time:
@@ -64243,7 +64342,10 @@ GAPS.
   lock entries, its properties and what the records hold; `apply` and `Index::commit_planned` are these carried to
   their end. Until that last step the records and the index read as before the apply began: what a step adds is
   reached only through the revision, and every read is at or below the youngest. The records step 12.2-12.5 ms →
-  under 5 ms (2 runs, load 33-48). Still whole: a recovery's replay of a revision, in its two stages. Oracles: over
+  under 5 ms (2 runs, load 33-48). Still whole: a recovery's replay of a revision, in its two stages
+  (`Repository::replay_step`: its rows, then its lists and stored texts). Its callers in the server's recovery drive
+  one stage a call with no budget of their own, so slicing it is a change to recovery's pacing, a piece of its own,
+  not the import's staging; it shares the apply's checks (`apply_checks`) and the index's commit. Oracles: over
   generated histories and every revision of every dump `svnadmin` wrote, a revision committed a unit a step equals it
   committed whole, and between every two of its steps every path at every revision reads as before the commit began
   (`a_record_planned_a_row_a_step_is_the_record_planned_whole` and its golden twin; a youngest moved at the first unit
@@ -64251,6 +64353,21 @@ GAPS.
   stored text dropped fails it). With it, the change index's rule stated on its own (main's order of 2026-11-25): after
   every generated work, each changed path has exactly one entry marked last, at its last change
   (`only_a_paths_newest_change_is_marked_last`; an earlier entry left marked last fails it, which no lib test caught).
+  **3d, the runs' places.** The import judge's last step (10.6 ms after 5b: the commit's begin 4.1, the hold 3.5,
+  `Reached::of` 1.5) began the verdict's commit with its preparation's first phase whole: the places of every named
+  run (`Post::run_places`, a map over 9,000 runs). They are now a phase of their own (`Prep::Places`), found a run a
+  unit (`Post::run_place`) until the step is spent, for every commit and apply that prepares so. The judge's last step
+  10.6 ms → 6.2-6.3 ms (2 runs, load 35-60). Still whole in it: the hold (the verdict, 2.6) and `Reached::of`.
+  Oracle: the named-texts history oracle's commits and applies prepare a unit a step; a resumed walk of the places that
+  skips a run fails it.
+  **3e, the preparation's turn.** The step a commit's preparation left its sole runs in (7.0-7.3 ms at 9,000 files)
+  named every file a run makes whole (`named_files`) and kept the files whose run makes no other (`alone`), each a
+  walk of every sole run. Each file's name and its run's count of files are now kept as the sole runs are found
+  (`whole_object`, shared with `named_files`), and the files kept are their own phase (`Prep::Alone`), a file a unit.
+  The step 7.0-7.3 ms → under 5 ms (2 runs, load 32-50). Oracle: the named-texts history oracle's deferring green, its
+  commits prepared a unit a step, makes as many files by copying as the judging green's whole commits
+  (`Green::mapped_files_made`, for every version not made in steps first); a resumed `Alone` that skips a file, which
+  moves no bytes differently and so passed every oracle before this count, fails it.
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
@@ -64511,3 +64628,31 @@ measured noise of the 100 figure, not a literal.
   - `crates/server/src/daemon.rs` (the open, the give-back's lowering);
   - `crates/server/src/content_ranges.rs` (the block's page in the plan, the marks' rows);
   - A-826's GAPS entry.
+
+### A-927 part 1 — A create on a default green this node cannot read says why: not recovered, or not made here yet, the green named (2026-11-25, w-shared for main 01a20182, its ruling of 2026-11-25 step 1; the a894 loop after A-915; amends A-654 and A-915)
+
+- **Why.** In main's a894 loop after A-915, a successor whose adoption of a repository's root green was refused
+  (A-915's `Unjoined`: the names-log part carrying the join reached only the other survivor) gave the green up. The
+  client's first push then created `main` there and was refused "the default branch holds files no commit names"
+  (`NO_EMPTY_DEFAULT`). The green held nothing; this node held no engine for it. `git_push::empty_default` answered
+  `None` for every way the default green was not an unborn, empty one. Unbound, holding files, given up and not made
+  here yet all read alike, as files. And a green this node had not recovered, whose engine was still lent, took the
+  create: an unrecovered green was written.
+- **The change.** `empty_default` answers why not (`NoEmptyDefault`), and the create's refusal carries its own words on
+  band 2 (git's `failed to update ref` in the report, as every refusal of slates' own):
+  - the default green in `ShardState::unrecovered`: "the default branch's green `<hex>` is not recovered here
+    (`<RecoveryCause::kind>`)", read before the engine, so a lent engine of a green not recovered is never written;
+  - the repository's git store or the green's engine not lent here (an adoption still materializing it, or its lineage
+    lent out): "the default branch's green `<hex>` is not made here yet; retry";
+  - no default branch, no green bound to it, or a green holding a git version, a file at its version 0 or a push it
+    owes (P2; lent as a create lends, `Greens::lend`): the old words, which are then true.
+- **Part 2, next:** an `Unjoined` adoption reads the names-log part carrying the join from its cohort through A-919's
+  read before refusing, and the deterministic red (state-log shipping held to the successor-to-be).
+- **Tests.** Red on the code before (the source change reverse-applied, the tests kept):
+  - `git_push::tests::t_a927_a_create_on_a_default_green_not_recovered_is_refused_naming_it`: the create landed (`ok`)
+    on the green recorded not recovered.
+  - `git_push::tests::t_a927_a_create_on_a_default_green_not_made_here_is_refused_to_retry` (its engine taken out of
+    its lineage): refused "the default branch holds files no commit names", a894's very words.
+- **Models.** None of `docs/wip/models/` models a push's create; no spec changed.
+- **Applied in the same change to:** `crates/server/src/git_push.rs` (the module docs' "A create", `NoEmptyDefault`,
+  `empty_default`), its tests, A-915's entry, GAPS (A-915's entry).

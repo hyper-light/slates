@@ -133,12 +133,36 @@ pub(crate) enum Located {
   Elsewhere(u16),
 }
 
+/// Where a repository this node holds but no longer owns went (A-921 part 2): a takeover moved it while this node was
+/// taken over, and admitted again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Elsewhere {
+  /// Its owner's edge, as it announced it (A-925): the base a request's path and query follow (`scheme://host:port`).
+  Edge(String),
+  /// Its owner, found, which announced no edge a client reaches: named by member id.
+  Owner(slates_db::HostId),
+  /// No owner claimed it within the lookup's budget (`OwnerUnreachable`): moved, its owner unknown here.
+  Unknown,
+}
+
 /// Where a repository is found by its name.
 pub(crate) trait Repositories {
   /// Where the repository named `name` lives.
   fn locate(&self, name: &str) -> Located;
   /// The repository named `name` on this shard, if one is.
   fn find(&self, name: &str) -> Option<RepositoryRecord>;
+  /// Where `repository` went, where this node holds it but no longer owns it (A-921 part 2); `None` where it serves it.
+  fn elsewhere(
+    &self,
+    _repository: &RepositoryRecord,
+  ) -> impl std::future::Future<Output = Option<Elsewhere>> {
+    std::future::ready(None)
+  }
+  /// Whether a takeover moved `repository` from this node (A-921 part 2), asked without the owner's lookup: the SSH
+  /// edge's synchronous dispatch refuses it typed, never serving the stale copy.
+  fn moved_here(&self, _repository: &RepositoryRecord) -> bool {
+    false
+  }
 }
 
 /// Why git's site refused a request, by kind: each answered with its status and counted under its name (A-625 part 3).
@@ -674,6 +698,10 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
     else {
       return self.refuse(Refused::NoRepository, true);
     };
+    // A repository a takeover moved from this node is answered with where it went (A-921 part 2), never served here.
+    if let Some(elsewhere) = self.repositories.elsewhere(&repository).await {
+      return moved(head, elsewhere);
+    }
     match vcs_policy::reaches(&repository, &proven.principal, rights(asked.service)) {
       Ok(true) => self.start(&asked, &repository, &proven.principal),
       Ok(false) => self.refuse(Refused::Forbidden, true),
@@ -879,6 +907,55 @@ fn refused_with<E>(status: Status, fields: Fields, proven: bool) -> Decided<E> {
     proven,
   }
 }
+
+/// The answer to a request for a repository a takeover moved from this node (A-921 part 2, main 01a20182's ruling of
+/// 2026-11-25): `307 Temporary Redirect` to its owner's edge with the request's own path and query (git follows a
+/// redirect at its first request, `http.followRedirects`'s `initial`; temporary, since a takeover may move it again);
+/// where its owner announced no edge, `503` naming it by member id ([`MOVED_OWNER_FIELD`]); where no owner claimed it,
+/// `503` "moved, owner unknown here". Each counted.
+pub(crate) fn moved<E>(head: &Head<'_>, elsewhere: Elsewhere) -> Decided<E> {
+  let mut fields = cache_fields();
+  match elsewhere {
+    Elsewhere::Edge(base) => {
+      crate::fleet::count_refusal(MOVED_REDIRECTED);
+      let mut location = base.into_bytes();
+      if let slates_http::head::Target::Path { path, query } = head.target {
+        location.extend_from_slice(path);
+        if let Some(query) = query {
+          location.push(b'?');
+          location.extend_from_slice(query);
+        }
+      }
+      fields.push((b"Location".to_vec(), location));
+      refused_with(Status::TEMPORARY_REDIRECT, fields, true)
+    }
+    Elsewhere::Owner(member) => {
+      crate::fleet::count_refusal(MOVED_NO_EDGE);
+      fields.push((
+        MOVED_OWNER_FIELD.to_vec(),
+        format!("member {:016x}", member.0).into_bytes(),
+      ));
+      refused_with(Status::SERVICE_UNAVAILABLE, fields, true)
+    }
+    Elsewhere::Unknown => {
+      crate::fleet::count_refusal(MOVED_OWNER_UNKNOWN);
+      fields.push((
+        MOVED_OWNER_FIELD.to_vec(),
+        b"moved, owner unknown here".to_vec(),
+      ));
+      refused_with(Status::SERVICE_UNAVAILABLE, fields, true)
+    }
+  }
+}
+
+/// Format: the field a refusal for a moved repository names its owner in (A-921 part 2).
+pub(crate) const MOVED_OWNER_FIELD: &[u8] = b"Slates-Repository-Owner";
+/// Counter: requests for a moved repository redirected to its owner's edge (A-921 part 2). Format: a counter name.
+pub(crate) const MOVED_REDIRECTED: &str = "vcs_http.git.moved_redirected";
+/// Counter: requests for a moved repository whose owner announced no edge (A-921 part 2). Format: a counter name.
+pub(crate) const MOVED_NO_EDGE: &str = "vcs_http.git.moved_no_edge";
+/// Counter: requests for a moved repository no owner claimed (A-921 part 2). Format: a counter name.
+pub(crate) const MOVED_OWNER_UNKNOWN: &str = "vcs_http.git.moved_owner_unknown";
 
 /// The cache fields `http-backend` sends on every answer, as the edge's fields.
 fn cache_fields() -> Fields {
