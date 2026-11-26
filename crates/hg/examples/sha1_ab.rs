@@ -278,22 +278,68 @@ fn write_piece_report(
   Ok(())
 }
 
+/// Direct stdout writer that surfaces Unix `EBADF` on read-only or unwritable fd 1 instead of
+/// letting `std::io::stdout()` suppress it.
+struct DirectStdout {
+  #[cfg(unix)]
+  inner: std::io::PipeWriter,
+  #[cfg(not(unix))]
+  inner: std::io::StdoutLock<'static>,
+}
+
+impl DirectStdout {
+  /// Opens a direct handle to stdout on Unix by duplicating fd 1 into `PipeWriter`, whose
+  /// `write(2)` calls propagate `EBADF` and `EPIPE`.
+  #[cfg(unix)]
+  fn open() -> std::io::Result<Self> {
+    use std::os::fd::AsFd as _;
+    let owned = std::io::stdout().as_fd().try_clone_to_owned()?;
+    Ok(Self {
+      inner: std::io::PipeWriter::from(owned),
+    })
+  }
+
+  /// Opens the standard locked stdout handle on non-Unix platforms.
+  #[cfg(not(unix))]
+  fn open() -> std::io::Result<Self> {
+    Ok(Self {
+      inner: std::io::stdout().lock(),
+    })
+  }
+}
+
+impl std::io::Write for DirectStdout {
+  fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    self.inner.write(buf)
+  }
+
+  fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+    self.inner.write_all(buf)
+  }
+
+  fn flush(&mut self) -> std::io::Result<()> {
+    self.inner.flush()
+  }
+}
+
 fn run_benchmark(
   config: &Config,
   corpus: &[u8],
   rates: &mut [Vec<f64>; WAY_COUNT],
 ) -> std::io::Result<()> {
-  let mut stdout = std::io::stdout().lock();
+  let mut stdout = std::io::LineWriter::new(DirectStdout::open()?);
   writeln!(
     stdout,
     "corpus {} MiB; rounds {}; MB/s of each way, every round",
     config.mib, config.rounds
   )?;
+  stdout.flush()?;
   for piece_len in PIECES {
     measure_piece_size(corpus, piece_len, config.rounds, rates);
     write_piece_report(&mut stdout, piece_len, rates)?;
+    stdout.flush()?;
   }
-  stdout.flush()
+  Ok(())
 }
 
 fn main() -> ExitCode {
