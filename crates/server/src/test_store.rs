@@ -312,6 +312,88 @@ pub(crate) async fn created(
   }
 }
 
+/// Repository `name`'s import from `files`, laid out on a simulated host as 7.2 keeps them, asked of the import verb by
+/// `principal` as a client's request numbered `request` asks it ([`routed_create`]'s route): the verb's reply,
+/// `Acknowledged` once its task runs the import. The caller waits for it ([`import_ended`]).
+pub(crate) fn import_begun(
+  state: &mut crate::state::ShardState,
+  (principal, request): (&slates_db::catalog::Principal, u64),
+  name: &str,
+  files: crate::hg_base::tests::Files,
+) -> slates_ipc::protocol::ReplyBody {
+  state.current_request = Some((1, slates_wire::request::RequestId::from_word(request)));
+  state.reply_route = Some(crate::merge_service::ReplyRoute {
+    shard: state.shard,
+    client_index: NO_CLIENT,
+    request,
+    through_work: false,
+  });
+  let reply = crate::repository::import::import_with(state, principal, (name, "/"), |_| {
+    let (host, directory) = crate::hg_base::tests::laid_out(files.iter().copied());
+    Ok((
+      Box::new(host) as Box<dyn slates_vfs::host::HostFs>,
+      directory,
+    ))
+  });
+  // Left as the verb runner leaves them after it took a deferred acceptance.
+  state.current_request = None;
+  state.reply_route = None;
+  state.acceptance_deferred = false;
+  reply
+}
+
+/// Waits, from a task on the shard, for Mercurial repository `name`'s (`id`'s) import to end, as the verb's own task
+/// runs and lands it (`repository::import`), never holding the shard; refused where it ended with no changeset in the
+/// store.
+pub(crate) async fn import_ended(name: &str, id: slates_db::catalog::RepositoryId) {
+  let deadline = slates_rt::futures::now_ns()
+    .saturating_add(u64::try_from(IMPORT_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+  loop {
+    let importing =
+      crate::state::with_state(|state| state.vcs_stores.importing(id)).expect("the shard's state");
+    if !importing {
+      break;
+    }
+    assert!(
+      slates_rt::futures::now_ns() < deadline,
+      "repository {name}'s import still running after {IMPORT_PATIENCE:?}"
+    );
+    slates_rt::futures::yield_now().await;
+  }
+  let landed = crate::state::with_state(|state| {
+    state
+      .vcs_stores
+      .mercurial_ref(id)
+      .is_some_and(|(content, store)| {
+        store.index.len(content, slates_hg::index::Log::Changelog) > 0
+      })
+  })
+  .expect("the shard's state");
+  assert!(landed, "repository {name}'s import landed");
+}
+
+/// [`import_begun`] and [`import_ended`]: repository `name` (`id`) imported from `files` through the verb, from a task on
+/// the shard.
+pub(crate) async fn imported_through_the_verb(
+  (principal, request): (&slates_db::catalog::Principal, u64),
+  (name, id): (&str, slates_db::catalog::RepositoryId),
+  files: crate::hg_base::tests::Files,
+) {
+  let reply =
+    crate::state::with_state(|state| import_begun(state, (principal, request), name, files))
+      .expect("the shard's state");
+  assert_eq!(
+    reply,
+    slates_ipc::protocol::ReplyBody::Acknowledged,
+    "the import taken"
+  );
+  import_ended(name, id).await;
+}
+
+/// Shape: how long [`imported_through_the_verb`] waits for an import of a test's fixture: far past a debug build's
+/// (milliseconds), so only an import that never ends reaches it.
+const IMPORT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// [`created`] from the test's thread, on `daemon`'s shard of partition `partition`.
 pub(crate) fn create_on(
   daemon: &crate::Daemon,
@@ -363,8 +445,8 @@ pub(crate) fn create_on(
 pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   Allowed {
     fixture: "test_store::audit_on_stored_shard",
-    owner: "each history's (GAPS: svn 0, git 0, hg 32, other 82)",
-    reaching: 114,
+    owner: "each history's (GAPS: svn 0, git 0, hg 22, other 82)",
+    reaching: 104,
   },
   Allowed {
     fixture: "test_store::create",

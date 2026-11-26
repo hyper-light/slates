@@ -558,13 +558,28 @@ async fn pushed(hg: &Hg, unbundle: &Unbundle) -> Outcome {
 
 /// `bundle`, a bundle2 as a client sends it, pushed as [`pushed`] pushes one.
 async fn pushed_bytes(hg: &Hg, bundle: &[u8]) -> Outcome {
-  super::unbundle(
-    hg.repository,
-    (&owner(), &HeadsArgument::Force, bundle),
-    &mut room(),
-  )
-  .await
-  .expect("a served view")
+  pushed_bytes_to(hg.repository, bundle).await
+}
+
+/// `bundle` pushed to repository `id` by the tests' owner through the daemon's driver ([`super::unbundle`]), from a
+/// task on its shard: what it came to.
+async fn pushed_bytes_to(id: RepositoryId, bundle: &[u8]) -> Outcome {
+  super::unbundle(id, (&owner(), &HeadsArgument::Force, bundle), &mut room())
+    .await
+    .expect("a served view")
+}
+
+/// `part` pushed alone to repository `id` ([`pushed_bytes_to`]), from a task on its shard, accepted: as a client's push of
+/// the changegroup lands it, every store wait awaited.
+pub(crate) async fn pushed_changegroup(id: RepositoryId, part: ChangegroupPart) {
+  let unbundle = Unbundle {
+    parts: vec![taken(0, Asks::Changegroup(part))],
+  };
+  let outcome = pushed_bytes_to(id, &bundled(&unbundle)).await;
+  assert!(
+    matches!(outcome, Outcome::Accepted(_)),
+    "the push was refused: {outcome:?}"
+  );
 }
 
 /// Mercurial repository `name` made on `daemon`'s first shard and `unbundle` pushed to it ([`pushed`]), from a task
