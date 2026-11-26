@@ -163,10 +163,10 @@ pub const LOADED_LATENCY_BAR: Derived<u64> = derived!(
 /// quantum at the machine's measured rate ([`copy_slice_bytes`], [`archive_slice_bytes`]); a paced walk's unit is one
 /// key, path, effect or window; a verdict's units allocate nothing of their own, so no unit's free returns the
 /// allocator's region to the kernel (A-920 3l: one cost a gathering's step 1.2 ms); and an import judge's first unit
-/// walks its content paths' fit a path a step (A-920 3j). The check's last unit is bounded next (A-920 2c). The quantum
-/// is the shard's online wake estimate (§4.3), and load grows it: a quiet wake is 1.7-10 µs (A-223), while probe 5 read
-/// the learned quantum at about 1.05 ms at load 38-56, every step it filled over the bar. So the ceiling binds only
-/// under load.
+/// walks its content paths' fit a path a step (A-920 3j). A check's plan takes its sort and its finish a unit a step
+/// (A-920 2c, 2d). The quantum is the shard's online wake estimate (§4.3), and load grows it: a quiet wake is 1.7-10 µs
+/// (A-223), while probe 5 read the learned quantum at about 1.05 ms at load 38-56, every step it filled over the bar.
+/// So the ceiling binds only under load.
 pub const STEP_QUANTUM_CEILING: Derived<u64> = derived!(
   LOADED_LATENCY_BAR.get() / 2,
   "loaded bar / 2: a step is at most its quantum and the unit begun before its check, a unit within a quantum",
