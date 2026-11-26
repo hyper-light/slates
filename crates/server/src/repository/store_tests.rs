@@ -1260,6 +1260,27 @@ fn checkpoint_named_now(daemon: &Daemon, repository: RepositoryId, head: u64) ->
   })
 }
 
+/// What the shard holds of repository `repository`'s green's named texts now, so a restart's failure says which side of
+/// its stop lost them (main 01a20182's loaded loop of 2026-11-25, run 6 of 7: all three brought back, none found whole):
+/// the named texts it lacks whole (`svn_texts::named_lacking`), the landed texts' bytes it has let go, and the windows a
+/// reader and a home kept from a let-go. None for no green.
+fn held_named(daemon: &Daemon, repository: RepositoryId) -> Option<(usize, u64, u64, u64)> {
+  crate::daemon::observe_first(daemon, move |state| {
+    use crate::vcs_store::name_holds::{
+      LANDED_TEXT_LET_GO_BYTES, LANDED_TEXT_PINNED_HOMES, LANDED_TEXT_PINNED_READER,
+    };
+    let green = super::svn_commit::green_of(state, repository).ok()?;
+    let lacking = crate::vcs_store::svn_texts::named_lacking(state, green).len();
+    let count = |name| state.refusals.get(name).copied().unwrap_or(0);
+    Some((
+      lacking,
+      count(LANDED_TEXT_LET_GO_BYTES),
+      count(LANDED_TEXT_PINNED_READER),
+      count(LANDED_TEXT_PINNED_HOMES),
+    ))
+  })
+}
+
 /// A-760's pre-pass on the cold path alone (main 01a20182's ruling of 2026-11-22 ~11:35), with A-869's checkpoint naming
 /// its files. Do: import `full.dump` whole on a daemon holding a store; wait for the batch's checkpoint at its head and
 /// count the objects it names; stop the daemon and the store's owner, start both again, read the history. Expect: the batch's checkpoint covers
@@ -1286,6 +1307,7 @@ fn a_cleanly_restarted_import_brings_back_only_its_checkpoints_named_texts() {
   );
   assert_eq!(loaded, Ok(FULL_LAST));
   let named = checkpoint_named(&daemon, repository, FULL_LAST);
+  let before_stop = held_named(&daemon, repository);
   daemon.stop();
   store.restart_owner();
   let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
@@ -1301,7 +1323,8 @@ fn a_cleanly_restarted_import_brings_back_only_its_checkpoints_named_texts() {
   assert_eq!(
     brought,
     (0, named),
-    "named texts brought back, found whole: the checkpoint's"
+    "named texts brought back, found whole: the checkpoint's; before the stop, named texts lacking, landed bytes let \
+     go, windows kept by a reader and by a home: {before_stop:?}"
   );
   assert!(exported == Some((FULL_LAST, FULL.to_vec())), "full.dump");
 }
