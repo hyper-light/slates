@@ -1211,13 +1211,21 @@ fn imported_whole_and_stepped(
   (read.0, read.1, read.2, read.3)
 }
 
-/// The calling shard's longest poll and the task it polled (`registry::Pulse::longest_polling`, A-920 6b).
+/// The calling shard's longest poll and the task it polled (`registry::Pulse::longest_polling`, A-920 6b), with the
+/// longest a green's checkpoint took in turns, from its first turn to its record (A-579's completion time, which the
+/// fold's bounded share past its deadline lengthens; `merge_service::CHECKPOINT_IN_TURNS_LONGEST_NS`).
 fn longest_poll() -> (u64, String) {
   let shard = slates_rt::registry::current_shard().expect("on a shard");
+  let checkpoint_ns =
+    on(|state| count(state, crate::merge_service::CHECKPOINT_IN_TURNS_LONGEST_NS));
   slates_rt::registry::with_entry(shard, |entry| {
     (
       entry.pulse.longest_step_ns(),
-      entry.pulse.longest_polling().to_string(),
+      format!(
+        "{}; a checkpoint's turns took {} us at most",
+        entry.pulse.longest_polling(),
+        checkpoint_ns / 1000
+      ),
     )
   })
   .expect("the shard's entry")
