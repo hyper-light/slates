@@ -1165,17 +1165,17 @@
 >   bare runtime runs on the test's thread and is not refused. The fixtures still blocking are named in
 >   `test_store::SHARD_BLOCKING_ALLOWED`, each with its owner and how many sites reach it, and run their blocking body
 >   through `allowing_shard_blocking`; there is no global off-switch. The list only shrinks.
->   **The shard-blocking allow-list: 9 fixtures** (a test holds the list's length to this figure; edit both together):
->   - `test_store::audit_on_stored_shard`: 104 sites. svn 0; git 0; hg 22 (`hg_push/tests.rs` 15,
->     `hg_import/tests.rs` 7); other 82 (`push/tests.rs` 18, `vcs_store/tests.rs` 14, `paths/tests.rs` 11,
+>   **The shard-blocking allow-list: 7 fixtures** (a test holds the list's length to this figure; edit both together):
+>   - `test_store::audit_on_stored_shard`: 97 sites. svn 0; git 0; hg 15 (`hg_push/tests.rs` 15);
+>     other 82 (`push/tests.rs` 18, `vcs_store/tests.rs` 14, `paths/tests.rs` 11,
 >     `repository.rs` 10, `commits/tests.rs` 8, `identities/tests.rs` 8, `vcs_share/grants.rs` 4,
 >     `vcs_share/read_backs.rs` 3, `index_upkeep.rs` 2, `import/tests.rs` 2, `fleet.rs` 2). Moved by w-git (2026-11-25)
 >     to forms that make a history's repositories from the test's thread first: `git_push::tests::on_stored_shard_with`
 >     (`git_push/tests.rs` 23, `vcs_share/tests.rs` 9, `vcs_share/wait.rs` 2, `vcs_store/tests.rs` 2, `replica.rs` 1,
 >     `named_objects.rs` 1) and `test_store::audit_on_stored_shard_made_all`, any tool's (`upload/tests.rs` 12,
 >     `git_hooks/tests.rs` 2).
->   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 34 tests. hg 16
->     (`hg_made` 10, `vcs_ssh` 4, `hg_import` 2); other 18 (`daemon::tests` 6, `repository::push` 5,
+>   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 31 tests. hg 14
+>     (`hg_made` 10, `vcs_ssh` 4); other 17 (`daemon::tests` 5, `repository::push` 5,
 >     `vcs_share` 3, `repository::import` 2, `identities` 1, `repository::tests` 1). Counted by w-git (2026-11-25) by the
 >     tests refused with its allowance taken away: `vcs_http::daemon_edge` and `vcs_store::upload` reach it no more, and
 >     one `vcs_share` test's Mercurial creation (`hg_repository`, w-hg's) moved here from `audit_on_stored_shard` when
@@ -1191,8 +1191,7 @@
 >   - w-hg's push and import helpers, counted by the tests refused without each once the entries above let them
 >     through: `repository::hg_push::land_stored` (2 tests, `vcs_ssh::tests::hg`),
 >     `repository::hg_push::land_in` (1, `hg_made`), `vcs_store::commits::home_and_land_blocking` (7: `commits` 6,
->     `upload` 1), `repository::hg_push::stored_now` (1, `hg_made`), `vcs_store::hg_import::land_imported` (1,
->     `daemon::tests`), `land_imported_on`'s works built whole (1, `hg_import`), and
+>     `upload` 1), `repository::hg_push::stored_now` (1, `hg_made`), and
 >     `repository::import::tests::served`'s read-back (1).
 >   Moved instead of listed: `daemon::tests::t_goal93_a_homes_landed_records_survive_a_restart…` lands between two
 >   observations. Shrunk: `repository/hg_push/tests.rs`' 17 daemon tests push through the daemon's own driver
@@ -1204,7 +1203,11 @@
 >   histories run as tasks on a store-backed daemon (`on_stored_shard`): repositories made by `created().await`, imports
 >   through the import verb awaited to their end (`test_store::imported_through_the_verb`), pushes through
 >   `hg_push::unbundle`, the store's answers by the daemon's own `answer_store_wants`, and a branch's `.hgtags` read at
->   the verb's door by `hg_tags::dispatch_awaited`, which replaces `dispatch_blocking`. The pattern to move to is `audit_on_stored_shard_made`, `created().await` in a task
+>   the verb's door by `hg_tags::dispatch_awaited`, which replaces `dispatch_blocking`. And again: `vcs_store/hg_import/tests.rs`' 7 histories
+>   and its 2 shard creations, and `daemon::tests`' A-729 import, run as tasks, their imports turned by hand, then
+>   landed by `hg_import::land_imported_awaited` (each segment's store landing awaited, the bookmark works built a
+>   unit a turn by `built_works`); `land_imported_on` is that landing run as a task, so `land_imported`,
+>   `land_segments_blocking` and `built_works_whole` are gone with both their entries. The pattern to move to is `audit_on_stored_shard_made`, `created().await` in a task
 >   (`run_on_first`), `create_on` from the test's thread, or `hg_push::unbundle` from a shard task.
 > **The piece-reading replay (A-767 C1; R2's replay half). CLOSED.** A changeset's payload is read back a piece at a
 > time as its replay wants it, never whole. `slates_hg::framing` is the one walk of a changegroup's chunks over a

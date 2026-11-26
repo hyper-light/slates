@@ -1520,7 +1520,9 @@ fn session_over_ssh(
     .expect("the session's task");
     slates_rt::futures::detach(task).expect("detached");
   });
-  outcome.recv_timeout(PATIENCE).expect("the session ended")
+  outcome
+    .recv_timeout(PATIENCE)
+    .map_err(|waited| format!("the session never ended within {PATIENCE:?}: {waited:?}"))?
 }
 
 /// `channel`'s standard output a bundle2 whose changegroup carries `large` whole.

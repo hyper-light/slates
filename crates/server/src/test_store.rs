@@ -394,6 +394,27 @@ pub(crate) async fn imported_through_the_verb(
 /// (milliseconds), so only an import that never ends reaches it.
 const IMPORT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// `history` run as a task on the first shard of a daemon keeping a store, its landed packs kept resident: what
+/// [`audit_on_stored_shard`] runs, with every store wait in it awaited, never the shard's thread held through one
+/// ([`SHARD_BLOCKING_ALLOWED`]).
+pub(crate) fn run_on_stored_shard<
+  T: Send + 'static,
+  F: std::future::Future<Output = T> + 'static,
+>(
+  history: impl FnOnce() -> F + Clone + Send + 'static,
+) -> T {
+  let (store, daemon) = audit_daemon_stored();
+  keep_landed(&daemon);
+  let answer = run_on_first(&daemon, history, HISTORY_PATIENCE);
+  daemon.stop();
+  drop(store);
+  answer
+}
+
+/// Shape: how long [`run_on_stored_shard`]'s history may run: far past a debug build's (seconds), so only one that never
+/// ends reaches it.
+const HISTORY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// [`created`] from the test's thread, on `daemon`'s shard of partition `partition`.
 pub(crate) fn create_on(
   daemon: &crate::Daemon,
@@ -445,13 +466,13 @@ pub(crate) fn create_on(
 pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   Allowed {
     fixture: "test_store::audit_on_stored_shard",
-    owner: "each history's (GAPS: svn 0, git 0, hg 22, other 82)",
-    reaching: 104,
+    owner: "each history's (GAPS: svn 0, git 0, hg 15, other 82)",
+    reaching: 97,
   },
   Allowed {
     fixture: "test_store::create",
-    owner: "each caller's (GAPS: hg 16, other 18)",
-    reaching: 34,
+    owner: "each caller's (GAPS: hg 14, other 17)",
+    reaching: 31,
   },
   Allowed {
     fixture: "vcs_store::commits::home_and_land_blocking",
@@ -471,16 +492,6 @@ pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   Allowed {
     fixture: "repository::hg_push::stored_now",
     owner: "w-hg (vcs_store::hg_made 1)",
-    reaching: 1,
-  },
-  Allowed {
-    fixture: "vcs_store::hg_import::land_imported",
-    owner: "w-hg (daemon::tests 1)",
-    reaching: 1,
-  },
-  Allowed {
-    fixture: "vcs_store::hg_import::land_imported_on",
-    owner: "w-hg (vcs_store::hg_import::tests 1)",
     reaching: 1,
   },
   Allowed {
