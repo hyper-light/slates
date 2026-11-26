@@ -401,29 +401,55 @@ impl Repository {
     })
   }
 
-  /// The revision `transaction` makes with `properties` as its revision properties, exactly the stream's: the changed
-  /// paths FSFS records for it and the contents they name that the repository does not hold, made on the youngest
-  /// revision, with no lock entries; what the import commits through the step.
-  pub(super) fn revision_of(
+  /// The close of `transaction` begun (A-920 7b): the revision it makes with `properties` as its revision properties,
+  /// made by [`Repository::close_step`] a unit at a time while the repository stands as it is.
+  pub(super) fn close_begin(
     &self,
     mut transaction: Transaction,
     properties: Properties,
-  ) -> Result<RevisionToCommit, MigrationRefusal> {
-    let changes = transaction.rows(self)?;
-    let fresh = transaction.take_fresh_contents(self, &changes)?;
-    let stored = transaction.stored_named(self, &changes);
-    Ok(RevisionToCommit {
-      head: transaction.base,
-      record: RevisionRecord {
-        transaction: transaction.name,
-        changes,
-      },
+  ) -> Closing {
+    let changes = std::mem::take(&mut transaction.changes);
+    Closing {
+      rows: Vec::with_capacity(changes.len()),
+      transaction,
       properties,
-      contents: fresh.into_iter().collect(),
-      // An import's texts are its sink's, named stored here by their lengths (the import's module docs, "Texts").
-      stored,
-      lock_entries: Vec::new(),
-    })
+      changes,
+      phase: ClosePhase::Rows,
+      named: BTreeSet::new(),
+      fresh: BTreeMap::new(),
+      stored: BTreeMap::new(),
+    }
+  }
+
+  /// One step of `closing` ([`Repository::close_begin`]), a unit at least, until `spent` says the step's slice is spent,
+  /// stopping between its phases where it is: the changed path each path records (FSFS's rows), a path a unit; the
+  /// contents the rows name, a row a unit; those the repository does not hold taken out of the transaction, a name a
+  /// unit; then the texts the transaction set that the rows name, each with its length (named stored, their bytes the
+  /// sink's), a row a unit. Closed, the revision made on the youngest revision, exactly the stream's, with no lock
+  /// entries: what the import commits through the step. (A-920 7b: closed whole in one call, 20.4 ms debug at 9,000
+  /// files.)
+  ///
+  /// # Errors
+  /// [`MigrationRefusal::Corrupt`] for a deletion of a path the transaction never saw held, a property list whose
+  /// `svn:mergeinfo` cannot be read, or a content the rows name that neither the transaction nor the repository holds.
+  pub(super) fn close_step(
+    &self,
+    mut closing: Closing,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<CloseStep, MigrationRefusal> {
+    let mut step_spent = || spent() || close_a_unit_a_step();
+    loop {
+      let ended = match closing.phase {
+        ClosePhase::Rows => closing.rows_some(self, &mut step_spent)?,
+        ClosePhase::Naming(at) => closing.name_some(at, &mut step_spent),
+        ClosePhase::Fresh => closing.fresh_some(self, &mut step_spent)?,
+        ClosePhase::Stored(at) => closing.stored_some(self, at, &mut step_spent),
+        ClosePhase::Closed => return Ok(CloseStep::Closed(Box::new(closing.closed()))),
+      };
+      if !ended || step_spent() {
+        return Ok(CloseStep::More(Box::new(closing)));
+      }
+    }
   }
 
   /// The commit step's check (the module documentation): `revision` judged against the records, nothing changed. The
@@ -1120,21 +1146,6 @@ pub fn before(changes: &[ChangedPath], path: &str) -> Before {
   Before::Head
 }
 
-/// The texts and property lists `changes` name, each with whether a row names it as a text, in identity order; the
-/// same bytes named as both come twice.
-fn named_as(changes: &[ChangedPath]) -> BTreeSet<(ContentIdentity, bool)> {
-  let mut named = BTreeSet::new();
-  for change in changes {
-    if let Some(text) = change.text {
-      named.insert((text.identity, true));
-    }
-    if let Some(PropertyList::Held { identity, .. }) = change.properties {
-      named.insert((identity, false));
-    }
-  }
-  named
-}
-
 /// The records as the read commands, the report drive and the DAV site read a repository (A-681; the svn:// listener's
 /// connection too, A-689): a directory's entries from the index ([`Index::children`]); a property list's `svn:mergeinfo`
 /// from the list held under its identity.
@@ -1695,18 +1706,6 @@ impl Transaction {
     Ok(identity)
   }
 
-  /// The changed paths FSFS would record for the transaction: a modification that set nothing records nothing, as
-  /// a dump's change record without a section makes no call.
-  fn rows(&self, repository: &Repository) -> Result<Vec<ChangedPath>, MigrationRefusal> {
-    let mut rows = Vec::with_capacity(self.changes.len());
-    for (path, change) in &self.changes {
-      if let Some(row) = self.row(repository, path, change)? {
-        rows.push(row);
-      }
-    }
-    Ok(rows)
-  }
-
   /// One path's changed path, if it records one.
   fn row(
     &self,
@@ -1754,51 +1753,181 @@ impl Transaction {
       .ok_or(MigrationRefusal::Corrupt)?;
     Ok(mergeinfo(&properties).map(<[u8]>::to_vec))
   }
+}
 
-  /// The contents `changes` name that the repository does not hold, taken out of the transaction.
-  fn take_fresh_contents(
+/// A revision being closed a unit at a time ([`Repository::close_begin`], [`Repository::close_step`]; A-920 7b).
+#[derive(Clone, Debug)]
+pub(super) struct Closing {
+  /// The transaction closed, its changes taken into [`Closing::changes`].
+  transaction: Transaction,
+  /// The revision's properties, the stream's.
+  properties: Properties,
+  /// What the transaction did at each path not yet made a row, taken a path a unit.
+  changes: BTreeMap<String, Change>,
+  /// Where the close is.
+  phase: ClosePhase,
+  /// The changed paths FSFS records for the revision, in path order: a modification that set nothing records nothing,
+  /// as a dump's change record without a section makes no call.
+  rows: Vec<ChangedPath>,
+  /// The contents the rows name, each with whether as a text, not yet looked for.
+  named: BTreeSet<(ContentIdentity, bool)>,
+  /// The contents the rows name that the repository does not hold, taken out of the transaction.
+  fresh: BTreeMap<ContentIdentity, Vec<u8>>,
+  /// The texts the transaction set that the rows name and the repository does not hold, each with its length.
+  stored: BTreeMap<ContentIdentity, u64>,
+}
+
+/// Where a [`Closing`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClosePhase {
+  /// Making each path's row.
+  Rows,
+  /// Naming the contents of the rows from this one on.
+  Naming(usize),
+  /// Taking out of the transaction each named content the repository does not hold.
+  Fresh,
+  /// Naming stored each text the transaction set that the rows from this one on name.
+  Stored(usize),
+  /// Closed.
+  Closed,
+}
+
+/// What a step of [`Repository::close_step`] left.
+#[derive(Debug)]
+pub(super) enum CloseStep {
+  /// The close goes on at the next step.
+  More(Box<Closing>),
+  /// Closed: the revision for the caller to commit.
+  Closed(Box<RevisionToCommit>),
+}
+
+impl Closing {
+  /// The rows, a path a unit until `spent`: whether every path is a row.
+  fn rows_some(
     &mut self,
     repository: &Repository,
-    changes: &[ChangedPath],
-  ) -> Result<Vec<(ContentIdentity, Vec<u8>)>, MigrationRefusal> {
-    let mut fresh = Vec::new();
-    for (identity, as_text) in named_as(changes) {
-      // A text the transaction set is named stored ([`Transaction::stored_named`]), its bytes the sink's.
-      let stored = as_text && self.stored.contains_key(&identity);
-      if !stored
-        && !repository.holds_as(&identity, as_text)
-        && !fresh.iter().any(|(held, _)| *held == identity)
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<bool, MigrationRefusal> {
+    while let Some((path, change)) = self.changes.pop_first() {
+      if let Some(row) = self.transaction.row(repository, &path, &change)? {
+        self.rows.push(row);
+      }
+      if spent() {
+        return Ok(false);
+      }
+    }
+    self.phase = ClosePhase::Naming(0);
+    Ok(true)
+  }
+
+  /// The contents the rows from `at` name, a row a unit until `spent`: whether every row's are named.
+  fn name_some(&mut self, mut at: usize, spent: &mut dyn FnMut() -> bool) -> bool {
+    while let Some(row) = self.rows.get(at) {
+      if let Some(text) = row.text {
+        self.named.insert((text.identity, true));
+      }
+      if let Some(PropertyList::Held { identity, .. }) = row.properties {
+        self.named.insert((identity, false));
+      }
+      at = at.saturating_add(1);
+      if spent() {
+        self.phase = ClosePhase::Naming(at);
+        return false;
+      }
+    }
+    self.phase = ClosePhase::Fresh;
+    true
+  }
+
+  /// Each named content the repository does not hold taken out of the transaction, a name a unit until `spent`; a text
+  /// the transaction set is named stored instead ([`Closing::stored_some`]), its bytes the sink's. Whether every name
+  /// is looked for.
+  fn fresh_some(
+    &mut self,
+    repository: &Repository,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<bool, MigrationRefusal> {
+    while let Some((identity, as_text)) = self.named.pop_first() {
+      let stored = as_text && self.transaction.stored.contains_key(&identity);
+      if !stored && !repository.holds_as(&identity, as_text) && !self.fresh.contains_key(&identity)
       {
-        let bytes = match self.pending.remove(&identity) {
+        let bytes = match self.transaction.pending.remove(&identity) {
           Some(bytes) => bytes,
           None => repository
             .text(&identity)
             .ok_or(MigrationRefusal::Corrupt)?
             .into_owned(),
         };
-        fresh.push((identity, bytes));
+        self.fresh.insert(identity, bytes);
+      }
+      if spent() {
+        return Ok(false);
       }
     }
-    Ok(fresh)
+    self.phase = ClosePhase::Stored(0);
+    Ok(true)
   }
 
-  /// The texts the transaction set that `changes` name and the repository does not hold, each with its length: what
-  /// its revision names stored.
-  fn stored_named(
-    &self,
+  /// Each text the transaction set that the rows from `at` name and the repository does not hold, named stored with
+  /// its length, a row a unit until `spent`: whether every row's is.
+  fn stored_some(
+    &mut self,
     repository: &Repository,
-    changes: &[ChangedPath],
-  ) -> BTreeMap<ContentIdentity, u64> {
-    changes
-      .iter()
-      .filter_map(|change| change.text)
-      .filter(|text| !repository.holds(&text.identity))
-      .filter_map(|text| {
-        let len = self.stored.get(&text.identity)?;
-        Some((text.identity, *len))
-      })
-      .collect()
+    mut at: usize,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> bool {
+    while let Some(row) = self.rows.get(at) {
+      if let Some(text) = row.text
+        && !repository.holds(&text.identity)
+        && let Some(len) = self.transaction.stored.get(&text.identity)
+      {
+        self.stored.insert(text.identity, *len);
+      }
+      at = at.saturating_add(1);
+      if spent() {
+        self.phase = ClosePhase::Stored(at);
+        return false;
+      }
+    }
+    self.phase = ClosePhase::Closed;
+    true
   }
+
+  /// The revision closed: made on the transaction's base, with no lock entries.
+  fn closed(self) -> RevisionToCommit {
+    RevisionToCommit {
+      head: self.transaction.base,
+      record: RevisionRecord {
+        transaction: self.transaction.name,
+        changes: self.rows,
+      },
+      properties: self.properties,
+      contents: self.fresh,
+      // An import's texts are its sink's, named stored here by their lengths (the import's module docs, "Texts").
+      stored: self.stored,
+      lock_entries: Vec::new(),
+    }
+  }
+}
+
+/// Whether a close's step ([`Repository::close_step`]) is spent beyond its caller's say: never, but in the tests that
+/// take every one a unit a step ([`CLOSE_A_UNIT_A_STEP`]).
+fn close_a_unit_a_step() -> bool {
+  #[cfg(test)]
+  {
+    CLOSE_A_UNIT_A_STEP.with(std::cell::Cell::get)
+  }
+  #[cfg(not(test))]
+  {
+    false
+  }
+}
+
+#[cfg(test)]
+std::thread_local! {
+  /// Test support: every [`Repository::close_step`] taken a unit a step, as an import call whose slice is always spent
+  /// takes it (A-920 7b's oracle).
+  pub(crate) static CLOSE_A_UNIT_A_STEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A deletion's changed path.

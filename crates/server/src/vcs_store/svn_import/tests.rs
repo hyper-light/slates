@@ -1183,6 +1183,8 @@ struct WideCounts {
   in_turns: u64,
   /// The import's calls stopped with their slice spent (`svn_import::IMPORT_PAUSES`, 7a).
   pauses: u64,
+  /// The import's calls stopped in a revision's close (`svn_import::IMPORT_CLOSE_STEPS`, 7b).
+  close_steps: u64,
 }
 
 /// The calling shard's [`WideCounts`] now.
@@ -1198,6 +1200,7 @@ fn wide_counts() -> WideCounts {
     inline: on(|state| count(state, crate::merge_service::CHECKPOINT_BEGUN_INLINE)),
     in_turns: on(|state| count(state, crate::merge_service::CHECKPOINT_IN_TURNS)),
     pauses: on(|state| count(state, super::IMPORT_PAUSES)),
+    close_steps: on(|state| count(state, super::IMPORT_CLOSE_STEPS)),
   }
 }
 
@@ -1243,11 +1246,17 @@ fn wide_import_sliced(counts: &WideCounts) {
     staging_steps,
     apply_steps,
     pauses,
+    close_steps,
     ..
   } = counts;
   // The dump parsed an event at a time, its calls stopped as their turn's slice is spent (A-920 7a: a copy slice of 68 KB
   // a call was 3.9-5.3 ms, debug).
   assert!(*pauses > 2, "the import's calls paused {pauses} time(s)");
+  // Its revision closed a unit at a time over calls (A-920 7b: `close_revision` whole in one call, 20.4 ms debug).
+  assert!(
+    *close_steps > 2,
+    "the revision's close stopped {close_steps} time(s)"
+  );
   // Non-vacuity: the landing's tail ran in slices, so no loop over its texts ran whole in one step.
   assert!(*tail_slices > 2, "the tail took {tail_slices} slice(s)");
   // Non-vacuity: the revision's version was applied a few units a call (goal 93 piece 3), never in one.
