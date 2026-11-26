@@ -122,5 +122,13 @@ Main's rulings set the follow-up pieces, each landing after this one:
     it fails `Some(Intake(Unverified(UnknownDeltaBase { .. })))`.
 - `KEEP_LANDED` (`crates/server/src/vcs_store.rs:2654`, `:3958`): set by every default stored-test runner, so those
   tests never ran production's let-go. The runners stop setting it; tests that must keep packs resident set it by name.
-- A made changeset whose landing is refused because the owner is gone is retried without end
-  (`made_commit::abandon`). A refused landing is to be retried within a bound, and a gone owner refused, typed.
+- The gone owner (fixed 2026-11-26). Every landing the store refused answered the submit `Unmade::Unlanded`, which
+  `made_commit::abandon` turned into `Overloaded`, unrecorded, so its retry met a gone owner again without end.
+  - Fixed: `hg_made::landed_patiently` asks again after a yield only while the owner is busy, within the fleet's live
+    deadline. Any other refusal, or a busy owner past that deadline, answers `Unmade::Landing(OwnerError)`, refused in
+    the store's words and recorded.
+  - `Unlanded` is left for a made commit whose task could not start.
+  - Red: `a_made_changesets_landing_on_a_gone_owner_is_refused_in_the_stores_words_and_recorded`
+    (`crates/server/src/vcs_store/hg_made/tests.rs`). Landed packs are kept so nothing reads the store before the
+    landing, the owner is stopped, then a second submit is made. It expects a recorded `StoreRefused` naming
+    `Landing(Gone)`. With the old mapping it fails "request 2 unanswered after 60s".

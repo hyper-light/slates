@@ -102,6 +102,9 @@ struct PatientSocket<P> {
   steps: P,
   /// How long a look and a beat last.
   look: (Duration, Duration),
+  /// How far past their length its waits woke, summed (each look's read and each beat's park, timed on the reading
+  /// thread as it waited): what a loaded host's scheduler added, which a bound on the give-up allows for.
+  overrun: Duration,
 }
 
 impl<P: FnMut() -> Option<u64>> PatientSocket<P> {
@@ -113,6 +116,7 @@ impl<P: FnMut() -> Option<u64>> PatientSocket<P> {
       socket,
       steps,
       look: (look, beat),
+      overrun: Duration::ZERO,
     }
   }
 }
@@ -121,6 +125,7 @@ impl<P: FnMut() -> Option<u64>> Read for PatientSocket<P> {
   fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
     let began = std::time::Instant::now();
     loop {
+      let asked = std::time::Instant::now();
       match self.socket.read(buf) {
         Err(error)
           if matches!(
@@ -128,8 +133,13 @@ impl<P: FnMut() -> Option<u64>> Read for PatientSocket<P> {
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
           ) =>
         {
+          let late = asked.elapsed().saturating_sub(self.look.0);
+          self.overrun = self.overrun.saturating_add(late);
           let before = (self.steps)();
+          let parked = std::time::Instant::now();
           std::thread::park_timeout(self.look.1);
+          let late = parked.elapsed().saturating_sub(self.look.1);
+          self.overrun = self.overrun.saturating_add(late);
           let after = (self.steps)();
           if before.is_some() && after != before {
             continue;
@@ -231,26 +241,57 @@ fn a_patient_read_waits_for_an_answer_while_its_daemon_steps() {
 }
 
 /// The same ruling's other half. Do: from a loopback listener that never answers, read through a [`PatientSocket`]
-/// whose daemon makes no step. Expect: given up typed (`TimedOut`, naming the steps it saw), within a look, a beat and
-/// a look's slack for the host; not before the look.
+/// whose daemon makes no step, once as the host wakes it and once with its look's wait woken twelve beats late (its
+/// socket's timeout set past the look, as a loaded host's scheduler wakes a thread late: main's reading of w-hg's gate
+/// at load 56 to 62, given up after 221.76 ms against a look of 100 ms and a beat of 10 ms). Expect: each given up
+/// typed (`TimedOut`, naming the steps it saw), after one look and one beat (the daemon's steps asked twice, before
+/// and after the beat), never before the look, and within [`gave_up_within`]'s bound, which allows the overrun its
+/// waits measured. Red before the overrun was allowed: the late one past two looks and a beat.
 #[test]
 fn a_patient_read_gives_up_on_a_daemon_that_makes_no_step() {
   let (look, beat) = TEST_LOOK;
-  let (port, serving) = answering_after(4 * look, None);
-  let socket =
-    ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).expect("connected");
-  let mut patient = PatientSocket::new(socket, || Some(7), TEST_LOOK);
-  let began = std::time::Instant::now();
-  let read = patient.read(&mut [0u8; 16]);
-  let waited = began.elapsed();
-  drop(patient);
-  serving.join().expect("the listener's thread");
-  let error = read.expect_err("given up");
-  assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
-  assert!(error.to_string().contains("Some(7) steps"), "{error}");
+  for late in [Duration::ZERO, 12 * beat] {
+    let (port, serving) = answering_after(4 * look + late, None);
+    let socket =
+      ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).expect("connected");
+    let mut asked = 0u32;
+    let mut patient = PatientSocket::new(
+      socket,
+      || {
+        asked = asked.saturating_add(1);
+        Some(7)
+      },
+      TEST_LOOK,
+    );
+    patient
+      .socket
+      .set_read_timeout(Some(look + late))
+      .expect("a read timeout");
+    let began = std::time::Instant::now();
+    let read = patient.read(&mut [0u8; 16]);
+    let waited = began.elapsed();
+    let overrun = patient.overrun;
+    drop(patient);
+    serving.join().expect("the listener's thread");
+    let error = read.expect_err("given up");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+    assert!(error.to_string().contains("Some(7) steps"), "{error}");
+    assert_eq!(asked, 2, "one look and one beat, then given up");
+    gave_up_within(waited, overrun);
+  }
+}
+
+/// Asserts a patient read that gave up after `waited`, its waits woken `overrun` past their lengths in all, waited at
+/// least a look ([`TEST_LOOK`]) and less than two looks and a beat past what its host's scheduler added.
+fn gave_up_within(waited: Duration, overrun: Duration) {
+  let (look, beat) = TEST_LOOK;
   assert!(
-    waited >= look && waited < 2 * look + beat,
-    "given up after {waited:?}, a look {look:?} and a beat {beat:?}"
+    waited >= look,
+    "given up after {waited:?}, before a look {look:?}"
+  );
+  assert!(
+    waited < 2 * look + beat + overrun,
+    "given up after {waited:?}, a look {look:?}, a beat {beat:?} and its waits {overrun:?} late"
   );
 }
 
