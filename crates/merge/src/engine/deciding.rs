@@ -41,6 +41,16 @@ struct Walk<'w> {
   spent: &'w mut dyn FnMut() -> bool,
 }
 
+impl Deciding {
+  /// One path of what the decision's earlier phases left for its later ones let go: whether one was (A-920 piece 3h,
+  /// [`super::Resolved::release_one`]).
+  pub(crate) fn release_one(&mut self) -> bool {
+    self.cleared.pop_first().is_some()
+      || self.homes.pop_first().is_some()
+      || self.judged.pop_first().is_some()
+  }
+}
+
 impl Walk<'_> {
   /// Whether the step is spent once `key` is decided; where it is, the phase goes on after `key` at the next.
   fn spent_after(&mut self, key: &str) -> bool {

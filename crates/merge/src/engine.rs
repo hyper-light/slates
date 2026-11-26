@@ -2198,6 +2198,40 @@ struct Resolved {
 }
 
 impl Resolved {
+  /// One entry of the resolution let go, from the first of its collections that holds any, its copies' resolution
+  /// last: whether one was (A-920 piece 3h: let go whole, a revision of 9,000 files' resolution and decision took 1.5 ms
+  /// of one step on a debug build and 1.1 ms on a release one, the judge's).
+  pub(super) fn release_one(&mut self) -> bool {
+    self.content.pop_first().is_some()
+      || self.creates.pop_first().is_some()
+      || self.specials.pop_first().is_some()
+      || self.invalid.pop_first().is_some()
+      || self.across_copies.pop_first().is_some()
+      || self.unlinks.pop_first().is_some()
+      || self.mkdirs.pop_first().is_some()
+      || self.rmdirs.pop_first().is_some()
+      || self.modes.pop_first().is_some()
+      || self.symlinks.pop_first().is_some()
+      || self.hardlinks.pop_first().is_some()
+      || self.renames.pop_first().is_some()
+      || self.xattr_sets.pop().is_some()
+      || self.xattr_removes.pop().is_some()
+      || self.copies.pop_first().is_some()
+      || self.resolution_establishes.pop_first().is_some()
+      || self.release_copied_one()
+  }
+
+  /// One entry of the copies' resolution let go, and it with its last: whether one was.
+  fn release_copied_one(&mut self) -> bool {
+    let Some(copied) = self.copied.as_mut() else {
+      return false;
+    };
+    if !copied.release_one() {
+      self.copied = None;
+    }
+    true
+  }
+
   /// The resolution's end once every op is resolved ([`Green::resolve_some`]): each IPC node made at a path the work
   /// also does anything else at is invalid, and the copies split from what lands in their trees.
   fn finish_resolving(&mut self) {
