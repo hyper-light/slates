@@ -509,7 +509,13 @@
 >   the push's own pack (A-864's noted entry). The fsck stage's read is reached by no push (a session's fsck is made
 >   as each object is kept, from its bytes), so it keeps its refusal. Owed as B1b: unpack's read of an in-pack base
 >   back from the quarantine (`Reader::applied`, `DeltaBaseMissing`), reached where that base is itself a thin
->   delta over a let-go window.
+>   delta over a let-go window. Its failures under load (main's 4 of 4 at b95e9ddb1, then 3 of 16 at the diagnostic
+>   branch agents/w-git-b1-debug, 884538b14) had two causes, each named by main's lines and fixed red first:
+>   - a stop ends the check's whole turn (`Walk::stopped`; `Checking::unit` and `Checking::turn` return not done).
+>     The check's own turn loop took the walk again at once after its stop, while its quantum was unspent, and the
+>     same let-go met twice with nothing brought back refused the object (`receive::tests::session::
+>     a_checks_turn_ends_at_its_walks_stop_on_a_let_go_window_and_is_whole_once_it_is_back`, a quantum never
+>     spent: done and `Missing` in the first turn before);
 > - OPEN: B2 (the server's tag-headed green, `ShardGreens::tree_of`), B3 (the admission's peel and references), B4 (the
 >   policy's reads), B5 (`PushedObjects::bytes` of a pushed object, `Malformed`), B6 (a verdict's one-call build), B7
 >   (`push_of`'s peel at judge time, after `prepare`'s), B8 (the encoding's tree walk: time, not correctness).

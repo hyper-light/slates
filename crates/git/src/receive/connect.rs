@@ -159,6 +159,9 @@ pub(crate) struct Walk {
   marks: Vec<Mark>,
   /// The let-go window the walk last stopped at, kept across its turns ([`crate::away`]'s one rule).
   wait: WaitOnce<u64>,
+  /// Whether its last turn ended at an object whose read met a let-go window, for the window to be brought back before
+  /// it is taken again ([`Walk::stopped`]).
+  stopped: bool,
 }
 
 impl Walk {
@@ -185,6 +188,7 @@ impl Walk {
       stack: Vec::new(),
       marks: Vec::new(),
       wait: WaitOnce::default(),
+      stopped: false,
     })
   }
 
@@ -198,9 +202,11 @@ impl Walk {
   ) -> Result<bool, Refusal> {
     let Quantum { clock, ns } = quantum;
     let begun = clock.now_ns();
+    self.stopped = false;
     while self.pass != Pass::Done {
       // A unit that met a let-go window ends the turn, for the window to be brought back (the module docs).
       if !self.unit((request, pushed, repository), admission)? {
+        self.stopped = true;
         break;
       }
       if clock.now_ns().saturating_sub(begun) >= ns {
@@ -433,6 +439,13 @@ impl Walk {
     grown(&mut self.stack, admission)?;
     self.stack.push(frame);
     Ok(())
+  }
+
+  /// Whether the walk's last turn ended at an object whose read met a let-go window: its caller's turn ends there too,
+  /// so the window is brought back before the walk meets the object again (main's lines of agents/w-git-b1-debug: the
+  /// check's own turn loop took the walk again at once, and the same let-go met twice refused the object).
+  pub(crate) fn stopped(&self) -> bool {
+    self.stopped
   }
 
   /// Each command's connectivity once the walk is done ([`connectivity`]'s answer), charged a
