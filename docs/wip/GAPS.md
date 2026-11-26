@@ -1167,7 +1167,7 @@
 >   bare runtime runs on the test's thread and is not refused. The fixtures still blocking are named in
 >   `test_store::SHARD_BLOCKING_ALLOWED`, each with its owner and how many sites reach it, and run their blocking body
 >   through `allowing_shard_blocking`; there is no global off-switch. The list only shrinks.
->   **The shard-blocking allow-list: 7 fixtures** (a test holds the list's length to this figure; edit both together):
+>   **The shard-blocking allow-list: 5 fixtures** (a test holds the list's length to this figure; edit both together):
 >   - `test_store::audit_on_stored_shard`: 97 sites. svn 0; git 0; hg 15 (`hg_push/tests.rs` 15);
 >     other 82 (`push/tests.rs` 18, `vcs_store/tests.rs` 14, `paths/tests.rs` 11,
 >     `repository.rs` 10, `commits/tests.rs` 8, `identities/tests.rs` 8, `vcs_share/grants.rs` 4,
@@ -1176,12 +1176,12 @@
 >     (`git_push/tests.rs` 23, `vcs_share/tests.rs` 9, `vcs_share/wait.rs` 2, `vcs_store/tests.rs` 2, `replica.rs` 1,
 >     `named_objects.rs` 1) and `test_store::audit_on_stored_shard_made_all`, any tool's (`upload/tests.rs` 12,
 >     `git_hooks/tests.rs` 2).
->   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 28 tests. hg 14
->     (`hg_made` 10, `vcs_ssh` 4); other 14 (`daemon::tests` 5, `repository::push` 5, `repository::import` 2,
+>   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 18 tests. hg 4
+>     (`vcs_ssh` 4); other 14 (`daemon::tests` 5, `repository::push` 5, `repository::import` 2,
 >     `identities` 1, `repository::tests` 1). Counted by the tests refused with its allowance taken away (w-git,
 >     2026-11-25): `vcs_http::daemon_edge`, `vcs_store::upload` and `vcs_share` reach it no more, `vcs_share`'s three
 >     Mercurial creations made from the test's thread (`hg_on`, `test_store::create_on`), one inside
->     `audit_on_stored_shard_made_all`.
+>     `audit_on_stored_shard_made_all`; and `hg_made`'s 10 made from the test's thread (w-hg, `create_on`).
 >   - (`git_push::tests::carry_blocking`, 8 direct sites, and `git_push::tests::git_repository`, 41 sites: both emptied
 >     and removed by w-git, 2026-11-25. Every test that pushed through the synchronous driver (`answered`, `pushed`,
 >     `pushed_from_the_fixtures`, removed with it) pushes by awaiting: `git_push::tests::on_stored_shard_awaited` and its
@@ -1192,8 +1192,7 @@
 >     test's thread, `git_repository_on`, or through `on_stored_shard_with`.)
 >   - w-hg's push and import helpers, counted by the tests refused without each once the entries above let them
 >     through: `repository::hg_push::land_stored` (2 tests, `vcs_ssh::tests::hg`),
->     `repository::hg_push::land_in` (1, `hg_made`), `vcs_store::commits::home_and_land_blocking` (7: `commits` 6,
->     `upload` 1), `repository::hg_push::stored_now` (1, `hg_made`), and
+>     `vcs_store::commits::home_and_land_blocking` (7: `commits` 6, `upload` 1), and
 >     `repository::import::tests::served`'s read-back (1).
 >   Moved instead of listed: `daemon::tests::t_goal93_a_homes_landed_records_survive_a_restart…` lands between two
 >   observations. Shrunk: `repository/hg_push/tests.rs`' 17 daemon tests push through the daemon's own driver
@@ -1209,7 +1208,10 @@
 >   and its 2 shard creations, and `daemon::tests`' A-729 import, run as tasks, their imports turned by hand, then
 >   landed by `hg_import::land_imported_awaited` (each segment's store landing awaited, the bookmark works built a
 >   unit a turn by `built_works`); `land_imported_on` is that landing run as a task, so `land_imported`,
->   `land_segments_blocking` and `built_works_whole` are gone with both their entries. The pattern to move to is `audit_on_stored_shard_made`, `created().await` in a task
+>   `land_segments_blocking` and `built_works_whole` are gone with both their entries. And `vcs_store/hg_made/tests.rs`'
+>   10: each repository made from the test's thread (`create_on`), and the client's push on a made changeset sent
+>   through `hg_push::unbundle` from a task (`pushed_changegroup`), so `land_in`'s and `stored_now`'s entries are gone
+>   (`hg_push`'s race histories still reach both, under `audit_on_stored_shard`'s). The pattern to move to is `audit_on_stored_shard_made`, `created().await` in a task
 >   (`run_on_first`), `create_on` from the test's thread, or `hg_push::unbundle` from a shard task.
 > **The piece-reading replay (A-767 C1; R2's replay half). CLOSED.** A changeset's payload is read back a piece at a
 > time as its replay wants it, never whole. `slates_hg::framing` is the one walk of a changegroup's chunks over a
@@ -1899,8 +1901,10 @@
 > and `a_pin_that_finds_a_window_let_go_counts_it_and_a_pin_of_nothing_is_refused`. Sibling sweep:
 > git's push and hg's import not of this shape; svn's import batches were (fixed in d3539309d, to move onto the store's
 > pins). A made changeset's (`hg_made`, and the tests' `take_whole`) texts are unpinned at their intake's finish, before
-> the `disk.land` it awaits: nothing reads them between (its intake and record are made in one step), and once landed a
-> window let go meanwhile comes back from the store; a reader before the landing would need the pins kept to its let-go.
+> the `disk.land` it awaits: nothing reads them between (since 2026-11-25 its intake is taken a slice a step by its
+> task, which holds the repository's landing turn throughout, its store wants awaited; docs/bugs/2026-11-25-a-made-
+> changeset-over-a-let-go-parent-was-never-made.md), and once landed a window let go meanwhile comes back from the
+> store; a reader before the landing would need the pins kept to its let-go.
 > Owed: main's push loop re-run.
 > Found by main's round 2 at f8fe97e5e (the clone about 1.7x its load's slowing past stock's) and cut (2026-11-24): a
 > fetch made each let-go changelog and manifest text by its own request of the store's owner, a piece a request
@@ -14701,6 +14705,14 @@ after the push, 0 handed before and 1 now. The DAV proppatch 500 of that loop wa
 from one fast run killed a slower second `post-revprop-change`. Main's ruling of 2026-11-25: no bound holds a run
 until `vcs_hooks::RUNS_FOR_A_BOUND` (99) runs support the 99th percentile it claims; until then the client's
 connection is the deadline (A-622 part 3, "The bound rests on enough runs").
+`daemon_edge.rs:418` ("the answer ended inside a line (WouldBlock)", in both arms of main's join A/B at load 52 to 99):
+the edge's test clients read at a fixed patience, ten liveness windows a read, and a push's answer has no deadline of
+its own. Main's ruling (a) of 2026-11-25: every client of `vcs_http::daemon_edge`'s connect helpers (`tls_client`,
+`cleartext_client`) reads through `PatientSocket`, which waits a liveness window for a byte, and only then looks at the
+steps of the daemon serving its port (`EDGE_SHARDS`, registered by `daemon_configured`; `slates_rt::registry`'s pulse),
+waits a heartbeat and looks again: stepped, it reads on; not, it gives up typed. Reds:
+`a_patient_read_waits_for_an_answer_while_its_daemon_steps` (a fixed patience of one look gives up where the patient read
+is answered three looks later) and `a_patient_read_gives_up_on_a_daemon_that_makes_no_step` (within a look and a beat).
 
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 

@@ -63,6 +63,209 @@ fn patience_ns() -> u64 {
   PATIENCE_NS.saturating_mul(crate::test_lane::slowdown())
 }
 
+/// Derived: how long a client's read waits for a byte before it asks whether the daemon serving it still steps (main
+/// 01a20182's ruling of 2026-11-25 on `daemon_edge.rs:418`: a push's answer has no deadline of its own, and stock git
+/// waits as long as its server works): one liveness window, the watchdog's own judgement of a shard stuck.
+const STALL_LOOK: Duration = Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS);
+/// Derived: how long a stalled read waits between two looks at the daemon's steps: the heartbeat, the cadence the
+/// watchdog itself looks at its shards in (`daemon::HEARTBEAT_NS`).
+const STALL_BEAT: Duration = Duration::from_nanos(crate::daemon::HEARTBEAT_NS);
+
+/// The shards serving each edge port's daemon in this test process: registered as [`daemon_configured`] starts one,
+/// read by a client's stalled read ([`edge_steps`]).
+#[allow(clippy::disallowed_types)] // D-8's test-harness exception: two owners, the test thread that starts a daemon and any client thread that reads its edge.
+static EDGE_SHARDS: std::sync::Mutex<std::collections::BTreeMap<u16, Vec<u16>>> =
+  std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The steps the shards of the daemon serving `port` have run, summed (`slates_rt::registry`'s pulse, read on any
+/// thread): none for a port no daemon of this process registered.
+fn edge_steps(port: u16) -> Option<u64> {
+  let shards = EDGE_SHARDS.lock().ok()?.get(&port).cloned()?;
+  Some(
+    shards
+      .iter()
+      .filter_map(|shard| slates_rt::registry::with_entry(*shard, |entry| entry.pulse.steps()))
+      .sum(),
+  )
+}
+
+/// A client's socket that waits for its answer as long as the daemon serving it works (main 01a20182's ruling of
+/// 2026-11-25, CLAUDE.md's liveness pattern: a liveness question asked on a cold path only). Each read waits
+/// [`STALL_LOOK`] for a byte; only when one passes with none does it look at the daemon's steps (`steps`), wait a beat
+/// ([`STALL_BEAT`]) and look again: stepped, it reads on; not, it gives up, typed `TimedOut`, naming how long it waited
+/// and the steps it saw. A fixed patience gave up on a working daemon under load (main's join A/B, load 52 to 99: "the
+/// answer ended inside a line (WouldBlock)" in both arms).
+struct PatientSocket<P> {
+  /// The connection.
+  socket: ClientStream,
+  /// The daemon's steps now; none where it cannot be asked.
+  steps: P,
+  /// How long a look and a beat last.
+  look: (Duration, Duration),
+}
+
+impl<P: FnMut() -> Option<u64>> PatientSocket<P> {
+  /// `socket` read patiently, the daemon's steps asked of `steps`, each read waiting `look` before it asks and `beat`
+  /// between its two looks.
+  fn new(socket: ClientStream, steps: P, (look, beat): (Duration, Duration)) -> Self {
+    socket.set_read_timeout(Some(look)).expect("a read timeout");
+    PatientSocket {
+      socket,
+      steps,
+      look: (look, beat),
+    }
+  }
+}
+
+impl<P: FnMut() -> Option<u64>> Read for PatientSocket<P> {
+  fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    let began = std::time::Instant::now();
+    loop {
+      match self.socket.read(buf) {
+        Err(error)
+          if matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+          ) =>
+        {
+          let before = (self.steps)();
+          std::thread::park_timeout(self.look.1);
+          let after = (self.steps)();
+          if before.is_some() && after != before {
+            continue;
+          }
+          return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+              "no byte for {:?} and the daemon made no step over a beat ({:?}): its shards at {after:?} steps",
+              began.elapsed(),
+              self.look.1
+            ),
+          ));
+        }
+        other => return other,
+      }
+    }
+  }
+}
+
+impl<P> Write for PatientSocket<P> {
+  fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    self.socket.write(buf)
+  }
+
+  fn flush(&mut self) -> std::io::Result<()> {
+    self.socket.flush()
+  }
+}
+
+/// Shape: the look and the beat [`PatientSocket`]'s own tests use: a tenth of [`STALL_LOOK`] and of [`STALL_BEAT`], so
+/// they run in a second; what they pin is the order of events, not the lengths.
+const TEST_LOOK: (Duration, Duration) = (
+  Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS / 10),
+  Duration::from_nanos(crate::daemon::HEARTBEAT_NS / 10),
+);
+
+/// Parks this thread until `ending` has passed (a park may wake early, so it parks again until then).
+fn parked_until(ending: std::time::Instant) {
+  while std::time::Instant::now() < ending {
+    std::thread::park_timeout(ending.saturating_duration_since(std::time::Instant::now()));
+  }
+}
+
+/// A loopback listener that takes one connection and, `delay` after, writes `answer` (none: writes nothing) and holds
+/// the connection a further `delay`: its port, and its thread.
+fn answering_after(
+  delay: Duration,
+  answer: Option<&'static [u8]>,
+) -> (u16, std::thread::JoinHandle<()>) {
+  let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener");
+  let port = listener.local_addr().expect("its address").port();
+  let serving = std::thread::spawn(move || {
+    let (mut taken, _) = listener.accept().expect("the connection");
+    parked_until(std::time::Instant::now() + delay);
+    if let Some(answer) = answer {
+      taken.write_all(answer).expect("the answer written");
+    }
+    parked_until(std::time::Instant::now() + delay);
+  });
+  (port, serving)
+}
+
+/// Main 01a20182's ruling of 2026-11-25 (`daemon_edge.rs:418`: a client gave up on a working daemon at a fixed patience
+/// under load, in both arms of the join A/B). Do: from a loopback listener answering only three looks after it takes the
+/// connection, read a line once through a socket of a fixed patience of one look, as the edge's clients read before,
+/// and once through a [`PatientSocket`] whose daemon steps at every look. Expect: the fixed patience gives up, nothing
+/// read; the patient read answered.
+#[test]
+fn a_patient_read_waits_for_an_answer_while_its_daemon_steps() {
+  let (look, _) = TEST_LOOK;
+  let (port, serving) = answering_after(3 * look, Some(b"answered\n"));
+  let mut fixed =
+    ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).expect("connected");
+  fixed.set_read_timeout(Some(look)).expect("a read timeout");
+  let gave_up = fixed.read(&mut [0u8; 16]);
+  drop(fixed);
+  serving.join().expect("the listener's thread");
+  assert!(
+    gave_up.as_ref().is_err_and(|error| matches!(
+      error.kind(),
+      std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )),
+    "a fixed patience gave up: {gave_up:?}"
+  );
+  let (port, serving) = answering_after(3 * look, Some(b"answered\n"));
+  let socket =
+    ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).expect("connected");
+  let mut stepped = 0u64;
+  let mut patient = PatientSocket::new(
+    socket,
+    move || {
+      stepped += 1;
+      Some(stepped)
+    },
+    TEST_LOOK,
+  );
+  assert_eq!(line_of(&mut patient), b"answered\n");
+  serving.join().expect("the listener's thread");
+}
+
+/// The same ruling's other half. Do: from a loopback listener that never answers, read through a [`PatientSocket`]
+/// whose daemon makes no step. Expect: given up typed (`TimedOut`, naming the steps it saw), within a look, a beat and
+/// a look's slack for the host; not before the look.
+#[test]
+fn a_patient_read_gives_up_on_a_daemon_that_makes_no_step() {
+  let (look, beat) = TEST_LOOK;
+  let (port, serving) = answering_after(4 * look, None);
+  let socket =
+    ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).expect("connected");
+  let mut patient = PatientSocket::new(socket, || Some(7), TEST_LOOK);
+  let began = std::time::Instant::now();
+  let read = patient.read(&mut [0u8; 16]);
+  let waited = began.elapsed();
+  drop(patient);
+  serving.join().expect("the listener's thread");
+  let error = read.expect_err("given up");
+  assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+  assert!(error.to_string().contains("Some(7) steps"), "{error}");
+  assert!(
+    waited >= look && waited < 2 * look + beat,
+    "given up after {waited:?}, a look {look:?} and a beat {beat:?}"
+  );
+}
+
+/// A client's socket to the edge on `port`, read patiently ([`PatientSocket`]).
+type EdgeSocket = PatientSocket<Box<dyn FnMut() -> Option<u64> + Send>>;
+
+/// [`PatientSocket`] over `socket`, a connection to the edge on `port` of a daemon [`daemon_configured`] started.
+fn patient(socket: ClientStream, port: u16) -> EdgeSocket {
+  PatientSocket::new(
+    socket,
+    Box::new(move || edge_steps(port)),
+    (STALL_LOOK, STALL_BEAT),
+  )
+}
+
 /// The repository's owner, the principal of the human's channel that created it.
 fn owner() -> Principal {
   Principal::Uid {
@@ -117,6 +320,9 @@ fn daemon_configured(
   daemon
     .bootstrap(true)
     .expect("the daemon creates its initial group");
+  if let (Some(port), Ok(mut ports)) = (daemon.vcs_http_port(), EDGE_SHARDS.lock()) {
+    ports.insert(port, daemon.shards().iter().map(|shard| shard.0).collect());
+  }
   (daemon, instance)
 }
 
@@ -195,17 +401,31 @@ fn enroll(daemon: &Daemon, token: &str, uid: u32, expires_ns: Option<u64>) {
 fn tls_client(
   port: u16,
   certificate: &CertificateDer<'static>,
-) -> StreamOwned<ClientConnection, ClientStream> {
-  tls_client_within(port, certificate, Duration::from_nanos(patience_ns()))
+) -> StreamOwned<ClientConnection, EdgeSocket> {
+  let (connection, socket) = tls_connection(port, certificate);
+  StreamOwned::new(connection, patient(socket, port))
 }
 
-/// [`tls_client`], its reads waiting at most `patience` for an answer.
-#[allow(clippy::disallowed_types)] // rustls takes its configuration and provider as `Arc` by signature (D-8's test-harness exception).
+/// [`tls_client`], its reads waiting at most `patience` for an answer, however the daemon steps: a test that asks
+/// whether an answer comes within a bound of its own.
 fn tls_client_within(
   port: u16,
   certificate: &CertificateDer<'static>,
   patience: Duration,
 ) -> StreamOwned<ClientConnection, ClientStream> {
+  let (connection, socket) = tls_connection(port, certificate);
+  socket
+    .set_read_timeout(Some(patience))
+    .expect("a read timeout");
+  StreamOwned::new(connection, socket)
+}
+
+/// A TLS client's connection trusting `certificate`, and its socket to the edge on `port`.
+#[allow(clippy::disallowed_types)] // rustls takes its configuration and provider as `Arc` by signature (D-8's test-harness exception).
+fn tls_connection(
+  port: u16,
+  certificate: &CertificateDer<'static>,
+) -> (ClientConnection, ClientStream) {
   let mut roots = RootCertStore::empty();
   roots
     .add(certificate.clone())
@@ -223,10 +443,7 @@ fn tls_client_within(
   .expect("a client connection");
   let socket = ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
     .expect("the edge's listener takes the connection");
-  socket
-    .set_read_timeout(Some(patience))
-    .expect("a read timeout");
-  StreamOwned::new(connection, socket)
+  (connection, socket)
 }
 
 /// The status of the answer to `GET target` with `fields`, on a new TLS connection to the edge on `port`.
@@ -2422,13 +2639,10 @@ fn reply_parts(stream: &[u8], outputs: bool) -> Vec<(Vec<u8>, PartParameters)> {
 }
 
 /// A plain connection to the edge on loopback `port`, its reads waiting [`patience_ns`].
-fn cleartext_client(port: u16) -> ClientStream {
+fn cleartext_client(port: u16) -> EdgeSocket {
   let socket = ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
     .expect("the edge's listener takes the connection");
-  socket
-    .set_read_timeout(Some(Duration::from_nanos(patience_ns())))
-    .expect("a read timeout");
-  socket
+  patient(socket, port)
 }
 
 /// The head and the body of the answer to `request`, sent whole on `stream`.

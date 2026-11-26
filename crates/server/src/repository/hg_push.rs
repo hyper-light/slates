@@ -3672,18 +3672,113 @@ pub(crate) fn take_whole(
   taken_whole(state, repository, changegroup, (room, Some(bound)))
 }
 
-/// `changegroup` taken into its fork every slice at once, uncut: a changeset the server made (`vcs_store::hg_made`),
-/// one version's change, taken in its task's step and landed as one changeset (record v7), its texts its own.
-pub(crate) fn take_made(
-  state: &mut ShardState,
+/// Why a made changeset's changegroup was not taken into a fork ([`take_made`]).
+pub(crate) enum MadeTake {
+  /// The intake refused the changegroup, in its words.
+  Refused(Box<Refused>),
+  /// The node's changeset store left a want of the intake unanswered (a delta base of the parent's, let go once its
+  /// push landed): the store's own typed refusal, never taken for the version not being the head.
+  Store(vcs_store::hg_view::StoreUnanswered),
+  /// The repository's store is not held here, or the shard's state went away.
+  Gone,
+}
+
+/// Written out rather than derived, as `hg_made::Unmade`'s is: a refusal's words are all that read its fields, and
+/// dead-code analysis ignores derived impls; the output is the derived one's.
+impl core::fmt::Debug for MadeTake {
+  fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      MadeTake::Refused(refused) => formatter.debug_tuple("Refused").field(refused).finish(),
+      MadeTake::Store(why) => formatter.debug_tuple("Store").field(why).finish(),
+      MadeTake::Gone => formatter.write_str("Gone"),
+    }
+  }
+}
+
+/// `changegroup` taken into its fork, uncut, from a made changeset's task (`vcs_store::hg_made`): one version's change,
+/// landed as one changeset (record v7), its texts its own. Its slices are taken a step each, and a want of the node's
+/// changeset store between them (a delta base the client's push before it let go) is answered by awaiting the store
+/// in the task, as a push's are ([`take_sliced`]'s [`store_wants_answered`]). Until 2026-11-25 the take was one step and
+/// such a want was answered `false` in production and by a blocking read in tests, so a made changeset over a let-go
+/// parent was never made there and was made here (docs/bugs/2026-11-25-a-made-changeset-over-a-let-go-parent-was-never-
+/// made.md).
+pub(crate) async fn take_made(
   repository: RepositoryId,
   changegroup: (Version, Vec<u8>),
   room: &mut Admission,
-) -> Option<Result<Forked, Box<Refused>>> {
-  taken_whole(state, repository, changegroup, (room, None))
+) -> Result<Forked, MadeTake> {
+  let lend = u64::MAX;
+  let begun =
+    crate::state::with_state(|state| begin_intake(state, repository, changegroup, lend, room))
+      .flatten();
+  let mut taking = match begun {
+    Some(Ok(taking)) => taking,
+    Some(Err(refused)) => return Err(MadeTake::Refused(intake_refused(&refused))),
+    None => return Err(MadeTake::Gone),
+  };
+  loop {
+    let sliced = crate::state::with_state(|state| taking.slice(state, lend, room)).flatten();
+    let refused = match sliced {
+      Some(Ok(Stepped::More)) => {
+        slates_rt::futures::yield_now().await;
+        continue;
+      }
+      Some(Ok(Stepped::Done)) => return made_taken(taking),
+      Some(Ok(Stepped::Store)) => match made_wants_answered(&mut taking, repository).await {
+        Ok(()) => continue,
+        Err(why) => MadeTake::Store(why),
+      },
+      Some(Ok(Stepped::Wanted(range))) => {
+        let wanted = match taking.changegroup.as_ref() {
+          Some((_, payload)) => whole_wanted(payload, range),
+          None => whole_wanted(&[], range),
+        };
+        MadeTake::Refused(intake_refused(&wanted))
+      }
+      Some(Err(refused)) => MadeTake::Refused(intake_refused(&refused)),
+      None => MadeTake::Gone,
+    };
+    let _ = crate::state::with_state(move |state| taking.abandon_in(state));
+    return Err(refused);
+  }
 }
 
-/// [`take_made`] and the tests' `take_whole`: cut at `cut` where given, the segments in the fork for its landing.
+/// [`take_made`]'s want of the node's changeset store answered by awaiting it ([`store_wants_answered`]'s, its refusal
+/// typed).
+async fn made_wants_answered(
+  taking: &mut Taking,
+  repository: RepositoryId,
+) -> Result<(), vcs_store::hg_view::StoreUnanswered> {
+  let Some(intake) = taking.intake.as_mut() else {
+    return Err(vcs_store::hg_view::StoreUnanswered::ShardGone);
+  };
+  vcs_store::hg_view::answered_store_wants_on(
+    &mut crate::vcs_http::git::ThisShard,
+    intake,
+    repository,
+  )
+  .await
+}
+
+/// [`take_made`]'s end once its intake is done, in one step: its pins given back and its fork made. Unpinned before its
+/// landing: a made changeset's intake and record are made by its task holding its repository's landing turn, so
+/// nothing reads its texts while they are unpinned and not durable (its `disk.land` awaits after); once landed, a
+/// window let go meanwhile is brought back from the store.
+fn made_taken(mut taking: Taking) -> Result<Forked, MadeTake> {
+  crate::state::with_state(move |state| {
+    taking.cut_rest();
+    taking.unpinned_in(state);
+    taking.finish().ok_or(MadeTake::Gone)
+  })
+  .unwrap_or(Err(MadeTake::Gone))
+}
+
+/// The tests' `take_whole`: cut at `cut` where given, the segments in the fork for its landing. A synchronous driver of
+/// a test history holding the shard: a want of the node's changeset store is answered by a blocking read
+/// (`test_store::answer_wants_blocking`), which only the allow-listed `audit_on_stored_shard` histories reach (hg_push's
+/// race histories, until they move; `test_store::SHARD_BLOCKING_ALLOWED`); the daemon's own takes answer it by awaiting
+/// the store ([`take_sliced`], [`take_made`]).
+#[cfg(test)]
 fn taken_whole(
   state: &mut ShardState,
   repository: RepositoryId,
@@ -3726,7 +3821,15 @@ fn taken_whole(
         return Some(Ok(forked));
       }
       Some(Ok(Stepped::Store)) => {
-        if !stored_now(state, repository, &mut taking) {
+        let answered = match (state.vcs_disk.clone(), taking.intake.as_mut()) {
+          (Some(disk), Some(intake)) => crate::test_store::answer_wants_blocking(
+            &disk,
+            u128::from_be_bytes(repository.bytes),
+            intake,
+          ),
+          _ => false,
+        };
+        if !answered {
           taking.abandon_in(state);
           return None;
         }
@@ -3766,50 +3869,12 @@ fn recorded_segments(state: &mut ShardState, taking: &mut Taking) -> Option<Vec<
   Some(recorded)
 }
 
-/// Answers the intake's want of the node's changeset store at once, for a caller that holds the shard's state and so
-/// cannot wait between steps: a test's, from the store on a thread of its own (`test_store::answer_wants_blocking`).
-/// Whether it was answered.
-#[cfg(test)]
-fn stored_now(state: &mut ShardState, repository: RepositoryId, taking: &mut Taking) -> bool {
-  let (Some(disk), Some(intake)) = (state.vcs_disk.clone(), taking.intake.as_mut()) else {
-    return false;
-  };
-  // Waited for on the shard's thread: allow-listed until its tests push from a task (test_store::SHARD_BLOCKING_ALLOWED).
-  crate::test_store::allowing_shard_blocking("repository::hg_push::stored_now", || {
-    crate::test_store::answer_wants_blocking(&disk, u128::from_be_bytes(repository.bytes), intake)
-  })
-}
-
-/// The intake's want of the store, met by a caller that cannot wait between steps: a made changeset's, which sends
-/// every revision whole (`slates_hg::push::made::changegroup`), so never asks; unanswered.
-#[cfg(not(test))]
-fn stored_now(_state: &mut ShardState, _repository: RepositoryId, _taking: &mut Taking) -> bool {
-  false
-}
-
 /// A prepared push landed as the driver lands it once its intake is done: a fork another push made stale taken again
 /// from its changegroup, every slice at once (the driver takes it again inside its repository's landing turn,
 /// `hg_run`), then its segments landed on the store ([`store_blocking`]), then judged at landing and landed: the
-/// driver's steps for the tests, which land pushes side by side with no runtime. Its segments and the texts its works
-/// want wait for the store on the shard's thread: allow-listed until its tests push from a task (`unbundle`;
-/// test_store::SHARD_BLOCKING_ALLOWED).
+/// driver's steps for the tests, which land pushes side by side with no runtime.
 #[cfg(test)]
 pub(crate) fn land_in(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  pushed: (&Principal, &[u8]),
-  unbundle: &Unbundle,
-  forked: Option<Forked>,
-  room: &mut Admission,
-) -> Option<PushOutcome> {
-  crate::test_store::allowing_shard_blocking("repository::hg_push::land_in", || {
-    land_in_held(state, repository, pushed, unbundle, forked, room)
-  })
-}
-
-/// [`land_in`]'s steps, on the shard's thread.
-#[cfg(test)]
-fn land_in_held(
   state: &mut ShardState,
   repository: RepositoryId,
   (principal, bundle): (&Principal, &[u8]),

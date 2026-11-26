@@ -2470,4 +2470,4 @@ mod manifesting;
 
 #[cfg(test)]
 #[path = "intake_tests.rs"]
-mod tests;
+pub(crate) mod tests;
