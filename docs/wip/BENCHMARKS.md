@@ -19955,3 +19955,43 @@ commits, so this makes no claim on it.
   not reproduced with `derive_behind`. C's took 13.3 ms in one round and 24.3 ms in the other: without it, a unit's time
   also doubled at this load.
 
+
+## The fetch's read cache given back least recently used: dead even in work on git/git, kept for the fixtures (goal 93 perf; main's A/B, 2026-11-26)
+
+**Verdict.** Kept (2f8b9d9f9, `packed::Recent::refresh`: an object found kept for the second time or more, in the older
+half of the chunks, laid again with the newest). On git/git it is dead even in work, by the reuse distance the GAPS
+entry derives ("The fetch's read cache on git/git"): every tree in the pack is read once, and a chain's members lie
+farther apart in the walk than any order keeps. The times are mixed, none regressed. It is kept for the fixtures'
+shape: the star fixture's roots inflated 44 -> 23 (`a_fetchs_tree_reads_count_the_bases_they_inflate_whole`).
+
+- **Command.** `git-leg-counters5.sh` over git/git, release `slates-cli` of each arm, two rounds in ABBA order.
+- **Load.** Load average 15 to 22; the machine is not named in main's report. Loaded points, compared only with each
+  other.
+- **The arms**, distinct by sha:
+  - before: 1e58953e0 (binary sha 9e38e1ebb6c9), oldest laid given back first.
+  - after: 003e4d7c7 (binary sha b68dc2789334), the refresh.
+
+**The read cache, per clone** (identical within each arm, so deterministic):
+
+| arm | `read_cache_hits` | `units.open_tree` | hit rate | `tree_bases_inflated` | `tree_deltas` | `tree_deltas_past_one` | budget at most |
+|---|---|---|---|---|---|---|---|
+| before | 31,620 | 3,093,691 | 1.02 % | 138,556 | 1,810,257 | 1,648,331 | 10,150,020 B |
+| after | 31,858 (+238) | 3,093,691 | 1.03 % | 138,318 (−238) | 1,810,435 (+178) | 1,648,509 (+178) | 10,150,020 B |
+
+Hits and roots inflated sum to 170,176 in both arms, the pack's trees: each read either finds an entry of its chain
+kept or inflates its root, and every tree is read once.
+
+**Seconds a step** (before's two legs, then after's, and the least of each):
+
+| step | before | after | least, after against before |
+|---|---|---|---|
+| clone | 66.55, 59.37 | 62.41, 57.56 | −3.1 % |
+| clone again | 60.65, 59.29 | 52.69, 51.74 | −12.7 % |
+| partial | 40.64, 32.78 | 33.63, 34.27 | +2.6 % |
+| push | 48.35, 47.78 | 52.84, 47.66 | −0.3 % |
+
+- **Not claimed:** clone again's 7.5 s. The counters are dead even, and nothing in them explains it.
+- **Not work:** the long-step and long-unit counts swing with load (`open_tree`'s long units 161,869 -> 327 between
+  legs of the same binaries).
+- **Why no order helps, and what would:** the GAPS entry (2,511 MiB of trees inflated on git/git against a 10 MB
+  budget; a budget from the pack's own chains, or an enumeration that reads no trees, the open path).
