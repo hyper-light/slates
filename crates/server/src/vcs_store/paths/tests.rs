@@ -62,6 +62,23 @@ pub(crate) fn git_repository(state: &mut ShardState, name: &str) -> (RepositoryI
   (record.id, id)
 }
 
+/// What these tests ask a creation for: git repository `name`, its default `main`, made by [`owner`] as a client's
+/// creation is made (`test_store::created`, awaited in a task of the shard), never landed on the shard's thread.
+fn git(name: &str) -> crate::test_store::Asked<'_> {
+  (name, VcsTool::Git, ObjectFormat::Sha1, "main")
+}
+
+/// Git repository `name` made from a task of the shard ([`git`]): its id and its root green.
+pub(crate) async fn git_made(name: &str) -> (RepositoryId, VolumeId) {
+  let (repository, root) = crate::test_store::created(&owner(), git(name)).await;
+  (repository, crate::verbs::to_wire_volume(root))
+}
+
+/// The shard's state for `f`, in a history awaiting on the shard (`vcs_store::tests::on_state`).
+fn on_state<T>(f: impl FnOnce(&mut ShardState) -> T) -> T {
+  crate::vcs_store::tests::on_state(f)
+}
+
 /// One change a version's work makes.
 pub(crate) enum Op {
   /// Splice `bytes` at `at` over `delete_len` bytes of the file at the path.
@@ -143,6 +160,56 @@ thread_local! {
   static TEST_SEQUENCE: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
 }
 
+/// A work over `green` named for `serial`, making `ops`, none refused: the work.
+fn work_making(state: &mut ShardState, (green, serial): (VolumeId, u32), ops: Vec<Op>) -> VolumeId {
+  let made = ask(
+    state,
+    RequestBody::CreateWork {
+      green,
+      name: format!("work-{serial}"),
+    },
+  );
+  let ReplyBody::WorkCreated { id: work, .. } = made else {
+    panic!("no work: {made:?}")
+  };
+  for op in ops {
+    let reply = match op {
+      Op::Edit(path, at, delete_len, bytes) => ask(
+        state,
+        RequestBody::Edit {
+          work,
+          path: path.to_owned(),
+          at,
+          delete_len,
+          bytes: bytes.to_vec(),
+        },
+      ),
+      Op::Declare(op) => ask(state, RequestBody::Declare { work, op }),
+    };
+    assert!(!matches!(reply, ReplyBody::Refused { .. }), "{reply:?}");
+  }
+  work
+}
+
+/// [`version`] on a git repository's `green` from a task of the shard: its submit a client's recorded request whose
+/// made commit the shard's own task lands ([`recorded_git_submit_awaited`]), never the shard's thread held through the
+/// store's commit. The version accepted.
+pub(crate) async fn version_awaited(green: VolumeId, serial: u32, ops: Vec<Op>) -> u64 {
+  let work = on_state(|state| work_making(state, (green, serial), ops));
+  let message = format!("version {serial}");
+  let submitted = recorded_git_submit_awaited(crate::identities::authored(work, &message)).await;
+  let ReplyBody::Submitted {
+    version: Some(version),
+    ..
+  } = submitted
+  else {
+    panic!("not accepted: {submitted:?}")
+  };
+  let destroyed = on_state(|state| ask(state, RequestBody::Destroy { volume: work }));
+  assert!(matches!(destroyed, ReplyBody::Destroyed), "{destroyed:?}");
+  version
+}
+
 /// [`version`] submitted with `message`.
 pub(crate) fn version_saying(
   state: &mut ShardState,
@@ -220,6 +287,71 @@ pub(crate) fn recorded_git_submit(state: &mut ShardState, body: RequestBody) -> 
     }),
   };
   recorded_git_submit_as(state, id, body)
+}
+
+/// Request [`TEST_CLIENT`]'s next sequence on this thread.
+fn next_test_request() -> slates_wire::request::RequestId {
+  slates_wire::request::RequestId {
+    client: TEST_CLIENT,
+    sequence: TEST_SEQUENCE.with(|next| {
+      let sequence = next.get();
+      next.set(sequence.wrapping_add(1));
+      sequence
+    }),
+  }
+}
+
+/// [`recorded_git_submit`] from a task of the shard ([`crate::test_store::run_on_stored_shard`]).
+pub(crate) async fn recorded_git_submit_awaited(body: RequestBody) -> ReplyBody {
+  recorded_git_submit_as_awaited(next_test_request(), body).await
+}
+
+/// [`recorded_git_submit_as`] from a task of the shard: nothing held for the test, so what the submit waits on (its
+/// refinement, its made commit, homed and landed by awaiting, and its version's whole build) runs as the shard's own
+/// tasks would run it, and the history awaits the answer its request records; the whole build then settled, so the test
+/// reads the store as the build leaves it.
+async fn recorded_git_submit_as_awaited(
+  id: slates_wire::request::RequestId,
+  body: RequestBody,
+) -> ReplyBody {
+  let answered = on_state(|state| {
+    crate::verbs::run_recorded_for_test(state, (u64::from(TEST_CLIENT), id), &owner(), body)
+  });
+  let answer = match answered {
+    Some(answer) => answer,
+    None => answer_awaited(id).await,
+  };
+  on_state(super::whole_build::settle);
+  answer
+}
+
+/// The answer request `id` of [`TEST_CLIENT`] records, awaited from a task of the shard.
+async fn answer_awaited(id: slates_wire::request::RequestId) -> ReplyBody {
+  let deadline = slates_rt::futures::now_ns().saturating_add(
+    u64::try_from(crate::test_store::HISTORY_PATIENCE.as_nanos()).unwrap_or(u64::MAX),
+  );
+  loop {
+    let recorded = on_state(|state| {
+      match state
+        .db
+        .partition()
+        .completion(u64::from(TEST_CLIENT), id.client, id.sequence)
+      {
+        slates_wire::request::Seen::Completed(bytes) => {
+          <ReplyBody as slates_wire::Wire>::from_bytes(&bytes).ok()
+        }
+        _ => None,
+      }
+    });
+    if let Some(answer) = recorded {
+      return answer;
+    }
+    assert!(
+      slates_rt::futures::now_ns() < deadline,
+      "request {id:?} was never answered"
+    );
+    slates_rt::futures::yield_now().await;
+  }
 }
 
 /// [`recorded_git_submit`] under request `id` of [`TEST_CLIENT`]: a resend of one answered retryable runs it again.
@@ -380,7 +512,7 @@ fn held(state: &ShardState) -> (Vec<(ContentId, u64)>, u64) {
 /// The fixed history's first five versions (each checked against the model): files made in a directory; one
 /// overwritten; one made executable; a symbolic link and a hard link; a named pipe and an attribute, which change no
 /// file git holds.
-fn first_five(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut Model) {
+async fn first_five(at: (RepositoryId, VolumeId), model: &mut Model) {
   let green = at.1;
   let ops = vec![
     Op::Declare(WorkOp::Mkdir {
@@ -390,22 +522,22 @@ fn first_five(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut 
     create("/d/a", b"alpha"),
     create("/keep", b"keep"),
   ];
-  let first = version(state, green, 1, ops);
+  let first = version_awaited(green, 1, ops).await;
   set(model, "f", FileClass::File, b"hello");
   set(model, "d/a", FileClass::File, b"alpha");
   set(model, "keep", FileClass::File, b"keep");
-  assert_kept(state, at, first, model);
-  let second = version(state, green, 2, vec![Op::Edit("/f", 0, 5, b"HELLO!")]);
+  on_state(|state| assert_kept(state, at, first, model));
+  let second = version_awaited(green, 2, vec![Op::Edit("/f", 0, 5, b"HELLO!")]).await;
   set(model, "f", FileClass::File, b"HELLO!");
-  assert_kept(state, at, second, model);
+  on_state(|state| assert_kept(state, at, second, model));
   let mode = WorkOp::SetMode {
     path: "/d/a".to_owned(),
     mode: EXECUTABLE,
   };
-  let third = version(state, green, 3, vec![Op::Declare(mode)]);
+  let third = version_awaited(green, 3, vec![Op::Declare(mode)]).await;
   set(model, "d/a", FileClass::Executable, b"alpha");
-  assert_kept(state, at, third, model);
-  links(state, at, model);
+  on_state(|state| assert_kept(state, at, third, model));
+  links(at, model).await;
   let pipe = WorkOp::Mknod {
     path: "/p".to_owned(),
     node: fifo(),
@@ -415,17 +547,12 @@ fn first_five(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut 
     name: "user.note".to_owned(),
     value: b"x".to_vec(),
   };
-  let fifth = version(
-    state,
-    green,
-    5,
-    vec![Op::Declare(pipe), Op::Declare(attribute)],
-  );
-  assert_kept(state, at, fifth, model);
+  let fifth = version_awaited(green, 5, vec![Op::Declare(pipe), Op::Declare(attribute)]).await;
+  on_state(|state| assert_kept(state, at, fifth, model));
 }
 
 /// The fourth version: a symbolic link (its content its target) and a hard link (a file with its primary's bytes).
-fn links(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut Model) {
+async fn links(at: (RepositoryId, VolumeId), model: &mut Model) {
   let symlink = WorkOp::Symlink {
     path: "/s".to_owned(),
     target: "f".to_owned(),
@@ -434,31 +561,26 @@ fn links(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut Model
     path: "/h".to_owned(),
     target: "/keep".to_owned(),
   };
-  let fourth = version(
-    state,
-    at.1,
-    4,
-    vec![Op::Declare(symlink), Op::Declare(hard)],
-  );
+  let fourth = version_awaited(at.1, 4, vec![Op::Declare(symlink), Op::Declare(hard)]).await;
   set(model, "s", FileClass::Symlink, b"f");
   set(model, "h", FileClass::File, b"keep");
-  assert_kept(state, at, fourth, model);
+  on_state(|state| assert_kept(state, at, fourth, model));
 }
 
 /// The sixth version: the file the hard link names is overwritten, which the change index names at the file alone; the
 /// link reads the new bytes, as git's tree holds them at both names.
-fn primary(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut Model) {
-  let sixth = version(state, at.1, 6, vec![Op::Edit("/keep", 0, 4, b"KEEP!")]);
+async fn primary(at: (RepositoryId, VolumeId), model: &mut Model) {
+  let sixth = version_awaited(at.1, 6, vec![Op::Edit("/keep", 0, 4, b"KEEP!")]).await;
   set(model, "keep", FileClass::File, b"KEEP!");
   set(model, "h", FileClass::File, b"KEEP!");
-  assert_kept(state, at, sixth, model);
+  on_state(|state| assert_kept(state, at, sixth, model));
 }
 
 /// The fixed history's last five versions (each checked against the model): a file renamed; a symbolic link removed; an
 /// executable file moved into a directory made with it, its old directory removed, a change whose directories the map
 /// makes and drops by their files alone (the move states the file's mode, as the green keeps a mode at its path,
 /// A-618); a splice into the moved file; its execute bit taken away.
-fn last_five(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut Model) {
+async fn last_five(at: (RepositoryId, VolumeId), model: &mut Model) {
   let green = at.1;
   let rename = |from: &str, to: &str| {
     Op::Declare(WorkOp::Rename {
@@ -466,16 +588,16 @@ fn last_five(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut M
       to: to.to_owned(),
     })
   };
-  let seventh = version(state, green, 7, vec![rename("/f", "/g")]);
+  let seventh = version_awaited(green, 7, vec![rename("/f", "/g")]).await;
   let (class, bytes) = take(model, "f");
   set(model, "g", class, &bytes);
-  assert_kept(state, at, seventh, model);
+  on_state(|state| assert_kept(state, at, seventh, model));
   let unlink = WorkOp::Unlink {
     path: "/s".to_owned(),
   };
-  let eighth = version(state, green, 8, vec![Op::Declare(unlink)]);
+  let eighth = version_awaited(green, 8, vec![Op::Declare(unlink)]).await;
   take(model, "s");
-  assert_kept(state, at, eighth, model);
+  on_state(|state| assert_kept(state, at, eighth, model));
   let moved = vec![
     Op::Declare(WorkOp::Mkdir {
       path: "/x".to_owned(),
@@ -489,20 +611,20 @@ fn last_five(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut M
       path: "/d".to_owned(),
     }),
   ];
-  let ninth = version(state, green, 9, moved);
+  let ninth = version_awaited(green, 9, moved).await;
   let (class, bytes) = take(model, "d/a");
   set(model, "x/a", class, &bytes);
-  assert_kept(state, at, ninth, model);
-  let tenth = version(state, green, 10, vec![Op::Edit("/x/a", 0, 0, b"A")]);
+  on_state(|state| assert_kept(state, at, ninth, model));
+  let tenth = version_awaited(green, 10, vec![Op::Edit("/x/a", 0, 0, b"A")]).await;
   set(model, "x/a", FileClass::Executable, b"Aalpha");
-  assert_kept(state, at, tenth, model);
+  on_state(|state| assert_kept(state, at, tenth, model));
   let mode = WorkOp::SetMode {
     path: "/x/a".to_owned(),
     mode: PLAIN,
   };
-  let eleventh = version(state, green, 11, vec![Op::Declare(mode)]);
+  let eleventh = version_awaited(green, 11, vec![Op::Declare(mode)]).await;
   set(model, "x/a", FileClass::File, b"Aalpha");
-  assert_kept(state, at, eleventh, model);
+  on_state(|state| assert_kept(state, at, eleventh, model));
 }
 
 /// A-664 part 3 (its first piece; A-647's owed map: "the green's state as the path map these types read"). Do: on a git
@@ -516,17 +638,19 @@ fn last_five(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut M
 /// link, asks for a whole build), none refused.
 #[test]
 fn t_a664_p3_every_version_of_a_git_green_keeps_its_map_of_gits_files() {
-  let counts = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
-    let at = git_repository(state, "tree");
+  let counts = crate::test_store::run_on_stored_shard(|| async {
+    let at = git_made("tree").await;
     let mut model = Model::new();
-    first_five(state, at, &mut model);
-    primary(state, at, &mut model);
-    last_five(state, at, &mut model);
-    (
-      count(state, BUILT),
-      count(state, DERIVED),
-      count(state, REFUSED),
-    )
+    first_five(at, &mut model).await;
+    primary(at, &mut model).await;
+    last_five(at, &mut model).await;
+    on_state(|state| {
+      (
+        count(state, BUILT),
+        count(state, DERIVED),
+        count(state, REFUSED),
+      )
+    })
   });
   assert_eq!(counts, (1, 10, 0));
 }
@@ -535,7 +659,7 @@ fn t_a664_p3_every_version_of_a_git_green_keeps_its_map_of_gits_files() {
 /// file to a plain green. Expect: accepted, and no map derived, built or refused.
 #[test]
 fn t_a664_p3_a_plain_greens_versions_keep_no_map() {
-  let counts = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
+  let counts = crate::test_store::on_a_stored_shard(|state| {
     let made = ask(
       state,
       RequestBody::CreateGreen {
@@ -563,23 +687,27 @@ fn t_a664_p3_a_plain_greens_versions_keep_no_map() {
 /// the third version's map derived from it; so one build as a version committed, one remade, two derived.
 #[test]
 fn t_a664_p3_a_store_made_again_holds_each_greens_map_again() {
-  let counts = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
-    let at = git_repository(state, "again");
+  let counts = crate::test_store::run_on_stored_shard(|| async {
+    let at = git_made("again").await;
     let mut model = Model::new();
-    version(state, at.1, 1, vec![create("/f", b"one")]);
-    let second = version(state, at.1, 2, vec![Op::Edit("/f", 0, 3, b"two")]);
-    crate::vcs_store::rebuild(state, at.0);
-    crate::vcs_store::settle_rebuild(state, at.0);
+    version_awaited(at.1, 1, vec![create("/f", b"one")]).await;
+    let second = version_awaited(at.1, 2, vec![Op::Edit("/f", 0, 3, b"two")]).await;
     set(&mut model, "f", FileClass::File, b"two");
-    assert_kept(state, at, second, &model);
-    let third = version(state, at.1, 3, vec![create("/g", b"three")]);
+    on_state(|state| {
+      crate::vcs_store::rebuild(state, at.0);
+      crate::vcs_store::settle_rebuild(state, at.0);
+      assert_kept(state, at, second, &model);
+    });
+    let third = version_awaited(at.1, 3, vec![create("/g", b"three")]).await;
     set(&mut model, "g", FileClass::File, b"three");
-    assert_kept(state, at, third, &model);
-    (
-      count(state, BUILT),
-      count(state, REMADE),
-      count(state, DERIVED),
-    )
+    on_state(|state| {
+      assert_kept(state, at, third, &model);
+      (
+        count(state, BUILT),
+        count(state, REMADE),
+        count(state, DERIVED),
+      )
+    })
   });
   assert_eq!(counts, (1, 1, 2));
 }
@@ -591,41 +719,45 @@ fn t_a664_p3_a_store_made_again_holds_each_greens_map_again() {
 /// its head equal to its model, remade once; the third version's derived from it.
 #[test]
 fn t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map() {
-  let counts = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
-    let at = git_repository(state, "taken");
+  let counts = crate::test_store::run_on_stored_shard(|| async {
+    let at = git_made("taken").await;
     let mut model = Model::new();
-    version(state, at.1, 1, vec![create("/f", b"one")]);
-    let second = version(state, at.1, 2, vec![Op::Edit("/f", 0, 3, b"two")]);
-    let repositories = state.db.partition().repositories();
-    let record = repositories.repository(at.0).cloned().expect("the record");
-    let dropped = slates_db::op::Op::RepositoryDestroyed { repository: at.0 };
-    let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
-    state
-      .db
-      .mutate(&mut state.segment, &dropped, now)
-      .expect("dropped");
-    crate::vcs_store::free(state, at.0);
-    assert!(crate::takeover::rebuild_repository(
-      state,
-      record,
-      vec![main_bound(at)]
-    ));
-    // Its store made a record a turn and its map in slices, by tasks a test's step never runs: driven to their end.
-    assert!(
-      state.vcs_stores.rebuilding(at.0) && state.vcs_stores.git_ref(at.0).is_none(),
-      "a successor's store is made again a step a turn, lent to nothing meanwhile"
-    );
-    crate::vcs_store::settle_rebuild(state, at.0);
+    version_awaited(at.1, 1, vec![create("/f", b"one")]).await;
+    let second = version_awaited(at.1, 2, vec![Op::Edit("/f", 0, 3, b"two")]).await;
     set(&mut model, "f", FileClass::File, b"two");
-    assert_kept(state, at, second, &model);
-    let third = version(state, at.1, 3, vec![create("/g", b"three")]);
+    on_state(|state| {
+      let repositories = state.db.partition().repositories();
+      let record = repositories.repository(at.0).cloned().expect("the record");
+      let dropped = slates_db::op::Op::RepositoryDestroyed { repository: at.0 };
+      let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+      state
+        .db
+        .mutate(&mut state.segment, &dropped, now)
+        .expect("dropped");
+      crate::vcs_store::free(state, at.0);
+      assert!(crate::takeover::rebuild_repository(
+        state,
+        record,
+        vec![main_bound(at)]
+      ));
+      // Its store made a record a turn and its map in slices, by tasks a test's step never runs: driven to their end.
+      assert!(
+        state.vcs_stores.rebuilding(at.0) && state.vcs_stores.git_ref(at.0).is_none(),
+        "a successor's store is made again a step a turn, lent to nothing meanwhile"
+      );
+      crate::vcs_store::settle_rebuild(state, at.0);
+      assert_kept(state, at, second, &model);
+    });
+    let third = version_awaited(at.1, 3, vec![create("/g", b"three")]).await;
     set(&mut model, "g", FileClass::File, b"three");
-    assert_kept(state, at, third, &model);
-    (
-      count(state, BUILT),
-      count(state, REMADE),
-      count(state, DERIVED),
-    )
+    on_state(|state| {
+      assert_kept(state, at, third, &model);
+      (
+        count(state, BUILT),
+        count(state, REMADE),
+        count(state, DERIVED),
+      )
+    })
   });
   assert_eq!(counts, (1, 1, 2));
 }
@@ -636,38 +768,35 @@ fn t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map() {
 /// files (polled more than once), one unit a file; the head's map equal to its model, remade once.
 #[test]
 fn t_a664_sliced_a_recoverys_whole_build_steps_a_file_a_unit() {
-  let seen = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
-    let at = git_repository(state, "sliced");
+  let seen = crate::test_store::run_on_stored_shard(|| async {
+    let at = git_made("sliced").await;
     let mut model = Model::new();
     let names = ["/a", "/b", "/c", "/d", "/e", "/f"];
-    let head = version(
-      state,
-      at.1,
-      1,
-      names.map(|name| create(name, b"six")).into(),
-    );
-    crate::vcs_store::paths::forget(state, at.0, to_db_volume(at.1));
-    let mut slices = crate::recovery_slices::RecoverySlices::begin(1);
-    let polls = {
-      let build = super::remake_green_sliced(state, to_db_volume(at.1), &mut slices);
-      let mut build = std::pin::pin!(build);
-      let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-      let mut polls = 1u64;
-      while build.as_mut().poll(&mut context).is_pending() {
-        polls = polls.saturating_add(1);
+    let head = version_awaited(at.1, 1, names.map(|name| create(name, b"six")).into()).await;
+    on_state(|state| {
+      crate::vcs_store::paths::forget(state, at.0, to_db_volume(at.1));
+      let mut slices = crate::recovery_slices::RecoverySlices::begin(1);
+      let polls = {
+        let build = super::remake_green_sliced(state, to_db_volume(at.1), &mut slices);
+        let mut build = std::pin::pin!(build);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut polls = 1u64;
+        while build.as_mut().poll(&mut context).is_pending() {
+          polls = polls.saturating_add(1);
+        }
+        polls
+      };
+      for name in names {
+        set(
+          &mut model,
+          name.trim_start_matches('/'),
+          FileClass::File,
+          b"six",
+        );
       }
-      polls
-    };
-    for name in names {
-      set(
-        &mut model,
-        name.trim_start_matches('/'),
-        FileClass::File,
-        b"six",
-      );
-    }
-    assert_kept(state, at, head, &model);
-    (polls > 1, slices.finish().units, count(state, REMADE))
+      assert_kept(state, at, head, &model);
+      (polls > 1, slices.finish().units, count(state, REMADE))
+    })
   });
   assert_eq!(seen, (true, 6, 1));
 }
@@ -706,27 +835,31 @@ fn main_bound((repository, root): (RepositoryId, VolumeId)) -> slates_db::catalo
 /// to its model; the second branch's first version built whole, its source's head having moved past it.
 #[test]
 fn t_a664_p3_a_branchs_first_version_derives_from_its_sources_map() {
-  let counts = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
-    let (repository, root) = git_repository(state, "branched");
-    version(state, root, 1, vec![create("/f", b"root")]);
-    let topic = branch(state, "branched", "topic");
+  let counts = crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = git_made("branched").await;
+    version_awaited(root, 1, vec![create("/f", b"root")]).await;
+    let topic = on_state(|state| branch(state, "branched", "topic"));
     let mut model = Model::new();
     set(&mut model, "f", FileClass::File, b"root");
-    let first = version(state, topic, 2, vec![create("/t", b"topic")]);
+    let first = version_awaited(topic, 2, vec![create("/t", b"topic")]).await;
     set(&mut model, "t", FileClass::File, b"topic");
-    assert_kept(state, (repository, topic), first, &model);
-    let second = version(state, topic, 3, vec![Op::Edit("/t", 0, 5, b"TOPIC")]);
+    on_state(|state| assert_kept(state, (repository, topic), first, &model));
+    let second = version_awaited(topic, 3, vec![Op::Edit("/t", 0, 5, b"TOPIC")]).await;
     set(&mut model, "t", FileClass::File, b"TOPIC");
-    assert_kept(state, (repository, topic), second, &model);
-    let derived = (count(state, BUILT), count(state, DERIVED));
-    let late = branch(state, "branched", "late");
-    version(state, root, 4, vec![create("/g", b"moved")]);
-    let late_first = version(state, late, 5, vec![create("/l", b"late")]);
+    let (derived, late) = on_state(|state| {
+      assert_kept(state, (repository, topic), second, &model);
+      let derived = (count(state, BUILT), count(state, DERIVED));
+      (derived, branch(state, "branched", "late"))
+    });
+    version_awaited(root, 4, vec![create("/g", b"moved")]).await;
+    let late_first = version_awaited(late, 5, vec![create("/l", b"late")]).await;
     let mut late_model = Model::new();
     set(&mut late_model, "f", FileClass::File, b"root");
     set(&mut late_model, "l", FileClass::File, b"late");
-    assert_kept(state, (repository, late), late_first, &late_model);
-    (derived, count(state, BUILT), count(state, DERIVED))
+    on_state(|state| {
+      assert_kept(state, (repository, late), late_first, &late_model);
+      (derived, count(state, BUILT), count(state, DERIVED))
+    })
   });
   assert_eq!(counts, ((1, 2), 2, 3));
 }
@@ -738,23 +871,25 @@ fn t_a664_p3_a_branchs_first_version_derives_from_its_sources_map() {
 /// holders and the bytes it uses; the root's map still its model.
 #[test]
 fn t_a664_p3_a_destroyed_branch_takes_its_map_with_it() {
-  crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
-    let (repository, root) = git_repository(state, "pruned");
-    let head = version(state, root, 1, vec![create("/f", b"root")]);
-    let topic = branch(state, "pruned", "topic");
-    let first = version(state, topic, 2, vec![create("/t", b"topic")]);
-    let before = kept(state, repository, topic, first).is_some();
-    let destroyed = ask(state, RequestBody::Destroy { volume: topic });
-    assert!(matches!(destroyed, ReplyBody::Destroyed), "{destroyed:?}");
-    let after = kept(state, repository, topic, first).is_some();
-    assert_eq!((before, after), (true, false), "the branch's map");
-    let live = held(state);
-    crate::vcs_store::rebuild(state, repository);
-    crate::vcs_store::settle_rebuild(state, repository);
-    assert_eq!(held(state), live, "the store made again");
-    let mut model = Model::new();
-    set(&mut model, "f", FileClass::File, b"root");
-    assert_kept(state, (repository, root), head, &model);
+  crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = git_made("pruned").await;
+    let head = version_awaited(root, 1, vec![create("/f", b"root")]).await;
+    let topic = on_state(|state| branch(state, "pruned", "topic"));
+    let first = version_awaited(topic, 2, vec![create("/t", b"topic")]).await;
+    on_state(|state| {
+      let before = kept(state, repository, topic, first).is_some();
+      let destroyed = ask(state, RequestBody::Destroy { volume: topic });
+      assert!(matches!(destroyed, ReplyBody::Destroyed), "{destroyed:?}");
+      let after = kept(state, repository, topic, first).is_some();
+      assert_eq!((before, after), (true, false), "the branch's map");
+      let live = held(state);
+      crate::vcs_store::rebuild(state, repository);
+      crate::vcs_store::settle_rebuild(state, repository);
+      assert_eq!(held(state), live, "the store made again");
+      let mut model = Model::new();
+      set(&mut model, "f", FileClass::File, b"root");
+      assert_kept(state, (repository, root), head, &model);
+    });
   });
 }
 
@@ -764,34 +899,36 @@ fn t_a664_p3_a_destroyed_branch_takes_its_map_with_it() {
 /// holding `e/a` with `a`'s bytes beside `d/a`, and the copy composed by the green's owner (counted).
 #[test]
 fn t_a626_p4_a_work_copies_a_tree_and_its_version_holds_it() {
-  let seen = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
-    let at = git_repository(state, "copied");
-    version(state, at.1, 1, vec![create("/d/a", b"alpha")]);
+  let seen = crate::test_store::run_on_stored_shard(|| async {
+    let at = git_made("copied").await;
+    version_awaited(at.1, 1, vec![create("/d/a", b"alpha")]).await;
     let copy = Op::Declare(WorkOp::Copy {
       from: "/d".to_owned(),
       to: "/e".to_owned(),
       version: None,
       replace: false,
     });
-    let second = version(state, at.1, 2, vec![copy]);
-    // The copy names a tree at its destination alone, so its version's map is built whole (`Green::copied_after`), and
-    // equals the files git holds there (A-664's owed copy through a work's whole build).
-    let mut model = Model::new();
-    set(&mut model, "d/a", FileClass::File, b"alpha");
-    set(&mut model, "e/a", FileClass::File, b"alpha");
-    assert_kept(state, at, second, &model);
-    let green = to_db_volume(at.1);
-    let engine = state.greens.get(&green).expect("the green's engine");
-    let held = (
-      engine.content_bytes("e/a").map(<[u8]>::to_vec),
-      engine.content_bytes("d/a").map(<[u8]>::to_vec),
-    );
-    drop(engine);
-    (
-      second,
-      held,
-      count(state, "merge.work.copy_composed_by_owner"),
-    )
+    let second = version_awaited(at.1, 2, vec![copy]).await;
+    on_state(|state| {
+      // The copy names a tree at its destination alone, so its version's map is built whole (`Green::copied_after`), and
+      // equals the files git holds there (A-664's owed copy through a work's whole build).
+      let mut model = Model::new();
+      set(&mut model, "d/a", FileClass::File, b"alpha");
+      set(&mut model, "e/a", FileClass::File, b"alpha");
+      assert_kept(state, at, second, &model);
+      let green = to_db_volume(at.1);
+      let engine = state.greens.get(&green).expect("the green's engine");
+      let held = (
+        engine.content_bytes("e/a").map(<[u8]>::to_vec),
+        engine.content_bytes("d/a").map(<[u8]>::to_vec),
+      );
+      drop(engine);
+      (
+        second,
+        held,
+        count(state, "merge.work.copy_composed_by_owner"),
+      )
+    })
   });
   assert_eq!(
     seen,
@@ -805,31 +942,33 @@ fn t_a626_p4_a_work_copies_a_tree_and_its_version_holds_it() {
 /// reads its bytes; `d/hard.txt` still names `d/g.txt`.
 #[test]
 fn t_a626_p4_a_work_copies_a_tree_holding_a_hard_link() {
-  let seen = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
-    let at = git_repository(state, "linked");
+  let seen = crate::test_store::run_on_stored_shard(|| async {
+    let at = git_made("linked").await;
     let link = Op::Declare(WorkOp::Link {
       path: "/d/hard.txt".to_owned(),
       target: "/d/g.txt".to_owned(),
     });
-    version(state, at.1, 1, vec![create("/d/g.txt", b"keep"), link]);
+    version_awaited(at.1, 1, vec![create("/d/g.txt", b"keep"), link]).await;
     let copy = Op::Declare(WorkOp::Copy {
       from: "/d".to_owned(),
       to: "/e".to_owned(),
       version: None,
       replace: false,
     });
-    let second = version(state, at.1, 2, vec![copy]);
-    let engine = state
-      .greens
-      .get(&to_db_volume(at.1))
-      .expect("the green's engine");
-    let linked = (
-      engine.hardlink("e/hard.txt").map(str::to_owned),
-      engine.content_bytes("e/g.txt").map(<[u8]>::to_vec),
-      engine.hardlink("d/hard.txt").map(str::to_owned),
-    );
-    drop(engine);
-    (second, linked)
+    let second = version_awaited(at.1, 2, vec![copy]).await;
+    on_state(|state| {
+      let engine = state
+        .greens
+        .get(&to_db_volume(at.1))
+        .expect("the green's engine");
+      let linked = (
+        engine.hardlink("e/hard.txt").map(str::to_owned),
+        engine.content_bytes("e/g.txt").map(<[u8]>::to_vec),
+        engine.hardlink("d/hard.txt").map(str::to_owned),
+      );
+      drop(engine);
+      (second, linked)
+    })
   });
   assert_eq!(
     seen,
@@ -848,27 +987,34 @@ fn t_a626_p4_a_work_copies_a_tree_holding_a_hard_link() {
 /// a work copying `/nothing` to `/z`. Expect: the submit refused `CopyRefused` naming `z` and `SourceEmpty`.
 #[test]
 fn t_a626_p4_a_copy_of_nothing_is_refused_by_its_case() {
-  let reply = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
-    let at = git_repository(state, "nothing");
-    version(state, at.1, 1, vec![create("/a", b"a")]);
-    let made = ask(
-      state,
-      RequestBody::CreateWork {
-        green: at.1,
-        name: "w".to_owned(),
-      },
-    );
-    let ReplyBody::WorkCreated { id: work, .. } = made else {
-      return Some(made);
+  let reply = crate::test_store::run_on_stored_shard(|| async {
+    let at = git_made("nothing").await;
+    version_awaited(at.1, 1, vec![create("/a", b"a")]).await;
+    let work = on_state(|state| {
+      let made = ask(
+        state,
+        RequestBody::CreateWork {
+          green: at.1,
+          name: "w".to_owned(),
+        },
+      );
+      let ReplyBody::WorkCreated { id: work, .. } = made else {
+        return Err(made);
+      };
+      let copy = WorkOp::Copy {
+        from: "/nothing".to_owned(),
+        to: "/z".to_owned(),
+        version: None,
+        replace: false,
+      };
+      ask(state, RequestBody::Declare { work, op: copy });
+      Ok(work)
+    });
+    let work = match work {
+      Ok(work) => work,
+      Err(made) => return Some(made),
     };
-    let copy = WorkOp::Copy {
-      from: "/nothing".to_owned(),
-      to: "/z".to_owned(),
-      version: None,
-      replace: false,
-    };
-    ask(state, RequestBody::Declare { work, op: copy });
-    recorded_git_submit(state, crate::identities::authored(work, "copy nothing"))
+    Some(recorded_git_submit_awaited(crate::identities::authored(work, "copy nothing")).await)
   });
   let expected = slates_ipc::protocol::Refusal::CopyRefused {
     path: "z".to_owned(),
@@ -886,46 +1032,52 @@ fn t_a626_p4_a_copy_of_nothing_is_refused_by_its_case() {
 /// first committed a version with no commit made of it.
 #[test]
 fn a_submit_over_a_git_green_whose_repository_awaits_its_rebuild_is_refused_until_it_is_rebuilt() {
-  let seen = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
-    let at = git_repository(state, "pending-git");
-    let mut parts = state.db.take_state_log_records();
-    version(state, at.1, 1, vec![create("/f", b"one")]);
-    parts.extend(state.db.take_state_log_records());
-    let green = crate::verbs::to_db_volume(at.1);
-    let head = state.db.partition().green_head(green);
-    let record = crate::test_store::awaiting_rebuild(state, at.0, true);
-    let made = ask(
-      state,
-      RequestBody::CreateWork {
-        green: at.1,
-        name: "pending-work".to_owned(),
-      },
-    );
-    let ReplyBody::WorkCreated { id: work, .. } = made else {
-      panic!("no work: {made:?}")
-    };
-    let edited = ask(
-      state,
-      RequestBody::Edit {
-        work,
-        path: "/g".to_owned(),
-        at: 0,
-        delete_len: 0,
-        bytes: b"two".to_vec(),
-      },
-    );
-    assert!(!matches!(edited, ReplyBody::Refused { .. }), "{edited:?}");
+  let seen = crate::test_store::run_on_stored_shard(|| async {
+    let at = git_made("pending-git").await;
+    let mut parts = on_state(|state| state.db.take_state_log_records());
+    version_awaited(at.1, 1, vec![create("/f", b"one")]).await;
+    let (work, (record, parts), (green, head)) = on_state(|state| {
+      parts.extend(state.db.take_state_log_records());
+      let green = crate::verbs::to_db_volume(at.1);
+      let head = state.db.partition().green_head(green);
+      let record = crate::test_store::awaiting_rebuild(state, at.0, true);
+      let made = ask(
+        state,
+        RequestBody::CreateWork {
+          green: at.1,
+          name: "pending-work".to_owned(),
+        },
+      );
+      let ReplyBody::WorkCreated { id: work, .. } = made else {
+        panic!("no work: {made:?}")
+      };
+      let edited = ask(
+        state,
+        RequestBody::Edit {
+          work,
+          path: "/g".to_owned(),
+          at: 0,
+          delete_len: 0,
+          bytes: b"two".to_vec(),
+        },
+      );
+      assert!(!matches!(edited, ReplyBody::Refused { .. }), "{edited:?}");
+      (work, (record, parts), (green, head))
+    });
     let id = slates_wire::request::RequestId {
       client: TEST_CLIENT,
       sequence: 1_000,
     };
     let body = || crate::identities::authored(work, "pending");
-    let first = recorded_git_submit_as(state, id, body());
-    let unbuilt = count(state, crate::made_commit::MADE_UNBUILT);
-    let unmoved = state.db.partition().green_head(green) == head;
-    crate::test_store::rebuilt_after_takeover(state, (record, parts));
-    let again = recorded_git_submit_as(state, id, body());
-    let moved = state.db.partition().green_head(green) > head;
+    let first = Some(recorded_git_submit_as_awaited(id, body()).await);
+    let (unbuilt, unmoved) = on_state(|state| {
+      let unbuilt = count(state, crate::made_commit::MADE_UNBUILT);
+      let unmoved = state.db.partition().green_head(green) == head;
+      crate::test_store::rebuilt_after_takeover(state, (record, parts));
+      (unbuilt, unmoved)
+    });
+    let again = Some(recorded_git_submit_as_awaited(id, body()).await);
+    let moved = on_state(|state| state.db.partition().green_head(green) > head);
     (first, unbuilt, unmoved, again, moved)
   });
   let (first, unbuilt, unmoved, again, moved) = seen;

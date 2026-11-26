@@ -405,8 +405,7 @@ pub(crate) async fn imported_through_the_verb(
 const IMPORT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `history` run as a task on the first shard of a daemon keeping a store, its landed packs let go as production lets
-/// them go: what [`audit_on_stored_shard`] runs, with every store wait in it awaited, never the shard's thread held
-/// through one ([`SHARD_BLOCKING_ALLOWED`]).
+/// them go, with every store wait in it awaited, never the shard's thread held through one ([`SHARD_BLOCKING_ALLOWED`]).
 pub(crate) fn run_on_stored_shard<
   T: Send + 'static,
   F: std::future::Future<Output = T> + 'static,
@@ -493,29 +492,19 @@ pub(crate) fn create_adopting_on(
 /// [`allowing_shard_blocking`]; any other blocking call on a shard's thread is refused ([`refuse_on_a_shard`]).
 pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   Allowed {
-    fixture: "test_store::audit_on_stored_shard",
-    owner: "each history's (GAPS: svn 0, git 0, hg 0, other 33)",
-    reaching: 33,
-  },
-  Allowed {
     fixture: "test_store::create",
-    owner: "each caller's (GAPS: hg 4, other 8)",
-    reaching: 12,
+    owner: "each caller's (GAPS: hg 4, other 5)",
+    reaching: 9,
   },
   Allowed {
     fixture: "vcs_store::commits::home_and_land_blocking",
-    owner: "w-hg (vcs_store::commits::tests 6, vcs_store::upload::tests 1)",
-    reaching: 7,
+    owner: "w-hg (vcs_store::upload::tests 12, git_hooks::tests 2)",
+    reaching: 14,
   },
   Allowed {
     fixture: "repository::hg_push::land_stored",
     owner: "w-hg (vcs_ssh::tests::hg 2)",
     reaching: 2,
-  },
-  Allowed {
-    fixture: "repository::import::tests::served",
-    owner: "w-hg (repository::import::tests 1)",
-    reaching: 1,
   },
 ];
 
@@ -623,16 +612,7 @@ pub(crate) fn waiting_runtime() -> slates_rt::runtime::LocalRuntime {
   .expect("the waiting thread's runtime")
 }
 
-/// [`crate::daemon::audit_on_shard`] over a daemon holding a fresh [`TestStore`] named `name`: `history` runs on its
-/// shard; the daemon stops, dropping every handle, before the store goes (module docs).
-pub(crate) fn audit_on_stored_shard<T: Send + 'static>(
-  name: &str,
-  history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
-) -> T {
-  audit_on_stored_shard_configured(name, history, |_| {})
-}
-
-/// [`audit_on_stored_shard`] for a history that begins by making a repository: `asked` is made first, by `principal`, as
+/// A stored daemon's first shard for a history that begins by making a repository: `asked` is made first, by `principal`, as
 /// a client's creation is made, the test's thread waiting for its record ([`create_on`]); then `history` runs on the
 /// shard with the repository's id and its root green. The shard is never held through the creation's commit
 /// (docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md).
@@ -657,7 +637,7 @@ pub(crate) fn audit_on_stored_shard_made<T: Send + 'static>(
   answer
 }
 
-/// [`audit_on_stored_shard`] for a history that waits on nothing: run on a stored daemon's first shard with no
+/// A stored daemon's first shard for a history that waits on nothing: run on a stored daemon's first shard with no
 /// allowance, so a blocking helper it reached would be refused ([`refuse_on_a_shard`]) rather than hold the shard (main
 /// 01a20182's order of 2026-11-26, the shard-blocking allow-list: a history that only reads and sets the shard's state
 /// needs none).
@@ -692,30 +672,6 @@ pub(crate) fn audit_on_stored_shard_made_all<T: Send + 'static, const N: usize>(
   let made = asked.map(|asked| create_on(&daemon, 0, principal, asked));
   let answer = crate::daemon::observe_first(&daemon, move |state| history(state, made));
   daemon.stop();
-  drop(store);
-  answer
-}
-
-/// [`audit_on_stored_shard`] with the daemon's configuration changed by `configure` first
-/// ([`crate::daemon::audit_on_shard_configured`]).
-pub(crate) fn audit_on_stored_shard_configured<T: Send + 'static>(
-  name: &str,
-  history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
-  configure: impl FnOnce(&mut crate::DaemonConfig),
-) -> T {
-  let store = TestStore::start(name);
-  let handle = store.handle();
-  // Its landed packs let go as production lets them go (main's ruling A3 of 2026-11-26): a test whose point is
-  // residency keeps them by name ([`keep_landed`]).
-  let kept = move |state: &mut crate::state::ShardState| {
-    // A whole synchronous history on the shard, its creations and landings waited for on the shard's thread: allow-listed
-    // until each owner's histories move to `audit_on_stored_shard_made` or a task that awaits (SHARD_BLOCKING_ALLOWED).
-    allowing_shard_blocking("test_store::audit_on_stored_shard", || history(state))
-  };
-  let answer = crate::daemon::audit_on_shard_configured(kept, move |config| {
-    config.vcs_disk = Some(handle);
-    configure(config);
-  });
   drop(store);
   answer
 }

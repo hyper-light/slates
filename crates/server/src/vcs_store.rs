@@ -2677,7 +2677,7 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
 #[cfg(test)]
 thread_local! {
   /// Whether a push's commit keeps its landed pack resident on this shard (true: the guard's old behaviour): set by
-  /// `test_store::audit_on_stored_shard` for a synchronous history, whose reads are the store's own calls with no driver
+  /// `test_store::keep_landed` for a history whose point is residency, or whose reads are the store's own calls with no driver
   /// to bring a let-go window back, as the edges', the green build's and the rebuild's do.
   pub(crate) static KEEP_LANDED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }

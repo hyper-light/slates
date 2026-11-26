@@ -1549,35 +1549,10 @@ pub(crate) async fn push_through_awaited(
 }
 
 /// [`push_through`] with the push's whole map left to its build's task (A-664's live whole builds), as a push leaves it
-/// when it is answered: the build is under way, not driven.
-pub(crate) fn push_unsettled(
-  state: &mut ShardState,
-  (repository, green): (RepositoryId, DbVolumeId),
-  objects: &[Brought],
-  (base, head, tree_id): (Option<ObjectId>, ObjectId, ObjectId),
-) {
-  let push = begun(state, repository, objects);
-  let version = state.greens.get(&green).expect("the green's engine").head();
-  let built = work_of(state, (&push, green), (version, base), (head, tree_id));
-  let mut sealed = push.seal(state).expect("sealed");
-  let changes = vec![BranchChange::Update { green, work: built }];
-  let moves = [(Target::Green(green), Some(head))];
-  // Homed and landed first, as a client's edge carries a push (C5 part 2b: no record carries a push's objects).
-  let _ = crate::vcs_store::commits::home_and_land_blocking(state, &mut sealed);
-  crate::repository::push::push_sealed(
-    state,
-    (&owner(), repository),
-    changes,
-    EntryParts::default(),
-    (&mut sealed, &moves),
-  )
-  .expect("appended");
-  sealed.abandon(state);
-}
-
-/// [`push_unsettled`] from a task of the shard: its names and pack homed and landed by awaiting
+/// when it is answered (the build is under way, not driven), from a task of the shard: its names and pack homed and
+/// landed by awaiting
 /// (`vcs_store::commits::home_and_land`), never holding the shard through the store's commit.
-async fn push_unsettled_awaited(
+pub(crate) async fn push_unsettled_awaited(
   (repository, green): (RepositoryId, DbVolumeId),
   objects: &[Brought],
   (base, head, tree_id): (Option<ObjectId>, ObjectId, ObjectId),

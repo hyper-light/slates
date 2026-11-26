@@ -241,7 +241,7 @@ pub(crate) fn git_repository_on(daemon: &crate::Daemon, name: &str) -> Repositor
 }
 
 /// Runs `history` on a stored daemon's first shard ([`crate::test_store::audit_daemon_stored`], its landed packs kept
-/// resident as [`crate::test_store::audit_on_stored_shard`]'s are) with git repositories `names` made first from the
+/// resident by [`crate::test_store::keep_landed`]) with git repositories `names` made first from the
 /// test's thread ([`git_repository_on`]), never on the shard: their ids, in `names`' order. The shard is never held
 /// through a creation's commit (`test_store::SHARD_BLOCKING_ALLOWED`: w-hg's guard of 2026-11-25).
 pub(crate) fn on_stored_shard_with<T: Send + 'static, const N: usize>(

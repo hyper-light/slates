@@ -282,6 +282,12 @@ impl Watchdog {
       }
     );
     let turns: &'static Turns = Box::leak(Box::default());
+    // The thread that started the daemon, named in the end's line: libtest names each test's thread after its test, so an
+    // exit 4 in a test binary names its test, and a production daemon's names its own (main's ruling of 2026-11-26).
+    let started_on = std::thread::current()
+      .name()
+      .unwrap_or("an unnamed thread")
+      .to_owned();
     let handle = std::thread::Builder::new()
       .name("slates-watchdog".to_owned())
       .spawn(move || {
@@ -289,7 +295,7 @@ impl Watchdog {
           &segment,
           &holders,
           (&control, &stop_signal),
-          supervision,
+          (supervision, &started_on),
           (turns, cost, memory),
         )
       })?;
@@ -875,7 +881,7 @@ fn run(
   segment: &AnchorSegment,
   holders: &[SlotHolder],
   (control, stop): (&Receiver<()>, &Receiver<()>),
-  supervision: Supervision,
+  (supervision, started_on): (Supervision, &str),
   (turns, cost, memory): (
     &Turns,
     Result<slates_machine::build_cost::BuildCost, slates_machine::build_cost::BuildCostRefused>,
@@ -895,6 +901,11 @@ fn run(
   let mut looks: Vec<Option<Look>> = Vec::with_capacity(holders.len());
   let mut windows: Vec<u64> = Vec::with_capacity(holders.len());
   let mut verdicts: Vec<Option<(u16, Verdict)>> = Vec::with_capacity(holders.len());
+  // Each shard's major-fault count at the look its stillness is measured from ([`ShardWatch::still_after_ns`]), so the
+  // end names the faults over the window a wedge was judged in; and the count at the last look, that look's baseline.
+  let mut faults_from: Vec<Option<u64>> =
+    vec![slates_machine::bench::major_faults(); holders.len()];
+  let mut faults_before = slates_machine::bench::major_faults();
   loop {
     match stop.recv_timeout(std::time::Duration::from_nanos(HEARTBEAT_NS)) {
       Err(RecvTimeoutError::Timeout) => {}
@@ -906,6 +917,7 @@ fn run(
       control_ended = true;
     }
     let now = clock.monotonic_ns();
+    let faults_now = slates_machine::bench::major_faults();
     let late_ns = lateness.look(now);
     // How late this thread's own looks come, at their p99 (A-474): a gap they explain is no span it did not watch.
     let watcher_late_ns = lateness.p99_ns();
@@ -931,8 +943,13 @@ fn run(
         .zip(looks.drain(..))
         .zip(watches.iter_mut())
         .zip(&windows)
-        .map(|(((holder, look), watch), window_ns)| {
+        .zip(faults_from.iter_mut())
+        .map(|((((holder, look), watch), window_ns), faults)| {
           let (verdict, next) = watch.judge(look?, *window_ns, spin_window_ns(cost, *window_ns));
+          // Its stillness now measured from the last look: the faults counted then are its window's start.
+          if next.still_after_ns() != watch.still_after_ns() {
+            *faults = faults_before;
+          }
           *watch = next;
           Some((holder.shard(), verdict))
         }),
@@ -957,7 +974,18 @@ fn run(
           window_ns,
         ))
       });
-      end_process(cause, lateness.since_beat(false, late_ns), judged);
+      let faults = MajorFaults(
+        stuck_at
+          .and_then(|index| faults_from.get(index).copied().flatten())
+          .zip(faults_now)
+          .map(|(from, now)| now.saturating_sub(from)),
+      );
+      end_process(
+        cause,
+        lateness.since_beat(false, late_ns),
+        judged,
+        (faults, started_on),
+      );
     }
     for ((((found, said), watch), holder), window_ns) in verdicts
       .iter()
@@ -980,6 +1008,7 @@ fn run(
     count_turn(turns, turn, (&mut last_beat_ns, now), episode_late_ns);
     mark(segment, turn, now);
     say_control_ended(turn, stopping, &mut said_control_ended);
+    faults_before = faults_now;
   }
 }
 
@@ -1143,13 +1172,23 @@ fn verdict_lateness_ns(now_ns: u64, still_after_ns: u64, window_ns: u64) -> Opti
 /// one-second exit sleep, and turned the exit code into its own 66 (diag-g218-tsan-2, run 44217144677: exit 66 seen
 /// 27.4 s after the hold, where the verdict came at 1.09 s); the Unix end starts no thread, so it leaves none.
 ///
+/// The line also names, for a stuck shard, the process's major page faults over its window ([`MajorFaults`]: faults
+/// there name a page-in stall, none a block in the product), and for any end the thread that started the daemon, which
+/// libtest names after its test (main's ruling of 2026-11-26: an exit 4 in a test binary named no test).
+///
 /// `judged` is what the line names of a stuck shard: its verdict's lateness ([`verdict_lateness_ns`]) and the window it
 /// was judged by ([`watch_window_ns`], A-455); none for an ended control loop.
-fn end_process(cause: Cause, late_ns: u64, judged: Option<(Option<u64>, u64)>) -> ! {
+fn end_process(
+  cause: Cause,
+  late_ns: u64,
+  judged: Option<(Option<u64>, u64)>,
+  (faults, started_on): (MajorFaults, &str),
+) -> ! {
   let line = match cause {
     Cause::Stuck { shard, verdict } => format!(
       "slates daemon: no anchor reads the beat, so the watchdog ends the daemon's process (exit {FAILED_EXIT_CODE}): \
-       shard {shard} is {}, in {}; {}; the watchdog's looks ran at most {} us late since its last beat",
+       shard {shard} is {}, in {}; {}; the watchdog's looks ran at most {} us late since its last beat; {faults}; the \
+       daemon was started on thread {started_on}",
       describe(verdict, judged.map(|(_, window_ns)| window_ns)),
       polling_words(shard),
       judged.and_then(|(late, _)| late).map_or_else(
@@ -1163,7 +1202,7 @@ fn end_process(cause: Cause, late_ns: u64, judged: Option<(Option<u64>, u64)>) -
     ),
     Cause::ControlEnded => format!(
       "slates daemon: the control loop ended and no anchor restarts the daemon, so the watchdog ends its process \
-       (exit {FAILED_EXIT_CODE})"
+       (exit {FAILED_EXIT_CODE}); the daemon was started on thread {started_on}"
     ),
   };
   let end_ns = slates_machine::clock::monotonic_ns().saturating_add(HEARTBEAT_NS);
@@ -1271,6 +1310,38 @@ fn write_whole_on_windows(line: &[u8]) {
     left = left
       .get(usize::try_from(wrote).unwrap_or(usize::MAX)..)
       .unwrap_or_default();
+  }
+}
+
+/// The process's major page faults over a stuck shard's window, as the end's line names them
+/// (`slates_machine::bench::major_faults`'s change since the look its stillness is measured from): faults over the
+/// window name a page-in stall, none a block in the product (main's ruling of 2026-11-26). Written by its `Display`,
+/// so the end's one line is its one allocation.
+#[derive(Clone, Copy, Debug)]
+struct MajorFaults(Option<u64>);
+
+#[cfg(unix)]
+impl std::fmt::Display for MajorFaults {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self.0 {
+      Some(faults) => write!(
+        formatter,
+        "{faults} major page faults over its window (ru_majflt)"
+      ),
+      None => formatter.write_str(
+        "its window's major page faults not read (getrusage refused, or no shard was stuck)",
+      ),
+    }
+  }
+}
+
+/// [`MajorFaults`] where the platform counts none: Windows has no `ru_majflt`, and its `PageFaultCount` counts soft
+/// faults with hard ones, so the line says what it does not carry.
+#[cfg(not(unix))]
+impl std::fmt::Display for MajorFaults {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let MajorFaults(_none_here) = *self;
+    formatter.write_str("major page faults not counted on this platform (no ru_majflt)")
   }
 }
 

@@ -706,14 +706,15 @@ impl Repository {
   }
 
   /// Widens what its reads keep of the objects read lately (`packed::Recent`, git's delta base cache) for a walk that
-  /// opens up to `breadth` bytes of trees for one commit (the most one sent commit's trees came to so far, the first
-  /// commit's every tree): to the entries of a chain as deep as its learned depth ([`Repository::learned_depth`], its
-  /// deltas and its base) times `breadth`, so every tree's chain the walk reads between two revisions of one tree stays
-  /// whole, each revision no longer than the tree it leads to. The growth alone is charged to `admission`, a fetch's own
-  /// (main 01a20182's ruling of 2026-11-25: a fork a fetch reads through kept no cache, so every tree read rebuilt its
-  /// chain from its base, 78 deltas for a 13-tree chain). Sized for one tree's chain alone, git/git's clone hit it 6,702
-  /// times and applied 2,004,133 deltas (main's leg at 47de9566d): the directories read between two of one directory's
-  /// revisions put its chain out. Refused room, it stays as it is.
+  /// opens up to `breadth` bytes of trees for one commit (the most one sent commit's trees came to so far, which may
+  /// grow past the first commit's, since a later commit the walk reads can open more): to the entries of a chain as
+  /// deep as its learned depth ([`Repository::learned_depth`], its deltas and its base) times `breadth`, so every
+  /// tree's chain the walk reads between two revisions of one tree stays whole, each revision no longer than the tree
+  /// it leads to. The growth alone is charged to `admission`, a fetch's own (main 01a20182's ruling of 2026-11-25: a
+  /// fork a fetch reads through kept no cache, so every tree read rebuilt its chain from its base, 78 deltas for a
+  /// 13-tree chain). Sized for one tree's chain alone, git/git's clone hit it 6,702 times and applied 2,004,133 deltas
+  /// (main's leg at 47de9566d): the directories read between two of one directory's revisions put its chain out.
+  /// Refused room, it stays as it is.
   pub fn widen_read_cache(&self, breadth: u64, admission: &mut Admission) -> Widening {
     let wanted = self
       .learned_depth()
