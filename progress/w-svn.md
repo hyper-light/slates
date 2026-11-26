@@ -791,6 +791,7 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - 11-25 later: A-920 piece 3f 40d25e354 (Reaching phase; hold reuses reached applied; judge last 6 -> 2.7 ms). Debug: no step >5ms; largest check 4.6 (encode/sort), judge 4.0 (decide_first). Labelled release probe patch ~/.cache/w-svn/a920-release-probe-labelled.patch sent to main. Next: main's checkpoint_hold test (state the rule, not steps==chunks; red with shrunken quantum).
 - 11-25 later: checkpoint_hold test 4ffd245d7 (HOLD_UNITS_A_STEP test switch; pinned one unit a step; red reproduced 5 steps/4 chunks at two). Waiting: main's labelled release probe lines (svn-probe2) to decide which whole parts (encode 3.8, sort 3.4, decide_first 4.0 debug) matter in release.
 - 11-25 later: A-920 piece 3g af1ad8f8c (hold_begin/holding_step/hold_end; judge last 2.7 -> <1 ms debug; release was 1.32-1.52, the only step past 84a bar). Asked main to rerun labelled release probe; if all <1 ms, write A-920 close with debug+release tables.
+- 11-25 later: A-920 piece 3h 352866fca (resolution + decision sets released a unit a step; release judge 1,107 us step was the whole drop, 1.53 ms debug). Asked main to rerun labelled release probe; if all <1 ms, write A-920 close with debug+release tables.
 ## 2026-11-24 ~05:00: A-899 virtio-fs serves a work, 7416cae15
 - virtiofs attach ensure_slot; pass lends GreenTree via mounted_work::source/lend (one lend); A-898 park now reached.
 - Integration case a_guests_read_of_a_let_go_subversion_text_is_brought_back_and_answered (in-process seam, unix).
