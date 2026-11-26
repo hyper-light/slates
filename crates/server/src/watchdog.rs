@@ -1129,17 +1129,19 @@ fn verdict_lateness_ns(now_ns: u64, still_after_ns: u64, window_ns: u64) -> Opti
 ///
 /// The verdict is logged first, but the end never waits on the log for longer than one beat: a shard can be wedged in a
 /// write to a standard error nobody drains, and a watchdog that waited on that write would never end anything. So the
-/// line is written by a thread of its own, and written past the lock every other line of the process takes
-/// ([`write_end_line`]): a thread that holds that lock, starved while it writes or blocked in a write, cannot keep the
-/// verdict out of the log. Through the lock it was lost behind such a thread, the exit coming at the beat without it
-/// (main's 28-module run at loads 21 to 27, 2026-11-25; `a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_
-/// log_is_held` in `crates/client/tests/lone_daemon.rs` red 1 of 1 before, the line read after). A pipe nobody drains
-/// still blocks the write itself, which is what the beat bounds. The end joins the writer once it says the line is
-/// written, which it does as its last act, so the join returns at once; a writer still blocked after a beat cannot be
-/// joined, and the exit ends it, so the exit is its owner then. Joined, a written line leaves no thread that finished
-/// unjoined: ThreadSanitizer reported that one as a leak at the exit, after its own one-second exit sleep, and turned
-/// the exit code into its own 66 (diag-g218-tsan-2, run 44217144677: exit 66 seen 27.4 s after the hold, where the
-/// verdict came at 1.09 s).
+/// line is written by the watchdog's own thread, the one running as it judges, in parts each behind a wait for the
+/// descriptor to take it, bounded by what is left of the beat ([`write_end_line`]), then the process exits. It is
+/// written past the lock every other line of the process takes, so a thread that holds that lock, starved while it
+/// writes or blocked in a write, cannot keep the verdict out of the log (main's 28-module run at loads 21 to 27,
+/// 2026-11-25, exited 4 with no line; `a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_log_is_held` in
+/// `crates/client/tests/lone_daemon.rs`). And no other thread is started for it: a writer thread of its own, as before,
+/// was not scheduled within the beat at load 124 and the line was lost again, and one that cannot be started is
+/// skipped (`a_lone_daemons_wedged_shard_ends_it_with_its_verdict_when_no_thread_can_start`, Linux, new threads
+/// refused by `RLIMIT_NPROC`). Windows has no wait for a pipe's write side, so its arm still writes from a thread of its
+/// own within the beat, a writer still blocked then left to the exit. Before A-305's end line a written line joined from
+/// a thread left none finished unjoined: ThreadSanitizer reported such a one as a leak at the exit, after its own
+/// one-second exit sleep, and turned the exit code into its own 66 (diag-g218-tsan-2, run 44217144677: exit 66 seen
+/// 27.4 s after the hold, where the verdict came at 1.09 s); the Unix end starts no thread, so it leaves none.
 ///
 /// `judged` is what the line names of a stuck shard: its verdict's lateness ([`verdict_lateness_ns`]) and the window it
 /// was judged by ([`watch_window_ns`], A-455); none for an ended control loop.
@@ -1164,34 +1166,50 @@ fn end_process(cause: Cause, late_ns: u64, judged: Option<(Option<u64>, u64)>) -
        (exit {FAILED_EXIT_CODE})"
     ),
   };
-  let (written, logged) = channel::<()>();
-  let writer = std::thread::Builder::new()
-    .name("slates-watchdog-end".to_owned())
-    .spawn(move || {
-      write_end_line(format!("{line}\n").as_bytes());
-      let _ = written.send(());
-    });
-  if let Ok(writer) = writer
-    && logged
-      .recv_timeout(std::time::Duration::from_nanos(HEARTBEAT_NS))
-      .is_ok()
-  {
-    // The line is written and the writer's last act is done; its end is all that is left to wait for.
-    let _ = writer.join();
-  }
+  let end_ns = slates_machine::clock::monotonic_ns().saturating_add(HEARTBEAT_NS);
+  write_end_line(format!("{line}\n").as_bytes(), end_ns);
   std::process::exit(i32::from(FAILED_EXIT_CODE))
 }
 
-/// Writes `line` to standard error's descriptor with the system's own write, a part at a time until it is all written or
-/// a write is refused, never through the lock `std`'s handle takes for every other line of the process ([`end_process`]):
-/// the end's line must not wait on a thread that holds that lock. A refused write drops the rest; the process is ending.
+/// Writes `line` to standard error's descriptor from the calling thread, the watchdog's own, until it is all written or
+/// the monotonic clock reaches `end_ns` ([`end_process`]). Each part waits for the descriptor to take a write
+/// (`poll` for `POLLOUT`, its timeout what is left until `end_ns`, an interrupted wait taken again) and is at most
+/// `PIPE_BUF` bytes, which a pipe that reports room takes without blocking. So a reader that has stopped draining
+/// cannot hold the end past `end_ns`, and no thread of another's need be scheduled for the line to be written. The
+/// write is the system's own, never through the lock `std`'s handle takes for every other line of the process. A
+/// refused or timed-out write drops the rest; the process is ending.
 #[cfg(unix)]
-fn write_end_line(line: &[u8]) {
+fn write_end_line(line: &[u8], end_ns: u64) {
+  use rustix::event::{PollFd, PollFlags, poll};
   use std::os::fd::AsFd;
   let stderr = std::io::stderr();
   let mut left = line;
   while !left.is_empty() {
-    match rustix::io::write(stderr.as_fd(), left) {
+    let wait_ns = end_ns.saturating_sub(slates_machine::clock::monotonic_ns());
+    if wait_ns == 0 {
+      return;
+    }
+    let Ok(timeout) = rustix::event::Timespec::try_from(std::time::Duration::from_nanos(wait_ns))
+    else {
+      return;
+    };
+    let mut ready = [PollFd::new(&stderr, PollFlags::OUT)];
+    match poll(&mut ready, Some(&timeout)) {
+      Ok(0) => return,
+      Ok(_) => {}
+      Err(rustix::io::Errno::INTR) => continue,
+      Err(_) => return,
+    }
+    if !ready
+      .first()
+      .is_some_and(|ready| ready.revents().contains(PollFlags::OUT))
+    {
+      return;
+    }
+    let part = left
+      .get(..left.len().min(rustix::pipe::PIPE_BUF))
+      .unwrap_or(left);
+    match rustix::io::write(stderr.as_fd(), part) {
       Ok(0) => return,
       Ok(wrote) => left = left.get(wrote..).unwrap_or_default(),
       Err(rustix::io::Errno::INTR) => {}
@@ -1200,9 +1218,34 @@ fn write_end_line(line: &[u8]) {
   }
 }
 
-/// [`write_end_line`] on Windows: `WriteFile` to the process's standard error handle, a part at a time.
+/// [`write_end_line`] on Windows, which has no wait for a pipe's write side to take bytes: the line is written with
+/// `WriteFile` to the standard error handle, past `std`'s lock, by a thread of its own, waited for until `end_ns` and
+/// joined once it says the line is written; a writer still blocked then cannot be joined, and the exit ends it. Unlike
+/// Unix's arm, a thread that cannot be started or scheduled before `end_ns` costs the line.
 #[cfg(windows)]
-fn write_end_line(line: &[u8]) {
+fn write_end_line(line: &[u8], end_ns: u64) {
+  let line = line.to_vec();
+  let (written, logged) = channel::<()>();
+  let writer = std::thread::Builder::new()
+    .name("slates-watchdog-end".to_owned())
+    .spawn(move || {
+      write_whole_on_windows(&line);
+      let _ = written.send(());
+    });
+  let wait_ns = end_ns.saturating_sub(slates_machine::clock::monotonic_ns());
+  if let Ok(writer) = writer
+    && logged
+      .recv_timeout(std::time::Duration::from_nanos(wait_ns))
+      .is_ok()
+  {
+    // The line is written and the writer's last act is done; its end is all that is left to wait for.
+    let _ = writer.join();
+  }
+}
+
+/// `WriteFile` of `line` to the process's standard error handle, a part at a time, until it is written or refused.
+#[cfg(windows)]
+fn write_whole_on_windows(line: &[u8]) {
   use std::os::windows::io::AsRawHandle;
   use windows_sys::Win32::Storage::FileSystem::WriteFile;
   let stderr = std::io::stderr();

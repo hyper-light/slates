@@ -10258,7 +10258,9 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > `a_routed_thread_never_waits_on_standard_error_and_a_full_queue_refuses` (`crates/machine/src/log.rs`). Since
 > 2026-11-25 the watchdog's end line is written past that lock as well (`watchdog::write_end_line`, the system's own
 > write), so a thread holding it no longer costs the verdict of an exit 4
-> (`a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_log_is_held`).
+> (`a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_log_is_held`), and on Unix by the watchdog's own
+> thread within the beat, behind `poll` for `POLLOUT`, so the end waits on no thread being started or scheduled
+> (`a_lone_daemons_wedged_shard_ends_it_with_its_verdict_when_no_thread_can_start`, Linux).
 
 > **Status (2026-11-18, A-308): a wedge is judged only over a window the watchdog watched.** The rule calls a shard
 > wedged once a window passed with no CPU progress and never seen runnable, and "never seen" is sampled at each look. A
@@ -32172,6 +32174,15 @@ shard routed, stopped after them).
   `a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_log_is_held` (`crates/client/tests/lone_daemon.rs`,
   the lock held for good from the wedge) exited 4 without the line, 1 of 1, before; the line is read after. A pipe
   nobody drains still blocks the write itself, which the beat bounds.
+- **The end's line from the watchdog's own thread (2026-11-25, main's ruling after the line was lost at load 124).**
+  The writer thread was not scheduled within its beat at load 124, and the line was lost again (w-hg's guarded run,
+  `~/.cache/w-hg-logs/2026-11-25-guarded-modules-exit4-b.log`); a writer that could not be spawned was skipped. So on
+  Unix the watchdog's own thread, already running as it judges, writes the line in parts of at most `PIPE_BUF` bytes,
+  each behind `poll` for `POLLOUT` bounded by what is left of the beat (an interrupted wait or write taken again), and
+  then exits: no thread is started for it. Red where it is deterministic:
+  `a_lone_daemons_wedged_shard_ends_it_with_its_verdict_when_no_thread_can_start` (Linux, new threads refused by
+  `RLIMIT_NPROC` from just after the wedge). Windows has no wait for a pipe's write side, so its arm keeps a writer
+  thread bounded by the same beat.
 
 ### A-308 — The watchdog judges a wedge only over a window it watched (2026-11-18, goal g251: every open slates bug fixed)
 Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 entry), `crates/server/src/watchdog.rs`
