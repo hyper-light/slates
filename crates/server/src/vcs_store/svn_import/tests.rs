@@ -1084,6 +1084,141 @@ fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shar
   );
 }
 
+/// A format-2 dump whose revision 1 adds the directory `trunk` and `files` files `trunk/f0`.. of about `size` bytes, and
+/// whose later revisions are `later`'s node records, one revision each (revision 2 the first).
+fn wide_trunk(files: usize, size: usize, later: &[String]) -> Vec<u8> {
+  let section = |number: usize| {
+    let date = format!("2026-11-24T00:00:00.{number:06}Z");
+    let log = format!("r{number}");
+    format!(
+      "K 10\nsvn:author\nV 5\nalice\nK 8\nsvn:date\nV {}\n{date}\nK 7\nsvn:log\nV {}\n{log}\nPROPS-END\n",
+      date.len(),
+      log.len()
+    )
+  };
+  let revision = |number: usize, nodes: &str| {
+    let props = section(number);
+    format!(
+      "Revision-number: {number}\nProp-content-length: {0}\nContent-length: {0}\n\n{props}\n{nodes}",
+      props.len()
+    )
+  };
+  let zero = "K 8\nsvn:date\nV 27\n2026-11-24T00:00:00.000000Z\nPROPS-END\n";
+  let mut dump = format!(
+    "SVN-fs-dump-format-version: 2\n\nUUID: 00000000-0000-4000-8000-000000000894\n\nRevision-number: 0\n\
+     Prop-content-length: {0}\nContent-length: {0}\n\n{zero}\n",
+    zero.len()
+  );
+  let mut first = String::from(
+    "Node-path: trunk\nNode-kind: dir\nNode-action: add\nProp-content-length: 10\nContent-length: 10\n\nPROPS-END\n\n",
+  );
+  for file in 0..files {
+    let line = format!("1:{file:05}\n");
+    let text: String = line.repeat(size / line.len());
+    first.push_str(&format!(
+      "Node-path: trunk/f{file}\nNode-kind: file\nNode-action: add\nProp-content-length: 10\n\
+       Text-content-length: {}\nContent-length: {}\n\nPROPS-END\n{text}\n\n",
+      text.len(),
+      text.len().saturating_add(10)
+    ));
+  }
+  dump.push_str(&revision(1, &first));
+  for (at, nodes) in later.iter().enumerate() {
+    dump.push_str(&revision(at.saturating_add(2), nodes));
+  }
+  dump.into_bytes()
+}
+
+/// A dump record copying directory `from` at revision `rev` to `to`.
+fn copied_dir(to: &str, (from, rev): (&str, u64)) -> String {
+  format!(
+    "Node-path: {to}\nNode-kind: dir\nNode-action: add\nNode-copyfrom-rev: {rev}\nNode-copyfrom-path: {from}\n\n"
+  )
+}
+
+/// `dump` imported on a store-backed shard: its youngest revision, the shard's longest step and its window, and the
+/// copies the green grafted (`Green::copies_grafted`).
+fn imported_whole_and_stepped(
+  name: &'static str,
+  dump: Vec<u8>,
+) -> (Result<u64, String>, u64, u64, u64) {
+  let read = stored(move || async move {
+    let (svn, green) = subversion(name).await;
+    let (loaded, _turns) = imported(svn, dump).await;
+    let grafted = on(|state| {
+      state
+        .greens
+        .get(&green)
+        .map_or(0, |engine| engine.copies_grafted())
+    });
+    let shard = slates_rt::registry::current_shard().expect("on a shard");
+    let longest_ns = slates_rt::registry::with_entry(shard, |entry| entry.pulse.longest_step_ns())
+      .expect("the shard's entry");
+    (
+      loaded
+        .map(|loaded| loaded.youngest)
+        .map_err(|failed| format!("{failed:?}")),
+      longest_ns,
+      crate::watchdog::own_window_ns(),
+      grafted,
+    )
+  });
+  // Every run shows its numbers, so a probe judges each against the 1 ms bar.
+  eprintln!(
+    "{name}: youngest {:?}, the longest step {} us of a window of {} us, {} copies grafted",
+    read.0,
+    read.1 / 1000,
+    read.2 / 1000,
+    read.3
+  );
+  read
+}
+
+/// Goal 93 (main's order of 2026-11-26 after probe 8: no fixture copied or moved a wide tree, so the commit's copies
+/// and node moves never ran wide). Do: import [`wide_trunk`]'s revision 1 adding `trunk` and [`WIDE_REVISION_FILES`]
+/// files of [`WIDE_TEXT_BYTES`] under it, and a revision 2 copying `trunk` at revision 1 to `branch`. Expect the import
+/// whole, a copy grafted (`Green::copies_grafted`), and the shard's longest step under its watchdog window.
+#[test]
+fn t_a920_a_revision_copying_a_tree_of_thousands_of_files_imports_with_every_step_under_the_shards_window()
+ {
+  let dump = wide_trunk(
+    WIDE_REVISION_FILES,
+    WIDE_TEXT_BYTES,
+    &[copied_dir("branch", ("trunk", 1))],
+  );
+  let (loaded, longest_ns, window_ns, grafted) = imported_whole_and_stepped("wide-copy", dump);
+  assert_eq!(loaded, Ok(2));
+  assert!(grafted > 0, "no copy grafted");
+  assert!(
+    longest_ns < window_ns,
+    "a step of {longest_ns} ns against the shard's window of {window_ns} ns"
+  );
+}
+
+/// Goal 93 (as the copy's test). Do: import [`wide_trunk`]'s revision 1, a revision 2 copying `trunk` to `branch`, and
+/// a revision 3 moving `trunk` to `moved` (a copy of `trunk` at revision 2, then its delete). Expect the import whole,
+/// both copies grafted, and the shard's longest step under its watchdog window.
+#[test]
+fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step_under_the_shards_window()
+ {
+  let moved = format!(
+    "{}Node-path: trunk\nNode-action: delete\n\n",
+    copied_dir("moved", ("trunk", 2))
+  );
+  let dump = wide_trunk(
+    WIDE_REVISION_FILES,
+    WIDE_TEXT_BYTES,
+    &[copied_dir("branch", ("trunk", 1)), moved],
+  );
+  let (loaded, longest_ns, window_ns, grafted) = imported_whole_and_stepped("wide-move", dump);
+  assert_eq!(loaded, Ok(3));
+  assert!(grafted >= 2, "{grafted} copies grafted");
+  assert!(
+    longest_ns < window_ns,
+    "a step of {longest_ns} ns against the shard's window of {window_ns} ns"
+  );
+}
+
 /// Shape: the texts-bound red's rewritten file's bytes, and how many rewrites: each rewrite under the batch's texts
 /// bound (`staging::texts_bound`, 2 MiB on a 16 KiB page), together many times it.
 pub(crate) const BOUNDED_REWRITE_BYTES: usize = 256 << 10;
