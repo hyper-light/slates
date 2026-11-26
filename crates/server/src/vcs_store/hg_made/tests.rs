@@ -6,16 +6,14 @@ use slates_hg::index::Log;
 use slates_hg::manifest::Flag;
 use slates_hg::push::held::IndexHeld;
 use slates_hg::push::made::{Authored, Change, made};
-use slates_hg::push::{Asks, Taken, Unbundle};
 use slates_hg::{Admission, NULL_NODE, Node};
 use slates_ipc::protocol::{ObjectFormat, ReplyBody, RequestBody, VcsTool};
 
 use super::{MADE, head_of};
+use crate::repository::hg_push::line_name;
 use crate::repository::hg_push::tests::{Made, changegroup};
-use crate::repository::hg_push::{land_in, line_name, take_whole};
 use crate::state::ShardState;
 use crate::vcs_store::paths::tests::{create, submitted_recorded};
-use crate::verbs::to_db_volume;
 
 /// Shape: how long a test waits for a shard's task (a rebuild) to end before it fails, as the import tests wait.
 const TASK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -27,30 +25,12 @@ fn owner() -> Principal {
   }
 }
 
-/// A Mercurial repository `name`, its first line `default`'s: its id and the line's green.
-fn mercurial(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId) {
-  let reply = crate::test_store::create(
-    state,
-    &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool: VcsTool::Mercurial,
-      format: ObjectFormat::Sha1,
-      default_branch: line_name(b"default", 0),
-      green: None,
-    },
-  );
-  let ReplyBody::GreenCreated { id } = reply else {
-    panic!("no repository: {reply:?}")
-  };
-  let repository = state
-    .db
-    .partition()
-    .repositories()
-    .repository_named(name)
-    .unwrap()
-    .id;
-  (repository, to_db_volume(id))
+/// A Mercurial repository `name` on `daemon`'s first shard, its first line `default`'s, made as a client's creation is
+/// made while this thread waits for its record (`test_store::create_on`), never the shard: its id and the line's green.
+fn mercurial_on(daemon: &crate::Daemon, name: &str) -> (RepositoryId, DbVolumeId) {
+  let line = line_name(b"default", 0);
+  let asked = (name, VcsTool::Mercurial, ObjectFormat::Sha1, line.as_str());
+  crate::test_store::create_on(daemon, 0, &owner(), asked)
 }
 
 /// The first parent of changeset `node` in the repository's index.
@@ -64,8 +44,9 @@ fn parent_of(state: &ShardState, repository: RepositoryId, node: &Node) -> Optio
   }
 }
 
-/// A client's push of a changeset adding `pushed.txt` over `parent`: its node, landed as the driver lands it.
-fn push_on(state: &mut ShardState, repository: RepositoryId, parent: Node) -> Node {
+/// A client's changeset adding `pushed.txt` over `parent`, made over repository `repository`'s index as stock 7.2's
+/// client would commit it: the changeset, its manifest and its file revision.
+fn pushed_made(state: &mut ShardState, repository: RepositoryId, parent: Node) -> Made {
   let verified = crate::vcs_store::lent_state(state, |state| {
     let (content, store) = state.vcs_stores.mercurial_ref(repository).unwrap();
     let authored = Authored {
@@ -90,42 +71,30 @@ fn push_on(state: &mut ShardState, repository: RepositoryId, parent: Node) -> No
   });
   let (changeset, manifest) = (&verified.changesets[0], &verified.manifests[0]);
   let (path, files) = &verified.files[0];
-  let one = Made {
+  Made {
     node: changeset.node,
     p1: changeset.p1,
     text: changeset.text.clone(),
     manifest: (manifest.node, manifest.p1, manifest.text.clone()),
     file: (path.clone(), files[0].node, files[0].text.clone()),
-  };
-  let unbundle = Unbundle {
-    parts: vec![Taken {
-      id: 0,
-      mandatory: true,
-      asks: Asks::Changegroup(changegroup(&[one], &[0])),
-    }],
-  };
-  let (_, part) = unbundle.changegroup().unwrap();
-  let forked = take_whole(
-    state,
-    repository,
-    (part.version, part.payload.clone()),
-    &mut Admission::new(u64::MAX),
-  )
-  .unwrap()
-  .unwrap();
-  let landed = land_in(
-    state,
-    repository,
-    (&owner(), b"pushed"),
-    &unbundle,
-    Some(forked),
-    &mut Admission::new(u64::MAX),
+  }
+}
+
+/// A client's push of [`pushed_made`]'s changeset over `parent` to repository `repository` on `daemon`'s first shard,
+/// through the daemon's driver from a task there (`hg_push::tests::pushed_changegroup`): its node.
+fn push_on(daemon: &crate::Daemon, repository: RepositoryId, parent: Node) -> Node {
+  let one =
+    crate::daemon::observe_first(daemon, move |state| pushed_made(state, repository, parent));
+  let node = one.node;
+  crate::test_store::run_on_first(
+    daemon,
+    move || async move {
+      let part = changegroup(&[one], &[0]);
+      crate::repository::hg_push::tests::pushed_changegroup(repository, part).await;
+    },
+    TASK_WAIT,
   );
-  assert!(
-    matches!(landed, Some(slates_hg::push::Outcome::Accepted(_))),
-    "{landed:?}"
-  );
-  changeset.node
+  node
 }
 
 /// Waits until `daemon`'s first shard has made `count` changesets of submitted versions: a made changeset lands on the
@@ -157,17 +126,20 @@ fn made_reaches(daemon: &crate::Daemon, count: u64) {
 #[test]
 fn t_a731_a_submitted_version_is_the_changeset_the_server_makes() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (repository, green) = crate::daemon::observe_first(&daemon, |state| {
-    let (repository, green) = mercurial(state, "made");
+  let (repository, green) = mercurial_on(&daemon, "made");
+  let (repository, green) = crate::daemon::observe_first(&daemon, move |state| {
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
     submitted_recorded(state, ipc_green, 1, vec![create("a.txt", b"alpha\n")]);
     (repository, green)
   });
   made_reaches(&daemon, 1);
-  let (first, pushed) = crate::daemon::observe_first(&daemon, move |state| {
+  let first = crate::daemon::observe_first(&daemon, move |state| {
     let first = head_of(state, green).expect("the submit made a changeset");
     assert_eq!(parent_of(state, repository, &first), Some(NULL_NODE));
-    let pushed = push_on(state, repository, first);
+    first
+  });
+  let pushed = push_on(&daemon, repository, first);
+  let (first, pushed) = crate::daemon::observe_first(&daemon, move |state| {
     assert_eq!(
       head_of(state, green),
       Some(pushed),
@@ -231,8 +203,8 @@ fn t_a731_a_copy_a_work_declares_is_a_copy_in_the_made_changeset() {
   use crate::vcs_store::paths::tests::Op;
   use slates_ipc::protocol::WorkOp;
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (repository, green) = crate::daemon::observe_first(&daemon, |state| {
-    let (repository, green) = mercurial(state, "copied");
+  let (repository, green) = mercurial_on(&daemon, "copied");
+  let (repository, green) = crate::daemon::observe_first(&daemon, move |state| {
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
     submitted_recorded(state, ipc_green, 1, vec![create("a.txt", b"alpha\n")]);
     (repository, green)
@@ -359,8 +331,8 @@ fn a_mercurial_made_changeset_is_answered_only_after_its_one_step() {
     client: 7,
     sequence: 1,
   };
+  let (_, green) = mercurial_on(&daemon, "deferred");
   let (green, in_the_step) = crate::daemon::observe_first(&daemon, move |state| {
-    let (_, green) = mercurial(state, "deferred");
     let work = hg_work(state, green, ("deferred-work", "a.txt", b"alpha\n"));
     crate::verbs::run_recorded_for_test(
       state,
@@ -396,8 +368,8 @@ fn a_mercurial_submit_meeting_its_repositorys_turn_held_waits_and_commits_once_i
     client: 7,
     sequence: 1,
   };
+  let (repository, green) = mercurial_on(&daemon, "turn-held");
   let (green, while_held) = crate::daemon::observe_first(&daemon, move |state| {
-    let (repository, green) = mercurial(state, "turn-held");
     let work = hg_work(state, green, ("turn-work", "a.txt", b"alpha\n"));
     let held = crate::repository::svn_commit::landing::Turn::take_now(state, repository);
     crate::verbs::run_recorded_for_test(
@@ -469,8 +441,8 @@ fn a_changeset_made_over_a_parent_let_go_reads_its_texts_from_the_store() {
     client: 7,
     sequence: 2,
   };
+  let (repository, green) = mercurial_on(&daemon, "parent-let-go");
   let (repository, green) = crate::daemon::observe_first(&daemon, move |state| {
-    let (repository, green) = mercurial(state, "parent-let-go");
     let work = hg_work(state, green, ("first-work", "a.txt", b"alpha\n"));
     crate::verbs::run_recorded_for_test(
       state,
@@ -539,8 +511,8 @@ fn a_second_deferred_submit_to_a_mercurial_green_makes_its_changeset() {
     client: 7,
     sequence,
   });
+  let (repository, green) = mercurial_on(&daemon, "second-deferred");
   let (repository, green) = crate::daemon::observe_first(&daemon, move |state| {
-    let (repository, green) = mercurial(state, "second-deferred");
     let work = hg_work(state, green, ("first-deferred", "a.txt", b"alpha\n"));
     crate::verbs::run_recorded_for_test(
       state,
@@ -590,8 +562,8 @@ fn deferred_submit(name: &'static str, fault: super::Fault) -> (bool, u64, bool)
     client: 7,
     sequence: 1,
   };
+  let (_, green) = mercurial_on(&daemon, name);
   let green = crate::daemon::observe_first(&daemon, move |state| {
-    let (_, green) = mercurial(state, name);
     let work = hg_work(state, green, (name, "a.txt", b"alpha\n"));
     super::TEST_FAULT.with(|set| set.set(Some(fault)));
     crate::verbs::run_recorded_for_test(
@@ -661,8 +633,8 @@ fn a_deferred_submit_whose_record_is_refused_commits_no_version_alone() {
 #[test]
 fn a_bare_submit_to_a_mercurial_green_is_refused_recorded_submit_required() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (reply, alone, head) = crate::daemon::observe_first(&daemon, |state| {
-    let (_, green) = mercurial(state, "bare-refused");
+  let (_, green) = mercurial_on(&daemon, "bare-refused");
+  let (reply, alone, head) = crate::daemon::observe_first(&daemon, move |state| {
     let work = hg_work(state, green, ("bare-refused", "a.txt", b"alpha\n"));
     let reply =
       crate::vcs_store::paths::tests::ask(state, crate::identities::authored(work, "made"));
@@ -684,4 +656,88 @@ fn a_bare_submit_to_a_mercurial_green_is_refused_recorded_submit_required() {
   );
   assert!(!alone);
   assert_eq!(head, (0, None), "nothing committed, nothing made");
+}
+
+std::thread_local! {
+  /// The made changeset [`a_made_changeset_whose_store_refused_its_intake_is_refused_in_the_stores_words`] makes in one
+  /// observation and takes in a task after, on the same shard's thread: a made changeset is no value an observation can
+  /// copy.
+  static MADE_HERE: core::cell::RefCell<Option<super::Made>> = const { core::cell::RefCell::new(None) };
+}
+
+/// A-731 (docs/bugs/2026-11-25-a-made-changeset-over-a-let-go-parent-was-never-made.md, main's ruling of 2026-11-25:
+/// a refusal named for its cause). Do: on a running daemon holding a changeset store, submit `a.txt` to a Mercurial
+/// repository's line and wait for its changeset; make the next changeset over it, changing `a.txt`, as the made commit's
+/// task makes one, while the parent's texts are at hand; let go every object the repository's changelog and manifest
+/// rows name; stop the store's owner; then take the made changeset's changegroup through the push's intake from a task,
+/// as the made commit's task does (`taken`). Expect the take refused in the store's own words, the owner gone
+/// (`Unmade::Store(Owner(Gone))`), its intake having asked the store for the parent manifest it was let go of. Red
+/// before: `NotHead`, the intake abandoned when its want of the store went unanswered.
+#[test]
+fn a_made_changeset_whose_store_refused_its_intake_is_refused_in_the_stores_words() {
+  let (mut store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, green) = mercurial_on(&daemon, "store-refused");
+  let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+  crate::daemon::observe_first(&daemon, move |state| {
+    submitted_recorded(state, ipc_green, 1, vec![create("a.txt", b"alpha\n")]);
+  });
+  made_reaches(&daemon, 1);
+  let let_go = crate::daemon::observe_first(&daemon, move |state| {
+    let parent = head_of(state, green).expect("the first submit's changeset");
+    let verified = crate::vcs_store::lent_state(state, |state| {
+      let (content, held) = state.vcs_stores.mercurial_ref(repository).unwrap();
+      let authored = Authored {
+        user: b"Agent <a@example.com>",
+        seconds: 2,
+        branch: b"default",
+        message: b"second",
+      };
+      let change = [Change {
+        path: b"a.txt",
+        after: Some((b"beta\n", Flag::Regular)),
+        copied_from: None,
+      }];
+      made(
+        &IndexHeld::new(&held.index, content),
+        parent,
+        &change,
+        &authored,
+        &mut Admission::new(u64::MAX),
+      )
+      .unwrap()
+    });
+    let made = super::Made {
+      repository,
+      green,
+      version: 2,
+      verified,
+    };
+    MADE_HERE.with(|here| here.replace(Some(made)));
+    let_go_logs_here(state, repository)
+  });
+  assert!(let_go > 0, "the parent's logs let go");
+  store.stop_owner();
+  let (sent, answer) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |_| {
+    let task = slates_rt::futures::spawn(async move {
+      let made = MADE_HERE
+        .with(core::cell::RefCell::take)
+        .expect("the made changeset");
+      let taken = super::taken(&made).await.map(|taken| taken.map(|_| ()));
+      let _ = sent.send(taken);
+    })
+    .expect("the take's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let taken = answer.recv_timeout(TASK_WAIT).expect("the take answered");
+  daemon.stop();
+  assert!(
+    matches!(
+      taken,
+      Some(Err(super::Unmade::Store(
+        crate::vcs_store::hg_view::StoreUnanswered::Owner(slates_store::owner::OwnerError::Gone)
+      )))
+    ),
+    "the take refused in the store's own words: {taken:?}"
+  );
 }
