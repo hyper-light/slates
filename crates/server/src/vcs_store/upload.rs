@@ -1253,20 +1253,36 @@ impl ShardPacks {
   fn count_on(&self, state: &mut ShardState) {
     count_deflaters(state);
     count_units(state);
-    state.count_max(UNIT_ENTRIES_MOST, self.chose.entries_most);
-    state.count_max(TREE_PARSE_BYTES_MOST, self.chose.tree_bytes_most);
-    state.count_max(TREE_DELTAS_MOST, self.chose.tree_deltas_most);
-    state.count_max(READ_CACHE_BUDGET_MOST, self.chose.read_cache_budget_most);
+    // Each field named, so one added to `PositionCounts` fails to build until it is told here (as in `chose`).
+    let slates_git::store::PositionCounts {
+      lookups,
+      hits,
+      conflicts,
+      unroomed,
+      entries_most,
+      tree_bytes_most,
+      tree_deltas_most,
+      tree_deltas,
+      tree_deltas_past_one,
+      read_cache_hits,
+      read_cache_widened,
+      read_cache_refused,
+      read_cache_budget_most,
+    } = self.chose;
+    state.count_max(UNIT_ENTRIES_MOST, entries_most);
+    state.count_max(TREE_PARSE_BYTES_MOST, tree_bytes_most);
+    state.count_max(TREE_DELTAS_MOST, tree_deltas_most);
+    state.count_max(READ_CACHE_BUDGET_MOST, read_cache_budget_most);
     for (name, by) in [
-      (POSITION_LOOKUPS, self.chose.lookups),
-      (POSITION_CACHE_HITS, self.chose.hits),
-      (POSITION_CACHE_CONFLICTS, self.chose.conflicts),
-      (POSITION_CACHE_UNROOMED, self.chose.unroomed),
-      (TREE_DELTAS, self.chose.tree_deltas),
-      (TREE_DELTAS_PAST_ONE, self.chose.tree_deltas_past_one),
-      (READ_CACHE_HITS, self.chose.read_cache_hits),
-      (READ_CACHE_WIDENED, self.chose.read_cache_widened),
-      (READ_CACHE_REFUSED, self.chose.read_cache_refused),
+      (POSITION_LOOKUPS, lookups),
+      (POSITION_CACHE_HITS, hits),
+      (POSITION_CACHE_CONFLICTS, conflicts),
+      (POSITION_CACHE_UNROOMED, unroomed),
+      (TREE_DELTAS, tree_deltas),
+      (TREE_DELTAS_PAST_ONE, tree_deltas_past_one),
+      (READ_CACHE_HITS, read_cache_hits),
+      (READ_CACHE_WIDENED, read_cache_widened),
+      (READ_CACHE_REFUSED, read_cache_refused),
     ] {
       if by > 0 {
         state.count(name, by);
@@ -1349,31 +1365,46 @@ impl PackSource for ShardPacks {
     written
   }
 
+  /// Adds a walk's `counts` to the step's: each field named, so a field added to `PositionCounts` fails to build until
+  /// it is summed here (`tree_deltas_past_one` was left out once, and the fetch counted 0 whatever the store counted).
   fn chose(&mut self, counts: slates_git::store::PositionCounts) {
-    self.chose.lookups = self.chose.lookups.saturating_add(counts.lookups);
-    self.chose.hits = self.chose.hits.saturating_add(counts.hits);
-    self.chose.conflicts = self.chose.conflicts.saturating_add(counts.conflicts);
-    self.chose.entries_most = self.chose.entries_most.max(counts.entries_most);
-    self.chose.tree_bytes_most = self.chose.tree_bytes_most.max(counts.tree_bytes_most);
-    self.chose.tree_deltas_most = self.chose.tree_deltas_most.max(counts.tree_deltas_most);
-    self.chose.tree_deltas = self.chose.tree_deltas.saturating_add(counts.tree_deltas);
-    self.chose.read_cache_hits = self
-      .chose
-      .read_cache_hits
-      .saturating_add(counts.read_cache_hits);
-    self.chose.read_cache_widened = self
-      .chose
-      .read_cache_widened
-      .saturating_add(counts.read_cache_widened);
-    self.chose.read_cache_refused = self
-      .chose
-      .read_cache_refused
-      .saturating_add(counts.read_cache_refused);
-    self.chose.read_cache_budget_most = self
-      .chose
-      .read_cache_budget_most
-      .max(counts.read_cache_budget_most);
-    self.chose.unroomed = self.chose.unroomed.saturating_add(counts.unroomed);
+    let slates_git::store::PositionCounts {
+      lookups,
+      hits,
+      conflicts,
+      unroomed,
+      entries_most,
+      tree_bytes_most,
+      tree_deltas_most,
+      tree_deltas,
+      tree_deltas_past_one,
+      read_cache_hits,
+      read_cache_widened,
+      read_cache_refused,
+      read_cache_budget_most,
+    } = counts;
+    let chose = &mut self.chose;
+    for (sum, by) in [
+      (&mut chose.lookups, lookups),
+      (&mut chose.hits, hits),
+      (&mut chose.conflicts, conflicts),
+      (&mut chose.unroomed, unroomed),
+      (&mut chose.tree_deltas, tree_deltas),
+      (&mut chose.tree_deltas_past_one, tree_deltas_past_one),
+      (&mut chose.read_cache_hits, read_cache_hits),
+      (&mut chose.read_cache_widened, read_cache_widened),
+      (&mut chose.read_cache_refused, read_cache_refused),
+    ] {
+      *sum = sum.saturating_add(by);
+    }
+    for (most, of) in [
+      (&mut chose.entries_most, entries_most),
+      (&mut chose.tree_bytes_most, tree_bytes_most),
+      (&mut chose.tree_deltas_most, tree_deltas_most),
+      (&mut chose.read_cache_budget_most, read_cache_budget_most),
+    ] {
+      *most = (*most).max(of);
+    }
   }
 }
 
