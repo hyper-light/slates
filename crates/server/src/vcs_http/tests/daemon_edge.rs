@@ -1314,6 +1314,99 @@ fn tagged_create() -> (Vec<u8>, ObjectId, Vec<ObjectId>) {
   (request, commit_id, tag_ids)
 }
 
+/// Precondition (a) of the landed let-go's lift (main's order of 2026-11-26; r18's push-tag-of-a-tag, fixed at
+/// 6eae9f8bb, its unit red at the edge owed: an earlier one never reached the miss, the inner tag read from what the
+/// repository's reads kept lately). Do: on a daemon with its edge, push as stock git posts it a commit of [`TAGS`]
+/// files and an annotated tag of it for each, each tag in a window of its own; let every window of the pushed pack go as
+/// a landed pack's let-go lets it go (its home told first, each window marked landed) and the repository go idle, what
+/// its reads keep lately given back (`git_encode::give_back_idle`); then push a tag of the first tag, its pack that tag
+/// alone. Expect: the second push `200` and `ok refs/tags/b`, the peel having read the inner tag from its let-go window
+/// brought back (`vcs_store.read_through.brought_back` moved). Red before 6eae9f8bb: declined "an object it names cannot
+/// be read", the peel's miss the ref's refusal.
+#[test]
+fn a_push_of_a_tag_of_a_tag_whose_inner_tags_window_was_let_go_brings_it_back_and_lands() {
+  use slates_git::object_name::Kind;
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, _, tags) = tagged_create();
+  assert_git_pushed(&pushed(edge, &name, &request));
+  let (_, commands_end) = packets_from(&request, 0);
+  let pack = request
+    .get(commands_end..)
+    .expect("the push's pack")
+    .to_vec();
+  let brought_before = let_go_pack_by_hand(&daemon, &pack);
+  let inner = *tags.first().expect("a tag");
+  let outer = format!(
+    "object {inner}\ntype tag\ntag b\ntagger A <a@example.com> 1700000001 +0000\n\na tag of a tag\n"
+  )
+  .into_bytes();
+  let outer_id = git_name(Kind::Tag, &outer);
+  let mut second = Vec::new();
+  let line = format!("{ZERO} {outer_id} refs/tags/b\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut second).expect("the command");
+  pktline::write(Packet::Flush, &mut second).expect("the flush");
+  second.extend_from_slice(&stored_pack(&[(Kind::Tag, &outer)]));
+  let tagged = pushed(edge, &name, &second);
+  let brought = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::read_through::BROUGHT_BACK,
+  );
+  daemon.stop();
+  let report = String::from_utf8_lossy(&tagged.1).into_owned();
+  assert_eq!(tagged.0, 200, "{report}");
+  assert!(
+    report.contains("ok refs/tags/b"),
+    "the tag of a tag landed: {report}"
+  );
+  assert!(
+    brought > brought_before,
+    "the inner tag's window brought back: {brought_before} -> {brought}"
+  );
+}
+
+/// Every window of `pack`, pushed to the repository on [`REPOSITORY`]'s partition, let go by hand as a landed pack's
+/// let-go lets it go (its home told first, each window marked landed), and every repository gone idle, what its reads
+/// keep lately given back (`git_encode::give_back_idle`): the windows brought back so far (`read_through.brought_back`).
+fn let_go_pack_by_hand(daemon: &Daemon, pack: &[u8]) -> u64 {
+  let window = crate::daemon::observe_at(daemon, REPOSITORY, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .expect("the repository's content store");
+  let ids: Vec<slates_vcs::ContentId> =
+    pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let pack_identity = slates_vcs::ContentId::of(pack);
+  crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().expect("the content store");
+      for id in &ids {
+        content.mark_landed(id);
+      }
+    });
+    for id in &ids {
+      let _ = crate::vcs_store::let_go_read(state, id);
+    }
+    for id in state.vcs_stores.git_repositories() {
+      crate::vcs_store::git_encode::give_back_idle(state, id);
+    }
+    state
+      .refusals
+      .get(crate::vcs_store::read_through::BROUGHT_BACK)
+      .copied()
+      .unwrap_or(0)
+  })
+}
+
 /// Goal 93 item 2b(a) (main 01a20182's r52, 2026-11-22: once git/git's push ended its landed pack was let go, and every
 /// fetch of it failed, ls-remote and clone alike, "aborting due to possible repository corruption on the remote side":
 /// the advertisement's tag peel read a window let go, `Unreadable`, where no read brings it back). Do: on a two-shard
