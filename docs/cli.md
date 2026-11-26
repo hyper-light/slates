@@ -392,8 +392,8 @@ slates mcp [--instance NAME] [--http PORT]
 
 `slates version [--licenses]` prints this binary's version (`slates VERSION`) without contacting a daemon, or with
 `--licenses` prints the bundled third-party cryptography copyright and license notices (`NOTICE`, including Marc
-Stevens & Dan Shumow's `sha1collisiondetection` and RustCrypto `sha1 0.11.0` MIT notices). Extra arguments or
-unaccepted flags exit with code 2.
+Stevens & Dan Shumow's `sha1collisiondetection` and RustCrypto `sha1 0.11.0` MIT notices) verbatim as plain text
+even when `--json` is passed. Extra arguments or unaccepted flags exit with code 2.
 
 `slates live-ship ID [--off]` turns a volume's live shipping on (or off): in a fleet each of its publications
 is then shipped to its candidates, and a sync is answered once the owner and `f` of them hold it (design A-200).
@@ -443,8 +443,9 @@ volume-lifecycle verbs (`create`, `snapshot`, `clone`, `resize`, `destroy`, `des
 `placed`, `attach`, `detach`, `pin`, `rewitness`, `grants`, `audit`, `land`), and the merge create
 verbs (`green`, `work`, `edit`) — with the same fields as the text form and the same schema the MCP
 surface emits (one definition, two surfaces). A creating verb returns `{"id": "<hex>"}` (the same
-key across `create`, `clone`, `green` and `work`); an outcome-only verb returns `{"ok": true}`. The
-one exception is `base read`, which streams a file's raw bytes with or without `--json`. `status
+key across `create`, `clone`, `green` and `work`); an outcome-only verb returns `{"ok": true}`.
+Exceptions are `base read`, which streams a file's raw bytes with or without `--json`, and `version`
+(`version --licenses` emits the plain-text `NOTICE` verbatim even when `--json` is passed). `status
 --json` carries every shard's block under `shards` (an array: the counters, `refusals`, `signals`
 with each signal's `value` — `null` when absent — and its `absence` meaning, and `telemetry`: the
 drain's markers, the `chokepoints` registry with each chokepoint's `fresh`/`latest_age_ns`/`absence`/

@@ -5,7 +5,8 @@
 //! two-stage filter with zero `unsafe`:
 //! 1. **Eight-lane schedule expansion**: reuses one caller-owned `[Octet; 65]` stack scratch across every octet in an
 //!    `update()` call (zero per-octet zeroing), expanding `W[16..65]` via tight `[u32; 8]` slice loops that LLVM
-//!    compiles to ARMv8.2 `ldp q` + `eor3.16b` + `add.4s` + `usra.4s` + `stp q` (13 instructions per 8 blocks).
+//!    compiles to ARMv8.2 `ldp q` + `eor3.16b` + `add.4s` + `usra.4s` + `stp q`
+//!    (13 data instructions per expanded schedule word across 8 blocks).
 //! 2. **Table-driven SIMD Stage 1**: evaluates the 71 high-leverage equations grouped by bit shift (`(29,29)`, `(4,29)`,
 //!    `(6,6)`, `(1,6)`, `(1,1)`, `(2,7)`) so every group runs as a tight L1I-resident 8-lane NEON/SSE loop, pruning
 //!    ~78% of uniform random blocks to zero mask (`~22.0%` survive into Stage 2).

@@ -2219,7 +2219,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     return Ok(command);
   }
   match words.as_slice() {
-    [] => Err(ParseError::Help),
+    [] => taken.only(&NONE).and(Err(ParseError::Help)),
     ["anchor" | "daemon"] => {
       taken.only(&Spec {
         values: &[
@@ -4608,5 +4608,42 @@ mod tests {
         "{line}"
       );
     }
+  }
+
+  /// A-893. Do: parse bare `--licenses` (and `--instance demo --licenses`) with no verb, `version --licenses`,
+  /// `oci-check` / `oci-runtime` with `--licenses`, and empty / `--help` invocations. Expect: bare `--licenses`
+  /// refused as usage (`UnknownFlag`, exit 2), `version --licenses` accepted, `oci-check`/`oci-runtime` with
+  /// `--licenses` refused, and empty/`--help` still returning `ParseError::Help`.
+  #[test]
+  fn bare_licenses_refuses_without_version_verb() {
+    for line in ["--licenses", "--instance demo --licenses"] {
+      assert_eq!(
+        parse(&args(line)),
+        Err(ParseError::UnknownFlag("--licenses".into())),
+        "{line}"
+      );
+    }
+    assert_eq!(
+      parse(&args("version --licenses")),
+      Ok(Command::Version { licenses: true })
+    );
+    for line in [
+      "oci-check /nonexistent 0 0 --licenses",
+      "oci-runtime docker --licenses",
+    ] {
+      assert_eq!(
+        parse(&args(line)),
+        Err(ParseError::UnknownFlag("--licenses".into())),
+        "{line}"
+      );
+    }
+    for line in ["oci-check --licenses", "oci-runtime --licenses"] {
+      assert!(
+        !matches!(parse(&args(line)), Ok(_) | Err(ParseError::Help)),
+        "{line} must refuse as usage, not help"
+      );
+    }
+    assert_eq!(parse(&[]), Err(ParseError::Help));
+    assert_eq!(parse(&args("--help")), Err(ParseError::Help));
   }
 }

@@ -138,8 +138,9 @@ aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-
 # `slates_vcs::sha1dc` pairs RustCrypto's hardware-accelerated `sha1` block compression (`sha1::block_api::compress`:
 # ARMv8 SHA instructions, x86 SHA-NI, scalar fallback; zero `unsafe` in slates) with 8-lane SIMD-friendly Marc Stevens
 # UBC filtering and exact single-block recompression on triggered blocks, held bit-for-bit to RustCrypto's `sha1-checked`
-# oracle in tests. Neither crate uses `std` or OID tables.
-sha1 = { version = "0.11.0", default-features = false }
+# oracle in tests. Neither crate uses `std` or OID tables. Exact `=` pin on `sha1`: `slates_vcs::sha1dc` binds to
+# `sha1::block_api::compress` and `NOTICE` bundles `sha1 0.11.0`'s verbatim `LICENSE-MIT` (Appendix B.1).
+sha1 = { version = "=0.11.0", default-features = false }
 sha1-checked = { version = "0.10.0", default-features = false }
 # zlib's CRC32 (the IEEE polynomial, reflected), which git's pack index keeps of each packed object and `git
 # verify-pack` checks (§4.17.2, A-591): the crate flate2 itself computes zlib's CRC32 with, and flate2 is the
