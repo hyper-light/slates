@@ -1216,6 +1216,8 @@ struct WideCounts {
   section_yields: u64,
   /// The steps that applied the greens' pending holds (`name_holds::NAME_HOLD_APPLY_STEPS`, 7c).
   hold_steps: u64,
+  /// The steps of the green's fold to its readers' floor (`svn_commit::FOLD_STEPS`, 11a).
+  fold_steps: u64,
 }
 
 /// The calling shard's [`WideCounts`] now.
@@ -1234,6 +1236,7 @@ fn wide_counts() -> WideCounts {
     close_steps: on(|state| count(state, super::IMPORT_CLOSE_STEPS)),
     section_yields: on(|state| count(state, crate::repository::svn_commit::LANDING_SECTION_YIELDS)),
     hold_steps: on(|state| count(state, crate::vcs_store::name_holds::NAME_HOLD_APPLY_STEPS)),
+    fold_steps: on(|state| count(state, crate::repository::svn_commit::FOLD_STEPS)),
   }
 }
 
@@ -1253,6 +1256,7 @@ fn wide_landing_sliced(counts: &WideCounts) {
     in_turns,
     section_yields,
     hold_steps,
+    fold_steps,
     ..
   } = counts;
   // Non-vacuity: the landing's unpin of its 9,000 texts and its scratch member's release each ran in slices (A-920 6a:
@@ -1282,6 +1286,9 @@ fn wide_landing_sliced(counts: &WideCounts) {
     *hold_steps > 2,
     "the greens' holds were applied in {hold_steps} step(s)"
   );
+  // The green's fold to its readers' floor a slice a step over the revision's 9,001 paths (A-920 11a: whole in the
+  // tail's one step, 7.5-23.4 ms, debug).
+  assert!(*fold_steps > 2, "the fold took {fold_steps} step(s)");
 }
 
 /// The import's parse, staging, apply and tail in steps (A-920 7a, goal 93 piece 3).
