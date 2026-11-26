@@ -84,8 +84,12 @@ enum Unmade {
   Record,
   /// The register refused the entry.
   Entry(Refusal),
-  /// The changeset store refused the changeset, or the task could not run.
+  /// The made commit's task could not run.
   Unlanded,
+  /// The node's changeset store refused the changeset's landing, in its own typed words: its owner gone, the store's
+  /// own refusal, or its owner busy past the made commit's budget ([`landed_patiently`]). Refused and recorded, never
+  /// answered `Overloaded` for a retry that would meet the same refusal without end.
+  Landing(slates_store::owner::OwnerError),
   /// A client's push landed after the changeset was made: its fork is stale.
   Stale,
   /// A file of the change is held by its content-plane object alone, which an hg green never holds (A-760 (b) 4b).
@@ -114,6 +118,7 @@ impl std::fmt::Debug for Unmade {
       Unmade::Named(unread) => formatter.debug_tuple("Named").field(unread).finish(),
       Unmade::ParentUnread => formatter.write_str("ParentUnread"),
       Unmade::Store(why) => formatter.debug_tuple("Store").field(why).finish(),
+      Unmade::Landing(refused) => formatter.debug_tuple("Landing").field(refused).finish(),
     }
   }
 }
@@ -229,8 +234,6 @@ async fn made_commit_landing(
           state.count(MADE, 1);
         }
       }
-      // The store refused the changeset: nothing of the accept is applied or durable, and its retry runs.
-      Some(Err(Unmade::Unlanded)) => crate::made_commit::abandon(state, (pending.request(), green)),
       // Its landing refused otherwise: refused typed and recorded, nothing applied.
       Some(Err(why)) => {
         unmade(state, &why);
@@ -458,11 +461,34 @@ async fn landed(
     Ok(prepared) => prepared,
     Err(why) => return Some(Err(why)),
   };
-  if disk.land(header, parts).await.is_ok() {
-    return Some(Ok((made, (forked, reference))));
+  match landed_patiently(&disk, header, parts).await {
+    Ok(_) => Some(Ok((made, (forked, reference)))),
+    Err(refused) => {
+      crate::state::with_state(|state| give_back_fork(state, forked.fork))?;
+      Some(Err(Unmade::Landing(refused)))
+    }
   }
-  crate::state::with_state(|state| give_back_fork(state, forked.fork))?;
-  Some(Err(Unmade::Unlanded))
+}
+
+/// `header` and `parts` landed on the node's changeset store: asked again after a yield while its owner is busy past
+/// its queue's bound, until the made commit's budget passes (the fleet's live deadline, `fleet::live_budget`, the bound
+/// every daemon wait is held to); any other refusal, an owner gone among them, answers at once. Until 2026-11-26 every
+/// refusal answered the submit `Overloaded`, unrecorded, so a client's retry met a gone owner again without end.
+async fn landed_patiently(
+  disk: &slates_store::owner::StoreHandle,
+  header: slates_store::log::Header,
+  parts: Vec<slates_store::owner::Part>,
+) -> Result<slates_store::log::Located, slates_store::owner::OwnerError> {
+  let deadline =
+    slates_rt::futures::now_ns().saturating_add(crate::fleet::live_budget().max_deadline_ns());
+  loop {
+    match disk.land(header, parts.clone()).await {
+      Err(slates_store::owner::OwnerError::Busy) if slates_rt::futures::now_ns() < deadline => {
+        slates_rt::futures::yield_now().await;
+      }
+      landed => return landed,
+    }
+  }
 }
 
 /// [`landed`]'s first part: `made`'s changegroup taken into a fork by the push's own intake from the task
