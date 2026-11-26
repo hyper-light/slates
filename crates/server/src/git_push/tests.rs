@@ -1182,11 +1182,8 @@ fn derive_counts(state: &mut ShardState) -> DeriveCounts {
   (count(TURNS), count(DERIVED), count(TURNS_YIELDED))
 }
 
-/// A line of [`PACED_HISTORY`] commits pushed as one create to `repository`: the repository and the counts before its
-/// derivation.
-
 /// A line of [`PACED_HISTORY`] commits pushed as one create to `repository`, made beforehand from the test's thread
-/// ([`git_repository_on`]): the repository and the pack it landed.
+/// ([`git_repository_on`]), from a task of `daemon`'s first shard ([`pushed_on`]): the pack it landed.
 fn paced_line_pushed_on(daemon: &crate::Daemon, repository: RepositoryId) -> Vec<u8> {
   let mut objects = Vec::new();
   let mut parent = None;
@@ -1350,8 +1347,10 @@ fn fetch_after_tagged_push(
   let request = tagged_line_request();
   let before = crate::daemon::observe_first(daemon, derive_driven);
   let read = if behind {
-    let pushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let read = read_on_the_shard(daemon, repository, Some(std::sync::Arc::clone(&pushed)));
+    // Shared by this thread and the shard's task: leaked for the test's life, so neither owns it (D-8, no `Arc`).
+    let pushed: &'static std::sync::atomic::AtomicBool =
+      Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+    let read = read_on_the_shard(daemon, repository, Some(pushed));
     let (created, _) = pushed_in_steps(daemon, repository, &request).unwrap();
     pushed.store(true, std::sync::atomic::Ordering::Release);
     assert!(reasons(&created).iter().all(|reason| reason == b"ok"));
@@ -1379,7 +1378,7 @@ fn fetch_after_tagged_push(
 fn read_on_the_shard(
   daemon: &crate::Daemon,
   repository: RepositoryId,
-  pushed: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+  pushed: Option<&'static std::sync::atomic::AtomicBool>,
 ) -> std::sync::mpsc::Receiver<Result<u64, String>> {
   use crate::vcs_store::git_derive::{BEHIND, behind_and_under_way, derive_for_read};
   let (done, read) = std::sync::mpsc::channel();
@@ -1387,7 +1386,7 @@ fn read_on_the_shard(
     let begun_before = state.refusals.get(BEHIND).copied().unwrap_or(0);
     let quantum_ns = state.config.step_quantum_ns();
     let task = slates_rt::futures::spawn(async move {
-      while let Some(pushed) = pushed.as_ref() {
+      while let Some(pushed) = pushed {
         let look = crate::state::with_state_counted(|state| {
           let begun = state.refusals.get(BEHIND).copied().unwrap_or(0) > begun_before;
           (begun, behind_and_under_way(state, repository))

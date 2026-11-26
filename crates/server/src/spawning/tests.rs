@@ -234,7 +234,7 @@ async fn tick() {
 /// lingering spawner on the shard, a gap of its [`LINGER_NS`].
 #[test]
 fn a_spawner_that_ends_its_conversation_and_lingers_is_reaped_while_its_shard_steps() {
-  let (gap, code) = on_a_thread_within(|| reaped_while_stepping());
+  let (gap, code) = on_a_thread_within(reaped_while_stepping);
   assert_eq!(code, Ok(Some(3)));
   assert!(
     gap < LIVENESS_BUDGET_NS,
@@ -309,7 +309,7 @@ fn reaped_while_stepping() -> (u64, Result<Option<i32>, SpawnRefused>) {
 /// liveness window while the start ran. Red before: the start ran on the shard, a gap of its [`LINGER_NS`].
 #[test]
 fn a_spawners_start_slowed_past_the_window_never_holds_its_shard() {
-  let (gap, code) = on_a_thread_within(|| started_while_stepping());
+  let (gap, code) = on_a_thread_within(started_while_stepping);
   assert_eq!(code, Ok(Some(4)));
   assert!(
     gap < LIVENESS_BUDGET_NS,
@@ -384,7 +384,11 @@ fn dropped_stopped(started: fn() -> TestSpawner) -> u64 {
       .expect("the spawner's pid");
     rustix::process::kill_process(pid, rustix::process::Signal::STOP).expect("the spawner stopped");
     let _continuer = std::thread::spawn(move || {
-      std::thread::sleep(std::time::Duration::from_nanos(LINGER_NS));
+      // Parked to its deadline (a park may wake early, so it parks again until the deadline has passed).
+      let until = std::time::Instant::now() + std::time::Duration::from_nanos(LINGER_NS);
+      while std::time::Instant::now() < until {
+        std::thread::park_timeout(until.saturating_duration_since(std::time::Instant::now()));
+      }
       let _ = rustix::process::kill_process(pid, rustix::process::Signal::CONT);
     });
     let began = slates_rt::futures::now_ns();
