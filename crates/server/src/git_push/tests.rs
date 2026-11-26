@@ -1549,9 +1549,84 @@ const THIN_TREE_FILES: usize = 64;
 /// necessary objects`, the check's read of the tree from the quarantine answering none.
 #[test]
 fn b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands() {
-  use slates_git::object_name::{Kind, name_of};
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let repository = git_repository_on(&daemon, "thin-check-away");
+  let (repository, update, pack) = thin_update_over_a_create(&daemon, "thin-check-away");
+  let (updated, (at_let_go, after), _) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move { let_go_at_its_checks(repository, &update, (&pack, false)).await },
+    HISTORY_PATIENCE,
+  )
+  .unwrap();
+  let refused = crate::daemon::observe_first(&daemon, bring_backs_refused);
+  daemon.stop();
+  assert_eq!(
+    reasons(&updated),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    updated.outcomes
+  );
+  assert!(
+    after > at_let_go,
+    "the base's window brought back after its let-go: {at_let_go} -> {after}"
+  );
+}
+
+/// B1's one rule keyed by the let-go met, not the window's place (main's order of 2026-11-26: the interleaving forced,
+/// not met by luck in a concurrent run). Do: [`b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands`]'s
+/// update, but at the push's first stop on the let-go base, another reader brings that window back first (so the
+/// push's driver finds it back and brings nothing), then lets it go again before the push's next step
+/// ([`another_reader_brings_back_and_lets_go`]): the push meets the window let go with nothing read between. Expect:
+/// `ok`, the window waited for again and brought back by the push's driver. Red with the stop keyed by the window's
+/// offset (489aab9a1): `missing necessary objects`, the second let-go taken for the first met twice.
+#[test]
+fn b1_a_window_brought_back_and_let_go_again_by_another_reader_is_waited_for_again() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, update, pack) = thin_update_over_a_create(&daemon, "thin-let-go-again");
+  let (updated, (at_let_go, after), again) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move { let_go_at_its_checks(repository, &update, (&pack, true)).await },
+    HISTORY_PATIENCE,
+  )
+  .unwrap();
+  let refused = crate::daemon::observe_first(&daemon, bring_backs_refused);
+  daemon.stop();
+  assert!(
+    again,
+    "another reader brought the window back and let it go again"
+  );
+  assert_eq!(
+    reasons(&updated),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    updated.outcomes
+  );
+  assert!(
+    after > at_let_go.saturating_add(1),
+    "the other reader's bring-back and the push's own after it: {at_let_go} -> {after}"
+  );
+}
+
+/// What this shard's bring-backs of let-go windows were refused, by its counters: refused (by the node's store, or with
+/// no store: `upload::RESIDENT_REFUSED`), past their patience (`upload::BRING_BACK_PAST_PATIENCE`), and a piece the
+/// store never answered (`read_through::UNANSWERED`); so a B1 test whose window was never brought back says why.
+fn bring_backs_refused(state: &mut ShardState) -> (u64, u64, u64) {
+  let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+  (
+    count(crate::vcs_store::upload::RESIDENT_REFUSED),
+    count(crate::vcs_store::upload::BRING_BACK_PAST_PATIENCE),
+    count(crate::vcs_store::read_through::UNANSWERED),
+  )
+}
+
+/// On a repository `name` of `daemon`: `main` created, `ok`, at a commit of a flat tree of [`THIN_TREE_FILES`] files,
+/// then the request updating it to a commit whose tree adds a file, sent as git sends a thin pack (the tree a REF_DELTA
+/// against the first tree, which the pack does not carry): the repository, that request, and the create's pack.
+fn thin_update_over_a_create(
+  daemon: &crate::Daemon,
+  name: &str,
+) -> (RepositoryId, Vec<u8>, Vec<u8>) {
+  use slates_git::object_name::{Kind, name_of};
+  let repository = git_repository_on(daemon, name);
   let (first, objects) = flat_commit(THIN_TREE_FILES, "base", None);
   let pack = pack_of_objects(&objects);
   let create = request(
@@ -1559,7 +1634,8 @@ fn b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands() {
     CAPABILITIES,
     &pack,
   );
-  let (created, _) = pushed_in_steps(&daemon, repository, &create).unwrap();
+  let (created, _) = pushed_in_steps(daemon, repository, &create).unwrap();
+  assert_eq!(reasons(&created), [b"ok"]);
   let base_tree = objects[1].1.clone();
   let blob = b"added\n".to_vec();
   let mut tree = base_tree.clone();
@@ -1582,19 +1658,7 @@ fn b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands() {
     CAPABILITIES,
     &thin,
   );
-  let (updated, (at_let_go, after)) = crate::test_store::run_on_first(
-    &daemon,
-    move || async move { let_go_at_its_checks(repository, &update, &pack).await },
-    HISTORY_PATIENCE,
-  )
-  .unwrap();
-  daemon.stop();
-  assert_eq!(reasons(&created), [b"ok"]);
-  assert_eq!(reasons(&updated), [b"ok"], "{:?}", updated.outcomes);
-  assert!(
-    after > at_let_go,
-    "the base's window brought back after its let-go: {at_let_go} -> {after}"
-  );
+  (repository, update, pack)
 }
 
 /// A thin pack of `commit` and `blob` whole and `tree` a REF_DELTA against `base`, which it does not carry, its data in
@@ -1628,19 +1692,21 @@ fn thin_tree_pack((commit, blob): (&[u8], &[u8]), (base, tree): (&[u8], &[u8])) 
 
 /// `request` pushed to `repository` by its owner from a task of its shard, driven as an edge drives it (each turn's
 /// let-go window brought back at once, `upload::brought_back_waited`, then its homing carried), every window of
-/// `let_go` let go by hand ([`let_go_by_hand`]) once the push's pack is read and its checks are due: what was received,
-/// and the windows brought back at the let-go and at the end.
+/// `let_go` let go by hand ([`let_go_by_hand`]) once the push's pack is read and its checks are due; with `again`, the
+/// first stop after that met by [`another_reader_brings_back_and_lets_go`] in the driver's stead. What was received, the
+/// windows brought back at the let-go and at the end, and whether another reader let the window go again.
 async fn let_go_at_its_checks(
   repository: RepositoryId,
   request: &[u8],
-  let_go: &[u8],
-) -> Result<(Received, (u64, u64)), String> {
+  (let_go, again): (&[u8], bool),
+) -> Result<(Received, (u64, u64), bool), String> {
   let (_, mut push) = on_state(|state| started(state, repository));
   for piece in request.chunks(PIECE) {
     on_state(|state| push.input(state, piece)).map_err(|failed| format!("{failed:?}"))?;
   }
   on_state(|state| push.end(state)).map_err(|failed| format!("{failed:?}"))?;
   let mut at_let_go = None;
+  let mut let_go_again = false;
   let mut answer = Vec::new();
   let received = loop {
     if at_let_go.is_none() && push.session.is_checking() && !push.session.is_resolving() {
@@ -1654,9 +1720,23 @@ async fn let_go_at_its_checks(
     match step {
       Answering::Answered(received) => break *received,
       Answering::Turned => {
-        // As the edges do: the window the step met brought back at once, before anything else on the shard runs and
-        // clears the repository's note of it (a derivation's or an encoding's turn).
-        crate::vcs_store::upload::brought_back_waited(repository).await;
+        if again && at_let_go.is_some() && !let_go_again {
+          let_go_again = another_reader_brings_back_and_lets_go(repository).await;
+        } else {
+          // As the edges do: the window the step met brought back at once, before anything else on the shard runs
+          // and clears the repository's note of it (a derivation's or an encoding's turn).
+          let (noted, before) =
+            on_state(|state| (noted_stop(state, repository), brought_back_count(state)));
+          crate::vcs_store::upload::brought_back_waited(repository).await;
+          if noted.is_some() {
+            // Printed by libtest only for a failing test: what main's runs under load read (main's order of
+            // 2026-11-26, the cause of B1's failure in a concurrent run shown, never guessed).
+            let after = on_state(|state| (brought_back_count(state), bring_backs_refused(state)));
+            eprintln!(
+              "b1 stop: (offset, let-go number) {noted:?}; brought back {before} -> {after:?}"
+            );
+          }
+        }
         slates_rt::futures::yield_now().await;
         carry_awaited(&mut push).await?;
       }
@@ -1666,10 +1746,50 @@ async fn let_go_at_its_checks(
   };
   dropped_in_a_step(push);
   let at_let_go = at_let_go.ok_or("the push's checks were never due")?;
-  Ok((
-    received,
-    (at_let_go, on_state(|state| brought_back_count(state))),
+  let after = on_state(|state| brought_back_count(state));
+  Ok((received, (at_let_go, after), let_go_again))
+}
+
+/// The window `repository`'s reads noted as met let go, for its driver to bring back: its offset in its pack and the
+/// content store's number for that let-go (`ContentStore::away_number`; none once it is back).
+fn noted_stop(state: &mut ShardState, repository: RepositoryId) -> Option<(u64, Option<u64>)> {
+  let (content, store) = state.vcs_stores.git(repository)?;
+  let waited = store.repository.peek_waiting()?;
+  Some((
+    waited.offset,
+    content.away_number(&waited.pack, waited.len, waited.offset),
   ))
+}
+
+/// The interleaving a concurrent reader makes (a derivation, which lets go at its end the windows it brought back),
+/// forced: the window the push's step met and noted is brought back by another reader first
+/// (`read_through::bring_back_window`); the push's driver then finds it back and brings nothing
+/// (`upload::brought_back_waited`); then the other reader lets it go again, as a landed window
+/// (`vcs_store::let_go_read`). Whether it did; where the step noted no window, the driver's bring-back alone, as an edge's.
+async fn another_reader_brings_back_and_lets_go(repository: RepositoryId) -> bool {
+  let noted = on_state(|state| {
+    state
+      .vcs_stores
+      .git(repository)
+      .and_then(|(_, store)| store.repository.peek_waiting())
+  });
+  let Some(waited) = noted else {
+    crate::vcs_store::upload::brought_back_waited(repository).await;
+    return false;
+  };
+  let brought = crate::vcs_store::read_through::bring_back_window(waited).await;
+  let Ok(Some((window, _))) = brought else {
+    panic!("the other reader brought the window back: {brought:?}");
+  };
+  crate::vcs_store::upload::brought_back_waited(repository).await;
+  on_state(|state| {
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      if let Some(content) = stores.content_mut() {
+        content.mark_landed(&window);
+      }
+    });
+    crate::vcs_store::let_go_read(state, &window).is_ok()
+  })
 }
 
 /// Main 01a20182's ruling of 2026-11-24 (w-hg's sweep of the bring-back sites: a write path's bring-back never let go).
