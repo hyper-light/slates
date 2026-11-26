@@ -478,8 +478,17 @@
 > value's peel fails and the repository names a let-go window (`Repository::away`), the push's driver bringing it back;
 > the same window twice ends in the typed refusal. Red at the session: git_correctness's verbs on a six-commit dataset
 > with the lift on locally failed push-tag-of-a-tag, delete-tags and both refs rows; all pass after; at the guard r89's
-> verbs over git/git pass all 26. Owed: its unit red at the edge (a push of a tag of a tag over a pack let go by hand
-> did not reach the miss).
+> verbs over git/git pass all 26. Its unit red at the edge BUILT (w-git, 2026-11-26, the lift's precondition (a)):
+> `a_push_of_a_tag_of_a_tag_whose_inner_tags_window_was_let_go_brings_it_back_and_lands` (every window of a tagged
+> create let go by hand and the repository idle, its reads' cache given back, then a tag of the first tag pushed alone:
+> `ok refs/tags/b`, `read_through.brought_back` moved; with `peel_away` off, `ng refs/tags/b missing necessary
+> objects`). The earlier try missed because the inner tag was read from what the reads kept lately. The mirror clone's
+> stall is not the lift's (main's r229, 2026-11-23: 2 of 2 at a patience of 360 s, the HTTP mirror clone 97.9 and 107.7
+> s, CPU-bound at 97% of a core in blake3, `Index::get` and the content store's reads): slowness, a P line below, off
+> the lift's preconditions.
+> **P OPEN (w-git; main's r229, 2026-11-23): git/git's HTTP mirror clone takes about 100 s** (97.9 and 107.7 s, 556 MB
+> against stock git's 612 MB; the work clone 92.9 and 97.2 s), the daemon CPU-bound at 97% of one core: blake3,
+> `Index::get`, `ContentStore::get` / `len_of` / `window_at_in`, `Positions::settle`. No stall; to be profiled.
 > **r227's SSH regression FIXED (w-git, 2026-11-23):** with the lift, stock git's fetch over SSH ended mid-answer
 > (`unexpected disconnect while reading sideband packet`; on a made history, the shallow clone right after its
 > `packfile` header): an answer whose pack's choice read a let-go window is held for it (`Answer::held_away`) with its
@@ -2451,7 +2460,10 @@
 > 997 B and of `PIECE_BYTES`, the same log bytes and rows),
 > `a_landing_crashed_at_each_piece_recovers_to_the_changeset_before_and_lands_again_whole` (a crash after every count of
 > pieces: the changeset before alone, then landed again to the reference's log). The C5 test prints the daemon's gauges
-> beside its resident figure at each settled point. Owed: the names' rows still one buffer per landing (about 40 B an
+> beside its resident figure at each settled point, and since d350346f5 the bytes it holds by them (`held_of`: the
+> live heap, the mapped blocks, each shard's stored windows, no overlap), judged in the landed let-go's flip by
+> `2N + O × R + W` (O the push's objects, R a row's held cost from the index's own layout; main's ruling B of
+> 2026-11-26), the resident bound until then. Owed: the names' rows still one buffer per landing (about 40 B an
 > object); and the Mac's footprint and Linux's RSS readings after b2b (main's). Unmeasured, owed (w-git) once a fleet
 > RSS round measures it: `put_remote` ships the whole pack in one buffer to each remote home (f ≥ 1); another shard of
 > this node as the pack's home is handed its bytes too. Owed (w-git): a node whose store lacks a record's changeset
