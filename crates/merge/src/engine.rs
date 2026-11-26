@@ -135,12 +135,12 @@ impl Increment {
 
   /// The post-state as the engine reads it: the inline bytes, then each named run's as read (A-760).
   pub fn post(&self) -> crate::named::Post<'_> {
-    crate::named::Post::of(&self.post_state, &self.named.read.0, &self.named.runs)
+    crate::named::Post::of(&self.post_state, &self.named.read, &self.named.runs)
   }
 
   /// The bytes of the `at`th named run read so far (A-760): what a turn's reader measures its progress by.
   pub fn read_run(&self, at: usize) -> Option<&[u8]> {
-    self.named.read.0.get(at).map(Vec::as_slice)
+    self.named.read.run_known(at)
   }
 
   /// Names `run` as the post-state's next bytes (A-760): the offset an op's `src` gives them.
@@ -255,7 +255,7 @@ impl Increment {
   /// `wanted` does not reach it.
   pub fn unread_among(&self, wanted: &[bool]) -> Option<&crate::named::NamedRun> {
     self.named.runs.iter().enumerate().find_map(|(at, run)| {
-      let read = self.named.read.0.get(at).map_or(0, Vec::len);
+      let read = self.named.read.read_len(at);
       let wants = wanted.get(at).copied().unwrap_or(true);
       (wants && u64::try_from(read).unwrap_or(u64::MAX) < run.len).then_some(run)
     })
@@ -288,7 +288,7 @@ impl Increment {
     let mut budget = slice.max(1);
     let mut at = 0usize;
     while let Some(run) = self.named.runs.get(at).copied() {
-      let read = self.named.read.0.get(at).map_or(0, Vec::len);
+      let read = self.named.read.read_len(at);
       let read = u64::try_from(read).unwrap_or(u64::MAX);
       if !wanted.get(at).copied().unwrap_or(true) || read >= run.len {
         at = at.saturating_add(1);
@@ -315,24 +315,24 @@ impl Increment {
     let missing = crate::named::ObjectMissing {
       identity: run.identity,
     };
-    while self.named.read.0.len() <= at {
-      self.named.read.0.push(Vec::new());
-    }
-    let buffer = self.named.read.0.get_mut(at).ok_or(missing)?;
-    if buffer.capacity() == 0 {
-      let whole = usize::try_from(run.len).map_err(|_| missing)?;
-      buffer.try_reserve_exact(whole).map_err(|_| missing)?;
-    }
-    let done = u64::try_from(buffer.len()).map_err(|_| missing)?;
-    let take = run.len.saturating_sub(done).min(budget);
-    let from = buffer.len();
-    let to = from
-      .checked_add(usize::try_from(take).map_err(|_| missing)?)
+    let done = self.named.read.read_len(at);
+    let take = run
+      .len
+      .saturating_sub(u64::try_from(done).map_err(|_| missing)?)
+      .min(budget);
+    let room = usize::try_from(take).map_err(|_| missing)?;
+    let total = usize::try_from(self.named.runs.total()).map_err(|_| missing)?;
+    let into = self
+      .named
+      .read
+      .next_room((at, total), room)
       .ok_or(missing)?;
-    buffer.resize(to, 0);
-    let into = buffer.get_mut(from..to).ok_or(missing)?;
-    if let Err(refused) = objects.read(&run.identity, run.offset.saturating_add(done), into) {
-      buffer.truncate(from);
+    let from = run
+      .offset
+      .saturating_add(u64::try_from(done).map_err(|_| missing)?);
+    let refused = objects.read(&run.identity, from, into).err();
+    self.named.read.settle(at, (room, refused.is_none()));
+    if let Some(refused) = refused {
       return Err(refused);
     }
     Ok(take)
@@ -545,8 +545,8 @@ pub struct Judged {
   /// The increment's post-state, from which the commit makes each mapped file ([`Effect::SetContent`]): its added bytes
   /// only, never a file.
   post_state: Vec<u8>,
-  /// Its named runs' bytes, taken from the work ([`Green::judge_named`], A-760): a whole text's buffer becomes the file.
-  read: Vec<Vec<u8>>,
+  /// Its named runs' bytes, taken from the work ([`Green::judge_named`], A-760), one buffer for them all.
+  read: crate::named::Read,
   /// Its named runs, which name the objects a file made whole of one is named for (A-760 (b), [`Green::name_of`]).
   runs: crate::named::RunTable,
   /// Its files made so far, a slice a step before the commit ([`Green::make_step`], A-760).
@@ -1416,6 +1416,10 @@ pub struct Green {
   /// The changed paths' Strings a commit made, each the one its change entry keeps (A-920 3m's non-vacuity count: one a
   /// distinct path the effects change, made once).
   commit_paths_made: u64,
+  /// The byte buffers commits let go for files named for their run's object (A-920 3n's non-vacuity count: none, since
+  /// such a file is given no bytes; each had been a run's own buffer, freed a commit unit at a time, and the free that
+  /// emptied the allocator's region cost one unit about 1 ms of the kernel's time).
+  named_buffers_freed: u64,
   /// The units of computed verdicts judged again because the green moved since they were computed
   /// ([`Green::judged_again`], A-658).
   judged_again: u64,
@@ -2086,14 +2090,21 @@ fn sole_run(base_len: u64, ops: &[Op], places: &BTreeMap<(u64, u64), usize>) -> 
   places.get(&(op.src, op.len)).copied()
 }
 
-/// Moves each of `wholes`' runs' buffers into its file (A-760, [`alone`]): last, once every other file is
-/// made, since a moved buffer shortens the post-state's address space under every later run.
-fn move_whole_runs(effects: &mut [Effect], read: &mut [Vec<u8>], wholes: &[(usize, usize)]) {
+/// Gives each of `wholes`' files its run's bytes (A-760, [`alone`]): last, once every other file is made. A file named
+/// for its run's object (`names`, [`named_files`]) holds it by its name alone and takes no bytes, so nothing is made for
+/// it, nor let go at its commit (A-920 3n); any other takes a copy of its run's bytes, which it keeps.
+fn move_whole_runs(
+  effects: &mut [Effect],
+  read: &crate::named::Read,
+  (wholes, names): (&[(usize, usize)], &[(usize, crate::named::Identity)]),
+) {
   for &(place, run) in wholes {
-    if let (Some(Effect::SetContent(_, bytes @ None, ..)), Some(buffer)) =
-      (effects.get_mut(place), read.get_mut(run))
-    {
-      *bytes = Some(core::mem::take(buffer));
+    if let Some(Effect::SetContent(_, bytes @ None, ..)) = effects.get_mut(place) {
+      *bytes = Some(if holds_place(names, place) {
+        Vec::new()
+      } else {
+        read.run(run).to_vec()
+      });
     }
   }
 }
@@ -2410,8 +2421,8 @@ pub struct Applying {
   at: usize,
   /// The commit's preparation, once every effect is made: a phase at a time, each a slice of the effects at a time.
   prep: Prep,
-  /// The named runs' buffers, read for this apply (A-760), taken from the increment as the preparation begins.
-  read: Vec<Vec<u8>>,
+  /// The named runs' bytes, read for this apply (A-760), taken from the increment as the preparation begins.
+  read: crate::named::Read,
   /// Whether the preparation checks each effect's read of a text held by name alone: a recorded version's apply does; a
   /// judged verdict's commit does not, its judge having checked them ([`Green::commit_reads`]).
   check_reads: bool,
@@ -4201,6 +4212,12 @@ impl Green {
   /// The changed paths commits put in a tree set of their own ([`Green::commit_tree_paths`]'s field, A-920 3m).
   pub fn commit_tree_paths(&self) -> u64 {
     self.commit_tree_paths
+  }
+
+  /// The byte buffers commits let go for files named for their run's object ([`Green::named_buffers_freed`]'s field,
+  /// A-920 3n).
+  pub fn named_buffers_freed(&self) -> u64 {
+    self.named_buffers_freed
   }
 
   /// The changed paths' Strings commits made ([`Green::commit_paths_made`]'s field, A-920 3m).
@@ -6677,7 +6694,12 @@ impl Green {
     // is re-anchored on that block (A-793).
     // A file made whole of one named object holds it by its name alone (A-760 (b) 4d): its bytes, the run's, let go.
     match name {
-      Some(name) => self.content.insert_named(&path, name),
+      Some(name) => {
+        if bytes.capacity() > 0 {
+          self.named_buffers_freed = self.named_buffers_freed.saturating_add(1);
+        }
+        self.content.insert_named(&path, name);
+      }
       None => self.content.insert(&path, bytes),
     }
     self.supersede_latest(&path);
@@ -7016,7 +7038,7 @@ impl Green {
     }
     let mut judgment = self.hold_unlent(inc, computed, true);
     if let Judgment::Accepted(held) = &mut judgment {
-      held.read = inc.named.read.0.clone();
+      held.read = inc.named.read.copied();
     }
     Ok(judgment)
   }
@@ -7035,7 +7057,7 @@ impl Green {
   pub fn judge(&mut self, inc: &Increment) -> Judgment {
     let mut judgment = self.judge_held(inc, true);
     if let Judgment::Accepted(held) = &mut judgment {
-      held.read = inc.named.read.0.clone();
+      held.read = inc.named.read.copied();
     }
     judgment
   }
@@ -7045,7 +7067,7 @@ impl Green {
   pub fn judge_named(&mut self, inc: &mut Increment) -> Judgment {
     let mut judgment = self.judge_held(inc, true);
     if let Judgment::Accepted(held) = &mut judgment {
-      held.read = core::mem::take(&mut inc.named.read.0);
+      held.read = core::mem::take(&mut inc.named.read);
     }
     judgment
   }
@@ -7057,7 +7079,7 @@ impl Green {
   pub fn judge_named_reads_later(&mut self, inc: &mut Increment) -> Judgment {
     let mut judgment = self.judge_held(inc, false);
     if let Judgment::Accepted(held) = &mut judgment {
-      held.read = core::mem::take(&mut inc.named.read.0);
+      held.read = core::mem::take(&mut inc.named.read);
     }
     judgment
   }
@@ -7199,7 +7221,7 @@ impl Green {
       effects,
       applied,
       post_state: inc.post_state.clone(),
-      read: Vec::new(),
+      read: crate::named::Read::default(),
       runs: inc.named.runs.clone(),
       making: Making::default(),
       reads_checked: holding.check_reads,
@@ -7324,7 +7346,8 @@ impl Green {
       }
       let Some(mut file) = judged.making.current.take() else {
         let wholes = judged.making.wholes.clone().unwrap_or_default();
-        move_whole_runs(&mut judged.effects, &mut judged.read, &wholes);
+        let names = judged.making.names.clone().unwrap_or_default();
+        move_whole_runs(&mut judged.effects, &judged.read, (&wholes, &names));
         return Ok(Made { done: true, copied });
       };
       copied =
@@ -7611,7 +7634,7 @@ impl Green {
       effects: Vec::with_capacity(applied.len()),
       at: 0,
       prep: Prep::Effects,
-      read: Vec::new(),
+      read: crate::named::Read::default(),
       check_reads: true,
       commit: None,
     }))
@@ -7675,7 +7698,7 @@ impl Green {
     if let Prep::Effects = run.prep {
       // A file a named run makes whole takes the run's buffer, read for this apply (A-760), with no copy, as a judged
       // verdict's commit does (`Green::commit_held`); every other file is made first, while every buffer is in place.
-      run.read = core::mem::take(&mut inc.named.read.0);
+      run.read = core::mem::take(&mut inc.named.read);
       run.prep = Prep::sole(crate::named::Post::of(
         &inc.post_state,
         &run.read,
@@ -7901,8 +7924,8 @@ impl Green {
     while let Some(whole) = wholes.get(*at) {
       move_whole_runs(
         &mut run.effects,
-        &mut run.read,
-        core::slice::from_ref(whole),
+        &run.read,
+        (core::slice::from_ref(whole), names),
       );
       *at = at.saturating_add(1);
       if wholes.get(*at).is_some() && spent() {
