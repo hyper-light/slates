@@ -20,8 +20,9 @@
 //! again.
 //!
 //! The job is a state machine, [`RefineJob`], whose [`RefineJob::turn`] takes one turn on the shard's state; its task
-//! calls it between yields and brings back what a turn's read met let go. A test that holds the shard calls the same
-//! turn through `refined_now`, and `tests` holds the two drivers equal on one recorded submit each.
+//! calls it between yields and brings back what a turn's read met let go. It is the job's only driver: a test-only one
+//! that took the turns on a held shard gave a job up where a turn met a let-go window, which the task brings back
+//! (`tests`, the let-go base's red; main's ruling of 2026-11-26).
 //!
 //! **Bounds.**
 //! - A copy slice is the shard's derived copy slice (its measured memcpy rate over half its quantum).
@@ -190,15 +191,6 @@ pub(crate) fn start(
   owed: Owed,
 ) -> bool {
   if state.refining.running.get(&work) == Some(&owed.key) {
-    return true;
-  }
-  // A test that holds the shard takes the job's turns itself (`refined_now`).
-  #[cfg(test)]
-  if HELD_FOR_TEST.with(std::cell::Cell::get) {
-    let key = owed.key;
-    HELD_JOBS.with(|held| held.borrow_mut().push(RefineJob::new(work, green, owed)));
-    state.refining.running.insert(work, key);
-    state.count(REFINE_STARTED, 1);
     return true;
   }
   let job = job(work, green, owed);
@@ -421,8 +413,7 @@ type Job = (
 );
 
 /// `work`'s refinement job for `owed` (module docs): its task runs [`RefineJob::turn`] on the shard's state a turn at a
-/// time, yielding between turns, and brings back what a turn's read met let go before the turn is taken again. A test
-/// that holds the shard takes the same turns through [`refined_now`].
+/// time, yielding between turns, and brings back what a turn's read met let go before the turn is taken again.
 fn job(work: DbVolumeId, green: DbVolumeId, owed: Owed) -> Job {
   let key = owed.key;
   (Box::pin(task_of(RefineJob::new(work, green, owed))), key)
@@ -442,30 +433,6 @@ async fn task_of(mut job: RefineJob) {
         let _ = crate::state::with_state(|s| job.brought(s, brought));
       }
       Some(Turned::Done) | None => return,
-    }
-  }
-}
-
-#[cfg(test)]
-thread_local! {
-  /// Set by a test that holds the shard: a job [`start`]s held for [`refined_now`], not spawned.
-  pub(crate) static HELD_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-  /// The jobs a test's shard holds for [`refined_now`] ([`HELD_FOR_TEST`]).
-  static HELD_JOBS: std::cell::RefCell<Vec<RefineJob>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Every held job run to its end now, a turn at a time through [`RefineJob::turn`], as its task takes them: for a test
-/// that holds the shard, so the task cannot run. A test's shard keeps its landed packs, so no copy meets a let-go window;
-/// were one met, the job gives up, as one whose windows the store cannot give back does.
-#[cfg(test)]
-pub(crate) fn refined_now(state: &mut ShardState) {
-  while let Some(mut job) = HELD_JOBS.with(|held| held.borrow_mut().pop()) {
-    loop {
-      match job.turn(state) {
-        Turned::More => {}
-        Turned::BringBack(_) => job.brought(state, None),
-        Turned::Done => break,
-      }
     }
   }
 }

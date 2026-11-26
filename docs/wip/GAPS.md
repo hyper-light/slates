@@ -1274,13 +1274,16 @@
 >   `test_store::on_a_stored_shard` (w-git's, for histories that wait on nothing) set it still, and no longer does
 >   (w-hg, 2026-11-26, main's order): its 12 callers' modules (`identities` 6, `repository::push` 1,
 >   `vcs_share::grants` 3, `vcs_store::paths` 1, `vcs_store::tests` 1) pass with production's let-go, 0 reds.
->   - The test-only holds left in production code, each pausing a driver for a test: `hg_push::hold_next_landing`
->     (the four race histories), `whole_build::DRIVEN_BY_TEST` (the storm's build slices), and
->     `refining::HELD_FOR_TEST` (`refining::start` holds a job for `refined_now`, only `refining/tests.rs`'
->     driver-equality test sets it). The last changes what refining answers, not only when: `refined_now` gives a job
->     up where its turn meets a let-go window (`job.brought(state, None)`), where the job's task brings the windows
->     back and copies the slice again; its doc's premise, that a test's shard keeps its landed packs, ended with A3.
->     Owed: removed (main's ruling of 2026-11-26), w-hg's next piece.
+>   - The test-only holds left in production code, each pausing a driver for a test, changing when and never what:
+>     `hg_push::hold_next_landing` (the four race histories) and `whole_build::DRIVEN_BY_TEST` (the storm's build
+>     slices). `refining::HELD_FOR_TEST` is gone (w-hg, 2026-11-26, main's ruling), with `HELD_JOBS`, `refined_now` and
+>     `refining::start`'s `cfg(test)` arm: it changed what refining answered. Red first,
+>     `refining::tests::a_refinement_whose_base_was_let_go_brings_it_back_and_refines` (a Subversion text of 2,000
+>     functions, every window let go, `test_store::a_text_whose_windows_are_away`, re-indented whole): under the task
+>     brought back 1, refined, accepted at version 2; under `refined_now` brought back 0, not brought back 1, the job
+>     given up and the submit never answered (`~/.local/state/w-hg-logs/2026-11-26-refined-now-red.txt`). Its doc's
+>     premise, that a test's shard keeps its landed packs, had ended with A3. t_a787 is now a test of the task alone
+>     (`t_a787_a_recorded_submit_parks_until_its_refinements_task_ends_in_turns`).
 >   - Fixed, 3 in `vcs_store/hg_view/tests.rs`: the every-format oracle takes each changeset's and manifest's text from
 >     the same history imported in one call into a store of its own that lets nothing go, never from the store under
 >     test; the let-go tag test holds every object not held whole after its let-go, which its landing had already
