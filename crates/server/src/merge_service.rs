@@ -591,18 +591,24 @@ impl CheckpointHold {
         env.quantum_ns = budget_ns.max(env.quantum_ns);
         let mut costs = state.merge.checkpoint_costs;
         let mut step = slates_pace::Step::begin(env, (env.clock)());
+        let mut taken = 0u32;
         let held = loop {
           let kind = if self.staging.is_some() {
             CHUNK_STAGED
           } else {
             CHUNK_HASHED
           };
-          if !step.more(kind, &mut costs) {
+          let spent = match hold_units_a_step() {
+            Some(units) => taken >= units,
+            None => !step.more(kind, &mut costs),
+          };
+          if spent {
             break Held::More;
           }
           if self.unit(state) == Held::Ended {
             break Held::Ended;
           }
+          taken = taken.saturating_add(1);
         };
         step.close((env.clock)(), &mut costs);
         state.merge.checkpoint_costs = costs;
@@ -826,6 +832,27 @@ pub(crate) const CHECKPOINT_IDENTITY_STEPS: &str = "merge.checkpoint.identity_st
 /// Counter: the steps that held a checkpoint's encoding in the content store (A-579's last step), the non-vacuity count
 /// of [`CheckpointHold::step`]: more than one for a checkpoint is the hold spread over turns.
 pub(crate) const CHECKPOINT_HOLD_STEPS: &str = "merge.checkpoint.hold_steps";
+
+/// How many units a checkpoint hold's paced step takes where a test pins it ([`HOLD_UNITS_A_STEP`]); none in the
+/// product, where the step's quantum decides (`slates_pace::Step::more`).
+fn hold_units_a_step() -> Option<u32> {
+  #[cfg(test)]
+  {
+    HOLD_UNITS_A_STEP.with(std::cell::Cell::get)
+  }
+  #[cfg(not(test))]
+  {
+    None
+  }
+}
+
+#[cfg(test)]
+std::thread_local! {
+  /// Test support: every checkpoint hold step on this shard takes exactly this many units, as a step whose quantum
+  /// holds that many would: budget alone, through the hold's own units, so a test states the hold's rule for a quantum
+  /// it chooses instead of the one the machine learned (main's order of 2026-11-25).
+  pub(crate) static HOLD_UNITS_A_STEP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
 /// Counter: the longest step that held a checkpoint's encoding, nanoseconds (A-579's last step).
 pub(crate) const CHECKPOINT_HOLD_LONGEST_STEP_NS: &str = "merge.checkpoint.hold_longest_step_ns";
 /// Counter: a checkpoint's hold whose stage gave way to another checkpoint's, or whose green went (A-579).

@@ -143,15 +143,19 @@ fn chunks_of(len: u64) -> u64 {
 }
 
 /// A-579's last step (w-work-cow: a 1 GiB green's checkpoint recorded in one 650 to 1,063 ms step). Do: with someone
-/// waiting on the shard throughout, write a green one version of three 1 MiB files and destroy its work, which asks its
-/// first checkpoint. Expect: the destroy returns with the checkpoint not yet recorded (the green checkpointing, its floor
-/// unmoved); the shard then holds it in turns, in at least two steps a chunk of its encoding (one hashing it, one
-/// staging it), and records it by name; the store holds the named encoding whole, and a green rebuilt from it is the
-/// green it was taken from. Red before: the record was taken whole in the destroy's step (one hold step).
+/// waiting on the shard throughout and each hold step pinned to one unit (`HOLD_UNITS_A_STEP`: a quantum that holds one
+/// chunk's hash or stage, chosen by the test, not learned by the machine), write a green one version of three 1 MiB
+/// files and destroy its work, which asks its first checkpoint. Expect: the destroy returns with the checkpoint not yet
+/// recorded (the green checkpointing, its floor unmoved); the shard then holds it in turns, a step a unit, so at least
+/// two steps a chunk of its encoding (one hashing it, one staging it), and records it by name; the store holds the named
+/// encoding whole, and a green rebuilt from it is the green it was taken from. Red before: the record was taken whole in
+/// the destroy's step (one hold step). And under the machine's learned quantum the step count is the machine's: with
+/// two units a step pinned, the hold took 5 steps for 4 chunks (w-shared's merged run at load 47-57 failed so).
 #[test]
 fn a_large_checkpoint_is_held_a_chunk_a_step_with_someone_waiting_and_recorded_by_name() {
   let daemon = crate::daemon::audit_daemon();
   let green = crate::daemon::observe_first(&daemon, |state| {
+    super::HOLD_UNITS_A_STEP.with(|units| units.set(Some(1)));
     wait_until_taken(1);
     let root = green(state, "large");
     let id = to_db_volume(root);

@@ -35,6 +35,16 @@ enum ComputePhase {
   Resolving(usize, Box<Resolved>),
   /// Deciding the units.
   Deciding(Box<(Resolved, Deciding, position::Units)>),
+  /// What the units reach, a unit a unit ([`Reached::of`]'s walk; A-920 piece 3f).
+  Reaching(Box<Reaching>),
+}
+
+/// The units decided, what they reach being found from the next ([`ComputePhase::Reaching`]).
+struct Reaching {
+  units: Vec<position::Unit>,
+  at: usize,
+  windows: Vec<crate::ConflictWindow>,
+  applied: Vec<crate::chain_entry::Applied>,
 }
 
 impl core::fmt::Debug for ComputePhase {
@@ -44,6 +54,7 @@ impl core::fmt::Debug for ComputePhase {
       ComputePhase::Ended(answer) => f.debug_tuple("Ended").field(answer).finish(),
       ComputePhase::Resolving(at, _) => f.debug_tuple("Resolving").field(at).finish(),
       ComputePhase::Deciding(_) => f.write_str("Deciding"),
+      ComputePhase::Reaching(reaching) => f.debug_tuple("Reaching").field(&reaching.at).finish(),
     }
   }
 }
@@ -164,12 +175,46 @@ impl Green {
           return None;
         }
         let units = core::mem::replace(units, position::Units::first());
+        computing.phase = ComputePhase::Reaching(Box::new(Reaching {
+          units: units.into_units().0,
+          at: 0,
+          windows: Vec::new(),
+          applied: Vec::new(),
+        }));
+        None
+      }
+      ComputePhase::Reaching(reaching) => {
+        while let Some(unit) = reaching.units.get(reaching.at) {
+          Reached::reach_unit(unit, (&mut reaching.windows, &mut reaching.applied));
+          reaching.at = reaching.at.saturating_add(1);
+          if reaching.at < reaching.units.len() && spent() {
+            return None;
+          }
+        }
+        let Reaching {
+          units,
+          windows,
+          applied,
+          ..
+        } = core::mem::replace(
+          &mut **reaching,
+          Reaching {
+            units: Vec::new(),
+            at: 0,
+            windows: Vec::new(),
+            applied: Vec::new(),
+          },
+        );
         Some(Ok(Computed {
           id: inc.id,
           base: inc.base,
           at: computing.at,
           floor: computing.floor,
-          reached: Reached::of(units.into_units().0),
+          reached: Reached::Verdict {
+            units,
+            applied,
+            windows,
+          },
         }))
       }
     }
