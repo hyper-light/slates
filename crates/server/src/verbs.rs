@@ -11261,6 +11261,10 @@ fn judge_submission(
   evidence: Vec<[u8; 32]>,
   policy: SubmitPolicy,
 ) -> ReplyBody {
+  // A green this shard did not recover takes no merge, its engine lent or not (A-927's sweep).
+  if let Err(refusal) = state.recovered(sealed.green) {
+    return refused(refusal);
+  }
   // The submit's judgment is one step today (its verdict, its commit with the history's re-anchor, its encode): its
   // longest, and those past the shard's derived step bound (the ceiling a paced step runs to, A-783), counted.
   let began = slates_rt::futures::now_ns();

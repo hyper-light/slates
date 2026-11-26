@@ -3165,16 +3165,18 @@ pub mod platform {
   }
 
   impl Liveness {
-    /// Whether the daemon has gone: its process exited, or the object names no daemon or another one. A look that cannot
-    /// tell (the object's open refused for want of a descriptor, a full system table) decides nothing: the client
-    /// waits on, and the exit watch still guards the process (main 01a20182's ruling of 2026-11-25: a client short of
-    /// descriptors judged its live daemon gone at its 2 s reply deadline, `reap_map`'s starved hand-off).
+    /// Whether the daemon has gone: its process exited, or the object names no daemon or another one. A look at the
+    /// object that cannot tell (its open refused for want of a descriptor, a full system table) asks the rendezvous's
+    /// holder instead ([`holder_lives`]; on macOS a bootstrap name's lookup, which takes no descriptor): gone once none
+    /// holds it, and nothing decided while one does or the ask is refused too (main 01a20182's ruling of 2026-11-25: a
+    /// client short of descriptors judged its live daemon gone at its 2 s reply deadline, `reap_map`'s starved hand-off;
+    /// and one whose daemon stopped inside its process, which no exit watch sees, then waited for its reply forever).
     pub(super) fn daemon_gone(&self) -> bool {
       self.watch.exited()
         || match stamp_of(&self.instance) {
           Stamp::Found(now) => now != self.generation,
           Stamp::Gone => true,
-          Stamp::Unknown => false,
+          Stamp::Unknown => matches!(holder_lives(&self.instance), Ok(false)),
         }
     }
 

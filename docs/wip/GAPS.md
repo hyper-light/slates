@@ -270,8 +270,11 @@
 > first push "the default branch holds files no commit names" on a successor that had given the root green up.** A
 > create on a default green this node has not recovered now says so, naming the green and its cause, and one not made
 > here yet says to retry; before, both read as files, and a green not recovered whose engine was still lent took the
-> create. Red first (`t_a927_...`). OPEN (A-927 part 2, w-shared): the `Unjoined` adoption reads the join from its
-> cohort before giving the green up.
+> create. Red first (`t_a927_...`). Part 1b swept that class: a push's changes, an import batch, the owner's branch
+> verbs and a submit's verdict each refused `NotRecovered` on a green this shard did not recover, by one check
+> (`ShardState::recovered`) where each takes the green; before, each read only whether the engine was lent, and a
+> holder's replica stays lent past its give-up. Red first (four `t_a927_` tests in `repository::push::tests`). OPEN
+> (A-927 part 2, w-shared): the `Unjoined` adoption reads the join from its cohort before giving the green up.
 > **FIXED (A-913, w-shared, 2026-11-24; A-912's sibling): a branch created while a member died refused `unable to
 > commit` at its record barrier (3 of 25 runs).** The restarted holder held its source's records but no replica, and
 > the record path branched only from a replica already there; now it makes a missing source first, as a branch's
@@ -1951,6 +1954,18 @@
 > exit-status, EOF and close in order (`[94, 98, 96, 97]`) and the connection's end 3 µs to 47 ms after the close.
 > Since, a failure names which end it missed: the channel messages' order and the wait for the connection's end after
 > the close (`Adjusted::ending` in `vcs_ssh/tests/hg.rs`). Owed: the next red's line (main's whole runs).
+> A push's manifest chain read a stack frame a delta (2026-11-25, w-hg; main's order: a 2,000-changeset push overflowed
+> a debug shard's 2 MiB stack in `hg_clone_store_wait`): `chain_read` made the text level by level, each delta's
+> patching reading the level below, so a read of a line no delta touched recursed through every delta to the whole text,
+> its depth the chain's links (bounded by bytes, never by links). Since, the chain's deltas are folded once, lowest first,
+> into one list of pieces over the text (`mpatch`'s fold), each a range of the whole text or of a delta's bytes, on the
+> heap in the chain's room: nothing recurses, and a read is a search and copies. Held by
+> `a_deep_chain_is_read_on_a_shards_stack` (10,000 one-line deltas over a 1,000-line text read in pieces of 1 to 4,096
+> bytes, in a re-invoked child on a thread of a shard's 2 MiB: red, the child aborted on the overflow; now the text the
+> deltas make). The 2,000-changeset measurement now runs on 2 MiB stacks (46.6 s, 87.8 s at 8 MiB before). Swept: no
+> other recursion in `slates-hg` or `slates-store` follows the data's depth (`render::next_log` recurses at most twice);
+> elsewhere git's `reach` recurses by its index's levels, svn's `children` by its tree's height, vcs's merge sort to lg k,
+> and svn's ra_svn items by a nesting depth its parser bounds (`Bounds::depth`).
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads
@@ -14575,6 +14590,26 @@ debug test binary costs about what `/usr/bin/true` does. No measurable hold on t
 thread's worst `dup` + `close` was 6.6 ms during the spawns and 6.0 ms with none. So a hook spawn is a long step on
 the shard that makes it, against the 1 ms bar, in a daemon holding its clients' sockets. Owed: the spawner, A-924 (w-git's
 next piece).
+
+**After A-924 (main's 8a loop at 523c522c2, 2026-11-25, 12 burners, 6 rounds, load 30 to 65, logs
+`~/.cache/main-rounds/loop-8a/run-*.log` on the MacBook).** 8 wedges in 6 rounds against 120 in 4 at 5ce5e0b5f: the
+spawn storm is gone. Every wedge was "in task spawned at hook_driver.rs:842", no CPU progress and no wait for a CPU,
+1,011 to 1,031 ms, at the task's last poll (2, 4, 5 or 6 by test: the poll-2 one beside
+`a_hook_that_cannot_start_is_unstartable_by_its_cause`, which ends on its second). That poll drops the test's
+`TestSpawner`, which joined its spawner on the shard: `wait` for one installed, `join_spawner`'s liveness window and
+then the kill's `wait` for one owned, while a spawner still starting under load could not yet see its end close. Fixed:
+both joins run on a thread of their own (`spawning::join_off_the_shard`); reds
+`a_test_spawners_drop_never_joins_its_spawner_on_the_shard` (3.07 s on the shard before, a stopped spawner standing in
+for an unstarted one) and `an_owned_test_spawners_drop_never_joins_its_spawner_on_the_shard` (1.005 s, the window).
+Test-only: a daemon's owner hands its spawner to the process thread (A-924's start off the shard).
+
+`hooks_spawned_at_once_each_end_at_their_own_exit` failed 3 of 6 rounds (3.26, 3.50 and 5.92 s against `QUICK_RUN_NS`,
+2 s for the whole run). The whole run holds two starts of the 342 MB debug test binary, the spawner's and the hook's,
+which load stretches, so the bound raced the machine. Its question is whether a run ends at its hook's exit, so it is
+asked of that now: a run answers when the spawner answered its hook's exit (`hook_driver::Ended::exited_at_ns`), and a
+refusing run must end within a liveness window of it (`AFTER_EXIT_NS`), where a leaked words stream holds it its
+holder's four windows. `a_hooks_run_ends_at_its_exit_whatever_another_spawner_holds` asks the same. If the loop still
+fails either, the message now prints the time after the exit, which tells a hold from a slow start.
 
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 

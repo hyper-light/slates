@@ -135,6 +135,18 @@ struct Pending {
   /// The named texts its commit's check of its reads asked for and was lent (A-920 piece 3a): one asked again is
   /// refused, never lent twice.
   asked: std::collections::BTreeSet<slates_merge::named::Identity>,
+  /// Its commit's end, its chain entry being measured ([`ImportBatch::measure_pending`]).
+  measured: Option<Measured>,
+}
+
+/// A committed verdict whose chain entry is being measured a slice at a time (A-920 piece 1c: 6.5 ms whole at 9,000
+/// files, debug): its outcome, what it applied (its copies in the green's numbering) and the head's identity, kept
+/// once its entry's length is known.
+struct Measured {
+  outcome: Outcome,
+  applied: Vec<Applied>,
+  identity: Option<[u8; 32]>,
+  measuring: slates_merge::chain_entry::Measuring,
 }
 
 /// What a step of a pending verdict's commit left ([`ImportBatch::stage_step`]).
@@ -143,11 +155,11 @@ enum Stepped {
   More,
   /// Its check of its reads met these named texts unlent.
   Lend(std::collections::BTreeSet<slates_merge::named::Identity>),
-  /// Committed: its verdict.
-  Committed(StagedVerdict),
+  /// Committed: its verdict, its entry to measure.
+  Committed(Box<Measured>),
 }
 
-/// What [`finish_staged`] needs of a pending verdict ([`Pending`]).
+/// What [`committed`] needs of a pending verdict ([`Pending`]).
 struct PendingVerdict {
   offset: u64,
   reserved: usize,
@@ -467,6 +479,7 @@ impl ImportBatch {
           head,
           holders,
           asked: std::collections::BTreeSet::new(),
+          measured: None,
         });
         Ok(None)
       }
@@ -529,6 +542,9 @@ impl ImportBatch {
     let Some(mut pending) = self.pending.take() else {
       return Some(Err(StageRefused::Unavailable));
     };
+    if pending.measured.is_some() {
+      return self.measure_pending(state, pending, spent);
+    }
     let Some(preview) = self.preview.as_ref() else {
       return Some(Err(StageRefused::Unavailable));
     };
@@ -537,14 +553,13 @@ impl ImportBatch {
         CommitStep::More => Stepped::More,
         CommitStep::Lend(unlent) => Stepped::Lend(unlent),
         CommitStep::Committed(version, applied) => {
-          let staged = finish_staged(
+          let measured = committed(
             engine,
-            &pending.work,
             (&pending.verdict, pending.holders),
             (version, applied),
           );
           engine.let_named_bytes_go();
-          Stepped::Committed(staged)
+          Stepped::Committed(Box::new(measured))
         }
       }
     });
@@ -555,11 +570,47 @@ impl ImportBatch {
         None
       }
       Ok(Stepped::Lend(unlent)) => self.lend_pending(state, pending, unlent),
-      Ok(Stepped::Committed(staged)) => {
-        let Pending { work, head, .. } = pending;
-        Some(self.keep_staged(state, work, (Ok(staged), head)))
+      Ok(Stepped::Committed(measured)) => {
+        pending.measured = Some(*measured);
+        self.pending = Some(pending);
+        None
       }
     }
+  }
+
+  /// One step of `pending`'s chain entry's measure, its commit ended (A-920 piece 1c), a unit at least, until `spent`:
+  /// none while it goes on; once measured, the work kept ([`ImportBatch::keep_staged`]).
+  fn measure_pending(
+    &mut self,
+    state: &mut ShardState,
+    mut pending: Pending,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Option<Result<u64, StageRefused>> {
+    let Some(measured) = pending.measured.as_mut() else {
+      return Some(Err(StageRefused::Unavailable));
+    };
+    let lengths = (&pending.work, measured.applied.as_slice());
+    let Some(entry) =
+      slates_merge::chain_entry::measure_step(lengths, &mut measured.measuring, spent)
+    else {
+      self.pending = Some(pending);
+      return None;
+    };
+    let Pending {
+      work,
+      head,
+      verdict,
+      measured,
+      ..
+    } = pending;
+    let Measured {
+      outcome,
+      applied,
+      identity,
+      ..
+    } = measured?;
+    let staged = (outcome, Some(applied), identity, verdict.reserved, entry);
+    Some(self.keep_staged(state, work, (Ok(staged), head)))
   }
 
   /// Lends the scratch member the named texts `unlent` that `pending`'s commit met unlent, read from the content plane
@@ -786,15 +837,14 @@ fn judge_end(
   Judging::Judged((outcome, applied, identity, reserved, entry))
 }
 
-/// What a pending verdict ([`Pending`]) staged once its commit into the scratch member `engine` ended as `version`,
-/// `applied`: as [`judge_end`] answers an accepted work, its verdict's copies moved back into the green's numbering
-/// and its chain entry sized.
-fn finish_staged(
+/// A pending verdict committed into the scratch member `engine` as `version`, `applied` what it applied: its outcome, the
+/// head's identity where its record goes to holders, its copies' versions moved back into the green's numbering, and
+/// its chain entry's measure begun ([`ImportBatch::measure_pending`]; A-920 piece 1c).
+fn committed(
   engine: &mut Green,
-  work: &Increment,
   (verdict, holders): (&PendingVerdict, bool),
   (version, mut applied): (u64, Vec<Applied>),
-) -> StagedVerdict {
+) -> Measured {
   let outcome = if verdict.identical {
     Outcome::Identical { version }
   } else {
@@ -806,6 +856,10 @@ fn finish_staged(
       *version = version.saturating_add(verdict.offset);
     }
   }
-  let entry = slates_merge::chain_entry::encoded_len(work, &applied, holders);
-  (outcome, Some(applied), identity, verdict.reserved, entry)
+  Measured {
+    outcome,
+    applied,
+    identity,
+    measuring: slates_merge::chain_entry::measuring(holders),
+  }
 }

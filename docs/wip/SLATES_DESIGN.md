@@ -32139,6 +32139,10 @@ materialization; an unrecovered volume is answered on its owner shard, never for
   rule); a given-up object keeps the share unconfirmed (A-272), so the retirement stays kept and its holders keep their
   copies; a new configuration judges it afresh, so a member retired late (detection past the SLO under load) costs a
   refusal, never the object.
+- **Amended by A-927 part 1b** (2026-11-25): "every verb on it" now includes the writes that name a given-up green
+  through its repository, not by its volume id: a push's changes, an import batch, the owner's branch verbs and a
+  submit's verdict. Each asks `ShardState::recovered` where it takes the green. Before, they read only whether the
+  engine was lent, and a holder's replica stays lent after its give-up.
 
 ### A-305 — A daemon's shards write their log lines through an owned writer and never wait on standard error (2026-11-18, goal g251: every open slates bug fixed)
 Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 entry), `crates/machine/src/log.rs`
@@ -63613,6 +63617,19 @@ Applied in the same change to: `crates/git/src/store/{graph,mod}.rs`, `crates/gi
 > being read stays whole for its next revisions; a longer one keeps its newest, the oldest given back first. The fork's release gives the cache back.
 > Counted: `vcs_store.git_upload.tree_deltas` and `tree_deltas_most`. Red: the 13-tree chain's fetch applied 78
 > deltas; now 12, the chain built once (the walk reads the newest first, whose read applies the whole chain).
+>
+> **Its size: every chain one commit's walk reads (2026-11-25, main's git/git leg at 47de9566d).** Sized for the tree
+> being read, the cache kept one chain: on git/git's clone it widened 13 times to at most 3,103,050 B, was never
+> refused, and hit 6,702 times while the walk applied 2,004,133 deltas, every clone alike (the cache lives with the
+> fetch's fork). A clone's walk reads every directory's chain interleaved, so the directories read between two of one
+> directory's revisions put its chain out. Now the walk's graph sums the bytes of the trees it opens for each sent
+> commit (`PositionCache`'s `trees_met`, its most `trees_most`, measured as the position cache measures ids), and the
+> cache widens to a chain's entries (the learned depth's deltas and their base) times the most of those: the first
+> commit opens every tree, so every directory's chain fits. And the cache is laid in at least eight chunks
+> (`packed::CHUNKS_A_BUDGET`): under the mapped floor its one chunk was its whole budget, and gave everything back each
+> time it filled. Red: `a_fetchs_read_cache_keeps_every_interleaved_chain_whole`, eight directories and the root 12
+> revisions deep, 117 tree reads: 12 hits and 698 deltas before (budget 4,992 B); 94 hits and 187 deltas with the size
+> alone (budget 46,488 B); 108 hits, every read past each chain's first, and 108 deltas with the chunks.
 
 ### A-912 — A push during a member's death is accepted: no exchange holds a peer's record session across a wait that needs the council's next round, and a push's homing outlasts a death (2026-11-24, w-shared for main 01a20182, its rulings of 2026-11-24 ((i), (1), (a), (b)); found by A-908 part 4's fleet test; amends A-902; A-363, A-724 piece 6, A-727 (d1a), A-907)
 
@@ -64200,6 +64217,17 @@ GAPS.
   each path's last change, their bytes); `changed_since_reports_every_dimension_as_changed_between_does` and
   `changed_since_reads_the_span_alone_and_folds_with_the_histories` (merge's integration tests) fail where an earlier
   entry stays marked last, which no lib test caught; a version's list never kept fails 33 lib tests.
+  **1c, the entry's measure.** What was left of the commit's end step (6.2-6.7 ms) was the batch measuring its chain
+  entry whole (`chain_entry::encoded_len` in `finish_staged`). `chain_entry::measuring` and `measure_step` take it a
+  unit a step: what the work declares indexed an op a unit, its names held by the measure itself
+  (`DeclaredBy<String>`; `Declared` is the same index borrowing the work's names, both built by one `declare`), then
+  each effect's bytes added an effect a unit, then the same trailers (`tail_bytes`). The batch's commit ends in
+  `committed` (outcome, the head's identity, the copies' versions back in the green's numbering) and the measure is a
+  phase of the pending work (`ImportBatch::measure_pending`). The commit's end step 6.2-6.7 ms → under 5 ms (2 runs,
+  load 38-82). Oracle: over generated works of every kind, renames and edits, every accepted verdict's entry measured a
+  unit a step is `encoded_len`'s, with a head identity and without, and some verdict records a splice, the effect whose
+  length reads what the work declares (`an_entry_measured_a_unit_a_step_is_the_entry_measured_whole`; a resumed index
+  that skips an op fails it, which the first generator, with no edits, did not).
 - **Piece 2, the record check.** Its 101-106 ms at 9,000 files were the index's plan of the revision's rows
   (`Index::plan`, 96 ms: its builder's apply of each row 87, the rows' sort 3.9, the plan's finish 4.4), the fresh
   texts (9 ms), the record's encoding (4 ms) and the stored filter (1.6 ms). The plan is taken a slice at a time:
@@ -64473,7 +64501,14 @@ measured noise of the 100 figure, not a literal.
 > 1,984K fresh and 2,000K 60 s later (RSS 6,576 KiB), against the daemon's 38M (RSS 49,568 KiB): about 5 %, flat; no
 > process of the binary left after the stop. Linux (diag 2, debug, 4-core runners), a start's median on the asking
 > thread through the spawner against direct: x86_64 94.3 / 102.7 / 96.1 µs at 100 / 10,000 / 65,527 descriptors
-> against 214.4 µs / 674.5 µs / 3.26 ms; arm64 94.5 / 94.8 / 80.5 µs against 272.7 / 354.3 / 670.2 µs.
+> against 214.4 µs / 674.5 µs / 3.26 ms; arm64 94.5 / 94.8 / 80.5 µs against 272.7 / 354.3 / 670.2 µs. Diag 3 (run
+> 45711714350 at 0b9a3f9e8, after the close-on-exec fix): `slates-ipc --lib spawner` 8 of 8 on both Linux lanes,
+> `a_child_started_through_the_spawner_holds_what_a_direct_one_holds` included, so the parity condition is met on
+> Linux. Through the spawner against direct, least / median / most: x86_64 at 100 descriptors 68.6 / 74.1 / 90.2 µs
+> against 178.3 / 188.7 / 243.2 µs; at 10,000, 66.2 / 68.5 / 76.8 against 506.2 / 534.0 / 578.3 µs; at 65,527, 65.7 /
+> 65.8 / 74.5 µs against 2.32 / 2.34 / 2.36 ms. arm64 at 100, 89.5 / 105.2 / 117.7 against 270.9 / 313.3 / 394.5 µs; at
+> 10,000, 84.4 / 100.3 / 152.6 against 371.3 / 390.7 / 424.6 µs; at 65,527, 80.9 / 91.5 / 157.9 against 674.7 / 705.9 /
+> 746.9 µs. A start through the spawner stays at 66 to 105 µs at the median whatever the daemon holds open.
 
 ### A-923 — The Aways family is keyed by let-go number, and every capped cut read counts each entry's page head (2026-11-25, w-perf for main 01a20182, its churn ruling (b) and its rulings on the format and the read cap; A-870, A-767 C1 step 2b)
 
@@ -64644,3 +64679,35 @@ measured noise of the 100 figure, not a literal.
 - **Models.** None of `docs/wip/models/` models a push's create; no spec changed.
 - **Applied in the same change to:** `crates/server/src/git_push.rs` (the module docs' "A create", `NoEmptyDefault`,
   `empty_default`), its tests, A-915's entry, GAPS (A-915's entry).
+
+### A-927 part 1b — Every write naming a green this shard did not recover is refused `NotRecovered`, by one check where the write takes the green (2026-11-25, w-shared for main 01a20182, its ruling of 2026-11-25 on part 1's second bug; amends A-304)
+
+- **Why.** Part 1's red found a create landing on a green recorded unrecovered whose engine was still lent. A takeover
+  that gives a green up records it in `ShardState::unrecovered` and leaves `state.greens` as it was, and a holder's
+  replica (A-908) is lent there. A verb addressed by the green's volume id answers `NotRecovered` (`verbs::find`,
+  `merge_service::find_record`). A write addressed by the green's repository read only whether the engine was lent, and
+  wrote to state this node had not recovered.
+- **The sweep** (every path that writes a green or a repository's name for one, followed to where it takes the green):
+  - `repository::push::plan`: the one interface for git's receive-pack, Mercurial's unbundle and import, the LFS locks
+    and a Subversion commit (`RepositoryLogs::append`). Each change's green is checked before its own rules: an
+    update's, a deferred update's, a create's source and a delete's (the green its name binds).
+  - `repository::push::append_versions`: an import batch's versions, appended past the plan.
+  - `repository::{create_branch, bind_branch, retire_branch}`: the owner's branch verbs (the source, the green bound,
+    the green the retired name binds).
+  - `verbs::judge_submission`: a submit's verdict, the owner's half, local or asked by `work_home` (`owner_judge`).
+  - Part 1's `git_push::empty_default`, already landed, keeps its own words, which name the green.
+  - Not a boundary: a work's edits, reads and conflicts (`merge_service::require_work`), which write the work and not
+    its green; `DestroyRepository`, still served, as `verbs::destroy_unrecovered` serves a volume's destroy; the
+    store's internal holds (`vcs_store::name_holds`, `svn_texts`), which run under the verbs above.
+- **The check.** One method, `ShardState::recovered(green) -> Result<(), Refusal>`: `NotRecovered` with the recorded
+  cause, or `Ok`. Each boundary above calls it before it reads the engine, and `merge_service::find_record` now calls
+  it too.
+- **Tests.** Red on the code before, each for one boundary (`repository::push::tests`):
+  - `t_a927_a_push_naming_greens_not_recovered_refuses_each_change`: an update, a create from it and a delete, each
+    refused by index (before, all three applied);
+  - `t_a927_an_import_batch_onto_a_green_not_recovered_is_refused` (before, recorded);
+  - `t_a927_the_branch_verbs_naming_a_green_not_recovered_are_refused` (before, `CreateBranch` made the green);
+  - `t_a927_a_submit_into_a_green_not_recovered_is_refused` (before, accepted at version 1).
+- **Models.** None of `docs/wip/models/` models a give-up's record or a verb's refusal of it; no spec changed.
+- **Applied in the same change to:** `crates/server/src/{state,repository,merge_service,verbs}.rs`,
+  `crates/server/src/repository/push.rs` and its tests, A-304's entry, GAPS (A-915's entry).
