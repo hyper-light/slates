@@ -1882,3 +1882,409 @@ fn a_push_whose_keeping_and_its_widest_step_pass_its_repositorys_ceiling_is_refu
     assert_eq!(passes.err(), Some(super::past_ceiling()));
   });
 }
+
+/// Decodes a bundle2 push reply into `(part_kind, message_param)` pairs for error assertions.
+fn error_parts(bytes: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+  let bundle = Bundle2::decode(bytes, &mut room()).unwrap();
+  bundle
+    .top_level()
+    .map(|(_, part)| {
+      (
+        part.kind.to_vec(),
+        part.param(b"message").map(<[u8]>::to_vec),
+      )
+    })
+    .collect()
+}
+
+/// Encodes a bundle2 push stream carrying `check:heads` (`expected_heads`) and `changegroup` (`part`).
+fn bundle2_push(expected_heads: &[Node], part: &ChangegroupPart) -> Vec<u8> {
+  use slates_hg::bundle2::{Event, Param, Part};
+  let mut heads_payload = Vec::with_capacity(expected_heads.len() * 20);
+  for node in expected_heads {
+    heads_payload.extend_from_slice(node);
+  }
+  let stream = Bundle2 {
+    params: Vec::new(),
+    parts: vec![
+      Part {
+        kind: b"CHECK:HEADS",
+        id: 0,
+        params: Vec::new(),
+        mandatory_params: 0,
+        depth: 0,
+      },
+      Part {
+        kind: b"CHANGEGROUP",
+        id: 1,
+        params: vec![Param {
+          key: b"version",
+          value: b"03",
+        }],
+        mandatory_params: 1,
+        depth: 0,
+      },
+    ],
+    events: vec![
+      Event::Open(0),
+      Event::Chunk(&heads_payload),
+      Event::Close,
+      Event::Open(1),
+      Event::Chunk(&part.payload),
+      Event::Close,
+    ],
+  };
+  let mut out = Vec::new();
+  stream.encode(&mut out).unwrap();
+  out
+}
+
+/// Opens a competing content-store stage on `green` at `sequence` with a distinct manifest so a concurrent push's
+/// `AheadHold` targeting the same green and sequence hits a real `ContentRefusal::StaleStage`.
+fn stage_competing_increment(state: &mut ShardState, green: DbVolumeId, sequence: u64) {
+  let payload = b"competing concurrent push increment";
+  let extent = crate::merge_origin::inputs_extent(0, payload);
+  let archive = crate::merge_origin::inputs_manifest_archive_of(
+    vec![extent],
+    u64::try_from(payload.len()).unwrap(),
+    0,
+    crate::merge_service::archive_page(state),
+  );
+  let opened = state.held_content.stage_fetched(
+    &mut crate::content_holder::hold_space(&mut state.store),
+    slates_db::register::ObjectId(green.bytes),
+    slates_cluster::content::Placed { sequence },
+    &archive,
+  );
+  assert!(
+    matches!(opened, Ok(Some(_))),
+    "expected a live competing stage, got {opened:?}"
+  );
+}
+
+/// Red-team `rt1-hg-claude` (`push_race_wrong_refusal.sh`, AC-HG.5): do open a competing content-store stage on a
+/// repository's default branch green at `base_version + 1` (producing a real `ContentRefusal::StaleStage` during
+/// `held_ahead`), then push stock `push-plain` through `super::unbundle`. Expect a bundle2 `ERROR:PUSHRACED` reply
+/// with stock 7.2's `"remote repository changed while pushing - please try again"`, never the capacity `UNHELD`
+/// `ERROR:ABORT`, and no commit landed.
+#[test]
+fn a_competing_stage_during_hg_push_answers_error_pushraced() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, root, version, pushed_node) = crate::daemon::observe_first(&daemon, |state| {
+    let mut hg = Hg::new(state, "stale-stage-race");
+    let made = rebuild(state, &mut hg, (&[1], 1));
+    let version = state.db.partition().green_head(hg.root);
+    stage_competing_increment(state, hg.root, version + 1);
+    (hg.repository, hg.root, version, made[3].node)
+  });
+  let (sent, got) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |_state| {
+    let task = slates_rt::futures::spawn(async move {
+      let principal = owner();
+      let heads = HeadsArgument::Force;
+      let mut admission = room();
+      let outcome = super::unbundle(
+        repository,
+        (&principal, &heads, &fixture!("push-plain.hg")[..]),
+        &mut admission,
+      )
+      .await;
+      let _ = sent.send(outcome);
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let outcome = got.recv_timeout(TASK_WAIT).unwrap();
+  let (after_version, held_pushed) = crate::daemon::observe_first(&daemon, move |state| {
+    let hg = Hg { repository, root };
+    (
+      state.db.partition().green_head(root),
+      hg.holds(state, &pushed_node),
+    )
+  });
+  daemon.stop();
+  let Some(Outcome::Refused(reply)) = outcome else {
+    panic!("expected refused push, got {outcome:?}");
+  };
+  let parts = error_parts(&encoded(&reply));
+  assert_eq!(
+    parts,
+    vec![(
+      b"ERROR:PUSHRACED".to_vec(),
+      Some(slates_hg::push::check::RACED.to_vec()),
+    )]
+  );
+  assert_eq!((after_version, held_pushed), (version, false));
+  let Outcome::Refused(capacity_reply) = super::hold_refused_outcome(super::HoldRefusal::Capacity)
+  else {
+    panic!("expected capacity refusal outcome");
+  };
+  assert_eq!(
+    error_parts(&encoded(&capacity_reply)),
+    vec![(b"ERROR:ABORT".to_vec(), Some(super::UNHELD.to_vec()))],
+  );
+}
+
+/// Red-team `rt1-hg-claude` (`push_race_wrong_refusal.sh`, AC-HG.5): do launch two concurrent `super::unbundle` pushes
+/// carrying divergent children of the same head on one daemon shard. Expect one winner, one loser answered with bundle2
+/// `ERROR:PUSHRACED` (`"remote repository changed while pushing - please try again"`, never `UNHELD`), and exactly one
+/// head on `default`.
+#[test]
+fn concurrent_divergent_hg_pushes_answer_loser_error_pushraced() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let commits: [Commit; 3] = [
+    ("seed", "seed.txt", b"seed\n", None, "default"),
+    ("left", "left.txt", b"left\n", Some(0), "default"),
+    ("right", "right.txt", b"right\n", Some(0), "default"),
+  ];
+  let made = history_of(&commits);
+  let left_bundle = bundle2_push(&[made[0].node], &changegroup(&made, &[1]));
+  let right_bundle = bundle2_push(&[made[0].node], &changegroup(&made, &[2]));
+  let (seed_node, left_node, right_node) = (made[0].node, made[1].node, made[2].node);
+  let (repository, root) = crate::daemon::observe_first(&daemon, move |state| {
+    let mut hg = Hg::new(state, "concurrent-race");
+    let seed = Unbundle {
+      parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[0])))],
+    };
+    assert!(hg.push(state, &seed, &View::default()).is_ok());
+    (hg.repository, hg.root)
+  });
+  let (sent, got) = std::sync::mpsc::sync_channel(2);
+  let spawn_push = move |bundle: Vec<u8>, tx: std::sync::mpsc::SyncSender<Option<Outcome>>| {
+    let task = slates_rt::futures::spawn(async move {
+      let principal = owner();
+      let heads = HeadsArgument::Force;
+      let mut admission = room();
+      let outcome =
+        super::unbundle(repository, (&principal, &heads, &bundle), &mut admission).await;
+      let _ = tx.send(outcome);
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  };
+  let tx_left = sent.clone();
+  crate::daemon::observe_first(&daemon, move |_state| {
+    spawn_push(left_bundle, tx_left);
+    spawn_push(right_bundle, sent);
+  });
+  let first = got.recv_timeout(TASK_WAIT).unwrap();
+  let second = got.recv_timeout(TASK_WAIT).unwrap();
+  let (final_head, line_count) = crate::daemon::observe_first(&daemon, move |state| {
+    let lines = state
+      .db
+      .partition()
+      .repositories()
+      .branches(repository, LINE_TAG)
+      .count();
+    (head(state, root), lines)
+  });
+  daemon.stop();
+  let outcomes = [first, second];
+  let accepted = outcomes
+    .iter()
+    .filter(|outcome| matches!(outcome, Some(Outcome::Accepted(_))))
+    .count();
+  let refused: Vec<&Reply> = outcomes
+    .iter()
+    .filter_map(|outcome| match outcome {
+      Some(Outcome::Refused(reply)) => Some(reply),
+      _ => None,
+    })
+    .collect();
+  assert_eq!((accepted, refused.len(), line_count), (1, 1, 1));
+  assert!(
+    final_head == Some(left_node) || final_head == Some(right_node),
+    "expected one winner head past {}, got {final_head:?}",
+    hex(&seed_node)
+  );
+  let parts = error_parts(&encoded(refused[0]));
+  assert_eq!(
+    parts,
+    vec![(
+      b"ERROR:PUSHRACED".to_vec(),
+      Some(slates_hg::push::check::RACED.to_vec()),
+    )]
+  );
+}
+
+/// Builds a single-changeset changegroup 03 with explicit `claimed_node` and `parent` for corrupt/dangling-node tests.
+fn single_changeset_changegroup(claimed_node: Node, parent: Node, text: &[u8]) -> ChangegroupPart {
+  let mut delta_bytes = Vec::new();
+  delta::encode_full_text(text, &mut delta_bytes).unwrap();
+  let group = Changegroup {
+    version: Version::V03,
+    revisions: vec![full_text(claimed_node, parent, claimed_node, &delta_bytes)],
+    changelog: 0..1,
+    manifests: 1..1,
+    trees: Vec::new(),
+    files: Vec::new(),
+  };
+  let mut payload = Vec::new();
+  group.encode(&mut payload).unwrap();
+  ChangegroupPart {
+    version: Version::V03,
+    changesets: None,
+    target_phase: None,
+    tree_manifests: false,
+    payload,
+  }
+}
+
+/// Asserts that `message` contains every 40-char lowercase hex node in `expected_hex` and contains no Rust `Debug`
+/// decimal byte array (`[b0, b1, ...]`).
+fn assert_hex_wire_refusal(message: &[u8], expected_nodes: &[Node]) {
+  let text = String::from_utf8_lossy(message);
+  assert!(
+    !text.contains('['),
+    "wire refusal leaked Rust Debug array formatting: {text}"
+  );
+  for node in expected_nodes {
+    let expected = hex(node);
+    assert!(
+      text.contains(&expected),
+      "wire refusal missing 40-hex node {expected}: {text}"
+    );
+    let decimal = format!("{node:?}");
+    assert!(
+      !text.contains(&decimal),
+      "wire refusal leaked decimal byte array {decimal}: {text}"
+    );
+  }
+}
+
+/// Verifies every node-carrying `Unverified`, `Unindexed`, and `WorkRefused` formatter renders 40-char lowercase hex
+/// node IDs without Rust `Debug` decimal byte arrays.
+fn assert_formatted_hex_refusals(orphan_node: Node, stranger: Node) {
+  let unverified_cases = [
+    (
+      slates_hg::push::verify::Unverified::UnknownDeltaBase {
+        log: slates_hg::push::verify::LogOf::Manifests,
+        node: orphan_node,
+        base: stranger,
+      },
+      vec![orphan_node, stranger],
+    ),
+    (
+      slates_hg::push::verify::Unverified::UnknownLink {
+        log: slates_hg::push::verify::LogOf::File(b"a.txt".to_vec()),
+        node: orphan_node,
+        link: stranger,
+      },
+      vec![orphan_node, stranger],
+    ),
+    (
+      slates_hg::push::verify::Unverified::MissingManifest {
+        changeset: orphan_node,
+        manifest: stranger,
+      },
+      vec![orphan_node, stranger],
+    ),
+    (
+      slates_hg::push::verify::Unverified::MissingFile {
+        path: b"a.txt".to_vec(),
+        node: stranger,
+      },
+      vec![stranger],
+    ),
+    (
+      slates_hg::push::verify::Unverified::Node {
+        log: slates_hg::push::verify::LogOf::Changelog,
+        node: orphan_node,
+        fault: node::Refusal::CollisionAttack(node::CollisionAttack { sha1: stranger }),
+      },
+      vec![orphan_node, stranger],
+    ),
+    (
+      slates_hg::push::verify::Unverified::Changegroup(slates_hg::changegroup::Refusal::Delta {
+        node: stranger,
+        refusal: delta::Refusal::Undecodable { at: 4 },
+      }),
+      vec![stranger],
+    ),
+  ];
+  for (fault, nodes) in &unverified_cases {
+    assert_hex_wire_refusal(&super::unverified_words(fault), nodes);
+  }
+  for fault in [
+    slates_hg::push::commit::Unindexed::Index(slates_hg::index::Refused::MissingParent {
+      node: stranger,
+    }),
+    slates_hg::push::commit::Unindexed::Index(slates_hg::index::Refused::MissingLink {
+      node: stranger,
+    }),
+  ] {
+    assert_hex_wire_refusal(&super::unindexed_words(&fault), &[stranger]);
+  }
+  for (work_fault, expected) in [
+    (
+      slates_hg::push::tree::WorkRefused::Layout(
+        slates_hg::push::tree::LayoutRefusal::MissingChangeset { node: stranger },
+      ),
+      stranger,
+    ),
+    (
+      slates_hg::push::tree::WorkRefused::Layout(
+        slates_hg::push::tree::LayoutRefusal::MissingManifest { node: orphan_node },
+      ),
+      orphan_node,
+    ),
+  ] {
+    assert_hex_wire_refusal(&super::work_refused_words(&work_fault), &[expected]);
+  }
+}
+
+/// Red-team `rt1-hg-claude` (`fuzz_corrupt-node.txt`, AC-HG.9): do push a bundle with a corrupt changeset node hash
+/// and a bundle with a dangling unknown parent through the driver, and format node-carrying `Unverified`, `Unindexed`,
+/// and `WorkRefused` refusals. Expect every refusal's message to render 40-char lowercase hex node IDs in plain
+/// English, never Rust `Debug` decimal byte arrays like `[198, 103, 136, ...]`.
+#[test]
+fn corrupt_node_and_dangling_parent_wire_refusals_format_40_hex_nodes() {
+  crate::test_store::audit_on_stored_shard("hg-hex-refusal", |state| {
+    let mut hg = Hg::new(state, "hex-refusal");
+    let made = rebuild(state, &mut hg, (&[1], 1));
+    let mut corrupt_node = made[3].node;
+    corrupt_node[0] ^= 0xff;
+    let corrupt_bundle = bundle2_push(
+      &[made[1].node],
+      &single_changeset_changegroup(corrupt_node, made[1].node, &made[3].text),
+    );
+    let principal = owner();
+    let heads = HeadsArgument::Force;
+    let corrupt_outcome = drive(
+      state,
+      hg.repository,
+      (&principal, &heads, &corrupt_bundle),
+      &mut room(),
+    );
+    let Some(Outcome::Refused(corrupt_reply)) = corrupt_outcome else {
+      panic!("expected corrupt node refusal, got {corrupt_outcome:?}");
+    };
+    let corrupt_parts = error_parts(&encoded(&corrupt_reply));
+    let corrupt_msg = corrupt_parts[0].1.as_deref().expect("abort message");
+    assert_eq!(corrupt_parts[0].0, b"ERROR:ABORT");
+    assert_hex_wire_refusal(corrupt_msg, &[corrupt_node, made[3].node]);
+
+    let stranger: Node = [
+      198, 103, 136, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+    ];
+    let orphan_node = node::compute(&stranger, &NULL_NODE, &made[3].text).unwrap();
+    let orphan_bundle = bundle2_push(
+      &[made[1].node],
+      &single_changeset_changegroup(orphan_node, stranger, &made[3].text),
+    );
+    let orphan_outcome = drive(
+      state,
+      hg.repository,
+      (&principal, &heads, &orphan_bundle),
+      &mut room(),
+    );
+    let Some(Outcome::Refused(orphan_reply)) = orphan_outcome else {
+      panic!("expected unknown parent refusal, got {orphan_outcome:?}");
+    };
+    let orphan_parts = error_parts(&encoded(&orphan_reply));
+    let orphan_msg = orphan_parts[0].1.as_deref().expect("abort message");
+    assert_eq!(orphan_parts[0].0, b"ERROR:ABORT");
+    assert_hex_wire_refusal(orphan_msg, &[orphan_node, stranger]);
+    assert_formatted_hex_refusals(orphan_node, stranger);
+  });
+}

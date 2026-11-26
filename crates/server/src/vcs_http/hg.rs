@@ -20,9 +20,11 @@
 //! 5. The policy. A principal the policy lets read none of the repository is `403`, for every request, as hgweb's
 //!    `checkauthz` reads `deny_read` and `allow_read` first. A push (`unbundle`, `pushkey`) also needs `POST` (`405`
 //!    with `Allow: POST`, hgweb's "push requires POST request") and a right to submit, rewrite or delete (`403`).
-//! 6. The service. hgweb's pages (a request naming no command of 7.2's table: the repository's browsing URLs,
-//!    §4.17.3 piece 12) are `503`, and so is a repository whose served view this shard does not lend ([`HgStores`]: A-662
-//!    keeps each repository's store on its owner shard, and the daemon's lender makes the view over it, A-680 part 2).
+//! 6. The service. An unknown or empty wire command (`?cmd=rt_unknown`, `?cmd=`, `?cmd`) is `400`, matching stock
+//!    hgweb (`wireprotoserver.handlewsgirequest`). hgweb's pages (a request with no `cmd` parameter: the repository's
+//!    browsing URLs, §4.17.3 piece 12) are `503`, and so is a repository whose served view this shard does not lend
+//!    ([`HgStores`]: A-662 keeps each repository's store on its owner shard, and the daemon's lender makes the view
+//!    over it, A-680 part 2).
 //!
 //! A served request is `200`: its body is the command's answer and its media type the one the answer names
 //! (`application/mercurial-0.1`, `-0.2` or `application/hg-error`), given as the reply begins.
@@ -411,12 +413,23 @@ impl Compressor for LearnedCompressor {
   }
 }
 
+/// What kind of Mercurial HTTP request a query string names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandKind {
+  /// No `cmd` query parameter: an hgweb browsing URL, refused `503`.
+  WebPage,
+  /// A `cmd` query parameter whose value is empty or not in 7.2's wire command table: refused `400`.
+  UnknownWire,
+  /// A wire command in 7.2's table, with the permission it requires.
+  Wire(Permission),
+}
+
 /// What a routed head names: its repository, and the wire command its query names, if any.
 struct Routed {
   /// The repository's name.
   name: String,
-  /// The permission the query's command needs, `None` where it names no command of 7.2's table (hgweb's pages).
-  permission: Option<Permission>,
+  /// Whether the query names an hgweb page, an unknown/empty wire command, or a known wire command.
+  command: CommandKind,
   /// Whether the command is `unbundle`, a push's bundle (the module doc's push).
   unbundle: bool,
   /// Whether the command is `pushkey`, landed as a push of one key (A-758).
@@ -475,7 +488,10 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
       Ok(routed) => routed,
       Err(status) => return refused_with(status, Fields::new(), false),
     };
-    if routed.permission.is_some() && head.method != GET && head.method != PUSH_METHOD {
+    if matches!(routed.command, CommandKind::Wire(_))
+      && head.method != GET
+      && head.method != PUSH_METHOD
+    {
       return refused_with(Status::METHOD_NOT_ALLOWED, allow(WIRE_METHODS), false);
     }
     let principal = match self.proof(head).await {
@@ -496,7 +512,7 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
     else {
       return refused_with(Status::NOT_FOUND, Fields::new(), true);
     };
-    if let Some(refused) = judged(&repository, &principal, head, routed.permission) {
+    if let Some(refused) = judged(&repository, &principal, head, routed.command) {
       return refused;
     }
     if !self.stores.holds(repository.id) {
@@ -568,13 +584,40 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> Site for HgSite<A, 
   }
 }
 
-/// The policy's refusal of `principal` on `repository` for a request needing `permission`, if any (the module doc,
-/// steps 4 and 5): read first, then hgweb's pages, then a push's method and rights.
+/// The policy's refusal for a push wire command (`unbundle`, `pushkey`): method must be `POST` (`405`), and the
+/// principal must hold at least one write right (`403`).
+fn push_judged<E>(
+  repository: &RepositoryRecord,
+  principal: &Principal,
+  head: &Head<'_>,
+) -> Option<Decided<E>> {
+  if head.method != PUSH_METHOD {
+    return Some(refused_with(
+      Status::METHOD_NOT_ALLOWED,
+      allow(PUSH_METHOD),
+      true,
+    ));
+  }
+  let push = [Right::Submit, Right::Rewrite, Right::Delete];
+  match vcs_policy::reaches(repository, principal, &push) {
+    Ok(true) => None,
+    Ok(false) => Some(refused_with(Status::FORBIDDEN, Fields::new(), true)),
+    Err(_) => Some(refused_with(
+      Status::INTERNAL_SERVER_ERROR,
+      Fields::new(),
+      true,
+    )),
+  }
+}
+
+/// The policy's refusal of `principal` on `repository` for a request of `command` kind, if any (the module doc,
+/// steps 5 and 6): read first, then hgweb's pages (`503`) or unknown/empty wire commands (`400`), then a push's
+/// method and rights.
 fn judged<E>(
   repository: &RepositoryRecord,
   principal: &Principal,
   head: &Head<'_>,
-  permission: Option<Permission>,
+  command: CommandKind,
 ) -> Option<Decided<E>> {
   let refused = |status| Some(refused_with(status, Fields::new(), true));
   match vcs_policy::reaches(repository, principal, &[Right::Read]) {
@@ -583,22 +626,11 @@ fn judged<E>(
     // A policy its tool cannot read is a damaged record (A-622's guard keeps such rules out): never judged without it.
     Err(_) => return refused(Status::INTERNAL_SERVER_ERROR),
   }
-  match permission {
-    None => refused(Status::SERVICE_UNAVAILABLE),
-    Some(Permission::Pull) => None,
-    Some(Permission::Push) if head.method != PUSH_METHOD => Some(refused_with(
-      Status::METHOD_NOT_ALLOWED,
-      allow(PUSH_METHOD),
-      true,
-    )),
-    Some(Permission::Push) => {
-      let push = [Right::Submit, Right::Rewrite, Right::Delete];
-      match vcs_policy::reaches(repository, principal, &push) {
-        Ok(true) => None,
-        Ok(false) => refused(Status::FORBIDDEN),
-        Err(_) => refused(Status::INTERNAL_SERVER_ERROR),
-      }
-    }
+  match command {
+    CommandKind::WebPage => refused(Status::SERVICE_UNAVAILABLE),
+    CommandKind::UnknownWire => refused(Status::BAD_REQUEST),
+    CommandKind::Wire(Permission::Pull) => None,
+    CommandKind::Wire(Permission::Push) => push_judged(repository, principal, head),
   }
 }
 
@@ -614,6 +646,14 @@ pub(crate) fn wire_request(head: &Head<'_>, room: u64) -> bool {
     return false;
   };
   hg_http::command(query, &mut Admission::new(room)).is_ok_and(|command| command.is_some())
+}
+
+/// Classifies a query's `cmd` parameter into an hgweb page, an unknown/empty wire command, or a known wire command.
+fn command_kind(command: Option<&[u8]>) -> CommandKind {
+  match command {
+    None => CommandKind::WebPage,
+    Some(name) => hg_http::permission(name).map_or(CommandKind::UnknownWire, CommandKind::Wire),
+  }
 }
 
 /// Routes `head` (the module doc's names): its repository's name and its command's permission, each read within
@@ -640,7 +680,7 @@ fn route(head: &Head<'_>, room: u64) -> Result<Routed, Status> {
   };
   Ok(Routed {
     name,
-    permission: command.as_deref().and_then(hg_http::permission),
+    command: command_kind(command.as_deref()),
     unbundle: command.as_deref() == Some(hg_http::UNBUNDLE),
     pushkey: command.as_deref() == Some(slates_hg::serve::keys::COMMAND),
     batch: command.as_deref() == Some(hg_http::BATCH),

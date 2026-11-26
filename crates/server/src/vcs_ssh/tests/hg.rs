@@ -1923,3 +1923,70 @@ fn a_mercurial_push_is_counted_and_learned_on_its_repositorys_usage_row() {
     "its bytes learned: {learned:?}"
   );
 }
+
+/// Drives `input` through an SSH `HgCommand` at single-byte and whole cuts and asserts a typed out-of-band refusal
+/// (`\n` on stdout, non-empty refusal ending `\n-\n` on stderr).
+fn assert_ssh_out_of_band_refusal(lends: Lends, input: &[u8]) {
+  for cut in [1, input.len()] {
+    let channel = session(lends, None, input, cut);
+    assert_eq!(
+      (channel.stdout, channel.consumed, channel.exited),
+      (b"\n".to_vec(), input.len(), Some(EXIT_STATUS)),
+      "cut {cut} input {:?}",
+      String::from_utf8_lossy(input)
+    );
+    assert!(
+      channel.stderr.ends_with(b"\n-\n") && channel.stderr.len() > 3,
+      "expected typed SSH out-of-band refusal on stderr, got {:?}",
+      String::from_utf8_lossy(&channel.stderr)
+    );
+  }
+}
+
+/// Red-team `rt1-hg-claude` (`ssh_probes.sh` row `known-badhex`, AC-HG.9): do send SSH `known` with non-hex node input
+/// both truncated without `* 0\n` before EOF (the exact `ssh_probes.sh` probe) and fully framed with `* 0\n`, at
+/// single-byte and whole cuts and over the real SSH edge; also send valid `known`, empty EOF, and `heads\n`. Expect
+/// every malformed `known` to return a typed Mercurial SSH out-of-band refusal (`\n` on stdout and a non-empty refusal
+/// line ending `\n-\n` on stderr — never silent empty output), while valid requests and clean EOF keep exact behavior.
+#[test]
+fn ssh_known_with_non_hex_node_returns_a_typed_refusal_never_empty_output() {
+  let lends = Lends::probed();
+  let bad_truncated = b"known\nnodes 40\nzz00000000000000000000000000000000000000";
+  let bad_framed = b"known\n* 0\nnodes 40\nzz00000000000000000000000000000000000000";
+  let bad_odd = b"known\n* 0\nnodes 3\nabc";
+  let good_null = b"known\n* 0\nnodes 40\n0000000000000000000000000000000000000000";
+
+  for input in [&bad_truncated[..], &bad_framed[..], &bad_odd[..]] {
+    assert_ssh_out_of_band_refusal(lends, input);
+  }
+
+  let valid = session(lends, None, good_null, good_null.len());
+  assert_eq!(
+    (valid.stdout, valid.stderr, valid.exited),
+    (b"1\n1".to_vec(), Vec::new(), Some(EXIT_STATUS))
+  );
+  let empty = session(lends, None, b"", 1);
+  assert_eq!(
+    (empty.stdout, empty.stderr, empty.exited),
+    (Vec::new(), Vec::new(), Some(EXIT_STATUS))
+  );
+  let after_heads = session(lends, None, b"heads\n\n", 1);
+  assert_eq!(after_heads.stderr, Vec::<u8>::new());
+  assert_eq!(after_heads.exited, Some(EXIT_STATUS));
+
+  let (transcript, _) = served_by(
+    ONE_SEAT,
+    move || site(lends),
+    |address| hg_session(address, b"hg -R hg/r serve --stdio", bad_truncated, true),
+  );
+  let transcript = transcript.expect("the session");
+  assert_eq!(
+    (transcript.out, transcript.status),
+    (b"\n".to_vec(), Some(EXIT_STATUS))
+  );
+  assert!(
+    transcript.err.ends_with(b"\n-\n") && transcript.err.len() > 3,
+    "expected SSH edge out-of-band refusal, got {:?}",
+    String::from_utf8_lossy(&transcript.err)
+  );
+}

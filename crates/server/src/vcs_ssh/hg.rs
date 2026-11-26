@@ -8,8 +8,10 @@
 //! handshake is `hello`, then `between` with the null pair), each request is served once it is whole and the last
 //! answer has gone to the channel, an error's words go on standard error before its empty line on standard output, and
 //! the session ends at an empty line, at a request it cannot read, or at the end of the client's input once the whole
-//! requests before it are served. It then exits 0 whatever it answered (`EXIT_STATUS`), as `hg serve --stdio` does,
-//! but where an answer was refused past its stream's start (`Stdio::exit_status`, A-745).
+//! requests before it are served (if an incomplete request remains unconsumed when client input ends, an out-of-band
+//! SSH error refusal is emitted before exiting rather than silent empty output). It then exits 0 whatever it answered
+//! (`EXIT_STATUS`), as `hg serve --stdio` does, but where an answer was refused past its stream's start
+//! (`Stdio::exit_status`, A-745).
 //! The input a step consumed is given back to the channel's window. Bytes that arrive after the session ended, which it
 //! drops as an exited process reads none, are given back at the next step, so the window is never left short.
 //!
@@ -64,6 +66,10 @@ use crate::vcs_http::hg::HgStores;
 /// (`commands.py` `serve`, 7.2), before the user it names and a line end.
 const HIDDEN_REFUSED: &[u8] = b"ignoring request to access hidden changeset by unauthorized user: ";
 
+/// Format: out-of-band SSH refusal message when client input ends mid-request (for example a `known` command missing
+/// its `* <count>` varargs line or a truncated push bundle), framed via `slates_hg::ssh::respond_error`.
+const INCOMPLETE_REQUEST: &[u8] = b"unreadable request: incomplete request before end of input";
+
 /// One `hg serve --stdio` session over SSH (the module doc).
 pub(crate) struct HgCommand<S: HgStores> {
   /// Where the store is lent.
@@ -80,6 +86,14 @@ pub(crate) struct HgCommand<S: HgStores> {
   stdio: Stdio,
   /// 7.2's warning to a client asking for hidden changesets, not yet taken by the channel: sent before anything else.
   warning: Vec<u8>,
+  /// Bytes currently buffered inside [`Self::stdio`] that have not yet been consumed by a completed step.
+  pending_bytes: usize,
+  /// Whether the client closed standard input; applied once all complete buffered requests are drained.
+  eof_pending: bool,
+  /// Out-of-band stderr refusal emitted on an incomplete request at EOF, drained before exiting.
+  refusal_stderr: Vec<u8>,
+  /// Out-of-band stdout empty-line marker paired with [`Self::refusal_stderr`].
+  refusal_stdout: Vec<u8>,
   /// Input that arrived after the session ended, which it dropped: given back to the window at the next step.
   dropped: usize,
   /// A streamed answer's measured step cost, across its turns (A-783's paced turn).
@@ -109,9 +123,102 @@ impl<S: HgStores> HgCommand<S> {
       room,
       stdio: Stdio::new(window),
       warning,
+      pending_bytes: 0,
+      eof_pending: false,
+      refusal_stderr: Vec::new(),
+      refusal_stdout: Vec::new(),
       dropped: 0,
       costs: crate::vcs_store::TurnCosts::ZERO,
     }
+  }
+
+  /// Whether an EOF-triggered out-of-band refusal is still waiting to be drained to the channel.
+  fn has_refusal(&self) -> bool {
+    !self.refusal_stderr.is_empty() || !self.refusal_stdout.is_empty()
+  }
+
+  /// Whether a deferred client EOF can now be applied to [`Self::stdio`] without interrupting a reply or stream.
+  fn can_finish_at_eof(&self, progress: &Progress) -> bool {
+    matches!(progress, Progress::Waiting)
+      && self.eof_pending
+      && !self.stdio.ended()
+      && self.stdio.stdout().is_empty()
+      && self.stdio.stderr().is_empty()
+      && !self.stdio.streaming()
+  }
+
+  /// Advances [`Self::stdio`] by one step and lands any push bundle that step completed.
+  async fn advance_stdio(&mut self) -> Result<Progress, Refused> {
+    if let Some(push_room) = self.stores.push_room(self.repository) {
+      self.stdio.admit_pushes(push_room);
+    }
+    let progress = if self.stdio.taking_push() {
+      self.stdio.step_push()
+    } else if let (true, Some(generation)) = (self.stdio.streaming(), self.generation.as_ref()) {
+      streamed_turn(
+        &mut self.stores,
+        (generation, self.repository, self.room),
+        &mut self.stdio,
+        &mut self.costs,
+      )
+      .await?
+    } else {
+      answered_step(
+        &mut self.stores,
+        (self.repository, self.room),
+        &mut self.stdio,
+        &mut self.generation,
+      )?
+    };
+    if !self.stdio.streaming() {
+      self.generation = None;
+    }
+    if let Some(push) = self.stdio.take_push() {
+      land(
+        &mut self.stores,
+        (self.repository, &self.principal),
+        push,
+        &mut self.stdio,
+      )
+      .await?;
+    }
+    Ok(progress)
+  }
+
+  /// Applies a deferred EOF once `stdio` is waiting with no buffered reply, emitting a typed SSH out-of-band refusal
+  /// if unconsumed request bytes or an unfinished push remained before EOF.
+  fn finish_at_eof(&mut self) -> Result<usize, Refused> {
+    self.eof_pending = false;
+    let incomplete = self.pending_bytes > 0 || self.stdio.taking_push();
+    self.stdio.eof();
+    let final_progress = if self.stdio.taking_push() {
+      self.stdio.step_push()
+    } else {
+      answered_step(
+        &mut self.stores,
+        (self.repository, self.room),
+        &mut self.stdio,
+        &mut self.generation,
+      )?
+    };
+    let consumed = consumed_of(&final_progress);
+    self.pending_bytes = self.pending_bytes.saturating_sub(consumed);
+    if incomplete && self.stdio.stdout().is_empty() && self.stdio.stderr().is_empty() {
+      slates_hg::ssh::respond_error(
+        INCOMPLETE_REQUEST,
+        &mut self.refusal_stdout,
+        &mut self.refusal_stderr,
+      );
+    }
+    Ok(consumed)
+  }
+}
+
+/// The input bytes consumed by a single [`Progress`] transition.
+fn consumed_of(progress: &Progress) -> usize {
+  match progress {
+    Progress::Stepped { consumed, .. } | Progress::Took { consumed, .. } => *consumed,
+    Progress::Streamed { .. } | Progress::Waiting => 0,
   }
 }
 
@@ -256,73 +363,58 @@ impl<S: HgStores> Command for HgCommand<S> {
       self.dropped = self.dropped.saturating_add(run.len());
       return Ok(());
     }
-    self.stdio.receive(run).map_err(past_window)
+    self.stdio.receive(run).map_err(past_window)?;
+    self.pending_bytes = self.pending_bytes.saturating_add(run.len());
+    Ok(())
   }
 
   fn input_end(&mut self) {
-    self.stdio.eof();
+    self.eof_pending = true;
   }
 
   async fn step(&mut self, _gone: ClientGone<'_>) -> Result<Stepped, Refused> {
-    let Self {
-      stores,
-      generation,
-      repository,
-      principal,
-      room,
-      stdio,
-      dropped,
-      costs,
-      ..
-    } = self;
-    if let Some(push_room) = stores.push_room(*repository) {
-      stdio.admit_pushes(push_room);
+    let progress = self.advance_stdio().await?;
+    let mut consumed = consumed_of(&progress);
+    self.pending_bytes = self.pending_bytes.saturating_sub(consumed);
+    if self.can_finish_at_eof(&progress) {
+      consumed = consumed.saturating_add(self.finish_at_eof()?);
     }
-    let progress = if stdio.taking_push() {
-      stdio.step_push()
-    } else if let (true, Some(generation)) = (stdio.streaming(), generation.as_ref()) {
-      streamed_turn(stores, (generation, *repository, *room), stdio, costs).await?
+    let next = if self.stdio.finished() && self.warning.is_empty() {
+      Next::Exited(self.stdio.exit_status())
+    } else if matches!(progress, Progress::Waiting) && !self.stdio.finished() {
+      Next::Input
     } else {
-      answered_step(stores, (*repository, *room), stdio, generation)?
-    };
-    if !stdio.streaming() {
-      *generation = None;
-    }
-    if let Some(push) = stdio.take_push() {
-      land(stores, (*repository, principal), push, stdio).await?;
-    }
-    let (consumed, next) = match progress {
-      Progress::Stepped { consumed, .. } | Progress::Took { consumed, .. } => {
-        (consumed, Next::More)
-      }
-      Progress::Streamed { .. } => (0, Next::More),
-      Progress::Waiting => (0, Next::Input),
-    };
-    let next = if stdio.finished() {
-      Next::Exited(stdio.exit_status())
-    } else {
-      next
+      Next::More
     };
     Ok(Stepped {
-      consumed: consumed.saturating_add(std::mem::take(dropped)),
+      consumed: consumed.saturating_add(std::mem::take(&mut self.dropped)),
       next,
     })
   }
 
   fn output(&self) -> (&[u8], &[u8]) {
-    if self.warning.is_empty() {
-      (self.stdio.stderr(), self.stdio.stdout())
-    } else {
+    if !self.warning.is_empty() {
       (&self.warning, &[])
+    } else if self.has_refusal() {
+      (&self.refusal_stderr, &self.refusal_stdout)
+    } else {
+      (self.stdio.stderr(), self.stdio.stdout())
     }
   }
 
   fn sent(&mut self, stderr: usize, stdout: usize) {
-    if self.warning.is_empty() {
+    if !self.warning.is_empty() {
+      self.warning.drain(..stderr.min(self.warning.len()));
+    } else if self.has_refusal() {
+      self
+        .refusal_stderr
+        .drain(..stderr.min(self.refusal_stderr.len()));
+      self
+        .refusal_stdout
+        .drain(..stdout.min(self.refusal_stdout.len()));
+    } else {
       self.stdio.sent_stderr(stderr);
       self.stdio.sent_stdout(stdout);
-    } else {
-      self.warning.drain(..stderr.min(self.warning.len()));
     }
   }
 }

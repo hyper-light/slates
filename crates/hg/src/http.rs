@@ -642,6 +642,28 @@ mod tests {
     );
   }
 
+  /// Red-team `rt1-hg-claude` (AC-HG.9): do decode queries with no `cmd`, empty `cmd=`, bare `cmd`, and unknown
+  /// `cmd=rt_unknown`. Expect absent `cmd` to return `None`, empty and bare `cmd` to return `Some(b"")`, and unknown
+  /// `cmd` to return its bytes so the HTTP edge separates web pages from invalid wire commands.
+  #[test]
+  fn command_distinguishes_absent_empty_and_unknown_values() {
+    let mut buffers = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let [b0, b1, b2, b3] = &mut buffers;
+    assert_eq!(decode(b"foo=bar", &[], b"", b0).unwrap().command(), None);
+    assert_eq!(
+      decode(b"cmd=", &[], b"", b1).unwrap().command(),
+      Some(&b""[..])
+    );
+    assert_eq!(
+      decode(b"cmd", &[], b"", b2).unwrap().command(),
+      Some(&b""[..])
+    );
+    assert_eq!(
+      decode(b"cmd=rt_unknown", &[], b"", b3).unwrap().command(),
+      Some(&b"rt_unknown"[..])
+    );
+  }
+
   /// AC-HG.9 (hostile input), A-569: do declare post arguments longer than the body, a post length that is not
   /// digits, a named argument the request lacks, and fields past the admission. Expect `PostArguments`,
   /// `MissingArgument` at its position, and `PastAdmission` with nothing charged.

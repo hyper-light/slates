@@ -1045,3 +1045,110 @@ fn a_lookup_is_answered_within_a_fetchs_room_not_its_requests() {
     (media(hg_wire::MEDIA_TYPE_V1), format!("1 {hex}\n"))
   );
 }
+
+/// Red-team `rt1-hg-claude` (`wirefuzz.py` rows `unknown-cmd`, `empty-cmd`; AC-HG.9): do send unknown (`?cmd=rt_unknown`),
+/// empty (`?cmd=` and bare `?cmd`), duplicate-ending-unknown (`?cmd=heads&cmd=rt_unknown`, `?cmd=heads&cmd=`), and
+/// `POST ?cmd=rt_unknown` wire requests, alongside unauthenticated/unauthorized unknown commands, a browsing page
+/// (`/hg`), an unheld store (`/bare?cmd=heads`), and duplicate-ending-known (`?cmd=rt_unknown&cmd=heads`). Expect
+/// `400 Bad Request` for unknown or empty `cmd` (never `503`), while auth (`401`), policy (`403`), hgweb browsing pages
+/// (`503`), and genuine unheld-store unavailability (`503`) keep their statuses.
+#[test]
+fn unknown_and_empty_wire_commands_are_refused_400_while_pages_and_unheld_stores_stay_503() {
+  let mut open = site(vec![stranger_may(PolicyRight::Read)]);
+  let mut strict = site(Vec::new());
+  let cases: [StepCase; 11] = [
+    (
+      "open",
+      "GET",
+      "/hg?cmd=rt_unknown",
+      &[OWNER_BEARER],
+      Some(Status::BAD_REQUEST),
+    ),
+    (
+      "open",
+      "GET",
+      "/hg?cmd=",
+      &[OWNER_BEARER],
+      Some(Status::BAD_REQUEST),
+    ),
+    (
+      "open",
+      "GET",
+      "/hg?cmd",
+      &[OWNER_BEARER],
+      Some(Status::BAD_REQUEST),
+    ),
+    (
+      "open",
+      "GET",
+      "/hg?cmd=heads&cmd=rt_unknown",
+      &[OWNER_BEARER],
+      Some(Status::BAD_REQUEST),
+    ),
+    (
+      "open",
+      "GET",
+      "/hg?cmd=heads&cmd=",
+      &[OWNER_BEARER],
+      Some(Status::BAD_REQUEST),
+    ),
+    (
+      "open",
+      "POST",
+      "/hg?cmd=rt_unknown",
+      &[OWNER_BEARER],
+      Some(Status::BAD_REQUEST),
+    ),
+    (
+      "open",
+      "GET",
+      "/hg?cmd=rt_unknown",
+      &[],
+      Some(Status::UNAUTHORIZED),
+    ),
+    (
+      "strict",
+      "GET",
+      "/hg?cmd=rt_unknown",
+      &[STRANGER_BEARER],
+      Some(Status::FORBIDDEN),
+    ),
+    (
+      "open",
+      "GET",
+      "/hg",
+      &[OWNER_BEARER],
+      Some(Status::SERVICE_UNAVAILABLE),
+    ),
+    (
+      "open",
+      "GET",
+      "/bare?cmd=heads",
+      &[OWNER_BEARER],
+      Some(Status::SERVICE_UNAVAILABLE),
+    ),
+    (
+      "open",
+      "GET",
+      "/hg?cmd=rt_unknown&cmd=heads",
+      &[OWNER_BEARER],
+      None,
+    ),
+  ];
+  let (judged, expected): (Vec<_>, Vec<_>) = cases
+    .into_iter()
+    .map(|(which, method, target, fields, expected)| {
+      let site = if which == "strict" {
+        &mut strict
+      } else {
+        &mut open
+      };
+      let status = refused_status(site, method, target, fields);
+      (
+        (which, method, target, fields, status),
+        (which, method, target, fields, expected),
+      )
+    })
+    .unzip();
+  assert_eq!(judged, expected);
+}
