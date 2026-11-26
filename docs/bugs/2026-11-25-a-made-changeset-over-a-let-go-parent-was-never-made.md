@@ -109,8 +109,17 @@ Main's rulings set the follow-up pieces, each landing after this one:
     (`crates/hg/src/landed_tests.rs`). Two pushes of one file land as two changesets, the second a delta on the first,
     and the first revision's bytes are let go between them. It expects `Record { sequence: 1, StoreWanted }`. With the
     test arm put back it fails `Record { sequence: 1, Intake(Unverified(UnknownDeltaBase { .. })) }`.
-- `crates/hg/src/import/record.rs:1834`: a record's store want answered from the fork in tests, left pending in
-  production. Its own bug piece, recorded here.
+- `crates/hg/src/import/record.rs:1834` (A2, fixed 2026-11-26). `Retaken::step` answered an intake's store want from
+  the fork's own texts in tests and left it pending in production. A waiting replay answers a pending ask through
+  `Replay::store_wants`; a whole `record::replay` refuses it `StoreWanted`.
+  - In tests a whole replay never saw the refusal; for a let-go base it answered `UnknownDeltaBase` instead.
+  - No test reached the arm: with production's arm in place, `slates-hg --lib` passed 473 of 473, rc 0.
+  - The server builds slates-hg without `cfg(test)`, so only the hg crate's own tests were ever bent.
+  - Fixed: the test arm is deleted.
+  - Red: `a_whole_records_replay_wanting_a_base_let_go_is_refused_as_production_refuses_it`
+    (`crates/hg/src/push/intake_tests.rs`). One file's first revision is pushed and its bytes let go, then a second
+    push, a delta on the first, is replayed whole from its record. It expects `StoreWanted`. With the test arm put back
+    it fails `Some(Intake(Unverified(UnknownDeltaBase { .. })))`.
 - `KEEP_LANDED` (`crates/server/src/vcs_store.rs:2654`, `:3958`): set by every default stored-test runner, so those
   tests never ran production's let-go. The runners stop setting it; tests that must keep packs resident set it by name.
 - A made changeset whose landing is refused because the owner is gone is retried without end
