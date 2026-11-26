@@ -113,7 +113,9 @@ const LOOKUP_UNANSWERED: &str = "vcs_svn.lookup_unanswered";
 /// Counter: a Subversion repository whose store its owner shard does not hold: the connection closed.
 const STORE_MISSING: &str = "vcs_svn.store_missing";
 /// `SVN_ERR_FS_CORRUPT`: typed refusal code when a repository's backing store is unrecovered or
-/// corrupt (`svn_error_codes.h`: FS category 160,000 + 4).
+/// corrupt.
+/// Format: the filesystem category's start, 120,000 + 8 × 5,000 = 160,000, plus 4
+/// (`svn_error_codes.h`, `SVN_ERR_FS_CORRUPT = 160004`).
 const SVN_ERR_FS_CORRUPT: u32 = 160_004;
 /// Counter: a shard that could not keep its listener state, so a connection that moves there is lost.
 const NOT_KEPT: &str = "vcs_svn.not_kept";
