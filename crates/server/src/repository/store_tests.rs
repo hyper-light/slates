@@ -29,6 +29,7 @@ fn owner() -> Principal {
 /// on `main` at sequence 0 under the store's standing grant, and the store's rows find it by its repository.
 fn creation_recovered(dir: &std::path::Path) {
   // Recovered: the log read whole names one changeset, and the store's rows find it by its repository.
+  let seal = Store::open(root(dir), SIZING).unwrap().seal();
   let log_file = hyper_block::file::DeviceFile::adopt(
     root(dir).open_file(LOG_FILE).unwrap(),
     &dir.join(LOG_FILE),
@@ -37,7 +38,9 @@ fn creation_recovered(dir: &std::path::Path) {
   )
   .unwrap();
   let mut found = Vec::new();
-  let log = ChangesetLog::recover(log_file, 0, |_, located| found.push(*located)).unwrap();
+  let log =
+    ChangesetLog::recover_sealed(log_file, 0, seal, None, |_, located| found.push(*located))
+      .unwrap();
   assert_eq!(found.len(), 1, "one creation landed");
   let creation = found[0];
   assert_eq!(
@@ -288,6 +291,7 @@ fn a_subversion_commit_lands_as_a_changeset_in_the_store() {
   store.stop_owner();
   assert_eq!(landed, Some(Ok(1)));
 
+  let seal = Store::open(root(&dir), SIZING).unwrap().seal();
   let log_file = hyper_block::file::DeviceFile::adopt(
     root(&dir).open_file(LOG_FILE).unwrap(),
     &dir.join(LOG_FILE),
@@ -296,7 +300,9 @@ fn a_subversion_commit_lands_as_a_changeset_in_the_store() {
   )
   .unwrap();
   let mut found = Vec::new();
-  let log = ChangesetLog::recover(log_file, 0, |_, located| found.push(*located)).unwrap();
+  let log =
+    ChangesetLog::recover_sealed(log_file, 0, seal, None, |_, located| found.push(*located))
+      .unwrap();
   let ours: Vec<_> = found
     .iter()
     .filter(|located| located.header.repository == u128::from_be_bytes(repository.bytes))
@@ -493,6 +499,7 @@ fn a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset(
   store.stop_owner();
 
   // Non-vacuity: the restarted node minted the killed creation's id again, so the log holds two changesets 0 of it.
+  let seal = Store::open(root(&dir), SIZING).unwrap().seal();
   let log_file = hyper_block::file::DeviceFile::adopt(
     root(&dir).open_file(LOG_FILE).unwrap(),
     &dir.join(LOG_FILE),
@@ -501,7 +508,7 @@ fn a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset(
   )
   .unwrap();
   let mut at_zero = 0;
-  let log = ChangesetLog::recover(log_file, 0, |_, located| {
+  let log = ChangesetLog::recover_sealed(log_file, 0, seal, None, |_, located| {
     if located.header.repository == u128::from_be_bytes(created.bytes)
       && located.header.sequence == 0
     {
@@ -742,6 +749,7 @@ fn a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood() {
   daemon.stop();
   store.stop_owner();
 
+  let seal = Store::open(root(store.dir()), SIZING).unwrap().seal();
   let log_file = hyper_block::file::DeviceFile::adopt(
     root(store.dir()).open_file(LOG_FILE).unwrap(),
     &store.dir().join(LOG_FILE),
@@ -750,7 +758,9 @@ fn a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood() {
   )
   .unwrap();
   let mut found = Vec::new();
-  let log = ChangesetLog::recover(log_file, 0, |_, located| found.push(*located)).unwrap();
+  let log =
+    ChangesetLog::recover_sealed(log_file, 0, seal, None, |_, located| found.push(*located))
+      .unwrap();
   let ours: Vec<_> = found
     .iter()
     .filter(|located| located.header.repository == u128::from_be_bytes(repository.bytes))

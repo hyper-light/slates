@@ -74,19 +74,20 @@ fn write_formatted(line: fmt::Arguments<'_>, deliver: impl FnOnce(String)) {
   deliver(buffer);
 }
 
+/// Writes `bytes` to `sink` in one `write_all` call, counting one refusal on error and returning
+/// whether the write succeeded.
+fn write_or_refuse(sink: &mut impl Write, bytes: &[u8]) -> bool {
+  if sink.write_all(bytes).is_err() {
+    LOG_LINES_REFUSED.fetch_add(1, Ordering::Relaxed);
+    return false;
+  }
+  true
+}
+
 /// Writes one already-framed log record `bytes` to `sink` in one `write_all` call, counting a
 /// refusal on error.
 fn write_bytes_to(sink: &mut impl Write, bytes: &[u8]) {
-  if sink.write_all(bytes).is_err() {
-    LOG_LINES_REFUSED.fetch_add(1, Ordering::Relaxed);
-  }
-}
-
-/// Writes one already-framed log record `bytes` to standard error under this process's single
-/// stderr lock so local `log_line!` calls and relayed child stderr lines never interleave.
-fn write_bytes_owned(bytes: &[u8]) {
-  let mut stderr = std::io::stderr().lock();
-  write_bytes_to(&mut stderr, bytes);
+  let _ = write_or_refuse(sink, bytes);
 }
 
 /// [`write_owned_to`] on standard error: the sink a [`LogWriter`] writes with.
@@ -110,94 +111,172 @@ fn write_owned_to(sink: &mut impl Write, mut line: String) {
   write_bytes_to(sink, line.as_bytes());
 }
 
-/// Emits `head` appended to any buffered `line`, avoiding a copy when `line` is empty.
-fn emit_complete_line(line: &mut Vec<u8>, head: &[u8], emit: &mut impl FnMut(&[u8])) {
-  if line.is_empty() {
-    emit(head);
-  } else {
-    line.extend_from_slice(head);
-    emit(line);
-    line.clear();
+/// Explicit state of the logical line currently being relayed from a child's stderr pipe.
+enum RelayLine<W> {
+  /// At a line boundary: no sink lock is held; bytes of a normal line buffer up to `cap`.
+  Idle,
+  /// Streaming an overlong (`>= cap`) logical line while holding the sink lock `W` continuously
+  /// until `\n` (or EOF, where a trailing `\n` is written before releasing `W`).
+  Streaming(W),
+  /// A write for this logical line already failed (refusal counted once); draining remaining bytes
+  /// until `\n` or EOF without re-locking or counting duplicate refusals.
+  Refused,
+}
+
+/// Bounded per-line relay pairing the line buffer, lock factory, and logical-line state machine.
+struct LineRelay<W, F> {
+  cap: usize,
+  line: Vec<u8>,
+  state: RelayLine<W>,
+  acquire: F,
+}
+
+impl<W: Write, F: FnMut() -> W> LineRelay<W, F> {
+  fn new(cap: usize, acquire: F) -> Self {
+    Self {
+      cap,
+      line: Vec::new(),
+      state: RelayLine::Idle,
+      acquire,
+    }
+  }
+
+  /// Acquires the sink lock once and writes a complete `<= cap` buffered line in one `write_all`.
+  fn emit_buffered_line(&mut self, head: &[u8]) {
+    let mut sink = (self.acquire)();
+    if self.line.is_empty() {
+      write_bytes_to(&mut sink, head);
+    } else {
+      self.line.extend_from_slice(head);
+      write_bytes_to(&mut sink, &self.line);
+      self.line.clear();
+    }
+  }
+
+  /// Acquires the sink lock and writes the first `cap` bytes of an overlong line, holding the lock
+  /// in `Streaming` until `\n` or EOF (or transitioning to `Refused` on error).
+  fn begin_streaming(&mut self) {
+    let mut sink = (self.acquire)();
+    let ok = write_or_refuse(&mut sink, &self.line);
+    self.line.clear();
+    self.state = if ok {
+      RelayLine::Streaming(sink)
+    } else {
+      RelayLine::Refused
+    };
+  }
+
+  fn step_idle<'a>(&mut self, rest: &'a [u8]) -> &'a [u8] {
+    let room = self.cap.saturating_sub(self.line.len());
+    if let Some(nl) = rest.iter().position(|byte| *byte == b'\n')
+      && nl < room
+      && let Some((head, tail)) = rest.split_at_checked(nl.saturating_add(1))
+    {
+      self.emit_buffered_line(head);
+      return tail;
+    }
+    let take = rest.len().min(room);
+    let Some((head, tail)) = rest.split_at_checked(take) else {
+      return &[];
+    };
+    self.line.extend_from_slice(head);
+    if self.line.len() >= self.cap {
+      self.begin_streaming();
+    }
+    tail
+  }
+
+  fn step_streaming<'a>(&mut self, rest: &'a [u8]) -> &'a [u8] {
+    let (head, tail, ended) = match rest.iter().position(|byte| *byte == b'\n') {
+      Some(nl) => match rest.split_at_checked(nl.saturating_add(1)) {
+        Some((head, tail)) => (head, tail, true),
+        None => (rest, &[][..], false),
+      },
+      None => (rest, &[][..], false),
+    };
+    if let RelayLine::Streaming(mut sink) = std::mem::replace(&mut self.state, RelayLine::Idle) {
+      let ok = write_or_refuse(&mut sink, head);
+      if !ended {
+        self.state = if ok {
+          RelayLine::Streaming(sink)
+        } else {
+          RelayLine::Refused
+        };
+      }
+    }
+    tail
+  }
+
+  fn step_refused<'a>(&mut self, rest: &'a [u8]) -> &'a [u8] {
+    match rest.iter().position(|byte| *byte == b'\n') {
+      Some(nl) => {
+        self.state = RelayLine::Idle;
+        rest.get(nl.saturating_add(1)..).unwrap_or_default()
+      }
+      None => &[],
+    }
+  }
+
+  fn feed(&mut self, mut rest: &[u8]) {
+    while !rest.is_empty() {
+      rest = match self.state {
+        RelayLine::Idle => self.step_idle(rest),
+        RelayLine::Streaming(_) => self.step_streaming(rest),
+        RelayLine::Refused => self.step_refused(rest),
+      };
+    }
+  }
+
+  /// Flushes any unterminated trailing line at EOF with a trailing `\n` before releasing the lock.
+  fn finish(mut self) {
+    match std::mem::replace(&mut self.state, RelayLine::Idle) {
+      RelayLine::Idle => {
+        if !self.line.is_empty() {
+          self.line.push(b'\n');
+          let mut sink = (self.acquire)();
+          write_bytes_to(&mut sink, &self.line);
+        }
+      }
+      RelayLine::Streaming(mut sink) => {
+        write_bytes_to(&mut sink, b"\n");
+      }
+      RelayLine::Refused => {}
+    }
   }
 }
 
-/// Consumes one `\n`-terminated line or one bounded prefix up to `capacity` bytes from `rest`,
-/// returning the unconsumed tail.
-fn step_relay_chunk<'a>(
-  rest: &'a [u8],
-  line: &mut Vec<u8>,
-  capacity: usize,
-  emit: &mut impl FnMut(&[u8]),
-) -> &'a [u8] {
-  let room = capacity.saturating_sub(line.len());
-  if let Some(nl) = rest.iter().position(|byte| *byte == b'\n')
-    && nl < room
-    && let Some((head, tail)) = rest.split_at_checked(nl.saturating_add(1))
-  {
-    emit_complete_line(line, head, emit);
-    return tail;
-  }
-  let take = rest.len().min(room);
-  let Some((head, tail)) = rest.split_at_checked(take) else {
-    return &[];
-  };
-  line.extend_from_slice(head);
-  if line.len() >= capacity {
-    emit(line);
-    line.clear();
-  }
-  tail
-}
-
-/// Feeds every byte of `mut rest` through `line` (bounded at `capacity` bytes), emitting complete
-/// lines or full-capacity chunks via `emit`.
-fn drain_relay_chunk(
-  mut rest: &[u8],
-  line: &mut Vec<u8>,
-  capacity: usize,
-  emit: &mut impl FnMut(&[u8]),
-) {
-  while !rest.is_empty() {
-    rest = step_relay_chunk(rest, line, capacity, emit);
-  }
-}
-
-/// Reads bytes from `reader` in `capacity`-byte chunks, buffers up to `capacity` bytes per line,
-/// and passes each complete `\n`-terminated line (and any non-empty partial line at EOF, or flush
-/// when the buffer reaches `capacity`) to `emit`.
-fn relay_stderr_bounded(
+/// Reads bytes from `reader` in `capacity`-byte chunks and writes each logical line to a lock guard
+/// returned by `acquire`. Lines up to `capacity` bytes emit in a single locked `write_all`; longer
+/// lines hold the acquired guard continuously across bounded `<= capacity` chunks until `\n` (or
+/// EOF, terminating with `\n` before releasing the guard) and count at most one refusal per logical
+/// line.
+fn relay_stderr_bounded<W: Write>(
   mut reader: impl std::io::Read,
   capacity: usize,
-  mut emit: impl FnMut(&[u8]),
+  acquire: impl FnMut() -> W,
 ) {
   let cap = capacity.max(1);
   let mut chunk = vec![0u8; cap];
-  let mut line = Vec::new();
+  let mut relay = LineRelay::new(cap, acquire);
   loop {
     match reader.read(&mut chunk) {
       Ok(0) => break,
-      Ok(count) => drain_relay_chunk(
-        chunk.get(..count).unwrap_or_default(),
-        &mut line,
-        cap,
-        &mut emit,
-      ),
+      Ok(count) => relay.feed(chunk.get(..count).unwrap_or_default()),
       Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
       Err(_) => break,
     }
   }
-  if !line.is_empty() {
-    line.push(b'\n');
-    emit(&line);
-  }
+  relay.finish();
 }
 
 /// Relays a supervised child's stderr pipe line-by-line into this process's standard error under
-/// its single stderr lock, bounding per-line memory to [`QUEUE_BYTES`]. If standard error refuses
-/// writes (e.g. `EPIPE`), refusals are counted in [`log_lines_refused`] while draining continues
-/// until EOF so the child never stalls on a full pipe.
+/// its single stderr lock, bounding per-line memory to [`QUEUE_BYTES`] while holding the lock for
+/// each complete logical line (including lines longer than [`QUEUE_BYTES`] and unterminated EOF
+/// tails). If standard error refuses writes (e.g. `EPIPE`), each failed logical line is counted
+/// once in [`log_lines_refused`] while draining continues until EOF so the child never stalls on a
+/// full pipe.
 pub fn relay_stderr(reader: impl std::io::Read) {
-  relay_stderr_bounded(reader, QUEUE_BYTES, write_bytes_owned);
+  relay_stderr_bounded(reader, QUEUE_BYTES, || std::io::stderr().lock());
 }
 
 /// Derived: the bytes of lines a [`LogWriter`] holds while standard error does not take them: a pipe's capacity on Linux
@@ -641,6 +720,36 @@ mod tests {
     })))
   }
 
+  /// Adapter implementing `Write` over a locked test sink so `relay_stderr_bounded` can hold the
+  /// mutex guard across an entire logical line just as `std::io::stderr().lock()` does.
+  #[allow(clippy::disallowed_types)]
+  struct LockedSink<T: 'static>(std::sync::MutexGuard<'static, T>);
+
+  impl<T: Write + 'static> Write for LockedSink<T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      self.0.flush()
+    }
+  }
+
+  /// Single-thread `RefCell` guard implementing `Write` and counting lock acquisitions.
+  struct BorrowedSink<'a, T> {
+    guard: std::cell::RefMut<'a, T>,
+  }
+
+  impl<T: Write> Write for BorrowedSink<'_, T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      self.guard.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      self.guard.flush()
+    }
+  }
+
   /// Blocker 4: Do: concurrently relay 16 child lines of 32 KiB+ (fed in 512-byte pipe writes
   /// matching macOS `PIPE_BUF`) through `relay_stderr_bounded` while an anchor thread writes 16
   /// 32 KiB+ lines through `write_formatted`/`write_owned_to`, both locking one shared sink.
@@ -661,11 +770,12 @@ mod tests {
       }
     });
     let relay = std::thread::spawn(move || {
-      relay_stderr_bounded(reader, QUEUE_BYTES, |record| {
-        let mut guard = sink
-          .lock()
-          .unwrap_or_else(std::sync::PoisonError::into_inner);
-        write_bytes_to(&mut *guard, record);
+      relay_stderr_bounded(reader, QUEUE_BYTES, || {
+        LockedSink(
+          sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
       });
     });
     for _ in 0..16 {
@@ -694,16 +804,26 @@ mod tests {
 
   /// Blocker 4: Do: feed an overlong newline-less stream (256 bytes under a 100-byte bound), a
   /// normal `\n`-terminated line, and an unterminated EOF tail into `relay_stderr_bounded`.
-  /// Expect: every emitted chunk is bounded at <= 100 bytes, complete lines flush at `\n`, and
-  /// the unterminated EOF remainder flushes with a trailing `\n`.
+  /// Expect: every emitted chunk is bounded at <= 100 bytes, the lock is held continuously across
+  /// the entire overlong line (2 lock acquisitions total for 2 logical lines), and the unterminated
+  /// EOF remainder flushes with a trailing `\n`.
   #[test]
   fn relay_stderr_bounds_overlong_input_and_flushes_eof_remainder() {
     let mut input = vec![b'A'; 256];
     input.extend_from_slice(b"short\ntail");
-    let mut emitted = Vec::new();
-    relay_stderr_bounded(std::io::Cursor::new(input), 100, |bytes| {
-      emitted.push(bytes.to_vec());
+    let sink = RefCell::new(RecordingSink {
+      writes: Vec::new(),
+      fail: false,
     });
+    let mut acquisitions = 0usize;
+    relay_stderr_bounded(std::io::Cursor::new(input), 100, || {
+      acquisitions += 1;
+      BorrowedSink {
+        guard: sink.borrow_mut(),
+      }
+    });
+    let emitted = sink.into_inner().writes;
+    assert_eq!(acquisitions, 2, "one lock hold per logical line");
     assert_eq!(
       emitted.iter().map(Vec::len).collect::<Vec<_>>(),
       vec![100, 100, 62, 5]
@@ -727,14 +847,184 @@ mod tests {
         writer.write_all(line.as_bytes()).unwrap();
       }
     });
-    let mut broken = RecordingSink {
+    let broken = RefCell::new(RecordingSink {
       writes: Vec::new(),
       fail: true,
-    };
-    relay_stderr_bounded(reader, QUEUE_BYTES, |bytes| {
-      write_bytes_to(&mut broken, bytes);
+    });
+    relay_stderr_bounded(reader, QUEUE_BYTES, || BorrowedSink {
+      guard: broken.borrow_mut(),
     });
     producer.join().unwrap();
     assert_eq!(log_lines_refused().saturating_sub(refused_before), 4);
+  }
+
+  /// Sink that appends all written bytes into one byte stream to detect any mid-line interleaving
+  /// or missing newline terminators across arbitrary line lengths.
+  struct StreamSink {
+    bytes: Vec<u8>,
+    acquisitions: usize,
+  }
+
+  impl Write for StreamSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      self.bytes.extend_from_slice(buf);
+      Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+  }
+
+  #[allow(clippy::disallowed_types)]
+  fn shared_stream_sink() -> &'static std::sync::Mutex<StreamSink> {
+    // structural: allow — D-8 exception 3: test harness sink shared by the relay and anchor threads.
+    Box::leak(Box::new(std::sync::Mutex::new(StreamSink {
+      bytes: Vec::new(),
+      acquisitions: 0,
+    })))
+  }
+
+  /// Classifies one newline-delimited logical line from the concurrent overlong-line relay test.
+  fn classify_overlong_line(line: &[u8]) -> Option<&'static str> {
+    if let Some(fill) = line.strip_prefix(b"ANCHOR:")
+      && fill.len() == 1_024
+      && fill.iter().all(|byte| *byte == b'A')
+    {
+      return Some("anchor");
+    }
+    if let Some(fill) = line.strip_prefix(b"CHILD:")
+      && fill.iter().all(|byte| *byte == b'C')
+    {
+      return match fill.len() {
+        65_532 => Some("child_65539"),
+        99_993 => Some("child_100000"),
+        _ => None,
+      };
+    }
+    if let Some(fill) = line.strip_prefix(b"EOF:")
+      && fill.len() == QUEUE_BYTES - 4
+      && fill.iter().all(|byte| *byte == b'E')
+    {
+      return Some("eof_exact");
+    }
+    None
+  }
+
+  /// Feeds 8×65,539-byte, 8×100,000-byte, and 1×exact-65,536-byte unterminated lines into `writer`
+  /// in 512-byte pieces to exercise lock continuity across `QUEUE_BYTES` boundaries.
+  fn write_overlong_child_lines(mut writer: std::io::PipeWriter) {
+    let line_65539 = format!("CHILD:{}\n", "C".repeat(65_532));
+    assert_eq!(line_65539.len(), 65_539);
+    let line_100000 = format!("CHILD:{}\n", "C".repeat(99_993));
+    assert_eq!(line_100000.len(), 100_000);
+    let eof_exact = format!("EOF:{}", "E".repeat(QUEUE_BYTES - 4));
+    assert_eq!(eof_exact.len(), QUEUE_BYTES);
+    for _ in 0..8 {
+      for piece in line_65539.as_bytes().chunks(512) {
+        writer.write_all(piece).unwrap();
+      }
+      for piece in line_100000.as_bytes().chunks(512) {
+        writer.write_all(piece).unwrap();
+      }
+    }
+    for piece in eof_exact.as_bytes().chunks(512) {
+      writer.write_all(piece).unwrap();
+    }
+  }
+
+  /// Verifies every newline-delimited logical line in `stream` matches expected counts with zero
+  /// interleaving and a trailing newline.
+  fn assert_overlong_stream_intact(stream: &[u8], expected: (usize, usize, usize, usize)) {
+    assert!(
+      stream.ends_with(b"\n"),
+      "exact-capacity unterminated EOF line must end with a newline"
+    );
+    let mut counts = (0usize, 0usize, 0usize, 0usize);
+    for raw in stream[..stream.len() - 1].split(|byte| *byte == b'\n') {
+      match classify_overlong_line(raw) {
+        Some("anchor") => counts.0 += 1,
+        Some("child_65539") => counts.1 += 1,
+        Some("child_100000") => counts.2 += 1,
+        Some("eof_exact") => counts.3 += 1,
+        other => panic!(
+          "interleaved or malformed line (len={}, kind={other:?}, prefix={:?})",
+          raw.len(),
+          &raw[..raw.len().min(32)]
+        ),
+      }
+    }
+    assert_eq!(counts, expected);
+  }
+
+  /// Round-2 Blocker 3: Do: concurrently relay 65,539-byte and 100,000-byte lines (both past
+  /// `QUEUE_BYTES`) plus an exact-65,536-byte unterminated EOF line while an anchor thread writes
+  /// `log_line!` records against the same sink lock.
+  /// Expect: zero interleaved or merged lines, exactly one lock acquisition per logical line, and
+  /// an exact trailing `\n` on the exact-capacity EOF line.
+  #[test]
+  fn relay_stderr_holds_lock_across_overlong_lines_and_terminates_exact_cap_eof() {
+    let _gate = counter_gate();
+    let (reader, writer) = std::io::pipe().unwrap();
+    let sink = shared_stream_sink();
+    let anchor_line = format!("ANCHOR:{}", "A".repeat(1_024));
+    let producer = std::thread::spawn(move || write_overlong_child_lines(writer));
+    let relay = std::thread::spawn(move || {
+      relay_stderr_bounded(reader, QUEUE_BYTES, || {
+        let mut guard = sink
+          .lock()
+          .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.acquisitions += 1;
+        LockedSink(guard)
+      });
+    });
+    for _ in 0..64 {
+      write_formatted(format_args!("{anchor_line}"), |buf| {
+        let mut guard = sink
+          .lock()
+          .unwrap_or_else(std::sync::PoisonError::into_inner);
+        write_owned_to(&mut *guard, buf);
+      });
+      std::thread::yield_now();
+    }
+    producer.join().unwrap();
+    relay.join().unwrap();
+
+    let (stream, acquisitions) = {
+      let guard = sink
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+      (guard.bytes.clone(), guard.acquisitions)
+    };
+    assert_eq!(
+      acquisitions, 17,
+      "each of the 17 relayed logical lines must acquire the sink lock exactly once"
+    );
+    assert_overlong_stream_intact(&stream, (64, 8, 8, 1));
+  }
+
+  /// Round-2 Blocker 3 / Nit 1: Do: relay two 150,000-byte lines (3 `QUEUE_BYTES` chunks each)
+  /// into a failing `BrokenPipe` sink.
+  /// Expect: `log_lines_refused` increases by 2 (one per logical line), not 6 (per chunk).
+  #[test]
+  fn relay_stderr_counts_one_refusal_per_overlong_logical_line() {
+    let _gate = counter_gate();
+    let refused_before = log_lines_refused();
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    let producer = std::thread::spawn(move || {
+      let line = format!("{}\n", "X".repeat(149_999));
+      assert_eq!(line.len(), 150_000);
+      writer.write_all(line.as_bytes()).unwrap();
+      writer.write_all(line.as_bytes()).unwrap();
+    });
+    let broken = RefCell::new(RecordingSink {
+      writes: Vec::new(),
+      fail: true,
+    });
+    relay_stderr_bounded(reader, QUEUE_BYTES, || BorrowedSink {
+      guard: broken.borrow_mut(),
+    });
+    producer.join().unwrap();
+    assert_eq!(log_lines_refused().saturating_sub(refused_before), 2);
   }
 }

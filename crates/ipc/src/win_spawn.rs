@@ -20,6 +20,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
@@ -65,7 +66,6 @@ pub struct ClosedOnDrop(pub(crate) HANDLE);
 /// Clears inheritance on a handle a daemon adopted from its anchor (A-198). The one intended spawn already carried
 /// it; a later child of the daemon must inherit none of the held volume, drive link, ledger or hold channel.
 pub fn clear_inheritance(handle: &std::os::windows::io::OwnedHandle) -> Result<(), IpcError> {
-  use std::os::windows::io::AsRawHandle;
   // SAFETY: `handle` remains owned for the call. This changes a flag in its handle-table entry and touches no bytes.
   if unsafe { SetHandleInformation(handle.as_raw_handle(), HANDLE_FLAG_INHERIT, 0) } == 0 {
     return Err(refused("SetHandleInformation (clear inheritance)"));
@@ -398,16 +398,38 @@ pub fn environment_block(added: &[(&OsStr, &OsStr)]) -> Vec<u16> {
   block
 }
 
+fn resolve_stdout(output: &StandardOutput<'_>) -> Result<Option<ClosedOnDrop>, IpcError> {
+  match output {
+    StandardOutput::Into(write_end) => duplicate_inheritable(write_end.0).map(Some),
+    StandardOutput::Inherited => standard_handle_inheritable(STD_OUTPUT_HANDLE),
+  }
+}
+
+fn resolve_stderr(stderr: Option<BorrowedHandle<'_>>) -> Result<Option<ClosedOnDrop>, IpcError> {
+  match stderr {
+    Some(write_end) => duplicate_inheritable(write_end.as_raw_handle()).map(Some),
+    None => standard_handle_inheritable(STD_ERROR_HANDLE),
+  }
+}
+
 /// Starts the child `spawn` describes: it inherits `spawn.inherited` and inheritable duplicates of this process's
 /// standard handles, and nothing else of this process. The duplicates of the standard handles are closed before this
 /// returns, whether or not the child started; the caller's inherited handles are the caller's to close.
 pub fn spawn(spawn: &Spawn<'_>) -> Result<Process, IpcError> {
+  spawn_with_error(spawn, None)
+}
+
+/// Starts the child `spawn` describes with standard error directed to `stderr`: when `Some`, an
+/// inheritable duplicate of that write end is placed in `hStdError` and the explicit
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (and closed right after `CreateProcessW`); when `None`,
+/// this process's standard error is inherited as in [`spawn`].
+pub fn spawn_with_error(
+  spawn: &Spawn<'_>,
+  stderr: Option<BorrowedHandle<'_>>,
+) -> Result<Process, IpcError> {
   let stdin = standard_handle_inheritable(STD_INPUT_HANDLE)?;
-  let stdout = match spawn.output {
-    StandardOutput::Into(write_end) => Some(duplicate_inheritable(write_end.0)?),
-    StandardOutput::Inherited => standard_handle_inheritable(STD_OUTPUT_HANDLE)?,
-  };
-  let stderr = standard_handle_inheritable(STD_ERROR_HANDLE)?;
+  let stdout = resolve_stdout(&spawn.output)?;
+  let stderr = resolve_stderr(stderr)?;
   // SAFETY: a plain-data record every zero of which is a valid field value.
   let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
   startup.StartupInfo.cb = u32::try_from(size_of::<STARTUPINFOEXW>()).unwrap_or(0);

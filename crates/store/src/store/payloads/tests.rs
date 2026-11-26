@@ -101,7 +101,8 @@ fn an_old_payload_checkpoint_recovers_only_the_surviving_copies_once() {
 
   // One changeset per page exercises the continuation while the index is modified.
   let page = CHANGESET_ENTRY_BYTES;
-  index_checkpoint(&mut rows, log.file(), log.end(), page).unwrap();
+  let seal = log.seal();
+  index_checkpoint(&mut rows, log.file(), (log.end(), &seal), page).unwrap();
   let IntoFile::Finished {
     file: saved,
     result,
@@ -112,7 +113,7 @@ fn an_old_payload_checkpoint_recovers_only_the_surviving_copies_once() {
   result.unwrap();
   let (mut rows, applied) = ShardDb::open(saved, config, memory, trunk).unwrap();
   // A second open has the marker. An empty log here makes any repeated read of its prefix fail.
-  index_checkpoint(&mut rows, &file(3), applied, page).unwrap();
+  index_checkpoint(&mut rows, &file(3), (applied, &seal), page).unwrap();
   assert_eq!(read(&mut rows, &log, orphan_id.as_bytes()), None);
   for located in [&first, &second] {
     assert_eq!(

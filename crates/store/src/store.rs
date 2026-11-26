@@ -27,6 +27,7 @@ use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
@@ -37,7 +38,8 @@ use mantle_engine::trunk::TrunkConfig;
 use slates_land::store_root::{StoreRoot, StoreRootRefusal};
 
 use crate::log::{
-  Appending, ChangesetLog, Header, Located, LogError, SectionKind, identity_of_range, sections_in,
+  Appending, ChangesetLog, Header, Located, LogError, SEAL_BYTES, SectionKind, identity_of_range,
+  sections_in,
 };
 use crate::staging::{Identity, Staging};
 
@@ -51,6 +53,9 @@ const CHANGESETS: u8 = b'C';
 const CONTENTS: u8 = b'P';
 /// Format: the tag of a standing grant's row (A-767's `G`: the grant the store's directory was opened under, R10).
 const GRANTS: u8 = b'G';
+/// Format: the tag of the store's per-store changeset log seal row (`S`), holding the 32-byte
+/// random secret authenticating every record header CRC and keyed BLAKE3 identity in [`LOG_FILE`].
+const SEAL_ROW: u8 = b'S';
 /// Format: a grant row's key: the tag and the grant's id.
 const GRANT_KEY_BYTES: usize = AFTER_TAG + U64;
 /// Format: a grant row's value: when it was first issued, the directory's device and inode.
@@ -309,24 +314,31 @@ impl Store {
     } else {
       (ShardDb::create(rows_file, config, mem_limit, trunk)?, 0)
     };
+    let seal = load_or_create_seal(&mut rows, applied)?;
     let mut corrupt_rows_skipped =
-      payloads::index_checkpoint(&mut rows, &log_file, applied, config.page_size)?;
+      payloads::index_checkpoint(&mut rows, &log_file, (applied, &seal), config.page_size)?;
     let expected_grant = grant_id(root.grant().target.device, root.grant().target.inode);
     let mut replayed = Ok(());
     let mut value = Vec::new();
     let mut buffer = Vec::new();
-    let log =
-      ChangesetLog::recover_for_grant(log_file, applied, Some(expected_grant), |file, located| {
+    let log = ChangesetLog::recover_sealed(
+      log_file,
+      applied,
+      seal,
+      Some(expected_grant),
+      |file, located| {
         if replayed.is_ok() {
           replayed = put_rows_from_log(
             &mut rows,
             file,
+            &seal,
             located,
             (&mut value, &mut buffer),
             &mut corrupt_rows_skipped,
           );
         }
-      })?;
+      },
+    )?;
     replayed?;
     let mut store = Self {
       root,
@@ -346,6 +358,11 @@ impl Store {
     };
     store.grant = store.record_grant()?;
     Ok(store)
+  }
+
+  /// The per-store 32-byte changeset log seal persisted in the store's engine (`S` row).
+  pub fn seal(&self) -> [u8; SEAL_BYTES] {
+    self.log.seal()
   }
 
   /// The standing grant the store's directory is written under, as first recorded (its `G` row).
@@ -467,9 +484,11 @@ impl Store {
   /// `land` puts (`C`, `P` for each payload, `T`/`H` from its `Texts`; w-perf's finding).
   pub fn applied(&mut self, located: &Located) -> Result<(), StoreError> {
     let mut buffer = Vec::new();
+    let seal = self.log.seal();
     put_rows_from_log(
       &mut self.rows,
       self.log.file(),
+      &seal,
       located,
       (&mut self.value, &mut buffer),
       &mut self.corrupt_rows_skipped,
@@ -509,9 +528,11 @@ impl Store {
       }
       record.commit()?
     };
+    let seal = self.log.seal();
     if !put_changeset_counted(
       &mut self.rows,
       self.log.file(),
+      &seal,
       &located,
       &mut self.value,
       &mut self.corrupt_rows_skipped,
@@ -544,9 +565,16 @@ impl Store {
     Ok(located)
   }
 
-  /// The bytes of the content `identity` (of `len` bytes) from `offset` on, as far as one piece reaches: from `staging`
-  /// while it is in flight (borrowed, no copy), else from the log where it landed (a read of at most [`PIECE_BYTES`]).
-  /// `None` where neither holds it, or `offset` is at or past its end.
+  /// Returns up to [`PIECE_BYTES`] of the content `identity` (expected length `len`) starting at
+  /// `offset`, or `None` when neither `staging` nor the log holds it or `offset >= len`.
+  ///
+  /// While `identity` is staged in flight, the remaining slice from `offset` is borrowed from
+  /// `staging` without copying. For a landed payload in the log, a [`VerifiedPayloads`] cache miss
+  /// streams and authenticates the entire landed payload against `identity` before returning any
+  /// byte (refusing [`LogError::Corrupt`] on mismatch), returning at most [`PIECE_BYTES`] from
+  /// `offset`; subsequent hits on the cached `(offset, len, identity)` read only the requested
+  /// piece without re-hashing, trading continuous re-verification for single-pass read speed per
+  /// payload lifetime until FIFO eviction.
   pub fn piece<'a>(
     &mut self,
     staging: &'a Staging,
@@ -604,7 +632,8 @@ impl Store {
 
   /// The sections of the landed changeset `row`, in order (its header read from the log).
   pub fn sections(&self, row: &Changeset) -> Result<Vec<crate::log::Section>, StoreError> {
-    sections_of(self.log.file(), self.log.end(), row)
+    let seal = self.log.seal();
+    sections_of(self.log.file(), self.log.end(), &seal, row)
   }
 
   /// At most [`PIECE_BYTES`] of the log from `offset` (a section's bytes, by the place [`Store::sections`] gave), as
@@ -694,6 +723,26 @@ impl Store {
     self.rows.checkpoint(self.log.end())?;
     Ok(())
   }
+}
+
+/// Loads the store's per-store 32-byte log seal (`S` row) from `rows`, or on a new store generates
+/// fresh OS randomness via AWS-LC, writes the `S` row, and checkpoints durably at `applied` before
+/// returning so a crash before the first user checkpoint never loses the seal.
+fn load_or_create_seal<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  applied: u64,
+) -> Result<[u8; SEAL_BYTES], StoreError> {
+  let mut value = Vec::new();
+  if rows.get(&[SEAL_ROW], &mut value)? {
+    return value.as_slice().try_into().map_err(|_| StoreError::BadRow);
+  }
+  let mut seal = [0u8; SEAL_BYTES];
+  SystemRandom::new()
+    .fill(&mut seal)
+    .map_err(|_| StoreError::Sizing("the OS random source refused the store seal"))?;
+  rows.put(&[SEAL_ROW], &seal)?;
+  rows.checkpoint(applied)?;
+  Ok(seal)
 }
 
 /// Opens (creating on first use) the store file `name` as a buffered device file.
@@ -816,7 +865,8 @@ fn texts_of_changeset<F: BlockFile>(
     return Ok(Vec::new());
   };
   let mut buffer = Vec::new();
-  for section in sections_of(log.file(), log.end(), &row)? {
+  let seal = log.seal();
+  for section in sections_of(log.file(), log.end(), &seal, &row)? {
     if section.kind == SectionKind::Texts {
       return section_texts(log.file(), &section, &mut buffer);
     }
@@ -828,11 +878,12 @@ fn texts_of_changeset<F: BlockFile>(
 fn sections_of<F: BlockFile>(
   file: &F,
   end: u64,
+  seal: &[u8; SEAL_BYTES],
   row: &Changeset,
 ) -> Result<Vec<crate::log::Section>, StoreError> {
   let located = Located {
     offset: row.offset,
-    header: crate::log::header_in(file, row.offset, end)?,
+    header: crate::log::header_in(file, row.offset, end, seal)?,
     identity: row.identity,
     len: row.len,
   };
@@ -956,11 +1007,12 @@ fn read_verified_piece<F: BlockFile>(
 fn put_rows_from_log<F: BlockFile>(
   rows: &mut ShardDb<F>,
   file: &F,
+  seal: &[u8; SEAL_BYTES],
   located: &Located,
   (value, buffer): (&mut Vec<u8>, &mut Vec<u8>),
   corrupt_rows_skipped: &mut u64,
 ) -> Result<(), StoreError> {
-  if !put_changeset_counted(rows, file, located, value, corrupt_rows_skipped)? {
+  if !put_changeset_counted(rows, file, seal, located, value, corrupt_rows_skipped)? {
     return Ok(());
   }
   for section in sections_in(file, located)? {
@@ -993,7 +1045,14 @@ fn put_changeset<F: BlockFile>(
   value: &mut Vec<u8>,
 ) -> Result<bool, StoreError> {
   let mut skipped = 0u64;
-  put_changeset_counted(rows, file, located, value, &mut skipped)
+  put_changeset_counted(
+    rows,
+    file,
+    &crate::log::UNSEALED,
+    located,
+    value,
+    &mut skipped,
+  )
 }
 
 /// Names this record at its sequence and releases the payload places of any record it replaces,
@@ -1002,6 +1061,7 @@ fn put_changeset<F: BlockFile>(
 fn put_changeset_counted<F: BlockFile>(
   rows: &mut ShardDb<F>,
   file: &F,
+  seal: &[u8; SEAL_BYTES],
   located: &Located,
   value: &mut Vec<u8>,
   corrupt_rows_skipped: &mut u64,
@@ -1017,7 +1077,7 @@ fn put_changeset_counted<F: BlockFile>(
         // A retried creation can reuse a sequence. Only the newly named record can keep payloads there.
         match payloads::visit(
           file,
-          located.offset,
+          (located.offset, seal),
           &previous,
           &mut Vec::new(),
           |identity, offset, _| {

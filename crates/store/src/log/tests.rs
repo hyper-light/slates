@@ -433,7 +433,9 @@ fn mid_file_corrupt_header_with_embedded_magic_and_consecutive_damage_recovers_c
   let (log, found) = recovered(file);
   assert_eq!(found, vec![r3]);
   assert_eq!(log.end(), r3.end());
-  assert_eq!(log.skipped(), 2);
+  // Without untrusted `SkipTo` jumps during resync, r1 (broken header) and r2 (damaged payload)
+  // are bypassed as one contiguous corrupt span `r1.offset..r3.offset`.
+  assert_eq!(log.skipped(), 1);
   assert_eq!(read_payload(&log, &r3), hg_bytes);
 }
 
@@ -726,4 +728,211 @@ fn mid_file_bad_trailer_followed_by_broken_header_never_scans_own_payload() {
   let log =
     ChangesetLog::recover_for_grant(sim, 0, Some(3), |_, located| found.push(*located)).unwrap();
   assert_recovered_payloads(&log, &found, &[(r3, &r3_bytes)]);
+}
+
+/// Round-2 Blocker 2: Do: write a 3-record log (Git, Mercurial, Subversion) and flip EVERY single
+/// bit of the middle record (`0..r2.len * 8`, covering header, every section descriptor, payload,
+/// and trailer); recover each faulted copy.
+/// Expect: 100% of single-bit faults leave both healthy siblings (Git and Subversion) recovered
+/// with exact bytes, `log.end() == r3.end()`, and `log.skipped() == 1`.
+#[test]
+fn every_single_bit_flip_in_middle_record_preserves_both_healthy_siblings() {
+  let (mut log, _) = recovered(file(90));
+  let git_bytes = payload(61, 32);
+  let hg_bytes = vec![0x5Au8];
+  let svn_bytes = payload(63, 48);
+  let r1 = append_for(&mut log, Tool::Git, 101, 1, &git_bytes);
+  let r2 = append_for(&mut log, Tool::Mercurial, 202, 1, &hg_bytes);
+  let r3 = append_for(&mut log, Tool::Subversion, 303, 1, &svn_bytes);
+  assert_eq!(r2.len * 8, 1_264);
+  let image = log.into_file().durable_image().unwrap();
+  let start = usize::try_from(r2.offset).unwrap();
+  let count = usize::try_from(r2.len).unwrap();
+  for byte_idx in 0..count {
+    for bit in 0..8u8 {
+      let copy = file(91);
+      copy.write_all_at(&image, 0).unwrap();
+      copy.sync_data().unwrap();
+      copy
+        .inject(Fault::BitFlip {
+          offset: r2.offset + u64::try_from(byte_idx).unwrap(),
+          bit,
+          stored: true,
+        })
+        .unwrap();
+      let (log, found) = recovered(copy);
+      assert_eq!(
+        found,
+        vec![r1, r3],
+        "bit flip at r2+{byte_idx} (file offset {}) bit {bit} lost sibling",
+        start + byte_idx
+      );
+      assert_eq!(
+        log.end(),
+        r3.end(),
+        "bit flip at r2+{byte_idx} bit {bit} rewound log.end()"
+      );
+      assert_eq!(log.skipped(), 1, "bit flip at r2+{byte_idx} bit {bit}");
+      assert_eq!(read_payload(&log, &r1), git_bytes);
+      assert_eq!(read_payload(&log, &r3), svn_bytes);
+    }
+  }
+}
+
+/// Encodes a committed record at `target_offset` with `seal` and `grant`.
+fn encoded_record_at(
+  seal: [u8; SEAL_BYTES],
+  target_offset: u64,
+  tool: Tool,
+  repository: u128,
+  grant: u64,
+  payload_bytes: &[u8],
+) -> Vec<u8> {
+  let sim = file(95);
+  if target_offset > 0 {
+    let pad = vec![0u8; usize::try_from(target_offset).unwrap()];
+    sim.write_all_at(&pad, 0).unwrap();
+    sim.sync_data().unwrap();
+  }
+  let mut log = ChangesetLog::recover_sealed(sim, target_offset, seal, None, |_, _| {}).unwrap();
+  let mut record = log
+    .begin(Header {
+      tool,
+      repository,
+      sequence: 1,
+      judged_over: 0,
+      grant,
+      work: 77,
+      time_ns: 777,
+      sections: 2,
+    })
+    .unwrap();
+  record.section(SectionKind::Record, 5).unwrap();
+  record.piece(b"heads").unwrap();
+  record
+    .section(
+      SectionKind::Payload,
+      u64::try_from(payload_bytes.len()).unwrap(),
+    )
+    .unwrap();
+  record.piece(payload_bytes).unwrap();
+  let located = record.commit().unwrap();
+  let image = log.into_file().durable_image().unwrap();
+  image[usize::try_from(located.offset).unwrap()..usize::try_from(located.end()).unwrap()].to_vec()
+}
+
+/// Checks C1 (mid-file broken header followed by healthy record 3) against `forged` under `seal`.
+fn assert_c1_forged_rejected(seed: u64, seal: [u8; SEAL_BYTES], forged: &[u8], label: &str) {
+  let mut log = ChangesetLog::recover_sealed(file(seed), 0, seal, Some(3), |_, _| {}).unwrap();
+  let r1 = append_for(&mut log, Tool::Git, 101, 1, forged);
+  let r3_bytes = payload(64, 128);
+  let r3 = append_for(&mut log, Tool::Subversion, 303, 1, &r3_bytes);
+  let sim = log.into_file();
+  sim
+    .inject(Fault::BitFlip {
+      offset: r1.offset + 8,
+      bit: 2,
+      stored: true,
+    })
+    .unwrap();
+  let mut found = Vec::new();
+  let log = ChangesetLog::recover_sealed(sim, 0, seal, Some(3), |_, located| {
+    found.push(*located);
+  })
+  .unwrap();
+  assert_eq!(found, vec![r3], "{label}");
+  assert_eq!(log.end(), r3.end(), "{label}");
+  assert_eq!(read_payload(&log, &r3), r3_bytes, "{label}");
+}
+
+/// Checks C2 (zeroed header at EOF) and C3 (zeroed header + trailer at EOF) against `forged`.
+fn assert_c2_c3_forged_rejected(
+  seed: u64,
+  seal: [u8; SEAL_BYTES],
+  forged: &[u8],
+  zero_trailer: bool,
+  label: &str,
+) {
+  let mut log = ChangesetLog::recover_sealed(file(seed), 0, seal, Some(3), |_, _| {}).unwrap();
+  let r1 = append_for(&mut log, Tool::Git, 101, 1, b"legit commit");
+  let carrier = append_for(&mut log, Tool::Git, 101, 2, forged);
+  let sim = log.into_file();
+  sim
+    .write_all_at(&[0u8; HEADER_BYTES], carrier.offset)
+    .unwrap();
+  if zero_trailer {
+    sim
+      .write_all_at(
+        &[0u8; TRAILER_BYTES],
+        carrier.end() - u64::try_from(TRAILER_BYTES).unwrap(),
+      )
+      .unwrap();
+  }
+  sim.sync_data().unwrap();
+  let mut found = Vec::new();
+  let log = ChangesetLog::recover_sealed(sim, 0, seal, Some(3), |_, located| {
+    found.push(*located);
+  })
+  .unwrap();
+  assert_eq!(found, vec![r1], "{label}");
+  assert_eq!(log.end(), r1.end(), "{label}");
+}
+
+/// Round-2 Blocker 1 (`SimFile` C1/C2/C3): Do: under a non-zero per-store secret `seal`, embed a
+/// same-grant `SLCS..SLCC` record for repo 202 — both (a) a verbatim offset-0 record sealed with
+/// the SAME secret and (b) an unsealed record freshly encoded for the exact nested offset with the
+/// same grant — inside repo 101's carrier payload under C1 (mid-file broken header + healthy
+/// sibling 3), C2 (zeroed header at EOF), and C3 (zeroed header + trailer torn tail at EOF).
+/// Expect: repo 202 is NEVER indexed, repo 303 recovers cleanly on C1, and `log.end()` stops at
+/// the last genuine committed record on C2 and C3.
+#[test]
+fn nested_same_grant_forged_record_never_indexes_in_c1_c2_c3() {
+  let seal = [0xA5u8; SEAL_BYTES];
+  let payload_prefix =
+    u64::try_from(HEADER_BYTES + SECTION_HEAD_BYTES + 5 + SECTION_HEAD_BYTES).unwrap();
+  let verbatim_same_seal = encoded_record_at(seal, 0, Tool::Mercurial, 202, 3, b"FORGED same-seal");
+  let exact_c1_unsealed = encoded_record_at(
+    UNSEALED,
+    payload_prefix,
+    Tool::Mercurial,
+    202,
+    3,
+    b"FORGED exact-offset c1",
+  );
+  assert_c1_forged_rejected(92, seal, &verbatim_same_seal, "C1 verbatim same-seal");
+  assert_c1_forged_rejected(93, seal, &exact_c1_unsealed, "C1 exact-offset unsealed");
+
+  let r1_len =
+    u64::try_from(HEADER_BYTES + SECTION_HEAD_BYTES + 5 + SECTION_HEAD_BYTES + 12 + TRAILER_BYTES)
+      .unwrap();
+  let exact_eof_unsealed = encoded_record_at(
+    UNSEALED,
+    r1_len + payload_prefix,
+    Tool::Mercurial,
+    202,
+    3,
+    b"FORGED exact-offset eof",
+  );
+  assert_c2_c3_forged_rejected(
+    94,
+    seal,
+    &verbatim_same_seal,
+    false,
+    "C2 verbatim same-seal",
+  );
+  assert_c2_c3_forged_rejected(95, seal, &verbatim_same_seal, true, "C3 verbatim same-seal");
+  assert_c2_c3_forged_rejected(
+    96,
+    seal,
+    &exact_eof_unsealed,
+    false,
+    "C2 exact-offset unsealed",
+  );
+  assert_c2_c3_forged_rejected(
+    97,
+    seal,
+    &exact_eof_unsealed,
+    true,
+    "C3 exact-offset unsealed",
+  );
 }

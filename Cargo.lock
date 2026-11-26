@@ -1981,6 +1981,7 @@ dependencies = [
 name = "slates-store"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "blake3",
  "hyper-block",
  "mantle-crc",

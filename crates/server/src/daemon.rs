@@ -8859,6 +8859,10 @@ mod tests {
     // The store's log, read back from its files: the creation, then the push as one changeset.
     store.stop_owner();
     let dir = store.dir().to_path_buf();
+    let seal =
+      slates_store::store::Store::open(crate::test_store::root(&dir), crate::test_store::SIZING)
+        .unwrap()
+        .seal();
     let log_file = hyper_block::file::DeviceFile::adopt(
       crate::test_store::root(&dir)
         .open_file(slates_store::store::LOG_FILE)
@@ -8869,7 +8873,9 @@ mod tests {
     )
     .unwrap();
     let mut found = Vec::new();
-    let log = ChangesetLog::recover(log_file, 0, |_, located| found.push(*located)).unwrap();
+    let log =
+      ChangesetLog::recover_sealed(log_file, 0, seal, None, |_, located| found.push(*located))
+        .unwrap();
     let ours: Vec<_> = found
       .iter()
       .filter(|located| located.header.repository == u128::from_be_bytes(repository.bytes))

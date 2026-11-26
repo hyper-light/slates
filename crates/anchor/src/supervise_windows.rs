@@ -4,6 +4,7 @@
 //! anchor; each successor gets a fresh channel, so a predecessor's unread acknowledgement cannot reach it.
 
 use std::ffi::{OsStr, OsString};
+use std::os::windows::io::BorrowedHandle;
 use std::os::windows::process::ExitStatusExt;
 use std::process::ExitStatus;
 
@@ -58,15 +59,15 @@ impl Child {
 }
 
 /// Starts the child with only the named handles (the handoff's and `extra`, each inheritable), plus copies of its
-/// standard three. `job` is assigned by
+/// standard streams (directing `hStdError` to an inheritable duplicate of `stderr` when given). `job` is assigned by
 /// `PROC_THREAD_ATTRIBUTE_JOB_LIST` at creation, before the child can run.
 pub(super) fn spawn(
-  program: &str,
-  args: &[String],
+  (program, args): (&str, &[String]),
   env: &[(String, String)],
   handoff: Option<&Handoff>,
   job: HANDLE,
   extra: &[HANDLE],
+  stderr: Option<BorrowedHandle<'_>>,
 ) -> Result<Child, slates_ipc::IpcError> {
   let args: Vec<OsString> = args.iter().map(OsString::from).collect();
   let env: Vec<(&OsStr, &OsStr)> = env
@@ -77,15 +78,18 @@ pub(super) fn spawn(
   let mut handles = handoff.map_or_else(Vec::new, Handoff::handles);
   handles.extend_from_slice(extra);
   let process_security = slates_ipc::process_access::ProcessSecurity::handle_owner()?;
-  let process = slates_ipc::win_spawn::spawn(&Spawn {
-    program: OsStr::new(program),
-    args: &args,
-    environment: Some(&env),
-    inherited: &handles,
-    output: StandardOutput::Inherited,
-    job: Some(job),
-    process_security: Some(&process_security),
-  })?;
+  let process = slates_ipc::win_spawn::spawn_with_error(
+    &Spawn {
+      program: OsStr::new(program),
+      args: &args,
+      environment: Some(&env),
+      inherited: &handles,
+      output: StandardOutput::Inherited,
+      job: Some(job),
+      process_security: Some(&process_security),
+    },
+    stderr,
+  )?;
   Ok(Child { process })
 }
 

@@ -8,6 +8,8 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+# OS randomness for each store's per-store 32-byte changeset log seal (SEAM-1 / Round 2).
+aws-lc-rs = { workspace = true }
 blake3 = { workspace = true }
 # The block layer the log and the engine's file are written through (vendor/hyper-raft): aligned I/O and the
 # platform's full flush (`F_FULLFSYNC` on macOS).

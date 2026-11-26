@@ -293,7 +293,6 @@ pub struct Supervisor {
   published_refusals: (u64, u64),
   /// Owned thread relaying the supervised daemon's stderr pipe through this process's single stderr
   /// lock so anchor and daemon lines past `PIPE_BUF` never interleave (SEAM-3).
-  #[cfg(unix)]
   stderr_relay: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -397,7 +396,6 @@ impl Supervisor {
       #[cfg(windows)]
       shared_listeners: Vec::new(),
       published_refusals: (0, 0),
-      #[cfg(unix)]
       stderr_relay: None,
     })
   }
@@ -761,7 +759,6 @@ impl Supervisor {
     if self.child.is_some() {
       return Ok(());
     }
-    #[cfg(unix)]
     self.join_stderr_relay();
     self.started_at_ns = now_ns;
     self.serving_seen_ns = None;
@@ -838,23 +835,18 @@ impl Supervisor {
 
   /// Joins any prior child's stderr relay thread once the child has been reaped so no thread is
   /// ever orphaned (§2 item 9).
-  #[cfg(unix)]
   fn join_stderr_relay(&mut self) {
     if let Some(handle) = self.stderr_relay.take() {
       let _ = handle.join();
     }
   }
 
-  /// Spawns an owned thread relaying `child`'s piped stderr line-by-line through this process's
-  /// single stderr lock so anchor and daemon lines past `PIPE_BUF` never interleave.
-  #[cfg(unix)]
-  fn attach_stderr_relay(&mut self, child: &mut Child) {
-    let Some(stderr) = child.stderr.take() else {
-      return;
-    };
+  /// Spawns an owned thread relaying a child's piped stderr line-by-line through this process's
+  /// single stderr lock so anchor and daemon lines never interleave.
+  fn attach_stderr_relay(&mut self, reader: impl std::io::Read + Send + 'static) {
     match std::thread::Builder::new()
       .name("slates-stderr".to_owned())
-      .spawn(move || slates_machine::log::relay_stderr(stderr))
+      .spawn(move || slates_machine::log::relay_stderr(reader))
     {
       Ok(handle) => self.stderr_relay = Some(handle),
       Err(error) => {
@@ -879,11 +871,14 @@ impl Supervisor {
       code: error.raw_os_error(),
     })?;
     self.lifetime.tie(&child)?;
-    self.attach_stderr_relay(&mut child);
+    if let Some(stderr) = child.stderr.take() {
+      self.attach_stderr_relay(stderr);
+    }
     Ok(child)
   }
 
-  /// Windows replaces broad inheritance with one explicit handle list, including its job at creation (A-198).
+  /// Windows replaces broad inheritance with one explicit handle list, including its job at creation (A-198),
+  /// and pipes the child's stderr through the anchor's own stderr relay (SEAM-3).
   #[cfg(windows)]
   fn spawn_child(&mut self, mut env: Vec<(String, String)>) -> Result<Child, AnchorError> {
     // Windows' own-image identity remains unchecked as A-145 records; this transport change adds no new check.
@@ -920,17 +915,23 @@ impl Supervisor {
       ));
       Some((reader, writer, handed))
     };
+    let (stderr_reader, stderr_writer) = std::io::pipe().map_err(|error| AnchorError::Spawn {
+      code: error.raw_os_error(),
+    })?;
     let extra: Vec<windows_sys::Win32::Foundation::HANDLE> =
       pipe.iter().map(|(_, _, handed)| handed.raw()).collect();
     let child = windows::spawn(
-      &self.program,
-      &self.args,
+      (&self.program, &self.args),
       &env,
       handoff.as_ref(),
       job,
       &extra,
+      Some(std::os::windows::io::AsHandle::as_handle(&stderr_writer)),
     )
     .map_err(hold_error)?;
+    // Close the anchor's copy of the write end immediately so EOF arrives when the child exits.
+    drop(stderr_writer);
+    self.attach_stderr_relay(stderr_reader);
     if let Some((reader, writer, handed)) = pipe {
       // This process's copies of the reading end go first, so the daemon's read meets the pipe's end once the writer
       // closes, and a daemon that died meanwhile fails the write rather than leaving it waiting.
@@ -1009,7 +1010,6 @@ impl Supervisor {
       }
     };
     self.child = None;
-    #[cfg(unix)]
     self.join_stderr_relay();
     let exit_code = status.code();
     // Only a daemon that exited before it served as long as its start took failed: one that served that long had
@@ -1140,7 +1140,6 @@ impl Supervisor {
     // A stop ends a crash loop's backoff too: nothing restarts the daemon after it.
     self.retry_at_ns = None;
     let Some(child) = self.child.as_mut() else {
-      #[cfg(unix)]
       self.join_stderr_relay();
       self.segment.supervision()?.record_exit(false);
       return Ok(Stopping::Exited {
@@ -1151,7 +1150,6 @@ impl Supervisor {
     match child.try_wait() {
       Ok(Some(status)) => {
         self.child = None;
-        #[cfg(unix)]
         self.join_stderr_relay();
         self.segment.supervision()?.record_exit(false);
         return Ok(Stopping::Exited {
@@ -1188,7 +1186,6 @@ impl Supervisor {
       }
       None => None,
     };
-    #[cfg(unix)]
     self.join_stderr_relay();
     self.segment.supervision()?.record_exit(false);
     Ok(Stopping::Exited {
@@ -1206,7 +1203,6 @@ impl Supervisor {
       let _ = child.kill();
       let _ = child.wait();
     }
-    #[cfg(unix)]
     self.join_stderr_relay();
     self.segment.supervision()?.record_exit(false);
     Ok(())

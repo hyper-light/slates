@@ -551,7 +551,8 @@ pub(crate) enum ReplayRefused {
 }
 
 impl ReplayRefused {
-  /// Concise typed refusal diagnostic for HTTP `503 Service Unavailable` bodies when a repository failed recovery.
+  /// Concise typed refusal diagnostic for HTTP `503 Service Unavailable` bodies and `Display` when
+  /// a repository failed recovery; covers every [`ReplayRefused`] variant exhaustively.
   pub(crate) fn diagnostic(&self) -> &'static str {
     match self {
       Self::Unlanded => {

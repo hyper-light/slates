@@ -4,8 +4,8 @@
 
 use super::{
   BlockFile, CHANGESET_ENTRY_BYTES, CHANGESETS, CONTENT_KEY_BYTES, CONTENT_VALUE_BYTES, CONTENTS,
-  Changeset, Identity, LogError, Rows, SectionKind, ShardDb, StoreError, U64, content_key,
-  decode_changeset, decode_content, field, identity_of_range, put, sections_of,
+  Changeset, Identity, LogError, Rows, SEAL_BYTES, SectionKind, ShardDb, StoreError, U64,
+  content_key, decode_changeset, decode_content, field, identity_of_range, put, sections_of,
 };
 
 /// Width of an alternate place's key. Its final field is the section's unique offset in the log.
@@ -101,12 +101,12 @@ pub(super) fn forget<F: BlockFile>(
 /// Visits only this record's payloads, hashing through the same bounded buffer as log recovery.
 pub(super) fn visit<F: BlockFile>(
   file: &F,
-  end: u64,
+  (end, seal): (u64, &[u8; SEAL_BYTES]),
   row: &Changeset,
   buffer: &mut Vec<u8>,
   mut each: impl FnMut(&Identity, u64, u64) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
-  for section in sections_of(file, end, row)? {
+  for section in sections_of(file, end, seal, row)? {
     if section.kind == SectionKind::Payload {
       let identity = identity_of_range(file, section.offset, section.len, buffer)?;
       each(&identity, section.offset, section.len)?;
@@ -120,7 +120,7 @@ pub(super) fn visit<F: BlockFile>(
 fn rebuild_payload_places<F: BlockFile>(
   rows: &mut ShardDb<F>,
   file: &F,
-  applied: u64,
+  (applied, seal): (u64, &[u8; SEAL_BYTES]),
   per_page: usize,
   value: &mut Vec<u8>,
 ) -> Result<u64, StoreError> {
@@ -131,9 +131,13 @@ fn rebuild_payload_places<F: BlockFile>(
   let mut corrupt_rows_skipped = 0u64;
   scan_table(rows, CHANGESETS, per_page, |rows, key, entry| {
     let row = decode_changeset(key, entry)?;
-    match visit(file, applied, &row, &mut buffer, |identity, offset, len| {
-      keep(rows, identity, offset, len, value)
-    }) {
+    match visit(
+      file,
+      (applied, seal),
+      &row,
+      &mut buffer,
+      |identity, offset, len| keep(rows, identity, offset, len, value),
+    ) {
       Ok(()) => Ok(()),
       Err(StoreError::Log(LogError::Corrupt(what))) => {
         corrupt_rows_skipped = corrupt_rows_skipped.saturating_add(1);
@@ -158,7 +162,7 @@ fn rebuild_payload_places<F: BlockFile>(
 pub(super) fn index_checkpoint<F: BlockFile>(
   rows: &mut ShardDb<F>,
   file: &F,
-  applied: u64,
+  (applied, seal): (u64, &[u8; SEAL_BYTES]),
   page_bytes: usize,
 ) -> Result<u64, StoreError> {
   let mut value = Vec::new();
@@ -171,7 +175,7 @@ pub(super) fn index_checkpoint<F: BlockFile>(
       .checked_div(CHANGESET_ENTRY_BYTES)
       .unwrap_or(1)
       .max(1);
-    rebuild_payload_places(rows, file, applied, per_page, &mut value)?
+    rebuild_payload_places(rows, file, (applied, seal), per_page, &mut value)?
   } else {
     0
   };

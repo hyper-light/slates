@@ -6,6 +6,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use hyper_block::block::BlockFile;
 use slates_land::store_root::{StoreGrant, StoreRoot};
 
 use super::{
@@ -292,7 +293,8 @@ fn read_all_pieces(
 }
 
 /// Lands `payload` and a healthy sibling, checkpoints, flips one bit at `payload + flip_at`,
-/// reopens, and asserts `Store::piece` starting at `start_offset` refuses `LogError::Corrupt`.
+/// reopens, and asserts the VERY FIRST `Store::piece` call at `start_offset` refuses
+/// `LogError::Corrupt` (even when `flip_at` lies outside the requested window).
 fn assert_corrupt_checkpointed_piece_refused(
   name: &str,
   payload_len: usize,
@@ -312,25 +314,31 @@ fn assert_corrupt_checkpointed_piece_refused(
   flip_bit_in_file(&dir.path().join(LOG_FILE), r1_payload_offset + flip_at, 4);
 
   let mut store = open_store(dir.path());
-  let read = read_all_pieces(&mut store, &git_bytes, start_offset);
+  let staging = Staging::new(0);
+  let id = *blake3::hash(&git_bytes).as_bytes();
+  let first = store.piece(&staging, &id, to_u64(git_bytes.len()), start_offset);
   assert!(
-    matches!(read, Err(StoreError::Log(LogError::Corrupt(_)))),
-    "{name}: corrupt checkpointed payload must refuse Corrupt, got {read:?}"
+    matches!(first, Err(StoreError::Log(LogError::Corrupt(_)))),
+    "{name}: very first Store::piece(offset={start_offset}) must refuse Corrupt, got {first:?}"
   );
+  assert_eq!(store.payload_verifications(), 0);
   assert_eq!(read_piece_whole(&mut store, &hg_bytes), Some(hg_bytes));
 }
 
-/// SEAM-1 item 3 / Blocker 3: Do: land and checkpoint payloads of (a) 1 piece (1,000 B), (b) exact
-/// 65,536 B read from suffix offset 1, (c) 200,000 B with a bit-flip in piece 1 (+5) and in piece 3
-/// (+150,000); and (d) a healthy 131,089-byte 3-piece payload.
-/// Expect: (a)-(c) all refuse `LogError::Corrupt` before returning corrupt bytes while healthy Hg
-/// reads intact; (d) returns exact bytes in 3 pieces and hashes the payload exactly once.
+/// SEAM-1 item 3 / Blocker 3 / Suggestion 5: Do: land and checkpoint payloads of (a) 1 piece
+/// (1,000 B), (b) exact 65,536 B read from suffix offset 1, (c) 200,000 B with a bit-flip in
+/// piece 1 (+5) and in piece 3 (+150,000) requested at offset 0 and offset 1; and (d) a healthy
+/// 131,089-byte 3-piece payload.
+/// Expect: (a)-(c) all refuse `LogError::Corrupt` on the very first `Store::piece` call before
+/// returning any byte while healthy Hg reads intact; (d) returns exact bytes in 3 pieces and hashes
+/// the payload exactly once.
 #[test]
 fn checkpointed_stale_row_does_not_mask_corrupt_payload_on_piece_read() {
   assert_corrupt_checkpointed_piece_refused("seam1-ckpt-1piece", 1_000, 5, 0);
   assert_corrupt_checkpointed_piece_refused("seam1-ckpt-suffix", PIECE_BYTES, 5, 1);
   assert_corrupt_checkpointed_piece_refused("seam1-ckpt-mp-first", 200_000, 5, 0);
-  assert_corrupt_checkpointed_piece_refused("seam1-ckpt-mp-third", 200_000, 150_000, 0);
+  assert_corrupt_checkpointed_piece_refused("seam1-ckpt-mp-third-off0", 200_000, 150_000, 0);
+  assert_corrupt_checkpointed_piece_refused("seam1-ckpt-mp-third-off1", 200_000, 150_000, 1);
 
   let dir = ScratchDir::new("seam1-ckpt-healthy-3piece");
   let healthy = pattern_bytes(131_089, 17, 3);
@@ -419,6 +427,145 @@ fn torn_record_carrying_forged_record_for_other_repo_is_never_indexed() {
   assert_forged_tail_rejected(dir_b.path(), forged_payload, r1_end);
 }
 
+/// Encodes a same-grant `SLCS..SLCC` record image for repository 2 without the store's secret seal,
+/// targeting `target_offset` (or offset 0 when `target_offset == 0`).
+fn forge_unsealed_same_grant_record(
+  grant: u64,
+  target_offset: u64,
+  forged_payload: &[u8],
+) -> Vec<u8> {
+  let sim = hyper_block::sim::SimFile::new(
+    hyper_block::buf::Alignment::BYTE,
+    hyper_block::buf::Alignment::BYTE,
+    99,
+  )
+  .unwrap();
+  if target_offset > 0 {
+    let pad = vec![0u8; usize::try_from(target_offset).unwrap()];
+    sim.write_all_at(&pad, 0).unwrap();
+    sim.sync_data().unwrap();
+  }
+  let mut log = ChangesetLog::recover(sim, target_offset, |_, _| {}).unwrap();
+  let mut record = log
+    .begin(Header {
+      tool: Tool::Mercurial,
+      repository: 2,
+      sequence: 1,
+      judged_over: 0,
+      grant,
+      work: 77,
+      time_ns: 77,
+      sections: 2,
+    })
+    .unwrap();
+  record.section(SectionKind::Record, 4).unwrap();
+  record.piece(b"refs").unwrap();
+  record
+    .section(SectionKind::Payload, to_u64(forged_payload.len()))
+    .unwrap();
+  record.piece(forged_payload).unwrap();
+  let located = record.commit().unwrap();
+  let image = log.into_file().durable_image().unwrap();
+  image[usize::try_from(located.offset).unwrap()..usize::try_from(located.end()).unwrap()].to_vec()
+}
+
+/// Runs C1 (mid-file broken header followed by healthy repo 3) over a real `Store` with either a
+/// verbatim offset-0 copy sealed by the SAME store or an unsealed exact-offset forgery.
+fn assert_c1_store_nested_rejected(exact_offset: bool, forged_payload: &[u8]) {
+  use crate::log::{HEADER_BYTES, SECTION_HEAD_BYTES};
+
+  let healthy_r3 = b"healthy repository 3 sibling after broken carrier".to_vec();
+  let dir = ScratchDir::new(if exact_offset {
+    "seam1-c1-exact-offset"
+  } else {
+    "seam1-c1-verbatim"
+  });
+  let (carrier_offset, r3_id, r3_end) = {
+    let mut store = open_store(dir.path());
+    let seed = land_for(&mut store, Tool::Git, 99, 1, b"seed at offset zero");
+    let nested_base =
+      seed.end() + to_u64(HEADER_BYTES + SECTION_HEAD_BYTES + 4 + SECTION_HEAD_BYTES);
+    let forged = if exact_offset {
+      forge_unsealed_same_grant_record(store.grant().id, nested_base, forged_payload)
+    } else {
+      let mut raw = std::fs::read(dir.path().join(LOG_FILE)).unwrap();
+      raw.truncate(usize::try_from(seed.end()).unwrap());
+      raw
+    };
+    let carrier = land_for(&mut store, Tool::Git, 1, 1, &forged);
+    assert_eq!(
+      store.log().sections(&carrier).unwrap()[1].offset,
+      nested_base
+    );
+    let r3 = land_for(&mut store, Tool::Subversion, 3, 1, &healthy_r3);
+    (carrier.offset, r3.identity, r3.end())
+  };
+  flip_bit_in_file(&dir.path().join(LOG_FILE), carrier_offset + 8, 2);
+  let mut store = open_store(dir.path());
+  let seed_rows = store.changesets(99, 0, 10).unwrap();
+  assert_eq!(seed_rows.len(), 1);
+  assert_eq!(seed_rows[0].offset, 0);
+  assert!(
+    store.changesets(2, 0, 10).unwrap().is_empty(),
+    "C1 (exact_offset={exact_offset}): forged repo 2 record must never be indexed"
+  );
+  assert_eq!(read_piece_whole(&mut store, forged_payload), None);
+  assert_single_changeset_intact(&mut store, 3, r3_id, &healthy_r3);
+  assert_eq!(store.log().end(), r3_end);
+}
+
+/// Runs C2 (zeroed header at EOF) or C3 (zeroed header + trailer at EOF) over a real `Store` with
+/// an exact-offset same-grant unsealed forgery embedded inside the carrier payload.
+fn assert_c2_c3_store_nested_rejected(zero_trailer: bool, forged_payload: &[u8]) {
+  use crate::log::{HEADER_BYTES, SECTION_HEAD_BYTES};
+
+  let dir = ScratchDir::new(if zero_trailer {
+    "seam1-c3-zero-head-trailer"
+  } else {
+    "seam1-c2-zero-head"
+  });
+  let (r1_end, carrier_offset, carrier_end) = {
+    let mut store = open_store(dir.path());
+    let r1 = land_for(&mut store, Tool::Git, 1, 1, b"legit git push one");
+    let nested_offset =
+      r1.end() + to_u64(HEADER_BYTES + SECTION_HEAD_BYTES + 4 + SECTION_HEAD_BYTES);
+    let forged = forge_unsealed_same_grant_record(store.grant().id, nested_offset, forged_payload);
+    let carrier = land_for(&mut store, Tool::Git, 1, 2, &forged);
+    assert_eq!(
+      store.log().sections(&carrier).unwrap()[1].offset,
+      nested_offset
+    );
+    (r1.end(), carrier.offset, carrier.end())
+  };
+  let log_path = dir.path().join(LOG_FILE);
+  let mut bytes = std::fs::read(&log_path).unwrap();
+  let head_start = usize::try_from(carrier_offset).unwrap();
+  bytes[head_start..head_start + HEADER_BYTES].fill(0);
+  if zero_trailer {
+    let tail_start = usize::try_from(carrier_end).unwrap() - TRAILER_BYTES;
+    bytes[tail_start..tail_start + TRAILER_BYTES].fill(0);
+  }
+  overwrite_file(&log_path, &bytes);
+  assert_forged_tail_rejected(dir.path(), forged_payload, r1_end);
+}
+
+/// Round-2 Blocker 1 (C1/C2/C3): Do: embed a complete same-grant `SLCS..SLCC` record image naming
+/// repository 2 inside repository 1's carrier payload — both (a) a verbatim copy from offset 0 of
+/// the same store and (b) a record freshly encoded for the exact nested offset with the victim
+/// store's `grant` but without its per-store secret — and test C1 (mid-file broken header + healthy
+/// sibling 3), C2 (zeroed header at EOF), and C3 (zeroed header + trailer torn tail at EOF).
+/// Expect: repository 2 is NEVER indexed (`changesets(2)` empty, `piece` returns `None`),
+/// repository 3 recovers intact on C1, and `log.end()` stays at the last genuine committed record
+/// on C2 and C3.
+#[test]
+fn nested_same_grant_forged_record_never_indexes_on_broken_header_or_torn_tail() {
+  let forged_payload = b"FORGED same-grant repo 2 bytes never pushed by owner";
+  assert_c1_store_nested_rejected(false, forged_payload);
+  assert_c1_store_nested_rejected(true, forged_payload);
+  assert_c2_c3_store_nested_rejected(false, forged_payload);
+  assert_c2_c3_store_nested_rejected(true, forged_payload);
+}
+
 /// Pure `SimFile` unit tests for piece authentication, bounded FIFO caching, and corrupt-row
 /// accounting (runnable without `StoreRoot::identify`).
 mod sim_tests {
@@ -486,31 +633,34 @@ mod sim_tests {
       })
       .unwrap();
     let mut verified = VerifiedPayloads::new(8 << 20);
-    let got = read_sim_pieces(
+    let id = *blake3::hash(&bytes).as_bytes();
+    let first = read_verified_piece(
       &log,
       &mut verified,
-      &bytes,
+      &id,
       (section.offset, section.len),
       start_offset,
     );
     assert!(
-      matches!(got, Err(StoreError::Log(LogError::Corrupt(_)))),
-      "flip at +{flip_at} from start {start_offset} must refuse Corrupt, got {got:?}"
+      matches!(first, Err(StoreError::Log(LogError::Corrupt(_)))),
+      "very first piece read (flip +{flip_at}, start {start_offset}) must refuse Corrupt, got {first:?}"
     );
     assert_eq!(verified.verifications(), 0);
   }
 
-  /// Blocker 3 (`SimFile` oracle): Do: run `read_verified_piece` on (a) 1-piece control, (b) suffix
-  /// `offset = 1` on 65,536-byte payload with bit-flip, (c) 200,000-byte payload flipped at +5 and
-  /// +150,000, (d) healthy 131,089-byte 3-piece read, and (e) FIFO eviction under `capacity = 2`.
-  /// Expect: (a)-(c) refuse `LogError::Corrupt`; (d) returns exact bytes in 3 pieces verifying
-  /// exactly once; (e) evicting the oldest entry triggers re-verification on next read.
+  /// Blocker 3 / Suggestion 5 (`SimFile` oracle): Do: run `read_verified_piece` on (a) 1-piece
+  /// control, (b) suffix `offset = 1` on 65,536-byte payload with bit-flip, (c) 200,000-byte
+  /// payload flipped at +5 and +150,000 requested at offset 0 and offset 1, (d) healthy
+  /// 131,089-byte 3-piece read, and (e) FIFO eviction under `capacity = 2`.
+  /// Expect: (a)-(c) refuse `LogError::Corrupt` on the very first piece call; (d) returns exact
+  /// bytes in 3 pieces verifying once; (e) evicting the oldest entry triggers re-verification.
   #[test]
   fn sim_piece_verification_covers_one_piece_suffix_multipiece_and_fifo_cache() {
     assert_sim_flip_refused(90, 1_000, 5, 0);
     assert_sim_flip_refused(91, PIECE_BYTES, 5, 1);
     assert_sim_flip_refused(92, 200_000, 5, 0);
     assert_sim_flip_refused(93, 200_000, 150_000, 0);
+    assert_sim_flip_refused(98, 200_000, 150_000, 1);
 
     let healthy = pattern_bytes(131_089, 17, 3);
     let mut log = ChangesetLog::recover(sim_file(94), 0, |_, _| {}).unwrap();
@@ -551,10 +701,19 @@ mod sim_tests {
     };
     let mut rows = ShardDb::create(sim_file(95), config, 1 << 20, trunk).unwrap();
     let mut log = ChangesetLog::recover(sim_file(96), 0, |_, _| {}).unwrap();
+    let seal = log.seal();
     let first = append_sim(&mut log, 1, b"first payload");
     let mut value = Vec::new();
     let mut skipped = 0u64;
-    put_changeset_counted(&mut rows, log.file(), &first, &mut value, &mut skipped).unwrap();
+    put_changeset_counted(
+      &mut rows,
+      log.file(),
+      &seal,
+      &first,
+      &mut value,
+      &mut skipped,
+    )
+    .unwrap();
     assert_eq!(skipped, 0);
 
     // Corrupt first record's header so both `index_checkpoint` and replacement meet `LogError::Corrupt`.
@@ -566,19 +725,66 @@ mod sim_tests {
         stored: true,
       })
       .unwrap();
-    let ckpt_skipped =
-      payloads::index_checkpoint(&mut rows, log.file(), log.end(), CHANGESET_ENTRY_BYTES).unwrap();
+    let ckpt_skipped = payloads::index_checkpoint(
+      &mut rows,
+      log.file(),
+      (log.end(), &seal),
+      CHANGESET_ENTRY_BYTES,
+    )
+    .unwrap();
     assert_eq!(ckpt_skipped, 1);
 
     let replacement = append_sim(&mut log, 1, b"replacement payload");
     put_changeset_counted(
       &mut rows,
       log.file(),
+      &seal,
       &replacement,
       &mut value,
       &mut skipped,
     )
     .unwrap();
     assert_eq!(skipped, 1);
+  }
+
+  /// Round-2 Blocker 1 (`SimFile` seal durability oracle): Do: create a fresh `ShardDb`, call
+  /// `load_or_create_seal` at `applied = 0`, simulate a power-loss crash before any user
+  /// checkpoint, reopen `ShardDb`, and call `load_or_create_seal` again.
+  /// Expect: the initial 32-byte random seal survives the crash verbatim and is non-zero, and a
+  /// distinct fresh store draws a distinct seal.
+  #[test]
+  fn sim_store_seal_is_durably_checkpointed_before_first_user_checkpoint() {
+    use hyper_block::sim::Crash;
+    use mantle_engine::store::IntoFile;
+
+    let config = Config {
+      page_size: MIN_PAGE,
+      extent_pages: 32,
+      max_extents: 256,
+    };
+    let trunk = TrunkConfig {
+      fanout: 8,
+      leaf_entries: 1024,
+    };
+    let mut rows = ShardDb::create(sim_file(101), config, 1 << 20, trunk).unwrap();
+    let created_seal = super::super::load_or_create_seal(&mut rows, 0).unwrap();
+    assert_ne!(created_seal, crate::log::UNSEALED);
+    let IntoFile::Finished {
+      file: saved,
+      result,
+    } = rows.into_file()
+    else {
+      panic!("rows must close cleanly");
+    };
+    result.unwrap();
+    saved.crash(Crash::LoseAll).unwrap();
+    let (mut reopened, applied) = ShardDb::open(saved, config, 1 << 20, trunk).unwrap();
+    assert_eq!(applied, 0);
+    let loaded_seal = super::super::load_or_create_seal(&mut reopened, applied).unwrap();
+    assert_eq!(loaded_seal, created_seal);
+
+    let mut other = ShardDb::create(sim_file(102), config, 1 << 20, trunk).unwrap();
+    let other_seal = super::super::load_or_create_seal(&mut other, 0).unwrap();
+    assert_ne!(other_seal, created_seal);
   }
 }
