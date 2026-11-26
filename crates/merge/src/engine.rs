@@ -847,22 +847,31 @@ enum Reached {
 impl Reached {
   /// The verdict of `units`.
   fn of(units: Vec<position::Unit>) -> Reached {
-    let windows: Vec<ConflictWindow> = units
-      .iter()
-      .flat_map(|unit| unit.windows.iter().cloned())
-      .collect();
-    let applied = if windows.is_empty() {
-      units
-        .iter()
-        .flat_map(|unit| unit.effects.iter().map(Effect::applied))
-        .collect()
-    } else {
-      Vec::new()
-    };
+    let (mut windows, mut applied) = (Vec::new(), Vec::new());
+    for unit in &units {
+      Reached::reach_unit(unit, (&mut windows, &mut applied));
+    }
     Reached::Verdict {
       units,
       applied,
       windows,
+    }
+  }
+
+  /// `unit` added to what a verdict reached ([`Reached::of`]; a unit a step where it is computed so, A-920 piece 3f):
+  /// its windows; and what the chain records of its effects while no unit so far held a window, none once one does.
+  fn reach_unit(
+    unit: &position::Unit,
+    (windows, applied): (
+      &mut Vec<ConflictWindow>,
+      &mut Vec<crate::chain_entry::Applied>,
+    ),
+  ) {
+    windows.extend(unit.windows.iter().cloned());
+    if windows.is_empty() {
+      applied.extend(unit.effects.iter().map(Effect::applied));
+    } else {
+      applied.clear();
     }
   }
 }
@@ -6831,16 +6840,21 @@ impl Green {
         floor: self.deltas_from,
       };
     }
-    let units = match computed.reached {
+    let (units, reached) = match computed.reached {
       Reached::Before(version) => return Judgment::AcceptedBefore { version },
-      Reached::Verdict { units, .. } => self.at_head(inc, (computed.at, computed.floor), units),
+      Reached::Verdict { units, applied, .. } => {
+        // Reached at the head, nothing since: its effects are the ones reached, and so what the chain records of them.
+        let unchanged = self.since(computed.at, computed.floor).is_nothing();
+        let units = self.at_head(inc, (computed.at, computed.floor), units);
+        (units, unchanged.then_some(applied))
+      }
     };
     match position::verdict(units) {
       Ok(effects) => {
         if check_reads {
           self.commit_reads(&effects, inc.post());
         }
-        let applied = effects.iter().map(Effect::applied).collect();
+        let applied = reached.unwrap_or_else(|| effects.iter().map(Effect::applied).collect());
         Judgment::Accepted(Judged {
           id: inc.id,
           at: self.head(),

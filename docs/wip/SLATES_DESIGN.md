@@ -64355,6 +64355,16 @@ GAPS.
   commits prepared a unit a step, makes as many files by copying as the judging green's whole commits
   (`Green::mapped_files_made`, for every version not made in steps first); a resumed `Alone` that skips a file, which
   moves no bytes differently and so passed every oracle before this count, fails it.
+  **3f, the judge's remainder** (5.9-6.2 ms after 3e: `Reached::of` 1.5, then the hold: `position::verdict` 1.5,
+  what the chain records of the effects again 0.5, the clones 0.07). What the units reach is a phase of the
+  computation (`ComputePhase::Reaching`), a unit a unit (`Reached::reach_unit`, which `Reached::of` is carried to its
+  end): each unit's windows, and what the chain records of its effects while no unit holds a window. The hold reuses
+  that list where the verdict was reached at the head with nothing since, its effects the ones reached, instead of
+  mapping them again. The judge's last step 5.9-6.2 ms → 2.7 ms (labelled debug run); the judge's longest is now its
+  first unit's walk (4.0). Oracles: the applying and named oracles' judges a unit a step; a hold that reuses the list
+  after the head moved fails three tests. A list kept after a window appears fails none: no reader takes a conflicted
+  verdict's list (`Computed::applied` answers none for it, the wire form writes the units, the hold reuses it only
+  for an accepted verdict).
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
