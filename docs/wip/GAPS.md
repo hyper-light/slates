@@ -1966,6 +1966,23 @@
 > other recursion in `slates-hg` or `slates-store` follows the data's depth (`render::next_log` recurses at most twice);
 > elsewhere git's `reach` recurses by its index's levels, svn's `children` by its tree's height, vcs's merge sort to lg k,
 > and svn's ra_svn items by a nesting depth its parser bounds (`Bounds::depth`).
+> The hg-over-SSH clone tests' fixture held its shard through the store's commit (main's 8a burner loop at 228d0dc97,
+> load about 50: exit 4 in 3 of 6 rounds and a fourth wedge, each `vcs_ssh/tests/hg.rs:1448` at its poll 1, 1,084 to
+> 1,156 ms with no CPU progress and never runnable). `one_file_history` landed its push inside an observation through
+> `test_store::land_blocking`, which joins a thread waiting on the owner's commit, so the shard's thread sat blocked
+> through an fsync (one landing served in 3.4 s at load about 45 in a run of the measurement). Since (w-hg), the fixture
+> pushes from a task on the shard through `hg_push::unbundle`, which awaits the store's landing, as a client's push does.
+> The fold of 459c07141 is not on this path (a one-changeset push reads no chain). No red reproduces a slow fsync on
+> demand; main's loop is the check.
+> The 57k clone's store asks and turns doubled at 459c07141 against the morning (2,508 and 1,326 against 1,140 and 669)
+> with every manifest path the same (main's table). A fetch's read-ahead and a text's slices are sized by the shard's
+> step bytes, half its step quantum at the memcpy rate, the quantum its live wake estimate, so asks grow as the shard's
+> measured wake shrinks; turns follow asks (a turn ends at an ask; two asks a turn in both runs). Now counted: each ask's
+> step bytes (`vcs_store.hg_store_ask_step_bytes`, its mean over the asks printed by `hg_clone_store_wait`; 34,829 bytes
+> over the 2,000-changeset history in debug), and the owner logs each request whose service passes twice the longest
+> it logged before, by kind and parts (`slates-store: the owner's longest service yet`), so a run's slowest request names
+> itself (the table's 863 ms one was unnamed; a landing of 3.4 s logged in a debug measurement). Owed: the 57k figures
+> with them (main's).
 > Instrumented (2026-11-25, w-hg; main's order: the 57k clone at 15b4f1061 waited 121.35 s on 6,232 store asks, about
 > 19 ms each, of its 165.8 s): each request of the store's owner splits its wait into parts that sum to it to the
 > nanosecond (`slates_store::owner`'s `Served` and `AskWaits`; a store test holds the sum), counted for a fetch's reads

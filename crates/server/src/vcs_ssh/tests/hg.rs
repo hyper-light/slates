@@ -1299,57 +1299,67 @@ fn stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it
   );
 }
 
-/// Makes Mercurial repository `name` on `state`'s shard holding one changeset whose one file is `bytes`: its record and
-/// the changeset's node.
+/// A Mercurial repository named `name` on `daemon`'s first shard, owned by [`owner`], holding one changeset whose one
+/// file is `bytes`, pushed as a client pushes it (`hg_push::unbundle`, from a task on the shard, the store's landing
+/// awaited, never blocked on): its record and the changeset's node. Until 2026-11-25 the push was landed inside an
+/// observation, the shard's thread blocked on the store's commit (`test_store::land_blocking`), and under load that wait
+/// alone passed the watchdog's window (main's 8a burner loop at 228d0dc97, load about 50: shards 30 and 7 judged wedged,
+/// 1,151 and 1,156 ms, no CPU progress and never runnable, at this fixture's observation).
 fn one_file_history(
-  state: &mut ShardState,
-  name: &str,
+  daemon: &crate::Daemon,
+  name: &'static str,
   bytes: &'static [u8],
 ) -> (RepositoryRecord, Node) {
-  let reply = crate::test_store::create(
-    state,
-    &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool: IpcTool::Mercurial,
-      format: IpcFormat::Sha1,
-      default_branch: line_name(b"default", 0),
-      green: None,
-    },
-  );
-  assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
-  let id = state
-    .db
-    .partition()
-    .repositories()
-    .repository_named(name)
-    .expect("the repository made")
-    .id;
+  let id = crate::daemon::observe_first(daemon, move |state| {
+    let reply = crate::test_store::create(
+      state,
+      &owner(),
+      RequestBody::CreateRepository {
+        name: name.to_owned(),
+        tool: IpcTool::Mercurial,
+        format: IpcFormat::Sha1,
+        default_branch: line_name(b"default", 0),
+        green: None,
+      },
+    );
+    assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(name)
+      .expect("the repository made")
+      .id
+  });
   let made = history_of(&[("large", "large", bytes, None, "default")]);
-  let unbundle = Unbundle {
-    parts: vec![Taken {
-      id: 0,
-      mandatory: true,
-      asks: Asks::Changegroup(changegroup(&made, &[0])),
-    }],
-  };
-  let mut room = slates_hg::Admission::new(u64::MAX);
-  // The push is past one request's room by design: it is admitted what the shard can hold.
-  let terms = (false, HISTORY_PUSH, u64::MAX);
-  let prepared =
-    hg_push::prepare_served(state, id, &unbundle, terms, &mut room).expect("the history prepared");
-  let landed = hg_push::land_stored(state, (&owner(), id), prepared);
+  let bundle = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0]);
+  let (sent, outcome) = mpsc::sync_channel(1);
+  crate::daemon::observe_first(daemon, move |state| {
+    // The push is past one request's room by design: it is admitted what the repository's share holds.
+    let room = crate::vcs_share::room(state, id).bytes;
+    let task = slates_rt::futures::spawn(async move {
+      let heads = slates_hg::push::check::HeadsArgument::Force;
+      let mut admission = slates_hg::Admission::new(room);
+      let pushed = hg_push::unbundle(id, (&owner(), &heads, &bundle), &mut admission).await;
+      let _ = sent.send(pushed);
+    })
+    .expect("the push's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let pushed = outcome.recv_timeout(PATIENCE).expect("the push answered");
   assert!(
-    landed.answer.is_ok() && landed.released.is_ok(),
-    "{landed:?}"
+    matches!(pushed, Some(slates_hg::push::Outcome::Accepted(_))),
+    "{pushed:?}"
   );
-  let record = state
-    .db
-    .partition()
-    .repositories()
-    .repository(id)
-    .cloned()
-    .expect("the record");
+  let record = crate::daemon::observe_first(daemon, move |state| {
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository(id)
+      .cloned()
+      .expect("the record")
+  });
   (record, made[0].node)
 }
 
@@ -1445,9 +1455,7 @@ fn random_file(len: u64) -> &'static [u8] {
 /// serving steps taken (`vcs_store.hg_ssh_steps`).
 fn cloned_over_ssh(large: &'static [u8], burners: usize) -> ((Channel, (Polls, u64)), (u64, u64)) {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (record, head) = crate::daemon::observe_first(&daemon, move |state| {
-    one_file_history(state, "cloned-over-ssh", large)
-  });
+  let (record, head) = one_file_history(&daemon, "cloned-over-ssh", large);
   let burning = std::sync::atomic::AtomicBool::new(true);
   let channel = std::thread::scope(|scope| {
     for _ in 0..burners {
