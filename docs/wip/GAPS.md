@@ -1159,8 +1159,8 @@
 >   `test_store::SHARD_BLOCKING_ALLOWED`, each with its owner and how many sites reach it, and run their blocking body
 >   through `allowing_shard_blocking`; there is no global off-switch. The list only shrinks.
 >   **The shard-blocking allow-list: 10 fixtures** (a test holds the list's length to this figure; edit both together):
->   - `test_store::audit_on_stored_shard`: 114 sites. svn 0; git 0; hg 32 (`hg_push/tests.rs` 15, `hg_view/tests.rs`
->     10, `hg_import/tests.rs` 7); other 82 (`push/tests.rs` 18, `vcs_store/tests.rs` 14, `paths/tests.rs` 11,
+>   - `test_store::audit_on_stored_shard`: 104 sites. svn 0; git 0; hg 22 (`hg_push/tests.rs` 15,
+>     `hg_import/tests.rs` 7); other 82 (`push/tests.rs` 18, `vcs_store/tests.rs` 14, `paths/tests.rs` 11,
 >     `repository.rs` 10, `commits/tests.rs` 8, `identities/tests.rs` 8, `vcs_share/grants.rs` 4,
 >     `vcs_share/read_backs.rs` 3, `index_upkeep.rs` 2, `import/tests.rs` 2, `fleet.rs` 2). Moved by w-git (2026-11-25)
 >     to forms that make a history's repositories from the test's thread first: `git_push::tests::on_stored_shard_with`
@@ -1188,7 +1188,11 @@
 >   `prepare_whole`'s entry is gone and `land_stored`'s and `create`'s fell by 15 and 16. The two that rebuild from the
 >   state logs' parts keep the parts the shard takes between the push's turns (`state_log::keep_for_test`). Left in
 >   that file: its 15 `audit_on_stored_shard` histories, which judge pushes over views of their own and race two pushes
->   by hand (`prepare_whole`, `land_in`). The pattern to move to is `audit_on_stored_shard_made`, `created().await` in a task
+>   by hand (`prepare_whole`, `land_in`). Shrunk again: `vcs_store/hg_view/tests.rs`' 10
+>   histories run as tasks on a store-backed daemon (`on_stored_shard`): repositories made by `created().await`, imports
+>   through the import verb awaited to their end (`test_store::imported_through_the_verb`), pushes through
+>   `hg_push::unbundle`, the store's answers by the daemon's own `answer_store_wants`, and a branch's `.hgtags` read at
+>   the verb's door by `hg_tags::dispatch_awaited`, which replaces `dispatch_blocking`. The pattern to move to is `audit_on_stored_shard_made`, `created().await` in a task
 >   (`run_on_first`), `create_on` from the test's thread, or `hg_push::unbundle` from a shard task.
 > **The piece-reading replay (A-767 C1; R2's replay half). CLOSED.** A changeset's payload is read back a piece at a
 > time as its replay wants it, never whole. `slates_hg::framing` is the one walk of a changegroup's chunks over a
