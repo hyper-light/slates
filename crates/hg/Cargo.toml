@@ -36,5 +36,10 @@ lz4_flex = { workspace = true }
 aws-lc-rs = { workspace = true }
 sha1-checked = { workspace = true }
 
+[target.'cfg(unix)'.dev-dependencies]
+# Direct stdout writes in `examples/sha1_ab.rs` through borrowed fd 1 without duplicating the descriptor or
+# suppressing `EBADF` on read-only stdout (A-893).
+rustix = { workspace = true }
+
 [lints]
 workspace = true
