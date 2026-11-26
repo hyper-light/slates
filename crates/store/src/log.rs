@@ -1,43 +1,56 @@
 //! The changeset log (A-767 item 2): a repository's history, an append-only file of landed changesets, each one record.
 //!
+//! **Store preamble.** A [`crate::store::Store`]'s changeset log begins at offset 0 with a [`SEAL_PREAMBLE_BYTES`]-byte
+//! self-describing `SLSE` preamble (`SLSE`, [`FORMAT`] as little-endian `u16`, two reserved zero bytes, the store's
+//! 32-byte random secret seal, the CRC-32C of those 40 bytes, and its bitwise complement). The preamble makes the log
+//! self-contained so the derived `rows` index can be deleted and rebuilt byte-identically from the log alone, and lets
+//! `Store::open` refuse legacy `FORMAT = 1` or future format versions with [`LogError::UnsupportedFormat`] before
+//! creating or mutating any file. Direct [`ChangesetLog::recover`] callers over bare logs still start at offset 0.
+//!
 //! **A record** (all integers little-endian):
-//! - a header of [`HEADER_BYTES`]: magic `SLCS`, the format, the tool, a flags byte, then the repository, the
+//! - a header of [`HEADER_BYTES`]: magic `SLCS`, [`FORMAT`] (`2`), the tool, a flags byte, then the repository, the
 //!   changeset's sequence in it, the sequence it was judged over, the grant, the work and the time (the repository a
 //!   `u128`, the rest each a `u64`), the section count (`u16`), two zero bytes, and the CRC-32C of the log's
 //!   32-byte seal, the record's file offset (`u64` little-endian), and the 68 header bytes before the CRC;
-//! - its sections, each a head of [`SECTION_HEAD_BYTES`] (the kind, three zero bytes, the length as a `u64`, the CRC-32C
-//!   of the section's bytes) followed by the bytes;
+//! - its sections, each a head of [`SECTION_HEAD_BYTES`] followed by the section's bytes. When a section opens before
+//!   its pieces stream, its head holds the kind, [`SECTION_OPEN_FLAG`] (`0x80`), two zero bytes, its declared length
+//!   (`u64`), and the `(seal, section_head_offset)`-keyed CRC-32C of those 12 bytes. When the section closes, those 16
+//!   bytes are overwritten with the closed head (the kind, three zero bytes, the actual length as a `u64`, and the
+//!   CRC-32C of the section's bytes);
 //! - a trailer of [`TRAILER_BYTES`]: the changeset's identity, the commit magic `SLCC`, the record's whole length
 //!   (`u64`), and the CRC-32C of the trailer before it. The identity is keyed BLAKE3 (keyed by the log's 32-byte seal)
 //!   over the record's file offset (`u64` little-endian), the header bytes, and, for each section in order, its kind,
-//!   its length (`u64`) and its bytes: bound to both position and store secret while keeping the exact `FORMAT = 1`
-//!   on-disk byte layout, hashed as bytes are written so nothing is read back to name a record.
+//!   its length (`u64`) and its bytes: bound to both position and store secret, hashed as bytes are written so nothing
+//!   is read back to name a record.
 //!
 //! **Appending.** A record is written where the log ends, a section at a time and a section's bytes in pieces of any
-//! size, so an import of any size holds one piece in memory; a section's CRC is filled into its head once its bytes are
-//! written. The trailer is written last, then one flush of the file (`sync_data`: `F_FULLFSYNC` on macOS,
-//! `fdatasync` on Linux, `FlushFileBuffers` on Windows), and only then does the log's end move past the record: a
-//! reader of the log sees a record only once it is committed and durable. A record abandoned before its commit (its
-//! writer dropped, an error) leaves bytes past the end that the next append overwrites.
+//! size, so an import of any size holds one piece in memory; opening a section writes its authenticated open head, and
+//! closing it overwrites those 16 bytes with the closed head and payload CRC. The trailer is written last, then one
+//! flush of the file (`sync_data`: `F_FULLFSYNC` on macOS, `fdatasync` on Linux, `FlushFileBuffers` on Windows), and
+//! only then does the log's end move past the record: a reader of the log sees a record only once it is committed and
+//! durable. A record abandoned before its commit (its writer dropped, an error) leaves bytes past the end that the next
+//! append overwrites.
 //!
 //! **Recovery.** The log is read from a committed offset the caller trusts (the engine's checkpoint, A-767 item 3, or
 //! the file's start), record by record, each verified whole against `(offset, seal)`: the header's CRC, every section's
 //! CRC, the trailer's CRC and length, and the keyed BLAKE3 identity recomputed over the record. A record whose header,
 //! section heads, and commit trailer all verify at `cursor` (`Verify::Damaged`) but whose payload CRC or identity fails
-//! has an authenticated boundary `[cursor, next)`: it is never indexed and recovery skips directly to `next`. An
-//! authenticated `(offset, seal)` header whose next section head was never written (`[0u8; SECTION_HEAD_BYTES]`), with
-//! no valid commit trailer (for the last section) or next section head (for earlier sections) immediately following it
-//! and with all prior sections' CRCs intact, is an interrupted uncommitted write at EOF (`Verify::UnwrittenTail`):
-//! recovery stops cleanly in O(1) reads without scanning the uncommitted tail payload and without incrementing
-//! `skipped`. Whenever header decoding, section-head framing, or commit-trailer verification fails at `cursor` (including
-//! a single-bit flip zeroing a 0-byte section head of a mid-file committed record, or flipping a prior section's length
-//! into zero payload bytes), recovery never trusts an unverified `section.len` to stop early or jump past siblings; it
-//! scans linearly from `cursor + 1` in [`VERIFY_PIECE`] chunks (overlapping by [`HEADER_OVERLAP`]) with a linear
-//! section-head read budget and optional `expected_grant` filter. False `SLCS` occurrences inside payloads or torn EOF
-//! tails fail `(offset, seal)` header CRC verification immediately in memory without touching disk or section heads, so
-//! mid-file faults (including every single-bit media fault in a header, section descriptor, payload, or trailer) recover
-//! healthy trailing siblings while uncommitted torn EOF tails stop cleanly at the last genuine committed record. A record
-//! whose trailer reached the device before a crash is whole and is kept, as any write that completed.
+//! has an authenticated boundary `[cursor, next)`: it is never indexed and recovery skips directly to `next`. At
+//! `FrameContext::Cursor` (never during resync), an authenticated `(offset, seal)` header whose next section head
+//! decodes as a genuinely authenticated open-section head (`SECTION_OPEN_FLAG` with valid `(seal, head_offset)` CRC),
+//! whose declared remaining record cannot finish before EOF, and whose prior closed sections all pass CRC verification
+//! is an interrupted uncommitted write at EOF (`Verify::UnwrittenTail`): recovery logs the offset and trailing byte
+//! count and stops cleanly in O(1) reads without scanning the uncommitted tail payload and without incrementing
+//! `skipped`. An all-zero section head `[0u8; SECTION_HEAD_BYTES]` (from a lost 16 B, 512 B, or 4 KiB sector or a
+//! flipped kind bit) is always `Verify::Broken`, never `Verify::UnwrittenTail`. Whenever header decoding, section-head
+//! framing, or commit-trailer verification fails at `cursor`, recovery never trusts an unverified `section.len` to stop
+//! early or jump past siblings; it scans linearly from `cursor + 1` in [`VERIFY_PIECE`] chunks (overlapping by
+//! [`HEADER_OVERLAP`]) with a linear section-head read budget and optional `expected_grant` filter. False `SLCS`
+//! occurrences inside payloads or torn EOF tails fail `(offset, seal)` header CRC verification immediately in memory
+//! without touching disk or section heads, so mid-file faults (including zeroed sectors and every single-bit media
+//! fault in a header, section descriptor, payload, or trailer) recover healthy trailing siblings while uncommitted torn
+//! EOF tails stop cleanly at the last genuine committed record. A record whose trailer reached the device before a
+//! crash is whole and is kept, as any write that completed.
 
 use std::fmt;
 
@@ -48,8 +61,10 @@ use hyper_block::block::BlockFile;
 const MAGIC: [u8; 4] = *b"SLCS";
 /// Format: the trailer's commit magic.
 const COMMIT: [u8; 4] = *b"SLCC";
-/// Format: this layout's number.
-const FORMAT: u16 = 1;
+/// Format: the store seal preamble's magic at offset 0 of a `Store`'s changeset log.
+const SEAL_MAGIC: [u8; 4] = *b"SLSE";
+/// Format: this layout's number (2 = sealed + offset-bound + authenticated open-section head).
+pub const FORMAT: u16 = 2;
 /// Format: a `u16` field's width.
 const U16: usize = size_of::<u16>();
 /// Format: a `u32` field's width.
@@ -65,6 +80,19 @@ pub const SEAL_BYTES: usize = blake3::KEY_LEN;
 /// Format: the all-zero seal used by direct unsealed [`ChangesetLog::recover`] callers (records
 /// still bind to their exact file offset).
 pub const UNSEALED: [u8; SEAL_BYTES] = [0u8; SEAL_BYTES];
+
+/// Format: the seal preamble's format field, after its magic.
+const P_FORMAT: usize = SEAL_MAGIC.len();
+/// Format: the seal preamble's two reserved zero bytes, after its format.
+const P_RESERVED: usize = P_FORMAT + U16;
+/// Format: the seal preamble's 32-byte secret seal, after its reserved bytes.
+const P_SEAL: usize = P_RESERVED + U16;
+/// Format: the seal preamble's CRC-32C, after its seal: the bytes its CRC covers.
+const SEAL_PREAMBLE_COVERED: usize = P_SEAL + SEAL_BYTES;
+/// Format: the seal preamble's bitwise-complement CRC guard, after its CRC.
+const P_CRC_COMPLEMENT: usize = SEAL_PREAMBLE_COVERED + U32;
+/// Format: the store seal preamble's width in bytes (48 bytes).
+pub const SEAL_PREAMBLE_BYTES: usize = P_CRC_COMPLEMENT + U32;
 
 /// Format: the header's format field, after its magic.
 const H_FORMAT: usize = MAGIC.len();
@@ -91,12 +119,16 @@ const HEADER_COVERED: usize = H_SECTIONS + U16 + U16;
 /// Format: the header's bytes, its CRC last.
 pub const HEADER_BYTES: usize = HEADER_COVERED + U32;
 
-/// Format: a section head's zero bytes, after its kind byte.
-const S_ZERO: usize = 1;
-/// Format: a section head's zero bytes' count (the head's length field is `u64`-aligned).
-const S_ZERO_LEN: usize = U32 - 1;
-/// Format: a section head's length, after its zero bytes.
-const S_LEN: usize = S_ZERO + S_ZERO_LEN;
+/// Format: a section head's flags byte, after its kind byte (`0` for a closed section,
+/// [`SECTION_OPEN_FLAG`] for an open section written before its bytes stream).
+const S_FLAGS: usize = 1;
+/// Format: flags byte value marking an open, uncommitted section head authenticated against
+/// `(seal, section_head_offset)` rather than holding a payload CRC.
+const SECTION_OPEN_FLAG: u8 = 0x80;
+/// Format: a section head's two reserved zero bytes, after its flags byte (the length is `u64`-aligned).
+const S_RESERVED: usize = S_FLAGS + 1;
+/// Format: a section head's length, after its reserved bytes.
+const S_LEN: usize = S_RESERVED + U16;
 /// Format: a section head's CRC, after its length.
 const S_CRC: usize = S_LEN + U64;
 /// Format: a section head's bytes.
@@ -264,6 +296,8 @@ pub enum LogError {
   /// A record read where a committed one was expected does not verify (the caller's offset is not a record's start, or
   /// the bytes changed under the log).
   Corrupt(&'static str),
+  /// The changeset log's on-disk format version is not supported by this binary.
+  UnsupportedFormat(u16),
 }
 
 impl fmt::Display for LogError {
@@ -273,8 +307,23 @@ impl fmt::Display for LogError {
       Self::OutOfOrder(what) => write!(f, "a changeset appended out of order: {what}"),
       Self::TooLarge => f.write_str("a changeset past what the log can hold"),
       Self::Corrupt(what) => write!(f, "a changeset that does not verify: {what}"),
+      Self::UnsupportedFormat(found) => write!(
+        f,
+        "unsupported changeset log format version {found} (this binary expects format {FORMAT})"
+      ),
     }
   }
+}
+
+/// Result of inspecting the leading bytes of a non-empty store changeset log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SealPreamble {
+  /// Valid `SLSE` preamble matching [`FORMAT`], carrying the store's 32-byte seal.
+  Valid([u8; SEAL_BYTES]),
+  /// Recognized `SLSE` or legacy unprefixed `SLCS` log whose format version differs from [`FORMAT`].
+  UnsupportedFormat(u16),
+  /// Damaged, truncated, or unrecognized preamble bytes.
+  Damaged,
 }
 
 impl std::error::Error for LogError {}
@@ -439,9 +488,11 @@ impl<F: BlockFile> ChangesetLog<F> {
     self.open.is_some()
   }
 
-  /// Begins the open record's next section, `len` bytes of `kind`; its bytes follow through [`ChangesetLog::open_piece`].
+  /// Begins the open record's next section, `len` bytes of `kind`; writes an authenticated open-section head before its
+  /// bytes follow through [`ChangesetLog::open_piece`].
   pub fn open_section(&mut self, kind: SectionKind, len: u64) -> Result<(), LogError> {
     self.close_section()?;
+    let seal = self.seal.0;
     let record = self
       .open
       .as_mut()
@@ -450,7 +501,11 @@ impl<F: BlockFile> ChangesetLog<F> {
       return Err(LogError::OutOfOrder("more sections than the header names"));
     }
     let head = record.at;
-    record.at = offset_after(head, SECTION_HEAD_BYTES)?;
+    let next_at = offset_after(head, SECTION_HEAD_BYTES)?;
+    let mut open_head = [0u8; SECTION_HEAD_BYTES];
+    encode_open_section_head(kind, len, head, &seal, &mut open_head);
+    self.file.write_all_at(&open_head, head)?;
+    record.at = next_at;
     record.written = record.written.saturating_add(1);
     record.identity.update(&section_label(kind, len));
     record.section = Some(OpenSection {
@@ -742,10 +797,10 @@ struct RecoverState {
 enum SectionsFrame {
   /// Every section head decoded cleanly and fit within `len`, ending at this trailer offset.
   Complete(u64),
-  /// An all-zero section head after `prior_sections` closed sections with no committed
-  /// continuation immediately following it (an interrupted uncommitted write at EOF).
+  /// A genuinely authenticated open-section head after `prior_sections` closed sections whose
+  /// declared remaining record cannot finish before EOF (an interrupted uncommitted write at EOF).
   UnwrittenTail { prior_sections: u16 },
-  /// A section head failed to decode or a section ran past `len`.
+  /// A section head failed to decode (including all-zeroes) or a section ran past `len`.
   Broken,
   /// The resync section-head read budget ran out before all sections were framed.
   BudgetExhausted,
@@ -756,8 +811,8 @@ enum Frame {
   /// Valid `(offset, seal)` header, valid section heads fitting in the file, and a valid `SLCC`
   /// commit trailer whose `record_len` matches `past - offset`.
   Committed(Framed),
-  /// Valid `(offset, seal)` header followed by an unwritten all-zero section head after
-  /// `prior_sections` framed sections and no committed continuation immediately after it.
+  /// Valid `(offset, seal)` header followed by an authenticated open-section head after
+  /// `prior_sections` framed sections whose declared remaining record cannot finish before EOF.
   UnwrittenTail { prior_sections: u16 },
   /// Header, section heads, or commit trailer failed verification or ran past `len`.
   Broken,
@@ -767,14 +822,17 @@ enum Frame {
 
 /// Outcome of verifying a record at `offset`.
 enum Verify {
+  /// A valid store `SLSE` seal preamble at offset `0` matching this recovery's `seal`.
+  Preamble { next: u64 },
   /// A verified committed record.
   Valid(Located),
   /// A structurally committed record whose header, section heads, and `SLCC` trailer all verified
   /// at `offset`, but whose payload CRC or keyed BLAKE3 identity failed: never indexed, skip
   /// directly to `next`.
   Damaged { next: u64 },
-  /// Valid `(offset, seal)` header whose next section head was never closed and has no committed
-  /// continuation after it: stop cleanly without scanning the uncommitted tail payload.
+  /// Valid `(offset, seal)` header followed by a genuinely authenticated open-section head whose
+  /// declared remaining record cannot finish before EOF and whose prior sections all verify: stop
+  /// cleanly without scanning the uncommitted tail payload.
   UnwrittenTail,
   /// Header, section head, or commit trailer failed verification (or ran past `len`): never trust
   /// an unverified `section.len` to jump or stop early; resync linearly from `cursor + 1`.
@@ -820,73 +878,52 @@ fn spend_read(context: &mut FrameContext<'_>) -> bool {
   true
 }
 
-/// Peeks `TRAILER_BYTES` at `bytes_at` after an all-zero final section head: a decodable `SLCC`
-/// trailer indicates a single-bit-zeroed 0-byte section head (`Broken`), otherwise `UnwrittenTail`.
-fn peek_trailer<F: BlockFile>(
-  file: &F,
-  (bytes_at, len): (u64, u64),
-  prior_sections: u16,
-  context: &mut FrameContext<'_>,
-) -> Result<SectionsFrame, LogError> {
-  if fits_after(bytes_at, TRAILER_BYTES, len)?.is_none() {
-    return Ok(SectionsFrame::UnwrittenTail { prior_sections });
-  }
-  if !spend_read(context) {
-    return Ok(SectionsFrame::BudgetExhausted);
-  }
-  let mut trailer = [0u8; TRAILER_BYTES];
-  file.read_exact_at(&mut trailer, bytes_at)?;
-  Ok(if decode_trailer(&trailer).is_some() {
-    SectionsFrame::Broken
-  } else {
-    SectionsFrame::UnwrittenTail { prior_sections }
-  })
+/// Returns `true` when an open section starting at `bytes_at` with `declared_len`, followed by
+/// `remaining_sections` minimum section heads and the commit trailer, cannot finish within `len`.
+fn open_record_exceeds_file(
+  bytes_at: u64,
+  declared_len: u64,
+  remaining_sections: u16,
+  len: u64,
+) -> bool {
+  let remaining_heads = u64::try_from(SECTION_HEAD_BYTES)
+    .ok()
+    .and_then(|width| u64::from(remaining_sections).checked_mul(width));
+  let trailer = u64::try_from(TRAILER_BYTES).ok();
+  let min_end = bytes_at
+    .checked_add(declared_len)
+    .and_then(|at| at.checked_add(remaining_heads?))
+    .and_then(|at| at.checked_add(trailer?));
+  min_end.is_none_or(|need| need > len)
 }
 
-/// Peeks `SECTION_HEAD_BYTES` at `bytes_at` after an all-zero non-final section head: a decodable
-/// next section head indicates a single-bit-zeroed 0-byte section head (`Broken`), otherwise
-/// `UnwrittenTail`.
-fn peek_next_section_head<F: BlockFile>(
-  file: &F,
-  (bytes_at, len): (u64, u64),
-  prior_sections: u16,
-  context: &mut FrameContext<'_>,
-) -> Result<SectionsFrame, LogError> {
-  if fits_after(bytes_at, SECTION_HEAD_BYTES, len)?.is_none() {
-    return Ok(SectionsFrame::UnwrittenTail { prior_sections });
-  }
-  if !spend_read(context) {
-    return Ok(SectionsFrame::BudgetExhausted);
-  }
-  let mut next_head = [0u8; SECTION_HEAD_BYTES];
-  file.read_exact_at(&mut next_head, bytes_at)?;
-  Ok(if decode_section_head(&next_head).is_some() {
-    SectionsFrame::Broken
-  } else {
-    SectionsFrame::UnwrittenTail { prior_sections }
-  })
-}
-
-/// Distinguishes an ordinary unwritten section head (`UnwrittenTail`) from a single-bit-zeroed
-/// 0-byte section head of a mid-file committed record (`Broken`) with one constant-size peek.
-fn classify_zero_section_head<F: BlockFile>(
-  file: &F,
-  (bytes_at, len): (u64, u64),
+/// Classifies a non-closed section head at `(at, bytes_at)` under `(seal, context)`.
+fn classify_non_closed_section(
+  section: &[u8; SECTION_HEAD_BYTES],
+  (at, bytes_at, len): (u64, u64, u64),
   (prior_sections, remaining_sections): (u16, u16),
-  context: &mut FrameContext<'_>,
-) -> Result<SectionsFrame, LogError> {
-  if remaining_sections == 0 {
-    peek_trailer(file, (bytes_at, len), prior_sections, context)
+  seal: &[u8; SEAL_BYTES],
+  context: &FrameContext<'_>,
+) -> SectionsFrame {
+  let open_tail = matches!(context, FrameContext::Cursor)
+    && decode_open_section_head(section, at, seal).is_some_and(|(_, declared_len)| {
+      open_record_exceeds_file(bytes_at, declared_len, remaining_sections, len)
+    });
+  if open_tail {
+    SectionsFrame::UnwrittenTail { prior_sections }
   } else {
-    peek_next_section_head(file, (bytes_at, len), prior_sections, context)
+    SectionsFrame::Broken
   }
 }
 
-/// Frames one section head at `at` within a file of `len` bytes under `context`.
+/// Frames one section head at `at` within a file of `len` bytes under `(seal, context)`.
+/// An all-zero head is always `Broken`; only a genuinely authenticated open-section head at
+/// `FrameContext::Cursor` whose declared remaining record exceeds `len` returns `UnwrittenTail`.
 fn step_section<F: BlockFile>(
   file: &F,
   (at, len): (u64, u64),
   (prior_sections, remaining_sections): (u16, u16),
+  seal: &[u8; SEAL_BYTES],
   context: &mut FrameContext<'_>,
 ) -> Result<SectionsFrame, LogError> {
   let Some(bytes_at) = fits_after(at, SECTION_HEAD_BYTES, len)? else {
@@ -897,24 +934,19 @@ fn step_section<F: BlockFile>(
   }
   let mut section = [0u8; SECTION_HEAD_BYTES];
   file.read_exact_at(&mut section, at)?;
-  if section == [0u8; SECTION_HEAD_BYTES] {
-    return classify_zero_section_head(
-      file,
-      (bytes_at, len),
-      (prior_sections, remaining_sections),
-      context,
-    );
+  if let Some((_, section_len, _)) = decode_section_head(&section) {
+    let next = bytes_at
+      .checked_add(section_len)
+      .filter(|past| *past <= len);
+    return Ok(next.map_or(SectionsFrame::Broken, SectionsFrame::Complete));
   }
-  let Some((_, section_len, _)) = decode_section_head(&section) else {
-    return Ok(SectionsFrame::Broken);
-  };
-  match bytes_at
-    .checked_add(section_len)
-    .filter(|past| *past <= len)
-  {
-    Some(past) => Ok(SectionsFrame::Complete(past)),
-    None => Ok(SectionsFrame::Broken),
-  }
+  Ok(classify_non_closed_section(
+    &section,
+    (at, bytes_at, len),
+    (prior_sections, remaining_sections),
+    seal,
+    context,
+  ))
 }
 
 /// Walks `sections` section heads from `at` without reading payload bytes, charging each head read
@@ -923,6 +955,7 @@ fn frame_sections_budgeted<F: BlockFile>(
   file: &F,
   (mut at, len): (u64, u64),
   sections: u16,
+  seal: &[u8; SEAL_BYTES],
   context: &mut FrameContext<'_>,
 ) -> Result<SectionsFrame, LogError> {
   for prior_sections in 0..sections {
@@ -931,6 +964,7 @@ fn frame_sections_budgeted<F: BlockFile>(
       file,
       (at, len),
       (prior_sections, remaining_sections),
+      seal,
       context,
     )? {
       SectionsFrame::Complete(next) => at = next,
@@ -967,14 +1001,14 @@ fn frame_trailer<F: BlockFile>(
 fn frame_decoded_header<F: BlockFile>(
   file: &F,
   (offset, len): (u64, u64),
-  header: Header,
-  head_bytes: [u8; HEADER_BYTES],
+  (header, head_bytes): (Header, [u8; HEADER_BYTES]),
+  seal: &[u8; SEAL_BYTES],
   context: &mut FrameContext<'_>,
 ) -> Result<Frame, LogError> {
   let Some(start) = fits_after(offset, HEADER_BYTES, len)? else {
     return Ok(Frame::Broken);
   };
-  let at = match frame_sections_budgeted(file, (start, len), header.sections, context)? {
+  let at = match frame_sections_budgeted(file, (start, len), header.sections, seal, context)? {
     SectionsFrame::Complete(at) => at,
     SectionsFrame::UnwrittenTail { prior_sections } => {
       return Ok(Frame::UnwrittenTail { prior_sections });
@@ -988,9 +1022,8 @@ fn frame_decoded_header<F: BlockFile>(
   frame_trailer(file, (offset, at, past), header, head_bytes)
 }
 
-/// Confirms an `UnwrittenTail` found after `prior_sections` sections: when `prior_sections > 0`,
-/// verifies each prior section's CRC so a single-bit flip in an earlier section's length that
-/// jumped into zero payload bytes falls back to linear resync (`Verify::Broken`).
+/// Confirms an `UnwrittenTail` found after `prior_sections` closed sections: verifies each prior
+/// section's CRC when `prior_sections > 0` so damage in an earlier section falls back to resync.
 fn verify_unwritten_tail<F: BlockFile>(
   file: &F,
   (offset, len): (u64, u64),
@@ -1054,7 +1087,13 @@ fn verify_decoded_header<F: BlockFile>(
   mut context: FrameContext<'_>,
   buffer: &mut Vec<u8>,
 ) -> Result<Verify, LogError> {
-  match frame_decoded_header(file, (offset, len), header, head_bytes, &mut context)? {
+  match frame_decoded_header(
+    file,
+    (offset, len),
+    (header, head_bytes),
+    seal,
+    &mut context,
+  )? {
     Frame::Broken => Ok(Verify::Broken),
     Frame::BudgetExhausted => Ok(Verify::BudgetExhausted),
     Frame::UnwrittenTail { prior_sections } => match context {
@@ -1065,10 +1104,39 @@ fn verify_decoded_header<F: BlockFile>(
         prior_sections,
         buffer,
       ),
-      FrameContext::Resync(_) => Ok(Verify::UnwrittenTail),
+      FrameContext::Resync(_) => Ok(Verify::Broken),
     },
     Frame::Committed(framed) => verify_committed(file, (offset, len), seal, &framed, buffer),
   }
+}
+
+/// Checks whether `prefix` at offset `0` is a valid `SLSE` store preamble matching `seal`.
+fn matching_preamble_at_zero(offset: u64, prefix: &[u8], seal: &[u8; SEAL_BYTES]) -> Option<u64> {
+  if offset != 0 {
+    return None;
+  }
+  let head = prefix.get(..SEAL_PREAMBLE_BYTES)?;
+  (decode_seal_preamble(head) == SealPreamble::Valid(*seal))
+    .then(|| offset_after(0, SEAL_PREAMBLE_BYTES).ok())
+    .flatten()
+}
+
+/// Checks an offset-0 file shorter than [`HEADER_BYTES`] for an exact [`SEAL_PREAMBLE_BYTES`]
+/// matching `SLSE` preamble.
+fn verify_short_preamble<F: BlockFile>(
+  file: &F,
+  (offset, len): (u64, u64),
+  seal: &[u8; SEAL_BYTES],
+) -> Result<Verify, LogError> {
+  if offset != 0 || fits_after(0, SEAL_PREAMBLE_BYTES, len)?.is_none() {
+    return Ok(Verify::Broken);
+  }
+  let mut preamble = [0u8; SEAL_PREAMBLE_BYTES];
+  file.read_exact_at(&mut preamble, 0)?;
+  Ok(
+    matching_preamble_at_zero(0, &preamble, seal)
+      .map_or(Verify::Broken, |next| Verify::Preamble { next }),
+  )
 }
 
 /// Reads and verifies the record at `offset` in a file of `len` bytes against `(offset, seal)`.
@@ -1079,12 +1147,15 @@ fn verify_at<F: BlockFile>(
   buffer: &mut Vec<u8>,
 ) -> Result<Verify, LogError> {
   if fits_after(offset, HEADER_BYTES, len)?.is_none() {
-    return Ok(Verify::Broken);
+    return verify_short_preamble(file, (offset, len), seal);
   }
   let mut head_bytes = [0u8; HEADER_BYTES];
   file.read_exact_at(&mut head_bytes, offset)?;
   let Some(header) = decode_header(&head_bytes, offset, seal) else {
-    return Ok(Verify::Broken);
+    return Ok(
+      matching_preamble_at_zero(offset, &head_bytes, seal)
+        .map_or(Verify::Broken, |next| Verify::Preamble { next }),
+    );
   };
   verify_decoded_header(
     file,
@@ -1136,7 +1207,9 @@ fn probe_candidate<F: BlockFile>(
     Verify::BudgetExhausted => Ok(Some(ChunkProbe::BudgetExhausted)),
     // Never jump past a `Damaged` or `UnwrittenTail` candidate during resync; advance one byte to
     // preserve linearity and prevent crafted headers from skipping healthy trailing siblings.
-    Verify::Damaged { .. } | Verify::UnwrittenTail | Verify::Broken => Ok(None),
+    Verify::Preamble { .. } | Verify::Damaged { .. } | Verify::UnwrittenTail | Verify::Broken => {
+      Ok(None)
+    }
   }
 }
 
@@ -1273,6 +1346,11 @@ fn step_recover<F: BlockFile>(
 ) -> Result<bool, LogError> {
   let cursor = progress.cursor;
   match verify_at(file, (cursor, len), &progress.seal, buffers.1)? {
+    Verify::Preamble { next } => {
+      progress.end = next;
+      progress.cursor = next;
+      Ok(true)
+    }
     Verify::Valid(located) => {
       each(file, &located);
       progress.end = located.end();
@@ -1288,7 +1366,14 @@ fn step_recover<F: BlockFile>(
       progress.cursor = next;
       Ok(true)
     }
-    Verify::UnwrittenTail | Verify::BudgetExhausted => Ok(false),
+    Verify::UnwrittenTail => {
+      slates_machine::log_line!(
+        "slates-store: changeset log stopped at uncommitted open tail offset {cursor} ({} trailing bytes)",
+        len.saturating_sub(cursor)
+      );
+      Ok(false)
+    }
+    Verify::BudgetExhausted => Ok(false),
     Verify::Broken => apply_resync_scan(
       file,
       (cursor.saturating_add(1), len),
@@ -1297,6 +1382,66 @@ fn step_recover<F: BlockFile>(
       each,
     ),
   }
+}
+
+/// Encodes the 48-byte `SLSE` store seal preamble carrying [`FORMAT`] and `seal`.
+pub fn encode_seal_preamble(seal: &[u8; SEAL_BYTES]) -> [u8; SEAL_PREAMBLE_BYTES] {
+  let mut out = [0u8; SEAL_PREAMBLE_BYTES];
+  put_bytes(&mut out, 0, &SEAL_MAGIC);
+  put_u16(&mut out, P_FORMAT, FORMAT);
+  put_bytes(&mut out, P_SEAL, seal);
+  let crc = out
+    .get(..SEAL_PREAMBLE_COVERED)
+    .map_or(0, mantle_crc::crc32c);
+  put_u32(&mut out, SEAL_PREAMBLE_COVERED, crc);
+  put_u32(&mut out, P_CRC_COMPLEMENT, !crc);
+  out
+}
+
+/// Validates the reserved bytes, CRC-32C, and complement guard of a `FORMAT`-matched `SLSE` preamble.
+fn verify_seal_preamble_body(prefix: &[u8]) -> SealPreamble {
+  if prefix.len() != SEAL_PREAMBLE_BYTES {
+    return SealPreamble::Damaged;
+  }
+  let Some(reserved) = prefix.get(P_RESERVED..P_SEAL) else {
+    return SealPreamble::Damaged;
+  };
+  if reserved.iter().any(|byte| *byte != 0) {
+    return SealPreamble::Damaged;
+  }
+  let Some(covered) = prefix.get(..SEAL_PREAMBLE_COVERED) else {
+    return SealPreamble::Damaged;
+  };
+  let expected = mantle_crc::crc32c(covered);
+  let crc_ok = get_u32(prefix, SEAL_PREAMBLE_COVERED) == Some(expected)
+    && get_u32(prefix, P_CRC_COMPLEMENT) == Some(!expected);
+  if !crc_ok {
+    return SealPreamble::Damaged;
+  }
+  get_array::<SEAL_BYTES>(prefix, P_SEAL).map_or(SealPreamble::Damaged, SealPreamble::Valid)
+}
+
+/// Decodes the leading bytes (`1..=SEAL_PREAMBLE_BYTES`) of a non-empty store changeset log.
+pub fn decode_seal_preamble(prefix: &[u8]) -> SealPreamble {
+  let Some(magic) = get_array::<{ SEAL_MAGIC.len() }>(prefix, 0) else {
+    return SealPreamble::Damaged;
+  };
+  if magic == SEAL_MAGIC {
+    let Some(found) = get_u16(prefix, P_FORMAT) else {
+      return SealPreamble::Damaged;
+    };
+    if found != FORMAT {
+      return SealPreamble::UnsupportedFormat(found);
+    }
+    return verify_seal_preamble_body(prefix);
+  }
+  if magic == MAGIC
+    && let Some(found) = get_u16(prefix, H_FORMAT)
+    && found != FORMAT
+  {
+    return SealPreamble::UnsupportedFormat(found);
+  }
+  SealPreamble::Damaged
 }
 
 fn put_bytes(out: &mut [u8], at: usize, value: &[u8]) {
@@ -1336,8 +1481,8 @@ fn get_u64(bytes: &[u8], at: usize) -> Option<u64> {
   get_array(bytes, at).map(u64::from_le_bytes)
 }
 
-/// Computes the header CRC-32C bound to `(seal, offset)` over `covered` (`head[..HEADER_COVERED]`).
-fn header_crc(seal: &[u8; SEAL_BYTES], offset: u64, covered: &[u8]) -> u32 {
+/// Computes CRC-32C bound to `(seal, offset)` over `covered` (a record header or open-section head).
+fn keyed_offset_crc(seal: &[u8; SEAL_BYTES], offset: u64, covered: &[u8]) -> u32 {
   let crc = mantle_crc::crc32c(seal);
   let crc = mantle_crc::crc32c_extend(crc, &offset.to_le_bytes());
   mantle_crc::crc32c_extend(crc, covered)
@@ -1373,7 +1518,7 @@ fn encode_header(
   put_u16(out, H_SECTIONS, header.sections);
   let crc = out
     .get(..HEADER_COVERED)
-    .map_or(0, |covered| header_crc(seal, offset, covered));
+    .map_or(0, |covered| keyed_offset_crc(seal, offset, covered));
   put_u32(out, HEADER_COVERED, crc);
 }
 
@@ -1388,7 +1533,8 @@ fn decode_header(
   {
     return None;
   }
-  if get_u32(bytes, HEADER_COVERED)? != header_crc(seal, offset, bytes.get(..HEADER_COVERED)?) {
+  if get_u32(bytes, HEADER_COVERED)? != keyed_offset_crc(seal, offset, bytes.get(..HEADER_COVERED)?)
+  {
     return None;
   }
   Some(Header {
@@ -1403,6 +1549,42 @@ fn decode_header(
   })
 }
 
+/// Encodes a 16-byte authenticated open-section head at `head_offset`, written before the
+/// section's payload streams and overwritten by [`encode_section_head`] when the section closes.
+fn encode_open_section_head(
+  kind: SectionKind,
+  declared_len: u64,
+  head_offset: u64,
+  seal: &[u8; SEAL_BYTES],
+  out: &mut [u8; SECTION_HEAD_BYTES],
+) {
+  put_bytes(out, 0, &[kind.byte(), SECTION_OPEN_FLAG]);
+  put_u64(out, S_LEN, declared_len);
+  let crc = out
+    .get(..S_CRC)
+    .map_or(0, |covered| keyed_offset_crc(seal, head_offset, covered));
+  put_u32(out, S_CRC, crc);
+}
+
+/// Decodes a 16-byte authenticated open-section head at `head_offset` against `(seal, head_offset)`.
+fn decode_open_section_head(
+  bytes: &[u8; SECTION_HEAD_BYTES],
+  head_offset: u64,
+  seal: &[u8; SEAL_BYTES],
+) -> Option<(SectionKind, u64)> {
+  if *bytes.get(S_FLAGS)? != SECTION_OPEN_FLAG
+    || bytes.get(S_RESERVED..S_LEN)?.iter().any(|byte| *byte != 0)
+  {
+    return None;
+  }
+  let kind = SectionKind::from_byte(*bytes.first()?)?;
+  let declared_len = get_u64(bytes, S_LEN)?;
+  if get_u32(bytes, S_CRC)? != keyed_offset_crc(seal, head_offset, bytes.get(..S_CRC)?) {
+    return None;
+  }
+  Some((kind, declared_len))
+}
+
 fn encode_section_head(kind: SectionKind, len: u64, crc: u32, out: &mut [u8; SECTION_HEAD_BYTES]) {
   put_bytes(out, 0, &[kind.byte()]);
   put_u64(out, S_LEN, len);
@@ -1410,7 +1592,7 @@ fn encode_section_head(kind: SectionKind, len: u64, crc: u32, out: &mut [u8; SEC
 }
 
 fn decode_section_head(bytes: &[u8; SECTION_HEAD_BYTES]) -> Option<(SectionKind, u64, u32)> {
-  if bytes.get(S_ZERO..S_LEN)?.iter().any(|byte| *byte != 0) {
+  if bytes.get(S_FLAGS..S_LEN)?.iter().any(|byte| *byte != 0) {
     return None;
   }
   Some((

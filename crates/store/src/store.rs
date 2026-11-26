@@ -9,8 +9,11 @@
 //! memtable: the log is the engine's write-ahead log, so the rows need no flush of their own. A landing is acknowledged
 //! once its commit is durable.
 //!
-//! **Recovery.** The engine's checkpoint records the log offset it applied to; opening the store opens the engine at
-//! its checkpoint and replays the log from that offset, applying each committed record's rows again, so the rows never
+//! **Recovery.** [`LOG_FILE`] opens with a [`SEAL_PREAMBLE_BYTES`]-byte `SLSE` preamble naming its format version and
+//! 32-byte random secret seal, mirrored as a backup `S` row in [`ROWS_FILE`]. Opening the store inspects [`LOG_FILE`]
+//! before touching [`ROWS_FILE`], refusing unsupported formats without mutating any file; when [`ROWS_FILE`] is
+//! absent, the engine is recreated and rebuilt byte-identically from [`LOG_FILE`]'s self-contained preamble and
+//! records. Otherwise the engine opens at its checkpoint offset and replays [`LOG_FILE`] from there, so the rows never
 //! name a changeset the log lacks and lack none it holds.
 //!
 //! **Rows** (item 3), keyed so a repository's rows are one contiguous range: `C`, then the repository and the
@@ -24,7 +27,7 @@
 mod payloads;
 
 use std::borrow::Cow;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
@@ -38,7 +41,8 @@ use mantle_engine::trunk::TrunkConfig;
 use slates_land::store_root::{StoreRoot, StoreRootRefusal};
 
 use crate::log::{
-  Appending, ChangesetLog, Header, Located, LogError, SEAL_BYTES, SectionKind, identity_of_range,
+  Appending, ChangesetLog, Header, Located, LogError, SEAL_BYTES, SEAL_PREAMBLE_BYTES,
+  SealPreamble, SectionKind, decode_seal_preamble, encode_seal_preamble, identity_of_range,
   sections_in,
 };
 use crate::staging::{Identity, Staging};
@@ -211,57 +215,108 @@ pub struct Changeset {
   pub work: u64,
 }
 
-/// A verified landed payload range: its offset and length in the log, and its expected BLAKE3 identity.
-type VerifiedKey = (u64, u64, Identity);
+/// One 32-byte BLAKE3 digest of a single [`PIECE_BYTES`] payload block.
+type BlockDigest = [u8; blake3::OUT_LEN];
+/// Owned per-[`PIECE_BYTES`] block-digest slice for one authenticated landed payload.
+type BlockDigests = Box<[BlockDigest]>;
 
-/// Bounded FIFO cache of landed payload ranges already authenticated against their expected BLAKE3
-/// identity, preventing O(N^2) re-hashing across sequential multi-piece reads while bounding memory.
-#[derive(Debug)]
-struct VerifiedPayloads {
-  /// Maximum entries retained, derived from `sizing.memory / PIECE_BYTES` (at least 1).
-  capacity: usize,
-  /// Insertion order for FIFO eviction.
-  order: VecDeque<VerifiedKey>,
-  /// O(1) membership index mirroring `order`.
-  entries: HashSet<VerifiedKey>,
-  /// Non-vacuity counter: total full BLAKE3 payload verifications performed.
-  verifications: u64,
+/// Authenticated payload range key: its log offset, exact byte length, and expected BLAKE3 identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct VerifiedKey {
+  at: u64,
+  len: u64,
+  identity: Identity,
 }
 
-impl VerifiedPayloads {
-  /// Derived: one verified-payload entry per [`PIECE_BYTES`] read unit in `memory` (at least 1 so
-  /// sequential multi-piece reads of any single payload hash it once), bounding cache memory under
-  /// `2 * size_of::<VerifiedKey>() / PIECE_BYTES` (< 0.15%) of `memory`.
-  fn new(memory: usize) -> Self {
-    let capacity = memory.checked_div(PIECE_BYTES).unwrap_or(0).max(1);
+/// Bounded FIFO cache of authenticated per-[`PIECE_BYTES`] BLAKE3 block digests for multi-piece
+/// landed payloads.
+///
+/// An entry is inserted only after a full-payload streaming BLAKE3 pass verifies `identity`.
+/// Cached reads still hash every disk block they touch against these digests and evict on mismatch,
+/// giving O(N) sequential streaming while preserving per-piece integrity against mid-session disk
+/// bit-flips (A5).
+#[derive(Debug)]
+struct PieceDigests {
+  budget_bytes: usize,
+  used_bytes: usize,
+  entries: HashMap<VerifiedKey, BlockDigests>,
+  order: VecDeque<VerifiedKey>,
+  payload_verifications: u64,
+}
+
+impl PieceDigests {
+  /// Derived: cache budget from `sizing.memory / sizing.fanout` floored at one [`PIECE_BYTES`]
+  /// read unit, matching [`Sizing`]'s lent memory and engine trunk fanout inputs.
+  fn from_sizing(sizing: Sizing) -> Self {
+    let budget_bytes = sizing
+      .memory
+      .checked_div(sizing.fanout.max(1))
+      .unwrap_or(PIECE_BYTES)
+      .max(PIECE_BYTES);
+    Self::with_budget(budget_bytes)
+  }
+
+  fn with_budget(budget_bytes: usize) -> Self {
     Self {
-      capacity,
+      budget_bytes,
+      used_bytes: 0,
+      entries: HashMap::new(),
       order: VecDeque::new(),
-      entries: HashSet::new(),
-      verifications: 0,
+      payload_verifications: 0,
     }
   }
 
-  fn contains(&self, key: &VerifiedKey) -> bool {
-    self.entries.contains(key)
+  fn budget_bytes(&self) -> usize {
+    self.budget_bytes
   }
 
-  fn record_verified(&mut self, key: VerifiedKey) {
-    self.verifications = self.verifications.saturating_add(1);
-    if self.entries.contains(&key) {
+  fn get(&self, key: &VerifiedKey) -> Option<&[BlockDigest]> {
+    self.entries.get(key).map(Box::as_ref)
+  }
+
+  fn insert(&mut self, key: VerifiedKey, digests: BlockDigests) {
+    if self.entries.contains_key(&key) {
       return;
     }
-    if self.order.len() >= self.capacity
-      && let Some(oldest) = self.order.pop_front()
-    {
-      self.entries.remove(&oldest);
+    let Some(entry_bytes) = digests.len().checked_mul(blake3::OUT_LEN) else {
+      return;
+    };
+    if entry_bytes > self.budget_bytes {
+      return;
     }
+    let limit = self.budget_bytes.saturating_sub(entry_bytes);
+    self.evict_until(limit);
+    self.used_bytes = self.used_bytes.saturating_add(entry_bytes);
     self.order.push_back(key);
-    self.entries.insert(key);
+    self.entries.insert(key, digests);
+  }
+
+  fn evict_until(&mut self, max_used_bytes: usize) {
+    while self.used_bytes > max_used_bytes {
+      let Some(oldest) = self.order.pop_front() else {
+        break;
+      };
+      if let Some(evicted) = self.entries.remove(&oldest) {
+        let evicted_bytes = evicted.len().saturating_mul(blake3::OUT_LEN);
+        self.used_bytes = self.used_bytes.saturating_sub(evicted_bytes);
+      }
+    }
+  }
+
+  fn remove(&mut self, key: &VerifiedKey) {
+    if let Some(digests) = self.entries.remove(key) {
+      let removed_bytes = digests.len().saturating_mul(blake3::OUT_LEN);
+      self.used_bytes = self.used_bytes.saturating_sub(removed_bytes);
+      self.order.retain(|queued| queued != key);
+    }
+  }
+
+  fn record_verification(&mut self) {
+    self.payload_verifications = self.payload_verifications.saturating_add(1);
   }
 
   fn verifications(&self) -> u64 {
-    self.verifications
+    self.payload_verifications
   }
 }
 
@@ -275,8 +330,8 @@ pub struct Store {
   value: Vec<u8>,
   /// The standing grant its directory is written under, as first recorded.
   grant: GrantRow,
-  /// Bounded cache of landed payload ranges whose full BLAKE3 identity was verified on read.
-  verified_payloads: VerifiedPayloads,
+  /// Bounded per-[`PIECE_BYTES`] BLAKE3 block-digest cache for landed payloads (A5).
+  piece_digests: PieceDigests,
   /// Corrupt changeset rows encountered and skipped during checkpoint indexing or row replacement.
   corrupt_rows_skipped: u64,
   /// The log reads that answered places ([`Store::places_bytes`]): the counter its coalescing is held to.
@@ -301,29 +356,29 @@ pub struct GrantRow {
 }
 
 impl Store {
-  /// Opens the store in the granted directory `root`, creating its files on first use, and recovers: the engine at its checkpoint, the log replayed from there, and the standing grant
-  /// `root` was opened under recorded durably as its `G` row the first time (checkpointed before the store serves), or
-  /// found as first recorded every time after.
+  /// Opens the store in the granted directory `root`, inspecting [`LOG_FILE`]'s `SLSE` preamble
+  /// before creating or mutating [`ROWS_FILE`] so unsupported format versions are refused without
+  /// touching any file and a deleted `rows` index rebuilds cleanly from the self-contained log.
+  /// Records the standing grant `root` was opened under durably as its `G` row on first open.
   pub fn open(root: StoreRoot, sizing: Sizing) -> Result<Self, StoreError> {
-    let log_file = adopt(&root, LOG_FILE)?;
-    let rows_existed = root.exists(ROWS_FILE)?;
-    let rows_file = adopt(&root, ROWS_FILE)?;
-    let (config, mem_limit, trunk) = engine_sizing(&rows_file, sizing)?;
-    let (mut rows, applied) = if rows_existed {
-      ShardDb::open(rows_file, config, mem_limit, trunk)?
-    } else {
-      (ShardDb::create(rows_file, config, mem_limit, trunk)?, 0)
-    };
-    let seal = load_or_create_seal(&mut rows, applied)?;
+    let OpenedStoreFiles {
+      log_file,
+      mut rows,
+      seal,
+      applied,
+      replay_from,
+      page_size,
+      seal_written_to_rows,
+    } = open_store_files(&root, sizing)?;
     let mut corrupt_rows_skipped =
-      payloads::index_checkpoint(&mut rows, &log_file, (applied, &seal), config.page_size)?;
+      payloads::index_checkpoint(&mut rows, &log_file, (applied, &seal), page_size)?;
     let expected_grant = grant_id(root.grant().target.device, root.grant().target.inode);
     let mut replayed = Ok(());
     let mut value = Vec::new();
     let mut buffer = Vec::new();
     let log = ChangesetLog::recover_sealed(
       log_file,
-      applied,
+      replay_from,
       seal,
       Some(expected_grant),
       |file, located| {
@@ -345,7 +400,7 @@ impl Store {
       log,
       rows,
       value,
-      verified_payloads: VerifiedPayloads::new(sizing.memory),
+      piece_digests: PieceDigests::from_sizing(sizing),
       corrupt_rows_skipped,
       place_reads: 0,
       tool_reads: 0,
@@ -356,11 +411,16 @@ impl Store {
         inode: 0,
       },
     };
-    store.grant = store.record_grant()?;
+    let (grant, checkpointed) = store.record_grant()?;
+    store.grant = grant;
+    if seal_written_to_rows && !checkpointed {
+      store.checkpoint()?;
+    }
     Ok(store)
   }
 
-  /// The per-store 32-byte changeset log seal persisted in the store's engine (`S` row).
+  /// The per-store 32-byte changeset log seal persisted in [`LOG_FILE`]'s `SLSE` preamble and
+  /// mirrored in [`ROWS_FILE`]'s `S` row.
   pub fn seal(&self) -> [u8; SEAL_BYTES] {
     self.log.seal()
   }
@@ -370,9 +430,9 @@ impl Store {
     &self.grant
   }
 
-  /// Full BLAKE3 payload verifications performed by [`Store::piece`] so far (non-vacuity counter).
+  /// Verified disk piece reads completed by [`Store::piece`] so far (non-vacuity counter).
   pub fn payload_verifications(&self) -> u64 {
-    self.verified_payloads.verifications()
+    self.piece_digests.verifications()
   }
 
   /// Corrupt changeset rows logged and skipped during checkpoint indexing or changeset replacement.
@@ -400,9 +460,9 @@ impl Store {
     self.place_reads = self.place_reads.saturating_add(1);
   }
 
-  /// Finds the `G` row of the grant the directory was opened under, or puts it and checkpoints the engine so it is
-  /// durable before anything lands.
-  fn record_grant(&mut self) -> Result<GrantRow, StoreError> {
+  /// Finds the `G` row of the grant the directory was opened under, or puts it and checkpoints the
+  /// engine so it is durable before anything lands. Returns `(grant, checkpointed)`.
+  fn record_grant(&mut self) -> Result<(GrantRow, bool), StoreError> {
     let grant = self.root.grant();
     let id = grant_id(grant.target.device, grant.target.inode);
     let mut key = [0u8; GRANT_KEY_BYTES];
@@ -418,12 +478,15 @@ impl Store {
           bytes.try_into().map_err(|_| StoreError::BadRow)?,
         ))
       };
-      return Ok(GrantRow {
-        id,
-        issued_ns: word(0)?,
-        device: word(U64)?,
-        inode: word(U64 + U64)?,
-      });
+      return Ok((
+        GrantRow {
+          id,
+          issued_ns: word(0)?,
+          device: word(U64)?,
+          inode: word(U64 + U64)?,
+        },
+        false,
+      ));
     }
     let row = GrantRow {
       id,
@@ -437,7 +500,7 @@ impl Store {
     put(&mut value, U64 + U64, &row.inode.to_le_bytes());
     self.rows.put(&key, &value)?;
     self.checkpoint()?;
-    Ok(row)
+    Ok((row, true))
   }
 
   /// The granted directory.
@@ -569,12 +632,11 @@ impl Store {
   /// `offset`, or `None` when neither `staging` nor the log holds it or `offset >= len`.
   ///
   /// While `identity` is staged in flight, the remaining slice from `offset` is borrowed from
-  /// `staging` without copying. For a landed payload in the log, a [`VerifiedPayloads`] cache miss
-  /// streams and authenticates the entire landed payload against `identity` before returning any
-  /// byte (refusing [`LogError::Corrupt`] on mismatch), returning at most [`PIECE_BYTES`] from
-  /// `offset`; subsequent hits on the cached `(offset, len, identity)` read only the requested
-  /// piece without re-hashing, trading continuous re-verification for single-pass read speed per
-  /// payload lifetime until FIFO eviction.
+  /// `staging` without copying. For a landed payload in the log, every call verifies the disk
+  /// bytes it reads against `identity`—the full payload on single-piece reads and cache misses,
+  /// and each touched [`PIECE_BYTES`] block against its authenticated digest on cache hits
+  /// (evicting and refusing [`LogError::Corrupt`] on any mismatch)—returning at most
+  /// [`PIECE_BYTES`] from `offset`.
   pub fn piece<'a>(
     &mut self,
     staging: &'a Staging,
@@ -599,7 +661,7 @@ impl Store {
     }
     let bytes = read_verified_piece(
       &self.log,
-      &mut self.verified_payloads,
+      &mut self.piece_digests,
       identity,
       (at, landed_len),
       offset,
@@ -725,24 +787,174 @@ impl Store {
   }
 }
 
-/// Loads the store's per-store 32-byte log seal (`S` row) from `rows`, or on a new store generates
-/// fresh OS randomness via AWS-LC, writes the `S` row, and checkpoints durably at `applied` before
-/// returning so a crash before the first user checkpoint never loses the seal.
-fn load_or_create_seal<F: BlockFile>(
-  rows: &mut ShardDb<F>,
+/// Result of inspecting the leading bytes of an existing [`BlockFile`] log without mutating it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogHead {
+  /// The log file is empty (0 bytes).
+  Empty,
+  /// The log file begins with a valid `FORMAT` `SLSE` preamble carrying this 32-byte seal.
+  Sealed([u8; SEAL_BYTES]),
+  /// The log file is non-empty and its preamble is damaged or unrecognized (not a foreign format).
+  DamagedPreamble,
+}
+
+/// Prepared store files and recovery start offset ready for log replay.
+struct OpenedStoreFiles<F: BlockFile> {
+  log_file: F,
+  rows: ShardDb<F>,
+  seal: [u8; SEAL_BYTES],
   applied: u64,
-) -> Result<[u8; SEAL_BYTES], StoreError> {
-  let mut value = Vec::new();
-  if rows.get(&[SEAL_ROW], &mut value)? {
-    return value.as_slice().try_into().map_err(|_| StoreError::BadRow);
+  replay_from: u64,
+  page_size: usize,
+  seal_written_to_rows: bool,
+}
+
+/// Inspects the leading bytes of `file` without modifying it. Refuses recognized foreign formats
+/// (`SLCS` v1 or `SLSE` != [`crate::log::FORMAT`]) with [`LogError::UnsupportedFormat`].
+fn inspect_log_file<F: BlockFile>(file: &F) -> Result<LogHead, StoreError> {
+  let len = file.len()?;
+  if len == 0 {
+    return Ok(LogHead::Empty);
   }
+  let cap = u64::try_from(SEAL_PREAMBLE_BYTES).map_err(|_| LogError::TooLarge)?;
+  let take = usize::try_from(len.min(cap)).map_err(|_| LogError::TooLarge)?;
+  let mut prefix = [0u8; SEAL_PREAMBLE_BYTES];
+  let head = prefix.get_mut(..take).ok_or(LogError::TooLarge)?;
+  file.read_exact_at(head, 0)?;
+  match decode_seal_preamble(head) {
+    SealPreamble::Valid(seal) => Ok(LogHead::Sealed(seal)),
+    SealPreamble::UnsupportedFormat(found) => {
+      Err(StoreError::Log(LogError::UnsupportedFormat(found)))
+    }
+    SealPreamble::Damaged => Ok(LogHead::DamagedPreamble),
+  }
+}
+
+/// Reads the backup per-store 32-byte log seal (`S` row) from `rows`, if present.
+fn read_seal_row<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+) -> Result<Option<[u8; SEAL_BYTES]>, StoreError> {
+  let mut value = Vec::new();
+  if !rows.get(&[SEAL_ROW], &mut value)? {
+    return Ok(None);
+  }
+  value
+    .as_slice()
+    .try_into()
+    .map(Some)
+    .map_err(|_| StoreError::BadRow)
+}
+
+/// Generates a fresh 32-byte per-store log seal from OS randomness via AWS-LC.
+fn generate_seal() -> Result<[u8; SEAL_BYTES], StoreError> {
   let mut seal = [0u8; SEAL_BYTES];
   SystemRandom::new()
     .fill(&mut seal)
     .map_err(|_| StoreError::Sizing("the OS random source refused the store seal"))?;
-  rows.put(&[SEAL_ROW], &seal)?;
-  rows.checkpoint(applied)?;
   Ok(seal)
+}
+
+/// Writes the 48-byte `SLSE` preamble at offset 0 of `file` and flushes it durably.
+fn write_seal_preamble<F: BlockFile>(file: &F, seal: &[u8; SEAL_BYTES]) -> Result<(), StoreError> {
+  let preamble = encode_seal_preamble(seal);
+  file.write_all_at(&preamble, 0)?;
+  file.sync_data()?;
+  Ok(())
+}
+
+/// Pairs an already-sealed `log_file` with `rows`, mirroring `seal` into `rows` when rebuilding
+/// and refusing a mismatched `SEAL_ROW` without mutating either file.
+fn prepare_sealed_log<F: BlockFile>(
+  log_file: F,
+  seal: [u8; SEAL_BYTES],
+  (mut rows, applied, page_size): (ShardDb<F>, u64, usize),
+) -> Result<OpenedStoreFiles<F>, StoreError> {
+  let preamble_len = u64::try_from(SEAL_PREAMBLE_BYTES).map_err(|_| LogError::TooLarge)?;
+  let seal_written_to_rows = match read_seal_row(&mut rows)? {
+    Some(existing) if existing != seal => {
+      return Err(StoreError::Log(LogError::Corrupt("a store seal mismatch")));
+    }
+    Some(_) => false,
+    None => {
+      rows.put(&[SEAL_ROW], &seal)?;
+      true
+    }
+  };
+  Ok(OpenedStoreFiles {
+    log_file,
+    rows,
+    seal,
+    applied,
+    replay_from: applied.max(preamble_len),
+    page_size,
+    seal_written_to_rows,
+  })
+}
+
+/// Recovers a log whose leading `SLSE` preamble is damaged only when an existing `rows` holds the
+/// backup `SEAL_ROW`, refusing without mutating any file otherwise.
+fn prepare_damaged_preamble_log<F: BlockFile>(
+  log_file: F,
+  existing_rows: Option<(ShardDb<F>, u64, usize)>,
+) -> Result<OpenedStoreFiles<F>, StoreError> {
+  let preamble_len = u64::try_from(SEAL_PREAMBLE_BYTES).map_err(|_| LogError::TooLarge)?;
+  let Some((mut rows, applied, page_size)) = existing_rows else {
+    return Err(StoreError::Log(LogError::Corrupt("a store seal preamble")));
+  };
+  let Some(seal) = read_seal_row(&mut rows)? else {
+    return Err(StoreError::Log(LogError::Corrupt("a store seal preamble")));
+  };
+  Ok(OpenedStoreFiles {
+    log_file,
+    rows,
+    seal,
+    applied,
+    replay_from: applied.max(preamble_len),
+    page_size,
+    seal_written_to_rows: false,
+  })
+}
+
+/// Initializes an empty `log_file` with a durable `SLSE` preamble, reusing `SEAL_ROW` from `rows`
+/// if present or generating fresh OS randomness.
+fn prepare_empty_log<F: BlockFile>(
+  log_file: F,
+  (mut rows, applied, page_size): (ShardDb<F>, u64, usize),
+) -> Result<OpenedStoreFiles<F>, StoreError> {
+  if applied > 0 {
+    return Err(StoreError::Log(LogError::Corrupt(
+      "a missing or truncated changeset log",
+    )));
+  }
+  let preamble_len = u64::try_from(SEAL_PREAMBLE_BYTES).map_err(|_| LogError::TooLarge)?;
+  let (seal, seal_written_to_rows) = match read_seal_row(&mut rows)? {
+    Some(existing) => (existing, false),
+    None => {
+      let fresh = generate_seal()?;
+      rows.put(&[SEAL_ROW], &fresh)?;
+      (fresh, true)
+    }
+  };
+  write_seal_preamble(&log_file, &seal)?;
+  Ok(OpenedStoreFiles {
+    log_file,
+    rows,
+    seal,
+    applied,
+    replay_from: preamble_len,
+    page_size,
+    seal_written_to_rows,
+  })
+}
+
+/// Opens an existing store file `name` without creating it.
+fn open_existing(root: &StoreRoot, name: &str) -> Result<DeviceFile, StoreError> {
+  Ok(DeviceFile::adopt(
+    root.open_file(name)?,
+    &root.path_of(name),
+    CachingRequest::Buffered,
+    Alignment::BYTE,
+  )?)
 }
 
 /// Opens (creating on first use) the store file `name` as a buffered device file.
@@ -758,6 +970,90 @@ fn adopt(root: &StoreRoot, name: &str) -> Result<DeviceFile, StoreError> {
     CachingRequest::Buffered,
     Alignment::BYTE,
   )?)
+}
+
+/// Opens an existing [`ROWS_FILE`] without mutating it.
+fn open_rows_existing(
+  root: &StoreRoot,
+  sizing: Sizing,
+) -> Result<(ShardDb<DeviceFile>, u64, usize), StoreError> {
+  let rows_file = open_existing(root, ROWS_FILE)?;
+  let (config, mem_limit, trunk) = engine_sizing(&rows_file, sizing)?;
+  let page_size = config.page_size;
+  let (rows, applied) = ShardDb::open(rows_file, config, mem_limit, trunk)?;
+  Ok((rows, applied, page_size))
+}
+
+/// Creates a new [`ROWS_FILE`] and empty [`ShardDb`] (`applied == 0`).
+fn create_rows_fresh(
+  root: &StoreRoot,
+  sizing: Sizing,
+) -> Result<(ShardDb<DeviceFile>, u64, usize), StoreError> {
+  let rows_file = adopt(root, ROWS_FILE)?;
+  let (config, mem_limit, trunk) = engine_sizing(&rows_file, sizing)?;
+  let page_size = config.page_size;
+  let rows = ShardDb::create(rows_file, config, mem_limit, trunk)?;
+  Ok((rows, 0, page_size))
+}
+
+/// Opens existing [`ROWS_FILE`] or creates a fresh one when absent.
+fn open_or_create_rows(
+  root: &StoreRoot,
+  rows_existed: bool,
+  sizing: Sizing,
+) -> Result<(ShardDb<DeviceFile>, u64, usize), StoreError> {
+  if rows_existed {
+    open_rows_existing(root, sizing)
+  } else {
+    create_rows_fresh(root, sizing)
+  }
+}
+
+/// Initializes a store whose [`LOG_FILE`] is absent or empty, checking `rows` before creating the
+/// log file and writing a durable `SLSE` preamble at offset 0.
+fn open_empty_store_log(
+  root: &StoreRoot,
+  existing_log: Option<DeviceFile>,
+  rows_existed: bool,
+  sizing: Sizing,
+) -> Result<OpenedStoreFiles<DeviceFile>, StoreError> {
+  let rows_state = open_or_create_rows(root, rows_existed, sizing)?;
+  if rows_state.1 > 0 {
+    return Err(StoreError::Log(LogError::Corrupt(
+      "a missing or truncated changeset log",
+    )));
+  }
+  let log_file = match existing_log {
+    Some(file) => file,
+    None => adopt(root, LOG_FILE)?,
+  };
+  prepare_empty_log(log_file, rows_state)
+}
+
+/// Inspects [`LOG_FILE`] before touching [`ROWS_FILE`], refusing unsupported formats or corrupt
+/// preambles without mutating any file, and prepares both files with a durable seal.
+fn open_store_files(
+  root: &StoreRoot,
+  sizing: Sizing,
+) -> Result<OpenedStoreFiles<DeviceFile>, StoreError> {
+  let rows_existed = root.exists(ROWS_FILE)?;
+  if !root.exists(LOG_FILE)? {
+    return open_empty_store_log(root, None, rows_existed, sizing);
+  }
+  let log_file = open_existing(root, LOG_FILE)?;
+  match inspect_log_file(&log_file)? {
+    LogHead::Empty => open_empty_store_log(root, Some(log_file), rows_existed, sizing),
+    LogHead::Sealed(seal) => {
+      let rows_state = open_or_create_rows(root, rows_existed, sizing)?;
+      prepare_sealed_log(log_file, seal, rows_state)
+    }
+    LogHead::DamagedPreamble => {
+      let existing = rows_existed
+        .then(|| open_rows_existing(root, sizing))
+        .transpose()?;
+      prepare_damaged_preamble_log(log_file, existing)
+    }
+  }
 }
 
 /// The engine's shape from the caller's sizing: its page the file's layout block, its extents bounded by the disk
@@ -933,20 +1229,62 @@ fn capture_overlap(
   Ok(())
 }
 
-/// Streams `[at, at + landed_len)` through BLAKE3 in [`PIECE_BYTES`] reads (enforcing the committed
-/// log boundary via [`ChangesetLog::read_at`]) while capturing `[offset, offset + take)` in a single
-/// pass, returning [`LogError::Corrupt`] before exposing any byte on identity mismatch.
+/// Returns the number of [`PIECE_BYTES`] block digests needed for `landed_len` when the full
+/// digest slice fits within `budget_bytes`, or `None` when empty or over budget.
+fn digest_capacity(landed_len: u64, piece_cap: u64, budget_bytes: usize) -> Option<usize> {
+  if landed_len == 0 {
+    return None;
+  }
+  let blocks = usize::try_from(landed_len.div_ceil(piece_cap.max(1))).ok()?;
+  let bytes = blocks.checked_mul(blake3::OUT_LEN)?;
+  (bytes <= budget_bytes).then_some(blocks)
+}
+
+/// Converts a payload byte offset into its zero-based [`PIECE_BYTES`] block index.
+fn block_index(byte_offset: u64, piece_cap: u64) -> Result<usize, StoreError> {
+  byte_offset
+    .checked_div(piece_cap)
+    .and_then(|idx| usize::try_from(idx).ok())
+    .ok_or(StoreError::BadRow)
+}
+
+/// Returns `[block_start, block_end)` within `[0, landed_len)` for `block_idx`.
+fn block_bounds(
+  block_idx: usize,
+  piece_cap: u64,
+  landed_len: u64,
+) -> Result<(u64, u64), StoreError> {
+  let start = u64::try_from(block_idx)
+    .ok()
+    .and_then(|idx| idx.checked_mul(piece_cap))
+    .ok_or(StoreError::BadRow)?;
+  let end = start.saturating_add(piece_cap).min(landed_len);
+  Ok((start, end))
+}
+
+/// Streams `[at, at + landed_len)` through BLAKE3 in [`PIECE_BYTES`] blocks (enforcing the
+/// committed log boundary via [`ChangesetLog::read_at`]), collecting per-block digests when they
+/// fit within `budget_bytes` and capturing `[offset, offset + take)` in a single pass. Returns
+/// [`LogError::Corrupt`] before exposing any byte on whole-payload identity mismatch.
 fn stream_verify_and_capture<F: BlockFile>(
   log: &ChangesetLog<F>,
   identity: &Identity,
   (at, landed_len): (u64, u64),
   (offset, take): (u64, usize),
-) -> Result<Vec<u8>, StoreError> {
+  budget_bytes: usize,
+) -> Result<(Vec<u8>, Option<BlockDigests>), StoreError> {
+  let payload_end = at.checked_add(landed_len).ok_or(StoreError::BadRow)?;
+  if payload_end > log.end() {
+    return Err(StoreError::Log(LogError::Corrupt(
+      "a read past the committed records",
+    )));
+  }
   let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
   let req_end = offset
     .checked_add(u64::try_from(take).map_err(|_| StoreError::BadRow)?)
     .ok_or(StoreError::BadRow)?;
   let mut out = Vec::with_capacity(take);
+  let mut digests = digest_capacity(landed_len, piece_cap, budget_bytes).map(Vec::with_capacity);
   let mut chunk_buf = vec![0u8; PIECE_BYTES];
   let mut hasher = blake3::Hasher::new();
   let mut done = 0u64;
@@ -956,6 +1294,9 @@ fn stream_verify_and_capture<F: BlockFile>(
     let slice = chunk_buf.get_mut(..step).ok_or(StoreError::BadRow)?;
     log.read_at(slice, at.checked_add(done).ok_or(StoreError::BadRow)?)?;
     hasher.update(slice);
+    if let Some(list) = &mut digests {
+      list.push(*blake3::hash(slice).as_bytes());
+    }
     let chunk_end = done
       .checked_add(u64::try_from(step).map_err(|_| StoreError::BadRow)?)
       .ok_or(StoreError::BadRow)?;
@@ -968,36 +1309,124 @@ fn stream_verify_and_capture<F: BlockFile>(
   if out.len() != take {
     return Err(StoreError::BadRow);
   }
+  Ok((out, digests.map(Vec::into_boxed_slice)))
+}
+
+/// Reads and verifies only the [`PIECE_BYTES`] blocks overlapping `[offset, offset + take)`
+/// against their authenticated BLAKE3 digests in `block_digests`.
+fn read_cached_blocks<F: BlockFile>(
+  log: &ChangesetLog<F>,
+  block_digests: &[BlockDigest],
+  (at, landed_len): (u64, u64),
+  (offset, take): (u64, usize),
+) -> Result<Vec<u8>, StoreError> {
+  let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
+  let take_u64 = u64::try_from(take).map_err(|_| StoreError::BadRow)?;
+  let req_end = offset.checked_add(take_u64).ok_or(StoreError::BadRow)?;
+  let last_byte = req_end.checked_sub(1).ok_or(StoreError::BadRow)?;
+  let first_block = block_index(offset, piece_cap)?;
+  let last_block = block_index(last_byte, piece_cap)?;
+  let mut out = Vec::with_capacity(take);
+  let mut block_buf = vec![0u8; PIECE_BYTES];
+  for block_idx in first_block..=last_block {
+    let expected = block_digests.get(block_idx).ok_or(StoreError::BadRow)?;
+    let (block_start, block_end) = block_bounds(block_idx, piece_cap, landed_len)?;
+    let block_len = usize::try_from(
+      block_end
+        .checked_sub(block_start)
+        .ok_or(StoreError::BadRow)?,
+    )
+    .map_err(|_| StoreError::BadRow)?;
+    let slice = block_buf.get_mut(..block_len).ok_or(StoreError::BadRow)?;
+    log.read_at(
+      slice,
+      at.checked_add(block_start).ok_or(StoreError::BadRow)?,
+    )?;
+    if *blake3::hash(slice).as_bytes() != *expected {
+      return Err(StoreError::Log(LogError::Corrupt("a payload's bytes")));
+    }
+    capture_overlap(slice, (block_start, block_end), (offset, req_end), &mut out)?;
+  }
+  if out.len() != take {
+    return Err(StoreError::BadRow);
+  }
   Ok(out)
 }
 
+/// Reads a whole single-piece payload from `at` and authenticates it directly against `identity`.
+fn read_single_piece<F: BlockFile>(
+  log: &ChangesetLog<F>,
+  digests: &mut PieceDigests,
+  identity: &Identity,
+  at: u64,
+  take: usize,
+) -> Result<Vec<u8>, StoreError> {
+  let bytes = read_piece_raw(log, at, take)?;
+  if *blake3::hash(&bytes).as_bytes() != *identity {
+    return Err(StoreError::Log(LogError::Corrupt("a payload's bytes")));
+  }
+  digests.record_verification();
+  Ok(bytes)
+}
+
+/// Records a cached block-digest read on success, or evicts `key` before returning corruption.
+fn finish_cached_read(
+  digests: &mut PieceDigests,
+  key: &VerifiedKey,
+  result: Result<Vec<u8>, StoreError>,
+) -> Result<Vec<u8>, StoreError> {
+  match result {
+    Ok(bytes) => {
+      digests.record_verification();
+      Ok(bytes)
+    }
+    Err(error @ StoreError::Log(LogError::Corrupt(_))) => {
+      digests.remove(key);
+      Err(error)
+    }
+    Err(error) => Err(error),
+  }
+}
+
 /// Reads one piece (at most [`PIECE_BYTES`] from `offset`) of a landed payload at `(at, landed_len)`,
-/// authenticating the entire payload against `identity` on a [`VerifiedPayloads`] cache miss before
-/// returning any byte.
+/// authenticating every disk block read against `identity` (whole payload on single-piece reads
+/// and cache misses; cached per-[`PIECE_BYTES`] block digests on hits, evicting on any mismatch).
 fn read_verified_piece<F: BlockFile>(
   log: &ChangesetLog<F>,
-  verified: &mut VerifiedPayloads,
+  digests: &mut PieceDigests,
   identity: &Identity,
   (at, landed_len): (u64, u64),
   offset: u64,
 ) -> Result<Vec<u8>, StoreError> {
+  let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
   let left = landed_len.checked_sub(offset).ok_or(StoreError::BadRow)?;
-  let take = usize::try_from(left.min(u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?))
-    .map_err(|_| StoreError::BadRow)?;
-  let key = (at, landed_len, *identity);
-  if verified.contains(&key) {
-    return read_piece_raw(log, at.checked_add(offset).ok_or(StoreError::BadRow)?, take);
-  }
+  let take = usize::try_from(left.min(piece_cap)).map_err(|_| StoreError::BadRow)?;
   if offset == 0 && u64::try_from(take).ok() == Some(landed_len) {
-    let bytes = read_piece_raw(log, at, take)?;
-    if *blake3::hash(&bytes).as_bytes() != *identity {
-      return Err(StoreError::Log(LogError::Corrupt("a payload's bytes")));
-    }
-    verified.record_verified(key);
-    return Ok(bytes);
+    return read_single_piece(log, digests, identity, at, take);
   }
-  let bytes = stream_verify_and_capture(log, identity, (at, landed_len), (offset, take))?;
-  verified.record_verified(key);
+  if take == 0 {
+    return Err(StoreError::BadRow);
+  }
+  let key = VerifiedKey {
+    at,
+    len: landed_len,
+    identity: *identity,
+  };
+  if let Some(cached) = digests.get(&key) {
+    let result = read_cached_blocks(log, cached, (at, landed_len), (offset, take));
+    return finish_cached_read(digests, &key, result);
+  }
+  let (bytes, block_digests) = stream_verify_and_capture(
+    log,
+    identity,
+    (at, landed_len),
+    (offset, take),
+    digests.budget_bytes(),
+  )?;
+  if let Some(block_digests) = block_digests {
+    digests.insert(key, block_digests);
+  }
+  digests.record_verification();
   Ok(bytes)
 }
 

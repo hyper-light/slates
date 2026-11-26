@@ -972,6 +972,8 @@ fn append_one_section(
 enum UnwrittenTailShape {
   /// One declared section, interrupted mid-payload before `close_section`.
   SingleSection,
+  /// One declared section whose full payload arrived before the writer dropped uncommitted.
+  SingleSectionFullPayloadNoTrailer,
   /// Two declared sections, interrupted during section 0 before section 1 begins.
   TwoSectionsFirstOpen,
   /// Two declared sections, section 0 (`Record`) closed, section 1 (`Payload`) interrupted mid-write.
@@ -991,8 +993,12 @@ fn measure_unwritten_tail_reads(tail_bytes: u64, shape: UnwrittenTailShape) -> u
     b"committed control",
   );
   let sections = match shape {
-    UnwrittenTailShape::SingleSection => 1,
+    UnwrittenTailShape::SingleSection | UnwrittenTailShape::SingleSectionFullPayloadNoTrailer => 1,
     UnwrittenTailShape::TwoSectionsFirstOpen | UnwrittenTailShape::TwoSectionsSecondOpen => 2,
+  };
+  let declared = match shape {
+    UnwrittenTailShape::SingleSectionFullPayloadNoTrailer => tail_bytes,
+    _ => tail_bytes + 1,
   };
   {
     let mut uncommitted = log
@@ -1011,9 +1017,7 @@ fn measure_unwritten_tail_reads(tail_bytes: u64, shape: UnwrittenTailShape) -> u
       uncommitted.section(SectionKind::Record, 5).unwrap();
       uncommitted.piece(b"heads").unwrap();
     }
-    uncommitted
-      .section(SectionKind::Payload, tail_bytes + 1)
-      .unwrap();
+    uncommitted.section(SectionKind::Payload, declared).unwrap();
     uncommitted
       .piece(&vec![b'd'; usize::try_from(tail_bytes).unwrap()])
       .unwrap();
@@ -1052,6 +1056,7 @@ fn assert_constant_tail_reads(shape: UnwrittenTailShape) {
 fn ordinary_interrupted_uncommitted_tail_reads_constant_calls_across_tail_sizes() {
   for shape in [
     UnwrittenTailShape::SingleSection,
+    UnwrittenTailShape::SingleSectionFullPayloadNoTrailer,
     UnwrittenTailShape::TwoSectionsFirstOpen,
     UnwrittenTailShape::TwoSectionsSecondOpen,
   ] {
@@ -1183,4 +1188,353 @@ fn single_bit_flip_in_section_len_landing_in_zero_payload_still_recovers_trailin
   assert_eq!(log.end(), trailing.end());
   assert_eq!(log.skipped(), 1);
   assert_eq!(read_payload(&log, &trailing), trailing_bytes);
+}
+
+/// Appends a record with arbitrary `(kind, payload)` sections under `seal`.
+fn append_sections(
+  log: &mut ChangesetLog<SimFile>,
+  tool: Tool,
+  repository: u128,
+  sections: &[(SectionKind, &[u8])],
+) -> Located {
+  let mut record = log
+    .begin(Header {
+      tool,
+      repository,
+      sequence: 1,
+      judged_over: 0,
+      grant: 3,
+      work: 1,
+      time_ns: 1,
+      sections: u16::try_from(sections.len()).unwrap(),
+    })
+    .unwrap();
+  for (kind, bytes) in sections {
+    record
+      .section(*kind, u64::try_from(bytes.len()).unwrap())
+      .unwrap();
+    if !bytes.is_empty() {
+      record.piece(bytes).unwrap();
+    }
+  }
+  record.commit().unwrap()
+}
+
+/// Zeroes `[fault_start, fault_start + fault_len)` in `image` and verifies recovery skips the
+/// damaged middle record, keeps `[prefix, hg, svn]`, preserves `log.end() == svn.end()`, and
+/// appending a 5th record leaves `hg` and `svn` bytes intact on disk across reopen.
+fn assert_zeroed_mid_section_recovers_siblings(
+  image: &[u8],
+  seal: [u8; SEAL_BYTES],
+  (fault_start, fault_len): (u64, usize),
+  (prefix, hg, svn): (Located, Located, Located),
+  label: &str,
+) {
+  let mut damaged = image.to_vec();
+  let start = usize::try_from(fault_start).unwrap();
+  damaged[start..start + fault_len].fill(0);
+  let sim = file(105);
+  sim.write_all_at(&damaged, 0).unwrap();
+  sim.sync_data().unwrap();
+  let mut found = Vec::new();
+  let mut log =
+    ChangesetLog::recover_sealed(sim, 0, seal, Some(3), |_, entry| found.push(*entry)).unwrap();
+  assert_eq!(found, vec![prefix, hg, svn], "{label}: lost siblings");
+  assert_eq!(log.end(), svn.end(), "{label}: rewound log.end()");
+  assert_eq!(log.skipped(), 1, "{label}: skipped count");
+  let next = append_sections(
+    &mut log,
+    Tool::Git,
+    55,
+    &[(SectionKind::Payload, &payload(99, 2_048))],
+  );
+  assert_eq!(next.offset, svn.end(), "{label}: next append offset");
+  let after = log.into_file().durable_image().unwrap();
+  let hg_start = usize::try_from(hg.offset).unwrap();
+  let svn_end = usize::try_from(svn.end()).unwrap();
+  assert_eq!(
+    &after[hg_start..svn_end],
+    &image[hg_start..svn_end],
+    "{label}: next append overwrote healthy siblings"
+  );
+}
+
+/// Round-3 Blocker 1 (`Z1..Z5`, `media_sector`): Do: zero 16 B, 512 B, and 4 KiB spans starting at
+/// a committed middle record's section head (single-section, 2-section last head, 3-section middle
+/// head, and aligned 512 B / 4 KiB storage sectors), recover, and append a new record.
+/// Expect: all-zero section heads never trigger `UnwrittenTail`; linear resync recovers 100% of
+/// trailing Hg/SVN siblings, keeps `log.end() == svn.end()`, and the next append preserves healthy
+/// sibling bytes intact.
+#[test]
+fn zeroed_section_head_mid_file_recovers_trailing_siblings_and_preserves_them_on_append() {
+  let seal = [0x53u8; SEAL_BYTES];
+  let hg_bytes = payload(9, 300);
+  let svn_bytes = payload(11, 300);
+
+  // Z1/Z4 (16 B last head of 2-section record) & Z2 (4 KiB page starting at last head).
+  for (label, pad_len, payload_len, fault_len) in [
+    (
+      "Z1 16B last head",
+      1_000usize,
+      8_192usize,
+      SECTION_HEAD_BYTES,
+    ),
+    ("Z2 4KiB page at last head", 4_096, 65_536, 4_096),
+  ] {
+    let mut log = ChangesetLog::recover_sealed(file(103), 0, seal, Some(3), |_, _| {}).unwrap();
+    let prefix = append_sections(
+      &mut log,
+      Tool::Git,
+      11,
+      &[(SectionKind::Payload, &payload(7, pad_len))],
+    );
+    let rec_part = payload(1, 200);
+    let pay_part = payload(2, payload_len);
+    let middle = append_sections(
+      &mut log,
+      Tool::Git,
+      22,
+      &[
+        (SectionKind::Record, &rec_part),
+        (SectionKind::Payload, &pay_part),
+      ],
+    );
+    let hg = append_sections(
+      &mut log,
+      Tool::Mercurial,
+      33,
+      &[(SectionKind::Payload, &hg_bytes)],
+    );
+    let svn = append_sections(
+      &mut log,
+      Tool::Subversion,
+      44,
+      &[(SectionKind::Payload, &svn_bytes)],
+    );
+    let last_head = middle.offset + u64::try_from(HEADER_BYTES + SECTION_HEAD_BYTES + 200).unwrap();
+    let image = log.into_file().durable_image().unwrap();
+    assert_zeroed_mid_section_recovers_siblings(
+      &image,
+      seal,
+      (last_head, fault_len),
+      (prefix, hg, svn),
+      label,
+    );
+  }
+
+  // Z3 (single-section record, prior_sections == 0) & Z5 (middle head of 3-section record).
+  {
+    let mut log = ChangesetLog::recover_sealed(file(104), 0, seal, Some(3), |_, _| {}).unwrap();
+    let prefix = append_sections(
+      &mut log,
+      Tool::Git,
+      11,
+      &[(SectionKind::Payload, &payload(7, 512))],
+    );
+    let middle = append_sections(
+      &mut log,
+      Tool::Git,
+      22,
+      &[(SectionKind::Payload, &payload(2, 4_096))],
+    );
+    let hg = append_sections(
+      &mut log,
+      Tool::Mercurial,
+      33,
+      &[(SectionKind::Payload, &hg_bytes)],
+    );
+    let svn = append_sections(
+      &mut log,
+      Tool::Subversion,
+      44,
+      &[(SectionKind::Payload, &svn_bytes)],
+    );
+    let head = middle.offset + u64::try_from(HEADER_BYTES).unwrap();
+    let image = log.into_file().durable_image().unwrap();
+    assert_zeroed_mid_section_recovers_siblings(
+      &image,
+      seal,
+      (head, SECTION_HEAD_BYTES),
+      (prefix, hg, svn),
+      "Z3 single-section head",
+    );
+  }
+  {
+    let mut log = ChangesetLog::recover_sealed(file(106), 0, seal, Some(3), |_, _| {}).unwrap();
+    let prefix = append_sections(
+      &mut log,
+      Tool::Git,
+      11,
+      &[(SectionKind::Payload, &payload(7, 512))],
+    );
+    let middle = append_sections(
+      &mut log,
+      Tool::Git,
+      22,
+      &[
+        (SectionKind::Record, &payload(1, 200)),
+        (SectionKind::Payload, &payload(2, 4_096)),
+        (SectionKind::Work, &payload(4, 512)),
+      ],
+    );
+    let hg = append_sections(
+      &mut log,
+      Tool::Mercurial,
+      33,
+      &[(SectionKind::Payload, &hg_bytes)],
+    );
+    let svn = append_sections(
+      &mut log,
+      Tool::Subversion,
+      44,
+      &[(SectionKind::Payload, &svn_bytes)],
+    );
+    let mid_head = middle.offset + u64::try_from(HEADER_BYTES + SECTION_HEAD_BYTES + 200).unwrap();
+    let image = log.into_file().durable_image().unwrap();
+    assert_zeroed_mid_section_recovers_siblings(
+      &image,
+      seal,
+      (mid_head, SECTION_HEAD_BYTES),
+      (prefix, hg, svn),
+      "Z5 3-section middle head",
+    );
+  }
+
+  // Aligned 512 B and 4 KiB storage sector loss right at middle record's section head (media_sector).
+  let overhead = HEADER_BYTES + SECTION_HEAD_BYTES + TRAILER_BYTES;
+  for sector in [512usize, 4_096] {
+    let mut log = ChangesetLog::recover_sealed(file(107), 0, seal, Some(3), |_, _| {}).unwrap();
+    let first_payload = vec![b'p'; sector - overhead - HEADER_BYTES];
+    let prefix = append_sections(
+      &mut log,
+      Tool::Git,
+      1,
+      &[(SectionKind::Payload, &first_payload)],
+    );
+    let _middle = append_sections(
+      &mut log,
+      Tool::Git,
+      2,
+      &[(SectionKind::Payload, &vec![b'm'; 2 * sector])],
+    );
+    let hg = append_sections(
+      &mut log,
+      Tool::Mercurial,
+      3,
+      &[(SectionKind::Payload, b"healthy Hg")],
+    );
+    let svn = append_sections(
+      &mut log,
+      Tool::Subversion,
+      4,
+      &[(SectionKind::Payload, b"healthy SVN")],
+    );
+    let image = log.into_file().durable_image().unwrap();
+    assert_zeroed_mid_section_recovers_siblings(
+      &image,
+      seal,
+      (u64::try_from(sector).unwrap(), sector),
+      (prefix, hg, svn),
+      &format!("media_sector {sector}B"),
+    );
+  }
+}
+
+/// Verifies every single-bit flip across all 48 bytes of `encoded` is rejected as either
+/// `UnsupportedFormat` (inside the format field) or `Damaged` (every other byte).
+fn assert_preamble_bitflips_rejected(encoded: [u8; SEAL_PREAMBLE_BYTES]) {
+  for byte_idx in 0..SEAL_PREAMBLE_BYTES {
+    for bit in 0..8u8 {
+      let mut flipped = encoded;
+      flipped[byte_idx] ^= 1u8 << bit;
+      let decoded = decode_seal_preamble(&flipped);
+      if (P_FORMAT..P_RESERVED).contains(&byte_idx) {
+        assert!(
+          matches!(decoded, SealPreamble::UnsupportedFormat(found) if found != FORMAT),
+          "flip in format byte {byte_idx} bit {bit} got {decoded:?}"
+        );
+      } else {
+        assert_eq!(
+          decoded,
+          SealPreamble::Damaged,
+          "flip at preamble+{byte_idx} bit {bit}"
+        );
+      }
+    }
+  }
+}
+
+/// Verifies `ChangesetLog::recover_sealed` from offset 0 steps cleanly past a matching `SLSE`
+/// preamble with `skipped() == 0` and recovers trailing records intact.
+fn assert_recover_from_zero_steps_past_preamble(
+  seal: [u8; SEAL_BYTES],
+  encoded: &[u8; SEAL_PREAMBLE_BYTES],
+) {
+  let sim = file(108);
+  sim.write_all_at(encoded, 0).unwrap();
+  sim.sync_data().unwrap();
+  let start = u64::try_from(SEAL_PREAMBLE_BYTES).unwrap();
+  let mut log = ChangesetLog::recover_sealed(sim, start, seal, Some(3), |_, _| {}).unwrap();
+  let first = append_sections(
+    &mut log,
+    Tool::Git,
+    11,
+    &[(SectionKind::Payload, b"after preamble")],
+  );
+  assert_eq!(first.offset, start);
+  let mut found = Vec::new();
+  let reopened = ChangesetLog::recover_sealed(log.into_file(), 0, seal, Some(3), |_, entry| {
+    found.push(*entry);
+  })
+  .unwrap();
+  assert_eq!(
+    (found, reopened.end(), reopened.skipped()),
+    (vec![first], first.end(), 0)
+  );
+}
+
+/// Round-3 Blocker 2: Do: round-trip `encode_seal_preamble` / `decode_seal_preamble`, flip every
+/// single bit across all 48 bytes, feed all-zeroes, legacy `FORMAT = 1` `SLCS`, future
+/// `FORMAT = 3` `SLSE`, and truncated `SLSE`, and recover a `ChangesetLog` starting at offset 0
+/// over an `SLSE`-prefixed file.
+/// Expect: valid `FORMAT = 2` preambles decode identically; `SLCS` v1 yields
+/// `UnsupportedFormat(1)`; `SLSE` v3 yields `UnsupportedFormat(3)`; all-zeroes, truncated, and
+/// bit-flipped non-format bytes yield `Damaged`; and `recover_sealed` from 0 steps past a matching
+/// `SLSE` preamble cleanly with `skipped() == 0`.
+#[test]
+fn seal_preamble_round_trips_and_refuses_foreign_formats_and_damage() {
+  let seal = [0x6Bu8; SEAL_BYTES];
+  let encoded = encode_seal_preamble(&seal);
+  assert_eq!(
+    (
+      encoded.len(),
+      decode_seal_preamble(&encoded),
+      decode_seal_preamble(&[0u8; SEAL_PREAMBLE_BYTES]),
+      decode_seal_preamble(&encoded[..SEAL_PREAMBLE_BYTES - 1]),
+    ),
+    (
+      SEAL_PREAMBLE_BYTES,
+      SealPreamble::Valid(seal),
+      SealPreamble::Damaged,
+      SealPreamble::Damaged,
+    )
+  );
+  assert_preamble_bitflips_rejected(encoded);
+
+  let mut legacy_slcs = [0u8; SEAL_PREAMBLE_BYTES];
+  legacy_slcs[..4].copy_from_slice(b"SLCS");
+  legacy_slcs[4..6].copy_from_slice(&1u16.to_le_bytes());
+  let mut future_slse = encoded;
+  future_slse[4..6].copy_from_slice(&3u16.to_le_bytes());
+  assert_eq!(
+    (
+      decode_seal_preamble(&legacy_slcs),
+      decode_seal_preamble(&future_slse),
+    ),
+    (
+      SealPreamble::UnsupportedFormat(1),
+      SealPreamble::UnsupportedFormat(3),
+    )
+  );
+  assert_recover_from_zero_steps_past_preamble(seal, &encoded);
 }
