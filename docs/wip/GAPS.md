@@ -1176,13 +1176,18 @@
 >   Edit none of them meanwhile; main assigns them back if either agent returns. **Passed to w-hg (2026-11-26, main's
 >   order: claimed in e15868057, not started):** `identities/tests.rs`, `vcs_store/index_upkeep.rs`,
 >   `repository/import/tests.rs` and `fleet.rs`; w-git keeps `vcs_store/paths/tests.rs` and `vcs_store/commits/tests.rs`.
->   - `test_store::audit_on_stored_shard`: 23 sites. svn 0; git 0; hg 0;
->     other 23 (`paths/tests.rs` 11, `commits/tests.rs` 8, `import/tests.rs` 2, `fleet.rs` 2). `identities/tests.rs`' 8
->     moved by w-hg (2026-11-26): the six that wait on nothing to `on_a_stored_shard`; the two that make git
->     repositories to `run_on_stored_shard` tasks, made by `created().await`, the owner's submit run as a client's
->     recorded request whose made commit lands by its own task (`recorded_git_submit_awaited`), so
->     `home_and_land_blocking`'s reach did not grow. `index_upkeep.rs`' 2 moved by w-hg (2026-11-26) to
->     `audit_on_stored_shard_made`, the repository made from the test's thread. `vcs_store/tests.rs`' 14 moved by w-git (2026-11-26): the one that waits on
+>   - `test_store::audit_on_stored_shard`: 12 sites. svn 0; git 0; hg 0;
+>     other 12 (`commits/tests.rs` 8, `import/tests.rs` 2, `fleet.rs` 2). `identities/tests.rs`' 8 moved by w-hg
+>     (2026-11-26): the six that wait on nothing to `on_a_stored_shard`; the two that make git repositories to
+>     `run_on_stored_shard` tasks, made by `created().await`, the owner's submit awaited where it records its answer
+>     (`paths::tests::recorded_git_submit_as_awaited`), so `home_and_land_blocking`'s reach did not grow.
+>     `index_upkeep.rs`' 2 moved by w-hg (2026-11-26) to `audit_on_stored_shard_made`, the repository made from the
+>     test's thread. `vcs_store/paths/tests.rs`' 11 moved by w-git (2026-11-26): the plain green's, whose submit is a
+>     bare dispatch, to `on_a_stored_shard`; the 10 on git repositories to `run_on_stored_shard` tasks creating with
+>     `created().await` and submitting with `paths::tests::version_awaited` (`recorded_git_submit_as_awaited`: the
+>     submit a client's recorded request with nothing held for the test, its made commit landed by the shard's own
+>     task, the answer awaited where the request records it). A probe making `home_and_land_blocking` and a held made
+>     landing panic passed `paths::tests` and `vcs_store::tests` whole (39), so neither file reaches either. `vcs_store/tests.rs`' 14 moved by w-git (2026-11-26): the one that waits on
 >     nothing to `on_a_stored_shard`; the 13 that push to `test_store::run_on_stored_shard` tasks, each creating with
 >     `created().await` and landing with `push_through_awaited` or `appended_awaited` (new: `pushed_many_awaited`,
 >     `push_unsettled_awaited`), so `home_and_land_blocking`'s reach did not grow; its `repository` helper removed. `repository/push/tests.rs`' 18 moved by w-git (2026-11-26): 17 histories that create to

@@ -108,45 +108,6 @@ fn on<T>(step: impl FnOnce(&mut ShardState) -> T) -> T {
   crate::state::with_state(step).expect("the shard's state")
 }
 
-/// Format: the client a test's awaited submits are made as ([`recorded_git_submit_awaited`]), apart from the clients
-/// tests name.
-const AWAITED_CLIENT: u32 = 9_002;
-/// Shape: how long an awaited submit waits for its recorded answer: far past a debug build's made commit (seconds).
-const AWAITED_PATIENCE_NS: u64 = 60_000_000_000;
-
-/// `body`, a submit to a git green, run as [`AWAITED_CLIENT`]'s request `sequence` from a task on the shard, as a
-/// client's recorded request runs: its made commit landed by its own task, every store wait awaited (never
-/// `commits::made_landing_now`, which carries on the shard's thread), and its answer read where the request recorded it,
-/// waited for a turn at a time.
-async fn recorded_git_submit_awaited(body: RequestBody, sequence: u32) -> Option<ReplyBody> {
-  let id = RequestId {
-    client: AWAITED_CLIENT,
-    sequence,
-  };
-  let origin = u64::from(AWAITED_CLIENT);
-  let answered =
-    on(|state| crate::verbs::run_recorded_for_test(state, (origin, id), &owner(), body));
-  if answered.is_some() {
-    return answered;
-  }
-  let deadline = slates_rt::futures::now_ns().saturating_add(AWAITED_PATIENCE_NS);
-  loop {
-    let seen = on(|state| {
-      state
-        .db
-        .partition()
-        .completion(origin, id.client, id.sequence)
-    });
-    if let Seen::Completed(bytes) = seen {
-      return <ReplyBody as slates_wire::Wire>::from_bytes(&bytes).ok();
-    }
-    if slates_rt::futures::now_ns() >= deadline {
-      return None;
-    }
-    slates_rt::futures::yield_now().await;
-  }
-}
-
 /// The root greens of new repositories `tools` (each a name and a tool) on a store-backed daemon's one shard, each made
 /// through a client's request (A-767 item 7: a creation lands on the store before it is recorded, and a Subversion
 /// repository needs the store, C2): each name with its green.
@@ -761,7 +722,6 @@ fn t_a664_a_later_read_never_replaces_the_identities_a_session_keeps() {
 /// owner's own submit of the work is accepted at, which says whether the returning submit built anything.
 async fn returned_to(
   (name, seat): (&str, Handle<ClientSlot>),
-  sequence: u32,
 ) -> (Option<Refusal>, Option<ToolIdentities>, Option<u64>) {
   let work = repository_work_awaited(name, VcsTool::Git).await;
   let (answer, kept) = on(|state| {
@@ -788,10 +748,14 @@ async fn returned_to(
     (answer, kept)
   });
   // The owner's own submit, a client's recorded request, as a git green takes one (main 01a20182's ruling of 2026-11-24
-  // 01:36), its made commit landed by its own task.
-  let owners =
-    recorded_git_submit_awaited(submit(work, Some("the change"), git_only("Ada")), sequence).await;
-  (answer, kept, owners.as_ref().and_then(accepted_version))
+  // 01:36), its made commit landed by its own task (`paths::tests::recorded_git_submit_awaited`).
+  let owners = crate::vcs_store::paths::tests::recorded_git_submit_awaited(submit(
+    work,
+    Some("the change"),
+    git_only("Ada"),
+  ))
+  .await;
+  (answer, kept, accepted_version(&owners))
 }
 
 /// A-664 part 1 (module docs: a read is kept with the session that asked, while its seat is still that session's). Do:
@@ -812,8 +776,8 @@ fn t_a664_a_read_returning_to_a_seat_its_session_left_is_kept_by_no_one_and_runs
       (taken, retiring, (taken_region, retiring_region))
     });
     let returned = [
-      returned_to(("taken", taken), 1).await,
-      returned_to(("retiring", retiring), 2).await,
+      returned_to(("taken", taken)).await,
+      returned_to(("retiring", retiring)).await,
     ];
     (returned, on(|state| state.refusals.get(READ).copied()))
   });

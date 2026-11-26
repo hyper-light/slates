@@ -304,11 +304,19 @@ impl Hg {
   }
 }
 
+/// One part as [`bundled`] lays it out before encoding: its id, its kind, its parameters and its payload.
+type BundledPart = (
+  u32,
+  &'static [u8],
+  Vec<slates_hg::bundle2::Param<'static>>,
+  Vec<u8>,
+);
+
 /// `unbundle`'s parts as the bundle2 a client sends: its replycaps, check:heads, changegroup, phase-heads and bookmarks
 /// parts, each mandatory, in order, each under its own id (a reply names a part by it). A part of another kind is no push these tests send whole.
 fn bundled(unbundle: &Unbundle) -> Vec<u8> {
   use slates_hg::bundle2::{Event, Param, Part};
-  let mut payloads: Vec<(u32, &'static [u8], Vec<Param<'static>>, Vec<u8>)> = Vec::new();
+  let mut payloads: Vec<BundledPart> = Vec::new();
   for part in &unbundle.parts {
     match &part.asks {
       Asks::ReplyCaps(caps) => payloads.push((part.id, b"REPLYCAPS", Vec::new(), caps.clone())),

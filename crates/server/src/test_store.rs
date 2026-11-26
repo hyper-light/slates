@@ -494,8 +494,8 @@ pub(crate) fn create_adopting_on(
 pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   Allowed {
     fixture: "test_store::audit_on_stored_shard",
-    owner: "each history's (GAPS: svn 0, git 0, hg 0, other 23)",
-    reaching: 23,
+    owner: "each history's (GAPS: svn 0, git 0, hg 0, other 12)",
+    reaching: 12,
   },
   Allowed {
     fixture: "test_store::create",

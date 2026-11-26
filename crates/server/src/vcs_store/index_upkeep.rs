@@ -275,7 +275,12 @@ mod tests {
     };
     // The repository made first, from the test's thread (`test_store::create_on`), so the shard is never held through
     // its creation's commit; then the history, which waits on nothing.
-    let asked = ("pushed", VcsTool::Mercurial, WireFormat::Sha1, "branch:default:0");
+    let asked = (
+      "pushed",
+      VcsTool::Mercurial,
+      WireFormat::Sha1,
+      "branch:default:0",
+    );
     crate::test_store::audit_on_stored_shard_made((&owner, asked), move |state, (id, _)| {
       let room = state.store.admittable();
       within_budget(state, room, |stores| {
