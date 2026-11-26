@@ -746,16 +746,45 @@ fn build_some_in(
         let BuildAt::Going(building) = at else {
           return Err(Uncommitted::NotHeld);
         };
-        let mut spent = || slates_rt::futures::now_ns() >= deadline;
-        Building::step(
+        let mut spent = || build_spent(slates_rt::futures::now_ns() >= deadline);
+        let stepped = Building::step(
           (records, engine, checked),
           building,
           &mut spent,
           (head, work_identity),
-        )
+        );
+        Ok((stepped, building.most_gone()))
       })
       .ok_or(Uncommitted::NotHeld)?
   })
+  .and_then(|(stepped, most_gone)| {
+    let most = state
+      .refusals
+      .entry(super::BUILD_MOST_GONE_A_UNIT)
+      .or_insert(0);
+    *most = (*most).max(most_gone);
+    stepped
+  })
+}
+
+/// Whether a build step's slice is spent ([`build_some_in`]): `by_clock`, but in the tests that take every build a unit a
+/// step or whole ([`BUILD_SPENT`]).
+fn build_spent(by_clock: bool) -> bool {
+  #[cfg(test)]
+  {
+    BUILD_SPENT.with(std::cell::Cell::get).unwrap_or(by_clock)
+  }
+  #[cfg(not(test))]
+  {
+    by_clock
+  }
+}
+
+#[cfg(test)]
+std::thread_local! {
+  /// Test support: every import build's step spent after each unit (`Some(true)`, a unit a step) or never (`Some(false)`,
+  /// the build whole in one step), whatever its clock says; none, by its clock (A-920 9b's oracle).
+  pub(crate) static BUILD_SPENT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// A revision's record's identity (`svn_commit::identity`), the record hashed a slice a step, each counted

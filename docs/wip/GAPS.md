@@ -680,6 +680,24 @@
 > files): `made_commit.rs` (two calls), `vcs_store/svn_made.rs`, `vcs_store/hg_made.rs`, `greens.rs`'s own caller. A
 > probe of a wide made commit on each VCS would name any past the bar.
 
+> **Open (A-920's sweep, w-svn for main, 2026-11-26): four tests whose counts hold only in one load regime.** A test
+> that counts a step's units or turns against the shard's live quantum certifies nothing when the quantum moves. Each
+> of these is to be worked when it fails, by the 7c test's fix (the step takes its slice or budget as an argument, the
+> test chooses it, and the count is asserted from it; the model is `vcs_store/named_objects.rs`'s `read_step`):
+> - `image_pages.rs:1774`: it reads the live `copy_slice_bytes` and asserts it is past three pages ("or the test asks
+>   nothing"). That fails on a quiet shard with a small quantum, and the turns a slice takes move with it.
+> - `vcs_http/tests/daemon_edge.rs:5603` (`turns > 1`): the hg commit's let-go runs a turn until half the live
+>   quantum over 120 changesets' windows. A loaded quantum near 500 µs makes 250 µs turns, so it goes to one turn
+>   where every window lets go within that (release, likely).
+> - `vcs_store/svn_import/tests.rs:1019` (`slices >= 2`, w-svn's): `apply_slice` runs until the live
+>   `step_budget_ns`, against 400 revisions. It holds while their applies take more than the 500 µs ceiling: yes in
+>   debug, borderline in release.
+> - `refining/tests.rs:256` (`turns > 1`): the copy slice is `copy_slice_bytes_within(quantum / 2)`, live, against a
+>   fixed rewrite, and the refining pace is by the clock.
+> Not affected: `merge_origin.rs:2126` (a fixed chunk a unit of gathering already makes `units > chunks`) and
+> `daemon_edge.rs:5218` (the let-go's listing is a slice of its own, so `slices > 1` in any regime). Neither
+> certifies the live share's slicing.
+
 > **Held (A-928, w-svn, 2026-11-25; goal 93, 84a): a shard's step quantum stays under half the loaded bar.** The
 > quantum is the shard's wake estimate, and load grew it: A-920's release probe 5 read it at about 1.05 ms at load 38-56,
 > so every step that filled it passed 1 ms. It is now held to `STEP_QUANTUM_CEILING` (bar / 2, 500 µs), since a step is
