@@ -63187,7 +63187,8 @@ Applied in the same change to: GAPS (the svn HTTP edge), `crates/svn/src/dav/sit
   owed record of key 0's version 2: refused `OwedCommit { key: 0, version: 2 }`, the store as the push left it; before
   this change the replay kept it owed, by reading, not run red). Moved to recorded submits (`paths::tests::
   submit_as_taken` and `recorded_git_submit`, which take the refinement through `refining::refined_now` and the made
-  commit through `commits::made_landing_now`): every git `version` of the paths, commits, identities and repository
+  commit through `commits::made_landing_now`; all three gone 2026-11-26, the submits awaited from tasks and the
+  refinement run by its task alone, since `refined_now` gave a job up over a let-go window): every git `version` of the paths, commits, identities and repository
   tests, the NUL message test and the copy of nothing. Removed: the two owed tests. `cargo test -p slates-server
   --lib -- vcs_store:: identities:: made_commit:: repository:: git_push:: refining:: verbs::` 389 of 389 in 7 of 10
   runs. One ended at the watchdog (exit 4: `t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step`'s

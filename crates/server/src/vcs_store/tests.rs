@@ -2742,3 +2742,164 @@ fn room_asked_inside_a_lend_is_refused_out_of_reach_at_its_first_put() {
   );
   assert_eq!(counted, 1, "the ask inside the lend counted once");
 }
+
+/// Bytes no deflate shortens (a xorshift's stream), `len` of them: a file whose pack is as long as it.
+fn incompressible(len: usize) -> Vec<u8> {
+  let mut word = 0x9e37_79b9_7f4a_7c15u64;
+  (0..len)
+    .map(|_| {
+      word ^= word << 13;
+      word ^= word >> 7;
+      word ^= word << 17;
+      word.to_le_bytes()[0]
+    })
+    .collect()
+}
+
+/// Shape: how many times a replay's pack bound (`vcs_store::replay_pack_bound`) the C2 test's pack is: past it by more
+/// than its pieces' rounding.
+const STREAMED_PACKS: usize = 4;
+
+/// Repository `id`'s one record's pack, its identity and length, and its bytes as the content store holds them, then
+/// every window of it let go (marked landed, as goal 93's landed let-go leaves a landed pack): the content store holds
+/// it whole no more.
+fn pack_let_go(state: &mut ShardState, id: RepositoryId) -> ((ContentId, u64), Vec<u8>) {
+  let record = records(state, id).pop().expect("a record");
+  let packed = Record::decode(&record, FORMAT)
+    .expect("a record")
+    .packed
+    .expect("a pack named");
+  let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+  let content = lent.stores.content_mut().expect("the content store");
+  let root = content.root_of(&packed.0);
+  let bytes = content
+    .object_bytes(&root, packed.1)
+    .expect("the pack held whole");
+  for window in bytes.chunks(content.window()).map(ContentId::of) {
+    if !content.is_away(&window) && content.mark_landed(&window) {
+      let _ = content.let_go(&window);
+    }
+  }
+  assert!(!content.holds_whole(&packed.0), "the pack let go");
+  (packed, bytes)
+}
+
+/// Awaits `ended` of the shard's state, a yield between looks, within the stored runner's patience.
+async fn awaited(ended: impl Fn(&ShardState) -> bool) {
+  let deadline = slates_rt::futures::now_ns().saturating_add(
+    u64::try_from(crate::test_store::HISTORY_PATIENCE.as_nanos()).unwrap_or(u64::MAX),
+  );
+  while !on_state(|state| ended(state)) {
+    assert!(slates_rt::futures::now_ns() < deadline, "never ended");
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// The pack `packed` read back from the node's store (`StorePacks`, one fill of its whole length), its windows the
+/// content store holds let go brought back from those bytes, and the pack the content store names then read whole.
+async fn pack_read_back(packed: (ContentId, u64)) -> Option<Vec<u8>> {
+  let disk = on_state(|state| state.vcs_disk.clone())?;
+  let len = usize::try_from(packed.1).ok()?;
+  let mut pieces = super::store_packs::StorePacks::new(disk, len.saturating_add(1 << 16));
+  pieces.fill(&packed.0, packed.1, 0, packed.1).await.ok()?;
+  let mut bytes = Vec::new();
+  while bytes.len() < len {
+    let at = u64::try_from(bytes.len()).ok()?;
+    let piece = slates_git::store::packed::PackSource::piece(&pieces, &packed.0, packed.1, at)?;
+    bytes.extend_from_slice(&piece);
+  }
+  on_state(|state| {
+    let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+    let content = lent.stores.content_mut()?;
+    content.bring_back_object(&packed.0, &bytes).ok()?;
+    let root = content.root_of(&packed.0);
+    content.object_bytes(&root, packed.1)
+  })
+}
+
+/// Main's order of 2026-11-26 (C2: a replay reads its record's pack from the node's store a piece at a time,
+/// cancellation safe and idempotent). Do: push a create whose one file is incompressible and [`STREAMED_PACKS`] times a
+/// replay's pack bound; let go every window of its pack; rebuild the repository, held between two of its pack's pieces
+/// after its first fill (`vcs_store::REPLAY_FILLS_BEFORE_HOLD`), and there rebuild it again, the first cancelled; let
+/// the second run to its end. Expect: neither the held nor the cancelled replay names the pack whole; the second ends,
+/// no replay refused, the store made again the live one (its rows, refs and learned depth), and the pack it names read
+/// back byte for byte.
+#[test]
+fn t_c2_a_rebuild_cancelled_between_two_pieces_names_no_pack_and_the_next_reads_it_whole() {
+  crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = crate::test_store::created(&owner(), git("streamed")).await;
+    let bound =
+      on_state(|state| super::replay_pack_bound(&state.config, state.config.step_quantum_ns()));
+    let files = [(b"f".to_vec(), incompressible(bound * STREAMED_PACKS))];
+    let (objects, head) = commit_of(&files, &[], FIRST_DATE);
+    push_through_awaited(
+      (repository, root),
+      &objects,
+      (None, head, tree_of(&objects)),
+    )
+    .await;
+    let key = green_key(root);
+    // The store's rows, refs and learned depth: what its records make again. Its contents' residency is not (the pack
+    // let go here, put again by the replay that reads it, as a whole read put it).
+    let made_of = |state: &ShardState| {
+      state
+        .vcs_stores
+        .git_ref(repository)
+        .map(|(content, store)| facts(content, store, &[key]))
+        .map(|facts| (facts.rows, facts.refs, facts.depth))
+    };
+    let (live, (packed, bytes)) =
+      on_state(|state| (made_of(state), pack_let_go(state, repository)));
+    let held = &super::REPLAY_FILLS_BEFORE_HOLD;
+    held.with(|left| left.set(Some(1)));
+    on_state(|state| super::rebuild(state, repository));
+    awaited(|state| {
+      held.with(|left| left.get() == Some(0))
+        && state.vcs_stores.replay_packs.contains_key(&repository)
+    })
+    .await;
+    let whole = |state: &ShardState| {
+      state
+        .vcs_stores
+        .content()
+        .is_some_and(|content| content.holds_whole(&packed.0))
+    };
+    let cancelled = on_state(|state| {
+      let held_whole = whole(state);
+      super::rebuild(state, repository);
+      held.with(|left| left.set(None));
+      (held_whole, whole(state))
+    });
+    assert_eq!(
+      cancelled,
+      (false, false),
+      "a pack named whole held or cancelled"
+    );
+    awaited(|state| {
+      !state.vcs_stores.rebuilding(repository) && state.vcs_stores.unrecovered(repository).is_none()
+    })
+    .await;
+    assert_eq!(
+      on_state(|state| made_of(state)),
+      live,
+      "the store made again the live one"
+    );
+    let (refused, held_most) = on_state(|state| {
+      let count = |name: &str| state.refusals.get(name).copied();
+      (
+        count(super::REPLAY_REFUSED),
+        count(super::REPLAY_PACK_HELD_MOST),
+      )
+    });
+    assert_eq!(refused, None, "no replay refused");
+    assert!(
+      held_most.is_some_and(|most| most > 0 && most <= u64::try_from(bound).unwrap()),
+      "the rebuild read its pack within its bound {bound} B: {held_most:?}"
+    );
+    assert_eq!(
+      pack_read_back(packed).await,
+      Some(bytes),
+      "the pack read back whole"
+    );
+  });
+}

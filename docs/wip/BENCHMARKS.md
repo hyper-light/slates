@@ -19965,8 +19965,8 @@ farther apart in the walk than any order keeps. The times are mixed, none regres
 shape: the star fixture's roots inflated 44 -> 23 (`a_fetchs_tree_reads_count_the_bases_they_inflate_whole`).
 
 - **Command.** `git-leg-counters5.sh` over git/git, release `slates-cli` of each arm, two rounds in ABBA order.
-- **Load.** Load average 15 to 22; the machine is not named in main's report. Loaded points, compared only with each
-  other.
+- **Machine and load.** An Apple M5 Max MacBook Pro (18 cores, 6 performance and 12 efficiency; 128 GiB; macOS
+  26.4.1), under other sessions' load: load average 15 to 22. Loaded points, compared only with each other.
 - **The arms**, distinct by sha:
   - before: 1e58953e0 (binary sha 9e38e1ebb6c9), oldest laid given back first.
   - after: 003e4d7c7 (binary sha b68dc2789334), the refresh.
@@ -19995,3 +19995,37 @@ kept or inflates its root, and every tree is read once.
   legs of the same binaries).
 - **Why no order helps, and what would:** the GAPS entry (2,511 MiB of trees inflated on git/git against a 10 MB
   budget; a budget from the pack's own chains, or an enumeration that reads no trees, the open path).
+
+## The fetch's read cache asked past the chunks its turnover holds idle: a win in work on git/git, kept (goal 93 perf; main's A/B, 2026-11-26)
+
+**Verdict.** Kept (aea6024e7, `packed::Recent::budget_keeping`: the budget the bytes to keep and the two chunks that
+keep nothing at a moment, the oldest given back whole and the newest not yet laid). Unlike the eviction order above,
+it is real capacity on git/git: fewer roots inflated and steps rebuilt, more hits, the clones faster.
+
+- **Command.** `git-leg-counters5.sh` over git/git, release `slates-cli` of each arm, two rounds in ABBA order.
+- **Machine and load.** An Apple M5 Max MacBook Pro (18 cores, 6 performance and 12 efficiency; 128 GiB; macOS
+  26.4.1), under other sessions' load: load average 13 to 30. Loaded points, compared only with each other.
+- **The arms**, distinct by sha:
+  - before: 087826ef2 (binary sha 1c9cce990211), the budget sized for what it keeps alone.
+  - after: ee9f617df (binary sha 9dcfecef4bd6), `budget_keeping`.
+
+**The read cache, per clone** (identical within each arm):
+
+| arm | budget at most | `read_cache_hits` | `tree_deltas` | `tree_deltas_past_one` | `tree_bases_inflated` |
+|---|---|---|---|---|---|
+| before | 10,150,020 B | 31,858 | 1,810,435 | 1,648,509 | 138,318 |
+| after | 12,247,172 B (+20.7 %) | 37,720 (+18.4 %) | 1,761,550 (−2.70 %) | 1,599,769 | 132,456 (−4.24 %) |
+
+**Seconds a step** (before's legs 1 and 4, then after's legs 2 and 3, and the least of each):
+
+| step | before | after | least, after against before |
+|---|---|---|---|
+| clone | 59.66, 62.31 | 54.95, 60.35 | −7.9 % |
+| clone again | 49.45, 51.00 | 46.59, 44.23 | −10.6 % |
+| partial | 31.11, 34.37 | 37.51, 31.64 | +1.7 % |
+| push | 50.03, 50.84 | 52.91, 56.29 | +5.8 % |
+
+- **The push** reads no read cache: its +5.8 % is the after arm's heavier load, so the clones' figures understate the
+  gain if anything.
+- **What is left:** git/git's working set is 2,511 MiB of trees inflated against this 12 MB budget (the GAPS entry "The
+  fetch's read cache on git/git"); this piece takes the budget's own idle share back, not the working set.
