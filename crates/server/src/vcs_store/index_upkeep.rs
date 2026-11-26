@@ -179,7 +179,7 @@ pub(crate) fn slice(state: &mut ShardState, id: RepositoryId, budget_ns: u64) ->
 #[cfg(test)]
 mod tests {
   use super::*;
-  use slates_ipc::protocol::{ObjectFormat as WireFormat, ReplyBody, RequestBody, VcsTool};
+  use slates_ipc::protocol::{ObjectFormat as WireFormat, VcsTool};
 
   /// Goal 93 perf (main's ruling of 2026-11-21 01:05: the merge wired once, for every tool whose index is
   /// `slates_vcs::Index`). Do: create a repository of `tool` on a store-backed shard, give its index four runs of its own
@@ -187,30 +187,14 @@ mod tests {
   /// each). Expect: one merge (the non-vacuity counter), made in more steps than one, one run left, every row read back,
   /// each lookup visiting at most the tail and that run.
   fn an_index_built_whole_is_merged_into_one_run(tool: VcsTool, format: WireFormat) {
-    crate::test_store::audit_on_stored_shard("upkeep", move |state| {
-      let owner = slates_db::catalog::Principal::Uid {
-        host: slates_db::HostId(0),
-        uid: 1234,
-      };
-      let reply = crate::test_store::create(
-        state,
-        &owner,
-        RequestBody::CreateRepository {
-          name: "upkeep".to_owned(),
-          tool,
-          format,
-          default_branch: "branch:default:0".to_owned(),
-          green: None,
-        },
-      );
-      assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
-      let id = state
-        .db
-        .partition()
-        .repositories()
-        .repository_named("upkeep")
-        .unwrap()
-        .id;
+    let owner = slates_db::catalog::Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 1234,
+    };
+    // The repository made first, from the test's thread (`test_store::create_on`), so the shard is never held through
+    // its creation's commit; then the history, which waits on nothing.
+    let asked = ("upkeep", tool, format, "branch:default:0");
+    crate::test_store::audit_on_stored_shard_made((&owner, asked), move |state, (id, _)| {
       let keys: Vec<Vec<u8>> = (0..4u8)
         .flat_map(|batch| (0..64u8).map(move |at| vec![b'Z', batch, at]))
         .collect();
@@ -285,30 +269,19 @@ mod tests {
   /// the slices. Expect: one merge, one run left.
   #[test]
   fn an_index_never_merged_is_merged_once_its_lookups_are_reported() {
-    crate::test_store::audit_on_stored_shard("upkeep-push", |state| {
-      let owner = slates_db::catalog::Principal::Uid {
-        host: slates_db::HostId(0),
-        uid: 1234,
-      };
-      let reply = crate::test_store::create(
-        state,
-        &owner,
-        RequestBody::CreateRepository {
-          name: "pushed".to_owned(),
-          tool: VcsTool::Mercurial,
-          format: WireFormat::Sha1,
-          default_branch: "branch:default:0".to_owned(),
-          green: None,
-        },
-      );
-      assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
-      let id = state
-        .db
-        .partition()
-        .repositories()
-        .repository_named("pushed")
-        .unwrap()
-        .id;
+    let owner = slates_db::catalog::Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 1234,
+    };
+    // The repository made first, from the test's thread (`test_store::create_on`), so the shard is never held through
+    // its creation's commit; then the history, which waits on nothing.
+    let asked = (
+      "pushed",
+      VcsTool::Mercurial,
+      WireFormat::Sha1,
+      "branch:default:0",
+    );
+    crate::test_store::audit_on_stored_shard_made((&owner, asked), move |state, (id, _)| {
       let room = state.store.admittable();
       within_budget(state, room, |stores| {
         let (content, index) = index_of(stores, id).unwrap();

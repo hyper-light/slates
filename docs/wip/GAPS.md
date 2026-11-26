@@ -1173,16 +1173,22 @@
 >   `repository/push/tests.rs`, `repository.rs`, `vcs_share/grants.rs`, `vcs_share/read_backs.rs`, `identities/tests.rs`,
 >   `repository/import/tests.rs`, `fleet.rs`, `replica.rs`, `daemon::tests`; w-perf's: `vcs_store/tests.rs`,
 >   `vcs_store/paths/tests.rs`, `vcs_store/commits/tests.rs`, `vcs_store/index_upkeep.rs`, `vcs_store/named_objects.rs`.
->   Edit none of them meanwhile; main assigns them back if either agent returns.
->   - `test_store::audit_on_stored_shard`: 14 sites. svn 0; git 0; hg 0;
->     other 14 (`identities/tests.rs` 8, `index_upkeep.rs` 2, `import/tests.rs` 2, `fleet.rs` 2).
->     `vcs_store/commits/tests.rs`' 8 moved by w-git (2026-11-26) to `run_on_stored_shard` tasks: created with
->     `created().await`, submitted with `paths::tests::version_awaited`, pushed with `push_through_awaited` or
->     `push_unsettled_awaited`; the storm's build slices held to the test's own by `whole_build::DRIVEN_BY_TEST` (a
->     test-only hold: awaiting its pushes' landings let the build's task finish it between them, red `MOVED` 0). The
->     probe (`home_and_land_blocking` and a held made landing panicking) failed only
+>   Edit none of them meanwhile; main assigns them back if either agent returns. **Passed to w-hg (2026-11-26, main's
+>   order: claimed in e15868057, not started):** `identities/tests.rs`, `vcs_store/index_upkeep.rs`,
+>   `repository/import/tests.rs` and `fleet.rs`; w-git keeps `vcs_store/paths/tests.rs` and `vcs_store/commits/tests.rs`.
+>   - `test_store::audit_on_stored_shard`: 4 sites. svn 0; git 0; hg 0;
+>     other 4 (`import/tests.rs` 2, `fleet.rs` 2). `vcs_store/commits/tests.rs`' 8 moved by w-git (2026-11-26) to
+>     `run_on_stored_shard` tasks: created with `created().await`, submitted with `paths::tests::version_awaited`,
+>     pushed with `push_through_awaited` or `push_unsettled_awaited`; the storm's build slices held to the test's own by
+>     `whole_build::DRIVEN_BY_TEST` (a test-only hold: awaiting its pushes' landings let the build's task finish it
+>     between them, red `MOVED` 0). The probe (`home_and_land_blocking` and a held made landing panicking) failed only
 >     `t_a664_live_a_submit_waits_parked_for_its_greens_whole_build` of `commits::tests`, through its sync
->     `pushed_three`. `vcs_store/paths/tests.rs`' 11 moved by w-git (2026-11-26): the plain green's, whose submit is a
+>     `pushed_three`. `identities/tests.rs`' 8 moved by w-hg
+>     (2026-11-26): the six that wait on nothing to `on_a_stored_shard`; the two that make git repositories to
+>     `run_on_stored_shard` tasks, made by `created().await`, the owner's submit awaited where it records its answer
+>     (`paths::tests::recorded_git_submit_as_awaited`), so `home_and_land_blocking`'s reach did not grow.
+>     `index_upkeep.rs`' 2 moved by w-hg (2026-11-26) to `audit_on_stored_shard_made`, the repository made from the
+>     test's thread. `vcs_store/paths/tests.rs`' 11 moved by w-git (2026-11-26): the plain green's, whose submit is a
 >     bare dispatch, to `on_a_stored_shard`; the 10 on git repositories to `run_on_stored_shard` tasks creating with
 >     `created().await` and submitting with `paths::tests::version_awaited` (`recorded_git_submit_as_awaited`: the
 >     submit a client's recorded request with nothing held for the test, its made commit landed by the shard's own
@@ -1205,8 +1211,9 @@
 >     (`git_push/tests.rs` 23, `vcs_share/tests.rs` 9, `vcs_share/wait.rs` 2, `vcs_store/tests.rs` 2, `replica.rs` 1,
 >     `named_objects.rs` 1) and `test_store::audit_on_stored_shard_made_all`, any tool's (`upload/tests.rs` 12,
 >     `git_hooks/tests.rs` 2).
->   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 12 tests. hg 4
->     (`vcs_ssh` 4); other 8 (`daemon::tests` 5, `repository::import` 2, `identities` 1). `repository::tests`' 1 moved
+>   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 11 tests. hg 4
+>     (`vcs_ssh` 4); other 7 (`daemon::tests` 5, `repository::import` 2). `identities`' 1 moved by w-hg (2026-11-26):
+>     its session test's repository made from the test's thread (`create_on`). `repository::tests`' 1 moved
 >     by w-git (2026-11-26): its checkpoint test's repository made by `test_store::create_on` first.
 >     `repository::push`'s 5 moved by w-git (2026-11-26): each observation's repository made first by
 >     `test_store::create_on` from the test's thread, and `push::tests`' `repository` helper, which created on the
