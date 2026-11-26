@@ -1262,7 +1262,12 @@
 >     test's thread, `git_repository_on`, or through `on_stored_shard_with`.)
 >   - w-hg's push and import helpers, counted by the tests refused without each once the entries above let them
 >     through: `repository::hg_push::land_stored` (2 tests, `vcs_ssh::tests::hg`),
->     `vcs_store::commits::home_and_land_blocking` (7: `commits` 6, `upload` 1), and
+>     `vcs_store::commits::home_and_land_blocking` (14 tests: `vcs_store::upload::tests` 12, `git_hooks::tests` 2,
+>     through `vcs_store::tests`' synchronous `push_through` and `appended`; `commits::tests` 0 since w-hg moved
+>     `t_a664_live_a_submit_waits_parked_for_its_greens_whole_build` to `pushed_three_awaited`, 2026-11-26, and
+>     `push_unsettled`, its last caller gone, was deleted. Counted by w-hg's probe of 2026-11-26, the fixture and a held
+>     made landing (`made_landing_now`) panicking over `vcs_store::` and `git_hooks::`: 14 failed, all at the fixture,
+>     none at `made_landing_now`; the earlier 7 was an undercount, whose cause is not on record; log `~/.local/state/w-hg-logs/2026-11-26-probe-home-and-land-vcs_store::.txt`), and
 >     `repository::import::tests::served`'s read-back (1, gone 2026-11-26).
 >   Moved instead of listed: `daemon::tests::t_goal93_a_homes_landed_records_survive_a_restart…` lands between two
 >   observations. Shrunk: `repository/hg_push/tests.rs`' 17 daemon tests push through the daemon's own driver

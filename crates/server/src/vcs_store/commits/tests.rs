@@ -489,23 +489,7 @@ fn t_a664_p3_an_executable_file_moved_is_100755_in_its_commit() {
   assert_eq!(second, expected);
 }
 
-/// A pushed commit of three files on `repository`'s root green, its map left to its build (A-664's live whole builds):
-/// the pushed tree.
-fn pushed_three(
-  state: &mut ShardState,
-  (repository, root): (RepositoryId, slates_db::catalog::VolumeId),
-) -> ObjectId {
-  let (objects, pushed, tree) = three_files();
-  crate::vcs_store::tests::push_unsettled(
-    state,
-    (repository, root),
-    &objects,
-    (None, pushed, tree),
-  );
-  tree
-}
-
-/// [`pushed_three`]'s commit: its objects, the commit and its tree.
+/// [`pushed_three_awaited`]'s commit: its objects, the commit and its tree.
 fn three_files() -> (Vec<crate::vcs_store::tests::Brought>, ObjectId, ObjectId) {
   let files = [
     (b"README".to_vec(), b"one\n".to_vec()),
@@ -517,7 +501,8 @@ fn three_files() -> (Vec<crate::vcs_store::tests::Brought>, ObjectId, ObjectId) 
   (objects, pushed, tree)
 }
 
-/// [`pushed_three`] from a task of the shard ([`push_unsettled_awaited`]).
+/// A pushed commit of three files on `repository`'s root green, its map left to its build (A-664's live whole builds),
+/// pushed from a task of the shard ([`push_unsettled_awaited`]): the pushed tree.
 async fn pushed_three_awaited(
   (repository, root): (RepositoryId, slates_db::catalog::VolumeId),
 ) -> ObjectId {
@@ -575,10 +560,11 @@ fn t_a664_live_a_submit_waits_parked_for_its_greens_whole_build() {
     &daemon,
     || async move {
       let head = |state: &ShardState, root| state.greens.get(&root).map(|engine| engine.head());
+      let (repository, green) = git_made("parked").await;
+      let root = to_db_volume(green);
+      // Nothing yields between the push's last step and the submit, so the build is still under way when it parks.
+      let pushed = pushed_three_awaited((repository, root)).await;
       let begun = crate::state::with_state(|state| {
-        let (repository, green) = git_repository(state, "parked");
-        let root = to_db_volume(green);
-        let pushed = pushed_three(state, (repository, root));
         let ask = crate::vcs_store::paths::tests::ask;
         let made = ask(
           state,

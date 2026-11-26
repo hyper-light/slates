@@ -498,8 +498,8 @@ pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   },
   Allowed {
     fixture: "vcs_store::commits::home_and_land_blocking",
-    owner: "w-hg (vcs_store::commits::tests 6, vcs_store::upload::tests 1)",
-    reaching: 7,
+    owner: "w-hg (vcs_store::upload::tests 12, git_hooks::tests 2)",
+    reaching: 14,
   },
   Allowed {
     fixture: "repository::hg_push::land_stored",
