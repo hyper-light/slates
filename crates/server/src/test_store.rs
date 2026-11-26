@@ -237,7 +237,17 @@ pub(crate) type Asked<'a> = (
 pub(crate) fn routed_create(
   state: &mut crate::state::ShardState,
   (principal, request): (&slates_db::catalog::Principal, u64),
+  asked: Asked<'_>,
+) -> slates_ipc::protocol::ReplyBody {
+  routed_create_adopting(state, (principal, request), asked, None)
+}
+
+/// [`routed_create`] adopting `green`, a green `principal` made alone, as the repository's root (A-636 part 2b-2).
+fn routed_create_adopting(
+  state: &mut crate::state::ShardState,
+  (principal, request): (&slates_db::catalog::Principal, u64),
   (name, tool, format, default_branch): Asked<'_>,
+  green: Option<slates_ipc::protocol::VolumeId>,
 ) -> slates_ipc::protocol::ReplyBody {
   state.current_request = Some((1, slates_wire::request::RequestId::from_word(request)));
   state.reply_route = Some(crate::merge_service::ReplyRoute {
@@ -255,7 +265,7 @@ pub(crate) fn routed_create(
       tool,
       format,
       default_branch: default_branch.to_owned(),
-      green: None,
+      green,
     },
   );
   // Left as the verb runner leaves them after it took a deferred acceptance.
@@ -424,6 +434,20 @@ pub(crate) fn create_on(
   slates_db::catalog::RepositoryId,
   slates_db::catalog::VolumeId,
 ) {
+  create_adopting_on(daemon, (partition, principal), asked, None)
+}
+
+/// [`create_on`] adopting `green`, a green `principal` made alone, as the repository's root (A-636 part 2b-2): the
+/// root then is `green`.
+pub(crate) fn create_adopting_on(
+  daemon: &crate::Daemon,
+  (partition, principal): (usize, &slates_db::catalog::Principal),
+  asked: Asked<'_>,
+  green: Option<slates_ipc::protocol::VolumeId>,
+) -> (
+  slates_db::catalog::RepositoryId,
+  slates_db::catalog::VolumeId,
+) {
   let (principal, name, tool, format, branch) = (
     principal.clone(),
     asked.0.to_owned(),
@@ -434,7 +458,12 @@ pub(crate) fn create_on(
   let reply = {
     let (name, branch) = (name.clone(), branch.clone());
     crate::daemon::observe_at(daemon, partition, move |state| {
-      routed_create(state, (&principal, 1), (&name, tool, format, &branch))
+      routed_create_adopting(
+        state,
+        (&principal, 1),
+        (&name, tool, format, &branch),
+        green,
+      )
     })
   };
   assert!(
@@ -465,13 +494,13 @@ pub(crate) fn create_on(
 pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   Allowed {
     fixture: "test_store::audit_on_stored_shard",
-    owner: "each history's (GAPS: svn 0, git 0, hg 15, other 57)",
-    reaching: 72,
+    owner: "each history's (GAPS: svn 0, git 0, hg 15, other 47)",
+    reaching: 62,
   },
   Allowed {
     fixture: "test_store::create",
-    owner: "each caller's (GAPS: hg 4, other 9)",
-    reaching: 13,
+    owner: "each caller's (GAPS: hg 4, other 8)",
+    reaching: 12,
   },
   Allowed {
     fixture: "vcs_store::commits::home_and_land_blocking",
