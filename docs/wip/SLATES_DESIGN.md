@@ -64682,6 +64682,47 @@ GAPS.
   - the landing's text release, 4.2 ms;
   - the checkpoint's turns, 5.0 and 3.9 ms.
   The longest poll runs several of these with no yield between them. Owed: their release sizes (main's probe 10).
+  **Release probe 10** (main, at 9a8ab7387, after 7a and 7b; 99 runs of each wide test at load 21-31, then 99 with 12
+  burners at load 27-44, all rc 0; record `~/.local/state/main-01a20182/rounds/svn-probe10/summary.txt`). The longest
+  step's p50, p90 and p99 in ms, ambient then with burners, with probe 9's ambient figures in brackets:
+  - add: 3.04, 3.18, 3.31, then 2.96, 3.09, 3.36 [23.0, 72.2, 97.4];
+  - copy: 3.12, 3.57, 4.04, then 3.13, 3.84, 4.19 [23.6, 54.7, 85.7];
+  - move: 5.34, 6.45, 7.50, then 5.30, 5.85, 7.75 [39.2, 84.2, 97.3].
+  The history's thread CPU equals its wall time, and the burners leave it where it was: held work, not a preempted
+  thread. Every run of every test is still past 1 ms. Add's and copy's longest step is the history's (the landing's
+  sections, 3.0-4.2 ms of CPU). Move's is the checkpoint task's (`merge_service.rs:374`, 5.3-7.8 ms), so
+  `CheckpointHold::begin`'s build and encode is past the bar in release for a tree of copies and a move (main's next
+  order: a file a unit inside the hold).
+  **7c, each of the landing's sections a step of its own** (main's order after probe 10). A debug probe of every state
+  borrow over 300 µs inside each long poll named two chains: the storing's begin (`stage_texts`: `storing_of` and
+  `hand_over`, 15.4 ms) ran on into the carried texts (`texts_carried`, 14.3 ms, outside any borrow) in one poll of
+  31 ms, and each paced loop's last slice ran on into the section after it. Now `svn_commit::section_yield` yields,
+  counted, after the storing begins and before the carried texts, and `until_done` yields after its last slice. Three
+  paced loops ran units past their deadline. Each now stops at it:
+  - The preparation's hold hashed a content chunk a unit, up to 1 MiB (10.4 ms of one step, debug). It now hashes a
+    copy slice a unit (`IncrementHold::chunk_hasher`, `merge_origin::inputs_extent_hashed`). Oracle:
+    `an_increment_held_a_slice_a_unit_names_the_inputs_held_whole` (the same inputs as `hold_increment`, in more units
+    than a hold that hashes a chunk a unit).
+  - The chain entry's encoding hashed the whole entry in its last unit (4.7 ms, debug). It now hashes what each unit
+    writes (`chain_entry::Encoding::digest`). Oracle: `an_entry_encoded_a_unit_a_step_is_the_entry_encoded_whole`,
+    unchanged.
+  - The tail's first text release applied the greens' 9,000 pending name holds at one free decision (7.8 ms, debug).
+    `name_holds::apply_some` now applies them a hold a unit before the release, every take before any give, putting
+    those left first in line (`Greens::put_back_name_holds`), so a free decision between steps applies the rest whole
+    as before. Oracle: `a_drain_applied_a_hold_a_step_leaves_the_holders_applied_whole_leaves` (a drain that gives a
+    text back and takes it again: the same holders a hold a step as whole). Planted bug, red: the holds applied in
+    order, which frees the text before its take.
+  Counters, each more than two in `t_c2c`: `repository.svn_commit.landing_section_yields` and
+  `merge.name_hold.apply_steps`; red at 0 before. After 7c (debug), add's longest poll is 14.4 ms, its largest single
+  section (the storing's begin), where it had been 31 ms. In copy and move every long poll is one section. What is
+  left, each one section (debug, the probe's largest):
+  - a staging step (`staging::within_records`, its check, build, reads or judge), 29-30 ms for copy and move;
+  - the tail's end (checkpoint begun, `fold_to_readers`), 13-21 ms;
+  - the storing's begin, 14-19 ms;
+  - `texts_carried`, 14-19 ms;
+  - `record_landed`'s register op, 9.7-16 ms;
+  - `apply_slice`, `retire_begun` and the text release, 4-5 ms each.
+  These are to be sized in release next (main's order: each section left judged against the bar).
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
