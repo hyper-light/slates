@@ -1513,6 +1513,61 @@ pub(crate) fn appended(
   appended
 }
 
+/// The shard's state for `f`, in an awaiting history (a task of the shard: [`push_through_awaited`]).
+pub(crate) fn on_state<T>(f: impl FnOnce(&mut ShardState) -> T) -> T {
+  crate::state::with_state(f).expect("the shard's state")
+}
+
+/// [`appended`] from a task of the shard: its names and pack homed and landed by awaiting
+/// (`vcs_store::commits::home_and_land`), never holding the shard through the store's commit as
+/// `home_and_land_blocking` does (main 01a20182's order of 2026-11-26, the shard-blocking allow-list).
+pub(crate) async fn appended_awaited(
+  repository: RepositoryId,
+  changes: Vec<BranchChange>,
+  (sealed, moves): (&mut super::SealedPush, &[StoreMove]),
+) -> Result<Appended, crate::repository::push::AppendRefused> {
+  let _ = crate::vcs_store::commits::home_and_land(sealed).await;
+  on_state(|state| {
+    let appended = crate::repository::push::push_sealed(
+      state,
+      (&owner(), repository),
+      changes,
+      EntryParts::default(),
+      (&mut *sealed, moves),
+    );
+    if appended.is_err() {
+      sealed.release_homed(state);
+    }
+    crate::vcs_store::paths::whole_build::settle(state);
+    appended
+  })
+}
+
+/// [`push_through`] from a task of the shard ([`appended_awaited`]): the version it made.
+pub(crate) async fn push_through_awaited(
+  (repository, green): (RepositoryId, DbVolumeId),
+  objects: &[Brought],
+  (base, head, tree_id): (Option<ObjectId>, ObjectId, ObjectId),
+) -> u64 {
+  let (mut sealed, built) = on_state(|state| {
+    let push = begun(state, repository, objects);
+    let version = state.greens.get(&green).expect("the green's engine").head();
+    let built = work_of(state, (&push, green), (version, base), (head, tree_id));
+    (push.seal(state).expect("sealed"), built)
+  });
+  let changes = vec![BranchChange::Update { green, work: built }];
+  let moves = [(Target::Green(green), Some(head))];
+  let made = appended_awaited(repository, changes, (&mut sealed, &moves))
+    .await
+    .expect("appended");
+  // Committed, the push holds nothing: giving it back gives back nothing.
+  on_state(|state| sealed.abandon(state));
+  match made.changes.first() {
+    Some(BranchAppended::Moved { version, .. }) => *version,
+    other => panic!("not moved: {other:?}"),
+  }
+}
+
 /// [`push_through`] with the push's whole map left to its build's task (A-664's live whole builds), as a push leaves it
 /// when it is answered: the build is under way, not driven.
 pub(crate) fn push_unsettled(

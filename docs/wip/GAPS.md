@@ -1168,10 +1168,20 @@
 >   `test_store::SHARD_BLOCKING_ALLOWED`, each with its owner and how many sites reach it, and run their blocking body
 >   through `allowing_shard_blocking`; there is no global off-switch. The list only shrinks.
 >   **The shard-blocking allow-list: 5 fixtures** (a test holds the list's length to this figure; edit both together):
->   - `test_store::audit_on_stored_shard`: 97 sites. svn 0; git 0; hg 15 (`hg_push/tests.rs` 15);
->     other 82 (`push/tests.rs` 18, `vcs_store/tests.rs` 14, `paths/tests.rs` 11,
->     `repository.rs` 10, `commits/tests.rs` 8, `identities/tests.rs` 8, `vcs_share/grants.rs` 4,
->     `vcs_share/read_backs.rs` 3, `index_upkeep.rs` 2, `import/tests.rs` 2, `fleet.rs` 2). Moved by w-git (2026-11-25)
+>   **Taken by w-git (2026-11-26, main's order: w-shared and w-perf held on a permission prompt since 18:03): their
+>   `audit_on_stored_shard` and `test_store::create` sites, a file at a time, each landing with its counts.** w-shared's:
+>   `repository/push/tests.rs`, `repository.rs`, `vcs_share/grants.rs`, `vcs_share/read_backs.rs`, `identities/tests.rs`,
+>   `repository/import/tests.rs`, `fleet.rs`, `replica.rs`, `daemon::tests`; w-perf's: `vcs_store/tests.rs`,
+>   `vcs_store/paths/tests.rs`, `vcs_store/commits/tests.rs`, `vcs_store/index_upkeep.rs`, `vcs_store/named_objects.rs`.
+>   Edit none of them meanwhile; main assigns them back if either agent returns.
+>   - `test_store::audit_on_stored_shard`: 90 sites. svn 0; git 0; hg 15 (`hg_push/tests.rs` 15);
+>     other 75 (`push/tests.rs` 18, `vcs_store/tests.rs` 14, `paths/tests.rs` 11,
+>     `repository.rs` 10, `commits/tests.rs` 8, `identities/tests.rs` 8, `index_upkeep.rs` 2, `import/tests.rs` 2,
+>     `fleet.rs` 2). `vcs_share/grants.rs`' 4 and `read_backs.rs`' 3 moved by w-git (2026-11-26): three histories that
+>     wait on nothing to `test_store::on_a_stored_shard` (no allowance, so the guard refuses any blocking they reach),
+>     those that only create to `audit_on_stored_shard_made_all`, and the one that pushes to
+>     `test_store::run_on_stored_shard`, creating with `created().await` and landing with
+>     `vcs_store::tests::push_through_awaited` (`appended_awaited`, `commits::home_and_land` awaited). Moved by w-git (2026-11-25)
 >     to forms that make a history's repositories from the test's thread first: `git_push::tests::on_stored_shard_with`
 >     (`git_push/tests.rs` 23, `vcs_share/tests.rs` 9, `vcs_share/wait.rs` 2, `vcs_store/tests.rs` 2, `replica.rs` 1,
 >     `named_objects.rs` 1) and `test_store::audit_on_stored_shard_made_all`, any tool's (`upload/tests.rs` 12,
@@ -1182,6 +1192,19 @@
 >     2026-11-25): `vcs_http::daemon_edge`, `vcs_store::upload` and `vcs_share` reach it no more, `vcs_share`'s three
 >     Mercurial creations made from the test's thread (`hg_on`, `test_store::create_on`), one inside
 >     `audit_on_stored_shard_made_all`; and `hg_made`'s 10 made from the test's thread (w-hg, `create_on`).
+> - **Production's let-go in the stored tests (main's ruling A3 of 2026-11-26).** The stored test runners
+>   (`audit_on_stored_shard` and its configured, made and made-all forms, `run_on_stored_shard`) no longer set
+>   `vcs_store::KEEP_LANDED`, so a stored test's landed packs let go as production lets them go; a test whose point is
+>   residency keeps them by name (`test_store::keep_landed`, `keep_landed_pinned`). It brought 7 reds, all w-hg's.
+>   - Fixed, 3 in `vcs_store/hg_view/tests.rs`: the every-format oracle takes each changeset's and manifest's text from
+>     the same history imported in one call into a store of its own that lets nothing go, never from the store under
+>     test; the let-go tag test holds every object not held whole after its let-go, which its landing had already
+>     done; the name-lookup test holds each branch's door read, `mark`'s now its let-go manifest's.
+>   - Pinned, 4 in `repository/hg_push/tests.rs`, each failing "push refused: its re-base asked for bytes of its
+>     changegroup" without the pin, since a synchronous audit history cannot bring a let-go base back. They are the
+>     15-race piece's reds, unpinned when those histories move to tasks.
+>   **The landed-pack pins: 4 tests** (`test_store::LANDED_KEPT_PINNED`, a test holds its length to this figure; w-hg,
+>   until hg_push's 15 race histories move to tasks).
 >   - (`git_push::tests::carry_blocking`, 8 direct sites, and `git_push::tests::git_repository`, 41 sites: both emptied
 >     and removed by w-git, 2026-11-25. Every test that pushed through the synchronous driver (`answered`, `pushed`,
 >     `pushed_from_the_fixtures`, removed with it) pushes by awaiting: `git_push::tests::on_stored_shard_awaited` and its
@@ -14713,6 +14736,13 @@ steps of the daemon serving its port (`EDGE_SHARDS`, registered by `daemon_confi
 waits a heartbeat and looks again: stepped, it reads on; not, it gives up typed. Reds:
 `a_patient_read_waits_for_an_answer_while_its_daemon_steps` (a fixed patience of one look gives up where the patient read
 is answered three looks later) and `a_patient_read_gives_up_on_a_daemon_that_makes_no_step` (within a look and a beat).
+The SSH seat tests' `ended: false` (the 8a loop at 228d0dc97, round 4: `a_slow_push_is_reaped_when_a_new_connection_needs_its_seat`,
+`a_passphrase_pause_is_not_cut_while_a_seat_is_free`, `a_slow_push_is_not_cut_while_a_seat_is_free`, each a whole session,
+`order [94, 98, 96, 97]`, status 0): the client judged its connection ended only where its close came within its patience,
+four liveness windows. Now `Peer::ended` reads until the close itself (`read_until_closed`), each timeout read again, as
+A-745's patient reads do: the SSH edge's phase waits close a stuck session, so a stuck server still ends it, and the seat
+tests count their reaps beside. Red: `a_connection_closed_past_the_clients_patience_is_seen_ended`, a fixed patience
+judging a connection closed three timeouts later not ended, the end itself seen.
 
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 

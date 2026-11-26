@@ -7448,8 +7448,10 @@ fn tree_chained_create(depth: usize) -> (Vec<u8>, ObjectId) {
 /// (`vcs_store.git_upload.tree_deltas` past zero, `tree_deltas_most` at least one), so a clone's `open_tree` can be read
 /// against what its reads apply; and the chain built once over the whole walk, at most [`TREE_CHAIN`] deltas, each tree
 /// after the first read found in the read cache (the walk reads the newest first, so that first read applies the whole
-/// chain). Red before the fetch's read cache: 78 deltas, 0+1+...+12, every tree's chain rebuilt from its base, since the
-/// fork a fetch reads through kept no cache.
+/// chain), so `tree_deltas_past_one` is that read's all but one. Red before the fetch's read cache: 78 deltas,
+/// 0+1+...+12, every tree's chain rebuilt from its base, since the fork a fetch reads through kept no cache. Red before
+/// the fetch summed `tree_deltas_past_one` with the others: 0 counted, so git/git's leg read 0 past one over 1,810,257
+/// deltas.
 #[test]
 fn a_fetchs_tree_reads_count_the_deltas_they_apply_and_build_a_chain_once() {
   let (identity, certificate) = identity();
@@ -7472,12 +7474,24 @@ fn a_fetchs_tree_reads_count_the_deltas_they_apply_and_build_a_chain_once() {
     REPOSITORY,
     crate::vcs_store::upload::TREE_DELTAS_MOST,
   );
+  let past_one = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::upload::TREE_DELTAS_PAST_ONE,
+  );
   daemon.stop();
-  eprintln!("tree reads: {deltas} deltas applied, at most {most} in one");
+  eprintln!(
+    "tree reads: {deltas} deltas applied, at most {most} in one, {past_one} past each read's first"
+  );
   assert_eq!(fetched.0, 200);
   assert_eq!(ids_in(&fetched_pack(&fetched.1)).len(), pushed_pack_objects);
   assert!(deltas > 0, "the tree reads applied deltas: {deltas}");
   assert!(most >= 1, "one tree read applied at least one: {most}");
+  assert_eq!(
+    past_one,
+    most.saturating_sub(1),
+    "the one read building the chain applied all but its first past one"
+  );
   assert!(
     deltas <= u64::try_from(TREE_CHAIN).expect("a count"),
     "the chain built once over the walk: {deltas} deltas against {TREE_CHAIN}"
@@ -7496,6 +7510,21 @@ const SPREAD_DEPTH: usize = 12;
 /// directories. A walk reading the newest commit first meets every directory's chain in turn, interleaved, as a real
 /// clone's walk does. The request, the last commit, and the trees it holds.
 fn spread_chained_create(dirs: usize, depth: usize) -> (Vec<u8>, ObjectId, usize) {
+  spread_create(dirs, depth, Deltas::Chained)
+}
+
+/// How [`spread_create`]'s revisions of each directory are stored.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Deltas {
+  /// Each against the revision before it: one chain a directory.
+  Chained,
+  /// Each against the directory's first revision, held whole: a base every revision shares, as `git pack-objects`'s
+  /// window often deltas many of a path's revisions against one of them.
+  Star,
+}
+
+/// [`spread_chained_create`]'s history, its directories' revisions stored as `deltas` says.
+fn spread_create(dirs: usize, depth: usize, deltas: Deltas) -> (Vec<u8>, ObjectId, usize) {
   use slates_git::entry::{self, Header, Representation};
   use slates_git::object_name::Kind;
   let mut blobs: Vec<Vec<u8>> = Vec::new();
@@ -7561,10 +7590,15 @@ fn spread_chained_create(dirs: usize, depth: usize) -> (Vec<u8>, ObjectId, usize
       revisions[0].len(),
       &mut at,
     );
+    let first = base;
     for k in 1..revisions.len() {
-      let delta = slates_git::store::delta_of(&revisions[k - 1], &revisions[k]).expect("a delta");
+      let (from, against) = match deltas {
+        Deltas::Chained => (&revisions[k - 1], base),
+        Deltas::Star => (&revisions[0], first),
+      };
+      let delta = slates_git::store::delta_of(from, &revisions[k]).expect("a delta");
       base = put(
-        Representation::OfsDelta { base },
+        Representation::OfsDelta { base: against },
         &delta,
         delta.len(),
         &mut at,
@@ -7587,6 +7621,55 @@ fn spread_chained_create(dirs: usize, depth: usize) -> (Vec<u8>, ObjectId, usize
   pktline::write(Packet::Flush, &mut request).expect("the flush");
   request.extend_from_slice(&pack);
   (request, tip, trees)
+}
+
+/// Main's order of 2026-11-26 (the eviction order needs what a fetch's tree reads inflate whole, against the distinct
+/// bases `git verify-pack -v` finds in the pack offline). Do: push [`spread_create`] of [`SPREAD_DIRS`] directories
+/// [`SPREAD_DEPTH`] revisions deep, each directory's revisions (and the root's) a delta against its first
+/// ([`Deltas::Star`]); fetch its last commit. Expect: `200`, the pack whole; `tree_bases_inflated` at least the
+/// fixture's distinct bases (one a directory and the root's, known from its construction: the floor, every base kept),
+/// and every read that found nothing kept inflating its root (a star's chain is one step, so a read either finds its
+/// tree or its base kept, or inflates the base), its headroom over the floor those reads past each base's first. Red
+/// before the count: 0. Kept oldest-laid first it read 44 (9 first reads and 35 bases given back while their
+/// revisions were still read).
+#[test]
+fn a_fetchs_tree_reads_count_the_bases_they_inflate_whole() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, tip, trees) = spread_create(SPREAD_DIRS, SPREAD_DEPTH, Deltas::Star);
+  let pushed_pack_objects = {
+    let (_, commands_end) = packets_from(&request, 0);
+    ids_in(&request[commands_end..]).len()
+  };
+  assert_git_pushed(&pushed(edge, &name, &request));
+  let fetched = uploaded(edge, &name, &fetch_of(tip));
+  let read = |counter| counted_on(&daemon, REPOSITORY, counter);
+  let (inflated, hits) = (
+    read(crate::vcs_store::upload::TREE_BASES_INFLATED),
+    read(crate::vcs_store::upload::READ_CACHE_HITS),
+  );
+  daemon.stop();
+  let distinct = u64::try_from(SPREAD_DIRS.saturating_add(1)).expect("a count");
+  let trees = u64::try_from(trees).expect("a count");
+  eprintln!(
+    "{trees} star tree reads: {inflated} bases inflated, {distinct} distinct, {hits} read cache hits"
+  );
+  assert_eq!(fetched.0, 200);
+  assert_eq!(ids_in(&fetched_pack(&fetched.1)).len(), pushed_pack_objects);
+  assert!(
+    inflated >= distinct,
+    "each base inflated at least once: {inflated} of {distinct}"
+  );
+  assert_eq!(
+    inflated,
+    trees.saturating_sub(hits),
+    "every read finding nothing kept inflated its base"
+  );
 }
 
 /// Main 01a20182's reading of 2026-11-25: on git/git the fetch's read cache cut chain rebuilds by 2.1 % (2,047,136

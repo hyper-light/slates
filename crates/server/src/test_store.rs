@@ -394,9 +394,9 @@ pub(crate) async fn imported_through_the_verb(
 /// (milliseconds), so only an import that never ends reaches it.
 const IMPORT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// `history` run as a task on the first shard of a daemon keeping a store, its landed packs kept resident: what
-/// [`audit_on_stored_shard`] runs, with every store wait in it awaited, never the shard's thread held through one
-/// ([`SHARD_BLOCKING_ALLOWED`]).
+/// `history` run as a task on the first shard of a daemon keeping a store, its landed packs let go as production lets
+/// them go: what [`audit_on_stored_shard`] runs, with every store wait in it awaited, never the shard's thread held
+/// through one ([`SHARD_BLOCKING_ALLOWED`]).
 pub(crate) fn run_on_stored_shard<
   T: Send + 'static,
   F: std::future::Future<Output = T> + 'static,
@@ -404,7 +404,6 @@ pub(crate) fn run_on_stored_shard<
   history: impl FnOnce() -> F + Clone + Send + 'static,
 ) -> T {
   let (store, daemon) = audit_daemon_stored();
-  keep_landed(&daemon);
   let answer = run_on_first(&daemon, history, HISTORY_PATIENCE);
   daemon.stop();
   drop(store);
@@ -413,7 +412,7 @@ pub(crate) fn run_on_stored_shard<
 
 /// Shape: how long [`run_on_stored_shard`]'s history may run: far past a debug build's (seconds), so only one that never
 /// ends reaches it.
-const HISTORY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) const HISTORY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// [`created`] from the test's thread, on `daemon`'s shard of partition `partition`.
 pub(crate) fn create_on(
@@ -466,8 +465,8 @@ pub(crate) fn create_on(
 pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   Allowed {
     fixture: "test_store::audit_on_stored_shard",
-    owner: "each history's (GAPS: svn 0, git 0, hg 15, other 82)",
-    reaching: 97,
+    owner: "each history's (GAPS: svn 0, git 0, hg 15, other 75)",
+    reaching: 90,
   },
   Allowed {
     fixture: "test_store::create",
@@ -607,8 +606,7 @@ pub(crate) fn audit_on_stored_shard<T: Send + 'static>(
 /// [`audit_on_stored_shard`] for a history that begins by making a repository: `asked` is made first, by `principal`, as
 /// a client's creation is made, the test's thread waiting for its record ([`create_on`]); then `history` runs on the
 /// shard with the repository's id and its root green. The shard is never held through the creation's commit
-/// (docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md), and the history keeps its landed
-/// packs resident, as [`audit_on_stored_shard`]'s does.
+/// (docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md).
 pub(crate) fn audit_on_stored_shard_made<T: Send + 'static>(
   (principal, asked): (&slates_db::catalog::Principal, Asked<'_>),
   history: impl FnOnce(
@@ -623,9 +621,23 @@ pub(crate) fn audit_on_stored_shard_made<T: Send + 'static>(
   + 'static,
 ) -> T {
   let (store, daemon) = audit_daemon_stored();
-  keep_landed(&daemon);
   let made = create_on(&daemon, 0, principal, asked);
   let answer = crate::daemon::observe_first(&daemon, move |state| history(state, made));
+  daemon.stop();
+  drop(store);
+  answer
+}
+
+/// [`audit_on_stored_shard`] for a history that waits on nothing: run on a stored daemon's first shard with no
+/// allowance, so a blocking helper it reached would be refused ([`refuse_on_a_shard`]) rather than hold the shard (main
+/// 01a20182's order of 2026-11-26, the shard-blocking allow-list: a history that only reads and sets the shard's state
+/// needs none).
+pub(crate) fn on_a_stored_shard<T: Send + 'static>(
+  history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+) -> T {
+  let (store, daemon) = audit_daemon_stored();
+  keep_landed(&daemon);
+  let answer = crate::daemon::observe_first(&daemon, move |state| history(state));
   daemon.stop();
   drop(store);
   answer
@@ -648,7 +660,6 @@ pub(crate) fn audit_on_stored_shard_made_all<T: Send + 'static, const N: usize>(
   + 'static,
 ) -> T {
   let (store, daemon) = audit_daemon_stored();
-  keep_landed(&daemon);
   let made = asked.map(|asked| create_on(&daemon, 0, principal, asked));
   let answer = crate::daemon::observe_first(&daemon, move |state| history(state, made));
   daemon.stop();
@@ -665,9 +676,9 @@ pub(crate) fn audit_on_stored_shard_configured<T: Send + 'static>(
 ) -> T {
   let store = TestStore::start(name);
   let handle = store.handle();
-  // A synchronous history brings no let-go window back, so its landed packs stay resident (`vcs_store::KEEP_LANDED`).
+  // Its landed packs let go as production lets them go (main's ruling A3 of 2026-11-26): a test whose point is
+  // residency keeps them by name ([`keep_landed`]).
   let kept = move |state: &mut crate::state::ShardState| {
-    crate::vcs_store::KEEP_LANDED.with(|keep| keep.set(true));
     // A whole synchronous history on the shard, its creations and landings waited for on the shard's thread: allow-listed
     // until each owner's histories move to `audit_on_stored_shard_made` or a task that awaits (SHARD_BLOCKING_ALLOWED).
     allowing_shard_blocking("test_store::audit_on_stored_shard", || history(state))
@@ -678,6 +689,55 @@ pub(crate) fn audit_on_stored_shard_configured<T: Send + 'static>(
   });
   drop(store);
   answer
+}
+
+/// The tests that keep their landed packs resident by name ([`keep_landed_pinned`]), each until the piece that moves it
+/// (main's ruling of 2026-11-26: the stored runners let packs go as production does, and a test that cannot yet is
+/// named here with its owner). The list only shrinks: its length is the figure GAPS records ("The landed-pack pins"),
+/// held by a test.
+pub(crate) const LANDED_KEPT_PINNED: &[Pinned] = &[
+  Pinned {
+    test: "repository::hg_push::tests::a_stock_push_lands_on_the_rebuilt_repository_as_7_2_answered_it",
+    owner: "w-hg",
+    until: "hg_push's 15 race histories moved to tasks",
+  },
+  Pinned {
+    test: "repository::hg_push::tests::a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race",
+    owner: "w-hg",
+    until: "hg_push's 15 race histories moved to tasks",
+  },
+  Pinned {
+    test: "repository::hg_push::tests::two_pushes_taken_side_by_side_both_land",
+    owner: "w-hg",
+    until: "hg_push's 15 race histories moved to tasks",
+  },
+  Pinned {
+    test: "repository::hg_push::tests::a_push_is_refused_when_a_green_it_only_checked_moved",
+    owner: "w-hg",
+    until: "hg_push's 15 race histories moved to tasks",
+  },
+];
+
+/// A test keeping its landed packs resident by name ([`LANDED_KEPT_PINNED`]): its path, whose it is, and the piece that
+/// unpins it.
+#[derive(Debug)]
+pub(crate) struct Pinned {
+  /// The test, by its path under the crate.
+  pub(crate) test: &'static str,
+  /// Whose test it is.
+  pub(crate) owner: &'static str,
+  /// The piece that unpins it.
+  pub(crate) until: &'static str,
+}
+
+/// Keeps the landed packs of the shard this runs on resident (`vcs_store::KEEP_LANDED`) for `test`, one of
+/// [`LANDED_KEPT_PINNED`]: refused for a test not in it. Called at the start of the test's history on its shard.
+pub(crate) fn keep_landed_pinned(test: &'static str) {
+  assert!(
+    LANDED_KEPT_PINNED.iter().any(|pinned| pinned.test == test),
+    "{test} keeps its landed packs resident only by name (test_store::LANDED_KEPT_PINNED)"
+  );
+  crate::vcs_store::KEEP_LANDED.with(|keep| keep.set(true));
 }
 
 /// Keeps a push's landed pack resident on `daemon`'s first shard (`vcs_store::KEEP_LANDED`): for a test whose history
@@ -1147,6 +1207,38 @@ pub(crate) fn rebuild_after_takeover(
 /// Main's ruling (a) of 2026-11-25, condition 2: the shard-blocking allow-list only shrinks. Do: read the figure GAPS
 /// records for it ("The shard-blocking allow-list: N fixtures"). Expect: the list holds exactly that many, each named
 /// once with an owner and a count of the sites reaching it, so an entry added is a GAPS edit made in the same review.
+/// Main's ruling of 2026-11-26 (KEEP_LANDED off the default runners): the landed-pack pins only shrink. Do: read the
+/// figure GAPS records for them ("The landed-pack pins: N tests"). Expect the list holds exactly that many, each named
+/// once with its owner and the piece that unpins it.
+#[test]
+fn the_landed_pack_pins_hold_the_figure_gaps_records() {
+  const GAPS: &str = include_str!("../../../docs/wip/GAPS.md");
+  const LINE: &str = "**The landed-pack pins: ";
+  let recorded = GAPS
+    .lines()
+    .find_map(|line| line.split_once(LINE))
+    .and_then(|(_, rest)| rest.split_once(" tests**"))
+    .map(|(figure, _)| figure.parse::<usize>())
+    .expect("GAPS records the pins' figure")
+    .expect("a whole number");
+  assert_eq!(
+    LANDED_KEPT_PINNED.len(),
+    recorded,
+    "edit the pins and GAPS together"
+  );
+  for pinned in LANDED_KEPT_PINNED {
+    let named = LANDED_KEPT_PINNED
+      .iter()
+      .filter(|other| other.test == pinned.test)
+      .count();
+    assert_eq!(named, 1, "{pinned:?} listed once");
+    assert!(
+      !pinned.owner.is_empty() && !pinned.until.is_empty(),
+      "{pinned:?} carries its owner and its piece"
+    );
+  }
+}
+
 #[test]
 fn the_shard_blocking_allow_list_holds_the_figure_gaps_records() {
   const GAPS: &str = include_str!("../../../docs/wip/GAPS.md");

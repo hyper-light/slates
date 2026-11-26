@@ -285,7 +285,8 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
 /// Mercurial resolves a branch's name to its tip-most head; `v1` the first changeset, made from `mark`, the bookmark that
 /// heads it; `mid` refused `Unsupported`, since no line or bookmark heads it; and `nope` `NotFound`. Since A-767 C1
 /// (main's ruling (A)) a name that reaches the tags has the heads' `.hgtags` read from the changeset store at the verb's
-/// door first: none read before the head names a `.hgtags`, then one read each for `default` and `v1`.
+/// door first: a read for `default` and for `v1`, none for `tip`. And `mark`'s from `default` reads its head's manifest,
+/// let go once its push landed as production lets one go, to learn that it names no `.hgtags` yet.
 #[test]
 fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
   use slates_ipc::protocol::Refusal;
@@ -306,7 +307,7 @@ fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
       ("second", "b", b"b\n", Some(0), "default"),
       ("Added tags", ".hgtags", tags, Some(1), "default"),
     ]);
-    let reads = core::cell::Cell::new(0);
+    let reads = core::cell::RefCell::new(Vec::new());
     let branch = async |name: &str, from: &str| {
       let (reply, read) = crate::vcs_store::hg_tags::dispatch_awaited(
         &owner(),
@@ -318,13 +319,12 @@ fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
         },
       )
       .await;
-      reads.set(reads.get() + u32::from(read));
+      reads.borrow_mut().push((name.to_owned(), read));
       reply
     };
     pushed(hg, &made, &[0]).await;
     let mark = branch("mark", "default").await;
     assert!(matches!(mark, ReplyBody::GreenCreated { .. }), "{mark:?}");
-    assert_eq!(reads.get(), 0, "no head named a .hgtags revision yet");
     pushed(hg, &made, &[1, 2]).await;
     let mut replies: Vec<ReplyBody> = Vec::new();
     for (name, from) in [
@@ -362,8 +362,25 @@ fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
       ),
       "{marks:?}"
     );
-    // `default` and `v1` reach the tags, read from the changeset store before each runs (A-767 C1); `tip` never.
-    assert_eq!(reads.get(), 2, "the tags read for `default` and `v1`");
+    // `default` and `v1` reach the tags, read from the changeset store before each runs (A-767 C1); `tip` never. `mark`'s
+    // read is its head's manifest, let go once its push landed, read back to learn it names no `.hgtags` yet.
+    let read = |name: &str| {
+      reads
+        .borrow()
+        .iter()
+        .find(|(made, _)| made == name)
+        .map(|(_, read)| *read)
+    };
+    assert_eq!(
+      [
+        read("mark"),
+        read("from-default"),
+        read("from-tip"),
+        read("from-v1")
+      ],
+      [Some(true), Some(true), Some(false), Some(true)],
+      "the tags read where a name reaches them, never for `tip`"
+    );
     let mid = branch("from-mid", "mid").await;
     assert!(
       matches!(
@@ -435,18 +452,18 @@ fn a_branch_from_a_tag_whose_heads_manifests_were_let_go_reads_them_once_and_is_
               .map(|row| row.bytes)
           });
           let objects = changesets.chain(manifests).collect::<Option<Vec<_>>>()?;
-          Some(
-            objects
-              .iter()
-              .filter(|object| content.let_go_object(object) > 0)
-              .count(),
-          )
+          for object in &objects {
+            content.let_go_object(object);
+          }
+          Some(objects.iter().all(|object| !content.holds_whole(object)))
         })
       })
     });
-    assert!(
-      let_go.is_some_and(|count| count > 0),
-      "objects let go: {let_go:?}"
+    // Let go by its landing as production lets a landed text go, or by this let-go where the landing kept it.
+    assert_eq!(
+      let_go,
+      Some(true),
+      "every changelog and manifest object let go"
     );
     let (from_v1, read) = branch("from-v1", "v1").await;
     assert!(
@@ -665,12 +682,14 @@ fn a_replays_ask_past_a_step_is_copied_a_step_a_request() {
   });
 }
 
-/// What a revision's text must be, as its writer kept it: a changeset's or a manifest's text whole; a file revision's
-/// by the identities its row names (its bytes' BLAKE3 and its metadata block's), since a landed file's text leaves the
-/// content store once its writer lands it (goal 93 item 2b(b)) and its row's names are what the writer kept.
+/// What a revision's text must be: a changeset's or a manifest's text whole, as the same history imported in one call
+/// into a content store of its own holds it ([`one_call_texts`]); a file revision's by the identities its row names
+/// (its bytes' BLAKE3 and its metadata block's). A landed text leaves the node's content store once its writer lands it
+/// (goal 93 item 2b(b), and every stored test's landing since main's ruling A3 of 2026-11-26), so no text the store
+/// makes is checked against the store itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Kept {
-  /// The text.
+  /// A changeset's or a manifest's text.
   Text(Vec<u8>),
   /// A file revision's names.
   File(slates_hg::push::verify::FileNames),
@@ -694,30 +713,23 @@ impl Kept {
 fn every_revision(
   state: &mut ShardState,
   id: RepositoryId,
+  texts: &std::collections::BTreeMap<slates_hg::Node, Vec<u8>>,
 ) -> Vec<(Vec<u8>, slates_hg::Node, Kept)> {
   use slates_hg::push::intake::{CHANGELOG_PATH, MANIFEST_PATH};
   use slates_hg::push::verify::Held;
   let mut room = Admission::new(ROOM);
+  let text_of =
+    |node: &slates_hg::Node| Kept::Text(texts.get(node).expect("a text of the node").clone());
   crate::vcs_store::lent_state(state, |state| {
-    super::with_view(state, id, &mut room, |view, held, room| {
+    super::with_view(state, id, &mut room, |view, held, _| {
       let mut revisions = Vec::new();
       for rev in 0..view.count() {
         let node = view.node(rev).unwrap();
-        let text = view
-          .changeset_text(rev, room)
-          .unwrap()
-          .unwrap()
-          .into_owned();
-        revisions.push((CHANGELOG_PATH.to_vec(), node, Kept::Text(text)));
+        revisions.push((CHANGELOG_PATH.to_vec(), node, text_of(&node)));
       }
       let mut position = 0;
       while let Some(linked) = view.manifest_linked(position) {
-        let logged = view.manifest(&linked.node, room).unwrap().unwrap();
-        revisions.push((
-          MANIFEST_PATH.to_vec(),
-          linked.node,
-          Kept::Text(logged.text.into_owned()),
-        ));
+        revisions.push((MANIFEST_PATH.to_vec(), linked.node, text_of(&linked.node)));
         position += 1;
       }
       let mut at = (Vec::new(), 0);
@@ -732,6 +744,38 @@ fn every_revision(
   })
   .expect("the view lent")
 }
+
+/// Every changeset's and manifest's text of `files`, imported in one call into a content store of its own that lets
+/// nothing go (`slates_hg::import::import`), by node: the oracle [`every_revision`] holds the store's texts to.
+fn one_call_texts(files: Files) -> std::collections::BTreeMap<slates_hg::Node, Vec<u8>> {
+  use slates_hg::index::Log;
+  let (mut host, repository) = crate::hg_base::tests::laid_out(files.iter().copied());
+  let mut store = slates_vcs::ContentStore::new(ROOM, ONE_CALL_WINDOW).expect("a content store");
+  let mut base = crate::hg_base::HgBase::new(&mut host, repository);
+  let imported =
+    slates_hg::import::import(&mut base, &mut store, Admission::new(ROOM)).expect("imported");
+  let index = &imported.index;
+  let mut texts = std::collections::BTreeMap::new();
+  for rev in 0..index.len(&store, Log::Changelog) {
+    let row = index.changeset(&store, rev).expect("a changeset");
+    let text = store.object_bytes(&row.text, row.len).expect("its text");
+    texts.insert(row.node, text);
+  }
+  for rev in 0..index.len(&store, Log::Manifest) {
+    let node = index
+      .revision(&store, Log::Manifest, rev)
+      .expect("a manifest")
+      .node;
+    let text = index
+      .revision_text(&store, Log::Manifest, rev)
+      .expect("its text");
+    texts.insert(node, text);
+  }
+  texts
+}
+
+/// Shape: the content store's window [`one_call_texts`] imports into: any, since it lets nothing go.
+const ONE_CALL_WINDOW: usize = 1 << 16;
 
 /// What the node's store keeps of `revisions` in repository `id`: how many it keeps as an edit against a base, and each
 /// text made whole from its chain (`StoreHandle::texts_by_tool`, then `hg_view::texts_made`).
@@ -892,7 +936,8 @@ fn every_text_both_writers_keep_is_made_whole_by_the_store_in_every_format() {
       let imported_name = format!("{name}-imported");
       let imported_id = created(&imported_name, VcsTool::Mercurial).await;
       imported(request, (&imported_name, imported_id), files).await;
-      let revisions = on(|state| every_revision(state, imported_id));
+      let texts = one_call_texts(files);
+      let revisions = on(|state| every_revision(state, imported_id, &texts));
       let made_as_kept = |made: &[Vec<u8>]| {
         made.len() == revisions.len()
           && made
@@ -906,7 +951,7 @@ fn every_text_both_writers_keep_is_made_whole_by_the_store_in_every_format() {
       let pushed_id = created(&format!("{name}-pushed"), VcsTool::Mercurial).await;
       push_part(pushed_id, changegroup).await;
       assert_eq!(
-        on(|state| every_revision(state, pushed_id)),
+        on(|state| every_revision(state, pushed_id, &texts)),
         revisions,
         "{name}: the push holds the import's history"
       );
