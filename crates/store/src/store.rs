@@ -23,6 +23,8 @@
 
 mod payloads;
 
+use std::borrow::Cow;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 
 use hyper_block::block::BlockFile;
@@ -33,8 +35,6 @@ use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
 use slates_land::store_root::{StoreRoot, StoreRootRefusal};
-
-use std::borrow::Cow;
 
 use crate::log::{
   Appending, ChangesetLog, Header, Located, LogError, SectionKind, identity_of_range, sections_in,
@@ -206,6 +206,60 @@ pub struct Changeset {
   pub work: u64,
 }
 
+/// A verified landed payload range: its offset and length in the log, and its expected BLAKE3 identity.
+type VerifiedKey = (u64, u64, Identity);
+
+/// Bounded FIFO cache of landed payload ranges already authenticated against their expected BLAKE3
+/// identity, preventing O(N^2) re-hashing across sequential multi-piece reads while bounding memory.
+#[derive(Debug)]
+struct VerifiedPayloads {
+  /// Maximum entries retained, derived from `sizing.memory / PIECE_BYTES` (at least 1).
+  capacity: usize,
+  /// Insertion order for FIFO eviction.
+  order: VecDeque<VerifiedKey>,
+  /// O(1) membership index mirroring `order`.
+  entries: HashSet<VerifiedKey>,
+  /// Non-vacuity counter: total full BLAKE3 payload verifications performed.
+  verifications: u64,
+}
+
+impl VerifiedPayloads {
+  /// Derived: one verified-payload entry per [`PIECE_BYTES`] read unit in `memory` (at least 1 so
+  /// sequential multi-piece reads of any single payload hash it once), bounding cache memory under
+  /// `2 * size_of::<VerifiedKey>() / PIECE_BYTES` (< 0.15%) of `memory`.
+  fn new(memory: usize) -> Self {
+    let capacity = memory.checked_div(PIECE_BYTES).unwrap_or(0).max(1);
+    Self {
+      capacity,
+      order: VecDeque::new(),
+      entries: HashSet::new(),
+      verifications: 0,
+    }
+  }
+
+  fn contains(&self, key: &VerifiedKey) -> bool {
+    self.entries.contains(key)
+  }
+
+  fn record_verified(&mut self, key: VerifiedKey) {
+    self.verifications = self.verifications.saturating_add(1);
+    if self.entries.contains(&key) {
+      return;
+    }
+    if self.order.len() >= self.capacity
+      && let Some(oldest) = self.order.pop_front()
+    {
+      self.entries.remove(&oldest);
+    }
+    self.order.push_back(key);
+    self.entries.insert(key);
+  }
+
+  fn verifications(&self) -> u64 {
+    self.verifications
+  }
+}
+
 /// The store, open.
 #[derive(Debug)]
 pub struct Store {
@@ -216,6 +270,10 @@ pub struct Store {
   value: Vec<u8>,
   /// The standing grant its directory is written under, as first recorded.
   grant: GrantRow,
+  /// Bounded cache of landed payload ranges whose full BLAKE3 identity was verified on read.
+  verified_payloads: VerifiedPayloads,
+  /// Corrupt changeset rows encountered and skipped during checkpoint indexing or row replacement.
+  corrupt_rows_skipped: u64,
   /// The log reads that answered places ([`Store::places_bytes`]): the counter its coalescing is held to.
   place_reads: u64,
   /// The engine reads (a lookup, or a page of a scan) that answered versions by their tool ids
@@ -251,21 +309,32 @@ impl Store {
     } else {
       (ShardDb::create(rows_file, config, mem_limit, trunk)?, 0)
     };
-    payloads::index_checkpoint(&mut rows, &log_file, applied, config.page_size)?;
+    let mut corrupt_rows_skipped =
+      payloads::index_checkpoint(&mut rows, &log_file, applied, config.page_size)?;
+    let expected_grant = grant_id(root.grant().target.device, root.grant().target.inode);
     let mut replayed = Ok(());
     let mut value = Vec::new();
     let mut buffer = Vec::new();
-    let log = ChangesetLog::recover(log_file, applied, |file, located| {
-      if replayed.is_ok() {
-        replayed = put_rows_from_log(&mut rows, file, located, (&mut value, &mut buffer));
-      }
-    })?;
+    let log =
+      ChangesetLog::recover_for_grant(log_file, applied, Some(expected_grant), |file, located| {
+        if replayed.is_ok() {
+          replayed = put_rows_from_log(
+            &mut rows,
+            file,
+            located,
+            (&mut value, &mut buffer),
+            &mut corrupt_rows_skipped,
+          );
+        }
+      })?;
     replayed?;
     let mut store = Self {
       root,
       log,
       rows,
       value,
+      verified_payloads: VerifiedPayloads::new(sizing.memory),
+      corrupt_rows_skipped,
       place_reads: 0,
       tool_reads: 0,
       grant: GrantRow {
@@ -282,6 +351,16 @@ impl Store {
   /// The standing grant the store's directory is written under, as first recorded (its `G` row).
   pub fn grant(&self) -> &GrantRow {
     &self.grant
+  }
+
+  /// Full BLAKE3 payload verifications performed by [`Store::piece`] so far (non-vacuity counter).
+  pub fn payload_verifications(&self) -> u64 {
+    self.verified_payloads.verifications()
+  }
+
+  /// Corrupt changeset rows logged and skipped during checkpoint indexing or changeset replacement.
+  pub fn corrupt_rows_skipped(&self) -> u64 {
+    self.corrupt_rows_skipped
   }
 
   /// The log reads that answered places so far ([`Store::places_bytes`]).
@@ -393,6 +472,7 @@ impl Store {
       self.log.file(),
       located,
       (&mut self.value, &mut buffer),
+      &mut self.corrupt_rows_skipped,
     )
   }
 
@@ -429,7 +509,13 @@ impl Store {
       }
       record.commit()?
     };
-    if !put_changeset(&mut self.rows, self.log.file(), &located, &mut self.value)? {
+    if !put_changeset_counted(
+      &mut self.rows,
+      self.log.file(),
+      &located,
+      &mut self.value,
+      &mut self.corrupt_rows_skipped,
+    )? {
       return Ok(located);
     }
     for (kind, contents) in sections {
@@ -483,21 +569,13 @@ impl Store {
     if landed_len != len || offset >= landed_len {
       return Ok(None);
     }
-    let left = landed_len.checked_sub(offset).ok_or(StoreError::BadRow)?;
-    let take =
-      usize::try_from(left.min(u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?))
-        .map_err(|_| StoreError::BadRow)?;
-    let mut bytes = vec![0u8; take];
-    self.log.read_at(
-      &mut bytes,
-      at.checked_add(offset).ok_or(StoreError::BadRow)?,
+    let bytes = read_verified_piece(
+      &self.log,
+      &mut self.verified_payloads,
+      identity,
+      (at, landed_len),
+      offset,
     )?;
-    if offset == 0
-      && u64::try_from(bytes.len()).ok() == Some(landed_len)
-      && *blake3::hash(&bytes).as_bytes() != *identity
-    {
-      return Err(StoreError::Log(LogError::Corrupt("a payload's bytes")));
-    }
     Ok(Some(Cow::Owned(bytes)))
   }
 
@@ -770,6 +848,108 @@ fn changeset_key(repository: u128, sequence: u64) -> [u8; KEY_BYTES] {
   key
 }
 
+/// Reads `take` raw bytes from `log` at `offset` within its committed prefix.
+fn read_piece_raw<F: BlockFile>(
+  log: &ChangesetLog<F>,
+  offset: u64,
+  take: usize,
+) -> Result<Vec<u8>, StoreError> {
+  let mut bytes = vec![0u8; take];
+  log.read_at(&mut bytes, offset)?;
+  Ok(bytes)
+}
+
+/// Copies the intersection of chunk `[done, chunk_end)` and requested window `[offset, req_end)`
+/// from `slice` into `out`.
+fn capture_overlap(
+  slice: &[u8],
+  (done, chunk_end): (u64, u64),
+  (offset, req_end): (u64, u64),
+  out: &mut Vec<u8>,
+) -> Result<(), StoreError> {
+  let copy_start = done.max(offset);
+  let copy_end = chunk_end.min(req_end);
+  if copy_start >= copy_end {
+    return Ok(());
+  }
+  let local_start =
+    usize::try_from(copy_start.saturating_sub(done)).map_err(|_| StoreError::BadRow)?;
+  let local_end = usize::try_from(copy_end.saturating_sub(done)).map_err(|_| StoreError::BadRow)?;
+  let part = slice
+    .get(local_start..local_end)
+    .ok_or(StoreError::BadRow)?;
+  out.extend_from_slice(part);
+  Ok(())
+}
+
+/// Streams `[at, at + landed_len)` through BLAKE3 in [`PIECE_BYTES`] reads (enforcing the committed
+/// log boundary via [`ChangesetLog::read_at`]) while capturing `[offset, offset + take)` in a single
+/// pass, returning [`LogError::Corrupt`] before exposing any byte on identity mismatch.
+fn stream_verify_and_capture<F: BlockFile>(
+  log: &ChangesetLog<F>,
+  identity: &Identity,
+  (at, landed_len): (u64, u64),
+  (offset, take): (u64, usize),
+) -> Result<Vec<u8>, StoreError> {
+  let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
+  let req_end = offset
+    .checked_add(u64::try_from(take).map_err(|_| StoreError::BadRow)?)
+    .ok_or(StoreError::BadRow)?;
+  let mut out = Vec::with_capacity(take);
+  let mut chunk_buf = vec![0u8; PIECE_BYTES];
+  let mut hasher = blake3::Hasher::new();
+  let mut done = 0u64;
+  while done < landed_len {
+    let left = landed_len.checked_sub(done).ok_or(StoreError::BadRow)?;
+    let step = usize::try_from(left.min(piece_cap)).map_err(|_| StoreError::BadRow)?;
+    let slice = chunk_buf.get_mut(..step).ok_or(StoreError::BadRow)?;
+    log.read_at(slice, at.checked_add(done).ok_or(StoreError::BadRow)?)?;
+    hasher.update(slice);
+    let chunk_end = done
+      .checked_add(u64::try_from(step).map_err(|_| StoreError::BadRow)?)
+      .ok_or(StoreError::BadRow)?;
+    capture_overlap(slice, (done, chunk_end), (offset, req_end), &mut out)?;
+    done = chunk_end;
+  }
+  if *hasher.finalize().as_bytes() != *identity {
+    return Err(StoreError::Log(LogError::Corrupt("a payload's bytes")));
+  }
+  if out.len() != take {
+    return Err(StoreError::BadRow);
+  }
+  Ok(out)
+}
+
+/// Reads one piece (at most [`PIECE_BYTES`] from `offset`) of a landed payload at `(at, landed_len)`,
+/// authenticating the entire payload against `identity` on a [`VerifiedPayloads`] cache miss before
+/// returning any byte.
+fn read_verified_piece<F: BlockFile>(
+  log: &ChangesetLog<F>,
+  verified: &mut VerifiedPayloads,
+  identity: &Identity,
+  (at, landed_len): (u64, u64),
+  offset: u64,
+) -> Result<Vec<u8>, StoreError> {
+  let left = landed_len.checked_sub(offset).ok_or(StoreError::BadRow)?;
+  let take = usize::try_from(left.min(u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?))
+    .map_err(|_| StoreError::BadRow)?;
+  let key = (at, landed_len, *identity);
+  if verified.contains(&key) {
+    return read_piece_raw(log, at.checked_add(offset).ok_or(StoreError::BadRow)?, take);
+  }
+  if offset == 0 && u64::try_from(take).ok() == Some(landed_len) {
+    let bytes = read_piece_raw(log, at, take)?;
+    if *blake3::hash(&bytes).as_bytes() != *identity {
+      return Err(StoreError::Log(LogError::Corrupt("a payload's bytes")));
+    }
+    verified.record_verified(key);
+    return Ok(bytes);
+  }
+  let bytes = stream_verify_and_capture(log, identity, (at, landed_len), (offset, take))?;
+  verified.record_verified(key);
+  Ok(bytes)
+}
+
 /// Puts every row of the committed record `located`, its sections read back from `file`: the `C` row, a `P` row for each
 /// payload (its identity hashed from the log), the `T`/`H` rows of its `Texts`. One function for a recovery's replay and
 /// for [`Store::applied`], so a record is indexed the same whichever way it landed.
@@ -778,8 +958,9 @@ fn put_rows_from_log<F: BlockFile>(
   file: &F,
   located: &Located,
   (value, buffer): (&mut Vec<u8>, &mut Vec<u8>),
+  corrupt_rows_skipped: &mut u64,
 ) -> Result<(), StoreError> {
-  if !put_changeset(rows, file, located, value)? {
+  if !put_changeset_counted(rows, file, located, value, corrupt_rows_skipped)? {
     return Ok(());
   }
   for section in sections_in(file, located)? {
@@ -803,13 +984,27 @@ fn put_rows_from_log<F: BlockFile>(
   Ok(())
 }
 
-/// Names this record at its sequence and releases the payload places of any record it replaces.
-/// Returns false when a later landing already owns the sequence, so retrying the older apply writes no rows.
+/// Test-compatible wrapper for [`put_changeset_counted`] used by `payloads::tests`.
+#[cfg(test)]
 fn put_changeset<F: BlockFile>(
   rows: &mut ShardDb<F>,
   file: &F,
   located: &Located,
   value: &mut Vec<u8>,
+) -> Result<bool, StoreError> {
+  let mut skipped = 0u64;
+  put_changeset_counted(rows, file, located, value, &mut skipped)
+}
+
+/// Names this record at its sequence and releases the payload places of any record it replaces,
+/// logging and counting any replaced row whose prior log entry no longer verifies.
+/// Returns false when a later landing already owns the sequence, so retrying the older apply writes no rows.
+fn put_changeset_counted<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  file: &F,
+  located: &Located,
+  value: &mut Vec<u8>,
+  corrupt_rows_skipped: &mut u64,
 ) -> Result<bool, StoreError> {
   let header = &located.header;
   let key = changeset_key(header.repository, header.sequence);
@@ -830,7 +1025,16 @@ fn put_changeset<F: BlockFile>(
             Ok(())
           },
         ) {
-          Ok(()) | Err(StoreError::Log(LogError::Corrupt(_))) => {}
+          Ok(()) => {}
+          Err(StoreError::Log(LogError::Corrupt(what))) => {
+            *corrupt_rows_skipped = corrupt_rows_skipped.saturating_add(1);
+            slates_machine::log_line!(
+              "slates-store: put_changeset skipped corrupt replaced changeset row repo={} seq={} offset={} ({what})",
+              previous.repository,
+              previous.sequence,
+              previous.offset
+            );
+          }
           Err(error) => return Err(error),
         }
       }

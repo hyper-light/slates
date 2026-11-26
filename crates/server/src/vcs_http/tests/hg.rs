@@ -320,7 +320,9 @@ fn request(method: &str, target: &str, fields: &[&str]) -> Vec<u8> {
 /// A refusal's status and fields, or `None` for a served or moved request.
 fn refusal<E>(decided: &Decided<E>) -> Option<(Status, Fields)> {
   match &decided.answer {
-    Answer::Refuse { status, fields } => Some((*status, fields.clone())),
+    Answer::Refuse { status, fields } | Answer::RefuseWithBody { status, fields, .. } => {
+      Some((*status, fields.clone()))
+    }
     Answer::Serve { .. } | Answer::Move { .. } => None,
   }
 }
@@ -568,7 +570,7 @@ fn a_request_for_a_repository_another_shard_holds_moves_there_once_proven() {
     let refused = refusal(&decided).map(|(status, _)| status);
     let moved = match &decided.answer {
       Answer::Move { shard } => Some(*shard),
-      Answer::Serve { .. } | Answer::Refuse { .. } => None,
+      Answer::Serve { .. } | Answer::Refuse { .. } | Answer::RefuseWithBody { .. } => None,
     };
     (moved, refused, decided.proven)
   };
@@ -627,7 +629,9 @@ fn served<S: HgStores + Clone>(
       assert!(fields.is_empty() && !head_only);
       exchange
     }
-    Answer::Refuse { status, .. } => panic!("{method} {target} refused {status:?}"),
+    Answer::Refuse { status, .. } | Answer::RefuseWithBody { status, .. } => {
+      panic!("{method} {target} refused {status:?}")
+    }
     Answer::Move { shard } => panic!("{method} {target} moved to shard {shard}"),
   }
 }

@@ -115,44 +115,71 @@ pub(super) fn visit<F: BlockFile>(
   Ok(())
 }
 
+/// Rebuilds `CONTENTS` rows from all surviving `CHANGESETS` rows in the checkpointed prefix up to
+/// `applied`, logging and counting any row whose log header or section heads no longer verify.
+fn rebuild_payload_places<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  file: &F,
+  applied: u64,
+  per_page: usize,
+  value: &mut Vec<u8>,
+) -> Result<u64, StoreError> {
+  scan_table(rows, CONTENTS, per_page, |rows, key, _| {
+    Ok(rows.delete(key)?)
+  })?;
+  let mut buffer = Vec::new();
+  let mut corrupt_rows_skipped = 0u64;
+  scan_table(rows, CHANGESETS, per_page, |rows, key, entry| {
+    let row = decode_changeset(key, entry)?;
+    match visit(file, applied, &row, &mut buffer, |identity, offset, len| {
+      keep(rows, identity, offset, len, value)
+    }) {
+      Ok(()) => Ok(()),
+      Err(StoreError::Log(LogError::Corrupt(what))) => {
+        corrupt_rows_skipped = corrupt_rows_skipped.saturating_add(1);
+        slates_machine::log_line!(
+          "slates-store: index_checkpoint skipped corrupt changeset row repo={} seq={} offset={} ({what})",
+          row.repository,
+          row.sequence,
+          row.offset
+        );
+        Ok(())
+      }
+      Err(error) => Err(error),
+    }
+  })?;
+  Ok(corrupt_rows_skipped)
+}
+
 /// The bare table tag marks a complete checkpoint of payload ownership. An older checkpoint knows
 /// only one place per identity and can already lack a live payload's lookup. Rebuild once from its
 /// surviving changesets. The marker commits with all the places before replay resumes at `applied`.
+/// Returns the number of corrupt changeset rows skipped during the rebuild.
 pub(super) fn index_checkpoint<F: BlockFile>(
   rows: &mut ShardDb<F>,
   file: &F,
   applied: u64,
   page_bytes: usize,
-) -> Result<(), StoreError> {
+) -> Result<u64, StoreError> {
   let mut value = Vec::new();
   if rows.get(&[CONTENTS], &mut value)? {
-    return Ok(());
+    return Ok(0);
   }
-  if applied > 0 {
+  let corrupt_rows_skipped = if applied > 0 {
     // One engine page of the larger changeset rows bounds both scans' retained keys and values.
     let per_page = page_bytes
       .checked_div(CHANGESET_ENTRY_BYTES)
       .unwrap_or(1)
       .max(1);
-    scan_table(rows, CONTENTS, per_page, |rows, key, _| {
-      Ok(rows.delete(key)?)
-    })?;
-    let mut buffer = Vec::new();
-    scan_table(rows, CHANGESETS, per_page, |rows, key, entry| {
-      let row = decode_changeset(key, entry)?;
-      match visit(file, applied, &row, &mut buffer, |identity, offset, len| {
-        keep(rows, identity, offset, len, &mut value)
-      }) {
-        Ok(()) | Err(StoreError::Log(LogError::Corrupt(_))) => Ok(()),
-        Err(error) => Err(error),
-      }
-    })?;
-  }
+    rebuild_payload_places(rows, file, applied, per_page, &mut value)?
+  } else {
+    0
+  };
   rows.put(&[CONTENTS], &[])?;
   if applied > 0 {
     rows.checkpoint(applied)?;
   }
-  Ok(())
+  Ok(corrupt_rows_skipped)
 }
 
 /// Streams one table through a bounded engine page. The continuation survives writes by the visitor.

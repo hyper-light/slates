@@ -23,11 +23,15 @@
 //! the file's start), record by record, each verified whole: the header's CRC, every section's CRC, the trailer's CRC
 //! and length, and the identity recomputed over the record. A record whose framing and commit trailer are intact but
 //! whose payload CRC or identity fails is a damaged committed record, never indexed and skipped so later healthy
-//! records (of other repositories or tools) still recover; similarly, a mid-file header or trailer corruption
-//! resynchronizes linearly on the next verified committed record. A torn uncommitted write at the tail with no later
-//! valid committed record leaves the log ending right after the last valid committed record so the next append cleanly
-//! overwrites the uncommitted tail. A record whose trailer reached the device before a crash is whole and is kept, as
-//! any write that completed.
+//! records (of other repositories or tools) still recover. A record whose header and section heads frame cleanly up to
+//! `next` with a damaged trailer is never scanned inside `[cursor, next)`: at EOF (`next == len`) recovery stops
+//! immediately; mid-file (`next < len`) recovery advances directly to `next` (or scans only from `next` if `next`
+//! itself is broken). A torn uncommitted write at EOF (an intact header whose section head, body, or trailer runs past
+//! EOF, or whose last section head was never written) stops recovery immediately right after the last valid committed
+//! record so its payload is never scanned and the next append cleanly overwrites it. Only when a header's CRC or a
+//! non-zero section head fails to decode does recovery scan forward with a linear section-head read budget and optional
+//! standing-grant filter (`expected_grant`) for the next verified committed record. A record whose trailer reached the
+//! device before a crash is whole and is kept, as any write that completed.
 
 use std::fmt;
 
@@ -299,48 +303,45 @@ impl<F: BlockFile> ChangesetLog<F> {
   /// file's start, or where the engine's checkpoint says it applied to), calling `each` with every verified committed
   /// record found after it, in order, with the file to read its sections from ([`sections_in`]). Damaged committed
   /// records and broken mid-file spans are skipped without indexing so trailing healthy records still recover; a torn
-  /// uncommitted tail with no later valid record leaves the log ending right after the last valid committed record.
-  pub fn recover(file: F, from: u64, mut each: impl FnMut(&F, &Located)) -> Result<Self, LogError> {
+  /// uncommitted tail stops immediately right after the last valid committed record without scanning its payload.
+  pub fn recover(file: F, from: u64, each: impl FnMut(&F, &Located)) -> Result<Self, LogError> {
+    Self::recover_for_grant(file, from, None, each)
+  }
+
+  /// Opens the log as [`ChangesetLog::recover`] does, additionally filtering any byte-scan resynchronization candidate
+  /// against `expected_grant` when `Some` so a foreign store's record bytes embedded inside a corrupt span are never
+  /// indexed.
+  pub fn recover_for_grant(
+    file: F,
+    from: u64,
+    expected_grant: Option<u64>,
+    mut each: impl FnMut(&F, &Located),
+  ) -> Result<Self, LogError> {
     let len = file.len()?;
-    let mut end = from;
-    let mut cursor = from;
-    let mut skipped = 0u64;
+    let mut progress = RecoverState {
+      end: from,
+      cursor: from,
+      skipped: 0,
+      expected_grant,
+    };
     let mut verify_buf = Vec::new();
     let mut scan_buf = Vec::new();
-    while cursor < len {
-      match verify_at(&file, cursor, len, &mut verify_buf)? {
-        Verify::Valid(located) => {
-          each(&file, &located);
-          end = located.end();
-          cursor = end;
-        }
-        Verify::Damaged { next } => {
-          skipped = skipped.saturating_add(1);
-          slates_machine::log_line!(
-            "slates-store: changeset log skipped damaged committed record at offset {cursor} (len {})",
-            next.saturating_sub(cursor)
-          );
-          cursor = next;
-        }
-        Verify::Unframed { hint } => {
-          let Some(next) = apply_resync(
-            &file,
-            (cursor, hint, len),
-            (&mut scan_buf, &mut verify_buf),
-            &mut each,
-            (&mut end, &mut skipped),
-          )?
-          else {
-            break;
-          };
-          cursor = next;
-        }
+    while progress.cursor < len {
+      let keep_going = step_recover(
+        &file,
+        len,
+        &mut progress,
+        (&mut scan_buf, &mut verify_buf),
+        &mut each,
+      )?;
+      if !keep_going {
+        break;
       }
     }
     Ok(Self {
       file,
-      end,
-      skipped,
+      end: progress.end,
+      skipped: progress.skipped,
       open: None,
     })
   }
@@ -683,16 +684,42 @@ struct Framed {
   past: u64,
 }
 
+/// Mutable cursor and accounting state carried through [`ChangesetLog::recover_for_grant`].
+struct RecoverState {
+  end: u64,
+  cursor: u64,
+  skipped: u64,
+  expected_grant: Option<u64>,
+}
+
+/// Outcome of framing a record's section heads without reading payload bytes.
+enum SectionsFrame {
+  /// Every section head decoded cleanly and fit within `len`, ending at this trailer offset.
+  Complete(u64),
+  /// Every in-bounds section head decoded cleanly, and either a head/body ran past `len` or an
+  /// unwritten all-zero head appeared (an abandoned uncommitted write at EOF).
+  TruncatedTail,
+  /// A non-zero in-bounds section head failed to decode.
+  Broken,
+  /// The resync section-head read budget ran out before all sections were framed.
+  BudgetExhausted,
+}
+
 /// Structural framing check of a record at `offset` before hashing any section payload.
 enum Frame {
   /// Valid header, valid section heads fitting in the file, and a valid `SLCC` commit trailer whose `record_len`
   /// matches `past - offset`.
   Committed(Framed),
   /// Valid header and section heads reaching `next <= len`, but the trailer did not verify: either a mid-file trailer
-  /// bit-flip (`next` points to the following record) or an uncommitted tail write.
+  /// bit-flip (`next < len`) or a torn trailer at EOF (`next == len`).
   BadTrailer { next: u64 },
-  /// Header or section framing did not decode or ran past the file's end.
+  /// Valid header (or fewer than [`HEADER_BYTES`] remaining at EOF) whose section heads/bodies or trailer ran past
+  /// `len`, or whose last section head was left all zeros: a torn uncommitted tail.
+  TruncatedTail,
+  /// Header CRC/magic failed or a non-zero in-bounds section head failed to decode.
   Broken,
+  /// The resync section-head read budget ran out while framing this candidate.
+  BudgetExhausted,
 }
 
 /// Outcome of verifying a record at `offset`.
@@ -702,9 +729,15 @@ enum Verify {
   /// A structurally committed record whose payload CRC or BLAKE3 identity failed: never indexed, skip directly to
   /// `next`.
   Damaged { next: u64 },
-  /// Header, section heads, or commit trailer did not verify; `hint` names where the next record sits when header and
-  /// section heads were intact.
-  Unframed { hint: Option<u64> },
+  /// Header and section heads framed cleanly up to `next <= len`, but the commit trailer failed: never scan inside
+  /// `[offset, next)`.
+  BadTrailer { next: u64 },
+  /// A torn uncommitted write at EOF: stop recovery immediately without scanning its payload.
+  TruncatedTail,
+  /// Header CRC/magic or a non-zero section head failed to decode (or a resync candidate's grant did not match).
+  Broken,
+  /// The resync section-head read budget ran out while framing this candidate.
+  BudgetExhausted,
 }
 
 /// Outcome of scanning one [`VERIFY_PIECE`] chunk for the next committed record.
@@ -715,15 +748,17 @@ enum ChunkProbe {
   SkipTo(u64),
   /// No verified record starts in this chunk.
   Exhausted,
+  /// The linear section-head read budget for this resync scan ran out.
+  BudgetExhausted,
 }
 
-/// Outcome of resynchronizing past an unframed offset.
-enum Resync {
-  /// A structurally committed record starts at `next`: resume the main loop there.
-  Advance(u64),
-  /// Found and verified the next committed record after scanning past broken bytes.
-  Found(Located),
-  /// No valid committed record exists in the rest of the file (torn uncommitted tail).
+/// Where recovery should resume after a cleanly-framed record with a bad trailer at `[cursor, next)`.
+enum AfterBadTrailer {
+  /// A structurally committed record begins at this offset.
+  Committed(u64),
+  /// A broken mid-file header begins at this offset (past the bad-trailer record's payload).
+  ScanFrom(u64),
+  /// Only torn tail or bad-trailer records remain to EOF: stop recovery cleanly.
   Stop,
 }
 
@@ -733,49 +768,71 @@ fn fits_after(at: u64, count: usize, len: u64) -> Result<Option<u64>, LogError> 
   Ok((past <= len).then_some(past))
 }
 
-/// Walks `sections` section heads from `at` without reading payload bytes, returning the offset where the trailer
-/// begins or `None` if any head fails to decode or runs past `len`.
-fn frame_sections<F: BlockFile>(
+/// Consumes one section-head read from `budget` when present, returning `false` when exhausted.
+fn spend_read(budget: &mut Option<&mut u64>) -> bool {
+  let Some(remaining) = budget.as_deref_mut() else {
+    return true;
+  };
+  if *remaining == 0 {
+    return false;
+  }
+  *remaining = remaining.saturating_sub(1);
+  true
+}
+
+/// Frames one section head at `at` within a file of `len` bytes under `budget`.
+fn step_section<F: BlockFile>(
+  file: &F,
+  (at, len): (u64, u64),
+  budget: &mut Option<&mut u64>,
+) -> Result<SectionsFrame, LogError> {
+  let Some(bytes_at) = fits_after(at, SECTION_HEAD_BYTES, len)? else {
+    return Ok(SectionsFrame::TruncatedTail);
+  };
+  if !spend_read(budget) {
+    return Ok(SectionsFrame::BudgetExhausted);
+  }
+  let mut section = [0u8; SECTION_HEAD_BYTES];
+  file.read_exact_at(&mut section, at)?;
+  if section == [0u8; SECTION_HEAD_BYTES] {
+    return Ok(SectionsFrame::TruncatedTail);
+  }
+  let Some((_, section_len, _)) = decode_section_head(&section) else {
+    return Ok(SectionsFrame::Broken);
+  };
+  match bytes_at
+    .checked_add(section_len)
+    .filter(|past| *past <= len)
+  {
+    Some(past) => Ok(SectionsFrame::Complete(past)),
+    None => Ok(SectionsFrame::TruncatedTail),
+  }
+}
+
+/// Walks `sections` section heads from `at` without reading payload bytes, charging each head read
+/// to `budget` when scanning.
+fn frame_sections_budgeted<F: BlockFile>(
   file: &F,
   (mut at, len): (u64, u64),
   sections: u16,
-) -> Result<Option<u64>, LogError> {
+  mut budget: Option<&mut u64>,
+) -> Result<SectionsFrame, LogError> {
   for _ in 0..sections {
-    let Some(bytes_at) = fits_after(at, SECTION_HEAD_BYTES, len)? else {
-      return Ok(None);
-    };
-    let mut section = [0u8; SECTION_HEAD_BYTES];
-    file.read_exact_at(&mut section, at)?;
-    let Some((_, section_len, _)) = decode_section_head(&section) else {
-      return Ok(None);
-    };
-    let Some(past) = bytes_at
-      .checked_add(section_len)
-      .filter(|past| *past <= len)
-    else {
-      return Ok(None);
-    };
-    at = past;
+    match step_section(file, (at, len), &mut budget)? {
+      SectionsFrame::Complete(next) => at = next,
+      other => return Ok(other),
+    }
   }
-  Ok(Some(at))
+  Ok(SectionsFrame::Complete(at))
 }
 
-/// Checks the header, section heads, and commit trailer at `offset` in a file of `len` bytes without reading payloads.
-fn frame_at<F: BlockFile>(file: &F, offset: u64, len: u64) -> Result<Frame, LogError> {
-  let Some(start) = fits_after(offset, HEADER_BYTES, len)? else {
-    return Ok(Frame::Broken);
-  };
-  let mut head_bytes = [0u8; HEADER_BYTES];
-  file.read_exact_at(&mut head_bytes, offset)?;
-  let Some(header) = decode_header(&head_bytes) else {
-    return Ok(Frame::Broken);
-  };
-  let Some(at) = frame_sections(file, (start, len), header.sections)? else {
-    return Ok(Frame::Broken);
-  };
-  let Some(past) = fits_after(at, TRAILER_BYTES, len)? else {
-    return Ok(Frame::Broken);
-  };
+/// Reads and checks the commit trailer at `at` for a record spanning `[offset, past)`.
+fn frame_trailer<F: BlockFile>(
+  file: &F,
+  (offset, at, past): (u64, u64, u64),
+  header: Header,
+  head_bytes: [u8; HEADER_BYTES],
+) -> Result<Frame, LogError> {
   let mut trailer = [0u8; TRAILER_BYTES];
   file.read_exact_at(&mut trailer, at)?;
   let Some((recorded, record_len)) = decode_trailer(&trailer) else {
@@ -792,7 +849,34 @@ fn frame_at<F: BlockFile>(file: &F, offset: u64, len: u64) -> Result<Frame, LogE
   }))
 }
 
-/// Verifies every section's CRC and the whole-record BLAKE3 identity for a record already framed by [`frame_at`].
+/// Checks the header, section heads, and commit trailer at `offset` in a file of `len` bytes without reading payloads.
+fn frame_at_budgeted<F: BlockFile>(
+  file: &F,
+  offset: u64,
+  len: u64,
+  budget: Option<&mut u64>,
+) -> Result<Frame, LogError> {
+  let Some(start) = fits_after(offset, HEADER_BYTES, len)? else {
+    return Ok(Frame::TruncatedTail);
+  };
+  let mut head_bytes = [0u8; HEADER_BYTES];
+  file.read_exact_at(&mut head_bytes, offset)?;
+  let Some(header) = decode_header(&head_bytes) else {
+    return Ok(Frame::Broken);
+  };
+  let at = match frame_sections_budgeted(file, (start, len), header.sections, budget)? {
+    SectionsFrame::Complete(at) => at,
+    SectionsFrame::TruncatedTail => return Ok(Frame::TruncatedTail),
+    SectionsFrame::Broken => return Ok(Frame::Broken),
+    SectionsFrame::BudgetExhausted => return Ok(Frame::BudgetExhausted),
+  };
+  let Some(past) = fits_after(at, TRAILER_BYTES, len)? else {
+    return Ok(Frame::TruncatedTail);
+  };
+  frame_trailer(file, (offset, at, past), header, head_bytes)
+}
+
+/// Verifies every section's CRC and the whole-record BLAKE3 identity for a record already framed by [`frame_at_budgeted`].
 fn verify_committed<F: BlockFile>(
   file: &F,
   (offset, len): (u64, u64),
@@ -810,7 +894,7 @@ fn verify_committed<F: BlockFile>(
     buffer,
   )?;
   let Some(record_len) = framed.past.checked_sub(offset) else {
-    return Ok(Verify::Unframed { hint: None });
+    return Ok(Verify::Broken);
   };
   let end_matches =
     verified.is_some_and(|at| offset_after(at, TRAILER_BYTES).ok() == Some(framed.past));
@@ -826,18 +910,26 @@ fn verify_committed<F: BlockFile>(
   }
 }
 
-/// Verifies the record at `offset` in a file of `len` bytes: distinguishes a verified committed record, a structurally
-/// committed record with damaged payload/identity, and unframed bytes (damaged header/trailer or torn tail).
-fn verify_at<F: BlockFile>(
+/// Verifies the record at `offset` in a file of `len` bytes under optional `expected_grant` and
+/// section-head read `budget`.
+fn verify_at_budgeted<F: BlockFile>(
   file: &F,
-  offset: u64,
-  len: u64,
+  (offset, len): (u64, u64),
+  expected_grant: Option<u64>,
+  budget: Option<&mut u64>,
   buffer: &mut Vec<u8>,
 ) -> Result<Verify, LogError> {
-  match frame_at(file, offset, len)? {
-    Frame::Broken => Ok(Verify::Unframed { hint: None }),
-    Frame::BadTrailer { next } => Ok(Verify::Unframed { hint: Some(next) }),
-    Frame::Committed(framed) => verify_committed(file, (offset, len), &framed, buffer),
+  match frame_at_budgeted(file, offset, len, budget)? {
+    Frame::TruncatedTail => Ok(Verify::TruncatedTail),
+    Frame::Broken => Ok(Verify::Broken),
+    Frame::BudgetExhausted => Ok(Verify::BudgetExhausted),
+    Frame::BadTrailer { next } => Ok(Verify::BadTrailer { next }),
+    Frame::Committed(framed) => {
+      if expected_grant.is_some_and(|grant| framed.header.grant != grant) {
+        return Ok(Verify::Broken);
+      }
+      verify_committed(file, (offset, len), &framed, buffer)
+    }
   }
 }
 
@@ -851,26 +943,40 @@ fn find_magic(chunk: &[u8], from: usize) -> Option<usize> {
 }
 
 /// Probes every [`MAGIC`] candidate in `chunk` (starting at file offset `scan`), skipping past any structurally
-/// committed damaged record so every byte of the file is hashed at most once.
+/// committed damaged record (counting each skip) and enforcing `section_budget` so total work stays linear.
 fn probe_chunk<F: BlockFile>(
   file: &F,
   (scan, len): (u64, u64),
   chunk: &[u8],
+  expected_grant: Option<u64>,
+  (section_budget, skipped): (&mut u64, &mut u64),
   verify_buf: &mut Vec<u8>,
 ) -> Result<ChunkProbe, LogError> {
   let mut pos = 0usize;
   while let Some(at) = find_magic(chunk, pos) {
     let candidate = offset_after(scan, at)?;
-    match verify_at(file, candidate, len, verify_buf)? {
+    match verify_at_budgeted(
+      file,
+      (candidate, len),
+      expected_grant,
+      Some(section_budget),
+      verify_buf,
+    )? {
       Verify::Valid(located) => return Ok(ChunkProbe::Found(located)),
       Verify::Damaged { next } => {
+        *skipped = skipped.saturating_add(1);
+        slates_machine::log_line!(
+          "slates-store: changeset log skipped damaged committed record at offset {candidate} (len {})",
+          next.saturating_sub(candidate)
+        );
         let chunk_end = offset_after(scan, chunk.len())?;
         if next >= chunk_end {
           return Ok(ChunkProbe::SkipTo(next));
         }
         pos = usize::try_from(next.saturating_sub(scan)).map_err(|_| LogError::TooLarge)?;
       }
-      Verify::Unframed { .. } => {
+      Verify::BudgetExhausted => return Ok(ChunkProbe::BudgetExhausted),
+      Verify::BadTrailer { .. } | Verify::TruncatedTail | Verify::Broken => {
         pos = at.saturating_add(1);
       }
     }
@@ -878,26 +984,57 @@ fn probe_chunk<F: BlockFile>(
   Ok(ChunkProbe::Exhausted)
 }
 
-/// Scans linearly from `scan` in [`VERIFY_PIECE`] chunks (overlapping by [`MAGIC_OVERLAP`] bytes) for the next verified
-/// committed record, or `None` when none exists before `len`.
+/// Derived linear budget for section-head reads across a resync scan from `scan_start` to `len`:
+/// at most one section-head read per [`SECTION_HEAD_BYTES`] of scanned bytes, plus one.
+fn resync_section_budget(scan_start: u64, len: u64) -> Result<u64, LogError> {
+  let head_bytes = u64::try_from(SECTION_HEAD_BYTES).map_err(|_| LogError::TooLarge)?;
+  Ok(
+    len
+      .saturating_sub(scan_start)
+      .checked_div(head_bytes)
+      .unwrap_or(0)
+      .saturating_add(1),
+  )
+}
+
+/// Scans linearly from `scan_start` in [`VERIFY_PIECE`] chunks (overlapping by [`MAGIC_OVERLAP`] bytes) for the next
+/// verified committed record matching `expected_grant`, or `None` when none exists before `len` or the linear
+/// section-head read budget runs out.
 fn resync_from<F: BlockFile>(
   file: &F,
-  mut scan: u64,
+  scan_start: u64,
   len: u64,
+  expected_grant: Option<u64>,
+  skipped: &mut u64,
   (scan_buf, verify_buf): (&mut Vec<u8>, &mut Vec<u8>),
 ) -> Result<Option<Located>, LogError> {
   let min_record = u64::try_from(MIN_RECORD_BYTES).map_err(|_| LogError::TooLarge)?;
   let piece_len = u64::try_from(VERIFY_PIECE).map_err(|_| LogError::TooLarge)?;
   let overlap = u64::try_from(MAGIC_OVERLAP).map_err(|_| LogError::TooLarge)?;
+  let mut section_budget = resync_section_budget(scan_start, len)?;
+  let mut scan = scan_start;
   scan_buf.resize(VERIFY_PIECE, 0);
   while scan.checked_add(min_record).is_some_and(|need| need <= len) {
     let left = len.checked_sub(scan).ok_or(LogError::TooLarge)?;
     let take = usize::try_from(left.min(piece_len)).map_err(|_| LogError::TooLarge)?;
     let chunk = scan_buf.get_mut(..take).ok_or(LogError::TooLarge)?;
     file.read_exact_at(chunk, scan)?;
-    match probe_chunk(file, (scan, len), chunk, verify_buf)? {
+    match probe_chunk(
+      file,
+      (scan, len),
+      chunk,
+      expected_grant,
+      (&mut section_budget, skipped),
+      verify_buf,
+    )? {
       ChunkProbe::Found(located) => return Ok(Some(located)),
       ChunkProbe::SkipTo(next) => scan = next,
+      ChunkProbe::BudgetExhausted => {
+        slates_machine::log_line!(
+          "slates-store: changeset log stopped resync from offset {scan_start}: section-head read budget exhausted"
+        );
+        return Ok(None);
+      }
       ChunkProbe::Exhausted => {
         let read = u64::try_from(take).map_err(|_| LogError::TooLarge)?;
         if scan.checked_add(read).is_none_or(|end| end >= len) {
@@ -911,54 +1048,118 @@ fn resync_from<F: BlockFile>(
   Ok(None)
 }
 
-/// Attempts `hint` first (for a mid-file trailer bit-flip whose framing was intact), then scans linearly from
-/// `cursor + 1` for a verified committed record.
-fn resync_after<F: BlockFile>(
+/// Probes past one or more cleanly-framed records with damaged trailers starting at `at` without
+/// ever scanning inside their payloads.
+fn next_after_bad_trailer<F: BlockFile>(
   file: &F,
-  (cursor, hint, len): (u64, Option<u64>, u64),
-  buffers: (&mut Vec<u8>, &mut Vec<u8>),
-) -> Result<Resync, LogError> {
-  if let Some(next) = hint
-    && next < len
-    && matches!(frame_at(file, next, len)?, Frame::Committed(_))
-  {
-    return Ok(Resync::Advance(next));
+  mut at: u64,
+  len: u64,
+) -> Result<AfterBadTrailer, LogError> {
+  while at < len {
+    match frame_at_budgeted(file, at, len, None)? {
+      Frame::Committed(_) => return Ok(AfterBadTrailer::Committed(at)),
+      Frame::BadTrailer { next } if next > at => at = next,
+      Frame::TruncatedTail | Frame::BadTrailer { .. } | Frame::BudgetExhausted => {
+        return Ok(AfterBadTrailer::Stop);
+      }
+      Frame::Broken => return Ok(AfterBadTrailer::ScanFrom(at)),
+    }
   }
-  match resync_from(file, cursor.saturating_add(1), len, buffers)? {
-    Some(located) => Ok(Resync::Found(located)),
-    None => Ok(Resync::Stop),
+  Ok(AfterBadTrailer::Stop)
+}
+
+/// Scans forward from `scan_start` past broken bytes starting at `cursor`; returns `true` when a
+/// verified committed record was found and indexed, or `false` to stop recovery cleanly.
+fn apply_resync_scan<F: BlockFile>(
+  file: &F,
+  (scan_start, len): (u64, u64),
+  progress: &mut RecoverState,
+  buffers: (&mut Vec<u8>, &mut Vec<u8>),
+  each: &mut impl FnMut(&F, &Located),
+) -> Result<bool, LogError> {
+  let cursor = progress.cursor;
+  let Some(located) = resync_from(
+    file,
+    scan_start,
+    len,
+    progress.expected_grant,
+    &mut progress.skipped,
+    buffers,
+  )?
+  else {
+    return Ok(false);
+  };
+  progress.skipped = progress.skipped.saturating_add(1);
+  slates_machine::log_line!(
+    "slates-store: changeset log resynchronized past corrupt span {cursor}..{}",
+    located.offset
+  );
+  each(file, &located);
+  progress.end = located.end();
+  progress.cursor = progress.end;
+  Ok(true)
+}
+
+/// Handles a cleanly-framed record with a bad trailer spanning `[progress.cursor, next)` without
+/// ever scanning inside `[progress.cursor, next)`.
+fn apply_bad_trailer<F: BlockFile>(
+  file: &F,
+  (next, len): (u64, u64),
+  progress: &mut RecoverState,
+  buffers: (&mut Vec<u8>, &mut Vec<u8>),
+  each: &mut impl FnMut(&F, &Located),
+) -> Result<bool, LogError> {
+  let cursor = progress.cursor;
+  match next_after_bad_trailer(file, next, len)? {
+    AfterBadTrailer::Committed(resume) => {
+      progress.skipped = progress.skipped.saturating_add(1);
+      slates_machine::log_line!(
+        "slates-store: changeset log skipped record with damaged trailer at offset {cursor}..{resume}"
+      );
+      progress.cursor = resume;
+      Ok(true)
+    }
+    AfterBadTrailer::ScanFrom(scan_start) => {
+      apply_resync_scan(file, (scan_start, len), progress, buffers, each)
+    }
+    AfterBadTrailer::Stop => Ok(false),
   }
 }
 
-/// Applies a resync step for `recover`: returns the next cursor offset or `None` when the remaining bytes are a torn
-/// uncommitted tail.
-fn apply_resync<F: BlockFile>(
+/// Runs one step of [`ChangesetLog::recover_for_grant`]; returns `false` when recovery stops cleanly.
+fn step_recover<F: BlockFile>(
   file: &F,
-  bounds: (u64, Option<u64>, u64),
+  len: u64,
+  progress: &mut RecoverState,
   buffers: (&mut Vec<u8>, &mut Vec<u8>),
   each: &mut impl FnMut(&F, &Located),
-  (end, skipped): (&mut u64, &mut u64),
-) -> Result<Option<u64>, LogError> {
-  let cursor = bounds.0;
-  match resync_after(file, bounds, buffers)? {
-    Resync::Advance(next) => {
-      *skipped = skipped.saturating_add(1);
-      slates_machine::log_line!(
-        "slates-store: changeset log skipped record with damaged trailer at offset {cursor}..{next}"
-      );
-      Ok(Some(next))
-    }
-    Resync::Found(located) => {
-      *skipped = skipped.saturating_add(1);
-      slates_machine::log_line!(
-        "slates-store: changeset log resynchronized past corrupt span {cursor}..{}",
-        located.offset
-      );
+) -> Result<bool, LogError> {
+  let cursor = progress.cursor;
+  match verify_at_budgeted(file, (cursor, len), None, None, buffers.1)? {
+    Verify::Valid(located) => {
       each(file, &located);
-      *end = located.end();
-      Ok(Some(*end))
+      progress.end = located.end();
+      progress.cursor = progress.end;
+      Ok(true)
     }
-    Resync::Stop => Ok(None),
+    Verify::Damaged { next } => {
+      progress.skipped = progress.skipped.saturating_add(1);
+      slates_machine::log_line!(
+        "slates-store: changeset log skipped damaged committed record at offset {cursor} (len {})",
+        next.saturating_sub(cursor)
+      );
+      progress.cursor = next;
+      Ok(true)
+    }
+    Verify::TruncatedTail | Verify::BudgetExhausted => Ok(false),
+    Verify::BadTrailer { next } => apply_bad_trailer(file, (next, len), progress, buffers, each),
+    Verify::Broken => apply_resync_scan(
+      file,
+      (cursor.saturating_add(1), len),
+      progress,
+      buffers,
+      each,
+    ),
   }
 }
 

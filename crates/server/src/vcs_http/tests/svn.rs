@@ -454,7 +454,9 @@ fn decided(
   let decided: Decided<SvnExchange<Stores>> = ready(site.answer(&head(&bytes)));
   let outcome = match decided.answer {
     Answer::Move { shard } => format!("moved {shard}"),
-    Answer::Refuse { status, .. } => format!("refused {}", status.code),
+    Answer::Refuse { status, .. } | Answer::RefuseWithBody { status, .. } => {
+      format!("refused {}", status.code)
+    }
     Answer::Serve { head_only, .. } => format!("served, head alone {head_only}"),
   };
   (outcome, decided.proven)

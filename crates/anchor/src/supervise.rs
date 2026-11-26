@@ -291,6 +291,10 @@ pub struct Supervisor {
   /// The hold refusals and refused log lines last written to the segment (`layout::SUP_HOLD_REFUSALS`,
   /// `SUP_LOG_REFUSALS`), so a step writes only a change.
   published_refusals: (u64, u64),
+  /// Owned thread relaying the supervised daemon's stderr pipe through this process's single stderr
+  /// lock so anchor and daemon lines past `PIPE_BUF` never interleave (SEAM-3).
+  #[cfg(unix)]
+  stderr_relay: Option<std::thread::JoinHandle<()>>,
 }
 
 /// The device channel's two ends, what has been received over it, and the refusals counted.
@@ -393,6 +397,8 @@ impl Supervisor {
       #[cfg(windows)]
       shared_listeners: Vec::new(),
       published_refusals: (0, 0),
+      #[cfg(unix)]
+      stderr_relay: None,
     })
   }
 
@@ -755,6 +761,8 @@ impl Supervisor {
     if self.child.is_some() {
       return Ok(());
     }
+    #[cfg(unix)]
+    self.join_stderr_relay();
     self.started_at_ns = now_ns;
     self.serving_seen_ns = None;
     let mut env = self.segment.handoff_env()?;
@@ -828,17 +836,50 @@ impl Supervisor {
     Ok(())
   }
 
+  /// Joins any prior child's stderr relay thread once the child has been reaped so no thread is
+  /// ever orphaned (§2 item 9).
+  #[cfg(unix)]
+  fn join_stderr_relay(&mut self) {
+    if let Some(handle) = self.stderr_relay.take() {
+      let _ = handle.join();
+    }
+  }
+
+  /// Spawns an owned thread relaying `child`'s piped stderr line-by-line through this process's
+  /// single stderr lock so anchor and daemon lines past `PIPE_BUF` never interleave.
+  #[cfg(unix)]
+  fn attach_stderr_relay(&mut self, child: &mut Child) {
+    let Some(stderr) = child.stderr.take() else {
+      return;
+    };
+    match std::thread::Builder::new()
+      .name("slates-stderr".to_owned())
+      .spawn(move || slates_machine::log::relay_stderr(stderr))
+    {
+      Ok(handle) => self.stderr_relay = Some(handle),
+      Err(error) => {
+        slates_machine::log_line!(
+          "slates anchor: could not start stderr relay thread ({error}); daemon stderr will not be relayed"
+        );
+      }
+    }
+  }
+
   /// Unix retains its descriptor-based spawn and the existing executable-identity check (A-145).
   #[cfg(unix)]
   fn spawn_child(&mut self, env: Vec<(String, String)>) -> Result<Child, AnchorError> {
     let mut command = own_image::command(&self.program, self.image)?;
-    command.args(&self.args).envs(env);
+    command
+      .args(&self.args)
+      .envs(env)
+      .stderr(std::process::Stdio::piped());
     #[cfg(target_os = "linux")]
     hand_on_in_child(&mut command, self.segment.handed_descriptors()?);
-    let child = command.spawn().map_err(|error| AnchorError::Spawn {
+    let mut child = command.spawn().map_err(|error| AnchorError::Spawn {
       code: error.raw_os_error(),
     })?;
     self.lifetime.tie(&child)?;
+    self.attach_stderr_relay(&mut child);
     Ok(child)
   }
 
@@ -968,6 +1009,8 @@ impl Supervisor {
       }
     };
     self.child = None;
+    #[cfg(unix)]
+    self.join_stderr_relay();
     let exit_code = status.code();
     // Only a daemon that exited before it served as long as its start took failed: one that served that long had
     // recovered, so restarting it is no busy loop, and one that died sooner spent more of its life starting than serving.
@@ -1097,6 +1140,8 @@ impl Supervisor {
     // A stop ends a crash loop's backoff too: nothing restarts the daemon after it.
     self.retry_at_ns = None;
     let Some(child) = self.child.as_mut() else {
+      #[cfg(unix)]
+      self.join_stderr_relay();
       self.segment.supervision()?.record_exit(false);
       return Ok(Stopping::Exited {
         exit_code: None,
@@ -1106,6 +1151,8 @@ impl Supervisor {
     match child.try_wait() {
       Ok(Some(status)) => {
         self.child = None;
+        #[cfg(unix)]
+        self.join_stderr_relay();
         self.segment.supervision()?.record_exit(false);
         return Ok(Stopping::Exited {
           exit_code: status.code(),
@@ -1141,6 +1188,8 @@ impl Supervisor {
       }
       None => None,
     };
+    #[cfg(unix)]
+    self.join_stderr_relay();
     self.segment.supervision()?.record_exit(false);
     Ok(Stopping::Exited {
       exit_code,
@@ -1157,6 +1206,8 @@ impl Supervisor {
       let _ = child.kill();
       let _ = child.wait();
     }
+    #[cfg(unix)]
+    self.join_stderr_relay();
     self.segment.supervision()?.record_exit(false);
     Ok(())
   }

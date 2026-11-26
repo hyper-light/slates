@@ -999,3 +999,76 @@ fn an_at_head_route_writes_an_interim_run_while_its_body_is_read() {
   assert_eq!(whole.matches("HTTP/1.1 200 OK").count(), 1, "{whole:?}");
   assert!(whole.ends_with("5\r\n0005\u{1}\r\n0\r\n\r\n"), "{whole:?}");
 }
+
+/// Suggestion 1: Do: send a `POST` with `Expect: 100-continue` and `Content-Length: 4`, deciding it
+/// with `Decision::RefuseWithBody` (`503`, plain-text diagnostic body) before any body arrives.
+/// Expect: `503 Service Unavailable` with `Content-Length`, `Connection: close`, and the body sent
+/// immediately — ZERO `100 Continue`, ZERO body read, and a staged close.
+#[test]
+fn a_refusal_with_body_on_expect_continue_post_answers_before_100_continue() {
+  let body = b"repository recovery failed: Unlanded\n";
+  let request = post(&["Content-Length: 4", "Expect: 100-continue"], b"");
+  let refuse = |_: &Head<'_>| Decision::RefuseWithBody {
+    status: Status::SERVICE_UNAVAILABLE,
+    fields: fields(&[("Content-Type", "text/plain; charset=utf-8")]),
+    body: body.to_vec(),
+    head_only: false,
+  };
+  let mut connection = Connection::clear(ROOM);
+  let seen = drive(
+    &mut connection,
+    &[&request],
+    &Script {
+      decision: &refuse,
+      reply: &[],
+    },
+  );
+  let expected = format!(
+    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+    body.len(),
+    String::from_utf8_lossy(body),
+  );
+  assert_eq!(String::from_utf8(seen.written).unwrap(), expected);
+  assert_eq!(
+    (seen.staged, seen.drained, seen.bodies.len()),
+    (true, true, 0)
+  );
+  assert_eq!(
+    connection.ended(),
+    Some(Ended::Refused(Status::SERVICE_UNAVAILABLE))
+  );
+}
+
+/// Suggestion 1: Do: send pipelined `HEAD` followed by `GET` on one HTTP/1.1 connection, both
+/// decided with `Decision::RefuseWithBody` (`head_only: head.method == b"HEAD"`).
+/// Expect: `HEAD` answers `503` with `Content-Length: body.len()`, zero body bytes on wire, and
+/// keeps the connection alive so the pipelined `GET` receives `503` with the full body.
+#[test]
+fn a_refusal_with_body_on_head_omits_wire_body_and_keeps_connection() {
+  let body = b"repository recovery failed: Unlanded\n";
+  let head_req = b"HEAD /r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: h\r\n\r\n";
+  let both = [&head_req[..], GET].concat();
+  let refuse = |head: &Head<'_>| Decision::RefuseWithBody {
+    status: Status::SERVICE_UNAVAILABLE,
+    fields: fields(&[("Content-Type", "text/plain; charset=utf-8")]),
+    body: body.to_vec(),
+    head_only: head.method == b"HEAD",
+  };
+  let mut connection = Connection::clear(ROOM);
+  let seen = drive(
+    &mut connection,
+    &[&both],
+    &Script {
+      decision: &refuse,
+      reply: &[],
+    },
+  );
+  let head_reply = format!(
+    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+    body.len(),
+  );
+  let expected = format!("{head_reply}{head_reply}{}", String::from_utf8_lossy(body));
+  assert_eq!(String::from_utf8(seen.written).unwrap(), expected);
+  assert_eq!((seen.decided, seen.staged, seen.closed), (2, false, true));
+  assert_eq!(connection.ended(), Some(Ended::Peer));
+}

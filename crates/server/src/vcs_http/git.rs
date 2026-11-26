@@ -503,43 +503,12 @@ impl<L: LfsService> Exchange for LfsExchange<L> {
   }
 }
 
-/// A `503 Service Unavailable` exchange carrying a concise typed diagnostic body for a repository whose store failed
-/// recovery.
-pub(crate) struct UnavailableExchange {
-  /// The diagnostic line not yet sent.
-  body: Option<&'static str>,
-}
-
-impl Exchange for UnavailableExchange {
-  async fn body(&mut self, _run: &[u8]) -> Result<(), Failed> {
-    Ok(())
-  }
-
-  async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), Failed> {
-    Ok(())
-  }
-
-  fn reply_status(&self) -> Status {
-    Status::SERVICE_UNAVAILABLE
-  }
-
-  async fn reply(&mut self, out: &mut Vec<u8>, _gone: ClientGone<'_>) -> Result<bool, Failed> {
-    if let Some(reason) = self.body.take() {
-      out.extend_from_slice(reason.as_bytes());
-      out.push(b'\n');
-    }
-    Ok(false)
-  }
-}
-
-/// What git's site serves a request with: one of git's services, Git LFS, or a typed `503` diagnostic body.
+/// What git's site serves a request with: one of git's services, or Git LFS.
 pub(crate) enum SiteExchange<E, L> {
   /// git's service.
   Git(GitExchange<E>),
   /// Git LFS, boxed: its exchange is by far the larger.
   Lfs(Box<LfsExchange<L>>),
-  /// A `503 Service Unavailable` refusal carrying a concise typed diagnostic body (e.g. an unrecovered store).
-  Unavailable(UnavailableExchange),
 }
 
 impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
@@ -547,7 +516,6 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
     match self {
       SiteExchange::Git(git) => git.body(run).await,
       SiteExchange::Lfs(lfs) => lfs.body(run).await,
-      SiteExchange::Unavailable(unavailable) => unavailable.body(run).await,
     }
   }
 
@@ -555,7 +523,6 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
     match self {
       SiteExchange::Git(git) => git.body_end(gone).await,
       SiteExchange::Lfs(lfs) => lfs.body_end(gone).await,
-      SiteExchange::Unavailable(unavailable) => unavailable.body_end(gone).await,
     }
   }
 
@@ -563,7 +530,6 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
     match self {
       SiteExchange::Git(git) => git.reply_status(),
       SiteExchange::Lfs(lfs) => lfs.reply_status(),
-      SiteExchange::Unavailable(unavailable) => unavailable.reply_status(),
     }
   }
 
@@ -571,7 +537,6 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
     match self {
       SiteExchange::Git(git) => git.reply_fields().await,
       SiteExchange::Lfs(lfs) => lfs.reply_fields().await,
-      SiteExchange::Unavailable(unavailable) => unavailable.reply_fields().await,
     }
   }
 
@@ -585,7 +550,6 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
     match self {
       SiteExchange::Git(git) => git.reply(out, gone).await,
       SiteExchange::Lfs(lfs) => lfs.reply(out, gone).await,
-      SiteExchange::Unavailable(unavailable) => unavailable.reply(out, gone).await,
     }
   }
 
@@ -895,7 +859,8 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
   }
 
   /// `503 Service Unavailable` with `Content-Type: text/plain; charset=utf-8`, the cache fields, and `reason` as its
-  /// diagnostic body for an unrecovered repository, counted under [`Refused::Unavailable`].
+  /// immediate refusal body for an unrecovered repository (sent before `100 Continue` and without reading any request
+  /// body), counted under [`Refused::Unavailable`].
   fn unavailable_body(
     &self,
     reason: &'static str,
@@ -904,12 +869,14 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
     crate::fleet::count_refusal(Refused::Unavailable.counter());
     let mut fields = vec![(CONTENT_TYPE.to_vec(), TEXT_PLAIN.to_vec())];
     fields.extend(cache_fields());
+    let mut body = reason.as_bytes().to_vec();
+    body.push(b'\n');
     Decided {
-      answer: Answer::Serve {
+      answer: Answer::RefuseWithBody {
+        status: Status::SERVICE_UNAVAILABLE,
         fields,
+        body,
         head_only,
-        status: StatusMode::AfterBody,
-        exchange: SiteExchange::Unavailable(UnavailableExchange { body: Some(reason) }),
       },
       proven: true,
     }

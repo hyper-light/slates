@@ -1,6 +1,7 @@
 //! The changeset log over a simulated file with power-loss semantics (A-767 item 2): records round-trip whole,
-//! committed records survive every crash, a record interrupted before its commit never does, and a log cut or damaged
-//! anywhere recovers exactly the committed records before the damage.
+//! committed records survive every crash, a record interrupted before its commit never does, a truncated or torn
+//! uncommitted EOF tail stops right after the last valid committed record without scanning its payload, and mid-file
+//! damage is skipped or resynchronized linearly so healthy records after it still recover.
 
 use hyper_block::buf::Alignment;
 use hyper_block::sim::{Crash, Fault, SimFile};
@@ -432,5 +433,297 @@ fn mid_file_corrupt_header_with_embedded_magic_and_consecutive_damage_recovers_c
   let (log, found) = recovered(file);
   assert_eq!(found, vec![r3]);
   assert_eq!(log.end(), r3.end());
+  assert_eq!(log.skipped(), 2);
   assert_eq!(read_payload(&log, &r3), hg_bytes);
+}
+
+/// Counting wrapper over [`SimFile`] so complexity tests prove linear I/O bounds by counting
+/// `read_exact_at` calls rather than measuring wall-clock time.
+struct CountingFile {
+  inner: SimFile,
+  reads: std::sync::atomic::AtomicU64,
+}
+
+impl CountingFile {
+  fn new(inner: SimFile) -> Self {
+    Self {
+      inner,
+      reads: std::sync::atomic::AtomicU64::new(0),
+    }
+  }
+
+  fn reads(&self) -> u64 {
+    self.reads.load(std::sync::atomic::Ordering::Relaxed)
+  }
+}
+
+impl BlockFile for CountingFile {
+  fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
+    self
+      .reads
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    self.inner.read_exact_at(buf, offset)
+  }
+
+  fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
+    self.inner.write_all_at(buf, offset)
+  }
+
+  fn sync_data(&self) -> Result<(), DiskError> {
+    self.inner.sync_data()
+  }
+
+  fn len(&self) -> Result<u64, DiskError> {
+    self.inner.len()
+  }
+
+  fn layout_block(&self) -> Alignment {
+    self.inner.layout_block()
+  }
+
+  fn alignment(&self) -> Alignment {
+    self.inner.alignment()
+  }
+}
+
+/// Builds the serialized bytes of a valid committed record for `repository` with `grant`.
+fn encoded_record(tool: Tool, repository: u128, grant: u64, payload_bytes: &[u8]) -> Vec<u8> {
+  let (mut log, _) = recovered(file(80));
+  let mut record = log
+    .begin(Header {
+      tool,
+      repository,
+      sequence: 1,
+      judged_over: 0,
+      grant,
+      work: 77,
+      time_ns: 777,
+      sections: 2,
+    })
+    .unwrap();
+  record.section(SectionKind::Record, 5).unwrap();
+  record.piece(b"heads").unwrap();
+  record
+    .section(
+      SectionKind::Payload,
+      u64::try_from(payload_bytes.len()).unwrap(),
+    )
+    .unwrap();
+  record.piece(payload_bytes).unwrap();
+  let located = record.commit().unwrap();
+  let image = log.into_file().durable_image().unwrap();
+  image[usize::try_from(located.offset).unwrap()..usize::try_from(located.end()).unwrap()].to_vec()
+}
+
+/// Builds a valid `SLCS` header declaring `sections` sections and a valid section head whose
+/// length equals [`HEADER_BYTES`], so `[header][head]` chains force overlapping framing scans.
+fn chained_header_and_head(sections: u16) -> (Vec<u8>, Vec<u8>) {
+  let (mut log, _) = recovered(file(81));
+  let mut record = log.begin(header(1, sections)).unwrap();
+  for _ in 0..sections {
+    record.section(SectionKind::Record, 0).unwrap();
+  }
+  let located = record.commit().unwrap();
+  let image = log.into_file().durable_image().unwrap();
+  let start = usize::try_from(located.offset).unwrap();
+  let header_bytes = image[start..start + HEADER_BYTES].to_vec();
+  let mut head = image[start + HEADER_BYTES..start + HEADER_BYTES + SECTION_HEAD_BYTES].to_vec();
+  head[S_LEN..S_CRC].copy_from_slice(&(HEADER_BYTES as u64).to_le_bytes());
+  (header_bytes, head)
+}
+
+/// Asserts that recovering `sim` keeps only `expected` with `log.end() == expected.end()` and
+/// `log.skipped() == 0`.
+fn assert_torn_ignored(sim: SimFile, expected: Located, label: &str) {
+  let (log, found) = recovered(sim);
+  assert_eq!(found, vec![expected], "{label}");
+  assert_eq!(log.end(), expected.end(), "{label}");
+  assert_eq!(log.skipped(), 0, "{label}");
+}
+
+/// Blocker 1: Do: place a whole valid committed record for repository 202 inside repository 101's
+/// torn record at EOF — in three variants: (a) trailer zeroed, (b) truncated mid-payload after the
+/// embedded record, and (c) uncommitted `Appending` dropped mid-payload — and recover.
+/// Expect: repository 202's forged record is NEVER recovered, `log.end()` stops right after
+/// repository 101's committed first record, and `log.skipped()` is 0.
+#[test]
+fn torn_record_carrying_valid_forged_record_never_indexes_it() {
+  let forged = encoded_record(
+    Tool::Mercurial,
+    202,
+    3,
+    b"FORGED: bytes repository 202's owner never pushed",
+  );
+
+  // Variant A: trailer zeroed at EOF.
+  let (mut log, _) = recovered(file(82));
+  let r1 = append_for(&mut log, Tool::Git, 101, 1, b"legit git push one");
+  let torn = append_for(&mut log, Tool::Git, 101, 2, &forged);
+  let sim = log.into_file();
+  sim
+    .write_all_at(&[0u8; TRAILER_BYTES], torn.end() - TRAILER_BYTES as u64)
+    .unwrap();
+  sim.sync_data().unwrap();
+  assert_torn_ignored(sim, r1, "trailer-zeroed variant must ignore forged payload");
+
+  // Variant B: truncated mid-payload (after the complete embedded forged record, before r2's end).
+  let mut padded = forged.clone();
+  padded.extend_from_slice(&[0x55; 256]);
+  let (mut log, _) = recovered(file(83));
+  let r1 = append_for(&mut log, Tool::Git, 101, 1, b"legit git push one");
+  let torn = append_for(&mut log, Tool::Git, 101, 2, &padded);
+  let image = log.into_file().durable_image().unwrap();
+  let cut = usize::try_from(torn.end()).unwrap() - 128;
+  let truncated = file(84);
+  truncated.write_all_at(&image[..cut], 0).unwrap();
+  truncated.sync_data().unwrap();
+  assert_torn_ignored(
+    truncated,
+    r1,
+    "truncated-mid-payload variant must ignore forged payload",
+  );
+
+  // Variant C: uncommitted Appending dropped mid-payload (section 1 head left zeroed).
+  let (mut log, _) = recovered(file(85));
+  let r1 = append_for(&mut log, Tool::Git, 101, 1, b"legit git push one");
+  {
+    let mut open = log.begin(header(2, 2)).unwrap();
+    open.section(SectionKind::Record, 5).unwrap();
+    open.piece(b"heads").unwrap();
+    open
+      .section(SectionKind::Payload, u64::try_from(forged.len()).unwrap())
+      .unwrap();
+    open.piece(&forged).unwrap();
+  }
+  assert_torn_ignored(
+    log.into_file(),
+    r1,
+    "dropped uncommitted tail must ignore forged payload",
+  );
+}
+
+/// Builds a payload of `count` chained valid `[header][head]` pairs declaring `sections` sections.
+fn chained_headers_payload(sections: u16, count: usize) -> Vec<u8> {
+  let (many_header, one_head) = chained_header_and_head(sections);
+  let mut chained = Vec::with_capacity((many_header.len() + one_head.len()) * count);
+  for _ in 0..count {
+    chained.extend_from_slice(&many_header);
+    chained.extend_from_slice(&one_head);
+  }
+  chained
+}
+
+/// Blocker 2: Do: fill a record's payload with `K` chained valid `[header][section_head]` pairs
+/// (declaring 4096 sections each) under both (a) a torn trailer at EOF and (b) a mid-file
+/// corrupted header, and count `BlockFile::read_exact_at` calls during recovery.
+/// Expect: (a) does O(1) reads without scanning the payload, and (b) stays strictly within the
+/// linear section-head read budget rather than blowing up quadratically (~K^2/2 reads).
+#[test]
+fn resync_over_chained_valid_headers_does_linear_work() {
+  let chained_payload = chained_headers_payload(4_096, 400);
+
+  // Case A: torn trailer at EOF carrying chained valid headers -> stops at r1 with O(1) reads.
+  let (mut log, _) = recovered(file(86));
+  let r1 = append_for(&mut log, Tool::Git, 101, 1, b"legit");
+  let torn = append_for(&mut log, Tool::Git, 101, 2, &chained_payload);
+  let sim = log.into_file();
+  sim
+    .write_all_at(&[0u8; TRAILER_BYTES], torn.end() - TRAILER_BYTES as u64)
+    .unwrap();
+  sim.sync_data().unwrap();
+  let mut found = Vec::new();
+  let log =
+    ChangesetLog::recover(CountingFile::new(sim), 0, |_, located| found.push(*located)).unwrap();
+  assert_eq!((found, log.end()), (vec![r1], r1.end()));
+  assert!(
+    log.file().reads() <= 32,
+    "torn trailer must not scan payload; got {} reads",
+    log.file().reads()
+  );
+
+  // Case B: mid-file corrupted header ahead of chained valid headers -> strictly linear reads.
+  let (mut log, _) = recovered(file(87));
+  let bad = append_for(&mut log, Tool::Git, 101, 1, &chained_payload);
+  let sim = log.into_file();
+  sim
+    .inject(Fault::BitFlip {
+      offset: bad.offset + 2,
+      bit: 0,
+      stored: true,
+    })
+    .unwrap();
+  let total_len = sim.len().unwrap();
+  let mut found = Vec::new();
+  let log =
+    ChangesetLog::recover(CountingFile::new(sim), 0, |_, located| found.push(*located)).unwrap();
+  let linear_cap = (total_len / SECTION_HEAD_BYTES as u64) * 3 + 64;
+  assert!(
+    found.is_empty() && log.file().reads() <= linear_cap,
+    "corrupted-header resync must stay linear (<= {linear_cap} reads), got {} reads",
+    log.file().reads()
+  );
+}
+
+/// Blocker 1 (grant filter): Do: corrupt record 1's header mid-file while record 1's payload holds
+/// a whole valid record carrying a foreign `grant` (999) and record 2 follows with victim `grant`
+/// (3); recover via `recover_for_grant(..., Some(3))`.
+/// Expect: the foreign-grant candidate is rejected and record 2 recovers with exact payload bytes.
+#[test]
+fn recover_for_grant_rejects_foreign_candidates_in_corrupt_span() {
+  let foreign = encoded_record(Tool::Mercurial, 202, 999, b"foreign store record");
+  let (mut log, _) = recovered(file(88));
+  let r1 = append_for(&mut log, Tool::Git, 101, 1, &foreign);
+  let real_bytes = payload(44, 512);
+  let r2 = append_for(&mut log, Tool::Subversion, 303, 1, &real_bytes);
+  let sim = log.into_file();
+  sim
+    .inject(Fault::BitFlip {
+      offset: r1.offset + 2,
+      bit: 0,
+      stored: true,
+    })
+    .unwrap();
+  let mut found = Vec::new();
+  let log =
+    ChangesetLog::recover_for_grant(sim, 0, Some(3), |_, located| found.push(*located)).unwrap();
+  assert_recovered_payloads(&log, &found, &[(r2, &real_bytes)]);
+}
+
+/// Blocker 1 (mid-file bad-trailer isolation): Do: corrupt BOTH record 1's trailer (whose payload
+/// holds a whole valid record with victim grant 3) AND record 2's header, while record 3 follows.
+/// Expect: scanning begins at record 2 (never inside record 1's payload), so the forged record
+/// inside record 1 is never indexed and record 3 recovers whole.
+#[test]
+fn mid_file_bad_trailer_followed_by_broken_header_never_scans_own_payload() {
+  let same_grant_forged = encoded_record(Tool::Mercurial, 202, 3, b"forged same-grant payload");
+  let (mut log, _) = recovered(file(89));
+  let r1 = append_for(&mut log, Tool::Git, 101, 1, &same_grant_forged);
+  let r2 = append_for(
+    &mut log,
+    Tool::Git,
+    101,
+    2,
+    b"second record with broken header",
+  );
+  let r3_bytes = payload(55, 640);
+  let r3 = append_for(&mut log, Tool::Subversion, 303, 1, &r3_bytes);
+  let sim = log.into_file();
+  sim
+    .inject(Fault::BitFlip {
+      offset: r1.end() - 8,
+      bit: 1,
+      stored: true,
+    })
+    .unwrap();
+  sim
+    .inject(Fault::BitFlip {
+      offset: r2.offset + 2,
+      bit: 0,
+      stored: true,
+    })
+    .unwrap();
+  let mut found = Vec::new();
+  let log =
+    ChangesetLog::recover_for_grant(sim, 0, Some(3), |_, located| found.push(*located)).unwrap();
+  assert_recovered_payloads(&log, &found, &[(r3, &r3_bytes)]);
 }

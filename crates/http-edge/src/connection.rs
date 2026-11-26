@@ -109,6 +109,20 @@ pub enum Decision {
     /// The fields.
     fields: Fields,
   },
+  /// Refuse it immediately at the request head (before `100 Continue` and without reading any
+  /// request body) with `status`, `fields`, `Content-Length: body.len()`, and `body` (omitting
+  /// body bytes on wire when `head_only` is true).
+  RefuseWithBody {
+    /// The status.
+    status: Status,
+    /// The fields.
+    fields: Fields,
+    /// The fixed-length refusal body bytes.
+    body: Vec<u8>,
+    /// Whether the reply is the head alone (`HEAD`): sends `Content-Length: body.len()` with zero
+    /// body bytes on wire.
+    head_only: bool,
+  },
 }
 
 /// Where a connection is, which says how long its listener may wait for its peer.
@@ -607,6 +621,12 @@ impl Connection {
         status,
       } => self.serve(request, fields, (head_only, status)),
       Decision::Refuse { status, fields } => self.refuse(request, status, &fields),
+      Decision::RefuseWithBody {
+        status,
+        fields,
+        body,
+        head_only,
+      } => self.refuse_with_body(request, status, &fields, &body, head_only),
     }
   }
 
@@ -658,16 +678,33 @@ impl Connection {
     };
   }
 
-  /// Refuses a request: the connection kept when the request leaves no body unread and asked to be kept, otherwise
-  /// ended in stages.
+  /// Refuses a request with no body: keeps the connection when the request leaves no body unread
+  /// and asked to be kept, otherwise ends it in stages.
   fn refuse(&mut self, request: Request, status: Status, fields: &Fields) {
+    self.refuse_with_body(request, status, fields, &[], false);
+  }
+
+  /// Refuses a request immediately at its head (before `100 Continue` and without reading any
+  /// request body) with `status`, `fields`, `Content-Length: body.len()`, and `body` (omitting
+  /// body bytes on wire when `head_only` is true). Keeps the connection when the request leaves no
+  /// body unread and asked to be kept; otherwise closes in stages (RFC 9112 §9.6).
+  fn refuse_with_body(
+    &mut self,
+    request: Request,
+    status: Status,
+    fields: &Fields,
+    body: &[u8],
+    head_only: bool,
+  ) {
     let keep = request.kept() && !request.has_body();
-    let mut head = Vec::new();
-    if reply::head(status, &borrowed(fields), Body::Length(0), !keep, &mut head).is_err() {
+    let Some(head) = render_refusal_head(status, fields, body.len(), !keep) else {
       self.refuse_staged(Status::INTERNAL_SERVER_ERROR);
       return;
-    }
+    };
     self.send(&head);
+    if !head_only && !body.is_empty() && !self.failed() {
+      self.send(body);
+    }
     if self.failed() {
       return;
     }
@@ -945,6 +982,27 @@ impl Connection {
   pub fn ended(&self) -> Option<Ended> {
     self.ended
   }
+}
+
+/// Renders a fixed-length refusal head into a buffer; `None` if `body_len` exceeds `u64` or a field
+/// cannot be carried.
+fn render_refusal_head(
+  status: Status,
+  fields: &Fields,
+  body_len: usize,
+  close: bool,
+) -> Option<Vec<u8>> {
+  let len = u64::try_from(body_len).ok()?;
+  let mut head = Vec::new();
+  reply::head(
+    status,
+    &borrowed(fields),
+    Body::Length(len),
+    close,
+    &mut head,
+  )
+  .ok()?;
+  Some(head)
 }
 
 /// Renders a served reply's head for `request` into `out`: `status`, `fields`, chunked to HTTP/1.1 and framed by the

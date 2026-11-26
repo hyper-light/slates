@@ -291,6 +291,9 @@ fn with_cache(pairs: &[(&str, &str)]) -> Fields {
 fn refusal<E>(decided: &Decided<E>) -> (Status, Fields, bool) {
   match &decided.answer {
     Answer::Refuse { status, fields } => (*status, fields.clone(), decided.proven),
+    Answer::RefuseWithBody { status, .. } => {
+      panic!("refused with body {status:?} where a bodyless refusal was expected")
+    }
     Answer::Serve { .. } => panic!("served where a refusal was expected"),
     Answer::Move { shard } => panic!("moved to shard {shard} where a refusal was expected"),
   }
@@ -306,7 +309,9 @@ fn served<E>(decided: Decided<E>) -> (Fields, bool, E, bool) {
       exchange,
       ..
     } => (fields, head_only, exchange, decided.proven),
-    Answer::Refuse { status, .. } => panic!("refused {status:?} where a service was expected"),
+    Answer::Refuse { status, .. } | Answer::RefuseWithBody { status, .. } => {
+      panic!("refused {status:?} where a service was expected")
+    }
     Answer::Move { shard } => panic!("moved to shard {shard} where a service was expected"),
   }
 }
@@ -919,7 +924,9 @@ fn served_lfs<E>(decided: Decided<E>) -> (Fields, bool, StatusMode, E, bool) {
       status,
       exchange,
     } => (fields, head_only, status, exchange, decided.proven),
-    Answer::Refuse { status, .. } => panic!("refused {status:?} where a service was expected"),
+    Answer::Refuse { status, .. } | Answer::RefuseWithBody { status, .. } => {
+      panic!("refused {status:?} where a service was expected")
+    }
     Answer::Move { shard } => panic!("moved to shard {shard} where a service was expected"),
   }
 }
@@ -1151,39 +1158,48 @@ impl Repositories for UnrecoveredHeld {
   }
 }
 
-/// Drives one request against an unrecovered `GitSite`, asserting `503 Service Unavailable`, the
-/// expected response fields, `head_only`, and `StatusMode::AfterBody`, and returning the exchange.
-fn assert_unrecovered_reply(
+/// Asserts that `asked` against an unrecovered `GitSite` returns an immediate
+/// `Answer::RefuseWithBody` (`503 Service Unavailable`) with `expected_fields`, `expected_head_only`,
+/// `proven == true`, and a newline-terminated body containing `Unlanded`.
+fn assert_unrecovered_refusal(
   site: &mut GitSite<Tokens, UnrecoveredHeld, Unserved>,
   asked: &[u8],
   expected_fields: &[(Vec<u8>, Vec<u8>)],
   expected_head_only: bool,
-  request_body: Option<&[u8]>,
-) -> impl Exchange + use<> {
-  let (fields, head_only, status_mode, mut exchange, proven) =
-    served_lfs(ready(site.answer(&head(asked), true)));
+) {
+  let decided = ready(site.answer(&head(asked), true));
+  let Answer::RefuseWithBody {
+    status,
+    fields,
+    body,
+    head_only,
+  } = decided.answer
+  else {
+    panic!("expected immediate Answer::RefuseWithBody for unrecovered repository");
+  };
+  let text = String::from_utf8(body).unwrap();
   assert_eq!(
-    (fields.as_slice(), head_only, status_mode, proven),
+    (status, fields.as_slice(), head_only, decided.proven),
     (
+      Status::SERVICE_UNAVAILABLE,
       expected_fields,
       expected_head_only,
-      StatusMode::AfterBody,
-      true
+      true,
     )
   );
-  if let Some(chunk) = request_body {
-    ready(exchange.body(chunk)).unwrap();
-  }
-  ready(exchange.body_end(ClientGone::never())).unwrap();
-  assert_eq!(exchange.reply_status(), Status::SERVICE_UNAVAILABLE);
-  exchange
+  assert!(
+    text.contains("Unlanded") && text.ends_with('\n'),
+    "expected newline-terminated Unlanded diagnostic body, got: {text:?}"
+  );
 }
 
-/// Deliverable 3: Do: ask for `GET`, `HEAD`, and `POST` on an unrecovered Git repository whose
-/// store failed recovery with `ReplayRefused::Unlanded`.
-/// Expect: `503 Service Unavailable` with `Content-Type: text/plain; charset=utf-8`, the cache
-/// fields, `StatusMode::AfterBody`, and a non-empty typed diagnostic body naming `Unlanded`
-/// (`head_only == true` for `HEAD`).
+/// Deliverable 3 / Suggestion 1: Do: ask for `GET`, `HEAD`, and `POST` (with `Expect: 100-continue`)
+/// on an unrecovered Git repository whose store failed recovery with `ReplayRefused::Unlanded`,
+/// plus unauthenticated (`401`), unauthorized (`403`), and bad media type (`415`) requests.
+/// Expect: authorized requests return immediate `Answer::RefuseWithBody` (`503`,
+/// `Content-Type: text/plain; charset=utf-8`, cache fields, `Unlanded\n` body, `head_only == true`
+/// for `HEAD`) before `100 Continue`; `401`/`403`/`415` order and empty-body `Answer::Refuse` are
+/// preserved.
 #[test]
 fn an_unrecovered_git_repository_returns_503_with_typed_refusal_body() {
   let reason = crate::vcs_store::ReplayRefused::Unlanded.diagnostic();
@@ -1204,39 +1220,41 @@ fn an_unrecovered_git_repository_returns_503_with_typed_refusal_body() {
   let expected_fields = with_cache(&[("Content-Type", "text/plain; charset=utf-8")]);
 
   let get_refs = request("GET", UPLOAD_ADVERTISEMENT, &[OWNER_BEARER]);
-  let mut exchange = assert_unrecovered_reply(&mut site, &get_refs, &expected_fields, false, None);
-  let body = String::from_utf8(replies(&mut exchange).concat()).unwrap();
-  assert!(
-    body.contains("Unlanded"),
-    "expected typed Unlanded body, got: {body:?}"
-  );
-  assert!(
-    body.ends_with('\n'),
-    "diagnostic body should end with newline: {body:?}"
-  );
+  assert_unrecovered_refusal(&mut site, &get_refs, &expected_fields, false);
 
   let head_refs = request("HEAD", UPLOAD_ADVERTISEMENT, &[OWNER_BEARER]);
-  let _ = assert_unrecovered_reply(&mut site, &head_refs, &expected_fields, true, None);
+  assert_unrecovered_refusal(&mut site, &head_refs, &expected_fields, true);
 
-  let post_upload = request(
+  let post_receive = request(
     "POST",
-    "/r.git/git-upload-pack",
+    "/r.git/git-receive-pack",
     &[
       OWNER_BEARER,
-      "Content-Type: application/x-git-upload-pack-request",
+      "Content-Type: application/x-git-receive-pack-request",
       "Content-Length: 4",
+      "Expect: 100-continue",
     ],
   );
-  let mut exchange = assert_unrecovered_reply(
-    &mut site,
-    &post_upload,
-    &expected_fields,
-    false,
-    Some(b"0000"),
+  assert_unrecovered_refusal(&mut site, &post_receive, &expected_fields, false);
+
+  // Auth and route-before-auth order remain bodyless `Answer::Refuse`.
+  let anon = request("GET", UPLOAD_ADVERTISEMENT, &[]);
+  let stranger = request("GET", UPLOAD_ADVERTISEMENT, &[STRANGER_BEARER]);
+  let bad_media = request(
+    "POST",
+    "/r.git/git-upload-pack",
+    &["Content-Type: text/plain"],
   );
-  let body = String::from_utf8(replies(&mut exchange).concat()).unwrap();
-  assert!(
-    body.contains("Unlanded"),
-    "expected typed Unlanded body on POST, got: {body:?}"
+  assert_eq!(
+    (
+      refusal(&ready(site.answer(&head(&anon), true))).0,
+      refusal(&ready(site.answer(&head(&stranger), true))).0,
+      refusal(&ready(site.answer(&head(&bad_media), true))).0,
+    ),
+    (
+      Status::UNAUTHORIZED,
+      Status::FORBIDDEN,
+      Status::UNSUPPORTED_MEDIA_TYPE,
+    )
   );
 }

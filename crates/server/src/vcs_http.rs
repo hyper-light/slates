@@ -320,6 +320,19 @@ pub(crate) enum Answer<E> {
     /// The fields.
     fields: Fields,
   },
+  /// Refuse it immediately at the request head (before `100 Continue` and without reading any
+  /// request body) with `status`, `fields`, `Content-Length: body.len()`, and `body` (omitting
+  /// body bytes on wire when `head_only` is true).
+  RefuseWithBody {
+    /// The status.
+    status: Status,
+    /// The fields.
+    fields: Fields,
+    /// The fixed-length refusal body bytes.
+    body: Vec<u8>,
+    /// Whether the reply is the head alone (`HEAD`).
+    head_only: bool,
+  },
   /// Decide it on runtime shard `shard`, where its repository lives: the connection moves there whole, its head
   /// undecided (the module doc).
   Move {
@@ -364,6 +377,17 @@ impl<E> Decided<E> {
         exchange: wrap(exchange),
       },
       Answer::Refuse { status, fields } => Answer::Refuse { status, fields },
+      Answer::RefuseWithBody {
+        status,
+        fields,
+        body,
+        head_only,
+      } => Answer::RefuseWithBody {
+        status,
+        fields,
+        body,
+        head_only,
+      },
       Answer::Move { shard } => Answer::Move { shard },
     };
     Decided {
@@ -1276,6 +1300,20 @@ impl<S: Site> Parts<S> {
       Answer::Refuse { status, fields } => {
         self.service = None;
         connection.decide(Decision::Refuse { status, fields });
+      }
+      Answer::RefuseWithBody {
+        status,
+        fields,
+        body,
+        head_only,
+      } => {
+        self.service = None;
+        connection.decide(Decision::RefuseWithBody {
+          status,
+          fields,
+          body,
+          head_only,
+        });
       }
     }
     Flow::Go
