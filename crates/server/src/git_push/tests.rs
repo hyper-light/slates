@@ -4579,3 +4579,77 @@ fn a_derivation_brings_a_window_let_go_under_it_back_again_and_derives_the_same(
     "the windows let go again"
   );
 }
+
+/// `green`'s id in a refusal's words: its bytes in lower-case hex.
+fn hex_of(green: slates_db::catalog::VolumeId) -> String {
+  green
+    .bytes
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect()
+}
+
+/// Asserts that `received` refused its one command naming `words` on band 2, never "holds files no commit names".
+fn assert_refused_naming(received: &Received, words: &str) {
+  assert_eq!(reasons(received), [b"failed to update ref".to_vec()]);
+  assert_first_line_names(received, words.as_bytes());
+  assert!(
+    !received.outcomes.iter().any(|outcome| matches!(
+      outcome,
+      Outcome::Ng(Declined { message: Some(line), .. })
+        if line.windows(NO_COMMIT_NAMES.len()).any(|seen| seen == NO_COMMIT_NAMES)
+    )),
+    "the old false reason"
+  );
+}
+
+/// The words of the reason A-927 retired for a default green this node could not read.
+const NO_COMMIT_NAMES: &[u8] = b"holds files no commit names";
+
+/// A-927 (main's ruling of 2026-11-25; the a894 loop, docs/design/amendments/A-927): a successor that gave a
+/// repository's root green up answered the first push's create "the default branch holds files no commit names", which
+/// it did not know. Do: make a git repository; record its default green not recovered, as a takeover that gave it up
+/// records it; push `main`'s create. Expect: the create refused naming the green and its cause's kind on band 2,
+/// never "holds files no commit names" (before, it landed on the green this node had not recovered).
+#[test]
+fn t_a927_a_create_on_a_default_green_not_recovered_is_refused_naming_it() {
+  let asked = ("given-up", VcsTool::Git, WireFormat::Sha1, "main");
+  let (received, green) = crate::test_store::audit_on_stored_shard_made(
+    (&owner(), asked),
+    |state, (repository, green)| {
+      let cause = slates_ipc::protocol::RecoveryCause::TakeoverIncomplete {
+        waited_on: "inputs".to_owned(),
+      };
+      state.unrecovered.insert(green, cause);
+      (pushed(state, repository, chain()[0].0.request), green)
+    },
+  );
+  let words = format!(
+    "the default branch's green {} is not recovered here (TakeoverIncomplete)",
+    hex_of(green)
+  );
+  assert_refused_naming(&received, &words);
+}
+
+/// A-927: a successor still materializing an adopted repository holds its record before its root green's engine. Do:
+/// make a git repository; take its default green's engine out of its lineage; push `main`'s create; put it back.
+/// Expect: the create refused naming the green as not made here yet, to retry, on band 2, never "holds files no commit
+/// names".
+#[test]
+fn t_a927_a_create_on_a_default_green_not_made_here_is_refused_to_retry() {
+  let asked = ("unmade", VcsTool::Git, WireFormat::Sha1, "main");
+  let (received, green) = crate::test_store::audit_on_stored_shard_made(
+    (&owner(), asked),
+    |state, (repository, green)| {
+      let engine = state.greens.take_any(&green).expect("the green was made");
+      let received = pushed(state, repository, chain()[0].0.request);
+      state.greens.put_back_any(&green, engine);
+      (received, green)
+    },
+  );
+  let words = format!(
+    "the default branch's green {} is not made here yet; retry",
+    hex_of(green)
+  );
+  assert_refused_naming(&received, &words);
+}

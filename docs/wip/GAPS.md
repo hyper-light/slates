@@ -266,6 +266,12 @@
 > or refused `AlreadyExists` naming the adopted one, whose name is reserved until its rebuild (before, the retry made
 > a second repository of the name). Red first (`a915_...`, the kill held between the record and the join). OWED
 > (main): gate 19 at 40 + 40 with each failed run's daemon log.
+> **FIXED in part (A-927 part 1, w-shared, 2026-11-25; main 01a20182's ruling): after A-915, a894's loop refused the
+> first push "the default branch holds files no commit names" on a successor that had given the root green up.** A
+> create on a default green this node has not recovered now says so, naming the green and its cause, and one not made
+> here yet says to retry; before, both read as files, and a green not recovered whose engine was still lent took the
+> create. Red first (`t_a927_...`). OPEN (A-927 part 2, w-shared): the `Unjoined` adoption reads the join from its
+> cohort before giving the green up.
 > **FIXED (A-913, w-shared, 2026-11-24; A-912's sibling): a branch created while a member died refused `unable to
 > commit` at its record barrier (3 of 25 runs).** The restarted holder held its source's records but no replica, and
 > the record path branched only from a replica already there; now it makes a missing source first, as a branch's

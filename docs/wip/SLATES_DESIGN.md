@@ -64066,6 +64066,9 @@ Applied in the same change to: `crates/server/src/{edges,daemon,fleet,state,lib,
   - a894, its own flake's scene, green.
 - **Models.** None of `docs/wip/models/` models a creation's answer, the names log or an adoption's wait; no spec
   changed.
+- **Amended by A-927 part 1** (2026-11-25): the green an adoption gives up is not said to hold files. A create on it
+  is refused naming the green and its cause (`NotRecovered`'s kind), where before it was refused "the default branch
+  holds files no commit names" (a894's loop after A-915).
 
 Applied in the same change to: §4.16 "Apply on holders", the A-894 entry, `crates/server/src/{live_ship,state_log,
 merge_service,merge_origin,green_adopt,fleet,state,daemon,repository,takeover}.rs`, `crates/server/tests/fleet.rs`,
@@ -64594,3 +64597,31 @@ measured noise of the 100 figure, not a literal.
   - `crates/server/src/daemon.rs` (the open, the give-back's lowering);
   - `crates/server/src/content_ranges.rs` (the block's page in the plan, the marks' rows);
   - A-826's GAPS entry.
+
+### A-927 part 1 — A create on a default green this node cannot read says why: not recovered, or not made here yet, the green named (2026-11-25, w-shared for main 01a20182, its ruling of 2026-11-25 step 1; the a894 loop after A-915; amends A-654 and A-915)
+
+- **Why.** In main's a894 loop after A-915, a successor whose adoption of a repository's root green was refused
+  (A-915's `Unjoined`: the names-log part carrying the join reached only the other survivor) gave the green up. The
+  client's first push then created `main` there and was refused "the default branch holds files no commit names"
+  (`NO_EMPTY_DEFAULT`). The green held nothing; this node held no engine for it. `git_push::empty_default` answered
+  `None` for every way the default green was not an unborn, empty one. Unbound, holding files, given up and not made
+  here yet all read alike, as files. And a green this node had not recovered, whose engine was still lent, took the
+  create: an unrecovered green was written.
+- **The change.** `empty_default` answers why not (`NoEmptyDefault`), and the create's refusal carries its own words on
+  band 2 (git's `failed to update ref` in the report, as every refusal of slates' own):
+  - the default green in `ShardState::unrecovered`: "the default branch's green `<hex>` is not recovered here
+    (`<RecoveryCause::kind>`)", read before the engine, so a lent engine of a green not recovered is never written;
+  - the repository's git store or the green's engine not lent here (an adoption still materializing it, or its lineage
+    lent out): "the default branch's green `<hex>` is not made here yet; retry";
+  - no default branch, no green bound to it, or a green holding a git version, a file at its version 0 or a push it
+    owes (P2; lent as a create lends, `Greens::lend`): the old words, which are then true.
+- **Part 2, next:** an `Unjoined` adoption reads the names-log part carrying the join from its cohort through A-919's
+  read before refusing, and the deterministic red (state-log shipping held to the successor-to-be).
+- **Tests.** Red on the code before (the source change reverse-applied, the tests kept):
+  - `git_push::tests::t_a927_a_create_on_a_default_green_not_recovered_is_refused_naming_it`: the create landed (`ok`)
+    on the green recorded not recovered.
+  - `git_push::tests::t_a927_a_create_on_a_default_green_not_made_here_is_refused_to_retry` (its engine taken out of
+    its lineage): refused "the default branch holds files no commit names", a894's very words.
+- **Models.** None of `docs/wip/models/` models a push's create; no spec changed.
+- **Applied in the same change to:** `crates/server/src/git_push.rs` (the module docs' "A create", `NoEmptyDefault`,
+  `empty_default`), its tests, A-915's entry, GAPS (A-915's entry).
