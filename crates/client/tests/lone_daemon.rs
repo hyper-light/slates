@@ -655,6 +655,36 @@ fn judged_by(line: &str) -> Duration {
   Duration::from_millis(ms)
 }
 
+/// Format: the end line's words naming the thread that started the daemon: the role's, which libtest names after its
+/// test.
+const STARTED_ON_WORDS: &str = "the daemon was started on thread a_lone_daemon_role";
+/// Format: the end line's words after its window's major page faults, where the platform counts them.
+#[cfg(unix)]
+const FAULTS_WORDS: &str = " major page faults over its window (ru_majflt)";
+/// Format: the end line's words where the platform counts no major page faults.
+#[cfg(not(unix))]
+const FAULTS_WORDS: &str = "major page faults not counted on this platform (no ru_majflt)";
+
+/// Main's ruling of 2026-11-26 (an exit 4's line must name what it can): the end line `line` names the thread that
+/// started the daemon and the major page faults over the stuck shard's window, a number of them where the platform
+/// counts them.
+fn assert_names_its_start_and_faults(name: &str, line: &str) {
+  assert!(
+    line.contains(STARTED_ON_WORDS),
+    "{name}: the end line names the thread that started the daemon: {line}"
+  );
+  let faults = line
+    .split(FAULTS_WORDS)
+    .next()
+    .filter(|_| line.contains(FAULTS_WORDS));
+  #[cfg(unix)]
+  let faults = faults.and_then(|before| before.rsplit(' ').next()?.parse::<u64>().ok());
+  assert!(
+    faults.is_some(),
+    "{name}: the end line names its window's major page faults: {line}"
+  );
+}
+
 /// One lone daemon held `hold` with a call outstanding: the daemon must end itself within the rule's bound, with the
 /// failed exit code, and the call must end `DaemonGone`.
 ///
@@ -723,6 +753,7 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
   let gone_ns = ended
     .gone_at_ns
     .unwrap_or_else(|| panic!("{name}: the client's liveness never answered the daemon gone"));
+  assert_names_its_start_and_faults(name, &line);
   let window = judged_by(&line);
   assert!(
     window >= WINDOW,
