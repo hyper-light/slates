@@ -3694,6 +3694,9 @@ fn a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step() {
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
+  // A fresh daemon knows its recovery memory unwritten (A-926): taken as written whole, as over an image before the
+  // marks, so its idle ticks have all of it to give back.
+  daemon.take_recovery_memory_as_written_whole().unwrap();
   let mut client = connect(&instance);
   let volume = client.create(&scratch("probed")).unwrap();
   let window = Duration::from_nanos(
@@ -3729,9 +3732,10 @@ fn a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step() {
     );
   }
   daemon.stop();
-  // The judge every Linux and macOS host can apply: a restarted daemon has not seen its recovery memory written, so it
-  // gives all of it back again, and each step's CPU on the shard's own thread clock is what the step held the shard.
+  // The judge every Linux and macOS host can apply: a restarted daemon's recovery memory taken as written whole again, so
+  // it gives all of it back, and each step's CPU on the shard's own thread clock is what the step held the shard.
   let restarted = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  restarted.take_recovery_memory_as_written_whole().unwrap();
   assert_each_give_back_step_takes_about_a_quantum(&restarted);
   restarted.stop();
   drop(anchor);
@@ -3860,7 +3864,17 @@ fn returned_after_idle(daemon: &Daemon, before: u64) -> u64 {
       .copied()
       .unwrap_or(0)
   };
+  // Bounded, so a give-back that never counts fails the test rather than spins it (a 38-minute hang on 2026-11-25, when
+  // A-926 left the journal's dead ranges in byte extents off the object's pages and every page-sized piece of the
+  // give-back held no whole page).
+  let patience = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(60));
+  let began = std::time::Instant::now();
   while cfg!(any(target_os = "linux", target_os = "macos")) && returned() <= before {
+    assert!(
+      began.elapsed() < patience,
+      "no recovery memory given back within {patience:?}: {} bytes counted",
+      returned()
+    );
     std::thread::yield_now();
   }
   returned()

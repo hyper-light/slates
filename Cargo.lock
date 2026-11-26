@@ -1958,6 +1958,7 @@ dependencies = [
  "slates-pace",
  "slates-rt",
  "slates-seal",
+ "slates-server",
  "slates-ssh",
  "slates-store",
  "slates-svn",

@@ -64586,6 +64586,25 @@ measured noise of the 100 figure, not a literal.
     now opens over the extents its predecessor's marks carry, and every written byte stays inside the written ranges.
 - **Measured** (debug, the MacBook, 2026-11-25): the sweep 3,495,300 pages (12,582,958 before). Alone, 1.6 s over
   40,988 idle slices (23.7 s, 1,185,392 before). Loaded, two hogs a core, 1.6 s over 40,730 (55.5 s, 3,075,443 before).
+- **The regression part 1 left, fixed (2026-11-25, main's ruling the same day).** The journal's extents are bytes, so a
+  dead range ended where its bytes did, off a page, and a give-back takes whole pages only. Every page-sized piece of
+  the top-down give-back straddled two pages: a one-page slice (the slice before a rate is learned) gave nothing back,
+  the extents fell anyway, and the recovery test's wait for pages given back never ended (38 minutes on the Studio).
+  - **The rule:** each dead range is given back to the object's page boundary at or past its last byte, within its
+    memory (the stale slot's end, the log's end), in the object's own pages, since a region need not start on one. An
+    empty range stays empty: rounded, its partial page took a share of every slice and the give-back never ended (the
+    unit test's first green run found it, 77,485 steps of nothing).
+  - **Red:** `a_one_page_give_back_takes_the_pages_of_extents_that_end_off_a_page` (daemon unit test): on main, dead
+    stale slot (0, 46) and log (0, 73) fell to nothing with 0 bytes given back; with the rule, 16,384 bytes given back
+    and 0 left. `returned_after_idle` in `tests/recovery.rs` is bounded at sixty liveness budgets with a typed failure.
+  - **The boot test's premise:** a fresh daemon's marks say its recovery memory is unwritten, so it has nothing to
+    give back, and `a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step` failed typed on main. It now takes the
+    memory as written whole first (`Daemon::take_recovery_memory_as_written_whole`), as a daemon over an image before
+    the marks would. That method is test support only, behind `slates-server`'s `test-support` feature (and
+    `cfg(test)`), turned on by the crate's own dev-dependency on itself; with resolver 2 a dev-dependency's features
+    stay out of a normal build: `cargo tree -p slates-cli -e features --edges normal`, the `slates` binary that runs
+    the daemon, and the same for `slates-server`, `-api`, `-client`, `-mcp`, `-archive` and `--workspace` show no
+    `test-support` (0 lines each), while the dev edges show it.
 - **Part 2, owed:** the segment's log and snapshot regions (3,495,255 pages, the anchor's format, the register's code)
   get marks of their own, with their own migration.
 - **Applied in the same change to:**
