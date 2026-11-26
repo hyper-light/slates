@@ -169,6 +169,8 @@ pub struct Counters {
   pub waiting_asked: u64,
   /// The asks that found someone waiting, so the step yielded.
   pub waiting_found: u64,
+  /// Of the asks, those that harvested I/O ([`ShardContext::harvest_period_ns`]): at most one a harvest period.
+  pub paced_harvests: u64,
   /// Pollers woken because their ring had something (client command rings).
   pub poller_wakes: u64,
   /// Idle spins that ran out and parked.
@@ -388,6 +390,11 @@ pub struct ShardContext {
   /// How far the poll under way may run, on the shard clock, since a paced step last asked and found no one waiting
   /// (A-783): the long-step count judges a poll against this, not the bare quantum.
   poll_allowed_until_ns: Cell<u64>,
+  /// What a harvest of I/O asked by a paced step costs ([`Self::others_waiting`]), measured as the pace measures its probe
+  /// (`slates_pace::UnitCost`): the `c` of [`Self::harvest_period_ns`].
+  harvest_cost: Cell<slates_pace::UnitCost>,
+  /// When I/O was last harvested, on the shard clock, by any of its harvests.
+  harvested_at_ns: Cell<u64>,
   /// The tasks of the step's batch still to be polled after the one under way (A-783): taken out of the ready queue
   /// with it, so neither the queue nor the control channel shows them, yet each waits on this poll.
   batch_left: Cell<usize>,
@@ -598,6 +605,8 @@ impl ShardContext {
       fixed_quantum_ns: config.step_budget_ns,
       step_ceiling_ns: Cell::new(None),
       poll_allowed_until_ns: Cell::new(0),
+      harvest_cost: Cell::new(slates_pace::UnitCost::default()),
+      harvested_at_ns: Cell::new(0),
       batch_left: Cell::new(0),
       fixed_spin_ns: config.spin_ns,
       parks_at_once: slates_machine::round_robin::holds() == Some(true),
@@ -750,9 +759,10 @@ impl ShardContext {
 
   /// Whether anyone else waits on this shard now (A-783; asked once a paced step's quantum, never once a unit): an
   /// inbound ring's word, a ready poller (woken, since asking may consume its signal, as the idle spin does), the
-  /// driver's pending or harvested completions (a non-blocking poll, as a busy run's harvest), a due timer, a ready
-  /// task, or a task of the step's batch not yet polled. Counted ([`Counters::waiting_asked`],
-  /// [`Counters::waiting_found`]).
+  /// driver's pending completions, a due timer, a ready task, or a task of the step's batch not yet polled, looked at
+  /// every ask; and the driver's harvested completions (a non-blocking poll, as a busy run's harvest), harvested only
+  /// once the last harvest is [`Self::harvest_period_ns`] old. Counted ([`Counters::waiting_asked`],
+  /// [`Counters::waiting_found`], [`Counters::paced_harvests`]).
   pub fn others_waiting(&self) -> bool {
     let now = self.now_ns();
     let mut waiting = self.has_inbound();
@@ -768,7 +778,17 @@ impl ShardContext {
       })
       .unwrap_or(false);
     waiting = waiting || inner;
-    waiting = self.harvest_io() || waiting;
+    let harvesting = now.saturating_sub(self.harvested_at_ns.get()) >= self.harvest_period_ns();
+    if harvesting {
+      let harvested = self.harvest_io();
+      let mut cost = self.harvest_cost.get();
+      cost.add(
+        self.now_ns().saturating_sub(now),
+        slates_pace::target_ppm(self.scheduler_overrun_ns(), self.quantum_ns()),
+      );
+      self.harvest_cost.set(cost);
+      waiting = harvested || waiting;
+    }
     // The rest of this step's batch waits too: taken from the queue with the task asking, it is in no queue now.
     waiting = waiting || !self.local.is_empty() || self.batch_left.get() > 0;
     if !waiting {
@@ -783,8 +803,36 @@ impl ShardContext {
       if waiting {
         inner.counters.waiting_found = inner.counters.waiting_found.saturating_add(1);
       }
+      if harvesting {
+        inner.counters.paced_harvests = inner.counters.paced_harvests.saturating_add(1);
+      }
     });
     waiting
+  }
+
+  /// Derived: how long a paced step's asks leave I/O unharvested (A-783, main 01a20182's ruling of 2026-11-25): `P =
+  /// max(c, o)`, `c` a harvest's measured cost ([`Self::harvest_cost`]) and `o` the shard's measured scheduler overrun
+  /// ([`Self::scheduler_overrun_ns`]): no waiter on this shard is woken more precisely than the scheduler lets it run, so
+  /// harvesting sooner than that buys an arrival nothing, and a harvest takes at most `c / o` of a paced step. On a quiet
+  /// host (`o` under `c`) every ask a harvest's cost after the last harvests, as before; with nothing measured, every
+  /// ask. A socket's arrival mid-step is seen up to `P` later, never past the step's end, where the run loop harvests;
+  /// an inbound ring's word, a due timer, a ready task or a ready poller are seen at the next ask. Measured: on
+  /// git/git's clone the harvest was 39 % of the encoding behind a push (main's sample: 375 of 951 samples in `kevent`
+  /// under `others_waiting`). The pace's own target error was the first rule (`P = c / s`), and it fell at both ends:
+  /// `s` clamps to the whole wherever the overrun passes a quantum, every ask harvesting under load, and to a part in a
+  /// million on a quiet host, seconds between harvests (`a_connection_arriving_on_a_busy_shard_is_seen_waiting` unseen).
+  pub fn harvest_period_ns(&self) -> u64 {
+    self
+      .harvest_cost
+      .get()
+      .estimate_ns()
+      .max(self.scheduler_overrun_ns())
+  }
+
+  /// Holds the measured scheduler overrun at `ns` (a test's stand-in for a loaded host's, [`Self::harvest_period_ns`]).
+  #[cfg(test)]
+  pub(crate) fn hold_scheduler_overrun_ns(&self, ns: u64) {
+    self.scheduler_overrun_ns.set(ns);
   }
 
   /// Whether any inbound ring holds a word (a check without a syscall).
@@ -1458,6 +1506,7 @@ impl ShardContext {
   /// driver error other than loss is left for the next real wait to surface; loss is likewise deferred
   /// (this is a best-effort poll, not the loop's liveness point).
   fn harvest_io(&self) -> bool {
+    self.harvested_at_ns.set(self.now_ns());
     self
       .with_inner(|inner| {
         let mut completions = std::mem::take(&mut inner.completions);
@@ -2554,3 +2603,6 @@ fn unlink_child(arena: &mut Slab<TaskSlot>, parent: u32, child: u32) {
 pub fn boxed<F: std::future::Future<Output = ()> + 'static>(future: F) -> BoxedFuture {
   Box::pin(future) as Pin<Box<dyn std::future::Future<Output = ()>>>
 }
+
+#[cfg(test)]
+mod harvest_tests;

@@ -1969,18 +1969,10 @@ pub(crate) fn shard_pace_env(state: &ShardState) -> slates_pace::Env {
 }
 
 /// A unit estimate's target relative error, parts per million (A-783, `slates_pace::Env::target_ppm`): the scheduler's
-/// own measured jitter over the quantum, at least one part, at most the whole.
+/// own measured jitter over the quantum, at least one part, at most the whole ([`slates_pace::target_ppm`], which the
+/// runtime's harvest period reads too).
 pub(crate) fn target_ppm(jitter_ns: u64, quantum_ns: u64) -> u64 {
-  // Format: parts per million.
-  const MILLION: u64 = 1_000_000;
-  u64::try_from(
-    u128::from(jitter_ns)
-      .saturating_mul(u128::from(MILLION))
-      .checked_div(u128::from(quantum_ns.max(1)))
-      .unwrap_or(0),
-  )
-  .unwrap_or(u64::MAX)
-  .clamp(1, MILLION)
+  slates_pace::target_ppm(jitter_ns, quantum_ns)
 }
 
 impl PushTurns {

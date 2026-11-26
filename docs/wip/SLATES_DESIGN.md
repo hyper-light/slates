@@ -59580,6 +59580,27 @@ C1's, keeps the paths the verb's fetch holds only lengths of), `verbs.rs` (`edit
   polls' length histogram; `futures`; `tests/pacing.rs`), `crates/merge` (`pace`, `push`), `crates/git`
   (`receive::works`), `crates/server` (`git_push`, `daemon`, `content_ranges`: the runtime's counters as status rows),
   `crates/cli/bench/pacing_ab.py` (new), §4.3, GAPS, BENCHMARKS.md, amendments.tsv.
+- **The ask harvests I/O once a harvest period (2026-11-25, w-git for main 01a20182, its ruling on the period).** A
+  3 s sample of git/git's clone waiting for its first pack bytes found the encoding behind the push spending 39 % of
+  its time in the `kevent` of `harvest_io` under `others_waiting` (375 of its 951 samples): one ask a quantum, as
+  built, but the quantum is the wake estimate, a few microseconds, raised to the ask's own measured cost, so asking
+  could take half a step. Now an ask looks at the inbound rings, the ready queue and the step's batch, due timers,
+  ready pollers and the driver's pending completions every time, and harvests I/O only once the last harvest (by any
+  path) is `ShardContext::harvest_period_ns` old: `P = max(c, o)`, `c` a harvest's cost measured as the pace measures
+  its probe (`slates_pace::UnitCost`), `o` the shard's measured scheduler overrun. No waiter on the shard is woken more
+  precisely than the scheduler lets it run, so a harvest sooner than `o` buys nothing, and a harvest takes at most
+  `c / o` of a paced step; on a quiet host every ask a harvest's cost apart harvests, as before. Its cost: a socket's
+  arrival mid-step is seen up to `P` later, never past the step's end (where the run loop harvests); a ring's word, a
+  due timer, a ready task or poller at the next ask, so the client ring path is untouched. The first rule tried, `P =
+  c / s` with `s` the pace's target error (`slates_pace::target_ppm`, moved there from the server so the runtime reads
+  it), fell at both ends: `s` clamps to the whole wherever the overrun passes a quantum, so every ask harvested under
+  load, and to a part in a million on a quiet host, so `tests/pacing.rs`'s
+  `a_connection_arriving_on_a_busy_shard_is_seen_waiting` saw no connection for its 2 s. Counted:
+  `Counters::paced_harvests` beside `waiting_asked`. Reds (`shard::harvest_tests`):
+  `a_loaded_shards_asks_harvest_io_once_its_overrun`, the overrun held at 200 µs and the loop asking for 4 ms, 219
+  harvests of 219 asks before, the harvests within the time over the period plus one now, the asks many more; and
+  `a_quiet_shards_asks_a_harvests_cost_apart_each_harvest`, every ask harvesting with no overrun. Main judges it on the
+  interleaved git/git A/B: first pack bytes, and the VCS edge's socket latency under load against the overrun.
 
 ### A-791 — A volume over an S3 base is made through the wire, its credential handed with the create (2026-11-20, w-k90-whp; main's dispatch 15:52 PST, goal 92's A-555 parts 2 and 3; §4.15 "An S3 base", A-464, A-524, A-555; R1, R3)
 > **Removed (A-795, 2026-11-20).** The S3 base this entry built is removed whole (Ada: never asked for; she said

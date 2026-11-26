@@ -51,6 +51,12 @@ pub fn others_waiting() -> bool {
   registry::with_current(|ctx| ctx.others_waiting()).unwrap_or(false)
 }
 
+/// How long the current shard's paced asks leave I/O unharvested (A-783,
+/// [`crate::shard::ShardContext::harvest_period_ns`]). `None` off a shard thread.
+pub fn harvest_period_ns() -> Option<u64> {
+  registry::with_current(|ctx| ctx.harvest_period_ns())
+}
+
 /// The most a paced step runs on the current shard while no one waits (A-783,
 /// [`crate::shard::ShardContext::step_ceiling_ns`]). `None` off a shard thread.
 pub fn step_ceiling_ns() -> Option<u64> {
