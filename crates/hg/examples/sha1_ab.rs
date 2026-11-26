@@ -21,6 +21,8 @@
   clippy::disallowed_methods
 )]
 
+use std::ffi::{OsStr, OsString};
+use std::io::Write as _;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -29,6 +31,9 @@ use sha1_checked::{Digest, Sha1};
 /// Shape: a manifest's typical length in hg's own history (about 4,200 entries of about 57 bytes), and a file
 /// revision's: the two piece lengths a push hashes.
 const PIECES: [usize; 2] = [240 * 1024, 8 * 1024];
+
+/// Derived: IEC binary mebibyte (2^20 = 1,048,576 bytes), converting `<corpus MiB>` to bytes.
+const BYTES_PER_MIB: usize = 1 << 20;
 
 /// Shape: default corpus size in MiB when `<corpus MiB>` is omitted.
 const DEFAULT_MIB: usize = 256;
@@ -46,6 +51,16 @@ struct Config {
   rounds: usize,
 }
 
+/// Decodes an OS CLI argument as UTF-8 or returns a usage error.
+fn decode_utf8_arg(raw: &OsStr) -> Result<&str, String> {
+  raw.to_str().ok_or_else(|| {
+    format!(
+      "invalid argument `{}`: not valid UTF-8",
+      raw.to_string_lossy()
+    )
+  })
+}
+
 /// Parses a positive integer CLI argument or returns a usage error naming the argument.
 fn parse_positive_usize(label: &str, raw: &str) -> Result<usize, String> {
   let value: usize = raw
@@ -57,20 +72,31 @@ fn parse_positive_usize(label: &str, raw: &str) -> Result<usize, String> {
   Ok(value)
 }
 
-/// Parses optional `[<corpus MiB> [<rounds>]]` arguments without panicking.
-fn parse_args(arguments: &[String]) -> Result<Config, String> {
+/// Converts a corpus size in MiB to a non-zero byte count within Rust's `isize::MAX` allocation layout cap.
+fn corpus_bytes_from_mib(mib: usize) -> Result<usize, String> {
+  let bytes = mib
+    .checked_mul(BYTES_PER_MIB)
+    .ok_or_else(|| format!("corpus MiB `{mib}` overflows address space"))?;
+  if bytes == 0 || isize::try_from(bytes).is_err() {
+    return Err(format!(
+      "corpus MiB `{mib}` exceeds maximum allocation size"
+    ));
+  }
+  Ok(bytes)
+}
+
+/// Parses optional `[<corpus MiB> [<rounds>]]` OS arguments without panicking.
+fn parse_args(arguments: &[OsString]) -> Result<Config, String> {
   if let Some(extra) = arguments.get(2) {
-    return Err(format!("unexpected argument `{extra}`"));
+    return Err(format!("unexpected argument `{}`", extra.to_string_lossy()));
   }
   let mib = match arguments.first() {
-    Some(value) => parse_positive_usize("corpus MiB", value)?,
+    Some(value) => parse_positive_usize("corpus MiB", decode_utf8_arg(value)?)?,
     None => DEFAULT_MIB,
   };
-  let corpus_bytes = mib
-    .checked_shl(20)
-    .ok_or_else(|| format!("corpus MiB `{mib}` overflows address space"))?;
+  let corpus_bytes = corpus_bytes_from_mib(mib)?;
   let rounds = match arguments.get(1) {
-    Some(value) => parse_positive_usize("rounds", value)?,
+    Some(value) => parse_positive_usize("rounds", decode_utf8_arg(value)?)?,
     None => DEFAULT_ROUNDS,
   };
   Ok(Config {
@@ -81,25 +107,27 @@ fn parse_args(arguments: &[String]) -> Result<Config, String> {
 }
 
 /// Generates a deterministic `corpus_bytes`-byte text-like corpus of manifest lines (path, NUL, 40 hex digits).
-fn build_corpus(corpus_bytes: usize) -> Vec<u8> {
-  let mut corpus = Vec::with_capacity(corpus_bytes);
+fn build_corpus(corpus_bytes: usize) -> Result<Vec<u8>, String> {
+  let mut corpus = Vec::new();
+  corpus
+    .try_reserve_exact(corpus_bytes)
+    .map_err(|err| format!("cannot allocate {corpus_bytes}-byte corpus: {err}"))?;
   let mut seed = 0x2026_1121_u64;
   while corpus.len() < corpus_bytes {
     seed ^= seed << 13;
     seed ^= seed >> 7;
     seed ^= seed << 17;
-    corpus.extend_from_slice(
-      format!(
-        "mercurial/dir{}/file{}.py\0{:040x}\n",
-        seed % 97,
-        seed % 1013,
-        seed
-      )
-      .as_bytes(),
+    let line = format!(
+      "mercurial/dir{}/file{}.py\0{:040x}\n",
+      seed % 97,
+      seed % 1013,
+      seed
     );
+    let remaining = corpus_bytes.saturating_sub(corpus.len());
+    let bytes = line.as_bytes();
+    corpus.extend_from_slice(bytes.get(..remaining).unwrap_or(bytes));
   }
-  corpus.truncate(corpus_bytes);
-  corpus
+  Ok(corpus)
 }
 
 /// A way of hashing a piece: its name and its hasher.
@@ -131,17 +159,7 @@ fn hardware(piece: &[u8]) -> [u8; 20] {
   out
 }
 
-fn main() -> ExitCode {
-  let arguments: Vec<String> = std::env::args().skip(1).collect();
-  let config = match parse_args(&arguments) {
-    Ok(parsed) => parsed,
-    Err(message) => {
-      eprintln!("sha1_ab: {message}");
-      eprintln!("usage: sha1_ab [<corpus MiB> [<rounds>]]");
-      return ExitCode::from(EXIT_USAGE);
-    }
-  };
-  let corpus = build_corpus(config.corpus_bytes);
+fn run_benchmark(config: &Config, corpus: &[u8]) {
   println!(
     "corpus {} MiB; rounds {}; MB/s of each way, every round",
     config.mib, config.rounds
@@ -162,12 +180,12 @@ fn main() -> ExitCode {
     ];
     let mut rates: Vec<Vec<f64>> = vec![Vec::new(); ways.len()];
     for _ in 0..config.rounds {
-      for (at, (_, way)) in ways.iter().enumerate() {
+      for ((_, way), way_rates) in ways.iter().zip(&mut rates) {
         let started = Instant::now();
         for (piece, expected) in pieces.iter().zip(&reference) {
           assert_eq!(way(piece), *expected);
         }
-        rates[at].push(corpus.len() as f64 / started.elapsed().as_secs_f64() / 1e6);
+        way_rates.push(corpus.len() as f64 / started.elapsed().as_secs_f64() / 1e6);
       }
     }
     println!("pieces of {} KiB:", piece_len / 1024);
@@ -176,5 +194,26 @@ fn main() -> ExitCode {
       println!("  {name:<26} {}", shown.join(" "));
     }
   }
+}
+
+fn main() -> ExitCode {
+  let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+  let config = match parse_args(&arguments) {
+    Ok(parsed) => parsed,
+    Err(message) => {
+      let mut stderr = std::io::stderr();
+      let _ = writeln!(stderr, "sha1_ab: {message}");
+      let _ = writeln!(stderr, "usage: sha1_ab [<corpus MiB> [<rounds>]]");
+      return ExitCode::from(EXIT_USAGE);
+    }
+  };
+  let corpus = match build_corpus(config.corpus_bytes) {
+    Ok(corpus) => corpus,
+    Err(message) => {
+      let _ = writeln!(std::io::stderr(), "sha1_ab: {message}");
+      return ExitCode::from(EXIT_USAGE);
+    }
+  };
+  run_benchmark(&config, &corpus);
   ExitCode::SUCCESS
 }

@@ -444,7 +444,8 @@ volume-lifecycle verbs (`create`, `snapshot`, `clone`, `resize`, `destroy`, `des
 verbs (`green`, `work`, `edit`) — with the same fields as the text form and the same schema the MCP
 surface emits (one definition, two surfaces). A creating verb returns `{"id": "<hex>"}` (the same
 key across `create`, `clone`, `green` and `work`); an outcome-only verb returns `{"ok": true}`.
-Exceptions are `base read`, which streams a file's raw bytes with or without `--json`, and `version`
+Exceptions are `base read`, which streams a file's raw bytes with or without `--json`, `apparmor profile`,
+which prints the plain-text AppArmor profile verbatim even when `--json` is passed, and `version`
 (`version --licenses` emits the plain-text `NOTICE` verbatim even when `--json` is passed). `status
 --json` carries every shard's block under `shards` (an array: the counters, `refusals`, `signals`
 with each signal's `value` — `null` when absent — and its `absence` meaning, and `telemetry`: the
