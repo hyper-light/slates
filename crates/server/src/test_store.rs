@@ -355,6 +355,124 @@ pub(crate) fn create_on(
   }
 }
 
+/// The fixtures that may still block a shard's own thread on the store, by name, each until its callers move to the
+/// awaiting forms (main's order of 2026-11-25: `audit_on_stored_shard_made`, [`created`] in a task, [`create_on`] from
+/// the test's thread). The list only shrinks: its length is the figure GAPS records ("The shard-blocking allow-list"),
+/// held by a test, so an entry added is a GAPS edit too. A fixture in it runs its blocking body through
+/// [`allowing_shard_blocking`]; any other blocking call on a shard's thread is refused ([`refuse_on_a_shard`]).
+pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
+  Allowed {
+    fixture: "test_store::audit_on_stored_shard",
+    owner: "each history's (GAPS: svn 0, git 25, hg 32, other 109)",
+    reaching: 166,
+  },
+  Allowed {
+    fixture: "test_store::create",
+    owner: "each caller's (GAPS: hg 32, other 23)",
+    reaching: 55,
+  },
+  Allowed {
+    fixture: "vcs_store::commits::home_and_land_blocking",
+    owner: "w-hg (vcs_store::commits::tests 6, vcs_store::upload::tests 1)",
+    reaching: 7,
+  },
+  Allowed {
+    fixture: "repository::hg_push::land_stored",
+    owner: "w-hg (repository::hg_push 15, vcs_ssh::tests::hg 2)",
+    reaching: 17,
+  },
+  Allowed {
+    fixture: "repository::hg_push::land_in",
+    owner: "w-hg (vcs_store::hg_made 1)",
+    reaching: 1,
+  },
+  Allowed {
+    fixture: "repository::hg_push::prepare_whole",
+    owner: "w-hg (repository::hg_push 1)",
+    reaching: 1,
+  },
+  Allowed {
+    fixture: "repository::hg_push::stored_now",
+    owner: "w-hg (vcs_store::hg_made 1)",
+    reaching: 1,
+  },
+  Allowed {
+    fixture: "vcs_store::hg_import::land_imported",
+    owner: "w-hg (daemon::tests 1)",
+    reaching: 1,
+  },
+  Allowed {
+    fixture: "vcs_store::hg_import::land_imported_on",
+    owner: "w-hg (vcs_store::hg_import::tests 1)",
+    reaching: 1,
+  },
+  Allowed {
+    fixture: "repository::import::tests::served",
+    owner: "w-hg (repository::import::tests 1)",
+    reaching: 1,
+  },
+  Allowed {
+    fixture: "git_push::tests::git_repository",
+    owner: "w-git",
+    reaching: 41,
+  },
+  Allowed {
+    fixture: "git_push::tests::carry_blocking",
+    owner: "w-git",
+    reaching: 8,
+  },
+];
+
+/// A fixture allowed to block a shard's thread on the store for now ([`SHARD_BLOCKING_ALLOWED`]): its name, whose tests
+/// reach it, and how many do, counted when it was listed (GAPS says whether by call site or by test).
+#[derive(Debug)]
+pub(crate) struct Allowed {
+  /// The fixture, as [`allowing_shard_blocking`] names it.
+  pub(crate) fixture: &'static str,
+  /// Whose tests reach it, to move them.
+  pub(crate) owner: &'static str,
+  /// How many call sites reach it.
+  pub(crate) reaching: u32,
+}
+
+std::thread_local! {
+  /// The allow-listed fixture this thread runs the body of now, if any ([`allowing_shard_blocking`]).
+  static ALLOWED_HERE: core::cell::Cell<Option<&'static str>> = const { core::cell::Cell::new(None) };
+}
+
+/// Runs `body`, which may block this shard's thread on the store, for `fixture`, one of [`SHARD_BLOCKING_ALLOWED`]:
+/// refused for a fixture not in it.
+pub(crate) fn allowing_shard_blocking<T>(fixture: &'static str, body: impl FnOnce() -> T) -> T {
+  assert!(
+    SHARD_BLOCKING_ALLOWED
+      .iter()
+      .any(|allowed| allowed.fixture == fixture),
+    "{fixture} is not allowed to block a shard's thread (test_store::SHARD_BLOCKING_ALLOWED)"
+  );
+  let before = ALLOWED_HERE.with(|allowed| allowed.replace(Some(fixture)));
+  let done = body();
+  ALLOWED_HERE.with(|allowed| allowed.set(before));
+  done
+}
+
+/// Refuses `blocking`, a wait on the store a test helper makes by joining a thread of its own, when it is called on a
+/// daemon shard's own thread (one the runtime names `slates-shard-N`): there the wait holds the shard through the store's
+/// commit, and under load that alone passes the watchdog's window, which judges a shard neither running nor runnable
+/// wedged (main's 8a burner loop at 228d0dc97: exit 4 in 3 of 6 rounds, a fixture's landing in an observation). So the
+/// shape fails every test that has it, on any machine, naming `instead`, never only under a slow fsync. A bare runtime
+/// runs on the test's own thread and is not refused; neither is an allow-listed fixture's body
+/// ([`allowing_shard_blocking`]).
+fn refuse_on_a_shard(blocking: &str, instead: &str) {
+  let on_a_shard = std::thread::current()
+    .name()
+    .is_some_and(|name| name.starts_with("slates-shard-"));
+  let allowed = ALLOWED_HERE.with(core::cell::Cell::get);
+  assert!(
+    !on_a_shard || allowed.is_some(),
+    "{blocking} on a daemon shard's own thread holds the shard through the store's commit: {instead}"
+  );
+}
+
 /// Lands `parts` under `header` through `disk` and waits for the store's answer, for a test's synchronous history on a
 /// shard: the landing runs on a thread of its own with a runtime of its own, which parks until the store's owner
 /// answers (the shard's own thread cannot wait on a wake its runtime would deliver). Whether it landed.
@@ -367,12 +485,17 @@ pub(crate) fn land_blocking(
 }
 
 /// [`land_blocking`]'s landing with the store's answer: where it was committed, or why the owner refused it (`Gone` for
-/// a waiting thread that could not run it).
+/// a waiting thread that could not run it). Refused on a shard's own thread ([`refuse_on_a_shard`]).
 pub(crate) fn land_answered_blocking(
   disk: StoreHandle,
   header: slates_store::log::Header,
   parts: Vec<slates_store::owner::Part>,
 ) -> Result<slates_store::log::Located, slates_store::owner::OwnerError> {
+  refuse_on_a_shard(
+    "a landing waited for on its thread (test_store::land_blocking)",
+    "land from the test's thread after the observation returns, or await the landing in a task on the shard \
+     (hg_push::unbundle for a push; test_store::created().await for a creation, through test_store::run_on_first)",
+  );
   std::thread::scope(|scope| {
     scope
       .spawn(move || {
@@ -452,7 +575,9 @@ pub(crate) fn audit_on_stored_shard_configured<T: Send + 'static>(
   // A synchronous history brings no let-go window back, so its landed packs stay resident (`vcs_store::KEEP_LANDED`).
   let kept = move |state: &mut crate::state::ShardState| {
     crate::vcs_store::KEEP_LANDED.with(|keep| keep.set(true));
-    history(state)
+    // A whole synchronous history on the shard, its creations and landings waited for on the shard's thread: allow-listed
+    // until each owner's histories move to `audit_on_stored_shard_made` or a task that awaits (SHARD_BLOCKING_ALLOWED).
+    allowing_shard_blocking("test_store::audit_on_stored_shard", || history(state))
   };
   let answer = crate::daemon::audit_on_shard_configured(kept, move |config| {
     config.vcs_disk = Some(handle);
@@ -502,12 +627,14 @@ pub(crate) fn create(
       format,
       default_branch,
       green,
-    } => crate::repository::create_blocking(
-      state,
-      (disk, principal),
-      (&name, tool, format, &default_branch),
-      green,
-    ),
+    } => allowing_shard_blocking("test_store::create", || {
+      crate::repository::create_blocking(
+        state,
+        (disk, principal),
+        (&name, tool, format, &default_branch),
+        green,
+      )
+    }),
     other => crate::verbs::dispatch(state, 1, principal, other),
   }
 }
@@ -664,6 +791,10 @@ pub(crate) fn answer_wants_blocking(
   wants: &mut dyn slates_hg::render::StoreWants,
 ) -> bool {
   use slates_hg::render::{StoredPlace, StoredRevision, Want};
+  refuse_on_a_shard(
+    "the changeset store's answers waited for on its thread (test_store::answer_wants_blocking)",
+    "answer the wants from the test's thread, or await them in a task on the shard (hg_view::answer_wants_over)",
+  );
   while let Some(want) = wants.wants().cloned() {
     let disk = disk.clone();
     let given = std::thread::scope(|scope| {
@@ -917,4 +1048,36 @@ pub(crate) fn rebuild_after_takeover(
     crate::takeover::rebuild_repository(state, record, parts),
     "rebuilt"
   );
+}
+
+/// Main's ruling (a) of 2026-11-25, condition 2: the shard-blocking allow-list only shrinks. Do: read the figure GAPS
+/// records for it ("The shard-blocking allow-list: N fixtures"). Expect: the list holds exactly that many, each named
+/// once with an owner and a count of the sites reaching it, so an entry added is a GAPS edit made in the same review.
+#[test]
+fn the_shard_blocking_allow_list_holds_the_figure_gaps_records() {
+  const GAPS: &str = include_str!("../../../docs/wip/GAPS.md");
+  const LINE: &str = "**The shard-blocking allow-list: ";
+  let recorded = GAPS
+    .lines()
+    .find_map(|line| line.split_once(LINE))
+    .and_then(|(_, rest)| rest.split_once(" fixtures**"))
+    .map(|(figure, _)| figure.parse::<usize>())
+    .expect("GAPS records the allow-list's figure")
+    .expect("a whole number");
+  assert_eq!(
+    SHARD_BLOCKING_ALLOWED.len(),
+    recorded,
+    "edit the list and GAPS together"
+  );
+  for allowed in SHARD_BLOCKING_ALLOWED {
+    let named = SHARD_BLOCKING_ALLOWED
+      .iter()
+      .filter(|other| other.fixture == allowed.fixture)
+      .count();
+    assert_eq!(named, 1, "{allowed:?} listed once");
+    assert!(
+      !allowed.owner.is_empty() && allowed.reaching > 0,
+      "{allowed:?} carries its owner and reach"
+    );
+  }
 }
