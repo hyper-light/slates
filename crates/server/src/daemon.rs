@@ -9112,63 +9112,72 @@ mod tests {
       .collect();
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
-    let (repository, packs) = first
-      .observe(first.shards.first().copied(), move |state| {
-        use crate::vcs_store::paths::tests::{ask, git_repository};
+    let (repository, packs) = crate::test_store::run_on_first(
+      &first,
+      move || async move {
+        use crate::vcs_store::paths::tests::{ask, git_made, recorded_git_submit_awaited};
+        use crate::vcs_store::tests::on_state;
         use slates_ipc::protocol::{ReplyBody, RequestBody};
-        let (repository, green) = git_repository(state, "held");
-        let ReplyBody::WorkCreated { id: work, .. } = ask(
-          state,
-          RequestBody::CreateWork {
-            green,
-            name: "work-held".to_owned(),
-          },
-        ) else {
+        let (repository, green) = git_made("held").await;
+        let work = on_state(|state| {
+          let ReplyBody::WorkCreated { id: work, .. } = ask(
+            state,
+            RequestBody::CreateWork {
+              green,
+              name: "work-held".to_owned(),
+            },
+          ) else {
+            return None;
+          };
+          ask(
+            state,
+            RequestBody::Edit {
+              work,
+              path: "/large".to_owned(),
+              at: 0,
+              delete_len: 0,
+              bytes: blob.clone(),
+            },
+          );
+          Some(work)
+        });
+        let Some(work) = work else {
           panic!("no work");
         };
-        ask(
-          state,
-          RequestBody::Edit {
-            work,
-            path: "/large".to_owned(),
-            at: 0,
-            delete_len: 0,
-            bytes: blob.clone(),
-          },
-        );
-        // A git green's submit is a client's recorded request (A-896), its refinement, made commit and whole build
-        // taken in this step.
-        let submitted = crate::vcs_store::paths::tests::recorded_git_submit(
-          state,
-          crate::identities::authored(work, "held"),
-        );
+        // A git green's submit is a client's recorded request (A-896), awaited from a task of the shard: its
+        // refinement, made commit and whole build run as the shard's own tasks run them.
+        let submitted =
+          recorded_git_submit_awaited(crate::identities::authored(work, "held")).await;
         assert!(
           matches!(
             submitted,
-            Some(ReplyBody::Submitted {
+            ReplyBody::Submitted {
               version: Some(_),
               ..
-            })
+            }
           ),
           "{submitted:?}"
         );
-        let packs: Vec<slates_vcs::ContentId> = state
-          .vcs_stores
-          .git_ref(repository)
-          .map(|(_, store)| store.repository.packs().map(|(pack, _)| pack).collect())
-          .unwrap_or_default();
-        let here = state.shard;
-        for pack in &packs {
-          crate::vcs_store::let_go_landed_pack_among(state, pack, &[here]);
-        }
-        let away = state
-          .vcs_stores
-          .content()
-          .is_some_and(|content| packs.iter().any(|pack| !content.holds_whole(pack)));
-        assert!(away, "the commit's pack let go by hand");
-        (repository, packs)
-      })
-      .unwrap();
+        on_state(|state| {
+          let packs: Vec<slates_vcs::ContentId> = state
+            .vcs_stores
+            .git_ref(repository)
+            .map(|(_, store)| store.repository.packs().map(|(pack, _)| pack).collect())
+            .unwrap_or_default();
+          let here = state.shard;
+          for pack in &packs {
+            crate::vcs_store::let_go_landed_pack_among(state, pack, &[here]);
+          }
+          let away = state
+            .vcs_stores
+            .content()
+            .is_some_and(|content| packs.iter().any(|pack| !content.holds_whole(pack)));
+          assert!(away, "the commit's pack let go by hand");
+          (repository, packs)
+        })
+      },
+      crate::test_store::HISTORY_PATIENCE,
+    );
     assert!(!packs.is_empty(), "the commit landed a pack");
     first.publish_every_shard().unwrap();
     first.stop();
@@ -9454,50 +9463,57 @@ mod tests {
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
     let written = blob.clone();
-    let before = first
-      .observe(first.shards.first().copied(), move |state| {
-        use crate::vcs_store::paths::tests::{ask, git_repository};
+    let before = crate::test_store::run_on_first(
+      &first,
+      move || async move {
+        use crate::vcs_store::paths::tests::{ask, git_made, recorded_git_submit_awaited};
+        use crate::vcs_store::tests::on_state;
         use slates_ipc::protocol::{ReplyBody, RequestBody};
-        let (_, green) = git_repository(state, "large");
-        let made = ask(
-          state,
-          RequestBody::CreateWork {
-            green,
-            name: "work-large".to_owned(),
-          },
-        );
-        let ReplyBody::WorkCreated { id: work, .. } = made else {
+        let (_, green) = git_made("large").await;
+        let work = on_state(|state| {
+          let made = ask(
+            state,
+            RequestBody::CreateWork {
+              green,
+              name: "work-large".to_owned(),
+            },
+          );
+          let ReplyBody::WorkCreated { id: work, .. } = made else {
+            return None;
+          };
+          ask(
+            state,
+            RequestBody::Edit {
+              work,
+              path: "/large".to_owned(),
+              at: 0,
+              delete_len: 0,
+              bytes: written,
+            },
+          );
+          Some(work)
+        });
+        let Some(work) = work else {
           return None;
         };
-        ask(
-          state,
-          RequestBody::Edit {
-            work,
-            path: "/large".to_owned(),
-            at: 0,
-            delete_len: 0,
-            bytes: written,
-          },
-        );
-        // A git green's submit is a client's recorded request (A-896), its refinement, made commit and whole build
-        // taken in this step.
-        let submitted = crate::vcs_store::paths::tests::recorded_git_submit(
-          state,
-          crate::identities::authored(work, "large"),
-        );
+        // A git green's submit is a client's recorded request (A-896), awaited from a task of the shard: its
+        // refinement, made commit and whole build run as the shard's own tasks run them.
+        let submitted =
+          recorded_git_submit_awaited(crate::identities::authored(work, "large")).await;
         assert!(
           matches!(
             submitted,
-            Some(ReplyBody::Submitted {
+            ReplyBody::Submitted {
               version: Some(_),
               ..
-            })
+            }
           ),
           "{submitted:?}"
         );
-        read(state)
-      })
-      .unwrap();
+        on_state(|state| read(state))
+      },
+      crate::test_store::HISTORY_PATIENCE,
+    );
     first.publish_every_shard().unwrap();
     first.stop();
     let second = super::Daemon::start(&profile, config, source()).unwrap();
@@ -9625,56 +9641,65 @@ mod tests {
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
     let written = blob.clone();
-    let windows = first
-      .observe(first.shards.first().copied(), move |state| {
-        use crate::vcs_store::paths::tests::{ask, git_repository};
+    let windows = crate::test_store::run_on_first(
+      &first,
+      move || async move {
+        use crate::vcs_store::paths::tests::{ask, git_made, recorded_git_submit_awaited};
+        use crate::vcs_store::tests::on_state;
         use slates_ipc::protocol::{ReplyBody, RequestBody};
-        let (_, green) = git_repository(state, "large");
-        let ReplyBody::WorkCreated { id: work, .. } = ask(
-          state,
-          RequestBody::CreateWork {
-            green,
-            name: "work-large".to_owned(),
-          },
-        ) else {
+        let (_, green) = git_made("large").await;
+        let work = on_state(|state| {
+          let ReplyBody::WorkCreated { id: work, .. } = ask(
+            state,
+            RequestBody::CreateWork {
+              green,
+              name: "work-large".to_owned(),
+            },
+          ) else {
+            return None;
+          };
+          ask(
+            state,
+            RequestBody::Edit {
+              work,
+              path: "/large".to_owned(),
+              at: 0,
+              delete_len: 0,
+              bytes: written.clone(),
+            },
+          );
+          Some(work)
+        });
+        let Some(work) = work else {
           return Vec::new();
         };
-        ask(
-          state,
-          RequestBody::Edit {
-            work,
-            path: "/large".to_owned(),
-            at: 0,
-            delete_len: 0,
-            bytes: written.clone(),
-          },
-        );
-        // A git green's submit is a client's recorded request (A-896), its refinement, made commit and whole build
-        // taken in this step.
-        let submitted = crate::vcs_store::paths::tests::recorded_git_submit(
-          state,
-          crate::identities::authored(work, "large"),
-        );
+        // A git green's submit is a client's recorded request (A-896), awaited from a task of the shard: its
+        // refinement, made commit and whole build run as the shard's own tasks run them.
+        let submitted =
+          recorded_git_submit_awaited(crate::identities::authored(work, "large")).await;
         assert!(
           matches!(
             submitted,
-            Some(ReplyBody::Submitted {
+            ReplyBody::Submitted {
               version: Some(_),
               ..
-            })
+            }
           ),
           "{submitted:?}"
         );
-        let window = state
-          .vcs_stores
-          .content()
-          .map_or(1, slates_vcs::ContentStore::window);
-        written
-          .chunks(window)
-          .map(slates_vcs::ContentId::of)
-          .collect::<Vec<_>>()
-      })
-      .unwrap();
+        on_state(|state| {
+          let window = state
+            .vcs_stores
+            .content()
+            .map_or(1, slates_vcs::ContentStore::window);
+          written
+            .chunks(window)
+            .map(slates_vcs::ContentId::of)
+            .collect::<Vec<_>>()
+        })
+      },
+      crate::test_store::HISTORY_PATIENCE,
+    );
     assert!(windows.len() > 1, "the file past one window");
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     let mut daemon = first;

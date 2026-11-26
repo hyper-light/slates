@@ -256,37 +256,38 @@ pub(crate) fn version_saying(
   version
 }
 
-/// `body`, a submit to `green`, as its green takes one: a git repository's as a client's recorded request alone (main
-/// 01a20182's ruling of 2026-11-24 01:36: no version committed before its commit is made, [`recorded_git_submit`]); any
-/// other's asked bare, a whole build its version's map waits for then driven to its end, so the test reads the store
-/// as the build leaves it. Its answer.
+/// `body`, a submit to `green`, a green no git repository holds, asked bare: a whole build its version's map waits for
+/// then driven to its end, so the test reads the store as the build leaves it. Its answer. A git green's submit is a
+/// client's recorded request (main 01a20182's ruling of 2026-11-24 01:36: no version committed before its commit is
+/// made), awaited from a task of the shard ([`submit_as_taken_awaited`]), so it is refused here.
 pub(crate) fn submit_as_taken(
   state: &mut ShardState,
   green: VolumeId,
   body: RequestBody,
 ) -> Option<ReplyBody> {
-  if super::git_repository_of(state, crate::verbs::to_db_volume(green)).is_some() {
-    return recorded_git_submit(state, body);
-  }
+  assert!(
+    super::git_repository_of(state, crate::verbs::to_db_volume(green)).is_none(),
+    "a git green's submit is a client's recorded request, awaited from a task (submit_as_taken_awaited)"
+  );
   let submitted = ask(state, body);
   super::whole_build::settle(state);
   Some(submitted)
 }
 
-/// `body`, a submit to a git green, run as request [`TEST_CLIENT`]'s next: what the submit waits on taken here, as the
-/// shard's tasks would take it, since a test's step runs none of them (its refinement, when the work
-/// rewrites a file whole, `refining::refined_now`; its made commit, `commits::made_landing_now`; the whole build its
-/// version's map waits on), and its answer read where the request recorded it.
-pub(crate) fn recorded_git_submit(state: &mut ShardState, body: RequestBody) -> Option<ReplyBody> {
-  let id = slates_wire::request::RequestId {
-    client: TEST_CLIENT,
-    sequence: TEST_SEQUENCE.with(|next| {
-      let sequence = next.get();
-      next.set(sequence.wrapping_add(1));
-      sequence
-    }),
-  };
-  recorded_git_submit_as(state, id, body)
+/// [`submit_as_taken`] from a task of the shard: a git repository's submit a client's recorded request whose made commit
+/// the shard's own task lands ([`recorded_git_submit_awaited`]); any other's asked bare, its version's whole build
+/// driven to its end. Its answer.
+pub(crate) async fn submit_as_taken_awaited(green: VolumeId, body: RequestBody) -> ReplyBody {
+  let git =
+    on_state(|state| super::git_repository_of(state, crate::verbs::to_db_volume(green)).is_some());
+  if git {
+    return recorded_git_submit_awaited(body).await;
+  }
+  on_state(|state| {
+    let submitted = ask(state, body);
+    super::whole_build::settle(state);
+    submitted
+  })
 }
 
 /// Request [`TEST_CLIENT`]'s next sequence on this thread.
@@ -301,12 +302,13 @@ fn next_test_request() -> slates_wire::request::RequestId {
   }
 }
 
-/// [`recorded_git_submit`] from a task of the shard ([`crate::test_store::run_on_stored_shard`]).
+/// `body`, a submit to a git green, run as request [`TEST_CLIENT`]'s next from a task of the shard
+/// ([`crate::test_store::run_on_stored_shard`]), its answer read where the request recorded it.
 pub(crate) async fn recorded_git_submit_awaited(body: RequestBody) -> ReplyBody {
   recorded_git_submit_as_awaited(next_test_request(), body).await
 }
 
-/// [`recorded_git_submit_as`] from a task of the shard: nothing held for the test, so what the submit waits on (its
+/// `body` as request `id` of [`TEST_CLIENT`], from a task of the shard: nothing held for the test, so what the submit waits on (its
 /// refinement, its made commit, homed and landed by awaiting, and its version's whole build) runs as the shard's own
 /// tasks would run it, and the history awaits the answer its request records; the whole build then settled, so the test
 /// reads the store as the build leaves it.
@@ -352,35 +354,6 @@ async fn answer_awaited(id: slates_wire::request::RequestId) -> ReplyBody {
     );
     slates_rt::futures::yield_now().await;
   }
-}
-
-/// [`recorded_git_submit`] under request `id` of [`TEST_CLIENT`]: a resend of one answered retryable runs it again.
-pub(crate) fn recorded_git_submit_as(
-  state: &mut ShardState,
-  id: slates_wire::request::RequestId,
-  body: RequestBody,
-) -> Option<ReplyBody> {
-  crate::refining::HELD_FOR_TEST.with(|held| held.set(true));
-  crate::vcs_store::commits::MADE_HELD_FOR_TEST.with(|held| held.set(true));
-  let answered =
-    crate::verbs::run_recorded_for_test(state, (u64::from(TEST_CLIENT), id), &owner(), body);
-  crate::refining::refined_now(state);
-  crate::vcs_store::commits::made_landing_now(state);
-  crate::vcs_store::commits::MADE_HELD_FOR_TEST.with(|held| held.set(false));
-  crate::refining::HELD_FOR_TEST.with(|held| held.set(false));
-  super::whole_build::settle(state);
-  answered.or_else(|| {
-    match state
-      .db
-      .partition()
-      .completion(u64::from(TEST_CLIENT), id.client, id.sequence)
-    {
-      slates_wire::request::Seen::Completed(bytes) => {
-        <ReplyBody as slates_wire::Wire>::from_bytes(&bytes).ok()
-      }
-      _ => None,
-    }
-  })
 }
 
 /// The map the store holds for `green`, when it is of `version`: its root and its files.
