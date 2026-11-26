@@ -566,10 +566,15 @@ fn an_object_is_homed_in_the_region_only_once_its_homes_image_is_published() {
       let short = slates_cluster::CommitBudget::hard(budget / 50, (budget / 500).max(1));
       // Homed only once its home has published an image holding it: the wait publishes the home itself where nothing
       // else has, counted.
-      if home_in_region(origin, &shards, (bytes.clone(), super::TEST_OWNER), short)
-        .await
-        .outcome
-        .is_ok()
+      if home_in_region(
+        origin,
+        &shards,
+        (super::HomeSource::Bytes(bytes.clone()), super::TEST_OWNER),
+        short,
+      )
+      .await
+      .outcome
+      .is_ok()
         && crate::xshard::call_in_shard_time(
           origin,
           home,
@@ -596,9 +601,14 @@ fn an_object_is_homed_in_the_region_only_once_its_homes_image_is_published() {
       .unwrap();
       slates_rt::futures::detach(publisher).unwrap();
       let full = slates_cluster::CommitBudget::hard(budget, (budget / 100).max(1));
-      match home_in_region(origin, &shards, (bytes, super::TEST_OWNER), full)
-        .await
-        .outcome
+      match home_in_region(
+        origin,
+        &shards,
+        (super::HomeSource::Bytes(bytes), super::TEST_OWNER),
+        full,
+      )
+      .await
+      .outcome
       {
         Ok(homed) if homed == identity => {}
         other => outcome.push(format!("not homed after the publication: {other:?}")),
@@ -656,9 +666,14 @@ fn an_object_longer_than_a_window_is_homed_and_read_back_by_its_blake3() {
         .map(|at| u8::try_from(at % 251).unwrap_or(0))
         .collect();
       let identity = ContentId::of(&bytes);
-      match home_in_region(origin, &shards, (bytes.clone(), super::TEST_OWNER), full)
-        .await
-        .outcome
+      match home_in_region(
+        origin,
+        &shards,
+        (super::HomeSource::Bytes(bytes.clone()), super::TEST_OWNER),
+        full,
+      )
+      .await
+      .outcome
       {
         Ok(homed) if homed == identity => {}
         other => outcome.push(format!("not homed under its BLAKE3: {other:?}")),

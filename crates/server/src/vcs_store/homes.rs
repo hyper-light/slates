@@ -431,6 +431,31 @@ pub(crate) fn keep_here(
   }
 }
 
+/// [`keep_here`] of the object `identity` the shard's content store holds whole already: held once more, as a put of
+/// its bytes would hold it (b2a: a push's pack, put as it arrived, homed with no copy of it).
+fn keep_held_here(
+  state: &mut ShardState,
+  identity: &ContentId,
+) -> Result<(ContentId, HomeTicket), HomeRefused> {
+  let held = {
+    let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+    lent
+      .stores
+      .content
+      .as_mut()
+      .filter(|content| content.holds_whole(identity))
+      .map(|content| content.hold(identity))
+  };
+  match held {
+    Some(Ok(())) => {
+      state.count(HOMED, 1);
+      Ok((*identity, ticket_here(state.shard)))
+    }
+    Some(Err(refused)) => Err(HomeRefused::Content(refused)),
+    None => Err(HomeRefused::NotHeld),
+  }
+}
+
 /// The bytes of the window or object `identity` this shard keeps as its home: refused `NotHeld` where it keeps none of
 /// it whole here, and by its content store's kind where the store could not be made.
 pub(crate) fn read_here(
@@ -1332,7 +1357,31 @@ pub(crate) fn keep_for_region(
   bytes: &[u8],
   owners: &[HomeOwner],
 ) -> Result<(ContentId, HomeTicket), HomeRefused> {
-  let identity = ContentId::of(bytes);
+  keep_for_region_by(state, ContentId::of(bytes), owners, |state| {
+    keep_here(state, bytes)
+  })
+}
+
+/// [`keep_for_region`] of the object `identity` this shard's content store holds whole already (a push's pack, put
+/// there as it arrived: main's order of 2026-11-26, b2a): held once more by its identity, as a put of bytes it holds
+/// would hold it, no bytes handed or copied. Refused `NotHeld` where the store does not hold it whole.
+pub(crate) fn keep_held_for_region(
+  state: &mut ShardState,
+  identity: ContentId,
+  owners: &[HomeOwner],
+) -> Result<(ContentId, HomeTicket), HomeRefused> {
+  keep_for_region_by(state, identity, owners, |state| {
+    keep_held_here(state, &identity)
+  })
+}
+
+/// [`keep_for_region`]'s body over `identity`, kept by `keep` where the region holds it not yet.
+fn keep_for_region_by(
+  state: &mut ShardState,
+  identity: ContentId,
+  owners: &[HomeOwner],
+  keep: impl FnOnce(&mut ShardState) -> Result<(ContentId, HomeTicket), HomeRefused>,
+) -> Result<(ContentId, HomeTicket), HomeRefused> {
   if owners.is_empty() {
     return Err(HomeRefused::NotHeld);
   }
@@ -1351,7 +1400,7 @@ pub(crate) fn keep_for_region(
     join_owners(&identity, owners);
     return Ok((identity, ticket_here(state.shard)));
   }
-  let kept = keep_here(state, bytes)?;
+  let kept = keep(state)?;
   let inserted = REGION_HELD.with(|held| {
     held.try_borrow_mut().is_ok_and(|mut held| {
       region_before(&held, &kept.0);
@@ -2887,44 +2936,29 @@ pub(crate) const HOMED_IN_REGION: &str = "vcs_store.homes.homed_in_region";
 /// Counter: homings in the region that fell short of `f + 1` within their budget. Format: a counter name.
 pub(crate) const HOMED_SHORT: &str = "vcs_store.homes.homed_short";
 
-/// The object `bytes` homed in the region before a record names it (main's ruling of 2026-11-20 (ii), A-727's rule:
-/// content durable at `f + 1` before the record that names it): kept on each of its region homes
-/// (`slates_db::identity_homes::homes` over its BLAKE3), this node's own through its home shard, every other through
-/// [`slates_cluster::homes`]; each answers kept only once its home's image holding it is published. Its identity once
-/// `f + 1` homes (every member, in a region of fewer) answered kept within `budget`; refused `Unanswered` otherwise, and
-/// the caller records the names inline instead (version 2). Asked from shard `origin`; at most one window
-/// (an object of any length a home keeps whole, cut at its own windows; one region message carries at most
+/// The object `source` names homed in the region before a record names it (main's ruling of 2026-11-20 (ii), A-727's
+/// rule: content durable at `f + 1` before the record that names it): kept on each of its region homes
+/// (`slates_db::identity_homes::homes` over its BLAKE3), this node's own through its home shard (by its identity where
+/// that is the origin and holds it whole, b2a), every other through [`slates_cluster::homes`], its bytes read from the
+/// origin's content store only for those; each answers kept only once its home's image holding it is published. Its
+/// identity once `f + 1` homes (every member, in a region of fewer) answered kept within `budget`; refused `Unanswered`
+/// otherwise, and the caller records the names inline instead (version 2). Asked from shard `origin`; at most one
+/// window (an object of any length a home keeps whole, cut at its own windows; one region message carries at most
 /// `slates_archive::format::MAX_CHUNK_BYTES` until an object past that is sent in parts).
-/// This node, one of the object's homes, keeps `bytes`: 1 once its image holding them is durable within `budget_ns`,
-/// else 0 with why it was not (for [`home_in_region`]'s log of a short homing).
-async fn kept_here(
-  origin: u16,
-  shards: &[u16],
-  (bytes, owner): (&[u8], HomeOwner),
-  budget_ns: u64,
-) -> Result<(usize, Option<super::durable::BarrierRefused>), HomeRefused> {
-  let (_, ticket) =
-    keep_region_at_home(origin, shards, (bytes.to_vec(), vec![owner]), budget_ns).await?;
-  Ok(
-    match super::durable::content_durable(origin, ticket, budget_ns).await {
-      Ok(()) => (1, None),
-      Err(refused) => (0, Some(refused)),
-    },
-  )
-}
-
 pub(crate) async fn home_in_region(
   origin: u16,
   shards: &[u16],
-  (bytes, owner): (Vec<u8>, HomeOwner),
+  (source, owner): (HomeSource, HomeOwner),
   budget: slates_cluster::CommitBudget,
 ) -> Homed {
-  let identity = ContentId::of(&bytes);
+  let identity = source.identity();
   let budget_ns = budget.max_deadline_ns();
   let began = slates_rt::futures::now_ns();
+  let held = matches!(source, HomeSource::Held(..));
   let mut homing = Homing {
     kept_by: Vec::new(),
-    bytes,
+    source,
+    held,
     ranked: Vec::new(),
     reranked: false,
     other_version: false,
@@ -2994,7 +3028,10 @@ pub(crate) async fn home_in_region(
 /// homes it was last ranked at, and whether a configuration installed meanwhile ranked them differently.
 struct Homing {
   kept_by: Vec<slates_db::HostId>,
-  bytes: Vec<u8>,
+  source: HomeSource,
+  /// Whether it was handed content held whole ([`HomeSource::Held`]): the buffers of it it makes are counted
+  /// ([`CARRY_BUFFER_MOST`]).
+  held: bool,
   ranked: Vec<slates_db::HostId>,
   reranked: bool,
   /// A home answered as a member of another home wire version: no install changes that (A-727 (d1a)).
@@ -3016,7 +3053,8 @@ impl Homing {
     let round_ns = round.max_deadline_ns();
     let began = slates_rt::futures::now_ns();
     if wanted.contains(&local) {
-      let (durable, refused) = kept_here(origin, shards, (&self.bytes, owner), round_ns)
+      let (durable, refused) = self
+        .kept_here(origin, shards, owner, round_ns)
         .await
         .inspect_err(|refused| {
           slates_machine::log_line!(
@@ -3042,7 +3080,7 @@ impl Homing {
     let began = slates_rt::futures::now_ns();
     if !others.is_empty() {
       let control = shards.first().copied().unwrap_or(origin);
-      let bytes = std::mem::take(&mut self.bytes);
+      let bytes = self.bytes_now()?;
       // The bytes go to the control shard's task and come back with its answer, so a caller that moves them on (a push's
       // pack into the changeset store, A-767 C5) makes no copy; a task that never answered took them with it.
       let answered = crate::xshard::task_in_shard_time(
@@ -3055,7 +3093,7 @@ impl Homing {
       if let Some((remote, back)) = answered {
         self.kept_by.extend(remote.kept);
         self.other_version |= remote.other_version;
-        self.bytes = back;
+        self.source = HomeSource::Bytes(back);
       }
     }
     let region_ns = slates_rt::futures::now_ns().saturating_sub(began);
@@ -3067,11 +3105,64 @@ impl Homing {
     Ok(())
   }
 
-  /// The homing ended `outcome`, its bytes given back.
+  /// The homing ended `outcome`, its bytes given back (none for content held whole that no home needed the bytes of).
   fn ended(self, outcome: Result<ContentId, HomeRefused>) -> Homed {
     Homed {
       outcome,
-      bytes: self.bytes,
+      bytes: self.source.into_given_back(),
+    }
+  }
+
+  /// This node's keep of the content as one of its homes, once durable: by its identity on the origin where it is the
+  /// content's home shard and holds it whole ([`keep_held_for_region`], no bytes copied); else its bytes put on the
+  /// home shard ([`keep_region_at_home`]), read from the origin's content store first where only it held them.
+  async fn kept_here(
+    &mut self,
+    origin: u16,
+    shards: &[u16],
+    owner: HomeOwner,
+    budget_ns: u64,
+  ) -> Result<(usize, Option<super::durable::BarrierRefused>), HomeRefused> {
+    let identity = self.source.identity();
+    let ticket = match (&self.source, home_of(shards, &identity)) {
+      (HomeSource::Held(..), Some(home)) if home == origin => {
+        crate::state::with_state(|state| keep_held_for_region(state, identity, &[owner]))
+          .ok_or(HomeRefused::Unanswered)??
+          .1
+      }
+      _ => {
+        let bytes = self.bytes_now()?;
+        let copy = bytes.clone();
+        self.source = HomeSource::Bytes(bytes);
+        if self.held {
+          count_carried(copy.len().saturating_mul(2));
+        }
+        keep_region_at_home(origin, shards, (copy, vec![owner]), budget_ns)
+          .await?
+          .1
+      }
+    };
+    Ok(
+      match super::durable::content_durable(origin, ticket, budget_ns).await {
+        Ok(()) => (1, None),
+        Err(refused) => (0, Some(refused)),
+      },
+    )
+  }
+
+  /// The content's bytes, taken out of the homing: its own, or read whole from the origin's content store where it held
+  /// them (the homing's one buffer of them, counted [`CARRY_BUFFER_MOST`]). Refused `NotHeld` where the store no longer
+  /// holds them whole.
+  fn bytes_now(&mut self) -> Result<Vec<u8>, HomeRefused> {
+    match core::mem::replace(&mut self.source, HomeSource::Bytes(Vec::new())) {
+      HomeSource::Bytes(bytes) => Ok(bytes),
+      HomeSource::Held(identity, len) => {
+        let bytes = crate::state::with_state(|state| held_bytes(state, (identity, len)))
+          .flatten()
+          .ok_or(HomeRefused::NotHeld)?;
+        count_carried(bytes.len());
+        Ok(bytes)
+      }
     }
   }
 
@@ -3154,8 +3245,59 @@ pub(crate) const HOMING_RERANKED_KEPT: &str = "vcs_store.homes.homing_reranked_k
 pub(crate) struct Homed {
   /// The object's identity once `f + 1` homes kept it; refused otherwise.
   pub(crate) outcome: Result<ContentId, HomeRefused>,
-  /// The bytes homed.
+  /// The bytes homed: none where the homing was handed content held whole and no home needed its bytes.
   pub(crate) bytes: Vec<u8>,
+}
+
+/// What a homing puts in the region ([`home_in_region`]): content's bytes, or content the origin shard's content store
+/// holds whole, by its identity and length (a push's pack, put there as it arrived: main's order of 2026-11-26, b2a),
+/// its bytes read only where a home needs them (another shard of this node, a remote home).
+#[derive(Debug)]
+pub(crate) enum HomeSource {
+  /// The content's bytes.
+  Bytes(Vec<u8>),
+  /// The content held whole on the origin: its identity and length.
+  Held(ContentId, u64),
+}
+
+impl HomeSource {
+  /// The content's identity.
+  pub(crate) fn identity(&self) -> ContentId {
+    match self {
+      HomeSource::Bytes(bytes) => ContentId::of(bytes),
+      HomeSource::Held(identity, _) => *identity,
+    }
+  }
+
+  /// Its bytes given back once homed: none for content held whole.
+  pub(crate) fn into_given_back(self) -> Vec<u8> {
+    match self {
+      HomeSource::Bytes(bytes) => bytes,
+      HomeSource::Held(..) => Vec::new(),
+    }
+  }
+}
+
+/// Counted most: the most bytes of the content one homing held in buffers of its own (b2a, main's order of
+/// 2026-11-26): none for a push's pack homed on this node by its identity. Format: a counter name.
+pub(crate) const CARRY_BUFFER_MOST: &str = "git_push.carry_buffer_most";
+
+/// Counts `bytes`, what a homing holds in buffers of its own now, toward [`CARRY_BUFFER_MOST`].
+fn count_carried(bytes: usize) {
+  let _ = crate::state::with_state(|state| {
+    state.count_max(CARRY_BUFFER_MOST, u64::try_from(bytes).unwrap_or(u64::MAX));
+  });
+}
+
+/// The object `identity`, `len` bytes, read whole from this shard's content store, its chunk store lent; none where it
+/// does not hold it whole.
+pub(crate) fn held_bytes(
+  state: &mut ShardState,
+  (identity, len): (ContentId, u64),
+) -> Option<Vec<u8>> {
+  let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+  let content = lent.stores.content()?;
+  content.object_bytes(&content.root_of(&identity), len)
 }
 
 /// The object `identity` read from the region (A-724 piece 8c: a version-3 record's names, read where its replay runs):

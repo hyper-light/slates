@@ -112,6 +112,18 @@
 > `a_status_requests_sweep_completes_within_its_bound_under_load` and
 > `a_fresh_daemons_sweep_walks_what_its_marks_cover_not_its_unwritten_journal`. OWED, A-926 part 2: the segment's log
 > and snapshot regions (3,495,255 pages, the register's format) get marks too.
+> A-926 part 1's sibling red, fixed (w-hg, 2026-11-26, main's order; w-perf held on a permission prompt):
+> `idle_sweep::tests::a_pass_cut_short_at_each_start_settles_in_that_pass_at_the_shards_idle_points` failed 20 of 20
+> from 3aa1ad9e8 (main's bisect: b2af92cae 3 of 3 green), "resumed 0". The product was right; the test's premise was
+> not: it took its give-back work from what a fresh daemon leaves, and with the marks a fresh daemon leaves two journal
+> pages, one step, so the poller had no step to cut. Its work is now its own, made at the start in the poller's step:
+> 32 files written and every other one freed, 16 free runs no free coalesces, each four times the size the arena purges
+> from (`discard_from_bytes`, derived from the host), a run a give-back step. It holds: the give-back took 17 steps, cut
+> once by the poller and resumed once at the shard's idle points in that pass, settling the shard (left and resumed
+> both 1). With the poller removed the same 17 steps run, left 0 and resumed 0
+> (`~/.local/state/w-hg-logs/2026-11-26-idle-sweep-no-poller.txt`), so the count is not vacuous. Its old
+> `started == 1` could not hold: written files take their sealing and busy passes first (4 started), so it counts the
+> one cut and its one resume instead, which a give-back left for later passes would exceed.
 
 > **Open (w-shared, 2026-11-21; closed by A-826 when it lands): a holder-route submit of 320 MiB and above does not
 > complete under load.** Its `SubmitComputed` carried the whole increment over the forward lane; on a loaded machine
@@ -2390,7 +2402,17 @@
 > (w-git, main's order of 2026-11-26, the next piece):** the homing and the landing still carry the pack as whole
 > buffers, `SealedPush::pack_to_home`'s copy into `Carry::Home(bytes, owner)` and `git_push::landing_of`'s parts built
 > from the homed bytes, each a whole-pack copy that grows with the push (main's reading: the likely reason C5's peak,
-> 551.6 MiB, sits far above its after-push figure). Owed (w-git): a node whose store lacks a record's changeset
+> 551.6 MiB, sits far above its after-push figure). b2a BUILT (w-git, 2026-11-26): the pack is homed as
+> `homes::HomeSource::Held`, its identity and length in the content store it was put in; this node's keep, where the
+> origin is its home shard, is a hold by identity (`homes::keep_held_for_region`), no bytes; its bytes read once, and
+> only for another home shard or a remote home (counted `git_push.carry_buffer_most`); the landing reads it once for its
+> `Payload` (`git_push::landed_pack`, `git_push.land_buffer_most`). Red: the one-shard push of a 2,213,177-byte pack in
+> `a_pushs_pack_is_put_as_it_arrives_…`: the homing held 0 B of it, 4,426,354 B (two copies) in the old shape. b2b
+> OWED (w-git, main's ruling: the slates-store owner side included): the landing's `Payload` from the content store's
+> windows through a pieces landing (begin, append, finish) that is the whole landing's one path. Unmeasured, owed
+> (w-git) once a fleet RSS round measures it: `put_remote` ships the whole pack in one buffer to each remote home
+> (f ≥ 1); another shard of this node as the pack's home is handed its bytes too. Owed (w-git): a node whose store
+> lacks a record's changeset
 > reading its names from their region homes, held by a test of its own (the rebuild test now reads the node's store).
 > OPEN (goal 93, w-git; w-sessionlog's reduction 2026-11-21): a whole clone of git/git with 506 tags or more is aborted
 > "possible repository corruption on the remote side". The repository's encoding never finishes (its first version,

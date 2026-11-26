@@ -498,10 +498,11 @@ enum Stage {
     plan: PostStatePlan,
     preparing: Preparing,
   },
-  /// Its result to keep at its next turn.
+  /// Its result to keep at its next turn. What it prepared stays boxed, as its step left it: it holds the increment, its
+  /// verdict and its encoding, several times any other stage's size.
   Finishing {
     refined: Option<(OpsDoc, PostStatePlan)>,
-    prepared: Option<Prepared>,
+    prepared: Option<Box<Prepared>>,
   },
   /// Ended.
   Done,
@@ -733,7 +734,7 @@ impl RefineJob {
           PrepareStepped::Ended(prepared, yielded) => {
             self.stage = Stage::Finishing {
               refined: Some((doc, plan)),
-              prepared: prepared.map(|prepared| *prepared),
+              prepared,
             };
             if yielded {
               return Turned::More;
@@ -744,7 +745,7 @@ impl RefineJob {
           finish(
             state,
             self.work,
-            (self.key, refined, prepared),
+            (self.key, refined, prepared.map(|prepared| *prepared)),
             (self.turns, self.longest),
           );
           return Turned::Done;

@@ -356,40 +356,68 @@ mod tests {
     }
   }
 
+  /// The idle passes the shard has run so far: those that give free content, dead recovery memory and the emptied write
+  /// log back (`crate::daemon::TICKS_IDLE`).
+  fn idle_passes(state: &mut crate::state::ShardState) -> u64 {
+    state
+      .refusals
+      .get(crate::daemon::TICKS_IDLE)
+      .copied()
+      .unwrap_or(0)
+  }
+
+  /// Shape: the files the cut-pass test writes, every other one freed ([`files_written`]): free runs enough that one idle
+  /// pass's give-back takes many steps, a run a step (`daemon::purge_slice_blocks` on a test shard: one).
+  const GIVE_BACK_FILES: usize = 32;
+
   /// A-226, A-715 (main 01a20182's ruling of 2026-11-23; the drift-free case). Do: on a one-shard daemon, set a poller
   /// that the keeper wakes beside each pass it starts and that takes turns on the shard until the pass has taken a
   /// step, so it cuts every pass short at its first step on every platform. A look once an interval did that on
   /// windows-latest, landing on the same 15.6 ms scheduler tick as each pass, and arm64's timing drifted out of it after
-  /// a few passes. Then look until the sweep has settled. Expect: the first pass settles the shard by itself, its
-  /// give-back resumed at the shard's idle points (counted) and no second pass started. Until 2026-11-23 a cut pass's
+  /// a few passes. The give-back's work is made at the start, in the poller's step: [`GIVE_BACK_FILES`] files written and
+  /// every other one freed, free runs no free coalesces, each past the size the arena purges from, and a give-back step
+  /// takes one run (`daemon::purge_slice_blocks`). Since A-926 (the write log's and slots' high-water marks) a fresh
+  /// daemon leaves two journal pages to give back, a single step, so the start's own leftovers no longer give the poller
+  /// a step to cut (main's bisect of 2026-11-26: red from 3aa1ad9e8). Then look until the sweep has settled. Expect: the
+  /// idle pass's give-back took a step a run; the poller cut it once, at its first step, and it resumed at the shard's
+  /// idle points in that pass (counted), settling the shard, never left for later passes. Until 2026-11-23 a cut pass's
   /// give-back resumed only in the next pass, an interval on, which the poller cut again at its first step: one step an
-  /// interval, and every pass's first step walks one page, since a fresh shard has learned no rate.
+  /// interval, every pass's give-back left once more.
   #[test]
   fn a_pass_cut_short_at_each_start_settles_in_that_pass_at_the_shards_idle_points() {
     let interval = Duration::from_nanos(super::interval_ns());
     let daemon = crate::daemon::audit_daemon_of(1);
-    // What a start leaves to give back is given back first, as the tests above do.
-    let _ = daemon.give_back_recovery_on_every_shard();
-    let polling = crate::daemon::observe_first(&daemon, |_state| {
+    // The give-back's work: a file of many pages written at the start, before any pass, so the first idle pass has its
+    // emptied write log to give back while the shard has learned no give-back rate (a step walks one page). A start
+    // leaves next to nothing of its own since A-926 (the write log's and slots' high-water marks: two journal pages),
+    // and a give-back by hand first would teach the rate. The poller is set in the same step.
+    let (idle_before, polling) = crate::daemon::observe_first(&daemon, |state| {
+      // Each run four times the size the arena purges from (`discard_from_bytes`, derived from the host), so each is
+      // given back whatever the host derived.
+      let run = state.config.discard_from_bytes.saturating_mul(4);
+      assert!(
+        files_written(state, (GIVE_BACK_FILES, run), true),
+        "the files were written and every other one freed"
+      );
       let task = slates_rt::futures::spawn(poller()).ok();
       if let Some(task) = task {
         let _ = slates_rt::futures::detach(task);
       }
       super::TEST_POLLER.set(task);
-      task.is_some()
+      (idle_passes(state), task.is_some())
     });
-    let first = look_until(&daemon, interval * FIRST_SETTLE_INTERVALS, |state| {
-      passes(state) > 0 && settled(state)
+    let settled_again = look_until(&daemon, interval * FIRST_SETTLE_INTERVALS, move |state| {
+      idle_passes(state) > idle_before && settled(state)
     });
-    let (started, resumed, seen) = crate::daemon::observe_first(&daemon, |state| {
-      let count = |state: &crate::state::ShardState, kind: &str| {
-        state.refusals.get(kind).copied().unwrap_or(0)
-      };
-      (
-        count(state, super::PASSES_STARTED),
-        count(state, super::GIVE_BACK_RESUMED),
-        describe(state),
-      )
+    let (steps, (left, resumed), seen) = crate::daemon::observe_first(&daemon, move |state| {
+      let seen = describe(state);
+      let steps = idle_passes(state) - idle_before;
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      let cut = (
+        count(crate::daemon::GIVE_BACK_LEFT),
+        count(super::GIVE_BACK_RESUMED),
+      );
+      (steps, cut, seen)
     });
     let parked = parked_with_ready(&daemon);
     daemon.stop();
@@ -398,14 +426,20 @@ mod tests {
       "no park of the shard began with a task ready (A-881)"
     );
     assert!(polling, "the poller is on the shard");
-    assert!(first, "the first pass ran and settled the shard: {seen}");
+    assert!(settled_again, "the files' passes settled the shard: {seen}");
+    let runs = u64::try_from(GIVE_BACK_FILES / 2).expect("a count");
+    assert!(
+      steps > runs,
+      "the give-back took a step a freed run, so the poller had a step to cut: {steps} steps, {seen}"
+    );
     assert!(
       resumed > 0,
       "the poller cut the pass, and its give-back resumed at the shard's idle point: {seen}"
     );
     assert_eq!(
-      started, 1,
-      "one pass settled the shard, its give-back resumed in it rather than in later passes: {seen}"
+      (left, resumed),
+      (1, 1),
+      "one pass's give-back was cut once and resumed in it, never left to later passes: {seen}"
     );
   }
 
@@ -609,17 +643,29 @@ mod tests {
 
   /// Creates a volume on the shard and writes a file into it: whether it was written.
   fn write_a_file(state: &mut crate::state::ShardState) -> bool {
+    files_written(state, (1, 4096), false)
+  }
+
+  /// Creates a volume on the shard and writes `files` files of `len` bytes each into it, then, where `freed`, truncates
+  /// every other one to nothing, so the arena holds that many free runs, each between two allocated ones, which no free
+  /// coalesces: whether all of it was done.
+  fn files_written(
+    state: &mut crate::state::ShardState,
+    (files, len): (usize, usize),
+    freed: bool,
+  ) -> bool {
     let principal = slates_db::catalog::Principal::Uid {
       host: slates_db::HostId(0),
       uid: 0,
     };
+    let limit = u64::try_from(files * len).unwrap_or(u64::MAX).max(1 << 20);
     let reply = crate::verbs::dispatch(
       state,
       1,
       &principal,
       slates_ipc::protocol::RequestBody::Create {
         name: "swept".to_owned(),
-        size: slates_ipc::protocol::SizeClass::Bounded { limit: 1 << 20 },
+        size: slates_ipc::protocol::SizeClass::Bounded { limit },
         names: slates_ipc::protocol::NamePolicy::Exact,
         require_locked: false,
         base: None,
@@ -638,9 +684,26 @@ mod tests {
     let Ok(root) = slot.volume.root_inode(store) else {
       return false;
     };
-    let Ok(file) = slot.volume.create_file_no(store, root, "written", 0o644) else {
-      return false;
-    };
-    slot.volume.write(store, file, 0, &[7u8; 4096]).is_ok()
+    let bytes = vec![7u8; len];
+    let mut made = Vec::new();
+    for at in 0..files {
+      let name = if at == 0 {
+        "written".to_owned()
+      } else {
+        format!("written-{at}")
+      };
+      let Ok(file) = slot.volume.create_file_no(store, root, &name, 0o644) else {
+        return false;
+      };
+      if slot.volume.write(store, file, 0, &bytes).is_err() {
+        return false;
+      }
+      made.push(file);
+    }
+    !freed
+      || made
+        .iter()
+        .step_by(2)
+        .all(|file| slot.volume.truncate(store, *file, 0).is_ok())
   }
 }
