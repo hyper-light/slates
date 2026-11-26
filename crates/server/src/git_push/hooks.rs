@@ -466,6 +466,7 @@ fn admitted<P>(
     peel_away: &mut None,
     making_room: &mut None,
     door: &mut None,
+    waits: &push.waits,
   };
   judge.admitted(command).is_ok()
 }

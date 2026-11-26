@@ -492,11 +492,7 @@ impl GitReplay {
   fn site<'s>(&'s self, content: &'s ContentStore, store: &'s GitStore) -> Site<'s> {
     Site {
       queue: BTreeMap::new(),
-      quarantined: Quarantined {
-        push: Some(&self.push),
-        store: content,
-        repository: &store.repository,
-      },
+      quarantined: Quarantined::new(Some(&self.push), content, (&store.repository, None)),
       outside: StoreBases(slates_git::store::views::IndexedObjects::new(
         &store.repository,
         content,
