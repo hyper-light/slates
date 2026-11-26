@@ -4100,26 +4100,9 @@ fn intake_outcome(refused: &IntakeRefused) -> PushOutcome {
 }
 
 /// [`prepare`] over `view` with `unbundle`'s changegroup taken whole into a fork first, the prepared push holding the
-/// fork: the driver's steps for the tests, which judge a push over a view of their own. The texts its works want wait
-/// for the store on the shard's thread: allow-listed until its tests push from a task (`unbundle`;
-/// test_store::SHARD_BLOCKING_ALLOWED).
+/// fork: the driver's steps for the tests, which judge a push over a view of their own.
 #[cfg(test)]
 pub(crate) fn prepare_whole<V: Repository>(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  unbundle: &Unbundle,
-  view: &V,
-  terms: Terms,
-  room: &mut Admission,
-) -> Result<Prepared, Box<Refused>> {
-  crate::test_store::allowing_shard_blocking("repository::hg_push::prepare_whole", || {
-    prepare_whole_held(state, repository, unbundle, view, terms, room)
-  })
-}
-
-/// [`prepare_whole`]'s steps, on the shard's thread.
-#[cfg(test)]
-fn prepare_whole_held<V: Repository>(
   state: &mut ShardState,
   repository: RepositoryId,
   unbundle: &Unbundle,

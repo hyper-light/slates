@@ -1158,26 +1158,31 @@
 >   bare runtime runs on the test's thread and is not refused. The fixtures still blocking are named in
 >   `test_store::SHARD_BLOCKING_ALLOWED`, each with its owner and how many sites reach it, and run their blocking body
 >   through `allowing_shard_blocking`; there is no global off-switch. The list only shrinks.
->   **The shard-blocking allow-list: 12 fixtures** (a test holds the list's length to this figure; edit both together):
+>   **The shard-blocking allow-list: 11 fixtures** (a test holds the list's length to this figure; edit both together):
 >   - `test_store::audit_on_stored_shard`: 166 sites. svn 0; git 25 (`git_push/tests.rs` 23, `git_hooks/tests.rs` 2);
 >     hg 32 (`hg_push/tests.rs` 15, `hg_view/tests.rs` 10, `hg_import/tests.rs` 7); other 109 (`push/tests.rs` 18,
 >     `vcs_store/tests.rs` 16, `upload/tests.rs` 12, `paths/tests.rs` 11, `repository.rs` 10, `vcs_share/tests.rs` 9,
 >     `commits/tests.rs` 8, `identities/tests.rs` 8, `vcs_share/grants.rs` 4, `vcs_share/read_backs.rs` 3,
 >     `index_upkeep.rs` 2, `vcs_share/wait.rs` 2, `import/tests.rs` 2, `fleet.rs` 2, `replica.rs` 1,
 >     `named_objects.rs` 1).
->   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 55 tests. hg 32
->     (`hg_push` 16, `hg_made` 10, `vcs_ssh` 4, `hg_import` 2); other 23 (`daemon::tests` 6, `repository::push` 5,
+>   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 39 tests. hg 16
+>     (`hg_made` 10, `vcs_ssh` 4, `hg_import` 2); other 23 (`daemon::tests` 6, `repository::push` 5,
 >     `vcs_http::daemon_edge` 5, `repository::import` 2, `vcs_share` 2, `identities` 1, `repository::tests` 1,
 >     `vcs_store::upload` 1).
 >   - `git_push::tests::git_repository` (41 sites) and `git_push::tests::carry_blocking` (8): w-git.
 >   - w-hg's push and import helpers, counted by the tests refused without each once the entries above let them
->     through: `repository::hg_push::land_stored` (17 tests: `hg_push` 15, `vcs_ssh::tests::hg` 2),
->     `repository::hg_push::land_in` (1, `hg_made`), `repository::hg_push::prepare_whole` (1, `hg_push`), `vcs_store::commits::home_and_land_blocking` (7: `commits` 6,
+>     through: `repository::hg_push::land_stored` (2 tests, `vcs_ssh::tests::hg`),
+>     `repository::hg_push::land_in` (1, `hg_made`), `vcs_store::commits::home_and_land_blocking` (7: `commits` 6,
 >     `upload` 1), `repository::hg_push::stored_now` (1, `hg_made`), `vcs_store::hg_import::land_imported` (1,
 >     `daemon::tests`), `land_imported_on`'s works built whole (1, `hg_import`), and
 >     `repository::import::tests::served`'s read-back (1).
 >   Moved instead of listed: `daemon::tests::t_goal93_a_homes_landed_records_survive_a_restart…` lands between two
->   observations. The pattern to move to is `audit_on_stored_shard_made`, `created().await` in a task
+>   observations. Shrunk: `repository/hg_push/tests.rs`' 17 daemon tests push through the daemon's own driver
+>   (`hg_push::unbundle`) from a task on the shard, their repositories made there (`created().await`), so
+>   `prepare_whole`'s entry is gone and `land_stored`'s and `create`'s fell by 15 and 16. The two that rebuild from the
+>   state logs' parts keep the parts the shard takes between the push's turns (`state_log::keep_for_test`). Left in
+>   that file: its 15 `audit_on_stored_shard` histories, which judge pushes over views of their own and race two pushes
+>   by hand (`prepare_whole`, `land_in`). The pattern to move to is `audit_on_stored_shard_made`, `created().await` in a task
 >   (`run_on_first`), `create_on` from the test's thread, or `hg_push::unbundle` from a shard task.
 > **The piece-reading replay (A-767 C1; R2's replay half). CLOSED.** A changeset's payload is read back a piece at a
 > time as its replay wants it, never whole. `slates_hg::framing` is the one walk of a changegroup's chunks over a

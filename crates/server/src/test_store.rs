@@ -368,8 +368,8 @@ pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   },
   Allowed {
     fixture: "test_store::create",
-    owner: "each caller's (GAPS: hg 32, other 23)",
-    reaching: 55,
+    owner: "each caller's (GAPS: hg 16, other 23)",
+    reaching: 39,
   },
   Allowed {
     fixture: "vcs_store::commits::home_and_land_blocking",
@@ -378,17 +378,12 @@ pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   },
   Allowed {
     fixture: "repository::hg_push::land_stored",
-    owner: "w-hg (repository::hg_push 15, vcs_ssh::tests::hg 2)",
-    reaching: 17,
+    owner: "w-hg (vcs_ssh::tests::hg 2)",
+    reaching: 2,
   },
   Allowed {
     fixture: "repository::hg_push::land_in",
     owner: "w-hg (vcs_store::hg_made 1)",
-    reaching: 1,
-  },
-  Allowed {
-    fixture: "repository::hg_push::prepare_whole",
-    owner: "w-hg (repository::hg_push 1)",
     reaching: 1,
   },
   Allowed {
