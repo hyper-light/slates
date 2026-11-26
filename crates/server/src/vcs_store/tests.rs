@@ -46,7 +46,7 @@ const DEEP: u64 = 2;
 const FORMAT: ObjectFormat = ObjectFormat::Sha1;
 
 /// Format: the first committer date the histories use, seconds since the epoch.
-pub(super) const FIRST_DATE: u64 = 1_700_000_000;
+pub(crate) const FIRST_DATE: u64 = 1_700_000_000;
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Objects as git writes them.
@@ -461,6 +461,8 @@ fn landed_record(
 /// ref its own append), and every object it brought.
 struct Pending {
   push: Push,
+  /// The pack it put, as the model's record writes it (the push's own is in the content store, its put under way).
+  pack: Vec<u8>,
   writer: RecordWriter,
   moves: Vec<Planned>,
   split: bool,
@@ -504,7 +506,9 @@ impl Live {
         .map(|incoming| (incoming.kind, incoming.content)),
     )
     .map_err(|_| GitRefused::Allocation)?;
-    push.extend_pack(&pack);
+    push
+      .extend_pack(&mut self.content, &pack)
+      .map_err(|refused| GitRefused::Object(PushRefused::Content(refused)))?;
     for (arriving, offset) in arriving.into_iter().zip(offsets) {
       admit_object(
         &mut self.content,
@@ -515,6 +519,7 @@ impl Live {
     }
     Ok(Pending {
       push,
+      pack,
       writer,
       moves,
       split,
@@ -564,7 +569,7 @@ impl Live {
     let record = landed_record(
       &mut self.content,
       &self.store,
-      (&pending.writer, deepest, pending.push.pack()),
+      (&pending.writer, deepest, &pending.pack),
       (moves, &bases),
     )?;
     commit_moves(
@@ -2744,7 +2749,7 @@ fn room_asked_inside_a_lend_is_refused_out_of_reach_at_its_first_put() {
 }
 
 /// Bytes no deflate shortens (a xorshift's stream), `len` of them: a file whose pack is as long as it.
-fn incompressible(len: usize) -> Vec<u8> {
+pub(crate) fn incompressible(len: usize) -> Vec<u8> {
   let mut word = 0x9e37_79b9_7f4a_7c15u64;
   (0..len)
     .map(|_| {

@@ -747,8 +747,16 @@ impl<P> ReceivePack<P> {
     })?;
     match (quarantine.as_mut(), self.unadmitted.is_some()) {
       (Some(quarantine), false) => {
-        quarantine.keep_pack_to(session.pack_len(), input);
-        if let Err(refused) = intake::admit_queued(state, quarantine, queue, admission) {
+        let admitted = match quarantine.keep_pack_to(state, session.pack_len(), input) {
+          Ok(()) => intake::admit_queued(state, quarantine, queue, admission),
+          Err(refused) => {
+            for (_, hold) in queue.into_values() {
+              admission.release(hold);
+            }
+            Err(refused)
+          }
+        };
+        if let Err(refused) = admitted {
           self.unadmitted = Some(refused);
         }
       }
@@ -1030,7 +1038,7 @@ impl<P> ReceivePack<P> {
       }
       // The pack the staging put in the store, held once more for the record (A-722's record v4), and asked of the edge;
       // a push whose pack is not held is refused (C5 part 2b).
-      Homing::PackDue(names) => match decision.sealed.pack_to_home() {
+      Homing::PackDue(names) => match decision.sealed.pack_to_home(state) {
         Some((bytes, packed)) if crate::vcs_store::hold_for_record(state, &packed.0) => {
           decision.homing = Homing::PackAsked(bytes, packed, names);
           Ok(false)

@@ -2001,12 +2001,20 @@ impl SealedPush {
     self.attempt.homed(named.0);
   }
 
-  /// The push's pack to home in the region for a version 4 record (A-722's record v4): its bytes, and the identity and
-  /// length its staging put it in the store under; none for a push that put no pack. The bytes are copied for the
-  /// homing, which runs off the shard's step.
-  pub(crate) fn pack_to_home(&self) -> Option<(Vec<u8>, (slates_vcs::ContentId, u64))> {
+  /// The push's pack to home in the region for a version 4 record (A-722's record v4): its bytes, read from the content
+  /// store it was put in as it arrived, and the identity and length its staging finished it under; none for a push that
+  /// put no pack, or whose pack the store does not hold whole. The bytes are copied for the homing, which runs off the
+  /// shard's step: a whole-pack copy b2 owes (main's order of 2026-11-26, GAPS).
+  pub(crate) fn pack_to_home(
+    &self,
+    state: &mut ShardState,
+  ) -> Option<(Vec<u8>, (slates_vcs::ContentId, u64))> {
     let stored = self.push.stored_pack()?;
-    Some((self.push.pack().to_vec(), stored))
+    // Read with the shard's chunk store lent, where the content store keeps its windows (A-727).
+    let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+    let content = lent.stores.content()?;
+    let bytes = content.object_bytes(&content.root_of(&stored.0), stored.1)?;
+    Some((bytes, stored))
   }
 
   /// Keeps `packed`, the push's pack homed in the region under its identity and length: the record is version 5 while
@@ -2279,14 +2287,53 @@ impl GitPush {
     &self.push
   }
 
-  /// Keeps the pack the client sent as far as `sent` bytes, the push's objects' one copy (`Push::extend_pack`): what it
-  /// lacks of it is the end of `input`, the bytes of the call that brought them. The push's first record holds it in
-  /// place of its objects' bytes (A-723).
-  pub(crate) fn keep_pack_to(&mut self, sent: u64, input: &[u8]) {
-    let kept = u64::try_from(self.push.pack().len()).unwrap_or(u64::MAX);
-    let owed = usize::try_from(sent.saturating_sub(kept)).unwrap_or(usize::MAX);
+  /// Puts the pack the client sent as far as `sent` bytes in the content store as it arrives, the push's objects' one
+  /// copy (`Push::extend_pack`; main's order of 2026-11-26, C3: content once on arrival): what it lacks of it is the end
+  /// of `input`, the bytes of the call that brought them, put within the room the shard lends the step. The most the
+  /// push itself held of its pack then counted ([`PUSH_PACK_BUFFER_MOST`]). Refused (the budget, the storage), the push
+  /// keeps what it put, for its caller to abandon.
+  pub(crate) fn keep_pack_to(
+    &mut self,
+    state: &mut ShardState,
+    sent: u64,
+    input: &[u8],
+  ) -> Result<(), GitRefused> {
+    let owed = usize::try_from(sent.saturating_sub(self.push.pack_len())).unwrap_or(usize::MAX);
     let from = input.len().saturating_sub(owed);
-    self.push.extend_pack(input.get(from..).unwrap_or_default());
+    let piece = input.get(from..).unwrap_or_default();
+    let push = &mut self.push;
+    let put = within_budget(
+      state,
+      u64::try_from(piece.len()).unwrap_or(u64::MAX),
+      |stores| {
+        let content = stores.content_mut().ok_or(GitRefused::NoStore)?;
+        push.extend_pack(content, piece).map_err(content_refused)
+      },
+    );
+    state.count_max(
+      PUSH_PACK_BUFFER_MOST,
+      u64::try_from(self.push.pack_held()).unwrap_or(u64::MAX),
+    );
+    put
+  }
+
+  /// Widens what the push's reads keep of the objects read lately for the chains its pack carries, within what the
+  /// shard grants now (`Push::widen_reading`, the fetch's widening's rule): its growth asked of the room the shard can
+  /// admit (`Store::admittable`), never of the reading's own admission, which is the room its reader holds objects in;
+  /// what the cache keeps is charged on the store's room as it keeps it (A-861, `Push::true_up_recent`). Counted
+  /// [`PUSH_READ_CACHE_WIDENED`], [`PUSH_READ_CACHE_REFUSED`] past the grant, and the budget's most
+  /// ([`PUSH_READ_CACHE_BUDGET_MOST`]).
+  pub(crate) fn widen_reading(&self, state: &mut ShardState) {
+    let mut grant = slates_git::Admission::new(state.store.admittable());
+    match self.push.widen_reading(&mut grant) {
+      slates_git::store::Widening::Grown => state.count(PUSH_READ_CACHE_WIDENED, 1),
+      slates_git::store::Widening::Refused => state.count(PUSH_READ_CACHE_REFUSED, 1),
+      slates_git::store::Widening::Enough => {}
+    }
+    state.count_max(
+      PUSH_READ_CACHE_BUDGET_MOST,
+      u64::try_from(self.push.reading_budget()).unwrap_or(u64::MAX),
+    );
   }
 
   /// Admits `objects`, a pack's as its reader resolved them, each held where its entry lies in the push's pack
@@ -2341,9 +2388,9 @@ impl GitPush {
         .map(|incoming| (incoming.kind, incoming.content)),
     )
     .map_err(|_| GitRefused::Allocation)?;
-    let sent = u64::try_from(self.push.pack().len().saturating_add(pack.len())).unwrap_or(u64::MAX);
-    let base = u64::try_from(self.push.pack().len()).unwrap_or(u64::MAX);
-    self.keep_pack_to(sent, &pack);
+    let base = self.push.pack_len();
+    let sent = base.saturating_add(u64::try_from(pack.len()).unwrap_or(u64::MAX));
+    self.keep_pack_to(state, sent, &pack)?;
     within_budget(state, 0, |stores| {
       let (content, store) = stores.git(self.repository).ok_or(GitRefused::NoStore)?;
       for (incoming, offset) in objects.iter().zip(offsets) {
@@ -3280,8 +3327,11 @@ fn replay_pack(
       .map_err(ReplayRefused::Pack)?
   };
   // Each object is held where it lies in the record's pack, as the live push held it (A-722's record v4: rows by pack
-  // place), so the store made again from the log is the live one.
-  push.extend_pack(pack);
+  // place), so the store made again from the log is the live one; its windows a landed push let go brought back.
+  push.bringing_back();
+  push
+    .extend_pack(content, pack)
+    .map_err(|refused| ReplayRefused::Git(content_refused(refused)))?;
   for object in &unpacked.objects {
     let incoming = Incoming {
       kind: object.kind,
@@ -4027,6 +4077,19 @@ fn put_changeset(
 /// Counter: git changesets a recovery or rebuild read from the node's store before replaying the record naming them
 /// (A-767 C5). Format: a counter name.
 pub(crate) const CHANGESET_READ: &str = "vcs_store.git_changeset_read";
+
+/// Counted most: the most bytes a git push itself held of its own pack at once: its put's window being filled, the pack
+/// put in the content store as it arrives (main's order of 2026-11-26, C3; `Push::pack_held`). At most a window. Format: a
+/// counter name.
+pub(crate) const PUSH_PACK_BUFFER_MOST: &str = "git_push.pack_buffer_most";
+/// Counter: the times a git push's reads widened what they keep of the objects read lately (`Push::widen_reading`).
+/// Format: a counter name.
+pub(crate) const PUSH_READ_CACHE_WIDENED: &str = "git_push.read_cache_widened";
+/// Counter: the times a git push's admission refused its read cache the room its chains asked: its reads past the grant
+/// rebuilt from their bases, never refused. Format: a counter name.
+pub(crate) const PUSH_READ_CACHE_REFUSED: &str = "git_push.read_cache_refused";
+/// Counted most: the most bytes a git push's read cache was allowed to keep. Format: a counter name.
+pub(crate) const PUSH_READ_CACHE_BUDGET_MOST: &str = "git_push.read_cache_budget_most";
 
 /// Counted most: the most bytes of its record's pack a git replay held at once while reading it from the node's store
 /// (C2 of w-git's close list, main's order of 2026-11-26: read whole, one buffer as long as the pack, a working set

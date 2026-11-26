@@ -122,5 +122,7 @@ pub(super) fn admit_queued(
   for hold in holds {
     admission.release(hold);
   }
+  // What the push's reads keep lately widened for the chains it carries now, within what the shard grants.
+  quarantine.widen_reading(state);
   admitted
 }

@@ -2344,6 +2344,78 @@ pub(crate) fn create_of_file(blob: Vec<u8>) -> (Vec<u8>, ObjectId) {
   (request, blob_id)
 }
 
+/// Shape: the files of [`a_pushs_pack_is_put_as_it_arrives_its_buffer_a_window_and_its_cache_its_chains`]'s commit.
+const BOUNDED_FILES: usize = 32;
+/// Shape: each one's bytes, incompressible: the pack many windows long, each object a small fraction of it.
+const BOUNDED_FILE: usize = 64 << 10;
+
+/// Main's order of 2026-11-26 (C3 (b): content once on arrival, a bounded working set a push). Do: push a create of
+/// `main` at a commit of [`BOUNDED_FILES`] incompressible files of [`BOUNDED_FILE`] bytes each, its pack many windows of
+/// the content store long, its request handed to the driver a piece at a time. Expect: `main` created; the most the push
+/// itself held of its pack at once (`git_push.pack_buffer_most`) within one window, the pack put in the content store
+/// as it arrived; its read cache's budget at most (`git_push.read_cache_budget_most`) what one longest object's chain
+/// asks (`Recent::budget_keeping`, its objects whole), a fraction of the pack, and never refused. Red before: the push
+/// held its pack whole in a buffer of its own, and its read cache's budget was the pack's length.
+#[test]
+fn a_pushs_pack_is_put_as_it_arrives_its_buffer_a_window_and_its_cache_its_chains() {
+  use crate::vcs_store::{
+    PUSH_PACK_BUFFER_MOST, PUSH_READ_CACHE_BUDGET_MOST, PUSH_READ_CACHE_REFUSED,
+  };
+  on_stored_shard_awaited(["bounded"], |[repository]| async move {
+    let bytes = crate::vcs_store::tests::incompressible(BOUNDED_FILES * BOUNDED_FILE);
+    let files: Vec<(Vec<u8>, Vec<u8>)> = bytes
+      .chunks(BOUNDED_FILE)
+      .enumerate()
+      .map(|(n, file)| (format!("f{n:02}").into_bytes(), file.to_vec()))
+      .collect();
+    let (objects, head) =
+      crate::vcs_store::tests::commit_of(&files, &[], crate::vcs_store::tests::FIRST_DATE);
+    let pack = slates_git::pack::of_whole(
+      ObjectFormat::Sha1,
+      objects
+        .iter()
+        .map(|(kind, _, bytes)| (*kind, bytes.as_slice())),
+    )
+    .unwrap();
+    let request = request(
+      &[("", &head.to_string(), b"refs/heads/main")],
+      CAPABILITIES,
+      &pack,
+    );
+    let received = pushed_awaited(repository, &request).await;
+    assert_eq!(reasons(&received), [b"ok".to_vec()], "main created");
+    let (window, buffer, budget, refused) = on_state(|state| {
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      let window = state
+        .vcs_stores
+        .content()
+        .map_or(0, slates_vcs::ContentStore::window);
+      (
+        u64::try_from(window).unwrap(),
+        count(PUSH_PACK_BUFFER_MOST),
+        count(PUSH_READ_CACHE_BUDGET_MOST),
+        count(PUSH_READ_CACHE_REFUSED),
+      )
+    });
+    let pack_len = u64::try_from(pack.len()).unwrap();
+    let chain =
+      slates_git::store::packed::Recent::budget_keeping(u64::try_from(BOUNDED_FILE).unwrap() + 64);
+    eprintln!(
+      "a {pack_len}-byte pack: the push held at most {buffer} B, window {window} B; cache budget {budget} B"
+    );
+    assert!(pack_len > 8 * window, "the pack many windows long");
+    assert!(
+      buffer > 0 && buffer <= window,
+      "the push held {buffer} B of its pack"
+    );
+    assert!(
+      budget > 0 && budget <= chain && budget < pack_len / 4,
+      "its read cache's budget {budget} B, a chain's {chain} B"
+    );
+    assert_eq!(refused, 0, "never refused");
+  });
+}
+
 /// A-719 part 3 (§4.17.1 "A push's intake", rule 1). Do: push a create of `main` at a commit whose one file is a
 /// mebibyte, handing the driver its request a piece at a time, then answer it. Expect: once its bytes are all taken,
 /// the file in the push's quarantine and the push's admission holding the pack as sent (A-723's record) and less than

@@ -220,6 +220,9 @@ impl GitReplay {
     };
     let mut push = Push::new(format);
     push.carried(record.deepest);
+    // Its pack is put again as it is read, each window a landed push let go brought back, so its objects read where they
+    // lie (main's order of 2026-11-26, C3).
+    push.bringing_back();
     // The pack is read from the content store by its identity, a window at a time (A-722's record v4, version 5).
     Ok(Box::new(Self {
       push,
@@ -349,9 +352,13 @@ impl GitReplay {
             .map_err(ReplayRefused::Pack)?;
           (took, site.queue)
         };
-        self.push.extend_pack(piece.get(..took).unwrap_or_default());
+        // What the reader took, at most a turn's chunk, copied out before the content store is lent to the push's put.
+        let taken = piece.get(..took).unwrap_or_default().to_vec();
         let piece_was_empty = piece.is_empty();
         drop(stored);
+        self.push.extend_pack(content, &taken).map_err(|refused| {
+          ReplayRefused::Git(GitRefused::Object(PushRefused::Content(refused)))
+        })?;
         self.admit_queued((content, store), queue, &mut admission)?;
         if reader.is_whole() {
           (Stage::Resolving { reader, admission }, None)
@@ -526,6 +533,9 @@ impl GitReplay {
         .keep_read(object.offset, object.kind, object.content);
       admission.release(hold);
     }
+    // What its reads keep lately widened for the chains it carries now, within the content store's room, as a live
+    // push's is within the shard's.
+    let _ = self.push.widen_reading(&mut Admission::new(content.room()));
     Ok(())
   }
 
