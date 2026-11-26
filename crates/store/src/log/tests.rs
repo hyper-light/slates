@@ -936,3 +936,251 @@ fn nested_same_grant_forged_record_never_indexes_in_c1_c2_c3() {
     "C3 exact-offset unsealed",
   );
 }
+
+/// Appends a single-section committed record with `kind` and `contents`.
+fn append_one_section(
+  log: &mut ChangesetLog<SimFile>,
+  tool: Tool,
+  repository: u128,
+  sequence: u64,
+  kind: SectionKind,
+  contents: &[u8],
+) -> Located {
+  let mut record = log
+    .begin(Header {
+      tool,
+      repository,
+      sequence,
+      judged_over: sequence.saturating_sub(1),
+      grant: 3,
+      work: sequence,
+      time_ns: sequence,
+      sections: 1,
+    })
+    .unwrap();
+  record
+    .section(kind, u64::try_from(contents.len()).unwrap())
+    .unwrap();
+  if !contents.is_empty() {
+    record.piece(contents).unwrap();
+  }
+  record.commit().unwrap()
+}
+
+/// Layout of an ordinary interrupted uncommitted tail at EOF.
+#[derive(Clone, Copy, Debug)]
+enum UnwrittenTailShape {
+  /// One declared section, interrupted mid-payload before `close_section`.
+  SingleSection,
+  /// Two declared sections, interrupted during section 0 before section 1 begins.
+  TwoSectionsFirstOpen,
+  /// Two declared sections, section 0 (`Record`) closed, section 1 (`Payload`) interrupted mid-write.
+  TwoSectionsSecondOpen,
+}
+
+/// Runs one ordinary interrupted uncommitted tail recovery with `tail_bytes` written into an
+/// unclosed section in `shape` and returns the exact `SimFile` read call count consumed by recovery.
+fn measure_unwritten_tail_reads(tail_bytes: u64, shape: UnwrittenTailShape) -> u64 {
+  let (mut log, _) = recovered(file(98));
+  let committed = append_one_section(
+    &mut log,
+    Tool::Git,
+    11,
+    1,
+    SectionKind::Payload,
+    b"committed control",
+  );
+  let sections = match shape {
+    UnwrittenTailShape::SingleSection => 1,
+    UnwrittenTailShape::TwoSectionsFirstOpen | UnwrittenTailShape::TwoSectionsSecondOpen => 2,
+  };
+  {
+    let mut uncommitted = log
+      .begin(Header {
+        tool: Tool::Git,
+        repository: 11,
+        sequence: 2,
+        judged_over: 1,
+        grant: 3,
+        work: 2,
+        time_ns: 2,
+        sections,
+      })
+      .unwrap();
+    if matches!(shape, UnwrittenTailShape::TwoSectionsSecondOpen) {
+      uncommitted.section(SectionKind::Record, 5).unwrap();
+      uncommitted.piece(b"heads").unwrap();
+    }
+    uncommitted
+      .section(SectionKind::Payload, tail_bytes + 1)
+      .unwrap();
+    uncommitted
+      .piece(&vec![b'd'; usize::try_from(tail_bytes).unwrap()])
+      .unwrap();
+  }
+  let disk = log.into_file();
+  let before = disk.stats().unwrap().reads;
+  let (reopened, records) = recovered(disk);
+  assert_eq!(records, vec![committed]);
+  assert_eq!(reopened.end(), committed.end());
+  assert_eq!(reopened.skipped(), 0);
+  reopened.file().stats().unwrap().reads - before
+}
+
+/// Asserts that recovery of `shape` performs the exact same `SimFile` read call count across
+/// 4 KiB, 64 KiB, and 1 MiB uncommitted tail payloads.
+fn assert_constant_tail_reads(shape: UnwrittenTailShape) {
+  let reads_4k = measure_unwritten_tail_reads(4_096, shape);
+  let reads_64k = measure_unwritten_tail_reads(65_536, shape);
+  let reads_1m = measure_unwritten_tail_reads(1_048_576, shape);
+  assert!(reads_4k > 0, "{shape:?}: recovery must read the log");
+  assert_eq!(
+    reads_4k, reads_64k,
+    "{shape:?}: 4 KiB ({reads_4k}) vs 64 KiB ({reads_64k}) reads"
+  );
+  assert_eq!(
+    reads_4k, reads_1m,
+    "{shape:?}: 4 KiB ({reads_4k}) vs 1 MiB ({reads_1m}) reads"
+  );
+}
+
+/// Do: commit one record, append an interrupted uncommitted tail (unclosed section head) with
+/// payloads of 4 KiB, 64 KiB, and 1 MiB across 1-section and 2-section layouts, and recover.
+/// Expect: only the committed prefix recovers, `skipped() == 0`, and `SimFile` read call counts
+/// are strictly identical across all three payload sizes (O(1) reads, never scanning the tail).
+#[test]
+fn ordinary_interrupted_uncommitted_tail_reads_constant_calls_across_tail_sizes() {
+  for shape in [
+    UnwrittenTailShape::SingleSection,
+    UnwrittenTailShape::TwoSectionsFirstOpen,
+    UnwrittenTailShape::TwoSectionsSecondOpen,
+  ] {
+    assert_constant_tail_reads(shape);
+  }
+}
+
+/// Verifies that flipping `flip_bit` at `head_offset` turns the 16-byte section head to all zeros
+/// and that recovery still resynchronizes past `middle` to recover `prefix` and `trailing`.
+fn assert_zeroed_empty_section_recovers_siblings(
+  sim: SimFile,
+  head_offset: u64,
+  flip_bit: u8,
+  (prefix, trailing): (Located, Located),
+  trailing_bytes: &[u8],
+  label: &str,
+) {
+  sim
+    .inject(Fault::BitFlip {
+      offset: head_offset,
+      bit: flip_bit,
+      stored: true,
+    })
+    .unwrap();
+  let mut head = [0u8; SECTION_HEAD_BYTES];
+  sim.read_exact_at(&mut head, head_offset).unwrap();
+  assert_eq!(
+    head, [0u8; SECTION_HEAD_BYTES],
+    "{label}: bit flip must produce an all-zero section head"
+  );
+  let (log, found) = recovered(sim);
+  assert_eq!(found, vec![prefix, trailing], "{label}");
+  assert_eq!(log.end(), trailing.end(), "{label}");
+  assert_eq!(log.skipped(), 1, "{label}");
+  assert_eq!(read_payload(&log, &trailing), trailing_bytes, "{label}");
+}
+
+/// Do: commit `[prefix, middle, trailing]` where `middle` contains a 0-byte section whose single
+/// set kind bit (`Record=1`, `Payload=2`, `Names=4`) is flipped so its 16-byte head becomes all
+/// zeros — covering single-section records, a 0-byte first section followed by another section,
+/// and a 0-byte last section after a closed first section — and recover.
+/// Expect: recovery never mistakes the flipped head for an unwritten tail; linear resync skips
+/// `middle` (`skipped() == 1`) and recovers both `prefix` and `trailing` intact.
+#[test]
+fn single_bit_flip_zeroing_empty_section_head_still_recovers_trailing_sibling() {
+  let trailing_bytes = payload(77, 64);
+
+  // Single-section 0-byte middle records (last section -> commit trailer sits at `bytes_at`).
+  for (kind, bit, label) in [
+    (SectionKind::Record, 0u8, "1-sec empty Record"),
+    (SectionKind::Payload, 1, "1-sec empty Payload"),
+    (SectionKind::Names, 2, "1-sec empty Names"),
+  ] {
+    let (mut log, _) = recovered(file(99));
+    let prefix = append_for(&mut log, Tool::Git, 101, 1, b"prefix");
+    let middle = append_one_section(&mut log, Tool::Git, 101, 2, kind, &[]);
+    let trailing = append_for(&mut log, Tool::Subversion, 303, 1, &trailing_bytes);
+    let head_offset = middle.offset + u64::try_from(HEADER_BYTES).unwrap();
+    assert_zeroed_empty_section_recovers_siblings(
+      log.into_file(),
+      head_offset,
+      bit,
+      (prefix, trailing),
+      &trailing_bytes,
+      label,
+    );
+  }
+
+  // Two-section middle record: 0-byte first section (`remaining_sections == 1`, next head at `bytes_at`).
+  let (mut log, _) = recovered(file(100));
+  let prefix = append_for(&mut log, Tool::Git, 101, 1, b"prefix");
+  let middle = {
+    let mut rec = log.begin(header(2, 2)).unwrap();
+    rec.section(SectionKind::Record, 0).unwrap();
+    rec.section(SectionKind::Payload, 5).unwrap();
+    rec.piece(b"after").unwrap();
+    rec.commit().unwrap()
+  };
+  let trailing = append_for(&mut log, Tool::Subversion, 303, 1, &trailing_bytes);
+  let first_head = middle.offset + u64::try_from(HEADER_BYTES).unwrap();
+  assert_zeroed_empty_section_recovers_siblings(
+    log.into_file(),
+    first_head,
+    0,
+    (prefix, trailing),
+    &trailing_bytes,
+    "2-sec empty first Record",
+  );
+
+  // Two-section middle record: 0-byte last section (`remaining_sections == 0`, trailer at `bytes_at`).
+  let (mut log, _) = recovered(file(101));
+  let prefix = append_for(&mut log, Tool::Git, 101, 1, b"prefix");
+  let middle = append_for(&mut log, Tool::Mercurial, 202, 1, &[]);
+  let trailing = append_for(&mut log, Tool::Subversion, 303, 1, &trailing_bytes);
+  let second_head = middle.offset + u64::try_from(HEADER_BYTES + SECTION_HEAD_BYTES + 5).unwrap();
+  assert_zeroed_empty_section_recovers_siblings(
+    log.into_file(),
+    second_head,
+    1,
+    (prefix, trailing),
+    &trailing_bytes,
+    "2-sec empty last Payload",
+  );
+}
+
+/// Do: commit `[prefix, middle, trailing]` where `middle` has a 5-byte `Record` section followed
+/// by a 256-byte all-zero `Payload` section; flip bit 6 of section 0's length (`5 -> 69`) so
+/// framing lands inside section 1's zero payload bytes.
+/// Expect: recovery verifies section 0's CRC before trusting the all-zero head at section 1,
+/// falls back to linear resync, skips `middle` (`skipped() == 1`), and recovers `trailing`.
+#[test]
+fn single_bit_flip_in_section_len_landing_in_zero_payload_still_recovers_trailing_sibling() {
+  let trailing_bytes = payload(78, 96);
+  let (mut log, _) = recovered(file(102));
+  let prefix = append_for(&mut log, Tool::Git, 101, 1, b"prefix");
+  let middle = append_for(&mut log, Tool::Mercurial, 202, 1, &[0u8; 256]);
+  let trailing = append_for(&mut log, Tool::Subversion, 303, 1, &trailing_bytes);
+  let len_byte_offset = middle.offset + u64::try_from(HEADER_BYTES + S_LEN).unwrap();
+  let sim = log.into_file();
+  sim
+    .inject(Fault::BitFlip {
+      offset: len_byte_offset,
+      bit: 6,
+      stored: true,
+    })
+    .unwrap();
+  let (log, found) = recovered(sim);
+  assert_eq!(found, vec![prefix, trailing]);
+  assert_eq!(log.end(), trailing.end());
+  assert_eq!(log.skipped(), 1);
+  assert_eq!(read_payload(&log, &trailing), trailing_bytes);
+}

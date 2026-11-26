@@ -24,15 +24,20 @@
 //! the file's start), record by record, each verified whole against `(offset, seal)`: the header's CRC, every section's
 //! CRC, the trailer's CRC and length, and the keyed BLAKE3 identity recomputed over the record. A record whose header,
 //! section heads, and commit trailer all verify at `cursor` (`Verify::Damaged`) but whose payload CRC or identity fails
-//! has an authenticated boundary `[cursor, next)`: it is never indexed and recovery skips directly to `next`. Whenever
-//! header decoding, section-head framing, or commit-trailer verification fails at `cursor`, recovery never trusts an
-//! unverified `section.len` to stop early or jump past siblings; it scans linearly from `cursor + 1` in
-//! [`VERIFY_PIECE`] chunks (overlapping by [`HEADER_OVERLAP`]) with a linear section-head read budget and optional
-//! `expected_grant` filter. False `SLCS` occurrences inside payloads or torn EOF tails fail `(offset, seal)` header CRC
-//! verification immediately in memory without touching disk or section heads, so mid-file faults (including every
-//! single-bit media fault in a header, section descriptor, payload, or trailer) recover healthy trailing siblings while
-//! uncommitted torn EOF tails stop cleanly at the last genuine committed record. A record whose trailer reached the
-//! device before a crash is whole and is kept, as any write that completed.
+//! has an authenticated boundary `[cursor, next)`: it is never indexed and recovery skips directly to `next`. An
+//! authenticated `(offset, seal)` header whose next section head was never written (`[0u8; SECTION_HEAD_BYTES]`), with
+//! no valid commit trailer (for the last section) or next section head (for earlier sections) immediately following it
+//! and with all prior sections' CRCs intact, is an interrupted uncommitted write at EOF (`Verify::UnwrittenTail`):
+//! recovery stops cleanly in O(1) reads without scanning the uncommitted tail payload and without incrementing
+//! `skipped`. Whenever header decoding, section-head framing, or commit-trailer verification fails at `cursor` (including
+//! a single-bit flip zeroing a 0-byte section head of a mid-file committed record, or flipping a prior section's length
+//! into zero payload bytes), recovery never trusts an unverified `section.len` to stop early or jump past siblings; it
+//! scans linearly from `cursor + 1` in [`VERIFY_PIECE`] chunks (overlapping by [`HEADER_OVERLAP`]) with a linear
+//! section-head read budget and optional `expected_grant` filter. False `SLCS` occurrences inside payloads or torn EOF
+//! tails fail `(offset, seal)` header CRC verification immediately in memory without touching disk or section heads, so
+//! mid-file faults (including every single-bit media fault in a header, section descriptor, payload, or trailer) recover
+//! healthy trailing siblings while uncommitted torn EOF tails stop cleanly at the last genuine committed record. A record
+//! whose trailer reached the device before a crash is whole and is kept, as any write that completed.
 
 use std::fmt;
 
@@ -737,6 +742,9 @@ struct RecoverState {
 enum SectionsFrame {
   /// Every section head decoded cleanly and fit within `len`, ending at this trailer offset.
   Complete(u64),
+  /// An all-zero section head after `prior_sections` closed sections with no committed
+  /// continuation immediately following it (an interrupted uncommitted write at EOF).
+  UnwrittenTail { prior_sections: u16 },
   /// A section head failed to decode or a section ran past `len`.
   Broken,
   /// The resync section-head read budget ran out before all sections were framed.
@@ -748,6 +756,9 @@ enum Frame {
   /// Valid `(offset, seal)` header, valid section heads fitting in the file, and a valid `SLCC`
   /// commit trailer whose `record_len` matches `past - offset`.
   Committed(Framed),
+  /// Valid `(offset, seal)` header followed by an unwritten all-zero section head after
+  /// `prior_sections` framed sections and no committed continuation immediately after it.
+  UnwrittenTail { prior_sections: u16 },
   /// Header, section heads, or commit trailer failed verification or ran past `len`.
   Broken,
   /// The resync section-head read budget ran out while framing this candidate.
@@ -762,11 +773,23 @@ enum Verify {
   /// at `offset`, but whose payload CRC or keyed BLAKE3 identity failed: never indexed, skip
   /// directly to `next`.
   Damaged { next: u64 },
+  /// Valid `(offset, seal)` header whose next section head was never closed and has no committed
+  /// continuation after it: stop cleanly without scanning the uncommitted tail payload.
+  UnwrittenTail,
   /// Header, section head, or commit trailer failed verification (or ran past `len`): never trust
   /// an unverified `section.len` to jump or stop early; resync linearly from `cursor + 1`.
   Broken,
   /// The resync section-head read budget ran out while framing this candidate.
   BudgetExhausted,
+}
+
+/// Whether framing runs at the recovery cursor (unbudgeted, may confirm an unwritten tail) or
+/// inside a linear resync scan (strictly bounded by section-head reads).
+enum FrameContext<'a> {
+  /// Top-level verification at the recovery cursor.
+  Cursor,
+  /// Candidate probing inside linear resync, bounded by remaining section-head reads.
+  Resync(&'a mut u64),
 }
 
 /// Outcome of scanning one [`VERIFY_PIECE`] chunk for the next committed record.
@@ -785,32 +808,103 @@ fn fits_after(at: u64, count: usize, len: u64) -> Result<Option<u64>, LogError> 
   Ok((past <= len).then_some(past))
 }
 
-/// Consumes one section-head read from `budget` when present, returning `false` when exhausted.
-fn spend_read(budget: &mut Option<&mut u64>) -> bool {
-  let Some(remaining) = budget.as_deref_mut() else {
+/// Consumes one section-head read from `context` when scanning, returning `false` when exhausted.
+fn spend_read(context: &mut FrameContext<'_>) -> bool {
+  let FrameContext::Resync(remaining) = context else {
     return true;
   };
-  if *remaining == 0 {
+  if **remaining == 0 {
     return false;
   }
-  *remaining = remaining.saturating_sub(1);
+  **remaining = remaining.saturating_sub(1);
   true
 }
 
-/// Frames one section head at `at` within a file of `len` bytes under `budget`.
+/// Peeks `TRAILER_BYTES` at `bytes_at` after an all-zero final section head: a decodable `SLCC`
+/// trailer indicates a single-bit-zeroed 0-byte section head (`Broken`), otherwise `UnwrittenTail`.
+fn peek_trailer<F: BlockFile>(
+  file: &F,
+  (bytes_at, len): (u64, u64),
+  prior_sections: u16,
+  context: &mut FrameContext<'_>,
+) -> Result<SectionsFrame, LogError> {
+  if fits_after(bytes_at, TRAILER_BYTES, len)?.is_none() {
+    return Ok(SectionsFrame::UnwrittenTail { prior_sections });
+  }
+  if !spend_read(context) {
+    return Ok(SectionsFrame::BudgetExhausted);
+  }
+  let mut trailer = [0u8; TRAILER_BYTES];
+  file.read_exact_at(&mut trailer, bytes_at)?;
+  Ok(if decode_trailer(&trailer).is_some() {
+    SectionsFrame::Broken
+  } else {
+    SectionsFrame::UnwrittenTail { prior_sections }
+  })
+}
+
+/// Peeks `SECTION_HEAD_BYTES` at `bytes_at` after an all-zero non-final section head: a decodable
+/// next section head indicates a single-bit-zeroed 0-byte section head (`Broken`), otherwise
+/// `UnwrittenTail`.
+fn peek_next_section_head<F: BlockFile>(
+  file: &F,
+  (bytes_at, len): (u64, u64),
+  prior_sections: u16,
+  context: &mut FrameContext<'_>,
+) -> Result<SectionsFrame, LogError> {
+  if fits_after(bytes_at, SECTION_HEAD_BYTES, len)?.is_none() {
+    return Ok(SectionsFrame::UnwrittenTail { prior_sections });
+  }
+  if !spend_read(context) {
+    return Ok(SectionsFrame::BudgetExhausted);
+  }
+  let mut next_head = [0u8; SECTION_HEAD_BYTES];
+  file.read_exact_at(&mut next_head, bytes_at)?;
+  Ok(if decode_section_head(&next_head).is_some() {
+    SectionsFrame::Broken
+  } else {
+    SectionsFrame::UnwrittenTail { prior_sections }
+  })
+}
+
+/// Distinguishes an ordinary unwritten section head (`UnwrittenTail`) from a single-bit-zeroed
+/// 0-byte section head of a mid-file committed record (`Broken`) with one constant-size peek.
+fn classify_zero_section_head<F: BlockFile>(
+  file: &F,
+  (bytes_at, len): (u64, u64),
+  (prior_sections, remaining_sections): (u16, u16),
+  context: &mut FrameContext<'_>,
+) -> Result<SectionsFrame, LogError> {
+  if remaining_sections == 0 {
+    peek_trailer(file, (bytes_at, len), prior_sections, context)
+  } else {
+    peek_next_section_head(file, (bytes_at, len), prior_sections, context)
+  }
+}
+
+/// Frames one section head at `at` within a file of `len` bytes under `context`.
 fn step_section<F: BlockFile>(
   file: &F,
   (at, len): (u64, u64),
-  budget: &mut Option<&mut u64>,
+  (prior_sections, remaining_sections): (u16, u16),
+  context: &mut FrameContext<'_>,
 ) -> Result<SectionsFrame, LogError> {
   let Some(bytes_at) = fits_after(at, SECTION_HEAD_BYTES, len)? else {
     return Ok(SectionsFrame::Broken);
   };
-  if !spend_read(budget) {
+  if !spend_read(context) {
     return Ok(SectionsFrame::BudgetExhausted);
   }
   let mut section = [0u8; SECTION_HEAD_BYTES];
   file.read_exact_at(&mut section, at)?;
+  if section == [0u8; SECTION_HEAD_BYTES] {
+    return classify_zero_section_head(
+      file,
+      (bytes_at, len),
+      (prior_sections, remaining_sections),
+      context,
+    );
+  }
   let Some((_, section_len, _)) = decode_section_head(&section) else {
     return Ok(SectionsFrame::Broken);
   };
@@ -824,15 +918,21 @@ fn step_section<F: BlockFile>(
 }
 
 /// Walks `sections` section heads from `at` without reading payload bytes, charging each head read
-/// to `budget` when scanning.
+/// to `context` when scanning.
 fn frame_sections_budgeted<F: BlockFile>(
   file: &F,
   (mut at, len): (u64, u64),
   sections: u16,
-  mut budget: Option<&mut u64>,
+  context: &mut FrameContext<'_>,
 ) -> Result<SectionsFrame, LogError> {
-  for _ in 0..sections {
-    match step_section(file, (at, len), &mut budget)? {
+  for prior_sections in 0..sections {
+    let remaining_sections = sections.saturating_sub(prior_sections.saturating_add(1));
+    match step_section(
+      file,
+      (at, len),
+      (prior_sections, remaining_sections),
+      context,
+    )? {
       SectionsFrame::Complete(next) => at = next,
       other => return Ok(other),
     }
@@ -869,13 +969,16 @@ fn frame_decoded_header<F: BlockFile>(
   (offset, len): (u64, u64),
   header: Header,
   head_bytes: [u8; HEADER_BYTES],
-  budget: Option<&mut u64>,
+  context: &mut FrameContext<'_>,
 ) -> Result<Frame, LogError> {
   let Some(start) = fits_after(offset, HEADER_BYTES, len)? else {
     return Ok(Frame::Broken);
   };
-  let at = match frame_sections_budgeted(file, (start, len), header.sections, budget)? {
+  let at = match frame_sections_budgeted(file, (start, len), header.sections, context)? {
     SectionsFrame::Complete(at) => at,
+    SectionsFrame::UnwrittenTail { prior_sections } => {
+      return Ok(Frame::UnwrittenTail { prior_sections });
+    }
     SectionsFrame::Broken => return Ok(Frame::Broken),
     SectionsFrame::BudgetExhausted => return Ok(Frame::BudgetExhausted),
   };
@@ -883,6 +986,29 @@ fn frame_decoded_header<F: BlockFile>(
     return Ok(Frame::Broken);
   };
   frame_trailer(file, (offset, at, past), header, head_bytes)
+}
+
+/// Confirms an `UnwrittenTail` found after `prior_sections` sections: when `prior_sections > 0`,
+/// verifies each prior section's CRC so a single-bit flip in an earlier section's length that
+/// jumped into zero payload bytes falls back to linear resync (`Verify::Broken`).
+fn verify_unwritten_tail<F: BlockFile>(
+  file: &F,
+  (offset, len): (u64, u64),
+  (seal, head_bytes): (&[u8; SEAL_BYTES], &[u8; HEADER_BYTES]),
+  prior_sections: u16,
+  buffer: &mut Vec<u8>,
+) -> Result<Verify, LogError> {
+  if prior_sections == 0 {
+    return Ok(Verify::UnwrittenTail);
+  }
+  let mut identity = new_record_hasher(seal, offset, head_bytes);
+  let start = offset_after(offset, HEADER_BYTES)?;
+  let valid = sections_verified(file, (start, len), prior_sections, &mut identity, buffer)?;
+  Ok(if valid.is_some() {
+    Verify::UnwrittenTail
+  } else {
+    Verify::Broken
+  })
 }
 
 /// Verifies every section's CRC and the whole-record keyed BLAKE3 identity for a framed record.
@@ -925,12 +1051,22 @@ fn verify_decoded_header<F: BlockFile>(
   (offset, len): (u64, u64),
   (header, head_bytes): (Header, [u8; HEADER_BYTES]),
   seal: &[u8; SEAL_BYTES],
-  budget: Option<&mut u64>,
+  mut context: FrameContext<'_>,
   buffer: &mut Vec<u8>,
 ) -> Result<Verify, LogError> {
-  match frame_decoded_header(file, (offset, len), header, head_bytes, budget)? {
+  match frame_decoded_header(file, (offset, len), header, head_bytes, &mut context)? {
     Frame::Broken => Ok(Verify::Broken),
     Frame::BudgetExhausted => Ok(Verify::BudgetExhausted),
+    Frame::UnwrittenTail { prior_sections } => match context {
+      FrameContext::Cursor => verify_unwritten_tail(
+        file,
+        (offset, len),
+        (seal, &head_bytes),
+        prior_sections,
+        buffer,
+      ),
+      FrameContext::Resync(_) => Ok(Verify::UnwrittenTail),
+    },
     Frame::Committed(framed) => verify_committed(file, (offset, len), seal, &framed, buffer),
   }
 }
@@ -955,7 +1091,7 @@ fn verify_at<F: BlockFile>(
     (offset, len),
     (header, head_bytes),
     seal,
-    None,
+    FrameContext::Cursor,
     buffer,
   )
 }
@@ -993,14 +1129,14 @@ fn probe_candidate<F: BlockFile>(
     (candidate, len),
     (header, head_bytes),
     seal,
-    Some(section_budget),
+    FrameContext::Resync(section_budget),
     verify_buf,
   )? {
     Verify::Valid(located) => Ok(Some(ChunkProbe::Found(located))),
     Verify::BudgetExhausted => Ok(Some(ChunkProbe::BudgetExhausted)),
-    // Never jump past a `Damaged` candidate during resync; advance one byte to preserve linearity
-    // and prevent crafted jumps from skipping healthy trailing siblings.
-    Verify::Damaged { .. } | Verify::Broken => Ok(None),
+    // Never jump past a `Damaged` or `UnwrittenTail` candidate during resync; advance one byte to
+    // preserve linearity and prevent crafted headers from skipping healthy trailing siblings.
+    Verify::Damaged { .. } | Verify::UnwrittenTail | Verify::Broken => Ok(None),
   }
 }
 
@@ -1152,7 +1288,7 @@ fn step_recover<F: BlockFile>(
       progress.cursor = next;
       Ok(true)
     }
-    Verify::BudgetExhausted => Ok(false),
+    Verify::UnwrittenTail | Verify::BudgetExhausted => Ok(false),
     Verify::Broken => apply_resync_scan(
       file,
       (cursor.saturating_add(1), len),
