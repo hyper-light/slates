@@ -640,7 +640,8 @@ pub(crate) fn on_a_stored_shard<T: Send + 'static>(
   history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
 ) -> T {
   let (store, daemon) = audit_daemon_stored();
-  keep_landed(&daemon);
+  // Its landed packs let go as production lets them go (main's ruling A3 of 2026-11-26, carried to this runner the
+  // same day): a test whose point is residency keeps them by name ([`keep_landed`]).
   let answer = crate::daemon::observe_first(&daemon, move |state| history(state));
   daemon.stop();
   drop(store);

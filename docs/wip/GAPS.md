@@ -1262,6 +1262,16 @@
 >   (`audit_on_stored_shard` and its configured, made and made-all forms, `run_on_stored_shard`) no longer set
 >   `vcs_store::KEEP_LANDED`, so a stored test's landed packs let go as production lets them go; a test whose point is
 >   residency keeps them by name (`test_store::keep_landed`, `keep_landed_pinned`). It brought 7 reds, all w-hg's.
+>   `test_store::on_a_stored_shard` (w-git's, for histories that wait on nothing) set it still, and no longer does
+>   (w-hg, 2026-11-26, main's order): its 12 callers' modules (`identities` 6, `repository::push` 1,
+>   `vcs_share::grants` 3, `vcs_store::paths` 1, `vcs_store::tests` 1) pass with production's let-go, 0 reds.
+>   - The test-only holds left in production code, each pausing a driver for a test: `hg_push::hold_next_landing`
+>     (the four race histories), `whole_build::DRIVEN_BY_TEST` (the storm's build slices), and
+>     `refining::HELD_FOR_TEST` (`refining::start` holds a job for `refined_now`, only `refining/tests.rs`'
+>     driver-equality test sets it). The last changes what refining answers, not only when: `refined_now` gives a job
+>     up where its turn meets a let-go window (`job.brought(state, None)`), where the job's task brings the windows
+>     back and copies the slice again; its doc's premise, that a test's shard keeps its landed packs, ended with A3.
+>     Owed: removed (main's ruling of 2026-11-26), w-hg's next piece.
 >   - Fixed, 3 in `vcs_store/hg_view/tests.rs`: the every-format oracle takes each changeset's and manifest's text from
 >     the same history imported in one call into a store of its own that lets nothing go, never from the store under
 >     test; the let-go tag test holds every object not held whole after its let-go, which its landing had already
