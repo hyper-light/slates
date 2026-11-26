@@ -1192,6 +1192,19 @@
 >     2026-11-25): `vcs_http::daemon_edge`, `vcs_store::upload` and `vcs_share` reach it no more, `vcs_share`'s three
 >     Mercurial creations made from the test's thread (`hg_on`, `test_store::create_on`), one inside
 >     `audit_on_stored_shard_made_all`; and `hg_made`'s 10 made from the test's thread (w-hg, `create_on`).
+> - **Production's let-go in the stored tests (main's ruling A3 of 2026-11-26).** The stored test runners
+>   (`audit_on_stored_shard` and its configured, made and made-all forms, `run_on_stored_shard`) no longer set
+>   `vcs_store::KEEP_LANDED`, so a stored test's landed packs let go as production lets them go; a test whose point is
+>   residency keeps them by name (`test_store::keep_landed`, `keep_landed_pinned`). It brought 7 reds, all w-hg's.
+>   - Fixed, 3 in `vcs_store/hg_view/tests.rs`: the every-format oracle takes each changeset's and manifest's text from
+>     the same history imported in one call into a store of its own that lets nothing go, never from the store under
+>     test; the let-go tag test holds every object not held whole after its let-go, which its landing had already
+>     done; the name-lookup test holds each branch's door read, `mark`'s now its let-go manifest's.
+>   - Pinned, 4 in `repository/hg_push/tests.rs`, each failing "push refused: its re-base asked for bytes of its
+>     changegroup" without the pin, since a synchronous audit history cannot bring a let-go base back. They are the
+>     15-race piece's reds, unpinned when those histories move to tasks.
+>   **The landed-pack pins: 4 tests** (`test_store::LANDED_KEPT_PINNED`, a test holds its length to this figure; w-hg,
+>   until hg_push's 15 race histories move to tasks).
 >   - (`git_push::tests::carry_blocking`, 8 direct sites, and `git_push::tests::git_repository`, 41 sites: both emptied
 >     and removed by w-git, 2026-11-25. Every test that pushed through the synchronous driver (`answered`, `pushed`,
 >     `pushed_from_the_fixtures`, removed with it) pushes by awaiting: `git_push::tests::on_stored_shard_awaited` and its

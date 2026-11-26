@@ -1853,6 +1853,11 @@ fn a_second_work_naming_a_pushed_text_let_go_before_its_entry_reads_it_back() {
 #[test]
 fn a_stock_push_lands_on_the_rebuilt_repository_as_7_2_answered_it() {
   crate::test_store::audit_on_stored_shard("hg", |state| {
+    // Pinned by name until hg_push's 15 race histories move to tasks (test_store::LANDED_KEPT_PINNED): its stale fork's
+    // re-base wants a base its landing let go, which a synchronous audit history cannot bring back.
+    crate::test_store::keep_landed_pinned(
+      "repository::hg_push::tests::a_stock_push_lands_on_the_rebuilt_repository_as_7_2_answered_it",
+    );
     let mut hg = Hg::new(state, "plain");
     let made = rebuild(state, &mut hg, (&[1], 1));
     assert_rebuilt(state, &hg, &made);
@@ -2134,6 +2139,11 @@ fn a_hooks_words_follow_the_changegroup_reply_naming_its_part() {
 #[test]
 fn a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race() {
   crate::test_store::audit_on_stored_shard("hg", |state| {
+    // Pinned by name until hg_push's 15 race histories move to tasks (test_store::LANDED_KEPT_PINNED): its stale fork's
+    // re-base wants a base its landing let go, which a synchronous audit history cannot bring back.
+    crate::test_store::keep_landed_pinned(
+      "repository::hg_push::tests::a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race",
+    );
     let mut hg = Hg::new(state, "race");
     let made = rebuild(state, &mut hg, (&[1], 1));
     let view = View::of(
@@ -2184,6 +2194,11 @@ fn a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race() {
 #[test]
 fn two_pushes_taken_side_by_side_both_land() {
   crate::test_store::audit_on_stored_shard("hg", |state| {
+    // Pinned by name until hg_push's 15 race histories move to tasks (test_store::LANDED_KEPT_PINNED): its stale fork's
+    // re-base wants a base its landing let go, which a synchronous audit history cannot bring back.
+    crate::test_store::keep_landed_pinned(
+      "repository::hg_push::tests::two_pushes_taken_side_by_side_both_land",
+    );
     let mut hg = Hg::new(state, "side-by-side");
     let made = rebuild(state, &mut hg, (&[1], 1));
     let first = Unbundle {
@@ -2249,6 +2264,11 @@ fn view_with(made: &[Made], drafts: &[usize]) -> View {
 #[test]
 fn a_push_is_refused_when_a_green_it_only_checked_moved() {
   crate::test_store::audit_on_stored_shard("hg", |state| {
+    // Pinned by name until hg_push's 15 race histories move to tasks (test_store::LANDED_KEPT_PINNED): its stale fork's
+    // re-base wants a base its landing let go, which a synchronous audit history cannot bring back.
+    crate::test_store::keep_landed_pinned(
+      "repository::hg_push::tests::a_push_is_refused_when_a_green_it_only_checked_moved",
+    );
     let mut hg = Hg::new(state, "heads");
     let made = rebuild(state, &mut hg, (&[1], 1));
     let first = Unbundle {
