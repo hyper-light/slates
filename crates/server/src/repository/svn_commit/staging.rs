@@ -576,25 +576,24 @@ fn build_some_in(
     }
     batch
       .with_engine_in(greens, |engine| {
-        let building = match core::mem::replace(at, BuildAt::Taken) {
-          BuildAt::Begin(plans) => Building::begin(records, engine, (checked, plans))?,
-          BuildAt::Going(building) => *building,
-          BuildAt::Taken => return Err(Uncommitted::NotHeld),
+        // Begun once, its state kept in place from then on: no step moves or boxes it.
+        if matches!(at, BuildAt::Begin(_)) {
+          let BuildAt::Begin(plans) = core::mem::replace(at, BuildAt::Taken) else {
+            return Err(Uncommitted::NotHeld);
+          };
+          let begun = Building::begin(records, engine, (checked, plans))?;
+          *at = BuildAt::Going(Box::new(begun));
+        }
+        let BuildAt::Going(building) = at else {
+          return Err(Uncommitted::NotHeld);
         };
         let mut spent = || slates_rt::futures::now_ns() >= deadline;
-        let built = Building::step(
+        Building::step(
           (records, engine, checked),
           building,
           &mut spent,
           (head, work_identity),
-        )?;
-        Ok(match built {
-          super::BuildStep::More(building) => {
-            *at = BuildAt::Going(building);
-            None
-          }
-          super::BuildStep::Built(built) => Some(built),
-        })
+        )
       })
       .ok_or(Uncommitted::NotHeld)?
   })

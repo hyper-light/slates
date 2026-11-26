@@ -400,44 +400,61 @@ impl BaseRead for Reading<'_> {
 }
 
 impl Reading<'_> {
-  /// `n` bytes of the text from `at` onto `out`, piece by piece from the one holding `at` (the cursor's where it is at or
-  /// before `at`, else found by the pieces' starts): none past the text, or where the store does not hold a window.
+  /// `n` bytes of the text from `at` onto `out`, piece by piece from the one holding `at` ([`Reading::first_piece`]):
+  /// none past the text, or where the store does not hold a window.
   fn read_pieces(&mut self, at: u64, n: usize, out: &mut Vec<u8>) -> Option<()> {
-    let pieces = &self.chain.room.pieces;
     let end = at.checked_add(to_u64(n))?;
     if end > self.chain.len() {
       return None;
     }
-    let mut number = match pieces.get(self.cursor.piece) {
-      Some(piece) if piece.at <= at => self.cursor.piece,
-      _ => pieces.partition_point(|piece| piece.end() <= at),
-    };
+    let mut number = self.first_piece(at);
     let mut at = at;
     while at < end {
-      let piece = pieces.get(number)?;
+      let piece = self.chain.room.pieces.get(number)?;
       if piece.end() <= at {
         number = number.checked_add(1)?;
         continue;
       }
-      let skip = at.checked_sub(piece.at)?;
-      let len = end.min(piece.end()).checked_sub(at)?;
-      match piece.from {
-        From::Root(offset) => read_root(
-          self.store,
-          self.chain.root,
-          (offset.checked_add(skip)?, usize::try_from(len).ok()?),
-          out,
-        )?,
-        From::Bytes(offset) => {
-          let from = offset.checked_add(usize::try_from(skip).ok()?)?;
-          let until = from.checked_add(usize::try_from(len).ok()?)?;
-          out.extend_from_slice(self.chain.room.bytes.get(from..until)?);
-        }
-      }
-      at = at.checked_add(len)?;
+      at = at.checked_add(self.read_from_piece(piece, (at, end), out)?)?;
       self.cursor.piece = number;
     }
     Some(())
+  }
+
+  /// The piece a read from `at` begins its search at: the cursor's where it starts at or before `at`, else the first
+  /// whose end passes `at`, found by the pieces' starts.
+  fn first_piece(&self, at: u64) -> usize {
+    let pieces = &self.chain.room.pieces;
+    match pieces.get(self.cursor.piece) {
+      Some(piece) if piece.at <= at => self.cursor.piece,
+      _ => pieces.partition_point(|piece| piece.end() <= at),
+    }
+  }
+
+  /// The bytes of `piece` from `at` up to its end or `end`, whichever comes first, onto `out`, from the root's windows or
+  /// the chain's own bytes as the piece is from: how many, none where the store does not hold a window.
+  fn read_from_piece(
+    &self,
+    piece: &Piece,
+    (at, end): (u64, u64),
+    out: &mut Vec<u8>,
+  ) -> Option<u64> {
+    let skip = at.checked_sub(piece.at)?;
+    let len = end.min(piece.end()).checked_sub(at)?;
+    match piece.from {
+      From::Root(offset) => read_root(
+        self.store,
+        self.chain.root,
+        (offset.checked_add(skip)?, usize::try_from(len).ok()?),
+        out,
+      )?,
+      From::Bytes(offset) => {
+        let from = offset.checked_add(usize::try_from(skip).ok()?)?;
+        let until = from.checked_add(usize::try_from(len).ok()?)?;
+        out.extend_from_slice(self.chain.room.bytes.get(from..until)?);
+      }
+    }
+    Some(len)
   }
 }
 

@@ -77,6 +77,9 @@ enum Hold {
   /// As [`Hold::Wedged`], with a thread of the role holding standard error's lock for good from just before the wedge
   /// ([`hold_the_log_for_good`]): a writer starved while it held the lock, or one blocked in a write to a full pipe.
   WedgedLogHeld,
+  /// As [`Hold::Wedged`], with every new thread of the role's process refused from just after the wedge
+  /// ([`refuse_new_threads`], Linux): a machine on which no thread of the end's own could start or be scheduled in time.
+  WedgedNoThreads,
 }
 
 impl Hold {
@@ -87,6 +90,7 @@ impl Hold {
       Hold::Starved => "starved",
       Hold::LogStalled => "log-stalled",
       Hold::WedgedLogHeld => "wedged-log-held",
+      Hold::WedgedNoThreads => "wedged-no-threads",
     }
   }
 
@@ -97,6 +101,7 @@ impl Hold {
       "starved" => Hold::Starved,
       "log-stalled" => Hold::LogStalled,
       "wedged-log-held" => Hold::WedgedLogHeld,
+      "wedged-no-threads" => Hold::WedgedNoThreads,
       other => panic!("no hold named {other:?}"),
     }
   }
@@ -171,7 +176,7 @@ fn hold_for_good(daemon: &Daemon, index: usize, hold: Hold) {
         std::sync::atomic::Ordering::Release,
       );
       match hold {
-        Hold::Wedged | Hold::WedgedLogHeld => {
+        Hold::Wedged | Hold::WedgedLogHeld | Hold::WedgedNoThreads => {
           let _ = std::io::Read::read_exact(&mut never, &mut byte);
         }
         Hold::Spinning => loop {
@@ -187,7 +192,11 @@ fn hold_for_good(daemon: &Daemon, index: usize, hold: Hold) {
   loop {
     let at = HELD_AT_NS.load(std::sync::atomic::Ordering::Acquire);
     if at != 0 {
-      println!("{HELD_TAG} shard={index} {} {AT_WORD}{at}", hold.word());
+      let refused = hold == Hold::WedgedNoThreads && refuse_new_threads();
+      println!(
+        "{HELD_TAG} shard={index} {} {AT_WORD}{at} {THREADS_REFUSED_WORD}{refused}",
+        hold.word()
+      );
       return;
     }
     pause(STEP_PAUSE);
@@ -280,6 +289,31 @@ fn stall_the_log(daemon: &Daemon) {
   }
   holder.join().unwrap();
   println!("{STALL_OVER_TAG}");
+}
+
+/// Format: the held line's word before whether the role's new threads are refused ([`Hold::WedgedNoThreads`]).
+const THREADS_REFUSED_WORD: &str = "threads_refused=";
+
+/// Refuses every new thread of this process from now on: the soft `RLIMIT_NPROC` lowered to the threads it runs now,
+/// which Linux counts with every other thread of the user's. Whether a thread started next was refused: a privileged
+/// process (root, or `CAP_SYS_RESOURCE`) is held to no such limit.
+#[cfg(target_os = "linux")]
+fn refuse_new_threads() -> bool {
+  use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+  let own = std::fs::read_dir("/proc/self/task").unwrap().count();
+  let limit = getrlimit(Resource::Nproc);
+  let lowered = Rlimit {
+    current: Some(u64::try_from(own).unwrap()),
+    maximum: limit.maximum,
+  };
+  setrlimit(Resource::Nproc, lowered).unwrap();
+  std::thread::Builder::new().spawn(|| {}).is_err()
+}
+
+/// [`refuse_new_threads`] where no per-process limit on threads exists: none refused.
+#[cfg(not(target_os = "linux"))]
+fn refuse_new_threads() -> bool {
+  false
 }
 
 /// Holds this process's standard error lock from a thread of its own until the process ends, once it is taken: every
@@ -651,7 +685,15 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
   let stdin = daemon.stdin.as_mut().unwrap();
   writeln!(stdin, "{}", client.client_id()).unwrap();
   stdin.flush().unwrap();
-  let t0_ns = held_at_ns(&await_tag(&daemon.stdout, HELD_TAG));
+  let held = await_tag(&daemon.stdout, HELD_TAG);
+  if hold == Hold::WedgedNoThreads && !held.contains(&format!("{THREADS_REFUSED_WORD}true")) {
+    println!(
+      "SKIPPED {name}: this process's new threads could not be refused (a privileged process, or a platform with no \
+       per-process thread limit): {held}"
+    );
+    return;
+  }
+  let t0_ns = held_at_ns(&held);
   let held_at = Instant::now();
   let mut driver = Driver::new(&client);
   let ticket = driver
@@ -713,7 +755,7 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
     "{name}: the watchdog's exit code"
   );
   match hold {
-    Hold::Wedged | Hold::WedgedLogHeld => assert!(
+    Hold::Wedged | Hold::WedgedLogHeld | Hold::WedgedNoThreads => assert!(
       line_after <= rule,
       "{name}: the watchdog's verdict was read {line_after:?} after the wedge, past the rule's W + B + L = {rule:?}"
     ),
@@ -772,6 +814,18 @@ fn a_lone_daemons_spinning_shard_ends_its_process_and_the_call_ends_daemon_gone(
 #[test]
 fn a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_log_is_held() {
   a_lone_daemons_stuck_shard_ends_it("wedged-log-held", Hold::WedgedLogHeld);
+}
+
+/// A-232, A-305 (main's ruling of 2026-11-25: at load 124 an exit 4 still came with no end line, its writer thread not
+/// scheduled within the end's beat). Do: as the wedged case, with every new thread of the daemon's process refused from
+/// just after the wedge (`RLIMIT_NPROC` lowered to its own threads; Linux, where the limit counts threads; skipped
+/// loudly where the process is privileged). Expect: the process exits with the failed exit code, and the watchdog's
+/// end line is read, naming the wedged shard, within `W + B + L` of the wedge. Red before: the end's writer thread
+/// could not be spawned, so the end skipped the line.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_lone_daemons_wedged_shard_ends_it_with_its_verdict_when_no_thread_can_start() {
+  a_lone_daemons_stuck_shard_ends_it("wedged-no-threads", Hold::WedgedNoThreads);
 }
 
 /// Format: the environment variable that runs the starved case, and the words the watchdog's starved line carries.
