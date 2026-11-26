@@ -741,3 +741,55 @@ fn a_made_changeset_whose_store_refused_its_intake_is_refused_in_the_stores_word
     "the take refused in the store's own words: {taken:?}"
   );
 }
+
+/// The reply recorded for client 7's request `serial` on `daemon`'s first shard, waited for within [`TASK_WAIT`].
+fn recorded_reply(daemon: &crate::Daemon, serial: u32) -> ReplyBody {
+  let began = std::time::Instant::now();
+  loop {
+    let seen = crate::daemon::observe_first(daemon, move |state| {
+      state.db.partition().completion(7, 7, serial)
+    });
+    if let slates_wire::request::Seen::Completed(bytes) = seen {
+      return <ReplyBody as slates_wire::Wire>::from_bytes(&bytes).expect("a reply");
+    }
+    assert!(
+      began.elapsed() < TASK_WAIT,
+      "request {serial} unanswered after {TASK_WAIT:?}"
+    );
+  }
+}
+
+/// A-731 (main's ruling 5 of 2026-11-26, the made-changeset bug's sibling: a gone owner is refused, never retried
+/// without end). Do: on a running daemon holding a changeset store, its landed packs kept resident so the made commit
+/// reads nothing of the store before its landing, submit `a.txt` to a Mercurial repository's line and wait for its
+/// changeset; stop the store's owner; then submit a work changing `a.txt`. Expect the submit answered and recorded, its
+/// refusal the store's own (`Landing(Gone)`), within the wait. Red before: a landing the store refused answered the
+/// submit `Overloaded`, unrecorded (`made_commit::abandon`), so its retry met the gone owner again without end, and the
+/// submit was never recorded.
+#[test]
+fn a_made_changesets_landing_on_a_gone_owner_is_refused_in_the_stores_words_and_recorded() {
+  let (mut store, daemon) = crate::test_store::audit_daemon_stored();
+  crate::test_store::keep_landed(&daemon);
+  let (_, green) = mercurial_on(&daemon, "gone-owner");
+  let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+  crate::daemon::observe_first(&daemon, move |state| {
+    submitted_recorded(state, ipc_green, 1, vec![create("a.txt", b"alpha\n")]);
+  });
+  made_reaches(&daemon, 1);
+  store.stop_owner();
+  crate::daemon::observe_first(&daemon, move |state| {
+    submitted_recorded(state, ipc_green, 2, vec![create("a.txt", b"beta\n")]);
+  });
+  let reply = recorded_reply(&daemon, 2);
+  daemon.stop();
+  let ReplyBody::Refused {
+    refusal: slates_ipc::protocol::Refusal::StoreRefused { reason },
+  } = &reply
+  else {
+    panic!("the submit refused by the store: {reply:?}");
+  };
+  assert!(
+    reason.contains("Landing(Gone)"),
+    "the refusal names the store's own: {reason}"
+  );
+}
