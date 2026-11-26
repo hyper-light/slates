@@ -7673,7 +7673,9 @@ fn spread_create(dirs: usize, depth: usize, deltas: Deltas) -> (Vec<u8>, ObjectI
 /// tree or its base kept, or inflates the base), its headroom over the floor those reads past each base's first. Red
 /// before the count: 0. Kept oldest-laid first it read 44 (9 first reads and 35 bases given back while their
 /// revisions were still read); with a base found kept again laid again with the newest (`packed::Recent::refresh`), 23
-/// (94 hits), the rest the budget's turnover, its capacity and not its order.
+/// (94 hits), the rest the budget's turnover, its capacity and not its order. With the budget asked past the two chunks
+/// its turnover holds idle (`packed::Recent::budget_keeping`), each base inflated less than twice on average over the
+/// walk (reuse = inflated ÷ distinct under 2): 11 (106 hits). Red before: 23, reuse 2.6.
 #[test]
 fn a_fetchs_tree_reads_count_the_bases_they_inflate_whole() {
   let (identity, certificate) = identity();
@@ -7706,6 +7708,10 @@ fn a_fetchs_tree_reads_count_the_bases_they_inflate_whole() {
   assert!(
     inflated >= distinct,
     "each base inflated at least once: {inflated} of {distinct}"
+  );
+  assert!(
+    inflated < distinct.saturating_mul(2),
+    "each base inflated less than twice on average: {inflated} for {distinct}"
   );
   assert_eq!(
     inflated,
