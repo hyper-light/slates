@@ -409,8 +409,13 @@ enum Homing {
   Waiting((slates_vcs::ContentId, u64)),
   /// The names homed, their rows given back for the landing: the pack is asked next.
   PackDue(Vec<u8>),
-  /// Asked: the pack's bytes, for the edge to take, its identity and length (held for the record), and the names' rows.
-  PackAsked(Vec<u8>, (slates_vcs::ContentId, u64), Vec<u8>),
+  /// Asked: the pack, held whole in the content store it was put in as it arrived (b2a: its bytes read only where a
+  /// home needs them), for the edge to take, its identity and length (held for the record), and the names' rows.
+  PackAsked(
+    crate::vcs_store::homes::HomeSource,
+    (slates_vcs::ContentId, u64),
+    Vec<u8>,
+  ),
   /// The pack taken by the edge, its outcome awaited, with the names' rows.
   PackWaiting((slates_vcs::ContentId, u64), Vec<u8>),
   /// Both homed: the changeset to ask of the edge at the decision's next turn.
@@ -447,8 +452,12 @@ impl Landing {
 /// What a push asks its edge to carry off the shard's step ([`ReceivePack::take_homing`]).
 #[derive(Debug)]
 pub(crate) enum Carry {
-  /// Content to home in the region (its names, then its pack), held there for the push's attempt (A-727 (d1a)).
-  Home(Vec<u8>, slates_cluster::homes::HomeOwner),
+  /// Content to home in the region (its names' bytes, then its pack held whole where it was put), held there for the
+  /// push's attempt (A-727 (d1a)).
+  Home(
+    crate::vcs_store::homes::HomeSource,
+    slates_cluster::homes::HomeOwner,
+  ),
   /// Its changeset to land on the node's store.
   Land(Box<Landing>),
 }
@@ -467,11 +476,11 @@ pub(crate) enum Carried {
 /// way every edge (HTTP, SSH, the tests' driver) runs a push's homing.
 pub(crate) async fn carry(origin: u16, shards: &[u16], carry: Carry) -> Carried {
   match carry {
-    Carry::Home(bytes, owner) => Carried::Homed(
+    Carry::Home(source, owner) => Carried::Homed(
       crate::vcs_store::homes::home_in_region(
         origin,
         shards,
-        (bytes, owner),
+        (source, owner),
         crate::fleet::homing_budget(),
       )
       .await,
@@ -1038,9 +1047,9 @@ impl<P> ReceivePack<P> {
       }
       // The pack the staging put in the store, held once more for the record (A-722's record v4), and asked of the edge;
       // a push whose pack is not held is refused (C5 part 2b).
-      Homing::PackDue(names) => match decision.sealed.pack_to_home(state) {
-        Some((bytes, packed)) if crate::vcs_store::hold_for_record(state, &packed.0) => {
-          decision.homing = Homing::PackAsked(bytes, packed, names);
+      Homing::PackDue(names) => match decision.sealed.pack_to_home() {
+        Some((source, packed)) if crate::vcs_store::hold_for_record(state, &packed.0) => {
+          decision.homing = Homing::PackAsked(source, packed, names);
           Ok(false)
         }
         _ => {
@@ -1080,12 +1089,15 @@ impl<P> ReceivePack<P> {
       Homing::Asked(bytes, named) => {
         let owner = decision.sealed.owner_now()?;
         decision.homing = Homing::Waiting(named);
-        Some(Carry::Home(bytes, owner))
+        Some(Carry::Home(
+          crate::vcs_store::homes::HomeSource::Bytes(bytes),
+          owner,
+        ))
       }
-      Homing::PackAsked(bytes, packed, names) => {
+      Homing::PackAsked(source, packed, names) => {
         let owner = decision.sealed.owner_now()?;
         decision.homing = Homing::PackWaiting(packed, names);
-        Some(Carry::Home(bytes, owner))
+        Some(Carry::Home(source, owner))
       }
       Homing::LandAsked(landing) => {
         decision.homing = Homing::LandWaiting(landing.header.sequence);
@@ -1130,7 +1142,8 @@ impl<P> ReceivePack<P> {
           return;
         }
         decision.sealed.pack_homed_as((identity, len));
-        decision.homing = match landing_of(state, repository, (names, homed.bytes)) {
+        let pack = landed_pack(state, homed.bytes, (identity, len));
+        decision.homing = match pack.and_then(|pack| landing_of(state, repository, (names, pack))) {
           Some(landing) => Homing::LandDue(Box::new(landing)),
           None => Homing::Unlanded(Unlanded::NoLanding),
         };
@@ -1179,6 +1192,29 @@ pub(crate) const PUSH_LANDED: &str = "git_push.landed";
 /// Counter: git pushes whose changeset the node's store refused: each refused whole, nothing of it in the register.
 /// Format: a counter name.
 pub(crate) const PUSH_UNLANDED: &str = "git_push.unlanded";
+
+/// The pack a changeset's `Payload` lands: the bytes its homing gave back, else (a pack homed by its identity, b2a)
+/// read whole from the content store it was put in, `packed` its identity and length, counted [`LAND_BUFFER_MOST`]: the
+/// landing's one whole-pack buffer, which b2b streams. None where the store no longer holds it whole.
+pub(crate) fn landed_pack(
+  state: &mut ShardState,
+  homed: Vec<u8>,
+  packed: (slates_vcs::ContentId, u64),
+) -> Option<Vec<u8>> {
+  if !homed.is_empty() {
+    return Some(homed);
+  }
+  let bytes = crate::vcs_store::homes::held_bytes(state, packed)?;
+  state.count_max(
+    LAND_BUFFER_MOST,
+    u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+  );
+  Some(bytes)
+}
+
+/// Counted most: the most bytes of a pack one landing held in a buffer of its own: its changeset's `Payload` (b2b
+/// streams it from the content store's windows). Format: a counter name.
+pub(crate) const LAND_BUFFER_MOST: &str = "git_push.land_buffer_most";
 
 /// Repository `repository`'s push's changeset as the edge lands it (A-767 C5): `Names` the names' rows and `Payload` the
 /// pack, both the bytes their homing gave back, moved in; its sequence the repository's next, taken now so two pushes

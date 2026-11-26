@@ -2001,20 +2001,12 @@ impl SealedPush {
     self.attempt.homed(named.0);
   }
 
-  /// The push's pack to home in the region for a version 4 record (A-722's record v4): its bytes, read from the content
-  /// store it was put in as it arrived, and the identity and length its staging finished it under; none for a push that
-  /// put no pack, or whose pack the store does not hold whole. The bytes are copied for the homing, which runs off the
-  /// shard's step: a whole-pack copy b2 owes (main's order of 2026-11-26, GAPS).
-  pub(crate) fn pack_to_home(
-    &self,
-    state: &mut ShardState,
-  ) -> Option<(Vec<u8>, (slates_vcs::ContentId, u64))> {
+  /// The push's pack to home in the region for a version 4 record (A-722's record v4): held whole in the content store
+  /// it was put in as it arrived, by the identity and length its staging finished it under, its bytes read only where a
+  /// home needs them (b2a, main's order of 2026-11-26: `homes::HomeSource::Held`); none for a push that put no pack.
+  pub(crate) fn pack_to_home(&self) -> Option<(homes::HomeSource, (slates_vcs::ContentId, u64))> {
     let stored = self.push.stored_pack()?;
-    // Read with the shard's chunk store lent, where the content store keeps its windows (A-727).
-    let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
-    let content = lent.stores.content()?;
-    let bytes = content.object_bytes(&content.root_of(&stored.0), stored.1)?;
-    Some((bytes, stored))
+    Some((homes::HomeSource::Held(stored.0, stored.1), stored))
   }
 
   /// Keeps `packed`, the push's pack homed in the region under its identity and length: the record is version 5 while

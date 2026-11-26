@@ -969,7 +969,7 @@ fn first_ask(state: &mut ShardState, sealed: &mut SealedPush) -> Option<Ask> {
   // The attempt its holds in the region are for until its record commits (A-727 (d1a)).
   let owner = sealed.home_owner(state);
   Some((
-    crate::git_push::Carry::Home(bytes, owner),
+    crate::git_push::Carry::Home(super::homes::HomeSource::Bytes(bytes), owner),
     Homing::Names((identity, count)),
   ))
 }
@@ -990,13 +990,13 @@ fn next_ask(
         return None;
       }
       sealed.homed_as((identity, count));
-      let (bytes, packed) = sealed.pack_to_home(state)?;
+      let (source, packed) = sealed.pack_to_home()?;
       if !super::hold_for_record(state, &packed.0) {
         return None;
       }
       let owner = sealed.home_owner(state);
       Some(Some((
-        Carry::Home(bytes, owner),
+        Carry::Home(source, owner),
         Homing::Pack(homed.bytes, packed),
       )))
     }
@@ -1006,7 +1006,8 @@ fn next_ask(
         return None;
       }
       sealed.pack_homed_as(packed);
-      let landing = crate::git_push::landing_of(state, sealed.repository(), (names, homed.bytes))?;
+      let pack = crate::git_push::landed_pack(state, homed.bytes, packed)?;
+      let landing = crate::git_push::landing_of(state, sealed.repository(), (names, pack))?;
       let sequence = landing.sequence();
       Some(Some((
         Carry::Land(Box::new(landing)),

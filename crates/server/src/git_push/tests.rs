@@ -2350,12 +2350,14 @@ const BOUNDED_FILES: usize = 32;
 const BOUNDED_FILE: usize = 64 << 10;
 
 /// Main's order of 2026-11-26 (C3 (b): content once on arrival, a bounded working set a push). Do: push a create of
-/// `main` at a commit of [`BOUNDED_FILES`] incompressible files of [`BOUNDED_FILE`] bytes each, its pack many windows of
-/// the content store long, its request handed to the driver a piece at a time. Expect: `main` created; the most the push
-/// itself held of its pack at once (`git_push.pack_buffer_most`) within one window, the pack put in the content store
-/// as it arrived; its read cache's budget at most (`git_push.read_cache_budget_most`) what one longest object's chain
-/// asks (`Recent::budget_keeping`, its objects whole), a fraction of the pack, and never refused. Red before: the push
-/// held its pack whole in a buffer of its own, and its read cache's budget was the pack's length.
+/// `main` at a commit of [`BOUNDED_FILES`] incompressible files of [`BOUNDED_FILE`] bytes each, its pack many windows
+/// of the content store long, its request handed to the driver a piece at a time. Expect: `main` created; the most the
+/// push itself held of its pack at once (`git_push.pack_buffer_most`) within one window, the pack put in the content
+/// store as it arrived; its read cache's budget at most (`git_push.read_cache_budget_most`) what one longest object's
+/// chain asks (`Recent::budget_keeping`, its objects whole), a fraction of the pack, and never refused; the pack homed
+/// on this one-shard node by its identity, the homing holding no copy of it (b2a, `git_push.carry_buffer_most` 0), the
+/// landing's `Payload` its one whole buffer until b2b (`git_push.land_buffer_most`). Red before: the push held its pack
+/// whole in a buffer of its own, and its read cache's budget was the pack's length; before b2a, the homing two copies.
 #[test]
 fn a_pushs_pack_is_put_as_it_arrives_its_buffer_a_window_and_its_cache_its_chains() {
   use crate::vcs_store::{
@@ -2384,8 +2386,13 @@ fn a_pushs_pack_is_put_as_it_arrives_its_buffer_a_window_and_its_cache_its_chain
     );
     let received = pushed_awaited(repository, &request).await;
     assert_eq!(reasons(&received), [b"ok".to_vec()], "main created");
-    let (window, buffer, budget, refused) = on_state(|state| {
+    let (window, buffer, budget, refused, (shards, carried, landed)) = on_state(|state| {
       let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      let carry = (
+        state.shards.len(),
+        count(crate::vcs_store::homes::CARRY_BUFFER_MOST),
+        count(crate::git_push::LAND_BUFFER_MOST),
+      );
       let window = state
         .vcs_stores
         .content()
@@ -2395,6 +2402,7 @@ fn a_pushs_pack_is_put_as_it_arrives_its_buffer_a_window_and_its_cache_its_chain
         count(PUSH_PACK_BUFFER_MOST),
         count(PUSH_READ_CACHE_BUDGET_MOST),
         count(PUSH_READ_CACHE_REFUSED),
+        carry,
       )
     });
     let pack_len = u64::try_from(pack.len()).unwrap();
@@ -2413,6 +2421,12 @@ fn a_pushs_pack_is_put_as_it_arrives_its_buffer_a_window_and_its_cache_its_chain
       "its read cache's budget {budget} B, a chain's {chain} B"
     );
     assert_eq!(refused, 0, "never refused");
+    assert_eq!(
+      shards, 1,
+      "a one-shard node: the origin is every content's home"
+    );
+    assert_eq!(carried, 0, "the homing held {carried} B of the pack");
+    assert_eq!(landed, pack_len, "the landing's one buffer, the pack");
   });
 }
 
@@ -2758,10 +2772,10 @@ async fn short_homing_drive(repository: RepositoryId, request: &[u8]) -> Result<
       Answering::Answered(_) => return Ok(answer),
       Answering::Turned => {
         slates_rt::futures::yield_now().await;
-        if let Some(crate::git_push::Carry::Home(bytes, _)) = push.take_homing() {
+        if let Some(crate::git_push::Carry::Home(source, _)) = push.take_homing() {
           let fallen = crate::git_push::Carried::Homed(crate::vcs_store::homes::Homed {
             outcome: Err(crate::vcs_store::homes::HomeRefused::Unanswered),
-            bytes,
+            bytes: source.into_given_back(),
           });
           with_state(|state| push.homed(state, fallen)).ok_or("no state")?;
         }
@@ -4412,10 +4426,10 @@ async fn half_homed_drive(repository: RepositoryId, request: &[u8]) -> Result<Ve
         };
         homings += 1;
         let carried = match asked {
-          crate::git_push::Carry::Home(bytes, _) if homings > 1 => {
+          crate::git_push::Carry::Home(source, _) if homings > 1 => {
             crate::git_push::Carried::Homed(crate::vcs_store::homes::Homed {
               outcome: Err(crate::vcs_store::homes::HomeRefused::Unanswered),
-              bytes,
+              bytes: source.into_given_back(),
             })
           }
           asked => {

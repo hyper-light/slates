@@ -2386,7 +2386,17 @@
 > (w-git, main's order of 2026-11-26, the next piece):** the homing and the landing still carry the pack as whole
 > buffers, `SealedPush::pack_to_home`'s copy into `Carry::Home(bytes, owner)` and `git_push::landing_of`'s parts built
 > from the homed bytes, each a whole-pack copy that grows with the push (main's reading: the likely reason C5's peak,
-> 551.6 MiB, sits far above its after-push figure). Owed (w-git): a node whose store lacks a record's changeset
+> 551.6 MiB, sits far above its after-push figure). b2a BUILT (w-git, 2026-11-26): the pack is homed as
+> `homes::HomeSource::Held`, its identity and length in the content store it was put in; this node's keep, where the
+> origin is its home shard, is a hold by identity (`homes::keep_held_for_region`), no bytes; its bytes read once, and
+> only for another home shard or a remote home (counted `git_push.carry_buffer_most`); the landing reads it once for its
+> `Payload` (`git_push::landed_pack`, `git_push.land_buffer_most`). Red: the one-shard push of a 2,213,177-byte pack in
+> `a_pushs_pack_is_put_as_it_arrives_…`: the homing held 0 B of it, 4,426,354 B (two copies) in the old shape. b2b
+> OWED (w-git, main's ruling: the slates-store owner side included): the landing's `Payload` from the content store's
+> windows through a pieces landing (begin, append, finish) that is the whole landing's one path. Unmeasured, owed
+> (w-git) once a fleet RSS round measures it: `put_remote` ships the whole pack in one buffer to each remote home
+> (f ≥ 1); another shard of this node as the pack's home is handed its bytes too. Owed (w-git): a node whose store
+> lacks a record's changeset
 > reading its names from their region homes, held by a test of its own (the rebuild test now reads the node's store).
 > OPEN (goal 93, w-git; w-sessionlog's reduction 2026-11-21): a whole clone of git/git with 506 tags or more is aborted
 > "possible repository corruption on the remote side". The repository's encoding never finishes (its first version,
