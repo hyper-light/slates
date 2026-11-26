@@ -488,11 +488,6 @@ pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
     owner: "w-hg (repository::import::tests 1)",
     reaching: 1,
   },
-  Allowed {
-    fixture: "git_push::tests::carry_blocking",
-    owner: "w-git",
-    reaching: 8,
-  },
 ];
 
 /// A fixture allowed to block a shard's thread on the store for now ([`SHARD_BLOCKING_ALLOWED`]): its name, whose tests

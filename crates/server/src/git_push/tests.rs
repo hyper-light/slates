@@ -328,29 +328,155 @@ fn started(state: &mut ShardState, repository: RepositoryId) -> (Vec<u8>, Receiv
   (advertised, push)
 }
 
-/// `request` handed to `push` a piece at a time as an edge hands it in, then its end, then its
-/// answer, a step at a time while its checks turn (A-719) under a presenter that shows no view:
-/// what the driver wrote, and what it received.
-fn answered(state: &mut ShardState, push: &mut ReceivePack, request: &[u8]) -> (Vec<u8>, Received) {
+/// Shape: how long an awaiting history ([`on_stored_shard_awaited`]) may run on its shard before the test fails: as long
+/// as `svn_commit`'s histories are held.
+const HISTORY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// [`on_stored_shard_with`] for a history that awaits (main 01a20182's order of 2026-11-25, the shard-blocking
+/// allow-list): `history` runs as a task on the stored daemon's first shard ([`crate::test_store::run_on_first`]), with
+/// git repositories `names` made first from the test's thread, and reads and changes the shard's state between its awaits
+/// through [`crate::state::with_state`]; its pushes land on the store by awaiting ([`answered_awaited`]), never holding
+/// the shard through the store's commit, as the synchronous driver's `carry_blocking` did (removed with it, 2026-11-25).
+pub(crate) fn on_stored_shard_awaited<T, F, const N: usize>(
+  names: [&'static str; N],
+  history: impl FnOnce([RepositoryId; N]) -> F + Clone + Send + 'static,
+) -> T
+where
+  T: Send + 'static,
+  F: std::future::Future<Output = T> + 'static,
+{
+  on_stored_shard_configured_awaited(names, |_| {}, history)
+}
+
+/// [`on_stored_shard_awaited`] with the daemon's configuration changed by `configure` first.
+pub(crate) fn on_stored_shard_configured_awaited<T, F, const N: usize>(
+  names: [&'static str; N],
+  configure: impl FnOnce(&mut crate::DaemonConfig),
+  history: impl FnOnce([RepositoryId; N]) -> F + Clone + Send + 'static,
+) -> T
+where
+  T: Send + 'static,
+  F: std::future::Future<Output = T> + 'static,
+{
+  let (store, daemon) = crate::test_store::audit_daemon_stored_configured(configure);
+  crate::test_store::keep_landed(&daemon);
+  let made = names.map(|name| git_repository_on(&daemon, name));
+  let answer = crate::test_store::run_on_first(&daemon, move || history(made), HISTORY_PATIENCE);
+  daemon.stop();
+  drop(store);
+  answer
+}
+
+/// [`on_stored_shard_awaited`] for a history that wants the repository's root green too: `asked` made first from the
+/// test's thread (`test_store::create_on`), then `history` run as a task of the shard with its id and green.
+pub(crate) fn on_stored_shard_made_awaited<T, F>(
+  asked: crate::test_store::Asked<'static>,
+  history: impl FnOnce((RepositoryId, slates_db::catalog::VolumeId)) -> F + Clone + Send + 'static,
+) -> T
+where
+  T: Send + 'static,
+  F: std::future::Future<Output = T> + 'static,
+{
+  let (store, daemon) = crate::test_store::audit_daemon_stored();
+  crate::test_store::keep_landed(&daemon);
+  let made = crate::test_store::create_on(&daemon, 0, &owner(), asked);
+  let answer = crate::test_store::run_on_first(&daemon, move || history(made), HISTORY_PATIENCE);
+  daemon.stop();
+  drop(store);
+  answer
+}
+
+/// The shard's state for `f`, in an awaiting history ([`on_stored_shard_awaited`]).
+pub(crate) fn on_state<T>(f: impl FnOnce(&mut ShardState) -> T) -> T {
+  crate::state::with_state(f).expect("the shard's state")
+}
+
+/// A push driven as an edge's task drives it: `request` a piece at a time, then its end, then its answer a step at a
+/// time, yielding after each turn and carrying what the push asks off the step ([`carry_awaited`]): what the driver
+/// wrote, and what it received.
+pub(crate) async fn answered_awaited(
+  push: &mut ReceivePack,
+  request: &[u8],
+) -> (Vec<u8>, Received) {
   for piece in request.chunks(PIECE) {
-    push.input(state, piece).expect("taken");
+    on_state(|state| push.input(state, piece)).expect("taken");
   }
-  push.end(state).expect("ended");
+  on_state(|state| push.end(state)).expect("ended");
   let mut answer = Vec::new();
   loop {
-    match push.answer_step(state, &mut answer).expect("answered") {
+    match on_state(|state| push.answer_step(state, &mut answer)).expect("answered") {
       Answering::Answered(received) => return (answer, *received),
-      Answering::Turned => carry_blocking(state, push),
+      Answering::Turned => {
+        slates_rt::futures::yield_now().await;
+        carry_awaited(push).await.expect("carried");
+      }
       #[cfg(unix)]
       step @ Answering::Hook(_) => panic!("no hook runs where no view is shown: {step:?}"),
     }
   }
 }
 
-/// `request` pushed to `repository` by its owner: what was received.
-pub(crate) fn pushed(state: &mut ShardState, repository: RepositoryId, request: &[u8]) -> Received {
-  let (_, mut push) = started(state, repository);
-  answered(state, &mut push, request).1
+/// Drops `push` where the shard's state is lent, as a synchronous step drops it ([`pushed_awaited`]).
+pub(crate) fn dropped_in_a_step(push: ReceivePack) {
+  on_state(|_| drop(push));
+}
+
+/// `request` pushed to `repository` by its owner from a task of its shard ([`answered_awaited`]). The push is dropped
+/// where the shard's state is lent, as a synchronous step dropped it, so what a push's end starts
+/// through the state (a derivation behind it, its owed let-gos) is not started: a test that measures a derivation
+/// drives it itself.
+pub(crate) async fn pushed_awaited(repository: RepositoryId, request: &[u8]) -> Received {
+  let (_, mut push) = on_state(|state| started(state, repository));
+  let (_, received) = answered_awaited(&mut push, request).await;
+  dropped_in_a_step(push);
+  received
+}
+
+/// `request` pushed to `repository` by its owner from a task of `daemon`'s first shard ([`pushed_awaited`]), the test's
+/// thread waiting for its answer: what was received.
+pub(crate) fn pushed_on(
+  daemon: &crate::Daemon,
+  repository: RepositoryId,
+  request: &[u8],
+) -> Received {
+  let request = request.to_vec();
+  crate::test_store::run_on_first(
+    daemon,
+    move || async move { pushed_awaited(repository, &request).await },
+    HISTORY_PATIENCE,
+  )
+}
+
+/// The fixtures' scenarios `names` pushed from a task of `daemon`'s first shard
+/// ([`pushed_from_the_fixtures_awaited`]), the test's thread waiting for it.
+pub(crate) fn pushed_from_the_fixtures_on(
+  daemon: &crate::Daemon,
+  repository: RepositoryId,
+  names: &'static [&'static str],
+) {
+  crate::test_store::run_on_first(
+    daemon,
+    move || async move { pushed_from_the_fixtures_awaited(repository, names).await },
+    HISTORY_PATIENCE,
+  );
+}
+
+/// Pushes the fixtures' scenarios `names` in order to `repository` ([`pushed_awaited`]), each answered `ok`.
+pub(crate) async fn pushed_from_the_fixtures_awaited(repository: RepositoryId, names: &[&str]) {
+  let mut taken = Vec::new();
+  for (scenario, _) in chain() {
+    if names.contains(&scenario.name) {
+      let received = pushed_awaited(repository, scenario.request).await;
+      assert!(
+        reasons(&received).iter().all(|reason| reason == b"ok"),
+        "{}: {:?}",
+        scenario.name,
+        received.outcomes
+      );
+      taken.push(scenario.name);
+    }
+  }
+  assert_eq!(taken, names);
 }
 
 /// Each command's outcome in a report's words: `ok`, or the reason it was refused.
@@ -424,28 +550,6 @@ fn assert_hold_the_second_text(state: &mut ShardState, repository: RepositoryId,
   }
 }
 
-/// Pushes the fixtures' scenarios `names` in order to `repository`, each answered `ok` for every command.
-pub(crate) fn pushed_from_the_fixtures(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  names: &[&str],
-) {
-  let mut taken = Vec::new();
-  for (scenario, _) in chain() {
-    if names.contains(&scenario.name) {
-      let received = pushed(state, repository, scenario.request);
-      assert!(
-        reasons(&received).iter().all(|reason| reason == b"ok"),
-        "{}: {:?}",
-        scenario.name,
-        received.outcomes
-      );
-      taken.push(scenario.name);
-    }
-  }
-  assert_eq!(taken, names);
-}
-
 /// A-654 part 2 (§4.17.2 "A push" items 1 to 7; golden vectors: six pushes stock git 2.50.1 made, captured by
 /// `make-push-fixtures.sh`). Do: make a git repository on the owner shard; then, in the script's order, start each
 /// push advertising, hand it the request git sent a few bytes at a time, end it and answer it: `main` created in the
@@ -457,13 +561,13 @@ pub(crate) fn pushed_from_the_fixtures(
 /// one record in the register a push.
 #[test]
 fn t_a654_stock_gits_pushes_are_answered_as_git_answered_and_each_ref_holds_its_tree() {
-  on_stored_shard_with(["fixtures"], |state, [repository]| {
+  on_stored_shard_awaited(["fixtures"], |[repository]| async move {
     let mut after = "";
     for (scenario, next) in chain() {
-      let (advertised, mut push) = started(state, repository);
+      let (advertised, mut push) = on_state(|state| started(state, repository));
       let expected = advertisement(scenario.before, &OURS);
       assert_eq!(advertised, expected, "{}: the advertisement", scenario.name);
-      let (answer, _) = answered(state, &mut push, scenario.request);
+      let (answer, _) = answered_awaited(&mut push, scenario.request).await;
       assert_eq!(
         answer,
         gits_report(&scenario),
@@ -472,45 +576,44 @@ fn t_a654_stock_gits_pushes_are_answered_as_git_answered_and_each_ref_holds_its_
       );
       if scenario.name == "create" {
         let first = vec![("text".to_owned(), text(false))];
-        assert_eq!(files(state, repository, "main"), first);
+        assert_eq!(on_state(|state| files(state, repository, "main")), first);
       }
       after = next;
     }
-    let (advertised, _) = started(state, repository);
-    assert_eq!(advertised, advertisement(after, &OURS));
-    assert_hold_the_second_text(state, repository, &["main", "copy", "refs/tags/v1"]);
-    let main = state
-      .db
-      .partition()
-      .repositories()
-      .branch(repository, "main");
-    assert_eq!(
-      main.map(|green| state.db.partition().green_head(green)),
-      Some(2)
-    );
-    assert_eq!(records(state, repository), chain().len());
+    on_state(|state| {
+      let (advertised, _) = started(state, repository);
+      assert_eq!(advertised, advertisement(after, &OURS));
+      assert_hold_the_second_text(state, repository, &["main", "copy", "refs/tags/v1"]);
+      let main = state
+        .db
+        .partition()
+        .repositories()
+        .branch(repository, "main");
+      assert_eq!(
+        main.map(|green| state.db.partition().green_head(green)),
+        Some(2)
+      );
+      assert_eq!(records(state, repository), chain().len());
+    });
   });
 }
 
 /// A-645 P3 (main's ruling 1): with a `pre-receive` hook configured, `delete` is refused in words naming the root mount
 /// before this daemon has published it, and `hook not run` once it has (nothing yet shows the hook's view); each names
 /// the hook and records nothing past `held`.
-fn assert_a_configured_hook_refuses(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  delete: &[u8],
-  held: usize,
-) {
-  let received = pushed(state, repository, delete);
+async fn assert_a_configured_hook_refuses(repository: RepositoryId, delete: &[u8], held: usize) {
+  let received = pushed_awaited(repository, delete).await;
   assert_eq!(reasons(&received), [ROOT_UNPUBLISHED]);
   assert_first_line_names(&received, b"pre-receive");
-  assert_eq!(records(state, repository), held);
-  state.hook_views =
-    crate::vcs_store::svn_presenter::HookViews::Given(std::path::PathBuf::from("/slates-root"));
-  let received = pushed(state, repository, delete);
+  on_state(|state| {
+    assert_eq!(records(state, repository), held);
+    state.hook_views =
+      crate::vcs_store::svn_presenter::HookViews::Given(std::path::PathBuf::from("/slates-root"));
+  });
+  let received = pushed_awaited(repository, delete).await;
   assert_eq!(reasons(&received), [HOOK_NOT_RUN]);
   assert_first_line_names(&received, b"pre-receive");
-  assert_eq!(records(state, repository), held);
+  assert_eq!(on_state(|state| records(state, repository)), held);
 }
 
 /// A-654 part 2 (§4.17.1 "Policy"; §4.17.2 "Access", "Protected branches, in git's terms" and "Hooks, in git's
@@ -523,53 +626,63 @@ fn assert_a_configured_hook_refuses(
 /// then the delete applied, one record more.
 #[test]
 fn t_a654_the_policy_hides_and_refuses_in_gits_words_and_a_configured_hook_refuses_typed() {
-  on_stored_shard_with(["policy"], |state, [repository]| {
-    pushed_from_the_fixtures(state, repository, &["create", "update", "copy"]);
-    let held = records(state, repository);
+  on_stored_shard_awaited(["policy"], |[repository]| async move {
+    pushed_from_the_fixtures_awaited(repository, &["create", "update", "copy"]).await;
+    let held = on_state(|state| records(state, repository));
     let copy: &[u8] = b"refs/heads/copy";
     let delete = request(&[(SECOND, "", copy)], CAPABILITIES, &[]);
-    set_policy(
-      state,
-      "policy",
-      0,
-      (vec![deny(PolicyRight::Read, "refs/heads/copy")], Vec::new()),
-    );
-    let (advertised, mut push) = started(state, repository);
+    let (advertised, mut push) = on_state(|state| {
+      set_policy(
+        state,
+        "policy",
+        0,
+        (vec![deny(PolicyRight::Read, "refs/heads/copy")], Vec::new()),
+      );
+      started(state, repository)
+    });
     let main_alone = format!("{SECOND} refs/heads/main\n");
     assert_eq!(advertised, advertisement(&main_alone, &OURS));
-    let (_, received) = answered(state, &mut push, &delete);
+    let (_, received) = answered_awaited(&mut push, &delete).await;
     assert_eq!(reasons(&received), [HIDDEN_DELETE]);
-    set_policy(
-      state,
-      "policy",
-      1,
-      (
-        vec![deny(PolicyRight::Delete, "refs/heads/copy")],
-        Vec::new(),
-      ),
-    );
-    let received = pushed(state, repository, &delete);
+    on_state(|state| {
+      set_policy(
+        state,
+        "policy",
+        1,
+        (
+          vec![deny(PolicyRight::Delete, "refs/heads/copy")],
+          Vec::new(),
+        ),
+      );
+    });
+    let received = pushed_awaited(repository, &delete).await;
     let prohibited = Outcome::Ng(protected::deletion_prohibited(copy));
     assert_eq!(received.outcomes, [prohibited]);
     let other: &[u8] = b"refs/heads/other";
     let create = request(&[("", SECOND, other)], CAPABILITIES, empty_pack());
-    set_policy(
-      state,
-      "policy",
-      2,
-      (
-        vec![deny(PolicyRight::Submit, "refs/heads/other")],
-        Vec::new(),
-      ),
-    );
-    assert_declined_as_a_hook(&pushed(state, repository, &create), other, b"rule 0");
-    set_policy(state, "policy", 3, (Vec::new(), vec![pre_receive()]));
-    assert_a_configured_hook_refuses(state, repository, &delete, held);
-    assert!(bound(state, repository, "copy") && !bound(state, repository, "other"));
-    set_policy(state, "policy", 4, (Vec::new(), Vec::new()));
-    assert_eq!(reasons(&pushed(state, repository, &delete)), [b"ok"]);
-    assert!(!bound(state, repository, "copy"));
-    assert_eq!(records(state, repository), held + 1);
+    on_state(|state| {
+      set_policy(
+        state,
+        "policy",
+        2,
+        (
+          vec![deny(PolicyRight::Submit, "refs/heads/other")],
+          Vec::new(),
+        ),
+      );
+    });
+    assert_declined_as_a_hook(&pushed_awaited(repository, &create).await, other, b"rule 0");
+    on_state(|state| set_policy(state, "policy", 3, (Vec::new(), vec![pre_receive()])));
+    assert_a_configured_hook_refuses(repository, &delete, held).await;
+    on_state(|state| {
+      assert!(bound(state, repository, "copy") && !bound(state, repository, "other"));
+      set_policy(state, "policy", 4, (Vec::new(), Vec::new()));
+    });
+    assert_eq!(reasons(&pushed_awaited(repository, &delete).await), [b"ok"]);
+    on_state(|state| {
+      assert!(!bound(state, repository, "copy"));
+      assert_eq!(records(state, repository), held + 1);
+    });
   });
 }
 
@@ -619,18 +732,20 @@ fn assert_first_line_names(received: &Received, what: &[u8]) {
 /// more; the fourth applying both as one entry, one record more, `again` holding the second commit's text.
 #[test]
 fn t_a654_a_push_with_atomic_is_all_or_none_and_without_it_a_ref_at_a_time() {
-  on_stored_shard_with(["atomic"], |state, [repository]| {
-    pushed_from_the_fixtures(state, repository, &["create", "update", "tag", "copy"]);
-    let held = records(state, repository);
+  on_stored_shard_awaited(["atomic"], |[repository]| async move {
+    pushed_from_the_fixtures_awaited(repository, &["create", "update", "tag", "copy"]).await;
+    let held = on_state(|state| records(state, repository));
     let stale = [(SECOND, "", COPY_REF), (FIRST, "", TAG_REF)];
-    let received = pushed(state, repository, &request(&stale, ATOMIC, &[]));
+    let received = pushed_awaited(repository, &request(&stale, ATOMIC, &[])).await;
     assert_eq!(reasons(&received), [ATOMIC_FAILURE, FAILED_TO_UPDATE]);
-    atomic_refused_whole_at_its_append(state, repository, held);
-    let received = pushed(state, repository, &request(&stale, CAPABILITIES, &[]));
+    atomic_refused_whole_at_its_append(repository, held).await;
+    let received = pushed_awaited(repository, &request(&stale, CAPABILITIES, &[])).await;
     assert_eq!(reasons(&received), [b"ok".as_slice(), FAILED_TO_UPDATE]);
-    assert_eq!(records(state, repository), held + 1);
-    assert!(!bound(state, repository, "copy") && bound(state, repository, "refs/tags/v1"));
-    atomic_applied_as_one_entry(state, repository, held + 1);
+    on_state(|state| {
+      assert_eq!(records(state, repository), held + 1);
+      assert!(!bound(state, repository, "copy") && bound(state, repository, "refs/tags/v1"));
+    });
+    atomic_applied_as_one_entry(repository, held + 1).await;
   });
 }
 
@@ -641,49 +756,51 @@ const TAG_REF: &[u8] = b"refs/tags/v1";
 
 /// Branch `cli` made with the CLI's verb at `main`'s version before its first push (no commit, so git sees it unborn), then, with `atomic`, the tag deleted and `cli` created at a commit held:
 /// refused whole at its append, git's line naming `cli`, the tag still bound and the `held` records unchanged.
-fn atomic_refused_whole_at_its_append(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  held: usize,
-) {
-  let reply = dispatch(
-    state,
-    1,
-    &owner(),
-    RequestBody::CreateBranch {
-      repository: "atomic".to_owned(),
-      name: "cli".to_owned(),
-      from: "main".to_owned(),
-      version: Some(0),
-    },
-  );
+async fn atomic_refused_whole_at_its_append(repository: RepositoryId, held: usize) {
+  let reply = on_state(|state| {
+    dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::CreateBranch {
+        repository: "atomic".to_owned(),
+        name: "cli".to_owned(),
+        from: "main".to_owned(),
+        version: Some(0),
+      },
+    )
+  });
   assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
   let cli = [
     (TAG, "", TAG_REF),
     ("", SECOND, b"refs/heads/cli".as_slice()),
   ];
-  let received = pushed(state, repository, &request(&cli, ATOMIC, empty_pack()));
+  let received = pushed_awaited(repository, &request(&cli, ATOMIC, empty_pack())).await;
   assert_eq!(
     reasons(&received),
     [ATOMIC_TRANSACTION_FAILED, ATOMIC_TRANSACTION_FAILED]
   );
   assert_first_line_names(&received, b"refs/heads/cli");
-  assert_eq!(records(state, repository), held);
-  assert!(bound(state, repository, "copy") && bound(state, repository, "refs/tags/v1"));
+  on_state(|state| {
+    assert_eq!(records(state, repository), held);
+    assert!(bound(state, repository, "copy") && bound(state, repository, "refs/tags/v1"));
+  });
 }
 
 /// With `atomic`, the tag deleted and `again` created at a commit held: both applied as one entry past the `held`
 /// records, `again` holding the second commit's text.
-fn atomic_applied_as_one_entry(state: &mut ShardState, repository: RepositoryId, held: usize) {
+async fn atomic_applied_as_one_entry(repository: RepositoryId, held: usize) {
   let again = [
     (TAG, "", TAG_REF),
     ("", SECOND, b"refs/heads/again".as_slice()),
   ];
-  let received = pushed(state, repository, &request(&again, ATOMIC, empty_pack()));
+  let received = pushed_awaited(repository, &request(&again, ATOMIC, empty_pack())).await;
   assert_eq!(reasons(&received), [b"ok", b"ok"]);
-  assert_eq!(records(state, repository), held + 1);
-  assert!(!bound(state, repository, "refs/tags/v1"));
-  assert_hold_the_second_text(state, repository, &["again"]);
+  on_state(|state| {
+    assert_eq!(records(state, repository), held + 1);
+    assert!(!bound(state, repository, "refs/tags/v1"));
+    assert_hold_the_second_text(state, repository, &["again"]);
+  });
 }
 
 /// A-743 (main's ruling 2026-11-20, found by use: a branch the CLI made never showed in `git ls-remote`; §4.17's concept
@@ -695,83 +812,88 @@ fn atomic_applied_as_one_entry(state: &mut ShardState, repository: RepositoryId,
 /// holding the second commit's text. Before that push, the store made again from the log advertises `topic` too.
 #[test]
 fn t_a743_a_branch_the_namespace_binds_is_a_ref_git_sees_and_pushes_move_its_green() {
-  on_stored_shard_with(["bindings"], |state, [repository]| {
-    pushed_from_the_fixtures(state, repository, &["create"]);
-    // Through the door, as `verbs::run_recorded` reaches a green: one that owes its push is made first (P2).
-    let branch = |state: &mut ShardState, body: RequestBody| {
-      if let Some(green) = crate::green_ready::owing_green_of(state, &body) {
-        crate::green_ready::made_now(state, green);
-      }
-      dispatch(state, 1, &owner(), body)
-    };
-    let made = branch(
-      state,
-      RequestBody::CreateBranch {
-        repository: "bindings".to_owned(),
-        name: "topic".to_owned(),
-        from: "main".to_owned(),
-        version: None,
-      },
-    );
-    let ReplyBody::GreenCreated { id: green } = made else {
-      panic!("no branch: {made:?}");
-    };
-    let topic = (named(FIRST), b"refs/heads/topic".to_vec());
-    let after_create = super::advertised_refs(state, repository).contains(&topic);
-    let retired = branch(
-      state,
-      RequestBody::RetireBranch {
-        repository: "bindings".to_owned(),
-        name: "topic".to_owned(),
-      },
-    );
-    assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
-    let after_retire = super::advertised_refs(state, repository)
-      .iter()
-      .any(|(_, name)| name == b"refs/heads/topic");
-    let bound_again = branch(
-      state,
-      RequestBody::BindBranch {
-        repository: "bindings".to_owned(),
-        name: "topic".to_owned(),
-        green,
-      },
-    );
-    assert!(
-      matches!(bound_again, ReplyBody::Acknowledged),
-      "{bound_again:?}"
-    );
-    let after_bind = super::advertised_refs(state, repository).contains(&topic);
-    assert_eq!(
-      (after_create, after_retire, after_bind),
-      (true, false, true)
-    );
-    crate::vcs_store::rebuild(state, repository);
-    crate::vcs_store::settle_rebuild(state, repository);
-    assert!(super::advertised_refs(state, repository).contains(&topic));
-    let members = state
-      .db
-      .partition()
-      .repositories()
-      .members_of(repository)
-      .count();
+  on_stored_shard_awaited(["bindings"], |[repository]| async move {
+    pushed_from_the_fixtures_awaited(repository, &["create"]).await;
+    let (green, members) = on_state(|state| {
+      // Through the door, as `verbs::run_recorded` reaches a green: one that owes its push is made first (P2).
+      let branch = |state: &mut ShardState, body: RequestBody| {
+        if let Some(green) = crate::green_ready::owing_green_of(state, &body) {
+          crate::green_ready::made_now(state, green);
+        }
+        dispatch(state, 1, &owner(), body)
+      };
+      let made = branch(
+        state,
+        RequestBody::CreateBranch {
+          repository: "bindings".to_owned(),
+          name: "topic".to_owned(),
+          from: "main".to_owned(),
+          version: None,
+        },
+      );
+      let ReplyBody::GreenCreated { id: green } = made else {
+        panic!("no branch: {made:?}");
+      };
+      let topic = (named(FIRST), b"refs/heads/topic".to_vec());
+      let after_create = super::advertised_refs(state, repository).contains(&topic);
+      let retired = branch(
+        state,
+        RequestBody::RetireBranch {
+          repository: "bindings".to_owned(),
+          name: "topic".to_owned(),
+        },
+      );
+      assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
+      let after_retire = super::advertised_refs(state, repository)
+        .iter()
+        .any(|(_, name)| name == b"refs/heads/topic");
+      let bound_again = branch(
+        state,
+        RequestBody::BindBranch {
+          repository: "bindings".to_owned(),
+          name: "topic".to_owned(),
+          green,
+        },
+      );
+      assert!(
+        matches!(bound_again, ReplyBody::Acknowledged),
+        "{bound_again:?}"
+      );
+      let after_bind = super::advertised_refs(state, repository).contains(&topic);
+      assert_eq!(
+        (after_create, after_retire, after_bind),
+        (true, false, true)
+      );
+      crate::vcs_store::rebuild(state, repository);
+      crate::vcs_store::settle_rebuild(state, repository);
+      assert!(super::advertised_refs(state, repository).contains(&topic));
+      let members = state
+        .db
+        .partition()
+        .repositories()
+        .members_of(repository)
+        .count();
+      (green, members)
+    });
     let update = scenario!("update").request;
     let pack = &update[update
       .windows(4)
       .position(|magic| magic == b"PACK")
       .unwrap()..];
     let moved = [(FIRST, SECOND, b"refs/heads/topic".as_slice())];
-    let received = pushed(state, repository, &request(&moved, CAPABILITIES, pack));
+    let received = pushed_awaited(repository, &request(&moved, CAPABILITIES, pack)).await;
     assert_eq!(reasons(&received), [b"ok"]);
-    let repositories = state.db.partition().repositories();
-    assert_eq!(
-      (
-        repositories.branch(repository, "topic"),
-        repositories.members_of(repository).count()
-      ),
-      (Some(crate::verbs::to_db_volume(green)), members)
-    );
-    assert_hold_the_second_text(state, repository, &["topic"]);
+    on_state(|state| {
+      let repositories = state.db.partition().repositories();
+      assert_eq!(
+        (
+          repositories.branch(repository, "topic"),
+          repositories.members_of(repository).count()
+        ),
+        (Some(crate::verbs::to_db_volume(green)), members)
+      );
+      assert_hold_the_second_text(state, repository, &["topic"]);
+    });
   });
 }
 
@@ -781,18 +903,20 @@ fn t_a743_a_branch_the_namespace_binds_is_a_ref_git_sees_and_pushes_move_its_gre
 /// before.
 #[test]
 fn t_a722_p4_a_thin_packs_record_is_replayed_in_turns_with_its_deltas_resolved() {
-  on_stored_shard_with(["thin-replayed"], |state, [repository]| {
-    pushed_from_the_fixtures(state, repository, &["create", "update"]);
-    let before = super::advertised_refs(state, repository);
-    let held = records(state, repository);
-    crate::vcs_store::rebuild(state, repository);
-    let mut turns = 0usize;
-    while crate::vcs_store::rebuild_turn_once_within(state, repository, 0) {
-      turns += 1;
-    }
-    crate::vcs_store::paths::whole_build::settle(state);
-    assert!(turns > held, "{turns} turns for {held} records");
-    assert_eq!(super::advertised_refs(state, repository), before);
+  on_stored_shard_awaited(["thin-replayed"], |[repository]| async move {
+    pushed_from_the_fixtures_awaited(repository, &["create", "update"]).await;
+    on_state(|state| {
+      let before = super::advertised_refs(state, repository);
+      let held = records(state, repository);
+      crate::vcs_store::rebuild(state, repository);
+      let mut turns = 0usize;
+      while crate::vcs_store::rebuild_turn_once_within(state, repository, 0) {
+        turns += 1;
+      }
+      crate::vcs_store::paths::whole_build::settle(state);
+      assert!(turns > held, "{turns} turns for {held} records");
+      assert_eq!(super::advertised_refs(state, repository), before);
+    });
   });
 }
 
@@ -830,19 +954,21 @@ fn update_with_its_delta_first() -> Vec<u8> {
 /// the change: the replay refused as diverged, the second push's ref lost.
 #[test]
 fn t_a722_a_thin_packs_record_whose_delta_waits_first_is_replayed() {
-  on_stored_shard_with(["thin-first"], |state, [repository]| {
-    pushed_from_the_fixtures(state, repository, &["create"]);
-    let received = pushed(state, repository, &update_with_its_delta_first());
+  on_stored_shard_awaited(["thin-first"], |[repository]| async move {
+    pushed_from_the_fixtures_awaited(repository, &["create"]).await;
+    let received = pushed_awaited(repository, &update_with_its_delta_first()).await;
     assert!(
       reasons(&received).iter().all(|reason| reason == b"ok"),
       "{:?}",
       received.outcomes
     );
-    let before = super::advertised_refs(state, repository);
-    crate::vcs_store::rebuild(state, repository);
-    while crate::vcs_store::rebuild_turn_once_within(state, repository, 0) {}
-    crate::vcs_store::paths::whole_build::settle(state);
-    assert_eq!(super::advertised_refs(state, repository), before);
+    on_state(|state| {
+      let before = super::advertised_refs(state, repository);
+      crate::vcs_store::rebuild(state, repository);
+      while crate::vcs_store::rebuild_turn_once_within(state, repository, 0) {}
+      crate::vcs_store::paths::whole_build::settle(state);
+      assert_eq!(super::advertised_refs(state, repository), before);
+    });
   });
 }
 
@@ -864,17 +990,19 @@ const CREATES: usize = 24;
 /// holds its commit.
 #[test]
 fn t_a753_a_repository_takes_branch_creates_past_its_chain_budget() {
-  let refused = on_stored_shard_configured_with(
+  let refused = on_stored_shard_configured_awaited(
     ["chains"],
     |config| config.caps.green_chain_bytes = SMALL_CHAIN_BUDGET,
-    |state, [repository]| {
+    |[repository]| async move {
       let pack = pack_of(scenario!("create").request);
       let mut refused = Vec::new();
       for k in 0..CREATES {
         let name = format!("refs/heads/p{k}");
         let created = [("", FIRST, name.as_bytes())];
-        let received = pushed(state, repository, &request(&created, CAPABILITIES, pack));
-        if reasons(&received) != [b"ok".to_vec()] || !bound(state, repository, &format!("p{k}")) {
+        let received = pushed_awaited(repository, &request(&created, CAPABILITIES, pack)).await;
+        if reasons(&received) != [b"ok".to_vec()]
+          || !on_state(|state| bound(state, repository, &format!("p{k}")))
+        {
           if k == 1 {
             eprintln!("DBG {:?}", received.outcomes);
           }
@@ -882,10 +1010,12 @@ fn t_a753_a_repository_takes_branch_creates_past_its_chain_budget() {
         }
       }
       let first = vec![("text".to_owned(), text(false))];
-      let wrong = (0..CREATES)
-        .filter(|k| !refused.contains(k))
-        .filter(|k| files(state, repository, &format!("p{k}")) != first)
-        .count();
+      let wrong = on_state(|state| {
+        (0..CREATES)
+          .filter(|k| !refused.contains(k))
+          .filter(|k| files(state, repository, &format!("p{k}")) != first)
+          .count()
+      });
       (refused, wrong)
     },
   );
@@ -906,11 +1036,7 @@ const CREATES_UNHELD: usize = 4;
 /// The greens a push's search for the green holding a commit examined (`HOLDING_EXAMINED`), in a repository holding
 /// `held` greens at the fixtures' first commit, over one push creating [`CREATES_UNHELD`] branches at its second commit,
 /// which no green holds; and each create's outcome.
-fn examined_over(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  held: usize,
-) -> (u64, Vec<Vec<u8>>) {
+async fn examined_over(repository: RepositoryId, held: usize) -> (u64, Vec<Vec<u8>>) {
   let create = pack_of(scenario!("create").request);
   for k in 0..held {
     let branch = if k == 0 {
@@ -920,7 +1046,7 @@ fn examined_over(
     };
     let named = format!("refs/heads/{branch}");
     let created = [("", FIRST, named.as_bytes())];
-    let received = pushed(state, repository, &request(&created, CAPABILITIES, create));
+    let received = pushed_awaited(repository, &request(&created, CAPABILITIES, create)).await;
     assert_eq!(reasons(&received), [b"ok".to_vec()], "{branch}");
   }
   let names: Vec<Vec<u8>> = (0..CREATES_UNHELD)
@@ -931,18 +1057,18 @@ fn examined_over(
     .map(|name| ("", SECOND, name.as_slice()))
     .collect();
   let update = pack_of(scenario!("update").request);
-  let before = state
-    .refusals
-    .get(super::HOLDING_EXAMINED)
-    .copied()
-    .unwrap_or(0);
-  let received = pushed(state, repository, &request(&commands, CAPABILITIES, update));
-  let after = state
-    .refusals
-    .get(super::HOLDING_EXAMINED)
-    .copied()
-    .unwrap_or(0);
-  (after - before, reasons(&received))
+  let examined = || {
+    on_state(|state| {
+      state
+        .refusals
+        .get(super::HOLDING_EXAMINED)
+        .copied()
+        .unwrap_or(0)
+    })
+  };
+  let before = examined();
+  let received = pushed_awaited(repository, &request(&commands, CAPABILITIES, update)).await;
+  (examined() - before, reasons(&received))
 }
 
 /// Goal 93 (main 01a20182's order: git/git's push spent its time in `ShardGreens::holding`, which lent every member
@@ -954,9 +1080,9 @@ fn examined_over(
 /// four times as many in the larger repository.
 #[test]
 fn t_goal93_a_pushs_search_for_the_green_holding_a_commit_is_flat_in_the_repositorys_greens() {
-  let (few, many) = on_stored_shard_with(["few", "many"], |state, [few, many]| {
-    let few = examined_over(state, few, HELD_FEW);
-    let many = examined_over(state, many, HELD_MANY);
+  let (few, many) = on_stored_shard_awaited(["few", "many"], |[few, many]| async move {
+    let few = examined_over(few, HELD_FEW).await;
+    let many = examined_over(many, HELD_MANY).await;
     (few, many)
   });
   let created = vec![b"ok".to_vec(); CREATES_UNHELD];
@@ -997,10 +1123,8 @@ fn t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step(
     let updated = [(first.as_str(), second.as_str(), name.as_bytes())];
     for (commands, objects) in [(created, &objects), (updated, &more)] {
       let pushing = request(&commands, CAPABILITIES, &pack_of_objects(objects));
-      // A push a poll of the shard, as a client's push is its own task.
-      let answered = crate::daemon::observe_first(&daemon, move |state| {
-        reasons(&pushed(state, repository, &pushing))
-      });
+      // A push a task of the shard, as a client's push is its own task.
+      let answered = reasons(&pushed_on(&daemon, repository, &pushing));
       if answered != [b"ok".to_vec()] {
         refused.push(k);
       }
@@ -1039,9 +1163,9 @@ const PACED_TURNS: u64 = 8;
 #[test]
 fn t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let paced = git_repository_on(&daemon, "paced");
-  let (repository, before) =
-    crate::daemon::observe_first(&daemon, move |state| push_paced_line(state, paced));
+  let repository = git_repository_on(&daemon, "paced");
+  paced_line_pushed_on(&daemon, repository);
+  let before = crate::daemon::observe_first(&daemon, derive_counts);
   let paced = derived_for_read(&daemon, repository);
   let after = crate::daemon::observe_first(&daemon, derive_counts);
   daemon.stop();
@@ -1060,17 +1184,10 @@ fn derive_counts(state: &mut ShardState) -> DeriveCounts {
 
 /// A line of [`PACED_HISTORY`] commits pushed as one create to `repository`: the repository and the counts before its
 /// derivation.
-fn push_paced_line(
-  state: &mut ShardState,
-  repository: RepositoryId,
-) -> (RepositoryId, DeriveCounts) {
-  let (repository, _) = paced_line_pushed(state, repository);
-  (repository, derive_counts(state))
-}
 
 /// A line of [`PACED_HISTORY`] commits pushed as one create to `repository`, made beforehand from the test's thread
 /// ([`git_repository_on`]): the repository and the pack it landed.
-fn paced_line_pushed(state: &mut ShardState, repository: RepositoryId) -> (RepositoryId, Vec<u8>) {
+fn paced_line_pushed_on(daemon: &crate::Daemon, repository: RepositoryId) -> Vec<u8> {
   let mut objects = Vec::new();
   let mut parent = None;
   for at in 0..PACED_HISTORY {
@@ -1081,9 +1198,9 @@ fn paced_line_pushed(state: &mut ShardState, repository: RepositoryId) -> (Repos
   let head = parent.unwrap().to_string();
   let created = [("", head.as_str(), b"refs/heads/main".as_slice())];
   let pack = pack_of_objects(&objects);
-  let received = pushed(state, repository, &request(&created, CAPABILITIES, &pack));
+  let received = pushed_on(daemon, repository, &request(&created, CAPABILITIES, &pack));
   assert_eq!(reasons(&received), [b"ok".to_vec()]);
-  (repository, pack)
+  pack
 }
 
 /// The derivation's time and turns as this shard counted them.
@@ -1102,9 +1219,8 @@ fn derive_time(state: &mut ShardState) -> (u64, u64) {
 #[test]
 fn a_derivations_own_time_is_counted_and_a_call_with_nothing_due_counts_nothing() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let made = git_repository_on(&daemon, "derive-time");
-  let (repository, _) =
-    crate::daemon::observe_first(&daemon, move |state| paced_line_pushed(state, made));
+  let repository = git_repository_on(&daemon, "derive-time");
+  paced_line_pushed_on(&daemon, repository);
   let before = crate::daemon::observe_first(&daemon, derive_time);
   derived_for_read(&daemon, repository);
   let derived = crate::daemon::observe_first(&daemon, derive_time);
@@ -1241,9 +1357,7 @@ fn fetch_after_tagged_push(
     assert!(reasons(&created).iter().all(|reason| reason == b"ok"));
     read
   } else {
-    let said = crate::daemon::observe_first(daemon, move |state| {
-      reasons(&pushed(state, repository, &request))
-    });
+    let said = reasons(&pushed_on(daemon, repository, &request));
     assert!(said.iter().all(|reason| reason == b"ok"));
     read_on_the_shard(daemon, repository, None)
   };
@@ -1430,12 +1544,12 @@ fn brought_back_count(state: &ShardState) -> u64 {
 #[test]
 fn a_derivation_lets_go_the_windows_it_brought_back_once_it_ends() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let made = git_repository_on(&daemon, "derive-brought-back");
-  let (repository, windows, let_go_first) = crate::daemon::observe_first(&daemon, move |state| {
-    let (repository, pack) = paced_line_pushed(state, made);
+  let repository = git_repository_on(&daemon, "derive-brought-back");
+  let pack = paced_line_pushed_on(&daemon, repository);
+  let (windows, let_go_first) = crate::daemon::observe_first(&daemon, move |state| {
     let windows = let_go_by_hand(state, &pack);
     let held = held_of(state, &windows);
-    (repository, windows, held)
+    (windows, held)
   });
   let brought_before = crate::daemon::observe_first(&daemon, |state| brought_back_count(state));
   derived_for_read(&daemon, repository);
@@ -1674,46 +1788,48 @@ fn owed_of(green: &slates_merge::engine::Green) -> (u64, Option<Vec<u8>>) {
 /// same; making a recovered owing green over a restarted node's shares is the fleet test GAPS owes (A-812 (b)).
 #[test]
 fn t_p2_a_created_branch_and_tag_owe_one_push_across_a_replay_and_are_made_as_the_eager_create() {
-  on_stored_shard_with(["p2-oracle"], |state, [repository]| {
-    pushed_from_the_fixtures(state, repository, &["create", "update", "tag", "copy"]);
-    let second = vec![("text".to_owned(), text(true))];
-    for name in ["refs/tags/v1", "copy"] {
-      let green = state
-        .db
-        .partition()
-        .repositories()
-        .branch(repository, name)
-        .unwrap();
-      let live = owed_of(&state.greens.lend(&green).expect("the green"));
-      assert_eq!(
-        (live.0, live.1.is_some()),
-        (0, true),
-        "{name}: owes its push at its base"
-      );
-      let before = crate::verbs::replayed_green_for_test(state, green).unwrap();
-      assert_eq!(owed_of(&before), live, "{name}: replayed before it is made");
-      assert_eq!(
-        before
-          .deferred()
-          .map(slates_merge::push::DeferredPush::version),
-        Some(1),
-        "{name}: version 1 owed"
-      );
-      crate::green_ready::made_now(state, green);
-      let engine = state.greens.get(&green).expect("made");
-      let files: Vec<(String, Vec<u8>)> = engine
-        .files_bytes()
-        .map(|(path, bytes)| (path, bytes.to_vec()))
-        .collect();
-      assert_eq!(
-        (engine.head(), files),
-        (1, second.clone()),
-        "{name}: the eager create's"
-      );
-      drop(engine);
-      let after = crate::verbs::replayed_green_for_test(state, green).unwrap();
-      assert_eq!(owed_of(&after), live, "{name}: replayed after it is made");
-    }
+  on_stored_shard_awaited(["p2-oracle"], |[repository]| async move {
+    pushed_from_the_fixtures_awaited(repository, &["create", "update", "tag", "copy"]).await;
+    on_state(|state| {
+      let second = vec![("text".to_owned(), text(true))];
+      for name in ["refs/tags/v1", "copy"] {
+        let green = state
+          .db
+          .partition()
+          .repositories()
+          .branch(repository, name)
+          .unwrap();
+        let live = owed_of(&state.greens.lend(&green).expect("the green"));
+        assert_eq!(
+          (live.0, live.1.is_some()),
+          (0, true),
+          "{name}: owes its push at its base"
+        );
+        let before = crate::verbs::replayed_green_for_test(state, green).unwrap();
+        assert_eq!(owed_of(&before), live, "{name}: replayed before it is made");
+        assert_eq!(
+          before
+            .deferred()
+            .map(slates_merge::push::DeferredPush::version),
+          Some(1),
+          "{name}: version 1 owed"
+        );
+        crate::green_ready::made_now(state, green);
+        let engine = state.greens.get(&green).expect("made");
+        let files: Vec<(String, Vec<u8>)> = engine
+          .files_bytes()
+          .map(|(path, bytes)| (path, bytes.to_vec()))
+          .collect();
+        assert_eq!(
+          (engine.head(), files),
+          (1, second.clone()),
+          "{name}: the eager create's"
+        );
+        drop(engine);
+        let after = crate::verbs::replayed_green_for_test(state, green).unwrap();
+        assert_eq!(owed_of(&after), live, "{name}: replayed after it is made");
+      }
+    });
   });
 }
 
@@ -1730,21 +1846,23 @@ const INTERLEAVED: usize = 12;
 #[cfg(unix)]
 #[test]
 fn t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_append() {
-  let (outcomes, restaged) = on_stored_shard_with(["overtaken"], |state, [repository]| {
+  let (outcomes, restaged) = on_stored_shard_awaited(["overtaken"], |[repository]| async move {
     let pack = pack_of(scenario!("create").request);
-    let mut pushes: Vec<Option<ReceivePack>> = (0..INTERLEAVED)
-      .map(|k| {
-        let name = format!("refs/heads/p{k}");
-        let created = [("", FIRST, name.as_bytes())];
-        let body = request(&created, CAPABILITIES, pack);
-        let (_, mut push) = started(state, repository);
-        for piece in body.chunks(PIECE) {
-          push.input(state, piece).expect("taken");
-        }
-        push.end(state).expect("ended");
-        Some(push)
-      })
-      .collect();
+    let mut pushes: Vec<Option<ReceivePack>> = on_state(|state| {
+      (0..INTERLEAVED)
+        .map(|k| {
+          let name = format!("refs/heads/p{k}");
+          let created = [("", FIRST, name.as_bytes())];
+          let body = request(&created, CAPABILITIES, pack);
+          let (_, mut push) = started(state, repository);
+          for piece in body.chunks(PIECE) {
+            push.input(state, piece).expect("taken");
+          }
+          push.end(state).expect("ended");
+          Some(push)
+        })
+        .collect()
+    });
     let mut outcomes = vec![Vec::new(); INTERLEAVED];
     while pushes.iter().any(Option::is_some) {
       for (at, slot) in pushes.iter_mut().enumerate() {
@@ -1752,19 +1870,24 @@ fn t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_appen
           continue;
         };
         if let Answering::Answered(received) =
-          push.answer_step(state, &mut Vec::new()).expect("answered")
+          on_state(|state| push.answer_step(state, &mut Vec::new())).expect("answered")
         {
           outcomes[at] = reasons(&received);
-          *slot = None;
+          // Dropped where the state is lent, as a step drops it ([`pushed_awaited`]).
+          let done = slot.take();
+          on_state(|_| drop(done));
         } else {
-          carry_blocking(state, push);
+          slates_rt::futures::yield_now().await;
+          carry_awaited(push).await.expect("carried");
         }
       }
     }
-    let restaged = state
-      .vcs_stores
-      .git_ref(repository)
-      .map(|(_, git)| git.repository.counters().restaged);
+    let restaged = on_state(|state| {
+      state
+        .vcs_stores
+        .git_ref(repository)
+        .map(|(_, git)| git.repository.counters().restaged)
+    });
     (outcomes, restaged)
   });
   assert!(
@@ -2229,12 +2352,12 @@ pub(crate) fn create_of_file(blob: Vec<u8>) -> (Vec<u8>, ObjectId) {
 /// created.
 #[test]
 fn t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes() {
-  on_stored_shard_with(["large"], |state, [repository]| {
-    let (_, mut push) = started(state, repository);
+  on_stored_shard_awaited(["large"], |[repository]| async move {
+    let (_, mut push) = on_state(|state| started(state, repository));
     let (request, blob) = large_create(LARGE);
     let room = push.admission.left();
     for piece in request.chunks(LARGE / 16) {
-      push.input(state, piece).expect("taken");
+      on_state(|state| push.input(state, piece)).expect("taken");
     }
     let held = room - push.admission.left();
     let quarantined = push
@@ -2248,16 +2371,20 @@ fn t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes() {
       held < sent + (LARGE as u64) / 16,
       "the push holds {held} bytes of a {sent}-byte request"
     );
-    push.end(state).expect("ended");
+    on_state(|state| push.end(state)).expect("ended");
     let mut answer = Vec::new();
     let received = loop {
-      match push.answer_step(state, &mut answer).expect("answered") {
+      match on_state(|state| push.answer_step(state, &mut answer)).expect("answered") {
         Answering::Answered(received) => break *received,
-        Answering::Turned => carry_blocking(state, &mut push),
+        Answering::Turned => {
+          slates_rt::futures::yield_now().await;
+          carry_awaited(&mut push).await.expect("carried");
+        }
         #[cfg(unix)]
         Answering::Hook(_) => panic!("no hook is configured"),
       }
     };
+    dropped_in_a_step(push);
     assert_eq!(reasons(&received), [b"ok"]);
   });
 }
@@ -2268,45 +2395,48 @@ fn t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes() {
 /// principal named for all of them; the idle repository has no row.
 #[test]
 fn t_a724_a_repositorys_pushes_are_counted_on_its_own_usage_row() {
-  on_stored_shard_with(["pushed", "idle"], |state, [pushed_to, idle]| {
+  on_stored_shard_awaited(["pushed", "idle"], |[pushed_to, idle]| async move {
     let mut sent = 0u64;
     for (scenario, _) in chain() {
-      let (_, mut push) = started(state, pushed_to);
-      answered(state, &mut push, scenario.request);
+      let (_, mut push) = on_state(|state| started(state, pushed_to));
+      answered_awaited(&mut push, scenario.request).await;
+      dropped_in_a_step(push);
       sent += u64::try_from(scenario.request.len()).unwrap();
     }
     let pushes = u64::try_from(chain().len()).unwrap();
-    let usage = state
-      .vcs_usage
-      .usage(&pushed_to)
-      .expect("a row for the pushed repository");
-    assert_eq!(
-      (
-        usage.intake.begun,
-        usage.intake.answered,
-        usage.intake.bytes_in
-      ),
-      (pushes, pushes, sent)
-    );
-    assert!(
-      usage.intake.steps >= pushes,
-      "every push takes steps: {usage:?}"
-    );
-    assert!(
-      usage.intake.step_ns > 0,
-      "the steps took the shard's time: {usage:?}"
-    );
-    assert_eq!(usage.fetch, slates_vcs::WorkUsage::default());
-    let named: Vec<_> = usage
-      .principals()
-      .iter()
-      .map(|slot| (slot.principal.clone(), slot.count, slot.overstated))
-      .collect();
-    assert_eq!(named, vec![(owner(), pushes, 0)]);
-    assert!(
-      state.vcs_usage.usage(&idle).is_none(),
-      "the idle repository was counted"
-    );
+    on_state(|state| {
+      let usage = state
+        .vcs_usage
+        .usage(&pushed_to)
+        .expect("a row for the pushed repository");
+      assert_eq!(
+        (
+          usage.intake.begun,
+          usage.intake.answered,
+          usage.intake.bytes_in
+        ),
+        (pushes, pushes, sent)
+      );
+      assert!(
+        usage.intake.steps >= pushes,
+        "every push takes steps: {usage:?}"
+      );
+      assert!(
+        usage.intake.step_ns > 0,
+        "the steps took the shard's time: {usage:?}"
+      );
+      assert_eq!(usage.fetch, slates_vcs::WorkUsage::default());
+      let named: Vec<_> = usage
+        .principals()
+        .iter()
+        .map(|slot| (slot.principal.clone(), slot.count, slot.overstated))
+        .collect();
+      assert_eq!(named, vec![(owner(), pushes, 0)]);
+      assert!(
+        state.vcs_usage.usage(&idle).is_none(),
+        "the idle repository was counted"
+      );
+    });
   });
 }
 
@@ -2322,8 +2452,8 @@ const BRANCHES: usize = 40;
 #[cfg(unix)]
 #[test]
 fn t_a719_a_push_is_decided_a_command_a_step() {
-  on_stored_shard_with(["many"], |state, [repository]| {
-    let (_, mut push) = started(state, repository);
+  on_stored_shard_awaited(["many"], |[repository]| async move {
+    let (_, mut push) = on_state(|state| started(state, repository));
     let names: Vec<Vec<u8>> = (0..BRANCHES)
       .map(|branch| format!("refs/heads/b{branch}").into_bytes())
       .collect();
@@ -2334,23 +2464,25 @@ fn t_a719_a_push_is_decided_a_command_a_step() {
     let create = scenario!("create");
     let request = request(&commands, CAPABILITIES, pack_of(create.request));
     for piece in request.chunks(PIECE) {
-      push.input(state, piece).expect("taken");
+      on_state(|state| push.input(state, piece)).expect("taken");
     }
-    push.end(state).expect("ended");
+    on_state(|state| push.end(state)).expect("ended");
     let mut answer = Vec::new();
     let mut deciding = 0;
     let received = loop {
       let was_deciding = matches!(push.answer, super::AnswerState::Deciding(_));
-      match push.answer_step(state, &mut answer).expect("answered") {
+      match on_state(|state| push.answer_step(state, &mut answer)).expect("answered") {
         Answering::Answered(received) => break *received,
         Answering::Turned => {
           deciding += usize::from(was_deciding);
-          carry_blocking(state, &mut push);
+          slates_rt::futures::yield_now().await;
+          carry_awaited(&mut push).await.expect("carried");
         }
         #[cfg(unix)]
         Answering::Hook(_) => panic!("no hook is configured"),
       }
     };
+    dropped_in_a_step(push);
     let reasons = reasons(&received);
     assert_eq!(reasons.len(), BRANCHES);
     assert!(reasons.iter().all(|reason| reason == b"ok"), "{reasons:?}");
@@ -2369,15 +2501,14 @@ fn t_a719_a_push_is_decided_a_command_a_step() {
 /// its deltas (no input step resolved them), and its answer, made over turns, is the one git's own server gave.
 #[test]
 fn t_a724_a_pushs_waiting_deltas_resolve_in_its_answers_turns_never_in_an_input_step() {
-  on_stored_shard_with(["deferred"], |state, [repository]| {
+  on_stored_shard_awaited(["deferred"], |[repository]| async move {
     let mut chained = chain().into_iter();
     let (create, _) = chained.next().unwrap();
-    let (_, mut push) = started(state, repository);
-    answered(state, &mut push, create.request);
+    pushed_awaited(repository, create.request).await;
     let (update, _) = chained.next().unwrap();
-    let (_, mut push) = started(state, repository);
-    push.input(state, update.request).expect("taken");
-    push.end(state).expect("ended");
+    let (_, mut push) = on_state(|state| started(state, repository));
+    on_state(|state| push.input(state, update.request)).expect("taken");
+    on_state(|state| push.end(state)).expect("ended");
     assert!(
       push.session.is_resolving(),
       "the thin pack's deltas were resolved inside an input step"
@@ -2386,13 +2517,17 @@ fn t_a724_a_pushs_waiting_deltas_resolve_in_its_answers_turns_never_in_an_input_
     let mut turns = 0;
     let received = loop {
       turns += 1;
-      match push.answer_step(state, &mut answer).expect("answered") {
+      match on_state(|state| push.answer_step(state, &mut answer)).expect("answered") {
         Answering::Answered(received) => break received,
-        Answering::Turned => carry_blocking(state, &mut push),
+        Answering::Turned => {
+          slates_rt::futures::yield_now().await;
+          carry_awaited(&mut push).await.expect("carried");
+        }
         #[cfg(unix)]
         step @ Answering::Hook(_) => panic!("no hook runs here: {step:?}"),
       }
     };
+    dropped_in_a_step(push);
     assert!(turns >= 2, "resolved and checked in one step");
     assert_eq!(answer, gits_report(&update), "{}", update.name);
     assert!(reasons(&received).iter().all(|reason| reason == b"ok"));
@@ -2405,47 +2540,28 @@ fn t_a724_a_pushs_waiting_deltas_resolve_in_its_answers_turns_never_in_an_input_
 /// the live store holds no content the records would not, and the rebuilt none fewer.
 #[test]
 fn t_a727_a_plain_push_then_its_update_are_made_again_with_the_same_holders() {
-  on_stored_shard_with(["again"], |state, [repository]| {
-    pushed_from_the_fixtures(state, repository, &["create", "update"]);
-    let main = state
-      .db
-      .partition()
-      .repositories()
-      .branch(repository, "main")
-      .expect("main");
-    crate::vcs_store::tests::assert_made_again_whole(
-      state,
-      repository,
-      &[crate::vcs_store::green_key(main)],
-    );
+  on_stored_shard_awaited(["again"], |[repository]| async move {
+    pushed_from_the_fixtures_awaited(repository, &["create", "update"]).await;
+    on_state(|state| {
+      let main = state
+        .db
+        .partition()
+        .repositories()
+        .branch(repository, "main")
+        .expect("main");
+      crate::vcs_store::tests::assert_made_again_whole(
+        state,
+        repository,
+        &[crate::vcs_store::green_key(main)],
+      );
+    });
   });
 }
 
-/// The edge's carry as a test's synchronous driver stands in for it (C5 part 2b piece 2: a push whose homing no edge
-/// takes is refused): its names and pack kept for the region on this shard as their home keeps them
-/// (`crate::vcs_store::homes::keep_for_region`, the home's own step; a test's daemon is one node, and the crossing to
-/// other homes is held by the async drivers' tests, [`homed_drive`]), and its changeset landed on the node's store for
-/// real, from a thread of its own (`crate::test_store::land_answered_blocking`). Nothing to do where the push asked
-/// nothing.
-pub(crate) fn carry_blocking<P>(state: &mut ShardState, push: &mut ReceivePack<P>) {
-  // The shard's materializations run between the push's turns, as their tasks would (P2's door): a synchronous driver
-  // holds the shard, so a push waiting at the door for a green would otherwise wait forever.
-  crate::green_ready::make_building_now(state);
-  let Some(asked) = push.take_homing() else {
-    return;
-  };
-  // Allow-listed until git_push's tests carry a push in a task that awaits its landing (`test_store::
-  // SHARD_BLOCKING_ALLOWED`, w-git's to empty).
-  let carried =
-    crate::test_store::allowing_shard_blocking("git_push::tests::carry_blocking", || {
-      carried_blocking(state, asked)
-    });
-  push.homed(state, carried);
-}
-
-/// `carry` carried as [`carry_blocking`] stands in for the edge: content kept for the region on this shard as its home
-/// keeps it, a changeset landed on the node's store from a thread of its own. What a git commit the server makes is
-/// carried by in a test's synchronous driver too (`crate::vcs_store::commits::made_landing_now`).
+/// `carry` carried as a test's synchronous driver stands in for the edge (`vcs_store::commits::home_and_land_blocking`,
+/// allow-listed as w-hg's): content kept for the region on this shard as its home keeps it, a changeset landed on the
+/// node's store from a thread of its own. What a git commit the server makes is carried by in a test's synchronous
+/// driver too (`crate::vcs_store::commits::made_landing_now`).
 pub(crate) fn carried_blocking(state: &mut ShardState, carry: super::Carry) -> super::Carried {
   match carry {
     super::Carry::Home(bytes, owner) => {
@@ -2769,18 +2885,18 @@ fn tag_object(name: &str, (target, kind): (ObjectId, &str)) -> (ObjectId, Vec<u8
 #[test]
 fn t_a836_refs_naming_a_blob_and_tags_of_tags_are_taken_and_advertised() {
   use slates_git::object_name::{Kind, name_of};
-  on_stored_shard_with(["targets"], |state, [repository]| {
+  on_stored_shard_awaited(["targets"], |[repository]| async move {
     let (first, objects) = flat_commit(1, "first", None);
     let created = [("", first.to_string(), b"refs/heads/main".to_vec())];
     let created: Vec<(&str, &str, &[u8])> = created
       .iter()
       .map(|(old, new, name)| (*old, new.as_str(), name.as_slice()))
       .collect();
-    let received = pushed(
-      state,
+    let received = pushed_awaited(
       repository,
       &request(&created, CAPABILITIES, &pack_of_objects(&objects)),
-    );
+    )
+    .await;
     assert_eq!(reasons(&received), [b"ok"]);
     let key = b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n".to_vec();
     let blob = name_of(ObjectFormat::Sha1, Kind::Blob, &key).unwrap();
@@ -2804,42 +2920,44 @@ fn t_a836_refs_naming_a_blob_and_tags_of_tags_are_taken_and_advertised() {
       .zip(&ids)
       .map(|((_, name), id)| ("", id.as_str(), name.as_slice()))
       .collect();
-    let received = pushed(
-      state,
+    let received = pushed_awaited(
       repository,
       &request(&commands, CAPABILITIES, &pack_of_objects(&objects)),
-    );
-    let advertised = super::advertised_refs(state, repository);
-    assert_eq!(
-      reasons(&received),
-      [b"ok", b"ok", b"ok"],
-      "{:?}",
-      received.outcomes
-    );
-    for (id, name) in &named {
-      assert!(
-        advertised.contains(&(*id, name.clone())),
-        "{} not advertised at {id}: {advertised:?}",
-        String::from_utf8_lossy(name)
+    )
+    .await;
+    on_state(|state| {
+      let advertised = super::advertised_refs(state, repository);
+      assert_eq!(
+        reasons(&received),
+        [b"ok", b"ok", b"ok"],
+        "{:?}",
+        received.outcomes
       );
-    }
-    // Served as git serves them: `ls-refs` with `peel` names each tag's object peeled through every tag it names, and a
-    // fetch wanting the three answers a pack holding them and everything they reach.
-    let lines = tags_listed_peeled(state, repository);
-    for expected in [
-      format!("{blob} refs/tags/junio-gpg-pub"),
-      format!("{signed} refs/tags/signed-blob peeled:{blob}"),
-      format!("{rc} refs/tags/rc peeled:{first}"),
-    ] {
-      assert!(
-        lines.contains(&expected),
-        "{expected} not listed: {lines:?}"
-      );
-    }
-    let ids = fetched_ids(state, repository, &[blob, signed, rc]);
-    for id in [blob, signed, rc, inner, first] {
-      assert!(ids.contains(&id), "{id} not fetched: {ids:?}");
-    }
+      for (id, name) in &named {
+        assert!(
+          advertised.contains(&(*id, name.clone())),
+          "{} not advertised at {id}: {advertised:?}",
+          String::from_utf8_lossy(name)
+        );
+      }
+      // Served as git serves them: `ls-refs` with `peel` names each tag's object peeled through every tag it names, and a
+      // fetch wanting the three answers a pack holding them and everything they reach.
+      let lines = tags_listed_peeled(state, repository);
+      for expected in [
+        format!("{blob} refs/tags/junio-gpg-pub"),
+        format!("{signed} refs/tags/signed-blob peeled:{blob}"),
+        format!("{rc} refs/tags/rc peeled:{first}"),
+      ] {
+        assert!(
+          lines.contains(&expected),
+          "{expected} not listed: {lines:?}"
+        );
+      }
+      let ids = fetched_ids(state, repository, &[blob, signed, rc]);
+      for id in [blob, signed, rc, inner, first] {
+        assert!(ids.contains(&id), "{id} not fetched: {ids:?}");
+      }
+    });
   });
 }
 
@@ -2899,7 +3017,7 @@ const ENCODE_TURNS_BOUND: usize = 1 << 16;
 #[test]
 fn t_goal93_a_whole_clone_of_a_line_with_an_annotated_tag_of_every_commit_is_whole() {
   use slates_git::object_name::Kind;
-  on_stored_shard_with(["tagged-line"], |state, [repository]| {
+  on_stored_shard_awaited(["tagged-line"], |[repository]| async move {
     let mut objects = Vec::new();
     let mut commits = Vec::new();
     let mut parent = None;
@@ -2923,62 +3041,64 @@ fn t_goal93_a_whole_clone_of_a_line_with_an_annotated_tag_of_every_commit_is_who
       .zip(&ids)
       .map(|((_, name), id)| ("", id.as_str(), name.as_slice()))
       .collect();
-    let received = pushed(
-      state,
+    let received = pushed_awaited(
       repository,
       &request(&commands, CAPABILITIES, &pack_of_objects(&objects)),
-    );
+    )
+    .await;
     assert!(
       reasons(&received).iter().all(|reason| reason == b"ok"),
       "{:?}",
       received.outcomes
     );
-    use crate::vcs_store::upload::tests::{answered, fetch, pack_of};
-    let wants: Vec<ObjectId> = named.iter().map(|(id, _)| *id).collect();
-    let pushed_ids: std::collections::BTreeSet<ObjectId> = objects
-      .iter()
-      .map(|(kind, bytes)| {
-        slates_git::object_name::name_of(ObjectFormat::Sha1, *kind, bytes).unwrap()
-      })
-      .collect();
-    // Fetched as a fresh repository answers (nothing encoded yet), then from the versions' kept fragments (A-718), as a
-    // daemon serves a clone once its encoding has run.
-    for round in ["before the encoding", "from the kept fragments"] {
-      if round == "from the kept fragments" {
-        let mut turns = 0usize;
-        while crate::vcs_store::git_encode::turn(state, repository)
-          != crate::vcs_store::git_encode::Turned::Idle
-        {
-          turns += 1;
-          assert!(turns < ENCODE_TURNS_BOUND, "an encoding that never ended");
+    on_state(|state| {
+      use crate::vcs_store::upload::tests::{answered, fetch, pack_of};
+      let wants: Vec<ObjectId> = named.iter().map(|(id, _)| *id).collect();
+      let pushed_ids: std::collections::BTreeSet<ObjectId> = objects
+        .iter()
+        .map(|(kind, bytes)| {
+          slates_git::object_name::name_of(ObjectFormat::Sha1, *kind, bytes).unwrap()
+        })
+        .collect();
+      // Fetched as a fresh repository answers (nothing encoded yet), then from the versions' kept fragments (A-718), as a
+      // daemon serves a clone once its encoding has run.
+      for round in ["before the encoding", "from the kept fragments"] {
+        if round == "from the kept fragments" {
+          let mut turns = 0usize;
+          while crate::vcs_store::git_encode::turn(state, repository)
+            != crate::vcs_store::git_encode::Turned::Idle
+          {
+            turns += 1;
+            assert!(turns < ENCODE_TURNS_BOUND, "an encoding that never ended");
+          }
+          let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+          eprintln!(
+            "goal 93 tagged line: {} versions encoded in {turns} turns",
+            count(crate::vcs_store::git_encode::ENCODED)
+          );
         }
-        let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
-        eprintln!(
-          "goal 93 tagged line: {} versions encoded in {turns} turns",
-          count(crate::vcs_store::git_encode::ENCODED)
+        let fetched = answered(
+          state,
+          (repository, &owner()),
+          slates_git::upload::Asked::Request(&fetch(&wants, &[])),
+        );
+        assert_eq!(fetched.1, None, "the clone's fetch refused, {round}");
+        let unpacked = slates_git::unpack::read_whole(
+          &pack_of(&fetched.0),
+          ObjectFormat::Sha1,
+          &slates_git::unpack::NoIndex,
+          &mut slates_git::Admission::new(u64::MAX),
+        )
+        .unwrap_or_else(|refused| panic!("not a whole pack {round}: {refused:?}"));
+        let fetched_ids: std::collections::BTreeSet<ObjectId> =
+          unpacked.objects.iter().map(|object| object.id).collect();
+        assert_eq!(
+          (unpacked.objects.len(), &fetched_ids),
+          (pushed_ids.len(), &pushed_ids),
+          "the clone holds every object pushed, each once, {round}"
         );
       }
-      let fetched = answered(
-        state,
-        (repository, &owner()),
-        slates_git::upload::Asked::Request(&fetch(&wants, &[])),
-      );
-      assert_eq!(fetched.1, None, "the clone's fetch refused, {round}");
-      let unpacked = slates_git::unpack::read_whole(
-        &pack_of(&fetched.0),
-        ObjectFormat::Sha1,
-        &slates_git::unpack::NoIndex,
-        &mut slates_git::Admission::new(u64::MAX),
-      )
-      .unwrap_or_else(|refused| panic!("not a whole pack {round}: {refused:?}"));
-      let fetched_ids: std::collections::BTreeSet<ObjectId> =
-        unpacked.objects.iter().map(|object| object.id).collect();
-      assert_eq!(
-        (unpacked.objects.len(), &fetched_ids),
-        (pushed_ids.len(), &pushed_ids),
-        "the clone holds every object pushed, each once, {round}"
-      );
-    }
+    });
   });
 }
 
@@ -3021,9 +3141,7 @@ fn t_goal93_a_clone_answered_while_the_encoding_is_under_way_is_whole() {
   let pushing = request(&commands, CAPABILITIES, &pack_of_objects(&objects));
   // The push a poll of its own, as each round below is: the shard steps between them, as a daemon's does.
   let repository = git_repository_on(&daemon, "encoding-under-way");
-  let (repository, reasons_pushed) = crate::daemon::observe_first(&daemon, move |state| {
-    (repository, reasons(&pushed(state, repository, &pushing)))
-  });
+  let reasons_pushed = reasons(&pushed_on(&daemon, repository, &pushing));
   assert!(
     reasons_pushed.iter().all(|reason| reason == b"ok"),
     "{reasons_pushed:?}"
@@ -3084,7 +3202,7 @@ const ENCODING_TURNS_BETWEEN_FETCHES: usize = 1;
 /// each once: a fetch costs time, never its answer. Red before the fix: refused, the pack ended with git's abort words.
 #[test]
 fn t_goal93_a_clone_answered_before_its_reach_sets_are_derived_is_whole() {
-  on_stored_shard_with(["underived"], |state, [repository]| {
+  on_stored_shard_awaited(["underived"], |[repository]| async move {
     let mut objects = Vec::new();
     let mut parent = None;
     for at in 0..PACED_HISTORY {
@@ -3095,13 +3213,13 @@ fn t_goal93_a_clone_answered_before_its_reach_sets_are_derived_is_whole() {
     let head = parent.unwrap();
     let head_hex = head.to_string();
     let created = [("", head_hex.as_str(), b"refs/heads/main".as_slice())];
-    let received = pushed(
-      state,
+    let received = pushed_awaited(
       repository,
       &request(&created, CAPABILITIES, &pack_of_objects(&objects)),
-    );
+    )
+    .await;
     assert_eq!(reasons(&received), [b"ok".to_vec()]);
-    let fetched = fetched_ids(state, repository, &[head]);
+    let fetched = on_state(|state| fetched_ids(state, repository, &[head]));
     let set: std::collections::BTreeSet<ObjectId> = fetched.iter().copied().collect();
     let pushed_ids: std::collections::BTreeSet<ObjectId> = objects
       .iter()
@@ -3832,27 +3950,29 @@ fn pushed_v3_at(
 /// record (`LoggedChange::Objects`), the same bytes the repository's register keeps.
 #[test]
 fn t_a724_a_pushs_record_rides_its_repositorys_names_log() {
-  on_stored_shard_with(["shipped"], |state, [repository]| {
-    let _ = state.db.take_state_log_records();
-    pushed_from_the_fixtures(state, repository, &["create"]);
-    let records = state.db.take_state_log_records();
-    let carried: Vec<Vec<u8>> = records
-      .iter()
-      .filter(|record| {
-        record.repository == repository && record.log == slates_db::catalog::StateLog::Names
-      })
-      .flat_map(|record| record.changes.iter())
-      .filter_map(|change| match change {
-        slates_db::catalog::LoggedChange::Objects { record } => Some(record.clone()),
-        _ => None,
-      })
-      .collect();
-    let kept: Vec<Vec<u8>> = crate::vcs_store::tests::records(state, repository);
-    assert!(
-      !carried.is_empty(),
-      "no names record carried the push's record: {records:?}"
-    );
-    assert_eq!(carried, kept);
+  on_stored_shard_awaited(["shipped"], |[repository]| async move {
+    let _ = on_state(|state| state.db.take_state_log_records());
+    pushed_from_the_fixtures_awaited(repository, &["create"]).await;
+    on_state(|state| {
+      let records = state.db.take_state_log_records();
+      let carried: Vec<Vec<u8>> = records
+        .iter()
+        .filter(|record| {
+          record.repository == repository && record.log == slates_db::catalog::StateLog::Names
+        })
+        .flat_map(|record| record.changes.iter())
+        .filter_map(|change| match change {
+          slates_db::catalog::LoggedChange::Objects { record } => Some(record.clone()),
+          _ => None,
+        })
+        .collect();
+      let kept: Vec<Vec<u8>> = crate::vcs_store::tests::records(state, repository);
+      assert!(
+        !carried.is_empty(),
+        "no names record carried the push's record: {records:?}"
+      );
+      assert_eq!(carried, kept);
+    });
   });
 }
 
@@ -3992,7 +4112,7 @@ fn tagged_line() -> (
 /// trees and tags searched and encoded afresh, their whole entries passed over where the encoder would try a delta.
 #[test]
 fn t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie() {
-  on_stored_shard_with(["reused"], |state, [repository]| {
+  on_stored_shard_awaited(["reused"], |[repository]| async move {
     let (objects, named) = tagged_line();
     let pack = deltified_pack(&objects);
     let ids: Vec<String> = named.iter().map(|(id, _)| id.to_string()).collect();
@@ -4001,68 +4121,80 @@ fn t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie() {
       .zip(&ids)
       .map(|((_, name), id)| ("", id.as_str(), name.as_slice()))
       .collect();
-    let received = pushed(state, repository, &request(&commands, CAPABILITIES, &pack));
+    let received = pushed_awaited(repository, &request(&commands, CAPABILITIES, &pack)).await;
     assert!(
       reasons(&received).iter().all(|reason| reason == b"ok"),
       "{:?}",
       received.outcomes
     );
-    while crate::vcs_store::git_derive::turn(state, repository)
-      != crate::vcs_store::git_derive::Turned::Idle
-    {}
-    let wants: Vec<ObjectId> = named.iter().map(|(id, _)| *id).collect();
-    let fetch = crate::vcs_store::upload::tests::fetch(&wants, &[]);
-    let bound = pack.len() + objects.len() * REUSED_ENTRY_SLACK;
-    // Cloned before any version is encoded: every object from the stream's loose stage.
-    let (streamed, counted_streamed) =
-      crate::vcs_store::upload::tests::fetched_with_counters(state, (repository, &owner()), &fetch);
-    let streamed = crate::vcs_store::upload::tests::pack_of(&streamed);
-    eprintln!(
-      "A-859 before encoding: pushed pack {} bytes, clone pack {} bytes; {counted_streamed:?}",
-      pack.len(),
-      streamed.len()
-    );
-    assert!(
-      streamed.len() <= bound,
-      "the streamed clone's pack {} past {bound}",
-      streamed.len()
-    );
-    let deltas = u64::try_from(TAGGED_LINE - 1).unwrap();
-    assert_the_stream_sent_every_pushed_entry_as_it_lies(&counted_streamed, deltas, objects.len());
-    assert_whole_clone(&streamed, objects.len());
-    while crate::vcs_store::git_encode::turn(state, repository)
-      != crate::vcs_store::git_encode::Turned::Idle
-    {}
-    let (answer, counted) =
-      crate::vcs_store::upload::tests::fetched_with_counters(state, (repository, &owner()), &fetch);
-    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
-    let reused = (
-      count(crate::vcs_store::git_encode::REUSED_WHOLE),
-      count(crate::vcs_store::git_encode::REUSED_DELTAS),
-      count(crate::vcs_store::git_encode::REUSE_REFUSED),
-    );
-    let raw: usize = objects.iter().map(|(_, bytes)| bytes.len()).sum();
-    let clone = crate::vcs_store::upload::tests::pack_of(&answer);
-    eprintln!(
-      "A-859: pushed pack {} bytes, clone pack {} bytes, objects' raw {raw}; reused (whole, deltas, refused) {reused:?}; {counted:?}",
-      pack.len(),
-      clone.len()
-    );
-    assert!(
-      clone.len() <= bound,
-      "the clone's pack {} past {bound}",
-      clone.len()
-    );
-    assert!(
-      reused.0 > 0 && reused.1 == deltas && reused.2 == 0,
-      "{reused:?}"
-    );
-    assert_eq!(
-      reused.0 + reused.1,
-      u64::try_from(objects.len()).unwrap(),
-      "every pushed object kept as its entry lies, none encoded: {reused:?}"
-    );
-    assert_whole_clone(&clone, objects.len());
+    on_state(|state| {
+      while crate::vcs_store::git_derive::turn(state, repository)
+        != crate::vcs_store::git_derive::Turned::Idle
+      {}
+      let wants: Vec<ObjectId> = named.iter().map(|(id, _)| *id).collect();
+      let fetch = crate::vcs_store::upload::tests::fetch(&wants, &[]);
+      let bound = pack.len() + objects.len() * REUSED_ENTRY_SLACK;
+      // Cloned before any version is encoded: every object from the stream's loose stage.
+      let (streamed, counted_streamed) = crate::vcs_store::upload::tests::fetched_with_counters(
+        state,
+        (repository, &owner()),
+        &fetch,
+      );
+      let streamed = crate::vcs_store::upload::tests::pack_of(&streamed);
+      eprintln!(
+        "A-859 before encoding: pushed pack {} bytes, clone pack {} bytes; {counted_streamed:?}",
+        pack.len(),
+        streamed.len()
+      );
+      assert!(
+        streamed.len() <= bound,
+        "the streamed clone's pack {} past {bound}",
+        streamed.len()
+      );
+      let deltas = u64::try_from(TAGGED_LINE - 1).unwrap();
+      assert_the_stream_sent_every_pushed_entry_as_it_lies(
+        &counted_streamed,
+        deltas,
+        objects.len(),
+      );
+      assert_whole_clone(&streamed, objects.len());
+      while crate::vcs_store::git_encode::turn(state, repository)
+        != crate::vcs_store::git_encode::Turned::Idle
+      {}
+      let (answer, counted) = crate::vcs_store::upload::tests::fetched_with_counters(
+        state,
+        (repository, &owner()),
+        &fetch,
+      );
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      let reused = (
+        count(crate::vcs_store::git_encode::REUSED_WHOLE),
+        count(crate::vcs_store::git_encode::REUSED_DELTAS),
+        count(crate::vcs_store::git_encode::REUSE_REFUSED),
+      );
+      let raw: usize = objects.iter().map(|(_, bytes)| bytes.len()).sum();
+      let clone = crate::vcs_store::upload::tests::pack_of(&answer);
+      eprintln!(
+        "A-859: pushed pack {} bytes, clone pack {} bytes, objects' raw {raw}; reused (whole, deltas, refused) {reused:?}; {counted:?}",
+        pack.len(),
+        clone.len()
+      );
+      assert!(
+        clone.len() <= bound,
+        "the clone's pack {} past {bound}",
+        clone.len()
+      );
+      assert!(
+        reused.0 > 0 && reused.1 == deltas && reused.2 == 0,
+        "{reused:?}"
+      );
+      assert_eq!(
+        reused.0 + reused.1,
+        u64::try_from(objects.len()).unwrap(),
+        "every pushed object kept as its entry lies, none encoded: {reused:?}"
+      );
+      assert_whole_clone(&clone, objects.len());
+    });
   });
 }
 
@@ -4113,7 +4245,7 @@ const GROWING_FILES: usize = 8;
 #[test]
 fn t_a859_an_encoding_places_a_pushed_deltas_base_before_it() {
   use slates_git::object_name::{Kind, name_of};
-  on_stored_shard_with(["based"], |state, [repository]| {
+  on_stored_shard_awaited(["based"], |[repository]| async move {
     let blobs: Vec<Vec<u8>> = (0..GROWING_FILES)
       .map(|file| {
         (0..=file + 20)
@@ -4145,35 +4277,40 @@ fn t_a859_an_encoding_places_a_pushed_deltas_base_before_it() {
     let pack = deltified_pack(&objects);
     let id = commit_id.to_string();
     let commands: Vec<(&str, &str, &[u8])> = vec![("", id.as_str(), b"refs/heads/main")];
-    let received = pushed(state, repository, &request(&commands, CAPABILITIES, &pack));
+    let received = pushed_awaited(repository, &request(&commands, CAPABILITIES, &pack)).await;
     assert!(
       reasons(&received).iter().all(|reason| reason == b"ok"),
       "{:?}",
       received.outcomes
     );
-    while crate::vcs_store::git_derive::turn(state, repository)
-      != crate::vcs_store::git_derive::Turned::Idle
-    {}
-    while crate::vcs_store::git_encode::turn(state, repository)
-      != crate::vcs_store::git_encode::Turned::Idle
-    {}
-    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
-    let reused = (
-      count(crate::vcs_store::git_encode::REUSED_DELTAS),
-      count(crate::vcs_store::git_encode::REUSE_REFUSED),
-    );
-    assert_eq!(
-      reused,
-      (u64::try_from(GROWING_FILES - 1).unwrap(), 0),
-      "every pushed delta reused, none refused"
-    );
-    let fetch = crate::vcs_store::upload::tests::fetch(&[commit_id], &[]);
-    let (answer, _) =
-      crate::vcs_store::upload::tests::fetched_with_counters(state, (repository, &owner()), &fetch);
-    assert_whole_clone(
-      &crate::vcs_store::upload::tests::pack_of(&answer),
-      objects.len(),
-    );
+    on_state(|state| {
+      while crate::vcs_store::git_derive::turn(state, repository)
+        != crate::vcs_store::git_derive::Turned::Idle
+      {}
+      while crate::vcs_store::git_encode::turn(state, repository)
+        != crate::vcs_store::git_encode::Turned::Idle
+      {}
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      let reused = (
+        count(crate::vcs_store::git_encode::REUSED_DELTAS),
+        count(crate::vcs_store::git_encode::REUSE_REFUSED),
+      );
+      assert_eq!(
+        reused,
+        (u64::try_from(GROWING_FILES - 1).unwrap(), 0),
+        "every pushed delta reused, none refused"
+      );
+      let fetch = crate::vcs_store::upload::tests::fetch(&[commit_id], &[]);
+      let (answer, _) = crate::vcs_store::upload::tests::fetched_with_counters(
+        state,
+        (repository, &owner()),
+        &fetch,
+      );
+      assert_whole_clone(
+        &crate::vcs_store::upload::tests::pack_of(&answer),
+        objects.len(),
+      );
+    });
   });
 }
 
@@ -4546,7 +4683,7 @@ fn landing_counts_of_a_push_of_new_refs(
   name: &'static str,
   capabilities: &'static [u8],
 ) -> (Vec<Vec<u8>>, u64, u64) {
-  on_stored_shard_with([name], move |state, [repository]| {
+  on_stored_shard_awaited([name], move |[repository]| async move {
     let (head, objects) = flat_commit(1, "a tagged commit", None);
     let head = head.to_string();
     let refs: Vec<String> = (0..NEW_REFS).map(|at| format!("refs/tags/v{at}")).collect();
@@ -4554,17 +4691,19 @@ fn landing_counts_of_a_push_of_new_refs(
       .iter()
       .map(|name| ("", head.as_str(), name.as_bytes()))
       .collect();
-    let received = pushed(
-      state,
+    let received = pushed_awaited(
       repository,
       &request(&commands, capabilities, &pack_of_objects(&objects)),
-    );
-    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
-    (
-      reasons(&received),
-      count(crate::repository::push::LANDING_STEP_CREATES),
-      count(crate::repository::push::LANDING_STEP_NS),
     )
+    .await;
+    on_state(|state| {
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        reasons(&received),
+        count(crate::repository::push::LANDING_STEP_CREATES),
+        count(crate::repository::push::LANDING_STEP_NS),
+      )
+    })
   })
 }
 
@@ -4600,11 +4739,9 @@ fn a_derivation_brings_a_window_let_go_under_it_back_again_and_derives_the_same(
     git_repository_on(&daemon, "derive-plain"),
     git_repository_on(&daemon, "derive-forced"),
   );
-  let (plain, forced, windows) = crate::daemon::observe_first(&daemon, move |state| {
-    let (plain, _) = paced_line_pushed(state, plain);
-    let (forced, pack) = paced_line_pushed(state, forced);
-    (plain, forced, let_go_by_hand(state, &pack))
-  });
+  paced_line_pushed_on(&daemon, plain);
+  let pack = paced_line_pushed_on(&daemon, forced);
+  let windows = crate::daemon::observe_first(&daemon, move |state| let_go_by_hand(state, &pack));
   let counts = |daemon: &crate::Daemon| {
     crate::daemon::observe_first(daemon, |state| {
       (brought_back_count(state), derive_counts(state).1)
@@ -4680,16 +4817,16 @@ const NO_COMMIT_NAMES: &[u8] = b"holds files no commit names";
 #[test]
 fn t_a927_a_create_on_a_default_green_not_recovered_is_refused_naming_it() {
   let asked = ("given-up", VcsTool::Git, WireFormat::Sha1, "main");
-  let (received, green) = crate::test_store::audit_on_stored_shard_made(
-    (&owner(), asked),
-    |state, (repository, green)| {
-      let cause = slates_ipc::protocol::RecoveryCause::TakeoverIncomplete {
-        waited_on: "inputs".to_owned(),
-      };
-      state.unrecovered.insert(green, cause);
-      (pushed(state, repository, chain()[0].0.request), green)
-    },
-  );
+  let (received, green) = on_stored_shard_made_awaited(asked, |(repository, green)| async move {
+    let cause = slates_ipc::protocol::RecoveryCause::TakeoverIncomplete {
+      waited_on: "inputs".to_owned(),
+    };
+    on_state(|state| state.unrecovered.insert(green, cause));
+    (
+      pushed_awaited(repository, chain()[0].0.request).await,
+      green,
+    )
+  });
   let words = format!(
     "the default branch's green {} is not recovered here (TakeoverIncomplete)",
     hex_of(green)
@@ -4704,15 +4841,12 @@ fn t_a927_a_create_on_a_default_green_not_recovered_is_refused_naming_it() {
 #[test]
 fn t_a927_a_create_on_a_default_green_not_made_here_is_refused_to_retry() {
   let asked = ("unmade", VcsTool::Git, WireFormat::Sha1, "main");
-  let (received, green) = crate::test_store::audit_on_stored_shard_made(
-    (&owner(), asked),
-    |state, (repository, green)| {
-      let engine = state.greens.take_any(&green).expect("the green was made");
-      let received = pushed(state, repository, chain()[0].0.request);
-      state.greens.put_back_any(&green, engine);
-      (received, green)
-    },
-  );
+  let (received, green) = on_stored_shard_made_awaited(asked, |(repository, green)| async move {
+    let engine = on_state(|state| state.greens.take_any(&green).expect("the green was made"));
+    let received = pushed_awaited(repository, chain()[0].0.request).await;
+    on_state(|state| state.greens.put_back_any(&green, engine));
+    (received, green)
+  });
   let words = format!(
     "the default branch's green {} is not made here yet; retry",
     hex_of(green)
