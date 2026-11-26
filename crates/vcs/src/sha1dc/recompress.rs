@@ -159,6 +159,8 @@ pub(super) fn compress_and_check(ihv: &mut State, block: &[u8; BLOCK_LEN], ubc_m
       TestStep::T58 => recompress_58(&state_58, &perturbed),
       TestStep::T65 => recompress_65(&state_65, &perturbed),
     };
+    #[cfg(test)]
+    record_dv_candidate(bit, candidate);
     if candidate == *ihv {
       return true;
     }
@@ -192,6 +194,48 @@ pub(super) fn probe_unperturbed_recompress(
     recompress_58(&state_58, &w),
     recompress_65(&state_65, &w),
   )
+}
+
+#[cfg(test)]
+std::thread_local! {
+  /// Test-only observer collecting `(bit, candidate)` pairs evaluated inside [`compress_and_check`].
+  static DV_OBSERVER: core::cell::RefCell<Option<Vec<(u32, State)>>> =
+    const { core::cell::RefCell::new(None) };
+}
+
+/// Records one `(bit, candidate)` evaluation inside [`compress_and_check`] when a test observer is active.
+#[cfg(test)]
+fn record_dv_candidate(bit: u32, candidate: State) {
+  DV_OBSERVER.with(|slot| {
+    if let Some(log) = slot.borrow_mut().as_mut() {
+      log.push((bit, candidate));
+    }
+  });
+}
+
+/// Runs [`compress_and_check`] while recording every `(bit, candidate)` pair it evaluates, clearing the thread-local
+/// observer on exit or unwind.
+#[cfg(test)]
+pub(super) fn observe_compress_and_check(
+  ihv: &mut State,
+  block: &[u8; BLOCK_LEN],
+  ubc_mask: u32,
+) -> (bool, Vec<(u32, State)>) {
+  struct ResetObserver;
+  impl Drop for ResetObserver {
+    fn drop(&mut self) {
+      DV_OBSERVER.with(|slot| {
+        *slot.borrow_mut() = None;
+      });
+    }
+  }
+  DV_OBSERVER.with(|slot| {
+    *slot.borrow_mut() = Some(Vec::new());
+  });
+  let _guard = ResetObserver;
+  let hit = compress_and_check(ihv, block, ubc_mask);
+  let observed = DV_OBSERVER.with(|slot| slot.borrow_mut().take().unwrap_or_default());
+  (hit, observed)
 }
 
 /// Expands one 64-byte big-endian block into the full 80-word SHA-1 message schedule (FIPS 180-4 §6.1.2).

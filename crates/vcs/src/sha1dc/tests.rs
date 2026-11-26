@@ -371,6 +371,83 @@ fn unperturbed_recompress_58_and_65_rebuild_post_compression_state() {
   }
 }
 
+/// Verifies that `recompress::compress_and_check` evaluates every disturbance vector `0..32` on `(ihv, block)` and
+/// produces the bit-for-bit identical candidate state as `oracle::reference_dv_candidate`.
+fn assert_all_32_dvs_dispatched(step: usize, ihv: super::State, block: &[u8; BLOCK_LEN]) {
+  let ref_states = oracle::compress_states_ref(ihv, block);
+  let mut actual_ihv = ihv;
+  let (hit, observed) = recompress::observe_compress_and_check(&mut actual_ihv, block, u32::MAX);
+  assert!(!hit, "false-positive collision at step {step}");
+  assert_eq!(actual_ihv, ref_states.ihv, "ihv mismatch at step {step}");
+  assert_eq!(
+    observed.len(),
+    32,
+    "expected 32 DV evaluations at step {step}, got {}",
+    observed.len()
+  );
+
+  let mut seen_bits = 0u32;
+  for &(bit, candidate) in &observed {
+    assert!(bit < 32, "out-of-range DV bit {bit} at step {step}");
+    seen_bits |= 1u32 << bit;
+    let index = usize::try_from(bit).unwrap();
+    let expected_candidate = oracle::reference_dv_candidate(
+      index,
+      &ref_states.w,
+      &ref_states.state_58,
+      &ref_states.state_65,
+    );
+    assert_eq!(
+      candidate, expected_candidate,
+      "DV bit {bit} candidate mismatch at step {step}"
+    );
+  }
+  assert_eq!(
+    seen_bits,
+    u32::MAX,
+    "missing DV bits at step {step}: {:#010x}",
+    !seen_bits
+  );
+}
+
+/// A-893 (32-DV `compress_and_check` dispatch oracle): do run `recompress::compress_and_check` with `ubc_mask = !0`
+/// across seeded `(ihv, block)` pairs while observing every `(bit, candidate)` evaluated in the dispatch loop, and
+/// cross-check SHAttered-1's colliding block against `oracle::reference_dv_candidate`. Expect all 32 bits `0..32` to
+/// execute per block and every candidate to match the independent oracle bit-for-bit.
+#[test]
+fn compress_and_check_dispatches_all_32_disturbance_vectors_matching_oracle() {
+  let mut rng = SplitMix64(0xd150_a7c4_32d0_2026);
+  for step in 0..32usize {
+    let ihv = [
+      rng.next_u32(),
+      rng.next_u32(),
+      rng.next_u32(),
+      rng.next_u32(),
+      rng.next_u32(),
+    ];
+    let block = rng.next_block();
+    assert_all_32_dvs_dispatched(step, ihv, &block);
+  }
+
+  let mut state = super::INITIAL_STATE;
+  for chunk in SHATTERED_1[..256].chunks_exact(BLOCK_LEN) {
+    let block: &[u8; BLOCK_LEN] = chunk.try_into().unwrap();
+    oracle::compress_ref(&mut state, block);
+  }
+  let colliding_block: &[u8; BLOCK_LEN] = SHATTERED_1[256..320].try_into().unwrap();
+  let ref_states = oracle::compress_states_ref(state, colliding_block);
+  assert_eq!(
+    oracle::reference_dv_candidate(
+      27,
+      &ref_states.w,
+      &ref_states.state_58,
+      &ref_states.state_65
+    ),
+    ref_states.ihv,
+    "oracle reference_dv_candidate did not match SHAttered-1 block 5 at bit 27"
+  );
+}
+
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
 

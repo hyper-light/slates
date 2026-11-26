@@ -26859,8 +26859,9 @@ interleaved head-to-head stock results recorded in `BENCHMARKS.md`.
   - Initial full push of `git/git` (86,386 commits, 424,984 objects): `42.5s` vs stock `9.5s` (~75% of active CPU is
     mandatory single-shard pure-Rust SHA-1DC collision checking via `sha1-checked` + ~12% BLAKE3 content hashing, whereas
     stock `git index-pack` runs C SHA-1DC across all 18 cores). *(Updated 2026-11-25, A-892/A-893: multi-shard scatter
-    plus 8-lane SIMD UBC + hardware SHA-1DC in `slates_vcs::sha1dc` raised SHA-1DC throughput from `714 → 1,363 MB/s`,
-    post-remediation median `1,352 MB/s` / best `1,368 MB/s` at 240 KiB with zero `unsafe`.)*
+    plus 8-lane SIMD UBC + hardware SHA-1DC in `slates_vcs::sha1dc` raised single-threaded `sha1_ab` hash benchmark
+    throughput from `714 → 1,363 MB/s`, post-remediation median `1,352 MB/s` / best `1,368 MB/s` at 240 KiB with zero
+    `unsafe`.)*
   - Initial full push of `hg-src` (57,036 changesets): `48.3s` vs stock `9.7s` (BLAKE3 content hashing + manifest delta
     encoding + Mantle disk persistence in `slates-store`).
   - Single-host 10,000-socket simultaneous loopback blasts on macOS encounter host kernel `kern.ipc.somaxconn=128` SYN

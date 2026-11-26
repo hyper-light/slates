@@ -7,10 +7,11 @@
 //!    `update()` call (zero per-octet zeroing), expanding `W[16..65]` via tight `[u32; 8]` slice loops that LLVM
 //!    compiles to ARMv8.2 `ldp q` + `eor3.16b` + `add.4s` + `usra.4s` + `stp q` (13 instructions per 8 blocks).
 //! 2. **Table-driven SIMD Stage 1**: evaluates the 71 high-leverage equations grouped by bit shift (`(29,29)`, `(4,29)`,
-//!    `(6,6)`, `(1,6)`, `(1,1)`, `(2,7)`) so every group runs as a tight L1I-resident 8-lane NEON/SSE loop, dropping
-//!    per-block survival from 53% to ~6%.
-//! 3. **Guarded scalar Stage 2**: runs ONLY on individual lanes whose Stage 1 mask is non-zero (~6% of blocks),
-//!    testing each remaining group/single-DV equation behind `if mask & bits != 0`.
+//!    `(6,6)`, `(1,6)`, `(1,1)`, `(2,7)`) so every group runs as a tight L1I-resident 8-lane NEON/SSE loop, pruning
+//!    ~78% of uniform random blocks to zero mask (`~22.0%` survive into Stage 2).
+//! 3. **Guarded scalar Stage 2**: runs ONLY on individual lanes whose Stage 1 mask is non-zero (`~22.0%` of uniform
+//!    random blocks), testing each remaining group/single-DV equation behind `if mask & bits != 0` and reducing the
+//!    final non-zero `ubc_mask` rate to `4.74%` (`95.26%` zero-mask blocks proceed to hardware SHA-1).
 //!
 //! Because every UBC equation clears bits with bitwise AND, reordering equations between Stage 1 and Stage 2 produces
 //! the bit-for-bit identical 32-bit `ubc_mask` on every possible 64-byte block.

@@ -22,7 +22,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
            [--vcs-svn ADDRESS]                                 either role: serve svn:// (cleartext) at ADDRESS; loopback
                                                                alone unless --fleet
   profile  [--quick] [--json]                      measure and print the machine profile
-  version                                          print this binary's version (`slates VERSION`)
+  version  [--licenses]                            print this binary's version (`slates VERSION`), or third-party notices
   mcp [--instance NAME] [--http PORT]               serve the MCP tools (stdio, or loopback HTTP)
 
   volume create NAME (--bounded SIZE | --dynamic MAX) [--fold] [--locked] [--base DIR] [--json]
@@ -825,8 +825,11 @@ pub(crate) enum Command {
   Daemon(ProcessOptions),
   /// The profile.
   Profile(ProfileOptions),
-  /// The binary's version.
-  Version,
+  /// The binary's version, or bundled third-party software notices (`--licenses`).
+  Version {
+    /// Print bundled third-party software notices (`NOTICE`) instead of the version line.
+    licenses: bool,
+  },
   /// The MCP server (stdio, or Streamable HTTP on a loopback port).
   Mcp(McpOptions),
   /// A client verb.
@@ -920,6 +923,7 @@ const SWITCHES: &[&str] = &[
   "--apparmor-profile",
   "--hold",
   "--replace",
+  "--licenses",
 ];
 
 /// Takes the untouched command after `--` (`exec` and `run` share this boundary).
@@ -2261,8 +2265,13 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     }
     ["oci-runtime", runtime] => Ok(Command::OciRuntime((*runtime).to_owned())),
     ["version"] => {
-      taken.only(&NONE)?;
-      Ok(Command::Version)
+      taken.only(&Spec {
+        values: &[],
+        switches: &["--licenses"],
+      })?;
+      Ok(Command::Version {
+        licenses: taken.switch("--licenses"),
+      })
     }
     ["profile"] => {
       taken.only(&Spec {
@@ -4558,5 +4567,35 @@ mod tests {
     ] {
       assert_eq!(refusal(&line), expected, "{line}");
     }
+  }
+
+  /// A-893. Do: parse `version`, `version --licenses`, `version extra`, `version --licenses=yes`, and
+  /// `volume list --licenses`. Expect: `licenses` false by default, true with `--licenses`, extra words and inline
+  /// values refused as usage, and `--licenses` refused on unrelated verbs.
+  #[test]
+  fn version_accepts_optional_licenses_switch_and_refuses_misuse() {
+    assert_eq!(
+      parse(&args("version")),
+      Ok(Command::Version { licenses: false })
+    );
+    assert_eq!(
+      parse(&args("version --licenses")),
+      Ok(Command::Version { licenses: true })
+    );
+    assert_eq!(
+      parse(&args("version extra")),
+      Err(ParseError::Extra("extra".into()))
+    );
+    assert_eq!(
+      parse(&args("version --licenses=yes")),
+      Err(ParseError::BadValue {
+        what: "switch",
+        reason: "`--licenses` takes no value".into(),
+      })
+    );
+    assert_eq!(
+      parse(&args("volume list --licenses")),
+      Err(ParseError::UnknownFlag("--licenses".into()))
+    );
   }
 }

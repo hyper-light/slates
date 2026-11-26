@@ -52,6 +52,9 @@ const EXIT_UNAVAILABLE: u8 = 3;
 /// Format: the exit code when the anchor or the daemon itself failed; a daemon its own watchdog ends exits with it too
 /// (A-232), so it is the server's one constant.
 const EXIT_FAILED: u8 = slates_server::watchdog::FAILED_EXIT_CODE;
+/// Format: bundled third-party software notices and license text (`NOTICE`), emitted by `slates version --licenses`
+/// so single-binary release recipients receive required copyright and permission notices (A-893).
+const THIRD_PARTY_NOTICES: &str = include_str!("../../../NOTICE");
 
 /// Every allocation of the anchor, the daemon and the client: a large one mapped directly and unmapped when freed, so
 /// a freed large buffer returns to the OS at once (`slates_mem::large`, A-742); the rest the system's. An
@@ -97,8 +100,12 @@ fn main() -> ExitCode {
       slates_api::role::serve(&[], &slates_api::role::Role::Daemon(options)).map_err(Failure::from)
     }
     Command::Profile(options) => verbs::profile(&options),
-    Command::Version => {
+    Command::Version { licenses: false } => {
       slates_machine::out_line!("slates {}", env!("CARGO_PKG_VERSION"));
+      Ok(())
+    }
+    Command::Version { licenses: true } => {
+      slates_machine::out_line!("{}", THIRD_PARTY_NOTICES.trim_end_matches('\n'));
       Ok(())
     }
     Command::Mcp(options) => verbs::mcp(&options),

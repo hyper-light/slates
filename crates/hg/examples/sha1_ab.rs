@@ -1,10 +1,12 @@
-//! The node check's hash, A/B (main's ruling of 2026-11-21 05:12 (b)): w-perf's profile of hg-src's first push put
-//! about 26 s of the shard's 90.6 s in `node::check`, the collision-detecting SHA-1 (sha1dc, `sha1-checked`, configured
-//! as 7.2's binding configures it) over every pushed revision's whole text. This times, interleaved over `rounds`, each
-//! way of hashing a text-like corpus in pieces of a manifest's and a file revision's typical length, one hasher a piece
-//! as the intake hashes a revision: sha1dc as `node.rs` configures it; sha1dc with its detection off (software SHA-1);
-//! AWS-LC's SHA-1 (the CPU's SHA instructions); and AWS-LC's then sha1dc's, the hardware hash with the collision check
-//! beside it. Every way's digests are held equal to sha1dc's.
+//! The node check's hash, A/B (main's ruling of 2026-11-21 05:12 (b); updated for A-893): w-perf's profile of hg-src's
+//! first push put about 26 s of the shard's 90.6 s in `node::check`, the collision-detecting SHA-1 (previously
+//! `sha1-checked`, now `slates_vcs::sha1dc`, configured as Mercurial 7.2's binding configures it: detection on, safe
+//! hash off) over every pushed revision's whole text. This times, interleaved over `rounds`, five ways of hashing a
+//! text-like corpus in pieces of a manifest's and a file revision's typical length, one hasher a piece as the intake
+//! hashes a revision: `sha1-checked` (previous production baseline, detection on); `slates_vcs::sha1dc` (current
+//! `node.rs` implementation: 8-lane SIMD UBC + hardware SHA-1); `sha1-checked` with detection off (software SHA-1);
+//! AWS-LC's hardware SHA-1 (the CPU's SHA instructions without collision detection); and AWS-LC's hardware hash
+//! paired with `sha1-checked`'s collision check beside it. Every way's digests are held equal to `sha1-checked`'s.
 //!
 //! Command: `cargo run --release -p slates-hg --example sha1_ab -- <corpus MiB> <rounds>`.
 

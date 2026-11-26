@@ -43483,10 +43483,11 @@ Applied in the same change to:
   bytes that end before its NUL are not yet whole, and 32 bytes with no NUL are too long. The size is charged to the
   caller's admission before any content is read. Each refusal is typed and names where it stopped.
 - **The names.** SHA-1 through RustCrypto's `sha1-checked`, configured as git configures sha1dc (detection on, safe
-  hash off: `git_SHA1DCInit`). An input in which a block shows a known attack's disturbance is refused
-  (`CollisionAttack`) and named by its plain SHA-1, as `git_SHA1DCFinal`'s message names it. SHA-256 is hashed
-  through aws-lc-rs. `object-format`'s `sha1` and `sha256` map both ways, compared exactly as `hash_algo_by_name`
-  compares them.
+  hash off: `git_SHA1DCInit`) *(superseded in production by A-893's zero-`unsafe` `slates_vcs::sha1dc` paired with
+  RustCrypto `sha1 0.11.0`; `sha1-checked 0.10.0` remains a dev-dependency differential oracle)*. An input in which a
+  block shows a known attack's disturbance is refused (`CollisionAttack`) and named by its plain SHA-1, as
+  `git_SHA1DCFinal`'s message names it. SHA-256 is hashed through aws-lc-rs. `object-format`'s `sha1` and `sha256`
+  map both ways, compared exactly as `hash_algo_by_name` compares them.
 - **The dependency.** Main approved `sha1-checked` on three conditions, each checked here:
   - it is RustCrypto's (authors "RustCrypto Developers", repository RustCrypto/hashes);
   - it is pure Rust (`sha1`, `digest`, no C);
@@ -62691,27 +62692,33 @@ Applied in the same change to: §4.4's taxonomy, GAPS (C2's owed (b)), `crates/i
     manifests at `4.74%`/block); 4-lane `[u32; 4]` UBC (`924 MB/s`); `if`-branching Stage 1 (breaks LLVM SLP
     auto-vectorization); raw NEON intrinsics without `unsafe` (`E0133`).
 - **Updated approval basis, dependencies & upstream notices:**
+  - Authorized by Ada Lundhe (2026-11-26, Rev 4 / clamber program authorization).
   - Production crates (`slates-vcs`, `slates-git`, `slates-hg`) depend on RustCrypto `sha1 0.11.0`
     (`default-features = false`, no `std`, no OID tables) for vetted hardware block compression; collision detection
     is in-house zero-`unsafe` Rust held bit-for-bit against both `sha1-checked 0.10.0` (retained as dev-dependency
     oracle in `slates-vcs` and `slates-hg`) and an in-tree 32-DV reference oracle (`crates/vcs/src/sha1dc/oracle.rs`).
   - Workspace lockfile additions: `sha1 0.11.0`, `digest 0.11.3`, `block-buffer 0.12.1`, `crypto-common 0.2.2`,
-    `hybrid-array 0.4.15`, `cpufeatures 0.3.1`.
+    `hybrid-array 0.4.15` (`cpufeatures 0.3.1` was already present in `Cargo.lock` and is reused by `sha1 0.11.0`).
   - Verbatim Marc Stevens & Dan Shumow (2017) MIT copyright and permission notice (`cr-marcstevens/sha1collisiondetection`)
-    bundled in `NOTICE` and `crates/vcs/src/sha1dc/{mod,ubc,recompress,oracle}.rs`; RustCrypto `sha1-checked 0.10.0`
-    MIT/Apache-2.0 attribution in `NOTICE` and `crates/vcs/src/sha1dc/oracle.rs`.
+    bundled in `NOTICE`, `crates/vcs/src/sha1dc/{mod,ubc,recompress,oracle}.rs`, and embedded in the `slates` executable
+    via `slates version --licenses` (`crates/cli/src/main.rs`) so single-binary release recipients receive the notice;
+    RustCrypto `sha1-checked 0.10.0` MIT/Apache-2.0 attribution in `NOTICE` and `crates/vcs/src/sha1dc/oracle.rs`.
 - **Verification:**
-  - `cargo test --offline -p slates-vcs --lib sha1dc`: 8/8 passing (0.33s), covering all 32 `DVS[0..32]` `dm[80]` and
-    `T58`/`T65` entries against `oracle::SHA1_DVS`, full `check_one`/`check_octet` vs `oracle::ubc_check` across
-    structured edge blocks (`0x00`, `0xff`, 1,024 single-bit blocks) and seeded random blocks with all 32 mask bits
-    non-vacuously observed (`seen == u32::MAX`; mutation-checked by dropping `DV_I_43_0`), unperturbed
-    `recompress_58`/`recompress_65` and Miri scalar `compress_block` parity, SHAttered-1/2 prefixes and `>= 512`-byte
-    extensions (`576 B`, `1,024 B`) driving `process_octets` (`octet_batches >= 1`), and proptest chunk splits against
-    `sha1-checked`.
-  - `cargo test --offline -p slates-git --lib object_name`: 8/8; `cargo test --offline -p slates-hg --lib node`: 22/22.
+  - `cargo test --offline -p slates-vcs --lib sha1dc`: 9/9 passing, covering all 32 `DVS[0..32]` `dm[80]` and
+    `T58`/`T65` entries against `oracle::SHA1_DVS`, full `recompress::compress_and_check` 32-DV dispatch observation
+    against `oracle::reference_dv_candidate` (mutation-checked against skipping 31/32 DVs and routing `T58` to
+    `state_65`), full `check_one`/`check_octet` vs `oracle::ubc_check` across structured edge blocks (`0x00`, `0xff`,
+    1,024 single-bit blocks) and seeded random blocks with all 32 mask bits non-vacuously observed (`seen == u32::MAX`;
+    mutation-checked by dropping `DV_I_43_0`), unperturbed `recompress_58`/`recompress_65` and Miri scalar
+    `compress_block` parity, SHAttered-1/2 prefixes and `>= 512`-byte extensions (`576 B`, `1,024 B`) driving
+    `process_octets` (`octet_batches >= 1`), and proptest chunk splits against `sha1-checked`.
+  - `cargo test --offline -p slates-git --lib object_name`: 8/8; `cargo test --offline -p slates-hg --lib node`: 22/22;
+    `cargo test --offline -p slates-cli --test cli the_binary_names_its_version` (verifying `slates version`,
+    `slates version --licenses`, and exit-2 usage refusal on extra args).
   - `slates-hg/examples/sha1_ab.rs` handles `CollisionAttack` explicitly instead of panicking on `.unwrap()`.
 - **Applied in the same change to:** `Cargo.toml`, `Cargo.lock`, `NOTICE`,
   `crates/vcs/{Cargo.toml,src/{lib.rs,sha1dc/{mod,ubc,recompress,oracle,tests}.rs}}`,
   `crates/git/{Cargo.toml,src/object_name.rs}`,
   `crates/hg/{Cargo.toml,src/{node.rs,push/intake_batch.rs},examples/sha1_ab.rs}`,
+  `crates/cli/{src/{args,main}.rs,tests/cli.rs}`,
   `docs/wip/{SLATES_DESIGN.md,GAPS.md}`.

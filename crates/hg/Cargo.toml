@@ -31,7 +31,8 @@ slates-mem = { workspace = true }
 proptest = { workspace = true }
 # The changeset A/B example (examples/changeset_ab.rs): a landed log's segments in LZ4.
 lz4_flex = { workspace = true }
-# The node-hash A/B example (examples/sha1_ab.rs): hardware SHA-1 beside the collision-detecting one the node check uses.
+# The node-hash A/B example (examples/sha1_ab.rs) and differential oracle: AWS-LC hardware SHA-1 and previous
+# `sha1-checked` baseline beside `node.rs`'s `slates_vcs::sha1dc` (A-893).
 aws-lc-rs = { workspace = true }
 sha1-checked = { workspace = true }
 

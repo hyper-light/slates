@@ -1,9 +1,9 @@
-//! Independent test-only reference oracle for Marc Stevens's 32 SHA-1 disturbance vectors, `ubc_check`, and
-//! FIPS 180-4 SHA-1 schedule expansion and compression (A-893).
+//! Independent test-only reference oracle for Marc Stevens's 32 SHA-1 disturbance vectors, `ubc_check`,
+//! recompression, and FIPS 180-4 SHA-1 schedule expansion and compression (A-893).
 //!
-//! Adapted directly from RustCrypto's `sha1-checked` 0.10.0 (`src/ubc_check.rs`, where the module is crate-private),
-//! which translates Marc Stevens & Dan Shumow's `cr-marcstevens/sha1collisiondetection` (`lib/ubc_check.c`, generated
-//! from `tools/data/3565`). Compiled only under `#[cfg(test)]`.
+//! Adapted directly from RustCrypto's `sha1-checked` 0.10.0 (`src/ubc_check.rs` and `src/compress.rs:645`, where
+//! both modules are crate-private), which translates Marc Stevens & Dan Shumow's `cr-marcstevens/sha1collisiondetection`
+//! (`lib/ubc_check.c`, `lib/sha1.c`, generated from `tools/data/3565`). Compiled only under `#[cfg(test)]`.
 //!
 //! ```text
 //! MIT License
@@ -819,34 +819,129 @@ pub(super) fn expand_ref(block: &[u8; 64]) -> [u32; 80] {
   w
 }
 
+/// Independent FIPS 180-4 §4.1.1/§4.2.1 round boolean function and constant for step `t`.
+fn round_fk(t: usize, b: u32, c: u32, d: u32) -> (u32, u32) {
+  match t {
+    0..=19 => ((b & c) | (!b & d), 0x5a82_7999u32),
+    20..=39 => (b ^ c ^ d, 0x6ed9_eba1u32),
+    40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdcu32),
+    _ => (b ^ c ^ d, 0xca62_c1d6u32),
+  }
+}
+
+/// Advances canonical FIPS 180-4 SHA-1 state `[a, b, c, d, e]` forward by one round `t`.
+fn step_forward(state: [u32; 5], t: usize, word: u32) -> [u32; 5] {
+  let [a, b, c, d, e] = state;
+  let (f, k) = round_fk(t, b, c, d);
+  let next = a
+    .rotate_left(5)
+    .wrapping_add(f)
+    .wrapping_add(e)
+    .wrapping_add(k)
+    .wrapping_add(word);
+  [next, a, b.rotate_left(30), c, d]
+}
+
+/// Inverts one canonical FIPS 180-4 SHA-1 round `t` from `[a_next, a, b_rot, c, d]` back to `[a, b, c, d, e]`.
+fn step_backward(state: [u32; 5], t: usize, word: u32) -> [u32; 5] {
+  let [next, a, b_rot, c, d] = state;
+  let b = b_rot.rotate_right(30);
+  let (f, k) = round_fk(t, b, c, d);
+  let e = next.wrapping_sub(
+    a.rotate_left(5)
+      .wrapping_add(f)
+      .wrapping_add(k)
+      .wrapping_add(word),
+  );
+  [a, b, c, d, e]
+}
+
+/// Independent FIPS 180-4 single-block compression output alongside the expanded schedule and Stevens states.
+pub(super) struct RefStates {
+  /// Post-compression chaining state `H0..H4`.
+  pub(super) ihv: [u32; 5],
+  /// Full 80-word expanded SHA-1 message schedule `W[0..80]`.
+  pub(super) w: [u32; 80],
+  /// Canonical state `[a, b, c, d, e]` immediately before round 58.
+  pub(super) state_58: [u32; 5],
+  /// Canonical state `[a, b, c, d, e]` immediately before round 65.
+  pub(super) state_65: [u32; 5],
+}
+
+/// Independent FIPS 180-4 §6.1.2 SHA-1 single-block compression returning post-compression `ihv`, `w`, `state_58`,
+/// and `state_65`.
+pub(super) fn compress_states_ref(ihv: [u32; 5], block: &[u8; 64]) -> RefStates {
+  let w = expand_ref(block);
+  let mut s = ihv;
+  let mut state_58 = [0u32; 5];
+  let mut state_65 = [0u32; 5];
+  for (t, &word) in w.iter().enumerate() {
+    if t == 58 {
+      state_58 = s;
+    }
+    if t == 65 {
+      state_65 = s;
+    }
+    s = step_forward(s, t, word);
+  }
+  RefStates {
+    ihv: [
+      ihv[0].wrapping_add(s[0]),
+      ihv[1].wrapping_add(s[1]),
+      ihv[2].wrapping_add(s[2]),
+      ihv[3].wrapping_add(s[3]),
+      ihv[4].wrapping_add(s[4]),
+    ],
+    w,
+    state_58,
+    state_65,
+  }
+}
+
 /// Independent FIPS 180-4 §6.1.2 SHA-1 single-block compression.
 pub(super) fn compress_ref(ihv: &mut [u32; 5], block: &[u8; 64]) {
-  let w = expand_ref(block);
-  let [mut a, mut b, mut c, mut d, mut e] = *ihv;
-  for (t, &word) in w.iter().enumerate() {
-    let (f, k) = match t {
-      0..=19 => ((b & c) | (!b & d), 0x5a82_7999u32),
-      20..=39 => (b ^ c ^ d, 0x6ed9_eba1u32),
-      40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdcu32),
-      _ => (b ^ c ^ d, 0xca62_c1d6u32),
-    };
-    let next = a
-      .rotate_left(5)
-      .wrapping_add(f)
-      .wrapping_add(e)
-      .wrapping_add(k)
-      .wrapping_add(word);
-    e = d;
-    d = c;
-    c = b.rotate_left(30);
-    b = a;
-    a = next;
+  *ihv = compress_states_ref(*ihv, block).ihv;
+}
+
+/// Independent reference Marc Stevens recompression from `step` (`58` or `65`), adapted in canonical FIPS 180-4
+/// state order from `sha1-checked` 0.10.0 `src/compress.rs:645`.
+fn recompression_step(step: usize, me2: &[u32; 80], state: &[u32; 5]) -> [u32; 5] {
+  let mut ihv_in = *state;
+  for (t, &word) in me2[..step].iter().enumerate().rev() {
+    ihv_in = step_backward(ihv_in, t, word);
   }
-  ihv[0] = ihv[0].wrapping_add(a);
-  ihv[1] = ihv[1].wrapping_add(b);
-  ihv[2] = ihv[2].wrapping_add(c);
-  ihv[3] = ihv[3].wrapping_add(d);
-  ihv[4] = ihv[4].wrapping_add(e);
+  let mut fwd = *state;
+  for (t, &word) in me2.iter().enumerate().skip(step) {
+    fwd = step_forward(fwd, t, word);
+  }
+  [
+    ihv_in[0].wrapping_add(fwd[0]),
+    ihv_in[1].wrapping_add(fwd[1]),
+    ihv_in[2].wrapping_add(fwd[2]),
+    ihv_in[3].wrapping_add(fwd[3]),
+    ihv_in[4].wrapping_add(fwd[4]),
+  ]
+}
+
+/// Independent reference recompression candidate for disturbance vector `bit` (`0..32`), computing
+/// `me2 = w ^ SHA1_DVS[bit].dm` and running [`recompression_step`] from `state_58` (`T58`) or `state_65` (`T65`).
+pub(super) fn reference_dv_candidate(
+  bit: usize,
+  w: &[u32; 80],
+  state_58: &[u32; 5],
+  state_65: &[u32; 5],
+) -> [u32; 5] {
+  let info = &SHA1_DVS[bit];
+  let mut me2 = [0u32; 80];
+  for ((dst, &orig), &diff) in me2.iter_mut().zip(w).zip(&info.dm) {
+    *dst = orig ^ diff;
+  }
+  let (step, state) = match info.test_step {
+    58 => (58usize, state_58),
+    65 => (65usize, state_65),
+    other => panic!("unexpected test_step {other} for DV bit {bit}"),
+  };
+  recompression_step(step, &me2, state)
 }
 
 /// Clears `bit` in `mask` if any condition in `failed` holds.

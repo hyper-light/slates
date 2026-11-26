@@ -19,8 +19,8 @@
 //!    filters into 128-bit SIMD.
 //! 2. Contiguous zero-mask runs (95.26% of blocks, averaging ~20 blocks / ~1.3 KiB per run so data stays L1-hot) feed
 //!    directly into `sha1::block_api::compress` (RustCrypto `sha1 0.11.0`), which dispatches at run time to ARMv8
-//!    `vsha1c/p/m/su0/su1`, x86 SHA-NI, or scalar fallback (paired under `#[cfg(miri)]` with canonical scalar
-//!    [`recompress::compress_block`] because Miri does not emulate `llvm.aarch64.crypto.sha1h`).
+//!    `vsha1c/p/m/su0/su1`, x86 SHA-NI, or scalar fallback (paired under `#[cfg(miri)]` via [`compress_clean_blocks`]
+//!    with canonical scalar `recompress::compress_block` because Miri does not emulate `llvm.aarch64.crypto.sha1h`).
 //! 3. Only the 4.74% of single blocks with `ubc_mask != 0` run [`recompress::compress_and_check`] starting from
 //!    the exact incoming chaining state `ihv`, capturing rounds 58 and 65 and running Stevens's backward/forward
 //!    recompression for each set bit in `ubc_mask`.
