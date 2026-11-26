@@ -112,6 +112,18 @@
 > `a_status_requests_sweep_completes_within_its_bound_under_load` and
 > `a_fresh_daemons_sweep_walks_what_its_marks_cover_not_its_unwritten_journal`. OWED, A-926 part 2: the segment's log
 > and snapshot regions (3,495,255 pages, the register's format) get marks too.
+> A-926 part 1's sibling red, fixed (w-hg, 2026-11-26, main's order; w-perf held on a permission prompt):
+> `idle_sweep::tests::a_pass_cut_short_at_each_start_settles_in_that_pass_at_the_shards_idle_points` failed 20 of 20
+> from 3aa1ad9e8 (main's bisect: b2af92cae 3 of 3 green), "resumed 0". The product was right; the test's premise was
+> not: it took its give-back work from what a fresh daemon leaves, and with the marks a fresh daemon leaves two journal
+> pages, one step, so the poller had no step to cut. Its work is now its own, made at the start in the poller's step:
+> 32 files written and every other one freed, 16 free runs no free coalesces, each four times the size the arena purges
+> from (`discard_from_bytes`, derived from the host), a run a give-back step. It holds: the give-back took 17 steps, cut
+> once by the poller and resumed once at the shard's idle points in that pass, settling the shard (left and resumed
+> both 1). With the poller removed the same 17 steps run, left 0 and resumed 0
+> (`~/.local/state/w-hg-logs/2026-11-26-idle-sweep-no-poller.txt`), so the count is not vacuous. Its old
+> `started == 1` could not hold: written files take their sealing and busy passes first (4 started), so it counts the
+> one cut and its one resume instead, which a give-back left for later passes would exceed.
 
 > **Open (w-shared, 2026-11-21; closed by A-826 when it lands): a holder-route submit of 320 MiB and above does not
 > complete under load.** Its `SubmitComputed` carried the whole increment over the forward lane; on a loaded machine
@@ -641,10 +653,12 @@
 > (`docs/bugs/2026-11-20-a-shards-idle-spin-took-a-clients-kick.md`).
 
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
-> the landing's entry are sliced (A-920 pieces 1-6b), and the checkpoint's identity fold takes at most the step ceiling a
+> the landing's entry are sliced (A-920 pieces 1-6b, 7a), and the checkpoint's identity fold takes at most the step ceiling a
 > turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history
 > task (debug, 9,000 files): the tail's `fold_to_readers` (7.6 ms), the register's op
-> (`publish_held_increments` and `record_all`, 8 ms), and a turn (19 ms); its longest landing poll 28-76 ms a run. Owed:
+> (`publish_held_increments` and `record_all`, 8 ms), and a turn's close (`close_revision`, 20.4 ms whole; A-920 7b
+> next; its parse is an event a unit since 7a, a 68 KB slice a call having been 3.9-5.3 ms); its longest landing poll
+> 28-76 ms a run. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
 > files): `made_commit.rs` (two calls), `vcs_store/svn_made.rs`, `vcs_store/hg_made.rs`, `greens.rs`'s own caller. A

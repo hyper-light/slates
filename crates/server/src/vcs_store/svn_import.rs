@@ -331,6 +331,13 @@ fn takes_import(state: &ShardState, id: RepositoryId) -> Result<(), LoadFailed> 
   Ok(())
 }
 
+/// Counter: an import call stopped after a whole event with its turn's slice spent ([`Importer::import_within`], A-920
+/// 7a): many a wide revision shows its parse was taken an event at a time, never a copy slice of bytes a call. Format: a
+/// counter name in the daemon's status report.
+///
+/// [`Importer::import_within`]: slates_svn::migration::Importer::import_within
+pub(crate) const IMPORT_PAUSES: &str = "vcs_store.svn_import.pauses";
+
 /// One turn of repository `id`'s import (the module doc): units until the turn's time is spent, at least one. `More`
 /// while there is more, what the import holds then charged; at the stream's end what it did; refused, why. Ended either
 /// way, what it held is given back and its file closed. `None` when no import of `id` is under way.
@@ -349,8 +356,9 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Option<Result<Tu
   state.count(TURNS, 1);
   let began = slates_rt::futures::now_ns();
   let spend = state.config.copy_slice_ns();
+  let deadline = began.saturating_add(spend);
   let outcome = loop {
-    match unit(state, id, &mut importing) {
+    match unit(state, id, &mut importing, deadline) {
       Ok(Unit::More) if slates_rt::futures::now_ns().saturating_sub(began) < spend => {}
       // A record handed over ends the turn: it lands before the import reads on ([`land_owed`]).
       Ok(Unit::More | Unit::Owed) => {
@@ -389,6 +397,7 @@ fn unit(
   state: &mut ShardState,
   id: RepositoryId,
   importing: &mut Importing,
+  deadline: u64,
 ) -> Result<Unit, LoadFailed> {
   let slice = usize::try_from(state.config.copy_slice_bytes()).unwrap_or(usize::MAX);
   importing.fill(slice)?;
@@ -407,11 +416,17 @@ fn unit(
       ..
     } = &mut *importing;
     let sink = texts::InStore::new(texts, store);
-    Ok(importer.import(records, &sink, buffer, *ended))
+    // An event a unit within the turn's slice: the call stops after a whole event once its slice is spent (A-920 7a).
+    let mut spent = || slates_rt::futures::now_ns() >= deadline;
+    Ok(importer.import_within((records, &sink), (buffer, *ended), &mut spent))
   });
   crate::vcs_store::settle_svn(state, id);
   match answer? {
     Ok(Imported::NeedMore { consumed, needed }) => {
+      // Stopped with its slice spent, none more needed (A-920 7a): counted.
+      if needed == 0 {
+        state.count(IMPORT_PAUSES, 1);
+      }
       importing.consume(consumed);
       importing.needed = needed;
       Ok(Unit::More)

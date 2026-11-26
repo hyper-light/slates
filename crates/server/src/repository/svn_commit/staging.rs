@@ -1565,26 +1565,57 @@ impl Staging {
     principal: &Principal,
     cause: Flush,
   ) -> Option<Result<usize, Uncommitted>> {
-    let repository = self.repository;
-    let place = crate::state::with_state(|state| landing::landing_place(state, repository))?;
-    let (disk, sequence) = match place {
-      Ok(place) => place,
+    let revisions = self.records.len();
+    let (mut recorded, timings) = match self.recorded(principal).await? {
+      Ok(recorded) => recorded,
       Err(refused) => {
         let _ = crate::state::with_state(|state| self.abandon(state));
         return Some(Err(refused));
       }
     };
-    let revisions = self.records.len();
+    self.applied(&mut recorded, cause, timings).await?;
+    #[cfg(test)]
+    kill_at_stage_where_set(LandStage::Landed).await;
+    Some(Ok(revisions))
+  }
+
+  /// The landing's changeset made durable, its texts and scratch member let go and its register entry recorded
+  /// ([`Staging::land`]), with when the flush and the commit began. Refused, the refusal, for the caller to abandon the
+  /// batch on. None where the shard's state is gone.
+  async fn recorded(
+    &mut self,
+    principal: &Principal,
+  ) -> Option<Result<(crate::repository::push::RecordedBatch, (u64, u64)), Uncommitted>> {
+    let repository = self.repository;
+    let place = crate::state::with_state(|state| landing::landing_place(state, repository))?;
+    let (disk, sequence) = match place {
+      Ok(place) => place,
+      Err(refused) => return Some(Err(refused)),
+    };
     let (landed, flushing, committing) = self
       .land_changeset_timed(&disk, (repository, sequence))
       .await;
+    self.let_go(landed.is_ok()).await?;
+    let prepared = match self.prepared_if_landed(&landed).await? {
+      Ok(prepared) => prepared,
+      Err(refused) => return Some(Err(refused)),
+    };
+    let recorded = crate::state::with_state(|state| {
+      self.record_landed(state, landed, principal, ((repository, sequence), prepared))
+    })?;
+    Some(recorded.map(|recorded| (recorded, (flushing, committing))))
+  }
+
+  /// The batch's texts unpinned where its changeset `landed`, and its scratch member let go, each a unit at a time, a
+  /// slice of the shard's budget a step (A-920 6a). None where the shard's state is gone.
+  async fn let_go(&mut self, landed: bool) -> Option<()> {
     // Landed: the changeset holding every text the batch put is durable on the node's store, so its texts are no
     // unlanded holders now (ruling (B)), whatever the register answers next. Unpinned before the entry, not at the tail:
     // a kill after the entry never reaches the tail, and the texts are landed all the same (w-perf's red at a55d7cfa6,
     // `store_tests::a_subversion_restart_replays_a_named_text_with_one_released_window`). A text a unit, a slice of the
     // shard's budget a step (A-920 6a: 9,000 texts unpinned in one step, 14.3 ms debug); a kill between slices leaves
     // texts unpinned whose changeset is durable, which is what the landing makes true.
-    if landed.is_ok() {
+    if landed {
       let pinned = std::mem::take(&mut self.pinned);
       let mut at = 0usize;
       until_done(|state| {
@@ -1608,31 +1639,33 @@ impl Staging {
       })
       .await?;
     }
-    // Each version made ready for the register's op a unit a step (A-920 6b): its increment encoded, held and its chain
-    // entry encoded, never whole in the entry's step.
-    let prepared = match landed {
-      Ok(()) => match self.prepared().await? {
-        Ok(prepared) => prepared,
-        Err(refused) => {
-          let _ = crate::state::with_state(|state| self.abandon(state));
-          return Some(Err(Uncommitted::Append(super::AppendRefused::Entry(
-            refused,
-          ))));
-        }
-      },
-      Err(_) => Vec::new(),
-    };
-    let recorded = crate::state::with_state(|state| {
-      self.record_landed(state, landed, principal, ((repository, sequence), prepared))
-    })?;
-    let mut recorded = match recorded {
-      Ok(recorded) => recorded,
-      Err(refused) => {
-        let _ = crate::state::with_state(|state| self.abandon(state));
-        return Some(Err(refused));
-      }
-    };
-    let (applying, tailing) = apply_recorded(&mut recorded).await?;
+    Some(())
+  }
+
+  /// Each version made ready for the register's op a unit a step where the changeset `landed` (A-920 6b): its increment
+  /// encoded, held and its chain entry encoded, never whole in the entry's step ([`Staging::prepared`]). None made where
+  /// the changeset did not land; a hold refused, the refusal as the entry's. None where the shard's state is gone.
+  async fn prepared_if_landed(
+    &self,
+    landed: &Result<(), Uncommitted>,
+  ) -> Option<Result<Vec<crate::repository::push::Prepared>, Uncommitted>> {
+    if landed.is_err() {
+      return Some(Ok(Vec::new()));
+    }
+    let prepared = self.prepared().await?;
+    Some(prepared.map_err(|refused| Uncommitted::Append(super::AppendRefused::Entry(refused))))
+  }
+
+  /// The recorded batch applied and the landing's tail run (each a slice of the shard's budget a step), then the
+  /// landing's parts counted from `(flushing, committing)`, when its flush and its commit began. None where the shard's
+  /// state is gone.
+  async fn applied(
+    &mut self,
+    recorded: &mut crate::repository::push::RecordedBatch,
+    cause: Flush,
+    (flushing, committing): (u64, u64),
+  ) -> Option<()> {
+    let (applying, tailing) = apply_recorded(recorded).await?;
     self.land_tail(cause).await?;
     let ended = slates_rt::futures::now_ns();
     crate::state::with_state(|state| {
@@ -1641,10 +1674,7 @@ impl Staging {
       state.count(LAND_COMMIT_NS, applying.saturating_sub(committing));
       state.count(LAND_APPLY_NS, tailing.saturating_sub(applying));
       state.count(LAND_TAIL_NS, ended.saturating_sub(tailing));
-    })?;
-    #[cfg(test)]
-    kill_at_stage_where_set(LandStage::Landed).await;
-    Some(Ok(revisions))
+    })
   }
 
   /// Each of the batch's versions made ready for the register's op, a unit at a time, a slice of the shard's budget a

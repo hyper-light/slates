@@ -64644,6 +64644,21 @@ GAPS.
   preparation run whole (`staging::prepared_whole`). Counter: `LANDING_PREPARE_STEPS`, more than two a wide landing;
   red with the preparation run whole (one step). `a_shards_longest_poll_names_its_task` (`slates-rt`): red with the
   longest poll's task never recorded.
+- **Piece 7, the import's turn** (main's ruling of 2026-11-26: a turn's units, t1 then t2). The history task's longest
+  polls after 6b (debug, 9,000 files) were a turn's units: its parse, a copy slice of 68 KB of the dump a call, 3.9-5.3
+  ms each, since a dump's parse costs far more than its bytes' copy; and its close, `Importer::close_revision`'s
+  `revision_of` whole, 20.4 ms. **7a, an event a unit.** `Importer::import_within` stops after any whole event once the
+  caller's `spent` says its slice is spent, at least one event a call, and answers `Importing::NeedMore` with the bytes
+  done with and none more needed; `Importer::import` is it never spent. The import's `unit` passes its turn's deadline,
+  so a turn is units of events until its copy slice of time is spent. Counter: `vcs_store.svn_import.pauses`
+  (`svn_import::IMPORT_PAUSES`), more than two a wide revision in `t_c2c`; red at 0 with the call taking its whole
+  buffer. The landing's own step, `Staging::land`, is split into its parts (`recorded`, `let_go`,
+  `prepared_if_landed`, `applied`), each await-bearing part a helper, the order unchanged. The wide tests now print
+  their history's longest poll by the wall and by its thread's CPU (`cpu_timed`, `registry::calling_thread_cpu`
+  around each poll; main's order after probe 9, whose release longest steps of 22-98 ms were wall clock on loaded,
+  time-shared shard threads): in debug, after 7a, 27.3, 30.2 and 30.1 ms by the wall against 27.3, 27.0 and 29.6 ms
+  of CPU (add, copy, move), so held work, not a paused thread. Next, 7b: the close a unit a step in a closing phase,
+  with an oracle against the whole close.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
