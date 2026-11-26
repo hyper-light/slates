@@ -868,3 +868,11 @@
   expected; the server lib test binary never reserves the key region (main's to place). WAITING: main's interleaved
   read-cache A/B on git/git; main's next 8a loop. NEXT: the loop's other failures (first-run client-leaves, git_hooks
   receive-pack points, dav proppatch multistatus, git_push fetch mid-derivation); Windows owned_object (reported).
+- 11-25 ~20:00 PST: LANDED 63970075b (A-622: no bound before 99 runs, RUNS_FOR_A_BOUND; hook tests timed from their own
+  moment; mid-derivation read waits on the shard); 02602af52 (derivations_due from counts, 9→0 versions looked; units.<kind>
+  totals); 53be3fcf0 (pace harvest P = max(c, overrun), Miri passed on e76a719ef; git_push::tests::git_repository gone,
+  41 sites, list 12→11); 50dc3dcd7 (audit_on_stored_shard_made_all; upload 12 + git_hooks 2 moved; audit 114, create
+  34, list 10). Read-cache A/B: inconclusive on time (one binary 57–132 s), stays on counts (4.7x hits, −9.6% deltas);
+  main's sample showed the clone waiting on encode_behind (derivations_due + harvest kevent), both now cut. NEXT:
+  carry_blocking (answered/pushed sync driver, ~90 sites) → async histories, asked main whether hg_view's 10 are w-hg's;
+  then the cache's eviction order (LRU) judged by hits ÷ units.open_tree; SSH seats; Windows owned_object (reported).
