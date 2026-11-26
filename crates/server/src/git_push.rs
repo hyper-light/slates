@@ -430,16 +430,19 @@ enum Homing {
   Done,
 }
 
-/// A push's changeset as the edge lands it on the node's changeset store (A-767 C5): the store's handle, the header, and
-/// the sections, their bytes moved in.
+/// A push's changeset as the edge lands it on the node's changeset store (A-767 C5), a piece at a time through the
+/// store's sliced landing ([`landed_in_pieces`], b2b): the store's handle, the header, its names' rows, and its pack by
+/// the identity and length the origin's content store holds it under, read from there a piece at a time as it lands.
 #[derive(Debug)]
 pub(crate) struct Landing {
   /// The node's store.
   disk: slates_store::owner::StoreHandle,
   /// The changeset's header: the repository, its sequence.
   header: slates_store::log::Header,
-  /// Its `Names` and its `Payload`.
-  parts: Vec<slates_store::owner::Part>,
+  /// Its `Names` section's bytes.
+  names: Vec<u8>,
+  /// Its `Payload`: the push's pack in the origin shard's content store.
+  pack: (slates_vcs::ContentId, u64),
 }
 
 impl Landing {
@@ -485,15 +488,63 @@ pub(crate) async fn carry(origin: u16, shards: &[u16], carry: Carry) -> Carried 
       )
       .await,
     ),
-    Carry::Land(landing) => {
-      let Landing {
-        disk,
-        header,
-        parts,
-      } = *landing;
-      Carried::Landed(disk.land(header, parts).await)
-    }
+    Carry::Land(landing) => Carried::Landed(landed_in_pieces(*landing).await),
   }
+}
+
+/// Lands `landing` through the store's sliced landing (b2b, main's order of 2026-11-26): its `Names` and then its
+/// `Payload` a piece at a time (`slates_store::store::PIECE_BYTES`), the pack's pieces read from the origin shard's
+/// content store, where it was put as it arrived, into one buffer each part hands back; then committed, answered once
+/// durable. The landing holds one piece of the pack, never the pack (counted [`LAND_BUFFER_MOST`]). Cut off between
+/// two pieces (dropped, or refused), the store abandons it: nothing of it is visible. A piece the content store no
+/// longer holds refuses it (`StoreError::NotStaged`).
+async fn landed_in_pieces(
+  landing: Landing,
+) -> Result<slates_store::log::Located, slates_store::owner::OwnerError> {
+  use slates_store::log::SectionKind;
+  use slates_store::store::PIECE_BYTES;
+  let Landing {
+    disk,
+    mut header,
+    names,
+    pack: (identity, len),
+  } = landing;
+  header.sections = 2;
+  let mut open = disk.begin(header).await?;
+  let to_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+  open
+    .section(SectionKind::Names, to_u64(names.len()))
+    .await?;
+  let mut buffer = Vec::with_capacity(PIECE_BYTES);
+  for piece in names.chunks(PIECE_BYTES) {
+    buffer.clear();
+    buffer.extend_from_slice(piece);
+    buffer = open.part(buffer).await?;
+  }
+  open.section(SectionKind::Payload, len).await?;
+  let mut at = 0u64;
+  while at < len {
+    buffer.clear();
+    let filled = crate::state::with_state(|state| {
+      crate::vcs_store::homes::held_piece_into(
+        state,
+        (identity, len, at),
+        (PIECE_BYTES, &mut buffer),
+      )
+    })
+    .unwrap_or(false);
+    if !filled || buffer.is_empty() {
+      return Err(slates_store::owner::OwnerError::Store(
+        slates_store::store::StoreError::NotStaged,
+      ));
+    }
+    at = at.saturating_add(to_u64(buffer.len()));
+    let _ = crate::state::with_state(|state| {
+      state.count_max(LAND_BUFFER_MOST, to_u64(buffer.capacity()));
+    });
+    buffer = open.part(buffer).await?;
+  }
+  open.commit().await
 }
 
 /// Where a push's answer stands between its steps.
@@ -1142,8 +1193,7 @@ impl<P> ReceivePack<P> {
           return;
         }
         decision.sealed.pack_homed_as((identity, len));
-        let pack = landed_pack(state, homed.bytes, (identity, len));
-        decision.homing = match pack.and_then(|pack| landing_of(state, repository, (names, pack))) {
+        decision.homing = match landing_of(state, repository, (names, (identity, len))) {
           Some(landing) => Homing::LandDue(Box::new(landing)),
           None => Homing::Unlanded(Unlanded::NoLanding),
         };
@@ -1193,37 +1243,19 @@ pub(crate) const PUSH_LANDED: &str = "git_push.landed";
 /// Format: a counter name.
 pub(crate) const PUSH_UNLANDED: &str = "git_push.unlanded";
 
-/// The pack a changeset's `Payload` lands: the bytes its homing gave back, else (a pack homed by its identity, b2a)
-/// read whole from the content store it was put in, `packed` its identity and length, counted [`LAND_BUFFER_MOST`]: the
-/// landing's one whole-pack buffer, which b2b streams. None where the store no longer holds it whole.
-pub(crate) fn landed_pack(
-  state: &mut ShardState,
-  homed: Vec<u8>,
-  packed: (slates_vcs::ContentId, u64),
-) -> Option<Vec<u8>> {
-  if !homed.is_empty() {
-    return Some(homed);
-  }
-  let bytes = crate::vcs_store::homes::held_bytes(state, packed)?;
-  state.count_max(
-    LAND_BUFFER_MOST,
-    u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-  );
-  Some(bytes)
-}
-
-/// Counted most: the most bytes of a pack one landing held in a buffer of its own: its changeset's `Payload` (b2b
-/// streams it from the content store's windows). Format: a counter name.
+/// Counted most: the most bytes of a pack one landing held in a buffer of its own: its `Payload`'s one reused piece
+/// buffer ([`landed_in_pieces`], b2b), at most `slates_store::store::PIECE_BYTES`. Format: a counter name.
 pub(crate) const LAND_BUFFER_MOST: &str = "git_push.land_buffer_most";
 
-/// Repository `repository`'s push's changeset as the edge lands it (A-767 C5): `Names` the names' rows and `Payload` the
-/// pack, both the bytes their homing gave back, moved in; its sequence the repository's next, taken now so two pushes
-/// landing side by side never share one. None where the daemon holds no store, or the repository no store here. A git
-/// commit the server makes lands the same way (`vcs_store::commits::make_deferred`, C5 2b piece 3).
+/// Repository `repository`'s push's changeset as the edge lands it (A-767 C5): `Names` the names' rows their homing
+/// gave back, and `Payload` the pack `packed` names in the origin's content store, read a piece at a time as it lands
+/// ([`landed_in_pieces`]); its sequence the repository's next, taken now so two pushes landing side by side never share
+/// one. None where the daemon holds no store, or the repository no store here. A git commit the server makes lands the
+/// same way (`vcs_store::commits::make_deferred`, C5 2b piece 3).
 pub(crate) fn landing_of(
   state: &mut ShardState,
   repository: RepositoryId,
-  (names, pack): (Vec<u8>, Vec<u8>),
+  (names, pack): (Vec<u8>, (slates_vcs::ContentId, u64)),
 ) -> Option<Landing> {
   let disk = state.vcs_disk.clone()?;
   let sequence = state.vcs_stores.next_changeset(repository)?;
@@ -1240,10 +1272,8 @@ pub(crate) fn landing_of(
   Some(Landing {
     disk,
     header,
-    parts: vec![
-      (slates_store::log::SectionKind::Names, names),
-      (slates_store::log::SectionKind::Payload, pack),
-    ],
+    names,
+    pack,
   })
 }
 

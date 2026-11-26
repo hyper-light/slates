@@ -1097,6 +1097,16 @@ fn plan_update(
   Ok(Step::Update { green, work })
 }
 
+/// Whether an update of `green` passes [`plan_update`]'s rules but the once-only one and the gates: a member of
+/// `repository`, its engine here and not fenced. What a push's driver checks before it judges the update ahead of its
+/// step ([`PreparedCreates::judge_updates_some`]); the step's plan judges every rule again, its gates too (left to it, so
+/// a refusal is counted once).
+fn update_admissible(state: &ShardState, repository: RepositoryId, green: DbVolumeId) -> bool {
+  is_member(state, repository, green)
+    && !state.fenced_greens.contains_key(&green)
+    && state.greens.contains_key(&green)
+}
+
 /// A deferred update's rules (P2): an update's, a member changed once whose engine is here and not fenced, and a push
 /// based at the green's head that it does not owe already. No gate is judged now: nothing merges until the push is built,
 /// when its green is first reached (`crate::green_ready`).
@@ -1262,6 +1272,16 @@ pub(crate) const CREATE_MISSES: &str = "repository.push.create_misses";
 /// report.
 pub(crate) const CREATE_SLICES: &str = "repository.push.create_slices";
 
+/// Counter: a slice of a push's updates judged ahead of its landing's step ([`PreparedUpdates::prepare_some`]): more than
+/// one a push shows its moved lines' works were judged a slice at a time (goal 93, the landing spin's owed (1)). Format:
+/// a counter name in the daemon's status report.
+pub(crate) const UPDATE_SLICES: &str = "repository.push.update_slices";
+
+/// Counter: an update a push's driver judged ahead of its landing's step that the step could not take (its green moved,
+/// or the step planned another work for it): judged again within the step. Format: a counter name in the daemon's status
+/// report.
+pub(crate) const UPDATE_MISSES: &str = "repository.push.update_misses";
+
 /// A create made: its step (the new green's record), what it holds until its entry is recorded, and its verdict, its
 /// work committed into the new green (none for a create with no work, or one whose work was accepted before).
 struct PreparedCreate {
@@ -1413,6 +1433,35 @@ fn creates_made(
   Ok((adopted, created))
 }
 
+/// Each update of `steps` judged ahead of this step ([`PreparedCreates::judge_updates_some`]) and still standing, taken:
+/// its verdict put where the step's own judge would put it, the retention it secured moved into `held`, and the step
+/// marked adopted so this step neither secures nor judges it again. An update not taken where its driver judged ahead
+/// (its green moved, or none was judged) is counted a miss ([`UPDATE_MISSES`]) and judged by this step.
+fn updates_taken(
+  state: &mut ShardState,
+  steps: &[Step],
+  (held, prepared): (&mut Held, Option<&mut PreparedCreates>),
+  (adopted, created): (&mut [bool], &mut [Option<Verdict>]),
+) {
+  let Some(prepared) = prepared else {
+    return;
+  };
+  for (index, step) in steps.iter().enumerate() {
+    let Step::Update { green, work } = step else {
+      continue;
+    };
+    let Some((verdict, taken)) = prepared.take_update(state, (*green, work.id)) else {
+      state.count(UPDATE_MISSES, 1);
+      continue;
+    };
+    held.secured.extend(taken.secured);
+    if let (Some(adopted), Some(created)) = (adopted.get_mut(index), created.get_mut(index)) {
+      *adopted = true;
+      *created = Some(verdict);
+    }
+  }
+}
+
 /// A step standing in for one taken out to be made, replaced before anything reads it.
 fn placeholder() -> Step {
   Step::Delete {
@@ -1447,6 +1496,25 @@ pub(crate) struct PreparedCreates {
   planned: std::collections::VecDeque<Step>,
   /// The creates made.
   made: Vec<PreparedCreate>,
+  /// The push's updates judged ahead of its step ([`PreparedCreates::judge_updates_some`]).
+  updates: Vec<PreparedUpdate>,
+  /// The push's next change to look at for an update to judge ahead.
+  next_update: usize,
+}
+
+/// An update judged ahead of its push's landing step (goal 93, the landing spin's owed (1); main's order of 2026-11-26):
+/// its green, its work's id, the retention its secure holds, and its verdict, judged at the green's head then. The green
+/// is a reader's, so nothing is committed ahead: the step commits the verdict only while the green is still at the head
+/// it was judged at, and judges the work again itself where it is not ([`UPDATE_MISSES`]).
+struct PreparedUpdate {
+  /// The green the update moves.
+  green: DbVolumeId,
+  /// Its work's id.
+  work: [u8; 32],
+  /// What its secure holds.
+  held: Held,
+  /// Its verdict.
+  verdict: Verdict,
 }
 
 impl PreparedCreates {
@@ -1527,9 +1595,83 @@ impl PreparedCreates {
       PreparedCreates {
         planned: steps.into(),
         made: Vec::new(),
+        updates: Vec::new(),
+        next_update: 0,
       },
       charged,
     ))
+  }
+
+  /// Judges the next updates of `changes` ahead of the landing step (goal 93, the landing spin's owed (1)): each
+  /// update's retention secured ([`secure_one`]) and its work judged in place ([`judge_one`]) at its green's head, until
+  /// the shard's step budget is spent from now, at least one; counted where any was judged ([`UPDATE_SLICES`]). An
+  /// update the step's plan would refuse (another repository's green, one changed twice, a fenced or absent engine, a
+  /// gate) or whose judging refused is left for the step, which refuses it as it would have, what it held given back.
+  /// Whether every change has been looked at.
+  pub(crate) fn judge_updates_some(
+    &mut self,
+    state: &mut ShardState,
+    (repository, changes): (RepositoryId, &mut [BranchChange]),
+  ) -> bool {
+    let budget = slates_rt::futures::step_budget_ns().unwrap_or(0);
+    let deadline = slates_rt::futures::now_ns().saturating_add(budget);
+    let mut judged = false;
+    while let Some(change) = changes.get_mut(self.next_update) {
+      self.next_update = self.next_update.saturating_add(1);
+      let BranchChange::Update { green, work } = change else {
+        continue;
+      };
+      let green = *green;
+      let twice = self.updates.iter().any(|update| update.green == green);
+      if twice || !update_admissible(state, repository, green) {
+        continue;
+      }
+      let mut held = Held::default();
+      let verdict = secure_one(state, (green, work), &mut held)
+        .and_then(|()| judge_one(state, (green, work), &mut held));
+      judged = true;
+      match verdict {
+        Ok(verdict) => self.updates.push(PreparedUpdate {
+          green,
+          work: work.id,
+          held,
+          verdict,
+        }),
+        Err(_) => held.give_back(state),
+      }
+      if slates_rt::futures::now_ns() >= deadline {
+        break;
+      }
+    }
+    if judged {
+      state.count(UPDATE_SLICES, 1);
+    }
+    self.next_update >= changes.len()
+  }
+
+  /// The update judged ahead for `work` on `green`, taken, with what it holds, while its verdict still stands: accepted
+  /// before, or held at `green`'s head now. One whose green moved since is given back; none where none was judged.
+  fn take_update(
+    &mut self,
+    state: &mut ShardState,
+    (green, work): (DbVolumeId, [u8; 32]),
+  ) -> Option<(Verdict, Held)> {
+    let at = self
+      .updates
+      .iter()
+      .position(|update| update.green == green && update.work == work)?;
+    let update = self.updates.swap_remove(at);
+    let head = state.greens.get(&green).map(|engine| engine.head());
+    let stands = match &update.verdict {
+      Verdict::Held(judged) => head == Some(judged.at()),
+      Verdict::Before(_) => true,
+      Verdict::Committed { .. } => false,
+    };
+    if stands {
+      return Some((update.verdict, update.held));
+    }
+    update.held.give_back(state);
+    None
   }
 
   /// Makes the next creates ([`prepare_create`]) until the shard's step budget is spent from now, at least one;
@@ -1574,10 +1716,14 @@ impl PreparedCreates {
       .collect()
   }
 
-  /// Gives back every create made and not taken: its increment, its green retired, its retention trued up.
+  /// Gives back every create made and not taken (its increment, its green retired, its retention trued up), and every
+  /// update judged ahead and not taken (its retention trued up).
   pub(crate) fn give_back(self, state: &mut ShardState) {
     for made in self.made {
       made.give_back(state);
+    }
+    for update in self.updates {
+      update.held.give_back(state);
     }
   }
 }
@@ -1621,7 +1767,15 @@ fn landed_planned(
   ),
   mut stored: Option<Stored<'_, '_>>,
 ) -> Result<Appended, AppendRefused> {
-  let (adopted, mut created) = creates_made(state, &mut steps, (held, ahead, prepared))?;
+  let mut prepared = prepared;
+  let (mut adopted, mut created) =
+    creates_made(state, &mut steps, (held, ahead, prepared.as_deref_mut()))?;
+  updates_taken(
+    state,
+    &steps,
+    (held, prepared),
+    (&mut adopted, &mut created),
+  );
   let works = steps
     .iter()
     .zip(&adopted)
@@ -1890,28 +2044,8 @@ fn secure(
     let Some((green, work)) = step.work() else {
       continue;
     };
-    let reserved = state.greens.get(&green).map(|engine| {
-      engine
-        .history_reservation(work)
-        .saturating_add(engine.changes_reservation(work))
-    });
-    let Some(reserved) = reserved else {
-      refused.push(ChangeRefused {
-        index,
-        why: ChangeRefusal::Refused(Refusal::ContentUnavailable),
-      });
-      continue;
-    };
-    let secured = u64::try_from(reserved).unwrap_or(u64::MAX);
-    let room = usize::try_from(secured).unwrap_or(usize::MAX);
-    let charged = crate::merge_service::settle_green_retention_leaving(state, green, room)
-      .and_then(|()| crate::merge_service::secure_green_retention(state, green, secured));
-    match charged {
-      Ok(()) => held.secured.push((green, None)),
-      Err(available) => refused.push(ChangeRefused {
-        index,
-        why: ChangeRefusal::Refused(Refusal::BudgetExceeded { available }),
-      }),
+    if let Err(why) = secure_one(state, (green, work), held) {
+      refused.push(ChangeRefused { index, why });
     }
   }
   if refused.is_empty() {
@@ -1919,6 +2053,30 @@ fn secure(
   } else {
     Err(refused)
   }
+}
+
+/// One work's retention secured on `green` ([`secure`]), what it secured noted in `held`; refused by kind.
+fn secure_one(
+  state: &mut ShardState,
+  (green, work): (DbVolumeId, &Increment),
+  held: &mut Held,
+) -> Result<(), ChangeRefusal> {
+  let reserved = state
+    .greens
+    .get(&green)
+    .map(|engine| {
+      engine
+        .history_reservation(work)
+        .saturating_add(engine.changes_reservation(work))
+    })
+    .ok_or(ChangeRefusal::Refused(Refusal::ContentUnavailable))?;
+  let secured = u64::try_from(reserved).unwrap_or(u64::MAX);
+  let room = usize::try_from(secured).unwrap_or(usize::MAX);
+  crate::merge_service::settle_green_retention_leaving(state, green, room)
+    .and_then(|()| crate::merge_service::secure_green_retention(state, green, secured))
+    .map_err(|available| ChangeRefusal::Refused(Refusal::BudgetExceeded { available }))?;
+  held.secured.push((green, None));
+  Ok(())
 }
 
 /// A work's held verdict: accepted and held, or accepted before as a version.
@@ -2009,62 +2167,64 @@ fn judge(
       verdicts.push(None);
       continue;
     };
-    // A work naming its files' objects (A-887) reads them from the content store first: a clone of it, as each step's
-    // is, carries no run's bytes (`slates_merge::named::Read`).
-    if crate::repository::svn_commit::read_named(state, work).is_err() {
-      refused.push(ChangeRefused {
-        index,
-        why: ChangeRefusal::Refused(Refusal::ContentUnavailable),
-      });
-      verdicts.push(None);
-      continue;
+    match judge_one(state, (green, work), held) {
+      Ok(verdict) => verdicts.push(Some(verdict)),
+      Err(why) => {
+        verdicts.push(None);
+        refused.push(ChangeRefused { index, why });
+      }
     }
-    let judgment = judged_lent(state, green, work);
-    // An accepted verdict takes the runs' buffers: any the work still holds were cloned. A refused one takes none, and
-    // they go with the work.
-    let kept = (0..work.named.runs.len())
-      .filter_map(|at| work.read_run(at))
-      .fold(0u64, |total, run| {
-        total.saturating_add(u64::try_from(run.len()).unwrap_or(u64::MAX))
-      });
-    if kept > 0 && matches!(judgment, Some(Judgment::Accepted(_))) {
-      state.count(READ_CLONED_BYTES, kept);
-    }
-    let why = match judgment {
-      Some(Judgment::Accepted(judged)) => {
-        verdicts.push(Some(Verdict::Held(Box::new(judged))));
-        continue;
-      }
-      Some(Judgment::AcceptedBefore { version }) => {
-        verdicts.push(Some(Verdict::Before(version)));
-        continue;
-      }
-      Some(Judgment::Conflict { windows }) => {
-        if let Some(secured) = held.secured.iter_mut().find(|(at, _)| *at == green) {
-          secured.1 = Some(work.id);
-        }
-        ChangeRefusal::Conflict { windows }
-      }
-      Some(Judgment::BaseUnavailable { base, .. }) => {
-        ChangeRefusal::Refused(Refusal::UnknownBase {
-          green: to_wire_volume(green),
-          version: base,
-        })
-      }
-      Some(Judgment::CopyRefused { path, case }) => {
-        ChangeRefusal::Refused(crate::verbs::copy_refused(path, case))
-      }
-      Some(Judgment::ContentUnread { .. }) => ChangeRefusal::Refused(Refusal::ContentUnavailable),
-      None => ChangeRefusal::Refused(Refusal::ContentUnavailable),
-    };
-    verdicts.push(None);
-    refused.push(ChangeRefused { index, why });
   }
   if refused.is_empty() {
     Ok(verdicts)
   } else {
     Err(refused)
   }
+}
+
+/// One work's verdict on `green` ([`judge`]): held, or accepted before; refused by kind, a conflict's work noted in
+/// `held`'s secured entry for its green, so its settle drops the rejected result if it cannot be held.
+fn judge_one(
+  state: &mut ShardState,
+  (green, work): (DbVolumeId, &mut Increment),
+  held: &mut Held,
+) -> Result<Verdict, ChangeRefusal> {
+  // A work naming its files' objects (A-887) reads them from the content store first: a clone of it, as each step's
+  // is, carries no run's bytes (`slates_merge::named::Read`).
+  if crate::repository::svn_commit::read_named(state, work).is_err() {
+    return Err(ChangeRefusal::Refused(Refusal::ContentUnavailable));
+  }
+  let judgment = judged_lent(state, green, work);
+  // An accepted verdict takes the runs' buffers: any the work still holds were cloned. A refused one takes none, and
+  // they go with the work.
+  let kept = (0..work.named.runs.len())
+    .filter_map(|at| work.read_run(at))
+    .fold(0u64, |total, run| {
+      total.saturating_add(u64::try_from(run.len()).unwrap_or(u64::MAX))
+    });
+  if kept > 0 && matches!(judgment, Some(Judgment::Accepted(_))) {
+    state.count(READ_CLONED_BYTES, kept);
+  }
+  Err(match judgment {
+    Some(Judgment::Accepted(judged)) => return Ok(Verdict::Held(Box::new(judged))),
+    Some(Judgment::AcceptedBefore { version }) => return Ok(Verdict::Before(version)),
+    Some(Judgment::Conflict { windows }) => {
+      if let Some(secured) = held.secured.iter_mut().find(|(at, _)| *at == green) {
+        secured.1 = Some(work.id);
+      }
+      ChangeRefusal::Conflict { windows }
+    }
+    Some(Judgment::BaseUnavailable { base, .. }) => ChangeRefusal::Refused(Refusal::UnknownBase {
+      green: to_wire_volume(green),
+      version: base,
+    }),
+    Some(Judgment::CopyRefused { path, case }) => {
+      ChangeRefusal::Refused(crate::verbs::copy_refused(path, case))
+    }
+    Some(Judgment::ContentUnread { .. }) | None => {
+      ChangeRefusal::Refused(Refusal::ContentUnavailable)
+    }
+  })
 }
 
 /// The entry the push records: the deletes' checks then `parts`'; the new members; each held verdict's version, the one

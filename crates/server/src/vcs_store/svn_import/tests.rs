@@ -1296,7 +1296,7 @@ std::thread_local! {
 
 /// A history whose every poll is timed by the wall clock and by its thread's CPU clock
 /// ([`slates_rt::registry::calling_thread_cpu`]), the longest kept in [`TIMED_LONGEST`].
-struct CpuTimed<F> {
+pub(crate) struct CpuTimed<F> {
   /// The history.
   future: std::pin::Pin<Box<F>>,
 }
@@ -1325,7 +1325,7 @@ impl<F: std::future::Future> std::future::Future for CpuTimed<F> {
 /// `history` with each of its polls timed by the wall and by its thread's CPU ([`CpuTimed`]; main's order after probe
 /// 9: the pulse's longest step is a poll's wall clock, which a preempted or waiting thread stretches as much as held
 /// work, so the CPU beside it tells the two apart). Made on the shard that polls it, whose longest so far it clears.
-fn cpu_timed<F: std::future::Future>(history: F) -> CpuTimed<F> {
+pub(crate) fn cpu_timed<F: std::future::Future>(history: F) -> CpuTimed<F> {
   TIMED_LONGEST.with(|longest| longest.set((0, 0)));
   CpuTimed {
     future: Box::pin(history),
@@ -1336,7 +1336,7 @@ fn cpu_timed<F: std::future::Future>(history: F) -> CpuTimed<F> {
 /// longest a green's checkpoint took in turns, from its first turn to its record (A-579's completion time, which the
 /// fold's bounded share past its deadline lengthens; `merge_service::CHECKPOINT_IN_TURNS_LONGEST_NS`), and the longest
 /// poll of its history by the wall and by its thread's CPU ([`cpu_timed`]).
-fn longest_poll() -> (u64, String) {
+pub(crate) fn longest_poll() -> (u64, String) {
   let shard = slates_rt::registry::current_shard().expect("on a shard");
   let checkpoint_ns =
     on(|state| count(state, crate::merge_service::CHECKPOINT_IN_TURNS_LONGEST_NS));
