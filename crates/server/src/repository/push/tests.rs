@@ -130,28 +130,10 @@ fn work(
     .increment
 }
 
-/// Creates repository `name` (git, its default `main` a new empty green): its id and the root.
-fn repository(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId) {
-  let reply = crate::test_store::create(
-    state,
-    &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool: VcsTool::Git,
-      format: ObjectFormat::Sha1,
-      default_branch: "main".to_owned(),
-      green: None,
-    },
-  );
-  let ReplyBody::GreenCreated { id } = reply else {
-    panic!("no repository: {reply:?}")
-  };
-  let repositories = state.db.partition().repositories();
-  let repo = repositories
-    .repository_named(name)
-    .expect("the repository")
-    .id;
-  (repo, to_db_volume(id))
+/// What these tests ask a creation for: git repository `name`, its default `main` a new empty green, made by
+/// [`owner`] from the test's thread (`test_store::create_on`, `audit_on_stored_shard_made`), never on the shard.
+fn git(name: &str) -> crate::test_store::Asked<'_> {
+  (name, VcsTool::Git, ObjectFormat::Sha1, "main")
 }
 
 /// Makes branch `name` of `repository` at `from`'s head through the verb: its green.
@@ -257,10 +239,12 @@ fn kept(state: &mut ShardState, repository: RepositoryId, greens: &[DbVolumeId])
   )
 }
 
-/// A repository `tree` whose `main` is at version 1 (file `f` = `one`, head `c1`) and whose `topic`, made from `main` at
+/// Repository `tree` ([`git`], made before the history) whose `main` is at version 1 (file `f` = `one`, head `c1`) and whose `topic`, made from `main` at
 /// version 0, is empty: the repository, the two greens, the store and `main`'s tree at version 1.
-fn two_branches(state: &mut ShardState) -> (RepositoryId, [DbVolumeId; 2], Store, ObjectKey) {
-  let (repo, main) = repository(state, "tree");
+fn two_branches(
+  state: &mut ShardState,
+  (repo, main): (RepositoryId, DbVolumeId),
+) -> (RepositoryId, [DbVolumeId; 2], Store, ObjectKey) {
   let topic = branch(state, "tree", ("topic", "main"));
   let mut store = Store::default();
   let one = store.put_tree(&[("f", b"one")]);
@@ -294,8 +278,8 @@ fn two_branches(state: &mut ShardState) -> (RepositoryId, [DbVolumeId; 2], Store
 /// included: names, heads, identities, chains, records, retention and engines as they were.
 #[test]
 fn a_push_moves_every_branch_or_none_of_them() {
-  crate::test_store::audit_on_stored_shard("repository-push", |state| {
-    let (repo, [main, topic], mut store, one) = two_branches(state);
+  crate::test_store::audit_on_stored_shard_made((&owner(), git("tree")), |state, made| {
+    let (repo, [main, topic], mut store, one) = two_branches(state, made);
     let two = store.put_tree(&[("f", b"two")]);
     let topical = store.put_tree(&[("g", b"topic")]);
     let together = vec![
@@ -423,8 +407,8 @@ fn assert_refused_whole(
 /// namespace and its green stays; `main` moves.
 #[test]
 fn a_push_creates_and_deletes_branches_in_the_same_step() {
-  crate::test_store::audit_on_stored_shard("repository-push", |state| {
-    let (repo, [main, topic], mut store, one) = two_branches(state);
+  crate::test_store::audit_on_stored_shard_made((&owner(), git("tree")), |state, made| {
+    let (repo, [main, topic], mut store, one) = two_branches(state, made);
     let featured = store.put_tree(&[("f", b"one"), ("h", b"new")]);
     let two = store.put_tree(&[("f", b"two")]);
     let changes = vec![
@@ -529,8 +513,8 @@ fn assert_recorded_as_one(
 /// its verdict, gone again; nothing of either applied.
 #[test]
 fn every_refused_change_is_named_and_nothing_is_applied() {
-  crate::test_store::audit_on_stored_shard("repository-push", |state| {
-    let (repo, [main, topic], mut store, one) = two_branches(state);
+  crate::test_store::audit_on_stored_shard_made((&owner(), git("tree")), |state, made| {
+    let (repo, [main, topic], mut store, one) = two_branches(state, made);
     let lone = lone_green(state);
     let two = store.put_tree(&[("f", b"two")]);
     let moving = work(state, main, (1, Some(one)), (two, b"c2"), (&store, 8));
@@ -583,8 +567,8 @@ fn every_refused_change_is_named_and_nothing_is_applied() {
 /// creates then lands both.
 #[test]
 fn creates_made_ahead_of_a_landing_and_not_taken_are_given_back() {
-  crate::test_store::audit_on_stored_shard("repository-push", |state| {
-    let (repo, [main, _], mut store, one) = two_branches(state);
+  crate::test_store::audit_on_stored_shard_made((&owner(), git("tree")), |state, made| {
+    let (repo, [main, _], mut store, one) = two_branches(state, made);
     let changes = |state: &ShardState, store: &mut Store| -> Vec<BranchChange> {
       [("made-a", 30u8), ("made-b", 31u8)]
         .into_iter()
@@ -650,8 +634,8 @@ fn creates_made_ahead_of_a_landing_and_not_taken_are_given_back() {
 /// Expect: refused `BudgetExceeded` naming the room, before anything is made: no green made, the name still free.
 #[test]
 fn creates_past_their_pushs_room_are_refused_before_any_is_made() {
-  crate::test_store::audit_on_stored_shard("repository-push", |state| {
-    let (repo, [main, _], mut store, one) = two_branches(state);
+  crate::test_store::audit_on_stored_shard_made((&owner(), git("tree")), |state, made| {
+    let (repo, [main, _], mut store, one) = two_branches(state, made);
     let tree = store.put_tree(&[("f", b"one"), ("past", b"past")]);
     let greens = state.greens.keys().count();
     let mut planned = vec![BranchChange::Create {
@@ -772,8 +756,8 @@ fn assert_a_conflict_retires_the_branch_made_for_it(
 /// approver would approve; the stranger is refused `Forbidden` and the unknown repository `NotFound`.
 #[test]
 fn the_gates_and_the_entry_refuse_the_whole_push() {
-  crate::test_store::audit_on_stored_shard("repository-push", |state| {
-    let (repo, [main, topic], mut store, one) = two_branches(state);
+  crate::test_store::audit_on_stored_shard_made((&owner(), git("tree")), |state, made| {
+    let (repo, [main, topic], mut store, one) = two_branches(state, made);
     let two = store.put_tree(&[("f", b"two")]);
     let moving = work(state, main, (1, Some(one)), (two, b"c2"), (&store, 12));
     assert_a_failed_check_refuses_the_entry(state, (repo, [main, topic]), moving.clone());
@@ -943,8 +927,8 @@ fn made_greens(pushed: &Appended) -> Vec<DbVolumeId> {
 /// the second branch's id was the first's, and the entry was refused `ContentUnavailable` naming it.
 #[test]
 fn t_a694_an_append_makes_each_new_branch_its_own_green() {
-  crate::test_store::audit_on_stored_shard("repository-push", |state| {
-    let (repo, [main, _], _, _) = two_branches(state);
+  crate::test_store::audit_on_stored_shard_made((&owner(), git("tree")), |state, made| {
+    let (repo, [main, _], _, _) = two_branches(state, made);
     let changes = vec![
       create("left", main, 1),
       create("middle", main, 1),
@@ -1045,8 +1029,8 @@ fn a_deferred_create_is_made_when_first_reached_and_reads_as_the_eager_create() 
     client: 7,
     sequence: 1,
   };
+  let (repo, main) = crate::test_store::create_on(&daemon, 0, &owner(), git("p2"));
   let (eager, owed) = crate::daemon::observe_first(&daemon, move |state| {
-    let (repo, main) = repository(state, "p2");
     let mut store = Store::default();
     let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
     let built = work(state, main, (0, None), (tree, b"h1"), (&store, 1));
@@ -1186,8 +1170,8 @@ fn an_untouched_materialized_green_past_the_bound_is_dropped_back_and_made_again
     client: 7,
     sequence,
   };
+  let (repo, main) = crate::test_store::create_on(&daemon, 0, &owner(), git("p2-bound"));
   let (first, second) = crate::daemon::observe_first(&daemon, move |state| {
-    let (repo, main) = repository(state, "p2-bound");
     let mut store = Store::default();
     let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
     let owed = |name: &str, tag: u8| BranchChange::CreateDeferred {
@@ -1353,71 +1337,73 @@ fn staged_batch(
 /// - made, the adopted replica reads as the eager green: head, files, head identity.
 #[test]
 fn a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green() {
-  crate::test_store::audit_on_stored_shard("p2-holder", |state| {
-    let (repo, main) = repository(state, "p2-holder");
-    let mut store = Store::default();
-    let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
-    let built = work(state, main, (0, None), (tree, b"h1"), (&store, 1));
-    let owed_push = slates_merge::push::Push {
-      name: [2; 32],
-      base_version: 0,
-      base_tree: None,
-      tree,
-      head: Some(b"h1"),
-    };
-    let changes = vec![
-      BranchChange::Create {
-        name: "eager".to_owned(),
-        from: main,
-        version: 0,
-        work: Some(built.clone()),
-      },
-      BranchChange::CreateDeferred {
-        name: "owed".to_owned(),
-        from: main,
-        version: 0,
-        push: slates_merge::push::DeferredPush::of(&owed_push),
-      },
-    ];
-    push(state, &owner(), repo, changes, EntryParts::default()).expect("pushed");
-    let branch_of = |name: &str| {
-      state
-        .db
-        .partition()
-        .repositories()
-        .branch(repo, name)
-        .expect("the branch")
-    };
-    let (eager, owed) = (branch_of("eager"), branch_of("owed"));
-    let (inputs, identity) =
-      crate::merge_service::shipped_for_test(state, owed, 1).expect("the shipped record");
-    assert!(
-      slates_merge::push::DeferredPush::is_record(&inputs),
-      "the push's record is the inputs"
-    );
-    let mut replica = replica_owing_the_record((&inputs, identity), &built);
-    let mut building = replica
-      .materializing(slates_merge::pace::Pace::unbounded(), ROOM)
-      .expect("it owes a push");
-    let made = loop {
-      if let Some(made) = building.advance(&replica, &store) {
-        break made.expect("built");
-      }
-    };
-    assert_eq!(replica.materialize(&made.increment), Ok(1));
-    let mut engine = state.greens.get_mut(&eager).expect("the eager green");
-    let files = |green: &slates_merge::engine::Green| -> Vec<(String, Vec<u8>)> {
-      green
-        .files_bytes()
-        .map(|(path, bytes)| (path, bytes.to_vec()))
-        .collect()
-    };
-    assert_eq!(
-      (replica.head(), files(&replica), replica.head_identity()),
-      (engine.head(), files(&engine), engine.head_identity()),
-      "the adopted replica, made, reads as the eager green"
-    );
-  });
+  crate::test_store::audit_on_stored_shard_made(
+    (&owner(), git("p2-holder")),
+    |state, (repo, main)| {
+      let mut store = Store::default();
+      let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
+      let built = work(state, main, (0, None), (tree, b"h1"), (&store, 1));
+      let owed_push = slates_merge::push::Push {
+        name: [2; 32],
+        base_version: 0,
+        base_tree: None,
+        tree,
+        head: Some(b"h1"),
+      };
+      let changes = vec![
+        BranchChange::Create {
+          name: "eager".to_owned(),
+          from: main,
+          version: 0,
+          work: Some(built.clone()),
+        },
+        BranchChange::CreateDeferred {
+          name: "owed".to_owned(),
+          from: main,
+          version: 0,
+          push: slates_merge::push::DeferredPush::of(&owed_push),
+        },
+      ];
+      push(state, &owner(), repo, changes, EntryParts::default()).expect("pushed");
+      let branch_of = |name: &str| {
+        state
+          .db
+          .partition()
+          .repositories()
+          .branch(repo, name)
+          .expect("the branch")
+      };
+      let (eager, owed) = (branch_of("eager"), branch_of("owed"));
+      let (inputs, identity) =
+        crate::merge_service::shipped_for_test(state, owed, 1).expect("the shipped record");
+      assert!(
+        slates_merge::push::DeferredPush::is_record(&inputs),
+        "the push's record is the inputs"
+      );
+      let mut replica = replica_owing_the_record((&inputs, identity), &built);
+      let mut building = replica
+        .materializing(slates_merge::pace::Pace::unbounded(), ROOM)
+        .expect("it owes a push");
+      let made = loop {
+        if let Some(made) = building.advance(&replica, &store) {
+          break made.expect("built");
+        }
+      };
+      assert_eq!(replica.materialize(&made.increment), Ok(1));
+      let mut engine = state.greens.get_mut(&eager).expect("the eager green");
+      let files = |green: &slates_merge::engine::Green| -> Vec<(String, Vec<u8>)> {
+        green
+          .files_bytes()
+          .map(|(path, bytes)| (path, bytes.to_vec()))
+          .collect()
+      };
+      assert_eq!(
+        (replica.head(), files(&replica), replica.head_identity()),
+        (engine.head(), files(&engine), engine.head_identity()),
+        "the adopted replica, made, reads as the eager green"
+      );
+    },
+  );
 }
 
 /// P2's retention (main's order of 05:51: secured before the build commits, as the admission rule charges, with a typed
@@ -1432,8 +1418,8 @@ fn a_materialization_past_the_greens_retention_room_is_refused_before_it_commits
     client: 7,
     sequence,
   };
+  let (repo, main) = crate::test_store::create_on(&daemon, 0, &owner(), git("p2-room"));
   let owed = crate::daemon::observe_first(&daemon, move |state| {
-    let (repo, main) = repository(state, "p2-room");
     let mut store = Store::default();
     let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
     let change = BranchChange::CreateDeferred {
@@ -1571,83 +1557,84 @@ fn green_reads(state: &mut ShardState, green: DbVolumeId) -> GreenRead {
 /// - the batched green replayed from its chain reaches the same head.
 #[test]
 fn an_import_batch_commits_its_revisions_as_one_entry_and_reads_as_one_by_one() {
-  crate::test_store::audit_on_stored_shard("import-batch", |state| {
-    let (one_by_one, seq_main) = repository(state, "one-by-one");
-    let (batched, batch_main) = repository(state, "batched");
-    let mut store = Store::default();
-    let trees: Vec<ObjectKey> = [
-      &[("f", &b"zero"[..])][..],
-      &[("f", &b"one"[..]), ("g", &b"g1"[..])][..],
-      &[("f", &b"two"[..]), ("g", &b"g1"[..])][..],
-      &[("f", &b"two"[..]), ("g", &b"g3"[..]), ("h", &b"new"[..])][..],
-    ]
-    .iter()
-    .map(|files| store.put_tree(files))
-    .collect();
-    let reference = |n: u8| EntryParts {
-      objects: vec![b'r', n],
-      ..EntryParts::default()
-    };
-    for (repo, green) in [(one_by_one, seq_main), (batched, batch_main)] {
-      let first = work(state, green, (0, None), (trees[0], b"h0"), (&store, 1));
-      push(
-        state,
-        &owner(),
-        repo,
-        vec![BranchChange::Update { green, work: first }],
-        reference(0),
-      )
-      .expect("the first version");
-    }
-    for n in 1..4u8 {
-      let index = usize::from(n);
-      let next = work(
-        state,
-        seq_main,
-        (u64::from(n), Some(trees[index - 1])),
-        (trees[index], &[n]),
-        (&store, n + 1),
-      );
-      push(
-        state,
-        &owner(),
-        one_by_one,
-        vec![BranchChange::Update {
-          green: seq_main,
-          work: next,
-        }],
-        reference(n),
-      )
-      .expect("a revision, one entry");
-    }
-    let batch = staged_batch(state, batch_main, (&trees, &store));
-    let mut recorded = batch
-      .commit(state, (&owner(), batched), reference(9))
-      .expect("committed");
-    // Applied a slice at a time after its record (`RecordedBatch::apply_slice`).
-    let made = loop {
-      if let Some(made) = recorded.apply_slice(state) {
-        break made;
+  crate::test_store::audit_on_stored_shard_made_all(
+    (&owner(), [git("one-by-one"), git("batched")]),
+    |state, [(one_by_one, seq_main), (batched, batch_main)]| {
+      let mut store = Store::default();
+      let trees: Vec<ObjectKey> = [
+        &[("f", &b"zero"[..])][..],
+        &[("f", &b"one"[..]), ("g", &b"g1"[..])][..],
+        &[("f", &b"two"[..]), ("g", &b"g1"[..])][..],
+        &[("f", &b"two"[..]), ("g", &b"g3"[..]), ("h", &b"new"[..])][..],
+      ]
+      .iter()
+      .map(|files| store.put_tree(files))
+      .collect();
+      let reference = |n: u8| EntryParts {
+        objects: vec![b'r', n],
+        ..EntryParts::default()
+      };
+      for (repo, green) in [(one_by_one, seq_main), (batched, batch_main)] {
+        let first = work(state, green, (0, None), (trees[0], b"h0"), (&store, 1));
+        push(
+          state,
+          &owner(),
+          repo,
+          vec![BranchChange::Update { green, work: first }],
+          reference(0),
+        )
+        .expect("the first version");
       }
-    };
-    assert_eq!(made, vec![2, 3, 4]);
-    assert_eq!(
-      green_reads(state, batch_main),
-      green_reads(state, seq_main),
-      "the batch reads as one by one"
-    );
-    let entries = |repo| state.db.partition().repositories().object_count(repo);
-    assert_eq!(
-      (entries(one_by_one), entries(batched)),
-      (4, 2),
-      "three entries against one for the revisions"
-    );
-    assert_eq!(
-      crate::verbs::replay_green_for_test(state, batch_main),
-      Some((4, None)),
-      "the record replays whole"
-    );
-  });
+      for n in 1..4u8 {
+        let index = usize::from(n);
+        let next = work(
+          state,
+          seq_main,
+          (u64::from(n), Some(trees[index - 1])),
+          (trees[index], &[n]),
+          (&store, n + 1),
+        );
+        push(
+          state,
+          &owner(),
+          one_by_one,
+          vec![BranchChange::Update {
+            green: seq_main,
+            work: next,
+          }],
+          reference(n),
+        )
+        .expect("a revision, one entry");
+      }
+      let batch = staged_batch(state, batch_main, (&trees, &store));
+      let mut recorded = batch
+        .commit(state, (&owner(), batched), reference(9))
+        .expect("committed");
+      // Applied a slice at a time after its record (`RecordedBatch::apply_slice`).
+      let made = loop {
+        if let Some(made) = recorded.apply_slice(state) {
+          break made;
+        }
+      };
+      assert_eq!(made, vec![2, 3, 4]);
+      assert_eq!(
+        green_reads(state, batch_main),
+        green_reads(state, seq_main),
+        "the batch reads as one by one"
+      );
+      let entries = |repo| state.db.partition().repositories().object_count(repo);
+      assert_eq!(
+        (entries(one_by_one), entries(batched)),
+        (4, 2),
+        "three entries against one for the revisions"
+      );
+      assert_eq!(
+        crate::verbs::replay_green_for_test(state, batch_main),
+        Some((4, None)),
+        "the record replays whole"
+      );
+    },
+  );
 }
 
 /// C2 stage C's refusals (A-814). Do: stage two revisions into a batch over a green at version 1, then abandon it; stage
@@ -1656,57 +1643,59 @@ fn an_import_batch_commits_its_revisions_as_one_entry_and_reads_as_one_by_one() 
 /// `NotAtHead`, nothing kept.
 #[test]
 fn an_import_batch_refused_or_abandoned_leaves_its_green_as_it_was() {
-  crate::test_store::audit_on_stored_shard("import-batch-refused", |state| {
-    let (repo, main) = repository(state, "refused");
-    let mut store = Store::default();
-    let zero = store.put_tree(&[("f", b"zero")]);
-    let one = store.put_tree(&[("f", b"one")]);
-    let two = store.put_tree(&[("f", b"two")]);
-    let first = work(state, main, (0, None), (zero, b"h0"), (&store, 1));
-    push(
-      state,
-      &owner(),
-      repo,
-      vec![BranchChange::Update {
-        green: main,
-        work: first,
-      }],
-      EntryParts::default(),
-    )
-    .expect("the first version");
-    let before = green_reads(state, main);
-    let staged_two = |state: &mut ShardState| {
+  crate::test_store::audit_on_stored_shard_made(
+    (&owner(), git("refused")),
+    |state, (repo, main)| {
+      let mut store = Store::default();
+      let zero = store.put_tree(&[("f", b"zero")]);
+      let one = store.put_tree(&[("f", b"one")]);
+      let two = store.put_tree(&[("f", b"two")]);
+      let first = work(state, main, (0, None), (zero, b"h0"), (&store, 1));
+      push(
+        state,
+        &owner(),
+        repo,
+        vec![BranchChange::Update {
+          green: main,
+          work: first,
+        }],
+        EntryParts::default(),
+      )
+      .expect("the first version");
+      let before = green_reads(state, main);
+      let staged_two = |state: &mut ShardState| {
+        let mut batch = crate::import_batch::ImportBatch::begin(state, main).expect("a batch");
+        let w1 = batch_work(state, &batch, (zero, one, b"h1"), (&store, 2));
+        batch.stage(state, w1).expect("staged");
+        let w2 = batch_work(state, &batch, (one, two, b"h2"), (&store, 3));
+        batch.stage(state, w2).expect("staged");
+        batch
+      };
+      staged_two(state).abandon(state);
+      assert_eq!(green_reads(state, main), before, "abandoned: as it was");
+      let refused = staged_two(state)
+        .commit(state, (&stranger(), repo), EntryParts::default())
+        .err();
+      assert!(
+        matches!(
+          refused,
+          Some(AppendRefused::Repository(Refusal::Forbidden { .. }))
+        ),
+        "{refused:?}"
+      );
+      assert_eq!(green_reads(state, main), before, "refused: as it was");
       let mut batch = crate::import_batch::ImportBatch::begin(state, main).expect("a batch");
-      let w1 = batch_work(state, &batch, (zero, one, b"h1"), (&store, 2));
-      batch.stage(state, w1).expect("staged");
-      let w2 = batch_work(state, &batch, (one, two, b"h2"), (&store, 3));
-      batch.stage(state, w2).expect("staged");
-      batch
-    };
-    staged_two(state).abandon(state);
-    assert_eq!(green_reads(state, main), before, "abandoned: as it was");
-    let refused = staged_two(state)
-      .commit(state, (&stranger(), repo), EntryParts::default())
-      .err();
-    assert!(
-      matches!(
-        refused,
-        Some(AppendRefused::Repository(Refusal::Forbidden { .. }))
-      ),
-      "{refused:?}"
-    );
-    assert_eq!(green_reads(state, main), before, "refused: as it was");
-    let mut batch = crate::import_batch::ImportBatch::begin(state, main).expect("a batch");
-    let mut off = batch_work(state, &batch, (zero, one, b"h1"), (&store, 4));
-    off.base = 0;
-    assert_eq!(
-      batch.stage(state, off),
-      Err(crate::import_batch::StageRefused::NotAtHead { head: 1 })
-    );
-    assert_eq!(batch.staged(), 0);
-    batch.abandon(state);
-    assert_eq!(green_reads(state, main), before);
-  });
+      let mut off = batch_work(state, &batch, (zero, one, b"h1"), (&store, 4));
+      off.base = 0;
+      assert_eq!(
+        batch.stage(state, off),
+        Err(crate::import_batch::StageRefused::NotAtHead { head: 1 })
+      );
+      assert_eq!(batch.staged(), 0);
+      batch.abandon(state);
+      assert_eq!(green_reads(state, main), before);
+    },
+  );
 }
 
 thread_local! {
@@ -1726,8 +1715,8 @@ thread_local! {
 #[test]
 fn a_held_verdicts_preview_lives_across_turns_until_its_one_step() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repo, main) = crate::test_store::create_on(&daemon, 0, &owner(), git("held-preview"));
   let (main, repo, members) = crate::daemon::observe_first(&daemon, move |state| {
-    let (repo, main) = repository(state, "held-preview");
     let mut store = Store::default();
     let one = store.put_tree(&[("f", b"one")]);
     let two = store.put_tree(&[("f", b"two"), ("g", b"new")]);
@@ -1840,8 +1829,7 @@ fn a_held_verdicts_preview_lives_across_turns_until_its_one_step() {
 /// refused push's hold given back (`held_ahead::give_back`), the store no longer holding it.
 #[test]
 fn a_push_held_ahead_of_its_landing_is_named_by_its_step() {
-  crate::test_store::audit_on_stored_shard("repository-push-held-ahead", |state| {
-    let (repo, main) = repository(state, "ahead");
+  crate::test_store::audit_on_stored_shard_made((&owner(), git("ahead")), |state, (repo, main)| {
     let chunk = crate::merge_origin::inputs_chunk_bytes();
     let large: Vec<u8> = (0..chunk * 3 + 1)
       .map(|at| u8::try_from(at % 251).unwrap())
@@ -1887,8 +1875,8 @@ fn a_deferred_build_past_its_room_waits_for_room_and_is_made() {
     client: 7,
     sequence: 1,
   };
+  let (repo, main) = crate::test_store::create_on(&daemon, 0, &owner(), git("p2-past-room"));
   let owed = crate::daemon::observe_first(&daemon, move |state| {
-    let (repo, main) = repository(state, "p2-past-room");
     let mut store = Store::default();
     let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
     let change = BranchChange::CreateDeferred {
@@ -2124,46 +2112,48 @@ fn stored_object(state: &mut ShardState, bytes: &[u8]) -> slates_merge::named::I
 #[test]
 fn a_staged_commit_is_lent_the_named_text_its_reads_meet() {
   use slates_merge::increment::{Base, VolumeOp, compose_volume_planned};
-  crate::test_store::audit_on_stored_shard("stage-commit-lent", |state| {
-    let (_, green) = repository(state, "commit-lent");
-    let first = vec![b'1'; 20_000];
-    let object = stored_object(state, &first);
-    let mut batch = crate::import_batch::ImportBatch::begin(state, green).expect("a batch");
-    let mut create = named_create("a", object, (1, 0));
-    crate::repository::svn_commit::read_named(state, &mut create).expect("read");
-    assert_eq!(batch.stage(state, create), Ok(1));
-    let journal = [VolumeOp::Extend {
-      path: "a".to_owned(),
-      at: object.len,
-      len: 5,
-    }];
-    let (doc, _) = compose_volume_planned(
-      &Base::of_files(vec![("a".to_owned(), object.len)]),
-      &journal,
-    )
-    .expect("composed");
-    let append = Increment {
-      id: [2; 32],
-      base: 1,
-      doc,
-      post_state: b"tail!".to_vec(),
-      evidence: Vec::new(),
-      named: Default::default(),
-    };
-    assert_eq!(batch.stage(state, append), Ok(2));
-    let lent = state
-      .refusals
-      .get(crate::import_batch::STAGE_COMMIT_LENT)
-      .copied();
-    assert_eq!(lent, Some(1), "the commit asked for a's text once");
-    let made = batch.with_engine(state, |engine| {
-      engine.content_bytes("a").map(<[u8]>::to_vec)
-    });
-    let mut expected = first;
-    expected.extend_from_slice(b"tail!");
-    assert_eq!(made, Some(Some(expected)));
-    batch.abandon(state);
-  });
+  crate::test_store::audit_on_stored_shard_made(
+    (&owner(), git("commit-lent")),
+    |state, (_, green)| {
+      let first = vec![b'1'; 20_000];
+      let object = stored_object(state, &first);
+      let mut batch = crate::import_batch::ImportBatch::begin(state, green).expect("a batch");
+      let mut create = named_create("a", object, (1, 0));
+      crate::repository::svn_commit::read_named(state, &mut create).expect("read");
+      assert_eq!(batch.stage(state, create), Ok(1));
+      let journal = [VolumeOp::Extend {
+        path: "a".to_owned(),
+        at: object.len,
+        len: 5,
+      }];
+      let (doc, _) = compose_volume_planned(
+        &Base::of_files(vec![("a".to_owned(), object.len)]),
+        &journal,
+      )
+      .expect("composed");
+      let append = Increment {
+        id: [2; 32],
+        base: 1,
+        doc,
+        post_state: b"tail!".to_vec(),
+        evidence: Vec::new(),
+        named: Default::default(),
+      };
+      assert_eq!(batch.stage(state, append), Ok(2));
+      let lent = state
+        .refusals
+        .get(crate::import_batch::STAGE_COMMIT_LENT)
+        .copied();
+      assert_eq!(lent, Some(1), "the commit asked for a's text once");
+      let made = batch.with_engine(state, |engine| {
+        engine.content_bytes("a").map(<[u8]>::to_vec)
+      });
+      let mut expected = first;
+      expected.extend_from_slice(b"tail!");
+      assert_eq!(made, Some(Some(expected)));
+      batch.abandon(state);
+    },
+  );
 }
 
 /// A-920 piece 3c (the judge taken a slice at a time, its lend kept). Do: in one import batch on a green, stage a named
@@ -2173,42 +2163,44 @@ fn a_staged_commit_is_lent_the_named_text_its_reads_meet() {
 #[test]
 fn a_staged_judge_is_lent_the_named_text_its_verdict_reads() {
   use slates_merge::increment::{Base, VolumeOp, compose_volume_planned};
-  crate::test_store::audit_on_stored_shard("stage-judge-lent", |state| {
-    let (_, green) = repository(state, "judge-lent");
-    let object = stored_object(state, &[b'r'; 4_096]);
-    let mut batch = crate::import_batch::ImportBatch::begin(state, green).expect("a batch");
-    let mut create = named_create("a", object, (1, 0));
-    crate::repository::svn_commit::read_named(state, &mut create).expect("read");
-    assert_eq!(batch.stage(state, create), Ok(1));
-    let journal = [VolumeOp::Rename {
-      from: "a".to_owned(),
-      to: "b".to_owned(),
-    }];
-    let (doc, _) = compose_volume_planned(
-      &Base::of_files(vec![("a".to_owned(), object.len)]),
-      &journal,
-    )
-    .expect("composed");
-    let rename = Increment {
-      id: [2; 32],
-      base: 1,
-      doc,
-      post_state: Vec::new(),
-      evidence: Vec::new(),
-      named: Default::default(),
-    };
-    assert_eq!(batch.stage(state, rename), Ok(2));
-    let lent = state
-      .refusals
-      .get(crate::vcs_store::name_holds::NAME_LENT_VERDICTS)
-      .copied();
-    assert_eq!(lent, Some(1), "the judge lent a's text once");
-    let held = batch.with_engine(state, |engine| {
-      (engine.content("a").is_some(), engine.content("b").is_some())
-    });
-    assert_eq!(held, Some((false, true)));
-    batch.abandon(state);
-  });
+  crate::test_store::audit_on_stored_shard_made(
+    (&owner(), git("judge-lent")),
+    |state, (_, green)| {
+      let object = stored_object(state, &[b'r'; 4_096]);
+      let mut batch = crate::import_batch::ImportBatch::begin(state, green).expect("a batch");
+      let mut create = named_create("a", object, (1, 0));
+      crate::repository::svn_commit::read_named(state, &mut create).expect("read");
+      assert_eq!(batch.stage(state, create), Ok(1));
+      let journal = [VolumeOp::Rename {
+        from: "a".to_owned(),
+        to: "b".to_owned(),
+      }];
+      let (doc, _) = compose_volume_planned(
+        &Base::of_files(vec![("a".to_owned(), object.len)]),
+        &journal,
+      )
+      .expect("composed");
+      let rename = Increment {
+        id: [2; 32],
+        base: 1,
+        doc,
+        post_state: Vec::new(),
+        evidence: Vec::new(),
+        named: Default::default(),
+      };
+      assert_eq!(batch.stage(state, rename), Ok(2));
+      let lent = state
+        .refusals
+        .get(crate::vcs_store::name_holds::NAME_LENT_VERDICTS)
+        .copied();
+      assert_eq!(lent, Some(1), "the judge lent a's text once");
+      let held = batch.with_engine(state, |engine| {
+        (engine.content("a").is_some(), engine.content("b").is_some())
+      });
+      assert_eq!(held, Some((false, true)));
+      batch.abandon(state);
+    },
+  );
 }
 
 /// Goal 93, A-760's append (main 01a20182's ruling of 2026-11-22 ~13:30: a work reused after a refused append must be
@@ -2220,40 +2212,42 @@ fn a_staged_judge_is_lent_the_named_text_its_verdict_reads() {
 /// verdict (`READ_CLONED_BYTES` 0).
 #[test]
 fn a_refused_named_append_is_retried_only_with_a_work_built_again() {
-  crate::test_store::audit_on_stored_shard("push-named-retry", |state| {
-    let (repository, green) = repository(state, "named");
-    let first = vec![b'1'; 20_000];
-    let second = vec![b'2'; 30_000];
-    let (first_object, second_object) =
-      (stored_object(state, &first), stored_object(state, &second));
-    let cloned = |state: &ShardState| {
-      state
-        .refusals
-        .get(super::READ_CLONED_BYTES)
-        .copied()
-        .unwrap_or(0)
-    };
-    let append = |state: &mut ShardState, mut work: Increment| {
-      crate::repository::svn_commit::read_named(state, &mut work).expect("read");
-      push(
-        state,
-        &owner(),
-        repository,
-        vec![BranchChange::Update { green, work }],
-        EntryParts::default(),
-      )
-    };
-    let landed = append(state, named_create("a", first_object, (1, 0)));
-    let stale = append(state, named_create("a", second_object, (2, 0)));
-    // The stale work was moved into the append and is gone with its refusal: the retry is a work built again.
-    let retried = append(state, named_create("b", second_object, (3, 1)));
-    assert!(landed.is_ok(), "{landed:?}");
-    assert!(matches!(stale, Err(AppendRefused::Changes(_))), "{stale:?}");
-    assert!(retried.is_ok(), "{retried:?}");
-    assert_eq!(file(state, green, "a"), Some(first));
-    assert_eq!(file(state, green, "b"), Some(second));
-    assert_eq!(cloned(state), 0, "read bytes cloned by a verdict");
-  });
+  crate::test_store::audit_on_stored_shard_made(
+    (&owner(), git("named")),
+    |state, (repository, green)| {
+      let first = vec![b'1'; 20_000];
+      let second = vec![b'2'; 30_000];
+      let (first_object, second_object) =
+        (stored_object(state, &first), stored_object(state, &second));
+      let cloned = |state: &ShardState| {
+        state
+          .refusals
+          .get(super::READ_CLONED_BYTES)
+          .copied()
+          .unwrap_or(0)
+      };
+      let append = |state: &mut ShardState, mut work: Increment| {
+        crate::repository::svn_commit::read_named(state, &mut work).expect("read");
+        push(
+          state,
+          &owner(),
+          repository,
+          vec![BranchChange::Update { green, work }],
+          EntryParts::default(),
+        )
+      };
+      let landed = append(state, named_create("a", first_object, (1, 0)));
+      let stale = append(state, named_create("a", second_object, (2, 0)));
+      // The stale work was moved into the append and is gone with its refusal: the retry is a work built again.
+      let retried = append(state, named_create("b", second_object, (3, 1)));
+      assert!(landed.is_ok(), "{landed:?}");
+      assert!(matches!(stale, Err(AppendRefused::Changes(_))), "{stale:?}");
+      assert!(retried.is_ok(), "{retried:?}");
+      assert_eq!(file(state, green, "a"), Some(first));
+      assert_eq!(file(state, green, "b"), Some(second));
+      assert_eq!(cloned(state), 0, "read bytes cloned by a verdict");
+    },
+  );
 }
 
 /// The cause a takeover that gave a green up records (`takeover::give_up`'s, A-304): what these tests record.
@@ -2285,8 +2279,8 @@ fn given_up(state: &mut ShardState, greens: &[DbVolumeId]) {
 /// were applied).
 #[test]
 fn t_a927_a_push_naming_greens_not_recovered_refuses_each_change() {
-  crate::test_store::audit_on_stored_shard("a927-push", |state| {
-    let (repo, [main, topic], mut store, one) = two_branches(state);
+  crate::test_store::audit_on_stored_shard_made((&owner(), git("tree")), |state, made| {
+    let (repo, [main, topic], mut store, one) = two_branches(state, made);
     let two = store.put_tree(&[("f", b"two")]);
     let update = BranchChange::Update {
       green: main,
@@ -2319,30 +2313,32 @@ fn t_a927_a_push_naming_greens_not_recovered_refuses_each_change() {
 /// no entry recorded (before, recorded and applied).
 #[test]
 fn t_a927_an_import_batch_onto_a_green_not_recovered_is_refused() {
-  crate::test_store::audit_on_stored_shard("a927-import-batch", |state| {
-    let (repo, main) = repository(state, "batch-given-up");
-    let mut store = Store::default();
-    let trees: Vec<ObjectKey> = [&b"zero"[..], &b"one"[..], &b"two"[..], &b"three"[..]]
-      .iter()
-      .map(|text| store.put_tree(&[("f", text)]))
-      .collect();
-    let first = work(state, main, (0, None), (trees[0], b"h0"), (&store, 1));
-    let update = BranchChange::Update {
-      green: main,
-      work: first,
-    };
-    push(state, &owner(), repo, vec![update], EntryParts::default()).expect("version 1");
-    let batch = staged_batch(state, main, (&trees, &store));
-    given_up(state, &[main]);
-    let entries = |state: &ShardState| state.db.partition().repositories().object_count(repo);
-    let before = entries(state);
-    let committed = batch.commit(state, (&owner(), repo), EntryParts::default());
-    assert_eq!(
-      committed.map(|_| ()),
-      Err(AppendRefused::Repository(not_recovered()))
-    );
-    assert_eq!(entries(state), before, "nothing recorded");
-  });
+  crate::test_store::audit_on_stored_shard_made(
+    (&owner(), git("batch-given-up")),
+    |state, (repo, main)| {
+      let mut store = Store::default();
+      let trees: Vec<ObjectKey> = [&b"zero"[..], &b"one"[..], &b"two"[..], &b"three"[..]]
+        .iter()
+        .map(|text| store.put_tree(&[("f", text)]))
+        .collect();
+      let first = work(state, main, (0, None), (trees[0], b"h0"), (&store, 1));
+      let update = BranchChange::Update {
+        green: main,
+        work: first,
+      };
+      push(state, &owner(), repo, vec![update], EntryParts::default()).expect("version 1");
+      let batch = staged_batch(state, main, (&trees, &store));
+      given_up(state, &[main]);
+      let entries = |state: &ShardState| state.db.partition().repositories().object_count(repo);
+      let before = entries(state);
+      let committed = batch.commit(state, (&owner(), repo), EntryParts::default());
+      assert_eq!(
+        committed.map(|_| ()),
+        Err(AppendRefused::Repository(not_recovered()))
+      );
+      assert_eq!(entries(state), before, "nothing recorded");
+    },
+  );
 }
 
 /// A-927's sweep: the owner's branch verbs name greens without a push. Do: make `topic` from `main`; record both not
@@ -2350,36 +2346,38 @@ fn t_a927_an_import_batch_onto_a_green_not_recovered_is_refused() {
 /// (before, each was served).
 #[test]
 fn t_a927_the_branch_verbs_naming_a_green_not_recovered_are_refused() {
-  crate::test_store::audit_on_stored_shard("a927-branch-verbs", |state| {
-    let (_, main) = repository(state, "verbs-given-up");
-    let topic = branch(state, "verbs-given-up", ("topic", "main"));
-    given_up(state, &[main, topic]);
-    let repository = || "verbs-given-up".to_owned();
-    let bodies = [
-      RequestBody::CreateBranch {
-        repository: repository(),
-        name: "made".to_owned(),
-        from: "main".to_owned(),
-        version: None,
-      },
-      RequestBody::BindBranch {
-        repository: repository(),
-        name: "again".to_owned(),
-        green: crate::verbs::to_wire_volume(topic),
-      },
-      RequestBody::RetireBranch {
-        repository: repository(),
-        name: "topic".to_owned(),
-      },
-    ];
-    for body in bodies {
-      let reply = dispatch(state, 1, &owner(), body.clone());
-      let expected = ReplyBody::Refused {
-        refusal: not_recovered(),
-      };
-      assert_eq!(reply, expected, "{body:?}");
-    }
-  });
+  crate::test_store::audit_on_stored_shard_made(
+    (&owner(), git("verbs-given-up")),
+    |state, (_, main)| {
+      let topic = branch(state, "verbs-given-up", ("topic", "main"));
+      given_up(state, &[main, topic]);
+      let repository = || "verbs-given-up".to_owned();
+      let bodies = [
+        RequestBody::CreateBranch {
+          repository: repository(),
+          name: "made".to_owned(),
+          from: "main".to_owned(),
+          version: None,
+        },
+        RequestBody::BindBranch {
+          repository: repository(),
+          name: "again".to_owned(),
+          green: crate::verbs::to_wire_volume(topic),
+        },
+        RequestBody::RetireBranch {
+          repository: repository(),
+          name: "topic".to_owned(),
+        },
+      ];
+      for body in bodies {
+        let reply = dispatch(state, 1, &owner(), body.clone());
+        let expected = ReplyBody::Refused {
+          refusal: not_recovered(),
+        };
+        assert_eq!(reply, expected, "{body:?}");
+      }
+    },
+  );
 }
 
 /// A-927's sweep: a submit merges into its green at the owner's half of the verdict (`verbs::judge_submission`). Do:
@@ -2387,7 +2385,7 @@ fn t_a927_the_branch_verbs_naming_a_green_not_recovered_are_refused() {
 /// `NotRecovered` (before, accepted).
 #[test]
 fn t_a927_a_submit_into_a_green_not_recovered_is_refused() {
-  crate::test_store::audit_on_stored_shard("a927-submit", |state| {
+  crate::test_store::on_a_stored_shard(|state| {
     let green = lone_green(state);
     let made = dispatch(
       state,
