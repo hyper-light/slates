@@ -1186,11 +1186,12 @@ fn peak_while<T>(pid: &str, work: impl FnOnce() -> T) -> (T, u64) {
   })
 }
 
-/// Prints the daemon's memory gauges (`slates status --memory`'s `mem.gauge.*` rows, `crate::memory_gauges` of
-/// slates-server) labelled `when`: what holds its memory by its own accounting at each reading, so a resident set past the
-/// bound names its holders (main 01a20182's ask of 2026-11-22 06:28).
+/// Prints the daemon's memory gauges (`slates status --memory`'s `mem.gauge.*` and `vcs_content.*` rows,
+/// `crate::memory_gauges` of slates-server) labelled `when`, beside `resident`, the figure the bound judges: what holds
+/// its memory by its own accounting at each reading, so a resident set past the bound names its holders (main
+/// 01a20182's ask of 2026-11-22 06:28) and tells bytes held from the allocator's keep.
 #[cfg(unix)]
-fn print_gauges(instance: &str, when: &str) {
+fn print_gauges(instance: &str, (when, resident): (&str, u64)) {
   let (_, report, _) = slates(instance, &[], &["status", "--memory"]);
   let rows: Vec<&str> = report
     .lines()
@@ -1200,9 +1201,20 @@ fn print_gauges(instance: &str, when: &str) {
         || line.contains("vcs_store.landed.")
         || line.contains("vcs_store.read_through.")
         || line.contains("vcs_store.git_resident")
+        || line.contains("vcs_content.")
     })
     .collect();
-  eprintln!("gauges at {when}:\n  {}", rows.join("\n  "));
+  // Beside the resident figure the bound judges, so a red tells bytes held (`mem.gauge.process.system_live_bytes`,
+  // `mapped_resident_bytes`, `vcs_content.stored_bytes`) from the allocator's keep (main's order of 2026-11-26).
+  eprintln!(
+    "gauges at {when}, resident {resident} bytes ({}):\n  {}",
+    if cfg!(target_os = "macos") {
+      "phys_footprint"
+    } else {
+      "RSS"
+    },
+    rows.join("\n  ")
+  );
 }
 
 /// What one round of the memory test measured: the pack's bytes, the daemon's peak resident set while its push and its
@@ -1278,7 +1290,7 @@ fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the
       git.ok(&source, &["push", "-q", &url, &refspec]);
     });
     let pushed = settled_resident(&pid);
-    print_gauges(&leg.instance, &format!("{name} after the push"));
+    print_gauges(&leg.instance, (&format!("{name} after the push"), pushed));
     let clone = git.copy(&format!("{name}-clone"));
     let ((), clone_peak) = peak_while(&pid, || {
       git.ok(&git.scratch, &["clone", "-q", &url, &clone]);
@@ -1298,13 +1310,13 @@ fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the
       pushed,
       cloned: {
         let cloned = settled_resident(&pid);
-        print_gauges(&leg.instance, &format!("{name} after the clone"));
+        print_gauges(&leg.instance, (&format!("{name} after the clone"), cloned));
         cloned
       },
     }
   };
   let start = settled_resident(&pid);
-  print_gauges(&leg.instance, "the start");
+  print_gauges(&leg.instance, ("the start", start));
   let warm = round("warm", WARM_COMMITS, None);
   // W: the range the warm-up's resident set moved over, from its least (the start or its settled end, whichever the
   // idle give-back left lower) to its peak: what a push and a clone cost, and the noise of reading them, whatever

@@ -18440,6 +18440,27 @@ left over the turns before its doubling deadline (310288b17). The fold: 0.33-0.4
   whole fold killed a daemon on w-git's push); the Z = 20 ms p99 is a measured gap in GAPS, and the fold's work itself
   is the next cut.
 
+**Pass 3, the share past the deadline bounded (2026-11-26, main for w-svn; A-920's checkpoint piece):** A = 16a473db1,
+B = 031bcf6e9 (each fold turn past its doubling deadline takes at most the step ceiling, `STEP_QUANTUM_CEILING_NS`,
+where it had taken whatever was left: 406 ms in one step of a wide import, debug). The same `load_bench` (1,000 clients,
+`--hot-files 800`, `--per-connection 32`, `--rounds 20`), release, in process, in ABBA order at each Z, but on a MacBook
+(Apple M5 Max) at load about 30, over git/git v2.40.0 (4,338 files): the Linux tree is on the Studio, which kiln could not
+reach that day. 0 oracle failures in all 8 runs. Server-side, milliseconds, A's rounds then B's.
+
+| Z | kind | A p99 | B p99 | A p999 | B p999 |
+|---|---|---|---|---|---|
+| 50 ms | SubmitAccepted | 11.38, 10.88 | 12.58, 12.46 | 16.60, 28.69 | 23.95, 20.75 |
+| 50 ms | Rebase | 10.17, 9.74 | 10.62, 11.53 | | |
+| 20 ms | SubmitAccepted | 21.65, 51.73 | 52.75, 49.54 | 27.09, 69.10 | 69.92, 63.74 |
+
+- **What it says.** Even. At Z = 20 ms only A's first round (run 1 of A1, B2, B3, A4) stands apart, which fits the load
+  rising through the run, not the arm. The bound changes no turn's speed. It only stops a fold turn from running past
+  the ceiling, so an even result is what it should give, and it stays (main's verdict). Its completion in turns, from
+  A-920's probe 9 (release, 594 runs of the three wide import tests): p50 20-21 ms, p90 32-41 ms, at most 102-140 ms,
+  never seconds. Caveat: these absolute figures are not comparable with passes 1 and 2. The machine (M5 Max laptop, not
+  the M3 Ultra Studio), the load (about 30, not 6-27) and the tree (git's 4,338 files, not Linux `fs`) all differ, and
+  this Mac's p99 at Z = 50 ms is about 11 ms.
+
 
 ## Offset-shift layers for a path's history: writes win, old reads lose (A-803 (b); measured and REJECTED; 2026-11-21)
 

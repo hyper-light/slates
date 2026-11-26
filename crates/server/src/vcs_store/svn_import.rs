@@ -338,6 +338,13 @@ fn takes_import(state: &ShardState, id: RepositoryId) -> Result<(), LoadFailed> 
 /// [`Importer::import_within`]: slates_svn::migration::Importer::import_within
 pub(crate) const IMPORT_PAUSES: &str = "vcs_store.svn_import.pauses";
 
+/// Counter: an import call stopped in a revision's close with its turn's slice spent ([`Importer::closing`], A-920 7b):
+/// many a wide revision shows its close was taken a unit at a time, never whole in one call. Format: a counter name in
+/// the daemon's status report.
+///
+/// [`Importer::closing`]: slates_svn::migration::Importer::closing
+pub(crate) const IMPORT_CLOSE_STEPS: &str = "vcs_store.svn_import.close_steps";
+
 /// One turn of repository `id`'s import (the module doc): units until the turn's time is spent, at least one. `More`
 /// while there is more, what the import holds then charged; at the stream's end what it did; refused, why. Ended either
 /// way, what it held is given back and its file closed. `None` when no import of `id` is under way.
@@ -423,9 +430,14 @@ fn unit(
   crate::vcs_store::settle_svn(state, id);
   match answer? {
     Ok(Imported::NeedMore { consumed, needed }) => {
-      // Stopped with its slice spent, none more needed (A-920 7a): counted.
+      // Stopped with its slice spent, none more needed, after an event (A-920 7a) or in a close (7b): counted.
       if needed == 0 {
-        state.count(IMPORT_PAUSES, 1);
+        let stopped = if importing.importer.closing() {
+          IMPORT_CLOSE_STEPS
+        } else {
+          IMPORT_PAUSES
+        };
+        state.count(stopped, 1);
       }
       importing.consume(consumed);
       importing.needed = needed;

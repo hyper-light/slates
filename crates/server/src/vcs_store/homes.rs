@@ -3289,6 +3289,24 @@ fn count_carried(bytes: usize) {
   });
 }
 
+/// The bytes of the object `identity` (`len` bytes long) from `offset`, as far as the window holding them and at most
+/// `most`, appended to `into`, read from this shard's content store, its chunk store lent: whether it held them.
+pub(crate) fn held_piece_into(
+  state: &mut ShardState,
+  (identity, len, offset): (ContentId, u64, u64),
+  (most, into): (usize, &mut Vec<u8>),
+) -> bool {
+  let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+  let Some(content) = lent.stores.content() else {
+    return false;
+  };
+  let Some(run) = content.run_at(&identity, len, offset) else {
+    return false;
+  };
+  into.extend_from_slice(run.get(..most).unwrap_or(&run));
+  true
+}
+
 /// The object `identity`, `len` bytes, read whole from this shard's content store, its chunk store lent; none where it
 /// does not hold it whole.
 pub(crate) fn held_bytes(

@@ -2356,8 +2356,9 @@ const BOUNDED_FILE: usize = 64 << 10;
 /// store as it arrived; its read cache's budget at most (`git_push.read_cache_budget_most`) what one longest object's
 /// chain asks (`Recent::budget_keeping`, its objects whole), a fraction of the pack, and never refused; the pack homed
 /// on this one-shard node by its identity, the homing holding no copy of it (b2a, `git_push.carry_buffer_most` 0), the
-/// landing's `Payload` its one whole buffer until b2b (`git_push.land_buffer_most`). Red before: the push held its pack
-/// whole in a buffer of its own, and its read cache's budget was the pack's length; before b2a, the homing two copies.
+/// landing's `Payload` read a piece at a time into one buffer (b2b, `git_push.land_buffer_most` within one piece). Red
+/// before: the push held its pack whole in a buffer of its own, and its read cache's budget was the pack's length;
+/// before b2a, the homing two copies; before b2b, the landing's buffer the whole pack (2,213,177 B at 0f3e49ab9).
 #[test]
 fn a_pushs_pack_is_put_as_it_arrives_its_buffer_a_window_and_its_cache_its_chains() {
   use crate::vcs_store::{
@@ -2426,7 +2427,11 @@ fn a_pushs_pack_is_put_as_it_arrives_its_buffer_a_window_and_its_cache_its_chain
       "a one-shard node: the origin is every content's home"
     );
     assert_eq!(carried, 0, "the homing held {carried} B of the pack");
-    assert_eq!(landed, pack_len, "the landing's one buffer, the pack");
+    let piece = u64::try_from(slates_store::store::PIECE_BYTES).unwrap();
+    assert!(
+      landed > 0 && landed <= piece,
+      "the landing held {landed} B of the pack, one piece {piece} B"
+    );
   });
 }
 

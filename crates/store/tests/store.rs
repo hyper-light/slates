@@ -483,3 +483,177 @@ fn a_replaced_sequence_releases_its_duplicate_payload_during_replay() {
   assert_eq!(read(&mut store, shared), None);
   assert_eq!(read(&mut store, new).as_deref(), Some(new.as_slice()));
 }
+
+/// The header of the oracle tests' changeset at `sequence` of repository 7.
+fn oracle_header(sequence: u64) -> Header {
+  Header {
+    tool: Tool::Git,
+    repository: 7,
+    sequence,
+    judged_over: sequence.saturating_sub(1),
+    grant: 1,
+    work: 500 + sequence,
+    time_ns: sequence,
+    sections: 2,
+  }
+}
+
+/// A payload no two pieces of which are alike, `len` bytes.
+fn oracle_payload(len: usize) -> Vec<u8> {
+  (0..len)
+    .map(|at| u8::try_from((at * 31 + at / 251) % 256).unwrap())
+    .collect()
+}
+
+/// Lands changeset `sequence` (a record section and `payload`) whole, one call ([`Store::land`]).
+fn land_whole(store: &mut Store, sequence: u64, payload: &[u8]) -> slates_store::log::Located {
+  store
+    .land(
+      oracle_header(sequence),
+      &[
+        (
+          SectionKind::Record,
+          slates_store::store::Contents::Bytes(b"refs"),
+        ),
+        (
+          SectionKind::Payload,
+          slates_store::store::Contents::Bytes(payload),
+        ),
+      ],
+      &slates_store::staging::Staging::new(0),
+    )
+    .unwrap()
+}
+
+/// Opens changeset `sequence`'s landing in pieces and writes its record section and the first `pieces` parts of
+/// `payload`, `piece` bytes a part: what a landing has written when it is cut off there.
+fn land_pieces_to(
+  store: &mut Store,
+  (sequence, payload): (u64, &[u8]),
+  (piece, pieces): (usize, usize),
+) {
+  store.open_landing(oracle_header(sequence)).unwrap();
+  store.landing_section(SectionKind::Record, 4).unwrap();
+  store.landing_part(b"refs").unwrap();
+  store
+    .landing_section(SectionKind::Payload, payload.len() as u64)
+    .unwrap();
+  for part in payload.chunks(piece).take(pieces) {
+    store.landing_part(part).unwrap();
+  }
+}
+
+/// The payload `identity` of `len` bytes read back whole from `store`, a piece at a time.
+fn read_back(store: &mut Store, identity: &[u8; 32], len: u64) -> Option<Vec<u8>> {
+  let staging = slates_store::staging::Staging::new(0);
+  let mut read = Vec::new();
+  while (read.len() as u64) < len {
+    let piece = store
+      .piece(&staging, identity, len, read.len() as u64)
+      .unwrap()?;
+    read.extend_from_slice(&piece);
+  }
+  Some(read)
+}
+
+/// Main's ruling of 2026-11-26 (b2b; CLAUDE.md §2 item 7: one landing path, whole equal to pieces by construction).
+/// Do: land a changeset of a record section and a 200,000-byte payload whole (`Store::land`) in one store, and in
+/// pieces of 997 bytes and of `PIECE_BYTES` in two others. Expect: the three stores' logs the same bytes, each listing
+/// the one changeset at the same place, its payload read back byte for byte.
+#[test]
+fn a_changeset_landed_in_pieces_is_the_changeset_landed_whole_byte_for_byte() {
+  use slates_store::store::{LOG_FILE, PIECE_BYTES};
+  let payload = oracle_payload(200_000);
+  let whole_dir = scratch("oracle-whole");
+  let mut whole = open(&whole_dir);
+  let landed = land_whole(&mut whole, 1, &payload);
+  let reference = std::fs::read(whole_dir.join(LOG_FILE)).unwrap();
+  for piece in [997, PIECE_BYTES] {
+    let dir = scratch(&format!("oracle-pieces-{piece}"));
+    let mut store = open(&dir);
+    land_pieces_to(&mut store, (1, &payload), (piece, usize::MAX));
+    let located = store.commit_landing().unwrap();
+    assert_eq!(
+      located, landed,
+      "landed at the same place, pieces of {piece}"
+    );
+    assert_eq!(
+      std::fs::read(dir.join(LOG_FILE)).unwrap(),
+      reference,
+      "the same log bytes, pieces of {piece}"
+    );
+    let rows = store.changesets(7, 0, 10).unwrap();
+    assert_eq!(rows, whole.changesets(7, 0, 10).unwrap(), "the same rows");
+    let identity = *blake3::hash(&payload).as_bytes();
+    let read = read_back(&mut store, &identity, payload.len() as u64);
+    assert_eq!(
+      read.as_deref(),
+      Some(payload.as_slice()),
+      "the payload, pieces of {piece}"
+    );
+  }
+}
+
+/// Main's ruling of 2026-11-26 (b2b's oracle; `crates/land/tests/oracle.rs`'s crash at every instruction is the
+/// pattern). Do: for every count of pieces a landing can have written, from none to all (and a last with every piece
+/// written but no commit), land changeset 1 whole, write changeset 2's record and that many pieces of its payload, and
+/// crash (the store dropped with no stop, as a `kill -9` leaves it); open the store again, then land changeset 2 in
+/// pieces and open it again. Expect: after each crash the store lists changeset 1 alone and names no payload of 2;
+/// after the second landing and its restart, both listed and 2's payload read back byte for byte, its log the
+/// reference's (both landed whole in one store, no crash).
+#[test]
+fn a_landing_crashed_at_each_piece_recovers_to_the_changeset_before_and_lands_again_whole() {
+  use slates_store::store::{LOG_FILE, PIECE_BYTES};
+  let first = oracle_payload(1_000);
+  let payload = oracle_payload(4 * PIECE_BYTES + 123);
+  let pieces = payload.len().div_ceil(PIECE_BYTES);
+  let reference_dir = scratch("crash-reference");
+  let mut reference = open(&reference_dir);
+  land_whole(&mut reference, 1, &first);
+  land_whole(&mut reference, 2, &payload);
+  drop(reference);
+  // A payload is named by the plain BLAKE3 of its bytes.
+  let identity = *blake3::hash(&payload).as_bytes();
+  let reference_log = std::fs::read(reference_dir.join(LOG_FILE)).unwrap();
+  for cut in 0..=pieces {
+    let dir = scratch(&format!("crash-at-{cut}"));
+    let mut store = open(&dir);
+    land_whole(&mut store, 1, &first);
+    land_pieces_to(&mut store, (2, &payload), (PIECE_BYTES, cut));
+    drop(store);
+    let mut store = open(&dir);
+    let listed: Vec<u64> = store
+      .changesets(7, 0, 10)
+      .unwrap()
+      .iter()
+      .map(|row| row.sequence)
+      .collect();
+    assert_eq!(listed, [1], "crashed after {cut} pieces: changeset 1 alone");
+    assert_eq!(
+      read_back(&mut store, &identity, payload.len() as u64),
+      None,
+      "crashed after {cut} pieces: no payload of 2 named"
+    );
+    land_pieces_to(&mut store, (2, &payload), (PIECE_BYTES, usize::MAX));
+    store.commit_landing().unwrap();
+    drop(store);
+    let mut store = open(&dir);
+    let listed: Vec<u64> = store
+      .changesets(7, 0, 10)
+      .unwrap()
+      .iter()
+      .map(|row| row.sequence)
+      .collect();
+    assert_eq!(listed, [1, 2], "landed again after a crash at {cut}");
+    assert_eq!(
+      read_back(&mut store, &identity, payload.len() as u64).as_deref(),
+      Some(payload.as_slice()),
+      "the payload after a crash at {cut}"
+    );
+    assert_eq!(
+      std::fs::read(dir.join(LOG_FILE)).unwrap()[..reference_log.len()],
+      reference_log[..],
+      "the reference's log after a crash at {cut}"
+    );
+  }
+}

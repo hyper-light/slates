@@ -64657,8 +64657,31 @@ GAPS.
   their history's longest poll by the wall and by its thread's CPU (`cpu_timed`, `registry::calling_thread_cpu`
   around each poll; main's order after probe 9, whose release longest steps of 22-98 ms were wall clock on loaded,
   time-shared shard threads): in debug, after 7a, 27.3, 30.2 and 30.1 ms by the wall against 27.3, 27.0 and 29.6 ms
-  of CPU (add, copy, move), so held work, not a paused thread. Next, 7b: the close a unit a step in a closing phase,
-  with an oracle against the whole close.
+  of CPU (add, copy, move), so held work, not a paused thread.
+  **7b, the close a unit a step.** A revision's close (`Repository::close_begin`, `close_step`, `records::Closing`)
+  makes its rows a path a unit, names their contents a row a unit, takes each named content the repository does not
+  hold out of the transaction a name a unit (a set, where a list's search made it quadratic), then names stored each
+  text the transaction set that the rows name, a row a unit. It stops between units once the caller's `spent` says so,
+  at least one unit a step. The importer keeps a stopped close (`Importer::closing`) and steps it first at its next
+  call, which answers `NeedMore` with none of the buffer done with and none more needed until the record is handed
+  over. `Importer::import`, never spent, closes whole in its call as before. Oracle:
+  `every_dump_svnadmin_wrote_imports_alike_with_every_close_a_unit_a_step` (golden: every close a unit a step,
+  `records::CLOSE_A_UNIT_A_STEP`; each dump holds the history `full.dump` makes closed whole and exports as `full.dump`
+  byte for byte). Planted bugs: a stop that drops the next path's row, and a stop that skips a row's stored text, each
+  red. Counter: `vcs_store.svn_import.close_steps` (`svn_import::IMPORT_CLOSE_STEPS`), more than two in `t_c2c`; red at
+  0 with the close whole. After 7b, every one of `t_c2c`'s turns is under 6 ms (debug), but its history's longest poll
+  is still 29-30 ms of thread CPU. It is the landing (`land_owed`), not a turn. A probe of every state borrow over 3 ms
+  (debug, kept in `~/.local/state/w-svn/logs/t2-probe-sites-kept.log`) named:
+  - `svn_commit::stage_texts`'s storing and hand-over (`storing_of`, `hand_over`), 14.2 ms;
+  - three paced steps past their deadline (`staging::until_done`), 10.7, 8.2 and 4.6 ms;
+  - `record_landed`, the register's op, 9.1 ms;
+  - the tail's end (`checkpoint_green_in_turns` and `fold_to_readers`), 7.4 ms;
+  - `apply_slice`, 4.5 ms;
+  - `retire_begun`, 4.5 ms;
+  - a staging step, 4.3 ms;
+  - the landing's text release, 4.2 ms;
+  - the checkpoint's turns, 5.0 and 3.9 ms.
+  The longest poll runs several of these with no yield between them. Owed: their release sizes (main's probe 10).
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 

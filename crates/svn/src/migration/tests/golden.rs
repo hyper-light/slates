@@ -532,3 +532,22 @@ fn every_dump_svnadmin_wrote_imports_alike_with_every_check_and_apply_a_unit_a_s
   }
   sliced.with(|sliced| sliced.set(false));
 }
+
+/// A-920 7b (golden). Do: import every dump `svnadmin` wrote (`full.dump`, `deltas.dump`, and `part1.dump` then
+/// `part2.dump`) with every revision's close taken a unit a step over the import's calls
+/// (`records::CLOSE_A_UNIT_A_STEP`), as an import call whose slice is always spent takes it. Expect each to hold the
+/// history `full.dump` makes closed whole, and to export as `full.dump` byte for byte.
+#[test]
+fn every_dump_svnadmin_wrote_imports_alike_with_every_close_a_unit_a_step() {
+  let whole = history(&imported(&["full.dump"]));
+  let sliced = &crate::migration::records::CLOSE_A_UNIT_A_STEP;
+  sliced.with(|sliced| sliced.set(true));
+  for dumps in [
+    &["full.dump"][..],
+    &["deltas.dump"],
+    &["part1.dump", "part2.dump"],
+  ] {
+    holds_the_full_history(&format!("{dumps:?}"), &imported(dumps), &whole);
+  }
+  sliced.with(|sliced| sliced.set(false));
+}
