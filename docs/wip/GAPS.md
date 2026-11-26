@@ -1168,6 +1168,12 @@
 >   `test_store::SHARD_BLOCKING_ALLOWED`, each with its owner and how many sites reach it, and run their blocking body
 >   through `allowing_shard_blocking`; there is no global off-switch. The list only shrinks.
 >   **The shard-blocking allow-list: 5 fixtures** (a test holds the list's length to this figure; edit both together):
+>   **Taken by w-git (2026-11-26, main's order: w-shared and w-perf held on a permission prompt since 18:03): their
+>   `audit_on_stored_shard` and `test_store::create` sites, a file at a time, each landing with its counts.** w-shared's:
+>   `repository/push/tests.rs`, `repository.rs`, `vcs_share/grants.rs`, `vcs_share/read_backs.rs`, `identities/tests.rs`,
+>   `repository/import/tests.rs`, `fleet.rs`, `replica.rs`, `daemon::tests`; w-perf's: `vcs_store/tests.rs`,
+>   `vcs_store/paths/tests.rs`, `vcs_store/commits/tests.rs`, `vcs_store/index_upkeep.rs`, `vcs_store/named_objects.rs`.
+>   Edit none of them meanwhile; main assigns them back if either agent returns.
 >   - `test_store::audit_on_stored_shard`: 97 sites. svn 0; git 0; hg 15 (`hg_push/tests.rs` 15);
 >     other 82 (`push/tests.rs` 18, `vcs_store/tests.rs` 14, `paths/tests.rs` 11,
 >     `repository.rs` 10, `commits/tests.rs` 8, `identities/tests.rs` 8, `vcs_share/grants.rs` 4,
