@@ -4902,24 +4902,10 @@ async fn recover_repository(
     let outcome = if record.tool == VcsTool::Mercurial {
       hg_record_replayed(state, (record.id, index), slices).await
     } else {
-      if !fetched_before_turn(state, (record.id, index), &mut read_index).await {
-        break;
-      }
-      // A git record carrying a pack is replayed a turn's units a unit of the recovery (A-722 part 4).
-      let ns = state.config.step_quantum_ns();
-      match record_turn(state, (record.id, index), ns) {
-        Some(RecordTurn::More) => {
-          slices.unit_done().await;
-          continue;
-        }
-        Some(RecordTurn::Wants) => {
-          if !filled_here(state, record.id).await {
-            break;
-          }
-          continue;
-        }
-        Some(RecordTurn::Replayed(outcome)) => Some(outcome),
-        None => None,
+      match git_recovery_turn(state, (record.id, index), &mut read_index, slices).await {
+        Recovering::Again => continue,
+        Recovering::Stopped => break,
+        Recovering::Turned(outcome) => outcome,
       }
     };
     let Some(outcome) = outcome else {
@@ -4937,6 +4923,46 @@ async fn recover_repository(
   // ([`put_changeset`]), once its greens' maps are made again: a warm restart leaves out of RAM what its predecessor
   // let go.
   let_go_owed(state, record.id);
+}
+
+/// What one turn of a git record's replay left its recovery ([`git_recovery_turn`]).
+enum Recovering {
+  /// The record replayed, or refused; none where it has no record there.
+  Turned(Option<Result<(), ReplayRefused>>),
+  /// More of the record to turn.
+  Again,
+  /// Its changeset's read or its pack's fill refused: the recovery stops.
+  Stopped,
+}
+
+/// One turn of repository `id`'s git record at `index` in its recovery: its changeset read from the node's store before
+/// its first turn ([`fetched_before_turn`]), then a turn's units a unit of the recovery (A-722 part 4), its pack's
+/// wanted range filled between two turns where it reads the pack a piece at a time (C2, [`filled_here`]).
+async fn git_recovery_turn(
+  state: &mut ShardState,
+  (id, index): (RepositoryId, usize),
+  read_index: &mut Option<usize>,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) -> Recovering {
+  if !fetched_before_turn(state, (id, index), read_index).await {
+    return Recovering::Stopped;
+  }
+  let ns = state.config.step_quantum_ns();
+  match record_turn(state, (id, index), ns) {
+    Some(RecordTurn::More) => {
+      slices.unit_done().await;
+      Recovering::Again
+    }
+    Some(RecordTurn::Wants) => {
+      if filled_here(state, id).await {
+        Recovering::Again
+      } else {
+        Recovering::Stopped
+      }
+    }
+    Some(RecordTurn::Replayed(outcome)) => Recovering::Turned(Some(outcome)),
+    None => Recovering::Turned(None),
+  }
 }
 
 /// Each of `record`'s greens' map of its head made again as the live store holds it (A-664 part 3), and a Subversion
@@ -5038,101 +5064,122 @@ fn rebuild_sliced_from(state: &mut ShardState, record: &RepositoryRecord) {
 /// finds them held. One that no home answers is left missing, and the replay refuses it typed.
 async fn rebuild_turns(id: RepositoryId, generation: u64) {
   loop {
-    // A version-5 record's names and pack read from the node's store where this node lacks them (A-767 C5).
-    if let Some(Some((wanted, disk))) = crate::state::with_state(|state| {
-      let under_way = state.vcs_stores.rebuild_turns.get(&id).copied()?;
-      if under_way.0 != generation || state.vcs_stores.git_replays.contains_key(&id) {
-        return None;
-      }
-      let wanted = changeset_wanted(state, id, under_way.1, false)?;
-      Some((wanted, state.vcs_disk.clone()?))
-    }) {
-      let read = read_changeset(&disk, &wanted).await;
-      let _ = crate::state::with_state(|state| {
-        read.and_then(|read| put_changeset(state, id, &wanted, read))
-      });
-    }
-    while let Some(Some((origin, shards, identity))) =
-      crate::state::with_state(|state| names_to_fetch(state, id, generation))
-    {
-      let fetched =
-        homes::read_in_region(origin, &shards, identity, crate::fleet::live_budget()).await;
-      let put = crate::state::with_state(|state| match fetched {
-        Some(bytes) if put_names_whole(state, &bytes) == Some(identity) => {
-          state.count(NAMES_FETCHED, 1);
-          true
-        }
-        _ => {
-          state.count(NAMES_UNFETCHED, 1);
-          false
-        }
-      });
-      if put != Some(true) {
-        break;
-      }
-    }
-    // A Subversion record is read back from the node's store before its replay (C2): the register names it alone.
-    let place = crate::state::with_state(|state| {
-      let (current, index) = state.vcs_stores.rebuild_turns.get(&id).copied()?;
-      (current == generation)
-        .then(|| svn_to_fetch(state, id, index).map(|place| (index, place)))
-        .flatten()
-    })
-    .flatten();
-    if let Some((index, place)) = place
-      && let Some(fetched) = fetch_svn(id, index, place).await
-    {
-      crate::state::with_state(|state| state.vcs_stores.svn_fetched.insert(id, fetched));
-    }
-    // A git record's pack read from the node's store a piece at a time: the range its last turn wanted, filled here,
-    // off the step (C2), and taken back only while this rebuild is still the repository's (a rebuild begun meanwhile
-    // gave this one's replay back).
-    #[cfg(test)]
-    while REPLAY_FILLS_BEFORE_HOLD.with(|left| left.get() == Some(0)) {
-      slates_rt::futures::yield_now().await;
-    }
-    let current = |state: &ShardState| {
-      state
-        .vcs_stores
-        .rebuild_turns
-        .get(&id)
-        .is_some_and(|(at, _)| *at == generation)
-    };
-    let wanting = crate::state::with_state(|state| {
-      let wants = current(state)
-        && state
-          .vcs_stores
-          .replay_packs
-          .get(&id)
-          .is_some_and(|pack| pack.wanted.is_some());
-      wants
-        .then(|| state.vcs_stores.replay_packs.remove(&id))
-        .flatten()
-    })
-    .flatten();
-    if let Some(pack) = wanting {
-      let left = filled(pack).await;
-      #[cfg(test)]
-      REPLAY_FILLS_BEFORE_HOLD.with(|left| left.set(left.get().map(|n| n.saturating_sub(1))));
-      let goes_on = crate::state::with_state(|state| {
-        if !current(state) {
-          return false;
-        }
-        let goes_on = pack_filled(state, id, left);
-        if !goes_on {
-          rebuild_ended(state, id);
-        }
-        goes_on
-      });
-      if goes_on != Some(true) {
-        return;
-      }
+    changeset_read_for_rebuild(id, generation).await;
+    names_fetched_for_rebuild(id, generation).await;
+    svn_fetched_for_rebuild(id, generation).await;
+    if !pack_filled_for_rebuild(id, generation).await {
+      return;
     }
     if crate::state::with_state(|state| rebuild_turn(state, id, generation)) != Some(true) {
       return;
     }
     slates_rt::futures::yield_now().await;
   }
+}
+
+/// A version-5 record's names and pack read from the node's store where this node lacks them, before its replay begins
+/// in repository `id`'s rebuild of `generation` (A-767 C5; [`read_changeset`], [`put_changeset`]).
+async fn changeset_read_for_rebuild(id: RepositoryId, generation: u64) {
+  let Some(Some((wanted, disk))) = crate::state::with_state(|state| {
+    let under_way = state.vcs_stores.rebuild_turns.get(&id).copied()?;
+    if under_way.0 != generation || state.vcs_stores.git_replays.contains_key(&id) {
+      return None;
+    }
+    let wanted = changeset_wanted(state, id, under_way.1, false)?;
+    Some((wanted, state.vcs_disk.clone()?))
+  }) else {
+    return;
+  };
+  let read = read_changeset(&disk, &wanted).await;
+  let _ =
+    crate::state::with_state(|state| read.and_then(|read| put_changeset(state, id, &wanted, read)));
+}
+
+/// A version-4 record's names and pack read from their region homes where this node does not hold them, before its
+/// replay begins in repository `id`'s rebuild of `generation` (A-724 piece 8c; [`names_to_fetch`]): each put into the
+/// content store, so the replay finds them held; one no home answers left missing, which the replay refuses typed.
+async fn names_fetched_for_rebuild(id: RepositoryId, generation: u64) {
+  while let Some(Some((origin, shards, identity))) =
+    crate::state::with_state(|state| names_to_fetch(state, id, generation))
+  {
+    let fetched =
+      homes::read_in_region(origin, &shards, identity, crate::fleet::live_budget()).await;
+    let put = crate::state::with_state(|state| match fetched {
+      Some(bytes) if put_names_whole(state, &bytes) == Some(identity) => {
+        state.count(NAMES_FETCHED, 1);
+        true
+      }
+      _ => {
+        state.count(NAMES_UNFETCHED, 1);
+        false
+      }
+    });
+    if put != Some(true) {
+      return;
+    }
+  }
+}
+
+/// A Subversion record read back from the node's store before its replay in repository `id`'s rebuild of `generation`
+/// (C2: the register names it alone).
+async fn svn_fetched_for_rebuild(id: RepositoryId, generation: u64) {
+  let place = crate::state::with_state(|state| {
+    let (current, index) = state.vcs_stores.rebuild_turns.get(&id).copied()?;
+    (current == generation)
+      .then(|| svn_to_fetch(state, id, index).map(|place| (index, place)))
+      .flatten()
+  })
+  .flatten();
+  if let Some((index, place)) = place
+    && let Some(fetched) = fetch_svn(id, index, place).await
+  {
+    crate::state::with_state(|state| state.vcs_stores.svn_fetched.insert(id, fetched));
+  }
+}
+
+/// A git record's pack read from the node's store a piece at a time (C2): the range its replay's last turn wanted in
+/// repository `id`'s rebuild of `generation`, filled here, off the step, and taken back only while this rebuild is still
+/// the repository's (a rebuild begun meanwhile gave this one's replay back). Whether the rebuild goes on.
+async fn pack_filled_for_rebuild(id: RepositoryId, generation: u64) -> bool {
+  #[cfg(test)]
+  while REPLAY_FILLS_BEFORE_HOLD.with(|left| left.get() == Some(0)) {
+    slates_rt::futures::yield_now().await;
+  }
+  let current = |state: &ShardState| {
+    state
+      .vcs_stores
+      .rebuild_turns
+      .get(&id)
+      .is_some_and(|(at, _)| *at == generation)
+  };
+  let wanting = crate::state::with_state(|state| {
+    let wants = current(state)
+      && state
+        .vcs_stores
+        .replay_packs
+        .get(&id)
+        .is_some_and(|pack| pack.wanted.is_some());
+    wants
+      .then(|| state.vcs_stores.replay_packs.remove(&id))
+      .flatten()
+  })
+  .flatten();
+  let Some(pack) = wanting else {
+    return true;
+  };
+  let left = filled(pack).await;
+  #[cfg(test)]
+  REPLAY_FILLS_BEFORE_HOLD.with(|left| left.set(left.get().map(|n| n.saturating_sub(1))));
+  crate::state::with_state(|state| {
+    if !current(state) {
+      return false;
+    }
+    let goes_on = pack_filled(state, id, left);
+    if !goes_on {
+      rebuild_ended(state, id);
+    }
+    goes_on
+  }) == Some(true)
 }
 
 /// Counter: a version-4 record's names or pack read from their region homes before its replay (A-724 piece 8c; A-722's
