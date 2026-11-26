@@ -60664,6 +60664,11 @@ Applied in the same change to:
   and for a share past it (red: 80 ms, everything left). The begin's build and encode (`CheckpointHold::begin`), first
   taken for the 428 ms, are 1.6 and 1.2 ms (debug, 9,000 files, 512 KB): the 428 ms poll was the fold in the same task.
   Main's A/B at A-579's Z, before and after, is owed (completion must not fall back into seconds).
+  An import's landing begins its checkpoints in their task's turns (`checkpoint_green_in_turns`), at its versions'
+  apply's end and its tail: `checkpoint_green` took the first fold and hold steps in its caller's step, 16 ms of one
+  landing poll (debug, 9,000 files), since a paced step with no one waiting runs on past its quantum (A-783). Other
+  callers keep the inline first steps. Counter `merge.checkpoint.begun_inline`: none from a wide landing in `t_c2c`
+  (red: one, before).
 - **The checkpoint by name, held in turns (A-579's last step, piece 1; main's order of 15:00, goal 93's, since it
   scales).** w-work-cow measured a 1 GiB green's checkpoint right after its sliced submit at 650-1,063 ms in one step:
   build 52, encode 71, record 527 ms of `db.mutate_owned`. That stalls the watchdog for any green that large, a big

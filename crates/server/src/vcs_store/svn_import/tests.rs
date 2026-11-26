@@ -1051,6 +1051,7 @@ fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shar
     window_ns,
     (tail_slices, staging_steps, apply_steps),
     (unpins, releases, prepares),
+    (inline, in_turns),
   ) = stored(move || async move {
     let (svn, _green) = subversion("wide-revision").await;
     let (loaded, _turns) = imported(svn, dump).await;
@@ -1076,6 +1077,8 @@ fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shar
         crate::repository::svn_commit::staging::LANDING_PREPARE_STEPS,
       )
     });
+    let inline = on(|state| count(state, crate::merge_service::CHECKPOINT_BEGUN_INLINE));
+    let in_turns = on(|state| count(state, crate::merge_service::CHECKPOINT_IN_TURNS));
     let (longest_ns, longest_task) = longest_poll();
     eprintln!(
       "wide-add: the longest step {} us ({longest_task})",
@@ -1087,6 +1090,7 @@ fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shar
       crate::watchdog::own_window_ns(),
       (tail_slices, staging_steps, apply_steps),
       (unpins, releases, prepares),
+      (inline, in_turns),
     )
   });
   assert_eq!(loaded, Ok(1));
@@ -1103,6 +1107,10 @@ fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shar
     prepares > 2,
     "its version's making ready took {prepares} step(s)"
   );
+  // The landing's checkpoints are taken in their task's turns, never begun in a landing's step (A-920's checkpoint
+  // piece: the first fold and hold steps inline were 16 ms of one poll, debug).
+  assert_eq!(inline, 0, "checkpoints begun in a landing's step");
+  assert!(in_turns > 0, "no checkpoint taken in turns");
   // Non-vacuity: the landing's tail ran in slices, so no loop over its texts ran whole in one step.
   assert!(tail_slices > 2, "the tail took {tail_slices} slice(s)");
   // Non-vacuity: the revision's version was applied a few units a call (goal 93 piece 3), never in one.

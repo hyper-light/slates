@@ -320,6 +320,18 @@ pub(crate) fn checkpoint_floor(state: &ShardState, green: DbVolumeId) -> u64 {
 /// Never refuses the verb that called it: a checkpoint the engine cannot take at the floor (its histories already
 /// folded past it) or the partition refuses is counted and skipped, and the chain stays whole and correct.
 pub(crate) fn checkpoint_green(state: &mut ShardState, green: DbVolumeId) {
+  checkpoint_green_with(state, green, true);
+}
+
+/// [`checkpoint_green`] with none of its work in the caller's step: its task begun at once, the identity's fold and the
+/// hold all in its turns (A-920's checkpoint piece: an import's landing took the first fold and hold steps inline in one
+/// poll, 16 ms debug at 9,000 files, since a paced step with no one waiting runs on past its quantum, A-783).
+pub(crate) fn checkpoint_green_in_turns(state: &mut ShardState, green: DbVolumeId) {
+  checkpoint_green_with(state, green, false);
+}
+
+/// [`checkpoint_green`], its first fold and hold steps taken in the caller's step where `inline`.
+fn checkpoint_green_with(state: &mut ShardState, green: DbVolumeId, inline: bool) {
   if state.merge.checkpointing.contains(&green) {
     return;
   }
@@ -342,7 +354,10 @@ pub(crate) fn checkpoint_green(state: &mut ShardState, green: DbVolumeId) {
   // 527 ms of one step, w-work-cow 2026-11-21). When a step's quantum ends with someone waiting, the rest is done in
   // turns by a task of its own.
   let quantum = state.config.step_quantum_ns();
-  let hold = if identity_folded_in_a_step(state, green, quantum) {
+  if inline {
+    state.count(CHECKPOINT_BEGUN_INLINE, 1);
+  }
+  let hold = if inline && identity_folded_in_a_step(state, green, quantum) {
     let Some(mut hold) = CheckpointHold::begin(state, green, Doubling::Wait) else {
       checkpoint_ended(state, green);
       return;
@@ -835,6 +850,11 @@ pub(crate) fn release_unnamed_checkpoints(state: &mut ShardState, green: DbVolum
 pub(crate) const CHECKPOINT_IN_TURNS: &str = "merge.checkpoint.in_turns";
 /// Counter: the longest a checkpoint in turns took from its first step to its record, nanoseconds (A-579).
 pub(crate) const CHECKPOINT_IN_TURNS_LONGEST_NS: &str = "merge.checkpoint.in_turns_longest_ns";
+
+/// Counter: a checkpoint whose first fold and hold steps ran in its caller's step ([`checkpoint_green`]), not its task's
+/// turns ([`checkpoint_green_in_turns`]): none from an import's landing (A-920's checkpoint piece). Format: a counter name
+/// in the daemon's status report.
+pub(crate) const CHECKPOINT_BEGUN_INLINE: &str = "merge.checkpoint.begun_inline";
 /// Counter: the paced steps that folded a checkpoint's identity backlog (A-579).
 pub(crate) const CHECKPOINT_IDENTITY_STEPS: &str = "merge.checkpoint.identity_steps";
 /// Counter: the steps that held a checkpoint's encoding in the content store (A-579's last step), the non-vacuity count

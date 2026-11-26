@@ -643,8 +643,7 @@
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b), and the checkpoint's identity fold takes at most the step ceiling a
 > turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history
-> task (debug, 9,000 files): the apply's last slice's inline checkpoint (`checkpoint_green`, 16 ms: its begin's build
-> 1.6 and encode 1.2 ms, then its first fold and hold steps), the tail's `fold_to_readers` (7.6 ms), the register's op
+> task (debug, 9,000 files): the tail's `fold_to_readers` (7.6 ms), the register's op
 > (`publish_held_increments` and `record_all`, 8 ms), and a turn (19 ms); its longest landing poll 28-76 ms a run. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
