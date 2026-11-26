@@ -186,6 +186,33 @@ fn change_index_holds(green: &Green) -> Result<(), String> {
   Ok(())
 }
 
+/// `inc`'s entry recording `applied` measured a unit a step ([`crate::chain_entry::measuring`],
+/// [`crate::chain_entry::measure_step`], every step spent once its first unit is taken), with a head identity where
+/// `identity`.
+fn measured_a_unit_a_step(
+  inc: &super::Increment,
+  applied: &[crate::chain_entry::Applied],
+  identity: bool,
+) -> usize {
+  let mut measuring = crate::chain_entry::measuring(identity);
+  loop {
+    if let Some(len) =
+      crate::chain_entry::measure_step((inc, applied), &mut measuring, &mut || true)
+    {
+      return len;
+    }
+  }
+}
+
+/// `work` with `path` changed as `how` names ([`reserved_change`]'s changes), or edited: a byte of the file
+/// overwritten from the work's post-state, which the entry records as a splice.
+fn measured_change(work: Work, path: &str, how: u8, mark: u8) -> Work {
+  if how % 16 >= 12 {
+    return work.op(super::OpKind::Overwrite, path, (u64::from(mark % 3), 1, 0));
+  }
+  reserved_change(work, path, how, mark)
+}
+
 fn committed_a_unit_a_step(green: &mut Green, inc: &super::Increment) -> Option<u64> {
   let Judgment::Accepted(held) = green.judge(inc) else {
     return None;
@@ -315,4 +342,62 @@ proptest! {
       }
     }
   }
+}
+
+/// [`an_entry_measured_a_unit_a_step_is_the_entry_measured_whole`]'s one history: `steps` judged on a green, each
+/// accepted verdict's entry measured whole and a unit a step, with a head identity and without, then committed. The
+/// splices the verdicts recorded; where the two lengths differ, how.
+fn measured_alike(steps: &[(Vec<(usize, u8)>, u8)]) -> Result<usize, TestCaseError> {
+  let mut green = Green::new();
+  let mut spliced = 0usize;
+  for (id, (changes, mark)) in (0u64..).zip(steps) {
+    // A file of its own whose bytes lead the work's post-state, which its edits overwrite from.
+    let mut work = Work::default().create(&format!("post{id}"), &[*mark; 4]);
+    for (index, how) in changes {
+      work = measured_change(work, PATHS[*index], *how, *mark);
+    }
+    let inc = work.at(green.head(), id);
+    let Judgment::Accepted(held) = green.judge(&inc) else {
+      continue;
+    };
+    let splices = held
+      .applied()
+      .iter()
+      .filter(|applied| matches!(applied, crate::chain_entry::Applied::Spliced(..)));
+    spliced += splices.count();
+    for identity in [false, true] {
+      prop_assert_eq!(
+        measured_a_unit_a_step(&inc, held.applied(), identity),
+        crate::chain_entry::encoded_len(&inc, held.applied(), identity)
+      );
+    }
+    prop_assert!(green.commit_judged(held).is_ok(), "the verdict committed");
+  }
+  Ok(spliced)
+}
+
+/// A-920 piece 1c (oracle). Do: judge generated works of every kind, renames and edits on a green, and measure each
+/// accepted verdict's chain entry whole (`chain_entry::encoded_len`) and a unit a step, with a head identity and
+/// without; then commit it. Expect the same length every time, and some verdict recording a splice, the effect whose
+/// length reads what the work declares.
+#[test]
+fn an_entry_measured_a_unit_a_step_is_the_entry_measured_whole() {
+  let steps = prop::collection::vec(
+    (
+      prop::collection::vec((0usize..5, any::<u8>()), 1..5),
+      any::<u8>(),
+    ),
+    1..16,
+  );
+  let spliced = std::cell::Cell::new(0usize);
+  let mut runner =
+    proptest::test_runner::TestRunner::new(slates_test_seeds::unseeded(ProptestConfig::default()));
+  let result = runner.run(&steps, |steps| {
+    spliced.set(spliced.get() + measured_alike(&steps)?);
+    Ok(())
+  });
+  if let Err(failure) = result {
+    panic!("{failure}");
+  }
+  assert!(spliced.get() > 0, "no verdict recorded a splice");
 }

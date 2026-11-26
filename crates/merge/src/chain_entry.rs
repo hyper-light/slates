@@ -620,6 +620,66 @@ pub fn encoded_len(increment: &Increment, applied: &[Applied], identity: bool) -
   )
 }
 
+/// [`encoded_len`] taken a slice at a time (A-920 piece 1c: 6.5 ms whole for an import's revision of 9,000 files,
+/// debug, the step its commit ended in): what the increment declares indexed an op a unit, holding its paths' names
+/// itself so that it outlives each step's borrow of the increment, then each effect's bytes added an effect a unit.
+pub struct Measuring {
+  /// What the increment declares, so far.
+  declared: DeclaredBy<String>,
+  /// The next op to index, then the next effect to count.
+  at: usize,
+  /// Whether the ops are indexed.
+  indexed: bool,
+  /// The effects' bytes so far.
+  effects: usize,
+  /// Whether the entry carries a head identity.
+  identity: bool,
+}
+
+/// Begins measuring an entry as [`encoded_len`] does, with a head identity where `identity` ([`measure_step`]).
+pub fn measuring(identity: bool) -> Measuring {
+  Measuring {
+    declared: DeclaredBy::new(),
+    at: 0,
+    indexed: false,
+    effects: 0,
+    identity,
+  }
+}
+
+/// One step of `measuring` ([`measuring`]) for `increment`'s entry recording `applied`, both as they were when it began,
+/// a unit at least, until `spent`: once it ends, [`encoded_len`]'s answer.
+pub fn measure_step(
+  (increment, applied): (&Increment, &[Applied]),
+  measuring: &mut Measuring,
+  spent: &mut dyn FnMut() -> bool,
+) -> Option<usize> {
+  let ops = &increment.doc.ops;
+  while !measuring.indexed {
+    let Some(op) = ops.get(measuring.at) else {
+      measuring.indexed = true;
+      measuring.at = 0;
+      break;
+    };
+    measuring.declared.declare(&increment.doc.paths, op);
+    measuring.at = measuring.at.saturating_add(1);
+    if measuring.at < ops.len() && spent() {
+      return None;
+    }
+  }
+  while let Some(effect) = applied.get(measuring.at) {
+    measuring.effects = measuring
+      .effects
+      .saturating_add(applied_bytes(&measuring.declared, effect));
+    measuring.at = measuring.at.saturating_add(1);
+    if measuring.at < applied.len() && spent() {
+      return None;
+    }
+  }
+  let identity = measuring.identity.then_some([0; HASH_BYTES]);
+  Some(tail_bytes((0, measuring.effects), (None, identity, None)))
+}
+
 /// The bytes [`encode_carrying`] writes for an entry carrying `carried` bytes of its increment's encoding, with `applied`'s
 /// effects and its trailers, without writing them: the entry's exact length, which its buffer is reserved at.
 fn entry_bytes(
@@ -632,6 +692,15 @@ fn entry_bytes(
     .iter()
     .map(|effect| applied_bytes(declared, effect))
     .fold(0usize, usize::saturating_add);
+  tail_bytes((carried, effects), (completion, identity, signature))
+}
+
+/// An entry's bytes once its effects' are known (`effects`), carrying `carried` of its increment's encoding: its header,
+/// those, and its trailers.
+fn tail_bytes(
+  (carried, effects): (usize, usize),
+  (completion, identity, signature): (Option<Completion>, Option<[u8; 32]>, Option<Signature>),
+) -> usize {
   // A completion's marker, and its key with the work's marker, and the work's id where it names one.
   let completion = completion.map_or(1, |key| {
     let without_work = 1usize.saturating_add(COMPLETION_BYTES.saturating_sub(WORK_BYTES));
@@ -651,7 +720,10 @@ fn entry_bytes(
 }
 
 /// The bytes [`put_applied`] writes for `applied`, without writing them.
-fn applied_bytes(declared: &Declared<'_>, applied: &Applied) -> usize {
+fn applied_bytes<K: Ord + core::borrow::Borrow<str>>(
+  declared: &DeclaredBy<K>,
+  applied: &Applied,
+) -> usize {
   let tagged = |paths: &[&str]| {
     paths
       .iter()
@@ -927,42 +999,59 @@ fn put_tagged_paths(out: &mut Vec<u8>, tag: u8, paths: &[&str]) {
 /// over the increment's ops, once per entry encoded or decoded; finding them by scanning every op
 /// for each splice and each copy cost O(effects × ops), quadratic for a version that splices many
 /// files.
-pub(crate) struct Declared<'a> {
+pub(crate) struct DeclaredBy<K> {
   /// Each path's content ops, in the increment's order.
-  ops: BTreeMap<&'a str, Vec<Op>>,
+  ops: BTreeMap<K, Vec<Op>>,
   /// Each copy's source version and whether it replaces, by destination, then source; the first a
   /// pair declares.
-  copies: BTreeMap<&'a str, BTreeMap<&'a str, (u64, bool)>>,
+  copies: BTreeMap<K, BTreeMap<K, (u64, bool)>>,
 }
+
+/// [`DeclaredBy`] borrowing the increment's paths: what an entry's encoding and decoding read.
+pub(crate) type Declared<'a> = DeclaredBy<&'a str>;
 
 impl<'a> Declared<'a> {
   /// The index of what `increment` declares: every op visited once.
   pub(crate) fn of(increment: &'a Increment) -> Declared<'a> {
-    let mut declared = Declared {
-      ops: BTreeMap::new(),
-      copies: BTreeMap::new(),
-    };
-    let paths = &increment.doc.paths;
+    let mut declared = DeclaredBy::new();
     for op in &increment.doc.ops {
       #[cfg(test)]
       tests::count_visit();
-      let Some(path) = paths.path(op.path) else {
-        continue;
-      };
-      if crate::engine::is_content(op.kind) {
-        declared.ops.entry(path).or_default().push(*op);
-      } else if op.kind == OpKind::Copy
-        && let Some(from) = paths.path(op.src)
-      {
-        declared
-          .copies
-          .entry(path)
-          .or_default()
-          .entry(from)
-          .or_insert((op.at, op.replaces()));
-      }
+      declared.declare(&increment.doc.paths, op);
     }
     declared
+  }
+}
+
+impl<K: Ord + core::borrow::Borrow<str>> DeclaredBy<K> {
+  /// Nothing declared yet.
+  fn new() -> DeclaredBy<K> {
+    DeclaredBy {
+      ops: BTreeMap::new(),
+      copies: BTreeMap::new(),
+    }
+  }
+
+  /// `op`, named in `paths`, added to what is declared: a content op to its path's, a copy to its destination's.
+  fn declare<'p>(&mut self, paths: &'p crate::ops_doc::PathTable, op: &Op)
+  where
+    K: From<&'p str>,
+  {
+    let Some(path) = paths.path(op.path) else {
+      return;
+    };
+    if crate::engine::is_content(op.kind) {
+      self.ops.entry(K::from(path)).or_default().push(*op);
+    } else if op.kind == OpKind::Copy
+      && let Some(from) = paths.path(op.src)
+    {
+      self
+        .copies
+        .entry(K::from(path))
+        .or_default()
+        .entry(K::from(from))
+        .or_insert((op.at, op.replaces()));
+    }
   }
 
   /// The content ops the increment declares for `path`, in order.
