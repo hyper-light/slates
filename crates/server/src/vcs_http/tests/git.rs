@@ -1151,6 +1151,34 @@ impl Repositories for UnrecoveredHeld {
   }
 }
 
+/// Drives one request against an unrecovered `GitSite`, asserting `503 Service Unavailable`, the
+/// expected response fields, `head_only`, and `StatusMode::AfterBody`, and returning the exchange.
+fn assert_unrecovered_reply(
+  site: &mut GitSite<Tokens, UnrecoveredHeld, Unserved>,
+  asked: &[u8],
+  expected_fields: &[(Vec<u8>, Vec<u8>)],
+  expected_head_only: bool,
+  request_body: Option<&[u8]>,
+) -> impl Exchange + use<> {
+  let (fields, head_only, status_mode, mut exchange, proven) =
+    served_lfs(ready(site.answer(&head(asked), true)));
+  assert_eq!(
+    (fields.as_slice(), head_only, status_mode, proven),
+    (
+      expected_fields,
+      expected_head_only,
+      StatusMode::AfterBody,
+      true
+    )
+  );
+  if let Some(chunk) = request_body {
+    ready(exchange.body(chunk)).unwrap();
+  }
+  ready(exchange.body_end(ClientGone::never())).unwrap();
+  assert_eq!(exchange.reply_status(), Status::SERVICE_UNAVAILABLE);
+  exchange
+}
+
 /// Deliverable 3: Do: ask for `GET`, `HEAD`, and `POST` on an unrecovered Git repository whose
 /// store failed recovery with `ReplayRefused::Unlanded`.
 /// Expect: `503 Service Unavailable` with `Content-Type: text/plain; charset=utf-8`, the cache
@@ -1176,14 +1204,7 @@ fn an_unrecovered_git_repository_returns_503_with_typed_refusal_body() {
   let expected_fields = with_cache(&[("Content-Type", "text/plain; charset=utf-8")]);
 
   let get_refs = request("GET", UPLOAD_ADVERTISEMENT, &[OWNER_BEARER]);
-  let (fields, head_only, status_mode, mut exchange, proven) =
-    served_lfs(ready(site.answer(&head(&get_refs), true)));
-  assert_eq!(
-    (fields, head_only, status_mode, proven),
-    (expected_fields.clone(), false, StatusMode::AfterBody, true)
-  );
-  ready(exchange.body_end(ClientGone::never())).unwrap();
-  assert_eq!(exchange.reply_status(), Status::SERVICE_UNAVAILABLE);
+  let mut exchange = assert_unrecovered_reply(&mut site, &get_refs, &expected_fields, false, None);
   let body = String::from_utf8(replies(&mut exchange).concat()).unwrap();
   assert!(
     body.contains("Unlanded"),
@@ -1195,14 +1216,7 @@ fn an_unrecovered_git_repository_returns_503_with_typed_refusal_body() {
   );
 
   let head_refs = request("HEAD", UPLOAD_ADVERTISEMENT, &[OWNER_BEARER]);
-  let (fields, head_only, status_mode, mut exchange, proven) =
-    served_lfs(ready(site.answer(&head(&head_refs), true)));
-  assert_eq!(
-    (fields, head_only, status_mode, proven),
-    (expected_fields.clone(), true, StatusMode::AfterBody, true)
-  );
-  ready(exchange.body_end(ClientGone::never())).unwrap();
-  assert_eq!(exchange.reply_status(), Status::SERVICE_UNAVAILABLE);
+  let _ = assert_unrecovered_reply(&mut site, &head_refs, &expected_fields, true, None);
 
   let post_upload = request(
     "POST",
@@ -1213,15 +1227,13 @@ fn an_unrecovered_git_repository_returns_503_with_typed_refusal_body() {
       "Content-Length: 4",
     ],
   );
-  let (fields, head_only, status_mode, mut exchange, proven) =
-    served_lfs(ready(site.answer(&head(&post_upload), true)));
-  assert_eq!(
-    (fields, head_only, status_mode, proven),
-    (expected_fields, false, StatusMode::AfterBody, true)
+  let mut exchange = assert_unrecovered_reply(
+    &mut site,
+    &post_upload,
+    &expected_fields,
+    false,
+    Some(b"0000"),
   );
-  ready(exchange.body(b"0000")).unwrap();
-  ready(exchange.body_end(ClientGone::never())).unwrap();
-  assert_eq!(exchange.reply_status(), Status::SERVICE_UNAVAILABLE);
   let body = String::from_utf8(replies(&mut exchange).concat()).unwrap();
   assert!(
     body.contains("Unlanded"),

@@ -128,6 +128,46 @@ fn pattern_bytes(len: usize, mul: u8, add: u8) -> Vec<u8> {
     .collect()
 }
 
+/// Verifies `repository` has one indexed changeset matching `expected_id` and its payload reads
+/// back byte-for-byte.
+fn assert_single_changeset_intact(
+  store: &mut Store,
+  repository: u128,
+  expected_id: [u8; blake3::OUT_LEN],
+  payload: &[u8],
+) {
+  let rows = store.changesets(repository, 0, 10).unwrap();
+  assert_eq!(rows.len(), 1);
+  assert_eq!(rows[0].identity, expected_id);
+  assert_eq!(read_piece_whole(store, payload).as_deref(), Some(payload));
+}
+
+/// Reopens the store at `dir` and verifies repository 1 stays unindexed, Hg/SVN/r4 payloads read
+/// back intact, and `log.end()` matches `expected_end`.
+fn assert_reopened_after_append(
+  dir: &Path,
+  hg_bytes: &[u8],
+  svn_bytes: &[u8],
+  r4_bytes: &[u8],
+  expected_end: u64,
+) {
+  let mut reopened = open_store(dir);
+  assert!(reopened.changesets(1, 0, 10).unwrap().is_empty());
+  assert_eq!(
+    read_piece_whole(&mut reopened, hg_bytes).as_deref(),
+    Some(hg_bytes)
+  );
+  assert_eq!(
+    read_piece_whole(&mut reopened, svn_bytes).as_deref(),
+    Some(svn_bytes)
+  );
+  assert_eq!(
+    read_piece_whole(&mut reopened, r4_bytes).as_deref(),
+    Some(r4_bytes)
+  );
+  assert_eq!(reopened.log().end(), expected_end);
+}
+
 /// SEAM-1: Do: land Git (1), Mercurial (2), and Subversion (3) records into one `Store` without
 /// checkpointing `rows`; flip 1 bit in Git's payload on disk; reopen `Store`.
 /// Expect: Git's corrupt record is NOT indexed and its payload is NOT served; Hg and SVN ARE
@@ -155,33 +195,16 @@ fn multi_protocol_store_recovery_isolates_corrupt_git_record_from_hg_and_svn() {
     "corrupt Git record must never be indexed"
   );
   assert_eq!(read_piece_whole(&mut store, &git_bytes), None);
-  let hg_rows = store.changesets(2, 0, 10).unwrap();
-  assert_eq!(hg_rows.len(), 1);
-  assert_eq!(hg_rows[0].identity, r2_id);
-  assert_eq!(
-    read_piece_whole(&mut store, &hg_bytes),
-    Some(hg_bytes.clone())
-  );
-  let svn_rows = store.changesets(3, 0, 10).unwrap();
-  assert_eq!(svn_rows.len(), 1);
-  assert_eq!(svn_rows[0].identity, r3_id);
-  assert_eq!(
-    read_piece_whole(&mut store, &svn_bytes),
-    Some(svn_bytes.clone())
-  );
+  assert_single_changeset_intact(&mut store, 2, r2_id, &hg_bytes);
+  assert_single_changeset_intact(&mut store, 3, r3_id, &svn_bytes);
   assert_eq!(store.log().end(), r3_end);
 
-  let r4_bytes = b"fresh git push after isolated recovery".to_vec();
-  let r4 = land_for(&mut store, Tool::Git, 4, 1, &r4_bytes);
+  let r4_bytes = b"fresh git push after isolated recovery";
+  let r4 = land_for(&mut store, Tool::Git, 4, 1, r4_bytes);
   assert_eq!(r4.offset, r3_end);
   drop(store);
 
-  let mut reopened = open_store(dir.path());
-  assert!(reopened.changesets(1, 0, 10).unwrap().is_empty());
-  assert_eq!(read_piece_whole(&mut reopened, &hg_bytes), Some(hg_bytes));
-  assert_eq!(read_piece_whole(&mut reopened, &svn_bytes), Some(svn_bytes));
-  assert_eq!(read_piece_whole(&mut reopened, &r4_bytes), Some(r4_bytes));
-  assert_eq!(reopened.log().end(), r4.end());
+  assert_reopened_after_append(dir.path(), &hg_bytes, &svn_bytes, r4_bytes, r4.end());
 }
 
 /// SEAM-1: Do: flip 1 bit in record 1's header mid-file AND leave a torn uncommitted tail after

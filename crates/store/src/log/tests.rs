@@ -245,6 +245,21 @@ fn read_payload(log: &ChangesetLog<SimFile>, located: &Located) -> Vec<u8> {
   out
 }
 
+/// Verifies recovered record locations, log end offset, and exact payload bytes for each record.
+fn assert_recovered_payloads(
+  log: &ChangesetLog<SimFile>,
+  found: &[Located],
+  expected: &[(Located, &[u8])],
+) {
+  let expected_located: Vec<Located> = expected.iter().map(|(located, _)| *located).collect();
+  assert_eq!(found, expected_located.as_slice());
+  let last_end = expected.last().unwrap().0.end();
+  assert_eq!(log.end(), last_end);
+  for (located, bytes) in expected {
+    assert_eq!(read_payload(log, located), *bytes);
+  }
+}
+
 /// SEAM-1: cross-protocol blast-radius isolation for a payload bit-flip.
 /// Do: commit records for Git (1), Mercurial (2), and Subversion (3); flip 1 bit in Git's payload;
 /// recover, read Hg and SVN back, append record 4, and recover again.
@@ -269,20 +284,17 @@ fn mid_file_payload_bitflip_does_not_take_down_following_records() {
     })
     .unwrap();
   let (mut log, found) = recovered(file);
-  assert_eq!(found, vec![r2, r3]);
-  assert_eq!(log.end(), r3.end());
   assert_eq!(log.skipped(), 1);
-  assert_eq!(read_payload(&log, &r2), hg_bytes);
-  assert_eq!(read_payload(&log, &r3), svn_bytes);
+  assert_recovered_payloads(&log, &found, &[(r2, &hg_bytes), (r3, &svn_bytes)]);
   let r4_bytes = payload(4, 1_024);
   let r4 = append_for(&mut log, Tool::Git, 101, 2, &r4_bytes);
   assert_eq!(r4.offset, r3.end());
   let (log, found) = recovered(log.into_file());
-  assert_eq!(found, vec![r2, r3, r4]);
-  assert_eq!(log.end(), r4.end());
-  assert_eq!(read_payload(&log, &r2), hg_bytes);
-  assert_eq!(read_payload(&log, &r3), svn_bytes);
-  assert_eq!(read_payload(&log, &r4), r4_bytes);
+  assert_recovered_payloads(
+    &log,
+    &found,
+    &[(r2, &hg_bytes), (r3, &svn_bytes), (r4, &r4_bytes)],
+  );
 }
 
 /// SEAM-1: cross-protocol isolation for mid-file header and trailer bit-flips, including a record
