@@ -1186,7 +1186,9 @@
 >     `whole_build::DRIVEN_BY_TEST` (a test-only hold: awaiting its pushes' landings let the build's task finish it
 >     between them, red `MOVED` 0). The probe (`home_and_land_blocking` and a held made landing panicking) failed only
 >     `t_a664_live_a_submit_waits_parked_for_its_greens_whole_build` of `commits::tests`, through its sync
->     `pushed_three`. `identities/tests.rs`' 8 moved by w-hg
+>     `pushed_three`. Its cost (main's acceptance of 2026-11-26): the storm no longer covers the build's own task slicing
+>     between live pushes, and no other test drives that interleaving (`whole_build::MOVED` and `RESTARTED` are read by
+>     the storm alone). Open, with no piece of its own. `identities/tests.rs`' 8 moved by w-hg
 >     (2026-11-26): the six that wait on nothing to `on_a_stored_shard`; the two that make git repositories to
 >     `run_on_stored_shard` tasks, made by `created().await`, the owner's submit awaited where it records its answer
 >     (`paths::tests::recorded_git_submit_as_awaited`), so `home_and_land_blocking`'s reach did not grow.
