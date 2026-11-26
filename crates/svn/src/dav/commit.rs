@@ -36,7 +36,7 @@ use super::xml::{Element, parse};
 use super::{Bounds, CUSTOM_PROPS, DAV, DavRefusal, SVN_DAV, SVN_PROPS};
 use crate::commit::drive::{Drive, Due, Edited, Green, NeedText, Setup, TextSink, Work};
 use crate::commit::edit::{CopiedFrom, EditCommand};
-use crate::index::{Index, NodeKind, PropertyPairs, Revision};
+use crate::index::{Action, Index, NodeKind, PropertyPairs, Revision};
 use crate::lock::LockTable;
 
 /// `SVN_ERR_FS_CORRUPT`: a base text the store lacks when applying a delta synchronously.
@@ -504,20 +504,23 @@ impl DavCommit {
     revision: Option<u64>,
   ) -> HttpAnswer {
     let path = relpath(path);
-    let deleted = self.open_parents(world, hooks, &path).and_then(|parent| {
-      self.step(
-        world,
-        hooks,
-        &EditCommand::DeleteEntry {
-          path: path.as_bytes(),
-          revision,
-          directory: &parent,
-        },
-      )
-    });
+    let deleted = self
+      .close_open_directories_at(world, hooks, &path)
+      .and_then(|()| self.open_parents(world, hooks, &path))
+      .and_then(|parent| {
+        self.step(
+          world,
+          hooks,
+          &EditCommand::DeleteEntry {
+            path: path.as_bytes(),
+            revision,
+            directory: &parent,
+          },
+        )
+      });
     match deleted {
       Ok(()) => {
-        self.added.remove(&path);
+        self.added.retain(|entry| !same_or_descendant(entry, &path));
         bare(HTTP_NO_CONTENT)
       }
       Err(refused) => refused,
@@ -720,7 +723,7 @@ impl DavCommit {
     let path = relpath(path);
     let parent = self.open_parents(world, hooks, &path)?;
     let file = self.token(b'c');
-    let adds = start.version_name.is_none() && !self.added.contains(&path);
+    let adds = start.version_name.is_none() && self.node_kind(world, &path) != Some(NodeKind::File);
     let command = if adds {
       EditCommand::AddFile {
         path: path.as_bytes(),
@@ -886,7 +889,7 @@ impl DavCommit {
     (path, revision): (&str, Option<u64>),
     changes: &[(Vec<u8>, Option<Vec<u8>>)],
   ) -> Result<(), HttpAnswer> {
-    let directory = self.directories.contains_key(path) || self.is_directory(world, path);
+    let directory = self.node_kind(world, path) == Some(NodeKind::Directory);
     if directory {
       let token = self.open_directory(world, hooks, path, revision)?;
       for (name, value) in changes {
@@ -940,13 +943,72 @@ impl DavCommit {
     )
   }
 
-  /// Whether `path` is a directory in the transaction's base: one this transaction added is in [`Self::directories`].
-  fn is_directory<G: ?Sized>(&self, world: &World<'_, G>, path: &str) -> bool {
-    let base = self.drive.pending().base;
-    matches!(
-      world.index.node(&format!("/{path}"), base),
-      Ok(Some(node)) if node.kind() == NodeKind::Directory
-    )
+  /// The node kind currently visible at `path` inside the pending transaction: reflects pending
+  /// adds, deletes, replaces, and inherited subtrees of copied directories before falling back to
+  /// the transaction's base revision (mirroring `Drive::view`).
+  fn node_kind<G: ?Sized>(&self, world: &World<'_, G>, path: &str) -> Option<NodeKind> {
+    let pending = self.drive.pending();
+    let full = full_path(pending.base_path, path);
+    if let Some(row) = pending.rows.get(&full) {
+      return (row.action != Action::Delete).then_some(row.kind);
+    }
+    let mut ancestor = full.as_str();
+    while let Some(end) = ancestor.rfind('/') {
+      ancestor = if end == 0 {
+        "/"
+      } else {
+        ancestor.get(..end).unwrap_or("/")
+      };
+      if let Some(row) = pending.rows.get(ancestor) {
+        match (row.action, &row.copy_from) {
+          (Action::Delete, _) | (Action::Add | Action::Replace, None) => return None,
+          (Action::Add | Action::Replace, Some(source)) => {
+            let inside = copied_source_path(&source.path, ancestor, &full);
+            return world
+              .index
+              .node(&inside, source.revision)
+              .ok()
+              .flatten()
+              .map(|node| node.kind());
+          }
+          (Action::Modify, _) => {}
+        }
+      }
+      if ancestor == "/" {
+        break;
+      }
+    }
+    world
+      .index
+      .node(&full, pending.base)
+      .ok()
+      .flatten()
+      .map(|node| node.kind())
+  }
+
+  /// Closes any open directory tokens at or beneath `path` (deepest first) before `path` is
+  /// deleted, so deleted directory batons are never closed twice or overwritten.
+  fn close_open_directories_at<G: Green + ?Sized>(
+    &mut self,
+    world: &World<'_, G>,
+    hooks: Hooks<'_>,
+    path: &str,
+  ) -> Result<(), HttpAnswer> {
+    if path.is_empty() {
+      return Ok(());
+    }
+    let mut victims: Vec<(String, Vec<u8>)> = self
+      .directories
+      .iter()
+      .filter(|(entry, _)| same_or_descendant(entry, path))
+      .map(|(entry, token)| (entry.clone(), token.clone()))
+      .collect();
+    victims.sort_by_key(|(entry, _)| std::cmp::Reverse(entry.matches('/').count()));
+    for (entry, token) in victims {
+      self.directories.remove(&entry);
+      self.step(world, hooks, &EditCommand::CloseDir { directory: &token })?;
+    }
+    Ok(())
   }
 
   /// The token of the directory at `path`, opened (with its parents) where it is not yet.
@@ -1324,5 +1386,355 @@ fn is_space(byte: u8) -> bool {
   matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
 }
 
+/// Joins `base_path` (with leading `/`) and `relative` (without leading `/`) into a canonical
+/// repository path.
+fn full_path(base_path: &str, relative: &str) -> String {
+  let base = base_path.trim_end_matches('/');
+  if relative.is_empty() {
+    if base.is_empty() {
+      String::from("/")
+    } else {
+      base.to_owned()
+    }
+  } else {
+    format!("{base}/{relative}")
+  }
+}
+
+/// Maps `full` beneath copied `ancestor` back to its source path beneath `source`.
+fn copied_source_path(source: &str, ancestor: &str, full: &str) -> String {
+  let suffix = full
+    .strip_prefix(ancestor)
+    .unwrap_or("")
+    .trim_start_matches('/');
+  let base = source.trim_end_matches('/');
+  if suffix.is_empty() {
+    if base.is_empty() {
+      String::from("/")
+    } else {
+      base.to_owned()
+    }
+  } else {
+    format!("{base}/{suffix}")
+  }
+}
+
+/// Whether `entry` equals `prefix` or is a strict path descendant of `prefix`.
+fn same_or_descendant(entry: &str, prefix: &str) -> bool {
+  entry == prefix
+    || entry
+      .strip_prefix(prefix)
+      .is_some_and(|rest| rest.starts_with('/'))
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod redteam_tests {
+  use super::*;
+  use crate::commit::revision::Revision as RevisionToCommit;
+  use crate::dump::Uuid;
+  use crate::lock::{AprTime, CommitLocks};
+  use crate::migration::{Repository, Room, Standalone};
+
+  /// Shape: room large enough for test commits.
+  const ROOM: usize = 1 << 20;
+  /// Shape: XML bounds for test PROPPATCH bodies.
+  const BOUNDS: Bounds = Bounds {
+    body_bytes: ROOM,
+    depth: 16,
+    name_bytes: 256,
+    attributes: 1 << 12,
+    elements: 1 << 12,
+  };
+  /// Shape: test repository UUID.
+  const UUID: &[u8] = b"00000000-0000-4000-8000-000000000684";
+  /// Shape: test repository creation timestamp.
+  const CREATED: &[u8] = b"2026-11-20T00:00:00.000000Z";
+  /// Shape: test commit instant.
+  const NOW: AprTime = AprTime(1_795_100_000_000_000);
+  /// Shape: svndiff making `hello\n` (6 bytes) from empty.
+  const HELLO_DELTA: &[u8] = b"SVN\x00\x00\x00\x06\x01\x06\x86hello\n";
+  /// Shape: svndiff making `world!\n` (7 bytes) via new-data instruction.
+  const WORLD_DELTA: &[u8] = b"SVN\x00\x00\x00\x07\x01\x07\x87world!\n";
+  /// Shape: PROPPATCH setting a custom property.
+  const PROPPATCH_PROP: &[u8] = b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+<D:propertyupdate xmlns:D=\"DAV:\" xmlns:C=\"http://subversion.tigris.org/xmlns/custom/\">\
+<D:set><D:prop><C:tag>v2</C:tag></D:prop></D:set></D:propertyupdate>";
+
+  fn passed(_: &Due) -> Result<(), Vec<(u32, String)>> {
+    Ok(())
+  }
+
+  fn setup(txn: &str) -> Setup {
+    Setup {
+      base_path: String::from("/"),
+      repository_url: String::from("http://svn.example/repo"),
+      filesystem: String::from("repo"),
+      transaction: txn.to_owned(),
+      locks: CommitLocks {
+        user: Some(String::from("alice")),
+        presented: BTreeMap::new(),
+        keep: false,
+      },
+      now: NOW,
+      room: ROOM,
+      rules: None,
+      revision_properties: vec![
+        (b"svn:author".to_vec(), b"alice".to_vec()),
+        (b"svn:log".to_vec(), b"redteam".to_vec()),
+      ],
+    }
+  }
+
+  /// Commits accepted DAV `work` with its sealed `sink` texts into standalone `repo`.
+  fn land(repo: &mut Standalone, work: Work, sink: Box<dyn TextSink>) -> Revision {
+    let mut revision = RevisionToCommit::of_work(work, NOW).unwrap();
+    let identities: Vec<_> = revision.stored.keys().copied().collect();
+    for identity in identities {
+      if let Some(bytes) = sink.sealed(&identity) {
+        revision.stored.remove(&identity);
+        revision.contents.insert(identity, bytes.into_owned());
+      }
+    }
+    repo.commit(revision).unwrap()
+  }
+
+  /// Creates r1 with `/trunk`, `/trunk/child` (`hello\n`), and `/trunk/sub`.
+  fn seeded_repository() -> Standalone {
+    let room = Room {
+      entries: ROOM,
+      bytes: 1 << 30,
+    };
+    let mut repo =
+      Standalone::new(Repository::new(Uuid::parse(UUID).unwrap(), CREATED, room).unwrap());
+    let hooks: Hooks<'_> = &passed;
+    let world = World {
+      index: repo.index(),
+      green: &repo,
+      locks: repo.locks(),
+    };
+    let mut commit = DavCommit::begin(
+      setup("0-1"),
+      &world,
+      hooks,
+      Box::new(crate::commit::drive::HeldTexts::new()),
+    )
+    .unwrap();
+    assert_eq!(commit.mkcol(&world, hooks, "/trunk").status, 201);
+    assert_eq!(commit.mkcol(&world, hooks, "/trunk/sub").status, 201);
+    let put = Put {
+      body: HELLO_DELTA,
+      base_md5: None,
+      result_md5: None,
+      version_name: None,
+    };
+    assert_eq!(commit.put(&world, hooks, "/trunk/child", &put).status, 201);
+    let Merged::Accepted(work, sink) = commit.merge(&world, hooks) else {
+      panic!("seed merge refused");
+    };
+    assert_eq!(land(&mut repo, *work, sink), 1);
+    repo
+  }
+
+  /// SVN-4: Do COPY `/trunk` -> `/branch` and PUT `/branch/child` with `version_name = None` in
+  /// the same transaction, then MERGE. Expect: `201` on COPY, `204` on PUT (not `E160020`),
+  /// revision 2 committed with `/branch/child` holding `world!\n` while `/trunk/child` stays `hello\n`.
+  #[test]
+  fn dav_copy_dir_then_put_inherited_child_succeeds() {
+    let mut repo = seeded_repository();
+    let hooks: Hooks<'_> = &passed;
+    let world = World {
+      index: repo.index(),
+      green: &repo,
+      locks: repo.locks(),
+    };
+    let mut commit = DavCommit::begin(
+      setup("1-1"),
+      &world,
+      hooks,
+      Box::new(crate::commit::drive::HeldTexts::new()),
+    )
+    .unwrap();
+    assert_eq!(
+      commit.copy(&world, hooks, ("/trunk", 1), "/branch").status,
+      201
+    );
+    let edit = Put {
+      body: WORLD_DELTA,
+      base_md5: None,
+      result_md5: None,
+      version_name: None,
+    };
+    let answer = commit.put(&world, hooks, "/branch/child", &edit);
+    assert_eq!(
+      answer.status,
+      204,
+      "PUT of inherited child failed: {}",
+      String::from_utf8_lossy(&answer.body)
+    );
+    let Merged::Accepted(work, sink) = commit.merge(&world, hooks) else {
+      panic!("merge after copy+put refused");
+    };
+    assert_eq!(land(&mut repo, *work, sink), 2);
+    let branch_text = repo
+      .index()
+      .node("/branch/child", 2)
+      .unwrap()
+      .unwrap()
+      .text()
+      .unwrap();
+    assert_eq!(
+      repo.text(&branch_text.identity).as_deref(),
+      Some(b"world!\n".as_slice())
+    );
+    let trunk_text = repo
+      .index()
+      .node("/trunk/child", 2)
+      .unwrap()
+      .unwrap()
+      .text()
+      .unwrap();
+    assert_eq!(
+      repo.text(&trunk_text.identity).as_deref(),
+      Some(b"hello\n".as_slice())
+    );
+  }
+
+  /// SVN-4 edge + siblings: Do COPY `/trunk` -> `/branch`, then:
+  /// (a) DELETE `/branch/child` + PUT `/branch/child` (`201`, replaced),
+  /// (b) PROPPATCH `/branch/sub` (inherited subdirectory! `207`),
+  /// (c) DELETE `/branch/sub` + MKCOL `/branch/sub` (`204` then `201`, no stale open dir token).
+  /// Expect: every step succeeds and MERGE lands revision 2 cleanly.
+  #[test]
+  fn dav_copy_dir_delete_readd_child_and_proppatch_copied_subdir_succeed() {
+    let mut repo = seeded_repository();
+    let hooks: Hooks<'_> = &passed;
+    let world = World {
+      index: repo.index(),
+      green: &repo,
+      locks: repo.locks(),
+    };
+    let mut commit = DavCommit::begin(
+      setup("1-1"),
+      &world,
+      hooks,
+      Box::new(crate::commit::drive::HeldTexts::new()),
+    )
+    .unwrap();
+    assert_eq!(
+      commit.copy(&world, hooks, ("/trunk", 1), "/branch").status,
+      201
+    );
+    assert_eq!(
+      commit.delete(&world, hooks, "/branch/child", None).status,
+      204
+    );
+    let readd = Put {
+      body: WORLD_DELTA,
+      base_md5: None,
+      result_md5: None,
+      version_name: None,
+    };
+    assert_eq!(
+      commit.put(&world, hooks, "/branch/child", &readd).status,
+      201
+    );
+    let prop = commit.proppatch(
+      &world,
+      hooks,
+      ("/branch/sub", None),
+      (PROPPATCH_PROP, &BOUNDS),
+    );
+    assert_eq!(
+      prop.status,
+      207,
+      "PROPPATCH of copied subdir failed: {}",
+      String::from_utf8_lossy(&prop.body)
+    );
+    assert_eq!(
+      commit.delete(&world, hooks, "/branch/sub", None).status,
+      204
+    );
+    assert_eq!(commit.mkcol(&world, hooks, "/branch/sub").status, 201);
+    let Merged::Accepted(work, sink) = commit.merge(&world, hooks) else {
+      panic!("merge after copy+delete+readd+proppatch refused");
+    };
+    assert_eq!(land(&mut repo, *work, sink), 2);
+  }
+
+  /// SVN-4 sibling: Do COPY `/trunk` -> `/branch` and PROPPATCH `/branch/sub` (inherited
+  /// subdirectory), then MERGE; also DELETE `/trunk/sub`, PUT `/trunk/sub`, and PROPPATCH
+  /// `/trunk/sub` (replaced dir -> file). Expect: `/branch/sub` commits as a `Directory` carrying
+  /// `tag=v2`, and `/trunk/sub` commits as a `File` carrying `world!\n` and `tag=v2`.
+  #[test]
+  fn dav_proppatch_on_copied_subdir_and_replaced_dir_to_file_uses_pending_node_kind() {
+    let mut repo = seeded_repository();
+    let hooks: Hooks<'_> = &passed;
+    let world = World {
+      index: repo.index(),
+      green: &repo,
+      locks: repo.locks(),
+    };
+    let mut commit = DavCommit::begin(
+      setup("1-1"),
+      &world,
+      hooks,
+      Box::new(crate::commit::drive::HeldTexts::new()),
+    )
+    .unwrap();
+    assert_eq!(
+      commit.copy(&world, hooks, ("/trunk", 1), "/branch").status,
+      201
+    );
+    let prop_dir = commit.proppatch(
+      &world,
+      hooks,
+      ("/branch/sub", None),
+      (PROPPATCH_PROP, &BOUNDS),
+    );
+    assert_eq!(
+      prop_dir.status,
+      207,
+      "{}",
+      String::from_utf8_lossy(&prop_dir.body)
+    );
+    assert_eq!(commit.delete(&world, hooks, "/trunk/sub", None).status, 204);
+    let replace_put = Put {
+      body: WORLD_DELTA,
+      base_md5: None,
+      result_md5: None,
+      version_name: None,
+    };
+    assert_eq!(
+      commit.put(&world, hooks, "/trunk/sub", &replace_put).status,
+      201
+    );
+    let prop_file = commit.proppatch(
+      &world,
+      hooks,
+      ("/trunk/sub", None),
+      (PROPPATCH_PROP, &BOUNDS),
+    );
+    assert_eq!(
+      prop_file.status,
+      207,
+      "{}",
+      String::from_utf8_lossy(&prop_file.body)
+    );
+    let Merged::Accepted(work, sink) = commit.merge(&world, hooks) else {
+      panic!("merge after proppatch on copied subdir + replaced dir->file refused");
+    };
+    assert_eq!(land(&mut repo, *work, sink), 2);
+    let copied_sub = repo.index().node("/branch/sub", 2).unwrap().unwrap();
+    assert_eq!(copied_sub.kind(), NodeKind::Directory);
+    let replaced_sub = repo.index().node("/trunk/sub", 2).unwrap().unwrap();
+    assert_eq!(replaced_sub.kind(), NodeKind::File);
+    let text = replaced_sub.text().unwrap();
+    assert_eq!(
+      repo.text(&text.identity).as_deref(),
+      Some(b"world!\n".as_slice())
+    );
+  }
+}

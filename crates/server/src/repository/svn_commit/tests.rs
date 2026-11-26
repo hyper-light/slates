@@ -2877,3 +2877,227 @@ fn a_mount_read_of_a_named_text_let_go_is_noted_brought_back_and_read_again() {
     assert!(away_again.is_empty(), "met a let-go window again");
   });
 }
+
+/// SVN-3: Do replace files with directories and non-empty directories with files in one commit —
+/// both via `Action::Replace` and via `Action::Delete` + `Action::Add`, with new children added
+/// under newly created directories and old properties cleared — then rebuild the store from
+/// persisted changesets. Expect: revision 2 commits cleanly (no `Uncommitted::Unsupported`),
+/// both directions hold the new kind, bytes, children, and properties (without leaking replaced
+/// node properties), and rebuild recovers revision 2 identically.
+#[test]
+fn t_svn3_atomic_file_to_dir_and_dir_to_file_replacements_succeed_and_recover() {
+  stored(|| async move {
+    let (svn, green) = subversion("kind-replace").await;
+    let old_file_props = list("tag", "old-file");
+    let old_dir_props = list("tag", "old-dir");
+    let new_file_props = list("tag", "new-file");
+    let new_dir_props = list("tag", "new-dir");
+    let r1_rows = vec![
+      row("/trunk", Action::Add, NodeKind::Directory),
+      ChangedPath {
+        properties: Some(held(&old_file_props)),
+        ..file("/trunk/swap", Action::Add, b"old-file\n")
+      },
+      ChangedPath {
+        properties: Some(held(&old_dir_props)),
+        ..row("/trunk/dir", Action::Add, NodeKind::Directory)
+      },
+      file("/trunk/dir/inner.txt", Action::Add, b"inner\n"),
+      file("/trunk/del_file", Action::Add, b"df\n"),
+      row("/trunk/del_dir", Action::Add, NodeKind::Directory),
+      row("/trunk/del_dir/sub", Action::Add, NodeKind::Directory),
+      file("/trunk/del_dir/sub/x.txt", Action::Add, b"x\n"),
+    ];
+    let r1 = revision(
+      0,
+      r1_rows,
+      &[
+        &old_file_props,
+        &old_dir_props,
+        b"old-file\n",
+        b"inner\n",
+        b"df\n",
+        b"x\n",
+      ],
+    );
+    assert_eq!(commit((&owner(), svn), r1, None).await, answered(1));
+
+    let r2_rows = vec![
+      // File -> Dir via Replace + new child in the same revision.
+      ChangedPath {
+        properties: Some(held(&new_dir_props)),
+        ..row("/trunk/swap", Action::Replace, NodeKind::Directory)
+      },
+      file("/trunk/swap/child.txt", Action::Add, b"new-child\n"),
+      // Non-empty Dir -> File via Replace.
+      ChangedPath {
+        properties: Some(held(&new_file_props)),
+        ..file("/trunk/dir", Action::Replace, b"now-file\n")
+      },
+      // File -> Dir via Replace (no props) + child.
+      row("/trunk/del_file", Action::Replace, NodeKind::Directory),
+      file("/trunk/del_file/k.txt", Action::Add, b"kid\n"),
+      // Nested non-empty Dir -> File via Replace (no props).
+      file("/trunk/del_dir", Action::Replace, b"flat\n"),
+    ];
+    let r2 = revision(
+      1,
+      r2_rows,
+      &[
+        &new_dir_props,
+        &new_file_props,
+        b"new-child\n",
+        b"now-file\n",
+        b"kid\n",
+        b"flat\n",
+      ],
+    );
+    assert_eq!(commit((&owner(), svn), r2, None).await, answered(2));
+
+    // Verify both the green and the SVN records at r2.
+    let (swap_dir, dir_is_dir, del_file_dir, del_dir_is_dir, dir_props_id, swap_props_id) =
+      on(|state| {
+        let engine = state.greens.get(&green).expect("the green");
+        assert!(engine.xattr("trunk/del_dir", PROPS).is_none());
+        assert!(engine.xattr("trunk/del_file", PROPS).is_none());
+        let records = state
+          .vcs_stores
+          .subversion_records(svn)
+          .expect("the records");
+        assert_eq!(records.index().youngest(), 2);
+        let dir_node = records.index().node("/trunk/dir", 2).unwrap().unwrap();
+        let swap_node = records.index().node("/trunk/swap", 2).unwrap().unwrap();
+        assert_eq!(dir_node.kind(), NodeKind::File);
+        assert_eq!(swap_node.kind(), NodeKind::Directory);
+        assert!(
+          records
+            .index()
+            .node("/trunk/dir/inner.txt", 2)
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+          records
+            .index()
+            .node("/trunk/del_dir/sub/x.txt", 2)
+            .unwrap()
+            .is_none()
+        );
+        (
+          engine.is_dir("trunk/swap"),
+          engine.is_dir("trunk/dir"),
+          engine.is_dir("trunk/del_file"),
+          engine.is_dir("trunk/del_dir"),
+          engine.xattr("trunk/dir", PROPS).map(|b| b.to_vec()),
+          engine.xattr("trunk/swap", PROPS).map(|b| b.to_vec()),
+        )
+      });
+    assert_eq!(
+      (swap_dir, dir_is_dir, del_file_dir, del_dir_is_dir),
+      (true, false, true, false)
+    );
+    assert_eq!(
+      dir_props_id.as_deref(),
+      Some(identity(&new_file_props).as_slice())
+    );
+    assert_eq!(
+      swap_props_id.as_deref(),
+      Some(identity(&new_dir_props).as_slice())
+    );
+    let dir_bytes = crate::vcs_store::named_objects::read_file_brought(green, "trunk/dir").await;
+    assert_eq!(dir_bytes.as_deref(), Some(&b"now-file\n"[..]));
+    let child_bytes =
+      crate::vcs_store::named_objects::read_file_brought(green, "trunk/swap/child.txt").await;
+    assert_eq!(child_bytes.as_deref(), Some(&b"new-child\n"[..]));
+    let flat_bytes =
+      crate::vcs_store::named_objects::read_file_brought(green, "trunk/del_dir").await;
+    assert_eq!(flat_bytes.as_deref(), Some(&b"flat\n"[..]));
+
+    // Rebuild the SVN store from persisted changesets and verify r2 recovers cleanly.
+    on(|state| crate::vcs_store::rebuild(state, svn));
+    youngest_reaches(svn, 2).await;
+    let recovered = on(|state| {
+      let records = state
+        .vcs_stores
+        .subversion_records(svn)
+        .expect("rebuilt records");
+      (
+        records
+          .index()
+          .node("/trunk/swap", 2)
+          .unwrap()
+          .unwrap()
+          .kind(),
+        records
+          .index()
+          .node("/trunk/dir", 2)
+          .unwrap()
+          .unwrap()
+          .kind(),
+        records
+          .index()
+          .node("/trunk/swap/child.txt", 2)
+          .unwrap()
+          .is_some(),
+      )
+    });
+    assert_eq!(recovered, (NodeKind::Directory, NodeKind::File, true));
+  });
+}
+
+/// SVN-3 (older-revision copy across intervening kind change, `restore.rs`): Do create `/trunk/item`
+/// (file) and `/trunk/dir` (dir with `a.txt`) in r1, swap both kinds in r2, and copy `/trunk@1` to
+/// `/branch` in r3. Expect: r3 commits cleanly with `/branch/item` a file (`v1\n`) and
+/// `/branch/dir` a directory holding `/branch/dir/a.txt` (`a\n`).
+#[test]
+fn t_svn3_older_revision_copy_with_intervening_kind_change_succeeds() {
+  stored(|| async move {
+    let (svn, green) = subversion("restore-kind").await;
+    let r1 = revision(
+      0,
+      vec![
+        row("/trunk", Action::Add, NodeKind::Directory),
+        file("/trunk/item", Action::Add, b"v1\n"),
+        row("/trunk/dir", Action::Add, NodeKind::Directory),
+        file("/trunk/dir/a.txt", Action::Add, b"a\n"),
+      ],
+      &[b"v1\n", b"a\n"],
+    );
+    assert_eq!(commit((&owner(), svn), r1, None).await, answered(1));
+
+    let r2 = revision(
+      1,
+      vec![
+        row("/trunk/item", Action::Replace, NodeKind::Directory),
+        file("/trunk/item/x.txt", Action::Add, b"x\n"),
+        file("/trunk/dir", Action::Replace, b"r2\n"),
+      ],
+      &[b"x\n", b"r2\n"],
+    );
+    assert_eq!(commit((&owner(), svn), r2, None).await, answered(2));
+
+    let r3 = revision(
+      2,
+      vec![ChangedPath {
+        copy_from: Some(CopySource {
+          path: "/trunk".to_owned(),
+          revision: 1,
+        }),
+        ..row("/branch", Action::Add, NodeKind::Directory)
+      }],
+      &[],
+    );
+    assert_eq!(commit((&owner(), svn), r3, None).await, answered(3));
+
+    let (item_is_dir, dir_is_dir) = on(|state| {
+      let engine = state.greens.get(&green).expect("the green");
+      (engine.is_dir("branch/item"), engine.is_dir("branch/dir"))
+    });
+    assert_eq!((item_is_dir, dir_is_dir), (false, true));
+    let item_bytes = crate::vcs_store::named_objects::read_file_brought(green, "branch/item").await;
+    assert_eq!(item_bytes.as_deref(), Some(&b"v1\n"[..]));
+    let a_bytes =
+      crate::vcs_store::named_objects::read_file_brought(green, "branch/dir/a.txt").await;
+    assert_eq!(a_bytes.as_deref(), Some(&b"a\n"[..]));
+  });
+}

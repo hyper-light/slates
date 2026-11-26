@@ -1745,28 +1745,32 @@ impl<'b> Building<'b> {
       .filter(|gone| moved(gone, &path, "").is_some() || **gone == path)
       .cloned()
       .collect();
-    for gone in &held {
-      self.gone.remove(gone);
-    }
     let replace = row.action == Action::Replace || !held.is_empty();
     let from = self.doc.paths.intern(green_path(&source.path));
     let flags = if replace { REPLACE } else { 0 };
     // A copy from an older revision is made from the head and set back where its source changed since (P7's
     // finding (1), `restore`): the green keeps no version for it.
     let head = self.records.youngest();
-    let version = match self.plans.remove(&row.path) {
+    let (version, from_head) = match self.plans.remove(&row.path) {
       Some(plan) if source.revision < head => {
-        if !plan.from_head && replace {
-          return Err(Uncommitted::Unsupported {
-            path: row.path.clone(),
-          });
-        }
         self.restores.extend(plan.restores);
-        plan.from_head.then_some(head)
+        (plan.from_head.then_some(head), plan.from_head)
       }
-      None if source.revision >= head => Some(source.revision),
+      None if source.revision >= head => (Some(source.revision), true),
       _ => return Err(corrupt()),
     };
+    if !from_head && replace {
+      // No `OpKind::Copy` is emitted when the source disappeared or changed kind since
+      // `source.revision`; keep the replaced destination (and any descendants) in `self.gone`
+      // so `restored` removes or updates them cleanly.
+      if row.action == Action::Replace {
+        self.remove(row, true)?;
+      }
+    } else {
+      for gone in &held {
+        self.gone.remove(gone);
+      }
+    }
     if let Some(version) = version {
       self.op_at(OpKind::Copy, &path, (version, 0, from), flags);
     }
@@ -1883,6 +1887,9 @@ impl<'b> Building<'b> {
         text,
         props,
       } => {
+        if let Some(stood) = self.gone.remove(path) {
+          return self.replace_node(path, stood, (directory, text.as_ref(), Some(props)));
+        }
         if directory {
           self.op(OpKind::Mkdir, path);
         } else {
@@ -1899,13 +1906,7 @@ impl<'b> Building<'b> {
         directory,
         text,
         props,
-      } => {
-        if !directory {
-          self.replace_text(path, brought.len, text.as_ref())?;
-        }
-        self.properties(path, Some(props), brought.props);
-        Ok(())
-      }
+      } => self.replace_node(path, brought, (directory, text.as_ref(), Some(props))),
     }
   }
 
@@ -1936,18 +1937,45 @@ impl<'b> Building<'b> {
     Ok(())
   }
 
-  /// A node made again where one stood (module docs): of its kind, its text the row's or none and its property list the
-  /// row's or none; a node of another kind is not declared yet.
+  /// A node made again where one stood (module docs): of its kind, updated in place, or of the
+  /// opposite kind, removed and recreated in the same increment (`slates_merge` drops replaced
+  /// metadata before applying the new node's attributes).
   fn remake(&mut self, row: &ChangedPath, path: &str, stood: Stood) -> Result<(), Uncommitted> {
-    if stood.directory != (row.kind == NodeKind::Directory) {
-      return Err(Uncommitted::Unsupported {
-        path: row.path.clone(),
-      });
+    self.replace_node(
+      path,
+      stood,
+      (
+        row.kind == NodeKind::Directory,
+        row.text.as_ref(),
+        row.properties,
+      ),
+    )
+  }
+
+  /// Replaces `stood` at `path` with a node of `directory` kind, optional `text`, and `props`.
+  fn replace_node(
+    &mut self,
+    path: &str,
+    stood: Stood,
+    (directory, text, props): (bool, Option<&Text>, Option<PropertyList>),
+  ) -> Result<(), Uncommitted> {
+    if stood.directory != directory {
+      self.gone.insert(path.to_owned(), stood);
+      if directory {
+        self.op(OpKind::Mkdir, path);
+      } else {
+        self.op(OpKind::Create, path);
+        if let Some(text) = text {
+          self.insert(path, text)?;
+        }
+      }
+      self.properties(path, props, false);
+      return Ok(());
     }
     if !stood.directory {
-      self.replace_text(path, stood.len, row.text.as_ref())?;
+      self.replace_text(path, stood.len, text)?;
     }
-    let list = row.properties.unwrap_or(PropertyList::Empty);
+    let list = props.unwrap_or(PropertyList::Empty);
     self.properties(path, Some(list), stood.props);
     Ok(())
   }

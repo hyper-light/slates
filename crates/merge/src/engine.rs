@@ -2189,6 +2189,58 @@ fn present_at(history: &[(u64, bool)], version: u64) -> bool {
     .is_some_and(|(_, present)| *present)
 }
 
+/// Appends `(version, value)` to a per-version history, updating the last entry in place if an
+/// earlier step in the same version (such as dropping replaced metadata) already recorded one.
+fn push_versioned<T>(history: &mut Vec<(u64, T)>, version: u64, value: T) {
+  if let Some((last_version, last_value)) = history.last_mut()
+    && *last_version == version
+  {
+    *last_value = value;
+  } else {
+    history.push((version, value));
+  }
+}
+
+/// Paths in `effects` that remove one node kind and create the opposite kind (directory <->
+/// non-directory) in the same version: their old mode and attributes must be dropped before the
+/// replacement node's metadata effects apply.
+fn kind_replaced_paths(effects: &[Effect]) -> BTreeSet<String> {
+  let mut removed_dirs: BTreeSet<&str> = BTreeSet::new();
+  let mut removed_non_dirs: BTreeSet<&str> = BTreeSet::new();
+  for effect in effects {
+    match effect {
+      Effect::RemoveDir(path) => {
+        removed_dirs.insert(path.as_str());
+      }
+      Effect::RemoveContent(path)
+      | Effect::RemoveSymlink(path)
+      | Effect::RemoveHardlink(path)
+      | Effect::RemoveSpecial(path) => {
+        removed_non_dirs.insert(path.as_str());
+      }
+      _ => {}
+    }
+  }
+  let mut replaced = BTreeSet::new();
+  for effect in effects {
+    match effect {
+      Effect::SetContent(path, ..)
+      | Effect::Symlink(path, _)
+      | Effect::Hardlink(path, _)
+      | Effect::Special(path, _)
+        if removed_dirs.contains(path.as_str()) =>
+      {
+        replaced.insert(path.clone());
+      }
+      Effect::MakeDir(path) if removed_non_dirs.contains(path.as_str()) => {
+        replaced.insert(path.clone());
+      }
+      _ => {}
+    }
+  }
+  replaced
+}
+
 /// The base range an op touches, for overlap testing.
 fn touched_range(op: &Op) -> Range {
   match op.kind {
@@ -5409,8 +5461,14 @@ impl Green {
     &self,
     path: &str,
     (declared, post): (&[Op], crate::named::Post<'_>),
+    r: &Resolved,
   ) -> Result<Option<Effect>, ConflictWindow> {
-    if self.occupied_by_nonfile(path) {
+    let dir_clashes = self.dirs.contains_key(path) && !r.rmdirs.contains(path);
+    let non_dir_clashes = (self.symlinks.contains_key(path)
+      || self.hardlinks.contains_key(path)
+      || self.specials.contains_key(path))
+      && !r.unlinks.contains(path);
+    if dir_clashes || non_dir_clashes {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     match self.content.get(path) {
@@ -5741,12 +5799,12 @@ impl Green {
   }
 
   /// Merges a directory creation.
-  fn merge_mkdir(&self, path: &str) -> Result<Option<Effect>, ConflictWindow> {
-    if self.content.contains_key(path)
+  fn merge_mkdir(&self, path: &str, r: &Resolved) -> Result<Option<Effect>, ConflictWindow> {
+    let occupied = self.content.contains_key(path)
       || self.symlinks.contains_key(path)
       || self.hardlinks.contains_key(path)
-      || self.specials.contains_key(path)
-    {
+      || self.specials.contains_key(path);
+    if occupied && !r.unlinks.contains(path) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     if self.dirs.contains_key(path) {
@@ -6265,7 +6323,7 @@ impl Green {
     for path in &r.creates {
       units.unit(position::Footprint::path(path), |_| {
         let content = r.content.get(path).map(Vec::as_slice).unwrap_or(&[]);
-        position::Unit::of(self.merge_create(path, (content, inc.post())))
+        position::Unit::of(self.merge_create(path, (content, inc.post()), r))
       });
     }
     for path in &r.unlinks {
@@ -6381,7 +6439,7 @@ impl Green {
   ) {
     for path in &r.mkdirs {
       units.unit(position::Footprint::path(path), |_| {
-        position::Unit::of(self.merge_mkdir(path))
+        position::Unit::of(self.merge_mkdir(path, r))
       });
     }
     for path in &r.rmdirs {
@@ -6690,6 +6748,12 @@ impl Green {
     effects.extend(linked);
     let mut changed: BTreeSet<String> = effects.iter().map(|e| e.path().to_owned()).collect();
     changed.extend(self.commit_copies(&effects, version));
+    // Same-increment kind replacement (e.g. Rmdir + Create or Unlink + Mkdir): drop the replaced
+    // node's mode and attributes BEFORE applying the replacement node's metadata effects so old
+    // metadata never leaks onto the new kind.
+    for path in kind_replaced_paths(&effects) {
+      self.drop_metadata(&path, version);
+    }
     let mut staged = Staged::default();
     // The effects' places are where the verdict put them: the node moves and links are added after every one.
     for (place, effect) in effects.into_iter().enumerate() {
@@ -6909,11 +6973,11 @@ impl Green {
         );
         self.modes.insert(&path, mode);
         self.set_mode_changed(&path, version);
-        self
-          .mode_history
-          .entry(path)
-          .or_default()
-          .push((version, Some(mode)));
+        push_versioned(
+          self.mode_history.entry(path).or_default(),
+          version,
+          Some(mode),
+        );
       }
       Effect::Symlink(path, target) => self.set_symlink(path, Some(target), version),
       Effect::RemoveSymlink(path) => {
@@ -6992,11 +7056,7 @@ impl Green {
     let at = self.seed_of(&self.xattr_history, &key, &key.0, version);
     seed(&mut self.xattr_history, &key, before, at);
     self.xattr_changed.insert(key.clone(), version);
-    self
-      .xattr_history
-      .entry(key)
-      .or_default()
-      .push((version, value));
+    push_versioned(self.xattr_history.entry(key).or_default(), version, value);
   }
 
   /// Removes the file at `path` at `version` (a staged removal, or a replaced tree's, A-626): its last value stays in
@@ -10197,5 +10257,427 @@ mod tests {
         "CheckpointEncoder must match Checkpoint::into_encoded byte-for-byte at slice={slice}"
       );
     }
+  }
+}
+
+#[cfg(test)]
+mod kind_replace_tests {
+  use super::*;
+
+  #[derive(Default)]
+  struct Ops {
+    doc: OpsDoc,
+    post: Vec<u8>,
+  }
+
+  impl Ops {
+    fn create(mut self, path: &str, bytes: &[u8]) -> Self {
+      let index = self.doc.paths.intern(path);
+      self.doc.ops.push(Op {
+        kind: OpKind::Create,
+        flags: 0,
+        path: index,
+        at: 0,
+        len: 0,
+        src: u64::MAX,
+      });
+      if !bytes.is_empty() {
+        let src = self.post.len() as u64;
+        self.post.extend_from_slice(bytes);
+        self.doc.ops.push(Op {
+          kind: OpKind::Insert,
+          flags: 0,
+          path: index,
+          at: 0,
+          len: bytes.len() as u64,
+          src,
+        });
+      }
+      self
+    }
+
+    fn overwrite(mut self, path: &str, at: u64, bytes: &[u8]) -> Self {
+      let index = self.doc.paths.intern(path);
+      let src = self.post.len() as u64;
+      self.post.extend_from_slice(bytes);
+      self.doc.ops.push(Op {
+        kind: OpKind::Overwrite,
+        flags: 0,
+        path: index,
+        at,
+        len: bytes.len() as u64,
+        src,
+      });
+      self
+    }
+
+    fn unlink(mut self, path: &str) -> Self {
+      let index = self.doc.paths.intern(path);
+      self.doc.ops.push(Op {
+        kind: OpKind::Unlink,
+        flags: 0,
+        path: index,
+        at: 0,
+        len: 0,
+        src: u64::MAX,
+      });
+      self
+    }
+
+    fn mkdir(mut self, path: &str) -> Self {
+      let index = self.doc.paths.intern(path);
+      self.doc.ops.push(Op {
+        kind: OpKind::Mkdir,
+        flags: 0,
+        path: index,
+        at: 0,
+        len: 0,
+        src: u64::MAX,
+      });
+      self
+    }
+
+    fn rmdir(mut self, path: &str) -> Self {
+      let index = self.doc.paths.intern(path);
+      self.doc.ops.push(Op {
+        kind: OpKind::Rmdir,
+        flags: 0,
+        path: index,
+        at: 0,
+        len: 0,
+        src: u64::MAX,
+      });
+      self
+    }
+
+    fn mode(mut self, path: &str, mode: u32) -> Self {
+      let index = self.doc.paths.intern(path);
+      self.doc.ops.push(Op {
+        kind: OpKind::SetMode,
+        flags: 0,
+        path: index,
+        at: 0,
+        len: u64::from(mode),
+        src: u64::MAX,
+      });
+      self
+    }
+
+    fn xattr(mut self, path: &str, name: &str, value: &[u8]) -> Self {
+      let path = self.doc.paths.intern(path);
+      let attr = self.doc.paths.intern(name);
+      let src = self.post.len() as u64;
+      self.post.extend_from_slice(value);
+      self.doc.ops.push(Op {
+        kind: OpKind::SetXattr,
+        flags: 0,
+        path,
+        at: attr,
+        len: value.len() as u64,
+        src,
+      });
+      self
+    }
+
+    fn copy(mut self, src: &str, dst: &str, version: u64) -> Self {
+      let dst = self.doc.paths.intern(dst);
+      let src = self.doc.paths.intern(src);
+      self.doc.ops.push(Op {
+        kind: OpKind::Copy,
+        flags: 0,
+        path: dst,
+        at: version,
+        len: 0,
+        src,
+      });
+      self
+    }
+
+    fn at(self, id: u8, base: u64) -> Increment {
+      Increment {
+        id: [id; 32],
+        base,
+        doc: self.doc,
+        post_state: self.post,
+        evidence: Vec::new(),
+        named: Default::default(),
+      }
+    }
+  }
+
+  /// SVN-3 / Invariant 2 & 3a: Do replace a non-empty directory (`target`) with a file and a
+  /// file (`swap`) with a directory + child in one increment; verify old modes and xattrs do NOT
+  /// leak, v1 historical reads stay intact, chain replay matches `head_identity()`, and
+  /// checkpoint + fold preserve v2 cleanly.
+  #[test]
+  fn kind_replace_dir_to_file_and_file_to_dir_drop_old_metadata_and_replay_identically() {
+    let v1 = Ops::default()
+      .mkdir("target")
+      .mode("target", 0o755)
+      .xattr("target", "user.old", b"dirval")
+      .create("target/child", b"inner")
+      .create("swap", b"oldbytes")
+      .mode("swap", 0o755)
+      .xattr("swap", "user.old", b"fileval")
+      .at(1, 0);
+    let mut green = Green::new();
+    let mut replayed = Green::new();
+    assert_eq!(green.submit(&v1), Outcome::Accepted { version: 1 });
+    assert_eq!(replayed.submit(&v1), Outcome::Accepted { version: 1 });
+
+    let v2 = Ops::default()
+      .unlink("target/child")
+      .rmdir("target")
+      .create("target", b"newfile")
+      .xattr("target", "user.fresh", b"fval")
+      .unlink("swap")
+      .mkdir("swap")
+      .xattr("swap", "user.fresh", b"dval")
+      .create("swap/sub", b"childbytes")
+      .at(2, 1);
+    let (outcome, applied) = green.submit_resolved(&v2);
+    assert_eq!(outcome, Outcome::Accepted { version: 2 });
+    let applied = applied.expect("accepted version effects");
+
+    // Current head (v2): kinds swapped and old metadata NOT leaked.
+    assert_eq!(green.content_bytes("target"), Some(b"newfile".as_slice()));
+    assert!(!green.dirs.contains_key("target"));
+    assert_eq!(green.content_bytes("target/child"), None);
+    assert_eq!(green.modes.get("target"), None);
+    assert_eq!(green.xattrs.get("target", "user.old"), None);
+    assert_eq!(
+      green.xattrs.get("target", "user.fresh").map(Vec::as_slice),
+      Some(b"fval".as_slice())
+    );
+
+    assert!(green.dirs.contains_key("swap"));
+    assert_eq!(green.content_bytes("swap"), None);
+    assert_eq!(
+      green.content_bytes("swap/sub"),
+      Some(b"childbytes".as_slice())
+    );
+    assert_eq!(green.modes.get("swap"), None);
+    assert_eq!(green.xattrs.get("swap", "user.old"), None);
+    assert_eq!(
+      green.xattrs.get("swap", "user.fresh").map(Vec::as_slice),
+      Some(b"dval".as_slice())
+    );
+
+    // Historical reads at v1 still see the original kinds and metadata.
+    assert!(green.dir_at("target", 1));
+    assert_eq!(green.content_at("target", 1), None);
+    assert_eq!(green.mode_at("target", 1), Some(0o755));
+    assert_eq!(
+      green.xattr_at("target", "user.old", 1).as_deref(),
+      Some(b"dirval".as_slice())
+    );
+    assert!(!green.dir_at("swap", 1));
+    assert_eq!(
+      green.content_at("swap", 1),
+      Some(ContentAt::Bytes(std::borrow::Cow::Borrowed(b"oldbytes")))
+    );
+    assert_eq!(green.mode_at("swap", 1), Some(0o755));
+    assert_eq!(
+      green.xattr_at("swap", "user.old", 1).as_deref(),
+      Some(b"fileval".as_slice())
+    );
+
+    // Chain entry replay produces identical head identity and metadata.
+    let inc_bytes = v2.encode();
+    let entry = crate::chain_entry::encode(
+      crate::chain_entry::held_for_tests(&inc_bytes),
+      &v2,
+      &applied,
+      None,
+      None,
+      None,
+    );
+    let decoded = crate::chain_entry::decode(&entry, &inc_bytes).expect("decode chain entry");
+    let mut replay_inc = decoded.increment;
+    assert_eq!(
+      replayed.apply_recorded(&mut replay_inc, &decoded.applied),
+      2
+    );
+    assert_eq!(replayed.head_identity(), green.head_identity());
+    assert_eq!(replayed.modes.get("target"), None);
+    assert_eq!(replayed.xattrs.get("target", "user.old"), None);
+    assert_eq!(replayed.modes.get("swap"), None);
+    assert_eq!(replayed.xattrs.get("swap", "user.old"), None);
+
+    // Checkpoint restore and history folding keep v2 exact.
+    let expected_identity = green.head_identity();
+    let checkpoint = green.checkpoint(2).expect("checkpoint at 2");
+    let mut restored = Green::restore(crate::origin::Origin::default(), &checkpoint);
+    assert_eq!(restored.head_identity(), expected_identity);
+    assert_eq!(
+      restored.content_bytes("target"),
+      Some(b"newfile".as_slice())
+    );
+    assert!(restored.dirs.contains_key("swap"));
+    assert_eq!(restored.xattrs.get("target", "user.old"), None);
+    assert_eq!(restored.xattrs.get("swap", "user.old"), None);
+
+    green.fold_history_before(2);
+    assert_eq!(green.head_identity(), expected_identity);
+    assert_eq!(green.content_bytes("target"), Some(b"newfile".as_slice()));
+    assert!(green.dirs.contains_key("swap"));
+  }
+
+  /// SVN-3 / Invariant 2 & 3a (copied tree): Do copy `src` -> `dst` and replace `dst/sub`
+  /// (dir -> file) and `dst/item` (file -> dir + child) in the same increment; expect acceptance,
+  /// zero leaked xattrs, and bit-exact chain replay.
+  #[test]
+  fn kind_replace_inside_copied_tree_in_same_increment_and_replay() {
+    let v1 = Ops::default()
+      .mkdir("src")
+      .mkdir("src/sub")
+      .xattr("src/sub", "user.old", b"1")
+      .create("src/sub/a", b"inner")
+      .create("src/item", b"orig")
+      .xattr("src/item", "user.old", b"2")
+      .at(1, 0);
+    let mut green = Green::new();
+    let mut replayed = Green::new();
+    assert_eq!(green.submit(&v1), Outcome::Accepted { version: 1 });
+    assert_eq!(replayed.submit(&v1), Outcome::Accepted { version: 1 });
+
+    let v2 = Ops::default()
+      .copy("src", "dst", 1)
+      .unlink("dst/sub/a")
+      .rmdir("dst/sub")
+      .create("dst/sub", b"replaced")
+      .xattr("dst/sub", "user.new", b"ok")
+      .unlink("dst/item")
+      .mkdir("dst/item")
+      .create("dst/item/k", b"kid")
+      .at(2, 1);
+    let (outcome, applied) = green.submit_resolved(&v2);
+    assert_eq!(outcome, Outcome::Accepted { version: 2 });
+    let applied = applied.expect("accepted copied-tree kind replace");
+    assert_eq!(green.content_bytes("dst/sub"), Some(b"replaced".as_slice()));
+    assert!(!green.dirs.contains_key("dst/sub"));
+    assert_eq!(green.xattrs.get("dst/sub", "user.old"), None);
+    assert_eq!(
+      green.xattrs.get("dst/sub", "user.new").map(Vec::as_slice),
+      Some(b"ok".as_slice())
+    );
+    assert!(green.dirs.contains_key("dst/item"));
+    assert_eq!(green.content_bytes("dst/item"), None);
+    assert_eq!(green.content_bytes("dst/item/k"), Some(b"kid".as_slice()));
+    assert_eq!(green.xattrs.get("dst/item", "user.old"), None);
+
+    let inc_bytes = v2.encode();
+    let entry = crate::chain_entry::encode(
+      crate::chain_entry::held_for_tests(&inc_bytes),
+      &v2,
+      &applied,
+      None,
+      None,
+      None,
+    );
+    let decoded = crate::chain_entry::decode(&entry, &inc_bytes).expect("decode");
+    let mut replay_inc = decoded.increment;
+    assert_eq!(
+      replayed.apply_recorded(&mut replay_inc, &decoded.applied),
+      2
+    );
+    assert_eq!(replayed.head_identity(), green.head_identity());
+  }
+
+  /// SVN-3 / Invariant 1 & 3b-c: Verify concurrent `DeleteModify` and non-removing `TypeChanged`
+  /// remain strictly enforced.
+  #[test]
+  fn kind_replace_preserves_concurrent_delete_modify_and_type_changed() {
+    let seed = Ops::default()
+      .mkdir("dir")
+      .create("dir/a", b"a")
+      .create("file", b"orig")
+      .at(1, 0);
+
+    // (b1) Concurrent file edit -> file->dir replacement MUST fail DeleteModify.
+    let mut g1 = Green::new();
+    assert_eq!(g1.submit(&seed), Outcome::Accepted { version: 1 });
+    let concurrent_edit = Ops::default().overwrite("file", 0, b"edit").at(2, 1);
+    assert_eq!(
+      g1.submit(&concurrent_edit),
+      Outcome::Accepted { version: 2 }
+    );
+    let replace_file = Ops::default().unlink("file").mkdir("file").at(3, 1);
+    assert!(
+      matches!(
+        g1.submit(&replace_file),
+        Outcome::Conflict { ref windows }
+          if windows.iter().any(|w| w.path == "file" && w.class == MergeConflictClass::DeleteModify)
+      ),
+      "concurrent file edit must trigger DeleteModify"
+    );
+
+    // (b2) Concurrent child added to dir -> dir->file replacement MUST fail DeleteModify.
+    let mut g2 = Green::new();
+    assert_eq!(g2.submit(&seed), Outcome::Accepted { version: 1 });
+    let concurrent_child = Ops::default().create("dir/late", b"late").at(2, 1);
+    assert_eq!(
+      g2.submit(&concurrent_child),
+      Outcome::Accepted { version: 2 }
+    );
+    let replace_dir = Ops::default()
+      .unlink("dir/a")
+      .rmdir("dir")
+      .create("dir", b"nowfile")
+      .at(3, 1);
+    assert!(
+      matches!(
+        g2.submit(&replace_dir),
+        Outcome::Conflict { ref windows }
+          if windows.iter().any(|w| w.path == "dir" && w.class == MergeConflictClass::DeleteModify)
+      ),
+      "concurrent child in replaced dir must trigger DeleteModify"
+    );
+
+    // (b3) Concurrent xattr change on dir -> dir->file replacement MUST fail DeleteModify.
+    let mut g3 = Green::new();
+    assert_eq!(g3.submit(&seed), Outcome::Accepted { version: 1 });
+    let concurrent_xattr = Ops::default().xattr("dir", "user.k", b"v").at(2, 1);
+    assert_eq!(
+      g3.submit(&concurrent_xattr),
+      Outcome::Accepted { version: 2 }
+    );
+    let replace_dir_meta = Ops::default()
+      .unlink("dir/a")
+      .rmdir("dir")
+      .create("dir", b"nowfile")
+      .at(3, 1);
+    assert!(
+      matches!(
+        g3.submit(&replace_dir_meta),
+        Outcome::Conflict { ref windows }
+          if windows.iter().any(|w| w.path == "dir" && w.class == MergeConflictClass::DeleteModify)
+      ),
+      "concurrent dir xattr change must trigger DeleteModify"
+    );
+
+    // (c1) Create over existing dir WITHOUT rmdir MUST fail TypeChanged.
+    let mut g4 = Green::new();
+    assert_eq!(g4.submit(&seed), Outcome::Accepted { version: 1 });
+    let bare_create = Ops::default().create("dir", b"clash").at(2, 1);
+    assert!(
+      matches!(
+        g4.submit(&bare_create),
+        Outcome::Conflict { ref windows }
+          if windows.iter().any(|w| w.path == "dir" && w.class == MergeConflictClass::TypeChanged)
+      ),
+      "Create over dir without rmdir must trigger TypeChanged"
+    );
+
+    // (c2) Mkdir over existing file WITHOUT unlink MUST fail TypeChanged.
+    let bare_mkdir = Ops::default().mkdir("file").at(3, 1);
+    assert!(
+      matches!(
+        g4.submit(&bare_mkdir),
+        Outcome::Conflict { ref windows }
+          if windows.iter().any(|w| w.path == "file" && w.class == MergeConflictClass::TypeChanged)
+      ),
+      "Mkdir over file without unlink must trigger TypeChanged"
+    );
   }
 }

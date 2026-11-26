@@ -490,13 +490,27 @@ fn lfs_transfer(head: &Head<'_>, room: u64) -> bool {
   )
 }
 
+/// Whether `head` matches any Git smart or dumb HTTP route, read within `room`.
+fn git_http_route(head: &Head<'_>, room: u64) -> bool {
+  !matches!(
+    slates_git::http::route(head, &mut slates_http::Admission::new(room)),
+    Err(slates_git::http::RouteRefused::NotFound)
+  )
+}
+
 impl<G: Site, H: Site, S: Site> Site for ToolSites<G, H, S> {
   type Exchange = ToolExchange<G::Exchange, H::Exchange, S::Exchange>;
 
   async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange> {
     if hg::wire_request(head, self.room) {
       self.hg.decide(head, secure).await.map(ToolExchange::Hg)
-    } else if svn::dav_request(head) && !lfs_transfer(head, self.room) {
+    } else if lfs_transfer(head, self.room) {
+      self.git.decide(head, secure).await.map(ToolExchange::Git)
+    } else if svn::dav_request(head) {
+      self.svn.decide(head, secure).await.map(ToolExchange::Svn)
+    } else if git_http_route(head, self.room) {
+      self.git.decide(head, secure).await.map(ToolExchange::Git)
+    } else if matches!(head.method, b"GET" | b"HEAD") {
       self.svn.decide(head, secure).await.map(ToolExchange::Svn)
     } else {
       self.git.decide(head, secure).await.map(ToolExchange::Git)

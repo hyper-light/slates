@@ -100,8 +100,8 @@ use crate::authz::{self, Authz};
 use crate::commit::drive::{self as commit_drive, Begun, Drive, Due, Pending, Start, Step, Work};
 use crate::commit::revision::StepRefusal;
 use crate::handshake::{
-  self, Access, ClientOpen, CommandMechanisms, CramKey, Principal, Repository, Session, Unserved,
-  Verdict,
+  self, Access, ClientOpen, CommandMechanisms, CramAccount, CramKey, CramVerdict, Principal,
+  Repository, Session, Unserved, Verdict,
 };
 use crate::index::{Index, Revision};
 use crate::lock::{AprTime, LockTable};
@@ -155,6 +155,30 @@ const SVN_ERR_UNSUPPORTED_FEATURE: u32 = 200_007;
 /// The words a commit the owner does not make yet is refused with.
 /// Format: slates' own, `svnserve` having no such refusal.
 const NOT_SERVED: &str = "This server does not make commits yet";
+
+/// Commands of `svnserve`'s `main_commands` answered by the read module (`reads::answer` and
+/// `reads::answer_lock_read`) that require repository read access (`serve.c` `must_have_access`).
+/// Format: `serve.c`'s `main_commands` read-only verbs plus `get-lock` and `get-locks`.
+const READ_COMMANDS: [&str; 18] = [
+  "get-latest-rev",
+  "get-dated-rev",
+  "rev-proplist",
+  "rev-prop",
+  "check-path",
+  "stat",
+  "get-mergeinfo",
+  "get-iprops",
+  "get-dir",
+  "get-locations",
+  "get-file",
+  "list",
+  "get-location-segments",
+  "get-deleted-rev",
+  "log",
+  "get-file-revs",
+  "get-lock",
+  "get-locks",
+];
 
 /// The bounds a connection keeps, each its caller's, derived from its shard's budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -489,6 +513,14 @@ impl ReadRules {
 }
 
 impl Established {
+  /// The repository-wide access level `policy` grants the session's current principal.
+  fn current_access(&self, policy: &Policy<'_>) -> authz::Access {
+    match self.session.principal {
+      Principal::Anonymous => policy.anonymous,
+      Principal::User(_) => policy.authenticated,
+    }
+  }
+
   /// The session's one read rule ([`ReadRules::for_principal`]), which the read commands, an
   /// update's target and the update's drive all judge paths by ([`authz::may_read`]).
   fn compiled_read_rules(&mut self, policy: &Policy<'_>) -> Option<&authz::PrincipalRules> {
@@ -903,6 +935,65 @@ impl Connection {
     }
   }
 
+  /// Verifies the CRAM-MD5 response against `account`, binding its canonical principal and
+  /// refusing unauthorized principals with `SVN_ERR_RA_NOT_AUTHORIZED` only after the digest
+  /// verifies.
+  ///
+  /// # Errors
+  /// [`Refused::OutOfTurn`] unless a response naming a user was just read.
+  pub fn key_as(
+    &mut self,
+    account: Option<CramAccount<'_>>,
+    out: &mut Vec<u8>,
+  ) -> Result<CramVerdict, Refused> {
+    match std::mem::replace(&mut self.phase, Phase::Ended) {
+      Phase::Handshake(mut server) => match server.key_as(account, out) {
+        Ok(CramVerdict::Established(principal)) => {
+          self.establish(&server)?;
+          Ok(CramVerdict::Established(principal))
+        }
+        Ok(CramVerdict::Denied(principal)) => Ok(CramVerdict::Denied(principal)),
+        other => {
+          self.phase = Phase::Handshake(server);
+          other.map_err(Refused::Handshake)
+        }
+      },
+      Phase::Authenticating(established, mut server, interrupted) => {
+        match server.key_as(account, out) {
+          Ok(CramVerdict::Established(principal)) => {
+            self.authenticated(established, &server, interrupted)?;
+            Ok(CramVerdict::Established(principal))
+          }
+          Ok(CramVerdict::Denied(principal)) => Ok(CramVerdict::Denied(principal)),
+          other => {
+            self.phase = Phase::Authenticating(established, server, interrupted);
+            other.map_err(Refused::Handshake)
+          }
+        }
+      }
+      other => {
+        self.phase = other;
+        Err(Refused::OutOfTurn)
+      }
+    }
+  }
+
+  /// Appends a typed command failure `( failure ( ( code message "" 0 ) ) )` and ends the
+  /// connection, so a fatal repository failure (such as an unrecovered store) reaches the client
+  /// cleanly instead of dropping the socket.
+  ///
+  /// # Errors
+  /// [`Refused::Item`] if encoding the failure fails.
+  pub fn fail_command(
+    &mut self,
+    code: u32,
+    message: &str,
+    out: &mut Vec<u8>,
+  ) -> Result<(), Refused> {
+    self.phase = Phase::Ended;
+    write_failure(&[(code, message.to_owned())], out)
+  }
+
   /// Begins the commit the client asked for ([`Turn::CommitAsked`]) with `start`, through A-655's
   /// entry point as `serve.c` `commit` begins it: its answer appended to `out`, after which the
   /// drive takes the client's editor commands; or an authentication for write asked first, the
@@ -1189,6 +1280,9 @@ impl Connection {
       }
       Parsed::Item { value, consumed } => (value, consumed),
     };
+    if established.current_access(&sources.policy) < authz::Access::Read {
+      return self.command_without_read(established, sources, &value, input, consumed, out);
+    }
     let authentication = established.reads_authentication(&sources.policy);
     let session = established.reads_session(&sources.policy, authentication);
     let outcome = read_answer(sources, &session, &value, out).map_err(Refused::Item)?;
@@ -1210,47 +1304,126 @@ impl Connection {
       Outcome::Elsewhere => {
         let (name, params) = command_of(&value).ok_or(Refused::Malformed)?;
         let item = input.get(..consumed).ok_or(Refused::Malformed)?;
-        let answered = self.elsewhere(&mut established, sources, name, params, item, out)?;
-        Ok(match answered {
-          Answered::Here => {
-            self.phase = Phase::Commands(established);
-            Turn::Took { consumed }
-          }
-          Answered::Reporting(exchange) => {
-            self.phase = Phase::Reporting(established, exchange);
-            Turn::Took { consumed }
-          }
-          Answered::Authenticating(server, interrupted) => {
-            self.phase = Phase::Authenticating(established, server, interrupted);
-            Turn::Took { consumed }
-          }
-          Answered::CommitAsked => {
-            self.phase = Phase::CommitAsked(established, item.to_vec());
-            Turn::CommitAsked { consumed }
-          }
-          Answered::LockAsked => {
-            self.phase = Phase::LockAsked(established, item.to_vec(), false);
-            Turn::LockAsked { consumed }
-          }
-          Answered::Replaying(replaying) => {
-            self.phase = Phase::Replaying(established, replaying);
-            Turn::Took { consumed }
-          }
-          Answered::RevisionProperty(pending) => {
-            let call = Box::new(pending.call());
-            self.phase = Phase::RevisionProperty(established, pending);
-            Turn::RevisionPropertyHook { call, consumed }
-          }
-          Answered::Unserved => {
-            self.phase = Phase::Commands(established);
-            Turn::Unserved {
-              command: name,
-              consumed,
-            }
-          }
-        })
+        self.dispatch_elsewhere(established, sources, (name, params, item), consumed, out)
       }
     }
+  }
+
+  /// Handles a command while the session's current principal has `Access::None` under `policy`:
+  /// every read, report, replay, and lock-read command is refused `SVN_ERR_RA_NOT_AUTHORIZED` (or
+  /// challenges an anonymous session when authentication could grant read), while write commands
+  /// still reach their own write-access checks and unknown commands answer `UnknownCommand`.
+  fn command_without_read<'a, R>(
+    &mut self,
+    established: Box<Established>,
+    sources: &Sources<'_, R>,
+    value: &Value<'a>,
+    input: &'a [u8],
+    consumed: usize,
+    out: &mut Vec<u8>,
+  ) -> Result<Turn<'a>, Refused>
+  where
+    R: reads::Repository + ?Sized,
+  {
+    let (name, params) = command_of(value).ok_or(Refused::Malformed)?;
+    let item = input.get(..consumed).ok_or(Refused::Malformed)?;
+    if READ_COMMANDS.contains(&name) {
+      self.ask_for_read(established, item.to_vec(), &sources.policy, out)?;
+      return Ok(Turn::Took { consumed });
+    }
+    if replays::is_replay(name) {
+      ReportFailure::NotAuthorized
+        .write(out)
+        .map_err(Refused::Report)?;
+      self.phase = Phase::Commands(established);
+      return Ok(Turn::Took { consumed });
+    }
+    if let Some(kind) = RequestKind::of(name) {
+      if kind == RequestKind::Update
+        && let Some(server) = self.ask(&established, &sources.policy, authz::Access::Read, out)?
+      {
+        let interrupted = Interrupted::Update {
+          command: item.to_vec(),
+        };
+        self.phase = Phase::Authenticating(established, server, Box::new(interrupted));
+      } else {
+        ReportFailure::NotAuthorized
+          .write(out)
+          .map_err(Refused::Report)?;
+        self.phase = Phase::Commands(established);
+      }
+      return Ok(Turn::Took { consumed });
+    }
+    if name == COMMIT
+      || name == REPARENT
+      || locks::is_lock_verb(name)
+      || revprops::is_revision_property_change(name)
+    {
+      return self.dispatch_elsewhere(established, sources, (name, params, item), consumed, out);
+    }
+    ReportFailure::UnknownCommand {
+      name: name.to_owned(),
+    }
+    .write(out)
+    .map_err(Refused::Report)?;
+    self.phase = Phase::Commands(established);
+    Ok(Turn::Unserved {
+      command: name,
+      consumed,
+    })
+  }
+
+  /// Dispatches a command handled outside `reads::answer` and updates the connection phase.
+  fn dispatch_elsewhere<'a, R>(
+    &mut self,
+    mut established: Box<Established>,
+    sources: &Sources<'_, R>,
+    (name, params, item): (&'a str, &[Value<'a>], &[u8]),
+    consumed: usize,
+    out: &mut Vec<u8>,
+  ) -> Result<Turn<'a>, Refused>
+  where
+    R: reads::Repository + ?Sized,
+  {
+    let answered = self.elsewhere(&mut established, sources, name, params, item, out)?;
+    Ok(match answered {
+      Answered::Here => {
+        self.phase = Phase::Commands(established);
+        Turn::Took { consumed }
+      }
+      Answered::Reporting(exchange) => {
+        self.phase = Phase::Reporting(established, exchange);
+        Turn::Took { consumed }
+      }
+      Answered::Authenticating(server, interrupted) => {
+        self.phase = Phase::Authenticating(established, server, interrupted);
+        Turn::Took { consumed }
+      }
+      Answered::CommitAsked => {
+        self.phase = Phase::CommitAsked(established, item.to_vec());
+        Turn::CommitAsked { consumed }
+      }
+      Answered::LockAsked => {
+        self.phase = Phase::LockAsked(established, item.to_vec(), false);
+        Turn::LockAsked { consumed }
+      }
+      Answered::Replaying(replaying) => {
+        self.phase = Phase::Replaying(established, replaying);
+        Turn::Took { consumed }
+      }
+      Answered::RevisionProperty(pending) => {
+        let call = Box::new(pending.call());
+        self.phase = Phase::RevisionProperty(established, pending);
+        Turn::RevisionPropertyHook { call, consumed }
+      }
+      Answered::Unserved => {
+        self.phase = Phase::Commands(established);
+        Turn::Unserved {
+          command: name,
+          consumed,
+        }
+      }
+    })
   }
 
   /// A command the read commands hand over, whose item is `item`: `reparent`, `commit`, a report
@@ -1384,6 +1557,13 @@ impl Connection {
   where
     R: reads::Repository + ?Sized,
   {
+    if established.current_access(&sources.policy) < authz::Access::Read {
+      ReportFailure::NotAuthorized
+        .write(out)
+        .map_err(Refused::Report)?;
+      self.phase = Phase::Commands(established);
+      return Ok(());
+    }
     let value = self.whole_item(command)?;
     let session = established.reads_session(&sources.policy, reads::Authentication::Done);
     let outcome = read_answer(sources, &session, &value, out).map_err(Refused::Item)?;
@@ -1472,7 +1652,8 @@ impl Connection {
           Request::read(RequestKind::Update, params).map_err(Refused::Report)?
         };
         let target = join_fspath(&established.base, &request.target);
-        let readable = authz::may_read(established.compiled_read_rules(&sources.policy), &target);
+        let readable = established.current_access(&sources.policy) >= authz::Access::Read
+          && authz::may_read(established.compiled_read_rules(&sources.policy), &target);
         let begun = self.begin_report(&established, sources.index, request, readable, true, out)?;
         self.phase = match begun {
           Some(exchange) => Phase::Reporting(established, exchange),
@@ -1875,4 +2056,307 @@ fn write_failure(errors: &[(u32, String)], out: &mut Vec<u8>) -> Result<(), Refu
     out,
   )
   .map_err(Refused::Item)
+}
+
+#[cfg(test)]
+mod redteam_tests {
+  use super::*;
+  use crate::report::drive::green::{Green, NOW, repository};
+  use crate::report::recorded::{ROOT_URL, UUID};
+
+  /// Shape: bounds large enough for every test command.
+  const LIMITS: Limits = Limits {
+    item_bytes: 1 << 20,
+    report_room: 1 << 20,
+    most_open: 64,
+  };
+  /// Shape: a budget large enough for every test command.
+  const BUDGET: Budget = Budget {
+    room: 1 << 20,
+    steps: 1 << 16,
+    quantum: None,
+  };
+  /// Shape: a client answer naming `ROOT_URL` with `edit-pipeline`.
+  const OPEN_ROOT: &[u8] =
+    b"( 2 ( edit-pipeline svndiff1 absent-entries depth mergeinfo log-revprops ) 20:svn://127.0.0.1/repo 8:SVN/1.15 ( ) ) ";
+  /// Shape: the client's `EXTERNAL` auth-response.
+  const EXTERNAL_AUTH: &[u8] = b"( EXTERNAL ( 0: ) ) ";
+  /// Format: `SVN_ERR_RA_NOT_AUTHORIZED` "Authorization failed".
+  const NOT_AUTHORIZED: &str = "( failure ( ( 170001 20:Authorization failed 0: 0 ) ) ) ";
+
+  /// Establishes an authenticated session as `user` via `EXTERNAL` on the fixtures repository.
+  fn authenticated_session(user: &[u8]) -> Connection {
+    let mut out = Vec::new();
+    let mut connection = Connection::new(LIMITS, &mut out).unwrap();
+    let Turn::Opened { consumed, .. } = connection
+      .receive(None::<&Sources<'_, Green>>, OPEN_ROOT, &mut out, BUDGET)
+      .unwrap()
+    else {
+      panic!("expected Opened");
+    };
+    assert_eq!(consumed, OPEN_ROOT.len());
+    let repository = Repository {
+      uuid: UUID,
+      root_url: ROOT_URL,
+      realm: UUID,
+      mergeinfo: true,
+      anonymous: false,
+      tunnel_user: Some(user),
+      cram_md5: true,
+    };
+    assert_eq!(connection.open(&repository, &mut out), Ok(Access::Asked));
+    let Turn::Established { .. } = connection
+      .receive(None::<&Sources<'_, Green>>, EXTERNAL_AUTH, &mut out, BUDGET)
+      .unwrap()
+    else {
+      panic!("expected Established");
+    };
+    connection
+  }
+
+  /// Sends one command on `connection` under `sources` until it awaits the next command.
+  fn send_command(
+    connection: &mut Connection,
+    sources: &Sources<'_, Green>,
+    command: &[u8],
+  ) -> String {
+    let mut out = Vec::new();
+    let mut rest = command;
+    loop {
+      match connection.receive(Some(sources), rest, &mut out, BUDGET) {
+        Ok(Turn::Took { consumed }) => rest = &rest[consumed..],
+        Ok(Turn::Wrote) => {}
+        Ok(Turn::NeedMore { .. }) => return String::from_utf8_lossy(&out).into_owned(),
+        other => panic!(
+          "unexpected turn for {:?}: {other:?}",
+          String::from_utf8_lossy(command)
+        ),
+      }
+    }
+  }
+
+  /// SVN-1: Do authenticate a user and run every read/report/replay/lock-read command while
+  /// `policy.authenticated == Access::None` and `policy.authz == None`, then repeat as a user
+  /// with `Access::Write`. Expect: every single read command refused `E170001`
+  /// ("Authorization failed") with zero repository data leaked when `Access::None`, while
+  /// `Access::Write` succeeds.
+  #[test]
+  fn authenticated_user_with_none_access_is_refused_every_read_command() {
+    let (index, green) = repository();
+    let locks = LockTable::new();
+    let texts = crate::commit::drive::HeldTexts::new();
+    let denied = Sources {
+      index: &index,
+      repository: &green,
+      locks: &locks,
+      now: NOW,
+      policy: Policy {
+        anonymous: authz::Access::None,
+        authenticated: authz::Access::None,
+        authz: None,
+        filesystem: "repo",
+      },
+      texts: &texts,
+    };
+    let allowed = Sources {
+      policy: Policy {
+        anonymous: authz::Access::None,
+        authenticated: authz::Access::Write,
+        authz: None,
+        filesystem: "repo",
+      },
+      ..denied
+    };
+    let commands: [&[u8]; 16] = [
+      b"( get-latest-rev ( ) ) ",
+      b"( get-dated-rev ( 27:2026-11-19T00:00:00.000000Z ) ) ",
+      b"( rev-proplist ( 1 ) ) ",
+      b"( rev-prop ( 1 7:svn:log ) ) ",
+      b"( check-path ( 5:trunk ( 1 ) ) ) ",
+      b"( stat ( 5:trunk ( 1 ) ) ) ",
+      b"( get-dir ( 5:trunk ( 1 ) true true ( kind ) ) ) ",
+      b"( get-file ( 11:trunk/a.txt ( 1 ) true true ) ) ",
+      b"( log ( ( 0: ) ( 1 ) ( 1 ) true false 0 false all-revprops ( ) ) ) ",
+      b"( get-locations ( 11:trunk/a.txt 1 ( 1 ) ) ) ",
+      b"( get-file-revs ( 11:trunk/a.txt ( 0 ) ( 1 ) false ) ) ",
+      b"( get-lock ( 11:trunk/a.txt ) ) ",
+      b"( get-locks ( 0: ( ) ) ) ",
+      b"( update ( ( 1 ) 0: true infinity false false ) ) ",
+      b"( status ( ( 1 ) 0: true infinity ) ) ",
+      b"( replay ( 1 0 true ) ) ",
+    ];
+    let mut connection = authenticated_session(b"stranger");
+    for command in commands {
+      let reply = send_command(&mut connection, &denied, command);
+      assert_eq!(
+        reply,
+        NOT_AUTHORIZED,
+        "command {} must be refused E170001 when policy.authenticated == Access::None",
+        String::from_utf8_lossy(command)
+      );
+    }
+    let mut owner = authenticated_session(b"owner");
+    let latest = send_command(&mut owner, &allowed, b"( get-latest-rev ( ) ) ");
+    assert!(latest.contains("( success ( 6 ) ) "), "{latest}");
+  }
+
+  /// Helper that drives `Connection` through greeting + `open` + `CRAM-MD5` challenge and
+  /// returns `(connection, response_wire_bytes, challenge)`.
+  fn cram_handshake_until_key(wire_user: &[u8], secret: &[u8]) -> (Connection, Vec<u8>) {
+    let mut out = Vec::new();
+    let mut connection = Connection::new(LIMITS, &mut out).unwrap();
+    let Turn::Opened { .. } = connection
+      .receive(None::<&Sources<'_, Green>>, OPEN_ROOT, &mut out, BUDGET)
+      .unwrap()
+    else {
+      panic!("expected Opened");
+    };
+    let repository = Repository {
+      uuid: UUID,
+      root_url: ROOT_URL,
+      realm: UUID,
+      mergeinfo: true,
+      anonymous: false,
+      tunnel_user: None,
+      cram_md5: true,
+    };
+    assert_eq!(connection.open(&repository, &mut out), Ok(Access::Asked));
+    out.clear();
+    let choose = b"( CRAM-MD5 ( ) ) ";
+    let Turn::ChallengeNeeded { .. } = connection
+      .receive(None::<&Sources<'_, Green>>, choose, &mut out, BUDGET)
+      .unwrap()
+    else {
+      panic!("expected ChallengeNeeded");
+    };
+    out.clear();
+    let host = c"localhost";
+    connection.challenge(7, 42, host, &mut out).unwrap();
+    let challenge = b"<7.42@localhost>";
+    let digest = CramKey::from_secret(secret).digest(challenge);
+    let mut hex = String::new();
+    for byte in digest {
+      use std::fmt::Write as _;
+      let _ = write!(&mut hex, "{byte:02x}");
+    }
+    let mut response = wire_user.to_vec();
+    response.push(b' ');
+    response.extend_from_slice(hex.as_bytes());
+    let wire = format!(
+      "{}:{} ",
+      response.len(),
+      String::from_utf8(response).unwrap()
+    )
+    .into_bytes();
+    out.clear();
+    let Turn::KeyNeeded { user, .. } = connection
+      .receive(None::<&Sources<'_, Green>>, &wire, &mut out, BUDGET)
+      .unwrap()
+    else {
+      panic!("expected KeyNeeded");
+    };
+    assert_eq!(user, wire_user);
+    (connection, out)
+  }
+
+  /// SVN-1 + SVN-2 + Bonus: Do CRAM-MD5 `key_as` with (a) wrong password on an unauthorized user,
+  /// (b) valid password on an unauthorized user, (c) valid password on an authorized token whose
+  /// canonical principal differs from the wire token id, and (d) `Unserved::StoreUnrecovered` +
+  /// `Connection::fail_command`. Expect: (a) `WrongPassword` with no authorization oracle,
+  /// (b) `Denied` with `( success ( ) )` followed by `E170001 "No access allowed to this
+  /// repository"`, (c) `Established(Principal::User(b"uid:1000"))`, and (d) typed `E160004` frames.
+  #[test]
+  fn cram_key_as_enforces_authz_binds_canonical_principal_and_unrecovered_store_fails_typed() {
+    let key = CramKey::from_secret(b"correct-secret");
+
+    // (a) Wrong password on an unauthorized account must fail WrongPassword, not Denied.
+    let (mut wrong, mut out) = cram_handshake_until_key(b"tok-stranger", b"wrong-secret");
+    let verdict = wrong
+      .key_as(
+        Some(CramAccount {
+          key: &key,
+          principal: Some(b"uid:4242"),
+          authorized: false,
+        }),
+        &mut out,
+      )
+      .unwrap();
+    assert_eq!(
+      verdict,
+      CramVerdict::Failed(handshake::AuthFailure::WrongPassword)
+    );
+    let wire = String::from_utf8_lossy(&out);
+    assert!(wire.contains("Password incorrect"), "{wire}");
+    assert!(
+      !wire.contains("170001"),
+      "wrong password must not leak authz: {wire}"
+    );
+
+    // (b) Valid password on an unauthorized account ends with E170001 after auth success.
+    let (mut denied, mut out) = cram_handshake_until_key(b"tok-stranger", b"correct-secret");
+    let verdict = denied
+      .key_as(
+        Some(CramAccount {
+          key: &key,
+          principal: Some(b"uid:4242"),
+          authorized: false,
+        }),
+        &mut out,
+      )
+      .unwrap();
+    assert_eq!(
+      verdict,
+      CramVerdict::Denied(Principal::User(b"uid:4242".to_vec()))
+    );
+    assert_eq!(denied.waiting(), Waiting::Ended);
+    let wire = String::from_utf8_lossy(&out);
+    assert_eq!(
+      wire,
+      "( success ( ) ) ( failure ( ( 170001 36:No access allowed to this repository 0: 0 ) ) ) "
+    );
+
+    // (c) Valid password on an authorized token binds canonical principal, not token id hex.
+    let (mut authed, mut out) = cram_handshake_until_key(b"deadbeef01", b"correct-secret");
+    let verdict = authed
+      .key_as(
+        Some(CramAccount {
+          key: &key,
+          principal: Some(b"uid:1000"),
+          authorized: true,
+        }),
+        &mut out,
+      )
+      .unwrap();
+    assert_eq!(
+      verdict,
+      CramVerdict::Established(Principal::User(b"uid:1000".to_vec()))
+    );
+    assert_eq!(
+      authed.session().map(|session| &session.principal),
+      Some(&Principal::User(b"uid:1000".to_vec()))
+    );
+
+    // (d) Bonus: Unserved::StoreUnrecovered & Connection::fail_command emit typed E160004.
+    let (code, message) = Unserved::StoreUnrecovered { name: b"repo" }.failure();
+    assert_eq!(code, 160_004);
+    assert!(
+      String::from_utf8_lossy(&message).contains("unrecovered"),
+      "{}",
+      String::from_utf8_lossy(&message)
+    );
+    out.clear();
+    authed
+      .fail_command(
+        160_004,
+        "Repository 'repo' store is unrecovered or corrupt",
+        &mut out,
+      )
+      .unwrap();
+    assert_eq!(authed.waiting(), Waiting::Ended);
+    let wire = String::from_utf8_lossy(&out);
+    assert!(
+      wire.contains("160004") && wire.contains("unrecovered"),
+      "{wire}"
+    );
+  }
 }

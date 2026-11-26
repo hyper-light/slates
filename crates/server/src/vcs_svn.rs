@@ -71,8 +71,7 @@ use slates_rt::{RtError, Runtime, ShardId, TaskId, futures};
 use slates_svn::commit::drive::{Due, Work};
 use slates_svn::dump::Uuid;
 use slates_svn::find::{Found, find_repository};
-use slates_svn::handshake::Verdict;
-use slates_svn::handshake::{Access, Unserved};
+use slates_svn::handshake::{Access, CramAccount, CramVerdict, Unserved};
 use slates_svn::index::{ContentIdentity, Revision};
 use slates_svn::report::exchange::{Budget, Quantum};
 use slates_svn::serve::{CommitStart, Connection, Limits, Made, Policy, Sources, Turn};
@@ -113,6 +112,9 @@ const NO_ACCESS: &str = "vcs_svn.no_access";
 const LOOKUP_UNANSWERED: &str = "vcs_svn.lookup_unanswered";
 /// Counter: a Subversion repository whose store its owner shard does not hold: the connection closed.
 const STORE_MISSING: &str = "vcs_svn.store_missing";
+/// `SVN_ERR_FS_CORRUPT`: typed refusal code when a repository's backing store is unrecovered or
+/// corrupt (`svn_error_codes.h`: FS category 160,000 + 4).
+const SVN_ERR_FS_CORRUPT: u32 = 160_004;
 /// Counter: a shard that could not keep its listener state, so a connection that moves there is lost.
 const NOT_KEPT: &str = "vcs_svn.not_kept";
 /// Counter: a move its target shard's control channel refused: the descriptor dropped with the spawn, so the
@@ -1122,6 +1124,11 @@ fn answer(conversation: &mut Conversation, out: &mut Vec<u8>) -> Next {
   }
   lent.unwrap_or_else(|| {
     crate::fleet::count_refusal(STORE_MISSING);
+    let message = format!(
+      "Repository '{}' store is unrecovered or corrupt",
+      opened.name
+    );
+    let _ = connection.fail_command(SVN_ERR_FS_CORRUPT, &message, out);
     Next::End
   })
 }
@@ -1983,8 +1990,9 @@ async fn challenge(stream: &TcpStream, connection: &mut Connection, out: &mut Ve
 }
 
 /// Answers the client's CRAM-MD5 response naming `user` with the key its token's record keeps
-/// ([`crate::credentials::cram_md5_key`]), or none, answered as `svnserve` answers a user it has no password for; an
-/// established session's principal is the token's.
+/// ([`crate::credentials::cram_md5_key`]), binding the token's canonical principal
+/// ([`crate::lfs::owner_name`], matching HTTP and SSH) and enforcing repository access at the
+/// handshake only after verifying the digest.
 async fn keyed(
   stream: &TcpStream,
   conversation: &mut Conversation,
@@ -1996,18 +2004,40 @@ async fn keyed(
   if found.is_err() {
     crate::fleet::count_refusal(UNKEYED);
   }
-  let key = found.as_ref().ok().map(|found| &found.key);
-  match conversation.connection.key(key, out) {
-    Ok(Verdict::Established(_)) => {
+  let resolved = found.as_ref().ok().map(|found| {
+    let canonical = crate::lfs::owner_name(&found.principal);
+    let authorized = conversation.opened.as_ref().is_some_and(|opened| {
+      crate::state::with_state(|state| {
+        authenticated_access(state, &opened.name, &found.principal)
+          >= slates_svn::authz::Access::Read
+      })
+      .unwrap_or(false)
+    });
+    (canonical, authorized, &found.key)
+  });
+  let account = resolved
+    .as_ref()
+    .map(|(canonical, authorized, key)| CramAccount {
+      key,
+      principal: Some(canonical.as_bytes()),
+      authorized: *authorized,
+    });
+  let end = match conversation.connection.key_as(account, out) {
+    Ok(CramVerdict::Established(_)) => {
       conversation.principal = found.ok().map(|found| found.principal);
+      false
     }
-    Ok(_) => {}
+    Ok(CramVerdict::Denied(_)) => {
+      crate::fleet::count_refusal(NO_ACCESS);
+      true
+    }
+    Ok(CramVerdict::Failed(_)) => false,
     Err(_) => return Stepped::End,
-  }
+  };
   if !out.is_empty() && stream.write_all(out).await.is_err() {
     return Stepped::End;
   }
-  Stepped::Go
+  if end { Stepped::End } else { Stepped::Go }
 }
 
 /// Answers the client's URL with `unserved`, in `svnserve`'s words, appended to `out`; the connection ends.
@@ -2155,8 +2185,15 @@ async fn opened(
       }
       asked
     }
-    Some((_, Held::NoStore)) => {
+    Some((located, Held::NoStore)) => {
       crate::fleet::count_refusal(STORE_MISSING);
+      refuse(
+        connection,
+        Unserved::StoreUnrecovered {
+          name: located.name.as_bytes(),
+        },
+        out,
+      );
       false
     }
     Some((_, Held::None)) | None => {
@@ -2389,3 +2426,359 @@ async fn read_more(
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod redteam_tests {
+  use std::io::{Read, Write};
+  use std::net::TcpStream as ClientStream;
+  use std::sync::atomic::{AtomicU32, Ordering};
+  use std::time::Duration;
+
+  use slates_db::HostId;
+  use slates_db::catalog::Principal;
+  use slates_ipc::protocol::{CredentialMaterial, ObjectFormat, ReplyBody, RequestBody, VcsTool};
+  use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
+
+  use crate::daemon::{Daemon, SegmentSource};
+
+  /// Shape: two shards so the repository routes off the listener shard.
+  const SHARDS: u16 = 2;
+  /// Shape: partition off the listener shard.
+  const OTHER: usize = 1;
+  /// Shape: owner uid.
+  const OWNER: u32 = 1234;
+  /// Shape: unshared authenticated principal uid.
+  const STRANGER: u32 = 4242;
+  /// Shape: read patience matching the daemon's liveness budget.
+  const PATIENCE_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
+  /// Shape: owner token secret.
+  const OWNER_TOKEN: &[u8] = b"redteam-owner-token";
+  /// Shape: unshared principal token secret.
+  const STRANGER_TOKEN: &[u8] = b"redteam-stranger-token";
+
+  fn start_daemon() -> crate::test_store::StoredDaemon {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let profile = crate::daemon::test_profile();
+    let instance = format!(
+      "vcs-svn-rt-{}-{}",
+      std::process::id(),
+      NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
+    config.vcs_svn = Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let daemon = crate::test_store::StoredDaemon::start(
+      "vcs-svn-rt",
+      &profile,
+      config,
+      SegmentSource::Create { name: instance },
+    )
+    .expect("daemon starts");
+    daemon.bootstrap(true).expect("bootstrap");
+    daemon
+  }
+
+  fn uid_principal(uid: u32) -> Principal {
+    Principal::Uid {
+      host: HostId(0),
+      uid,
+    }
+  }
+
+  fn enroll_token(daemon: &Daemon, uid: u32, token: &[u8]) -> String {
+    let material = CredentialMaterial::HttpToken {
+      id: crate::credentials::token_id(token),
+      cram_md5_contexts: crate::credentials::cram_md5_contexts(token),
+    };
+    let id = crate::credentials::id_of(&material);
+    let partition = usize::from(crate::credentials::owner_of(&id, usize::from(SHARDS)));
+    let reply = crate::daemon::observe_at(daemon, partition, move |state| {
+      let principal = slates_ipc::protocol::Principal::Uid { host: 0, uid };
+      let proof =
+        crate::credentials::enroll_proof(&state.issuer_secret, &principal, &material, None);
+      let body = RequestBody::EnrollCredential {
+        principal,
+        material,
+        expires_ns: None,
+        proof,
+      };
+      crate::verbs::dispatch(state, 0, &uid_principal(uid), body)
+    });
+    assert_eq!(reply, ReplyBody::CredentialEnrolled { id });
+    crate::credentials::token_id(token)
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect()
+  }
+
+  fn name_on(prefix: &str, partition: usize) -> String {
+    (0u32..)
+      .map(|serial| format!("{prefix}{serial}"))
+      .find(|name| usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS))) == partition)
+      .expect("name on partition")
+  }
+
+  fn read_items(stream: &mut ClientStream, items: usize) -> String {
+    let mut read = Vec::new();
+    let (mut depth, mut whole) = (0usize, 0usize);
+    let mut byte = [0u8; 1];
+    while whole < items {
+      match stream.read(&mut byte) {
+        Ok(1) => {}
+        _ => break,
+      }
+      read.push(byte[0]);
+      match byte[0] {
+        b'(' => depth += 1,
+        b')' => {
+          depth = depth.saturating_sub(1);
+          whole += usize::from(depth == 0);
+        }
+        _ => {}
+      }
+    }
+    if stream.read(&mut byte).is_ok_and(|taken| taken == 1) {
+      read.push(byte[0]);
+    }
+    String::from_utf8_lossy(&read).into_owned()
+  }
+
+  fn challenge_of(item: &str) -> String {
+    let length_end = item.find(':').expect("challenge length");
+    let start = item
+      .get(..length_end)
+      .and_then(|head| head.rfind(' '))
+      .expect("space")
+      + 1;
+    let length: usize = item.get(start..length_end).unwrap().parse().unwrap();
+    item
+      .get(length_end + 1..length_end + 1 + length)
+      .unwrap()
+      .to_owned()
+  }
+
+  fn cram_response(wire_user: &str, secret: &[u8], challenge: &str) -> Vec<u8> {
+    let digest: String = slates_svn::handshake::CramKey::from_secret(secret)
+      .digest(challenge.as_bytes())
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect();
+    let response = format!("{wire_user} {digest}");
+    format!("{}:{response} ", response.len()).into_bytes()
+  }
+
+  fn connect_and_open(port: u16, url: &str) -> (ClientStream, String) {
+    let mut stream = ClientStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+      .set_read_timeout(Some(Duration::from_nanos(PATIENCE_NS)))
+      .expect("timeout");
+    let _greeting = read_items(&mut stream, 1);
+    let open = format!(
+      "( 2 ( edit-pipeline absent-entries depth mergeinfo log-revprops ) {}:{} 8:SVN/1.15 ( ) ) ",
+      url.len(),
+      url
+    );
+    stream.write_all(open.as_bytes()).expect("write open");
+    let reply = read_items(&mut stream, 1);
+    (stream, reply)
+  }
+
+  /// SVN-1: Do enroll an owner token and an unshared stranger token, create a private Subversion
+  /// repository owned by `OWNER`, and connect over `svn://` as `STRANGER` with (a) wrong password
+  /// and (b) valid password, then as `OWNER`. Expect: (a) `Password incorrect` with no authz
+  /// oracle, (b) `( success ( ) )` followed by `E170001 "No access allowed to this repository"`
+  /// and clean EOF (never `repos-info` and never able to read), and (c) `OWNER` reads normally.
+  #[test]
+  fn svn1_unshared_authenticated_principal_is_refused_at_cram_handshake_with_e170001() {
+    let daemon = start_daemon();
+    let port = daemon.vcs_svn_port().expect("listener port");
+    let owner_user = enroll_token(&daemon, OWNER, OWNER_TOKEN);
+    let stranger_user = enroll_token(&daemon, STRANGER, STRANGER_TOKEN);
+    let name = name_on("svn-private-", OTHER);
+    let asked = (
+      name.as_str(),
+      VcsTool::Subversion,
+      ObjectFormat::Sha1,
+      "trunk",
+    );
+    crate::test_store::create_on(&daemon, OTHER, &uid_principal(OWNER), asked);
+    let url = format!("svn://127.0.0.1:{port}/{name}");
+
+    // (a) Stranger with wrong password: must get Password incorrect, not E170001.
+    let (mut wrong_stream, asked_auth) = connect_and_open(port, &url);
+    assert!(asked_auth.contains("CRAM-MD5"), "{asked_auth}");
+    wrong_stream.write_all(b"( CRAM-MD5 ( ) ) ").unwrap();
+    let step = read_items(&mut wrong_stream, 1);
+    let challenge = challenge_of(&step);
+    wrong_stream
+      .write_all(&cram_response(
+        &stranger_user,
+        b"not-the-secret",
+        &challenge,
+      ))
+      .unwrap();
+    let wrong_reply = read_items(&mut wrong_stream, 1);
+    assert!(
+      wrong_reply.contains("Password incorrect") && !wrong_reply.contains("170001"),
+      "wrong password must not leak authz: {wrong_reply}"
+    );
+    drop(wrong_stream);
+
+    // (b) Stranger with valid password: refused E170001 "No access allowed to this repository".
+    let (mut denied_stream, _) = connect_and_open(port, &url);
+    denied_stream.write_all(b"( CRAM-MD5 ( ) ) ").unwrap();
+    let step = read_items(&mut denied_stream, 1);
+    let challenge = challenge_of(&step);
+    denied_stream
+      .write_all(&cram_response(&stranger_user, STRANGER_TOKEN, &challenge))
+      .unwrap();
+    let mut rest = Vec::new();
+    denied_stream.read_to_end(&mut rest).unwrap();
+    let denied_wire = String::from_utf8_lossy(&rest);
+    assert_eq!(
+      denied_wire,
+      "( success ( ) ) ( failure ( ( 170001 36:No access allowed to this repository 0: 0 ) ) ) ",
+      "unshared principal must be refused E170001 at CRAM-MD5 handshake"
+    );
+
+    // (c) Owner signs in and reads cleanly.
+    let (mut owner_stream, _) = connect_and_open(port, &url);
+    owner_stream.write_all(b"( CRAM-MD5 ( ) ) ").unwrap();
+    let step = read_items(&mut owner_stream, 1);
+    let challenge = challenge_of(&step);
+    owner_stream
+      .write_all(&cram_response(&owner_user, OWNER_TOKEN, &challenge))
+      .unwrap();
+    let established = read_items(&mut owner_stream, 2);
+    assert!(established.contains(&url), "{established}");
+    owner_stream.write_all(b"( get-latest-rev ( ) ) ").unwrap();
+    let latest = read_items(&mut owner_stream, 2);
+    assert_eq!(latest, "( success ( ( ) 0: ) ) ( success ( 0 ) ) ");
+  }
+
+  /// SVN-2: Do authenticate over `svn://` with an enrolled owner token (wire username = token id
+  /// hex), commit a file, and acquire a lock on it. Expect: `svn:author` on revision 1 AND the
+  /// lock's owner equal `crate::lfs::owner_name(&owner)` (`"0:1234"`, identical to HTTP & SSH),
+  /// NEVER the CRAM-MD5 wire token id hex.
+  #[test]
+  fn svn2_cram_session_records_canonical_principal_for_commit_author_and_lock_owner() {
+    let daemon = start_daemon();
+    let port = daemon.vcs_svn_port().expect("listener port");
+    let owner_user = enroll_token(&daemon, OWNER, OWNER_TOKEN);
+    let canonical = crate::lfs::owner_name(&uid_principal(OWNER));
+    assert_ne!(owner_user, canonical);
+    let name = name_on("svn-identity-", OTHER);
+    let asked = (
+      name.as_str(),
+      VcsTool::Subversion,
+      ObjectFormat::Sha1,
+      "trunk",
+    );
+    crate::test_store::create_on(&daemon, OTHER, &uid_principal(OWNER), asked);
+    let url = format!("svn://127.0.0.1:{port}/{name}");
+
+    let (mut stream, _) = connect_and_open(port, &url);
+    stream.write_all(b"( CRAM-MD5 ( ) ) ").unwrap();
+    let step = read_items(&mut stream, 1);
+    let challenge = challenge_of(&step);
+    stream
+      .write_all(&cram_response(&owner_user, OWNER_TOKEN, &challenge))
+      .unwrap();
+    let _established = read_items(&mut stream, 2);
+
+    // Commit adding `/hello.txt` via ra_svn editor commands.
+    let mut commit_cmd = Vec::new();
+    commit_cmd.extend_from_slice(
+      b"( commit ( 4:test ( ) false ( ( 7:svn:log 4:test ) ) ) ) \
+        ( open-root ( ( 0 ) 2:d0 ) ) \
+        ( add-file ( 9:hello.txt 2:d0 2:c1 ( ) ) ) \
+        ( apply-textdelta ( 2:c1 ( ) ) ) \
+        ( textdelta-chunk ( 2:c1 16:SVN\x00\x00\x00\x06\x01\x06\x86hello\n ) ) \
+        ( textdelta-end ( 2:c1 ) ) \
+        ( close-file ( 2:c1 ( 32:b1946ac92492d2347c6235b4d2611184 ) ) ) \
+        ( close-dir ( 2:d0 ) ) \
+        ( close-edit ( ) ) ",
+    );
+    stream.write_all(&commit_cmd).unwrap();
+    // commit auth + commit success + close-edit success + trivial auth + commit-info = 5 items.
+    let committed = read_items(&mut stream, 5);
+    assert!(
+      committed.contains(&format!("{}:{canonical}", canonical.len())),
+      "commit-info author must be canonical principal {canonical}, not token hex {owner_user}: {committed}"
+    );
+    assert!(
+      !committed.contains(&owner_user),
+      "commit-info leaked token hex {owner_user}: {committed}"
+    );
+
+    // Lock `/hello.txt` and read it back via `get-lock`.
+    stream
+      .write_all(b"( lock-many ( ( 4:mine ) false ( ( 9:hello.txt ( ) ) ) ) ) ")
+      .unwrap();
+    // trivial auth + lock result + `done` + `( success ( ) )`
+    let mut locked_wire = read_items(&mut stream, 2);
+    let mut tail = [0u8; 64];
+    let mut buf = Vec::new();
+    while !String::from_utf8_lossy(&buf).contains("( success ( ) ) ") {
+      let n = stream.read(&mut tail).unwrap();
+      assert!(n > 0);
+      buf.extend_from_slice(&tail[..n]);
+    }
+    locked_wire.push_str(&String::from_utf8_lossy(&buf));
+    assert!(
+      locked_wire.contains(&format!("{}:{canonical}", canonical.len())),
+      "lock owner must be canonical principal {canonical}, not token hex {owner_user}: {locked_wire}"
+    );
+    assert!(
+      !locked_wire.contains(&owner_user),
+      "lock leaked token hex {owner_user}: {locked_wire}"
+    );
+
+    stream.write_all(b"( get-lock ( 9:hello.txt ) ) ").unwrap();
+    let got_lock = read_items(&mut stream, 2);
+    assert!(
+      got_lock.contains(&format!("{}:{canonical}", canonical.len()))
+        && !got_lock.contains(&owner_user),
+      "get-lock owner must be canonical {canonical}: {got_lock}"
+    );
+  }
+
+  /// Bonus: Do drop a Subversion repository's in-memory store (`vcs_store::free`), simulating an
+  /// unrecovered store (`lend_in` returns `None`), then open it over `svn://`. Expect: a typed
+  /// `E160004` (`SVN_ERR_FS_CORRUPT`) failure frame naming the unrecovered/corrupt store before
+  /// EOF, NEVER a silent TCP drop.
+  #[test]
+  fn bonus_unrecovered_svn_store_returns_typed_e160004_instead_of_silent_drop() {
+    let daemon = start_daemon();
+    let port = daemon.vcs_svn_port().expect("listener port");
+    let name = name_on("svn-unrecovered-", OTHER);
+    let asked = (
+      name.as_str(),
+      VcsTool::Subversion,
+      ObjectFormat::Sha1,
+      "trunk",
+    );
+    crate::test_store::create_on(&daemon, OTHER, &uid_principal(OWNER), asked);
+    crate::daemon::observe_at(&daemon, OTHER, {
+      let name = name.clone();
+      move |state| {
+        let id = state
+          .db
+          .partition()
+          .repositories()
+          .repository_named(&name)
+          .expect("repo exists")
+          .id;
+        crate::vcs_store::free(state, id);
+      }
+    });
+    let url = format!("svn://127.0.0.1:{port}/{name}");
+    let (mut stream, reply) = connect_and_open(port, &url);
+    let mut tail = Vec::new();
+    let _ = stream.read_to_end(&mut tail);
+    let combined = format!("{reply}{}", String::from_utf8_lossy(&tail));
+    assert!(
+      combined.contains("( failure ( ( 160004 ") && combined.contains("unrecovered"),
+      "unrecovered SVN store must emit typed E160004 frame instead of silent TCP drop: {combined:?}"
+    );
+  }
+}

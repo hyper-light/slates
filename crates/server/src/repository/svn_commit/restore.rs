@@ -227,7 +227,22 @@ fn step(
       (None, None) => {}
       (Some(old), Some(new)) if old.0 == new.0 => {}
       (Some(old), Some(new)) if old.1 != new.1 => {
-        return Err(Uncommitted::Unsupported { path: dest });
+        let old_dir = old.1 == NodeKind::Directory;
+        walk.plan.restores.push((
+          to,
+          Restore::Set {
+            brought: Some(stood_of(new.1, new.2, new.3)),
+            directory: old_dir,
+            text: old.2,
+            props: old.3,
+          },
+        ));
+        let children = if old_dir {
+          names(&source, walk.revision)?
+        } else {
+          names(&source, walk.head)?
+        };
+        push_children(&mut walk.stack, (&source, &dest), &children);
       }
       (Some(old), Some(new)) => {
         let differs =

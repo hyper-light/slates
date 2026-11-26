@@ -1230,7 +1230,7 @@ impl Green {
     for path in &copied.creates {
       let ops = copied.content.get(path).map(Vec::as_slice).unwrap_or(&[]);
       let (brought, at) = from(path);
-      let verdict = Green::copied_create(path, (&brought, at.as_str()), ops, inc.post());
+      let verdict = Green::copied_create(path, (&brought, at.as_str()), ops, inc.post(), copied);
       record(effects, windows, verdict);
     }
     for (path, ops) in &copied.content {
@@ -1271,7 +1271,7 @@ impl Green {
       record(
         effects,
         windows,
-        Green::copied_mkdir(path, (&brought, at.as_str())),
+        Green::copied_mkdir(path, (&brought, at.as_str()), copied),
       );
     }
     let cleared: BTreeSet<String> = copied
@@ -1353,14 +1353,20 @@ impl Green {
   }
 
   /// A file created at `path` in a copied tree, where the copy brings nothing (`from`, its place in the source as the
-  /// copy brings it).
+  /// copy brings it) or the same increment removes what the copy brings there.
   fn copied_create(
     path: &str,
     (brought, from): (&SourceAt<'_>, &str),
     ops: &[Op],
     post_state: crate::named::Post<'_>,
+    copied: &Resolved,
   ) -> Result<Option<Effect>, ConflictWindow> {
-    if brought.holds_node(from) {
+    let dir_clashes = brought.dir(from) && !copied.rmdirs.contains(path);
+    let non_dir_clashes = (brought.content(from).is_some()
+      || brought.symlink(from).is_some()
+      || brought.special(from).is_some())
+      && !copied.unlinks.contains(path);
+    if dir_clashes || non_dir_clashes {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     let bytes = apply(&[], ops, post_state);
@@ -1416,16 +1422,17 @@ impl Green {
     }
   }
 
-  /// A directory made at `path` in a copied tree: nothing where the copy brings one, a type conflict where it brings
-  /// another kind.
+  /// A directory made at `path` in a copied tree: nothing where the copy brings one, allowed when
+  /// the same increment unlinks a non-directory standing there, else a type conflict.
   fn copied_mkdir(
     path: &str,
     (brought, from): (&SourceAt<'_>, &str),
+    copied: &Resolved,
   ) -> Result<Option<Effect>, ConflictWindow> {
     if brought.dir(from) {
       return Ok(None);
     }
-    if brought.holds_node(from) {
+    if brought.holds_node(from) && !copied.unlinks.contains(path) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     Ok(Some(Effect::MakeDir(path.to_owned())))

@@ -218,10 +218,22 @@ const SVN_ERR_BAD_FILENAME: u32 = 125_001;
 /// Format: the bad category's start plus 2 (`svn_error_codes.h` 173).
 const SVN_ERR_BAD_URL: u32 = 125_002;
 
+/// `SVN_ERR_FS_CORRUPT`.
+/// Format: the FS category's start, 120,000 + 8 × 5,000 = 160,000, plus 4 (`svn_error_codes.h`).
+const SVN_ERR_FS_CORRUPT: u32 = 160_004;
+
 /// `SVN_ERR_RA_NOT_AUTHORIZED`.
 /// Format: the RA category's start, 120,000 + 10 × 5,000 = 170,000, plus 1 (`svn_error_codes.h`
 /// 967).
 const SVN_ERR_RA_NOT_AUTHORIZED: u32 = 170_001;
+
+/// The message `svnserve` sends when a repository refuses all access to the opening principal
+/// (`serve.c` 4345-4351, `find_repos` / `auth_request`).
+const NO_ACCESS_MESSAGE: &[u8] = b"No access allowed to this repository";
+
+/// The message `svnserve` sends when a command's authenticated principal lacks required access
+/// (`SVN_ERR_RA_NOT_AUTHORIZED`'s own text).
+const NOT_AUTHORIZED_MESSAGE: &[u8] = b"Authorization failed";
 
 /// `SVN_ERR_RA_SVN_MALFORMED_DATA`.
 /// Format: the ra_svn category's start, 120,000 + 18 × 5,000 = 210,000, plus 4
@@ -297,6 +309,11 @@ pub enum Unserved<'a> {
   /// Neither anonymous nor authenticated users may read: "No access allowed to this repository"
   /// (`SVN_ERR_RA_NOT_AUTHORIZED`).
   NoAccess,
+  /// The repository's backing store is not loaded or recovered in memory (`SVN_ERR_FS_CORRUPT`).
+  StoreUnrecovered {
+    /// The repository's name.
+    name: &'a [u8],
+  },
 }
 
 impl Unserved<'_> {
@@ -317,10 +334,8 @@ impl Unserved<'_> {
         SVN_ERR_RA_SVN_REPOS_NOT_FOUND,
         quoted(b"No repository found in '", url),
       ),
-      Unserved::NoAccess => (
-        SVN_ERR_RA_NOT_AUTHORIZED,
-        b"No access allowed to this repository".to_vec(),
-      ),
+      Unserved::NoAccess => (SVN_ERR_RA_NOT_AUTHORIZED, NO_ACCESS_MESSAGE.to_vec()),
+      Unserved::StoreUnrecovered { name } => (SVN_ERR_FS_CORRUPT, store_unrecovered(name)),
     }
   }
 }
@@ -527,6 +542,34 @@ pub enum Verdict {
   /// The digest is the key's: its success is written, followed at the handshake by the
   /// repository's information, and the handshake, or the authentication for one command, is done.
   Established(Principal),
+  /// The attempt failed and its failure is written; the client may answer again.
+  Failed(AuthFailure),
+}
+
+/// Who a CRAM-MD5 login resolves to and whether that principal may access the repository
+/// ([`Server::key_as`]).
+#[derive(Clone, Copy, Debug)]
+pub struct CramAccount<'a> {
+  /// The CRAM-MD5 key verifying the client's digest.
+  pub key: &'a CramKey,
+  /// Canonical principal name to record on the established session (for example the token's
+  /// owning principal rather than the wire token id); `None` keeps the CRAM-MD5 wire username.
+  pub principal: Option<&'a [u8]>,
+  /// Whether the verified principal is authorized to open the repository; `false` refuses the
+  /// session with `SVN_ERR_RA_NOT_AUTHORIZED` only after the digest verifies, so wrong passwords
+  /// never act as an authorization oracle.
+  pub authorized: bool,
+}
+
+/// What a CRAM-MD5 response's verification and authorization came to ([`Server::key_as`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CramVerdict {
+  /// The digest verified and the principal is authorized: its success (and at the handshake the
+  /// repository's information) is written, and the session is established.
+  Established(Principal),
+  /// The digest verified, but the principal lacks access: `( success ( ) )` and an
+  /// `SVN_ERR_RA_NOT_AUTHORIZED` command failure are written, and the handshake has ended.
+  Denied(Principal),
   /// The attempt failed and its failure is written; the client may answer again.
   Failed(AuthFailure),
 }
@@ -972,6 +1015,57 @@ impl Server {
   /// # Errors
   /// `OutOfTurn` unless a response naming a user was just read ([`Progress::KeyNeeded`]).
   pub fn key(&mut self, key: Option<&CramKey>, out: &mut Vec<u8>) -> Result<Verdict, Refused> {
+    match self.verify_cram(key, out)? {
+      Ok((offer, user)) => {
+        let principal = self.establish(offer, Principal::User(user), out)?;
+        Ok(Verdict::Established(principal))
+      }
+      Err(failure) => Ok(Verdict::Failed(failure)),
+    }
+  }
+
+  /// Verifies the CRAM-MD5 response against `account`, resolving the session's canonical principal
+  /// and checking repository authorization only after the digest matches (so wrong credentials
+  /// never act as an authorization oracle).
+  ///
+  /// # Errors
+  /// `OutOfTurn` unless a response naming a user was just read ([`Progress::KeyNeeded`]).
+  pub fn key_as(
+    &mut self,
+    account: Option<CramAccount<'_>>,
+    out: &mut Vec<u8>,
+  ) -> Result<CramVerdict, Refused> {
+    let key = account.map(|resolved| resolved.key);
+    let (offer, user) = match self.verify_cram(key, out)? {
+      Ok(verified) => verified,
+      Err(failure) => return Ok(CramVerdict::Failed(failure)),
+    };
+    let Some(account) = account else {
+      return Ok(CramVerdict::Failed(AuthFailure::UnknownUser));
+    };
+    let principal = Principal::User(account.principal.map_or(user, <[u8]>::to_vec));
+    if !account.authorized {
+      write_response(SUCCESS, Value::List(Vec::new()), out)?;
+      let message = if offer.information {
+        NO_ACCESS_MESSAGE
+      } else {
+        NOT_AUTHORIZED_MESSAGE
+      };
+      write_command_failure(SVN_ERR_RA_NOT_AUTHORIZED, message, out)?;
+      self.state = State::Ended;
+      return Ok(CramVerdict::Denied(principal));
+    }
+    let principal = self.establish(offer, principal, out)?;
+    Ok(CramVerdict::Established(principal))
+  }
+
+  /// Checks the pending CRAM-MD5 digest against `key`; on mismatch writes the challenge failure
+  /// and restores `State::Asked` so the client may retry.
+  fn verify_cram(
+    &mut self,
+    key: Option<&CramKey>,
+    out: &mut Vec<u8>,
+  ) -> Result<Result<(Offer, Vec<u8>), AuthFailure>, Refused> {
     let (offer, challenge, user, digest) = match std::mem::replace(&mut self.state, State::Ended) {
       State::Verifying {
         offer,
@@ -987,14 +1081,11 @@ impl Server {
     let failure = match key {
       None => AuthFailure::UnknownUser,
       Some(key) if !key.verifies(&challenge, &digest) => AuthFailure::WrongPassword,
-      Some(_) => {
-        let principal = self.establish(offer, Principal::User(user), out)?;
-        return Ok(Verdict::Established(principal));
-      }
+      Some(_) => return Ok(Ok((offer, user))),
     };
     write_challenge_failure(failure, out)?;
     self.state = State::Asked(offer);
-    Ok(Verdict::Failed(failure))
+    Ok(Err(failure))
   }
 
   /// Whether the handshake waits on the client's bytes, rather than on its caller or on nothing.
@@ -1180,6 +1271,14 @@ fn quoted(prefix: &[u8], url: &[u8]) -> Vec<u8> {
   let mut message = prefix.to_vec();
   message.extend_from_slice(url);
   message.push(b'\'');
+  message
+}
+
+/// The message for [`Unserved::StoreUnrecovered`]: names the repository whose store is absent.
+fn store_unrecovered(name: &[u8]) -> Vec<u8> {
+  let mut message = b"Repository '".to_vec();
+  message.extend_from_slice(name);
+  message.extend_from_slice(b"' store is unrecovered or corrupt");
   message
 }
 
