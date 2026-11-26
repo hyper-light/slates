@@ -21,7 +21,7 @@ use slates_ipc::protocol::{
 use super::super::Target;
 use super::super::hg_view::ServedViews;
 use super::super::tests::{
-  Brought, FIRST_DATE, appended, begun, commit_of, owner, push_through, repository, tree_of,
+  Brought, FIRST_DATE, appended, begun, commit_of, owner, push_through, tree_of,
 };
 use super::{ShardStores, lend_on};
 use crate::repository::push::BranchChange;
@@ -343,14 +343,32 @@ fn branch_at(
   sealed.abandon(state);
 }
 
+/// A git repository `name` asked as a client's creation asks it ([`crate::test_store::audit_on_stored_shard_made_all`]).
+fn git(name: &str) -> crate::test_store::Asked<'_> {
+  (
+    name,
+    VcsTool::Git,
+    slates_ipc::protocol::ObjectFormat::Sha1,
+    "main",
+  )
+}
+
+/// Runs `history` on a stored shard with the repositories `asked` made first from the test's thread, never on the shard
+/// (`test_store::SHARD_BLOCKING_ALLOWED`): their ids and root greens, in order.
+fn made<T: Send + 'static, const N: usize>(
+  asked: [crate::test_store::Asked<'static>; N],
+  history: impl FnOnce(&mut ShardState, [(RepositoryId, DbVolumeId); N]) -> T + Clone + Send + 'static,
+) -> T {
+  crate::test_store::audit_on_stored_shard_made_all((&owner(), asked), history)
+}
+
 /// A git repository `name` on the shard whose default branch `main` holds one commit, and each of `branches` made at
 /// that commit: its id, the commit's objects and the commit.
 fn pushed_repository(
   state: &mut ShardState,
-  name: &str,
+  (id, root): (RepositoryId, DbVolumeId),
   branches: &[&str],
 ) -> (RepositoryId, Vec<Brought>, ObjectId) {
-  let (id, root) = repository(state, name, VcsTool::Git);
   let files = [(b"README".to_vec(), b"one\n".to_vec())];
   let (objects, head) = commit_of(&files, &[], FIRST_DATE);
   let version = push_through(state, (id, root), &objects, (None, head, tree_of(&objects)));
@@ -400,14 +418,13 @@ fn reader_reads_main(state: &mut ShardState, name: &str) {
 /// and its blob; neither answer refused.
 #[test]
 fn t_a682_a_pushed_branch_is_listed_and_fetched_whole_from_the_store() {
-  let (listed, fetched, objects, head) =
-    crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
-      let (id, objects, head) = pushed_repository(state, "lent", &[]);
-      let listed = answered(state, (id, &owner()), Asked::Request(&ls_refs()));
-      let wants = fetch(&[head], &[]);
-      let fetched = answered(state, (id, &owner()), Asked::Request(&wants));
-      (listed, fetched, objects, head)
-    });
+  let (listed, fetched, objects, head) = made([git("lent")], |state, [made]| {
+    let (id, objects, head) = pushed_repository(state, made, &[]);
+    let listed = answered(state, (id, &owner()), Asked::Request(&ls_refs()));
+    let wants = fetch(&[head], &[]);
+    let fetched = answered(state, (id, &owner()), Asked::Request(&wants));
+    (listed, fetched, objects, head)
+  });
   let expected = vec![
     ref_line(head, "HEAD", Some("refs/heads/main")),
     ref_line(head, "refs/heads/main", None),
@@ -424,31 +441,30 @@ fn t_a682_a_pushed_branch_is_listed_and_fetched_whole_from_the_store() {
 /// holds no curve: a step's reads are noted in its own repository's alone.
 #[test]
 fn t_a724_a_fetchs_reads_are_noted_in_its_own_repositorys_curve() {
-  let (read, kept, cold, other) =
-    crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
-      let (id, _, head) = pushed_repository(state, "curved", &[]);
-      let (quiet, _, _) = pushed_repository(state, "quiet", &[]);
-      let wants = fetch(&[head], &[]);
-      for _ in 0..2 {
-        let fetched = answered(state, (id, &owner()), Asked::Request(&wants));
-        assert_eq!(fetched.1, None);
-      }
-      let row = state
-        .vcs_usage
-        .usage(&id)
-        .expect("the fetched repository's row");
-      let curve = row.curve().expect("its curve");
-      let other = state
-        .vcs_usage
-        .usage(&quiet)
-        .is_some_and(|row| row.curve().is_some());
-      (
-        curve.reads(),
-        curve.miss_ratio(curve.edges().last().unwrap_or(0)),
-        curve.miss_ratio(0),
-        other,
-      )
-    });
+  let (read, kept, cold, other) = made([git("curved"), git("quiet")], |state, [curved, quiet]| {
+    let (id, _, head) = pushed_repository(state, curved, &[]);
+    let (quiet, _, _) = pushed_repository(state, quiet, &[]);
+    let wants = fetch(&[head], &[]);
+    for _ in 0..2 {
+      let fetched = answered(state, (id, &owner()), Asked::Request(&wants));
+      assert_eq!(fetched.1, None);
+    }
+    let row = state
+      .vcs_usage
+      .usage(&id)
+      .expect("the fetched repository's row");
+    let curve = row.curve().expect("its curve");
+    let other = state
+      .vcs_usage
+      .usage(&quiet)
+      .is_some_and(|row| row.curve().is_some());
+    (
+      curve.reads(),
+      curve.miss_ratio(curve.edges().last().unwrap_or(0)),
+      curve.miss_ratio(0),
+      other,
+    )
+  });
   assert!(read > 0.0, "no read noted");
   assert!(kept < cold, "kept {kept} vs cold {cold}");
   assert!(!other, "a read noted in another repository's curve");
@@ -461,21 +477,19 @@ fn t_a724_a_fetchs_reads_are_noted_in_its_own_repositorys_curve() {
 /// refused as git refuses a ref it does not have ("unknown ref").
 #[test]
 fn t_a682_a_ref_the_reader_may_not_read_is_neither_listed_nor_wanted() {
-  let (by_owner, by_reader, wanted, head) =
-    crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
-      let (id, root) = repository(state, "hidden", VcsTool::Git);
-      reader_reads_main(state, "hidden");
-      let files = [(b"README".to_vec(), b"one\n".to_vec())];
-      let (objects, head) = commit_of(&files, &[], FIRST_DATE);
-      let version = push_through(state, (id, root), &objects, (None, head, tree_of(&objects)));
-      branch_at(state, (id, &objects), ("topic", root, version), head);
-      let ls_refs = ls_refs();
-      let by_owner = answered(state, (id, &owner()), Asked::Request(&ls_refs));
-      let by_reader = answered(state, (id, &reader()), Asked::Request(&ls_refs));
-      let topic = fetch(&[], &["refs/heads/topic"]);
-      let wanted = answered(state, (id, &reader()), Asked::Request(&topic));
-      (by_owner, by_reader, wanted, head)
-    });
+  let (by_owner, by_reader, wanted, head) = made([git("hidden")], |state, [(id, root)]| {
+    reader_reads_main(state, "hidden");
+    let files = [(b"README".to_vec(), b"one\n".to_vec())];
+    let (objects, head) = commit_of(&files, &[], FIRST_DATE);
+    let version = push_through(state, (id, root), &objects, (None, head, tree_of(&objects)));
+    branch_at(state, (id, &objects), ("topic", root, version), head);
+    let ls_refs = ls_refs();
+    let by_owner = answered(state, (id, &owner()), Asked::Request(&ls_refs));
+    let by_reader = answered(state, (id, &reader()), Asked::Request(&ls_refs));
+    let topic = fetch(&[], &["refs/heads/topic"]);
+    let wanted = answered(state, (id, &reader()), Asked::Request(&topic));
+    (by_owner, by_reader, wanted, head)
+  });
   let main = vec![
     ref_line(head, "HEAD", Some("refs/heads/main")),
     ref_line(head, "refs/heads/main", None),
@@ -496,8 +510,8 @@ fn t_a682_a_ref_the_reader_may_not_read_is_neither_listed_nor_wanted() {
 /// cannot carry; one ref listed twice, which upload-pack's order check refuses).
 #[test]
 fn t_a682_a_name_that_is_no_git_ref_is_not_lent() {
-  let (listed, head) = crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
-    let (id, _, head) = pushed_repository(state, "spaced", &["my topic", "refs/heads/main"]);
+  let (listed, head) = made([git("spaced")], |state, [made]| {
+    let (id, _, head) = pushed_repository(state, made, &["my topic", "refs/heads/main"]);
     let listed = answered(state, (id, &owner()), Asked::Request(&ls_refs()));
     (listed, head)
   });
@@ -514,26 +528,21 @@ fn t_a682_a_name_that_is_no_git_ref_is_not_lent() {
 /// (its store held, its objects still lent to an answer's later steps), and the unnamed one holds nothing here.
 #[test]
 fn t_a682_a_store_not_held_here_is_not_lent() {
-  let lent = crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (mercurial, _) = repository(state, "elsewhere", VcsTool::Mercurial);
-    let reply = crate::test_store::create(
-      state,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: "unnamed-head".to_owned(),
-        tool: VcsTool::Git,
-        format: slates_ipc::protocol::ObjectFormat::Sha1,
-        default_branch: "my main".to_owned(),
-        green: None,
-      },
-    );
-    assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
-    let spaced = state
-      .db
-      .partition()
-      .repositories()
-      .repository_named("unnamed-head");
-    let spaced = spaced.map(|record| record.id).expect("the record");
+  let asked = [
+    (
+      "elsewhere",
+      VcsTool::Mercurial,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      "main",
+    ),
+    (
+      "unnamed-head",
+      VcsTool::Git,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      "my main",
+    ),
+  ];
+  let lent = made(asked, |state, [(mercurial, _), (spaced, _)]| {
     let nobody = RepositoryId { bytes: [0xa6; 16] };
     let asked = |state: &mut ShardState, id| {
       let request = lend_on(state, (id, Some(&owner())), |_, _| ()).is_some();
@@ -607,8 +616,9 @@ async fn ssh_session(
 #[test]
 fn t_a682_an_ssh_session_fetches_through_the_daemons_lender() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (record, objects, head) = crate::daemon::observe_first(&daemon, |state| {
-    let (id, objects, head) = pushed_repository(state, "over-ssh", &[]);
+  let made = crate::test_store::create_on(&daemon, 0, &owner(), git("over-ssh"));
+  let (record, objects, head) = crate::daemon::observe_first(&daemon, move |state| {
+    let (id, objects, head) = pushed_repository(state, made, &[]);
     let record = state.db.partition().repositories().repository(id).cloned();
     (record.expect("the record"), objects, head)
   });
@@ -655,20 +665,19 @@ fn t_a682_an_ssh_session_fetches_through_the_daemons_lender() {
 /// its tree and its blob, read as index-pack reads one.
 #[test]
 fn t_a718_a_pushed_version_is_encoded_once_and_fetched_from_its_kept_fragments() {
-  let (before, after, encoded_count, again, objects) =
-    crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
-      let (id, objects, head) = pushed_repository(state, "encoded", &[]);
-      let wants = fetch(&[head], &[]);
-      let before = fetched_with_counters(state, (id, &owner()), &wants);
-      encoded(state, id);
-      let again = encoded(state, id);
-      let encoded_count = state
-        .refusals
-        .get(super::super::git_encode::ENCODED)
-        .copied();
-      let after = fetched_with_counters(state, (id, &owner()), &wants);
-      (before, after, encoded_count, again, objects)
-    });
+  let (before, after, encoded_count, again, objects) = made([git("encoded")], |state, [made]| {
+    let (id, objects, head) = pushed_repository(state, made, &[]);
+    let wants = fetch(&[head], &[]);
+    let before = fetched_with_counters(state, (id, &owner()), &wants);
+    encoded(state, id);
+    let again = encoded(state, id);
+    let encoded_count = state
+      .refusals
+      .get(super::super::git_encode::ENCODED)
+      .copied();
+    let after = fetched_with_counters(state, (id, &owner()), &wants);
+    (before, after, encoded_count, again, objects)
+  });
   assert_eq!((encoded_count, again), (Some(1), 0));
   let fresh = |counters: &slates_git::store::UploadCounters| {
     counters.loose_whole + counters.loose_deltas + counters.reused_whole + counters.reused_deltas
@@ -733,83 +742,81 @@ fn tagged(
 /// ref, so the tag is lost), so the hold is what keeps it.
 #[test]
 fn a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile() {
-  let (start, held, unheld) =
-    crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
-      let (id, root) = repository(state, "generations", VcsTool::Git);
-      let files = [(b"README".to_vec(), b"one\n".to_vec())];
-      let (objects, first) = commit_of(&files, &[], FIRST_DATE);
-      let first_tree = tree_of(&objects);
-      let version = push_through(state, (id, root), &objects, (None, first, first_tree));
-      tagged(state, (id, root, version), first, "v1");
-      let mut wants = fetch(&[first], &[]);
-      // `include-tag` beside the request's other arguments, before its flush.
-      let flush_at = wants.len() - FLUSH.len();
-      wants.splice(flush_at..flush_at, packet(b"include-tag\n"));
-      let began = super::hold_in(state, id, &owner()).expect("held");
-      let start = answered(state, (id, &owner()), Asked::Request(&wants)).0;
-      let in_turns = |state: &mut ShardState,
-                      hold: super::GitGeneration,
-                      held: bool,
-                      land: &mut dyn FnMut(&mut ShardState)| {
-        let mut admission = Admission::new(ROOM);
-        let mut answer = super::lend_held_in(state, &hold, |served, packs| {
-          upload::serve_in_turns(
+  let (start, held, unheld) = made([git("generations")], |state, [(id, root)]| {
+    let files = [(b"README".to_vec(), b"one\n".to_vec())];
+    let (objects, first) = commit_of(&files, &[], FIRST_DATE);
+    let first_tree = tree_of(&objects);
+    let version = push_through(state, (id, root), &objects, (None, first, first_tree));
+    tagged(state, (id, root, version), first, "v1");
+    let mut wants = fetch(&[first], &[]);
+    // `include-tag` beside the request's other arguments, before its flush.
+    let flush_at = wants.len() - FLUSH.len();
+    wants.splice(flush_at..flush_at, packet(b"include-tag\n"));
+    let began = super::hold_in(state, id, &owner()).expect("held");
+    let start = answered(state, (id, &owner()), Asked::Request(&wants)).0;
+    let in_turns = |state: &mut ShardState,
+                    hold: super::GitGeneration,
+                    held: bool,
+                    land: &mut dyn FnMut(&mut ShardState)| {
+      let mut admission = Admission::new(ROOM);
+      let mut answer = super::lend_held_in(state, &hold, |served, packs| {
+        upload::serve_in_turns(
+          served,
+          Version::V2,
+          Asked::Request(&wants),
+          packs,
+          &mut admission,
+        )
+      })
+      .expect("the request's step lent");
+      let mut out = Vec::new();
+      let mut judge = Judge::new("an answer in turns", answer_seen(&answer, &out));
+      loop {
+        let write = |served: &upload::Served<'_>, packs: &mut super::ShardPacks| {
+          answer.write_within(
             served,
-            Version::V2,
-            Asked::Request(&wants),
             packs,
             &mut admission,
+            &mut out,
+            MAX_LEN,
+            &mut || true,
           )
-        })
-        .expect("the request's step lent");
-        let mut out = Vec::new();
-        let mut judge = Judge::new("an answer in turns", answer_seen(&answer, &out));
-        loop {
-          let write = |served: &upload::Served<'_>, packs: &mut super::ShardPacks| {
-            answer.write_within(
-              served,
-              packs,
-              &mut admission,
-              &mut out,
-              MAX_LEN,
-              &mut || true,
-            )
-          };
-          let written = if held {
-            super::lend_held_in(state, &hold, write)
-          } else {
-            lend_on(state, (id, None), write)
-          }
-          .expect("the answer's step lent");
-          if judge.steps == 0 {
-            land(state);
-          }
-          if written == Written::End {
-            return out;
-          }
-          if let Err(stalled) = judge.stepped(answer_seen(&answer, &out)) {
-            panic!("{stalled}: (bytes written, its pack's counters)")
-          }
+        };
+        let written = if held {
+          super::lend_held_in(state, &hold, write)
+        } else {
+          lend_on(state, (id, None), write)
         }
-      };
-      let mut landed = false;
-      let held = in_turns(state, began, true, &mut |state| {
-        let files = [(b"README".to_vec(), b"two\n".to_vec())];
-        let (objects, second) = commit_of(&files, &[first], FIRST_DATE + 1);
-        let version = push_through(
-          state,
-          (id, root),
-          &objects,
-          (Some(first_tree), second, tree_of(&objects)),
-        );
-        tagged(state, (id, root, version), first, "v2");
-        landed = true;
-      });
-      assert!(landed, "the push landed mid-answer");
-      let hold = super::hold_in(state, id, &owner()).expect("held");
-      let unheld = in_turns(state, hold, false, &mut |_| {});
-      (start, held, unheld)
+        .expect("the answer's step lent");
+        if judge.steps == 0 {
+          land(state);
+        }
+        if written == Written::End {
+          return out;
+        }
+        if let Err(stalled) = judge.stepped(answer_seen(&answer, &out)) {
+          panic!("{stalled}: (bytes written, its pack's counters)")
+        }
+      }
+    };
+    let mut landed = false;
+    let held = in_turns(state, began, true, &mut |state| {
+      let files = [(b"README".to_vec(), b"two\n".to_vec())];
+      let (objects, second) = commit_of(&files, &[first], FIRST_DATE + 1);
+      let version = push_through(
+        state,
+        (id, root),
+        &objects,
+        (Some(first_tree), second, tree_of(&objects)),
+      );
+      tagged(state, (id, root, version), first, "v2");
+      landed = true;
     });
+    assert!(landed, "the push landed mid-answer");
+    let hold = super::hold_in(state, id, &owner()).expect("held");
+    let unheld = in_turns(state, hold, false, &mut |_| {});
+    (start, held, unheld)
+  });
   // Byte for byte: the encoder's level and window are one function of the bytes and the machine's measured rates
   // (`learn::Rates`), never the shard's clock, so two streams of one generation write one answer.
   assert_eq!(held, start, "held to the generation it began on");
@@ -828,8 +835,8 @@ fn a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile
 /// counts are not all zero).
 #[test]
 fn t_a859_a_fetchs_stream_counts_each_path_its_objects_took_on_its_shard() {
-  let (stream, counted) = crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
-    let (id, _, head) = pushed_repository(state, "counted", &[]);
+  let (stream, counted) = made([git("counted")], |state, [made]| {
+    let (id, _, head) = pushed_repository(state, made, &[]);
     let (_, stream) = fetched_with_counters(state, (id, &owner()), &fetch(&[head], &[]));
     let counted: Vec<u64> = super::STREAM_COUNTED
       .iter()
@@ -859,8 +866,8 @@ fn t_a868_a_shards_deflate_states_are_counted_one_made_and_let_go_idle() {
       u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
   }
-  crate::test_store::audit_on_stored_shard("vcs_store-deflaters", |state| {
-    let (id, _, head) = pushed_repository(state, "deflated", &[]);
+  made([git("deflated")], |state, [made]| {
+    let (id, _, head) = pushed_repository(state, made, &[]);
     slates_git::store::deflaters::let_go();
     super::count_deflaters(state);
     let names = [
@@ -902,7 +909,7 @@ fn t_a868_a_shards_deflate_states_are_counted_one_made_and_let_go_idle() {
 fn t_a859_a_shard_prices_a_fetched_byte_cold_until_its_link_is_learned() {
   use super::{LINK_LEARNED, Pacing, Sent, exchange, learn_link};
   use slates_git::store::learn::Exchange;
-  crate::test_store::audit_on_stored_shard("vcs_store-link", |state| {
+  made([], |state, []| {
     let rates = state.config.git_rates;
     let cold = exchange(state);
     let memcpy_priced = u128::from(cold.ns) * u128::from(state.config.memcpy_bytes_per_second)
@@ -1264,8 +1271,10 @@ const LINE_FILES: usize = 60;
 
 /// A git repository `name` whose `main` is a line of [`LINE_COMMITS`] commits, each a root tree of [`LINE_FILES`] files
 /// with one file changed from the commit before: the repository, its head, and its distinct objects.
-fn pushed_line(state: &mut ShardState, name: &str) -> (RepositoryId, ObjectId, usize) {
-  let (id, root) = repository(state, name, VcsTool::Git);
+fn pushed_line(
+  state: &mut ShardState,
+  (id, root): (RepositoryId, DbVolumeId),
+) -> (RepositoryId, ObjectId, usize) {
   let mut files: Vec<(Vec<u8>, Vec<u8>)> = (0..LINE_FILES)
     .map(|at| {
       (
@@ -1324,8 +1333,8 @@ fn position_counts(state: &ShardState) -> PositionCounted {
 /// [`pushed_line`]'s line, as repository `name` on an audit shard, fetched whole under a depth filter past it: its
 /// distinct objects, what the fetch counted ([`PositionCounted`]), and the objects its pack sent.
 fn line_fetched(name: &'static str) -> (usize, PositionCounted, usize) {
-  crate::test_store::audit_on_stored_shard(name, move |state| {
-    let (id, head, distinct) = pushed_line(state, name);
+  made([git(name)], move |state, [made]| {
+    let (id, head, distinct) = pushed_line(state, made);
     let before = position_counts(state);
     let asked = fetch_under_depth(head, PAST_THE_LINE);
     let (answer, _) = fetched_with_counters(state, (id, &owner()), &asked);
@@ -1379,8 +1388,8 @@ fn a911_a_miss_into_a_slot_another_id_holds_is_counted_a_conflict() {
 /// [`pushed_line`]'s line, as repository `name` on a fresh audit shard, fetched whole under a depth filter past it: the
 /// most entries one unit of its walk took, and the longest tree one unit parsed, as the shard counted them most.
 fn line_walk_most(name: &'static str) -> (u64, u64) {
-  crate::test_store::audit_on_stored_shard(name, move |state| {
-    let (id, head, _) = pushed_line(state, name);
+  made([git(name)], move |state, [made]| {
+    let (id, head, _) = pushed_line(state, made);
     let asked = fetch_under_depth(head, PAST_THE_LINE);
     let _ = fetched_with_counters(state, (id, &owner()), &asked);
     let most = |counter: &str| state.refusals.get(counter).copied().unwrap_or(0);

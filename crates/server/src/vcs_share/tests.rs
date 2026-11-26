@@ -5,7 +5,7 @@ use slates_db::catalog::RepositoryId;
 use slates_vcs::Work;
 
 use super::{Bound, DIVIDED, FAST, Live, NARROWED, Room, room};
-use crate::git_push::tests::{git_repository, owner};
+use crate::git_push::tests::owner;
 use crate::state::ShardState;
 
 /// A counter's value on `state`'s shard: zero when it never moved.
@@ -36,8 +36,7 @@ fn answered_intake(state: &mut ShardState, repository: RepositoryId, bytes: u64)
 /// fast path, counted, and nothing divided.
 #[test]
 fn t_a724_a_repository_alone_is_admitted_all_the_shard_can_hold_by_the_fast_path() {
-  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
-    let toy = git_repository(state, "toy");
+  crate::git_push::tests::on_stored_shard_with(["toy"], |state, [toy]| {
     let own = Live::begin(toy);
     let admittable = state.store.admittable();
     let slot_room = state.db.snapshot_room(&state.segment);
@@ -55,9 +54,7 @@ fn t_a724_a_repository_alone_is_admitted_all_the_shard_can_hold_by_the_fast_path
 /// everything by the fast path.
 #[test]
 fn t_a724_a_repositorys_room_is_its_share_while_others_push_and_learns_from_their_traffic() {
-  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
-    let monorepo = git_repository(state, "monorepo");
-    let toy = git_repository(state, "toy");
+  crate::git_push::tests::on_stored_shard_with(["monorepo", "toy"], |state, [monorepo, toy]| {
     let admittable = state.store.admittable();
     // Memory and the snapshot slot are divided together (A-724 piece 8a): the lesser room binds.
     let free = admittable.min(state.db.snapshot_room(&state.segment));
@@ -91,9 +88,7 @@ fn t_a724_a_repositorys_room_is_its_share_while_others_push_and_learns_from_thei
 /// leaves the other alone again.
 #[test]
 fn t_a724_a_push_is_live_from_its_start_until_it_drops() {
-  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
-    let pushed = git_repository(state, "pushed");
-    let other = git_repository(state, "other");
+  crate::git_push::tests::on_stored_shard_with(["pushed", "other"], |state, [pushed, other]| {
     let mut advertised = Vec::new();
     let push = crate::git_push::ReceivePack::start(
       state,
@@ -147,8 +142,7 @@ fn encoded_and_learned(state: &mut ShardState, id: RepositoryId) -> u64 {
 fn t_a724_a_repository_over_its_share_drops_fragments_only_where_rebuilding_costs_less_than_the_room()
  {
   use crate::vcs_store::git_encode::{DROPPED, kept_bytes, relieve};
-  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
-    let pushed = git_repository(state, "pushed");
+  crate::git_push::tests::on_stored_shard_with(["pushed"], |state, [pushed]| {
     crate::git_push::tests::pushed_from_the_fixtures(state, pushed, &["create", "update"]);
     let kept = encoded_and_learned(state, pushed);
     let given = relieve(state, pushed, kept.saturating_mul(2), 2.0);
@@ -176,11 +170,13 @@ fn t_a724_a_repository_over_its_share_drops_fragments_only_where_rebuilding_cost
 /// snapshot and naming it; beside another, at most that, the slot divided between them.
 #[test]
 fn t_a724_a_repositorys_room_is_bounded_by_its_partitions_snapshot_slot() {
-  crate::test_store::audit_on_stored_shard_configured(
-    "vcs_share",
-    |state| {
-      let toy = git_repository(state, "toy");
-      let other = git_repository(state, "other");
+  crate::git_push::tests::on_stored_shard_configured_with(
+    ["toy", "other"],
+    |config| {
+      // The slot shrunk below the shard's admittable room, as a giant repository's partition meets it.
+      config.geometry.snapshot_bytes = config.geometry.page.saturating_mul(1 << 8);
+    },
+    |state, [toy, other]| {
       let admittable = state.store.admittable();
       let slot_room = state.db.snapshot_room(&state.segment);
       assert!(
@@ -203,10 +199,6 @@ fn t_a724_a_repositorys_room_is_bounded_by_its_partitions_snapshot_slot() {
       );
       drop(pushing);
     },
-    |config| {
-      // The slot shrunk below the shard's admittable room, as a giant repository's partition meets it.
-      config.geometry.snapshot_bytes = config.geometry.page.saturating_mul(1 << 8);
-    },
   );
 }
 
@@ -217,9 +209,7 @@ fn t_a724_a_repositorys_room_is_bounded_by_its_partitions_snapshot_slot() {
 /// nearly everything, overcommitting the shard to the monorepo's next push.
 #[test]
 fn t_a724_a_repositorys_claim_follows_its_learned_demand_not_its_lifetime_mean() {
-  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
-    let monorepo = git_repository(state, "monorepo");
-    let toy = git_repository(state, "toy");
+  crate::git_push::tests::on_stored_shard_with(["monorepo", "toy"], |state, [monorepo, toy]| {
     let free = state
       .store
       .admittable()
@@ -291,11 +281,14 @@ fn first_refusal(
 /// server; alone, not refused for a share.
 #[test]
 fn t_a724_a_push_past_its_share_is_refused_retryable_naming_the_share() {
-  crate::test_store::audit_on_stored_shard_configured(
-    "vcs_share",
-    |state| {
-      let monorepo = git_repository(state, "monorepo");
-      let toy = git_repository(state, "toy");
+  crate::git_push::tests::on_stored_shard_configured_with(
+    ["monorepo", "toy"],
+    |config| {
+      // The slot shrunk so its room, divided, binds a push of a few hundred bytes (6,400 bytes less the partition's
+      // state leaves 461 here).
+      config.geometry.snapshot_bytes = 6_400;
+    },
+    |state, [monorepo, toy]| {
       let request = crate::git_push::tests::chain()[0].0.request;
       let pushing = Live::begin(monorepo);
       assert!(matches!(room(state, toy).bound, Bound::Share { .. }));
@@ -316,11 +309,6 @@ fn t_a724_a_push_past_its_share_is_refused_retryable_naming_the_share() {
         "alone, not refused for a share: {alone:?}"
       );
     },
-    |config| {
-      // The slot shrunk so its room, divided, binds a push of a few hundred bytes (6,400 bytes less the partition's
-      // state leaves 461 here).
-      config.geometry.snapshot_bytes = 6_400;
-    },
   );
 }
 
@@ -331,9 +319,7 @@ fn t_a724_a_push_past_its_share_is_refused_retryable_naming_the_share() {
 /// path.
 #[test]
 fn t_a724_a_fetch_in_flight_is_a_claim_on_the_room() {
-  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
-    let fetched = git_repository(state, "fetched");
-    let toy = git_repository(state, "toy");
+  crate::git_push::tests::on_stored_shard_with(["fetched", "toy"], |state, [fetched, toy]| {
     crate::git_push::tests::pushed_from_the_fixtures(state, fetched, &["create", "update"]);
     let held = crate::vcs_store::upload::hold_in(state, fetched, &owner()).expect("held");
     let divided = room(state, toy);
@@ -356,8 +342,8 @@ fn t_a724_a_fetch_in_flight_is_a_claim_on_the_room() {
 fn t_a724_a_fetchs_answer_is_counted_and_learned_on_its_repositorys_usage_row() {
   use crate::vcs_http::git::upload::StoreLender;
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let fetched = crate::daemon::observe_first(&daemon, |state| {
-    let fetched = git_repository(state, "fetched");
+  let fetched = crate::git_push::tests::git_repository_on(&daemon, "fetched");
+  let fetched = crate::daemon::observe_first(&daemon, move |state| {
     crate::git_push::tests::pushed_from_the_fixtures(state, fetched, &["create", "update"]);
     fetched
   });
@@ -424,9 +410,8 @@ fn hg_repository(state: &mut ShardState, name: &str) -> RepositoryId {
 /// once it is given back. Expect: while the fetch is in flight, the other's room divided with it; once it ends, alone.
 #[test]
 fn t_a724_a_mercurial_fetch_in_flight_is_a_claim_on_the_room() {
-  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
+  crate::git_push::tests::on_stored_shard_with(["toy"], |state, [toy]| {
     let fetched = hg_repository(state, "fetched");
-    let toy = git_repository(state, "toy");
     let mut held_room = slates_hg::Admission::new(u64::MAX);
     let held = crate::vcs_store::hg_view::hold_in(state, fetched, &mut held_room).expect("held");
     let divided = room(state, toy);
@@ -496,12 +481,8 @@ fn t_a724_a_mercurial_push_past_its_share_is_refused_naming_the_share() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored_configured(|config| {
     config.geometry.snapshot_bytes = 6_400;
   });
-  let (pushed, other) = crate::daemon::observe_first(&daemon, |state| {
-    (
-      hg_repository(state, "pushed"),
-      git_repository(state, "other"),
-    )
-  });
+  let other = crate::git_push::tests::git_repository_on(&daemon, "other");
+  let pushed = crate::daemon::observe_first(&daemon, |state| hg_repository(state, "pushed"));
   let (sent, outcome) = std::sync::mpsc::sync_channel(1);
   crate::daemon::observe_first(&daemon, move |_| {
     let task = slates_rt::futures::spawn(async move {

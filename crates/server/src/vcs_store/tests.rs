@@ -2514,8 +2514,7 @@ fn let_go_of_a_pack_of(windows: usize) -> LetGoSeen {
   use super::{
     LANDED_LET_GO_BYTES, LANDED_PINNED, LET_GO_PAST_QUANTUM, LET_GO_SLICES, LET_GO_TRACE,
   };
-  crate::test_store::audit_on_stored_shard("let-go-sliced", move |state| {
-    let id = crate::git_push::tests::git_repository(state, "let-go-sliced");
+  crate::git_push::tests::on_stored_shard_with(["let-go-sliced"], move |state, [id]| {
     let window = state
       .vcs_stores
       .content()
@@ -2654,8 +2653,7 @@ fn room_asked_inside_a_lend_is_refused_out_of_reach_at_its_first_put() {
   let bytes = b"a window put within the room asked for it".to_vec();
   let need = u64::try_from(bytes.len()).unwrap();
   let (slack_inside, inside, held_after, outside, counted) =
-    crate::test_store::audit_on_stored_shard("room-out-of-reach", move |state| {
-      crate::git_push::tests::git_repository(state, "room-out-of-reach");
+    crate::git_push::tests::on_stored_shard_with(["room-out-of-reach"], move |state, [_]| {
       let window = u64::try_from(state.store.content.chunk_bytes()).unwrap();
       super::within_budget(state, window, |_| ());
       let put =

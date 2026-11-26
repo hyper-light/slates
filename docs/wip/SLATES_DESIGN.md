@@ -10255,7 +10255,10 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > neither wedge nor end a daemon serving held mounts (the rule A-213 set for a closed one). Every other thread writes as
 > before. Regressions: `a_lone_daemon_whose_log_stalls_lives_on_and_serves` (`crates/client/tests/lone_daemon.rs`:
 > standard error held three windows while each shard logs; exit 4 within the stall before) and
-> `a_routed_thread_never_waits_on_standard_error_and_a_full_queue_refuses` (`crates/machine/src/log.rs`).
+> `a_routed_thread_never_waits_on_standard_error_and_a_full_queue_refuses` (`crates/machine/src/log.rs`). Since
+> 2026-11-25 the watchdog's end line is written past that lock as well (`watchdog::write_end_line`, the system's own
+> write), so a thread holding it no longer costs the verdict of an exit 4
+> (`a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_log_is_held`).
 
 > **Status (2026-11-18, A-308): a wedge is judged only over a window the watchdog watched.** The rule calls a shard
 > wedged once a window passed with no CPU progress and never seen runnable, and "never seen" is sampled at each look. A
@@ -32161,6 +32164,14 @@ shard routed, stopped after them).
   without end.
 - **What it does not change.** The watchdog's verdicts, window and ends (A-228, A-232); the lines' text; the CLI's, the
   anchor's and every other thread's direct writes, whose order with their output stays as it was.
+- **The end's line (2026-11-25, main's order after w-hg's exit 4 with no verdict).** The watchdog's end line is written
+  past the process's standard-error lock too: its writer thread writes the line with the system's own write to the
+  descriptor (`rustix::io::write`; `WriteFile` on Windows), a part at a time, and the end still waits at most a beat for
+  it (`watchdog::write_end_line`). Through the lock the verdict was lost behind any thread holding it: w-hg's 28-module
+  run at loads 21 to 27 exited 4 with no end line, and the red
+  `a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_log_is_held` (`crates/client/tests/lone_daemon.rs`,
+  the lock held for good from the wedge) exited 4 without the line, 1 of 1, before; the line is read after. A pipe
+  nobody drains still blocks the write itself, which the beat bounds.
 
 ### A-308 — The watchdog judges a wedge only over a window it watched (2026-11-18, goal g251: every open slates bug fixed)
 Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 entry), `crates/server/src/watchdog.rs`
@@ -59580,6 +59591,27 @@ C1's, keeps the paths the verb's fetch holds only lengths of), `verbs.rs` (`edit
   polls' length histogram; `futures`; `tests/pacing.rs`), `crates/merge` (`pace`, `push`), `crates/git`
   (`receive::works`), `crates/server` (`git_push`, `daemon`, `content_ranges`: the runtime's counters as status rows),
   `crates/cli/bench/pacing_ab.py` (new), §4.3, GAPS, BENCHMARKS.md, amendments.tsv.
+- **The ask harvests I/O once a harvest period (2026-11-25, w-git for main 01a20182, its ruling on the period).** A
+  3 s sample of git/git's clone waiting for its first pack bytes found the encoding behind the push spending 39 % of
+  its time in the `kevent` of `harvest_io` under `others_waiting` (375 of its 951 samples): one ask a quantum, as
+  built, but the quantum is the wake estimate, a few microseconds, raised to the ask's own measured cost, so asking
+  could take half a step. Now an ask looks at the inbound rings, the ready queue and the step's batch, due timers,
+  ready pollers and the driver's pending completions every time, and harvests I/O only once the last harvest (by any
+  path) is `ShardContext::harvest_period_ns` old: `P = max(c, o)`, `c` a harvest's cost measured as the pace measures
+  its probe (`slates_pace::UnitCost`), `o` the shard's measured scheduler overrun. No waiter on the shard is woken more
+  precisely than the scheduler lets it run, so a harvest sooner than `o` buys nothing, and a harvest takes at most
+  `c / o` of a paced step; on a quiet host every ask a harvest's cost apart harvests, as before. Its cost: a socket's
+  arrival mid-step is seen up to `P` later, never past the step's end (where the run loop harvests); a ring's word, a
+  due timer, a ready task or poller at the next ask, so the client ring path is untouched. The first rule tried, `P =
+  c / s` with `s` the pace's target error (`slates_pace::target_ppm`, moved there from the server so the runtime reads
+  it), fell at both ends: `s` clamps to the whole wherever the overrun passes a quantum, so every ask harvested under
+  load, and to a part in a million on a quiet host, so `tests/pacing.rs`'s
+  `a_connection_arriving_on_a_busy_shard_is_seen_waiting` saw no connection for its 2 s. Counted:
+  `Counters::paced_harvests` beside `waiting_asked`. Reds (`shard::harvest_tests`):
+  `a_loaded_shards_asks_harvest_io_once_its_overrun`, the overrun held at 200 µs and the loop asking for 4 ms, 219
+  harvests of 219 asks before, the harvests within the time over the period plus one now, the asks many more; and
+  `a_quiet_shards_asks_a_harvests_cost_apart_each_harvest`, every ask harvesting with no overrun. Main judges it on the
+  interleaved git/git A/B: first pack bytes, and the VCS edge's socket latency under load against the overrun.
 
 ### A-791 — A volume over an S3 base is made through the wire, its credential handed with the create (2026-11-20, w-k90-whp; main's dispatch 15:52 PST, goal 92's A-555 parts 2 and 3; §4.15 "An S3 base", A-464, A-524, A-555; R1, R3)
 > **Removed (A-795, 2026-11-20).** The S3 base this entry built is removed whole (Ada: never asked for; she said

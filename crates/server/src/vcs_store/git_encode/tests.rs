@@ -11,8 +11,8 @@ use super::{AHEAD_STOPPED, BEHIND, Turned, UNITS_PAST_BUDGET, encode_within, tur
 #[test]
 fn t_a718_a_fetch_that_stops_waiting_leaves_a_task_that_finishes_the_encoding() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let id = crate::daemon::observe_first(&daemon, |state| {
-    let id = crate::git_push::tests::git_repository(state, "behind");
+  let id = crate::git_push::tests::git_repository_on(&daemon, "behind");
+  let id = crate::daemon::observe_first(&daemon, move |state| {
     crate::git_push::tests::pushed_from_the_fixtures(state, id, &["create", "update"]);
     answered_live(state, id);
     let unencoded = state
@@ -91,8 +91,8 @@ fn answered_live(state: &mut crate::state::ShardState, id: slates_db::catalog::R
 #[test]
 fn t_a856_with_no_fetch_answered_nothing_is_encoded_ahead() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let id = crate::daemon::observe_first(&daemon, |state| {
-    let id = crate::git_push::tests::git_repository(state, "nobody");
+  let id = crate::git_push::tests::git_repository_on(&daemon, "nobody");
+  let id = crate::daemon::observe_first(&daemon, move |state| {
     crate::git_push::tests::pushed_from_the_fixtures(state, id, &["create", "update"]);
     let waited = slates_rt::futures::spawn(async move {
       let _ = encode_within(id, 0).await;
@@ -160,8 +160,8 @@ fn a718_no_unit_of_a_56_mb_packs_encoding_outgrows_the_step_quantum() {
   // The shard's task sends the outcome once; this test thread waits for it.
   let (told, done) = std::sync::mpsc::channel();
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  crate::daemon::observe_first(&daemon, move |state| {
-    let id = crate::git_push::tests::git_repository(state, "large");
+  let id = crate::git_push::tests::git_repository_on(&daemon, "large");
+  crate::daemon::observe_first(&daemon, move |_| {
     let task = async move {
       let _ = told.send(drive(id, request).await);
     };
@@ -361,10 +361,10 @@ fn fetched_main(
 #[test]
 fn t_a856_a_grant_is_learned_from_reads_and_given_back_when_idle() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let seen = crate::daemon::observe_first(&daemon, |state| {
-    let small = crate::git_push::tests::git_repository(state, "small");
+  let small = crate::git_push::tests::git_repository_on(&daemon, "small");
+  let larger = crate::git_push::tests::git_repository_on(&daemon, "larger");
+  let seen = crate::daemon::observe_first(&daemon, move |state| {
     crate::git_push::tests::pushed_from_the_fixtures(state, small, &["create", "update"]);
-    let larger = crate::git_push::tests::git_repository(state, "larger");
     let (create, _) = crate::git_push::tests::create_of_file(incompressible());
     let received = crate::git_push::tests::pushed(state, larger, &create);
     assert!(
@@ -463,8 +463,8 @@ fn t_a856_a_grant_is_learned_from_reads_and_given_back_when_idle() {
 #[test]
 fn t_a860_a_repository_gone_idle_lets_go_of_the_objects_its_reads_keep() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (id, before, during) = crate::daemon::observe_first(&daemon, |state| {
-    let id = crate::git_push::tests::git_repository(state, "idle-reads");
+  let id = crate::git_push::tests::git_repository_on(&daemon, "idle-reads");
+  let (id, before, during) = crate::daemon::observe_first(&daemon, move |state| {
     crate::git_push::tests::pushed_from_the_fixtures(state, id, &["create", "update"]);
     let recent = |state: &crate::state::ShardState| {
       state

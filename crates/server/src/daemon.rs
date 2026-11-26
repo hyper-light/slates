@@ -8458,11 +8458,12 @@ mod tests {
     let (sent, got) = std::sync::mpsc::channel();
     let put = object.clone();
     let (made, repository) = std::sync::mpsc::channel();
+    // A repository beside the object, so the successor's recovery replays its records and then frees every restored
+    // window nothing holds (`release_unheld`): the region hold must be what keeps the object.
+    let beside = crate::git_push::tests::git_repository_on(&first, "beside");
     first
       .observe(shard, move |state| {
-        // A repository beside the object, so the successor's recovery replays its records and then frees every restored
-        // window nothing holds (`release_unheld`): the region hold must be what keeps the object.
-        let repository = crate::git_push::tests::git_repository(state, "beside");
+        let repository = beside;
         crate::git_push::tests::pushed_from_the_fixtures(state, repository, &["create"]);
         let _ = made.send(repository);
       })
@@ -8623,9 +8624,9 @@ mod tests {
     first.bootstrap(true).unwrap();
     let shard = first.shards.first().copied();
     let (sent, got) = std::sync::mpsc::channel();
+    let repository = crate::git_push::tests::git_repository_on(&first, "barrier");
     first
-      .observe(shard, move |state| {
-        let repository = crate::git_push::tests::git_repository(state, "barrier");
+      .observe(shard, move |_| {
         let request = crate::git_push::tests::chain()
           .into_iter()
           .next()
@@ -9246,9 +9247,9 @@ mod tests {
     first.bootstrap(true).unwrap();
     let shard = first.shards.first().copied();
     let (sent, got) = std::sync::mpsc::channel();
+    let repository = crate::git_push::tests::git_repository_on(&first, "landed");
     first
-      .observe(shard, move |state| {
-        let repository = crate::git_push::tests::git_repository(state, "landed");
+      .observe(shard, move |_| {
         let request = crate::git_push::tests::chain()
           .into_iter()
           .next()
@@ -9807,9 +9808,9 @@ mod tests {
     };
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
+    let repository = crate::git_push::tests::git_repository_on(&first, "large");
     let unread = first
       .observe(first.shards.first().copied(), move |state| {
-        let repository = crate::git_push::tests::git_repository(state, "large");
         let received = crate::git_push::tests::pushed(state, repository, &request);
         let _ = received;
         read(state)
@@ -10315,9 +10316,9 @@ mod tests {
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
     let shard = first.shards.first().copied();
+    let repository = crate::git_push::tests::git_repository_on(&first, "kept");
     let map_before = first
-      .observe(shard, |state| {
-        let repository = crate::git_push::tests::git_repository(state, "kept");
+      .observe(shard, move |state| {
         crate::git_push::tests::pushed_from_the_fixtures(state, repository, &["create", "update"]);
         crate::vcs_store::paths::whole_build::settle(state);
         let map = main_map(state).and_then(|(_, map)| map);

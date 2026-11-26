@@ -361,6 +361,7 @@ fn encoded(reply: &Reply) -> Vec<u8> {
 }
 
 /// A Mercurial repository on the shard, whose pushes keep their revisions in its store there (A-662's Mercurial arm).
+#[derive(Clone, Copy, Debug)]
 struct Hg {
   repository: RepositoryId,
   root: DbVolumeId,
@@ -477,6 +478,175 @@ impl Hg {
   }
 }
 
+impl Hg {
+  /// [`Hg::new`] from a task on the shard: the creation awaited, as a client's is answered
+  /// (`test_store::created`), never waited for on the shard's thread.
+  async fn made(name: &str) -> Hg {
+    let line = line_name(b"default", 0);
+    let asked = (name, VcsTool::Mercurial, ObjectFormat::Sha1, line.as_str());
+    let (repository, root) = crate::test_store::created(&owner(), asked).await;
+    Hg { repository, root }
+  }
+}
+
+/// `unbundle`'s parts as the bundle2 a client sends: its changegroup, phase-heads and bookmarks parts, each mandatory,
+/// in order. A part of another kind is no push these tests send whole.
+fn bundled(unbundle: &Unbundle) -> Vec<u8> {
+  use slates_hg::bundle2::{Event, Param, Part};
+  let mut payloads: Vec<(&'static [u8], Vec<Param<'static>>, Vec<u8>)> = Vec::new();
+  for part in &unbundle.parts {
+    match &part.asks {
+      Asks::Changegroup(group) => {
+        assert_eq!(group.version, Version::V03, "a version-03 changegroup");
+        let version = Param {
+          key: b"version",
+          value: b"03",
+        };
+        payloads.push((b"CHANGEGROUP", vec![version], group.payload.clone()));
+      }
+      Asks::PhaseHeads(heads) => {
+        let mut payload = Vec::new();
+        slates_hg::phases::encode(heads, &mut payload);
+        payloads.push((b"PHASE-HEADS", Vec::new(), payload));
+      }
+      Asks::Bookmarks(marks) => {
+        let marks: Vec<_> = marks
+          .iter()
+          .map(|mark| slates_hg::bookmarks::Bookmark {
+            name: &mark.name,
+            node: mark.node,
+          })
+          .collect();
+        let mut payload = Vec::new();
+        slates_hg::bookmarks::encode(&marks, &mut payload).expect("a bookmarks payload");
+        payloads.push((b"BOOKMARKS", Vec::new(), payload));
+      }
+      other => panic!("no bundle2 written for {other:?}"),
+    }
+  }
+  let parts = payloads
+    .iter()
+    .zip(0_u32..)
+    .map(|((kind, params, _), id)| Part {
+      kind,
+      id,
+      mandatory_params: params.len(),
+      params: params.clone(),
+      depth: 0,
+    })
+    .collect();
+  let events = payloads
+    .iter()
+    .enumerate()
+    .flat_map(|(at, (_, _, payload))| [Event::Open(at), Event::Chunk(payload), Event::Close])
+    .collect();
+  let bundle = Bundle2 {
+    params: Vec::new(),
+    parts,
+    events,
+  };
+  let mut out = Vec::new();
+  bundle.encode(&mut out).expect("a bundle2");
+  out
+}
+
+/// `unbundle` pushed to `hg`'s repository through the daemon's driver from a task on its shard
+/// ([`super::unbundle`]): every store wait awaited, never the shard's thread blocked. What it came to.
+async fn pushed(hg: &Hg, unbundle: &Unbundle) -> Outcome {
+  pushed_bytes(hg, &bundled(unbundle)).await
+}
+
+/// `bundle`, a bundle2 as a client sends it, pushed as [`pushed`] pushes one.
+async fn pushed_bytes(hg: &Hg, bundle: &[u8]) -> Outcome {
+  super::unbundle(
+    hg.repository,
+    (&owner(), &HeadsArgument::Force, bundle),
+    &mut room(),
+  )
+  .await
+  .expect("a served view")
+}
+
+/// Mercurial repository `name` made on `daemon`'s first shard and `unbundle` pushed to it ([`pushed`]), from a task
+/// there, accepted: the repository.
+fn made_and_pushed_on(daemon: &crate::Daemon, name: &'static str, unbundle: Unbundle) -> Hg {
+  let (hg, outcome) = crate::test_store::run_on_first(
+    daemon,
+    move || async move {
+      let hg = Hg::made(name).await;
+      let outcome = pushed(&hg, &unbundle).await;
+      (hg, outcome)
+    },
+    NAMED_PATIENCE,
+  );
+  assert!(
+    matches!(outcome, Outcome::Accepted(_)),
+    "the push was refused: {outcome:?}"
+  );
+  hg
+}
+
+/// Mercurial repository `name` made on `daemon`'s first shard from a task there (`test_store::created`).
+fn made_on(daemon: &crate::Daemon, name: &'static str) -> Hg {
+  crate::test_store::run_on_first(
+    daemon,
+    move || async move { Hg::made(name).await },
+    NAMED_PATIENCE,
+  )
+}
+
+/// `unbundle` pushed to `hg` ([`pushed`]) from a task on `daemon`'s first shard, accepted.
+fn pushed_unbundle_on(daemon: &crate::Daemon, hg: Hg, unbundle: Unbundle) {
+  let outcome = crate::test_store::run_on_first(
+    daemon,
+    move || async move { pushed(&hg, &unbundle).await },
+    NAMED_PATIENCE,
+  );
+  assert!(
+    matches!(outcome, Outcome::Accepted(_)),
+    "the push was refused: {outcome:?}"
+  );
+}
+
+/// [`pushed_bytes`] from a task on `daemon`'s first shard, accepted.
+fn pushed_on(daemon: &crate::Daemon, hg: Hg, bundle: &'static [u8]) {
+  let outcome = crate::test_store::run_on_first(
+    daemon,
+    move || async move { pushed_bytes(&hg, bundle).await },
+    NAMED_PATIENCE,
+  );
+  assert!(matches!(outcome, Outcome::Accepted(_)), "{outcome:?}");
+}
+
+/// [`rebuild`] through the daemon's driver ([`pushed`]): the fixtures' history, accepted.
+async fn rebuilt(hg: &Hg, (public, mark): (&[usize], usize)) -> Vec<Made> {
+  let (made, unbundle) = rebuilding((public, mark));
+  let outcome = pushed(hg, &unbundle).await;
+  assert!(
+    matches!(outcome, Outcome::Accepted(_)),
+    "the rebuild was refused: {outcome:?}"
+  );
+  made
+}
+
+/// Mercurial repository `name` made on `daemon`'s first shard and the fixtures' history pushed to it
+/// ([`rebuilt`]), from a task there: the repository and the history.
+fn rebuilt_on(
+  daemon: &crate::Daemon,
+  name: &'static str,
+  (public, mark): (&'static [usize], usize),
+) -> (Hg, Vec<Made>) {
+  crate::test_store::run_on_first(
+    daemon,
+    move || async move {
+      let hg = Hg::made(name).await;
+      let made = rebuilt(&hg, (public, mark)).await;
+      (hg, made)
+    },
+    NAMED_PATIENCE,
+  )
+}
+
 /// A green's head, as its root's attribute holds it.
 fn head(state: &ShardState, green: DbVolumeId) -> Option<Node> {
   state.greens.get(&green).and_then(|engine| {
@@ -494,6 +664,14 @@ fn file(state: &ShardState, green: DbVolumeId, path: &str) -> Option<Vec<u8>> {
 /// Rebuilds the fixtures' repository in `hg` as one push to its empty first line: `base` and `second`, the changesets
 /// `public` names published by a `phase-heads` part, bookmark `main` made at `mark`.
 fn rebuild(state: &mut ShardState, hg: &mut Hg, (public, mark): (&[usize], usize)) -> Vec<Made> {
+  let (made, unbundle) = rebuilding((public, mark));
+  let answer = hg.push(state, &unbundle, &View::default());
+  assert!(answer.is_ok(), "the rebuild was refused: {answer:?}");
+  made
+}
+
+/// [`rebuild`]'s push: the fixtures' history and the unbundle that makes it.
+fn rebuilding((public, mark): (&[usize], usize)) -> (Vec<Made>, Unbundle) {
   let made = history();
   let heads = public
     .iter()
@@ -515,9 +693,7 @@ fn rebuild(state: &mut ShardState, hg: &mut Hg, (public, mark): (&[usize], usize
       ),
     ],
   };
-  let answer = hg.push(state, &unbundle, &View::default());
-  assert!(answer.is_ok(), "the rebuild was refused: {answer:?}");
-  made
+  (made, unbundle)
 }
 
 /// The rebuilt repository against 7.2's: every node 7.2's, `default`'s first line at `second` holding both files, and
@@ -589,27 +765,16 @@ fn a_pushed_file_the_content_store_holds_whole_is_held_by_its_name() {
 #[test]
 fn a_named_pushed_file_let_go_is_read_back_through_its_name() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (green, named_away) = crate::daemon::observe_first(&daemon, |state| {
-    let mut hg = Hg::new(state, "named-read");
-    let _ = rebuild(state, &mut hg, (&[1], 1));
-    let content = state.vcs_stores.content().unwrap();
-    let held = state
-      .greens
-      .get(&hg.root)
-      .unwrap()
-      .content("b")
-      .map(|held| match held {
-        slates_merge::engine::Content::Named(identity) => {
-          content.is_away(&slates_vcs::ContentId(identity.hash))
-        }
-        slates_merge::engine::Content::Bytes(_) => false,
-      });
-    (hg.root, held)
-  });
-  let served = crate::test_store::run_on_first(
+  let (named_away, served) = crate::test_store::run_on_first(
     &daemon,
-    move || async move { crate::vcs_store::named_objects::read_file_brought(green, "b").await },
-    std::time::Duration::from_secs(60),
+    || async move {
+      let hg = Hg::made("named-read").await;
+      let _ = rebuilt(&hg, (&[1], 1)).await;
+      let named_away = crate::state::with_state(|state| named_away_at(state, hg.root, "b"));
+      let served = crate::vcs_store::named_objects::read_file_brought(hg.root, "b").await;
+      (named_away.flatten(), served)
+    },
+    NAMED_PATIENCE,
   );
   daemon.stop();
   assert_eq!(
@@ -622,6 +787,22 @@ fn a_named_pushed_file_let_go_is_read_back_through_its_name() {
     Some(&b"b\n"[..]),
     "read back through its name"
   );
+}
+
+/// Whether green `green` holds `path` by its object's name with that object let go of the content store; none where it
+/// holds no such file.
+fn named_away_at(state: &ShardState, green: DbVolumeId, path: &str) -> Option<bool> {
+  let content = state.vcs_stores.content()?;
+  state
+    .greens
+    .get(&green)?
+    .content(path)
+    .map(|held| match held {
+      slates_merge::engine::Content::Named(identity) => {
+        content.is_away(&slates_vcs::ContentId(identity.hash))
+      }
+      slates_merge::engine::Content::Bytes(_) => false,
+    })
 }
 
 /// The reply recorded for request `id` of `origin`, waited for a step at a time within [`NAMED_PATIENCE`]. A parked
@@ -739,9 +920,8 @@ async fn edited_named_as(
 #[test]
 fn a_readopted_green_brings_back_the_named_base_its_chain_splices_first() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (green, base, repository) = crate::daemon::observe_first(&daemon, |state| {
-    let mut hg = Hg::new(state, "named-readopt");
-    let _ = rebuild(state, &mut hg, (&[1], 1));
+  let (hg, _) = rebuilt_on(&daemon, "named-readopt", (&[1], 1));
+  let (green, base, repository) = crate::daemon::observe_first(&daemon, move |state| {
     let base = match state.greens.get(&hg.root).unwrap().content("b") {
       Some(slates_merge::engine::Content::Named(identity)) => identity.hash,
       other => panic!("`b` not named: {other:?}"),
@@ -822,9 +1002,8 @@ fn a_readopted_green_brings_back_the_named_base_its_chain_splices_first() {
 #[test]
 fn a_named_group_refused_partway_lets_go_what_it_brought_back() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (green, base) = crate::daemon::observe_first(&daemon, |state| {
-    let mut hg = Hg::new(state, "named-partial");
-    let _ = rebuild(state, &mut hg, (&[1], 1));
+  let (hg, _) = rebuilt_on(&daemon, "named-partial", (&[1], 1));
+  let (green, base) = crate::daemon::observe_first(&daemon, move |state| {
     let base = match state.greens.get(&hg.root).unwrap().content("b") {
       Some(slates_merge::engine::Content::Named(identity)) => identity.hash,
       other => panic!("`b` not named: {other:?}"),
@@ -919,9 +1098,8 @@ fn awaiting_readoption(state: &mut ShardState, green: DbVolumeId) {
 #[test]
 fn a_readopted_branch_member_is_rebuilt_over_its_source_and_takes_a_made_commit() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let branch = crate::daemon::observe_first(&daemon, |state| {
-    let mut hg = Hg::new(state, "branch-readopt");
-    let _ = rebuild(state, &mut hg, (&[1], 1));
+  let (hg, _) = rebuilt_on(&daemon, "branch-readopt", (&[1], 1));
+  let branch = crate::daemon::observe_first(&daemon, move |state| {
     let branch = hg
       .bound(state, &bookmark_name(b"main"))
       .expect("`main`'s green");
@@ -973,9 +1151,8 @@ fn a_readopted_branch_member_is_rebuilt_over_its_source_and_takes_a_made_commit(
 #[test]
 fn a_branch_whose_root_awaits_readoption_waits_and_is_rebuilt_over_it() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (root, branch, fenced) = crate::daemon::observe_first(&daemon, |state| {
-    let mut hg = Hg::new(state, "branch-waits");
-    let _ = rebuild(state, &mut hg, (&[1], 1));
+  let (hg, _) = rebuilt_on(&daemon, "branch-waits", (&[1], 1));
+  let (root, branch, fenced) = crate::daemon::observe_first(&daemon, move |state| {
     let branch = hg
       .bound(state, &bookmark_name(b"main"))
       .expect("`main`'s green");
@@ -1029,13 +1206,12 @@ fn a_submit_over_a_green_whose_repository_awaits_its_rebuild_is_refused_until_it
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   // Its texts kept resident: the submit's own commit is what is judged here, not a read back of a let-go base.
   crate::test_store::keep_landed(&daemon);
-  let (root, record, head, node) = crate::daemon::observe_first(&daemon, |state| {
-    // The state logs' parts as the partition makes them, taken as they come, as a successor's acceptors hold them: what
-    // its rebuild keeps (A-636 part 2c-2).
-    let mut hg = Hg::new(state, "pending-rebuild");
-    let mut parts = state.db.take_state_log_records();
-    let _ = rebuild(state, &mut hg, (&[1], 1));
-    parts.extend(state.db.take_state_log_records());
+  // The state logs' parts as the partition makes them, kept as they come, as a successor's acceptors hold them: what
+  // its rebuild keeps (A-636 part 2c-2).
+  crate::daemon::observe_first(&daemon, crate::state_log::keep_for_test);
+  let (hg, _) = rebuilt_on(&daemon, "pending-rebuild", (&[1], 1));
+  let (root, record, head, node) = crate::daemon::observe_first(&daemon, move |state| {
+    let parts = crate::state_log::kept_for_test(state);
     let node = crate::vcs_store::hg_made::head_of(state, hg.root);
     // Its store gone too: a successor holds none, nor any of its texts, until its rebuild makes them from the log.
     let record = crate::test_store::awaiting_rebuild(state, hg.repository, true);
@@ -1147,11 +1323,10 @@ fn a_submit_over_a_green_whose_repository_awaits_its_rebuild_is_refused_until_it
 #[test]
 fn a_successors_rebuild_lets_go_the_texts_it_brought_back_once_it_lands() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let record = crate::daemon::observe_first(&daemon, |state| {
-    let mut hg = Hg::new(state, "let-go-rebuild");
-    let mut parts = state.db.take_state_log_records();
-    let _ = rebuild(state, &mut hg, (&[1], 1));
-    parts.extend(state.db.take_state_log_records());
+  crate::daemon::observe_first(&daemon, crate::state_log::keep_for_test);
+  let (hg, _) = rebuilt_on(&daemon, "let-go-rebuild", (&[1], 1));
+  let record = crate::daemon::observe_first(&daemon, move |state| {
+    let parts = crate::state_log::kept_for_test(state);
     (
       crate::test_store::awaiting_rebuild(state, hg.repository, true),
       parts,
@@ -1209,11 +1384,8 @@ fn a_restarts_replay_lets_go_the_texts_it_brought_back() {
   let anchor = anchor_of(&instance);
   let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
   daemon.bootstrap(true).unwrap();
-  let repository = crate::daemon::observe_first(&daemon, |state| {
-    let mut hg = Hg::new(state, "let-go-restart");
-    let _ = rebuild(state, &mut hg, (&[1], 1));
-    hg.repository
-  });
+  let (hg, _) = rebuilt_on(&daemon, "let-go-restart", (&[1], 1));
+  let repository = hg.repository;
   let landed_held = |daemon: &crate::Daemon| {
     crate::daemon::observe_first(daemon, move |state| {
       held_whole(state, repository)
@@ -1329,12 +1501,8 @@ fn named_restart_daemon(
 ) -> (crate::Daemon, DbVolumeId) {
   let daemon = crate::repository::store_tests::daemon_over(instance, (&anchor.0, &anchor.1), store);
   daemon.bootstrap(true).unwrap();
-  let green = crate::daemon::observe_first(&daemon, |state| {
-    let mut hg = Hg::new(state, "named-restart");
-    let _ = rebuild(state, &mut hg, (&[1], 1));
-    hg.root
-  });
-  (daemon, green)
+  let (hg, _) = rebuilt_on(&daemon, "named-restart", (&[1], 1));
+  (daemon, hg.root)
 }
 
 /// A-923 (main's rulings of 2026-11-25: an image written before the aways carried their let-go numbers is migrated at
@@ -1564,9 +1732,8 @@ fn a_restart_recovers_a_green_whose_named_pushed_file_a_work_edited() {
 #[test]
 fn a_work_editing_a_named_pushed_file_in_place_brings_its_text_back_and_lands() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (green, named_away) = crate::daemon::observe_first(&daemon, |state| {
-    let mut hg = Hg::new(state, "named-edit");
-    let _ = rebuild(state, &mut hg, (&[1], 1));
+  let (hg, _) = rebuilt_on(&daemon, "named-edit", (&[1], 1));
+  let (green, named_away) = crate::daemon::observe_first(&daemon, move |state| {
     let content = state.vcs_stores.content().unwrap();
     let held = state
       .greens
@@ -1614,24 +1781,22 @@ fn a_work_editing_a_named_pushed_file_in_place_brings_its_text_back_and_lands() 
 #[test]
 fn a_second_work_naming_a_pushed_text_let_go_before_its_entry_reads_it_back() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let greens = crate::daemon::observe_first(&daemon, |state| {
-    let mut hg = Hg::new(state, "named-twice");
-    let made = history();
-    let at = |name: &[u8]| BookmarkAt {
-      name: name.to_vec(),
-      node: Some(made[1].node),
-    };
-    let unbundle = Unbundle {
-      parts: vec![
-        taken(0, Asks::Changegroup(changegroup(&made, &[0, 1]))),
-        taken(
-          1,
-          Asks::Bookmarks(vec![at(b"main"), at(b"left"), at(b"right")]),
-        ),
-      ],
-    };
-    let answer = hg.push(state, &unbundle, &View::default());
-    assert!(answer.is_ok(), "the push was refused: {answer:?}");
+  let made = history();
+  let at = |name: &[u8]| BookmarkAt {
+    name: name.to_vec(),
+    node: Some(made[1].node),
+  };
+  let unbundle = Unbundle {
+    parts: vec![
+      taken(0, Asks::Changegroup(changegroup(&made, &[0, 1]))),
+      taken(
+        1,
+        Asks::Bookmarks(vec![at(b"main"), at(b"left"), at(b"right")]),
+      ),
+    ],
+  };
+  let hg = made_and_pushed_on(&daemon, "named-twice", unbundle);
+  let greens = crate::daemon::observe_first(&daemon, move |state| {
     let greens = [b"main".as_slice(), b"left", b"right"].map(|name| {
       hg.bound(state, &bookmark_name(name))
         .expect("a bookmark's green")
@@ -1723,15 +1888,9 @@ fn a_stock_push_lands_on_the_rebuilt_repository_as_7_2_answered_it() {
 #[test]
 fn a_landed_push_is_replayed_into_the_store_from_its_entry() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (repository, made, before) = crate::daemon::observe_first(&daemon, |state| {
-    let mut hg = Hg::new(state, "replayed");
-    let made = rebuild(state, &mut hg, (&[1], 1));
-    let view = View::of(
-      listing!("push-plain-server.txt"),
-      listing!("push-plain-bookmarks.txt"),
-    );
-    let answer = hg.push(state, &stock(fixture!("push-plain.hg")), &view);
-    assert!(answer.is_ok(), "{answer:?}");
+  let (hg, made) = rebuilt_on(&daemon, "replayed", (&[1], 1));
+  pushed_on(&daemon, hg, fixture!("push-plain.hg"));
+  let (repository, made, before) = crate::daemon::observe_first(&daemon, move |state| {
     let before = hg.changesets(state);
     crate::vcs_store::rebuild(state, hg.repository);
     (hg.repository, made, before)
@@ -1807,14 +1966,14 @@ fn a_landed_push_replays_as_its_run_of_segments_reading_no_payload() {
   let part = changegroup(&made, &[0, 1, 2, 3, 4, 5]);
   let payload = u64::try_from(part.payload.len()).unwrap();
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let repository = crate::daemon::observe_first(&daemon, move |state| {
+  crate::daemon::observe_first(&daemon, |_| {
     super::super::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(SEGMENT_BYTES));
-    let mut hg = Hg::new(state, "pieces");
-    let unbundle = Unbundle {
-      parts: vec![taken(0, Asks::Changegroup(part))],
-    };
-    let answer = hg.push(state, &unbundle, &View::default());
-    assert!(answer.is_ok(), "{answer:?}");
+  });
+  let unbundle = Unbundle {
+    parts: vec![taken(0, Asks::Changegroup(part))],
+  };
+  let hg = made_and_pushed_on(&daemon, "pieces", unbundle);
+  let repository = crate::daemon::observe_first(&daemon, move |state| {
     crate::vcs_store::rebuild(state, hg.repository);
     hg.repository
   });
@@ -2904,8 +3063,8 @@ fn counted(state: &ShardState, name: &str) -> u64 {
 #[test]
 fn a_dropped_run_is_forgotten_and_the_next_push_lands_past_it() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (repository, root, named) = crate::daemon::observe_first(&daemon, |state| {
-    let hg = Hg::new(state, "dropped");
+  let hg = made_on(&daemon, "dropped");
+  let (repository, root, named) = crate::daemon::observe_first(&daemon, move |state| {
     let named = state.vcs_stores.landed_of(hg.repository).unwrap();
     let task = slates_rt::futures::spawn(run_held_until_dropped(hg.repository)).unwrap();
     RUN_TASK.with(|held| held.set(Some(task)));
@@ -2922,25 +3081,25 @@ fn a_dropped_run_is_forgotten_and_the_next_push_lands_past_it() {
   let forgotten = until(&daemon, |state| {
     counted(state, super::super::hg_run::RUN_ROWS_FORGOTTEN) >= 2
   });
-  let (abandoned, (run, tip)) = crate::daemon::observe_first(&daemon, move |state| {
-    let abandoned = counted(state, super::super::hg_run::RUNS_ABANDONED);
-    let made = history_of(&[
-      ("one", "one", b"one\n", None, "default"),
-      ("two", "two", b"two\n", Some(0), "default"),
-    ]);
-    let unbundle = Unbundle {
-      parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[0, 1])))],
-    };
-    let mut hg = Hg { repository, root };
-    let pushed = hg.push(state, &unbundle, &View::default());
-    assert!(pushed.is_ok(), "{pushed:?}");
+  let abandoned = crate::daemon::observe_first(&daemon, |state| {
+    counted(state, super::super::hg_run::RUNS_ABANDONED)
+  });
+  let made = history_of(&[
+    ("one", "one", b"one\n", None, "default"),
+    ("two", "two", b"two\n", Some(0), "default"),
+  ]);
+  let unbundle = Unbundle {
+    parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[0, 1])))],
+  };
+  pushed_unbundle_on(&daemon, hg, unbundle);
+  let (run, tip) = crate::daemon::observe_first(&daemon, move |state| {
     let records = state.db.partition().repositories();
     let run = (0..)
       .map_while(|index| records.object_record(repository, index))
       .filter_map(slates_hg::import::record::run_of)
       .last();
     crate::vcs_store::rebuild(state, repository);
-    (abandoned, (run, made[1].node))
+    (run, made[1].node)
   });
   let rebuilt = until(&daemon, move |state| {
     !state.vcs_stores.rebuilding(repository)
