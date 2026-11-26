@@ -3813,8 +3813,8 @@ fn made_taken(mut taking: Taking) -> Result<Forked, MadeTake> {
 
 /// The tests' `take_whole`: cut at `cut` where given, the segments in the fork for its landing. A synchronous driver of
 /// a test history holding the shard: a want of the node's changeset store is answered by a blocking read
-/// (`test_store::answer_wants_blocking`), which only the allow-listed `audit_on_stored_shard` histories reach (hg_push's
-/// race histories, until they move; `test_store::SHARD_BLOCKING_ALLOWED`); the daemon's own takes answer it by awaiting
+/// (`test_store::answer_wants_blocking`), which only the allow-listed `land_stored` reaches (`vcs_ssh::tests::hg`'s, until
+/// they move; `test_store::SHARD_BLOCKING_ALLOWED`); the daemon's own takes answer it by awaiting
 /// the store ([`take_sliced`], [`take_made`]).
 #[cfg(test)]
 fn taken_whole(

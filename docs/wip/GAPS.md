@@ -1167,7 +1167,7 @@
 >   bare runtime runs on the test's thread and is not refused. The fixtures still blocking are named in
 >   `test_store::SHARD_BLOCKING_ALLOWED`, each with its owner and how many sites reach it, and run their blocking body
 >   through `allowing_shard_blocking`; there is no global off-switch. The list only shrinks.
->   **The shard-blocking allow-list: 4 fixtures** (a test holds the list's length to this figure; edit both together):
+>   **The shard-blocking allow-list: 3 fixtures** (a test holds the list's length to this figure; edit both together):
 >   **Taken by w-git (2026-11-26, main's order: w-shared and w-perf held on a permission prompt since 18:03): their
 >   `audit_on_stored_shard` and `test_store::create` sites, a file at a time, each landing with its counts.** w-shared's:
 >   `repository/push/tests.rs`, `repository.rs`, `vcs_share/grants.rs`, `vcs_share/read_backs.rs`, `identities/tests.rs`,
@@ -1176,9 +1176,17 @@
 >   Edit none of them meanwhile; main assigns them back if either agent returns. **Passed to w-hg (2026-11-26, main's
 >   order: claimed in e15868057, not started):** `identities/tests.rs`, `vcs_store/index_upkeep.rs`,
 >   `repository/import/tests.rs` and `fleet.rs`; w-git keeps `vcs_store/paths/tests.rs` and `vcs_store/commits/tests.rs`.
->   - `test_store::audit_on_stored_shard`: 10 sites. svn 0; git 0; hg 0;
->     other 10 (`commits/tests.rs` 8, `fleet.rs` 2). `repository/import/tests.rs`' 2 moved by w-hg (2026-11-26) to
->     `audit_on_stored_shard_made` and `_made_all`, its repositories made from the test's thread. `identities/tests.rs`' 8 moved by w-hg
+>   - `test_store::audit_on_stored_shard`: 0 sites; the fixture and its allow-list entry are gone (w-hg, 2026-11-26).
+>     `repository/import/tests.rs`' 2 moved by w-hg (2026-11-26) to `audit_on_stored_shard_made` and `_made_all`, its
+>     repositories made from the test's thread. `fleet.rs`' 2 moved by w-hg (2026-11-26) to `run_on_stored_shard`
+>     tasks: the region of three set first, the repository made by `created().await`, its branch dispatched after.
+>     `vcs_store/commits/tests.rs`' 8 moved by w-git (2026-11-26) to
+>     `run_on_stored_shard` tasks: created with `created().await`, submitted with `paths::tests::version_awaited`,
+>     pushed with `push_through_awaited` or `push_unsettled_awaited`; the storm's build slices held to the test's own by
+>     `whole_build::DRIVEN_BY_TEST` (a test-only hold: awaiting its pushes' landings let the build's task finish it
+>     between them, red `MOVED` 0). The probe (`home_and_land_blocking` and a held made landing panicking) failed only
+>     `t_a664_live_a_submit_waits_parked_for_its_greens_whole_build` of `commits::tests`, through its sync
+>     `pushed_three`. `identities/tests.rs`' 8 moved by w-hg
 >     (2026-11-26): the six that wait on nothing to `on_a_stored_shard`; the two that make git repositories to
 >     `run_on_stored_shard` tasks, made by `created().await`, the owner's submit awaited where it records its answer
 >     (`paths::tests::recorded_git_submit_as_awaited`), so `home_and_land_blocking`'s reach did not grow.
