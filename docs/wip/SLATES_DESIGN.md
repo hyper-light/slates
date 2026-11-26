@@ -64526,6 +64526,27 @@ GAPS.
   the effect lists units allocated of their own, red first at 10 for a work of five effects computed whole and a unit
   a step, 0 after (`a_verdicts_units_allocate_no_effect_list_of_their_own`). Planted: a standing unit that moves one
   effect too few fails three position oracles.
+  **3m, the commit's beginning a part a step, its paths ordered with no tree.** Release probe 7 (99 runs at 67db69be9,
+  load 17-40, quanta mostly 2-5 µs): the judge's steps were all under 1 ms (at most 664 µs), and the only steps over it
+  were the check's whole parts (5 steps, 1,013-1,122 µs; 2c) and one commit step a run (97 steps, 1,120-1,864 µs, at a
+  quantum of 2-3 µs, so one unit each). A debug pass timing each commit unit named it: the preparation's last mapped
+  file, then in the same step `move_whole_runs` (107-110 µs over 9,000 runs) and `commit_begin` (`make_mapped` again
+  117, `node_moves` 37-51, `copy_link_effects` 25, `commit_copies` 39-51, and the changed-path set 730-778: 9,000
+  String clones into a tree, its nodes then freed as the commit's changes took them). The preparation now ends there,
+  and the whole runs are moved a run a unit (`Prep::Moving`). The beginning is its own phase (`Prep::Beginning`):
+  - each mapped file made a file a unit;
+  - the node moves, the copied trees' links and the copies each a whole part, run only as a step's first unit;
+  - the effects' paths put in order with no tree (`PathOrder`): their sorted runs found an effect a unit, then merged
+    by a heap of the runs a path a unit, each distinct path ranked;
+  - the commit's paths (`ChangedPaths`) are those ranks, each String made as its effect is applied, the one its change
+    entry keeps; the links and the changes walk them, the copies' paths and the links found by cursor, with no tree and
+    no clone of a path a unit (the links' walk had cloned each).
+
+  Counters: `Green::commit_tree_paths` (changed paths a commit put in a tree of its own), red first at 5 for a work of
+  five distinct paths, 0 after; a copy's paths still come as `commit_copies`' set and count there. And
+  `Green::commit_paths_made`, one a distinct path, so each String is made once
+  (`a_commits_changed_paths_are_ordered_without_a_tree_each_made_once`). Planted: a merge that never ranks its second
+  path fails fourteen oracles (position, copy, branch, fold, node-exclusive and replaced-node).
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
