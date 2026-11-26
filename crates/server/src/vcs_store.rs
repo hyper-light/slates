@@ -5878,21 +5878,31 @@ async fn record_unit(
 /// in, as a push's work is built from it, handed over rather than returned so a view borrowing the shard's state
 /// outlives nothing. For git, the push's own view over an empty push (`PushedObjects`), which reads every object from
 /// the repository's committed index once the push that brought them landed: the objects the eager create's build read
-/// from the same index and the push's quarantine. Its caller lends the stores room and the shard's chunk store first
-/// (`vcs_store::with_room`), as a push's build has them: the pack's windows are read from that chunk store, and its
+/// from the same index and the push's quarantine. For Mercurial, `layout`, the owed line's trees its materialization
+/// laid out (`hg_push::owed_layout`, main's ruling (A) of 2026-11-26), over the repository's committed index and content
+/// store (`hg_push::lend_owed`); none laid out, none lent. Its caller lends the stores room and the shard's chunk store
+/// first (`vcs_store::with_room`), as a push's build has them: the pack's windows are read from that chunk store, and its
 /// parses are admitted the lent room. None for another tool's repository, or a store not held here, whose owing green
 /// answers its readers `ContentUnavailable`. Whether there were any.
 pub(crate) fn with_owed_push_objects(
   state: &crate::state::ShardState,
-  repository: Option<RepositoryId>,
+  (repository, layout): (
+    Option<RepositoryId>,
+    Option<&mut slates_hg::push::tree::Layout>,
+  ),
   read: &mut dyn FnMut(&dyn slates_merge::push::PushObjects),
 ) -> bool {
-  let Some((content, git)) = repository.and_then(|repository| state.vcs_stores.git_ref(repository))
-  else {
+  let Some(repository) = repository else {
     return false;
   };
-  let empty = Push::new(git.repository.format());
-  let objects = slates_git::store::views::PushedObjects::new(&git.repository, content, &empty);
-  read(&objects);
-  true
+  if let Some((content, git)) = state.vcs_stores.git_ref(repository) {
+    let empty = Push::new(git.repository.format());
+    let objects = slates_git::store::views::PushedObjects::new(&git.repository, content, &empty);
+    read(&objects);
+    return true;
+  }
+  match layout {
+    Some(layout) => crate::repository::hg_push::lend_owed(state, repository, layout, read),
+    None => false,
+  }
 }

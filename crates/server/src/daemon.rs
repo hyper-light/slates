@@ -14947,10 +14947,10 @@ mod tests {
   /// spun shard 0 for 3,553 ms of CPU in one poll of `hg_push::landing`, the daemon ended by its watchdog). Do: push a
   /// root and [`MANY_HEADS`] - 1 changesets on it, each a head of its own, through the daemon's driver
   /// (`hg_push::unbundle`). Expect the push accepted, a line green for every head, and the landing's one step doing no
-  /// line's work itself (`repository.push.landing_step_works_most` 0: the existing line's judged ahead of it since
-  /// 2026-11-26, where it did that one alone), each new line's made before it a slice a step
-  /// (`repository.push.create_slices` moved) and taken by it (`repository.push.create_misses` 0). Red before: every
-  /// head's work in the one step (64).
+  /// line's work itself (`repository.push.landing_step_works_most` 0: the existing line's judged ahead of it), each new
+  /// line made in the step owing its push, its work built only when it is first reached (P2 for Mercurial, main's ruling
+  /// (A) of 2026-11-26), none counted a miss (`repository.push.create_misses` 0). Red before 2026-11-24: every head's
+  /// work in the one step (64); until 2026-11-26 each new line's work was built and committed ahead a slice a step.
   #[test]
   fn t_goal93_a_push_of_many_heads_lands_its_new_lines_outside_its_landing_step() {
     use crate::repository::hg_push::tests::history_of;
@@ -14997,20 +14997,25 @@ mod tests {
     let (sent, answered) = std::sync::mpsc::channel();
     b1_push(&daemon, repository, &bundle, sent);
     let outcome = answered.recv().ok().flatten();
-    let (lines, (in_step, slices, misses)) = daemon
+    let (lines, owing, (in_step, misses)) = daemon
       .observe(daemon.shards.first().copied(), move |state| {
-        let lines = state
+        let members: Vec<_> = state
           .db
           .partition()
           .repositories()
           .members_of(repository)
+          .map(|member| member.green)
+          .collect();
+        let owing = members
+          .iter()
+          .filter(|green| state.greens.is_owing(green))
           .count();
         let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
         (
-          lines,
+          members.len(),
+          owing,
           (
             counted(crate::repository::push::LANDING_STEP_WORKS),
-            counted(crate::repository::push::CREATE_SLICES),
             counted(crate::repository::push::CREATE_MISSES),
           ),
         )
@@ -15026,11 +15031,10 @@ mod tests {
       in_step, 0,
       "the landing's step did no line's work itself (the existing line's judged ahead, as each new one's was made)"
     );
-    assert!(slices > 0, "the new lines made a slice at a time: {slices}");
-    assert_eq!(
-      misses, 0,
-      "every line made ahead taken by the landing's step"
-    );
+    // The root's [`MANY_HEADS`] - 1 heads: one moves `default`, every other is a new line; the bookmark `main` is a green
+    // of its own, made at a line's version with no work.
+    assert_eq!(owing, MANY_HEADS - 2, "every new line owes its push");
+    assert_eq!(misses, 0, "no owed line counted a miss");
   }
 
   /// The oracle's push: four changesets on one line, each a file of 1,536 bytes, so that a push cut at

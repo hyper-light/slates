@@ -65118,3 +65118,72 @@ measured noise of the 100 figure, not a literal.
   `crates/rt/src/shard.rs` (`quantum_ns`, `wake_cost_ns`), `crates/server/src/config.rs` (`LOADED_LATENCY_BAR`,
   `STEP_QUANTUM_CEILING`, `hold_quantum_to_bar`), `crates/merge/src/engine.rs` and `engine/computing.rs` (A-920 3i's
   sizing), §4.3's derived constants, A-920's 3i, GAPS (84a's step quantum).
+
+### A-929 — A new Mercurial line owes its push and is made when first reached, through the one door: P2's Mercurial half (2026-11-26, w-hg for main 01a20182, its ruling (A) of 2026-11-26 on the many-heads push's (2) and (3); A-812, A-823, A-857, A-618, A-641)
+Applied in the same change to:
+- `crates/hg/src/push/tree.rs`: `changeset_tree`, the name an owed push gives a changeset's tree (its node); a
+  `Layout` laid out for an owed push (`Layout::lay_out_owed`, a changeset a call), each changeset resolved to its root
+  directory (`Trees`' roots), and lent as the build's objects for a turn (`Layout::lend`); the file revision a turn
+  waited for asked of the node's changeset store (`Layout::waited`). Held by
+  `push::work_tests::a_lines_owed_push_materialized_is_the_eager_work_byte_for_byte`.
+- `crates/server/src/repository/hg_push.rs`: a new line is `BranchChange::CreateDeferred` (`owed_line`), its work never
+  built at the push; its trees laid out at materialization (`owed_layout`, a let-go changeset or manifest text read from
+  the node's changeset store and given in its object's place, as a push's work's layout reads one) and lent
+  (`lend_owed`); a waited file text brought back (`text_brought_back`, the push's own); a push moving a line that owes
+  makes it through the door first (`built_works`, `green_ready::made_for`), pinned until the push ends.
+- `crates/server/src/vcs_store.rs`: `with_owed_push_objects` takes the owed line's layout beside its repository and
+  lends Mercurial's objects through it; git's unchanged.
+- `crates/server/src/vcs_store/hg_made.rs`: `head_of` answers a line that owes its push from the debt's head, so a
+  push's read of the lines and the served view's bookmarks never materialize one.
+- `crates/server/src/green_ready.rs`: a Mercurial line's trees laid out before its build's first turn (`laid_out`),
+  kept for its turns and dropped at its end; a waited file revision asked and brought back (`Turned::Asked`,
+  counted `merge.green.materialize_texts_asked`); the first read's wait counted most
+  (`merge.green.materialize_wait_ns_most`); pins (`Pinned`, `made_for`), never dropped back to owing by the bound
+  while held.
+- `crates/server/src/repository/push.rs`: a deferred create counts no miss; the record's version bytes counted most
+  (`repository.push.entry_versions_bytes_most`).
+- `crates/server/src/replica_build.rs`: a holder lends no Mercurial layout yet (owed, GAPS).
+- GAPS (the landing spin's (2) and (3); A-812).
+
+- **Why.** A push of a history with many heads made each new line from the line it branched from at the version read
+  before the push. In a fresh history that base is the empty `default`, so each new line's work was its whole tree: its
+  build and commit walked the tree (the landing spin's (3): 123 ms a line at 452 heads, debug), and its chain entry
+  carried the tree into the landing's one record, which grew with heads times tree (the landing spin's (2): 377 ms of
+  the 452-head step; w-hg's probe, 2026-11-26, debug: 32 lines of a 200-file tree, 33 versions in 329,007 bytes, about
+  10 KB a line for a one-file change). git's creates had owed their pushes since A-823; Mercurial was the one tool left
+  making a whole tree a new line, eagerly. Main ruled (A): P2 for Mercurial, over (B) (a create from a version its own
+  entry makes, which still leaves a lone new line whole) and (C) (the chain entries out of the record and the judge in
+  units, which changes the most and fixes nothing at the root).
+- **What.**
+  - A new line's change is `BranchChange::CreateDeferred`: the push its green owes is `DeferredPush::of` the push the
+    eager create would have built, based at the new green's version 0, its trees named by their changesets' nodes
+    (`changeset_tree`), its head the head changeset. The landing makes the green and makes it owe (A-812): no work is
+    built, judged or committed for it, and the record carries the debt's encoding (about 150 bytes), not a tree.
+  - A materialization lays out the push's base changeset's tree and its head's, a turn each, over the repository's
+    committed index. A changeset's or manifest's text let go once landed (A-767 C1's P5) is read whole from the node's
+    changeset store and given in its object's place. The layout is then lent each turn of the green's own owed build
+    (`Green::materializing`) as its objects, through `with_owed_push_objects`, the one lend behind which git's objects
+    are lent too: one builder over one input, A-618's, as the eager create's and a push's work's. A file revision whose
+    text was let go stops the turn `NotYet`; its text is asked of the changeset store and brought back into the content
+    store, then the unit taken again.
+  - The work's identity hashes its push's name and base (A-618), so an owed line's work is a hash apart from the eager
+    create's, which hashed the base line's version and was rebased to 0; its files, its head and its head's identity
+    are the eager create's, by construction, and held so twice: the work byte for byte in the hg crate, and a line made
+    after a restart against a repository whose `default` holds the same head eagerly.
+  - A line's head is read from its debt while it owes (`hg_made::head_of`): the push's classifier and the served view
+    read the lines' heads without making any. A push moving a line that owes makes it first, through the door
+    (`green_ready::made_for`), as git's commands do, since its work is built on the line's content; the lines it made
+    stay pinned until the push ends, so the bound on materialized greens drops none of them back meanwhile.
+  - A line's first read waits for its build (P2's rule), counted most from the build's start to its commit.
+- **Measured** (debug, this Mac, 2026-11-26): the 200-file, 32-head push's record carries 14,335 bytes of versions
+  against the eager 329,007, its landing step building no line's work; a line's first read waited 156 ms for its build.
+  Release: main's probe on the 452-head history.
+- **Held by.** `hg_push::tests::t_goal93_a_push_of_many_new_lines_records_each_as_its_owed_push_not_its_tree` (red:
+  329,007 bytes of versions, a tenth the bound), `an_owed_line_made_after_a_restart_reads_as_the_eager_line`,
+  `an_owed_lines_build_dropped_mid_way_names_nothing_and_is_made_again`,
+  `t_goal93_a_push_moving_many_heads_judges_their_works_ahead_of_its_landing_step` (the moved lines made through the
+  door, then judged ahead), `daemon::tests::t_goal93_a_push_of_many_heads_lands_its_new_lines_outside_its_landing_step`,
+  and the hg crate's oracle above.
+- **Owed.** A holder's replica of a Mercurial line that owes (`replica_build`): it lends no layout, so such a replica is
+  refused, counted; a takeover of an owing Mercurial line therefore needs its owner's build first. The release measure
+  of the first read's wait on the 452-head history (main's probe).

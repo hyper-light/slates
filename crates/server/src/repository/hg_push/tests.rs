@@ -16,7 +16,6 @@ use slates_hg::push::reply::{Refused, Reply};
 use slates_hg::push::{Asks, BookmarkAt, ChangegroupPart, Outcome, Taken, Unbundle, read};
 use slates_hg::{Admission, NULL_NODE, Node, delta, node};
 use slates_ipc::protocol::{ObjectFormat, ReplyBody, RequestBody, VcsTool};
-use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
 
 use super::{
   BOOKMARK_TAG, LINE_TAG, bookmark_name, bookmark_of, branch_prefix, line_name, line_of,
@@ -467,6 +466,21 @@ fn made_on(daemon: &crate::Daemon, name: &'static str) -> Hg {
   )
 }
 
+/// `bundle`, a bundle2 as a client sends it, pushed to `hg` from a task on `daemon`'s first shard ([`pushed_bytes_to`]),
+/// accepted.
+fn pushed_bundle_on(daemon: &crate::Daemon, hg: &Hg, bundle: Vec<u8>) {
+  let repository = hg.repository;
+  let outcome = crate::test_store::run_on_first(
+    daemon,
+    move || async move { pushed_bytes_to(repository, &bundle).await },
+    NAMED_PATIENCE,
+  );
+  assert!(
+    matches!(outcome, Outcome::Accepted(_)),
+    "the push was refused: {outcome:?}"
+  );
+}
+
 /// `unbundle` pushed to `hg` ([`pushed`]) from a task on `daemon`'s first shard, accepted.
 fn pushed_unbundle_on(daemon: &crate::Daemon, hg: Hg, unbundle: Unbundle) {
   let outcome = crate::test_store::run_on_first(
@@ -560,13 +574,10 @@ fn rebuilt_on(
   )
 }
 
-/// A green's head, as its root's attribute holds it.
+/// A line's head as the server reads it (`hg_made::head_of`): its root's attribute, or the head the push a new line owes
+/// sets (P2), read without making it.
 fn head(state: &ShardState, green: DbVolumeId) -> Option<Node> {
-  state.greens.get(&green).and_then(|engine| {
-    engine
-      .xattr(ROOT, HEAD_ATTRIBUTE)
-      .map(|bytes| Node::try_from(bytes).unwrap())
-  })
+  crate::vcs_store::hg_made::head_of(state, green)
 }
 
 /// A green's file at its head.
@@ -3041,5 +3052,281 @@ fn t_goal93_a_push_moving_many_heads_judges_their_works_ahead_of_its_landing_ste
   assert_eq!(
     misses, 0,
     "every work judged ahead taken by the landing's step"
+  );
+}
+
+/// Shape: the files a wide line's whole tree holds: enough that a whole tree a line shows in the landing's record.
+const WIDE_TREE: usize = 200;
+/// Shape: the wide-lines push's heads, each a line of its own past the first.
+const WIDE_HEADS: usize = 32;
+/// Shape: the bytes of versions the wide-lines push's landing record carried while each new line's work was built
+/// eagerly (w-hg's probe of `apply_planned`, 2026-11-26, debug: 33 versions in 329,007 bytes, about 10 KB a line for a
+/// one-file change): the red, which the owed pushes must stay far under.
+const WIDE_EAGER_VERSIONS_BYTES: u64 = 329_007;
+
+/// A history of `tree` changesets on `default`, each adding one file to the one before, then `heads` changesets on the
+/// last, each adding a file of its own, each a head: the history and its every revision.
+fn wide_history(tree: usize, heads: usize) -> (Vec<Made>, Vec<usize>) {
+  let names: &'static [String] = Box::leak(
+    (0..tree)
+      .map(|at| format!("file-{at}"))
+      .chain((0..heads).map(|at| format!("head-{at}")))
+      .collect::<Vec<_>>()
+      .into_boxed_slice(),
+  );
+  let commits: Vec<Commit> = names
+    .iter()
+    .enumerate()
+    .map(|(at, name)| {
+      let parent = match at {
+        0 => None,
+        at if at < tree => Some(at - 1),
+        _ => Some(tree - 1),
+      };
+      (
+        name.as_str(),
+        name.as_str(),
+        name.as_bytes(),
+        parent,
+        "default",
+      )
+    })
+    .collect();
+  let made = history_of(&commits);
+  let all = (0..made.len()).collect();
+  (made, all)
+}
+
+/// The lines of `repository` that owe their pushes (P2), each a new line a push made.
+fn owing_lines(state: &ShardState, repository: RepositoryId) -> Vec<DbVolumeId> {
+  state
+    .db
+    .partition()
+    .repositories()
+    .members_of(repository)
+    .map(|member| member.green)
+    .filter(|green| state.greens.is_owing(green))
+    .collect()
+}
+
+/// A file as a green holds it: its path, and its length and hash, whether its bytes are held or named (A-887).
+type HeldFile = (String, (u64, [u8; 32]));
+
+/// What `green` reads, materialized: its head, its files (each as [`HeldFile`]) and its head's identity.
+fn read_whole(state: &mut ShardState, green: DbVolumeId) -> (u64, Vec<HeldFile>, [u8; 32]) {
+  let mut engine = state.greens.get_mut(&green).expect("materialized");
+  let files = engine
+    .files()
+    .map(|(path, content)| (path, content.digest()))
+    .collect();
+  (engine.head(), files, engine.head_identity())
+}
+
+/// Goal 93, the landing spin's (2) and (3), closed by P2 for Mercurial (main's ruling (A) of 2026-11-26). Do: push a
+/// history of [`WIDE_TREE`] changesets, each adding a file, and [`WIDE_HEADS`] heads on it, each a line; then read one
+/// new line through the door (`green_ready::made_for`), the history's polls timed. Expect: the push accepted; every new
+/// line owing its push, made in the landing's step with no work there (`repository.push.landing_step_works_most` 0,
+/// `landing_step_creates_most` the new lines); the record's versions far under the eager build's
+/// [`WIDE_EAGER_VERSIONS_BYTES`] (a tenth), since each new line's is its owed push's small record, not its tree; and the
+/// line read made, its first read's wait counted (`merge.green.materialize_wait_ns_most`) and printed with the
+/// shard's longest poll, for main's release probe.
+#[test]
+fn t_goal93_a_push_of_many_new_lines_records_each_as_its_owed_push_not_its_tree() {
+  let (made, all) = wide_history(WIDE_TREE, WIDE_HEADS);
+  let bundle = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &all);
+  let seen = crate::test_store::run_on_stored_shard(move || {
+    crate::vcs_store::svn_import::tests::cpu_timed(async move {
+      let hg = Hg::made("wide-lines").await;
+      let pushed = pushed_bytes_to(hg.repository, &bundle).await;
+      let (owing, counted) = crate::repository::svn_commit::tests::on(|state| {
+        let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        (
+          owing_lines(state, hg.repository),
+          (
+            count(crate::repository::push::LANDING_STEP_WORKS),
+            count(crate::repository::push::LANDING_STEP_CREATES),
+            count(crate::repository::push::ENTRY_VERSIONS_BYTES_MOST),
+          ),
+        )
+      });
+      let mut pinned = crate::green_ready::Pinned::default();
+      let made = match owing.first() {
+        Some(green) => crate::green_ready::made_for(*green, &mut pinned).await,
+        None => None,
+      };
+      let waited = crate::repository::svn_commit::tests::on(|state| {
+        let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        count(crate::green_ready::MATERIALIZE_WAIT_NS_MOST)
+      });
+      drop(pinned);
+      let (longest_ns, polls) = crate::vcs_store::svn_import::tests::longest_poll();
+      (
+        pushed,
+        owing.len(),
+        counted,
+        made,
+        waited,
+        longest_ns,
+        polls,
+      )
+    })
+  });
+  let (pushed, owing, (works, creates, bytes), made, waited, longest_ns, polls) = seen;
+  eprintln!(
+    "wide lines: {owing} owing, {creates} made in the step, {works} works in it, {bytes} bytes of versions in its record; \
+     a line's first read waited {} us for its build; the shard's longest poll {} us ({polls})",
+    waited / 1000,
+    longest_ns / 1000
+  );
+  assert!(matches!(pushed, Outcome::Accepted(_)), "{pushed:?}");
+  assert_eq!(owing, WIDE_HEADS - 1, "every new line owes its push");
+  assert_eq!(works, 0, "the landing's step did no line's work");
+  assert_eq!(
+    creates,
+    u64::try_from(owing).unwrap(),
+    "each new line made in the step, owing"
+  );
+  assert!(
+    bytes < WIDE_EAGER_VERSIONS_BYTES / 10,
+    "the record's versions no longer carry each line's tree: {bytes} bytes"
+  );
+  assert_eq!(made, Some(true), "the line read was made");
+  assert!(waited > 0, "its first read's wait counted");
+}
+
+/// P2 for Mercurial's oracle (main's ruling (A) of 2026-11-26, requirement 3). Do: on a daemon over a segment and a
+/// store, push a root and three heads on it to one repository, each head past the first a new line owing its push, and
+/// to another the root and the first new line's head alone, which that repository's `default` moves to eagerly. Stop
+/// the daemon and the store's owner and start both again, so the owed pushes come back by the recovery's replay of
+/// their records (`slates_merge::push::DeferredPush`); then read the owed line naming that head through the door.
+/// Expect: the line still owing after the restart, then made, and reading as the eager line: the same files and the
+/// same head identity (its own head counts its versions from its own base, the line's version 0).
+#[test]
+fn an_owed_line_made_after_a_restart_reads_as_the_eager_line() {
+  use crate::repository::store_tests::{anchor_of, daemon_over};
+  let commits: &'static [Commit] = &[
+    ("root", "a", b"alpha", None, "default"),
+    ("one", "b", b"beta", Some(0), "default"),
+    ("two", "c", b"gamma", Some(0), "default"),
+    ("three", "d", b"delta", Some(0), "default"),
+  ];
+  let made = history_of(commits);
+  let all = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0, 1, 2, 3]);
+  let instance = format!("hg-owed-restart-{}", std::process::id());
+  let mut store = crate::test_store::TestStore::start("hg-owed-restart");
+  let anchor = anchor_of(&instance);
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  daemon.bootstrap(true).unwrap();
+  let owed = made_on(&daemon, "owed-lines");
+  pushed_bundle_on(&daemon, &owed, all);
+  let owing: Vec<(DbVolumeId, Option<Node>)> =
+    crate::daemon::observe_first(&daemon, move |state| {
+      owing_lines(state, owed.repository)
+        .into_iter()
+        .map(|green| (green, crate::vcs_store::hg_made::head_of(state, green)))
+        .collect()
+    });
+  assert_eq!(
+    owing.len(),
+    3 - 1,
+    "each head past the first a line owing its push"
+  );
+  // The line the eager repository is to hold: one owed line, by the head its push sets.
+  let (line, head) = owing.first().copied().expect("an owed line");
+  let head = head.expect("its owed push names its head");
+  let at = made
+    .iter()
+    .position(|made| made.node == head)
+    .expect("a head of the history");
+  let eager = made_on(&daemon, "eager-line");
+  let alone = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0, at]);
+  pushed_bundle_on(&daemon, &eager, alone);
+  crate::daemon::observe_first(&daemon, |state| {
+    crate::verbs::publish_shard(state).unwrap();
+  });
+  daemon.stop();
+  store.restart_owner();
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let read = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let still = crate::repository::svn_commit::tests::on(|state| state.greens.is_owing(&line));
+      let mut pinned = crate::green_ready::Pinned::default();
+      let made = crate::green_ready::made_for(line, &mut pinned).await;
+      let reads = crate::repository::svn_commit::tests::on(|state| {
+        let owed = read_whole(state, line);
+        let eager = read_whole(state, eager.root);
+        (owed, eager)
+      });
+      (still, made, reads)
+    },
+    NAMED_PATIENCE,
+  );
+  daemon.stop();
+  let (still, made, (owed, eager)) = read;
+  assert!(still, "the line owes its push again after the restart");
+  assert_eq!(made, Some(true), "made through the door");
+  let paths: Vec<&str> = owed.1.iter().map(|(path, _)| path.as_str()).collect();
+  assert_eq!(paths.len(), 2, "the root's file and the head's: {paths:?}");
+  assert_eq!(owed.1, eager.1, "the same files");
+  assert_eq!(owed.2, eager.2, "the same head identity");
+}
+
+/// P2 for Mercurial: a build dropped mid-way (main's ruling (A) of 2026-11-26, requirement 3; A-857's wait for room).
+/// Do: push a root and two heads, the second a new line owing its push; read that line through the door with its first
+/// build given a room of one byte, so the build is dropped past its room mid-way and begun again within the room that
+/// comes. Expect: the line made, once (`merge.green.materialized` 1), after one wait (`merge.green.materialize_waited`
+/// 1); its chain still the owed push's record alone (the dropped build named nothing); and it reads the files its head
+/// checks out.
+#[test]
+fn an_owed_lines_build_dropped_mid_way_names_nothing_and_is_made_again() {
+  let commits: &'static [Commit] = &[
+    ("root", "a", b"alpha", None, "default"),
+    ("one", "b", b"beta", Some(0), "default"),
+    ("two", "c", b"gamma", Some(0), "default"),
+  ];
+  let made = history_of(commits);
+  let bundle = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0, 1, 2]);
+  let seen = crate::test_store::run_on_stored_shard(move || async move {
+    let hg = Hg::made("dropped-line").await;
+    let pushed = pushed_bytes_to(hg.repository, &bundle).await;
+    let line = crate::repository::svn_commit::tests::on(|state| owing_lines(state, hg.repository))
+      .first()
+      .copied();
+    crate::green_ready::TEST_ROOMS.with(|rooms| rooms.borrow_mut().push_back(1));
+    let mut pinned = crate::green_ready::Pinned::default();
+    let made = match line {
+      Some(green) => crate::green_ready::made_for(green, &mut pinned).await,
+      None => None,
+    };
+    let after = crate::repository::svn_commit::tests::on(|state| {
+      let files = line.map(|green| read_whole(state, green).1);
+      let chain = line.map_or(0, |green| state.db.partition().green_chain(green).len());
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        count(crate::green_ready::MATERIALIZED),
+        count(crate::green_ready::MATERIALIZE_WAITED),
+        chain,
+        files,
+      )
+    });
+    (pushed, made, after)
+  });
+  let (pushed, made, (materialized, waited, chain, files)) = seen;
+  assert!(matches!(pushed, Outcome::Accepted(_)), "{pushed:?}");
+  assert_eq!(made, Some(true), "the line made");
+  assert_eq!((materialized, waited), (1, 1), "made once, after one wait");
+  assert_eq!(chain, 1, "its chain the owed push's record alone");
+  let files: Vec<String> = files
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(path, _)| path)
+    .collect();
+  assert!(
+    files.len() == 2
+      && files
+        .iter()
+        .all(|path| path == "a" || path == "b" || path == "c"),
+    "{files:?}"
   );
 }

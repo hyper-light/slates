@@ -115,6 +115,9 @@ pub struct Trees<'v, H: ?Sized> {
   dirs: BTreeMap<ObjectKey, Vec<TreeEntry>>,
   /// Each file node a laid-out manifest names, with the path naming it: where its revision is found.
   paths: BTreeMap<Node, Vec<u8>>,
+  /// A line's owed push's trees, named by their changesets ([`changeset_tree`]), each with its root directory's name:
+  /// what [`Layout::lay_out_owed`] resolved. Empty for a push's own works, which name their roots.
+  roots: BTreeMap<ObjectKey, ObjectKey>,
 }
 
 /// One directory being laid out: its path and its entries so far.
@@ -133,6 +136,7 @@ impl<'v, H: Held + ?Sized> Trees<'v, H> {
       held,
       dirs: BTreeMap::new(),
       paths: BTreeMap::new(),
+      roots: BTreeMap::new(),
     }
   }
 
@@ -310,8 +314,10 @@ impl<'v, H: Held + ?Sized> Trees<'v, H> {
 }
 
 impl<H: Held + ?Sized> PushObjects for Trees<'_, H> {
+  /// The directory `id` names; a changeset's tree an owed push names ([`changeset_tree`]) is its root directory.
   fn tree(&self, id: ObjectKey) -> Result<Vec<TreeEntry>, Unavailable> {
-    self.dirs.get(&id).cloned().ok_or(Unavailable::Missing)
+    let dir = self.roots.get(&id).copied().unwrap_or(id);
+    self.dirs.get(&dir).cloned().ok_or(Unavailable::Missing)
   }
 
   fn blob_len(&self, id: ObjectKey) -> Result<u64, Unavailable> {
@@ -460,11 +466,94 @@ pub fn work(
 
 /// A version's trees laid out, owned (A-767 C1, the push spin w-balance found): what a work's build keeps between its
 /// turns, so its manifests are laid out once, not a turn at a time.
+#[derive(Default)]
 pub struct Layout {
   /// Every directory laid out, by its name.
   dirs: BTreeMap<ObjectKey, Vec<TreeEntry>>,
   /// Each file node a laid-out manifest names, with the path naming it.
   paths: BTreeMap<Node, Vec<u8>>,
+  /// The changesets laid out for a line's owed push, each with its root directory's name ([`Trees::roots`]).
+  roots: BTreeMap<ObjectKey, ObjectKey>,
+}
+
+/// The name a line's owed push gives changeset `node`'s tree (P2 for Mercurial, main's ruling (A) of 2026-11-26): the
+/// changeset's own node, so the push owes its trees by what Mercurial names them and lays none out when it lands; its
+/// materialization lays out both and resolves each to its root directory ([`Layout::lay_out_owed`]). Twenty bytes, so
+/// never a directory's thirty-two; a file node is twenty too, but a builder asks a tree only of what it holds as a tree.
+/// None only for a node no key can hold, which a twenty-byte node never is.
+pub fn changeset_tree(node: &Node) -> Option<ObjectKey> {
+  ObjectKey::new(node.as_slice())
+}
+
+impl Layout {
+  /// Lays out changeset `changeset`'s tree for a line's owed push, over `revisions` (the repository's, through the
+  /// materialization's lend), its root resolved from the changeset's name ([`changeset_tree`]): one changeset a call, so
+  /// a materialization lays out its base's and its head's a turn each. A text not at hand is refused
+  /// ([`LayoutRefusal::NotAtHand`]) for its owner to read from the node's changeset store and give back, then call again.
+  pub fn lay_out_owed(
+    &mut self,
+    changeset: &Node,
+    revisions: (&Verified, &(impl Held + ?Sized)),
+    admission: &mut Admission,
+  ) -> Result<(), LayoutRefusal> {
+    let key =
+      changeset_tree(changeset).ok_or(LayoutRefusal::MissingChangeset { node: *changeset })?;
+    if self.roots.contains_key(&key) {
+      return Ok(());
+    }
+    let (verified, held) = revisions;
+    let mut trees = Trees {
+      verified,
+      held,
+      dirs: core::mem::take(&mut self.dirs),
+      paths: core::mem::take(&mut self.paths),
+      roots: core::mem::take(&mut self.roots),
+    };
+    let root = trees.lay_out_changeset(changeset, admission);
+    self.dirs = trees.dirs;
+    self.paths = trees.paths;
+    self.roots = trees.roots;
+    self.roots.insert(key, root?);
+    Ok(())
+  }
+
+  /// Whether changeset `changeset`'s tree is laid out ([`Layout::lay_out_owed`]).
+  pub fn laid_out(&self, changeset: &Node) -> bool {
+    changeset_tree(changeset).is_some_and(|key| self.roots.contains_key(&key))
+  }
+
+  /// These trees over `revisions` (the repository's, lent for one turn of a line's owed build) handed to `read` as the
+  /// objects the build reads ([`PushObjects`]), as a push's work's turn reads them ([`WorkBuild::advance`]): what the
+  /// materializer's lend gives the green's own owed build (`slates_merge::Green::materializing`), so one builder makes
+  /// every tool's owed push.
+  pub fn lend(
+    &mut self,
+    (verified, held): (&Verified, &(impl Held + ?Sized)),
+    read: &mut dyn FnMut(&dyn PushObjects),
+  ) {
+    let trees = Trees {
+      verified,
+      held,
+      dirs: core::mem::take(&mut self.dirs),
+      paths: core::mem::take(&mut self.paths),
+      roots: core::mem::take(&mut self.roots),
+    };
+    read(&trees);
+    self.dirs = trees.dirs;
+    self.paths = trees.paths;
+    self.roots = trees.roots;
+  }
+
+  /// The ask of the node's changeset store for the file revision `building`'s last turn waited for
+  /// ([`push::Building::waiting`]), its text within `most` bytes, as [`WorkBuild::ask_waited`] asks a push's: none where
+  /// it waited for nothing these trees name.
+  pub fn waited(&self, building: &push::Building, most: u64) -> Option<super::held::TextAsk> {
+    let node = building
+      .waiting()
+      .and_then(|id| Node::try_from(id.as_bytes()).ok())?;
+    let path = self.paths.get(&node).cloned()?;
+    Some(super::held::TextAsk::new(path, node, most))
+  }
 }
 
 /// A push's work built a unit a turn (A-767 C1, the push spin: a 64 MiB file's work built in one step spun its shard
@@ -514,6 +603,7 @@ pub fn begin_work(
     layout: Layout {
       dirs: trees.dirs,
       paths: trees.paths,
+      roots: trees.roots,
     },
     building,
     asked: None,
@@ -563,11 +653,13 @@ impl WorkBuild {
       held,
       dirs: core::mem::take(&mut self.layout.dirs),
       paths: core::mem::take(&mut self.layout.paths),
+      roots: core::mem::take(&mut self.layout.roots),
     };
     let advanced = self.building.advance(green, &trees);
     self.layout = Layout {
       dirs: trees.dirs,
       paths: trees.paths,
+      roots: trees.roots,
     };
     advanced.map(|built| built.map_err(WorkRefused::Push))
   }
