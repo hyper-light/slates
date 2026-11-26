@@ -259,6 +259,9 @@ fn head_paths(engine: &slates_merge::engine::Green) -> Vec<String> {
 /// Drives `green`'s build a slice at a time, yielding between slices, until it ends or is replaced.
 async fn drive(green: DbVolumeId) {
   while crate::state::with_state_counted(|state| {
+    if let Some(standing) = driven_by_test(state, green) {
+      return standing;
+    }
     let budget = slates_rt::futures::step_budget_ns().unwrap_or(0);
     slice(state, green, budget)
   }) == Some(true)
@@ -671,6 +674,28 @@ fn retire(state: &mut ShardState, build: Build) -> Vec<ParkedSubmit> {
     let _ = slates_rt::futures::cancel(task);
   }
   build.parked
+}
+
+#[cfg(test)]
+thread_local! {
+  /// Whether a test drives this shard's builds itself ([`step_once`], [`settle`]): a history awaiting on the shard (its
+  /// pushes' landings awaited) lets the shard run its tasks, and a build's own would put its files meanwhile, so a test
+  /// interleaving pushes with a build's slices could not hold the build under way across them.
+  pub(crate) static DRIVEN_BY_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Under [`DRIVEN_BY_TEST`], whether `green`'s build still stands, its task putting nothing; otherwise none.
+#[cfg(test)]
+fn driven_by_test(state: &ShardState, green: DbVolumeId) -> Option<bool> {
+  DRIVEN_BY_TEST
+    .with(std::cell::Cell::get)
+    .then(|| state.vcs_stores.whole_builds.0.contains_key(&green))
+}
+
+/// Outside tests a build's task always puts its files.
+#[cfg(not(test))]
+fn driven_by_test(_: &ShardState, _: DbVolumeId) -> Option<bool> {
+  None
 }
 
 /// Drives every build of the shard to its end, a slice at a time, in this step: what a test that pushes and then reads

@@ -1174,9 +1174,15 @@
 >   `repository/import/tests.rs`, `fleet.rs`, `replica.rs`, `daemon::tests`; w-perf's: `vcs_store/tests.rs`,
 >   `vcs_store/paths/tests.rs`, `vcs_store/commits/tests.rs`, `vcs_store/index_upkeep.rs`, `vcs_store/named_objects.rs`.
 >   Edit none of them meanwhile; main assigns them back if either agent returns.
->   - `test_store::audit_on_stored_shard`: 22 sites. svn 0; git 0; hg 0;
->     other 22 (`commits/tests.rs` 8, `identities/tests.rs` 8, `index_upkeep.rs` 2, `import/tests.rs` 2,
->     `fleet.rs` 2). `vcs_store/paths/tests.rs`' 11 moved by w-git (2026-11-26): the plain green's, whose submit is a
+>   - `test_store::audit_on_stored_shard`: 14 sites. svn 0; git 0; hg 0;
+>     other 14 (`identities/tests.rs` 8, `index_upkeep.rs` 2, `import/tests.rs` 2, `fleet.rs` 2).
+>     `vcs_store/commits/tests.rs`' 8 moved by w-git (2026-11-26) to `run_on_stored_shard` tasks: created with
+>     `created().await`, submitted with `paths::tests::version_awaited`, pushed with `push_through_awaited` or
+>     `push_unsettled_awaited`; the storm's build slices held to the test's own by `whole_build::DRIVEN_BY_TEST` (a
+>     test-only hold: awaiting its pushes' landings let the build's task finish it between them, red `MOVED` 0). The
+>     probe (`home_and_land_blocking` and a held made landing panicking) failed only
+>     `t_a664_live_a_submit_waits_parked_for_its_greens_whole_build` of `commits::tests`, through its sync
+>     `pushed_three`. `vcs_store/paths/tests.rs`' 11 moved by w-git (2026-11-26): the plain green's, whose submit is a
 >     bare dispatch, to `on_a_stored_shard`; the 10 on git repositories to `run_on_stored_shard` tasks creating with
 >     `created().await` and submitting with `paths::tests::version_awaited` (`recorded_git_submit_as_awaited`: the
 >     submit a client's recorded request with nothing held for the test, its made commit landed by the shard's own

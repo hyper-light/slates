@@ -1577,7 +1577,7 @@ pub(crate) fn push_unsettled(
 
 /// [`push_unsettled`] from a task of the shard: its names and pack homed and landed by awaiting
 /// (`vcs_store::commits::home_and_land`), never holding the shard through the store's commit.
-async fn push_unsettled_awaited(
+pub(crate) async fn push_unsettled_awaited(
   (repository, green): (RepositoryId, DbVolumeId),
   objects: &[Brought],
   (base, head, tree_id): (Option<ObjectId>, ObjectId, ObjectId),

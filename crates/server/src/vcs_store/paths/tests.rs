@@ -69,7 +69,7 @@ fn git(name: &str) -> crate::test_store::Asked<'_> {
 }
 
 /// Git repository `name` made from a task of the shard ([`git`]): its id and its root green.
-async fn git_made(name: &str) -> (RepositoryId, VolumeId) {
+pub(crate) async fn git_made(name: &str) -> (RepositoryId, VolumeId) {
   let (repository, root) = crate::test_store::created(&owner(), git(name)).await;
   (repository, crate::verbs::to_wire_volume(root))
 }
@@ -194,7 +194,7 @@ fn work_making(state: &mut ShardState, (green, serial): (VolumeId, u32), ops: Ve
 /// [`version`] on a git repository's `green` from a task of the shard: its submit a client's recorded request whose
 /// made commit the shard's own task lands ([`recorded_git_submit_awaited`]), never the shard's thread held through the
 /// store's commit. The version accepted.
-async fn version_awaited(green: VolumeId, serial: u32, ops: Vec<Op>) -> u64 {
+pub(crate) async fn version_awaited(green: VolumeId, serial: u32, ops: Vec<Op>) -> u64 {
   let work = on_state(|state| work_making(state, (green, serial), ops));
   let message = format!("version {serial}");
   let submitted = recorded_git_submit_awaited(crate::identities::authored(work, &message)).await;
@@ -302,7 +302,7 @@ fn next_test_request() -> slates_wire::request::RequestId {
 }
 
 /// [`recorded_git_submit`] from a task of the shard ([`crate::test_store::run_on_stored_shard`]).
-async fn recorded_git_submit_awaited(body: RequestBody) -> ReplyBody {
+pub(crate) async fn recorded_git_submit_awaited(body: RequestBody) -> ReplyBody {
   recorded_git_submit_as_awaited(next_test_request(), body).await
 }
 

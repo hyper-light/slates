@@ -21,11 +21,13 @@ use super::{KILL_BEFORE_MADE_COMMIT, MAP_TURNS, TEST_ENTRY_REFUSED, TEST_MAP_BUD
 use super::{MADE, UNMADE};
 use crate::state::ShardState;
 use crate::vcs_store::green_key;
-use crate::vcs_store::paths::tests::{Op, branch, count, create, git_repository, version};
+use crate::vcs_store::paths::tests::{
+  Op, branch, count, create, git_made, git_repository, recorded_git_submit_awaited, version_awaited,
+};
 use crate::vcs_store::record::Record;
 use crate::vcs_store::tests::{
-  FIRST_DATE, assert_made_again_whole, commit_of, hex, owner, push_through, push_unsettled,
-  records, tree_of,
+  FIRST_DATE, assert_made_again_whole, commit_of, hex, on_state, owner, push_through_awaited,
+  push_unsettled_awaited, records, tree_of,
 };
 use crate::vcs_store::upload::tests::{answered, fetch, lines_of, ls_refs, pack_of};
 use crate::verbs::to_db_volume;
@@ -226,24 +228,25 @@ fn counts(state: &ShardState) -> (u64, u64) {
 /// made and none refused. Red before the commit was made: `main` was listed at nothing.
 #[test]
 fn t_a664_p3_a_submitted_version_is_a_commit_a_clone_fetches() {
-  let (clone, made, dated) =
-    crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
-      let (repository, green) = git_repository(state, "made");
-      let before = wall_seconds();
-      let ops = vec![
-        mkdir("/d"),
-        create("/d/a", b"alpha"),
-        create("/f", b"hello"),
-        executable("/d/a"),
-      ];
-      version(state, green, 1, ops);
-      let after = wall_seconds();
+  let (clone, made, dated) = crate::test_store::run_on_stored_shard(|| async {
+    let (repository, green) = git_made("made").await;
+    let before = wall_seconds();
+    let ops = vec![
+      mkdir("/d"),
+      create("/d/a", b"alpha"),
+      create("/f", b"hello"),
+      executable("/d/a"),
+    ];
+    version_awaited(green, 1, ops).await;
+    let after = wall_seconds();
+    on_state(|state| {
       (
         cloned(state, repository, "main"),
         counts(state),
         (before, after),
       )
-    });
+    })
+  });
   let expected = listing(&[
     ("d/a", Mode::Executable, b"alpha"),
     ("f", Mode::File, b"hello"),
@@ -309,48 +312,49 @@ type RecordFacts = (Vec<(u64, u64, Option<ObjectId>)>, Vec<Kind>);
 /// whole, every record replayed; `main` fetched at the second made commit after it.
 #[test]
 fn t_a664_p3_made_commits_name_the_one_before_and_are_made_again_from_the_log() {
-  crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
-    let (repository, green) = git_repository(state, "history");
+  crate::test_store::run_on_stored_shard(|| async {
+    let (repository, green) = git_made("history").await;
     let root = to_db_volume(green);
     let key = green_key(root);
     let (objects, pushed) = commit_of(&[(b"README".to_vec(), b"one\n".to_vec())], &[], FIRST_DATE);
     let pushed_tree = tree_of(&objects);
-    push_through(
-      state,
-      (repository, root),
-      &objects,
-      (None, pushed, pushed_tree),
-    );
-    assert_eq!(kept_tree(state, repository, key), Some(pushed_tree));
-    version(state, green, 2, vec![Op::Edit("/README", 0, 4, b"two\n")]);
-    let second = cloned(state, repository, "main");
-    let before = tree_counters(state, repository);
+    push_through_awaited((repository, root), &objects, (None, pushed, pushed_tree)).await;
+    on_state(|state| assert_eq!(kept_tree(state, repository, key), Some(pushed_tree)));
+    version_awaited(green, 2, vec![Op::Edit("/README", 0, 4, b"two\n")]).await;
+    let (second, before) = on_state(|state| {
+      (
+        cloned(state, repository, "main"),
+        tree_counters(state, repository),
+      )
+    });
     let ops = vec![mkdir("/src"), create("/src/lib.rs", b"fn main() {}\n")];
-    version(state, green, 3, ops);
-    let after = tree_counters(state, repository);
-    let third = cloned(state, repository, "main");
-    assert_eq!(parents_of(&second.text), vec![pushed]);
-    assert_eq!(parents_of(&third.text), vec![second.head]);
-    let expected: Vec<RecordFacts> = vec![
-      (
-        vec![(key, 2, Some(second.head))],
-        vec![Kind::Tree, Kind::Blob, Kind::Commit],
-      ),
-      (
-        vec![(key, 3, Some(third.head))],
-        vec![Kind::Tree, Kind::Tree, Kind::Blob, Kind::Commit],
-      ),
-    ];
-    assert_eq!(recorded(state, repository, 1), expected);
-    let derived = (
-      after.directories - before.directories,
-      after.blobs - before.blobs,
-    );
-    assert_eq!(derived, (2, 1));
-    assert_eq!(counts(state), (2, 0));
-    assert_made_again_whole(state, repository, &[key]);
-    let again = cloned(state, repository, "main");
-    assert_eq!((again.head, again.files), (third.head, third.files));
+    version_awaited(green, 3, ops).await;
+    on_state(|state| {
+      let after = tree_counters(state, repository);
+      let third = cloned(state, repository, "main");
+      assert_eq!(parents_of(&second.text), vec![pushed]);
+      assert_eq!(parents_of(&third.text), vec![second.head]);
+      let expected: Vec<RecordFacts> = vec![
+        (
+          vec![(key, 2, Some(second.head))],
+          vec![Kind::Tree, Kind::Blob, Kind::Commit],
+        ),
+        (
+          vec![(key, 3, Some(third.head))],
+          vec![Kind::Tree, Kind::Tree, Kind::Blob, Kind::Commit],
+        ),
+      ];
+      assert_eq!(recorded(state, repository, 1), expected);
+      let derived = (
+        after.directories - before.directories,
+        after.blobs - before.blobs,
+      );
+      assert_eq!(derived, (2, 1));
+      assert_eq!(counts(state), (2, 0));
+      assert_made_again_whole(state, repository, &[key]);
+      let again = cloned(state, repository, "main");
+      assert_eq!((again.head, again.files), (third.head, third.files));
+    });
   });
 }
 
@@ -359,15 +363,17 @@ fn t_a664_p3_made_commits_name_the_one_before_and_are_made_again_from_the_log() 
 /// both. Expect: `topic` at a commit the server made whose parent is `main`'s commit, its tree holding `f` and `t`.
 #[test]
 fn t_a664_p3_a_branchs_first_made_commit_names_the_commit_it_was_made_at() {
-  let (main, topic) = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
-    let (repository, green) = git_repository(state, "branched");
-    version(state, green, 1, vec![create("/f", b"main")]);
-    let topic = branch(state, "branched", "topic");
-    version(state, topic, 2, vec![create("/t", b"topic")]);
-    (
-      cloned(state, repository, "main"),
-      cloned(state, repository, "topic"),
-    )
+  let (main, topic) = crate::test_store::run_on_stored_shard(|| async {
+    let (repository, green) = git_made("branched").await;
+    version_awaited(green, 1, vec![create("/f", b"main")]).await;
+    let topic = on_state(|state| branch(state, "branched", "topic"));
+    version_awaited(topic, 2, vec![create("/t", b"topic")]).await;
+    on_state(|state| {
+      (
+        cloned(state, repository, "main"),
+        cloned(state, repository, "topic"),
+      )
+    })
   });
   assert_eq!(parents_of(&topic.text), vec![main.head]);
   let expected = listing(&[("f", Mode::File, b"main"), ("t", Mode::File, b"topic")]);
@@ -383,9 +389,9 @@ fn t_a664_p3_a_branchs_first_made_commit_names_the_commit_it_was_made_at() {
 /// unmade.
 #[test]
 fn t_a664_p3_a_submit_whose_message_git_refuses_is_refused_before_its_verdict() {
-  let (refused, clone, made) =
-    crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
-      let (repository, green) = git_repository(state, "refused");
+  let (refused, clone, made) = crate::test_store::run_on_stored_shard(|| async {
+    let (repository, green) = git_made("refused").await;
+    let work = on_state(|state| {
       let made = crate::vcs_store::paths::tests::ask(
         state,
         RequestBody::CreateWork {
@@ -407,18 +413,19 @@ fn t_a664_p3_a_submit_whose_message_git_refuses_is_refused_before_its_verdict() 
         },
       );
       assert!(!matches!(edited, ReplyBody::Refused { .. }), "{edited:?}");
-      // A client's recorded submit, as `version_saying` makes a git green's: what it waits on taken here.
-      let submitted = crate::vcs_store::paths::tests::recorded_git_submit(
-        state,
-        crate::identities::authored(work, "one\0two"),
-      );
+      work
+    });
+    // A client's recorded submit, as `version_awaited` makes a git green's.
+    let submitted =
+      Some(recorded_git_submit_awaited(crate::identities::authored(work, "one\0two")).await);
+    let refused = on_state(|state| {
       let key = green_key(to_db_volume(green));
       let held = state
         .vcs_stores
         .git_ref(repository)
         .map(|(_, git)| git.versions(key).len());
       let head = state.db.partition().green_head(to_db_volume(green));
-      let refused = (
+      (
         matches!(
           submitted,
           Some(ReplyBody::Refused {
@@ -429,10 +436,11 @@ fn t_a664_p3_a_submit_whose_message_git_refuses_is_refused_before_its_verdict() 
         head,
         held,
         counts(state),
-      );
-      version(state, green, 2, vec![create("/g", b"two")]);
-      (refused, cloned(state, repository, "main"), counts(state))
+      )
     });
+    version_awaited(green, 2, vec![create("/g", b"two")]).await;
+    on_state(|state| (refused, cloned(state, repository, "main"), counts(state)))
+  });
   assert_eq!(refused, (true, 0, Some(0), (0, 0)));
   assert_eq!(parents_of(&clone.text), Vec::<ObjectId>::new());
   let expected = listing(&[("g", Mode::File, b"two")]);
@@ -454,8 +462,8 @@ fn moved(from: &str, to: &str) -> Op {
 /// POSIX `rename` and `git mv` keep a file's mode.
 #[test]
 fn t_a664_p3_an_executable_file_moved_is_100755_in_its_commit() {
-  let (first, second) = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
-    let (repository, green) = git_repository(state, "moved");
+  let (first, second) = crate::test_store::run_on_stored_shard(|| async {
+    let (repository, green) = git_made("moved").await;
     let ops = vec![
       mkdir("/d"),
       create("/d/a", b"alpha"),
@@ -463,12 +471,15 @@ fn t_a664_p3_an_executable_file_moved_is_100755_in_its_commit() {
       mkdir("/x"),
       moved("/d/a", "/x/a"),
     ];
-    version(state, green, 1, ops);
-    let first = cloned(state, repository, "main").files;
+    version_awaited(green, 1, ops).await;
+    let first = on_state(|state| cloned(state, repository, "main").files);
     let ops = vec![mkdir("/e"), create("/e/b", b"beta"), executable("/e/b")];
-    version(state, green, 2, ops);
-    version(state, green, 3, vec![mkdir("/y"), moved("/e/b", "/y/b")]);
-    (first, cloned(state, repository, "main").files)
+    version_awaited(green, 2, ops).await;
+    version_awaited(green, 3, vec![mkdir("/y"), moved("/e/b", "/y/b")]).await;
+    (
+      first,
+      on_state(|state| cloned(state, repository, "main").files),
+    )
   });
   assert_eq!(first, listing(&[("x/a", Mode::Executable, b"alpha")]));
   let expected = listing(&[
@@ -484,6 +495,18 @@ fn pushed_three(
   state: &mut ShardState,
   (repository, root): (RepositoryId, slates_db::catalog::VolumeId),
 ) -> ObjectId {
+  let (objects, pushed, tree) = three_files();
+  crate::vcs_store::tests::push_unsettled(
+    state,
+    (repository, root),
+    &objects,
+    (None, pushed, tree),
+  );
+  tree
+}
+
+/// [`pushed_three`]'s commit: its objects, the commit and its tree.
+fn three_files() -> (Vec<crate::vcs_store::tests::Brought>, ObjectId, ObjectId) {
   let files = [
     (b"README".to_vec(), b"one\n".to_vec()),
     (b"a".to_vec(), b"alpha\n".to_vec()),
@@ -491,7 +514,15 @@ fn pushed_three(
   ];
   let (objects, pushed) = commit_of(&files, &[], FIRST_DATE);
   let tree = tree_of(&objects);
-  push_unsettled(state, (repository, root), &objects, (None, pushed, tree));
+  (objects, pushed, tree)
+}
+
+/// [`pushed_three`] from a task of the shard ([`push_unsettled_awaited`]).
+async fn pushed_three_awaited(
+  (repository, root): (RepositoryId, slates_db::catalog::VolumeId),
+) -> ObjectId {
+  let (objects, pushed, tree) = three_files();
+  push_unsettled_awaited((repository, root), &objects, (None, pushed, tree)).await;
   tree
 }
 
@@ -502,25 +533,27 @@ fn pushed_three(
 /// file, and kept the pushed commit's tree, built once.
 #[test]
 fn t_a664_live_a_pushs_whole_map_is_built_in_slices_after_its_answer() {
-  let seen = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
-    let (repository, green) = git_repository(state, "sliced");
+  let seen = crate::test_store::run_on_stored_shard(|| async {
+    let (repository, green) = git_made("sliced").await;
     let root = to_db_volume(green);
     let key = green_key(root);
-    let tree = pushed_three(state, (repository, root));
-    let building = crate::vcs_store::paths::whole_build::building;
-    let answered = (kept_tree(state, repository, key), building(state, root));
-    crate::vcs_store::paths::whole_build::settle(state);
-    let built = (
-      kept_tree(state, repository, key) == Some(tree),
-      building(state, root),
-    );
-    let slices = count(state, crate::vcs_store::paths::whole_build::SLICES);
-    (
-      answered,
-      built,
-      slices,
-      count(state, crate::vcs_store::paths::BUILT),
-    )
+    let tree = pushed_three_awaited((repository, root)).await;
+    on_state(|state| {
+      let building = crate::vcs_store::paths::whole_build::building;
+      let answered = (kept_tree(state, repository, key), building(state, root));
+      crate::vcs_store::paths::whole_build::settle(state);
+      let built = (
+        kept_tree(state, repository, key) == Some(tree),
+        building(state, root),
+      );
+      let slices = count(state, crate::vcs_store::paths::whole_build::SLICES);
+      (
+        answered,
+        built,
+        slices,
+        count(state, crate::vcs_store::paths::BUILT),
+      )
+    })
   });
   assert_eq!(seen, ((None, true), (true, false), 3, 1));
 }
@@ -636,8 +669,11 @@ fn recorded_submit(state: &mut ShardState, body: slates_ipc::protocol::RequestBo
 /// its slices' boundaries, built once, and the tree kept the last push's.
 #[test]
 fn t_a664_live_a_storm_of_fifty_pushes_never_restarts_a_whole_build() {
-  let seen = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
-    let (repository, green) = git_repository(state, "storm");
+  let seen = crate::test_store::run_on_stored_shard(|| async {
+    let (repository, green) = git_made("storm").await;
+    // The build's slices are the test's own, between its pushes, whose landings it awaits.
+    let driven = &crate::vcs_store::paths::whole_build::DRIVEN_BY_TEST;
+    driven.with(|held| held.set(true));
     let root = to_db_volume(green);
     let mut files: Vec<(Vec<u8>, Vec<u8>)> = (0..60)
       .map(|serial| {
@@ -650,31 +686,29 @@ fn t_a664_live_a_storm_of_fifty_pushes_never_restarts_a_whole_build() {
     files.insert(0, (b"README".to_vec(), b"one\n".to_vec()));
     let (objects, mut head) = commit_of(&files, &[], FIRST_DATE);
     let mut tree = tree_of(&objects);
-    push_unsettled(state, (repository, root), &objects, (None, head, tree));
+    push_unsettled_awaited((repository, root), &objects, (None, head, tree)).await;
     for push in 0..50u64 {
-      crate::vcs_store::paths::whole_build::step_once(state);
+      on_state(crate::vcs_store::paths::whole_build::step_once);
       if let Some(readme) = files.first_mut() {
         readme.1 = format!("push {push}\n").into_bytes();
       }
       let (objects, next) = commit_of(&files, &[head], FIRST_DATE.saturating_add(push + 1));
       let before = tree;
       tree = tree_of(&objects);
-      push_unsettled(
-        state,
-        (repository, root),
-        &objects,
-        (Some(before), next, tree),
-      );
+      push_unsettled_awaited((repository, root), &objects, (Some(before), next, tree)).await;
       head = next;
     }
-    crate::vcs_store::paths::whole_build::settle(state);
-    let whole_build = |name| count(state, name);
-    (
-      whole_build(crate::vcs_store::paths::whole_build::RESTARTED),
-      whole_build(crate::vcs_store::paths::whole_build::MOVED) > 0,
-      whole_build(crate::vcs_store::paths::BUILT),
-      kept_tree(state, repository, green_key(root)) == Some(tree),
-    )
+    on_state(|state| {
+      crate::vcs_store::paths::whole_build::settle(state);
+      driven.with(|held| held.set(false));
+      let whole_build = |name| count(state, name);
+      (
+        whole_build(crate::vcs_store::paths::whole_build::RESTARTED),
+        whole_build(crate::vcs_store::paths::whole_build::MOVED) > 0,
+        whole_build(crate::vcs_store::paths::BUILT),
+        kept_tree(state, repository, green_key(root)) == Some(tree),
+      )
+    })
   });
   assert_eq!(seen, (0, true, 1, true));
 }
@@ -686,36 +720,38 @@ fn t_a664_live_a_storm_of_fifty_pushes_never_restarts_a_whole_build() {
 /// the green still at the pushed version, since nothing of the submit ran (its retry runs it again).
 #[test]
 fn t_a664_live_a_parked_submit_waits_at_most_its_bound() {
-  let seen = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
-    let (repository, green) = git_repository(state, "overdue");
+  let seen = crate::test_store::run_on_stored_shard(|| async {
+    let (repository, green) = git_made("overdue").await;
     let root = to_db_volume(green);
-    pushed_three(state, (repository, root));
-    let ask = crate::vcs_store::paths::tests::ask;
-    let made = ask(
-      state,
-      slates_ipc::protocol::RequestBody::CreateWork {
-        green,
-        name: "work-overdue".to_owned(),
-      },
-    );
-    let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
-      return (0, 0, 0, None);
-    };
-    recorded_submit(state, crate::identities::authored(work, "too late"));
-    let overdue = crate::vcs_store::paths::whole_build::OVERDUE;
-    let now = slates_rt::futures::now_ns();
-    crate::vcs_store::paths::whole_build::answer_overdue_at(state, (now, u64::MAX));
-    let within = count(state, overdue);
-    crate::vcs_store::paths::whole_build::answer_overdue_at(state, (u64::MAX, 0));
-    let past = count(state, overdue);
-    crate::vcs_store::paths::whole_build::settle(state);
-    let head = state.greens.get(&root).map(|engine| engine.head());
-    (
-      count(state, crate::vcs_store::paths::whole_build::PARKED),
-      within,
-      past,
-      head,
-    )
+    pushed_three_awaited((repository, root)).await;
+    on_state(|state| {
+      let ask = crate::vcs_store::paths::tests::ask;
+      let made = ask(
+        state,
+        slates_ipc::protocol::RequestBody::CreateWork {
+          green,
+          name: "work-overdue".to_owned(),
+        },
+      );
+      let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
+        return (0, 0, 0, None);
+      };
+      recorded_submit(state, crate::identities::authored(work, "too late"));
+      let overdue = crate::vcs_store::paths::whole_build::OVERDUE;
+      let now = slates_rt::futures::now_ns();
+      crate::vcs_store::paths::whole_build::answer_overdue_at(state, (now, u64::MAX));
+      let within = count(state, overdue);
+      crate::vcs_store::paths::whole_build::answer_overdue_at(state, (u64::MAX, 0));
+      let past = count(state, overdue);
+      crate::vcs_store::paths::whole_build::settle(state);
+      let head = state.greens.get(&root).map(|engine| engine.head());
+      (
+        count(state, crate::vcs_store::paths::whole_build::PARKED),
+        within,
+        past,
+        head,
+      )
+    })
   });
   assert_eq!(seen, (1, 0, 1, Some(1)));
 }
