@@ -386,10 +386,20 @@ pub(crate) async fn brought_back_waited(id: RepositoryId) -> bool {
     })
   })
   .flatten();
+  let encoding =
+    crate::state::with_state(|state| crate::vcs_store::git_encode::units_done(state, id).is_some())
+      .unwrap_or(false);
   let Some(waited) = waited else {
     return false;
   };
-  if bring_back_within(waited).await.is_err() {
+  let brought = bring_back_within(waited).await;
+  eprintln!(
+    "b1dbg {:?} driver bring-back of {} at {} (an encoding under way: {encoding}): {brought:?}",
+    std::thread::current().id(),
+    waited.len,
+    waited.offset
+  );
+  if brought.is_err() {
     let _ = crate::state::with_state_counted(|state| state.count(RESIDENT_REFUSED, 1));
   }
   true

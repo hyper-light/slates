@@ -1733,7 +1733,8 @@ async fn let_go_at_its_checks(
             // 2026-11-26, the cause of B1's failure in a concurrent run shown, never guessed).
             let after = on_state(|state| (brought_back_count(state), bring_backs_refused(state)));
             eprintln!(
-              "b1 stop: (offset, let-go number) {noted:?}; brought back {before} -> {after:?}"
+              "b1 stop {:?}: (offset, let-go number) {noted:?}; brought back {before} -> {after:?}",
+              std::thread::current().id()
             );
           }
         }

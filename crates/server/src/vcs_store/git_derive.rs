@@ -183,7 +183,12 @@ fn turn_lent(
   };
   let mut deriving = deriving;
   // A miss an earlier step left noted is not this turn's: cleared, so only a read of this turn names what it waits for.
-  let _ = repository.waiting();
+  if let Some(cleared) = repository.waiting() {
+    eprintln!(
+      "b1dbg {:?} derivation turn cleared the repository's note {cleared:?}",
+      std::thread::current().id()
+    );
+  }
   let (outcome, derived) = paced(repository, content, &mut deriving, (quantum_ns, driver));
   let answer = match outcome {
     Ok(Turned::More) => {
@@ -194,7 +199,13 @@ fn turn_lent(
       (Turned::More, derived, false)
     }
     Ok(Turned::Idle) => (Turned::Idle, derived, false),
-    Ok(Turned::Waiting(waited)) => (Turned::Waiting(waited), derived, false),
+    Ok(Turned::Waiting(waited)) => {
+      eprintln!(
+        "b1dbg {:?} derivation turn waits {waited:?}",
+        std::thread::current().id()
+      );
+      (Turned::Waiting(waited), derived, false)
+    }
     // A read that met a window let go: waited for, never refused (the unit it was on cannot be taken again, so the
     // derivation is begun afresh once the window is back).
     Err(_) => match repository.waiting() {

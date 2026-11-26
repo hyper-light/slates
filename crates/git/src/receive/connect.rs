@@ -249,9 +249,18 @@ impl Walk {
         }
       },
     )?;
+    let waits = !read && self.wait.waits(pushed.away());
+    if !read {
+      eprintln!(
+        "b1dbg {:?} walk judge unread {}: let-go {:?}, waits {waits}",
+        std::thread::current().id(),
+        object.id,
+        pushed.away()
+      );
+    }
     if read {
       self.wait.answered();
-    } else if self.wait.waits(pushed.away()) {
+    } else if waits {
       return Ok(false);
     }
     let state = if read { state } else { Connected::Missing };
@@ -402,9 +411,18 @@ impl Walk {
         _ => {}
       }
     })?;
+    let waits = !read && self.wait.waits(pushed.away());
+    if !read {
+      eprintln!(
+        "b1dbg {:?} walk enter unread {}: let-go {:?}, waits {waits}",
+        std::thread::current().id(),
+        object.id,
+        pushed.away()
+      );
+    }
     if read {
       self.wait.answered();
-    } else if self.wait.waits(pushed.away()) {
+    } else if waits {
       // Nothing was entered under it: its exit frame goes, and its own frame takes the place again.
       self.stack.truncate(exit);
       if let Some(mark) = self.marks.get_mut(node) {

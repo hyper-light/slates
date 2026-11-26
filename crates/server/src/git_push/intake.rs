@@ -139,7 +139,20 @@ impl Contents for Quarantined<'_> {
         store: self.store,
       };
       if let Some(read) = push.bytes(self.store, &outside, id) {
-        return read.map_err(|refused| self.noted(refused.waited())).ok();
+        return read
+          .map_err(|refused| {
+            eprintln!(
+              "b1dbg {:?} quarantine miss {id}: {refused:?}",
+              std::thread::current().id()
+            );
+            self.noted(refused.waited());
+            eprintln!(
+              "b1dbg {:?} quarantine noted let-go {:?}",
+              std::thread::current().id(),
+              self.away.get()
+            );
+          })
+          .ok();
       }
     }
     // An object the repository indexed already is passed over by the quarantine as it arrives (`admit_object`): a pack
@@ -147,6 +160,10 @@ impl Contents for Quarantined<'_> {
     let (_, stored, len) = self.repository.stored(self.store, id)?;
     let read = self.repository.read_stored(self.store, &stored, len);
     if read.is_none() {
+      eprintln!(
+        "b1dbg {:?} quarantine stored miss {id}",
+        std::thread::current().id()
+      );
       // A stored read notes the window it met on the repository itself.
       self.noted(self.repository.peek_waiting());
     }

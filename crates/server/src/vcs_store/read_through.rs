@@ -156,7 +156,13 @@ impl BroughtBack {
     }
     let _ = with_state(|state| {
       for window in &self.0 {
-        if crate::vcs_store::let_go_read(state, window).is_ok() {
+        let let_go = crate::vcs_store::let_go_read(state, window);
+        eprintln!(
+          "b1dbg {:?} a write path lets go a window it brought back: {:?}",
+          std::thread::current().id(),
+          let_go.is_ok()
+        );
+        if let_go.is_ok() {
           state.count(WRITE_PATH_LET_GO, 1);
         }
       }
