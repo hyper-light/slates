@@ -465,13 +465,13 @@ pub(crate) fn create_on(
 pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   Allowed {
     fixture: "test_store::audit_on_stored_shard",
-    owner: "each history's (GAPS: svn 0, git 0, hg 0, other 75)",
-    reaching: 75,
+    owner: "each history's (GAPS: svn 0, git 0, hg 0, other 57)",
+    reaching: 57,
   },
   Allowed {
     fixture: "test_store::create",
-    owner: "each caller's (GAPS: hg 4, other 14)",
-    reaching: 18,
+    owner: "each caller's (GAPS: hg 4, other 9)",
+    reaching: 13,
   },
   Allowed {
     fixture: "vcs_store::commits::home_and_land_blocking",

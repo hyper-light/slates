@@ -1174,10 +1174,12 @@
 >   `repository/import/tests.rs`, `fleet.rs`, `replica.rs`, `daemon::tests`; w-perf's: `vcs_store/tests.rs`,
 >   `vcs_store/paths/tests.rs`, `vcs_store/commits/tests.rs`, `vcs_store/index_upkeep.rs`, `vcs_store/named_objects.rs`.
 >   Edit none of them meanwhile; main assigns them back if either agent returns.
->   - `test_store::audit_on_stored_shard`: 75 sites. svn 0; git 0; hg 0;
->     other 75 (`push/tests.rs` 18, `vcs_store/tests.rs` 14, `paths/tests.rs` 11,
+>   - `test_store::audit_on_stored_shard`: 57 sites. svn 0; git 0; hg 0;
+>     other 57 (`vcs_store/tests.rs` 14, `paths/tests.rs` 11,
 >     `repository.rs` 10, `commits/tests.rs` 8, `identities/tests.rs` 8, `index_upkeep.rs` 2, `import/tests.rs` 2,
->     `fleet.rs` 2). `vcs_share/grants.rs`' 4 and `read_backs.rs`' 3 moved by w-git (2026-11-26): three histories that
+>     `fleet.rs` 2). `repository/push/tests.rs`' 18 moved by w-git (2026-11-26): 17 histories that create to
+>     `audit_on_stored_shard_made` or `_made_all` (git repositories by `push::tests::git`, made from the test's thread),
+>     the one that creates nothing to `on_a_stored_shard`; none reached another blocking helper. `vcs_share/grants.rs`' 4 and `read_backs.rs`' 3 moved by w-git (2026-11-26): three histories that
 >     wait on nothing to `test_store::on_a_stored_shard` (no allowance, so the guard refuses any blocking they reach),
 >     those that only create to `audit_on_stored_shard_made_all`, and the one that pushes to
 >     `test_store::run_on_stored_shard`, creating with `created().await` and landing with
@@ -1186,9 +1188,11 @@
 >     (`git_push/tests.rs` 23, `vcs_share/tests.rs` 9, `vcs_share/wait.rs` 2, `vcs_store/tests.rs` 2, `replica.rs` 1,
 >     `named_objects.rs` 1) and `test_store::audit_on_stored_shard_made_all`, any tool's (`upload/tests.rs` 12,
 >     `git_hooks/tests.rs` 2).
->   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 18 tests. hg 4
->     (`vcs_ssh` 4); other 14 (`daemon::tests` 5, `repository::push` 5, `repository::import` 2,
->     `identities` 1, `repository::tests` 1). Counted by the tests refused with its allowance taken away (w-git,
+>   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 13 tests. hg 4
+>     (`vcs_ssh` 4); other 9 (`daemon::tests` 5, `repository::import` 2, `identities` 1, `repository::tests` 1).
+>     `repository::push`'s 5 moved by w-git (2026-11-26): each observation's repository made first by
+>     `test_store::create_on` from the test's thread, and `push::tests`' `repository` helper, which created on the
+>     shard, removed. Counted by the tests refused with its allowance taken away (w-git,
 >     2026-11-25): `vcs_http::daemon_edge`, `vcs_store::upload` and `vcs_share` reach it no more, `vcs_share`'s three
 >     Mercurial creations made from the test's thread (`hg_on`, `test_store::create_on`), one inside
 >     `audit_on_stored_shard_made_all`; and `hg_made`'s 10 made from the test's thread (w-hg, `create_on`).

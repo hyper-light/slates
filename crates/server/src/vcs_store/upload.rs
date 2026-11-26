@@ -1150,6 +1150,12 @@ pub(crate) const TREE_DELTAS_PAST_ONE: &str = "vcs_store.git_upload.tree_deltas_
 /// (`slates_git::store::PositionCounts::read_cache_hits`; main 01a20182's reading of 2026-11-25: on git/git the cache cut
 /// chain rebuilds by 2.1 % where a one-directory fixture cut 85 %). Format: a counter name.
 pub(crate) const READ_CACHE_HITS: &str = "vcs_store.git_upload.read_cache_hits";
+/// Counter: a fetch's tree reads that inflated their chain's root, an entry whole in its pack: the roots inflated,
+/// beside [`TREE_DELTAS`], the steps rebuilt over them (`slates_git::store::PositionCounts::tree_bases_inflated`; main's
+/// order of 2026-11-26). The read cache keeps the root and every step's result, so its saving is roots and steps both.
+/// Derived: reuse = this ÷ distinct, headroom = this − distinct, distinct the roots the pushed pack's trees' chains end
+/// at, read offline by `git verify-pack -v` and never counted here. Format: a counter name.
+pub(crate) const TREE_BASES_INFLATED: &str = "vcs_store.git_upload.tree_bases_inflated";
 /// Counter: the times a fetch's walk widened its read cache before a tree's read. Format: a counter name.
 pub(crate) const READ_CACHE_WIDENED: &str = "vcs_store.git_upload.read_cache_widened";
 /// Counter: the times a fetch's admission refused its read cache the room a tree's read asked. Format: a counter name.
@@ -1264,6 +1270,7 @@ impl ShardPacks {
       tree_deltas_most,
       tree_deltas,
       tree_deltas_past_one,
+      tree_bases_inflated,
       read_cache_hits,
       read_cache_widened,
       read_cache_refused,
@@ -1280,6 +1287,7 @@ impl ShardPacks {
       (POSITION_CACHE_UNROOMED, unroomed),
       (TREE_DELTAS, tree_deltas),
       (TREE_DELTAS_PAST_ONE, tree_deltas_past_one),
+      (TREE_BASES_INFLATED, tree_bases_inflated),
       (READ_CACHE_HITS, read_cache_hits),
       (READ_CACHE_WIDENED, read_cache_widened),
       (READ_CACHE_REFUSED, read_cache_refused),
@@ -1378,6 +1386,7 @@ impl PackSource for ShardPacks {
       tree_deltas_most,
       tree_deltas,
       tree_deltas_past_one,
+      tree_bases_inflated,
       read_cache_hits,
       read_cache_widened,
       read_cache_refused,
@@ -1391,6 +1400,7 @@ impl PackSource for ShardPacks {
       (&mut chose.unroomed, unroomed),
       (&mut chose.tree_deltas, tree_deltas),
       (&mut chose.tree_deltas_past_one, tree_deltas_past_one),
+      (&mut chose.tree_bases_inflated, tree_bases_inflated),
       (&mut chose.read_cache_hits, read_cache_hits),
       (&mut chose.read_cache_widened, read_cache_widened),
       (&mut chose.read_cache_refused, read_cache_refused),
