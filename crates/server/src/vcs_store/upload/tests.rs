@@ -359,7 +359,7 @@ fn git(name: &str) -> crate::test_store::Asked<'_> {
 }
 
 /// Runs `history` on a stored shard with the repositories `asked` made first from the test's thread, never on the shard
-/// (`test_store::SHARD_BLOCKING_ALLOWED`): their ids and root greens, in order. For a history that pushes nothing.
+/// (`test_store::refuse_on_a_shard`): their ids and root greens, in order. For a history that pushes nothing.
 fn made<T: Send + 'static, const N: usize>(
   asked: [crate::test_store::Asked<'static>; N],
   history: impl FnOnce(&mut ShardState, [(RepositoryId, DbVolumeId); N]) -> T + Clone + Send + 'static,

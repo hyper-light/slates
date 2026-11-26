@@ -22,7 +22,7 @@ use super::{MADE, UNMADE};
 use crate::state::ShardState;
 use crate::vcs_store::green_key;
 use crate::vcs_store::paths::tests::{
-  Op, branch, count, create, git_made, git_repository, recorded_git_submit_awaited, version_awaited,
+  Op, branch, count, create, git_made, recorded_git_submit_awaited, version_awaited,
 };
 use crate::vcs_store::record::Record;
 use crate::vcs_store::tests::{
@@ -641,7 +641,7 @@ fn recorded_submit(state: &mut ShardState, body: slates_ipc::protocol::RequestBo
   };
   state.db.begin();
   state.current_request = Some((1, id));
-  let reply = crate::test_store::create(state, &owner(), body);
+  let reply = crate::verbs::dispatch(state, 1, &owner(), body);
   state.current_request = None;
   let deferred = std::mem::take(&mut state.acceptance_deferred);
   let committed = state.db.commit(&mut state.segment);
@@ -773,8 +773,8 @@ fn t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_com
         client: 7,
         sequence: 1,
       };
+      let (repository, green) = git_made("deferred").await;
       let (repository, root, in_the_verb) = crate::state::with_state(|state| {
-        let (repository, green) = git_repository(state, "deferred");
         let root = to_db_volume(green);
         let made = crate::vcs_store::paths::tests::ask(
           state,
@@ -884,8 +884,8 @@ fn t_c5b_p3_a_kill_between_a_made_commits_landing_and_its_step_recovers_to_befor
         client: 7,
         sequence: 1,
       };
+      let (repository, green) = git_made("killed").await;
       let (repository, root, work, held) = crate::state::with_state(|state| {
-        let (repository, green) = git_repository(state, "killed");
         let ask = crate::vcs_store::paths::tests::ask;
         let made = ask(
           state,
@@ -1009,8 +1009,8 @@ fn refused_made(
         client: 7,
         sequence: 1,
       };
+      let (repository, green) = git_made(name).await;
       let (repository, root, work, held) = crate::state::with_state(|state| {
-        let (repository, green) = git_repository(state, name);
         let ask = crate::vcs_store::paths::tests::ask;
         let made = ask(
           state,
@@ -1122,8 +1122,7 @@ fn t_a824_a_made_commits_map_is_put_a_slice_a_turn_over_the_preview() {
     &daemon,
     || async move {
       TEST_MAP_BUDGET.with(|budget| budget.set(Some(0)));
-      let (repository, green) =
-        crate::state::with_state(|state| git_repository(state, "sliced-made")).expect("the state");
+      let (repository, green) = git_made("sliced-made").await;
       let mut turns = Vec::new();
       for (sequence, word) in [(1u32, "one"), (2, "two")] {
         let id = slates_wire::request::RequestId {

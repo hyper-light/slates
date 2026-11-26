@@ -47,12 +47,12 @@ fn agent() -> Principal {
 
 /// `body` asked of `state` as the owner.
 fn ask(state: &mut ShardState, body: RequestBody) -> ReplyBody {
-  crate::test_store::create(state, &owner(), body)
+  crate::verbs::dispatch(state, 1, &owner(), body)
 }
 
 /// The green `made` creates.
 fn created(state: &mut ShardState, made: RequestBody) -> VolumeId {
-  let ReplyBody::GreenCreated { id } = crate::test_store::create(state, &owner(), made) else {
+  let ReplyBody::GreenCreated { id } = crate::verbs::dispatch(state, 1, &owner(), made) else {
     panic!("a green");
   };
   id
