@@ -1264,12 +1264,17 @@
 >     test's thread, `git_repository_on`, or through `on_stored_shard_with`.)
 >   - w-hg's push and import helpers, counted by the tests refused without each once the entries above let them
 >     through: `repository::hg_push::land_stored` (2 tests, `vcs_ssh::tests::hg`),
->     `vcs_store::commits::home_and_land_blocking` (14 tests: `vcs_store::upload::tests` 12, `git_hooks::tests` 2,
->     through `vcs_store::tests`' synchronous `push_through` and `appended`; `commits::tests` 0 since w-hg moved
->     `t_a664_live_a_submit_waits_parked_for_its_greens_whole_build` to `pushed_three_awaited`, 2026-11-26, and
->     `push_unsettled`, its last caller gone, was deleted. Counted by w-hg's probe of 2026-11-26, the fixture and a held
->     made landing (`made_landing_now`) panicking over `vcs_store::` and `git_hooks::`: 14 failed, all at the fixture,
->     none at `made_landing_now`; the earlier 7 was an undercount, whose cause is not on record; log `~/.local/state/w-hg-logs/2026-11-26-probe-home-and-land-vcs_store::.txt`), and
+>     `vcs_store::commits::home_and_land_blocking` (9 tests: `repository::tests` 6, `daemon::tests` 3, each
+>     through `vcs_store::paths::tests::recorded_git_submit`, whose held made commit is landed by `made_landing_now` on
+>     the shard's thread). `vcs_store::upload::tests`' 12 and `git_hooks::tests`' 2 moved by w-hg (2026-11-26) to
+>     `test_store::run_on_stored_shard_made_all` tasks pushing by `push_through_awaited` and `appended_awaited`
+>     (`upload::tests::made_pushing`; A-745's mid-answer push lands between the answer's steps, `InTurns`), and the
+>     synchronous `push_through` and `appended` were deleted; `commits::tests` 0 since t_a664's parked submit moved
+>     to `pushed_three_awaited` (w-hg, 2026-11-26), `push_unsettled` deleted with it. Counted by w-hg's probes of
+>     2026-11-26, the fixture and `made_landing_now` panicking in turn: `vcs_store::` and `git_hooks::` 0 failed;
+>     `repository::tests` 6 and the 3 daemon tests that submit through `recorded_git_submit` failed at each. The first
+>     probe of that day ran over `vcs_store::` and `git_hooks::` alone and counted 14, missing these 9; the 7 before it
+>     was an undercount whose cause is not on record. Logs `~/.local/state/w-hg-logs/2026-11-26-probe{2,3}-*.txt`), and
 >     `repository::import::tests::served`'s read-back (1, gone 2026-11-26).
 >   Moved instead of listed: `daemon::tests::t_goal93_a_homes_landed_records_survive_a_restart…` lands between two
 >   observations. Shrunk: `repository/hg_push/tests.rs`' 17 daemon tests push through the daemon's own driver

@@ -498,8 +498,8 @@ pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   },
   Allowed {
     fixture: "vcs_store::commits::home_and_land_blocking",
-    owner: "w-hg (vcs_store::upload::tests 12, git_hooks::tests 2)",
-    reaching: 14,
+    owner: "w-hg (repository::tests 6, daemon::tests 3, through paths::tests::recorded_git_submit's made_landing_now)",
+    reaching: 9,
   },
   Allowed {
     fixture: "repository::hg_push::land_stored",
@@ -647,6 +647,34 @@ pub(crate) fn on_a_stored_shard<T: Send + 'static>(
   let (store, daemon) = audit_daemon_stored();
   keep_landed(&daemon);
   let answer = crate::daemon::observe_first(&daemon, move |state| history(state));
+  daemon.stop();
+  drop(store);
+  answer
+}
+
+/// [`run_on_stored_shard`] for a history that begins by making several repositories: each of `asked` made first, by
+/// `principal`, from the test's thread ([`create_on`]), in order; then `history` runs as a task on the shard with their
+/// ids and root greens, in `asked`'s order, every store wait in it awaited. The shard is never held through a creation's
+/// commit, nor through a landing.
+pub(crate) fn run_on_stored_shard_made_all<
+  T: Send + 'static,
+  F: std::future::Future<Output = T> + 'static,
+  const N: usize,
+>(
+  (principal, asked): (&slates_db::catalog::Principal, [Asked<'_>; N]),
+  history: impl FnOnce(
+    [(
+      slates_db::catalog::RepositoryId,
+      slates_db::catalog::VolumeId,
+    ); N],
+  ) -> F
+  + Clone
+  + Send
+  + 'static,
+) -> T {
+  let (store, daemon) = audit_daemon_stored();
+  let made = asked.map(|asked| create_on(&daemon, 0, principal, asked));
+  let answer = run_on_first(&daemon, move || history(made), HISTORY_PATIENCE);
   daemon.stop();
   drop(store);
   answer
