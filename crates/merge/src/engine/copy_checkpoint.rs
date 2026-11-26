@@ -122,32 +122,37 @@ impl Green {
     }
   }
 
-  /// The copied trees' keys holding at `at` what the copy above them gave them (the module docs): every key of every
-  /// copied tree made at or before `at`, current or recorded, whose own history records no change after that copy and at
-  /// or before `at`, read at `at` as every reader reads it, with the copy's version. A key absent at `at` is listed only
-  /// where something stood at it at or before `at`, which a restore must take away. With the keys listed.
-  pub(super) fn copied_at(&self, at: u64) -> (Tables, BTreeSet<IdentityKey>) {
-    let mut keys: BTreeSet<IdentityKey> = BTreeSet::new();
-    for (destination, records) in &self.copies {
-      if records.iter().any(|record| record.version <= at) {
-        keys.extend(self.every_key(destination));
-      }
+  /// The destinations of the copies made at or before `at`, whose trees' keys a checkpoint at `at` reads
+  /// ([`Green::copied_key`]).
+  pub(super) fn copied_trees_at(&self, at: u64) -> Vec<String> {
+    self
+      .copies
+      .iter()
+      .filter(|(_, records)| records.iter().any(|record| record.version <= at))
+      .map(|(destination, _)| destination.clone())
+      .collect()
+  }
+
+  /// One key of a copied tree read for a checkpoint at `at` (the module docs): listed in `tables`, with the copy's
+  /// version, where the copy above it gave it what it holds at `at` (no change of its own after that copy and at or
+  /// before `at`), read at `at` as every reader reads it; a key absent at `at` is listed only where something stood at
+  /// it at or before `at`, which a restore must take away. Listed, it joins `listed`.
+  pub(super) fn copied_key(
+    &self,
+    key: IdentityKey,
+    at: u64,
+    (tables, listed): (&mut Tables, &mut BTreeSet<IdentityKey>),
+  ) {
+    let Some(copy) = self
+      .copy_above_at(key.path(), at)
+      .map(|record| record.version)
+    else {
+      return;
+    };
+    let (changed_since, recorded) = self.own_entries(&key, (copy, at));
+    if !changed_since && self.list_copied(&key, (copy, at), recorded, tables) {
+      listed.insert(key);
     }
-    let mut tables = Tables::default();
-    let mut listed = BTreeSet::new();
-    for key in keys {
-      let Some(copy) = self
-        .copy_above_at(key.path(), at)
-        .map(|record| record.version)
-      else {
-        continue;
-      };
-      let (changed_since, recorded) = self.own_entries(&key, (copy, at));
-      if !changed_since && self.list_copied(&key, (copy, at), recorded, &mut tables) {
-        listed.insert(key);
-      }
-    }
-    (tables, listed)
   }
 
   /// Lists `key`'s value at `at` in its table of `tables`, with the version `copy` of the copy that gave it: present, or

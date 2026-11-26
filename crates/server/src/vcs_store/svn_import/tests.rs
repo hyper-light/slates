@@ -1127,11 +1127,13 @@ fn copied_dir(to: &str, (from, rev): (&str, u64)) -> String {
 fn imported_whole_and_stepped(
   name: &'static str,
   dump: Vec<u8>,
-) -> (Result<u64, String>, u64, u64, u64) {
+) -> (Result<u64, String>, u64, u64, (u64, u64)) {
   let read = stored(move || {
     cpu_timed(async move {
       let (svn, green) = subversion(name).await;
       let (loaded, _turns) = imported(svn, dump).await;
+      checkpoints_ended().await;
+      let build_units = on(|state| count(state, crate::merge_service::CHECKPOINT_BUILD_UNITS));
       let grafted = on(|state| {
         state
           .greens
@@ -1145,21 +1147,34 @@ fn imported_whole_and_stepped(
           .map_err(|failed| format!("{failed:?}")),
         longest_ns,
         crate::watchdog::own_window_ns(),
-        grafted,
+        (grafted, build_units),
         longest_task,
       )
     })
   });
   // Every run shows its numbers, so a probe judges each against the 1 ms bar, and names what held the longest.
   eprintln!(
-    "{name}: youngest {:?}, the longest step {} us of a window of {} us ({}), {} copies grafted",
+    "{name}: youngest {:?}, the longest step {} us of a window of {} us ({}), {} copies grafted, {} checkpoint build \
+     units",
     read.0,
     read.1 / 1000,
     read.2 / 1000,
     read.4,
-    read.3
+    read.3.0,
+    read.3.1
   );
   (read.0, read.1, read.2, read.3)
+}
+
+/// Yields until no checkpoint of the calling shard is taken in turns, at most [`TURN_LIMIT`] times: what a test that
+/// reads what a landing's checkpoint did waits for (`merge_service::checkpoint_in_turns`).
+async fn checkpoints_ended() {
+  for _ in 0..TURN_LIMIT {
+    if on(|state| state.merge.checkpointing.is_empty()) {
+      return;
+    }
+    slates_rt::futures::yield_now().await;
+  }
 }
 
 /// The slicing counts a wide landing moves (A-920), read on the calling shard after its import ([`wide_counts`]).
@@ -1369,7 +1384,7 @@ fn t_a920_a_revision_copying_a_tree_of_thousands_of_files_imports_with_every_ste
     WIDE_TEXT_BYTES,
     &[copied_dir("branch", ("trunk", 1))],
   );
-  let (loaded, longest_ns, window_ns, grafted) = imported_whole_and_stepped("wide-copy", dump);
+  let (loaded, longest_ns, window_ns, (grafted, _)) = imported_whole_and_stepped("wide-copy", dump);
   assert_eq!(loaded, Ok(2));
   assert!(grafted > 0, "no copy grafted");
   assert!(
@@ -1380,7 +1395,8 @@ fn t_a920_a_revision_copying_a_tree_of_thousands_of_files_imports_with_every_ste
 
 /// Goal 93 (as the copy's test). Do: import [`wide_trunk`]'s revision 1, a revision 2 copying `trunk` to `branch`, and
 /// a revision 3 moving `trunk` to `moved` (a copy of `trunk` at revision 2, then its delete). Expect the import whole,
-/// both copies grafted, and the shard's longest step under its watchdog window.
+/// both copies grafted, the landings' checkpoints built a unit at a time (A-920 8a), and the shard's longest step under
+/// its watchdog window.
 #[test]
 fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step_under_the_shards_window()
  {
@@ -1393,9 +1409,16 @@ fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step
     WIDE_TEXT_BYTES,
     &[copied_dir("branch", ("trunk", 1)), moved],
   );
-  let (loaded, longest_ns, window_ns, grafted) = imported_whole_and_stepped("wide-move", dump);
+  let (loaded, longest_ns, window_ns, (grafted, build_units)) =
+    imported_whole_and_stepped("wide-move", dump);
   assert_eq!(loaded, Ok(3));
   assert!(grafted >= 2, "{grafted} copies grafted");
+  // A checkpoint of the green holding the branch's and the move's trees built a unit at a time, a copied key a unit
+  // (A-920 8a: built whole at its begin, 52.5 ms of one checkpoint turn, debug).
+  assert!(
+    build_units > 2,
+    "the checkpoints were built in {build_units} unit(s)"
+  );
   assert!(
     longest_ns < window_ns,
     "a step of {longest_ns} ns against the shard's window of {window_ns} ns"

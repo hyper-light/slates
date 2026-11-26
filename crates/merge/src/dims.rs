@@ -593,6 +593,11 @@ impl Files {
     self.map.keys()
   }
 
+  /// The paths that start with `prefix`, in order: one descent, then the paths it answers.
+  pub(crate) fn keys_with_prefix(&self, prefix: &str) -> impl Iterator<Item = String> + '_ {
+    self.map.prefix(prefix).map(|(path, _)| path)
+  }
+
   /// Every file's content, in path order.
   pub(crate) fn values(&self) -> impl Iterator<Item = crate::engine::Content<'_>> + '_ {
     self

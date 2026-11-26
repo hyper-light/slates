@@ -64723,6 +64723,32 @@ GAPS.
   - `record_landed`'s register op, 9.7-16 ms;
   - `apply_slice`, `retire_begun` and the text release, 4-5 ms each.
   These are to be sized in release next (main's order: each section left judged against the bar).
+- **Piece 8, the checkpoint's build a unit at a time** (main's order after probe 10: move's longest step, 5.3-7.8 ms in
+  release, was the checkpoint task's). A debug probe of `CheckpointHold::begin` on the move test read the green's
+  second checkpoint at 52.5 ms of one turn, nearly all of it the build (`Green::checkpoint`), 48.3 ms of that its two
+  copied trees' 18,002 keys. 21.8 ms went to gathering them: `every_key` walked every key of the green once a tree,
+  keeping those inside it. The rest was reading each key at the checkpoint's version. The encode was 1.0 ms.
+  **8a.** `every_key` now walks each map from the tree's root alone: a descent of each trie (`Dim::prefix`,
+  `Files::keys_with_prefix`, `Xattrs::iter_tree`) and a range of each history, with the same keys in the same order.
+  The build is `Green::checkpoint_begin` and `checkpoint_unit` (`engine::CheckpointBuild`), and `Green::checkpoint`
+  runs its units to their end:
+  - each copied tree's keys gathered, a tree a unit;
+  - each key read at the checkpoint's version, a key a unit (`copied_key`);
+  - then the rest made whole: the changed keys, the increments, the copies' records and the sum, the copied keys left
+    out of the changed ones, canonical.
+  Between units the green may take versions past the checkpoint's, which change nothing it reads. A fold past it or a
+  push owed ends it, unavailable. `CheckpointHold` builds it this way (`Making`), then encodes it in a unit of its own
+  before hashing. A gathering, the rest and the encoding each begin a step, never end one past its quantum. A copied key
+  is its own pace kind (`CHECKPOINT_KEY`). Oracles:
+  - `every_key_walks_its_tree_alone_and_finds_what_a_whole_walk_finds`: the keys a walk of every key finds, beside a
+    sibling `trunk-x` whose name begins with the trunk's. Planted bug, red: the in-tree filter dropped from the files.
+  - `a_checkpoint_built_a_unit_at_a_time_across_later_versions_is_the_one_built_whole`: versions accepted part-way, a
+    file made and a copied file unlinked inside the copy. Planted bug, red: a key read at the head, not the
+    checkpoint's version.
+  Counter: `merge.checkpoint.build_units`, more than two in the move test (18,006 in debug). After 8a the move test's
+  longest step is the history's (a staging step, 30-33 ms in debug), not the checkpoint task's (54 ms before). With the
+  import's own longest poll at 14.9 ms, the add test's longest step is now the daemon's shard start
+  (`daemon.rs:1274`'s `start_shard`, its sixth poll, 32.6 ms in debug), outside the import.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
