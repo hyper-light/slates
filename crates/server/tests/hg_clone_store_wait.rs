@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 const CHANGESETS: u64 = 2_000;
 
 /// Format: the counters of a fetch's store asks, the owner's split of them after the first two.
-const COUNTERS: [&str; 22] = [
+const COUNTERS: [&str; 24] = [
   "vcs_store.hg_fetch_manifest_stored_parent_delta",
   "vcs_store.hg_fetch_manifest_at_hand_delta",
   "vcs_store.hg_fetch_manifest_at_hand_whole",
@@ -48,7 +48,49 @@ const COUNTERS: [&str; 22] = [
   "vcs_store.hg_owner_most_ns",
   "vcs_store.hg_text_requests",
   "vcs_store.hg_stream_turns",
+  "vcs_store.hg_replay_wants",
+  "vcs_store.hg_replay_window_most",
 ];
+
+/// Format: what a push's tail still moves after its `hg push` returned (its segments' landings and let-go, its records'
+/// replays and the store reads they ask): the measurements wait until none moves across a look ([`settled`]), so the
+/// clone's window holds the clone alone (main's chain-0b9 at 0b9a3f9e8, load about 69: the push's replay read 4,036 texts
+/// inside the clone's window, 548 at load 30).
+const SETTLING: [&str; 5] = [
+  "vcs.hg.push_segments_landed",
+  "vcs.hg.landed_let_go_turns",
+  "vcs_store.hg_replay_turns",
+  "vcs_store.hg_replay_wants",
+  "vcs_store.hg_owner_requests",
+];
+
+/// Shape: the time between two looks at [`SETTLING`]: two seconds, past a landing's and a replay turn's gaps under load.
+const LOOK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Shape: how long a push's tail may take to settle before the measurement fails: half an hour, past the 57k push's own
+/// length at the loads measured (26 minutes at load 69).
+const SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Waits until a push's tail is done ([`SETTLING`] unmoved across a [`LOOK`]), so what follows is measured alone: the
+/// wait. Fails, naming the counters as last read, past [`SETTLE_BOUND`], never waiting on.
+fn settled(served: &common::hg::Served) -> std::time::Duration {
+  let began = std::time::Instant::now();
+  let mut last = summed(served, &SETTLING);
+  loop {
+    #[allow(clippy::disallowed_methods, reason = "a measurement's looks, apart")]
+    std::thread::sleep(LOOK);
+    let now = summed(served, &SETTLING);
+    if now == last {
+      return began.elapsed();
+    }
+    assert!(
+      began.elapsed() < SETTLE_BOUND,
+      "the push's tail still moving after {:?}: {now:?}",
+      SETTLE_BOUND
+    );
+    last = now;
+  }
+}
 
 /// Each of [`COUNTERS`] summed over the daemon's shards.
 fn counters(served: &common::hg::Served) -> BTreeMap<&'static str, u64> {
@@ -92,8 +134,8 @@ fn source(served: &common::hg::Served) -> String {
   format!("{}/source", served.base())
 }
 
-/// Goal 93 (main's order of 2026-11-25). Do: push a history to an in-process daemon with stock `hg`, then clone it
-/// whole, reading the store-ask counters before and after the clone. Expect: the clone succeeds; its owner requests'
+/// Goal 93 (main's order of 2026-11-25). Do: push a history to an in-process daemon with stock `hg`, wait for the push's
+/// tail to settle ([`settled`]), then clone it whole, reading the store-ask counters before and after the clone. Expect: the clone succeeds; its owner requests'
 /// parts sum to their whole. Prints the clone's wall time and each counter's change, the owner's split as shares of its
 /// whole.
 #[test]
@@ -115,6 +157,11 @@ fn what_a_whole_mercurial_clone_waits_on_when_it_asks_the_store() {
     pushed.status.code().is_some_and(|code| code <= 1),
     "push: {}",
     String::from_utf8_lossy(&pushed.stderr)
+  );
+  let waited = settled(&served);
+  println!(
+    "hg_clone_store_wait: the push's tail settled {:.3} s after its push returned",
+    waited.as_secs_f64()
   );
   let before = counters(&served);
   let began = std::time::Instant::now();
@@ -236,8 +283,8 @@ fn summed(served: &common::hg::Served, names: &[&'static str]) -> BTreeMap<&'sta
 }
 
 /// Main's hg leg at 608930048 (2026-11-25: the 57k stream 18.0 s against stock's 1.3 s, its 164 turns about 100 ms
-/// apart). Do: push a history to an in-process daemon with stock `hg`, then stream-clone it, reading the stream's turn
-/// counters before and after. Expect: the clone succeeds. Prints the stream's wall time, its turns, the time inside them,
+/// apart). Do: push a history to an in-process daemon with stock `hg`, wait for the push's tail to settle ([`settled`]),
+/// then stream-clone it, reading the stream's turn counters before and after. Expect: the clone succeeds. Prints the stream's wall time, its turns, the time inside them,
 /// its writes (and those that waited for the peer) and the yields between them.
 #[test]
 #[ignore = "a measurement (the hg stream's turns): run by name, with SLATES_HG_PUSH_SOURCE for a real history"]
@@ -255,6 +302,11 @@ fn what_a_mercurial_stream_clone_waits_on_between_its_turns() {
     .output()
     .unwrap();
   assert!(pushed.status.code().is_some_and(|code| code <= 1), "push");
+  let waited = settled(&served);
+  println!(
+    "hg_stream_turns: the push's tail settled {:.3} s after its push returned",
+    waited.as_secs_f64()
+  );
   let before = summed(&served, &STREAM_COUNTERS);
   let began = std::time::Instant::now();
   let cloned = served
