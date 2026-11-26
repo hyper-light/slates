@@ -2079,8 +2079,84 @@ fn namespace_of(name: &[u8]) -> Option<&str> {
 
 /// The head of the newest of the store's versions of the green keyed `key`: none while it is unborn, or deleted.
 fn git_head((content, git): (&ContentStore, &GitStore), key: u64) -> Option<ObjectId> {
-  let newest = git.repository.versions(key).checked_sub(1)?;
-  git.repository.head(content, key, newest)
+  repo_git_head((content, &git.repository), key)
+}
+
+/// The head of the newest version of `key` in `repository`: none while unborn or deleted.
+fn repo_git_head(
+  (content, repository): (&ContentStore, &slates_git::store::Repository),
+  key: u64,
+) -> Option<ObjectId> {
+  let newest = repository.versions(key).checked_sub(1)?;
+  repository.head(content, key, newest)
+}
+
+/// Whether `ref_name` maps to a bound branch in `repository` holding a live git head in `store`.
+fn is_live_ref(
+  repositories: &slates_db::repository::Repositories,
+  store: (&ContentStore, &slates_git::store::Repository),
+  repository: RepositoryId,
+  ref_name: &[u8],
+) -> bool {
+  namespace_of(ref_name)
+    .and_then(|namespace| repositories.branch(repository, namespace))
+    .is_some_and(|green| repo_git_head(store, green_key(green)).is_some())
+}
+
+/// Returns an existing live ancestor ref (a strict `'/'`-delimited prefix of `name`) not in
+/// `deleted`, if any.
+fn ancestor_ref_conflict(
+  repositories: &slates_db::repository::Repositories,
+  store: (&ContentStore, &slates_git::store::Repository),
+  repository: RepositoryId,
+  name: &[u8],
+  deleted: &[&[u8]],
+) -> Option<Vec<u8>> {
+  for (at, &byte) in name.iter().enumerate() {
+    if byte != b'/' {
+      continue;
+    }
+    let prefix = name.get(..at)?;
+    if !deleted.contains(&prefix) && is_live_ref(repositories, store, repository, prefix) {
+      return Some(prefix.to_vec());
+    }
+  }
+  None
+}
+
+/// Returns an existing live descendant ref (`<name>/...`) not in `deleted`, if any.
+fn descendant_ref_conflict(
+  repositories: &slates_db::repository::Repositories,
+  store: (&ContentStore, &slates_git::store::Repository),
+  repository: RepositoryId,
+  name: &[u8],
+  deleted: &[&[u8]],
+) -> Option<Vec<u8>> {
+  let namespace = namespace_of(name)?;
+  let prefix = format!("{namespace}/");
+  repositories
+    .branches(repository, &prefix)
+    .find_map(|(existing_ns, green)| {
+      let full = ref_of(existing_ns)?;
+      let conflicts = receive::refs_conflict(name, &full)
+        && !deleted.contains(&full.as_slice())
+        && repo_git_head(store, green_key(green)).is_some();
+      conflicts.then_some(full)
+    })
+}
+
+/// Returns an existing live ref in `repository` that has a files-backend directory/file conflict
+/// with `name` and is not among `deleted`, checking both `'/'`-delimited ancestors and descendants
+/// of `name` across all ref namespaces (including hidden refs).
+fn ref_conflict_in(
+  repositories: &slates_db::repository::Repositories,
+  store: (&ContentStore, &slates_git::store::Repository),
+  repository: RepositoryId,
+  name: &[u8],
+  deleted: &[&[u8]],
+) -> Option<Vec<u8>> {
+  ancestor_ref_conflict(repositories, store, repository, name, deleted)
+    .or_else(|| descendant_ref_conflict(repositories, store, repository, name, deleted))
 }
 
 /// The green the ref `name` names in `repository`'s namespace (module docs).
@@ -2702,6 +2778,18 @@ impl Judge for ServerJudge<'_> {
     }
     self.appended(planned).map_err(declined)?;
     Ok((0..count).map(|_| Vec::new()).collect())
+  }
+
+  fn ref_conflict(&self, name: &[u8], deleted: &[&[u8]]) -> Option<Vec<u8>> {
+    let (content, git) = self.state.vcs_stores.git_ref(self.record.id)?;
+    let repositories = self.state.db.partition().repositories();
+    ref_conflict_in(
+      repositories,
+      (content, &git.repository),
+      self.record.id,
+      name,
+      deleted,
+    )
   }
 }
 
