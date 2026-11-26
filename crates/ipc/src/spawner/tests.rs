@@ -429,6 +429,7 @@ fn a_spawns_cost_on_its_calling_thread_is_flat_in_the_daemons_descriptors() {
   // Its bound is drawn from the median at 100 and its own spread below it, which no one slow spawn widens: drawn from the
   // most, one direct spawn of 6.79 ms at 100 (its median 1.54) lifted it past a least of 4.9 ms at 100,000 (MacBook,
   // 2026-11-25, beside the crate's other tests).
+  #[cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "x86_64")))]
   let steady = |least: usize, median: usize| {
     figure(0, median) + figure(0, median).saturating_sub(figure(0, least))
   };
