@@ -212,6 +212,8 @@ pub struct Scratch {
   recent: Recent,
   /// Whether its last read found an entry of its chain among the objects read lately ([`Scratch::found_kept`]).
   found_kept: bool,
+  /// Whether its last read inflated its chain's root, an entry whole in a pack ([`Scratch::base_inflated`]).
+  base_inflated: bool,
 }
 
 impl Scratch {
@@ -226,6 +228,13 @@ impl Scratch {
   /// read cache, which spared it the rest of the chain.
   pub fn found_kept(&self) -> bool {
     self.found_kept
+  }
+
+  /// Whether its last read inflated its chain's root: an entry held whole in a pack, met with nothing of the chain kept
+  /// above it. A read finding an entry kept, or a REF_DELTA's base held whole outside every pack, inflates none. The
+  /// steps it rebuilt over that root are [`Scratch::deltas_applied`]; both the root and every step's result are kept.
+  pub fn base_inflated(&self) -> bool {
+    self.base_inflated
   }
 }
 
@@ -567,6 +576,7 @@ pub fn read(
 ) -> Result<Kind, PackedRefused> {
   scratch.chain.clear();
   scratch.found_kept = false;
+  scratch.base_inflated = false;
   let mut at = place;
   let (kind, base) = loop {
     if let Some((kind, kept)) = scratch.recent.get(at) {
@@ -617,6 +627,7 @@ pub fn read(
   // A base whole in a pack is inflated now; one held whole outside every pack is in `built` already.
   if let Some(link) = base {
     inflate_into(store, link, room, &mut scratch.built)?;
+    scratch.base_inflated = true;
     scratch.recent.keep_copy(link.entry, kind, &scratch.built);
   }
   let Scratch {

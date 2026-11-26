@@ -599,6 +599,8 @@ pub struct Repository {
   last_deltas: std::cell::Cell<u64>,
   /// Whether its last read of a stored object found an entry of its chain kept ([`Repository::last_read_found_kept`]).
   last_found_kept: std::cell::Cell<bool>,
+  /// Whether its last read of a stored object inflated its chain's root whole ([`Repository::last_read_inflated_base`]).
+  last_inflated_base: std::cell::Cell<bool>,
   /// The first let-go piece a read met since its owner last asked ([`Repository::waiting`]): a read that meets one answers
   /// none, and its owner brings the piece back and takes the step again.
   waiting: Cell<Option<packed::Waited>>,
@@ -653,6 +655,7 @@ impl Repository {
       reading: RefCell::new(Scratch::default()),
       last_deltas: std::cell::Cell::new(0),
       last_found_kept: std::cell::Cell::new(false),
+      last_inflated_base: std::cell::Cell::new(false),
       waiting: Cell::new(None),
       largest: 0,
       landings_charged: 0,
@@ -810,6 +813,7 @@ impl Repository {
   ) -> Option<Cow<'s, [u8]>> {
     self.last_deltas.set(0);
     self.last_found_kept.set(false);
+    self.last_inflated_base.set(false);
     match stored {
       StoredAt::Whole(content) => stored_bytes(store, content, len),
       StoredAt::InPack(place) => {
@@ -831,6 +835,7 @@ impl Repository {
           .last_deltas
           .set(u64::try_from(reading.deltas_applied()).unwrap_or(u64::MAX));
         self.last_found_kept.set(reading.found_kept());
+        self.last_inflated_base.set(reading.base_inflated());
         read.ok()?;
         (u64::try_from(out.len()).ok() == Some(len)).then_some(Cow::Owned(out))
       }
@@ -938,6 +943,12 @@ impl Repository {
   /// (`packed::Scratch::found_kept`): a hit of its read cache.
   pub fn last_read_found_kept(&self) -> bool {
     self.last_found_kept.get()
+  }
+
+  /// Whether its last read of a stored object inflated its chain's root, an entry whole in its pack
+  /// (`packed::Scratch::base_inflated`): none for one held whole, kept lately, or a delta whose base was kept.
+  pub fn last_read_inflated_base(&self) -> bool {
+    self.last_inflated_base.get()
   }
 
   /// The most bytes its reads keep of the objects read lately now (`packed::Recent`'s budget).
@@ -2156,6 +2167,7 @@ impl Repository {
       reading: RefCell::new(Scratch::default()),
       last_deltas: std::cell::Cell::new(0),
       last_found_kept: std::cell::Cell::new(false),
+      last_inflated_base: std::cell::Cell::new(false),
       waiting: Cell::new(None),
       largest: self.largest,
       landings_charged: self.landings_charged,
