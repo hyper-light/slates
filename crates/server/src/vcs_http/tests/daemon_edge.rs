@@ -7062,6 +7062,7 @@ fn the_choosing_units_counters_follow_the_negotiations_kinds() {
   ];
   for (at, (kind, name)) in named.iter().enumerate() {
     assert_eq!(UnitKind::ALL[at], *kind);
+    assert!(crate::vcs_store::upload::UNITS_BY_KIND[at].ends_with(&format!(".{name}")));
     assert!(crate::vcs_store::upload::LONG_UNITS[at].ends_with(&format!(".{name}")));
     assert!(crate::vcs_store::upload::UNIT_NS_MOST[at].ends_with(&format!(".{name}")));
   }
@@ -7405,9 +7406,19 @@ fn a_fetchs_read_cache_keeps_every_interleaved_chain_whole() {
     read(crate::vcs_store::upload::READ_CACHE_BUDGET_MOST),
     read(crate::vcs_store::upload::TREE_DELTAS),
   );
+  let open_tree = slates_git::negotiation::UnitKind::ALL
+    .iter()
+    .position(|kind| *kind == slates_git::negotiation::UnitKind::OpenTree)
+    .expect("an open_tree kind");
+  let opened = read(crate::vcs_store::upload::UNITS_BY_KIND[open_tree]);
   daemon.stop();
   eprintln!(
-    "read cache over {trees} tree reads: {hits} hits, widened {widened}, refused {refused}, budget {budget} B, {deltas} deltas applied"
+    "read cache over {trees} tree reads: {hits} hits, widened {widened}, refused {refused}, budget {budget} B, {deltas} deltas applied, {opened} open_tree units"
+  );
+  assert_eq!(
+    opened,
+    u64::try_from(trees).expect("a count"),
+    "every tree read counted among the open_tree units, what the hits are a share of"
   );
   assert_eq!(fetched.0, 200);
   assert_eq!(ids_in(&fetched_pack(&fetched.1)).len(), pushed_pack_objects);
