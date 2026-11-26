@@ -5646,32 +5646,30 @@ impl Green {
     Ok(Some(Effect::Special(path.to_owned(), node)))
   }
 
-  /// The paths whose content ops do not fit the content they edit at the increment's base ([`fits_base`]): a
-  /// created path edits nothing, a renamed-into path edits its source, and a link a node passes to with the work's
-  /// writes edits the node's home ([`Green::handed_home`], A-669).
-  fn unfit_content(&self, inc: &Increment, r: &Resolved) -> Vec<String> {
-    let post_len = inc.post().len();
-    let cleared = r.cleared();
-    r.content
-      .iter()
-      .filter(|(path, ops)| {
-        let edited = r
-          .renames
-          .get(*path)
-          .map(String::as_str)
-          .or_else(|| self.handed_home(r, path, &cleared))
-          .unwrap_or(path.as_str());
-        let base_len = if r.creates.contains(*path) {
-          0
-        } else {
-          self
-            .content_len_at(edited, inc.base)
-            .map_or(0, |len| u64::try_from(len).unwrap_or(u64::MAX))
-        };
-        !fits_base(ops, base_len, post_len)
-      })
-      .map(|(path, _)| path.clone())
-      .collect()
+  /// Whether `path`'s content ops fit the content they edit at the increment's base ([`fits_base`]): a created path
+  /// edits nothing, a renamed-into path edits its source, and a link a node passes to with the work's writes edits the
+  /// node's home ([`Green::handed_home`], A-669). `cleared` is the paths the work removes itself ([`Resolved::cleared`]).
+  fn content_fits(
+    &self,
+    inc: &Increment,
+    r: &Resolved,
+    cleared: &BTreeSet<String>,
+    (path, ops): (&str, &[Op]),
+  ) -> bool {
+    let edited = r
+      .renames
+      .get(path)
+      .map(String::as_str)
+      .or_else(|| self.handed_home(r, path, cleared))
+      .unwrap_or(path);
+    let base_len = if r.creates.contains(path) {
+      0
+    } else {
+      self
+        .content_len_at(edited, inc.base)
+        .map_or(0, |len| u64::try_from(len).unwrap_or(u64::MAX))
+    };
+    fits_base(ops, base_len, inc.post().len())
   }
 
   /// Decides every dimension of an increment, collecting the accepted effects or the conflicts.

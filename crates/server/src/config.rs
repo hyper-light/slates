@@ -160,9 +160,9 @@ pub const LOADED_LATENCY_BAR: Derived<u64> = derived!(
 /// of it. What holds a unit there is each slicing's own size: a copy-bound or hashed slice is half the live quantum at
 /// the machine's measured rate ([`copy_slice_bytes`], [`archive_slice_bytes`]); a paced walk's unit is one key, path or
 /// effect; and a gathered list is sized once at what it gathers, so no unit's extend copies the whole list at a doubling
-/// (A-920 3i: probe 5's gather steps ran a median 0.27 ms past a 1.05 ms quantum before it). Not yet held: an import
-/// judge's first unit, which walks every content path whole (`Green::decide_first`; probe 5: 557 µs median, past 1 ms
-/// in 39 steps; GAPS, A-928). The quantum is the shard's online wake estimate (§4.3), and load grows it: a quiet wake is
+/// (A-920 3i: probe 5's gather steps ran a median 0.27 ms past a 1.05 ms quantum before it); an import judge's first
+/// unit walks its content paths' fit a path a step (A-920 3j: whole, probe 5 read it at 557 µs median, past 1 ms in 39
+/// steps). The quantum is the shard's online wake estimate (§4.3), and load grows it: a quiet wake is
 /// 1.7-10 µs (A-223), while probe 5 read the learned quantum at about 1.05 ms at load 38-56, every step it filled over
 /// the bar. So the ceiling binds only under load.
 pub const STEP_QUANTUM_CEILING: Derived<u64> = derived!(

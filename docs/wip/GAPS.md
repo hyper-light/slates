@@ -614,9 +614,9 @@
 > **Held (A-928, w-svn, 2026-11-25; goal 93, 84a): a shard's step quantum stays under half the loaded bar.** The
 > quantum is the shard's wake estimate, and load grew it: A-920's release probe 5 read it at about 1.05 ms at load 38-56,
 > so every step that filled it passed 1 ms. It is now held to `STEP_QUANTUM_CEILING` (bar / 2, 500 µs), since a step is
-> at most its quantum and the unit begun before its check. Open: that premise, a unit within a quantum, does not yet
-> hold for the import judge's first unit (`Green::decide_first`: 557 µs median, past 1 ms in 39 of probe 5's steps).
-> Owed: main's macOS 84a round, release probe 6 with each step's quantum, and the loaded long-step counts.
+> at most its quantum and the unit begun before its check. That premise, a unit within a quantum, did not hold for the
+> import judge's first unit (`Green::decide_first`: 557 µs median, past 1 ms in 39 of probe 5's steps). A-920 3j now
+> walks it a content path a step. Owed: main's macOS 84a round, release probe 6 with each step's quantum, and the loaded long-step counts.
 
 > **Open (84a, g222, 2026-11-20): where a loaded edit and merge's tail waits — a 1 ms band on macOS and on Linux.**
 > A diagnostic (branches `diag-g222-hops*`, never main) stamped every request from its landing in the ring (A-559) to

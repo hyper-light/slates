@@ -64466,6 +64466,16 @@ GAPS.
   now sized once at every unit's effects (`Green::hold_begin`, the decision's end in `computing.rs`). The hold's end is
   40 µs median, 100 µs at most. Still past a quantum: the judge's first unit (`Green::decide_first`, every content
   path's fit to its base walked whole; 557 µs median, past 1 ms in 39 steps), next.
+  **3j, the judge's first unit.** The first unit (`Green::decide_first`: the work's invalid operations and every
+  content path whose ops do not fit what they edit at its base, A-669's links naming the files it removes its
+  footprint) was one unit, whole, so its step walked every content path with a base-length lookup each. It is now
+  judged over steps. Its first asks whether it is judged at all (`position::Units::judges`, the peek `Units::unit`
+  decides by), so a unit taken as reached costs nothing, and finds the paths the work removes itself, which the
+  cleared phase then reuses. Each content path's fit is then a unit of the walk (`Green::content_fits`), the unfit
+  kept in the decision, and the unit is pushed whole when the walk ends, so the units are the same however it is
+  sliced. Oracle: `a_works_first_unit_walked_a_content_path_a_step_is_its_first_unit_decided_whole` decides a work
+  with fitting and unfitting writes whole and a unit a step. A walk that drops the path a step ends on fails it, and
+  no other test.
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
@@ -64805,8 +64815,8 @@ measured noise of the 100 figure, not a literal.
   step is at most two quanta, and 2q ≤ bar is q ≤ bar / 2. Each slicing's own size holds a unit there: a copy-bound or
   hashed slice is half the live quantum at the machine's measured rate; a paced walk's unit is one key, path or
   effect; and a gathered list is sized once (A-920 3i), so no unit's extend copies the list at a doubling (probe 5's
-  gather ran 0.27 ms past the check before it). One unit is not yet held: the import judge's first
-  (`Green::decide_first`, 557 µs median, past 1 ms in 39 steps; GAPS). A quiet wake is 1.7-10 µs (A-223), so the
+  gather ran 0.27 ms past the check before it). The import judge's first unit was not (`Green::decide_first`,
+  557 µs median, past 1 ms in 39 steps), and A-920 3j walks it a content path a step. A quiet wake is 1.7-10 µs (A-223), so the
   ceiling binds only under load.
 - **Tests.** Red first: `a_wake_learned_past_the_bar_steps_by_the_quantum_ceiling` (`crates/rt/tests/wake_estimate.rs`)
   tracks a shard whose estimate stands at 2 ms, with a 500 µs ceiling. With the field present but unread, its task's

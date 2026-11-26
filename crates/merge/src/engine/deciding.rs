@@ -26,6 +26,10 @@ pub(crate) struct Deciding {
   homes: BTreeSet<String>,
   /// The paths the node-exclusive rule has judged ([`Green::decide_node_exclusive_some`]).
   judged: BTreeSet<String>,
+  /// Whether [`Deciding::cleared`] is found: by the first unit's first step where it is judged, else by its own phase.
+  cleared_found: bool,
+  /// The content paths whose ops do not fit what they edit at the work's base, found so far by the first unit's walk.
+  unfit: Vec<String>,
 }
 
 /// What a phase decides from: the increment and its resolution.
@@ -48,6 +52,7 @@ impl Deciding {
     self.cleared.pop_first().is_some()
       || self.homes.pop_first().is_some()
       || self.judged.pop_first().is_some()
+      || self.unfit.pop().is_some()
   }
 }
 
@@ -101,6 +106,15 @@ const PHASES: [Phase; 17] = [
   Green::decide_node_exclusive_some,
 ];
 
+/// The files the work removes or replaces: the first unit's footprint names the links to them (A-669).
+fn leaving(r: &Resolved) -> Vec<&str> {
+  r.unlinks
+    .iter()
+    .chain(r.renames.keys())
+    .map(String::as_str)
+    .collect()
+}
+
 impl Green {
   /// Decides every dimension of an increment unit by unit into `units` (A-658, `position`): each unit one verdict
   /// function over its own paths, in the order the whole verdict pushes its effects and windows, so the verdict reached
@@ -137,22 +151,67 @@ impl Green {
 
   /// What the work and its base decide: an operation no verdict applies, an edit that does not fit what it edits. The
   /// head decides one thing of it, the file an edit declared at a link edits when the work hands that file's node on to
-  /// the link (A-669), which turns only with the links naming the files the work removes or replaces. One unit, whole.
+  /// the link (A-669), which turns only with the links naming the files the work removes or replaces. One unit, judged
+  /// over steps (A-920 3j): its first asks whether it is judged at all ([`position::Units::judges`]) and finds the paths
+  /// the work removes itself; then each content path's fit to its base is a unit of the walk ([`Green::content_fits`]),
+  /// the unfit kept; and the unit is pushed whole when the walk ends, so the units are the same however it is sliced.
   fn decide_first(&self, from: &DecideIn<'_>, walk: &mut Walk<'_>) -> bool {
+    let r = from.r;
+    if walk.deciding.at == 0 {
+      walk.deciding.at = 1;
+      if !walk
+        .units
+        .judges(&position::Footprint::links_naming(&leaving(r)))
+      {
+        return self.first_unit_pushed(from, walk);
+      }
+      walk.deciding.cleared = r.cleared();
+      walk.deciding.cleared_found = true;
+      if (walk.spent)() {
+        return false;
+      }
+    }
+    for (path, ops) in r.content.range::<str, _>(walk.after()) {
+      if !self.content_fits(
+        from.inc,
+        r,
+        &walk.deciding.cleared,
+        (path.as_str(), ops.as_slice()),
+      ) {
+        walk.deciding.unfit.push(path.clone());
+      }
+      if walk.spent_after(path) {
+        return false;
+      }
+    }
+    self.first_unit_pushed(from, walk)
+  }
+
+  /// The first unit pushed ([`Green::decide_first`]): its windows the work's invalid operations and its unfit content,
+  /// as found by its walk; judged whole here should the units judge it where its first step found they would not.
+  fn first_unit_pushed(&self, from: &DecideIn<'_>, walk: &mut Walk<'_>) -> bool {
     let (inc, r) = (from.inc, from.r);
-    let leaving: Vec<&str> = r
-      .unlinks
-      .iter()
-      .chain(r.renames.keys())
-      .map(String::as_str)
-      .collect();
+    let unfit = core::mem::take(&mut walk.deciding.unfit);
+    let walked = walk.deciding.cleared_found;
     walk
       .units
-      .unit(position::Footprint::links_naming(&leaving), |_| {
+      .unit(position::Footprint::links_naming(&leaving(r)), |_| {
+        let unfit = if walked {
+          unfit
+        } else {
+          let cleared = r.cleared();
+          r.content
+            .iter()
+            .filter(|(path, ops)| {
+              !self.content_fits(inc, r, &cleared, (path.as_str(), ops.as_slice()))
+            })
+            .map(|(path, _)| path.clone())
+            .collect()
+        };
         position::Unit::windows(
           r.invalid
             .iter()
-            .chain(self.unfit_content(inc, r).iter())
+            .chain(unfit.iter())
             .map(|path| Green::window(path, MergeConflictClass::TypeChanged))
             .collect(),
         )
@@ -187,7 +246,10 @@ impl Green {
 
   /// The paths the increment removes itself: a rename over a file and a directory's removal read them.
   fn decide_cleared(&self, from: &DecideIn<'_>, walk: &mut Walk<'_>) -> bool {
-    walk.deciding.cleared = from.r.cleared();
+    if !walk.deciding.cleared_found {
+      walk.deciding.cleared = from.r.cleared();
+      walk.deciding.cleared_found = true;
+    }
     true
   }
 

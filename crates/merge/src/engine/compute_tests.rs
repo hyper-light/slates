@@ -1331,3 +1331,59 @@ fn a_link_removed_after_the_position_meets_the_fit_of_the_writes_handed_to_it() 
     (Answer::Conflict, vec![unfit, gone])
   );
 }
+
+/// The units `inc`'s decision reaches on `green`, each its windows and its count of effects, and the steps it took: whole,
+/// or a unit a step where `sliced`.
+fn decided_units(
+  green: &Green,
+  inc: &Increment,
+  sliced: bool,
+) -> (Vec<(Vec<super::ConflictWindow>, usize)>, u32) {
+  let resolved = Green::resolve(inc);
+  let mut units = super::position::Units::first();
+  let mut deciding = super::deciding::Deciding::default();
+  let mut steps = 1u32;
+  while !green.decide_some(inc, &resolved, (&mut units, &mut deciding), &mut || sliced) {
+    steps = steps.saturating_add(1);
+  }
+  let units = units.into_units().0;
+  let shapes = units
+    .iter()
+    .map(|unit| (unit.windows.clone(), unit.effects.len()))
+    .collect();
+  (shapes, steps)
+}
+
+/// A-920 3j (A-658's first unit, A-669): the first unit holds every content path whose ops do not fit what they edit at
+/// the work's base, a walk of every content path, so it is decided a path a step. Do: decide, whole and a unit a step, a
+/// work at the origin's version whose writes fit two files and fit neither a third (an overwrite past its end), a fourth
+/// (an insert past its end) nor a path with nothing at its base (an insert inside it). Expect the same units, the first
+/// holding the three unfit paths' windows (`TypeChanged`) in path order, and the sliced decision taking more steps than
+/// the work has content paths.
+#[test]
+fn a_works_first_unit_walked_a_content_path_a_step_is_its_first_unit_decided_whole() {
+  let green = Green::with_origin(origin());
+  let mut draft = Draft::default();
+  draft.content(OpKind::Insert, FILES[0], 0, b"A");
+  draft.content(OpKind::Overwrite, FILES[1], 3, b"0123456789");
+  draft.content(OpKind::Insert, FILES[2], 99, b"C");
+  draft.content(OpKind::Insert, FILES[3], 1, b"D");
+  draft.content(OpKind::Insert, "zz", 2, b"Z");
+  let inc = increment(draft, green.head(), 1);
+  let (whole, _) = decided_units(&green, &inc, false);
+  let (sliced, steps) = decided_units(&green, &inc, true);
+  assert_eq!(sliced, whole);
+  let unfit: Vec<(String, MergeConflictClass)> = whole
+    .first()
+    .expect("a first unit")
+    .0
+    .iter()
+    .map(|window| (window.path.clone(), window.class))
+    .collect();
+  let expected: Vec<(String, MergeConflictClass)> = [FILES[1], FILES[2], "zz"]
+    .iter()
+    .map(|path| ((*path).to_owned(), MergeConflictClass::TypeChanged))
+    .collect();
+  assert_eq!(unfit, expected);
+  assert!(steps > 5, "{steps} steps");
+}
