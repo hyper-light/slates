@@ -841,6 +841,9 @@ pub(crate) enum HoldBegun {
 /// head, their effects and windows gathered so far.
 pub(crate) struct Holding {
   units: std::vec::IntoIter<position::Unit>,
+  /// The effects of the unit being gathered not yet moved, an effect a unit of the walk (A-920 3k): one unit can hold
+  /// most of a work's effects (its copies' is one unit whole), and moved in one extend it was the gathering's step.
+  gathering: std::vec::IntoIter<Effect>,
   effects: Vec<Effect>,
   windows: Vec<ConflictWindow>,
   /// What the chain records of the effects, where it was reached at the head with nothing since.
@@ -2142,14 +2145,18 @@ fn named_files(
     .collect()
 }
 
+/// What the preparation keeps of its sole runs as it finds them ([`note_sole`]): each file's place and run, each run's
+/// count of files, and each whole object's file and name.
+type SoleNotes<'n> = (
+  &'n mut Vec<(usize, usize)>,
+  &'n mut BTreeMap<usize, usize>,
+  &'n mut Vec<(usize, crate::named::Identity)>,
+);
+
 /// The file at `place`, made of run `found` alone, kept as the preparation finds it ([`Prep::Sole`]): its run, its
 /// run's count of files ([`alone`]'s), and its name where the run is its object whole ([`named_files`]'s).
 fn note_sole(
-  (sole, files_of, names): (
-    &mut Vec<(usize, usize)>,
-    &mut BTreeMap<usize, usize>,
-    &mut Vec<(usize, crate::named::Identity)>,
-  ),
+  (sole, files_of, names): SoleNotes<'_>,
   (place, found): (usize, usize),
   runs: &[crate::named::NamedRun],
 ) {
@@ -5642,32 +5649,30 @@ impl Green {
     Ok(Some(Effect::Special(path.to_owned(), node)))
   }
 
-  /// The paths whose content ops do not fit the content they edit at the increment's base ([`fits_base`]): a
-  /// created path edits nothing, a renamed-into path edits its source, and a link a node passes to with the work's
-  /// writes edits the node's home ([`Green::handed_home`], A-669).
-  fn unfit_content(&self, inc: &Increment, r: &Resolved) -> Vec<String> {
-    let post_len = inc.post().len();
-    let cleared = r.cleared();
-    r.content
-      .iter()
-      .filter(|(path, ops)| {
-        let edited = r
-          .renames
-          .get(*path)
-          .map(String::as_str)
-          .or_else(|| self.handed_home(r, path, &cleared))
-          .unwrap_or(path.as_str());
-        let base_len = if r.creates.contains(*path) {
-          0
-        } else {
-          self
-            .content_len_at(edited, inc.base)
-            .map_or(0, |len| u64::try_from(len).unwrap_or(u64::MAX))
-        };
-        !fits_base(ops, base_len, post_len)
-      })
-      .map(|(path, _)| path.clone())
-      .collect()
+  /// Whether `path`'s content ops fit the content they edit at the increment's base ([`fits_base`]): a created path
+  /// edits nothing, a renamed-into path edits its source, and a link a node passes to with the work's writes edits the
+  /// node's home ([`Green::handed_home`], A-669). `cleared` is the paths the work removes itself ([`Resolved::cleared`]).
+  fn content_fits(
+    &self,
+    inc: &Increment,
+    r: &Resolved,
+    cleared: &BTreeSet<String>,
+    (path, ops): (&str, &[Op]),
+  ) -> bool {
+    let edited = r
+      .renames
+      .get(path)
+      .map(String::as_str)
+      .or_else(|| self.handed_home(r, path, cleared))
+      .unwrap_or(path);
+    let base_len = if r.creates.contains(path) {
+      0
+    } else {
+      self
+        .content_len_at(edited, inc.base)
+        .map_or(0, |len| u64::try_from(len).unwrap_or(u64::MAX))
+    };
+    fits_base(ops, base_len, inc.post().len())
   }
 
   /// Decides every dimension of an increment, collecting the accepted effects or the conflicts.
@@ -6952,17 +6957,24 @@ impl Green {
         (units, unchanged.then_some(applied))
       }
     };
+    // Sized once at every unit's effects: a list grown as they are gathered copied itself whole at each doubling, the
+    // unit that ran past the step's check (A-920 3i: probe 5's gather steps a median 0.27 ms past a 1.05 ms quantum).
+    let effects = units
+      .iter()
+      .map(|unit| unit.effects.len())
+      .fold(0usize, usize::saturating_add);
     HoldBegun::Holding(Holding {
       units: units.into_iter(),
-      effects: Vec::new(),
+      gathering: Vec::new().into_iter(),
+      effects: Vec::with_capacity(effects),
       windows: Vec::new(),
       reached,
       check_reads,
     })
   }
 
-  /// One step of `holding` ([`Green::hold_begin`]): each unit's effects and windows gathered in order, a unit at least,
-  /// until `spent` ([`position::verdict`]'s walk); once every unit is, the verdict held, or a conflict cached, in this
+  /// One step of `holding` ([`Green::hold_begin`]): each unit's windows and its effects gathered in order, an effect a
+  /// unit of the walk (an effectless unit one), until `spent` ([`position::verdict`]'s walk); once every unit is, the verdict held, or a conflict cached, in this
   /// last step alone ([`Green::hold_end`]).
   pub(super) fn holding_step(
     &mut self,
@@ -6970,14 +6982,22 @@ impl Green {
     holding: &mut Holding,
     spent: &mut dyn FnMut() -> bool,
   ) -> Option<Judgment> {
-    while let Some(unit) = holding.units.next() {
-      holding.effects.extend(unit.effects);
+    loop {
+      for effect in holding.gathering.by_ref() {
+        holding.effects.push(effect);
+        if spent() {
+          return None;
+        }
+      }
+      let Some(unit) = holding.units.next() else {
+        return Some(self.hold_end(inc, holding));
+      };
       holding.windows.extend(unit.windows);
-      if holding.units.len() > 0 && spent() {
+      holding.gathering = unit.effects.into_iter();
+      if holding.gathering.len() == 0 && spent() {
         return None;
       }
     }
-    Some(self.hold_end(inc, holding))
   }
 
   /// `holding`'s verdict once every unit is gathered: accepted and held where no unit holds a window (its commit's reads

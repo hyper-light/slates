@@ -326,6 +326,16 @@ impl Units {
     self.done.push(unit);
   }
 
+  /// Whether the next unit, whose verdict reads `footprint`, is judged ([`Units::unit`]): on a first judgment, where no
+  /// unit was reached at the earlier head, or where something it reads changed since. A unit judged over more than one
+  /// step asks it at its first (A-920 3j, `Green::decide_first`), so a unit taken as reached costs nothing.
+  pub(super) fn judges(&self, footprint: &Footprint<'_>) -> bool {
+    match self.prior.as_ref() {
+      None => true,
+      Some((units, since)) => units.as_slice().first().is_none() || since.meets(footprint),
+    }
+  }
+
   /// A unit whose verdict reads `footprint`: taken as reached when nothing it reads changed since, else judged
   /// (`judge`, handed the earlier head and where a content edit's ops stood there when it is judged again).
   pub(super) fn unit(

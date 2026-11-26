@@ -66,6 +66,7 @@ fn capped_config() -> RuntimeConfig {
       idle_ratio: INFLATED_RATIO,
       idle_floor_ns: NO_IDLE_FLOOR_NS,
       idle_ceiling_ns: CEILING_NS,
+      quantum_ceiling_ns: slates_rt::runtime::NO_QUANTUM_CEILING_NS,
     }),
     ..config_with_window(CEILING_NS)
   }

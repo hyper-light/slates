@@ -1040,8 +1040,9 @@ volume requires a matching profile), `MeasurementTimeout`.
 **Derived constants.** Spin window = wake_ns.mean (Karlin: the 2-competitive threshold is the
 expected cost of parking, and the wake's heavy tail is part of that cost, not noise), the runtime's own
 spin-then-park; the daemon's idle window is §4.7's, which no estimate prices on Linux and macOS (A-223); the cooperative
-step quantum = wake_ns.mean — both as the prior of the online estimate a shard and a client refine
-from their own confirmed wakes (A-31), weighted over about 2^shift wakes with shift =
+step quantum = wake_ns.mean, at most half 84a's 1 ms loaded bar (A-928: a step is at most its quantum and the unit
+begun before its check, a unit within a quantum, so two quanta within the bar) — both as the prior of the online
+estimate a shard and a client refine from their own confirmed wakes (A-31), the estimate itself unbent by the ceiling, weighted over about 2^shift wakes with shift =
 ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉, the sample size at which the estimate is as
 precise as the probe asks of itself; shard count = performance-class physical cores minus one control core
 (minimum one); ring depth = ceil(arrival_rate × service_time × safety) from measured rates with a
@@ -64470,6 +64471,33 @@ GAPS.
   at a time before the reach begins (`Resolved::release_one`, its copies' resolution last; `Deciding::release_one`),
   until the step is spent. In debug the judge's third step over 1 ms is gone (2 runs, load 22-32): its steps past 1
   ms are its first unit (3.9) and its second (1.1-1.2, 0.33 ms in release).
+  **3i, the gathered lists sized once.** Release probe 5 (99 runs on 352866fca with each part timed, load 38-56) put
+  554 steps of every label over 1 ms. Two causes. First, the learned quantum itself was about 1.05 ms, which A-928
+  holds to half the bar. Second, the judge's gathering ran a median 0.27 ms past it (gather the largest part in 93 of
+  172 judge steps over 1 ms, median 1,320 µs): the list a held verdict gathers its units' effects into, and the one the
+  reach maps them into, grew as they were gathered, so the unit that crossed a doubling copied the whole list. Both are
+  now sized once at every unit's effects (`Green::hold_begin`, the decision's end in `computing.rs`). The hold's end is
+  40 µs median, 100 µs at most. Still past a quantum: the judge's first unit (`Green::decide_first`, every content
+  path's fit to its base walked whole; 557 µs median, past 1 ms in 39 steps), next.
+  **3j, the judge's first unit.** The first unit (`Green::decide_first`: the work's invalid operations and every
+  content path whose ops do not fit what they edit at its base, A-669's links naming the files it removes its
+  footprint) was one unit, whole, so its step walked every content path with a base-length lookup each. It is now
+  judged over steps. Its first asks whether it is judged at all (`position::Units::judges`, the peek `Units::unit`
+  decides by), so a unit taken as reached costs nothing, and finds the paths the work removes itself, which the
+  cleared phase then reuses. Each content path's fit is then a unit of the walk (`Green::content_fits`), the unfit
+  kept in the decision, and the unit is pushed whole when the walk ends, so the units are the same however it is
+  sliced. Oracle: `a_works_first_unit_walked_a_content_path_a_step_is_its_first_unit_decided_whole` decides a work
+  with fitting and unfitting writes whole and a unit a step. A walk that drops the path a step ends on fails it, and
+  no other test.
+  **3k, a unit's effects an effect at a time.** With each step's quantum printed (a debug probe at 4e048d71d, where the
+  test daemon's quantum is 4 µs, so every step is one unit), the gathering's one long step was one unit, 1,058 µs:
+  a unit can hold most of a work's effects (its copies' is one unit whole), and the hold moved them in one extend
+  and the reach mapped them in one go (probe 5's reach: 592 µs median, 978 at most). Both now walk a unit's effects
+  an effect a unit (`Holding::gathering`, `Reaching::effect_at`), a unit's windows taken as it is begun. Oracles: the
+  applying and named oracles' judges a unit a step fail when the gathering drops the effect a step ends on. A reach
+  that dropped it failed no test, so `a_verdict_reached_an_effect_a_step_records_what_the_verdict_reached_whole_does`
+  now compares what the chain records of a work computed whole and a unit a step: red with that drop (none against
+  five), green without.
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
@@ -64790,3 +64818,37 @@ measured noise of the 100 figure, not a literal.
 - **Models.** None of `docs/wip/models/` models a give-up's record or a verb's refusal of it; no spec changed.
 - **Applied in the same change to:** `crates/server/src/{state,repository,merge_service,verbs}.rs`,
   `crates/server/src/repository/push.rs` and its tests, A-304's entry, GAPS (A-915's entry).
+
+### A-928 — A shard's step quantum is its wake estimate held to half 84a's loaded bar (2026-11-25, w-svn for main 01a20182, its rulings of 2026-11-25 on release probe 5 (a) and (b); goal 93, 84a; amends §4.3's derived quantum and A-31)
+
+- **Why.** A step runs to the first check at or past its quantum, so it is one quantum and the unit begun before that
+  check. The quantum is the shard's online wake estimate (§4.3, A-31), seeded with the boot probe's mean wake, and the
+  daemon's fixed step budget is that mean too. Load delays wakes, so it grows both, and nothing bounded them. In A-920's
+  release probe 5 (99 runs, load 38-56) the learned quantum read about 1.05 ms: every step that filled it, of every
+  label, was past 84a's 1 ms loaded bar, which goal 93 holds each step to. 554 steps were over 1 ms. While the quantum
+  stands above the bar, no slicing meets it.
+- **The change.** `WakeTracking::quantum_ceiling_ns` bounds `ShardContext::quantum_ns`, the estimate min the ceiling,
+  so the harvest cadence, the long-step count and every cooperative slice (`step_budget_ns`,
+  `DaemonConfig::step_quantum_ns`) read the bounded quantum. `wake_cost_ns` stays the estimate, since what a wake
+  costs (a hold's pay-off, the counters, the pulse) is not a step's length. The daemon derives the ceiling as
+  `STEP_QUANTUM_CEILING = LOADED_LATENCY_BAR / 2 = 500 µs` and holds its fixed step budget to it too, so the boot's
+  slices are sized by it. The runtime's own configuration has no ceiling (`NO_QUANTUM_CEILING_NS`).
+- **The formula and its premise.** A step is at most its quantum plus one unit. A unit is sized within a quantum, so a
+  step is at most two quanta, and 2q ≤ bar is q ≤ bar / 2. Each slicing's own size holds a unit there: a copy-bound or
+  hashed slice is half the live quantum at the machine's measured rate; a paced walk's unit is one key, path or
+  effect; and a gathered list is sized once (A-920 3i), so no unit's extend copies the list at a doubling (probe 5's
+  gather ran 0.27 ms past the check before it). The import judge's first unit was not (`Green::decide_first`,
+  557 µs median, past 1 ms in 39 steps), and A-920 3j walks it a content path a step. A quiet wake is 1.7-10 µs (A-223), so the
+  ceiling binds only under load.
+- **Tests.** Red first: `a_wake_learned_past_the_bar_steps_by_the_quantum_ceiling` (`crates/rt/tests/wake_estimate.rs`)
+  tracks a shard whose estimate stands at 2 ms, with a 500 µs ceiling. With the field present but unread, its task's
+  `step_budget_ns` was `Some(2000000)` against `Some(500000)`. It now reads the ceiling, the wake cost stays 2 ms, and
+  a shard with no ceiling steps by its estimate. `a_quantum_learned_past_the_loaded_bar_is_held_to_half_of_it` (server
+  `config`) holds a 2 ms boot's budget to the ceiling and leaves a 10 µs boot's its own, both estimates ceilinged.
+- **Owed:** main's macOS 84a round, since the ceiling changes loaded latency; release probe 6, each step judged against
+  the quantum it ran under; and the loaded long-step counts, which a smaller loaded quantum can raise.
+- **Models.** None of `docs/wip/models/` models the step quantum; no spec changed.
+- **Applied in the same change to:** `crates/rt/src/runtime.rs` (`WakeTracking`, `NO_QUANTUM_CEILING_NS`),
+  `crates/rt/src/shard.rs` (`quantum_ns`, `wake_cost_ns`), `crates/server/src/config.rs` (`LOADED_LATENCY_BAR`,
+  `STEP_QUANTUM_CEILING`, `hold_quantum_to_bar`), `crates/merge/src/engine.rs` and `engine/computing.rs` (A-920 3i's
+  sizing), §4.3's derived constants, A-920's 3i, GAPS (84a's step quantum).

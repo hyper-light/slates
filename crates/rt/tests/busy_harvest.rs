@@ -48,6 +48,7 @@ fn config() -> RuntimeConfig {
       idle_ratio: WINDOW_NS / PRIOR_WAKE_NS,
       idle_floor_ns: NO_IDLE_FLOOR_NS,
       idle_ceiling_ns: WINDOW_NS,
+      quantum_ceiling_ns: slates_rt::runtime::NO_QUANTUM_CEILING_NS,
     }),
   }
 }
