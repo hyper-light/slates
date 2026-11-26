@@ -641,10 +641,12 @@
 > (`docs/bugs/2026-11-20-a-shards-idle-spin-took-a-clients-kick.md`).
 
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
-> the landing's entry are sliced (A-920 pieces 1-6b), and the checkpoint's identity fold takes at most the step ceiling a
+> the landing's entry are sliced (A-920 pieces 1-6b, 7a), and the checkpoint's identity fold takes at most the step ceiling a
 > turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history
 > task (debug, 9,000 files): the tail's `fold_to_readers` (7.6 ms), the register's op
-> (`publish_held_increments` and `record_all`, 8 ms), and a turn (19 ms); its longest landing poll 28-76 ms a run. Owed:
+> (`publish_held_increments` and `record_all`, 8 ms), and a turn's close (`close_revision`, 20.4 ms whole; A-920 7b
+> next; its parse is an event a unit since 7a, a 68 KB slice a call having been 3.9-5.3 ms); its longest landing poll
+> 28-76 ms a run. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
 > files): `made_commit.rs` (two calls), `vcs_store/svn_made.rs`, `vcs_store/hg_made.rs`, `greens.rs`'s own caller. A
