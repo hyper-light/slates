@@ -363,8 +363,8 @@ pub(crate) fn create_on(
 pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   Allowed {
     fixture: "test_store::audit_on_stored_shard",
-    owner: "each history's (GAPS: svn 0, git 25, hg 32, other 109)",
-    reaching: 166,
+    owner: "each history's (GAPS: svn 0, git 2, hg 32, other 94)",
+    reaching: 128,
   },
   Allowed {
     fixture: "test_store::create",
@@ -405,11 +405,6 @@ pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
     fixture: "repository::import::tests::served",
     owner: "w-hg (repository::import::tests 1)",
     reaching: 1,
-  },
-  Allowed {
-    fixture: "git_push::tests::git_repository",
-    owner: "w-git",
-    reaching: 41,
   },
   Allowed {
     fixture: "git_push::tests::carry_blocking",

@@ -1158,18 +1158,21 @@
 >   bare runtime runs on the test's thread and is not refused. The fixtures still blocking are named in
 >   `test_store::SHARD_BLOCKING_ALLOWED`, each with its owner and how many sites reach it, and run their blocking body
 >   through `allowing_shard_blocking`; there is no global off-switch. The list only shrinks.
->   **The shard-blocking allow-list: 11 fixtures** (a test holds the list's length to this figure; edit both together):
->   - `test_store::audit_on_stored_shard`: 166 sites. svn 0; git 25 (`git_push/tests.rs` 23, `git_hooks/tests.rs` 2);
->     hg 32 (`hg_push/tests.rs` 15, `hg_view/tests.rs` 10, `hg_import/tests.rs` 7); other 109 (`push/tests.rs` 18,
->     `vcs_store/tests.rs` 16, `upload/tests.rs` 12, `paths/tests.rs` 11, `repository.rs` 10, `vcs_share/tests.rs` 9,
->     `commits/tests.rs` 8, `identities/tests.rs` 8, `vcs_share/grants.rs` 4, `vcs_share/read_backs.rs` 3,
->     `index_upkeep.rs` 2, `vcs_share/wait.rs` 2, `import/tests.rs` 2, `fleet.rs` 2, `replica.rs` 1,
->     `named_objects.rs` 1).
+>   **The shard-blocking allow-list: 10 fixtures** (a test holds the list's length to this figure; edit both together):
+>   - `test_store::audit_on_stored_shard`: 128 sites. svn 0; git 2 (`git_hooks/tests.rs` 2); hg 32 (`hg_push/tests.rs`
+>     15, `hg_view/tests.rs` 10, `hg_import/tests.rs` 7); other 94 (`push/tests.rs` 18, `vcs_store/tests.rs` 14,
+>     `upload/tests.rs` 12, `paths/tests.rs` 11, `repository.rs` 10, `commits/tests.rs` 8, `identities/tests.rs` 8,
+>     `vcs_share/grants.rs` 4, `vcs_share/read_backs.rs` 3, `index_upkeep.rs` 2, `import/tests.rs` 2, `fleet.rs` 2).
+>     Moved by w-git (2026-11-25) to `git_push::tests::on_stored_shard_with`, which makes a history's git repositories
+>     from the test's thread first: `git_push/tests.rs` 23, `vcs_share/tests.rs` 9, `vcs_share/wait.rs` 2,
+>     `vcs_store/tests.rs` 2, `replica.rs` 1, `named_objects.rs` 1.
 >   - `test_store::create` (a creation landed in an observation or a shard task, outside that runner): 39 tests. hg 16
 >     (`hg_made` 10, `vcs_ssh` 4, `hg_import` 2); other 23 (`daemon::tests` 6, `repository::push` 5,
 >     `vcs_http::daemon_edge` 5, `repository::import` 2, `vcs_share` 2, `identities` 1, `repository::tests` 1,
 >     `vcs_store::upload` 1).
->   - `git_push::tests::git_repository` (41 sites) and `git_push::tests::carry_blocking` (8): w-git.
+>   - `git_push::tests::carry_blocking` (8): w-git. (`git_push::tests::git_repository`, 41 sites, emptied and removed
+>     by w-git: each caller makes its repository from the test's thread, `git_repository_on`, or through
+>     `on_stored_shard_with`.)
 >   - w-hg's push and import helpers, counted by the tests refused without each once the entries above let them
 >     through: `repository::hg_push::land_stored` (2 tests, `vcs_ssh::tests::hg`),
 >     `repository::hg_push::land_in` (1, `hg_made`), `vcs_store::commits::home_and_land_blocking` (7: `commits` 6,
