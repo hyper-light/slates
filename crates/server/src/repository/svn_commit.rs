@@ -1673,6 +1673,7 @@ struct Building<'b> {
 
 /// A build's own state between its steps ([`Building::detach`]), without the records, the engine or the checked
 /// revision it borrows, which each step lends it again ([`Building::attach`]).
+#[derive(Default)]
 pub(super) struct BuildState {
   /// The next row to build.
   at: usize,
@@ -1692,14 +1693,6 @@ pub(super) struct BuildState {
   plans: restore::CopyPlans,
   /// The green paths a copy from an older revision sets back.
   restores: BTreeMap<String, restore::Restore>,
-}
-
-/// What a step of [`Building::step`] left.
-pub(super) enum BuildStep {
-  /// Rows left to build, at the next step.
-  More(Box<BuildState>),
-  /// Built: the increment.
-  Built(Increment),
 }
 
 impl<'b> Building<'b> {
@@ -1799,15 +1792,17 @@ impl<'b> Building<'b> {
   /// the revision removes and restores, and the increment based at `head`, identified by `id`.
   pub(super) fn step(
     (records, engine, checked): (&'b Repository, &'b Green, &'b Checked),
-    state: BuildState,
+    state: &mut BuildState,
     spent: &mut dyn FnMut() -> bool,
     (head, id): (u64, [u8; 32]),
-  ) -> Result<BuildStep, Uncommitted> {
-    let mut building = Building::attach((records, engine, checked), state);
+  ) -> Result<Option<Increment>, Uncommitted> {
+    // The state stays where its owner keeps it between steps, taken up for this one and put back where rows remain.
+    let mut building = Building::attach((records, engine, checked), core::mem::take(state));
     if !building.rows_some(spent)? {
-      return Ok(BuildStep::More(Box::new(building.detach())));
+      *state = building.detach();
+      return Ok(None);
     }
-    building.finish(head, id).map(BuildStep::Built)
+    building.finish(head, id).map(Some)
   }
 
   /// The post-state sized once at the length of every text the rows set that is not named (`Building::insert`), so no
