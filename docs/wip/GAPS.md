@@ -3587,9 +3587,10 @@
 > choosing the engine and level, each answer charged at its engine's bound; `getbundle` judging bundle capabilities
 > before what is missing, in 7.2's order (a bundle1 client was sent a bundle2 abort for a head the view lacked); the
 > daemon's site (`vcs_http::hg`): hgweb's route, git's credentials (A-625 part 3's record), a proven request moved to
-> its repository's shard, the policy in hgweb's order, `503` for hgweb's pages and for a repository whose store the
-> shard lacks (until the site is handed A-662's stores, after which that path goes), the media type named as the reply
-> begins. `slates-hg --lib` 306 of 306, the 13 captured exchanges among them, and `slates-server --lib vcs_http` 40 of
+> its repository's shard, the policy in hgweb's order, `503` for hgweb's 20 non-wire views (and `400` for unknown,
+> empty, or bare `?cmd=`, hardened in A-893 alongside 40-hex node-preserving bundle2 push errors, stage-race-only
+> `error:pushraced` via `AheadRefusal::{NoCapacity, Raced, Corrupt}`, and SSH out-of-band refusal on incomplete EOF),
+> the media type named as the reply begins. `slates-hg --lib` 306 of 306, the 13 captured exchanges among them, and `slates-server --lib vcs_http` 40 of
 > 40 on macOS arm64 (Mac Studio, kiln r137, 2026-11-19); the other platforms owed.
 > **Built (A-675):** the daemon's import of a Mercurial repository's directory (`slates-server`'s
 > `vcs_store::hg_import`): started into a repository's empty store, advanced a turn at a time on its owner shard within
