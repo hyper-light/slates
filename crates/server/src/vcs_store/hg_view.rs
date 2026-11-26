@@ -147,6 +147,12 @@ pub(crate) fn walks_noted(state: &mut crate::state::ShardState, index: &slates_h
 /// Counter: the asks a fetch's streamed answer made of the node's changeset store ([`answer_store_wants`]), each a
 /// batch of rows or of chunks. Format: a counter name in the status report.
 pub(crate) const STORE_ASKS: &str = "vcs_store.hg_stream_store_asks";
+/// Counter: the step bytes each of those asks was sized by (`text_bytes_a_step`: half the shard's step quantum at the
+/// machine's memcpy rate, the quantum the shard's own wake estimate), summed: over [`STORE_ASKS`], the mean, which sizes a
+/// fetch's read-ahead and the slices a text made whole is read in, so asks and turns grow as it shrinks (main's 57k table
+/// at 459c07141: asks 2,508 and turns 1,326 against 1,140 and 669 with every manifest path the same). Format: a counter
+/// name in the status report.
+pub(crate) const STORE_ASK_STEP_BYTES: &str = "vcs_store.hg_store_ask_step_bytes";
 
 /// Counter: the file revisions a pull sent whole against the null base, each a text the store made from its chain since
 /// its stored base was neither on the client nor sent earlier in the answer (A-767 C1 step 1b, main's ruling of
@@ -337,6 +343,7 @@ where
     let (tags, bases) = (wants.reads_tags(), wants.reads_bases());
     let _ = lender.lend(|state| {
       state.count(STORE_ASKS, 1);
+      state.count(STORE_ASK_STEP_BYTES, step);
       state.count(STORE_WAIT_NS, waited);
       count_owner_waits(state, &owner);
       state.count(TEXT_REQUESTS, asks.requests);

@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 const CHANGESETS: u64 = 2_000;
 
 /// Format: the counters of a fetch's store asks, the owner's split of them after the first two.
-const COUNTERS: [&str; 24] = [
+const COUNTERS: [&str; 25] = [
   "vcs_store.hg_fetch_manifest_stored_parent_delta",
   "vcs_store.hg_fetch_manifest_at_hand_delta",
   "vcs_store.hg_fetch_manifest_at_hand_whole",
@@ -50,6 +50,7 @@ const COUNTERS: [&str; 24] = [
   "vcs_store.hg_stream_turns",
   "vcs_store.hg_replay_wants",
   "vcs_store.hg_replay_window_most",
+  "vcs_store.hg_store_ask_step_bytes",
 ];
 
 /// Format: what a push's tail still moves after its `hg push` returned (its segments' landings and let-go, its records'
@@ -187,6 +188,13 @@ fn what_a_whole_mercurial_clone_waits_on_when_it_asks_the_store() {
   for name in COUNTERS {
     println!("hg_clone_store_wait: {name} +{}", moved(name));
   }
+  // The step a store ask was sized by, on average: what sizes the read-ahead and a text's slices (asks grow as it shrinks).
+  println!(
+    "hg_clone_store_wait: a store ask's step {} bytes on average",
+    moved("vcs_store.hg_store_ask_step_bytes")
+      .checked_div(moved("vcs_store.hg_stream_store_asks"))
+      .unwrap_or(0)
+  );
   let total = moved("vcs_store.hg_owner_total_ns").max(1);
   for part in ["behind", "wake", "serve", "disk", "back"] {
     let ns = moved(&format!("vcs_store.hg_owner_{part}_ns"));
