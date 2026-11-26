@@ -2532,3 +2532,47 @@ fn a_plans_step_is_refused_once_a_revision_was_appended_after_it_began() {
     }
   );
 }
+
+/// A-920 2d (`Index::plan_step`'s rows put in path order a unit at a time, with no sort of the whole). Do: plan after
+/// `trunk`, whole and a unit a step, a record listing its rows out of path order (an added directory and file between
+/// the edits of two files, the later path first); then a record listing one path twice. Expect the first's two plans
+/// the same, and more units taken than the record has rows (each row's check, run, merge, apply and sort); the second
+/// refused `Duplicate` at that path both ways.
+#[test]
+fn a_record_listed_out_of_path_order_plans_a_unit_a_step_as_whole() {
+  let index = trunk();
+  let rows = vec![
+    edit("/trunk/lib/a.c", 3),
+    add_dir("/tags"),
+    add_file("/tags/notes", 4),
+    edit("/trunk/README", 5),
+  ];
+  let record = || RevisionRecord {
+    transaction: TRANSACTION.to_owned(),
+    changes: rows.clone(),
+  };
+  let whole = index.plan(record(), ALL_ROOM).unwrap();
+  let sliced = planned_a_row_a_step(&index, record(), ALL_ROOM).unwrap();
+  assert_eq!(format!("{whole:?}"), format!("{sliced:?}"));
+  assert!(
+    sliced.units() > rows.len() as u64,
+    "{} units",
+    sliced.units()
+  );
+  let twice = || RevisionRecord {
+    transaction: TRANSACTION.to_owned(),
+    changes: vec![
+      edit("/trunk/README", 6),
+      edit("/trunk/lib/a.c", 7),
+      edit("/trunk/README", 8),
+    ],
+  };
+  let duplicate = IndexRefusal::Duplicate {
+    path: "/trunk/README".to_owned(),
+  };
+  assert_eq!(index.plan(twice(), ALL_ROOM).unwrap_err(), duplicate);
+  assert_eq!(
+    planned_a_row_a_step(&index, twice(), ALL_ROOM).unwrap_err(),
+    duplicate
+  );
+}

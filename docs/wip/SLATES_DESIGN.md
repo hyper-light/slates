@@ -64337,6 +64337,23 @@ GAPS.
   finish taken at the next. Each is still whole (3.4-4.4 ms a unit in debug at a 4 µs quantum); release probe 7 reads
   them. No test observes which step a whole part runs in; the dump oracle with every check a unit a step holds the
   history.
+  **2d, the plan a unit a step.** Release probe 7 (99 runs at 67db69be9): the check's only steps over 1 ms were 2c's
+  whole parts alone in their steps (5 steps, 1,013-1,122 µs, at a quantum of 4-16 µs). `Index::plan_begin` now checks
+  the transaction's name and makes the new root, nothing more. `Index::plan_step` takes the rest a unit at a time:
+  - each row checked, as `Index::plan` checks it;
+  - the rows put in path order with no sort of the whole (`RowOrder`): their sorted runs found a row a unit (a dump
+    lists a revision's paths in path order), then merged by a heap of the runs a row a unit, a path met twice refused
+    `Duplicate` where its two rows meet;
+  - the rows applied in that order;
+  - the revision's paths numbered a path a unit, each event checked against the paths numbered so far (which is
+    `check_plan`'s check, made as each is numbered);
+  - its maps' bytes summed a map a unit;
+  - the rows put in path order in place, a swap a unit, then the plan checked against the room.
+
+  Counter: `Planned::units`, the units a plan took, more than its rows. Oracles: the proptest of a record planned a row
+  a step against whole, the dump oracle, and `a_record_listed_out_of_path_order_plans_a_unit_a_step_as_whole` (rows out
+  of path order, and a path listed twice refused alike both ways). Planted: a merge that drops its second row fails the
+  commit drive's and the index's tests.
 - **Piece 3, the judge** (89-92 ms at 9,000 files after piece 1: the reservation's history walk 19.6 ms and changes
   walk 10.9, `resolve` 11.6, `decide_units` 24.5, `Reached::of` 1.5, `position::verdict` 2.6, `commit_reads` 15.3),
   in parts. **3a, the commit's reads.** `commit_reads` is the check the commit's own preparation makes a slice at a
