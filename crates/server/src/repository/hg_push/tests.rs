@@ -414,6 +414,44 @@ pub(crate) async fn pushed_changegroup(id: RepositoryId, part: ChangegroupPart) 
   );
 }
 
+/// Ruling R, its first piece's counter (main's order of 2026-11-26: a segment's bytes by section, read from the status
+/// report). Do: on a stored shard push three changesets, each adding a file. Expect: the push accepted and its segments'
+/// landed bytes counted by section: the `Payload` bytes exactly the bytes its deltas' chunks took
+/// (`vcs.hg.segment_compress_stored_bytes`, counted as the chunks were made), and the `Record` and `Texts` bytes moved.
+/// Red before: nothing counted a landed segment's sections.
+#[test]
+fn a_pushs_landed_segments_are_counted_by_section() {
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = Hg::made("sections").await;
+    let made = history_of(&[
+      ("base", "a", b"alpha\n", None, "default"),
+      ("second", "b", b"beta\n", Some(0), "default"),
+      ("third", "c", b"gamma\n", Some(1), "default"),
+    ]);
+    let outcome = pushed_bytes_to(
+      hg.repository,
+      &crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0, 1, 2]),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Accepted(_)), "{outcome:?}");
+    let counted = crate::repository::svn_commit::tests::on(|state| {
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        count(crate::repository::hg_run::LANDED_RECORD_BYTES),
+        count(crate::repository::hg_run::LANDED_PAYLOAD_BYTES),
+        count(crate::repository::hg_run::LANDED_TEXTS_BYTES),
+        count(super::COMPRESS_STORED_BYTES),
+      )
+    });
+    let (record, payload, texts, chunked) = counted;
+    assert_eq!(payload, chunked, "the payload is its chunks: {counted:?}");
+    assert!(
+      record > 0 && payload > 0 && texts > 0,
+      "each section counted: {counted:?}"
+    );
+  });
+}
+
 /// Bookmark `mark` pushed to repository `id` at `node` alone (a `bookmarks` part, as `hg push -B` sends one for a
 /// changeset the server holds): the push's answer.
 pub(crate) async fn pushed_bookmark(id: RepositoryId, mark: &[u8], node: Node) -> Outcome {

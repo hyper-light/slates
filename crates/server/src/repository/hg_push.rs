@@ -3246,8 +3246,12 @@ async fn segment_landed(
     return Some(Err(PushOutcome::refused(&abort(UNLANDED.to_vec()))));
   };
   let sequence = header.sequence;
+  let sections = super::hg_run::section_bytes(&parts);
   let ok = disk.land(header, parts).await.is_ok();
   crate::state::with_state(|state| {
+    if ok {
+      super::hg_run::count_landed(state, sections);
+    }
     landed_segment(state, (run, segment), (sequence, ok), Some(counted))
   })
 }

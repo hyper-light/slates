@@ -52,6 +52,46 @@ use slates_store::owner::{Part, StoreHandle};
 use crate::repository::svn_commit::landing::{self, Turn};
 use crate::state::ShardState;
 
+/// Counter: the `Record` bytes of a Mercurial push's or import's segment changesets landed on the node's changeset store
+/// (main's order of 2026-11-26 on ruling R: what each section of a segment holds, read from the status report, the held
+/// bytes' check beside the store's file sizes). Format: a counter name in the status report.
+pub(crate) const LANDED_RECORD_BYTES: &str = "vcs.hg.segment_landed_record_bytes";
+/// Counter: their `Payload` bytes, the received deltas as stock's revlog chunks ([`LANDED_RECORD_BYTES`]'s sibling).
+/// Format: a counter name in the status report.
+pub(crate) const LANDED_PAYLOAD_BYTES: &str = "vcs.hg.segment_landed_payload_bytes";
+/// Counter: their `Texts` bytes, the index of each kept revision's text, base and place ([`LANDED_RECORD_BYTES`]'s
+/// sibling). Format: a counter name in the status report.
+pub(crate) const LANDED_TEXTS_BYTES: &str = "vcs.hg.segment_landed_texts_bytes";
+
+/// A segment changeset's bytes by section, `Record`, `Payload` and `Texts` ([`section_bytes`]), taken before its parts
+/// move into the landing and counted once it lands ([`count_landed`]).
+pub(crate) type SectionBytes = [u64; 3];
+
+/// `parts`' bytes by section ([`SectionBytes`]); a section of another kind counts in none.
+pub(crate) fn section_bytes(parts: &[Part]) -> SectionBytes {
+  let mut bytes = [0u64; 3];
+  for (kind, part) in parts {
+    let at = match kind {
+      SectionKind::Record => 0,
+      SectionKind::Payload => 1,
+      SectionKind::Texts => 2,
+      SectionKind::Work | SectionKind::Names => continue,
+    };
+    if let Some(sum) = bytes.get_mut(at) {
+      *sum = sum.saturating_add(u64::try_from(part.len()).unwrap_or(u64::MAX));
+    }
+  }
+  bytes
+}
+
+/// Counts a landed segment's `bytes` by section ([`LANDED_RECORD_BYTES`] and its siblings).
+pub(crate) fn count_landed(state: &mut ShardState, bytes: SectionBytes) {
+  let [record, payload, texts] = bytes;
+  state.count(LANDED_RECORD_BYTES, record);
+  state.count(LANDED_PAYLOAD_BYTES, payload);
+  state.count(LANDED_TEXTS_BYTES, texts);
+}
+
 /// Derived: how long a push waits for its repository's landing turn before it is refused, the patience a push waits
 /// for room (`vcs_share::wait::PATIENCE_NS`): a push parked past it would be parked past a client's patience too.
 pub(crate) const PATIENCE_NS: u64 = crate::vcs_share::wait::PATIENCE_NS;
