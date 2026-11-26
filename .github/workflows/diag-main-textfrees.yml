@@ -1,0 +1,42 @@
+name: diag-main-textfrees
+# Run 1 (main 01a20182, 2026-11-26 04:15 PST): A-920 3n's one free on Linux. w-svn's crates/merge/examples/text_frees.rs
+# (5d623fe13) frees 9,000 buffers of 1 KiB one at a time against one 9 MiB buffer, 20 rounds, every round printed:
+# glibc serves a 9 MiB block by mmap past its threshold (dynamic: it rises after the first large free), so the one free
+# may be a munmap in a shard step. Release, ubuntu-latest and ubuntu-24.04-arm, three runs each. Run only from
+# diag-measurer-main-textfrees-* branches, never main.
+on:
+  push:
+    branches: ["diag-measurer-main-textfrees-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  frees:
+    name: text_frees (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Build the example (release)
+        run: |
+          git log -1 --format='at %h %s' | cut -c1-120
+          cargo build --release --locked -p slates-merge --example text_frees
+      - name: Three runs
+        run: |
+          echo "cores: $(nproc); kernel: $(uname -r); glibc: $(ldd --version | head -1)"
+          for n in 1 2 3; do
+            out=$(target/release/examples/text_frees 2>&1)
+            echo "$out"
+            echo "::notice title=${{ matrix.os }} run $n::$(echo "$out" | tr '\n' ' ' | cut -c1-900)"
+          done
