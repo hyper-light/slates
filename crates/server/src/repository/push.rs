@@ -631,7 +631,8 @@ impl RecordedBatch {
       return None;
     }
     let _ = crate::merge_service::settle_green_retention(state, self.green);
-    crate::merge_service::checkpoint_green(state, self.green);
+    // Its checkpoint taken in its task's turns, none of it in this slice (A-920's checkpoint piece).
+    crate::merge_service::checkpoint_green_in_turns(state, self.green);
     Some(std::mem::take(&mut self.made))
   }
 

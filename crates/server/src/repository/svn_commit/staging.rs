@@ -1779,7 +1779,7 @@ impl Staging {
     crate::state::with_state(|state| {
       state.count(cause.counter(), 1);
       crate::vcs_store::svn_import::batch_landed(state, self.repository, (cause, self.bound));
-      crate::merge_service::checkpoint_green(state, green);
+      crate::merge_service::checkpoint_green_in_turns(state, green);
       super::fold_to_readers(state, green);
     })?;
     let holding: Vec<(ContentIdentity, String)> = std::mem::take(&mut self.holding)
