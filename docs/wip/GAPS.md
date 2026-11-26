@@ -1174,10 +1174,14 @@
 >   `repository/import/tests.rs`, `fleet.rs`, `replica.rs`, `daemon::tests`; w-perf's: `vcs_store/tests.rs`,
 >   `vcs_store/paths/tests.rs`, `vcs_store/commits/tests.rs`, `vcs_store/index_upkeep.rs`, `vcs_store/named_objects.rs`.
 >   Edit none of them meanwhile; main assigns them back if either agent returns.
->   - `test_store::audit_on_stored_shard`: 97 sites. svn 0; git 0; hg 15 (`hg_push/tests.rs` 15);
->     other 82 (`push/tests.rs` 18, `vcs_store/tests.rs` 14, `paths/tests.rs` 11,
->     `repository.rs` 10, `commits/tests.rs` 8, `identities/tests.rs` 8, `vcs_share/grants.rs` 4,
->     `vcs_share/read_backs.rs` 3, `index_upkeep.rs` 2, `import/tests.rs` 2, `fleet.rs` 2). Moved by w-git (2026-11-25)
+>   - `test_store::audit_on_stored_shard`: 90 sites. svn 0; git 0; hg 15 (`hg_push/tests.rs` 15);
+>     other 75 (`push/tests.rs` 18, `vcs_store/tests.rs` 14, `paths/tests.rs` 11,
+>     `repository.rs` 10, `commits/tests.rs` 8, `identities/tests.rs` 8, `index_upkeep.rs` 2, `import/tests.rs` 2,
+>     `fleet.rs` 2). `vcs_share/grants.rs`' 4 and `read_backs.rs`' 3 moved by w-git (2026-11-26): three histories that
+>     wait on nothing to `test_store::on_a_stored_shard` (no allowance, so the guard refuses any blocking they reach),
+>     those that only create to `audit_on_stored_shard_made_all`, and the one that pushes to
+>     `test_store::run_on_stored_shard`, creating with `created().await` and landing with
+>     `vcs_store::tests::push_through_awaited` (`appended_awaited`, `commits::home_and_land` awaited). Moved by w-git (2026-11-25)
 >     to forms that make a history's repositories from the test's thread first: `git_push::tests::on_stored_shard_with`
 >     (`git_push/tests.rs` 23, `vcs_share/tests.rs` 9, `vcs_share/wait.rs` 2, `vcs_store/tests.rs` 2, `replica.rs` 1,
 >     `named_objects.rs` 1) and `test_store::audit_on_stored_shard_made_all`, any tool's (`upload/tests.rs` 12,

@@ -1093,7 +1093,7 @@ fn next_ask(
 /// Homes `sealed`'s names and then its pack in the region, and lands them on the node's store as one changeset, through
 /// the edges' own carry (`crate::git_push::carry`, C5 part 2b): the push then names the changeset. None where any of it
 /// fell short; the caller gives back what it holds.
-async fn home_and_land(sealed: &mut SealedPush) -> Option<()> {
+pub(crate) async fn home_and_land(sealed: &mut SealedPush) -> Option<()> {
   let (origin, shards, mut ask) = crate::state::with_state(|state| {
     let ask = first_ask(state, sealed)?;
     Some((state.shard, state.shards.clone(), ask))

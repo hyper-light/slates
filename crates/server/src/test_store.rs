@@ -413,7 +413,7 @@ pub(crate) fn run_on_stored_shard<
 
 /// Shape: how long [`run_on_stored_shard`]'s history may run: far past a debug build's (seconds), so only one that never
 /// ends reaches it.
-const HISTORY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) const HISTORY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// [`created`] from the test's thread, on `daemon`'s shard of partition `partition`.
 pub(crate) fn create_on(
@@ -466,8 +466,8 @@ pub(crate) fn create_on(
 pub(crate) const SHARD_BLOCKING_ALLOWED: &[Allowed] = &[
   Allowed {
     fixture: "test_store::audit_on_stored_shard",
-    owner: "each history's (GAPS: svn 0, git 0, hg 15, other 82)",
-    reaching: 97,
+    owner: "each history's (GAPS: svn 0, git 0, hg 15, other 75)",
+    reaching: 90,
   },
   Allowed {
     fixture: "test_store::create",
@@ -626,6 +626,21 @@ pub(crate) fn audit_on_stored_shard_made<T: Send + 'static>(
   keep_landed(&daemon);
   let made = create_on(&daemon, 0, principal, asked);
   let answer = crate::daemon::observe_first(&daemon, move |state| history(state, made));
+  daemon.stop();
+  drop(store);
+  answer
+}
+
+/// [`audit_on_stored_shard`] for a history that waits on nothing: run on a stored daemon's first shard with no
+/// allowance, so a blocking helper it reached would be refused ([`refuse_on_a_shard`]) rather than hold the shard (main
+/// 01a20182's order of 2026-11-26, the shard-blocking allow-list: a history that only reads and sets the shard's state
+/// needs none).
+pub(crate) fn on_a_stored_shard<T: Send + 'static>(
+  history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+) -> T {
+  let (store, daemon) = audit_daemon_stored();
+  keep_landed(&daemon);
+  let answer = crate::daemon::observe_first(&daemon, move |state| history(state));
   daemon.stop();
   drop(store);
   answer
