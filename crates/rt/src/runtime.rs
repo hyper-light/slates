@@ -128,12 +128,19 @@ pub struct WakeTracking {
   /// window. The daemon derives it from its watchdog's (`slates_server::config::IDLE_SPIN_CEILING`); none for a
   /// runtime nothing watches.
   pub idle_ceiling_ns: u64,
+  /// The longest the step quantum may be, nanoseconds, whatever the estimate (A-928): a wake learned on a loaded
+  /// machine grows past any latency bar, and a step a quantum long, plus the unit begun before its check, would pass the
+  /// bar with it. The daemon derives it from 84a's loaded bar (`slates_server::config::STEP_QUANTUM_CEILING`); none for
+  /// a runtime held to no bar. The estimate itself is unbent ([`crate::shard::ShardContext::wake_cost_ns`]).
+  pub quantum_ceiling_ns: u64,
 }
 
 /// Format: no least idle window: the runtime's own spin-then-park is its wake estimate alone.
 pub const NO_IDLE_FLOOR_NS: u64 = 0;
 /// Format: no ceiling on an idle spin: a runtime that no watcher judges by its steps.
 pub const NO_IDLE_CEILING_NS: u64 = u64::MAX;
+/// Format: no ceiling on the step quantum: a runtime held to no latency bar, whose quantum is its wake estimate.
+pub const NO_QUANTUM_CEILING_NS: u64 = u64::MAX;
 
 /// A shard's wake-ring size from the profile's derived `ring_entries` (Little's law at the overflow target), at
 /// least the ring's smallest admitted capacity ([`slates_mem::mpsc::MIN_CAPACITY`]): on a machine whose wake p99
@@ -189,6 +196,7 @@ impl RuntimeConfig {
         idle_ratio: 1,
         idle_floor_ns: NO_IDLE_FLOOR_NS,
         idle_ceiling_ns: NO_IDLE_CEILING_NS,
+        quantum_ceiling_ns: NO_QUANTUM_CEILING_NS,
       }),
     };
     config.batch = config.calibrate_batch(latency_budget_ns).get();

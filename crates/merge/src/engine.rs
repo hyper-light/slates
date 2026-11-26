@@ -2142,14 +2142,18 @@ fn named_files(
     .collect()
 }
 
+/// What the preparation keeps of its sole runs as it finds them ([`note_sole`]): each file's place and run, each run's
+/// count of files, and each whole object's file and name.
+type SoleNotes<'n> = (
+  &'n mut Vec<(usize, usize)>,
+  &'n mut BTreeMap<usize, usize>,
+  &'n mut Vec<(usize, crate::named::Identity)>,
+);
+
 /// The file at `place`, made of run `found` alone, kept as the preparation finds it ([`Prep::Sole`]): its run, its
 /// run's count of files ([`alone`]'s), and its name where the run is its object whole ([`named_files`]'s).
 fn note_sole(
-  (sole, files_of, names): (
-    &mut Vec<(usize, usize)>,
-    &mut BTreeMap<usize, usize>,
-    &mut Vec<(usize, crate::named::Identity)>,
-  ),
+  (sole, files_of, names): SoleNotes<'_>,
   (place, found): (usize, usize),
   runs: &[crate::named::NamedRun],
 ) {
@@ -6952,9 +6956,15 @@ impl Green {
         (units, unchanged.then_some(applied))
       }
     };
+    // Sized once at every unit's effects: a list grown as they are gathered copied itself whole at each doubling, the
+    // unit that ran past the step's check (A-920 3i: probe 5's gather steps a median 0.27 ms past a 1.05 ms quantum).
+    let effects = units
+      .iter()
+      .map(|unit| unit.effects.len())
+      .fold(0usize, usize::saturating_add);
     HoldBegun::Holding(Holding {
       units: units.into_iter(),
-      effects: Vec::new(),
+      effects: Vec::with_capacity(effects),
       windows: Vec::new(),
       reached,
       check_reads,

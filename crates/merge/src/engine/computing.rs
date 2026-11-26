@@ -194,12 +194,19 @@ impl Green {
           return None;
         };
         let (resolved, cursor, units) = *decided;
+        let units = units.into_units().0;
+        // Sized once at every unit's effects, as a held verdict's are ([`Green::hold_begin`]): grown, it copied itself
+        // whole at each doubling.
+        let effects = units
+          .iter()
+          .map(|unit| unit.effects.len())
+          .fold(0usize, usize::saturating_add);
         computing.phase = ComputePhase::Reaching(Box::new(Reaching {
           releasing: Some(Box::new((resolved, cursor))),
-          units: units.into_units().0,
+          units,
           at: 0,
           windows: Vec::new(),
-          applied: Vec::new(),
+          applied: Vec::with_capacity(effects),
         }));
         None
       }

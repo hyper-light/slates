@@ -147,6 +147,42 @@ const _: () = assert!(
     && IDLE_SPIN_CEILING_NS + crate::daemon::HEARTBEAT_NS <= crate::daemon::LIVENESS_BUDGET_NS
 );
 
+/// 84a's loaded bar, nanoseconds (GAPS 84a; Ada, 2026-11-23, judged on bare metal): a loaded edit and merge's p99 and
+/// p999 under 1 ms. A step holds every request behind it on its shard, so goal 93 holds each step under the same bar.
+pub const LOADED_LATENCY_BAR: Derived<u64> = derived!(
+  1_000_000,
+  "84a: a loaded edit and merge's p99 and p999 under 1 ms",
+  ["84a", "goal 93"]
+);
+/// The longest a shard's step quantum may be, whatever its wake estimate (A-928): half the loaded bar. A step runs to
+/// the first check at or past its quantum, so it is at most one quantum and the unit begun before that check. Premise:
+/// a unit is sized within a quantum, so a step is at most two quanta, and two quanta within the bar is one within half
+/// of it. What holds a unit there is each slicing's own size: a copy-bound or hashed slice is half the live quantum at
+/// the machine's measured rate ([`copy_slice_bytes`], [`archive_slice_bytes`]); a paced walk's unit is one key, path or
+/// effect; and a gathered list is sized once at what it gathers, so no unit's extend copies the whole list at a doubling
+/// (A-920 3i: probe 5's gather steps ran a median 0.27 ms past a 1.05 ms quantum before it). Not yet held: an import
+/// judge's first unit, which walks every content path whole (`Green::decide_first`; probe 5: 557 µs median, past 1 ms
+/// in 39 steps; GAPS, A-928). The quantum is the shard's online wake estimate (§4.3), and load grows it: a quiet wake is
+/// 1.7-10 µs (A-223), while probe 5 read the learned quantum at about 1.05 ms at load 38-56, every step it filled over
+/// the bar. So the ceiling binds only under load.
+pub const STEP_QUANTUM_CEILING: Derived<u64> = derived!(
+  LOADED_LATENCY_BAR.get() / 2,
+  "loaded bar / 2: a step is at most its quantum and the unit begun before its check, a unit within a quantum",
+  ["LOADED_LATENCY_BAR", "A-920"]
+);
+/// The step quantum's ceiling in nanoseconds ([`STEP_QUANTUM_CEILING`]).
+pub const STEP_QUANTUM_CEILING_NS: u64 = STEP_QUANTUM_CEILING.get();
+
+/// Holds a runtime's step quantum within [`STEP_QUANTUM_CEILING`] (A-928): its fixed budget, the boot probe's mean
+/// wake, by which a runtime tracking no estimate steps and the boot's slices are sized; and its tracked estimate's
+/// ceiling, so a wake learned under load never lengthens a step past it.
+fn hold_quantum_to_bar(runtime: &mut RuntimeConfig) {
+  runtime.step_budget_ns = runtime.step_budget_ns.min(STEP_QUANTUM_CEILING_NS);
+  if let Some(tracking) = runtime.wake_tracking.as_mut() {
+    tracking.quantum_ceiling_ns = STEP_QUANTUM_CEILING_NS;
+  }
+}
+
 /// Format: R9 holds a create's p99 (AC-2.1), so one request in this many may fall in the tail: the share of a closed
 /// loop's requests a held window may leave to find their shard parked ([`loop_revisit_cycles`]).
 pub const PROVISION_TAIL: u64 = 100;
@@ -863,6 +899,9 @@ impl DaemonConfig {
     derivations.push(note("requests_in_flight_per_shard", &admission));
     let mut runtime =
       RuntimeConfig::from_profile(profile, admission.get(), admission.get(), LATENCY_BUDGET_NS);
+    derivations.push(note("loaded_latency_bar_ns", &LOADED_LATENCY_BAR));
+    derivations.push(note("step_quantum_ceiling_ns", &STEP_QUANTUM_CEILING));
+    hold_quantum_to_bar(&mut runtime);
     if let Some(shards) = shards {
       runtime.shards = shards.max(1);
       runtime.pin = false;
@@ -2031,6 +2070,54 @@ mod tests {
       busy.window_ns, quiet.window_ns,
       "the derived window is the machine's, not the load's"
     );
+  }
+
+  /// A runtime configuration as a boot probe that measured `wake_ns` makes it, tracking its wake from there.
+  fn booted_at(wake_ns: u64) -> RuntimeConfig {
+    RuntimeConfig {
+      shards: 1,
+      tasks_per_shard: 64,
+      timers_per_shard: 64,
+      ring_entries: 64,
+      step_budget_ns: wake_ns,
+      timer_tick_ns: 100_000,
+      batch: 64,
+      pin: false,
+      cores: Vec::new(),
+      page_bytes: 4096,
+      spin_ns: wake_ns,
+      wake_tracking: Some(slates_rt::runtime::WakeTracking {
+        prior_ns: wake_ns,
+        shift: 4,
+        idle_ratio: 1,
+        idle_floor_ns: slates_rt::runtime::NO_IDLE_FLOOR_NS,
+        idle_ceiling_ns: slates_rt::runtime::NO_IDLE_CEILING_NS,
+        quantum_ceiling_ns: slates_rt::runtime::NO_QUANTUM_CEILING_NS,
+      }),
+    }
+  }
+
+  /// A-928. Do: hold to the bar a runtime from a loaded boot, whose probe's mean wake (2 ms) passed 84a's 1 ms, and one
+  /// from a quiet boot (10 µs, the top of a quiet wake, A-223). Expect the loaded one's fixed budget at the ceiling, the
+  /// quiet one's its own, and both tracked estimates held to the ceiling, which is half the bar: a step of a quantum and
+  /// the unit begun before its check, each within a quantum, ends within the bar.
+  #[test]
+  fn a_quantum_learned_past_the_loaded_bar_is_held_to_half_of_it() {
+    let quiet_wake_ns = 10_000;
+    assert_eq!(
+      STEP_QUANTUM_CEILING_NS.saturating_mul(2),
+      LOADED_LATENCY_BAR.get()
+    );
+    let mut loaded = booted_at(2_000_000);
+    hold_quantum_to_bar(&mut loaded);
+    assert_eq!(loaded.step_budget_ns, STEP_QUANTUM_CEILING_NS);
+    let mut quiet = booted_at(quiet_wake_ns);
+    hold_quantum_to_bar(&mut quiet);
+    assert_eq!(quiet.step_budget_ns, quiet_wake_ns);
+    for held in [loaded, quiet] {
+      let tracking = held.wake_tracking.unwrap();
+      assert_eq!(tracking.quantum_ceiling_ns, STEP_QUANTUM_CEILING_NS);
+    }
   }
 
   /// A-326, §4.7. Do: derive the closed-loop hold for every shard count from one to [`MOST_SHARDS_TESTED`]. Expect: the
