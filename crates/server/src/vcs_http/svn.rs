@@ -1,7 +1,7 @@
 //! Subversion's site on the HTTP edge (A-681 part 1; §4.17.4 item 5 "HTTP", item 10 and piece 13): each request's head
 //! routed as `mod_dav_svn` routes a repository under `SVNParentPath` (the URL's first segment names the repository),
 //! its credentials proved to a principal of §4.13 (git's [`Authenticator`]), its repository found ([`Repositories`]),
-//! the principal's reach of it decided by the repository's policy (`crate::vcs_policy::reaches`, A-597, A-622), and
+//! the principal's reach of it decided by the repository's policy (`crate::vcs_policy::svn_access`, A-597, A-622), and
 //! the request answered by `slates_svn::dav::site` from the repository's index, green and lock table, which its owner
 //! shard lends a step at a time ([`SvnStores`]) with the principal's compiled read rules (A-606), each path the answer
 //! names judged by them (`mod_authz_svn`'s questions).
@@ -60,7 +60,7 @@ use crate::repository::svn_commit::{Committed, Uncommitted};
 use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
 use crate::vcs_store::svn_texts::SvnView;
 use crate::vcs_store::svn_view::{BroughtText, FetchedPiece};
-use crate::vcs_svn::{HookSite, Hooked, MERGEINFO, run_hook};
+use crate::vcs_svn::{HookSite, Hooked, MERGEINFO, NOT_AUTHORIZED, run_hook};
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_http::Admission;
 use slates_http::head::{Head, Target};
@@ -92,7 +92,7 @@ use std::collections::BTreeMap;
 
 use super::git::{Authenticator, Located, Proven, Repositories, Unproven};
 use super::{Answer, ClientGone, Decided, Exchange, Failed, Site, ToolLookup};
-use crate::vcs_policy::{self, Right};
+use crate::vcs_policy::{self, SvnAccess};
 
 /// Format: the bytes an escape may not name in a repository's path: a slash, which would move a segment's boundary,
 /// and NUL.
@@ -104,20 +104,70 @@ const HEAD: &[u8] = b"HEAD";
 /// Format: the `Depth` header's name (RFC 4918 §10.2).
 const DEPTH: &[u8] = b"depth";
 
-/// Policy right required for read-only Subversion WebDAV methods (`GET`, `HEAD`, `OPTIONS`,
-/// `PROPFIND`, `REPORT`).
-const READ_RIGHTS: &[Right] = &[Right::Read];
-
-/// Policy rights required for mutating Subversion WebDAV methods (`POST`, `MKACTIVITY`,
-/// `CHECKOUT`, `LOCK`, `UNLOCK`, `PROPPATCH`, `PUT`, `DELETE`, `MKCOL`, `COPY`, `MOVE`, `MERGE`).
-const WRITE_RIGHTS: &[Right] = &[Right::Submit, Right::Rewrite, Right::Delete];
-
-/// Returns the policy rights required for HTTP `method` on a Subversion WebDAV endpoint, failing
-/// closed to [`WRITE_RIGHTS`] for any non-read method before opening transactions or running hooks.
-fn required_rights(method: &[u8]) -> &'static [Right] {
+/// Returns the repository-level Subversion access required for HTTP `method`, failing closed to
+/// [`SvnAccess::Write`] for any non-read method before opening transactions or running hooks.
+fn required_access(method: &[u8]) -> SvnAccess {
   match method {
-    b"GET" | b"HEAD" | b"OPTIONS" | b"PROPFIND" | b"REPORT" => READ_RIGHTS,
-    _ => WRITE_RIGHTS,
+    b"GET" | b"HEAD" | b"OPTIONS" | b"PROPFIND" | b"REPORT" => SvnAccess::Read,
+    _ => SvnAccess::Write,
+  }
+}
+
+/// Extracts the repository tree path targeted by an HTTP WebDAV request (`method`, decoded
+/// `routed_path` below the repository root), or `None` for capability discovery (`OPTIONS`),
+/// transaction commit (`MERGE`, checked per changed path against `work.record.changes`), and
+/// internal `!svn` endpoints without a tree path (`!svn/me`, `!svn/vcc`, `!svn/act`, `!svn/txn`,
+/// `!svn/rev`).
+fn dav_target_path(method: &[u8], routed_path: &str) -> Option<String> {
+  if matches!(method, b"OPTIONS" | b"MERGE") {
+    return None;
+  }
+  let segments: Vec<&str> = routed_path
+    .split('/')
+    .filter(|segment| !segment.is_empty())
+    .collect();
+  match segments.as_slice() {
+    [first, kind, _id, rest @ ..]
+      if *first == site::SPECIAL && matches!(*kind, "rvr" | "bc" | "ver" | "txr" | "wrk") =>
+    {
+      Some(format!("/{}", rest.join("/")))
+    }
+    [first, ..] if *first == site::SPECIAL => None,
+    _ => Some(routed_path.to_owned()),
+  }
+}
+
+/// Checks repository-level and (when applicable) per-path Subversion policy for `(method, path)`,
+/// returning `None` when allowed or the HTTP refusal status (`403` / `500`) otherwise.
+fn check_svn_policy(
+  repository: &RepositoryRecord,
+  principal: &Principal,
+  method: &[u8],
+  routed_path: &str,
+) -> Option<Status> {
+  let required = required_access(method);
+  let access = match vcs_policy::svn_access(repository, principal) {
+    Ok(access) => access,
+    Err(_) => return Some(Status::INTERNAL_SERVER_ERROR),
+  };
+  if access < required {
+    return Some(Status::FORBIDDEN);
+  }
+  let target = dav_target_path(method, routed_path)?;
+  let allowed = if required == SvnAccess::Read || method == b"COPY" {
+    vcs_policy::svn_path_read_allowed(repository, principal, target.as_bytes())
+  } else {
+    vcs_policy::svn_path_write_allowed(
+      repository,
+      principal,
+      target.as_bytes(),
+      method == b"DELETE",
+    )
+  };
+  match allowed {
+    Ok(true) => None,
+    Ok(false) => Some(Status::FORBIDDEN),
+    Err(_) => Some(Status::INTERNAL_SERVER_ERROR),
   }
 }
 
@@ -391,11 +441,8 @@ impl<A: Authenticator, R: Repositories, S: SvnStores + Clone> SvnSite<A, R, S> {
     else {
       return refused_with(Status::NOT_FOUND, Fields::new(), true);
     };
-    match vcs_policy::reaches(&repository, &principal, required_rights(head.method)) {
-      Ok(true) => {}
-      Ok(false) => return refused_with(Status::FORBIDDEN, Fields::new(), true),
-      // A policy its tool cannot read is a damaged record (A-622's guard keeps such rules out): never judged without it.
-      Err(_) => return refused_with(Status::INTERNAL_SERVER_ERROR, Fields::new(), true),
+    if let Some(status) = check_svn_policy(&repository, &principal, head.method, &routed.path) {
+      return refused_with(status, Fields::new(), true);
     }
     if !self.stores.holds(repository.id) {
       return refused_with(Status::SERVICE_UNAVAILABLE, Fields::new(), true);
@@ -514,10 +561,31 @@ pub(crate) fn first_path_segment(head: &Head<'_>, room: u64) -> Option<String> {
 /// protocol: GET and POST), which a Subversion request needs its special segment to be told by.
 const SHARED_METHODS: [&[u8]; 3] = [b"GET", b"HEAD", b"POST"];
 
-/// Whether `head` is Subversion's (A-681; the daemon's `ToolSites` routes it here): a method no other tool's client sends
-/// (OPTIONS, PROPFIND, REPORT, MERGE, PUT, ...), or a path with the special URI's segment ([`site::SPECIAL`]), as stock
-/// svn's GETs and HTTPv2 POSTs name `!svn/...`. The segment is compared as sent: svn writes it unescaped.
-pub(crate) fn dav_request(head: &Head<'_>) -> bool {
+/// Whether a raw path `segment` equals [`site::SPECIAL`] (`!svn`) either literally or after
+/// percent-decoding within `room` (rejecting escaped `/` and NUL like [`route`]).
+fn is_special_segment(segment: &[u8], room: u64) -> bool {
+  let special = site::SPECIAL.as_bytes();
+  if segment == special {
+    return true;
+  }
+  if !segment.contains(&b'%') || percent::names_any(segment, PATH_REFUSED) {
+    return false;
+  }
+  let Ok(length) = percent::decoded_len(segment) else {
+    return false;
+  };
+  if length != special.len() || Admission::new(room).charge(to_u64(length)).is_err() {
+    return false;
+  }
+  let mut decoded = Vec::with_capacity(length);
+  percent::decode_into(segment, Plus::Plus, &mut decoded).is_ok() && decoded.as_slice() == special
+}
+
+/// Whether `head` is Subversion's (A-681; the daemon's `ToolSites` routes it here): a method no
+/// other tool's client sends (`OPTIONS`, `PROPFIND`, `REPORT`, `MERGE`, `PUT`, ...), or a path
+/// containing the special URI's segment ([`site::SPECIAL`], raw or percent-encoded such as
+/// `%21svn`) decoded within `room`.
+pub(crate) fn dav_request(head: &Head<'_>, room: u64) -> bool {
   if !SHARED_METHODS.contains(&head.method) {
     return true;
   }
@@ -526,7 +594,7 @@ pub(crate) fn dav_request(head: &Head<'_>) -> bool {
   };
   path
     .split(|byte| *byte == b'/')
-    .any(|segment| segment == site::SPECIAL.as_bytes())
+    .any(|segment| is_special_segment(segment, room))
 }
 
 /// Routes `head` (the module doc's names): its repository's name and the path below its root, read within `room`;
@@ -743,7 +811,9 @@ pub(crate) struct SvnExchange<S: SvnStores> {
   name: String,
   /// The HTTPv2 commit headers the request sent ([`CommitHeaders`]).
   commit_headers: CommitHeaders,
-  /// The repository's policy: the hooks its commits and locks run (A-733).
+  /// The repository's owner, used to evaluate unruled Subversion policy paths on commit landing.
+  owner: Principal,
+  /// The repository's policy: the hooks its commits and locks run (A-733) and path rules.
   policy: slates_db::catalog::RepositoryPolicy,
   /// A PUT on a transaction's root, its body streamed into the transaction's drive run by run and never held
   /// (§4.17.1 "A push's intake"); none for every other request.
@@ -873,6 +943,7 @@ impl<S: SvnStores> SvnExchange<S> {
       streamed: streamed_put(&method, &asked.routed.path),
       name: asked.routed.name.clone(),
       commit_headers,
+      owner: repository.owner.clone(),
       policy: repository.policy.clone(),
       stores,
       repository: repository.id,
@@ -1538,12 +1609,38 @@ impl<S: SvnStores> SvnExchange<S> {
       Merged::Accepted(work, texts) => (work, texts),
       Merged::Refused(refused) => return refused,
     };
+    self.land_merged(*work, &*texts, gone).await
+  }
+
+  /// Enforces per-path Subversion policy on `work`'s changed paths, lands `work` on the owner
+  /// shard, runs `post-commit`, and formats the MERGE HTTP response.
+  async fn land_merged(
+    &mut self,
+    work: Work,
+    texts: &dyn slates_svn::commit::drive::TextSink,
+    gone: ClientGone<'_>,
+  ) -> HttpAnswer {
+    if vcs_policy::admit_svn_changes(
+      &self.owner,
+      &self.policy,
+      &self.principal,
+      &work.record.changes,
+    )
+    .is_err()
+    {
+      return locking::error_answer(
+        Status::FORBIDDEN.code,
+        true,
+        NOT_AUTHORIZED,
+        "Authorization failed",
+      );
+    }
     let transaction = work.record.transaction.clone();
     // A-740: a shard stuck landing a revision names it.
     let landing = slates_rt::futures::doing("vcs_http::svn::land");
     let landed = self
       .stores
-      .land(self.repository, &self.principal, *work, &*texts)
+      .land(self.repository, &self.principal, work, texts)
       .await;
     drop(landing);
     match landed {

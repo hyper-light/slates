@@ -483,13 +483,28 @@ impl HgPolicy {
 /// Format: the prefix authz gives a section whose path may hold wildcards (`[:glob:/path]`, the 1.10 release notes).
 const GLOB_FORM: &str = ":glob:";
 
+/// Format: POSIX character-class open delimiter inside a glob bracket expression (`[:class:]`).
+const POSIX_CLASS_OPEN: &[u8] = b"[:";
+
+/// Format: POSIX character-class close delimiter inside a glob bracket expression (`[:class:]`).
+const POSIX_CLASS_CLOSE: &[u8] = b":]";
+
+/// Format: an escaped byte in a glob pattern (`\x`) spans two raw bytes.
+const ESCAPED_BYTE_LEN: usize = b"\\x".len();
+
 /// One segment of a Subversion path pattern.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Segment {
   /// Exactly these bytes.
   Literal(Vec<u8>),
-  /// Wildcards within one segment (`*foo*.bar`, `a?c`, `[ab]`, `\*`).
-  Glob(Glob),
+  /// Wildcards within one segment (`*foo*.bar`, `a?c`, `[ab]`, `\*`), retaining the raw segment
+  /// bytes so concrete witness paths can be synthesized for effective-policy checks.
+  Glob {
+    /// Raw segment pattern bytes.
+    raw: Vec<u8>,
+    /// Compiled wildmatch matcher.
+    glob: Glob,
+  },
   /// `*` alone: any one segment.
   One,
   /// `**` alone: any number of segments, none included.
@@ -502,7 +517,10 @@ impl Segment {
     match text {
       "*" => Self::One,
       "**" => Self::Any,
-      _ if text.bytes().any(is_glob_special) => Self::Glob(Glob::new(text.as_bytes())),
+      _ if text.bytes().any(is_glob_special) => Self::Glob {
+        raw: text.as_bytes().to_vec(),
+        glob: Glob::new(text.as_bytes()),
+      },
       _ => Self::Literal(text.as_bytes().to_vec()),
     }
   }
@@ -511,7 +529,7 @@ impl Segment {
   fn takes(&self, segment: &[u8]) -> bool {
     match self {
       Self::Literal(bytes) => bytes == segment,
-      Self::Glob(glob) => glob.matches(segment),
+      Self::Glob { glob, .. } => glob.matches(segment),
       Self::One => !segment.is_empty(),
       Self::Any => true,
     }
@@ -600,6 +618,152 @@ impl PathPattern {
     }
     reached.iter().rposition(|&was| was)
   }
+
+  /// Whether any segment contains a wildcard (`*`, `**`, or an in-segment glob).
+  fn has_wildcard(&self) -> bool {
+    self
+      .segments
+      .iter()
+      .any(|segment| !matches!(segment, Segment::Literal(_)))
+  }
+
+  /// Builds a concrete repository path matched by this pattern, expanding the first `**` to
+  /// `any_expand` copies of `fresh` (and any further `**` to zero segments) and substituting `*`
+  /// inside segment globs with `star_fill`.
+  fn witness(&self, fresh: &[u8], any_expand: usize, star_fill: &[u8]) -> Option<Vec<u8>> {
+    let mut path = Vec::new();
+    let mut expanded_any = false;
+    for segment in &self.segments {
+      match segment {
+        Segment::Literal(bytes) => {
+          path.push(b'/');
+          path.extend_from_slice(bytes);
+        }
+        Segment::One => {
+          path.push(b'/');
+          path.extend_from_slice(fresh);
+        }
+        Segment::Any if !expanded_any => {
+          expanded_any = true;
+          for _ in 0..any_expand {
+            path.push(b'/');
+            path.extend_from_slice(fresh);
+          }
+        }
+        Segment::Any => {}
+        Segment::Glob { raw, glob } => {
+          let concrete = witness_glob_segment(raw, glob, star_fill)?;
+          path.push(b'/');
+          path.extend_from_slice(&concrete);
+        }
+      }
+    }
+    if path.is_empty() {
+      path.push(b'/');
+    }
+    Some(path)
+  }
+}
+
+/// Advances past a POSIX character class `[:...:]` starting at `open`, returning the index
+/// immediately after `:]`, or `None` when no valid class starts there.
+fn skip_posix_class(raw: &[u8], open: usize) -> Option<usize> {
+  let body_start = open.saturating_add(POSIX_CLASS_OPEN.len());
+  if raw.get(open..body_start) != Some(POSIX_CLASS_OPEN) {
+    return None;
+  }
+  let rest = raw.get(body_start..)?;
+  let close = rest
+    .windows(POSIX_CLASS_CLOSE.len())
+    .position(|pair| pair == POSIX_CLASS_CLOSE)?;
+  Some(
+    body_start
+      .saturating_add(close)
+      .saturating_add(POSIX_CLASS_CLOSE.len()),
+  )
+}
+
+/// Finds the index immediately after the closing `]` of a glob bracket expression starting at
+/// `open`, respecting leading `!`/`^`, a literal first `]`, `\` escapes, and `[:class:]`.
+fn bracket_end(raw: &[u8], open: usize) -> Option<usize> {
+  let mut at = open.saturating_add(1);
+  if matches!(raw.get(at), Some(b'!' | b'^')) {
+    at = at.saturating_add(1);
+  }
+  if raw.get(at) == Some(&b']') {
+    at = at.saturating_add(1);
+  }
+  while let Some(&byte) = raw.get(at) {
+    match byte {
+      b'\\' => at = at.saturating_add(ESCAPED_BYTE_LEN),
+      b'[' => at = skip_posix_class(raw, at).unwrap_or_else(|| at.saturating_add(1)),
+      b']' => return Some(at.saturating_add(1)),
+      _ => at = at.saturating_add(1),
+    }
+  }
+  None
+}
+
+/// Picks a concrete non-slash, non-NUL byte matched by the single bracket expression `slice`
+/// using [`Glob::new`], or `None` when the bracket expression matches nothing.
+fn pick_bracket_byte(slice: &[u8]) -> Option<u8> {
+  let sub = Glob::new(slice);
+  (b'a'..=b'z')
+    .chain(1_u8..=u8::MAX)
+    .find(|&byte| byte != b'/' && sub.matches(&[byte]))
+}
+
+/// Constructs a non-empty concrete path segment matching `glob` by substituting `*` with
+/// `star_fill`, `?` with `b'a'`, and `[...]` with [`pick_bracket_byte`].
+fn witness_glob_segment(raw: &[u8], glob: &Glob, star_fill: &[u8]) -> Option<Vec<u8>> {
+  let mut out = Vec::new();
+  let mut at = 0;
+  while let Some(&byte) = raw.get(at) {
+    match byte {
+      b'\\' => {
+        let &escaped = raw.get(at.saturating_add(1))?;
+        out.push(escaped);
+        at = at.saturating_add(ESCAPED_BYTE_LEN);
+      }
+      b'*' => {
+        out.extend_from_slice(star_fill);
+        at = at.saturating_add(1);
+      }
+      b'?' => {
+        out.push(b'a');
+        at = at.saturating_add(1);
+      }
+      b'[' => {
+        let end = bracket_end(raw, at)?;
+        let chosen = pick_bracket_byte(raw.get(at..end)?)?;
+        out.push(chosen);
+        at = end;
+      }
+      other => {
+        out.push(other);
+        at = at.saturating_add(1);
+      }
+    }
+  }
+  (!out.is_empty() && glob.matches(&out)).then_some(out)
+}
+
+/// Returns a deterministic non-empty ASCII path segment distinct from every literal segment in
+/// `rules`, preventing wildcard witnesses from colliding with literal `Deny` rules.
+fn fresh_segment(rules: &[Rule<PathPattern>]) -> Vec<u8> {
+  let has_literal = |candidate: &[u8]| {
+    rules.iter().any(|rule| {
+      rule.pattern.segments.iter().any(|segment| match segment {
+        Segment::Literal(bytes) => bytes.as_slice() == candidate,
+        _ => false,
+      })
+    })
+  };
+  let mut candidate = b"a".to_vec();
+  while has_literal(&candidate) {
+    candidate.push(b'a');
+  }
+  candidate
 }
 
 /// A repository path's segments, as authz's lookup reads them: repeated slashes as one, leading and trailing ones as
@@ -675,6 +839,56 @@ impl SvnPolicy {
       .filter(|&(_, position)| speaks(&self.rules, position, principal, right))
       .max();
     decide(&self.rules, best.map(|(_, position)| position))
+  }
+
+  /// Whether `principal` effectively holds `right` on at least one path under this policy,
+  /// accounting for `PolicyEffect::Deny` precedence at root and subpaths.
+  fn holds_right(&self, allow_unruled: bool, principal: &Principal, right: Right) -> bool {
+    match self.verdict(b"/", principal, right) {
+      Verdict::Allowed { .. } => return true,
+      Verdict::Unruled if allow_unruled => return true,
+      Verdict::Denied { .. } | Verdict::Unruled | Verdict::NotListed => {}
+    }
+    let fresh = fresh_segment(&self.rules);
+    let deep_expand = self
+      .rules
+      .iter()
+      .map(|rule| rule.pattern.segments.len())
+      .max()
+      .unwrap_or(0)
+      .saturating_add(1);
+    self.rules.iter().any(|rule| {
+      rule.effect == Effect::Allow
+        && rule.speaks(principal, right)
+        && self.rule_survives_deny(&rule.pattern, principal, right, &fresh, deep_expand)
+    })
+  }
+
+  /// Whether at least one concrete witness path generated from `pattern` evaluates to
+  /// [`Verdict::Allowed`] rather than being shadowed by an equal-or-deeper/later `Deny` rule.
+  fn rule_survives_deny(
+    &self,
+    pattern: &PathPattern,
+    principal: &Principal,
+    right: Right,
+    fresh: &[u8],
+    deep_expand: usize,
+  ) -> bool {
+    let passes: &[(usize, &[u8])] = if pattern.has_wildcard() {
+      &[(0, b""), (deep_expand, fresh)]
+    } else {
+      &[(0, b"")]
+    };
+    passes.iter().any(|&(any_expand, star_fill)| {
+      pattern
+        .witness(fresh, any_expand, star_fill)
+        .is_some_and(|path| {
+          matches!(
+            self.verdict(&path, principal, right),
+            Verdict::Allowed { .. }
+          )
+        })
+    })
   }
 }
 
@@ -817,14 +1031,7 @@ impl Compiled {
         };
         HgPattern::parse(namespace, &rule.pattern).ok()
       })?)),
-      VcsTool::Subversion => {
-        Self::Subversion(SvnPolicy::new(compiled_rules(rules, |rule| {
-          match rule.names {
-            slates_db::catalog::PolicyNames::Paths => PathPattern::parse(&rule.pattern).ok(),
-            _ => None,
-          }
-        })?))
-      }
+      VcsTool::Subversion => Self::Subversion(compile_svn_policy(rules)?),
     })
   }
 
@@ -1018,6 +1225,155 @@ pub(crate) fn reaches(
       && rights.contains(&right_of(rule.right))
       && who_of(&rule.who).names(principal)
   }))
+}
+
+/// Effective repository-level Subversion access for a principal after evaluating `Allow` and
+/// `Deny` rules in [`SvnPolicy`] precedence order (`None < Read < Write`, matching Subversion's
+/// model where write implies read).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SvnAccess {
+  /// No effective `Read` access on any path (including `Submit`-only without `Read`).
+  None,
+  /// Effective `Read` access on at least one path, but no effective write right.
+  Read,
+  /// Effective `Read` access and at least one effective write right (`Submit`, `Rewrite`, or
+  /// `Delete`).
+  Write,
+}
+
+/// Compiles `rules` as a Subversion [`SvnPolicy`], returning `Unreadable` naming the first rule
+/// whose name kind or path pattern is invalid for Subversion.
+fn compile_svn_policy(rules: &[slates_db::catalog::PolicyRule]) -> Result<SvnPolicy, PushRefusal> {
+  Ok(SvnPolicy::new(compiled_rules(rules, |rule| {
+    match rule.names {
+      slates_db::catalog::PolicyNames::Paths => PathPattern::parse(&rule.pattern).ok(),
+      _ => None,
+    }
+  })?))
+}
+
+/// Evaluates `principal`'s effective repository-level Subversion access on `record`, honoring
+/// `PolicyEffect::Deny` precedence and requiring effective `Read` for any access (`None < Read <
+/// Write`).
+pub(crate) fn svn_access(
+  record: &RepositoryRecord,
+  principal: &Principal,
+) -> Result<SvnAccess, PushRefusal> {
+  let Compiled::Subversion(policy) = Compiled::of(record)? else {
+    return Ok(SvnAccess::None);
+  };
+  let is_owner = *principal == record.owner;
+  if !policy.holds_right(is_owner, principal, Right::Read) {
+    return Ok(SvnAccess::None);
+  }
+  let can_write = policy.holds_right(is_owner, principal, Right::Submit)
+    || policy.holds_right(false, principal, Right::Rewrite)
+    || policy.holds_right(false, principal, Right::Delete);
+  Ok(if can_write {
+    SvnAccess::Write
+  } else {
+    SvnAccess::Read
+  })
+}
+
+/// Whether `verdict` allows access when `allow_unruled` permits [`Verdict::Unruled`].
+fn verdict_allows(verdict: Verdict, allow_unruled: bool) -> bool {
+  matches!(verdict, Verdict::Allowed { .. })
+    || (allow_unruled && matches!(verdict, Verdict::Unruled))
+}
+
+/// Checks whether `principal` holds both `Read` and write permission at `path` under `policy`.
+/// When `deleting` is true, an explicit `Deny Delete` overrides `Submit`, and an explicit
+/// `Allow Delete` suffices without `Submit`.
+fn svn_path_writable(
+  policy: &SvnPolicy,
+  is_owner: bool,
+  principal: &Principal,
+  path: &[u8],
+  deleting: bool,
+) -> bool {
+  if !verdict_allows(policy.verdict(path, principal, Right::Read), is_owner) {
+    return false;
+  }
+  if deleting {
+    return match policy.verdict(path, principal, Right::Delete) {
+      Verdict::Allowed { .. } => true,
+      Verdict::Denied { .. } | Verdict::NotListed => false,
+      Verdict::Unruled => verdict_allows(policy.verdict(path, principal, Right::Submit), is_owner),
+    };
+  }
+  verdict_allows(policy.verdict(path, principal, Right::Submit), is_owner)
+    || verdict_allows(policy.verdict(path, principal, Right::Rewrite), false)
+}
+
+/// Evaluates whether `principal` may read `path` in Subversion `record` under [`SvnPolicy`].
+pub(crate) fn svn_path_read_allowed(
+  record: &RepositoryRecord,
+  principal: &Principal,
+  path: &[u8],
+) -> Result<bool, PushRefusal> {
+  let Compiled::Subversion(policy) = Compiled::of(record)? else {
+    return Ok(false);
+  };
+  let is_owner = *principal == record.owner;
+  Ok(verdict_allows(
+    policy.verdict(path, principal, Right::Read),
+    is_owner,
+  ))
+}
+
+/// Evaluates whether `principal` may write (or delete when `deleting`) `path` in Subversion
+/// `record` under [`SvnPolicy`], requiring effective `Read` as well as write permission.
+pub(crate) fn svn_path_write_allowed(
+  record: &RepositoryRecord,
+  principal: &Principal,
+  path: &[u8],
+  deleting: bool,
+) -> Result<bool, PushRefusal> {
+  let Compiled::Subversion(policy) = Compiled::of(record)? else {
+    return Ok(false);
+  };
+  let is_owner = *principal == record.owner;
+  Ok(svn_path_writable(
+    &policy, is_owner, principal, path, deleting,
+  ))
+}
+
+/// Checks whether `principal` is allowed by `policy` (owned by `owner`) to commit every changed
+/// path (and read every copy-source path) in `changes`.
+pub(crate) fn admit_svn_changes(
+  owner: &Principal,
+  policy: &slates_db::catalog::RepositoryPolicy,
+  principal: &Principal,
+  changes: &[slates_svn::index::ChangedPath],
+) -> Result<(), PushRefusal> {
+  let compiled = compile_svn_policy(&policy.rules)?;
+  let is_owner = principal == owner;
+  for (index, change) in changes.iter().enumerate() {
+    let deleting = change.action == slates_svn::index::Action::Delete;
+    if !svn_path_writable(
+      &compiled,
+      is_owner,
+      principal,
+      change.path.as_bytes(),
+      deleting,
+    ) {
+      return Err(PushRefusal::NotPermitted {
+        index: index_of(index),
+      });
+    }
+    if let Some(copy_from) = &change.copy_from
+      && !verdict_allows(
+        compiled.verdict(copy_from.path.as_bytes(), principal, Right::Read),
+        is_owner,
+      )
+    {
+      return Err(PushRefusal::NotPermitted {
+        index: index_of(index),
+      });
+    }
+  }
+  Ok(())
 }
 
 #[cfg(test)]
@@ -2249,5 +2605,304 @@ mod tests {
       judged(&git, OWNER, (main, Right::Submit, &broken)),
       (Err(unjudged), (1, 0))
     );
+  }
+
+  fn svn_path_rule(
+    pattern: &str,
+    right: slates_db::catalog::PolicyRight,
+    effect: slates_db::catalog::PolicyEffect,
+    who: slates_db::catalog::PolicyWho,
+  ) -> slates_db::catalog::PolicyRule {
+    record_rule(
+      slates_db::catalog::PolicyNames::Paths,
+      pattern,
+      (right, effect),
+      who,
+    )
+  }
+
+  fn assert_svn_access_core_cases() {
+    use slates_db::catalog::{PolicyEffect, PolicyRight, PolicyWho, VcsTool};
+    let (owner, stranger, other) = (principal(OWNER), principal(STRANGER), principal(UNNAMED));
+    let empty = record(VcsTool::Subversion, vec![]);
+    let deny_read = record(
+      VcsTool::Subversion,
+      vec![
+        svn_path_rule(
+          "/",
+          PolicyRight::Read,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/",
+          PolicyRight::Read,
+          PolicyEffect::Deny,
+          record_only(&[STRANGER]),
+        ),
+      ],
+    );
+    let deny_submit = record(
+      VcsTool::Subversion,
+      vec![
+        svn_path_rule(
+          "/",
+          PolicyRight::Read,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/",
+          PolicyRight::Submit,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/",
+          PolicyRight::Submit,
+          PolicyEffect::Deny,
+          record_only(&[STRANGER]),
+        ),
+      ],
+    );
+    let submit_only = record(
+      VcsTool::Subversion,
+      vec![svn_path_rule(
+        "/",
+        PolicyRight::Submit,
+        PolicyEffect::Allow,
+        record_only(&[STRANGER]),
+      )],
+    );
+    let owner_deny_submit = record(
+      VcsTool::Subversion,
+      vec![svn_path_rule(
+        "/",
+        PolicyRight::Submit,
+        PolicyEffect::Deny,
+        record_only(&[OWNER]),
+      )],
+    );
+    let sub_allow = record(
+      VcsTool::Subversion,
+      vec![
+        svn_path_rule(
+          "/",
+          PolicyRight::Read,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/",
+          PolicyRight::Read,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/trunk",
+          PolicyRight::Read,
+          PolicyEffect::Allow,
+          record_only(&[STRANGER]),
+        ),
+      ],
+    );
+    assert_eq!(
+      [
+        super::svn_access(&empty, &owner),
+        super::svn_access(&empty, &stranger),
+        super::svn_access(&deny_read, &stranger),
+        super::svn_access(&deny_read, &other),
+        super::svn_access(&deny_submit, &stranger),
+        super::svn_access(&deny_submit, &other),
+        super::svn_access(&submit_only, &stranger),
+        super::svn_access(&owner_deny_submit, &owner),
+        super::svn_access(&sub_allow, &stranger),
+        super::svn_access(&sub_allow, &other),
+      ],
+      [
+        Ok(super::SvnAccess::Write),
+        Ok(super::SvnAccess::None),
+        Ok(super::SvnAccess::None),
+        Ok(super::SvnAccess::Read),
+        Ok(super::SvnAccess::Read),
+        Ok(super::SvnAccess::Write),
+        Ok(super::SvnAccess::None),
+        Ok(super::SvnAccess::Read),
+        Ok(super::SvnAccess::Read),
+        Ok(super::SvnAccess::None),
+      ]
+    );
+  }
+
+  fn assert_svn_access_glob_and_damaged_cases() {
+    use slates_db::catalog::{PolicyEffect, PolicyNames, PolicyRight, PolicyWho, VcsTool};
+    let (owner, stranger) = (principal(OWNER), principal(STRANGER));
+    let glob_survives = record(
+      VcsTool::Subversion,
+      vec![
+        svn_path_rule(
+          ":glob:/trunk/*",
+          PolicyRight::Read,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/trunk/a",
+          PolicyRight::Read,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+      ],
+    );
+    let double_star_survives = record(
+      VcsTool::Subversion,
+      vec![
+        svn_path_rule(
+          ":glob:/trunk/**",
+          PolicyRight::Read,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/trunk",
+          PolicyRight::Read,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+      ],
+    );
+    let double_star_eclipsed = record(
+      VcsTool::Subversion,
+      vec![
+        svn_path_rule(
+          ":glob:/trunk/**",
+          PolicyRight::Read,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          ":glob:/trunk/**",
+          PolicyRight::Read,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+      ],
+    );
+    let bracket_allow = record(
+      VcsTool::Subversion,
+      vec![svn_path_rule(
+        ":glob:/[[:alpha:]]/file?",
+        PolicyRight::Read,
+        PolicyEffect::Allow,
+        record_only(&[STRANGER]),
+      )],
+    );
+    let damaged = record(
+      VcsTool::Subversion,
+      vec![record_rule(
+        PolicyNames::Branches,
+        "main",
+        (PolicyRight::Read, PolicyEffect::Allow),
+        PolicyWho::Anyone,
+      )],
+    );
+    assert_eq!(
+      [
+        super::svn_access(&glob_survives, &stranger),
+        super::svn_access(&double_star_survives, &stranger),
+        super::svn_access(&double_star_eclipsed, &stranger),
+        super::svn_access(&bracket_allow, &stranger),
+        super::svn_access(&damaged, &owner),
+      ],
+      [
+        Ok(super::SvnAccess::Read),
+        Ok(super::SvnAccess::Read),
+        Ok(super::SvnAccess::None),
+        Ok(super::SvnAccess::Read),
+        Err(super::PushRefusal::Unreadable { rule: 0 }),
+      ]
+    );
+  }
+
+  fn assert_svn_commit_change_admission() {
+    use slates_db::catalog::{PolicyEffect, PolicyRight, PolicyWho, VcsTool};
+    use slates_svn::index::{Action, ChangedPath, CopySource, NodeKind};
+    let (owner, stranger) = (principal(OWNER), principal(STRANGER));
+    let commit_policy = record(
+      VcsTool::Subversion,
+      vec![
+        svn_path_rule(
+          "/",
+          PolicyRight::Read,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/",
+          PolicyRight::Submit,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/tags",
+          PolicyRight::Submit,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/secret",
+          PolicyRight::Read,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/trunk",
+          PolicyRight::Delete,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+      ],
+    );
+    let change = |path: &str, action: Action, copy_from: Option<&str>| ChangedPath {
+      path: path.to_owned(),
+      action,
+      kind: NodeKind::File,
+      copy_from: copy_from.map(|src| CopySource {
+        path: src.to_owned(),
+        revision: 1,
+      }),
+      text: None,
+      properties: None,
+      mergeinfo_modified: false,
+    };
+    let admitted = |c: ChangedPath| {
+      super::admit_svn_changes(&owner, &commit_policy.policy, &stranger, &[c]).is_ok()
+    };
+    assert_eq!(
+      [
+        admitted(change("/trunk/ok.txt", Action::Add, None)),
+        admitted(change("/tags/v1", Action::Add, None)),
+        admitted(change(
+          "/trunk/leak.txt",
+          Action::Add,
+          Some("/secret/key.txt")
+        )),
+        admitted(change("/trunk/old.txt", Action::Delete, None)),
+      ],
+      [true, false, false, false]
+    );
+  }
+
+  /// Round-4 Blocker 2 (`svn_access`, `svn_path_read_allowed`, `svn_path_write_allowed`,
+  /// `admit_svn_changes`): Do evaluate root `Deny Read`/`Deny Submit`, owner `Deny Submit`,
+  /// `Submit`-only, subpath `Allow` under root `Deny`, glob `Allow` vs literal/glob `Deny`,
+  /// damaged records, and per-change commit admission (including `copy_from` read check and
+  /// `Action::Delete`). Expect: exact `SvnPolicy` precedence everywhere, write requires read,
+  /// and damaged policies fail closed with `Unreadable`.
+  #[test]
+  fn round4_blocker2_svn_access_and_per_path_policy_honor_deny_globs_and_submit_only() {
+    assert_svn_access_core_cases();
+    assert_svn_access_glob_and_damaged_cases();
+    assert_svn_commit_change_admission();
   }
 }

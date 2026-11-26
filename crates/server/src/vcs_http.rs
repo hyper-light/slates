@@ -344,17 +344,20 @@ pub(crate) struct Decided<E> {
 /// cycles, even across nested multi-segment repositories and cross-shard Git LFS `.git` aliases.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum RouteStage {
-  /// First attempt, or moving toward the exact multi-segment syntactic repository candidate's
-  /// owning shard (or first path segment's owning shard when no multi-segment candidate exists).
+  /// First attempt, or moving toward a multi-segment Mercurial (`?cmd=`) repository candidate's
+  /// owning shard (the full decoded path, strictly longer than any stripped Git/LFS candidate).
   #[default]
   Initial,
+  /// Multi-segment Mercurial candidate was checked (or not applicable); now checking any
+  /// multi-segment Git LFS or Git smart/dumb HTTP repository candidate on its owning shard.
+  ExactGit,
   /// Exact multi-segment Git LFS candidate ending in `.git` (e.g. `team/app.git`) was already
   /// checked on its owning shard and absent; now checking its `.git`-stripped multi-segment alias
   /// (`team/app`).
   ExactLfsBare,
-  /// Multi-segment syntactic repository candidate (and any `.git` LFS bare alias) was already
-  /// checked on its owning shard and did not match its tool; now checking the first path segment
-  /// on its owning shard (e.g. `project` for SVN-5 `/project/trunk/HEAD`).
+  /// Multi-segment syntactic repository candidates (Mercurial, Git/LFS, and any `.git` LFS bare
+  /// alias) were already checked on their owning shards and did not match their tool; now checking
+  /// the first path segment on its owning shard (e.g. `project` for SVN-5 `/project/trunk/HEAD`).
   ExactAbsent,
   /// The first path segment was already checked on its owning shard and is not a registered
   /// repository (or delegated onward from it); dispatch directly by protocol without bouncing back.
@@ -609,7 +612,7 @@ fn classify_route(head: &Head<'_>, room: u64) -> SiteRoute {
     SiteRoute::Hg
   } else if lfs_transfer(head, room) {
     SiteRoute::Git
-  } else if svn::dav_request(head) {
+  } else if svn::dav_request(head, room) {
     SiteRoute::Svn
   } else if git_http_route(head, room) {
     SiteRoute::Git
@@ -628,7 +631,7 @@ enum PreAuth {
   Refused(git::Refused),
 }
 
-/// Which tool a multi-segment syntactic repository candidate targets.
+/// Which Git protocol shape a multi-segment syntactic repository candidate matched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExactKind {
   /// Exact Git LFS repository path (may end in `.git`, falling back to bare alias if absent).
@@ -637,21 +640,9 @@ enum ExactKind {
   LfsBare,
   /// Exact Git smart or dumb HTTP repository path.
   Git,
-  /// Exact Mercurial `?cmd=` wire repository path.
-  Hg,
 }
 
-impl ExactKind {
-  /// Expected registered [`VcsTool`] for this syntactic candidate.
-  const fn tool(self) -> VcsTool {
-    match self {
-      Self::LfsExact | Self::LfsBare | Self::Git => VcsTool::Git,
-      Self::Hg => VcsTool::Mercurial,
-    }
-  }
-}
-
-/// Multi-segment syntactic repository candidate extracted from an HTTP request head.
+/// Multi-segment syntactic Git/LFS repository candidate extracted from an HTTP request head.
 struct ExactCandidate {
   /// Decoded repository name containing at least one `/`.
   name: String,
@@ -659,25 +650,26 @@ struct ExactCandidate {
   kind: ExactKind,
 }
 
-/// Extracts the exact multi-segment repository candidate targeted by Git LFS, Git smart/dumb
-/// HTTP, or Mercurial `?cmd=` wire protocol, if the targeted repository name contains `/`.
-fn exact_multi_segment_candidate(head: &Head<'_>, room: u64) -> Option<ExactCandidate> {
-  if let Some(repo) = git::lfs_repo_candidate(head, room) {
-    return repo.contains('/').then_some(ExactCandidate {
-      name: repo,
+/// Extracts a multi-segment Mercurial `?cmd=` wire repository candidate (full decoded path) when
+/// the repository name contains `/`.
+fn exact_hg_multi_segment_candidate(head: &Head<'_>, room: u64) -> Option<String> {
+  hg::wire_repo_candidate(head, room).filter(|repo| repo.contains('/'))
+}
+
+/// Extracts the exact multi-segment Git LFS or Git smart/dumb HTTP repository candidate when the
+/// stripped repository name contains `/`, never letting a single-segment LFS candidate suppress a
+/// multi-segment Git candidate.
+fn exact_git_multi_segment_candidate(head: &Head<'_>, room: u64) -> Option<ExactCandidate> {
+  if let Some(name) = git::lfs_repo_candidate(head, room).filter(|repo| repo.contains('/')) {
+    return Some(ExactCandidate {
+      name,
       kind: ExactKind::LfsExact,
     });
   }
-  if let Some(repo) = git::http_repo_candidate(head, room) {
-    return repo.contains('/').then_some(ExactCandidate {
-      name: repo,
-      kind: ExactKind::Git,
-    });
-  }
-  let repo = hg::wire_repo_candidate(head, room)?;
-  repo.contains('/').then_some(ExactCandidate {
-    name: repo,
-    kind: ExactKind::Hg,
+  let name = git::http_repo_candidate(head, room).filter(|repo| repo.contains('/'))?;
+  Some(ExactCandidate {
+    name,
+    kind: ExactKind::Git,
   })
 }
 
@@ -770,7 +762,7 @@ impl<G: Site, H: Site, S: Site + ToolLookup> ToolSites<G, H, S> {
   ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
     match tool {
       VcsTool::Subversion => {
-        if svn::dav_request(head) || matches!(head.method, b"GET" | b"HEAD") {
+        if svn::dav_request(head, self.room) || matches!(head.method, b"GET" | b"HEAD") {
           self
             .svn
             .decide_proven(head, secure, proven)
@@ -799,34 +791,22 @@ impl<G: Site, H: Site, S: Site + ToolLookup> ToolSites<G, H, S> {
     }
   }
 
-  /// Dispatches an authenticated multi-segment candidate matched to its registered tool.
-  async fn dispatch_exact_match(
+  /// Dispatches an authenticated multi-segment Git/LFS candidate matched to `VcsTool::Git`.
+  async fn dispatch_exact_git_match(
     &mut self,
     kind: ExactKind,
     head: &Head<'_>,
     secure: bool,
     proven: &git::Proven,
   ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
-    match kind {
-      ExactKind::LfsExact | ExactKind::Git => self
-        .git
-        .decide_proven(head, secure, proven)
-        .await
-        .map(ToolExchange::Git),
-      ExactKind::LfsBare => {
-        self.git.set_route_stage(RouteStage::LfsBareFallback);
-        self
-          .git
-          .decide_proven(head, secure, proven)
-          .await
-          .map(ToolExchange::Git)
-      }
-      ExactKind::Hg => self
-        .hg
-        .decide_proven(head, secure, proven)
-        .await
-        .map(ToolExchange::Hg),
+    if kind == ExactKind::LfsBare {
+      self.git.set_route_stage(RouteStage::LfsBareFallback);
     }
+    self
+      .git
+      .decide_proven(head, secure, proven)
+      .await
+      .map(ToolExchange::Git)
   }
 
   /// Propagates `LfsBareFallback` or `FirstAbsent` when a delegated site returns `Answer::Move`.
@@ -920,10 +900,10 @@ impl<G: Site, H: Site, S: Site + ToolLookup> ToolSites<G, H, S> {
       if self
         .svn
         .find_repository(&candidate.name)
-        .is_some_and(|record| record.tool == candidate.kind.tool())
+        .is_some_and(|record| record.tool == VcsTool::Git)
       {
         return self
-          .dispatch_exact_match(candidate.kind, head, secure, proven)
+          .dispatch_exact_git_match(candidate.kind, head, secure, proven)
           .await;
       }
     }
@@ -931,16 +911,17 @@ impl<G: Site, H: Site, S: Site + ToolLookup> ToolSites<G, H, S> {
     self.decide_first_segment_proven(head, secure, proven).await
   }
 
-  /// Stage `Initial`: checks any multi-segment syntactic repository candidate on its owning shard
-  /// before falling back to its `.git`-stripped LFS alias (`ExactLfsBare`) or the first path
-  /// segment (`ExactAbsent`).
-  async fn decide_initial_proven(
+  /// Stage `ExactGit`: checks any multi-segment Git LFS or Git smart/dumb HTTP repository
+  /// candidate on its owning shard before falling back to its `.git`-stripped LFS alias
+  /// (`ExactLfsBare`) or the first path segment (`ExactAbsent`).
+  async fn decide_exact_git_proven(
     &mut self,
     head: &Head<'_>,
     secure: bool,
     proven: &git::Proven,
   ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
-    let Some(candidate) = exact_multi_segment_candidate(head, self.room) else {
+    let Some(candidate) = exact_git_multi_segment_candidate(head, self.room) else {
+      self.stage = RouteStage::ExactAbsent;
       return self.decide_first_segment_proven(head, secure, proven).await;
     };
     if let git::Located::Elsewhere(shard) = self.svn.locate_repository(&candidate.name) {
@@ -952,10 +933,10 @@ impl<G: Site, H: Site, S: Site + ToolLookup> ToolSites<G, H, S> {
     if self
       .svn
       .find_repository(&candidate.name)
-      .is_some_and(|record| record.tool == candidate.kind.tool())
+      .is_some_and(|record| record.tool == VcsTool::Git)
     {
       return self
-        .dispatch_exact_match(candidate.kind, head, secure, proven)
+        .dispatch_exact_git_match(candidate.kind, head, secure, proven)
         .await;
     }
     if candidate.kind == ExactKind::LfsExact && exact_lfs_bare_candidate(head, self.room).is_some()
@@ -965,6 +946,38 @@ impl<G: Site, H: Site, S: Site + ToolLookup> ToolSites<G, H, S> {
     }
     self.stage = RouteStage::ExactAbsent;
     self.decide_first_segment_proven(head, secure, proven).await
+  }
+
+  /// Stage `Initial`: checks any multi-segment Mercurial (`?cmd=`) repository candidate (full
+  /// decoded path, strictly longer than any Git/LFS stripped candidate) on its owning shard before
+  /// advancing to [`RouteStage::ExactGit`].
+  async fn decide_initial_proven(
+    &mut self,
+    head: &Head<'_>,
+    secure: bool,
+    proven: &git::Proven,
+  ) -> Decided<ToolExchange<G::Exchange, H::Exchange, S::Exchange>> {
+    if let Some(name) = exact_hg_multi_segment_candidate(head, self.room) {
+      if let git::Located::Elsewhere(shard) = self.svn.locate_repository(&name) {
+        return Decided {
+          answer: Answer::Move { shard },
+          proven: true,
+        };
+      }
+      if self
+        .svn
+        .find_repository(&name)
+        .is_some_and(|record| record.tool == VcsTool::Mercurial)
+      {
+        return self
+          .hg
+          .decide_proven(head, secure, proven)
+          .await
+          .map(ToolExchange::Hg);
+      }
+    }
+    self.stage = RouteStage::ExactGit;
+    self.decide_exact_git_proven(head, secure, proven).await
   }
 
   /// Routes an authenticated request from the current monotonic [`RouteStage`].
@@ -979,6 +992,7 @@ impl<G: Site, H: Site, S: Site + ToolLookup> ToolSites<G, H, S> {
       RouteStage::FirstAbsent => self.dispatch_after_first_absent(head, secure, proven).await,
       RouteStage::ExactAbsent => self.decide_first_segment_proven(head, secure, proven).await,
       RouteStage::ExactLfsBare => self.decide_exact_lfs_bare(head, secure, proven).await,
+      RouteStage::ExactGit => self.decide_exact_git_proven(head, secure, proven).await,
       RouteStage::Initial => self.decide_initial_proven(head, secure, proven).await,
     }
   }

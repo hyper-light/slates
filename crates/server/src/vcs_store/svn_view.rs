@@ -12,7 +12,7 @@
 //! its clock's wall time, at which a lock's expiry is judged (`lock.c` `lock_expired`).
 //!
 //! **Read rules.** A repository's record names no Subversion authorization file yet, so no rule narrows a principal's
-//! reads below what the repository's policy lets it read (`crate::vcs_policy::reaches`, asked before anything is lent),
+//! reads below what the repository's policy lets it read (`crate::vcs_policy::svn_access`, asked before anything is lent),
 //! as `svnserve` and `mod_authz_svn` read every path of a repository whose configuration names no `authz-db` (GAPS).
 //!
 //! **The tunnel's lender** ([`TunnelRecords`], `svnserve -t` over the daemon's SSH site, A-688): the same records lent

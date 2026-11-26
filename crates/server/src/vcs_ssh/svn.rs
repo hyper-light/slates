@@ -11,7 +11,7 @@
 //! `svn_repos_find_root_path` walks up from the whole path. The repository's root URL is the client's URL cut after
 //! that run. A URL of another form is refused "Non-svn URL passed to svn server", one no repository holds "No
 //! repository found in '…'", and one whose repository's policy lets the principal reach it for none of its rights
-//! (A-597's `vcs_policy::reaches`, as the site judges Mercurial's `serve --stdio`) "No access allowed to this
+//! (A-597's `vcs_policy::svn_access`, enforcing both `Allow` and `Deny` rules) "No access allowed to this
 //! repository". A repository whose store is not held here ([`SvnStores::holds`]) is not served, in the site's words,
 //! with nothing written to the client.
 //!
@@ -84,10 +84,10 @@ use super::site::{
 use crate::repository::svn_commit::{self, Committed};
 use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
 use crate::vcs_http::git::Repositories;
-use crate::vcs_policy::{self, Right};
+use crate::vcs_policy::{self, SvnAccess};
 use crate::vcs_store::svn_view::{BroughtText, FetchedPiece};
 use crate::vcs_svn::{
-  HookSite, Hooked, Located, Location, MERGEINFO, post_lock_hook, pre_lock_hooks,
+  HookSite, Hooked, Located, Location, MERGEINFO, NOT_AUTHORIZED, post_lock_hook, pre_lock_hooks,
   revision_property_hook, run_hook,
 };
 
@@ -131,10 +131,6 @@ const CLOSED_WORDS: &str = "Network connection closed unexpectedly";
 const MALFORMED_WORDS: &str = "Malformed network data";
 /// The words of an item past its bound: `SVN_ERR_RA_SVN_REQUEST_SIZE`'s own (slates-svn's `report::Refused`).
 const TOO_LONG_WORDS: &str = "Client request too long";
-
-/// The rights some name of a repository must grant a principal for its tunnel to open it: any of the four, each command
-/// then judged by the session, as the site judges Mercurial's `serve --stdio`.
-const TUNNEL_RIGHTS: [Right; 4] = [Right::Read, Right::Submit, Right::Rewrite, Right::Delete];
 
 /// What a Subversion repository's sessions are opened with beside its sources: what `svnserve`'s `find_repos` and its
 /// `svnserve.conf` give `repos-info` and the authentication request.
@@ -766,8 +762,8 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
   /// Checks policy and store presence on the owner shard and opens `record` with `root_url`.
   fn open_record(&mut self, record: RepositoryRecord, root_url: &[u8]) {
     if !matches!(
-      vcs_policy::reaches(&record, &self.principal, &TUNNEL_RIGHTS),
-      Ok(true)
+      vcs_policy::svn_access(&record, &self.principal),
+      Ok(SvnAccess::Read | SvnAccess::Write)
     ) {
       crate::fleet::count_refusal(NO_ACCESS);
       return self.refuse_url(Refusal::NoAccess);
@@ -1105,6 +1101,24 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     let id = record.id;
     let policy = record.policy.clone();
     let hooked = Hooked::new(id, &record.name, self.stores.hook_views());
+    if vcs_policy::admit_svn_changes(
+      &record.owner,
+      &policy,
+      &self.principal,
+      &work.record.changes,
+    )
+    .is_err()
+    {
+      self.texts.clear();
+      let refused = slates_svn::serve::Uncommitted::Refused {
+        code: NOT_AUTHORIZED,
+        message: "Authorization failed".to_owned(),
+      };
+      if let Err(refused) = self.connection.not_committed(&refused, &mut self.out) {
+        self.end(refused);
+      }
+      return;
+    }
     let transaction = work.record.transaction.clone();
     let landed = self
       .stores
@@ -1847,23 +1861,16 @@ mod store_unrecovered_tests {
 
   /// Shape: UID of a read-only principal (`PolicyRight::Read` only) in the `svn+ssh://` policy test.
   const READER_UID: u32 = 88;
-  /// Shape: UID of a writer principal (`PolicyRight::Submit`) in the `svn+ssh://` policy test.
+  /// Shape: UID of a writer principal (`Read` + `Submit`) in the `svn+ssh://` policy test.
   const WRITER_UID: u32 = 89;
   /// Shape: UID of an outsider with no policy rule in the `svn+ssh://` policy test.
   const OUTSIDER_UID: u32 = 90;
+  /// Shape: UID of a `Submit`-only principal (without `Read`) in the `svn+ssh://` policy test.
+  const SUBMIT_ONLY_UID: u32 = 91;
+  /// Shape: UID of a principal denied by explicit `PolicyEffect::Deny` in the `svn+ssh://` test.
+  const DENIED_UID: u32 = 4242;
 
-  fn read_only_policy_record() -> RepositoryRecord {
-    use slates_db::catalog::{
-      PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyRule, PolicyWho,
-    };
-    let reader = Principal::Uid {
-      host: HostId(0),
-      uid: READER_UID,
-    };
-    let writer = Principal::Uid {
-      host: HostId(0),
-      uid: WRITER_UID,
-    };
+  fn svn_policy_record(rules: Vec<slates_db::catalog::PolicyRule>) -> RepositoryRecord {
     RepositoryRecord {
       index_bits: 0,
       id: REPO_ID,
@@ -1874,32 +1881,40 @@ mod store_unrecovered_tests {
       owner: owner_principal(),
       policy: RepositoryPolicy {
         version: 1,
-        rules: vec![
-          PolicyRule {
-            names: PolicyNames::Paths,
-            pattern: "/".to_owned(),
-            right: PolicyRight::Read,
-            effect: PolicyEffect::Allow,
-            who: PolicyWho::AnyOf {
-              entries: vec![PolicyEntry::Is { principal: reader }],
-            },
-          },
-          PolicyRule {
-            names: PolicyNames::Paths,
-            pattern: "/".to_owned(),
-            right: PolicyRight::Submit,
-            effect: PolicyEffect::Allow,
-            who: PolicyWho::AnyOf {
-              entries: vec![PolicyEntry::Is { principal: writer }],
-            },
-          },
-        ],
+        rules,
         hooks: Vec::new(),
         hooks_env: Vec::new(),
         signers: Vec::new(),
         hg_publishing: true,
       },
     }
+  }
+
+  fn read_only_policy_record() -> RepositoryRecord {
+    use slates_db::catalog::{
+      PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyRule, PolicyWho,
+    };
+    let uid = |n| Principal::Uid {
+      host: HostId(0),
+      uid: n,
+    };
+    let rule = |right: PolicyRight, target: u32| PolicyRule {
+      names: PolicyNames::Paths,
+      pattern: "/".to_owned(),
+      right,
+      effect: PolicyEffect::Allow,
+      who: PolicyWho::AnyOf {
+        entries: vec![PolicyEntry::Is {
+          principal: uid(target),
+        }],
+      },
+    };
+    svn_policy_record(vec![
+      rule(PolicyRight::Read, READER_UID),
+      rule(PolicyRight::Read, WRITER_UID),
+      rule(PolicyRight::Submit, WRITER_UID),
+      rule(PolicyRight::Submit, SUBMIT_ONLY_UID),
+    ])
   }
 
   struct PolicyRepo(RepositoryRecord);
@@ -1914,13 +1929,9 @@ mod store_unrecovered_tests {
   }
 
   fn assert_tunnel_access_policy(record: &RepositoryRecord, reader: &Principal) {
-    let writer = Principal::Uid {
+    let uid = |n| Principal::Uid {
       host: HostId(0),
-      uid: WRITER_UID,
-    };
-    let outsider = Principal::Uid {
-      host: HostId(0),
-      uid: OUTSIDER_UID,
+      uid: n,
     };
     assert_eq!(
       crate::vcs_store::svn_view::tunnel_access(Some(record), &owner_principal()),
@@ -1931,11 +1942,15 @@ mod store_unrecovered_tests {
       authz::Access::Read
     );
     assert_eq!(
-      crate::vcs_store::svn_view::tunnel_access(Some(record), &writer),
+      crate::vcs_store::svn_view::tunnel_access(Some(record), &uid(WRITER_UID)),
       authz::Access::Write
     );
     assert_eq!(
-      crate::vcs_store::svn_view::tunnel_access(Some(record), &outsider),
+      crate::vcs_store::svn_view::tunnel_access(Some(record), &uid(SUBMIT_ONLY_UID)),
+      authz::Access::None
+    );
+    assert_eq!(
+      crate::vcs_store::svn_view::tunnel_access(Some(record), &uid(OUTSIDER_UID)),
       authz::Access::None
     );
     assert_eq!(
@@ -1944,11 +1959,32 @@ mod store_unrecovered_tests {
     );
   }
 
+  fn open_ssh_tunnel(
+    record: RepositoryRecord,
+    principal: &Principal,
+  ) -> SvnCommand<PolicyRepo, DroppableStore> {
+    let alive: &'static Cell<bool> = Box::leak(Box::new(Cell::new(true)));
+    let records = test_records();
+    SvnCommand::new(
+      PolicyRepo(record.clone()),
+      DroppableStore {
+        alive,
+        unrecovered: false,
+        records,
+        record: Some(record),
+      },
+      principal,
+      test_bounds(),
+    )
+    .expect("tunnel starts")
+  }
+
   /// Gemini Suggestion 3 (`svn+ssh://` policy): Do check `tunnel_access` across owner, reader,
-  /// writer, outsider, and missing record, then drive an `SvnCommand` session as the read-only
-  /// principal sending `get-latest-rev` followed by `commit`. Expect: `tunnel_access` returns
-  /// `Write`/`Read`/`Write`/`None`/`None`; over `SvnCommand`, `get-latest-rev` succeeds
-  /// (`( success ( 0 ) )`) and `commit` is refused `E170001` (`Authorization failed`).
+  /// writer (`Read` + `Submit`), `Submit`-only, outsider, and missing record, then drive an
+  /// `SvnCommand` session as the read-only principal sending `get-latest-rev` followed by `commit`.
+  /// Expect: `tunnel_access` returns `Write`/`Read`/`Write`/`None`/`None`/`None`; over
+  /// `SvnCommand`, `get-latest-rev` succeeds (`( success ( 0 ) )`) and `commit` is refused
+  /// `E170001` (`Authorization failed`).
   #[test]
   fn suggestion3_ssh_tunnel_read_only_principal_reads_and_is_refused_commit_e170001() {
     let record = read_only_policy_record();
@@ -1958,21 +1994,7 @@ mod store_unrecovered_tests {
     };
     assert_tunnel_access_policy(&record, &reader);
 
-    let alive: &'static Cell<bool> = Box::leak(Box::new(Cell::new(true)));
-    let records = test_records();
-    let mut cmd = SvnCommand::new(
-      PolicyRepo(record.clone()),
-      DroppableStore {
-        alive,
-        unrecovered: false,
-        records,
-        record: Some(record),
-      },
-      &reader,
-      test_bounds(),
-    )
-    .expect("tunnel starts");
-
+    let mut cmd = open_ssh_tunnel(record, &reader);
     let handshake =
       b"( 2 ( edit-pipeline svndiff1 absent-entries depth mergeinfo log-revprops ) 22:svn+ssh://fixture/demo 8:SVN/1.15 ( ) ) \
         ( EXTERNAL ( 0: ) ) ";
@@ -1994,5 +2016,108 @@ mod store_unrecovered_tests {
       commit_out.contains("( failure ( ( 170001 "),
       "read-only ssh principal must be refused commit with E170001: {commit_out:?}"
     );
+  }
+
+  fn assert_ssh_handshake_refused_e170001(
+    record: RepositoryRecord,
+    principal: &Principal,
+    label: &str,
+  ) {
+    let open_msg =
+      b"( 2 ( edit-pipeline svndiff1 absent-entries depth mergeinfo log-revprops ) 22:svn+ssh://fixture/demo 8:SVN/1.15 ( ) ) ";
+    assert_eq!(
+      crate::vcs_store::svn_view::tunnel_access(Some(&record), principal),
+      authz::Access::None,
+      "{label} tunnel_access must be None"
+    );
+    let mut cmd = open_ssh_tunnel(record, principal);
+    cmd.input(open_msg).unwrap();
+    let (exit_code, stdout, stderr) = drive_until_exit(&mut cmd);
+    assert_eq!(exit_code, 1, "{label} must exit 1");
+    assert!(
+      stdout.contains("170001")
+        && stdout.contains("No access allowed")
+        && !stdout.contains("EXTERNAL"),
+      "{label} must refuse E170001 without disclosing EXTERNAL/UUID: {stdout:?}"
+    );
+    assert!(
+      stderr.contains("E170001") && stderr.contains("No access allowed"),
+      "{label} stderr must carry E170001: {stderr:?}"
+    );
+  }
+
+  fn assert_ssh_read_allowed_commit_refused(record: RepositoryRecord, principal: &Principal) {
+    let open_msg =
+      b"( 2 ( edit-pipeline svndiff1 absent-entries depth mergeinfo log-revprops ) 22:svn+ssh://fixture/demo 8:SVN/1.15 ( ) ) ";
+    assert_eq!(
+      crate::vcs_store::svn_view::tunnel_access(Some(&record), principal),
+      authz::Access::Read
+    );
+    let mut cmd = open_ssh_tunnel(record, principal);
+    cmd.input(open_msg).unwrap();
+    cmd.input(b"( EXTERNAL ( 0: ) ) ").unwrap();
+    let _ = drive_until_input(&mut cmd);
+    cmd.input(b"( get-latest-rev ( ) ) ").unwrap();
+    let read_out = drive_until_input(&mut cmd);
+    assert!(
+      read_out.contains("( success ( 0 ) )"),
+      "Deny Submit must still allow reads: {read_out:?}"
+    );
+    cmd
+      .input(b"( commit ( 4:test ( ) false ( ( 7:svn:log 4:test ) ) ) ) ")
+      .unwrap();
+    let commit_out = drive_until_input(&mut cmd);
+    assert!(
+      commit_out.contains("( failure ( ( 170001 "),
+      "Deny Submit must refuse commit with E170001: {commit_out:?}"
+    );
+  }
+
+  /// Round-4 Blocker 2 + Suggestion 2 (`svn+ssh://` front-door `PolicyEffect::Deny` and
+  /// `Submit`-only enforcement): Do open `SvnCommand` sessions for (a) `Submit`-only without
+  /// `Read`, (b) `[Allow Read / Anyone, Deny Read / uid:4242]`, and (c) `[Allow Read / Anyone,
+  /// Allow Submit / Anyone, Deny Submit / uid:4242]`. Expect: (a) and (b) are refused `E170001`
+  /// ("No access allowed to this repository") at handshake BEFORE disclosing the repository UUID,
+  /// while (c) reads (`get-latest-rev`) cleanly and refuses `commit` with `E170001`.
+  #[test]
+  fn round4_blocker2_ssh_tunnel_enforces_deny_read_deny_submit_and_submit_only() {
+    use slates_db::catalog::{
+      PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyRule, PolicyWho,
+    };
+    let denied = Principal::Uid {
+      host: HostId(0),
+      uid: DENIED_UID,
+    };
+    let submit_only = Principal::Uid {
+      host: HostId(0),
+      uid: SUBMIT_ONLY_UID,
+    };
+    let only_denied = PolicyWho::AnyOf {
+      entries: vec![PolicyEntry::Is {
+        principal: denied.clone(),
+      }],
+    };
+    let rule = |right: PolicyRight, effect: PolicyEffect, who: PolicyWho| PolicyRule {
+      names: PolicyNames::Paths,
+      pattern: "/".to_owned(),
+      right,
+      effect,
+      who,
+    };
+
+    assert_ssh_handshake_refused_e170001(read_only_policy_record(), &submit_only, "Submit-only");
+
+    let deny_read = svn_policy_record(vec![
+      rule(PolicyRight::Read, PolicyEffect::Allow, PolicyWho::Anyone),
+      rule(PolicyRight::Read, PolicyEffect::Deny, only_denied.clone()),
+    ]);
+    assert_ssh_handshake_refused_e170001(deny_read, &denied, "Deny Read");
+
+    let deny_write = svn_policy_record(vec![
+      rule(PolicyRight::Read, PolicyEffect::Allow, PolicyWho::Anyone),
+      rule(PolicyRight::Submit, PolicyEffect::Allow, PolicyWho::Anyone),
+      rule(PolicyRight::Submit, PolicyEffect::Deny, only_denied),
+    ]);
+    assert_ssh_read_allowed_commit_refused(deny_write, &denied);
   }
 }

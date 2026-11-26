@@ -1192,7 +1192,7 @@ fn stock_svn_reads_a_repository_through_the_site_over_https() {
 fn a_request_is_subversions_by_its_method_or_its_special_segment() {
   let asked = |method: &str, target: &str| {
     let input = request(method, target, &[]);
-    super::dav_request(&head(&input))
+    super::dav_request(&head(&input), ROOM)
   };
   let svn = [
     asked("OPTIONS", "/project"),
@@ -1200,6 +1200,9 @@ fn a_request_is_subversions_by_its_method_or_its_special_segment() {
     asked("REPORT", "/project/!svn/me"),
     asked("GET", "/project/!svn/rvr/3/trunk/a.txt"),
     asked("POST", "/project/!svn/me"),
+    asked("POST", "/project/%21svn/me"),
+    asked("POST", "/project/%21%73%76%6e/me"),
+    asked("GET", "/project/%21svn/rvr/3/trunk/a.txt"),
     asked("MERGE", "/project/trunk"),
   ];
   let others = [
@@ -1208,8 +1211,10 @@ fn a_request_is_subversions_by_its_method_or_its_special_segment() {
     asked("POST", "/project/git-receive-pack"),
     asked("POST", "/project.git/info/lfs/objects/batch"),
     asked("GET", "/project/svn/trunk"),
+    asked("POST", "/project/%21Svn/me"),
+    asked("POST", "/project/%21svn%2fme"),
   ];
-  assert_eq!((svn, others), ([true; 6], [false; 5]));
+  assert_eq!((svn, others), ([true; 9], [false; 7]));
 }
 
 /// Minimal stub site that marks which protocol site [`ToolSites`] dispatched to.
@@ -2527,4 +2532,616 @@ fn suggestion1_unauthenticated_cmd_query_preserves_401_parity_across_all_repo_st
       assert_unauthenticated_401_with_challenge(&mut tools, method, &target);
     }
   }
+}
+
+/// Shape: SVN-planted spoof files matching every Git/LFS suffix tested in Blocker 1.
+const HG_SHADOW_SPOOF_FILES: &[(&str, &[u8])] = &[
+  ("/HEAD", b"SPOOFED_SVN_HEAD\n"),
+  ("/info/refs", b"SPOOFED_SVN_REFS\n"),
+  ("/info/lfs/locks", b"SPOOFED_SVN_LFS_LOCKS\n"),
+  ("/team/HEAD", b"SPOOFED_SVN_ORG_TEAM_HEAD\n"),
+];
+
+fn repo_with_hg_shadow_spoof_files() -> Repo {
+  let dirs = ["/info", "/info/lfs", "/team"];
+  let mut changes: Vec<ChangedPath> = dirs
+    .iter()
+    .map(|path| added(path, NodeKind::Directory, None, None))
+    .collect();
+  let mut tree_r1 = BTreeMap::from([("/".to_owned(), true)]);
+  for dir in dirs {
+    tree_r1.insert(dir.to_owned(), true);
+  }
+  let mut texts = BTreeMap::new();
+  for (path, bytes) in HG_SHADOW_SPOOF_FILES {
+    let text = text_of(bytes);
+    texts.insert(text.identity, bytes.to_vec());
+    changes.push(added(path, NodeKind::File, Some(text), None));
+    tree_r1.insert((*path).to_owned(), false);
+  }
+  let mut index = Index::new();
+  index
+    .append(
+      RevisionRecord {
+        transaction: "0-1".to_owned(),
+        changes,
+      },
+      usize::try_from(ROOM).unwrap(),
+    )
+    .unwrap();
+  let date = |value: &str| (b"svn:date".to_vec(), value.as_bytes().to_vec());
+  Repo {
+    index,
+    trees: vec![BTreeMap::from([("/".to_owned(), true)]), tree_r1],
+    lists: BTreeMap::new(),
+    texts,
+    revisions: vec![
+      vec![date("2026-11-18T00:00:00.000000Z")],
+      vec![
+        (b"svn:author".to_vec(), b"alice".to_vec()),
+        date(DATE),
+        (b"svn:log".to_vec(), b"spoof hg git suffixes".to_vec()),
+      ],
+    ],
+    locks: LockTable::new(),
+    authz: Authz::parse(AUTHZ, None, authz::Bounds::of(AUTHZ, None)).unwrap(),
+  }
+}
+
+/// Multi-shard catalog spanning 8 distinct shards to test multi-segment Mercurial repos ending in
+/// Git/LFS suffixes, Git/SVN coexistence, and strictly monotonic cross-shard hops.
+struct EightShardHgShadowCatalog {
+  shard: u16,
+}
+
+impl EightShardHgShadowCatalog {
+  fn owner_of(name: &str) -> u16 {
+    match name {
+      "team/HEAD" | "team/info/refs" | "team/info/lfs/locks" | "team/git-upload-pack" => 0,
+      "org/team/HEAD" | "team/missing.git/info/lfs/objects/batch" => 1,
+      "gprefix/HEAD" | "team/missing.git" => 2,
+      "ns/app/HEAD" | "team/missing" => 3,
+      "team" | "org" | "plain" => 4,
+      "gprefix" | "team/app" => 5,
+      "ns/app" => 6,
+      _ => 7,
+    }
+  }
+}
+
+impl Repositories for EightShardHgShadowCatalog {
+  fn locate(&self, name: &str) -> Located {
+    let owner = Self::owner_of(name);
+    if owner == self.shard {
+      Located::Here
+    } else {
+      Located::Elsewhere(owner)
+    }
+  }
+
+  fn find(&self, name: &str) -> Option<RepositoryRecord> {
+    if Self::owner_of(name) != self.shard {
+      return None;
+    }
+    let (id_byte, tool, format) = match name {
+      "team" | "org" | "plain" => (0, VcsTool::Subversion, ObjectFormat::Revisions),
+      "gprefix" | "ns/app" | "team/app" => (31, VcsTool::Git, ObjectFormat::Sha1),
+      "team/HEAD"
+      | "team/info/refs"
+      | "team/info/lfs/locks"
+      | "team/git-upload-pack"
+      | "org/team/HEAD"
+      | "gprefix/HEAD"
+      | "ns/app/HEAD" => (32, VcsTool::Mercurial, ObjectFormat::Sha1),
+      _ => return None,
+    };
+    let id = if id_byte == 0 {
+      REPO
+    } else {
+      RepositoryId {
+        bytes: [id_byte; 16],
+      }
+    };
+    Some(RepositoryRecord {
+      index_bits: 0,
+      id,
+      name: name.to_owned(),
+      tool,
+      format,
+      default_branch: None,
+      owner: principal(OWNER),
+      policy: RepositoryPolicy {
+        version: 1,
+        rules: Vec::new(),
+        hooks: Vec::new(),
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+        hg_publishing: true,
+      },
+    })
+  }
+}
+
+/// Shape: upper bound on cross-shard hops across the 6 monotonic `RouteStage` levels.
+const MAX_EIGHT_SHARD_HOPS: usize = 6;
+
+/// Minimal Mercurial site stub backed by `EightShardHgShadowCatalog` that mirrors real
+/// `HgSite`'s cross-shard `locate`/`find` (`Move` -> `421` marker for Hg -> `404` if absent).
+struct CatalogHgStub(EightShardHgShadowCatalog);
+
+impl Site for CatalogHgStub {
+  type Exchange = StubExchange;
+
+  async fn decide(&mut self, head: &Head<'_>, _secure: bool) -> Decided<Self::Exchange> {
+    let Some(name) = crate::vcs_http::hg::wire_repo_candidate(head, ROOM) else {
+      return Decided {
+        answer: Answer::Refuse {
+          status: Status::NOT_FOUND,
+          fields: Vec::new(),
+        },
+        proven: true,
+      };
+    };
+    if let Located::Elsewhere(shard) = self.0.locate(&name) {
+      return Decided {
+        answer: Answer::Move { shard },
+        proven: true,
+      };
+    }
+    let status = if self
+      .0
+      .find(&name)
+      .is_some_and(|record| record.tool == VcsTool::Mercurial)
+    {
+      Status {
+        code: 421,
+        reason: "HgMatched",
+      }
+    } else {
+      Status::NOT_FOUND
+    };
+    Decided {
+      answer: Answer::Refuse {
+        status,
+        fields: Vec::new(),
+      },
+      proven: true,
+    }
+  }
+}
+
+type EightShardTools = ToolSites<
+  GitSite<Tokens, EightShardHgShadowCatalog, MockGitServices, MockLfs>,
+  CatalogHgStub,
+  SvnSite<Tokens, EightShardHgShadowCatalog, Stores>,
+>;
+
+fn run_eight_shard_tool_sites(
+  start_shard: u16,
+  req: &[u8],
+  repo: &'static Repo,
+) -> (usize, Decided<<EightShardTools as Site>::Exchange>) {
+  let mut shard = start_shard;
+  let mut stage = crate::vcs_http::RouteStage::Initial;
+  for hops in 0..=MAX_EIGHT_SHARD_HOPS {
+    let git = GitSite::new(
+      REALM.to_owned(),
+      ROOM,
+      Tokens,
+      EightShardHgShadowCatalog { shard },
+      MockGitServices,
+    )
+    .with_lfs(MockLfs);
+    let svn = SvnSite::new(
+      REALM.to_owned(),
+      ROOM,
+      Tokens,
+      EightShardHgShadowCatalog { shard },
+      Stores { repo },
+    );
+    let mut tools = ToolSites::new(
+      git,
+      CatalogHgStub(EightShardHgShadowCatalog { shard }),
+      svn,
+      ROOM,
+    );
+    tools.set_route_stage(stage);
+    let decided = ready(tools.decide(&head(req), false));
+    match decided.answer {
+      Answer::Move { shard: next } => {
+        stage = tools.route_stage();
+        shard = next;
+      }
+      _ => {
+        assert_eq!(
+          tools.route_stage(),
+          crate::vcs_http::RouteStage::Initial,
+          "terminal decision must reset route_stage to Initial"
+        );
+        return (hops, decided);
+      }
+    }
+  }
+  panic!(
+    "ToolSites cross-shard routing exceeded {MAX_EIGHT_SHARD_HOPS} hops from shard {start_shard}"
+  );
+}
+
+fn assert_eight_shard_hg_suffixes(repo: &'static Repo, owner: &str) {
+  for (method, target) in [
+    ("GET", "/team/HEAD?cmd=capabilities"),
+    ("GET", "/team/info/refs?cmd=capabilities"),
+    ("GET", "/team/info/lfs/locks?cmd=capabilities"),
+    ("GET", "/team/git-upload-pack?cmd=capabilities"),
+    ("POST", "/team/git-upload-pack?cmd=unbundle"),
+    ("GET", "/org/team/HEAD?cmd=capabilities"),
+    ("GET", "/gprefix/HEAD?cmd=capabilities"),
+    ("GET", "/ns/app/HEAD?cmd=capabilities"),
+  ] {
+    let req = request(method, target, &[owner]);
+    let (_hops, decided) = run_eight_shard_tool_sites(7, &req, repo);
+    assert!(
+      matches!(decided.answer, Answer::Refuse { status, .. } if status.code == 421),
+      "{method} {target} must route to HgSite (421), never shadowed by SVN/Git"
+    );
+  }
+}
+
+fn assert_eight_shard_coexistence_and_missing(repo: &'static Repo, owner: &str) {
+  let git_with_cmd = request(
+    "GET",
+    "/team/app/info/refs?service=git-upload-pack&cmd=capabilities",
+    &[owner],
+  );
+  let (_hops, decided) = run_eight_shard_tool_sites(7, &git_with_cmd, repo);
+  assert!(
+    matches!(
+      decided.answer,
+      Answer::Serve {
+        exchange: ToolExchange::Git(_),
+        ..
+      }
+    ),
+    "Git team/app must still serve when no Hg team/app/info/refs exists"
+  );
+
+  let git_dumb = request("GET", "/ns/app/HEAD", &[owner]);
+  let (_hops, decided) = run_eight_shard_tool_sites(7, &git_dumb, repo);
+  assert!(
+    matches!(decided.answer, Answer::Refuse { status, .. } if status.code == 403),
+    "non-cmd GET /ns/app/HEAD must stay on GitSite (403 DumbProtocol)"
+  );
+
+  let svn_fallback = request("GET", "/plain/HEAD?cmd=capabilities", &[owner]);
+  let (_hops, decided) = run_eight_shard_tool_sites(7, &svn_fallback, repo);
+  assert!(
+    matches!(
+      decided.answer,
+      Answer::Serve {
+        exchange: ToolExchange::Svn(_),
+        ..
+      }
+    ),
+    "SVN plain/HEAD?cmd=capabilities must serve from SvnSite when no Hg plain/HEAD exists"
+  );
+}
+
+fn assert_eight_shard_missing_lfs_bounded(repo: &'static Repo, owner: &str) {
+  let lfs_headers = [
+    owner,
+    "Accept: application/vnd.git-lfs+json",
+    "Content-Type: application/vnd.git-lfs+json",
+  ];
+  for target in [
+    "/team/missing.git/info/lfs/objects/batch",
+    "/team/missing.git/info/lfs/objects/batch?cmd=capabilities",
+  ] {
+    let req = request("POST", target, &lfs_headers);
+    let (hops, decided) = run_eight_shard_tool_sites(7, &req, repo);
+    assert!(hops <= MAX_EIGHT_SHARD_HOPS, "{target} took {hops} hops");
+    assert!(
+      matches!(decided.answer, Answer::Refuse { status, .. } if status == Status::NOT_FOUND),
+      "{target} must terminate 404 without livelock"
+    );
+  }
+}
+
+/// Round-4 Blocker 1: Do route 2/3/4-segment Mercurial repos ending in Git/LFS suffixes
+/// (`team/HEAD`, `team/info/refs`, `team/info/lfs/locks`, `team/git-upload-pack`, `org/team/HEAD`,
+/// `gprefix/HEAD`, `ns/app/HEAD`), Git smart/dumb coexistences, SVN fallback (`plain/HEAD`), and
+/// absent `team/missing.git/info/lfs/objects/batch` across 8 distinct shards. Expect: every
+/// registered Hg repo dispatches to `HgSite` (`421` stub), Git smart/dumb routes stay on `GitSite`,
+/// SVN fallback serves SVN `/HEAD`, and missing LFS paths terminate `404` within bounded hops.
+#[test]
+fn round4_blocker1_multi_segment_hg_git_suffixes_and_eight_shard_monotonicity() {
+  let repo: &'static Repo = Box::leak(Box::new(repo_with_hg_shadow_spoof_files()));
+  let owner = basic("alice", OWNER_TOKEN);
+  assert_eight_shard_hg_suffixes(repo, &owner);
+  assert_eight_shard_coexistence_and_missing(repo, &owner);
+  assert_eight_shard_missing_lfs_bounded(repo, &owner);
+}
+
+/// Round-4 Suggestion 1: Do send `POST /repo/%21svn/me` (percent-encoded `!svn`) through
+/// `ToolSites` as the owner and unauthenticated. Expect: owner dispatches to `ToolExchange::Svn`
+/// (identical to `POST /repo/!svn/me`, never `404` via `GitSite`) and unauthenticated gets `401`.
+#[test]
+fn round4_suggestion1_percent_encoded_special_segment_routes_to_svn() {
+  let mut tools = real_tool_sites_with_suffix_files();
+  let owner = basic("alice", OWNER_TOKEN);
+  let req = request(
+    "POST",
+    "/repo/%21svn/me",
+    &[&owner, "Content-Type: application/vnd.svn-skel"],
+  );
+  assert!(
+    matches!(
+      ready(tools.decide(&head(&req), false)).answer,
+      Answer::Serve {
+        exchange: ToolExchange::Svn(_),
+        ..
+      }
+    ),
+    "POST /repo/%21svn/me must route to SvnSite"
+  );
+  assert_unauthenticated_401_with_challenge(&mut tools, "POST", "/repo/%21svn/me");
+}
+
+/// Configurable policy fixture for HTTP WebDAV `PolicyEffect::Deny` and per-path authz tests.
+struct PolicyHeld {
+  rules: Vec<slates_db::catalog::PolicyRule>,
+}
+
+impl Repositories for PolicyHeld {
+  fn locate(&self, _name: &str) -> Located {
+    Located::Here
+  }
+
+  fn find(&self, name: &str) -> Option<RepositoryRecord> {
+    if name != "repo" {
+      return None;
+    }
+    Some(RepositoryRecord {
+      index_bits: 0,
+      id: REPO,
+      name: "repo".to_owned(),
+      tool: VcsTool::Subversion,
+      format: ObjectFormat::Revisions,
+      default_branch: None,
+      owner: principal(OWNER),
+      policy: RepositoryPolicy {
+        version: 1,
+        rules: self.rules.clone(),
+        hooks: Vec::new(),
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+        hg_publishing: true,
+      },
+    })
+  }
+}
+
+fn svn_site_with_rules(
+  repo: &'static Repo,
+  rules: Vec<slates_db::catalog::PolicyRule>,
+) -> SvnSite<Tokens, PolicyHeld, Stores> {
+  SvnSite::new(
+    REALM.to_owned(),
+    ROOM,
+    Tokens,
+    PolicyHeld { rules },
+    Stores { repo },
+  )
+}
+
+fn assert_dav_status(
+  svn: &mut SvnSite<Tokens, PolicyHeld, Stores>,
+  auth: &str,
+  method: &str,
+  target: &str,
+  expected_serve: bool,
+) {
+  let req = request(method, target, &[auth]);
+  let answer = ready(svn.answer(&head(&req))).answer;
+  if expected_serve {
+    assert!(
+      matches!(answer, Answer::Serve { .. }),
+      "{method} {target} must be allowed"
+    );
+  } else {
+    let Answer::Refuse { status, .. } = answer else {
+      panic!("{method} {target} must be refused 403");
+    };
+    assert_eq!(status, Status::FORBIDDEN, "{method} {target}");
+  }
+}
+
+/// Round-4 Blocker 2 + Suggestion 2 (HTTP WebDAV `PolicyEffect::Deny`, per-path `Deny`,
+/// subpath `Allow` under root `Deny`, `Submit`-only, and owner `Deny Submit`): Do drive `SvnSite`
+/// across all six policy shapes. Expect: `Deny Read /` and `Submit`-only refuse all methods `403`;
+/// `Deny Submit /` (non-owner and owner) permits reads and refuses all writes `403`; per-path
+/// `Deny Read /secret` refuses `GET`/`PROPFIND`/`!svn/rvr` under `/secret` while allowing `/trunk`;
+/// subpath `Allow Read /trunk` under root `Deny Read /` allows `OPTIONS /repo` and `/trunk` reads
+/// while refusing `/secret`.
+#[test]
+fn round4_blocker2_http_webdav_enforces_deny_rules_per_path_and_submit_only() {
+  use slates_db::catalog::{
+    PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyRule, PolicyWho,
+  };
+  let repo: &'static Repo = Box::leak(Box::new(Repo::build()));
+  let stranger = basic("bob", STRANGER_TOKEN);
+  let owner = basic("alice", OWNER_TOKEN);
+  let only = |uid: u32| PolicyWho::AnyOf {
+    entries: vec![PolicyEntry::Is {
+      principal: principal(uid),
+    }],
+  };
+  let rule = |pattern: &str, right: PolicyRight, effect: PolicyEffect, who: PolicyWho| PolicyRule {
+    names: PolicyNames::Paths,
+    pattern: pattern.to_owned(),
+    right,
+    effect,
+    who,
+  };
+
+  // 1. [Allow Read / Anyone, Deny Read / STRANGER] -> 403 on all reads & writes.
+  let mut deny_read = svn_site_with_rules(
+    repo,
+    vec![
+      rule(
+        "/",
+        PolicyRight::Read,
+        PolicyEffect::Allow,
+        PolicyWho::Anyone,
+      ),
+      rule("/", PolicyRight::Read, PolicyEffect::Deny, only(STRANGER)),
+    ],
+  );
+  for (m, t) in [
+    ("GET", "/repo/trunk/a.txt"),
+    ("OPTIONS", "/repo"),
+    ("PROPFIND", "/repo"),
+    ("REPORT", "/repo/!svn/me"),
+    ("POST", "/repo/!svn/me"),
+  ] {
+    assert_dav_status(&mut deny_read, &stranger, m, t, false);
+  }
+
+  // 2. [Allow Read / Anyone, Allow Submit / Anyone, Deny Submit / STRANGER] -> reads ok, writes 403.
+  let mut deny_write = svn_site_with_rules(
+    repo,
+    vec![
+      rule(
+        "/",
+        PolicyRight::Read,
+        PolicyEffect::Allow,
+        PolicyWho::Anyone,
+      ),
+      rule(
+        "/",
+        PolicyRight::Submit,
+        PolicyEffect::Allow,
+        PolicyWho::Anyone,
+      ),
+      rule("/", PolicyRight::Submit, PolicyEffect::Deny, only(STRANGER)),
+    ],
+  );
+  assert_dav_status(&mut deny_write, &stranger, "GET", "/repo/trunk/a.txt", true);
+  for (m, t) in [
+    ("POST", "/repo/!svn/me"),
+    ("MKACTIVITY", "/repo/!svn/act/a1"),
+    ("LOCK", "/repo/trunk/a.txt"),
+    ("UNLOCK", "/repo/trunk/a.txt"),
+    ("PROPPATCH", "/repo/!svn/rev/1"),
+    ("MERGE", "/repo"),
+  ] {
+    assert_dav_status(&mut deny_write, &stranger, m, t, false);
+  }
+
+  // 3. Submit-only [Allow Submit / STRANGER] (no Read) -> 403 on both reads & writes.
+  let mut submit_only = svn_site_with_rules(
+    repo,
+    vec![rule(
+      "/",
+      PolicyRight::Submit,
+      PolicyEffect::Allow,
+      only(STRANGER),
+    )],
+  );
+  assert_dav_status(
+    &mut submit_only,
+    &stranger,
+    "GET",
+    "/repo/trunk/a.txt",
+    false,
+  );
+  assert_dav_status(&mut submit_only, &stranger, "POST", "/repo/!svn/me", false);
+
+  // 4. Owner with explicit Deny Submit / owner -> reads ok, writes 403.
+  let mut owner_ro = svn_site_with_rules(
+    repo,
+    vec![rule(
+      "/",
+      PolicyRight::Submit,
+      PolicyEffect::Deny,
+      only(OWNER),
+    )],
+  );
+  assert_dav_status(&mut owner_ro, &owner, "GET", "/repo/trunk/a.txt", true);
+  assert_dav_status(&mut owner_ro, &owner, "POST", "/repo/!svn/me", false);
+
+  // 5. Per-path Deny Read /secret -> /trunk ok, /secret + !svn/rvr/1/secret 403.
+  let mut path_deny = svn_site_with_rules(
+    repo,
+    vec![
+      rule(
+        "/",
+        PolicyRight::Read,
+        PolicyEffect::Allow,
+        PolicyWho::Anyone,
+      ),
+      rule(
+        "/secret",
+        PolicyRight::Read,
+        PolicyEffect::Deny,
+        PolicyWho::Anyone,
+      ),
+    ],
+  );
+  assert_dav_status(&mut path_deny, &stranger, "GET", "/repo/trunk/a.txt", true);
+  assert_dav_status(
+    &mut path_deny,
+    &stranger,
+    "GET",
+    "/repo/secret/b.txt",
+    false,
+  );
+  assert_dav_status(
+    &mut path_deny,
+    &stranger,
+    "GET",
+    "/repo/!svn/rvr/1/secret/b.txt",
+    false,
+  );
+  assert_dav_status(&mut path_deny, &stranger, "PROPFIND", "/repo/secret", false);
+
+  // 6. Subpath Allow /trunk under root Deny / -> OPTIONS + /trunk ok, /secret 403.
+  let mut sub_allow = svn_site_with_rules(
+    repo,
+    vec![
+      rule(
+        "/",
+        PolicyRight::Read,
+        PolicyEffect::Allow,
+        PolicyWho::Anyone,
+      ),
+      rule(
+        "/",
+        PolicyRight::Read,
+        PolicyEffect::Deny,
+        PolicyWho::Anyone,
+      ),
+      rule(
+        "/trunk",
+        PolicyRight::Read,
+        PolicyEffect::Allow,
+        only(STRANGER),
+      ),
+    ],
+  );
+  assert_dav_status(&mut sub_allow, &stranger, "OPTIONS", "/repo", true);
+  assert_dav_status(&mut sub_allow, &stranger, "GET", "/repo/trunk/a.txt", true);
+  assert_dav_status(
+    &mut sub_allow,
+    &stranger,
+    "GET",
+    "/repo/!svn/rvr/1/trunk/a.txt",
+    true,
+  );
+  assert_dav_status(
+    &mut sub_allow,
+    &stranger,
+    "GET",
+    "/repo/secret/b.txt",
+    false,
+  );
 }

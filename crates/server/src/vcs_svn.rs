@@ -54,7 +54,7 @@
 //! live token's record keys is answered as `svnserve` answers a user it has no password for. From there each call is
 //! handed the repository's sources, lent afresh on the owner, with the principal's access: write where the repository's
 //! policy grants any write right (`Submit`/`Rewrite`/`Delete`), read where it grants only `Read`, and nothing otherwise
-//! (`vcs_policy::reaches`). A commit's drive runs over
+//! (`vcs_policy::svn_access`). A commit's drive runs over
 //! those sources; a hook it waits for passes where the repository configures none at its point and is refused where one
 //! is (none runs yet); its accepted work lands through the owner's commit step (A-698's
 //! `repository::svn_commit::land_work`, which the `svn+ssh://` tunnel calls too), and `close-edit` is answered with
@@ -144,13 +144,8 @@ const READ_BYTES: usize = SVN_READ_PAGES * SVN_PAGE_BYTES;
 /// Format: the fewest bytes a path spends on one of its names: a name of one byte and its `/`.
 const NAME_BYTES: usize = 2;
 
-/// The write rights some name of a repository must grant an authenticated principal for its
-/// `svn://` session to receive `Access::Write` (`auth-access = write`).
-const WRITE_RIGHTS: [crate::vcs_policy::Right; 3] = [
-  crate::vcs_policy::Right::Submit,
-  crate::vcs_policy::Right::Rewrite,
-  crate::vcs_policy::Right::Delete,
-];
+/// Format: `SVN_ERR_RA_NOT_AUTHORIZED` (`svn_error_codes.h`: RA category 170,000 + 1).
+pub(crate) const NOT_AUTHORIZED: u32 = 170_001;
 
 /// Whether a repository lets a client read without authenticating (`svnserve`'s `anon-access`): none does, since every
 /// request is a principal's and a client that has not authenticated is none (§4.13).
@@ -1215,25 +1210,17 @@ fn held_sources<T>(
   .flatten()
 }
 
-/// Evaluates `principal`'s `svn://` session access on `record` (`svnserve`'s `auth-access`):
-/// `Write` when the repository's policy grants any write right (`Submit`/`Rewrite`/`Delete`),
-/// `Read` when it grants only `Read`, and `None` otherwise.
+/// Evaluates `principal`'s `svn://` session access on `record` (`svnserve`'s `auth-access`)
+/// using full [`crate::vcs_policy::SvnPolicy`] precedence (`PolicyEffect::Deny` included),
+/// requiring effective `Read` for any access (`None < Read < Write`).
 pub(crate) fn access_for_record(
   record: &slates_db::catalog::RepositoryRecord,
   principal: &Principal,
 ) -> slates_svn::authz::Access {
-  if matches!(
-    crate::vcs_policy::reaches(record, principal, &WRITE_RIGHTS),
-    Ok(true)
-  ) {
-    slates_svn::authz::Access::Write
-  } else if matches!(
-    crate::vcs_policy::reaches(record, principal, &[crate::vcs_policy::Right::Read]),
-    Ok(true)
-  ) {
-    slates_svn::authz::Access::Read
-  } else {
-    slates_svn::authz::Access::None
+  match crate::vcs_policy::svn_access(record, principal) {
+    Ok(crate::vcs_policy::SvnAccess::Write) => slates_svn::authz::Access::Write,
+    Ok(crate::vcs_policy::SvnAccess::Read) => slates_svn::authz::Access::Read,
+    Ok(crate::vcs_policy::SvnAccess::None) | Err(_) => slates_svn::authz::Access::None,
   }
 }
 
@@ -1413,6 +1400,15 @@ async fn finish_post_lock(
   conversation.connection.locks_finished(ended, out).is_ok()
 }
 
+/// Draws a random lock token from the system generator, setting `undrawn` if entropy fails.
+fn draw_lock_token(undrawn: &Cell<bool>) -> [u8; slates_svn::lock::UUID_BYTES] {
+  let mut token = [0u8; slates_svn::lock::UUID_BYTES];
+  if aws_lc_rs::rand::fill(&mut token).is_err() {
+    undrawn.set(true);
+  }
+  token
+}
+
 /// Judges the lock verb the client asked for over the repository's sources on its owner, lands the lock entries it
 /// makes through the owner's step (a `Record::Locks`, durable as a revision is; `repository::svn_commit::land_record_with`), and
 /// answers it (A-693 part 2; `slates_svn::serve` `locks`), running the repository's hooks where `svnserve` runs them
@@ -1423,10 +1419,10 @@ async fn finish_post_lock(
 /// one item has bytes.
 async fn lock(stream: &TcpStream, conversation: &mut Conversation, out: &mut Vec<u8>) -> bool {
   let room = conversation.limits.item_bytes;
-  let Some((id, hooked)) = conversation
+  let Some((id, name, hooked)) = conversation
     .opened
     .as_ref()
-    .map(|opened| (opened.id, opened.hooked()))
+    .map(|opened| (opened.id, opened.name.clone(), opened.hooked()))
   else {
     return false;
   };
@@ -1442,16 +1438,11 @@ async fn lock(stream: &TcpStream, conversation: &mut Conversation, out: &mut Vec
   // The repository's landing turn, held from the judgment to the entries' landing, so no other landing moves the lock
   // table between them (C2, `svn_commit::landing`).
   let Some(turn) = svn_commit::landing::turn(id).await else {
+    fail_store_missing(&mut conversation.connection, &name, out);
     return false;
   };
   let undrawn = Cell::new(false);
-  let mut draw = || {
-    let mut token = [0u8; slates_svn::lock::UUID_BYTES];
-    if aws_lc_rs::rand::fill(&mut token).is_err() {
-      undrawn.set(true);
-    }
-    token
-  };
+  let mut draw = || draw_lock_token(&undrawn);
   let Some(entries) = lend_lock_judged(conversation, verdicts, &mut draw, room, out) else {
     return false;
   };
@@ -1566,10 +1557,10 @@ async fn revision_property(
   out: &mut Vec<u8>,
 ) -> bool {
   let room = conversation.limits.item_bytes;
-  let Some((id, hooked)) = conversation
+  let Some((id, name, hooked)) = conversation
     .opened
     .as_ref()
-    .map(|opened| (opened.id, opened.hooked()))
+    .map(|opened| (opened.id, opened.name.clone(), opened.hooked()))
   else {
     return false;
   };
@@ -1581,6 +1572,7 @@ async fn revision_property(
   };
   // The landing turn, held from the judgment to the record's landing (C2): no other change lands in between.
   let Some(turn) = svn_commit::landing::turn(id).await else {
+    fail_store_missing(&mut conversation.connection, &name, out);
     return false;
   };
   let record = match lend_revision_property_hooked(conversation, verdict, out) {
@@ -2044,6 +2036,30 @@ async fn run_svn_hook(
   }
 }
 
+/// Checks per-path Subversion policy for every changed path in `work` against the live
+/// repository record held on this shard, returning `false` if the policy denies any change.
+fn svn_commit_authorized(name: &str, principal: &Principal, work: &Work) -> bool {
+  let record = crate::state::with_state(|state| {
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(name)
+      .cloned()
+  })
+  .flatten();
+  let Some(record) = record else {
+    return true;
+  };
+  crate::vcs_policy::admit_svn_changes(
+    &record.owner,
+    &record.policy,
+    principal,
+    &work.record.changes,
+  )
+  .is_ok()
+}
+
 /// Lands the accepted `work` through the owner's commit step (A-698's `repository::svn_commit::land_work`, which the
 /// `svn+ssh://` tunnel calls too, at the owner's instant) and answers `close-edit` with `commit-info` or with the
 /// step's refusal as its failure: whether the conversation goes on, the answer in `out`.
@@ -2063,11 +2079,21 @@ async fn land(
     return false;
   };
   let id = opened.id;
+  let name = opened.name.clone();
   let hooked = opened.hooked();
+  if !svn_commit_authorized(&name, principal, &work) {
+    opened.texts.clear();
+    let refused = slates_svn::serve::Uncommitted::Refused {
+      code: NOT_AUTHORIZED,
+      message: "Authorization failed".to_owned(),
+    };
+    return conversation.connection.not_committed(&refused, out).is_ok();
+  }
   let transaction = work.record.transaction.clone();
   let landed = svn_commit::land_work((principal, id), work, &opened.texts).await;
   opened.texts.clear();
   let Some(landed) = landed else {
+    fail_store_missing(&mut conversation.connection, &name, out);
     return false;
   };
   // post-commit runs once the revision stands, and its failure is `commit-info`'s `post-commit-err` (A-730).
@@ -3079,8 +3105,9 @@ mod redteam_tests {
   }
 
   /// Pure in-memory unit test (no TCP/store required): verifies `access_for_record` distinguishes
-  /// `Write`, `Read`, and `None` per policy rights and `fail_store_missing` writes a typed
-  /// `E160004` (`SVN_ERR_FS_CORRUPT`) wire frame and ends the connection.
+  /// `Write`, `Read`, and `None` across allow, explicit `Deny Read`/`Deny Submit`, owner `Deny`,
+  /// subpath `Allow` under root `Deny`, and `Submit`-only (without `Read`), and verifies
+  /// `fail_store_missing` writes a typed `E160004` (`SVN_ERR_FS_CORRUPT`) wire frame.
   #[test]
   fn access_for_record_and_fail_store_missing_behave_accurately() {
     use slates_db::catalog::{
@@ -3090,10 +3117,29 @@ mod redteam_tests {
     };
 
     const WRITER: u32 = 5000;
+    const SUBMIT_ONLY: u32 = 5001;
+    const OTHER_USER: u32 = 5002;
+    const DENIED_USER: u32 = 4242;
     let reader = uid_principal(STRANGER);
     let writer = uid_principal(WRITER);
+    let submit_only = uid_principal(SUBMIT_ONLY);
+    let other_user = uid_principal(OTHER_USER);
+    let denied = uid_principal(DENIED_USER);
     let outsider = uid_principal(9999);
-    let record = RepositoryRecord {
+    let rule =
+      |pattern: &str, right: PolicyRight, effect: PolicyEffect, who: PolicyWho| PolicyRule {
+        names: PolicyNames::Paths,
+        pattern: pattern.to_owned(),
+        right,
+        effect,
+        who,
+      };
+    let only = |who: &Principal| PolicyWho::AnyOf {
+      entries: vec![PolicyEntry::Is {
+        principal: who.clone(),
+      }],
+    };
+    let make_record = |rules: Vec<PolicyRule>| RepositoryRecord {
       index_bits: 0,
       id: RepositoryId { bytes: [3; 16] },
       name: "demo".to_owned(),
@@ -3103,51 +3149,119 @@ mod redteam_tests {
       owner: uid_principal(OWNER),
       policy: RepositoryPolicy {
         version: 1,
-        rules: vec![
-          PolicyRule {
-            names: PolicyNames::Paths,
-            pattern: "/".to_owned(),
-            right: PolicyRight::Read,
-            effect: PolicyEffect::Allow,
-            who: PolicyWho::AnyOf {
-              entries: vec![PolicyEntry::Is {
-                principal: reader.clone(),
-              }],
-            },
-          },
-          PolicyRule {
-            names: PolicyNames::Paths,
-            pattern: "/".to_owned(),
-            right: PolicyRight::Submit,
-            effect: PolicyEffect::Allow,
-            who: PolicyWho::AnyOf {
-              entries: vec![PolicyEntry::Is {
-                principal: writer.clone(),
-              }],
-            },
-          },
-        ],
+        rules,
         hooks: Vec::new(),
         hooks_env: Vec::new(),
         signers: Vec::new(),
         hg_publishing: true,
       },
     };
+    let record = make_record(vec![
+      rule("/", PolicyRight::Read, PolicyEffect::Allow, only(&reader)),
+      rule("/", PolicyRight::Read, PolicyEffect::Allow, only(&writer)),
+      rule("/", PolicyRight::Submit, PolicyEffect::Allow, only(&writer)),
+      rule(
+        "/",
+        PolicyRight::Submit,
+        PolicyEffect::Allow,
+        only(&submit_only),
+      ),
+    ]);
+    let access_cases = [
+      (
+        super::access_for_record(&record, &uid_principal(OWNER)),
+        slates_svn::authz::Access::Write,
+      ),
+      (
+        super::access_for_record(&record, &reader),
+        slates_svn::authz::Access::Read,
+      ),
+      (
+        super::access_for_record(&record, &writer),
+        slates_svn::authz::Access::Write,
+      ),
+      (
+        super::access_for_record(&record, &submit_only),
+        slates_svn::authz::Access::None,
+      ),
+      (
+        super::access_for_record(&record, &outsider),
+        slates_svn::authz::Access::None,
+      ),
+    ];
+    for (got, expected) in access_cases {
+      assert_eq!(got, expected);
+    }
+
+    let deny_read = make_record(vec![
+      rule(
+        "/",
+        PolicyRight::Read,
+        PolicyEffect::Allow,
+        PolicyWho::Anyone,
+      ),
+      rule("/", PolicyRight::Read, PolicyEffect::Deny, only(&denied)),
+    ]);
+    let deny_write = make_record(vec![
+      rule(
+        "/",
+        PolicyRight::Read,
+        PolicyEffect::Allow,
+        PolicyWho::Anyone,
+      ),
+      rule(
+        "/",
+        PolicyRight::Submit,
+        PolicyEffect::Allow,
+        PolicyWho::Anyone,
+      ),
+      rule("/", PolicyRight::Submit, PolicyEffect::Deny, only(&denied)),
+    ]);
+    let owner_deny_submit = make_record(vec![rule(
+      "/",
+      PolicyRight::Submit,
+      PolicyEffect::Deny,
+      only(&uid_principal(OWNER)),
+    )]);
+    let subpath_allow = make_record(vec![
+      rule(
+        "/",
+        PolicyRight::Read,
+        PolicyEffect::Allow,
+        PolicyWho::Anyone,
+      ),
+      rule(
+        "/",
+        PolicyRight::Read,
+        PolicyEffect::Deny,
+        PolicyWho::Anyone,
+      ),
+      rule(
+        "/trunk",
+        PolicyRight::Read,
+        PolicyEffect::Allow,
+        only(&denied),
+      ),
+    ]);
     assert_eq!(
-      super::access_for_record(&record, &uid_principal(OWNER)),
-      slates_svn::authz::Access::Write
-    );
-    assert_eq!(
-      super::access_for_record(&record, &reader),
-      slates_svn::authz::Access::Read
-    );
-    assert_eq!(
-      super::access_for_record(&record, &writer),
-      slates_svn::authz::Access::Write
-    );
-    assert_eq!(
-      super::access_for_record(&record, &outsider),
-      slates_svn::authz::Access::None
+      [
+        super::access_for_record(&deny_read, &denied),
+        super::access_for_record(&deny_read, &other_user),
+        super::access_for_record(&deny_write, &denied),
+        super::access_for_record(&deny_write, &other_user),
+        super::access_for_record(&owner_deny_submit, &uid_principal(OWNER)),
+        super::access_for_record(&subpath_allow, &denied),
+        super::access_for_record(&subpath_allow, &other_user),
+      ],
+      [
+        slates_svn::authz::Access::None,
+        slates_svn::authz::Access::Read,
+        slates_svn::authz::Access::Read,
+        slates_svn::authz::Access::Write,
+        slates_svn::authz::Access::Read,
+        slates_svn::authz::Access::Read,
+        slates_svn::authz::Access::None,
+      ]
     );
 
     let mut out = Vec::new();
