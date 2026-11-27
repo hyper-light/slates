@@ -11866,6 +11866,18 @@ pub(crate) fn publish_held_increments(state: &mut ShardState) -> Result<(), Refu
   })
 }
 
+/// The content store's changes since the shard's last committed publication published now, outside any transaction,
+/// ahead of an op that will name them (A-920 13b): an import's landing publishes its versions' held increments in a step
+/// of its own, so the register's op finds them published and only records (A-727's order kept: published before
+/// recorded). Whether it published. A refusal leaves them unpublished for the op's own publication to meet and refuse,
+/// as it would have; nothing is remade here.
+pub(crate) fn publish_held_ahead(state: &mut ShardState) -> bool {
+  if !held_unpublished(state) || state.db.in_transaction() {
+    return false;
+  }
+  publish_shard(state).is_ok()
+}
+
 /// Whether the content store changed since the shard's last committed publication. A shard with no content object keeps
 /// no image (a degraded build): nothing it holds survives it, so there is no order to keep.
 fn held_unpublished(state: &ShardState) -> bool {

@@ -751,8 +751,10 @@
 > size: the register's op (`landing.record`, atomic by main's ruling). The reserve's copy entry room resolves the copy
 > ops alone since 12a (11.5 ms whole, debug); move's other named units are the judge's `finish_resolving` (5.8 ms)
 > and a `decide_some` unit (4.9) and the commit's `Prep::Beginning` (7.7-7.9). The storing's begin is a text a unit
-> since 13a (release probe 15's leader at about 1.4 ms p50). Next: copy's `landing.release` (1.6 ms) and the register's
-> op. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
+> since 13a (release probe 15's leader at about 1.4 ms p50). Copy's `landing.release` unit is kernel time in debug
+> (3.0 ms, 99.8% system: an allocator region's return, owed its own piece). The register's op publishes ahead of
+> itself since 13b; the publication is one whole step (8.8 ms debug, owed turns if release finds it past the bar), and
+> the record's inline chain entry (430,978 bytes) is next, (a). Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
