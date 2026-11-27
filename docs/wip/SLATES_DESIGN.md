@@ -9925,7 +9925,9 @@ server, not inferred from command names.
 > lookup, and a client's token proves its principal on a successor after the issuing node is lost. An enrollment is
 > acknowledged once `f + 1` members hold it, a revocation only once every member has let it go (a member that kept it
 > would go on proving a revoked credential); short of that each is refused `CredentialUnreplicated` and asked again
-> reaches the rest. At each configuration change every member offers what it holds, so one that joined holds what the
+> reaches the rest. An enrollment asked again finds its very record held on the enrolling partition (same id, principal,
+> kind and expiry), answers enrolled there and goes on to the region; a different record under a held id, or a revoked
+> id, is refused `AlreadyExists` (2026-11-27, `credential.enroll.repeated`). At each configuration change every member offers what it holds, so one that joined holds what the
 > region holds. A revocation leaves a tombstone on every member that applies it (`CredentialTombstoned`, appended), which
 > the healer offers too, so a revoked credential is never enrolled again: not by a member that missed its revocation
 > and rejoins with the record (it lets the record go), and not by that member's offer of it (refused where the

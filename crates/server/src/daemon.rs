@@ -4350,6 +4350,31 @@ impl Daemon {
     })
   }
 
+  /// Test support: while `deaf`, this node answers no member's credential message (A-764's stream), as a member whose
+  /// credential plane is not yet up does, so an enrolling node counts it as not holding the credential; `false`
+  /// restores its answers. Set on every shard, since a message is served on whichever shard its session lands.
+  /// `Ok` once installed, else the typed refusal.
+  pub fn inject_credential_deafness(&self, deaf: bool) -> Result<(), ObserveError> {
+    for shard in &self.shards {
+      self.observe(Some(*shard), move |s| {
+        s.injected_credential_deafness = deaf;
+      })?;
+    }
+    Ok(())
+  }
+
+  /// Test support: whether any of this node's partitions holds the credential `id` (A-764: on the partition its id
+  /// routes to), read on every shard; the typed refusal where a shard does not answer.
+  pub fn credential_held(&self, id: [u8; 32]) -> Result<bool, ObserveError> {
+    let mut held = false;
+    for shard in &self.shards {
+      held |= self.observe(Some(*shard), move |s| {
+        s.db.partition().credentials().get(&id).is_some()
+      })?;
+    }
+    Ok(held)
+  }
+
   /// Test support: while `Some(ns)`, this node publishes `ns` as its failover delay in place of its estimate, on every
   /// shard at once (A-363, A-414): the bound of every wait that bounds a failover (a forward, the location round, a held
   /// reply, a takeover's attempts) and the term of the leases that read it (the write lease, a landing's target lease,
@@ -5842,6 +5867,7 @@ async fn init_shard(
     injected_serve_delay_ns: None,
     injected_forward_answer_delay_ns: None,
     injected_content_ack_delay_ns: None,
+    injected_credential_deafness: false,
     injected_forward_silence: None,
     injected_takeover_silence: std::collections::BTreeSet::new(),
     injected_holder_silence: std::collections::BTreeSet::new(),

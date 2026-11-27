@@ -36344,31 +36344,146 @@ fn anchored_git_fleet_of(name: &str, nodes: &[&str]) -> GitFleet {
 /// A token named for `name`, enrolled at `daemon` for this uid through `client` (connected to it), once a quorum holds
 /// it: the bearer a [`GitFleet`]'s pushes carry.
 fn enrolled_token(name: &str, daemon: &Daemon, client: &mut slates_client::Client) -> String {
+  // Enrolled once a quorum holds it (A-764): refused `CredentialUnreplicated` while the other members' credential planes
+  // are still coming up, so asked again within the placement deadline (a flake of the A-727 runs, 1 in 8).
+  let asked = token_enrollment(name, daemon, client);
+  if let Err(error) = enrolled_once_replicated(client, &asked) {
+    panic!("the credential enrolled: {error:?}");
+  }
+  asked.token
+}
+
+/// A-764's retry (diag CI 11, diagnosed by w-shared; main's order of 2026-11-27): an enrollment refused
+/// `CredentialUnreplicated` promises that the same request again reaches the rest (`Refusal::CredentialUnreplicated`),
+/// but the enrolling partition refused its own held id `AlreadyExists` before any fan-out, so the retry reached no other
+/// member, the client met `AlreadyExists` for its own credential, and the enrollment could stay short of `f + 1` for
+/// good. Do: form a three-node fleet at `f = 1`; make b and c answer no credential message
+/// (`Daemon::inject_credential_deafness`); enroll a token at a; give c back its answers; ask the same enrollment again
+/// (again while it is refused `CredentialUnreplicated`, as [`enrolled_token`] does, within [`PLACEMENT_DEADLINE`]).
+/// Expect: the first refused `CredentialUnreplicated { held: 1, needed: 2 }`; the retry `CredentialEnrolled` naming the
+/// token's id; c holding it and b, still deaf, not; and a counting the repeat (`credential.enroll.repeated`) at least
+/// once. Before the fix the retry was refused `AlreadyExists` and c never held the token.
+#[test]
+fn a764_an_enrollment_short_of_f_plus_one_completes_when_the_same_request_is_asked_again() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  for deaf in &daemons[1..] {
+    deaf.inject_credential_deafness(true).unwrap();
+  }
+  let mut client = common::client::connect(daemons[0].instance());
+  let asked = token_enrollment("a764-retry", &daemons[0], &mut client);
+  let first = enrolled_by(&mut client, &asked);
+  daemons[2].inject_credential_deafness(false).unwrap();
+  let retried = enrolled_once_replicated(&mut client, &asked);
+  let held: Vec<_> = daemons[1..]
+    .iter()
+    .map(|member| member.credential_held(asked.id))
+    .collect();
+  let repeated = move_counter(&daemons[0], "credential.enroll.repeated");
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    matches!(
+      first,
+      Err(slates_client::ClientError::Refused(
+        Refusal::CredentialUnreplicated { held: 1, needed: 2 }
+      ))
+    ),
+    "the first enrollment, b and c deaf, is held at a alone: {first:?}"
+  );
+  assert_eq!(
+    retried.as_ref().ok(),
+    Some(&asked.id),
+    "the same request again enrolls the token: {retried:?}"
+  );
+  assert_eq!(
+    held,
+    [Ok(false), Ok(true)],
+    "c holds the token, b (still deaf) does not"
+  );
+  assert!(
+    repeated.as_ref().is_ok_and(|count| *count >= 1),
+    "a counted the repeat: {repeated:?}"
+  );
+}
+
+/// A token's enrollment for this uid as a client asks it: the token (a bearer), its id, and the request's principal,
+/// credential and proof under the enrolling daemon's issuer secret.
+struct TokenEnrollment {
+  token: String,
+  id: [u8; 32],
+  principal: slates_ipc::protocol::Principal,
+  material: slates_ipc::protocol::CredentialMaterial,
+  proof: [u8; 32],
+}
+
+/// A token named for `name` to be enrolled at `daemon` for this uid through `client` (connected to it), never expiring.
+fn token_enrollment(
+  name: &str,
+  daemon: &Daemon,
+  client: &mut slates_client::Client,
+) -> TokenEnrollment {
   use slates_ipc::protocol::{CredentialMaterial, Principal};
   let token = format!("{name}-token-{}", std::process::id());
   let principal = Principal::Uid {
     host: client.daemon_status().unwrap().anchor,
     uid: this_account(),
   };
+  let id = slates_server::credentials::token_id(token.as_bytes());
   let material = CredentialMaterial::HttpToken {
-    id: slates_server::credentials::token_id(token.as_bytes()),
+    id,
     cram_md5_contexts: slates_server::credentials::cram_md5_contexts(token.as_bytes()),
   };
   let secret = daemon.segment().issuer_secret().unwrap();
   let proof = slates_server::credentials::enroll_proof(&secret, &principal, &material, None);
-  // Enrolled once a quorum holds it (A-764): refused `CredentialUnreplicated` while the other members' credential planes
-  // are still coming up, so asked again within the placement deadline (a flake of the A-727 runs, 1 in 8).
+  TokenEnrollment {
+    token,
+    id,
+    principal,
+    material,
+    proof,
+  }
+}
+
+/// `asked` through `client`, asked again while it is refused `CredentialUnreplicated` (the members' credential planes
+/// still coming up; the refusal's contract: the same request again reaches the rest), within [`PLACEMENT_DEADLINE`]:
+/// the id it enrolled, or the last refusal.
+fn enrolled_once_replicated(
+  client: &mut slates_client::Client,
+  asked: &TokenEnrollment,
+) -> Result<[u8; 32], slates_client::ClientError> {
   let began = Instant::now();
   loop {
-    match client.enroll_credential(principal.clone(), material.clone(), None, proof) {
-      Ok(_) => break,
-      Err(slates_client::ClientError::Refused(
-        slates_ipc::protocol::Refusal::CredentialUnreplicated { .. },
-      )) if began.elapsed() < PLACEMENT_DEADLINE => std::thread::yield_now(),
-      Err(error) => panic!("the credential enrolled: {error:?}"),
+    match enrolled_by(client, asked) {
+      Err(slates_client::ClientError::Refused(Refusal::CredentialUnreplicated { .. }))
+        if began.elapsed() < PLACEMENT_DEADLINE =>
+      {
+        std::thread::yield_now();
+      }
+      answer => return answer,
     }
   }
-  token
+}
+
+/// `asked` through `client`: the id it enrolled, or the refusal.
+fn enrolled_by(
+  client: &mut slates_client::Client,
+  asked: &TokenEnrollment,
+) -> Result<[u8; 32], slates_client::ClientError> {
+  client.enroll_credential(
+    asked.principal.clone(),
+    asked.material.clone(),
+    None,
+    asked.proof,
+  )
 }
 
 /// The [`GitFleet`] of `daemons`, formed: its repository `project` made on the first, held by another node as its

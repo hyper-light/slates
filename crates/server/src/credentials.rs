@@ -70,6 +70,9 @@ const TOKEN_TEXT_BYTES: usize = TOKEN_PREFIX.len() + HEX_DIGITS_PER_BYTE * TOKEN
 const BY_CONSUMER: &str = "credential_by_consumer";
 /// Counter: an enrollment or a revocation whose proof of issuer authority did not verify.
 const ISSUER_UNVERIFIED: &str = "grant_issuer_unverified";
+/// Counter: an enrollment of the very record this partition holds, answered enrolled and sent on to the region: the
+/// same request asked again after `CredentialUnreplicated` (A-764), whose contract is that it reaches the rest.
+const ENROLL_REPEATED: &str = "credential.enroll.repeated";
 
 /// The SHA-256 of `bytes`.
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -249,7 +252,10 @@ pub(crate) struct Enrollment {
 /// `EnrollCredential` (the module doc), on the partition the credential's id routes to: refused `Forbidden` on a
 /// consumer's channel and `GrantIssuerUnverified` for a proof that does not verify, each counted; `BadRequest` for a key
 /// the SSH edge does not take; then recorded, or refused as the database refuses it (`AlreadyExists`,
-/// `TableAtCapacity`).
+/// `TableAtCapacity`). The very record this partition holds (the same id, principal, kind with its key's blob or its
+/// token's keyed contexts, and expiry) is the same request asked again, answered `CredentialEnrolled` and counted, so
+/// [`enroll_in_region`] sends it on to the members it has not yet reached (A-764: `CredentialUnreplicated`'s contract);
+/// a different record under a held id, or an id revoked here, stays `AlreadyExists`.
 pub(crate) fn enroll(state: &mut ShardState, channel: &Principal, asked: Enrollment) -> ReplyBody {
   if matches!(channel, Principal::Consumer { .. }) {
     state.count(BY_CONSUMER, 1);
@@ -281,6 +287,10 @@ pub(crate) fn enroll(state: &mut ShardState, channel: &Principal, asked: Enrollm
     kind,
     expires_ns,
   };
+  if state.db.partition().credentials().get(&id) == Some(&record) {
+    state.count(ENROLL_REPEATED, 1);
+    return ReplyBody::CredentialEnrolled { id };
+  }
   let now = state.clock.monotonic_ns();
   match state
     .db
@@ -394,9 +404,13 @@ async fn apply_on_partition(
 
 /// A member's credential exchange (`slates_cluster::credentials`, its stream on the record session), served on shard
 /// `origin`: applied to the partition the id routes to and answered whether it is held as asked. Bytes that are no
-/// message are answered with none.
+/// message are answered with none, as is every message while a test makes this node deaf to them
+/// (`Daemon::inject_credential_deafness`).
 pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) -> Vec<u8> {
   use slates_cluster::credentials::CredentialMessage;
+  if crate::state::with_state(|state| state.injected_credential_deafness).unwrap_or(false) {
+    return Vec::new();
+  }
   let Ok(message) = CredentialMessage::decode(request) else {
     return Vec::new();
   };
@@ -476,7 +490,7 @@ fn region_f() -> usize {
 /// An enrollment as the channel serves it (A-764): recorded on the partition its id routes to as before (`enroll`),
 /// then sent to every other member of the region; answered `CredentialEnrolled` once `f + 1` members hold it, this one
 /// among them, and refused `CredentialUnreplicated` otherwise (what was held stays; the same enrollment again reaches
-/// the rest, and is held as asked where it is already).
+/// the rest, answered enrolled by this partition, which holds its very record, and held as asked where it is already).
 pub(crate) async fn enroll_in_region(
   origin: u16,
   owner: u16,
