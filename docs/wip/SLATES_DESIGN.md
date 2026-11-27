@@ -65210,8 +65210,55 @@ measured noise of the 100 figure, not a literal.
     now opens over the extents its predecessor's marks carry, and every written byte stays inside the written ranges.
 - **Measured** (debug, the MacBook, 2026-11-25): the sweep 3,495,300 pages (12,582,958 before). Alone, 1.6 s over
   40,988 idle slices (23.7 s, 1,185,392 before). Loaded, two hogs a core, 1.6 s over 40,730 (55.5 s, 3,075,443 before).
-- **Part 2, owed:** the segment's log and snapshot regions (3,495,255 pages, the anchor's format, the register's code)
-  get marks of their own, with their own migration.
+- **The regression part 1 left, fixed (2026-11-25, main's ruling the same day).** The journal's extents are bytes, so a
+  dead range ended where its bytes did, off a page, and a give-back takes whole pages only. Every page-sized piece of
+  the top-down give-back straddled two pages: a one-page slice (the slice before a rate is learned) gave nothing back,
+  the extents fell anyway, and the recovery test's wait for pages given back never ended (38 minutes on the Studio).
+  - **The rule:** each dead range is given back to the object's page boundary at or past its last byte, within its
+    memory (the stale slot's end, the log's end), in the object's own pages, since a region need not start on one. An
+    empty range stays empty: rounded, its partial page took a share of every slice and the give-back never ended (the
+    unit test's first green run found it, 77,485 steps of nothing).
+  - **Red:** `a_one_page_give_back_takes_the_pages_of_extents_that_end_off_a_page` (daemon unit test): on main, dead
+    stale slot (0, 46) and log (0, 73) fell to nothing with 0 bytes given back; with the rule, 16,384 bytes given back
+    and 0 left. `returned_after_idle` in `tests/recovery.rs` is bounded at sixty liveness budgets with a typed failure.
+  - **The boot test's premise:** a fresh daemon's marks say its recovery memory is unwritten, so it has nothing to
+    give back, and `a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step` failed typed on main. It now takes the
+    memory as written whole first (`Daemon::take_recovery_memory_as_written_whole`), as a daemon over an image before
+    the marks would. That method is test support only, behind `slates-server`'s `test-support` feature (and
+    `cfg(test)`), turned on by the crate's own dev-dependency on itself; with resolver 2 a dev-dependency's features
+    stay out of a normal build: `cargo tree -p slates-cli -e features --edges normal`, the `slates` binary that runs
+    the daemon, and the same for `slates-server`, `-api`, `-client`, `-mcp`, `-archive` and `--workspace` show no
+    `test-support` (0 lines each), while the dev edges show it.
+- **Part 2** (main's ruling (b) of 2026-11-25: marks, and the give-back A-746 owed): the segment's log ring and snapshot
+  slots, 3,495,255 of the fresh daemon's pages.
+  - **Where:** each partition's log ring header's spare words (32 to 56, `layout::RING_MARKS_VERSION` and after) hold
+    a version word ("RMRK", 1) and the marks of its ring and of each of its snapshot slots. No offset moves, and the
+    anchor's layout version stays.
+  - **Raised before the write:** `LogRing::write` raises the ring's mark (the record's end, or the whole ring once it
+    wraps) before its copy, and `AnchorSegment::publish` raises a snapshot slot's (its payload's end) before the
+    payload, each with a release fence.
+  - **The give-back** (`AnchorSegment::give_back_dead`, run beside the journal's in `daemon::return_dead_recovery`, in
+    what its slice leaves) takes only what no read reaches again: the ring past its tail while it has not wrapped since
+    a snapshot released it (replay reads from the head to the tail, A-71's reset putting both at the first byte), and
+    each snapshot slot past its payload (a seqlock reader takes the length only; `SparseObject::discard_racy`, its
+    bytes being racy). It works from the top down, then lowers the mark.
+  - **The migration:**
+    - a segment made before part 2 (the version word zero) is adopted at `AnchorSegment::attach`: every mark whole,
+      then the version word;
+    - a fresh segment's version word is set at creation (`init_rings`), its marks zero;
+    - an adopted segment's whole falls at its first give-back after a release.
+  - **What a restart on an old segment costs:** one walk and one give-back of each region whole.
+  - **Reds:**
+    - `an_old_segment_is_adopted_whole_then_its_give_back_makes_its_marks_exact`;
+    - `a_crash_at_every_store_of_a_give_back_recovers_the_database_and_resumes_to_the_reference`: each of seven crash
+      points recovers the history's database, and the resumed give-back reaches the reference's marks;
+    - `a_crash_after_a_payloads_bytes_leaves_its_slots_mark_covering_them` and
+      `a_crash_after_a_records_bytes_leaves_the_rings_mark_covering_them`: with the raise after the write, mark 0
+      against a payload to 12,304, and 12,288 against a record to 16,524;
+    - `a_growing_log_raises_its_mark_once_a_page` (`crates/db/tests/segment_marks.rs`): one raise a page the tail
+      crosses, 11.9 against 13.4 us an append with the marks whole (debug);
+    - `a_released_rings_pages_go_back_to_the_os`: 96 MiB released, the physical footprint 98 MiB to 4 MiB on macOS.
+  - **The sweep:** a fresh daemon's is 46 pages (3,495,300 after part 1), completing in one idle slice.
 - **Applied in the same change to:**
   - `crates/vfs/src/checkpoint_log.rs` (`WrittenExtents`, `Journal::over`, `Journal::recover`'s extents, the extents
     a slot by place);
@@ -65219,8 +65266,13 @@ measured noise of the 100 figure, not a literal.
   - `crates/server/src/write_log.rs` (the marks block, version 3, the migration);
   - `crates/server/src/verbs.rs` (`ContentSlots`' raise, `read_journal`'s extents);
   - `crates/server/src/daemon.rs` (the open, the give-back's lowering);
-  - `crates/server/src/content_ranges.rs` (the block's page in the plan, the marks' rows);
-  - A-826's GAPS entry.
+  - `crates/server/src/content_ranges.rs` (the block's page in the plan, the marks' rows, the segment's regions by
+    their marks);
+  - part 2: `crates/anchor/src/layout.rs` and `segment.rs` (the ring header's marks, `region_marks`,
+    `raise_region_mark`, `give_back_dead`, `unmark`), `crates/mem/src/shared.rs` (`discard_racy`),
+    `crates/db/src/record.rs` (the ring's raise), `crates/db/tests/segment_marks.rs` and
+    `segment_give_back_footprint.rs`;
+  - A-826's and A-746's GAPS entries.
 
 ### A-927 part 1 — A create on a default green this node cannot read says why: not recovered, or not made here yet, the green named (2026-11-25, w-shared for main 01a20182, its ruling of 2026-11-25 step 1; the a894 loop after A-915; amends A-654 and A-915)
 
@@ -65485,6 +65537,34 @@ Applied in the same change to:
       unsent, then a resolution pass on the successor. Red with the Mercurial arm off: 26 of 55 lost.
     - `homes::tests::an_identitys_home_is_the_head_of_the_one_rendezvous_ranking_and_homes_spread`: the same place
       whatever the shards' ids.
+- **The remote home's barrier, one exchange a home a push** (main 01a20182's order of 2026-11-26: "a measured gap is
+  fixed now, never left owed"; r42 at 30de9030f read the local barrier once a home shard, push 63 s). Applied in the same
+  change to:
+  - `crates/cluster/src/homes.rs`: home wire 0x87. A put and a put's part say whether they are answered once durable
+    (`durable`, as every put was) or at once. `Kept` names the home shard's place among the member's shards (never its
+    runtime id) beside the generation. `HomeMessage::Durable` carries a sender's tickets at one home (at most
+    `DURABLE_MOST`) and is answered `Published` with how many of their images are. A member of 0x86 is refused typed by
+    the version rule.
+  - `crates/server/src/vcs_store/homes.rs`:
+    - a remote home answers a put asked at once as soon as it is kept (`keep_put`), and serves a barrier
+      (`durable_answer`);
+    - `home_in_region_deferred` asks remote homes at once and keeps each home shard's latest ticket in a `Barrier`;
+    - `barrier_published` waits on this node's tickets and sends one `Durable` a remote home, counted
+      `vcs_store.homes.remote_barriers`;
+    - git's homings and the healer still ask durable, unchanged.
+  - `crates/server/src/repository/hg_run.rs`: a push's one barrier is `barrier_published` over its run's `Barrier`.
+  - `crates/server/src/vcs_share/place.rs`: `first_by_place`, the one ranking of a node's shards by place.
+    `homes::home_of` and a push's `intake_shard` both use it (the sibling found above).
+  - Held by:
+    - `homes::tests::puts_asked_at_once_are_kept_unpublished_and_one_barrier_a_home_publishes_them`: eight puts kept with
+      no publication, then one barrier publishing once a home shard. Red with the flag ignored: 8 publications.
+    - `vcs_share::place::tests::a_pushs_intake_shard_is_ranked_by_place_whatever_the_shards_ids`: red, renumbered shards
+      moved push 0 from place 3 to 0.
+    - The wire's `a_barrier_reads_back_whole_and_a_hostile_one_is_refused_by_kind`.
+    - Across real processes, `crates/cli/tests/hg_takeover.rs` (`#[ignore]`d, run as
+      `SLATES_TEST_HG=hg cargo test -p slates-cli --test hg_takeover -- --ignored`): three anchors at `f = 1`, stock hg
+      pushes, the owner killed with one in flight, a survivor serving every acknowledged changeset in order, `hg verify`
+      clean.
 - **The settle queue, batched and bounded** (main 01a20182's order of 2026-11-26, after piece (i): its settles were one
   region exchange an object, two a segment, about 4,200 for the 57k, in a queue with no bound; CLAUDE.md §2 item 8).
   Applied in the same change to:

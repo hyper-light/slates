@@ -233,9 +233,9 @@ pub(crate) struct Run {
   /// The push's holds in the region while it is in flight (A-727 (d1a)): each homed object's, moved to the repository's
   /// records once its entry commits, let go at every home otherwise.
   attempt: crate::vcs_store::homes::AttemptHolds,
-  /// The latest ticket of each home shard on this node its objects were kept on, waited on once before its entry names
-  /// them ([`list_landed`]; group commit per shard). Bounded by the node's shards.
-  tickets: std::collections::BTreeMap<u16, crate::vcs_store::homes::HomeTicket>,
+  /// The latest ticket of each home shard its objects were kept on, this node's and each remote home's, waited on once
+  /// before its entry names them ([`list_landed`]; group commit per shard). Bounded by its homes' shards.
+  tickets: crate::vcs_store::homes::Barrier,
   /// Whether it is settled.
   settled: bool,
 }
@@ -251,7 +251,7 @@ impl Run {
       admission_held: 0,
       entries: Vec::new(),
       attempt: crate::vcs_store::homes::AttemptHolds::default(),
-      tickets: std::collections::BTreeMap::new(),
+      tickets: crate::vcs_store::homes::Barrier::default(),
       settled: false,
     }
   }
@@ -866,15 +866,20 @@ pub(crate) async fn list_landed(
     Err(unlanded) => return Some(Err(unlanded)),
   };
   // The one barrier (A-727's rule, group commit per shard): every object the record will name, through its list, durable
-  // at this node's homes, each home shard's latest ticket published, before the record is written.
-  let budget_ns = crate::fleet::homing_budget().max_deadline_ns();
-  for ticket in core::mem::take(&mut run.tickets).into_values() {
-    if !crate::vcs_store::homes::published(origin, ticket, budget_ns).await {
-      crate::state::with_state(|state| state.count(HOMED_SHORT, 1))?;
-      return Some(Err(ListUnlanded::Unhomed(
-        crate::vcs_store::homes::HomeRefused::Unanswered,
-      )));
-    }
+  // at every home, each home shard's latest ticket published (this node's each at its shard, a remote home's by one
+  // exchange), before the record is written.
+  let shards = crate::state::with_state(|state| state.shards.clone())?;
+  let durable = crate::vcs_store::homes::barrier_published(
+    (origin, &shards),
+    &mut run.tickets,
+    crate::fleet::homing_budget(),
+  )
+  .await;
+  if !durable {
+    crate::state::with_state(|state| state.count(HOMED_SHORT, 1))?;
+    return Some(Err(ListUnlanded::Unhomed(
+      crate::vcs_store::homes::HomeRefused::Unanswered,
+    )));
   }
   Some(Ok((identity, len, sequence)))
 }
