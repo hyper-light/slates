@@ -1390,6 +1390,7 @@ impl<F: std::future::Future> std::future::Future for CpuTimed<F> {
 pub(crate) fn cpu_timed<F: std::future::Future>(history: F) -> CpuTimed<F> {
   TIMED_LONGEST.with(|longest| longest.set((0, 0)));
   TIMED_SPANS.with(|kept| kept.borrow_mut().clear());
+  let _ = super::phase::release_units_taken();
   CpuTimed {
     future: Box::pin(history),
     phase: "untagged",
@@ -1427,6 +1428,8 @@ pub(crate) fn print_phases(name: &str) {
   let longest = TIMED_LONGEST.with(std::cell::Cell::get);
   let spans = TIMED_SPANS.with(|kept| kept.borrow().clone());
   eprintln!("{}", phases_line(name, longest, &spans));
+  let (unit_wall, unit_cpu, units) = super::phase::release_units_taken();
+  eprintln!("RELEASE {name} unit_wall_ns={unit_wall} unit_cpu_ns={unit_cpu} units={units}");
 }
 
 /// The line naming the phases of `name`'s history's longest poll (`wall_ns` and `cpu_ns` long), for a probe's parser:

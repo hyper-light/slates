@@ -759,6 +759,16 @@
 > files): `made_commit.rs` (two calls), `vcs_store/svn_made.rs`, `vcs_store/hg_made.rs`, `greens.rs`'s own caller. A
 > probe of a wide made commit on each VCS would name any past the bar.
 
+> **Open (84a, a restart under load, w-svn for main, 2026-11-26): a shard's start runs pieces of its own past 1 ms.**
+> The start runs in `RecoverySlices`, each slice ending at a named piece, so a piece is one poll whole. Release probe 15
+> put the start's first poll (`daemon.rs:1274`, `spawn_alone(start_shard)`) past 1 ms in 25 copy, 5 add and 4 move runs
+> of 99. That is the daemon's, not the import's: A-920 is judged by the history's own longest poll. The pieces that were
+> a start's longest, across 310 starts of the server set's test daemons (debug, small arenas):
+> - "the content object, its write log and DAX table": 2.6-3.5 ms, in 53 starts;
+> - "the pool's segment and its content regions": 1.3-1.5 ms, in 129;
+> - "the catalog's opening": about 1.45 ms, in 110.
+> Each scales with the shard's arena or records. Owed: their release sizes (main's probe 16), then a piece's slicing.
+
 > **Open (A-920's sweep, w-svn for main, 2026-11-26): four tests whose counts hold only in one load regime.** A test
 > that counts a step's units or turns against the shard's live quantum certifies nothing when the quantum moves. Each
 > of these is to be worked when it fails, by the 7c test's fix (the step takes its slice or budget as an argument, the
