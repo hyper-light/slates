@@ -66263,6 +66263,10 @@ Applied in the same change to:
 - **Applied in the same change to:** `crates/server/src/{member_task,edges,fleet,state,daemon}.rs`,
   `crates/cluster/src/member_plane.rs` (`MemberPlane::is_joined`), `crates/server/tests/fleet.rs`, A-921 part 4's
   entry, GAPS.
+- **Amended** (2026-11-27, main 01a20182's order of 09:50): the re-key watch is judged from each node's last look that
+  saw it not yet re-keyed, so the test's own looks (one control-shard question a node in turn) add nothing, and its
+  bound is the restarted node's detection plus both nodes' measured wake lateness (`detector_granularity_ns`), never a
+  bare 1 s. Diag 10's Windows x86_64 lane met node 2 first seen at 1,010 ms: a timer tick of 15.625 ms on each look.
 
 ### A-932 — A merge record names its green's lineage, and a holder makes a green standing alone at once (2026-11-27, w-interop for main 01a20182, its ruling (a) of 2026-11-27 07:06 and its approval of 07:08; the fleet suite's red; amends A-908 and A-908 part 4; A-636 part 2b-2, A-145, A-255)
 
