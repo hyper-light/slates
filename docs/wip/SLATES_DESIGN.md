@@ -58877,7 +58877,9 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > between them; the push's entry names them as ranges (record v11), and a restart replays exactly those, each record's
 > rows by node over the index as it stands then. Since ruling R piece (i) (2026-11-26, A-929) each segment's `Record`
 > and `Payload` are homed in the region before it lands and the entry names one homed segment list (record v12), which
-> replaced v11 outright: v11 is no longer read. The repository's landing turn (Subversion's, which Mercurial's made
+> replaced v11 outright: v11 is no longer read. Since piece (ii) (same day) the segment is homed as it landed, its `Texts`
+> with its `Record` and `Payload`, and a holder lands the owner's segments verbatim from the region before it replays
+> them (A-929). The repository's landing turn (Subversion's, which Mercurial's made
 > changesets hold too) is taken for the entry's commit alone: a fork another landing made stale is re-based by node
 > first, off the turn, and once more holding it at most. Readers see only what an entry names. A run no entry names
 > is forgotten as it ends. The store drops its rows and retains every payload another changeset still holds (C3).
@@ -64876,6 +64878,21 @@ GAPS.
     a text put and a row.
   - In debug the walk is now the step's: the add test's longest poll is the register's op (`landing.record`, 19.2
     ms in one run), already on file as owed.
+  **Main's partial probe 14** (4 runs a test in release at 3e98db372, 11a alone, under another session's load). Move
+  was led by `stage.reserving` at 1.82-2.62 ms, against `landing.tail_end`'s 3.32 ms p50 in probe 13, so 11a took
+  about 40% off move's longest.
+- **Piece 12, the staging's reserve.** **12a, the copy entry room from the copy ops alone.** Named before the change
+  (debug, move's revision 3): `stage.reserving`'s whole step was the reservation's shares, and in them
+  `Green::copy_entry_room` was 11.5 ms. Of that, `Green::resolve` walked all 9,002 ops and 9,002 paths, resolving the
+  whole increment, while `copy_fixes`, the one copy's fix, took 13 µs. A resolution's copies are its copy ops' alone:
+  `declare_copy` makes them, and the resolution's end (`split_copies`) moves other ops into their trees, never a copy.
+  So the room now resolves the copy ops alone (`Green::resolve_op` on each), the same copies and fixes.
+  - Oracle: `the_copy_entry_room_from_the_copy_ops_alone_is_the_whole_resolutions`. A copy from before a change, with
+    edits beneath; a copy of the head; two copies each with a fix, one inside the other's tree; and none. Each gives
+    the room the whole resolution gave.
+  - Planted bug, red: only the first copy op resolved, 44 bytes against 88.
+  - After 12a (debug), the move test's longest poll is `storing`, the storing's begin (`stage_texts`' `storing_of`
+    and `hand_over`, 14.0 ms), already on file.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
@@ -65307,8 +65324,8 @@ Applied in the same change to:
   - `crates/server/src/repository/hg_run.rs`: a segment's `Record` and `Payload` are put whole in the content store,
     their buffers dropped (`segment_held`), and each is homed at `f + 1` for the push's attempt (`homed_for`). It then
     lands from the content store a piece at a time (`HeldSegment::landed`), and each section is let go at its home as
-    a landed git pack is (`Landed::Pack`, brought back by `disk.piece`). `Texts` is not homed: it is an index derived
-    from the other two. At the entry, the list is homed, landed as a changeset of its own and let go (`list_landed`);
+    a landed git pack is (`Landed::Pack`, brought back by `disk.piece`). (`Texts` not homed, an index derived from the
+    other two, was main's ruling 1, superseded on piece (ii), below.) At the entry, the list is homed, landed as a changeset of its own and let go (`list_landed`);
     it is never held for the region past its landing (correction 3). A homing short refuses the push (`hg_push`'s
     `HOMED_SHORT`) with nothing recorded and the attempt's holds let go (A-727 (d1a)); committed, they move to the
     repository's records.
@@ -65334,6 +65351,34 @@ Applied in the same change to:
   `merge.recompute_mismatch`); svn's holder path red in the same piece; the Mercurial fleet-takeover CLI test
   `#[ignore]`d with its command. Then an import's run (v9) and a single pushed or made changeset (v7), homed the same
   way, before unit 43.
+- **Ruling R, piece (ii): the segment homed as it landed, and a holder lands it verbatim** (main 01a20182's ruling of
+  2026-11-26 on w-hg's finding, Option A; its ruling 1, `Texts` derived on the holder, superseded). Why: `Texts` is the
+  intake's index (each revision's text identity and length, its base text's identity, its chunk's place in the
+  `Payload`), which a segment's `Record` does not carry (its rows name the base by node and the plain delta's length,
+  and a stock chunk is not self-delimiting). Deriving it on a holder would be a second producer that must equal the
+  intake's byte for byte: a chunk-boundary walker, a new parser of external bytes (zstd's frame size), a dependence on
+  the `Record`'s row order and base resolution through a part-replayed index (CLAUDE.md §2 item 7). Homed as landed, it
+  has one producer, and each holder appends "the same changesets with the same identities" (A-767 item 5) by
+  construction. It holds no RAM: about 150 bytes a revision, homed and let go at its home once landed, as the other two
+  are (about 150 MB more of region wire and disk for the 57k, read from the section counters). Applied in the same
+  change to:
+  - `crates/store`: a `Texts` section keyed by its identity too (`SectionKind::keyed`), forgotten with its changeset.
+  - `crates/hg/src/import/record.rs`: segment list version 2, each entry naming its `Texts` by identity and length (128
+    bytes a segment); version 1 no longer read.
+  - `crates/server/src/repository/hg_run.rs`: a segment's `Texts` put, homed, landed from the content store and let go as
+    its `Record` and `Payload` are.
+  - `crates/server/src/vcs_store.rs`: `homed_run_on_store`. Before a rebuild replays a v12 run (a holder's replica, a
+    takeover's rebuild), the list and each segment the node's store lacks at its sequence (by its `Record`'s identity)
+    are read from their region homes by identity (`homes::read_in_region`, which takes only bytes of the identity asked)
+    and landed verbatim at the owner's sequence (counted `vcs_store.hg_run_fetched`, refused `Unlanded` and counted
+    `..._unfetched` where a section could not be had). A recovery's own replay reads its own store.
+  - Held by `hg_push::tests::a_holders_run_lands_the_owners_segments_byte_for_byte_by_identity`, the oracle: a push of
+    several segments made whole on a second node's store, each segment and the list fetched once and none on a second
+    pass, every section on the second store the owner's byte for byte by identity. Red with the fetch refused: the run
+    not made whole.
+  - Owed in R (ii)'s next pieces: the holder's recompute of an hg line's second version accepted with the owner's
+    identity (today `merge.recompute_mismatch`); svn's holder path red; the Mercurial fleet-takeover CLI test
+    `#[ignore]`d with its command. A remote home that never lands an object it keeps holds it in RAM, as git's do.
 - **The settle queue, batched and bounded** (main 01a20182's order of 2026-11-26, after piece (i): its settles were one
   region exchange an object, two a segment, about 4,200 for the 57k, in a queue with no bound; CLAUDE.md §2 item 8).
   Applied in the same change to:

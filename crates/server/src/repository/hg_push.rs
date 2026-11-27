@@ -3280,7 +3280,7 @@ async fn segment_landed(
   let Some(Ok(held)) = held else {
     return unlanded();
   };
-  for (identity, len) in [held.record, held.payload] {
+  for (_, (identity, len)) in held.sections() {
     let source = crate::vcs_store::homes::HomeSource::Held(identity, len);
     let (homed, _) = super::hg_run::homed_for(run, source).await?;
     if let Err(refused) = homed {

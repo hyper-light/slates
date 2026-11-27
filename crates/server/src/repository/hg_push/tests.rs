@@ -499,6 +499,100 @@ fn a_push_whose_changeset_is_not_durable_at_its_homes_is_refused_and_records_not
   );
 }
 
+/// Ruling R piece (ii)'s oracle (main 01a20182's ruling of 2026-11-26: the segment homed as it landed, and a holder's
+/// landed segment the owner's byte for byte, by identity). Do: on a stored shard, cut a push's segments at one byte and
+/// push four changesets; then make its run whole on a second node's store that holds none of it, as a holder's rebuild
+/// does (`vcs_store::homed_run_on_store`), and again. Expect: the list and every segment fetched from the region once
+/// (`vcs_store.hg_run_fetched` the segments and the list), the second pass fetching nothing; and on the second store
+/// the list and each segment's `Record`, `Payload` and `Texts`, read by identity, the owner's byte for byte. Red before:
+/// a holder's rebuild read its own store alone and was refused `Unlanded`.
+#[test]
+fn a_holders_run_lands_the_owners_segments_byte_for_byte_by_identity() {
+  let holder = crate::test_store::TestStore::start("hg-holder-store");
+  let theirs = holder.handle();
+  let (fetched, again, entries, differing) =
+    crate::test_store::run_on_stored_shard(move || async move {
+      let hg = Hg::made("fetched").await;
+      let made = history_of(&[
+        ("one", "one", b"one\n", None, "default"),
+        ("two", "two", b"two\n", Some(0), "default"),
+        ("three", "three", b"three\n", Some(1), "default"),
+        ("four", "four", b"four\n", Some(2), "default"),
+      ]);
+      super::super::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(1));
+      let outcome = pushed_bytes_to(
+        hg.repository,
+        &crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0, 1, 2, 3]),
+      )
+      .await;
+      super::super::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(0));
+      assert!(matches!(outcome, Outcome::Accepted(_)), "{outcome:?}");
+      let (homed, ours) = crate::repository::svn_commit::tests::on(|state| {
+        let records = state.db.partition().repositories();
+        let homed = (0..)
+          .map_while(|index| records.object_record(hg.repository, index))
+          .filter_map(slates_hg::import::record::homed_run_of)
+          .last();
+        (
+          homed.expect("the push's homed run"),
+          state.vcs_disk.clone().expect("a store"),
+        )
+      });
+      let count = || {
+        crate::repository::svn_commit::tests::on(|state| {
+          state
+            .refusals
+            .get(crate::vcs_store::HG_RUN_FETCHED)
+            .copied()
+            .unwrap_or(0)
+        })
+      };
+      let before = count();
+      let ran = crate::vcs_store::homed_run_on_store(&theirs, hg.repository, homed).await;
+      let fetched = count() - before;
+      assert!(ran.is_some(), "the run made whole on the second store");
+      let again = crate::vcs_store::homed_run_on_store(&theirs, hg.repository, homed).await;
+      let again = (again.is_some(), count() - before - fetched);
+      let read = async |disk: &slates_store::owner::StoreHandle,
+                        (identity, len): ([u8; 32], u64)| {
+        crate::vcs_store::keyed_bytes(disk, identity, len).await
+      };
+      let list = read(&ours, (homed.list, homed.len))
+        .await
+        .expect("the owner's list");
+      let mut differing = Vec::new();
+      if read(&theirs, (homed.list, homed.len)).await.as_deref() != Some(&list[..]) {
+        differing.push("the list".to_owned());
+      }
+      let entries = slates_hg::import::record::segment_list_of(&list).expect("a list");
+      for entry in &entries {
+        for (name, section) in [
+          ("record", entry.record),
+          ("payload", entry.payload),
+          ("texts", entry.texts),
+        ] {
+          let owners = read(&ours, section).await;
+          if owners.is_none() || read(&theirs, section).await != owners {
+            differing.push(format!("segment {}'s {name}", entry.sequence));
+          }
+        }
+      }
+      (fetched, again, entries.len(), differing)
+    });
+  drop(holder);
+  assert!(entries >= 3, "several segments: {entries}");
+  assert_eq!(
+    fetched,
+    u64::try_from(entries).unwrap() + 1,
+    "each segment and the list fetched once"
+  );
+  assert_eq!(again, (true, 0), "a second pass fetches nothing");
+  assert!(
+    differing.is_empty(),
+    "the holder's sections differ from the owner's: {differing:?}"
+  );
+}
+
 /// The settle queue's shape (main 01a20182's order of 2026-11-26 after ruling R piece (i): an unbounded queue is CLAUDE.md
 /// §2 item 8). Do: on a stored shard, cut a push's segments at one byte so each of its six changesets lands as segments
 /// of their own, and push it. Expect: the push accepted, landed as several segments (each homing its `Record` and its
@@ -3034,6 +3128,7 @@ async fn run_held_until_dropped(repository: RepositoryId) {
       sequence,
       record: ([0; 32], 0),
       payload: ([0; 32], 0),
+      texts: ([0; 32], 0),
     };
     run.landed(entry, &[]);
   }

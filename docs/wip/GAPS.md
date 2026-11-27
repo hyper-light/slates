@@ -748,7 +748,9 @@
 > (move, 3.3 ms p50), its release of the scratch member (copy, 2.7) and `texts_carried` (add, 1.3). The fold is a
 > unit a step since 11a, and the release since 11b (the retired member's own maps let go an entry a step, 5.2 ms
 > whole, debug), and `texts_carried` since 11c (a text put and a row a unit, 12.3 ms whole, debug). Next by release
-> size: the register's op (`landing.record`, atomic by main's ruling). Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
+> size: the register's op (`landing.record`, atomic by main's ruling). The reserve's copy entry room resolves the copy
+> ops alone since 12a (11.5 ms whole, debug); move's other named units are the judge's `finish_resolving` (5.8 ms)
+> and a `decide_some` unit (4.9), the commit's `Prep::Beginning` (7.7-7.9), and the storing's begin (14.0). Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
@@ -2103,8 +2105,11 @@
 > homed list (record v12, v11 withdrawn), a homing short refusing the push with nothing recorded
 > (`a_push_whose_changeset_is_not_durable_at_its_homes_is_refused_and_records_nothing`). CLOSED the same day: its
 > settles, one region exchange an object in an unbounded queue, now one batched settle an attempt (home wire 0x86) in a
-> queue bounded with the attempts in flight (`homes::settle_bound`, refused typed at it). OPEN: (ii) a holder fetching
-> the segments by identity and its recompute accepted with the owner's identity, with svn's holder red and an
+> queue bounded with the attempts in flight (`homes::settle_bound`, refused typed at it). (ii)'s first half BUILT the
+> same day: the segment homed as it landed (`Texts` with `Record` and `Payload`, list v2), and a rebuild lands the
+> segments its store lacks from the region verbatim at the owner's sequences
+> (`a_holders_run_lands_the_owners_segments_byte_for_byte_by_identity`). OPEN: (ii)'s rest: the holder's recompute
+> accepted with the owner's identity, with svn's holder red and an
 > `#[ignore]`d fleet-takeover CLI test for Mercurial, which no test drives yet; then an import's run (v9) and a single
 > changeset (v7) homed the same way.
 > Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
