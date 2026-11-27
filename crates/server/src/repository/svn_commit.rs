@@ -1906,6 +1906,10 @@ impl BuildState {
   }
 }
 
+/// [`Building::listed_beneath`]'s listing: the green paths of the place a path stood before the revision and of the
+/// path itself, and every node the green holds beneath the first, with whether it is a directory.
+type Listing = (String, String, Vec<(String, bool)>);
+
 impl<'b> Building<'b> {
   /// The build so far, its borrows let go, to be taken up again by [`Building::attach`].
   fn detach(self) -> BuildState {
@@ -2242,10 +2246,7 @@ impl<'b> Building<'b> {
 
   /// [`Building::tree_beneath`]'s listing: the green paths of the place `path` stood before the revision (`from`) and of
   /// `path` itself (`to`), and every node the green holds beneath `from`, with whether it is a directory.
-  fn listed_beneath(
-    &self,
-    path: &str,
-  ) -> Result<(String, String, Vec<(String, bool)>), Uncommitted> {
+  fn listed_beneath(&self, path: &str) -> Result<Listing, Uncommitted> {
     let (source, revision) = self.place_before(path).ok_or_else(corrupt)?;
     // The head in the records' numbering: the green's head, or an import batch's whose scratch member counts its own
     // versions from 0 (C2 stage C).
