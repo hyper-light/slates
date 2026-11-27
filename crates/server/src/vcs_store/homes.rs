@@ -389,13 +389,20 @@ pub(crate) async fn published_within(
   .await
 }
 
-/// The shard of `shards` that is `identity`'s home (module docs): the first by rendezvous over the identity; none for
-/// no shards.
+/// The shard of `shards` that is `identity`'s home (module docs): the first by rendezvous over the identity, ranking each
+/// shard by its place among the node's shards (its partition), never by its id; none for no shards. A shard's id is the
+/// runtime's, made afresh each start and numbered across a process's daemons, so a ranking by it moved every home when a
+/// successor started with other ids (an in-process successor beside another daemon took ids 1 and 3 where its
+/// predecessor had 0 and 2, and read 54 of 55 homed objects as held nowhere, w-hg's crash test of 2026-11-26), while the
+/// shard image keeps what each partition held.
 pub(crate) fn home_of(shards: &[u16], identity: &ContentId) -> Option<u16> {
-  let members: Vec<u64> = shards.iter().map(|shard| u64::from(*shard)).collect();
-  rendezvous_ranked_by_key(&members, &identity.0)
+  let places: Vec<u64> = (0..shards.len())
+    .map(|place| u64::try_from(place).unwrap_or(u64::MAX))
+    .collect();
+  let first = rendezvous_ranked_by_key(&places, &identity.0)
     .first()
-    .and_then(|member| u16::try_from(*member).ok())
+    .copied()?;
+  shards.get(usize::try_from(first).ok()?).copied()
 }
 
 /// Keeps the object `bytes` on this shard, its home, held once more for its sender (cut at the store's windows, named by
@@ -2737,7 +2744,35 @@ fn resolve_step(
       }
       Walked::Done(Resolution::Named(false))
     }
-    // Only git homes in the region so far (A-727 (d1b) brings Subversion's texts): no other tool's record names a hold.
+    // A Mercurial push's record names its segments only through its list (record v13, ruling R), so it names the attempt
+    // that homed them: a hold of an attempt some record committed is named (every object it homed is the run's, its
+    // sections and its list), one of an attempt none committed is not.
+    slates_db::catalog::VcsTool::Mercurial => {
+      let HomeOwner::Attempt {
+        node,
+        process,
+        attempt: number,
+        ..
+      } = attempt
+      else {
+        return Walked::Done(Resolution::Named(false));
+      };
+      let quantum_ns = state.config.step_quantum_ns();
+      let began = slates_rt::futures::now_ns();
+      for (at, bytes) in repositories.objects(repository).enumerate().skip(from) {
+        if slates_hg::import::record::homed_run_of(bytes)
+          .is_some_and(|run| run.attempt == (node.0, process, number))
+        {
+          return Walked::Done(Resolution::Named(true));
+        }
+        if slates_rt::futures::now_ns().saturating_sub(began) >= quantum_ns {
+          return Walked::More(at.saturating_add(1));
+        }
+      }
+      Walked::Done(Resolution::Named(false))
+    }
+    // Only git and Mercurial home in the region so far (A-727 (d1b) brings Subversion's texts): no other tool's record
+    // names a hold.
     _ => Walked::Done(Resolution::Named(false)),
   }
 }
@@ -3070,6 +3105,31 @@ pub(crate) async fn home_in_region(
   (source, owner): (HomeSource, HomeOwner),
   budget: slates_cluster::CommitBudget,
 ) -> Homed {
+  homed_in_region(origin, shards, (source, owner), budget, None).await
+}
+
+/// [`home_in_region`] with this node's own keep not waited for (main 01a20182's order of 2026-11-26: "One barrier
+/// serves every window kept before it: group commit per shard"): kept on its home shard here, and that shard's ticket
+/// put in `tickets`, the latest a shard, for the caller to wait on once ([`published`]) before any record names what it
+/// kept. A remote home still answers kept only once its own image holding it is published.
+pub(crate) async fn home_in_region_deferred(
+  origin: u16,
+  shards: &[u16],
+  (source, owner): (HomeSource, HomeOwner),
+  budget: slates_cluster::CommitBudget,
+  tickets: &mut std::collections::BTreeMap<u16, HomeTicket>,
+) -> Homed {
+  homed_in_region(origin, shards, (source, owner), budget, Some(tickets)).await
+}
+
+/// [`home_in_region`]'s body: this node's keep waited for durable, or its ticket kept in `deferred`.
+async fn homed_in_region(
+  origin: u16,
+  shards: &[u16],
+  (source, owner): (HomeSource, HomeOwner),
+  budget: slates_cluster::CommitBudget,
+  deferred: Option<&mut std::collections::BTreeMap<u16, HomeTicket>>,
+) -> Homed {
   let identity = source.identity();
   let budget_ns = budget.max_deadline_ns();
   let began = slates_rt::futures::now_ns();
@@ -3081,6 +3141,7 @@ pub(crate) async fn home_in_region(
     ranked: Vec::new(),
     reranked: false,
     other_version: false,
+    deferred,
   };
   loop {
     let Some((local, members, f, installs)) = crate::state::with_state(|state| {
@@ -3145,7 +3206,7 @@ pub(crate) async fn home_in_region(
 
 /// One homing in the region as it goes ([`home_in_region`], A-912): the homes that kept the window so far, its bytes, the
 /// homes it was last ranked at, and whether a configuration installed meanwhile ranked them differently.
-struct Homing {
+struct Homing<'h> {
   kept_by: Vec<slates_db::HostId>,
   source: HomeSource,
   /// Whether it was handed content held whole ([`HomeSource::Held`]): the buffers of it it makes are counted
@@ -3155,9 +3216,12 @@ struct Homing {
   reranked: bool,
   /// A home answered as a member of another home wire version: no install changes that (A-727 (d1a)).
   other_version: bool,
+  /// Where this node's keep's ticket goes, its durability left to the caller's one barrier
+  /// ([`home_in_region_deferred`]); none to wait for it here.
+  deferred: Option<&'h mut std::collections::BTreeMap<u16, HomeTicket>>,
 }
 
-impl Homing {
+impl Homing<'_> {
   /// One round of puts to `wanted` within `round`: kept here where this node is one of them (once durable), the rest
   /// sent from the control shard, which holds the record sessions (`crate::fleet::take_sessions`). Refused where this
   /// node's own keep was.
@@ -3261,6 +3325,14 @@ impl Homing {
           .1
       }
     };
+    // Kept; its durability the caller's one barrier, a home shard's latest ticket kept.
+    if let Some(tickets) = self.deferred.as_deref_mut() {
+      let latest = tickets.entry(ticket.shard).or_insert(ticket);
+      if ticket.generation > latest.generation {
+        *latest = ticket;
+      }
+      return Ok((1, None));
+    }
     Ok(
       match super::durable::content_durable(origin, ticket, budget_ns).await {
         Ok(()) => (1, None),
