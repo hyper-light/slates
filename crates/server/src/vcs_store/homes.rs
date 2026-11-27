@@ -1948,7 +1948,7 @@ async fn outcome_of(
   (local, members, f): (slates_db::HostId, &[slates_db::HostId], usize),
   budget_ns: u64,
 ) -> Option<([u8; 32], slates_cluster::homes::HomeOutcome)> {
-  use slates_cluster::homes::{HomeMessage, HomeOutcome};
+  use slates_cluster::homes::HomeMessage;
   let answered = match message {
     HomeMessage::Put {
       identity,
@@ -1990,6 +1990,24 @@ async fn outcome_of(
       [0; 32],
       durable_answer(origin, shards, tickets, budget_ns).await,
     ),
+    HomeMessage::Settle { settle, identities } => (
+      [0; 32],
+      settle_answer(origin, shards, (settle, identities), budget_ns).await,
+    ),
+    other => return held_outcome_of(other, (origin, shards), budget_ns).await,
+  };
+  Some(answered)
+}
+
+/// [`outcome_of`]'s outcome for a message that puts nothing: a read, a let-go, a move, a resolution or a rebuild heard
+/// of. `None` for an answer, which nothing answers, and for a put or a barrier, which [`outcome_of`] answers itself.
+async fn held_outcome_of(
+  message: slates_cluster::homes::HomeMessage,
+  (origin, shards): (u16, &[u16]),
+  budget_ns: u64,
+) -> Option<([u8; 32], slates_cluster::homes::HomeOutcome)> {
+  use slates_cluster::homes::{HomeMessage, HomeOutcome};
+  let answered = match message {
     HomeMessage::ReadPart { identity, offset } => (
       identity,
       read_part(origin, shards, ContentId(identity), offset, budget_ns).await,
@@ -2018,11 +2036,11 @@ async fn outcome_of(
       let _ = crate::state::with_state(|state| state.count(REBUILT_HEARD, 1));
       ([0; 32], HomeOutcome::Owed)
     }
-    HomeMessage::Settle { settle, identities } => (
-      [0; 32],
-      settle_answer(origin, shards, (settle, identities), budget_ns).await,
-    ),
-    HomeMessage::Answer { .. } => return None,
+    HomeMessage::Answer { .. }
+    | HomeMessage::Put { .. }
+    | HomeMessage::PutPart { .. }
+    | HomeMessage::Durable { .. }
+    | HomeMessage::Settle { .. } => return None,
   };
   Some(answered)
 }
