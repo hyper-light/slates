@@ -65239,6 +65239,12 @@ GAPS.
     `svn_commit::BUILD_MOST_LISTED_A_UNIT`, the most nodes a build unit listed whole, recorded where one is listed.
   - The move test bounds a build unit's gone paths and listed nodes at one; red at 9,000 with the deletion's tree
     listed.
+  **The wide tests under ThreadSanitizer** (main's order, diag 46018002586 at 56b609053). The copy's and the move's
+  wide tests hold every step to the shard's native window, which the lane's 10 to 20 times slowdown cannot keep; their
+  histories did not even end within the 120 s patience. They join `t_c2c` in the lane's `SERVER_SKIPPED`
+  (`xtask/src/tsan.rs`), with the run cited. The removal's wide test asserts no step's time, so its history's patience
+  is the lane's (`svn_commit::tests::lane_patience`: 120 s times `test_lane::slowdown`, 25 in that lane), through
+  `stored_patient`, of which `stored_configured` is the unscaled case.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
