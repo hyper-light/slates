@@ -680,3 +680,10 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
 - BENCHMARKS entries landed for bench7: the svn leg and the hg store-wait split (f8d28d2f8), P7's true F (b42a4bbb6,
   fed0b8164) and its fourth arm (e2dee55c5), and the git leg (b54e8a361) with its derive_behind A/B (e03925040).
 - Nothing open. Branch w-interop/hg-matrix-ci (diag only, never main) stays local.
+- Run 9 (45644433352): hg passed all three runners, svn all four legs, git both Linux runners; Windows git was 23 of 27
+  on the SSH rows. Fixed by 9099f5055 (landed 8eac5188a): GIT_SSH_COMMAND quotes its paths, and every matrix prints
+  rss=unmeasured where ps lists none. Red on the MacBook with a backslash work directory (23/27), then green (27/27).
+  Branch w-interop/hg-matrix-ci, recreated at 80eccadbd, handed to main for interop-linux-10.
+- 373d90ee4: BENCHMARKS, the 57k hg clone at 7a9cb385e (43.150 s) and P7 closed.
+- Disk freed: 2.8 GB of matrix scratch and 3.0 GB of target. git/git up to v1.0.0 is kept at
+  ~/.local/state/w-interop/git-v1.0.0.git (~/.cache/main-rounds was wiped).
