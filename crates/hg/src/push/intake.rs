@@ -132,6 +132,9 @@ pub struct Intaken {
   /// The file delta bases asked of the node's changeset store between steps: a revision landed before the push whose
   /// windows were let go, brought back to be read.
   pub base_store_reads: u64,
+  /// Of those, a base asked again because its windows went again after it was brought back (main's once rule of
+  /// 2026-11-27: at most once a revision, a third ask refused).
+  pub base_store_reasked: u64,
   /// The most text bytes one step hashed and kept (A-767 C1, the push spin): a revision longer than the content
   /// store's window is taken over as many steps as it has windows ([`Pending`]), so no step's work grows with a file.
   pub longest_step_bytes: u64,

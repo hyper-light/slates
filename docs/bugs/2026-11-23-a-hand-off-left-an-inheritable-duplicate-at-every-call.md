@@ -115,9 +115,16 @@ inherited every one made before. A claim refused at exhaustion leaked a descript
   there, and the daemon keeps the copy for the client until its release or the client's reap. Closing the handle is a
   line in the drop branch (`handle_route::adopt_section`, dropped). Giving the copy back needs a release request from
   that path, and neither can be exercised off Windows, so the edge is recorded, not changed.
-- **Not changed.**
+- **Not changed** (the first item amended 2026-11-27, A-931).
   - The anchor's held listeners and its hold table stay inheritable in the anchor, whose only child is the daemon, and
     the daemon marks them close-on-exec at its start.
+    - **Amended 2026-11-27 (A-931).** The premise holds for a standalone anchor but not for the holder's process
+      wherever an anchor shares it: tests and embeddings (`Adoption`'s doc names both). There every child of the
+      process, the daemon's spawner and its hooks among them, kept the listeners. The TSan lane's parity listing showed
+      a held rendezvous (`socket:[22118]`, flags `04002`) in both children of a test, and an unrelated shell held one
+      (run 45993337450, `socket:[16158]` at the instance's address). Now every descriptor the anchor hands its daemon
+      stays close-on-exec in the anchor and is cleared in the daemon's child alone, as the segment's are:
+      docs/bugs/2026-11-27-an-anchors-held-sockets-reached-every-child-of-their-holders-process.md.
   - Every other creator of a descriptor in shipped code passes the flag as it creates it: sockets
     (`SOCK_CLOEXEC`), accepted connections (`accept_with`), eventfds, memfds and pipes. The plain `dup`s left are in
     tests.

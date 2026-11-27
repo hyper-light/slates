@@ -30,6 +30,19 @@ pub(crate) struct Deciding {
   cleared_found: bool,
   /// The content paths whose ops do not fit what they edit at the work's base, found so far by the first unit's walk.
   unfit: Vec<String>,
+  /// The directory removal being decided over steps, its children counted ([`Green::decide_rmdirs_some`]).
+  rmdir: Option<RmdirWalk>,
+}
+
+/// A directory's removal being decided over steps ([`Green::decide_rmdirs_some`], A-920): of the paths the increment
+/// removes itself under it, from the least, those each of the head's node maps holds, counted a path a unit. A child the
+/// work does not remove itself is one more key under the directory in a map than its count there.
+#[derive(Debug, Default)]
+struct RmdirWalk {
+  /// Of the paths counted, those each map holds ([`Green::held_under`]'s order).
+  cleared: [usize; 5],
+  /// The last path counted.
+  after: Option<String>,
 }
 
 /// What a phase decides from: the increment and its resolution.
@@ -398,20 +411,103 @@ impl Green {
   }
 
   /// The directories the increment removes, a unit each over the directory's tree.
+  ///
+  /// A removal's children are counted, never walked whole (A-920: a directory of 9,000 files the work removed walked them
+  /// all in one unit, 4.96 ms debug): the head's keys under the directory in each map, a descent each; and the paths the
+  /// work removes itself under it, a path a unit, counted where each map holds them. A child survives exactly where a
+  /// map holds more keys under the directory than its count, so the removal is delete against modify there.
   fn decide_rmdirs_some(&self, from: &DecideIn<'_>, walk: &mut Walk<'_>) -> bool {
     let base = from.inc.base;
-    for path in from.r.rmdirs.range::<str, _>(walk.after()) {
-      let cleared = &walk.deciding.cleared;
+    // Taken on after the last directory decided; a removal whose children were being counted is taken on again there.
+    let after = walk.deciding.after.clone();
+    let from_after = after.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
+    for path in from
+      .r
+      .rmdirs
+      .range::<str, _>((from_after, Bound::Unbounded))
+    {
+      let Some(decided) = self.rmdir_decided(path, base, walk) else {
+        return false;
+      };
       walk
         .units
         .unit(position::Footprint::directory(path), |_, sink| {
-          sink.of(self.merge_rmdir(path, base, cleared))
+          sink.of(decided)
         });
       if walk.spent_after(path) {
         return false;
       }
     }
     true
+  }
+
+  /// The removal of the directory at `path` decided ([`Green::decide_rmdirs_some`]), its children counted from where the
+  /// last step left them: none while the step is spent before they all are.
+  fn rmdir_decided(
+    &self,
+    path: &str,
+    base: u64,
+    walk: &mut Walk<'_>,
+  ) -> Option<Result<Option<super::Effect>, super::ConflictWindow>> {
+    if walk.deciding.rmdir.is_none() {
+      if let Some(decided) = self.rmdir_before_children(path, base) {
+        return Some(decided);
+      }
+      walk.deciding.rmdir = Some(RmdirWalk::default());
+    }
+    let prefix = format!("{path}/");
+    if !self.rmdir_children_counted(&prefix, walk) {
+      return None;
+    }
+    let counted = walk.deciding.rmdir.take().unwrap_or_default();
+    let live = self
+      .held_under(&prefix)
+      .iter()
+      .zip(counted.cleared)
+      .any(|(held, cleared)| *held > cleared);
+    Some(if live {
+      Err(Green::window(path, MergeConflictClass::DeleteModify))
+    } else {
+      Ok(Some(super::Effect::RemoveDir(path.to_owned())))
+    })
+  }
+
+  /// The paths the work removes itself under `prefix` counted where each of the head's maps holds them, a path a unit
+  /// from the last counted: whether all are, else the step is spent.
+  fn rmdir_children_counted(&self, prefix: &str, walk: &mut Walk<'_>) -> bool {
+    let Walk {
+      deciding, spent, ..
+    } = walk;
+    let Deciding { cleared, rmdir, .. } = &mut **deciding;
+    let Some(counting) = rmdir.as_mut() else {
+      return true;
+    };
+    let mut counted = 0u64;
+    let all = loop {
+      let from = counting
+        .after
+        .as_deref()
+        .map_or(Bound::Included(prefix), Bound::Excluded);
+      let Some(child) = cleared
+        .range::<str, _>((from, Bound::Unbounded))
+        .next()
+        .filter(|child| child.starts_with(prefix))
+      else {
+        break true;
+      };
+      for (count, held) in counting.cleared.iter_mut().zip(self.held_at(child)) {
+        if held {
+          *count = count.saturating_add(1);
+        }
+      }
+      counting.after = Some(child.clone());
+      counted = counted.saturating_add(1);
+      if spent() {
+        break false;
+      }
+    };
+    self.rmdir_children_noted(counted);
+    all
   }
 
   /// The modes the increment sets, a unit each.

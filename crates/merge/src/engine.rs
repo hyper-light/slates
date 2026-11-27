@@ -1558,6 +1558,12 @@ pub struct Green {
   /// flat lists; one each had been freed a unit at a time, and the free that emptied the allocator's region cost a
   /// gathering's step 1.2 ms). A cell, as `fast_path_hits` is.
   unit_effect_lists: std::cell::Cell<u64>,
+  /// The children directory removals counted, and the units that counted them (A-920: a child a unit, never the
+  /// directory's whole tree in its removal's one unit, 4.96 ms debug at 9,000 files). Cells, as `fast_path_hits` is.
+  rmdir_children: std::cell::Cell<(u64, u64)>,
+  /// The entries resolutions' ends took and the units that took them (A-920: an entry a unit in a judge's steps, never
+  /// the end whole in one, 5.86 ms debug at 9,000 paths). A cell, as `fast_path_hits` is.
+  resolution_ends: std::cell::Cell<(u64, u64)>,
   /// The changed paths a commit put in a tree set of its own (A-920 3m: none, since its paths are ordered a unit at a
   /// time with no tree; 9,000 String clones and their nodes had been 0.73-0.78 ms of one step, debug).
   commit_tree_paths: u64,
@@ -2500,20 +2506,9 @@ impl Resolved {
   /// The resolution's end once every op is resolved ([`Green::resolve_some`]): each IPC node made at a path the work
   /// also does anything else at is invalid, and the copies split from what lands in their trees.
   fn finish_resolving(&mut self) {
-    for path in self.specials.keys() {
-      if self.creates.contains(path)
-        || self.content.contains_key(path)
-        || self.mkdirs.contains(path)
-        || self.symlinks.contains_key(path)
-        || self.hardlinks.contains_key(path)
-        || self.renames.contains_key(path)
-        || self.unlinks.contains(path)
-        || self.rmdirs.contains(path)
-      {
-        self.invalid.insert(path.clone());
-      }
-    }
-    self.split_copies();
+    // One end, the stepped one's: taken to its end here ([`finishing::Finishing`], an entry a unit in a judge's steps).
+    let mut finishing = finishing::Finishing::default();
+    while !finishing.step(self) {}
   }
 
   /// The paths this increment removes (unlinks, rmdirs and rename sources) — a directory removal's
@@ -4506,6 +4501,35 @@ impl Green {
     self.commit_paths_made
   }
 
+  /// The children directory removals counted, and the units that counted them ([`Green::rmdir_children`]'s field,
+  /// A-920).
+  pub fn rmdir_children(&self) -> (u64, u64) {
+    self.rmdir_children.get()
+  }
+
+  /// One unit of a directory removal's children counted, `counted` of them ([`Green::rmdir_children`]).
+  fn rmdir_children_noted(&self, counted: u64) {
+    if counted > 0 {
+      let (children, units) = self.rmdir_children.get();
+      self
+        .rmdir_children
+        .set((children.saturating_add(counted), units.saturating_add(1)));
+    }
+  }
+
+  /// The entries resolutions' ends took and the units that took them ([`Green::resolution_ends`]'s field, A-920).
+  pub fn resolution_ends(&self) -> (u64, u64) {
+    self.resolution_ends.get()
+  }
+
+  /// One unit of a resolution's end that took `taken` entries ([`Green::resolution_ends`]).
+  fn resolution_end_noted(&self, taken: u64) {
+    let (entries, units) = self.resolution_ends.get();
+    self
+      .resolution_ends
+      .set((entries.saturating_add(taken), units.saturating_add(1)));
+  }
+
   /// The effects commits walked for their node moves ([`Green::node_moves_walked`]'s field, A-920).
   pub fn node_moves_walked(&self) -> u64 {
     self.node_moves_walked
@@ -5456,17 +5480,6 @@ impl Green {
     }
   }
 
-  /// Whether any file, directory, symlink or hard link under `prefix` survives `cleared`: each map's keys under the
-  /// prefix, one descent each (A-534; a scan of every key of every map before).
-  fn has_live_child(&self, prefix: &str, cleared: &BTreeSet<String>) -> bool {
-    let live = |path: &String| !cleared.contains(path);
-    self.content.prefix(prefix).any(|(path, _)| live(&path))
-      || self.dirs.prefix(prefix).any(|(path, _)| live(&path))
-      || self.symlinks.prefix(prefix).any(|(path, _)| live(&path))
-      || self.hardlinks.prefix(prefix).any(|(path, _)| live(&path))
-      || self.specials.prefix(prefix).any(|(path, _)| live(&path))
-  }
-
   /// Whether an intervening change occupied `path` with any non-file kind.
   fn occupied_by_nonfile(&self, path: &str) -> bool {
     self.dirs.contains_key(path)
@@ -5911,35 +5924,53 @@ impl Green {
     Ok(Some(Effect::MakeDir(path.to_owned())))
   }
 
-  /// Merges a directory removal against the increment's own removals, and against its base: a
-  /// directory changed after the base in any dimension is delete against modify (A-643).
-  fn merge_rmdir(
+  /// A directory's removal at `path`, decided before its children (A-920): a node of another kind there refuses it
+  /// (type changed), none there makes it nothing to do, and a directory changed after `base` in any dimension is not the
+  /// one the work removes (delete against modify; A-643: the removal had no base, and removed a directory made again
+  /// since). None where its children decide it ([`Green::held_under`], [`Green::held_at`]: a child the work does not
+  /// remove itself is delete against modify, else the directory goes).
+  fn rmdir_before_children(
     &self,
     path: &str,
     base: u64,
-    cleared: &BTreeSet<String>,
-  ) -> Result<Option<Effect>, ConflictWindow> {
+  ) -> Option<Result<Option<Effect>, ConflictWindow>> {
     if self.content.contains_key(path)
       || self.symlinks.contains_key(path)
       || self.hardlinks.contains_key(path)
       || self.specials.contains_key(path)
     {
-      return Err(Green::window(path, MergeConflictClass::TypeChanged));
+      return Some(Err(Green::window(path, MergeConflictClass::TypeChanged)));
     }
     if !self.dirs.contains_key(path) {
-      return Ok(None);
+      return Some(Ok(None));
     }
-    // A directory changed after the base in any dimension (removed and made again, its mode or an
-    // attribute changed) is not the one the work removes: delete against modify (A-643; the
-    // removal had no base, and removed a directory made again since).
     if self.changed_after(path, base) {
-      return Err(Green::window(path, MergeConflictClass::DeleteModify));
+      return Some(Err(Green::window(path, MergeConflictClass::DeleteModify)));
     }
-    let prefix = format!("{path}/");
-    if self.has_live_child(&prefix, cleared) {
-      return Err(Green::window(path, MergeConflictClass::DeleteModify));
-    }
-    Ok(Some(Effect::RemoveDir(path.to_owned())))
+    None
+  }
+
+  /// The head's keys under `prefix` in each of its node maps (files, directories, symbolic links, hard links and IPC
+  /// nodes, in that order), counted with no walk: a descent each.
+  fn held_under(&self, prefix: &str) -> [usize; 5] {
+    [
+      self.content.prefix_len(prefix),
+      self.dirs.prefix_len(prefix),
+      self.symlinks.prefix_len(prefix),
+      self.hardlinks.prefix_len(prefix),
+      self.specials.prefix_len(prefix),
+    ]
+  }
+
+  /// Which of the head's node maps hold `path`, in [`Green::held_under`]'s order.
+  fn held_at(&self, path: &str) -> [bool; 5] {
+    [
+      self.content.contains_key(path),
+      self.dirs.contains_key(path),
+      self.symlinks.contains_key(path),
+      self.hardlinks.contains_key(path),
+      self.specials.contains_key(path),
+    ]
   }
 
   /// Metadata on a former IPC inode cannot silently apply to another kind that now owns its
@@ -9582,6 +9613,7 @@ fn special_payload(
 }
 
 mod branch;
+mod finishing;
 mod node_moves;
 pub use branch::{Lent, Lineage, LineageGreen, LineageRefused, Release};
 

@@ -799,3 +799,81 @@ fn a_wide_renames_node_moves_on_a_linked_green_walk_an_effect_a_unit() -> Result
   }
   Ok(())
 }
+
+/// Shape: the files under the directory a wide removal takes away.
+const UNDER: usize = 400;
+
+/// A green holding the directory `tree` and [`UNDER`] files under it.
+fn tree_of_files() -> Green {
+  let mut origin = crate::origin::Origin::default();
+  origin.dirs.push("tree".to_owned());
+  for at in 0..UNDER {
+    origin
+      .files
+      .push((format!("tree/f{at}"), b"<t>\n".to_vec()));
+  }
+  Green::with_origin(origin)
+}
+
+/// A work at `green`'s head removing every file under `tree` but those `kept` names, then `tree` itself.
+fn tree_removed(green: &Green, kept: &[&str]) -> Increment {
+  let mut work = Work::default();
+  for at in 0..UNDER {
+    let path = format!("tree/f{at}");
+    if !kept.contains(&path.as_str()) {
+      work = work.op(OpKind::Unlink, &path, (0, 0, u64::MAX));
+    }
+  }
+  work
+    .op(OpKind::Rmdir, "tree", (0, 0, u64::MAX))
+    .at(green.head(), 1)
+}
+
+/// `inc` computed on `green` whole and a unit a step: what each records it applies, or the windows it conflicts in, and
+/// the children the step's directory removals counted and the units that counted them.
+fn computed_both_ways(
+  green: &Green,
+  inc: &Increment,
+) -> Result<(String, String, (u64, u64)), String> {
+  let whole = format!(
+    "{:?}",
+    green
+      .compute(inc)
+      .map_err(|refused| format!("{refused:?}"))?
+      .applied()
+  );
+  let before = green.rmdir_children();
+  let mut computing = green.begin_computing(inc);
+  let sliced = loop {
+    if let Some(computed) = green.computing_step(inc, &mut computing, &mut || true) {
+      break computed.map_err(|refused| format!("{refused:?}"))?;
+    }
+  };
+  let after = green.rmdir_children();
+  let counted = (after.0 - before.0, after.1 - before.1);
+  Ok((whole, format!("{:?}", sliced.applied()), counted))
+}
+
+/// A-920 (a directory's removal decided with its children counted a unit a step). Do: compute, whole and a unit a step,
+/// a work removing every one of [`UNDER`] files under `tree` and then `tree`; then one that keeps a file there. Expect
+/// each computed alike both ways: the first removing the directory, the second, whose directory keeps a child, not; and a
+/// unit a step, each child the work removes counted in a unit of its own (`Green::rmdir_children`). Before, a removal
+/// walked the directory's whole tree in its one unit (4.96 ms debug at 9,000 files).
+#[test]
+fn a_directorys_removal_counts_its_children_a_unit_a_step() -> Result<(), String> {
+  let green = tree_of_files();
+  let (whole, sliced, (children, units)) = computed_both_ways(&green, &tree_removed(&green, &[]))?;
+  if whole != sliced
+    || !sliced.contains("RemoveDir(\"tree\")")
+    || children < UNDER as u64
+    || units != children
+  {
+    return Err(format!("removed: {whole} {sliced} {children} {units}"));
+  }
+  let kept = tree_removed(&green, &["tree/f7"]);
+  let (whole, sliced, _) = computed_both_ways(&green, &kept)?;
+  if whole != sliced || sliced.contains("RemoveDir(\"tree\")") {
+    return Err(format!("kept: {whole} {sliced}"));
+  }
+  Ok(())
+}
