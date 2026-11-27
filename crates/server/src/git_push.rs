@@ -382,6 +382,9 @@ struct DecidingPush {
   preparing: Option<slates_git::receive::works::Preparing>,
   /// Where the let-go window the command under way's peel last stopped for lies (A-864's push readers, r18).
   peel_away: Option<u64>,
+  /// The let-go, by its number, the command under way's policy check last stopped at (B4,
+  /// [`ServerJudge::policy_ready`]).
+  policy_away: Option<u64>,
   /// The repository's member greens still to checkpoint, a green a turn, to make the chains room for the command under
   /// way's entry before its append (A-238 moved off the append's step); none while the chains have room.
   making_room: Option<Vec<DbVolumeId>>,
@@ -1006,6 +1009,7 @@ impl<P> ReceivePack<P> {
       restaging: None,
       preparing: None,
       peel_away: None,
+      policy_away: None,
       making_room: None,
       door: None,
       homing: Homing::Due,
@@ -1038,6 +1042,7 @@ impl<P> ReceivePack<P> {
         restaging,
         preparing,
         peel_away,
+        policy_away,
         making_room,
         door,
         ..
@@ -1053,6 +1058,7 @@ impl<P> ReceivePack<P> {
         restaging,
         preparing,
         peel_away,
+        policy_away,
         making_room,
         door,
         waits: &self.waits,
@@ -2136,12 +2142,52 @@ struct ServerJudge<'j> {
   preparing: &'j mut Option<slates_git::receive::works::Preparing>,
   /// Where the let-go window the command under way's peel last stopped for lies (A-864's push readers, r18).
   peel_away: &'j mut Option<u64>,
+  /// The let-go the command under way's policy check last stopped at ([`ServerJudge::policy_ready`]).
+  policy_away: &'j mut Option<u64>,
   /// The member greens still to checkpoint before the command under way's append ([`DecidingPush::making_room`]).
   making_room: &'j mut Option<Vec<DbVolumeId>>,
   /// The green owing its push that the command under way waits at the door for (P2).
   door: &'j mut Option<DbVolumeId>,
   /// The push's own slot for the let-go window its readers meet ([`ReceivePack::take_waited`]).
   waits: &'j slates_git::away::Waits,
+}
+
+/// The policy's verdict on `command` (module docs, "Answering", item 3): A-644's store answers how the change moves its
+/// ref and so the right it needs, and A-622's check point judges that right and, where a rule imposes one, the
+/// requirements on what the change brings (A-644 part 2's `StoreBrings`: a linear history, signed commits); a refusal
+/// in git's words (`git_protect::declined`). Read on `state` against the sealed `push`, for the repository `record` and
+/// the pusher `principal`.
+fn policy_check(
+  state: &ShardState,
+  (record, principal): (&RepositoryRecord, &Principal),
+  push: &SealedPush,
+  command: &Command,
+) -> Result<(), Declined> {
+  let name = command.name.as_slice();
+  let Some(store) = state.vcs_stores.git_ref(record.id) else {
+    return Err(refused_declined(name, words(&GitRefused::NoStore)));
+  };
+  let (content, git) = store;
+  let green = born(state, (record.id, name), store).unwrap_or_else(|| unheld_key(record.id));
+  let to = (!command.is_delete()).then_some(command.new);
+  let change = git
+    .repository
+    .change(content, push.quarantine(), green, to)
+    .map_err(|refused| refused_declined(name, words(&refused)))?;
+  let right = right_of(change);
+  let brings = to.map(|to| StoreBrings {
+    repository: &git.repository,
+    store: content,
+    push: push.quarantine(),
+    green,
+    to,
+  });
+  let asked = [Asked {
+    name: Name::Ref(name),
+    right,
+    brings: brings.as_ref().map(|brings| brings as &dyn Brings),
+  }];
+  admit(record, principal, &asked).map_err(|refusal| declined(&refusal, name, right))
 }
 
 impl Judge for ServerJudge<'_> {
@@ -2193,6 +2239,7 @@ impl Judge for ServerJudge<'_> {
       self.waits,
     ) && self.build_turn(command, pushed, began)
       && self.room_turn()
+      && self.policy_ready(command)
   }
 
   fn judge(&mut self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
@@ -2286,33 +2333,51 @@ impl ServerJudge<'_> {
       principal,
       ..
     } = self;
-    let name = command.name.as_slice();
     with_room(state, |state| {
-      let Some(store) = state.vcs_stores.git_ref(record.id) else {
-        return Err(refused_declined(name, words(&GitRefused::NoStore)));
-      };
-      let (content, git) = store;
-      let green = born(state, (record.id, name), store).unwrap_or_else(|| unheld_key(record.id));
-      let to = (!command.is_delete()).then_some(command.new);
-      let change = git
-        .repository
-        .change(content, push.quarantine(), green, to)
-        .map_err(|refused| refused_declined(name, words(&refused)))?;
-      let right = right_of(change);
-      let brings = to.map(|to| StoreBrings {
-        repository: &git.repository,
-        store: content,
-        push: push.quarantine(),
-        green,
-        to,
-      });
-      let asked = [Asked {
-        name: Name::Ref(name),
-        right,
-        brings: brings.as_ref().map(|brings| brings as &dyn Brings),
-      }];
-      admit(record, principal, &asked).map_err(|refusal| declined(&refusal, name, right))
+      policy_check(state, (record, principal), push, command)
     })
+  }
+
+  /// Whether the policy's check of `command` (its verdict's, [`ServerJudge::admitted`]) reads what it needs now: its
+  /// reads made quiet (`Repository::reading_quietly`), a let-go window one meets is noted in the push's own slot for
+  /// its driver to bring back and the command not ready, by the one rule keyed by its number (B4 of the landed let-go's
+  /// lift, main's order of 2026-11-26: a rule requiring signed commits or a linear history read a let-go commit or tag,
+  /// and the verdict declined the command `Unjudged`, its commits read as unreadable). Asked last, once the command is
+  /// otherwise ready, so the verdict that follows in the same step reads what this check read; any other answer leaves
+  /// the verdict's own check to answer it.
+  fn policy_ready(&mut self, command: &Command) -> bool {
+    let Self {
+      state,
+      push,
+      record,
+      principal,
+      policy_away,
+      waits,
+      ..
+    } = self;
+    let met = with_room(state, |state| {
+      let (content, git) = state.vcs_stores.git_ref(record.id)?;
+      let (checked, met) = git
+        .repository
+        .reading_quietly(|| policy_check(state, (record, principal), push, command));
+      let waited = met.filter(|_| checked.is_err())?;
+      Some((
+        waited,
+        content.away_number(&waited.pack, waited.len, waited.offset),
+      ))
+    });
+    let seen = slates_git::away::WaitOnce::after(**policy_away);
+    let Some((waited, number)) = met else {
+      seen.answered();
+      **policy_away = seen.last();
+      return true;
+    };
+    let wait = seen.waits(number);
+    **policy_away = seen.last();
+    if wait {
+      waits.note(waited);
+    }
+    !wait
   }
 
   /// `command`'s entry (module docs, "Answering", item 4): A-654 part 1's verdicts over the shard's greens, the
