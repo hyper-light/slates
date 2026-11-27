@@ -74,6 +74,14 @@ pub(crate) struct RecoverySlices {
   longest_cpu_ns: u64,
   /// The units done when the slice that took the most CPU ended, naming where it was.
   longest_cpu_ended_at: u64,
+  /// When the current unit began, on the shard's clock: the last unit's end, or the slice's beginning.
+  unit_began_ns: u64,
+  /// The current slice's longest unit by the shard's clock: its kind, as its caller names it ([`Self::unit_done`]), and
+  /// its time.
+  slice_heaviest_unit: Option<(&'static str, u64)>,
+  /// That unit of the slice that took the most CPU (r42 at 20a49642c: "the most CPU in one 952,728 µs, ending at unit
+  /// 46" named no kind, so a slice's work could only be guessed).
+  longest_cpu_unit: Option<(&'static str, u64)>,
   /// When the current named piece began, on the shard's clock ([`Self::piece_done`]).
   piece_began_ns: u64,
   /// The pieces of at least a slice's floor the current slice has held.
@@ -103,6 +111,8 @@ pub(crate) struct SliceReport {
   pub(crate) longest_cpu_ns: u64,
   /// The units done when that slice ended: 1 when it was the first unit, the catalog's replay.
   pub(crate) longest_cpu_ended_at: u64,
+  /// That slice's longest unit, by its kind and its time on the shard's clock ([`RecoverySlices::unit_done`]).
+  pub(crate) longest_cpu_unit: Option<(&'static str, u64)>,
   /// The most pieces of at least a slice's floor one slice held ([`RecoverySlices::piece_done`]): 1 when every such
   /// piece is a slice of its own, as a start's must be.
   pub(crate) heavy_pieces_in_one_slice: u64,
@@ -156,6 +166,9 @@ impl RecoverySlices {
       slice_cpu_began_ns: cpu,
       longest_cpu_ns: 0,
       longest_cpu_ended_at: 0,
+      unit_began_ns: began_ns,
+      slice_heaviest_unit: None,
+      longest_cpu_unit: None,
       piece_began_ns: began_ns,
       heavy_pieces_in_slice: 0,
       heavy_pieces_in_one_slice: 0,
@@ -174,6 +187,7 @@ impl RecoverySlices {
     let heavy = self.note_piece(name);
     self.units = self.units.saturating_add(1);
     let now = slates_rt::futures::now_ns();
+    self.unit_timed(name, now);
     if heavy || self.spent(now) {
       self.yield_slice(now).await;
     }
@@ -205,14 +219,24 @@ impl RecoverySlices {
     self.budget_ns
   }
 
-  /// One unit done: when the slice is spent ([`slice_is_spent`]), it ends and the task yields, so the shard completes a
-  /// step before the next unit begins.
-  pub(crate) async fn unit_done(&mut self) {
+  /// One unit done, of `kind` (what the boot log names the heaviest slice's longest unit by): when the slice is spent
+  /// ([`slice_is_spent`]), it ends and the task yields, so the shard completes a step before the next unit begins.
+  pub(crate) async fn unit_done(&mut self, kind: &'static str) {
     self.units = self.units.saturating_add(1);
     let now = slates_rt::futures::now_ns();
+    self.unit_timed(kind, now);
     if self.spent(now) {
       self.yield_slice(now).await;
     }
+  }
+
+  /// A unit of `kind` ended at `now`: kept as its slice's longest where it is ([`Self::unit_done`]).
+  fn unit_timed(&mut self, kind: &'static str, now: u64) {
+    let took = now.saturating_sub(self.unit_began_ns);
+    if self.slice_heaviest_unit.is_none_or(|(_, most)| took > most) {
+      self.slice_heaviest_unit = Some((kind, took));
+    }
+    self.unit_began_ns = now;
   }
 
   /// Whether the slice is spent at `now` ([`slice_is_spent`]).
@@ -233,6 +257,7 @@ impl RecoverySlices {
     let resumed = slates_rt::futures::now_ns();
     self.yielding_ns = self.yielding_ns.saturating_add(resumed.saturating_sub(now));
     self.began_ns = resumed;
+    self.unit_began_ns = resumed;
   }
 
   /// Ends the last slice and reports the whole.
@@ -249,6 +274,7 @@ impl RecoverySlices {
         .map(|(now, began)| now.saturating_sub(began)),
       longest_cpu_ns: self.longest_cpu_ns,
       longest_cpu_ended_at: self.longest_cpu_ended_at,
+      longest_cpu_unit: self.longest_cpu_unit,
       heavy_pieces_in_one_slice: self.heavy_pieces_in_one_slice,
       heaviest_piece: self.heaviest_piece,
     }
@@ -267,8 +293,10 @@ impl RecoverySlices {
       if spent > self.longest_cpu_ns {
         self.longest_cpu_ns = spent;
         self.longest_cpu_ended_at = self.units;
+        self.longest_cpu_unit = self.slice_heaviest_unit;
       }
     }
+    self.slice_heaviest_unit = None;
     self.slice_cpu_began_ns = cpu;
     cpu
   }
@@ -339,7 +367,7 @@ mod tests {
           while slates_rt::futures::now_ns().saturating_sub(unit_began) < least_yield_ns {
             std::hint::spin_loop();
           }
-          slices.unit_done().await;
+          slices.unit_done("a test unit").await;
         }
         let sliced = slices.finish();
         let elapsed = slates_rt::futures::now_ns().saturating_sub(began);

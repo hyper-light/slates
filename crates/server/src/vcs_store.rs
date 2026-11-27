@@ -3573,7 +3573,7 @@ async fn replay_hg_sliced(
     match hg_record_step(state, id, index, Some(replay), slices.budget_ns())? {
       Ok(HgStep::Stepped(Some(more))) => {
         replay = more;
-        slices.unit_done().await;
+        slices.unit_done("a Mercurial record's revision").await;
       }
       Ok(HgStep::Asked(mut more)) => {
         let Some(disk) = state.vcs_disk.clone() else {
@@ -4145,7 +4145,7 @@ async fn replay_hg_referenced(
     match stepped {
       PieceStep::More(more) => {
         replay = Some(more);
-        slices.unit_done().await;
+        slices.unit_done("a Mercurial changeset's revision").await;
       }
       PieceStep::Wanted(more, wanted) => {
         let room = crate::vcs_share::room(state, id).bytes;
@@ -4934,7 +4934,7 @@ async fn replay_hg_run(
       match hg_segment_step(state, id, &bytes, replay.take(), slices.budget_ns())? {
         HgStep::Begun(begun) | HgStep::Stepped(Some(begun)) => {
           replay = Some(begun);
-          slices.unit_done().await;
+          slices.unit_done("a Mercurial segment's step").await;
         }
         HgStep::Asked(mut more) => {
           let step = hg_view::text_bytes_a_step(state);
@@ -5079,7 +5079,7 @@ async fn recover_repository(
       break;
     }
     index = index.saturating_add(1);
-    slices.unit_done().await;
+    slices.unit_done("a repository record's turn").await;
   }
   remake_greens(state, record, slices).await;
   // The landed packs its replay read whole from the node's store, let go again as their commits let them go
@@ -5113,7 +5113,7 @@ async fn git_recovery_turn(
   let ns = state.config.step_quantum_ns();
   match record_turn(state, (id, index), ns) {
     Some(RecordTurn::More) => {
-      slices.unit_done().await;
+      slices.unit_done("a git record's turn").await;
       Recovering::Again
     }
     Some(RecordTurn::Wants) => {
@@ -5152,7 +5152,7 @@ async fn remake_greens(
       svn_texts::rehold_head(state, record.id, green);
       crate::repository::svn_commit::fold_to_readers(state, green);
     }
-    slices.unit_done().await;
+    slices.unit_done("a repository's green made again").await;
   }
 }
 

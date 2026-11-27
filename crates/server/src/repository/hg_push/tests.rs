@@ -499,6 +499,36 @@ fn a_push_whose_changeset_is_not_durable_at_its_homes_is_refused_and_records_not
   );
 }
 
+/// Unit 43 (main 01a20182's r42 of 2026-11-26: a restart's one unit applied a whole tree's chain entry in one step,
+/// 329.6 ms of CPU at 6a4dcbc6a, 952.7 ms at 20a49642c). Do: on a stored shard push a line of [`WIDE_TREE`] changesets
+/// each adding a file, so `default`'s green records one entry naming every file; replay that green's chain as a
+/// restart does with each apply step given one nanosecond (`verbs::TEST_REPLAY_APPLY_BUDGET_NS`). Expect: the replay
+/// ends, its one entry applied in more steps than one. Red before: an entry's apply was one `apply_recorded` call, a
+/// step an entry.
+#[test]
+fn a_restarts_replay_applies_a_whole_trees_entry_a_slice_at_a_time() {
+  let (made, all) = wide_history(WIDE_TREE, 0);
+  let bundle = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &all);
+  let steps = crate::test_store::run_on_stored_shard(move || async move {
+    let hg = Hg::made("sliced-apply").await;
+    let outcome = pushed_bytes_to(hg.repository, &bundle).await;
+    assert!(matches!(outcome, Outcome::Accepted(_)), "{outcome:?}");
+    crate::repository::svn_commit::tests::on(|state| {
+      crate::verbs::TEST_REPLAY_APPLY_BUDGET_NS.with(|budget| budget.set(Some(1)));
+      let steps = crate::verbs::replay_apply_steps_for_test(state, hg.root);
+      crate::verbs::TEST_REPLAY_APPLY_BUDGET_NS.with(|budget| budget.set(None));
+      (steps, state.db.partition().green_head(hg.root))
+    })
+  });
+  let (steps, entries) = steps;
+  let steps = steps.expect("the green's replay ended");
+  println!("unit 43: {entries} entries applied in {steps} steps");
+  assert!(
+    steps > entries,
+    "the entry's apply sliced: {steps} steps for {entries} entries"
+  );
+}
+
 /// Ruling R piece (ii)'s oracle (main 01a20182's ruling of 2026-11-26: the segment homed as it landed, and a holder's
 /// landed segment the owner's byte for byte, by identity). Do: on a stored shard, cut a push's segments at one byte and
 /// push four changesets; then make its run whole on a second node's store that holds none of it, as a holder's rebuild
