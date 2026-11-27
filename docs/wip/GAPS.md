@@ -357,6 +357,15 @@
 >     none claimed it; SSH refused typed. Found by the one owner lookup (`owner_location::locate_owner`), shared with the
 >     volume forward and the homes' resolution. For a cross-node `307`, git needs a credential helper answering every
 >     node's edge (curl drops a custom `Authorization` field on an origin change).
+>   - **FIXED (w-git, 2026-11-26; main's order, from w-shared's A-921 test): the shared owner lookup holds a bounded
+>     caller to its bound.** `locate_within_horizon` slept a whole pace (`HEARTBEAT_NS / POLL_PER_PERIOD`, 10 ms)
+>     between looks whatever was left of its caller's bound, so the home healer's resolution pass, which bounds it by
+>     what is left of its own budget, ran one pace and a wait's lateness past that budget (main's sets: 10.08 to 10.57
+>     ms past 1,998 ms, 6 times in 4 sets). Now it sleeps the pace or what is left before its ceiling, whichever is
+>     less. Red: `owner_location::tests::a921_a_bounded_owner_lookup_ends_within_its_bound_and_its_waits_lateness` (a
+>     lookup bounded at two paces and a half: 33.2 ms against 25 ms, 1.87 ms of measured lateness and a 0.55 ms look);
+>     the resolution pass's test now bounds it by its budget, the shard's measured lateness of its waits
+>     (`futures::scheduler_overrun_ns`) and one look's measured time, not a pace (after: 0.15 ms past its budget).
 >   - **OPEN, waits for Ada's word: fleet-wide repository name routing.** A node holding no copy of a repository answers
 >     `404` (the fleet test: the third node's `ls-remote` "not found"): a name resolves only where a partition holds it
 >     (D-12, no directory; D-14, no global catalog), so it cannot even form the owner's query. Not started.

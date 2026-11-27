@@ -5245,11 +5245,29 @@ fn t_a727_d1a_a_refused_push_leaves_another_repositorys_hold_of_the_same_object(
   );
 }
 
+/// One look of the owner lookup the resolution pass waits on (`owner_location::locate`), timed on this shard: the
+/// location of an object no node holds, as an unclaimed attempt's repository is. Its nanoseconds.
+async fn one_look_ns() -> u64 {
+  let object = slates_db::register::ObjectId::new(slates_db::HostId(u64::MAX >> 1), 7);
+  let Some(query) =
+    crate::state::with_state(|state| crate::owner_location::home_query(state, object))
+  else {
+    return 0;
+  };
+  let began = slates_rt::futures::now_ns();
+  let _ = crate::owner_location::locate(query).await;
+  slates_rt::futures::now_ns().saturating_sub(began)
+}
+
 /// A-921 part 2 (main 01a20182's ruling of 2026-11-25: the home healer waits the shared owner lookup within its own
 /// budget). Do: on a store-backed shard, hold three objects for earlier-process attempts of repositories no shard holds
-/// (nobody will claim them), then run one resolution pass within the live budget. Expect the pass over within that budget
-/// and one look's pace past it (the lane never held past it), each hold kept, counted, and no hold let go or moved.
-/// Before, the shared lookup waited its own horizon for each unclaimed attempt in turn.
+/// (nobody will claim them), then run one resolution pass within the live budget. Expect the pass over within that
+/// budget, the shard's measured lateness of its waits (`futures::scheduler_overrun_ns`) and one look's own measured
+/// time (the lane never held past it), each hold kept, counted, and no hold let go or moved. Before, the shared lookup
+/// waited its own horizon for each unclaimed attempt in turn; and then a whole pace past its bound, which the test
+/// allowed as one look's pace and the timer's lateness overran (main's sets of 2026-11-26: 10.08 to 10.57 ms past a
+/// 1,998 ms budget, 6 times in 4 sets;
+/// `owner_location::tests::a921_a_bounded_owner_lookup_ends_within_its_bound_and_its_waits_lateness`).
 #[test]
 fn a_resolution_pass_over_unclaimed_attempts_ends_within_its_budget() {
   use crate::vcs_store::homes;
@@ -5278,10 +5296,12 @@ fn a_resolution_pass_over_unclaimed_attempts_ends_within_its_budget() {
         return;
       };
       let budget = crate::fleet::live_budget();
+      let look = one_look_ns().await;
       homes::resolve_owed();
       let began = slates_rt::futures::now_ns();
       homes::resolve_ended(origin, &shards, budget).await;
       let took = slates_rt::futures::now_ns().saturating_sub(began);
+      let late = slates_rt::futures::scheduler_overrun_ns();
       let seen = crate::state::with_state(|state| {
         let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
         (
@@ -5296,20 +5316,21 @@ fn a_resolution_pass_over_unclaimed_attempts_ends_within_its_budget() {
           ],
         )
       });
-      let _ = sent.send(Ok((took, budget.max_deadline_ns(), seen)));
+      let _ = sent.send(Ok((took, (budget.max_deadline_ns(), late, look), seen)));
     })
     .expect("the task");
     slates_rt::futures::detach(task).expect("detached");
   });
-  let (took, budget_ns, seen) = got.recv().expect("the pass ended").expect("held");
+  let (took, (budget_ns, late, look), seen) = got.recv().expect("the pass ended").expect("held");
   let (holds, counts) = seen.expect("the shard's state");
-  let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
   println!(
-    "a919: a resolution pass over three unclaimed attempts took {took} ns of its {budget_ns} ns budget"
+    "a919: a resolution pass over three unclaimed attempts took {took} ns of its {budget_ns} ns budget, its waits \
+     {late} ns late, a look {look} ns"
   );
   assert!(
-    took <= budget_ns.saturating_add(pace),
-    "the pass ended within its budget and one look's pace: {took} ns of {budget_ns} ns"
+    took <= budget_ns.saturating_add(late).saturating_add(look),
+    "the pass ended within its budget, its waits' lateness and one look: {took} ns of {budget_ns} ns, {late} ns late, \
+     a look {look} ns"
   );
   assert_eq!(holds, vec![1, 1, 1], "every unclaimed hold kept");
   assert_eq!((counts[0], counts[1]), (0, 0), "none moved or let go");
