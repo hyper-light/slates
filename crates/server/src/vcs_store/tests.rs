@@ -2247,9 +2247,10 @@ fn t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands() {
       let built = work_of(state, (&push, root), (version, None), (commit, tree));
       let mut sealed = push.seal(state).expect("sealed");
       let (mut admitting, mut turns) = (None, 0usize);
+      let waits = slates_git::away::Waits::default();
       loop {
         turns += 1;
-        if sealed.admission_turn(state, (key, commit), (&mut admitting, 0)) {
+        if sealed.admission_turn(state, (key, commit), (&mut admitting, 0), &waits) {
           break;
         }
       }

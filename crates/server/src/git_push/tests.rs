@@ -1830,6 +1830,23 @@ fn tag_headed_pushed(
   name: &str,
   second: impl FnOnce(ObjectId, ObjectId) -> Vec<u8>,
 ) -> (Received, u64, (u64, u64, u64)) {
+  pushed_over_a_let_go(name, |window| {
+    let (create, pack, (tag, commit)) = tag_headed_create(window);
+    ((create, pack, tag), second(tag, commit))
+  })
+}
+
+/// On a stored daemon's repository `name`: the create `made` makes of the content store's window size pushed, `ok`
+/// for each of its commands, and the derivation behind it ended, so no write path holds or lets go its pack's windows
+/// after; then, in the next push's own task, before its first step and with nothing between, every window of that
+/// pack let go by hand and the repository idle (`git_encode::give_back_idle`), the window of the object `made` names
+/// asserted let go by its let-go's number; then the request `made` makes next, driven as an edge drives it
+/// ([`let_go_when`]). What that push received, the windows its own driver brought back of ones its steps noted, and the
+/// bring-backs refused.
+fn pushed_over_a_let_go(
+  name: &str,
+  made: impl FnOnce(usize) -> ((Vec<u8>, Vec<u8>, ObjectId), Vec<u8>),
+) -> (Received, u64, (u64, u64, u64)) {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let repository = git_repository_on(&daemon, name);
   let window = crate::daemon::observe_first(&daemon, |state| {
@@ -1839,23 +1856,29 @@ fn tag_headed_pushed(
       .map(slates_vcs::ContentStore::window)
   })
   .expect("the content store");
-  let (create, pack, (tag, commit)) = tag_headed_create(window);
+  let ((create, pack, away), request) = made(window);
   let (created, _) = pushed_in_steps(&daemon, repository, &create).unwrap();
-  assert_eq!(reasons(&created), [b"ok", b"ok"]);
+  assert!(
+    reasons(&created).iter().all(|reason| reason == b"ok"),
+    "{:?}",
+    created.outcomes
+  );
   assert!(
     derivation_ended(&daemon, repository),
     "the create's derivation behind it ended"
   );
-  let request = second(tag, commit);
   let (received, _, _, driven) = crate::test_store::run_on_first(
     &daemon,
     move || async move {
       let number = on_state(|state| {
         let _ = let_go_by_hand(state, &pack);
         crate::vcs_store::git_encode::give_back_idle(state, repository);
-        away_number_of(state, repository, &tag)
+        away_number_of(state, repository, &away)
       });
-      assert!(number.is_some(), "the tag's window let go before the push");
+      assert!(
+        number.is_some(),
+        "the object's window let go before the push"
+      );
       let_go_when(repository, &request, (&[], LetGoAt::Already, Meddle::Not)).await
     },
     HISTORY_PATIENCE,
@@ -1921,6 +1944,244 @@ fn tag_headed_create(window: usize) -> (Vec<u8>, Vec<u8>, (ObjectId, ObjectId)) 
     &pack,
   );
   (create, pack, (tag, commit))
+}
+
+/// B3 at the admission's own site (main's ruling of 2026-11-26: an admission answering ready over a swallowed typed
+/// refusal is a lost error, CLAUDE.md §2 item 9, whatever re-read heals it later). Do: create `main` and
+/// `refs/tags/v1`, the tag in a window of its own ([`tag_headed_create`]); once its derivation has ended, let every
+/// window go and the repository idle; then run one turn of the admission of a create of `refs/tags/v2` at that tag
+/// (`SealedPush:: admission_turn`), whose peel reads the tag's bytes through its let-go window. Expect: not ready, the
+/// let-go noted in the push's own slot, nothing on the repository's shared one. Red before: ready, the refusal
+/// swallowed, and the note left on the shared slot.
+#[test]
+fn b3_an_admission_turn_over_a_let_go_tag_answers_not_ready_and_notes_the_push_alone() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository = git_repository_on(&daemon, "admission-let-go");
+  let window = crate::daemon::observe_first(&daemon, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .expect("the content store");
+  let (create, pack, (tag, _)) = tag_headed_create(window);
+  let (created, _) = pushed_in_steps(&daemon, repository, &create).unwrap();
+  assert_eq!(reasons(&created), [b"ok", b"ok"]);
+  assert!(
+    derivation_ended(&daemon, repository),
+    "the create's derivation ended"
+  );
+  let (number, ready, shared) = crate::daemon::observe_first(&daemon, move |state| {
+    let _ = let_go_by_hand(state, &pack);
+    crate::vcs_store::git_encode::give_back_idle(state, repository);
+    let number = away_number_of(state, repository, &tag);
+    let mut sealed = crate::vcs_store::GitPush::begin(&state.vcs_stores, repository)
+      .expect("a git store")
+      .seal(state)
+      .expect("sealed");
+    let ns = state.config.step_quantum_ns();
+    let waits = slates_git::away::Waits::default();
+    let ready = sealed.admission_turn(
+      state,
+      (super::unheld_key(repository), tag),
+      (&mut None, ns),
+      &waits,
+    );
+    let shared = state
+      .vcs_stores
+      .git(repository)
+      .and_then(|(_, store)| store.repository.peek_waiting());
+    sealed.abandon(state);
+    (number, (ready, waits.peek()), shared.is_some())
+  });
+  daemon.stop();
+  let (ready, noted) = ready;
+  assert!(number.is_some(), "the tag's window let go");
+  assert!(!ready, "not ready over its let-go window");
+  assert!(noted.is_some(), "the let-go noted in the push's own slot");
+  assert!(!shared, "nothing on the repository's shared slot");
+}
+
+/// B3's healed path, kept as its net (main's ruling of 2026-11-26): a create at a commit a green holds is made at that
+/// green (A-753), no base search read. Do: create `main` at `C2` over `C1` over `C0`, `C0`'s window apart from `C1`'s
+/// ([`three_commit_create`]); let every window go in the next push's task; create `refs/heads/x` at `C1`, the empty
+/// pack stock git sends for a commit the server holds. Expect: `ok`, what the push read brought back by its own driver.
+#[test]
+fn b3_a_create_at_a_commit_a_green_holds_lands_over_let_go_windows() {
+  let (created, driven, refused) = pushed_over_a_let_go("let-go-held-create", |window| {
+    let (create, pack, (zero, one)) = three_commit_create(window, Apart::Zero);
+    let request = request(
+      &[("", &one.to_string(), b"refs/heads/x")],
+      CAPABILITIES,
+      empty_pack(),
+    );
+    ((create, pack, zero), request)
+  });
+  assert_eq!(
+    reasons(&created),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    created.outcomes
+  );
+  assert!(
+    driven > 0,
+    "the push's own driver brought back what it read"
+  );
+}
+
+/// B3's healed path, kept as its net: a create's search back for its base reads its commits' parents from the index's
+/// rows, never their bytes. Do: [`b3_a_create_at_a_commit_a_green_holds_lands_over_let_go_windows`]'s create with
+/// `C1`'s window apart from `C2`'s; let every window go; create `refs/heads/x` at a new commit over `C1`, its pack that
+/// commit's objects. Expect: `ok`.
+#[test]
+fn b3_a_create_whose_base_search_runs_over_a_let_go_commit_lands() {
+  let (created, _, refused) = pushed_over_a_let_go("let-go-base-search", |window| {
+    let (create, pack, (_, one)) = three_commit_create(window, Apart::One);
+    let (new, objects) = flat_commit(1, "over one", Some(one));
+    let request = request(
+      &[("", &new.to_string(), b"refs/heads/x")],
+      CAPABILITIES,
+      &pack_of_objects(&objects),
+    );
+    ((create, pack, one), request)
+  });
+  assert_eq!(
+    reasons(&created),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    created.outcomes
+  );
+}
+
+/// Which of [`three_commit_create`]'s commits lies past its filler blob, in a window apart from the commits before it.
+#[derive(Clone, Copy)]
+enum Apart {
+  /// `C0`, its window apart from `C1`'s.
+  Zero,
+  /// `C1` (and `C0` with it), its window apart from `C2`'s.
+  One,
+}
+
+/// A create of `main` at `C2` over `C1` over `C0`, each a commit of one file, the pack laid in that order with a filler
+/// blob of [`FILLER_WINDOWS`] content store windows (each `window` bytes) of bytes that do not compress before the
+/// commit `apart` names: the request, its pack, and `C0`'s and `C1`'s ids.
+fn three_commit_create(window: usize, apart: Apart) -> (Vec<u8>, Vec<u8>, (ObjectId, ObjectId)) {
+  use slates_git::object_name::Kind;
+  let (zero, under) = flat_commit(1, "zero", None);
+  let (one, middle) = flat_commit(1, "one", Some(zero));
+  let (two, mut objects) = flat_commit(1, "two", Some(one));
+  let filler = (
+    Kind::Blob,
+    crate::vcs_store::tests::incompressible(window * FILLER_WINDOWS),
+  );
+  match apart {
+    Apart::Zero => {
+      objects.extend(middle);
+      objects.push(filler);
+    }
+    Apart::One => {
+      objects.push(filler);
+      objects.extend(middle);
+    }
+  }
+  objects.extend(under);
+  let pack = pack_of_objects(&objects);
+  let create = request(
+    &[("", &two.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack,
+  );
+  (create, pack, (zero, one))
+}
+
+/// B3 of the landed let-go's lift (main's order of 2026-11-26; w-git's read sweep: the admission's reads,
+/// `admitting.rs` through `Repository::bytes_of`, refused on a let-go window, and the server's `admission_turn` took
+/// the refusal as ready, so the append's own admission answered it). Do: create `main` at `C1` and `side` at `S`, both
+/// over `C0`, `S`'s commit in a window of its own past a filler blob ([`branched_create`]); let every window go in the
+/// next push's task ([`pushed_over_a_let_go`]); then move `main` to a merge of `C1` and `S`, its pack the merge and its
+/// tree. The admission's walk of what the move brings reads `S`, which `main` has not reached, through its let-go
+/// window; the command's preparation never reads it (it builds the merge's tree, whose files are `C1`'s and `S`'s
+/// blobs). Expect: `ok`, the push's own driver bringing the window back. Red before: `ng refs/heads/main`, the append's
+/// admission refusing what the admission's turn had answered ready.
+#[test]
+fn b3_a_merge_whose_admission_walks_a_let_go_parent_brings_it_back_and_lands() {
+  let (moved, driven, refused) = pushed_over_a_let_go("let-go-admission-walk", |window| {
+    let (create, pack, (one, side), files) = branched_create(window);
+    let (merge, objects) = merge_of((one, side), files);
+    let request = request(
+      &[(&one.to_string(), &merge.to_string(), b"refs/heads/main")],
+      CAPABILITIES,
+      &pack_of_objects(&objects),
+    );
+    ((create, pack, side), request)
+  });
+  assert_eq!(
+    reasons(&moved),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    moved.outcomes
+  );
+  assert!(driven > 0, "the push's own driver brought the window back");
+}
+
+/// A create of `main` at `C1` and `side` at `S`, each a commit of one file over `C0`, the pack laid `C1`'s objects,
+/// `S`'s tree and blob, a filler blob of [`FILLER_WINDOWS`] content store windows (each `window` bytes) of bytes that
+/// do not compress, then `S`'s commit and `C0`'s objects, so `S`'s commit lies in no window its files do: the request,
+/// its pack, `C1`'s and `S`'s ids, and the ids of `C1`'s and `S`'s blobs.
+fn branched_create(
+  window: usize,
+) -> (Vec<u8>, Vec<u8>, (ObjectId, ObjectId), (ObjectId, ObjectId)) {
+  use slates_git::object_name::{Kind, name_of};
+  let (zero, under) = flat_commit(1, "zero", None);
+  let (one, mut objects) = flat_commit(1, "one", Some(zero));
+  let (side, mut sided) = flat_commit(1, "side", Some(zero));
+  let blob_of = |objects: &[(Kind, Vec<u8>)]| {
+    let (_, blob) = objects
+      .iter()
+      .find(|(kind, _)| *kind == Kind::Blob)
+      .unwrap();
+    name_of(ObjectFormat::Sha1, Kind::Blob, blob).unwrap()
+  };
+  let files = (blob_of(&objects), blob_of(&sided));
+  let side_commit = sided.remove(0);
+  objects.extend(sided);
+  objects.push((
+    Kind::Blob,
+    crate::vcs_store::tests::incompressible(window * FILLER_WINDOWS),
+  ));
+  objects.push(side_commit);
+  objects.extend(under);
+  let pack = pack_of_objects(&objects);
+  let create = request(
+    &[
+      ("", &one.to_string(), b"refs/heads/main"),
+      ("", &side.to_string(), b"refs/heads/side"),
+    ],
+    CAPABILITIES,
+    &pack,
+  );
+  (create, pack, (one, side), files)
+}
+
+/// A merge of `C1` and `S` (`parents`) whose tree holds `C1`'s file as `f00000` and `S`'s as `g` (`files`, their blobs'
+/// ids): its id and its objects (the merge, its tree), the blobs the repository holds.
+fn merge_of(
+  (one, side): (ObjectId, ObjectId),
+  (first, second): (ObjectId, ObjectId),
+) -> (ObjectId, Vec<(slates_git::object_name::Kind, Vec<u8>)>) {
+  use slates_git::object_name::{Kind, name_of};
+  let mut tree = b"100644 f00000\0".to_vec();
+  tree.extend_from_slice(first.as_bytes());
+  tree.extend_from_slice(b"100644 g\0");
+  tree.extend_from_slice(second.as_bytes());
+  let tree_id = name_of(ObjectFormat::Sha1, Kind::Tree, &tree).unwrap();
+  let commit = format!(
+    "tree {tree_id}\nparent {one}\nparent {side}\nauthor A <a@example.com> 1700000002 +0000\n\
+     committer A <a@example.com> 1700000002 +0000\n\nmerge side\n"
+  )
+  .into_bytes();
+  let merge = name_of(ObjectFormat::Sha1, Kind::Commit, &commit).unwrap();
+  (merge, vec![(Kind::Commit, commit), (Kind::Tree, tree)])
 }
 
 /// On a repository `name` of `daemon`: `main` created, `ok`, at a commit of a flat tree of [`THIN_TREE_FILES`] files,

@@ -591,9 +591,23 @@
 >   let go by its number; both `failed to update ref` before, and after, the push's own driver bringing it back; main's
 >   run 10 of 16 had the delete pass with nothing brought back when the let-go was made before the push's task). No unit
 >   red below the server: the miss is `ShardGreens`', and `prepare` is driven only by the server's judge.
-> - OPEN: B3 (the admission's peel and references), B4 (the policy's reads), B5 (`PushedObjects::bytes` of a pushed
->   object, `Malformed`), B6 (a verdict's one-call build), B7 (`push_of`'s peel at judge time, after `prepare`'s), B8
->   (the encoding's tree walk: time, not correctness).
+> - **B3 BUILT (w-git, 2026-11-26): the admission's reads.** The admission (`admitting.rs`) reads bytes through
+>   `Repository::bytes_of` for a tag's peel and for the trees its walk of an update meets unreached (a commit's parents,
+>   generation and references come from its index row), and the server's `SealedPush::admission_turn` answered ready
+>   over its refusal, so the append's own admission answered it: a lost error (CLAUDE.md §2 item 9, main's ruling). Its
+>   harm is narrow: in the same `ServerJudge::ready` the command's preparation re-reads the same tag or trees, waits on
+>   their let-go window and its driver brings it back, so on any one push's path it heals; it bites where another party
+>   lets the window go between a finished preparation and an unfinished admission. Now the turn's reads are quiet
+>   (`Repository::reading_quietly`: `wait_for` keeps a read's let-go for its reader, never the repository's shared slot;
+>   `bytes_of`'s pushed arm names `Push::bytes`'s let-go), and `admission_turn` notes the let-go in the push's own slot
+>   and answers not ready, by the one rule keyed by its number (`SealedPush::admission_seen`). Red at the site:
+>   `git_push::tests::b3_an_admission_turn_over_a_let_go_tag_answers_not_ready_and_notes_the_push_alone` (ready before).
+>   The healed path's net: `b3_a_create_at_a_commit_a_green_holds_lands_over_let_go_windows`,
+>   `b3_a_create_whose_base_search_runs_over_a_let_go_commit_lands`,
+>   `b3_a_merge_whose_admission_walks_a_let_go_parent_brings_it_back_and_lands`.
+> - OPEN: B4 (the policy's reads), B5 (`PushedObjects::bytes` of a pushed object, `Malformed`), B6 (a verdict's one-call
+>   build), B7 (`push_of`'s peel at judge time, after `prepare`'s), B8 (the encoding's tree walk: time, not
+>   correctness).
 > **P OPEN (w-git; main's r229, 2026-11-23): git/git's HTTP mirror clone takes about 100 s** (97.9 and 107.7 s, 556 MB
 > against stock git's 612 MB; the work clone 92.9 and 97.2 s), the daemon CPU-bound at 97% of one core: blake3,
 > `Index::get`, `ContentStore::get` / `len_of` / `window_at_in`, `Positions::settle`. No stall; to be profiled.
