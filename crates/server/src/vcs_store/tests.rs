@@ -1475,6 +1475,25 @@ pub(crate) fn on_state<T>(f: impl FnOnce(&mut ShardState) -> T) -> T {
   crate::state::with_state(f).expect("the shard's state")
 }
 
+/// `sealed`'s names and pack homed and landed (`vcs_store::commits::home_and_land`), asserted where it brings an object:
+/// one that brings none has nothing to home, which `home_and_land` answers none for as it does a landing that fell
+/// short, so the helpers asked it apart.
+async fn landed_unless_empty(sealed: &mut super::SealedPush) {
+  let brings = on_state(|state| {
+    let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+    sealed
+      .names_now(lent.stores)
+      .is_ok_and(|(_, count)| count > 0)
+  });
+  let landed = crate::vcs_store::commits::home_and_land(sealed)
+    .await
+    .is_some();
+  assert!(
+    landed || !brings,
+    "the push's names and pack homed and landed"
+  );
+}
+
 /// `changes` appended with `sealed`'s objects and `moves` through A-635's append, from a task of the shard: its names
 /// and pack homed and landed by awaiting (`vcs_store::commits::home_and_land`), never holding the shard through the
 /// store's commit (main 01a20182's order of 2026-11-26, the shard-blocking allow-list).
@@ -1483,7 +1502,10 @@ pub(crate) async fn appended_awaited(
   changes: Vec<BranchChange>,
   (sealed, moves): (&mut super::SealedPush, &[StoreMove]),
 ) -> Result<Appended, crate::repository::push::AppendRefused> {
-  let _ = crate::vcs_store::commits::home_and_land(sealed).await;
+  // The landing's own answer, never dropped: a push whose names or pack fell short of landing is that test's failure,
+  // named here, not a commit refused later for want of its changeset (main 01a20182's note of 2026-11-27 07:29). One
+  // that brings no object has nothing to home (`home_and_land` answers none for it too).
+  landed_unless_empty(sealed).await;
   on_state(|state| {
     let appended = crate::repository::push::push_sealed(
       state,
@@ -1543,7 +1565,7 @@ pub(crate) async fn push_unsettled_awaited(
   });
   let changes = vec![BranchChange::Update { green, work: built }];
   let moves = [(Target::Green(green), Some(head))];
-  let _ = crate::vcs_store::commits::home_and_land(&mut sealed).await;
+  landed_unless_empty(&mut sealed).await;
   on_state(|state| {
     crate::repository::push::push_sealed(
       state,

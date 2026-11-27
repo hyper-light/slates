@@ -345,6 +345,9 @@ pub struct ContentCensus {
   pub used: u64,
   /// The bytes structures beside it charged to it.
   pub charged: u64,
+  /// Windows an unlanded holder pins against a let-go now ([`ContentStore::pin_unlanded`]): what a git push holds until
+  /// its changeset lands, and Mercurial's kept revisions; none once every pinning holder landed or ended.
+  pub pinned_unlanded: u64,
 }
 
 /// What the store has done, for the tests' non-vacuity checks and the owner's accounting.
@@ -434,6 +437,12 @@ impl Writing {
   /// The windows kept so far.
   pub fn windows_kept(&self) -> usize {
     self.windows.len()
+  }
+
+  /// The identities of the windows kept so far, in order: what a writer whose object no store holds yet pins against a
+  /// let-go as each is kept ([`ContentStore::pin_unlanded`]; a git push's pack, B10 of the landed let-go's lift).
+  pub fn kept_windows(&self) -> &[ContentId] {
+    &self.windows
   }
 
   /// The bytes of the window being filled: at most a window, what the writer itself holds.
@@ -2641,6 +2650,9 @@ impl ContentStore {
       ..ContentCensus::default()
     };
     for held in self.entries.values() {
+      if held.unlanded > 0 {
+        census.pinned_unlanded = census.pinned_unlanded.saturating_add(1);
+      }
       let len = u64::try_from(held.len()).unwrap_or(u64::MAX);
       let (count, bytes) = match (&held.kept, held.form) {
         (Kept::Away { .. }, _) => (&mut census.away, &mut census.away_bytes),

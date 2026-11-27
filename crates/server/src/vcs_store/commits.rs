@@ -1032,7 +1032,7 @@ fn next_ask(
         1,
       );
       ok.then(|| {
-        sealed.landed_as(sequence);
+        sealed.landed_as(state, sequence);
         None
       })
     }

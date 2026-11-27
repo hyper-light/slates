@@ -4734,6 +4734,16 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
   // an object the region holds is pinned until then (`vcs_store::landed_pin`).
   let ids = windows.clone();
   let pack_identity = slates_vcs::ContentId::of(&pack);
+  // What pins windows against a let-go once the push has answered (`ContentStore::pin_unlanded`; B10's own pins are
+  // released at its landing): named in the peak's failure, with the let-gos a pin refused by the clone's end, so a
+  // clone holding more than a turn's windows tells a pin from any other holder (main 01a20182's order of 2026-11-27
+  // 12:35).
+  let pinned_after_push = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map_or(0, |content| content.census().pinned_unlanded)
+  });
   let (let_go, refused) = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
     crate::vcs_store::homes::landed_pack_here(state, pack_identity);
     crate::vcs_store::within_budget(state, 0, |stores| {
@@ -4766,7 +4776,21 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
     counted("vcs_store.git_resident.peak_windows"),
     counted("vcs_store.git_resident.let_go_behind"),
   );
+  let pins = (
+    pinned_after_push,
+    crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+      state
+        .vcs_stores
+        .content()
+        .map_or(0, |content| content.counters().kept_unlanded)
+    }),
+  );
   daemon.stop();
+  eprintln!(
+    "clone of a let-go pack: (stops, peak, let go behind) {observed:?} of {} windows; pinned after the push, \
+     let-gos a pin refused: {pins:?}",
+    windows.len()
+  );
   assert!(
     let_go >= 1,
     "{let_go} of {} windows let go: {refused:?}",
@@ -4784,7 +4808,8 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
   let (_, peak, _) = observed;
   assert!(
     peak <= 3,
-    "at most a turn's windows held: {observed:?} of {}",
+    "at most a turn's windows held: {observed:?} of {}; windows pinned after the push and let-gos a pin refused: \
+     {pins:?}",
     windows.len()
   );
 }
