@@ -705,3 +705,10 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
 - Red 1 (signed_work waits for the checkpoint within the reply deadline) landed 0408a5b26. The spawner cost role (holds
   until refused; the parent prints the role's stderr and status) landed 2386b45f1. OPEN: red 4 (arm64 hg_import overlap),
   on diag 6, 7 and 8's arm64 lanes.
+- 2026-11-27 08:09 PST: the Windows fleet red was not Windows-specific; it reproduces on the Mac. First bad 02bd0ec94 (main's
+  A/B). A-932 landed 3665e42d9 (merge f8f8a33f0): a merge record names its green's lineage (format 5), so a holder makes
+  a green standing alone at once. The sibling, a lone green adopted later as a root, is OPEN in GAPS (2d3a8cfe2) and is
+  my next piece after red 2. OWED (main): the whole tests/fleet.rs on the Mac and the Windows lanes.
+- 2026-11-27 08:09 PST: red 2 (store_tests clean restart, image (1, 2) against (0, 3)) is back on diag 9's TSan lane: the
+  publish_shard in image_split did not publish the last let-go. Investigating now. Red 4's DIAG-LANDING
+  instrumentation is still unpushed on w-interop/windows-fleet-diag.
