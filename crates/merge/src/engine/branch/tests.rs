@@ -47,7 +47,10 @@ fn copy_at(green: &Green, version: u64) -> Origin {
 /// Retires `handle` and gives every hold back, a node a step, as a shard's slices do.
 fn retire_whole(lineage: &mut Lineage, handle: LineageGreen) {
   let mut release = lineage.retire(handle).unwrap();
-  while lineage.release_step(&mut release).unwrap() {}
+  while lineage
+    .release_step(&mut release, &mut crate::reaped::Reaped::default())
+    .unwrap()
+  {}
   assert!(release.is_done());
 }
 
@@ -1092,11 +1095,14 @@ fn a_member_taken_out_holds_the_arenas_and_every_other_lend_waits_for_it() {
   let mut release = lineage.retire(other).unwrap();
   let out = lineage.take(root).unwrap();
   assert_eq!(
-    lineage.release_step(&mut release),
+    lineage.release_step(&mut release, &mut crate::reaped::Reaped::default()),
     Err(LineageRefused::Busy)
   );
   lineage.put_back(root, out).unwrap();
-  while lineage.release_step(&mut release).unwrap() {}
+  while lineage
+    .release_step(&mut release, &mut crate::reaped::Reaped::default())
+    .unwrap()
+  {}
   assert_eq!(read_member(&mut lineage, root, "a"), Some(b"0123".to_vec()));
   assert_eq!(lineage.len(), 1);
 }
@@ -1121,7 +1127,9 @@ fn retire_a_node_a_step(lineage: &mut Lineage, branch: LineageGreen) {
   let mut steps = 0u64;
   loop {
     let before = lineage.live_nodes();
-    let more = lineage.release_step(&mut release).unwrap();
+    let more = lineage
+      .release_step(&mut release, &mut crate::reaped::Reaped::default())
+      .unwrap();
     assert!(
       before - lineage.live_nodes() <= 1,
       "a step freed more than one node"
@@ -1198,38 +1206,30 @@ fn a_branch_with_a_tenth_changed() -> (Lineage, LineageGreen, usize) {
   (lineage, branch, held_alone)
 }
 
-/// The steps `release` takes to its end over `lineage`.
-fn release_steps(lineage: &mut Lineage, release: &mut super::Release) -> u64 {
-  let mut steps = 0u64;
-  while lineage.release_step(release).unwrap() {
-    steps += 1;
-  }
-  steps
-}
-
-/// A-920 11b. Do: in two lineages alike, a green of a thousand files and a branch with a hundred changed, retire the
-/// branch; in one drop what else it held at once, as its retire did before (`Release::remains` let go whole), and in
-/// the other step its release to its end. Expect: the stepped release takes at least one step more a changed file (the
-/// branch's own histories let go an entry a step, never whole in its retire's step), and both lineages hold exactly the
-/// nodes the root held alone.
+/// A-920 (the reaper, main's ruling after release probe 17). Do: in a lineage of a thousand files, retire a branch with
+/// a hundred changed and step its release to its end, keeping what every step took in one `Reaped`. Expect: the release
+/// ends with the lineage holding exactly the nodes the root held alone, and what the steps took counts more than the
+/// nodes they freed (each freed node's label or child list, its value's bytes, the branch's remains whole), so what the
+/// release frees is handed to its caller, not dropped in its steps. Before, the steps dropped all of it themselves, and
+/// one free among them paid the allocator's return of a batch of pages (1.3-1.7 ms of system time, debug).
 #[test]
-fn a_retired_branchs_own_histories_are_let_go_an_entry_a_step() {
-  let (mut whole, branch, held_alone) = a_branch_with_a_tenth_changed();
-  let mut dropped = whole.retire(branch).unwrap();
-  dropped.remains = None;
-  let at_once = release_steps(&mut whole, &mut dropped);
-  let (mut stepped, branch, _) = a_branch_with_a_tenth_changed();
-  let mut release = stepped.retire(branch).unwrap();
-  let in_steps = release_steps(&mut stepped, &mut release);
-  assert!(
-    in_steps >= at_once + 100,
-    "{in_steps} steps against {at_once} with its histories dropped whole"
-  );
-  assert!(release.is_done(), "the stepped release ended");
+fn a_retired_branchs_release_hands_what_it_frees_to_its_reaped() {
+  let (mut lineage, branch, held_alone) = a_branch_with_a_tenth_changed();
+  let before = lineage.live_nodes();
+  let mut release = lineage.retire(branch).unwrap();
+  let mut reaped = crate::reaped::Reaped::default();
+  while lineage.release_step(&mut release, &mut reaped).unwrap() {}
+  let freed = before.saturating_sub(lineage.live_nodes());
+  assert!(release.is_done(), "the release ended");
   assert_eq!(
-    (whole.live_nodes(), stepped.live_nodes()),
-    (held_alone, held_alone),
-    "each release freed what the branch alone held"
+    (lineage.live_nodes(), freed > 0),
+    (held_alone, true),
+    "the release freed what the branch alone held"
+  );
+  assert!(
+    reaped.taken() > u64::try_from(freed).unwrap(),
+    "{} things taken for {freed} nodes freed",
+    reaped.taken()
   );
 }
 

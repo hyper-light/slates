@@ -1262,6 +1262,8 @@ struct WideCounts {
   published_ahead: u64,
   /// The most bytes a register op's identity hashed (`push::SEALED_BYTES_MOST`, 13c).
   sealed_most: u64,
+  /// What the shard's releases handed the daemon's reaper and dropped in place (`reaper::counts`, the reaper).
+  reaped: crate::reaper::ReapCounts,
 }
 
 /// The calling shard's [`WideCounts`] now.
@@ -1285,6 +1287,7 @@ fn wide_counts() -> WideCounts {
     hand_over_steps: on(|state| count(state, crate::repository::svn_commit::HAND_OVER_STEPS)),
     published_ahead: on(|state| count(state, staging::LANDING_PUBLISHED_AHEAD)),
     sealed_most: on(|state| count(state, crate::repository::push::SEALED_BYTES_MOST)),
+    reaped: crate::reaper::counts(),
   }
 }
 
@@ -1293,6 +1296,20 @@ fn wide_counts_sliced(counts: &WideCounts) {
   wide_landing_sliced(counts);
   wide_landing_stepped(counts);
   wide_import_sliced(counts);
+  wide_release_reaped(counts);
+}
+
+/// The landing's release of its scratch member frees nothing on the shard (A-920, the reaper): what its units took, more
+/// things than the revision's files, went to the daemon's reaper, and none was dropped in place. Red before: nothing handed, the release's units dropping all
+/// of it themselves, one free among them paying the allocator's return of a batch of pages (release probe 17: copy's
+/// longest unit p50 1,226-1,302 µs, all of it system time).
+fn wide_release_reaped(counts: &WideCounts) {
+  let reaped = counts.reaped;
+  assert!(
+    reaped.handed > u64::try_from(WIDE_REVISION_FILES).unwrap() && reaped.batches > 0,
+    "the releases handed the reaper {reaped:?}"
+  );
+  assert_eq!(reaped.inline, 0, "dropped in place: {reaped:?}");
 }
 
 /// The landing's own parts in steps (A-920 6a, 6b and its checkpoint piece).
@@ -1516,6 +1533,25 @@ pub(crate) fn print_phases(name: &str) {
   eprintln!(
     "RELEASE {name} unit_wall_ns={} unit_cpu_ns={} unit_user_ns={} unit_sys_ns={} units={}",
     unit.wall, unit.cpu, unit.user_system.0, unit.user_system.1, unit.units
+  );
+  print_reaper(name);
+}
+
+/// Prints what the calling shard handed its daemon's reaper and what the reaper spent dropping it, apart from the
+/// shard's own time: `REAPER <name> handed=<n> batches=<n> inline=<n> reaper_cpu_ns=<n> reaper_user_ns=<n>
+/// reaper_sys_ns=<n> reaper_taken=<n>` (A-920, the reaper).
+fn print_reaper(name: &str) {
+  let shard = crate::reaper::counts();
+  let reaper = crate::reaper::spent(slates_rt::registry::current_shard().unwrap_or(0));
+  eprintln!(
+    "REAPER {name} handed={} batches={} inline={} reaper_cpu_ns={} reaper_user_ns={} reaper_sys_ns={} reaper_taken={}",
+    shard.handed,
+    shard.batches,
+    shard.inline,
+    reaper.cpu_ns,
+    reaper.user_ns,
+    reaper.system_ns,
+    reaper.taken
   );
 }
 
