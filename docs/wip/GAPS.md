@@ -748,26 +748,26 @@
 > answers a clone's object enumeration from reachability bitmaps, without walking trees, where a pack has them: git's
 > documentation, the bitmap format (`gitformat-bitmap`, https://git-scm.com/docs/bitmap-format) and `pack.useBitmaps`
 > in `git config` (https://git-scm.com/docs/git-config).
-> **PRECONDITION OF THE NEXT LIFT (w-git, 2026-11-25, main 01a20182's ruling): a holder's replica build reads a let-go
-> window as missing.** Found writing the red for main's ruling of 2026-11-24 (a write path's bring-back lets go at its
-> owner's end, a64f385b1). Scene (a three-node `f = 1` fleet, git repository on a): push `main`; push two new branches,
-> `first` and `second` (each holder's replica of each owing its push, P2); push a commit on top of `first` (each holder
-> builds its replica of `first`, making its store of the repository); let go every window b and c hold, each home told
-> first; push a commit on top of `second`. Both holders' replica builds refused `a holder's replica's owed push was
-> refused building: Object { path: "", id: …, why: Missing }`, and the push was refused `unable to commit`: the
-> holder's read answers Missing, never noting the window waited (`replica_build::turn`'s `Turned::Waiting` is never
-> reached), so nothing is brought back. Unreachable while `LANDED_LET_GO` is false: the only roots of a git window's
-> let-go are a commit's (`vcs_store::commit`) and a rebuild's or recovery's (`put_changeset`), both under it; the home's
-> let-go (`homes::landed_pack_here`) is reached only from their sliced let-go; every other let-go takes only windows a
-> read brought back (`vcs_share::read_backs`, the fetch's look-ahead, `read_through::BroughtBack`). So **the lift must
-> first make a holder's replica-store read note a let-go window as waiting and bring it back through its node store**,
-> red first with the scene above: `patches/w-git-replica-red.patch` on `agents/fanout-state` (the fleet test
-> `a_holders_replica_build_lets_go_the_windows_it_brought_back_once_it_is_made` and its `Daemon::let_go_vcs_windows` and
-> `vcs_windows_held` hooks), which then also proves the replica build's let-go of what it brought back. Every git
-> bring-back is dormant until the lift; the derivation's and green build's reds of that let-go
-> (`a_derivation_lets_go_the_windows_it_brought_back_once_it_ends`,
-> `a_green_build_lets_go_the_windows_it_brought_back_once_it_is_made`) let windows go by hand, standing in for the gated
-> roots, which the lift makes real paths.
+> **(d) CLOSED AS UNREACHABLE ON HOLDERS (w-git, 2026-11-27, main 01a20182's ruling of 06:00): a holder's replica
+> build over a let-go pack.** Found 2026-11-25 writing the red for main's ruling of 2026-11-24 (a write path's
+> bring-back lets go at its owner's end, a64f385b1): on a three-node `f = 1` fleet, a holder whose windows were let go
+> refused its replica's owed push. The parked red (`patches/w-git-replica-red.patch` on `agents/fanout-state`) let go
+> every identity a holder's content store held, the index's rows and names too, which no let-go does; narrowed to what
+> a landed let-go lets go (a pack's windows, its home told first), its holders' replica stores were made again from
+> their records about 8,000 times in one test, each refused `Pack(Truncated { at: 0 })` at the replay's piece read
+> (`git_replay`, no pieces). The control, the same scene with nothing let go, lands every push. Tagged runs named why:
+> `changeset_wanted` asks for the pack (not held whole), and `read_changeset` on a holder answered `Unlanded` 4,023 of
+> 4,023 times, since **a holder's node store holds no changeset row for the owner's pushes**. So nothing lets a
+> holder's pack go, the lift or not: a commit's let-go is the owner's; `put_changeset`'s follows a read of this node's
+> store, which a holder cannot make; and `homes::landed_pack_here` is reached only from `let_go_landed_pack_among`,
+> which the landing node's commit runs among its own shards, never a holder node's. The hook made a state production
+> never does, so its red would have certified the wrong rule; it and its hooks did not land. **Consequence: if a
+> holder's copy is ever let go, its bring-back must come from the region (`homes::read_in_region`), never its own
+> store.** OWED with the flip: the rule checked, not read: the control scene with the let-go on and no hooks, each
+> holder's landed let-go staying 0 while the owner's moves, so a change that lets a holder's pack go fails it and
+> reopens (d) with a real red. Two defects the runs found stand without any let-go and are their own landing: the
+> swallowed `Unlanded` of `changeset_read_for_rebuild` (CLAUDE.md §2 item 9), and the replica store begun again with
+> no bound after its replay was refused (`replica_build::wanted` → `replica::begin`; §2 item 8).
 > The lift must also keep `landed_let_go_may`'s wait on live intakes (`intakes_live(id) <= own`, `vcs_store.rs`): it is
 > what keeps a landed pack's windows while a later push of the repository, or the same push's later refs, still reads
 > them (main 01a20182's sibling sweep of 2026-11-25). A lift that drops it opens Mercurial's bug in git: a window let go
