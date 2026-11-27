@@ -1170,6 +1170,14 @@ pub struct ShardState {
   /// other stream and the probe plane answer as usual: a holder alive and in contact whose report misses an asker's
   /// budget, as one retransmission on a lossy path made it (`Daemon::inject_live_state_withhold`).
   pub live_state_withhold_replies: bool,
+  /// Test support (A-921 part 5): the streams of a peer member loop's announcements, its plane epoch
+  /// (`member_task::PLANE_EPOCH_STREAM`) or its edges (`edges::EDGES_STREAM`), this node answers none of after its
+  /// request arrived, while every other stream and the probe plane answer as usual: a peer that took a restarted node's
+  /// session and died before answering (`Daemon::inject_member_exchange_withhold`). Empty but in a test.
+  pub member_exchange_withheld: std::collections::BTreeSet<u64>,
+  /// Test support (A-921 part 5 follow-up): while set, the member loop's announcement tasks are refused as a full arena
+  /// refuses them (`member_task::spawn_exchange`, `Daemon::inject_member_spawn_refusal`). False but in a test.
+  pub member_spawns_refused: bool,
   /// The measured **path** to each peer (§4.8 "Derived constants": "election timeout ≥ 10 × broadcast RTT
   /// p99"; `slates_cluster::timing::PathRtt`): the transport's RFC 9002 estimator over every round trip
   /// this node timed to that peer — its SWIM probe's acknowledgement each period, and every consensus

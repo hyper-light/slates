@@ -47,6 +47,9 @@ const HELD_TAG: &str = "LONE-DAEMON-HELD";
 const END_WORDS: &str = "so the watchdog ends the daemon's process";
 const VERDICT_LATE_WORDS: &str = "the verdict came ";
 const LATE_WORDS: &str = "the watchdog's looks ran at most ";
+/// Format: the words of the end line right before the instant the watchdog judged the shard stuck, on the host's
+/// monotonic clock.
+const JUDGED_AT_WORDS: &str = "judged at monotonic ";
 /// Format: the held line's word for the hold's time on the host's monotonic clock.
 const AT_WORD: &str = "at_ns=";
 /// Shape: the probe budget of the quick profile (milliseconds).
@@ -595,6 +598,40 @@ fn said_so_far(stderr: &Receiver<(u64, String)>) -> String {
   said.get(from..).unwrap_or_default().join("\n")
 }
 
+/// The rule's two halves for a stuck shard (A-232 step 5): the watchdog judged it within `rule` (`W + B + L`) of the
+/// wedge at `t0_ns`, by the verdict's own instant, which the end line names (`judged at monotonic N ns`); and the line
+/// was read within a beat of that verdict, the beat the watchdog writes its end line within (`end_process`), what is left
+/// being the line's way through the pipe to this test's reader. Until 2026-11-27 the read instant was held to the rule
+/// alone, and the TSan lane read a wedged-log-held verdict 0.63 ms past it (diag CI 7, run 46004209050): the rule names
+/// the verdict, not the line's delivery.
+fn assert_the_verdict_and_its_line(
+  name: &str,
+  line: &str,
+  (t0_ns, line_read_ns): (u64, u64),
+  rule: Duration,
+) {
+  let judged_at_ns: u64 = line
+    .split(JUDGED_AT_WORDS)
+    .nth(1)
+    .and_then(|rest| rest.split(' ').next())
+    .and_then(|number| number.parse().ok())
+    .unwrap_or_else(|| panic!("{name}: the end line names when the shard was judged: {line}"));
+  let judged_after = Duration::from_nanos(judged_at_ns.saturating_sub(t0_ns));
+  let read_after_verdict = Duration::from_nanos(line_read_ns.saturating_sub(judged_at_ns));
+  println!(
+    "A232-UNSUPERVISED {name}: judged {judged_after:?} after t0 against W + B + L = {rule:?}; the end line read \
+     {read_after_verdict:?} after the verdict, against a beat {BEAT:?}"
+  );
+  assert!(
+    judged_after <= rule,
+    "{name}: the watchdog judged the shard {judged_after:?} after the wedge, past the rule's W + B + L = {rule:?}"
+  );
+  assert!(
+    read_after_verdict <= BEAT,
+    "{name}: the end line was read {read_after_verdict:?} after its verdict, past the beat it is written within"
+  );
+}
+
 /// What the watchdog's end line names, from everything the child said on standard error: the verdict's lateness, the
 /// looks' lateness, when the parent read the line (the host's monotonic clock), and the line.
 fn end_line(stderr: &Receiver<(u64, String)>) -> Option<(Duration, Duration, u64, String)> {
@@ -786,10 +823,9 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
     "{name}: the watchdog's exit code"
   );
   match hold {
-    Hold::Wedged | Hold::WedgedLogHeld | Hold::WedgedNoThreads => assert!(
-      line_after <= rule,
-      "{name}: the watchdog's verdict was read {line_after:?} after the wedge, past the rule's W + B + L = {rule:?}"
-    ),
+    Hold::Wedged | Hold::WedgedLogHeld | Hold::WedgedNoThreads => {
+      assert_the_verdict_and_its_line(name, &line, (t0_ns, line_read_ns), rule);
+    }
     Hold::Starved | Hold::LogStalled => {
       panic!(
         "{name}: a starved daemon, or one whose log stalls, is not a stuck one; this case is not run here"

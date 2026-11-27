@@ -1045,18 +1045,24 @@ impl Recording {
   }
 }
 
+/// The texts a kept revision's walks let go and those they hold, each path once, its last row's
+/// ([`walked_a_unit_a_step`]).
+#[cfg(test)]
+pub(crate) type WalkedTexts = (
+  std::collections::BTreeMap<String, ContentIdentity>,
+  std::collections::BTreeMap<String, ContentIdentity>,
+);
+
 /// A kept revision's walks of `changes` taken a unit a step, as [`Staging::record_some`] takes them with every step
 /// spent: the texts they let go over `records` at `youngest`, then those they hold at `revision`, each path once, its
-/// last row's. For a test that holds them to the whole walks (`svn_texts::released_before`, `held_after`; A-920 9a).
+/// last row's; and the units the walks took. For a test that holds them to the whole walks (`svn_texts::released_before`,
+/// `held_after`; A-920 9a).
 #[cfg(test)]
 pub(crate) fn walked_a_unit_a_step(
   records: &slates_svn::migration::Repository,
   changes: &[slates_svn::index::ChangedPath],
   (youngest, revision): (u64, u64),
-) -> (
-  std::collections::BTreeMap<String, ContentIdentity>,
-  std::collections::BTreeMap<String, ContentIdentity>,
-) {
+) -> (WalkedTexts, u64) {
   let mut recording = Recording {
     checked: None,
     applying: None,
@@ -1078,7 +1084,7 @@ pub(crate) fn walked_a_unit_a_step(
   while let RecordPhase::After(at, revision) = recording.phase {
     recording.walk((records, revision, at), &mut spent);
   }
-  (recording.before, recording.after)
+  ((recording.before, recording.after), recording.walked)
 }
 
 /// Where a revision's staging stands between its steps ([`Staging::staged_in`]).
@@ -1398,6 +1404,11 @@ impl Staging {
     // the yield, and the landing turn keeps every other commit out.
     slates_rt::futures::yield_now().await;
     let staged = self.stage_in(repository, (revision, plans)).await;
+    // The greens' pending holds, the revision's every named text's among them, applied a slice a step before the free
+    // decision that releases what was brought, which applies them whole otherwise (A-920: a wide revision's 9,000 in
+    // one step, 4.72 ms debug, with no text brought to release).
+    until_done(|state| crate::vcs_store::name_holds::apply_some(state, slice_deadline_ns()))
+      .await?;
     let released = crate::state::with_state(|state| {
       super::release_texts(state, None, &brought_texts);
       super::release_texts(state, None, &restoring);

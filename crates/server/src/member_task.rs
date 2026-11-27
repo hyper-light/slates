@@ -37,9 +37,9 @@ use rustls::pki_types::CertificateDer;
 use slates_cluster::member_plane::{Fleet, MemberPlane, PlaneEvent};
 use slates_cluster::membership::MemberState;
 use slates_db::register::HostId;
-use slates_rt::error::ReceiveRefusal;
+use slates_rt::error::{ReceiveRefusal, RtError};
 use slates_rt::futures;
-use slates_rt::shard::Kept;
+use slates_rt::shard::{Kept, TaskId};
 use slates_rt::udp::{SocketAddrV4, UdpSocket};
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::Endpoint;
@@ -96,6 +96,44 @@ const FOLD_REFUSED: &str = "fleet.plane.fold_refused";
 /// the pass borrowing sessions that owe nothing.
 const EPOCH_LENT: &str = "fleet.plane.announce_lends";
 const EPOCH_SENT: &str = "fleet.plane.announcements_sent";
+
+/// Counters (Format: names in the daemon's status report): a member loop's announcement task the runtime refused, by
+/// pass and by the refusal's kind ([`count_spawn_refused`]). Admission refuses with these three kinds alone
+/// (`ShardContext::admit`); any other is counted `other`.
+const EPOCH_REFUSED_TASKS: &str = "fleet.plane.announce_refused.too_many_tasks";
+const EPOCH_REFUSED_MEM: &str = "fleet.plane.announce_refused.mem";
+const EPOCH_REFUSED_OFF_SHARD: &str = "fleet.plane.announce_refused.not_on_shard_thread";
+const EPOCH_REFUSED_OTHER: &str = "fleet.plane.announce_refused.other";
+const EDGES_REFUSED_TASKS: &str = "fleet.edges.announce_refused.too_many_tasks";
+const EDGES_REFUSED_MEM: &str = "fleet.edges.announce_refused.mem";
+const EDGES_REFUSED_OFF_SHARD: &str = "fleet.edges.announce_refused.not_on_shard_thread";
+const EDGES_REFUSED_OTHER: &str = "fleet.edges.announce_refused.other";
+
+/// Which of the member loop's announcement passes a task was spawned for ([`spawn_exchange`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pass {
+  /// Its plane epochs ([`announce_epochs`]).
+  Epochs,
+  /// Its edges (`edges::announce_edges`).
+  Edges,
+}
+
+/// Counts a refused announcement task by its pass and the refusal's kind. The member stays owed, so a later turn tries
+/// again; the loop never runs the exchange itself, which would hold it for the exchange's whole budget. A refusal off a
+/// shard thread cannot happen in the member loop, so its count is a bug's, surfaced typed.
+pub(crate) fn count_spawn_refused(pass: Pass, refusal: &RtError) {
+  let counter = match (pass, refusal) {
+    (Pass::Epochs, RtError::TooManyTasks { .. }) => EPOCH_REFUSED_TASKS,
+    (Pass::Epochs, RtError::Mem(_)) => EPOCH_REFUSED_MEM,
+    (Pass::Epochs, RtError::NotOnShardThread) => EPOCH_REFUSED_OFF_SHARD,
+    (Pass::Epochs, _) => EPOCH_REFUSED_OTHER,
+    (Pass::Edges, RtError::TooManyTasks { .. }) => EDGES_REFUSED_TASKS,
+    (Pass::Edges, RtError::Mem(_)) => EDGES_REFUSED_MEM,
+    (Pass::Edges, RtError::NotOnShardThread) => EDGES_REFUSED_OFF_SHARD,
+    (Pass::Edges, _) => EDGES_REFUSED_OTHER,
+  };
+  let _ = crate::fleet::count_refusal(counter);
+}
 
 /// One side's identity in an epoch exchange.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +219,13 @@ pub(crate) struct PlaneState {
   /// Per member, the process nonce it last announced itself with to this node: another one is a new process under the
   /// same id ([`note_reconnected`]). Bounded by the fleet's peer capacity.
   pub announced_from: BTreeMap<HostId, u64>,
+  /// Per member keyed here, the process nonce of the one its installed epoch was agreed with: the announcing dialer's,
+  /// or the answering acceptor's. A member whose process restarted is keyed again only once this names the new one
+  /// (A-921 part 5). Bounded as `keyed` is, by the members keyed.
+  pub keyed_process: BTreeMap<HostId, u64>,
+  /// Members whose announcement task ([`announce_epochs`]) has ended, for the member loop to join on its next turn.
+  /// Bounded by the loop's tasks in flight, one a member.
+  pub announce_done: std::collections::BTreeSet<HostId>,
 }
 
 impl std::fmt::Debug for PlaneState {
@@ -275,6 +320,10 @@ pub(crate) fn accept_announcement(
     return refuse(state, EPOCH_REFUSED_INSTALL);
   }
   state.plane.keyed.insert(announced.member, false);
+  state
+    .plane
+    .keyed_process
+    .insert(announced.member, announced.process);
   forget_address(state, anchor);
   answer.encode().to_vec()
 }
@@ -337,6 +386,11 @@ const PEER_RECONNECTED: &str = "fleet.plane.peer_reconnected";
 /// Counter: an announcement from a member this node held dead, whose contact is kept so it can refute the death.
 const MEMBER_RETURNED: &str = "fleet.plane.member_returned";
 
+/// Counter: the member loop's turns ([`run`]), each one step of the detector and at most one announcement attempt a
+/// member a pass, so a per-turn count (a refused announcement's, `count_spawn_refused`) is bounded by its owed members
+/// times this, and one past it is a spin.
+const LOOP_TURNS: &str = "fleet.plane.loop_turns";
+
 /// Marks `anchor`'s resolved plane address stale so the next turn resolves it afresh: a new connection may come from a
 /// new address (a replaced pod keeps its name and certificate, not its IP). The address stays the manifest's or
 /// discovery's, never a datagram's source, which only path validation could vouch for. The old address is kept until
@@ -355,14 +409,23 @@ fn forget_address(state: &mut ShardState, anchor: HostId) {
 /// identity; any other announces [`IDENTITY_ONLY`].
 ///
 /// Only a session whose connection has not announced yet is owed, decided in the state's borrow from the session
-/// still in its slot, and each owed session is borrowed alone for its own exchange and returned before the next. The
-/// membership loop runs this on every turn: borrowing every session on each turn, all of them held while one
+/// still in its slot, and each owed member's sessions are borrowed alone on its own task (`announcing`, the loop's
+/// tasks in flight, by member, with its anchor) and returned at its exchange's end. The membership loop runs this on every turn: borrowing every session on each turn, all of them held while one
 /// announcement waited, kept the whole record plane lent about a hundred times a second per node and held every
 /// session for up to 3.1 s behind one unanswered announcement (diagnostic run at 10% loss, 2026-10-09).
-async fn announce_epochs() {
+async fn announce_epochs(announcing: &mut BTreeMap<HostId, (HostId, TaskId)>) {
+  // The tasks that ended since the last turn are joined, so their slots are released; each recorded its end as it
+  // returned, so the join completes at once.
+  let done =
+    state::with_state(|state| std::mem::take(&mut state.plane.announce_done)).unwrap_or_default();
+  for member in done {
+    if let Some((_, task)) = announcing.remove(&member) {
+      let _ = futures::join(task).await;
+    }
+  }
   // Decided in one borrow: `take_sessions` runs its filter inside the state's borrow, so the filter must not borrow the
   // state again.
-  let owed: Vec<(HostId, bool)> = state::with_state(|state| {
+  let owed: Vec<(HostId, HostId, bool)> = state::with_state(|state| {
     let origin = state.origin_anchor;
     let anchors: BTreeMap<HostId, HostId> = state
       .record_sessions
@@ -376,21 +439,69 @@ async fn announce_epochs() {
       .filter_map(|(member, link)| {
         let anchor = anchors.get(member)?;
         let connection = link.endpoint.as_mut()?.connection_id().ok()?;
-        (announced_on.get(member) != Some(&connection)).then_some((*member, *anchor > origin))
+        (announced_on.get(member) != Some(&connection)).then_some((
+          *member,
+          *anchor,
+          *anchor > origin,
+        ))
       })
       .collect()
   })
   .unwrap_or_default();
-  for (member, canonical) in owed {
-    let mut sessions =
-      crate::fleet::take_sessions("fleet.lent_to.announce_epochs", |host| host == member);
-    let lent = u64::try_from(sessions.len()).unwrap_or(u64::MAX);
-    let _ = state::with_state_counted(|s| s.count(EPOCH_LENT, lent));
-    for (_, endpoint) in &mut sessions {
-      announce_on(member, endpoint, canonical).await;
+  // Each member's announcement runs on its own, its session borrowed alone and returned once its exchange ends, so a
+  // peer that took a session and never answers (it died meanwhile) holds no other member's keying (A-921's next mode,
+  // main 01a20182's ruling of 2026-11-27; A-921 part 5). In turn, the pass awaited each exchange before the next: a restarted node's
+  // announcement to a peer that died just then held every later one for its whole exchange budget (4.4 to 7.6 s, past
+  // the node's own detection of 1 s), its peers probed it under its old process's keys, and condemned it beside the dead
+  // one. Nor does the loop wait on them: it steps the detector and answers probes meanwhile, and joins each task once
+  // it ended. Each is the loop's child, so the loop's end cancels and joins any still running. Bounded by the owed
+  // sessions, one a member (a member in flight has its session lent, so it is owed nothing more), and one an anchor: a
+  // canonical announcement reads the anchor's last epoch and records the next once answered, so two at once (its seed
+  // id's session and its learned id's) would both name the same one. A task the runtime refuses leaves the member owed
+  // for a later turn, counted by its kind ([`count_spawn_refused`]).
+  for (member, anchor, canonical) in owed {
+    if announcing
+      .iter()
+      .any(|(held, (held_anchor, _))| *held == member || *held_anchor == anchor)
+    {
+      continue;
     }
-    crate::fleet::return_sessions(sessions);
+    match spawn_exchange(announce_member(member, canonical)) {
+      Ok(task) => {
+        announcing.insert(member, (anchor, task));
+      }
+      // Left owed, so a later turn tries again; never awaited here (main 01a20182's ruling of 2026-11-27 05:11).
+      Err(refusal) => count_spawn_refused(Pass::Epochs, &refusal),
+    }
   }
+}
+
+/// Spawns one of the member loop's announcement exchanges ([`announce_epochs`], `edges::announce_edges`) as a child of
+/// the loop, labelled with its caller's line. Refused as the runtime refuses it, or while a test refuses them
+/// (`ShardState::member_spawns_refused`), as a full arena does.
+#[track_caller]
+pub(crate) fn spawn_exchange<F: core::future::Future<Output = ()> + 'static>(
+  exchange: F,
+) -> Result<TaskId, RtError> {
+  if state::with_state(|state| state.member_spawns_refused).unwrap_or(false) {
+    // Format: the hook names no arena, so no capacity.
+    return Err(RtError::TooManyTasks { capacity: 0 });
+  }
+  futures::spawn_child(exchange)
+}
+
+/// The announcement owed `member` on its sessions, each borrowed for its own exchange and returned at its end
+/// ([`announce_epochs`]).
+async fn announce_member(member: HostId, canonical: bool) {
+  let mut sessions =
+    crate::fleet::take_sessions("fleet.lent_to.announce_epochs", |host| host == member);
+  let lent = u64::try_from(sessions.len()).unwrap_or(u64::MAX);
+  let _ = state::with_state_counted(|s| s.count(EPOCH_LENT, lent));
+  for (_, endpoint) in &mut sessions {
+    announce_on(member, endpoint, canonical).await;
+  }
+  crate::fleet::return_sessions(sessions);
+  let _ = state::with_state(|state| state.plane.announce_done.insert(member));
 }
 
 /// One announcement on one borrowed session, once per connection: the pair's next epoch on its `canonical` session,
@@ -471,6 +582,10 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
     if matches!(installed, Some(Ok(()))) {
       state.plane.announced.insert(anchor, epoch);
       state.plane.keyed.insert(answer.member, false);
+      state
+        .plane
+        .keyed_process
+        .insert(answer.member, answer.process);
       forget_address(state, anchor);
     } else {
       crate::fleet::count_refusal_in(state, EPOCH_REFUSED);
@@ -905,10 +1020,13 @@ pub(crate) async fn run(
   }
   let (origin, shards) = state::with_state(|s| (s.shard, s.shards.clone())).unwrap_or_default();
   let mut buffer = vec![0u8; RECEIVE_BYTES];
+  let mut announcing = BTreeMap::new();
+  let mut announcing_edges = BTreeMap::new();
   loop {
-    announce_epochs().await;
+    let _ = crate::fleet::count_refusal(LOOP_TURNS);
+    announce_epochs(&mut announcing).await;
     // And this node's edges, once a session and again as they change (A-925).
-    crate::edges::announce_edges().await;
+    crate::edges::announce_edges(&mut announcing_edges).await;
     resolve_peers(resolver).await;
     join_addressable();
     let now = slates_machine::clock::monotonic_ns();

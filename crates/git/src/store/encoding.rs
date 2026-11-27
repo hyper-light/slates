@@ -9,15 +9,16 @@
 //! drives it outgrows its turn by more than a window's work; found by use: a 56 MB push of git/git cut at v2.0.0 spun
 //! the shard 3.5 s in one unit, an object's whole delta trials and level samples, and the daemon died into a restart
 //! loop). The walk of a version's root tree beside the one before it, for the bases a reference delta may name: one
-//! pair of trees a unit, the pairs still to walk held. The objects' rows read into the encoding's order (by type, the
-//! largest first, then by id, which each object's row gives without its bytes): one row a unit (a window's worth of
-//! handles had been 32,768 rows, 315 ms of one unit in a debug build), the order held as two sets, one a part. One
-//! object encoded: its row and its named base's row read; a window of its bytes, then of its base's, read a unit; then
-//! its entry made by the part's encoder a window's work a unit ([`super::fragment::Encoder::step`]): a step of one
-//! candidate base's delta search (`deltas::Search`, a window's blocks indexed or a window of the target scanned; the
-//! same delta `delta_of` makes), one level sampled on the data's first window, or a window of the data deflated (the
-//! same stream one call deflates). Last, each part put into the content store a window a unit
-//! (`ContentStore::put_window`, then its lists), and both recorded.
+//! pair of trees a unit, the pairs still to walk held; a pair whose tree read meets a let-go window stops the walk and
+//! is held to walk again once the window is brought back (B8 of the landed let-go's lift). The objects' rows read into
+//! the encoding's order (by type, the largest first, then by id, which each object's row gives without its bytes): one
+//! row a unit (a window's worth of handles had been 32,768 rows, 315 ms of one unit in a debug build), the order held
+//! as two sets, one a part. One object encoded: its row and its named base's row read; a window of its bytes, then of
+//! its base's, read a unit; then its entry made by the part's encoder a window's work a unit
+//! ([`super::fragment::Encoder::step`]): a step of one candidate base's delta search (`deltas::Search`, a window's
+//! blocks indexed or a window of the target scanned; the same delta `delta_of` makes), one level sampled on the data's
+//! first window, or a window of the data deflated (the same stream one call deflates). Last, each part put into the
+//! content store a window a unit (`ContentStore::put_window`, then its lists), and both recorded.
 //!
 //! **A pushed entry sent on as it lies** (A-859, git's pack reuse). An object a push brought in a pack is written into
 //! its part as its entry lies there, its compressed data copied a window a unit, once its check holds (a whole entry's
@@ -51,7 +52,7 @@ use super::learn::{Clock, Exchange};
 use super::packed::{self, InPack, PackSource};
 use super::positions::Positions;
 use super::push::StoredAt;
-use super::repository::{Repository, StoreRefused};
+use super::repository::{Repository, StoreRefused, TreeEntries};
 use super::rows::{self, ObjectRow};
 use super::upload::{Progress, Turn};
 
@@ -637,24 +638,42 @@ impl Encoding {
     let Some((new, old)) = pending.pop() else {
       return Ok(Stage::Gather { from: 0 });
     };
-    if new != old && self.named.insert(new, old).is_none() {
-      self.counters.trees_walked = self.counters.trees_walked.saturating_add(1);
-      self.compare(repository, store, (new, old), &mut pending)?;
+    if new == old || self.named.contains_key(&new) {
+      return Ok(Stage::Walk { pending });
     }
+    // B8 of the landed let-go's lift: both trees are read, quietly, before anything of the pair is noted, so a read
+    // that met a let-go window stops the walk with the pair kept to be walked again once the window is brought back, as
+    // the encoding's other units stop (`stopped_unit`); a window met again, or a read that met none, refuses as before.
+    let (read, met) = repository.reading_quietly(|| {
+      let olds = repository.tree_entries(store, &old)?;
+      Ok((olds, repository.tree_entries(store, &new)?))
+    });
+    let (olds, news) = match read {
+      Ok(both) => both,
+      Err(refused) => {
+        return match met {
+          Some(waited) if self.stop_at(store, waited) => {
+            pending.push((new, old));
+            Ok(Stage::Walk { pending })
+          }
+          _ => Err(refused),
+        };
+      }
+    };
+    self.named.insert(new, old);
+    self.counters.trees_walked = self.counters.trees_walked.saturating_add(1);
+    self.compare((&olds, news), &mut pending);
     Ok(Stage::Walk { pending })
   }
 
-  /// `new`'s entries beside `old`'s: a subtree replaced at its name held to walk, any other object replaced by one of
-  /// its kind named as its base.
+  /// A tree's entries `news` beside its previous version's `olds`: a subtree replaced at its name held to walk, any
+  /// other object replaced by one of its kind named as its base.
   fn compare(
     &mut self,
-    repository: &Repository,
-    store: &ContentStore,
-    (new, old): (ObjectId, ObjectId),
+    (olds, news): (&TreeEntries, TreeEntries),
     pending: &mut Vec<(ObjectId, ObjectId)>,
-  ) -> Result<(), StoreRefused> {
-    let olds = repository.tree_entries(store, &old)?;
-    for (name, (is_dir, id)) in repository.tree_entries(store, &new)? {
+  ) {
+    for (name, (is_dir, id)) in news {
       let Some(&(was_dir, was)) = olds.get(&name) else {
         continue;
       };
@@ -667,7 +686,6 @@ impl Encoding {
         self.named.insert(id, was);
       }
     }
-    Ok(())
   }
 
   /// One object's row read into the order (module docs; A-718: a row a unit); with none left, the commits, trees and

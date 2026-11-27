@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 
 use slates_db::register::HostId;
 use slates_rt::futures;
+use slates_rt::shard::TaskId;
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::{ConnectionId, Endpoint};
 
@@ -291,6 +292,9 @@ pub(crate) struct Edges {
   sent_on: BTreeMap<HostId, (ConnectionId, u64)>,
   /// Each peer's record, by anchor. Bounded by the members; one leaves with its member.
   learned: BTreeMap<HostId, EdgesRecord>,
+  /// Members whose announcement task ([`announce_edges`]) has ended, for the member loop to join on its next turn.
+  /// Bounded by the loop's tasks in flight, one a member.
+  announce_done: std::collections::BTreeSet<HostId>,
 }
 
 impl Edges {
@@ -335,7 +339,21 @@ pub(crate) fn serve_edges(state: &mut ShardState, peer_anchor: HostId, request: 
 /// Sends this node's edges record on each of its record sessions that has not carried its current one (A-925): once a
 /// session, again when its edges change. An answer of any kind ends the session's debt, an older peer's empty one
 /// included; a lost exchange is owed again.
-pub(crate) async fn announce_edges() {
+///
+/// Each member's on its own task, a child of the member loop (`announcing`, its tasks in flight), which joins it once it
+/// ended and never waits on it (A-921 part 5): sent in turn and awaited by the loop, a restarted node's record to a peer
+/// that died just then held the loop for the exchange budget, so it answered no probe, and its peers condemned it
+/// beside the dead one (1 run of A919's owner-restart scene in 5, its silence 1.46 s at the takeover). Bounded by the
+/// record sessions, one a member; a task the runtime refuses leaves the member owed for a later turn, counted by its
+/// kind (`member_task::count_spawn_refused`).
+pub(crate) async fn announce_edges(announcing: &mut BTreeMap<HostId, TaskId>) {
+  let done =
+    state::with_state(|state| core::mem::take(&mut state.edges.announce_done)).unwrap_or_default();
+  for member in done {
+    if let Some(task) = announcing.remove(&member) {
+      let _ = futures::join(task).await;
+    }
+  }
   let owed: Vec<HostId> = state::with_state(|state| {
     let Some(_) = state.edges.local.as_ref() else {
       return Vec::new();
@@ -353,13 +371,37 @@ pub(crate) async fn announce_edges() {
   })
   .unwrap_or_default();
   for member in owed {
-    let mut sessions =
-      crate::fleet::take_sessions("fleet.lent_to.announce_edges", |host| host == member);
-    for (_, endpoint) in &mut sessions {
-      announce_on(member, endpoint).await;
+    if announcing.contains_key(&member) {
+      continue;
     }
-    crate::fleet::return_sessions(sessions);
+    match crate::member_task::spawn_exchange(announce_member(member)) {
+      Ok(task) => {
+        announcing.insert(member, task);
+      }
+      // Left owed, so a later turn tries again; never awaited here (main 01a20182's ruling of 2026-11-27 05:11).
+      Err(refusal) => {
+        crate::member_task::count_spawn_refused(crate::member_task::Pass::Edges, &refusal);
+      }
+    }
   }
+}
+
+/// Makes this node owe its edges record again to every peer, as a change of its edges does (test support for
+/// `Daemon::owe_edges_again`, A-921 part 5 follow-up).
+pub(crate) fn owe_again(state: &mut ShardState) {
+  state.edges.sent_on.clear();
+}
+
+/// This node's edges record owed `member`, on its sessions, each borrowed for its own exchange and returned at its end
+/// ([`announce_edges`]).
+async fn announce_member(member: HostId) {
+  let mut sessions =
+    crate::fleet::take_sessions("fleet.lent_to.announce_edges", |host| host == member);
+  for (_, endpoint) in &mut sessions {
+    announce_on(member, endpoint).await;
+  }
+  crate::fleet::return_sessions(sessions);
+  let _ = state::with_state(|state| state.edges.announce_done.insert(member));
 }
 
 /// One edges record on one borrowed session to `member`.
