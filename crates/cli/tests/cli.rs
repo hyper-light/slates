@@ -3414,12 +3414,14 @@ fn port_blocks() -> Vec<HeldBlock> {
   blocks
 }
 
-/// A duplicate of `socket`'s descriptor that a spawned child inherits (close-on-exec cleared); the
-/// test's own socket keeps the port, and the duplicate is closed here once the child has it.
-fn inheritable(socket: &std::net::UdpSocket) -> std::os::fd::OwnedFd {
-  let duplicate: std::os::fd::OwnedFd = socket.try_clone().unwrap().into();
-  rustix::io::fcntl_setfd(&duplicate, rustix::io::FdFlags::empty()).unwrap();
-  duplicate
+#[path = "support/hand_on.rs"]
+mod hand_on;
+use hand_on::HandOn as _;
+
+/// A close-on-exec duplicate of `socket` for the one slates process a spawn hands it to (`.handing_on`,
+/// `support/hand_on.rs`): the test's own socket keeps the port, and the duplicate is closed here once the child has it.
+fn held_duplicate(socket: &std::net::UdpSocket) -> std::os::fd::OwnedFd {
+  socket.try_clone().unwrap().into()
 }
 
 /// Starts `slates daemon --fleet MANIFEST --node NODE` alone (no anchor) at `instance`, handing it the
@@ -3434,7 +3436,7 @@ fn start_fleet_daemon(
   let [probe, record] = held.sockets.as_slice() else {
     panic!("a node's block is its probe and record ports");
   };
-  let (probe, record) = (inheritable(probe), inheritable(record));
+  let (probe, record) = (held_duplicate(probe), held_duplicate(record));
   let child = slates()
     .args([
       "--instance",
@@ -3454,6 +3456,7 @@ fn start_fleet_daemon(
     )
     .stdout(Stdio::null())
     .stderr(Stdio::inherit())
+    .handing_on(&[probe.as_raw_fd(), record.as_raw_fd()])
     .spawn()
     .unwrap();
   FleetProcess { child }
@@ -3532,7 +3535,7 @@ fn start_anchored_fleet_node(dir: &str, instance: &str) -> (AnchorProcess, [u16;
   let [probe, record] = blocks[0].sockets.as_slice() else {
     panic!("a node's block is its probe and record ports");
   };
-  let (probe, record) = (inheritable(probe), inheritable(record));
+  let (probe, record) = (held_duplicate(probe), held_duplicate(record));
   let child = slates()
     .args([
       "--instance",
@@ -3552,6 +3555,7 @@ fn start_anchored_fleet_node(dir: &str, instance: &str) -> (AnchorProcess, [u16;
     )
     .stdout(Stdio::null())
     .stderr(Stdio::inherit())
+    .handing_on(&[probe.as_raw_fd(), record.as_raw_fd()])
     .spawn()
     .unwrap();
   (
@@ -3738,8 +3742,7 @@ impl EnrolledFleet {
     let port = self.blocks[0].base;
     let export = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
     let export_fd: std::os::fd::OwnedFd = export.try_clone().unwrap().into();
-    rustix::io::fcntl_setfd(&export_fd, rustix::io::FdFlags::empty()).unwrap();
-    let (probe, record) = (inheritable(probe), inheritable(record));
+    let (probe, record) = (held_duplicate(probe), held_duplicate(record));
     let child = slates()
       .args([
         "--instance",
@@ -3764,6 +3767,7 @@ impl EnrolledFleet {
       )
       .stdout(Stdio::null())
       .stderr(Stdio::inherit())
+      .handing_on(&[probe.as_raw_fd(), record.as_raw_fd(), export_fd.as_raw_fd()])
       .spawn()
       .unwrap();
     (AnchorProcess { child, drain: None }, port)
@@ -3936,7 +3940,7 @@ fn a_daemon_refuses_inherited_serve_sockets_bound_elsewhere_or_malformed() {
   let blocks = port_blocks();
   let bases: Vec<u16> = blocks.iter().map(|held| held.base).collect();
   let manifest = write_manifest(&scratch.path, &bases);
-  let refused = |value: String| {
+  let refused = |value: String, handed: &[std::os::fd::RawFd]| {
     slates()
       .args([
         "--instance",
@@ -3951,6 +3955,7 @@ fn a_daemon_refuses_inherited_serve_sockets_bound_elsewhere_or_malformed() {
         FLEET_NODES[0],
       ])
       .env(slates_anchor::ENV_FLEET_SERVE, value)
+      .handing_on(handed)
       .output()
       .unwrap()
   };
@@ -3958,8 +3963,14 @@ fn a_daemon_refuses_inherited_serve_sockets_bound_elsewhere_or_malformed() {
   let [elsewhere_probe, elsewhere_record] = blocks[1].sockets.as_slice() else {
     panic!("a node's block is its probe and record ports");
   };
-  let (probe, record) = (inheritable(elsewhere_probe), inheritable(elsewhere_record));
-  let output = refused(format!("{},{}", probe.as_raw_fd(), record.as_raw_fd()));
+  let (probe, record) = (
+    held_duplicate(elsewhere_probe),
+    held_duplicate(elsewhere_record),
+  );
+  let output = refused(
+    format!("{},{}", probe.as_raw_fd(), record.as_raw_fd()),
+    &[probe.as_raw_fd(), record.as_raw_fd()],
+  );
   drop((probe, record));
   let stderr = String::from_utf8_lossy(&output.stderr);
   assert!(
@@ -3971,7 +3982,7 @@ fn a_daemon_refuses_inherited_serve_sockets_bound_elsewhere_or_malformed() {
       && stderr.contains(&format!("not at the planned 127.0.0.1:{}", bases[0])),
     "the refusal names where the socket is and where it should be: {stderr}"
   );
-  let output = refused("not-descriptors".to_owned());
+  let output = refused("not-descriptors".to_owned(), &[]);
   let stderr = String::from_utf8_lossy(&output.stderr);
   assert!(
     !output.status.success(),
