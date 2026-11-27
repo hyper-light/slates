@@ -1,4 +1,6 @@
 name: diag-main-84a
+# Run 4 (main 01a20182, 2026-11-27 06:22 PST): macos-latest alone, its leg in run 3 having run nothing (no GNU timeout on
+# macOS runners); the bench bounded by perl's alarm where timeout is missing. Linux and Windows stand from run 3.
 # Run 3 (main 01a20182, 2026-11-27 06:01 PST): goal 84a's loaded and quiet tails at current main (0408a5b26) on every
 # runner its 11-21 figures came from: macos-latest (A-831's "p999 4/12", BENCHMARKS "84a on macOS", run 44934544995),
 # windows-latest and windows-11-arm (w-k90-win's run 44948887874), and Linux's two with the account granted
@@ -21,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
+        os: [macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
     defaults:
@@ -54,6 +56,8 @@ jobs:
       - name: Three loaded invocations, then two quiet
         run: |
           set +e
+          # macOS runners have no GNU timeout (run 3's macOS leg: "timeout: command not found"); perl's alarm bounds it.
+          bound() { if command -v timeout > /dev/null; then timeout "$@"; else perl -e 'alarm shift; exec @ARGV' "$@"; fi; }
           if [ "$RUNNER_OS" = Linux ]; then
             sudo prlimit --pid $$ --rtprio=99:99
             echo "RLIMIT_RTPRIO of this shell: $(ulimit -r) (soft) $(ulimit -Hr) (hard), user $(id -un)"
@@ -62,14 +66,14 @@ jobs:
           B=target/release/examples/edit_merge_bench; [ -f "$B.exe" ] && B="$B.exe"
           echo "cores: $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")"
           for n in 1 2 3; do
-            timeout 1500 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null > "$L/loaded-$n.log" 2>&1
+            bound 1500 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null > "$L/loaded-$n.log" 2>&1
             rc=$?
             echo "::notice title=${{ matrix.os }} loaded $n (exit $rc)::$(grep -a '^goal	merge\.' "$L/loaded-$n.log" | cut -f2 | cut -c1-400 | tr '\n' ' ')"
             grep -a '^goal	merge\.' "$L/loaded-$n.log" | cut -c1-400
           done
           grep -ahE 'runs round-robin|runs time-share|NoPriorityGranted' "$L"/loaded-*.log | sort | uniq -c | head -4
           for n in 1 2; do
-            timeout 1200 "$B" --quiet-only --files 10 --form accept --form conflict </dev/null > "$L/quiet-$n.log" 2>&1
+            bound 1200 "$B" --quiet-only --files 10 --form accept --form conflict </dev/null > "$L/quiet-$n.log" 2>&1
             rc=$?
             echo "::notice title=${{ matrix.os }} quiet $n (exit $rc)::$(grep -a '^goal	merge\.' "$L/quiet-$n.log" | cut -f2 | cut -c1-400 | tr '\n' ' ')"
             grep -a '^goal	merge\.' "$L/quiet-$n.log" | cut -c1-400
