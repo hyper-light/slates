@@ -139,7 +139,7 @@ impl<W: Write, F: FnMut() -> W> LineRelay<F> {
   fn new(cap: usize, acquire: F) -> Self {
     Self {
       cap,
-      line: Vec::new(),
+      line: Vec::with_capacity(cap),
       state: RelayLine::Active,
       acquire,
     }
@@ -799,7 +799,7 @@ mod tests {
   fn relay_stderr_bounds_overlong_input_and_flushes_eof_remainder() {
     let mut input = vec![b'A'; 256];
     input.extend_from_slice(b"short\n");
-    input.extend_from_slice(&vec![b'B'; 99]);
+    input.extend_from_slice(&[b'B'; 99]);
     input.push(b'\n');
     input.extend_from_slice(b"tail");
     let sink = RefCell::new(RecordingSink {
@@ -920,7 +920,7 @@ mod tests {
     child_lines: &mut Vec<&'a [u8]>,
   ) {
     assert!(
-      raw.len() + 1 <= QUEUE_BYTES,
+      raw.len() < QUEUE_BYTES,
       "emitted line exceeds QUEUE_BYTES ({} + 1 > {QUEUE_BYTES})",
       raw.len()
     );
@@ -1143,5 +1143,37 @@ mod tests {
     ]
     .concat();
     assert_eq!(stream, expected);
+  }
+
+  /// Round-6 Suggestion 5: Do: construct `LineRelay::new(QUEUE_BYTES, ...)` and feed a full
+  /// `QUEUE_BYTES`-byte newline-less chunk (triggering `emit_split_line` with synthetic `\n`)
+  /// followed by an exact `QUEUE_BYTES`-byte `\n`-terminated line and an EOF remainder.
+  /// Expect: `relay.line.capacity()` stays strictly equal to `QUEUE_BYTES` throughout (no 2x
+  /// amortized reallocation when appending the synthetic `\n`).
+  #[test]
+  fn line_relay_preallocates_cap_and_never_grows_past_queue_bytes() {
+    let sink = RefCell::new(RecordingSink {
+      writes: Vec::new(),
+      fail: false,
+    });
+    let mut relay = LineRelay::new(QUEUE_BYTES, || BorrowedSink {
+      guard: sink.borrow_mut(),
+    });
+    assert_eq!(relay.line.capacity(), QUEUE_BYTES);
+    relay.feed(&vec![b'A'; QUEUE_BYTES]);
+    assert_eq!(relay.line.capacity(), QUEUE_BYTES);
+    relay.feed(&vec![b'B'; QUEUE_BYTES - 2]);
+    relay.feed(b"\n");
+    assert_eq!(relay.line.capacity(), QUEUE_BYTES);
+    relay.feed(&vec![b'C'; QUEUE_BYTES - 1]);
+    assert_eq!(relay.line.capacity(), QUEUE_BYTES);
+    relay.finish();
+    let writes = sink.into_inner().writes;
+    assert_eq!(writes.len(), 3);
+    assert!(
+      writes
+        .iter()
+        .all(|w| w.len() == QUEUE_BYTES && w.ends_with(b"\n"))
+    );
   }
 }

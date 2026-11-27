@@ -3648,12 +3648,10 @@ async fn fetch_svn(
   match read {
     Ok(records) => Some((index, records.into())),
     Err(why) => {
-      let _ = crate::state::with_state(|state| {
-        slates_machine::log_line!(
-          "slates-server: partition {}: a Subversion changeset {sequence} was not read back from the store: {why:?}",
-          state.partition
-        );
-      });
+      let partition = crate::state::with_state(|state| state.partition);
+      slates_machine::log_line!(
+        "slates-server: partition {partition:?}: a Subversion changeset was not read back from the store: repository={id:?} sequence={sequence} why={why:?}"
+      );
       None
     }
   }

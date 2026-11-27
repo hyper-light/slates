@@ -1157,6 +1157,14 @@ fn zero_byte_rows_and_bad_sizing_recover_on_valid_reopen() {
     "extent_bytes=4096",
   );
   assert_bad_sizing_refused_without_rows(dir.path(), Sizing { fanout: 1, ..valid }, "fanout=1");
+  assert_bad_sizing_refused_without_rows(
+    dir.path(),
+    Sizing {
+      disk: 2 * valid.extent_bytes,
+      ..valid
+    },
+    "disk=2*extent_bytes",
+  );
 
   let body = b"lands cleanly after bad sizing".to_vec();
   let r1 = {
@@ -1587,7 +1595,7 @@ mod sim_tests {
     put_changeset_counted(
       &mut rows,
       log.file(),
-      &seal,
+      (&seal, MIN_PAGE),
       &first,
       &mut value,
       &mut skipped,
@@ -1617,7 +1625,7 @@ mod sim_tests {
     put_changeset_counted(
       &mut rows,
       log.file(),
-      &seal,
+      (&seal, MIN_PAGE),
       &replacement,
       &mut value,
       &mut skipped,
@@ -2046,10 +2054,9 @@ mod sim_tests {
     assert_eq!(got, dup);
   }
 
-  /// Proves `validate_sizing_bounds` rejects `memory: 0` / `extent_bytes: 0` and
-  /// `ChangesetLog::recover_sealed(..., None, ...)` resyncs records carrying another directory's
-  /// grant id after a mid-file header bit-flip.
-  fn assert_sim_sizing_validation_and_grantless_resync() {
+  /// Proves `validate_sizing_bounds` accepts valid sizing bounds and rejects zero/undersized
+  /// `memory`, `extent_bytes`, `fanout`, and `disk` values with `StoreError::Sizing`.
+  fn assert_sim_sizing_bounds() {
     let valid = Sizing {
       memory: 8 << 20,
       disk: 1 << 30,
@@ -2057,45 +2064,62 @@ mod sim_tests {
       fanout: 8,
     };
     assert!(validate_sizing_bounds(valid, MIN_PAGE).is_ok());
-    assert!(matches!(
-      validate_sizing_bounds(Sizing { memory: 0, ..valid }, MIN_PAGE),
-      Err(StoreError::Sizing(_))
-    ));
-    assert!(matches!(
-      validate_sizing_bounds(
+    let invalid_cases = [
+      ("memory=0", Sizing { memory: 0, ..valid }),
+      (
+        "extent_bytes=0",
         Sizing {
           extent_bytes: 0,
           ..valid
         },
-        MIN_PAGE,
       ),
-      Err(StoreError::Sizing(_))
-    ));
-    assert!(matches!(
-      validate_sizing_bounds(
+      (
+        "extent_bytes=1",
         Sizing {
           extent_bytes: 1,
           ..valid
         },
-        MIN_PAGE,
       ),
-      Err(StoreError::Sizing(_))
-    ));
-    assert!(matches!(
-      validate_sizing_bounds(
+      (
+        "extent_bytes=MIN_PAGE",
         Sizing {
           extent_bytes: to_u64(MIN_PAGE),
           ..valid
         },
-        MIN_PAGE,
       ),
-      Err(StoreError::Sizing(_))
-    ));
-    assert!(matches!(
-      validate_sizing_bounds(Sizing { fanout: 1, ..valid }, MIN_PAGE),
-      Err(StoreError::Sizing(_))
-    ));
+      ("fanout=1", Sizing { fanout: 1, ..valid }),
+      (
+        "disk=2*extent_bytes",
+        Sizing {
+          disk: 2 * valid.extent_bytes,
+          ..valid
+        },
+      ),
+    ];
+    for (label, sizing) in invalid_cases {
+      assert!(
+        matches!(
+          validate_sizing_bounds(sizing, MIN_PAGE),
+          Err(StoreError::Sizing(_))
+        ),
+        "invalid sizing {label} must return Err(StoreError::Sizing(_))"
+      );
+    }
+    assert!(
+      validate_sizing_bounds(
+        Sizing {
+          disk: 3 * valid.extent_bytes,
+          ..valid
+        },
+        MIN_PAGE,
+      )
+      .is_ok()
+    );
+  }
 
+  /// Proves `ChangesetLog::recover_sealed(..., None, ...)` resyncs records carrying another
+  /// directory's grant id after a mid-file header bit-flip.
+  fn assert_sim_grantless_resync() {
     let seal = [0x77u8; SEAL_BYTES];
     let sim = sim_file(116);
     sim.write_all_at(&encode_seal_preamble(&seal), 0).unwrap();
@@ -2133,7 +2157,7 @@ mod sim_tests {
     put_changeset_counted(
       &mut rows,
       log.file(),
-      &seal,
+      (&seal, MIN_PAGE),
       &located,
       &mut value,
       &mut skipped,
@@ -2178,7 +2202,8 @@ mod sim_tests {
   fn sim_b_rows_o1_work_oversized_interleaved_and_forget_cleanup() {
     assert_sim_o1_interleaved_and_unaligned_reads();
     assert_sim_forget_cleans_block_digests_and_keeps_duplicate();
-    assert_sim_sizing_validation_and_grantless_resync();
+    assert_sim_sizing_bounds();
+    assert_sim_grantless_resync();
     assert_sim_index_checkpoint_rebuilds_missing_block_digests();
   }
 
@@ -2206,7 +2231,7 @@ mod sim_tests {
       put_changeset_counted(
         &mut rows,
         log.file(),
-        &seal,
+        (&seal, MIN_PAGE),
         &located,
         &mut value,
         &mut skipped,
@@ -2311,8 +2336,24 @@ mod sim_tests {
     let r2 = rec2.commit().unwrap();
     let mut value = Vec::new();
     let mut skipped = 0u64;
-    put_changeset_counted(&mut rows, log.file(), &seal, &r1, &mut value, &mut skipped).unwrap();
-    put_changeset_counted(&mut rows, log.file(), &seal, &r2, &mut value, &mut skipped).unwrap();
+    put_changeset_counted(
+      &mut rows,
+      log.file(),
+      (&seal, MIN_PAGE),
+      &r1,
+      &mut value,
+      &mut skipped,
+    )
+    .unwrap();
+    put_changeset_counted(
+      &mut rows,
+      log.file(),
+      (&seal, MIN_PAGE),
+      &r2,
+      &mut value,
+      &mut skipped,
+    )
+    .unwrap();
     rows.checkpoint(log.end()).unwrap();
 
     let s_len_off = r1.offset + to_u64(HEADER_BYTES + 4) + u64::from(bit / 8);
@@ -2346,7 +2387,7 @@ mod sim_tests {
     let applied = put_changeset_counted(
       &mut rows,
       log.file(),
-      &seal,
+      (&seal, MIN_PAGE),
       &r1_new,
       &mut value,
       &mut replace_skipped,
@@ -2406,8 +2447,24 @@ mod sim_tests {
     let r2_sec = log.sections(&r2).unwrap()[0];
     let mut value = Vec::new();
     let mut skipped = 0u64;
-    put_changeset_counted(&mut rows, log.file(), &seal, &r1, &mut value, &mut skipped).unwrap();
-    put_changeset_counted(&mut rows, log.file(), &seal, &r2, &mut value, &mut skipped).unwrap();
+    put_changeset_counted(
+      &mut rows,
+      log.file(),
+      (&seal, MIN_PAGE),
+      &r1,
+      &mut value,
+      &mut skipped,
+    )
+    .unwrap();
+    put_changeset_counted(
+      &mut rows,
+      log.file(),
+      (&seal, MIN_PAGE),
+      &r2,
+      &mut value,
+      &mut skipped,
+    )
+    .unwrap();
     rows.put(&[super::super::CONTENTS], &[]).unwrap();
     rows.checkpoint(log.end()).unwrap();
 
@@ -2777,5 +2834,734 @@ mod sim_tests {
   fn sim_forget_damaged_payload_cleans_p_and_b_rows_without_leak() {
     assert_sim_forget_unique_damaged_payload();
     assert_sim_forget_duplicate_damaged_payload();
+  }
+
+  /// Round-6 Suggestion 1 (`SimFile` oracle): Do: pair a valid Format-2 sealed `changesets` log
+  /// with a non-empty `rows` (`applied > 0`) that has no `S` (`SEAL_ROW`) entry, as a Format-1
+  /// `rows` file would, and call `prepare_sealed_log`.
+  /// Expect: refuses `Err(StoreError::Log(LogError::Corrupt("a store seal mismatch")))` without
+  /// writing `SEAL_ROW` or mutating `rows`.
+  #[test]
+  fn sim_prepare_sealed_log_refuses_sealless_nonempty_rows_without_mutation() {
+    let (config, trunk) = sim_db_config();
+    let seal = [0x99u8; SEAL_BYTES];
+    let log_file = sim_file(270);
+    log_file
+      .write_all_at(&encode_seal_preamble(&seal), 0)
+      .unwrap();
+    log_file.sync_data().unwrap();
+    let applied = to_u64(SEAL_PREAMBLE_BYTES);
+
+    let mut sealless = ShardDb::create(sim_file(271), config, 1 << 20, trunk).unwrap();
+    sealless.checkpoint(applied).unwrap();
+    let IntoFile::Finished {
+      file: rows_file,
+      result,
+    } = sealless.into_file()
+    else {
+      panic!("rows must close cleanly");
+    };
+    result.unwrap();
+    let rows_before = rows_file.durable_image().unwrap();
+
+    let (opened_rows, opened_applied) = ShardDb::open(rows_file, config, 1 << 20, trunk).unwrap();
+    assert_eq!(opened_applied, applied);
+    let refused = prepare_sealed_log(
+      log_file,
+      seal,
+      (opened_rows, opened_applied, config.page_size),
+    );
+    assert!(matches!(
+      refused,
+      Err(StoreError::Log(LogError::Corrupt("a store seal mismatch")))
+    ));
+    let verify_file = sim_file(272);
+    verify_file.write_all_at(&rows_before, 0).unwrap();
+    verify_file.sync_data().unwrap();
+    let (mut check_rows, _) = ShardDb::open(verify_file, config, 1 << 20, trunk).unwrap();
+    assert_eq!(read_seal_row(&mut check_rows).unwrap(), None);
+  }
+
+  /// Appends a changeset carrying `[Record, Payload]` for `(repo, seq)` and indexes its `C`, `P`,
+  /// and `B` rows via `put_rows_from_log`.
+  fn append_and_put_record_and_payload(
+    log: &mut ChangesetLog<SimFile>,
+    rows: &mut ShardDb<SimFile>,
+    (repo, seq): (u128, u64),
+    (record_bytes, payload_bytes): (&[u8], &[u8]),
+  ) -> crate::log::Located {
+    let mut rec = log
+      .begin(Header {
+        tool: Tool::Git,
+        repository: repo,
+        sequence: seq,
+        judged_over: 0,
+        grant: 7,
+        work: seq,
+        time_ns: seq,
+        sections: 2,
+      })
+      .unwrap();
+    rec
+      .section(SectionKind::Record, to_u64(record_bytes.len()))
+      .unwrap();
+    rec.piece(record_bytes).unwrap();
+    rec
+      .section(SectionKind::Payload, to_u64(payload_bytes.len()))
+      .unwrap();
+    rec.piece(payload_bytes).unwrap();
+    let located = rec.commit().unwrap();
+    let seal = log.seal();
+    let (mut value, mut buf) = (Vec::new(), Vec::new());
+    let mut skipped = 0u64;
+    super::super::put_rows_from_log(
+      rows,
+      log.file(),
+      (&seal, MIN_PAGE),
+      &located,
+      (&mut value, &mut buf),
+      &mut skipped,
+    )
+    .unwrap();
+    located
+  }
+
+  /// Reopens a checkpointed `ShardDb<SimFile>` from its underlying `SimFile` to verify durable
+  /// state survives restart.
+  fn reopen_sim_rows(rows: ShardDb<SimFile>) -> (ShardDb<SimFile>, u64) {
+    let (config, trunk) = sim_db_config();
+    let IntoFile::Finished { file, result } = rows.into_file() else {
+      panic!("rows must close cleanly");
+    };
+    result.unwrap();
+    ShardDb::open(file, config, 1 << 20, trunk).unwrap()
+  }
+
+  /// Verifies that primary `P[shared_id]` points to `expected_off`, all `B` rows for `old_off` are
+  /// deleted, and reading piece 0 from `expected_off` verifies intact.
+  fn assert_b2_sibling_promoted(
+    log: &ChangesetLog<SimFile>,
+    rows: &mut ShardDb<SimFile>,
+    shared: &[u8],
+    (old_off, expected_off): (u64, u64),
+    label: &str,
+  ) {
+    let shared_id = *blake3::hash(shared).as_bytes();
+    let mut value = Vec::new();
+    assert!(
+      rows
+        .get(&super::super::content_key(&shared_id), &mut value)
+        .unwrap(),
+      "{label}: primary P row must survive"
+    );
+    assert_eq!(
+      super::super::decode_content(&value),
+      Some((expected_off, to_u64(shared.len()))),
+      "{label}: Repo 2 healthy duplicate must be promoted to primary P"
+    );
+    assert!(
+      !(0..2u64).any(|blk| rows.get(&block_key(old_off, blk), &mut value).unwrap()),
+      "{label}: corrupt O1 B rows must be deleted"
+    );
+    let mut metrics = PieceMetrics::default();
+    let got = read_sim_piece(
+      log,
+      rows,
+      &mut metrics,
+      &shared_id,
+      (expected_off, to_u64(shared.len())),
+      0,
+    )
+    .unwrap();
+    assert_eq!(got.as_slice(), &shared[..PIECE_BYTES]);
+  }
+
+  /// Exercises Blocker 2 (`flip_s_len = false` -> Case A payload bit-flip; `flip_s_len = true` ->
+  /// Case B `S_LEN` + payload bit-flip) in pure `SimFile`: Repo 1 and Repo 2 share a multi-piece
+  /// payload, Repo 1's copy corrupts, Repo 1 replaces `(1, 1)`, checkpoints, forgets `(1, 1)`, and
+  /// reopens; Repo 2's healthy duplicate must stay promoted and readable before and after reopen.
+  fn assert_sim_b2_replace_corrupt_promotes_sibling(seed: u64, flip_s_len: bool) {
+    let shared = pattern_bytes(PIECE_BYTES + 2_048, 29, 7);
+    let mut rows = create_sim_rows(seed + 1_000);
+    let mut log = ChangesetLog::recover(sim_file(seed), 0, |_, _| {}).unwrap();
+    let r1 = append_and_put_record_and_payload(&mut log, &mut rows, (1, 1), (b"repo1-v1", &shared));
+    let r2 =
+      append_and_put_record_and_payload(&mut log, &mut rows, (2, 1), (b"repo2-healthy", &shared));
+    let r1_secs = log.sections(&r1).unwrap();
+    let r2_secs = log.sections(&r2).unwrap();
+    let (o1, o2) = (r1_secs[1].offset, r2_secs[1].offset);
+    rows.checkpoint(log.end()).unwrap();
+
+    if flip_s_len {
+      let s0_head = r1_secs[0].offset - to_u64(SECTION_HEAD_BYTES);
+      log
+        .file()
+        .inject(Fault::BitFlip {
+          offset: s0_head + 9,
+          bit: 0,
+          stored: true,
+        })
+        .unwrap();
+    }
+    log
+      .file()
+      .inject(Fault::BitFlip {
+        offset: o1 + 10,
+        bit: 0,
+        stored: true,
+      })
+      .unwrap();
+
+    let r1_v2 = append_sim(&mut log, 1, b"replacement");
+    let seal = log.seal();
+    let (mut value, mut buf, mut skipped) = (Vec::new(), Vec::new(), 0u64);
+    put_changeset_counted(
+      &mut rows,
+      log.file(),
+      (&seal, MIN_PAGE),
+      &r1_v2,
+      &mut value,
+      &mut skipped,
+    )
+    .unwrap();
+    assert_eq!(skipped, 1);
+    rows.checkpoint(log.end()).unwrap();
+    let label = if flip_s_len { "Case B" } else { "Case A" };
+    assert_b2_sibling_promoted(&log, &mut rows, &shared, (o1, o2), label);
+
+    super::super::forget_changeset(&mut rows, &log, (1, 1), MIN_PAGE, (&mut value, &mut buf))
+      .unwrap();
+    let (mut reopened_rows, _) = reopen_sim_rows(rows);
+    assert_b2_sibling_promoted(&log, &mut reopened_rows, &shared, (o1, o2), "reopened");
+  }
+
+  /// Verifies replacing a corrupt changeset that itself held two identical payload sections cleans
+  /// BOTH in-range occurrences and promotes a third surviving copy outside that record.
+  fn assert_sim_b2_double_in_record_payload_promotes_outer_sibling() {
+    let shared = pattern_bytes(PIECE_BYTES + 1_024, 17, 5);
+    let mut rows = create_sim_rows(1282);
+    let mut log = ChangesetLog::recover(sim_file(282), 0, |_, _| {}).unwrap();
+    let mut rec1 = log
+      .begin(Header {
+        tool: Tool::Git,
+        repository: 1,
+        sequence: 1,
+        judged_over: 0,
+        grant: 7,
+        work: 1,
+        time_ns: 1,
+        sections: 2,
+      })
+      .unwrap();
+    for _ in 0..2 {
+      rec1
+        .section(SectionKind::Payload, to_u64(shared.len()))
+        .unwrap();
+      rec1.piece(&shared).unwrap();
+    }
+    let r1 = rec1.commit().unwrap();
+    let seal = log.seal();
+    let (mut value, mut buf, mut skipped) = (Vec::new(), Vec::new(), 0u64);
+    super::super::put_rows_from_log(
+      &mut rows,
+      log.file(),
+      (&seal, MIN_PAGE),
+      &r1,
+      (&mut value, &mut buf),
+      &mut skipped,
+    )
+    .unwrap();
+    let r2 =
+      append_and_put_record_and_payload(&mut log, &mut rows, (2, 1), (b"repo2-outer", &shared));
+    let r1_secs = log.sections(&r1).unwrap();
+    let o3 = log.sections(&r2).unwrap()[1].offset;
+    log
+      .file()
+      .inject(Fault::BitFlip {
+        offset: r1_secs[0].offset + 12,
+        bit: 0,
+        stored: true,
+      })
+      .unwrap();
+    let r1_v2 = append_sim(&mut log, 1, b"replacement-2");
+    put_changeset_counted(
+      &mut rows,
+      log.file(),
+      (&seal, MIN_PAGE),
+      &r1_v2,
+      &mut value,
+      &mut skipped,
+    )
+    .unwrap();
+    assert_eq!(skipped, 1);
+    assert_b2_sibling_promoted(&log, &mut rows, &shared, (r1_secs[0].offset, o3), "dup-0");
+    assert_b2_sibling_promoted(&log, &mut rows, &shared, (r1_secs[1].offset, o3), "dup-1");
+  }
+
+  /// Round-6 Blocker 2 (`SimFile` oracle): Do: run Case A (payload bit-flip), Case B (`S_LEN` +
+  /// payload bit-flip), reopen after replace + forget, and a corrupt record carrying two identical
+  /// payload sections alongside a healthy sibling Repo 2.
+  /// Expect: `put_changeset_counted` cleans all corrupt in-range `P`/`B` rows and promotes Repo
+  /// 2's healthy duplicate so verified reads keep succeeding before and after reopen.
+  #[test]
+  fn sim_b2_replace_corrupt_changeset_cleans_p_and_b_and_promotes_sibling() {
+    assert_sim_b2_replace_corrupt_promotes_sibling(280, false);
+    assert_sim_b2_replace_corrupt_promotes_sibling(281, true);
+    assert_sim_b2_double_in_record_payload_promotes_outer_sibling();
+  }
+
+  /// Appends a changeset carrying `[Payload, Texts]` for `(repo, seq)` and indexes all rows
+  /// (`C`, `P`, `B`, `K`, `H`, `T`, `I`) via `put_rows_from_log`.
+  fn append_and_put_payload_and_texts(
+    log: &mut ChangesetLog<SimFile>,
+    rows: &mut ShardDb<SimFile>,
+    (repo, seq): (u128, u64),
+    (payload, entry): (&[u8], TextEntry),
+  ) -> crate::log::Located {
+    let texts_bytes = texts::encode(&[entry]);
+    let mut rec = log
+      .begin(Header {
+        tool: Tool::Mercurial,
+        repository: repo,
+        sequence: seq,
+        judged_over: 0,
+        grant: 7,
+        work: seq,
+        time_ns: seq,
+        sections: 2,
+      })
+      .unwrap();
+    rec
+      .section(SectionKind::Payload, to_u64(payload.len()))
+      .unwrap();
+    rec.piece(payload).unwrap();
+    rec
+      .section(SectionKind::Texts, to_u64(texts_bytes.len()))
+      .unwrap();
+    rec.piece(&texts_bytes).unwrap();
+    let located = rec.commit().unwrap();
+    let seal = log.seal();
+    let (mut value, mut buf) = (Vec::new(), Vec::new());
+    let mut skipped = 0u64;
+    super::super::put_rows_from_log(
+      rows,
+      log.file(),
+      (&seal, MIN_PAGE),
+      &located,
+      (&mut value, &mut buf),
+      &mut skipped,
+    )
+    .unwrap();
+    located
+  }
+
+  /// Builds a payload + `TextEntry` pair for Blocker 1 tests with `txt` at offset 0.
+  fn make_text_fixture(
+    txt: &[u8],
+    payload_len: usize,
+    fill: u8,
+    tool_id: &[u8],
+  ) -> (Vec<u8>, TextEntry) {
+    let tid = *blake3::hash(txt).as_bytes();
+    let mut payload = vec![fill; payload_len];
+    payload[..txt.len()].copy_from_slice(txt);
+    let pid = *blake3::hash(&payload).as_bytes();
+    let entry = TextEntry {
+      path: b"a.txt".to_vec(),
+      tool_id: tool_id.to_vec(),
+      text: tid,
+      len: to_u64(txt.len()),
+      base: None,
+      place: Place {
+        payload: pid,
+        offset: 0,
+        len: to_u64(txt.len()),
+      },
+    };
+    (payload, entry)
+  }
+
+  /// Builds raw `T`, `I`, `K`, or `H` lookup keys for assertions in `sim_tests`.
+  fn raw_text_row_key(repo: u128, tid: &[u8; 32]) -> Vec<u8> {
+    let mut key = vec![b'T'];
+    key.extend_from_slice(&repo.to_be_bytes());
+    key.extend_from_slice(tid);
+    key
+  }
+
+  fn raw_tool_row_key(repo: u128, path: &[u8], tool_id: &[u8]) -> Vec<u8> {
+    let mut key = vec![b'I'];
+    key.extend_from_slice(&repo.to_be_bytes());
+    key.extend_from_slice(blake3::hash(path).as_bytes());
+    key.extend_from_slice(tool_id);
+    key
+  }
+
+  fn raw_seq_row_key(tag: u8, repo: u128, hash: &[u8; 32], seq: u64) -> Vec<u8> {
+    let mut key = vec![tag];
+    key.extend_from_slice(&repo.to_be_bytes());
+    key.extend_from_slice(hash);
+    key.extend_from_slice(&seq.to_be_bytes());
+    key.extend_from_slice(&0u32.to_be_bytes());
+    key
+  }
+
+  /// Verifies every `C`/`P`/`B`/`K`/`H`/`T`/`I` row for forgotten `(1, 1)` is absent from
+  /// `reopened` while sibling repo 2's `C` and `T` rows stay intact.
+  fn assert_sim_b1_case_a_rows_cleaned(
+    reopened: &mut ShardDb<SimFile>,
+    (pid1, pay_off): (&[u8; 32], u64),
+    (tid, path_hash, sib_tid): (&[u8; 32], &[u8; 32], &[u8; 32]),
+  ) {
+    let mut value = Vec::new();
+    let c1 = super::super::changeset_key(1, 1);
+    let p1 = super::super::content_key(pid1);
+    let b0 = block_key(pay_off, 0);
+    let b1 = block_key(pay_off, 1);
+    let t1 = raw_text_row_key(1, tid);
+    let i1 = raw_tool_row_key(1, b"a.txt", b"n1");
+    let k1 = raw_seq_row_key(b'K', 1, tid, 1);
+    let h1 = raw_seq_row_key(b'H', 1, path_hash, 1);
+    let absent_rows: &[(&str, &[u8])] = &[
+      ("C(1, 1)", &c1),
+      ("P(pid1)", &p1),
+      ("B(pay_off, 0)", &b0),
+      ("B(pay_off, 1)", &b1),
+      ("T(1, tid)", &t1),
+      ("I(1, a.txt, n1)", &i1),
+      ("K(1, tid, 1)", &k1),
+      ("H(1, a.txt, 1)", &h1),
+    ];
+    for &(label, key) in absent_rows {
+      assert!(
+        !reopened.get(key, &mut value).unwrap(),
+        "forgotten row {label} must be absent after reopen"
+      );
+    }
+    let c2 = super::super::changeset_key(2, 1);
+    let t2 = raw_text_row_key(2, sib_tid);
+    let present_rows: &[(&str, &[u8])] = &[("C(2, 1)", &c2), ("T(2, sib_tid)", &t2)];
+    for &(label, key) in present_rows {
+      assert!(
+        reopened.get(key, &mut value).unwrap(),
+        "sibling row {label} must remain intact after reopen"
+      );
+    }
+  }
+
+  /// Exercises Blocker 1 Case A on `forget_changeset` with either a flipped `Texts` section
+  /// (`flip_header = false`) or a flipped record header (`flip_header = true`), verifying every
+  /// `C`/`P`/`B`/`K`/`H`/`T`/`I` row for `(1, 1)` disappears, sibling repo 2 stays intact,
+  /// reopening keeps the clean state, and a retry returns `Ok(0)`.
+  fn assert_sim_b1_case_a_self_corrupt(seed: u64, flip_header: bool) {
+    let txt = b"hello-self-corrupt-texts-sim".to_vec();
+    let tid = *blake3::hash(&txt).as_bytes();
+    let path_hash = *blake3::hash(b"a.txt").as_bytes();
+    let (p1, e1) = make_text_fixture(&txt, PIECE_BYTES + 4_096, 0x42, b"n1");
+    let pid1 = *blake3::hash(&p1).as_bytes();
+    let sib_txt = b"sibling-repo-text-untouched".to_vec();
+    let sib_tid = *blake3::hash(&sib_txt).as_bytes();
+    let (p_sib, e_sib) = make_text_fixture(&sib_txt, 512, 0x77, b"s1");
+
+    let mut rows = create_sim_rows(seed + 1_000);
+    let mut log = ChangesetLog::recover(sim_file(seed), 0, |_, _| {}).unwrap();
+    let l1 = append_and_put_payload_and_texts(&mut log, &mut rows, (1, 1), (&p1, e1));
+    let _l2 = append_and_put_payload_and_texts(&mut log, &mut rows, (2, 1), (&p_sib, e_sib));
+    let secs1 = log.sections(&l1).unwrap();
+    let pay_off = secs1[0].offset;
+    let flip_off = if flip_header {
+      l1.offset + 12
+    } else {
+      secs1[1].offset + 2
+    };
+    rows.checkpoint(log.end()).unwrap();
+    log
+      .file()
+      .inject(Fault::BitFlip {
+        offset: flip_off,
+        bit: 0,
+        stored: true,
+      })
+      .unwrap();
+
+    let (mut value, mut buf) = (Vec::new(), Vec::new());
+    let changed =
+      super::super::forget_changeset(&mut rows, &log, (1, 1), MIN_PAGE, (&mut value, &mut buf))
+        .unwrap();
+    assert!(changed >= 6, "must clean C, P, K, H, T, I rows");
+
+    let (mut reopened, _) = reopen_sim_rows(rows);
+    let retry = super::super::forget_changeset(
+      &mut reopened,
+      &log,
+      (1, 1),
+      MIN_PAGE,
+      (&mut value, &mut buf),
+    )
+    .unwrap();
+    assert_eq!(retry, 0);
+    assert_sim_b1_case_a_rows_cleaned(
+      &mut reopened,
+      (&pid1, pay_off),
+      (&tid, &path_hash, &sib_tid),
+    );
+  }
+
+  /// Round-6 Blocker 1 Case A (`SimFile` oracle): Do: forget `(1, 1)` carrying `[Payload, Texts]`
+  /// after (a) flipping 1 bit in `Texts` and (b) flipping 1 bit in its record header, reopen, and
+  /// retry `forget_changeset(1, 1)`.
+  /// Expect: every `C`/`P`/`B`/`K`/`H`/`T`/`I` row for `(1, 1)` is removed durably, sibling repo
+  /// 2 stays intact, and retrying `forget_changeset(1, 1)` returns `Ok(0)`.
+  #[test]
+  fn sim_b1_case_a_forget_self_corrupt_texts_and_record_cleans_all_rows_and_retries_cleanly() {
+    assert_sim_b1_case_a_self_corrupt(285, false);
+    assert_sim_b1_case_a_self_corrupt(286, true);
+  }
+
+  /// Exercises Blocker 1 Case B1 (healthy `seq=1` + ONLY corrupt keeper `seq=2`): forgetting
+  /// `seq=1` succeeds cleanly, deletes `C(1, 1)`, `P1`, `K1`, `H1`, `T`, and `I(k1)` with zero
+  /// torn index state.
+  fn assert_sim_b1_case_b_only_corrupt_keeper_retires_text_cleanly() {
+    let txt = b"shared-text-only-corrupt-keeper".to_vec();
+    let tid = *blake3::hash(&txt).as_bytes();
+    let (p1, e1) = make_text_fixture(&txt, 1_024, 0x11, b"k1");
+    let (p2, e2) = make_text_fixture(&txt, 1_024, 0x22, b"k2");
+    let pid1 = *blake3::hash(&p1).as_bytes();
+
+    let mut rows = create_sim_rows(1289);
+    let mut log = ChangesetLog::recover(sim_file(289), 0, |_, _| {}).unwrap();
+    let _l1 = append_and_put_payload_and_texts(&mut log, &mut rows, (1, 1), (&p1, e1));
+    let l2 = append_and_put_payload_and_texts(&mut log, &mut rows, (1, 2), (&p2, e2));
+    let t2_off = log.sections(&l2).unwrap()[1].offset;
+    log
+      .file()
+      .inject(Fault::BitFlip {
+        offset: t2_off + 2,
+        bit: 0,
+        stored: true,
+      })
+      .unwrap();
+
+    let (mut value, mut buf) = (Vec::new(), Vec::new());
+    super::super::forget_changeset(&mut rows, &log, (1, 1), MIN_PAGE, (&mut value, &mut buf))
+      .unwrap();
+    let (mut reopened, _) = reopen_sim_rows(rows);
+    assert!(
+      !reopened
+        .get(&super::super::changeset_key(1, 1), &mut value)
+        .unwrap()
+    );
+    assert!(
+      !reopened
+        .get(&super::super::content_key(&pid1), &mut value)
+        .unwrap()
+    );
+    assert!(
+      !reopened
+        .get(&raw_text_row_key(1, &tid), &mut value)
+        .unwrap()
+    );
+    assert!(
+      !reopened
+        .get(&raw_tool_row_key(1, b"a.txt", b"k1"), &mut value)
+        .unwrap()
+    );
+    assert!(
+      reopened
+        .get(&super::super::changeset_key(1, 2), &mut value)
+        .unwrap()
+    );
+  }
+
+  /// Exercises Blocker 1 Case B2 (healthy `seq=1` + corrupt keeper `seq=2` + healthy keeper
+  /// `seq=3`): forgetting `seq=1` skips corrupt `seq=2` and promotes healthy `seq=3` to own BOTH
+  /// the `T` row and the `I` row.
+  fn assert_sim_b1_case_b_promotes_healthy_seq3_past_corrupt_seq2() {
+    let txt = b"shared-text-for-b1-case-b".to_vec();
+    let tid = *blake3::hash(&txt).as_bytes();
+    let (p1, e1) = make_text_fixture(&txt, 512, 0x11, b"same-node");
+    let (p2, e2) = make_text_fixture(&txt, 512, 0x22, b"same-node");
+    let (p3, e3) = make_text_fixture(&txt, 512, 0x33, b"same-node");
+
+    let mut rows = create_sim_rows(1290);
+    let mut log = ChangesetLog::recover(sim_file(290), 0, |_, _| {}).unwrap();
+    let _l1 = append_and_put_payload_and_texts(&mut log, &mut rows, (1, 1), (&p1, e1));
+    let l2 = append_and_put_payload_and_texts(&mut log, &mut rows, (1, 2), (&p2, e2));
+    let _l3 = append_and_put_payload_and_texts(&mut log, &mut rows, (1, 3), (&p3, e3));
+    let t2_off = log.sections(&l2).unwrap()[1].offset;
+    log
+      .file()
+      .inject(Fault::BitFlip {
+        offset: t2_off + 2,
+        bit: 0,
+        stored: true,
+      })
+      .unwrap();
+
+    let (mut value, mut buf) = (Vec::new(), Vec::new());
+    super::super::forget_changeset(&mut rows, &log, (1, 1), MIN_PAGE, (&mut value, &mut buf))
+      .unwrap();
+    let (mut reopened, _) = reopen_sim_rows(rows);
+    assert!(
+      !reopened
+        .get(&super::super::changeset_key(1, 1), &mut value)
+        .unwrap()
+    );
+    assert!(
+      reopened
+        .get(&raw_text_row_key(1, &tid), &mut value)
+        .unwrap()
+    );
+    let t_owner = u64::from_le_bytes(value[..8].try_into().unwrap());
+    assert_eq!(t_owner, 3, "T row must promote to healthy keeper seq=3");
+    assert!(
+      reopened
+        .get(&raw_tool_row_key(1, b"a.txt", b"same-node"), &mut value)
+        .unwrap()
+    );
+    let i_owner = u64::from_le_bytes(value[32..40].try_into().unwrap());
+    assert_eq!(i_owner, 3, "I row must promote to healthy keeper seq=3");
+  }
+
+  /// Round-6 Blocker 1 Case B (`SimFile` oracle): Do: forget healthy `seq=1` when (a) its only
+  /// other keeper `seq=2` has a flipped `Texts` section, and (b) corrupt keeper `seq=2` is
+  /// followed by healthy keeper `seq=3`.
+  /// Expect: (a) succeeds cleanly and retires `T`/`I` without leaving torn rows; (b) skips
+  /// corrupt `seq=2` and promotes healthy `seq=3` to own both `T` and `I`.
+  #[test]
+  fn sim_b1_case_b_forget_healthy_skips_corrupt_keeper_and_promotes_healthy_keeper() {
+    assert_sim_b1_case_b_only_corrupt_keeper_retires_text_cleanly();
+    assert_sim_b1_case_b_promotes_healthy_seq3_past_corrupt_seq2();
+  }
+
+  /// Suggestion 3a: intact record 0 at `preamble_len` succeeds on the fast path without scanning
+  /// `C` rows (even when `rows` contains a malformed `C` entry).
+  fn assert_s3_fast_path_skips_c_scan(seal: [u8; SEAL_BYTES]) {
+    let (config, trunk) = sim_db_config();
+    let (log_a, rows_a_file, applied_a, _) =
+      build_sealed_sim_store(300, seal, &[b"healthy record 0"]);
+    log_a
+      .inject(Fault::BitFlip {
+        offset: 4,
+        bit: 0,
+        stored: true,
+      })
+      .unwrap();
+    let (mut rows_a, _) = ShardDb::open(rows_a_file, config, 1 << 20, trunk).unwrap();
+    rows_a
+      .put(&super::super::changeset_key(99, 99), b"bad")
+      .unwrap();
+    assert!(
+      prepare_damaged_preamble_log(log_a, Some((rows_a, applied_a, config.page_size))).is_ok(),
+      "fast path at preamble_len must succeed without scanning C rows"
+    );
+  }
+
+  /// Suggestion 3b: damaged record 0 + malformed `C` row preceding healthy record 1's `C` row
+  /// skips the malformed row in `max_row_offset_in_page` instead of aborting repair.
+  fn assert_s3_resilient_hint_skips_bad_c_row(seal: [u8; SEAL_BYTES]) {
+    let (config, trunk) = sim_db_config();
+    let (log_b, rows_b_file, applied_b, recs_b) =
+      build_sealed_sim_store(301, seal, &[b"damaged record 0", b"healthy record 1"]);
+    log_b
+      .inject(Fault::BitFlip {
+        offset: 4,
+        bit: 0,
+        stored: true,
+      })
+      .unwrap();
+    log_b
+      .inject(Fault::BitFlip {
+        offset: recs_b[0].offset + 12,
+        bit: 1,
+        stored: true,
+      })
+      .unwrap();
+    let (mut rows_b, _) = ShardDb::open(rows_b_file, config, 1 << 20, trunk).unwrap();
+    rows_b
+      .put(&super::super::changeset_key(0, 0), b"bad")
+      .unwrap();
+    assert!(
+      prepare_damaged_preamble_log(log_b, Some((rows_b, applied_b, config.page_size))).is_ok(),
+      "max_row_offset_in_page must skip malformed C rows instead of aborting repair"
+    );
+  }
+
+  /// Suggestion 3c: damaged record 0 carrying a same-seal record with a DIFFERENT grant (`999`)
+  /// embedded inside payload bytes while `rows` holds standing grant `7` is rejected via
+  /// `expected_grant` during `resync_from`.
+  fn assert_s3_foreign_grant_rejected_on_resync(seal: [u8; SEAL_BYTES]) {
+    let (config, trunk) = sim_db_config();
+    let start = to_u64(SEAL_PREAMBLE_BYTES);
+    let nested_off = start + to_u64(HEADER_BYTES + SECTION_HEAD_BYTES);
+    let foreign_src = sim_file(303);
+    foreign_src
+      .write_all_at(&vec![0u8; usize::try_from(nested_off).unwrap()], 0)
+      .unwrap();
+    foreign_src.sync_data().unwrap();
+    let mut f_log =
+      ChangesetLog::recover_sealed(foreign_src, nested_off, seal, None, |_, _| {}).unwrap();
+    let foreign_rec = append_sim_with_grant(&mut f_log, 1, 999, b"foreign grant record");
+    let foreign_img = f_log.into_file().durable_image().unwrap();
+    let embedded = &foreign_img
+      [usize::try_from(foreign_rec.offset).unwrap()..usize::try_from(foreign_rec.end()).unwrap()];
+
+    let foreign_log = sim_file(302);
+    foreign_log
+      .write_all_at(&encode_seal_preamble(&seal), 0)
+      .unwrap();
+    foreign_log.sync_data().unwrap();
+    let mut carrier_log =
+      ChangesetLog::recover_sealed(foreign_log, start, seal, None, |_, _| {}).unwrap();
+    let carrier = append_sim_with_grant(&mut carrier_log, 1, 7, embedded);
+    assert_eq!(
+      carrier_log.sections(&carrier).unwrap()[0].offset,
+      nested_off
+    );
+    let carrier_file = carrier_log.into_file();
+    carrier_file
+      .inject(Fault::BitFlip {
+        offset: 4,
+        bit: 0,
+        stored: true,
+      })
+      .unwrap();
+    carrier_file
+      .inject(Fault::BitFlip {
+        offset: carrier.offset + 12,
+        bit: 1,
+        stored: true,
+      })
+      .unwrap();
+    let mut rows_c = ShardDb::create(sim_file(304), config, 1 << 20, trunk).unwrap();
+    rows_c.put(&[super::super::SEAL_ROW], &seal).unwrap();
+    let mut gkey = [0u8; super::super::GRANT_KEY_BYTES];
+    super::super::put(&mut gkey, 0, &[super::super::GRANTS]);
+    super::super::put(&mut gkey, super::super::AFTER_TAG, &7u64.to_be_bytes());
+    rows_c
+      .put(&gkey, &[0u8; super::super::GRANT_VALUE_BYTES])
+      .unwrap();
+    let refused =
+      prepare_damaged_preamble_log(carrier_file, Some((rows_c, start, config.page_size)));
+    assert!(
+      matches!(
+        refused,
+        Err(StoreError::Log(LogError::Corrupt("a store seal preamble")))
+      ),
+      "foreign-grant embedded record must be rejected via expected_grant, got {:?}",
+      refused.err()
+    );
+  }
+
+  /// Round-6 Suggestion 3 (`SimFile` oracle): Do: exercise (a) record-0 fast path skipping `C`
+  /// scan, (b) resilient `max_row_offset_in_page` skipping malformed `C` rows, and (c)
+  /// `expected_grant` rejecting an embedded foreign-grant record during `resync_from`.
+  /// Expect: (a) and (b) repair cleanly; (c) refuses `Corrupt("a store seal preamble")`.
+  #[test]
+  fn sim_s3_damaged_preamble_fast_path_resilient_hint_and_foreign_grant_rejection() {
+    let seal = [0x66u8; SEAL_BYTES];
+    assert_s3_fast_path_skips_c_scan(seal);
+    assert_s3_resilient_hint_skips_bad_c_row(seal);
+    assert_s3_foreign_grant_rejected_on_resync(seal);
   }
 }

@@ -44,8 +44,8 @@ use slates_land::store_root::{StoreRoot, StoreRootRefusal};
 
 use crate::log::{
   Appending, ChangesetLog, Header, Located, LogError, SEAL_BYTES, SEAL_PREAMBLE_BYTES,
-  SealPreamble, Section, SectionKind, decode_seal_preamble, encode_seal_preamble, sections_in,
-  verified_identity_of_section, verify_seal_matches_log,
+  SealPreamble, Section, SectionKind, decode_seal_preamble, encode_seal_preamble,
+  has_valid_record_at, sections_in, verified_identity_of_section, verify_seal_matches_log,
 };
 use crate::staging::{Identity, Staging};
 
@@ -112,6 +112,10 @@ const ROW_OVERHEAD: usize = 1 + 1 + 1;
 const CHANGESET_ENTRY_BYTES: usize = KEY_BYTES + VALUE_BYTES + ROW_OVERHEAD;
 /// Format: mantle's minimum trunk fanout and leaf entry count (`mantle_engine/src/trunk/mod.rs`).
 const MIN_TRUNK_DEGREE: usize = 2;
+/// Derived: fewest engine extents [`Store::open`] requires before any changeset lands: one
+/// superblock extent, one initial trunk extent, and one initial grant/seal checkpoint extent
+/// written by [`Store::record_grant`].
+const MIN_STORE_EXTENTS: u64 = 3;
 
 /// What the store may hold, from its caller: the memory its shard lends it and the disk its grant allows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,7 +302,7 @@ impl Store {
         replayed = put_rows_from_log(
           &mut rows,
           file,
-          &seal,
+          (&seal, page_size),
           located,
           (&mut value, &mut buffer),
           &mut corrupt_rows_skipped,
@@ -474,7 +478,7 @@ impl Store {
     put_rows_from_log(
       &mut self.rows,
       self.log.file(),
-      &seal,
+      (&seal, self.page_size),
       located,
       (&mut self.value, &mut buffer),
       &mut self.corrupt_rows_skipped,
@@ -528,7 +532,7 @@ impl Store {
     if !put_changeset_counted(
       &mut self.rows,
       self.log.file(),
-      &seal,
+      (&seal, self.page_size),
       located,
       &mut self.value,
       &mut self.corrupt_rows_skipped,
@@ -733,42 +737,14 @@ impl Store {
   /// # Errors
   /// [`StoreError::BadRow`] for a row or section that does not decode; the log's and the engine's refusals.
   pub fn forget(&mut self, repository: u128, sequence: u64) -> Result<u64, StoreError> {
-    let key = changeset_key(repository, sequence);
-    let Some(row) = changeset_row(&mut self.rows, &key)? else {
-      return Ok(0);
-    };
-    let mut forgotten = 0_u64;
     let mut buffer = Vec::new();
-    for section in self.sections(&row)? {
-      match section.kind {
-        SectionKind::Payload => {
-          forgotten = forgotten.saturating_add(forget_payload_section(
-            &mut self.rows,
-            self.log.file(),
-            &section,
-            self.page_size,
-            (&mut self.value, &mut buffer),
-          )?);
-        }
-        SectionKind::Texts => {
-          let entries = section_texts(self.log.file(), &section, &mut buffer)?;
-          let Store { rows, log, .. } = self;
-          let mut entries_of = |rows: &mut ShardDb<DeviceFile>, keeper: u64| {
-            texts_of_changeset(rows, log, repository, keeper)
-          };
-          forgotten = forgotten.saturating_add(crate::texts::forget_rows(
-            rows,
-            (repository, sequence),
-            &entries,
-            &mut entries_of,
-          )?);
-        }
-        _ => {}
-      }
-    }
-    self.rows.delete(&key)?;
-    self.rows.checkpoint(self.log.end())?;
-    Ok(forgotten.saturating_add(1))
+    forget_changeset(
+      &mut self.rows,
+      &self.log,
+      (repository, sequence),
+      self.page_size,
+      (&mut self.value, &mut buffer),
+    )
   }
 
   /// Checkpoints the engine at the log's end, so a recovery replays only what lands after.
@@ -872,6 +848,9 @@ fn prepare_sealed_log<F: BlockFile>(
       return Err(StoreError::Log(LogError::Corrupt("a store seal mismatch")));
     }
     Some(_) => false,
+    None if applied > 0 => {
+      return Err(StoreError::Log(LogError::Corrupt("a store seal mismatch")));
+    }
     None => {
       rows.put(&[SEAL_ROW], &seal)?;
       true
@@ -897,21 +876,38 @@ fn has_changeset_rows<F: BlockFile>(rows: &mut ShardDb<F>) -> Result<bool, Store
   Ok(found.get(0).is_some())
 }
 
+/// Reads the standing grant id (`G` row) from `rows` when exactly one is recorded; returns `None`
+/// if zero or multiple grants exist (e.g. a store copied across directories).
+fn read_grant_row<F: BlockFile>(rows: &mut ShardDb<F>) -> Result<Option<u64>, StoreError> {
+  let start = [GRANTS];
+  let end = [GRANTS.saturating_add(1)];
+  let mut found = Rows::new();
+  // Shape: read at most two grant rows so a single-grant store filters resync by its grant while
+  // a multi-grant store (copied across directories) returns `None`.
+  rows.scan(&start, Some(&end), 2, &mut found, &mut Vec::new())?;
+  if found.len() != 1 {
+    return Ok(None);
+  }
+  let Some((key, _)) = found.get(0) else {
+    return Ok(None);
+  };
+  if key.len() != GRANT_KEY_BYTES {
+    return Ok(None);
+  }
+  Ok(field(key, AFTER_TAG).map(u64::from_be_bytes))
+}
+
 /// Updates `newest` with the largest changeset row offset in `[preamble_len, file_len)` present in
-/// one scanned `page`.
-fn max_row_offset_in_page(
-  page: &Rows,
-  preamble_len: u64,
-  file_len: u64,
-  newest: &mut Option<u64>,
-) -> Result<(), StoreError> {
+/// one scanned `page`, skipping any malformed `C` row instead of aborting preamble repair.
+fn max_row_offset_in_page(page: &Rows, preamble_len: u64, file_len: u64, newest: &mut Option<u64>) {
   for (key, entry) in page.iter() {
-    let row = decode_changeset(key, entry)?;
+    let Ok(row) = decode_changeset(key, entry) else {
+      continue;
+    };
     if (preamble_len..file_len).contains(&row.offset) {
       *newest = Some(newest.map_or(row.offset, |prev| prev.max(row.offset)));
     }
   }
-  Ok(())
 }
 
 /// Finds the largest changeset row offset in `[preamble_len, file_len)` stored in `rows` to use as
@@ -934,7 +930,7 @@ fn newest_changeset_offset<F: BlockFile>(
   loop {
     page.clear();
     let more = rows.scan(&start, Some(&end), per_page, &mut page, &mut next)?;
-    max_row_offset_in_page(&page, preamble_len, file_len, &mut newest)?;
+    max_row_offset_in_page(&page, preamble_len, file_len, &mut newest);
     if !more {
       return Ok(newest);
     }
@@ -944,7 +940,8 @@ fn newest_changeset_offset<F: BlockFile>(
 
 /// Verifies that `log_file` genuinely belongs to `rows`'s backup `seal` before repairing a damaged
 /// `SLSE` preamble: empty-payload logs require `applied == SEAL_PREAMBLE_BYTES` with zero `C`
-/// rows, and non-empty logs require at least one committed record verifying under `seal`.
+/// rows, and non-empty logs check record 0 at `preamble_len` first (zero `C`-row scan on the
+/// common path) before falling back to a resilient `C`-row hint and grant-filtered linear resync.
 fn verify_damaged_preamble_match<F: BlockFile>(
   log_file: &F,
   rows: &mut ShardDb<F>,
@@ -957,8 +954,12 @@ fn verify_damaged_preamble_match<F: BlockFile>(
     }
     return Ok(());
   }
+  if has_valid_record_at(log_file, (preamble_len, file_len), seal)? {
+    return Ok(());
+  }
   let hint = newest_changeset_offset(rows, preamble_len, file_len, page_size)?;
-  if !verify_seal_matches_log(log_file, file_len, seal, hint)? {
+  let expected_grant = read_grant_row(rows)?;
+  if !verify_seal_matches_log(log_file, file_len, (seal, expected_grant), hint)? {
     return Err(StoreError::Log(LogError::Corrupt("a store seal preamble")));
   }
   Ok(())
@@ -1164,7 +1165,7 @@ fn open_store_files(
 }
 
 /// Pure sizing derivation for `page_size`: checks extent pages (`>= 2`), disk allowance
-/// (`>= 2` extents), memory (`>= 2` leaf entries), and trunk fanout (`>= 2`).
+/// (`>= MIN_STORE_EXTENTS`), memory (`>= 2` leaf entries), and trunk fanout (`>= 2`).
 fn engine_sizing_for_page(
   page_size: usize,
   sizing: Sizing,
@@ -1182,9 +1183,9 @@ fn engine_sizing_for_page(
   let max_extents = sizing
     .disk
     .checked_div(extent_bytes)
-    .filter(|extents| *extents > 1)
+    .filter(|extents| *extents >= MIN_STORE_EXTENTS)
     .ok_or(StoreError::Sizing(
-      "a disk allowance under two extents (the superblocks' and one of rows)",
+      "a disk allowance under three extents (superblocks, initial trunk, and initial grant checkpoint)",
     ))?;
   let min_entries =
     u64::try_from(MIN_TRUNK_DEGREE).map_err(|_| StoreError::Sizing("no memory for a row"))?;
@@ -1270,10 +1271,129 @@ fn forget_payload_section<F: BlockFile>(
         section.offset,
         section.len
       );
-      payloads::forget_by_offset(rows, section.offset, section.len, page_size)
+      payloads::forget_by_offset(rows, section.offset, page_size)
     }
     Err(error) => Err(error.into()),
   }
+}
+
+/// Forgets one `Texts` section during [`Store::forget`]: uses the fast [`crate::texts::forget_rows`]
+/// path when the section's CRC-32C verifies on disk, and falls back to bounded repository-scoped
+/// cleanup via [`crate::texts::forget_rows_by_sequence`] when damaged.
+fn forget_texts_section<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  log: &ChangesetLog<F>,
+  (repository, sequence): (u128, u64),
+  (section, page_size): (&Section, usize),
+  buffer: &mut Vec<u8>,
+) -> Result<u64, StoreError> {
+  let mut entries_of =
+    |rows: &mut ShardDb<F>, keeper: u64| texts_of_changeset(rows, log, repository, keeper);
+  match section_texts(log.file(), section, buffer) {
+    Ok(entries) => {
+      crate::texts::forget_rows(rows, (repository, sequence), &entries, &mut entries_of)
+    }
+    Err(StoreError::Log(LogError::Corrupt(what))) => {
+      slates_machine::log_line!(
+        "slates-store: forget cleaned damaged texts section repo={repository} seq={sequence} offset={} ({what})",
+        section.offset
+      );
+      crate::texts::forget_rows_by_sequence(
+        rows,
+        (repository, sequence),
+        page_size,
+        &mut entries_of,
+      )
+    }
+    Err(error) => Err(error),
+  }
+}
+
+/// Fallback cleanup when a forgotten changeset's record header or section heads fail verification
+/// on disk: removes all `P`/`B` rows in `[row.offset, row.offset + row.len)` and all `K`/`H`/`T`/`I`
+/// rows of `(row.repository, row.sequence)`.
+fn forget_corrupt_record<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  log: &ChangesetLog<F>,
+  row: &Changeset,
+  page_size: usize,
+) -> Result<u64, StoreError> {
+  let range = (row.offset, row.offset.saturating_add(row.len));
+  let payload_rows = payloads::forget_by_offset_range(rows, range, page_size)?;
+  let mut entries_of =
+    |rows: &mut ShardDb<F>, keeper: u64| texts_of_changeset(rows, log, row.repository, keeper);
+  let text_rows = crate::texts::forget_rows_by_sequence(
+    rows,
+    (row.repository, row.sequence),
+    page_size,
+    &mut entries_of,
+  )?;
+  Ok(payload_rows.saturating_add(text_rows))
+}
+
+/// Forgets every `Payload` and `Texts` section of a record whose section heads decoded cleanly.
+fn forget_record_sections<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  log: &ChangesetLog<F>,
+  (repository, sequence): (u128, u64),
+  (sections, page_size): (&[Section], usize),
+  (value, buffer): (&mut Vec<u8>, &mut Vec<u8>),
+) -> Result<u64, StoreError> {
+  let mut forgotten = 0_u64;
+  for section in sections {
+    let changed = match section.kind {
+      SectionKind::Payload => {
+        forget_payload_section(rows, log.file(), section, page_size, (value, buffer))?
+      }
+      SectionKind::Texts => forget_texts_section(
+        rows,
+        log,
+        (repository, sequence),
+        (section, page_size),
+        buffer,
+      )?,
+      _ => 0,
+    };
+    forgotten = forgotten.saturating_add(changed);
+  }
+  Ok(forgotten)
+}
+
+/// Generic implementation of [`Store::forget`] over any [`BlockFile`]: cleans every indexed row
+/// (`P`, `B`, `K`, `H`, `T`, `I`, `C`) and checkpoints `rows` at `log.end()`, falling back cleanly
+/// to offset-range and sequence scans whenever the record, payload, or `Texts` section is corrupt.
+fn forget_changeset<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  log: &ChangesetLog<F>,
+  (repository, sequence): (u128, u64),
+  page_size: usize,
+  (value, buffer): (&mut Vec<u8>, &mut Vec<u8>),
+) -> Result<u64, StoreError> {
+  let key = changeset_key(repository, sequence);
+  let Some(row) = changeset_row(rows, &key)? else {
+    return Ok(0);
+  };
+  let seal = log.seal();
+  let forgotten = match sections_of(log.file(), log.end(), &seal, &row) {
+    Ok(sections) => forget_record_sections(
+      rows,
+      log,
+      (repository, sequence),
+      (&sections, page_size),
+      (value, buffer),
+    )?,
+    Err(StoreError::Log(LogError::Corrupt(what))) => {
+      slates_machine::log_line!(
+        "slates-store: forget cleaned damaged changeset record repo={repository} seq={sequence} offset={} ({what})",
+        row.offset
+      );
+      forget_corrupt_record(rows, log, &row, page_size)?
+    }
+    Err(error) => return Err(error),
+  };
+  rows.delete(&key)?;
+  rows.checkpoint(log.end())?;
+  Ok(forgotten.saturating_add(1))
 }
 
 /// The `Texts` entries of a committed record's section `section`, read whole from `file` into
@@ -1669,12 +1789,19 @@ fn read_verified_span_with<F: BlockFile>(
 fn put_rows_from_log<F: BlockFile>(
   rows: &mut ShardDb<F>,
   file: &F,
-  seal: &[u8; SEAL_BYTES],
+  (seal, page_size): (&[u8; SEAL_BYTES], usize),
   located: &Located,
   (value, buffer): (&mut Vec<u8>, &mut Vec<u8>),
   corrupt_rows_skipped: &mut u64,
 ) -> Result<(), StoreError> {
-  if !put_changeset_counted(rows, file, seal, located, value, corrupt_rows_skipped)? {
+  if !put_changeset_counted(
+    rows,
+    file,
+    (seal, page_size),
+    located,
+    value,
+    corrupt_rows_skipped,
+  )? {
     return Ok(());
   }
   for section in sections_in(file, located)? {
@@ -1710,20 +1837,62 @@ fn put_changeset<F: BlockFile>(
   put_changeset_counted(
     rows,
     file,
-    &crate::log::UNSEALED,
+    (&crate::log::UNSEALED, MIN_PAGE),
     located,
     value,
     &mut skipped,
   )
 }
 
+/// Releases payload and block-digest rows owned by a replaced changeset `previous`, falling back
+/// to bounded offset-range cleanup via [`payloads::forget_by_offset_range`] when `previous`'s log
+/// record or payload fails verification so healthy sibling duplicates are promoted cleanly.
+fn forget_replaced_payloads<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  file: &F,
+  (end, seal, page_size): (u64, &[u8; SEAL_BYTES], usize),
+  previous: &Changeset,
+  value: &mut Vec<u8>,
+  corrupt_rows_skipped: &mut u64,
+) -> Result<(), StoreError> {
+  match payloads::visit(
+    file,
+    (end, seal),
+    previous,
+    &mut Vec::new(),
+    |identity, offset, _| {
+      payloads::forget(rows, identity, offset, value)?;
+      Ok(())
+    },
+  ) {
+    Ok(()) => Ok(()),
+    Err(StoreError::Log(LogError::Corrupt(what))) => {
+      *corrupt_rows_skipped = corrupt_rows_skipped.saturating_add(1);
+      slates_machine::log_line!(
+        "slates-store: put_changeset cleaned corrupt replaced changeset row repo={} seq={} offset={} ({what})",
+        previous.repository,
+        previous.sequence,
+        previous.offset
+      );
+      let range = (
+        previous.offset,
+        previous.offset.saturating_add(previous.len),
+      );
+      payloads::forget_by_offset_range(rows, range, page_size)?;
+      Ok(())
+    }
+    Err(error) => Err(error),
+  }
+}
+
 /// Names this record at its sequence and releases the payload places of any record it replaces,
-/// logging and counting any replaced row whose prior log entry no longer verifies.
-/// Returns false when a later landing already owns the sequence, so retrying the older apply writes no rows.
+/// logging, counting, and cleaning by offset range any replaced row whose prior log entry no
+/// longer verifies. Returns false when a later landing already owns the sequence, so retrying the
+/// older apply writes no rows.
 fn put_changeset_counted<F: BlockFile>(
   rows: &mut ShardDb<F>,
   file: &F,
-  seal: &[u8; SEAL_BYTES],
+  (seal, page_size): (&[u8; SEAL_BYTES], usize),
   located: &Located,
   value: &mut Vec<u8>,
   corrupt_rows_skipped: &mut u64,
@@ -1737,28 +1906,14 @@ fn put_changeset_counted<F: BlockFile>(
       std::cmp::Ordering::Equal => return Ok(true),
       std::cmp::Ordering::Less => {
         // A retried creation can reuse a sequence. Only the newly named record can keep payloads there.
-        match payloads::visit(
+        forget_replaced_payloads(
+          rows,
           file,
-          (located.offset, seal),
+          (located.offset, seal, page_size),
           &previous,
-          &mut Vec::new(),
-          |identity, offset, _| {
-            payloads::forget(rows, identity, offset, value)?;
-            Ok(())
-          },
-        ) {
-          Ok(()) => {}
-          Err(StoreError::Log(LogError::Corrupt(what))) => {
-            *corrupt_rows_skipped = corrupt_rows_skipped.saturating_add(1);
-            slates_machine::log_line!(
-              "slates-store: put_changeset skipped corrupt replaced changeset row repo={} seq={} offset={} ({what})",
-              previous.repository,
-              previous.sequence,
-              previous.offset
-            );
-          }
-          Err(error) => return Err(error),
-        }
+          value,
+          corrupt_rows_skipped,
+        )?;
       }
     }
   }

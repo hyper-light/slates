@@ -1467,14 +1467,24 @@ fn is_valid_record_at<F: BlockFile>(
   ))
 }
 
+/// Returns `true` when `offset` starts a valid committed record in `file` under `seal`.
+pub(crate) fn has_valid_record_at<F: BlockFile>(
+  file: &F,
+  (offset, file_len): (u64, u64),
+  seal: &[u8; SEAL_BYTES],
+) -> Result<bool, LogError> {
+  let mut verify_buf = Vec::new();
+  is_valid_record_at(file, (offset, file_len), seal, &mut verify_buf)
+}
+
 /// Returns `true` when at least one committed record in `[SEAL_PREAMBLE_BYTES, file_len)` of
-/// `file` verifies as [`Verify::Valid`] under `seal`: checks offset [`SEAL_PREAMBLE_BYTES`]
-/// first, then optional `hint_offset` (from `rows`), and finally scans linearly with
-/// [`resync_from`] in case the leading record was damaged alongside the preamble.
+/// `file` verifies as [`Verify::Valid`] under `seal`: checks `hint_offset` (from `rows`) first
+/// when present, and falls back to linear [`resync_from`] filtered by `expected_grant` when the
+/// leading record was damaged alongside the preamble.
 pub(crate) fn verify_seal_matches_log<F: BlockFile>(
   file: &F,
   file_len: u64,
-  seal: &[u8; SEAL_BYTES],
+  (seal, expected_grant): (&[u8; SEAL_BYTES], Option<u64>),
   hint_offset: Option<u64>,
 ) -> Result<bool, LogError> {
   let preamble_len = u64::try_from(SEAL_PREAMBLE_BYTES).map_err(|_| LogError::TooLarge)?;
@@ -1482,9 +1492,6 @@ pub(crate) fn verify_seal_matches_log<F: BlockFile>(
     return Ok(false);
   }
   let mut verify_buf = Vec::new();
-  if is_valid_record_at(file, (preamble_len, file_len), seal, &mut verify_buf)? {
-    return Ok(true);
-  }
   if let Some(hint) = hint_offset.filter(|off| *off > preamble_len && *off < file_len)
     && is_valid_record_at(file, (hint, file_len), seal, &mut verify_buf)?
   {
@@ -1495,7 +1502,7 @@ pub(crate) fn verify_seal_matches_log<F: BlockFile>(
     resync_from(
       file,
       (preamble_len, file_len),
-      (seal, None),
+      (seal, expected_grant),
       (&mut scan_buf, &mut verify_buf),
     )?
     .is_some(),

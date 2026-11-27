@@ -3170,13 +3170,11 @@ async fn start_segment_land(
   #[cfg(not(test))]
   let must_sync = false;
   if !must_sync && let Ok((tx, rx)) = slates_rt::sync::channel::<bool>(1) {
-    let key = u128::from_be_bytes(repository.bytes);
-    let spawned = slates_rt::futures::spawn_detached(async move {
-      let ok = disk.land(header, parts).await.is_ok();
-      if tx.try_send(ok).is_err() && ok {
-        let _ = disk.forget(key, sequence).await;
-      }
-    });
+    let spawned = slates_rt::futures::spawn_detached(land_or_forget_segment(
+      (disk, header, parts),
+      repository,
+      tx,
+    ));
     if spawned.is_ok() {
       *in_flight = Some(InFlightSegment {
         segment,
@@ -3197,6 +3195,26 @@ async fn start_segment_land(
   #[cfg(test)]
   super::hg_run::parked_for_a_crash(run).await;
   Some(Ok(()))
+}
+
+/// Lands one Mercurial segment on `disk` and forgets it (logging if cleanup refuses) when the
+/// caller cancelled before receiving the outcome.
+async fn land_or_forget_segment(
+  (disk, header, parts): super::hg_run::SegmentChangeset,
+  repository: RepositoryId,
+  tx: slates_rt::sync::Sender<bool>,
+) {
+  let sequence = header.sequence;
+  let key = u128::from_be_bytes(repository.bytes);
+  let ok = disk.land(header, parts).await.is_ok();
+  if tx.try_send(ok).is_err()
+    && ok
+    && let Err(why) = disk.forget(key, sequence).await
+  {
+    slates_machine::log_line!(
+      "slates-server: failed to forget abandoned Mercurial segment repository={repository:?} sequence={sequence}: {why:?}"
+    );
+  }
 }
 
 /// Counter: the turns a push's segment records were written in, a turn's steps under the shard's paced turn each
