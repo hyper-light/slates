@@ -65294,7 +65294,9 @@ measured noise of the 100 figure, not a literal.
 > the same descriptors as a direct one. Linux (main's diag run 45666757721, 4-core runners, debug): through the
 > spawner 69.9 and 69.8 µs at 100 and 10,000 descriptors on x86_64, 96.9 and 98.5 on arm; direct 193.1 → 531.9 µs on
 > x86_64, 284.3 → 332.7 on arm. The runners' hard `RLIMIT_NOFILE` is 65,536, so the measure holds the most it may and
-> says so (`SPAWN-HELD`).
+> says so (`SPAWN-HELD`). Since 2026-11-27 (diag CI 10's macos-latest, whose per-process cap is about 10,240) the most is
+> also the system's own cap, less the descriptor numbers a spawn's streams need (`SPAWN_STREAMS`, 3). A count no
+> larger than the row before makes no row, and fewer than two rows skip the test, saying so.
 >
 > **Piece 2a built (2026-11-25).** `Daemon::start` starts the spawner once its runtime is built, before any client's
 > descriptor is open (`slates_ipc::spawner::start_here`: this executable with `spawner_role --exact --nocapture`; the
