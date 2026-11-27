@@ -1630,6 +1630,42 @@ pub fn in_family(green: VolumeId, repository: RepositoryId) -> bool {
   green.is_family() && green.line_key() == repository.line_key()
 }
 
+/// An operation's identity encoding ([`OperationIdentity`], A-920 13c): its own encoding, but for a repository entry's
+/// versions, each chain entry standing in as its own trailing 32-byte digest (chain entry format 6's, its bytes'), an
+/// entry too short to carry one standing in whole. What the operation's identity hashes, bounded by its versions' count,
+/// never by what each entry records.
+pub fn identity_encoding(op: &crate::op::Op) -> Vec<u8> {
+  /// Format: a chain entry's trailing digest's bytes (BLAKE3).
+  const DIGEST_BYTES: usize = 32;
+  let crate::op::Op::RepositoryAdvanced { entry } = op else {
+    return slates_wire::Wire::to_bytes(op);
+  };
+  let versions = entry
+    .versions
+    .iter()
+    .map(|version| crate::catalog::GreenVersion {
+      green: version.green,
+      version: version.version,
+      entry: version
+        .entry
+        .get(version.entry.len().saturating_sub(DIGEST_BYTES)..)
+        .unwrap_or_default()
+        .to_vec(),
+    })
+    .collect();
+  slates_wire::Wire::to_bytes(&crate::op::Op::RepositoryAdvanced {
+    entry: crate::catalog::RepositoryEntry {
+      repository: entry.repository,
+      checks: entry.checks.clone(),
+      joined: entry.joined.clone(),
+      versions,
+      names: entry.names.clone(),
+      state: entry.state.clone(),
+      objects: entry.objects.clone(),
+    },
+  })
+}
+
 #[cfg(test)]
 // proptest's strategy types carry `Arc` (D-8's harness exception).
 #[allow(clippy::disallowed_types)]
@@ -3093,40 +3129,4 @@ mod tests {
       .to_vec();
     assert_eq!(positions, vec![Some(2), Some(0), Some(1)]);
   }
-}
-
-/// An operation's identity encoding ([`OperationIdentity`], A-920 13c): its own encoding, but for a repository entry's
-/// versions, each chain entry standing in as its own trailing 32-byte digest (chain entry format 6's, its bytes'), an
-/// entry too short to carry one standing in whole. What the operation's identity hashes, bounded by its versions' count,
-/// never by what each entry records.
-pub fn identity_encoding(op: &crate::op::Op) -> Vec<u8> {
-  /// Format: a chain entry's trailing digest's bytes (BLAKE3).
-  const DIGEST_BYTES: usize = 32;
-  let crate::op::Op::RepositoryAdvanced { entry } = op else {
-    return slates_wire::Wire::to_bytes(op);
-  };
-  let versions = entry
-    .versions
-    .iter()
-    .map(|version| crate::catalog::GreenVersion {
-      green: version.green,
-      version: version.version,
-      entry: version
-        .entry
-        .get(version.entry.len().saturating_sub(DIGEST_BYTES)..)
-        .unwrap_or_default()
-        .to_vec(),
-    })
-    .collect();
-  slates_wire::Wire::to_bytes(&crate::op::Op::RepositoryAdvanced {
-    entry: crate::catalog::RepositoryEntry {
-      repository: entry.repository,
-      checks: entry.checks.clone(),
-      joined: entry.joined.clone(),
-      versions,
-      names: entry.names.clone(),
-      state: entry.state.clone(),
-      objects: entry.objects.clone(),
-    },
-  })
 }

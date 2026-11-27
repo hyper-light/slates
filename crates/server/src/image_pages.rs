@@ -15,7 +15,7 @@
 //!
 //! **The directory.** Which pages a family's coordinates lie in ([`Directory`]): rebuilt from the page pieces a
 //! recovered image carries, a coordinate in no page found the largest aligned page its neighbours leave it
-//! ([`Directory::page_of`]). A delta re-encodes only the pages its changes lie in ([`Directory::plan_dirty`]); a
+//! ([`Directory::page_of`]). A delta re-encodes only the pages its changes lie in ([`Encoder::dirty_marks`]); a
 //! checkpoint plans every page afresh ([`plan`]).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -663,14 +663,6 @@ impl Directory {
     for page in new {
       self.pages.insert(page.start, page.depth);
     }
-  }
-
-  /// The pages `coordinates` lie in, each once ([`Directory::page_of`]): what a delta re-encodes.
-  pub(crate) fn plan_dirty(&self, coordinates: impl IntoIterator<Item = u64>) -> BTreeSet<Page> {
-    coordinates
-      .into_iter()
-      .map(|coordinate| self.page_of(coordinate))
-      .collect()
   }
 }
 

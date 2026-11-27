@@ -17,7 +17,9 @@ const SPIN: Duration = Duration::from_millis(20);
 fn a_threads_user_time_grows_with_its_own_spin() {
   let Some((user_before, system_before)) = slates_rt::registry::calling_thread_user_system_ns()
   else {
-    assert!(!cfg!(target_os = "macos"), "macOS reads a thread's split");
+    if cfg!(target_os = "macos") {
+      panic!("macOS reads a thread's split");
+    }
     eprintln!("skipped: this platform keeps no per-thread user and system split read here");
     return;
   };

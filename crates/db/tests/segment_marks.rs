@@ -199,7 +199,7 @@ fn an_old_segment_is_adopted_whole_then_its_give_back_makes_its_marks_exact() {
   assert_eq!(adopted.region_marks(0).unwrap(), whole, "adopted whole");
   let (mut db, _) = recover(&mut adopted, 0, caps(), NOW_NS).unwrap();
   db.snapshot(&mut adopted).unwrap();
-  let steps = give_back_whole(&mut adopted, PAGE as usize);
+  let steps = give_back_whole(&mut adopted, usize::try_from(PAGE).unwrap());
   assert!(steps > 1, "given back a page a step");
   assert_eq!(
     adopted.region_marks(0).unwrap(),
@@ -260,10 +260,10 @@ fn a_growing_log_raises_its_mark_once_a_page() {
     let mut fresh = segment(&format!("slates-db-marks-raises-{round}"));
     let (ns, raises, tail, began_at) = append_ns(&mut fresh);
     marked_ns = marked_ns.min(ns);
-    let reached = (RING_BYTES as u64 + tail).div_ceil(PAGE) as usize;
+    let reached = usize::try_from((RING_BYTES as u64 + tail).div_ceil(PAGE)).unwrap();
     assert_eq!(
       raises,
-      reached - began_at / PAGE as usize,
+      reached - began_at / usize::try_from(PAGE).unwrap(),
       "one raise a page the tail crossed past the mark it began at"
     );
     assert_eq!(

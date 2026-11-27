@@ -580,7 +580,7 @@ mod tests {
     let large = LogEntry {
       ops: vec![crate::Op::WorkLogged {
         work: crate::catalog::VolumeId { bytes: [1; 16] },
-        entry: vec![5; 2 * PAGE as usize],
+        entry: vec![5; 2 * usize::try_from(PAGE).unwrap()],
       }],
     };
     STOP_AFTER_RECORD.with(|stop| stop.set(true));
