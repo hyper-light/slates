@@ -5322,6 +5322,13 @@
 >   included. Run 7 (45612515778) had passed 24 of 30 on Windows: `evo-repository` pasted the binary's Windows path into
 >   its shell's command, which took its backslashes, and the five rows after it failed on the missing repository;
 >   0e73ff11d passes the path through the environment.
+> - **All three matrices on all three runners, green (2026-11-26):** run 10 (45944507454,
+>   `diag-measurer-main-interop-linux-10` at 80eccadbd, main 8eac5188a, release slates), every leg exit 0: git 27 of 27
+>   on ubuntu-latest, ubuntu-24.04-arm and windows-latest; hg 30 of 30 on all three; svn 33 of 33 on both Linux runners
+>   over svn:// and HTTP. Run 9 (45644433352) had passed Windows git 23 of 27: `GIT_SSH_COMMAND` pasted the key's and
+>   known hosts' paths bare, and the shell took the Windows path's backslashes; 9099f5055 quotes them, and every matrix
+>   prints `unmeasured` where ps lists no resident sizes (Windows' every row had read 0 MiB). svn on Windows waits on
+>   Ada's go.
 > - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
 >   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
