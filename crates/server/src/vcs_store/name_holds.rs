@@ -41,6 +41,12 @@ pub(crate) fn freeing<T>(
   free: impl FnOnce(Option<&mut ContentStore>) -> T,
 ) -> T {
   let holds = state.greens.take_name_holds();
+  if !holds.is_empty() {
+    state.count(
+      NAME_HOLD_APPLIED_FREEING,
+      u64::try_from(holds.len()).unwrap_or(u64::MAX),
+    );
+  }
   let (unheld, answer) = super::within_budget(state, 0, |stores| {
     let unheld = apply(stores.content_mut(), holds);
     (unheld, free(stores.content_mut()))
@@ -55,6 +61,12 @@ pub(crate) fn freeing<T>(
   }
   answer
 }
+
+/// Counter: the greens' pending holds a free decision applied whole ([`freeing`]): none where every step that frees
+/// applies them a slice at a time first ([`apply_some`]; A-920: a staging's release of its brought texts applied a wide
+/// revision's 9,000 holds in one step, 4.72 ms debug, with no text to release). Format: a counter name in the daemon's
+/// status report.
+pub(crate) const NAME_HOLD_APPLIED_FREEING: &str = "merge.name_hold.applied_freeing";
 
 /// Counted for each step of [`apply_some`] that applied some of the greens' pending holds: many a wide landing shows its
 /// holds were applied a slice at a time, never all at its first free decision (A-920 7c). Format: a counter name in the
