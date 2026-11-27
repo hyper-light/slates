@@ -646,8 +646,8 @@ impl Supervisor {
   }
 
   /// Hands `name=value` to every daemon this supervisor spawns: the handoff of an endpoint the owner holds across
-  /// restarts (the client rendezvous, A-114). The owner keeps the endpoint itself alive; a descriptor it names is handed
-  /// on with [`Supervisor::hand_on_descriptor`].
+  /// restarts (the client rendezvous, A-114). The owner keeps the endpoint itself alive; on Unix, a descriptor it names
+  /// is handed on with `Supervisor::hand_on_descriptor`.
   pub fn hold_environment(&mut self, name: &str, value: String) {
     self.environment.push((name.to_owned(), value));
   }
