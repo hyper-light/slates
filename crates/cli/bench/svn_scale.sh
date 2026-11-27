@@ -35,7 +35,12 @@
 #    it (`svn cat`), and the revision's changed paths (`svn log -v`, without its author and date), recorded as one
 #    digest a run and compared across the servers at the end (main's ruling of 14:31), the file's text the same on every
 #    server;
-# 5. update-1000: the working copy taken back 1,000 revisions (untimed), then updated to the youngest.
+# 5. update-1000: the working copy taken back 1,000 revisions (untimed), then updated to the youngest;
+# 6. concurrent clients (`concurrent.sh`, main 01a20182's ruling of 2026-11-27 15:02), before update-1000: N checkouts
+#    of trunk at once, each one's tree the single client's at the youngest revision (`concurrent-checkout`); N copies of
+#    the working copy updating at once to one more revision committed before them, each then holding it
+#    (`concurrent-update`). N derived from the machine, the wall time, each client's median and most and the server's
+#    peak resident memory recorded.
 #
 # svn runs with its own empty configuration directory, never prompts, and speaks C. Everything is written under WORK,
 # which is made empty and removed at the end; DUMP and SOURCE are only read.
@@ -97,6 +102,8 @@ timed() {
 git -C "$SOURCE" ls-tree -r --format='%(objectmode) %(objectname) %(path)' "$REF" | sed -n 's/^100[0-7]* //p' \
   | LC_ALL=C sort > "$WORK/source.files"
 echo "dataset: $DUMP, $(du -h "$DUMP" | cut -f1); $SOURCE at $(git -C "$SOURCE" rev-parse "$REF"), $(wc -l < "$WORK/source.files" | tr -d ' ') regular files"
+# shellcheck source=concurrent.sh
+. "$(dirname "$0")/concurrent.sh"
 echo "svn: $(svn --version --quiet); slates: $("$SLATES" version 2> /dev/null || echo none); svnserve: $(svnserve --version --quiet)"
 echo "machine: $(sysctl -n machdep.cpu.brand_string 2> /dev/null), $(sysctl -n hw.ncpu 2> /dev/null) cores; load: $(uptime | sed 's/.*load averages*: //')"
 
@@ -261,6 +268,58 @@ committed() {
     | shasum -a 256 | cut -d' ' -f1)" | tee -a "$RESULTS"
 }
 
+# The listing of working copy $1's regular files, each its git blob id and path, into $2 (as `check` lists one).
+listing() {
+  (cd "$1" && find . -name .svn -prune -o -type f -print | sed 's|^\./||' | LC_ALL=C sort > "$2.paths" \
+    && git hash-object --no-filters --stdin-paths < "$2.paths" | paste -d' ' - "$2.paths" | LC_ALL=C sort > "$2")
+}
+
+# The concurrent clients of server $1's run $2 (header, step 6): working copy $3 at the youngest revision, and copy $4
+# the single client committed from.
+concurrent_steps() {
+  local server=$1 run=$2
+  C_SERVER=$server C_RUN=$run C_COPY=$3 C_OTHER=$4
+  case $server in slates | slates-http) SERVER_PIDS="$ANCHOR $DAEMON" ;; *) SERVER_PIDS=$STOCK ;; esac
+  CLIENT_VARS="S AUTH URL C_RUN"
+  concurrent "$server" checkout "$run" svn_checkout_client svn_checkout_check svn_checkout_prepare
+  concurrent "$server" update "$run" svn_update_client svn_update_check svn_update_prepare
+}
+
+# The single client's tree at the youngest revision: what each checkout must hold.
+svn_checkout_prepare() { s update -q "$C_COPY" && listing "$C_COPY" "$C_DIR/expected.files"; }
+svn_checkout_client() { "${S[@]}" ${AUTH[@]+"${AUTH[@]}"} checkout -q "$URL/trunk" "$C_DIR/co-$1"; }
+svn_checkout_check() {
+  listing "$C_DIR/co-$1" "$C_DIR/co-$1.files" 2> /dev/null
+  if [ -s "$C_DIR/co-$1.files" ] && cmp -s "$C_DIR/expected.files" "$C_DIR/co-$1.files"; then
+    echo "$C_SERVER check concurrent-checkout client $1 tree identical" >> "$RESULTS"
+  else
+    echo "$C_SERVER check concurrent-checkout client $1 tree DIFFER" | tee -a "$RESULTS"
+  fi
+  rm -rf "$C_DIR/co-$1"
+}
+
+# A copy of the working copy for each of $1 clients (the probe's when 0), then one more revision committed for them to
+# update to, the same text on every server.
+svn_update_prepare() {
+  local k
+  for k in $(seq "$([ "$1" = 0 ] && echo 0 || echo 1)" "$1"); do cp -R "$C_COPY" "$C_DIR/up-$k"; done
+  s update -q "$C_OTHER"
+  C_UPDATED="an updated revision, run $C_RUN, for $1 clients"
+  echo "$C_UPDATED" > "$C_OTHER/a-699-updated-$1.txt"
+  s add -q "$C_OTHER/a-699-updated-$1.txt"
+  s commit -q -m "updated" "$C_OTHER"
+  C_UPDATED_FILE="a-699-updated-$1.txt"
+}
+svn_update_client() { "${S[@]}" ${AUTH[@]+"${AUTH[@]}"} update -q "$C_DIR/up-$1"; }
+svn_update_check() {
+  if [ "$(cat "$C_DIR/up-$1/$C_UPDATED_FILE" 2> /dev/null)" = "$C_UPDATED" ]; then
+    echo "$C_SERVER check concurrent-update client $1 updated" >> "$RESULTS"
+  else
+    echo "$C_SERVER check concurrent-update client $1 MISSED" | tee -a "$RESULTS"
+  fi
+  rm -rf "$C_DIR/up-$1"
+}
+
 # Runs the steps against the server started for run $2 ($1 its name).
 steps() {
   local server=$1 run=$2 copy="$WORK/$1-wc-$2" other="$WORK/$1-other-$2" youngest named
@@ -283,6 +342,7 @@ steps() {
   if [ -f "$copy/a-699-scale.txt" ]; then
     echo "$server incremental check updated" | tee -a "$RESULTS"
     committed "$server" "$run" "$youngest"
+    concurrent_steps "$server" "$run" "$copy" "$other"
   else
     echo "$server incremental check MISSED" | tee -a "$RESULTS"
   fi
@@ -330,7 +390,7 @@ done
 
 echo "== results (seconds; every run shown)"
 FAILED_ROWS=""
-for step in load import checkout log commit update "update-$UPDATE_SPAN"; do
+for step in load import checkout log commit update "update-$UPDATE_SPAN" concurrent-checkout concurrent-update; do
   grep -qE "^[^ ]+ $step " "$RESULTS" || continue
   for server in $SERVERS; do
   # A step only another server runs (svn's load is stock's, its import slates') is no line for this one.
@@ -342,6 +402,7 @@ for step in load import checkout log commit update "update-$UPDATE_SPAN"; do
   if ! grep "^$server $step " "$RESULTS" | grep -q " ok$"; then FAILED_ROWS="$FAILED_ROWS $server:$step"; fi
   done
 done
+concurrent_table
 echo "load at the end: $(uptime | sed 's/.*load averages*: //')"
 # A step a server ran in no run is no row; a step whose every run failed is FAILED, and fails the harness: a leg that
 # could not run must never print as a best of "-" (main's r592, every slates git and svn step failed and the round
