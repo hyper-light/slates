@@ -369,9 +369,11 @@
 >     `LOOK_MOST`), not a pace, nor the shard's overall overrun and a look timed beforehand, which main's 9 runs found
 >     short by 9 to 110 us under load (after: 0.15 ms past the pass's budget; main's runs 9 to 110 us). The lookup's
 >     test asserts the lookup's own time (`ELAPSED_MOST`, before its first look to its answer), not the test task's
->     resume after it, which main's next 9 found 2.6 to 6.2 us past; and adds its thread's time off a CPU between its
->     last wait's return and its answer (`PREEMPTED_MOST`: that stretch's wall time less the thread's CPU time), which
->     main's 16 under burners found 1.2 and 3.9 us past the rest.
+>     resume after it, which main's next 9 found 2.6 to 6.2 us past. Each finer term in turn (a pre-emption term, the
+>     thread's CPU clock read at each wait) left the lookup's own fixed cost, microseconds, over it, and the reads added
+>     cost, so the lookup's test asserts the regression itself: its own time past its bound and its waits' lateness
+>     under half a pace (`HEARTBEAT_NS / POLL_PER_PERIOD / 2`); a whole pace's sleep past the bound overruns it by 8 ms
+>     against that 5 ms. The resolution pass's test keeps its bound, which passed every run.
 >   - **OPEN, waits for Ada's word: fleet-wide repository name routing.** A node holding no copy of a repository answers
 >     `404` (the fleet test: the third node's `ls-remote` "not found"): a name resolves only where a partition holds it
 >     (D-12, no directory; D-14, no global catalog), so it cannot even form the owner's query. Not started.
