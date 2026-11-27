@@ -714,3 +714,10 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - a914 now asserts no record-barrier refusal; homing's retry stays a separate mode (1 of 3).
 - Focused set 17/17, unit tests 59/59.
 - Open: homing retry in a914; A-919's open edge (past tolerance).
+
+## 2026-11-27 09:28 PST: a914 homing shortfall, diagnosis in progress (paused: Mac on battery)
+- Run 1's log (kept: ~/.local/state/w-shared/a914-homing-retry-1.log): at the second death, home 6304571128542657093 answered the pack's put "unreadable: Truncated" after 1999 ms. The homing then ended "1 of 2 homes kept it" with 16 s of its 18 s budget left.
+- Cause in code: homes.rs put_remote and exchange_round count any undecodable reply (Err(_)) as another home wire version, and A-727 (d1a) ends a homing on that at once. The homing loop's re-rank after an install (A-912) never ran.
+- Conflict: A-727 (d1a)'s test models an older version as an empty answer, which is also what a dying peer's broken stream gives.
+- Proposed discriminator: the session's peer_reset() on that reply.
+- Uncommitted: a DIAG log of peer_reset per unreadable reply (patch: ~/.local/state/w-shared/a914-homing-diag.patch). a914 runs to catch one are not started until the Mac is on AC.
