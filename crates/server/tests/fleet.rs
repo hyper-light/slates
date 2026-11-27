@@ -38215,14 +38215,16 @@ fn a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_th
   assert!(let_go, "a let its state logs' parts go again: {bytes:?}");
 }
 
-/// A-919 (main 01a20182's start rule of 2026-11-25). Do: on a four-node `f = 1` anchored git fleet with a repository on a,
-/// push `main` and wait for both of a's remote candidates to hold it; restart a warm (its own hold of the repository's
-/// state logs rebuilt empty, as no image carries it), a still the repository's owner after it; stop one of the
-/// candidates, so the fourth node, which holds none of the logs, becomes a candidate; push on top. Expect the newcomer
-/// to adopt nothing of the logs' prefix (no position held from a read) and its read counted past tolerance: below where
-/// a's hold now begins, a counts as one gone, and the old holder alone is no quorum, so the newest surviving value is
-/// never taken for the committed one (the open edge: refused typed, the register's candidacy owed). Red without the
-/// start rule: a's empty answer named nothing there, the old holder's prefix adopted on its word alone.
+/// A-919's past-tolerance edge, closed by (C) (main 01a20182's ruling of 2026-11-27 10:57: an owner's committed floor,
+/// verified). Do: on a four-node `f = 1` anchored git fleet with a repository on a, push `main` and wait for both of a's
+/// remote candidates to hold it, so a lets the repository's state-log parts go; restart a warm (its hold of the logs
+/// rebuilt from its owed parts alone, A-921 part 3), a still the repository's owner after it; stop one of the candidates,
+/// so the fourth node, which holds none of the logs, becomes a candidate; push on top. Expect the newcomer's read never
+/// past tolerance and the names log held from its first part, as the old holder holds it: below where a's hold begins, the old holder's
+/// report alone is adopted where a's committed floor (the highest position a let go, with the chain's digest there)
+/// witnesses it; and a's parts let go again (`Daemon::state_log_parts_bytes` back to zero). Red before (C): a counted as
+/// one gone below its hold's start and the departed another, so the read went past tolerance, the newcomer adopted
+/// nothing below a's start, refused every part, and a kept its parts from then on (the open edge, A-919).
 ///
 /// A-921 (main 01a20182's rulings of 2026-11-25): a warm restart whose silence outlasts detection is a death by design,
 /// and a's takeover then leaves the scene two deaths at `f = 1`, outside the fault model (measured 1 run in 3 to 5:
@@ -38242,7 +38244,7 @@ fn a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_th
 /// each peer on its own task, and sends its edges record so too (1 run in 5 met that pass's stall once the first was
 /// fixed), so no scene is guarded against that adoption, and the test runs again.
 #[test]
-fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins() {
+fn a919_a_newcomer_holds_a_restarted_owners_let_go_prefix_on_its_committed_floor() {
   let _serial = serialize_fleet_tests();
   let Some((mut fleet, holders)) = (0..SCENE_RESTARTS).find_map(restarted_owner_scene) else {
     panic!("a was taken over at every one of {SCENE_RESTARTS} warm restarts");
@@ -38301,7 +38303,14 @@ fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_beg
     old_holder_host.is_some_and(|host| daemon.member_identity().is_ok_and(|id| id == host))
   });
   let (old_refused, old_counts) = old_holder.map_or_else(Default::default, refusals_of);
+  let old_positions = old_holder.map(|daemon| daemon.names_log_positions(fleet.repository));
   let newcomer_refused = refusals_of(&fleet.daemons[newcomer]);
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let let_go = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(fleet.daemons[0].state_log_parts_bytes()? == 0)
+  });
+  drop(observed);
+  let parts_bytes = fleet.daemons[0].state_log_parts_bytes();
   fleet.stop();
   eprintln!(
     "restarted-owner-log: holders {holders:?}; taken over {taken}; pushes {pushed:?}; the newcomer's read past \
@@ -38314,19 +38323,33 @@ fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_beg
     pushed.iter().any(Result::is_ok),
     "a push after a's warm restart landed: {pushed:?}"
   );
-  // The start rule, measured (main 01a20182's ruling of 2026-11-26 on "held 1"): every position the newcomer holds is at
-  // or above where a's restarted hold begins, so none was adopted on the old holder's word alone. The read past tolerance
-  // is recorded: a owes its held parts again after its restart (A-921's second mode), so its hold may begin at the log's
-  // oldest owed part.
-  let _ = (refused, held);
-  let at_or_above = match (&newcomer_positions, &start) {
-    (Ok(positions), Ok(Some(start))) => positions.iter().all(|position| position >= start),
-    (Ok(positions), Ok(None)) => positions.is_empty(),
-    _ => false,
-  };
+  // (C): the old holder's report below a's restarted hold start adopted on a's committed floor, so the read is never
+  // past tolerance, the newcomer holds the log from its first position, and a's parts are let go again.
+  let _ = held;
   assert!(
-    at_or_above,
-    "every newcomer position at or above a's restarted hold start: {newcomer_positions:?}, {start:?}"
+    !refused,
+    "the newcomer's read was never past tolerance: positions held {held:?}"
+  );
+  // The log's first part, as the old holder holds it whole, and below where a's restarted hold begins: adopted on a's
+  // floor alone.
+  let first = |positions: &Result<Vec<u64>, ObserveError>| {
+    positions
+      .as_ref()
+      .ok()
+      .and_then(|positions| positions.first().copied())
+  };
+  let old_first = old_positions.as_ref().and_then(first);
+  assert!(
+    first(&newcomer_positions).is_some_and(|newcomer_first| Some(newcomer_first) == old_first
+      && start
+        .as_ref()
+        .is_ok_and(|start| start.is_some_and(|start| newcomer_first < start))),
+    "the newcomer holds the names log from its first part, as the old holder does ({old_positions:?}), below a's hold \
+     start {start:?}: {newcomer_positions:?}"
+  );
+  assert!(
+    let_go,
+    "a let its state logs' parts go again: {parts_bytes:?}"
   );
 }
 
@@ -38352,7 +38375,7 @@ fn refusals_of(daemon: &Daemon) -> Refusals {
   (last, counts)
 }
 
-/// One attempt at [`a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins`]'s scene: a
+/// One attempt at [`a919_a_newcomer_holds_a_restarted_owners_let_go_prefix_on_its_committed_floor`]'s scene: a
 /// four-node anchored git fleet, `main` pushed and held by both of a's remote candidates, then a restarted warm and
 /// settled. The fleet and those candidates where a was not taken over by its restart (its fencing epoch unchanged at
 /// every other node); `None`, the attempt printed and its fleet stopped, where it was (A-921).

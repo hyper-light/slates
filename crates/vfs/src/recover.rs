@@ -117,9 +117,13 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// that had missed one refused every later part, and every push was refused). An image of 35 never carried them, so
 /// reading it as owing none would lose them without a word: no reader of 35's layout is kept, and it is refused by its
 /// version (CLAUDE.md §2.7).
+/// 37 (A-919 (C), 2026-11-27) the held replicas' image may also carry each state log's committed floor its owner keeps,
+/// a piece each (its position and the chain's digest through it), so a warm restart answers a candidate's read of the
+/// log with it. An image of 36 never carried one, and reading it as keeping none would be a floor forgotten without a
+/// word: no reader of 36's layout is kept, and it is refused by its version (CLAUDE.md §2.7).
 /// Format: the image layout version, bumped with any change to the types below, to what they may hold, or to the held
 /// replicas' image they carry.
-pub const IMAGE_VERSION: u16 = 36;
+pub const IMAGE_VERSION: u16 = 37;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]

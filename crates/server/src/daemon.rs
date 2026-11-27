@@ -11807,13 +11807,20 @@ mod tests {
   fn owe_next_part(state: &mut crate::state::ShardState, which: u8, at: usize) {
     let name = oracle_names_log(which);
     let register = name.register();
-    let from = state
+    // The log's next position, as its repository's own positions rise: past every part owed and past its committed
+    // floor (A-919 (C), main 01a20182's ruling of 2026-11-27 13:42), so a position let go is never made again.
+    let held_end = state
       .state_logs
       .parts()
       .filter(|(owed, ..)| *owed == register)
       .map(|(_, position, _)| position)
       .max()
       .unwrap_or(0);
+    let floor = state
+      .state_logs
+      .floor(register)
+      .map_or(0, |floor| floor.position);
+    let from = held_end.max(floor);
     let slates_db::catalog::LogName::State { repository, log } = name else {
       return;
     };

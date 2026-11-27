@@ -425,10 +425,14 @@
 >   bytes, refused 12,002 times; green: held 2 positions, the parts let go to 0. OWED (main): the TLC run of
 >   `FencedLedger_forget.cfg` (must hold) and `FencedLedger_forget_norule.cfg` (must fail Continuity), with the three
 >   older configurations (verdicts unchanged); the model is written, its run is not yet made.
-> - **OPEN, the open edge (A-919, the configuration's):** a newcomer whose read is past tolerance (the owner's hold
->   forgotten at its restart, the departed gone) adopts nothing, refused typed (`fleet.ledger_read.past_tolerance`),
->   and pins the owner's let-go of the register's parts. The answer is a candidate that cannot hold a register
->   leaving its candidacy. In the owner-restart test the push after was refused `unable to commit` too.
+> - **FIXED, the open edge (A-919 (C), w-shared, 2026-11-27; main 01a20182's ruling of 10:57):** a newcomer whose read
+>   was past tolerance (the owner's hold forgotten at its restart, the departed gone) adopted nothing and pinned the
+>   owner's let-go. The owner now keeps a committed floor per state log, the highest position it let go with the
+>   chain's digest, durable in its image beside its owed parts; its ledger-read answer carries it, and the fold adopts a
+>   single holder's prefix at or below it only where the digest matches (mismatch refused, a fault; uncovered refused as
+>   before). Red first: a919's owner-restart newcomer now holds the log from its first part and a's parts are let go.
+>   Model: `FencedLedger_floor_bounded` holds (TLC, 50,040,406 states, complete, bounded at one forget); the full
+>   `FencedLedger_floor`'s verdict is owed (no violation at 49.7M states when this landed).
 > - **A-921 (found by A-919's owner-restart scene; main 01a20182's rulings of 2026-11-25).** About 1 run in 3 to 5,
 >   a's warm restart outlasted detection (1.40 to 1.79 s of silence to the takeover installed): a was taken over,
 >   refuted at incarnation 1, and readmitted. A silence past detection is a death by design, and the false-death path
