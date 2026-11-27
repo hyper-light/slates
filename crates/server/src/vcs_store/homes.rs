@@ -1651,6 +1651,14 @@ pub(crate) const BEHIND_KEPT_AFTER: &str = "vcs_store.homes.behind_kept_after";
 /// Counter: a home's reply refusing this member's version, or one it could not read, its exchange failed at once
 /// (A-727 (d1a)). Format: a counter name.
 pub(crate) const REPLY_OTHER_VERSION: &str = "vcs_store.homes.reply_other_version";
+/// Counter: a home's reply to an exchange that came back with no round trip (a transport error, its stream broken as the
+/// home died), settled as no answer and its host left to ask again (A-914, `fleet::settle_replies`). Format: a counter
+/// name in the daemon's status report.
+pub(crate) const REPLY_UNANSWERED: &str = "vcs_store.homes.reply_unanswered";
+
+/// Counter: home exchanges a member was asked from the region, counted as each arrives, before any wait (A-914: a test
+/// knows a node is one of a window's homes once it was asked). Format: a counter name.
+pub(crate) const REMOTE_ASKED: &str = "vcs_store.homes.remote_asked";
 
 /// Counter: home exchanges a member served from the region (module docs, "From the region"). Format: a counter name.
 pub(crate) const REMOTE_SERVED: &str = "vcs_store.homes.remote_served";
@@ -1912,6 +1920,7 @@ pub(crate) async fn serve_remote(
   request: &[u8],
   budget_ns: u64,
 ) -> Vec<u8> {
+  let _ = crate::state::with_state(|state| state.count(REMOTE_ASKED, 1));
   let delay_ns = ANSWER_DELAY_NS.with(std::cell::Cell::get);
   if delay_ns > 0 {
     let _ = slates_rt::futures::sleep(delay_ns).await;
@@ -3813,18 +3822,40 @@ async fn exchange_round(
     }
     answers.push((host, bytes));
   };
-  let mut returned = Vec::with_capacity(replied.len());
-  for (host, reply, endpoint) in replied {
-    take(host, reply.bytes);
-    returned.push((host, endpoint));
+  // Settled as the late ones are (A-914): a home that answered (a round trip) is taken; one whose exchange ended without
+  // an answer (a deadline, a transport error, its stream broken as it died) stays left, nothing taken from its empty
+  // bytes, and its link is dialed afresh. Before, those bytes were read as another version's reply and the homing ended.
+  let asked = replied.len();
+  let (answered, _) = crate::fleet::settle_replies(replied);
+  count_unanswered(asked, answered.len());
+  for (host, bytes) in answered {
+    take(host, bytes);
   }
-  crate::fleet::return_sessions(returned);
   // A home slower than the round's stall (one waiting for its own install, A-902) answers late: its answer counts, and
   // its session goes back on its link (A-907). An unanswered one's link is dialed afresh and the host stays left.
-  for (host, bytes) in crate::fleet::settled_stragglers(stragglers).await {
+  let mut stragglers = stragglers;
+  let (late, _) = stragglers.settle().await;
+  let asked = late.len();
+  let answered = crate::fleet::settle_late(late);
+  count_unanswered(asked, answered.len());
+  for (host, bytes) in answered {
     take(host, bytes);
   }
   answered_behind
+}
+
+/// Counts the homes of `asked` an exchange's replies (timely or late) left with no answer, the `answered` aside
+/// ([`REPLY_UNANSWERED`]).
+fn count_unanswered(asked: usize, answered: usize) {
+  let unanswered = asked.saturating_sub(answered);
+  if unanswered > 0 {
+    let _ = crate::state::with_state(|state| {
+      state.count(
+        REPLY_UNANSWERED,
+        u64::try_from(unanswered).unwrap_or(u64::MAX),
+      );
+    });
+  }
 }
 
 /// Waits, within `left_ns`, for a council round to pass through this node after the `seen` counted

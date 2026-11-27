@@ -346,11 +346,33 @@
 > - **(c) A first death's prior** (w-shared, after the barrier piece below), from main's batch of 10 ambient and 10
 >   loaded runs of A-912's push test. Recorded red: the first stretched death's silence 3.99 to 5.24 s against the
 >   estimate's window of 3.3 to 3.8 s, that push refused `retry` at its homing 4 of 7.
-> - **A named debt: a914's test does not assert its second push lands.** On the learned window (16.9 to 18.7 s) it
->   landed 4 of 7; 2 refused at the record barrier (the piece below), 1 short at its homing, cause not yet seen. With
->   each death awaited to its unseating from the council (as `f = 1` needs: a second death before the first's voter was
->   replaced left 2 runs in 11 with no council), 2 of 6 landed, 4 refused at the barrier. The barrier piece adds the
->   assertion.
+> - **FIXED, the named debt: a914's second push (A-914 (d), w-shared, 2026-11-27; main 01a20182's rulings of 09:33 and
+>   09:43).** Its record-barrier refusals were A-918 B's (fixed). Its homing shortfall (1 of 7, then 1 of 3) was a
+>   home's put whose stream broke as the home died: the reply came back empty with no round trip, and `exchange_round`
+>   read it as another home wire version's (A-727 (d1a)), which ends a homing at once, 2 s into its 18 s window. Now
+>   every reply is settled by its round trip (`fleet::settle_replies`, one path for timely replies and stragglers): one
+>   with none is no answer, its host left, its link dialed afresh, and the homing waits and ranks its homes again once
+>   the death installs (A-912). Red first: `a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once`.
+>   a914 asserts its second push lands.
+> - **OPEN, found by A-914 (d)'s sweep: replies with no round trip read as answers** (to be worked when measured or
+>   blocking; main's ruling of 09:43). `TimedReply::bytes` is empty on a refusal, a deadline or a transport error, and
+>   only `round_trip_ns` says the peer answered. Of 26 readers of a `broadcast` or `request_within` reply, 20 read empty
+>   bytes as no reply. The others:
+>   1. **State changes:** `slates_cluster::commit_record_sent_as` (`cluster/src/lib.rs` ~1116) keeps every non-ack
+>      reply as an answer, and `merge_service::record_inputs_answers` (~4707) then drops a holder from the version's
+>      inputs acks on a transport failure, as if it said it no longer held them. A fleet test failing on a lost inputs
+>      ack makes this its own piece, red first.
+>   2. `owner_location::fold_replies` (~648): an empty reply is counted `REFUSED_BY_PEER`, the peer leaving `no_reply`
+>      (counters; the owner's answer unaffected).
+>   3. `moves::ask` (~1498) and `takeover::ask_pages` (~1722): an empty reply is counted `MOVE_ANSWER_UNBOUND` and
+>      `TAKEOVER_PAGE_UNBOUND` (counters; the folds unaffected).
+>   4. Unclear: `collect_ledger_promises` and `commit_record` (`cluster/src/lib.rs` ~898, ~1144, ~1277, ~1295) and
+>      `content.rs` (~3013, ~3078, ~3088): a broken child still reports, so a round can end `NotPlaced` where a holder
+>      whose stream broke may have accepted (`Uncertain`); in the server mostly the ship counters (`fleet.rs` ~12278).
+>   5. Unclear: `broadcast`'s `keep_waiting(replies.len())` (`cluster/src/lib.rs` ~839) counts a broken stream as
+>      progress toward its stall window.
+>   6. Unclear: the pre-vote rounds (`fleet.rs` ~9536, ~10151) pass every replied endpoint, broken ones too, into
+>      `drive_vote_round`.
 > - **Noted, not to fix now (main's ruling):** the learned tail from one sample is wide (about 13.3 s from a 4.5 s
 >   silence; 11 to 14 s from two). After (c), whether the tail's estimator should weight its sample count.
 > **OPEN, w-shared's next pieces (A-918 and A-919; A-912's sibling; main 01a20182's rulings of 2026-11-25): a candidate a

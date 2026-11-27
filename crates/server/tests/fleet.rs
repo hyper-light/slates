@@ -36537,34 +36537,10 @@ impl GitFleet {
     (file, bytes): (&str, &[u8]),
     branch: &str,
   ) -> Result<(), String> {
-    let dir = common::target::target_dir();
     let port = self.daemons[node]
       .vcs_http_port()
       .expect("the edge listens");
-    let header = format!("http.extraHeader=Authorization: Bearer {}", self.token);
-    let helper = token_helper(&self.token);
-    let url = format!("http://127.0.0.1:{port}/project");
-    let cloned = git_in(
-      &dir.path,
-      &[
-        "-c", &header, "-c", &helper, "clone", "-q", "-b", branch, &url, "copy",
-      ],
-    );
-    if !cloned.status.success() {
-      return Err(String::from_utf8_lossy(&cloned.stderr).into_owned());
-    }
-    commit_in(&dir, "copy", (file, bytes));
-    let work = format!("{}/copy", dir.path);
-    let refspec = format!("HEAD:refs/heads/{branch}");
-    let pushed = git_in(
-      &work,
-      &["-c", &header, "-c", &helper, "push", "-q", &url, &refspec],
-    );
-    if pushed.status.success() {
-      Ok(())
-    } else {
-      Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
-    }
+    push_on_top_at_edge((port, &self.token), (file, bytes), branch)
   }
 
   /// [`GitFleet::push`] of a fresh history to branch `branch` rather than `main`: a create of a new branch, its own green.
@@ -36957,6 +36933,124 @@ fn a894_a_repository_whose_owner_dies_as_its_creation_answers_is_taken_over_and_
 /// holds a window for the region: each push homes two windows at two of the three nodes, so a is a home of neither one
 /// time in nine, and of none after this many more pushes one time in 3^16, about 43 million.
 const PUSHES_FOR_A_HOME: usize = 8;
+
+/// A-914's homing shortfall (main 01a20182's rulings of 2026-11-27 09:33 and 09:43; a914's second push refused `retry`,
+/// 1 of 3). Do: on a three-node `f = 1` git fleet, push `main`; make b and c hold each home message they are asked a
+/// whole homing budget before they answer (`Daemon::delay_home_answers`); push on top from a, and as soon as b or c is
+/// asked a home put (`vcs_store.homes.remote_asked`: so it is one of the window's homes), stop it, its exchange broken
+/// with no answer (no round trip, a transport error, empty bytes); the other answers at once again. Expect a to read no
+/// reply as another home wire version's (`vcs_store.homes.reply_other_version` 0) and to have settled the broken one as
+/// no answer (`vcs_store.homes.reply_unanswered` at least 1), and the push to land, or be refused only once its homing
+/// waited its window out: a home that died unseen costs a round, then the homes are ranked again once its takeover
+/// installs (A-912). Red before: the empty bytes were read as another version's reply (A-727 (d1a)) and the homing ended
+/// short at once.
+#[test]
+fn a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = git_fleet("died-mid-put");
+  let first = fleet.push(0, ("first.txt", b"main before the home dies\n"));
+  let window_ns = fleet.daemons[0]
+    .homing_window()
+    .map_or(0, |reading| reading.window_ns);
+  let budget_ns = fleet.daemons[0].homing_budget_ns();
+  let asked_before: Vec<u64> = fleet.daemons[1..]
+    .iter()
+    .map(|daemon| move_counter(daemon, REMOTE_ASKED).unwrap_or(0))
+    .collect();
+  for daemon in &fleet.daemons[1..] {
+    daemon.delay_home_answers(budget_ns).unwrap();
+  }
+  let port = fleet.daemons[0].vcs_http_port().expect("the edge listens");
+  let token = fleet.token.clone();
+  let began = Instant::now();
+  let pushing = std::thread::spawn(move || {
+    push_on_top_at((port, &token), ("second.txt", b"pushed as a home dies\n"))
+  });
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let mut asked = None;
+  let found = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    asked = (1..fleet.daemons.len()).find(|node| {
+      move_counter(&fleet.daemons[*node], REMOTE_ASKED)
+        .is_ok_and(|now| now > asked_before[node.saturating_sub(1)])
+    });
+    Ok(asked.is_some())
+  });
+  drop(observed);
+  let Some(home) = asked else {
+    fleet.stop();
+    panic!("neither b nor c was asked a home put of the push ({found})");
+  };
+  fleet.daemons.remove(home).stop();
+  for daemon in &fleet.daemons[1..] {
+    daemon.delay_home_answers(0).unwrap();
+  }
+  let pushed = pushing.join().expect("the pushing thread");
+  let elapsed = began.elapsed();
+  let counts = [
+    move_counter(&fleet.daemons[0], "vcs_store.homes.reply_other_version").unwrap_or(0),
+    move_counter(&fleet.daemons[0], "vcs_store.homes.reply_unanswered").unwrap_or(0),
+  ];
+  fleet.stop();
+  eprintln!(
+    "died-mid-put: first {first:?}; home node {home} stopped once asked; pushed {pushed:?} after {elapsed:?}, window \
+     {window_ns} ns; (other version, unanswered) {counts:?}"
+  );
+  assert_eq!(first, Ok(()), "the push before the home's death landed");
+  assert!(
+    counts[0].saturating_add(counts[1]) >= 1,
+    "the dead home's broken exchange was settled one way or the other: {counts:?}"
+  );
+  assert_eq!(
+    counts[0], 0,
+    "no reply was read as another home wire version's: {counts:?}"
+  );
+  assert!(
+    pushed.is_ok() || elapsed.as_nanos() >= u128::from(window_ns),
+    "the push landed, or its homing waited its window ({window_ns} ns) out: {pushed:?} after {elapsed:?}"
+  );
+}
+
+/// [`GitFleet::push_on_top`] at the edge on `port` with `token`, needing no fleet, for a push run on a thread of its own.
+fn push_on_top_at((port, token): (u16, &str), (file, bytes): (&str, &[u8])) -> Result<(), String> {
+  push_on_top_at_edge((port, token), (file, bytes), "main")
+}
+
+/// [`GitFleet::push_on_top_of`] at the edge on `port` with `token`: cloned at `branch`, `bytes` committed as `file` on
+/// top, and pushed back to it.
+fn push_on_top_at_edge(
+  (port, token): (u16, &str),
+  (file, bytes): (&str, &[u8]),
+  branch: &str,
+) -> Result<(), String> {
+  let dir = common::target::target_dir();
+  let header = format!("http.extraHeader=Authorization: Bearer {token}");
+  let helper = token_helper(token);
+  let url = format!("http://127.0.0.1:{port}/project");
+  let cloned = git_in(
+    &dir.path,
+    &[
+      "-c", &header, "-c", &helper, "clone", "-q", "-b", branch, &url, "copy",
+    ],
+  );
+  if !cloned.status.success() {
+    return Err(String::from_utf8_lossy(&cloned.stderr).into_owned());
+  }
+  commit_in(&dir, "copy", (file, bytes));
+  let work = format!("{}/copy", dir.path);
+  let refspec = format!("HEAD:refs/heads/{branch}");
+  let pushed = git_in(
+    &work,
+    &["-c", &header, "-c", &helper, "push", "-q", &url, &refspec],
+  );
+  if pushed.status.success() {
+    Ok(())
+  } else {
+    Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
+  }
+}
+
+/// Counter: home exchanges a node was asked, counted as each arrives (`vcs_store::homes::REMOTE_ASKED`).
+const REMOTE_ASKED: &str = "vcs_store.homes.remote_asked";
 
 /// Shape: the share of a push's homing budget each home waits before it answers in
 /// [`a907_a_home_slower_than_its_senders_round_costs_the_sender_no_session`]: a quarter, past the coordinator's round
@@ -37878,15 +37972,13 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
       .is_ok_and(|reading| reading.samples >= 1 && reading.learned),
     "the second death's window came from the learned silence: {second_window:?}"
   );
-  // A-918 B: the candidate the first death brought in reads the green's chain from its cohort, so the second death's
-  // push finds its record barrier's f + 1 with it (before, refused `unable to commit` 2 of 7, then 4 of 6). Its homing
-  // may still fall short of the region's homes, refused `retry`, a mode of its own (1 of 7 then, 1 of 3 after).
-  assert!(
-    second_push
-      .as_ref()
-      .err()
-      .is_none_or(|refused| !refused.contains(BARRIER_REFUSED_ANSWER)),
-    "the push during the second death was never refused at its record barrier: {second_push:?}"
+  // A-918 B: the candidate the first death brought in reads the green's chain from its cohort, so the record barrier
+  // finds its f + 1; A-914 (d): a home whose put broke as it died is no answer, so the homing waits and ranks again
+  // once the death installs. Before, refused `unable to commit` (2 of 7, then 4 of 6) or `retry` (1 of 7, then 1 of 3).
+  assert_eq!(
+    *second_push,
+    Ok(()),
+    "the push during the second death landed"
   );
 }
 
