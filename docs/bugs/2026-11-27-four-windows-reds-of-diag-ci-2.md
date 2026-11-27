@@ -3,7 +3,7 @@
 - **Date:** found 2026-11-27 (diag CI 2, run 45986066740 at 89f01a607; windows-latest x86_64 job 140461887964,
   windows-11-arm job 140461888146); diagnosed and fixed 2026-11-27, main 01a20182's brief
   (`inbox/w-interop-from-main-windows-reds.md`).
-- **Status:** reds 2 and 3 fixed here; reds 1 and 4 diagnosed against diag CI 6's Windows lanes, below as they settle.
+- **Status:** reds 1, 2 and 3 fixed here; red 4 diagnosed against diag CI 6's Windows lanes, below as it settles.
 
 ## 3. An SSH session's steps read no CPU on Windows (product counter; arm64)
 
@@ -29,3 +29,16 @@
   restores, holds only once the shard's changes are published.
 - **Fix.** `image_split` publishes the shard (`verbs::publish_shard`) in the same step as its read. On the MacBook the
   test reads (whole 0, Away 3) against the shard's 3 lacking, and passes.
+
+## 1. The signed-work restart test read the checkpoint's count at once (test; both lanes)
+
+- **Symptom.** `a_merges_verdict_survives_a_daemon_restart`: "the floor rose past both versions, and a checkpoint folded
+  them", `merge.checkpoint.taken` 0 right after the lagging work's destroy.
+- **Cause.** Since A-579 a floor move's checkpoint takes its hold inline only within the step's quantum and the rest in
+  a task of its own, so it may land after the destroy answers: the design (main's ruling of 2026-11-27). The test read
+  the count at once.
+- **Fix.** `checkpoint_taken_past` waits for the count to rise as a user reads it, through the status counters, within
+  the client's reply deadline (the anchor's liveness budget), failing at it, so a checkpoint that never lands is still
+  caught. No hook into the product. The same suite's `expect_the_verdicts_were_the_verifiers` read it at once too and
+  waits the same way. On the MacBook `--test signed_work` passes, 13 of 13.
+

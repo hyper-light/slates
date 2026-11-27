@@ -245,7 +245,7 @@ fn revlog(
     let mut text = Vec::new();
     // A chunk is at most its text and one header byte ([`revlog_chunk::chunk`]).
     admission.charge(kept.len.saturating_add(to_u64(ENTRY_BYTES + 1)))?;
-    if write_text(&mut text, store, &kept) != kept.len {
+    if write_text(&mut text, store, &kept) != Some(kept.len) {
       return Err(unreadable());
     }
     let offset = to_u64(data.len());
@@ -1424,6 +1424,8 @@ fn obsstore(
     let marker = index.marker(store, number).ok_or_else(unreadable)?;
     let mut alone = Vec::new();
     for window in store.windows(&marker) {
+      // A window let go or not held: refused unreadable, never read as a short marker.
+      let window = window.map_err(|_| unreadable())?;
       admission.charge(to_u64(window.len()))?;
       alone.extend_from_slice(&window);
     }

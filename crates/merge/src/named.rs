@@ -64,12 +64,20 @@ pub struct Read {
   bytes: Vec<u8>,
   /// Each run's place in `bytes` (none until its first byte is read) and its bytes read so far, by the run's place.
   spans: Vec<(Option<usize>, usize)>,
+  /// The runs, from the first, read whole: every run before this one is, and this one is not (A-920: whether any run is
+  /// unread, and where a read goes on, found with no walk of the runs read before it; [`Read::advance_whole`]).
+  whole: usize,
+  /// The runs the reads' calls visited, read or passed over: about one a run and one a call where each call goes on
+  /// from the first run not read whole ([`crate::engine::Increment::read_step_among`]; A-920's non-vacuity count).
+  visited: u64,
 }
 
 /// No run read: a post-state of inline bytes alone.
 static NO_READ: Read = Read {
   bytes: Vec::new(),
   spans: Vec::new(),
+  whole: 0,
+  visited: 0,
 };
 
 impl Read {
@@ -157,8 +165,14 @@ impl Read {
         start = start.saturating_add(len);
         span
       })
-      .collect();
-    Read { bytes, spans }
+      .collect::<Vec<_>>();
+    let whole = spans.len();
+    Read {
+      bytes,
+      spans,
+      whole,
+      visited: 0,
+    }
   }
 
   /// A copy of the runs read so far, in one buffer: a held verdict's own, for its commit ([`crate::engine::Judged`]).
@@ -166,6 +180,35 @@ impl Read {
     Read {
       bytes: self.bytes.clone(),
       spans: self.spans.clone(),
+      whole: self.whole,
+      visited: self.visited,
+    }
+  }
+
+  /// The runs the reads' calls visited ([`Read::visited`]'s field): read by the test that holds the reads to going on
+  /// from the first run not read whole.
+  #[cfg(test)]
+  pub(crate) fn runs_visited(&self) -> u64 {
+    self.visited
+  }
+
+  /// One run visited by a read's call.
+  pub(crate) fn visit(&mut self) {
+    self.visited = self.visited.saturating_add(1);
+  }
+
+  /// The runs, from the first, read whole ([`Read::whole`]'s field).
+  pub(crate) fn whole_runs(&self) -> usize {
+    self.whole
+  }
+
+  /// The runs read whole, from the first, counted on past each of `runs` its bytes are all read of: amortized a step a
+  /// run over every read, each run passed once.
+  pub(crate) fn advance_whole(&mut self, runs: &[NamedRun]) {
+    while let Some(run) = runs.get(self.whole)
+      && u64::try_from(self.read_len(self.whole)).unwrap_or(u64::MAX) >= run.len
+    {
+      self.whole = self.whole.saturating_add(1);
     }
   }
 }

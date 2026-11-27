@@ -55,7 +55,7 @@ fn windows_lent_the_shards_chunk_store_read_back_in_place_and_free_their_chunks(
   assert!(
     store
       .windows(&root)
-      .all(|window| matches!(window, Cow::Borrowed(_)))
+      .all(|window| matches!(window, Ok(Cow::Borrowed(_))))
   );
   assert!(store.hand_back(&mut chunks));
   assert_eq!(

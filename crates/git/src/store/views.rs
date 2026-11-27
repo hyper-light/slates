@@ -416,15 +416,19 @@ fn count(counters: &Cell<ViewCounters>, which: impl FnOnce(&mut ViewCounters) ->
 /// when they span several.
 fn as_kept<'s>(store: &'s ContentStore, root: &ContentId, len: u64) -> Option<Cow<'s, [u8]>> {
   let mut windows = store.windows(root);
-  let first = windows.next()?;
+  let first = windows.next()?.ok()?;
   (windows.next().is_none() && to_u64(first.len()) == len).then_some(first)
 }
 
-/// The bytes the store gives for `root`, counted: what a read of an object's windows found.
+/// The bytes the store gives for `root`, counted: what a read of an object's windows found, up to the first it could
+/// not read (a window let go, or not held), so a caller holding the object's length against it sees the shortfall.
 fn stored_len(store: &ContentStore, root: &ContentId) -> u64 {
-  store.windows(root).fold(0_u64, |total, window| {
-    total.saturating_add(to_u64(window.len()))
-  })
+  store
+    .windows(root)
+    .map_while(Result::ok)
+    .fold(0_u64, |total, window| {
+      total.saturating_add(to_u64(window.len()))
+    })
 }
 
 /// A tree the store gave whose listing git's tree walk cannot read, or which is past the store's room.
