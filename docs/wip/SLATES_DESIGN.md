@@ -65115,7 +65115,24 @@ GAPS.
   - Test `a_directorys_removal_counts_its_children_a_unit_a_step` (400 files): computed alike whole and a unit a step,
     the directory removed, a child a unit; with one file kept, alike both ways and not removed. Red with the count
     unstopped: the units fewer than the children.
-  - Left in `stage.judging`: the resolution's end (`split_copies`, 5.86 ms whole), next.
+  **The resolution's end, an entry a unit** (`engine/finishing.rs`, `Finishing`). `Resolved::finish_resolving` marked
+  invalid each IPC node the work also made or removed as another kind, then split every container of the resolution
+  between the copies' trees and what stays (`split_copies`). That was eleven containers partitioned whole, renames and
+  hard links reaching a copy marked across copies, each path tested against every copy's destination: 5.86 ms of one
+  call (debug), quadratic in a revision of many copies. Now:
+  - the IPC nodes are checked from the last one checked;
+  - each container is drained in the whole split's order, every entry routed back into the resolution or into the
+    copied tree.
+  A path lies in a copy's tree exactly where the root or one of its own ancestors (itself included) is a copy's
+  destination, a lookup a level of the path. The judge's compute takes the end in a phase of its own
+  (`ComputePhase::Finishing`), an entry a unit until the step is spent, then checks the copies and begins the decision;
+  `finish_resolving` is the same end taken whole. `split_copies` and its partitions go: one implementation.
+  - Counter: `Green::resolution_ends`, the entries ends took and the units that took them.
+  - Test `a_resolutions_end_with_a_copy_is_taken_an_entry_a_unit`: a copy of `trunk` and 600 files made in and out of
+    it, computed alike whole and a unit a step, an entry a unit. Red with the end unstopped: 1,201 entries in 1 unit.
+  - Debug, after: move's `stage.judging` is out of its eight longest spans (5.8-6.4 ms before). The leaders of all
+    three wide tests now, publication aside: `stage.recording` 5.3-5.5 ms, `stage.check` 3.6-3.9, `landing.changeset`
+    2.3-2.4.
   - Left: a replay's plan is still a pass over the entry in one unit, as is the scan of the runs, linear in them. Both
     are owed their slicing by §3.
 

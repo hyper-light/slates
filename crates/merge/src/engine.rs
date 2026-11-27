@@ -1561,6 +1561,9 @@ pub struct Green {
   /// The children directory removals counted, and the units that counted them (A-920: a child a unit, never the
   /// directory's whole tree in its removal's one unit, 4.96 ms debug at 9,000 files). Cells, as `fast_path_hits` is.
   rmdir_children: std::cell::Cell<(u64, u64)>,
+  /// The entries resolutions' ends took and the units that took them (A-920: an entry a unit in a judge's steps, never
+  /// the end whole in one, 5.86 ms debug at 9,000 paths). A cell, as `fast_path_hits` is.
+  resolution_ends: std::cell::Cell<(u64, u64)>,
   /// The changed paths a commit put in a tree set of its own (A-920 3m: none, since its paths are ordered a unit at a
   /// time with no tree; 9,000 String clones and their nodes had been 0.73-0.78 ms of one step, debug).
   commit_tree_paths: u64,
@@ -2503,20 +2506,9 @@ impl Resolved {
   /// The resolution's end once every op is resolved ([`Green::resolve_some`]): each IPC node made at a path the work
   /// also does anything else at is invalid, and the copies split from what lands in their trees.
   fn finish_resolving(&mut self) {
-    for path in self.specials.keys() {
-      if self.creates.contains(path)
-        || self.content.contains_key(path)
-        || self.mkdirs.contains(path)
-        || self.symlinks.contains_key(path)
-        || self.hardlinks.contains_key(path)
-        || self.renames.contains_key(path)
-        || self.unlinks.contains(path)
-        || self.rmdirs.contains(path)
-      {
-        self.invalid.insert(path.clone());
-      }
-    }
-    self.split_copies();
+    // One end, the stepped one's: taken to its end here ([`finishing::Finishing`], an entry a unit in a judge's steps).
+    let mut finishing = finishing::Finishing::default();
+    while !finishing.step(self) {}
   }
 
   /// The paths this increment removes (unlinks, rmdirs and rename sources) — a directory removal's
@@ -4523,6 +4515,19 @@ impl Green {
         .rmdir_children
         .set((children.saturating_add(counted), units.saturating_add(1)));
     }
+  }
+
+  /// The entries resolutions' ends took and the units that took them ([`Green::resolution_ends`]'s field, A-920).
+  pub fn resolution_ends(&self) -> (u64, u64) {
+    self.resolution_ends.get()
+  }
+
+  /// One unit of a resolution's end that took `taken` entries ([`Green::resolution_ends`]).
+  fn resolution_end_noted(&self, taken: u64) {
+    let (entries, units) = self.resolution_ends.get();
+    self
+      .resolution_ends
+      .set((entries.saturating_add(taken), units.saturating_add(1)));
   }
 
   /// The effects commits walked for their node moves ([`Green::node_moves_walked`]'s field, A-920).
@@ -9608,6 +9613,7 @@ fn special_payload(
 }
 
 mod branch;
+mod finishing;
 mod node_moves;
 pub use branch::{Lent, Lineage, LineageGreen, LineageRefused, Release};
 
