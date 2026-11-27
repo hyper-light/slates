@@ -64847,6 +64847,35 @@ GAPS.
     Chunk numbers are left out: a later release lets a new work's chunk take another number.
   - Planted bug, red: a begin that does not finish the fold under way.
   - After 11a (debug), the move test's longest poll is `storing.carried`, as add's and copy's are, no longer the tail.
+  **11b, a retired scratch member's own histories let go an entry a step.** Named before the change (debug, the copy
+  test): `landing.release`'s retire (`Lineage::retire`) unseated the member, took its maps and chunks for the stepped
+  release (1-6 µs) and dropped the rest of the green whole, 5.2 ms. The largest parts of that drop:
+  - `content_history`, 3.0 ms;
+  - `deltas`, 0.58 ms;
+  - `identity_dirty`, 0.57 ms;
+  - `identity_out`, 0.51 ms;
+  - `last_changed`, 0.50 ms;
+  - `latest_change`, 0.49 ms.
+  Now the retire keeps the rest of the green in the `Release` (`remains`). Once its holds are back,
+  `Lineage::release_step` lets the green's own maps go an entry a step (`Green::let_go_entry`: its histories, its
+  deltas, its change index, its identity's sets and its records, the largest first), then drops the emptied shell.
+  `Release::is_done` waits for them.
+  - Oracle: `a_retired_branchs_own_histories_are_let_go_an_entry_a_step`. Twin lineages retire the same branch of a
+    thousand files with a hundred changed; one drops the remains whole. The stepped one takes at least a step more
+    for each changed file, and both free exactly what the branch alone held.
+  - Red: 321 steps against 321 with the remains dropped at the retire.
+  **11c, the texts a changeset carries walked a unit at a time.** Named before the change (debug, the add test):
+  `storing.carried` was `texts_carried` in one unit. It made the set of the 9,000 texts put (4.2 ms), then read the
+  9,000 rows, carrying each text once at its first path (8.1 ms). Its end and the brought texts' first part
+  (`stage.bringing`, 1.1-1.3 ms) shared a poll. Now `texts_carried` is a walk (`svn_commit::Carrying`): a text put
+  noted, or a row read, a unit; a slice of the shard's budget a step; each step counted
+  (`repository.svn_commit.carried_steps`, more than two in `t_c2c`). `stage_texts` yields after it, so the staging's
+  next part begins a step of its own. A client commit's landing walks it the same way.
+  - Oracle: `the_texts_a_changeset_carries_walked_a_unit_a_call_are_the_whole_walks`. Rows whose texts were put, one
+    whose text was not, one text at two paths and a deletion give what the old whole walk carried, in order, a unit
+    a text put and a row.
+  - In debug the walk is now the step's: the add test's longest poll is the register's op (`landing.record`, 19.2
+    ms in one run), already on file as owed.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
@@ -65304,6 +65333,23 @@ Applied in the same change to:
   before each replay, and its recompute of an hg line's second version is accepted with the owner's identity (today
   `merge.recompute_mismatch`); svn's holder path red in the same piece; the Mercurial fleet-takeover CLI test
   `#[ignore]`d with its command. Then an import's run (v9) and a single pushed or made changeset (v7), homed the same
-  way, before unit 43. Settling an attempt's holds is one region exchange an object, two a segment (about 4,200 for the
-  57k), and `homes`' settle queue is unbounded by its own size (it was two a git push).
+  way, before unit 43.
+- **The settle queue, batched and bounded** (main 01a20182's order of 2026-11-26, after piece (i): its settles were one
+  region exchange an object, two a segment, about 4,200 for the 57k, in a queue with no bound; CLAUDE.md §2 item 8).
+  Applied in the same change to:
+  - `crates/cluster/src/homes.rs`: home wire 0x86, `HomeMessage::Settle` (an attempt's holds of many objects moved or
+    let go in one message, its identity field all zeros, at most `SETTLE_MOST`, the chunk cap over 32) answered
+    `HomeOutcome::Settled { settled }`; a member of 0x85 is refused typed by the version rule.
+  - `crates/server/src/vcs_store/homes.rs`: an attempt owes one `Settle` of every object it homed (a short homing's
+    object let go with the rest); `settle_in_region` settles it with one call a home shard on this node and one message
+    a remote home (in parts of `SETTLE_MOST`); a home serves one with one call a shard, a move counted once that shard's
+    image holding it is published. Bound: `settle_bound`, `clients_per_shard × region slots` (the requests a shard holds
+    at once), over the attempts in flight and the settles owed together, so the queue never passes it; an attempt past
+    it is refused its owner, `HomeRefused::AttemptsAtBound`, counted `vcs_store.homes.attempts_at_bound`, before
+    anything is homed. A git push so refused answers `Unlanded::AttemptsAtBound`, a Mercurial push `PUSHES_AT_BOUND`,
+    each in slates' words to send it again.
+  - Held by `hg_push::tests::a_many_segment_pushs_attempt_settles_its_homed_objects_as_one` (red: 37 settles for a
+    push of 18 segments; 1 after) and `a_push_past_the_shards_attempts_bound_is_refused_typed_and_the_next_lands` (red:
+    no bound, the push accepted), the wire's `a_settle_reads_back_whole_and_a_hostile_one_is_refused_by_kind`, and git's
+    A-727 (d1a) tests, which now wait for one settle an attempt.
 - **Owed.** The release measure of the first read's wait on the 452-head history (main's probe).

@@ -2024,7 +2024,11 @@ impl SealedPush {
 
   /// Gives back the hold the store took of `identity` for a record that will never name it (its homing fell short), and
   /// the attempt's holds of it in the region, let go at every home that kept it (A-727 (d1a)).
-  pub(crate) fn release_unhomed(&self, state: &mut ShardState, identity: &slates_vcs::ContentId) {
+  pub(crate) fn release_unhomed(
+    &mut self,
+    state: &mut ShardState,
+    identity: &slates_vcs::ContentId,
+  ) {
     release_names(state, identity);
     self.attempt.release_one(*identity);
   }
@@ -2035,7 +2039,10 @@ impl SealedPush {
   }
 
   /// Who the push's holds in the region are for while it is in flight (A-727 (d1a)): this attempt, made once.
-  pub(crate) fn home_owner(&mut self, state: &ShardState) -> slates_cluster::homes::HomeOwner {
+  pub(crate) fn home_owner(
+    &mut self,
+    state: &mut ShardState,
+  ) -> Result<slates_cluster::homes::HomeOwner, homes::HomeRefused> {
     self.attempt.owner(state, self.repository.bytes)
   }
 

@@ -165,6 +165,18 @@ const UNLANDED: &[u8] = b"the push could not be landed on the repository's chang
 /// A-727's rule: no record names content not durable at `f + 1`): nothing of it is recorded, so it may be sent again.
 const HOMED_SHORT: &[u8] =
   b"the push's changeset was not made durable at its homes in the region in time: send it again";
+/// Format: slates' words for a push refused before it homed anything because the shard's pushes in flight and the
+/// settles it owes the region were at their bound (`homes::settle_bound`): nothing of it is recorded.
+const PUSHES_AT_BOUND: &[u8] =
+  b"the server has as many pushes in flight as it holds at once: send it again once they end";
+
+/// Slates' words for a push whose object's homing `refused` it ([`HOMED_SHORT`], [`PUSHES_AT_BOUND`]).
+fn unhomed_words(refused: &crate::vcs_store::homes::HomeRefused) -> &'static [u8] {
+  match refused {
+    crate::vcs_store::homes::HomeRefused::AttemptsAtBound => PUSHES_AT_BOUND,
+    _ => HOMED_SHORT,
+  }
+}
 
 /// Counter: pushes landed as a changeset on the node's changeset log (A-767 C4).
 pub(crate) const PUSH_LANDED: &str = "hg_push.landed";
@@ -2703,7 +2715,7 @@ async fn recorded(
     Err(unlanded) => {
       state.count(PUSH_UNLANDED, 1);
       let words = match unlanded {
-        super::hg_run::ListUnlanded::HomedShort => HOMED_SHORT,
+        super::hg_run::ListUnlanded::Unhomed(refused) => unhomed_words(&refused),
         _ => UNLANDED,
       };
       Err(PushOutcome::refused(&abort(words.to_vec())))
@@ -3271,9 +3283,11 @@ async fn segment_landed(
   for (identity, len) in [held.record, held.payload] {
     let source = crate::vcs_store::homes::HomeSource::Held(identity, len);
     let (homed, _) = super::hg_run::homed_for(run, source).await?;
-    if homed.is_err() {
+    if let Err(refused) = homed {
       crate::state::with_state(|state| held.given_back(state, (false, &[])))?;
-      return Some(Err(PushOutcome::refused(&abort(HOMED_SHORT.to_vec()))));
+      return Some(Err(PushOutcome::refused(&abort(
+        unhomed_words(&refused).to_vec(),
+      ))));
     }
   }
   let ok = held.landed().await.is_ok();

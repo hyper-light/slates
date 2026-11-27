@@ -79,6 +79,9 @@ pub(crate) enum HomeRefused {
   Unanswered,
   /// The home holds no such content.
   NotHeld,
+  /// This shard's attempts in flight and the settles it owes the region are at their bound ([`settle_bound`]): an attempt
+  /// begun now would owe one more past it. Refused before anything is homed, so nothing is owed for it.
+  AttemptsAtBound,
 }
 
 /// Why a home's read gave no bytes ([`read`]; module docs, "Refused"): answered to the region as the nearest kind its
@@ -1671,6 +1674,8 @@ async fn keep_put(
     Err(HomeRefused::PastWindow) => HomeOutcome::Refused(HomeRefusal::Misnamed),
     Err(HomeRefused::Content(_)) => HomeOutcome::Refused(HomeRefusal::Room),
     Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
+    // A put from the region starts no attempt: answered as the busy home it would be.
+    Err(HomeRefused::AttemptsAtBound) => HomeOutcome::Refused(HomeRefusal::Unanswered),
   }
 }
 
@@ -1970,6 +1975,10 @@ async fn outcome_of(
       let _ = crate::state::with_state(|state| state.count(REBUILT_HEARD, 1));
       ([0; 32], HomeOutcome::Owed)
     }
+    HomeMessage::Settle { settle, identities } => (
+      [0; 32],
+      settle_answer(origin, shards, (settle, identities), budget_ns).await,
+    ),
     HomeMessage::Answer { .. } => return None,
   };
   Some(answered)
@@ -2090,6 +2099,51 @@ async fn moved_answer(
   }
 }
 
+/// [`serve_remote`]'s answer to a settle of `identities` (version 0x86): each settled on its home shard among `shards`,
+/// one call a shard, asked from shard `origin`; a move counted settled only once that shard's image holding it is
+/// published ([`published`], A-727's barrier), as [`moved_answer`] counts one. `Settled` with how many were.
+async fn settle_answer(
+  origin: u16,
+  shards: &[u16],
+  (of, identities): (slates_cluster::homes::SettleOf, Vec<[u8; 32]>),
+  budget_ns: u64,
+) -> slates_cluster::homes::HomeOutcome {
+  let mut by_shard: std::collections::BTreeMap<u16, Vec<ContentId>> =
+    std::collections::BTreeMap::new();
+  for identity in identities {
+    let identity = ContentId(identity);
+    if let Some(shard) = home_of(shards, &identity) {
+      by_shard.entry(shard).or_default().push(identity);
+    }
+  }
+  let mut settled = 0u64;
+  for (shard, identities) in by_shard {
+    let done = crate::xshard::call_in_shard_time(
+      origin,
+      shard,
+      move |state| {
+        (
+          settled_here(state, of, &identities),
+          ticket_here(state.shard),
+        )
+      },
+      budget_ns,
+    )
+    .await;
+    let Some((count, ticket)) = done else {
+      continue;
+    };
+    let durable = match of {
+      slates_cluster::homes::SettleOf::Moved { .. } => published(origin, ticket, budget_ns).await,
+      slates_cluster::homes::SettleOf::LetGo { .. } => true,
+    };
+    if durable {
+      settled = settled.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+    }
+  }
+  slates_cluster::homes::HomeOutcome::Settled { settled }
+}
+
 /// [`keep_for_region`] on the home shard among `shards` of the window `bytes`, asked from shard `origin`.
 async fn keep_region_at_home(
   origin: u16,
@@ -2153,7 +2207,8 @@ std::thread_local! {
   static ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
   /// The owners' moves and let-gos this shard owes the region (A-727 (d1a)): an attempt's entry committed (its holds
   /// moved to its records) or refused (its holds let go), each made where the step is and settled off it by one task
-  /// ([`settle_owed`]) a turn at a time. Bounded by the holds its attempts in flight took.
+  /// ([`settle_owed`]) a turn at a time. One an attempt at most, whatever it homed, and bounded with the attempts in
+  /// flight by [`settle_bound`]: an attempt past it is refused its owner ([`attempt_owner`]).
   static SETTLES: std::cell::RefCell<std::collections::VecDeque<Settle>> =
     const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
   /// Whether the task settling [`SETTLES`] runs.
@@ -2237,10 +2292,36 @@ pub(crate) fn region_holds_owned() -> Vec<([u8; 32], Vec<HomeOwner>)> {
 /// own attempts, so two shards of one boot never make the same one).
 const ATTEMPT_SHARD_SHIFT: u32 = 48;
 
+/// Derived: the most attempts this shard runs and settles it owes the region at once ([`attempt_owner`], [`SETTLES`]),
+/// the requests a shard holds at once: `clients_per_shard × region slots`, each a push's attempt at most, and each attempt
+/// owing one settle at its end. So [`SETTLES`] never passes it.
+pub(crate) fn settle_bound(state: &ShardState) -> usize {
+  state
+    .config
+    .clients_per_shard
+    .saturating_mul(usize::try_from(state.config.region.slots).unwrap_or(1))
+    .max(1)
+}
+
+/// Counter: an attempt refused its owner because this shard's attempts in flight and settles owed were at their bound
+/// ([`settle_bound`]). Format: a counter name.
+pub(crate) const ATTEMPTS_AT_BOUND: &str = "vcs_store.homes.attempts_at_bound";
+
 /// A fresh owner for an attempt of repository `repository` on this shard (A-727 (d1a)): this member, its process (the
 /// process's nonce, fresh at every start: a member's SWIM incarnation starts over at each start, and a warm restart keeps
-/// its boot nonce) and a number no other attempt of this process takes.
-pub(crate) fn attempt_owner(state: &ShardState, repository: [u8; 16]) -> HomeOwner {
+/// its boot nonce) and a number no other attempt of this process takes. Refused [`HomeRefused::AttemptsAtBound`], typed
+/// and counted, where this shard's attempts in flight and the settles it owes are at [`settle_bound`]: every attempt owes
+/// at most one settle, so the settles owed stay within it.
+pub(crate) fn attempt_owner(
+  state: &mut ShardState,
+  repository: [u8; 16],
+) -> Result<HomeOwner, HomeRefused> {
+  let live = LIVE_ATTEMPTS.with(|live| live.try_borrow().map_or(0, |live| live.len()));
+  let owed = SETTLES.with(|settles| settles.try_borrow().map_or(0, |settles| settles.len()));
+  if live.saturating_add(owed) >= settle_bound(state) {
+    state.count(ATTEMPTS_AT_BOUND, 1);
+    return Err(HomeRefused::AttemptsAtBound);
+  }
   let count = ATTEMPTS.with(|attempts| {
     let count = attempts.get();
     attempts.set(count.wrapping_add(1));
@@ -2255,12 +2336,12 @@ pub(crate) fn attempt_owner(state: &ShardState, repository: [u8; 16]) -> HomeOwn
       live.insert(attempt);
     }
   });
-  HomeOwner::Attempt {
+  Ok(HomeOwner::Attempt {
     repository,
     node: state.fleet.host(),
     process: state.member_process_nonce,
     attempt,
-  }
+  })
 }
 
 /// The attempt `owner` ended on this shard (A-727 (d1a-3)): committed or refused, what it owes settled
@@ -2282,9 +2363,10 @@ pub(crate) fn resolve_owed() {
 
 /// An attempt's holds in the region (A-727 (d1a), (d1a-3)): the owner they are for, made at the attempt's first homing,
 /// and the objects homed for it. Ended once, by its record's commit ([`AttemptHolds::committed`]: each moved to the
-/// records) or its refusal ([`AttemptHolds::released`]: each let go); dropped before either (its push's task gone), it
-/// is released as a refusal would be, so no hold outlives its attempt unowed. Bounded by the objects one attempt homes
-/// (a push's names and pack).
+/// records) or its refusal ([`AttemptHolds::released`]: each let go), owed the region as one settle carrying all of them
+/// (main 01a20182's order of 2026-11-26: a Mercurial push homes two objects a segment); dropped before either (its push's
+/// task gone), it is released as a refusal would be, so no hold outlives its attempt unowed. Bounded by the objects one
+/// attempt homes (a git push's names and pack; a Mercurial push's segments' records and payloads and its list).
 #[derive(Debug, Default)]
 pub(crate) struct AttemptHolds {
   /// The attempt, once its homing began.
@@ -2294,11 +2376,19 @@ pub(crate) struct AttemptHolds {
 }
 
 impl AttemptHolds {
-  /// The attempt's owner, made at the first ask ([`attempt_owner`]).
-  pub(crate) fn owner(&mut self, state: &ShardState, repository: [u8; 16]) -> HomeOwner {
-    *self
-      .owner
-      .get_or_insert_with(|| attempt_owner(state, repository))
+  /// The attempt's owner, made at the first ask ([`attempt_owner`]): refused where the shard's attempts and settles owed
+  /// are at their bound.
+  pub(crate) fn owner(
+    &mut self,
+    state: &mut ShardState,
+    repository: [u8; 16],
+  ) -> Result<HomeOwner, HomeRefused> {
+    if let Some(owner) = self.owner {
+      return Ok(owner);
+    }
+    let owner = attempt_owner(state, repository)?;
+    self.owner = Some(owner);
+    Ok(owner)
   }
 
   /// The attempt's owner, once made.
@@ -2313,32 +2403,40 @@ impl AttemptHolds {
     }
   }
 
-  /// The attempt's hold of `identity` let go at every home that kept it: its homing fell short.
-  pub(crate) fn release_one(&self, identity: ContentId) {
-    if let Some(owner) = self.owner {
-      settle_later(Settle::Release { identity, owner });
-    }
+  /// The attempt's hold of `identity`, whose homing fell short, let go at every home that kept part of it once the
+  /// attempt ends ([`AttemptHolds::released`]), with its other holds: an attempt whose homing fell short is refused.
+  pub(crate) fn release_one(&mut self, identity: ContentId) {
+    self.homed(identity);
   }
 
-  /// The attempt's record committed: each of its holds moved to repository `repository`'s records, the attempt ended.
+  /// The attempt's record committed: each of its holds moved to repository `repository`'s records, owed as one settle,
+  /// the attempt ended.
   pub(crate) fn committed(&mut self, repository: [u8; 16]) {
     let Some(from) = self.owner.take() else {
       return;
     };
-    let to = HomeOwner::Record { repository };
-    for identity in core::mem::take(&mut self.homed) {
-      settle_later(Settle::Move { identity, from, to });
+    let identities = core::mem::take(&mut self.homed);
+    if !identities.is_empty() {
+      let to = HomeOwner::Record { repository };
+      settle_later(Settle {
+        identities,
+        of: slates_cluster::homes::SettleOf::Moved { from, to },
+      });
     }
     attempt_ended(&from);
   }
 
-  /// The attempt refused: each of its holds let go, the attempt ended.
+  /// The attempt refused: each of its holds let go, owed as one settle, the attempt ended.
   pub(crate) fn released(&mut self) {
     let Some(owner) = self.owner.take() else {
       return;
     };
-    for identity in core::mem::take(&mut self.homed) {
-      settle_later(Settle::Release { identity, owner });
+    let identities = core::mem::take(&mut self.homed);
+    if !identities.is_empty() {
+      settle_later(Settle {
+        identities,
+        of: slates_cluster::homes::SettleOf::LetGo { owner },
+      });
     }
     attempt_ended(&owner);
   }
@@ -2350,28 +2448,17 @@ impl Drop for AttemptHolds {
   }
 }
 
-/// What an attempt owes its holds' homes once it ends (A-727 (d1a)).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Settle {
-  /// Its entry committed: the hold of `identity` moved from the attempt to the records naming it.
-  Move {
-    /// The object.
-    identity: ContentId,
-    /// The attempt.
-    from: HomeOwner,
-    /// The records.
-    to: HomeOwner,
-  },
-  /// It was refused: the attempt's hold of `identity` let go.
-  Release {
-    /// The object.
-    identity: ContentId,
-    /// The attempt.
-    owner: HomeOwner,
-  },
+/// What an attempt owes its holds' homes once it ends (A-727 (d1a)): every object it homed, each hold moved from the
+/// attempt to the records naming it (its entry committed) or let go (it was refused), settled together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Settle {
+  /// The objects.
+  pub(crate) identities: Vec<ContentId>,
+  /// What becomes of each one's hold.
+  pub(crate) of: slates_cluster::homes::SettleOf,
 }
 
-/// Counter: an attempt's move or let-go every home of its object answered (A-727 (d1a)). Format: a counter name.
+/// Counter: an attempt's settle every home of its objects answered (A-727 (d1a)). Format: a counter name.
 pub(crate) const SETTLED: &str = "vcs_store.homes.settled";
 /// Counter: one some home did not answer, its hold left to the resolution of the attempt (A-727 (d1a-3)). Format: a
 /// counter name.
@@ -2380,6 +2467,10 @@ pub(crate) const SETTLE_UNANSWERED: &str = "vcs_store.homes.settle_unanswered";
 /// ([`settle_later`]): its settles wait for the next settle to start one. Format: a counter name.
 pub(crate) const SETTLE_TASK_REFUSED: &str = "vcs_store.homes.settle_task_refused";
 
+/// Counter: settles queued on this shard ([`settle_later`]): an attempt's moves or let-gos owed the region. Format: a
+/// counter name.
+pub(crate) const SETTLES_QUEUED: &str = "vcs_store.homes.settles_queued";
+
 /// Owes `settle` to the region (A-727 (d1a)), and starts the task that settles what this shard owes where none runs.
 pub(crate) fn settle_later(settle: Settle) {
   SETTLES.with(|settles| {
@@ -2387,6 +2478,7 @@ pub(crate) fn settle_later(settle: Settle) {
       settles.push_back(settle);
     }
   });
+  let _ = crate::state::with_state(|state| state.count(SETTLES_QUEUED, 1));
   if SETTLING.with(|settling| settling.replace(true)) {
     return;
   }
@@ -2423,16 +2515,17 @@ async fn settle_owed() {
   SETTLING.with(|settling| settling.set(false));
 }
 
-/// Settles `settle` at every home of its object (A-727 (d1a)): this node's home shard where this node is one, and each
-/// other home by its own message ([`HomeMessage::Moved`](slates_cluster::homes::HomeMessage::Moved),
-/// [`HomeMessage::LetGo`](slates_cluster::homes::HomeMessage::LetGo)). Whether every home answered it (a home that
-/// holds nothing for the owner answers too: there is nothing to settle there).
+/// Settles `settle` at every home of its objects (A-727 (d1a)), a few exchanges whatever their count (main 01a20182's
+/// order of 2026-11-26): on this node, one call a home shard of its objects ranked here; to each other home, one
+/// [`HomeMessage::Settle`](slates_cluster::homes::HomeMessage::Settle) of its objects ranked there, in messages of at most
+/// [`slates_cluster::homes::SETTLE_MOST`]. Whether every home answered every object (a home that holds nothing for the
+/// owner answers too: there is nothing to settle there).
 async fn settle_in_region(
   (origin, shards): (u16, &[u16]),
   settle: Settle,
   budget: slates_cluster::CommitBudget,
 ) -> bool {
-  use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal};
+  use slates_cluster::homes::{HomeMessage, HomeOutcome};
   let Some((local, members, f)) = crate::state::with_state(|state| {
     (
       state.fleet.host(),
@@ -2443,63 +2536,89 @@ async fn settle_in_region(
     return false;
   };
   let budget_ns = budget.max_deadline_ns();
-  let identity = match settle {
-    Settle::Move { identity, .. } | Settle::Release { identity, .. } => identity,
-  };
-  let homes = slates_db::identity_homes::homes(&identity.0, &members, f);
+  let mut here: std::collections::BTreeMap<u16, Vec<ContentId>> = std::collections::BTreeMap::new();
+  let mut there: std::collections::BTreeMap<u64, (slates_db::HostId, Vec<[u8; 32]>)> =
+    std::collections::BTreeMap::new();
+  for identity in &settle.identities {
+    for home in slates_db::identity_homes::homes(&identity.0, &members, f) {
+      if home == local {
+        if let Some(shard) = home_of(shards, identity) {
+          here.entry(shard).or_default().push(*identity);
+        }
+      } else {
+        there
+          .entry(home.0)
+          .or_insert_with(|| (home, Vec::new()))
+          .1
+          .push(identity.0);
+      }
+    }
+  }
   let mut answered = true;
-  if homes.contains(&local) {
-    let here = match settle {
-      Settle::Move { from, to, .. } => {
-        move_region_at_home(origin, shards, identity, (from, to), budget_ns)
-          .await
-          .map(drop)
-      }
-      Settle::Release { owner, .. } => {
-        let_go_region_at_home(origin, shards, identity, Some(owner), budget_ns).await
-      }
-    };
-    answered &= matches!(here, Ok(()) | Err(HomeRefused::NotHeld));
+  for (shard, identities) in here {
+    let count = identities.len();
+    let of = settle.of;
+    let settled = crate::xshard::call_in_shard_time(
+      origin,
+      shard,
+      move |state| settled_here(state, of, &identities),
+      budget_ns,
+    )
+    .await;
+    answered &= settled == Some(count);
   }
-  let others: Vec<slates_db::HostId> = homes.into_iter().filter(|home| *home != local).collect();
-  if others.is_empty() {
-    return answered;
-  }
-  let request = match settle {
-    Settle::Move { identity, from, to } => HomeMessage::Moved {
-      identity: identity.0,
-      from,
-      to,
-    },
-    Settle::Release { identity, owner } => HomeMessage::LetGo {
-      identity: identity.0,
-      owner: Some(owner),
-    },
-  }
-  .encode();
   let control = shards.first().copied().unwrap_or(origin);
-  let count = others.len();
-  let replies = crate::xshard::task_in_shard_time(
-    origin,
-    control,
-    move || async move { exchange(&others, &request, budget).await },
-    budget_ns,
-  )
-  .await
-  .unwrap_or_default();
-  let settled = replies
-    .iter()
-    .filter(|(_, reply)| {
-      matches!(
-        HomeMessage::decode(reply),
-        Ok(HomeMessage::Answer {
-          identity: answered,
-          outcome: HomeOutcome::Moved | HomeOutcome::LetGo | HomeOutcome::Refused(HomeRefusal::NotHeld),
-        }) if answered == identity.0
+  let most = usize::try_from(slates_cluster::homes::SETTLE_MOST)
+    .unwrap_or(1)
+    .max(1);
+  for (_, (home, identities)) in there {
+    for chunk in identities.chunks(most) {
+      let count = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+      let request = HomeMessage::Settle {
+        settle: settle.of,
+        identities: chunk.to_vec(),
+      }
+      .encode();
+      let replies = crate::xshard::task_in_shard_time(
+        origin,
+        control,
+        move || async move { exchange(&[home], &request, budget).await },
+        budget_ns,
       )
+      .await
+      .unwrap_or_default();
+      answered &= replies.iter().any(|(_, reply)| {
+        matches!(
+          HomeMessage::decode(reply),
+          Ok(HomeMessage::Answer {
+            outcome: HomeOutcome::Settled { settled },
+            ..
+          }) if settled == count
+        )
+      });
+    }
+  }
+  answered
+}
+
+/// Settles `of` for each of `identities` on this shard, their home here: each hold moved or let go, or held for no such
+/// owner. How many were settled so.
+fn settled_here(
+  state: &mut ShardState,
+  of: slates_cluster::homes::SettleOf,
+  identities: &[ContentId],
+) -> usize {
+  use slates_cluster::homes::SettleOf;
+  identities
+    .iter()
+    .filter(|identity| {
+      let done = match of {
+        SettleOf::Moved { from, to } => move_region_owner(identity, (from, to)),
+        SettleOf::LetGo { owner } => let_go_for_region(state, identity, Some(owner)),
+      };
+      matches!(done, Ok(()) | Err(HomeRefused::NotHeld))
     })
-    .count();
-  answered && settled == count
+    .count()
 }
 
 /// Test support (A-727 (d1a-3)): `owner` joined to the region hold of `identity` this shard keeps, as a keep for it would.
