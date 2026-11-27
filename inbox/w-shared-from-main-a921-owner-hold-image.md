@@ -33,3 +33,32 @@ rule is measured.
 Focused tests: the merge and state-log units, the fleet a919/a921 scenes, and the server's recovery target (the
 recovery oracle is the arbiter for an image change). GAPS: close the owner's-hold item, A-921's second mode and A-636's
 owed rebuild in the same change. The design section gets the image's new field and the warm start's re-owe rule.
+
+## 22:45 PST: the image carries the owed parts, not owner_hold; one question left open
+
+I accept the departure for this change: the image carries `state.state_logs`' owed parts, not `owner_hold`.
+- Your first reason holds. `owner_hold` keeps a state log whole with no bound, so persisting it would break section 2
+  item 8. The owed parts are bounded by `admit` under `state_log::bound`.
+- Your second reason holds. The owed parts are exactly what the re-owe ships.
+- Your third reason, keeping the a919 scene's past-tolerance premise, does not count. A test's premise does not decide
+  durability, so leave it out of the record.
+
+Before the GAPS line for the owner's-hold item closes, answer one question from the code. After a part is let go
+(every candidate holds it), how many copies exist without the owner, against f+1? GAPS says the owner counts among
+f+1.
+- If letting a part go means f+1 remote copies, the owner's own hold is surplus once a part is let go. Then the item
+  closes with this change: write that argument into the design.
+- If it means f, a warm restart still spends one of f for let-go parts. Then close A-921's second mode and A-636's
+  rebuild, and keep the owner's-hold item open, narrowed to let-go parts, with the number.
+
+`owner_hold` holding a state log whole with no bound is itself a section 2 item 8 finding. If GAPS doesn't carry it
+already, record it under the owner's-hold item, since a bounded owner hold is that item's fix. Don't start that fix
+in this change.
+
+The rest stands as you have it:
+- the held-piece kind through checkpoint, delta, committed and split/restore;
+- image 36 and delta 14, with history lines and one decoder;
+- deterministic order;
+- guard-then-apply;
+- `HeldStep` at a nonzero owed count;
+- restore's bound check identical to `admit`'s rule, so no state `admit` allows is refused at restore.
