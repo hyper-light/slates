@@ -1247,6 +1247,10 @@ pub struct ShardState {
   /// report traffic on the same session still flows (`fleet::accept_held_record`). Empty in production
   /// (`Daemon::inject_record_refusal`).
   pub record_refused_from: std::collections::BTreeSet<slates_db::HostId>,
+  /// The record this holder last answered with no acknowledgement, by why (A-921's second mode; main 01a20182's order of
+  /// 2026-11-26: which refusal, at what epoch and position), read by `Daemon::last_record_refusals`. Bounded by the
+  /// kinds of refusal: one entry each, replaced by the next of its kind.
+  pub(crate) last_record_refusals: BTreeMap<&'static str, crate::fleet::RefusedRecord>,
   /// This node's owner-lease evidence (§4.8 "Leases and reads"; AUD-08): each peer's latest direct
   /// acknowledgement that reported this node alive under the installed configuration version, and any
   /// newer version a peer announced. Written on the control shard by the probe tasks

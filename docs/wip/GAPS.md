@@ -296,8 +296,11 @@
 > or with no names log, counted by why. And a lineage's hand-over waited without end on a member never pending (its
 > branch rebuilt a second root after the first had gone, 2 of 5 runs of the read test): it now waits for the family's
 > members pending here, each in the lineage at its adopted version, bounded by their own attempts. Red first (two
-> `a927_` fleet tests, the join held off the successor-to-be alone; three `merge_origin` units). OWED (main): the a894
-> loop's after (bar 0 of 40).
+> `a927_` fleet tests, the join held off the successor-to-be alone; three `merge_origin` units). The a894 loop's after met its
+> bar (main, 2026-11-26, c207c9f81 with a52c0aa1e, debug): 0 of 40, 20 ambient (mean 7.2 s, max 15 s) and 20 under 12
+> burners (mean 12.3 s, max 62 s), interleaved, load 17 to 31, every marker zero (files-no-commit, not-materialized,
+> not-recovered, barrier, wedged); before, 3 of 41 at 03c736286, each "files no commit names"
+> (~/.local/state/main-01a20182/rounds/loop-a894-after/summary.txt).
 > **FIXED (A-913, w-shared, 2026-11-24; A-912's sibling): a branch created while a member died refused `unable to
 > commit` at its record barrier (3 of 25 runs).** The restarted holder held its source's records but no replica, and
 > the record path branched only from a replica already there; now it makes a missing source first, as a branch's
@@ -353,12 +356,21 @@
 >     at every node, named by no kept retirement); the owner-restart test asserts a was not taken over (its fencing
 >     epoch unchanged at every other node) before it stops anyone, and forms the scene afresh, at most three times,
 >     where it was. Still `#[ignore]`d, for the second mode below.
->   - **OPEN, A-921's second mode (after part 2):** about 1 run in 6, a not taken over by its restart, the old holder
->     still acknowledged neither a's green's v2 nor its names-log part, every push refused `unable to commit`. Red first
->     with the old holder's refusal counters printed (which refusal, at what epoch and position); it may be the sibling
->     below (a's hold rebuilt empty) or the owner's merge or state-log state after a warm restart. In that run the
->     newcomer held 1 position: settle it against the start rule (adopted only within tolerance, stopping refused at the
->     first position past it) and write the assertion as that rule.
+>   - **FIXED, A-921's second mode's (1) (A-921 part 3, w-shared, 2026-11-26):** the old holder had missed a names-log
+>     part a owed it before a's warm restart, which rebuilt a's parts empty, so it refused every later part
+>     `Behind { held }` and every push was refused. The parts owed now ride the shard's recovery image (image 36, delta
+>     14), are owed again at a warm start to every candidate, and are persisted before they ship. Red first, made
+>     deterministic (a holds its parts off the old holder). "held 1" is measured: every newcomer position at or above
+>     a's restarted hold start.
+>   - **OPEN, A-921's second mode's (2) (w-shared, next):** after a's warm restart its merge plane ships no pending
+>     version again (v2 acked [a] and shipped once, v3 on none, nothing to the newcomer), so the push still never lands
+>     (3 of 3 refused in the deterministic red). Fix by the same rule: a warm start's pending versions owed again, their
+>     shipment state rebuilt from their recorded acks; its fix asserts the push in that red.
+>   - **OPEN, found 2026-11-26 (w-shared):** `a921_a_warm_restarted_node_never_names_a_false_death_victim_its_old_volumes_owner`
+>     fails 3 of 3 on main past 03c736286 (green when A-921 part 2 landed): the warm-restarted stranger's direct route
+>     names a (`named a true`, claims 0), while its status is served. It fails alike with A-921 part 3's runtime changes
+>     turned off, so it is not that change: something on main since moved the creator skip's case. Owner: w-shared,
+>     after (2).
 >   - **FIXED, its prerequisite (A-925):** each node announces its own edges (git HTTP or HTTPS, SSH) to its peers over
 >     stream 33, as a client reaches them, held only from its own authenticated session; an owner of no learned edge is
 >     the typed refusal naming its member id.
@@ -390,11 +402,14 @@
 >     (D-12, no directory; D-14, no global catalog), so it cannot even form the owner's query. Not started.
 >   - **OPEN, A-922:** a node whose authority over a repository moved forgets its partition's copy, sliced and bounded,
 >     as `forget_owned_by` does for volumes (AUD-08).
-> - **OPEN (found by A-919, owner main): an owner's hold is never recovered at a restart.** It counts among `f + 1`,
->   but the record plane builds it empty, and no image carries it. An owner's warm restart spends one of `f`, unseen,
->   on every record it counted itself in: commit at {owner, departed}, restart the owner warm, retire the departed,
->   and the record is gone after one failure anyone saw. Traced from the code, not observed. Root fix: publish and
->   recover the owner's hold as a holder's is.
+> - **OPEN, narrowed (found by A-919; w-shared since 2026-11-26): an owner's hold is never recovered at a restart.** It
+>   counts among `f + 1`, but the record plane builds it empty. A-921 part 3 closed it for a state-log part still owed:
+>   the parts owed ride the shard's recovery image and are owed again at a warm start. A let-go part is held by every
+>   remote candidate: `2f` copies without the owner at the candidate floor `2f + 1`, at least `f + 1`, so the owner's
+>   hold is surplus there. Left open: a placement short of the floor (`c` candidates, `f + 1 <= c < 2f + 1`) lets a
+>   part go at `c - 1` copies, exactly `f` at `c = f + 1`, where an owner's warm restart still spends one of `f`. And
+>   (§2 item 8) the owner's hold keeps a state log whole, unbounded (`compact_below` is for single-value registers
+>   only): a bounded owner hold is this item's fix.
 > - **B OPEN (A-918):** on `Behind`, the newcomer reads the green's chain through A-919's read (the same read a
 >   takeover's successor makes), folds it under the start rule, and rebuilds its replica from it, paced and bounded
 >   as replica builds are; one mechanism for both. The owner cannot push it the chain from v0: below a green's floor (its checkpoint or adoption)
@@ -487,9 +502,10 @@
 > A-930 (w-perf; main's ruling of 2026-11-25 on the 57k churn, whose push encoded 43,141,224 Aways bytes, 58% of its
 > image): a page changed only past its committed piece's last coordinate appends to the piece, and its split copies the
 > piece's entries, so a publication encodes only what was appended. Red: 600 let-goes published one at a time encoded
-> 2,588,710 bytes of the family (600 times a 4,314.5-byte tail) for 46,275 appended; now 46,300. OWED: the windows
-> family's removal as a cut of the committed piece (21,192,055 bytes, 28.5%), and main's in-place 57k rerun for the
-> after.
+> 2,588,710 bytes of the family (600 times a 4,314.5-byte tail) for 46,275 appended; now 46,300. Part 2: a window let
+> go is a cut of its committed piece (the windows family was 21,192,055 bytes, 28.5%): 60 let-goes over 300 kept
+> windows, a publication each, encoded 266,160 bytes of the family; now 0. OWED: main's in-place 57k rerun for the
+> after, with its publication count and page.
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
@@ -4230,8 +4246,8 @@
 > page, the record plane's counters and acknowledgements, a holder's check and keep. Tests (macOS arm64, Mac Studio):
 > see A-636 part 2b's amendment entry. Owed: a push's answer waiting for its records to commit (the barrier); a
 > candidate that joins a log's placement past parts every earlier one held (the log's state installed first, with a
-> state-log checkpoint, which also bounds the holders' copies); the parts rebuilt after the owner restarts; parts
-> batched; a destroyed repository's state-log registers forgotten; the successor adopting a repository's logs by the
+> state-log checkpoint, which also bounds the holders' copies); ~~the parts rebuilt after the owner restarts~~ (done,
+> A-921 part 3); parts batched; a destroyed repository's state-log registers forgotten; the successor adopting a repository's logs by the
 > rule (2c).
 > **A-636 part 2b-2 (2026-11-20, w-shared; routed by id):** a repository's id and every green minted to join it carry
 > its family (`ObjectId::family`; tag, number), and rendezvous hashes the family (`ObjectId::line_key`), so a
