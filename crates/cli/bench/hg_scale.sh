@@ -18,7 +18,11 @@
 #    `hg verify`, and its changeset ids exactly SOURCE's and the new one's. The changeset is made with one user, date and
 #    text on every server, so its id is one id, and each run's clones after the pull hold one set of changesets on every
 #    server: compared across the servers at the end (main 01a20182's ruling of 2026-11-27 14:31);
-# 4. stream: `hg clone -U --stream`, the server's store sent as files.
+# 4. stream: `hg clone -U --stream`, the server's store sent as files;
+# 5. concurrent clients (`concurrent.sh`, main 01a20182's ruling of 2026-11-27 15:02): N clones at once, each one's
+#    changesets the server's (`concurrent-clone`); N copies of the clone pulling at once one more changeset pushed
+#    before them, each then holding it (`concurrent-pull`). N derived from the machine, the wall time, each client's
+#    median and most and the server's peak resident memory recorded.
 #
 # hg runs outside every configuration file (HGRCPATH empty, HGPLAIN), never prompts, and speaks C. Everything is
 # written under WORK, which is made empty and removed at the end; SOURCE is only read.
@@ -107,6 +111,8 @@ listing() {
 
 echo "dataset: $SOURCE at $(h -R "$SOURCE" log -r tip -T '{rev}:{node}'); $(h -R "$SOURCE" log -r 'all()' -T x | wc -c | tr -d ' ') changesets, $(h -R "$SOURCE" tags -T x | wc -c | tr -d ' ') tags, $(h -R "$SOURCE" bookmarks -T x | wc -c | tr -d ' ') bookmarks, $(h -R "$SOURCE" heads -T x | wc -c | tr -d ' ') heads"
 listing "$SOURCE" "$WORK/source"
+# shellcheck source=concurrent.sh
+. "$(dirname "$0")/concurrent.sh"
 echo "hg: $(h --version | head -1); slates: $("$SLATES" version 2> /dev/null || echo none); store: $(du -sh "$SOURCE/.hg/store" | cut -f1)"
 echo "machine: $(sysctl -n machdep.cpu.brand_string 2> /dev/null), $(sysctl -n hw.ncpu 2> /dev/null) cores; load: $(uptime | sed 's/.*load averages*: //')"
 
@@ -224,6 +230,7 @@ steps() {
     echo "$server skipped incremental check $run: $missed failed" | tee -a "$RESULTS"
   else
     incremental "$server" "$run" "$clone" "$scratch"
+    concurrent_steps "$server" "$run" "$clone" "$scratch"
   fi
   stream "$server" "$run"
   [ "$server" = slates ] && echo "slates daemon rss at the end: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
@@ -275,6 +282,53 @@ incremental() {
   fi
   echo "$server incremental digest $run $(shasum -a 256 < "$WORK/$server-pulled-$run.changesets" | cut -d' ' -f1)" \
     | tee -a "$RESULTS"
+}
+
+# The concurrent clients of server $1's run $2 (header, step 5): clone $3 and scratch $4 the single client's, after its
+# incremental steps.
+concurrent_steps() {
+  local server=$1 run=$2
+  C_SERVER=$server C_RUN=$run C_CLONE=$3 C_SCRATCH=$4
+  if [ "$server" = slates ]; then SERVER_PIDS="$ANCHOR $DAEMON"; else SERVER_PIDS=$STOCK; fi
+  CLIENT_VARS="H AUTH URL C_RUN C_CLONE C_NEW"
+  concurrent "$server" clone "$run" hg_clone_client hg_clone_check hg_clone_prepare
+  concurrent "$server" pull "$run" hg_pull_client hg_pull_check hg_pull_prepare
+}
+
+# The server's changesets now, as the single client's clone holds them after its pull: what each clone must hold.
+hg_clone_prepare() { h -R "$C_CLONE" log -r 'all()' -T '{node}\n' | LC_ALL=C sort > "$C_DIR/expected.changesets"; }
+hg_clone_client() { "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q -U "$URL" "$C_DIR/clone-$1"; }
+hg_clone_check() {
+  h -R "$C_DIR/clone-$1" log -r 'all()' -T '{node}\n' 2> /dev/null | LC_ALL=C sort > "$C_DIR/clone-$1.changesets"
+  if [ -s "$C_DIR/clone-$1.changesets" ] && cmp -s "$C_DIR/expected.changesets" "$C_DIR/clone-$1.changesets"; then
+    echo "$C_SERVER check concurrent-clone client $1 changesets identical" >> "$RESULTS"
+  else
+    echo "$C_SERVER check concurrent-clone client $1 changesets DIFFER" | tee -a "$RESULTS"
+  fi
+  rm -rf "$C_DIR/clone-$1"
+}
+
+# A copy of the clone for each of $1 clients (the probe's when 0), then one more changeset pushed for them to pull, one
+# user and date on every server.
+hg_pull_prepare() {
+  local k
+  for k in $(seq "$([ "$1" = 0 ] && echo 0 || echo 1)" "$1"); do cp -R "$C_CLONE" "$C_DIR/pull-$k"; done
+  h -R "$C_SCRATCH" pull -q "$C_CLONE" > /dev/null 2>&1 || true
+  h -R "$C_SCRATCH" update -q tip
+  echo "a pulled changeset, run $C_RUN, for $1 clients" > "$C_SCRATCH/a-699-pulled.txt"
+  h -R "$C_SCRATCH" commit -q -A -u "a-699 <scale@slates.invalid>" -d "2026-11-27 00:00 +0000" -m "pulled" \
+    "$C_SCRATCH/a-699-pulled.txt"
+  C_NEW=$(h -R "$C_SCRATCH" log -r . -T '{node}')
+  h ${AUTH[@]+"${AUTH[@]}"} -R "$C_SCRATCH" push -q -r "$C_NEW" "$URL" > /dev/null 2>&1 || true
+}
+hg_pull_client() { "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} -R "$C_DIR/pull-$1" pull -q "$URL"; }
+hg_pull_check() {
+  if [ "$(h -R "$C_DIR/pull-$1" log -r "$C_NEW" -T '{node}' 2> /dev/null)" = "$C_NEW" ]; then
+    echo "$C_SERVER check concurrent-pull client $1 pulled" >> "$RESULTS"
+  else
+    echo "$C_SERVER check concurrent-pull client $1 MISSED" | tee -a "$RESULTS"
+  fi
+  rm -rf "$C_DIR/pull-$1"
 }
 
 # The stream counters w-hg reads (`crates/server/src` `vcs_store.hg_stream_*`), for its stream clone's slowness.
@@ -342,7 +396,7 @@ done
 
 echo "== results (seconds; every run shown)"
 FAILED_ROWS=""
-for step in push push-chunked import clone incremental-push incremental-pull stream; do
+for step in push push-chunked import clone incremental-push incremental-pull stream concurrent-clone concurrent-pull; do
   grep -qE "^[^ ]+ $step " "$RESULTS" || continue
   for server in $SERVERS; do
   # A step only another server runs (svn's load is stock's, its import slates') is no line for this one.
@@ -354,6 +408,7 @@ for step in push push-chunked import clone incremental-push incremental-pull str
   if ! grep "^$server $step " "$RESULTS" | grep -q " ok$"; then FAILED_ROWS="$FAILED_ROWS $server:$step"; fi
   done
 done
+concurrent_table
 echo "load at the end: $(uptime | sed 's/.*load averages*: //')"
 # A step a server ran in no run is no row; a step whose every run failed is FAILED, and fails the harness: a leg that
 # could not run must never print as a best of "-" (main's r592, every slates git and svn step failed and the round

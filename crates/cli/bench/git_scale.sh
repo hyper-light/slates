@@ -25,7 +25,12 @@
 # 3. incremental: one commit (one new file) made on SOURCE's default branch in a scratch copy and pushed, then fetched
 #    into the mirror clone, which must then name it;
 # 4. shallow: `git clone --bare --depth 1`;
-# 5. partial: `git clone --bare --filter=blob:none`.
+# 5. partial: `git clone --bare --filter=blob:none`;
+# 6. concurrent clients (`concurrent.sh`, main 01a20182's ruling of 2026-11-27 15:02): N mirror clones at once, each
+#    one's refs the server's (`concurrent-clone`); N copies of the mirror fetching at once one more commit pushed
+#    before them, each then naming it (`concurrent-fetch`); N pushes at once, a new branch each, each then listed by
+#    the server at its commit (`concurrent-push`). N derived from the machine, the wall time, each client's median and
+#    most and the server's peak resident memory recorded.
 #
 # git runs outside every configuration file and user (no system or global configuration, its home the scratch
 # directory), never prompts, and speaks C. Everything is written under WORK, which is made empty and removed at the end;
@@ -87,6 +92,8 @@ timed() {
 rss_of() { ps -o rss= -p "$1" 2> /dev/null | awk '{ printf "%.0f", $1 / 1024 }' || echo -; }
 
 DEFAULT=$(g -C "$SOURCE" symbolic-ref --short HEAD)
+# shellcheck source=concurrent.sh
+. "$(dirname "$0")/concurrent.sh"
 echo "dataset: $SOURCE at $(g -C "$SOURCE" rev-parse HEAD) ($DEFAULT); $(g -C "$SOURCE" for-each-ref refs/heads | wc -l | tr -d ' ') branches, $(g -C "$SOURCE" for-each-ref refs/tags | wc -l | tr -d ' ') tags, $(g -C "$SOURCE" rev-list --all --count) commits"
 g -C "$SOURCE" for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags | sort > "$WORK/source.refs"
 # The refs the first push sends, which every clone's refs must equal: none would make that check vacuous.
@@ -343,8 +350,90 @@ steps() {
   timed "$server shallow $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q --bare --depth 1 "$URL" "$WORK/$server-shallow-$run"
   [ "$server" = slates ] && counters_at after shallow "$run"
   clone_timed partial "$run" "$WORK/$server-partial-$run" --bare --filter=blob:none
+  concurrent_steps "$server" "$run" "$mirror" "$scratch"
   [ "$server" = slates ] && echo "slates daemon rss at the end: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
   rm -rf "$mirror" "$scratch" "$WORK/$server-shallow-$run" "$WORK/$server-partial-$run"
+}
+
+# The concurrent clients of server $1's run $2 (header, step 6): mirror $3 and scratch $4 the single client's.
+concurrent_steps() {
+  local server=$1 run=$2
+  C_SERVER=$server C_RUN=$run C_MIRROR=$3 C_SCRATCH=$4 C_NEW=""
+  if [ "$server" = slates ]; then SERVER_PIDS="$ANCHOR $DAEMON"; else SERVER_PIDS=$STOCK; fi
+  CLIENT_VARS="G AUTH URL C_RUN C_MIRROR C_SCRATCH C_NEW C_PUSHES"
+  concurrent "$server" clone "$run" git_clone_client git_clone_check git_clone_prepare
+  concurrent "$server" fetch "$run" git_fetch_client git_fetch_check git_fetch_prepare
+  concurrent "$server" push "$run" git_push_client git_push_check git_push_prepare
+}
+
+# The server's heads and tags now, as `for-each-ref` lists a mirror's: what each concurrent clone must hold.
+git_clone_prepare() {
+  g ${AUTH[@]+"${AUTH[@]}"} ls-remote "$URL" 'refs/heads/*' 'refs/tags/*' | grep -v '\^{}$' | tr '\t' ' ' | sort \
+    > "$C_DIR/expected.refs"
+}
+git_clone_client() { "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q --mirror "$URL" "$C_DIR/clone-$1"; }
+git_clone_check() {
+  "${G[@]}" -C "$C_DIR/clone-$1" for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags 2> /dev/null \
+    | sort > "$C_DIR/clone-$1.refs"
+  if [ -s "$C_DIR/clone-$1.refs" ] && cmp -s "$C_DIR/expected.refs" "$C_DIR/clone-$1.refs"; then
+    echo "$C_SERVER check concurrent-clone client $1 refs identical" >> "$RESULTS"
+  else
+    echo "$C_SERVER check concurrent-clone client $1 refs DIFFER" | tee -a "$RESULTS"
+  fi
+  rm -rf "$C_DIR/clone-$1"
+}
+
+# A copy of the mirror for each of $1 clients (the probe's when 0), then one more commit pushed for them to fetch, on
+# top of the server's head (the mirror's after the single client's fetch, then each pushed here): a fast-forward.
+git_fetch_prepare() {
+  local k blob tree head
+  for k in $(seq "$([ "$1" = 0 ] && echo 0 || echo 1)" "$1"); do cp -R "$C_MIRROR" "$C_DIR/fetch-$k"; done
+  head=${C_NEW:-$(g -C "$C_MIRROR" rev-parse "refs/heads/$DEFAULT")}
+  g -C "$C_SCRATCH" update-ref "refs/heads/$DEFAULT" "$head"
+  blob=$(echo "a fetched commit, run $C_RUN, for $1 clients" | g -C "$C_SCRATCH" hash-object -w --stdin)
+  GIT_INDEX_FILE="$C_DIR/index" g -C "$C_SCRATCH" read-tree "refs/heads/$DEFAULT"
+  GIT_INDEX_FILE="$C_DIR/index" g -C "$C_SCRATCH" update-index --add --cacheinfo "100644,$blob,a-699-fetched.txt"
+  tree=$(GIT_INDEX_FILE="$C_DIR/index" g -C "$C_SCRATCH" write-tree)
+  rm -f "$C_DIR/index"
+  C_NEW=$(g -C "$C_SCRATCH" commit-tree "$tree" -p "$(g -C "$C_SCRATCH" rev-parse "refs/heads/$DEFAULT")" -m "fetched")
+  g -C "$C_SCRATCH" update-ref "refs/heads/$DEFAULT" "$C_NEW"
+  g ${AUTH[@]+"${AUTH[@]}"} -C "$C_SCRATCH" push -q "$URL" "$C_NEW:refs/heads/$DEFAULT"
+}
+git_fetch_client() { "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} -C "$C_DIR/fetch-$1" fetch -q; }
+git_fetch_check() {
+  if [ "$("${G[@]}" -C "$C_DIR/fetch-$1" rev-parse "refs/heads/$DEFAULT" 2> /dev/null)" = "$C_NEW" ]; then
+    echo "$C_SERVER check concurrent-fetch client $1 fetched" >> "$RESULTS"
+  else
+    echo "$C_SERVER check concurrent-fetch client $1 MISSED" | tee -a "$RESULTS"
+  fi
+  rm -rf "$C_DIR/fetch-$1"
+}
+
+# A commit for each of $1 clients (the probe's when 0) to push as a branch of its own.
+git_push_prepare() {
+  local k blob tree
+  C_PUSHES=()
+  for k in $(seq 0 "$1"); do
+    blob=$(echo "a pushed branch, run $C_RUN, client $k of $1" | g -C "$C_SCRATCH" hash-object -w --stdin)
+    GIT_INDEX_FILE="$C_DIR/index" g -C "$C_SCRATCH" read-tree "refs/heads/$DEFAULT"
+    GIT_INDEX_FILE="$C_DIR/index" g -C "$C_SCRATCH" update-index --add --cacheinfo "100644,$blob,a-699-pushed.txt"
+    tree=$(GIT_INDEX_FILE="$C_DIR/index" g -C "$C_SCRATCH" write-tree)
+    rm -f "$C_DIR/index"
+    C_PUSHES[k]=$(g -C "$C_SCRATCH" commit-tree "$tree" -p "refs/heads/$DEFAULT" -m "pushed by client $k")
+  done
+  C_PUSH_ROUND=$1
+}
+git_push_client() {
+  "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} -C "$C_SCRATCH" push -q "$URL" "${C_PUSHES[$1]}:refs/heads/concurrent-$C_RUN-$1"
+}
+git_push_check() {
+  local listed
+  listed=$(g ${AUTH[@]+"${AUTH[@]}"} ls-remote "$URL" "refs/heads/concurrent-$C_RUN-$1" | cut -f1)
+  if [ "$listed" = "${C_PUSHES[$1]}" ]; then
+    echo "$C_SERVER check concurrent-push client $1 listed" >> "$RESULTS"
+  else
+    echo "$C_SERVER check concurrent-push client $1 MISSED: ${listed:-none}" | tee -a "$RESULTS"
+  fi
 }
 
 for run in $(seq 1 "$RUNS"); do
@@ -406,7 +495,8 @@ fi
 
 echo "== results (seconds; every run shown)"
 FAILED_ROWS=""
-for step in push clone clone-again incremental-push incremental-fetch shallow partial; do
+for step in push clone clone-again incremental-push incremental-fetch shallow partial concurrent-clone concurrent-fetch \
+  concurrent-push; do
   grep -qE "^[^ ]+ $step " "$RESULTS" || continue
   for server in $SERVERS; do
     # A step only another server runs (svn's load is stock's, its import slates') is no line for this one.
@@ -418,6 +508,7 @@ for step in push clone clone-again incremental-push incremental-fetch shallow pa
     if ! grep "^$server $step " "$RESULTS" | grep -q " ok$"; then FAILED_ROWS="$FAILED_ROWS $server:$step"; fi
   done
 done
+concurrent_table
 echo "load at the end: $(uptime | sed 's/.*load averages*: //')"
 # A step a server ran in no run is no row; a step whose every run failed is FAILED, and fails the harness: a leg that
 # could not run must never print as a best of "-" (main's r592, every slates git and svn step failed and the round
