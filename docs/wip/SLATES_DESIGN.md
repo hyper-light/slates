@@ -66052,11 +66052,45 @@ Applied in the same change to:
   carries a page's piece whole; the copy only replaced the encoding. OWED: the 57k's cut count from the rerun with
   these counters, and main's ruling on carrying a piece in parts (the committed bytes by reference), which would take
   the copy out.
+- **Part 3, the cadence: a cut nobody waits on begins once its changes come to its cost** (2026-11-27, main's ruling
+  (ii) on the 57k churn: "a byte rule for cuts nobody waits on, plus a cut a ticket asks for, plus one when the shard
+  settles idle, its threshold derived"; its second churn at ca78de951 began 17,745 cuts, a cut a publication, and
+  copied 874,543,777 bytes). A cut moves its dirty pages' committed bytes whole however few entries changed, so begun
+  at every publication its work is the pages' bytes times the publications. Now the encoder keeps the bytes changed
+  since the last cut began (`Encoder::changed`: each coordinate marked fresh, counted at its page's mean committed
+  entry) and the bytes the content arena holds freed for the committed cut (`Encoder::hold`, read at every drain from
+  `deferred_bytes`). The next cut is due (`Encoder::due`) when asked, or when the changes and the held frees together
+  come to its cost, the dirty pages' committed bytes (`Encoder::cut_cost`). So the cuts' copying is about the changes'
+  own bytes, and the memory a deferred cut keeps is never more than the cut would copy: a derived bound, with no
+  budget of its own (§2 item 8; main's ruling of 07:19 kept the held term, since without it a let-go-heavy push with no
+  ticket holds its whole let-go until idle).
+  - **Asked:** a homes ticket's wait (`homes::PublishedHere` asks before its `publish_shard`, so persistence still
+    precedes the reply); the shard settling idle (the idle sweep arms on a deferred cut, and
+    `content_holder::image_retry_owed` asks, begins it and owes it, counted `vcs_store.image.idle_cuts`).
+  - **Deferred:** a publication whose next cut is not due carries the committed cut again, keeps the arena's deferred
+    frees as any publication that carried no cut does (A-64), owes nothing and starts no catch-up; counted
+    `vcs_store.image.publications_deferred`. A cut's publication answers kept tickets
+    (`homes::publication_committed`) only where nothing is left dirty, so no ticket is answered past changes the image
+    does not hold. `vcs_store.image.held_deferred_peak_bytes` is the most the arena held freed at a drain since start.
+  - **Reds:** `a_cut_nobody_waits_on_begins_once_its_changes_come_to_its_cost` (300 let-goes published one at a time:
+    a cut asked at each, 300 cuts and 2,804,085 bytes copied and encoded; the cadence, 2 cuts and 161,862 bytes; both
+    images the shard's entries once idle; with `due` always true the two equal). And
+    `a_deferred_cut_holds_no_more_freed_bytes_than_it_would_cost` (40 let-goes of a 4,096-byte granule the committed
+    image named, nothing asking: 5 cuts before idle and 35 publications deferred, at most 24,576 bytes held while a cut
+    costing 26,885 to 29,730 was deferred, the gauge's peak 28,672; with the held term taken out, no cut before idle and
+    163,840 bytes held against a cost of 26,885). The cut-mechanics tests ask for their cuts as a ticket's wait does;
+    the generated-histories oracle asks at half its publications and once quiet, and asserts some publication deferred.
+  - OWED: main's 57k rerun at the tip for the cuts, the copied bytes, the held peak and wall time against 894a1e111
+    (3,291 cuts, 697 MB copied).
 - **Applied in the same change to:** `crates/server/src/image_pages.rs` (the encoder's lasts and least changes,
   `append_page`, `entry_ends`, `CommittedPiece`, `Encoder::appends`, `append`, `split_appended`, `dirty_whole`); the
   goal 93 line in GAPS (A-923's entry). Part 2: `image_pages.rs` (`Marked`, `EntryCoordinate`, `Changed`, `PieceCut`,
   `CommittedPiece::coordinates`, `Encoder::changed_since`, `changed_turn`, `cut_committed`; `Encoder::turn` takes the
-  coordinate reader beside the family reader) and `crates/server/src/content_holder.rs` (`entry_coordinate`).
+  coordinate reader beside the family reader) and `crates/server/src/content_holder.rs` (`entry_coordinate`). Part 3:
+  `image_pages.rs` (`Encoder::asked`, `changed`, `held`, `due`, `cut_cost`, `committed_entry_bytes`, `deferred`, `ask`,
+  `hold`; `Turned::caught_up` holds where nothing is due), `content_holder.rs` (`image_committed`, `image_retry_owed`,
+  `image_drain`, `IMAGE_DEFERRED`, `IMAGE_IDLE_CUTS`, `IMAGE_HELD_PEAK`), `idle_sweep.rs` (`after_borrow` arms on a
+  deferred cut) and `vcs_store/homes.rs` (`PublishedHere::poll` asks).
 
 ### A-921 part 4 — A holder joins a version's record its owner re-derived with other floors, instead of refusing it as another proposal (2026-11-27, w-shared for main 01a20182, its ruling of 2026-11-27 (B); A-921's second mode's (2); amends §4.16 "Apply on holders" and the register's position rule)
 

@@ -1144,12 +1144,21 @@ pub(crate) fn image_committed(state: &mut ShardState, carried: bool) {
     }
     if !next {
       // Nothing changed since the cut's moment (or none was in flight): the image is the shard's now, so every window
-      // kept before this publication is in it.
-      crate::vcs_store::homes::publication_committed();
+      // kept before this publication is in it. Changes waiting for a cut not yet due (A-930's cadence) are not in it,
+      // so no ticket is published past them: theirs wait for the cut a ticket's wait asks for.
+      if !state.image_encoder.deferred() {
+        crate::vcs_store::homes::publication_committed();
+      }
       return;
     }
   } else {
     state.store.content.arena_mut().capture_deferred();
+    // The committed cut carried again while the next is not due (A-930's cadence): nothing owed, no catch-up, no
+    // pause; the blocks the committed cut names kept as for any publication that carried no cut.
+    if state.image_encoder.deferred() {
+      state.count(IMAGE_DEFERRED, 1);
+      return;
+    }
     state.count(IMAGE_SKIPPED, 1);
   }
   let lag = state.image_encoder.skipped();
@@ -1230,6 +1239,15 @@ pub(crate) const IMAGE_LONGEST_CUT_STEP_BYTES: &str = "vcs_store.image.longest_c
 pub(crate) const IMAGE_CUT_LEFT: &str = "vcs_store.image.cut_left";
 /// Format: the status counter of publications that carried no paged page, a change not yet encoded (A-870 piece 2).
 pub(crate) const IMAGE_SKIPPED: &str = "vcs_store.image.publications_skipped";
+/// Format: the status counter of publications that carried the committed cut again while the next cut was not due
+/// (A-930's cadence, main's ruling (ii) of 2026-11-27): nothing owed by them.
+pub(crate) const IMAGE_DEFERRED: &str = "vcs_store.image.publications_deferred";
+/// Format: the status counter of cuts begun because the shard went idle with changes waiting for a cut not yet due.
+pub(crate) const IMAGE_IDLE_CUTS: &str = "vcs_store.image.idle_cuts";
+/// Format: the status counter of the most bytes the content arena held freed for the committed cut at a drain since
+/// start (A-930's cadence: a deferred cut holds no more than it would cost, so this stays within a cut's cost and one
+/// change's frees).
+pub(crate) const IMAGE_HELD_PEAK: &str = "vcs_store.image.held_deferred_peak_bytes";
 /// Format: the status counter of the longest a publication of the paged families was owed, in encoder turns.
 pub(crate) const IMAGE_LONGEST_LAG: &str = "vcs_store.image.longest_lag_turns";
 /// Format: the status counter of elective changes paused while a publication was owed past its bound.
@@ -1307,6 +1325,15 @@ thread_local! {
 /// catch-up begun again, counted; a spawn refused again is counted and left for the next sweep. Whether one is owed, so
 /// the sweep does not settle the shard while it is.
 pub(crate) fn image_retry_owed(state: &mut ShardState) -> bool {
+  // Idle with changes waiting for a cut not yet due (A-930's cadence): the cut is begun now and owed, so the shard is
+  // not settled until it is published.
+  if state.image_encoder.deferred() {
+    state.image_encoder.ask();
+    if image_begin(state) {
+      let _ = state.image_encoder.skipped();
+      state.count(IMAGE_IDLE_CUTS, 1);
+    }
+  }
   if !state.image_encoder.owed() {
     return false;
   }
@@ -1338,6 +1365,10 @@ pub(crate) fn image_drain(state: &mut ShardState) {
   }
   crate::vcs_store::homes::region_changes_committed();
   crate::vcs_store::homes::landed_changes_committed();
+  // What a deferred cut keeps in memory (A-930's cadence): the frees the arena holds for the committed cut.
+  let held = u64::try_from(state.store.content.arena().deferred_bytes()).unwrap_or(u64::MAX);
+  state.image_encoder.hold(held);
+  state.count_max(IMAGE_HELD_PEAK, held);
 }
 
 /// Begins an image cut where none is in flight and a page is dirty (F2): the changes taken first, so the cut is this
