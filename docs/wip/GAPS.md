@@ -638,8 +638,18 @@
 >   let-go twice its typed refusal, brought back its verdict `Ok`). The healed path's net:
 >   `b4_a_linear_rules_update_of_a_let_go_tag_head_lands`. The reds were taken with the policy step alone disabled
 >   (`true || policy_ready`), the tests needing its new field to compile.
-> - OPEN: B5 (`PushedObjects::bytes` of a pushed object, `Malformed`), B6 (a verdict's one-call build), B7 (`push_of`'s
->   peel at judge time, after `prepare`'s), B8 (the encoding's tree walk: time, not correctness).
+> - **B5 BUILT (w-git, 2026-11-27): a pushed object read through the verdict's view.** `views::PushedObjects::bytes` of
+>   a pushed object answered `Malformed` where `Push::bytes` met a let-go window (a REF_DELTA's base outside the push),
+>   noting nothing, so the verdict's build refused the command. On one push's own path its reads keep the pushed tree
+>   its checks resolved, so the build reads it kept; it bites once the push's read cache has turned that tree over. Now
+>   the refusal that met a let-go is not yet (`Unavailable::NotYet`), noted for the view's owner as the indexed arm's is
+>   (the push's own slot, `PushedObjects::noting`), and the preparation waits on it; any other refusal stays
+>   `Malformed`. Red at the site:
+>   `git_push::tests::b5_a_pushed_delta_read_over_a_let_go_base_is_not_yet_and_noted_for_the_push` (a push that has read
+>   nothing over the create's let-go pack: `Malformed` before; `NotYet`, the push's slot noted and the shared one empty,
+>   after). Net: `b5_a_verdicts_build_of_a_pushed_delta_over_a_let_go_base_lands`.
+> - OPEN: B6 (a verdict's one-call build), B7 (`push_of`'s peel at judge time, after `prepare`'s), B8 (the encoding's
+>   tree walk: time, not correctness).
 > **P OPEN (w-git; main's r229, 2026-11-23): git/git's HTTP mirror clone takes about 100 s** (97.9 and 107.7 s, 556 MB
 > against stock git's 612 MB; the work clone 92.9 and 97.2 s), the daemon CPU-bound at 97% of one core: blake3,
 > `Index::get`, `ContentStore::get` / `len_of` / `window_at_in`, `Positions::settle`. No stall; to be profiled.
