@@ -2392,11 +2392,11 @@ impl ServerJudge<'_> {
       waits,
       ..
     } = self;
-    let (entry, examined) = with_room(state, |state| {
+    let (entry, (examined, one_call)) = with_room(state, |state| {
       let Some(store) = state.vcs_stores.git_ref(record.id) else {
         return (
           Err(refused_declined(&command.name, words(&GitRefused::NoStore))),
-          0,
+          (0, 0),
         );
       };
       let (content, git) = store;
@@ -2411,12 +2411,13 @@ impl ServerJudge<'_> {
         owing: std::cell::Cell::new(None),
         examined: std::cell::Cell::new(0),
       };
-      let entry = Verdicts::new(&greens, &indexed, &objects, *name, room)
-        .prepared(preparing.take())
-        .judge(command, pushed);
-      (entry, greens.examined.get())
+      let verdicts =
+        Verdicts::new(&greens, &indexed, &objects, *name, room).prepared(preparing.take());
+      let entry = verdicts.judge(command, pushed);
+      (entry, (greens.examined.get(), verdicts.one_call_builds()))
     });
     state.count(HOLDING_EXAMINED, examined);
+    state.count(ONE_CALL_BUILDS, one_call);
     entry
   }
 
@@ -2800,6 +2801,13 @@ pub(crate) fn uncommitted_report(received: &Received) -> Vec<u8> {
   let _ = write_report(&refused, &mut report);
   report
 }
+
+/// Counter: the works a push's verdicts built in one call, with no prepared build of their push to take
+/// (`receive::works::Verdicts::one_call_builds`; B6 of the landed let-go's lift, main's ruling of 2026-11-27): 0 on the
+/// server's path by construction (every update's verdict takes the build its `ready` prepared in the same step over the
+/// same base), so a build is never made whole in one step nor a let-go read under it declined as missing. Format: a
+/// counter name.
+pub(crate) const ONE_CALL_BUILDS: &str = "git_push.verdict.one_call_builds";
 
 /// Format: the status counter of the greens a push's search for the green holding a commit examined
 /// (`ShardGreens::holding`): each one lent or whose versions were read.
