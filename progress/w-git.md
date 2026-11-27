@@ -892,3 +892,13 @@
   Unreadable before; clone byte-identical after); git lib 630/630, server focused 295/295; in main's 16, push held for
   the verdict. Sibling left OPEN by main's ruling (Encoding::stop_at keyed by place). NEXT: (d) the replica red, then
   the flip with C5's 2N + O×R + W, C4, P1, P2.
+- 11-27 06:58 PST: LANDED B8 60a07f166..fa73e2322 (the encoding's tree walk stops at a let-go tree; main's 16/16 at 2cde8d4f3).
+  (d) CLOSED AS UNREACHABLE ON HOLDERS 511a6980a..62c389858 (GAPS alone): a holder's node store holds no changeset row
+  for the owner's pushes (read_changeset Unlanded 4,023/4,023), and landed_pack_here is told only among the landing
+  node's shards; the parked red's hook let go index rows too, and its narrowed form a state production never makes; red
+  and hooks dropped. Checked-rule fleet test owed with the flip. LANDED the loop it exposed 431f2b621..a05f07e5f:
+  replica::begin refuses Unchanged (counted vcs_store.replica.unchanged_refused) over the same records with nothing
+  brought back (was ~8,000 begins a test); changeset_read_for_rebuild's refusal falls through to the region counted
+  (vcs_store.changeset_unread; ending the rebuild there broke a908/new-branch fleet tests); git_replay refuses a let-go
+  pack nothing fills Unlanded, not Truncated. NEXT: the flip (LANDED_LET_GO true, C5's 2N + O×R + W, (e) kept, (d)'s
+  checked rule + holder let-go counter), plan to main first; then C4, P1, P2.
