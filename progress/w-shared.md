@@ -641,3 +641,12 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - A create on a default green this node cannot read says why, naming the green: "not recovered here (<cause kind>)" or "not made here yet; retry". Never the false "holds files no commit names".
 - The red also caught a create landing on a green recorded unrecovered whose engine was still lent; it is now refused.
 - Next: A-927 part 2, an Unjoined adoption reading the join through A-919's read, with the deterministic fleet red (state-log shipping held to the successor-to-be). Then A-921's second mode, A-922, A-918 B and A-914 (c).
+
+## 2026-11-26: A-927 parts 1b and 2 landed
+- Part 1b landed as slates 32dfb1e8c (commit fae183741). Every write naming a green this shard did not recover is now refused NotRecovered by one check, `ShardState::recovered`, at four boundaries: a push's plan, an import batch, the branch verbs and a submit's verdict.
+- Part 2 landed as slates a52c0aa1e (commit a44ebd05c). This was a894's cause: the takeover adopted the names log's newest part without noting its memberships.
+  - An Unjoined adoption now re-notes the held parts and reads the lacking positions through A-919's read.
+  - The hand-over (`take_engine`) now waits for pending family members, which fixes an unbounded wait.
+  - Reds first: two fleet tests and three units.
+- Owed (main): the a894 loop after, bar 0 of 40.
+- Moot: the a_resolution_pass flake (w-git landed it as 668c10e99) and my allow-list share (w-hg removed the allow-list).
