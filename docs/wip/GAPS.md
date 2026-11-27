@@ -110,8 +110,10 @@
 > A-926 keeps a high-water mark for each written memory, so a successor knows its extents. Now the sweep is 3,495,300
 > pages, and it completes in 1.6 s both alone (40,988 slices) and loaded (40,730, two hogs a core), held by
 > `a_status_requests_sweep_completes_within_its_bound_under_load` and
-> `a_fresh_daemons_sweep_walks_what_its_marks_cover_not_its_unwritten_journal`. OWED, A-926 part 2: the segment's log
-> and snapshot regions (3,495,255 pages, the register's format) get marks too.
+> `a_fresh_daemons_sweep_walks_what_its_marks_cover_not_its_unwritten_journal`. A-926 part 2 gave the segment's log
+> ring and snapshot slots their marks too: a fresh daemon's sweep is 46 pages, two sweeps completing in one idle slice
+> (the spacing test now holds the rule itself: a request right after a sweep arms none, or one no sooner than the last
+> took).
 
 > **Open (w-shared, 2026-11-21; closed by A-826 when it lands): a holder-route submit of 320 MiB and above does not
 > complete under load.** Its `SubmitComputed` carried the whole increment over the forward lane; on a loaded machine
@@ -3053,7 +3055,12 @@
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
-> the log ring's released pages given back (88 MiB resident past the live tail); `projected_snapshot_bytes`'s encode.
+> `projected_snapshot_bytes`'s encode. The log ring's released pages given back (88 MiB resident past the live tail):
+> DONE by A-926 part 2 (w-perf, 2026-11-25). An idle shard gives back its partition's ring past its tail, once a
+> snapshot released it (A-71's reset), and each snapshot slot past its payload, a slice at a time beside the
+> journal's give-back, lowering their marks after. `a_released_rings_pages_go_back_to_the_os` (macOS, by the
+> physical footprint): 96 MiB logged and released, the process charged 98 MiB, then 4 MiB after the give-back, 94 MiB
+> given back. OWED: the same test on Linux, by RSS (main's lane).
 >
 > **A-752 (2026-11-20, w-engine; Ada's rule, main's order):** a push's work build a unit at a time: part 1 the
 > deriver's replay indexed (O(n^2) -> O(n log n)); part 2 `push::Building` over the turns before the verdict

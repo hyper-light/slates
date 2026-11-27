@@ -3870,6 +3870,18 @@ impl Daemon {
     Ok(returned)
   }
 
+  /// Test support: every shard's recovery memory taken as written whole (A-926), as a daemon over an image before its
+  /// marks takes it: what a give-back test needs given back, a fresh daemon's being unwritten.
+  pub fn take_recovery_memory_as_written_whole(&self) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), |s| {
+        let totals = recovery_totals(s);
+        s.journal.forget_what_was_given_back(totals);
+      })?;
+    }
+    Ok(())
+  }
+
   /// Test support: the bytes of dead recovery memory every shard has still to give back (A-226): what the give-back's
   /// own record says is left, so a test waits on the give-back's completion rather than on how long it usually takes.
   pub fn recovery_left_to_give_back(&self) -> Result<u64, ObserveError> {
@@ -6212,6 +6224,31 @@ fn return_dead_recovery_timed(
   s: &mut ShardState,
   cpu: &mut impl FnMut() -> Option<u64>,
 ) -> (usize, bool) {
+  let slice = give_back_slice(s);
+  let started = cpu();
+  let mut left = slice;
+  let (journal, journal_more) = give_back_dead_journal(s, &mut left);
+  // The partition's log ring past its tail and its snapshot slots past their payloads, in what the slice has left
+  // (A-926 part 2; A-746's owed give-back), whether or not the journal had any: their marks fall after.
+  let partition = s.partition;
+  let segment = s
+    .segment
+    .give_back_dead(partition, (left, None))
+    .unwrap_or_default();
+  left = left.saturating_sub(segment.walked);
+  learn_give_back_rate(s, slice.saturating_sub(left), spent_since(started, cpu()));
+  let returned = journal.saturating_add(segment.bytes);
+  s.count(
+    RECOVERY_RETURNED,
+    u64::try_from(returned).unwrap_or(u64::MAX),
+  );
+  (returned, journal_more || segment.more)
+}
+
+/// The journal's part of [`return_dead_recovery_timed`]: its dead ranges given back from the top, at most `left` bytes,
+/// `left` lowered by what it walked, and the slice's marks lowered after (A-926). The bytes the object took, and whether
+/// some is left; none where nothing is committed or the shard keeps no content object.
+fn give_back_dead_journal(s: &mut ShardState, left: &mut usize) -> (usize, bool) {
   let (slots_start, slots_end) = s.content_range;
   let (log_start, log_end) = s.delta_range;
   let Some(dead) = s.journal.dead_ranges(
@@ -6220,22 +6257,55 @@ fn return_dead_recovery_timed(
   ) else {
     return (0, false);
   };
-  let slice = give_back_slice(s);
-  let started = cpu();
+  // Each dead range runs to its memory's end (the stale slot whole, the log past its tail), so it is given back to its
+  // last page's end within that: the journal's extents are bytes (A-926), and a give-back takes whole pages only, so a
+  // range ending mid-page left that page resident, and one under a page gave back nothing at all.
+  // Rounded in the object's own pages (a region need not start on one), so a give-back's top-down pieces of whole pages
+  // each hold one: rounded within the region, a page-sized piece straddled two and gave back nothing.
+  let page = s.config.page.max(1);
+  // A range already given back whole stays empty: rounded, an empty range's partial page took a share of every slice
+  // and gave nothing back, and the give-back never ended.
+  let page_end = |base: usize, (offset, len): (usize, usize), limit: usize| -> (usize, usize) {
+    if len == 0 {
+      return (offset, 0);
+    }
+    let end = base
+      .saturating_add(offset)
+      .saturating_add(len)
+      .checked_next_multiple_of(page)
+      .unwrap_or(usize::MAX)
+      .saturating_sub(base)
+      .min(limit)
+      .max(offset.saturating_add(len));
+    (offset, end.saturating_sub(offset))
+  };
+  let (first, second) = slates_vfs::recover::slots_of_memory(slots_end.saturating_sub(slots_start));
+  let stale_end = if dead.stale_slot.0 == first.0 {
+    first.0.saturating_add(first.1)
+  } else {
+    second.0.saturating_add(second.1)
+  };
+  let dead = slates_vfs::checkpoint_log::DeadRanges {
+    stale_slot: page_end(slots_start, dead.stale_slot, stale_end),
+    log_past_tail: page_end(
+      log_start,
+      dead.log_past_tail,
+      log_end.saturating_sub(log_start),
+    ),
+  };
   let Some(object) = s.content.as_mut() else {
     return (0, false);
   };
-  let mut left = slice;
   // The top `left` bytes of `(offset, len)` within the region at `base`: given back, the offset they start at (what
   // the journal records), and the bytes the object took. `None` when the object refused.
   let mut give_back = |base: usize, (offset, len): (usize, usize)| -> Option<(usize, usize)> {
-    let piece = len.min(left);
+    let piece = len.min(*left);
     let from = offset.saturating_add(len).saturating_sub(piece);
     if piece == 0 {
       return Some((from, 0));
     }
     let bytes = object.discard(base.checked_add(from)?, piece).ok()?;
-    left = left.saturating_sub(piece);
+    *left = left.saturating_sub(piece);
     Some((from, bytes))
   };
   let stale_slot = give_back(slots_start, dead.stale_slot);
@@ -6248,14 +6318,9 @@ fn return_dead_recovery_timed(
   if let (Some(log), Some(object)) = (s.write_log.as_mut(), s.content.as_mut()) {
     let _lowered = log.lower_journal_marks(object, s.journal.written());
   }
-  learn_give_back_rate(s, slice.saturating_sub(left), spent_since(started, cpu()));
   let returned = stale_slot
     .map_or(0, |(_, bytes)| bytes)
     .saturating_add(log_past_tail.map_or(0, |(_, bytes)| bytes));
-  s.count(
-    RECOVERY_RETURNED,
-    u64::try_from(returned).unwrap_or(u64::MAX),
-  );
   let more = stale_slot.is_some_and(|(from, _)| from > dead.stale_slot.0)
     || log_past_tail.is_some_and(|(from, _)| from > dead.log_past_tail.0);
   (returned, more)

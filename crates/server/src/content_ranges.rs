@@ -289,8 +289,23 @@ fn targets(state: &ShardState) -> Plan {
       slates_anchor::layout::RegionKind::Snapshot(partition, 1),
     ),
   ] {
-    if let Ok(len) = state.segment.region_len(kind) {
-      targets.push(Target::Segment { range, kind, len });
+    // As far as the region's mark says it may hold pages (A-926 part 2), never the region whole.
+    let marked = state
+      .segment
+      .region_marks(partition)
+      .ok()
+      .map(|marks| match kind {
+        slates_anchor::layout::RegionKind::Snapshot(_, slot) => {
+          marks.snapshots.get(usize::from(slot)).copied().unwrap_or(0)
+        }
+        _ => marks.ring,
+      });
+    if let (Ok(len), Some(marked)) = (state.segment.region_len(kind), marked) {
+      targets.push(Target::Segment {
+        range,
+        kind,
+        len: marked.min(len),
+      });
     }
   }
   targets.retain(|target| target.len() > 0);
@@ -938,21 +953,31 @@ mod tests {
         (log.written_bytes() + marks.slots[0] + marks.slots[1] + marks.log).div_ceil(page);
       let (images, deltas) = (state.content_range, state.delta_range);
       let whole = (images.1 - images.0 + deltas.1 - deltas.0) / page;
+      // The segment's log ring and snapshot slots as their marks hold them (A-926 part 2).
+      let segment = state.segment.region_marks(state.partition).unwrap();
+      let segment_marked =
+        (segment.ring + segment.snapshots[0] + segment.snapshots[1]).div_ceil(page);
+      let segment_planned = pages(&|range| range == SEGMENT_LOG || range == SEGMENT_SNAPSHOTS);
       (
-        content_pages,
-        content_ranges,
-        marked,
-        whole,
+        (content_pages, content_ranges, marked, whole),
         (all_pages, all_ranges),
+        (segment_planned, segment_marked),
       )
     });
-    let sweeps = first_sweep_within(&daemon, 1_000_000);
-    let walked = crate::daemon::observe_first(&daemon, |state| state.content_sweep.pages);
+    first_sweep_within(&daemon, 1_000_000);
+    let (sweeps, walked) = crate::daemon::observe_first(&daemon, |state| {
+      (state.content_sweep.sweeps, state.content_sweep.pages)
+    });
     daemon.stop();
-    let (content_pages, content_ranges, marked, whole, (all_pages, all_ranges)) = planned;
+    let (
+      (content_pages, content_ranges, marked, whole),
+      (all_pages, all_ranges),
+      ((segment_pages, segment_ranges), segment_marked),
+    ) = planned;
     println!(
       "content_ranges: the plan's journal and write log {content_pages} pages in {content_ranges} ranges (marked \
-       {marked}, whole {whole}); the sweep walked {walked} pages of a plan of {all_pages}"
+       {marked}, whole {whole}); the segment's {segment_pages} in {segment_ranges} (marked {segment_marked}); {sweeps} \
+       sweeps walked {walked} pages of a plan of {all_pages}"
     );
     assert!(sweeps > 0, "a sweep completed");
     assert!(
@@ -963,11 +988,16 @@ mod tests {
       content_pages * 100 < whole,
       "far under the memories whole: {content_pages} of {whole}"
     );
-    // The plan read here and the one the sweep made at its start may differ by what moved between (the arena's held
-    // runs, a client's ring): within a percent of it and a step a range.
     assert!(
-      walked as usize <= all_pages + all_pages / 100 + all_ranges,
-      "the sweep walked {walked} pages, past its plan's {all_pages}"
+      segment_pages <= segment_marked + segment_ranges,
+      "the segment's regions planned {segment_pages} pages, past the {segment_marked} marked and a page a range"
+    );
+    // The plan read here and the one each sweep made at its start may differ by what moved between (the arena's held
+    // runs, a client's ring): each sweep, and one under way, within a percent of it and a step a range.
+    let each = all_pages + all_pages / 100 + all_ranges;
+    assert!(
+      walked as usize <= (sweeps as usize + 1) * each,
+      "{sweeps} sweeps walked {walked} pages, past {each} a sweep"
     );
   }
 
@@ -980,7 +1010,7 @@ mod tests {
     hogs: usize,
   ) -> (
     (u64, u64, bool),
-    (Option<std::time::Duration>, u64, (u64, bool)),
+    (Option<std::time::Duration>, u64, (bool, bool)),
     (std::time::Duration, std::time::Duration),
   ) {
     let stop = std::sync::atomic::AtomicBool::new(false);
@@ -1003,7 +1033,7 @@ mod tests {
   #[allow(clippy::type_complexity)]
   fn status_sweep_watch() -> (
     (u64, u64, bool),
-    (Option<std::time::Duration>, u64, (u64, bool)),
+    (Option<std::time::Duration>, u64, (bool, bool)),
     (std::time::Duration, std::time::Duration),
   ) {
     /// Shape: the memory report's kinds' bound: swept on idle time within ten liveness budgets.
@@ -1043,9 +1073,19 @@ mod tests {
     let took_ns = crate::daemon::observe_first(&daemon, |state| {
       state.content_sweep.last.map_or(0, |(_, took)| took)
     });
+    // The request right after the completed sweep, and whether the spacing rule allowed what it did: armed none, or
+    // armed one no sooner after the last completed than that one took (A-926: a sweep of microseconds is spaced by
+    // microseconds).
     let spaced = crate::daemon::observe_first(&daemon, |state| {
+      let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+      let last = state.content_sweep.last;
+      let before = state.content_sweep.spaced;
       report(state, true);
-      (state.content_sweep.spaced, state.content_sweep.running)
+      let armed = state.content_sweep.running;
+      let spaced = state.content_sweep.spaced - before == 1 && !armed;
+      let past_its_length =
+        armed && last.is_some_and(|(completed, took)| now >= completed.saturating_add(took));
+      (spaced, past_its_length)
     });
     let pages = crate::daemon::observe_first(&daemon, |state| state.content_sweep.pages);
     daemon.stop();
@@ -1068,7 +1108,7 @@ mod tests {
   /// holds it to progress alone.
   fn assert_the_status_sweep_kept_its_bounds(
     seen: (u64, u64, bool),
-    (kinds_seen, took_ns, spaced): (Option<std::time::Duration>, u64, (u64, bool)),
+    (kinds_seen, took_ns, spaced): (Option<std::time::Duration>, u64, (bool, bool)),
     (watch, kinds): (std::time::Duration, std::time::Duration),
   ) {
     let (sweeps, idle_slices, running) = seen;
@@ -1089,10 +1129,10 @@ mod tests {
       "the memory report's kinds passed within {kinds:?}: {kinds_seen:?}"
     );
     assert!(took_ns > 0, "the completed sweep says how long it took");
-    assert_eq!(
-      spaced,
-      (1, false),
-      "a request right after a sweep completed armed none: (spaced, running) {spaced:?}"
+    assert!(
+      spaced.0 || spaced.1,
+      "a request right after a sweep completed armed none, or one no sooner than the last took: (spaced, armed past its \
+       length) {spaced:?}"
     );
   }
 

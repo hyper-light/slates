@@ -64448,8 +64448,36 @@ measured noise of the 100 figure, not a literal.
     now opens over the extents its predecessor's marks carry, and every written byte stays inside the written ranges.
 - **Measured** (debug, the MacBook, 2026-11-25): the sweep 3,495,300 pages (12,582,958 before). Alone, 1.6 s over
   40,988 idle slices (23.7 s, 1,185,392 before). Loaded, two hogs a core, 1.6 s over 40,730 (55.5 s, 3,075,443 before).
-- **Part 2, owed:** the segment's log and snapshot regions (3,495,255 pages, the anchor's format, the register's code)
-  get marks of their own, with their own migration.
+- **Part 2** (main's ruling (b) of 2026-11-25: marks, and the give-back A-746 owed): the segment's log ring and snapshot
+  slots, 3,495,255 of the fresh daemon's pages.
+  - **Where:** each partition's log ring header's spare words (32 to 56, `layout::RING_MARKS_VERSION` and after) hold
+    a version word ("RMRK", 1) and the marks of its ring and of each of its snapshot slots. No offset moves, and the
+    anchor's layout version stays.
+  - **Raised before the write:** `LogRing::write` raises the ring's mark (the record's end, or the whole ring once it
+    wraps) before its copy, and `AnchorSegment::publish` raises a snapshot slot's (its payload's end) before the
+    payload, each with a release fence.
+  - **The give-back** (`AnchorSegment::give_back_dead`, run beside the journal's in `daemon::return_dead_recovery`, in
+    what its slice leaves) takes only what no read reaches again: the ring past its tail while it has not wrapped since
+    a snapshot released it (replay reads from the head to the tail, A-71's reset putting both at the first byte), and
+    each snapshot slot past its payload (a seqlock reader takes the length only; `SparseObject::discard_racy`, its
+    bytes being racy). It works from the top down, then lowers the mark.
+  - **The migration:**
+    - a segment made before part 2 (the version word zero) is adopted at `AnchorSegment::attach`: every mark whole,
+      then the version word;
+    - a fresh segment's version word is set at creation (`init_rings`), its marks zero;
+    - an adopted segment's whole falls at its first give-back after a release.
+  - **What a restart on an old segment costs:** one walk and one give-back of each region whole.
+  - **Reds:**
+    - `an_old_segment_is_adopted_whole_then_its_give_back_makes_its_marks_exact`;
+    - `a_crash_at_every_store_of_a_give_back_recovers_the_database_and_resumes_to_the_reference`: each of seven crash
+      points recovers the history's database, and the resumed give-back reaches the reference's marks;
+    - `a_crash_after_a_payloads_bytes_leaves_its_slots_mark_covering_them` and
+      `a_crash_after_a_records_bytes_leaves_the_rings_mark_covering_them`: with the raise after the write, mark 0
+      against a payload to 12,304, and 12,288 against a record to 16,524;
+    - `a_growing_log_raises_its_mark_once_a_page` (`crates/db/tests/segment_marks.rs`): one raise a page the tail
+      crosses, 11.9 against 13.4 us an append with the marks whole (debug);
+    - `a_released_rings_pages_go_back_to_the_os`: 96 MiB released, the physical footprint 98 MiB to 4 MiB on macOS.
+  - **The sweep:** a fresh daemon's is 46 pages (3,495,300 after part 1), completing in one idle slice.
 - **Applied in the same change to:**
   - `crates/vfs/src/checkpoint_log.rs` (`WrittenExtents`, `Journal::over`, `Journal::recover`'s extents, the extents
     a slot by place);
@@ -64457,5 +64485,10 @@ measured noise of the 100 figure, not a literal.
   - `crates/server/src/write_log.rs` (the marks block, version 3, the migration);
   - `crates/server/src/verbs.rs` (`ContentSlots`' raise, `read_journal`'s extents);
   - `crates/server/src/daemon.rs` (the open, the give-back's lowering);
-  - `crates/server/src/content_ranges.rs` (the block's page in the plan, the marks' rows);
-  - A-826's GAPS entry.
+  - `crates/server/src/content_ranges.rs` (the block's page in the plan, the marks' rows, the segment's regions by
+    their marks);
+  - part 2: `crates/anchor/src/layout.rs` and `segment.rs` (the ring header's marks, `region_marks`,
+    `raise_region_mark`, `give_back_dead`, `unmark`), `crates/mem/src/shared.rs` (`discard_racy`),
+    `crates/db/src/record.rs` (the ring's raise), `crates/db/tests/segment_marks.rs` and
+    `segment_give_back_footprint.rs`;
+  - A-826's and A-746's GAPS entries.
