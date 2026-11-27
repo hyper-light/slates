@@ -23,9 +23,9 @@
 //! every batch queued, then the join. Each shard thread holds its own sender, installed at its start as the spawner's
 //! end is ([`install`]), and gone with the thread.
 //!
-//! **What it reports.** Each shard thread counts what it handed and what it dropped in place ([`counts`]). The reaper
+//! **What it reports.** Each shard thread counts what it handed and what it dropped in place (`counts`). The reaper
 //! reads its own thread's CPU, user and system time around each batch's drop and keeps the totals in its daemon's slot
-//! ([`spent`]), one a control shard as the doorbell's flags are, so its time is reported apart from the shards'.
+//! (`spent`), one a control shard as the doorbell's flags are, so its time is reported apart from the shards'.
 
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -257,7 +257,7 @@ pub(crate) fn spent(control: u16) -> Spent {
   }
 }
 
-/// What a shard thread handed its reaper and what it dropped in place ([`counts`]).
+/// What a shard thread handed its reaper and what it dropped in place (`counts`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReapCounts {
   /// The batches handed.

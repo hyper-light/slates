@@ -1049,7 +1049,7 @@ impl Index {
   }
 
   /// The next path the revision did something at numbered ([`Builder::intern`]) and its event kept, checked against the
-  /// paths numbered so far, as [`Index::check_plan`] checks a whole plan's; once every one is, the maps' bytes next.
+  /// paths numbered so far, as `Index::check_plan` checks a whole plan's; once every one is, the maps' bytes next.
   fn intern_unit(&self, planning: &mut Planning) -> Result<PlanPhase, IndexRefusal> {
     let Some((path, done)) = planning.built.staged.pop_first() else {
       return Ok(PlanPhase::Bytes(0));

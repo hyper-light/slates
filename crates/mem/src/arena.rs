@@ -219,7 +219,7 @@ pub struct ChunkArena {
   /// Where an unfinished purge resumes: the region id and the byte within it.
   purge_cursor: Option<(u16, usize)>,
   /// Whether a recorded run may reach the discard size since the last walk began: set by a mark that made one
-  /// ([`UnitSet::run_reaches`]), cleared as a walk begins. A purge with none owed and no walk under way walks nothing,
+  /// (`UnitSet::run_reaches`), cleared as a walk begins. A purge with none owed and no walk under way walks nothing,
   /// so short runs kept recorded cost an idle shard nothing (main's ruling of 2026-11-25).
   purge_owed: bool,
   /// Allocations so far, monotone: a caller that sees it unchanged across an interval knows the arena was idle.

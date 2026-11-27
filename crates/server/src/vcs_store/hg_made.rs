@@ -6,7 +6,7 @@
 //! changeset, so the repository's history had no changeset of it, and the next push's race checks met a line moved to no
 //! head they knew.
 //!
-//! **What.** As the version commits on the owner ([`make`], from `verbs::judge_submission`, after git's and
+//! **What.** As the version commits on the owner (`make`, from `verbs::judge_submission`, after git's and
 //! Subversion's), the changeset of the version's change (`slates_hg::push::made`): its parent the line's head before the
 //! version ([`head_of`] at the version before), each path the green changed between the two versions
 //! (`Green::changed_between`) its bytes and flag at the head (a symbolic link's target with `l`, an executable `x`), or
@@ -20,7 +20,7 @@
 //! entry naming it by reference (`write_made_reference`). A recorded submit takes the deferred-submit hook (A-807,
 //! `crate::made_commit`, [`make_deferred`]): the repository's landing turn before its verdict, the changeset made from a
 //! preview of the held verdict, landed on the store by a task, then the version and the entry committed in one step,
-//! then the answer; a store that refused it gives the accept up. A bare dispatch ([`make`]) takes the turn in its step
+//! then the answer; a store that refused it gives the accept up. A bare dispatch (`make`) takes the turn in its step
 //! and a task lands and records the changeset after it, in its own transaction. A client's push landed between a made
 //! changeset's making and its commit leaves its fork stale: the version stands alone, counted.
 

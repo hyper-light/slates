@@ -360,7 +360,7 @@ impl Increment {
     wholes
   }
 
-  /// [`Increment::unread`] among the runs `wanted` marks by place (a replay's, [`Green::replay_reads`]); every run where
+  /// [`Increment::unread`] among the runs `wanted` marks by place (a replay's, `Green::replay_reads`); every run where
   /// `wanted` does not reach it.
   pub fn unread_among(&self, wanted: &[bool]) -> Option<&crate::named::NamedRun> {
     self.named.runs.iter().enumerate().find_map(|(at, run)| {
@@ -381,7 +381,7 @@ impl Increment {
     self.read_step_among(objects, slice, &[])
   }
 
-  /// [`Increment::read_step`] over the runs `wanted` marks by place (a replay's, [`Green::replay_reads`]): whether every
+  /// [`Increment::read_step`] over the runs `wanted` marks by place (a replay's, `Green::replay_reads`): whether every
   /// one of them is read. A run `wanted` does not reach is read.
   ///
   /// One call reads on from the first run unread into the next, run after run, until its `slice` is spent, so reading

@@ -938,7 +938,7 @@ pub(crate) const CHECKPOINT_IDENTITY_STEPS: &str = "merge.checkpoint.identity_st
 /// of [`CheckpointHold::step`]: more than one for a checkpoint is the hold spread over turns.
 pub(crate) const CHECKPOINT_HOLD_STEPS: &str = "merge.checkpoint.hold_steps";
 
-/// How many units a checkpoint hold's paced step takes where a test pins it ([`HOLD_UNITS_A_STEP`]); none in the
+/// How many units a checkpoint hold's paced step takes where a test pins it (`HOLD_UNITS_A_STEP`); none in the
 /// product, where the step's quantum decides (`slates_pace::Step::more`).
 fn hold_units_a_step() -> Option<u32> {
   #[cfg(test)]
@@ -3201,11 +3201,10 @@ pub(crate) fn hold_increment(
 /// step of its landing's entry): the encoding's chunks hashed into the inputs archive's manifest a copy slice a unit
 /// (A-920 7c: a chunk a unit, up to 1 MiB, was 10.4 ms of one step, debug), then its
 /// stage opened in the content store under the green's object, the chunks copied in a chunk a unit
-/// (`stage_lent_piece`, [`hold_lent`]'s piece at a time), and the stage completed. The same identity, charges and
+/// (`stage_lent_piece`, `hold_lent`'s piece at a time), and the stage completed. The same identity, charges and
 /// refusals as [`hold_increment`]; dropped part-way, it leaves only its stage, which the next hold of the green's object
 /// gives way to.
 ///
-/// [`hold_lent`]: slates_cluster::content::ContentStore::hold_lent
 pub(crate) struct IncrementHold {
   /// The green.
   green: DbVolumeId,

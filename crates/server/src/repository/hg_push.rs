@@ -1533,7 +1533,7 @@ async fn unbundled(
 }
 
 /// [`unbundled`]'s landing once its run is recorded ([`landed_after_builds`]), held first where a test asked for it
-/// ([`held_before_landing`]).
+/// (`held_before_landing`).
 async fn landed_recorded(
   repository: RepositoryId,
   (principal, name): (&Principal, [u8; 32]),
@@ -2402,7 +2402,7 @@ impl BringBackRefused {
 
 /// Brings back the windows of the revision `node` that repository `repository` holds under `path` (goal 93 item 2b(b);
 /// w-shared's seam 1, main's ruling of 2026-11-22 18:43): a file's, or the changelog's or manifest log's by the path
-/// their kept texts are named with ([`bring_back_log`]). Where any window was let go once its segment landed
+/// their kept texts are named with (`bring_back_log`). Where any window was let go once its segment landed
 /// ([`hg_run::let_go_windows`](super::hg_run::let_go_windows)), its whole text is read from the node's changeset store
 /// off the shard's step ([`hg_view::answer_store_wants`]), then put back by the identities the repository's index
 /// names, within the room its bytes take ([`file_put_back`]). Ok where it is held whole after (brought back, or never
