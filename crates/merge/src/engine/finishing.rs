@@ -118,7 +118,7 @@ impl Finishing {
     let (copies, d, c) = (&r.copies, &mut self.drains, &mut self.copied);
     let inside = |path: &str| inside_copies(copies, path);
     match self.stage {
-      Stage::Specials => return self.special_checked(r),
+      Stage::Specials => self.special_checked(r),
       Stage::Renames => route_across(
         &mut d.renames,
         (&mut r.renames, &mut r.across_copies),

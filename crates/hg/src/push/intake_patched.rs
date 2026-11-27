@@ -77,9 +77,10 @@ impl FileBase {
     // The block whole where the framing read is its markers and every byte of it; the bytes whole where none of their
     // windows is away. A block read short leaves the bytes' length long by as much, which no read of them meets.
     let block_whole = row.block.is_none_or(|block| {
-      store
-        .len_of(&block)
-        .is_some_and(|len| to_u64(framing.len()) == len.saturating_add(to_u64(2 * MARKER.len())))
+      store.len_of(&block).is_some_and(|len| {
+        let marker = to_u64(MARKER.len());
+        to_u64(framing.len()) == len.saturating_add(marker).saturating_add(marker)
+      })
     });
     let bytes_len = row.len.checked_sub(to_u64(framing.len()))?;
     let whole = block_whole && store.holds_whole(&row.bytes);

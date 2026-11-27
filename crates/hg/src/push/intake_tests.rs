@@ -3365,24 +3365,7 @@ fn a_file_delta_on_a_base_whose_block_was_let_go_is_taken_after_its_base_is_brou
   // Derived: a step a revision of the push's three (its changeset, manifest and file) and a step a window of B's text,
   // each at most four times over (an ask, its answer, the read again, the stage moved on).
   let bound = 4 * (3 + b.len().div_ceil(WINDOW) as u64);
-  let (mut steps, mut asked) = (0_u64, 0_u64);
-  let taken = loop {
-    if steps >= bound {
-      break false;
-    }
-    steps += 1;
-    match intake.step(&second, &mut store, &mut room()).unwrap() {
-      Stepped::Store => match intake.asked_text() {
-        Some(_) => {
-          asked += 1;
-          intake.answer_text(Some(a.clone()));
-        }
-        None => intake.answer_from_fork(&store),
-      },
-      stepped if more(&stepped) => {}
-      _ => break true,
-    }
-  };
+  let (taken, steps, asked) = stepped_answering(&mut intake, &second, &mut store, (&a, bound));
   println!(
     "a delta on a base whose block was let go: {steps} steps of at most {bound}, the store asked {asked} times"
   );
@@ -3402,4 +3385,33 @@ fn a_file_delta_on_a_base_whose_block_was_let_go_is_taken_after_its_base_is_brou
     intaken.base_store_reasked
   );
   fork.release(&mut store).unwrap();
+}
+
+/// Steps `intake` over `payload` until it is taken or `bound` steps have passed, every ask of the store answered with
+/// `text`: whether it was taken, the steps it took and the store's asks.
+fn stepped_answering(
+  intake: &mut Intake,
+  payload: &[u8],
+  store: &mut ContentStore,
+  (text, bound): (&[u8], u64),
+) -> (bool, u64, u64) {
+  let (mut steps, mut asked) = (0_u64, 0_u64);
+  let taken = loop {
+    if steps >= bound {
+      break false;
+    }
+    steps += 1;
+    match intake.step(payload, store, &mut room()).unwrap() {
+      Stepped::Store => match intake.asked_text() {
+        Some(_) => {
+          asked += 1;
+          intake.answer_text(Some(text.to_vec()));
+        }
+        None => intake.answer_from_fork(store),
+      },
+      stepped if more(&stepped) => {}
+      _ => break true,
+    }
+  };
+  (taken, steps, asked)
 }
