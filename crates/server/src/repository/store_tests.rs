@@ -1399,6 +1399,9 @@ fn a_cleanly_restarted_import_brings_back_only_its_checkpoints_named_texts() {
 /// lane, 2026-11-27). Expect the same, and at least one named text of more than one window (non-vacuity). Red before the
 /// fix to `image_split` on any host: the image's (whole, Away) read (1, 2) against the recovery's (0, 3), the text of
 /// two windows read whole.
+/// This run closes CLAUDE.md's degenerate-parameter gotcha for the test: at a 16 KiB page every text of `full.dump` is
+/// one window, a degenerate case of the counting that certified nothing about a text of several, so the miscount stayed
+/// green on every Mac while it failed every 4 KiB-page lane.
 #[test]
 fn a_cleanly_restarted_import_counts_a_text_of_several_windows_by_its_windows() {
   /// Shape: a 4 KiB page, the page of the hosts whose window a text of `full.dump` spans more than one of.
