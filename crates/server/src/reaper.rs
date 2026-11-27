@@ -176,14 +176,16 @@ struct ReaperSpent {
 }
 
 impl ReaperSpent {
-  /// None yet.
-  const NONE: ReaperSpent = ReaperSpent {
-    batches: AtomicU64::new(0),
-    taken: AtomicU64::new(0),
-    cpu_ns: AtomicU64::new(0),
-    user_ns: AtomicU64::new(0),
-    system_ns: AtomicU64::new(0),
-  };
+  /// None yet: a fresh slot, made in place for each slot of a static, never shared through a constant.
+  const fn none() -> ReaperSpent {
+    ReaperSpent {
+      batches: AtomicU64::new(0),
+      taken: AtomicU64::new(0),
+      cpu_ns: AtomicU64::new(0),
+      user_ns: AtomicU64::new(0),
+      system_ns: AtomicU64::new(0),
+    }
+  }
 
   /// Cleared, for a reaper starting on this slot.
   fn clear(&self) {
@@ -211,7 +213,7 @@ impl ReaperSpent {
 /// One reaper's totals per control shard, indexed by the shard's registry id: a table, not one total, because a process
 /// that runs several daemons (the test suites) must give each its own, as the doorbell's flags do.
 static REAPER_SPENT: [ReaperSpent; slates_rt::registry::MAX_SHARDS] =
-  [const { ReaperSpent::NONE }; slates_rt::registry::MAX_SHARDS];
+  [const { ReaperSpent::none() }; slates_rt::registry::MAX_SHARDS];
 
 /// The slot of the daemon whose control shard is `control`: the first for an id past the table, which the registry
 /// never hands out.
@@ -223,7 +225,7 @@ fn spent_slot(control: u16) -> &'static ReaperSpent {
 }
 
 /// The slot no registry id names, for a table that could not be read (it always can).
-static FALLBACK_SPENT: ReaperSpent = ReaperSpent::NONE;
+static FALLBACK_SPENT: ReaperSpent = ReaperSpent::none();
 
 /// A reaper's totals so far, as [`spent`] reads them.
 #[cfg(test)]
