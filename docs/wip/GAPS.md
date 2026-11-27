@@ -541,19 +541,19 @@
 >   stops_the_resolution_until_it_is_back` and `git_push::tests::b1b_a_thin_pushs_delta_on_a_delta_whose_base_was_
 >   let_go_is_resolved_once_it_is_back` (a nanosecond step budget, the first push's pack let go once the middle tree
 >   is admitted).
-> - **B2 BUILT (w-git, 2026-11-26): the server's tag-headed green.** `ShardGreens::tree_of` reads the annotated tag at
->   a green's head through the push's `IndexedObjects`; on a let-go window it answered no version, and the verdicts
->   took the ref as moved (`failed to update ref`, "cannot lock ref"), for an update and for a delete alike. Now
+> - **B2 BUILT (w-git, 2026-11-26): the server's tag-headed green.** `ShardGreens::tree_of` reads the annotated tag at a
+>   green's head through the push's `IndexedObjects`; on a let-go window it answered no version, and the verdicts took
+>   the ref as moved (`failed to update ref`, "cannot lock ref"), for an update and for a delete alike. Now
 >   `Verdicts::prepare` asks an update's and a delete's base through `Verdicts::base_of`, which answers wait where the
->   version is none and the repository names a let-go window, by the one rule, so the push's driver brings it back
->   (a delete was answered ready at once by `ServerJudge::ready`, and now takes the build turn its preparation needs);
+>   version is none and the repository names a let-go window, by the one rule, so the push's driver brings it back (a
+>   delete was answered ready at once by `ServerJudge::ready`, and now takes the build turn its preparation needs);
 >   `IndexedObjects` drops a let-go met by an earlier ask before one answered from what it kept. Reds:
 >   `git_push::tests::b2_an_update_of_a_ref_whose_green_is_headed_by_a_let_go_tag_brings_it_back_and_lands` and
 >   `b2_a_delete_of_...` (the tag in a window of its own past a filler blob; once the create's derivation has ended,
 >   every window let go and the repository idle in the push's own task before its first step, the tag's window asserted
 >   let go by its number; both `failed to update ref` before, and after, the push's own driver bringing it back; main's
->   run 10 of 16 had the delete pass with nothing brought back when the let-go was made before the push's task). No unit red below the server: the miss is `ShardGreens`', and
->   `prepare` is driven only by the server's judge.
+>   run 10 of 16 had the delete pass with nothing brought back when the let-go was made before the push's task). No unit
+>   red below the server: the miss is `ShardGreens`', and `prepare` is driven only by the server's judge.
 > - OPEN: B3 (the admission's peel and references), B4 (the policy's reads), B5 (`PushedObjects::bytes` of a pushed
 >   object, `Malformed`), B6 (a verdict's one-call build), B7 (`push_of`'s peel at judge time, after `prepare`'s), B8
 >   (the encoding's tree walk: time, not correctness).

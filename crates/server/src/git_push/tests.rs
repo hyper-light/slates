@@ -1769,8 +1769,8 @@ fn thin_chain_update_over_a_create(
 /// annotated tag of `main`'s commit lying in a window of its own past a filler blob ([`tag_headed_create`]); let every
 /// window of that pack go and the repository go idle, its reads' cache given back; then update `refs/tags/v1` to
 /// another annotated tag of the same commit, the pack that tag alone. Expect: `ok`, the old tag's window brought back
-/// by the push's own driver ([`tag_headed_pushed`]: let go in the push's task, asserted let go before it reads). Red before: `ng refs/tags/v1 failed to update ref` ("cannot lock
-/// ref"), the old value read as moved.
+/// by the push's own driver ([`tag_headed_pushed`]: let go in the push's task, asserted let go before it reads). Red
+/// before: `ng refs/tags/v1 failed to update ref` ("cannot lock ref"), the old value read as moved.
 #[test]
 fn b2_an_update_of_a_ref_whose_green_is_headed_by_a_let_go_tag_brings_it_back_and_lands() {
   let (updated, driven, refused) = tag_headed_pushed("tag-headed-update", |old, commit| {
@@ -1818,10 +1818,10 @@ fn b2_a_delete_of_a_ref_whose_green_is_headed_by_a_let_go_tag_brings_it_back_and
   );
 }
 
-/// On a stored daemon's repository `name`: [`tag_headed_create`] pushed, `ok`, and the derivation behind it ended, so no
-/// write path holds or lets go its pack's windows after; then, in the next push's own task, before its first step and
-/// with nothing between (main's order of 2026-11-26: B2's delete once brought nothing back under burners, the window
-/// resident when it read it), every window of that pack let go by hand and the repository idle
+/// On a stored daemon's repository `name`: [`tag_headed_create`] pushed, `ok`, and the derivation behind it ended, so
+/// no write path holds or lets go its pack's windows after; then, in the next push's own task, before its first step
+/// and with nothing between (main's order of 2026-11-26: B2's delete once brought nothing back under burners, the
+/// window resident when it read it), every window of that pack let go by hand and the repository idle
 /// (`git_encode::give_back_idle`, so no read is served from what its reads kept), the tag's window asserted let go by
 /// its let-go's number; then the request `second` makes of the tag's id and its commit's, driven as an edge drives it
 /// ([`let_go_when`]). What that push received, the windows its own driver brought back of ones its steps noted, and the
