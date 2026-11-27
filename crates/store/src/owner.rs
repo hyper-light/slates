@@ -41,8 +41,7 @@ use std::fmt;
 use slates_land::store_root::StoreRoot;
 use slates_rt::sync::{self, ChannelReceiver, Sender, SyncError};
 
-use crate::log::Section;
-use crate::log::{Header, Located, SectionKind};
+use crate::log::{Header, Located, LogError, Section, SectionKind};
 use crate::staging::{Identity, Staging};
 use crate::store::{Changeset, Contents, PIECE_BYTES, Sizing, Store, StoreError};
 use crate::texts::{Place, TextCache, TextRow};
@@ -678,7 +677,8 @@ impl Landings {
   }
 }
 
-/// `row`'s sections, each small one with its bytes.
+/// `row`'s sections, each small (`<= PIECE_BYTES`) one read into memory and verified against its
+/// closed section head's CRC-32C before being returned.
 fn sections_of(store: &Store, row: &Changeset) -> Result<Vec<SectionAt>, StoreError> {
   let piece = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
   store
@@ -686,7 +686,9 @@ fn sections_of(store: &Store, row: &Changeset) -> Result<Vec<SectionAt>, StoreEr
     .into_iter()
     .map(|section| {
       let inline = if section.len <= piece {
-        Some(store.read(section.offset, section.len)?)
+        let bytes = store.read(section.offset, section.len)?;
+        section.verify_bytes(&bytes)?;
+        Some(bytes)
       } else {
         None
       };
@@ -824,6 +826,51 @@ impl StoreHandle {
         answers,
       )
       .await
+  }
+
+  /// Reads an entire [`SectionAt`] (returning already-verified inline bytes when present, or
+  /// streaming via [`StoreHandle::read`] and verifying accumulated CRC-32C against `section.crc`),
+  /// refusing [`LogError::Corrupt`] on any byte mismatch.
+  pub async fn read_section(&self, at: SectionAt) -> Result<Vec<u8>, OwnerError> {
+    if let Some(bytes) = at.inline {
+      return Ok(bytes);
+    }
+    let section = at.section;
+    let len = usize::try_from(section.len)
+      .map_err(|_| OwnerError::Store(StoreError::Sizing("a section past memory")))?;
+    let mut bytes = Vec::new();
+    bytes
+      .try_reserve_exact(len)
+      .map_err(|_| OwnerError::Store(StoreError::Sizing("a section past memory")))?;
+    let mut crc = section.crc_verifier();
+    while bytes.len() < len {
+      let done = u64::try_from(bytes.len()).map_err(|_| OwnerError::Store(StoreError::BadRow))?;
+      let offset = section
+        .offset
+        .checked_add(done)
+        .ok_or(OwnerError::Store(StoreError::BadRow))?;
+      let rest = section
+        .len
+        .checked_sub(done)
+        .ok_or(OwnerError::Store(StoreError::BadRow))?;
+      let piece = self.read(offset, rest).await?;
+      if piece.is_empty() {
+        return Err(OwnerError::Store(StoreError::Log(LogError::Corrupt(
+          "a section's bytes",
+        ))));
+      }
+      crc.update(&piece);
+      bytes.extend_from_slice(&piece);
+    }
+    if bytes.len() != len {
+      return Err(OwnerError::Store(StoreError::Log(LogError::Corrupt(
+        "a section's bytes",
+      ))));
+    }
+    crc
+      .finish()
+      .map_err(|error| OwnerError::Store(StoreError::Log(error)))?;
+    Ok(bytes)
   }
 
   /// The text `identity` of `repository` from `offset`, as far as one piece reaches, made from its chain on the owner

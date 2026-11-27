@@ -459,9 +459,38 @@ pub(crate) async fn changeset_record(
     .ok_or(Unread::NoRecord)
 }
 
+/// Streams a multi-piece `Record` section from `disk` and verifies its accumulated CRC-32C against
+/// `section.crc`, refusing [`Unread::Store`] on any length or checksum mismatch.
+async fn read_multi_piece_record(
+  disk: &StoreHandle,
+  section: &slates_store::log::Section,
+) -> Result<Vec<u8>, Unread> {
+  let len = usize::try_from(section.len).map_err(|_| Unread::Store)?;
+  let mut record = Vec::new();
+  record.try_reserve_exact(len).map_err(|_| Unread::Store)?;
+  let mut crc = section.crc_verifier();
+  while record.len() < len {
+    let done = u64::try_from(record.len()).map_err(|_| Unread::Store)?;
+    let offset = section.offset.checked_add(done).ok_or(Unread::Store)?;
+    let rest = section.len.checked_sub(done).ok_or(Unread::Store)?;
+    let piece = patiently(|| disk.read(offset, rest)).await?;
+    if piece.is_empty() {
+      return Err(Unread::Store);
+    }
+    crc.update(&piece);
+    record.extend_from_slice(&piece);
+  }
+  if record.len() != len {
+    return Err(Unread::Store);
+  }
+  crc.finish().map_err(|_| Unread::Store)?;
+  Ok(record)
+}
+
 /// Every `Record` section of repository `repository`'s changeset `sequence`, in order, read back from the store `disk` a
 /// piece at a time past one piece: a commit's one record, or an import's batch's revisions (C2 stage C). A busy owner
-/// is asked again after a yield. Refused `NoRecord` where the changeset holds none.
+/// is asked again after a yield. Refused `NoRecord` where the changeset holds none, and `Store` on any section CRC
+/// mismatch.
 pub(crate) async fn changeset_records(
   disk: &StoreHandle,
   repository: RepositoryId,
@@ -479,24 +508,10 @@ pub(crate) async fn changeset_records(
     .into_iter()
     .filter(|at| at.section.kind == SectionKind::Record)
   {
-    if let Some(bytes) = at.inline {
-      records.push(bytes);
-      continue;
-    }
-    let len = usize::try_from(at.section.len).map_err(|_| Unread::Store)?;
-    let mut record = Vec::new();
-    record.try_reserve_exact(len).map_err(|_| Unread::Store)?;
-    while record.len() < len {
-      let done = u64::try_from(record.len()).map_err(|_| Unread::Store)?;
-      let offset = at.section.offset.saturating_add(done);
-      let rest = at.section.len.saturating_sub(done);
-      let piece = patiently(|| disk.read(offset, rest)).await?;
-      if piece.is_empty() {
-        return Err(Unread::Store);
-      }
-      record.extend_from_slice(&piece);
-    }
-    record.truncate(len);
+    let record = match at.inline {
+      Some(bytes) => bytes,
+      None => read_multi_piece_record(disk, &at.section).await?,
+    };
     records.push(record);
   }
   if records.is_empty() {

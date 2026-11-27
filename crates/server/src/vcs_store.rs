@@ -4010,7 +4010,8 @@ async fn read_changeset(
   })
 }
 
-/// A section's bytes read by its place a piece at a time ([`slates_store::owner::StoreHandle::read`]).
+/// A section's bytes read by its place a piece at a time ([`slates_store::owner::StoreHandle::read`])
+/// and verified against `section.crc`.
 async fn section_bytes(
   disk: &slates_store::owner::StoreHandle,
   section: &slates_store::log::Section,
@@ -4018,6 +4019,7 @@ async fn section_bytes(
   let len = usize::try_from(section.len).ok()?;
   let mut bytes = Vec::new();
   bytes.try_reserve_exact(len).ok()?;
+  let mut crc = section.crc_verifier();
   while bytes.len() < len {
     let at = u64::try_from(bytes.len()).ok()?;
     let piece = disk
@@ -4030,9 +4032,10 @@ async fn section_bytes(
     if piece.is_empty() {
       return None;
     }
+    crc.update(&piece);
     bytes.extend_from_slice(&piece);
   }
-  (bytes.len() == len).then_some(bytes)
+  (bytes.len() == len && crc.finish().is_ok()).then_some(bytes)
 }
 
 /// A landed payload's bytes read by its identity a piece at a time ([`slates_store::owner::StoreHandle::piece`]).
@@ -4625,24 +4628,7 @@ async fn segment_record(
   if let Some(bytes) = section.inline {
     return Some(bytes);
   }
-  let len = usize::try_from(section.section.len).ok()?;
-  let mut bytes = Vec::new();
-  bytes.try_reserve_exact(len).ok()?;
-  while bytes.len() < len {
-    let read = u64::try_from(bytes.len()).ok()?;
-    let piece = disk
-      .read(
-        section.section.offset.saturating_add(read),
-        section.section.len.saturating_sub(read),
-      )
-      .await
-      .ok()?;
-    if piece.is_empty() {
-      return None;
-    }
-    bytes.extend_from_slice(&piece);
-  }
-  Some(bytes)
+  section_bytes(disk, &section.section).await
 }
 
 /// [`hg_record_step`] for an import's segment record read back from the changeset log (`bytes`), its length lent at

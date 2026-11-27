@@ -6,7 +6,7 @@ use super::{
   BLOCK_DIGESTS, BlockFile, CHANGESET_ENTRY_BYTES, CHANGESETS, CONTENT_KEY_BYTES,
   CONTENT_VALUE_BYTES, CONTENTS, Changeset, Identity, LogError, Rows, SEAL_BYTES, SectionKind,
   ShardDb, StoreError, U64, content_key, decode_changeset, decode_content, delete_block_digests,
-  field, identity_of_range, index_payload_from_log, put, sections_of,
+  field, index_verified_payload_from_log, put, sections_of, verified_identity_of_section,
 };
 
 /// Width of an alternate place's key. Its final field is the section's unique offset in the log.
@@ -114,7 +114,58 @@ pub(super) fn forget<F: BlockFile>(
   Ok(changed.saturating_add(u64::from(alternate)))
 }
 
-/// Visits only this record's payloads, hashing through the same bounded buffer as log recovery.
+/// Removes one `CONTENTS` row pointing at `target_offset` (promoting a surviving duplicate copy
+/// when `key` is a primary `P` row, or deleting an alternate suffix key) and returns the count of
+/// `P` rows modified.
+fn forget_matching_content_row<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  key: &[u8],
+  entry: &[u8],
+  target_offset: u64,
+) -> Result<u64, StoreError> {
+  if key.len() == CONTENT_KEY_BYTES {
+    let (current, current_len) = decode_content(entry).ok_or(StoreError::BadRow)?;
+    if current == target_offset {
+      let primary: [u8; CONTENT_KEY_BYTES] = key.try_into().map_err(|_| StoreError::BadRow)?;
+      return promote_or_delete_primary(rows, &primary, current_len);
+    }
+  } else if key.len() == PLACE_KEY_BYTES {
+    let alt_offset = field(key, CONTENT_KEY_BYTES)
+      .map(u64::from_be_bytes)
+      .ok_or(StoreError::BadRow)?;
+    if alt_offset == target_offset {
+      rows.delete(key)?;
+      return Ok(1_u64);
+    }
+  }
+  Ok(0_u64)
+}
+
+/// Fallback cleanup when a payload section on disk fails CRC verification during `Store::forget`:
+/// removes any primary or alternate `P` row referencing `offset` (promoting a healthy duplicate if
+/// present) and deletes all `B` rows belonging to `(offset, len)` so no rows leak.
+pub(super) fn forget_by_offset<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  offset: u64,
+  len: u64,
+  page_bytes: usize,
+) -> Result<u64, StoreError> {
+  let per_page = page_bytes
+    .checked_div(CHANGESET_ENTRY_BYTES)
+    .unwrap_or(1)
+    .max(1);
+  let mut changed = 0_u64;
+  scan_table(rows, CONTENTS, per_page, |rows, key, entry| {
+    let removed = forget_matching_content_row(rows, key, entry, offset)?;
+    changed = changed.saturating_add(removed);
+    Ok(())
+  })?;
+  delete_block_digests(rows, offset, len)?;
+  Ok(changed)
+}
+
+/// Visits only this record's payloads, verifying each section's CRC-32C alongside BLAKE3 through
+/// the same bounded buffer as log recovery.
 pub(super) fn visit<F: BlockFile>(
   file: &F,
   (end, seal): (u64, &[u8; SEAL_BYTES]),
@@ -124,14 +175,15 @@ pub(super) fn visit<F: BlockFile>(
 ) -> Result<(), StoreError> {
   for section in sections_of(file, end, seal, row)? {
     if section.kind == SectionKind::Payload {
-      let identity = identity_of_range(file, section.offset, section.len, buffer)?;
+      let identity = verified_identity_of_section(file, &section, buffer)?;
       each(&identity, section.offset, section.len)?;
     }
   }
   Ok(())
 }
 
-/// Rebuilds the `P` and multi-piece `B` rows for one changeset row within `applied`.
+/// Rebuilds the `P` and multi-piece `B` rows for one changeset row within `applied`, verifying
+/// every payload section's CRC-32C before writing any `P` or `B` row.
 fn rebuild_changeset_payloads<F: BlockFile>(
   rows: &mut ShardDb<F>,
   file: &F,
@@ -139,16 +191,22 @@ fn rebuild_changeset_payloads<F: BlockFile>(
   row: &Changeset,
   buffers: (&mut Vec<u8>, &mut Vec<u8>),
 ) -> Result<(), StoreError> {
+  let mut verified = Vec::new();
   for section in sections_of(file, applied, seal, row)? {
     if section.kind == SectionKind::Payload {
-      index_payload_from_log(
-        rows,
-        file,
-        seal,
-        (section.offset, section.len),
-        (buffers.0, buffers.1),
-      )?;
+      let identity = verified_identity_of_section(file, &section, buffers.1)?;
+      verified.push((section, identity));
     }
+  }
+  for (section, identity) in verified {
+    index_verified_payload_from_log(
+      rows,
+      file,
+      seal,
+      &section,
+      &identity,
+      (buffers.0, buffers.1),
+    )?;
   }
   Ok(())
 }

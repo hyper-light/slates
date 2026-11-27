@@ -39,7 +39,8 @@
 //! the file's start), record by record, each verified whole against `(offset, seal)`: the header's CRC, every section's
 //! CRC, the trailer's CRC and length, and the keyed BLAKE3 identity recomputed over the record. A record whose header,
 //! section heads, and commit trailer all verify at `cursor` (`Verify::Damaged`) but whose payload CRC or identity fails
-//! has an authenticated boundary `[cursor, next)`: it is never indexed and recovery skips directly to `next`. At
+//! has an authenticated boundary `[cursor, next)`: it is never indexed, recovery skips directly to `next`, and `end`
+//! advances to `next` so a subsequent append never overwrites intact blocks of a damaged committed tail record. At
 //! `FrameContext::Cursor` (never during resync), an authenticated `(offset, seal)` header whose next section head
 //! decodes as a genuinely authenticated open-section head (`SECTION_OPEN_FLAG` with valid `(seal, head_offset)` CRC),
 //! whose declared remaining record cannot finish before EOF, and whose prior closed sections all pass CRC verification
@@ -276,7 +277,7 @@ impl Located {
   }
 }
 
-/// One section of a committed record: its kind and where its bytes are.
+/// One section of a committed record: its kind, where its bytes are, and its CRC-32C checksum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Section {
   /// The kind.
@@ -285,6 +286,55 @@ pub struct Section {
   pub offset: u64,
   /// Its length.
   pub len: u64,
+  /// CRC-32C of the section's bytes, as recorded in its closed section head.
+  pub crc: u32,
+}
+
+/// Incremental CRC-32C verifier for a [`Section`]'s bytes streamed across pieces.
+#[derive(Clone, Copy, Debug)]
+pub struct SectionCrc {
+  expected: u32,
+  running: u32,
+}
+
+impl SectionCrc {
+  /// Starts verifying a section whose closed head recorded `expected` CRC-32C.
+  pub fn new(expected: u32) -> Self {
+    Self {
+      expected,
+      running: 0,
+    }
+  }
+
+  /// Feeds the next contiguous piece of the section's bytes into the running CRC-32C.
+  pub fn update(&mut self, piece: &[u8]) {
+    self.running = mantle_crc::crc32c_extend(self.running, piece);
+  }
+
+  /// Verifies that the accumulated CRC-32C matches the section head's checksum.
+  pub fn finish(self) -> Result<(), LogError> {
+    if self.running == self.expected {
+      Ok(())
+    } else {
+      Err(LogError::Corrupt("a section's bytes"))
+    }
+  }
+}
+
+impl Section {
+  /// Verifies that `bytes` matches this section's recorded length and CRC-32C.
+  pub fn verify_bytes(&self, bytes: &[u8]) -> Result<(), LogError> {
+    let len = u64::try_from(bytes.len()).map_err(|_| LogError::TooLarge)?;
+    if len != self.len || mantle_crc::crc32c(bytes) != self.crc {
+      return Err(LogError::Corrupt("a section's bytes"));
+    }
+    Ok(())
+  }
+
+  /// Starts an incremental CRC-32C verifier for streaming this section piece by piece.
+  pub fn crc_verifier(&self) -> SectionCrc {
+    SectionCrc::new(self.crc)
+  }
 }
 
 /// Why the log refused.
@@ -677,20 +727,65 @@ pub(crate) fn header_in<F: BlockFile>(
   decode_header(&head, offset, seal).ok_or(LogError::Corrupt("a header"))
 }
 
-/// The sections of the committed record `located` in `file`, in order: each head read for its kind and length.
+/// Reads one closed section head at `at` bounded within `sections_end`, returning the section and
+/// the offset immediately after its body.
+fn read_bounded_section<F: BlockFile>(
+  file: &F,
+  at: u64,
+  sections_end: u64,
+) -> Result<(Section, u64), LogError> {
+  let offset =
+    offset_after(at, SECTION_HEAD_BYTES).map_err(|_| LogError::Corrupt("a section's length"))?;
+  if offset > sections_end {
+    return Err(LogError::Corrupt("a section's length"));
+  }
+  let mut head = [0u8; SECTION_HEAD_BYTES];
+  file.read_exact_at(&mut head, at)?;
+  let (kind, len, crc) = decode_section_head(&head).ok_or(LogError::Corrupt("a section's head"))?;
+  let next = offset
+    .checked_add(len)
+    .ok_or(LogError::Corrupt("a section's length"))?;
+  if next > sections_end {
+    return Err(LogError::Corrupt("a section's length"));
+  }
+  Ok((
+    Section {
+      kind,
+      offset,
+      len,
+      crc,
+    },
+    next,
+  ))
+}
+
+/// The sections of the committed record `located` in `file`, in order: each head read for its
+/// kind, offset, length, and CRC-32C, bounded strictly by `located`'s record frame.
 pub fn sections_in<F: BlockFile>(file: &F, located: &Located) -> Result<Vec<Section>, LogError> {
+  let record_end = located
+    .offset
+    .checked_add(located.len)
+    .ok_or(LogError::Corrupt("a record's length"))?;
+  let trailer_bytes = u64::try_from(TRAILER_BYTES).map_err(|_| LogError::TooLarge)?;
+  let sections_end = record_end
+    .checked_sub(trailer_bytes)
+    .ok_or(LogError::Corrupt("a record's length"))?;
+  let mut at = offset_after(located.offset, HEADER_BYTES)
+    .map_err(|_| LogError::Corrupt("a record's length"))?;
+  if at > sections_end {
+    return Err(LogError::Corrupt("a record's length"));
+  }
   let mut sections = Vec::new();
   sections
     .try_reserve_exact(usize::from(located.header.sections))
     .map_err(|_| LogError::TooLarge)?;
-  let mut at = offset_after(located.offset, HEADER_BYTES)?;
   for _ in 0..located.header.sections {
-    let mut head = [0u8; SECTION_HEAD_BYTES];
-    file.read_exact_at(&mut head, at)?;
-    let (kind, len, _) = decode_section_head(&head).ok_or(LogError::Corrupt("a section's head"))?;
-    let offset = offset_after(at, SECTION_HEAD_BYTES)?;
-    sections.push(Section { kind, offset, len });
-    at = offset.checked_add(len).ok_or(LogError::TooLarge)?;
+    let (section, next) = read_bounded_section(file, at, sections_end)?;
+    sections.push(section);
+    at = next;
+  }
+  if at != sections_end {
+    return Err(LogError::Corrupt("a record's section layout"));
   }
   Ok(sections)
 }
@@ -704,6 +799,21 @@ pub fn identity_of_range<F: BlockFile>(
 ) -> Result<[u8; IDENTITY], LogError> {
   let mut hasher = blake3::Hasher::new();
   hash_range(file, &mut hasher, offset, len, buffer)?;
+  Ok(*hasher.finalize().as_bytes())
+}
+
+/// BLAKE3 of `section`'s bytes in `file`, refusing [`LogError::Corrupt`] if their CRC-32C does
+/// not match `section.crc`.
+pub fn verified_identity_of_section<F: BlockFile>(
+  file: &F,
+  section: &Section,
+  buffer: &mut Vec<u8>,
+) -> Result<[u8; IDENTITY], LogError> {
+  let mut hasher = blake3::Hasher::new();
+  let crc = hash_range(file, &mut hasher, section.offset, section.len, buffer)?;
+  if crc != section.crc {
+    return Err(LogError::Corrupt("a section's bytes"));
+  }
   Ok(*hasher.finalize().as_bytes())
 }
 
@@ -1344,6 +1454,54 @@ fn apply_resync_scan<F: BlockFile>(
   Ok(true)
 }
 
+/// Returns `true` when `offset` starts a valid committed record in `file` under `seal`.
+fn is_valid_record_at<F: BlockFile>(
+  file: &F,
+  (offset, file_len): (u64, u64),
+  seal: &[u8; SEAL_BYTES],
+  verify_buf: &mut Vec<u8>,
+) -> Result<bool, LogError> {
+  Ok(matches!(
+    verify_at(file, (offset, file_len), seal, verify_buf)?,
+    Verify::Valid(_)
+  ))
+}
+
+/// Returns `true` when at least one committed record in `[SEAL_PREAMBLE_BYTES, file_len)` of
+/// `file` verifies as [`Verify::Valid`] under `seal`: checks offset [`SEAL_PREAMBLE_BYTES`]
+/// first, then optional `hint_offset` (from `rows`), and finally scans linearly with
+/// [`resync_from`] in case the leading record was damaged alongside the preamble.
+pub(crate) fn verify_seal_matches_log<F: BlockFile>(
+  file: &F,
+  file_len: u64,
+  seal: &[u8; SEAL_BYTES],
+  hint_offset: Option<u64>,
+) -> Result<bool, LogError> {
+  let preamble_len = u64::try_from(SEAL_PREAMBLE_BYTES).map_err(|_| LogError::TooLarge)?;
+  if file_len <= preamble_len {
+    return Ok(false);
+  }
+  let mut verify_buf = Vec::new();
+  if is_valid_record_at(file, (preamble_len, file_len), seal, &mut verify_buf)? {
+    return Ok(true);
+  }
+  if let Some(hint) = hint_offset.filter(|off| *off > preamble_len && *off < file_len)
+    && is_valid_record_at(file, (hint, file_len), seal, &mut verify_buf)?
+  {
+    return Ok(true);
+  }
+  let mut scan_buf = Vec::new();
+  Ok(
+    resync_from(
+      file,
+      (preamble_len, file_len),
+      (seal, None),
+      (&mut scan_buf, &mut verify_buf),
+    )?
+    .is_some(),
+  )
+}
+
 /// Runs one step of [`ChangesetLog::recover_sealed`]; returns `false` when recovery stops cleanly.
 fn step_recover<F: BlockFile>(
   file: &F,
@@ -1371,6 +1529,7 @@ fn step_recover<F: BlockFile>(
         "slates-store: changeset log skipped damaged committed record at offset {cursor} (len {})",
         next.saturating_sub(cursor)
       );
+      progress.end = next;
       progress.cursor = next;
       Ok(true)
     }

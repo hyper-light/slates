@@ -38,14 +38,14 @@ use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
-use mantle_engine::store::Config;
+use mantle_engine::store::{Config, MIN_PAGE};
 use mantle_engine::trunk::TrunkConfig;
 use slates_land::store_root::{StoreRoot, StoreRootRefusal};
 
 use crate::log::{
   Appending, ChangesetLog, Header, Located, LogError, SEAL_BYTES, SEAL_PREAMBLE_BYTES,
-  SealPreamble, SectionKind, decode_seal_preamble, encode_seal_preamble, identity_of_range,
-  sections_in,
+  SealPreamble, Section, SectionKind, decode_seal_preamble, encode_seal_preamble, sections_in,
+  verified_identity_of_section, verify_seal_matches_log,
 };
 use crate::staging::{Identity, Staging};
 
@@ -110,6 +110,8 @@ const VALUE_BYTES: usize = V_WORK + U64;
 const ROW_OVERHEAD: usize = 1 + 1 + 1;
 /// Bytes of a changeset row in a memtable, including the engine's entry framing.
 const CHANGESET_ENTRY_BYTES: usize = KEY_BYTES + VALUE_BYTES + ROW_OVERHEAD;
+/// Format: mantle's minimum trunk fanout and leaf entry count (`mantle_engine/src/trunk/mod.rs`).
+const MIN_TRUNK_DEGREE: usize = 2;
 
 /// What the store may hold, from its caller: the memory its shard lends it and the disk its grant allows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,6 +244,8 @@ pub struct Store {
   rows: ShardDb<DeviceFile>,
   /// Reused for every row's value.
   value: Vec<u8>,
+  /// Engine page size derived from the store device's layout block, used for bounded table scans.
+  page_size: usize,
   /// The standing grant its directory is written under, as first recorded.
   grant: GrantRow,
   /// Non-vacuity and bytes-hashed counters for verified disk payload reads (A5).
@@ -307,6 +311,7 @@ impl Store {
       log,
       rows,
       value,
+      page_size,
       piece_metrics: PieceMetrics::default(),
       corrupt_rows_skipped,
       place_reads: 0,
@@ -668,6 +673,34 @@ impl Store {
     Ok(bytes)
   }
 
+  /// Reads an entire [`Section`] piece by piece via [`Store::read`] and verifies its accumulated
+  /// CRC-32C against `section.crc`, refusing [`LogError::Corrupt`] on any byte mismatch.
+  pub fn read_section(&self, section: &Section) -> Result<Vec<u8>, StoreError> {
+    let len =
+      usize::try_from(section.len).map_err(|_| StoreError::Sizing("a section past memory"))?;
+    let mut bytes = Vec::new();
+    bytes
+      .try_reserve_exact(len)
+      .map_err(|_| StoreError::Sizing("a section past memory"))?;
+    let mut crc = section.crc_verifier();
+    while bytes.len() < len {
+      let done = u64::try_from(bytes.len()).map_err(|_| StoreError::BadRow)?;
+      let at = section.offset.checked_add(done).ok_or(StoreError::BadRow)?;
+      let left = section.len.checked_sub(done).ok_or(StoreError::BadRow)?;
+      let piece = self.read(at, left)?;
+      if piece.is_empty() {
+        return Err(StoreError::Log(LogError::Corrupt("a section's bytes")));
+      }
+      crc.update(&piece);
+      bytes.extend_from_slice(&piece);
+    }
+    if bytes.len() != len {
+      return Err(StoreError::Log(LogError::Corrupt("a section's bytes")));
+    }
+    crc.finish()?;
+    Ok(bytes)
+  }
+
   /// The repository's landed changesets from sequence `from` on, at most `limit`, in order.
   pub fn changesets(
     &mut self,
@@ -709,13 +742,12 @@ impl Store {
     for section in self.sections(&row)? {
       match section.kind {
         SectionKind::Payload => {
-          let identity =
-            identity_of_range(self.log.file(), section.offset, section.len, &mut buffer)?;
-          forgotten = forgotten.saturating_add(payloads::forget(
+          forgotten = forgotten.saturating_add(forget_payload_section(
             &mut self.rows,
-            &identity,
-            section.offset,
-            &mut self.value,
+            self.log.file(),
+            &section,
+            self.page_size,
+            (&mut self.value, &mut buffer),
           )?);
         }
         SectionKind::Texts => {
@@ -856,9 +888,86 @@ fn prepare_sealed_log<F: BlockFile>(
   })
 }
 
+/// Returns `true` when `rows` holds at least one `CHANGESETS` (`C`) row.
+fn has_changeset_rows<F: BlockFile>(rows: &mut ShardDb<F>) -> Result<bool, StoreError> {
+  let start = [CHANGESETS];
+  let end = [CHANGESETS.saturating_add(1)];
+  let mut found = Rows::new();
+  rows.scan(&start, Some(&end), 1, &mut found, &mut Vec::new())?;
+  Ok(found.get(0).is_some())
+}
+
+/// Updates `newest` with the largest changeset row offset in `[preamble_len, file_len)` present in
+/// one scanned `page`.
+fn max_row_offset_in_page(
+  page: &Rows,
+  preamble_len: u64,
+  file_len: u64,
+  newest: &mut Option<u64>,
+) -> Result<(), StoreError> {
+  for (key, entry) in page.iter() {
+    let row = decode_changeset(key, entry)?;
+    if (preamble_len..file_len).contains(&row.offset) {
+      *newest = Some(newest.map_or(row.offset, |prev| prev.max(row.offset)));
+    }
+  }
+  Ok(())
+}
+
+/// Finds the largest changeset row offset in `[preamble_len, file_len)` stored in `rows` to use as
+/// an O(1) verification hint when record 0 at `preamble_len` is itself damaged.
+fn newest_changeset_offset<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  preamble_len: u64,
+  file_len: u64,
+  page_size: usize,
+) -> Result<Option<u64>, StoreError> {
+  let per_page = page_size
+    .checked_div(CHANGESET_ENTRY_BYTES)
+    .unwrap_or(1)
+    .max(1);
+  let mut start = vec![CHANGESETS];
+  let mut next = Vec::new();
+  let mut page = Rows::new();
+  let end = [CHANGESETS.saturating_add(1)];
+  let mut newest: Option<u64> = None;
+  loop {
+    page.clear();
+    let more = rows.scan(&start, Some(&end), per_page, &mut page, &mut next)?;
+    max_row_offset_in_page(&page, preamble_len, file_len, &mut newest)?;
+    if !more {
+      return Ok(newest);
+    }
+    std::mem::swap(&mut start, &mut next);
+  }
+}
+
+/// Verifies that `log_file` genuinely belongs to `rows`'s backup `seal` before repairing a damaged
+/// `SLSE` preamble: empty-payload logs require `applied == SEAL_PREAMBLE_BYTES` with zero `C`
+/// rows, and non-empty logs require at least one committed record verifying under `seal`.
+fn verify_damaged_preamble_match<F: BlockFile>(
+  log_file: &F,
+  rows: &mut ShardDb<F>,
+  (file_len, preamble_len, applied, page_size): (u64, u64, u64, usize),
+  seal: &[u8; SEAL_BYTES],
+) -> Result<(), StoreError> {
+  if file_len == preamble_len {
+    if applied != preamble_len || has_changeset_rows(rows)? {
+      return Err(StoreError::Log(LogError::Corrupt("a store seal preamble")));
+    }
+    return Ok(());
+  }
+  let hint = newest_changeset_offset(rows, preamble_len, file_len, page_size)?;
+  if !verify_seal_matches_log(log_file, file_len, seal, hint)? {
+    return Err(StoreError::Log(LogError::Corrupt("a store seal preamble")));
+  }
+  Ok(())
+}
+
 /// Recovers a log whose leading `SLSE` preamble is damaged only when an existing `rows` holds the
-/// backup `SEAL_ROW` and `log_file` reaches `applied.max(SEAL_PREAMBLE_BYTES)`, durably repairing
-/// the 48-byte preamble on disk so a subsequent loss of `rows` still rebuilds cleanly.
+/// backup `SEAL_ROW`, `log_file` reaches `applied.max(SEAL_PREAMBLE_BYTES)`, and the log itself
+/// verifies under that `SEAL_ROW` seal; only then durably repairs the 48-byte preamble on disk so
+/// a subsequent loss of `rows` still rebuilds cleanly.
 fn prepare_damaged_preamble_log<F: BlockFile>(
   log_file: F,
   existing_rows: Option<(ShardDb<F>, u64, usize)>,
@@ -868,7 +977,8 @@ fn prepare_damaged_preamble_log<F: BlockFile>(
     return Err(StoreError::Log(LogError::Corrupt("a store seal preamble")));
   };
   let replay_from = applied.max(preamble_len);
-  if log_file.len()? < replay_from {
+  let file_len = log_file.len()?;
+  if file_len < replay_from {
     return Err(StoreError::Log(LogError::Corrupt(
       "a missing or truncated changeset log",
     )));
@@ -876,6 +986,12 @@ fn prepare_damaged_preamble_log<F: BlockFile>(
   let Some(seal) = read_seal_row(&mut rows)? else {
     return Err(StoreError::Log(LogError::Corrupt("a store seal preamble")));
   };
+  verify_damaged_preamble_match(
+    &log_file,
+    &mut rows,
+    (file_len, preamble_len, applied, page_size),
+    &seal,
+  )?;
   write_seal_preamble(&log_file, &seal)?;
   slates_machine::log_line!("slates-store: repaired damaged seal preamble from rows backup");
   Ok(OpenedStoreFiles {
@@ -946,22 +1062,10 @@ fn adopt(root: &StoreRoot, name: &str) -> Result<DeviceFile, StoreError> {
   )?)
 }
 
-/// Rejects device-independent invalid `Sizing` parameters before creating any store file on disk.
-fn validate_sizing_bounds(sizing: Sizing) -> Result<(), StoreError> {
-  if sizing.memory < CHANGESET_ENTRY_BYTES {
-    return Err(StoreError::Sizing("no memory for a row"));
-  }
-  if sizing.extent_bytes == 0
-    || sizing
-      .disk
-      .checked_div(sizing.extent_bytes)
-      .is_none_or(|extents| extents <= 1)
-  {
-    return Err(StoreError::Sizing(
-      "a disk allowance under two extents (the superblocks' and one of rows)",
-    ));
-  }
-  Ok(())
+/// Rejects invalid `Sizing` parameters against `min_page` (at least [`MIN_PAGE`]) before creating
+/// any store file on disk.
+fn validate_sizing_bounds(sizing: Sizing, min_page: usize) -> Result<(), StoreError> {
+  engine_sizing_for_page(min_page.max(MIN_PAGE), sizing).map(|_| ())
 }
 
 /// Opens an existing non-empty [`ROWS_FILE`] without mutating it, returning `None` when the file
@@ -993,13 +1097,15 @@ fn create_rows_fresh(
 }
 
 /// Opens an existing non-empty [`ROWS_FILE`], or creates/initializes a fresh one when absent or
-/// 0 bytes, validating sizing bounds before creating any file.
+/// 0 bytes, validating sizing bounds against `known_page` (or [`MIN_PAGE`]) before creating any
+/// file.
 fn open_or_create_rows(
   root: &StoreRoot,
   rows_existed: bool,
+  known_page: Option<usize>,
   sizing: Sizing,
 ) -> Result<(ShardDb<DeviceFile>, u64, usize), StoreError> {
-  validate_sizing_bounds(sizing)?;
+  validate_sizing_bounds(sizing, known_page.unwrap_or(MIN_PAGE))?;
   if rows_existed && let Some(opened) = open_rows_existing(root, sizing)? {
     return Ok(opened);
   }
@@ -1014,7 +1120,8 @@ fn open_empty_store_log(
   rows_existed: bool,
   sizing: Sizing,
 ) -> Result<OpenedStoreFiles<DeviceFile>, StoreError> {
-  let rows_state = open_or_create_rows(root, rows_existed, sizing)?;
+  let known_page = existing_log.as_ref().map(|file| file.layout_block().get());
+  let rows_state = open_or_create_rows(root, rows_existed, known_page, sizing)?;
   if rows_state.1 > 0 {
     return Err(StoreError::Log(LogError::Corrupt(
       "a missing or truncated changeset log",
@@ -1041,7 +1148,8 @@ fn open_store_files(
   match inspect_log_file(&log_file)? {
     LogHead::Empty => open_empty_store_log(root, Some(log_file), rows_existed, sizing),
     LogHead::Sealed(seal) => {
-      let rows_state = open_or_create_rows(root, rows_existed, sizing)?;
+      let known_page = Some(log_file.layout_block().get());
+      let rows_state = open_or_create_rows(root, rows_existed, known_page, sizing)?;
       prepare_sealed_log(log_file, seal, rows_state)
     }
     LogHead::DamagedPreamble => {
@@ -1055,13 +1163,12 @@ fn open_store_files(
   }
 }
 
-/// The engine's shape from the caller's sizing: its page the file's layout block, its extents bounded by the disk
-/// allowed, its leaves by the memory lent over a row's bytes.
-fn engine_sizing(
-  file: &DeviceFile,
+/// Pure sizing derivation for `page_size`: checks extent pages (`>= 2`), disk allowance
+/// (`>= 2` extents), memory (`>= 2` leaf entries), and trunk fanout (`>= 2`).
+fn engine_sizing_for_page(
+  page_size: usize,
   sizing: Sizing,
 ) -> Result<(Config, usize, TrunkConfig), StoreError> {
-  let page_size = file.layout_block().get();
   let page = u64::try_from(page_size).map_err(|_| StoreError::Sizing("a page past u64"))?;
   let extent_pages = sizing
     .extent_bytes
@@ -1079,12 +1186,17 @@ fn engine_sizing(
     .ok_or(StoreError::Sizing(
       "a disk allowance under two extents (the superblocks' and one of rows)",
     ))?;
+  let min_entries =
+    u64::try_from(MIN_TRUNK_DEGREE).map_err(|_| StoreError::Sizing("no memory for a row"))?;
   let leaf_entries = sizing
     .memory
     .checked_div(CHANGESET_ENTRY_BYTES)
     .and_then(|entries| u64::try_from(entries).ok())
-    .filter(|entries| *entries > 0)
+    .filter(|entries| *entries >= min_entries)
     .ok_or(StoreError::Sizing("no memory for a row"))?;
+  if sizing.fanout < MIN_TRUNK_DEGREE {
+    return Err(StoreError::Sizing("a trunk fanout under two"));
+  }
   Ok((
     Config {
       page_size,
@@ -1097,6 +1209,15 @@ fn engine_sizing(
       leaf_entries,
     },
   ))
+}
+
+/// The engine's shape from the caller's sizing: its page the file's layout block, its extents bounded by the disk
+/// allowed, its leaves by the memory lent over a row's bytes.
+fn engine_sizing(
+  file: &DeviceFile,
+  sizing: Sizing,
+) -> Result<(Config, usize, TrunkConfig), StoreError> {
+  engine_sizing_for_page(file.layout_block().get(), sizing)
 }
 
 /// A standing grant's id (its `G` row's key, and what each landing's header names as its `grant`): its directory's
@@ -1131,7 +1252,32 @@ fn changeset_row<F: BlockFile>(
   decode_changeset(key, &value).map(Some)
 }
 
-/// The `Texts` entries of a committed record's section `section`, read whole from `file` into `buffer`.
+/// Forgets one payload section during [`Store::forget`]: uses the O(1) identity lookup when the
+/// section's CRC-32C matches on disk, and falls back to [`payloads::forget_by_offset`] when the
+/// payload is damaged on disk so its `P` and `B` rows never leak.
+fn forget_payload_section<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  file: &F,
+  section: &Section,
+  page_size: usize,
+  (value, buffer): (&mut Vec<u8>, &mut Vec<u8>),
+) -> Result<u64, StoreError> {
+  match verified_identity_of_section(file, section, buffer) {
+    Ok(identity) => payloads::forget(rows, &identity, section.offset, value),
+    Err(LogError::Corrupt(what)) => {
+      slates_machine::log_line!(
+        "slates-store: forget cleaned damaged payload at offset={} len={} by offset ({what})",
+        section.offset,
+        section.len
+      );
+      payloads::forget_by_offset(rows, section.offset, section.len, page_size)
+    }
+    Err(error) => Err(error.into()),
+  }
+}
+
+/// The `Texts` entries of a committed record's section `section`, read whole from `file` into
+/// `buffer` and verified against `section.crc`.
 fn section_texts<F: BlockFile>(
   file: &F,
   section: &crate::log::Section,
@@ -1145,6 +1291,7 @@ fn section_texts<F: BlockFile>(
   file
     .read_exact_at(buffer, section.offset)
     .map_err(LogError::from)?;
+  section.verify_bytes(buffer)?;
   crate::texts::decode(buffer).map_err(|_| StoreError::BadRow)
 }
 
@@ -1176,6 +1323,15 @@ fn sections_of<F: BlockFile>(
   seal: &[u8; SEAL_BYTES],
   row: &Changeset,
 ) -> Result<Vec<crate::log::Section>, StoreError> {
+  let record_end = row
+    .offset
+    .checked_add(row.len)
+    .ok_or(LogError::Corrupt("a record's length"))?;
+  if record_end > end {
+    return Err(StoreError::Log(LogError::Corrupt(
+      "a record past the committed records",
+    )));
+  }
   let located = Located {
     offset: row.offset,
     header: crate::log::header_in(file, row.offset, end, seal)?,
@@ -1270,54 +1426,70 @@ fn delete_block_digests<F: BlockFile>(
   Ok(())
 }
 
-/// Streams a multi-piece payload `[section_offset, section_offset + section_len)` once in
-/// [`PIECE_BYTES`] blocks (peak RAM = one [`PIECE_BYTES`] buffer), updating the whole-payload
-/// BLAKE3 identity and persisting each block's keyed MAC `B` row in `rows`.
-fn hash_and_put_blocks<F: BlockFile>(
+/// Streams a multi-piece payload `section` in [`PIECE_BYTES`] blocks (peak RAM = one
+/// [`PIECE_BYTES`] buffer), persisting each block's keyed MAC `B` row in `rows` and re-checking
+/// `section.crc` (cleaning up any written `B` rows if a transient read mismatch occurs).
+fn put_block_digests_from_log<F: BlockFile>(
   rows: &mut ShardDb<F>,
   file: &F,
   seal: &[u8; SEAL_BYTES],
-  (section_offset, section_len): (u64, u64),
+  section: &Section,
   buffer: &mut Vec<u8>,
-) -> Result<Identity, StoreError> {
+) -> Result<(), StoreError> {
   let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
   buffer.resize(PIECE_BYTES, 0);
-  let mut whole = blake3::Hasher::new();
+  let mut crc = section.crc_verifier();
   let mut done = 0u64;
   let mut block_idx = 0u64;
-  while done < section_len {
-    let left = section_len.checked_sub(done).ok_or(StoreError::BadRow)?;
+  while done < section.len {
+    let left = section.len.checked_sub(done).ok_or(StoreError::BadRow)?;
     let step = usize::try_from(left.min(piece_cap)).map_err(|_| StoreError::BadRow)?;
     let slice = buffer.get_mut(..step).ok_or(StoreError::BadRow)?;
-    let at = section_offset.checked_add(done).ok_or(StoreError::BadRow)?;
+    let at = section.offset.checked_add(done).ok_or(StoreError::BadRow)?;
     file.read_exact_at(slice, at).map_err(LogError::from)?;
-    whole.update(slice);
-    let tag = keyed_block_tag(seal, section_offset, section_len, block_idx, slice);
-    rows.put(&block_key(section_offset, block_idx), &tag)?;
+    crc.update(slice);
+    let tag = keyed_block_tag(seal, section.offset, section.len, block_idx, slice);
+    rows.put(&block_key(section.offset, block_idx), &tag)?;
     done = done
       .checked_add(u64::try_from(step).map_err(|_| StoreError::BadRow)?)
       .ok_or(StoreError::BadRow)?;
     block_idx = block_idx.checked_add(1).ok_or(StoreError::BadRow)?;
   }
-  Ok(*whole.finalize().as_bytes())
+  if let Err(error) = crc.finish() {
+    delete_block_digests(rows, section.offset, section.len)?;
+    return Err(error.into());
+  }
+  Ok(())
 }
 
-/// Indexes one `SectionKind::Payload` from `file`: single-piece (`<= PIECE_BYTES`) writes only its
-/// `P` row; multi-piece (`> PIECE_BYTES`) streams once to write its `B` rows and its `P` row.
+/// Persists the `B` rows (when `section.len > PIECE_BYTES`) and `P` row for a payload section
+/// whose CRC-32C and `identity` have already been verified against `file`.
+fn index_verified_payload_from_log<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  file: &F,
+  seal: &[u8; SEAL_BYTES],
+  section: &Section,
+  identity: &Identity,
+  (value, buffer): (&mut Vec<u8>, &mut Vec<u8>),
+) -> Result<(), StoreError> {
+  let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
+  if section.len > piece_cap {
+    put_block_digests_from_log(rows, file, seal, section, buffer)?;
+  }
+  payloads::keep(rows, identity, section.offset, section.len, value)
+}
+
+/// Indexes one `SectionKind::Payload` from `file`, verifying `section.crc` BEFORE writing any `B`
+/// or `P` rows to `rows`.
 fn index_payload_from_log<F: BlockFile>(
   rows: &mut ShardDb<F>,
   file: &F,
   seal: &[u8; SEAL_BYTES],
-  (section_offset, section_len): (u64, u64),
+  section: &Section,
   (value, buffer): (&mut Vec<u8>, &mut Vec<u8>),
 ) -> Result<(), StoreError> {
-  let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
-  let identity = if section_len <= piece_cap {
-    identity_of_range(file, section_offset, section_len, buffer)?
-  } else {
-    hash_and_put_blocks(rows, file, seal, (section_offset, section_len), buffer)?
-  };
-  payloads::keep(rows, &identity, section_offset, section_len, value)
+  let identity = verified_identity_of_section(file, section, buffer)?;
+  index_verified_payload_from_log(rows, file, seal, section, &identity, (value, buffer))
 }
 
 /// Verifies a zero-length span request (checking the empty-bytes BLAKE3 identity when the whole
@@ -1507,13 +1679,7 @@ fn put_rows_from_log<F: BlockFile>(
   }
   for section in sections_in(file, located)? {
     if section.kind == SectionKind::Payload {
-      index_payload_from_log(
-        rows,
-        file,
-        seal,
-        (section.offset, section.len),
-        (value, buffer),
-      )?;
+      index_payload_from_log(rows, file, seal, &section, (value, buffer))?;
     }
     if section.kind == SectionKind::Texts {
       buffer.clear();
@@ -1525,6 +1691,7 @@ fn put_rows_from_log<F: BlockFile>(
       file
         .read_exact_at(buffer, section.offset)
         .map_err(LogError::from)?;
+      section.verify_bytes(buffer)?;
       crate::texts::put_rows(rows, &located.header, buffer)?;
     }
   }

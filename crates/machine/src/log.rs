@@ -111,16 +111,17 @@ fn write_owned_to(sink: &mut impl Write, mut line: String) {
   write_bytes_to(sink, line.as_bytes());
 }
 
+/// Format: the fewest bytes a newline-terminated line can hold: one payload byte and its trailing `\n`.
+const MIN_LINE_BYTES: usize = 2;
+
 /// Explicit state of the logical line currently being relayed from a child's stderr pipe.
 /// Never holds a sink lock across `Read::read` so a stalled child cannot deadlock parent callers
 /// of [`log`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RelayLine {
-  /// At a line boundary: bytes of a normal line buffer up to `cap`.
-  Idle,
-  /// Streaming an overlong (`>= cap`) logical line in bounded `<= cap` locked chunks until `\n`
-  /// (or EOF, where a trailing `\n` is written).
-  Streaming,
+  /// Accumulating bytes of the current logical line; lines up to `cap` emit whole, and overlong
+  /// lines split into self-contained `\n`-terminated chunks of at most `cap` bytes each.
+  Active,
   /// A write for this logical line already failed (refusal counted once); draining remaining bytes
   /// until `\n` or EOF without re-locking or counting duplicate refusals.
   Refused,
@@ -139,12 +140,18 @@ impl<W: Write, F: FnMut() -> W> LineRelay<F> {
     Self {
       cap,
       line: Vec::new(),
-      state: RelayLine::Idle,
+      state: RelayLine::Active,
       acquire,
     }
   }
 
-  /// Acquires the sink lock once and writes a complete `<= cap` buffered line in one `write_all`.
+  /// Maximum payload bytes before the trailing `\n` of a single emitted `<= cap` line.
+  fn max_body(&self) -> usize {
+    self.cap.saturating_sub(1)
+  }
+
+  /// Acquires the sink lock once and writes a complete `<= cap` `\n`-terminated line in one
+  /// `write_all`.
   fn emit_buffered_line(&mut self, head: &[u8]) {
     let mut sink = (self.acquire)();
     if self.line.is_empty() {
@@ -156,22 +163,23 @@ impl<W: Write, F: FnMut() -> W> LineRelay<F> {
     }
   }
 
-  /// Acquires the sink lock only for the immediate write of the first `cap` bytes of an overlong
-  /// line, dropping the lock before returning to `Read::read`.
-  fn begin_streaming(&mut self) {
+  /// Appends `head` and a synthetic `\n` (forming an exact `cap`-byte self-contained line), writes
+  /// it under a single immediate lock acquisition, and transitions to [`RelayLine::Refused`] if
+  /// the sink refused the write so the rest of this logical line counts no duplicate refusals.
+  fn emit_split_line(&mut self, head: &[u8]) {
+    self.line.extend_from_slice(head);
+    self.line.push(b'\n');
     let ok = {
       let mut sink = (self.acquire)();
       write_or_refuse(&mut sink, &self.line)
     };
     self.line.clear();
-    self.state = if ok {
-      RelayLine::Streaming
-    } else {
-      RelayLine::Refused
-    };
+    if !ok {
+      self.state = RelayLine::Refused;
+    }
   }
 
-  fn step_idle<'a>(&mut self, rest: &'a [u8]) -> &'a [u8] {
+  fn step_active<'a>(&mut self, rest: &'a [u8]) -> &'a [u8] {
     let room = self.cap.saturating_sub(self.line.len());
     if let Some(nl) = rest.iter().position(|byte| *byte == b'\n')
       && nl < room
@@ -180,43 +188,22 @@ impl<W: Write, F: FnMut() -> W> LineRelay<F> {
       self.emit_buffered_line(head);
       return tail;
     }
-    let take = rest.len().min(room);
-    let Some((head, tail)) = rest.split_at_checked(take) else {
+    let body_room = self.max_body().saturating_sub(self.line.len());
+    if rest.len() <= body_room {
+      self.line.extend_from_slice(rest);
+      return &[];
+    }
+    let Some((head, tail)) = rest.split_at_checked(body_room) else {
       return &[];
     };
-    self.line.extend_from_slice(head);
-    if self.line.len() >= self.cap {
-      self.begin_streaming();
-    }
-    tail
-  }
-
-  fn step_streaming<'a>(&mut self, rest: &'a [u8]) -> &'a [u8] {
-    let (head, tail, ended) = match rest.iter().position(|byte| *byte == b'\n') {
-      Some(nl) => match rest.split_at_checked(nl.saturating_add(1)) {
-        Some((head, tail)) => (head, tail, true),
-        None => (rest, &[][..], false),
-      },
-      None => (rest, &[][..], false),
-    };
-    let ok = {
-      let mut sink = (self.acquire)();
-      write_or_refuse(&mut sink, head)
-    };
-    self.state = if ended {
-      RelayLine::Idle
-    } else if ok {
-      RelayLine::Streaming
-    } else {
-      RelayLine::Refused
-    };
+    self.emit_split_line(head);
     tail
   }
 
   fn step_refused<'a>(&mut self, rest: &'a [u8]) -> &'a [u8] {
     match rest.iter().position(|byte| *byte == b'\n') {
       Some(nl) => {
-        self.state = RelayLine::Idle;
+        self.state = RelayLine::Active;
         rest.get(nl.saturating_add(1)..).unwrap_or_default()
       }
       None => &[],
@@ -226,8 +213,7 @@ impl<W: Write, F: FnMut() -> W> LineRelay<F> {
   fn feed(&mut self, mut rest: &[u8]) {
     while !rest.is_empty() {
       rest = match self.state {
-        RelayLine::Idle => self.step_idle(rest),
-        RelayLine::Streaming => self.step_streaming(rest),
+        RelayLine::Active => self.step_active(rest),
         RelayLine::Refused => self.step_refused(rest),
       };
     }
@@ -235,32 +221,25 @@ impl<W: Write, F: FnMut() -> W> LineRelay<F> {
 
   /// Flushes any unterminated trailing line at EOF with a trailing `\n`.
   fn finish(mut self) {
-    match self.state {
-      RelayLine::Idle if !self.line.is_empty() => {
-        self.line.push(b'\n');
-        let mut sink = (self.acquire)();
-        write_bytes_to(&mut sink, &self.line);
-      }
-      RelayLine::Streaming => {
-        let mut sink = (self.acquire)();
-        write_bytes_to(&mut sink, b"\n");
-      }
-      RelayLine::Idle | RelayLine::Refused => {}
+    if self.state == RelayLine::Active && !self.line.is_empty() {
+      self.line.push(b'\n');
+      let mut sink = (self.acquire)();
+      write_bytes_to(&mut sink, &self.line);
     }
   }
 }
 
-/// Reads bytes from `reader` in `capacity`-byte chunks and writes to a lock guard returned by
-/// `acquire`, dropping the guard before every `Read::read` call. Lines up to `capacity` bytes emit
-/// atomically in one locked `write_all`; longer lines stream in bounded `<= capacity` locked
-/// chunks until `\n` (or EOF, terminating with `\n`) and count at most one refusal per logical
-/// line.
+/// Reads bytes from `reader` in `capacity`-byte chunks and writes complete `\n`-terminated lines
+/// to a lock guard returned by `acquire`, dropping the guard before every `Read::read` call. Lines
+/// up to `capacity` bytes emit atomically in one locked `write_all`; longer lines split into
+/// self-contained `\n`-terminated lines of at most `capacity` bytes each so concurrent [`log`]
+/// writers never merge onto a partial chunk, counting at most one refusal per logical line.
 fn relay_stderr_bounded<W: Write>(
   mut reader: impl std::io::Read,
   capacity: usize,
   acquire: impl FnMut() -> W,
 ) {
-  let cap = capacity.max(1);
+  let cap = capacity.max(MIN_LINE_BYTES);
   let mut chunk = vec![0u8; cap];
   let mut relay = LineRelay::new(cap, acquire);
   loop {
@@ -276,9 +255,10 @@ fn relay_stderr_bounded<W: Write>(
 
 /// Relays a supervised child's stderr pipe line-by-line into this process's standard error under
 /// its single stderr lock, bounding per-line memory to [`QUEUE_BYTES`] and never holding the lock
-/// across `Read::read`. Lines up to [`QUEUE_BYTES`] write atomically; longer lines stream
-/// losslessly in bounded chunks with a trailing `\n` on unterminated EOF tails. If standard error
-/// refuses writes (e.g. `EPIPE`), each failed logical line is counted once in
+/// across `Read::read`. Lines up to [`QUEUE_BYTES`] write atomically; longer lines split into
+/// self-contained `\n`-terminated lines of at most [`QUEUE_BYTES`] bytes each so concurrent
+/// [`log`] writes never merge onto partial chunks, with a trailing `\n` on unterminated EOF tails.
+/// If standard error refuses writes (e.g. `EPIPE`), each failed logical line is counted once in
 /// [`log_lines_refused`] while draining continues until EOF so the child never stalls on a full
 /// pipe.
 pub fn relay_stderr(reader: impl std::io::Read) {
@@ -808,15 +788,20 @@ mod tests {
     );
   }
 
-  /// Blocker 4: Do: feed an overlong newline-less stream (256 bytes under a 100-byte bound), a
-  /// normal `\n`-terminated line, and an unterminated EOF tail into `relay_stderr_bounded`.
-  /// Expect: every emitted chunk is bounded at <= 100 bytes, the sink lock is acquired only for
-  /// each immediate write (never held across `Read::read`: 4 acquisitions for 4 emitted chunks),
-  /// and the unterminated EOF remainder flushes with a trailing `\n`.
+  /// Blocker 4 / Round-5 Blocker 1: Do: feed an overlong newline-less stream (256 bytes under a
+  /// 100-byte bound), a normal `\n`-terminated line, an exact-capacity (`99` body + `\n` = `100`
+  /// bytes) line, and an unterminated EOF tail into `relay_stderr_bounded`.
+  /// Expect: every emitted chunk is a self-contained `\n`-terminated line bounded at <= 100 bytes
+  /// with zero lost bytes, exact-capacity lines stay unsplit, the sink lock is acquired once per
+  /// emitted line (never held across `Read::read`), and the unterminated EOF remainder flushes
+  /// with a trailing `\n`.
   #[test]
   fn relay_stderr_bounds_overlong_input_and_flushes_eof_remainder() {
     let mut input = vec![b'A'; 256];
-    input.extend_from_slice(b"short\ntail");
+    input.extend_from_slice(b"short\n");
+    input.extend_from_slice(&vec![b'B'; 99]);
+    input.push(b'\n');
+    input.extend_from_slice(b"tail");
     let sink = RefCell::new(RecordingSink {
       writes: Vec::new(),
       fail: false,
@@ -830,15 +815,26 @@ mod tests {
     });
     let emitted = sink.into_inner().writes;
     assert_eq!(
-      acquisitions, 4,
-      "one immediate lock acquisition per emitted chunk/line"
+      (
+        acquisitions,
+        emitted
+          .iter()
+          .all(|chunk| chunk.len() <= 100 && chunk.ends_with(b"\n")),
+        emitted.iter().map(Vec::len).collect::<Vec<_>>(),
+      ),
+      (5, true, vec![100, 100, 64, 100, 5]),
+      "every emitted line must be <= cap, newline-terminated, and acquire lock once"
     );
     assert_eq!(
-      emitted.iter().map(Vec::len).collect::<Vec<_>>(),
-      vec![100, 100, 62, 5]
+      emitted,
+      vec![
+        [vec![b'A'; 99], b"\n".to_vec()].concat(),
+        [vec![b'A'; 99], b"\n".to_vec()].concat(),
+        [vec![b'A'; 58], b"short\n".to_vec()].concat(),
+        [vec![b'B'; 99], b"\n".to_vec()].concat(),
+        b"tail\n".to_vec(),
+      ]
     );
-    assert_eq!(emitted[2], [vec![b'A'; 56], b"short\n".to_vec()].concat());
-    assert_eq!(emitted[3], b"tail\n");
   }
 
   /// Blocker 4: Do: relay lines over a real pipe while the destination sink refuses every write
@@ -894,32 +890,6 @@ mod tests {
     })))
   }
 
-  /// Classifies one newline-delimited logical line from the concurrent overlong-line relay test.
-  fn classify_overlong_line(line: &[u8]) -> Option<&'static str> {
-    if let Some(fill) = line.strip_prefix(b"ANCHOR:")
-      && fill.len() == 1_024
-      && fill.iter().all(|byte| *byte == b'A')
-    {
-      return Some("anchor");
-    }
-    if let Some(fill) = line.strip_prefix(b"CHILD:")
-      && fill.iter().all(|byte| *byte == b'C')
-    {
-      return match fill.len() {
-        65_532 => Some("child_65539"),
-        99_993 => Some("child_100000"),
-        _ => None,
-      };
-    }
-    if let Some(fill) = line.strip_prefix(b"EOF:")
-      && fill.len() == QUEUE_BYTES - 4
-      && fill.iter().all(|byte| *byte == b'E')
-    {
-      return Some("eof_exact");
-    }
-    None
-  }
-
   /// Feeds 8×65,539-byte, 8×100,000-byte, and 1×exact-65,536-byte unterminated lines into `writer`
   /// in 512-byte pieces to exercise lock continuity across `QUEUE_BYTES` boundaries.
   fn write_overlong_child_lines(mut writer: std::io::PipeWriter) {
@@ -942,40 +912,94 @@ mod tests {
     }
   }
 
-  /// Verifies every newline-delimited logical line in `stream` matches expected counts with zero
-  /// interleaving and a trailing newline.
-  fn assert_overlong_stream_intact(stream: &[u8], expected: (usize, usize, usize, usize)) {
+  /// Validates one `\n`-delimited line from the concurrent overlong-line relay test and appends
+  /// non-anchor child chunks to `child_lines`.
+  fn check_overlong_line<'a>(
+    raw: &'a [u8],
+    anchor_count: &mut usize,
+    child_lines: &mut Vec<&'a [u8]>,
+  ) {
+    assert!(
+      raw.len() + 1 <= QUEUE_BYTES,
+      "emitted line exceeds QUEUE_BYTES ({} + 1 > {QUEUE_BYTES})",
+      raw.len()
+    );
+    if let Some(fill) = raw.strip_prefix(b"ANCHOR:") {
+      assert!(
+        fill.len() == 1_024 && fill.iter().all(|byte| *byte == b'A'),
+        "corrupted or merged anchor line (len={}, prefix={:?})",
+        raw.len(),
+        &raw[..raw.len().min(32)]
+      );
+      *anchor_count += 1;
+      return;
+    }
+    assert!(
+      !raw.windows(7).any(|window| window == b"ANCHOR:"),
+      "child line merged with anchor bytes (len={}, tail={:?})",
+      raw.len(),
+      &raw[raw.len().saturating_sub(32)..]
+    );
+    child_lines.push(raw);
+  }
+
+  /// Verifies that every line in `stream` is standalone (zero `ANCHOR` + child merges), all 64
+  /// anchor lines arrive intact, every emitted line fits within `QUEUE_BYTES`, and the ordered
+  /// child split lines reconstruct every single byte of all 8×65,539, 8×100,000, and 1×65,536
+  /// child lines with zero bytes lost.
+  fn assert_overlong_stream_intact(stream: &[u8], expected_anchors: usize) {
     assert!(
       stream.ends_with(b"\n"),
       "exact-capacity unterminated EOF line must end with a newline"
     );
-    let mut counts = (0usize, 0usize, 0usize, 0usize);
+    let mut anchor_count = 0usize;
+    let mut child_lines: Vec<&[u8]> = Vec::new();
     for raw in stream[..stream.len() - 1].split(|byte| *byte == b'\n') {
-      match classify_overlong_line(raw) {
-        Some("anchor") => counts.0 += 1,
-        Some("child_65539") => counts.1 += 1,
-        Some("child_100000") => counts.2 += 1,
-        Some("eof_exact") => counts.3 += 1,
-        other => panic!(
-          "interleaved or malformed line (len={}, kind={other:?}, prefix={:?})",
-          raw.len(),
-          &raw[..raw.len().min(32)]
-        ),
-      }
+      check_overlong_line(raw, &mut anchor_count, &mut child_lines);
     }
-    assert_eq!(counts, expected);
+    assert_eq!(anchor_count, expected_anchors);
+    assert_child_split_lines_lossless(&child_lines);
   }
 
-  /// Round-2 Blocker 3 / Round-4 Deadlock Fix: Do: relay 65,539-byte and 100,000-byte lines (both
-  /// past `QUEUE_BYTES`) plus an exact-65,536-byte unterminated EOF line over a real pipe in
-  /// 512-byte writes.
-  /// Expect: zero lost or merged bytes, every logical line arrives intact with an exact trailing
-  /// `\n` on the exact-capacity EOF line, and streaming releases the sink lock between chunks.
+  /// Checks that the ordered child lines (after separating standalone anchor lines) match the
+  /// exact expected `\n`-terminated split chunks for 8×65,539, 8×100,000, and 1×65,536 EOF lines.
+  fn assert_child_split_lines_lossless(child_lines: &[&[u8]]) {
+    let max_body = QUEUE_BYTES - 1;
+    let mut expected: Vec<Vec<u8>> = Vec::new();
+    let line_65539 = format!("CHILD:{}", "C".repeat(65_532));
+    let line_100000 = format!("CHILD:{}", "C".repeat(99_993));
+    let eof_exact = format!("EOF:{}", "E".repeat(QUEUE_BYTES - 4));
+    for _ in 0..8 {
+      expected.extend(line_65539.as_bytes().chunks(max_body).map(<[u8]>::to_vec));
+      expected.extend(line_100000.as_bytes().chunks(max_body).map(<[u8]>::to_vec));
+    }
+    expected.extend(eof_exact.as_bytes().chunks(max_body).map(<[u8]>::to_vec));
+    assert_eq!(child_lines.len(), expected.len());
+    for (idx, (got, want)) in child_lines.iter().zip(&expected).enumerate() {
+      assert_eq!(
+        *got,
+        want.as_slice(),
+        "child split line {idx} mismatch (got len {}, want len {})",
+        got.len(),
+        want.len()
+      );
+    }
+  }
+
+  /// Round-2 Blocker 3 / Round-4 Deadlock Fix / Round-5 Blocker 1: Do: concurrently relay
+  /// 8×65,539-byte, 8×100,000-byte, and 1×exact-65,536-byte unterminated child lines over a real
+  /// pipe in 512-byte writes while an anchor thread writes 64 `ANCHOR:...` lines through
+  /// `write_formatted`/`write_owned_to` against the same shared sink.
+  /// Expect: all 64 `ANCHOR:...` lines arrive intact as standalone lines, zero lines contain
+  /// merged `CHILD`/`EOF` + `ANCHOR` bytes, every emitted chunk is `\n`-terminated and `<=
+  /// QUEUE_BYTES`, zero child payload bytes are lost, and streaming releases the sink lock per
+  /// emitted chunk.
   #[test]
   fn relay_stderr_streams_overlong_lines_losslessly_and_terminates_exact_cap_eof() {
     let _gate = counter_gate();
     let (reader, writer) = std::io::pipe().unwrap();
     let sink = shared_stream_sink();
+    let anchor_line = format!("ANCHOR:{}", "A".repeat(1_024));
     let producer = std::thread::spawn(move || write_overlong_child_lines(writer));
     let relay = std::thread::spawn(move || {
       relay_stderr_bounded(reader, QUEUE_BYTES, || {
@@ -986,6 +1010,15 @@ mod tests {
         LockedSink(guard)
       });
     });
+    for _ in 0..64 {
+      write_formatted(format_args!("{anchor_line}"), |buf| {
+        let mut guard = sink
+          .lock()
+          .unwrap_or_else(std::sync::PoisonError::into_inner);
+        write_owned_to(&mut *guard, buf);
+      });
+      std::thread::yield_now();
+    }
     producer.join().unwrap();
     relay.join().unwrap();
 
@@ -999,7 +1032,7 @@ mod tests {
       acquisitions > 17,
       "overlong lines must release and reacquire the sink lock per chunk rather than holding across reads (got {acquisitions})"
     );
-    assert_overlong_stream_intact(&stream, (0, 8, 8, 1));
+    assert_overlong_stream_intact(&stream, 64);
   }
 
   /// Round-2 Blocker 3 / Nit 1: Do: relay two 150,000-byte lines (3 `QUEUE_BYTES` chunks each)
@@ -1105,9 +1138,8 @@ mod tests {
       .bytes
       .clone();
     let expected = [
-      vec![b'X'; QUEUE_BYTES],
-      b"ANCHOR:unblocked\n".to_vec(),
-      b"TAIL\n".to_vec(),
+      vec![b'X'; QUEUE_BYTES - 1],
+      b"\nANCHOR:unblocked\nXTAIL\n".to_vec(),
     ]
     .concat();
     assert_eq!(stream, expected);

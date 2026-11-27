@@ -1596,3 +1596,71 @@ fn close_section_refuses_commit_after_incomplete_section_error() {
   );
   assert_eq!(log.end(), 0);
 }
+
+/// Verifies that a damaged committed 3-block record at the log tail (with or without a following
+/// uncommitted torn tail) advances `log.end()` past its `SLCC` trailer and keeps its intact blocks
+/// untouched across the next append.
+fn assert_damaged_tail_preserved(seed: u64, with_torn_tail: bool) {
+  let (mut log, _) = recovered(file(seed));
+  let r1 = append_for(&mut log, Tool::Git, 101, 1, b"healthy first");
+  let big = payload(77, 12_288);
+  let r2 = append_for(&mut log, Tool::Mercurial, 202, 1, &big);
+  let r2_payload = log.sections(&r2).unwrap()[1];
+  if with_torn_tail {
+    let mut torn = log.begin(header(2, 1)).unwrap();
+    torn.section(SectionKind::Payload, 4_096).unwrap();
+    torn.piece(&vec![0xEE; 1_024]).unwrap();
+  }
+  let sim = log.into_file();
+  sim
+    .inject(Fault::BitFlip {
+      offset: r2_payload.offset + 5_000,
+      bit: 3,
+      stored: true,
+    })
+    .unwrap();
+  let image_before = sim.durable_image().unwrap();
+  let (mut reopened, found) = recovered(sim);
+  assert_eq!(
+    (found, reopened.skipped(), reopened.end()),
+    (vec![r1], 1, r2.end()),
+    "with_torn_tail={with_torn_tail}"
+  );
+  let r3 = append_for(
+    &mut reopened,
+    Tool::Subversion,
+    303,
+    1,
+    b"next landing after damaged committed tail",
+  );
+  let image_after = reopened.into_file().durable_image().unwrap();
+  let b0_start = usize::try_from(r2_payload.offset).unwrap();
+  let b0_end = b0_start + 4_096;
+  let b2_start = b0_start + 8_192;
+  let b2_end = b0_start + 12_288;
+  assert_eq!(
+    (
+      r3.offset,
+      &image_after[b0_start..b0_end],
+      &image_after[b2_start..b2_end],
+    ),
+    (
+      r2.end(),
+      &image_before[b0_start..b0_end],
+      &image_before[b2_start..b2_end],
+    ),
+    "with_torn_tail={with_torn_tail}"
+  );
+}
+
+/// Round-5 Suggestion 4: Do: commit `r1` and a 3-block tail record `r2`, flip 1 bit in `r2`'s
+/// middle block (keeping `r2`'s header, section heads, blocks 0 & 2, and `SLCC` trailer intact),
+/// optionally follow with an uncommitted torn tail, recover, and append `r3`.
+/// Expect: `r2` is skipped (`skipped() == 1`, not indexed in `found`), `log.end()` advances to
+/// `r2.end()` (never rewinding into `r2`), `r3` lands at `r2.end()` (overwriting only any
+/// uncommitted torn tail), and `r2`'s intact block 0 and block 2 bytes survive byte-for-byte.
+#[test]
+fn damaged_last_committed_record_preserves_intact_bytes_across_next_append() {
+  assert_damaged_tail_preserved(112, false);
+  assert_damaged_tail_preserved(113, true);
+}

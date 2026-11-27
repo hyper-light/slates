@@ -680,3 +680,112 @@ fn concurrent_reads_past_channel_capacity_wait_instead_of_failing_busy() {
   owner.stop().unwrap();
   let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Flips one bit at `offset` in `path` and flushes it to disk.
+fn flip_bit(path: &Path, offset: u64, bit: u8) {
+  use std::io::{Read, Seek, SeekFrom, Write};
+  let mut file = std::fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .open(path)
+    .unwrap();
+  file.seek(SeekFrom::Start(offset)).unwrap();
+  let mut byte = [0u8; 1];
+  file.read_exact(&mut byte).unwrap();
+  byte[0] ^= 1u8 << bit;
+  file.seek(SeekFrom::Start(offset)).unwrap();
+  file.write_all(&byte).unwrap();
+  file.sync_all().unwrap();
+}
+
+/// Round-5 Blocker 3: Do: land both an inline (`<= 64 KiB`) and a multi-piece (`> 64 KiB`)
+/// `SectionKind::Record`, stop the owner (checkpointing `rows`), flip 1 bit in each `Record`
+/// section in `changesets`, restart the owner, and read both via `StoreHandle::sections` and
+/// `StoreHandle::read_section`.
+/// Expect: inline tampered `Record` refuses `OwnerError::Store(StoreError::Log(LogError::Corrupt))`
+/// immediately inside `handle.sections`, and multi-piece tampered `Record` refuses `Corrupt`
+/// inside `handle.read_section`.
+#[test]
+fn corrupt_checkpointed_record_section_is_refused_inline_and_multipiece() {
+  use slates_store::log::LogError;
+  use slates_store::owner::OwnerError;
+  use slates_store::store::{LOG_FILE, PIECE_BYTES, StoreError};
+
+  let dir = scratch("record-crc");
+  let inline_msg = b"clean-audit-msg".to_vec();
+  let multi_msg: Vec<u8> = (0..(2 * PIECE_BYTES + 123))
+    .map(|at| u8::try_from((at * 17 + 3) % 251).unwrap())
+    .collect();
+  let runtime = runtime();
+
+  let (inline_off, multi_off) = {
+    let owner = start(&dir);
+    let handle = owner.handle();
+    let inline_bytes = inline_msg.clone();
+    let multi_bytes = multi_msg.clone();
+    let offsets = runtime
+      .block_on(async move {
+        handle
+          .land(header(1), vec![(SectionKind::Record, inline_bytes.clone())])
+          .await
+          .unwrap();
+        handle
+          .land(header(2), vec![(SectionKind::Record, multi_bytes.clone())])
+          .await
+          .unwrap();
+        let rows = handle.changesets(11, 1, 10).await.unwrap();
+        let s1 = handle.sections(rows[0]).await.unwrap();
+        let s2 = handle.sections(rows[1]).await.unwrap();
+        assert_eq!(s1[0].inline.as_deref(), Some(inline_bytes.as_slice()));
+        assert!(s2[0].inline.is_none());
+        assert_eq!(
+          handle.read_section(s2[0].clone()).await.unwrap(),
+          multi_bytes
+        );
+        (s1[0].section.offset, s2[0].section.offset)
+      })
+      .unwrap();
+    owner.stop().unwrap();
+    offsets
+  };
+
+  let log_path = dir.join(LOG_FILE);
+  flip_bit(&log_path, inline_off + 6, 1);
+  flip_bit(
+    &log_path,
+    multi_off + u64::try_from(PIECE_BYTES + 55).unwrap(),
+    2,
+  );
+
+  let owner = start(&dir);
+  let handle = owner.handle();
+  let (inline_res, multi_res) = runtime
+    .block_on(async move {
+      let rows = handle.changesets(11, 1, 10).await.unwrap();
+      let inline_res = handle.sections(rows[0]).await;
+      let multi_sections = handle.sections(rows[1]).await.unwrap();
+      let multi_res = handle.read_section(multi_sections[0].clone()).await;
+      (inline_res, multi_res)
+    })
+    .unwrap();
+  assert!(
+    matches!(
+      inline_res,
+      Err(OwnerError::Store(StoreError::Log(LogError::Corrupt(
+        "a section's bytes"
+      ))))
+    ),
+    "inline tampered Record must refuse Corrupt, got {inline_res:?}"
+  );
+  assert!(
+    matches!(
+      multi_res,
+      Err(OwnerError::Store(StoreError::Log(LogError::Corrupt(
+        "a section's bytes"
+      ))))
+    ),
+    "multi-piece tampered Record must refuse Corrupt, got {multi_res:?}"
+  );
+  owner.stop().unwrap();
+  let _ = std::fs::remove_dir_all(&dir);
+}
