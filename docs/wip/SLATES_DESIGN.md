@@ -65070,8 +65070,20 @@ GAPS.
     link names, more than 0 for a rename of a linked home, whose links follow it. Red at 3 with the walk unconditional.
   - Debug, after: move's `stage.committing` is out of its eight longest spans (8.55 ms before). `landing.apply` is
     still 4.5 ms in move and 4.8 in copy: another unit, named next.
-  - Left: a green with a link anywhere still walks every effect whole in this unit (a volume push with a hard link in
-    its head; GAPS).
+  - A green with a link anywhere walked every effect whole in this unit (a volume push with a hard link in its head).
+    Main's ruling of 2026-11-27 02:03: a defect by §3 whether a probe finds it or not. Now sliced
+    (`engine/node_moves.rs`, `NodeMoves`), an effect a unit until the step is spent:
+    - the version's links gathered;
+    - each removal, rename and replacement kept only where some link may survive its path, in owned paths, so the
+      walk lives across the beginning's steps;
+    - each kept rename's links named at its new path;
+    - each kept home handed over.
+    A home no link survives moves no node, renamed or not, so the moves are the whole walk's, in its order.
+    `Green::node_moves` is the same walk run to its end (the rebase's `heirs_of`), one implementation.
+    - Counter: `Green::node_moves_units`, the units that walked an effect.
+    - Test `a_wide_renames_node_moves_on_a_linked_green_walk_an_effect_a_unit`: 500 renames on a green holding one
+      link, applied a unit a step, at the version the whole submit committed, the link kept. It walked 1,000 or more
+      effects, one a unit. Red with the walk unstopped: one unit for all of them.
   **An apply begun over runs all read plans no replay's reads.** `landing.apply`'s remaining unit, named (debug): its
   slice's `begin_version` at 4.46 ms in one call. The rest of the apply slice was under 1 ms: reads, runs, the
   retention's settle 17-95 µs and the checkpoint's start 36-64 µs. `Green::begin_applying` planned which named runs a
