@@ -117,10 +117,14 @@ pub(crate) fn wanted(state: &mut ShardState, green: ObjectId) {
     Some(crate::vcs_store::RepositoryStore::Git(_))
   ) && let Err(refused) = crate::vcs_store::replica::begin(state, &record, records)
   {
-    slates_machine::log_line!(
-      "slates-server: partition {}: a replica's repository store was refused: {refused:?}",
-      state.partition
-    );
+    // One refused unchanged is counted where it is refused (`replica::UNCHANGED_REFUSED`), not logged: it repeats at
+    // every version waited for until its records or a window change, and its replay's refusal was logged once.
+    if refused != crate::vcs_store::replica::ReplicaRefused::Unchanged {
+      slates_machine::log_line!(
+        "slates-server: partition {}: a replica's repository store was refused: {refused:?}",
+        state.partition
+      );
+    }
     state.count(REFUSED, 1);
     return;
   }

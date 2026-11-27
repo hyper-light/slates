@@ -765,9 +765,26 @@
 > holder's copy is ever let go, its bring-back must come from the region (`homes::read_in_region`), never its own
 > store.** OWED with the flip: the rule checked, not read: the control scene with the let-go on and no hooks, each
 > holder's landed let-go staying 0 while the owner's moves, so a change that lets a holder's pack go fails it and
-> reopens (d) with a real red. Two defects the runs found stand without any let-go and are their own landing: the
-> swallowed `Unlanded` of `changeset_read_for_rebuild` (CLAUDE.md §2 item 9), and the replica store begun again with
-> no bound after its replay was refused (`replica_build::wanted` → `replica::begin`; §2 item 8).
+> reopens (d) with a real red. Two defects the runs found stood without any let-go:
+> - **FIXED (w-git, 2026-11-27): the dropped `Unlanded` and the false `Truncated`** (CLAUDE.md §2 item 9).
+>   `changeset_read_for_rebuild` dropped a refused changeset read unseen. The node's store is the first source, not
+>   the only one: the region's homes are asked next (`names_fetched_for_rebuild`) for what the content store lacks, and
+>   ending the rebuild at the read refused every holder's replica in the fleet tests (`a908_…`, `a_new_branchs_push_…`:
+>   `unable to commit`). So the refusal is counted, `vcs_store.changeset_unread`, and left to the region. A pack the
+>   content store holds let go is not fetched from the region, so where the node's store cannot fill it either the
+>   replay refused `Pack(Truncated { at: 0 })`, a pack cut short, which it is not; it now refuses `Unlanded`
+>   (`git_replay`'s piece read). Red: `vcs_store::replica::tests::a_replicas_replay_over_a_let_go_pack_nothing_fills_is_
+>   refused_unlanded` (a replica begun from records whose changesets this node's store holds none of, its pack let go:
+>   `Truncated` and nothing counted before; `changeset_unread` counted and `Unlanded` after).
+> - **FIXED (w-git, 2026-11-27): a refused replica store begun again with no bound** (§2 item 8; main's keying of
+>   05:52). `replica_build::wanted` begins a replica store wherever none stands, and a refused replay leaves none, so
+>   each version waited for replayed the same records into the same refusal. Now `replica::begin` refuses at once,
+>   `ReplicaRefused::Unchanged`, counted `vcs_store.replica.unchanged_refused` and not logged, while the store is
+>   unrecovered from the same records and no window has been brought back on the shard since it was begun
+>   (`read_through::BROUGHT_BACK`, `homes::LANDED_BROUGHT_BACK`); other records, or a window brought back, begin it
+>   again. Red: `vcs_store::replica::tests::a_replica_store_refused_is_not_begun_again_from_the_same_records` (records
+>   that are not push records: begun and replayed twice before; refused `Unchanged` the second time after, one replay
+>   refused, other records begun).
 > The lift must also keep `landed_let_go_may`'s wait on live intakes (`intakes_live(id) <= own`, `vcs_store.rs`): it is
 > what keeps a landed pack's windows while a later push of the repository, or the same push's later refs, still reads
 > them (main 01a20182's sibling sweep of 2026-11-25). A lift that drops it opens Mercurial's bug in git: a window let go
