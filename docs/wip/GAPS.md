@@ -822,8 +822,11 @@
 > itself since 13b; the publication is one whole step (8.8 ms debug, owed turns if release finds it past the bar), and
 > the record's inline chain entry (430,978 bytes) was to be next, (a). Measured and rejected: the log's write of it was 0.32
 > ms of the op's 4.29 (debug), and the cost was the identity's hash of the whole op (4.92 ms), which hashes each entry as
-> its digest since 13c. The log write's about 48 bytes a path stays, for a wider probe to judge. Next: copy's release
-> unit (kernel time), then move's `stage.committing` and `landing.apply`. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
+> its digest since 13c. The log write's about 48 bytes a path stays, for a wider probe to judge. Release probe 17's
+> move leader was the test's own setup (the simulated host's copy of the dump), now made before the timed history; the
+> product's create and begin print apart (`SETUP`). Next: copy's release unit (an allocator's batch of freed pages
+> returned in one free, 1.2-1.3 ms of system time in release), to a reaper thread by main's ruling, then move's
+> `stage.committing` and `landing.apply`. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's

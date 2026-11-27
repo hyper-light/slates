@@ -71,6 +71,8 @@ pub(crate) fn owner() -> Principal {
 /// Creates Subversion repository `name` from a history running as a task on the shard, through a client's request,
 /// once its creation landed on the node's store and was recorded (A-767 item 7): its id and its one green.
 pub(crate) async fn subversion(name: &str) -> (RepositoryId, DbVolumeId) {
+  // The product's create, a step of a timed history of its own name (A-920, main's ruling after probe 17).
+  super::phase::tag("create");
   crate::test_store::created(
     &owner(),
     (name, VcsTool::Subversion, ObjectFormat::Revisions, "main"),
@@ -86,6 +88,32 @@ pub(crate) fn host_holding(dump: &[u8]) -> (SimHost, HostDir) {
   (host, root)
 }
 
+/// A simulated host holding a test's dump, made on the test's thread before the history that imports it begins (A-920,
+/// main's ruling after probe 17: measure the product, not the oracle). Made inside the history, the host's copy of
+/// move's 10.5 MB dump was 1.49 ms of its first poll, debug, 1.23 of it system time faulting the copy's pages in, and
+/// that poll led move's release runs. Shared so a history holding it stays `Clone`; taken once.
+#[derive(Clone)]
+pub(crate) struct HeldDump(std::sync::Arc<std::sync::Mutex<Option<(SimHost, HostDir)>>>);
+
+impl HeldDump {
+  /// `dump` held by a simulated host ([`host_holding`]): the caller's copy goes with it, off the shard.
+  pub(crate) fn holding(dump: Vec<u8>) -> HeldDump {
+    HeldDump(std::sync::Arc::new(std::sync::Mutex::new(Some(
+      host_holding(&dump),
+    ))))
+  }
+
+  /// The host and its root: taken once, by the history that imports from it.
+  fn taken(&self) -> (SimHost, HostDir) {
+    self
+      .0
+      .lock()
+      .expect("the held dump's lock")
+      .take()
+      .expect("the held dump, taken once")
+  }
+}
+
 /// Imports `dump` into repository `id` from a history running as a task on the shard, a turn at a time, each record
 /// handed over landed on the node's store before the next turn (C2, `super::land_owed`), to its end: what the turns
 /// ended with, and how many there were.
@@ -96,6 +124,14 @@ pub(crate) async fn imported(
   imported_sampling(id, dump, &mut || {}).await
 }
 
+/// [`imported`] from the host `held` holds ([`HeldDump`]), made before the history began.
+pub(crate) async fn imported_held(
+  id: RepositoryId,
+  held: &HeldDump,
+) -> (Result<Loaded, LoadFailed>, u64) {
+  imported_from(id, held.taken(), &mut || {}).await
+}
+
 /// [`imported`], `sampled` run after each turn's landings and owed bases, before the next turn: what a test reads of
 /// the shard between turns.
 pub(crate) async fn imported_sampling(
@@ -103,10 +139,21 @@ pub(crate) async fn imported_sampling(
   dump: impl AsRef<[u8]>,
   sampled: &mut dyn FnMut(),
 ) -> (Result<Loaded, LoadFailed>, u64) {
-  use crate::repository::svn_commit::tests::on;
-  let (host, root) = host_holding(dump.as_ref());
+  let held = host_holding(dump.as_ref());
   // The simulated host holds the dump now: the caller's copy goes, so a measurement counts one.
   drop(dump);
+  imported_from(id, held, sampled).await
+}
+
+/// [`imported_sampling`] from `host`, which holds the dump at its `root`.
+async fn imported_from(
+  id: RepositoryId,
+  (host, root): (SimHost, HostDir),
+  sampled: &mut dyn FnMut(),
+) -> (Result<Loaded, LoadFailed>, u64) {
+  use crate::repository::svn_commit::tests::on;
+  // The product's begin, a step of a timed history of its own name (A-920, main's ruling after probe 17).
+  super::phase::tag("begin");
   if let Err(failed) = on(|state| begin(state, (&owner(), id), (Box::new(host), root, DUMP))) {
     return (Err(failed), 0);
   }
@@ -1044,11 +1091,15 @@ const WIDE_TEXT_BYTES: usize = 1024;
 #[test]
 fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shards_window() {
   // Made before the shard's history begins: the fixture's own work is no step of the import's.
-  let dump = wide_revisions(WIDE_REVISION_FILES, WIDE_TEXT_BYTES, (1, false));
+  let held = HeldDump::holding(wide_revisions(
+    WIDE_REVISION_FILES,
+    WIDE_TEXT_BYTES,
+    (1, false),
+  ));
   let (loaded, (longest_ns, window_ns), counts) = stored(move || {
     cpu_timed(async move {
       let (svn, _green) = subversion("wide-revision").await;
-      let (loaded, _turns) = imported(svn, dump).await;
+      let (loaded, _turns) = imported_held(svn, &held).await;
       let counts = wide_counts();
       let (longest_ns, longest_task) = longest_poll();
       print_phases("wide-add");
@@ -1129,10 +1180,12 @@ fn imported_whole_and_stepped(
   name: &'static str,
   dump: Vec<u8>,
 ) -> (Result<u64, String>, u64, u64, (u64, u64, u64, u64)) {
+  // Held before the shard's history begins: the oracle host's copy of the dump is no step of the import's.
+  let held = HeldDump::holding(dump);
   let read = stored(move || {
     cpu_timed(async move {
       let (svn, green) = subversion(name).await;
-      let (loaded, _turns) = imported(svn, dump).await;
+      let (loaded, _turns) = imported_held(svn, &held).await;
       checkpoints_ended().await;
       let build_units = on(|state| count(state, crate::merge_service::CHECKPOINT_BUILD_UNITS));
       let walk_most = on(|state| {
@@ -1374,6 +1427,9 @@ std::thread_local! {
   static TIMED_LONGEST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
   /// That poll's spans in the import's phases, in order (`svn_import::phase`).
   static TIMED_SPANS: std::cell::RefCell<Vec<super::phase::Span>> = const { std::cell::RefCell::new(Vec::new()) };
+  /// The longest span of the product's create and of its begin in a timed history's polls, by the wall: reported apart
+  /// from the import's turns ([`print_phases`]'s `SETUP` line).
+  static SETUP_LONGEST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// A history whose every poll is timed by the wall clock and by its thread's CPU clock
@@ -1400,6 +1456,7 @@ impl<F: std::future::Future> std::future::Future for CpuTimed<F> {
     let spent = cpu_ns().saturating_sub(cpu_began);
     let (spans, ended) = super::phase::poll_ended();
     self.phase = ended;
+    setup_spans(&spans);
     TIMED_LONGEST.with(|longest| {
       if wall > longest.get().0 {
         longest.set((wall, spent));
@@ -1410,12 +1467,28 @@ impl<F: std::future::Future> std::future::Future for CpuTimed<F> {
   }
 }
 
+/// The longest spans of the product's create and begin among `spans`, a poll's, kept in [`SETUP_LONGEST`].
+fn setup_spans(spans: &[super::phase::Span]) {
+  SETUP_LONGEST.with(|longest| {
+    let (mut create, mut begin) = longest.get();
+    for (tag, wall, _) in spans {
+      match *tag {
+        "create" => create = create.max(*wall),
+        "begin" => begin = begin.max(*wall),
+        _ => {}
+      }
+    }
+    longest.set((create, begin));
+  });
+}
+
 /// `history` with each of its polls timed by the wall and by its thread's CPU ([`CpuTimed`]; main's order after probe
 /// 9: the pulse's longest step is a poll's wall clock, which a preempted or waiting thread stretches as much as held
 /// work, so the CPU beside it tells the two apart). Made on the shard that polls it, whose longest so far it clears.
 pub(crate) fn cpu_timed<F: std::future::Future>(history: F) -> CpuTimed<F> {
   TIMED_LONGEST.with(|longest| longest.set((0, 0)));
   TIMED_SPANS.with(|kept| kept.borrow_mut().clear());
+  SETUP_LONGEST.with(|longest| longest.set((0, 0)));
   let _ = super::phase::release_units_taken();
   CpuTimed {
     future: Box::pin(history),
@@ -1449,11 +1522,14 @@ pub(crate) fn longest_poll() -> (u64, String) {
 }
 
 /// Prints the phases of `name`'s history's longest poll on this thread ([`cpu_timed`]): its spans in the import's
-/// phases, in order, each by the wall and by the thread's CPU ([`phases_line`]).
+/// phases, in order, each by the wall and by the thread's CPU ([`phases_line`]); then the longest span of the product's
+/// create and of its begin, apart (`SETUP <name> create_ns=<n> begin_ns=<n>`), and the release's longest unit.
 pub(crate) fn print_phases(name: &str) {
   let longest = TIMED_LONGEST.with(std::cell::Cell::get);
   let spans = TIMED_SPANS.with(|kept| kept.borrow().clone());
   eprintln!("{}", phases_line(name, longest, &spans));
+  let (create_ns, begin_ns) = SETUP_LONGEST.with(std::cell::Cell::get);
+  eprintln!("SETUP {name} create_ns={create_ns} begin_ns={begin_ns}");
   let unit = super::phase::release_units_taken();
   eprintln!(
     "RELEASE {name} unit_wall_ns={} unit_cpu_ns={} unit_user_ns={} unit_sys_ns={} units={}",

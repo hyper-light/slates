@@ -64985,6 +64985,34 @@ GAPS.
   - Test: `an_ops_identity_hashes_each_entry_as_its_digest_alike_at_the_owner_and_its_replay`. The encoding is the
     same for the op read back as a replay reads it; a 431 KB entry's is no longer than a 100-byte one's; a one-byte
     change of an entry gives a different encoding.
+  **Release probe 17** (main, at a52c0aa1e with 13b and the release's user and system split, before 13c; by the
+  history's longest poll; 99 runs at load 50-56, then 99 with burners; all rc 0):
+  - add: p50 714 µs, then 695 with burners; over 1 ms in 14 and 4 of 99. Led by `stage.recording`.
+  - copy: p50 1,326 µs, then 1,242; led by `landing.release` in 78 and 75. Its longest release unit is p50 1,226 to
+    1,302 µs, all of it system time (user 3 to 5 µs).
+  - move: p50 1,548 µs, then 1,556; over 1 ms in 99 and 98. Led by an untagged span, the whole poll, in 98 and 96.
+  **The untagged span is the test's own setup** (main's ruling: measure the product, not the oracle). A history's
+  phase is "untagged" until its first tag, so the span was what the history did before the import's first turn.
+  Tagged once (debug), move's first poll was 1,623 µs:
+  - the simulated host's copy of the 10.5 MB dump, 1,438 µs. `to_vec` was 1,486 µs, 1,232 of it system time
+    faulting the copy's pages in; `replace_file`'s own work 300. The harness alone: no product code runs in it.
+  - the import's `begin`, 178 µs; the repository's create, 7 µs warm and 1,796 µs cold (the process's first).
+  The host is now made on the test's thread before the timed history begins (`HeldDump`). The product's create and
+  begin stay in the history under tags of their own ("create", "begin"). Their longest spans print apart from the
+  import's turns: `SETUP <test> create_ns=<n> begin_ns=<n>`. In debug, create is 167-202 µs warm and 1,957 µs cold,
+  and begin is 615-1,141 µs. Probe 16 at cb73f520b read move at p50 1,090 µs with the same setup code. Unmeasured
+  guess: 7fcc72414's harness fix removed a clone and drop of the history's dump on the shard just before. Its freed
+  pages had made the host's copy cheap.
+  **Copy's release unit: an allocator's batch of freed pages returned in one free.** By the unit's kind (debug), the
+  long unit is a map node's release in most runs and a remains entry's pop in one. Inside it, the time is in one
+  free whose value varies from run to run: a named block's (1.30-1.56 ms), a node's 160-byte child list (1.32 ms).
+  The task's VM counters (`TASK_VM_INFO`) around that free:
+  - `internal` and `phys_footprint` drop by 39-44 MB;
+  - `reusable` rises by 28-33 MB.
+  That is the allocator marking freed pages reusable in a batch (`madvise`), paid by whichever free crosses its
+  threshold. The release's walk does not decide which free that is. Main's ruling: what the release takes goes by
+  move to a reaper thread the daemon owns, not to a swap of the global allocator (a C dependency on every platform,
+  and every memory figure rebaselined).
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
