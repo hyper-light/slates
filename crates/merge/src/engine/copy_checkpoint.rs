@@ -216,7 +216,7 @@ impl Green {
     }
   }
 
-  /// The checkpoint's changed tables without the keys `listed` as copied ([`Green::copied_at`]).
+  /// The checkpoint's changed tables without the keys `listed` as copied (`Green::copied_at`).
   pub(super) fn leave_out_copied(
     checkpoint: &mut crate::checkpoint::Checkpoint,
     listed: &BTreeSet<IdentityKey>,

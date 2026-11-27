@@ -270,7 +270,7 @@ enum Met {
   Parked(u64),
 }
 
-/// What a handle's asks of the owner waited on, all told since it was last taken ([`StoreHandle::take_waits`]): each
+/// What a handle's asks of the owner waited on, all told since it was last taken (`StoreHandle::take_waits`): each
 /// ask's wait split into its parts, which sum to its whole (goal 93, main's order of 2026-11-25).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AskWaits {

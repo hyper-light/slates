@@ -522,7 +522,7 @@ pub fn start(program: &Path, args: &[&OsStr], ends: usize) -> io::Result<Started
   Ok(Started { child, ends: ours })
 }
 
-/// Format: the test a test binary runs as the spawner ([`spawner_role!`] defines it at the binary's root), named so
+/// Format: the test a test binary runs as the spawner (`spawner_role!` defines it at the binary's root), named so
 /// libtest runs it alone (`--exact`); the `slates` binary serves before it reads any argument, so the same arguments
 /// start either.
 pub const ROLE_TEST: &str = "spawner_role";

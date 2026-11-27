@@ -360,7 +360,7 @@ impl Increment {
     wholes
   }
 
-  /// [`Increment::unread`] among the runs `wanted` marks by place (a replay's, [`Green::replay_reads`]); every run where
+  /// [`Increment::unread`] among the runs `wanted` marks by place (a replay's, `Green::replay_reads`); every run where
   /// `wanted` does not reach it.
   pub fn unread_among(&self, wanted: &[bool]) -> Option<&crate::named::NamedRun> {
     self.named.runs.iter().enumerate().find_map(|(at, run)| {
@@ -381,7 +381,7 @@ impl Increment {
     self.read_step_among(objects, slice, &[])
   }
 
-  /// [`Increment::read_step`] over the runs `wanted` marks by place (a replay's, [`Green::replay_reads`]): whether every
+  /// [`Increment::read_step`] over the runs `wanted` marks by place (a replay's, `Green::replay_reads`): whether every
   /// one of them is read. A run `wanted` does not reach is read.
   ///
   /// One call reads on from the first run unread into the next, run after run, until its `slice` is spent, so reading
@@ -1568,6 +1568,10 @@ pub struct Green {
   /// the version makes none, since then no link survives a home; a move of 9,000 files had walked its 18,000 effects in
   /// one unit, 7.99 ms debug, finding no move).
   node_moves_walked: u64,
+  /// The plans of a replay's reads applies began ([`Increment::replay_reads`]; A-920: none where every named run is
+  /// read already, as a landing reads them all before its apply begins; the plan, a pass over every effect and run, had
+  /// been 4.46 ms of one step at 9,000 files, debug, answering that none was unread).
+  replay_plans: u64,
   /// The byte buffers commits let go for files named for their run's object (A-920 3n's non-vacuity count: none, since
   /// such a file is given no bytes; each had been a run's own buffer, freed a commit unit at a time, and the free that
   /// emptied the allocator's region cost one unit about 1 ms of the kernel's time).
@@ -4500,6 +4504,11 @@ impl Green {
   /// The effects commits walked for their node moves ([`Green::node_moves_walked`]'s field, A-920).
   pub fn node_moves_walked(&self) -> u64 {
     self.node_moves_walked
+  }
+
+  /// The plans of a replay's reads applies began ([`Green::replay_plans`]'s field, A-920).
+  pub fn replay_plans(&self) -> u64 {
+    self.replay_plans
   }
 
   /// The effect lists a verdict's units allocated of their own ([`Green::unit_effect_lists`]'s field, A-920 3l).
@@ -7897,8 +7906,14 @@ impl Green {
     // A named run not read yet (A-760) is never applied as zeros: nothing commits, and the head answered differs from
     // the version the entry was recorded as, which its caller refuses as it refuses any chain that disagrees. A run the
     // apply names whole, which no op reads, is never read for it (A-887, [`Green::replay_reads`]).
-    if inc.unread_among(&inc.replay_reads(applied)).is_some() {
-      return Begun::Answered(self.head());
+    // With every run read (a landing reads them all before its apply begins) none is unread whatever the plan says, so
+    // the plan, a pass over every effect and run (A-920: 4.46 ms of one step at 9,000 files, debug), is made only where
+    // one is unread: a recovery's replay, which reads only the runs it plans.
+    if inc.unread().is_some() {
+      self.replay_plans = self.replay_plans.saturating_add(1);
+      if inc.unread_among(&inc.replay_reads(applied)).is_some() {
+        return Begun::Answered(self.head());
+      }
     }
     let copies = applied
       .iter()

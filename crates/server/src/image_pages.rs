@@ -592,7 +592,7 @@ pub(crate) struct Directory {
 
 impl Clone for Directory {
   /// A copy of every page: work a family's size, which the encoder's turns and drains never pay (A-870 F2), counted
-  /// under a test ([`DIRECTORY_PAGES_COPIED`]).
+  /// under a test (`DIRECTORY_PAGES_COPIED`).
   fn clone(&self) -> Directory {
     #[cfg(test)]
     DIRECTORY_PAGES_COPIED.with(|copied| {
