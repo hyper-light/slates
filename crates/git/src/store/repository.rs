@@ -604,6 +604,9 @@ pub struct Repository {
   /// The first let-go piece a read met since its owner last asked ([`Repository::waiting`]): a read that meets one answers
   /// none, and its owner brings the piece back and takes the step again.
   waiting: Cell<Option<packed::Waited>>,
+  /// While a reader with a slot of its own reads ([`Repository::reading_quietly`]): the first let-go its reads met,
+  /// kept here and never on [`Repository::waiting`]'s shared slot. None outside such a read.
+  quiet: Cell<Option<Option<packed::Waited>>>,
   /// The longest object its packs hold: what a read from them is held to (§4.9: every size a stored entry's header
   /// names, and its chain's, checked against it before a buffer grows to it; a read allocates nothing in the store, so
   /// the store's lent room is no bound for it).
@@ -657,6 +660,7 @@ impl Repository {
       last_found_kept: std::cell::Cell::new(false),
       last_inflated_base: std::cell::Cell::new(false),
       waiting: Cell::new(None),
+      quiet: Cell::new(None),
       largest: 0,
       landings_charged: 0,
       counters: Cell::new(StoreCounters::default()),
@@ -911,9 +915,8 @@ impl Repository {
   fn note_waited<T>(&self, read: &Result<T, packed::PackedRefused>) {
     if let Err(refused) = read
       && let Some(waited) = refused.waited()
-      && self.waiting.get().is_none()
     {
-      self.waiting.set(Some(waited));
+      self.wait_for(waited);
     }
   }
 
@@ -934,9 +937,25 @@ impl Repository {
   /// Notes `waited` as what a step waits for, where none is noted yet ([`Repository::waiting`]): what a caller that took
   /// a step's miss to act on it gives back when another step of its turn is the one its driver brings it back for.
   pub fn wait_for(&self, waited: packed::Waited) {
-    if self.waiting.get().is_none() {
-      self.waiting.set(Some(waited));
+    match self.quiet.get() {
+      // A quiet read's own: kept for its reader alone (B3; one slot a reader).
+      Some(None) => self.quiet.set(Some(Some(waited))),
+      Some(Some(_)) => {}
+      None if self.waiting.get().is_none() => self.waiting.set(Some(waited)),
+      None => {}
     }
+  }
+
+  /// `read` run with every let-go window its reads meet kept for its caller alone, never noted on the repository's
+  /// shared slot ([`Repository::waiting`]), which a derivation's turn clears and other owners take: what it answered,
+  /// and the first let-go it met (B3 of the landed let-go's lift, main's ruling of 2026-11-26: a push's admission notes
+  /// its let-go in the push's own slot). A read already quiet keeps its own scope: the inner one answers what it met
+  /// and leaves the outer's as it was.
+  pub fn reading_quietly<T>(&self, read: impl FnOnce() -> T) -> (T, Option<packed::Waited>) {
+    let outer = self.quiet.replace(Some(None));
+    let answered = read();
+    let met = self.quiet.replace(outer).flatten();
+    (answered, met)
   }
 
   /// The packs the repository's objects lie in, each with its length (goal 93 item 2a: what a fetch or an encoding
@@ -1026,7 +1045,14 @@ impl Repository {
         };
         match push.bytes(store, &outside, id) {
           Some(Ok(bytes)) => Ok(bytes),
-          _ => Err(unreadable),
+          // A REF_DELTA's base outside the push met let go: named for the reader's owner to bring back (B3).
+          Some(Err(refused)) => {
+            if let Some(waited) = refused.waited() {
+              self.wait_for(waited);
+            }
+            Err(unreadable)
+          }
+          None => Err(unreadable),
         }
       }
     }
@@ -2191,6 +2217,7 @@ impl Repository {
       last_found_kept: std::cell::Cell::new(false),
       last_inflated_base: std::cell::Cell::new(false),
       waiting: Cell::new(None),
+      quiet: Cell::new(None),
       largest: self.largest,
       landings_charged: self.landings_charged,
       counters: Cell::new(StoreCounters::default()),
