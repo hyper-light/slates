@@ -322,6 +322,11 @@ where
   }
 }
 
+/// A read a command's preparation made met a let-go window, to be brought back before the command is prepared again
+/// ([`crate::away`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Wait;
+
 impl<'w, G, R, O> Verdicts<'w, G, R, O>
 where
   G: Greens + ?Sized,
@@ -378,8 +383,14 @@ where
   ) -> bool {
     // A delete builds nothing, nor does a create, whose push its green owes until first reached (P2). A create reaches
     // the greens its verdict will read, so the owner can make any that owes its own push before the verdict reads it.
+    // A delete's verdict reads the version at its old value, so where that read meets a let-go window (B2) it waits.
     if command.is_delete() {
-      return true;
+      return self
+        .greens
+        .read(&command.name, |read| {
+          self.base_of(read.id, &command.old).is_ok()
+        })
+        .unwrap_or(true);
     }
     // A-864's push readers (main 01a20182's r18: a push of a tag of a tag declined "an object it names cannot be read",
     // the tag it names read from a pack let go): a peel of the new value whose read met a let-go window is not ready, so
@@ -447,9 +458,10 @@ where
         if begun {
           return turn(read.green, None);
         }
-        match self.greens.version_of(read.id, &command.old) {
-          Some(base) => turn(read.green, Some(base)),
-          None => true,
+        match self.base_of(read.id, &command.old) {
+          Ok(Some(base)) => turn(read.green, Some(base)),
+          Ok(None) => true,
+          Err(Wait) => false,
         }
       })
       .unwrap_or(true)
@@ -614,6 +626,23 @@ where
       tree: key(&tree, &command.name)?,
       head: Some(command.new.as_bytes()),
     })
+  }
+
+  /// The version of `green` whose head is `old`, an update's or a delete's base (none where no version is: the ref
+  /// moved); or [`Wait`] where its read met a let-go window the repository names ([`Repository::away`]), so the push's
+  /// driver brings it back before the command is prepared again (B2, goal 93 item 2b: a green headed by an annotated
+  /// tag reads the tag through the repository, and a let-go tag's miss was a version none, the ref declined as moved).
+  /// The same let-go met again with nothing brought back between answers none, the ref's typed refusal
+  /// ([`crate::away`]'s one rule).
+  fn base_of(&self, green: u64, old: &ObjectId) -> Result<Option<Version>, Wait> {
+    if let Some(version) = self.greens.version_of(green, old) {
+      self.away_seen.answered();
+      return Ok(Some(version));
+    }
+    if self.away_seen.waits(self.repository.away()) {
+      return Err(Wait);
+    }
+    Ok(None)
   }
 
   /// Whether `command`'s new value cannot yet be peeled to its tree because a read of the chain met a let-go window (the

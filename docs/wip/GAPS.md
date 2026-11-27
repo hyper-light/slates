@@ -541,9 +541,22 @@
 >   stops_the_resolution_until_it_is_back` and `git_push::tests::b1b_a_thin_pushs_delta_on_a_delta_whose_base_was_
 >   let_go_is_resolved_once_it_is_back` (a nanosecond step budget, the first push's pack let go once the middle tree
 >   is admitted).
-> - OPEN: B2 (the server's tag-headed green, `ShardGreens::tree_of`), B3 (the admission's peel and references), B4 (the
->   policy's reads), B5 (`PushedObjects::bytes` of a pushed object, `Malformed`), B6 (a verdict's one-call build), B7
->   (`push_of`'s peel at judge time, after `prepare`'s), B8 (the encoding's tree walk: time, not correctness).
+> - **B2 BUILT (w-git, 2026-11-26): the server's tag-headed green.** `ShardGreens::tree_of` reads the annotated tag at a
+>   green's head through the push's `IndexedObjects`; on a let-go window it answered no version, and the verdicts took
+>   the ref as moved (`failed to update ref`, "cannot lock ref"), for an update and for a delete alike. Now
+>   `Verdicts::prepare` asks an update's and a delete's base through `Verdicts::base_of`, which answers wait where the
+>   version is none and the repository names a let-go window, by the one rule, so the push's driver brings it back (a
+>   delete was answered ready at once by `ServerJudge::ready`, and now takes the build turn its preparation needs);
+>   `IndexedObjects` drops a let-go met by an earlier ask before one answered from what it kept. Reds:
+>   `git_push::tests::b2_an_update_of_a_ref_whose_green_is_headed_by_a_let_go_tag_brings_it_back_and_lands` and
+>   `b2_a_delete_of_...` (the tag in a window of its own past a filler blob; once the create's derivation has ended,
+>   every window let go and the repository idle in the push's own task before its first step, the tag's window asserted
+>   let go by its number; both `failed to update ref` before, and after, the push's own driver bringing it back; main's
+>   run 10 of 16 had the delete pass with nothing brought back when the let-go was made before the push's task). No unit
+>   red below the server: the miss is `ShardGreens`', and `prepare` is driven only by the server's judge.
+> - OPEN: B3 (the admission's peel and references), B4 (the policy's reads), B5 (`PushedObjects::bytes` of a pushed
+>   object, `Malformed`), B6 (a verdict's one-call build), B7 (`push_of`'s peel at judge time, after `prepare`'s), B8
+>   (the encoding's tree walk: time, not correctness).
 > **P OPEN (w-git; main's r229, 2026-11-23): git/git's HTTP mirror clone takes about 100 s** (97.9 and 107.7 s, 556 MB
 > against stock git's 612 MB; the work clone 92.9 and 97.2 s), the daemon CPU-bound at 97% of one core: blake3,
 > `Index::get`, `ContentStore::get` / `len_of` / `window_at_in`, `Positions::settle`. No stall; to be profiled.
@@ -4671,12 +4684,16 @@
 > presenter, a read-only attachment the mount edges serve (a read-only volume whose base-plane host reads the
 > repository's content store, under the root mount): until it lands a push whose repository configures a git hook is
 > refused `hook not run`, as before; the edges' signal of a client gone; the hooks' learned times; the SSH channel's call.
-> **OPEN (test, found under battery throttling, 2026-11-26, main's B1b round; not worked now):** the A-665 hooks tests'
-> bound between two progress reports (`git_push::tests::pushed_with_hooks`, `git_hooks::tests::TEST_BOUND_NS`, ten
-> liveness budgets) failed 4 times in 3 of 8 runs of `git_push::` with 12 burners while the Mac ran on battery at 29 to
-> 22% (runs 21 to 88 s, against 8 to 21 s on AC): `t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_
-> the_update` once, then it, the pre-receive refusal and the update refusal of its own command together, each "the
-> push went no further within the test's bound after 20 / 21 / 48 steps". On AC, 8 of 8 at the same load passed.
+> **OPEN (test, found under battery throttling and at load 50 and more on AC, 2026-11-26, main's B1b and B2 rounds; not
+> worked now):** the A-665 hooks tests' bound between two progress reports (`git_push::tests::pushed_with_hooks`,
+> `git_hooks::tests::TEST_BOUND_NS`, ten liveness budgets) failed 4 times in 3 of 8 runs of `git_push::` with 12
+> burners while the Mac ran on battery at 29 to 22% (runs 21 to 88 s, against 8 to 21 s on AC):
+> `t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update` once, then it, the pre-receive
+> refusal and the update refusal of its own command together, each "the push went no further within the test's bound
+> after 20 / 21 / 48 steps"; on AC, 8 of 8 at load 46 to 106 with burners passed then. On AC with no burners it failed
+> too, at main's code as well as B2's (w-git's runs): all three after 20 / 21 / 21 steps in `git_push::` with
+> `git_hooks::` at load 50 to 60; the three alone after 15 / 18 / 15 at load 54 to 60; and alone with B2's change
+> reversed after 35 / 36 / 35 at load 85 to 106. At load about 48 they passed.
 > **A-665 part 4a (2026-11-20, w-git):** the HTTP edge's signal of a client gone (`vcs_http::ClientGone`, the socket's
 > close after the body) ends a hook's run. Owed: the SSH edge's; a TLS `close_notify` ahead of the close is not seen.
 > **A-665 part 4b (2026-11-20, w-git):** git's hooks held to the bound each learned on the owner shard

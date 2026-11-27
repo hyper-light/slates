@@ -2168,15 +2168,13 @@ impl Judge for ServerJudge<'_> {
       return false;
     }
     if command.is_delete() {
-      // A delete builds nothing; it reads only its own green, made first if it owes its push (P2's door).
+      // A delete builds nothing; it reads only its own green, made first if it owes its push (P2's door), then its
+      // version at the old value, which waits where that read meets a let-go window (B2, `Verdicts::prepare`).
       return match bound(self.state, self.record.id, &command.name)
         .filter(|green| self.state.greens.is_owing(green))
       {
         Some(green) => self.door(green),
-        None => {
-          *self.door = None;
-          true
-        }
+        None => self.build_turn(command, pushed, slates_rt::futures::now_ns()),
       };
     }
     let repository = self.record.id;

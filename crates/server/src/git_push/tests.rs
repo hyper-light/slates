@@ -1551,7 +1551,7 @@ const THIN_TREE_FILES: usize = 64;
 fn b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (repository, update, pack) = thin_update_over_a_create(&daemon, "thin-check-away");
-  let (updated, (at_let_go, after), _) = crate::test_store::run_on_first(
+  let (updated, (at_let_go, after), _, _) = crate::test_store::run_on_first(
     &daemon,
     move || async move { let_go_at_its_checks(repository, &update, (&pack, Meddle::Not)).await },
     HISTORY_PATIENCE,
@@ -1582,7 +1582,7 @@ fn b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands() {
 fn b1_a_window_brought_back_and_let_go_again_by_another_reader_is_waited_for_again() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (repository, update, pack) = thin_update_over_a_create(&daemon, "thin-let-go-again");
-  let (updated, (at_let_go, after), again) =
+  let (updated, (at_let_go, after), again, _) =
     crate::test_store::run_on_first(
       &daemon,
       move || async move {
@@ -1633,7 +1633,7 @@ fn b1_a_note_cleared_on_the_repository_between_a_pushs_stop_and_its_driver_leave
 {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (repository, update, pack) = thin_update_over_a_create(&daemon, "thin-note-cleared");
-  let (updated, (at_let_go, after), cleared) =
+  let (updated, (at_let_go, after), cleared, _) =
     crate::test_store::run_on_first(
       &daemon,
       move || async move {
@@ -1673,7 +1673,7 @@ fn b1b_a_thin_pushs_delta_on_a_delta_whose_base_was_let_go_is_resolved_once_it_i
     crate::test_store::audit_daemon_stored_configured(|config| config.runtime.step_budget_ns = 1);
   let (repository, update, pack, middle) =
     thin_chain_update_over_a_create(&daemon, "thin-chain-away");
-  let (updated, (at_let_go, after), _) = crate::test_store::run_on_first(
+  let (updated, (at_let_go, after), _, _) = crate::test_store::run_on_first(
     &daemon,
     move || async move {
       let_go_when(
@@ -1761,6 +1761,166 @@ fn thin_chain_update_over_a_create(
   );
   let middle = name_of(ObjectFormat::Sha1, Kind::Tree, &middle).unwrap();
   (repository, update, pack, middle)
+}
+
+/// B2 of the landed let-go's lift (main's order of 2026-11-26; w-git's read sweep: the server's tag-headed green,
+/// `ShardGreens::tree_of`, read the annotated tag at its green's head through `IndexedObjects`, and on a let-go window
+/// answered no version, which the verdicts took as a ref that moved). Do: create `main` and `refs/tags/v1`, an
+/// annotated tag of `main`'s commit lying in a window of its own past a filler blob ([`tag_headed_create`]); let every
+/// window of that pack go and the repository go idle, its reads' cache given back; then update `refs/tags/v1` to
+/// another annotated tag of the same commit, the pack that tag alone. Expect: `ok`, the old tag's window brought back
+/// by the push's own driver ([`tag_headed_pushed`]: let go in the push's task, asserted let go before it reads). Red
+/// before: `ng refs/tags/v1 failed to update ref` ("cannot lock ref"), the old value read as moved.
+#[test]
+fn b2_an_update_of_a_ref_whose_green_is_headed_by_a_let_go_tag_brings_it_back_and_lands() {
+  let (updated, driven, refused) = tag_headed_pushed("tag-headed-update", |old, commit| {
+    let (new, tag) = tag_object("v1 again", (commit, "commit"));
+    let pack = pack_of_objects(&[(slates_git::object_name::Kind::Tag, tag)]);
+    request(
+      &[(&old.to_string(), &new.to_string(), b"refs/tags/v1")],
+      CAPABILITIES,
+      &pack,
+    )
+  });
+  assert_eq!(
+    reasons(&updated),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    updated.outcomes
+  );
+  assert!(
+    driven > 0,
+    "the push's own driver brought the old tag's window back"
+  );
+}
+
+/// B2's delete: [`b2_an_update_of_a_ref_whose_green_is_headed_by_a_let_go_tag_brings_it_back_and_lands`]'s create and
+/// let-go, then a delete of `refs/tags/v1`. Expect: `ok`, the old tag's window brought back. Red before: `ng
+/// refs/tags/v1`, the delete's check that its old value is its green's head reading no version.
+#[test]
+fn b2_a_delete_of_a_ref_whose_green_is_headed_by_a_let_go_tag_brings_it_back_and_lands() {
+  let (deleted, driven, refused) = tag_headed_pushed("tag-headed-delete", |old, _| {
+    request(
+      &[(&old.to_string(), "", b"refs/tags/v1")],
+      CAPABILITIES,
+      &[],
+    )
+  });
+  assert_eq!(
+    reasons(&deleted),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    deleted.outcomes
+  );
+  assert!(
+    driven > 0,
+    "the push's own driver brought the old tag's window back"
+  );
+}
+
+/// On a stored daemon's repository `name`: [`tag_headed_create`] pushed, `ok`, and the derivation behind it ended, so
+/// no write path holds or lets go its pack's windows after; then, in the next push's own task, before its first step
+/// and with nothing between (main's order of 2026-11-26: B2's delete once brought nothing back under burners, the
+/// window resident when it read it), every window of that pack let go by hand and the repository idle
+/// (`git_encode::give_back_idle`, so no read is served from what its reads kept), the tag's window asserted let go by
+/// its let-go's number; then the request `second` makes of the tag's id and its commit's, driven as an edge drives it
+/// ([`let_go_when`]). What that push received, the windows its own driver brought back of ones its steps noted, and the
+/// bring-backs refused.
+fn tag_headed_pushed(
+  name: &str,
+  second: impl FnOnce(ObjectId, ObjectId) -> Vec<u8>,
+) -> (Received, u64, (u64, u64, u64)) {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository = git_repository_on(&daemon, name);
+  let window = crate::daemon::observe_first(&daemon, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .expect("the content store");
+  let (create, pack, (tag, commit)) = tag_headed_create(window);
+  let (created, _) = pushed_in_steps(&daemon, repository, &create).unwrap();
+  assert_eq!(reasons(&created), [b"ok", b"ok"]);
+  assert!(
+    derivation_ended(&daemon, repository),
+    "the create's derivation behind it ended"
+  );
+  let request = second(tag, commit);
+  let (received, _, _, driven) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let number = on_state(|state| {
+        let _ = let_go_by_hand(state, &pack);
+        crate::vcs_store::git_encode::give_back_idle(state, repository);
+        away_number_of(state, repository, &tag)
+      });
+      assert!(number.is_some(), "the tag's window let go before the push");
+      let_go_when(repository, &request, (&[], LetGoAt::Already, Meddle::Not)).await
+    },
+    HISTORY_PATIENCE,
+  )
+  .unwrap();
+  let refused = crate::daemon::observe_first(&daemon, bring_backs_refused);
+  daemon.stop();
+  (received, driven, refused)
+}
+
+/// Whether repository `repository`'s derivation behind its last push has ended, within the test's patience
+/// ([`HISTORY_PATIENCE`]): none behind it and none under way (`git_derive::behind_and_under_way`).
+fn derivation_ended(daemon: &crate::Daemon, repository: RepositoryId) -> bool {
+  let began = std::time::Instant::now();
+  while crate::daemon::observe_first(daemon, move |state| {
+    crate::vcs_store::git_derive::behind_and_under_way(state, repository)
+  }) != (false, false)
+  {
+    if began.elapsed() > HISTORY_PATIENCE {
+      return false;
+    }
+    std::thread::yield_now();
+  }
+  true
+}
+
+/// The let-go number of the window repository `repository`'s index places object `id` in (`ContentStore::away_number`):
+/// none where it is held, or not in a pack.
+fn away_number_of(state: &ShardState, repository: RepositoryId, id: &ObjectId) -> Option<u64> {
+  let (content, store) = state.vcs_stores.git_ref(repository)?;
+  match store.repository.stored(content, id)? {
+    (_, slates_git::store::StoredAt::InPack(place), _) => {
+      content.away_number(&place.pack, place.len, place.offset)
+    }
+    _ => None,
+  }
+}
+
+/// Shape: the filler blob [`tag_headed_create`] lays between its commit and its tag, in content store windows: past
+/// one, so the tag lies in a window of its own.
+const FILLER_WINDOWS: usize = 2;
+
+/// A create of `main` at a commit of one file and of `refs/tags/v1` at an annotated tag of it, the pack laid commit,
+/// tree, file, a filler blob of [`FILLER_WINDOWS`] content store windows of bytes that do not compress, then the tag,
+/// so the tag's window (each `window` bytes) is not its commit's: the request, its pack, and the tag's and the commit's
+/// ids.
+fn tag_headed_create(window: usize) -> (Vec<u8>, Vec<u8>, (ObjectId, ObjectId)) {
+  use slates_git::object_name::Kind;
+  let (commit, mut objects) = flat_commit(1, "tagged", None);
+  objects.push((
+    Kind::Blob,
+    crate::vcs_store::tests::incompressible(window * FILLER_WINDOWS),
+  ));
+  let (tag, tag_bytes) = tag_object("v1", (commit, "commit"));
+  objects.push((Kind::Tag, tag_bytes));
+  let pack = pack_of_objects(&objects);
+  let create = request(
+    &[
+      ("", &commit.to_string(), b"refs/heads/main"),
+      ("", &tag.to_string(), b"refs/tags/v1"),
+    ],
+    CAPABILITIES,
+    &pack,
+  );
+  (create, pack, (tag, commit))
 }
 
 /// On a repository `name` of `daemon`: `main` created, `ok`, at a commit of a flat tree of [`THIN_TREE_FILES`] files,
@@ -1882,7 +2042,7 @@ async fn let_go_at_its_checks(
   repository: RepositoryId,
   request: &[u8],
   (let_go, meddle): (&[u8], Meddle),
-) -> Result<(Received, (u64, u64), bool), String> {
+) -> Result<(Received, (u64, u64), bool, u64), String> {
   let_go_when(repository, request, (let_go, LetGoAt::Checks, meddle)).await
 }
 
@@ -1893,6 +2053,8 @@ enum LetGoAt {
   Checks,
   /// Once the object of this name is admitted to the push's quarantine.
   Admitted(ObjectId),
+  /// Before the push began: its test let the pack go itself, and `let_go` is empty.
+  Already,
 }
 
 /// [`let_go_at_its_checks`], the pack let go at `at`.
@@ -1900,7 +2062,7 @@ async fn let_go_when(
   repository: RepositoryId,
   request: &[u8],
   (let_go, at, meddle): (&[u8], LetGoAt, Meddle),
-) -> Result<(Received, (u64, u64), bool), String> {
+) -> Result<(Received, (u64, u64), bool, u64), String> {
   let (_, mut push) = on_state(|state| started(state, repository));
   for piece in request.chunks(PIECE) {
     on_state(|state| push.input(state, piece)).map_err(|failed| format!("{failed:?}"))?;
@@ -1908,11 +2070,14 @@ async fn let_go_when(
   on_state(|state| push.end(state)).map_err(|failed| format!("{failed:?}"))?;
   let mut at_let_go = None;
   let mut meddled = meddle == Meddle::Not;
+  let mut driven = 0u64;
   let mut answer = Vec::new();
   let received = loop {
     if at_let_go.is_none() && is_due(&push, at) {
       at_let_go = Some(on_state(|state| {
-        let _ = let_go_by_hand(state, let_go);
+        if !let_go.is_empty() {
+          let _ = let_go_by_hand(state, let_go);
+        }
         brought_back_count(state)
       }));
     }
@@ -1924,7 +2089,7 @@ async fn let_go_when(
         if at_let_go.is_some() && !meddled {
           meddled = meddled_at_a_stop(&mut push, repository, meddle).await;
         } else {
-          logged_bring_back(&mut push, repository).await;
+          driven = driven.saturating_add(logged_bring_back(&mut push, repository).await);
         }
         slates_rt::futures::yield_now().await;
         carry_awaited(&mut push).await?;
@@ -1940,6 +2105,7 @@ async fn let_go_when(
     received,
     (at_let_go, after),
     meddled && meddle != Meddle::Not,
+    driven,
   ))
 }
 
@@ -1951,6 +2117,7 @@ fn is_due(push: &ReceivePack, at: LetGoAt) -> bool {
       .quarantine
       .as_ref()
       .is_some_and(|quarantine| quarantine.quarantine().object(&id).is_some()),
+    LetGoAt::Already => true,
   }
 }
 
@@ -1970,8 +2137,8 @@ async fn driven_bring_back(push: &mut ReceivePack, _repository: RepositoryId) {
 
 /// [`driven_bring_back`], each stop printed (libtest shows it for a failing test alone: what main's runs under load
 /// read; main's order of 2026-11-26, a cause shown, never guessed): its offset and let-go number, and the windows
-/// brought back before and after with the bring-backs refused.
-async fn logged_bring_back(push: &mut ReceivePack, repository: RepositoryId) {
+/// brought back before and after with the bring-backs refused. The windows it brought back of one the push noted.
+async fn logged_bring_back(push: &mut ReceivePack, repository: RepositoryId) -> u64 {
   let noted = noted_wait(push, repository).map(|waited| {
     on_state(|state| {
       let number = state
@@ -1983,10 +2150,12 @@ async fn logged_bring_back(push: &mut ReceivePack, repository: RepositoryId) {
   });
   let before = on_state(|state| brought_back_count(state));
   driven_bring_back(push, repository).await;
-  if noted.is_some() {
-    let after = on_state(|state| (brought_back_count(state), bring_backs_refused(state)));
-    eprintln!("b1 stop: (offset, let-go number) {noted:?}; brought back {before} -> {after:?}");
+  if noted.is_none() {
+    return 0;
   }
+  let after = on_state(|state| (brought_back_count(state), bring_backs_refused(state)));
+  eprintln!("b1 stop: (offset, let-go number) {noted:?}; brought back {before} -> {after:?}");
+  after.0.saturating_sub(before)
 }
 
 /// `meddle` done at the push's stop, then its driver's bring-back: whether the step stopped (a window noted for the
