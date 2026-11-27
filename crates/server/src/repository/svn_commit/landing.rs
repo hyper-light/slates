@@ -346,20 +346,32 @@ async fn land_sliced(
     .section(SectionKind::Texts, texts_len)
     .await
     .map_err(unstored)?;
-  let mut buffer = sent_texts(&mut landing, (texts, &places, payload), buffer).await?;
-  for (kind, bytes) in records
-    .into_iter()
-    .map(|record| (SectionKind::Record, record))
-  {
+  let buffer = sent_texts(&mut landing, (texts, &places, payload), buffer).await?;
+  sent_records(&mut landing, records, buffer).await?;
+  landing.commit().await.map(drop).map_err(unstored)
+}
+
+/// Sends each of `records` as a record section of its own, a store's piece at a time through the landing's one buffer,
+/// given back by each part to be filled again ([`land_sliced`]); the buffer once all are sent.
+async fn sent_records(
+  landing: &mut slates_store::owner::SlicedLanding,
+  records: Vec<Vec<u8>>,
+  mut buffer: Vec<u8>,
+) -> Result<Vec<u8>, Uncommitted> {
+  let unstored = |_| Uncommitted::Unstored;
+  for bytes in records {
     let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    landing.section(kind, len).await.map_err(unstored)?;
+    landing
+      .section(SectionKind::Record, len)
+      .await
+      .map_err(unstored)?;
     for piece in bytes.chunks(slates_store::store::PIECE_BYTES) {
       buffer.clear();
       buffer.extend_from_slice(piece);
       buffer = landing.part(buffer).await.map_err(unstored)?;
     }
   }
-  landing.commit().await.map(drop).map_err(unstored)
+  Ok(buffer)
 }
 
 /// The next piece of `text` from `offset` as the content store holds it, at most one of the store's pieces, appended to
