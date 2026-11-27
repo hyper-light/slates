@@ -70,10 +70,13 @@ pub enum FrameKind {
   /// The daemon lets a child go: reap it once it has exited.
   Release = 2,
   /// The spawner started it: its pid.
+  /// Format: a kind byte on the wire.
   Spawned = 11,
   /// The spawner could not start it: the error's number.
+  /// Format: a kind byte on the wire.
   Refused = 12,
   /// It exited: its status.
+  /// Format: a kind byte on the wire.
   Exited = 13,
 }
 

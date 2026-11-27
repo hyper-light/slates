@@ -96,7 +96,9 @@ impl TagsRead {
   /// rows of the manifests whose texts are not at hand, else of the `.hgtags` revisions).
   pub fn begin(repo: &impl Repository, admission: &mut Admission) -> Result<TagsRead, Refusal> {
     let revs = head_revs(repo, admission)?;
-    admission.charge_items::<Node>(revs.len().saturating_mul(3))?;
+    /// Shape: the nodes charged for each head this read holds.
+    const NODES_A_HEAD: usize = 3;
+    admission.charge_items::<Node>(revs.len().saturating_mul(NODES_A_HEAD))?;
     let mut heads = Vec::with_capacity(revs.len());
     let mut manifests = Vec::new();
     let head_nodes = revs

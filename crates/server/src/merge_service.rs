@@ -473,6 +473,7 @@ const CHUNK_HASHED: usize = 1;
 /// The pace kind of one chunk of a checkpoint's encoding copied into its content store stage ([`CheckpointHold::step`]).
 const CHUNK_STAGED: usize = 2;
 /// The pace kind of one copied key read for a checkpoint's build ([`CheckpointHold::step`], A-920 8a).
+/// Shape: its index among the pace kinds.
 const CHECKPOINT_KEY: usize = 3;
 /// The pace kinds a checkpoint's work is measured in: [`IDENTITY_KEY`], [`CHUNK_HASHED`], [`CHUNK_STAGED`],
 /// [`CHECKPOINT_KEY`].

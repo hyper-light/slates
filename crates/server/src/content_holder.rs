@@ -223,6 +223,7 @@ const KIND_VCS_REGION_HOLD: u8 = 20;
 /// (`ContentStore::restore_away_renumbered`), and the next publication writes it in [`KIND_VCS_AWAY`]'s form. Refused,
 /// a text brought back by its bytes would be lost (a Mercurial named file's read). Its reader goes once every daemon
 /// has published since A-923: images live in RAM alone, so none can carry the kind then (A-923).
+/// Format: a kind byte of the shard image's entries, retired.
 const KIND_VCS_AWAY_RETIRED: u8 = 15;
 
 #[cfg(test)]
