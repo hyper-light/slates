@@ -3754,6 +3754,11 @@ pub(crate) const LOG_TEXTS_ASKED: &str = "vcs.hg.push_log_texts_asked";
 /// Counted most: the most [`LOG_TEXTS_ASKED`] one push's intake asked. Format: a counter name in the status report.
 pub(crate) const MOST_LOG_TEXTS_ASKED: &str = "vcs.hg.push_log_texts_asked_most";
 
+/// Counted: of [`LOG_TEXTS_ASKED`], a manifest's base asked again, once, because a row above its chain's let-go link
+/// was let go between the ask and its use (a segment landed between the slices; main's ruling of 2026-11-27). Format: a
+/// counter name in the status report.
+pub(crate) const LOG_TEXTS_REASKED: &str = "vcs.hg.push_log_texts_reasked";
+
 /// Counted: of [`LOG_TEXTS_ASKED`], the parent manifest's read-back, named apart: the manifest the fork holds last, which
 /// a new manifest's row is kept as a delta against, asked where it is not also the delta's base (goal 93, C1 (1) P5).
 /// Format: a counter name in the status report.
@@ -3786,6 +3791,7 @@ pub(crate) const TIERED_MERGES: &str = "vcs.hg.push_tiered_merges";
 fn count_bases(state: &mut ShardState, intaken: &slates_hg::push::intake::Intaken) {
   state.count(BASE_STORE_READS, intaken.base_store_reads);
   state.count(LOG_TEXTS_ASKED, intaken.log_texts_asked);
+  state.count(LOG_TEXTS_REASKED, intaken.log_texts_reasked);
   state.count_max(MOST_LOG_TEXTS_ASKED, intaken.log_texts_asked);
   state.count(PREVIOUS_MANIFESTS_ASKED, intaken.previous_manifests_asked);
   state.count_max(
