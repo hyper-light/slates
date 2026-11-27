@@ -299,7 +299,18 @@ impl GitHookView {
       self
         .view
         .seal_step(&mut sealing, (content, &git.repository), quantum)
-        .map_err(GitHookRefused::Seal)?
+    };
+    let passed = match passed {
+      Ok(passed) => passed,
+      // A window of a landed pack let go (B9 of the landed let-go's lift): the sealing kept as it stands, its step
+      // taken again once the view's owner brought the window back; refused `NotYet` for the owner to note it.
+      Err(SealRefused::Read(ReadRefused::NotYet { waited })) => {
+        self.sealing = Some(sealing);
+        return Err(GitHookRefused::Seal(SealRefused::Read(
+          ReadRefused::NotYet { waited },
+        )));
+      }
+      Err(refused) => return Err(GitHookRefused::Seal(refused)),
     };
     if !passed {
       self.sealing = Some(sealing);

@@ -624,9 +624,15 @@ pub(in crate::store) fn stored_range(
   match stored {
     StoredAt::Whole(content) => content_range(store, content, len, range, out),
     StoredAt::InPack(_) => {
+      // A window of the landed pack let go is not yet, named for the reader's owner to bring back (B9 of the landed
+      // let-go's lift); any other miss is bytes the store does not hold.
       let bytes = repository
-        .read_stored(store, stored, len)
-        .ok_or(ReadRefused::Unreadable)?;
+        .read_stored_waited(store, stored, len)
+        .map_err(|waited| {
+          waited.map_or(ReadRefused::Unreadable, |waited| ReadRefused::NotYet {
+            waited,
+          })
+        })?;
       copy(&bytes, range, out);
       Ok(())
     }

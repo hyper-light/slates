@@ -3593,6 +3593,9 @@ async fn driven(
     match step {
       Answering::Answered(received) => break *received,
       Answering::Turned => {
+        // As the HTTP edge does: a let-go window the turn met brought back from the push's own slot (B9 of the landed
+        // let-go's lift, a hook's view sealed over a let-go pack), then the homing carried.
+        crate::vcs_store::upload::brought_back_own(push.take_waited()).await;
         slates_rt::futures::yield_now().await;
         carry_awaited(&mut push).await?;
       }
@@ -3680,6 +3683,64 @@ fn hooked_repository(
     set_policy(state, name, 0, (Vec::new(), configs));
     repository
   })
+}
+
+/// B9 of the landed let-go's lift, its push-level net (main 01a20182's ruling of 2026-11-27 07:21: a hook's view, a
+/// reader the read sweep missed). Do: configure a `pre-receive` hook that reads its input and exits 0; push stock git's
+/// `create` as the HTTP edge pushes; once its derivation behind it ends, let its pack go as a landed let-go does
+/// ([`let_go_by_hand`]) and give back what the repository's reads keep lately; then push a new branch at `main`'s
+/// commit, which brings no object, so nothing but the hook's view reads `main`'s objects, held whole in it where they
+/// lie in the let-go pack. Expect: the branch lands, its hook run in one view shown and withdrawn, and windows brought
+/// back for it by the push's driver. Red before: the view's seal refused `Read(Unreadable)`, the hook was not run, and
+/// the branch was declined.
+#[cfg(unix)]
+#[test]
+fn b9_a_hooked_push_over_a_let_go_pack_brings_its_views_windows_back_and_lands() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let hook = script(
+    HookPointName::GitPreReceive,
+    "pre-receive",
+    "cat >/dev/null",
+  );
+  let repository = hooked_repository(&daemon, "b9-hooked", &[&hook]);
+  let create = scenario!("create").request;
+  let (_, created, _) = pushed_with_hooks(&daemon, repository, create).unwrap();
+  assert_eq!(reasons(&created), [b"ok"], "the create landed");
+  assert!(
+    derivation_ended(&daemon, repository),
+    "the create's derivation behind it ended"
+  );
+  let at = create
+    .windows(4)
+    .position(|magic| magic == b"PACK")
+    .unwrap();
+  let pack = create[at..].to_vec();
+  let before = crate::daemon::observe_first(&daemon, move |state| {
+    assert!(!let_go_by_hand(state, &pack).is_empty(), "the pack let go");
+    if let Some((content, store)) = state.vcs_stores.git(repository) {
+      let _ = store.repository.let_go_recent(content);
+    }
+    brought_back_count(state)
+  });
+  let branch = request(
+    &[("", FIRST, b"refs/heads/other")],
+    CAPABILITIES,
+    empty_pack(),
+  );
+  let (_, received, shown) = pushed_with_hooks(&daemon, repository, &branch).unwrap();
+  let after = crate::daemon::observe_first(&daemon, |state| brought_back_count(state));
+  daemon.stop();
+  assert_eq!(
+    reasons(&received),
+    [b"ok"],
+    "the branch landed: {:?}",
+    received.outcomes
+  );
+  assert_eq!(shown, (1, 1), "its hook's view shown and withdrawn");
+  assert!(
+    after > before,
+    "windows brought back for the view: {before} then {after}"
+  );
 }
 
 /// A-665 part 3 (§4.17.2 "Hooks, in git's terms"; git's `execute_commands`, `copy_to_sideband`).
