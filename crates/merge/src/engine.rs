@@ -360,7 +360,7 @@ impl Increment {
     wholes
   }
 
-  /// [`Increment::unread`] among the runs `wanted` marks by place (a replay's, [`Green::replay_reads`]); every run where
+  /// [`Increment::unread`] among the runs `wanted` marks by place (a replay's, `Green::replay_reads`); every run where
   /// `wanted` does not reach it.
   pub fn unread_among(&self, wanted: &[bool]) -> Option<&crate::named::NamedRun> {
     self.named.runs.iter().enumerate().find_map(|(at, run)| {
@@ -381,7 +381,7 @@ impl Increment {
     self.read_step_among(objects, slice, &[])
   }
 
-  /// [`Increment::read_step`] over the runs `wanted` marks by place (a replay's, [`Green::replay_reads`]): whether every
+  /// [`Increment::read_step`] over the runs `wanted` marks by place (a replay's, `Green::replay_reads`): whether every
   /// one of them is read. A run `wanted` does not reach is read.
   ///
   /// One call reads on from the first run unread into the next, run after run, until its `slice` is spent, so reading
@@ -1564,6 +1564,17 @@ pub struct Green {
   /// The changed paths' Strings a commit made, each the one its change entry keeps (A-920 3m's non-vacuity count: one a
   /// distinct path the effects change, made once).
   commit_paths_made: u64,
+  /// The effects commits walked for their node moves ([`Green::node_moves`]; A-920: none where no node has a link and
+  /// the version makes none, since then no link survives a home; a move of 9,000 files had walked its 18,000 effects in
+  /// one unit, 7.99 ms debug, finding no move).
+  node_moves_walked: u64,
+  /// The units of commits' node moves that walked an effect (A-920, main's ruling of 2026-11-27 02:03): as many as the
+  /// effects walked where each unit walks one; one for a move of 9,000 files, whole, which walked 18,000 in it.
+  node_moves_units: u64,
+  /// The plans of a replay's reads applies began ([`Increment::replay_reads`]; A-920: none where every named run is
+  /// read already, as a landing reads them all before its apply begins; the plan, a pass over every effect and run, had
+  /// been 4.46 ms of one step at 9,000 files, debug, answering that none was unread).
+  replay_plans: u64,
   /// The byte buffers commits let go for files named for their run's object (A-920 3n's non-vacuity count: none, since
   /// such a file is given no bytes; each had been a run's own buffer, freed a commit unit at a time, and the free that
   /// emptied the allocator's region cost one unit about 1 ms of the kernel's time).
@@ -2725,6 +2736,11 @@ enum Prep {
 struct Beginning {
   names: Vec<(usize, crate::named::Identity)>,
   stage: BeginStage,
+  /// The version's own link effects, counted as [`BeginStage::Remapping`] visits each: with none, and no link in the
+  /// head, the node moves are none and walk nothing ([`BeginStage::Moves`], A-920).
+  links: usize,
+  /// The node moves being found, an effect a unit ([`BeginStage::Moves`]).
+  moves: Option<Box<node_moves::NodeMoves>>,
   /// The paths the copies changed, in path order, once they are committed.
   copied: Vec<String>,
   order: PathOrder,
@@ -4488,6 +4504,21 @@ impl Green {
   /// The changed paths' Strings commits made ([`Green::commit_paths_made`]'s field, A-920 3m).
   pub fn commit_paths_made(&self) -> u64 {
     self.commit_paths_made
+  }
+
+  /// The effects commits walked for their node moves ([`Green::node_moves_walked`]'s field, A-920).
+  pub fn node_moves_walked(&self) -> u64 {
+    self.node_moves_walked
+  }
+
+  /// The units of commits' node moves that walked an effect ([`Green::node_moves_units`]'s field, A-920).
+  pub fn node_moves_units(&self) -> u64 {
+    self.node_moves_units
+  }
+
+  /// The plans of a replay's reads applies began ([`Green::replay_plans`]'s field, A-920).
+  pub fn replay_plans(&self) -> u64 {
+    self.replay_plans
   }
 
   /// The effect lists a verdict's units allocated of their own ([`Green::unit_effect_lists`]'s field, A-920 3l).
@@ -6657,45 +6688,10 @@ impl Green {
   /// operation, and a rebase's journal restates only the work's (`Green::rebased_from`), while its
   /// changes show the files the moves leave ([`Green::heirs_of`], A-677).
   fn node_moves(&self, effects: &[Effect]) -> Vec<Effect> {
-    let mut links: BTreeMap<&str, Option<&str>> = BTreeMap::new();
-    let mut removed: BTreeSet<&str> = BTreeSet::new();
-    let mut copied: Vec<(&str, &str)> = Vec::new();
-    for effect in effects {
-      match effect {
-        Effect::Hardlink(path, target) => {
-          links.insert(path, Some(target.as_str()));
-        }
-        Effect::RemoveHardlink(path) => {
-          links.insert(path, None);
-        }
-        Effect::RemoveContent(path) | Effect::RemoveSpecial(path) => {
-          removed.insert(path);
-        }
-        Effect::SetContent(path, _, _, ContentSource::Copied(from, _)) if from != path => {
-          copied.push((from.as_str(), path.as_str()));
-        }
-        _ => {}
-      }
-    }
-    let mut moves = Vec::new();
-    let mut renamed: BTreeSet<&str> = BTreeSet::new();
-    for (from, to) in &copied {
-      if removed.contains(from) {
-        renamed.insert(*from);
-        for link in self.surviving_links(from, &links) {
-          moves.push(Effect::Hardlink(link.to_owned(), (*to).to_owned()));
-        }
-      }
-    }
-    let replaced = copied
-      .iter()
-      .map(|(_, to)| *to)
-      .filter(|to| self.content.contains_key(to));
-    let left: BTreeSet<&str> = removed.iter().copied().chain(replaced).collect();
-    for home in left.difference(&renamed) {
-      self.hand_over(home, self.surviving_links(home, &links), &mut moves);
-    }
-    moves
+    // One walk, the commit's: run to its end here ([`node_moves::NodeMoves`], a unit a step in a commit's beginning).
+    let mut finding = node_moves::NodeMoves::default();
+    while !finding.step(self, effects) {}
+    finding.into_moves()
   }
 
   /// The files a version's node moves leave at the links its removed or replaced homes hand their
@@ -6712,28 +6708,6 @@ impl Green {
         _ => None,
       })
       .collect()
-  }
-
-  /// The links naming the node at `home` once the version's link effects (`links`: each link's last
-  /// target, `None` for a removal) apply: the head's links to it the version keeps, and the links
-  /// it makes to it.
-  fn surviving_links<'a>(
-    &'a self,
-    home: &str,
-    links: &BTreeMap<&'a str, Option<&'a str>>,
-  ) -> BTreeSet<&'a str> {
-    let kept = self
-      .links_to
-      .get(home)
-      .into_iter()
-      .flatten()
-      .map(String::as_str)
-      .filter(|link| !links.contains_key(link));
-    let made = links
-      .iter()
-      .filter(|(_, target)| **target == Some(home))
-      .map(|(link, _)| *link);
-    kept.chain(made).collect()
   }
 
   /// Hands the node at `home`, which the version removes or replaces, to the least of the links
@@ -7885,8 +7859,14 @@ impl Green {
     // A named run not read yet (A-760) is never applied as zeros: nothing commits, and the head answered differs from
     // the version the entry was recorded as, which its caller refuses as it refuses any chain that disagrees. A run the
     // apply names whole, which no op reads, is never read for it (A-887, [`Green::replay_reads`]).
-    if inc.unread_among(&inc.replay_reads(applied)).is_some() {
-      return Begun::Answered(self.head());
+    // With every run read (a landing reads them all before its apply begins) none is unread whatever the plan says, so
+    // the plan, a pass over every effect and run (A-920: 4.46 ms of one step at 9,000 files, debug), is made only where
+    // one is unread: a recovery's replay, which reads only the runs it plans.
+    if inc.unread().is_some() {
+      self.replay_plans = self.replay_plans.saturating_add(1);
+      if inc.unread_among(&inc.replay_reads(applied)).is_some() {
+        return Begun::Answered(self.head());
+      }
     }
     let copies = applied
       .iter()
@@ -8201,6 +8181,8 @@ impl Green {
     run.prep = Prep::Beginning(Box::new(Beginning {
       names: core::mem::take(names),
       stage: BeginStage::Remapping(0),
+      links: 0,
+      moves: None,
       copied: Vec::new(),
       order: PathOrder::default(),
     }));
@@ -8220,10 +8202,7 @@ impl Green {
       return Some(ApplyStep::More);
     };
     let version = self.head().saturating_add(1);
-    let whole = matches!(
-      beginning.stage,
-      BeginStage::Moves | BeginStage::Links | BeginStage::Copies
-    );
+    let whole = matches!(beginning.stage, BeginStage::Links | BeginStage::Copies);
     if whole && !fresh {
       return Some(ApplyStep::More);
     }
@@ -8233,6 +8212,9 @@ impl Green {
         let post = crate::named::Post::of(post_state, &run.read, runs);
         let mut at = at;
         while let Some(effect) = run.effects.get_mut(at) {
+          if matches!(effect, Effect::Hardlink(..) | Effect::RemoveHardlink(_)) {
+            beginning.links = beginning.links.saturating_add(1);
+          }
           self.make_mapped_one((at, effect), post, &[]);
           at = at.saturating_add(1);
           if run.effects.get(at).is_some() && spent() {
@@ -8243,8 +8225,36 @@ impl Green {
         beginning.stage = BeginStage::Moves;
       }
       BeginStage::Moves => {
-        let moves = self.node_moves(&run.effects);
-        run.effects.extend(moves);
+        // A node moves only to a link that survives its home: where the head names no link (the map's count, read with
+        // no walk) and the version makes none, there is none, and no effect is walked (A-920: every import's case; a
+        // move of 9,000 files walked its 18,000 effects in this one unit, 7.99 ms debug, finding none).
+        // Otherwise they are found an effect a unit until `spent` ([`node_moves::NodeMoves`]; main's ruling of
+        // 2026-11-27 02:03: a green holding one link anywhere walked every effect in this one unit).
+        if beginning.links != 0 || self.links_to.len() != 0 {
+          let finding = beginning.moves.get_or_insert_with(Box::default);
+          let mut walked = 0u64;
+          let found = loop {
+            if finding.walking() {
+              walked = walked.saturating_add(1);
+            }
+            if finding.step(self, &run.effects) {
+              break true;
+            }
+            if spent() {
+              break false;
+            }
+          };
+          self.node_moves_walked = self.node_moves_walked.saturating_add(walked);
+          if walked > 0 {
+            self.node_moves_units = self.node_moves_units.saturating_add(1);
+          }
+          if !found {
+            return Some(ApplyStep::More);
+          }
+          if let Some(finding) = beginning.moves.take() {
+            run.effects.extend(finding.into_moves());
+          }
+        }
         beginning.stage = BeginStage::Links;
       }
       BeginStage::Links => {
@@ -9547,6 +9557,7 @@ fn special_payload(
 }
 
 mod branch;
+mod node_moves;
 pub use branch::{Lent, Lineage, LineageGreen, LineageRefused, Release};
 
 mod copy;

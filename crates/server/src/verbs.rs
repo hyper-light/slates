@@ -16072,11 +16072,7 @@ fn remake_green(state: &mut ShardState, record: &VolumeRecord) {
         return;
       }
       if let Some((repository, Ok(mut release))) = state.greens.retire(&record.id) {
-        while state
-          .greens
-          .release_step(repository, &mut release)
-          .is_ok_and(|more| more)
-        {}
+        state.greens.release_whole(repository, &mut release);
       }
     }
     None => {

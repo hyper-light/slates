@@ -187,6 +187,9 @@ mod deadlines;
 // process's exit (macOS, Windows), awaited through the shard's driver.
 mod hangup;
 mod reap;
+// The daemon's reaper (A-920): drops on a thread of its own what the shards' releases took, so the allocator's return
+// of freed pages costs no shard a step.
+mod reaper;
 // The repository verbs (§4.17.1; A-575). What a client's create names by default is public (A-685, `slates repository
 // create`): each tool's object formats and the namespace name a new repository's root is bound to.
 mod repository;

@@ -50,6 +50,7 @@ use super::{
 };
 use crate::dims::{Arenas, GreenRelease};
 use crate::identity::{Entry, SetHash};
+use crate::reaped::Reaped;
 use crate::special::SpecialNode;
 
 /// One key a branch sets back to its value at the version it was made at (`None`: absent then).
@@ -157,48 +158,6 @@ impl Green {
     self.hardlinks.lend(&mut other.hardlinks);
     self.xattrs.lend(&mut other.xattrs);
     self.links_to.lend(&mut other.links_to);
-  }
-
-  /// One entry of a retired green's own maps let go ([`Release`]'s remains, A-920 11b): its histories', its change
-  /// index's, its identity's and its records' entries, the largest first, each a unit. False once none is left, when
-  /// what remains is its shell.
-  fn let_go_entry(&mut self) -> bool {
-    if self.content_history.pop_first().is_some() {
-      return true;
-    }
-    if let Some(delta) = self.deltas.last_mut() {
-      if delta.pop_first().is_none() {
-        self.deltas.pop();
-      }
-      return true;
-    }
-    if let Some(mut version) = self.changes.first_entry() {
-      if version.get_mut().pop().is_none() {
-        version.remove();
-      }
-      return true;
-    }
-    self.identity_dirty.pop_first().is_some()
-      || self.identity_out.pop_first().is_some()
-      || self.identity_folded.pop_first().is_some()
-      || self.last_changed.pop_first().is_some()
-      || self.latest_change.pop_first().is_some()
-      || self.below_floor_last.pop_first().is_some()
-      || self.file_removed.pop_first().is_some()
-      || self.mode_changed.pop_first().is_some()
-      || self.symlink_changed.pop_first().is_some()
-      || self.hardlink_changed.pop_first().is_some()
-      || self.xattr_changed.pop_first().is_some()
-      || self.special_changed.pop_first().is_some()
-      || self.special_history.pop_first().is_some()
-      || self.dir_history.pop_first().is_some()
-      || self.mode_history.pop_first().is_some()
-      || self.symlink_history.pop_first().is_some()
-      || self.hardlink_history.pop_first().is_some()
-      || self.xattr_history.pop_first().is_some()
-      || self.accepted.pop_first().is_some()
-      || self.rejected.pop_first().is_some()
-      || self.copies.pop_first().is_some()
   }
 
   /// Every map's hold on its nodes, to give back a node a step in the lineage's arenas ([`Lineage::release_step`]):
@@ -580,9 +539,10 @@ pub struct Release {
   maps: GreenRelease,
   /// The green's content history chunks, whose files' blocks it holds (A-728), given back a chunk a step.
   history: crate::history::Chunks,
-  /// What else the retired green held, let go an entry a step once its holds are back (A-920 11b: dropped whole at
-  /// its retire, 5.2 ms of one step for a scratch member of 9,000 files, debug, 3.0 of it its content history); its
-  /// shell, once emptied, dropped.
+  /// What else the retired green held, handed whole to the release's [`Reaped`] once its holds are back, to be dropped
+  /// on another thread (A-920, main's ruling after release probe 17). Dropped whole at its retire it was 5.2 ms of one
+  /// step for a scratch member of 9,000 files, debug (11b), and let go an entry a step on the shard (11b), one of its
+  /// pops still paid the allocator's return of a batch of freed pages, 1.27 ms of system time.
   remains: Option<Box<super::Green>>,
 }
 
@@ -592,15 +552,15 @@ impl Release {
     self.history.is_released() && self.maps.is_done() && self.remains.is_none()
   }
 
-  /// One entry of what the retired green held let go, or its emptied shell dropped: whether there was one.
-  fn let_go_one(&mut self) -> bool {
-    let Some(green) = self.remains.as_deref_mut() else {
-      return false;
-    };
-    if !green.let_go_entry() {
-      self.remains = None;
+  /// What the retired green held, handed whole to `reaped`: whether there was any.
+  fn let_go_remains(&mut self, reaped: &mut Reaped) -> bool {
+    match self.remains.take() {
+      Some(green) => {
+        reaped.whole(green);
+        true
+      }
+      None => false,
     }
-    true
   }
 }
 
@@ -859,16 +819,23 @@ impl Lineage {
 
   /// One step of `release`: one chunk of its content history given back, its file's block let go when nothing else
   /// holds it (A-728), or else one node's hold given back, the node freed, and its file's block let go, when no other
-  /// member names it. False once every hold is back; refused `Busy` while a member is out, since the arenas are then in
-  /// its engine.
-  pub fn release_step(&mut self, release: &mut Release) -> Result<bool, LineageRefused> {
+  /// member names it; once every hold is back, what else the green held, whole. False once all of it is; refused `Busy`
+  /// while a member is out, since the arenas are then in its engine. Nothing the step frees is dropped here: what it
+  /// held is moved into `reaped`, for its caller to drop on another thread ([`crate::reaped`], A-920).
+  pub fn release_step(
+    &mut self,
+    release: &mut Release,
+    reaped: &mut Reaped,
+  ) -> Result<bool, LineageRefused> {
     if self.out.is_some() {
       return Err(LineageRefused::Busy);
     }
     Ok(
-      release.history.release_step(&mut self.arenas.blocks)
-        || self.arenas.release_step(&mut release.maps)
-        || release.let_go_one(),
+      release
+        .history
+        .release_step(&mut self.arenas.blocks, &mut *reaped)
+        || self.arenas.release_step(&mut release.maps, &mut *reaped)
+        || release.let_go_remains(reaped),
     )
   }
 

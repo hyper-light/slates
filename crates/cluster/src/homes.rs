@@ -53,6 +53,7 @@ pub const HOME_STREAM: u64 = 30;
 /// answered once durable (`durable`, as before) or at once, its `Kept` naming the home shard's place and the generation
 /// it is durable from; one [`HomeMessage::Durable`] a home then carries a push's barrier, answered
 /// [`HomeOutcome::Published`] once those images are published (homes.rs: group commit per shard).
+/// Format: the version byte every home message carries.
 pub const VERSION: u8 = 0x87;
 /// Format: the kind byte of a put.
 const KIND_PUT: u8 = 1;

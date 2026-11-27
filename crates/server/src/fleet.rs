@@ -2152,7 +2152,7 @@ const RECORD_REFUSED_UNTRACKED: &str = "fleet.record.refused.untracked";
 /// Counts a held record this holder refused, by its register refusal kind (`fleet.record.refused.<kind>`), so a sender
 /// whose commit never places shows on the holder why: before these, a holder restarted warm refused a successor's
 /// adoption `ForeignGeneration` every period without a trace. Format: refusal names in the daemon's status report.
-fn count_record_refusal(state: &mut ShardState, record: &Record, error: &RegisterError) {
+pub(crate) fn count_record_refusal(state: &mut ShardState, record: &Record, error: &RegisterError) {
   let kind = match error {
     RegisterError::StaleEpoch { .. } => "fleet.record.refused.stale_epoch",
     RegisterError::ConfigurationStale { .. } => "fleet.record.refused.configuration_stale",
@@ -2241,9 +2241,9 @@ pub(crate) fn hold_checked_record(
     .holder_records
     .get(&record.object)
     .and_then(|acceptor| acceptor.value_at(record.object, record.sequence))
-    .is_some_and(|held| held != record.value.as_slice());
+    .is_some_and(|held| crate::merge_service::replaces(held, &record.value));
   let accepted = match state.holder_records.get_mut(&record.object) {
-    Some(acceptor) => acceptor.accept(record),
+    Some(acceptor) => acceptor.accept_merged(record, &crate::merge_service::joined_floors),
     None => {
       // The object's first record: the acceptor exists only once it has **accepted** one. A refused first
       // record — this holder has not yet installed the generation the record names (the owner installed the
@@ -2558,7 +2558,9 @@ pub(crate) fn check_held_record(
     });
   }
   match state.holder_records.get(&record.object) {
-    Some(acceptor) => acceptor.check(record),
+    // A merge record re-derived with other floors joins the one held, never refused as another (A-921's second mode
+    // (2), `merge_service::joined_floors`).
+    Some(acceptor) => acceptor.check_merged(record, &crate::merge_service::joined_floors),
     None => Acceptor::new(
       local,
       Authority {

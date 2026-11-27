@@ -64079,7 +64079,9 @@ owner's acceptor in the control shard's state), the state_log module doc (its ow
     redirected and landed at the adopter. The adopter alone serves the repository, and the node that never held it
     answers not found.
   - Fleet `a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it` and
-    `a921_a_warm_restarted_node_never_names_a_false_death_victim_its_old_volumes_owner`: served forwards, never a.
+    `a921_a_warm_restarted_node_never_names_a_false_death_victim_its_old_volumes_owner` (since 2026-11-27
+    `a921_a_warm_restarted_node_serves_a_false_death_victims_old_volume`, asserting the status served alone; see the
+    amendment below): served forwards, never a.
   - Unit `owner_location::tests::the_direct_route_never_names_a_creator_a_kept_takeover_retired`: red without the skip
     (the creator named).
   - Unit `vcs_http::git::tests::a_request_for_a_moved_repository_is_answered_with_where_it_went`: `307` with its path,
@@ -64093,6 +64095,16 @@ Applied in the same change to: AUD-08's lookup status (§4.8), `crates/server/sr
 daemon}.rs`, `crates/server/src/vcs_http/{git,hg,svn,daemon_edge}.rs`, `crates/server/src/vcs_ssh/{site,svn}.rs`,
 `crates/server/src/vcs_store/homes.rs`, `crates/http/src/reply.rs`, `crates/server/tests/fleet.rs` and
 `crates/server/src/{vcs_http/tests/git,git_push/tests}.rs`, GAPS.
+
+- **Amended 2026-11-27 (main 01a20182's ruling): the creator skip cannot fire after a readmission.** A readmission drops
+  the readmitted host's completed takeover (`RegionalConfiguration::admit`, A-309: an earlier takeover of the id says
+  nothing of the member it names now), and its retirement is gone once that takeover completes, so a readmitted creator
+  is named by neither record the skip reads. Its warm-restart scene named a 3 of 3 on main past 03c736286, a becoming
+  eligible before the restarted node's own routing learned the adopter; it passed at this landing with that order
+  reversed, which is what the scene measured. The scene now asserts the status served, with the direct route's naming
+  and the location round's claims recorded; the skip's case, a retirement kept, stays its unit red's. GAPS records the
+  limit: a forward's first try may go to a readmitted creator, costing a redirect, never a wrong answer. Keeping a fact
+  past A-309's removal to close it is a design change of its own.
 
 ### A-925 — A node announces its own version-control edges to its peers, as a client reaches them (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25; A-921 part 2's prerequisite)
 
@@ -65015,6 +65027,79 @@ GAPS.
   threshold. The release's walk does not decide which free that is. Main's ruling: what the release takes goes by
   move to a reaper thread the daemon owns, not to a swap of the global allocator (a C dependency on every platform,
   and every memory figure rebaselined).
+  **The reaper** (`slates_merge::reaped`, `crates/server/src/reaper.rs`). A release's walk stays on the shard: a node's
+  hold given back, its slot freed, its children queued, its block's holder let go. What each unit frees is moved into a
+  `Reaped` and never dropped on the shard:
+  - a freed node's label and child list, and its value's heap;
+  - a freed block's bytes and an owned history chunk;
+  - the history arena's emptied lists;
+  - once the holds are back, the retired green's remains whole (11b's pop an entry a step is gone);
+  - an emptied lineage whole.
+  A block's release no longer copies a shared block's bytes only to drop them. The landing gathers its release's
+  `Reaped` over its slices and hands it once, at the release's end, to the daemon's reaper (`reaper::reap`), a thread
+  the daemon starts with its shards and joins after them. Each shard thread holds a sender, installed at its start as the
+  spawner's end is. The channel holds two batches a shard. At the bound, or on a thread with no reaper, the shard drops
+  the batch in place and counts it; it never waits. A batch a slice was tried first: about 2,500 small sends a copy,
+  which a reaper slow to wake under load met at its bound, so 1,872 to 9,245 things were dropped in place.
+  The release task (`repository::run_releases`) hands a slice's `Reaped` at its end. The releases run whole in one call
+  (a preview's, a member dropped whole) go through `Greens::release_whole`, which hands its `Reaped` at its end.
+  - Test: `wide_release_reaped` (in `t_c2c`): the releases handed the reaper more things than the revision's files and
+    dropped none in place. Red with a batch a slice: 1,344 handed, 8,560 in place.
+  - The wide tests print `REAPER <test> handed= batches= inline= reaper_cpu_ns= reaper_user_ns= reaper_sys_ns=
+    reaper_taken=`. The reaper's time is its own thread's, kept per daemon by its control shard as the doorbell's flags
+    are.
+  - Debug, after: copy's longest release unit is 25 µs (22 of it system), against 1.3-1.7 ms before. In each wide test
+    the shard handed 9,904 to 9,916 things in one or two batches, none in place, and the reaper spent 4.8 to 10.3 ms of
+    its own CPU dropping them.
+  - merge test `a_retired_branchs_release_hands_what_it_frees_to_its_reaped` replaces 11b's stepped-remains test: the
+    steps take more things than the nodes they free, and the lineage keeps exactly the root's nodes.
+  **A commit's node moves walk nothing where no node has a link.** Move's `stage.committing` and `landing.apply` were
+  named one unit (debug, at 0cd0186b7). A probe of each preparation phase's and begin stage's longest call, and of
+  each commit phase's longest unit, read the commit beginning's node moves (`BeginStage::Moves`, `Green::node_moves`)
+  at 7,991 µs in one unit. Nothing else in the preparation or the commit was past 0.39 ms a unit (prep.Sole 389,
+  prep.Alone 357, commit.Set 109).
+  The walk gathers move's 18,000 effects into a removed set, a copied list and the version's links. For each copied
+  pair it looks the source up, records the rename and finds the links that survive it; then the destinations' contents,
+  the left set and a hand-over a home. It found nothing: a node moves only to a link that survives its home, and a
+  Subversion green has none.
+  Now the beginning counts the version's own link effects as its remapping visits each effect. Where that count is
+  zero and the head's link map is empty (its count read with no walk), the Moves stage adds nothing and walks nothing.
+  That is every import (Subversion, git and Mercurial make no hard links) and every version of a green with no link.
+  - Counter: `Green::node_moves_walked`, the effects commits walked for their node moves.
+  - Test `a_commit_walks_no_effect_for_node_moves_where_no_node_has_a_link`: 0 for a rename and a removal on a green no
+    link names, more than 0 for a rename of a linked home, whose links follow it. Red at 3 with the walk unconditional.
+  - Debug, after: move's `stage.committing` is out of its eight longest spans (8.55 ms before). `landing.apply` is
+    still 4.5 ms in move and 4.8 in copy: another unit, named next.
+  - A green with a link anywhere walked every effect whole in this unit (a volume push with a hard link in its head).
+    Main's ruling of 2026-11-27 02:03: a defect by §3 whether a probe finds it or not. Now sliced
+    (`engine/node_moves.rs`, `NodeMoves`), an effect a unit until the step is spent:
+    - the version's links gathered;
+    - each removal, rename and replacement kept only where some link may survive its path, in owned paths, so the
+      walk lives across the beginning's steps;
+    - each kept rename's links named at its new path;
+    - each kept home handed over.
+    A home no link survives moves no node, renamed or not, so the moves are the whole walk's, in its order.
+    `Green::node_moves` is the same walk run to its end (the rebase's `heirs_of`), one implementation.
+    - Counter: `Green::node_moves_units`, the units that walked an effect.
+    - Test `a_wide_renames_node_moves_on_a_linked_green_walk_an_effect_a_unit`: 500 renames on a green holding one
+      link, applied a unit a step, at the version the whole submit committed, the link kept. It walked 1,000 or more
+      effects, one a unit. Red with the walk unstopped: one unit for all of them.
+  **An apply begun over runs all read plans no replay's reads.** `landing.apply`'s remaining unit, named (debug): its
+  slice's `begin_version` at 4.46 ms in one call. The rest of the apply slice was under 1 ms: reads, runs, the
+  retention's settle 17-95 µs and the checkpoint's start 36-64 µs. `Green::begin_applying` planned which named runs a
+  replay of the entry reads (`Increment::replay_reads`: a pass over every applied effect and run, A-887). The plan only
+  answered whether a wanted run was unread, and a landing reads every run before its apply begins
+  (`read_named_slice`), so none was. Now the plan is made only where some run is unread (`Increment::unread`, a scan of
+  the runs that stops at the first unread): a recovery's replay, which reads only the runs it plans. Where every run is
+  read, the plan's answer could only be "none unread", so the answer is the same.
+  - Counter: `Green::replay_plans`.
+  - Test `an_apply_begun_with_every_run_read_plans_no_replays_reads` (2,000 runs): 0 plans with every run read, one
+    with none read; red at 1 with the plan unconditional.
+  - Debug, after: `landing.apply` is out of the eight longest spans of add, copy and move (4.5-4.8 ms before). Their
+    leaders now: `landing.publish` (9.3-24.8 ms, A-930's cut copies), then `stage.judging` (5.8, move),
+    `stage.recording` (5.0-5.3) and `stage.check` (3.8-4.2).
+  - Left: a replay's plan is still a pass over the entry in one unit, as is the scan of the runs, linear in them. Both
+    are owed their slicing by §3.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
@@ -65265,7 +65350,11 @@ measured noise of the 100 figure, not a literal.
     unit test's first green run found it, 77,485 steps of nothing).
   - **Red:** `a_one_page_give_back_takes_the_pages_of_extents_that_end_off_a_page` (daemon unit test): on main, dead
     stale slot (0, 46) and log (0, 73) fell to nothing with 0 bytes given back; with the rule, 16,384 bytes given back
-    and 0 left. `returned_after_idle` in `tests/recovery.rs` is bounded at sixty liveness budgets with a typed failure.
+    and 0 left. The test holds what is asked, on every platform (2026-11-27, main's Windows CI run 45948476737: both
+    native Windows jobs failed its first form, which asserted the bytes the OS took, and Windows' section views took
+    none): the whole pages the give-back asks the OS for, counted `recovery.asked_bytes` (`daemon::RECOVERY_ASKED`), 0
+    on the old rounding on any platform, 16,384 with the rule on the MacBook, all of them taken there.
+    `returned_after_idle` in `tests/recovery.rs` is bounded at sixty liveness budgets with a typed failure.
   - **The boot test's premise:** a fresh daemon's marks say its recovery memory is unwritten, so it has nothing to
     give back, and `a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step` failed typed on main. It now takes the
     memory as written whole first (`Daemon::take_recovery_memory_as_written_whole`), as a daemon over an image before
@@ -65750,6 +65839,15 @@ Applied in the same change to:
 - **Applied in the same change to:** `crates/vfs/src/{recover,checkpoint_log}.rs` (the versions),
   `crates/server/src/{content_holder,state_log,fleet,verbs,state,daemon}.rs`, `crates/server/src/state_log/tests.rs`,
   `crates/server/tests/fleet.rs`, A-636 part 2b's owed list, GAPS.
+- **Amended 2026-11-27 (main 01a20182's ruling):** a part let go while still marked changed was held after the last
+  committed publication, so none carried it: its mark goes rather than staying for a delta to remove a piece never
+  published (`StateLogs::let_go_held`). At f = 0 every part is held and let go in one take, so nothing is ever marked;
+  before, each kept a key until a publication committed, and each delta carried a removal per part made since the last
+  (found looking at the 57k hg push's hang, of which part 3 is cleared: a push at ca78de951, which contains it,
+  finished). Red first: `state_log::tests::a_part_let_go_before_any_publication_carried_it_leaves_no_change` (4 marks,
+  now 0).
+- **Amended by A-921 part 4** (2026-11-27): (2) is fixed. Its cause was not shipping: the record a warm start
+  re-derives differs from the one shipped, which a holder joins now.
 
 ### A-930 — A page changed only past its committed piece's last coordinate appends to it, and its split copies the piece's entries (2026-11-26, w-perf for main 01a20182, its ruling of 2026-11-25 on the 57k churn: the Aways append rule; goal 93, A-870, A-923)
 
@@ -65825,3 +65923,71 @@ Applied in the same change to:
   goal 93 line in GAPS (A-923's entry). Part 2: `image_pages.rs` (`Marked`, `EntryCoordinate`, `Changed`, `PieceCut`,
   `CommittedPiece::coordinates`, `Encoder::changed_since`, `changed_turn`, `cut_committed`; `Encoder::turn` takes the
   coordinate reader beside the family reader) and `crates/server/src/content_holder.rs` (`entry_coordinate`).
+
+### A-921 part 4 — A holder joins a version's record its owner re-derived with other floors, instead of refusing it as another proposal (2026-11-27, w-shared for main 01a20182, its ruling of 2026-11-27 (B); A-921's second mode's (2); amends §4.16 "Apply on holders" and the register's position rule)
+
+- **Why.** After A-921 part 3, the deterministic owner-restart red still refused every push. Counters added on every
+  exit that had recorded nothing showed the cause. The owner sent the green's pending records every pass (184 sends,
+  186 acknowledgements, its own alone), so shipping was never the problem. The old holder refused v2
+  `ConflictingPosition`, 19 times a run, and the merge path had counted none of it. Decoded, the two values differed in
+  one field: `checkpoint_floor`, 1 in the v2 the holder accepted before a's restart, 0 in the v2 a re-derived from its
+  replay after it (`merge_service::enqueue_recovered_record`). A warm-started owner knows no committed floor yet. A
+  different value at a held position and epoch is another proposal, refused for good, so v2 never placed, nothing after
+  it shipped, and every push stayed refused.
+- **The rule.** A merge record carries the version's content and two fields of its owner's own state when it made the
+  record:
+  - `checkpoint_floor`, the newest version known committed; a holder keeps a checkpoint at it only past the one it
+    holds (`checkpoint_replica`), and a committed version stays committed, so the greater of two is always true.
+  - `folded_below`, the owner's fold floor; a holder folds no lower (`fold_replica`), and the owner never unfolds.
+  - Every other field is the version's content, stable per version, or its catalog's facts:
+    - the increment, base, inputs, evidence and completion;
+    - the signature, read from the chain entry recorded when the version became durable, which the replay reads again;
+    - the head identity, for a deferred push (P2) the base's in both the first enqueue and the replay.
+
+  A holder that holds a different record at the position and epoch now asks `merge_service::joined_floors`. Records
+  equal in all but the two floors are one proposal: it holds the join, each floor its greater, at the held epoch, and
+  acknowledges the record sent, so its commit counts the holder (`Acceptor::accept_merged`, `Acceptor::check_merged`).
+  Anything else is another proposal, refused `ConflictingPosition` as before. The register stays opaque to values: the
+  join is its caller's (`ValueMerge`). A joined value is no replacement, so it rewinds no replica
+  (`merge_service::replaces`). Residual: the catalog's facts (`name`, `require_evidence`, `owner`) are read when a
+  record is made, so a catalog changed while a version was pending would re-derive differently and still conflict.
+  They are not floors and are compared whole.
+- **A replica store made again after a refused build.** With the join, v2 placed in most runs. In the rest the old
+  holder's replica, owing v2's deferred push, refused every build `Object { why: Missing }` (94 of 94 a run, the
+  natural mode's ~20). A holder's replica store is made once, from the names-log parts it holds then
+  (`vcs_store::replica::begin`). One made before the missed part arrived never took that push's objects, which ride the
+  names log (A-724 piece 8c). So a refused build now marks its repository (`replica_build::ReplicaBuilds::refused_over`),
+  and the next build wanted makes the store again, where it was made from other push records than the held parts now
+  carry (`vcs_store::replica::drop_if_stale`, counted `vcs_store.replica.made_again`). It happens only after a refusal,
+  so an ordinary build replays no store.
+- **Why not persist the shipped bytes.** The other fix carried each pending version's record in the recovery image and
+  published it before it shipped. That puts an image publication in front of every merge's ship, which is a merge's
+  acknowledgement path, the one 84a's loaded p99 and p999 under 1 ms measure. This fix changes no format and adds no
+  wait.
+- **The silent exits, counted** (§2 item 9):
+  - a green with pending versions skipped for its uncommitted catalog (`merge.green.awaits_catalog`) or its unmade
+    origin (`merge.green.awaits_origin`);
+  - a record shipment with no session free (`merge.record.ship_no_session`), each sent (`merge.record.shipped`) and
+    the acknowledgements gathered (`merge.record.ship_acks`);
+  - on the holder, a green refused for good (`merge.record.green_refused`) and a record with no standing
+    (`merge.record.no_standing`);
+  - the merge path's authority check counted, and noted in the last-refusal record, as the register path's is.
+- **Tests.**
+  - Fleet `a921_a_holder_that_missed_an_owners_part_before_its_warm_restart_is_shipped_it_after` asserts the push
+    lands and no `ConflictingPosition` at the old holder. Before: 19 refusals, 3 of 3 pushes refused, and with the join
+    alone, 2 of 5 runs refused every build `Missing`. After both: none, and the push lands, 5 of 5.
+  - A919's owner-restart scene, one run by name: its push lands, and the start rule holds (the newcomer holds nothing,
+    a's restarted hold starts at 3). It stays ignored, now for A-921's next mode alone.
+  - That mode: a survivor adopts a's green with a candidate's death though a lives and its fencing epoch never moved;
+    a's records are then refused `Unauthorized` and its repository's `main` leaves a. 3 of 10 scenes met it. The
+    owed-part scene forms afresh where any survivor adopted a's repository or green, or holds a's root green under
+    another owner, after a's restart and again after the first candidate's takeover (`adopted_elsewhere_of`,
+    `Daemon::holder_owner`). GAPS keeps it as A-921's next.
+  - Units: `register::tests::a_value_the_merge_joins_is_acknowledged_and_another_is_still_refused` and
+    `merge_service::tests::a_versions_record_with_other_floors_joins_the_held_one_and_other_content_does_not`.
+- **Models.** `docs/wip/models/FencedLedger.tla` holds one value a position per ballot. Agreement now holds over a
+  record's content, its owner's floors joined. **Owed (main):** a TLC run with the join as a value class. Not run yet:
+  this Mac has no `tla2tools.jar`, and kiln does not reach the Studios that have it.
+- **Applied in the same change to:** `crates/db/src/register.rs`,
+  `crates/server/src/{merge_service,fleet,replica_build,daemon}.rs`, `crates/server/src/vcs_store/replica.rs`,
+  `crates/server/tests/fleet.rs`, A-921 part 3's entry, GAPS.

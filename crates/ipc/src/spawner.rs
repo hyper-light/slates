@@ -70,10 +70,13 @@ pub enum FrameKind {
   /// The daemon lets a child go: reap it once it has exited.
   Release = 2,
   /// The spawner started it: its pid.
+  /// Format: a kind byte on the wire.
   Spawned = 11,
   /// The spawner could not start it: the error's number.
+  /// Format: a kind byte on the wire.
   Refused = 12,
   /// It exited: its status.
+  /// Format: a kind byte on the wire.
   Exited = 13,
 }
 
@@ -522,7 +525,7 @@ pub fn start(program: &Path, args: &[&OsStr], ends: usize) -> io::Result<Started
   Ok(Started { child, ends: ours })
 }
 
-/// Format: the test a test binary runs as the spawner ([`spawner_role!`] defines it at the binary's root), named so
+/// Format: the test a test binary runs as the spawner (`spawner_role!` defines it at the binary's root), named so
 /// libtest runs it alone (`--exact`); the `slates` binary serves before it reads any argument, so the same arguments
 /// start either.
 pub const ROLE_TEST: &str = "spawner_role";

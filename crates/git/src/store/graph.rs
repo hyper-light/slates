@@ -105,6 +105,7 @@ const SLOTS_AN_ID: u64 = 8;
 /// three interleaved rounds): misses 11,438,922 direct-mapped against 3,963,393 at four ways (−65 %), the median first
 /// pack byte 45.8 → 38.4 s for a clone, 34.0 → 26.5 for a clone again, 28.4 → 22.7 for a partial clone; 32 slots an id,
 /// direct-mapped, missed 3,717,726 at four times the bytes and was no faster, so not taken.
+/// Measured: four ways, the A/B above.
 const WAYS: usize = 4;
 
 /// The positions of the ids a walk met lately (A-911, module docs **Positions met again**): exact, set-associative, an id
@@ -186,7 +187,7 @@ impl PositionCache {
   /// The slots of the set `id` lives in: its first bytes, under the sets' mask, [`WAYS`] slots each (fewer where the
   /// slots are fewer). With no slots, none.
   fn set_of(&self, id: &ObjectId) -> core::ops::Range<usize> {
-    let mut first = [0u8; 8];
+    let mut first = [0u8; core::mem::size_of::<u64>()];
     for (to, from) in first.iter_mut().zip(id.as_bytes()) {
       *to = *from;
     }

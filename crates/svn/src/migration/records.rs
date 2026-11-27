@@ -1034,7 +1034,7 @@ impl Checking {
 }
 
 /// Whether a whole check's or apply's step ([`Repository::check`], [`Repository::apply`]) is spent: never, but in the
-/// tests that take every one a unit a step ([`CHECK_A_UNIT_A_STEP`]).
+/// tests that take every one a unit a step (`CHECK_A_UNIT_A_STEP`).
 fn whole_check_spent() -> bool {
   #[cfg(test)]
   {
@@ -1911,7 +1911,7 @@ impl Closing {
 }
 
 /// Whether a close's step ([`Repository::close_step`]) is spent beyond its caller's say: never, but in the tests that
-/// take every one a unit a step ([`CLOSE_A_UNIT_A_STEP`]).
+/// take every one a unit a step (`CLOSE_A_UNIT_A_STEP`).
 fn close_a_unit_a_step() -> bool {
   #[cfg(test)]
   {

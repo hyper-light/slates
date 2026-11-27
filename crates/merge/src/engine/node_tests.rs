@@ -683,3 +683,119 @@ fn a_linked_fifos_removal_or_replacement_is_refused_rebased_or_not() -> Result<(
   }
   Ok(())
 }
+
+/// A green of `FILE` and `TARGET` that no link names.
+fn unlinked() -> Green {
+  let mut origin = crate::origin::Origin::default();
+  origin.files.push((FILE.to_owned(), b"<f>\n".to_vec()));
+  origin.files.push((TARGET.to_owned(), b"<g>\n".to_vec()));
+  Green::with_origin(origin)
+}
+
+/// A-920 (a commit's node moves walk nothing where no node has a link). Do: on a green whose files no link names,
+/// rename `FILE` and remove `TARGET` by one work; then on `linked`'s green, whose `TARGET` two links name, rename
+/// `TARGET`. Expect the first accepted with `FILE`'s bytes at the new path, nothing at the old two, and no effect walked
+/// for its node moves (`Green::node_moves_walked`); the second's links name the new path, its effects walked. Before,
+/// every commit walked every effect for its node moves: 7.99 ms of one unit for a move of 9,000 files (debug), which
+/// found none.
+#[test]
+fn a_commit_walks_no_effect_for_node_moves_where_no_node_has_a_link() -> Result<(), String> {
+  let mut plain = unlinked();
+  let work = Work::default().naming(OpKind::Rename, "moved", FILE).op(
+    OpKind::Unlink,
+    TARGET,
+    (0, 0, u64::MAX),
+  );
+  accept(&mut plain, work, 1)?;
+  let found = (
+    plain.content_bytes("moved").map(<[u8]>::to_vec),
+    kinds_at(&plain, FILE),
+    kinds_at(&plain, TARGET),
+    plain.node_moves_walked(),
+  );
+  if found != (Some(b"<f>\n".to_vec()), Vec::new(), Vec::new(), 0) {
+    return Err(format!("unlinked: {found:?}"));
+  }
+  let mut linked = linked()?;
+  accept(
+    &mut linked,
+    Work::default().naming(OpKind::Rename, "moved", TARGET),
+    4,
+  )?;
+  let found = (linked.hardlink(HARDLINK), linked.node_moves_walked() > 0);
+  if found != (Some("moved"), true) {
+    return Err(format!("linked: {found:?}"));
+  }
+  Ok(())
+}
+
+/// Shape: the files a wide rename over a linked green moves.
+const WIDE: usize = 500;
+
+/// `green` (`HARDLINK` naming `TARGET`) with [`WIDE`] files more, made by one work at its head.
+fn wide_linked() -> Result<Green, String> {
+  let mut green = green();
+  let mut work = Work::default();
+  for at in 0..WIDE {
+    work = work.create(&format!("w{at}"), b"<w>\n");
+  }
+  accept(&mut green, work, 1)?;
+  Ok(green)
+}
+
+/// Applies `applied` for `inc` to `green` a unit a step, every unit spending its step: the version it answered.
+fn applied_a_unit_a_step(
+  green: &mut Green,
+  inc: &Increment,
+  applied: &[crate::chain_entry::Applied],
+) -> Result<u64, String> {
+  let mut inc = inc.clone();
+  match green.begin_applying(&mut inc, applied) {
+    super::Begun::Answered(version) => Ok(version),
+    super::Begun::Applying(mut run) => loop {
+      match green.apply_step(&mut run, &mut inc, applied, &mut || true) {
+        super::ApplyStep::More => {}
+        super::ApplyStep::Done(version) | super::ApplyStep::Answered(version) => {
+          return Ok(version);
+        }
+        super::ApplyStep::Lend(unlent) => return Err(format!("asked to lend {unlent:?}")),
+      }
+    },
+  }
+}
+
+/// A-920 (main's ruling of 2026-11-27 02:03: a green holding one link anywhere walked every effect of a version for its
+/// node moves in one unit, which §3 forbids whatever a probe finds). Do: on two greens alike holding `HARDLINK` to
+/// `TARGET` and [`WIDE`] files more, rename each of those files by one work, submitted whole to the first and its
+/// recorded effects applied to the second a unit a step. Expect the second at the version the first committed, the
+/// renamed bytes at their new paths and `HARDLINK` still naming `TARGET`; its node moves walked every effect, one a
+/// unit (`Green::node_moves_walked` against `Green::node_moves_units`). Before, the commit's beginning walked them all in
+/// one unit.
+#[test]
+fn a_wide_renames_node_moves_on_a_linked_green_walk_an_effect_a_unit() -> Result<(), String> {
+  let (mut source, mut replica) = (wide_linked()?, wide_linked()?);
+  let mut work = Work::default();
+  for at in 0..WIDE {
+    work = work.naming(OpKind::Rename, &format!("v{at}"), &format!("w{at}"));
+  }
+  let inc = work.at(source.head(), 2);
+  let (outcome, applied) = source.submit_resolved(&inc);
+  let Outcome::Accepted { version } = outcome else {
+    return Err(format!("the rename was answered {outcome:?}"));
+  };
+  let before = (replica.node_moves_walked(), replica.node_moves_units());
+  let answered = applied_a_unit_a_step(&mut replica, &inc, &applied.unwrap_or_default())?;
+  let walked = replica.node_moves_walked() - before.0;
+  let units = replica.node_moves_units() - before.1;
+  let found = (
+    answered,
+    replica.content_bytes("v0").map(<[u8]>::to_vec),
+    replica.hardlink(HARDLINK),
+    walked >= 2 * WIDE as u64,
+    units == walked,
+  );
+  if found != (version, Some(b"<w>\n".to_vec()), Some(TARGET), true, true) {
+    return Err(format!("{found:?}"));
+  }
+  Ok(())
+}

@@ -295,6 +295,8 @@ pub struct Daemon {
   runtime: Option<Runtime>,
   segment: AnchorSegment,
   doorbell: Option<DoorbellThread>,
+  /// The reaper (A-920): drops what the shards' releases took on its own thread, stopped after the shards.
+  reaper: Option<crate::reaper::Reaper>,
   /// The liveness watchdog (A-228): the beat's writer, stopped after the shards.
   watchdog: Option<crate::watchdog::Watchdog>,
   /// The writer of the shards' log lines (A-305), stopped after the shards, so it writes every line they queued.
@@ -1114,6 +1116,9 @@ impl Daemon {
       &mut || start_beat.beat(&beat_block),
     )?;
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
+    // The reaper (A-920), before any shard starts: each shard's thread installs its end as it starts.
+    let reaper =
+      crate::reaper::Reaper::start(shards.first().map_or(0, |shard| shard.0), shards.len());
     // The daemon's spawner (A-924): started now, before any client's descriptor is open, with an end a shard. Every hook
     // and helper a shard starts is started by it, so a spawn never copies this process's descriptor table.
     #[cfg(unix)]
@@ -1232,6 +1237,7 @@ impl Daemon {
         } else {
           None
         },
+        reaper: reaper.as_ref().map(crate::reaper::Reaper::end),
         devices: inherited_devices.next().unwrap_or_default(),
         #[cfg(target_os = "linux")]
         copies: inherited_copies.next().unwrap_or_default(),
@@ -1240,6 +1246,7 @@ impl Daemon {
       #[cfg(windows)]
       let holds = ShardHolds {
         stop_watch,
+        reaper: reaper.as_ref().map(crate::reaper::Reaper::end),
         winfsp: inherited_winfsp.next().unwrap_or_default(),
         channel: if index == 0 {
           windows_channel.take()
@@ -1397,6 +1404,7 @@ impl Daemon {
       runtime: Some(runtime),
       segment,
       doorbell,
+      reaper,
       watchdog: Some(watchdog),
       log_writer: Some(log_writer),
       config,
@@ -1949,6 +1957,22 @@ impl Daemon {
           .min()
       })
     })
+  }
+
+  /// Test support (A-921's owner-restart scenes): the owner this node's acceptor of `object` names, on any shard holding
+  /// one; `None` where it holds none.
+  pub fn holder_owner(&self, object: [u8; 16]) -> Result<Option<slates_db::HostId>, ObserveError> {
+    let object = slates_db::register::ObjectId(object);
+    for shard in self.shards.clone() {
+      if let Some(owner) = self.observe(Some(shard), move |s| {
+        s.holder_records
+          .get(&object)
+          .map(slates_db::register::Acceptor::owner)
+      })? {
+        return Ok(Some(owner));
+      }
+    }
+    Ok(None)
   }
 
   /// Test support (A-927 part 2): no shard of this node ships the state logs' parts it owes to `peer`, and every other
@@ -4750,6 +4774,11 @@ impl Daemon {
     while let Ok(spawner) = self.spawner_join.try_recv() {
       crate::spawning::join_spawner(spawner);
     }
+    // The reaper after the shards, whose ends went with their threads: every batch they handed it is dropped first
+    // (A-920).
+    if let Some(mut reaper) = self.reaper.take() {
+      reaper.stop();
+    }
     // Last, so a draining daemon still beats while its shards step (A-228).
     if let Some(mut watchdog) = self.watchdog.take() {
       watchdog.stop();
@@ -5046,6 +5075,8 @@ struct ShardHolds {
   /// The spawner itself, the shards it serves in its ends' order, and how long its start took: the control shard's
   /// alone, which owns and restarts it (A-924 piece 2b).
   spawner_owner: Option<SpawnerOwner>,
+  /// This shard's end of the daemon's reaper (A-920).
+  reaper: Option<crate::reaper::ReaperEnd>,
   /// The held devices.
   devices: Vec<crate::fuse_hold::HeldDevice>,
   /// The held writable copies.
@@ -5061,6 +5092,8 @@ struct ShardHolds {
 struct ShardHolds {
   /// Where the process thread's stop watch arrives (the control shard's alone; [`StopWatch`]).
   stop_watch: Option<std::sync::mpsc::Receiver<StopWatch>>,
+  /// This shard's end of the daemon's reaper (A-920).
+  reaper: Option<crate::reaper::ReaperEnd>,
   /// The held WinFsp mounts.
   winfsp: Vec<crate::winfsp::InheritedMount>,
   /// The hold channel's daemon end: the control shard installs it.
@@ -5372,11 +5405,16 @@ async fn init_shard(
   #[cfg(windows)]
   let ShardHolds {
     stop_watch: stop_watch_install,
+    reaper,
     winfsp: inherited_winfsp,
     channel: windows_channel,
     resync: inherited_resync,
     dax: inherited_dax,
   } = holds;
+  #[cfg(unix)]
+  let reaper = holds.reaper;
+  // This shard's end of the daemon's reaper (A-920), before anything on the shard can release a green.
+  crate::reaper::install(reaper);
   #[cfg(unix)]
   let inherited_dax = holds.dax;
   #[cfg(unix)]
@@ -6300,6 +6338,11 @@ pub const CONTENT_PURGE_KEPT_SHORT: &str = "content.purge_kept_short_bytes";
 /// Counter: recovery memory an idle shard gave back because no restart reads it (A-117).
 pub const RECOVERY_RETURNED: &str = "recovery.returned_bytes";
 
+/// Counter: the whole pages (`Geometry::page`) of the journal's dead recovery memory an idle shard asked the OS to take
+/// back (A-926's give-back): what the give-back offers, on every platform, whatever the OS then takes
+/// ([`RECOVERY_RETURNED`]; Windows' section views may take none).
+pub const RECOVERY_ASKED: &str = "recovery.asked_bytes";
+
 /// Gives back one slice of an idle shard's recovery memory that no restart reads (A-117): the checkpoint slot older than
 /// the committed one, and its delta log past the tail, each only as far as it was written since its last give-back
 /// (`Journal::dead_ranges`, A-226), taken from the top of each down so the journal can record a slice at a time. A
@@ -6399,20 +6442,31 @@ fn give_back_dead_journal(s: &mut ShardState, left: &mut usize) -> (usize, bool)
   let Some(object) = s.content.as_mut() else {
     return (0, false);
   };
+  let mut asked = 0usize;
   // The top `left` bytes of `(offset, len)` within the region at `base`: given back, the offset they start at (what
-  // the journal records), and the bytes the object took. `None` when the object refused.
+  // the journal records), and the bytes the object took; the whole pages it was asked for counted in `asked`. `None`
+  // when the object refused.
   let mut give_back = |base: usize, (offset, len): (usize, usize)| -> Option<(usize, usize)> {
     let piece = len.min(*left);
     let from = offset.saturating_add(len).saturating_sub(piece);
     if piece == 0 {
       return Some((from, 0));
     }
-    let bytes = object.discard(base.checked_add(from)?, piece).ok()?;
+    let start = base.checked_add(from)?;
+    let bytes = object.discard(start, piece).ok()?;
+    let whole = start
+      .saturating_add(piece)
+      .checked_div(page)
+      .unwrap_or(0)
+      .saturating_mul(page)
+      .saturating_sub(start.checked_next_multiple_of(page).unwrap_or(usize::MAX));
+    asked = asked.saturating_add(whole);
     *left = left.saturating_sub(piece);
     Some((from, bytes))
   };
   let stale_slot = give_back(slots_start, dead.stale_slot);
   let log_past_tail = give_back(log_start, dead.log_past_tail);
+  s.count(RECOVERY_ASKED, u64::try_from(asked).unwrap_or(u64::MAX));
   s.journal.given_back_from(
     stale_slot.map(|(from, _)| from.saturating_sub(dead.stale_slot.0)),
     log_past_tail.map(|(from, _)| from),
@@ -11828,8 +11882,11 @@ mod tests {
   /// range ends where its bytes did, off a page, and a give-back takes whole pages only. Do: on a fresh shard, publish
   /// until a second checkpoint leaves a stale slot and a log written as far as their bytes reached; give back what is
   /// dead with the slice at one page (the shard's thread clock reading nothing, so no rate is learned) until nothing is
-  /// left. Expect the pages given back counted, not only the extents fallen. Red before: every page-sized piece of the
-  /// top-down give-back straddled two pages, so the extents fell to nothing and no page went back.
+  /// left. Expect whole pages asked back of the OS ([`super::RECOVERY_ASKED`]), not only the extents fallen. Red
+  /// before: every page-sized piece of the top-down give-back straddled two pages, so the extents fell to nothing and
+  /// no whole page was asked for. The rule is what is asked, on every platform: what the OS then takes is its own, and
+  /// Windows' section views took none (main's CI run 45948476737, both native Windows jobs, failed this test's earlier
+  /// form, which asserted the bytes taken).
   #[test]
   fn a_one_page_give_back_takes_the_pages_of_extents_that_end_off_a_page() {
     /// Shape: the publications a shard may take to commit its second checkpoint.
@@ -11852,6 +11909,11 @@ mod tests {
       }
       let dead = state.journal.dead_ranges(totals.0, totals.1);
       state.give_back_rate = super::GiveBackRate::default();
+      let asked_before = state
+        .refusals
+        .get(super::RECOVERY_ASKED)
+        .copied()
+        .unwrap_or(0);
       let mut returned = 0;
       for _ in 0..STEPS {
         let (bytes, more) = super::return_dead_recovery_timed(state, &mut || None);
@@ -11864,15 +11926,25 @@ mod tests {
         .journal
         .dead_ranges(totals.0, totals.1)
         .map_or(0, |dead| dead.stale_slot.1 + dead.log_past_tail.1);
-      (dead, returned, left)
+      let asked = state
+        .refusals
+        .get(super::RECOVERY_ASKED)
+        .copied()
+        .unwrap_or(0)
+        - asked_before;
+      (dead, (asked, returned), left)
     });
-    println!("daemon: dead {dead:?}, {returned} bytes given back a page a step, {left} left");
+    let (asked, returned) = returned;
+    println!(
+      "daemon: dead {dead:?}, {asked} bytes of whole pages asked back a page a step ({returned} taken by the \
+       OS), {left} left"
+    );
     let dead = dead.expect("a checkpoint committed");
     assert!(dead.stale_slot.1 > 0, "a stale slot written: {dead:?}");
     assert_eq!(left, 0, "nothing left dead");
     assert!(
-      returned > 0,
-      "pages given back, not only the extents fallen: {dead:?}"
+      asked > 0,
+      "whole pages asked back, not only the extents fallen: {dead:?}"
     );
   }
 

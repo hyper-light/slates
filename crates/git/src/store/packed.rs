@@ -245,6 +245,7 @@ impl Scratch {
 /// eighth each leaves at least three quarters of the budget keeping the newest objects. A chunk as long as the budget
 /// (one chunk) gave everything back each time it filled: a fetch walking eight directories' chains interleaved found
 /// 94 of 108 later reads kept where every one fits.
+/// Shape: an eighth of the budget a chunk, as above.
 const CHUNKS_A_BUDGET: usize = 8;
 
 /// Objects read lately, by where their entries begin (module docs, "Objects read lately"): none kept past `budget`

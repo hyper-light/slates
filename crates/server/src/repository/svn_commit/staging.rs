@@ -299,16 +299,18 @@ fn unpin_some(
 }
 
 /// Steps `release`, a retired scratch member's in `lineage`, until the shard's clock passes `deadline_ns`, at least one
-/// unit: whether it is done ([`Staging::land`]); a lineage gone is done.
+/// unit: whether it is done ([`Staging::land`]); a lineage gone is done. What the units free is moved into `reaped`, for
+/// the daemon's reaper, never dropped on the shard (A-920, main's ruling after release probe 17: one free among them
+/// paid the allocator's return of a batch of pages, 1.2-1.3 ms of system time in release).
 fn released_some(
   state: &mut ShardState,
   (lineage, release): (RepositoryId, &mut slates_merge::engine::Release),
-  deadline_ns: u64,
+  (reaped, deadline_ns): (&mut slates_merge::reaped::Reaped, u64),
 ) -> bool {
   loop {
     #[cfg(test)]
     let began = crate::vcs_store::svn_import::phase::release_unit_begun();
-    let stepped = state.greens.release_step(lineage, release);
+    let stepped = state.greens.release_step(lineage, release, reaped);
     // Each unit timed by the wall and the thread's CPU, the longest printed by the wide tests (A-920, main's order
     // after release probe 15: the release led copy's longest poll at 1.6 ms with no unit past 150 µs in debug).
     #[cfg(test)]
@@ -780,7 +782,7 @@ fn build_some_in(
 }
 
 /// Whether a build step's slice is spent ([`build_some_in`]): `by_clock`, but in the tests that take every build a unit a
-/// step or whole ([`BUILD_SPENT`]).
+/// step or whole (`BUILD_SPENT`).
 fn build_spent(by_clock: bool) -> bool {
   #[cfg(test)]
   {
@@ -1290,7 +1292,7 @@ impl Staging {
   /// (its texts in the content store, and again in its increment's post-state). An empty batch never flushes, so a
   /// revision past the bound alone is one batch.
   /// Whether the texts the batch carries and `revision`'s would pass the batch's bound ([`texts_bound`]); never in a
-  /// test that unbounds them ([`TEXTS_UNBOUNDED`]).
+  /// test that unbounds them (`TEXTS_UNBOUNDED`).
   fn texts_past_bound(&self, revision: &Revision) -> bool {
     #[cfg(test)]
     if TEXTS_UNBOUNDED.with(std::cell::Cell::get) {
@@ -1794,11 +1796,19 @@ impl Staging {
         .and_then(|batch| batch.retire_begun(state))
     })?;
     if let Some((lineage, mut release)) = begun {
+      // What its units free, gathered over its slices and handed to the daemon's reaper once at its end (A-920): a batch
+      // a slice was thousands of small sends, and a reaper slow to wake met them at its bound, which dropped them here.
+      let mut reaped = slates_merge::reaped::Reaped::default();
       until_done(|state| {
         state.count(LANDING_RELEASE_STEPS, 1);
-        released_some(state, (lineage, &mut release), slice_deadline_ns())
+        released_some(
+          state,
+          (lineage, &mut release),
+          (&mut reaped, slice_deadline_ns()),
+        )
       })
       .await?;
+      crate::reaper::reap(reaped);
     }
     Some(())
   }

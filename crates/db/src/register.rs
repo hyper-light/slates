@@ -400,6 +400,10 @@ pub struct HostEpoch(pub u64);
 /// The first epoch a host serves under.
 pub const FIRST_EPOCH: HostEpoch = HostEpoch(1);
 
+/// How a holder joins two values at one position its caller deems the same proposal ([`Acceptor::accept_merged`]):
+/// `(held, sent)` to the value to hold, or `None` where they are different proposals.
+pub type ValueMerge<'a> = dyn Fn(&[u8], &[u8]) -> Option<Vec<u8>> + 'a;
+
 /// A register refusal (the closed taxonomy of §4.8 that this core can raise).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegisterError {
@@ -2354,7 +2358,7 @@ impl Acceptor {
   /// is the object's only holder, so its floor for the object is the object's whole fence, and no takeover raises
   /// another (one node takes nothing over): the same code refuses there exactly what a fence of one object would.
   pub fn accept_own(&mut self, record: &Record) -> Result<Ack, RegisterError> {
-    self.check_against(record, self.own_floor(record.object))?;
+    self.check_against(record, self.own_floor(record.object), None)?;
     Ok(self.store(record))
   }
 
@@ -2535,11 +2539,62 @@ impl Acceptor {
   /// A holder uses this before recomputing a merge record: a refused record cannot mutate its replica.
   /// The check and acceptance must run in the same owning-shard turn, with no intervening await.
   pub fn check(&self, record: &Record) -> Result<(), RegisterError> {
-    self.check_against(record, self.fence.seen)
+    self.check_against(record, self.fence.seen, None)
   }
 
-  /// [`check`](Acceptor::check) with `floor` as the epoch fence.
-  fn check_against(&self, record: &Record, floor: HostEpoch) -> Result<(), RegisterError> {
+  /// [`check`](Acceptor::check), where a different value held at the record's position that `merge` deems the same
+  /// proposal is no conflict ([`accept_merged`](Acceptor::accept_merged)).
+  pub fn check_merged(&self, record: &Record, merge: &ValueMerge<'_>) -> Result<(), RegisterError> {
+    self.check_against(record, self.fence.seen, Some(merge))
+  }
+
+  /// Accepts `record` as [`accept`](Acceptor::accept) does, where its position may hold, at its epoch or above, a
+  /// different value `merge` deems the same proposal (A-921's second mode (2), main 01a20182's ruling of 2026-11-27): a
+  /// value whose owner re-derived it after a restart, differing only in fields of the owner's own state the merge knows
+  /// how to join. `merge(held, sent)` answers the value to hold there, the two joined; `None` names another proposal,
+  /// refused `ConflictingPosition` as before. The merged value is held at the held epoch, and the record the owner sent is
+  /// acknowledged, so its commit counts this holder. The register stays opaque to values: the merge is its caller's, and
+  /// with none every rule is [`accept`](Acceptor::accept)'s.
+  pub fn accept_merged(
+    &mut self,
+    record: &Record,
+    merge: &ValueMerge<'_>,
+  ) -> Result<Ack, RegisterError> {
+    self.check_against(record, self.fence.seen, Some(merge))?;
+    self.fence.accept(record.epoch)?;
+    let position = (record.object, record.sequence);
+    let joined = self
+      .accepted
+      .get(&position)
+      .filter(|(held_epoch, held)| held != &record.value && *held_epoch >= record.epoch)
+      .and_then(|(held_epoch, held)| {
+        merge(held, &record.value).map(|merged| (*held_epoch, merged))
+      });
+    let Some((held_epoch, merged)) = joined else {
+      return Ok(self.store(record));
+    };
+    self.accepted.insert(position, (held_epoch, merged));
+    self.written_by = Some(record.owner);
+    if let Some(changes) = self.changes.as_mut() {
+      changes.note_written(position);
+    }
+    Ok(Ack {
+      holder: self.id,
+      object: record.object,
+      sequence: record.sequence,
+      generation: record.generation,
+      identity: record.identity(),
+    })
+  }
+
+  /// [`check`](Acceptor::check) with `floor` as the epoch fence, and `merge` deciding whether a different value held at
+  /// the position is the same proposal ([`accept_merged`](Acceptor::accept_merged)).
+  fn check_against(
+    &self,
+    record: &Record,
+    floor: HostEpoch,
+    merge: Option<&ValueMerge<'_>>,
+  ) -> Result<(), RegisterError> {
     if record.generation < self.authority.generation {
       return Err(RegisterError::ConfigurationStale {
         version: self.authority.generation,
@@ -2565,6 +2620,7 @@ impl Acceptor {
     if let Some((held_epoch, existing)) = self.accepted.get(&position)
       && existing != &record.value
       && *held_epoch >= record.epoch
+      && merge.is_none_or(|merge| merge(existing, &record.value).is_none())
     {
       return Err(RegisterError::ConflictingPosition);
     }
@@ -5624,6 +5680,77 @@ mod tests {
     assert_eq!(
       recovered.accept(&stale),
       Err(RegisterError::StaleEpoch { current: 3 })
+    );
+  }
+
+  /// A-921's second mode (2) (main 01a20182's ruling of 2026-11-27): a holder joins a value its caller deems the same
+  /// proposal instead of refusing it. Do: accept a record; send at its position and epoch a value the merge joins (here:
+  /// one whose last byte is a floor, joined by the greater), then one it does not. Expect: the joined value acknowledged
+  /// as the record sent, the value held its join at the held epoch, a smaller floor acknowledged with the larger kept;
+  /// another value refused `ConflictingPosition`, as `accept` refuses it, and by `check_merged` too.
+  #[test]
+  fn a_value_the_merge_joins_is_acknowledged_and_another_is_still_refused() {
+    let owner = HostId(1);
+    let mut acceptor = Acceptor::new(
+      HostId(2),
+      Authority {
+        generation: 0,
+        owner,
+      },
+    );
+    let record = Record {
+      owner,
+      object: ObjectId::new(HostId(1), 6),
+      sequence: 2,
+      epoch: HostEpoch(1),
+      generation: 0,
+      value: b"v2 floor\x01".to_vec(),
+    };
+    acceptor.accept(&record).unwrap();
+    // Joins values equal but for their last byte, keeping the greater.
+    let merge = |held: &[u8], sent: &[u8]| -> Option<Vec<u8>> {
+      let (held_floor, held_content) = held.split_last()?;
+      let (sent_floor, sent_content) = sent.split_last()?;
+      (held_content == sent_content)
+        .then(|| [held_content, &[*held_floor.max(sent_floor)]].concat())
+    };
+    let lower = Record {
+      value: b"v2 floor\x00".to_vec(),
+      ..record.clone()
+    };
+    assert_eq!(
+      acceptor
+        .accept_merged(&lower, &merge)
+        .map(|ack| ack.identity),
+      Ok(lower.identity()),
+      "the record sent acknowledged"
+    );
+    assert_eq!(
+      acceptor.value_at(record.object, 2),
+      Some(&b"v2 floor\x01"[..]),
+      "the greater floor kept"
+    );
+    let higher = Record {
+      value: b"v2 floor\x05".to_vec(),
+      ..record.clone()
+    };
+    assert!(acceptor.accept_merged(&higher, &merge).is_ok());
+    assert_eq!(
+      acceptor.value_at(record.object, 2),
+      Some(&b"v2 floor\x05"[..]),
+      "joined upward"
+    );
+    let other = Record {
+      value: b"another\x05".to_vec(),
+      ..record.clone()
+    };
+    assert_eq!(
+      acceptor.check_merged(&other, &merge),
+      Err(RegisterError::ConflictingPosition)
+    );
+    assert_eq!(
+      acceptor.accept_merged(&other, &merge),
+      Err(RegisterError::ConflictingPosition)
     );
   }
 
