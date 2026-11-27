@@ -113,7 +113,9 @@ pub use slot::{PAYLOAD_BYTES, Slot, SlotKind};
 /// says.
 ///
 /// So every test in this binary that spawns a process holds the gate across the spawn (`exit_watch`'s, `mach_claim`'s
-/// stranger, and `endpoint`'s departure tests on macOS and Windows), and so does every test that asserts a descriptor's
+/// stranger, `endpoint`'s departure tests on macOS and Windows, and `spawner`'s, which went without it until 2026-11-27:
+/// its parity test's direct child then held three descriptors `delivery`'s wrong-kind test had open, under the TSan
+/// lane in 2 runs of 2), and so does every test that asserts a descriptor's
 /// last close: an `EPIPE`, a zero read, or a hangup (`delivery`'s descriptor tests, `stream`'s, the Linux rendezvous's
 /// refused delivery, and `endpoint`'s departure tests on Linux). Until 2026-11-18 the
 /// stranger's `sh` and `stream`'s two tests went without it, and the lib's tests failed 2 of 4 runs on a loaded Mac,

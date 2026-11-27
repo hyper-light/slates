@@ -1448,24 +1448,31 @@ mod tests {
     }
 
     /// A directory, the null device (a character device, as a terminal is) and a regular file are
-    /// the wrong kind, refused before a byte is read; a terminal too, where the test has one.
+    /// the wrong kind, refused before a byte is read; a terminal too, where the test has one. Each is
+    /// opened close-on-exec: opened without it, a child another test of the binary spawned meanwhile
+    /// held all three for its life (the spawner's parity test, the TSan lane 2026-11-27, run 45991805330).
     #[test]
     fn a_directory_a_device_or_a_file_is_the_wrong_kind() {
       let _gate = crate::descriptor_test_gate();
       use rustix::fs::{Mode, OFlags};
-      let directory =
-        rustix::fs::open(".", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
+      let directory = rustix::fs::open(
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+      )
+      .unwrap();
       assert_eq!(take_named(&named(directory)), Err(DeliveryFault::WrongKind));
-      let null = rustix::fs::open("/dev/null", OFlags::RDONLY, Mode::empty()).unwrap();
+      let null =
+        rustix::fs::open("/dev/null", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).unwrap();
       assert_eq!(take_named(&named(null)), Err(DeliveryFault::WrongKind));
       let file = rustix::fs::open(
         concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
-        OFlags::RDONLY,
+        OFlags::RDONLY | OFlags::CLOEXEC,
         Mode::empty(),
       )
       .unwrap();
       assert_eq!(take_named(&named(file)), Err(DeliveryFault::WrongKind));
-      match rustix::fs::open("/dev/tty", OFlags::RDONLY, Mode::empty()) {
+      match rustix::fs::open("/dev/tty", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()) {
         Ok(tty) => assert_eq!(take_named(&named(tty)), Err(DeliveryFault::WrongKind)),
         Err(_) => eprintln!("skipping the terminal case: this process has no controlling terminal"),
       }
