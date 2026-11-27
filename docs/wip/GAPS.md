@@ -6647,6 +6647,19 @@
 > svn://'s 3. In debug the daemon's live quantum derives tiny slices (4.4 µs: a 741-byte text piece, a 6.9 KB copy
 > slice), which inflate yield counts. Owed: main's release round of `an_svnrdump_dump_measured` over git-2000 on
 > these counters, which names the 2 to 4 ms polls' task and the reply's yields a revision at the release quantum.
+> **The writing session's 2.1×, counted (w-svn, 2026-11-27; main's order):** `an_svn_writing_session_measured`
+> (`crates/cli/tests/svn_interop.rs`) imports a dump into a store-backed daemon and runs the use test's writing session
+> with stock `svn` a phase at a time (checkout `--depth immediates`, commit, copy, merge, revprop set), each step timed,
+> printing what each phase added to every counter; then the same session against stock `svnserve -t` over the dump
+> loaded by `svnadmin`, in the same run. Over the local 300-revision history (debug, stock 1.15) no gap shows: HTTP
+> 5.75 s, svn:// 5.51 s, stock 7.50 s for the session. Every step is the `svn` client's own: its local verbs (`add`,
+> `revert -R`) take 0.03 to 0.94 s, and a whole phase polls the daemon 77 to 472 times, its longest poll 8 to 16 ms in
+> debug (`rt.poll_log2.23`, in each commit and merge). An earlier run under host load had each phase 4 to 5 s on both
+> edges with the same counts, so wall seconds here swing with the host and the counts are what to read. The use
+> test's `merge -c HEAD` (E205000, `-c` takes a number) and its `propset --revprop` with no `pre-revprop-change` hook
+> (E165006) fail on all three servers alike. Owed: main's release round of it over git-2000, whose 2.1× this local
+> history does not reproduce: the gap lies in what git-2000 adds (its wide tree and long history), and the round's
+> per-step seconds and counters name the step.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon

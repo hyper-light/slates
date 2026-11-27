@@ -2816,6 +2816,245 @@ fn an_svnrdump_dump_measured() {
   }
 }
 
+/// The HTTPv2 use test's writing row (goal 93; main's round of 2026-11-24: commit, copy, merge and propset of git-2000 at
+/// 14.2 s against stock svnserve's 6.8, 2.1 times; a measurement, not a gate). Do: for the HTTP edge and svn:// in turn,
+/// start an anchor whose daemon holds a changeset store and import the dump `SLATES_SVN_WRITES_DUMP` names through the
+/// CLI; then run the use test's writing session with stock `svn` 1.15 a phase at a time ([`WRITING_PHASES`]: a shallow
+/// checkout, a commit adding a file, a copy of the repository's root, a merge of a revision back, a revision property
+/// set), each step timed; then the same session against stock `svnserve -t` over the dump loaded by stock `svnadmin`,
+/// in the same run, its baseline. Expect nothing: print each phase's and step's seconds and answer and what each phase
+/// added to every counter of the daemon, so the session's work is read by counts. Skips loudly without stock Subversion
+/// 1.15 or the dump.
+#[test]
+#[cfg(unix)]
+#[ignore = "a measurement: SLATES_SVN_WRITES_DUMP=... cargo test -p slates-cli --test svn_interop -- --ignored an_svn_writing_session_measured --nocapture"]
+fn an_svn_writing_session_measured() {
+  let Ok(dump) = std::env::var("SLATES_SVN_WRITES_DUMP") else {
+    eprintln!("skipping the writing session's measurement: SLATES_SVN_WRITES_DUMP names no dump");
+    return;
+  };
+  if !stock_svn() {
+    eprintln!("skipping the writing session's measurement: no stock Subversion 1.15 here (svn)");
+    return;
+  }
+  for scheme in ["http", "svn"] {
+    let Some(served) = served_import(scheme, &dump, "svn-writes") else {
+      return;
+    };
+    let scratch = Scratch::new(&format!("svn-writes-{scheme}"));
+    let session = WritingSession {
+      url: served.url.clone(),
+      options: ["--username", &served.user, "--password", &served.token]
+        .map(str::to_owned)
+        .to_vec(),
+    };
+    for (phase, steps) in WRITING_PHASES {
+      let before = daemon_counters(&served.instance);
+      let ran = phase_run(&session, &scratch.path, steps);
+      let after = daemon_counters(&served.instance);
+      println!(
+        "an_svn_writing_session_measured {scheme} {phase}: {ran}\n  counters it added:{}",
+        counters_added(&before, &after, 1.0)
+      );
+    }
+  }
+  stock_writes_measured(&dump);
+}
+
+/// The measured writing session's baseline: the dump at `dump` loaded into a scratch FSFS repository by stock
+/// `svnadmin`, and [`WRITING_PHASES`] run against it through stock `svnserve -t` (the control's tunnel, as
+/// [`stock_svn_sessions_hold_against_stock_svnserve`] runs it), each phase and step timed and printed. Skips loudly
+/// without stock `svnadmin` and `svnserve`.
+#[cfg(unix)]
+fn stock_writes_measured(dump: &str) {
+  if !stock_svnserve() {
+    eprintln!("skipping the writing session's baseline: no stock svnadmin and svnserve 1.15 here");
+    return;
+  }
+  let scratch = Scratch::new("svn-writes-stock");
+  let root = format!("{}/repositories", scratch.path);
+  made_directory(&root);
+  let repository = format!("{root}/{REPOSITORY}");
+  let (code, out, err) = tool("svnadmin", &scratch.path, &["create", &repository]);
+  assert_eq!(code, 0, "svnadmin create: {out}{err}");
+  let loading = Instant::now();
+  let (code, out, err) = tool(
+    "svnadmin",
+    &scratch.path,
+    &["load", "-q", "--file", dump, &repository],
+  );
+  assert_eq!(code, 0, "svnadmin load: {out}{err}");
+  println!(
+    "an_svn_writing_session_measured stock: loaded in {:.2} s",
+    loading.elapsed().as_secs_f64()
+  );
+  let session = WritingSession {
+    url: format!("svn+{CONTROL_TUNNEL}://localhost/{REPOSITORY}"),
+    options: vec![
+      "--config-option".to_owned(),
+      format!(
+        "config:tunnels:{CONTROL_TUNNEL}=sh -c 'exec svnserve -t -r {root} --tunnel-user={TUNNEL_USER}'"
+      ),
+    ],
+  };
+  for (phase, steps) in WRITING_PHASES {
+    println!(
+      "an_svn_writing_session_measured stock {phase}: {}",
+      phase_run(&session, &scratch.path, steps)
+    );
+  }
+}
+
+/// Where the measured writing session's `svn` reaches its repository: the repository's URL and the options that sign it
+/// in (a user and token) or tunnel it (stock `svnserve -t`).
+#[cfg(unix)]
+struct WritingSession {
+  url: String,
+  options: Vec<String>,
+}
+
+/// One step of a phase of the measured writing session: a stock `svn` command, `{url}` standing for the repository's
+/// URL and `{wc}` for the working copy's path, or a file of the working copy written.
+#[cfg(unix)]
+enum WriteStep {
+  /// `svn` with these arguments.
+  Svn(&'static [&'static str]),
+  /// The working copy's file at this name written with these bytes.
+  File(&'static str, &'static str),
+}
+
+/// The use test's writing session ([`use_writes_logged`]) a phase at a time, each phase's steps in order.
+#[cfg(unix)]
+const WRITING_PHASES: [(&str, &[WriteStep]); 5] = [
+  (
+    "checkout",
+    &[WriteStep::Svn(&[
+      "checkout",
+      "-q",
+      "--depth",
+      "immediates",
+      "{url}",
+      "{wc}",
+    ])],
+  ),
+  (
+    "commit",
+    &[
+      WriteStep::File("use-written", "written by use\n"),
+      WriteStep::Svn(&["add", "-q", "{wc}/use-written"]),
+      WriteStep::Svn(&["commit", "-q", "-m", "by use: a commit", "{wc}"]),
+    ],
+  ),
+  (
+    "copy",
+    &[WriteStep::Svn(&[
+      "copy",
+      "-q",
+      "-m",
+      "by use: a copy",
+      "{url}",
+      "{url}/use-branch",
+    ])],
+  ),
+  (
+    "merge",
+    &[
+      WriteStep::Svn(&["update", "-q", "{wc}"]),
+      WriteStep::File("use-merged", "merged by use\n"),
+      WriteStep::Svn(&["add", "-q", "{wc}/use-merged"]),
+      WriteStep::Svn(&["commit", "-q", "-m", "by use: to merge", "{wc}"]),
+      WriteStep::Svn(&["update", "-q", "{wc}"]),
+      WriteStep::Svn(&["merge", "-q", "-c", "HEAD", "{url}", "{wc}"]),
+      WriteStep::Svn(&["status", "{wc}"]),
+      WriteStep::Svn(&["revert", "-q", "-R", "{wc}"]),
+    ],
+  ),
+  (
+    "propset",
+    &[WriteStep::Svn(&[
+      "propset",
+      "--revprop",
+      "-r",
+      "HEAD",
+      "svn:log",
+      "by use: a changed log",
+      "{url}",
+    ])],
+  ),
+];
+
+/// `steps` run against `session`'s repository with the working copy under `scratch`, each run whatever the one before
+/// answered, as the use test's session goes on past a refusal (its `svn merge -c HEAD` and its revision property change
+/// without a `pre-revprop-change` hook fail over slates and stock svnserve alike): the phase's seconds, then each step's
+/// seconds and, where it failed, its exit and error, a line each.
+#[cfg(unix)]
+fn phase_run(session: &WritingSession, scratch: &str, steps: &[WriteStep]) -> String {
+  let wc = format!("{scratch}/wc");
+  let started = Instant::now();
+  let said: String = steps
+    .iter()
+    .map(|step| step_timed(session, (scratch, &wc), step))
+    .collect();
+  format!("{:.2} s{said}", started.elapsed().as_secs_f64())
+}
+
+/// One step of a phase run by [`phase_run`], timed: a line naming it, its seconds, and its failure where it failed.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // test code: the working copy's file, in the test's own scratch directory
+fn step_timed(session: &WritingSession, (scratch, wc): (&str, &str), step: &WriteStep) -> String {
+  let started = Instant::now();
+  let (name, failed) = match step {
+    WriteStep::File(name, text) => (
+      format!("write {name}"),
+      std::fs::write(format!("{wc}/{name}"), text)
+        .err()
+        .map(|error| error.to_string()),
+    ),
+    WriteStep::Svn(args) => (
+      format!("svn {}", args.join(" ")),
+      svn_step(session, (scratch, wc), args),
+    ),
+  };
+  format!(
+    "\n    {name}: {:.2} s{}",
+    started.elapsed().as_secs_f64(),
+    failed
+      .map(|failure| format!(", failed: {failure}"))
+      .unwrap_or_default()
+  )
+}
+
+/// Stock `svn` with `args` (`{url}` and `{wc}` replaced) and `session`'s options: none where it answered 0, else its
+/// exit and error.
+#[cfg(unix)]
+fn svn_step(
+  session: &WritingSession,
+  (scratch, wc): (&str, &str),
+  args: &[&str],
+) -> Option<String> {
+  let args: Vec<String> = args
+    .iter()
+    .map(|arg| arg.replace("{url}", &session.url).replace("{wc}", wc))
+    .collect();
+  let out = Command::new("svn")
+    .args(&args)
+    .args(["--non-interactive", "--no-auth-cache", "--config-dir"])
+    .arg(format!("{scratch}/svn-config"))
+    .args(&session.options)
+    .env("LC_ALL", "C")
+    .stdin(Stdio::null())
+    .output();
+  match out {
+    Ok(out) if out.status.success() => None,
+    Ok(out) => Some(format!(
+      "exit {:?}: {}",
+      out.status.code(),
+      String::from_utf8_lossy(&out.stderr).trim()
+    )),
+    Err(error) => Some(format!("not started: {error}")),
+  }
+}
+
 /// Stock `svnrdump dump` of `served`'s repository over `scheme`'s edge, timed, its stream counted and dropped: its exit,
 /// its seconds, the revisions its stream held, and its error output.
 #[cfg(unix)]
