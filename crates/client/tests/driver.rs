@@ -13,6 +13,9 @@ use slates_anchor::AnchorSegment;
 use slates_client::driver::{Driver, Event, Ticket};
 use slates_client::{Client, ClientError, Deadlines};
 use slates_ipc::HeldRendezvous;
+
+#[path = "support/held_again.rs"]
+mod held_again;
 use slates_ipc::protocol::ReplyBody;
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::daemon::LIVENESS_BUDGET_NS;
@@ -228,9 +231,10 @@ impl Anchor {
     self.rendezvous = None;
   }
 
-  /// Holds the instance's rendezvous again, as a new anchor of it would.
+  /// Holds the instance's rendezvous again, as a new anchor of it would, once another test's spawn has let go of its
+  /// copy of the one this anchor dropped (support/held_again.rs).
   fn hold_again(&mut self, instance: &str) {
-    self.rendezvous = Some(HeldRendezvous::hold(instance).unwrap());
+    self.rendezvous = Some(held_again::hold_once_released(instance));
   }
 
   fn start(&self) -> Daemon {
