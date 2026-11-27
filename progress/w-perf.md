@@ -840,3 +840,11 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     UnknownDeltaBase landing every 2 steps; now every cadence 2-16 taken, 6 to 41 re-asks. w-hg noted (1a730cb13).
   - Found hunting main's 57k intake hang; whether it is that hang: open (main's hang control, sampled runs).
   - Waiting on main: the hang control's samples; the third churn's (i)/(ii) reading; the Windows diag's test lanes.
+- 2026-11-27 04:19  (f9b86eb34's commit time; written 2026-11-27 04:23 PST):
+  - LANDED f9b86eb34 (e07512e2b): main's 57k hg push intake hang. FileBase::stored framed a file base through
+    ContentStore::windows, which stops at an away window, so a base whose metadata block was let go read framed short
+    and long in bytes; the bring-back never refreshed patched.base, so it was asked two asks a slice forever. Fixed:
+    FileBase::Stored::whole, asked before read, rebuilt after bring-back, asked twice at most (base_store_reasked).
+    Red: 16 steps 11 asks at its derived bound before (9,995 at 10,000), 12 steps one ask now. Bug record in the commit.
+  - Waiting on main: its 57k runs on the tip (base_store_reads moving, no hang); the ContentStore::windows siblings'
+    ruling; then the image cut cadence, rule (ii).
