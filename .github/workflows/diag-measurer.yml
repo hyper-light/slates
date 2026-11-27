@@ -1,0 +1,64 @@
+name: diag measurer
+# w-interop (2026-11-27, main 01a20182's brief inbox/w-interop-from-main-tsan-lane.md, part 2): what descriptor 6 is.
+# Under the TSan lane on Linux (diag CI 2, run 45986066740, job 140461888152) the spawner parity test
+# (crates/ipc/src/spawner/tests.rs) found the direct child holding descriptor 6, which the child through the spawner
+# did not. This branch changes that test alone (marked DIAG, never main): each child prints every descriptor it holds
+# with its target and its open flags, and the test prints its own descriptors and flags just before each spawn. The
+# job runs slates-ipc's library tests as the lane runs them (nightly, -Zbuild-std, the lane's RUSTFLAGS and
+# TSAN_OPTIONS, every test of the binary in parallel), three times, then once without the sanitizer for contrast.
+# Each run's SPAWNER-PARITY blocks are printed after it, so one log read names descriptor 6. Runs only from
+# `diag-measurer-*` branches.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  tsan-spawner-fds:
+    name: the spawner parity test's descriptors (ubuntu-latest, TSan and native)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Under TSan, three runs (the lane's flags, xtask/src/tsan.rs)
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread --cfg=rustix_use_libc --cfg=slates_tsan"
+          RUSTDOCFLAGS: "-Zsanitizer=thread --cfg=rustix_use_libc --cfg=slates_tsan"
+          TSAN_OPTIONS: "halt_on_error=0"
+          SLATES_TEST_RESTART_SLOWDOWN: "25"
+        run: |
+          target=$(rustc +nightly -vV | sed -n 's/^host: //p')
+          for run in 1 2 3; do
+            echo "== TSan run $run"
+            cargo +nightly test -Zbuild-std --target "$target" -p slates-ipc --lib -- --nocapture \
+              > "$RUNNER_TEMP/tsan-$run.out" 2>&1
+            echo "exit $?; $(grep -E '^test result' "$RUNNER_TEMP/tsan-$run.out" | tail -1)"
+            grep -E 'spawner::tests::a_child_started_through_the_spawner_holds_what_a_direct_one_holds' "$RUNNER_TEMP/tsan-$run.out" | head -3
+            grep -A 24 'SPAWNER-PARITY' "$RUNNER_TEMP/tsan-$run.out" | cut -c1-220
+          done
+      - name: Without the sanitizer, one run (contrast)
+        run: |
+          cargo test -p slates-ipc --lib spawner::tests::a_child_started_through_the_spawner_holds_what_a_direct_one_holds \
+            -- --nocapture > "$RUNNER_TEMP/native.out" 2>&1
+          echo "exit $?; $(grep -E '^test result' "$RUNNER_TEMP/native.out" | tail -1)"
+          grep -A 24 'SPAWNER-PARITY' "$RUNNER_TEMP/native.out" | cut -c1-220
+      - name: Keep the outputs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsan-spawner-fds
+          path: ${{ runner.temp }}/*.out
+          if-no-files-found: warn

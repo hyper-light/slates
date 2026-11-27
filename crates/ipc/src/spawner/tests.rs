@@ -162,8 +162,16 @@ fn a_child_started_through_the_spawner_holds_what_a_direct_one_holds() {
   let spawner = spawner(1);
   let end = spawner.ends.first().unwrap();
   let (_held_read, _held_write) = std::io::pipe().unwrap();
-  let args = [OsStr::new("-c"), OsStr::new("ls /dev/fd")];
+  // DIAG (w-interop, never main): each child also names every descriptor it holds, its target and its open flags.
+  let args = [
+    OsStr::new("-c"),
+    OsStr::new(
+      "ls /dev/fd; echo ===; for f in /proc/$$/fd/*; do n=${f##*/}; \
+       echo \"$n $(readlink $f) $(grep ^flags /proc/$$/fdinfo/$n 2>/dev/null)\"; done",
+    ),
+  ];
   let (mut direct_read, direct_write) = std::io::pipe().unwrap();
+  diag_parent_fds("before the direct spawn");
   let mut child =
     crate::confined_spawn::spawn(&shell(&args, ChildStream::Fd(direct_write.as_fd()))).unwrap();
   drop(direct_write);
@@ -171,6 +179,7 @@ fn a_child_started_through_the_spawner_holds_what_a_direct_one_holds() {
   direct_read.read_to_string(&mut direct).unwrap();
   child.wait().unwrap();
   let (mut read, write) = std::io::pipe().unwrap();
+  diag_parent_fds("before the spawner's spawn");
   ask(end, 1, &shell(&args, ChildStream::Fd(write.as_fd())));
   drop(write);
   let mut inbound = Inbound::default();
@@ -182,10 +191,39 @@ fn a_child_started_through_the_spawner_holds_what_a_direct_one_holds() {
   read.read_to_string(&mut through).unwrap();
   let _ = answered(end, &mut inbound, 1);
   release(end, 1);
+  eprintln!("SPAWNER-PARITY direct child:\n{direct}");
+  eprintln!("SPAWNER-PARITY child through the spawner:\n{through}");
+  let listing = |all: &str| all.split("===").next().unwrap_or_default().to_owned();
   assert_eq!(
-    through, direct,
+    listing(&through),
+    listing(&direct),
     "the child through the spawner holds what a direct one holds"
   );
+}
+
+/// DIAG (w-interop, never main): this test process's descriptors at `when`: each one's target and its open flags
+/// (`O_CLOEXEC` is 02000000 in fdinfo's octal `flags`), so a descriptor held inheritable at a spawn is named.
+#[allow(clippy::disallowed_methods)]
+fn diag_parent_fds(when: &str) {
+  let mut lines = Vec::new();
+  for entry in std::fs::read_dir("/proc/self/fd")
+    .into_iter()
+    .flatten()
+    .flatten()
+  {
+    let name = entry.file_name().to_string_lossy().into_owned();
+    let target = std::fs::read_link(entry.path())
+      .map(|t| t.display().to_string())
+      .unwrap_or_default();
+    let flags = std::fs::read_to_string(format!("/proc/self/fdinfo/{name}"))
+      .unwrap_or_default()
+      .lines()
+      .find(|line| line.starts_with("flags"))
+      .unwrap_or_default()
+      .to_owned();
+    lines.push(format!("{name} {target} {flags}"));
+  }
+  eprintln!("SPAWNER-PARITY test process {when}:\n{}", lines.join("\n"));
 }
 
 /// A-924, bound to the daemon (main's ruling, addition 2). Do: ask the spawner for a child that sleeps far past the
