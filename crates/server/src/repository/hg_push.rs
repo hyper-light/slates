@@ -2702,17 +2702,23 @@ async fn recorded(
     return Some(Ok(()));
   }
   let listed = super::hg_run::list_landed(run, repository).await?;
-  crate::state::with_state(|state| match listed {
-    Ok((list, len, sequence)) => {
+  let attempt = run.attempt();
+  crate::state::with_state(|state| match (listed, attempt) {
+    (Ok((list, len, sequence)), Some(attempt)) => {
       state.count(PUSH_LANDED, 1);
       forked.record = Some(slates_hg::import::record::write_homed_run_reference(
         forked.room,
         (list.0, len),
-        sequence,
+        (sequence, attempt),
       ));
       Ok(())
     }
-    Err(unlanded) => {
+    // A list homed has its attempt: none is no run this push homed.
+    (Ok(_), None) => {
+      state.count(PUSH_UNLANDED, 1);
+      Err(PushOutcome::refused(&abort(UNLANDED.to_vec())))
+    }
+    (Err(unlanded), _) => {
       state.count(PUSH_UNLANDED, 1);
       let words = match unlanded {
         super::hg_run::ListUnlanded::Unhomed(refused) => unhomed_words(&refused),

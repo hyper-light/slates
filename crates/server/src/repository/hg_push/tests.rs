@@ -623,6 +623,204 @@ fn a_holders_run_lands_the_owners_segments_byte_for_byte_by_identity() {
   );
 }
 
+/// A crash after a push's answer: on a two-shard daemon over a retained segment and a store, push six changesets cut at
+/// one byte, its settles held unsent where `settles_held`; stop it without publishing anything more and start a successor
+/// over the same segment, waiting for its recovery (and, settles held, its resolution pass). The objects its record names,
+/// and those of them the successor's region read could not read back.
+fn crash_after_a_push(name: &'static str, settles_held: bool) -> (usize, Vec<[u8; 32]>) {
+  use slates_anchor::AnchorSegment;
+  let profile = crate::daemon::test_profile();
+  let instance = format!("{name}-{}", std::process::id());
+  let store = crate::test_store::TestStore::start(name);
+  let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(2));
+  config.vcs_disk = Some(store.handle());
+  let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+    .unwrap()
+    .with_content(&format!("{instance}-con"), config.content_bytes())
+    .unwrap();
+  let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+  let source = || {
+    let (handoff, len) = segment.handoff().unwrap();
+    crate::daemon::SegmentSource::Handoff {
+      handoff,
+      len,
+      content: segment.content_handoff().unwrap(),
+      rendezvous: rendezvous.adoption(),
+    }
+  };
+  let first = crate::Daemon::start(&profile, config.clone(), source()).unwrap();
+  first.bootstrap(true).unwrap();
+  let hg = made_on(&first, name);
+  let repository = hg.repository;
+  let made = history_of(&[
+    ("one", "one", b"one\n", None, "default"),
+    ("two", "two", b"two\n", Some(0), "default"),
+    ("three", "three", b"three\n", Some(1), "default"),
+    ("four", "four", b"four\n", Some(2), "default"),
+    ("five", "five", b"five\n", Some(3), "default"),
+    ("six", "six", b"six\n", Some(4), "default"),
+  ]);
+  let bundle = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0, 1, 2, 3, 4, 5]);
+  let named = crate::test_store::run_on_first(
+    &first,
+    move || async move {
+      // Where asked, the shard's settles wait unsent, so the stop leaves the attempt's moves to its records unsent, as a
+      // crash between the entry and its settle does (A-727 (d1a-3)).
+      crate::vcs_store::homes::hold_settles(settles_held);
+      super::super::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(1));
+      let outcome = pushed_bytes_to(repository, &bundle).await;
+      super::super::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(0));
+      assert!(matches!(outcome, Outcome::Accepted(_)), "{outcome:?}");
+      let (homed, disk) = crate::repository::svn_commit::tests::on(|state| {
+        let records = state.db.partition().repositories();
+        let homed = (0..)
+          .map_while(|index| records.object_record(repository, index))
+          .filter_map(slates_hg::import::record::homed_run_of)
+          .last();
+        (
+          homed.expect("the push's homed run"),
+          state.vcs_disk.clone().expect("a store"),
+        )
+      });
+      let list = crate::vcs_store::keyed_bytes(&disk, homed.list, homed.len)
+        .await
+        .expect("its list");
+      let mut named = vec![homed.list];
+      for entry in slates_hg::import::record::segment_list_of(&list).expect("a list") {
+        named.extend([entry.record.0, entry.payload.0, entry.texts.0]);
+      }
+      named
+    },
+    NAMED_PATIENCE,
+  );
+  // The crash: nothing more published.
+  first.stop();
+  let second = crate::Daemon::start(&profile, config, source()).unwrap();
+  let count = named.len();
+  let lost = crate::test_store::run_on_first(
+    &second,
+    move || async move {
+      // The successor's recovery of the repository first, its event, not a time: its stores made, its images' holds
+      // and notes restored with them.
+      loop {
+        let recovered = crate::repository::svn_commit::tests::on(|state| {
+          state.vcs_stores.unrecovered(repository).is_none()
+            && !state.vcs_stores.rebuilding(repository)
+            && state.vcs_stores.holds(repository)
+        });
+        if recovered {
+          break;
+        }
+        slates_rt::futures::yield_now().await;
+      }
+      let (origin, shards) =
+        crate::repository::svn_commit::tests::on(|state| (state.shard, state.shards.clone()));
+      // Where the settles were held, the successor's start owes a resolution of the earlier process's attempt (A-727
+      // (d1a-3)): run here, as the region's period turn runs it, before anything is read.
+      if settles_held {
+        crate::vcs_store::homes::resolve_owed();
+        crate::vcs_store::homes::resolve_ended(origin, &shards, crate::fleet::live_budget()).await;
+      }
+      let mut lost = Vec::new();
+      for identity in named {
+        let read = crate::vcs_store::homes::read_in_region(
+          origin,
+          &shards,
+          slates_vcs::ContentId(identity),
+          crate::fleet::live_budget(),
+        )
+        .await;
+        if read.is_none() {
+          lost.push(identity);
+        }
+      }
+      lost
+    },
+    NAMED_PATIENCE,
+  );
+  second.stop();
+  drop(segment);
+  (count, lost)
+}
+
+/// The one barrier keeps A-727's rule (main 01a20182's order of 2026-11-26: no entry names an object not durable at its
+/// homes). Do: [`crash_after_a_push`] with its settles sent: its segments' sections and its list homed on both shards, the
+/// crash after its answer. Expect every object its record names (the list and each segment's three sections) read back
+/// from the region on the successor (`homes::read_in_region`, brought back from the node's store by its home's landed
+/// note). Red with the barrier taken out: 29 of 55 lost, those kept on the shard the entry's own publication did not
+/// cover.
+#[test]
+fn a_crash_after_a_pushs_answer_loses_no_object_its_record_names() {
+  let (count, lost) = crash_after_a_push("hg-one-barrier", false);
+  assert!(count > 10, "many objects named: {count}");
+  assert!(
+    lost.is_empty(),
+    "{} of {count} named objects lost by the crash",
+    lost.len()
+  );
+}
+
+/// A-727 (d1a-3) for Mercurial (record v13 names its push's attempt: the record names its segments only through its
+/// list). Do: [`crash_after_a_push`] with its settles held unsent, so the successor finds every homed object held for an
+/// attempt of the earlier process and resolves it by the repository's records. Expect every object its record names read
+/// back from the region after the pass. Red before v13: no Mercurial record named a hold, so the pass let every
+/// segment's hold go.
+#[test]
+fn a_crash_between_a_pushs_entry_and_its_settle_resolves_every_hold_by_the_attempt_its_record_names()
+ {
+  let (count, lost) = crash_after_a_push("hg-resolved", true);
+  assert!(count > 10, "many objects named: {count}");
+  assert!(
+    lost.is_empty(),
+    "{} of {count} named objects lost to the resolution",
+    lost.len()
+  );
+}
+
+/// The homing's barrier, once a home shard (main 01a20182's order of 2026-11-26 after r42 at 20a49642c: a push 89 to 123
+/// s and a restart's CPU 48.0 to 57.7 s, each homed object waiting for its own home's publication; homes.rs: "One
+/// barrier serves every window kept before it: group commit per shard"). Do: on a stored shard, cut a push's segments at
+/// one byte and push six changesets, each of its segments homing three sections, then its list. Expect: the push accepted
+/// and its homes' publications made for its tickets (`vcs_store.homes.published_for_ticket`) at most the node's shards,
+/// one barrier a home shard. Red before: one an object homed.
+#[test]
+fn a_many_segment_pushs_homing_publishes_once_a_home_shard() {
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = Hg::made("one-barrier").await;
+    let made = history_of(&[
+      ("one", "one", b"one\n", None, "default"),
+      ("two", "two", b"two\n", Some(0), "default"),
+      ("three", "three", b"three\n", Some(1), "default"),
+      ("four", "four", b"four\n", Some(2), "default"),
+      ("five", "five", b"five\n", Some(3), "default"),
+      ("six", "six", b"six\n", Some(4), "default"),
+    ]);
+    super::super::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(1));
+    let count = |name: &str| {
+      crate::repository::svn_commit::tests::on(|state| {
+        state.refusals.get(name).copied().unwrap_or(0)
+      })
+    };
+    let published = count(crate::vcs_store::homes::HOME_PUBLISHED);
+    let homed = count(super::super::hg_run::OBJECTS_HOMED);
+    let outcome = pushed_bytes_to(
+      hg.repository,
+      &crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0, 1, 2, 3, 4, 5]),
+    )
+    .await;
+    super::super::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(0));
+    assert!(matches!(outcome, Outcome::Accepted(_)), "{outcome:?}");
+    let shards = crate::repository::svn_commit::tests::on(|state| state.shards.len());
+    let published = count(crate::vcs_store::homes::HOME_PUBLISHED) - published;
+    let homed = count(super::super::hg_run::OBJECTS_HOMED) - homed;
+    assert!(homed > 10, "many objects homed: {homed}");
+    assert!(
+      published <= u64::try_from(shards).unwrap(),
+      "{published} publications for {homed} objects on {shards} shards"
+    );
+  });
+}
+
 /// The settle queue's shape (main 01a20182's order of 2026-11-26 after ruling R piece (i): an unbounded queue is CLAUDE.md
 /// §2 item 8). Do: on a stored shard, cut a push's segments at one byte so each of its six changesets lands as segments
 /// of their own, and push it. Expect: the push accepted, landed as several segments (each homing its `Record` and its

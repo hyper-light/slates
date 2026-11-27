@@ -1764,27 +1764,31 @@ fn an_import_writes_the_changegroup_a_push_of_its_history_brings() {
 }
 
 /// Ruling R (main 01a20182's of 2026-11-26 with its corrections: a push's record names one homed segment list, O(1), and
-/// replaces version 11 outright). Do: write a push's homed run reference naming a list of 88 bytes landed as changeset
-/// 12, in a room of 1 MiB; read it back; cut it at every length, add a byte; read a version-11 runs reference (as one was
-/// written before) and an import's v9 run through both readers. Expect the golden bytes (the magic, version 12, the push's
-/// source byte 1, the room, the list's identity, its length and its sequence, each little-endian); the run read back
-/// whole; every damaged one read as none; the version-11 reference read as no run by either reader; and the import's v9
-/// run one range, no homed run.
+/// replaces version 11 outright; version 13 names its attempt too). Do: write a push's homed run reference naming a list
+/// of 88 bytes landed as changeset 12 by attempt (5, 6, 7), in a room of 1 MiB; read it back; cut it at every length, add
+/// a byte; read a version-11 runs reference (as one was written before), a version-12 one (without the attempt) and an
+/// import's v9 run through both readers. Expect the golden bytes (the magic, version 13, the push's source byte 1, the
+/// room, the list's identity, its length, its sequence and its attempt's node, process and number, each little-endian);
+/// the run read back whole; every damaged one read as none; the version-11 and version-12 references read as no run;
+/// and the import's v9 run one range, no homed run.
 #[test]
-fn a_pushs_homed_run_reference_is_the_golden_bytes_and_v11_is_no_longer_read() {
+fn a_pushs_homed_run_reference_is_the_golden_bytes_and_v11_and_v12_are_no_longer_read() {
   use crate::import::record::{
     HomedRun, homed_run_of, run_of, write_homed_run_reference, write_run_reference,
   };
   let list = [7u8; 32];
-  let written = write_homed_run_reference(1 << 20, (list, 88), 12);
+  let written = write_homed_run_reference(1 << 20, (list, 88), (12, (5, 6, 7)));
   let golden: Vec<u8> = [
     &b"SHGR"[..],
-    &12u32.to_le_bytes(),
+    &13u32.to_le_bytes(),
     &[1],
     &(1u64 << 20).to_le_bytes(),
     &list,
     &88u64.to_le_bytes(),
     &12u64.to_le_bytes(),
+    &5u64.to_le_bytes(),
+    &6u64.to_le_bytes(),
+    &7u64.to_le_bytes(),
   ]
   .concat();
   assert_eq!(written, golden);
@@ -1794,7 +1798,8 @@ fn a_pushs_homed_run_reference_is_the_golden_bytes_and_v11_is_no_longer_read() {
       room: 1 << 20,
       list,
       len: 88,
-      sequence: 12
+      sequence: 12,
+      attempt: (5, 6, 7),
     })
   );
   assert_eq!(run_of(&written), None, "a homed run is no v9 run");
@@ -1819,6 +1824,10 @@ fn a_pushs_homed_run_reference_is_the_golden_bytes_and_v11_is_no_longer_read() {
     (None, None),
     "v11 no longer read"
   );
+  let mut v12 = written.clone();
+  v12[4..8].copy_from_slice(&12u32.to_le_bytes());
+  v12.truncate(v12.len() - 24);
+  assert_eq!(homed_run_of(&v12), None, "v12 no longer read");
   let imported = write_run_reference(1 << 20, (4, 11));
   assert_eq!(run_of(&imported).map(|run| run.ranges), Some(vec![(4, 11)]));
   assert_eq!(homed_run_of(&imported), None);

@@ -58876,8 +58876,8 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > once each lands. Segments land at the repository's next sequences, which its owner shard allocates, other landings
 > between them; the push's entry names them as ranges (record v11), and a restart replays exactly those, each record's
 > rows by node over the index as it stands then. Since ruling R piece (i) (2026-11-26, A-929) each segment's `Record`
-> and `Payload` are homed in the region before it lands and the entry names one homed segment list (record v12), which
-> replaced v11 outright: v11 is no longer read. Since piece (ii) (same day) the segment is homed as it landed, its `Texts`
+> and `Payload` are homed in the region before it lands and the entry names one homed segment list (record v12, since
+> the same day v13, which names the push's attempt too), which replaced v11 outright: v11 and v12 are no longer read. Since piece (ii) (same day) the segment is homed as it landed, its `Texts`
 > with its `Record` and `Payload`, and a holder lands the owner's segments verbatim from the region before it replays
 > them (A-929). The repository's landing turn (Subversion's, which Mercurial's made
 > changesets hold too) is taken for the entry's commit alone: a fork another landing made stale is re-based by node
@@ -65418,6 +65418,35 @@ Applied in the same change to:
   - Owed in R (ii)'s next pieces: the holder's recompute of an hg line's second version accepted with the owner's
     identity (today `merge.recompute_mismatch`); svn's holder path red; the Mercurial fleet-takeover CLI test
     `#[ignore]`d with its command. A remote home that never lands an object it keeps holds it in RAM, as git's do.
+- **One barrier a home shard, and a crash's holds resolved by the attempt** (main 01a20182's order of 2026-11-26 after
+  r42 at 20a49642c: a push 89 to 123 s and a restart's CPU 48.0 to 57.7 s; each homed object waited for its own home's
+  publication, and `verbs::publish_shard` re-images every volume of the shard; homes.rs: "One barrier serves every
+  window kept before it: group commit per shard"). Applied in the same change to:
+  - `crates/server/src/vcs_store/homes.rs`: `home_in_region_deferred`, this node's keep not waited for, its home shard's
+    latest ticket kept for the caller. A remote home still answers kept once its own image is published: the next piece
+    (main's order: the remote acknowledges at once, and one "published through ticket N" exchange a home a push carries
+    the barrier, a wire version of its own, with the Mercurial fleet-takeover CLI test `#[ignore]`d with its command).
+  - `crates/server/src/repository/hg_run.rs`: a push's homings deferred, and after its list is homed and landed it waits
+    once on each home shard's latest ticket (`list_landed`), before its record names anything. A wait short refuses it
+    `HOMED_SHORT`.
+  - Record v13 (`crates/hg/src/import/record.rs`) names the push's attempt (its node, process and number); v12 is no
+    longer read. A resolution of a hold a crash left (`homes::resolve_step`) now has a Mercurial arm: the hold of an
+    attempt some record committed is named, since the record names its segments only through its list. Before, no
+    Mercurial record named a hold, so a crash between the entry and its settle let every segment's hold go.
+  - `homes::home_of` ranks a node's shards by their place (their partition), never by their runtime id. A shard's id is
+    made afresh each start and numbered across a process's daemons. Ranked by it, an in-process successor numbered 1 and
+    3 where its predecessor had 0 and 2 moved every home and read 54 of 55 homed objects as held nowhere, while the shard
+    image keeps what each partition held. A sibling, not changed here: `vcs_share::place` ranks the node's shards by id
+    for where a push's work runs, which nothing persists.
+  - Held by:
+    - `hg_push::tests::a_many_segment_pushs_homing_publishes_once_a_home_shard`: red 55 publications for 55 objects on one
+      shard, at most the shards after.
+    - `a_crash_after_a_pushs_answer_loses_no_object_its_record_names`: two shards, crash after the answer. Red with the
+      barrier taken out: 29 of 55 lost.
+    - `a_crash_between_a_pushs_entry_and_its_settle_resolves_every_hold_by_the_attempt_its_record_names`: settles held
+      unsent, then a resolution pass on the successor. Red with the Mercurial arm off: 26 of 55 lost.
+    - `homes::tests::an_identitys_home_is_the_head_of_the_one_rendezvous_ranking_and_homes_spread`: the same place
+      whatever the shards' ids.
 - **The settle queue, batched and bounded** (main 01a20182's order of 2026-11-26, after piece (i): its settles were one
   region exchange an object, two a segment, about 4,200 for the 57k, in a queue with no bound; CLAUDE.md §2 item 8).
   Applied in the same change to:

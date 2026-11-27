@@ -120,9 +120,13 @@ const RUN_VERSION: u32 = 9;
 /// sequence of the changeset the list landed as ([`write_homed_run_reference`], [`homed_run_of`]). The list names each
 /// segment's sequence and its `Record` and `Payload` by identity and length, so a node that has not landed them fetches
 /// them from their region homes by identity. It replaces version 11 outright (each range of a push's segment sequences
-/// written into the register), which is no longer read (CLAUDE.md §2 item 7), as version 3 was not after 4.
-/// Format: its number, 12.
-const HOMED_RUNS_VERSION: u32 = 12;
+/// written into the register), which is no longer read (CLAUDE.md §2 item 7), as version 3 was not after 4. Version 13
+/// (the same day) adds the push's attempt (its node, process and number, A-727 (d1a)): a resolution of a hold a crash
+/// left its attempt's asks whether a record committed that attempt, since the record names its segments only through the
+/// list (`vcs_store::homes`' resolution; before, a crash between the entry and its settle let every segment's hold go);
+/// version 12, without it, is no longer read.
+/// Format: its number, 13.
+const HOMED_RUNS_VERSION: u32 = 13;
 
 /// An import's or a push's run of segment changesets on the changeset log, as its register record names it: the
 /// sequences of its segments, one range for an import's ([`RUN_VERSION`]); a push's names its segments by a homed list
@@ -178,14 +182,17 @@ pub struct HomedRun {
   pub len: u64,
   /// The sequence of the changeset it landed as: the run's last.
   pub sequence: u64,
+  /// The attempt that homed it (A-727 (d1a)): the node, the process and the number its holds in the region were for.
+  pub attempt: (u64, u64, u64),
 }
 
 /// The register's record of a push landed as the segment changesets its segment list names, the list `list` (its
-/// identity and length) landed as changeset `sequence` ([`HOMED_RUNS_VERSION`]).
+/// identity and length) landed as changeset `sequence`, homed by `attempt` (its node, process and number)
+/// ([`HOMED_RUNS_VERSION`]).
 pub fn write_homed_run_reference(
   room: u64,
   (list, len): ([u8; 32], u64),
-  sequence: u64,
+  (sequence, attempt): (u64, (u64, u64, u64)),
 ) -> Vec<u8> {
   let mut out = Vec::new();
   out.extend_from_slice(&MAGIC.to_le_bytes());
@@ -195,6 +202,10 @@ pub fn write_homed_run_reference(
   out.extend_from_slice(&list);
   out.extend_from_slice(&len.to_le_bytes());
   out.extend_from_slice(&sequence.to_le_bytes());
+  let (node, process, number) = attempt;
+  for long in [node, process, number] {
+    out.extend_from_slice(&long.to_le_bytes());
+  }
   out
 }
 
@@ -209,11 +220,17 @@ pub fn homed_run_of(bytes: &[u8]) -> Option<HomedRun> {
   let list = <[u8; 32]>::try_from(reader.take(slates_vcs::content::IDENTITY_BYTES).ok()?).ok()?;
   let len = reader.long().ok()?;
   let sequence = reader.long().ok()?;
+  let attempt = (
+    reader.long().ok()?,
+    reader.long().ok()?,
+    reader.long().ok()?,
+  );
   reader.rest.is_empty().then_some(HomedRun {
     room: room.left(),
     list,
     len,
     sequence,
+    attempt,
   })
 }
 

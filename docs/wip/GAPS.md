@@ -2139,7 +2139,9 @@
 > queue bounded with the attempts in flight (`homes::settle_bound`, refused typed at it). (ii)'s first half BUILT the
 > same day: the segment homed as it landed (`Texts` with `Record` and `Payload`, list v2), and a rebuild lands the
 > segments its store lacks from the region verbatim at the owner's sequences
-> (`a_holders_run_lands_the_owners_segments_byte_for_byte_by_identity`). OPEN: (ii)'s rest: the holder's recompute
+> (`a_holders_run_lands_the_owners_segments_byte_for_byte_by_identity`). CLOSED the same day: one barrier a home
+> shard on this node (r42's push 89 to 123 s), a crash's holds resolved by the attempt record v13 names, and homes ranked
+> by partition, never by a runtime shard id (A-929). OPEN next: a remote home's barrier, one exchange a home a push. OPEN: (ii)'s rest: the holder's recompute
 > accepted with the owner's identity, with svn's holder red and an
 > `#[ignore]`d fleet-takeover CLI test for Mercurial, which no test drives yet; then an import's run (v9) and a single
 > changeset (v7) homed the same way.
