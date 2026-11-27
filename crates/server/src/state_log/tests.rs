@@ -333,3 +333,45 @@ fn parts_held_back_past_the_bound_surface_the_publications_refusal() {
   logs.carried();
   assert_eq!(logs.held_back_past(bound), None, "carried again");
 }
+
+/// Main 01a20182's ruling of 2026-11-27 (A-921 part 3's footprint at f = 0, found looking at the 57k hg push's hang):
+/// a part held and let go before any publication carried it leaves nothing for a delta. Do: at f = 0 (no remote
+/// candidate) hold and let go parts of a names log, as each take does; then hold a part, commit a publication, and let it
+/// go; then restore a part from an image and let it go. Expect: nothing changed after the first (every one held and let go
+/// between two publications); the published part's and the restored part's let-go each changed, so the next delta
+/// removes their pieces. Before: every hold and let-go kept a key until a publication committed, so each delta carried a
+/// removal per part made since the last.
+#[test]
+fn a_part_let_go_before_any_publication_carried_it_leaves_no_change() {
+  let repo = repository(5);
+  let mut logs = StateLogs::default();
+  for position in 0..4u64 {
+    let held = part(repo, StateLog::Names, (position, position + 1));
+    logs.hold(&held);
+    logs.let_go_held(held.log_name().register(), &[]);
+  }
+  assert_eq!(
+    logs.changed().count(),
+    0,
+    "held and let go between publications: nothing changed"
+  );
+  let published = part(repo, StateLog::Names, (4, 5));
+  let register = published.log_name().register();
+  logs.hold(&published);
+  logs.clear_changed();
+  logs.let_go_held(register, &[]);
+  assert_eq!(
+    logs.changed().collect::<Vec<_>>(),
+    vec![(register, 5)],
+    "the published part's piece removed"
+  );
+  logs.clear_changed();
+  let restored = part(repo, StateLog::Names, (5, 6));
+  logs.restore(register, 6, value_of(&restored));
+  logs.let_go_held(register, &[]);
+  assert_eq!(
+    logs.changed().collect::<Vec<_>>(),
+    vec![(register, 6)],
+    "the restored part's piece removed"
+  );
+}
