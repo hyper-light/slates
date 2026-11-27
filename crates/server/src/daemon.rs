@@ -1889,8 +1889,52 @@ impl Daemon {
   /// Test support (A-915): while `held`, no shard of this node ships the state logs' parts it owes, so a repository's
   /// creation here keeps its names-log part (its root's join) off the other members. `Ok` once set on every shard.
   pub fn hold_state_log_shipping(&self, held: bool) -> Result<(), ObserveError> {
+    let hold = if held {
+      crate::state::StateLogShipHold::Held
+    } else {
+      crate::state::StateLogShipHold::Shipped
+    };
+    self.set_state_log_ship_hold(hold)
+  }
+
+  /// Test support (A-927 part 2): the positions of the names log of `member`'s family (a repository's id, or a green's of
+  /// it) this node's acceptors hold, ascending, across its shards.
+  pub fn names_log_positions(&self, member: [u8; 16]) -> Result<Vec<u64>, ObserveError> {
+    let green = slates_db::register::ObjectId(member);
+    let mut positions = Vec::new();
+    for shard in self.shards.clone() {
+      positions.extend(self.observe(Some(shard), move |s| {
+        crate::ledger_read::names_register_of(s, green)
+          .and_then(|register| {
+            s.holder_records.get(&register).map(|acceptor| {
+              acceptor
+                .positions_between(register, 0, u64::MAX)
+                .into_iter()
+                .map(|accepted| accepted.sequence)
+                .collect::<Vec<_>>()
+            })
+          })
+          .unwrap_or_default()
+      })?);
+    }
+    positions.sort_unstable();
+    Ok(positions)
+  }
+
+  /// Test support (A-927 part 2): no shard of this node ships the state logs' parts it owes to `peer`, and every other
+  /// candidate is shipped them, so a repository's creation here answers once another member holds its names-log part (its
+  /// root's join) while `peer`, its successor-to-be, holds none. `Ok` once set on every shard.
+  pub fn hold_state_log_shipping_from(&self, peer: slates_db::HostId) -> Result<(), ObserveError> {
+    self.set_state_log_ship_hold(crate::state::StateLogShipHold::HeldFrom(peer))
+  }
+
+  /// Sets every shard's state-log shipping hold (test support, [`crate::state::StateLogShipHold`]).
+  fn set_state_log_ship_hold(
+    &self,
+    hold: crate::state::StateLogShipHold,
+  ) -> Result<(), ObserveError> {
     for shard in &self.shards {
-      self.observe(Some(*shard), move |s| s.state_log_ship_held = held)?;
+      self.observe(Some(*shard), move |s| s.state_log_ship_held = hold)?;
     }
     Ok(())
   }
@@ -5598,7 +5642,7 @@ async fn init_shard(
     callbacks: crate::callback::Callbacks::default(),
     forward_lanes: crate::forward_lane::ForwardLanes::default(),
     council_rounds: crate::fleet::CouncilRounds::default(),
-    state_log_ship_held: false,
+    state_log_ship_held: crate::state::StateLogShipHold::Shipped,
     staging: crate::staging::Staging::default(),
     member_boot_nonce: incarnation,
     member_process_nonce: keyed_word(&issuer_secret, b"slates/member-process/v1"),

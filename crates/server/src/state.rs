@@ -985,9 +985,10 @@ pub struct ShardState {
   /// The council's rounds that passed through this node, and the tasks waiting for the next (`crate::fleet::CouncilRounds`,
   /// A-912; the control shard's).
   pub(crate) council_rounds: crate::fleet::CouncilRounds,
-  /// Test support (A-915): while set, this shard ships none of the state logs' parts it owes
-  /// (`Daemon::hold_state_log_shipping`), so a test holds a creation's names-log part off the other members.
-  pub(crate) state_log_ship_held: bool,
+  /// Test support (A-915, A-927): which candidates this shard ships the state logs' parts it owes to
+  /// (`Daemon::hold_state_log_shipping`, `Daemon::hold_state_log_shipping_from`), so a test holds a creation's names-log
+  /// part off the other members, or off one of them. Never set outside a test's hook.
+  pub(crate) state_log_ship_held: StateLogShipHold,
   /// The staging buffers of edits too large for one request, for the works this shard owns (`crate::staging`).
   pub(crate) staging: crate::staging::Staging,
   /// This start's random nonce, announced with its derived member id on SWIM contact (§4.8).
@@ -1624,6 +1625,20 @@ impl std::fmt::Debug for PendingForward {
       .field("owner", &self.owner)
       .finish()
   }
+}
+
+/// Test support (A-915, A-927): which candidates a shard ships the state logs' parts it owes to
+/// ([`ShardState::state_log_ship_held`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum StateLogShipHold {
+  /// Every candidate, as every daemon outside a test ships them.
+  #[default]
+  Shipped,
+  /// None (A-915: a creation's root's join kept off the other members).
+  Held,
+  /// Every candidate but this one (A-927 part 2: the join kept off the successor-to-be alone, the other survivor holding
+  /// it, so the creation answers at f + 1 without it).
+  HeldFrom(slates_db::HostId),
 }
 
 impl ShardState {

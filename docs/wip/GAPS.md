@@ -273,8 +273,17 @@
 > create. Red first (`t_a927_...`). Part 1b swept that class: a push's changes, an import batch, the owner's branch
 > verbs and a submit's verdict each refused `NotRecovered` on a green this shard did not recover, by one check
 > (`ShardState::recovered`) where each takes the green; before, each read only whether the engine was lent, and a
-> holder's replica stays lent past its give-up. Red first (four `t_a927_` tests in `repository::push::tests`). OPEN
-> (A-927 part 2, w-shared): the `Unjoined` adoption reads the join from its cohort before giving the green up.
+> holder's replica stays lent past its give-up. Red first (four `t_a927_` tests in `repository::push::tests`).
+> **FIXED (A-927 part 2, w-shared, 2026-11-26; main 01a20182's ruling): a894's cause, 3 of 41 runs at any load.** A
+> takeover adopted the names log's newest part into the successor's acceptor without noting its lineage memberships,
+> so a successor the join never shipped to answered its root green `Unjoined` and gave it up. The adoption now notes
+> it; an `Unjoined` adoption re-notes the family's held names-log parts, then reads the positions it lacks below the
+> log's adopted position from its cohort (A-919's read), refusing only past the read's tolerance, with the log whole
+> or with no names log, counted by why. And a lineage's hand-over waited without end on a member never pending (its
+> branch rebuilt a second root after the first had gone, 2 of 5 runs of the read test): it now waits for the family's
+> members pending here, each in the lineage at its adopted version, bounded by their own attempts. Red first (two
+> `a927_` fleet tests, the join held off the successor-to-be alone; three `merge_origin` units). OWED (main): the a894
+> loop's after (bar 0 of 40).
 > **FIXED (A-913, w-shared, 2026-11-24; A-912's sibling): a branch created while a member died refused `unable to
 > commit` at its record barrier (3 of 25 runs).** The restarted holder held its source's records but no replica, and
 > the record path branched only from a replica already there; now it makes a missing source first, as a branch's
