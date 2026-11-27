@@ -256,9 +256,10 @@
 > upgrade it therefore cannot rebuild a replica from the old-format records it holds (`merge_origin::rebuild_replica_through`
 > finds nothing), and the owner reships only versions not yet placed. Until each green's next version places at f + 1 in
 > the new format, its acknowledged versions are held only on the owner's own chain, and an owner lost for good in that
-> window leaves its successor records it refuses: those versions lost. Every bump so far (formats 1 to 4: A-255, A-288,
-> A-385, A-404) had this window; nothing written says whether a fleet is upgraded whole or rolling. A-908 avoids a
-> format change for this reason (a holder reads a green's lineage membership from the names log it already holds).
+> window leaves its successor records it refuses: those versions lost. Every bump so far (formats 1 to 5: A-255, A-288,
+> A-385, A-404, A-932) had this window; nothing written says whether a fleet is upgraded whole or rolling. A-908 avoided
+> a format change for this reason (a holder reads a green's lineage membership from the names log it already holds);
+> A-932 made one anyway, by main's ruling (a) of 2026-11-27, since the family bit A-908 read instead cannot decide.
 > Nothing is built on either answer.
 > **BUILT (A-908 with part 4, w-shared, 2026-11-24): a branch's green is replicated by its lineage.** A holder reads a
 > green's membership from the names log it holds and makes version 0 as the owner made the green (a root founds its
@@ -270,6 +271,15 @@
 > warm between the branch's versions, c refusing a's records, the branch's next push lands on a and b; red with part 4's
 > rebuild reverted in a scratch copy (`unable to commit`, b's `merge.recompute_mismatch` 1). Gate 16 (`v3_takeover` at
 > b7e65cc63, part 4 in) held: 40 of 40, release and debug.
+> **FIXED (A-932, w-interop, 2026-11-27; main's ruling (a)): in a fleet, a green created alone never committed a
+> version.** A holder made version 0 by the family bit, waiting for a family green's join (A-908), and every green made
+> alone has been a family of its own since A-636 part 2b-2. So its holders refused each of its records
+> `merge.replica.member_unknown` without end, and a restarted holder's rebuild did too. First bad 02bd0ec94: main's A/B
+> against 41e00948e, good 9 s and 8 s, bad 39 s and 35 s. Now the merge record names the green's lineage (format 5; 4
+> refused typed), and a holder makes a green whose record names none at once
+> (`docs/bugs/2026-11-27-a-green-standing-alone-waited-on-its-holders-for-a-join-that-never-comes.md`). Red first: two
+> `merge_service` units and one `merge_origin` unit. The fleet probe test passed in 5.82 s. OWED (main): the whole
+> `tests/fleet.rs` on the Mac and the Windows lanes, then the gap that no Unix lane runs it.
 > **OPEN (w-interop, 2026-11-27; main's ruling of 07:08; found by reading the code, nothing run yet): a lone green
 > later adopted as a repository's root keeps a standalone replica on its holders, so a branch of it may never reach a
 > holder.** A green created alone is a family root of its own (A-636 part 2b-2), and its version 0 shipped while it

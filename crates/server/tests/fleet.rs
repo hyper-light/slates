@@ -33442,6 +33442,8 @@ fn planted_merge_record(anchor: HostId) -> slates_server::merge_service::MergeRe
     signature: None,
     folded_below: 0,
     checkpoint_floor: 0,
+    // A green standing alone (A-932).
+    lineage: None,
   }
 }
 
