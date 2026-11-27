@@ -92,9 +92,14 @@ pub(crate) fn host_holding(dump: &[u8]) -> (SimHost, HostDir) {
 /// main's ruling after probe 17: measure the product, not the oracle). Made inside the history, the host's copy of
 /// move's 10.5 MB dump was 1.49 ms of its first poll, debug, 1.23 of it system time faulting the copy's pages in, and
 /// that poll led move's release runs. Shared so a history holding it stays `Clone`; taken once.
+// D-8's harness exception: its two owners are the test's thread, which makes the host, and the shard's history, which
+// takes it once; a history must stay `Clone`, and the host crosses threads, so `Arc` and `Mutex` are this harness's.
+#[allow(clippy::disallowed_types)]
 #[derive(Clone)]
 pub(crate) struct HeldDump(std::sync::Arc<std::sync::Mutex<Option<(SimHost, HostDir)>>>);
 
+// D-8's harness exception, as on [`HeldDump`].
+#[allow(clippy::disallowed_types)]
 impl HeldDump {
   /// `dump` held by a simulated host ([`host_holding`]): the caller's copy goes with it, off the shard.
   pub(crate) fn holding(dump: Vec<u8>) -> HeldDump {
@@ -1174,12 +1179,12 @@ fn copied_dir(to: &str, (from, rev): (&str, u64)) -> String {
   )
 }
 
+/// [`imported_whole_and_stepped`]'s reading: the youngest revision, the longest step, its window, and the copies grafted.
+type ImportedWholeAndStepped = (Result<u64, String>, u64, u64, (u64, u64, u64, u64));
+
 /// `dump` imported on a store-backed shard: its youngest revision, the shard's longest step and its window, and the
 /// copies the green grafted (`Green::copies_grafted`).
-fn imported_whole_and_stepped(
-  name: &'static str,
-  dump: Vec<u8>,
-) -> (Result<u64, String>, u64, u64, (u64, u64, u64, u64)) {
+fn imported_whole_and_stepped(name: &'static str, dump: Vec<u8>) -> ImportedWholeAndStepped {
   // Held before the shard's history begins: the oracle host's copy of the dump is no step of the import's.
   let held = HeldDump::holding(dump);
   let read = stored(move || {

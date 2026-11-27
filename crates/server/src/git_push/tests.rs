@@ -2124,13 +2124,14 @@ fn b3_a_merge_whose_admission_walks_a_let_go_parent_brings_it_back_and_lands() {
   assert!(driven > 0, "the push's own driver brought the window back");
 }
 
+/// [`branched_create`]'s request, its pack, `C1`'s and `S`'s ids, and the ids of `C1`'s and `S`'s blobs.
+type BranchedCreate = (Vec<u8>, Vec<u8>, (ObjectId, ObjectId), (ObjectId, ObjectId));
+
 /// A create of `main` at `C1` and `side` at `S`, each a commit of one file over `C0`, the pack laid `C1`'s objects,
 /// `S`'s tree and blob, a filler blob of [`FILLER_WINDOWS`] content store windows (each `window` bytes) of bytes that
 /// do not compress, then `S`'s commit and `C0`'s objects, so `S`'s commit lies in no window its files do: the request,
 /// its pack, `C1`'s and `S`'s ids, and the ids of `C1`'s and `S`'s blobs.
-fn branched_create(
-  window: usize,
-) -> (Vec<u8>, Vec<u8>, (ObjectId, ObjectId), (ObjectId, ObjectId)) {
+fn branched_create(window: usize) -> BranchedCreate {
   use slates_git::object_name::{Kind, name_of};
   let (zero, under) = flat_commit(1, "zero", None);
   let (one, mut objects) = flat_commit(1, "one", Some(zero));
