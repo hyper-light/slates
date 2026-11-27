@@ -1268,6 +1268,8 @@ struct WideCounts {
   freeing_applied: u64,
   /// The steps of its revisions' record encodings (`staging::RECORD_ENCODE_STEPS`).
   encode_steps: u64,
+  /// The most entries of a changeset's `Texts` section made between two awaits (`landing::LANDING_TEXT_ENTRIES_MOST`).
+  text_entries_most: u64,
 }
 
 /// The calling shard's [`WideCounts`] now.
@@ -1299,6 +1301,12 @@ fn wide_counts() -> WideCounts {
       )
     }),
     encode_steps: on(|state| count(state, staging::RECORD_ENCODE_STEPS)),
+    text_entries_most: on(|state| {
+      count(
+        state,
+        crate::repository::svn_commit::landing::LANDING_TEXT_ENTRIES_MOST,
+      )
+    }),
   }
 }
 
@@ -1320,6 +1328,13 @@ fn wide_counts_sliced(counts: &WideCounts) {
     counts.encode_steps > 2,
     "the records encoded in {} step(s)",
     counts.encode_steps
+  );
+  // The changeset's `Texts` section made an entry a unit between its pieces (A-920: its 9,000 entries made and encoded
+  // whole in one step, 2.5 ms debug; red at 9,000).
+  let most = counts.text_entries_most;
+  assert!(
+    most > 0 && most < u64::try_from(WIDE_REVISION_FILES / 4).unwrap(),
+    "{most} entries made between two awaits"
   );
 }
 

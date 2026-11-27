@@ -837,9 +837,10 @@ fn rebuild_through(
   };
   // Version 0 by the green's membership of its repository's lineage (A-908 part 4), as a record's own version 0 is made
   // (`merge_service::make_origin_replica`): a green with no origin inputs only, since one seeded from its inputs stands
-  // alone there too (`seed_version_zero`).
+  // alone there too (`seed_version_zero`), and one whose version 0 names its lineage (A-932), since one that names none
+  // stands alone whatever its id (a green made alone is a family of its own, A-636 part 2b-2).
   let mut lineage = None;
-  if zero.inputs.is_none() {
+  if zero.inputs.is_none() && zero.lineage.is_some() {
     use slates_db::catalog::MemberOrigin;
     match crate::merge_service::membership(state, crate::merge_service::replica_key(object)) {
       Some(member) => match member.origin {
@@ -855,27 +856,24 @@ fn rebuild_through(
         }
       },
       // The join unknown to a successor's adoption: read from the names log's cohort before refusing (A-927 part 2).
-      None if object.is_family() && asker == Asker::Adoption => {
-        match crate::ledger_read::join_read(state, object) {
-          crate::ledger_read::JoinRead::Joined => {
-            return rebuild_through(state, object, through, asker);
-          }
-          crate::ledger_read::JoinRead::Reading => {
-            state.count(ADOPTED_UNJOINED_READING, 1);
-            return Ok(Rebuild::Later);
-          }
-          crate::ledger_read::JoinRead::Unjoined(why) => {
-            state.count(ADOPTED_UNJOINED, 1);
-            state.count(why, 1);
-            return Err(Unjoined);
-          }
+      None if asker == Asker::Adoption => match crate::ledger_read::join_read(state, object) {
+        crate::ledger_read::JoinRead::Joined => {
+          return rebuild_through(state, object, through, asker);
         }
-      }
-      None if object.is_family() => {
+        crate::ledger_read::JoinRead::Reading => {
+          state.count(ADOPTED_UNJOINED_READING, 1);
+          return Ok(Rebuild::Later);
+        }
+        crate::ledger_read::JoinRead::Unjoined(why) => {
+          state.count(ADOPTED_UNJOINED, 1);
+          state.count(why, 1);
+          return Err(Unjoined);
+        }
+      },
+      None => {
         state.count(crate::merge_service::MEMBER_UNKNOWN, 1);
         return Ok(Rebuild::Later);
       }
-      None => {}
     }
   }
   build(
@@ -1614,6 +1612,16 @@ impl ReplicaSeed {
     // applies them.
     if let Err(reason) = crate::merge_service::apply_inputs(&mut step.replica, &bytes, step.version)
     {
+      // A replica owing its push (P2) is kept at the version it reached and its build asked for, as a record's
+      // recomputation keeps and asks for it (`merge_service::build_if_owing`), so the next ask advances it once the
+      // build is made. Dropped instead, a takeover successor's adoption rebuilt it from version 0 each attempt, owing
+      // again, and gave the green up at its bound (A-933: v3_takeover's adoption stall, `merge.replica.owes` once
+      // an attempt).
+      if reason == crate::merge_service::REPLICA_OWES {
+        self.install(state, step.replica);
+        crate::merge_service::build_if_owing(state, self.object, reason);
+        return Err(reason);
+      }
       return self.chain_failed(state, step, reason);
     }
     self.held = Some(gather.manifest);
@@ -2028,6 +2036,26 @@ mod tests {
     object: ObjectId,
     records: &[(AcceptedRecord, u64)],
   ) {
+    accept_lineage_records(state, object, fixture_lineage(object), records);
+  }
+
+  /// The lineage these tests' greens are members of (A-932): the one repository's, `family(1, 1)`, for a green of its
+  /// family as [`family`] mints them; none for any other green. A green standing alone is a family of its own, so a test
+  /// of one names its lineage itself ([`accept_lineage_records`]).
+  fn fixture_lineage(object: ObjectId) -> Option<slates_db::catalog::RepositoryId> {
+    let repository = family(1, 1);
+    (object.family_tag() == repository.family_tag()).then_some(slates_db::catalog::RepositoryId {
+      bytes: repository.0,
+    })
+  }
+
+  /// [`accept_folded_records`], each record naming `lineage` as the green's (A-932).
+  fn accept_lineage_records(
+    state: &mut ShardState,
+    object: ObjectId,
+    lineage: Option<slates_db::catalog::RepositoryId>,
+    records: &[(AcceptedRecord, u64)],
+  ) {
     let owner = HostId(2);
     let mut acceptor = slates_db::register::Acceptor::new(
       HostId(1),
@@ -2054,6 +2082,7 @@ mod tests {
         signature: None,
         folded_below: *folded_below,
         checkpoint_floor: 0,
+        lineage,
       };
       acceptor
         .accept(&Record {
@@ -2436,6 +2465,60 @@ mod tests {
     })
   }
 
+  /// A-932 (main's ruling (a) of 2026-11-27): a restarted holder rebuilds a green standing alone at once, as a record's
+  /// version 0 makes it. Do: give a holder with no replicas the records of a green minted as `CreateGreen` mints one
+  /// standing alone (`verbs::fresh_family_id_at` with no family: a family of its own, A-636 part 2b-2), versions 0 and
+  /// 1, and version 1's increment, with no names-log part naming it, as a warm restart leaves it; ask for it as its next
+  /// records arriving would. Expect it installed at version 1 with the owner's identity and no
+  /// `merge.replica.member_unknown` counted. Red before: `Later` at every ask, the wait counted, for good, since the
+  /// rebuild took the family bit for a repository's member.
+  #[test]
+  fn a932_a_restarted_holder_rebuilds_a_green_standing_alone() {
+    let first = creating("alone-1", b"one", 1, 0);
+    let daemon = one_unit_slices();
+    let (green, one) = crate::daemon::observe_first(&daemon, move |state| {
+      let id = crate::verbs::fresh_family_id_at(state, None, 0).expect("a family id");
+      let green = ObjectId(id.bytes);
+      assert!(
+        green.is_family(),
+        "a green standing alone is a family of its own"
+      );
+      state.merge.memberships_built = true;
+      let mut serial = Green::new();
+      let zero = serial.head_identity();
+      let _ = serial.submit(&first);
+      let one = serial.head_identity();
+      let manifest = hold_encoded(state, green, &first.encode());
+      accept_lineage_records(
+        state,
+        green,
+        None,
+        &[((0, None, zero), 0), ((1, Some(manifest), one), 0)],
+      );
+      (green, one)
+    });
+    let asks = rebuild_asks(&daemon, green, 3);
+    let (identity, unknown) = crate::daemon::observe_first(&daemon, move |state| {
+      let identity = state
+        .merge
+        .replicas
+        .lend_mut(&crate::merge_service::replica_key(green))
+        .map(|mut replica| replica.head_identity());
+      (
+        identity,
+        count_of(state, crate::merge_service::MEMBER_UNKNOWN),
+      )
+    });
+    daemon.stop();
+    assert_eq!(
+      asks.last(),
+      Some(&Rebuild::Installed(1)),
+      "installed within its asks: {asks:?}"
+    );
+    assert_eq!(identity, Some(one), "the owner's identity");
+    assert_eq!(unknown, 0, "no wait counted");
+  }
+
   /// A-908 part 4, §4.16 "Apply on holders": a restarted holder rebuilds a branch by its lineage, as it first made it. Do:
   /// give a holder with no replicas the records of a root (versions 0 and 1) and of a branch made at the root's version 1
   /// (versions 0 and 1), their increments, and the names-log part joining both, as a warm restart leaves it; ask for the
@@ -2526,6 +2609,7 @@ mod tests {
       signature: None,
       folded_below: 0,
       checkpoint_floor: 0,
+      lineage: fixture_lineage(branch),
     };
     Record {
       owner,
@@ -3009,6 +3093,7 @@ mod tests {
       signature: None,
       folded_below: 0,
       checkpoint_floor: 0,
+      lineage: fixture_lineage(object),
     };
     Record {
       owner,

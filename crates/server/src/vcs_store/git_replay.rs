@@ -335,6 +335,11 @@ impl GitReplay {
                 };
                 return Ok(UnitDone::Wants(offset));
               }
+              // A pack the content store holds but not whole, a window of it let go (goal 93 item 2b), with no pieces
+              // read for it: neither the node's store nor the region's homes gave it (`changeset_read_for_rebuild`,
+              // `names_fetched_for_rebuild`), so the replay cannot read it. Unlanded, typed; never a pack cut short,
+              // which it is not (GAPS (d): a holder's replica refused `Truncated` about 8,000 times in one fleet test).
+              None if !content.holds_whole(&identity) => return Err(ReplayRefused::Unlanded),
               None => {
                 return Err(ReplayRefused::Pack(unpack::Refusal::Truncated {
                   at: offset,
