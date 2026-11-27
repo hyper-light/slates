@@ -65041,6 +65041,25 @@ GAPS.
     its own CPU dropping them.
   - merge test `a_retired_branchs_release_hands_what_it_frees_to_its_reaped` replaces 11b's stepped-remains test: the
     steps take more things than the nodes they free, and the lineage keeps exactly the root's nodes.
+  **A commit's node moves walk nothing where no node has a link.** Move's `stage.committing` and `landing.apply` were
+  named one unit (debug, at 0cd0186b7). A probe of each preparation phase's and begin stage's longest call, and of
+  each commit phase's longest unit, read the commit beginning's node moves (`BeginStage::Moves`, `Green::node_moves`)
+  at 7,991 µs in one unit. Nothing else in the preparation or the commit was past 0.39 ms a unit (prep.Sole 389,
+  prep.Alone 357, commit.Set 109).
+  The walk gathers move's 18,000 effects into a removed set, a copied list and the version's links. For each copied
+  pair it looks the source up, records the rename and finds the links that survive it; then the destinations' contents,
+  the left set and a hand-over a home. It found nothing: a node moves only to a link that survives its home, and a
+  Subversion green has none.
+  Now the beginning counts the version's own link effects as its remapping visits each effect. Where that count is
+  zero and the head's link map is empty (its count read with no walk), the Moves stage adds nothing and walks nothing.
+  That is every import (Subversion, git and Mercurial make no hard links) and every version of a green with no link.
+  - Counter: `Green::node_moves_walked`, the effects commits walked for their node moves.
+  - Test `a_commit_walks_no_effect_for_node_moves_where_no_node_has_a_link`: 0 for a rename and a removal on a green no
+    link names, more than 0 for a rename of a linked home, whose links follow it. Red at 3 with the walk unconditional.
+  - Debug, after: move's `stage.committing` is out of its eight longest spans (8.55 ms before). `landing.apply` is
+    still 4.5 ms in move and 4.8 in copy: another unit, named next.
+  - Left: a green with a link anywhere still walks every effect whole in this unit (a volume push with a hard link in
+    its head; GAPS).
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
