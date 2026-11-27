@@ -1903,6 +1903,9 @@ pub(crate) struct SealedPush {
   /// Moves admitted a turn at a time before their append (A-722 part 4c, `git_push`'s judge), each taken by its append
   /// while its green's head is still the one it was admitted from.
   prepared: Vec<Move>,
+  /// The let-go, by its number, an admission's turn last stopped at ([`SealedPush::admission_turn`],
+  /// `slates_git::away`'s one rule): met again with nothing read between, the turn answers its refusal's way.
+  admission_seen: slates_git::away::WaitOnce<u64>,
   /// The names homed in the region at `f + 1` before the record (A-724 piece 8c): their content's identity and count, so
   /// the record is written as version 4 if they are still the names it would write and its pack is homed too; none for
   /// version 2.
@@ -2233,40 +2236,81 @@ impl SealedPush {
     state: &mut ShardState,
     (green, to): (u64, ObjectId),
     (admitting, ns): (&mut Option<slates_git::store::Admitting>, u64),
+    waits: &slates_git::away::Waits,
   ) -> bool {
     let (repository, push, prepared) = (self.repository, &self.push, &mut self.prepared);
     if prepared.iter().any(|admitted| admitted.to() == Some(to)) {
       return true;
     }
-    let turned = lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
-      let (content, store) = stores.git_ref(repository).ok_or(GitRefused::NoStore)?;
-      let mut begun = match admitting.take() {
-        Some(begun) => begun,
-        None => store
-          .repository
-          .admitting(content, push, green, to)
-          .map_err(GitRefused::Store)?,
+    // B3 (main's ruling of 2026-11-26: a ready answered over a swallowed refusal is a lost error): the turn's reads are
+    // quiet, so a let-go window one meets is the push's own to bring back and never the repository's shared slot's.
+    let (turned, met) = lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+      let Some((content, store)) = stores.git_ref(repository) else {
+        return (Err(GitRefused::NoStore), None);
       };
-      let mut clock = crate::git_push::ShardClock;
-      let quantum = slates_git::store::hook_view::Quantum {
-        clock: &mut clock,
-        ns,
-      };
-      let done = store
-        .repository
-        .admit_turn(content, push, &mut begun, quantum)
-        .map_err(GitRefused::Store)?;
-      if done {
-        if let Some(admitted) = begun.admitted() {
-          prepared.push(admitted);
-        }
-      } else {
-        *admitting = Some(begun);
-      }
-      Ok::<bool, GitRefused>(done)
+      let (turned, met) = store.repository.reading_quietly(|| {
+        admission_unit_turn(
+          content,
+          store,
+          (push, prepared),
+          (green, to),
+          (admitting, ns),
+        )
+      });
+      let number =
+        met.and_then(|waited| content.away_number(&waited.pack, waited.len, waited.offset));
+      (turned, met.map(|waited| (waited, number)))
     });
-    turned.unwrap_or(true)
+    match (turned, met) {
+      (Ok(done), _) => {
+        self.admission_seen.answered();
+        done
+      }
+      // Its read met a let-go window: noted in the push's own slot for its driver to bring back, the turn not ready;
+      // the same let-go met again with nothing read between answers ready, the append's own admission refusing typed.
+      (Err(_), Some((waited, number))) if self.admission_seen.waits(number) => {
+        waits.note(waited);
+        false
+      }
+      (Err(_), _) => true,
+    }
   }
+}
+
+/// One turn of the admission of the move of the green keyed `green` to `to` in `push`, begun where `admitting` holds
+/// none, for `ns` of the shard's clock ([`SealedPush::admission_turn`]): whether it is done, its move kept in
+/// `prepared`.
+fn admission_unit_turn(
+  content: &ContentStore,
+  store: &GitStore,
+  (push, prepared): (&Push, &mut Vec<Move>),
+  (green, to): (u64, ObjectId),
+  (admitting, ns): (&mut Option<slates_git::store::Admitting>, u64),
+) -> Result<bool, GitRefused> {
+  let mut begun = match admitting.take() {
+    Some(begun) => begun,
+    None => store
+      .repository
+      .admitting(content, push, green, to)
+      .map_err(GitRefused::Store)?,
+  };
+  let mut clock = crate::git_push::ShardClock;
+  let quantum = slates_git::store::hook_view::Quantum {
+    clock: &mut clock,
+    ns,
+  };
+  let done = store
+    .repository
+    .admit_turn(content, push, &mut begun, quantum)
+    .map_err(GitRefused::Store)?;
+  if done {
+    if let Some(admitted) = begun.admitted() {
+      prepared.push(admitted);
+    }
+  } else {
+    *admitting = Some(begun);
+  }
+  Ok(done)
 }
 
 impl GitPush {
@@ -2515,6 +2559,7 @@ impl SealingPush {
         keyed: Vec::new(),
         objects: self.push.record,
         prepared: Vec::new(),
+        admission_seen: slates_git::away::WaitOnce::default(),
         named: None,
         packed: None,
         landed: 0,

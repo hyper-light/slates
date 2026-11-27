@@ -2186,10 +2186,12 @@ impl Judge for ServerJudge<'_> {
       born(state, (repository, &command.name), store).unwrap_or_else(|| unheld_key(repository))
     };
     let began = slates_rt::futures::now_ns();
-    self
-      .push
-      .admission_turn(self.state, (green, command.new), (self.admitting, ns))
-      && self.build_turn(command, pushed, began)
+    self.push.admission_turn(
+      self.state,
+      (green, command.new),
+      (self.admitting, ns),
+      self.waits,
+    ) && self.build_turn(command, pushed, began)
       && self.room_turn()
   }
 
