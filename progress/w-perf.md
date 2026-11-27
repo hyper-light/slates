@@ -848,3 +848,10 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     Red: 16 steps 11 asks at its derived bound before (9,995 at 10,000), 12 steps one ask now. Bug record in the commit.
   - Waiting on main: its 57k runs on the tip (base_store_reads moving, no hang); the ContentStore::windows siblings'
     ruling; then the image cut cadence, rule (ii).
+- 2026-11-27 06:04  (20d344f83's commit time; written 2026-11-27 06:10 PST):
+  - LANDED 20d344f83: 41bc4bbf0 (Windows give-back red: the content slice laid in whole pages, LAYOUT_VERSION 21, a
+    dead memory's top end on a page inside it; the give-back test asserts the platform layout's whole pages, 32,768
+    of 32,768) and 11168fab3 (ContentStore::windows yields a typed miss; every reader refuses or answers none; reds at
+    the store, blame and git's tree). Owners noted (74b30917a). GAPS calls the 57k hang fixed (main's 6 of 6).
+  - Next: A-930's byte rule (main's ruling (ii): a byte rule for cuts nobody waits on, a cut a ticket asks for, one at
+    idle). Waiting on main: the Windows lanes on this tip.
