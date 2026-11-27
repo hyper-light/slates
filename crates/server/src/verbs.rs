@@ -21231,18 +21231,22 @@ impl GreenReplay {
   }
 }
 
+/// A green's replay through its chain, where it stands: the next entry's index, the entry being read, the entry's lending
+/// and its replay plan ([`replay_chain_entry`]).
+type ReplayProgress<'a> = (
+  &'a mut usize,
+  &'a mut Option<Box<slates_merge::chain_entry::ChainEntry>>,
+  &'a mut Option<Box<Lending>>,
+  &'a mut Option<Box<ReplayPlan>>,
+);
+
 /// Applies green `id`'s next chain entry as its own version (A-257), keeping the version's merge record as its owner enqueued
 /// it, with the head identity the green has at that version; true once no entry is left.
 fn replay_chain_entry(
   state: &ShardState,
   (id, green): (DbVolumeId, &mut slates_merge::engine::Green),
   (held, head_check): (u64, Option<(u64, [u8; 32])>),
-  (next, reading, lending, planning): (
-    &mut usize,
-    &mut Option<Box<slates_merge::chain_entry::ChainEntry>>,
-    &mut Option<Box<Lending>>,
-    &mut Option<Box<ReplayPlan>>,
-  ),
+  (next, reading, lending, planning): ReplayProgress<'_>,
   (applying, apply_steps): (&mut Option<Box<slates_merge::engine::Applying>>, &mut u64),
   replayed: &mut Vec<crate::merge_service::ReplayedVersion>,
 ) -> Result<bool, crate::merge_service::GreenFence> {
