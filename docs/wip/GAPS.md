@@ -270,6 +270,17 @@
 > warm between the branch's versions, c refusing a's records, the branch's next push lands on a and b; red with part 4's
 > rebuild reverted in a scratch copy (`unable to commit`, b's `merge.recompute_mismatch` 1). Gate 16 (`v3_takeover` at
 > b7e65cc63, part 4 in) held: 40 of 40, release and debug.
+> **OPEN (w-interop, 2026-11-27; main's ruling of 07:08; found by reading the code, nothing run yet): a lone green
+> later adopted as a repository's root keeps a standalone replica on its holders, so a branch of it may never reach a
+> holder.** A green created alone is a family root of its own (A-636 part 2b-2), and its version 0 shipped while it
+> stood alone, so each holder made it a replica of no lineage. A repository that adopts it as its root moves the
+> owner's engine into the new lineage (`repository::install_root` with `adopted`) and enqueues no new version 0, so no
+> holder founds the lineage. A later branch's version 0 then meets `Greens::branch` refused `Stale` on each holder (the
+> source is no lineage member there), counted `merge.replica.branch_source_behind` and retried without end (CLAUDE.md
+> §2 item 8). The rebuild after a restart founds it by its join (`merge_origin::rebuild_through`), so only a holder that
+> made the replica before the join is affected. Owed (w-interop, after the lone-green record fix lands): a red test that
+> adopts a lone green as a root, branches it and requires the branch to reach a holder; the fix if it is red, else why
+> it holds and this closed.
 > **FIXED (A-912, w-shared, 2026-11-24; main 01a20182's rulings): a push made right after a member died was refused
 > `retry` for a second or more.** A home behind its sender held the put for its install, which needed the council's next
 > append on the very record session the put held, and the coordinator awaited its healer inline; and a home that died
