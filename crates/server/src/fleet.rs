@@ -14356,7 +14356,9 @@ mod state_log_tests {
       log: StateLog::Names,
       from,
       to,
-      identity: [u8::try_from(to).unwrap(); 32],
+      identity: slates_db::catalog::OperationIdentity {
+        digest: [u8::try_from(to).unwrap(); 32],
+      },
       spans: vec![LogSpan { log, from, to }],
       changes: (from..to)
         .map(|position| LoggedChange::Named {
@@ -14582,7 +14584,9 @@ mod state_log_tests {
         log: StateLog::Names,
         from,
         to,
-        identity: [u8::try_from(to).unwrap_or(u8::MAX); 32],
+        identity: slates_db::catalog::OperationIdentity {
+          digest: [u8::try_from(to).unwrap_or(u8::MAX); 32],
+        },
         spans: std::iter::once(LogSpan {
           log: names,
           from,

@@ -640,7 +640,7 @@ fn files_at(index: &Index, path: &str, revision: u64, out: &mut Vec<FileText>) {
 }
 
 /// A walk of the files a path holds in a revision, a node a unit (A-920 9a: a copied or deleted tree's 9,000 files
-/// walked in one unit of a staging step, 21-31 ms, debug): [`files_at`]'s and [`file_at`]'s, resumable between units.
+/// walked in one unit of a staging step, 21-31 ms, debug): [`files_at`]'s, and a single file's, resumable between units.
 #[derive(Debug)]
 pub(crate) struct FilesWalk {
   /// The revision it reads.
@@ -661,7 +661,7 @@ impl FilesWalk {
     }
   }
 
-  /// The walk of the file at `path` in `revision` alone ([`file_at`]): a directory there adds nothing.
+  /// The walk of the file at `path` in `revision` alone: a directory there adds nothing.
   pub(crate) fn file(path: &str, revision: u64) -> FilesWalk {
     FilesWalk {
       revision,
@@ -708,12 +708,6 @@ impl FilesWalk {
       });
     }
   }
-}
-
-/// The file at `path` in `revision` with its text, appended to `out`; a directory (whose property change changes no
-/// file beneath it), an empty file or a path the index cannot read adds nothing. [`FilesWalk::file`] run.
-fn file_at(index: &Index, path: &str, revision: u64, out: &mut Vec<FileText>) {
-  FilesWalk::file(path, revision).run(index, out);
 }
 
 /// A Subversion path's place in the green: without its leading `/`.

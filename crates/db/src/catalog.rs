@@ -2272,6 +2272,20 @@ pub enum LoggedChange {
 /// part 2b): what one operation moved of the log, from the position it found the log at to the one it left it at, with
 /// that operation's changes of the log in order. Its log's register holds it at position `to` (`LogName::register`),
 /// one register a log, so each log ships to its holders on its own. An operation that moves several logs makes one
+/// An operation's identity in the state-log records it made (A-636 part 2b; A-920 13c): BLAKE3 over the encoding of every
+/// span it moved, then over its own encoding with each chain entry it carries standing in as that entry's own trailing
+/// 32-byte digest (`crate::repository::identity_encoding`), never the entry's bytes: an import's revision of 9,000 paths
+/// carried a 431 KB entry, hashed whole in its landing's one step (4.9 ms, debug), so what the identity hashed grew with
+/// the revision's width. An entry's digest is its bytes' (chain entry format 6): its bytes are verified against it where
+/// they are read back (the log record's CRC32C at a replay, the chain entry's own check at its decode). Its own type, so
+/// the schema of every record and message that carries one names it, and no identity of the definition before (the
+/// entry's bytes hashed) is read beside one of this.
+#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OperationIdentity {
+  /// The BLAKE3 digest.
+  pub digest: [u8; 32],
+}
+
 /// record on each, all carrying the operation's identity and every span it moved, its greens' included, so a takeover
 /// can keep or drop the operation whole (A-642: a cut holds all of a record or none of it; A-636 part 1's rule).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
@@ -2284,9 +2298,9 @@ pub struct StateLogRecord {
   pub from: u64,
   /// The position it left the log at: where the log's register holds it.
   pub to: u64,
-  /// The operation's identity: BLAKE3 over its spans and its own encoding, so two operations that moved the same
-  /// positions alike are told apart by what they did, and every record of one operation names it alike.
-  pub identity: [u8; 32],
+  /// The operation's identity ([`OperationIdentity`]), so two operations that moved the same positions alike are told
+  /// apart by what they did, and every record of one operation names it alike.
+  pub identity: OperationIdentity,
   /// Every span the operation moved, in log order: each log's, this one's and its greens' included.
   pub spans: Vec<LogSpan>,
   /// The operation's changes of this log, in order: `to - from` of them.

@@ -50,6 +50,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::catalog::OperationIdentity;
 use crate::catalog::{
   AtomicHeld, AtomicRecord, BranchRecord, GreenPosition, LockRecord, LogName, LogSpan,
   LoggedChange, MemberOrigin, MemberRecord, NameChange, PhaseRoot, RegisterRecord, RepositoryId,
@@ -111,6 +112,9 @@ pub struct Repositories {
   /// What the operation being applied moved of its greens' logs (an entry's versions): spans its state logs' records
   /// carry beside their own, so a takeover keeps the whole operation or none of it.
   made_greens: Vec<LogSpan>,
+  /// The bytes the last operation's identity hashed ([`Repositories::seal_made`], A-920 13c): what bounds its cost,
+  /// never the width of a revision its entry records.
+  sealed_bytes: usize,
 }
 
 /// A repository's own state (§4.17.1 shared piece 2; A-603, A-642): its logs of its own, each at its own position,
@@ -1076,7 +1080,7 @@ impl Repositories {
               log,
               from,
               to,
-              identity: [0; 32],
+              identity: OperationIdentity::default(),
               spans: Vec::new(),
               changes,
             });
@@ -1111,7 +1115,7 @@ impl Repositories {
       log: StateLog::Names,
       from,
       to,
-      identity: [0; 32],
+      identity: OperationIdentity::default(),
       spans: Vec::new(),
       changes,
     });
@@ -1125,9 +1129,10 @@ impl Repositories {
   }
 
   /// Stamps the records the operation just applied made with what it moved and who it is (A-636 part 2b): every span
-  /// it moved, its greens' and each state log's, in log order, and its identity, BLAKE3 over those spans' encoding and
-  /// then the operation's own (`operation`, its log encoding), so the records of one operation name it alike and two
-  /// operations that moved the same positions alike are told apart by what they did. Nothing to stamp, nothing done.
+  /// it moved, its greens' and each state log's, in log order, and its identity ([`OperationIdentity`]), BLAKE3 over
+  /// those spans' encoding and then `operation`, the operation's identity encoding ([`identity_encoding`]), so the
+  /// records of one operation name it alike and two operations that moved the same positions alike are told apart by
+  /// what they did. Nothing to stamp, nothing done.
   pub fn seal_made(&mut self, operation: impl FnOnce() -> Vec<u8>) {
     if self.made.is_empty() {
       self.made_greens.clear();
@@ -1141,13 +1146,23 @@ impl Repositories {
     }));
     spans.sort_by_key(|span| span.log);
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&slates_wire::Wire::to_bytes(&spans));
-    hasher.update(&operation());
-    let identity = *hasher.finalize().as_bytes();
+    let spans_bytes = slates_wire::Wire::to_bytes(&spans);
+    let operation = operation();
+    self.sealed_bytes = spans_bytes.len().saturating_add(operation.len());
+    hasher.update(&spans_bytes);
+    hasher.update(&operation);
+    let identity = OperationIdentity {
+      digest: *hasher.finalize().as_bytes(),
+    };
     for record in &mut self.made {
       record.identity = identity;
       record.spans.clone_from(&spans);
     }
+  }
+
+  /// The bytes the last operation's identity hashed ([`Repositories::seal_made`]).
+  pub fn sealed_bytes(&self) -> usize {
+    self.sealed_bytes
   }
 
   /// Hands on the records the operation last applied made, stamped ([`Repositories::seal_made`]), leaving none.
@@ -1523,7 +1538,7 @@ impl Repositories {
 pub fn whole_parts(
   parts: Vec<StateLogRecord>,
   head: impl Fn(VolumeId) -> u64,
-) -> (Vec<StateLogRecord>, Vec<[u8; 32]>) {
+) -> (Vec<StateLogRecord>, Vec<OperationIdentity>) {
   let mut logs = contiguous(parts);
   let mut dropped = Vec::new();
   while let Some(identity) = first_not_whole(&logs, &head) {
@@ -1566,7 +1581,7 @@ fn contiguous(mut parts: Vec<StateLogRecord>) -> BTreeMap<StateLog, Vec<StateLog
 fn first_not_whole(
   logs: &BTreeMap<StateLog, Vec<StateLogRecord>>,
   head: &impl Fn(VolumeId) -> u64,
-) -> Option<[u8; 32]> {
+) -> Option<OperationIdentity> {
   logs
     .values()
     .flatten()
@@ -2866,7 +2881,9 @@ mod tests {
       log,
       from,
       to,
-      identity: [identity; 32],
+      identity: OperationIdentity {
+        digest: [identity; 32],
+      },
       spans,
       changes,
     }
@@ -2959,13 +2976,13 @@ mod tests {
       let (kept, dropped) = whole_parts(taken_over_parts(repo, root), |_| head);
       let kept: Vec<(StateLog, u8)> = kept
         .iter()
-        .map(|part| (part.log, part.identity[0]))
+        .map(|part| (part.log, part.identity.digest[0]))
         .collect();
       (
         kept,
         dropped
           .iter()
-          .map(|identity| identity[0])
+          .map(|identity| identity.digest[0])
           .collect::<Vec<u8>>(),
       )
     };
@@ -3076,4 +3093,40 @@ mod tests {
       .to_vec();
     assert_eq!(positions, vec![Some(2), Some(0), Some(1)]);
   }
+}
+
+/// An operation's identity encoding ([`OperationIdentity`], A-920 13c): its own encoding, but for a repository entry's
+/// versions, each chain entry standing in as its own trailing 32-byte digest (chain entry format 6's, its bytes'), an
+/// entry too short to carry one standing in whole. What the operation's identity hashes, bounded by its versions' count,
+/// never by what each entry records.
+pub fn identity_encoding(op: &crate::op::Op) -> Vec<u8> {
+  /// Format: a chain entry's trailing digest's bytes (BLAKE3).
+  const DIGEST_BYTES: usize = 32;
+  let crate::op::Op::RepositoryAdvanced { entry } = op else {
+    return slates_wire::Wire::to_bytes(op);
+  };
+  let versions = entry
+    .versions
+    .iter()
+    .map(|version| crate::catalog::GreenVersion {
+      green: version.green,
+      version: version.version,
+      entry: version
+        .entry
+        .get(version.entry.len().saturating_sub(DIGEST_BYTES)..)
+        .unwrap_or_default()
+        .to_vec(),
+    })
+    .collect();
+  slates_wire::Wire::to_bytes(&crate::op::Op::RepositoryAdvanced {
+    entry: crate::catalog::RepositoryEntry {
+      repository: entry.repository,
+      checks: entry.checks.clone(),
+      joined: entry.joined.clone(),
+      versions,
+      names: entry.names.clone(),
+      state: entry.state.clone(),
+      objects: entry.objects.clone(),
+    },
+  })
 }
