@@ -2206,7 +2206,7 @@ fn tag_window(pack: &[u8], window: usize, tag: &ObjectId) -> slates_vcs::Content
     .enumerate()
     .filter(|(_, magic)| *magic == b"tag ")
     .map(|(at, _)| at)
-    .last()
+    .next_back()
     .expect("the tag's bytes");
   let index = found / window;
   slates_vcs::ContentId::of(pack.chunks(window).nth(index).expect("its window"))
