@@ -3088,3 +3088,222 @@ fn a_whole_records_replay_wanting_a_base_let_go_is_refused_as_production_refuses
   );
   fork.release(&mut store).unwrap();
 }
+
+/// Shape: the changesets of the landing-cadence push's line, each adding a file, so its later manifests pass a window
+/// ([`WINDOW`]) and are taken over several steps.
+const LINE: usize = 80;
+/// Shape: the steps a push of [`LINE`] changesets may take before the harness calls it a livelock: far past what it
+/// takes (a few steps a revision).
+const LINE_STEPS: u64 = 200_000;
+
+/// A line of `count` changesets over `repository`'s tip, each over the one before and adding a file of its own, every
+/// manifest a client's delta: the line's revisions, with the repository's tip manifest they rest on.
+fn a_line_over(
+  repository: &mut HgIndex,
+  store: &mut ContentStore,
+  count: usize,
+) -> crate::push::verify::Verified {
+  let authored = crate::push::made::Authored {
+    user: b"Client <c@example.com>",
+    seconds: 1,
+    branch: b"default",
+    message: b"a line",
+  };
+  let len = repository.len(store, Log::Changelog);
+  let mut parent = repository.changeset(store, len - 1).unwrap().node;
+  let mut on: Option<HgIndex> = None;
+  let mut line: Vec<crate::push::verify::Verified> = Vec::new();
+  for at in 0..count {
+    let path = format!("files/a-file-of-the-line-number-{at:04}.txt").into_bytes();
+    let index = on.as_ref().unwrap_or(repository);
+    let made = crate::push::made::made(
+      &crate::push::held::IndexHeld::new(index, store),
+      parent,
+      &[crate::push::made::Change {
+        path: &path,
+        after: Some((&path, crate::manifest::Flag::Regular)),
+        copied_from: None,
+      }],
+      &authored,
+      &mut room(),
+    )
+    .unwrap();
+    let rev = index.len(store, Log::Manifest) - 1;
+    let tip = (
+      index.revision(store, Log::Manifest, rev).unwrap().node,
+      index.revision_text(store, Log::Manifest, rev).unwrap(),
+    );
+    let payload = manifests_as_deltas(&made, (tip.0, &tip.1));
+    let next = match on.as_mut() {
+      Some(previous) => taken_as_sent(previous, store, &payload),
+      None => taken_as_sent(repository, store, &payload),
+    };
+    on = Some(next);
+    parent = made.changesets[0].node;
+    line.push(made);
+  }
+  crate::push::verify::Verified::of(
+    line
+      .iter()
+      .flat_map(|made| made.changesets.clone())
+      .collect(),
+    line
+      .iter()
+      .flat_map(|made| made.manifests.clone())
+      .collect(),
+    line.iter().flat_map(|made| made.files.clone()).collect(),
+  )
+}
+
+/// What [`pushed_landing_every`] counted: the store's asks, the steps, and how the push ended.
+struct Cadenced {
+  /// The asks of a log's text answered from the changeset store.
+  asks: u64,
+  /// The steps taken.
+  steps: u64,
+  /// The push taken whole (with what it intook), refused, or still stepping at [`LINE_STEPS`].
+  outcome: Result<Intaken, String>,
+}
+
+/// A push of a [`LINE`]-changeset line over a repository whose logs' texts were let go once landed, taken as the server
+/// drives it: cut into segments at [`SEGMENT_BYTES`], each step's kept revisions pinned, every ask of a log's text
+/// answered from the changeset store alone; and every `cadence` steps the segments cut so far landed, each let go as a
+/// durable segment's is and its log texts then kept by the changeset store, as between a server's slices.
+fn pushed_landing_every(cadence: u64) -> Cadenced {
+  let mut store = store();
+  let mut empty = HgIndex::new();
+  let (mut repository, _, _) = intake(&stock(), &mut empty, &mut store, &mut room()).unwrap();
+  let line = a_line_over(&mut repository, &mut store, LINE);
+  let rev = repository.len(&store, Log::Manifest) - 1;
+  let tip = (
+    repository
+      .revision(&store, Log::Manifest, rev)
+      .unwrap()
+      .node,
+    repository
+      .revision_text(&store, Log::Manifest, rev)
+      .unwrap(),
+  );
+  let payload = manifests_as_deltas(&line, (tip.0, &tip.1));
+  let mut saved = saved_and_let_go_logs(&repository, &mut store);
+  let texts: Saved = line
+    .changesets
+    .iter()
+    .map(|arrived| {
+      (
+        (super::CHANGELOG_PATH.to_vec(), arrived.node),
+        arrived.text.clone(),
+      )
+    })
+    .chain(line.manifests.iter().map(|arrived| {
+      (
+        (super::MANIFEST_PATH.to_vec(), arrived.node),
+        arrived.text.clone(),
+      )
+    }))
+    .collect();
+  let mut taking = Intake::begin(
+    (crate::push::made::CHANGEGROUP_VERSION, payload.as_slice()),
+    &mut repository,
+    &mut store,
+    &mut room(),
+  )
+  .unwrap()
+  .cutting(SEGMENT_BYTES);
+  let mut counted = crate::push::pins::Counted::default();
+  let mut cut: Vec<PushSegment> = Vec::new();
+  let (mut asks, mut steps) = (0_u64, 0_u64);
+  let mut admission = room();
+  let outcome = loop {
+    if steps >= LINE_STEPS {
+      break Err(format!("still stepping after {steps} steps"));
+    }
+    let stepped = match taking.step(&payload, &mut store, &mut admission) {
+      Ok(stepped) => stepped,
+      Err(refused) => break Err(format!("refused: {refused:?}")),
+    };
+    steps += 1;
+    counted.count_kept(&mut store, &taking).unwrap();
+    while let Some(segment) = taking.take_segment() {
+      cut.push(segment);
+    }
+    if steps % cadence == 0 {
+      for segment in cut.drain(..) {
+        counted.count_out(&mut store, &segment.contents);
+        for contents in &segment.contents {
+          for identity in contents.identities() {
+            store.let_go_object_landed(identity, &|_| None);
+          }
+          let key = (contents.path.clone(), contents.node);
+          if let Some(text) = texts.get(&key) {
+            saved.insert(key, text.clone());
+          }
+        }
+      }
+    }
+    match stepped {
+      Stepped::Store => match taking.asked_text() {
+        Some(asked) => {
+          asks += 1;
+          taking.answer_text(saved.get(&asked).cloned());
+        }
+        None => taking.answer_from_fork(&store),
+      },
+      stepped if more(&stepped) => {}
+      _ => break Ok(finished(taking).1),
+    }
+  };
+  counted.release(&mut store);
+  Cadenced {
+    asks,
+    steps,
+    outcome,
+  }
+}
+
+/// Main's ruling of 2026-11-27 on w-perf's harness (found hunting the 57k hg push's intake hang): a manifest's base
+/// asked of the store over its chain's let-go link was refused `UnknownDeltaBase` when a segment landed between the ask
+/// and its use and let go a row above the link. A transient refused as final. Do: push a [`LINE`]-changeset line over a
+/// repository whose logs were let go once landed, as the server drives it ([`pushed_landing_every`]), landing the
+/// segments cut every 2, 3, 5, 8 and 16 steps. Expect at every cadence the push taken whole within [`LINE_STEPS`]
+/// steps; the store asked at most twice a log revision; and across them, a base asked again over a row let go since its
+/// ask (the counter moves). Red before: refused `UnknownDeltaBase { log: Manifests }` landing every 2 steps, after 3
+/// asks and 96 steps (and, at a 120-changeset line, at every cadence from 2 to 16, within 148 to 528 steps); now every
+/// cadence taken in 728 to 773 steps, 79 to 119 asks, 6 to 41 of them asked again.
+#[test]
+fn a_pushs_logs_taken_while_its_segments_land_ask_the_store_a_bounded_number_of_times() {
+  let mut reasked = 0;
+  for cadence in [2_u64, 3, 5, 8, 16] {
+    let pushed = pushed_landing_every(cadence);
+    let taken = pushed.outcome.as_ref().map_or((0, 0), |intaken| {
+      (intaken.log_texts_asked, intaken.log_texts_reasked)
+    });
+    println!(
+      "landing every {cadence} steps: {} asks, {} steps, {} log texts asked, {} asked again, {}",
+      pushed.asks,
+      pushed.steps,
+      taken.0,
+      taken.1,
+      pushed
+        .outcome
+        .as_ref()
+        .map_or_else(|why| why.clone(), |_| "taken".to_owned())
+    );
+    assert!(
+      pushed.outcome.is_ok(),
+      "landing every {cadence} steps: {:?}",
+      pushed.outcome.err()
+    );
+    assert!(
+      pushed.asks <= 4 * LINE as u64,
+      "landing every {cadence} steps: {} asks of the store for {} log revisions",
+      pushed.asks,
+      2 * LINE
+    );
+    reasked += taken.1;
+  }
+  assert!(
+    reasked > 0,
+    "a base asked again over a row let go since its ask"
+  );
+}
