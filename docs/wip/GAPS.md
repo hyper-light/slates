@@ -382,6 +382,13 @@
 >     which no longer waits on them. Red first, both: the peers re-keyed a within its 1 s detection (22 to 197 ms,
 >     against 4.4 to 7.6 s), and no peer condemned a while a silent one held its edges (3 of 3 red before). The
 >     adoption guard is gone, and A919's owner-restart test runs again (6 of 6 with the owed-part scene).
+>   - **FIXED, v3_takeover's adoption stall (A-933, w-shared, 2026-11-27):** about 1 run in 80 on Linux CI, a
+>     successor gave a taken-over green up "waiting on its adoption". Its rebuild could reach neither the record
+>     adoption (A-364: it checked the adopted record alone, so a successor short of version 0 never became
+>     `RecordsShort`) nor its owed push's build (a chain refused `REPLICA_OWES` dropped the replica and began again
+>     from version 0). Both are reached now. Red first: a successor holding none of the green's records gave it up after
+>     37 attempts; it adopts it in 7 now, and takes a push. A-918 B's newcomer half stays open below. **Owed (main):**
+>     gate 24.
 >   - **KNOWN LIMIT (main 01a20182's ruling of 2026-11-27): a forward's first try may go to a readmitted creator.**
 >     A readmission drops the host's completed takeover (`RegionalConfiguration::admit`, A-309) and its retirement is
 >     gone once that completes, so A-921 part 2's creator skip has nothing to read for it: a node that has not yet

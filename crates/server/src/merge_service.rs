@@ -5636,11 +5636,7 @@ fn recompute(
     if let Err(reason) = applied {
       // Given back as it was: a later record or an adoption meets it again.
       state.merge.replicas.put_back_any(&key, replica);
-      // A replica owing its push is made from the repository's objects on this node, and the record judged once it is
-      // (A-813's limit, `crate::replica_build`).
-      if reason == REPLICA_OWES {
-        crate::replica_build::wanted(state, object);
-      }
+      build_if_owing(state, object, reason);
       return Err(reason);
     }
   }
@@ -5756,6 +5752,23 @@ pub(crate) const MEMBER_UNKNOWN: &str = "merge.replica.member_unknown";
 /// Counter: a record of a version after an owed one met a replica that still owes it (P2): refused, counted, the record
 /// left for a later attempt (GAPS A-812, a holder's replica is not made from its tool's objects yet).
 pub(crate) const REPLICA_OWES: &str = "merge.replica.owes";
+
+/// What a replica of `object` refused [`REPLICA_OWES`] is owed: made from the repository's objects on this node (A-813's
+/// limit, `crate::replica_build::wanted`), so the version after its owed push is judged once it is. Both doors that apply
+/// a version's inputs to a replica call it, each having kept the replica at the version it reached: a record's
+/// recomputation, and a rebuild's chain (`merge_origin::ReplicaSeed`, a takeover's adoption among its askers, A-933).
+/// Whether `reason` was that refusal.
+pub(crate) fn build_if_owing(
+  state: &mut ShardState,
+  object: ObjectId,
+  reason: &'static str,
+) -> bool {
+  let owes = reason == REPLICA_OWES;
+  if owes {
+    crate::replica_build::wanted(state, object);
+  }
+  owes
+}
 
 /// Applies a version's inputs to a holder's `replica` as exactly `version` (§4.16 "Apply on holders"): an increment
 /// judged afresh and accepted as that version; or a deferred push's record (P2, `DeferredPush`), the replica then owing

@@ -1614,6 +1614,16 @@ impl ReplicaSeed {
     // applies them.
     if let Err(reason) = crate::merge_service::apply_inputs(&mut step.replica, &bytes, step.version)
     {
+      // A replica owing its push (P2) is kept at the version it reached and its build asked for, as a record's
+      // recomputation keeps and asks for it (`merge_service::build_if_owing`), so the next ask advances it once the
+      // build is made. Dropped instead, a takeover successor's adoption rebuilt it from version 0 each attempt, owing
+      // again, and gave the green up at its bound (A-933: v3_takeover's adoption stall, `merge.replica.owes` once
+      // an attempt).
+      if reason == crate::merge_service::REPLICA_OWES {
+        self.install(state, step.replica);
+        crate::merge_service::build_if_owing(state, self.object, reason);
+        return Err(reason);
+      }
       return self.chain_failed(state, step, reason);
     }
     self.held = Some(gather.manifest);
