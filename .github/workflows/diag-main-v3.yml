@@ -1,9 +1,11 @@
 name: diag-main-v3
-# main 01a20182 (2026-11-26 16:35 PST): gate 20 at 20a49642c, after w-hg's A-929 R piece (i) (72b2132ce: every hg
-# push's segments homed at f+1 and landed in pieces, record v12) and the batched, bounded settle (20a49642c: home wire
-# 0x86 adds HomeMessage::Settle, one settle an attempt for git and hg pushes, attempts past the shard's bound refused
-# AttemptsAtBound), and w-git's B1/B1b (92f5189db, 3e98db372). Gate 19 (bd5c1ddf4) passed 80 of 80. Forty release then forty
-# debug runs, stopped after the first three if all three fail; every run's log uploaded. Run only from
+# main 01a20182 (2026-11-26 21:55 PST): gate 21 at 544ea9576, after w-hg's remote barrier (home wire 0x87: puts asked at once
+# and kept unpublished, one Durable a remote home a push answered Published, Kept naming the home shard's place; the
+# place ranking vcs_share::place::first_by_place shared by homes::home_of and a push's intake shard). Gate 20
+# (20a49642c) passed 80 of 80. Job v3: forty release then forty debug runs of v3_takeover, stopped after the first
+# three if all three fail. Job hg_takeover: w-hg's #[ignore]d fleet-takeover flow (crates/cli/tests/hg_takeover.rs,
+# three `slates anchor --fleet` at f = 1 over HTTPS, stock hg 7.2.4 pushing, the owner SIGKILLed with a push in
+# flight), ten release runs, stopped after the first three if all three fail. Every run's log uploaded. Run only from
 # diag-measurer-main-v3-* branches.
 on:
   push:
@@ -14,13 +16,13 @@ env:
 
 jobs:
   v3:
-    name: v3_takeover (gate 20 at 20a49642c)
+    name: v3_takeover (gate 21 at 544ea9576)
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 20a49642c706850ae2e7355c0d04e69851bc30b7
+          ref: 544ea957610cc71fdfa02b0706e6405de5e0c89f
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
@@ -51,7 +53,7 @@ jobs:
             grep -a -A2 'panicked at' "$RUNNER_TEMP/debug-$n.log" | head -4 | cut -c1-300
           done
           fi
-          echo "== gate 20: $pass of $ran passed"
+          echo "== gate 21: $pass of $ran passed"
           for f in "$RUNNER_TEMP"/*.log; do
             echo "-- $(basename "$f"): edge ends $(grep -ac 'ended early\|ends early\|ended the response\|cause' "$f") line(s), Unlanded $(grep -ac 'Unlanded' "$f")"
             grep -a 'Unlanded\|refused after its body\|fell short\|publication for generation\|ticket of generation\|answered a put of\|a region exchange ended with\|install_wait' "$f" | head -8 | cut -c1-400
@@ -61,5 +63,51 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v3-gate20
+          name: v3-gate21
           path: ${{ runner.temp }}/*.log
+
+  hg_takeover:
+    name: hg_takeover (gate 21 at 544ea9576)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 544ea957610cc71fdfa02b0706e6405de5e0c89f
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Stock Mercurial 7.2.4 (a virtualenv)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/hgvenv"
+          "$RUNNER_TEMP/hgvenv/bin/pip" install --disable-pip-version-check --no-input "mercurial==7.2.4"
+          "$RUNNER_TEMP/hgvenv/bin/hg" version -q
+      - name: Build the test, release
+        run: |
+          git log -1 --format='at %h %s' | cut -c1-120
+          cargo test --release --locked -p slates-cli --test hg_takeover --no-run
+      - name: Run it ten times
+        env:
+          SLATES_TEST_HG: ${{ runner.temp }}/hgvenv/bin/hg
+        run: |
+          set +e
+          pass=0; ran=0
+          for n in $(seq 1 10); do
+            timeout 1200 cargo test --release --locked -p slates-cli --test hg_takeover -- --ignored --test-threads=1 --nocapture > "$RUNNER_TEMP/hg-takeover-$n.log" 2>&1
+            rc=$?; ran=$((ran + 1)); [ $rc -eq 0 ] && pass=$((pass + 1))
+            echo "hg_takeover $n rc=$rc $(date -u +%T) load $(cut -d' ' -f1-3 /proc/loadavg): $(grep -a '^test result' "$RUNNER_TEMP/hg-takeover-$n.log" | tail -1)"
+            grep -a -A3 'panicked at' "$RUNNER_TEMP/hg-takeover-$n.log" | head -6 | cut -c1-300
+            grep -a -i -E 'skip' "$RUNNER_TEMP/hg-takeover-$n.log" | head -2 | cut -c1-200
+            if [ $ran -eq 3 ] && [ $pass -eq 0 ]; then echo "the first three runs failed; stopping"; break; fi
+          done
+          echo "== gate 21 hg_takeover: $pass of $ran passed"
+          echo "-- run 1's survivor counts:"
+          grep -a -E 'homes\.|hg_run_fetched|hg_run_unfetched|replica' "$RUNNER_TEMP/hg-takeover-1.log" | head -20 | cut -c1-300
+          exit 0
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hg-takeover-gate21
+          path: ${{ runner.temp }}/hg-takeover-*.log
