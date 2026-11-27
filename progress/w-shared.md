@@ -677,3 +677,17 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - 2dc0a1386: StateLogs' changed set. A part let go before any publication carried it now drops its mark, so f = 0 marks nothing. Red: 4 marks, now 0. This was found while looking at the 57k hg hang, which main cleared of part 3.
 - 269f46e81: the false-death scene now asserts only that the status is served (named_a recorded). GAPS records the readmitted creator as a known limit (admit drops completed, A-309). Part 4's TLC run is owed.
 - Next: A-921's next mode (a survivor adopts a live owner's green with a candidate's death, 3 of 10 scenes), then v3_takeover's adoption stall.
+
+## 2026-11-27 05:08 PST: A-921 part 5 landed (slates 60a07f166; commits 79c12aaec, a69983736)
+- A-921's next mode was two stalls on a's warm restart, each behind its exchange to the candidate the scene had just stopped:
+  - epoch announcements sent to each peer in turn, so the other peers kept a under its old keys;
+  - the member loop awaiting its edges records (A-925) in turn, so a answered no probe for about 1.2 s, then again.
+- Fix: both passes run each member's exchange as an owned child task of the member loop. The loop joins each task once it ends and never waits on it. Bounded one per member, and one per anchor for epochs; a refused spawn runs inline, counted.
+- PlaneState::keyed_process records which process an installed epoch was agreed with.
+- Reds, all red first:
+  - re-key within detection: 4.4 to 7.6 s before, 22 to 197 ms after;
+  - highest anchor re-keyed by its dialers: 54 to 246 ms, never red;
+  - no condemnation while a silent peer holds a's edges: 3 of 3 red before, 4 of 4 green after.
+- Removed: adopted_elsewhere_of and Daemon::holder_owner. A919 is un-ignored; A919 and the owed-part scene ran 6 of 6 green, none re-formed.
+- The route record did not land (main's 03:33 note: counters, not a new interface).
+- Next: v3_takeover's "waiting on its adoption" stall.
