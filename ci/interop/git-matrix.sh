@@ -34,9 +34,15 @@ ROWS=()
 daemon_rss() {
   ps -axo rss=,command= 2>/dev/null | grep -F -- "--instance $INSTANCE daemon" | grep -v grep | awk '{s+=$1} END {print s+0}'
 }
+# RSS_MEASURED: 1 where ps lists resident sizes (it lists this script's own), else 0. Git Bash's ps on Windows lists
+# none, and every row there read 0 MiB (CI run 45644433352), so there each figure is printed `unmeasured`, never 0.
+RSS_MEASURED=0
+ps -axo pid=,rss= 2>/dev/null | awk -v me="$$" '$1 == me && $2 > 0 {found = 1} END {exit !found}' && RSS_MEASURED=1
+# rss_shown KIB: KIB as whole MiB, or `unmeasured` where ps lists no resident sizes.
+rss_shown() { if [ "$RSS_MEASURED" = 1 ]; then echo "$(($1 / 1024))MiB"; else echo unmeasured; fi; }
 # RSS_PERIOD: seconds between a row's samples of the daemon's resident memory (default 1). Each row's peak is printed
 # with it (rss=), and the whole run's after the summary, so a matrix records the memory each phase takes; where ps
-# cannot list the daemon (Git Bash on Windows) every figure reads 0.
+# cannot list the daemon (Git Bash on Windows) every figure reads `unmeasured` and no sampler runs.
 RSS_PERIOD=${RSS_PERIOD:-1}
 RUN_PEAK_KIB=0
 row() {
@@ -45,17 +51,20 @@ row() {
   mkdir -p "$WORK/logs"
   start=$(date +%s)
   daemon_rss >"$peak"
-  ( top=0; while :; do now=$(daemon_rss); [ "$now" -gt "$top" ] && { top=$now; echo "$top" >"$peak"; }
-    sleep "$RSS_PERIOD"; done ) &
-  sampler=$!
+  sampler=""
+  if [ "$RSS_MEASURED" = 1 ]; then
+    ( top=0; while :; do now=$(daemon_rss); [ "$now" -gt "$top" ] && { top=$now; echo "$top" >"$peak"; }
+      sleep "$RSS_PERIOD"; done ) &
+    sampler=$!
+  fi
   perl -e 'alarm shift; exec @ARGV or exit 127' "$STEP_LIMIT" "$@" >"$log" 2>&1
   code=$?
   end=$(date +%s)
-  kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null
+  [ -n "$sampler" ] && { kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null; }
   kib=$(cat "$peak" 2>/dev/null || echo 0)
   [ "$kib" -gt "$RUN_PEAK_KIB" ] && RUN_PEAK_KIB=$kib
-  if [ "$code" -eq 0 ]; then ROWS+=("PASS $name $((end - start))s rss=$((kib / 1024))MiB"); else
-    ROWS+=("FAIL $name $((end - start))s rss=$((kib / 1024))MiB exit=$code: $(tail -3 "$log" | tr '\n' ' ' | cut -c1-300)")
+  if [ "$code" -eq 0 ]; then ROWS+=("PASS $name $((end - start))s rss=$(rss_shown "$kib")"); else
+    ROWS+=("FAIL $name $((end - start))s rss=$(rss_shown "$kib") exit=$code: $(tail -3 "$log" | tr '\n' ' ' | cut -c1-300)")
     FAILED=1
   fi
   echo "${ROWS[${#ROWS[@]}-1]}"
@@ -99,8 +108,13 @@ ssh-keyscan -p "$SSH" -t ed25519 127.0.0.1 >"$WORK/known_hosts" 2>/dev/null
   { echo "the SSH edge's key is not the one the daemon named"; exit 1; }
 URL="http://git:$TOKEN@127.0.0.1:$HTTP/project"
 SSHURL="ssh://git@127.0.0.1:$SSH/project"
-export GIT_SSH_COMMAND="ssh -F /dev/null -i $WORK/key -o IdentitiesOnly=yes -o BatchMode=yes \
-  -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$WORK/known_hosts -o GlobalKnownHostsFile=/dev/null"
+# The key's and known hosts' paths quoted for the shell git runs the command through: pasted bare, a Windows path's
+# backslashes were taken by it (CI run 45644433352, windows-latest: "Identity file D:a_temp/matrix/key not accessible",
+# the four SSH rows refused).
+printf -v SSH_KEY_Q %q "$WORK/key"
+printf -v SSH_HOSTS_Q %q "$WORK/known_hosts"
+export GIT_SSH_COMMAND="ssh -F /dev/null -i $SSH_KEY_Q -o IdentitiesOnly=yes -o BatchMode=yes \
+  -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$SSH_HOSTS_Q -o GlobalKnownHostsFile=/dev/null"
 echo "git $(git --version); source $SOURCE $(git -C "$SOURCE" rev-list --all --count) commits; http $HTTP ssh $SSH"
 
 row push-all git -C "$SOURCE" push "$URL" "${PUSH_REFS[@]}"
@@ -136,6 +150,6 @@ row ssh-push bash -c "cd e && echo ssh >ssh.txt && git add ssh.txt && git commit
 row ssh-fetch git -C a fetch -q "$SSHURL"
 
 echo "---- summary ($(printf '%s\n' "${ROWS[@]}" | grep -c '^PASS') of ${#ROWS[@]} passed)"
-echo "daemon peak RSS over every row: $((RUN_PEAK_KIB / 1024)) MiB"
+echo "daemon peak RSS over every row: $(rss_shown "$RUN_PEAK_KIB")"
 printf '%s\n' "${ROWS[@]}"
 exit $FAILED
