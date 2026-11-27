@@ -64932,6 +64932,22 @@ GAPS.
   longest unit read 3,016 µs of CPU, 3,012 of it system and 5 user: kernel work in the unit, as a free that empties an
   allocator region would be. If release shows the same, the fix is in how memory is given back (the region kept, or
   returned off the shard's step), not in the release's walk (main's ruling).
+  **13b, the held increments published ahead of the register's op.** Named before the change (debug, the add test):
+  the register's op (`landing.record`) was 10.5 ms in one section. The admission took 14 µs. `publish_held_increments`
+  took 5.8 ms: `publish_shard`'s delta carries the content store's changed pieces, chiefly the version's held
+  increment of about 1.2 MB, whole. `record_all` took 4.7 ms, writing the version's chain entry inline (430,978
+  bytes, about 48 a path).
+  Now the landing publishes in a step of its own just before the op (`verbs::publish_held_ahead`), so the op finds
+  nothing unpublished and only records. A-727's order holds: published before recorded. A kill between the two
+  leaves an increment no record names, which a recovery gives back as any unnamed hold. A refused publication ahead
+  leaves the pieces for the op's own publication, which meets and refuses it as before; nothing is remade ahead.
+  - Counter: `repository.svn_commit.published_ahead`, more than zero in `t_c2c`; red at 0 without the step.
+  - After 13b (debug), no wide test's longest poll is the op:
+    - copy's is the publication ahead (`landing.publish`, 8.8 ms), now one whole step of its own;
+    - move's is `landing.apply` (8.5 ms);
+    - add's is `stage.recording` (5.4 ms).
+  - The publication is not yet a piece a step: the delta carries the held pieces whole, so carrying them in turns is
+    owed if release finds the step past the bar. (a), the record naming its chain entry held, is next.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
