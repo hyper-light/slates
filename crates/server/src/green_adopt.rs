@@ -286,9 +286,16 @@ fn at_adopted(state: &mut ShardState, object: ObjectId, identity: [u8; 32]) -> E
 
 /// Takes the green's engine, `object`'s replica, out of this node's replicas, for its owner shard. A replica standing
 /// alone goes as it is. A lineage's member takes its lineage whole (A-908: a successor adopts a repository's family as
-/// one, so every member is being adopted here), once every other member's replica is at its adopted version too; until
-/// then `None`, and the adoption waits as one whose replica is building does. The members that went with it are noted, so
-/// their own adoptions hand [`AdoptedEngine::InLineage`].
+/// one), once every other member of its family still pending adoption here is in the lineage at its adopted version;
+/// until then `None`, and the adoption waits as one whose replica is building does. The members that went with it are
+/// noted, so their own adoptions hand [`AdoptedEngine::InLineage`].
+///
+/// The wait is bounded by the awaited members' own adoptions (A-927 part 2): each is pending, so its attempts count
+/// toward the takeover's bound, it is given up past it and no longer awaited, or it waits on a finite build; a member
+/// whose replica is at its adopted version waits on no other at it. Before, the wait named the lineage's members
+/// instead. A root at its version with its branch not yet in the lineage took the lineage alone; the branch's own
+/// adoption then rebuilt a root of its own, never pending, so never "at its adopted version", and waited for it without
+/// end, no attempt spent (A-927's read test, 2 of 5 runs: 3,977 waits).
 pub(crate) fn take_engine(state: &mut ShardState, object: ObjectId) -> Option<AdoptedEngine> {
   if state.merge.moved_with_lineage.remove(&object) {
     return Some(AdoptedEngine::InLineage);
@@ -305,9 +312,16 @@ pub(crate) fn take_engine(state: &mut ShardState, object: ObjectId) -> Option<Ad
     .map(|member| ObjectId(member.bytes))
     .filter(|member| *member != object)
     .collect();
-  if !others
+  let family = object.line_key();
+  let awaited: Vec<ObjectId> = state
+    .pending_green_materializations
+    .keys()
+    .copied()
+    .filter(|member| *member != object && member.line_key() == family)
+    .collect();
+  if !awaited
     .iter()
-    .all(|member| at_adopted_version(state, *member))
+    .all(|member| in_lineage_at_adopted_version(state, repository, *member))
   {
     state.count(LINEAGE_WAITS_FOR_MEMBERS, 1);
     return None;
@@ -318,9 +332,18 @@ pub(crate) fn take_engine(state: &mut ShardState, object: ObjectId) -> Option<Ad
   Some(AdoptedEngine::Lineage(Box::new(taken)))
 }
 
-/// Whether this node's replica of `member` is at the version and identity its pending adoption names (A-908): a
-/// lineage moves to its successor only once every member is.
-fn at_adopted_version(state: &mut ShardState, member: ObjectId) -> bool {
+/// Whether this node's replica of `member`, pending adoption, is a member of `repository`'s lineage at the version and
+/// identity its pending adoption names (A-908, A-927 part 2): a lineage moves to its successor only once every member of
+/// its family pending here is.
+fn in_lineage_at_adopted_version(
+  state: &mut ShardState,
+  repository: slates_db::catalog::RepositoryId,
+  member: ObjectId,
+) -> bool {
+  let key = crate::merge_service::replica_key(member);
+  if state.merge.replicas.lineage_of(&key) != Some(repository) {
+    return false;
+  }
   let Some(adopted) = state
     .pending_green_materializations
     .get(&member)

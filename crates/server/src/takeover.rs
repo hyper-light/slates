@@ -2467,10 +2467,16 @@ async fn commit_adopted_at(
   // engine is advanced from the version before, never served from a value the ledger no longer holds.
   let replaced =
     replaces && acceptor.value_at(object, record.sequence) == Some(record.value.as_slice());
+  let held = acceptor.value_at(object, record.sequence) == Some(record.value.as_slice());
   state::with_state(|s| {
     s.holder_records.insert(object, acceptor);
     if replaced {
       crate::merge_origin::rewind_past_replaced(s, &record);
+    }
+    // A names-log part held by the adoption: its lineage memberships noted, as a shipped part's are
+    // (`fleet::after_held_record`), so a family green's adoption knows its join (A-927 part 2).
+    if held && matches!(object.class(), RegisterClass::State(_)) {
+      crate::merge_service::note_names_part(s, &record.value);
     }
   });
   Some((dispatch, record, placement))
