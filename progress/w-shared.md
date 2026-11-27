@@ -672,3 +672,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - The red now asserts the push lands: 5 of 5.
 - The owed-part scene forms afresh when a survivor adopts a's green with a candidate's death (3 of 10 scenes). A919 stays ignored for that mode.
 - Next: the false-death test regression (bisect command offered to main), then A-921's next mode, then v3_takeover's adoption stall.
+
+## 2026-11-27: two small landings (slates 901988816)
+- 2dc0a1386: StateLogs' changed set. A part let go before any publication carried it now drops its mark, so f = 0 marks nothing. Red: 4 marks, now 0. This was found while looking at the 57k hg hang, which main cleared of part 3.
+- 269f46e81: the false-death scene now asserts only that the status is served (named_a recorded). GAPS records the readmitted creator as a known limit (admit drops completed, A-309). Part 4's TLC run is owed.
+- Next: A-921's next mode (a survivor adopts a live owner's green with a candidate's death, 3 of 10 scenes), then v3_takeover's adoption stall.
