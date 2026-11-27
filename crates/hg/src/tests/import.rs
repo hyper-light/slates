@@ -1827,8 +1827,8 @@ fn a_pushs_homed_run_reference_is_the_golden_bytes_and_v11_is_no_longer_read() {
 /// Ruling R: a push's segment list, the one homed object its record names (`record::write_segment_list`). Do: write a
 /// list of two segments, read it back; cut it at every length, add a byte, claim a count past its bytes (`u64::MAX` and
 /// one more than it holds), flip its magic and its version; write lists empty, out of order and repeating a sequence.
-/// Expect the golden bytes ("SHGL", version 1, the count, then each segment's sequence, record identity and length,
-/// payload identity and length, each little-endian); the entries read back; every damaged one read as none, nothing
+/// Expect the golden bytes ("SHGL", version 2, the count, then each segment's sequence and its record's, payload's and
+/// texts' identity and length, each little-endian); the entries read back; every damaged one read as none, nothing
 /// allocated for a count its bytes cannot hold; and no list written for none, nor for sequences not ascending.
 #[test]
 fn a_segment_list_is_the_golden_bytes_and_reads_back_whole_or_not_at_all() {
@@ -1837,16 +1837,19 @@ fn a_segment_list_is_the_golden_bytes_and_reads_back_whole_or_not_at_all() {
     sequence,
     record: ([seed; 32], u64::from(seed)),
     payload: ([seed.wrapping_add(1); 32], u64::from(seed) * 1000),
+    texts: ([seed.wrapping_add(2); 32], u64::from(seed) * 7),
   };
   let entries = [entry(3, 1), entry(5, 9)];
   let written = write_segment_list(&entries).unwrap();
-  let mut golden: Vec<u8> = [&b"SHGL"[..], &1u32.to_le_bytes(), &2u64.to_le_bytes()].concat();
+  let mut golden: Vec<u8> = [&b"SHGL"[..], &2u32.to_le_bytes(), &2u64.to_le_bytes()].concat();
   for one in &entries {
     golden.extend_from_slice(&one.sequence.to_le_bytes());
     golden.extend_from_slice(&one.record.0);
     golden.extend_from_slice(&one.record.1.to_le_bytes());
     golden.extend_from_slice(&one.payload.0);
     golden.extend_from_slice(&one.payload.1.to_le_bytes());
+    golden.extend_from_slice(&one.texts.0);
+    golden.extend_from_slice(&one.texts.1.to_le_bytes());
   }
   assert_eq!(written, golden);
   assert_eq!(segment_list_of(&written).as_deref(), Some(&entries[..]));

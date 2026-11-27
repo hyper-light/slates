@@ -659,6 +659,14 @@ impl Store {
           )?);
         }
         SectionKind::Texts => {
+          let identity =
+            identity_of_range(self.log.file(), section.offset, section.len, &mut buffer)?;
+          forgotten = forgotten.saturating_add(payloads::forget(
+            &mut self.rows,
+            &identity,
+            section.offset,
+            &mut self.value,
+          )?);
           let entries = section_texts(self.log.file(), &section, &mut buffer)?;
           let Store { rows, log, .. } = self;
           let mut entries_of = |rows: &mut ShardDb<DeviceFile>, keeper: u64| {

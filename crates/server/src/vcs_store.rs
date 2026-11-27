@@ -4695,6 +4695,114 @@ async fn run_sequences(
   }
 }
 
+/// Counter: a push's segment, or its segment list, read from its region homes by identity and landed on this node's
+/// store at the owner's sequence, verbatim, before a rebuild replays it (ruling R piece (ii): a holder's replica).
+/// Format: a counter name.
+pub(crate) const HG_RUN_FETCHED: &str = "vcs_store.hg_run_fetched";
+/// Counter: one that could not be had: a section no home answered with bytes of its identity, or a landing the store
+/// refused; the rebuild is refused `Unlanded`. Format: a counter name.
+pub(crate) const HG_RUN_UNFETCHED: &str = "vcs_store.hg_run_unfetched";
+
+/// A push's run `homed` (record v12) of repository `id` made whole on this node's store `disk` (ruling R piece (ii),
+/// main 01a20182's ruling of 2026-11-26: the segment homed as it landed): its segment list, and each segment it names,
+/// kept where the store holds it at its sequence by its `Record`'s identity, else each of its three sections read from
+/// their region homes by identity ([`homes::read_in_region`], which takes only bytes of the identity asked) and landed
+/// verbatim at the owner's sequence. So a holder's replica replays the owner's changesets, the same bytes under the same
+/// identities (A-767 item 5). A section at a time is held, one segment's at most. The run's sequences and its last;
+/// none where any of it could not be had, counted. Off a shard (a recovery's replay, which reads its own store), the
+/// region is not asked.
+pub(crate) async fn homed_run_on_store(
+  disk: &slates_store::owner::StoreHandle,
+  id: RepositoryId,
+  homed: slates_hg::import::record::HomedRun,
+) -> Option<(Vec<u64>, u64)> {
+  use slates_store::log::SectionKind;
+  let list = match keyed_bytes(disk, homed.list, homed.len).await {
+    Some(bytes) => bytes,
+    None => {
+      let bytes = fetched(homed.list).await?;
+      landed_verbatim(
+        disk,
+        (id, homed.sequence),
+        vec![(SectionKind::Record, bytes.clone())],
+      )
+      .await?;
+      bytes
+    }
+  };
+  let entries = slates_hg::import::record::segment_list_of(&list)?;
+  let repository = u128::from_be_bytes(id.bytes);
+  for entry in &entries {
+    let held = segment_record(disk, repository, entry.sequence)
+      .await
+      .is_some_and(|record| blake3::hash(&record).as_bytes() == &entry.record.0);
+    if held {
+      continue;
+    }
+    let mut parts = Vec::new();
+    for (kind, (identity, _)) in [
+      (SectionKind::Record, entry.record),
+      (SectionKind::Payload, entry.payload),
+      (SectionKind::Texts, entry.texts),
+    ] {
+      parts.push((kind, fetched(identity).await?));
+    }
+    landed_verbatim(disk, (id, entry.sequence), parts).await?;
+  }
+  Some((
+    entries.iter().map(|entry| entry.sequence).collect(),
+    homed.sequence,
+  ))
+}
+
+/// The object `identity` read from its region homes ([`homes::read_in_region`]) from this shard; none where no home
+/// answered with its bytes, counted [`HG_RUN_UNFETCHED`].
+async fn fetched(identity: [u8; 32]) -> Option<Vec<u8>> {
+  let (origin, shards) = crate::state::with_state(|state| (state.shard, state.shards.clone()))?;
+  let bytes = homes::read_in_region(
+    origin,
+    &shards,
+    slates_vcs::ContentId(identity),
+    crate::fleet::live_budget(),
+  )
+  .await;
+  if bytes.is_none() {
+    crate::state::with_state(|state| state.count(HG_RUN_UNFETCHED, 1));
+  }
+  bytes
+}
+
+/// `parts`, a changeset's sections as its owner landed them, landed on `disk` as repository `id`'s changeset `sequence`
+/// (the owner's), counted [`HG_RUN_FETCHED`]; none where the store refused it, counted [`HG_RUN_UNFETCHED`].
+async fn landed_verbatim(
+  disk: &slates_store::owner::StoreHandle,
+  (id, sequence): (RepositoryId, u64),
+  parts: Vec<slates_store::owner::Part>,
+) -> Option<()> {
+  let header = slates_store::log::Header {
+    tool: slates_store::log::Tool::Mercurial,
+    repository: u128::from_be_bytes(id.bytes),
+    sequence,
+    judged_over: sequence.saturating_sub(1),
+    grant: 0,
+    work: 0,
+    time_ns: slates_rt::futures::now_ns(),
+    sections: 0,
+  };
+  let landed = disk.land(header, parts).await.is_ok();
+  crate::state::with_state(|state| {
+    state.count(
+      if landed {
+        HG_RUN_FETCHED
+      } else {
+        HG_RUN_UNFETCHED
+      },
+      1,
+    );
+  });
+  landed.then_some(())
+}
+
 /// The `len` bytes the node's store `disk` keeps under `identity` (a keyed section: `SectionKind::keyed`), read a piece
 /// at a time and held to their identity before anyone decodes them; none where the store refuses or answers short, the
 /// heap refuses room for them, or they hash to another identity.
@@ -4855,7 +4963,12 @@ async fn rebuild_hg_run(id: RepositoryId, run: HgRun) -> Unit {
     return Unit::Refused(ReplayRefused::Unlanded);
   };
   let repository = u128::from_be_bytes(id.bytes);
-  let Some((sequences, last)) = run_sequences(&disk, run).await else {
+  // A push's run made whole on this node's store first, its segments a holder lacks fetched from their homes.
+  let sequences = match run {
+    HgRun::Push(homed) => homed_run_on_store(&disk, id, homed).await,
+    run => run_sequences(&disk, run).await,
+  };
+  let Some((sequences, last)) = sequences else {
     return Unit::Refused(ReplayRefused::Unlanded);
   };
   for sequence in sequences {

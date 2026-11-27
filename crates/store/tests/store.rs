@@ -429,11 +429,11 @@ fn forgetting_a_duplicate_payload_keeps_the_surviving_changesets_bytes() {
   }
 }
 
-/// Ruling R (main 01a20182's of 2026-11-26: a Mercurial segment's `Record` is homed by its identity and let go at its
-/// home once landed, brought back from the store by that identity, as git's pack is). Do: land a changeset of a
-/// `Record` and a `Payload`; read each back by its identity; restart the store (its rows rebuilt from the log) and read
+/// Ruling R (main 01a20182's of 2026-11-26, and on piece (ii): a Mercurial segment is homed as it landed, each section
+/// by its identity, and let go at its home once landed, brought back from the store by that identity, as git's pack is).
+/// Do: land a changeset of a `Record`, a `Payload` and a `Texts`; read each back by its identity; restart the store (its rows rebuilt from the log) and read
 /// again; forget the changeset. Expect: each section's bytes by its identity, before and after the restart, and none of
-/// either once forgotten. Red before: the `Record` had no lookup by identity (`piece` answered none).
+/// any once forgotten. Red before: the `Record` and the `Texts` had no lookup by identity (`piece` answered none).
 #[test]
 fn a_landed_record_is_read_back_by_its_identity_until_its_changeset_is_forgotten() {
   use slates_store::staging::Staging;
@@ -441,6 +441,7 @@ fn a_landed_record_is_read_back_by_its_identity_until_its_changeset_is_forgotten
 
   let record = b"a segment's rows by node";
   let payload = b"a segment's chunks";
+  let texts = slates_store::texts::encode(&[]);
   let staging = Staging::new(0);
   let dir = scratch("keyed-record");
   let mut store = open(&dir);
@@ -454,11 +455,12 @@ fn a_landed_record_is_read_back_by_its_identity_until_its_changeset_is_forgotten
         grant: 1,
         work: 0,
         time_ns: 0,
-        sections: 2,
+        sections: 3,
       },
       &[
         (SectionKind::Record, Contents::Bytes(record)),
         (SectionKind::Payload, Contents::Bytes(payload)),
+        (SectionKind::Texts, Contents::Bytes(&texts)),
       ],
       &staging,
     )
@@ -471,6 +473,7 @@ fn a_landed_record_is_read_back_by_its_identity_until_its_changeset_is_forgotten
   };
   assert_eq!(read(&mut store, record).as_deref(), Some(&record[..]));
   assert_eq!(read(&mut store, payload).as_deref(), Some(&payload[..]));
+  assert_eq!(read(&mut store, &texts).as_deref(), Some(&texts[..]));
   drop(store);
   let mut store = open(&dir);
   assert_eq!(
@@ -481,6 +484,7 @@ fn a_landed_record_is_read_back_by_its_identity_until_its_changeset_is_forgotten
   assert!(store.forget(3, 1).unwrap() > 0);
   assert_eq!(read(&mut store, record), None, "the record forgotten");
   assert_eq!(read(&mut store, payload), None, "the payload forgotten");
+  assert_eq!(read(&mut store, &texts), None, "the texts forgotten");
 }
 
 /// A-767 C3. Replay two copies and a replacement for one at the same sequence. Forget the
