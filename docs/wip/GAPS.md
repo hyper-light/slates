@@ -725,7 +725,8 @@
 > and since 9a a staging's recording walks a copied or deleted tree a node a unit (debug: 21-31 ms a tree before). Move's
 > build unit (20.2 ms, debug) is a path a unit since 9b. Release probe 13 named the leaders: the landing's fold
 > (move, 3.3 ms p50), its release of the scratch member (copy, 2.7) and `texts_carried` (add, 1.3). The fold is a
-> unit a step since 11a; the release and `texts_carried` are next. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
+> unit a step since 11a, and the release since 11b (the retired member's own maps let go an entry a step, 5.2 ms
+> whole, debug); `texts_carried` is next. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
