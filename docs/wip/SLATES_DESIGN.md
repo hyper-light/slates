@@ -64079,7 +64079,9 @@ owner's acceptor in the control shard's state), the state_log module doc (its ow
     redirected and landed at the adopter. The adopter alone serves the repository, and the node that never held it
     answers not found.
   - Fleet `a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it` and
-    `a921_a_warm_restarted_node_never_names_a_false_death_victim_its_old_volumes_owner`: served forwards, never a.
+    `a921_a_warm_restarted_node_never_names_a_false_death_victim_its_old_volumes_owner` (since 2026-11-27
+    `a921_a_warm_restarted_node_serves_a_false_death_victims_old_volume`, asserting the status served alone; see the
+    amendment below): served forwards, never a.
   - Unit `owner_location::tests::the_direct_route_never_names_a_creator_a_kept_takeover_retired`: red without the skip
     (the creator named).
   - Unit `vcs_http::git::tests::a_request_for_a_moved_repository_is_answered_with_where_it_went`: `307` with its path,
@@ -64093,6 +64095,16 @@ Applied in the same change to: AUD-08's lookup status (§4.8), `crates/server/sr
 daemon}.rs`, `crates/server/src/vcs_http/{git,hg,svn,daemon_edge}.rs`, `crates/server/src/vcs_ssh/{site,svn}.rs`,
 `crates/server/src/vcs_store/homes.rs`, `crates/http/src/reply.rs`, `crates/server/tests/fleet.rs` and
 `crates/server/src/{vcs_http/tests/git,git_push/tests}.rs`, GAPS.
+
+- **Amended 2026-11-27 (main 01a20182's ruling): the creator skip cannot fire after a readmission.** A readmission drops
+  the readmitted host's completed takeover (`RegionalConfiguration::admit`, A-309: an earlier takeover of the id says
+  nothing of the member it names now), and its retirement is gone once that takeover completes, so a readmitted creator
+  is named by neither record the skip reads. Its warm-restart scene named a 3 of 3 on main past 03c736286, a becoming
+  eligible before the restarted node's own routing learned the adopter; it passed at this landing with that order
+  reversed, which is what the scene measured. The scene now asserts the status served, with the direct route's naming
+  and the location round's claims recorded; the skip's case, a retirement kept, stays its unit red's. GAPS records the
+  limit: a forward's first try may go to a readmitted creator, costing a redirect, never a wrong answer. Keeping a fact
+  past A-309's removal to close it is a design change of its own.
 
 ### A-925 — A node announces its own version-control edges to its peers, as a client reaches them (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25; A-921 part 2's prerequisite)
 
@@ -65754,6 +65766,13 @@ Applied in the same change to:
 - **Applied in the same change to:** `crates/vfs/src/{recover,checkpoint_log}.rs` (the versions),
   `crates/server/src/{content_holder,state_log,fleet,verbs,state,daemon}.rs`, `crates/server/src/state_log/tests.rs`,
   `crates/server/tests/fleet.rs`, A-636 part 2b's owed list, GAPS.
+- **Amended 2026-11-27 (main 01a20182's ruling):** a part let go while still marked changed was held after the last
+  committed publication, so none carried it: its mark goes rather than staying for a delta to remove a piece never
+  published (`StateLogs::let_go_held`). At f = 0 every part is held and let go in one take, so nothing is ever marked;
+  before, each kept a key until a publication committed, and each delta carried a removal per part made since the last
+  (found looking at the 57k hg push's hang, of which part 3 is cleared: a push at ca78de951, which contains it,
+  finished). Red first: `state_log::tests::a_part_let_go_before_any_publication_carried_it_leaves_no_change` (4 marks,
+  now 0).
 - **Amended by A-921 part 4** (2026-11-27): (2) is fixed. Its cause was not shipping: the record a warm start
   re-derives differs from the one shipped, which a holder joins now.
 
@@ -65894,8 +65913,8 @@ Applied in the same change to:
   - Units: `register::tests::a_value_the_merge_joins_is_acknowledged_and_another_is_still_refused` and
     `merge_service::tests::a_versions_record_with_other_floors_joins_the_held_one_and_other_content_does_not`.
 - **Models.** `docs/wip/models/FencedLedger.tla` holds one value a position per ballot. Agreement now holds over a
-  record's content, its owner's floors joined. Main's TLC run decides whether the model takes the join as a value
-  class.
+  record's content, its owner's floors joined. **Owed (main):** a TLC run with the join as a value class. Not run yet:
+  this Mac has no `tla2tools.jar`, and kiln does not reach the Studios that have it.
 - **Applied in the same change to:** `crates/db/src/register.rs`,
   `crates/server/src/{merge_service,fleet,replica_build,daemon}.rs`, `crates/server/src/vcs_store/replica.rs`,
   `crates/server/tests/fleet.rs`, A-921 part 3's entry, GAPS.

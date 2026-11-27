@@ -38546,11 +38546,15 @@ fn a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it
 /// four-node anchored fleet, a volume on a, held by two of its peers; cut a off until the survivors take it over, heal it
 /// until every node names a a member again; restart the fourth node (which holds none of the volume) warm, so it comes
 /// back knowing nothing of the volume's owner (its routing is not persisted); ask what its direct route names, then the
-/// volume's status from its client. Expect the direct route never to name a, and the status served, found by the location
-/// round (`fleet.owner_location.claim` moved on the restarted node). Red without the skip: its direct route named a,
-/// readmitted and a member again, the creator of a volume it no longer owns, and the request went there first.
+/// volume's status from its client. Expect the status served. Recorded, not asserted (main 01a20182's ruling of
+/// 2026-11-27): whether the direct route named a, and the location round's claims. A readmission drops a's completed
+/// takeover (`RegionalConfiguration::admit`, A-309), and its retirement is gone once that completes, so the creator skip
+/// has nothing to read: the direct route names a once a is eligible again and before the restarted node's own routing
+/// learns the adopter (3 of 3 runs on main past 03c736286; green at A-921 part 2's landing, its routing first). That
+/// costs a forward a redirect, never a wrong answer (GAPS: a known limit). The skip's own case, a retirement kept, is its
+/// unit red's (`the_direct_route_never_names_a_creator_a_kept_takeover_retired`).
 #[test]
-fn a921_a_warm_restarted_node_never_names_a_false_death_victim_its_old_volumes_owner() {
+fn a921_a_warm_restarted_node_serves_a_false_death_victims_old_volume() {
   let _serial = serialize_fleet_tests();
   let mut fleet = anchored_git_fleet_of("restarted-stranger", &["a", "b", "c", "d"]);
   let mut owner_client = Client::connect(fleet.daemons[0].instance());
@@ -38621,10 +38625,6 @@ fn a921_a_warm_restarted_node_never_names_a_false_death_victim_its_old_volumes_o
   assert!(
     placed && taken && readmitted && restarted,
     "the scene formed"
-  );
-  assert!(
-    !named_a,
-    "the restarted node's direct route never names a: last {tried_first:?}"
   );
   assert!(served, "the volume's status served from the restarted node");
   // Claims are recorded, not asserted: the restarted node's routing, learned again, may name the adopter before a round.
