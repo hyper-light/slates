@@ -728,3 +728,8 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   Extended diag ac1c60ccd on w-interop/hg-landing-diag (the owner's sent stamp against the hand-over's start) is
   running as main's run 46051267769. If the answers are sent before the hand-over: rule (a'), count by the owner's
   stamp. OPEN after it: why Windows cuts a segment every turn while the Mac cuts every other.
+- 2026-11-27 11:11 PST: red 4 landed: eb786dcee, merged 526859d1e (main's ruling (a')). A landing counts as overlapped when its
+  owner sent the answer before the hand-over began (Landed::sent_ns, StoreHandle::land_stamped). The cause: a 4 KiB
+  page makes the segment bound 512 KiB, so every turn cut a segment and no yield saw the answer. The test also runs at
+  4 KiB now. Main's next diag CI confirms on Windows. OPEN: main's call on whether the segment bound needs a change
+  for 4 KiB hosts; the A-932 sibling (a lone green adopted as a root) is my next piece.
