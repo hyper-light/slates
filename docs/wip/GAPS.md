@@ -837,10 +837,10 @@
 > in one free (1.2-1.3 ms of system time in release); since the reaper, what a release frees is dropped on the daemon's
 > reaper thread (25 µs the longest unit, debug), owed probe 18's release read. The shard's handed and in-place counts are
 > read by the tests alone, not yet the status report. Move's `stage.committing` was the commit's node moves, a walk of
-> every effect in one unit (7.99 ms debug), which walks nothing since where no node has a link; a green with a link
-> anywhere still walks every effect whole there, its slicing next by main's ruling. `landing.apply`'s remaining unit
+> every effect in one unit (7.99 ms debug), which walks nothing since where no node has a link, and an effect a unit
+> where one has. `landing.apply`'s remaining unit
 > was its begin's plan of a replay's reads (4.46 ms debug), made since only where a run is unread; a replay's plan and
-> the scan of the runs are still one unit each, owed their slicing. Next: the node moves sliced; then by size
+> the scan of the runs are still one unit each, owed their slicing. Next, by size:
 > `stage.judging` (5.8 ms debug, move), `stage.recording` (5.0-5.3) and `stage.check` (3.8-4.2); the landing's
 > publication (9.3-24.8 ms since today's merges) is A-930's image cut, w-perf's. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
