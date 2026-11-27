@@ -5026,7 +5026,7 @@ async fn start_shard(
   }
   match outcome {
     Ok(sliced) => slates_machine::log_line!(
-      "slates-server: shard {partition} initialized in {took_us} µs, {} µs of its CPU, in {} slices of {} units; the longest slice {} µs, the most CPU in one {} µs, ending at unit {} (a slice's floor {} µs, {} µs yielding)",
+      "slates-server: shard {partition} initialized in {took_us} µs, {} µs of its CPU, in {} slices of {} units; the longest slice {} µs, the most CPU in one {} µs, ending at unit {}, its longest unit {} (a slice's floor {} µs, {} µs yielding)",
       sliced.cpu_ns.map_or_else(
         || "unread".to_owned(),
         |cpu| (cpu / NANOS_PER_MICRO).to_string()
@@ -5036,6 +5036,10 @@ async fn start_shard(
       sliced.longest_ns / NANOS_PER_MICRO,
       sliced.longest_cpu_ns / NANOS_PER_MICRO,
       sliced.longest_cpu_ended_at,
+      sliced.longest_cpu_unit.map_or_else(
+        || "unnamed".to_owned(),
+        |(kind, took)| format!("{kind} of {} µs", took / NANOS_PER_MICRO)
+      ),
       sliced.budget_ns / NANOS_PER_MICRO,
       sliced.yielding_ns / NANOS_PER_MICRO
     ),
@@ -5070,7 +5074,7 @@ async fn hold_start(fault: crate::config::BootFault, slice_ns: u64) {
       let mut slices = crate::recovery_slices::RecoverySlices::begin(slice_ns);
       while started.elapsed() < duration {
         std::hint::spin_loop();
-        slices.unit_done().await;
+        slices.unit_done("a boot fault's hold").await;
       }
       let _report = slices.finish();
     }
@@ -5160,13 +5164,13 @@ async fn replay_catalog(
   slices: &mut crate::recovery_slices::RecoverySlices,
 ) -> Result<(slates_db::Db, slates_db::Recovered, u64), ServerError> {
   let mut recovering = slates_db::replay::Recovering::begin(segment, partition, caps, now)?;
-  slices.unit_done().await;
+  slices.unit_done("the catalog's opening").await;
   let mut most = 0_u64;
   loop {
     let before = recovering.records();
     let done = recovering.step(segment, CATALOG_RECORDS_A_UNIT)?;
     most = most.max(recovering.records().saturating_sub(before));
-    slices.unit_done().await;
+    slices.unit_done("a catalog record").await;
     if done {
       break;
     }
@@ -14714,14 +14718,42 @@ mod tests {
   }
 
   /// What a daemon over a retained segment saw of the oracle's repository: its changesets, the last sequence it counts
-  /// landed, the run its register names last, and the replays refused.
-  type B1Seen = (u32, u64, Option<slates_hg::import::record::Run>, u64);
+  /// landed, the sequences of the segments its register's last run names (record v12's list, read back from the node's
+  /// store), and the replays refused.
+  type B1Seen = (u32, u64, Option<Vec<u64>>, u64);
+
+  /// [`B1Seen`] as the shard sees it, the run named by its homed list (record v12), not yet read back.
+  type B1Look = (u32, u64, Option<slates_hg::import::record::HomedRun>, u64);
+
+  /// The oracle's look at `repository` on `daemon`'s shard ([`b1_seen`]), its run's segment sequences read back from the
+  /// node's store from a task there ([`crate::vcs_store::keyed_bytes`]), as a replay reads them.
+  fn b1_seen_on(daemon: &super::Daemon, look: B1Look) -> B1Seen {
+    let (changesets, landed, homed, refused) = look;
+    let sequences = homed.and_then(|homed| {
+      crate::test_store::run_on_first(
+        daemon,
+        move || async move {
+          let disk = crate::state::with_state(|state| state.vcs_disk.clone()).flatten()?;
+          let list = crate::vcs_store::keyed_bytes(&disk, homed.list, homed.len).await?;
+          let entries = slates_hg::import::record::segment_list_of(&list)?;
+          Some(
+            entries
+              .iter()
+              .map(|entry| entry.sequence)
+              .collect::<Vec<u64>>(),
+          )
+        },
+        std::time::Duration::from_nanos(10 * crate::daemon::LIVENESS_BUDGET_NS),
+      )
+    });
+    (changesets, landed, sequences, refused)
+  }
 
   /// The oracle's look at `repository` on `state`.
   fn b1_seen(
     state: &mut crate::state::ShardState,
     repository: slates_db::catalog::RepositoryId,
-  ) -> B1Seen {
+  ) -> B1Look {
     let changesets = state
       .vcs_stores
       .mercurial_ref(repository)
@@ -14731,7 +14763,7 @@ mod tests {
     let records = state.db.partition().repositories();
     let run = (0..)
       .map_while(|index| records.object_record(repository, index))
-      .filter_map(slates_hg::import::record::run_of)
+      .filter_map(slates_hg::import::record::homed_run_of)
       .last();
     (
       changesets,
@@ -14870,6 +14902,7 @@ mod tests {
         b1_seen(state, repository)
       })
       .unwrap();
+    let before = b1_seen_on(&first, before);
     // The crash: nothing more published.
     first.stop();
     let second = super::Daemon::start(&profile, config, source()).unwrap();
@@ -14885,6 +14918,7 @@ mod tests {
       (done || refused > 0).then(|| b1_seen(state, repository))
     })
     .expect("the successor recovered the repository or refused its replay");
+    let recovered = b1_seen_on(&second, recovered);
     second
       .observe(second.shards.first().copied(), |_| {
         crate::repository::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(B1_SEGMENT_BYTES));
@@ -14902,6 +14936,7 @@ mod tests {
         b1_seen(state, repository)
       })
       .unwrap();
+    let after = b1_seen_on(&second, after);
     second.stop();
     drop(segment);
     (before, recovered, after, outcome, unnamed)
@@ -14911,7 +14946,7 @@ mod tests {
   /// changesets apart from its repository's landing turn; a crash oracle at each segment boundary,
   /// `crates/land/tests/oracle.rs`'s pattern, killed with an unnamed run's rows present). Do: push four changesets of 1.5
   /// KiB files cut at [`B1_SEGMENT_BYTES`] through [`b1_crash`]: once to its answer, then with a crash after each count of
-  /// segments its run lands. Expect, answered: the push accepted, its run named (record v11), and a successor holding its
+  /// segments its run lands. Expect, answered: the push accepted, its run named (record v12's list), and a successor holding its
   /// four changesets with no replay refused (a second push of the same bundle lands nothing new). Each crash: the run's
   /// segments landed, unnamed; a successor holding none of the push's changesets, counting its next sequence from the
   /// creation's, no replay refused; its push again accepted, its four changesets held, and its run beginning at the
@@ -14925,7 +14960,7 @@ mod tests {
       "{outcome:?}"
     );
     let named = before.2.expect("the answered push's run is named");
-    let segments = u64::try_from(named.sequences().count()).unwrap();
+    let segments = u64::try_from(named.len()).unwrap();
     assert!(segments > 1, "the push landed as {segments} segments");
     assert_eq!(
       recovered.0, 4,
@@ -15071,12 +15106,7 @@ mod tests {
   /// held before the crash or after the successor's recovery (nothing unnamed applied), no replay is refused and no
   /// entry names the crashed run; and the push again is held whole, its run beginning at the sequence the answered
   /// push's run `named` began at, the last named plus one, each row there the newest landing's.
-  fn b1_crash_leaves_none_then_whole(
-    bundle: &[u8],
-    crash: u64,
-    segments: u64,
-    named: &slates_hg::import::record::Run,
-  ) {
+  fn b1_crash_leaves_none_then_whole(bundle: &[u8], crash: u64, segments: u64, named: &[u64]) {
     let (before, recovered, after, outcome, unnamed) =
       b1_crash(&format!("b1-crash-{crash}"), bundle, Some(crash));
     println!(

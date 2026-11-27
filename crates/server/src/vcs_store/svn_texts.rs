@@ -273,7 +273,9 @@ pub(crate) async fn bring_back_named(
       state.count(NAMED_BROUGHT_BACK, 1);
       brought.push(identity);
     }
-    slices.unit_done().await;
+    slices
+      .unit_done("a named Subversion text brought back")
+      .await;
   }
   brought
 }
