@@ -10054,13 +10054,29 @@ mod tests {
     }
   }
 
+  /// The git root tree id of `green`'s map head on this shard (`vcs_store::paths::Head::trees`), as its made commit
+  /// names it; none where the store keeps no map for it.
+  fn green_tree_id(
+    state: &crate::state::ShardState,
+    green: slates_client::VolumeId,
+  ) -> Option<slates_git::object_name::ObjectId> {
+    let green = slates_db::catalog::VolumeId { bytes: green.bytes };
+    let repository = crate::vcs_store::paths::git_repository_of(state, green)?;
+    let (content, git) = state.vcs_stores.git_ref(repository)?;
+    let head = git.heads.get(&crate::vcs_store::green_key(green))?;
+    git.trees.as_ref()?.id(content, head.trees).ok()
+  }
+
   /// A-767 C1 step 2b (main's ruling (a) of 2026-11-22 02:52: the image records the windows let go, and restore keeps
   /// them; the recovery oracle's shape, `crates/db/tests/model.rs`). Do: on a daemon over a retained anchor segment and
   /// content object, write `main`'s one file of 1 MiB in a work and submit it; then three times let go a seeded choice of
   /// its still-held windows, publish, stop and start a successor; at the end bring the object back by its bytes. Expect:
   /// each successor's content store whole as its predecessor published it (the same windows let go with the same
-  /// lengths, lists and names), none of the image's pieces refused, at least one window let go in all, and the object
-  /// brought back whole by its identity, the same bytes.
+  /// lengths, lists and names), none of the image's pieces refused, its green's map made again with no step refused and
+  /// its git root tree the predecessor's by id, at least one window let go in all, and the object brought back whole by
+  /// its identity, the same bytes. Red at 11168fab3 (main's bisect of 2026-11-27 11:01): the recovery's remake met the
+  /// file's window let go and was refused (`vcs_paths.refused` 1, no map), and `release_unheld` freed the file's list,
+  /// name and let-go window; before it, the remake hashed the short file and named another tree without a word.
   #[test]
   fn t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes() {
     use slates_anchor::AnchorSegment;
@@ -10122,7 +10138,7 @@ mod tests {
           Some(work)
         });
         let Some(work) = work else {
-          return Vec::new();
+          return (Vec::new(), green);
         };
         // A git green's submit is a client's recorded request (A-896), awaited from a task of the shard: its
         // refinement, made commit and whole build run as the shard's own tasks run them.
@@ -10138,7 +10154,7 @@ mod tests {
           ),
           "{submitted:?}"
         );
-        on_state(|state| {
+        let windows = on_state(|state| {
           let window = state
             .vcs_stores
             .content()
@@ -10147,10 +10163,12 @@ mod tests {
             .chunks(window)
             .map(slates_vcs::ContentId::of)
             .collect::<Vec<_>>()
-        })
+        });
+        (windows, green)
       },
       crate::test_store::HISTORY_PATIENCE,
     );
+    let (windows, green) = windows;
     assert!(windows.len() > 1, "the file past one window");
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     let mut daemon = first;
@@ -10169,7 +10187,7 @@ mod tests {
           // item 2b): turned to its end here, so the store published is the one observed.
           while crate::vcs_store::let_go_turn(state) {}
           let_go_picked(state, &windows, &mut pick);
-          store_whole(state)
+          (store_whole(state), green_tree_id(state, green))
         })
         .unwrap();
       seed = seed.wrapping_add(1);
@@ -10178,7 +10196,7 @@ mod tests {
       daemon = super::Daemon::start(&profile, config.clone(), source()).unwrap();
       let shard = daemon.shards.first().copied();
       let seen = daemon
-        .observe(shard, |state| {
+        .observe(shard, move |state| {
           // The recovery's replay read the landed pack whole and owes its let-go again (`vcs_store::put_changeset`),
           // queued a slice a turn: turned to its end before the store is compared.
           while crate::vcs_store::let_go_turn(state) {}
@@ -10186,13 +10204,25 @@ mod tests {
           (
             store_whole(state),
             count(crate::vcs_store::NODES_UNRESTORED),
+            count(crate::vcs_store::paths::REFUSED),
+            green_tree_id(state, green),
+            (
+              count(crate::vcs_store::paths::REMAKE_BROUGHT_BACK),
+              count(crate::vcs_store::paths::REMAKE_KEPT),
+            ),
           )
         })
         .unwrap();
+      assert!(published.1.is_some(), "the predecessor's green has a map");
+      // Every window let go is the file's, so the remake brought each back to hash it and let each go again.
+      let away = published
+        .0
+        .as_ref()
+        .map_or(0, |(aways, _, _)| u64::try_from(aways.len()).unwrap());
       assert_eq!(
         seen,
-        (published, 0),
-        "the store whole as published, none refused"
+        (published.0, 0, 0, published.1, (away, 0)),
+        "the store whole as published, none refused, the green's map made again to the same tree"
       );
     }
     let blob_back = blob.clone();
