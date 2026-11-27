@@ -15,3 +15,12 @@ Main's runs 1 and 16 (placed Some(1) at v2) are the half I have:
 - run 16: D was behind.
 I've asked main whether to keep reproducing, write a direct red, or hand this to you. Nothing of mine touches your
 files yet.
+
+## 2026-11-27 12:31 PST: runs 2 and 7 are yours, as evidence for (C) (main's ruling of 12:30)
+
+- run 7: ~/.local/state/w-interop-logs/a914-run-7.log. Its DIAG-NODE lines carry every node's merge, ledger_read and
+  takeover counters. The survivor B counted `fleet.ledger_read.past_tolerance` 1, `answered` 12 of `asked` 13, and
+  `positions_held` 2.
+- run 2: ~/.local/state/w-interop-logs/a914-run-2.log (narrower dump). B counted `merge.behind.chain_read` 1 and
+  `merge.record.no_standing` 13.
+I keep the placed Some(1) shape (main's runs 1 and 16) and am reproducing it now.
