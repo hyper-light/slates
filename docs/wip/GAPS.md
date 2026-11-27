@@ -2154,7 +2154,9 @@
 > segments its store lacks from the region verbatim at the owner's sequences
 > (`a_holders_run_lands_the_owners_segments_byte_for_byte_by_identity`). CLOSED the same day: one barrier a home
 > shard on this node (r42's push 89 to 123 s), a crash's holds resolved by the attempt record v13 names, and homes ranked
-> by partition, never by a runtime shard id (A-929). OPEN next: a remote home's barrier, one exchange a home a push. OPEN: (ii)'s rest: the holder's recompute
+> by partition, never by a runtime shard id (A-929). CLOSED the same day: a remote home's barrier, one exchange a home a
+> push (home wire 0x87; `homes::barrier_published`), with the Mercurial fleet-takeover flow `#[ignore]`d with its command
+> (`crates/cli/tests/hg_takeover.rs`), main's to run. OPEN: (ii)'s rest: the holder's recompute
 > accepted with the owner's identity, with svn's holder red and an
 > `#[ignore]`d fleet-takeover CLI test for Mercurial, which no test drives yet; then an import's run (v9) and a single
 > changeset (v7) homed the same way.
