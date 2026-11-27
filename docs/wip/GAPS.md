@@ -762,6 +762,14 @@
 >   and `push_through_awaited` now assert their landing where the push brings an object, which they dropped (`let _ =`),
 >   so this surfaced late as `ContentUnavailable` rather than at the landing (`home_and_land` answers none for a push
 >   with nothing to home too, so they ask it apart).
+> - OPEN (w-git, 2026-11-27, main's ruling of 13:47; after the flip, red first): a clone of a let-go pack holds more
+>   than a turn's windows under load. `vcs_http::daemon_edge::tests::a_clone_of_a_pushed_pack_let_go_is_whole_holding_
+>   at_most_a_turns_windows` failed 2 of 32 runs under 12 burners with B10 and 0 of 24 without (about p 0.5, not B10's:
+>   its instrumented A/B, d16e6fe20, printed no window pinned after the push and no let-go a pin refused in any of 16
+>   runs), at peaks of 10 and 8 of 13 against 3, and once before B10 under TSan at 4. A clone racing the encoding reads
+>   the let-go pack instead of copying the kept parts, and its let-go behind its cursor lags its bring-backs: ten stops,
+>   ten let go behind, ten held at once. The test prints its stops, peak and let-go-behind every run, with the pinned
+>   windows (`mem.gauge.vcs_content.pinned_unlanded`) and refused let-gos.
 > - OPEN (w-git, 2026-11-27, main's note of 09:17; its own item, not B10's): a git push dropped where the shard's state
 >   is not lent to its drop gives back nothing. `ReceivePack`'s `Drop` and `git_push::hooks::dropped` take the state
 >   with `with_state` and, finding none, log "a git push dropped mid-read could not give back its quarantine: the
