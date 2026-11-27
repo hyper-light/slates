@@ -65291,7 +65291,11 @@ measured noise of the 100 figure, not a literal.
     unit test's first green run found it, 77,485 steps of nothing).
   - **Red:** `a_one_page_give_back_takes_the_pages_of_extents_that_end_off_a_page` (daemon unit test): on main, dead
     stale slot (0, 46) and log (0, 73) fell to nothing with 0 bytes given back; with the rule, 16,384 bytes given back
-    and 0 left. `returned_after_idle` in `tests/recovery.rs` is bounded at sixty liveness budgets with a typed failure.
+    and 0 left. The test holds what is asked, on every platform (2026-11-27, main's Windows CI run 45948476737: both
+    native Windows jobs failed its first form, which asserted the bytes the OS took, and Windows' section views took
+    none): the whole pages the give-back asks the OS for, counted `recovery.asked_bytes` (`daemon::RECOVERY_ASKED`), 0
+    on the old rounding on any platform, 16,384 with the rule on the MacBook, all of them taken there.
+    `returned_after_idle` in `tests/recovery.rs` is bounded at sixty liveness budgets with a typed failure.
   - **The boot test's premise:** a fresh daemon's marks say its recovery memory is unwritten, so it has nothing to
     give back, and `a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step` failed typed on main. It now takes the
     memory as written whole first (`Daemon::take_recovery_memory_as_written_whole`), as a daemon over an image before
