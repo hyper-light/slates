@@ -45,8 +45,9 @@
       (`ContentStore::window_holding`), as `ContentStore::holds_whole` judges it.
     - The test runs at the host's page and again at a 4 KiB page; the second run requires at least one named text of
       more than one window, so it can't pass vacuously.
-    - The publish stays. Before it, `image_split` now asks for a cut and encodes it whole, since A-930 part 3's
-      cadence (7acfd685c) defers a cut nobody asks for.
+    - The publish stays. Before it, `image_split` now drives the encoder's cut to its end, so the publication carries
+      every change the shard has made. (A-930 part 3's cadence, 7acfd685c, would have needed an ask here as well; main
+      reverted it in 68e6fe9e3.)
   - **Green on the MacBook (debug):** (0, 3) at the host's page, and (0, 3) with one text of two windows at 4 KiB.
 
 ## 1. The signed-work restart test read the checkpoint's count at once (test; both lanes)

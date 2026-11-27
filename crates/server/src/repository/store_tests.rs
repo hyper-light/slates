@@ -1305,14 +1305,12 @@ fn checkpoint_named_now(daemon: &Daemon, repository: RepositoryId, head: u64) ->
 /// host, so it read as whole, (1, 2) against the recovery's (0, 3), on every such host (diag CI 2's windows-latest, diag
 /// CI 9's TSan lane), and a 16 KiB-page Mac, one 256 KiB window, never saw it.
 ///
-/// The image is made current in the same step: a cut asked for and encoded whole, as a reader that must see the last
-/// change asks (A-930 part 3's cadence defers a cut nobody asks for, `image_pages::Encoder::ask`), then published. A
+/// The image is made current in the same step: the shard's changes taken and its cut encoded whole, then published. A
 /// stop publishes nothing more (§4.8: "the daemon stopped with nothing more published"), so read just before one, it is
 /// what the successor restores. None for no green, no checkpoint, no content store, no journal or a refused publish.
 fn image_split(daemon: &Daemon, repository: RepositoryId) -> Option<(u64, u64, u64)> {
   crate::daemon::observe_first(daemon, move |state| {
     crate::content_holder::image_drain(state);
-    state.image_encoder.ask();
     while !crate::content_holder::image_turn(state).caught_up {}
     crate::verbs::publish_shard(state).ok()?;
     let green = super::svn_commit::green_of(state, repository).ok()?;
