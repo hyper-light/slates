@@ -237,12 +237,27 @@ fn advance(
   }
 }
 
-/// Rebuilds the replica from this node's ledger through `through`. The adopted version's inputs are checked first: a
-/// successor one version behind the quorum holds the adopted record (its adoption committed it here) but not always its
-/// inputs, which a fetch can bring (`fleet::fetch_green_inputs`); every earlier version this node accepted holding its
-/// inputs (A-244), retained while its record names them.
+/// Rebuilds the replica from this node's ledger through `through`. Each version the rebuild reads is checked first: its
+/// record, which the records' adoption brings where it is missing (`Engine::RecordsShort`), then its inputs, which a
+/// fetch brings (`Engine::Unheld`, `fleet::fetch_green_inputs`). A successor one version behind the quorum holds the
+/// adopted record (its adoption committed it here) but not always its inputs; one whose records were refused before the
+/// owner died (its join not yet held, A-918) holds the adopted record alone, and every version before it is adopted.
 fn rebuild(state: &mut ShardState, object: ObjectId, through: u64, identity: [u8; 32]) -> Engine {
-  match crate::merge_origin::ledger_unheld(state, object, (through, through)) {
+  // Every version the rebuild reads, version 0 and from its checkpoint's (or 1) through the adopted one: a shortfall
+  // anywhere below the adopted record is `RecordsShort`, so the records are adopted position by position
+  // (`fleet::adopt_missing_records`, A-364). Checked at the adopted version alone, a successor holding the adopted
+  // record and none before it began the rebuild, which found version 0 unrecorded (`merge.replica.records_short`) and
+  // ended `Later`, the attempt waiting "on its adoption" until the green was given up (A-933).
+  if crate::merge_origin::ledger_value(state, object, 0).is_none() {
+    return Engine::RecordsShort(0);
+  }
+  let from = state
+    .merge
+    .checkpoints
+    .get(&object)
+    .filter(|held| held.at <= through)
+    .map_or(1, |held| held.at);
+  match crate::merge_origin::ledger_unheld(state, object, (from.min(through), through)) {
     Err(version) => return Engine::RecordsShort(version),
     Ok(unheld) if !unheld.is_empty() => return Engine::Unheld(unheld),
     Ok(_) => {}

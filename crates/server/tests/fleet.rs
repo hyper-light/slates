@@ -37714,6 +37714,83 @@ fn git_fleet_with_join_held_from_successor(name: &str) -> (GitFleet, usize) {
   (fleet, successor)
 }
 
+/// A-933, v3_takeover's adoption stall (main 01a20182's finding of 2026-11-26 22:54 and rulings of 2026-11-27 06:37 and
+/// 06:55; GAP-A9-7's record half): a takeover's successor adopting a green whose chain records it does not hold. Do: on a
+/// three-node `f = 1` git fleet whose creation held its names-log parts off the successor-to-be
+/// ([`git_fleet_with_join_held_from_successor`]), so the successor refuses the green's version 0 (`member_unknown`)
+/// and accepts none of its records, push twice (acknowledged at a and the other survivor); lift the hold; kill a. Expect
+/// the successor to take the repository over, adopt the green and take a push, no survivor giving the green up. Red
+/// before: the successor's rebuild found version 0 unrecorded (`merge.replica.records_short` once an attempt) and
+/// began again each period, "waiting on its adoption", until it gave the green up after 37 attempts, and the push was
+/// refused "Remote branch main not found". With the records adopted (`fleet::adopt_missing_records`) but its owed
+/// push's build never asked for, it still gave it up (`merge.replica.owes` 43); with both, adopted in 7 attempts.
+#[test]
+fn a_successor_lacking_a_greens_chain_records_adopts_it_once_the_owner_dies() {
+  let _serial = serialize_fleet_tests();
+  let (mut fleet, successor) = git_fleet_with_join_held_from_successor("chain-short-successor");
+  let repository = fleet.repository;
+  let first = fleet.push(
+    0,
+    ("first.txt", b"main while the successor holds no part\n"),
+  );
+  let second = fleet.push_on_top(0, ("second.txt", b"on top, still held off\n"));
+  fleet.daemons[0].hold_state_log_shipping(false).unwrap();
+  fleet.daemons.remove(0).stop();
+  let successor = successor.saturating_sub(1);
+  let survivors: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let taken = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(
+      fleet.daemons[successor]
+        .repository_takeover(repository)
+        .is_ok_and(|(_, [_, rebuilt, _])| rebuilt >= 1),
+    )
+  });
+  drop(survivors);
+  let after = fleet.push_on_top(successor, ("after.txt", b"pushed to its successor\n"));
+  let given_up: Vec<_> = fleet
+    .daemons
+    .iter()
+    .map(|daemon| move_counter(daemon, "merge.takeover_given_up"))
+    .collect();
+  let short: Vec<_> = fleet
+    .daemons
+    .iter()
+    .map(|daemon| move_counter(daemon, "merge.replica.records_short"))
+    .collect();
+  let merge_counts: Vec<_> = fleet
+    .daemons
+    .iter()
+    .map(|daemon| {
+      daemon.refusals_on_every_shard().map(|counts| {
+        counts
+          .into_iter()
+          .filter(|(name, _)| {
+            name.starts_with("merge.") || name.starts_with("fleet.takeover.ledger")
+          })
+          .collect::<Vec<_>>()
+      })
+    })
+    .collect();
+  eprintln!("chain-short-successor: merge counts {merge_counts:?}");
+  fleet.stop();
+  eprintln!(
+    "chain-short-successor: pushes {first:?} {second:?}; successor node {successor}; taken {taken}; after {after:?}; \
+     given up {given_up:?}; records short {short:?}"
+  );
+  assert!(
+    first.is_ok() && second.is_ok(),
+    "both pushes before the death landed"
+  );
+  assert!(taken, "the successor took the repository over");
+  assert_eq!(after, Ok(()), "the successor took a push");
+  assert!(
+    given_up
+      .iter()
+      .all(|count| count.as_ref().is_ok_and(|count| *count == 0)),
+    "no survivor gave the green up: {given_up:?}"
+  );
+}
+
 /// Whether `a` and `b` are ids of one family (`ObjectId::family`): one creator and one family tag, as a repository and the
 /// root green its creation made are.
 fn same_family(a: [u8; 16], b: [u8; 16]) -> bool {

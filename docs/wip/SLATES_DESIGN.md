@@ -66319,3 +66319,46 @@ Applied in the same change to:
 - **Applied in the same change to:** §4.16 "Apply on holders", A-636 part 2b-2's note on a green made alone, A-908's
   entry, `crates/server/src/{merge_service,merge_origin,daemon,content_retention,state,takeover}.rs`,
   `crates/server/tests/fleet.rs`, GAPS.
+
+### A-933 — A takeover successor's adoption reaches the record adoption and the replica build it needs (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 06:37 and 06:55; v3_takeover's adoption stall; GAP-A9-7's record half, A-364)
+
+- **Why.** About 1 run in 80 of `v3_takeover` on Linux CI, a taken-over green "was not materialized after 35 attempts
+  without progress, ... the last waiting on its adoption", and no survivor served the repository (gates 21 and 22).
+  In both failed runs, and in 5 of 158 passing ones, a holder's replica refused every owed push's build
+  `Object { why: Missing }` from the first push on; none of the other 153 did. A fleet scene that keeps the successor-to-be
+  off the green's records reproduces the give-up deterministically. Its successor holds the adopted record alone. Two
+  mechanisms that exist and are bounded were unreachable from the adoption's rebuild:
+  - **The records.** `green_adopt::rebuild` checked the adopted version's record alone. The rebuild then found version
+    0 unrecorded (`merge.replica.records_short`) and ended `Later`, so the attempt waited "on its adoption", never
+    `Engine::RecordsShort`, the outcome that adopts the missing records position by position
+    (`fleet::adopt_missing_records`, A-364).
+  - **The owed push.** A rebuild's chain whose replica owes its push (P2, `merge_service::REPLICA_OWES`) dropped the
+    replica, so the next attempt rebuilt it from version 0, owing again. A record's recomputation keeps the replica
+    and asks for its build (`replica_build::wanted`, A-813's limit); the rebuild never did.
+- **The rule.**
+  - A successor's rebuild checks every version it reads, version 0 and from its checkpoint's (or 1) through the adopted
+    one. A shortfall anywhere below the adopted record is `RecordsShort(v)`, and A-364 adopts the records; a version
+    whose inputs are unheld is `Unheld`, and they are fetched (`fleet::fetch_green_inputs`).
+  - A rebuild's chain refused `REPLICA_OWES` installs the replica at the version it reached and asks for its build.
+    The record path and the rebuild share that handling (`merge_service::build_if_owing`). The next ask advances the
+    replica once the build is made.
+  - No new mechanism and no new bound: A-364's adoption and the replica build are each bounded already, and the
+    attempts count toward `fleet::takeover_attempts` as before.
+- **Not done here (main's ruling (ii)).** A-918 B, a newcomer reading a green's chain it lacks on `Behind`, stays open
+  in GAPS, to be worked with its own red. Folding A-364 onto `ledger_read` is not ordered.
+- **Tests.** Fleet `a_successor_lacking_a_greens_chain_records_adopts_it_once_the_owner_dies` (red first). Three nodes
+  at `f = 1`; the creation's names-log parts are held off the successor-to-be
+  (`git_fleet_with_join_held_from_successor`), so it refuses the green's version 0 and accepts none of its records;
+  two pushes, the hold lifted, a killed. The successor must take the repository over and take a push, and no survivor
+  may give the green up.
+  - Red on main: given up after 37 attempts, the push refused "Remote branch main not found".
+  - With the records half alone: `merge.replica.owes` 43 and `rebuilt_versions` 43, still given up after 44 attempts.
+  - With both halves: green in 7 attempts (`merge.replica_build.made` 1, `merge.replica.advanced` 1,
+    `merge.takeover.adopted` 1), the push landed. 3 of 3.
+- **CI's mode.** The survivor that gave up in gate 22 counted `merge.takeover_started` 35, `takeover_inputs_fetched` 1
+  and `vcs_store.replica.adopted` 1, and no `records_short`: the owed-push half. `v3_takeover` now prints each
+  survivor's `merge.replica.*` and `merge.takeover_*` before its panic (f9a62af6b), so a gate's failure names its mode.
+  **Owed (main):** gate 24, after this lands.
+- **Applied in the same change to:** `crates/server/src/{green_adopt,merge_origin,merge_service}.rs`,
+  `crates/server/tests/fleet.rs`, GAPS.
+
