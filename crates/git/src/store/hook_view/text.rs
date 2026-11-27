@@ -235,9 +235,16 @@ fn peeled(
     if row.kind != Kind::Tag {
       return Ok((depth > 0).then_some(target));
     }
+    // A tag in a window of a landed pack let go is not yet, named for the view's owner to bring back (B9 of the landed
+    // let-go's lift); any other miss is bytes the store does not hold.
     let bytes = repository
-      .row_bytes(store, &row, content)
-      .ok_or(ViewRefused::Store(StoreRefused::Unreadable { id: target }))?;
+      .read_stored_waited(store, &repository.stored_of(&row, content), row.len)
+      .map_err(|waited| {
+        waited.map_or(
+          ViewRefused::Store(StoreRefused::Unreadable { id: target }),
+          |waited| ViewRefused::NotYet { waited },
+        )
+      })?;
     let mut room = Admission::new(store.room());
     target = Tag::parse(&bytes, &mut room)
       .ok()
