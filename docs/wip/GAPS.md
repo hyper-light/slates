@@ -663,8 +663,22 @@
 >   `git_push::tests::b5_a_pushed_delta_read_over_a_let_go_base_is_not_yet_and_noted_for_the_push` (a push that has read
 >   nothing over the create's let-go pack: `Malformed` before; `NotYet`, the push's slot noted and the shared one empty,
 >   after). Net: `b5_a_verdicts_build_of_a_pushed_delta_over_a_let_go_base_lands`.
-> - OPEN: B6 (a verdict's one-call build), B7 (`push_of`'s peel at judge time, after `prepare`'s), B8 (the encoding's
->   tree walk: time, not correctness).
+> - **B6 CLOSED ON THE SERVER PATH (w-git, 2026-11-27, main's ruling): a verdict's one-call build.** `Verdicts::work`
+>   builds an update's work in one call where no prepared build of its push is left to take, and its `build` answers a
+>   let-go read `NotYet`, which `work_refused` takes for `MISSING_OBJECTS`. The server never reaches it: a create's
+>   verdict builds nothing (a deferred push its green owes, P2) and `Verdicts::prepare` returns at once for one; an
+>   update's verdict takes its base from `version_of` of its old value, which answers only while that is still the
+>   green's head at its current version, the base its preparation began from, and a moved green declines both before any
+>   build; and `receive::atomic_step` judges each command in the step that readied it. Pinned by a counter, not a mode
+>   (CLAUDE.md §2 item 7): `Verdicts::one_call_builds`, counted `git_push.verdict.one_call_builds`, 0 across
+>   `git_push::tests::b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands` and 1 for
+>   `receive::tests::works::an_update_is_its_branchs_next_work_appended_at_the_position_read` over memory, which
+>   prepares nothing.
+> - **B7 CLOSED ON THE SERVER PATH (w-git, 2026-11-27, main's ruling): `push_of`'s peel at judge time.**
+>   `Verdicts::peel_away` peels the new value at the top of every `Verdicts::prepare`, before its done check, waiting on
+>   a let-go window it meets (A-864's tag peel, precondition (a)), and the verdict runs in the same synchronous step as
+>   the `ready` that answered true, so its peel meets what `peel_away` read in that step.
+> - OPEN: B8 (the encoding's tree walk: time, not correctness).
 > **P OPEN (w-git; main's r229, 2026-11-23): git/git's HTTP mirror clone takes about 100 s** (97.9 and 107.7 s, 556 MB
 > against stock git's 612 MB; the work clone 92.9 and 97.2 s), the daemon CPU-bound at 97% of one core: blake3,
 > `Index::get`, `ContentStore::get` / `len_of` / `window_at_in`, `Positions::settle`. No stall; to be profiled.
