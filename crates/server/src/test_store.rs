@@ -154,9 +154,9 @@ pub(crate) fn run_at<T: Send + 'static, F: std::future::Future<Output = T> + 'st
   patience: std::time::Duration,
 ) -> T {
   let (sent, got) = std::sync::mpsc::sync_channel(1);
+  // The history and its sender moved into the task, never cloned on the shard: a clone of a history holding a wide
+  // dump was a poll of its own past 1 ms in 34-36 of 99 release runs (A-920, main's probe 15).
   crate::daemon::observe_at(daemon, partition, move |_state| {
-    let history = history.clone();
-    let sent = sent.clone();
     let task = slates_rt::futures::spawn(async move {
       let _ = sent.send(history().await);
     })

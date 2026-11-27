@@ -750,12 +750,24 @@
 > whole, debug), and `texts_carried` since 11c (a text put and a row a unit, 12.3 ms whole, debug). Next by release
 > size: the register's op (`landing.record`, atomic by main's ruling). The reserve's copy entry room resolves the copy
 > ops alone since 12a (11.5 ms whole, debug); move's other named units are the judge's `finish_resolving` (5.8 ms)
-> and a `decide_some` unit (4.9), the commit's `Prep::Beginning` (7.7-7.9), and the storing's begin (14.0). Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
+> and a `decide_some` unit (4.9) and the commit's `Prep::Beginning` (7.7-7.9). The storing's begin is a text a unit
+> since 13a (release probe 15's leader at about 1.4 ms p50). Next: copy's `landing.release` (1.6 ms) and the register's
+> op. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
 > files): `made_commit.rs` (two calls), `vcs_store/svn_made.rs`, `vcs_store/hg_made.rs`, `greens.rs`'s own caller. A
 > probe of a wide made commit on each VCS would name any past the bar.
+
+> **Open (84a, a restart under load, w-svn for main, 2026-11-26): a shard's start runs pieces of its own past 1 ms.**
+> The start runs in `RecoverySlices`, each slice ending at a named piece, so a piece is one poll whole. Release probe 15
+> put the start's first poll (`daemon.rs:1274`, `spawn_alone(start_shard)`) past 1 ms in 25 copy, 5 add and 4 move runs
+> of 99. That is the daemon's, not the import's: A-920 is judged by the history's own longest poll. The pieces that were
+> a start's longest, across 310 starts of the server set's test daemons (debug, small arenas):
+> - "the content object, its write log and DAX table": 2.6-3.5 ms, in 53 starts;
+> - "the pool's segment and its content regions": 1.3-1.5 ms, in 129;
+> - "the catalog's opening": about 1.45 ms, in 110.
+> Each scales with the shard's arena or records. Owed: their release sizes (main's probe 16), then a piece's slicing.
 
 > **Open (A-920's sweep, w-svn for main, 2026-11-26): four tests whose counts hold only in one load regime.** A test
 > that counts a step's units or turns against the shard's live quantum certifies nothing when the quantum moves. Each

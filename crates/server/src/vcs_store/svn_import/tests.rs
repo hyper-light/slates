@@ -1220,6 +1220,8 @@ struct WideCounts {
   fold_steps: u64,
   /// The steps of the walk of the texts the changeset carries (`svn_commit::CARRIED_STEPS`, 11c).
   carried_steps: u64,
+  /// The steps of the import's texts handed over to the landing (`svn_commit::HAND_OVER_STEPS`, 13a).
+  hand_over_steps: u64,
 }
 
 /// The calling shard's [`WideCounts`] now.
@@ -1240,6 +1242,7 @@ fn wide_counts() -> WideCounts {
     hold_steps: on(|state| count(state, crate::vcs_store::name_holds::NAME_HOLD_APPLY_STEPS)),
     fold_steps: on(|state| count(state, crate::repository::svn_commit::FOLD_STEPS)),
     carried_steps: on(|state| count(state, crate::repository::svn_commit::CARRIED_STEPS)),
+    hand_over_steps: on(|state| count(state, crate::repository::svn_commit::HAND_OVER_STEPS)),
   }
 }
 
@@ -1261,6 +1264,7 @@ fn wide_landing_sliced(counts: &WideCounts) {
     hold_steps,
     fold_steps,
     carried_steps,
+    hand_over_steps,
     ..
   } = counts;
   // Non-vacuity: the landing's unpin of its 9,000 texts and its scratch member's release each ran in slices (A-920 6a:
@@ -1298,6 +1302,12 @@ fn wide_landing_sliced(counts: &WideCounts) {
   assert!(
     *carried_steps > 2,
     "the carried texts' walk took {carried_steps} step(s)"
+  );
+  // The import's 9,000 texts handed over to the landing a text a unit (A-920 13a: whole in the storing's begin, 10.5
+  // ms of one step, debug).
+  assert!(
+    *hand_over_steps > 2,
+    "the texts' hand-over took {hand_over_steps} step(s)"
   );
 }
 
@@ -1380,6 +1390,7 @@ impl<F: std::future::Future> std::future::Future for CpuTimed<F> {
 pub(crate) fn cpu_timed<F: std::future::Future>(history: F) -> CpuTimed<F> {
   TIMED_LONGEST.with(|longest| longest.set((0, 0)));
   TIMED_SPANS.with(|kept| kept.borrow_mut().clear());
+  let _ = super::phase::release_units_taken();
   CpuTimed {
     future: Box::pin(history),
     phase: "untagged",
@@ -1417,6 +1428,8 @@ pub(crate) fn print_phases(name: &str) {
   let longest = TIMED_LONGEST.with(std::cell::Cell::get);
   let spans = TIMED_SPANS.with(|kept| kept.borrow().clone());
   eprintln!("{}", phases_line(name, longest, &spans));
+  let (unit_wall, unit_cpu, units) = super::phase::release_units_taken();
+  eprintln!("RELEASE {name} unit_wall_ns={unit_wall} unit_cpu_ns={unit_cpu} units={units}");
 }
 
 /// The line naming the phases of `name`'s history's longest poll (`wall_ns` and `cpu_ns` long), for a probe's parser:

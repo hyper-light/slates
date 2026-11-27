@@ -1059,6 +1059,31 @@ pub(crate) mod phase {
     });
   }
 
+  std::thread_local! {
+    /// The longest single unit of a landing's release of its scratch member on this thread (A-920, main's order
+    /// after release probe 15): its wall and thread-CPU nanoseconds, and the units timed.
+    static RELEASE_UNITS: std::cell::Cell<(u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0)) };
+  }
+
+  /// One unit of a landing's release took `wall` by the shard's clock and `cpu` of the thread's: kept where it is the
+  /// longest by the wall.
+  pub(crate) fn release_unit(wall: u64, cpu: u64) {
+    RELEASE_UNITS.with(|units| {
+      let (longest, longest_cpu, count) = units.get();
+      let count = count.saturating_add(1);
+      units.set(if wall > longest {
+        (wall, cpu, count)
+      } else {
+        (longest, longest_cpu, count)
+      });
+    });
+  }
+
+  /// The longest unit of a landing's release so far on this thread, its CPU and the units timed; cleared.
+  pub(crate) fn release_units_taken() -> (u64, u64, u64) {
+    RELEASE_UNITS.with(|units| units.replace((0, 0, 0)))
+  }
+
   /// The poll under way ended: its spans in order, and the phase it ended in.
   pub(crate) fn poll_ended() -> (Vec<Span>, &'static str) {
     TAGS.with(|tags| {

@@ -688,10 +688,7 @@ async fn stage_texts(
   slates_rt::futures::yield_now().await;
   let begun = crate::state::with_state(|state| {
     match storing_of(state, repository, (&revision.record.changes, texts.keys())) {
-      Ok(mut storing) => {
-        hand_over(state, repository, revision, imported, &mut storing);
-        Ok(storing)
-      }
+      Ok(storing) => Ok(storing),
       Err(refused) => {
         crate::vcs_store::name_holds::unpin_texts(state, &imported);
         release_texts(state, None, &imported);
@@ -703,6 +700,24 @@ async fn stage_texts(
     Ok(storing) => storing,
     Err(refused) => return Some(Err(refused)),
   };
+  section_yield().await?;
+  // The import's texts handed over a text a unit, a slice of the shard's budget a step (A-920 13a: 9,000 in one step,
+  // 10.5 ms, debug, with the storing's begin the release leader of every wide import).
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("storing.hand_over");
+  let mut handing = HandingOver::new(&storing, imported);
+  loop {
+    let deadline = slates_rt::futures::now_ns()
+      .saturating_add(slates_rt::futures::step_budget_ns().unwrap_or(0));
+    let done = crate::state::with_state(|state| {
+      state.count(HAND_OVER_STEPS, 1);
+      handing.some(state, (repository, &*revision), &mut storing, deadline)
+    })?;
+    if done {
+      break;
+    }
+    slates_rt::futures::yield_now().await;
+  }
   section_yield().await?;
   // Each piece lent from the text the landing holds, never copied out (P7's finding (2)).
   let piece = |identity: &ContentIdentity, offset: u64, len: usize| {
@@ -735,33 +750,74 @@ async fn stage_texts(
   Some(Ok((storing, carried)))
 }
 
-/// Takes the holds an import's sink took on the texts `revision` names stored, `imported`, as texts `storing` put, one
-/// each; gives back every other: one the records hold already, one sealed twice, one the revision does not name.
-fn hand_over(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  revision: &Revision,
+/// Counter: a step of an import's texts handed over to its landing ([`HandingOver`], A-920 13a): many a wide revision
+/// shows its texts were handed over a text a unit, never all in one step. Format: a counter name in the status report.
+pub(crate) const HAND_OVER_STEPS: &str = "repository.svn_commit.hand_over_steps";
+
+/// The holds an import's sink took on the texts `revision` names stored, `imported`, being taken as texts `storing`
+/// put, one each, a text a unit; every other given back a text a unit after: one the records hold already, one sealed
+/// twice, one the revision does not name (A-920 13a: whole, 10.5 ms of one step at 9,000 texts, debug).
+struct HandingOver {
+  /// The texts the sink put.
   imported: Vec<ContentIdentity>,
-  storing: &mut Storing,
-) {
-  let mut spare = Vec::new();
-  // What `storing` put, by identity: a lookup a text, not a search of every one put (goal 93: 166 ms of one step for a
-  // revision of 9,000 texts, debug).
-  let mut put: BTreeSet<ContentIdentity> = storing.put.iter().copied().collect();
-  for identity in imported {
-    let held = state
-      .vcs_stores
-      .subversion_records(repository)
-      .is_none_or(|records| records.holds(&identity));
-    if revision.stored.contains_key(&identity) && !held && put.insert(identity) {
-      storing.put.push(identity);
-      storing.pinned.push(identity);
-    } else {
-      spare.push(identity);
+  /// The next of them.
+  at: usize,
+  /// What `storing` put, by identity: a lookup a text, not a search of every one put (goal 93: 166 ms of one step for
+  /// a revision of 9,000 texts, debug).
+  put: BTreeSet<ContentIdentity>,
+  /// The texts to give back.
+  spare: Vec<ContentIdentity>,
+  /// The next of them.
+  spare_at: usize,
+}
+
+impl HandingOver {
+  /// The hand-over of `imported` to `storing`, begun.
+  fn new(storing: &Storing, imported: Vec<ContentIdentity>) -> HandingOver {
+    HandingOver {
+      put: storing.put.iter().copied().collect(),
+      imported,
+      at: 0,
+      spare: Vec::new(),
+      spare_at: 0,
     }
   }
-  crate::vcs_store::name_holds::unpin_texts(state, &spare);
-  release_texts(state, None, &spare);
+
+  /// Units until the shard's clock passes `deadline_ns`, a unit at least: a text taken or kept spare, then a spare
+  /// text unpinned and given back. Whether every text is.
+  fn some(
+    &mut self,
+    state: &mut ShardState,
+    (repository, revision): (RepositoryId, &Revision),
+    storing: &mut Storing,
+    deadline_ns: u64,
+  ) -> bool {
+    loop {
+      if let Some(identity) = self.imported.get(self.at).copied() {
+        self.at = self.at.saturating_add(1);
+        let held = state
+          .vcs_stores
+          .subversion_records(repository)
+          .is_none_or(|records| records.holds(&identity));
+        if revision.stored.contains_key(&identity) && !held && self.put.insert(identity) {
+          storing.put.push(identity);
+          storing.pinned.push(identity);
+        } else {
+          self.spare.push(identity);
+        }
+      } else if let Some(identity) = self.spare.get(self.spare_at).copied() {
+        self.spare_at = self.spare_at.saturating_add(1);
+        let one = core::slice::from_ref(&identity);
+        crate::vcs_store::name_holds::unpin_texts(state, one);
+        release_texts(state, None, one);
+      } else {
+        return true;
+      }
+      if slates_rt::futures::now_ns() >= deadline_ns {
+        return false;
+      }
+    }
+  }
 }
 
 /// The texts of `revision` repository `repository`'s records do not hold, taken out and named stored
@@ -912,6 +968,12 @@ fn storing_of<'t>(
     .vcs_stores
     .subversion_records(repository)
     .ok_or(Uncommitted::NotHeld)?;
+  // An import's texts are its sink's, none taken here: nothing to put, so its rows are not walked (A-920 13a: their
+  // lengths gathered for none, 5.4 ms of one step at 9,000 rows, debug).
+  let mut texts = texts.into_iter().peekable();
+  if texts.peek().is_none() {
+    return Ok(Storing::default());
+  }
   let lengths: BTreeMap<ContentIdentity, u64> = changes
     .iter()
     .filter_map(|change| change.text.map(|text| (text.identity, text.size)))
