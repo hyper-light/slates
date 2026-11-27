@@ -825,3 +825,12 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Landed 7e92e28b8 (push ..0cd0186b7): the reaper. Release frees nothing on its shard (slates_merge::reaped::Reaped; crate::reaper thread per daemon, bound 2 batches/shard, in-place drops counted). Copy's longest release unit 23-25 us debug (1.3-1.7 ms before); REAPER line for main's parser.
 - Owed: probe 18's release read (main); Windows ShardHolds branch and clippy on reaped.rs/reaper.rs (main); reaper counts not in status report (GAPS).
 - Next (main's order): move's stage.committing and landing.apply; landing.publish 18-21 ms debug since today's merges (A-930's image-cut copies the likely cause, w-perf ruling).
+
+## 2026-11-27 ~03:10 (A-920, move's committing and apply)
+- Landed e2034ed47: commit's node moves skip in O(1) where no node has a link (move's stage.committing 8.55 ms debug, gone).
+- Landed 650669e74: begin_applying plans a replay's reads only where a run is unread (landing.apply's 4.46 ms begin_version, gone).
+- Landed b5ea74c06 + c71ca5d03 (docs follow-up; chained commit ran past a failed docs edit): NodeMoves walks an effect a unit on a linked green (main's ruling 02:03).
+- Pushed ..c89d81f04; server set 399, merge 310, svn 595.
+- Debug leaders now (excl. landing.publish, A-930/w-perf): stage.judging 5.8 (move), stage.recording 5.0-5.3, stage.check 3.8-4.2, landing.changeset 2.3.
+- Owed (§3, GAPS): a replay's read plan and the runs' unread scan, each one linear unit.
+- Next (proposed to main): name stage.judging and stage.recording.
