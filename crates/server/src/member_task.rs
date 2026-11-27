@@ -37,7 +37,7 @@ use rustls::pki_types::CertificateDer;
 use slates_cluster::member_plane::{Fleet, MemberPlane, PlaneEvent};
 use slates_cluster::membership::MemberState;
 use slates_db::register::HostId;
-use slates_rt::error::ReceiveRefusal;
+use slates_rt::error::{ReceiveRefusal, RtError};
 use slates_rt::futures;
 use slates_rt::shard::{Kept, TaskId};
 use slates_rt::udp::{SocketAddrV4, UdpSocket};
@@ -97,9 +97,43 @@ const FOLD_REFUSED: &str = "fleet.plane.fold_refused";
 const EPOCH_LENT: &str = "fleet.plane.announce_lends";
 const EPOCH_SENT: &str = "fleet.plane.announcements_sent";
 
-/// Counter: a member's announcement run inline because the runtime refused its task ([`announce_epochs`]): it then waits
-/// on the pass as before. Format: a counter name in the daemon's status report.
-const EPOCH_INLINE: &str = "fleet.plane.announce_inline";
+/// Counters (Format: names in the daemon's status report): a member loop's announcement task the runtime refused, by
+/// pass and by the refusal's kind ([`count_spawn_refused`]). Admission refuses with these three kinds alone
+/// (`ShardContext::admit`); any other is counted `other`.
+const EPOCH_REFUSED_TASKS: &str = "fleet.plane.announce_refused.too_many_tasks";
+const EPOCH_REFUSED_MEM: &str = "fleet.plane.announce_refused.mem";
+const EPOCH_REFUSED_OFF_SHARD: &str = "fleet.plane.announce_refused.not_on_shard_thread";
+const EPOCH_REFUSED_OTHER: &str = "fleet.plane.announce_refused.other";
+const EDGES_REFUSED_TASKS: &str = "fleet.edges.announce_refused.too_many_tasks";
+const EDGES_REFUSED_MEM: &str = "fleet.edges.announce_refused.mem";
+const EDGES_REFUSED_OFF_SHARD: &str = "fleet.edges.announce_refused.not_on_shard_thread";
+const EDGES_REFUSED_OTHER: &str = "fleet.edges.announce_refused.other";
+
+/// Which of the member loop's announcement passes a task was spawned for ([`spawn_exchange`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pass {
+  /// Its plane epochs ([`announce_epochs`]).
+  Epochs,
+  /// Its edges (`edges::announce_edges`).
+  Edges,
+}
+
+/// Counts a refused announcement task by its pass and the refusal's kind. The member stays owed, so a later turn tries
+/// again; the loop never runs the exchange itself, which would hold it for the exchange's whole budget. A refusal off a
+/// shard thread cannot happen in the member loop, so its count is a bug's, surfaced typed.
+pub(crate) fn count_spawn_refused(pass: Pass, refusal: &RtError) {
+  let counter = match (pass, refusal) {
+    (Pass::Epochs, RtError::TooManyTasks { .. }) => EPOCH_REFUSED_TASKS,
+    (Pass::Epochs, RtError::Mem(_)) => EPOCH_REFUSED_MEM,
+    (Pass::Epochs, RtError::NotOnShardThread) => EPOCH_REFUSED_OFF_SHARD,
+    (Pass::Epochs, _) => EPOCH_REFUSED_OTHER,
+    (Pass::Edges, RtError::TooManyTasks { .. }) => EDGES_REFUSED_TASKS,
+    (Pass::Edges, RtError::Mem(_)) => EDGES_REFUSED_MEM,
+    (Pass::Edges, RtError::NotOnShardThread) => EDGES_REFUSED_OFF_SHARD,
+    (Pass::Edges, _) => EDGES_REFUSED_OTHER,
+  };
+  let _ = crate::fleet::count_refusal(counter);
+}
 
 /// One side's identity in an epoch exchange.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,7 +452,8 @@ async fn announce_epochs(announcing: &mut BTreeMap<HostId, (HostId, TaskId)>) {
   // it ended. Each is the loop's child, so the loop's end cancels and joins any still running. Bounded by the owed
   // sessions, one a member (a member in flight has its session lent, so it is owed nothing more), and one an anchor: a
   // canonical announcement reads the anchor's last epoch and records the next once answered, so two at once (its seed
-  // id's session and its learned id's) would both name the same one. A task the runtime refuses runs inline, counted.
+  // id's session and its learned id's) would both name the same one. A task the runtime refuses leaves the member owed
+  // for a later turn, counted by its kind ([`count_spawn_refused`]).
   for (member, anchor, canonical) in owed {
     if announcing
       .iter()
@@ -426,17 +461,28 @@ async fn announce_epochs(announcing: &mut BTreeMap<HostId, (HostId, TaskId)>) {
     {
       continue;
     }
-    match futures::spawn_child(announce_member(member, canonical)) {
+    match spawn_exchange(announce_member(member, canonical)) {
       Ok(task) => {
         announcing.insert(member, (anchor, task));
       }
-      Err(_) => {
-        let _ = state::with_state_counted(|s| s.count(EPOCH_INLINE, 1));
-        announce_member(member, canonical).await;
-        let _ = state::with_state(|state| state.plane.announce_done.remove(&member));
-      }
+      // Left owed, so a later turn tries again; never awaited here (main 01a20182's ruling of 2026-11-27 05:11).
+      Err(refusal) => count_spawn_refused(Pass::Epochs, &refusal),
     }
   }
+}
+
+/// Spawns one of the member loop's announcement exchanges ([`announce_epochs`], `edges::announce_edges`) as a child of
+/// the loop, labelled with its caller's line. Refused as the runtime refuses it, or while a test refuses them
+/// (`ShardState::member_spawns_refused`), as a full arena does.
+#[track_caller]
+pub(crate) fn spawn_exchange<F: core::future::Future<Output = ()> + 'static>(
+  exchange: F,
+) -> Result<TaskId, RtError> {
+  if state::with_state(|state| state.member_spawns_refused).unwrap_or(false) {
+    // Format: the hook names no arena, so no capacity.
+    return Err(RtError::TooManyTasks { capacity: 0 });
+  }
+  futures::spawn_child(exchange)
 }
 
 /// The announcement owed `member` on its sessions, each borrowed for its own exchange and returned at its end

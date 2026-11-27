@@ -3907,6 +3907,22 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support (A-921 part 5 follow-up): while `refused`, every task this node's member loop spawns for an
+  /// announcement (`member_task::spawn_exchange`) is refused as a full task arena refuses it, though nothing else on
+  /// the shard is: the pressure that refuses a spawn, without starving the shard's other work. On the control shard,
+  /// where the member loop runs; `Ok` once installed, else the typed refusal.
+  pub fn inject_member_spawn_refusal(&self, refused: bool) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.member_spawns_refused = refused;
+    })
+  }
+
+  /// Test support (A-921 part 5 follow-up): this node owes its edges record again to every peer it holds a session to,
+  /// as when its edges change (`edges::owe_again`). On the control shard; `Ok` once done, else the typed refusal.
+  pub fn owe_edges_again(&self) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), crate::edges::owe_again)
+  }
+
   /// Test support: while `withhold` is set, this node's record serve side holds each live-state reply (a takeover's
   /// report or log fetch) after its request arrived, and answers everything else, probes included, as usual: a holder
   /// alive and in contact whose answer to a takeover misses the asker's budget. Delivered like
@@ -5819,6 +5835,7 @@ async fn init_shard(
     shards_withhold_replies: false,
     live_state_withhold_replies: false,
     member_exchange_withheld: std::collections::BTreeSet::new(),
+    member_spawns_refused: false,
     peer_paths: std::collections::BTreeMap::new(),
     probe_windows: crate::fleet::ProbeWindows::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),

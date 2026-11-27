@@ -1045,6 +1045,14 @@ impl Recording {
   }
 }
 
+/// The texts a kept revision's walks let go and those they hold, each path once, its last row's
+/// ([`walked_a_unit_a_step`]).
+#[cfg(test)]
+pub(crate) type WalkedTexts = (
+  std::collections::BTreeMap<String, ContentIdentity>,
+  std::collections::BTreeMap<String, ContentIdentity>,
+);
+
 /// A kept revision's walks of `changes` taken a unit a step, as [`Staging::record_some`] takes them with every step
 /// spent: the texts they let go over `records` at `youngest`, then those they hold at `revision`, each path once, its
 /// last row's; and the units the walks took. For a test that holds them to the whole walks (`svn_texts::released_before`,
@@ -1054,13 +1062,7 @@ pub(crate) fn walked_a_unit_a_step(
   records: &slates_svn::migration::Repository,
   changes: &[slates_svn::index::ChangedPath],
   (youngest, revision): (u64, u64),
-) -> (
-  (
-    std::collections::BTreeMap<String, ContentIdentity>,
-    std::collections::BTreeMap<String, ContentIdentity>,
-  ),
-  u64,
-) {
+) -> (WalkedTexts, u64) {
   let mut recording = Recording {
     checked: None,
     applying: None,
