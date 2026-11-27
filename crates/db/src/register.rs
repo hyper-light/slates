@@ -1775,6 +1775,7 @@ pub fn chain_digest(previous: &[u8; DIGEST_BYTES], value: &[u8]) -> [u8; DIGEST_
 /// positions). A holder pages against it, so an answer with any of them absent stays within its frame too.
 pub const LEDGER_PROMISE_HEADER_BYTES: usize = 4 * size_of::<u64>()
   + OBJECT_BYTES
+  // Format: the three optional u64s (next position, fence, held start), each a presence byte then its value.
   + 3 * (1 + size_of::<u64>())
   + size_of::<u32>()
   + 1

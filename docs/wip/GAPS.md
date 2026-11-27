@@ -384,6 +384,15 @@
 >   abandoned by its exchange and its session given back
 >   (`docs/bugs/2026-11-27-a-region-read-waited-out-a-dead-first-home.md`). Red first, two fleet tests: a dead first
 >   home and a slow one, each read 1,998,960,833 ns against a 1,998,000,000 ns budget before.
+> - **OPEN, a risk of that fix (main 01a20182's ruling of 2026-11-27 15:48; to be worked if measured): a live home slow
+>   past its share is cut, and the read moves on to a dead one.** The budget is shared over the homes asked, so with two
+>   homes the first gets half of it. Before the fix only the first home was ever asked: the read's outer bound
+>   (`xshard::task_in_shard_time`) ended at the same budget, so a live home slow under load answered within the whole of
+>   it. Now one slower than half is cut, and where the second home has just died the read gets nothing. Not seen yet:
+>   a914's regression at 41aa47870 logged no exchange cut near a share (every one ran the whole ~2 s), and its signature
+>   is a names log acknowledged by no host. The cut, when measured: a hedged read, where the first home's exchange goes on
+>   past its share while the next is asked, the first good answer taken and the other exchange finishing in a detached
+>   task that gives its session back.
 > - **OPEN, found by that fix's sweep (main's ruling of 12:37: reported, not fixed): other callers that wait a dead home
 >   out.** One home at a time, the whole budget each, so a dead home before a live one costs all of it:
 >   `homes::settle_in_region` (each home, each chunk), `homes::announce_rebuilt` (each repository's member) and
