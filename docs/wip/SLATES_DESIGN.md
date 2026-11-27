@@ -63606,6 +63606,11 @@ Applied in the same change to: §4.16 "Apply on holders", `crates/server/src/{me
 greens,fleet,verbs}.rs`, `crates/db/src/register.rs` (its test), `crates/server/tests/fleet.rs`, GAPS. Part 4: §4.16
 "Apply on holders", `crates/server/src/merge_origin.rs`, GAPS.
 
+- **Amended by A-927 part 2** (2026-11-26): a lineage moves to its successor once every member of its family still
+  pending adoption here is in the lineage at its adopted version (`green_adopt::take_engine`). Before, the wait named
+  the lineage's current members, which was wrong both ways. A root could take a lineage of one while its branch was
+  still pending outside it. And a member no longer pending was never "at its adopted version", so the wait had no end.
+
 ### A-909 — An owner's own hold fences each object as its holders do, so what a successor makes after a takeover is placed (2026-11-24, w-shared for main 01a20182, its ruling of 2026-11-24 (B, at the source); found by A-908's successor test; the sibling of A-903; §4.8, D-16, AC-2.5)
 
 - **Why.** A branch pushed to a repository's successor after its owner died was refused `unable to commit`, every run
@@ -64009,6 +64014,11 @@ owner's acceptor in the control shard's state), the state_log module doc (its ow
 `crates/server/src/{ledger_read,state_log,fleet,moves,merge_service,takeover,state,daemon,lib}.rs`,
 `crates/server/tests/fleet.rs`, `docs/wip/models/FencedLedger.tla` and its configurations, GAPS.
 
+- **Amended by A-927 part 2** (2026-11-26): the read has a second asker, a successor's adoption of a family green whose
+  join it lacks (`ledger_read::join_read`). It reads the names log's positions below its adopted position. A read past
+  tolerance is kept per register, bounded by the registers held, so that adoption refuses on it. A read's held
+  names-log parts are noted as a shipped part's are.
+
 ### A-921 part 2 — A repository a takeover moved from a node is answered there with where it went, found by the one owner lookup (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25; amends AUD-08's lookup status)
 
 - **Why.** A node readmitted after a false death kept serving pushes as the repository's owner. The VCS edges route by
@@ -64172,6 +64182,10 @@ Applied in the same change to: `crates/server/src/{edges,daemon,fleet,state,lib,
   - a894, its own flake's scene, green.
 - **Models.** None of `docs/wip/models/` models a creation's answer, the names log or an adoption's wait; no spec
   changed.
+- **Amended by A-927 part 2** (2026-11-26): "every acknowledged green's join is in it" held for the log its takeover
+  adopted, but not for what the successor saw of it. The takeover adopted the log's newest part into the acceptor
+  without noting its memberships. An `Unjoined` adoption now notes the held parts again and reads the positions it
+  lacks from the log's cohort before refusing (`ledger_read::join_read`).
 - **Amended by A-927 part 1** (2026-11-25): the green an adoption gives up is not said to hold files. A create on it
   is refused naming the green and its cause (`NotRecovered`'s kind), where before it was refused "the default branch
   holds files no commit names" (a894's loop after A-915).
@@ -65333,6 +65347,60 @@ measured noise of the 100 figure, not a literal.
 - **Models.** None of `docs/wip/models/` models a give-up's record or a verb's refusal of it; no spec changed.
 - **Applied in the same change to:** `crates/server/src/{state,repository,merge_service,verbs}.rs`,
   `crates/server/src/repository/push.rs` and its tests, A-304's entry, GAPS (A-915's entry).
+
+### A-927 part 2 — A successor sees a join its takeover adopted, reads one it lacks from the names log's cohort, and hands a lineage over only once its pending members are in it (2026-11-26, w-shared for main 01a20182, its ruling of 2026-11-25; the a894 loop, 3 of 41 runs; amends A-908, A-915 and A-919)
+
+- **Why.** main's a894 loop (debug, 03c736286, 2026-11-25) failed 3 of 41 runs at any load. In each the successor
+  gave the root green up ("waiting on its refused"), and the first push was refused. The root's join shipped to the
+  owner and the other survivor, its f + 1, and never to the successor.
+- **The cause.** A takeover adopts a state log's newest part and commits it under the successor
+  (`takeover::commit_adopted_at`), which installs the acceptor directly. A shipped part goes through
+  `fleet::after_held_record`, which notes a names-log part's lineage memberships (`merge_service::note_names_part`);
+  the adoption skipped that. `memberships` is built once and then only noted, so it never learned the join the
+  successor's own acceptor now held. Each adoption attempt answered `Unjoined` (A-915) until the green was given up.
+- **The change.**
+  - The adoption commit notes a state-log part it holds, as a shipped part's hold does.
+  - An adoption that finds no membership for a family green asks `ledger_read::join_read` before refusing:
+    - it notes the held parts of the family's names log again (`merge_service::note_names_register`): a join held but
+      not noted is seen;
+    - the join still unknown, it reads the positions the successor lacks below the log's adopted position from the
+      log's cohort, A-919's one read (`ledger_read::want`), and waits (`Later`, counted
+      `merge.takeover.adopted_unjoined_reading`; each wait an attempt toward the takeover's bound);
+    - it refuses `Unjoined` only where the read went past tolerance, where it holds the log chained whole through its
+      adopted position with the join in none of it (A-915's case), or where no names log of the family is held or
+      adopted here, each counted by why (`merge.takeover.adopted_unjoined.{past_tolerance,log_whole,no_names_log}`).
+  - A read's held parts are noted too (`ledger_read::hold_adopted`).
+  - The lineage's hand-over (`green_adopt::take_engine`) waits for the family's members still pending adoption here,
+    each in the lineage at its adopted version, not for the lineage's current members. The read test found the old
+    rule's unbounded wait 2 times in 5 (`merge.takeover.lineage_waits_for_members` 3,977, no attempt spent). The
+    root's replica reached its version before its branch was in the lineage and took the lineage alone. The branch's
+    adoption then rebuilt a second root to branch from, never pending, so never "at its adopted version", and waited
+    for it without end. The wait is now bounded by the awaited members' own adoptions: each is pending, so it spends
+    attempts toward the bound and is given up past it, or it waits on a finite build. A member whose replica is at its
+    version waits on no other member that is also at its version.
+- **Test support.** `Daemon::hold_state_log_shipping_from(peer)`: the owner ships its state logs' parts to every
+  candidate but `peer` (`state::StateLogShipHold`, test-support only, never set outside a test's hook);
+  `Daemon::names_log_positions(member)`: the positions of a family's names log a node holds.
+- **Tests.**
+  - Fleet `a927_a_successor_the_roots_join_was_held_from_adopts_it_and_takes_a_push`. The creation holds its parts off
+    every member until a has listed the root, ranks the survivors for the family as a takeover will
+    (`rendezvous_first`), and then holds the parts off that one alone, so the other survivor holds the join. a is then
+    killed and the push goes to the successor. Red before: 51 `Unjoined` answers, the root given up, the push refused
+    (part 1's words).
+  - Fleet `a927_a_successor_reads_a_join_below_its_names_logs_newest_part_and_takes_a_push`: as above, then a branch
+    made, its part held off the successor too. The takeover adopts the branch's part, and the root's join comes only
+    by the read (`fleet.ledger_read.join_wanted` 1, asked 2, the first refused by a cohort member not yet on the
+    takeover's generation). Red 2 of 5 before the hand-over's change; red without the read.
+  - `merge_origin::tests::a927_an_adoption_sees_a_join_held_but_never_noted` (red: `Unjoined` at once).
+  - `merge_origin::tests::a927_a_lineage_waits_for_a_pending_member_not_in_it_yet` (red: the root took the lineage
+    alone).
+  - `merge_origin::tests::a927_a_lineage_never_waits_for_a_member_no_longer_pending` (red: no engine, for good).
+  - A-915's and A-908's unit tests, and a894's and A-915's fleet tests.
+- **Models.** None of `docs/wip/models/` models the memberships a holder notes, an adoption's wait for a join or a
+  lineage's hand-over. `FencedLedger.tla` models the read's fold, which this change calls unchanged.
+- **Applied in the same change to:** `crates/server/src/{takeover,ledger_read,merge_origin,merge_service,green_adopt,
+  state,daemon,fleet}.rs` (each module's docs where it states the rule), `crates/server/tests/fleet.rs`, A-908's,
+  A-915's and A-919's entries, GAPS (A-915's entry).
 
 ### A-928 — A shard's step quantum is its wake estimate held to half 84a's loaded bar (2026-11-25, w-svn for main 01a20182, its rulings of 2026-11-25 on release probe 5 (a) and (b); goal 93, 84a; amends §4.3's derived quantum and A-31)
 

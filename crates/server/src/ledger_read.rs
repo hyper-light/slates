@@ -28,6 +28,14 @@
 //! departed gone) adopts nothing, refused typed (counted [`PAST_TOLERANCE`]): what committed is the owner's applied
 //! state, never the newest surviving older value. It then pins the owner's let-go of the register's parts. The answer
 //! is the configuration's (a candidate that cannot hold a register leaving its candidacy), owed.
+//!
+//! **A successor's missing join** (A-927 part 2, main 01a20182's ruling of 2026-11-25). A takeover adopts a state log's
+//! newest part alone; a successor that adopts a family green whose join no names-log part it holds records
+//! ([`join_read`]) notes the parts it holds of that log again, then reads the positions it lacks below the log's adopted
+//! position from the log's cohort, this same read, and waits for it. It refuses the green (`Unjoined`) only where the
+//! read went past tolerance, where it holds the log whole through its adopted position with the join in none of it, or
+//! where it holds no names log of the family, each counted by why. Before, the join a takeover adopted into the
+//! successor's acceptor, or held only by the other survivor, was never seen, and the green was given up (a894, 3 of 41).
 
 use std::collections::BTreeMap;
 
@@ -60,12 +68,38 @@ pub(crate) const REFUSED: &str = "fleet.ledger_read.refused";
 pub(crate) const UNTRACKED: &str = "fleet.ledger_read.untracked";
 /// Counter: an adopted position that did not continue this node's copy, held no further. Format: a counter name.
 pub(crate) const DISCONTINUOUS: &str = "fleet.ledger_read.discontinuous";
+/// Counter: a successor's adoption of a family green whose join it did not hold, reading its names log's lacking
+/// positions from the log's cohort (A-927 part 2, [`join_read`]). Format: a counter name.
+pub(crate) const JOIN_WANTED: &str = "fleet.ledger_read.join_wanted";
+/// Counter: such an adoption refused (`Unjoined`) because no names log of the green's family is held or adopted here
+/// (A-927 part 2). Format: a counter name.
+pub(crate) const UNJOINED_NO_LOG: &str = "merge.takeover.adopted_unjoined.no_names_log";
+/// Counter: such an adoption refused because its names log's read went past tolerance (A-927 part 2). Format: a counter
+/// name.
+pub(crate) const UNJOINED_PAST_TOLERANCE: &str = "merge.takeover.adopted_unjoined.past_tolerance";
+/// Counter: such an adoption refused because this node holds the names log whole through its adopted position and no
+/// part of it records the join: never acknowledged as a member (A-915's case, A-927 part 2). Format: a counter name.
+pub(crate) const UNJOINED_LOG_WHOLE: &str = "merge.takeover.adopted_unjoined.log_whole";
 
 /// The registers this node reads a ledger range of (one field of [`ShardState`]): each wanted once its holder refused a
 /// part past its copy, at most one per register.
 #[derive(Debug, Default)]
 pub(crate) struct LedgerReads {
   wanted: BTreeMap<ObjectId, Wanted>,
+  /// The registers whose last read went past tolerance (A-927 part 2: a successor's adoption refuses on it, never reads
+  /// again for it). Bounded by the registers this node holds an acceptor of: pruned to them as one is added.
+  past_tolerance: std::collections::BTreeSet<ObjectId>,
+}
+
+/// What a successor's adoption of a family green whose join it does not know does next (A-927 part 2, [`join_read`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JoinRead {
+  /// A part this node holds records the join after all: the adoption goes on.
+  Joined,
+  /// The names log's lacking positions are being read from its cohort: the adoption waits.
+  Reading,
+  /// No read can bring the join: the adoption is refused `Unjoined`, counted by this counter's why.
+  Unjoined(&'static str),
 }
 
 /// One register's read: the range still lacked, and the owner its parts come from.
@@ -97,6 +131,81 @@ pub(crate) fn want(
   wanted.owner = owner;
   wanted.from = wanted.from.min(from);
   wanted.to = wanted.to.max(to);
+}
+
+/// What a successor's adoption of family green `green`, whose join no membership noted here records, does next (A-927
+/// part 2; module docs, "A successor's missing join"): the parts of its family's names log this node holds noted again
+/// (a takeover adopts the log's newest part into the acceptor without noting it); then, the join still unknown, a read of
+/// the positions this node lacks below the log's adopted position from its cohort ([`want`]), or the refusal's why.
+pub(crate) fn join_read(state: &mut ShardState, green: ObjectId) -> JoinRead {
+  let Some(register) = names_register_of(state, green) else {
+    return JoinRead::Unjoined(UNJOINED_NO_LOG);
+  };
+  crate::merge_service::note_names_register(state, register);
+  if crate::merge_service::membership(state, crate::merge_service::replica_key(green)).is_some() {
+    return JoinRead::Joined;
+  }
+  if state.ledger_reads.past_tolerance.contains(&register) {
+    return JoinRead::Unjoined(UNJOINED_PAST_TOLERANCE);
+  }
+  if state.ledger_reads.wanted.contains_key(&register) {
+    return JoinRead::Reading;
+  }
+  let adopted = state.placed_heads.get(&register).map(|head| head.sequence);
+  let highest = state
+    .holder_records
+    .get(&register)
+    .and_then(|acceptor| acceptor.highest(register))
+    .map(|(position, _)| position);
+  let Some(through) = adopted.max(highest) else {
+    return JoinRead::Unjoined(UNJOINED_NO_LOG);
+  };
+  let held = chained_end(state, register, through);
+  if held.is_some_and(|held| held >= through) {
+    return JoinRead::Unjoined(UNJOINED_LOG_WHOLE);
+  }
+  let owner = state
+    .fleet
+    .object_owner(register)
+    .unwrap_or_else(|| state.fleet.host());
+  want(state, (register, owner), held, through);
+  state.count(JOIN_WANTED, 1);
+  JoinRead::Reading
+}
+
+/// The names log of `green`'s family this node holds or adopted: the state-log register of class `Names` whose line key is
+/// the green's (a repository, its registers and every green minted to join it share one, A-636 part 2b-2).
+pub(crate) fn names_register_of(state: &ShardState, green: ObjectId) -> Option<ObjectId> {
+  let names = slates_db::register::RegisterClass::State(slates_db::catalog::StateLog::Names);
+  let family = green.line_key();
+  let is_names = |object: &ObjectId| object.class() == names && object.line_key() == family;
+  state
+    .holder_records
+    .iter()
+    .map(|(object, _)| *object)
+    .find(is_names)
+    .or_else(|| state.placed_heads.keys().copied().find(is_names))
+}
+
+/// The position through which this node holds `register`'s parts chained from the log's start (each part's `from` the
+/// position of the one before, the first's the log's start), looked at through `through`; `None` where it holds no part
+/// from the start.
+fn chained_end(state: &ShardState, register: ObjectId, through: u64) -> Option<u64> {
+  let acceptor = state.holder_records.get(&register)?;
+  let held = acceptor.positions_between(
+    register,
+    first_position(register),
+    through.saturating_add(1),
+  );
+  let mut last = None;
+  for accepted in held {
+    let from = crate::state_log::record_of(&accepted.value).map(|part| part.from);
+    if from != Some(last.unwrap_or(0)) {
+      break;
+    }
+    last = Some(accepted.sequence);
+  }
+  last
 }
 
 /// A candidate's answer to `peer_host`'s ledger read (A-919): admitted only from a current candidate of the register
@@ -276,6 +385,12 @@ async fn read_once(
         wanted.from
       );
       s.ledger_reads.wanted.remove(&register);
+      // Kept for a successor's adoption to refuse on (A-927 part 2), bounded by the registers held here.
+      let held = &s.holder_records;
+      s.ledger_reads
+        .past_tolerance
+        .retain(|kept| held.get(kept).is_some());
+      s.ledger_reads.past_tolerance.insert(register);
       return;
     }
     let held = hold_adopted(s, (register, wanted.owner), local, &adoption.adopted);
@@ -346,6 +461,9 @@ fn hold_adopted(
         BYTES_HELD,
         u64::try_from(accepted.value.len()).unwrap_or(u64::MAX),
       );
+      // A names-log part's lineage memberships noted for the greens' replicas and adoptions, as a shipped part's are
+      // (`fleet::after_held_record`, A-927 part 2).
+      crate::merge_service::note_names_part(state, &accepted.value);
     }
     held = held.saturating_add(1);
   }

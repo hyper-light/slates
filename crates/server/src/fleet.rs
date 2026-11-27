@@ -2668,11 +2668,17 @@ fn owed_state_log_parts(
   local: HostId,
 ) -> Vec<Head> {
   let mut heads = Vec::new();
-  if state.state_log_ship_held {
-    return heads;
-  }
+  // Test support (A-915, A-927): held from every candidate, or from one.
+  let held_from = match state.state_log_ship_held {
+    crate::state::StateLogShipHold::Shipped => None,
+    crate::state::StateLogShipHold::Held => return heads,
+    crate::state::StateLogShipHold::HeldFrom(peer) => Some(peer),
+  };
   for (register, parts, acked) in state.state_logs.owed() {
-    let placement = config.place(register);
+    let mut placement = config.place(register);
+    if let Some(peer) = held_from {
+      placement.candidates.retain(|candidate| *candidate != peer);
+    }
     // Written at the greater of the host's epoch and the epoch the log was adopted under, as `owed_record` writes a
     // head: a successor's holders fenced the dead owner's logs at the takeover's epoch, and refused every part this
     // node wrote at its own lower one `StaleEpoch`, so no push to a repository taken over ever committed (A-894's

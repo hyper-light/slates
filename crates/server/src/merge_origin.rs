@@ -84,6 +84,9 @@ use crate::state::ShardState;
 /// Counter: a successor's adoption of a family green whose join no names-log part held here records (A-915): never
 /// acknowledged as a member, its adoption refused and given up typed. Format: a counter name in the daemon's status report.
 pub(crate) const ADOPTED_UNJOINED: &str = "merge.takeover.adopted_unjoined";
+/// Counter: such an adoption waiting while its names log's lacking positions are read from the log's cohort (A-927 part
+/// 2, `ledger_read::join_read`). Format: a counter name in the daemon's status report.
+pub(crate) const ADOPTED_UNJOINED_READING: &str = "merge.takeover.adopted_unjoined_reading";
 /// Counter: a rebuilt lineage root not installed because its repository already has a lineage on this holder without
 /// it (A-908 part 4): a bug signal, since a holder makes a lineage's members only from its root.
 /// Format: a counter name in the daemon's status report.
@@ -851,9 +854,22 @@ fn rebuild_through(
           ));
         }
       },
+      // The join unknown to a successor's adoption: read from the names log's cohort before refusing (A-927 part 2).
       None if object.is_family() && asker == Asker::Adoption => {
-        state.count(ADOPTED_UNJOINED, 1);
-        return Err(Unjoined);
+        match crate::ledger_read::join_read(state, object) {
+          crate::ledger_read::JoinRead::Joined => {
+            return rebuild_through(state, object, through, asker);
+          }
+          crate::ledger_read::JoinRead::Reading => {
+            state.count(ADOPTED_UNJOINED_READING, 1);
+            return Ok(Rebuild::Later);
+          }
+          crate::ledger_read::JoinRead::Unjoined(why) => {
+            state.count(ADOPTED_UNJOINED, 1);
+            state.count(why, 1);
+            return Err(Unjoined);
+          }
+        }
       }
       None if object.is_family() => {
         state.count(crate::merge_service::MEMBER_UNKNOWN, 1);
@@ -2630,6 +2646,160 @@ mod tests {
     );
     assert_eq!(counts, [1, 1], "adopted unjoined, member unknown");
     assert!(!kept, "no replica built either way");
+  }
+
+  /// Marks each of `greens` pending adoption at its record of `version` this holder accepted, as a takeover's adoption
+  /// marks it (`state::PendingGreen::adopted`).
+  fn pending_at(state: &mut ShardState, greens: &[ObjectId], version: u64) {
+    for green in greens {
+      let merge = ledger_value(state, *green, version).expect("the adopted record");
+      state.pending_green_materializations.insert(
+        *green,
+        crate::state::PendingGreen::adopted(merge, None, Vec::new()),
+      );
+    }
+  }
+
+  /// A-927 part 2 (its read test, 2 of 5 runs: a branch's adoption waited for good, `lineage_waits_for_members` 3,977): a
+  /// lineage moves to its successor only once every member still pending adoption here is in it at its adopted version
+  /// (A-908). Do: rebuild a holder's root alone, a lineage of one, at version 1; mark the root and its branch pending;
+  /// hand the root's engine over; then settle the branch (given up, or adopted) and hand it over again. Expect: no
+  /// engine while the branch is pending outside the lineage, then the lineage. Red before: the root took the lineage
+  /// alone, so the branch's own adoption later rebuilt a root of its own and waited for it without end.
+  #[test]
+  fn a927_a_lineage_waits_for_a_pending_member_not_in_it_yet() {
+    let (first, second) = (
+      creating("main-1", b"one", 1, 0),
+      creating("branch-1", b"two", 2, 0),
+    );
+    let identities = lineage_identities(&first, &second);
+    let daemon = one_unit_slices();
+    hold_restarted_lineage(&daemon, (first, second), identities, None);
+    let (root, branch) = (family(1, 2), family(2, 3));
+    let asks = rebuild_asks(&daemon, root, 3);
+    let taken = crate::daemon::observe_first(&daemon, move |state| {
+      pending_at(state, &[root, branch], 1);
+      let while_pending = crate::green_adopt::take_engine(state, root).is_some();
+      state.pending_green_materializations.remove(&branch);
+      let once_settled = crate::green_adopt::take_engine(state, root).is_some();
+      (while_pending, once_settled)
+    });
+    daemon.stop();
+    assert_eq!(
+      asks.last(),
+      Some(&Rebuild::Installed(1)),
+      "the root rebuilt: {asks:?}"
+    );
+    assert_eq!(
+      taken,
+      (false, true),
+      "no engine while the branch is pending outside the lineage, then the lineage"
+    );
+  }
+
+  /// A-927 part 2: a lineage's member no longer pending here (adopted already, or given up) is never waited for. Do:
+  /// rebuild a holder's branch, its root rebuilt first, the two one lineage at version 1; mark the root alone pending;
+  /// hand its engine over. Expect the lineage. Red before: the branch, never pending, was never "at its adopted version",
+  /// and the root waited for it without end, no attempt spent.
+  #[test]
+  fn a927_a_lineage_never_waits_for_a_member_no_longer_pending() {
+    let (first, second) = (
+      creating("main-1", b"one", 1, 0),
+      creating("branch-1", b"two", 2, 0),
+    );
+    let identities = lineage_identities(&first, &second);
+    let daemon = one_unit_slices();
+    hold_restarted_lineage(&daemon, (first, second), identities, None);
+    let (root, branch) = (family(1, 2), family(2, 3));
+    let asks = rebuild_asks(&daemon, branch, 3);
+    let taken = crate::daemon::observe_first(&daemon, move |state| {
+      pending_at(state, &[root], 1);
+      crate::green_adopt::take_engine(state, root).is_some()
+    });
+    daemon.stop();
+    assert_eq!(
+      asks.last(),
+      Some(&Rebuild::Installed(1)),
+      "the branch rebuilt: {asks:?}"
+    );
+    assert!(
+      taken,
+      "the lineage handed over, its other member not pending"
+    );
+  }
+
+  /// Holds a names-log part of `repository` joining `root` as its lineage's root in this holder's acceptor of the log at
+  /// position 1, unnoted, as a takeover's adoption of the log's newest part held it before A-927 part 2.
+  fn hold_unnoted_root_join(
+    state: &mut ShardState,
+    repository: slates_db::catalog::RepositoryId,
+    root: ObjectId,
+  ) {
+    let record = slates_db::catalog::StateLogRecord {
+      repository,
+      log: slates_db::catalog::StateLog::Names,
+      from: 0,
+      to: 1,
+      identity: [3; 32],
+      spans: Vec::new(),
+      changes: vec![slates_db::catalog::LoggedChange::Joined {
+        member: slates_db::catalog::MemberRecord {
+          repository,
+          green: DbVolumeId { bytes: root.0 },
+          origin: slates_db::catalog::MemberOrigin::Root,
+        },
+      }],
+    };
+    let register = slates_db::catalog::LogName::State {
+      repository,
+      log: slates_db::catalog::StateLog::Names,
+    }
+    .register();
+    let mut acceptor = slates_db::register::Acceptor::new(
+      HostId(1),
+      slates_db::register::Authority {
+        generation: 0,
+        owner: HostId(2),
+      },
+    );
+    let accepted = slates_db::register::Accepted {
+      sequence: 1,
+      epoch: slates_db::register::HostEpoch(1),
+      value: crate::state_log::value_of(&record),
+    };
+    assert!(acceptor.hold_read(register, &accepted), "the part held");
+    state.holder_records.insert(register, acceptor);
+  }
+
+  /// A-927 part 2 (the a894 loop, 3 of 41 runs): a successor's adoption sees a join its acceptor holds, however it came
+  /// to hold it. Do: as A-915's test, give a holder a family root's records and its increment, its memberships built
+  /// already; then hold the names-log part joining the root without noting it, as a takeover's adoption of the log's
+  /// newest part held it; rebuild the root for an adoption. Expect not `Unjoined`: the root's join known and its
+  /// rebuild under way or done. Red before: `Unjoined` at once, and the root given up within its attempts.
+  #[test]
+  fn a927_an_adoption_sees_a_join_held_but_never_noted() {
+    let first = creating("main-1", b"one", 1, 0);
+    let (roots, _) = lineage_identities(&first, &creating("branch-1", b"two", 2, 0));
+    let (adopted, joined) = crate::daemon::audit_on_shard(move |state| {
+      let root = family(1, 2);
+      let repository = slates_db::catalog::RepositoryId {
+        bytes: family(1, 1).0,
+      };
+      state.merge.memberships_built = true;
+      let inputs = hold_encoded(state, root, &first.encode());
+      accept_records(
+        state,
+        root,
+        &[(0, None, roots[0]), (1, Some(inputs), roots[1])],
+      );
+      hold_unnoted_root_join(state, repository, root);
+      let adopted = rebuild_adopted_through(state, root, 1);
+      let joined =
+        crate::merge_service::membership(state, crate::merge_service::replica_key(root)).is_some();
+      (adopted, joined)
+    });
+    assert_ne!(adopted, Err(Unjoined), "the adoption sees the held join");
+    assert!(joined, "the root's membership noted from the held part");
   }
 
   /// A-908 part 4: a branch of a branch whose sources are both missing is rebuilt a level an ask, never by recursion. Do:

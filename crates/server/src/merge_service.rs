@@ -84,6 +84,20 @@ pub(crate) fn note_names_part(state: &mut ShardState, value: &[u8]) {
   }
 }
 
+/// Notes the lineage memberships every part of names-log `register` held here records, in the log's order (A-927 part
+/// 2): a part a takeover adopted into the acceptor, or any held without [`note_names_part`], is seen. Bounded by the
+/// log's parts held here.
+pub(crate) fn note_names_register(state: &mut ShardState, register: ObjectId) {
+  let parts: Vec<Vec<u8>> = state
+    .holder_records
+    .get(&register)
+    .map(|acceptor| acceptor.values(register).map(<[u8]>::to_vec).collect())
+    .unwrap_or_default();
+  for part in parts {
+    note_names_part(state, &part);
+  }
+}
+
 /// `green`'s membership of its repository's lineage as this holder's names logs record it (A-908), read from every
 /// names-log part held here the first time after a start ([`MergeShardState::memberships_built`]). `None` for a green
 /// no names log held here names.
