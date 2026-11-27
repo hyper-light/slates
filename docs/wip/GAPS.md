@@ -4882,6 +4882,13 @@
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
 > A-704), git-http-backend, Gitaly, mod_dav_svn, the Linux kernel dataset, server CPU and memory, concurrent clients.
+> Since then: slates' side of each, git-http-backend (`git_scale`'s stock-http), and server CPU and memory
+> (`interop_speed.sh`). Since 2026-11-27 (w-interop, main 01a20182's ruling of 14:31): `mod_dav_svn` under Apache as
+> svn's HTTP competitor (`svn_scale`'s stock-http, beside slates' WebDAV site as slates-http), measured where
+> `HTTPD_MODULES` has it and skipped, said so, where it does not (neither Mac has it). svn's commit and hg's push and
+> pull are each read back and compared across the servers: svn's commit by its served content and changed paths, hg's
+> pull by `hg verify` and exactly the source's changesets and the new one. Smoke run on the MacBook at a debug build:
+> every check passed, each digest one across the servers. Owed: Gitaly, the Linux kernel dataset, concurrent clients.
 >
 > **A stock git command's wait, judged by progress (2026-11-23, w-git; main 01a20182's ruling after r229):** each git
 > command of `crates/cli/tests/git_interop.rs` was killed past a fixed 120 s (`PATIENCE`), and git/git's whole-repository
