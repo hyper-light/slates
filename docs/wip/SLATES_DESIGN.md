@@ -65098,6 +65098,24 @@ GAPS.
   - Debug, after: `landing.apply` is out of the eight longest spans of add, copy and move (4.5-4.8 ms before). Their
     leaders now: `landing.publish` (9.3-24.8 ms, A-930's cut copies), then `stage.judging` (5.8, move),
     `stage.recording` (5.0-5.3) and `stage.check` (3.8-4.2).
+  **A directory's removal counts its children, a unit a step.** Move's `stage.judging` named (debug, a probe of each
+  judging part's and each decision phase's longest call): the resolution's end (`Resolved::finish_resolving`, its
+  `split_copies`) at 5.86 ms whole, and the decision's directory removals (`decide_rmdirs_some`) at 4.96 ms in one
+  call. Everything else of the judge was 56 µs or less.
+  The removal's one unit (`merge_rmdir`) walked every key under the directory in each of the head's node maps
+  (`has_live_child`) for one the work does not remove itself: 9,000 files for the move's source directory. Now:
+  - the checks before the children run first (a node of another kind, none, changed since the base);
+  - the head's keys under the directory in each map are counted with no walk (`Ptrie::prefix_len`, a descent each);
+  - the paths the work removes itself under it are counted a path a unit where each map holds them, taken on from the
+    last across steps (`RmdirWalk`), and the unit is pushed when the count ends.
+  A child survives exactly where a map holds more keys under the directory than the count there, so the verdict is the
+  walk's: delete against modify, or the directory removed. `merge_rmdir` and `Green::has_live_child` go: one
+  implementation.
+  - Counter: `Green::rmdir_children`, the children counted and the units that counted them.
+  - Test `a_directorys_removal_counts_its_children_a_unit_a_step` (400 files): computed alike whole and a unit a step,
+    the directory removed, a child a unit; with one file kept, alike both ways and not removed. Red with the count
+    unstopped: the units fewer than the children.
+  - Left in `stage.judging`: the resolution's end (`split_copies`, 5.86 ms whole), next.
   - Left: a replay's plan is still a pass over the entry in one unit, as is the scan of the runs, linear in them. Both
     are owed their slicing by §3.
 

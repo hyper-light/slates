@@ -123,6 +123,11 @@ impl<V: Clone> Dim<V> {
     self.root.iter(&self.nodes).map(|(_, value)| value)
   }
 
+  /// The keys that start with `prefix`, counted with no walk: one descent.
+  pub(crate) fn prefix_len(&self, prefix: &str) -> usize {
+    self.root.prefix_len(&self.nodes, prefix.as_bytes())
+  }
+
   /// The keys that start with `prefix` and their values, in key order: one descent, then the keys it answers.
   pub(crate) fn prefix(&self, prefix: &str) -> impl Iterator<Item = (String, &V)> + '_ {
     self
@@ -671,6 +676,11 @@ impl Files {
       .map
       .values()
       .filter_map(|block| self.blocks.content(*block))
+  }
+
+  /// The files under `prefix`, counted with no walk: one descent.
+  pub(crate) fn prefix_len(&self, prefix: &str) -> usize {
+    self.map.prefix_len(prefix)
   }
 
   /// The files under `prefix` and their content, in path order.
