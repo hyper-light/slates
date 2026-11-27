@@ -132,6 +132,11 @@
 > (`~/.local/state/w-hg-logs/2026-11-26-idle-sweep-no-poller.txt`), so the count is not vacuous. Its old
 > `started == 1` could not hold: written files take their sealing and busy passes first (4 started), so it counts the
 > one cut and its one resume instead, which a give-back left for later passes would exceed.
+> Amended 2026-11-27 (w-perf; main's diag 11): two more host premises did not hold. Under ThreadSanitizer a give-back
+> step took all 16 runs (`daemon::purge_slice_blocks` is an archive slice over the discard size: 3 steps for 65,536
+> bytes), so "a step a run" failed; on windows-11-arm a resumed give-back met the poller again, cut twice and resumed
+> twice in its one pass, so "once" failed. The product was right both times. The test now holds every cut to its
+> resume in the pass (`left > 0`, `resumed == left`): a give-back left for later passes resumes none at an idle point.
 
 > **Open (w-shared, 2026-11-21; closed by A-826 when it lands): a holder-route submit of 320 MiB and above does not
 > complete under load.** Its `SubmitComputed` carried the whole increment over the forward lane; on a loaded machine

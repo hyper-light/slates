@@ -367,7 +367,8 @@ mod tests {
   }
 
   /// Shape: the files the cut-pass test writes, every other one freed ([`files_written`]): free runs enough that one idle
-  /// pass's give-back takes many steps, a run a step (`daemon::purge_slice_blocks` on a test shard: one).
+  /// pass's give-back takes several steps on a host whose step takes a run (`daemon::purge_slice_blocks`), the poller's
+  /// to cut; a host whose step takes them all still has the dead recovery's and the write log's steps after it.
   const GIVE_BACK_FILES: usize = 32;
 
   /// A-226, A-715 (main 01a20182's ruling of 2026-11-23; the drift-free case). Do: on a one-shard daemon, set a poller
@@ -379,10 +380,16 @@ mod tests {
   /// takes one run (`daemon::purge_slice_blocks`). Since A-926 (the write log's and slots' high-water marks) a fresh
   /// daemon leaves two journal pages to give back, a single step, so the start's own leftovers no longer give the poller
   /// a step to cut (main's bisect of 2026-11-26: red from 3aa1ad9e8). Then look until the sweep has settled. Expect: the
-  /// idle pass's give-back took a step a run; the poller cut it once, at its first step, and it resumed at the shard's
-  /// idle points in that pass (counted), settling the shard, never left for later passes. Until 2026-11-23 a cut pass's
-  /// give-back resumed only in the next pass, an interval on, which the poller cut again at its first step: one step an
-  /// interval, every pass's give-back left once more.
+  /// poller cut the pass's give-back, and every cut resumed at the shard's idle points in that pass (counted), settling
+  /// the shard, never left for later passes. Until 2026-11-23 a cut pass's give-back resumed only in the next pass, an
+  /// interval on, which the poller cut again at its first step: one step an interval, every pass's give-back left once
+  /// more, and none resumed at an idle point.
+  ///
+  /// How many steps the give-back takes, and how often a resumed give-back meets a ready task again, are the host's
+  /// (main's diag 11, 2026-11-27): a step takes an archive slice's bytes of free runs (`daemon::purge_slice_blocks`),
+  /// one run on the Macs but all sixteen in a step under ThreadSanitizer (3 steps for 65,536 bytes); and on
+  /// windows-11-arm a resumed give-back met the poller once more, cut twice and resumed twice in its one pass. So the
+  /// test holds the cuts to their resumes, not to a count.
   #[test]
   fn a_pass_cut_short_at_each_start_settles_in_that_pass_at_the_shards_idle_points() {
     let interval = Duration::from_nanos(super::interval_ns());
@@ -427,19 +434,13 @@ mod tests {
     );
     assert!(polling, "the poller is on the shard");
     assert!(settled_again, "the files' passes settled the shard: {seen}");
-    let runs = u64::try_from(GIVE_BACK_FILES / 2).expect("a count");
     assert!(
-      steps > runs,
-      "the give-back took a step a freed run, so the poller had a step to cut: {steps} steps, {seen}"
-    );
-    assert!(
-      resumed > 0,
-      "the poller cut the pass, and its give-back resumed at the shard's idle point: {seen}"
+      left > 0,
+      "the poller cut the pass's give-back: {steps} steps, {seen}"
     );
     assert_eq!(
-      (left, resumed),
-      (1, 1),
-      "one pass's give-back was cut once and resumed in it, never left to later passes: {seen}"
+      resumed, left,
+      "every cut of the pass's give-back resumed at the shard's idle point in it, never left to later passes: {seen}"
     );
   }
 
