@@ -529,7 +529,12 @@ const TEST_LOOK: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS / 10);
 /// The 8a loop's seat tests (`ended: false` on whole sessions under load). Do: from a loopback listener that writes a
 /// byte at once and closes its connection three read timeouts later, read the connection once judging its end by one
 /// timeout, as the seat tests' client did, and once with [`read_until_closed`]. Expect: the first judges it not ended;
-/// the second sees it closed, the byte fed.
+/// the second sees it closed, the byte fed. The first judgement is the read's own answer (its timeout, not the close),
+/// never a second clock's. Until 2026-11-27 it compared `Instant`'s elapsed time with the timeout, and on Windows x86_64
+/// (diag CI 9, job 140570009931: `(true, true, [120])`) the read ended under one timeout by `Instant`, though the close
+/// comes three timeouts later by `Instant` itself: the read answered its own timeout, which the socket's timer judged
+/// shorter than `Instant` did. The clock family of section 3 of
+/// `docs/bugs/2026-11-27-four-windows-reds-of-diag-ci-2.md`.
 #[test]
 fn a_connection_closed_past_the_clients_patience_is_seen_ended() {
   let closing = || {
@@ -551,11 +556,16 @@ fn a_connection_closed_past_the_clients_patience_is_seen_ended() {
     (stream, serving)
   };
   let (mut stream, serving) = closing();
-  let started = Instant::now();
   let mut chunk = [0u8; 16];
-  while matches!(stream.read(&mut chunk), Ok(count) if count > 0) {}
-  // The seat tests' judgement: ended where the wait for the end took less than the patience, the socket's timeout.
-  let judged_by_patience = started.elapsed() < TEST_LOOK;
+  // The seat tests' judgement: ended where the end came within the patience, the socket's timeout; not ended where the
+  // timeout answered first.
+  let judged_by_patience = loop {
+    match stream.read(&mut chunk) {
+      Ok(0) => break true,
+      Ok(_) => {}
+      Err(_) => break false,
+    }
+  };
   drop(stream);
   serving.join().expect("the listener's thread");
   let (mut stream, serving) = closing();

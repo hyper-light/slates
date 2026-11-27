@@ -223,10 +223,26 @@ pub(crate) fn stored_configured<T: Send + 'static, F: std::future::Future<Output
   history: impl FnOnce() -> F + Clone + Send + 'static,
   configure: impl FnOnce(&mut crate::DaemonConfig),
 ) -> T {
+  stored_patient(history, (configure, PATIENCE))
+}
+
+/// [`stored_configured`] with `patience` for the history in place of [`PATIENCE`]: for a history whose length is a bet
+/// on the lane's speed ([`lane_patience`]).
+pub(crate) fn stored_patient<T: Send + 'static, F: std::future::Future<Output = T> + 'static>(
+  history: impl FnOnce() -> F + Clone + Send + 'static,
+  (configure, patience): (impl FnOnce(&mut crate::DaemonConfig), std::time::Duration),
+) -> T {
   let (_store, daemon) = crate::test_store::audit_daemon_stored_configured(configure);
-  let out = crate::test_store::run_on_first(&daemon, history, PATIENCE);
+  let out = crate::test_store::run_on_first(&daemon, history, patience);
   daemon.stop();
   out
+}
+
+/// [`PATIENCE`] scaled by the lane's declared slowdown (`crate::test_lane::slowdown`): the patience of a history whose
+/// length is a bet on the lane's speed, never a bound the test asserts the daemon keeps (A-920: a wide import's history
+/// ran past the unscaled patience under ThreadSanitizer, diag 46018002586).
+pub(crate) fn lane_patience() -> std::time::Duration {
+  PATIENCE.saturating_mul(u32::try_from(crate::test_lane::slowdown()).unwrap_or(u32::MAX))
 }
 
 /// The shard's state, borrowed for one step of a history.

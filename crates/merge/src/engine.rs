@@ -4368,6 +4368,46 @@ impl Green {
     found
   }
 
+  /// A walk of the nodes [`Green::beneath`] lists beneath `path`, a node a [`Green::beneath_next`] and in no order of
+  /// its own (its files, then its directories), borrowing nothing between them: what a walk taken over steps keeps
+  /// (A-920: a deleted directory's 9,000 nodes listed and sorted in one unit of a build, 2.2 ms debug). The green must
+  /// not change between its nodes.
+  pub fn beneath_cursor(&self, path: &str) -> BeneathCursor {
+    let prefix = if path.is_empty() {
+      String::new()
+    } else {
+      format!("{path}/")
+    };
+    BeneathCursor {
+      files: self.content.prefix_cursor(&prefix),
+      dirs: self.dirs.prefix_cursor(&prefix),
+      in_dirs: false,
+    }
+  }
+
+  /// `cursor`'s next node beneath its path, with whether it is a directory: none once its walk has ended.
+  pub fn beneath_next(&self, cursor: &mut BeneathCursor) -> Option<(String, bool)> {
+    loop {
+      let found = if cursor.in_dirs {
+        self
+          .dirs
+          .cursor_next(&mut cursor.dirs)
+          .map(|(directory, _)| (directory, true))?
+      } else {
+        match self.content.cursor_next(&mut cursor.files) {
+          Some((file, _)) => (file, false),
+          None => {
+            cursor.in_dirs = true;
+            continue;
+          }
+        }
+      };
+      if !found.0.is_empty() {
+        return Some(found);
+      }
+    }
+  }
+
   /// IPC aliases share the primary inode's metadata; no independent value is stored at an alias.
   fn metadata_path<'a>(&'a self, path: &'a str) -> &'a str {
     self
@@ -9609,6 +9649,17 @@ fn special_payload(
     return Err(DocDecodeError::Truncated);
   }
   SpecialNode::decode(&post.span(op.src, op.len))
+}
+
+/// A walk of the nodes beneath a path ([`Green::beneath_cursor`]), kept between steps.
+#[derive(Debug, Default)]
+pub struct BeneathCursor {
+  /// The files' walk.
+  files: crate::ptrie::Cursor,
+  /// The directories' walk, once the files' has ended.
+  dirs: crate::ptrie::Cursor,
+  /// Whether the files' walk has ended.
+  in_dirs: bool,
 }
 
 mod branch;

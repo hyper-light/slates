@@ -112,7 +112,7 @@ const SKIPPED: [(&str, &str); 8] = [
 
 /// Shape: the server's tests the lane leaves out, each with why. A test here has no second thread for ThreadSanitizer to
 /// watch, and its instrumented run passes the step's limit; it still runs in every other lane.
-const SERVER_SKIPPED: [(&str, &str); 2] = [
+const SERVER_SKIPPED: [(&str, &str); 4] = [
   (
     "content_ranges::tests::a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes",
     "it sweeps one shard's content ranges alone, so it has no second thread to race, while every byte it holds to is \
@@ -126,6 +126,18 @@ const SERVER_SKIPPED: [(&str, &str); 2] = [
      times slowdown of every step cannot keep (diag 45527257702, 2026-11-24, ubuntu-latest, main f387b56d3: its only \
      failure); scaled by the build's cost the window would pass the unsliced import too (1,208 ms red against a 3.4 s \
      debug window), so the claim runs only where a step's time is the rule's",
+  ),
+  (
+    "vcs_store::svn_import::tests::t_a920_a_revision_copying_a_tree_of_thousands_of_files_imports_with_every_step_under_the_shards_window",
+    "its sibling's claim (the one above): every step of an import held to the shard's native liveness window, which \
+     the instrumentation's 10 to 20 times slowdown cannot keep; its history did not even end within the test's 120 s \
+     patience (diag 46018002586, 2026-11-27, main 56b609053: the history ended: Timeout)",
+  ),
+  (
+    "vcs_store::svn_import::tests::t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step_under_the_shards_window",
+    "its sibling's claim (the one above): every step of an import held to the shard's native liveness window, which \
+     the instrumentation's 10 to 20 times slowdown cannot keep; its history did not even end within the test's 120 s \
+     patience (diag 46018002586, 2026-11-27, main 56b609053: the history ended: Timeout)",
   ),
 ];
 

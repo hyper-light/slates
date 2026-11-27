@@ -65235,6 +65235,26 @@ GAPS.
     leaders now are move's `stage.build` (2.1 ms) and the cold first `create` (2.3), then `stage.recording`,
     `landing.follow`, `stage.bringing` and `landing.holds` at 1.0-1.4 ms. Copy's `landing.prepare` read 11 ms of wall
     against 32 µs of CPU: preemption, not work.
+  **A removed directory's tree walked a node a unit in the build** (`ptrie::Cursor`, `Green::beneath_cursor`). Move's
+  `stage.build` (2.1 ms) named (debug): the step that took its trunk's deletion, 2.2 ms. Its `remove_begin` listed
+  every node the green held beneath the directory and sorted them (`Green::beneath`, 9,000) in the row's one unit,
+  then noted them gone a node a unit (9b). Every other build step was under 0.7 ms.
+  - The ptrie's walk is now a `Cursor` that borrows no arena between its keys, each `next` lent the arena; `Iter` is a
+    cursor and its arena, one walk.
+  - `Dim` and `Files` give prefix cursors, and `Green::beneath_cursor` and `beneath_next` walk a path's files, then its
+    directories, a node a call.
+  - The build's `Removing` keeps the cursor between steps in place of the listed tree. The order is the cursor's: each
+    node is only noted in a map of gone paths.
+  - A replacement, which remakes the node in its row, still lists its tree whole (`Building::remove`). Gauge
+    `svn_commit::BUILD_MOST_LISTED_A_UNIT`, the most nodes a build unit listed whole, recorded where one is listed.
+  - The move test bounds a build unit's gone paths and listed nodes at one; red at 9,000 with the deletion's tree
+    listed.
+  **The wide tests under ThreadSanitizer** (main's order, diag 46018002586 at 56b609053). The copy's and the move's
+  wide tests hold every step to the shard's native window, which the lane's 10 to 20 times slowdown cannot keep; their
+  histories did not even end within the 120 s patience. They join `t_c2c` in the lane's `SERVER_SKIPPED`
+  (`xtask/src/tsan.rs`), with the run cited. The removal's wide test asserts no step's time, so its history's patience
+  is the lane's (`svn_commit::tests::lane_patience`: 120 s times `test_lane::slowdown`, 25 in that lane), through
+  `stored_patient`, of which `stored_configured` is the unscaled case.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
@@ -65294,7 +65314,9 @@ measured noise of the 100 figure, not a literal.
 > the same descriptors as a direct one. Linux (main's diag run 45666757721, 4-core runners, debug): through the
 > spawner 69.9 and 69.8 µs at 100 and 10,000 descriptors on x86_64, 96.9 and 98.5 on arm; direct 193.1 → 531.9 µs on
 > x86_64, 284.3 → 332.7 on arm. The runners' hard `RLIMIT_NOFILE` is 65,536, so the measure holds the most it may and
-> says so (`SPAWN-HELD`).
+> says so (`SPAWN-HELD`). Since 2026-11-27 (diag CI 10's macos-latest, whose per-process cap is about 10,240) the most is
+> also the system's own cap, less the descriptor numbers a spawn's streams need (`SPAWN_STREAMS`, 3). A count no
+> larger than the row before makes no row, and fewer than two rows skip the test, saying so.
 >
 > **Piece 2a built (2026-11-25).** `Daemon::start` starts the spawner once its runtime is built, before any client's
 > descriptor is open (`slates_ipc::spawner::start_here`: this executable with `spawner_role --exact --nocapture`; the

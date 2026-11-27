@@ -767,18 +767,26 @@ fn build_some_in(
           &mut spent,
           (head, work_identity),
         );
-        Ok((stepped, building.most_gone()))
+        Ok((stepped, (building.most_gone(), building.most_listed())))
       })
       .ok_or(Uncommitted::NotHeld)?
   })
-  .and_then(|(stepped, most_gone)| {
-    let most = state
-      .refusals
-      .entry(super::BUILD_MOST_GONE_A_UNIT)
-      .or_insert(0);
-    *most = (*most).max(most_gone);
+  .and_then(|(stepped, mosts)| {
+    build_gauges_kept(state, mosts);
     stepped
   })
+}
+
+/// A build step's most gone paths a unit and most nodes listed whole a unit kept in the shard's gauges, each its largest
+/// ([`super::BUILD_MOST_GONE_A_UNIT`], [`super::BUILD_MOST_LISTED_A_UNIT`]).
+fn build_gauges_kept(state: &mut ShardState, (most_gone, most_listed): (u64, u64)) {
+  for (gauge, value) in [
+    (super::BUILD_MOST_GONE_A_UNIT, most_gone),
+    (super::BUILD_MOST_LISTED_A_UNIT, most_listed),
+  ] {
+    let most = state.refusals.entry(gauge).or_insert(0);
+    *most = (*most).max(value);
+  }
 }
 
 /// Whether a build step's slice is spent ([`build_some_in`]): `by_clock`, but in the tests that take every build a unit a

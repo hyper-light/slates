@@ -925,17 +925,21 @@ fn wide_removal(files: usize) -> Vec<u8> {
 
 /// A-920 piece 5 (main's order of 2026-11-25: the released fold's cost). Do: import [`wide_revisions`]' one revision
 /// adding [`WIDE_REVISION_FILES`] files, landed; then import [`wide_removal`]'s revision 2 removing every one, whose
-/// batch lets go every text from before it. Expect both imports whole.
+/// batch lets go every text from before it. Expect both imports whole. It asserts no step's time, so its history's
+/// patience is the lane's (`lane_patience`: ThreadSanitizer's lane ran it past the unscaled 120 s, diag 46018002586).
 #[test]
 fn t_a920_a_revision_removing_thousands_of_files_imports_whole() {
   let added = wide_revisions(WIDE_REVISION_FILES, WIDE_TEXT_BYTES, (1, false));
   let removed = wide_removal(WIDE_REVISION_FILES);
-  let (first, second) = stored(move || async move {
+  let history = move || async move {
     let (svn, _green) = subversion("wide-removal").await;
     let first = imported(svn, added).await.0.map(|loaded| loaded.youngest);
     let second = imported(svn, removed).await.0.map(|loaded| loaded.youngest);
     (first, second)
-  });
+  };
+  let patience = crate::repository::svn_commit::tests::lane_patience();
+  let (first, second) =
+    crate::repository::svn_commit::tests::stored_patient(history, (|_| {}, patience));
   assert_eq!((first, second), (Ok(1), Ok(2)));
 }
 
@@ -1176,8 +1180,13 @@ fn imported_whole_and_stepped(name: &'static str, dump: Vec<u8>) -> ImportedWhol
           crate::repository::svn_commit::staging::RECORDING_WALK_MOST_FILES,
         )
       });
-      let gone_most =
-        on(|state| count(state, crate::repository::svn_commit::BUILD_MOST_GONE_A_UNIT));
+      // The most gone paths a build unit noted, or nodes it listed whole beneath a removed directory (A-920).
+      let gone_most = on(|state| {
+        count(state, crate::repository::svn_commit::BUILD_MOST_GONE_A_UNIT).max(count(
+          state,
+          crate::repository::svn_commit::BUILD_MOST_LISTED_A_UNIT,
+        ))
+      });
       let grafted = on(|state| {
         state
           .greens
@@ -1654,8 +1663,9 @@ fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step
   );
   let (loaded, longest_ns, window_ns, (grafted, build_units, walk_most, gone_most)) =
     imported_whole_and_stepped("wide-move", dump);
-  // The move's delete of the trunk noted gone, and its paths made ops, a path a unit in its build (A-920 9b: the row
-  // 13.7 ms and the build's end 6.6 ms for 9,001 paths in one unit each, debug).
+  // The move's delete of the trunk walked, noted gone and its paths made ops a path a unit in its build (A-920 9b: the
+  // row 13.7 ms and the build's end 6.6 ms for 9,001 paths in one unit each, debug; and its tree listed whole in the
+  // row's unit, 2.2 ms, red at 9,000).
   assert!(
     gone_most <= 1,
     "a unit of the move's build noted {gone_most} gone paths"
