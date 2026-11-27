@@ -1686,3 +1686,71 @@ fn round5_blocker1_private_propfind_filters_revprops_by_revision_access() {
     );
   }
 }
+
+fn assert_private_propfind_status(
+  served: &Served<'_, RevpropRepo>,
+  targets: &[(&str, Option<&str>)],
+  expected_status: u16,
+  expected_code: &str,
+) {
+  for &(path, label) in targets {
+    let req = Request {
+      method: "PROPFIND",
+      path,
+      depth: Some("0"),
+      label,
+      body: PROPFIND_ALL,
+    };
+    let ans = whole(answer(served, &req, &BOUNDS, ROOM));
+    let body = text_of(&ans);
+    assert_eq!(ans.status, expected_status, "{path} ({label:?}): {body}");
+    assert!(
+      body.contains(expected_code),
+      "{path} ({label:?}) missing {expected_code}: {body}"
+    );
+  }
+}
+
+/// Round-6 Nit (`filtered_revision_properties` storage error propagation): Do PROPFIND on
+/// `!svn/rev/1`, `!svn/bln/1`, and `!svn/vcc/default` (`Label: 1`) when `revision_properties(1)`
+/// returns `None` (missing/corrupt revprop storage for an existing revision), and also PROPFIND on
+/// nonexistent revision `999`. Expect: missing revprop storage propagates HTTP `500` with
+/// `SVN_ERR_FS_CORRUPT` (`160004`) instead of silently returning `207` with empty properties,
+/// while nonexistent revision `999` still returns HTTP `404` with `SVN_ERR_FS_NO_SUCH_REVISION`
+/// (`160006`).
+#[test]
+fn round6_nit_filtered_revision_properties_propagates_storage_error() {
+  let (index, mut repo, rules) = revprop_test_repo();
+  // Truncate revprop storage after r0 so existing r1 returns `None` (corrupt storage).
+  repo.revisions.truncate(1);
+  let locks = LockTable::new();
+  let served = Served {
+    index: &index,
+    repository: &repo,
+    root: ROOT,
+    uuid: UUID,
+    locks: &locks,
+    rules: Some(&rules),
+    now: NOW,
+  };
+  assert_private_propfind_status(
+    &served,
+    &[
+      ("/!svn/rev/1", None),
+      ("/!svn/bln/1", None),
+      ("/!svn/vcc/default", Some("1")),
+    ],
+    HTTP_INTERNAL_SERVER_ERROR,
+    "160004",
+  );
+  assert_private_propfind_status(
+    &served,
+    &[
+      ("/!svn/rev/999", None),
+      ("/!svn/bln/999", None),
+      ("/!svn/vcc/default", Some("999")),
+    ],
+    HTTP_NOT_FOUND,
+    "160006",
+  );
+}

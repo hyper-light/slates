@@ -1771,19 +1771,24 @@ pub(crate) async fn post_lock_hook(
   .verdict
 }
 
-/// Runs the hook the commit's drive waits for (A-730): start-commit at `open-root` with the user, the client's
-/// capabilities and the transaction; pre-commit at `close-edit` with the transaction and the lock tokens the commit
-/// presented; each over the repository's policy ([`run_hook`]). Its verdict resumes the drive, as `svnserve`'s does: on,
-/// or refused in `check_hook_result`'s words. A client that left before the hook ended ends the conversation. A drive the
-/// answer lets accept its work lands it ([`land`]).
-async fn answer_hook(
+/// Result of resolving a commit hook step before resuming `Connection::answer_hook`.
+enum DueAnswer {
+  /// Resume the commit drive with this hook verdict (`Ok(())` or `Err(chain)`).
+  Resume(Result<(), Vec<(u32, String)>>),
+  /// The repository's Subversion store is missing on this shard; `E160004` was already written.
+  StoreMissing,
+  /// The client disconnected or the conversation lacked an open session; end the connection.
+  End,
+}
+
+/// Runs `HookPoint::SvnStartCommit` for the pending `open-root` transaction.
+async fn start_commit_answer(
   stream: &TcpStream,
-  conversation: &mut Conversation,
-  due: &Due,
-  out: &mut Vec<u8>,
-) -> bool {
-  let Some(opened) = conversation.opened.as_ref().map(Opened::hooked) else {
-    return false;
+  conversation: &Conversation,
+  transaction: &str,
+) -> DueAnswer {
+  let Some(hooked) = conversation.opened.as_ref().map(Opened::hooked) else {
+    return DueAnswer::End;
   };
   let (user, mergeinfo) = conversation
     .connection
@@ -1795,53 +1800,121 @@ async fn answer_hook(
       )
     })
     .unwrap_or_default();
-  let tokens: Vec<LockToken> = conversation
-    .connection
-    .pending()
-    .map(|pending| pending.lock_tokens())
-    .unwrap_or_default()
-    .into_iter()
-    .map(|(path, token)| LockToken { path, token })
-    .collect();
   let base = conversation
     .connection
     .pending()
     .map_or(0, |pending| pending.base);
+  let capabilities: &[&str] = if mergeinfo { &[MERGEINFO] } else { &[] };
   let words_cap = conversation.limits.item_bytes;
-  let ran = match due {
-    Due::StartCommit { transaction } => {
-      let capabilities: &[&str] = if mergeinfo { &[MERGEINFO] } else { &[] };
-      run_hook(
-        HookSite::Listener(stream),
-        &opened,
-        words_cap,
-        HookPoint::SvnStartCommit,
-        |env, repos| {
-          vcs_hooks::svn_start_commit(
-            PendingView(base),
-            env,
-            repos,
-            &user,
-            capabilities,
-            transaction,
-          )
-        },
+  match run_hook(
+    HookSite::Listener(stream),
+    &hooked,
+    words_cap,
+    HookPoint::SvnStartCommit,
+    |env, repos| {
+      vcs_hooks::svn_start_commit(
+        PendingView(base),
+        env,
+        repos,
+        &user,
+        capabilities,
+        transaction,
       )
-      .await
+    },
+  )
+  .await
+  .verdict
+  {
+    Some(verdict) => DueAnswer::Resume(verdict),
+    None => DueAnswer::End,
+  }
+}
+
+/// Authorizes the pending commit's changes (including copy-from sources and deleted/replaced
+/// directory subtrees) BEFORE invoking `HookPoint::SvnPreCommit`, refusing unauthorized commits
+/// with `E170001` without running the hook.
+async fn pre_commit_answer(
+  stream: &TcpStream,
+  conversation: &mut Conversation,
+  transaction: &str,
+  out: &mut Vec<u8>,
+) -> DueAnswer {
+  let (Some(opened), Some(principal)) = (
+    conversation.opened.as_ref(),
+    conversation.principal.as_ref(),
+  ) else {
+    return DueAnswer::End;
+  };
+  let Some(pending) = conversation.connection.pending() else {
+    return DueAnswer::End;
+  };
+  let base = pending.base;
+  let changes: Vec<slates_svn::index::ChangedPath> = pending.rows.values().cloned().collect();
+  let tokens: Vec<LockToken> = pending
+    .lock_tokens()
+    .into_iter()
+    .map(|(path, token)| LockToken { path, token })
+    .collect();
+  let name = opened.name.clone();
+  let hooked = opened.hooked();
+  match svn_pending_authorized(&name, principal, base, &changes) {
+    CommitAuthz::Allowed(_) => {}
+    CommitAuthz::Denied => {
+      if let Some(opened) = conversation.opened.as_ref() {
+        opened.texts.clear();
+      }
+      return DueAnswer::Resume(Err(vec![(
+        NOT_AUTHORIZED,
+        "Authorization failed".to_owned(),
+      )]));
+    }
+    CommitAuthz::StoreMissing => {
+      if let Some(opened) = conversation.opened.as_ref() {
+        opened.texts.clear();
+      }
+      fail_store_missing(&mut conversation.connection, &name, out);
+      return DueAnswer::StoreMissing;
+    }
+  }
+  let words_cap = conversation.limits.item_bytes;
+  match run_hook(
+    HookSite::Listener(stream),
+    &hooked,
+    words_cap,
+    HookPoint::SvnPreCommit,
+    |env, repos| vcs_hooks::svn_pre_commit(PendingView(base), env, repos, transaction, &tokens),
+  )
+  .await
+  .verdict
+  {
+    Some(verdict) => DueAnswer::Resume(verdict),
+    None => DueAnswer::End,
+  }
+}
+
+/// Runs the hook the commit's drive waits for (A-730): start-commit at `open-root` with the user, the client's
+/// capabilities and the transaction; pre-commit at `close-edit` AFTER per-path and subtree authorization
+/// ([`pre_commit_answer`]) with the transaction and the lock tokens the commit presented; each over the repository's
+/// policy ([`run_hook`]). Its verdict resumes the drive, as `svnserve`'s does: on, or refused in `check_hook_result`'s
+/// words. A client that left before the hook ended ends the conversation. A drive the answer lets accept its work
+/// lands it ([`land`]), which re-checks live authorization before committing.
+async fn answer_hook(
+  stream: &TcpStream,
+  conversation: &mut Conversation,
+  due: &Due,
+  out: &mut Vec<u8>,
+) -> bool {
+  let due_answer = match due {
+    Due::StartCommit { transaction } => {
+      start_commit_answer(stream, conversation, transaction).await
     }
     Due::PreCommit { transaction } => {
-      run_hook(
-        HookSite::Listener(stream),
-        &opened,
-        words_cap,
-        HookPoint::SvnPreCommit,
-        |env, repos| vcs_hooks::svn_pre_commit(PendingView(base), env, repos, transaction, &tokens),
-      )
-      .await
+      pre_commit_answer(stream, conversation, transaction, out).await
     }
   };
-  let Some(answer) = ran.verdict else {
-    return false;
+  let answer = match due_answer {
+    DueAnswer::Resume(verdict) => verdict,
+    DueAnswer::StoreMissing | DueAnswer::End => return false,
   };
   let Conversation {
     connection,
@@ -2106,6 +2179,82 @@ enum CommitAuthz {
   Denied,
   /// The repository's Subversion store is not held on this shard.
   StoreMissing,
+}
+
+/// Checks pending commit `changes` against `repo`'s policy at live HEAD and, when `base` differs,
+/// also at the transaction's `base` revision (covering copy-from sources and deleted or replaced
+/// directory subtrees).
+pub(crate) fn admit_pending_changes(
+  repo: &slates_db::catalog::RepositoryRecord,
+  principal: &Principal,
+  index: &slates_svn::index::Index,
+  base: slates_svn::index::Revision,
+  changes: &[slates_svn::index::ChangedPath],
+) -> Result<(), crate::vcs_policy::PushRefusal> {
+  if !matches!(
+    crate::vcs_policy::svn_access(repo, principal)?,
+    crate::vcs_policy::SvnAccess::Write
+  ) {
+    return Err(crate::vcs_policy::PushRefusal::NotPermitted { index: 0 });
+  }
+  let head = index.youngest();
+  crate::vcs_policy::admit_svn_changes(
+    &repo.owner,
+    &repo.policy,
+    principal,
+    (index, head),
+    changes,
+  )?;
+  if base != head {
+    crate::vcs_policy::admit_svn_changes(
+      &repo.owner,
+      &repo.policy,
+      principal,
+      (index, base),
+      changes,
+    )?;
+  }
+  Ok(())
+}
+
+/// Authorizes pending commit `changes` against the live repository record and index on `state`.
+fn authorize_pending_in(
+  state: &mut crate::state::ShardState,
+  name: &str,
+  principal: &Principal,
+  base: slates_svn::index::Revision,
+  changes: &[slates_svn::index::ChangedPath],
+) -> CommitAuthz {
+  let Some(repo) = state
+    .db
+    .partition()
+    .repositories()
+    .repository_named(name)
+    .cloned()
+  else {
+    return CommitAuthz::Denied;
+  };
+  let admitted = crate::vcs_store::svn_view::lend_in(state, repo.id, |lent| {
+    admit_pending_changes(&repo, principal, lent.index, base, changes)
+  });
+  match admitted {
+    None => CommitAuthz::StoreMissing,
+    Some(Ok(())) => CommitAuthz::Allowed(repo.owner),
+    Some(Err(_)) => CommitAuthz::Denied,
+  }
+}
+
+/// Checks per-path Subversion policy (including deleted/replaced and copied directory subtrees)
+/// for pending commit `changes` against the live repository record and index on this shard BEFORE
+/// running `HookPoint::SvnPreCommit`, failing closed (`CommitAuthz::Denied`) when no record exists.
+fn svn_pending_authorized(
+  name: &str,
+  principal: &Principal,
+  base: slates_svn::index::Revision,
+  changes: &[slates_svn::index::ChangedPath],
+) -> CommitAuthz {
+  crate::state::with_state(|state| authorize_pending_in(state, name, principal, base, changes))
+    .unwrap_or(CommitAuthz::Denied)
 }
 
 /// Checks per-path Subversion policy (including deleted/replaced and copied directory subtrees)
@@ -3665,5 +3814,363 @@ mod redteam_tests {
     assert_svn_per_path_reads(&mut stream);
     let trunk_token = assert_svn_per_path_locks(&mut stream);
     assert_svn_per_path_unlocks(&mut stream, &trunk_token);
+  }
+
+  fn pending_change(
+    path: &str,
+    action: slates_svn::index::Action,
+    kind: slates_svn::index::NodeKind,
+    copy_from: Option<(&str, u64)>,
+  ) -> slates_svn::index::ChangedPath {
+    slates_svn::index::ChangedPath {
+      path: path.to_owned(),
+      action,
+      kind,
+      copy_from: copy_from.map(|(src, revision)| slates_svn::index::CopySource {
+        path: src.to_owned(),
+        revision,
+      }),
+      text: None,
+      properties: None,
+      mergeinfo_modified: false,
+    }
+  }
+
+  /// Round-6 Blocker 1 (pure-RAM unit check of `admit_pending_changes` & `svn_pending_authorized`):
+  /// Do check direct denied write (`/tags/blocked`), denied subtree delete (`/pub` containing
+  /// denied `/pub/secret/vault.txt`), denied copy-from (`/exfil` copying `/pub`), allowed write
+  /// (`/trunk/ok.txt`), and missing repository record. Expect: every unauthorized commit is refused
+  /// before any `pre-commit` hook runs while permitted changes succeed.
+  #[test]
+  fn round6_blocker1_admit_pending_changes_rejects_direct_write_and_subtree_delete() {
+    use slates_db::catalog::{
+      ObjectFormat as DbFormat, PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyRule,
+      PolicyWho, RepositoryId, RepositoryPolicy, RepositoryRecord, VcsTool as DbTool,
+    };
+    use slates_svn::index::{Action, Index, NodeKind, RevisionRecord};
+    let mut index = Index::new();
+    let seed = seed_policy_tree_revision();
+    index.append(seed.record, 1 << 10).unwrap();
+    let stranger = uid_principal(STRANGER);
+    let only_stranger = PolicyWho::AnyOf {
+      entries: vec![PolicyEntry::Is {
+        principal: stranger.clone(),
+      }],
+    };
+    let rule =
+      |pattern: &str, right: PolicyRight, effect: PolicyEffect, who: PolicyWho| PolicyRule {
+        names: PolicyNames::Paths,
+        pattern: pattern.to_owned(),
+        right,
+        effect,
+        who,
+      };
+    let repo = RepositoryRecord {
+      index_bits: 0,
+      id: RepositoryId { bytes: [1; 16] },
+      name: "pending-authz".to_owned(),
+      tool: DbTool::Subversion,
+      format: DbFormat::Revisions,
+      owner: uid_principal(OWNER),
+      default_branch: Some("trunk".to_owned()),
+      policy: RepositoryPolicy {
+        version: 1,
+        rules: vec![
+          rule(
+            "/",
+            PolicyRight::Read,
+            PolicyEffect::Allow,
+            PolicyWho::Anyone,
+          ),
+          rule(
+            "/pub/secret",
+            PolicyRight::Read,
+            PolicyEffect::Deny,
+            only_stranger.clone(),
+          ),
+          rule(
+            "/trunk",
+            PolicyRight::Submit,
+            PolicyEffect::Allow,
+            only_stranger.clone(),
+          ),
+          rule(
+            "/pub",
+            PolicyRight::Submit,
+            PolicyEffect::Allow,
+            only_stranger.clone(),
+          ),
+          rule(
+            "/tags",
+            PolicyRight::Submit,
+            PolicyEffect::Deny,
+            only_stranger,
+          ),
+        ],
+        hooks: Vec::new(),
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+        hg_publishing: true,
+      },
+    };
+    let denied_write = [pending_change(
+      "/tags/blocked",
+      Action::Add,
+      NodeKind::Directory,
+      None,
+    )];
+    let denied_subtree = [pending_change(
+      "/pub",
+      Action::Delete,
+      NodeKind::Directory,
+      None,
+    )];
+    let denied_copy = [pending_change(
+      "/trunk/exfil",
+      Action::Add,
+      NodeKind::Directory,
+      Some(("/pub", 1)),
+    )];
+    let allowed_write = [pending_change(
+      "/trunk/okdir",
+      Action::Add,
+      NodeKind::Directory,
+      None,
+    )];
+    assert!(super::admit_pending_changes(&repo, &stranger, &index, 1, &denied_write).is_err());
+    assert!(super::admit_pending_changes(&repo, &stranger, &index, 1, &denied_subtree).is_err());
+    assert!(super::admit_pending_changes(&repo, &stranger, &index, 1, &denied_copy).is_err());
+    assert!(super::admit_pending_changes(&repo, &stranger, &index, 1, &allowed_write).is_ok());
+
+    // Advance HEAD (r2 removes /pub/secret) while pending transaction still has base=1:
+    // base != head must still catch protected descendants at base=1.
+    index
+      .append(
+        RevisionRecord {
+          transaction: "1-1".to_owned(),
+          changes: vec![pending_change(
+            "/pub/secret",
+            Action::Delete,
+            NodeKind::Directory,
+            None,
+          )],
+        },
+        1 << 10,
+      )
+      .unwrap();
+    assert!(super::admit_pending_changes(&repo, &stranger, &index, 1, &denied_subtree).is_err());
+    assert_eq!(
+      super::svn_pending_authorized("missing-repo", &stranger, 1, &allowed_write),
+      super::CommitAuthz::Denied
+    );
+  }
+
+  #[cfg(unix)]
+  fn read_hook_marks(path: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+      .unwrap_or_default()
+      .lines()
+      .map(str::to_owned)
+      .collect()
+  }
+
+  #[cfg(unix)]
+  fn assert_denied_ra_svn_commit_skips_pre_commit(
+    stream: &mut ClientStream,
+    wire_commit: &[u8],
+    mark_file: &std::path::Path,
+    label: &str,
+  ) {
+    stream.write_all(wire_commit).unwrap();
+    let refused = read_items(stream, 3);
+    assert!(
+      refused.contains("170001") && refused.contains("Authorization failed"),
+      "{label}: expected E170001 Authorization failed, got {refused}"
+    );
+    assert!(
+      read_hook_marks(mark_file).is_empty(),
+      "{label}: pre-commit hook must NOT run on unauthorized commit"
+    );
+    stream
+      .write_all(b"( abort-edit ( ) ) ( get-latest-rev ( ) ) ")
+      .unwrap();
+    let latest = read_items(stream, 2);
+    assert_eq!(
+      latest, "( success ( ( ) 0: ) ) ( success ( 1 ) ) ",
+      "{label}: connection must recover cleanly after abort-edit with HEAD unchanged"
+    );
+  }
+
+  #[cfg(unix)]
+  fn seed_pre_commit_authz_repo(
+    daemon: &crate::test_store::StoredDaemon,
+    name: &str,
+    pre_hook: String,
+  ) {
+    use slates_ipc::protocol::{
+      HookConfig, HookPointName, PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyRule,
+      PolicyWho,
+    };
+    let asked = (name, VcsTool::Subversion, ObjectFormat::Revisions, "trunk");
+    let (id, _) = crate::test_store::create_on(daemon, OTHER, &uid_principal(OWNER), asked);
+    let committed = crate::test_store::run_at(
+      daemon,
+      OTHER,
+      move || async move {
+        crate::repository::svn_commit::tests::commit(
+          (&uid_principal(OWNER), id),
+          seed_policy_tree_revision(),
+          None,
+        )
+        .await
+      },
+      Duration::from_secs(60),
+    );
+    assert!(committed.is_ok(), "{committed:?}");
+    let only_stranger = PolicyWho::AnyOf {
+      entries: vec![PolicyEntry::Is {
+        principal: slates_ipc::protocol::Principal::Uid {
+          host: 0,
+          uid: STRANGER,
+        },
+      }],
+    };
+    let rule =
+      |pattern: &str, right: PolicyRight, effect: PolicyEffect, who: PolicyWho| PolicyRule {
+        names: PolicyNames::Paths,
+        pattern: pattern.to_owned(),
+        right,
+        effect,
+        who,
+      };
+    let reply = crate::daemon::observe_at(daemon, OTHER, {
+      let name = name.to_owned();
+      move |state| {
+        crate::verbs::dispatch(
+          state,
+          1,
+          &uid_principal(OWNER),
+          RequestBody::SetRepositoryPolicy {
+            repository: name,
+            read: 0,
+            rules: vec![
+              rule(
+                "/",
+                PolicyRight::Read,
+                PolicyEffect::Allow,
+                PolicyWho::Anyone,
+              ),
+              rule(
+                "/pub/secret",
+                PolicyRight::Read,
+                PolicyEffect::Deny,
+                only_stranger.clone(),
+              ),
+              rule(
+                "/trunk",
+                PolicyRight::Submit,
+                PolicyEffect::Allow,
+                only_stranger.clone(),
+              ),
+              rule(
+                "/pub",
+                PolicyRight::Submit,
+                PolicyEffect::Allow,
+                only_stranger.clone(),
+              ),
+              rule(
+                "/tags",
+                PolicyRight::Submit,
+                PolicyEffect::Deny,
+                only_stranger,
+              ),
+            ],
+            hooks: vec![HookConfig {
+              point: HookPointName::SvnPreCommit,
+              name: "pre-commit".to_owned(),
+              program: pre_hook,
+            }],
+            hooks_env: Vec::new(),
+            signers: Vec::new(),
+            hg_publishing: true,
+          },
+        )
+      }
+    });
+    assert_eq!(reply, ReplyBody::Acknowledged);
+  }
+
+  /// Round-6 Blocker 1 (`ra_svn` authz BEFORE `HookPoint::SvnPreCommit`): Do configure a
+  /// `pre-commit` hook that records invocations, then over `svn://` on one connection as `STRANGER`
+  /// attempt (1) direct denied write under `/tags/subnew`, (2) denied subtree delete of `/pub`
+  /// (containing denied `/pub/secret/vault.txt`), and (3) allowed write under `/trunk/okdir`.
+  /// Expect: (1) and (2) fail with `E170001` (`Authorization failed`), execute ZERO `pre-commit`
+  /// hooks, and recover cleanly after `abort-edit` with HEAD at r1; (3) runs `pre-commit` exactly
+  /// once and commits r2.
+  #[cfg(unix)]
+  #[test]
+  fn round6_blocker1_ra_svn_authorizes_before_pre_commit_hook() {
+    let dir = crate::git_hooks::tests::ScratchDir::new();
+    let mark = dir.path.join("pre.ran");
+    let pre_hook = super::tests::hook_script(
+      &dir.path,
+      "pre-commit",
+      &format!(
+        "if [ \"$#\" -ge 2 ]; then echo \"$2\" >> {}; fi",
+        mark.display()
+      ),
+    );
+    let daemon = start_daemon();
+    daemon
+      .record_root_mount(std::path::Path::new(super::tests::TEST_ROOT))
+      .expect("root mount recorded");
+    let port = daemon.vcs_svn_port().expect("listener port");
+    let user = enroll_token(&daemon, STRANGER, STRANGER_TOKEN);
+    let name = name_on("svn-precommit-authz-", OTHER);
+    seed_pre_commit_authz_repo(&daemon, &name, pre_hook);
+
+    let url = format!("svn://127.0.0.1:{port}/{name}");
+    let mut stream = establish_cram(port, &url, &user, STRANGER_TOKEN);
+    stream
+      .set_read_timeout(Some(Duration::from_nanos(60 * PATIENCE_NS)))
+      .expect("hook read timeout");
+
+    let direct_denied = b"( commit ( 6:denied ( ) false ( ( 7:svn:log 6:denied ) ) ) ) \
+( open-root ( ( 1 ) 2:d0 ) ) \
+( open-dir ( 4:tags 2:d0 2:d1 ( 1 ) ) ) \
+( add-dir ( 11:tags/subnew 2:d1 2:d2 ( ) ) ) \
+( close-dir ( 2:d2 ) ) ( close-dir ( 2:d1 ) ) ( close-dir ( 2:d0 ) ) \
+( close-edit ( ) ) ";
+    assert_denied_ra_svn_commit_skips_pre_commit(&mut stream, direct_denied, &mark, "direct write");
+
+    let subtree_denied = b"( commit ( 6:delpub ( ) false ( ( 7:svn:log 6:delpub ) ) ) ) \
+( open-root ( ( 1 ) 2:d0 ) ) \
+( delete-entry ( 3:pub ( 1 ) 2:d0 ) ) \
+( close-dir ( 2:d0 ) ) \
+( close-edit ( ) ) ";
+    assert_denied_ra_svn_commit_skips_pre_commit(
+      &mut stream,
+      subtree_denied,
+      &mark,
+      "subtree delete",
+    );
+
+    let allowed_commit = b"( commit ( 7:allowed ( ) false ( ( 7:svn:log 7:allowed ) ) ) ) \
+( open-root ( ( 1 ) 2:d0 ) ) \
+( open-dir ( 5:trunk 2:d0 2:d1 ( 1 ) ) ) \
+( add-dir ( 11:trunk/okdir 2:d1 2:d2 ( ) ) ) \
+( close-dir ( 2:d2 ) ) ( close-dir ( 2:d1 ) ) ( close-dir ( 2:d0 ) ) \
+( close-edit ( ) ) ";
+    stream.write_all(allowed_commit).unwrap();
+    let committed = read_items(&mut stream, 5);
+    assert!(
+      committed.contains("( 2 ") && !committed.contains("failure"),
+      "allowed commit must land as r2: {committed}"
+    );
+    assert_eq!(
+      read_hook_marks(&mark).len(),
+      1,
+      "pre-commit hook must run exactly once for the authorized control commit"
+    );
   }
 }

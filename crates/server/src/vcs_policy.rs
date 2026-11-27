@@ -501,10 +501,51 @@ const EXCLUDED_SEGMENT_BYTES: &[u8] = &[0, b'/'];
 /// Format: valid non-NUL, non-slash bytes in a Subversion path segment (`256 - 2 = 254`).
 const VALID_SEGMENT_BYTES: usize = (1usize << u8::BITS) - EXCLUDED_SEGMENT_BYTES.len();
 
-/// Derived: upper bound on product-NFA states explored per witness query (`VALID_SEGMENT_BYTES^2`),
-/// derived strictly from the valid segment byte domain so realistic policies run to exact
-/// completion while pathological PSPACE-hard glob intersections stay bounded.
+/// Derived: upper bound on NFA-Allow × DFA-Deny product states explored per witness query
+/// (`VALID_SEGMENT_BYTES^2`), derived from the valid segment byte domain so realistic policies
+/// (including zero-deny nondeterministic allow globs, which stay linear in pattern length) run to
+/// exact completion while pathological PSPACE-hard multi-deny glob complementation stays bounded
+/// and returns [`WitnessOutcome::BudgetExceeded`].
 const WITNESS_STATE_BUDGET: usize = VALID_SEGMENT_BYTES * VALID_SEGMENT_BYTES;
+
+/// Format: RFC 3629 §4 highest 1-byte ASCII scalar byte (`0x7F`).
+const UTF8_ASCII_MAX: u8 = 0x7F;
+/// Format: RFC 3629 §4 lowest UTF-8 continuation byte (`0x80`).
+const UTF8_CONT_MIN: u8 = 0x80;
+/// Format: RFC 3629 §4 highest second byte after `0xF4` (`0x8F`, caps scalars at `U+10FFFF`).
+const UTF8_F4_SECOND_MAX: u8 = 0x8F;
+/// Format: RFC 3629 §4 lowest second byte after `0xF0` (`0x90`, rejects overlong 4-byte forms).
+const UTF8_F0_SECOND_MIN: u8 = 0x90;
+/// Format: RFC 3629 §4 highest second byte after `0xED` (`0x9F`, rejects UTF-16 surrogates).
+const UTF8_ED_SECOND_MAX: u8 = 0x9F;
+/// Format: RFC 3629 §4 lowest second byte after `0xE0` (`0xA0`, rejects overlong 3-byte forms).
+const UTF8_E0_SECOND_MIN: u8 = 0xA0;
+/// Format: RFC 3629 §4 highest UTF-8 continuation byte (`0xBF`).
+const UTF8_CONT_MAX: u8 = 0xBF;
+/// Format: RFC 3629 §4 lowest valid 2-byte lead (`0xC2`, rejects overlong `0xC0..=0xC1`).
+const UTF8_LEAD2_MIN: u8 = 0xC2;
+/// Format: RFC 3629 §4 highest valid 2-byte lead (`0xDF`).
+const UTF8_LEAD2_MAX: u8 = 0xDF;
+/// Format: RFC 3629 §4 overlong-guarded 3-byte lead (`0xE0`).
+const UTF8_LEAD3_E0: u8 = 0xE0;
+/// Format: RFC 3629 §4 lowest unrestricted 3-byte lead below `0xED` (`0xE1`).
+const UTF8_LEAD3_LO_MIN: u8 = 0xE1;
+/// Format: RFC 3629 §4 highest unrestricted 3-byte lead below `0xED` (`0xEC`).
+const UTF8_LEAD3_LO_MAX: u8 = 0xEC;
+/// Format: RFC 3629 §4 surrogate-guarded 3-byte lead (`0xED`).
+const UTF8_LEAD3_ED: u8 = 0xED;
+/// Format: RFC 3629 §4 lowest unrestricted 3-byte lead above `0xED` (`0xEE`).
+const UTF8_LEAD3_HI_MIN: u8 = 0xEE;
+/// Format: RFC 3629 §4 highest valid 3-byte lead (`0xEF`).
+const UTF8_LEAD3_HI_MAX: u8 = 0xEF;
+/// Format: RFC 3629 §4 overlong-guarded 4-byte lead (`0xF0`).
+const UTF8_LEAD4_F0: u8 = 0xF0;
+/// Format: RFC 3629 §4 lowest unrestricted 4-byte lead (`0xF1`).
+const UTF8_LEAD4_MID_MIN: u8 = 0xF1;
+/// Format: RFC 3629 §4 highest unrestricted 4-byte lead (`0xF3`).
+const UTF8_LEAD4_MID_MAX: u8 = 0xF3;
+/// Format: RFC 3629 §4 max-scalar-guarded 4-byte lead (`0xF4`).
+const UTF8_LEAD4_F4: u8 = 0xF4;
 
 /// One segment of a Subversion path pattern.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -719,11 +760,6 @@ impl BitSet {
     let (word, mask) = Self::place(bit);
     self.0.get(word).is_some_and(|slot| (*slot & mask) != 0)
   }
-
-  /// Whether no bit is set.
-  fn is_empty(&self) -> bool {
-    self.0.iter().all(|&word| word == 0)
-  }
 }
 
 /// 256-bit byte membership table matching [`slates_svn::authz::GlobToken::ByteSet`].
@@ -804,11 +840,171 @@ impl LiteralTrie {
   }
 }
 
-/// Byte predicates collected from active literals and globs at one path level.
+/// Exact RFC 3629 §4 byte equivalence classes across all 8 [`Utf8State`] transitions (bytes outside
+/// these classes — `0x00`, `'/'`, `0xC0..=0xC1`, `0xF5..=0xFF` — have no valid UTF-8 transition).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Utf8ByteClass {
+  /// Valid 1-byte ASCII (`0x01..=0x7F` excluding `'/'`).
+  Ascii,
+  /// Continuation `0x80..=0x8F` (valid after `0xF4` and `0xED`, invalid after `0xE0` and `0xF0`).
+  Cont80to8F,
+  /// Continuation `0x90..=0x9F` (valid after `0xF0` and `0xED`, invalid after `0xE0` and `0xF4`).
+  Cont90to9F,
+  /// Continuation `0xA0..=0xBF` (valid after `0xE0` and `0xF0`, invalid after `0xED` and `0xF4`).
+  ContA0toBF,
+  /// 2-byte lead (`0xC2..=0xDF`).
+  Lead2,
+  /// Overlong-guarded 3-byte lead `0xE0`.
+  Lead3E0,
+  /// Unrestricted 3-byte leads (`0xE1..=0xEC`, `0xEE..=0xEF`).
+  Lead3Plain,
+  /// Surrogate-guarded 3-byte lead `0xED`.
+  Lead3ED,
+  /// Overlong-guarded 4-byte lead `0xF0`.
+  Lead4F0,
+  /// Unrestricted 4-byte leads (`0xF1..=0xF3`).
+  Lead4Plain,
+  /// Max-scalar-guarded 4-byte lead `0xF4`.
+  Lead4F4,
+}
+
+impl Utf8ByteClass {
+  /// Classifies `byte` into its exact RFC 3629 §4 Subversion segment byte class, returning `None`
+  /// for NUL, `'/'`, overlong leads `0xC0..=0xC1`, and out-of-range leads `0xF5..=0xFF`.
+  fn of(byte: u8) -> Option<Self> {
+    match byte {
+      0 | b'/' => None,
+      1..=UTF8_ASCII_MAX => Some(Self::Ascii),
+      UTF8_CONT_MIN..=UTF8_F4_SECOND_MAX => Some(Self::Cont80to8F),
+      UTF8_F0_SECOND_MIN..=UTF8_ED_SECOND_MAX => Some(Self::Cont90to9F),
+      UTF8_E0_SECOND_MIN..=UTF8_CONT_MAX => Some(Self::ContA0toBF),
+      UTF8_LEAD2_MIN..=UTF8_LEAD2_MAX => Some(Self::Lead2),
+      UTF8_LEAD3_E0 => Some(Self::Lead3E0),
+      UTF8_LEAD3_LO_MIN..=UTF8_LEAD3_LO_MAX | UTF8_LEAD3_HI_MIN..=UTF8_LEAD3_HI_MAX => {
+        Some(Self::Lead3Plain)
+      }
+      UTF8_LEAD3_ED => Some(Self::Lead3ED),
+      UTF8_LEAD4_F0 => Some(Self::Lead4F0),
+      UTF8_LEAD4_MID_MIN..=UTF8_LEAD4_MID_MAX => Some(Self::Lead4Plain),
+      UTF8_LEAD4_F4 => Some(Self::Lead4F4),
+      _ => None,
+    }
+  }
+}
+
+/// Exact 8-state RFC 3629 §4 UTF-8 validator DFA for non-empty slash-free Subversion path segments;
+/// accepts ONLY in [`Utf8State::Start`] after at least one byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Utf8State {
+  /// At a UTF-8 code-point boundary (initial and ONLY accepting state).
+  Start,
+  /// Expecting 1 continuation byte (`0x80..=0xBF`) -> `Start`.
+  Need1,
+  /// After `0xE0`: expecting `0xA0..=0xBF` -> `Need1` (rejects overlong `< U+0800`).
+  Need2FromE0,
+  /// After `0xE1..=0xEC` or `0xEE..=0xEF`: expecting `0x80..=0xBF` -> `Need1`.
+  Need2,
+  /// After `0xED`: expecting `0x80..=0x9F` -> `Need1` (rejects UTF-16 surrogates `U+D800..U+DFFF`).
+  Need2FromED,
+  /// After `0xF0`: expecting `0x90..=0xBF` -> `Need2` (rejects overlong `< U+10000`).
+  Need3FromF0,
+  /// After `0xF1..=0xF3`: expecting `0x80..=0xBF` -> `Need2`.
+  Need3,
+  /// After `0xF4`: expecting `0x80..=0x8F` -> `Need2` (rejects `> U+10FFFF`).
+  Need3FromF4,
+}
+
+impl Utf8State {
+  /// Transition out of [`Utf8State::Start`] for classified byte `class`.
+  fn step_start(class: Utf8ByteClass) -> Option<Self> {
+    match class {
+      Utf8ByteClass::Ascii => Some(Self::Start),
+      Utf8ByteClass::Lead2 => Some(Self::Need1),
+      Utf8ByteClass::Lead3E0 => Some(Self::Need2FromE0),
+      Utf8ByteClass::Lead3Plain => Some(Self::Need2),
+      Utf8ByteClass::Lead3ED => Some(Self::Need2FromED),
+      Utf8ByteClass::Lead4F0 => Some(Self::Need3FromF0),
+      Utf8ByteClass::Lead4Plain => Some(Self::Need3),
+      Utf8ByteClass::Lead4F4 => Some(Self::Need3FromF4),
+      Utf8ByteClass::Cont80to8F | Utf8ByteClass::Cont90to9F | Utf8ByteClass::ContA0toBF => None,
+    }
+  }
+
+  /// Whether `class` is any RFC 3629 continuation byte (`0x80..=0xBF`).
+  fn is_continuation(class: Utf8ByteClass) -> bool {
+    matches!(
+      class,
+      Utf8ByteClass::Cont80to8F | Utf8ByteClass::Cont90to9F | Utf8ByteClass::ContA0toBF
+    )
+  }
+
+  /// Advances the RFC 3629 §4 UTF-8 validator DFA by one byte, returning `None` on invalid UTF-8,
+  /// NUL, or `'/'`.
+  fn step(self, byte: u8) -> Option<Self> {
+    let class = Utf8ByteClass::of(byte)?;
+    match self {
+      Self::Start => Self::step_start(class),
+      Self::Need1 => Self::is_continuation(class).then_some(Self::Start),
+      Self::Need2FromE0 => (class == Utf8ByteClass::ContA0toBF).then_some(Self::Need1),
+      Self::Need2 => Self::is_continuation(class).then_some(Self::Need1),
+      Self::Need2FromED => matches!(class, Utf8ByteClass::Cont80to8F | Utf8ByteClass::Cont90to9F)
+        .then_some(Self::Need1),
+      Self::Need3FromF0 => matches!(class, Utf8ByteClass::Cont90to9F | Utf8ByteClass::ContA0toBF)
+        .then_some(Self::Need2),
+      Self::Need3 => Self::is_continuation(class).then_some(Self::Need2),
+      Self::Need3FromF4 => (class == Utf8ByteClass::Cont80to8F).then_some(Self::Need2),
+    }
+  }
+}
+
+/// Whether `bytes` is a non-empty valid RFC 3629 UTF-8 Subversion path segment (no NUL or `'/'`).
+fn is_valid_utf8_segment(bytes: &[u8]) -> bool {
+  !bytes.is_empty()
+    && bytes
+      .iter()
+      .try_fold(Utf8State::Start, |state, &byte| state.step(byte))
+      == Some(Utf8State::Start)
+}
+
+/// Outcome of an exact Subversion witness-emptiness query over valid UTF-8 canonical paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WitnessOutcome {
+  /// At least one valid UTF-8 canonical path satisfies every queried constraint.
+  Found,
+  /// Exhaustive search proved zero valid UTF-8 canonical paths satisfy the constraints.
+  Empty,
+  /// State exploration hit [`WITNESS_STATE_BUDGET`] before finding a witness.
+  BudgetExceeded,
+}
+
+impl WitnessOutcome {
+  /// Merges two outcomes so [`WitnessOutcome::Found`] short-circuits and
+  /// [`WitnessOutcome::BudgetExceeded`] is never silently collapsed into [`WitnessOutcome::Empty`].
+  fn merge(self, other: Self) -> Self {
+    match (self, other) {
+      (Self::Found, _) | (_, Self::Found) => Self::Found,
+      (Self::BudgetExceeded, _) | (_, Self::BudgetExceeded) => Self::BudgetExceeded,
+      (Self::Empty, Self::Empty) => Self::Empty,
+    }
+  }
+}
+
+/// Positive segment constraint for one right along a path step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PosSegReq<'a> {
+  /// Unconstrained (`*` or inherited): matches any non-empty valid UTF-8 segment.
+  Any,
+  /// Must equal this exact valid UTF-8 byte slice.
+  Literal(&'a [u8]),
+  /// Must match this compiled segment glob (explored nondeterministically).
+  Glob(&'a [slates_svn::authz::GlobToken]),
+}
+
+/// Byte predicates collected from active positive globs and active `Deny` literals/globs.
 struct BytePredicates {
   /// Singleton byte predicates (literal bytes and `GlobToken::Byte`).
   singletons: ByteSetWords,
-  /// Distinct `ByteSet` predicates appearing in active globs.
+  /// Distinct `ByteSet` predicates appearing in participating globs.
   byte_sets: Vec<ByteSetWords>,
 }
 
@@ -827,9 +1023,10 @@ fn record_glob_token_predicates(
   }
 }
 
-/// Collects singleton predicate bytes (literal bytes and `GlobToken::Byte`) and unique `ByteSet`
-/// predicates appearing in `literals` and `globs`.
+/// Collects singleton predicate bytes and unique `ByteSet` predicates appearing across positive
+/// segment requirements `reqs`, active `Deny` `literals`, and active `Deny` `globs`.
 fn collect_byte_predicates(
+  reqs: [PosSegReq<'_>; 2],
   literals: &[&[u8]],
   globs: &[&[slates_svn::authz::GlobToken]],
 ) -> BytePredicates {
@@ -838,6 +1035,13 @@ fn collect_byte_predicates(
     mark_byte(&mut singletons, byte);
   }
   let mut byte_sets = Vec::new();
+  for req in reqs {
+    if let PosSegReq::Glob(tokens) = req {
+      for &token in tokens {
+        record_glob_token_predicates(token, &mut singletons, &mut byte_sets);
+      }
+    }
+  }
   for &token in globs.iter().copied().flatten() {
     record_glob_token_predicates(token, &mut singletons, &mut byte_sets);
   }
@@ -858,28 +1062,31 @@ fn byte_set_signature(byte_sets: &[ByteSetWords], byte: u8) -> BitSet {
   sig
 }
 
-/// Exact byte minterm equivalence-class representatives across all 254 valid Subversion segment
-/// bytes (`1..=255` excluding `'/'`), placing non-singleton classes before singletons so witness
-/// searches escape literal/prefix denies immediately.
+/// Exact byte minterm equivalence-class representatives across all valid RFC 3629 §4 Subversion
+/// segment bytes, partitioning by BOTH [`Utf8ByteClass`] and active glob predicates, and placing
+/// non-singleton classes before singletons so witness searches escape literal/prefix denies first.
 fn minterm_representatives(
+  reqs: [PosSegReq<'_>; 2],
   literals: &[&[u8]],
   globs: &[&[slates_svn::authz::GlobToken]],
 ) -> Vec<u8> {
   let BytePredicates {
     singletons,
     byte_sets,
-  } = collect_byte_predicates(literals, globs);
+  } = collect_byte_predicates(reqs, literals, globs);
   let valid_bytes = (b'a'..=b'z')
     .chain(1u8..b'a')
-    .chain(b'z'.saturating_add(1)..=u8::MAX)
-    .filter(|&byte| byte != b'/');
+    .chain(b'z'.saturating_add(1)..=u8::MAX);
   let mut non_singletons = Vec::new();
   let mut singleton_reps = Vec::new();
-  let mut seen_sigs: HashSet<BitSet> = HashSet::new();
+  let mut seen_sigs: HashSet<(Utf8ByteClass, BitSet)> = HashSet::new();
   for byte in valid_bytes {
+    let Some(utf8_class) = Utf8ByteClass::of(byte) else {
+      continue;
+    };
     if slates_svn::authz::byte_set_contains(&singletons, byte) {
       singleton_reps.push(byte);
-    } else if seen_sigs.insert(byte_set_signature(&byte_sets, byte)) {
+    } else if seen_sigs.insert((utf8_class, byte_set_signature(&byte_sets, byte))) {
       non_singletons.push(byte);
     }
   }
@@ -932,155 +1139,394 @@ fn glob_step_mask(tokens: &[slates_svn::authz::GlobToken], mask: &BitSet, byte: 
   next
 }
 
-/// Boolean signature of which active literal and globs match one concrete non-empty segment.
+/// Evaluates compiled segment glob `tokens` against concrete segment `bytes`.
+fn glob_tokens_match_bytes(tokens: &[slates_svn::authz::GlobToken], bytes: &[u8]) -> bool {
+  let mask = bytes
+    .iter()
+    .fold(glob_start_mask(tokens), |current, &byte| {
+      glob_step_mask(tokens, &current, byte)
+    });
+  mask.get(tokens.len())
+}
+
+/// Nondeterministic single-token NFA position for one positive segment requirement (`Any` or
+/// `Glob`). Positive globs are NEVER powerset-determinized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum PosSegState {
+  /// Unconstrained (`*` or inherited): accepts every non-empty valid UTF-8 segment.
+  Any,
+  /// Single token index `0..=tokens.len()` inside a positive segment glob.
+  Glob(usize),
+}
+
+/// Whether token position `pos` in collapsed `tokens` (no adjacent `Run`) can accept with zero
+/// further bytes.
+fn pos_glob_accepts(tokens: &[slates_svn::authz::GlobToken], pos: usize) -> bool {
+  pos == tokens.len()
+    || (pos.saturating_add(1) == tokens.len()
+      && tokens.get(pos) == Some(&slates_svn::authz::GlobToken::Run))
+}
+
+/// Nondeterministic single-byte step out of `pos` in collapsed `tokens` (at most 2 next positions,
+/// advancing past `Run` first so shortest witnesses are explored first).
+fn step_pos_glob(
+  tokens: &[slates_svn::authz::GlobToken],
+  pos: usize,
+  byte: u8,
+) -> [Option<usize>; 2] {
+  let Some(&token) = tokens.get(pos) else {
+    return [None, None];
+  };
+  if token == slates_svn::authz::GlobToken::Run {
+    let skip = tokens
+      .get(pos.saturating_add(1))
+      .is_some_and(|&next| glob_token_accepts_byte(next, byte))
+      .then(|| pos.saturating_add(2));
+    return [skip, Some(pos)];
+  }
+  let advance = glob_token_accepts_byte(token, byte).then(|| pos.saturating_add(1));
+  [advance, None]
+}
+
+impl PosSegState {
+  /// Initial NFA position for positive requirement `req` (`Literal` is handled before BFS).
+  fn initial(req: PosSegReq<'_>) -> Self {
+    match req {
+      PosSegReq::Glob(_) => Self::Glob(0),
+      PosSegReq::Any | PosSegReq::Literal(_) => Self::Any,
+    }
+  }
+
+  /// Whether this position accepts after consuming at least one byte.
+  fn accepts(self, req: PosSegReq<'_>) -> bool {
+    match (self, req) {
+      (Self::Any, _) => true,
+      (Self::Glob(pos), PosSegReq::Glob(tokens)) => pos_glob_accepts(tokens, pos),
+      _ => false,
+    }
+  }
+
+  /// Whether no further byte can ever be consumed from this position.
+  fn is_done(self, req: PosSegReq<'_>) -> bool {
+    match (self, req) {
+      (Self::Glob(pos), PosSegReq::Glob(tokens)) => pos >= tokens.len(),
+      _ => false,
+    }
+  }
+
+  /// Nondeterministically advances this position by one valid UTF-8 `byte`.
+  fn step(self, req: PosSegReq<'_>, byte: u8) -> [Option<Self>; 2] {
+    match (self, req) {
+      (Self::Any, _) => [Some(Self::Any), None],
+      (Self::Glob(pos), PosSegReq::Glob(tokens)) => {
+        let [first, second] = step_pos_glob(tokens, pos, byte);
+        [first.map(Self::Glob), second.map(Self::Glob)]
+      }
+      _ => [None, None],
+    }
+  }
+}
+
+/// Boolean signature of which active `Deny` literal and `Deny` globs match one concrete non-empty
+/// valid UTF-8 segment.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SegmentSignature {
   literal: Option<usize>,
   globs: BitSet,
 }
 
-/// Product-NFA state over the literal trie and every active glob NFA at one path level.
+/// Segment-level NFA-Allow × DFA-Deny × RFC 3629 UTF-8 product state: positive globs stay linear
+/// single-token positions while ONLY active `Deny` rules use powerset masks.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct SegNfaState {
-  trie: Option<usize>,
-  masks: Vec<BitSet>,
+struct SegProductState {
+  pos0: PosSegState,
+  pos1: PosSegState,
+  utf8: Utf8State,
+  deny_trie: Option<usize>,
+  deny_masks: Vec<BitSet>,
 }
 
-impl SegNfaState {
-  /// Advances the trie and every active glob NFA by one byte.
-  fn step(&self, trie: &LiteralTrie, globs: &[&[slates_svn::authz::GlobToken]], byte: u8) -> Self {
-    let next_trie = trie.step(self.trie, byte);
-    let next_masks = globs
-      .iter()
-      .zip(&self.masks)
-      .map(|(&tokens, mask)| glob_step_mask(tokens, mask, byte))
-      .collect();
-    Self {
-      trie: next_trie,
-      masks: next_masks,
-    }
+impl SegProductState {
+  /// Whether this non-empty state is a valid complete RFC 3629 UTF-8 segment matching both
+  /// positive requirements.
+  fn accepts(&self, reqs: [PosSegReq<'_>; 2]) -> bool {
+    let [req0, req1] = reqs;
+    self.utf8 == Utf8State::Start && self.pos0.accepts(req0) && self.pos1.accepts(req1)
   }
 
-  /// Accepting [`SegmentSignature`] of this non-empty state.
-  fn signature(
+  /// Whether neither positive requirement can consume any additional byte.
+  fn is_sink(&self, reqs: [PosSegReq<'_>; 2]) -> bool {
+    let [req0, req1] = reqs;
+    self.pos0.is_done(req0) || self.pos1.is_done(req1)
+  }
+
+  /// Accepting [`SegmentSignature`] over active `Deny` literals and `Deny` globs.
+  fn deny_signature(
     &self,
-    trie: &LiteralTrie,
-    globs: &[&[slates_svn::authz::GlobToken]],
+    deny_trie: &LiteralTrie,
+    deny_globs: &[&[slates_svn::authz::GlobToken]],
   ) -> SegmentSignature {
-    let mut accepted = BitSet::empty(globs.len());
-    for (idx, (&tokens, mask)) in globs.iter().zip(&self.masks).enumerate() {
+    let mut accepted = BitSet::empty(deny_globs.len());
+    for (idx, (&tokens, mask)) in deny_globs.iter().zip(&self.deny_masks).enumerate() {
       if mask.get(tokens.len()) {
         accepted.set(idx);
       }
     }
     SegmentSignature {
-      literal: trie.literal_at(self.trie),
+      literal: deny_trie.literal_at(self.deny_trie),
       globs: accepted,
     }
   }
-
-  /// Whether both the literal trie and every active glob NFA have reached their dead sink.
-  fn is_sink(&self) -> bool {
-    self.trie.is_none() && self.masks.iter().all(BitSet::is_empty)
-  }
 }
 
-/// Mutable BFS frontier state for segment-level product-NFA exploration.
-struct SegBfs {
-  queue: VecDeque<SegNfaState>,
-  visited: HashSet<SegNfaState>,
+/// Mutable BFS frontier state for segment-level NFA-Allow × DFA-Deny × UTF-8 exploration.
+struct SegProductBfs {
+  queue: VecDeque<SegProductState>,
+  visited: HashSet<SegProductState>,
   emitted: HashSet<SegmentSignature>,
+  budget_exceeded: bool,
 }
 
-/// Compiled literal trie, active glob token streams, and minterm representatives for one path
-/// level's segment-NFA BFS.
-struct SegDomain<'a> {
-  trie: &'a LiteralTrie,
-  globs: &'a [&'a [slates_svn::authz::GlobToken]],
+/// Compiled `Deny` literal trie, active `Deny` globs, positive requirements, and minterm
+/// representatives for one segment-level BFS.
+struct SegProductDomain<'a> {
+  reqs: [PosSegReq<'a>; 2],
+  deny_trie: &'a LiteralTrie,
+  deny_globs: &'a [&'a [slates_svn::authz::GlobToken]],
   reps: &'a [u8],
 }
 
-/// Expands one segment-NFA `state` across all equivalence-class representatives in `domain`,
-/// returning `true` immediately when `on_sig` reports an accepting path state.
-fn expand_seg_state(
-  bfs: &mut SegBfs,
-  state: &SegNfaState,
-  domain: &SegDomain<'_>,
+/// Evaluates whether concrete segment `bytes` satisfies positive requirement `req`.
+fn pos_seg_matches_bytes(req: PosSegReq<'_>, bytes: &[u8]) -> bool {
+  match req {
+    PosSegReq::Any => true,
+    PosSegReq::Literal(expected) => expected == bytes,
+    PosSegReq::Glob(tokens) => glob_tokens_match_bytes(tokens, bytes),
+  }
+}
+
+/// Computes the exact `Deny` [`SegmentSignature`] for concrete valid UTF-8 segment `bytes`.
+fn literal_deny_signature(
+  bytes: &[u8],
+  deny_literals: &[&[u8]],
+  deny_globs: &[&[slates_svn::authz::GlobToken]],
+) -> SegmentSignature {
+  let literal = deny_literals
+    .iter()
+    .position(|&candidate| candidate == bytes);
+  let mut globs = BitSet::empty(deny_globs.len());
+  for (idx, &tokens) in deny_globs.iter().enumerate() {
+    if glob_tokens_match_bytes(tokens, bytes) {
+      globs.set(idx);
+    }
+  }
+  SegmentSignature { literal, globs }
+}
+
+/// Direct O(len) segment check when at least one positive requirement pins an exact literal slice.
+fn explore_literal_segment(
+  bytes: &[u8],
+  other_req: PosSegReq<'_>,
+  deny_literals: &[&[u8]],
+  deny_globs: &[&[slates_svn::authz::GlobToken]],
   on_sig: &mut impl FnMut(&SegmentSignature) -> bool,
-) -> bool {
-  for &byte in domain.reps {
-    let next = state.step(domain.trie, domain.globs, byte);
-    if !bfs.visited.insert(next.clone()) {
-      continue;
-    }
-    let sig = next.signature(domain.trie, domain.globs);
-    if bfs.emitted.insert(sig.clone()) && on_sig(&sig) {
-      return true;
-    }
-    if !next.is_sink() && bfs.visited.len() < WITNESS_STATE_BUDGET {
-      bfs.queue.push_back(next);
-    }
+) -> WitnessOutcome {
+  if !is_valid_utf8_segment(bytes) || !pos_seg_matches_bytes(other_req, bytes) {
+    return WitnessOutcome::Empty;
   }
-  false
+  let sig = literal_deny_signature(bytes, deny_literals, deny_globs);
+  if on_sig(&sig) {
+    WitnessOutcome::Found
+  } else {
+    WitnessOutcome::Empty
+  }
 }
 
-/// Explores exact realizable non-empty [`SegmentSignature`]s over `literals` and `globs`,
-/// invoking `on_sig` for each newly discovered signature and returning `true` immediately when
-/// `on_sig` reports an accepting path state.
-fn explore_segment_signatures(
-  literals: &[&[u8]],
-  globs: &[&[slates_svn::authz::GlobToken]],
-  mut on_sig: impl FnMut(&SegmentSignature) -> bool,
-) -> bool {
-  if globs.is_empty() {
-    return explore_literal_only_signatures(literals.len(), &mut on_sig);
-  }
-  let trie = LiteralTrie::build(literals);
-  let reps = minterm_representatives(literals, globs);
-  let domain = SegDomain {
-    trie: &trie,
-    globs,
-    reps: &reps,
-  };
-  let start = SegNfaState {
-    trie: (!literals.is_empty()).then_some(0),
-    masks: globs
-      .iter()
-      .map(|&tokens| glob_start_mask(tokens))
-      .collect(),
-  };
-  let mut bfs = SegBfs {
-    queue: VecDeque::from([start]),
-    visited: HashSet::new(),
-    emitted: HashSet::new(),
-  };
-  while let Some(state) = bfs.queue.pop_front() {
-    if expand_seg_state(&mut bfs, &state, &domain, &mut on_sig) {
-      return true;
-    }
-  }
-  false
-}
-
-/// O(literals) signature enumeration when no active globs exist at the current path level:
-/// one fresh non-literal segment plus each literal itself.
-fn explore_literal_only_signatures(
+/// O(deny_literals) signature enumeration when both positive requirements are unconstrained (`Any`)
+/// and no active `Deny` globs exist: one fresh valid UTF-8 non-literal segment plus each valid
+/// `Deny` literal.
+fn explore_literal_only_deny_signatures(
   literal_count: usize,
   on_sig: &mut impl FnMut(&SegmentSignature) -> bool,
-) -> bool {
+) -> WitnessOutcome {
   let empty = BitSet::empty(0);
-  if on_sig(&SegmentSignature {
+  let found = on_sig(&SegmentSignature {
     literal: None,
     globs: empty.clone(),
-  }) {
-    return true;
-  }
-  (0..literal_count).any(|idx| {
+  }) || (0..literal_count).any(|idx| {
     on_sig(&SegmentSignature {
       literal: Some(idx),
       globs: empty.clone(),
     })
-  })
+  });
+  if found {
+    WitnessOutcome::Found
+  } else {
+    WitnessOutcome::Empty
+  }
+}
+
+/// Records one newly reached non-empty segment state into `bfs`, emitting its `Deny` signature when
+/// it finishes a valid UTF-8 segment matching both positive requirements.
+fn visit_seg_successor(
+  bfs: &mut SegProductBfs,
+  next: SegProductState,
+  domain: &SegProductDomain<'_>,
+  on_sig: &mut impl FnMut(&SegmentSignature) -> bool,
+) -> bool {
+  if bfs.visited.contains(&next) {
+    return false;
+  }
+  if bfs.visited.len() >= WITNESS_STATE_BUDGET {
+    bfs.budget_exceeded = true;
+    return false;
+  }
+  if next.accepts(domain.reqs) {
+    let sig = next.deny_signature(domain.deny_trie, domain.deny_globs);
+    if bfs.emitted.insert(sig.clone()) && on_sig(&sig) {
+      return true;
+    }
+  }
+  let sink = next.is_sink(domain.reqs);
+  bfs.visited.insert(next.clone());
+  if !sink {
+    bfs.queue.push_back(next);
+  }
+  false
+}
+
+/// Visits every `(pos0, pos1)` pair generated from one byte transition.
+fn visit_seg_pairs(
+  bfs: &mut SegProductBfs,
+  positions: ([Option<PosSegState>; 2], [Option<PosSegState>; 2]),
+  shared: (Utf8State, Option<usize>, &[BitSet]),
+  domain: &SegProductDomain<'_>,
+  on_sig: &mut impl FnMut(&SegmentSignature) -> bool,
+) -> bool {
+  let (next_pos0, next_pos1) = positions;
+  let (next_utf8, next_trie, next_masks) = shared;
+  for pos0 in next_pos0.into_iter().flatten() {
+    for pos1 in next_pos1.into_iter().flatten() {
+      let next = SegProductState {
+        pos0,
+        pos1,
+        utf8: next_utf8,
+        deny_trie: next_trie,
+        deny_masks: next_masks.to_vec(),
+      };
+      if visit_seg_successor(bfs, next, domain, on_sig) {
+        return true;
+      }
+    }
+  }
+  false
+}
+
+/// Advances `state` by one valid UTF-8 representative `byte`, skipping `Deny` mask work whenever
+/// either the UTF-8 DFA or a positive NFA rejects `byte`.
+fn expand_seg_byte(
+  bfs: &mut SegProductBfs,
+  state: &SegProductState,
+  byte: u8,
+  domain: &SegProductDomain<'_>,
+  on_sig: &mut impl FnMut(&SegmentSignature) -> bool,
+) -> bool {
+  let Some(next_utf8) = state.utf8.step(byte) else {
+    return false;
+  };
+  let [req0, req1] = domain.reqs;
+  let next_pos0 = state.pos0.step(req0, byte);
+  if next_pos0 == [None, None] {
+    return false;
+  }
+  let next_pos1 = state.pos1.step(req1, byte);
+  if next_pos1 == [None, None] {
+    return false;
+  }
+  let next_trie = domain.deny_trie.step(state.deny_trie, byte);
+  let next_masks: Vec<BitSet> = domain
+    .deny_globs
+    .iter()
+    .zip(&state.deny_masks)
+    .map(|(&tokens, mask)| glob_step_mask(tokens, mask, byte))
+    .collect();
+  visit_seg_pairs(
+    bfs,
+    (next_pos0, next_pos1),
+    (next_utf8, next_trie, &next_masks),
+    domain,
+    on_sig,
+  )
+}
+
+/// Runs the bounded segment-level NFA-Allow × DFA-Deny × UTF-8 BFS for non-literal positive
+/// requirements and active `Deny` globs.
+fn run_seg_product_bfs(
+  reqs: [PosSegReq<'_>; 2],
+  deny_literals: &[&[u8]],
+  deny_globs: &[&[slates_svn::authz::GlobToken]],
+  on_sig: &mut impl FnMut(&SegmentSignature) -> bool,
+) -> WitnessOutcome {
+  let [req0, req1] = reqs;
+  let deny_trie = LiteralTrie::build(deny_literals);
+  let reps = minterm_representatives(reqs, deny_literals, deny_globs);
+  let domain = SegProductDomain {
+    reqs,
+    deny_trie: &deny_trie,
+    deny_globs,
+    reps: &reps,
+  };
+  let start = SegProductState {
+    pos0: PosSegState::initial(req0),
+    pos1: PosSegState::initial(req1),
+    utf8: Utf8State::Start,
+    deny_trie: (!deny_literals.is_empty()).then_some(0),
+    deny_masks: deny_globs
+      .iter()
+      .map(|&tokens| glob_start_mask(tokens))
+      .collect(),
+  };
+  let mut bfs = SegProductBfs {
+    queue: VecDeque::from([start]),
+    visited: HashSet::new(),
+    emitted: HashSet::new(),
+    budget_exceeded: false,
+  };
+  while let Some(state) = bfs.queue.pop_front() {
+    if domain
+      .reps
+      .iter()
+      .any(|&byte| expand_seg_byte(&mut bfs, &state, byte, &domain, on_sig))
+    {
+      return WitnessOutcome::Found;
+    }
+  }
+  if bfs.budget_exceeded {
+    WitnessOutcome::BudgetExceeded
+  } else {
+    WitnessOutcome::Empty
+  }
+}
+
+/// Explores exact realizable non-empty valid RFC 3629 UTF-8 `Deny` [`SegmentSignature`]s matching
+/// both positive requirements in `reqs`, invoking `on_sig` for each newly discovered signature.
+fn explore_deny_signatures(
+  reqs: [PosSegReq<'_>; 2],
+  deny_literals: &[&[u8]],
+  deny_globs: &[&[slates_svn::authz::GlobToken]],
+  mut on_sig: impl FnMut(&SegmentSignature) -> bool,
+) -> WitnessOutcome {
+  let [req0, req1] = reqs;
+  if let PosSegReq::Literal(bytes) = req0 {
+    return explore_literal_segment(bytes, req1, deny_literals, deny_globs, &mut on_sig);
+  }
+  if let PosSegReq::Literal(bytes) = req1 {
+    return explore_literal_segment(bytes, req0, deny_literals, deny_globs, &mut on_sig);
+  }
+  if req0 == PosSegReq::Any && req1 == PosSegReq::Any && deny_globs.is_empty() {
+    return explore_literal_only_deny_signatures(deny_literals.len(), &mut on_sig);
+  }
+  run_seg_product_bfs(reqs, deny_literals, deny_globs, &mut on_sig)
 }
 
 /// Normalized path segment used by the exact path-level witness automaton.
@@ -1092,64 +1538,41 @@ enum NormSegment {
   Any,
 }
 
-/// Normalizes a [`Segment`] for witness solving, returning `None` when the segment can never match
-/// any non-empty Subversion path segment.
-fn normalize_segment(segment: &Segment) -> Option<NormSegment> {
+/// Normalizes a [`Segment::Glob`] into a [`NormSegment`], dropping segments that can never match
+/// any valid non-empty UTF-8 Subversion path segment.
+fn normalize_glob_segment(glob: &Glob) -> Option<NormSegment> {
   use slates_svn::authz::GlobToken;
-  match segment {
-    Segment::Literal(bytes) => (!bytes.is_empty()).then(|| NormSegment::Literal(bytes.clone())),
-    Segment::One => Some(NormSegment::One),
-    Segment::Any => Some(NormSegment::Any),
-    Segment::Glob(glob) => {
-      let tokens = glob_tokens(glob);
-      if tokens.is_empty() || tokens.contains(&GlobToken::Never) {
-        return None;
-      }
-      if tokens.as_slice() == [GlobToken::Run] {
-        return Some(NormSegment::One);
-      }
-      let literal: Option<Vec<u8>> = tokens
-        .iter()
-        .map(|token| match token {
-          GlobToken::Byte(byte) => Some(*byte),
-          _ => None,
-        })
-        .collect();
-      Some(literal.map_or(NormSegment::Glob(tokens), NormSegment::Literal))
-    }
+  let tokens = glob_tokens(glob);
+  if tokens.is_empty() || tokens.contains(&GlobToken::Never) {
+    return None;
+  }
+  if tokens.as_slice() == [GlobToken::Run] {
+    return Some(NormSegment::One);
+  }
+  let literal: Option<Vec<u8>> = tokens
+    .iter()
+    .map(|token| match token {
+      GlobToken::Byte(byte) => Some(*byte),
+      _ => None,
+    })
+    .collect();
+  match literal {
+    Some(bytes) => is_valid_utf8_segment(&bytes).then_some(NormSegment::Literal(bytes)),
+    None => Some(NormSegment::Glob(tokens)),
   }
 }
 
-/// One matchable rule compiled into the exact path-level witness automaton.
-struct CompiledPathRule {
-  query_idx: usize,
-  effect: Effect,
-  segments: Vec<NormSegment>,
-}
-
-/// Compiles all matchable rules of `rules` speaking to `principal` for any right in `queries`,
-/// preserving rule definition order (later wins at equal depth) and collapsing adjacent `**`.
-fn compile_path_rules(
-  rules: &[Rule<PathPattern>],
-  principal: &Principal,
-  queries: &[(Right, bool)],
-) -> Vec<CompiledPathRule> {
-  rules
-    .iter()
-    .flat_map(|rule| {
-      queries
-        .iter()
-        .enumerate()
-        .filter(|&(_, &(right, _))| rule.speaks(principal, right))
-        .filter_map(|(query_idx, _)| {
-          Some(CompiledPathRule {
-            query_idx,
-            effect: rule.effect,
-            segments: normalize_rule_segments(&rule.pattern.segments)?,
-          })
-        })
-    })
-    .collect()
+/// Normalizes a [`Segment`] for witness solving, returning `None` when the segment can never match
+/// any non-empty valid UTF-8 Subversion path segment.
+fn normalize_segment(segment: &Segment) -> Option<NormSegment> {
+  match segment {
+    Segment::Literal(bytes) => {
+      is_valid_utf8_segment(bytes).then(|| NormSegment::Literal(bytes.clone()))
+    }
+    Segment::One => Some(NormSegment::One),
+    Segment::Any => Some(NormSegment::Any),
+    Segment::Glob(glob) => normalize_glob_segment(glob),
+  }
 }
 
 /// Normalizes all segments of a rule, collapsing consecutive `**` and dropping unmatchable rules.
@@ -1164,7 +1587,7 @@ fn normalize_rule_segments(segments: &[Segment]) -> Option<Vec<NormSegment>> {
   Some(out)
 }
 
-/// Closes a rule's path-position `mask` across zero-segment `NormSegment::Any` (`**`) transitions.
+/// Closes a `Deny` rule's path-position `mask` across zero-segment `NormSegment::Any` (`**`) steps.
 fn path_close_any(segments: &[NormSegment], mask: &mut BitSet) {
   for (pos, segment) in segments.iter().enumerate() {
     if *segment == NormSegment::Any && mask.get(pos) {
@@ -1173,79 +1596,209 @@ fn path_close_any(segments: &[NormSegment], mask: &mut BitSet) {
   }
 }
 
-/// Exact state of the path-level automaton across every relevant rule and query right.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct PathNfaState {
-  reached: Vec<BitSet>,
-  effects: Vec<Option<Effect>>,
+/// One normalized rule belonging to a single queried right, carrying its policy definition order.
+struct RightRule {
+  order: usize,
+  segments: Vec<NormSegment>,
 }
 
-/// Whether `effects` satisfies every `(right, allow_unruled)` constraint in `queries`.
-fn effects_accept(effects: &[Option<Effect>], queries: &[(Right, bool)]) -> bool {
-  effects
-    .iter()
-    .zip(queries)
-    .all(|(&effect, &(_, allow_unruled))| match effect {
-      Some(Effect::Allow) => true,
-      Some(Effect::Deny) => false,
-      None => allow_unruled,
-    })
+/// All matchable rules speaking to one `(principal, right)` pair, partitioned into `allows` and
+/// `denies` while preserving policy definition order.
+struct RightRules {
+  allow_unruled: bool,
+  allows: Vec<RightRule>,
+  denies: Vec<RightRule>,
 }
 
-/// Deciding effect for query `qi` among rules matching at the current depth (last-defined wins).
-fn deciding_effect_at_depth(
-  rules: &[CompiledPathRule],
-  reached: &[BitSet],
-  qi: usize,
-) -> Option<Effect> {
-  rules
-    .iter()
-    .zip(reached)
-    .filter(|(rule, mask)| rule.query_idx == qi && mask.get(rule.segments.len()))
-    .map(|(rule, _)| rule.effect)
-    .next_back()
-}
-
-/// Applies rules matching at the current depth (`mask.get(rule.segments.len())`) over `inherited`
-/// effects (last-defined rule wins at equal depth) and clears accepting bits before state hashing.
-fn finalize_path_state(
-  rules: &[CompiledPathRule],
-  mut reached: Vec<BitSet>,
-  mut effects: Vec<Option<Effect>>,
-) -> PathNfaState {
-  for (qi, slot) in effects.iter_mut().enumerate() {
-    if let Some(effect) = deciding_effect_at_depth(rules, &reached, qi) {
-      *slot = Some(effect);
+/// Compiles all matchable rules of `rules` speaking to `principal` about `right`.
+fn compile_right_rules(
+  rules: &[Rule<PathPattern>],
+  principal: &Principal,
+  (right, allow_unruled): (Right, bool),
+) -> RightRules {
+  let mut allows = Vec::new();
+  let mut denies = Vec::new();
+  for (order, rule) in rules.iter().enumerate() {
+    if !rule.speaks(principal, right) {
+      continue;
+    }
+    let Some(segments) = normalize_rule_segments(&rule.pattern.segments) else {
+      continue;
+    };
+    let compiled = RightRule { order, segments };
+    match rule.effect {
+      Effect::Allow => allows.push(compiled),
+      Effect::Deny => denies.push(compiled),
     }
   }
-  for (rule, mask) in rules.iter().zip(&mut reached) {
-    mask.clear(rule.segments.len());
+  RightRules {
+    allow_unruled,
+    allows,
+    denies,
   }
-  PathNfaState { reached, effects }
 }
 
-/// Initial path state at `/` (depth 0).
-fn initial_path_state(rules: &[CompiledPathRule], query_count: usize) -> PathNfaState {
-  let reached = rules
-    .iter()
-    .map(|rule| {
-      let mut mask = BitSet::empty(rule.segments.len().saturating_add(1));
-      mask.set(0);
-      path_close_any(&rule.segments, &mut mask);
-      mask
-    })
-    .collect();
-  finalize_path_state(rules, reached, vec![None; query_count])
+/// Whether a normalized rule matches the root path `/` (depth 0).
+fn rule_matches_root(segments: &[NormSegment]) -> bool {
+  segments.is_empty() || segments == [NormSegment::Any]
 }
 
-/// Active specific segment patterns (`Literal` and `Glob`) referenced by reachable positions in
-/// `state`, deduplicated for product-NFA exploration.
+/// Positive witness choice for one queried right: either an explicit `Allow` rule or `Unruled`
+/// (when `allow_unruled` permits unruled paths).
+#[derive(Clone, Copy)]
+enum AllowChoice<'a> {
+  Unruled,
+  Rule(&'a RightRule),
+}
+
+impl AllowChoice<'_> {
+  /// Policy definition index of an explicit `Allow` rule, or `None` for `Unruled`.
+  fn order(self) -> Option<usize> {
+    match self {
+      Self::Unruled => None,
+      Self::Rule(rule) => Some(rule.order),
+    }
+  }
+}
+
+/// Nondeterministic state of one positive right choice along a path: positive `Allow` rules track
+/// a single linear segment index rather than a powerset bitset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum AllowPos {
+  /// Still matching segment index `pos` (`pos < rule.segments.len()`) of the chosen `Allow` rule.
+  Matching(usize),
+  /// The chosen `Allow` rule (or `Unruled`) has already won at an ancestor depth and now inherits
+  /// downward until any `Deny` rule for this right matches.
+  Inherited,
+}
+
+/// Whether path position `pos` in collapsed `segments` (no adjacent `Any`) reaches the end with
+/// zero further segments.
+fn can_accept_path(segments: &[NormSegment], pos: usize) -> bool {
+  pos == segments.len()
+    || (pos.saturating_add(1) == segments.len() && segments.get(pos) == Some(&NormSegment::Any))
+}
+
+/// Translates a non-`Any` [`NormSegment`] into its [`PosSegReq`].
+fn pos_seg_req_of(segment: &NormSegment) -> PosSegReq<'_> {
+  match segment {
+    NormSegment::Literal(bytes) => PosSegReq::Literal(bytes),
+    NormSegment::Glob(tokens) => PosSegReq::Glob(tokens),
+    NormSegment::One | NormSegment::Any => PosSegReq::Any,
+  }
+}
+
+/// One nondeterministic step out of an [`AllowPos`] across the next path segment.
+#[derive(Clone, Copy)]
+struct PosBranch<'a> {
+  req: PosSegReq<'a>,
+  next_pos: Option<usize>,
+}
+
+/// Computes the 0..=2 nondeterministic positive segment branches out of `pos` for `choice`,
+/// placing advancing branches before `**` self-loops so shortest witnesses are explored first.
+fn pos_branches<'a>(choice: AllowChoice<'a>, pos: AllowPos) -> [Option<PosBranch<'a>>; 2] {
+  let AllowPos::Matching(at) = pos else {
+    return [
+      Some(PosBranch {
+        req: PosSegReq::Any,
+        next_pos: None,
+      }),
+      None,
+    ];
+  };
+  let AllowChoice::Rule(rule) = choice else {
+    return [None, None];
+  };
+  let Some(segment) = rule.segments.get(at) else {
+    return [None, None];
+  };
+  if *segment == NormSegment::Any {
+    let advance = rule
+      .segments
+      .get(at.saturating_add(1))
+      .map(|next_seg| PosBranch {
+        req: pos_seg_req_of(next_seg),
+        next_pos: Some(at.saturating_add(2)),
+      });
+    let stay = Some(PosBranch {
+      req: PosSegReq::Any,
+      next_pos: Some(at),
+    });
+    return [advance, stay];
+  }
+  [
+    Some(PosBranch {
+      req: pos_seg_req_of(segment),
+      next_pos: Some(at.saturating_add(1)),
+    }),
+    None,
+  ]
+}
+
+/// Resolves the 0..=2 resulting [`AllowPos`] states from taking a branch to `next_pos`, given
+/// whether any `Deny` (`deny_any`) or any strictly later `Deny` (`deny_gt`) matched at the new
+/// depth.
+fn resolve_allow_pos(
+  choice: AllowChoice<'_>,
+  next_pos: Option<usize>,
+  deny_any: bool,
+  deny_gt: bool,
+) -> [Option<AllowPos>; 2] {
+  let Some(pos) = next_pos else {
+    return [(!deny_any).then_some(AllowPos::Inherited), None];
+  };
+  let AllowChoice::Rule(rule) = choice else {
+    return [None, None];
+  };
+  let inherited = (can_accept_path(&rule.segments, pos) && !deny_gt).then_some(AllowPos::Inherited);
+  let matching = (pos < rule.segments.len()).then_some(AllowPos::Matching(pos));
+  [inherited, matching]
+}
+
+/// Initial [`AllowPos`] states at depth 0 (`/`) for `choice`.
+fn initial_allow_positions(
+  choice: AllowChoice<'_>,
+  deny_any: bool,
+  deny_gt: bool,
+) -> [Option<AllowPos>; 2] {
+  match choice {
+    AllowChoice::Unruled => [(!deny_any).then_some(AllowPos::Inherited), None],
+    AllowChoice::Rule(_) => resolve_allow_pos(choice, Some(0), deny_any, deny_gt),
+  }
+}
+
+/// One queried right's positive choice paired with the `Deny` rules that can override it.
+struct RightSlot<'a> {
+  choice: AllowChoice<'a>,
+  denies: &'a [&'a RightRule],
+}
+
+/// Path-level NFA-Allow × DFA-Deny state: positive right choices keep a single linear [`AllowPos`]
+/// while ONLY the relevant `Deny` rules carry powerset bitsets.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PathPairState {
+  pos0: AllowPos,
+  pos1: Option<AllowPos>,
+  denies0: Vec<BitSet>,
+  denies1: Vec<BitSet>,
+}
+
+/// Mutable BFS frontier for path-level NFA-Allow × DFA-Deny search.
+struct PathPairBfs {
+  queue: VecDeque<PathPairState>,
+  visited: HashSet<PathPairState>,
+  budget_exceeded: bool,
+}
+
+/// Active `Deny` segment patterns (`Literal` and `Glob`) referenced by reachable positions in the
+/// current `Deny` masks, deduplicated for segment-level exploration.
 struct ActivePatterns<'a> {
   literals: Vec<&'a [u8]>,
   globs: Vec<&'a [slates_svn::authz::GlobToken]>,
 }
 
-/// Interns one active segment pattern into `active`.
+/// Interns one active `Deny` segment pattern into `active`.
 fn record_active_segment<'a>(segment: &'a NormSegment, active: &mut ActivePatterns<'a>) {
   match segment {
     NormSegment::Literal(bytes) if !active.literals.contains(&bytes.as_slice()) => {
@@ -1258,26 +1811,39 @@ fn record_active_segment<'a>(segment: &'a NormSegment, active: &mut ActivePatter
   }
 }
 
-/// Collects all distinct active `Literal` and `Glob` segment patterns from `state`.
-fn collect_active_patterns<'a>(
-  rules: &'a [CompiledPathRule],
-  state: &PathNfaState,
+/// Appends active `Deny` segment patterns from `denies`/`masks` into `active`.
+fn collect_deny_patterns_into<'a>(
+  denies: &[&'a RightRule],
+  masks: &[BitSet],
+  active: &mut ActivePatterns<'a>,
+) {
+  for (&rule, mask) in denies.iter().zip(masks) {
+    for (pos, segment) in rule.segments.iter().enumerate() {
+      if mask.get(pos) {
+        record_active_segment(segment, active);
+      }
+    }
+  }
+}
+
+/// Collects all distinct active `Deny` `Literal` and `Glob` segment patterns across both slots.
+fn collect_active_deny_patterns<'a>(
+  slot0: &RightSlot<'a>,
+  slot1: Option<&RightSlot<'a>>,
+  state: &PathPairState,
 ) -> ActivePatterns<'a> {
   let mut active = ActivePatterns {
     literals: Vec::new(),
     globs: Vec::new(),
   };
-  for (rule, mask) in rules.iter().zip(&state.reached) {
-    for (pos, segment) in rule.segments.iter().enumerate() {
-      if mask.get(pos) {
-        record_active_segment(segment, &mut active);
-      }
-    }
+  collect_deny_patterns_into(slot0.denies, &state.denies0, &mut active);
+  if let Some(s1) = slot1 {
+    collect_deny_patterns_into(s1.denies, &state.denies1, &mut active);
   }
   active
 }
 
-/// Whether `segment` at an active position consumes a segment realizing `sig`.
+/// Whether `Deny` segment `segment` at an active position consumes a segment realizing `sig`.
 fn norm_segment_matches_sig(
   segment: &NormSegment,
   active: &ActivePatterns<'_>,
@@ -1298,9 +1864,9 @@ fn norm_segment_matches_sig(
   }
 }
 
-/// Advances one rule's path position bitset across one concrete segment matching `sig`.
-fn advance_rule_mask(
-  rule: &CompiledPathRule,
+/// Advances one `Deny` rule's path position bitset across one valid UTF-8 segment matching `sig`.
+fn advance_deny_rule_mask(
+  rule: &RightRule,
   mask: &BitSet,
   active: &ActivePatterns<'_>,
   sig: &SegmentSignature,
@@ -1320,81 +1886,374 @@ fn advance_rule_mask(
   next
 }
 
-/// Advances `state` across one segment realizing `sig`.
-fn advance_path_state(
-  rules: &[CompiledPathRule],
-  state: &PathNfaState,
+/// Computes depth-0 `Deny` bitsets and `(deny_any_matched, deny_gt_matched)` for `slot`.
+fn initial_deny_list(slot: &RightSlot<'_>) -> (Vec<BitSet>, bool, bool) {
+  let allow_order = slot.choice.order();
+  let mut masks = Vec::with_capacity(slot.denies.len());
+  let (mut deny_any, mut deny_gt) = (false, false);
+  for &rule in slot.denies {
+    let mut mask = BitSet::empty(rule.segments.len().saturating_add(1));
+    mask.set(0);
+    path_close_any(&rule.segments, &mut mask);
+    if mask.get(rule.segments.len()) {
+      deny_any = true;
+      if allow_order.is_none_or(|ord| rule.order > ord) {
+        deny_gt = true;
+      }
+    }
+    mask.clear(rule.segments.len());
+    masks.push(mask);
+  }
+  (masks, deny_any, deny_gt)
+}
+
+/// Advances `slot`'s `Deny` bitsets across one segment realizing `sig`, returning the cleared next
+/// masks alongside `(deny_any_matched, deny_gt_matched)` at the new depth.
+fn step_deny_list(
+  slot: &RightSlot<'_>,
+  masks: &[BitSet],
   active: &ActivePatterns<'_>,
   sig: &SegmentSignature,
-) -> PathNfaState {
-  let next_reached = rules
-    .iter()
-    .zip(&state.reached)
-    .map(|(rule, mask)| advance_rule_mask(rule, mask, active, sig))
-    .collect();
-  finalize_path_state(rules, next_reached, state.effects.clone())
+) -> (Vec<BitSet>, bool, bool) {
+  let allow_order = slot.choice.order();
+  let mut next_masks = Vec::with_capacity(slot.denies.len());
+  let (mut deny_any, mut deny_gt) = (false, false);
+  for (&rule, mask) in slot.denies.iter().zip(masks) {
+    let mut next = advance_deny_rule_mask(rule, mask, active, sig);
+    if next.get(rule.segments.len()) {
+      deny_any = true;
+      if allow_order.is_none_or(|ord| rule.order > ord) {
+        deny_gt = true;
+      }
+    }
+    next.clear(rule.segments.len());
+    next_masks.push(next);
+  }
+  (next_masks, deny_any, deny_gt)
 }
 
-/// Explores all segment transitions out of `state`, pushing unvisited successors into `queue` and
-/// returning `true` immediately when an accepting path state is reached.
-fn expand_path_state(
-  rules: &[CompiledPathRule],
-  queries: &[(Right, bool)],
-  state: &PathNfaState,
-  visited: &mut HashSet<PathNfaState>,
-  queue: &mut VecDeque<PathNfaState>,
-) -> bool {
-  let active = collect_active_patterns(rules, state);
-  explore_segment_signatures(&active.literals, &active.globs, |sig| {
-    let next = advance_path_state(rules, state, &active, sig);
-    if effects_accept(&next.effects, queries) {
-      return true;
-    }
-    if visited.len() < WITNESS_STATE_BUDGET && visited.insert(next.clone()) {
-      queue.push_back(next);
-    }
-    false
-  })
+/// Inserts a non-accepting [`PathPairState`] into `bfs` respecting [`WITNESS_STATE_BUDGET`].
+fn enqueue_path_state(bfs: &mut PathPairBfs, next: PathPairState) {
+  if bfs.visited.contains(&next) {
+    return;
+  }
+  if bfs.visited.len() >= WITNESS_STATE_BUDGET {
+    bfs.budget_exceeded = true;
+    return;
+  }
+  bfs.visited.insert(next.clone());
+  bfs.queue.push_back(next);
 }
 
-/// Exact witness-emptiness check: whether at least one canonical repository path satisfies every
-/// `(right, allow_unruled)` constraint in `queries` simultaneously, using two-level minterm-class
-/// product-NFA BFS over the compiled wildmatch token streams.
-fn exists_path_satisfying_rules(
-  rules: &[Rule<PathPattern>],
-  principal: &Principal,
-  queries: &[(Right, bool)],
+/// Enqueues one `pos0` paired with every `pos1` in `p1_list`, returning `true` on acceptance.
+fn enqueue_two_right_pos0(
+  bfs: &mut PathPairBfs,
+  pos0: AllowPos,
+  p1_list: [Option<AllowPos>; 2],
+  denies: (&[BitSet], &[BitSet]),
 ) -> bool {
-  let compiled = compile_path_rules(rules, principal, queries);
-  if !every_required_right_has_allow(&compiled, queries) {
-    return false;
-  }
-  let start = initial_path_state(&compiled, queries.len());
-  if effects_accept(&start.effects, queries) {
-    return true;
-  }
-  let mut visited: HashSet<PathNfaState> = HashSet::from([start.clone()]);
-  let mut queue = VecDeque::from([start]);
-  while let Some(state) = queue.pop_front() {
-    if state.reached.iter().all(BitSet::is_empty) {
-      continue;
-    }
-    if expand_path_state(&compiled, queries, &state, &mut visited, &mut queue) {
+  let (denies0, denies1) = denies;
+  for pos1 in p1_list.into_iter().flatten() {
+    if pos0 == AllowPos::Inherited && pos1 == AllowPos::Inherited {
       return true;
+    }
+    enqueue_path_state(
+      bfs,
+      PathPairState {
+        pos0,
+        pos1: Some(pos1),
+        denies0: denies0.to_vec(),
+        denies1: denies1.to_vec(),
+      },
+    );
+  }
+  false
+}
+
+/// Enqueues all `(pos0, pos1)` combinations produced at one depth, returning `true` immediately when
+/// both queried rights reach [`AllowPos::Inherited`].
+fn enqueue_path_positions(
+  bfs: &mut PathPairBfs,
+  pos0s: [Option<AllowPos>; 2],
+  pos1s: Option<[Option<AllowPos>; 2]>,
+  denies: (&[BitSet], &[BitSet]),
+) -> bool {
+  for pos0 in pos0s.into_iter().flatten() {
+    match pos1s {
+      None => {
+        if pos0 == AllowPos::Inherited {
+          return true;
+        }
+        enqueue_path_state(
+          bfs,
+          PathPairState {
+            pos0,
+            pos1: None,
+            denies0: denies.0.to_vec(),
+            denies1: Vec::new(),
+          },
+        );
+      }
+      Some(p1_list) => {
+        if enqueue_two_right_pos0(bfs, pos0, p1_list, denies) {
+          return true;
+        }
+      }
     }
   }
   false
 }
 
-/// Whether every rule required to have an explicit `Allow` (`!allow_unruled`) has at least one
-/// matchable `Allow` rule in `rules`.
-fn every_required_right_has_allow(rules: &[CompiledPathRule], queries: &[(Right, bool)]) -> bool {
-  queries.iter().enumerate().all(|(qi, &(_, allow_unruled))| {
-    allow_unruled
-      || rules
-        .iter()
-        .any(|rule| rule.query_idx == qi && rule.effect == Effect::Allow)
+/// Applies one realized `Deny` segment signature `sig` to `(b0, b1)` out of `state`, returning
+/// `true` when an accepting path state is reached.
+fn apply_path_sig(
+  slots: (&RightSlot<'_>, Option<&RightSlot<'_>>),
+  branches: (PosBranch<'_>, Option<PosBranch<'_>>),
+  state: &PathPairState,
+  active: &ActivePatterns<'_>,
+  sig: &SegmentSignature,
+  bfs: &mut PathPairBfs,
+) -> bool {
+  let (slot0, slot1) = slots;
+  let (b0, b1) = branches;
+  let (next_d0, any0, gt0) = step_deny_list(slot0, &state.denies0, active, sig);
+  let pos0s = resolve_allow_pos(slot0.choice, b0.next_pos, any0, gt0);
+  if pos0s == [None, None] {
+    return false;
+  }
+  let Some((s1, branch1)) = slot1.zip(b1) else {
+    return enqueue_path_positions(bfs, pos0s, None, (&next_d0, &[]));
+  };
+  let (next_d1, any1, gt1) = step_deny_list(s1, &state.denies1, active, sig);
+  let pos1s = resolve_allow_pos(s1.choice, branch1.next_pos, any1, gt1);
+  if pos1s == [None, None] {
+    return false;
+  }
+  enqueue_path_positions(bfs, pos0s, Some(pos1s), (&next_d0, &next_d1))
+}
+
+/// Expands one positive branch pair `(b0, b1)` from `state` over all realizable valid UTF-8 `Deny`
+/// signatures.
+fn expand_branch_pair(
+  slots: (&RightSlot<'_>, Option<&RightSlot<'_>>),
+  branches: (PosBranch<'_>, Option<PosBranch<'_>>),
+  state: &PathPairState,
+  active: &ActivePatterns<'_>,
+  bfs: &mut PathPairBfs,
+) -> WitnessOutcome {
+  let reqs = [
+    branches.0.req,
+    branches.1.map_or(PosSegReq::Any, |branch| branch.req),
+  ];
+  explore_deny_signatures(reqs, &active.literals, &active.globs, |sig| {
+    apply_path_sig(slots, branches, state, active, sig, bfs)
   })
+}
+
+/// Expands one right-0 branch `b0` paired with every available right-1 branch in `branches1`.
+fn expand_branch_for_b0(
+  slots: (&RightSlot<'_>, Option<&RightSlot<'_>>),
+  b0: PosBranch<'_>,
+  branches1: Option<[Option<PosBranch<'_>>; 2]>,
+  state: &PathPairState,
+  active: &ActivePatterns<'_>,
+  bfs: &mut PathPairBfs,
+) -> WitnessOutcome {
+  let Some(b1_list) = branches1 else {
+    return expand_branch_pair((slots.0, None), (b0, None), state, active, bfs);
+  };
+  let mut outcome = WitnessOutcome::Empty;
+  for b1 in b1_list.into_iter().flatten() {
+    outcome = outcome.merge(expand_branch_pair(
+      slots,
+      (b0, Some(b1)),
+      state,
+      active,
+      bfs,
+    ));
+    if outcome == WitnessOutcome::Found {
+      return WitnessOutcome::Found;
+    }
+  }
+  outcome
+}
+
+/// Expands all positive branch pairs out of `state`.
+fn expand_path_pair_state(
+  slot0: &RightSlot<'_>,
+  slot1: Option<&RightSlot<'_>>,
+  state: &PathPairState,
+  bfs: &mut PathPairBfs,
+) -> WitnessOutcome {
+  let active = collect_active_deny_patterns(slot0, slot1, state);
+  let branches0 = pos_branches(slot0.choice, state.pos0);
+  let branches1 = slot1
+    .zip(state.pos1)
+    .map(|(s1, p1)| pos_branches(s1.choice, p1));
+  let mut outcome = WitnessOutcome::Empty;
+  for b0 in branches0.into_iter().flatten() {
+    outcome = outcome.merge(expand_branch_for_b0(
+      (slot0, slot1),
+      b0,
+      branches1,
+      state,
+      &active,
+      bfs,
+    ));
+    if outcome == WitnessOutcome::Found {
+      return WitnessOutcome::Found;
+    }
+  }
+  outcome
+}
+
+/// Seeds depth-0 initial states into `bfs`, returning `Some(Found)` when `/` already satisfies the
+/// query or `Some(Empty)` when no initial position exists.
+fn seed_allow_slots(
+  slot0: &RightSlot<'_>,
+  slot1: Option<&RightSlot<'_>>,
+  bfs: &mut PathPairBfs,
+) -> Option<WitnessOutcome> {
+  let (d0, any0, gt0) = initial_deny_list(slot0);
+  let pos0s = initial_allow_positions(slot0.choice, any0, gt0);
+  if pos0s == [None, None] {
+    return Some(WitnessOutcome::Empty);
+  }
+  let accepted_root = match slot1 {
+    None => enqueue_path_positions(bfs, pos0s, None, (&d0, &[])),
+    Some(s1) => {
+      let (d1, any1, gt1) = initial_deny_list(s1);
+      let pos1s = initial_allow_positions(s1.choice, any1, gt1);
+      if pos1s == [None, None] {
+        return Some(WitnessOutcome::Empty);
+      }
+      enqueue_path_positions(bfs, pos0s, Some(pos1s), (&d0, &d1))
+    }
+  };
+  accepted_root.then_some(WitnessOutcome::Found)
+}
+
+/// Runs exact NFA-Allow × DFA-Deny path-level BFS for one chosen positive rule (or pair of
+/// positive rules).
+fn search_allow_slots(slot0: &RightSlot<'_>, slot1: Option<&RightSlot<'_>>) -> WitnessOutcome {
+  let mut bfs = PathPairBfs {
+    queue: VecDeque::new(),
+    visited: HashSet::new(),
+    budget_exceeded: false,
+  };
+  if let Some(done) = seed_allow_slots(slot0, slot1, &mut bfs) {
+    return done;
+  }
+  while let Some(state) = bfs.queue.pop_front() {
+    match expand_path_pair_state(slot0, slot1, &state, &mut bfs) {
+      WitnessOutcome::Found => return WitnessOutcome::Found,
+      WitnessOutcome::BudgetExceeded => bfs.budget_exceeded = true,
+      WitnessOutcome::Empty => {}
+    }
+  }
+  if bfs.budget_exceeded {
+    WitnessOutcome::BudgetExceeded
+  } else {
+    WitnessOutcome::Empty
+  }
+}
+
+/// Collects all viable positive [`AllowChoice`] candidates for `right`, newest `Allow` rules first
+/// so unshadowed rules find witnesses immediately.
+fn positive_choices(right: &RightRules) -> Vec<AllowChoice<'_>> {
+  let mut choices = Vec::with_capacity(right.allows.len().saturating_add(1));
+  if right.allow_unruled
+    && !right
+      .denies
+      .iter()
+      .any(|deny| rule_matches_root(&deny.segments))
+  {
+    choices.push(AllowChoice::Unruled);
+  }
+  for allow in right.allows.iter().rev() {
+    choices.push(AllowChoice::Rule(allow));
+  }
+  choices
+}
+
+/// Exact witness search for a single queried right: checks unruled root in O(|denies|), then tests
+/// each `Allow` rule nondeterministically against ONLY strictly later `Deny` rules (`deny.order >
+/// allow.order`).
+fn witness_single_right(right: &RightRules) -> WitnessOutcome {
+  if right.allow_unruled
+    && !right
+      .denies
+      .iter()
+      .any(|deny| rule_matches_root(&deny.segments))
+  {
+    return WitnessOutcome::Found;
+  }
+  let mut outcome = WitnessOutcome::Empty;
+  for allow in right.allows.iter().rev() {
+    let overriding: Vec<&RightRule> = right
+      .denies
+      .iter()
+      .filter(|deny| deny.order > allow.order)
+      .collect();
+    let slot = RightSlot {
+      choice: AllowChoice::Rule(allow),
+      denies: &overriding,
+    };
+    outcome = outcome.merge(search_allow_slots(&slot, None));
+    if outcome == WitnessOutcome::Found {
+      return WitnessOutcome::Found;
+    }
+  }
+  outcome
+}
+
+/// Exact witness search for two simultaneously queried rights (`Read` and one write right): checks
+/// each `(choice0, choice1)` positive pair nondeterministically against each right's `Deny` rules.
+fn witness_two_rights(right0: &RightRules, right1: &RightRules) -> WitnessOutcome {
+  let choices0 = positive_choices(right0);
+  let choices1 = positive_choices(right1);
+  if choices0.is_empty() || choices1.is_empty() {
+    return WitnessOutcome::Empty;
+  }
+  let denies0: Vec<&RightRule> = right0.denies.iter().collect();
+  let denies1: Vec<&RightRule> = right1.denies.iter().collect();
+  let mut outcome = WitnessOutcome::Empty;
+  for &c0 in &choices0 {
+    let slot0 = RightSlot {
+      choice: c0,
+      denies: &denies0,
+    };
+    for &c1 in &choices1 {
+      let slot1 = RightSlot {
+        choice: c1,
+        denies: &denies1,
+      };
+      outcome = outcome.merge(search_allow_slots(&slot0, Some(&slot1)));
+      if outcome == WitnessOutcome::Found {
+        return WitnessOutcome::Found;
+      }
+    }
+  }
+  outcome
+}
+
+/// Exact witness-emptiness check: whether at least one valid RFC 3629 UTF-8 canonical repository
+/// path satisfies every `(right, allow_unruled)` constraint in `queries` simultaneously, using
+/// two-level NFA-Allow × DFA-Deny × UTF-8 product BFS.
+fn witness_satisfying_rules(
+  rules: &[Rule<PathPattern>],
+  principal: &Principal,
+  queries: &[(Right, bool)],
+) -> WitnessOutcome {
+  match queries {
+    [] => WitnessOutcome::Found,
+    [q0] => witness_single_right(&compile_right_rules(rules, principal, *q0)),
+    [q0, q1] => witness_two_rights(
+      &compile_right_rules(rules, principal, *q0),
+      &compile_right_rules(rules, principal, *q1),
+    ),
+    _ => WitnessOutcome::Empty,
+  }
 }
 
 /// A repository path's segments, as authz's lookup reads them: repeated slashes as one, leading and trailing ones as
@@ -1472,10 +2331,24 @@ impl SvnPolicy {
     decide(&self.rules, best.map(|(_, position)| position))
   }
 
-  /// Exact witness-emptiness check: whether at least one canonical repository path satisfies every
-  /// `(right, allow_unruled)` constraint in `queries` simultaneously.
+  /// Exact witness-emptiness check returning typed [`WitnessOutcome`] over valid UTF-8 paths.
+  fn witness_satisfying(&self, principal: &Principal, queries: &[(Right, bool)]) -> WitnessOutcome {
+    witness_satisfying_rules(&self.rules, principal, queries)
+  }
+
+  /// Exact witness-emptiness check: logs on [`WitnessOutcome::BudgetExceeded`] and fails closed.
   fn exists_path_satisfying(&self, principal: &Principal, queries: &[(Right, bool)]) -> bool {
-    exists_path_satisfying_rules(&self.rules, principal, queries)
+    match self.witness_satisfying(principal, queries) {
+      WitnessOutcome::Found => true,
+      WitnessOutcome::Empty => false,
+      WitnessOutcome::BudgetExceeded => {
+        slates_machine::log_line!(
+          "slates-server: svn witness search exceeded state budget ({WITNESS_STATE_BUDGET}) across {} rules; failing closed",
+          self.rules.len()
+        );
+        false
+      }
+    }
   }
 }
 
@@ -4627,6 +5500,330 @@ mod tests {
       let rec = record(slates_db::catalog::VcsTool::Subversion, rules.clone());
       let user = principal(if is_owner { OWNER } else { STRANGER });
       let paths = enumerate_paths(&THREE_BYTE_SEGMENTS, 2);
+      let expected = brute_force_svn_access(&rec, &user, &paths);
+      let actual = super::svn_access(&rec, &user).unwrap();
+      prop_assert_eq!(actual, expected, "owner={}, rules={:?}", is_owner, rules);
+    }
+  }
+
+  /// Helper compiling `rules` into an `SvnPolicy` for direct `WitnessOutcome` checks.
+  fn compiled_svn(rules: Vec<slates_db::catalog::PolicyRule>) -> SvnPolicy {
+    let rec = record(slates_db::catalog::VcsTool::Subversion, rules);
+    let super::Compiled::Subversion(policy) = super::Compiled::of(&rec).unwrap() else {
+      panic!("expected Subversion policy");
+    };
+    policy
+  }
+
+  /// Round-6 Blocker 2 (repro `repro_witness_budget_lockout.py` Cases A/B/C + typed
+  /// `WitnessOutcome` on PSPACE-hard multi-deny): Do evaluate 0-deny nondeterministic allow globs
+  /// (`/*a?????????????????`, `Allow Read /` + `Allow Submit /*a?????????????????`,
+  /// `/**/a/*/*/.../*` with 17 `*`), dual complex allow globs, eclipsed complex globs, and a
+  /// pathological self-negated 17-wildcard deny glob. Expect: Cases A/B/C and dual complex allow
+  /// globs find witnesses (`WitnessOutcome::Found`) without exhausting `WITNESS_STATE_BUDGET`;
+  /// eclipsed globs prove `WitnessOutcome::Empty`; and a genuinely PSPACE-hard deny reports
+  /// `WitnessOutcome::BudgetExceeded` and fails closed to `SvnAccess::None`.
+  #[test]
+  fn round6_blocker2_nfa_allow_dfa_deny_solves_cases_a_b_c_and_reports_budget_outcome() {
+    use slates_db::catalog::{PolicyEffect, PolicyRight, PolicyWho};
+    let allow_r =
+      |p: &str| svn_path_rule(p, PolicyRight::Read, PolicyEffect::Allow, PolicyWho::Anyone);
+    let deny_r =
+      |p: &str| svn_path_rule(p, PolicyRight::Read, PolicyEffect::Deny, PolicyWho::Anyone);
+    let allow_s = |p: &str| {
+      svn_path_rule(
+        p,
+        PolicyRight::Submit,
+        PolicyEffect::Allow,
+        PolicyWho::Anyone,
+      )
+    };
+    let pat_17_q = ":glob:/*a?????????????????";
+    let pat_17_q_b = ":glob:/*b?????????????????";
+    let pat_16_q_b = ":glob:/*b????????????????";
+    let pat_17_seg = ":glob:/**/a/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*";
+
+    assert_svn_access_cases(&[
+      (
+        "Case A: single 0-deny *a?{17} Read",
+        vec![allow_r(pat_17_q)],
+        super::SvnAccess::Read,
+      ),
+      (
+        "Case B: Read / + 0-deny Submit *a?{17}",
+        vec![allow_r("/"), allow_s(pat_17_q)],
+        super::SvnAccess::Write,
+      ),
+      (
+        "Case C: single 0-deny /**/a/*^17 Read",
+        vec![allow_r(pat_17_seg)],
+        super::SvnAccess::Read,
+      ),
+      (
+        "Overlapping complex 0-deny allows: Read *a?{17} + Submit *b?{16}",
+        vec![allow_r(pat_17_q), allow_s(pat_16_q_b)],
+        super::SvnAccess::Write,
+      ),
+      (
+        "Disjoint complex 0-deny allows: Read *a?{17} + Submit *b?{17} (18th-from-end conflict)",
+        vec![allow_r(pat_17_q), allow_s(pat_17_q_b)],
+        super::SvnAccess::Read,
+      ),
+      (
+        "Complex allow eclipsed by Deny /*",
+        vec![allow_r(pat_17_q), deny_r(":glob:/*")],
+        super::SvnAccess::None,
+      ),
+    ]);
+
+    let stranger = principal(STRANGER);
+    assert_eq!(
+      compiled_svn(vec![allow_r(pat_17_q)]).witness_satisfying(&stranger, &[(Right::Read, false)]),
+      super::WitnessOutcome::Found
+    );
+    assert_eq!(
+      compiled_svn(vec![allow_r(pat_17_q), allow_s(pat_17_q_b)])
+        .witness_satisfying(&stranger, &[(Right::Read, false), (Right::Submit, false)]),
+      super::WitnessOutcome::Empty
+    );
+    assert_eq!(
+      compiled_svn(vec![allow_r(pat_17_q), deny_r(":glob:/*")])
+        .witness_satisfying(&stranger, &[(Right::Read, false)]),
+      super::WitnessOutcome::Empty
+    );
+    // Pathological self-negated 17-wildcard Deny forces powerset complementation > budget.
+    let pathological = vec![allow_r(pat_17_q), deny_r(pat_17_q)];
+    assert_eq!(
+      compiled_svn(pathological.clone()).witness_satisfying(&stranger, &[(Right::Read, false)]),
+      super::WitnessOutcome::BudgetExceeded
+    );
+    assert_svn_access_cases(&[(
+      "BudgetExceeded fails closed to SvnAccess::None",
+      pathological,
+      super::SvnAccess::None,
+    )]);
+  }
+
+  /// Independent standard-library oracle for whether `bytes` is a valid non-empty slash-free UTF-8
+  /// Subversion path segment.
+  fn std_valid_utf8_segment(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+      && !bytes.contains(&0)
+      && !bytes.contains(&b'/')
+      && std::str::from_utf8(bytes).is_ok()
+  }
+
+  /// Round-6 Blocker 3 (exhaustive RFC 3629 UTF-8 validator DFA oracle): Do test
+  /// `is_valid_utf8_segment` against `std::str::from_utf8` across ALL 256 1-byte sequences, ALL
+  /// 65,536 2-byte sequences, and critical 3-byte/4-byte boundary vectors (overlong `E0`/`F0`,
+  /// UTF-16 surrogates `ED A0..=BF`, `> U+10FFFF` `F4 90..=BF`/`F5..=FF`). Expect: 100% exact
+  /// agreement on every byte sequence.
+  #[test]
+  fn round6_blocker3_utf8_dfa_matches_std_str_from_utf8() {
+    for b0 in 0u8..=u8::MAX {
+      assert_eq!(
+        super::is_valid_utf8_segment(&[b0]),
+        std_valid_utf8_segment(&[b0]),
+        "1-byte mismatch for 0x{b0:02x}"
+      );
+      for b1 in 0u8..=u8::MAX {
+        assert_eq!(
+          super::is_valid_utf8_segment(&[b0, b1]),
+          std_valid_utf8_segment(&[b0, b1]),
+          "2-byte mismatch for [0x{b0:02x}, 0x{b1:02x}]"
+        );
+      }
+    }
+    let multi_byte_cases: &[&[u8]] = &[
+      &[0xE0, 0x80, 0x80],
+      &[0xE0, 0x9F, 0xBF],
+      &[0xE0, 0xA0, 0x80],
+      &[0xE0, 0xBF, 0xBF],
+      &[0xED, 0x9F, 0xBF],
+      &[0xED, 0xA0, 0x80],
+      &[0xED, 0xBF, 0xBF],
+      &[0xEE, 0x80, 0x80],
+      &[0xEF, 0xBF, 0xBF],
+      &[0xF0, 0x80, 0x80, 0x80],
+      &[0xF0, 0x8F, 0xBF, 0xBF],
+      &[0xF0, 0x90, 0x80, 0x80],
+      &[0xF1, 0x80, 0x80, 0x80],
+      &[0xF4, 0x8F, 0xBF, 0xBF],
+      &[0xF4, 0x90, 0x80, 0x80],
+      &[0xF5, 0x80, 0x80, 0x80],
+      b"a\xC2\x80",
+      b"a\xE2\x82\xAC",
+      b"a\xF0\x9F\x98\x80",
+      b"a\xC2",
+      b"a\x80",
+    ];
+    for &sample in multi_byte_cases {
+      assert_eq!(
+        super::is_valid_utf8_segment(sample),
+        std_valid_utf8_segment(sample),
+        "multi-byte mismatch for {sample:02x?}"
+      );
+    }
+  }
+
+  /// Round-6 Blocker 3 (repro `repro_non_utf8_phantom_witness.py` + positive multi-byte UTF-8
+  /// witnesses): Do evaluate `Allow :glob:/?` minus `Deny :glob:/[[:cntrl:][:print:]]` (Read and
+  /// Read+Submit), single-byte non-ASCII bracket `/[é]`, and positive 2/3/4-byte UTF-8 glob
+  /// complements (`/??`, `/???`, `/????`, `/[é][é]`). Expect: zero-valid-UTF-8 policies return
+  /// `SvnAccess::None` (`WitnessOutcome::Empty`), while 2/3/4-byte UTF-8 witnesses (`"\u{0080}"`,
+  /// `"é"`, `"€"`, `"\u{10000}"`) are found.
+  #[test]
+  fn round6_blocker3_rejects_non_utf8_phantom_witness_and_finds_multibyte_utf8() {
+    use slates_db::catalog::{PolicyEffect, PolicyRight, PolicyWho};
+    let allow_r =
+      |p: &str| svn_path_rule(p, PolicyRight::Read, PolicyEffect::Allow, PolicyWho::Anyone);
+    let deny_r =
+      |p: &str| svn_path_rule(p, PolicyRight::Read, PolicyEffect::Deny, PolicyWho::Anyone);
+    let allow_s = |p: &str| {
+      svn_path_rule(
+        p,
+        PolicyRight::Submit,
+        PolicyEffect::Allow,
+        PolicyWho::Anyone,
+      )
+    };
+    let deny_s = |p: &str| {
+      svn_path_rule(
+        p,
+        PolicyRight::Submit,
+        PolicyEffect::Deny,
+        PolicyWho::Anyone,
+      )
+    };
+    let ascii = "[[:cntrl:][:print:]]";
+    let ascii2 = format!(":glob:/{ascii}{ascii}");
+    let ascii3 = format!(":glob:/{ascii}{ascii}{ascii}");
+    let ascii4 = format!(":glob:/{ascii}{ascii}{ascii}{ascii}");
+
+    assert_svn_access_cases(&[
+      (
+        "Repro: Allow Read+Submit /? minus Deny Read+Submit /[[:cntrl:][:print:]] -> None",
+        vec![
+          allow_r(":glob:/?"),
+          deny_r(&format!(":glob:/{ascii}")),
+          allow_s(":glob:/?"),
+          deny_s(&format!(":glob:/{ascii}")),
+        ],
+        super::SvnAccess::None,
+      ),
+      (
+        "1-byte Read /? minus ASCII -> None",
+        vec![allow_r(":glob:/?"), deny_r(&format!(":glob:/{ascii}"))],
+        super::SvnAccess::None,
+      ),
+      (
+        "2-byte UTF-8 witness: Allow Read /?? minus 2x ASCII -> Read (\\u{0080})",
+        vec![allow_r(":glob:/??"), deny_r(&ascii2)],
+        super::SvnAccess::Read,
+      ),
+      (
+        "2-byte UTF-8 Write witness: Read+Submit /?? minus 2x ASCII -> Write",
+        vec![
+          allow_r(":glob:/??"),
+          deny_r(&ascii2),
+          allow_s(":glob:/??"),
+          deny_s(&ascii2),
+        ],
+        super::SvnAccess::Write,
+      ),
+      (
+        "3-byte UTF-8 witness: Allow Read /??? minus 3x ASCII -> Read",
+        vec![allow_r(":glob:/???"), deny_r(&ascii3)],
+        super::SvnAccess::Read,
+      ),
+      (
+        "4-byte UTF-8 witness: Allow Read /???? minus 4x ASCII -> Read",
+        vec![allow_r(":glob:/????"), deny_r(&ascii4)],
+        super::SvnAccess::Read,
+      ),
+      (
+        "Single-byte non-ASCII bracket /[é] has no 1-byte valid UTF-8 witness",
+        vec![allow_r(":glob:/[é]")],
+        super::SvnAccess::None,
+      ),
+      (
+        "Two-byte bracket /[é][é] matches valid UTF-8 \"é\"",
+        vec![allow_r(":glob:/[é][é]")],
+        super::SvnAccess::Read,
+      ),
+    ]);
+  }
+
+  /// Complete valid RFC 3629 UTF-8 segment universe for `utf8_oracle_segment_piece()` covering
+  /// 1-byte ASCII (`a`, `d`), 2-byte UTF-8 (`\u{0080}`, `é`), 3-byte UTF-8 (`€`), and length-3/4
+  /// combinations.
+  const UTF8_ORACLE_SEGMENTS: [&[u8]; 22] = [
+    b"a",
+    b"d",
+    b"aa",
+    b"ad",
+    b"da",
+    b"dd",
+    "\u{0080}".as_bytes(),
+    "é".as_bytes(),
+    b"aaa",
+    b"add",
+    "a\u{0080}".as_bytes(),
+    "\u{0080}a".as_bytes(),
+    "d\u{0080}".as_bytes(),
+    "\u{0080}d".as_bytes(),
+    "aé".as_bytes(),
+    "éa".as_bytes(),
+    "€".as_bytes(),
+    b"aaaa",
+    b"aadd",
+    "\u{0080}\u{0080}".as_bytes(),
+    "a€".as_bytes(),
+    "€a".as_bytes(),
+  ];
+
+  fn utf8_oracle_segment_piece() -> impl Strategy<Value = &'static str> {
+    prop::sample::select(vec![
+      "a",
+      "\u{0080}",
+      "*",
+      "**",
+      "?",
+      "??",
+      "???",
+      "[[:cntrl:][:print:]]",
+      "[[:cntrl:][:print:]][[:cntrl:][:print:]]",
+      "[!a]",
+      "a*",
+    ])
+  }
+
+  fn utf8_oracle_literal_piece() -> impl Strategy<Value = &'static str> {
+    prop::sample::select(vec!["a", "\u{0080}"])
+  }
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig {
+      cases: slates_test_seeds::cases(if cfg!(miri) { 8 } else { 512 }),
+      ..ProptestConfig::default()
+    }))]
+
+    /// Round-6 Blocker 3 (valid-UTF-8 multi-byte brute-force proptest oracle): Do generate random
+    /// multi-rule policies mixing `?`, `??`, `???`, `[[:cntrl:][:print:]]`, `[!a]`, `a*`, `*`,
+    /// `**`, ASCII `"a"`, and 2-byte UTF-8 `"\u{0080}"`. Expect: the NFA-Allow × DFA-Deny × UTF-8
+    /// witness solver agrees 100% with brute-force `SvnPolicy::verdict` enumeration over valid
+    /// UTF-8 paths.
+    #[test]
+    fn round6_blocker3_utf8_multibyte_proptest_oracle(
+      rules in prop::collection::vec(
+        svn_oracle_rule(utf8_oracle_segment_piece(), utf8_oracle_literal_piece(), 1),
+        0..=5,
+      ),
+      is_owner in any::<bool>(),
+    ) {
+      let rec = record(slates_db::catalog::VcsTool::Subversion, rules.clone());
+      let user = principal(if is_owner { OWNER } else { STRANGER });
+      let paths = enumerate_paths(&UTF8_ORACLE_SEGMENTS, 2);
       let expected = brute_force_svn_access(&rec, &user, &paths);
       let actual = super::svn_access(&rec, &user).unwrap();
       prop_assert_eq!(actual, expected, "owner={}, rules={:?}", is_owner, rules);

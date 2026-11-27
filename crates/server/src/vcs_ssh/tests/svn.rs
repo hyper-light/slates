@@ -322,11 +322,13 @@ impl KeyHolders for NoKeys {
 }
 
 /// The repositories the site finds: [`REPOSITORY`] and [`ELSEWHERE`], Subversion's, and [`GIT_REPOSITORY`], each
-/// `owner`'s with no rules.
+/// `owner`'s with `rules` and `hooks`.
 #[derive(Clone)]
 struct Held {
   /// Their owner.
   owner: Principal,
+  /// The per-path policy rules their policy enforces.
+  rules: Vec<slates_db::catalog::PolicyRule>,
   /// The hooks their policy configures (A-730).
   hooks: Vec<slates_db::catalog::HookConfig>,
 }
@@ -353,7 +355,7 @@ impl Repositories for Held {
       owner: self.owner.clone(),
       policy: RepositoryPolicy {
         version: 1,
-        rules: Vec::new(),
+        rules: self.rules.clone(),
         hooks: self.hooks.clone(),
         hooks_env: Vec::new(),
         signers: Vec::new(),
@@ -477,14 +479,15 @@ struct Lends {
 }
 
 impl Lends {
-  /// A lender of a repository just created.
-  fn created() -> Lends {
-    let uuid = Uuid::parse(UUID.as_bytes()).expect("the recordings' UUID");
-    let records = Records::new(uuid, CREATED, RECORDS_ROOM).expect("revision 0's records");
+  /// A lender of a repository holding `records` and their stored `texts`.
+  fn from_records(
+    records: Records,
+    texts: std::collections::BTreeMap<ContentIdentity, Vec<u8>>,
+  ) -> Lends {
     let created: &'static Created = Box::leak(Box::new(Created {
       current: Cell::new(Box::leak(Box::new(records))),
       commits: Cell::new(0),
-      stored: StoredTexts::default(),
+      stored: std::cell::RefCell::new(texts),
     }));
     let id = CREATED_REPOS.with(|list| {
       let mut list = list.borrow_mut();
@@ -493,6 +496,13 @@ impl Lends {
       id
     });
     Lends { id, full: false }
+  }
+
+  /// A lender of a repository just created.
+  fn created() -> Lends {
+    let uuid = Uuid::parse(UUID.as_bytes()).expect("the recordings' UUID");
+    let records = Records::new(uuid, CREATED, RECORDS_ROOM).expect("revision 0's records");
+    Self::from_records(records, std::collections::BTreeMap::new())
   }
 
   /// The repository on this thread.
@@ -649,6 +659,7 @@ type TunnelSite<K> = ToolSite<K, Held, SvnServices<NotYet, Held, Lends>>;
 fn site_over<K>(keys: K, owner: Principal, lends: Lends) -> TunnelSite<K> {
   let held = Held {
     owner,
+    rules: Vec::new(),
     hooks: Vec::new(),
   };
   let services = SvnServices::new(NotYet, held.clone(), lends, BOUNDS);
@@ -1287,24 +1298,15 @@ async fn drive_awaiting<C: Command>(command: &mut C, runs: &[&[u8]]) -> Ended {
   panic!("a tunnel that never exits: {answered:?}");
 }
 
-/// The recorded `mkdir` connection's client bytes run through a tunnel whose repository's policy runs `hooks`, on a
-/// runtime of its own (a hook is a process the run awaits): what the tunnel gave its client, and the youngest revision
-/// then.
+/// Shape: timeout multiplier over the daemon's liveness budget for local hook-runner tests.
 #[cfg(unix)]
-fn commit_under_hooks(hooks: Vec<slates_db::catalog::HookConfig>) -> (Answered, u64) {
+const HOOK_TIMEOUT_BUDGETS: u64 = 10;
+
+/// Single-shard local runtime sized for executing Subversion hook subprocesses in tests.
+#[cfg(unix)]
+fn hook_runtime() -> slates_rt::runtime::LocalRuntime {
   use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
-  let lends = Lends::created();
-  let held = Held {
-    owner: principal(OWNER),
-    hooks,
-  };
-  let services = SvnServices::new(NotYet, held.clone(), lends, BOUNDS);
-  let mut site = ToolSite::new(NoKeys, held, services);
-  let Dispatched::Run(mut command) = site.dispatch(&principal(OWNER), &Asked::Subversion, None)
-  else {
-    panic!("the tunnel was refused");
-  };
-  let runtime = LocalRuntime::new(&RuntimeConfig {
+  LocalRuntime::new(&RuntimeConfig {
     shards: 1,
     tasks_per_shard: 8,
     timers_per_shard: 8,
@@ -1318,11 +1320,31 @@ fn commit_under_hooks(hooks: Vec<slates_db::catalog::HookConfig>) -> (Answered, 
     spin_ns: 0,
     wake_tracking: None,
   })
-  .expect("a local runtime");
+  .expect("a local runtime")
+}
+
+/// The recorded `mkdir` connection's client bytes run through a tunnel whose repository's policy runs `hooks`, on a
+/// runtime of its own (a hook is a process the run awaits): what the tunnel gave its client, and the youngest revision
+/// then.
+#[cfg(unix)]
+fn commit_under_hooks(hooks: Vec<slates_db::catalog::HookConfig>) -> (Answered, u64) {
+  let lends = Lends::created();
+  let held = Held {
+    owner: principal(OWNER),
+    rules: Vec::new(),
+    hooks,
+  };
+  let services = SvnServices::new(NotYet, held.clone(), lends, BOUNDS);
+  let mut site = ToolSite::new(NoKeys, held, services);
+  let Dispatched::Run(mut command) = site.dispatch(&principal(OWNER), &Asked::Subversion, None)
+  else {
+    panic!("the tunnel was refused");
+  };
+  let runtime = hook_runtime();
   let (sent, got) = std::sync::mpsc::channel();
   runtime
     .spawn(async move {
-      let bound = 10 * crate::daemon::LIVENESS_BUDGET_NS;
+      let bound = HOOK_TIMEOUT_BUDGETS * crate::daemon::LIVENESS_BUDGET_NS;
       let ran =
         slates_rt::futures::within(bound, drive_awaiting(&mut command, &[MKDIR_CLIENT])).await;
       let _ = sent.send(ran.ok().flatten());
@@ -1419,6 +1441,339 @@ fn a_tunnel_runs_its_repositorys_commit_hooks_as_svnserve_t_runs_them() {
   let out = String::from_utf8_lossy(&answered.out).into_owned();
   assert!(out.contains("post said no"), "{out}");
   assert_eq!(youngest, 1);
+}
+
+/// Wire commands for an unauthorized direct write under `/tags/subnew` at base r1.
+#[cfg(unix)]
+const DIRECT_DENIED_COMMIT: &str = concat!(
+  "( commit ( 6:denied ( ) false ( ( 7:svn:log 6:denied ) ) ) ) ",
+  "( open-root ( ( 1 ) 2:d0 ) ) ",
+  "( open-dir ( 4:tags 2:d0 2:d1 ( 1 ) ) ) ",
+  "( add-dir ( 11:tags/subnew 2:d1 2:d2 ( ) ) ) ",
+  "( close-dir ( 2:d2 ) ) ( close-dir ( 2:d1 ) ) ( close-dir ( 2:d0 ) ) ",
+  "( close-edit ( ) ) ",
+);
+/// Wire commands for an unauthorized subtree delete of `/pub` (holding denied `/pub/secret`).
+#[cfg(unix)]
+const SUBTREE_DENIED_COMMIT: &str = concat!(
+  "( commit ( 6:delpub ( ) false ( ( 7:svn:log 6:delpub ) ) ) ) ",
+  "( open-root ( ( 1 ) 2:d0 ) ) ",
+  "( delete-entry ( 3:pub ( 1 ) 2:d0 ) ) ",
+  "( close-dir ( 2:d0 ) ) ",
+  "( close-edit ( ) ) ",
+);
+/// Wire commands for an authorized control commit adding `/trunk/okdir` at base r1.
+#[cfg(unix)]
+const ALLOWED_CONTROL_COMMIT: &str = concat!(
+  "( commit ( 7:allowed ( ) false ( ( 7:svn:log 7:allowed ) ) ) ) ",
+  "( open-root ( ( 1 ) 2:d0 ) ) ",
+  "( open-dir ( 5:trunk 2:d0 2:d1 ( 1 ) ) ) ",
+  "( add-dir ( 11:trunk/okdir 2:d1 2:d2 ( ) ) ) ",
+  "( close-dir ( 2:d2 ) ) ( close-dir ( 2:d1 ) ) ( close-dir ( 2:d0 ) ) ",
+  "( close-edit ( ) ) ",
+);
+/// Wire commands to abort a refused edit and verify HEAD on the same tunnel session.
+#[cfg(unix)]
+const ABORT_AND_LATEST: &[u8] = b"( abort-edit ( ) ) ( get-latest-rev ( ) ) ";
+/// Expected `E170001` (`Authorization failed`) wire frame for an unauthorized commit.
+#[cfg(unix)]
+const AUTHZ_FAILED_FRAME: &str = "( failure ( ( 170001 20:Authorization failed 0: 0 ) ) ) ";
+/// Expected wire answer to `get-latest-rev` while HEAD remains at r1.
+#[cfg(unix)]
+const LATEST_R1: &str = "( success ( ( ) 0: ) ) ( success ( 1 ) ) ";
+
+/// Builds a lender seeded at r1 with `/pub/ok.txt`, `/pub/secret/vault.txt`, `/trunk/ok.txt`, and
+/// `/tags/locked.txt`.
+#[cfg(unix)]
+fn seeded_policy_lends() -> Lends {
+  use slates_svn::index::{Action, ChangedPath, NodeKind, RevisionRecord, Text};
+  let uuid = Uuid::parse(UUID.as_bytes()).expect("the recordings' UUID");
+  let mut records = Records::new(uuid, CREATED, RECORDS_ROOM).expect("revision 0's records");
+  let add = |path: &str, kind: NodeKind, bytes: Option<&[u8]>| ChangedPath {
+    path: path.to_owned(),
+    action: Action::Add,
+    kind,
+    copy_from: None,
+    text: bytes.map(|b| Text {
+      identity: *blake3::hash(b).as_bytes(),
+      md5: [0; 16],
+      sha1: [0; 20],
+      size: u64::try_from(b.len()).expect("test slice length fits u64"),
+    }),
+    properties: None,
+    mergeinfo_modified: false,
+  };
+  let (pub_ok, secret_vault, trunk_ok, tags_locked) = (
+    b"pub-ok\n".as_slice(),
+    b"SECRET-VAULT\n".as_slice(),
+    b"trunk-ok\n".as_slice(),
+    b"tags-locked\n".as_slice(),
+  );
+  let mut seed = RevisionToCommit {
+    head: 0,
+    record: RevisionRecord {
+      transaction: "0-1".to_owned(),
+      changes: vec![
+        add("/pub", NodeKind::Directory, None),
+        add("/pub/ok.txt", NodeKind::File, Some(pub_ok)),
+        add("/pub/secret", NodeKind::Directory, None),
+        add("/pub/secret/vault.txt", NodeKind::File, Some(secret_vault)),
+        add("/trunk", NodeKind::Directory, None),
+        add("/trunk/ok.txt", NodeKind::File, Some(trunk_ok)),
+        add("/tags", NodeKind::Directory, None),
+        add("/tags/locked.txt", NodeKind::File, Some(tags_locked)),
+      ],
+    },
+    properties: std::collections::BTreeMap::from([
+      (b"svn:author".to_vec(), b"alice".to_vec()),
+      (
+        b"svn:date".to_vec(),
+        b"2026-11-19T05:05:01.000000Z".to_vec(),
+      ),
+      (b"svn:log".to_vec(), b"seed".to_vec()),
+    ]),
+    contents: [pub_ok, secret_vault, trunk_ok, tags_locked]
+      .into_iter()
+      .map(|b| (*blake3::hash(b).as_bytes(), b.to_vec()))
+      .collect(),
+    stored: std::collections::BTreeMap::new(),
+    lock_entries: Vec::new(),
+  };
+  let taken = records.take_texts(&mut seed);
+  records.commit(seed).expect("seed revision 1");
+  Lends::from_records(records, taken)
+}
+
+/// Per-path policy rules for the `svn+ssh://` pre-commit authorization regression test: `STRANGER`
+/// may read `/` except `/pub/secret`, may submit `/trunk` and `/pub`, and is denied `/tags`.
+#[cfg(unix)]
+fn pre_commit_authz_rules() -> Vec<slates_db::catalog::PolicyRule> {
+  use slates_db::catalog::{
+    PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyRule, PolicyWho,
+  };
+  let only_stranger = PolicyWho::AnyOf {
+    entries: vec![PolicyEntry::Is {
+      principal: principal(STRANGER),
+    }],
+  };
+  let rule = |pattern: &str, right: PolicyRight, effect: PolicyEffect, who: PolicyWho| PolicyRule {
+    names: PolicyNames::Paths,
+    pattern: pattern.to_owned(),
+    right,
+    effect,
+    who,
+  };
+  vec![
+    rule(
+      "/",
+      PolicyRight::Read,
+      PolicyEffect::Allow,
+      PolicyWho::Anyone,
+    ),
+    rule(
+      "/pub/secret",
+      PolicyRight::Read,
+      PolicyEffect::Deny,
+      only_stranger.clone(),
+    ),
+    rule(
+      "/trunk",
+      PolicyRight::Submit,
+      PolicyEffect::Allow,
+      only_stranger.clone(),
+    ),
+    rule(
+      "/pub",
+      PolicyRight::Submit,
+      PolicyEffect::Allow,
+      only_stranger.clone(),
+    ),
+    rule(
+      "/tags",
+      PolicyRight::Submit,
+      PolicyEffect::Deny,
+      only_stranger,
+    ),
+  ]
+}
+
+/// Reads recorded `pre-commit` hook invocations from `path` (empty if never created).
+#[cfg(unix)]
+fn read_hook_marks(path: &std::path::Path) -> Vec<String> {
+  std::fs::read_to_string(path)
+    .unwrap_or_default()
+    .lines()
+    .map(str::to_owned)
+    .collect()
+}
+
+/// Feeds `input` to `command` and drives it asynchronously until it awaits further client input,
+/// returning all standard output written during this turn.
+#[cfg(unix)]
+async fn drive_turn_awaiting<C: Command>(command: &mut C, input: &[u8]) -> String {
+  command.input(input).expect("the tunnel holds its input");
+  let mut answered = Answered::default();
+  for _ in 0..MOST_STEPS {
+    let stepped = command
+      .step(ClientGone::never())
+      .await
+      .expect("a tunnel ends as svnserve ends, never failed");
+    take(command, &mut answered);
+    match stepped.next {
+      Next::Input => return String::from_utf8_lossy(&answered.out).into_owned(),
+      Next::More => {}
+      Next::Exited(status) => {
+        panic!(
+          "tunnel exited early with status {status}: out={:?}, err={:?}",
+          String::from_utf8_lossy(&answered.out),
+          String::from_utf8_lossy(&answered.err),
+        );
+      }
+      Next::Move(shard) => panic!("unexpected shard move to {shard}"),
+    }
+  }
+  panic!("tunnel never waited for input: {answered:?}");
+}
+
+/// Asserts that `wire_commit` fails with `E170001` (`Authorization failed`) without invoking
+/// `HookPoint::SvnPreCommit`, recovers cleanly after `abort-edit`, and leaves HEAD at r1.
+#[cfg(unix)]
+async fn assert_denied_ssh_commit_skips_pre_commit<C: Command>(
+  command: &mut C,
+  wire_commit: &[u8],
+  mark: &std::path::Path,
+  lends: Lends,
+  label: &str,
+) {
+  let refused = drive_turn_awaiting(command, wire_commit).await;
+  assert!(
+    refused.contains(AUTHZ_FAILED_FRAME),
+    "{label}: expected E170001 Authorization failed, got {refused:?}"
+  );
+  assert!(
+    read_hook_marks(mark).is_empty(),
+    "{label}: pre-commit hook must NOT run on unauthorized commit"
+  );
+  let recovered = drive_turn_awaiting(command, ABORT_AND_LATEST).await;
+  assert_eq!(
+    recovered, LATEST_R1,
+    "{label}: session must recover cleanly after abort-edit with HEAD at r1"
+  );
+  assert_eq!(
+    (lends.youngest(), lends.repo().commits.get()),
+    (1, 0),
+    "{label}: denied commit must not land"
+  );
+}
+
+/// Asserts that the allowed control commit executes `HookPoint::SvnPreCommit` exactly once and
+/// lands revision 2.
+#[cfg(unix)]
+async fn assert_allowed_ssh_commit_runs_pre_commit<C: Command>(
+  command: &mut C,
+  mark: &std::path::Path,
+  lends: Lends,
+) {
+  let committed = drive_turn_awaiting(command, ALLOWED_CONTROL_COMMIT.as_bytes()).await;
+  assert!(
+    committed.contains("( 2 ") && !committed.contains("failure"),
+    "allowed commit must land as r2: {committed:?}"
+  );
+  assert_eq!(
+    read_hook_marks(mark).len(),
+    1,
+    "pre-commit hook must run exactly once for the authorized control commit"
+  );
+  assert_eq!(
+    (lends.youngest(), lends.repo().commits.get()),
+    (2, 1),
+    "allowed control commit must advance HEAD to r2"
+  );
+}
+
+/// Round-6 Blocker 1 (`svn+ssh://` authz BEFORE `HookPoint::SvnPreCommit`): Do configure a
+/// `pre-commit` hook that records invocations, then over one `svn+ssh://` tunnel session as
+/// `STRANGER` attempt (1) direct denied write under `/tags/subnew`, (2) denied subtree delete of
+/// `/pub` (containing denied `/pub/secret/vault.txt`), and (3) allowed control write under
+/// `/trunk/okdir`. Expect: (1) and (2) fail with `E170001` (`Authorization failed`), execute ZERO
+/// `pre-commit` hooks, and recover cleanly after `abort-edit` with HEAD at r1; (3) runs
+/// `pre-commit` exactly once, commits r2, and exits cleanly with status 0.
+#[cfg(unix)]
+#[test]
+fn round6_blocker1_ssh_tunnel_authorizes_before_pre_commit_hook() {
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let mark = dir.path.join("pre.ran");
+  let pre_hook = hook_script(
+    &dir.path,
+    "pre-commit",
+    &format!(
+      "if [ \"$#\" -ge 2 ]; then echo \"$2\" >> \"{}\"; fi",
+      mark.display()
+    ),
+  );
+  let lends = seeded_policy_lends();
+  let held = Held {
+    owner: principal(OWNER),
+    rules: pre_commit_authz_rules(),
+    hooks: vec![hook_at(
+      slates_db::catalog::HookPointName::SvnPreCommit,
+      pre_hook,
+    )],
+  };
+  let services = SvnServices::new(NotYet, held.clone(), lends, BOUNDS);
+  let mut site = ToolSite::new(NoKeys, held, services);
+  let Dispatched::Run(mut command) = site.dispatch(&principal(STRANGER), &Asked::Subversion, None)
+  else {
+    panic!("the tunnel was refused");
+  };
+  let runtime = hook_runtime();
+  let (sent, got) = std::sync::mpsc::channel();
+  runtime
+    .spawn(async move {
+      let bound = HOOK_TIMEOUT_BUDGETS * crate::daemon::LIVENESS_BUDGET_NS;
+      let ran = slates_rt::futures::within(bound, async move {
+        let handshake = [answer(ROOT_URL), external("")].concat();
+        let opened = drive_turn_awaiting(&mut command, handshake.as_bytes()).await;
+        assert!(
+          !opened.contains("failure"),
+          "handshake must succeed: {opened:?}"
+        );
+        assert_denied_ssh_commit_skips_pre_commit(
+          &mut command,
+          DIRECT_DENIED_COMMIT.as_bytes(),
+          &mark,
+          lends,
+          "direct write",
+        )
+        .await;
+        assert_denied_ssh_commit_skips_pre_commit(
+          &mut command,
+          SUBTREE_DENIED_COMMIT.as_bytes(),
+          &mark,
+          lends,
+          "subtree delete",
+        )
+        .await;
+        assert_allowed_ssh_commit_runs_pre_commit(&mut command, &mark, lends).await;
+        command.input_end();
+        drive_awaiting(&mut command, &[]).await.0
+      })
+      .await;
+      let _ = sent.send(ran.ok().flatten());
+    })
+    .expect("the tunnel's task");
+  runtime.run_until_idle();
+  let ended = got
+    .recv()
+    .ok()
+    .flatten()
+    .expect("the tunnel ended within the test's bound");
+  assert_eq!(
+    ended.status,
+    Some(0),
+    "clean tunnel exit expected: {ended:?}"
+  );
+  assert!(ended.err.is_empty(), "no stderr on clean exit: {ended:?}");
 }
 
 /// Measurement, not a gate (main's order of 2026-11-20: svnsync over the matrix took 0.54 s a revision of

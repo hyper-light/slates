@@ -29,7 +29,8 @@
 //! **A commit.** The client's `commit` begins the drive (`Connection::commit`) with its transaction named B, a `-` and
 //! this connection's count of commits begun in base 36, B the youngest revision: §4.17.4 item 1 names it by the work's
 //! id. The hooks run where `svnserve -t` runs them (A-730, through `crate::vcs_svn::run_hook` with the tunnel's
-//! repository record): start-commit at `open-root` and pre-commit at `close-edit`, whose verdicts resume the drive;
+//! repository record): start-commit at `open-root` and pre-commit at `close-edit` (after per-path and subtree
+//! authorization via `crate::vcs_svn::admit_pending_changes`), whose verdicts resume the drive;
 //! post-commit once the revision stands, its failure `commit-info`'s `post-commit-err`; and around the lock verbs,
 //! pre-lock or pre-unlock for each path and post-lock or post-unlock once. A hook's run ends at its learned bound, by
 //! itself, or once the edge's signal says the client has gone (`super::site::ClientGone`), which ends the tunnel as
@@ -87,8 +88,8 @@ use crate::vcs_http::git::Repositories;
 use crate::vcs_policy::{self, SvnAccess};
 use crate::vcs_store::svn_view::{BroughtText, FetchedPiece};
 use crate::vcs_svn::{
-  HookSite, Hooked, Located, Location, MERGEINFO, NOT_AUTHORIZED, authorized_pre_lock_hooks,
-  post_lock_hook, revision_property_hook, run_hook,
+  HookSite, Hooked, Located, Location, MERGEINFO, NOT_AUTHORIZED, admit_pending_changes,
+  authorized_pre_lock_hooks, post_lock_hook, revision_property_hook, run_hook,
 };
 
 /// Format: the refusal count of a command the connection answered "Unknown editor command" because slates does not
@@ -481,6 +482,24 @@ impl Received {
       Turn::Accepted { work, consumed } => Received::Accepted { work, consumed },
     }
   }
+}
+
+/// Result of resolving a commit hook step before resuming `Connection::answer_hook`.
+enum DueAnswer {
+  /// Resume the commit drive with this hook verdict (`Ok(())` or `Err(chain)`).
+  Resume(Result<(), Vec<(u32, String)>>),
+  /// The step already ended the tunnel (missing store, out-of-turn state, or client gone).
+  Ended,
+}
+
+/// Result of authorizing pending commit changes against the live repository record and index.
+enum PendingAuthz {
+  /// Every changed path and affected subtree is permitted; carries the live repository policy.
+  Allowed(slates_db::catalog::RepositoryPolicy),
+  /// The repository record is missing, replaced, unreadable, or denies at least one path.
+  Denied,
+  /// The repository's Subversion store is not held on this shard.
+  StoreMissing,
 }
 
 impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
@@ -1028,68 +1047,151 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     }
   }
 
-  /// Answers the hook the drive waits for (the module doc's commit): passed where none is configured at its point,
-  /// refused in the not-served words where one is.
-  async fn answer_hook(&mut self, due: &Due, gone: ClientGone<'_>) {
-    let Some(record) = self.opened.as_ref() else {
-      return self.not_held();
+  /// Authorizes pending commit `changes` at `base` against the live repository record and index
+  /// before invoking `HookPoint::SvnPreCommit`.
+  fn authorize_pending(
+    &mut self,
+    id: RepositoryId,
+    name: &str,
+    base: slates_svn::index::Revision,
+    changes: &[slates_svn::index::ChangedPath],
+  ) -> PendingAuthz {
+    let Some(live) = self.repositories.find(name).filter(|repo| repo.id == id) else {
+      return PendingAuthz::Denied;
     };
-    let id = record.id;
+    let Self {
+      stores,
+      principal,
+      texts,
+      ..
+    } = self;
+    let admitted = stores.lend_for(id, principal, texts, |sources| {
+      admit_pending_changes(&live, principal, sources.index, base, changes)
+    });
+    match admitted {
+      None => PendingAuthz::StoreMissing,
+      Some(Ok(())) => PendingAuthz::Allowed(live.policy),
+      Some(Err(_)) => PendingAuthz::Denied,
+    }
+  }
+
+  /// Runs `HookPoint::SvnStartCommit` for the pending `open-root` transaction.
+  async fn start_commit_answer(&mut self, transaction: &str, gone: ClientGone<'_>) -> DueAnswer {
+    let Some(record) = self.opened.as_ref() else {
+      self.not_held();
+      return DueAnswer::Ended;
+    };
     let policy = record.policy.clone();
-    let hooked = Hooked::new(id, &record.name, self.stores.hook_views());
+    let hooked = Hooked::new(record.id, &record.name, self.stores.hook_views());
     let user = String::from_utf8_lossy(&self.user).into_owned();
     let mergeinfo = self
       .connection
       .session()
       .is_some_and(|session| session.capabilities.mergeinfo);
-    let tokens: Vec<LockToken> = self
-      .connection
-      .pending()
-      .map(|pending| pending.lock_tokens())
-      .unwrap_or_default()
+    let base = self.connection.pending().map_or(0, |pending| pending.base);
+    let capabilities: &[&str] = if mergeinfo { &[MERGEINFO] } else { &[] };
+    let words_cap = self.bounds.limits.item_bytes;
+    let ran = run_hook(
+      HookSite::Tunnel(&policy, gone),
+      &hooked,
+      words_cap,
+      HookPoint::SvnStartCommit,
+      |env, repos| {
+        vcs_hooks::svn_start_commit(
+          PendingView(base),
+          env,
+          repos,
+          &user,
+          capabilities,
+          transaction,
+        )
+      },
+    )
+    .await;
+    match ran.verdict {
+      Some(verdict) => DueAnswer::Resume(verdict),
+      None => {
+        self.texts.clear();
+        self.client_left();
+        DueAnswer::Ended
+      }
+    }
+  }
+
+  /// Authorizes pending commit changes (including copy-from sources and deleted/replaced
+  /// directory subtrees) against the live repository record and index BEFORE invoking
+  /// `HookPoint::SvnPreCommit`, refusing unauthorized commits with `E170001` without running
+  /// the hook.
+  async fn pre_commit_answer(&mut self, transaction: &str, gone: ClientGone<'_>) -> DueAnswer {
+    let Some(record) = self.opened.as_ref() else {
+      self.not_held();
+      return DueAnswer::Ended;
+    };
+    let id = record.id;
+    let name = record.name.clone();
+    let hooked = Hooked::new(id, &name, self.stores.hook_views());
+    let Some(pending) = self.connection.pending() else {
+      self.texts.clear();
+      self.end(serve::Refused::OutOfTurn);
+      return DueAnswer::Ended;
+    };
+    let base = pending.base;
+    let changes: Vec<slates_svn::index::ChangedPath> = pending.rows.values().cloned().collect();
+    let tokens: Vec<LockToken> = pending
+      .lock_tokens()
       .into_iter()
       .map(|(path, token)| LockToken { path, token })
       .collect();
-    let base = self.connection.pending().map_or(0, |pending| pending.base);
-    let site = HookSite::Tunnel(&policy, gone);
-    let words_cap = self.bounds.limits.item_bytes;
-    let ran = match due {
-      Due::StartCommit { transaction } => {
-        let capabilities: &[&str] = if mergeinfo { &[MERGEINFO] } else { &[] };
-        run_hook(
-          site,
-          &hooked,
-          words_cap,
-          HookPoint::SvnStartCommit,
-          |env, repos| {
-            vcs_hooks::svn_start_commit(
-              PendingView(base),
-              env,
-              repos,
-              &user,
-              capabilities,
-              transaction,
-            )
-          },
-        )
-        .await
+    let policy = match self.authorize_pending(id, &name, base, &changes) {
+      PendingAuthz::Allowed(policy) => policy,
+      PendingAuthz::Denied => {
+        self.texts.clear();
+        return DueAnswer::Resume(Err(vec![(
+          NOT_AUTHORIZED,
+          "Authorization failed".to_owned(),
+        )]));
       }
-      Due::PreCommit { transaction } => {
-        run_hook(
-          site,
-          &hooked,
-          words_cap,
-          HookPoint::SvnPreCommit,
-          |env, repos| {
-            vcs_hooks::svn_pre_commit(PendingView(base), env, repos, transaction, &tokens)
-          },
-        )
-        .await
+      PendingAuthz::StoreMissing => {
+        self.texts.clear();
+        self.not_held();
+        return DueAnswer::Ended;
       }
     };
-    // No verdict: the client left during the run (the module doc's hooks).
-    let Some(answer) = ran.verdict else {
-      return self.client_left();
+    let words_cap = self.bounds.limits.item_bytes;
+    let ran = run_hook(
+      HookSite::Tunnel(&policy, gone),
+      &hooked,
+      words_cap,
+      HookPoint::SvnPreCommit,
+      |env, repos| vcs_hooks::svn_pre_commit(PendingView(base), env, repos, transaction, &tokens),
+    )
+    .await;
+    match ran.verdict {
+      Some(verdict) => DueAnswer::Resume(verdict),
+      None => {
+        self.texts.clear();
+        self.client_left();
+        DueAnswer::Ended
+      }
+    }
+  }
+
+  /// Answers the hook the drive waits for (the module doc's commit): `start-commit` at
+  /// `open-root`, and `pre-commit` at `close-edit` AFTER per-path and subtree authorization
+  /// ([`Self::pre_commit_answer`]). Its verdict resumes the drive, and an accepted work lands
+  /// through [`Self::land`], which re-checks live authorization before committing.
+  async fn answer_hook(&mut self, due: &Due, gone: ClientGone<'_>) {
+    let due_answer = match due {
+      Due::StartCommit { transaction } => self.start_commit_answer(transaction, gone).await,
+      Due::PreCommit { transaction } => self.pre_commit_answer(transaction, gone).await,
+    };
+    let answer = match due_answer {
+      DueAnswer::Resume(verdict) => verdict,
+      DueAnswer::Ended => return,
+    };
+    let Some(id) = self.opened.as_ref().map(|record| record.id) else {
+      self.texts.clear();
+      return self.not_held();
     };
     let Self {
       connection,
@@ -1103,7 +1205,10 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       connection.answer_hook(answer, sources, out)
     });
     match answered {
-      None => self.not_held(),
+      None => {
+        self.texts.clear();
+        self.not_held();
+      }
       Some(Ok(Turn::Accepted { work, .. })) => Box::pin(self.land(*work, gone)).await,
       Some(Ok(_)) => {}
       Some(Err(refused)) => self.end(refused),

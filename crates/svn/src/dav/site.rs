@@ -1371,10 +1371,21 @@ const MULTISTATUS_OPEN: &str =
 /// One revision's `(name, value)` property pairs borrowed from the served repository.
 type RevisionProperties<'a> = Vec<(&'a [u8], &'a [u8])>;
 
+/// `500` for a green that lacks revision properties for a revision the index holds.
+fn corrupt_revision_properties() -> HttpAnswer {
+  error_answer(
+    HTTP_INTERNAL_SERVER_ERROR,
+    true,
+    SVN_ERR_FS_CORRUPT,
+    "The green lacks revision properties the index names",
+  )
+}
+
 /// Loads `revision`'s properties filtered by `svn_repos_check_revision_access` so HTTP WebDAV
 /// `PROPFIND` on `!svn/rev/N`, `!svn/bln/N`, and `!svn/vcc/default` matches `svn://` and
 /// `svn+ssh://`: `Full` exposes all revprops, `Partial` exposes `svn:author` and `svn:date` alone,
-/// and `Nothing` exposes none.
+/// and `Nothing` exposes none. Missing revprop storage on an existing readable revision propagates
+/// `500` (`SVN_ERR_FS_CORRUPT`) rather than silently answering empty properties.
 fn filtered_revision_properties<'a, R: Repository + ?Sized>(
   served: &'a Served<'_, R>,
   revision: Revision,
@@ -1392,11 +1403,12 @@ fn filtered_revision_properties<'a, R: Repository + ?Sized>(
   if access == crate::reads::RevisionAccess::Nothing {
     return Ok(Vec::new());
   }
+  let properties = served
+    .repository
+    .revision_properties(revision)
+    .ok_or_else(corrupt_revision_properties)?;
   Ok(
-    served
-      .repository
-      .revision_properties(revision)
-      .unwrap_or_default()
+    properties
       .into_iter()
       .filter(|(name, _)| access.shows(name))
       .collect(),
