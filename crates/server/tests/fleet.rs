@@ -36339,6 +36339,36 @@ fn anchored_git_fleet_of(name: &str, nodes: &[&str]) -> GitFleet {
   founded_git_fleet(name, (daemons, hosts), stores, (None, Some(anchored)))
 }
 
+/// A token named for `name`, enrolled at `daemon` for this uid through `client` (connected to it), once a quorum holds
+/// it: the bearer a [`GitFleet`]'s pushes carry.
+fn enrolled_token(name: &str, daemon: &Daemon, client: &mut slates_client::Client) -> String {
+  use slates_ipc::protocol::{CredentialMaterial, Principal};
+  let token = format!("{name}-token-{}", std::process::id());
+  let principal = Principal::Uid {
+    host: client.daemon_status().unwrap().anchor,
+    uid: this_account(),
+  };
+  let material = CredentialMaterial::HttpToken {
+    id: slates_server::credentials::token_id(token.as_bytes()),
+    cram_md5_contexts: slates_server::credentials::cram_md5_contexts(token.as_bytes()),
+  };
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let proof = slates_server::credentials::enroll_proof(&secret, &principal, &material, None);
+  // Enrolled once a quorum holds it (A-764): refused `CredentialUnreplicated` while the other members' credential planes
+  // are still coming up, so asked again within the placement deadline (a flake of the A-727 runs, 1 in 8).
+  let began = Instant::now();
+  loop {
+    match client.enroll_credential(principal.clone(), material.clone(), None, proof) {
+      Ok(_) => break,
+      Err(slates_client::ClientError::Refused(
+        slates_ipc::protocol::Refusal::CredentialUnreplicated { .. },
+      )) if began.elapsed() < PLACEMENT_DEADLINE => std::thread::yield_now(),
+      Err(error) => panic!("the credential enrolled: {error:?}"),
+    }
+  }
+  token
+}
+
 /// The [`GitFleet`] of `daemons`, formed: its repository `project` made on the first, held by another node as its
 /// creation answers (A-894), and a token enrolled for this uid.
 fn founded_git_fleet(
@@ -36347,7 +36377,7 @@ fn founded_git_fleet(
   stores: Vec<NodeStore>,
   (lease, anchored): (Option<PortLease>, Option<AnchoredFleet>),
 ) -> GitFleet {
-  use slates_ipc::protocol::{CredentialMaterial, ObjectFormat, Principal, VcsTool};
+  use slates_ipc::protocol::{ObjectFormat, VcsTool};
   let mut client = common::client::connect(daemons[0].instance());
   let repository = client
     .create_repository(&slates_client::RepositorySpec {
@@ -36380,29 +36410,7 @@ fn founded_git_fleet(
     "another node holds the repository's record as its creation answers ({holders} of 2), its answer held for it \
      ({awaited} held, {awaited_ns} ns)"
   );
-  let token = format!("{name}-token-{}", std::process::id());
-  let principal = Principal::Uid {
-    host: client.daemon_status().unwrap().anchor,
-    uid: this_account(),
-  };
-  let material = CredentialMaterial::HttpToken {
-    id: slates_server::credentials::token_id(token.as_bytes()),
-    cram_md5_contexts: slates_server::credentials::cram_md5_contexts(token.as_bytes()),
-  };
-  let secret = daemons[0].segment().issuer_secret().unwrap();
-  let proof = slates_server::credentials::enroll_proof(&secret, &principal, &material, None);
-  // Enrolled once a quorum holds it (A-764): refused `CredentialUnreplicated` while the other members' credential planes
-  // are still coming up, so asked again within the placement deadline (a flake of the A-727 runs, 1 in 8).
-  let began = Instant::now();
-  loop {
-    match client.enroll_credential(principal.clone(), material.clone(), None, proof) {
-      Ok(_) => break,
-      Err(slates_client::ClientError::Refused(
-        slates_ipc::protocol::Refusal::CredentialUnreplicated { .. },
-      )) if began.elapsed() < PLACEMENT_DEADLINE => std::thread::yield_now(),
-      Err(error) => panic!("the credential enrolled: {error:?}"),
-    }
-  }
+  let token = enrolled_token(name, &daemons[0], &mut client);
   GitFleet {
     daemons,
     hosts,
@@ -37466,6 +37474,242 @@ fn a915_a_creation_is_unacknowledged_while_its_roots_join_is_held_off_the_other_
     "the name names one repository, the retry's (a creation answers its root green's id, `AlreadyExists` the \
      repository's, one family): {first:?}, {again:?}"
   );
+}
+
+/// A-927 part 2 (main 01a20182's ruling of 2026-11-25; the a894 loop, 3 of 41 runs at any load). Do: on a three-node
+/// `f = 1` git fleet, make repository `project` on a with its root's join held off its successor-to-be alone
+/// ([`git_fleet_with_join_held_from_successor`]: the other survivor holds it as the creation answers); kill a at once;
+/// once the successor rebuilt the repository, push to the successor's edge. Expect the push to land: the successor adopts
+/// the root green from the join the other survivor holds. Red before part 2: the successor gave the root green up,
+/// "waiting on its refused" (A-915's `Unjoined`, counted `merge.takeover.adopted_unjoined`), and the push was refused
+/// (before part 1, "the default branch holds files no commit names"). Recorded, not asserted: the successor's unjoined
+/// answers and its ledger reads.
+#[test]
+fn a927_a_successor_the_roots_join_was_held_from_adopts_it_and_takes_a_push() {
+  let _serial = serialize_fleet_tests();
+  let (mut fleet, successor) = git_fleet_with_join_held_from_successor("join-held-from-successor");
+  fleet.daemons.remove(0).stop();
+  // The survivors are b and c, now at 0 and 1.
+  let at = successor - 1;
+  let survivors: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let repository = fleet.repository;
+  let rebuilt = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(
+      survivors[at]
+        .repository_takeover(repository)
+        .is_ok_and(|(_, [_, rebuilt, _])| rebuilt >= 1),
+    )
+  });
+  let view = survivors[at].repository_takeover(repository);
+  drop(survivors);
+  let unjoined = move_counter(&fleet.daemons[at], "merge.takeover.adopted_unjoined");
+  let reads = move_counter(&fleet.daemons[at], "fleet.ledger_read.asked");
+  let pushed = fleet.push(
+    at,
+    (
+      "after.txt",
+      b"pushed to the successor the join was held from\n",
+    ),
+  );
+  fleet.stop();
+  eprintln!(
+    "a join held from the successor: rebuilt {rebuilt} {view:?}, unjoined answers {unjoined:?}, ledger reads {reads:?}, \
+     the push {pushed:?}"
+  );
+  assert!(rebuilt, "the successor rebuilt the repository: {view:?}");
+  assert_eq!(
+    pushed,
+    Ok(()),
+    "the successor took a push: {view:?}, unjoined answers {unjoined:?}, ledger reads {reads:?}"
+  );
+}
+
+/// A-927 part 2, the read: a takeover adopts a state log's newest part alone, so a join below it reaches a successor
+/// that lacks it only by reading it from the log's cohort (A-919's read). Do: as
+/// [`a927_a_successor_the_roots_join_was_held_from_adopts_it_and_takes_a_push`], then make branch `topic` at a, its
+/// names-log part held off the successor too; once the other survivor holds both parts and the successor none, kill a;
+/// once the successor rebuilt the repository, push `main` to its edge. Expect the successor to read its names log's
+/// lacking positions (`fleet.ledger_read.join_wanted`) and the push to land. Red without the read: the root green given
+/// up (`Unjoined`), the push refused.
+#[test]
+fn a927_a_successor_reads_a_join_below_its_names_logs_newest_part_and_takes_a_push() {
+  let _serial = serialize_fleet_tests();
+  let (mut fleet, successor) = git_fleet_with_join_held_from_successor("join-below-newest");
+  let other = 3 - successor;
+  let branched = common::client::connect(fleet.daemons[0].instance())
+    .create_branch("project", ("topic", "main", None))
+    .map(|id| id.bytes);
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let repository = fleet.repository;
+  let mut held = (Vec::new(), Vec::new());
+  let shipped = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    held = (
+      fleet.daemons[other].names_log_positions(repository)?,
+      fleet.daemons[successor].names_log_positions(repository)?,
+    );
+    Ok(held.0.len() >= NAMES_PARTS_WITH_A_BRANCH)
+  });
+  drop(observed);
+  assert!(branched.is_ok(), "the branch made: {branched:?}");
+  assert!(
+    shipped && held.1.is_empty(),
+    "the other survivor holds the creation's and the branch's names-log parts, the successor none: {held:?}"
+  );
+  fleet.daemons.remove(0).stop();
+  let at = successor - 1;
+  let survivors: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let rebuilt = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(
+      survivors[at]
+        .repository_takeover(repository)
+        .is_ok_and(|(_, [_, rebuilt, _])| rebuilt >= 1),
+    )
+  });
+  let view = survivors[at].repository_takeover(repository);
+  drop(survivors);
+  let wanted = move_counter(&fleet.daemons[at], "fleet.ledger_read.join_wanted");
+  let unjoined = move_counter(&fleet.daemons[at], "merge.takeover.adopted_unjoined");
+  let counted = |daemon: &Daemon| -> Vec<(&str, u64)> {
+    JOIN_READ_COUNTERS
+      .iter()
+      .map(|name| (*name, move_counter(daemon, name).unwrap_or(0)))
+      .filter(|(_, count)| *count > 0)
+      .collect()
+  };
+  let (read_here, read_there) = (counted(&fleet.daemons[at]), counted(&fleet.daemons[1 - at]));
+  let positions = (
+    fleet.daemons[at].names_log_positions(repository),
+    fleet.daemons[1 - at].names_log_positions(repository),
+  );
+  let pushed = fleet.push(
+    at,
+    ("after.txt", b"pushed past a join read from the cohort\n"),
+  );
+  fleet.stop();
+  eprintln!(
+    "a join below the newest part: rebuilt {rebuilt} {view:?}, join reads {wanted:?}, unjoined answers {unjoined:?}, \
+     the push {pushed:?}; names-log positions held (successor, other) {positions:?}; the successor's counts \
+     {read_here:?}; the other survivor's {read_there:?}"
+  );
+  assert!(rebuilt, "the successor rebuilt the repository: {view:?}");
+  assert!(
+    wanted.as_ref().is_ok_and(|wanted| *wanted >= 1),
+    "the successor read its names log's lacking positions: {wanted:?}"
+  );
+  assert_eq!(
+    pushed,
+    Ok(()),
+    "the successor took a push: {view:?}, unjoined answers {unjoined:?}"
+  );
+}
+
+/// The counters [`a927_a_successor_reads_a_join_below_its_names_logs_newest_part_and_takes_a_push`] records of each
+/// survivor: its ledger reads, its adoptions' unjoined answers and its green takeovers' waits.
+const JOIN_READ_COUNTERS: [&str; 29] = [
+  "fleet.ledger_read.asked",
+  "fleet.ledger_read.answered",
+  "fleet.ledger_read.positions_held",
+  "fleet.ledger_read.past_tolerance",
+  "fleet.ledger_read.refused",
+  "fleet.ledger_read.untracked",
+  "fleet.ledger_read.discontinuous",
+  "fleet.ledger_read.join_wanted",
+  "merge.takeover.adopted_unjoined",
+  "merge.takeover.adopted_unjoined_reading",
+  "merge.replica.branch_source_behind",
+  "merge.replica.member_unknown",
+  "merge.takeover_started",
+  "merge.takeover_building",
+  "merge.takeover_refused",
+  "merge.takeover_incomplete",
+  "merge.takeover_waits_inputs",
+  "merge.takeover_given_up",
+  "merge.takeover.lineage_waits_for_members",
+  "merge.takeover.lineage_adopted",
+  "merge.takeover.replica_past_adoption",
+  "merge.takeover.adoption_mismatch",
+  "merge.replica.seeding",
+  "merge.replica.seeded",
+  "merge.replica.rebuilt",
+  "merge.replica.rebuilt_versions",
+  "merge.replica.records_short",
+  "merge.replica.advanced",
+  "merge.replica.superseded",
+];
+
+/// Shape: the names-log parts a repository made and then branched once holds (A-927 part 2's test): its creation's (its
+/// record and its root's join) and the branch's join.
+const NAMES_PARTS_WITH_A_BRANCH: usize = 2;
+
+/// A [`GitFleet`] named `name` whose repository's creation at a held its names-log part, its root's join, off the
+/// successor-to-be alone (A-927 part 2): a holds every part off every member (`Daemon::hold_state_log_shipping`) while
+/// the creation waits for its join's f + 1; reads the root green's id from its listing; ranks the survivors for its family
+/// as a takeover will ([`rendezvous_first`]); then holds the parts off that one alone
+/// (`Daemon::hold_state_log_shipping_from`), so the other survivor holds the join and the creation answers. With the
+/// successor-to-be's index among the nodes.
+fn git_fleet_with_join_held_from_successor(name: &str) -> (GitFleet, usize) {
+  use slates_ipc::protocol::{ObjectFormat, VcsTool};
+  let ((daemons, hosts), stores, lease) = started_git_fleet(name);
+  daemons[0].hold_state_log_shipping(true).unwrap();
+  let spec = slates_client::RepositorySpec {
+    name: "project".to_owned(),
+    tool: VcsTool::Git,
+    format: ObjectFormat::Sha1,
+    default_branch: "main".to_owned(),
+    green: None,
+  };
+  let instance = daemons[0].instance().to_owned();
+  let creating = std::thread::spawn(move || {
+    common::client::connect(&instance)
+      .create_repository(&spec)
+      .map(|id| id.bytes)
+      .map_err(|refused| format!("{refused:?}"))
+  });
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut root = None;
+  let held = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    let awaited = move_counter(&daemons[0], "fleet.creation.awaited")?;
+    root = common::client::connect(daemons[0].instance())
+      .list()
+      .unwrap_or_default()
+      .into_iter()
+      .map(|volume| volume.id.bytes)
+      .find(|id| ObjectId(*id).family_tag().is_some());
+    Ok(awaited >= 1 && root.is_some())
+  });
+  drop(observed);
+  assert!(
+    held,
+    "the creation waits for its root's join, its root listed: {root:?}"
+  );
+  let root = root.expect("the root green listed");
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(root)).expect("a survivor takes over");
+  daemons[0]
+    .hold_state_log_shipping_from(successor_host)
+    .unwrap();
+  let created = creating.join().expect("the creating thread");
+  assert_eq!(
+    created,
+    Ok(root),
+    "the creation answered its root once the other survivor held its join"
+  );
+  let successor = hosts
+    .iter()
+    .position(|host| *host == successor_host)
+    .expect("the successor is a node");
+  let mut client = common::client::connect(daemons[0].instance());
+  let token = enrolled_token(name, &daemons[0], &mut client);
+  let fleet = GitFleet {
+    daemons,
+    hosts,
+    repository: root,
+    token,
+    _stores: stores,
+    _lease: Some(lease),
+    anchored: None,
+  };
+  (fleet, successor)
 }
 
 /// Whether `a` and `b` are ids of one family (`ObjectId::family`): one creator and one family tag, as a repository and the

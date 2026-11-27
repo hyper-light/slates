@@ -287,8 +287,17 @@
 > create. Red first (`t_a927_...`). Part 1b swept that class: a push's changes, an import batch, the owner's branch
 > verbs and a submit's verdict each refused `NotRecovered` on a green this shard did not recover, by one check
 > (`ShardState::recovered`) where each takes the green; before, each read only whether the engine was lent, and a
-> holder's replica stays lent past its give-up. Red first (four `t_a927_` tests in `repository::push::tests`). OPEN
-> (A-927 part 2, w-shared): the `Unjoined` adoption reads the join from its cohort before giving the green up.
+> holder's replica stays lent past its give-up. Red first (four `t_a927_` tests in `repository::push::tests`).
+> **FIXED (A-927 part 2, w-shared, 2026-11-26; main 01a20182's ruling): a894's cause, 3 of 41 runs at any load.** A
+> takeover adopted the names log's newest part into the successor's acceptor without noting its lineage memberships,
+> so a successor the join never shipped to answered its root green `Unjoined` and gave it up. The adoption now notes
+> it; an `Unjoined` adoption re-notes the family's held names-log parts, then reads the positions it lacks below the
+> log's adopted position from its cohort (A-919's read), refusing only past the read's tolerance, with the log whole
+> or with no names log, counted by why. And a lineage's hand-over waited without end on a member never pending (its
+> branch rebuilt a second root after the first had gone, 2 of 5 runs of the read test): it now waits for the family's
+> members pending here, each in the lineage at its adopted version, bounded by their own attempts. Red first (two
+> `a927_` fleet tests, the join held off the successor-to-be alone; three `merge_origin` units). OWED (main): the a894
+> loop's after (bar 0 of 40).
 > **FIXED (A-913, w-shared, 2026-11-24; A-912's sibling): a branch created while a member died refused `unable to
 > commit` at its record barrier (3 of 25 runs).** The restarted holder held its source's records but no replica, and
 > the record path branched only from a replica already there; now it makes a missing source first, as a branch's
@@ -2151,7 +2160,9 @@
 > segments its store lacks from the region verbatim at the owner's sequences
 > (`a_holders_run_lands_the_owners_segments_byte_for_byte_by_identity`). CLOSED the same day: one barrier a home
 > shard on this node (r42's push 89 to 123 s), a crash's holds resolved by the attempt record v13 names, and homes ranked
-> by partition, never by a runtime shard id (A-929). OPEN next: a remote home's barrier, one exchange a home a push. OPEN: (ii)'s rest: the holder's recompute
+> by partition, never by a runtime shard id (A-929). CLOSED the same day: a remote home's barrier, one exchange a home a
+> push (home wire 0x87; `homes::barrier_published`), with the Mercurial fleet-takeover flow `#[ignore]`d with its command
+> (`crates/cli/tests/hg_takeover.rs`), main's to run. OPEN: (ii)'s rest: the holder's recompute
 > accepted with the owner's identity, with svn's holder red and an
 > `#[ignore]`d fleet-takeover CLI test for Mercurial, which no test drives yet; then an import's run (v9) and a single
 > changeset (v7) homed the same way.
@@ -5330,6 +5341,13 @@
 >   included. Run 7 (45612515778) had passed 24 of 30 on Windows: `evo-repository` pasted the binary's Windows path into
 >   its shell's command, which took its backslashes, and the five rows after it failed on the missing repository;
 >   0e73ff11d passes the path through the environment.
+> - **All three matrices on all three runners, green (2026-11-26):** run 10 (45944507454,
+>   `diag-measurer-main-interop-linux-10` at 80eccadbd, main 8eac5188a, release slates), every leg exit 0: git 27 of 27
+>   on ubuntu-latest, ubuntu-24.04-arm and windows-latest; hg 30 of 30 on all three; svn 33 of 33 on both Linux runners
+>   over svn:// and HTTP. Run 9 (45644433352) had passed Windows git 23 of 27: `GIT_SSH_COMMAND` pasted the key's and
+>   known hosts' paths bare, and the shell took the Windows path's backslashes; 9099f5055 quotes them, and every matrix
+>   prints `unmeasured` where ps lists no resident sizes (Windows' every row had read 0 MiB). svn on Windows waits on
+>   Ada's go.
 > - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
 >   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
