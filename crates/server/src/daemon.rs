@@ -1959,22 +1959,6 @@ impl Daemon {
     })
   }
 
-  /// Test support (A-921's owner-restart scenes): the owner this node's acceptor of `object` names, on any shard holding
-  /// one; `None` where it holds none.
-  pub fn holder_owner(&self, object: [u8; 16]) -> Result<Option<slates_db::HostId>, ObserveError> {
-    let object = slates_db::register::ObjectId(object);
-    for shard in self.shards.clone() {
-      if let Some(owner) = self.observe(Some(shard), move |s| {
-        s.holder_records
-          .get(&object)
-          .map(slates_db::register::Acceptor::owner)
-      })? {
-        return Ok(Some(owner));
-      }
-    }
-    Ok(None)
-  }
-
   /// Test support (A-927 part 2): no shard of this node ships the state logs' parts it owes to `peer`, and every other
   /// candidate is shipped them, so a repository's creation here answers once another member holds its names-log part (its
   /// root's join) while `peer`, its successor-to-be, holds none. `Ok` once set on every shard.
@@ -2495,6 +2479,30 @@ impl Daemon {
         .map(slates_cluster::member_plane::MemberPlane::counts)
         .unwrap_or_default()
     })
+  }
+
+  /// Test support (A-921 part 5): how this node's membership plane holds `peer`: whether it is joined to the detector,
+  /// whether it is keyed by an installed epoch (and joined, as `PlaneState::keyed` says), and the process nonce of the
+  /// peer that epoch was agreed with (`PlaneState::keyed_process`). A one-shot control-shard question.
+  pub fn member_keying(
+    &self,
+    peer: slates_db::HostId,
+  ) -> Result<(bool, Option<bool>, Option<u64>), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      (
+        s.plane
+          .plane
+          .as_ref()
+          .is_some_and(|plane| plane.is_joined(peer)),
+        s.plane.keyed.get(&peer).copied(),
+        s.plane.keyed_process.get(&peer).copied(),
+      )
+    })
+  }
+
+  /// Test support (A-921's next mode): this node's member process nonce, which a peer learns it by on each announcement.
+  pub fn member_process_nonce(&self) -> Result<u64, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| s.member_process_nonce)
   }
 
   /// The membership plane's detector's belief about `host` (A-67 H-2): `Suspect` where its probes went unanswered,
@@ -3871,6 +3879,32 @@ impl Daemon {
       self.shard_of_object(slates_db::register::ObjectId(volume.bytes)),
       move |s| crate::live_ship::inject_superseded(s, id, epoch, learned),
     )
+  }
+
+  /// Test support (A-921 part 5): this node's record serve side holds the answer to each announcement of a peer's member
+  /// loop of the kinds named, its plane epoch (`epochs`) or its edges (`edges`), after its request arrived, as a peer
+  /// that took a restarted node's session and died before answering does; every other stream and the probe plane answer
+  /// as usual, and neither kind lifts every hold. On every shard, as [`Self::inject_live_state_withhold`]; `Ok` once
+  /// installed, else the typed refusal.
+  pub fn inject_member_exchange_withhold(
+    &self,
+    epochs: bool,
+    edges: bool,
+  ) -> Result<(), ObserveError> {
+    let withheld: std::collections::BTreeSet<u64> = [
+      (epochs, crate::member_task::PLANE_EPOCH_STREAM),
+      (edges, crate::edges::EDGES_STREAM),
+    ]
+    .into_iter()
+    .filter_map(|(held, stream)| held.then_some(stream))
+    .collect();
+    for shard in self.shards.iter().copied() {
+      let withheld = withheld.clone();
+      self.observe(Some(shard), move |s| {
+        s.member_exchange_withheld = withheld;
+      })?;
+    }
+    Ok(())
   }
 
   /// Test support: while `withhold` is set, this node's record serve side holds each live-state reply (a takeover's
@@ -5784,6 +5818,7 @@ async fn init_shard(
     discovery_withhold_replies: false,
     shards_withhold_replies: false,
     live_state_withhold_replies: false,
+    member_exchange_withheld: std::collections::BTreeSet::new(),
     peer_paths: std::collections::BTreeMap::new(),
     probe_windows: crate::fleet::ProbeWindows::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),

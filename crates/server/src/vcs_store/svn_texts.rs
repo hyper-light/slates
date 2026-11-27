@@ -641,12 +641,14 @@ fn files_at(index: &Index, path: &str, revision: u64, out: &mut Vec<FileText>) {
 
 /// A walk of the files a path holds in a revision, a node a unit (A-920 9a: a copied or deleted tree's 9,000 files
 /// walked in one unit of a staging step, 21-31 ms, debug): [`files_at`]'s, and a single file's, resumable between units.
+/// A directory's children are read a child a unit through the index's cursor ([`Index::listing_after`]), never listed
+/// whole in one (A-920: a directory of 9,000 files listed, sorted and its paths made in one unit, 1.8 ms debug).
 #[derive(Debug)]
 pub(crate) struct FilesWalk {
   /// The revision it reads.
   revision: u64,
-  /// The paths left to visit, the next last.
-  stack: Vec<String>,
+  /// What is left to visit, the next last: paths, and directories being listed from their last child.
+  stack: Vec<Visit>,
   /// Whether a directory's children are walked: a tree's walk, not a single file's.
   tree: bool,
 }
@@ -656,7 +658,7 @@ impl FilesWalk {
   pub(crate) fn tree(path: &str, revision: u64) -> FilesWalk {
     FilesWalk {
       revision,
-      stack: vec![path.to_owned()],
+      stack: vec![Visit::Path(path.to_owned())],
       tree: true,
     }
   }
@@ -665,26 +667,31 @@ impl FilesWalk {
   pub(crate) fn file(path: &str, revision: u64) -> FilesWalk {
     FilesWalk {
       revision,
-      stack: vec![path.to_owned()],
+      stack: vec![Visit::Path(path.to_owned())],
       tree: false,
     }
   }
 
-  /// One node of the walk: a file's text appended to `out` (none for an empty file or a path the index cannot read),
-  /// or a directory's children put next, in byte order. Whether the walk has ended.
+  /// One unit of the walk: a path visited (a file's text appended to `out`, none for an empty file or a path the
+  /// index cannot read; a directory's listing put next), or a directory's next child read and put next, the directory
+  /// after it, so its children are visited in byte order, each one's tree before the next. Whether the walk has ended.
   pub(crate) fn step(&mut self, index: &Index, out: &mut Vec<FileText>) -> bool {
-    if let Some(at) = self.stack.pop()
-      && let Ok(Some(node)) = index.node(&at, self.revision)
-    {
-      match node.kind() {
-        NodeKind::File => {
-          if let Some(text) = node.text() {
-            out.push((text.identity, green_path(&at).to_owned()));
+    match self.stack.pop() {
+      Some(Visit::Path(at)) => {
+        if let Ok(Some(node)) = index.node(&at, self.revision) {
+          match node.kind() {
+            NodeKind::File => {
+              if let Some(text) = node.text() {
+                out.push((text.identity, green_path(&at).to_owned()));
+              }
+            }
+            NodeKind::Directory if self.tree => self.stack.push(Visit::Listing(at, None)),
+            NodeKind::Directory => {}
           }
         }
-        NodeKind::Directory if self.tree => self.stack_children(index, &at),
-        NodeKind::Directory => {}
       }
+      Some(Visit::Listing(dir, after)) => self.next_child(index, dir, after),
+      None => {}
     }
     self.stack.is_empty()
   }
@@ -694,20 +701,33 @@ impl FilesWalk {
     while !self.step(index, out) {}
   }
 
-  /// The children of the directory at `at` put next on the walk, the first in byte order last.
-  fn stack_children(&mut self, index: &Index, at: &str) {
-    let Ok(Some(mut names)) = index.children(at, self.revision) else {
+  /// The child of the directory `dir` after `after` (its first without one) put next on the walk, the directory's
+  /// listing after it beneath: nothing once none is left.
+  fn next_child(&mut self, index: &Index, dir: String, after: Option<String>) {
+    let Ok(Some((listed, _))) = index.listing_after(&dir, self.revision, after.as_deref(), 1)
+    else {
       return;
     };
-    names.sort_unstable_by(|left, right| right.cmp(left));
-    for name in names {
-      self.stack.push(if at == "/" {
-        format!("/{name}")
-      } else {
-        format!("{at}/{name}")
-      });
-    }
+    let Some((name, _)) = listed.into_iter().next() else {
+      return;
+    };
+    let path = if dir == "/" {
+      format!("/{name}")
+    } else {
+      format!("{dir}/{name}")
+    };
+    self.stack.push(Visit::Listing(dir, Some(name)));
+    self.stack.push(Visit::Path(path));
   }
+}
+
+/// What a [`FilesWalk`] has left to visit.
+#[derive(Debug)]
+enum Visit {
+  /// A path.
+  Path(String),
+  /// A directory's children, from the one after this name (its first without one).
+  Listing(String, Option<String>),
 }
 
 /// A Subversion path's place in the green: without its leading `/`.

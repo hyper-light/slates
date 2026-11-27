@@ -1264,6 +1264,8 @@ struct WideCounts {
   sealed_most: u64,
   /// What the shard's releases handed the daemon's reaper and dropped in place (`reaper::counts`, the reaper).
   reaped: crate::reaper::ReapCounts,
+  /// The greens' pending holds free decisions applied whole (`name_holds::NAME_HOLD_APPLIED_FREEING`).
+  freeing_applied: u64,
 }
 
 /// The calling shard's [`WideCounts`] now.
@@ -1288,15 +1290,27 @@ fn wide_counts() -> WideCounts {
     published_ahead: on(|state| count(state, staging::LANDING_PUBLISHED_AHEAD)),
     sealed_most: on(|state| count(state, crate::repository::push::SEALED_BYTES_MOST)),
     reaped: crate::reaper::counts(),
+    freeing_applied: on(|state| {
+      count(
+        state,
+        crate::vcs_store::name_holds::NAME_HOLD_APPLIED_FREEING,
+      )
+    }),
   }
 }
 
-/// Holds a wide landing's [`WideCounts`] to its slicing: each part ran in steps, never whole in one.
+/// Holds a wide landing's [`WideCounts`] to its slicing: each part ran in steps, never whole in one; and no free
+/// decision applied the greens' pending holds whole (A-920: a staging's release of what it brought applied the
+/// revision's 9,000 in one step, 4.72 ms debug; red at 9,000 or more before they were applied a slice a step first).
 fn wide_counts_sliced(counts: &WideCounts) {
   wide_landing_sliced(counts);
   wide_landing_stepped(counts);
   wide_import_sliced(counts);
   wide_release_reaped(counts);
+  assert_eq!(
+    counts.freeing_applied, 0,
+    "the greens' pending holds a free decision applied whole"
+  );
 }
 
 /// The landing's release of its scratch member frees nothing on the shard (A-920, the reaper): what its units took, more
@@ -1664,7 +1678,8 @@ fn texts_by_path(
 /// moving it (a copy, then the trunk's delete); walk revision 3's rows a node a step, as a recording whose every step is
 /// spent walks them (`staging::walked_a_unit_a_step`), and whole (`svn_texts::released_before` at revision 2,
 /// `held_after` at 3). Expect: the same texts let go and held, by path: the trunk's every file let go, the moved
-/// tree's every file held.
+/// tree's every file held; and each directory's children read a child a unit, two units a file at least (A-920: a
+/// directory listed whole was 1.8 ms of one unit at 9,000 files, debug).
 #[test]
 fn a_moves_recording_walked_a_node_a_step_finds_the_texts_the_whole_walk_finds() {
   let moved = format!(
@@ -1676,7 +1691,7 @@ fn a_moves_recording_walked_a_node_a_step_finds_the_texts_the_whole_walk_finds()
     WIDE_TEXT_BYTES,
     &[copied_dir("branch", ("trunk", 1)), moved],
   );
-  let (stepped, whole) = stored(move || async move {
+  let ((stepped, units), whole) = stored(move || async move {
     let (svn, _green) = subversion("walked-move").await;
     let (loaded, _turns) = imported(svn, dump).await;
     assert_eq!(loaded.map(|loaded| loaded.youngest), Ok(3));
@@ -1702,6 +1717,10 @@ fn a_moves_recording_walked_a_node_a_step_finds_the_texts_the_whole_walk_finds()
     (WALKED_TRUNK_FILES, WALKED_TRUNK_FILES),
     "the trunk's files let go and the moved tree's held"
   );
+  // A directory's children read a child a unit, each visited in a unit of its own: two units a file at least. Listed
+  // whole, a directory's files took one unit each and the directory one.
+  let files = u64::try_from(whole.0.len() + whole.1.len()).unwrap();
+  assert!(units >= 2 * files, "{units} units for {files} files");
 }
 
 /// The green's head and identity after importing `dump` into a fresh repository named `name`, every build step spent

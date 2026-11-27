@@ -306,10 +306,14 @@ fn port_blocks(nodes: usize) -> Vec<HeldBlock> {
   blocks
 }
 
-fn inheritable(socket: &std::net::UdpSocket) -> std::os::fd::OwnedFd {
-  let duplicate: std::os::fd::OwnedFd = socket.try_clone().unwrap().into();
-  rustix::io::fcntl_setfd(&duplicate, rustix::io::FdFlags::empty()).unwrap();
-  duplicate
+#[path = "support/hand_on.rs"]
+mod hand_on;
+use hand_on::HandOn as _;
+
+/// A close-on-exec duplicate of `socket` for the one slates process a spawn hands it to (`.handing_on`,
+/// `support/hand_on.rs`): the test's own socket keeps the port, and the duplicate is closed here once the child has it.
+fn held_duplicate(socket: &std::net::UdpSocket) -> std::os::fd::OwnedFd {
+  socket.try_clone().unwrap().into()
 }
 
 /// How a node's daemon runs: bare (the process is the daemon, so a SIGSTOP of it is a partition), or under its anchor
@@ -331,7 +335,7 @@ fn start_node(
   let [probe, record] = held.sockets.as_slice() else {
     panic!("a node's block is its probe and record ports");
   };
-  let (probe, record) = (inheritable(probe), inheritable(record));
+  let (probe, record) = (held_duplicate(probe), held_duplicate(record));
   let verb = match supervision {
     Supervision::Bare => "daemon",
     Supervision::Anchored => "anchor",
@@ -355,6 +359,7 @@ fn start_node(
     )
     .stdout(Stdio::null())
     .stderr(Stdio::inherit())
+    .handing_on(&[probe.as_raw_fd(), record.as_raw_fd()])
     .spawn()
     .unwrap();
   FleetProcess { child }

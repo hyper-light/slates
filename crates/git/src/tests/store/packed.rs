@@ -1089,6 +1089,183 @@ fn r165_an_encodings_object_read_past_its_header_reads_stops_at_a_window_let_go_
   assert!(kept_again == kept, "the same clone of the same fragments");
 }
 
+/// Shape: the files of each version's tree in B8's red, enough that its root tree crosses a `PIECE2_WINDOW` window.
+const WALKED_FILES: usize = 12;
+
+/// B8 of the landed let-go's lift (main's order of 2026-11-26, the read sweep's B8: the encoding's tree walk). A
+/// version's encoding walks its root tree beside its previous version's to name each changed file's base, and both
+/// trees lie in landed packs whose windows may be let go. Do: land green 1's two versions of [`WALKED_FILES`] files,
+/// each its own pack of whole entries, in a store of 256-byte windows; let every window of both packs go; encode
+/// version 1 a unit a turn, bringing back the window each turn stopped at (`Encoding::waiting`); then encode it with
+/// nothing let go; clone each. Expect: the let-go encoding stopped in its walk and walked the one pair of trees the
+/// resident one walked, and the two clones are byte for byte the same. Red before: the walk's tree read refused the
+/// encoding `Unreadable`.
+#[test]
+fn b8_an_encodings_tree_walk_stops_at_a_let_go_tree_and_keeps_the_same_fragments() {
+  let (walk_stops, walked, kept) = walked_encoding(false);
+  let (walk_stops_again, walked_again, kept_again) = walked_encoding(true);
+  assert_eq!((walk_stops, walked, walked_again), (0, 1, 1));
+  assert!(walk_stops_again > 0, "the walk met a let-go tree");
+  assert!(kept_again == kept, "the same clone of the same fragments");
+}
+
+/// Version 1's encoding in [`b8_an_encodings_tree_walk_stops_at_a_let_go_tree_and_keeps_the_same_fragments`], every
+/// window of both packs let go first where `let_go`: the stops its walk made, the pairs of trees it walked, and the
+/// clone after it, every window brought back.
+fn walked_encoding(let_go: bool) -> (u64, u64, Vec<u8>) {
+  use crate::store::{Encoding, Progress, Turn};
+  let (mut repository, mut store, packs) = landed_versions_in(PIECE2_WINDOW);
+  if let_go {
+    packs
+      .iter()
+      .for_each(|pack| let_go_every_window(&mut store, pack));
+  }
+  let mut encoding = Encoding::fragments(&repository, &store, 1, 1).unwrap();
+  let mut clock = super::Ticks(0);
+  let mut walk_stops = 0;
+  for _ in 0..100_000 {
+    let turn = Turn {
+      clock: &mut clock,
+      exchange: super::EXCHANGE,
+      quantum_ns: 1,
+    };
+    let progress = encoding
+      .advance(&mut repository, &mut store, turn)
+      .unwrap_or_else(|refused| panic!("the encoding after {walk_stops} walk stops: {refused:?}"));
+    if progress == Progress::Done {
+      break;
+    }
+    if let Some(waited) = encoding.waiting() {
+      walk_stops += u64::from(encoding.stage_index() == 0);
+      bring_back_from_either(&mut store, &packs, &waited);
+    }
+  }
+  let walked = encoding.counters().trees_walked;
+  packs
+    .iter()
+    .for_each(|pack| bring_back_every_window(&mut store, pack));
+  let clone = super::Answer::objects(&super::reached_now(&repository, &store, 1));
+  let (cloned, _) = super::streamed(&repository, &store, clone, u64::MAX);
+  (walk_stops, walked, cloned)
+}
+
+/// Green 1 at two versions of [`WALKED_FILES`] files in one tree, the second changing every other file, each version
+/// landed as a push's pack of whole entries in a store of `window`-byte windows: the repository, the store, the packs.
+fn landed_versions_in(window: usize) -> (Repository, ContentStore, [Vec<u8>; 2]) {
+  let mut store = ContentStore::new(1 << 26, window).unwrap();
+  let mut repository = Repository::new(ObjectFormat::Sha1);
+  let mut parent = None;
+  let packs = [0, 1].map(|version| {
+    let (objects, head) = walked_version(version, parent);
+    let pack = whole_entries_pack(&objects);
+    land_whole_pack(&mut repository, &mut store, (&pack, head));
+    parent = Some(head);
+    pack
+  });
+  (repository, store, packs)
+}
+
+/// Version `version`'s commit over its files, its parent `parent`: the objects it pushes (the commit, the tree, and
+/// the files it changed, every file in version 0) and the commit's id.
+fn walked_version(version: u64, parent: Option<ObjectId>) -> (Vec<super::Made>, ObjectId) {
+  use crate::objects::tree::Mode;
+  let format = ObjectFormat::Sha1;
+  let changed = |at: usize| version == 0 || at.is_multiple_of(2);
+  let files: Vec<super::Made> = (0..WALKED_FILES)
+    .map(|at| {
+      let made_in = if changed(at) { version } else { 0 };
+      super::blob(format, format!("file {at}, version {made_in}\n").as_bytes())
+    })
+    .collect();
+  let names: Vec<String> = (0..WALKED_FILES).map(|at| format!("f{at:03}")).collect();
+  let entries: Vec<(Mode, &[u8], ObjectId)> = names
+    .iter()
+    .zip(&files)
+    .map(|(name, file)| (Mode::File, name.as_bytes(), file.id))
+    .collect();
+  let root = super::tree(format, &entries);
+  let parents: Vec<ObjectId> = parent.into_iter().collect();
+  let head = super::commit(format, root.id, &parents, version + 1);
+  let id = head.id;
+  let mut objects = vec![head, root];
+  objects.extend(
+    files
+      .into_iter()
+      .enumerate()
+      .filter(|(at, _)| changed(*at))
+      .map(|(_, file)| file),
+  );
+  (objects, id)
+}
+
+/// `objects` as a pack of whole entries, each deflated.
+fn whole_entries_pack(objects: &[super::Made]) -> Vec<u8> {
+  use std::io::Write as _;
+
+  use crate::entry::{self, Header, Representation};
+  let mut pack = Vec::new();
+  let count = u32::try_from(objects.len()).unwrap();
+  let mut writer = crate::pack::Writer::new(ObjectFormat::Sha1, count, &mut pack);
+  let mut at = entry::PACK_HEADER_LEN;
+  for object in objects {
+    let header = Header {
+      representation: Representation::Whole(object.kind),
+      size: crate::to_u64(object.content.len()),
+    };
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&object.content).unwrap();
+    let zlib = encoder.finish().unwrap();
+    entry::write(header, at, &mut writer).unwrap();
+    crate::out::Out::put(&mut writer, &zlib);
+    at += entry::written_len(header, at).unwrap() + crate::to_u64(zlib.len());
+  }
+  writer.finish().unwrap();
+  pack
+}
+
+/// `pack` landed as a push's, held where it lies, moving green 1 to `head`, as [`landed_create_in`] lands its push.
+fn land_whole_pack(
+  repository: &mut Repository,
+  store: &mut ContentStore,
+  (pack, head): (&[u8], ObjectId),
+) {
+  let whole = read_whole(pack, &Held(BTreeMap::new()));
+  let naming = GitNaming {
+    format: ObjectFormat::Sha1,
+  };
+  let mut push = Push::new(ObjectFormat::Sha1);
+  push.extend_pack(store, pack).unwrap();
+  for object in &whole.objects {
+    push
+      .admit_placed::<_, Infallible>(store, &naming, (incoming(object), object.offset))
+      .unwrap();
+  }
+  repository.seal(store, &mut push).unwrap();
+  repository.stage(store, &mut push).unwrap();
+  let moved = repository.admit(store, &push, 1, Some(head)).unwrap();
+  repository.commit(store, &mut push, &[moved]).unwrap();
+  super::derive_all(repository, store);
+  push.abandon(store).unwrap();
+}
+
+/// Brings back the window a turn stopped at (`waited`) from whichever of `packs` holds it.
+fn bring_back_from_either(store: &mut ContentStore, packs: &[Vec<u8>], waited: &Waited) {
+  let (window, start, len) = store
+    .away_window(&waited.pack, waited.len, waited.offset)
+    .expect("the window met is let go");
+  let from = usize::try_from(start).unwrap();
+  let to = from + usize::try_from(len).unwrap();
+  let bytes = packs
+    .iter()
+    .find_map(|pack| {
+      pack
+        .get(from..to)
+        .filter(|bytes| ContentId::of(bytes) == window)
+    })
+    .expect("one of the packs holds the window");
+  store.bring_back(&window, bytes).unwrap();
+}
+
 /// Lets go every `PIECE2_WINDOW` window of `pack` the store still holds, each marked landed first.
 fn let_go_every_window(store: &mut ContentStore, pack: &[u8]) {
   for window in pack.chunks(PIECE2_WINDOW).map(ContentId::of) {
