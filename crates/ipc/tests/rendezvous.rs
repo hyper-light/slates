@@ -1485,3 +1485,50 @@ fn a_socket_file_a_dead_owner_left_is_replaced_and_a_live_ones_is_not() {
     "a claim connects through the replaced node"
   );
 }
+
+/// A held rendezvous reaches no child but its daemon (the TSan lane, 2026-11-27: in diagnostics run 45991805330 a
+/// listening socket, flags 04002 and no close-on-exec, was held by both children of the spawner's parity test, the
+/// signature of a held rendezvous). Do: hold an instance's rendezvous as an anchor does; spawn an unrelated child, a
+/// shell that lists every descriptor it holds by target. Expect: the child holds no descriptor of the held socket, named
+/// by its inode (`socket:[N]`). Linux, where the held rendezvous is a listening socket; elsewhere it is a bootstrap
+/// object no child inherits.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_child_spawned_beside_a_held_rendezvous_holds_none_of_it() {
+  let instance = format!("rv-inherit-{}", std::process::id());
+  let held = HeldRendezvous::hold(&instance).unwrap();
+  let number = held.adoption().env_value().to_owned();
+  let socket = std::fs::read_link(format!("/proc/self/fd/{number}"))
+    .unwrap()
+    .display()
+    .to_string();
+  let flags = std::fs::read_to_string(format!("/proc/self/fdinfo/{number}")).unwrap_or_default();
+  let inode = socket
+    .trim_start_matches("socket:[")
+    .trim_end_matches(']')
+    .to_owned();
+  let address = std::fs::read_to_string("/proc/net/unix")
+    .unwrap_or_default()
+    .lines()
+    .find(|line| line.split_whitespace().nth(6) == Some(inode.as_str()))
+    .unwrap_or_default()
+    .to_owned();
+  eprintln!(
+    "HELD-RENDEZVOUS descriptor {number} {socket}, {}; /proc/net/unix: {address}",
+    flags
+      .lines()
+      .find(|line| line.starts_with("flags"))
+      .unwrap_or_default()
+  );
+  let listed = Command::new("sh")
+    .args(["-c", "for f in /proc/$$/fd/*; do readlink \"$f\"; done"])
+    .output()
+    .unwrap();
+  let listed = String::from_utf8_lossy(&listed.stdout);
+  assert!(
+    !listed.lines().any(|line| line == socket),
+    "the child holds the held rendezvous {socket}:\n{listed}"
+  );
+  drop(held);
+}

@@ -1,0 +1,48 @@
+name: diag measurer
+# w-interop (2026-11-27, main 01a20182's brief inbox/w-interop-from-main-tsan-lane.md, item 3 of its follow-up): is the
+# inheritable socket the spawner's parity children held (diagnostics run 45991805330: socket:[22118], flags 04002, no
+# close-on-exec) a held rendezvous? This branch adds one test, crates/ipc/tests/rendezvous.rs
+# `a_child_spawned_beside_a_held_rendezvous_holds_none_of_it`: it holds an instance's rendezvous as an anchor does,
+# prints the held socket's target, its fdinfo flags and its /proc/net/unix line (its address), then spawns an unrelated
+# shell and expects the shell to hold none of it. Red is expected at this commit (the held socket is inheritable by
+# design, A-114). Runs only from `diag-measurer-*` branches.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  held-rendezvous-inherited:
+    name: a held rendezvous and an unrelated child (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: The test, natively (red expected)
+        run: |
+          set +e
+          cargo test -p slates-ipc --test rendezvous a_child_spawned_beside_a_held_rendezvous_holds_none_of_it \
+            -- --nocapture > "$RUNNER_TEMP/held.out" 2>&1
+          rc=$?
+          grep -E 'HELD-RENDEZVOUS|panicked|holds the held rendezvous|^test result|^error' "$RUNNER_TEMP/held.out" | cut -c1-300
+          grep -A 12 'holds the held rendezvous' "$RUNNER_TEMP/held.out" | cut -c1-200
+          line="HELD-RENDEZVOUS-TEST exit $rc: $(grep -E '^test result' "$RUNNER_TEMP/held.out" | tail -1)"
+          echo "$line"
+          echo "::notice title=held rendezvous::$line"
+      - name: Keep the output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: held-rendezvous
+          path: ${{ runner.temp }}/held.out
+          if-no-files-found: warn
