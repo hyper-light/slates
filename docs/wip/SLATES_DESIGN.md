@@ -65652,3 +65652,49 @@ Applied in the same change to:
     no bound, the push accepted), the wire's `a_settle_reads_back_whole_and_a_hostile_one_is_refused_by_kind`, and git's
     A-727 (d1a) tests, which now wait for one settle an attempt.
 - **Owed.** The release measure of the first read's wait on the 452-head history (main's probe).
+
+### A-930 — A page changed only past its committed piece's last coordinate appends to it, and its split copies the piece's entries (2026-11-26, w-perf for main 01a20182, its ruling of 2026-11-25 on the 57k churn: the Aways append rule; goal 93, A-870, A-923)
+
+- **Why.** In main's 57k churn (release, 0b9a3f9e8, 2026-11-25) a push encoded 74,340,245 bytes of image pages, and
+  43,141,224 of them (58%) were the Aways family, a few thousand short entries. Since A-923 a let-go takes the store's
+  next number, its coordinate, so every let-go falls in the family's tail page; and every publication re-encoded that
+  page whole. So the family's encoded bytes are the publications times the tail page's bytes, not the bytes let go.
+  - **At test scale, from the counters:** `a_push_of_let_goes_encodes_its_aways_appended_not_the_tail_again_each_publication`
+    publishes 600 let-goes one at a time on a 4,096-byte page. Before this change the family encoded 2,588,710 bytes
+    (`vcs_store.image.encoded_bytes.aways`) for 46,275 bytes of entries appended: 600 publications, each re-encoding a
+    tail of 4,314.5 bytes on the mean (1.05 pages).
+  - **At 57k:** the same product, 43,141,224 bytes, at the run's page (the copy slice; 18,324 bytes on the MacBook's
+    checkpoint test) and a tail of about 1.05 pages, is about 2,240 publications. OWED: the run's own publication
+    count and page from main's in-place rerun, which states both.
+- **The rule.** The encoder keeps each committed page's last coordinate (`Encoder::committed_last`, set wherever it
+  encodes a page; a recovered image's pages have none until re-encoded once), and for each dirty page the least
+  coordinate a change since lies at (`dirty_from`, a cut's `from`; a page dirtied whole by a split is zero).
+  - **Append:** a page whose least change is past its committed piece's last coordinate changed only past it. Its
+    entries past that coordinate are read at the cut, and the piece is copied with its count raised and only those
+    entries encoded (`append_page`), while the page stays within twice the page size.
+  - **Split:** past twice the page size it splits. The page is read whole (its committed bytes and what was just read,
+    so bounded), planned as before (`plan`), and each planned page's committed entries are copied from the committed
+    piece and only the rest encoded (`CommittedPiece::piece_of`). The copy is taken only where the read's first entries
+    are the piece's, key for key (`CommittedPiece::leads`); otherwise the page is re-encoded whole.
+  - **Every other page** (a change at or before its last coordinate, a new page, a recovered one, a read that stopped
+    at its cap) is re-encoded whole, as before.
+  - The bytes are the whole encoding's either way: what a restore reads and a checkpoint copies is unchanged, and no
+    format moves. Only the appended entries count as encoded (`ENCODED`, `encoded_by_family`); a turn's `spent` counts
+    the copy too.
+- **Reds:**
+  - `a_push_of_let_goes_encodes_its_aways_appended_not_the_tail_again_each_publication`: 2,588,710 bytes encoded
+    before. Appending alone took it to 87,110: the family's pages went from 7 to 22, and each split re-encoded its page.
+    With the split's copy, 46,300 bytes for 46,275 appended (the 25 more are the five new pages' heads), against main's
+    bound of the appended bytes plus a page. The same test holds the oracle: the image holds the shard's entries, and
+    every page piece is the bytes a whole encoding of its entries makes.
+  - `an_appended_page_piece_is_the_whole_encoding_of_its_entries`: appended at every split of 40 generated entries, the
+    piece byte for byte `encode_page`'s of all of them, only the appended entries counted encoded; a foreign version
+    and empty bytes refused.
+  - `a_pushs_let_goes_re_encode_the_aways_pages_they_fill_not_every_page_of_the_aways_held` (A-923's): 20 let-goes over
+    1,500 held aways re-encoded 8,639 bytes of the family before (under its bound of 9,732), 1,555 now.
+- **Owed, the rule's other half:** the windows family's removal (21,192,055 bytes, 28.5% of the 57k push's image) as a
+  cut of the committed piece. A let-go removes a window's entry anywhere in its page, so it is not an append; its own
+  piece follows.
+- **Applied in the same change to:** `crates/server/src/image_pages.rs` (the encoder's lasts and least changes,
+  `append_page`, `entry_ends`, `CommittedPiece`, `Encoder::appends`, `append`, `split_appended`, `dirty_whole`); the
+  goal 93 line in GAPS (A-923's entry).

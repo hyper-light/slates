@@ -278,31 +278,141 @@ pub(crate) fn encoded_bytes() -> u64 {
   ENCODED.with(core::cell::Cell::get)
 }
 
+/// Format: a page piece's head: its version byte and its entries' count.
+const PAGE_HEAD: usize = 1 + size_of::<u32>();
+
+/// Adds `len` bytes to this shard's thread's encoded bytes ([`ENCODED`]).
+fn count_encoded(len: usize) {
+  ENCODED.with(|encoded| {
+    encoded.set(
+      encoded
+        .get()
+        .saturating_add(u64::try_from(len).unwrap_or(u64::MAX)),
+    );
+  });
+}
+
+/// Each of `entries` as a page piece carries it, onto `out`: its key, length and bytes.
+fn put_entries(out: &mut Vec<u8>, entries: &[Entry]) {
+  for (_, key, bytes) in entries {
+    out.extend_from_slice(key);
+    out.extend_from_slice(&u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
+    out.extend_from_slice(bytes);
+  }
+}
+
+/// The page piece of `committed`'s entries then `appended`'s (goal 93, the Aways append rule): `committed` copied, its
+/// count raised, and only `appended` encoded, so the bytes are [`encode_page`]'s of the two together. The bytes encoded
+/// are `appended`'s alone. None where `committed` is no page piece's head.
+fn append_page(committed: &[u8], appended: &[Entry]) -> Option<Vec<u8>> {
+  let (&version, rest) = committed.split_first()?;
+  if version != PAGE_VERSION {
+    return None;
+  }
+  let count = u32::from_le_bytes(rest.get(..size_of::<u32>())?.try_into().ok()?);
+  let count = count.checked_add(u32::try_from(appended.len()).ok()?)?;
+  let mut out = Vec::with_capacity(committed.len().saturating_add(bytes_of(appended)));
+  out.push(PAGE_VERSION);
+  out.extend_from_slice(&count.to_le_bytes());
+  out.extend_from_slice(committed.get(PAGE_HEAD..)?);
+  put_entries(&mut out, appended);
+  count_encoded(bytes_of(appended));
+  Some(out)
+}
+
+/// Where each entry of a page piece's `bytes` ends, in order; none for bytes no page wrote.
+fn entry_ends(bytes: &[u8]) -> Option<Vec<usize>> {
+  let (&version, rest) = bytes.split_first()?;
+  if version != PAGE_VERSION {
+    return None;
+  }
+  let count = usize::try_from(u32::from_le_bytes(
+    rest.get(..size_of::<u32>())?.try_into().ok()?,
+  ))
+  .ok()?;
+  if count > bytes.len().checked_div(ENTRY_HEAD)? {
+    return None;
+  }
+  let mut ends = Vec::with_capacity(count);
+  let mut at = PAGE_HEAD;
+  for _ in 0..count {
+    let len_at = at.checked_add(slates_vfs::recover::HELD_PIECE_KEY_BYTES)?;
+    let len = bytes.get(len_at..len_at.checked_add(size_of::<u32>())?)?;
+    let len = usize::try_from(u32::from_le_bytes(len.try_into().ok()?)).ok()?;
+    at = len_at.checked_add(size_of::<u32>())?.checked_add(len)?;
+    ends.push(at);
+  }
+  (at == bytes.len()).then_some(ends)
+}
+
+/// A committed page piece and where its entries end ([`entry_ends`]): what a split of a page changed only past its last
+/// coordinate copies its unchanged entries from.
+struct CommittedPiece<'a> {
+  /// The piece's bytes.
+  bytes: &'a [u8],
+  /// Where each of its entries ends.
+  ends: Vec<usize>,
+}
+
+impl CommittedPiece<'_> {
+  /// Where its entry `at` begins.
+  fn start(&self, at: usize) -> usize {
+    match at.checked_sub(1) {
+      Some(before) => self.ends.get(before).copied().unwrap_or(self.bytes.len()),
+      None => PAGE_HEAD,
+    }
+  }
+
+  /// Whether `held`'s first entries are its entries, key for key, and the rest past them: what lets a page's split take
+  /// them from it.
+  fn leads(&self, held: &[Entry]) -> bool {
+    let key = slates_vfs::recover::HELD_PIECE_KEY_BYTES;
+    held.len() >= self.ends.len()
+      && held
+        .iter()
+        .enumerate()
+        .take(self.ends.len())
+        .all(|(at, (_, held_key, _))| {
+          let start = self.start(at);
+          self.bytes.get(start..start.saturating_add(key)) == Some(held_key.as_slice())
+        })
+  }
+
+  /// The page piece of `held[range]`, `held` led by its entries ([`CommittedPiece::leads`]): those of them in the range
+  /// copied from its bytes, the rest encoded. The bytes, and the bytes encoded (the head and the rest).
+  fn piece_of(&self, held: &[Entry], range: core::ops::Range<usize>) -> Option<(Vec<u8>, usize)> {
+    let copied_to = range.end.min(self.ends.len()).max(range.start);
+    let rest = held.get(copied_to..range.end)?;
+    let copied = self
+      .bytes
+      .get(self.start(range.start)..self.start(copied_to))?;
+    let count = u32::try_from(range.len()).ok()?;
+    let mut out = Vec::with_capacity(
+      PAGE_HEAD
+        .saturating_add(copied.len())
+        .saturating_add(bytes_of(rest)),
+    );
+    out.push(PAGE_VERSION);
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(copied);
+    put_entries(&mut out, rest);
+    let encoded = PAGE_HEAD.saturating_add(bytes_of(rest));
+    count_encoded(encoded);
+    Some((out, encoded))
+  }
+}
+
 /// A page piece's bytes: its version, its entries' count, then each entry's key, length and bytes.
 pub(crate) fn encode_page(entries: &[Entry]) -> Vec<u8> {
-  let mut out = Vec::with_capacity(
-    1usize
-      .saturating_add(size_of::<u32>())
-      .saturating_add(bytes_of(entries)),
-  );
+  let mut out = Vec::with_capacity(PAGE_HEAD.saturating_add(bytes_of(entries)));
   out.push(PAGE_VERSION);
   out.extend_from_slice(
     &u32::try_from(entries.len())
       .unwrap_or(u32::MAX)
       .to_le_bytes(),
   );
-  for (_, key, bytes) in entries {
-    out.extend_from_slice(key);
-    out.extend_from_slice(&u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
-    out.extend_from_slice(bytes);
-  }
-  ENCODED.with(|encoded| {
-    encoded.set(
-      encoded
-        .get()
-        .saturating_add(u64::try_from(out.len()).unwrap_or(u64::MAX)),
-    );
-  });
+  put_entries(&mut out, entries);
+  count_encoded(out.len());
   out
 }
 
@@ -443,6 +553,15 @@ pub(crate) struct Directories {
 pub(crate) struct Encoder {
   /// Each page's bytes in the last committed cut.
   committed: BTreeMap<(Family, Page), Vec<u8>>,
+  /// The last coordinate of each committed page's entries, where this encoder encoded it (a recovered image's pages
+  /// have none until re-encoded once): past it, a change appends (goal 93, the Aways append rule).
+  committed_last: BTreeMap<(Family, Page), u64>,
+  /// The last coordinate of each page re-encoded since the last committed cut, as [`Encoder::committed_last`] is of the
+  /// committed ones.
+  pending_last: BTreeMap<(Family, Page), u64>,
+  /// Of the pages dirty, the least coordinate a change since lies at: a page whose least is past its committed piece's
+  /// last coordinate changed only past it, so it appends. Zero for a page dirtied whole (its split's halves).
+  dirty_from: BTreeMap<(Family, Page), u64>,
   /// The directories as the pages re-encoded since leave them.
   working: Directories,
   /// The pages re-encoded since the last committed cut: each one's bytes, none for a page now of no entry (its piece
@@ -478,6 +597,8 @@ pub(crate) struct Encoder {
 struct Cut {
   /// Its pages not yet re-encoded, each frozen in its store until it is.
   remaining: BTreeSet<(Family, Page)>,
+  /// Of its pages, the least coordinate a change lay at since the committed cut ([`Encoder::dirty_from`] at its begin).
+  from: BTreeMap<(Family, Page), u64>,
   /// Its generation in homes' tickets.
   generation: u64,
   /// Test support (F2's oracle): its pages at its moment, which bound its pre-images.
@@ -549,12 +670,19 @@ impl Encoder {
   /// Notes the coordinates of `family`'s entries changed since: the pages they lie in are dirty.
   pub(crate) fn mark(&mut self, family: Family, coordinates: impl IntoIterator<Item = u64>) {
     // Read in place: a copy of the directory would be a family's size of work a drain.
-    let pages = match self.working.families.get(&family) {
-      Some(directory) => directory.plan_dirty(coordinates),
-      None => Directory::default().plan_dirty(coordinates),
-    };
+    let empty = Directory::default();
+    let directory = self.working.families.get(&family).unwrap_or(&empty);
+    let mut pages: BTreeMap<Page, u64> = BTreeMap::new();
+    for coordinate in coordinates {
+      let least = pages
+        .entry(directory.page_of(coordinate))
+        .or_insert(coordinate);
+      *least = (*least).min(coordinate);
+    }
     let paused = self.paused();
-    for page in pages {
+    for (page, from) in pages {
+      let least = self.dirty_from.entry((family, page)).or_insert(from);
+      *least = (*least).min(from);
       if self.dirty.insert((family, page)) && paused {
         self.dirtied_paused.insert((family, page));
       }
@@ -584,6 +712,7 @@ impl Encoder {
     let pages: Vec<(Family, Page)> = remaining.iter().copied().collect();
     self.cut = Some(Cut {
       remaining,
+      from: core::mem::take(&mut self.dirty_from),
       generation,
       #[cfg(test)]
       frozen: pages.clone(),
@@ -626,10 +755,10 @@ impl Encoder {
     let mut held = core::mem::take(&mut self.scratch);
     let mut capped_most = held.capacity();
     let mut allocated = 0usize;
-    let mut read = |held: &mut Vec<Entry>, (family, page): (Family, Page), cap: usize| {
+    let mut read = |held: &mut Vec<Entry>, family: Family, range: (u64, u64), cap: usize| {
       held.clear();
       let capacity = held.capacity();
-      let stopped = entries(family, (page.start, page.last()), cap, held);
+      let stopped = entries(family, range, cap, held);
       allocated = allocated.saturating_add(read_allocated(held, capacity, held.capacity()));
       stopped
     };
@@ -637,7 +766,37 @@ impl Encoder {
       let Some((family, page)) = self.cut.as_mut().and_then(|cut| cut.remaining.pop_first()) else {
         break;
       };
-      let stopped = read(&mut held, (family, page), cap);
+      // Changed only past its committed piece's last coordinate: the entries past it read, and appended to the piece
+      // where the page still holds them within twice the page size; else re-encoded whole, as any other.
+      if let Some((last, committed_bytes)) = self.appends((family, page)) {
+        let stopped = read(
+          &mut held,
+          family,
+          (last.saturating_add(1), page.last()),
+          cap,
+        );
+        let within =
+          committed_bytes.saturating_add(bytes_of(&held)) <= page_bytes.saturating_mul(2);
+        let appended = match (stopped, within) {
+          (Some(_), _) => None,
+          (None, true) => self.append((family, page), (last, &held), encoded),
+          // Past twice the page size it splits: read whole (its committed bytes and what was just read, so bounded),
+          // planned, and each page's unchanged entries copied from the committed piece.
+          (None, false) => {
+            read(&mut held, family, (page.start, page.last()), usize::MAX);
+            self.split_appended((family, page), &held, page_bytes, encoded)
+          }
+        };
+        if let Some((len, appended)) = appended {
+          spent = spent.saturating_add(len);
+          tally(&mut by_family, family, appended);
+          if self.dirtied_paused.remove(&(family, page)) {
+            imposed = imposed.saturating_add(appended);
+          }
+          continue;
+        }
+      }
+      let stopped = read(&mut held, family, (page.start, page.last()), cap);
       capped_most = capped_most.max(held.capacity());
       if let Some(stop) = stopped.filter(|_| page.halves().is_some()) {
         let (read, kept, encoded_len) =
@@ -655,7 +814,7 @@ impl Encoder {
       }
       // A page of one coordinate is read whole: its entries share their first eight bytes, so it cannot split.
       if stopped.is_some() {
-        read(&mut held, (family, page), usize::MAX);
+        read(&mut held, family, (page.start, page.last()), usize::MAX);
       }
       let len = self.reencode((family, page), &held, page_bytes, encoded);
       spent = spent.saturating_add(len);
@@ -679,6 +838,111 @@ impl Encoder {
       allocated: u64::try_from(allocated).unwrap_or(u64::MAX),
       encoded_by_family: by_family,
     }
+  }
+
+  /// Whether `page` of `family` changed only past its committed piece's last coordinate since the committed cut (goal
+  /// 93, the Aways append rule): that coordinate and the committed entries' bytes, where it did and its piece is one
+  /// this encoder encoded; none where a change lies at or before it, or the page is new or recovered.
+  fn appends(&self, key: (Family, Page)) -> Option<(u64, usize)> {
+    let from = *self.cut.as_ref()?.from.get(&key)?;
+    let last = *self.committed_last.get(&key)?;
+    let committed = self.committed.get(&key)?;
+    (from > last && last < key.1.last()).then(|| (last, committed.len().saturating_sub(PAGE_HEAD)))
+  }
+
+  /// Appends `held`, the entries of `page` of `family` past its committed piece's last coordinate `last`, to that piece
+  /// ([`append_page`]): the page re-encoded, noted in `encoded`. The bytes it spent (the piece copied and the entries
+  /// encoded) and the bytes it encoded; none where the committed piece is none.
+  fn append(
+    &mut self,
+    key: (Family, Page),
+    (last, held): (u64, &[Entry]),
+    encoded: &mut Vec<(Family, Page)>,
+  ) -> Option<(usize, usize)> {
+    let bytes = append_page(self.committed.get(&key)?, held)?;
+    let len = bytes.len();
+    self.pending.insert(key, Some(bytes));
+    self.pending_last.insert(
+      key,
+      held.last().map_or(last, |(coordinate, _, _)| *coordinate),
+    );
+    encoded.push(key);
+    Some((len, bytes_of(held)))
+  }
+
+  /// Notes `held`'s entries encoded as the piece of `page` of `family` since the last committed cut: its last
+  /// coordinate, or none for a page of no entry.
+  fn note_last(&mut self, key: (Family, Page), held: Option<&[Entry]>) {
+    match held.and_then(|held| held.last()) {
+      Some((coordinate, _, _)) => {
+        self.pending_last.insert(key, *coordinate);
+      }
+      None => {
+        self.pending_last.remove(&key);
+      }
+    }
+  }
+
+  /// Splits `page` of `family`, changed only past its committed piece's last coordinate and now past twice `page_bytes`,
+  /// from `held`, its entries read whole: planned as [`Encoder::reencode`] plans it, each planned page's entries of the
+  /// committed piece copied from it and only the rest encoded ([`CommittedPiece::piece_of`]), so a push that fills the
+  /// tail page splits it without encoding its committed entries again. The bytes it spent and those it encoded; none
+  /// where `held` is not led by the committed piece's entries, which the caller then re-encodes whole.
+  fn split_appended(
+    &mut self,
+    key: (Family, Page),
+    held: &[Entry],
+    page_bytes: usize,
+    encoded: &mut Vec<(Family, Page)>,
+  ) -> Option<(usize, usize)> {
+    let (family, page) = key;
+    let bytes = self.committed.get(&key)?;
+    let committed = CommittedPiece {
+      bytes,
+      ends: entry_ends(bytes)?,
+    };
+    if !committed.leads(held) {
+      return None;
+    }
+    let planned = plan(held, page, page_bytes);
+    let mut pieces = Vec::with_capacity(planned.len());
+    for (into, range) in &planned {
+      let piece = match range.is_empty() {
+        true => None,
+        false => Some(committed.piece_of(held, range.clone())?),
+      };
+      pieces.push((
+        *into,
+        piece,
+        held.get(range.clone()).filter(|held| !held.is_empty()),
+      ));
+    }
+    encoded.push(key);
+    self.pending.insert(key, None);
+    self.pending_last.remove(&key);
+    let (mut spent, mut encoded_len) = (0usize, 0usize);
+    for (into, piece, entries) in pieces {
+      let bytes = piece.map(|(bytes, encoded)| {
+        spent = spent.saturating_add(bytes.len());
+        encoded_len = encoded_len.saturating_add(encoded);
+        bytes
+      });
+      self.pending.insert((family, into), bytes);
+      self.note_last((family, into), entries);
+    }
+    let pages: Vec<Page> = planned.iter().map(|(into, _)| *into).collect();
+    self
+      .working
+      .families
+      .entry(family)
+      .or_default()
+      .replace(page, pages.iter().copied());
+    // A change since the cut marked the page for the next cut; split, its pages are marked whole in its place.
+    if pages != [page] && self.dirty.remove(&key) {
+      self.dirty_from.remove(&key);
+      self.dirty_whole(family, &pages);
+    }
+    Some((spent, encoded_len))
   }
 
   /// A turn's split of `page` of `family`, whose read (`held`) stopped at `stop` past its cap ([`Encoder::split_at_stop`]):
@@ -709,18 +973,18 @@ impl Encoder {
     let planned = if bytes_of(held) > page_bytes.saturating_mul(2) {
       // Its own piece removed, its halves put.
       self.pending.insert((family, page), None);
+      self.pending_last.remove(&(family, page));
       plan(held, page, page_bytes)
     } else {
       vec![(page, 0..held.len())]
     };
     let mut spent = 0usize;
     for (into, range) in &planned {
-      let bytes = held
-        .get(range.clone())
-        .filter(|held| !held.is_empty())
-        .map(encode_page);
+      let entries = held.get(range.clone()).filter(|held| !held.is_empty());
+      let bytes = entries.map(encode_page);
       spent = spent.saturating_add(bytes.as_ref().map_or(0, Vec::len));
       self.pending.insert((family, *into), bytes);
+      self.note_last((family, *into), entries);
     }
     let split: Vec<Page> = planned
       .iter()
@@ -733,11 +997,20 @@ impl Encoder {
       .entry(family)
       .or_default()
       .replace(page, planned.into_iter().map(|(page, _)| page));
-    // A change since the cut marked the page for the next cut; split, its halves are marked in its place.
+    // A change since the cut marked the page for the next cut; split, its halves are marked whole in its place.
     if !split.is_empty() && self.dirty.remove(&(family, page)) {
-      self.dirty.extend(split.iter().map(|into| (family, *into)));
+      self.dirty_from.remove(&(family, page));
+      self.dirty_whole(family, &split);
     }
     spent
+  }
+
+  /// Marks `pages` of `family` dirty whole: each re-encoded whole in the next cut, never appended.
+  fn dirty_whole(&mut self, family: Family, pages: &[Page]) {
+    for page in pages {
+      self.dirty.insert((family, *page));
+      self.dirty_from.insert((family, *page), 0);
+    }
   }
 
   /// The capacity, in entries, of the buffer the encoder keeps for its reads ([`Encoder::scratch`]).
@@ -779,6 +1052,7 @@ impl Encoder {
     }
     // Its own piece removed, the pages it now is put as they are encoded.
     self.pending.insert((family, page), None);
+    self.pending_last.remove(&(family, page));
     let mut kept = 0usize;
     let mut encoded_len = 0usize;
     let mut back = 0u64;
@@ -789,6 +1063,7 @@ impl Encoder {
         let bytes = entries.map(encode_page);
         encoded_len = encoded_len.saturating_add(bytes.as_ref().map_or(0, Vec::len));
         self.pending.insert((family, *into), bytes);
+        self.note_last((family, *into), entries);
         encoded.push((family, *into));
       } else if let Some(cut) = self.cut.as_mut() {
         cut.remaining.insert((family, *into));
@@ -802,9 +1077,11 @@ impl Encoder {
       .entry(family)
       .or_default()
       .replace(page, pages.iter().copied());
-    // A change since the cut marked the page for the next cut, or first dirtied it in a pause: its pages take its place.
+    // A change since the cut marked the page for the next cut, or first dirtied it in a pause: its pages take its place,
+    // whole.
     if self.dirty.remove(&(family, page)) {
-      self.dirty.extend(pages.iter().map(|into| (family, *into)));
+      self.dirty_from.remove(&(family, page));
+      self.dirty_whole(family, &pages);
     }
     // Each page put back is one more to encode, at most two turns' (the owed bound's rate, `Encoder::skipped`).
     if let Some((_, bound)) = self.owed.as_mut() {
@@ -862,6 +1139,7 @@ impl Encoder {
       return None;
     }
     let generation = self.cut.take().map(|cut| cut.generation);
+    let mut lasts = core::mem::take(&mut self.pending_last);
     for (page, bytes) in core::mem::take(&mut self.pending) {
       match bytes {
         Some(bytes) => {
@@ -869,6 +1147,14 @@ impl Encoder {
         }
         None => {
           self.committed.remove(&page);
+        }
+      }
+      match lasts.remove(&page) {
+        Some(last) => {
+          self.committed_last.insert(page, last);
+        }
+        None => {
+          self.committed_last.remove(&page);
         }
       }
     }
@@ -1064,6 +1350,32 @@ mod tests {
     let mut versioned = bytes;
     versioned[0] = PAGE_VERSION.wrapping_add(1);
     assert!(decode_page(&versioned).is_none());
+  }
+
+  /// Goal 93, the Aways append rule's encoding. Do: append generated entries to a page piece of generated entries, and
+  /// to bytes no page wrote. Expect the appended piece byte for byte the whole encoding of both, only the appended
+  /// entries' bytes counted encoded ([`encoded_bytes`]), and the foreign bytes refused.
+  #[test]
+  fn an_appended_page_piece_is_the_whole_encoding_of_its_entries() {
+    let entries: Vec<Entry> = (0..40)
+      .map(|at| entry(at, usize::try_from(at % 9).unwrap()))
+      .collect();
+    for split in [0, 1, 17, 40] {
+      let (committed, appended) = entries.split_at(split);
+      let piece = encode_page(committed);
+      let before = encoded_bytes();
+      let bytes = append_page(&piece, appended).unwrap();
+      assert_eq!(
+        encoded_bytes() - before,
+        u64::try_from(bytes_of(appended)).unwrap(),
+        "only the appended entries encoded"
+      );
+      assert_eq!(bytes, encode_page(&entries), "split at {split}");
+    }
+    let mut foreign = encode_page(&entries);
+    foreign[0] = PAGE_VERSION.wrapping_add(1);
+    assert!(append_page(&foreign, &entries).is_none());
+    assert!(append_page(&[], &entries).is_none());
   }
 
   /// Shape: how many objects the paged-image tests let go and note: enough that one piece an entry is thousands.
@@ -1272,6 +1584,114 @@ mod tests {
     assert!(
       deltas[1] > deltas[0],
       "the mass delta split pages: {deltas:?}"
+    );
+  }
+
+  /// The page pieces of `family` in `image`.
+  fn family_pages(image: &[slates_vfs::recover::HeldPiece], family: Family) -> usize {
+    image
+      .iter()
+      .filter(|piece| crate::content_holder::page_family(&piece.key) == Some(family))
+      .count()
+  }
+
+  /// The bytes of `family`'s page pieces in `image`: what its entries take in the image.
+  fn family_bytes(image: &[slates_vfs::recover::HeldPiece], family: Family) -> u64 {
+    image
+      .iter()
+      .filter(|piece| crate::content_holder::page_family(&piece.key) == Some(family))
+      .map(|piece| u64::try_from(piece.bytes.len()).unwrap())
+      .sum()
+  }
+
+  /// Publishes the shard's image as a delta after encoding its cut to the end, and commits it, as the shard's
+  /// publication does once its catch-up ends.
+  fn publish_up(state: &mut crate::state::ShardState) {
+    crate::content_holder::image_drain(state);
+    while !crate::content_holder::image_turn(state).caught_up {}
+    let changes = crate::content_holder::held_changes_carried(state);
+    assert!(changes.image_carried, "the delta carries the encoder's cut");
+    crate::content_holder::held_committed(state, changes.whole, false);
+    crate::content_holder::image_committed(state, changes.image_carried);
+  }
+
+  /// Goal 93, the Aways append rule (main's ruling of 2026-11-25 on the 57k churn: 43,141,224 of a push's 74,340,245
+  /// image bytes were the Aways family, a few thousand short entries). Do: on a shard whose pages are small
+  /// ([`crate::content_holder::TEST_PAGE_BYTES`]), let objects go and publish a checkpoint; then let one more go and
+  /// publish, [`APPENDS`] times, as a push's let-goes and its publications interleave; read the Aways family's encoded
+  /// bytes ([`crate::content_holder::IMAGE_FAMILY_ENCODED_BYTES`], the counter the churn run reads) and the family's
+  /// bytes in the image before and after. Expect the bytes encoded for the Aways family at most what the appended
+  /// entries take in the image plus one page: a let-go's number is past every number before it, so a publication encodes
+  /// the entries past the committed piece's last and nothing of the piece again. Red before: every publication
+  /// re-encoded the tail page whole.
+  #[test]
+  fn a_push_of_let_goes_encodes_its_aways_appended_not_the_tail_again_each_publication() {
+    const PAGE: usize = 4096;
+    /// Shape: the let-goes published one at a time, enough that the tail page fills and splits.
+    const APPENDS: usize = 600;
+    let (encoded, appended, pages) = crate::daemon::audit_on_shard(|state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
+      let counted = |state: &crate::state::ShardState| {
+        let name = crate::content_holder::IMAGE_FAMILY_ENCODED_BYTES[Family::Aways.index()];
+        state.refusals.get(name).copied().unwrap_or(0)
+      };
+      let _ = let_go_and_note(state, (0, ENTRIES / 10));
+      crate::content_holder::image_drain(state);
+      while !crate::content_holder::image_turn(state).caught_up {}
+      let (image, carried) = crate::content_holder::held_image_paged(state);
+      crate::content_holder::held_committed(state, crate::content_holder::whole_of(&image), true);
+      crate::content_holder::image_committed(state, carried);
+      let held = crate::content_holder::held_image(state);
+      let before = (
+        counted(state),
+        family_bytes(&held, Family::Aways),
+        family_pages(&held, Family::Aways),
+      );
+      for at in 0..APPENDS {
+        let _ = let_go_and_note(state, (ENTRIES / 10 + at, 1));
+        publish_up(state);
+      }
+      let image = crate::content_holder::held_image(state);
+      let after = family_bytes(&image, Family::Aways);
+      // The oracle: the image holds the shard's entries now, each page piece the bytes a whole encoding of its entries
+      // makes, so an appended piece is one no re-encoding would tell apart.
+      assert_eq!(
+        crate::content_holder::paged_entries_of(&image),
+        crate::content_holder::paged_entries_now(state),
+        "the image holds the shard's entries"
+      );
+      for piece in image
+        .iter()
+        .filter(|piece| crate::content_holder::page_family(&piece.key).is_some())
+      {
+        let entries: Vec<Entry> = decode_page(&piece.bytes)
+          .unwrap()
+          .into_iter()
+          .map(|(key, bytes)| (0, key, EntryBytes::owned(bytes)))
+          .collect();
+        assert_eq!(
+          encode_page(&entries),
+          piece.bytes,
+          "a page piece as a whole encoding makes it"
+        );
+      }
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      let pages = (before.2, family_pages(&image, Family::Aways));
+      (
+        counted(state).saturating_sub(before.0),
+        after.saturating_sub(before.1),
+        pages,
+      )
+    });
+    let publications = APPENDS;
+    println!(
+      "aways: {encoded} bytes encoded over {publications} publications, {appended} bytes appended, a page of {PAGE}, \
+       its pages {} then {}",
+      pages.0, pages.1
+    );
+    assert!(
+      encoded <= appended + u64::try_from(PAGE).unwrap(),
+      "{publications} publications encoded {encoded} aways bytes for {appended} appended, past a page more"
     );
   }
 
