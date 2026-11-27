@@ -408,7 +408,7 @@
 >     adoption (A-364: it checked the adopted record alone, so a successor short of version 0 never became
 >     `RecordsShort`) nor its owed push's build (a chain refused `REPLICA_OWES` dropped the replica and began again
 >     from version 0). Both are reached now. Red first: a successor holding none of the green's records gave it up after
->     37 attempts; it adopts it in 7 now, and takes a push. A-918 B's newcomer half stays open below. **Owed (main):**
+>     37 attempts; it adopts it in 7 now, and takes a push. A-918 B's newcomer half is closed below. **Owed (main):**
 >     gate 24.
 >   - **KNOWN LIMIT (main 01a20182's ruling of 2026-11-27): a forward's first try may go to a readmitted creator.**
 >     A readmission drops the host's completed takeover (`RegionalConfiguration::admit`, A-309) and its retirement is
@@ -457,11 +457,14 @@
 >   part go at `c - 1` copies, exactly `f` at `c = f + 1`, where an owner's warm restart still spends one of `f`. And
 >   (§2 item 8) the owner's hold keeps a state log whole, unbounded (`compact_below` is for single-value registers
 >   only): a bounded owner hold is this item's fix.
-> - **B OPEN (A-918):** on `Behind`, the newcomer reads the green's chain through A-919's read (the same read a
->   takeover's successor makes), folds it under the start rule, and rebuilds its replica from it, paced and bounded
->   as replica builds are; one mechanism for both. The owner cannot push it the chain from v0: below a green's floor (its checkpoint or adoption)
->   it holds no per-version records or inputs. Then the red goes green, a914 asserts its second push lands, and
->   GAP-A9-7's ledger-prefix transfer and AUD-14's new candidate set close.
+> - **B FIXED (A-918 B, w-shared, 2026-11-27):** on `Behind`, the holder reads the green's chain from its cohort
+>   through A-919's read, holds it under the start rule, fetches the versions' inputs from the cohort too (the owner
+>   holds none below its floor), and rebuilds. Red first: the A-918 fleet test's newcomer, at `None` after 424 s and
+>   4,002 `Behind`, holds version 2 in 21 s. a914 asserts its second death's push is never refused at its record
+>   barrier. GAP-A9-7's record half is closed for both askers: a successor through its takeover round (A-933), a
+>   newcomer through this read. **Still open:** the second death's push may be refused `retry` at its homing (a914, 1
+>   of 3), a mode of its own; AUD-14's new candidate set needs the configuration's answer to a read past tolerance
+>   (A-919's open edge, above).
 > **OPEN, a piece (A-912's (3); main 01a20182's rulings of 2026-11-24): a council session of its own per peer.** The
 > council's replication shares a node's one record session per peer with every exchange, each borrower taking it whole.
 > A-912 removed the hold found (a home holding a put across the install the council's next append brings) and counts any

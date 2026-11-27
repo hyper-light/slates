@@ -37855,7 +37855,7 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
   assert_eq!(first, Ok(()), "the push before any death landed");
   let [
     (first_window, _, first_taken, first_after),
-    (second_window, _, second_taken, _),
+    (second_window, second_push, second_taken, _),
   ] = &during[..]
   else {
     panic!("two deaths: {during:?}");
@@ -37877,6 +37877,16 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
       .as_ref()
       .is_ok_and(|reading| reading.samples >= 1 && reading.learned),
     "the second death's window came from the learned silence: {second_window:?}"
+  );
+  // A-918 B: the candidate the first death brought in reads the green's chain from its cohort, so the second death's
+  // push finds its record barrier's f + 1 with it (before, refused `unable to commit` 2 of 7, then 4 of 6). Its homing
+  // may still fall short of the region's homes, refused `retry`, a mode of its own (1 of 7 then, 1 of 3 after).
+  assert!(
+    second_push
+      .as_ref()
+      .err()
+      .is_none_or(|refused| !refused.contains(BARRIER_REFUSED_ANSWER)),
+    "the push during the second death was never refused at its record barrier: {second_push:?}"
   );
 }
 
@@ -38981,6 +38991,95 @@ fn a921_a_warm_restarted_node_serves_a_false_death_victims_old_volume() {
   );
   assert!(served, "the volume's status served from the restarted node");
   // Claims are recorded, not asserted: the restarted node's routing, learned again, may name the adopter before a round.
+}
+
+/// A-918 B (main 01a20182's rulings (3) and B of 2026-11-25; A-912's sibling; AUD-14's transfer to a new candidate set).
+/// Do: on a four-node `f = 1` git fleet with a repository on a, push `main` (its green's version 1) and wait for both of
+/// a's remote candidates to hold it; stop one of them, so the fourth node, which holds nothing of the green, becomes a
+/// candidate once the survivors took the dead one over; push a commit on top (version 2). Expect the push to land and
+/// the newcomer to hold the green's chain through version 2. Red before A-918: the newcomer answered every record of
+/// the green out of order, untyped, for good (`merge.out_of_order` rising), and nothing ever shipped it the versions
+/// placed before it became a candidate.
+#[test]
+fn a918_a_candidate_a_death_brings_in_is_shipped_the_greens_chain_and_holds_the_next_version() {
+  let _serial = serialize_fleet_tests();
+  let ((daemons, hosts), stores, lease) =
+    started_git_fleet_of("fresh-candidate", &["a", "b", "c", "d"]);
+  let mut fleet = founded_git_fleet(
+    "fresh-candidate",
+    (daemons, hosts),
+    stores,
+    (Some(lease), None),
+  );
+  let green = VolumeId {
+    bytes: fleet.repository,
+  };
+  let first = fleet.push(0, ("first.txt", b"main before the death\n"));
+  let holders_of = |fleet: &GitFleet, version: u64| -> Vec<usize> {
+    (1..fleet.daemons.len())
+      .filter(|node| {
+        fleet.daemons[*node]
+          .merge_holder_state(green)
+          .is_ok_and(|held| held.version.is_some_and(|reached| reached >= version))
+      })
+      .collect()
+  };
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let both_hold = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(holders_of(&fleet, 1).len() == 2)
+  });
+  drop(observed);
+  let holders = holders_of(&fleet, 1);
+  let (Some(&stopped), Some(newcomer)) = (
+    holders.first(),
+    (1..fleet.daemons.len()).find(|node| !holders.contains(node)),
+  ) else {
+    fleet.stop();
+    panic!("a's two remote candidates held version 1 ({both_hold}): {holders:?}");
+  };
+  let newcomer_host = fleet.hosts[newcomer];
+  let gone = fleet.hosts[stopped];
+  fleet.daemons.remove(stopped).stop();
+  let newcomer = fleet
+    .daemons
+    .iter()
+    .position(|daemon| {
+      daemon
+        .member_identity()
+        .is_ok_and(|host| host == newcomer_host)
+    })
+    .unwrap_or(newcomer);
+  let taken = poll_taken_over_and_unseated(&fleet.daemons, gone);
+  let pushed = fleet.push_on_top(0, ("second.txt", b"main after the death\n"));
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let caught_up = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(fleet.daemons[newcomer].merge_holder_state(green)?.version == Some(2))
+  });
+  drop(observed);
+  let newcomer_state = fleet.daemons[newcomer].merge_holder_state(green);
+  let newcomer_counters = fleet.daemons[newcomer].fleet_refusals().map(|counters| {
+    counters
+      .into_iter()
+      .filter(|(kind, _)| kind.starts_with("merge.") || kind.starts_with("fleet.ledger_read"))
+      .collect::<Vec<_>>()
+  });
+  fleet.stop();
+  eprintln!(
+    "fresh-candidate: first {first:?}; holders of v1 {holders:?} (both {both_hold}); stopped {stopped}, newcomer \
+     {newcomer_host:?}; taken over {taken}; second {pushed:?}; newcomer {newcomer_state:?} caught up {caught_up}; its \
+     counters {newcomer_counters:?}"
+  );
+  assert_eq!(first, Ok(()), "the push before the death landed");
+  assert!(
+    both_hold,
+    "both remote candidates held version 1 before the death"
+  );
+  assert!(taken, "the survivors took the dead candidate over");
+  assert_eq!(pushed, Ok(()), "the push after the death landed");
+  assert!(
+    caught_up,
+    "the newcomer holds the green's chain through version 2: {newcomer_state:?}"
+  );
 }
 
 /// Shape: A-914's test's stretch of each coordinator period: a few heartbeats, past the pace the failover

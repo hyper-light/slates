@@ -5839,10 +5839,12 @@ const CATCH_UP_FETCHED: &str = "merge.catch_up.fetched";
 /// a refusal name in the daemon's status report.
 const CATCH_UP_UNSPAWNED: &str = "merge.catch_up.unspawned";
 
-/// Fetches by identity from `sender`, a merge record's owner, the inputs of the versions of the green `object` this holder's
-/// ledger holds without them (`unheld`, each version and manifest, lowest first), its replica behind that ledger (A-412,
-/// `merge_service::catch_up`): a takeover committed those versions again here through the register path, which carries no
-/// inputs. Each is staged as placed for its version, so the retention rule keeps it by that version's ledger position
+/// Fetches by identity from `sender`, a merge record's owner, and the green's other current candidates, hedged across
+/// them, the inputs of the versions of the green `object` this holder's ledger holds without them (`unheld`, each version
+/// and manifest, lowest first), its replica behind that ledger (A-412, `merge_service::catch_up`): a takeover committed
+/// those versions again here through the register path, which carries no inputs. A candidate a death brought in, which
+/// read the green's chain from its cohort (A-918 B), lacks every version's inputs, and the owner holds none below its
+/// floor (its checkpoint or adoption): the cohort that answered the read holds them (A-244), so it is asked too. Each is staged as placed for its version, so the retention rule keeps it by that version's ledger position
 /// ([`fetch_manifest_into_hold`]); the record's next shipment finds them held and advances the replica. One fetch a green
 /// at a time (`MergeShardState::catching_up`), in a detached task of this shard, each manifest within one live exchange's
 /// budget; it ends at the first manifest not fetched, and the next shipment begins another.
@@ -5856,10 +5858,23 @@ pub(crate) fn fetch_ledger_inputs(
     return;
   }
   state.count(CATCH_UP_BEGUN, 1);
+  // The sender first, then the green's other candidates: bounded by the placement's candidates.
+  let local = state.fleet.host();
+  let holders: Vec<HostId> = std::iter::once(sender)
+    .chain(
+      state
+        .fleet
+        .configuration()
+        .place(object)
+        .candidates
+        .into_iter()
+        .filter(|host| *host != sender && *host != local),
+    )
+    .collect();
   let fetching = async move {
     let budget = live_budget();
     for (version, manifest) in unheld {
-      if !fetch_manifest_into_hold(object, &[sender], move |_| version, manifest, budget).await {
+      if !fetch_manifest_into_hold(object, &holders, move |_| version, manifest, budget).await {
         break;
       }
       count_refusal(CATCH_UP_FETCHED);

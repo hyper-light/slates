@@ -133,6 +133,24 @@ pub(crate) fn want(
   wanted.to = wanted.to.max(to);
 }
 
+/// Wants a read of green `register`'s chain, its records' positions past `held` (none: from version 0) through
+/// `through`, from its cohort, its records coming from `owner` (A-918 B: a holder behind a green, a candidate a death
+/// brought in among them, reads the chain as a takeover's successor reads a ledger). Not where this node's last read of
+/// it went past tolerance: the record is answered behind, typed, as before. Whether a read is newly wanted.
+pub(crate) fn want_chain(
+  state: &mut ShardState,
+  (register, owner): (ObjectId, HostId),
+  held: Option<u64>,
+  through: u64,
+) -> bool {
+  if state.ledger_reads.past_tolerance.contains(&register) {
+    return false;
+  }
+  let fresh = !state.ledger_reads.wanted.contains_key(&register);
+  want(state, (register, owner), held, through);
+  fresh && state.ledger_reads.wanted.contains_key(&register)
+}
+
 /// What a successor's adoption of family green `green`, whose join no membership noted here records, does next (A-927
 /// part 2; module docs, "A successor's missing join"): the parts of its family's names log this node holds noted again
 /// (a takeover adopts the log's newest part into the acceptor without noting it); then, the join still unknown, a read of

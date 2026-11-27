@@ -63923,6 +63923,7 @@ GAPS.
   - `merge_service::tests::an_owner_records_a_targets_behind_answer_on_its_pending_version`.
   - The fleet test `a918_a_candidate_a_death_brings_in_is_shipped_the_greens_chain_and_holds_the_next_version` is red
     until B and lands with it.
+- **Amended by A-918 B** (2026-11-27): B landed with that test; a holder behind reads the chain from its cohort.
 - **Models.** None of `docs/wip/models/` models a holder's merge answers; no spec changed.
 
 Applied in the same change to: the A-412 note in `merge_service::catch_up`'s doc (it now answers behind),
@@ -66361,4 +66362,46 @@ Applied in the same change to:
   **Owed (main):** gate 24, after this lands.
 - **Applied in the same change to:** `crates/server/src/{green_adopt,merge_origin,merge_service}.rs`,
   `crates/server/tests/fleet.rs`, GAPS.
+
+### A-918 B — A holder behind a green reads its chain from the green's cohort, and its inputs from there too (2026-11-27, w-shared for main 01a20182, its rulings B of 2026-11-25 and (ii) of 2026-11-27 06:55; A-918's newcomer half; amends A-412 and A-918 (i))
+
+- **Why.** After a death at three members every member is a green's candidate, so a node that held none of a green
+  joined its cohort. Since A-918 (i) it answers each record behind, typed, and nothing brought it the chain. In the
+  A-918 fleet test it answered `Behind` 4,002 times and held none of the green 424 s after the push. A push whose next
+  version's `f + 1` needs it is refused at its record barrier (a914: `unable to commit` 2 of 7, then 4 of 6). The
+  owner cannot ship the chain itself: below the green's floor (its checkpoint or adoption) it holds no per-version
+  records or inputs.
+- **The rule.** One read, A-919's, the same a takeover successor's join read makes.
+  - A holder that answers a record `Behind` (it holds none of the green, or `catch_up` met a version whose record it
+    lacks) wants a read of the green's register, its records' positions from past the version through which it holds
+    every record from 0 (`merge_origin::chained_through`) to the version before the record's
+    (`merge_service::read_chain`, `ledger_read::want_chain`, counted `merge.behind.chain_read`). The read asks the
+    green's other current candidates, the owner among them from its own hold, folds their answers under the start rule,
+    and holds each position in order in this holder's acceptor. A read whose fold went past tolerance is not wanted
+    again; the record is answered behind, typed, as before (A-919's open edge).
+  - A holder with records and no replica checks what a rebuild reads before it begins (`merge_origin::rebuild_needs`,
+    A-933's check, now shared by both askers): a record it lacks is read as above, and the version answered behind;
+    inputs it lacks are fetched; then the rebuild goes ahead (A-313).
+  - The inputs fetch (`fleet::fetch_ledger_inputs`, A-412's) asks the record's sender first, then the green's other
+    current candidates, hedged across them. Before, it asked the sender alone, the owner, which holds no inputs below
+    its floor; the cohort that answered the read holds them (A-244).
+- **Bounds.** One read in flight per register, a page a period, its range what the record named; wanted registers at
+  most the greens this node is a candidate of (A-919's). One inputs fetch a green at a time (A-412's), its holders the
+  placement's candidates. The read is wanted again only on a later `Behind`, never by itself.
+- **Not done here.** Folding A-364's record adoption onto `ledger_read` is not ordered (main's (ii)): a successor adopts
+  missing records through its takeover round (A-933), a newcomer through this read.
+- **Tests.**
+  - Fleet `a918_a_candidate_a_death_brings_in_is_shipped_the_greens_chain_and_holds_the_next_version` (red first; A-918
+    (i) named it, uncommitted until now). Four nodes at `f = 1`; push `main`; stop one of a's two remote candidates, so
+    the fourth node, holding none of the green, becomes a candidate; push on top. The newcomer must hold the green
+    through version 2.
+    - Red on main: `version: None` after 424 s, `Behind` 4,002.
+    - With the read alone (the inputs fetched from the sender): the records held (`chain_read` 1, 2 positions), but
+      the fetch began 4,001 times and never finished.
+    - With the cohort asked for inputs too: version 2 in 21 s (`catch_up.fetched` 1, its replica's owed push built,
+      `replica_build.made` 1).
+  - Fleet a914 now asserts the second death's push is never refused at its record barrier, A-912's sibling, which
+    this closes. It may still be refused `retry` at its homing (1 of 3), a mode of its own, recorded.
+- **Applied in the same change to:** `crates/server/src/{merge_service,merge_origin,ledger_read,green_adopt,fleet}.rs`,
+  `crates/server/tests/fleet.rs`, A-918 (i)'s entry, GAPS.
 
