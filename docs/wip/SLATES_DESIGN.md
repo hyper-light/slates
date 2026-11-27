@@ -65135,6 +65135,26 @@ GAPS.
   - Debug, after: move's `stage.judging` is out of its eight longest spans (5.8-6.4 ms before). The leaders of all
     three wide tests now, publication aside: `stage.recording` 5.3-5.5 ms, `stage.check` 3.6-3.9, `landing.changeset`
     2.3-2.4.
+  **`stage.recording` named: a free decision's whole apply of the pending holds, and a directory listed whole.**
+  - The recording's phases were each under 1.9 ms (debug). The 5.2-5.5 ms span, in all three wide tests and in add, was
+    what ran after the staging's last step under its tag. A probe split it at `stage_deferred`'s release of the texts
+    brought for the increment: `release_texts` took 4.72 ms with no text to release. It is a free decision
+    (`name_holds::freeing`), which applies the greens' pending holds whole before it frees, and the revision's
+    staging had just named its 9,000 texts.
+  - Now the staging applies the pending holds a slice a step first (`name_holds::apply_some`, as the landing's tail
+    does since 7c), so the free decision finds none.
+    - Counter: `name_holds::NAME_HOLD_APPLIED_FREEING`, the holds a free decision applied whole.
+    - `t_c2c` holds it at 0; red at 9,000 without the sliced apply.
+  - The recording's walks of the texts a revision lets go and holds (`svn_texts::FilesWalk`, 9a) visited a node a
+    unit, but a directory's visit listed all its children, sorted them and made their paths in that one unit: 1.8 ms
+    for 9,000, in move's and copy's walks. Now each directory is read a child a unit through the index's cursor
+    (`Index::listing_after`, one entry), the directory's place kept after the child it put next. That is the same
+    visit: children in byte order, each one's tree before the next.
+    - The 9a test (`a_moves_recording_walked_a_node_a_step_finds_the_texts_the_whole_walk_finds`) holds the stepped
+      walks to the whole ones and at least two units a file; red at 84 units for 80 files with the listing whole.
+  - Debug, after: `stage.recording` is 1.3 ms in add and copy and out of move's six longest spans (5.2-5.5 ms before).
+    The leaders, publication aside: `stage.check` 3.7-3.9 ms and `landing.changeset` 2.3-2.4 ms in all three, then
+    move's `stage.build` 2.0.
   - Left: a replay's plan is still a pass over the entry in one unit, as is the scan of the runs, linear in them. Both
     are owed their slicing by §3.
 
@@ -66095,8 +66115,13 @@ Applied in the same change to:
   - Of the epoch pass, at most one task per anchor is in flight. A canonical announcement reads the anchor's last
     epoch and records the next one once answered. Two at once (the session under the anchor's seed id and the one
     under its learned id) would both name the same epoch.
-  - A task the runtime refuses runs inline, as the pass did before, counted `fleet.plane.announce_inline` or
-    `fleet.edges.announce_inline`.
+  - A task the runtime refuses leaves its member owed, so a later turn tries again, and is counted by pass and by the
+    refusal's kind (`member_task::count_spawn_refused`: `fleet.plane.announce_refused.<kind>` and
+    `fleet.edges.announce_refused.<kind>`, the kinds admission refuses with, `too_many_tasks`, `mem` and
+    `not_on_shard_thread`, and `other`). The loop never runs an exchange itself. As landed first, a refused task ran
+    inline: under the very pressure that refuses a spawn, the loop again held for an exchange budget a member, the
+    mechanism this part removed, and the refusal's kind was dropped (main 01a20182's ruling of 2026-11-27 05:11, §2
+    items 7 and 9). Off a shard thread cannot happen in the member loop; its count would be a bug's, surfaced typed.
   - main's 03:38 ruling offered two ways: settle only once every peer re-keyed, or announce at once to every peer.
     This is the second. A peer's re-key no longer depends on any other peer's answer, so the first is not needed.
 - **Keyed under which process.** Each side now records the process nonce of the peer its installed epoch was agreed
@@ -66105,7 +66130,7 @@ Applied in the same change to:
   stays set across the redial.
 - **Observability.** The per-peer route record used in the diagnosis (direct and indirect answers by relay) does not
   land. Its acknowledgement path would grow entries for any sender, not only the view, and main's 03:33 note asked for
-  counters, not a new interface. The new counters are the two `announce_inline`. The others already existed:
+  counters, not a new interface. The new counters are the refused tasks by kind, above. The others already existed:
   `fleet.plane.announcements_sent`, `fleet.plane.announce_lends`, `fleet.plane.epoch_unanswered`, `fleet.edges.sent`.
 - **Tests.** One test hook: a node withholds its answer to a peer member loop's epoch or edges announcement, or both
   (`Daemon::inject_member_exchange_withhold`), as `inject_live_state_withhold` does for its kind. Each fleet red runs on
@@ -66123,6 +66148,12 @@ Applied in the same change to:
     No other node may hold a dead, or move its fencing epoch, for [`DOUBT_WINDOW_DETECTIONS`] (4) detections. A
     suspicion is no fault there: a peer's probe under a's old keys goes unanswered until it re-keys a, and a refutes it.
     With the edges pass in turn: 3 of 3 red (a held dead 119 to 410 ms after the settle). After: 4 of 4 green.
+  - `a921_a_member_loop_refused_a_task_keeps_answering_and_tries_again` (red first, the follow-up). Node c withholds
+    edges; node b's member loop has every announcement task refused (`Daemon::inject_member_spawn_refusal`, as a full
+    arena refuses) and owes its edges to every peer again (`Daemon::owe_edges_again`). No node may condemn b for four
+    of b's detections, b's refusals are counted by kind more than once, and its record is sent once the refusal lifts.
+    With the inline path: red, every other node held b dead within 460 ms, and no refusal counted. After: 3 of 3
+    green, the refusals counted once a member a turn (2,042 to 24,899 over the window).
   - The owed-part scene and A919's owner-restart scene no longer guard against the adoption (`adopted_elsewhere_of`
     and `Daemon::holder_owner` are removed), and A919's test is no longer ignored. Both, after both fixes: 6 runs each,
     none formed afresh, none failed.
