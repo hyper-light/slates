@@ -696,3 +696,12 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - Per main's 05:11 finding, a refused announcement spawn no longer runs inline. The member stays owed, the next turn retries, and the refusal is counted by kind (fleet.plane/edges.announce_refused.<kind>).
 - Red first: a921_a_member_loop_refused_a_task_keeps_answering_and_tries_again. The inline path got b held dead in 460 ms; after the fix, 3 of 3 green.
 - Next: v3_takeover's "waiting on its adoption" stall.
+
+## 2026-11-27 08:21 PST: A-933 landed (slates 0f8e83640, commit 581ab8ba0); v3_takeover dump f9a62af6b; loop turns 05b427754
+- v3_takeover's adoption stall: the adoption's rebuild couldn't reach two bounded mechanisms that already existed. Main re-ruled at 06:55 to fix that in place of a new ledger_read path.
+  - Records: rebuild now checks v0 through the adopted version, so a shortfall is RecordsShort and A-364 runs.
+  - Owed push: a chain refused REPLICA_OWES keeps the replica and asks for its build (merge_service::build_if_owing, shared with the record path).
+- Red first: a_successor_lacking_a_greens_chain_records_adopts_it_once_the_owner_dies. On main: given up after 37 attempts. Records half alone: owes 43, still given up. Both halves: 7 attempts, green 3 of 3.
+- After merging A-932: the focused set plus the five 02bd0ec94 failures, 18 of 18.
+- CI's giver-up (gate 22) counted no records_short, which fits the owed-push half; gate 24 is main's.
+- A-918 B's newcomer half stays open.
