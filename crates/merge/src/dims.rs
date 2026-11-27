@@ -51,6 +51,7 @@
 use std::collections::BTreeSet;
 
 use crate::ptrie::{Holders, Nodes, Plain, Ptrie, Releasing};
+use crate::reaped::{Reapable, Reaped};
 use crate::special::SpecialNode;
 
 mod copy;
@@ -467,14 +468,31 @@ impl Blocks {
 
   /// One holder of `block` fewer; the block is freed with its last, a named one's hold given back.
   pub(crate) fn release(&mut self, block: Block) {
-    let _ = self.take(block);
+    let _ = self.released(block);
+  }
+
+  /// [`Blocks::release`], the bytes a freed block held moved into `reaped`, to be dropped elsewhere ([`crate::reaped`]).
+  pub(crate) fn release_reaping(&mut self, block: Block, reaped: &mut Reaped) {
+    if let Some(bytes) = self.released(block) {
+      reaped.bytes(bytes);
+    }
+  }
+
+  /// One holder of `block` fewer, its bytes never copied: with its last the block is freed ([`Blocks::last_gone`]), and
+  /// the bytes it held are given back. None while another holder remains, or for a block that is gone.
+  fn released(&mut self, block: Block) -> Option<Vec<u8>> {
+    let slot = self.slots.get_mut(block.0)?.as_mut()?;
+    if slot.holders > 1 {
+      slot.holders = slot.holders.saturating_sub(1);
+      return None;
+    }
+    self.last_gone(block.0)?.0
   }
 
   /// One holder of `block` fewer, and what it held: its bytes moved out with the last holder (copied while another
   /// remains), or the object it was held by alone. None for a block that is gone.
   fn take(&mut self, block: Block) -> Option<Taken> {
-    let place = self.slots.get_mut(block.0)?;
-    let slot = place.as_mut()?;
+    let slot = self.slots.get_mut(block.0)?.as_mut()?;
     if slot.holders > 1 {
       slot.holders = slot.holders.saturating_sub(1);
       return Some(match (&slot.bytes, slot.name) {
@@ -483,24 +501,33 @@ impl Blocks {
         (None, None) => Taken::Bytes(Vec::new()),
       });
     }
-    let slot = place.take()?;
-    self.free.push(block.0);
-    Some(match (slot.bytes, slot.name) {
-      (_, Some(name)) => {
-        if self.track {
-          self.holds.push(NameHold::Give(name));
-        }
-        if let Some(places) = self.named.get_mut(&name) {
-          places.retain(|place| *place != block.0);
-          if places.is_empty() {
-            self.named.remove(&name);
-          }
-        }
-        Taken::Named(name)
-      }
+    Some(match self.last_gone(block.0)? {
+      (_, Some(name)) => Taken::Named(name),
       (Some(bytes), None) => Taken::Bytes(bytes),
       (None, None) => Taken::Bytes(Vec::new()),
     })
+  }
+
+  /// The block at `index` freed with its last holder: its slot reused next, and a named one's hold given back (tracked
+  /// when the owner tracks them) and its place among its object's let go. What its slot held: its bytes and its object.
+  fn last_gone(
+    &mut self,
+    index: usize,
+  ) -> Option<(Option<Vec<u8>>, Option<crate::named::Identity>)> {
+    let slot = self.slots.get_mut(index)?.take()?;
+    self.free.push(index);
+    if let Some(name) = slot.name {
+      if self.track {
+        self.holds.push(NameHold::Give(name));
+      }
+      if let Some(places) = self.named.get_mut(&name) {
+        places.retain(|place| *place != index);
+        if places.is_empty() {
+          self.named.remove(&name);
+        }
+      }
+    }
+    Some((slot.bytes, slot.name))
   }
 
   /// The blocks alive.
@@ -517,6 +544,46 @@ impl Holders<Block> for Blocks {
 
   fn freed(&mut self, value: Block) {
     self.release(value);
+  }
+}
+
+/// The holders of a released map's values that name nothing outside the arena ([`Arenas::release_step`]): each value's
+/// heap and each freed node's label and child list moved into the [`Reaped`], never dropped on the shard (A-920).
+struct ReapValues<'a>(&'a mut Reaped);
+
+impl<V: Reapable> Holders<V> for ReapValues<'_> {
+  fn copied(&mut self, _value: &V) {}
+
+  fn freed(&mut self, value: V) {
+    value.reap(self.0);
+  }
+
+  fn node_freed(&mut self, label: Vec<u8>, children: Vec<(u8, usize)>) {
+    self.0.bytes(label);
+    self.0.children(children);
+  }
+}
+
+/// The files' blocks as the holders of a released files map ([`Arenas::release_step`]): a freed node's block let go as
+/// [`Blocks`] lets it go, the bytes a freed block held and each freed node's label and child list moved into the
+/// [`Reaped`] (A-920).
+struct ReapBlocks<'a> {
+  blocks: &'a mut Blocks,
+  reaped: &'a mut Reaped,
+}
+
+impl Holders<Block> for ReapBlocks<'_> {
+  fn copied(&mut self, value: &Block) {
+    self.blocks.hold(*value);
+  }
+
+  fn freed(&mut self, value: Block) {
+    self.blocks.release_reaping(value, self.reaped);
+  }
+
+  fn node_freed(&mut self, label: Vec<u8>, children: Vec<(u8, usize)>) {
+    self.reaped.bytes(label);
+    self.reaped.children(children);
   }
 }
 
@@ -913,25 +980,38 @@ pub(crate) struct Arenas {
 impl Arenas {
   /// One node of `release` given back, in the first map whose release is not done (the files' with their blocks): a
   /// node is freed, and its value let go, when no other green's map names it. False once every map's is done.
-  pub(crate) fn release_step(&mut self, release: &mut GreenRelease) -> bool {
-    self
-      .files
-      .release_step(&mut release.files, &mut self.blocks)
+  ///
+  /// What the freed nodes and their values held is moved into `reaped`, never dropped here (A-920: the release's frees
+  /// are the reaper's, [`crate::reaped`]).
+  pub(crate) fn release_step(&mut self, release: &mut GreenRelease, reaped: &mut Reaped) -> bool {
+    let blocks = &mut self.blocks;
+    self.files.release_step(
+      &mut release.files,
+      &mut ReapBlocks {
+        blocks,
+        reaped: &mut *reaped,
+      },
+    ) || self
+      .specials
+      .release_step(&mut release.specials, &mut ReapValues(&mut *reaped))
       || self
-        .specials
-        .release_step(&mut release.specials, &mut Plain)
-      || self.dirs.release_step(&mut release.dirs, &mut Plain)
-      || self.modes.release_step(&mut release.modes, &mut Plain)
+        .dirs
+        .release_step(&mut release.dirs, &mut ReapValues(&mut *reaped))
+      || self
+        .modes
+        .release_step(&mut release.modes, &mut ReapValues(&mut *reaped))
       || self
         .symlinks
-        .release_step(&mut release.symlinks, &mut Plain)
+        .release_step(&mut release.symlinks, &mut ReapValues(&mut *reaped))
       || self
         .hardlinks
-        .release_step(&mut release.hardlinks, &mut Plain)
-      || self.xattrs.release_step(&mut release.xattrs, &mut Plain)
+        .release_step(&mut release.hardlinks, &mut ReapValues(&mut *reaped))
+      || self
+        .xattrs
+        .release_step(&mut release.xattrs, &mut ReapValues(&mut *reaped))
       || self
         .links_to
-        .release_step(&mut release.links_to, &mut Plain)
+        .release_step(&mut release.links_to, &mut ReapValues(reaped))
   }
 
   /// The nodes walks of every dimension visited: what a branch must leave unmoved (A-534's non-vacuity count).

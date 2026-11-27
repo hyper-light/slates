@@ -38141,7 +38141,7 @@ fn restarted_owner_scene(attempt: usize) -> Option<(GitFleet, Vec<usize>)> {
 #[test]
 fn a921_a_holder_that_missed_an_owners_part_before_its_warm_restart_is_shipped_it_after() {
   let _serial = serialize_fleet_tests();
-  let Some((mut fleet, old_host, taken)) = (0..SCENE_RESTARTS).find_map(part_missed_scene) else {
+  let Some((fleet, old_host, taken)) = (0..SCENE_RESTARTS).find_map(part_missed_scene) else {
     panic!("a was taken over at every one of {SCENE_RESTARTS} scenes");
   };
   let at = |fleet: &GitFleet, host: HostId| {

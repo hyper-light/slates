@@ -58,6 +58,9 @@ pub trait Holders<V> {
   fn copied(&mut self, value: &V);
   /// The last node holding `value` was freed.
   fn freed(&mut self, value: V);
+  /// A node no holder names any more was freed by a release ([`Nodes::release_step`]): its label and its child list,
+  /// which a release moves out to be dropped on another thread ([`crate::reaped`]). Dropped here by default.
+  fn node_freed(&mut self, _label: Vec<u8>, _children: Vec<(u8, usize)>) {}
 }
 
 /// The holders of values that name nothing outside the arena: both events are nothing to them.
@@ -187,12 +190,19 @@ impl<V> Nodes<V> {
       return true;
     }
     if let Some(node) = self.take(slot) {
+      let Node {
+        label,
+        value,
+        children,
+        ..
+      } = node;
       releasing
         .pending
-        .extend(node.children.iter().map(|(_, child)| *child));
-      if let Some(value) = node.value {
+        .extend(children.iter().map(|(_, child)| *child));
+      if let Some(value) = value {
         holders.freed(value);
       }
+      holders.node_freed(label, children);
     }
     true
   }

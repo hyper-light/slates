@@ -1564,6 +1564,10 @@ pub struct Green {
   /// The changed paths' Strings a commit made, each the one its change entry keeps (A-920 3m's non-vacuity count: one a
   /// distinct path the effects change, made once).
   commit_paths_made: u64,
+  /// The effects commits walked for their node moves ([`Green::node_moves`]; A-920: none where no node has a link and
+  /// the version makes none, since then no link survives a home; a move of 9,000 files had walked its 18,000 effects in
+  /// one unit, 7.99 ms debug, finding no move).
+  node_moves_walked: u64,
   /// The byte buffers commits let go for files named for their run's object (A-920 3n's non-vacuity count: none, since
   /// such a file is given no bytes; each had been a run's own buffer, freed a commit unit at a time, and the free that
   /// emptied the allocator's region cost one unit about 1 ms of the kernel's time).
@@ -2725,6 +2729,9 @@ enum Prep {
 struct Beginning {
   names: Vec<(usize, crate::named::Identity)>,
   stage: BeginStage,
+  /// The version's own link effects, counted as [`BeginStage::Remapping`] visits each: with none, and no link in the
+  /// head, the node moves are none and walk nothing ([`BeginStage::Moves`], A-920).
+  links: usize,
   /// The paths the copies changed, in path order, once they are committed.
   copied: Vec<String>,
   order: PathOrder,
@@ -4488,6 +4495,11 @@ impl Green {
   /// The changed paths' Strings commits made ([`Green::commit_paths_made`]'s field, A-920 3m).
   pub fn commit_paths_made(&self) -> u64 {
     self.commit_paths_made
+  }
+
+  /// The effects commits walked for their node moves ([`Green::node_moves_walked`]'s field, A-920).
+  pub fn node_moves_walked(&self) -> u64 {
+    self.node_moves_walked
   }
 
   /// The effect lists a verdict's units allocated of their own ([`Green::unit_effect_lists`]'s field, A-920 3l).
@@ -8201,6 +8213,7 @@ impl Green {
     run.prep = Prep::Beginning(Box::new(Beginning {
       names: core::mem::take(names),
       stage: BeginStage::Remapping(0),
+      links: 0,
       copied: Vec::new(),
       order: PathOrder::default(),
     }));
@@ -8233,6 +8246,9 @@ impl Green {
         let post = crate::named::Post::of(post_state, &run.read, runs);
         let mut at = at;
         while let Some(effect) = run.effects.get_mut(at) {
+          if matches!(effect, Effect::Hardlink(..) | Effect::RemoveHardlink(_)) {
+            beginning.links = beginning.links.saturating_add(1);
+          }
           self.make_mapped_one((at, effect), post, &[]);
           at = at.saturating_add(1);
           if run.effects.get(at).is_some() && spent() {
@@ -8243,8 +8259,15 @@ impl Green {
         beginning.stage = BeginStage::Moves;
       }
       BeginStage::Moves => {
-        let moves = self.node_moves(&run.effects);
-        run.effects.extend(moves);
+        // A node moves only to a link that survives its home: where the head names no link (the map's count, read with
+        // no walk) and the version makes none, there is none, and no effect is walked (A-920: every import's case; a
+        // move of 9,000 files walked its 18,000 effects in this one unit, 7.99 ms debug, finding none).
+        if beginning.links != 0 || self.links_to.len() != 0 {
+          let walked = u64::try_from(run.effects.len()).unwrap_or(u64::MAX);
+          self.node_moves_walked = self.node_moves_walked.saturating_add(walked);
+          let moves = self.node_moves(&run.effects);
+          run.effects.extend(moves);
+        }
         beginning.stage = BeginStage::Links;
       }
       BeginStage::Links => {

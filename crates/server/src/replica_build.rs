@@ -115,15 +115,14 @@ pub(crate) fn wanted(state: &mut ShardState, green: ObjectId) {
   if !matches!(
     state.vcs_stores.store(record.id),
     Some(crate::vcs_store::RepositoryStore::Git(_))
-  ) {
-    if let Err(refused) = crate::vcs_store::replica::begin(state, &record, records) {
-      slates_machine::log_line!(
-        "slates-server: partition {}: a replica's repository store was refused: {refused:?}",
-        state.partition
-      );
-      state.count(REFUSED, 1);
-      return;
-    }
+  ) && let Err(refused) = crate::vcs_store::replica::begin(state, &record, records)
+  {
+    slates_machine::log_line!(
+      "slates-server: partition {}: a replica's repository store was refused: {refused:?}",
+      state.partition
+    );
+    state.count(REFUSED, 1);
+    return;
   }
   begin(state, green, record.id);
 }

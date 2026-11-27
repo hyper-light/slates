@@ -1541,11 +1541,7 @@ fn retire_lineage(state: &mut ShardState, repository: RepositoryId) {
     .collect();
   for member in members.into_iter().rev() {
     if let Some((lineage, Ok(mut release))) = state.greens.retire(&member) {
-      while state
-        .greens
-        .release_step(lineage, &mut release)
-        .is_ok_and(|more| more)
-      {}
+      state.greens.release_whole(lineage, &mut release);
     }
   }
 }
@@ -1554,11 +1550,7 @@ fn retire_lineage(state: &mut ShardState, repository: RepositoryId) {
 /// lineage slot released, awaiting its re-adoption through version 0.
 fn awaiting_readoption(state: &mut ShardState, green: DbVolumeId) {
   if let Some((lineage, Ok(mut release))) = state.greens.retire(&green) {
-    while state
-      .greens
-      .release_step(lineage, &mut release)
-      .is_ok_and(|more| more)
-    {}
+    state.greens.release_whole(lineage, &mut release);
   }
   state.greens.remove(&green);
   state.merge.awaiting_adoption.insert(
@@ -1642,11 +1634,7 @@ fn a_branch_whose_root_awaits_readoption_waits_and_is_rebuilt_over_it() {
       .expect("`main`'s green");
     // As a boot finds them: the branch's engine gone first, then the root's, which awaits its re-adoption.
     if let Some((lineage, Ok(mut release))) = state.greens.retire(&branch) {
-      while state
-        .greens
-        .release_step(lineage, &mut release)
-        .is_ok_and(|more| more)
-      {}
+      state.greens.release_whole(lineage, &mut release);
     }
     state.greens.remove(&branch);
     awaiting_readoption(state, hg.root);

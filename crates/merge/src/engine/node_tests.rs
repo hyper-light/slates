@@ -683,3 +683,48 @@ fn a_linked_fifos_removal_or_replacement_is_refused_rebased_or_not() -> Result<(
   }
   Ok(())
 }
+
+/// A green of `FILE` and `TARGET` that no link names.
+fn unlinked() -> Green {
+  let mut origin = crate::origin::Origin::default();
+  origin.files.push((FILE.to_owned(), b"<f>\n".to_vec()));
+  origin.files.push((TARGET.to_owned(), b"<g>\n".to_vec()));
+  Green::with_origin(origin)
+}
+
+/// A-920 (a commit's node moves walk nothing where no node has a link). Do: on a green whose files no link names,
+/// rename `FILE` and remove `TARGET` by one work; then on `linked`'s green, whose `TARGET` two links name, rename
+/// `TARGET`. Expect the first accepted with `FILE`'s bytes at the new path, nothing at the old two, and no effect walked
+/// for its node moves (`Green::node_moves_walked`); the second's links name the new path, its effects walked. Before,
+/// every commit walked every effect for its node moves: 7.99 ms of one unit for a move of 9,000 files (debug), which
+/// found none.
+#[test]
+fn a_commit_walks_no_effect_for_node_moves_where_no_node_has_a_link() -> Result<(), String> {
+  let mut plain = unlinked();
+  let work = Work::default().naming(OpKind::Rename, "moved", FILE).op(
+    OpKind::Unlink,
+    TARGET,
+    (0, 0, u64::MAX),
+  );
+  accept(&mut plain, work, 1)?;
+  let found = (
+    plain.content_bytes("moved").map(<[u8]>::to_vec),
+    kinds_at(&plain, FILE),
+    kinds_at(&plain, TARGET),
+    plain.node_moves_walked(),
+  );
+  if found != (Some(b"<f>\n".to_vec()), Vec::new(), Vec::new(), 0) {
+    return Err(format!("unlinked: {found:?}"));
+  }
+  let mut linked = linked()?;
+  accept(
+    &mut linked,
+    Work::default().naming(OpKind::Rename, "moved", TARGET),
+    4,
+  )?;
+  let found = (linked.hardlink(HARDLINK), linked.node_moves_walked() > 0);
+  if found != (Some("moved"), true) {
+    return Err(format!("linked: {found:?}"));
+  }
+  Ok(())
+}
