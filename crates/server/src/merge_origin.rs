@@ -2740,7 +2740,7 @@ mod tests {
       log: slates_db::catalog::StateLog::Names,
       from: 0,
       to: 1,
-      identity: [3; 32],
+      identity: slates_db::catalog::OperationIdentity { digest: [3; 32] },
       spans: Vec::new(),
       changes: vec![slates_db::catalog::LoggedChange::Joined {
         member: slates_db::catalog::MemberRecord {
