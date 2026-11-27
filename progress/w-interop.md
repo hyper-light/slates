@@ -691,3 +691,10 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   ubuntu-24.04-arm and windows-latest; hg 30/30 on all three; svn 33/33 on both Linux runners over svn:// and HTTP.
   GAPS records it at 1f97bdd05. Main's log: ~/.local/state/main-01a20182/rounds/interop-linux-10.log.
 - FREE: nothing open (inbox/main-from-w-interop-free.md). svn on Windows waits on Ada's go; r110's rerun is main's.
+- 2026-11-27, main's TSan-lane piece: part 1 (client re-hold helper) cd7d8c96c; items 1 and 2 of the spawner red (the
+  gate, delivery's CLOEXEC opens) a06460d8d; item 3, A-931 (an anchor's held sockets close-on-exec, handed on to the
+  daemon's child alone; red in diag run 45993337450) 5f0089f85. The Linux runs are in run-requests.md for main.
+- 8fc8a0210: A-931's siblings. Six CLI suites hand their serve sockets on in the child (support/hand_on.rs). Their
+  runs are in run-requests.md.
+- FREE (2026-11-27 05:00 PST): nothing open; inbox/main-from-w-interop-free.md rewritten. Waiting on diag CI 6 and 7's
+  verdicts (main's).

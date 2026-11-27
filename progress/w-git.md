@@ -876,3 +876,19 @@
   main's sample showed the clone waiting on encode_behind (derivations_due + harvest kevent), both now cut. NEXT:
   carry_blocking (answered/pushed sync driver, ~90 sites) → async histories, asked main whether hg_view's 10 are w-hg's;
   then the cache's eviction order (LRU) judged by hits ÷ units.open_tree; SSH seats; Windows owned_object (reported).
+- 11-27 03:48 PST: LANDED, landed-let-go read sweep (main's order of 11-26: lift vcs_store::LANDED_LET_GO one
+  precondition at a time, red first, each tip through main's 16): B1 16867288d..92f5189db (a thin push's check brings
+  its let-go base back; slates_git::away::WaitOnce keyed by let-go number; Waits, a push's own slot); B1b
+  c6dc94edc..3e98db372; B2 5d9a36bd1..8987e6f6a (Verdicts::base_of); A-921 owner lookup bound 30de9030f..668c10e99;
+  B3 b266d871a..a9c8aeaec (admission_turn waits, red at the site); recent_ring held to reading_budget
+  ee59aa1c3..4d8330bad; B4 a5522f5d4..c6d97a069 (policy check last in ready, quiet, waits); B5 a06460d8d..aaa27b376
+  (a pushed object read over a let-go base is NotYet, noted for the push, never malformed; site red over a fresh Push).
+  B6/B7 closed on the server path: commit 4c0b3e2c5 (Verdicts::one_call_builds counter, 0 over B1's push), focused
+  running, tip to main for the 16. NEXT: B8 (the encoding's tree walk, time not correctness), then (d) the replica red,
+  the flip with C5's 2N + O×R + W, C4, P1, P2.
+- 11-27 04:57 PST: LANDED B6 00a1bd150..65f664d87 (B6/B7 closed on the server path; Verdicts::one_call_builds counted, 0 over B1's
+  push; main's 16/16 at 4c0b3e2c5). B8 BUILT 2cde8d4f3 (agents/w-git-b8): the encoding's tree walk stops at a let-go
+  tree and walks the pair again (red b8_an_encodings_tree_walk_stops_at_a_let_go_tree_and_keeps_the_same_fragments:
+  Unreadable before; clone byte-identical after); git lib 630/630, server focused 295/295; in main's 16, push held for
+  the verdict. Sibling left OPEN by main's ruling (Encoding::stop_at keyed by place). NEXT: (d) the replica red, then
+  the flip with C5's 2N + O×R + W, C4, P1, P2.
