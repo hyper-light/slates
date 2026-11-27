@@ -26865,3 +26865,11 @@ interleaved head-to-head stock results recorded in `BENCHMARKS.md`.
   - Single-host 10,000-socket simultaneous loopback blasts on macOS encounter host kernel `kern.ipc.somaxconn=128` SYN
     queue drops (`ETIMEDOUT`) and loopback mbuf exhaustion (`ENOBUFS`); slates survives with 0 crashes/restarts and
     bounded RSS (`246.6 MiB` peak on `git-http N=10,000`).
+
+### 2026-11-26: Git wire-protocol hardening (`object-info`, edge-kind validation, D/F parity, hidden-ref redaction, O(1) cooperative atomic pacing) — CLOSED (A-895)
+Live adversarial probing against stock Git 2.56.1 over HTTP and SSH closed pack edge-kind validation against existing
+objects, `(pack, offset)` away-progress keying, `object-info=size type` and bare missing/unreachable `<oid> ` parity
+(SHA-1 and SHA-256, hidden-ref visibility enforced), stock Git 2.56.1 atomic/non-atomic D/F and porcelain parity with
+hidden-ref redaction, and cooperative 1-ref/step atomic D/F pacing guarded by O(1) `namespace_revision()`.
+- **Tracked follow-up:** a pre-existing intermittent concurrent-push race on shared `Repository::waiting` across
+  `bring_back_waited().await` (`crates/server/src/git_push.rs`) is tracked for dedicated remediation.
