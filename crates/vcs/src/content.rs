@@ -436,6 +436,12 @@ impl Writing {
     self.windows.len()
   }
 
+  /// The identities of the windows kept so far, in order: what a writer whose object no store holds yet pins against a
+  /// let-go as each is kept ([`ContentStore::pin_unlanded`]; a git push's pack, B10 of the landed let-go's lift).
+  pub fn kept_windows(&self) -> &[ContentId] {
+    &self.windows
+  }
+
   /// The bytes of the window being filled: at most a window, what the writer itself holds.
   pub fn pending_len(&self) -> usize {
     self.pending.len()

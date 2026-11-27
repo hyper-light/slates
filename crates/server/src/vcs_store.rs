@@ -2025,9 +2025,15 @@ impl SealedPush {
   }
 
   /// Keeps `sequence`, the changeset the node's store landed the homed names and pack as (A-767 C5): the version 5 record
-  /// names it.
-  pub(crate) fn landed_as(&mut self, sequence: u64) {
+  /// names it. Its pack's windows, pinned against a let-go while no store held them, are unpinned now the node's store
+  /// does (`slates_git::store::Push::landed`; B10 of the landed let-go's lift).
+  pub(crate) fn landed_as(&mut self, state: &mut ShardState, sequence: u64) {
     self.landed = sequence;
+    within_budget(state, 0, |stores| {
+      if let Some(content) = stores.content_mut() {
+        self.push.landed(content);
+      }
+    });
   }
 
   /// Gives back the hold the store took of `identity` for a record that will never name it (its homing fell short), and
