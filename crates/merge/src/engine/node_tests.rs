@@ -728,3 +728,152 @@ fn a_commit_walks_no_effect_for_node_moves_where_no_node_has_a_link() -> Result<
   }
   Ok(())
 }
+
+/// Shape: the files a wide rename over a linked green moves.
+const WIDE: usize = 500;
+
+/// `green` (`HARDLINK` naming `TARGET`) with [`WIDE`] files more, made by one work at its head.
+fn wide_linked() -> Result<Green, String> {
+  let mut green = green();
+  let mut work = Work::default();
+  for at in 0..WIDE {
+    work = work.create(&format!("w{at}"), b"<w>\n");
+  }
+  accept(&mut green, work, 1)?;
+  Ok(green)
+}
+
+/// Applies `applied` for `inc` to `green` a unit a step, every unit spending its step: the version it answered.
+fn applied_a_unit_a_step(
+  green: &mut Green,
+  inc: &Increment,
+  applied: &[crate::chain_entry::Applied],
+) -> Result<u64, String> {
+  let mut inc = inc.clone();
+  match green.begin_applying(&mut inc, applied) {
+    super::Begun::Answered(version) => Ok(version),
+    super::Begun::Applying(mut run) => loop {
+      match green.apply_step(&mut run, &mut inc, applied, &mut || true) {
+        super::ApplyStep::More => {}
+        super::ApplyStep::Done(version) | super::ApplyStep::Answered(version) => {
+          return Ok(version);
+        }
+        super::ApplyStep::Lend(unlent) => return Err(format!("asked to lend {unlent:?}")),
+      }
+    },
+  }
+}
+
+/// A-920 (main's ruling of 2026-11-27 02:03: a green holding one link anywhere walked every effect of a version for its
+/// node moves in one unit, which §3 forbids whatever a probe finds). Do: on two greens alike holding `HARDLINK` to
+/// `TARGET` and [`WIDE`] files more, rename each of those files by one work, submitted whole to the first and its
+/// recorded effects applied to the second a unit a step. Expect the second at the version the first committed, the
+/// renamed bytes at their new paths and `HARDLINK` still naming `TARGET`; its node moves walked every effect, one a
+/// unit (`Green::node_moves_walked` against `Green::node_moves_units`). Before, the commit's beginning walked them all in
+/// one unit.
+#[test]
+fn a_wide_renames_node_moves_on_a_linked_green_walk_an_effect_a_unit() -> Result<(), String> {
+  let (mut source, mut replica) = (wide_linked()?, wide_linked()?);
+  let mut work = Work::default();
+  for at in 0..WIDE {
+    work = work.naming(OpKind::Rename, &format!("v{at}"), &format!("w{at}"));
+  }
+  let inc = work.at(source.head(), 2);
+  let (outcome, applied) = source.submit_resolved(&inc);
+  let Outcome::Accepted { version } = outcome else {
+    return Err(format!("the rename was answered {outcome:?}"));
+  };
+  let before = (replica.node_moves_walked(), replica.node_moves_units());
+  let answered = applied_a_unit_a_step(&mut replica, &inc, &applied.unwrap_or_default())?;
+  let walked = replica.node_moves_walked() - before.0;
+  let units = replica.node_moves_units() - before.1;
+  let found = (
+    answered,
+    replica.content_bytes("v0").map(<[u8]>::to_vec),
+    replica.hardlink(HARDLINK),
+    walked >= 2 * WIDE as u64,
+    units == walked,
+  );
+  if found != (version, Some(b"<w>\n".to_vec()), Some(TARGET), true, true) {
+    return Err(format!("{found:?}"));
+  }
+  Ok(())
+}
+
+/// Shape: the files under the directory a wide removal takes away.
+const UNDER: usize = 400;
+
+/// A green holding the directory `tree` and [`UNDER`] files under it.
+fn tree_of_files() -> Green {
+  let mut origin = crate::origin::Origin::default();
+  origin.dirs.push("tree".to_owned());
+  for at in 0..UNDER {
+    origin
+      .files
+      .push((format!("tree/f{at}"), b"<t>\n".to_vec()));
+  }
+  Green::with_origin(origin)
+}
+
+/// A work at `green`'s head removing every file under `tree` but those `kept` names, then `tree` itself.
+fn tree_removed(green: &Green, kept: &[&str]) -> Increment {
+  let mut work = Work::default();
+  for at in 0..UNDER {
+    let path = format!("tree/f{at}");
+    if !kept.contains(&path.as_str()) {
+      work = work.op(OpKind::Unlink, &path, (0, 0, u64::MAX));
+    }
+  }
+  work
+    .op(OpKind::Rmdir, "tree", (0, 0, u64::MAX))
+    .at(green.head(), 1)
+}
+
+/// `inc` computed on `green` whole and a unit a step: what each records it applies, or the windows it conflicts in, and
+/// the children the step's directory removals counted and the units that counted them.
+fn computed_both_ways(
+  green: &Green,
+  inc: &Increment,
+) -> Result<(String, String, (u64, u64)), String> {
+  let whole = format!(
+    "{:?}",
+    green
+      .compute(inc)
+      .map_err(|refused| format!("{refused:?}"))?
+      .applied()
+  );
+  let before = green.rmdir_children();
+  let mut computing = green.begin_computing(inc);
+  let sliced = loop {
+    if let Some(computed) = green.computing_step(inc, &mut computing, &mut || true) {
+      break computed.map_err(|refused| format!("{refused:?}"))?;
+    }
+  };
+  let after = green.rmdir_children();
+  let counted = (after.0 - before.0, after.1 - before.1);
+  Ok((whole, format!("{:?}", sliced.applied()), counted))
+}
+
+/// A-920 (a directory's removal decided with its children counted a unit a step). Do: compute, whole and a unit a step,
+/// a work removing every one of [`UNDER`] files under `tree` and then `tree`; then one that keeps a file there. Expect
+/// each computed alike both ways: the first removing the directory, the second, whose directory keeps a child, not; and a
+/// unit a step, each child the work removes counted in a unit of its own (`Green::rmdir_children`). Before, a removal
+/// walked the directory's whole tree in its one unit (4.96 ms debug at 9,000 files).
+#[test]
+fn a_directorys_removal_counts_its_children_a_unit_a_step() -> Result<(), String> {
+  let green = tree_of_files();
+  let (whole, sliced, (children, units)) = computed_both_ways(&green, &tree_removed(&green, &[]))?;
+  if whole != sliced
+    || !sliced.contains("RemoveDir(\"tree\")")
+    || children < UNDER as u64
+    || units != children
+  {
+    return Err(format!("removed: {whole} {sliced} {children} {units}"));
+  }
+  let kept = tree_removed(&green, &["tree/f7"]);
+  let (whole, sliced, _) = computed_both_ways(&green, &kept)?;
+  if whole != sliced || sliced.contains("RemoveDir(\"tree\")") {
+    return Err(format!("kept: {whole} {sliced}"));
+  }
+  Ok(())
+}

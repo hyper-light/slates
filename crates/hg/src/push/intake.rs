@@ -149,6 +149,10 @@ pub struct Intaken {
   /// The changelog's and the manifests' texts the intake asked of the node's changeset store, their windows let go once
   /// landed (goal 93, C1 (1)): a delta's base, or the manifest a new one is kept as a delta against.
   pub log_texts_asked: u64,
+  /// Of a manifest's bases asked of the store over its chain's let-go link, those asked again once because a row above
+  /// the link was let go between the ask and its use (its segment landed meanwhile): asked again for that row, now
+  /// landed and in the store, once at most (main's ruling of 2026-11-27).
+  pub log_texts_reasked: u64,
   /// The most bytes of whole text the intake held at once (goal 93, C1 (2): a revision rebuilt into one buffer, its base
   /// read whole, the text kept last for the next delta and the push's own bases cached): what a step's working set
   /// holds of texts, which a windowed rebuild bounds by the content store's window.

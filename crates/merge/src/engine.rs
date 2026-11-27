@@ -1558,6 +1558,9 @@ pub struct Green {
   /// flat lists; one each had been freed a unit at a time, and the free that emptied the allocator's region cost a
   /// gathering's step 1.2 ms). A cell, as `fast_path_hits` is.
   unit_effect_lists: std::cell::Cell<u64>,
+  /// The children directory removals counted, and the units that counted them (A-920: a child a unit, never the
+  /// directory's whole tree in its removal's one unit, 4.96 ms debug at 9,000 files). Cells, as `fast_path_hits` is.
+  rmdir_children: std::cell::Cell<(u64, u64)>,
   /// The changed paths a commit put in a tree set of its own (A-920 3m: none, since its paths are ordered a unit at a
   /// time with no tree; 9,000 String clones and their nodes had been 0.73-0.78 ms of one step, debug).
   commit_tree_paths: u64,
@@ -1568,6 +1571,9 @@ pub struct Green {
   /// the version makes none, since then no link survives a home; a move of 9,000 files had walked its 18,000 effects in
   /// one unit, 7.99 ms debug, finding no move).
   node_moves_walked: u64,
+  /// The units of commits' node moves that walked an effect (A-920, main's ruling of 2026-11-27 02:03): as many as the
+  /// effects walked where each unit walks one; one for a move of 9,000 files, whole, which walked 18,000 in it.
+  node_moves_units: u64,
   /// The plans of a replay's reads applies began ([`Increment::replay_reads`]; A-920: none where every named run is
   /// read already, as a landing reads them all before its apply begins; the plan, a pass over every effect and run, had
   /// been 4.46 ms of one step at 9,000 files, debug, answering that none was unread).
@@ -2736,6 +2742,8 @@ struct Beginning {
   /// The version's own link effects, counted as [`BeginStage::Remapping`] visits each: with none, and no link in the
   /// head, the node moves are none and walk nothing ([`BeginStage::Moves`], A-920).
   links: usize,
+  /// The node moves being found, an effect a unit ([`BeginStage::Moves`]).
+  moves: Option<Box<node_moves::NodeMoves>>,
   /// The paths the copies changed, in path order, once they are committed.
   copied: Vec<String>,
   order: PathOrder,
@@ -4501,9 +4509,30 @@ impl Green {
     self.commit_paths_made
   }
 
+  /// The children directory removals counted, and the units that counted them ([`Green::rmdir_children`]'s field,
+  /// A-920).
+  pub fn rmdir_children(&self) -> (u64, u64) {
+    self.rmdir_children.get()
+  }
+
+  /// One unit of a directory removal's children counted, `counted` of them ([`Green::rmdir_children`]).
+  fn rmdir_children_noted(&self, counted: u64) {
+    if counted > 0 {
+      let (children, units) = self.rmdir_children.get();
+      self
+        .rmdir_children
+        .set((children.saturating_add(counted), units.saturating_add(1)));
+    }
+  }
+
   /// The effects commits walked for their node moves ([`Green::node_moves_walked`]'s field, A-920).
   pub fn node_moves_walked(&self) -> u64 {
     self.node_moves_walked
+  }
+
+  /// The units of commits' node moves that walked an effect ([`Green::node_moves_units`]'s field, A-920).
+  pub fn node_moves_units(&self) -> u64 {
+    self.node_moves_units
   }
 
   /// The plans of a replay's reads applies began ([`Green::replay_plans`]'s field, A-920).
@@ -5446,17 +5475,6 @@ impl Green {
     }
   }
 
-  /// Whether any file, directory, symlink or hard link under `prefix` survives `cleared`: each map's keys under the
-  /// prefix, one descent each (A-534; a scan of every key of every map before).
-  fn has_live_child(&self, prefix: &str, cleared: &BTreeSet<String>) -> bool {
-    let live = |path: &String| !cleared.contains(path);
-    self.content.prefix(prefix).any(|(path, _)| live(&path))
-      || self.dirs.prefix(prefix).any(|(path, _)| live(&path))
-      || self.symlinks.prefix(prefix).any(|(path, _)| live(&path))
-      || self.hardlinks.prefix(prefix).any(|(path, _)| live(&path))
-      || self.specials.prefix(prefix).any(|(path, _)| live(&path))
-  }
-
   /// Whether an intervening change occupied `path` with any non-file kind.
   fn occupied_by_nonfile(&self, path: &str) -> bool {
     self.dirs.contains_key(path)
@@ -5901,35 +5919,53 @@ impl Green {
     Ok(Some(Effect::MakeDir(path.to_owned())))
   }
 
-  /// Merges a directory removal against the increment's own removals, and against its base: a
-  /// directory changed after the base in any dimension is delete against modify (A-643).
-  fn merge_rmdir(
+  /// A directory's removal at `path`, decided before its children (A-920): a node of another kind there refuses it
+  /// (type changed), none there makes it nothing to do, and a directory changed after `base` in any dimension is not the
+  /// one the work removes (delete against modify; A-643: the removal had no base, and removed a directory made again
+  /// since). None where its children decide it ([`Green::held_under`], [`Green::held_at`]: a child the work does not
+  /// remove itself is delete against modify, else the directory goes).
+  fn rmdir_before_children(
     &self,
     path: &str,
     base: u64,
-    cleared: &BTreeSet<String>,
-  ) -> Result<Option<Effect>, ConflictWindow> {
+  ) -> Option<Result<Option<Effect>, ConflictWindow>> {
     if self.content.contains_key(path)
       || self.symlinks.contains_key(path)
       || self.hardlinks.contains_key(path)
       || self.specials.contains_key(path)
     {
-      return Err(Green::window(path, MergeConflictClass::TypeChanged));
+      return Some(Err(Green::window(path, MergeConflictClass::TypeChanged)));
     }
     if !self.dirs.contains_key(path) {
-      return Ok(None);
+      return Some(Ok(None));
     }
-    // A directory changed after the base in any dimension (removed and made again, its mode or an
-    // attribute changed) is not the one the work removes: delete against modify (A-643; the
-    // removal had no base, and removed a directory made again since).
     if self.changed_after(path, base) {
-      return Err(Green::window(path, MergeConflictClass::DeleteModify));
+      return Some(Err(Green::window(path, MergeConflictClass::DeleteModify)));
     }
-    let prefix = format!("{path}/");
-    if self.has_live_child(&prefix, cleared) {
-      return Err(Green::window(path, MergeConflictClass::DeleteModify));
-    }
-    Ok(Some(Effect::RemoveDir(path.to_owned())))
+    None
+  }
+
+  /// The head's keys under `prefix` in each of its node maps (files, directories, symbolic links, hard links and IPC
+  /// nodes, in that order), counted with no walk: a descent each.
+  fn held_under(&self, prefix: &str) -> [usize; 5] {
+    [
+      self.content.prefix_len(prefix),
+      self.dirs.prefix_len(prefix),
+      self.symlinks.prefix_len(prefix),
+      self.hardlinks.prefix_len(prefix),
+      self.specials.prefix_len(prefix),
+    ]
+  }
+
+  /// Which of the head's node maps hold `path`, in [`Green::held_under`]'s order.
+  fn held_at(&self, path: &str) -> [bool; 5] {
+    [
+      self.content.contains_key(path),
+      self.dirs.contains_key(path),
+      self.symlinks.contains_key(path),
+      self.hardlinks.contains_key(path),
+      self.specials.contains_key(path),
+    ]
   }
 
   /// Metadata on a former IPC inode cannot silently apply to another kind that now owns its
@@ -6678,45 +6714,10 @@ impl Green {
   /// operation, and a rebase's journal restates only the work's (`Green::rebased_from`), while its
   /// changes show the files the moves leave ([`Green::heirs_of`], A-677).
   fn node_moves(&self, effects: &[Effect]) -> Vec<Effect> {
-    let mut links: BTreeMap<&str, Option<&str>> = BTreeMap::new();
-    let mut removed: BTreeSet<&str> = BTreeSet::new();
-    let mut copied: Vec<(&str, &str)> = Vec::new();
-    for effect in effects {
-      match effect {
-        Effect::Hardlink(path, target) => {
-          links.insert(path, Some(target.as_str()));
-        }
-        Effect::RemoveHardlink(path) => {
-          links.insert(path, None);
-        }
-        Effect::RemoveContent(path) | Effect::RemoveSpecial(path) => {
-          removed.insert(path);
-        }
-        Effect::SetContent(path, _, _, ContentSource::Copied(from, _)) if from != path => {
-          copied.push((from.as_str(), path.as_str()));
-        }
-        _ => {}
-      }
-    }
-    let mut moves = Vec::new();
-    let mut renamed: BTreeSet<&str> = BTreeSet::new();
-    for (from, to) in &copied {
-      if removed.contains(from) {
-        renamed.insert(*from);
-        for link in self.surviving_links(from, &links) {
-          moves.push(Effect::Hardlink(link.to_owned(), (*to).to_owned()));
-        }
-      }
-    }
-    let replaced = copied
-      .iter()
-      .map(|(_, to)| *to)
-      .filter(|to| self.content.contains_key(to));
-    let left: BTreeSet<&str> = removed.iter().copied().chain(replaced).collect();
-    for home in left.difference(&renamed) {
-      self.hand_over(home, self.surviving_links(home, &links), &mut moves);
-    }
-    moves
+    // One walk, the commit's: run to its end here ([`node_moves::NodeMoves`], a unit a step in a commit's beginning).
+    let mut finding = node_moves::NodeMoves::default();
+    while !finding.step(self, effects) {}
+    finding.into_moves()
   }
 
   /// The files a version's node moves leave at the links its removed or replaced homes hand their
@@ -6733,28 +6734,6 @@ impl Green {
         _ => None,
       })
       .collect()
-  }
-
-  /// The links naming the node at `home` once the version's link effects (`links`: each link's last
-  /// target, `None` for a removal) apply: the head's links to it the version keeps, and the links
-  /// it makes to it.
-  fn surviving_links<'a>(
-    &'a self,
-    home: &str,
-    links: &BTreeMap<&'a str, Option<&'a str>>,
-  ) -> BTreeSet<&'a str> {
-    let kept = self
-      .links_to
-      .get(home)
-      .into_iter()
-      .flatten()
-      .map(String::as_str)
-      .filter(|link| !links.contains_key(link));
-    let made = links
-      .iter()
-      .filter(|(_, target)| **target == Some(home))
-      .map(|(link, _)| *link);
-    kept.chain(made).collect()
   }
 
   /// Hands the node at `home`, which the version removes or replaces, to the least of the links
@@ -8229,10 +8208,63 @@ impl Green {
       names: core::mem::take(names),
       stage: BeginStage::Remapping(0),
       links: 0,
+      moves: None,
       copied: Vec::new(),
       order: PathOrder::default(),
     }));
     None
+  }
+
+  /// [`Self::beginning_some`]'s node moves. A node moves only to a link that survives its home: where the head names no
+  /// link (the map's count, read with no walk) and the version makes none, there is none, and no effect is walked
+  /// (A-920: every import's case; a move of 9,000 files walked its 18,000 effects in one unit, 7.99 ms debug, finding
+  /// none). Otherwise they are found an effect a unit until `spent` ([`node_moves::NodeMoves`]; main's ruling of
+  /// 2026-11-27: a green holding one link anywhere walked every effect in one unit). True once the moves are found and
+  /// added to `effects`; false where `spent` ended the step first.
+  fn begin_moves(
+    &mut self,
+    beginning: &mut Beginning,
+    effects: &mut Vec<Effect>,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> bool {
+    if beginning.links == 0 && self.links_to.len() == 0 {
+      return true;
+    }
+    let finding = beginning.moves.get_or_insert_with(Box::default);
+    let (found, walked) = self.walk_moves(finding, effects, spent);
+    self.node_moves_walked = self.node_moves_walked.saturating_add(walked);
+    if walked > 0 {
+      self.node_moves_units = self.node_moves_units.saturating_add(1);
+    }
+    if !found {
+      return false;
+    }
+    if let Some(finding) = beginning.moves.take() {
+      effects.extend(finding.into_moves());
+    }
+    true
+  }
+
+  /// [`Self::begin_moves`]'s walk, an effect a unit until the moves are found or `spent` ends the step: whether they
+  /// were found, and the effects walked.
+  fn walk_moves(
+    &self,
+    finding: &mut node_moves::NodeMoves,
+    effects: &[Effect],
+    spent: &mut dyn FnMut() -> bool,
+  ) -> (bool, u64) {
+    let mut walked = 0u64;
+    loop {
+      if finding.walking() {
+        walked = walked.saturating_add(1);
+      }
+      if finding.step(self, effects) {
+        return (true, walked);
+      }
+      if spent() {
+        return (false, walked);
+      }
+    }
   }
 
   /// [`Prep::Beginning`]: the commit begun over the effects, a part a step ([`Beginning`]), until `spent`; a whole part
@@ -8248,10 +8280,7 @@ impl Green {
       return Some(ApplyStep::More);
     };
     let version = self.head().saturating_add(1);
-    let whole = matches!(
-      beginning.stage,
-      BeginStage::Moves | BeginStage::Links | BeginStage::Copies
-    );
+    let whole = matches!(beginning.stage, BeginStage::Links | BeginStage::Copies);
     if whole && !fresh {
       return Some(ApplyStep::More);
     }
@@ -8274,14 +8303,8 @@ impl Green {
         beginning.stage = BeginStage::Moves;
       }
       BeginStage::Moves => {
-        // A node moves only to a link that survives its home: where the head names no link (the map's count, read with
-        // no walk) and the version makes none, there is none, and no effect is walked (A-920: every import's case; a
-        // move of 9,000 files walked its 18,000 effects in this one unit, 7.99 ms debug, finding none).
-        if beginning.links != 0 || self.links_to.len() != 0 {
-          let walked = u64::try_from(run.effects.len()).unwrap_or(u64::MAX);
-          self.node_moves_walked = self.node_moves_walked.saturating_add(walked);
-          let moves = self.node_moves(&run.effects);
-          run.effects.extend(moves);
+        if !self.begin_moves(beginning, &mut run.effects, &mut *spent) {
+          return Some(ApplyStep::More);
         }
         beginning.stage = BeginStage::Links;
       }
@@ -9585,6 +9608,7 @@ fn special_payload(
 }
 
 mod branch;
+mod node_moves;
 pub use branch::{Lent, Lineage, LineageGreen, LineageRefused, Release};
 
 mod copy;

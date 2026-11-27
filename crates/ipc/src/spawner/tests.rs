@@ -131,6 +131,8 @@ fn release(end: &OwnedFd, id: u64) {
 /// process's. Expect: the pid, the pipe's `spawned`, then the exit with code 7; the child reaped once released.
 #[test]
 fn a_child_started_through_the_spawner_runs_and_its_exit_is_answered() {
+  // Spawns a process, so holds the descriptor tests' gate across it (`crate::descriptor_test_gate`).
+  let _gate = crate::descriptor_test_gate();
   let spawner = spawner(1);
   let end = spawner.ends.first().unwrap();
   let (mut read, write) = std::io::pipe().unwrap();
@@ -159,6 +161,8 @@ fn a_child_started_through_the_spawner_runs_and_its_exit_is_answered() {
 /// spawner holds nothing a direct one does not (none of the spawner's ends, its self-pipe, or this process's pipe).
 #[test]
 fn a_child_started_through_the_spawner_holds_what_a_direct_one_holds() {
+  // Spawns a process, so holds the descriptor tests' gate across it (`crate::descriptor_test_gate`).
+  let _gate = crate::descriptor_test_gate();
   let spawner = spawner(1);
   let end = spawner.ends.first().unwrap();
   let (_held_read, _held_write) = std::io::pipe().unwrap();
@@ -193,6 +197,8 @@ fn a_child_started_through_the_spawner_holds_what_a_direct_one_holds() {
 /// within [`PATIENCE`].
 #[test]
 fn a_running_childs_group_is_killed_when_the_daemons_end_goes() {
+  // Spawns a process, so holds the descriptor tests' gate across it (`crate::descriptor_test_gate`).
+  let _gate = crate::descriptor_test_gate();
   let mut spawner = spawner(1);
   let end = spawner.ends.pop().unwrap();
   let args = [OsStr::new("-c"), OsStr::new("exec sleep 3600")];
@@ -225,6 +231,8 @@ fn a_running_childs_group_is_killed_when_the_daemons_end_goes() {
 /// reads closed.
 #[test]
 fn a_frame_longer_than_any_spawn_ends_its_conversation() {
+  // Spawns a process, so holds the descriptor tests' gate across it (`crate::descriptor_test_gate`).
+  let _gate = crate::descriptor_test_gate();
   let mut spawner = spawner(1);
   let end = spawner.ends.pop().unwrap();
   let mut header = frame(FrameKind::Spawn, 1, &[]).unwrap();
@@ -383,6 +391,8 @@ fn descriptor_room() -> usize {
 /// may and says so; red there before was the role refused its descriptors (main's diag run 45666757721).
 #[test]
 fn a_spawns_cost_on_its_calling_thread_is_flat_in_the_daemons_descriptors() {
+  // Spawns a process, so holds the descriptor tests' gate across it (`crate::descriptor_test_gate`).
+  let _gate = crate::descriptor_test_gate();
   let program = std::env::current_exe().unwrap();
   let output = std::process::Command::new(program)
     .args(role_args("spawn_cost_role"))

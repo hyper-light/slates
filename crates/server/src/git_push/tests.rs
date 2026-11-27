@@ -1847,6 +1847,16 @@ fn pushed_over_a_let_go(
   name: &str,
   made: impl FnOnce(usize) -> ((Vec<u8>, Vec<u8>, ObjectId), Vec<u8>),
 ) -> (Received, u64, (u64, u64, u64)) {
+  pushed_over_a_let_go_after(name, made, |_| {})
+}
+
+/// [`pushed_over_a_let_go`], `between` run on the repository's shard once the create's derivation has ended and before
+/// the let-go (a policy set after the create it would refuse).
+fn pushed_over_a_let_go_after(
+  name: &str,
+  made: impl FnOnce(usize) -> ((Vec<u8>, Vec<u8>, ObjectId), Vec<u8>),
+  between: impl FnOnce(&mut ShardState) + Clone + Send + 'static,
+) -> (Received, u64, (u64, u64, u64)) {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let repository = git_repository_on(&daemon, name);
   let window = crate::daemon::observe_first(&daemon, |state| {
@@ -1867,6 +1877,7 @@ fn pushed_over_a_let_go(
     derivation_ended(&daemon, repository),
     "the create's derivation behind it ended"
   );
+  crate::daemon::observe_first(&daemon, between);
   let (received, _, _, driven) = crate::test_store::run_on_first(
     &daemon,
     move || async move {
@@ -2000,6 +2011,584 @@ fn b3_an_admission_turn_over_a_let_go_tag_answers_not_ready_and_notes_the_push_a
   assert!(!ready, "not ready over its let-go window");
   assert!(noted.is_some(), "the let-go noted in the push's own slot");
   assert!(!shared, "nothing on the repository's shared slot");
+}
+
+/// B4 of the landed let-go's lift (main's order of 2026-11-26; w-git's read sweep: the policy's reads, `store::protect`
+/// `signature_refused` through `bytes_of`, refused on a let-go window, and the verdict declined the command
+/// `Unjudged`). Do: from A-644's golden vectors (`crates/git/fixtures/protected`, the `signed` scenario, its commits
+/// signed by the trusted key), create `refs/heads/base` at `second`, the pack laid so `second`'s and `first`'s commits
+/// lie in a window apart from their trees ([`signed_base_create`]); once its derivation has ended, set a policy denying
+/// unsigned commits on `main` that trusts the fixtures' key; let every window go in the next push's task; then create
+/// `main` at `third`, its pack the scenario's. The policy judges `third`, then `second` and `first` through their
+/// let-go window, which the command's preparation never reads (it reads `third` and `base`'s trees). Expect: `ok`,
+/// every commit signed by the trusted key, the window brought back by the push's own driver. Red before: `ng
+/// refs/heads/main`, "its commits cannot be read".
+#[test]
+fn b4_a_signed_commits_rule_reading_a_let_go_commit_brings_it_back_and_judges_it() {
+  let (created, driven, refused) = pushed_over_a_let_go_after(
+    "let-go-signed",
+    |window| {
+      let (create, pack, second) = signed_base_create(window);
+      let (third, objects) = signed_third();
+      let request = request(
+        &[("", &third.to_string(), b"refs/heads/main")],
+        CAPABILITIES,
+        &pack_of_objects(&objects),
+      );
+      ((create, pack, second), request)
+    },
+    |state| signed_commits_on_main(state, "let-go-signed"),
+  );
+  assert_eq!(
+    reasons(&created),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    created.outcomes
+  );
+  assert!(driven > 0, "the push's own driver brought the window back");
+}
+
+/// Sets repository `name`'s policy: unsigned commits denied on `refs/heads/main`, the A-644 fixtures' trusted key its
+/// one signer.
+fn signed_commits_on_main(state: &mut ShardState, name: &str) {
+  let line = include_str!("../../../git/fixtures/protected/trusted.pub");
+  let field = line.split_whitespace().nth(1).expect("the key's base64");
+  let blob = crate::signed_work::base64_decode(field).expect("the key's blob");
+  let reply = dispatch(
+    state,
+    1,
+    &owner(),
+    RequestBody::SetRepositoryPolicy {
+      repository: name.to_owned(),
+      read: 0,
+      rules: vec![deny(PolicyRight::UnsignedCommit, "refs/heads/main")],
+      hooks: Vec::new(),
+      hooks_env: Vec::new(),
+      signers: vec![blob],
+      hg_publishing: true,
+    },
+  );
+  assert_eq!(reply, ReplyBody::Acknowledged);
+}
+
+/// The objects of A-644's `signed` scenario's repository before its push (`first` and `second`, signed by the trusted
+/// key, their trees and blobs), as a create of `refs/heads/base` at `second` whose pack lays every tree and blob, a
+/// filler blob of [`FILLER_WINDOWS`] content store windows (each `window` bytes) of bytes that do not compress, then
+/// the commits, so the commits lie in no window a tree does: the request, its pack, and `second`'s id.
+fn signed_base_create(window: usize) -> (Vec<u8>, Vec<u8>, ObjectId) {
+  use slates_git::object_name::Kind;
+  let before = include_bytes!("../../../git/fixtures/protected/signed.before.pack");
+  let refs = include_str!("../../../git/fixtures/protected/signed.before.refs");
+  let second = named(refs.split_whitespace().next().expect("main's id"));
+  let objects = fixture_objects(before);
+  let (commits, mut laid): (Vec<_>, Vec<_>) = objects
+    .into_iter()
+    .partition(|(kind, _)| *kind == Kind::Commit);
+  laid.push((
+    Kind::Blob,
+    crate::vcs_store::tests::incompressible(window * FILLER_WINDOWS),
+  ));
+  laid.extend(commits);
+  let pack = pack_of_objects(&laid);
+  let create = request(
+    &[("", &second.to_string(), b"refs/heads/base")],
+    CAPABILITIES,
+    &pack,
+  );
+  (create, pack, second)
+}
+
+/// A-644's `signed` scenario's pushed objects (`third`, signed by the trusted key, its tree and blob) and `third`'s id,
+/// from what its `git push` sent.
+fn signed_third() -> (ObjectId, Vec<(slates_git::object_name::Kind, Vec<u8>)>) {
+  let sent = include_bytes!("../../../git/fixtures/protected/signed.request.bin");
+  let at = sent
+    .windows(4)
+    .position(|magic| magic == b"PACK")
+    .expect("its pack");
+  let line = String::from_utf8_lossy(&sent[4..at]).into_owned();
+  let third = named(line.split_whitespace().nth(1).expect("its new id"));
+  (third, fixture_objects(&sent[at..]))
+}
+
+/// The objects of a fixture's `pack`, each whole: its type and bytes.
+fn fixture_objects(pack: &[u8]) -> Vec<(slates_git::object_name::Kind, Vec<u8>)> {
+  let unpacked = slates_git::unpack::read_whole(
+    pack,
+    ObjectFormat::Sha1,
+    &slates_git::unpack::NoIndex,
+    &mut slates_git::Admission::new(u64::MAX),
+  )
+  .expect("the fixture's pack");
+  unpacked
+    .objects
+    .into_iter()
+    .map(|object| (object.kind, object.content))
+    .collect()
+}
+
+/// B4's linear rule at its own site (main's ruling of 2026-11-26: the rule's only byte reads are its peels of `to` and
+/// of the old head, which the preparation's peel and base read heal on one push's path; the harm is another party's
+/// let-go between the preparation and the verdict). Do: create `main` and `refs/tags/v1`, the tag in a window of its
+/// own ([`tag_headed_create`]); once its derivation has ended, set a policy denying merge commits on `refs/tags/v1` (a
+/// linear history); on the repository's shard, drive the judge of an update of `refs/tags/v1` to `main`'s commit
+/// (`ServerJudge::ready`) until it answers ready, everything resident; then let the tag's window alone go and ask it
+/// ready again. Expect: not ready, the let-go noted in the push's own slot and nothing on the shared one; the same
+/// let-go met again with nothing brought back between, ready, its verdict the typed refusal; and the window brought
+/// back, ready and its verdict `Ok`. Red before: ready over the let-go tag, the preparation done and nothing re-read,
+/// its verdict declining "its commits cannot be read".
+#[test]
+fn b4_a_linear_rules_check_over_a_let_go_old_tag_waits_for_it_before_its_verdict() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let name = "let-go-linear";
+  let repository = git_repository_on(&daemon, name);
+  let window = crate::daemon::observe_first(&daemon, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .expect("the content store");
+  let (create, pack, (tag, commit)) = tag_headed_create(window);
+  let (created, _) = pushed_in_steps(&daemon, repository, &create).unwrap();
+  assert_eq!(reasons(&created), [b"ok", b"ok"]);
+  assert!(
+    derivation_ended(&daemon, repository),
+    "the create's derivation ended"
+  );
+  crate::daemon::observe_first(&daemon, move |state| {
+    set_policy(
+      state,
+      name,
+      0,
+      (
+        vec![deny(PolicyRight::MergeCommit, "refs/tags/v1")],
+        Vec::new(),
+      ),
+    );
+  });
+  let window_of_tag = (
+    slates_vcs::ContentId::of(&pack),
+    tag_window(&pack, window, &tag),
+  );
+  let laid = (
+    slates_vcs::ContentId::of(&pack),
+    u64::try_from(pack.len()).unwrap(),
+    u64::try_from(window).unwrap(),
+  );
+  let answered = crate::test_store::run_on_first(
+    &daemon,
+    move || async move { judged_over_a_let_go(repository, (tag, commit), (window_of_tag, laid)).await },
+    HISTORY_PATIENCE,
+  );
+  daemon.stop();
+  let (not_ready, (noted, shared), (brought_ready, verdict), (again_ready, refused)) = answered;
+  assert!(not_ready, "not ready over the let-go tag");
+  assert!(noted, "the let-go noted in the push's own slot");
+  assert!(!shared, "nothing on the repository's shared slot");
+  assert!(brought_ready, "ready once the window is back");
+  assert_eq!(verdict, Ok(()), "its verdict once the window is back");
+  assert!(again_ready, "the same let-go met twice: ready");
+  assert!(
+    refused
+      .as_ref()
+      .is_err_and(|words| words.contains("its commits cannot be read")),
+    "the same let-go met twice: the typed refusal: {refused:?}"
+  );
+}
+
+/// The content id of the window of `pack` (`window` bytes each) the annotated tag `tag` lies in, found by its bytes.
+fn tag_window(pack: &[u8], window: usize, tag: &ObjectId) -> slates_vcs::ContentId {
+  let (_, bytes) = tag_object("v1", (*tag, "commit"));
+  let _ = bytes;
+  let found = pack
+    .windows(4)
+    .enumerate()
+    .filter(|(_, magic)| *magic == b"tag ")
+    .map(|(at, _)| at)
+    .next_back()
+    .expect("the tag's bytes");
+  let index = found / window;
+  slates_vcs::ContentId::of(pack.chunks(window).nth(index).expect("its window"))
+}
+
+/// On repository `repository`'s shard, the judge of an update of `refs/tags/v1` from `tag` to `commit` driven a ready
+/// at a time over a sealed empty push, its let-go windows brought back from the push's own slot as an edge does, until
+/// it answers ready; then every window of the pack `laid` names (its identity, length and window) brought back, its
+/// window `away` let go and the repository idle, and ready asked; asked again with nothing brought back between, and
+/// judged; then the window it noted brought back, ready asked and judged. What each answered.
+async fn judged_over_a_let_go(
+  repository: RepositoryId,
+  (tag, commit): (ObjectId, ObjectId),
+  (away, laid): (
+    (slates_vcs::ContentId, slates_vcs::ContentId),
+    (slates_vcs::ContentId, u64, u64),
+  ),
+) -> (
+  bool,
+  (bool, bool),
+  (bool, Result<(), String>),
+  (bool, Result<(), String>),
+) {
+  let mut judging = Judging::new(repository, (tag, commit));
+  let began = std::time::Instant::now();
+  while !judging.ready() {
+    assert!(began.elapsed() < HISTORY_PATIENCE, "the judge never ready");
+    crate::vcs_store::upload::brought_back_own(judging.waits.take()).await;
+    slates_rt::futures::yield_now().await;
+  }
+  // The derivation behind the create let the pack go: its home told it landed once, then every window brought back,
+  // so the tag's alone is let go next.
+  let (_, _, window) = laid;
+  on_state(|state| crate::vcs_store::homes::landed_pack_here(state, away.0));
+  let (pack, pack_len) = on_state(|state| {
+    let (content, store) = state.vcs_stores.git_ref(repository).expect("the git store");
+    match store.repository.stored(content, &tag) {
+      Some((_, slates_git::store::StoredAt::InPack(place), _)) => (place.pack, place.len),
+      _ => panic!("the tag in a pack"),
+    }
+  });
+  for index in 0..pack_len.div_ceil(window) {
+    let waited = slates_git::store::packed::Waited {
+      pack,
+      len: pack_len,
+      offset: index * window,
+    };
+    let _ = crate::vcs_store::read_through::bring_back_window(waited).await;
+  }
+  on_state(|state| let_go_window(state, repository, away));
+  let not_ready = !judging.ready();
+  let shared = on_state(|state| {
+    state
+      .vcs_stores
+      .git(repository)
+      .and_then(|(_, store)| store.repository.peek_waiting())
+      .is_some()
+  });
+  let noted = judging.waits.take();
+  let was_noted = noted.is_some();
+  // The same let-go met again with nothing brought back between: ready, its verdict the typed refusal.
+  let again_ready = judging.ready();
+  let refused = judging.verdict();
+  let _ = judging.waits.take();
+  crate::vcs_store::upload::brought_back_own(noted).await;
+  let brought_ready = judging.ready();
+  let verdict = judging.verdict();
+  on_state(|state| judging.sealed.take().map(|sealed| sealed.abandon(state)));
+  (
+    not_ready,
+    (was_noted, shared),
+    (brought_ready, verdict),
+    (again_ready, refused),
+  )
+}
+
+/// The window of repository `repository`'s pack `away` names (the pack's identity and the window's) let go by hand, as
+/// a landed pack's let-go lets it go (its home told before, [`judged_over_a_let_go`]; the window marked landed), and
+/// what the repository's reads keep lately given back, so no read is served from it.
+fn let_go_window(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  away: (slates_vcs::ContentId, slates_vcs::ContentId),
+) {
+  let (_, window) = away;
+  crate::vcs_store::within_budget(state, 0, |stores| {
+    if let Some(content) = stores.content_mut() {
+      content.mark_landed(&window);
+    }
+  });
+  // Already let go is let go: the derivation behind the create lets go at its end the windows it brought back.
+  let _ = crate::vcs_store::let_go_read(state, &window);
+  let away = state
+    .vcs_stores
+    .content()
+    .is_some_and(|content| content.is_away(&window));
+  assert!(away, "the window let go");
+  // What its reads keep lately given back alone (`git_encode::give_back_idle` would let the whole landed pack go too).
+  if let Some((content, store)) = state.vcs_stores.git(repository) {
+    let _ = store.repository.let_go_recent(content);
+  }
+}
+
+/// What [`ServerJudge`] keeps across a push's steps, for one command judged by hand ([`judged_over_a_let_go`]).
+struct Judging {
+  repository: RepositoryId,
+  command: slates_git::receive::Command,
+  sealed: Option<crate::vcs_store::SealedPush>,
+  hooks: super::HookVerdicts,
+  admitting: Option<slates_git::store::Admitting>,
+  restaging: Option<slates_git::store::Staging>,
+  preparing: Option<slates_git::receive::works::Preparing>,
+  peel_away: Option<u64>,
+  policy_away: Option<u64>,
+  making_room: Option<Vec<slates_db::catalog::VolumeId>>,
+  door: Option<slates_db::catalog::VolumeId>,
+  waits: slates_git::away::Waits,
+}
+
+impl Judging {
+  /// The judge of an update of `refs/tags/v1` in `repository` from `tag` to `commit`, over a sealed empty push.
+  fn new(repository: RepositoryId, (tag, commit): (ObjectId, ObjectId)) -> Self {
+    let sealed = on_state(|state| {
+      crate::vcs_store::GitPush::begin(&state.vcs_stores, repository)
+        .expect("a git store")
+        .seal(state)
+        .expect("sealed")
+    });
+    Self {
+      repository,
+      command: slates_git::receive::Command {
+        old: tag,
+        new: commit,
+        name: b"refs/tags/v1".to_vec(),
+      },
+      sealed: Some(sealed),
+      hooks: super::HookVerdicts::default(),
+      admitting: None,
+      restaging: None,
+      preparing: None,
+      peel_away: None,
+      policy_away: None,
+      making_room: None,
+      door: None,
+      waits: slates_git::away::Waits::default(),
+    }
+  }
+
+  /// One `ready` of the judge, made for the call over what it keeps.
+  fn ready(&mut self) -> bool {
+    self.with_judge(|judge, command, pushed| {
+      slates_git::receive::Judge::ready(judge, command, pushed)
+    })
+  }
+
+  /// The judge's verdict: `Ok` where it judged an entry, else its refusal's words.
+  fn verdict(&mut self) -> Result<(), String> {
+    self.with_judge(|judge, command, pushed| {
+      slates_git::receive::Judge::judge(judge, command, pushed)
+        .map(|_| ())
+        .map_err(|declined| String::from_utf8_lossy(&declined.hook).into_owned())
+    })
+  }
+
+  /// `act` over the judge made of what this keeps, on the shard's state.
+  fn with_judge<T>(
+    &mut self,
+    act: impl FnOnce(
+      &mut super::ServerJudge<'_>,
+      &slates_git::receive::Command,
+      &slates_git::receive::Pushed<'_>,
+    ) -> T,
+  ) -> T {
+    let repository = self.repository;
+    on_state(|state| {
+      let record = super::record_of(state, repository).expect("the record");
+      let pushed =
+        slates_git::receive::Pushed::new(&[], None, &mut slates_git::Admission::new(u64::MAX))
+          .expect("pushed");
+      let mut judge = super::ServerJudge {
+        state,
+        push: self.sealed.as_mut().expect("the push"),
+        record: &record,
+        principal: &owner(),
+        name: [0; 32],
+        hooks: &mut self.hooks,
+        admitting: &mut self.admitting,
+        restaging: &mut self.restaging,
+        preparing: &mut self.preparing,
+        peel_away: &mut self.peel_away,
+        policy_away: &mut self.policy_away,
+        making_room: &mut self.making_room,
+        door: &mut self.door,
+        waits: &self.waits,
+      };
+      act(&mut judge, &self.command, &pushed)
+    })
+  }
+}
+
+/// B4's linear rule's healed path, kept as its net (main's ruling of 2026-11-26): on one push's path the rule's reads
+/// (its peels of the new value and of the old head) meet what the preparation's peel and base read brought back. Do:
+/// create `main` and `refs/tags/v1`, the tag in a window of its own ([`tag_headed_create`]); once its derivation has
+/// ended, set a policy denying merge commits on `refs/tags/v1`; let every window go in the next push's task; update
+/// `refs/tags/v1` to another annotated tag of `main`'s commit. Expect: `ok`.
+#[test]
+fn b4_a_linear_rules_update_of_a_let_go_tag_head_lands() {
+  let (updated, _, refused) = pushed_over_a_let_go_after(
+    "let-go-linear-net",
+    |window| {
+      let (create, pack, (tag, commit)) = tag_headed_create(window);
+      let (new, bytes) = tag_object("v1 again", (commit, "commit"));
+      let request = request(
+        &[(&tag.to_string(), &new.to_string(), b"refs/tags/v1")],
+        CAPABILITIES,
+        &pack_of_objects(&[(slates_git::object_name::Kind::Tag, bytes)]),
+      );
+      ((create, pack, tag), request)
+    },
+    |state| {
+      set_policy(
+        state,
+        "let-go-linear-net",
+        0,
+        (
+          vec![deny(PolicyRight::MergeCommit, "refs/tags/v1")],
+          Vec::new(),
+        ),
+      );
+    },
+  );
+  assert_eq!(
+    reasons(&updated),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    updated.outcomes
+  );
+}
+
+/// B5 of the landed let-go's lift (main's order of 2026-11-26; w-git's read sweep: `views::PushedObjects::bytes` of a
+/// pushed object answered `Malformed` where `Push::bytes` met a let-go window, noting nothing, so the verdict's build
+/// refused the command). On one push's own path the push's reads keep the pushed tree its checks resolved, so the build
+/// reads it kept; it bites once the push's read cache has turned that tree over. Its red at its site: do, after
+/// [`thin_update_over_a_create`]'s create, let every window of its pack go; hand a push that has read nothing the
+/// update's thin pack (its new tree a REF_DELTA against the create's tree) and admit each object where it lies; read
+/// the new tree through the view the verdict's build reads (`PushedObjects::tree`). Expect: not yet
+/// (`Unavailable::NotYet`), the let-go noted in the push's own slot and nothing on the repository's shared one. Red
+/// before: `Malformed`.
+#[test]
+fn b5_a_pushed_delta_read_over_a_let_go_base_is_not_yet_and_noted_for_the_push() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository = git_repository_on(&daemon, "pushed-delta-away");
+  let (first, objects) = flat_commit(THIN_TREE_FILES, "base", None);
+  let pack = pack_of_objects(&objects);
+  let create = request(
+    &[("", &first.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack,
+  );
+  let (created, _) = pushed_in_steps(&daemon, repository, &create).unwrap();
+  assert_eq!(reasons(&created), [b"ok"]);
+  assert!(
+    derivation_ended(&daemon, repository),
+    "the create's derivation ended"
+  );
+  let (thin, (tree_id, tree)) = thin_tree_entries(&objects[1].1);
+  let (read, noted, shared) = crate::daemon::observe_first(&daemon, move |state| {
+    let _ = let_go_by_hand(state, &pack);
+    if let Some((content, store)) = state.vcs_stores.git(repository) {
+      let _ = store.repository.let_go_recent(content);
+    }
+    let mut push = slates_git::store::Push::new(ObjectFormat::Sha1);
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().expect("the content store");
+      push.extend_pack(content, &thin.0).expect("the pack put");
+    });
+    let naming = slates_git::store::GitNaming {
+      format: ObjectFormat::Sha1,
+    };
+    let (content, store) = state.vcs_stores.git_ref(repository).expect("the git store");
+    for (offset, kind, bytes, depth) in &thin.1 {
+      let incoming = slates_git::store::Incoming {
+        kind: *kind,
+        claimed: None,
+        content: bytes,
+        depth: *depth,
+      };
+      push
+        .admit_placed::<_, std::convert::Infallible>(content, &naming, (incoming, *offset))
+        .expect("admitted");
+    }
+    let waits = slates_git::away::Waits::default();
+    let objects = slates_git::store::views::PushedObjects::new(&store.repository, content, &push)
+      .noting(&waits);
+    let key = slates_merge::push::ObjectKey::new(tree_id.as_bytes()).expect("its key");
+    let read = slates_merge::push::PushObjects::tree(&objects, key).map(|entries| entries.len());
+    let _ = tree;
+    let shared = store.repository.peek_waiting().is_some();
+    (read, waits.peek().is_some(), shared)
+  });
+  daemon.stop();
+  assert_eq!(
+    read,
+    Err(slates_merge::push::Unavailable::NotYet),
+    "not yet over the let-go base"
+  );
+  assert!(noted, "the let-go noted in the push's own slot");
+  assert!(!shared, "nothing on the repository's shared slot");
+}
+
+/// The thin pack of [`thin_update_over_a_create`]'s update over the create's tree `base`: its bytes and each entry's
+/// offset, type, whole bytes and delta depth (the new tree a REF_DELTA against `base`, which the pack does not carry);
+/// and the new tree's id and bytes.
+#[allow(clippy::type_complexity)]
+fn thin_tree_entries(
+  base: &[u8],
+) -> (
+  (
+    Vec<u8>,
+    Vec<(u64, slates_git::object_name::Kind, Vec<u8>, u64)>,
+  ),
+  (ObjectId, Vec<u8>),
+) {
+  use slates_git::object_name::{Kind, name_of};
+  let blob = b"added\n".to_vec();
+  let mut tree = base.to_vec();
+  tree.extend_from_slice(b"100644 zz\0");
+  tree.extend_from_slice(
+    name_of(ObjectFormat::Sha1, Kind::Blob, &blob)
+      .unwrap()
+      .as_bytes(),
+  );
+  let tree_id = name_of(ObjectFormat::Sha1, Kind::Tree, &tree).unwrap();
+  let delta = slates_git::store::delta_of(base, &tree).expect("a delta shorter than the tree");
+  let base_id = name_of(ObjectFormat::Sha1, Kind::Tree, base).unwrap();
+  let entries = [
+    (Entry::Ref(base_id), delta, Kind::Tree, tree.clone(), 1u64),
+    (
+      Entry::Whole(Kind::Blob),
+      blob.clone(),
+      Kind::Blob,
+      blob,
+      0u64,
+    ),
+  ];
+  let laid: Vec<(Entry, Vec<u8>)> = entries
+    .iter()
+    .map(|(entry, data, ..)| (*entry, data.clone()))
+    .collect();
+  let (pack, offsets) = entries_pack_at(&laid);
+  let objects = entries
+    .into_iter()
+    .zip(offsets)
+    .map(|((_, _, kind, bytes, depth), offset)| (offset, kind, bytes, depth))
+    .collect();
+  ((pack, objects), (tree_id, tree))
+}
+
+/// B5's healed path, kept as its net: on one push's own path its reads keep the pushed tree its checks resolved, so the
+/// verdict's build reads it kept. Do: [`b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands`]'s update,
+/// every window of the first push's pack let go once its verdicts are being decided ([`LetGoAt::Deciding`]). Expect:
+/// `ok`.
+#[test]
+fn b5_a_verdicts_build_of_a_pushed_delta_over_a_let_go_base_lands() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, update, pack) = thin_update_over_a_create(&daemon, "thin-verdict-away");
+  let (updated, _, _, _) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let_go_when(repository, &update, (&pack, LetGoAt::Deciding, Meddle::Not)).await
+    },
+    HISTORY_PATIENCE,
+  )
+  .unwrap();
+  let refused = crate::daemon::observe_first(&daemon, bring_backs_refused);
+  daemon.stop();
+  assert_eq!(
+    reasons(&updated),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    updated.outcomes
+  );
 }
 
 /// B3's healed path, kept as its net (main's ruling of 2026-11-26): a create at a commit a green holds is made at that
@@ -2254,6 +2843,11 @@ enum Entry {
 
 /// A pack of `entries`, each its data in stored zlib blocks, in order.
 fn entries_pack(entries: &[(Entry, Vec<u8>)]) -> Vec<u8> {
+  entries_pack_at(entries).0
+}
+
+/// [`entries_pack`], with where each entry begins in it.
+fn entries_pack_at(entries: &[(Entry, Vec<u8>)]) -> (Vec<u8>, Vec<u64>) {
   use slates_git::entry::{self, Header, Representation};
   let mut pack = Vec::new();
   let count = u32::try_from(entries.len()).unwrap();
@@ -2279,7 +2873,7 @@ fn entries_pack(entries: &[(Entry, Vec<u8>)]) -> Vec<u8> {
     at += entry::written_len(header, at).unwrap() + u64::try_from(zlib.len()).unwrap();
   }
   writer.finish().unwrap();
-  pack
+  (pack, begun)
 }
 
 /// What another reader of the repository does at the push's first stop after its let-go, in [`let_go_at_its_checks`].
@@ -2317,6 +2911,8 @@ enum LetGoAt {
   Admitted(ObjectId),
   /// Before the push began: its test let the pack go itself, and `let_go` is empty.
   Already,
+  /// Once the push's pack is checked and sealed and its verdicts are being decided.
+  Deciding,
 }
 
 /// [`let_go_at_its_checks`], the pack let go at `at`.
@@ -2380,6 +2976,7 @@ fn is_due(push: &ReceivePack, at: LetGoAt) -> bool {
       .as_ref()
       .is_some_and(|quarantine| quarantine.quarantine().object(&id).is_some()),
     LetGoAt::Already => true,
+    LetGoAt::Deciding => matches!(push.answer, super::AnswerState::Deciding(_)),
   }
 }
 

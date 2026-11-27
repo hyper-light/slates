@@ -805,12 +805,13 @@ fn a_claim_begun_before_a_restart_judges_the_daemon_that_answered_it_alive() {
   let instance = format!("test-claim-restart-{}", std::process::id());
   let held = HeldRendezvous::hold(&instance).unwrap();
   let exe = std::env::current_exe().unwrap();
-  let status = Command::new(exe)
+  let mut child = Command::new(exe);
+  child
     .args(["--exact", "rendezvous_restart_child", "--nocapture"])
     .env(CHILD_RESTART_ROLE, &instance)
-    .env(ENV_RENDEZVOUS, held.adoption().env_value())
-    .status()
-    .unwrap();
+    .env(ENV_RENDEZVOUS, held.adoption().env_value());
+  hand_on_in_child(&mut child, held.handed_descriptor());
+  let status = child.status().unwrap();
   assert!(
     status.success(),
     "the client judged the daemon that answered its claim alive: {status:?}"
@@ -1485,3 +1486,80 @@ fn a_socket_file_a_dead_owner_left_is_replaced_and_a_live_ones_is_not() {
     "a claim connects through the replaced node"
   );
 }
+
+/// A held rendezvous reaches no child but its daemon (the TSan lane, 2026-11-27: in diagnostics run 45991805330 a
+/// listening socket, flags 04002 and no close-on-exec, was held by both children of the spawner's parity test; this
+/// test, red in run 45993337450, found its unrelated shell holding the held socket, inode 16158 at the instance's
+/// abstract address `@slates-rv-rv-inherit-…`, flags 04002). Do: hold an instance's rendezvous as an anchor does; spawn an unrelated child, a
+/// shell that lists every descriptor it holds by target. Expect: the child holds no descriptor of the held socket, named
+/// by its inode (`socket:[N]`). Linux, where the held rendezvous is a listening socket; elsewhere it is a bootstrap
+/// object no child inherits.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_child_spawned_beside_a_held_rendezvous_holds_none_of_it() {
+  let instance = format!("rv-inherit-{}", std::process::id());
+  let held = HeldRendezvous::hold(&instance).unwrap();
+  let number = held.adoption().env_value().to_owned();
+  let socket = std::fs::read_link(format!("/proc/self/fd/{number}"))
+    .unwrap()
+    .display()
+    .to_string();
+  let flags = std::fs::read_to_string(format!("/proc/self/fdinfo/{number}")).unwrap_or_default();
+  let inode = socket
+    .trim_start_matches("socket:[")
+    .trim_end_matches(']')
+    .to_owned();
+  let address = std::fs::read_to_string("/proc/net/unix")
+    .unwrap_or_default()
+    .lines()
+    .find(|line| line.split_whitespace().nth(6) == Some(inode.as_str()))
+    .unwrap_or_default()
+    .to_owned();
+  let flags = flags
+    .lines()
+    .find_map(|line| line.strip_prefix("flags:"))
+    .unwrap_or_default()
+    .trim();
+  eprintln!(
+    "HELD-RENDEZVOUS descriptor {number} {socket}, flags {flags}; /proc/net/unix: {address}"
+  );
+  let listed = Command::new("sh")
+    .args(["-c", "for f in /proc/$$/fd/*; do readlink \"$f\"; done"])
+    .output()
+    .unwrap();
+  let listed = String::from_utf8_lossy(&listed.stdout);
+  assert!(
+    !listed.lines().any(|line| line == socket),
+    "the child holds the held rendezvous {socket}:\n{listed}"
+  );
+  drop(held);
+}
+
+/// Hands the held rendezvous's descriptor, if it has one, to the child `command` spawns alone, as an anchor's spawn of
+/// its daemon does (`slates_anchor`'s `hand_on_in_child`): it is close-on-exec here, so the child holds it only once its
+/// flag is cleared in the child, between the fork and the exec.
+#[cfg(unix)]
+fn hand_on_in_child(command: &mut Command, number: Option<i32>) {
+  use std::os::unix::process::CommandExt;
+  let Some(number) = number else {
+    return;
+  };
+  // SAFETY: the closure runs in the child between its fork and its exec and makes one `fcntl(F_SETFD)` on `number`,
+  // which was copied in before the fork: no allocation, no lock and no other state, as `pre_exec` asks. The number is
+  // open in the child, whose descriptor table the fork copied from this process, where the held rendezvous keeps it
+  // open across the spawn; the flag cleared is the child's own.
+  unsafe {
+    command.pre_exec(move || {
+      rustix::io::fcntl_setfd(
+        std::os::fd::BorrowedFd::borrow_raw(number),
+        rustix::io::FdFlags::empty(),
+      )?;
+      Ok(())
+    });
+  }
+}
+
+/// See the Unix arm: no descriptor is handed on Windows, where the rendezvous is found by name.
+#[cfg(not(unix))]
+fn hand_on_in_child(_command: &mut Command, _number: Option<i32>) {}

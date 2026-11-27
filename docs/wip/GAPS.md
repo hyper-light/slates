@@ -84,6 +84,12 @@
 >   - `an_anchor_started_again_and_again_hands_each_daemon_its_objects_once`: `[8, 8]` after 7 starts, then `[1, 1]`.
 >   - `a_claim_refused_for_want_of_a_descriptor_leaves_none_of_its_region`: `remaining=1`, then 0.
 >   - Doc: docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md.
+> - **Amended 2026-11-27 (A-931, w-interop; main's TSan sweep):** what A-878 left inheritable in the anchor (its
+>   listeners, the rendezvous, its hold table) reached every child of a process an anchor shares (tests, embeddings):
+>   an unrelated shell held a held rendezvous (run 45993337450). Each is now close-on-exec in the anchor and cleared in
+>   the daemon's child alone, on every Unix. Red then green: `a_child_spawned_beside_a_held_rendezvous_holds_none_of_it`;
+>   with it `a_held_listener_reaches_its_daemon_alone`. OWED (main): the TSan lane and the anchor's cross-process tests
+>   on Linux. Doc: docs/bugs/2026-11-27-an-anchors-held-sockets-reached-every-child-of-their-holders-process.md.
 > **Open (Windows, recorded, not changed):** a map reply whose operation was abandoned is dropped on arrival
 > (`Client::buffer`'s `unawaited_dropped` branch), so the section handle the daemon duplicated into the client stays in
 > its table, and the daemon keeps the copy for the client until its release or reap. Closing the handle there is one
@@ -632,9 +638,36 @@
 >   The healed path's net: `b3_a_create_at_a_commit_a_green_holds_lands_over_let_go_windows`,
 >   `b3_a_create_whose_base_search_runs_over_a_let_go_commit_lands`,
 >   `b3_a_merge_whose_admission_walks_a_let_go_parent_brings_it_back_and_lands`.
-> - OPEN: B4 (the policy's reads), B5 (`PushedObjects::bytes` of a pushed object, `Malformed`), B6 (a verdict's one-call
->   build), B7 (`push_of`'s peel at judge time, after `prepare`'s), B8 (the encoding's tree walk: time, not
->   correctness).
+> - **B4 BUILT (w-git, 2026-11-27): the policy's reads.** A rule requiring signed commits or a linear history (A-644) is
+>   judged in the verdict (`ServerJudge::admitted`), whose reads go through `Repository::bytes_of`: a let-go commit or
+>   tag declined the command `Unjudged` ("its commits cannot be read"). A signed-commits rule reads every commit a move
+>   brings, below a tip a trusted key signed too, which the command's preparation never reads; a linear history reads
+>   bytes only for its peels of an annotated tag at the new value or the old head (a commit's parents come from its
+>   row), which the preparation's `peel_away` and `base_of` read first in the same `ServerJudge::ready`, so on one
+>   push's path it heals and bites only on another party's let-go between the preparation and the verdict. Now `ready`
+>   asks the policy's check last, once the command is otherwise ready, its reads quiet (`Repository::reading_quietly`),
+>   a let-go it meets noted in the push's own slot and the command not ready by the one rule keyed by its number
+>   (`DecidingPush::policy_away`), so the verdict in the same step reads what the check read; the check is shared
+>   (`git_push::policy_check`). Reds:
+>   `git_push::tests::b4_a_signed_commits_rule_reading_a_let_go_commit_brings_it_back_and_judges_it` (A-644's golden
+>   `signed` vectors, `second` and `first` in a window of their own: declined before, `ok` after) and, at the judge's
+>   own site, `b4_a_linear_rules_check_over_a_let_go_old_tag_waits_for_it_before_its_verdict` (ready over the let-go old
+>   tag before, the verdict `Unjudged`; after, not ready with the push's slot noted and the shared one empty, the same
+>   let-go twice its typed refusal, brought back its verdict `Ok`). The healed path's net:
+>   `b4_a_linear_rules_update_of_a_let_go_tag_head_lands`. The reds were taken with the policy step alone disabled
+>   (`true || policy_ready`), the tests needing its new field to compile.
+> - **B5 BUILT (w-git, 2026-11-27): a pushed object read through the verdict's view.** `views::PushedObjects::bytes` of
+>   a pushed object answered `Malformed` where `Push::bytes` met a let-go window (a REF_DELTA's base outside the push),
+>   noting nothing, so the verdict's build refused the command. On one push's own path its reads keep the pushed tree
+>   its checks resolved, so the build reads it kept; it bites once the push's read cache has turned that tree over. Now
+>   the refusal that met a let-go is not yet (`Unavailable::NotYet`), noted for the view's owner as the indexed arm's is
+>   (the push's own slot, `PushedObjects::noting`), and the preparation waits on it; any other refusal stays
+>   `Malformed`. Red at the site:
+>   `git_push::tests::b5_a_pushed_delta_read_over_a_let_go_base_is_not_yet_and_noted_for_the_push` (a push that has read
+>   nothing over the create's let-go pack: `Malformed` before; `NotYet`, the push's slot noted and the shared one empty,
+>   after). Net: `b5_a_verdicts_build_of_a_pushed_delta_over_a_let_go_base_lands`.
+> - OPEN: B6 (a verdict's one-call build), B7 (`push_of`'s peel at judge time, after `prepare`'s), B8 (the encoding's
+>   tree walk: time, not correctness).
 > **P OPEN (w-git; main's r229, 2026-11-23): git/git's HTTP mirror clone takes about 100 s** (97.9 and 107.7 s, 556 MB
 > against stock git's 612 MB; the work clone 92.9 and 97.2 s), the daemon CPU-bound at 97% of one core: blake3,
 > `Index::get`, `ContentStore::get` / `len_of` / `window_at_in`, `Positions::settle`. No stall; to be profiled.
@@ -840,11 +873,12 @@
 > in one free (1.2-1.3 ms of system time in release); since the reaper, what a release frees is dropped on the daemon's
 > reaper thread (25 µs the longest unit, debug), owed probe 18's release read. The shard's handed and in-place counts are
 > read by the tests alone, not yet the status report. Move's `stage.committing` was the commit's node moves, a walk of
-> every effect in one unit (7.99 ms debug), which walks nothing since where no node has a link; a green with a link
-> anywhere still walks every effect whole there, its slicing next by main's ruling. `landing.apply`'s remaining unit
+> every effect in one unit (7.99 ms debug), which walks nothing since where no node has a link, and an effect a unit
+> where one has. `landing.apply`'s remaining unit
 > was its begin's plan of a replay's reads (4.46 ms debug), made since only where a run is unread; a replay's plan and
-> the scan of the runs are still one unit each, owed their slicing. Next: the node moves sliced; then by size
-> `stage.judging` (5.8 ms debug, move), `stage.recording` (5.0-5.3) and `stage.check` (3.8-4.2); the landing's
+> the scan of the runs are still one unit each, owed their slicing. Next, by size:
+> `stage.judging` (5.8 ms debug, move: a directory removal's children are counted a unit a step since; the resolution's
+> end, `split_copies`, 5.86 ms whole, is left), `stage.recording` (5.0-5.3) and `stage.check` (3.8-4.2); the landing's
 > publication (9.3-24.8 ms since today's merges) is A-930's image cut, w-perf's. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
@@ -2272,6 +2306,18 @@
 > manifest was pushed as a delta, let go; two more pushed in one changegroup, each manifest a client's delta, asks
 > answered from the store alone: red, refused on the first's manifest itself; now both taken). File revisions are not of
 > this shape: a file row holds its whole text, and one this push kept is pinned unlanded.
+> Found by w-perf's harness hunting main's 57k intake hang and fixed (2026-11-27, main's ruling the same day): the chain
+> above an asked link is read from the fork once the store answers, and a segment that lands between the ask and that
+> read (the server lands segments between slices, after the slice that asked and before the one that uses the answer)
+> lets go a row above the link, so the push was refused `UnknownDeltaBase { log: Manifests }`, a transient refused as
+> final. Now `Taker::bring_in` asks again, once, for the topmost link let go then, which, landed, the store keeps
+> (`Base::Asked::again`); a chain that fails so a second time, or a link that did not move, is refused as before, since
+> an ask made again without bound is a livelock's shape. Counted `vcs.hg.push_log_texts_reasked`
+> (`Intaken::log_texts_reasked`). Held by
+> `a_pushs_logs_taken_while_its_segments_land_ask_the_store_a_bounded_number_of_times` (an 80-changeset line over let-go
+> logs, driven as the server drives it, the cut segments landed every 2, 3, 5, 8 and 16 steps: red, refused landing
+> every 2 steps after 3 asks and 96 steps; now every cadence taken, 79 to 119 asks, 6 to 41 asked again). OWED: whether
+> this race is also main's 57k hang (a stack of the hung build, main's).
 > C1 (2), second piece BUILT (main's ruling (B') of 2026-11-24): a push's manifest is taken a window a step and never
 > whole. Its text is made by `delta::Patching` over its base read front to back over its chain (`push::chain_read`, the
 > chain's deltas loaded: at most the base's length, A-729's bound); its lines checked and its written entries found as it

@@ -124,6 +124,7 @@ pub(crate) enum Marked {
   /// Its second slot.
   SecondSlot = 2,
   /// The delta log.
+  /// Format: its index among the regions.
   Deltas = 3,
 }
 
@@ -920,7 +921,11 @@ fn read_marks(
   let Some(block) = bytes.checked_sub(MARKS_BYTES) else {
     return (MarksFound::Adopted, whole);
   };
-  if header.get(3).copied().flatten() != Some(LAYOUT) || at(block) != Some(MARKS_VERSION) {
+  /// Format: [`AT_LAYOUT`]'s place in the header read above.
+  const LAYOUT_IN_HEADER: usize = 3;
+  if header.get(LAYOUT_IN_HEADER).copied().flatten() != Some(LAYOUT)
+    || at(block) != Some(MARKS_VERSION)
+  {
     return (MarksFound::Adopted, whole);
   }
   let mut marks = whole;

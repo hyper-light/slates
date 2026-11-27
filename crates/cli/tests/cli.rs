@@ -13088,6 +13088,11 @@ fn a_real_anchors_hold_refusals_show_in_slates_status() {
     slates_ipc::rendezvous::ENV_RENDEZVOUS,
     rendezvous.adoption().env_value().to_owned(),
   );
+  // Close-on-exec here, handed on to the daemon's child alone, as the anchor role hands it (A-931).
+  #[cfg(unix)]
+  if let Some(number) = rendezvous.handed_descriptor() {
+    anchor.0.hand_on_descriptor(number);
+  }
   anchor
     .0
     .hold_environment(GARBLING_DAEMON_INSTANCE, instance.clone());

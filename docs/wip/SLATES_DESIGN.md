@@ -62399,6 +62399,8 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   - A descriptor is close-on-exec everywhere except in the one exec that needs it.
   - A hand-off names the object's own descriptor. An open duplicates it and owns the duplicate. A spawn that hands it to
     a child clears close-on-exec in that child alone: the anchor's `hand_on_in_child`, between the fork and the exec.
+    *Amended by A-931 (2026-11-27):* this now holds for everything the anchor hands its daemon, its listeners, the
+    rendezvous and its hold table too, which this entry had left inheritable in the anchor.
   - The daemon's first step at its start makes every descriptor it inherited close-on-exec
     (`confined_spawn::close_inherited_on_exec`); a daemon that cannot does not start.
   - Its own copies are made with `fcntl_dupfd_cloexec`, never a plain `dup`.
@@ -65070,8 +65072,20 @@ GAPS.
     link names, more than 0 for a rename of a linked home, whose links follow it. Red at 3 with the walk unconditional.
   - Debug, after: move's `stage.committing` is out of its eight longest spans (8.55 ms before). `landing.apply` is
     still 4.5 ms in move and 4.8 in copy: another unit, named next.
-  - Left: a green with a link anywhere still walks every effect whole in this unit (a volume push with a hard link in
-    its head; GAPS).
+  - A green with a link anywhere walked every effect whole in this unit (a volume push with a hard link in its head).
+    Main's ruling of 2026-11-27 02:03: a defect by §3 whether a probe finds it or not. Now sliced
+    (`engine/node_moves.rs`, `NodeMoves`), an effect a unit until the step is spent:
+    - the version's links gathered;
+    - each removal, rename and replacement kept only where some link may survive its path, in owned paths, so the
+      walk lives across the beginning's steps;
+    - each kept rename's links named at its new path;
+    - each kept home handed over.
+    A home no link survives moves no node, renamed or not, so the moves are the whole walk's, in its order.
+    `Green::node_moves` is the same walk run to its end (the rebase's `heirs_of`), one implementation.
+    - Counter: `Green::node_moves_units`, the units that walked an effect.
+    - Test `a_wide_renames_node_moves_on_a_linked_green_walk_an_effect_a_unit`: 500 renames on a green holding one
+      link, applied a unit a step, at the version the whole submit committed, the link kept. It walked 1,000 or more
+      effects, one a unit. Red with the walk unstopped: one unit for all of them.
   **An apply begun over runs all read plans no replay's reads.** `landing.apply`'s remaining unit, named (debug): its
   slice's `begin_version` at 4.46 ms in one call. The rest of the apply slice was under 1 ms: reads, runs, the
   retention's settle 17-95 µs and the checkpoint's start 36-64 µs. `Green::begin_applying` planned which named runs a
@@ -65086,6 +65100,24 @@ GAPS.
   - Debug, after: `landing.apply` is out of the eight longest spans of add, copy and move (4.5-4.8 ms before). Their
     leaders now: `landing.publish` (9.3-24.8 ms, A-930's cut copies), then `stage.judging` (5.8, move),
     `stage.recording` (5.0-5.3) and `stage.check` (3.8-4.2).
+  **A directory's removal counts its children, a unit a step.** Move's `stage.judging` named (debug, a probe of each
+  judging part's and each decision phase's longest call): the resolution's end (`Resolved::finish_resolving`, its
+  `split_copies`) at 5.86 ms whole, and the decision's directory removals (`decide_rmdirs_some`) at 4.96 ms in one
+  call. Everything else of the judge was 56 µs or less.
+  The removal's one unit (`merge_rmdir`) walked every key under the directory in each of the head's node maps
+  (`has_live_child`) for one the work does not remove itself: 9,000 files for the move's source directory. Now:
+  - the checks before the children run first (a node of another kind, none, changed since the base);
+  - the head's keys under the directory in each map are counted with no walk (`Ptrie::prefix_len`, a descent each);
+  - the paths the work removes itself under it are counted a path a unit where each map holds them, taken on from the
+    last across steps (`RmdirWalk`), and the unit is pushed when the count ends.
+  A child survives exactly where a map holds more keys under the directory than the count there, so the verdict is the
+  walk's: delete against modify, or the directory removed. `merge_rmdir` and `Green::has_live_child` go: one
+  implementation.
+  - Counter: `Green::rmdir_children`, the children counted and the units that counted them.
+  - Test `a_directorys_removal_counts_its_children_a_unit_a_step` (400 files): computed alike whole and a unit a step,
+    the directory removed, a child a unit; with one file kept, alike both ways and not removed. Red with the count
+    unstopped: the units fewer than the children.
+  - Left in `stage.judging`: the resolution's end (`split_copies`, 5.86 ms whole), next.
   - Left: a replay's plan is still a pass over the entry in one unit, as is the scan of the runs, linear in them. Both
     are owed their slicing by §3.
 
@@ -65981,6 +66013,41 @@ Applied in the same change to:
   `crates/server/tests/fleet.rs`, A-921 part 3's entry, GAPS.
 - **Amended by A-921 part 5** (2026-11-27): A-921's next mode is fixed. The owed-part scene's adoption guard and
   `Daemon::holder_owner` are gone, and A919's owner-restart test runs again.
+
+### A-931 — Everything an anchor holds for its daemon is close-on-exec in the anchor and reaches the daemon's child alone (2026-11-27, w-interop for main 01a20182, its ruling of 2026-11-27 on the TSan lane; amends A-878; §2.6, §4.7, A-114)
+
+- **Why.** A-878 left the anchor's held listeners and its hold table inheritable in the anchor, on the rule that "the
+  anchor's only child is the daemon". That holds for a standalone `slates anchor`. It is false in the holder's process
+  wherever an anchor shares it, which `Adoption`'s doc admits: tests and embeddings. There every child of the process,
+  the daemon's spawner (A-924) and its hooks among them, kept each held socket for its life, and the address with it.
+  - The TSan lane's parity listing showed a held rendezvous in both children of a test: `socket:[22118]`, flags `04002`.
+  - A red test's unrelated shell held a held rendezvous: run 45993337450, `socket:[16158]` at the instance's abstract
+    address.
+- **The rule.** Every descriptor the anchor hands its daemon is close-on-exec in the anchor, as it is made or received,
+  and is cleared in the daemon's child alone (`hand_on_in_child`, between the fork and the exec, on every Unix):
+  - the client rendezvous's listening socket (Linux; `HeldRendezvous::handed_descriptor`, handed on through
+    `Supervisor::hand_on_descriptor`);
+  - the NFS, VCS HTTP, SSH and svn listeners and a fleet node's serve sockets (the supervisor's own);
+  - the hold table's channel end, every held device, connection and copy, and the table's object (`device_env` returns
+    their numbers rather than clearing the flag).
+  The daemon still marks everything it inherited close-on-exec at its start (A-878). An anchor in the daemon's own
+  process hands the rendezvous over by its number, which `adopt` duplicates close-on-exec.
+- **Not changed.** A close-on-exec descriptor is still copied into a child between its fork and its exec, so the client
+  tests' `hold_once_released` stays (that window measured 14 to 36 µs); what goes is the lifetime hold.
+- **Tests.**
+  - `a_child_spawned_beside_a_held_rendezvous_holds_none_of_it` (`crates/ipc/tests/rendezvous.rs`, Linux): red in run
+    45993337450, green with the change.
+  - `a_held_listener_reaches_its_daemon_alone` (`crates/anchor/tests/anchor.rs`, Linux): the supervised child holds a
+    held close-on-exec listener once, and an unrelated shell none.
+  - The Linux runs are main's: the TSan lane and the anchor's cross-process tests.
+- **Applied in the same change to:**
+  - `crates/ipc/src/rendezvous.rs`: `HeldRendezvous::hold`, `handed_descriptor`; `crates/ipc/tests/rendezvous.rs`.
+  - `crates/anchor/src/supervise.rs`: `hand_on_descriptor`, `device_env`, the spawn, `hand_on_in_child` on every Unix,
+    the listeners' docs; `crates/anchor/tests/anchor.rs`.
+  - `crates/api/src/role/anchor.rs`: the six listener sites and the rendezvous's hand-on.
+  - `crates/cli/tests/cli.rs`: its supervisor's rendezvous.
+  - A-878's entry, its bug record, GAPS, and
+    docs/bugs/2026-11-27-an-anchors-held-sockets-reached-every-child-of-their-holders-process.md.
 
 ### A-921 part 5 — A restarted node announces its new process to each peer on its own task, so a peer that died meanwhile holds no other peer's re-key (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 03:33 and 03:38; A-921's next mode)
 

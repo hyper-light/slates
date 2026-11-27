@@ -568,8 +568,7 @@ fn the_supervised_child_inherits_the_held_nfs_listener() {
   let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
   let port = listener.local_addr().unwrap().port();
   let fd = listener.into_owned();
-  // Make the descriptor inheritable so the spawned child receives it across the exec.
-  rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()).unwrap();
+  // Close-on-exec as it was made: the supervisor hands it on to its child alone (A-931).
 
   let segment = AnchorSegment::create(
     &unique_name("slates-anchor-test-nfs"),
@@ -665,8 +664,7 @@ fn the_supervised_child_inherits_the_held_vcs_http_listener() {
   let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
   let port = listener.local_addr().unwrap().port();
   let fd = listener.into_owned();
-  // Make the descriptor inheritable so the spawned child receives it across the exec.
-  rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()).unwrap();
+  // Close-on-exec as it was made: the supervisor hands it on to its child alone (A-931).
   let segment = AnchorSegment::create(
     &unique_name("slates-anchor-test-vcs-http"),
     &identity(),
@@ -761,8 +759,7 @@ fn the_supervised_child_inherits_the_held_vcs_ssh_listener() {
   let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
   let port = listener.local_addr().unwrap().port();
   let fd = listener.into_owned();
-  // Make the descriptor inheritable so the spawned child receives it across the exec.
-  rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()).unwrap();
+  // Close-on-exec as it was made: the supervisor hands it on to its child alone (A-931).
   let segment = AnchorSegment::create(
     &unique_name("slates-anchor-test-vcs-ssh"),
     &identity(),
@@ -1094,6 +1091,94 @@ fn an_anchor_started_again_and_again_hands_each_daemon_its_objects_once() {
     (before, vec![2u64; kills].as_slice()),
     "this process's descriptors of the segment and the content object, before the first start and after the last \
      restart (left), and each child's own at its start (right)"
+  );
+}
+
+/// Format: the variable that turns this binary into [`listener_counting_child`].
+#[cfg(target_os = "linux")]
+const CHILD_COUNTS_LISTENER: &str = "SLATES_ANCHOR_TEST_COUNTS_LISTENER";
+
+/// The child [`a_held_listener_reaches_its_daemon_alone`] supervises: counts its descriptors of the socket its
+/// [`slates_anchor::ENV_NFS_LISTENER`] number names, beats the count, marks that it serves, and serves on until it is
+/// stopped. Ignored, and run by its parent with `--ignored --exact`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "the listener counting child; run by a_held_listener_reaches_its_daemon_alone with --ignored"]
+fn listener_counting_child() {
+  if std::env::var_os(CHILD_COUNTS_LISTENER).is_none() {
+    return;
+  }
+  let held = descriptors_like_the_inherited(slates_anchor::ENV_NFS_LISTENER);
+  let segment = AnchorSegment::attach_from_env(&identity()).unwrap();
+  let supervision = segment.supervision().unwrap();
+  supervision.beat(held);
+  supervision.mark_serving(held);
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(served_watch());
+  std::process::exit(EXIT);
+}
+
+/// main 01a20182's ruling of 2026-11-27 (the TSan lane's sweep: an anchor's held sockets reached every child of their
+/// holder's process, docs/bugs/2026-11-27-an-anchors-held-sockets-reached-every-child-of-their-holders-process.md). Do:
+/// hold a loopback listener in a supervisor as the anchor holds its NFS listener, close-on-exec as it is made; supervise
+/// [`listener_counting_child`]; and, while it runs, spawn an unrelated shell from this process that lists its
+/// descriptors by target. Expect: the supervised child holds the listener once, at the number its environment names,
+/// and the shell holds none of it. Before, the anchor made each held listener inheritable in itself, so every child of
+/// its process kept it, and a close-on-exec one never reached the daemon.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_held_listener_reaches_its_daemon_alone() {
+  use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
+  /// Shape: the test listener's backlog, which no connection uses.
+  const BACKLOG: i32 = 1;
+  let name = unique_name("slates-anchor-test-listener");
+  let segment = AnchorSegment::create(&name, &identity(), geometry()).unwrap();
+  let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG)
+    .unwrap()
+    .into_owned();
+  let target = std::fs::read_link(format!(
+    "/proc/self/fd/{}",
+    std::os::fd::AsRawFd::as_raw_fd(&listener)
+  ))
+  .unwrap()
+  .display()
+  .to_string();
+  let args = vec![
+    "--ignored".to_owned(),
+    "--exact".to_owned(),
+    "listener_counting_child".to_owned(),
+    "--nocapture".to_owned(),
+  ];
+  let mut supervisor = Supervisor::new(segment, &args, policy()).unwrap();
+  supervisor.hold_environment(CHILD_COUNTS_LISTENER, "1".to_owned());
+  supervisor.hold_nfs_listener(listener);
+  let clock = Instant::now();
+  supervisor.start(now_ns(clock)).unwrap();
+  let deadline = served_watch();
+  let mut held = None;
+  while held.is_none() && clock.elapsed() < deadline {
+    assert_eq!(supervisor.step(now_ns(clock)).unwrap(), Step::Running);
+    if supervisor.has_recovered().unwrap() {
+      held = Some(supervisor.segment().supervision().unwrap().heartbeat_ns());
+    }
+    // The test harness paces the poll; shipped code parks on its driver (D-9).
+    std::thread::sleep(Duration::from_micros(POLL_US));
+  }
+  let listed = std::process::Command::new("sh")
+    .args(["-c", "for f in /proc/$$/fd/*; do readlink \"$f\"; done"])
+    .output()
+    .unwrap();
+  supervisor.stop().ok();
+  let listed = String::from_utf8_lossy(&listed.stdout);
+  assert_eq!(
+    held,
+    Some(1),
+    "the supervised child's descriptors of the held listener {target}"
+  );
+  assert!(
+    !listed.lines().any(|line| line == target),
+    "an unrelated child holds the held listener {target}:\n{listed}"
   );
 }
 
