@@ -1225,6 +1225,8 @@ struct WideCounts {
   /// The landings whose held increments were published ahead of the register's op (`staging::LANDING_PUBLISHED_AHEAD`,
   /// 13b).
   published_ahead: u64,
+  /// The most bytes a register op's identity hashed (`push::SEALED_BYTES_MOST`, 13c).
+  sealed_most: u64,
 }
 
 /// The calling shard's [`WideCounts`] now.
@@ -1247,6 +1249,7 @@ fn wide_counts() -> WideCounts {
     carried_steps: on(|state| count(state, crate::repository::svn_commit::CARRIED_STEPS)),
     hand_over_steps: on(|state| count(state, crate::repository::svn_commit::HAND_OVER_STEPS)),
     published_ahead: on(|state| count(state, staging::LANDING_PUBLISHED_AHEAD)),
+    sealed_most: on(|state| count(state, crate::repository::push::SEALED_BYTES_MOST)),
   }
 }
 
@@ -1295,6 +1298,7 @@ fn wide_landing_stepped(counts: &WideCounts) {
     carried_steps,
     hand_over_steps,
     published_ahead,
+    sealed_most,
     ..
   } = counts;
   // Each of the landing's sections begins a step of its own (A-920 7c: the storing's begin and the carried texts ran in
@@ -1325,6 +1329,12 @@ fn wide_landing_stepped(counts: &WideCounts) {
   // The landing's held increment published ahead of the register's op, the op only recording (A-920 13b: inside it,
   // 5.8 ms of its 10.5, debug).
   assert!(*published_ahead > 0, "no landing published ahead of its op");
+  // The register op's identity hashed each chain entry as its 32-byte digest, never its bytes (A-920 13c: the 9,000
+  // paths' 431 KB entry hashed whole before, 4.9 ms of the op, debug).
+  assert!(
+    (1..=SEALED_BOUND).contains(sealed_most),
+    "a register op's identity hashed {sealed_most} bytes"
+  );
 }
 
 /// The import's parse, staging, apply and tail in steps (A-920 7a, goal 93 piece 3).
@@ -1536,6 +1546,11 @@ fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step
     "a step of {longest_ns} ns against the shard's window of {window_ns} ns"
   );
 }
+
+/// Shape: the most bytes a register op's identity may hash for one revision's entry (A-920 13c): its spans and its op
+/// with the entry as its 32-byte digest, a few hundred bytes, whatever the revision's paths; the 9,000 paths' entry
+/// was 431 KB hashed whole before.
+const SEALED_BOUND: u64 = 4096;
 
 /// Shape: the files of the trunk [`a_moves_recording_walked_a_node_a_step_finds_the_texts_the_whole_walk_finds`]
 /// moves: enough for the walk to stop inside a tree many times, few enough for a quick import.

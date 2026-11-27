@@ -2059,7 +2059,8 @@ fn each_operation_records_what_it_moved_of_each_state_log_named_alike() {
   advance(&mut partition, push).unwrap();
   let pushed = partition.take_state_log_records();
   assert_a_push_names_itself_on_every_log_it_moved(&pushed, repo, [a, b]);
-  let mut identities: BTreeSet<[u8; 32]> = [first[0].identity, pushed[0].identity].into();
+  let mut identities: BTreeSet<crate::catalog::OperationIdentity> =
+    [first[0].identity, pushed[0].identity].into();
   let bound = Op::RepositoryBranchAdded {
     record: crate::catalog::BranchRecord {
       repository: repo,
@@ -2237,4 +2238,58 @@ fn a_transactions_state_log_records_go_on_only_once_it_is_durable() {
     vec![(StateLog::Names, 4, 5, 1)]
   );
   assert!(db.take_state_log_records().is_empty(), "handed on once");
+}
+
+/// A chain entry of `body` and its trailing BLAKE3 digest, as format 6 ends one.
+fn entry_of(body: &[u8]) -> Vec<u8> {
+  let mut entry = body.to_vec();
+  entry.extend_from_slice(blake3::hash(body).as_bytes());
+  entry
+}
+
+/// A register op advancing one green by one version whose chain entry is `entry`.
+fn advanced_by(entry: Vec<u8>) -> Op {
+  Op::RepositoryAdvanced {
+    entry: crate::catalog::RepositoryEntry {
+      repository: RepositoryId { bytes: [7; 16] },
+      versions: vec![crate::catalog::GreenVersion {
+        green: VolumeId { bytes: [8; 16] },
+        version: 1,
+        entry,
+      }],
+      ..crate::catalog::RepositoryEntry::default()
+    },
+  }
+}
+
+/// A-920 13c. Do: take the identity encoding (`identity_encoding`) of a register op whose chain entry is a 100-byte body
+/// and its digest, of one whose body is 431 KB, and of one whose 100-byte body differs by one byte (its digest with
+/// it); and of the first op read back from its own encoding, as a replay reads it from its log. Expect: the read-back
+/// op's the owner's; the wide entry's no longer than the small one's (an entry hashed as its digest, never its bytes);
+/// a one-byte change of an entry a different encoding.
+#[test]
+fn an_ops_identity_hashes_each_entry_as_its_digest_alike_at_the_owner_and_its_replay() {
+  use slates_wire::Wire;
+  let small = advanced_by(entry_of(&[1; 100]));
+  let wide = advanced_by(entry_of(&vec![2; 431_000]));
+  let mut changed_body = [1; 100];
+  changed_body[50] = 9;
+  let changed = advanced_by(entry_of(&changed_body));
+  let replayed = Op::from_bytes(&small.to_bytes()).unwrap();
+  let encoding = crate::repository::identity_encoding;
+  assert_eq!(
+    encoding(&replayed),
+    encoding(&small),
+    "the owner's and its replay's"
+  );
+  assert_eq!(
+    encoding(&wide).len(),
+    encoding(&small).len(),
+    "a 431 KB entry hashed as its digest"
+  );
+  assert_ne!(
+    encoding(&changed),
+    encoding(&small),
+    "a one-byte change of an entry"
+  );
 }

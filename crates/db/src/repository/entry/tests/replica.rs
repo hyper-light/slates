@@ -83,7 +83,7 @@ pub(super) struct Replica {
   /// The locks, by path.
   locks: BTreeMap<String, Vec<u8>>,
   /// Every operation's identity met: no two operations name one.
-  identities: BTreeSet<[u8; 32]>,
+  identities: BTreeSet<crate::catalog::OperationIdentity>,
 }
 
 impl Replica {
@@ -91,7 +91,7 @@ impl Replica {
   /// log, its spans naming every log it moved, each record's own among them, and its identity new.
   pub(super) fn take(&mut self, records: Vec<StateLogRecord>) -> Result<Taken, TestCaseError> {
     let mut taken = Taken::default();
-    let mut operation: Option<([u8; 32], Vec<LogSpan>)> = None;
+    let mut operation: Option<(crate::catalog::OperationIdentity, Vec<LogSpan>)> = None;
     for record in records {
       let same = operation
         .as_ref()
