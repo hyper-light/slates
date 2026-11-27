@@ -1234,7 +1234,7 @@ impl<P> ReceivePack<P> {
           1,
         );
         match landed {
-          Ok(_) => decision.sealed.landed_as(sequence),
+          Ok(_) => decision.sealed.landed_as(state, sequence),
           Err(refused) => {
             slates_machine::log_line!(
               "slates-server: partition {}: a git push's changeset {sequence} was refused by the node's store: {refused:?}",

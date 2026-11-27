@@ -3669,7 +3669,9 @@ pub(crate) fn held_bytes(
 /// The object `identity` read from the region (A-724 piece 8c: a version-3 record's names, read where its replay runs):
 /// from this node's own home shard when it holds it, else from each of its region homes in turn, the first answer whose
 /// bytes hash to `identity` taken (a home answering other bytes is passed over). None when no home answered it within
-/// `budget`. Asked from shard `origin`.
+/// `budget`. Asked from shard `origin`. The homes are asked live first, by this node's own view of each
+/// ([`live_first`]), each within its share of what is left of the budget ([`read_remote`]): a dead first home cost the
+/// whole budget before the next was asked (a914's record barrier, main 01a20182's ruling of 2026-11-27 12:37).
 pub(crate) async fn read_in_region(
   origin: u16,
   shards: &[u16],
@@ -3681,17 +3683,16 @@ pub(crate) async fn read_in_region(
   if let Some(bytes) = read_else_counted(origin, shards, identity, budget_ns).await {
     return Some(bytes);
   }
-  let (local, members, f) = crate::state::with_state(|state| {
-    (
-      state.fleet.host(),
-      state.fleet.members().to_vec(),
-      usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX),
-    )
+  let others = crate::state::with_state(|state| {
+    let local = state.fleet.host();
+    let members = state.fleet.members().to_vec();
+    let f = usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX);
+    let homes: Vec<slates_db::HostId> = slates_db::identity_homes::homes(&identity.0, &members, f)
+      .into_iter()
+      .filter(|home| *home != local)
+      .collect();
+    live_first(state, homes)
   })?;
-  let others: Vec<slates_db::HostId> = slates_db::identity_homes::homes(&identity.0, &members, f)
-    .into_iter()
-    .filter(|home| *home != local)
-    .collect();
   if others.is_empty() {
     return None;
   }
@@ -4003,12 +4004,45 @@ async fn read_remote(
   identity: ContentId,
   budget: slates_cluster::CommitBudget,
 ) -> Option<Vec<u8>> {
-  for home in &homes {
-    if let Some(bytes) = read_in_parts(*home, identity, budget).await {
+  let began = slates_rt::futures::now_ns();
+  let whole = budget.max_deadline_ns();
+  let count = homes.len();
+  for (asked, home) in homes.iter().enumerate() {
+    let left = whole.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+    let share = share_of(left, count.saturating_sub(asked))?;
+    if let Some(bytes) = read_in_parts(*home, identity, (share, budget.poll_interval_ns)).await {
       return Some(bytes);
     }
   }
   None
+}
+
+/// Derived: one home's share of `left` nanoseconds of a read's budget with `homes` still to ask (its own turn among
+/// them): `left` divided over them, so the last home asked gets all that is left and the shares never sum past the
+/// budget. None where no time or no home is left.
+fn share_of(left: u64, homes: usize) -> Option<u64> {
+  let homes = u64::try_from(homes).ok().filter(|homes| *homes > 0)?;
+  left.checked_div(homes).filter(|share| *share > 0)
+}
+
+/// `homes` ordered live first by this node's own view of each (`fleet.membership()`): alive, then suspect, then dead,
+/// the given order (rendezvous) kept within each, so one view orders them one way. Read once per read, not per home: a
+/// home judged dead mid-read keeps its place. A member with no belief held is taken as alive.
+fn live_first(state: &ShardState, mut homes: Vec<slates_db::HostId>) -> Vec<slates_db::HostId> {
+  use slates_cluster::membership::Liveness;
+  homes.sort_by_key(|home| {
+    match state
+      .fleet
+      .membership()
+      .state(*home)
+      .map(|belief| belief.liveness)
+    {
+      Some(Liveness::Dead) => 2u8,
+      Some(Liveness::Suspect) => 1,
+      _ => 0,
+    }
+  });
+  homes
 }
 
 /// Sends the object `bytes` named `identity` to each of `homes` a part at a time, in order (A-724 piece 8c: an object past
@@ -4065,11 +4099,19 @@ async fn put_in_parts(
 async fn read_in_parts(
   home: slates_db::HostId,
   identity: ContentId,
-  budget: slates_cluster::CommitBudget,
+  (within_ns, poll_ns): (u64, u64),
 ) -> Option<Vec<u8>> {
   use slates_cluster::homes::{HomeMessage, HomeOutcome};
+  let began = slates_rt::futures::now_ns();
   let mut bytes: Vec<u8> = Vec::new();
   loop {
+    // Every part within the home's one share: a part's exchange is given what the share has left, and ends there, its
+    // session given back (`exchange`), so a home slow past its share is passed over for the next.
+    let left = within_ns.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+    if left == 0 {
+      return None;
+    }
+    let budget = slates_cluster::CommitBudget::hard(left, poll_ns);
     let offset = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     let request = HomeMessage::ReadPart {
       identity: identity.0,

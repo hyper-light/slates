@@ -361,6 +361,24 @@
 >   with none is no answer, its host left, its link dialed afresh, and the homing waits and ranks its homes again once
 >   the death installs (A-912). Red first: `a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once`.
 >   a914 asserts its second push lands.
+> - **FIXED (w-interop, 2026-11-27; main 01a20182's ruling of 12:37): a914's record barrier, placed Some(1) (its runs 1
+>   and 16 of 16).** Not durability: every object was served by a live home. A holder whose replica owed its push
+>   (P2) replayed the repository's replica store, reading each name it lacked from the region (`homes::read_in_region`),
+>   and `read_remote` asked the name's homes one at a time in rendezvous order, each waiting the whole live budget. A
+>   name whose first home had just died cost 2 s, and the push's barrier gave up first: the holder made its replica
+>   2.01 s in (`merge.replica_build.made_ns`, a914 run 18). Now the homes are asked live first by this node's own view
+>   (`live_first`: alive, suspect, dead, read once per read), each within its share of what is left of the budget
+>   (`share_of`: the rest divided over the homes still to ask, the last given all of it), a home cut off at its share
+>   abandoned by its exchange and its session given back
+>   (`docs/bugs/2026-11-27-a-region-read-waited-out-a-dead-first-home.md`). Red first, two fleet tests: a dead first
+>   home and a slow one, each read 1,998,960,833 ns against a 1,998,000,000 ns budget before.
+> - **OPEN, found by that fix's sweep (main's ruling of 12:37: reported, not fixed): other callers that wait a dead home
+>   out.** One home at a time, the whole budget each, so a dead home before a live one costs all of it:
+>   `homes::settle_in_region` (each home, each chunk), `homes::announce_rebuilt` (each repository's member) and
+>   `homes::barrier_published` (each remote home's tickets, each part). All homes at once, waiting until every home
+>   answers or the budget is spent, so a dead home costs the whole budget on every part though the live answers are
+>   kept: `homes::put_remote` and `put_in_parts`, and the healer's `offer`. `homes::resolve_elsewhere` asks the one
+>   located owner and has no other to ask.
 > - **OPEN, found by A-914 (d)'s sweep: replies with no round trip read as answers** (to be worked when measured or
 >   blocking; main's ruling of 09:43). `TimedReply::bytes` is empty on a refusal, a deadline or a transport error, and
 >   only `round_trip_ns` says the peer answered. Of 26 readers of a `broadcast` or `request_within` reply, 20 read empty
@@ -783,6 +801,39 @@
 >   `git_push::tests::b9_a_hooked_push_over_a_let_go_pack_brings_its_views_windows_back_and_lands` (a new branch at
 >   `main`'s commit over the create's let-go pack: declined `hook not run` before; lands, windows brought back, after;
 >   its driver, like the HTTP edge, now brings back the push's waited window after a turn).
+> - **B10 BUILT (w-git, 2026-11-27, main's rulings of 08:25 and 09:01): an unlanded push's pack windows pinned.**
+>   Found by the flip's focused run (`vcs_store::upload::tests::t_a724_…`, two repositories pushed the same history):
+>   the second push's append refused `Unlanded`. Tagged (`~/.local/state/w-git-logs/b10-diag2.log`): A's commit landed
+>   pack `a2 33 ea 65`, one 214-byte window; B's identical pack was put while A still held it (a put brings a let-go
+>   window back, A-724 piece 4, but it was not let go yet); A's sliced let-go then let it go, a landed window going
+>   whatever its holders; B's landing read it as none. Now a git push pins each of its pack's windows as its put keeps
+>   it, and the finished pack's rest from its layout, through the one pin every let-go honours
+>   (`ContentStore::pin_unlanded`, main's ruling (B) of 2026-11-24, as Mercurial's push does), unpinned once its
+>   changeset lands (`Push::landed`, from `SealedPush::landed_as`) or first thing however it ends (`release_placed`,
+>   which `abandon` and a commit's `release_holds` take: every server end, a refused verdict, a dropped connection,
+>   its hooks' drop). The put paths were read correct as they stand: a one-window put brings a let-go window back
+>   from its bytes, and a replay's multi-window put under a held root keeps let-go windows away (A-767 C1 step 2b).
+>   Red at the push: `store::tests::packed::b10_an_unlanded_pushs_pack_survives_another_pushs_let_go_of_the_same_
+>   windows` (all three of B's windows let go under it before; refused while unlanded, and every window let go after
+>   B lands and after C is abandoned, after). Net: `t_a724` with the let-go on. The test helpers `appended_awaited`
+>   and `push_through_awaited` now assert their landing where the push brings an object, which they dropped (`let _ =`),
+>   so this surfaced late as `ContentUnavailable` rather than at the landing (`home_and_land` answers none for a push
+>   with nothing to home too, so they ask it apart).
+> - OPEN (w-git, 2026-11-27, main's ruling of 13:47; after the flip, red first): a clone of a let-go pack holds more
+>   than a turn's windows under load. `vcs_http::daemon_edge::tests::a_clone_of_a_pushed_pack_let_go_is_whole_holding_
+>   at_most_a_turns_windows` failed 2 of 32 runs under 12 burners with B10 and 0 of 24 without (about p 0.5, not B10's:
+>   its instrumented A/B, d16e6fe20, printed no window pinned after the push and no let-go a pin refused in any of 16
+>   runs), at peaks of 10 and 8 of 13 against 3, and once before B10 under TSan at 4. A clone racing the encoding reads
+>   the let-go pack instead of copying the kept parts, and its let-go behind its cursor lags its bring-backs: ten stops,
+>   ten let go behind, ten held at once. The test prints its stops, peak and let-go-behind every run, with the pinned
+>   windows (`mem.gauge.vcs_content.pinned_unlanded`) and refused let-gos.
+> - OPEN (w-git, 2026-11-27, main's note of 09:17; its own item, not B10's): a git push dropped where the shard's state
+>   is not lent to its drop gives back nothing. `ReceivePack`'s `Drop` and `git_push::hooks::dropped` take the state
+>   with `with_state` and, finding none, log "a git push dropped mid-read could not give back its quarantine: the
+>   shard's state was not lent to its drop" (or "… mid-seal or mid-decision could not give back its push …", "…
+>   mid-answer could not give back its quarantine or its hook's view …"), leaking the push's holds; pins ride the same
+>   path since B10, and a leaked pin is worse than a leaked hold: its windows are never let go, a bounded loss that
+>   lasts until a restart. The fix: a drop with no state lent defers its release to the shard's next turn.
 > - OPEN (sibling of B8; left recorded by main's ruling of 2026-11-27 04:41, by reading alone, its cost time): the
 >   encoding's stop rule (`Encoding::stop_at`, A-864 piece 2) is keyed by a window's place, once an encoding, not by the
 >   let-go's number as `slates_git::away::WaitOnce` is, so a window brought back by another reader and let go again
@@ -4867,6 +4918,13 @@
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
 > A-704), git-http-backend, Gitaly, mod_dav_svn, the Linux kernel dataset, server CPU and memory, concurrent clients.
+> Since then: slates' side of each, git-http-backend (`git_scale`'s stock-http), and server CPU and memory
+> (`interop_speed.sh`). Since 2026-11-27 (w-interop, main 01a20182's ruling of 14:31): `mod_dav_svn` under Apache as
+> svn's HTTP competitor (`svn_scale`'s stock-http, beside slates' WebDAV site as slates-http), measured where
+> `HTTPD_MODULES` has it and skipped, said so, where it does not (neither Mac has it). svn's commit and hg's push and
+> pull are each read back and compared across the servers: svn's commit by its served content and changed paths, hg's
+> pull by `hg verify` and exactly the source's changesets and the new one. Smoke run on the MacBook at a debug build:
+> every check passed, each digest one across the servers. Owed: Gitaly, the Linux kernel dataset, concurrent clients.
 >
 > **A stock git command's wait, judged by progress (2026-11-23, w-git; main 01a20182's ruling after r229):** each git
 > command of `crates/cli/tests/git_interop.rs` was killed past a fixed 120 s (`PATIENCE`), and git/git's whole-repository
