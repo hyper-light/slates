@@ -58,6 +58,10 @@ const PORT_ATTEMPTS: u16 = 2_000;
 const PUSHES: usize = 3;
 /// Format: the environment variable naming the command that runs stock Mercurial 7.2 (as `hg_interop`'s).
 const STOCK_HG: &str = "SLATES_TEST_HG";
+/// The hg commands this test runs that reach a node over its edge, the only ones given `--insecure`: hg 7.2.4 takes it as
+/// a command's option, never a global one ("option --insecure not recognized", exit 255; main's gate 21, run
+/// 45948743405, where every run stopped at `hg init`).
+const REACHES_A_NODE: [&str; 3] = ["clone", "identify", "push"];
 /// Format: the user name stock hg sends as Basic's user name; the token, its password, proves the principal.
 const HG_USER: &str = "slates";
 /// Shape: the repository's name.
@@ -377,10 +381,14 @@ fn stock_hg() -> Option<String> {
 }
 
 /// Runs stock hg with `args` in `dir`, Basic's password the bearer `token` for every node's edge, a fleet node's
-/// self-signed certificate not verified (`--insecure`): its exit code and both outputs. Bounded: a command that hangs
+/// self-signed certificate not verified (`--insecure`, after the command and only on the commands that reach a node:
+/// hg refuses it as a global option): its exit code and both outputs. Bounded: a command that hangs
 /// fails the test at twice the fleet wait.
 fn hg(dir: &str, token: &str, args: &[&str]) -> (i32, String, String) {
   let command = stock_hg().expect("stock hg");
+  let reaches_a_node = args
+    .first()
+    .is_some_and(|name| REACHES_A_NODE.contains(name));
   let mut output = Command::new(command)
     .args([
       "--config",
@@ -391,9 +399,10 @@ fn hg(dir: &str, token: &str, args: &[&str]) -> (i32, String, String) {
       &format!("auth.slates.password={token}"),
       "--config",
       "ui.username=t <t@t>",
-      "--insecure",
     ])
-    .args(args)
+    .args(args.iter().take(1))
+    .args(reaches_a_node.then_some("--insecure"))
+    .args(args.iter().skip(1))
     .current_dir(dir)
     .env("HGPLAIN", "1")
     .env_remove("HGRCPATH")
