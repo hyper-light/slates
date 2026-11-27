@@ -3320,3 +3320,98 @@ fn a_pushs_logs_taken_while_its_segments_land_ask_the_store_a_bounded_number_of_
     "a base asked again over a row let go since its ask"
   );
 }
+
+/// Main's 57k hg push hang (2026-11-27: sampled at 4:00 into a hung run, the shard serving the push in
+/// `advance_patched` -> `base_brought_back` -> `bring_back_file`, and asking the store `texts_by_tool` between, two
+/// asks a slice without end). Do: push a file revision A that carries a metadata block (a copy's), take it into a fork,
+/// and let its block's and its bytes' windows go as its landing does; then push B, a delta on A, every ask of the store
+/// answered with A's whole text. Expect B taken within four steps a revision and a window of its text, the base brought
+/// back (counted) and asked at most twice, asked again at most once. Red before: still stepping at the bound, 16 steps
+/// and 11 asks (at a bound of 10,000 steps, 9,995 asks); now 12 steps and one ask: `FileBase::stored` read A's framing
+/// through windows that stop at one let go, so its block read as empty and its bytes as that much longer; the read of
+/// the bytes at that length failed at every step, the base was asked and brought back, and `patched.base` kept the
+/// framing it began with, so it was asked again every step, without end.
+#[test]
+fn a_file_delta_on_a_base_whose_block_was_let_go_is_taken_after_its_base_is_brought_back() {
+  let hex = |byte: u8| -> Vec<u8> { std::iter::repeat_n(byte, 40).collect() };
+  let a: Vec<u8> = [
+    &b"\x01\ncopy: g\ncopyrev: "[..],
+    &hex(b'a'),
+    b"\n\x01\n",
+    &b"the copied file's line\n".repeat(64),
+  ]
+  .concat();
+  let b: Vec<u8> = [&a[..], b"and one more line\n"].concat();
+  let (first, line) = file_push(&[(&a, None)], (crate::NULL_NODE, crate::NULL_NODE, &[]));
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let (mut fork, _, _) = taken_answering(&first, (&mut index, &mut store), None);
+  let log = Log::File(b"f");
+  let rev = fork.rev(&store, log, &line.2[0].0).unwrap();
+  let row = fork.revision(&store, log, rev).unwrap();
+  let block = row.block.expect("A's row keeps its metadata block apart");
+  for object in [row.bytes, block] {
+    let (freed, _) = store.let_go_object_landed(&object, &|_| None);
+    assert!(freed > 0, "A's windows let go as its landing lets them go");
+  }
+  let (second, _) = file_push(&[(&b, Some(0))], (line.0, line.1, &line.2));
+  let mut intake = Intake::begin(
+    (crate::changegroup::Version::V03, second.as_slice()),
+    &mut fork,
+    &mut store,
+    &mut room(),
+  )
+  .unwrap();
+  // Derived: a step a revision of the push's three (its changeset, manifest and file) and a step a window of B's text,
+  // each at most four times over (an ask, its answer, the read again, the stage moved on).
+  let bound = 4 * (3 + b.len().div_ceil(WINDOW) as u64);
+  let (taken, steps, asked) = stepped_answering(&mut intake, &second, &mut store, (&a, bound));
+  println!(
+    "a delta on a base whose block was let go: {steps} steps of at most {bound}, the store asked {asked} times"
+  );
+  assert!(
+    taken,
+    "B still stepping after {steps} steps, the store asked {asked} times"
+  );
+  assert!(asked <= 2, "the store asked {asked} times for one base");
+  let (fork, intaken) = finished(intake);
+  assert!(
+    intaken.base_store_reads > 0,
+    "the base brought back from the store"
+  );
+  assert!(
+    intaken.base_store_reasked <= 1,
+    "the base asked again {} times",
+    intaken.base_store_reasked
+  );
+  fork.release(&mut store).unwrap();
+}
+
+/// Steps `intake` over `payload` until it is taken or `bound` steps have passed, every ask of the store answered with
+/// `text`: whether it was taken, the steps it took and the store's asks.
+fn stepped_answering(
+  intake: &mut Intake,
+  payload: &[u8],
+  store: &mut ContentStore,
+  (text, bound): (&[u8], u64),
+) -> (bool, u64, u64) {
+  let (mut steps, mut asked) = (0_u64, 0_u64);
+  let taken = loop {
+    if steps >= bound {
+      break false;
+    }
+    steps += 1;
+    match intake.step(payload, store, &mut room()).unwrap() {
+      Stepped::Store => match intake.asked_text() {
+        Some(_) => {
+          asked += 1;
+          intake.answer_text(Some(text.to_vec()));
+        }
+        None => intake.answer_from_fork(store),
+      },
+      stepped if more(&stepped) => {}
+      _ => break true,
+    }
+  };
+  (taken, steps, asked)
+}
