@@ -26,8 +26,15 @@ const CAP_TAG: &str = "SPAWN-HELD";
 /// duplicates and the listing that counts them.
 const ROLE_OWN_DESCRIPTORS: usize = 2;
 /// Shape: the open descriptors the red measures at: a quiet process, a busy daemon, a daemon serving tens of thousands
-/// of pushes (GAPS 8a-hook-exit: 0.2, 1.2 to 4, 8 to 13 ms a direct spawn on macOS).
+/// of pushes (GAPS 8a-hook-exit: 0.2, 1.2 to 4, 8 to 13 ms a direct spawn on macOS). A count past what the process may
+/// hold is measured at that most instead, and a count no larger than the row before it is no row of its own
+/// ([`spawn_cost_role`]).
 const DESCRIPTOR_COUNTS: [usize; 3] = [100, 10_000, 100_000];
+/// Derived: the free descriptor numbers one spawn of [`true_program`] needs in this process's table: its file actions
+/// open the null device once per stream (stdin, stdout, stderr) in the child's copy of the table before its exec
+/// (`confined_spawn::spawn`), so at the process's cap each open is refused `EMFILE` (diag CI 10's macos-latest: the
+/// role held 10,231 of 100,000 and its direct spawn failed `TooManyOpenFiles`).
+const SPAWN_STREAMS: usize = 3;
 /// Shape: the spawns measured at each count; the median and the spread of an odd count.
 const REPS: usize = 7;
 /// Shape: how long a test waits for the spawner's answer: four liveness windows' worth of a quiet machine's spawn.
@@ -290,12 +297,18 @@ fn through_the_spawner(end: &OwnedFd, first_id: u64) -> Vec<Duration> {
     .collect()
 }
 
-/// [`REPS`] direct spawns of `/usr/bin/true`, each reaped: each spawn call's time.
-fn direct() -> Vec<Duration> {
+/// [`REPS`] direct spawns of `/usr/bin/true`, each reaped: each spawn call's time. A refused spawn fails naming the
+/// descriptors held (`held`) and the soft `RLIMIT_NOFILE`.
+fn direct(held: usize) -> Vec<Duration> {
   (0..REPS)
     .map(|_| {
       let began = Instant::now();
-      let mut child = crate::confined_spawn::spawn(&true_program()).unwrap();
+      let mut child = crate::confined_spawn::spawn(&true_program()).unwrap_or_else(|error| {
+        let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
+        panic!(
+          "a direct spawn refused with {held} descriptors held under a soft RLIMIT_NOFILE of {limit:?}: {error}"
+        )
+      });
       let spent = began.elapsed();
       child.wait().unwrap();
       spent
@@ -320,8 +333,10 @@ fn true_program() -> Spawn<'static> {
 }
 
 /// The red's measurement, in a process of its own: the spawner started first, while this process holds few
-/// descriptors; then at each of [`DESCRIPTOR_COUNTS`] open descriptors, [`REPS`] spawns through it and as many direct,
-/// each count's figures printed on a [`COST_TAG`] line.
+/// descriptors; then at each of [`DESCRIPTOR_COUNTS`] open descriptors that fits, [`REPS`] spawns through it and as many
+/// direct, each count's figures printed on a [`COST_TAG`] line. The most it holds is its raised `RLIMIT_NOFILE`, or
+/// the system's own cap where that is lower, less a spawn's [`SPAWN_STREAMS`]; a count past it is measured at that most
+/// and said on a [`CAP_TAG`] line, and a count no larger than the last row's makes no row.
 #[test]
 fn spawn_cost_role() {
   if std::env::var_os(MEASURE_VARIABLE).is_none() {
@@ -329,26 +344,34 @@ fn spawn_cost_role() {
   }
   let spawner = spawner(1);
   let end = spawner.ends.first().unwrap();
-  let room = descriptor_room();
+  let mut most = descriptor_room().saturating_sub(SPAWN_STREAMS);
   let null = std::fs::File::open("/dev/null").unwrap();
   let mut held: Vec<OwnedFd> = Vec::new();
+  let mut last_row = 0;
   for (round, wanted) in DESCRIPTOR_COUNTS.iter().enumerate() {
-    let mut count = (*wanted).min(room);
     // Held until the system refuses one, whatever the limit said: macOS caps a process's descriptors by
     // `kern.maxfilesperproc` too, below a soft `RLIMIT_NOFILE` the raise was allowed (CI's macOS wall, diag CI 7, job
-    // 140523159665: the role failed before its 100,000 row).
-    while held.len() < count {
+    // 140523159665). A spawn's streams are given back from what the system allowed (diag CI 10).
+    while held.len() < (*wanted).min(most) {
       match null.as_fd().try_clone_to_owned() {
         Ok(more) => held.push(more),
-        Err(_) => count = held.len(),
+        Err(_) => {
+          most = held.len().saturating_sub(SPAWN_STREAMS);
+          held.truncate(most);
+        }
       }
     }
+    let count = held.len();
     if count < *wanted {
       println!("{CAP_TAG} {wanted} {count}");
     }
+    if count <= last_row {
+      continue;
+    }
+    last_row = count;
     let first_id = u64::try_from(round * REPS).unwrap() + 1;
     let spawner_took = took(through_the_spawner(end, first_id));
-    let direct_took = took(direct());
+    let direct_took = took(direct(count));
     println!(
       "{COST_TAG} {count} {} {} {} {} {} {}",
       spawner_took.least,
@@ -387,14 +410,17 @@ fn descriptor_room() -> usize {
 }
 
 /// A-924's red (main's ruling of 2026-11-25). Do: run [`spawn_cost_role`] in a process of its own. Expect: through the
-/// spawner, the least spawn's time on the asking thread at the most descriptors the process may hold, up to 100,000,
-/// within the spread measured at 100 (the most at 100 plus its own spread); and, so the measure is not vacuous, on macOS
+/// spawner, the least spawn's time on the asking thread at the most descriptors the process may hold, up to 100,000
+/// (its last row), within the spread measured at 100 (the most at 100 plus its own spread); and, so the measure is not
+/// vacuous, on macOS
 /// and x86_64 Linux the direct spawn's least there past the same bound drawn from its own figures at 100. The least,
 /// not the median: a copy of the table raises every spawn, the least too, while a busy machine lifts a median past a
 /// tight bound (1 of 4 runs on the MacBook at load 30 judged by the median). Red before: a
 /// hook's spawn was the direct one, 8 to 13 ms at 100,000 against 0.2 at 100 on macOS, 532 µs at 10,000 against 193 at
 /// 100 on x86_64 Linux. Where the process may not hold 100,000 (a runner's hard limit of 65,536) the role holds what it
-/// may and says so; red there before was the role refused its descriptors (main's diag run 45666757721).
+/// may and says so; red there before was the role refused its descriptors (main's diag run 45666757721). Where fewer than
+/// two rows fit, there is no flatness to judge, and the test skips, saying so; a role that failed fails it, naming its
+/// status and standard error (diag CI 10's macos-latest: its direct spawn at 10,231 held, `TooManyOpenFiles`).
 #[test]
 fn a_spawns_cost_on_its_calling_thread_is_flat_in_the_daemons_descriptors() {
   // Spawns a process, so holds the descriptor tests' gate across it (`crate::descriptor_test_gate`).
@@ -417,13 +443,20 @@ fn a_spawns_cost_on_its_calling_thread_is_flat_in_the_daemons_descriptors() {
     })
     .collect();
   eprintln!("{printed}");
-  assert_eq!(
-    rows.len(),
-    DESCRIPTOR_COUNTS.len(),
-    "a row a count: the role {}; it printed:\n{printed}\nand said on standard error:\n{}",
+  assert!(
+    output.status.success(),
+    "the role {}; it printed:\n{printed}\nand said on standard error:\n{}",
     output.status,
     String::from_utf8_lossy(&output.stderr)
   );
+  if rows.len() < 2 {
+    eprintln!(
+      "SKIPPED a_spawns_cost_on_its_calling_thread_is_flat_in_the_daemons_descriptors: {} row(s) fit this process's \
+       descriptors, no flatness to judge: {printed}",
+      rows.len()
+    );
+    return;
+  }
   let figure = |row: usize, at: usize| {
     rows
       .get(row)
@@ -433,7 +466,7 @@ fn a_spawns_cost_on_its_calling_thread_is_flat_in_the_daemons_descriptors() {
   };
   let bound =
     |least: usize, most: usize| figure(0, most) + figure(0, most).saturating_sub(figure(0, least));
-  let last = DESCRIPTOR_COUNTS.len() - 1;
+  let last = rows.len() - 1;
   assert!(
     figure(last, 1) <= bound(1, 3),
     "through the spawner, {} ns at least at {} descriptors against {} ns at {}: {printed}",
