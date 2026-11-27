@@ -361,6 +361,24 @@
 >   with none is no answer, its host left, its link dialed afresh, and the homing waits and ranks its homes again once
 >   the death installs (A-912). Red first: `a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once`.
 >   a914 asserts its second push lands.
+> - **FIXED (w-interop, 2026-11-27; main 01a20182's ruling of 12:37): a914's record barrier, placed Some(1) (its runs 1
+>   and 16 of 16).** Not durability: every object was served by a live home. A holder whose replica owed its push
+>   (P2) replayed the repository's replica store, reading each name it lacked from the region (`homes::read_in_region`),
+>   and `read_remote` asked the name's homes one at a time in rendezvous order, each waiting the whole live budget. A
+>   name whose first home had just died cost 2 s, and the push's barrier gave up first: the holder made its replica
+>   2.01 s in (`merge.replica_build.made_ns`, a914 run 18). Now the homes are asked live first by this node's own view
+>   (`live_first`: alive, suspect, dead, read once per read), each within its share of what is left of the budget
+>   (`share_of`: the rest divided over the homes still to ask, the last given all of it), a home cut off at its share
+>   abandoned by its exchange and its session given back
+>   (`docs/bugs/2026-11-27-a-region-read-waited-out-a-dead-first-home.md`). Red first, two fleet tests: a dead first
+>   home and a slow one, each read 1,998,960,833 ns against a 1,998,000,000 ns budget before.
+> - **OPEN, found by that fix's sweep (main's ruling of 12:37: reported, not fixed): other callers that wait a dead home
+>   out.** One home at a time, the whole budget each, so a dead home before a live one costs all of it:
+>   `homes::settle_in_region` (each home, each chunk), `homes::announce_rebuilt` (each repository's member) and
+>   `homes::barrier_published` (each remote home's tickets, each part). All homes at once, waiting until every home
+>   answers or the budget is spent, so a dead home costs the whole budget on every part though the live answers are
+>   kept: `homes::put_remote` and `put_in_parts`, and the healer's `offer`. `homes::resolve_elsewhere` asks the one
+>   located owner and has no other to ask.
 > - **OPEN, found by A-914 (d)'s sweep: replies with no round trip read as answers** (to be worked when measured or
 >   blocking; main's ruling of 09:43). `TimedReply::bytes` is empty on a refusal, a deadline or a transport error, and
 >   only `round_trip_ns` says the peer answered. Of 26 readers of a `broadcast` or `request_within` reply, 20 read empty

@@ -66440,3 +66440,12 @@ Applied in the same change to:
   - a914 asserts its second push lands, closing its named debt.
 - **Applied in the same change to:** `crates/server/src/{fleet,vcs_store/homes}.rs`, `crates/server/tests/fleet.rs`
   (`push_on_top_at_edge`, shared by `GitFleet::push_on_top_of`), GAPS.
+
+- **Amended (w-interop, 2026-11-27, main 01a20182's ruling of 12:37; a914's record barrier, placed Some(1)).** A
+  region read asks an object's homes live first by this node's own view of each (alive, suspect, dead; read once per
+  read, the rendezvous order kept within each), and gives each its share of what is left of the read's budget, the
+  last all of it (`vcs_store::homes::read_remote`, `live_first`, `share_of`). Before, it waited each home out in turn
+  for the whole budget, so a name whose first home had just died cost a replica's replay 2 s and a push's barrier gave
+  up first. The other callers that wait a dead home out are in GAPS, reported. Tests: fleet
+  `a_region_read_whose_first_home_died_unseen_is_answered_by_the_next_within_the_budget` and
+  `a_region_read_whose_first_home_is_slow_past_its_share_reads_the_next_and_returns_the_session`.

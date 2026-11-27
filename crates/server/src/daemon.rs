@@ -2017,6 +2017,133 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support (a914's record barrier, main 01a20182's ruling of 2026-11-27 12:37): homes `bytes` in the region from
+  /// this node's control shard as a record's names are homed (`vcs_store::homes::home_in_region`), kept for a
+  /// repository's records, the repository all zeros, within the live budget (`fleet::live_budget`). Its identity once
+  /// `f + 1` homes kept it; none otherwise.
+  pub fn home_bytes_in_region(&self, bytes: Vec<u8>) -> Result<Option<[u8; 32]>, ObserveError> {
+    self.run_on_control(move || async move {
+      let (origin, shards) = crate::state::with_state(|state| (state.shard, state.shards.clone()))?;
+      let owner = slates_cluster::homes::HomeOwner::Record {
+        repository: [0; 16],
+      };
+      crate::vcs_store::homes::home_in_region(
+        origin,
+        &shards,
+        (crate::vcs_store::homes::HomeSource::Bytes(bytes), owner),
+        crate::fleet::live_budget(),
+      )
+      .await
+      .outcome
+      .ok()
+      .map(|homed| homed.0)
+    })
+  }
+
+  /// Test support (a914): the object `identity` read from the region from this node's control shard
+  /// (`vcs_store::homes::read_in_region`) within the live budget, and how long the read took, in nanoseconds.
+  pub fn read_from_region(
+    &self,
+    identity: [u8; 32],
+  ) -> Result<(Option<Vec<u8>>, u64), ObserveError> {
+    self
+      .run_on_control(move || async move {
+        let (origin, shards) =
+          crate::state::with_state(|state| (state.shard, state.shards.clone()))?;
+        let began = futures::now_ns();
+        let read = crate::vcs_store::homes::read_in_region(
+          origin,
+          &shards,
+          slates_vcs::ContentId(identity),
+          crate::fleet::live_budget(),
+        )
+        .await;
+        Some((read, futures::now_ns().saturating_sub(began)))
+      })?
+      .ok_or(ObserveError::NoTarget)
+  }
+
+  /// Test support (a914): `identity`'s region homes in their rank order over this node's members, as a read asks them
+  /// before its liveness order (`slates_db::identity_homes::homes`), and the live budget a read of it is given, in
+  /// nanoseconds (`fleet::live_budget`).
+  pub fn homes_of_identity(
+    &self,
+    identity: [u8; 32],
+  ) -> Result<(Vec<slates_db::HostId>, u64), ObserveError> {
+    self.observe(self.shards.first().copied(), move |state| {
+      let members = state.fleet.members().to_vec();
+      let f = usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX);
+      (
+        slates_db::identity_homes::homes(&identity, &members, f),
+        crate::fleet::live_budget().max_deadline_ns(),
+      )
+    })
+  }
+
+  /// Runs the step `make` makes as a task of this node's control shard, made there since a step that holds the shard's
+  /// state is no thread's to move, and waits for its answer within the observe budget plus the live budget (a step that
+  /// waits on the fleet, a region read or homing, runs up to the live budget): the typed refusal where it could not be
+  /// admitted, was refused its task, or did not answer in time.
+  fn run_on_control<T: Send + 'static, F: core::future::Future<Output = T> + 'static>(
+    &self,
+    make: impl FnOnce() -> F + Send + 'static,
+  ) -> Result<T, ObserveError> {
+    let shard = self.shards.first().copied().ok_or(ObserveError::NoTarget)?;
+    let runtime = self.runtime.as_ref().ok_or(ObserveError::NoRuntime)?;
+    let (answer, answered) = std::sync::mpsc::sync_channel::<T>(1);
+    let receipt = runtime
+      .spawn_on_with_receipt(shard, async move {
+        let step = make();
+        // A task refused its slot drops `answer`, which ends the wait below as unanswered.
+        if let Ok(task) = futures::spawn(async move {
+          let _ = answer.send(step.await);
+        }) {
+          let _ = futures::detach(task);
+        }
+      })
+      .map_err(|refusal| ObserveError::Submission {
+        refusal,
+        attempts: 1,
+        waited_ns: 0,
+      })?;
+    let budget_ns = OBSERVE_BUDGET_NS.saturating_add(crate::fleet::live_budget().max_deadline_ns());
+    let budget = std::time::Duration::from_nanos(budget_ns);
+    match receipt.wait(budget) {
+      Some(slates_rt::Admission::Admitted(_)) => {}
+      Some(slates_rt::Admission::Refused(refusal)) => {
+        return Err(ObserveError::Admission {
+          refusal,
+          attempts: 1,
+          waited_ns: 0,
+        });
+      }
+      Some(slates_rt::Admission::Terminated) => {
+        return Err(ObserveError::Terminated {
+          stage: ObserveStage::Admission,
+          attempts: 1,
+        });
+      }
+      None => {
+        return Err(ObserveError::Deadline {
+          stage: ObserveStage::Admission,
+          budget_ns,
+          attempts: 1,
+          waited_ns: budget_ns,
+          last_refusal: None,
+        });
+      }
+    }
+    answered
+      .recv_timeout(budget)
+      .map_err(|_| ObserveError::Deadline {
+        stage: ObserveStage::Execution,
+        budget_ns,
+        attempts: 1,
+        waited_ns: budget_ns,
+        last_refusal: None,
+      })
+  }
+
   /// Test support: the version at which the council's configuration fixed `member`'s settled neighbourhood
   /// and the version its current neighbourhood was fixed at (§4.8 "Neighbourhood changes"): equal once the
   /// member has reported its change placed and the council settled it; `None` for a non-member. A one-shot
