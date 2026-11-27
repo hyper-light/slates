@@ -1845,7 +1845,7 @@ mod tests {
       caught_up_owed(state);
       let before = counted(state);
       for at in 0..CADENCE_APPENDS {
-        let _ = let_go_and_note(state, (ENTRIES / 10 + at as usize, 1));
+        let _ = let_go_and_note(state, (ENTRIES / 10 + usize::try_from(at).unwrap(), 1));
         if ask_each {
           state.image_encoder.ask();
         }
@@ -1901,6 +1901,11 @@ mod tests {
     );
   }
 
+  /// What [`held_flow`] read: each publication's arena deferred bytes, next cut's cost and whether a cut was deferred;
+  /// the cuts begun before idle, the publications deferred, the held-bytes peak and the granule; and whether, once
+  /// idle, the committed image is the shard's entries.
+  type HeldFlow = (Vec<(u64, u64, bool)>, (u64, u64, u64, u64), bool);
+
   /// [`a_deferred_cut_holds_no_more_freed_bytes_than_it_would_cost`]'s flow on a shard, its page pinned at
   /// [`HELD_PAGE_GRANULES`] of the arena's granule: [`HELD_OBJECTS`] objects of a granule each (a chunk each, never a
   /// slab's slot), then [`HELD_FILL`] small ones after them, so the large ones' entries share a page, all published and
@@ -1909,7 +1914,7 @@ mod tests {
   /// catch-up: the arena's deferred bytes, the next cut's cost, and whether a cut is deferred. Then the cuts begun
   /// before idle, the publications deferred, the held-bytes peak gauge, the granule, and whether once idle the
   /// committed image is the shard's entries.
-  fn held_flow() -> (Vec<(u64, u64, bool)>, (u64, u64, u64, u64), bool) {
+  fn held_flow() -> HeldFlow {
     crate::daemon::audit_on_shard(move |state| {
       let granule = state.store.content.arena().granule();
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(granule * HELD_PAGE_GRANULES));
