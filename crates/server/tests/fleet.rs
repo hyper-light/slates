@@ -36929,6 +36929,106 @@ fn a894_a_repository_whose_owner_dies_as_its_creation_answers_is_taken_over_and_
   );
 }
 
+/// Shape: how many candidate objects [`object_homed_away_from`] tries for one whose homes exclude the reader: each is one
+/// of the three members' two homes with chance 2/3, so all of them miss the reader with chance (2/3)^64.
+const OBJECT_TRIES: u32 = 64;
+
+/// Bytes whose region homes, in rank order, exclude `reader`'s host, homed from `reader` (`Daemon::home_bytes_in_region`):
+/// the bytes, their identity, their homes, and the read's live budget. Panics where none could be homed.
+fn object_homed_away_from(
+  fleet: &GitFleet,
+  reader: usize,
+  name: &str,
+) -> (Vec<u8>, [u8; 32], Vec<HostId>, u64) {
+  let local = fleet.hosts[reader];
+  let (bytes, identity, homes, budget_ns) = (0..OBJECT_TRIES)
+    .find_map(|try_at| {
+      let bytes =
+        format!("{name}: an object read back from the region, try {try_at}\n").into_bytes();
+      let identity = slates_vcs::ContentId::of(&bytes).0;
+      let (homes, budget_ns) = fleet.daemons[reader].homes_of_identity(identity).ok()?;
+      (!homes.contains(&local)).then_some((bytes, identity, homes, budget_ns))
+    })
+    .expect("an object whose homes exclude the reader");
+  let homed = fleet.daemons[reader].home_bytes_in_region(bytes.clone());
+  assert_eq!(homed, Ok(Some(identity)), "the object homed at f + 1");
+  (bytes, identity, homes, budget_ns)
+}
+
+/// a914's record barrier, placed Some(1) (main 01a20182's ruling of 2026-11-27 12:37; ~/.local/state/w-interop-logs/
+/// a914-run-18.log): a holder's replay read each name from its homes one at a time, each waiting the whole live budget,
+/// so a name whose first home had just died cost 2 s before its live home was asked, and the barrier gave up first. Do:
+/// on a three-node `f = 1` git fleet, home from a an object whose two homes are b and c; stop its first-ranked home,
+/// and read it back from a at once, before any takeover. Expect the bytes, read within the read's budget: the first home
+/// given only its share of it, the second the rest. Red before: no bytes, the whole budget spent on the stopped home.
+#[test]
+fn a_region_read_whose_first_home_died_unseen_is_answered_by_the_next_within_the_budget() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = git_fleet("dead-first-home");
+  let (bytes, identity, homes, budget_ns) = object_homed_away_from(&fleet, 0, "dead-first-home");
+  let first = homes.first().copied().expect("a first home");
+  let at = fleet
+    .hosts
+    .iter()
+    .position(|host| *host == first)
+    .expect("the first home a member");
+  fleet.daemons.remove(at).stop();
+  let read = fleet.daemons[0].read_from_region(identity);
+  fleet.stop();
+  eprintln!(
+    "dead-first-home: homes {homes:?}, the first stopped; read {:?} of budget {budget_ns} ns",
+    read
+      .as_ref()
+      .map(|(bytes, took)| (bytes.as_ref().map(Vec::len), took))
+  );
+  let (got, took) = read.expect("the read observed");
+  assert_eq!(got, Some(bytes), "read back from the live home");
+  assert!(
+    took < budget_ns,
+    "read within the budget: {took} ns of {budget_ns}"
+  );
+}
+
+/// The twin of [`a_region_read_whose_first_home_died_unseen_is_answered_by_the_next_within_the_budget`] (main's ruling of
+/// 12:37): a first home alive but slower than its share. Do: as there, but make the first-ranked home hold each home
+/// message a whole live budget before it answers (`Daemon::delay_home_answers`) instead of stopping it; read from a;
+/// then ask a for its record session to that home. Expect the bytes within the budget, from the second home, and the
+/// slow home's session back in its link (`SessionHold::Took`): the exchange cut at the share gives it back. Red before:
+/// no bytes, the whole budget spent waiting for the slow home.
+#[test]
+fn a_region_read_whose_first_home_is_slow_past_its_share_reads_the_next_and_returns_the_session() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = git_fleet("slow-first-home");
+  let (bytes, identity, homes, budget_ns) = object_homed_away_from(&fleet, 0, "slow-first-home");
+  let first = homes.first().copied().expect("a first home");
+  let at = fleet
+    .hosts
+    .iter()
+    .position(|host| *host == first)
+    .expect("the first home a member");
+  fleet.daemons[at].delay_home_answers(budget_ns).unwrap();
+  let read = fleet.daemons[0].read_from_region(identity);
+  let session = fleet.daemons[0].hold_record_session(first, 0);
+  fleet.daemons[at].delay_home_answers(0).unwrap();
+  fleet.stop();
+  eprintln!(
+    "slow-first-home: homes {homes:?}; read {:?} of budget {budget_ns} ns; session {session:?}",
+    read
+      .as_ref()
+      .map(|(bytes, took)| (bytes.as_ref().map(Vec::len), took))
+  );
+  let (got, took) = read.expect("the read observed");
+  assert_eq!(got, Some(bytes), "read back from the second home");
+  assert!(
+    took < budget_ns,
+    "read within the budget: {took} ns of {budget_ns}"
+  );
+  assert!(
+    matches!(session, Ok(SessionHold::Took { .. })),
+    "the slow home's session back in its link: {session:?}"
+  );
+}
+
 /// Shape: the pushes [`a907_a_home_slower_than_its_senders_round_costs_the_sender_no_session`] makes at most until a
 /// holds a window for the region: each push homes two windows at two of the three nodes, so a is a home of neither one
 /// time in nine, and of none after this many more pushes one time in 3^16, about 43 million.
