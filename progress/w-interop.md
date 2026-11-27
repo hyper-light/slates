@@ -720,3 +720,11 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   - ssh patience test: fix committed locally, 8d027b59c in w-interop-ceiling (patch
     ~/.local/state/w-interop-logs/ssh-patience-2026-11-27.patch), not yet tested. Run its test once back on AC, then
     push.
+- 2026-11-27 10:43 PST: landed f023f1537: the ssh patience control judged by the read's own answer (8d027b59c; diag 9 Windows
+  x86_64), and the spawn cost role leaving a spawn's 3 stream numbers free under the system's cap (8e97eb178; diag 10
+  macos-latest). Main's next diag CI confirms both.
+- 2026-11-27 10:43 PST: red 4. The landings ran beside the import on Windows, but the overlap counter counts only an answer seen at a
+  yield (main's read of runs 46045562251 and 46047367289: every landing waited at the hand-over, 27 to 56 us).
+  Extended diag ac1c60ccd on w-interop/hg-landing-diag (the owner's sent stamp against the hand-over's start) is
+  running as main's run 46051267769. If the answers are sent before the hand-over: rule (a'), count by the owner's
+  stamp. OPEN after it: why Windows cuts a segment every turn while the Mac cuts every other.
