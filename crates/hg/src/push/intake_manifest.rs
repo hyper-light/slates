@@ -58,6 +58,10 @@ enum Base {
     /// node) whose text the chain above is read over (w-interop's matrix at 29221d5ab: a manifest this push kept, a
     /// delta on a landed one let go, was asked of the store itself, which keeps no row of it).
     from: (u32, Node),
+    /// Whether this is its ask made again, once, over a row above the first link let go between that ask and its use
+    /// ([`Taker::bring_in`]; main's ruling of 2026-11-27): a chain that fails over a let-go row a second time is
+    /// refused.
+    again: bool,
   },
   /// A manifest's text the store gave, held in the content store as one object for this revision's steps.
   Given {
@@ -328,7 +332,14 @@ impl Taker {
       Some(chain) => (Base::Chain { node, chain }, len),
       None => {
         let from = Chain::let_go_link(&self.fork, store, rev).unwrap_or((rev, node));
-        (Base::Asked { node, from }, len)
+        (
+          Base::Asked {
+            node,
+            from,
+            again: false,
+          },
+          len,
+        )
       }
     })
   }
@@ -606,6 +617,7 @@ impl Taker {
     let Base::Asked {
       node,
       from: (from_rev, from),
+      again,
     } = *base
     else {
       return Ok(None);
@@ -657,7 +669,25 @@ impl Taker {
     };
     let Some(chain) = chain else {
       let _ = store.release(&object);
-      return Err(unread_of(node, from));
+      // A row above the link let go between the ask and its use (its segment landed meanwhile, between the server's
+      // slices): asked again, once, for the topmost link let go now, which, landed, the store keeps. Never more: an ask
+      // made again without bound is the shape of a livelock (main's ruling of 2026-11-27), so a chain that fails so a
+      // second time, or a link that did not move, is refused as before.
+      let moved = self
+        .fork
+        .rev(store, Log::Manifest, &node)
+        .and_then(|rev| Chain::let_go_link(&self.fork, store, rev))
+        .filter(|link| !again && link.1 != from);
+      let Some(link) = moved else {
+        return Err(unread_of(node, from));
+      };
+      self.intaken.log_texts_reasked = self.intaken.log_texts_reasked.saturating_add(1);
+      *base = Base::Asked {
+        node,
+        from: link,
+        again: true,
+      };
+      return self.bring_in(base, store, admission);
     };
     *base = Base::Given {
       node,
