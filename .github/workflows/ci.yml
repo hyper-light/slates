@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # diag only (main 01a20182, 2026-11-27): main's own runs are replaced while they wait, every push to main
+    # within the wait; this branch runs the whole of CI once at main's tip. Never merged to main.
+    branches: [main, "diag-measurer-main-ci-*"]
   pull_request:
   # The nightly run (Part 6: shuttle, TSan and the long lanes "nightly"; AUD-29-32; Ada authorized the
   # schedule 2026-10-03). Every job runs on it, on main, so a day with no push still meets a moving
