@@ -622,6 +622,31 @@ fn family_entries(
   }
 }
 
+/// The coordinate a committed entry of `family` lies at, read back from its key and bytes as [`family_entries`] made
+/// them (A-930: what a cut of a committed piece places its entries by): a window's handle is its key's position; a
+/// window let go's number is its bytes' last eight (A-923); every other family's is its identity's first eight bytes,
+/// which its key's object begins with. None for a form no build writes now (an away before A-923) or a foreign kind.
+pub(crate) fn entry_coordinate(
+  family: crate::image_pages::Family,
+  key: &PieceKey,
+  bytes: &[u8],
+) -> Option<u64> {
+  use crate::image_pages::Family;
+  let (kind, _, position) = split_key(key);
+  match family {
+    Family::Windows => (kind == KIND_VCS_WINDOW).then_some(position),
+    Family::Aways => {
+      let number = bytes.last_chunk::<{ size_of::<u64>() }>()?;
+      (kind == KIND_VCS_AWAY).then(|| u64::from_le_bytes(*number))
+    }
+    Family::Lists | Family::Names | Family::RegionHolds | Family::Landed => key
+      .get(KEY_OBJECT_AT..KEY_OBJECT_AT.saturating_add(size_of::<u64>()))?
+      .try_into()
+      .ok()
+      .map(u64::from_be_bytes),
+  }
+}
+
 /// [`family_entries`] of the content store's lists.
 fn list_entries(
   content: &slates_vcs::ContentStore,
@@ -1378,7 +1403,10 @@ pub(crate) fn image_turn(state: &mut ShardState) -> crate::image_pages::Turned {
   let mut encoded = Vec::new();
   let turned = encoder.turn(
     (limit, limit),
-    &|family, range, cap, out| family_entries(state, family, (range, Some(cap)), out),
+    (
+      &|family, range, cap, out| family_entries(state, family, (range, Some(cap)), out),
+      &entry_coordinate,
+    ),
     &mut encoded,
   );
   state.image_encoder = encoder;

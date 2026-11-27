@@ -65670,9 +65670,26 @@ Applied in the same change to:
     and empty bytes refused.
   - `a_pushs_let_goes_re_encode_the_aways_pages_they_fill_not_every_page_of_the_aways_held` (A-923's): 20 let-goes over
     1,500 held aways re-encoded 8,639 bytes of the family before (under its bound of 9,732), 1,555 now.
-- **Owed, the rule's other half:** the windows family's removal (21,192,055 bytes, 28.5% of the 57k push's image) as a
-  cut of the committed piece. A let-go removes a window's entry anywhere in its page, so it is not an append; its own
-  piece follows.
+- **Part 2, the rule's other half: a window let go is a cut of its committed piece** (2026-11-26, main's order of
+  22:39; the windows family was 21,192,055 bytes, 28.5% of the 57k push's image). A let-go takes a window's entry out
+  anywhere in its page, so it is no append. The encoder now keeps every coordinate a page's changes lie at since the
+  committed cut (`Marked`, which replaced part 1's least coordinate; a split's pages are marked whole).
+  - **The cut:** each committed entry's coordinate is read back from its key and bytes (`content_holder::entry_coordinate`:
+    a window's handle is its key's position, a window let go's number its bytes' last eight, every other family's
+    identity's first eight bytes its key's object's). At the cut, the entries at each changed coordinate are read
+    afresh, and the entries past the last coordinate as part 1 reads them. The new piece is the committed one with its
+    entries at the changed coordinates taken out and the fresh ones put in their place, then the ones past its end:
+    the unchanged runs copied, only what was read encoded (`Encoder::cut_committed`, `PieceCut`). A page of no entry
+    left has no piece, as a whole re-encoding leaves it.
+  - **Where it is not taken:** an entry of the piece whose coordinate does not read back inside the page, in order,
+    ending at the recorded last; a read that stops at its cap; or a page that would pass twice the page size, which
+    splits. Each is re-encoded whole, as before. So a cut piece is a whole encoding's bytes, and no format moves.
+  - **Red:** `a_windows_let_go_cuts_its_committed_piece_not_re_encodes_its_page`, 300 landed windows kept and
+    checkpointed at a 4,096-byte page, then 60 let go one publication each: 266,160 bytes encoded before (about a 4,436-byte page each publication); 0 bytes encoded with
+    the cut, the family 31,535 bytes in the image before and 25,235 after; the same oracle as part 1's (the image the
+    shard's entries, each piece a whole encoding's bytes). Part 1's red is unchanged by the cut: 46,300 bytes.
 - **Applied in the same change to:** `crates/server/src/image_pages.rs` (the encoder's lasts and least changes,
   `append_page`, `entry_ends`, `CommittedPiece`, `Encoder::appends`, `append`, `split_appended`, `dirty_whole`); the
-  goal 93 line in GAPS (A-923's entry).
+  goal 93 line in GAPS (A-923's entry). Part 2: `image_pages.rs` (`Marked`, `EntryCoordinate`, `Changed`, `PieceCut`,
+  `CommittedPiece::coordinates`, `Encoder::changed_since`, `changed_turn`, `cut_committed`; `Encoder::turn` takes the
+  coordinate reader beside the family reader) and `crates/server/src/content_holder.rs` (`entry_coordinate`).

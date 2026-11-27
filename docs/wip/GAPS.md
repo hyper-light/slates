@@ -487,9 +487,10 @@
 > A-930 (w-perf; main's ruling of 2026-11-25 on the 57k churn, whose push encoded 43,141,224 Aways bytes, 58% of its
 > image): a page changed only past its committed piece's last coordinate appends to the piece, and its split copies the
 > piece's entries, so a publication encodes only what was appended. Red: 600 let-goes published one at a time encoded
-> 2,588,710 bytes of the family (600 times a 4,314.5-byte tail) for 46,275 appended; now 46,300. OWED: the windows
-> family's removal as a cut of the committed piece (21,192,055 bytes, 28.5%), and main's in-place 57k rerun for the
-> after.
+> 2,588,710 bytes of the family (600 times a 4,314.5-byte tail) for 46,275 appended; now 46,300. Part 2: a window let
+> go is a cut of its committed piece (the windows family was 21,192,055 bytes, 28.5%): 60 let-goes over 300 kept
+> windows, a publication each, encoded 266,160 bytes of the family; now 0. OWED: main's in-place 57k rerun for the
+> after, with its publication count and page.
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
