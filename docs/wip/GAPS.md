@@ -629,9 +629,26 @@
 >   The healed path's net: `b3_a_create_at_a_commit_a_green_holds_lands_over_let_go_windows`,
 >   `b3_a_create_whose_base_search_runs_over_a_let_go_commit_lands`,
 >   `b3_a_merge_whose_admission_walks_a_let_go_parent_brings_it_back_and_lands`.
-> - OPEN: B4 (the policy's reads), B5 (`PushedObjects::bytes` of a pushed object, `Malformed`), B6 (a verdict's one-call
->   build), B7 (`push_of`'s peel at judge time, after `prepare`'s), B8 (the encoding's tree walk: time, not
->   correctness).
+> - **B4 BUILT (w-git, 2026-11-27): the policy's reads.** A rule requiring signed commits or a linear history (A-644) is
+>   judged in the verdict (`ServerJudge::admitted`), whose reads go through `Repository::bytes_of`: a let-go commit or
+>   tag declined the command `Unjudged` ("its commits cannot be read"). A signed-commits rule reads every commit a move
+>   brings, below a tip a trusted key signed too, which the command's preparation never reads; a linear history reads
+>   bytes only for its peels of an annotated tag at the new value or the old head (a commit's parents come from its
+>   row), which the preparation's `peel_away` and `base_of` read first in the same `ServerJudge::ready`, so on one
+>   push's path it heals and bites only on another party's let-go between the preparation and the verdict. Now `ready`
+>   asks the policy's check last, once the command is otherwise ready, its reads quiet (`Repository::reading_quietly`),
+>   a let-go it meets noted in the push's own slot and the command not ready by the one rule keyed by its number
+>   (`DecidingPush::policy_away`), so the verdict in the same step reads what the check read; the check is shared
+>   (`git_push::policy_check`). Reds:
+>   `git_push::tests::b4_a_signed_commits_rule_reading_a_let_go_commit_brings_it_back_and_judges_it` (A-644's golden
+>   `signed` vectors, `second` and `first` in a window of their own: declined before, `ok` after) and, at the judge's
+>   own site, `b4_a_linear_rules_check_over_a_let_go_old_tag_waits_for_it_before_its_verdict` (ready over the let-go old
+>   tag before, the verdict `Unjudged`; after, not ready with the push's slot noted and the shared one empty, the same
+>   let-go twice its typed refusal, brought back its verdict `Ok`). The healed path's net:
+>   `b4_a_linear_rules_update_of_a_let_go_tag_head_lands`. The reds were taken with the policy step alone disabled
+>   (`true || policy_ready`), the tests needing its new field to compile.
+> - OPEN: B5 (`PushedObjects::bytes` of a pushed object, `Malformed`), B6 (a verdict's one-call build), B7 (`push_of`'s
+>   peel at judge time, after `prepare`'s), B8 (the encoding's tree walk: time, not correctness).
 > **P OPEN (w-git; main's r229, 2026-11-23): git/git's HTTP mirror clone takes about 100 s** (97.9 and 107.7 s, 556 MB
 > against stock git's 612 MB; the work clone 92.9 and 97.2 s), the daemon CPU-bound at 97% of one core: blake3,
 > `Index::get`, `ContentStore::get` / `len_of` / `window_at_in`, `Positions::settle`. No stall; to be profiled.
