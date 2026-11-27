@@ -691,3 +691,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - Removed: adopted_elsewhere_of and Daemon::holder_owner. A919 is un-ignored; A919 and the owed-part scene ran 6 of 6 green, none re-formed.
 - The route record did not land (main's 03:33 note: counters, not a new interface).
 - Next: v3_takeover's "waiting on its adoption" stall.
+
+## 2026-11-27 05:41 PST: A-921 part 5 follow-up landed (slates 4ab6d9a16, commit 2b4f33e14)
+- Per main's 05:11 finding, a refused announcement spawn no longer runs inline. The member stays owed, the next turn retries, and the refusal is counted by kind (fleet.plane/edges.announce_refused.<kind>).
+- Red first: a921_a_member_loop_refused_a_task_keeps_answering_and_tries_again. The inline path got b held dead in 460 ms; after the fix, 3 of 3 green.
+- Next: v3_takeover's "waiting on its adoption" stall.
