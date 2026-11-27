@@ -694,3 +694,5 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
 - 2026-11-27, main's TSan-lane piece: part 1 (client re-hold helper) cd7d8c96c; items 1 and 2 of the spawner red (the
   gate, delivery's CLOEXEC opens) a06460d8d; item 3, A-931 (an anchor's held sockets close-on-exec, handed on to the
   daemon's child alone; red in diag run 45993337450) 5f0089f85. The Linux runs are in run-requests.md for main.
+- 8fc8a0210: A-931's siblings. Six CLI suites hand their serve sockets on in the child (support/hand_on.rs). Their
+  runs are in run-requests.md.

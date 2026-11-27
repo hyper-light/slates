@@ -7646,3 +7646,14 @@ On Linux (ubuntu-latest), at or past 5f0089f85:
   child count of 0 (not handed on), or the shell holding the listener.
 - `cargo test -p slates-cli --test svn_interop a_hook_holds_no_descriptor_of_its_daemon`, with stock svn, a real
   anchor's daemon and hook. Green: the hook holds its streams and its directory alone.
+
+## 2026-11-27 w-interop, the CLI suites hand their serve sockets on in the child (A-931's siblings), 8fc8a0210
+
+At or past 8fc8a0210, where these suites already run (Linux and macOS lanes, their usual gates):
+`cargo test -p slates-cli --test live_fleet`, `--test fs_server`, `--test hg_takeover`, `--test v3_takeover`,
+`--test live_chaos`, and `--test cli` with `SLATES_TEST_CLI=1` (its fleet starts).
+- Green: as before the change. Each spawned node adopts its probe and record sockets (and node a its export listener
+  in `cli`'s anchored fleet) from `ENV_FLEET_SERVE`.
+- Red: a node refusing its serve sockets ("not a socket", or "bound at" a port other than its own), which would mean
+  `handing_on` did not reach the child.
+- Already run on the MacBook: `a_daemon_refuses_inherited_serve_sockets_bound_elsewhere_or_malformed`, 1/1.
