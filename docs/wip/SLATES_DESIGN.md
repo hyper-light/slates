@@ -66153,7 +66153,10 @@ Applied in the same change to:
     arena refuses) and owes its edges to every peer again (`Daemon::owe_edges_again`). No node may condemn b for four
     of b's detections, b's refusals are counted by kind more than once, and its record is sent once the refusal lifts.
     With the inline path: red, every other node held b dead within 460 ms, and no refusal counted. After: 3 of 3
-    green, the refusals counted once a member a turn (2,042 to 24,899 over the window).
+    green, the refusals counted once a member a turn (2,042 to 24,899 over the window). Checked, not asserted
+    (main's 05:52): the member loop counts its turns (`fleet.plane.loop_turns`), and the test asserts the refusals at
+    most its owed members times its turns over the same window, so a spin cannot pass as the turn rate. Measured
+    exactly 3.0 a turn with 3 owed (2,523 over 841 turns, 2,382 over 794).
   - The owed-part scene and A919's owner-restart scene no longer guard against the adoption (`adopted_elsewhere_of`
     and `Daemon::holder_owner` are removed), and A919's test is no longer ignored. Both, after both fixes: 6 runs each,
     none formed afresh, none failed.
