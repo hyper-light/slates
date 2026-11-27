@@ -36998,7 +36998,7 @@ fn a_region_read_whose_first_home_died_unseen_is_answered_by_the_next_within_the
 #[test]
 fn a_region_read_whose_first_home_is_slow_past_its_share_reads_the_next_and_returns_the_session() {
   let _serial = serialize_fleet_tests();
-  let mut fleet = git_fleet("slow-first-home");
+  let fleet = git_fleet("slow-first-home");
   let (bytes, identity, homes, budget_ns) = object_homed_away_from(&fleet, 0, "slow-first-home");
   let first = homes.first().copied().expect("a first home");
   let at = fleet
