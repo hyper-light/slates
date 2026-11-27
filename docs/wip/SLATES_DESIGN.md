@@ -65806,6 +65806,18 @@ Applied in the same change to:
     checkpointed at a 4,096-byte page, then 60 let go one publication each: 266,160 bytes encoded before (about a 4,436-byte page each publication); 0 bytes encoded with
     the cut, the family 31,535 bytes in the image before and 25,235 after; the same oracle as part 1's (the image the
     shard's entries, each piece a whole encoding's bytes). Part 1's red is unchanged by the cut: 46,300 bytes.
+- **What it costs past encoding (main's 57k rerun at c207c9f81, 2026-11-26 23:37):** the families' encoded bytes fell
+  (aways 43,141,224 to 19,129,720, windows 21,192,055 to 12,235,090), but `vcs_store.image.encoded_bytes` rose from
+  74,340,245 to 295,619,288. Since part 1 a turn's spent bytes count the committed bytes each append, cut or split
+  copies, so 263,910,185 bytes of that were copies, counted as encoding. They are counted apart now
+  (`vcs_store.image.copied_bytes`, `Turned::copied`; `encoded_bytes` is encoding and splits' reads again, as its
+  definition says), with the page size a turn planned by (`vcs_store.image.page_bytes`), and `hg_fetch_heap`'s
+  `what_holds` prints every `vcs_store.image.*` counter. At test scale: the Aways red's 600 cuts encoded 160,860
+  bytes in all and copied 5,326,728 (two pages a cut: the Aways tail and the landed records' page); the windows red's 60
+  cuts encoded 4,625 and copied 402,745. A publication moves its dirty pages' bytes whole either way, since a delta
+  carries a page's piece whole; the copy only replaced the encoding. OWED: the 57k's cut count from the rerun with
+  these counters, and main's ruling on carrying a piece in parts (the committed bytes by reference), which would take
+  the copy out.
 - **Applied in the same change to:** `crates/server/src/image_pages.rs` (the encoder's lasts and least changes,
   `append_page`, `entry_ends`, `CommittedPiece`, `Encoder::appends`, `append`, `split_appended`, `dirty_whole`); the
   goal 93 line in GAPS (A-923's entry). Part 2: `image_pages.rs` (`Marked`, `EntryCoordinate`, `Changed`, `PieceCut`,
