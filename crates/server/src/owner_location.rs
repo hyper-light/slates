@@ -708,7 +708,12 @@ pub(crate) fn home_query(state: &ShardState, object: ObjectId) -> Query {
 /// control shard's driver waits (A-292's rule), a busy shard, which rarely waits, held it to the SLO too (A-315 found
 /// the same on the forward lane). The operator's failover SLO caps the whole on the wall.
 pub(crate) async fn locate_owner(query: Query, bound_ns: Option<u64>) -> Option<HostId> {
+  let began = slates_rt::futures::now_ns();
   let located = locate_within_horizon(query, bound_ns).await;
+  // Its own time, from before its first look to its answer in the poll that made it (A-921 part 2: what a bounded
+  // caller's lane is held for, apart from any task's resume after it).
+  let elapsed = slates_rt::futures::now_ns().saturating_sub(began);
+  crate::state::with_state(|state| state.count_max(ELAPSED_MOST, elapsed));
   if located.is_none() {
     // Counted here, so any way the location gives up is seen; its budget's own two ends are counted within it.
     crate::state::with_state(|state| state.count(LOCATION_GAVE_UP, 1));
@@ -781,6 +786,10 @@ pub(crate) const LOOK_MOST: &str = "fleet.owner_location.look_most_ns";
 /// nanoseconds (the timer's lateness and the task's resume after it): with [`LOOK_MOST`], what a bounded caller is held
 /// past its bound (A-921 part 2). Format: a counter name, read as the most it reached ([`ShardState::count_max`]).
 pub(crate) const WAIT_LATE_MOST: &str = "fleet.owner_location.wait_late_most_ns";
+/// Counter: the longest an owner location took on this shard, from before its first look to its answer in the poll that
+/// made it, in nanoseconds ([`locate_owner`]): a bounded caller's is within its bound, [`WAIT_LATE_MOST`] and
+/// [`LOOK_MOST`] (A-921 part 2). Format: a counter name, read as the most it reached ([`ShardState::count_max`]).
+pub(crate) const ELAPSED_MOST: &str = "fleet.owner_location.elapsed_most_ns";
 
 /// Counter: a forward's owner location ended by the operator's failover SLO, the owner still not found.
 const LOCATION_SLO_ENDED: &str = "fleet.owner_location.slo_ended";
@@ -1270,10 +1279,11 @@ mod tests {
   /// A-921 part 2's bound held by the lookup itself (main 01a20182's order of 2026-11-26: the home healer's resolution
   /// pass over unclaimed attempts ran 10.08 to 10.57 ms past its 1,998 ms budget in 6 of main's last 4 sets, one pace
   /// and a wait's lateness). Do: on a one-shard daemon, look up the owner of an object no node holds, bounded at two
-  /// paces and a half, so its bound ends inside a pace. Expect: none found, and the lookup over within its bound, the
+  /// paces and a half, so its bound ends inside a pace. Expect: none found, and the lookup's own time
+  /// ([`ELAPSED_MOST`], before its first look to its answer, not the test task's resume after it) within its bound, the
   /// most its own waits came back late ([`WAIT_LATE_MOST`]) and its longest look ([`LOOK_MOST`]), each measured in the
-  /// lookup. Red
-  /// before: it slept a whole pace whatever was left of its bound, so it ended at least half a pace past it.
+  /// lookup. Red before: it slept a whole pace whatever was left of its bound, so it ended at least half a pace past
+  /// it.
   #[test]
   fn a921_a_bounded_owner_lookup_ends_within_its_bound_and_its_waits_lateness() {
     let daemon = crate::daemon::audit_daemon();
@@ -1284,21 +1294,19 @@ mod tests {
       let task = slates_rt::futures::spawn(async move {
         let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
         let bound = pace.saturating_mul(2).saturating_add(pace / 2);
-        let began = slates_rt::futures::now_ns();
         let found = locate_owner(query, Some(bound)).await;
-        let took = slates_rt::futures::now_ns().saturating_sub(began);
         let held = crate::state::with_state(|state| {
           let most = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
-          (most(WAIT_LATE_MOST), most(LOOK_MOST))
+          (most(ELAPSED_MOST), most(WAIT_LATE_MOST), most(LOOK_MOST))
         });
-        let _ = sent.send((found, took, bound, held));
+        let _ = sent.send((found, bound, held));
       })
       .expect("the task");
       slates_rt::futures::detach(task).expect("detached");
     });
-    let (found, took, bound, held) = got.recv().expect("the lookup ended");
+    let (found, bound, held) = got.recv().expect("the lookup ended");
     daemon.stop();
-    let (late, look) = held.expect("the shard's state");
+    let (took, late, look) = held.expect("the shard's state");
     assert_eq!(found, None, "no node holds the object");
     assert!(
       took <= bound.saturating_add(late).saturating_add(look),

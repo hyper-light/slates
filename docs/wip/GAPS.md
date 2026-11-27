@@ -367,7 +367,9 @@
 >     both tests bound the lookup by its bound (the pass by its budget), the most its own waits came back late and its
 >     longest look, each measured in the lookup and counted on its shard (`owner_location::WAIT_LATE_MOST`,
 >     `LOOK_MOST`), not a pace, nor the shard's overall overrun and a look timed beforehand, which main's 9 runs found
->     short by 9 to 110 us under load (after: 0.15 ms past the pass's budget; main's runs 9 to 110 us).
+>     short by 9 to 110 us under load (after: 0.15 ms past the pass's budget; main's runs 9 to 110 us). The lookup's
+>     test asserts the lookup's own time (`ELAPSED_MOST`, before its first look to its answer), not the test task's
+>     resume after it, which main's next 9 found 2.6 to 6.2 us past.
 >   - **OPEN, waits for Ada's word: fleet-wide repository name routing.** A node holding no copy of a repository answers
 >     `404` (the fleet test: the third node's `ls-remote` "not found"): a name resolves only where a partition holds it
 >     (D-12, no directory; D-14, no global catalog), so it cannot even form the owner's query. Not started.
