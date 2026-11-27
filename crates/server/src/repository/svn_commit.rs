@@ -298,22 +298,10 @@ async fn landed_work(
   work: Work,
   texts: &dyn slates_svn::commit::drive::TextSink,
 ) -> Option<Result<Committed, Uncommitted>> {
-  let begun = crate::state::with_state(|state| begin_storing(state, repository, &work))?;
-  let mut storing = match begun {
+  let storing = match work_stored(repository, &work, texts).await? {
     Ok(storing) => storing,
     Err(refused) => return Some(Err(refused)),
   };
-  loop {
-    let stepped = crate::state::with_state(|state| store_step(state, &mut storing, texts))?;
-    match stepped {
-      Ok(true) => break,
-      Ok(false) => slates_rt::futures::yield_now().await,
-      Err(refused) => {
-        let _ = crate::state::with_state(|state| release_stored(state, storing));
-        return Some(Err(refused));
-      }
-    }
-  }
   // A stored text a row names that the content store let go is brought back whole for the green's increment.
   let brought = match bring_stored(repository, &work.record.changes).await? {
     Ok(brought) => brought,
@@ -380,6 +368,32 @@ async fn landed_work(
     crate::vcs_store::name_holds::let_go_landed_texts(state, &restoring);
   });
   landed
+}
+
+/// The texts `work` brings put through repository `repository`'s content store a copy slice a step, read from `texts`:
+/// what was put, held until the landing ends ([`release_stored`]). None where the shard's state is gone; refused with
+/// what was put given back.
+async fn work_stored(
+  repository: RepositoryId,
+  work: &Work,
+  texts: &dyn slates_svn::commit::drive::TextSink,
+) -> Option<Result<Storing, Uncommitted>> {
+  let begun = crate::state::with_state(|state| begin_storing(state, repository, work))?;
+  let mut storing = match begun {
+    Ok(storing) => storing,
+    Err(refused) => return Some(Err(refused)),
+  };
+  loop {
+    let stepped = crate::state::with_state(|state| store_step(state, &mut storing, texts))?;
+    match stepped {
+      Ok(true) => return Some(Ok(storing)),
+      Ok(false) => slates_rt::futures::yield_now().await,
+      Err(refused) => {
+        let _ = crate::state::with_state(|state| release_stored(state, storing));
+        return Some(Err(refused));
+      }
+    }
+  }
 }
 
 /// Repository `repository`'s landing turn, taken for a revision whose rows are `changes`, with the restores of its
@@ -681,6 +695,50 @@ async fn stage_texts(
   revision: &mut Revision,
   imported: Vec<ContentIdentity>,
 ) -> Option<Result<(Storing, Vec<landing::LandedText>), Uncommitted>> {
+  let storing = match texts_stored(repository, revision, imported).await? {
+    Ok(storing) => storing,
+    Err(refused) => return Some(Err(refused)),
+  };
+  section_yield().await?;
+  let carried = texts_carried(&revision.record.changes, &storing.put).await?;
+  // What the staging does next begins a step of its own (A-920 11c: the walk's end and the brought texts' first part
+  // shared one poll).
+  section_yield().await?;
+  Some(Ok((storing, carried)))
+}
+
+/// [`stage_texts`]'s texts put: the revision's taken out of its contents and their storing begun ([`staging_begun`]),
+/// the import's handed over ([`handed_over`]), then the revision's put through the content store a copy slice a step
+/// ([`taken_stored`]). None where the shard's state is gone; refused with what was put given back, `imported` too.
+async fn texts_stored(
+  repository: RepositoryId,
+  revision: &mut Revision,
+  imported: Vec<ContentIdentity>,
+) -> Option<Result<Storing, Uncommitted>> {
+  let (texts, mut storing) = match staging_begun(repository, revision, &imported).await? {
+    Ok(begun) => begun,
+    Err(refused) => return Some(Err(refused)),
+  };
+  handed_over(repository, revision, &mut storing, imported).await?;
+  let storing = match taken_stored(storing, &texts).await? {
+    Ok(storing) => storing,
+    Err(refused) => return Some(Err(refused)),
+  };
+  // The bytes are the content store's now, until the landing ends.
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("storing.carried");
+  drop(texts);
+  Some(Ok(storing))
+}
+
+/// The texts `revision` brings taken out of its contents ([`take_texts`]) and their storing begun in repository
+/// `repository`'s content store ([`storing_of`]), each a step of its own (goal 93). None where the shard's state is
+/// gone; refused with `imported` unpinned and given back.
+async fn staging_begun(
+  repository: RepositoryId,
+  revision: &mut Revision,
+  imported: &[ContentIdentity],
+) -> Option<Result<(BTreeMap<ContentIdentity, Vec<u8>>, Storing), Uncommitted>> {
   #[cfg(test)]
   crate::vcs_store::svn_import::phase::tag("storing");
   let texts = crate::state::with_state(|state| take_texts(state, repository, revision))?;
@@ -690,36 +748,54 @@ async fn stage_texts(
     match storing_of(state, repository, (&revision.record.changes, texts.keys())) {
       Ok(storing) => Ok(storing),
       Err(refused) => {
-        crate::vcs_store::name_holds::unpin_texts(state, &imported);
-        release_texts(state, None, &imported);
+        crate::vcs_store::name_holds::unpin_texts(state, imported);
+        release_texts(state, None, imported);
         Err(refused)
       }
     }
   })?;
-  let mut storing = match begun {
+  let storing = match begun {
     Ok(storing) => storing,
     Err(refused) => return Some(Err(refused)),
   };
   section_yield().await?;
-  // The import's texts handed over a text a unit, a slice of the shard's budget a step (A-920 13a: 9,000 in one step,
-  // 10.5 ms, debug, with the storing's begin the release leader of every wide import).
+  Some(Ok((texts, storing)))
+}
+
+/// The import's texts `imported` handed over to `storing` a text a unit, a slice of the shard's budget a step (A-920
+/// 13a: 9,000 in one step, 10.5 ms, debug, with the storing's begin the release leader of every wide import). None
+/// where the shard's state is gone.
+async fn handed_over(
+  repository: RepositoryId,
+  revision: &Revision,
+  storing: &mut Storing,
+  imported: Vec<ContentIdentity>,
+) -> Option<()> {
   #[cfg(test)]
   crate::vcs_store::svn_import::phase::tag("storing.hand_over");
-  let mut handing = HandingOver::new(&storing, imported);
+  let mut handing = HandingOver::new(storing, imported);
   loop {
     let deadline = slates_rt::futures::now_ns()
       .saturating_add(slates_rt::futures::step_budget_ns().unwrap_or(0));
     let done = crate::state::with_state(|state| {
       state.count(HAND_OVER_STEPS, 1);
-      handing.some(state, (repository, &*revision), &mut storing, deadline)
+      handing.some(state, (repository, revision), storing, deadline)
     })?;
     if done {
       break;
     }
     slates_rt::futures::yield_now().await;
   }
-  section_yield().await?;
-  // Each piece lent from the text the landing holds, never copied out (P7's finding (2)).
+  section_yield().await
+}
+
+/// The revision's taken `texts` put through the content store `storing` began a copy slice a step, each piece lent from
+/// the text the landing holds, never copied out (P7's finding (2)). None where the shard's state is gone; refused with
+/// what was put given back.
+async fn taken_stored(
+  mut storing: Storing,
+  texts: &BTreeMap<ContentIdentity, Vec<u8>>,
+) -> Option<Result<Storing, Uncommitted>> {
   let piece = |identity: &ContentIdentity, offset: u64, len: usize| {
     let bytes = texts.get(identity)?;
     let start = usize::try_from(offset).ok()?;
@@ -730,7 +806,7 @@ async fn stage_texts(
   loop {
     let stepped = crate::state::with_state(|state| store_step_from(state, &mut storing, &piece))?;
     match stepped {
-      Ok(true) => break,
+      Ok(true) => return Some(Ok(storing)),
       Ok(false) => slates_rt::futures::yield_now().await,
       Err(refused) => {
         let _ = crate::state::with_state(|state| release_stored(state, storing));
@@ -738,16 +814,6 @@ async fn stage_texts(
       }
     }
   }
-  // The bytes are the content store's now, until the landing ends.
-  #[cfg(test)]
-  crate::vcs_store::svn_import::phase::tag("storing.carried");
-  drop(texts);
-  section_yield().await?;
-  let carried = texts_carried(&revision.record.changes, &storing.put).await?;
-  // What the staging does next begins a step of its own (A-920 11c: the walk's end and the brought texts' first part
-  // shared one poll).
-  section_yield().await?;
-  Some(Ok((storing, carried)))
 }
 
 /// Counter: a step of an import's texts handed over to its landing ([`HandingOver`], A-920 13a): many a wide revision
