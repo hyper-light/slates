@@ -2361,7 +2361,15 @@
 > `vcs.hg.push_base_store_reasked` beside `vcs.hg.push_base_store_reads`. Red:
 > `a_file_delta_on_a_base_whose_block_was_let_go_is_taken_after_its_base_is_brought_back` (still stepping at its derived
 > bound, 16 steps and 11 asks; now 12 steps and one ask). The manifests' race above was a sibling, not the hang. OWED:
-> main's 57k runs on the tip, the new counter moving in them.
+> main's 57k runs on the tip, the new counter moving in them. FIXED (main, 2026-11-27 05:06): the 57k push at 95eaebdf1
+> went 6 of 6 under its 360 s bound (113, 98, 119, 108, 108 and 136 s at load 30 to 56), `vcs.hg.push_base_store_reads`
+> 1, 1, 3, 2, 2 and 0 by run, no re-ask; with the deterministic unit red, the hang is called fixed. Record:
+> `~/.local/state/main-01a20182/rounds/hang-final/summary.txt`.
+> Its root made loud (main's ruling of 2026-11-27 04:41; w-perf): `ContentStore::windows` yields a typed miss
+> (`WindowMiss`) at the first window or list it cannot read, never a short object, and all its readers (hg's render,
+> index, serve, record, chain read and file intake; the server's commits and homes; vcs's blame and `object_bytes`;
+> git's tree, push and views) take it as a refusal or a none their callers already handle. Reds at the store, blame and
+> git's tree, each red with the old silent stop. Record: the hang's bug record, its siblings section.
 > C1 (2), second piece BUILT (main's ruling (B') of 2026-11-24): a push's manifest is taken a window a step and never
 > whole. Its text is made by `delta::Patching` over its base read front to back over its chain (`push::chain_read`, the
 > chain's deltas loaded: at most the base's length, A-729's bound); its lines checked and its written entries found as it
@@ -3768,6 +3776,17 @@
 > given back. On Linux, by RSS (main's diag run 45946142955 at d295fc3ca, debug, five runs a runner, every one exit 0
 > and identical): ubuntu-latest (x86_64) 3 MiB before, 99 MiB with the released ring, 3 MiB after its give-back, 96 MiB
 > given back; ubuntu-24.04-arm 2, 99 and 2 MiB, 96 MiB given back; on both the ring's mark 64 and its tail 0.
+> Windows (main's diag CI 2, run 45986066740, both native lanes, 2026-11-27): the one-page give-back test asked no whole
+> page there. A shard's content slice was laid from its reserve unrounded, and a Windows runner's reserve of
+> 5,724,786,688 bytes put the slots and the delta log 1,024 bytes past a page, so no dead range of a few bytes held a
+> whole page. Fixed (w-perf, main's ruling of 05:00): every region laid in whole pages (`DaemonConfig::content_reserve`,
+> `write_log_bytes`; the anchor's layout version 21), and a whole dead memory's top end on the last page inside it
+> (`daemon::dead_to_pages`). Reds `every_region_of_a_shards_content_slice_begins_and_ends_on_a_page` and
+> `a_dead_memorys_top_end_lies_on_an_object_page_inside_it_wherever_the_memory_begins`; the give-back test now asserts
+> the whole pages its dead ranges hold on the platform's layout (32,768 of 32,768 on the MacBook, 16,384 before: its
+> delta log was off a page too). Record:
+> docs/bugs/2026-11-27-a-content-slices-regions-began-off-a-page-so-a-give-back-asked-nothing.md. OWED: main's Windows
+> lanes on the tip.
 >
 > **A-752 (2026-11-20, w-engine; Ada's rule, main's order):** a push's work build a unit at a time: part 1 the
 > deriver's replay indexed (O(n^2) -> O(n log n)); part 2 `push::Building` over the turns before the verdict

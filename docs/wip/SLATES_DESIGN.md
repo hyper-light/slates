@@ -19949,6 +19949,14 @@ Status: built 2026-10-03. A barrier's publication went from 75.4 ms to 0.11–0.
   over that range, AUD-29-09: no other mapping reaches those bytes; the daemon's copies of the object stay in
   the log and slots, and the anchor never touches the object's bytes). File bytes are written there once, by
   the write itself, and they survive the daemon because the anchor holds the object.
+  Since 2026-11-27 (layout version 21; main's Windows CI red, run 45986066740) every region of the slice is laid in
+  whole pages of the base page: the reserve (each slot's length and the delta log's) and the write log (a quarter of
+  it) are rounded down to pages, one at least (`DaemonConfig::content_reserve`, `write_log_bytes`), so the slots and
+  the delta log begin on a page. A Windows runner's reserve of 5,724,786,688 bytes, no multiple of four pages, had put
+  them 1,024 bytes past one, and a give-back could take no page a region shares with the one before it
+  (`every_region_of_a_shards_content_slice_begins_and_ends_on_a_page`). The give-back's top-down walk also ends a
+  whole dead memory on the last page inside it where the memory's end is off a page (`daemon::dead_to_pages`), so a
+  one-page piece from the top is a whole page on any layout.
 - The image: a file's runs, and a base-backed file's pinned ranges, carry **chunk references**: the block's
   offset and order within the arena range, the bytes used, and the birth epoch. A table lists each block once,
   so CoW sharing between versions, snapshots and clones is preserved by identity, not found by checksum.

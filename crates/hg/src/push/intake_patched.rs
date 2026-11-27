@@ -63,11 +63,15 @@ impl FileBase {
     let log = Log::File(path);
     let rev = taker.fork.rev(store, log, &node)?;
     let row = taker.fork.revision(store, log, rev)?;
+    let mut block_missed = false;
     let framing = match row.block {
       Some(block) => {
         let mut framing = MARKER.to_vec();
         for window in store.windows(&block) {
-          framing.extend_from_slice(&window);
+          match window {
+            Ok(window) => framing.extend_from_slice(&window),
+            Err(_) => block_missed = true,
+          }
         }
         framing.extend_from_slice(MARKER);
         framing
@@ -83,7 +87,7 @@ impl FileBase {
       })
     });
     let bytes_len = row.len.checked_sub(to_u64(framing.len()))?;
-    let whole = block_whole && store.holds_whole(&row.bytes);
+    let whole = block_whole && !block_missed && store.holds_whole(&row.bytes);
     Some(FileBase::Stored {
       node,
       framing,

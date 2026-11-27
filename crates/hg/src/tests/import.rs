@@ -174,7 +174,7 @@ fn paths() -> Vec<Vec<u8>> {
 fn whole(store: &ContentStore, root: &ContentId) -> Vec<u8> {
   store
     .windows(root)
-    .flat_map(|window| window.into_owned())
+    .flat_map(|window| window.unwrap().into_owned())
     .collect()
 }
 

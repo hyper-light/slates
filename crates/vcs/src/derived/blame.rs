@@ -850,6 +850,8 @@ impl<S> Work<'_, '_, S> {
     let mut bytes = Vec::new();
     let mut windows = Vec::new();
     for window in self.store.windows(&content) {
+      // A window let go (or a node not held) is refused typed, never blamed as a short file.
+      let window = window.map_err(|miss| BlameRefused::Content(ContentRefused::Missed(miss)))?;
       windows.push(u64::try_from(window.len()).unwrap_or(u64::MAX));
       bytes.extend_from_slice(&window);
     }

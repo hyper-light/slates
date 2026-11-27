@@ -1255,3 +1255,48 @@ fn t_a666_p3_forged_values_are_refused_as_malformed() {
   assert_eq!(state(&fixture.store), before);
   fixture.finish();
 }
+
+/// Main's ruling of 2026-11-27 (an object's walk stops silently at a window let go: the 57k hg push's hang's root). Do:
+/// put a file several windows long, let its windows go as a landing does, then blame its version. Expect the blame
+/// refused typed: the file's read missed a window let go (`ContentRefused::Missed(WindowMiss::Away)`). Red before: the
+/// read stopped at the first window let go and blamed the file's lines as none.
+#[test]
+fn t_goal93_a_file_whose_windows_were_let_go_is_refused_never_blamed_short() {
+  let mut built = Builder::new();
+  let text: String = (0..LONG_LINES).map(|at| format!("line {at}\n")).collect();
+  built.edit(None, &[("long", Some(text.as_str()))]);
+  let mut fixture = Fixture::empty(&built, Mode::Eager);
+  for content in fixture.contents.clone() {
+    assert!(
+      fixture.store.let_go_object(&content) > 0,
+      "the file's windows let go"
+    );
+  }
+  let mut fill = fixture
+    .derivations
+    .recorded(&mut fixture.store, &fixture.ty, 0)
+    .unwrap()
+    .unwrap();
+  let derived = loop {
+    match fill.step(
+      &mut fixture.derivations,
+      &mut fixture.ty,
+      &built.history,
+      &mut fixture.store,
+    ) {
+      Ok(Progress::More) => {}
+      Ok(Progress::Done(root)) => break Ok(root),
+      Err(refused) => break Err(refused),
+    }
+  };
+  assert!(
+    matches!(
+      derived,
+      Err(crate::derived::DerivedRefused::Type {
+        refused: BlameRefused::Content(ContentRefused::Missed(crate::content::WindowMiss::Away(_))),
+        ..
+      })
+    ),
+    "the blame refused for the window let go: {derived:?}"
+  );
+}

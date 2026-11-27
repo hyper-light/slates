@@ -1200,7 +1200,7 @@ impl WholeTexts<'_> {
       let rev = self.index.rev(self.store, log, node)?;
       let kept = crate::import::record::kept(self.index, self.store, log, rev)?;
       let mut text = Vec::new();
-      crate::import::record::write_text(&mut text, self.store, &kept);
+      crate::import::record::write_text(&mut text, self.store, &kept)?;
       let identity = *blake3::hash(&text).as_bytes();
       let len = u64::try_from(text.len()).ok()?;
       self.texts.insert(identity, text);

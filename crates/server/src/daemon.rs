@@ -6461,21 +6461,8 @@ fn give_back_dead_journal(s: &mut ShardState, left: &mut usize) -> (usize, bool)
   // straddling two pages, and a one-page slice gave nothing back at all. In the object's own pages, since a region need
   // not start on one.
   let page = usize::try_from(s.config.geometry.page).unwrap_or(1).max(1);
-  // A range already given back whole stays empty: rounded, an empty range's partial page took a share of every slice
-  // and gave nothing back, and the give-back never ended.
-  let page_end = |base: usize, (offset, len): (usize, usize), limit: usize| -> (usize, usize) {
-    if len == 0 {
-      return (offset, 0);
-    }
-    let end = base
-      .saturating_add(offset)
-      .saturating_add(len)
-      .checked_next_multiple_of(page)
-      .unwrap_or(usize::MAX)
-      .saturating_sub(base)
-      .min(limit)
-      .max(offset.saturating_add(len));
-    (offset, end.saturating_sub(offset))
+  let page_end = |base: usize, range: (usize, usize), limit: usize| -> (usize, usize) {
+    dead_to_pages(base, range, limit, page)
   };
   let (first, second) = slates_vfs::recover::slots_of_memory(slots_end.saturating_sub(slots_start));
   let stale_end = if dead.stale_slot.0 == first.0 {
@@ -6533,6 +6520,38 @@ fn give_back_dead_journal(s: &mut ShardState, left: &mut usize) -> (usize, bool)
   let more = stale_slot.is_some_and(|(from, _)| from > dead.stale_slot.0)
     || log_past_tail.is_some_and(|(from, _)| from > dead.log_past_tail.0);
   (returned, more)
+}
+
+/// The dead range `(offset, len)` of a memory `limit` bytes long at `base` in the content object, as the journal's
+/// give-back walks it from the top (A-926): its end moved to an object page boundary, so a one-page piece from the top
+/// is a whole page. Up to the boundary at or past its last byte where the memory reaches it; else down to the last
+/// boundary inside the memory, the bytes past it lying in a page the next region shares, which no give-back takes
+/// (main's Windows CI red of 2026-11-27: a memory ending off a page left every one-page piece straddling two). A range
+/// already given back whole stays empty: rounded, an empty range's partial page took a share of every slice and gave
+/// nothing back, and the give-back never ended.
+fn dead_to_pages(
+  base: usize,
+  (offset, len): (usize, usize),
+  limit: usize,
+  page: usize,
+) -> (usize, usize) {
+  if len == 0 {
+    return (offset, 0);
+  }
+  let page = page.max(1);
+  let up = base
+    .saturating_add(offset)
+    .saturating_add(len)
+    .checked_next_multiple_of(page)
+    .unwrap_or(usize::MAX);
+  let memory_end = base.saturating_add(limit);
+  let end = if up <= memory_end {
+    up
+  } else {
+    memory_end.saturating_sub(memory_end.checked_rem(page).unwrap_or(0))
+  };
+  let end = end.saturating_sub(base).max(offset);
+  (offset, end.saturating_sub(offset))
 }
 
 /// The free blocks one step of a give-back walks (A-226): an archive slice's bytes over the discard size, one at least.
@@ -11930,15 +11949,87 @@ mod tests {
     }
   }
 
+  /// Shape: the base page of both Windows CI runners (main's diag CI 2, run 45986066740).
+  const WINDOWS_PAGE: usize = 4096;
+  /// Shape: where a Windows runner's checkpoint slots begin in its slice of the content object: the write log's length,
+  /// `reserve_per_shard / 4` for its reserve of 5,724,786,688 bytes, which is 1,024 bytes past a page.
+  const WINDOWS_SLOTS_START: usize = 1_431_196_672;
+
+  /// Main's Windows CI red of 2026-11-27 (run 45986066740, both native Windows lanes): there a region starts 1,024
+  /// bytes past a page, as its reserve is no multiple of four pages. Do: take a memory at [`WINDOWS_SLOTS_START`], ten
+  /// pages and 1,000 bytes long, wholly dead (a restart's), as the give-back walks it ([`super::dead_to_pages`]), and a
+  /// short extent in it. Expect the whole memory's top end on an object page inside the memory, so a one-page piece
+  /// from the top is a whole page; the short extent's end up to its page; an empty range empty. Red before: the whole
+  /// memory's end was the memory's own, off a page, so every one-page piece straddled two pages and none was asked for.
+  #[test]
+  fn a_dead_memorys_top_end_lies_on_an_object_page_inside_it_wherever_the_memory_begins() {
+    let (page, base) = (WINDOWS_PAGE, WINDOWS_SLOTS_START);
+    let limit = 10 * page + 1_000;
+    let (offset, len) = super::dead_to_pages(base, (0, limit), limit, page);
+    let end = base + offset + len;
+    assert_eq!(end % page, 0, "the top end on an object page: {end}");
+    assert!(offset + len <= limit, "inside the memory");
+    let top = end - page;
+    assert!(
+      top >= base && top % page == 0,
+      "a one-page piece from the top is a whole page"
+    );
+    let short = super::dead_to_pages(base, (0, 46), limit, page);
+    assert_eq!(
+      (base + short.0 + short.1) % page,
+      0,
+      "a short extent's end up to its page"
+    );
+    assert_eq!(short, (0, page - base % page));
+    assert_eq!(
+      super::dead_to_pages(base, (7, 0), limit, page),
+      (7, 0),
+      "an empty range empty"
+    );
+  }
+
+  /// The bytes of whole object pages `dead`'s ranges hold on `state`'s layout, counted apart from the give-back's own
+  /// rounding: each non-empty range from its first byte to the page boundary at or past its last, cut at its memory's
+  /// end (the stale slot's, the log's), whole pages alone.
+  fn whole_pages_dead(
+    state: &crate::state::ShardState,
+    dead: slates_vfs::checkpoint_log::DeadRanges,
+  ) -> usize {
+    let page = usize::try_from(state.config.geometry.page).unwrap();
+    let (slots_start, slots_end) = state.content_range;
+    let (log_start, log_end) = state.delta_range;
+    let (first, second) = slates_vfs::recover::slots_of_memory(slots_end - slots_start);
+    let slot = if dead.stale_slot.0 == first.0 {
+      first
+    } else {
+      second
+    };
+    let whole = |base: usize, (offset, len): (usize, usize), memory_end: usize| -> usize {
+      if len == 0 {
+        return 0;
+      }
+      let from = base + offset;
+      let to = (from + len).next_multiple_of(page).min(memory_end);
+      let first_page = from.next_multiple_of(page);
+      let last_page = to - to % page;
+      last_page.saturating_sub(first_page)
+    };
+    whole(slots_start, dead.stale_slot, slots_start + slot.0 + slot.1)
+      + whole(log_start, dead.log_past_tail, log_end)
+  }
+
   /// A-926's regression (main's ruling of 2026-11-25): since the journal keeps its memories' extents in bytes, a dead
   /// range ends where its bytes did, off a page, and a give-back takes whole pages only. Do: on a fresh shard, publish
   /// until a second checkpoint leaves a stale slot and a log written as far as their bytes reached; give back what is
   /// dead with the slice at one page (the shard's thread clock reading nothing, so no rate is learned) until nothing is
-  /// left. Expect whole pages asked back of the OS ([`super::RECOVERY_ASKED`]), not only the extents fallen. Red
-  /// before: every page-sized piece of the top-down give-back straddled two pages, so the extents fell to nothing and
-  /// no whole page was asked for. The rule is what is asked, on every platform: what the OS then takes is its own, and
-  /// Windows' section views took none (main's CI run 45948476737, both native Windows jobs, failed this test's earlier
-  /// form, which asserted the bytes taken).
+  /// left. Expect the whole pages the dead ranges hold on this platform's layout ([`whole_pages_dead`], counted apart,
+  /// more than none since the layout's regions begin on pages) asked back of the OS ([`super::RECOVERY_ASKED`]), not
+  /// only the extents fallen. Red before: every page-sized piece of the top-down give-back straddled two pages, so the
+  /// extents fell to nothing and no whole page was asked for; and on Windows, whose regions began 1,024 bytes past a
+  /// page (main's diag CI 2, run 45986066740), none could be (the layout fixed by
+  /// `every_region_of_a_shards_content_slice_begins_and_ends_on_a_page`). The rule is what is asked, on every platform:
+  /// what the OS then takes is its own, and Windows' section views took none (main's CI run 45948476737, both native
+  /// Windows jobs, failed this test's earlier form, which asserted the bytes taken).
   #[test]
   fn a_one_page_give_back_takes_the_pages_of_extents_that_end_off_a_page() {
     /// Shape: the publications a shard may take to commit its second checkpoint.
@@ -11960,6 +12051,7 @@ mod tests {
         }
       }
       let dead = state.journal.dead_ranges(totals.0, totals.1);
+      let expected = dead.map_or(0, |dead| whole_pages_dead(state, dead));
       state.give_back_rate = super::GiveBackRate::default();
       let asked_before = state
         .refusals
@@ -11984,19 +12076,24 @@ mod tests {
         .copied()
         .unwrap_or(0)
         - asked_before;
-      (dead, (asked, returned), left)
+      (dead, (asked, returned, expected), left)
     });
-    let (asked, returned) = returned;
+    let (asked, returned, expected) = returned;
     println!(
       "daemon: dead {dead:?}, {asked} bytes of whole pages asked back a page a step ({returned} taken by the \
-       OS), {left} left"
+       OS; {expected} lie in the dead ranges), {left} left"
     );
     let dead = dead.expect("a checkpoint committed");
     assert!(dead.stale_slot.1 > 0, "a stale slot written: {dead:?}");
     assert_eq!(left, 0, "nothing left dead");
     assert!(
-      asked > 0,
-      "whole pages asked back, not only the extents fallen: {dead:?}"
+      expected > 0,
+      "the dead ranges hold a whole page on this layout: {dead:?}"
+    );
+    assert_eq!(
+      asked,
+      u64::try_from(expected).unwrap(),
+      "the whole pages in the dead ranges asked back, not only the extents fallen: {dead:?}"
     );
   }
 

@@ -525,6 +525,34 @@ fn t_a664_the_trees_refuse_by_kind_and_leave_the_store_as_it_was() {
   }
 }
 
+/// Main's ruling of 2026-11-27 (an object's walk stopped silently at a window let go: the 57k hg push's hang's root).
+/// Do: put a file three windows long, let its windows go as a landing does, and build the trees of a version holding
+/// it. Expect the build refused typed for the window let go (`ContentRefused::Missed(WindowMiss::Away)`), no tree made.
+/// Red before: the blob's walk stopped at the first window let go, so the tree named a blob id over no bytes.
+#[test]
+fn t_goal93_a_file_whose_windows_were_let_go_is_refused_never_named_short() {
+  for format in FORMATS {
+    let mut store = store();
+    // Each window its own bytes, so none is one window held thrice (which a let-go keeps).
+    let bytes: Vec<u8> = (0..3 * WINDOW)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    let content = content(&mut store, &bytes);
+    assert!(store.let_go_object(&content) > 0, "its windows let go");
+    let entries = BTreeMap::from([(b"f".to_vec(), Entry { class: 0, content })]);
+    let built = trees(format).build(&mut store, &entries);
+    assert!(
+      matches!(
+        built,
+        Err(TreesRefused::Content(slates_vcs::ContentRefused::Missed(
+          slates_vcs::WindowMiss::Away(_)
+        )))
+      ),
+      "{format:?}: the build refused for the window let go: {built:?}"
+    );
+  }
+}
+
 /// A-664 (hostile nodes; §4.9). Do: read as a directory a node with no payload, one whose id is short, one whose count
 /// of subtrees is more than it names, one whose list is not a list, and a commit's node. Expect: each refused as
 /// malformed, naming the node, with no panic.

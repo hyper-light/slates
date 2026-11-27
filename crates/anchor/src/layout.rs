@@ -18,19 +18,22 @@ pub const MAGIC: u32 = 0x4E41_4C53;
 /// 13 the copies' section and the sum each behind a presence byte, written beside a copy's record alone (checkpoint
 /// version 5, A-626 part 3, continued (1), 2026-11-19), 14 a work's logged journal may hold a copy (`LoggedOp::Copy`,
 /// A-626 part 4, 2026-11-19), 15 a token's credential record keeps its CRAM-MD5 keyed contexts beside its hash
-/// (`CredentialKind::HttpToken`'s field, A-692, 2026-11-19), 16 a green's checkpoint is named, not carried: its record and
-/// a snapshot hold the identity and length its encoding is held under in the owner shard's content store (A-579's last
-/// step, on chain entry format 6's rule, 2026-11-21), 17 a slice's pool extents a run doubling from one unit before the
-/// rest's binary parts, so an extent id names another range of the content object (A-848, 2026-11-21), 18 the pool
-/// region a want word a partition after its owner words (A-853, 2026-11-21), 19 a green's head identity hashes each
-/// file's path, length and plain BLAKE3, not its bytes (A-873, A-760 (b) piece 4a, 2026-11-23): every identity a
+/// (`CredentialKind::HttpToken`'s field, A-692, 2026-11-19), 16 a green's checkpoint is named, not carried: its record
+/// and a snapshot hold the identity and length its encoding is held under in the owner shard's content store (A-579's
+/// last step, on chain entry format 6's rule, 2026-11-21), 17 a slice's pool extents a run doubling from one unit
+/// before the rest's binary parts, so an extent id names another range of the content object (A-848, 2026-11-21), 18
+/// the pool region a want word a partition after its owner words (A-853, 2026-11-21), 19 a green's head identity hashes
+/// each file's path, length and plain BLAKE3, not its bytes (A-873, A-760 (b) piece 4a, 2026-11-23): every identity a
 /// segment of 18 records (chain entries, checkpoints' head checks, merge records, the ledger) was made under the other
 /// rule, and would fence the green it names as diverged, so the segment is refused at adoption, 20 the pool region a
-/// generation word after the want words, moved at every claim and release of an extent (A-906, 2026-11-24: a shard reads
-/// it to know its last count of the pool's free room still holds, where every lend scanned every owner word). An older
-/// segment is refused, never misread.
+/// generation word after the want words, moved at every claim and release of an extent (A-906, 2026-11-24: a shard
+/// reads it to know its last count of the pool's free room still holds, where every lend scanned every owner word), 21
+/// a shard's content slice laid in whole pages: its reserve and its write log rounded down to pages, so the checkpoint
+/// slots and the delta log begin on one (main's Windows CI red of 2026-11-27: a reserve no multiple of four pages put
+/// them 1,024 bytes past a page, which a give-back could not take), the slots and the delta log at other offsets of the
+/// content object wherever the reserve was no such multiple. An older segment is refused, never misread.
 /// Format: this layout's number in the history above.
-pub const LAYOUT_VERSION: u32 = 20;
+pub const LAYOUT_VERSION: u32 = 21;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus

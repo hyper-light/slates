@@ -896,7 +896,7 @@ pub fn stored_bytes<'s>(
   len: u64,
 ) -> Option<Cow<'s, [u8]>> {
   let mut windows = store.windows(content);
-  if let (Some(window), None) = (windows.next(), windows.next())
+  if let (Some(Ok(window)), None) = (windows.next(), windows.next())
     && u64::try_from(window.len()).ok() == Some(len)
   {
     return Some(window);
