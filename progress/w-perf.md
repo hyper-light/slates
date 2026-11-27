@@ -787,3 +787,14 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - OWED to main: the Linux RSS reading of the released ring (A-746's GAPS line).
   - Next: my share of the allow-list (vcs_store/tests 16, paths/tests 11, commits/tests 8, index_upkeep 2,
     named_objects 1), then the Aways append rule, then the 35.7 MB keep rows.
+- 2026-11-26 ~23:30 PST:
+  - LANDED 7e5615934 (13e4f0baf): A-930, the Aways append rule. A page changed only past its committed piece's last
+    coordinate appends to the piece, and its split copies the piece's entries. Red: 600 let-goes published one at a
+    time encoded 2,588,710 Aways bytes for 46,275 appended; now 46,300 (main's bound: appended plus a page). The
+    oracle holds the image to the shard's entries, each piece byte for byte a whole encoding. A-923's 20 let-go test
+    went from 8,639 to 1,555. GAPS: A-746's Linux RSS from main's diag run 45946142955.
+  - Focused runs: image_pages (17), content_holder/image/publish (46 after the merge), the two restart-over-old-image
+    tests.
+  - OWED: the windows family's removal as a cut of the committed piece (28.5% of the 57k image); main's in-place 57k
+    rerun for the after, with its publication count and page.
+  - Next: the 35.7 MB keep rows, after main's in-place rerun.
