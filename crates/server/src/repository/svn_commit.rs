@@ -325,7 +325,7 @@ async fn landed_work(
   // The texts this commit put land in its changeset (C2 stage B): the store holds every text its history names, so no
   // entry names a text that is durable only in the shard's image, and every reader reads one RAM does not hold back
   // from there (C2 stage B part 2). The texts the records already held landed with the changeset that put them.
-  let carried = texts_carried(&work.record.changes, &storing.put);
+  let carried = texts_carried(&work.record.changes, &storing.put).await?;
   // The revision made of the work at the owner's instant, judged again with the commit's locks then, checked, landed on
   // the store and committed in the register (`landing`); every text the landing put given back once it ends.
   let (turn, plans, restoring) = match planned(repository, &work.record.changes).await? {
@@ -458,26 +458,88 @@ async fn bring_texts(
   Some(Ok(brought))
 }
 
+/// Counter: a step of a landing's walk of the texts its changeset carries ([`texts_carried`], A-920 11c): many a wide
+/// revision shows the walk was taken a text and a row a unit, never whole in one step. Format: a counter name in the
+/// status report.
+pub(crate) const CARRIED_STEPS: &str = "repository.svn_commit.carried_steps";
+
 /// The texts of `work` that `put` names (those its landing put whole into the content store), each once, at the first
 /// path a row sets it at, with its length: what its changeset carries (C2 stage B). Each text looked up, not searched
-/// for among every one put and carried (goal 93: 327 ms of one step for a revision of 9,000 texts, debug).
-fn texts_carried(changes: &[ChangedPath], put: &[ContentIdentity]) -> Vec<landing::LandedText> {
-  let mut carried: Vec<landing::LandedText> = Vec::with_capacity(put.len());
-  let put: BTreeSet<&ContentIdentity> = put.iter().collect();
-  let mut seen: BTreeSet<ContentIdentity> = BTreeSet::new();
-  for change in changes {
-    let Some(text) = change.text else {
-      continue;
+/// for among every one put and carried (goal 93: 327 ms of one step for a revision of 9,000 texts, debug). Taken a unit
+/// at a time ([`Carrying`]), a slice of the shard's budget a step, each step counted ([`CARRIED_STEPS`]; A-920 11c:
+/// whole, 12.3 ms of one step at 9,000 texts and rows, debug, the release leader of a wide add's staging). None where
+/// the shard's state is gone.
+async fn texts_carried(
+  changes: &[ChangedPath],
+  put: &[ContentIdentity],
+) -> Option<Vec<landing::LandedText>> {
+  let mut carrying = Carrying::new(put.len());
+  loop {
+    crate::state::with_state(|state| state.count(CARRIED_STEPS, 1))?;
+    let deadline = slates_rt::futures::now_ns()
+      .saturating_add(slates_rt::futures::step_budget_ns().unwrap_or(0));
+    loop {
+      if carrying.unit(changes, put) {
+        return Some(carrying.carried);
+      }
+      if slates_rt::futures::now_ns() >= deadline {
+        break;
+      }
+    }
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// A walk of the texts a changeset carries being taken a unit at a time ([`texts_carried`]).
+struct Carrying {
+  /// The texts put, as noted so far.
+  put: BTreeSet<ContentIdentity>,
+  /// The next text put to note.
+  put_at: usize,
+  /// The texts a row has carried already.
+  seen: BTreeSet<ContentIdentity>,
+  /// The next row.
+  row_at: usize,
+  /// What is carried so far, in row order.
+  carried: Vec<landing::LandedText>,
+}
+
+impl Carrying {
+  /// A walk of a changeset carrying at most `texts` texts, begun.
+  fn new(texts: usize) -> Carrying {
+    Carrying {
+      put: BTreeSet::new(),
+      put_at: 0,
+      seen: BTreeSet::new(),
+      row_at: 0,
+      carried: Vec::with_capacity(texts),
+    }
+  }
+
+  /// One unit: a text of `put` noted, or once every one is, one row of `changes` read, its text carried where it was
+  /// put and no row before carried it. Whether every row is read.
+  fn unit(&mut self, changes: &[ChangedPath], put: &[ContentIdentity]) -> bool {
+    if let Some(identity) = put.get(self.put_at) {
+      self.put.insert(*identity);
+      self.put_at = self.put_at.saturating_add(1);
+      return false;
+    }
+    let Some(change) = changes.get(self.row_at) else {
+      return true;
     };
-    if put.contains(&text.identity) && seen.insert(text.identity) {
-      carried.push(landing::LandedText {
+    self.row_at = self.row_at.saturating_add(1);
+    if let Some(text) = change.text
+      && self.put.contains(&text.identity)
+      && self.seen.insert(text.identity)
+    {
+      self.carried.push(landing::LandedText {
         path: change.path.as_bytes().to_vec(),
         identity: text.identity,
         len: text.size,
       });
     }
+    false
   }
-  carried
 }
 
 /// Lands one changeset of repository `repository` (module docs of [`landing`]) holding its landing turn `turn`, taken by
@@ -666,7 +728,10 @@ async fn stage_texts(
   crate::vcs_store::svn_import::phase::tag("storing.carried");
   drop(texts);
   section_yield().await?;
-  let carried = texts_carried(&revision.record.changes, &storing.put);
+  let carried = texts_carried(&revision.record.changes, &storing.put).await?;
+  // What the staging does next begins a step of its own (A-920 11c: the walk's end and the brought texts' first part
+  // shared one poll).
+  section_yield().await?;
   Some(Ok((storing, carried)))
 }
 
