@@ -774,3 +774,16 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     UnitSet::run_reaches); red an_idle_purge_walks_nothing_while_no_recorded_run_reaches_the_discard_size.
   - Next: (b) of the churn ruling: TextCache::keep's chunk churn under make_chain (80.9% of the 57k push's mapped
     churn) and the owner's serve (15.3% of the clone's system churn).
+- 2026-11-26 ~21:45 PST:
+  - LANDED 4d7f5cecf (ec62ee78c): A-926's give-back regression. A dead range is now given back up to the content
+    object's page boundary, within its memory, and an empty range stays empty. Red: a one-page slice gave back 0 bytes on
+    main and gives back 16,384 with the fix. `returned_after_idle` is bounded. The boot test takes its memory as written
+    whole through `take_recovery_memory_as_written_whole`, which only the test-support feature (or cfg(test)) compiles;
+    `cargo tree -p slates-cli -e features --edges normal` shows 0 test-support lines.
+  - LANDED d295fc3ca (73ecf09d7): A-926 part 2. The segment's log ring and snapshot slots keep marks, and A-746's
+    give-back runs on them: footprint 98 to 4 MiB. Focused runs: the anchor, mem, db record, segment_marks and
+    segment_give_back_footprint tests; the server's give_back, content_ranges and idle_sweep unit tests; the whole
+    recovery target (64 passed, 2 ignored).
+  - OWED to main: the Linux RSS reading of the released ring (A-746's GAPS line).
+  - Next: my share of the allow-list (vcs_store/tests 16, paths/tests 11, commits/tests 8, index_upkeep 2,
+    named_objects 1), then the Aways append rule, then the 35.7 MB keep rows.

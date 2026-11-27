@@ -687,3 +687,7 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
 - 373d90ee4: BENCHMARKS, the 57k hg clone at 7a9cb385e (43.150 s) and P7 closed.
 - Disk freed: 2.8 GB of matrix scratch and 3.0 GB of target. git/git up to v1.0.0 is kept at
   ~/.local/state/w-interop/git-v1.0.0.git (~/.cache/main-rounds was wiped).
+- Run 10 (45944507454, interop-linux-10 at 80eccadbd): every leg green, exit 0. git 27/27 on ubuntu-latest,
+  ubuntu-24.04-arm and windows-latest; hg 30/30 on all three; svn 33/33 on both Linux runners over svn:// and HTTP.
+  GAPS records it at 1f97bdd05. Main's log: ~/.local/state/main-01a20182/rounds/interop-linux-10.log.
+- FREE: nothing open (inbox/main-from-w-interop-free.md). svn on Windows waits on Ada's go; r110's rerun is main's.
