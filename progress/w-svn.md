@@ -849,3 +849,8 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - be16a2521: an_svn_writing_session_measured (per-step timed, stock svnserve baseline in the same run). Local p7 debug:
   HTTP 5.75 s, svn:// 5.51 s, stock 7.50 s; no gap; time is the svn client's own. ee7243e7d: an_svnrdump_dump_measured.
 - Owed by main: release rounds of both over git-2000 (they name the step); probe 18 for A-920's cuts.
+
+## 2026-11-27 15:51 — A-764 retried enrollment
+- c5d77ed2c (on main at c9e273092): a held identical record answers enrolled and fans out; red-then-green fleet scene
+  a764_an_enrollment_short_of_f_plus_one_completes_when_the_same_request_is_asked_again; bug record in docs/bugs.
+- git-2000 rebuild: answered main what it needs (bare clone of git/git, REF = f7de81456940, ~0.8 GB, ~2 min convert); not built, awaiting go.
