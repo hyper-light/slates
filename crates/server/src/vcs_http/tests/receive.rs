@@ -10,7 +10,7 @@ use super::{
   PUSH_ENDED_EMPTY, PUSH_REFUSED_AFTER_BODY, Receive, ReceiveServices, ShardLender, ThisShard,
 };
 use crate::daemon::observe_first;
-use crate::git_push::tests::{git_repository, owner};
+use crate::git_push::tests::{git_repository_on, owner};
 use crate::state::ShardState;
 use crate::vcs_http::daemon_edge::tests::long_history;
 use crate::vcs_http::git::{GitServices, Start};
@@ -108,10 +108,10 @@ fn pushed_through(name: &'static str, request: Vec<u8>, fenced: u32) -> Pushed {
 fn pushed_fenced_after(name: &'static str, request: Vec<u8>, (lent, fenced): (u32, u32)) -> Pushed {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (sent, answered) = std::sync::mpsc::channel();
+  let repository = git_repository_on(&daemon, name);
   observe_first(&daemon, move |_| {
     let task = slates_rt::futures::spawn(async move {
       let record = crate::state::with_state(|state| {
-        let repository = git_repository(state, name);
         state
           .db
           .partition()

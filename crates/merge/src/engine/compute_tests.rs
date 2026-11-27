@@ -1331,3 +1331,156 @@ fn a_link_removed_after_the_position_meets_the_fit_of_the_writes_handed_to_it() 
     (Answer::Conflict, vec![unfit, gone])
   );
 }
+
+/// The units `inc`'s decision reaches on `green`, each its windows and its count of effects, and the steps it took: whole,
+/// or a unit a step where `sliced`.
+fn decided_units(
+  green: &Green,
+  inc: &Increment,
+  sliced: bool,
+) -> (Vec<(Vec<super::ConflictWindow>, usize)>, u32) {
+  let resolved = Green::resolve(inc);
+  let mut units = super::position::Units::first();
+  let mut deciding = super::deciding::Deciding::default();
+  let mut steps = 1u32;
+  while !green.decide_some(inc, &resolved, (&mut units, &mut deciding), &mut || sliced) {
+    steps = steps.saturating_add(1);
+  }
+  let units = units.into_units().0;
+  let shapes = units
+    .units()
+    .map(|unit| (unit.windows.to_vec(), unit.effects.len()))
+    .collect();
+  (shapes, steps)
+}
+
+/// A-920 3j (A-658's first unit, A-669): the first unit holds every content path whose ops do not fit what they edit at
+/// the work's base, a walk of every content path, so it is decided a path a step. Do: decide, whole and a unit a step, a
+/// work at the origin's version whose writes fit two files and fit neither a third (an overwrite past its end), a fourth
+/// (an insert past its end) nor a path with nothing at its base (an insert inside it). Expect the same units, the first
+/// holding the three unfit paths' windows (`TypeChanged`) in path order, and the sliced decision taking more steps than
+/// the work has content paths.
+#[test]
+fn a_works_first_unit_walked_a_content_path_a_step_is_its_first_unit_decided_whole() {
+  let green = Green::with_origin(origin());
+  let mut draft = Draft::default();
+  draft.content(OpKind::Insert, FILES[0], 0, b"A");
+  draft.content(OpKind::Overwrite, FILES[1], 3, b"0123456789");
+  draft.content(OpKind::Insert, FILES[2], 99, b"C");
+  draft.content(OpKind::Insert, FILES[3], 1, b"D");
+  draft.content(OpKind::Insert, "zz", 2, b"Z");
+  let inc = increment(draft, green.head(), 1);
+  let (whole, _) = decided_units(&green, &inc, false);
+  let (sliced, steps) = decided_units(&green, &inc, true);
+  assert_eq!(sliced, whole);
+  let unfit: Vec<(String, MergeConflictClass)> = whole
+    .first()
+    .expect("a first unit")
+    .0
+    .iter()
+    .map(|window| (window.path.clone(), window.class))
+    .collect();
+  let expected: Vec<(String, MergeConflictClass)> = [FILES[1], FILES[2], "zz"]
+    .iter()
+    .map(|path| ((*path).to_owned(), MergeConflictClass::TypeChanged))
+    .collect();
+  assert_eq!(unfit, expected);
+  assert!(steps > 5, "{steps} steps");
+}
+
+/// A-920 3k (`Reached::reach_unit`, an effect at a time): what the chain records of an accepted verdict's effects is
+/// mapped an effect a step, since one unit can hold most of a work's effects. Do: compute, whole and a unit a step, a
+/// work at the origin's version that writes into every file and makes one. Expect both accepted with the same list of
+/// what the chain records, one for each effect, in order; and the sliced computation taking more steps than that list.
+#[test]
+fn a_verdict_reached_an_effect_a_step_records_what_the_verdict_reached_whole_does() {
+  let green = Green::with_origin(origin());
+  let mut draft = Draft::default();
+  for (at, path) in FILES.iter().enumerate() {
+    draft.content(OpKind::Insert, path, at as u64, b"+");
+  }
+  draft.alone(OpKind::Create, "made");
+  draft.content(OpKind::Insert, "made", 0, b"new");
+  let inc = increment(draft, green.head(), 1);
+  let whole = green.compute(&inc).expect("computed whole");
+  let mut computing = green.begin_computing(&inc);
+  let mut steps = 1u32;
+  let sliced = loop {
+    if let Some(computed) = green.computing_step(&inc, &mut computing, &mut || true) {
+      break computed.expect("computed a unit a step");
+    }
+    steps = steps.saturating_add(1);
+  };
+  let recorded = whole.applied().expect("accepted whole");
+  assert!(recorded.len() > FILES.len(), "{recorded:?}");
+  assert_eq!(sliced.applied(), Some(recorded));
+  assert!(steps as usize > recorded.len(), "{steps} steps");
+}
+
+/// A-920 3l (one flat effects list a verdict, each unit its range in it): a unit allocates no list of its own, since the
+/// gathering then freed one a unit, and the free that emptied the allocator's region cost one step 1.2 ms (debug probe,
+/// 18,001 units of 0 or 1 effect). Do: compute, whole and a unit a step, a work at the origin's version that writes into
+/// every file and makes one. Expect both accepted with what the chain records of each effect; no unit allocated an
+/// effect list of its own (`Green::unit_effect_lists`); and the edits judged (`Green::fast_path_hits` moved).
+#[test]
+fn a_verdicts_units_allocate_no_effect_list_of_their_own() {
+  let green = Green::with_origin(origin());
+  let mut draft = Draft::default();
+  for (at, path) in FILES.iter().enumerate() {
+    draft.content(OpKind::Insert, path, at as u64, b"+");
+  }
+  draft.alone(OpKind::Create, "made");
+  draft.content(OpKind::Insert, "made", 0, b"new");
+  let inc = increment(draft, green.head(), 1);
+  let hits = green.fast_path_hits();
+  let whole = green.compute(&inc).expect("computed whole");
+  let mut computing = green.begin_computing(&inc);
+  let sliced = loop {
+    if let Some(computed) = green.computing_step(&inc, &mut computing, &mut || true) {
+      break computed.expect("computed a unit a step");
+    }
+  };
+  let recorded = whole.applied().expect("accepted whole");
+  assert_eq!(recorded.len(), FILES.len() + 1, "{recorded:?}");
+  assert_eq!(sliced.applied(), Some(recorded));
+  assert!(green.fast_path_hits() > hits, "no edit judged");
+  assert_eq!(
+    green.unit_effect_lists(),
+    0,
+    "effect lists the units allocated of their own"
+  );
+}
+
+/// A-920 3m (a commit's changed paths ordered a unit at a time, with no tree): a commit's paths took 0.73-0.78 ms of one
+/// step in a tree set of String clones (debug, 9,000 effects), its nodes made and freed. Do: submit, at the origin's
+/// version, a work that writes into every file, sets the first's mode (a second effect at one path) and makes a file.
+/// Expect it accepted; no changed path put in a tree set of the commit's own (`Green::commit_tree_paths`); and one
+/// String made for each distinct path its effects change, the one its change entry keeps (`Green::commit_paths_made`:
+/// five, the four files and the made one).
+#[test]
+fn a_commits_changed_paths_are_ordered_without_a_tree_each_made_once() {
+  let mut green = Green::with_origin(origin());
+  let mut draft = Draft::default();
+  for (at, path) in FILES.iter().enumerate() {
+    draft.content(OpKind::Insert, path, at as u64, b"+");
+  }
+  draft.op(
+    OpKind::SetMode,
+    FILES[0],
+    (0, u64::from(MODES[1]), u64::MAX),
+  );
+  draft.alone(OpKind::Create, "made");
+  draft.content(OpKind::Insert, "made", 0, b"new");
+  let inc = increment(draft, green.head(), 1);
+  assert!(matches!(green.submit(&inc), Outcome::Accepted { .. }));
+  assert_eq!(
+    green.commit_tree_paths(),
+    0,
+    "changed paths put in a tree set"
+  );
+  assert_eq!(
+    green.commit_paths_made(),
+    FILES.len() as u64 + 1,
+    "changed paths' Strings made"
+  );
+}

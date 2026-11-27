@@ -188,7 +188,8 @@ impl Greens {
     self.owing_reached.get()
   }
 
-  /// `id`'s engine, lent whether or not it owes a push: the materializer's, a replay's and a create's lend alone (P2).
+  /// `id`'s engine, lent whether or not it owes a push: the materializer's, a replay's and a create's lend alone (P2), and
+  /// a Mercurial line's head read from its debt (`vcs_store::hg_made::head_of`, A-929), which reads no content.
   pub fn lend(&self, id: &VolumeId) -> Option<GreenRef<'_>> {
     if let Some(green) = self.alone.get(id) {
       return Some(GreenRef::Alone(green));
@@ -262,6 +263,13 @@ impl Greens {
       }
     }
     holds
+  }
+
+  /// Puts `holds`, taken by [`Greens::take_name_holds`] and not yet applied, back before any owed since, in order: the
+  /// next free decision applies them first (`vcs_store::name_holds::apply_some`, A-920 7c).
+  pub fn put_back_name_holds(&mut self, mut holds: Vec<slates_merge::engine::NameHold>) {
+    holds.append(&mut self.given_back);
+    self.given_back = holds;
   }
 
   /// Installs a lone engine for `id`; the engine it replaced, its holds given back (it is the caller's, untracked).
@@ -411,15 +419,21 @@ impl Greens {
   /// Retires `preview`, its holds given back at once: a preview at its green's head shares every node but the ones its
   /// one version copied, so its release is that version's paths, never the tree.
   pub fn retire_preview(&mut self, preview: Preview) {
-    let Some(lineage) = self.lineages.get_mut(&preview.repository) else {
-      return;
-    };
-    if let Ok(mut release) = lineage.get_mut().retire(preview.handle) {
+    if let Some((repository, mut release)) = self.retire_preview_begun(preview) {
       while self
-        .release_step(preview.repository, &mut release)
+        .release_step(repository, &mut release)
         .is_ok_and(|more| more)
       {}
     }
+  }
+
+  /// Retires `preview` from its lineage, its engine gone at once, and answers what it held as a [`Release`] for its owner
+  /// to step under its own budget ([`Greens::release_step`]; A-920 6a: an import's landing released a scratch member of
+  /// 9,000 files whole in one step, 16.9 ms debug). None where its lineage is gone or it is no preview there.
+  pub fn retire_preview_begun(&mut self, preview: Preview) -> Option<(RepositoryId, Release)> {
+    let lineage = self.lineages.get_mut(&preview.repository)?;
+    let release = lineage.get_mut().retire(preview.handle).ok()?;
+    Some((preview.repository, release))
   }
 
   /// Retires member `id` from its lineage: its engine is gone at once, and what it held comes back as a [`Release`] to

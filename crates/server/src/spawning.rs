@@ -896,7 +896,8 @@ pub(crate) fn join_spawner(mut child: SpawnedChild) {
 
 impl Drop for Owner {
   /// The daemon's stop: the spawner handed to the daemon's process thread, which joins it once every shard's end has
-  /// closed with its shard ([`join_spawner`]); a test's runtime, with no daemon, joins it here, off any daemon's shard.
+  /// closed with its shard ([`join_spawner`]); a test's runtime, with no daemon, or a daemon's thread already gone, has
+  /// it joined on a thread of its own ([`join_off_the_shard`]).
   fn drop(&mut self) {
     let Some(child) = self.child.take() else {
       return;
@@ -904,11 +905,35 @@ impl Drop for Owner {
     match self.join_to.as_ref() {
       Some(join_to) => {
         if let Err(unsent) = join_to.send(child) {
-          join_spawner(unsent.0);
+          join_off_the_shard(unsent.0);
         }
       }
-      None => join_spawner(child),
+      None => join_off_the_shard(child),
     }
+  }
+}
+
+/// Joins `child` ([`join_spawner`]) on a thread of its own, never the shard's: the join may wait a liveness window, and
+/// then the kill's `wait`, on a spawner the machine has not yet run (main 01a20182's 8a loop at 523c522c2: a test's
+/// shard wedged just past its window in the join). The thread is made first and handed the child after, over a
+/// channel, so the child is never lost to a thread that could not be made: it is joined here then, as it is where the
+/// thread has gone before it could be sent.
+fn join_off_the_shard(child: SpawnedChild) {
+  let (hand, handed) = std::sync::mpsc::channel::<SpawnedChild>();
+  let joiner = std::thread::Builder::new()
+    .name("spawner-join".to_owned())
+    .spawn(move || {
+      if let Ok(child) = handed.recv() {
+        join_spawner(child);
+      }
+    });
+  match joiner {
+    Ok(_) => {
+      if let Err(unsent) = hand.send(child) {
+        join_spawner(unsent.0);
+      }
+    }
+    Err(_) => join_spawner(child),
   }
 }
 
@@ -932,7 +957,8 @@ pub(crate) const TEST_SPAWNS_IN_FLIGHT: usize = 8;
 /// A spawner a test's own runtime starts and installs on its shard (a daemon's shards get theirs from its start): this
 /// test binary in its role (`slates_ipc::spawner_role!` at the crate's root), its end installed on the current shard.
 /// Owned ([`TestSpawner::owned`]), the shard is its owner and restarts it on its death; otherwise its death refuses
-/// every spawn after. Dropped, it takes the end back and joins the spawner, which exits once its end has closed.
+/// every spawn after. Dropped, it takes the end back and joins the spawner, which exits once its end has closed, on a
+/// thread of its own ([`join_off_the_shard`]), never the shard's.
 #[cfg(test)]
 pub(crate) struct TestSpawner {
   /// The spawner, where this shard does not own it.
@@ -999,10 +1025,8 @@ impl TestSpawner {
 impl Drop for TestSpawner {
   fn drop(&mut self) {
     uninstall();
-    match self.child.as_mut() {
-      Some(child) => {
-        let _ = child.wait();
-      }
+    match self.child.take() {
+      Some(child) => join_off_the_shard(child),
       None => {
         let _ = OWNER.with(|owner| owner.try_borrow_mut().ok().map(|mut owner| owner.take()));
       }

@@ -84,6 +84,83 @@ proptest! {
   }
 }
 
+/// What a reader sees of `green` and what it counts: every path's bytes at every version from the floor to the head,
+/// each other history as it stands, and the recounted, folded and retained bytes. A content history's chunk numbers
+/// are left out: a fold that lets its values go later than another lets the next work's chunk take a different number,
+/// the same bytes.
+fn read_state(green: &Green) -> String {
+  let reads: Vec<(u64, &str, Option<Vec<u8>>)> = (green.folded_below..=green.head())
+    .flat_map(|version| {
+      PATHS
+        .iter()
+        .map(move |path| (version, *path, green.content_at_bytes(path, version)))
+    })
+    .collect();
+  let versions: Vec<(&String, Vec<u64>)> = green
+    .content_history
+    .iter()
+    .map(|(path, history)| (path, history.iter().map(|(version, _)| *version).collect()))
+    .collect();
+  format!(
+    "{reads:?}\n{versions:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{} {} {:?}",
+    green.special_history,
+    green.mode_history,
+    green.symlink_history,
+    green.hardlink_history,
+    green.xattr_history,
+    green.dir_history,
+    green.history_bytes_recounted(),
+    green.folded_below,
+    green.retained_bytes(),
+  )
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
+
+  /// A-920 11a (oracle). Do: two greens take the same generated works, as the oracle above; at each floor move one
+  /// folds whole (`Green::fold_history_before`), the other begins the fold (`Green::fold_begin`) and takes only a few
+  /// of its units (`Green::fold_some`), so the next works are judged with the fold part-way; it finishes at the end.
+  /// Expect the same head after every work, and at the end the same reads from the floor to the head, the same
+  /// histories (a content history's versions, not its chunk numbers: [`read_state`]), recounted bytes and retained bytes.
+  #[test]
+  fn a_fold_taken_a_unit_at_a_time_across_later_works_equals_the_fold_whole(
+    steps in prop::collection::vec(
+      (prop::collection::vec((0usize..5, any::<u8>()), 1..4), any::<u8>(), any::<bool>()),
+      1..24,
+    ),
+  ) {
+    let mut twins = [Green::new(), Green::new()];
+    for ((changes, mark, fold), id) in steps.iter().zip(0u64..) {
+      for green in &mut twins {
+        let mut work = Work::default();
+        for (index, how) in changes {
+          work = change(work, PATHS[*index], *how, *mark);
+        }
+        let _ = green.submit(&work.at(green.head(), id));
+      }
+      prop_assert_eq!(twins[0].head(), twins[1].head());
+      let head = twins[0].head();
+      let below = twins[0].folded_below;
+      if *fold && head > below {
+        let floor = below + 1 + u64::from(*mark) % (head - below);
+        let [whole, stepped] = &mut twins;
+        whole.fold_history_before(floor);
+        if stepped.fold_begin(floor) {
+          let mut units = usize::from(*mark % 7);
+          let _ = stepped.fold_some(&mut || {
+            units = units.saturating_sub(1);
+            units == 0
+          });
+        }
+      }
+    }
+    let [whole, stepped] = &mut twins;
+    let _ = stepped.fold_some(&mut || false);
+    prop_assert_eq!(read_state(stepped), read_state(whole));
+  }
+}
+
 /// Goal 93 (counted). Do: make 50 files at version 1, change one at version 2 and fold to it, then change another at
 /// version 3 and fold to it. Expect the second fold to visit only the paths changed at the last floor's version and
 /// since (two), never the green's 50: the first fold visits the 50 made since the green began.

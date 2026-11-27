@@ -154,9 +154,9 @@ pub(crate) fn run_at<T: Send + 'static, F: std::future::Future<Output = T> + 'st
   patience: std::time::Duration,
 ) -> T {
   let (sent, got) = std::sync::mpsc::sync_channel(1);
+  // The history and its sender moved into the task, never cloned on the shard: a clone of a history holding a wide
+  // dump was a poll of its own past 1 ms in 34-36 of 99 release runs (A-920, main's probe 15).
   crate::daemon::observe_at(daemon, partition, move |_state| {
-    let history = history.clone();
-    let sent = sent.clone();
     let task = slates_rt::futures::spawn(async move {
       let _ = sent.send(history().await);
     })
@@ -237,7 +237,17 @@ pub(crate) type Asked<'a> = (
 pub(crate) fn routed_create(
   state: &mut crate::state::ShardState,
   (principal, request): (&slates_db::catalog::Principal, u64),
+  asked: Asked<'_>,
+) -> slates_ipc::protocol::ReplyBody {
+  routed_create_adopting(state, (principal, request), asked, None)
+}
+
+/// [`routed_create`] adopting `green`, a green `principal` made alone, as the repository's root (A-636 part 2b-2).
+fn routed_create_adopting(
+  state: &mut crate::state::ShardState,
+  (principal, request): (&slates_db::catalog::Principal, u64),
   (name, tool, format, default_branch): Asked<'_>,
+  green: Option<slates_ipc::protocol::VolumeId>,
 ) -> slates_ipc::protocol::ReplyBody {
   state.current_request = Some((1, slates_wire::request::RequestId::from_word(request)));
   state.reply_route = Some(crate::merge_service::ReplyRoute {
@@ -255,7 +265,7 @@ pub(crate) fn routed_create(
       tool,
       format,
       default_branch: default_branch.to_owned(),
-      green: None,
+      green,
     },
   );
   // Left as the verb runner leaves them after it took a deferred acceptance.
@@ -312,12 +322,127 @@ pub(crate) async fn created(
   }
 }
 
+/// Repository `name`'s import from `files`, laid out on a simulated host as 7.2 keeps them, asked of the import verb by
+/// `principal` as a client's request numbered `request` asks it ([`routed_create`]'s route): the verb's reply,
+/// `Acknowledged` once its task runs the import. The caller waits for it ([`import_ended`]).
+pub(crate) fn import_begun(
+  state: &mut crate::state::ShardState,
+  (principal, request): (&slates_db::catalog::Principal, u64),
+  name: &str,
+  files: crate::hg_base::tests::Files,
+) -> slates_ipc::protocol::ReplyBody {
+  state.current_request = Some((1, slates_wire::request::RequestId::from_word(request)));
+  state.reply_route = Some(crate::merge_service::ReplyRoute {
+    shard: state.shard,
+    client_index: NO_CLIENT,
+    request,
+    through_work: false,
+  });
+  let reply = crate::repository::import::import_with(state, principal, (name, "/"), |_| {
+    let (host, directory) = crate::hg_base::tests::laid_out(files.iter().copied());
+    Ok((
+      Box::new(host) as Box<dyn slates_vfs::host::HostFs>,
+      directory,
+    ))
+  });
+  // Left as the verb runner leaves them after it took a deferred acceptance.
+  state.current_request = None;
+  state.reply_route = None;
+  state.acceptance_deferred = false;
+  reply
+}
+
+/// Waits, from a task on the shard, for Mercurial repository `name`'s (`id`'s) import to end, as the verb's own task
+/// runs and lands it (`repository::import`), never holding the shard; refused where it ended with no changeset in the
+/// store.
+pub(crate) async fn import_ended(name: &str, id: slates_db::catalog::RepositoryId) {
+  let deadline = slates_rt::futures::now_ns()
+    .saturating_add(u64::try_from(IMPORT_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+  loop {
+    let importing =
+      crate::state::with_state(|state| state.vcs_stores.importing(id)).expect("the shard's state");
+    if !importing {
+      break;
+    }
+    assert!(
+      slates_rt::futures::now_ns() < deadline,
+      "repository {name}'s import still running after {IMPORT_PATIENCE:?}"
+    );
+    slates_rt::futures::yield_now().await;
+  }
+  let landed = crate::state::with_state(|state| {
+    state
+      .vcs_stores
+      .mercurial_ref(id)
+      .is_some_and(|(content, store)| {
+        store.index.len(content, slates_hg::index::Log::Changelog) > 0
+      })
+  })
+  .expect("the shard's state");
+  assert!(landed, "repository {name}'s import landed");
+}
+
+/// [`import_begun`] and [`import_ended`]: repository `name` (`id`) imported from `files` through the verb, from a task on
+/// the shard.
+pub(crate) async fn imported_through_the_verb(
+  (principal, request): (&slates_db::catalog::Principal, u64),
+  (name, id): (&str, slates_db::catalog::RepositoryId),
+  files: crate::hg_base::tests::Files,
+) {
+  let reply =
+    crate::state::with_state(|state| import_begun(state, (principal, request), name, files))
+      .expect("the shard's state");
+  assert_eq!(
+    reply,
+    slates_ipc::protocol::ReplyBody::Acknowledged,
+    "the import taken"
+  );
+  import_ended(name, id).await;
+}
+
+/// Shape: how long [`imported_through_the_verb`] waits for an import of a test's fixture: far past a debug build's
+/// (milliseconds), so only an import that never ends reaches it.
+const IMPORT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `history` run as a task on the first shard of a daemon keeping a store, its landed packs let go as production lets
+/// them go, with every store wait in it awaited, never the shard's thread held through one ([`refuse_on_a_shard`]).
+pub(crate) fn run_on_stored_shard<
+  T: Send + 'static,
+  F: std::future::Future<Output = T> + 'static,
+>(
+  history: impl FnOnce() -> F + Clone + Send + 'static,
+) -> T {
+  let (store, daemon) = audit_daemon_stored();
+  let answer = run_on_first(&daemon, history, HISTORY_PATIENCE);
+  daemon.stop();
+  drop(store);
+  answer
+}
+
+/// Shape: how long [`run_on_stored_shard`]'s history may run: far past a debug build's (seconds), so only one that never
+/// ends reaches it.
+pub(crate) const HISTORY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// [`created`] from the test's thread, on `daemon`'s shard of partition `partition`.
 pub(crate) fn create_on(
   daemon: &crate::Daemon,
   partition: usize,
   principal: &slates_db::catalog::Principal,
   asked: Asked<'_>,
+) -> (
+  slates_db::catalog::RepositoryId,
+  slates_db::catalog::VolumeId,
+) {
+  create_adopting_on(daemon, (partition, principal), asked, None)
+}
+
+/// [`create_on`] adopting `green`, a green `principal` made alone, as the repository's root (A-636 part 2b-2): the
+/// root then is `green`.
+pub(crate) fn create_adopting_on(
+  daemon: &crate::Daemon,
+  (partition, principal): (usize, &slates_db::catalog::Principal),
+  asked: Asked<'_>,
+  green: Option<slates_ipc::protocol::VolumeId>,
 ) -> (
   slates_db::catalog::RepositoryId,
   slates_db::catalog::VolumeId,
@@ -332,7 +457,12 @@ pub(crate) fn create_on(
   let reply = {
     let (name, branch) = (name.clone(), branch.clone());
     crate::daemon::observe_at(daemon, partition, move |state| {
-      routed_create(state, (&principal, 1), (&name, tool, format, &branch))
+      routed_create_adopting(
+        state,
+        (&principal, 1),
+        (&name, tool, format, &branch),
+        green,
+      )
     })
   };
   assert!(
@@ -355,6 +485,23 @@ pub(crate) fn create_on(
   }
 }
 
+/// Refuses `blocking`, a wait on the store a test helper makes by joining a thread of its own, when it is called on a
+/// daemon shard's own thread (one the runtime names `slates-shard-N`): there the wait holds the shard through the store's
+/// commit, and under load that alone passes the watchdog's window, which judges a shard neither running nor runnable
+/// wedged (main's 8a burner loop at 228d0dc97: exit 4 in 3 of 6 rounds, a fixture's landing in an observation). So the
+/// shape fails every test that has it, on any machine, naming `instead`, never only under a slow fsync. A bare runtime
+/// runs on the test's own thread and is not refused. No fixture is allowed it (the shard-blocking allow-list emptied
+/// and removed, w-hg, 2026-11-26).
+fn refuse_on_a_shard(blocking: &str, instead: &str) {
+  let on_a_shard = std::thread::current()
+    .name()
+    .is_some_and(|name| name.starts_with("slates-shard-"));
+  assert!(
+    !on_a_shard,
+    "{blocking} on a daemon shard's own thread holds the shard through the store's commit: {instead}"
+  );
+}
+
 /// Lands `parts` under `header` through `disk` and waits for the store's answer, for a test's synchronous history on a
 /// shard: the landing runs on a thread of its own with a runtime of its own, which parks until the store's owner
 /// answers (the shard's own thread cannot wait on a wake its runtime would deliver). Whether it landed.
@@ -367,12 +514,17 @@ pub(crate) fn land_blocking(
 }
 
 /// [`land_blocking`]'s landing with the store's answer: where it was committed, or why the owner refused it (`Gone` for
-/// a waiting thread that could not run it).
+/// a waiting thread that could not run it). Refused on a shard's own thread ([`refuse_on_a_shard`]).
 pub(crate) fn land_answered_blocking(
   disk: StoreHandle,
   header: slates_store::log::Header,
   parts: Vec<slates_store::owner::Part>,
 ) -> Result<slates_store::log::Located, slates_store::owner::OwnerError> {
+  refuse_on_a_shard(
+    "a landing waited for on its thread (test_store::land_blocking)",
+    "land from the test's thread after the observation returns, or await the landing in a task on the shard \
+     (hg_push::unbundle for a push; test_store::created().await for a creation, through test_store::run_on_first)",
+  );
   std::thread::scope(|scope| {
     scope
       .spawn(move || {
@@ -404,20 +556,10 @@ pub(crate) fn waiting_runtime() -> slates_rt::runtime::LocalRuntime {
   .expect("the waiting thread's runtime")
 }
 
-/// [`crate::daemon::audit_on_shard`] over a daemon holding a fresh [`TestStore`] named `name`: `history` runs on its
-/// shard; the daemon stops, dropping every handle, before the store goes (module docs).
-pub(crate) fn audit_on_stored_shard<T: Send + 'static>(
-  name: &str,
-  history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
-) -> T {
-  audit_on_stored_shard_configured(name, history, |_| {})
-}
-
-/// [`audit_on_stored_shard`] for a history that begins by making a repository: `asked` is made first, by `principal`, as
+/// A stored daemon's first shard for a history that begins by making a repository: `asked` is made first, by `principal`, as
 /// a client's creation is made, the test's thread waiting for its record ([`create_on`]); then `history` runs on the
 /// shard with the repository's id and its root green. The shard is never held through the creation's commit
-/// (docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md), and the history keeps its landed
-/// packs resident, as [`audit_on_stored_shard`]'s does.
+/// (docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md).
 pub(crate) fn audit_on_stored_shard_made<T: Send + 'static>(
   (principal, asked): (&slates_db::catalog::Principal, Asked<'_>),
   history: impl FnOnce(
@@ -432,7 +574,6 @@ pub(crate) fn audit_on_stored_shard_made<T: Send + 'static>(
   + 'static,
 ) -> T {
   let (store, daemon) = audit_daemon_stored();
-  keep_landed(&daemon);
   let made = create_on(&daemon, 0, principal, asked);
   let answer = crate::daemon::observe_first(&daemon, move |state| history(state, made));
   daemon.stop();
@@ -440,26 +581,90 @@ pub(crate) fn audit_on_stored_shard_made<T: Send + 'static>(
   answer
 }
 
-/// [`audit_on_stored_shard`] with the daemon's configuration changed by `configure` first
-/// ([`crate::daemon::audit_on_shard_configured`]).
-pub(crate) fn audit_on_stored_shard_configured<T: Send + 'static>(
-  name: &str,
+/// A stored daemon's first shard for a history that waits on nothing: run on a stored daemon's first shard with no
+/// allowance, so a blocking helper it reached would be refused ([`refuse_on_a_shard`]) rather than hold the shard (main
+/// 01a20182's order of 2026-11-26, the shard-blocking allow-list: a history that only reads and sets the shard's state
+/// needs none).
+pub(crate) fn on_a_stored_shard<T: Send + 'static>(
   history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
-  configure: impl FnOnce(&mut crate::DaemonConfig),
 ) -> T {
-  let store = TestStore::start(name);
-  let handle = store.handle();
-  // A synchronous history brings no let-go window back, so its landed packs stay resident (`vcs_store::KEEP_LANDED`).
-  let kept = move |state: &mut crate::state::ShardState| {
-    crate::vcs_store::KEEP_LANDED.with(|keep| keep.set(true));
-    history(state)
-  };
-  let answer = crate::daemon::audit_on_shard_configured(kept, move |config| {
-    config.vcs_disk = Some(handle);
-    configure(config);
-  });
+  let (store, daemon) = audit_daemon_stored();
+  // Its landed packs let go as production lets them go (main's ruling A3 of 2026-11-26, carried to this runner the
+  // same day): a test whose point is residency keeps them by name ([`keep_landed`]).
+  let answer = crate::daemon::observe_first(&daemon, move |state| history(state));
+  daemon.stop();
   drop(store);
   answer
+}
+
+/// [`run_on_stored_shard`] for a history that begins by making several repositories: each of `asked` made first, by
+/// `principal`, from the test's thread ([`create_on`]), in order; then `history` runs as a task on the shard with their
+/// ids and root greens, in `asked`'s order, every store wait in it awaited. The shard is never held through a creation's
+/// commit, nor through a landing.
+pub(crate) fn run_on_stored_shard_made_all<
+  T: Send + 'static,
+  F: std::future::Future<Output = T> + 'static,
+  const N: usize,
+>(
+  (principal, asked): (&slates_db::catalog::Principal, [Asked<'_>; N]),
+  history: impl FnOnce(
+    [(
+      slates_db::catalog::RepositoryId,
+      slates_db::catalog::VolumeId,
+    ); N],
+  ) -> F
+  + Clone
+  + Send
+  + 'static,
+) -> T {
+  let (store, daemon) = audit_daemon_stored();
+  let made = asked.map(|asked| create_on(&daemon, 0, principal, asked));
+  let answer = run_on_first(&daemon, move || history(made), HISTORY_PATIENCE);
+  daemon.stop();
+  drop(store);
+  answer
+}
+
+/// [`audit_on_stored_shard_made`] for a history that begins by making several repositories: each of `asked` made first,
+/// by `principal`, from the test's thread ([`create_on`]), in order; then `history` runs on the shard with their ids and
+/// root greens, in `asked`'s order. The shard is never held through a creation's commit.
+pub(crate) fn audit_on_stored_shard_made_all<T: Send + 'static, const N: usize>(
+  (principal, asked): (&slates_db::catalog::Principal, [Asked<'_>; N]),
+  history: impl FnOnce(
+    &mut crate::state::ShardState,
+    [(
+      slates_db::catalog::RepositoryId,
+      slates_db::catalog::VolumeId,
+    ); N],
+  ) -> T
+  + Clone
+  + Send
+  + 'static,
+) -> T {
+  let (store, daemon) = audit_daemon_stored();
+  let made = asked.map(|asked| create_on(&daemon, 0, principal, asked));
+  let answer = crate::daemon::observe_first(&daemon, move |state| history(state, made));
+  daemon.stop();
+  drop(store);
+  answer
+}
+
+/// The tests that keep their landed packs resident by name, each until the piece that moves it
+/// (main's ruling of 2026-11-26: the stored runners let packs go as production does, and a test that cannot yet is
+/// named here with its owner). The list only shrinks: its length is the figure GAPS records ("The landed-pack pins"),
+/// held by a test.
+pub(crate) const LANDED_KEPT_PINNED: &[Pinned] = &[];
+
+/// A test keeping its landed packs resident by name ([`LANDED_KEPT_PINNED`]): its path, whose it is, and the piece that
+/// unpins it.
+#[derive(Debug)]
+pub(crate) struct Pinned {
+  /// The test, by its path under the crate.
+  pub(crate) test: &'static str,
+  /// Whose test it is.
+  pub(crate) owner: &'static str,
+  /// The piece that unpins it.
+  pub(crate) until: &'static str,
 }
 
 /// Keeps a push's landed pack resident on `daemon`'s first shard (`vcs_store::KEEP_LANDED`): for a test whose history
@@ -480,36 +685,6 @@ pub(crate) fn audit_daemon_of_stored(shards: u16) -> (TestStore, crate::Daemon) 
     config.vcs_disk = Some(handle);
   });
   (store, daemon)
-}
-
-/// A `CreateRepository` request served in a test's synchronous history on a shard of a node keeping a store, answered
-/// once its changeset 0 is landed and it is recorded (`repository::create_blocking`, A-767 item 7): the verb's own
-/// creation answers by its reply route from a task, which a history holding the shard cannot wait for ([`created`] and
-/// [`create_on`] serve a history that runs as a task, or the test's thread). On a node with no store, and for any other
-/// request, the verb as a client's dispatch serves it.
-pub(crate) fn create(
-  state: &mut crate::state::ShardState,
-  principal: &slates_db::catalog::Principal,
-  request: slates_ipc::protocol::RequestBody,
-) -> slates_ipc::protocol::ReplyBody {
-  let Some(disk) = state.vcs_disk.clone() else {
-    return crate::verbs::dispatch(state, 1, principal, request);
-  };
-  match request {
-    slates_ipc::protocol::RequestBody::CreateRepository {
-      name,
-      tool,
-      format,
-      default_branch,
-      green,
-    } => crate::repository::create_blocking(
-      state,
-      (disk, principal),
-      (&name, tool, format, &default_branch),
-      green,
-    ),
-    other => crate::verbs::dispatch(state, 1, principal, other),
-  }
 }
 
 /// A store-holding daemon over `owner`'s repository `name`, whose revision 1 adds `/trunk/a.bin` with `bytes` (a stored text, which
@@ -652,106 +827,6 @@ pub(crate) fn noise(len: usize) -> Vec<u8> {
       state.to_le_bytes()[0]
     })
     .collect()
-}
-
-/// Answers what a streamed answer asks of the changeset store (`slates_hg::render::StoreWants`), each want asked of
-/// `disk` for `repository` and waited for on a thread of its own ([`land_blocking`]'s way), for a test's synchronous
-/// history on a shard: what `vcs_store::hg_view::answer_store_wants` answers between a daemon's turns. Whether every
-/// want was answered.
-pub(crate) fn answer_wants_blocking(
-  disk: &StoreHandle,
-  repository: u128,
-  wants: &mut dyn slates_hg::render::StoreWants,
-) -> bool {
-  use slates_hg::render::{StoredPlace, StoredRevision, Want};
-  while let Some(want) = wants.wants().cloned() {
-    let disk = disk.clone();
-    let given = std::thread::scope(|scope| {
-      scope
-        .spawn(move || {
-          waiting_runtime()
-            .block_on(async move {
-              match want {
-                Want::Rows { logs } => {
-                  let asked = logs
-                    .into_iter()
-                    .map(|(log, nodes)| (log, nodes.iter().map(|node| node.to_vec()).collect()))
-                    .collect();
-                  disk
-                    .texts_by_tool(repository, asked)
-                    .await
-                    .ok()
-                    .map(|found| {
-                      slates_hg::serve::getbundle::Given::Rows(
-                        found
-                          .into_iter()
-                          .map(|log| {
-                            log
-                              .into_iter()
-                              .map(|row| {
-                                row.map(|(text, row)| StoredRevision {
-                                  text,
-                                  base: row.base,
-                                  place: StoredPlace {
-                                    payload: row.place.payload,
-                                    offset: row.place.offset,
-                                    len: row.place.len,
-                                    chunk: row.form == slates_store::texts::Form::Chunk,
-                                  },
-                                })
-                              })
-                              .collect()
-                          })
-                          .collect(),
-                      )
-                    })
-                }
-                Want::Chunks { places } => {
-                  let asked = places
-                    .iter()
-                    .map(|place| slates_store::texts::Place {
-                      payload: place.payload,
-                      offset: place.offset,
-                      len: place.len,
-                    })
-                    .collect();
-                  disk
-                    .places(asked)
-                    .await
-                    .ok()
-                    .map(slates_hg::serve::getbundle::Given::Chunks)
-                }
-                Want::Texts { texts, most } => {
-                  // A test's synchronous answer copies a want in one request: its step the want's own bytes.
-                  crate::vcs_store::hg_view::texts_made(&disk, repository, &texts, (most, most))
-                    .await
-                    .map(|(made, _)| match made {
-                      crate::vcs_store::hg_view::MadeTexts::Made(made) => {
-                        slates_hg::serve::getbundle::Given::Texts(made)
-                      }
-                      crate::vcs_store::hg_view::MadeTexts::Past => {
-                        slates_hg::serve::getbundle::Given::TextsPast
-                      }
-                    })
-                }
-              }
-            })
-            .ok()
-            .flatten()
-        })
-        .join()
-        .ok()
-        .flatten()
-    });
-    match given {
-      Some(slates_hg::serve::getbundle::Given::Rows(rows)) => wants.give_rows(rows),
-      Some(slates_hg::serve::getbundle::Given::Chunks(chunks)) => wants.give_chunks(chunks),
-      Some(slates_hg::serve::getbundle::Given::Texts(texts)) => wants.give_texts(texts),
-      Some(slates_hg::serve::getbundle::Given::TextsPast) => wants.texts_past(),
-      None => return false,
-    }
-  }
-  true
 }
 
 /// The principal the Subversion helpers below act as: uid 1234 on host 0, as the store tests' owner.
@@ -917,4 +992,39 @@ pub(crate) fn rebuild_after_takeover(
     crate::takeover::rebuild_repository(state, record, parts),
     "rebuilt"
   );
+}
+
+/// Main's ruling (a) of 2026-11-25, condition 2: the shard-blocking allow-list only shrinks. Do: read the figure GAPS
+/// records for it ("The shard-blocking allow-list: N fixtures"). Expect: the list holds exactly that many, each named
+/// once with an owner and a count of the sites reaching it, so an entry added is a GAPS edit made in the same review.
+/// Main's ruling of 2026-11-26 (KEEP_LANDED off the default runners): the landed-pack pins only shrink. Do: read the
+/// figure GAPS records for them ("The landed-pack pins: N tests"). Expect the list holds exactly that many, each named
+/// once with its owner and the piece that unpins it.
+#[test]
+fn the_landed_pack_pins_hold_the_figure_gaps_records() {
+  const GAPS: &str = include_str!("../../../docs/wip/GAPS.md");
+  const LINE: &str = "**The landed-pack pins: ";
+  let recorded = GAPS
+    .lines()
+    .find_map(|line| line.split_once(LINE))
+    .and_then(|(_, rest)| rest.split_once(" tests**"))
+    .map(|(figure, _)| figure.parse::<usize>())
+    .expect("GAPS records the pins' figure")
+    .expect("a whole number");
+  assert_eq!(
+    LANDED_KEPT_PINNED.len(),
+    recorded,
+    "edit the pins and GAPS together"
+  );
+  for pinned in LANDED_KEPT_PINNED {
+    let named = LANDED_KEPT_PINNED
+      .iter()
+      .filter(|other| other.test == pinned.test)
+      .count();
+    assert_eq!(named, 1, "{pinned:?} listed once");
+    assert!(
+      !pinned.owner.is_empty() && !pinned.until.is_empty(),
+      "{pinned:?} carries its owner and its piece"
+    );
+  }
 }

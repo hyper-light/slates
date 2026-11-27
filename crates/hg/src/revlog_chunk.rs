@@ -80,6 +80,9 @@ pub struct ChunkCounts {
   pub decode: PassCounts,
   /// The most bytes one of those decodes made (main's ruling (b), its condition (1)).
   pub decode_most: u64,
+  /// Chunks a stream's send pass copied as the store keeps them ([`count_kept`]; main's ruling (b)): their
+  /// `stored_bytes` what was copied, nothing made or timed.
+  pub kept: PassCounts,
 }
 
 /// Why a chunk could not be made.
@@ -161,6 +164,12 @@ thread_local! {
         ns: 0,
       },
       decode_most: 0,
+      kept: PassCounts {
+        chunks: 0,
+        plain_bytes: 0,
+        stored_bytes: 0,
+        ns: 0,
+      },
     })
   };
 }
@@ -315,6 +324,17 @@ fn framed(
   context
     .compress2(frame, plain)
     .map_err(|code| ChunkRefused::Engine(zstd_safe::get_error_name(code)))
+}
+
+/// Counts one chunk of `stored` bytes a stream sent as the store keeps it, made by no pass here (main's ruling (b)): so a
+/// stream that compresses nothing still shows what it sent, and its counts are not read as lost.
+pub fn count_kept(stored: u64) {
+  COUNTS.with(|counts| {
+    let mut now = counts.get();
+    now.kept.chunks = now.kept.chunks.saturating_add(1);
+    now.kept.stored_bytes = now.kept.stored_bytes.saturating_add(stored);
+    counts.set(now);
+  });
 }
 
 /// This thread's counts since its last call, begun again at zero (the server counts them on its shard).

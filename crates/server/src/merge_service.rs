@@ -334,6 +334,18 @@ pub(crate) fn checkpoint_floor(state: &ShardState, green: DbVolumeId) -> u64 {
 /// Never refuses the verb that called it: a checkpoint the engine cannot take at the floor (its histories already
 /// folded past it) or the partition refuses is counted and skipped, and the chain stays whole and correct.
 pub(crate) fn checkpoint_green(state: &mut ShardState, green: DbVolumeId) {
+  checkpoint_green_with(state, green, true);
+}
+
+/// [`checkpoint_green`] with none of its work in the caller's step: its task begun at once, the identity's fold and the
+/// hold all in its turns (A-920's checkpoint piece: an import's landing took the first fold and hold steps inline in one
+/// poll, 16 ms debug at 9,000 files, since a paced step with no one waiting runs on past its quantum, A-783).
+pub(crate) fn checkpoint_green_in_turns(state: &mut ShardState, green: DbVolumeId) {
+  checkpoint_green_with(state, green, false);
+}
+
+/// [`checkpoint_green`], its first fold and hold steps taken in the caller's step where `inline`.
+fn checkpoint_green_with(state: &mut ShardState, green: DbVolumeId, inline: bool) {
   if state.merge.checkpointing.contains(&green) {
     return;
   }
@@ -356,7 +368,10 @@ pub(crate) fn checkpoint_green(state: &mut ShardState, green: DbVolumeId) {
   // 527 ms of one step, w-work-cow 2026-11-21). When a step's quantum ends with someone waiting, the rest is done in
   // turns by a task of its own.
   let quantum = state.config.step_quantum_ns();
-  let hold = if identity_folded_in_a_step(state, green, quantum) {
+  if inline {
+    state.count(CHECKPOINT_BEGUN_INLINE, 1);
+  }
+  let hold = if inline && identity_folded_in_a_step(state, green, quantum) {
     let Some(mut hold) = CheckpointHold::begin(state, green, Doubling::Wait) else {
       checkpoint_ended(state, green);
       return;
@@ -398,28 +413,36 @@ fn checkpoint_ended(state: &mut ShardState, green: DbVolumeId) {
 /// (`left_ns`), spread over the turns left before its deadline, a turn every `gap_ns` (the time since the last turn, the
 /// shard's measured cycle through its ready tasks). The deadline is the doubling interval (`interval_ns`, the time the
 /// increments it folds took to come, from `began_ns`): the next checkpoint is due after as much again, so this one
-/// ends within it. Never under the quantum; past the deadline, what is left at once (a step stops at its ceiling). A
-/// first checkpoint's interval is nothing, so it has no deadline to spread over: the quantum a turn, as the hold's share
-/// is (goal 93: an import's first checkpoint folded 8,991 keys in one poll of 495 ms, debug, its deadline passed at its
+/// ends within it. Never under the quantum, and never over the step ceiling ([`crate::config::STEP_QUANTUM_CEILING_NS`],
+/// A-928's cap, half 84a's loaded bar): past the deadline a turn takes the ceiling, not everything left (main 01a20182's
+/// ruling of 2026-11-26, A-920's checkpoint piece: everything left at once folded a 7,441-key backlog in one step of
+/// 406 ms, debug), so the checkpoint lands later, by its backlog over a ceiling-turn's keys; the chain's cap stays the
+/// hard bound (`Doubling::Now` at the cap), so nothing grows without end. A turn of the quantum alone was measured and
+/// rejected (A-579: one key a trip round the owner's ready queue, 7.2-13.0 s under steady contention). A first
+/// checkpoint's interval is nothing, so it has no deadline to spread over: the quantum a turn, as the hold's share is
+/// (goal 93: an import's first checkpoint folded 8,991 keys in one poll of 495 ms, debug, its deadline passed at its
 /// first turn).
 fn turn_budget_ns(
   left_ns: u64,
   (gap_ns, quantum_ns): (u64, u64),
   (began_ns, interval_ns, now_ns): (u64, u64, u64),
 ) -> u64 {
+  let ceiling = crate::config::STEP_QUANTUM_CEILING_NS.max(quantum_ns);
   if interval_ns == 0 {
     return quantum_ns;
   }
   let deadline = began_ns.saturating_add(interval_ns);
   let remaining = deadline.saturating_sub(now_ns);
   if remaining <= gap_ns {
-    return left_ns.max(quantum_ns);
+    return ceiling;
   }
   let share = u128::from(left_ns)
     .saturating_mul(u128::from(gap_ns))
     .checked_div(u128::from(remaining))
     .unwrap_or(u128::from(left_ns));
-  u64::try_from(share).unwrap_or(u64::MAX).max(quantum_ns)
+  u64::try_from(share)
+    .unwrap_or(u64::MAX)
+    .clamp(quantum_ns, ceiling)
 }
 
 /// Folds `green`'s identity backlog a key a unit in one paced step (`slates_pace::Step`, A-579): whether it is all
@@ -449,8 +472,11 @@ const IDENTITY_KEY: usize = 0;
 const CHUNK_HASHED: usize = 1;
 /// The pace kind of one chunk of a checkpoint's encoding copied into its content store stage ([`CheckpointHold::step`]).
 const CHUNK_STAGED: usize = 2;
-/// The pace kinds a checkpoint's work is measured in: [`IDENTITY_KEY`], [`CHUNK_HASHED`], [`CHUNK_STAGED`].
-pub(crate) const CHECKPOINT_KINDS: usize = CHUNK_STAGED + 1;
+/// The pace kind of one copied key read for a checkpoint's build ([`CheckpointHold::step`], A-920 8a).
+const CHECKPOINT_KEY: usize = 3;
+/// The pace kinds a checkpoint's work is measured in: [`IDENTITY_KEY`], [`CHUNK_HASHED`], [`CHUNK_STAGED`],
+/// [`CHECKPOINT_KEY`].
+pub(crate) const CHECKPOINT_KINDS: usize = CHECKPOINT_KEY + 1;
 
 /// Takes `green`'s checkpoint in turns (A-579): its identity's backlog folded a paced step a turn, then its encoding held
 /// in the content store a paced step a turn (`hold`, begun already when the identity was folded in the asking step),
@@ -524,7 +550,9 @@ fn checkpoint_turn(
 }
 
 /// A green's checkpoint on its way into the owner shard's content store (A-579's last step, chain entry format 6's rule):
-/// built and encoded, then its encoding's chunks hashed into the inputs archive's manifest a unit at a time, then copied
+/// built a unit at a time (A-920 8a: each copied tree's keys gathered, each of their keys read, then the rest whole,
+/// [`slates_merge::engine::Green::checkpoint_unit`]; built whole at its begin, 52.5 ms of one checkpoint turn, debug,
+/// for a green holding two copied trees of 9,000 files), encoded, then its encoding's chunks hashed into the inputs archive's manifest a unit at a time, then copied
 /// into the store's stage of that manifest a unit at a time, then the stage completed, the shard published and the
 /// checkpoint recorded by name ([`Op::GreenCheckpointed`]). Owned by the step or the task taking it, so dropping it
 /// mid-way leaves nothing but its stage, which the next checkpoint's stage replaces and recovery gives back
@@ -534,7 +562,9 @@ pub(crate) struct CheckpointHold {
   green: DbVolumeId,
   /// The version the checkpoint is the green's state at: its checkpoint floor when it was built.
   version: u64,
-  /// The checkpoint's encoding (`slates_merge::checkpoint`).
+  /// What is left to make before the encoding is hashed: the checkpoint's build, then its encoding; none once encoded.
+  making: Option<Making>,
+  /// The checkpoint's encoding (`slates_merge::checkpoint`), once made.
   encoding: Vec<u8>,
   /// The manifest's extents hashed so far, one a chunk in order.
   extents: Vec<slates_archive::manifest::Extent>,
@@ -544,6 +574,14 @@ pub(crate) struct CheckpointHold {
   staging: Option<[u8; 32]>,
   /// The chunks copied into the stage so far.
   staged: usize,
+}
+
+/// What a [`CheckpointHold`] makes before its encoding is hashed (A-920 8a).
+enum Making {
+  /// The checkpoint being built, and the head and its identity read when it began (A-257), which it records.
+  Building(Box<slates_merge::engine::CheckpointBuild>, (u64, [u8; 32])),
+  /// The checkpoint built, to be encoded in a unit of its own.
+  Encoding(Box<slates_merge::checkpoint::Checkpoint>),
 }
 
 /// What a step of a [`CheckpointHold`] left.
@@ -570,10 +608,9 @@ impl CheckpointHold {
     }
     let floor = inputs.floor;
     // The head's identity beside it (A-257): the amortized rule above bounds how often this reads the identity.
-    let Some(checkpoint) = state.greens.get_mut(&green).and_then(|mut engine| {
-      let mut checkpoint = engine.checkpoint(floor)?;
-      checkpoint.head_check = Some((engine.head(), engine.head_identity()));
-      Some(checkpoint)
+    let Some(building) = state.greens.get_mut(&green).and_then(|mut engine| {
+      let build = engine.checkpoint_begin(floor)?;
+      Some((Box::new(build), (engine.head(), engine.head_identity())))
     }) else {
       state.count(CHECKPOINT_UNAVAILABLE, 1);
       return None;
@@ -581,7 +618,8 @@ impl CheckpointHold {
     Some(CheckpointHold {
       green,
       version: floor,
-      encoding: checkpoint.into_encoded(),
+      making: Some(Making::Building(building.0, building.1)),
+      encoding: Vec::new(),
       extents: Vec::new(),
       hashed: 0,
       staging: None,
@@ -605,18 +643,27 @@ impl CheckpointHold {
         env.quantum_ns = budget_ns.max(env.quantum_ns);
         let mut costs = state.merge.checkpoint_costs;
         let mut step = slates_pace::Step::begin(env, (env.clock)());
+        let mut taken = 0u32;
         let held = loop {
-          let kind = if self.staging.is_some() {
-            CHUNK_STAGED
-          } else {
-            CHUNK_HASHED
+          let kind = match (&self.making, self.staging.is_some()) {
+            (Some(_), _) => CHECKPOINT_KEY,
+            (None, true) => CHUNK_STAGED,
+            (None, false) => CHUNK_HASHED,
           };
-          if !step.more(kind, &mut costs) {
+          // A whole part of the build begins a step, never ends one past its quantum (A-920 piece 2c's rule).
+          let part_after_units = taken > 0 && self.next_is_part();
+          let spent = part_after_units
+            || match hold_units_a_step() {
+              Some(units) => taken >= units,
+              None => !step.more(kind, &mut costs),
+            };
+          if spent {
             break Held::More;
           }
           if self.unit(state) == Held::Ended {
             break Held::Ended;
           }
+          taken = taken.saturating_add(1);
         };
         step.close((env.clock)(), &mut costs);
         state.merge.checkpoint_costs = costs;
@@ -633,9 +680,54 @@ impl CheckpointHold {
     held
   }
 
-  /// One unit: a chunk hashed, the stage opened once every chunk is, a chunk staged, or the stage completed and the
-  /// checkpoint recorded.
+  /// Whether the next unit is a whole part: a copied tree's keys gathered, the build's rest, or the encoding.
+  fn next_is_part(&self) -> bool {
+    match &self.making {
+      Some(Making::Building(build, _)) => build.next_is_part(),
+      Some(Making::Encoding(_)) => true,
+      None => false,
+    }
+  }
+
+  /// One unit of the checkpoint's making (A-920 8a): a unit of its build, its encoding once built. Unavailable part-way
+  /// (its floor folded past, a push owed), counted and ended.
+  fn making_unit(&mut self, state: &mut ShardState, making: Making) -> Held {
+    match making {
+      Making::Building(mut build, head_check) => {
+        state.count(CHECKPOINT_BUILD_UNITS, 1);
+        let step = state
+          .greens
+          .get(&self.green)
+          .and_then(|engine| engine.checkpoint_unit(&mut build));
+        match step {
+          Some(slates_merge::engine::CheckpointStep::More) => {
+            self.making = Some(Making::Building(build, head_check));
+            Held::More
+          }
+          Some(slates_merge::engine::CheckpointStep::Built(mut checkpoint)) => {
+            checkpoint.head_check = Some(head_check);
+            self.making = Some(Making::Encoding(checkpoint));
+            Held::More
+          }
+          None => {
+            state.count(CHECKPOINT_UNAVAILABLE, 1);
+            Held::Ended
+          }
+        }
+      }
+      Making::Encoding(checkpoint) => {
+        self.encoding = checkpoint.into_encoded();
+        Held::More
+      }
+    }
+  }
+
+  /// One unit: a unit of the checkpoint's making, a chunk hashed, the stage opened once every chunk is, a chunk staged,
+  /// or the stage completed and the checkpoint recorded.
   fn unit(&mut self, state: &mut ShardState) -> Held {
+    if let Some(making) = self.making.take() {
+      return self.making_unit(state, making);
+    }
     let object = checkpoint_object(self.green);
     let Some(manifest) = self.staging else {
       let chunk = crate::merge_origin::inputs_chunk_bytes().max(1);
@@ -835,11 +927,37 @@ pub(crate) fn release_unnamed_checkpoints(state: &mut ShardState, green: DbVolum
 pub(crate) const CHECKPOINT_IN_TURNS: &str = "merge.checkpoint.in_turns";
 /// Counter: the longest a checkpoint in turns took from its first step to its record, nanoseconds (A-579).
 pub(crate) const CHECKPOINT_IN_TURNS_LONGEST_NS: &str = "merge.checkpoint.in_turns_longest_ns";
+
+/// Counter: a checkpoint whose first fold and hold steps ran in its caller's step ([`checkpoint_green`]), not its task's
+/// turns ([`checkpoint_green_in_turns`]): none from an import's landing (A-920's checkpoint piece). Format: a counter name
+/// in the daemon's status report.
+pub(crate) const CHECKPOINT_BEGUN_INLINE: &str = "merge.checkpoint.begun_inline";
 /// Counter: the paced steps that folded a checkpoint's identity backlog (A-579).
 pub(crate) const CHECKPOINT_IDENTITY_STEPS: &str = "merge.checkpoint.identity_steps";
 /// Counter: the steps that held a checkpoint's encoding in the content store (A-579's last step), the non-vacuity count
 /// of [`CheckpointHold::step`]: more than one for a checkpoint is the hold spread over turns.
 pub(crate) const CHECKPOINT_HOLD_STEPS: &str = "merge.checkpoint.hold_steps";
+
+/// How many units a checkpoint hold's paced step takes where a test pins it ([`HOLD_UNITS_A_STEP`]); none in the
+/// product, where the step's quantum decides (`slates_pace::Step::more`).
+fn hold_units_a_step() -> Option<u32> {
+  #[cfg(test)]
+  {
+    HOLD_UNITS_A_STEP.with(std::cell::Cell::get)
+  }
+  #[cfg(not(test))]
+  {
+    None
+  }
+}
+
+#[cfg(test)]
+std::thread_local! {
+  /// Test support: every checkpoint hold step on this shard takes exactly this many units, as a step whose quantum
+  /// holds that many would: budget alone, through the hold's own units, so a test states the hold's rule for a quantum
+  /// it chooses instead of the one the machine learned (main's order of 2026-11-25).
+  pub(crate) static HOLD_UNITS_A_STEP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
 /// Counter: the longest step that held a checkpoint's encoding, nanoseconds (A-579's last step).
 pub(crate) const CHECKPOINT_HOLD_LONGEST_STEP_NS: &str = "merge.checkpoint.hold_longest_step_ns";
 /// Counter: a checkpoint's hold whose stage gave way to another checkpoint's, or whose green went (A-579).
@@ -950,6 +1068,11 @@ pub(crate) fn settle_checkpoints(state: &mut ShardState) {
     checkpoint_ended(state, green);
   }
 }
+
+/// Counter: a unit of a checkpoint's build ([`CheckpointHold`], A-920 8a): a copied tree's keys gathered, one of its
+/// keys read, or the rest made; many a checkpoint of a green holding a wide copy shows its build was taken a unit at a
+/// time, never whole at its begin. Format: a counter name in the daemon's status report.
+pub(crate) const CHECKPOINT_BUILD_UNITS: &str = "merge.checkpoint.build_units";
 
 /// Counter: a green's chain checkpointed (W3), the non-vacuity count of [`checkpoint_green`].
 pub(crate) const CHECKPOINT_TAKEN: &str = "merge.checkpoint.taken";
@@ -3044,6 +3167,171 @@ pub(crate) fn hold_increment(
       Err(Refusal::BudgetExceeded { available })
     }
     Err(_) => Err(Refusal::ContentUnavailable),
+  }
+}
+
+/// [`hold_increment`] taken a unit at a time (A-920 6b: 23.6 ms whole for an import's revision of 9,000 files, debug, one
+/// step of its landing's entry): the encoding's chunks hashed into the inputs archive's manifest a copy slice a unit
+/// (A-920 7c: a chunk a unit, up to 1 MiB, was 10.4 ms of one step, debug), then its
+/// stage opened in the content store under the green's object, the chunks copied in a chunk a unit
+/// (`stage_lent_piece`, [`hold_lent`]'s piece at a time), and the stage completed. The same identity, charges and
+/// refusals as [`hold_increment`]; dropped part-way, it leaves only its stage, which the next hold of the green's object
+/// gives way to.
+///
+/// [`hold_lent`]: slates_cluster::content::ContentStore::hold_lent
+pub(crate) struct IncrementHold {
+  /// The green.
+  green: DbVolumeId,
+  /// The version whose inputs it holds.
+  version: u64,
+  /// The manifest's extents hashed so far, one a chunk in order.
+  extents: Vec<slates_archive::manifest::Extent>,
+  /// The encoding's bytes hashed so far.
+  hashed: usize,
+  /// Where the chunk being hashed begins in the encoding.
+  chunk_start: usize,
+  /// The chunk being hashed, its bytes from [`IncrementHold::chunk_start`] to [`IncrementHold::hashed`] so far.
+  chunk_hasher: blake3::Hasher,
+  /// The manifest's identity once its stage is open, and whether the store held it only from this hold.
+  staging: Option<([u8; 32], bool)>,
+  /// The chunks copied into the stage so far.
+  staged: usize,
+}
+
+impl IncrementHold {
+  /// A hold of `green`'s `version`'s increment, begun.
+  pub(crate) fn begin(green: DbVolumeId, version: u64) -> IncrementHold {
+    IncrementHold {
+      green,
+      version,
+      extents: Vec::new(),
+      hashed: 0,
+      chunk_start: 0,
+      chunk_hasher: blake3::Hasher::new(),
+      staging: None,
+      staged: 0,
+    }
+  }
+
+  /// One unit of the hold of `increment`, the encoding, its chunks hashed `slice` bytes a unit (the caller's copy slice,
+  /// `DaemonConfig::copy_slice_bytes`, so a test chooses it): none while units are left; once it ends,
+  /// [`hold_increment`]'s answer.
+  pub(crate) fn unit(
+    &mut self,
+    state: &mut ShardState,
+    (increment, slice): (&[u8], usize),
+  ) -> Option<Result<HeldIncrement, Refusal>> {
+    let object = ObjectId(self.green.bytes);
+    let Some((manifest, fresh)) = self.staging else {
+      let chunk = crate::merge_origin::inputs_chunk_bytes().max(1);
+      let chunk_end = self.chunk_start.saturating_add(chunk).min(increment.len());
+      if self.hashed < chunk_end {
+        // A slice of the chunk hashed a unit; its extent named once the chunk's last slice is.
+        let end = self.hashed.saturating_add(slice.max(1)).min(chunk_end);
+        if let Some(piece) = increment.get(self.hashed..end) {
+          self.chunk_hasher.update(piece);
+        }
+        self.hashed = end;
+        if end == chunk_end {
+          let offset = u64::try_from(self.chunk_start).unwrap_or(u64::MAX);
+          let identity = *self.chunk_hasher.finalize().as_bytes();
+          self.extents.push(crate::merge_origin::inputs_extent_hashed(
+            offset,
+            chunk_end.saturating_sub(self.chunk_start),
+            identity,
+          ));
+          self.chunk_hasher.reset();
+          self.chunk_start = chunk_end;
+        }
+        return None;
+      }
+      // The extents cloned, as a checkpoint's hold does: one a chunk of the encoding, so few.
+      let archive = crate::merge_origin::inputs_manifest_archive_of(
+        self.extents.clone(),
+        u64::try_from(increment.len()).unwrap_or(u64::MAX),
+        0,
+        archive_page(state),
+      );
+      let identity = archive.manifest_identity();
+      let opened = state.held_content.stage_fetched(
+        &mut crate::content_holder::hold_space(&mut state.store),
+        object,
+        slates_cluster::content::Placed {
+          sequence: self.version,
+        },
+        &archive,
+      );
+      return match opened {
+        // Held already (the same increment held for this version before): nothing to copy, and nothing of it this
+        // hold's to give back.
+        Ok(None) => Some(Ok(held_increment(
+          state,
+          (identity, increment.len()),
+          false,
+        ))),
+        Ok(Some(_)) => {
+          self.staging = Some((identity, true));
+          None
+        }
+        Err(refused) => Some(Err(held_refusal(refused))),
+      };
+    };
+    let Some(extent) = self.extents.get(self.staged) else {
+      let completed = state.held_content.complete_stage(
+        &mut crate::content_holder::hold_space(&mut state.store),
+        object,
+      );
+      return Some(
+        completed
+          .map(|_| held_increment(state, (manifest, increment.len()), fresh))
+          .map_err(held_refusal),
+      );
+    };
+    let start = usize::try_from(extent.offset).unwrap_or(usize::MAX);
+    let end = usize::try_from(extent.len).map_or(usize::MAX, |len| start.saturating_add(len));
+    let staged = match increment.get(start..end) {
+      Some(piece) => state.held_content.stage_lent_piece(
+        &mut crate::content_holder::hold_space(&mut state.store),
+        object,
+        &manifest,
+        extent.chunk,
+        piece,
+      ),
+      None => Err(slates_cluster::content::ContentRefusal::Unstaged),
+    };
+    match staged {
+      Ok(_) => {
+        self.staged = self.staged.saturating_add(1);
+        None
+      }
+      Err(refused) => Some(Err(held_refusal(refused))),
+    }
+  }
+}
+
+/// A held increment of `identity` and `len` bytes, counted: what its chain entry names.
+fn held_increment(
+  state: &mut ShardState,
+  (identity, len): ([u8; 32], usize),
+  fresh: bool,
+) -> HeldIncrement {
+  state.count(INPUTS_HELD_BY_OWNER, 1);
+  HeldIncrement {
+    inputs: slates_merge::chain_entry::Inputs {
+      identity,
+      len: u64::try_from(len).unwrap_or(u64::MAX),
+    },
+    fresh,
+  }
+}
+
+/// The refusal a hold of an increment answers for the store's: the room's at its capacity, else the content's.
+fn held_refusal(refused: slates_cluster::content::ContentRefusal) -> Refusal {
+  match refused {
+    slates_cluster::content::ContentRefusal::NoCapacity { available, .. } => {
+      Refusal::BudgetExceeded { available }
+    }
+    _ => Refusal::ContentUnavailable,
   }
 }
 
@@ -5480,11 +5768,14 @@ mod checkpoint_hold_tests;
 mod tests {
   use super::*;
 
-  /// A-579 (a checkpoint's identity fold paced to end within its doubling interval). Do: ask a turn's budget for 80 ms
+  /// A-579 (a checkpoint's identity fold paced to end within its doubling interval) and A-920's checkpoint piece (main
+  /// 01a20182's ruling of 2026-11-26: a share past the deadline that stays bounded). Do: ask a turn's budget for 80 ms
   /// of fold left, a turn every 0.5 ms, at several points of a 1 s interval; and past its end; and for almost nothing
-  /// left. Expect: the fold spread evenly over the turns left (80 ms x 0.5 / 1000 = 40 us at the start, twice that half
-  /// way), all of it once the deadline has passed, the quantum for a first checkpoint (its interval nothing, so no
-  /// deadline), and never less than the quantum.
+  /// left; and for 1.6 s left at the start, whose share (800 us) passes the step ceiling. Expect: the fold spread evenly over
+  /// the turns left (80 ms x 0.5 / 1000 = 40 us at the start, twice that half way); the step ceiling once the deadline
+  /// has passed, never everything left (A-928's cap, half 84a's loaded bar: past it, a 7,441-key backlog folded in one
+  /// step of 406 ms, debug); the ceiling too where the share passes it; the quantum for a first checkpoint (its interval
+  /// nothing, so no deadline) and for almost nothing left.
   #[test]
   fn a_folds_turn_budget_spreads_what_is_left_over_the_turns_before_its_deadline() {
     const MS: u64 = 1_000_000;
@@ -5501,7 +5792,12 @@ mod tests {
     );
     assert_eq!(
       turn_budget_ns(left, (gap, QUANTUM), (0, 1_000 * MS, 1_000 * MS)),
-      left
+      crate::config::STEP_QUANTUM_CEILING_NS
+    );
+    assert_eq!(
+      turn_budget_ns(20 * left, (gap, QUANTUM), (0, 1_000 * MS, 0)),
+      crate::config::STEP_QUANTUM_CEILING_NS,
+      "a share past the ceiling"
     );
     // A first checkpoint's interval is nothing: no deadline to spread over, so a quantum a turn.
     assert_eq!(turn_budget_ns(left, (gap, QUANTUM), (0, 0, 7)), QUANTUM);
@@ -6322,6 +6618,40 @@ mod tests {
     );
     assert_eq!(carried(None, u64::MAX), (ids.clone(), true));
     assert_eq!(carried(Some(&ids[2..]), chunk), (ids[2..].to_vec(), true));
+  }
+
+  /// A-920 7c. Do: hold an input of two and a half chunks through `IncrementHold`, a unit a call, its chunks hashed a
+  /// quarter chunk a unit (the slice the test chooses, never the shard's live quantum: a copy slice from a loaded
+  /// shard's quantum is a chunk or more, and the count then certified nothing, w-hg's focused set at load 50-60), and
+  /// the same bytes through `hold_increment` for another green. Expect: the same inputs named, identity and length, in
+  /// exactly the units the slice makes: each chunk's hashing a unit a slice (4, 4 and 2), the stage opened, each chunk
+  /// copied and the stage completed, 15.
+  #[test]
+  fn an_increment_held_a_slice_a_unit_names_the_inputs_held_whole() {
+    let chunk = crate::merge_origin::inputs_chunk_bytes();
+    let slice = chunk / 4;
+    let bytes: Vec<u8> = (0..chunk * 2 + chunk / 2)
+      .map(|at| u8::try_from(at % 247).unwrap())
+      .collect();
+    let (stepped, whole, units) = crate::daemon::audit_on_shard(move |state| {
+      let mut hold = IncrementHold::begin(DbVolumeId { bytes: [45; 16] }, 1);
+      let mut units = 0u64;
+      let stepped = loop {
+        units += 1;
+        if let Some(held) = hold.unit(state, (&bytes, slice)) {
+          break held.expect("room for the input");
+        }
+      };
+      let whole = hold_increment(state, DbVolumeId { bytes: [46; 16] }, 1, &bytes)
+        .expect("room for the input");
+      (stepped.inputs, whole.inputs, units)
+    });
+    assert_eq!(stepped, whole, "the inputs held a slice a unit");
+    // Hashing: two whole chunks of four slices each and a half chunk of two; then the stage opened, three chunks
+    // copied and the stage completed.
+    let hashing = 2 * chunk.div_ceil(slice) + (chunk / 2).div_ceil(slice);
+    assert_eq!(units, (hashing + 1 + 3 + 1) as u64, "the hold's units");
+    assert_eq!(units, 15, "the hold's units at a quarter chunk a slice");
   }
 
   /// A later version's shipments cut as views of the owner's content store (chain entry format 6: its increment held as

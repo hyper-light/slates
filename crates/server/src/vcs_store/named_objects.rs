@@ -726,8 +726,7 @@ mod tests {
   /// read with the shard's chunk store given in place of a lent one (a recovery's replay).
   #[test]
   fn t_a760_a_large_named_text_lands_a_slice_a_turn_held_once() {
-    crate::test_store::audit_on_stored_shard("vcs_store-named_objects", |state| {
-      let _repository = crate::git_push::tests::git_repository(state, "texts");
+    crate::git_push::tests::on_stored_shard_with(["texts"], |state, [_repository]| {
       let bytes: Vec<u8> = (0..TEXT)
         .map(|at| u8::try_from(at % 239).unwrap())
         .collect();

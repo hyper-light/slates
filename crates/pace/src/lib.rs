@@ -47,6 +47,17 @@ pub struct Env {
 /// Format: parts per million.
 const MILLION: u128 = 1_000_000;
 
+/// A unit estimate's target relative error, parts per million (`Env::target_ppm`): the scheduler's own measured jitter
+/// (`jitter_ns`) over the quantum, at least one part, at most the whole: the error a step's measurements cannot tell
+/// from their noise.
+pub fn target_ppm(jitter_ns: u64, quantum_ns: u64) -> u64 {
+  let ppm = u128::from(jitter_ns)
+    .saturating_mul(MILLION)
+    .checked_div(u128::from(quantum_ns.max(1)))
+    .unwrap_or(0);
+  u64::try_from(ppm.clamp(1, MILLION)).unwrap_or(u64::MAX)
+}
+
 /// One unit kind's measured cost (module docs).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UnitCost {

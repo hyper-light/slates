@@ -30,7 +30,7 @@ use slates_hg::serve::getbundle::{Logged, Store};
 use slates_hg::serve::stdio::{EXIT_STATUS, Progress, Stdio};
 use slates_hg::serve::{Repository, Rev};
 use slates_hg::{NULL_NODE, Node, capabilities, pushkey};
-use slates_ipc::protocol::{ObjectFormat as IpcFormat, ReplyBody, RequestBody, VcsTool as IpcTool};
+use slates_ipc::protocol::{ObjectFormat as IpcFormat, VcsTool as IpcTool};
 use slates_rt::tcp::SocketAddrV4;
 use slates_ssh::command::Command as Asked;
 
@@ -45,7 +45,6 @@ use super::{
 };
 use crate::repository::hg_push::tests::{Commit, changegroup, history_of};
 use crate::repository::hg_push::{self, Pushing, line_name};
-use crate::state::ShardState;
 use crate::vcs_http::Bounds;
 use crate::vcs_http::git::{Located, Repositories, StoreLender, ThisShard};
 use crate::vcs_http::hg::HgStores;
@@ -1098,10 +1097,6 @@ const PUSH_CAPABILITIES: [&[u8]; 6] = [
   b"phases",
   b"pushkey",
 ];
-/// Shape: the room a daemon test's push is prepared within, far past these trees.
-const PUSH_ROOM: u64 = 1 << 20;
-/// Shape: the name the repository's history was pushed under.
-const HISTORY_PUSH: [u8; 32] = [7; 32];
 /// Shape: how long a daemon test waits for its session: four liveness budgets.
 const PATIENCE: Duration = Duration::from_nanos(4 * crate::daemon::LIVENESS_BUDGET_NS);
 
@@ -1113,28 +1108,12 @@ fn owner() -> Principal {
   }
 }
 
-/// Makes Mercurial repository `name` on `state`'s shard holding what 7.2's server held before `ssh-push`: `base` and
-/// `second` landed draft, as a non-publishing push lands them, with bookmark `main` at `base`; its record.
-fn drafted_history(state: &mut ShardState, name: &str) -> RepositoryRecord {
-  let reply = crate::test_store::create(
-    state,
-    &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool: IpcTool::Mercurial,
-      format: IpcFormat::Sha1,
-      default_branch: line_name(b"default", 0),
-      green: None,
-    },
-  );
-  assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
-  let id = state
-    .db
-    .partition()
-    .repositories()
-    .repository_named(name)
-    .expect("the repository made")
-    .id;
+/// Makes Mercurial repository `name` on `daemon`'s first shard holding what 7.2's server held before `ssh-push`: `base`
+/// and `second` landed draft, as a non-publishing push lands them, with bookmark `main` at `base`; its record. Made and
+/// pushed as a client makes and pushes them, from a task of the shard (`hg_push::tests::made_non_publishing_and_pushed_on`),
+/// never the shard's thread held through the store's commit, then set publishing again as 7.2's server was. The push is
+/// a client's, so it is counted on the repository's usage row as one intake.
+fn drafted_history(daemon: &crate::Daemon, name: &'static str) -> RepositoryRecord {
   let made = history_of(&WIRE_HISTORY);
   let mark = BookmarkAt {
     name: b"main".to_vec(),
@@ -1154,22 +1133,34 @@ fn drafted_history(state: &mut ShardState, name: &str) -> RepositoryRecord {
       },
     ],
   };
-  let mut room = slates_hg::Admission::new(u64::MAX);
-  let terms = (false, HISTORY_PUSH, PUSH_ROOM);
-  let prepared =
-    hg_push::prepare_served(state, id, &unbundle, terms, &mut room).expect("the history prepared");
-  let landed = hg_push::land_stored(state, (&owner(), id), prepared);
-  assert!(
-    landed.answer.is_ok() && landed.released.is_ok(),
-    "{landed:?}"
-  );
-  state
-    .db
-    .partition()
-    .repositories()
-    .repository(id)
-    .cloned()
-    .expect("the record")
+  let id =
+    crate::repository::hg_push::tests::made_non_publishing_and_pushed_on(daemon, name, unbundle);
+  crate::daemon::observe_first(daemon, move |state| {
+    // Publishing again, as 7.2's server was when its client pushed (its answer says `publishing True`): the drafts stay
+    // drafts, and the next push is judged by the repository's own policy (version 2).
+    let published = crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      slates_ipc::protocol::RequestBody::SetRepositoryPolicy {
+        repository: name.to_owned(),
+        read: 1,
+        rules: Vec::new(),
+        hooks: Vec::new(),
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+        hg_publishing: true,
+      },
+    );
+    assert_eq!(published, slates_ipc::protocol::ReplyBody::Acknowledged);
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository(id)
+      .cloned()
+      .expect("the record")
+  })
 }
 
 /// Stock 7.2's client bytes of `ssh-push` sent to `record`'s repository as the SSH site starts `serve --stdio` over the
@@ -1253,8 +1244,7 @@ fn push_capabilities(hello: &[u8]) -> (CapabilityValues, Option<Vec<u8>>) {
 #[test]
 fn stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let record =
-    crate::daemon::observe_first(&daemon, |state| drafted_history(state, "pushed-over-ssh"));
+  let record = drafted_history(&daemon, "pushed-over-ssh");
   let id = record.id;
   let (sent, outcome) = mpsc::sync_channel(1);
   crate::daemon::observe_first(&daemon, move |_state| {
@@ -1299,57 +1289,54 @@ fn stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it
   );
 }
 
-/// Makes Mercurial repository `name` on `state`'s shard holding one changeset whose one file is `bytes`: its record and
-/// the changeset's node.
+/// A Mercurial repository named `name` on `daemon`'s first shard, owned by [`owner`], holding one changeset whose one
+/// file is `bytes`, pushed as a client pushes it (`hg_push::unbundle`, from a task on the shard, the store's landing
+/// awaited, never blocked on): its record and the changeset's node. Until 2026-11-25 the push was landed inside an
+/// observation, the shard's thread blocked on the store's commit (`test_store::land_blocking`), and under load that wait
+/// alone passed the watchdog's window (main's 8a burner loop at 228d0dc97, load about 50: shards 30 and 7 judged wedged,
+/// 1,151 and 1,156 ms, no CPU progress and never runnable, at this fixture's observation).
 fn one_file_history(
-  state: &mut ShardState,
-  name: &str,
+  daemon: &crate::Daemon,
+  name: &'static str,
   bytes: &'static [u8],
 ) -> (RepositoryRecord, Node) {
-  let reply = crate::test_store::create(
-    state,
+  // Made as a client's creation is, from the test's thread, the shard never held through its commit.
+  let line = line_name(b"default", 0);
+  let (id, _) = crate::test_store::create_on(
+    daemon,
+    0,
     &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool: IpcTool::Mercurial,
-      format: IpcFormat::Sha1,
-      default_branch: line_name(b"default", 0),
-      green: None,
-    },
+    (name, IpcTool::Mercurial, IpcFormat::Sha1, line.as_str()),
   );
-  assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
-  let id = state
-    .db
-    .partition()
-    .repositories()
-    .repository_named(name)
-    .expect("the repository made")
-    .id;
   let made = history_of(&[("large", "large", bytes, None, "default")]);
-  let unbundle = Unbundle {
-    parts: vec![Taken {
-      id: 0,
-      mandatory: true,
-      asks: Asks::Changegroup(changegroup(&made, &[0])),
-    }],
-  };
-  let mut room = slates_hg::Admission::new(u64::MAX);
-  // The push is past one request's room by design: it is admitted what the shard can hold.
-  let terms = (false, HISTORY_PUSH, u64::MAX);
-  let prepared =
-    hg_push::prepare_served(state, id, &unbundle, terms, &mut room).expect("the history prepared");
-  let landed = hg_push::land_stored(state, (&owner(), id), prepared);
+  let bundle = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0]);
+  let (sent, outcome) = mpsc::sync_channel(1);
+  crate::daemon::observe_first(daemon, move |state| {
+    // The push is past one request's room by design: it is admitted what the repository's share holds.
+    let room = crate::vcs_share::room(state, id).bytes;
+    let task = slates_rt::futures::spawn(async move {
+      let heads = slates_hg::push::check::HeadsArgument::Force;
+      let mut admission = slates_hg::Admission::new(room);
+      let pushed = hg_push::unbundle(id, (&owner(), &heads, &bundle), &mut admission).await;
+      let _ = sent.send(pushed);
+    })
+    .expect("the push's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let pushed = outcome.recv_timeout(PATIENCE).expect("the push answered");
   assert!(
-    landed.answer.is_ok() && landed.released.is_ok(),
-    "{landed:?}"
+    matches!(pushed, Some(slates_hg::push::Outcome::Accepted(_))),
+    "{pushed:?}"
   );
-  let record = state
-    .db
-    .partition()
-    .repositories()
-    .repository(id)
-    .cloned()
-    .expect("the record");
+  let record = crate::daemon::observe_first(daemon, move |state| {
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository(id)
+      .cloned()
+      .expect("the record")
+  });
   (record, made[0].node)
 }
 
@@ -1445,9 +1432,7 @@ fn random_file(len: u64) -> &'static [u8] {
 /// serving steps taken (`vcs_store.hg_ssh_steps`).
 fn cloned_over_ssh(large: &'static [u8], burners: usize) -> ((Channel, (Polls, u64)), (u64, u64)) {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (record, head) = crate::daemon::observe_first(&daemon, move |state| {
-    one_file_history(state, "cloned-over-ssh", large)
-  });
+  let (record, head) = one_file_history(&daemon, "cloned-over-ssh", large);
   let burning = std::sync::atomic::AtomicBool::new(true);
   let channel = std::thread::scope(|scope| {
     for _ in 0..burners {
@@ -1512,7 +1497,9 @@ fn session_over_ssh(
     .expect("the session's task");
     slates_rt::futures::detach(task).expect("detached");
   });
-  outcome.recv_timeout(PATIENCE).expect("the session ended")
+  outcome
+    .recv_timeout(PATIENCE)
+    .map_err(|waited| format!("the session never ended within {PATIENCE:?}: {waited:?}"))?
 }
 
 /// `channel`'s standard output a bundle2 whose changegroup carries `large` whole.
@@ -2086,9 +2073,15 @@ fn an_ssh_answer_refused_past_its_start_exits_as_an_abort() {
 #[test]
 fn a_mercurial_push_is_counted_and_learned_on_its_repositorys_usage_row() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let record =
-    crate::daemon::observe_first(&daemon, |state| drafted_history(state, "counted-over-ssh"));
+  let record = drafted_history(&daemon, "counted-over-ssh");
   let id = record.id;
+  // The fixture's own push is a client's intake too: the session's counted past it.
+  let before = crate::daemon::observe_first(&daemon, move |state| {
+    state
+      .vcs_usage
+      .usage(&id)
+      .map_or((0, 0), |row| (row.intake.begun, row.intake.answered))
+  });
   let (sent, outcome) = mpsc::sync_channel(1);
   crate::daemon::observe_first(&daemon, move |_state| {
     let task = slates_rt::futures::spawn(async move {
@@ -2119,7 +2112,7 @@ fn a_mercurial_push_is_counted_and_learned_on_its_repositorys_usage_row() {
   let Some((begun, answered, learned, named)) = row else {
     panic!("the push left no usage row");
   };
-  assert_eq!((begun, answered, named), (1, 1, true));
+  assert_eq!((begun - before.0, answered - before.1, named), (1, 1, true));
   assert!(
     learned.is_some_and(|bytes| bytes > 0),
     "its bytes learned: {learned:?}"

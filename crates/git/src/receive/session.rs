@@ -513,6 +513,10 @@ impl<S: Contents + ?Sized> Contents for Fscking<'_, S> {
   fn content(&self, at: usize, id: &ObjectId) -> Option<std::borrow::Cow<'_, [u8]>> {
     self.site.content(at, id)
   }
+
+  fn content_away(&self) -> Option<u64> {
+    self.site.content_away()
+  }
 }
 
 impl<S: Keep + ?Sized> Keep for Fscking<'_, S> {

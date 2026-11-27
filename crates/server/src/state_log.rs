@@ -188,6 +188,33 @@ pub(crate) fn record_of(value: &[u8]) -> Option<StateLogRecord> {
   StateLogRecord::from_bytes(untagged(STATE_LOG_CLASS, value)?).ok()
 }
 
+#[cfg(test)]
+std::thread_local! {
+  /// The records [`take_made`] took on this shard while a test keeps them (`Some`, [`keep_for_test`]): for a test that
+  /// rebuilds a repository from its parts as a successor's acceptors hold them, whose push spans turns in which the
+  /// shard takes them.
+  static KEPT_FOR_TEST: core::cell::RefCell<Option<Vec<StateLogRecord>>> =
+    const { core::cell::RefCell::new(None) };
+}
+
+/// Starts keeping what [`take_made`] takes on this shard, from the records the partition holds untaken now.
+#[cfg(test)]
+pub(crate) fn keep_for_test(state: &mut ShardState) {
+  let untaken = state.db.take_state_log_records();
+  KEPT_FOR_TEST.with(|kept| kept.replace(Some(untaken)));
+}
+
+/// Stops keeping ([`keep_for_test`]) and gives back what was kept, then the records the partition has handed on since,
+/// in the order they were made.
+#[cfg(test)]
+pub(crate) fn kept_for_test(state: &mut ShardState) -> Vec<StateLogRecord> {
+  let mut kept = KEPT_FOR_TEST
+    .with(|kept| kept.replace(None))
+    .unwrap_or_default();
+  kept.extend(state.db.take_state_log_records());
+  kept
+}
+
 /// Takes the records the partition handed on since the last take into the parts this owner shard owes, and lets go at
 /// once of those no remote candidate needs (a laptop's, every one).
 pub(crate) fn take_made(state: &mut ShardState) {
@@ -195,6 +222,12 @@ pub(crate) fn take_made(state: &mut ShardState) {
   if records.is_empty() {
     return;
   }
+  #[cfg(test)]
+  KEPT_FOR_TEST.with(|kept| {
+    if let Some(kept) = kept.borrow_mut().as_mut() {
+      kept.extend(records.iter().cloned());
+    }
+  });
   let local = state.fleet.host();
   let config = state.fleet.configuration().clone();
   for record in &records {

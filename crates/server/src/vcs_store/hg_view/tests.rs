@@ -3,34 +3,21 @@
 
 use slates_db::catalog::{Principal, RepositoryId};
 use slates_hg::Admission;
-use slates_hg::import::Clock;
 use slates_hg::serve::Repository;
 use slates_hg::serve::getbundle::Store as _;
 use slates_ipc::protocol::{ObjectFormat as WireFormat, ReplyBody, RequestBody, VcsTool};
 
 use super::{UNMADE, lend_in};
-use crate::hg_base::tests::{FILE_INDEX, STATES, laid_out};
+use crate::hg_base::tests::{FILE_INDEX, Files, STATES};
+use crate::repository::svn_commit::tests::on;
 use crate::state::ShardState;
-use crate::vcs_store::hg_import::{Turned, begin, land_imported, turn};
 use crate::verbs::dispatch;
 
 /// Shape: room enough for the view of every fixture these tests import.
 const ROOM: u64 = 1 << 24;
-/// Shape: more turns than the fixture's import takes, so an import that never ends fails the test rather than hangs it.
-const TURNS_AT_MOST: u64 = 1 << 16;
 /// Shape: the changesets stock 7.2's `served` filter serves of the `states` repository (`fixtures/state/states-served.txt`,
 /// three lines): what its view serves once the import has landed its phase roots and bookmarks in the register (A-687).
 const STATES_SERVED: u32 = 3;
-
-/// A clock one nanosecond on at each reading, so every turn of an import passes its quantum of one nanosecond.
-struct Ticking(u64);
-
-impl Clock for Ticking {
-  fn now_ns(&mut self) -> u64 {
-    self.0 = self.0.saturating_add(1);
-    self.0
-  }
-}
 
 /// The repositories' owner.
 fn owner() -> Principal {
@@ -40,42 +27,18 @@ fn owner() -> Principal {
   }
 }
 
-/// Creates repository `name` of `tool` on the shard: its id.
-fn created(state: &mut ShardState, name: &str, tool: VcsTool) -> RepositoryId {
-  let reply = crate::test_store::create(
-    state,
-    &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool,
-      format: WireFormat::Sha1,
-      // The root's name as the command line spells it (`repository::root_binding`): the first line of `default`.
-      default_branch: "branch:default:0".to_owned(),
-      green: None,
-    },
-  );
-  assert!(
-    matches!(reply, ReplyBody::GreenCreated { .. }),
-    "no repository: {reply:?}"
-  );
-  let repositories = state.db.partition().repositories();
-  repositories.repository_named(name).expect("the record").id
+/// Creates repository `name` of `tool` as a client's request does, from a task on the shard (`test_store::created`): its
+/// id.
+async fn created(name: &str, tool: VcsTool) -> RepositoryId {
+  // The root's name as the command line spells it (`repository::root_binding`): the first line of `default`.
+  let asked = (name, tool, WireFormat::Sha1, "branch:default:0");
+  crate::test_store::created(&owner(), asked).await.0
 }
 
-/// Runs repository `id`'s import, begun, a unit a turn to its end.
-fn imported(state: &mut ShardState, id: RepositoryId) {
-  let mut clock = Ticking(0);
-  for _ in 0..TURNS_AT_MOST {
-    match turn(state, id, (&mut clock, 1)) {
-      Some(Ok(Turned::More)) => {}
-      Some(Ok(Turned::Done(_))) => {
-        assert_eq!(land_imported(state, id), Ok(()));
-        return;
-      }
-      other => panic!("the import did not end: {other:?}"),
-    }
-  }
-  panic!("no end after {TURNS_AT_MOST} turns");
+/// Repository `name` (`id`) imported from `files` through the import verb as request `request`, awaited to its end
+/// (`test_store::imported_through_the_verb`).
+async fn imported(request: u64, (name, id): (&str, RepositoryId), files: Files) {
+  crate::test_store::imported_through_the_verb((&owner(), request), (name, id), files).await;
 }
 
 /// The count of the view of repository `id` the lender lends within `room`; none where it lends none.
@@ -91,32 +54,36 @@ fn lent_count(state: &mut ShardState, id: RepositoryId, room: u64) -> Option<u32
 /// nothing past the room, counted as a view not made.
 #[test]
 fn t_a680_a_view_is_lent_from_the_store_or_not_at_all() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let hg = created(state, "hg", VcsTool::Mercurial);
-    let git = created(state, "git", VcsTool::Git);
-    let (host, directory) = laid_out(STATES.iter().copied());
-    assert_eq!(begin(state, hg, (Box::new(host), directory)), Ok(()));
-    let while_importing = lent_count(state, hg, ROOM);
-    imported(state, hg);
-    let unmade = |state: &ShardState| state.refusals.get(UNMADE).copied().unwrap_or(0);
-    let before = unmade(state);
-    let lent = lent_count(state, hg, ROOM);
-    let others = (
-      lent_count(state, git, ROOM),
-      lent_count(
-        state,
-        RepositoryId {
-          bytes: [u8::MAX; 16],
-        },
-        ROOM,
-      ),
-    );
-    let past_room = lent_count(state, hg, 1);
-    assert_eq!(
-      (while_importing, lent, others, past_room),
-      (None, Some(STATES_SERVED), (None, None), None)
-    );
-    assert_eq!(unmade(state), before.saturating_add(1));
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = created("hg", VcsTool::Mercurial).await;
+    let git = created("git", VcsTool::Git).await;
+    let while_importing = on(|state| {
+      let begun = crate::test_store::import_begun(state, (&owner(), 2), "hg", STATES);
+      assert_eq!(begun, ReplyBody::Acknowledged, "the import taken");
+      lent_count(state, hg, ROOM)
+    });
+    crate::test_store::import_ended("hg", hg).await;
+    on(|state| {
+      let unmade = |state: &ShardState| state.refusals.get(UNMADE).copied().unwrap_or(0);
+      let before = unmade(state);
+      let lent = lent_count(state, hg, ROOM);
+      let others = (
+        lent_count(state, git, ROOM),
+        lent_count(
+          state,
+          RepositoryId {
+            bytes: [u8::MAX; 16],
+          },
+          ROOM,
+        ),
+      );
+      let past_room = lent_count(state, hg, 1);
+      assert_eq!(
+        (while_importing, lent, others, past_room),
+        (None, Some(STATES_SERVED), (None, None), None)
+      );
+      assert_eq!(unmade(state), before.saturating_add(1));
+    });
   });
 }
 
@@ -137,90 +104,75 @@ fn bookmarks_of(state: &mut ShardState, id: RepositoryId) -> Vec<(Vec<u8>, slate
 /// bookmark at `one`'s node once created, gone once retired, and back at it once bound; `one` and `two` unmoved.
 #[test]
 fn a_branch_the_owner_creates_retires_and_binds_is_a_bookmark_by_the_same_name() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let hg = created(state, "hg", VcsTool::Mercurial);
-    let (host, directory) = laid_out(STATES.iter().copied());
-    assert_eq!(begin(state, hg, (Box::new(host), directory)), Ok(()));
-    imported(state, hg);
-    let before = bookmarks_of(state, hg);
-    let one = before
-      .iter()
-      .find(|(name, _)| name.as_slice() == b"one")
-      .map(|(_, node)| *node)
-      .expect("states' bookmark one");
-    let ask = |state: &mut ShardState, body: RequestBody| dispatch(state, 1, &owner(), body);
-    let made = ask(
-      state,
-      RequestBody::CreateBranch {
-        repository: "hg".to_owned(),
-        name: "topic".to_owned(),
-        from: "one".to_owned(),
-        version: None,
-      },
-    );
-    let ReplyBody::GreenCreated { id: green } = made else {
-      panic!("no branch: {made:?}");
-    };
-    let topic = (b"topic".to_vec(), one);
-    let created = bookmarks_of(state, hg);
-    let retired_reply = ask(
-      state,
-      RequestBody::RetireBranch {
-        repository: "hg".to_owned(),
-        name: "topic".to_owned(),
-      },
-    );
-    let retired = bookmarks_of(state, hg);
-    let bound_reply = ask(
-      state,
-      RequestBody::BindBranch {
-        repository: "hg".to_owned(),
-        name: "topic".to_owned(),
-        green,
-      },
-    );
-    let bound = bookmarks_of(state, hg);
-    assert_eq!(
-      (retired_reply, bound_reply),
-      (ReplyBody::Acknowledged, ReplyBody::Acknowledged)
-    );
-    assert_eq!(
-      (
-        created.contains(&topic),
-        retired.iter().any(|(name, _)| name.as_slice() == b"topic"),
-        bound.contains(&topic),
-      ),
-      (true, false, true),
-      "created {created:?}, retired {retired:?}, bound {bound:?}"
-    );
-    assert_eq!(retired, before);
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = created("hg", VcsTool::Mercurial).await;
+    imported(2, ("hg", hg), STATES).await;
+    on(|state| {
+      let before = bookmarks_of(state, hg);
+      let one = before
+        .iter()
+        .find(|(name, _)| name.as_slice() == b"one")
+        .map(|(_, node)| *node)
+        .expect("states' bookmark one");
+      let ask = |state: &mut ShardState, body: RequestBody| dispatch(state, 1, &owner(), body);
+      let made = ask(
+        state,
+        RequestBody::CreateBranch {
+          repository: "hg".to_owned(),
+          name: "topic".to_owned(),
+          from: "one".to_owned(),
+          version: None,
+        },
+      );
+      let ReplyBody::GreenCreated { id: green } = made else {
+        panic!("no branch: {made:?}");
+      };
+      let topic = (b"topic".to_vec(), one);
+      let created = bookmarks_of(state, hg);
+      let retired_reply = ask(
+        state,
+        RequestBody::RetireBranch {
+          repository: "hg".to_owned(),
+          name: "topic".to_owned(),
+        },
+      );
+      let retired = bookmarks_of(state, hg);
+      let bound_reply = ask(
+        state,
+        RequestBody::BindBranch {
+          repository: "hg".to_owned(),
+          name: "topic".to_owned(),
+          green,
+        },
+      );
+      let bound = bookmarks_of(state, hg);
+      assert_eq!(
+        (retired_reply, bound_reply),
+        (ReplyBody::Acknowledged, ReplyBody::Acknowledged)
+      );
+      assert_eq!(
+        (
+          created.contains(&topic),
+          retired.iter().any(|(name, _)| name.as_slice() == b"topic"),
+          bound.contains(&topic),
+        ),
+        (true, false, true),
+        "created {created:?}, retired {retired:?}, bound {bound:?}"
+      );
+      assert_eq!(retired, before);
+    });
   });
 }
 
-/// Lands `which` of `made` on repository `id` as a push of its owner lands them.
-fn pushed(
-  state: &mut ShardState,
+/// Pushes `which` of `made` to repository `id` as its owner's push does, through the daemon's driver
+/// (`hg_push::unbundle`), from a task on the shard.
+async fn pushed(
   id: RepositoryId,
   made: &[crate::repository::hg_push::tests::Made],
   which: &[usize],
 ) {
-  use slates_hg::push::{Asks, Taken, Unbundle};
-  let unbundle = Unbundle {
-    parts: vec![Taken {
-      id: 0,
-      mandatory: true,
-      asks: Asks::Changegroup(crate::repository::hg_push::tests::changegroup(made, which)),
-    }],
-  };
-  let mut room = Admission::new(u64::MAX);
-  let terms = (false, [7; 32], u64::MAX);
-  let prepared = crate::repository::hg_push::prepare_served(state, id, &unbundle, terms, &mut room)
-    .expect("the push prepared");
-  let landed = crate::repository::hg_push::land_stored(state, (&owner(), id), prepared);
-  assert!(
-    landed.answer.is_ok() && landed.released.is_ok(),
-    "{landed:?}"
-  );
+  let part = crate::repository::hg_push::tests::changegroup(made, which);
+  crate::repository::hg_push::tests::pushed_changegroup(id, part).await;
 }
 
 /// A-745 (§4.17.1 "A fetch's answer", rule 4). Do: push three changesets to a Mercurial repository; answer a clone of it
@@ -240,15 +192,15 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
       }
     }
   }
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let hg = created(state, "hg", VcsTool::Mercurial);
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = created("hg", VcsTool::Mercurial).await;
     let made = crate::repository::hg_push::tests::history_of(&[
       ("base", "a", b"a\n", None, "default"),
       ("second", "b", b"b\n", Some(0), "default"),
       ("third", "c", b"c\n", Some(1), "default"),
       ("fourth", "d", b"d\n", Some(2), "default"),
     ]);
-    pushed(state, hg, &made, &[0, 1, 2]);
+    pushed(hg, &made, &[0, 1, 2]).await;
     let heads = crate::verbs::hex_of(&made[2].node);
     let arguments = format!(
       "bundlecaps=HG20%2Cbundle2%3DHG20%250Achangegroup%253D02%252C03&cg=1&common={}&heads={heads}",
@@ -264,63 +216,60 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
       body: &[],
     };
     let room = || Admission::new(ROOM);
-    let disk = state.vcs_disk.clone().expect("the store");
-    let repository = u128::from_be_bytes(hg.bytes);
-    // The whole answer as the edges make it: a step at a time, each want of the changeset store answered between steps
-    // (A-767 C1: a clone's file revisions as the store keeps them).
-    let whole = {
+    let begin = |state: &mut ShardState| {
       let begun = lend_in(state, hg, &mut room(), |view, left| {
         hg_http::begin(view, &request, 0, &mut Plain, left)
       })
       .expect("the answer begun");
-      let Begun::Streamed(mut streamed) = begun else {
+      let Begun::Streamed(streamed) = begun else {
         panic!("a clone's answer is streamed");
       };
-      let mut body = Vec::new();
-      loop {
-        assert!(crate::test_store::answer_wants_blocking(
-          &disk,
-          repository,
-          &mut *streamed
-        ));
-        let more = lend_in(state, hg, &mut room(), |view, left| {
-          streamed.step(view, left, &mut body)
+      streamed
+    };
+    // The whole answer as the edges make it: a step at a time, each want of the changeset store answered between steps
+    // (A-767 C1: a clone's file revisions as the store keeps them).
+    let mut streamed = on(begin);
+    let mut whole = Vec::new();
+    loop {
+      assert!(super::answer_store_wants(&mut *streamed, hg).await);
+      let more = on(|state| {
+        lend_in(state, hg, &mut room(), |view, left| {
+          streamed.step(view, left, &mut whole)
         })
-        .expect("a step")
-        .expect("a slice");
-        if !more {
-          break body;
-        }
+      })
+      .expect("a step")
+      .expect("a slice");
+      if !more {
+        break;
       }
-    };
-    let begun = lend_in(state, hg, &mut room(), |view, left| {
-      hg_http::begin(view, &request, 0, &mut Plain, left)
-    })
-    .expect("the answer begun");
-    let Begun::Streamed(mut streamed) = begun else {
-      panic!("a clone's answer is streamed");
-    };
-    let generation = super::hold_in(state, hg, &mut room()).expect("the generation held");
+    }
+    let (mut streamed, generation) = on(|state| {
+      let streamed = begin(state);
+      let generation = super::hold_in(state, hg, &mut room()).expect("the generation held");
+      (streamed, generation)
+    });
     let mut body = Vec::new();
-    let mut turn = |state: &mut ShardState, body: &mut Vec<u8>| {
-      assert!(crate::test_store::answer_wants_blocking(
-        &disk,
-        repository,
-        &mut *streamed
-      ));
-      super::lend_held_in(state, &generation, &mut room(), |view, left| {
-        streamed.step(view, left, body)
+    let mut turn = async |body: &mut Vec<u8>| {
+      assert!(super::answer_store_wants(&mut *streamed, hg).await);
+      on(|state| {
+        super::lend_held_in(state, &generation, &mut room(), |view, left| {
+          streamed.step(view, left, body)
+        })
       })
       .expect("a turn over the held generation")
       .expect("a slice")
     };
-    assert!(turn(state, &mut body));
-    pushed(state, hg, &made, &[3]);
-    state.vcs_stores.rebuilding.insert(hg);
-    let rebuilding = lend_in(state, hg, &mut room(), |_, _| ());
-    while turn(state, &mut body) {}
-    state.vcs_stores.rebuilding.remove(&hg);
-    generation.give_back(state);
+    assert!(turn(&mut body).await);
+    pushed(hg, &made, &[3]).await;
+    let rebuilding = on(|state| {
+      state.vcs_stores.rebuilding.insert(hg);
+      lend_in(state, hg, &mut room(), |_, _| ())
+    });
+    while turn(&mut body).await {}
+    on(|state| {
+      state.vcs_stores.rebuilding.remove(&hg);
+      generation.give_back(state);
+    });
     assert_eq!(
       rebuilding, None,
       "the repository's view was lent mid-rebuild"
@@ -336,12 +285,13 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
 /// Mercurial resolves a branch's name to its tip-most head; `v1` the first changeset, made from `mark`, the bookmark that
 /// heads it; `mid` refused `Unsupported`, since no line or bookmark heads it; and `nope` `NotFound`. Since A-767 C1
 /// (main's ruling (A)) a name that reaches the tags has the heads' `.hgtags` read from the changeset store at the verb's
-/// door first: none read before the head names a `.hgtags`, then one read each for `default` and `v1`.
+/// door first: a read for `default` and for `v1`, none for `tip`. And `mark`'s from `default` reads its head's manifest,
+/// let go once its push landed as production lets one go, to learn that it names no `.hgtags` yet.
 #[test]
 fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
   use slates_ipc::protocol::Refusal;
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let hg = created(state, "hg", VcsTool::Mercurial);
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = created("hg", VcsTool::Mercurial).await;
     let first = crate::repository::hg_push::tests::history_of(&[
       ("base", "a", b"a\n", None, "default"),
       ("second", "b", b"b\n", Some(0), "default"),
@@ -357,10 +307,9 @@ fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
       ("second", "b", b"b\n", Some(0), "default"),
       ("Added tags", ".hgtags", tags, Some(1), "default"),
     ]);
-    let reads = core::cell::Cell::new(0);
-    let branch = |state: &mut ShardState, name: &str, from: &str| {
-      let (reply, read) = crate::vcs_store::hg_tags::dispatch_blocking(
-        state,
+    let reads = core::cell::RefCell::new(Vec::new());
+    let branch = async |name: &str, from: &str| {
+      let (reply, read) = crate::vcs_store::hg_tags::dispatch_awaited(
         &owner(),
         RequestBody::CreateBranch {
           repository: "hg".to_owned(),
@@ -368,30 +317,30 @@ fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
           from: from.to_owned(),
           version: None,
         },
-      );
-      reads.set(reads.get() + u32::from(read));
+      )
+      .await;
+      reads.borrow_mut().push((name.to_owned(), read));
       reply
     };
-    pushed(state, hg, &made, &[0]);
-    let mark = branch(state, "mark", "default");
+    pushed(hg, &made, &[0]).await;
+    let mark = branch("mark", "default").await;
     assert!(matches!(mark, ReplyBody::GreenCreated { .. }), "{mark:?}");
-    assert_eq!(reads.get(), 0, "no head named a .hgtags revision yet");
-    pushed(state, hg, &made, &[1, 2]);
-    let replies: Vec<ReplyBody> = [
+    pushed(hg, &made, &[1, 2]).await;
+    let mut replies: Vec<ReplyBody> = Vec::new();
+    for (name, from) in [
       ("from-default", "default"),
       ("from-tip", "tip"),
       ("from-v1", "v1"),
-    ]
-    .iter()
-    .map(|(name, from)| branch(state, name, from))
-    .collect();
+    ] {
+      replies.push(branch(name, from).await);
+    }
     assert!(
       replies
         .iter()
         .all(|reply| matches!(reply, ReplyBody::GreenCreated { .. })),
       "{replies:?}"
     );
-    let marks = bookmarks_of(state, hg);
+    let marks = on(|state| bookmarks_of(state, hg));
     let at = |name: &[u8]| {
       marks
         .iter()
@@ -413,9 +362,26 @@ fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
       ),
       "{marks:?}"
     );
-    // `default` and `v1` reach the tags, read from the changeset store before each runs (A-767 C1); `tip` never.
-    assert_eq!(reads.get(), 2, "the tags read for `default` and `v1`");
-    let mid = branch(state, "from-mid", "mid");
+    // `default` and `v1` reach the tags, read from the changeset store before each runs (A-767 C1); `tip` never. `mark`'s
+    // read is its head's manifest, let go once its push landed, read back to learn it names no `.hgtags` yet.
+    let read = |name: &str| {
+      reads
+        .borrow()
+        .iter()
+        .find(|(made, _)| made == name)
+        .map(|(_, read)| *read)
+    };
+    assert_eq!(
+      [
+        read("mark"),
+        read("from-default"),
+        read("from-tip"),
+        read("from-v1")
+      ],
+      [Some(true), Some(true), Some(false), Some(true)],
+      "the tags read where a name reaches them, never for `tip`"
+    );
+    let mid = branch("from-mid", "mid").await;
     assert!(
       matches!(
         &mid,
@@ -426,7 +392,7 @@ fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
       "{mid:?}"
     );
     assert_eq!(
-      branch(state, "from-nope", "nope"),
+      branch("from-nope", "nope").await,
       ReplyBody::Refused {
         refusal: Refusal::NotFound
       }
@@ -444,8 +410,8 @@ fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
 /// and the verb was refused (in the daemon, parked again, for ever).
 #[test]
 fn a_branch_from_a_tag_whose_heads_manifests_were_let_go_reads_them_once_and_is_made() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let hg = created(state, "hg", VcsTool::Mercurial);
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = created("hg", VcsTool::Mercurial).await;
     let first = crate::repository::hg_push::tests::history_of(&[
       ("base", "a", b"a\n", None, "default"),
       ("second", "b", b"b\n", Some(0), "default"),
@@ -457,9 +423,8 @@ fn a_branch_from_a_tag_whose_heads_manifests_were_let_go_reads_them_once_and_is_
       ("second", "b", b"b\n", Some(0), "default"),
       ("Added tags", ".hgtags", tags, Some(1), "default"),
     ]);
-    let branch = |state: &mut ShardState, name: &str, from: &str| {
-      crate::vcs_store::hg_tags::dispatch_blocking(
-        state,
+    let branch = async |name: &str, from: &str| {
+      crate::vcs_store::hg_tags::dispatch_awaited(
         &owner(),
         RequestBody::CreateBranch {
           repository: "hg".to_owned(),
@@ -468,45 +433,108 @@ fn a_branch_from_a_tag_whose_heads_manifests_were_let_go_reads_them_once_and_is_
           version: None,
         },
       )
+      .await
     };
-    pushed(state, hg, &made, &[0]);
-    let (mark, _) = branch(state, "mark", "default");
+    pushed(hg, &made, &[0]).await;
+    let (mark, _) = branch("mark", "default").await;
     assert!(matches!(mark, ReplyBody::GreenCreated { .. }), "{mark:?}");
-    pushed(state, hg, &made, &[1, 2]);
-    let let_go = crate::vcs_store::lent_state(state, |state| {
-      crate::vcs_store::within_budget(state, 0, |stores| {
-        let (content, store) = stores.mercurial(hg)?;
-        let index = &store.index;
-        let changesets = (0..index.len(content, slates_hg::index::Log::Changelog))
-          .map(|rev| index.changeset(content, rev).map(|row| row.text));
-        let manifests = (0..index.len(content, slates_hg::index::Log::Manifest)).map(|rev| {
-          index
-            .revision(content, slates_hg::index::Log::Manifest, rev)
-            .map(|row| row.bytes)
-        });
-        let objects = changesets.chain(manifests).collect::<Option<Vec<_>>>()?;
-        Some(
-          objects
-            .iter()
-            .filter(|object| content.let_go_object(object) > 0)
-            .count(),
-        )
+    pushed(hg, &made, &[1, 2]).await;
+    let let_go = on(|state| {
+      crate::vcs_store::lent_state(state, |state| {
+        crate::vcs_store::within_budget(state, 0, |stores| {
+          let (content, store) = stores.mercurial(hg)?;
+          let index = &store.index;
+          let changesets = (0..index.len(content, slates_hg::index::Log::Changelog))
+            .map(|rev| index.changeset(content, rev).map(|row| row.text));
+          let manifests = (0..index.len(content, slates_hg::index::Log::Manifest)).map(|rev| {
+            index
+              .revision(content, slates_hg::index::Log::Manifest, rev)
+              .map(|row| row.bytes)
+          });
+          let objects = changesets.chain(manifests).collect::<Option<Vec<_>>>()?;
+          for object in &objects {
+            content.let_go_object(object);
+          }
+          Some(objects.iter().all(|object| !content.holds_whole(object)))
+        })
       })
     });
-    assert!(
-      let_go.is_some_and(|count| count > 0),
-      "objects let go: {let_go:?}"
+    // Let go by its landing as production lets a landed text go, or by this let-go where the landing kept it.
+    assert_eq!(
+      let_go,
+      Some(true),
+      "every changelog and manifest object let go"
     );
-    let (from_v1, read) = branch(state, "from-v1", "v1");
+    let (from_v1, read) = branch("from-v1", "v1").await;
     assert!(
       matches!(from_v1, ReplyBody::GreenCreated { .. }),
       "{from_v1:?}"
     );
     assert!(read, "the tags read from the changeset store");
-    let marks = bookmarks_of(state, hg);
+    let marks = on(|state| bookmarks_of(state, hg));
     let at = marks
       .iter()
       .find(|(held, _)| held.as_slice() == b"from-v1")
+      .map(|(_, node)| *node);
+    assert_eq!(at, Some(made[0].node), "{marks:?}");
+  });
+}
+
+/// A-575 with A-767 C1, by use (main's hg_interop round at b8ba82ad3: `stock_hg_pulls_by_a_tag_over_http_and_a_branch_is_
+/// made_from_the_tag` refused "a branch made at `v1` ... which no line or bookmark of the repository heads"). Do: push
+/// `first`, then `.hgtags` naming `v1` at `first`, then `third`, as the interop test's `hg tag --rev 0 v1` and commits
+/// make them; push bookmark `mark` at `first`, behind `default`'s head, as `hg push -B mark` sends it; then branch
+/// `from-tag` from `v1` through the verb's door. Expect the bookmark's push accepted and `mark` heading `first`, then the
+/// branch made at `first`.
+#[test]
+fn a_bookmark_pushed_at_a_tagged_changeset_behind_its_lines_head_heads_it_and_a_branch_is_made_from_the_tag()
+ {
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = created("hg", VcsTool::Mercurial).await;
+    let first = crate::repository::hg_push::tests::history_of(&[(
+      "first", "file", b"first\n", None, "default",
+    )]);
+    let tags = format!("{} v1\n", crate::verbs::hex_of(&first[0].node));
+    let tags: &'static [u8] = Box::leak(tags.into_bytes().into_boxed_slice());
+    let made = crate::repository::hg_push::tests::history_of(&[
+      ("first", "file", b"first\n", None, "default"),
+      ("Added tag v1", ".hgtags", tags, Some(0), "default"),
+      ("third", "third", b"third\n", Some(1), "default"),
+    ]);
+    pushed(hg, &made, &[0, 1, 2]).await;
+    let marked =
+      crate::repository::hg_push::tests::pushed_bookmark(hg, b"mark", made[0].node).await;
+    assert!(
+      matches!(marked, slates_hg::push::Outcome::Accepted(_)),
+      "push -B mark: {marked:?}"
+    );
+    let mark = on(|state| {
+      let green = state
+        .db
+        .partition()
+        .repositories()
+        .branch(hg, &crate::repository::hg_push::bookmark_name(b"mark"))?;
+      Some(crate::vcs_store::hg_made::head_of(state, green))
+    });
+    assert_eq!(mark, Some(Some(made[0].node)), "`mark` heads `first`");
+    let (from_tag, _) = crate::vcs_store::hg_tags::dispatch_awaited(
+      &owner(),
+      RequestBody::CreateBranch {
+        repository: "hg".to_owned(),
+        name: "from-tag".to_owned(),
+        from: "v1".to_owned(),
+        version: None,
+      },
+    )
+    .await;
+    assert!(
+      matches!(from_tag, ReplyBody::GreenCreated { .. }),
+      "{from_tag:?}"
+    );
+    let marks = on(|state| bookmarks_of(state, hg));
+    let at = marks
+      .iter()
+      .find(|(held, _)| held.as_slice() == b"from-tag")
       .map(|(_, node)| *node);
     assert_eq!(at, Some(made[0].node), "{marks:?}");
   });
@@ -533,23 +561,18 @@ fn streams_of(state: &mut ShardState, id: RepositoryId) -> (bool, bool) {
 /// whether it streams. Expect both to, either way.
 #[test]
 fn a_stream_clone_is_advertised_only_where_the_store_keeps_the_repositorys_logs() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let imported_id = created(state, "imported", VcsTool::Mercurial);
-    let (host, directory) = laid_out(FILE_INDEX.iter().copied());
-    assert_eq!(
-      begin(state, imported_id, (Box::new(host), directory)),
-      Ok(())
-    );
-    imported(state, imported_id);
-    let pushed_id = created(state, "pushed", VcsTool::Mercurial);
+  crate::test_store::run_on_stored_shard(|| async move {
+    let imported_id = created("imported", VcsTool::Mercurial).await;
+    imported(2, ("imported", imported_id), FILE_INDEX).await;
+    let pushed_id = created("pushed", VcsTool::Mercurial).await;
     let made = crate::repository::hg_push::tests::history_of(&[
       ("base", "a", b"a\n", None, "default"),
       ("second", "b", b"b\n", Some(0), "default"),
       ("third", "c", b"c\n", Some(1), "default"),
     ]);
-    pushed(state, pushed_id, &made, &[0, 1, 2]);
+    pushed(pushed_id, &made, &[0, 1, 2]).await;
     assert_eq!(
-      (streams_of(state, imported_id), streams_of(state, pushed_id)),
+      on(|state| (streams_of(state, imported_id), streams_of(state, pushed_id))),
       ((true, true), (true, true))
     );
   });
@@ -593,19 +616,18 @@ impl slates_hg::render::StoreWants for AskedTexts {
 /// was pushed, then the read refused past its room: a whole a push keeps is its raw text, as the store makes it.
 #[test]
 fn the_store_makes_a_pushed_mercurial_text_whole() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let hg = created(state, "hg", VcsTool::Mercurial);
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = created("hg", VcsTool::Mercurial).await;
     let made = crate::repository::hg_push::tests::history_of(&[
       ("base", "a", b"a\n", None, "default"),
       ("second", "b", b"b, a longer text\n", Some(0), "default"),
     ]);
-    pushed(state, hg, &made, &[0, 1]);
+    pushed(hg, &made, &[0, 1]).await;
     let texts: Vec<[u8; 32]> = [&b"a\n"[..], b"b, a longer text\n"]
       .iter()
       .map(|text| *blake3::hash(text).as_bytes())
       .collect();
-    let disk = state.vcs_disk.clone().expect("a store");
-    let ask = |most: u64| {
+    let ask = async |most: u64| {
       let mut asked = AskedTexts {
         want: Some(slates_hg::render::Want::Texts {
           texts: texts.clone(),
@@ -613,19 +635,15 @@ fn the_store_makes_a_pushed_mercurial_text_whole() {
         }),
         given: None,
       };
-      assert!(crate::test_store::answer_wants_blocking(
-        &disk,
-        u128::from_be_bytes(hg.bytes),
-        &mut asked
-      ));
+      assert!(super::answer_store_wants(&mut asked, hg).await);
       asked.given.expect("an answer")
     };
     assert_eq!(
-      ask(u64::MAX),
+      ask(u64::MAX).await,
       Some(vec![b"a\n".to_vec(), b"b, a longer text\n".to_vec()])
     );
     let held = u64::try_from(b"a\n".len() + b"b, a longer text\n".len()).unwrap();
-    assert_eq!(ask(held - 1), None, "refused past its room");
+    assert_eq!(ask(held - 1).await, None, "refused past its room");
   });
 }
 
@@ -641,8 +659,8 @@ const LONG_TEXT_LINES: usize = 300;
 /// more than the step; as many requests as its slices. Red before: one request copying the whole text.
 #[test]
 fn a_text_past_a_step_is_copied_a_step_a_request() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let hg = created(state, "hg", VcsTool::Mercurial);
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = created("hg", VcsTool::Mercurial).await;
     let long: &'static [u8] = Box::leak(
       (0..LONG_TEXT_LINES)
         .flat_map(|line| format!("line {line} of a text several steps long\n").into_bytes())
@@ -651,24 +669,13 @@ fn a_text_past_a_step_is_copied_a_step_a_request() {
     );
     let made =
       crate::repository::hg_push::tests::history_of(&[("base", "long", long, None, "default")]);
-    pushed(state, hg, &made, &[0]);
+    pushed(hg, &made, &[0]).await;
     let identity = *blake3::hash(long).as_bytes();
-    let disk = state.vcs_disk.clone().expect("a store");
+    let disk = on(|state| state.vcs_disk.clone()).expect("a store");
     let repository = u128::from_be_bytes(hg.bytes);
-    let (made, asks) = std::thread::scope(|scope| {
-      scope
-        .spawn(move || {
-          crate::test_store::waiting_runtime()
-            .block_on(async move {
-              super::texts_made(&disk, repository, &[identity], (u64::MAX, SMALL_STEP)).await
-            })
-            .ok()
-            .flatten()
-        })
-        .join()
-        .unwrap()
-    })
-    .expect("the text made");
+    let (made, asks) = super::texts_made(&disk, repository, &[identity], (u64::MAX, SMALL_STEP))
+      .await
+      .expect("the text made");
     let slices = (long.len() as u64).div_ceil(SMALL_STEP);
     println!(
       "hg_view: a text of {} B within a step of {SMALL_STEP} B: {asks:?} ({slices} slices)",
@@ -695,8 +702,8 @@ fn a_text_past_a_step_is_copied_a_step_a_request() {
 /// request copying the whole text.
 #[test]
 fn a_replays_ask_past_a_step_is_copied_a_step_a_request() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let hg = created(state, "hg", VcsTool::Mercurial);
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = created("hg", VcsTool::Mercurial).await;
     let long: &'static [u8] = Box::leak(
       (0..LONG_TEXT_LINES)
         .flat_map(|line| format!("line {line} of a base a replay asks for\n").into_bytes())
@@ -705,32 +712,21 @@ fn a_replays_ask_past_a_step_is_copied_a_step_a_request() {
     );
     let made =
       crate::repository::hg_push::tests::history_of(&[("base", "long", long, None, "default")]);
-    pushed(state, hg, &made, &[0]);
+    pushed(hg, &made, &[0]).await;
     let identity = *blake3::hash(long).as_bytes();
-    let disk = state.vcs_disk.clone().expect("a store");
+    let disk = on(|state| state.vcs_disk.clone()).expect("a store");
     let repository = u128::from_be_bytes(hg.bytes);
-    let (asked, asks) = std::thread::scope(|scope| {
-      scope
-        .spawn(move || {
-          crate::test_store::waiting_runtime()
-            .block_on(async move {
-              let mut asked = AskedTexts {
-                want: Some(slates_hg::render::Want::Texts {
-                  texts: vec![identity],
-                  most: u64::MAX,
-                }),
-                given: None,
-              };
-              let asks = super::answer_wants_over(&disk, repository, &mut asked, SMALL_STEP).await;
-              (asked.given, asks)
-            })
-            .ok()
-        })
-        .join()
-        .unwrap()
-    })
-    .expect("the want answered");
-    let asks = asks.expect("every want answered");
+    let mut wanted = AskedTexts {
+      want: Some(slates_hg::render::Want::Texts {
+        texts: vec![identity],
+        most: u64::MAX,
+      }),
+      given: None,
+    };
+    let asks = super::answer_wants_over(&disk, repository, &mut wanted, SMALL_STEP)
+      .await
+      .expect("every want answered");
+    let asked = wanted.given;
     let slices = (long.len() as u64).div_ceil(SMALL_STEP);
     println!(
       "hg_view: a replay's ask of {} B within a step of {SMALL_STEP} B: {asks:?} ({slices} slices)",
@@ -746,12 +742,14 @@ fn a_replays_ask_past_a_step_is_copied_a_step_a_request() {
   });
 }
 
-/// What a revision's text must be, as its writer kept it: a changeset's or a manifest's text whole; a file revision's
-/// by the identities its row names (its bytes' BLAKE3 and its metadata block's), since a landed file's text leaves the
-/// content store once its writer lands it (goal 93 item 2b(b)) and its row's names are what the writer kept.
+/// What a revision's text must be: a changeset's or a manifest's text whole, as the same history imported in one call
+/// into a content store of its own holds it ([`one_call_texts`]); a file revision's by the identities its row names
+/// (its bytes' BLAKE3 and its metadata block's). A landed text leaves the node's content store once its writer lands it
+/// (goal 93 item 2b(b), and every stored test's landing since main's ruling A3 of 2026-11-26), so no text the store
+/// makes is checked against the store itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Kept {
-  /// The text.
+  /// A changeset's or a manifest's text.
   Text(Vec<u8>),
   /// A file revision's names.
   File(slates_hg::push::verify::FileNames),
@@ -775,30 +773,23 @@ impl Kept {
 fn every_revision(
   state: &mut ShardState,
   id: RepositoryId,
+  texts: &std::collections::BTreeMap<slates_hg::Node, Vec<u8>>,
 ) -> Vec<(Vec<u8>, slates_hg::Node, Kept)> {
   use slates_hg::push::intake::{CHANGELOG_PATH, MANIFEST_PATH};
   use slates_hg::push::verify::Held;
   let mut room = Admission::new(ROOM);
+  let text_of =
+    |node: &slates_hg::Node| Kept::Text(texts.get(node).expect("a text of the node").clone());
   crate::vcs_store::lent_state(state, |state| {
-    super::with_view(state, id, &mut room, |view, held, room| {
+    super::with_view(state, id, &mut room, |view, held, _| {
       let mut revisions = Vec::new();
       for rev in 0..view.count() {
         let node = view.node(rev).unwrap();
-        let text = view
-          .changeset_text(rev, room)
-          .unwrap()
-          .unwrap()
-          .into_owned();
-        revisions.push((CHANGELOG_PATH.to_vec(), node, Kept::Text(text)));
+        revisions.push((CHANGELOG_PATH.to_vec(), node, text_of(&node)));
       }
       let mut position = 0;
       while let Some(linked) = view.manifest_linked(position) {
-        let logged = view.manifest(&linked.node, room).unwrap().unwrap();
-        revisions.push((
-          MANIFEST_PATH.to_vec(),
-          linked.node,
-          Kept::Text(logged.text.into_owned()),
-        ));
+        revisions.push((MANIFEST_PATH.to_vec(), linked.node, text_of(&linked.node)));
         position += 1;
       }
       let mut at = (Vec::new(), 0);
@@ -814,10 +805,41 @@ fn every_revision(
   .expect("the view lent")
 }
 
+/// Every changeset's and manifest's text of `files`, imported in one call into a content store of its own that lets
+/// nothing go (`slates_hg::import::import`), by node: the oracle [`every_revision`] holds the store's texts to.
+fn one_call_texts(files: Files) -> std::collections::BTreeMap<slates_hg::Node, Vec<u8>> {
+  use slates_hg::index::Log;
+  let (mut host, repository) = crate::hg_base::tests::laid_out(files.iter().copied());
+  let mut store = slates_vcs::ContentStore::new(ROOM, ONE_CALL_WINDOW).expect("a content store");
+  let mut base = crate::hg_base::HgBase::new(&mut host, repository);
+  let imported =
+    slates_hg::import::import(&mut base, &mut store, Admission::new(ROOM)).expect("imported");
+  let index = &imported.index;
+  let mut texts = std::collections::BTreeMap::new();
+  for rev in 0..index.len(&store, Log::Changelog) {
+    let row = index.changeset(&store, rev).expect("a changeset");
+    let text = store.object_bytes(&row.text, row.len).expect("its text");
+    texts.insert(row.node, text);
+  }
+  for rev in 0..index.len(&store, Log::Manifest) {
+    let node = index
+      .revision(&store, Log::Manifest, rev)
+      .expect("a manifest")
+      .node;
+    let text = index
+      .revision_text(&store, Log::Manifest, rev)
+      .expect("its text");
+    texts.insert(node, text);
+  }
+  texts
+}
+
+/// Shape: the content store's window [`one_call_texts`] imports into: any, since it lets nothing go.
+const ONE_CALL_WINDOW: usize = 1 << 16;
+
 /// What the node's store keeps of `revisions` in repository `id`: how many it keeps as an edit against a base, and each
 /// text made whole from its chain (`StoreHandle::texts_by_tool`, then `hg_view::texts_made`).
-fn kept_by_the_store(
-  state: &mut ShardState,
+async fn kept_by_the_store(
   id: RepositoryId,
   revisions: &[(Vec<u8>, slates_hg::Node, Kept)],
 ) -> (usize, Vec<Vec<u8>>) {
@@ -837,8 +859,6 @@ fn kept_by_the_store(
       self.want = None;
     }
   }
-  let disk = state.vcs_disk.clone().expect("a store");
-  let repository = u128::from_be_bytes(id.bytes);
   let logs = revisions
     .iter()
     .map(|(path, node, _)| (path.clone(), vec![*node]))
@@ -847,9 +867,7 @@ fn kept_by_the_store(
     want: Some(slates_hg::render::Want::Rows { logs }),
     rows: Vec::new(),
   };
-  assert!(crate::test_store::answer_wants_blocking(
-    &disk, repository, &mut rows
-  ));
+  assert!(super::answer_store_wants(&mut rows, id).await);
   let rows: Vec<slates_hg::render::StoredRevision> = rows
     .rows
     .into_iter()
@@ -869,9 +887,7 @@ fn kept_by_the_store(
     }),
     given: None,
   };
-  assert!(crate::test_store::answer_wants_blocking(
-    &disk, repository, &mut asked
-  ));
+  assert!(super::answer_store_wants(&mut asked, id).await);
   (
     edits,
     asked.given.expect("an answer").expect("within the room"),
@@ -880,10 +896,7 @@ fn kept_by_the_store(
 
 /// The changegroup a clone of repository `id` sends over the HTTP edge, its file revisions as the store keeps them
 /// (A-767 C1 step 1a), as a push's part.
-fn cloned_changegroup(
-  state: &mut ShardState,
-  id: RepositoryId,
-) -> slates_hg::push::ChangegroupPart {
+async fn cloned_changegroup(id: RepositoryId) -> slates_hg::push::ChangegroupPart {
   use slates_hg::serve::http::{self as hg_http, Begun, Compression, Compressor, Media};
   struct Plain;
   impl Compressor for Plain {
@@ -894,12 +907,14 @@ fn cloned_changegroup(
       }
     }
   }
-  let heads: Vec<String> = lend_in(state, id, &mut Admission::new(ROOM), |view, room| {
-    slates_hg::serve::discovery::head_revs(view, room)
-      .unwrap()
-      .into_iter()
-      .map(|rev| crate::verbs::hex_of(&view.node(rev).unwrap()))
-      .collect()
+  let heads: Vec<String> = on(|state| {
+    lend_in(state, id, &mut Admission::new(ROOM), |view, room| {
+      slates_hg::serve::discovery::head_revs(view, room)
+        .unwrap()
+        .into_iter()
+        .map(|rev| crate::verbs::hex_of(&view.node(rev).unwrap()))
+        .collect()
+    })
   })
   .expect("the view lent");
   let arguments = format!(
@@ -916,10 +931,10 @@ fn cloned_changegroup(
     headers: &headers,
     body: &[],
   };
-  let disk = state.vcs_disk.clone().expect("the store");
-  let repository = u128::from_be_bytes(id.bytes);
-  let begun = lend_in(state, id, &mut Admission::new(ROOM), |view, left| {
-    hg_http::begin(view, &request, 0, &mut Plain, left)
+  let begun = on(|state| {
+    lend_in(state, id, &mut Admission::new(ROOM), |view, left| {
+      hg_http::begin(view, &request, 0, &mut Plain, left)
+    })
   })
   .expect("the answer begun");
   let Begun::Streamed(mut streamed) = begun else {
@@ -927,13 +942,11 @@ fn cloned_changegroup(
   };
   let mut body = Vec::new();
   loop {
-    assert!(crate::test_store::answer_wants_blocking(
-      &disk,
-      repository,
-      &mut *streamed
-    ));
-    let more = lend_in(state, id, &mut Admission::new(ROOM), |view, left| {
-      streamed.step(view, left, &mut body)
+    assert!(super::answer_store_wants(&mut *streamed, id).await);
+    let more = on(|state| {
+      lend_in(state, id, &mut Admission::new(ROOM), |view, left| {
+        streamed.step(view, left, &mut body)
+      })
     })
     .expect("a step")
     .expect("a slice");
@@ -971,7 +984,7 @@ fn cloned_changegroup(
 #[test]
 fn every_text_both_writers_keep_is_made_whole_by_the_store_in_every_format() {
   use crate::hg_base::tests::{DOT, FILE_INDEX, HYBRID, LEGACY, V2};
-  crate::test_store::audit_on_stored_shard("hg", |state| {
+  crate::test_store::run_on_stored_shard(|| async move {
     let formats = [
       ("dot", DOT),
       ("hybrid", HYBRID),
@@ -979,15 +992,12 @@ fn every_text_both_writers_keep_is_made_whole_by_the_store_in_every_format() {
       ("v2", V2),
       ("fileindex", FILE_INDEX),
     ];
-    for (name, files) in formats {
-      let imported_id = created(state, &format!("{name}-imported"), VcsTool::Mercurial);
-      let (host, directory) = laid_out(files.iter().copied());
-      assert_eq!(
-        begin(state, imported_id, (Box::new(host), directory)),
-        Ok(())
-      );
-      imported(state, imported_id);
-      let revisions = every_revision(state, imported_id);
+    for ((name, files), request) in formats.into_iter().zip(2..) {
+      let imported_name = format!("{name}-imported");
+      let imported_id = created(&imported_name, VcsTool::Mercurial).await;
+      imported(request, (&imported_name, imported_id), files).await;
+      let texts = one_call_texts(files);
+      let revisions = on(|state| every_revision(state, imported_id, &texts));
       let made_as_kept = |made: &[Vec<u8>]| {
         made.len() == revisions.len()
           && made
@@ -995,17 +1005,17 @@ fn every_text_both_writers_keep_is_made_whole_by_the_store_in_every_format() {
             .zip(&revisions)
             .all(|(made, (_, _, kept))| kept.is(made))
       };
-      let (imported_edits, made) = kept_by_the_store(state, imported_id, &revisions);
+      let (imported_edits, made) = kept_by_the_store(imported_id, &revisions).await;
       assert!(made_as_kept(&made), "{name}: the import's texts made whole");
-      let changegroup = cloned_changegroup(state, imported_id);
-      let pushed_id = created(state, &format!("{name}-pushed"), VcsTool::Mercurial);
-      push_part(state, pushed_id, changegroup);
+      let changegroup = cloned_changegroup(imported_id).await;
+      let pushed_id = created(&format!("{name}-pushed"), VcsTool::Mercurial).await;
+      push_part(pushed_id, changegroup).await;
       assert_eq!(
-        every_revision(state, pushed_id),
+        on(|state| every_revision(state, pushed_id, &texts)),
         revisions,
         "{name}: the push holds the import's history"
       );
-      let (pushed_edits, made) = kept_by_the_store(state, pushed_id, &revisions);
+      let (pushed_edits, made) = kept_by_the_store(pushed_id, &revisions).await;
       assert!(made_as_kept(&made), "{name}: the push's texts made whole");
       assert!(
         imported_edits > 0 && pushed_edits > 0,
@@ -1015,27 +1025,7 @@ fn every_text_both_writers_keep_is_made_whole_by_the_store_in_every_format() {
   });
 }
 
-/// Lands `changegroup` on repository `id` as a push of its owner lands it.
-fn push_part(
-  state: &mut ShardState,
-  id: RepositoryId,
-  changegroup: slates_hg::push::ChangegroupPart,
-) {
-  use slates_hg::push::{Asks, Taken, Unbundle};
-  let unbundle = Unbundle {
-    parts: vec![Taken {
-      id: 0,
-      mandatory: true,
-      asks: Asks::Changegroup(changegroup),
-    }],
-  };
-  let mut room = Admission::new(u64::MAX);
-  let terms = (false, [7; 32], u64::MAX);
-  let prepared = crate::repository::hg_push::prepare_served(state, id, &unbundle, terms, &mut room)
-    .expect("the push prepared");
-  let landed = crate::repository::hg_push::land_stored(state, (&owner(), id), prepared);
-  assert!(
-    landed.answer.is_ok() && landed.released.is_ok(),
-    "{landed:?}"
-  );
+/// Pushes `changegroup` to repository `id` as its owner's push does ([`pushed`]).
+async fn push_part(id: RepositoryId, changegroup: slates_hg::push::ChangegroupPart) {
+  crate::repository::hg_push::tests::pushed_changegroup(id, changegroup).await;
 }

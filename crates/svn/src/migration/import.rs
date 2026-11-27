@@ -39,7 +39,7 @@
 
 use super::MigrationRefusal;
 use super::paths::{ROOT, absolute, canonical_relpath};
-use super::records::{Facts, Properties, Repository, Transaction, node};
+use super::records::{CloseStep, Closing, Facts, Properties, Repository, Transaction, node};
 use crate::commit::drive::{StagedText, TextRefused, TextSink};
 use crate::commit::record::Record;
 use crate::dump::{
@@ -128,6 +128,9 @@ pub struct Importer {
   /// Whether the stream may still name revisions the repository holds: true until the first revision it makes, so a
   /// stream resumes a cut-short import only from its start, never by revisions out of order.
   resumable: bool,
+  /// The revision being closed a unit at a time, its slice spent at the last call (A-920 7b): stepped before anything
+  /// else at the next; its record handed over once closed, and what [`Importer::pending`] holds done after.
+  closing: Option<Box<Closing>>,
 }
 
 /// A revision being read: its number, its properties and its transaction (none for revision 0).
@@ -226,7 +229,13 @@ impl Importer {
       done: false,
       wanted_base: None,
       resumable: true,
+      closing: None,
     }
+  }
+
+  /// Whether a revision is being closed a unit at a time ([`Importer::import_within`] stopped in its close, A-920 7b).
+  pub fn closing(&self) -> bool {
+    self.closing.is_some()
   }
 
   /// Hands the import the base `bytes` of the open delta text it asked for ([`Importing::Base`]), charged as the text's
@@ -286,13 +295,29 @@ impl Importer {
     buffer: &[u8],
     ended: bool,
   ) -> Result<Importing, MigrationRefusal> {
+    self.import_within((repository, texts), (buffer, ended), &mut || false)
+  }
+
+  /// [`Importer::import`], stopping after any whole event once `spent` says the caller's slice is spent, at least one
+  /// event a call (A-920 7a: a call took every event of its buffer, a copy slice of 68 KB, 3.9-5.3 ms debug, since a
+  /// dump's parse costs far more than its bytes' copy): then it answers [`Importing::NeedMore`] with the bytes done
+  /// with and none more needed, so the caller drops them and calls again with what remains.
+  ///
+  /// # Errors
+  /// As [`Importer::import`].
+  pub fn import_within(
+    &mut self,
+    (repository, texts): (&mut Repository, &dyn TextSink),
+    (buffer, ended): (&[u8], bool),
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<Importing, MigrationRefusal> {
     if let Some(refusal) = &self.refused {
       return Err(refusal.clone());
     }
     if self.done {
       return Ok(Importing::Done);
     }
-    let result = self.run((repository, texts), buffer, ended);
+    let result = self.run((repository, texts), (buffer, ended), spent);
     if let Err(refusal) = &result {
       self.refused = Some(refusal.clone());
       self.revision = None;
@@ -305,9 +330,12 @@ impl Importer {
   fn run(
     &mut self,
     (repository, texts): (&mut Repository, &dyn TextSink),
-    buffer: &[u8],
-    ended: bool,
+    (buffer, ended): (&[u8], bool),
+    spent: &mut dyn FnMut() -> bool,
   ) -> Result<Importing, MigrationRefusal> {
+    if let Some(closing) = self.closing.take() {
+      return self.close_some(repository, *closing, spent);
+    }
     match self.pending.take() {
       Some(Pending::Begin { number, properties }) => {
         self.begin_revision(repository, number, properties)?;
@@ -327,17 +355,31 @@ impl Importer {
         .map_err(MigrationRefusal::Stream)?
       {
         Read::Event { event, consumed } => {
-          let made = self.take((repository, texts), event)?;
+          let made = self.take((repository, texts), event, spent)?;
           offset = offset
             .checked_add(consumed)
             .ok_or(MigrationRefusal::Corrupt)?;
           if let Some(record) = made {
             return Ok(commit(offset, record));
           }
+          // A revision's close stopped with the slice spent: stepped on at the next call (A-920 7b).
+          if self.closing.is_some() {
+            return Ok(Importing::NeedMore {
+              consumed: offset,
+              needed: 0,
+            });
+          }
           if let Some(text) = self.wanted_base.take() {
             return Ok(Importing::Base {
               consumed: offset,
               text,
+            });
+          }
+          // The caller's slice spent after a whole event: what is done with dropped, the rest read at the next call.
+          if spent() {
+            return Ok(Importing::NeedMore {
+              consumed: offset,
+              needed: 0,
             });
           }
         }
@@ -348,9 +390,18 @@ impl Importer {
           return Ok(Importing::NeedMore { consumed, needed });
         }
         Read::End => {
-          if let Some(record) = self.close_revision(repository)? {
+          let closed = self.close_revision(repository, spent)?;
+          if closed.is_some() || self.closing.is_some() {
             self.pending = Some(Pending::End);
+          }
+          if let Some(record) = closed {
             return Ok(commit(offset, record));
+          }
+          if self.closing.is_some() {
+            return Ok(Importing::NeedMore {
+              consumed: offset,
+              needed: 0,
+            });
           }
           self.done = true;
           return Ok(Importing::Done);
@@ -364,6 +415,7 @@ impl Importer {
     &mut self,
     (repository, texts): (&mut Repository, &dyn TextSink),
     event: Event<'_>,
+    spent: &mut dyn FnMut() -> bool,
   ) -> Result<Option<Record>, MigrationRefusal> {
     let unmade = |done: Result<(), MigrationRefusal>| done.map(|()| None);
     // A revision the repository holds already is read through: its nodes, their sections and texts make nothing.
@@ -380,7 +432,7 @@ impl Importer {
     match event {
       Event::Format(_) | Event::Delta(_) => Ok(None),
       Event::Uuid(uuid) => uuid_record(repository, uuid),
-      Event::Revision(header) => self.revision_record(repository, &header),
+      Event::Revision(header) => self.revision_record(repository, &header, spent),
       Event::Node(header) => unmade(self.node_record((repository, texts), &header)),
       Event::Property(property) => unmade(self.property(repository, property)),
       Event::PropertiesEnd => unmade(self.properties_end(repository)),
@@ -396,11 +448,12 @@ impl Importer {
     &mut self,
     repository: &mut Repository,
     header: &RevisionHeader,
+    spent: &mut dyn FnMut() -> bool,
   ) -> Result<Option<Record>, MigrationRefusal> {
     let properties = header.properties.is_some();
-    let closed = self.close_revision(repository)?;
+    let closed = self.close_revision(repository, spent)?;
     self.loading = Some(header.number);
-    if closed.is_some() {
+    if closed.is_some() || self.closing.is_some() {
       self.pending = Some(Pending::Begin {
         number: header.number,
         properties,
@@ -458,6 +511,7 @@ impl Importer {
   fn close_revision(
     &mut self,
     repository: &Repository,
+    spent: &mut dyn FnMut() -> bool,
   ) -> Result<Option<Record>, MigrationRefusal> {
     self.node = None;
     let Some(open) = self.revision.take() else {
@@ -482,8 +536,35 @@ impl Importer {
         properties: open.properties,
       })),
       Some(transaction) => {
-        let revision = repository.revision_of(transaction, open.properties)?;
-        Ok(Some(Record::Revision(revision)))
+        let closing = repository.close_begin(transaction, open.properties);
+        match repository.close_step(closing, spent)? {
+          CloseStep::Closed(revision) => Ok(Some(Record::Revision(*revision))),
+          CloseStep::More(more) => {
+            self.closing = Some(more);
+            Ok(None)
+          }
+        }
+      }
+    }
+  }
+
+  /// A step of the revision `closing` (A-920 7b), a unit at least, until `spent`: its record handed over once closed,
+  /// what [`Importer::pending`] holds done at the next call; otherwise the call ends with none of the buffer done with
+  /// and none more needed.
+  fn close_some(
+    &mut self,
+    repository: &Repository,
+    closing: Closing,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<Importing, MigrationRefusal> {
+    match repository.close_step(closing, spent)? {
+      CloseStep::Closed(revision) => Ok(commit(0, Record::Revision(*revision))),
+      CloseStep::More(more) => {
+        self.closing = Some(more);
+        Ok(Importing::NeedMore {
+          consumed: 0,
+          needed: 0,
+        })
       }
     }
   }

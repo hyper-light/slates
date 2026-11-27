@@ -21,7 +21,7 @@ use super::{
 };
 use crate::config::GIT_KEEPALIVE_NS;
 use crate::daemon::observe_first;
-use crate::git_push::tests::{chain, files, git_repository, gits_report, owner, text};
+use crate::git_push::tests::{chain, files, git_repository_on, gits_report, owner, text};
 use crate::git_push::{ReceivePack, Unpresented};
 use crate::state::ShardState;
 use crate::vcs_http::Bounds;
@@ -92,17 +92,20 @@ type DaemonServices = ToolServices<ShardStores, ServedViews, ThisShard>;
 /// Makes git repository [`NAME`] on the shard and serves the edge there with [`site_within`], its listener on a loopback port:
 /// the repository, the listener's address, and the advertisement the driver makes the owner now (git's refs in the
 /// repository, none yet, under this server's capabilities).
-fn serving(state: &mut ShardState) -> (RepositoryId, SocketAddrV4, Vec<u8>) {
-  serving_within(state, ROOM, GIT_KEEPALIVE_NS)
+fn serving(
+  state: &mut ShardState,
+  repository: RepositoryId,
+) -> (RepositoryId, SocketAddrV4, Vec<u8>) {
+  serving_within(state, repository, ROOM, GIT_KEEPALIVE_NS)
 }
 
 /// [`serving`], each request admitted `room`, git's keepalive written after `keepalive_ns` of a silent fetch answer.
 fn serving_within(
   state: &mut ShardState,
+  repository: RepositoryId,
   room: u64,
   keepalive_ns: u64,
 ) -> (RepositoryId, SocketAddrV4, Vec<u8>) {
-  let repository = git_repository(state, NAME);
   let mut advertised = Vec::new();
   ReceivePack::start(
     state,
@@ -212,7 +215,8 @@ fn exited_cleanly(out: Vec<u8>) -> Transcript {
 fn t_a683_stock_gits_push_over_ssh_lands_through_the_driver() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   crate::test_store::keep_landed(&daemon);
-  let (repository, address, advertised) = observe_first(&daemon, serving);
+  let made = git_repository_on(&daemon, NAME);
+  let (repository, address, advertised) = observe_first(&daemon, move |state| serving(state, made));
   let [(create, _), ..] = chain();
   let pushed = pushed_over_ssh(address, None, create.request);
   let landed = observe_first(&daemon, move |state| files(state, repository, "main"));
@@ -230,7 +234,8 @@ fn t_a683_stock_gits_push_over_ssh_lands_through_the_driver() {
 #[test]
 fn t_a683_each_protocol_is_advertised_as_gits_and_a_push_of_nothing_writes_nothing() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (repository, address, advertised) = observe_first(&daemon, serving);
+  let made = git_repository_on(&daemon, NAME);
+  let (repository, address, advertised) = observe_first(&daemon, move |state| serving(state, made));
   let mut flush = Vec::new();
   pktline::write(Packet::Flush, &mut flush).expect("a flush");
   let mut version_one = Vec::new();
@@ -350,8 +355,9 @@ fn a745_a_long_historys_clone_over_ssh_is_answered_within_one_requests_room() {
     LONG_HISTORY, fetch_of, fetched_pack, ids_in, long_history, packets_from,
   };
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (_, address, _) = observe_first(&daemon, |state| {
-    serving_within(state, REQUEST_ROOM, GIT_KEEPALIVE_NS)
+  let made = git_repository_on(&daemon, NAME);
+  let (_, address, _) = observe_first(&daemon, move |state| {
+    serving_within(state, made, REQUEST_ROOM, GIT_KEEPALIVE_NS)
   });
   let (request, last) = long_history(LONG_HISTORY);
   let pushed = pushed_patiently(address, &request);
@@ -393,7 +399,8 @@ fn a_long_fetchs_answer_over_ssh_is_kept_alive_with_gits_keepalive_while_its_pac
     KEPT_ALIVE_HISTORY, OPENING_SHOWN, fetch_of, fetched_pack, ids_in, long_history, packets_from,
   };
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (_, address, _) = observe_first(&daemon, |state| serving_within(state, ROOM, 0));
+  let made = git_repository_on(&daemon, NAME);
+  let (_, address, _) = observe_first(&daemon, move |state| serving_within(state, made, ROOM, 0));
   observe_first(&daemon, |_| {
     slates_rt::futures::set_step_ceiling_ns(
       crate::vcs_http::daemon_edge_tests::KEPT_ALIVE_CEILING_NS,
@@ -448,8 +455,9 @@ fn a_pushed_pack_let_go_by_its_commit_is_cloned_whole_and_shallow_over_ssh() {
     packets_from, shallow_fetch_of,
   };
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (_, address, _) = observe_first(&daemon, |state| {
-    serving_within(state, ROOM, GIT_KEEPALIVE_NS)
+  let made = git_repository_on(&daemon, NAME);
+  let (_, address, _) = observe_first(&daemon, move |state| {
+    serving_within(state, made, ROOM, GIT_KEEPALIVE_NS)
   });
   let (request, commit) = large_create(LET_GO_FILE);
   let pushed = pushed_patiently(address, &request);
@@ -520,8 +528,9 @@ fn a_shallow_clone_of_a_later_push_let_go_is_answered_whole_over_ssh() {
   use slates_git::object_name::Kind;
   use slates_git::pktline::{self, Packet};
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (_, address, _) = observe_first(&daemon, |state| {
-    serving_within(state, ROOM, GIT_KEEPALIVE_NS)
+  let made = git_repository_on(&daemon, NAME);
+  let (_, address, _) = observe_first(&daemon, move |state| {
+    serving_within(state, made, ROOM, GIT_KEEPALIVE_NS)
   });
   let let_go_bytes = || {
     observe_first(&daemon, |state| {
@@ -616,8 +625,9 @@ fn a_fetch_past_its_room_over_ssh_waits_for_more_and_is_answered_whole() {
     TAGGED_FEW, fetched_pack_after, ids_in, packets_from, tagged_history, whole_fetch_of,
   };
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (_, address, _) = observe_first(&daemon, |state| {
-    serving_within(state, ROOM, GIT_KEEPALIVE_NS)
+  let made = git_repository_on(&daemon, NAME);
+  let (_, address, _) = observe_first(&daemon, move |state| {
+    serving_within(state, made, ROOM, GIT_KEEPALIVE_NS)
   });
   let (request, wants, objects) = tagged_history(TAGGED_FEW);
   let pushed = pushed_patiently(address, &request);

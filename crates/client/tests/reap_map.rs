@@ -112,6 +112,45 @@ fn starved_mapper() {
   }
 }
 
+/// The starved client whose daemon stops: connects, caps its descriptors at the lowest number free (as
+/// [`starved_mapper`]), says so, waits for a line on its input (its daemon stopped), then maps `/f.bin` of the volume it
+/// is given, which finds its daemon gone and reconnects; prints what the map returned and how long it took, and waits
+/// to be killed.
+fn starved_after_the_stop() {
+  use std::os::fd::AsRawFd;
+
+  let instance = std::env::var(ROLE_INSTANCE).unwrap();
+  let volume = unhex(&std::env::var(ROLE_VOLUME).unwrap());
+  let mut client = Client::connect(&instance, deadlines()).unwrap();
+  let lowest_free = rustix::io::dup(std::io::stdout()).unwrap();
+  let cap = u64::try_from(lowest_free.as_raw_fd()).unwrap();
+  drop(lowest_free);
+  let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+  rustix::process::setrlimit(
+    rustix::process::Resource::Nofile,
+    rustix::process::Rlimit {
+      current: Some(cap),
+      maximum: limit.maximum,
+    },
+  )
+  .unwrap();
+  println!("starved-capped:");
+  let mut stopped = String::new();
+  std::io::stdin().read_line(&mut stopped).unwrap();
+  let began = Instant::now();
+  let outcome = match client.map_read(volume, "/f.bin") {
+    Ok(mapped) => format!("mapped, zero-copy {}", mapped.is_zero_copy()),
+    Err(error) => format!("{error:?}"),
+  };
+  println!(
+    "starved-gone-outcome: {} ns {outcome}",
+    began.elapsed().as_nanos()
+  );
+  loop {
+    std::thread::park();
+  }
+}
+
 /// The mapper: connects, maps `/f.bin` of the volume it is given, prints its client id and whether the map is a
 /// direct one, and waits to be killed with the map held.
 fn mapper() {
@@ -508,6 +547,69 @@ fn a_hand_off_that_fails_in_the_client_gives_its_copy_back() {
   );
   assert_eq!(counted(&daemon, "dax.local_map_released"), 1);
   daemon.stop();
+}
+
+/// Main 01a20182's order of 2026-11-25 (docs/bugs/2026-11-25-a-client-short-of-descriptors-judged-its-live-daemon-gone):
+/// a client short of descriptors must not judge a live daemon gone, and one whose daemon is truly gone must still end
+/// typed, never reconnect forever. Do: a re-invoked test binary connects to a one-shard daemon and caps its descriptors
+/// at the lowest number free; stop the daemon; then the client maps a file. Expect: the map is refused typed within
+/// [`WAIT`] (the reconnect's every refusal answered: no holder left, or the descriptor the reconnect asks refused),
+/// never mapped and never waiting past the bound.
+#[test]
+fn a_client_short_of_descriptors_whose_daemon_stopped_is_refused_within_a_bound() {
+  if std::env::var(ROLE).as_deref() == Ok("starved-gone") {
+    starved_after_the_stop();
+    return;
+  }
+  let (daemon, instance, volume, _) = daemon_with_a_file("starvedgone");
+  let mut child = Victim(
+    Command::new(std::env::current_exe().unwrap())
+      .args([
+        "--exact",
+        "a_client_short_of_descriptors_whose_daemon_stopped_is_refused_within_a_bound",
+        "--nocapture",
+      ])
+      .env(ROLE, "starved-gone")
+      .env(ROLE_INSTANCE, &instance)
+      .env(ROLE_VOLUME, hex(volume))
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .spawn()
+      .unwrap(),
+  );
+  let (lines_to, lines) = std::sync::mpsc::channel();
+  let stdout = child.0.stdout.take().unwrap();
+  std::thread::spawn(move || {
+    for line in BufReader::new(stdout).lines() {
+      if lines_to
+        .send(line.expect("read the client's report"))
+        .is_err()
+      {
+        return;
+      }
+    }
+  });
+  let tagged = |tag: &str| loop {
+    let line = lines
+      .recv_timeout(WAIT)
+      .unwrap_or_else(|_| panic!("the client said `{tag}` within {WAIT:?}"));
+    if let Some(rest) = line.strip_prefix(tag) {
+      return rest.to_owned();
+    }
+  };
+  tagged("starved-capped:");
+  daemon.stop();
+  {
+    use std::io::Write;
+    let mut input = child.0.stdin.take().unwrap();
+    writeln!(input, "stopped").unwrap();
+  }
+  let outcome = tagged("starved-gone-outcome: ");
+  println!("the starved client after the stop: {outcome}");
+  assert!(
+    !outcome.contains("mapped"),
+    "a client whose daemon is gone maps nothing: {outcome}"
+  );
 }
 
 /// AC-A-186: a store into a writable map outlives its client's process, as one into a shared map of a file does. Do: on

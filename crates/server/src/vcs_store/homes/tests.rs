@@ -14,17 +14,27 @@ fn window(index: usize) -> Vec<u8> {
   format!("window {index} of a monorepo's cold content\n").into_bytes()
 }
 
-/// A-724 piece 5. Do: rank four shards for many identities. Expect: each identity's home the head of the one rendezvous
-/// ranking every placement uses; every shard some identity's home; none for no shards.
+/// A-724 piece 5. Do: rank four shards for many identities, and the same four renumbered, as a successor's start numbers
+/// them. Expect: each identity's home the shard at the head of the one rendezvous ranking every placement uses, over the
+/// shards' places (their partitions); the same place whatever the shards' ids (w-hg, 2026-11-26: ranked by id, an
+/// in-process successor numbered 1 and 3 where its predecessor had 0 and 2 read its homed objects as held nowhere);
+/// every shard some identity's home; none for no shards.
 #[test]
 fn an_identitys_home_is_the_head_of_the_one_rendezvous_ranking_and_homes_spread() {
   let shards = [3u16, 5, 8, 13];
+  let renumbered = [1u16, 2, 4, 9];
   let mut used = std::collections::BTreeSet::new();
   for index in 0..WINDOWS {
     let identity = ContentId::of(&window(index));
     let home = home_of(&shards, &identity).unwrap();
-    let ranked = rendezvous_ranked_by_key(&shards.map(u64::from), &identity.0);
-    assert_eq!(u64::from(home), ranked[0]);
+    let ranked = rendezvous_ranked_by_key(&[0, 1, 2, 3], &identity.0);
+    assert_eq!(home, shards[usize::try_from(ranked[0]).unwrap()]);
+    // The same partition, whatever ids the node's shards were given at this start.
+    let place = |shards: &[u16], home| shards.iter().position(|shard| *shard == home);
+    assert_eq!(
+      place(&shards, home),
+      place(&renumbered, home_of(&renumbered, &identity).unwrap())
+    );
     used.insert(home);
   }
   assert_eq!(used.len(), shards.len(), "every shard homes something");
@@ -566,10 +576,15 @@ fn an_object_is_homed_in_the_region_only_once_its_homes_image_is_published() {
       let short = slates_cluster::CommitBudget::hard(budget / 50, (budget / 500).max(1));
       // Homed only once its home has published an image holding it: the wait publishes the home itself where nothing
       // else has, counted.
-      if home_in_region(origin, &shards, (bytes.clone(), super::TEST_OWNER), short)
-        .await
-        .outcome
-        .is_ok()
+      if home_in_region(
+        origin,
+        &shards,
+        (super::HomeSource::Bytes(bytes.clone()), super::TEST_OWNER),
+        short,
+      )
+      .await
+      .outcome
+      .is_ok()
         && crate::xshard::call_in_shard_time(
           origin,
           home,
@@ -596,9 +611,14 @@ fn an_object_is_homed_in_the_region_only_once_its_homes_image_is_published() {
       .unwrap();
       slates_rt::futures::detach(publisher).unwrap();
       let full = slates_cluster::CommitBudget::hard(budget, (budget / 100).max(1));
-      match home_in_region(origin, &shards, (bytes, super::TEST_OWNER), full)
-        .await
-        .outcome
+      match home_in_region(
+        origin,
+        &shards,
+        (super::HomeSource::Bytes(bytes), super::TEST_OWNER),
+        full,
+      )
+      .await
+      .outcome
       {
         Ok(homed) if homed == identity => {}
         other => outcome.push(format!("not homed after the publication: {other:?}")),
@@ -656,9 +676,14 @@ fn an_object_longer_than_a_window_is_homed_and_read_back_by_its_blake3() {
         .map(|at| u8::try_from(at % 251).unwrap_or(0))
         .collect();
       let identity = ContentId::of(&bytes);
-      match home_in_region(origin, &shards, (bytes.clone(), super::TEST_OWNER), full)
-        .await
-        .outcome
+      match home_in_region(
+        origin,
+        &shards,
+        (super::HomeSource::Bytes(bytes.clone()), super::TEST_OWNER),
+        full,
+      )
+      .await
+      .outcome
       {
         Ok(homed) if homed == identity => {}
         other => outcome.push(format!("not homed under its BLAKE3: {other:?}")),

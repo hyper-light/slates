@@ -307,8 +307,14 @@ mod tests {
   /// counted. Failing first: kept resident, nothing letting it go.
   #[test]
   fn a_read_back_no_store_claims_is_let_go_once_unpinned() {
-    crate::test_store::audit_on_stored_shard("read-backs-unattributed", |state| {
-      let _ = crate::vcs_store::tests::repository(state, "unclaimed", VcsTool::Git);
+    let owner = crate::vcs_store::tests::owner();
+    let asked = [(
+      "unclaimed",
+      VcsTool::Git,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      "main",
+    )];
+    crate::test_store::audit_on_stored_shard_made_all((&owner, asked), |state, [_]| {
       let bytes = [7u8; 1_000];
       let window = crate::vcs_store::within_budget(state, 1 << 16, |stores| {
         let content = stores.content_mut().expect("a content store");
@@ -348,38 +354,52 @@ mod tests {
   /// repositories and packs it walked (`O(repositories × packs)`, run only on a bring-back).
   #[test]
   fn a_packs_window_is_attributed_to_the_repository_whose_store_holds_it() {
-    use crate::vcs_store::tests::{commit_of, push_through, repository, tree_of};
-    crate::test_store::audit_on_stored_shard("read-backs-packs", |state| {
+    use crate::vcs_store::tests::{commit_of, on_state, owner, push_through_awaited, tree_of};
+    crate::test_store::run_on_stored_shard(|| async {
       let mut held = Vec::new();
       for number in 0..REPOSITORIES {
-        let (id, root) = repository(state, &format!("packed-{number}"), VcsTool::Git);
+        let name = format!("packed-{number}");
+        let (id, root) = crate::test_store::created(
+          &owner(),
+          (
+            &name,
+            VcsTool::Git,
+            slates_ipc::protocol::ObjectFormat::Sha1,
+            "main",
+          ),
+        )
+        .await;
         let files = [(
           b"README".to_vec(),
           format!("repository {number}\n").into_bytes(),
         )];
         let (objects, commit) = commit_of(&files, &[], 1_700_000_000);
         let tree = tree_of(&objects);
-        push_through(state, (id, root), &objects, (None, commit, tree));
-        let packs: Vec<ContentId> = state
-          .vcs_stores
-          .git_ref(id)
-          .map(|(_, store)| store.repository.packs().map(|(pack, _)| pack).collect())
-          .unwrap_or_default();
+        push_through_awaited((id, root), &objects, (None, commit, tree)).await;
+        let packs: Vec<ContentId> = on_state(|state| {
+          state
+            .vcs_stores
+            .git_ref(id)
+            .map(|(_, store)| store.repository.packs().map(|(pack, _)| pack).collect())
+            .unwrap_or_default()
+        });
         assert!(!packs.is_empty(), "repository {number} holds a pack");
         held.extend(packs.into_iter().map(|pack| (id, pack)));
       }
-      let began = std::time::Instant::now();
-      for (id, pack) in &held {
-        assert_eq!(git_holding_pack(state, pack), Some(*id));
-      }
-      let took = began.elapsed();
-      assert_eq!(git_holding_pack(state, &ContentId([9; 32])), None);
-      eprintln!(
-        "read_backs: {} lookups over {REPOSITORIES} git repositories and {} packs in {took:?}, {} ns a lookup",
-        held.len(),
-        held.len(),
-        took.as_nanos() / u128::try_from(held.len().max(1)).unwrap_or(1)
-      );
+      on_state(|state| {
+        let began = std::time::Instant::now();
+        for (id, pack) in &held {
+          assert_eq!(git_holding_pack(state, pack), Some(*id));
+        }
+        let took = began.elapsed();
+        assert_eq!(git_holding_pack(state, &ContentId([9; 32])), None);
+        eprintln!(
+          "read_backs: {} lookups over {REPOSITORIES} git repositories and {} packs in {took:?}, {} ns a lookup",
+          held.len(),
+          held.len(),
+          took.as_nanos() / u128::try_from(held.len().max(1)).unwrap_or(1)
+        );
+      });
     });
   }
 
@@ -446,32 +466,41 @@ mod tests {
   /// (`vcs_share.read_backs_attributed_hg`), none unattributed.
   #[test]
   fn a_homes_mercurial_window_is_attributed_to_its_revisions_repository() {
-    crate::test_store::audit_on_stored_shard("read-backs-hg", |state| {
-      let (repository, _) =
-        crate::vcs_store::tests::repository(state, "hg-read-back", VcsTool::Mercurial);
-      let window = crate::vcs_store::within_budget(state, 1 << 16, |stores| {
-        stores
-          .content_mut()
-          .expect("a content store")
-          .put(&[3u8; 1_000])
-          .expect("put")
-      });
-      crate::vcs_store::homes::note_landed(
-        window,
-        crate::vcs_store::homes::Landed::Hg(crate::vcs_store::homes::HgLanded {
-          repository,
-          path: b"README".to_vec(),
-          node: [1; 20],
-        }),
-      );
-      brought_back(state, window, 1_000, Holder::Landed);
-      assert_eq!(
-        (
-          count(state, super::ATTRIBUTED_HG),
-          count(state, UNATTRIBUTED)
-        ),
-        (1, 0)
-      );
-    });
+    let owner = crate::vcs_store::tests::owner();
+    let default = crate::repository::hg_push::line_name(b"default", 0);
+    let asked = [(
+      "hg-read-back",
+      VcsTool::Mercurial,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      default.as_str(),
+    )];
+    crate::test_store::audit_on_stored_shard_made_all(
+      (&owner, asked),
+      |state, [(repository, _)]| {
+        let window = crate::vcs_store::within_budget(state, 1 << 16, |stores| {
+          stores
+            .content_mut()
+            .expect("a content store")
+            .put(&[3u8; 1_000])
+            .expect("put")
+        });
+        crate::vcs_store::homes::note_landed(
+          window,
+          crate::vcs_store::homes::Landed::Hg(crate::vcs_store::homes::HgLanded {
+            repository,
+            path: b"README".to_vec(),
+            node: [1; 20],
+          }),
+        );
+        brought_back(state, window, 1_000, Holder::Landed);
+        assert_eq!(
+          (
+            count(state, super::ATTRIBUTED_HG),
+            count(state, UNATTRIBUTED)
+          ),
+          (1, 0)
+        );
+      },
+    );
   }
 }

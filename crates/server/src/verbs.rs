@@ -11866,6 +11866,18 @@ pub(crate) fn publish_held_increments(state: &mut ShardState) -> Result<(), Refu
   })
 }
 
+/// The content store's changes since the shard's last committed publication published now, outside any transaction,
+/// ahead of an op that will name them (A-920 13b): an import's landing publishes its versions' held increments in a step
+/// of its own, so the register's op finds them published and only records (A-727's order kept: published before
+/// recorded). Whether it published. A refusal leaves them unpublished for the op's own publication to meet and refuse,
+/// as it would have; nothing is remade here.
+pub(crate) fn publish_held_ahead(state: &mut ShardState) -> bool {
+  if !held_unpublished(state) || state.db.in_transaction() {
+    return false;
+  }
+  publish_shard(state).is_ok()
+}
+
 /// Whether the content store changed since the shard's last committed publication. A shard with no content object keeps
 /// no image (a degraded build): nothing it holds survives it, so there is no order to keep.
 fn held_unpublished(state: &ShardState) -> bool {
@@ -19834,13 +19846,15 @@ pub(crate) async fn rebuild_recovered(
     // So does a checkpoint's stage a stop left part-way, or one held before a kill kept its record (A-579).
     crate::merge_service::release_unnamed_checkpoints(state, green);
   }
-  slices.unit_done().await;
+  slices
+    .unit_done("the greens' unnamed increments let go")
+    .await;
   // The objects the anchor held are taken back first, at the handles their backings had and dormant through the
   // replay, since each already holds every write the dead daemon made, in order with the stores made through it: the
   // writable direct maps' copies (A-197, Linux) and the Shards streams' DAX objects (A-365; Windows' sections, A-448), in
   // one ascending order of their backings' handles (A-389).
   rebuilt.copies_adopted = crate::shards::dax_hold::adopt_inherited(state);
-  slices.unit_done().await;
+  slices.unit_done("the inherited copies adopted").await;
   // The writes acknowledged after the last publication, a FUSE mount's (Linux) and a Shards stream's (every platform;
   // A-316, A-339, A-402), back on top of the rebuilt volumes (A-63).
   rebuilt.writes_replayed = replay_writes(state, slices).await;
@@ -19853,14 +19867,14 @@ pub(crate) async fn rebuild_recovered(
   // volume's inode numbers (the prefixes came from the images, not from `next_prefix`).
   state.next_prefix = max_prefix;
   rebuilt.destroys_completed = complete_recovered_destroys(state);
-  slices.unit_done().await;
+  slices.unit_done("the recovered destroys completed").await;
   // Each repository's tool store made again, every entry's objects replayed through its admission and commit in log
   // order, a record a unit (A-662).
   crate::vcs_store::recover(state, slices).await;
   // The greens whose replay reads a named base a repository's store resolves, rebuilt now the stores are (A-887).
   rebuild_after_stores(state, &after_stores, (slices, &mut rebuilt), max_prefix).await;
   rebuilt.pins_reconciled = reconcile_clone_pins(state);
-  slices.unit_done().await;
+  slices.unit_done("the clone pins reconciled").await;
   // The recorded snapshot mounts' views, once the volumes and their pins are back (AUD-29-76).
   rebuilt.snapshot_views = crate::snapshot_view::rebuild(state);
   // The held connections' byte states, once the volumes are back and every write since the publication replayed onto
@@ -19968,12 +19982,12 @@ async fn rebuild_records(
       member_rank(state, record.id),
     )
   });
-  slices.unit_done().await;
+  slices.unit_done("the volume records ordered").await;
   let mut after_stores = Vec::new();
   for record in &records {
     if rebuilt_after_stores(state, record) {
       after_stores.push(record.clone());
-      slices.unit_done().await;
+      slices.unit_done("a volume left for after the stores").await;
       continue;
     }
     rebuild_reconciled(
@@ -20083,7 +20097,7 @@ async fn rebuild_reconciled(
       .attachments_dropped
       .saturating_add(keep_unrecovered_mounts(state, record));
   }
-  slices.unit_done().await;
+  slices.unit_done("a reconciled volume").await;
 }
 
 /// The FUSE mounts of a volume recovery could not rebuild (§4.8 `NotRecovered`; A-102; A-509): one whose device the
@@ -20212,7 +20226,7 @@ async fn rebuild_green_record(
   crate::vcs_store::name_holds::let_go_landed_texts(state, &brought_hg);
   for version in versions {
     crate::merge_service::enqueue_recovered_record(state, record.id, version);
-    slices.unit_done().await;
+    slices.unit_done("a green's record").await;
   }
 }
 
@@ -20787,7 +20801,7 @@ async fn replay_member_sliced(
   loop {
     match replay.step(state) {
       Ok(true) => break,
-      Ok(false) => slices.unit_done().await,
+      Ok(false) => slices.unit_done("a member's replay step").await,
       Err(fence) => return (Err(fence), replay.into_engine()),
     }
   }
@@ -20915,7 +20929,7 @@ async fn replay_green_sliced(
   loop {
     match replay.step(state) {
       Ok(true) => break,
-      Ok(false) => slices.unit_done().await,
+      Ok(false) => slices.unit_done("a green's chain step").await,
       Err(fence) => return (Err(fence), replay.load_steps),
     }
   }
@@ -20943,6 +20957,10 @@ pub(crate) struct GreenReplay {
   phase: GreenReplayPhase,
   /// The shares its origin was seeded in: more than one shows the seeding was sliced.
   load_steps: u64,
+  /// The steps its chain entries were applied in, each under a slice's floor ([`replay_apply_budget_ns`]): more than its
+  /// entries shows an entry's apply was sliced (r42, 2026-11-26: a restart's unit applied hg's whole tree in one, 329.6
+  /// ms of CPU).
+  apply_steps: u64,
 }
 
 /// Where a [`GreenReplay`] is.
@@ -20966,6 +20984,8 @@ enum GreenReplayPhase {
     /// The named texts the next entry's apply reads that the green holds by name alone, read from the content plane a
     /// copy slice a step and lent the green (A-760 (b) 4d), once its runs are read.
     lending: Option<Box<Lending>>,
+    /// The next entry's apply under way, a slice's floor a step (`Green::apply_step`), once its texts are lent.
+    applying: Option<Box<slates_merge::engine::Applying>>,
   },
 }
 
@@ -21050,6 +21070,7 @@ impl GreenReplay {
       id,
       phase,
       load_steps: 0,
+      apply_steps: 0,
     })
   }
 
@@ -21070,6 +21091,7 @@ impl GreenReplay {
       id,
       phase: chain_phase_or_back(state, id, seeded)?,
       load_steps: 0,
+      apply_steps: 0,
     })
   }
 
@@ -21124,12 +21146,14 @@ impl GreenReplay {
         head_check,
         reading,
         lending,
+        applying,
       } => {
         return replay_chain_entry(
           state,
           (id, green),
           (*held, *head_check),
           (next, reading, lending),
+          (applying, &mut self.apply_steps),
           replayed,
         );
       }
@@ -21204,6 +21228,7 @@ fn replay_chain_entry(
     &mut Option<Box<slates_merge::chain_entry::ChainEntry>>,
     &mut Option<Box<Lending>>,
   ),
+  (applying, apply_steps): (&mut Option<Box<slates_merge::engine::Applying>>, &mut u64),
   replayed: &mut Vec<crate::merge_service::ReplayedVersion>,
 ) -> Result<bool, crate::merge_service::GreenFence> {
   use crate::merge_service::GreenFence;
@@ -21277,12 +21302,44 @@ fn replay_chain_entry(
     }
   }
   // The texts its apply reads that the green holds by name alone (A-760 (b) 4d) are lent it first, a copy slice a step.
-  if !lend_step(state, green, (&entry, version), lending)? {
+  if applying.is_none() && !lend_step(state, green, (&entry, version), lending)? {
     *reading = Some(entry);
     return Ok(false);
   }
-  let mut entry = *entry;
-  let accepted = green.apply_recorded(&mut entry.increment, &entry.applied);
+  // Then applied a slice's floor a step (`Green::apply_step`), the run kept with the entry between steps: an entry of a
+  // whole tree (a push's line from an empty root) applied in one unit held a restart's slice 329.6 ms of CPU (r42).
+  let mut entry = entry;
+  let run = match applying.take() {
+    Some(run) => Ok(run),
+    None => match green.begin_applying(&mut entry.increment, &entry.applied) {
+      slates_merge::engine::Begun::Applying(run) => Ok(run),
+      slates_merge::engine::Begun::Answered(version) => Err(version),
+    },
+  };
+  let accepted = match run {
+    // Answered at once: an owing green's tail (the entry kept in its order, once), or an increment accepted before, as
+    // `Green::apply_recorded` answers it. Never begun again: a second begin would keep an owing green's entry twice.
+    Err(version) => version,
+    Ok(mut run) => {
+      let deadline = slates_rt::futures::now_ns().saturating_add(replay_apply_budget_ns(state));
+      *apply_steps = apply_steps.saturating_add(1);
+      let stepped = green.apply_step(&mut run, &mut entry.increment, &entry.applied, &mut || {
+        slates_rt::futures::now_ns() >= deadline
+      });
+      match stepped {
+        slates_merge::engine::ApplyStep::More => {
+          *applying = Some(run);
+          *reading = Some(entry);
+          return Ok(false);
+        }
+        slates_merge::engine::ApplyStep::Done(version)
+        | slates_merge::engine::ApplyStep::Answered(version) => version,
+        // Every text it reads was lent above: one met unlent commits nothing, the head answered, as before.
+        slates_merge::engine::ApplyStep::Lend(_) => green.head(),
+      }
+    }
+  };
+  let entry = *entry;
   // Lent for the apply, let go once it is committed.
   green.let_named_bytes_go();
   if accepted != version {
@@ -21321,6 +21378,32 @@ fn replay_chain_entry(
   });
   *next = next.saturating_add(1);
   Ok(false)
+}
+
+/// The budget of one step of a replayed chain entry's apply ([`replay_chain_entry`]): a slice's floor, half the live step
+/// quantum (`DaemonConfig::copy_slice_ns`), the budget a recovery's every other long unit is given.
+fn replay_apply_budget_ns(state: &ShardState) -> u64 {
+  #[cfg(test)]
+  if let Some(budget) = TEST_REPLAY_APPLY_BUDGET_NS.with(core::cell::Cell::get) {
+    return budget;
+  }
+  state.config.copy_slice_ns()
+}
+
+#[cfg(test)]
+thread_local! {
+  /// A test's budget for a replayed entry's apply step, in place of the slice's floor: a nanosecond makes every step a
+  /// unit of the apply.
+  pub(crate) static TEST_REPLAY_APPLY_BUDGET_NS: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
+}
+
+/// The steps green `id`'s replay applied its chain's entries in ([`GreenReplay`]'s count), for a test: none where the
+/// replay was refused.
+#[cfg(test)]
+pub(crate) fn replay_apply_steps_for_test(state: &ShardState, id: DbVolumeId) -> Option<u64> {
+  let mut replay = GreenReplay::begin(state, id).ok()?;
+  while !replay.step(state).ok()? {}
+  Some(replay.apply_steps)
 }
 
 /// Green `id`'s engine before its chain, from the origin recovery found (`None` for a green that started from
@@ -21429,6 +21512,7 @@ fn chain_from(
     head_check,
     reading: None,
     lending: None,
+    applying: None,
   })
 }
 
@@ -21551,6 +21635,7 @@ pub(crate) fn begin_readoption(
         id,
         phase,
         load_steps: 0,
+        apply_steps: 0,
       }
     }
   };
@@ -23553,7 +23638,7 @@ async fn replay_writes(
   let mut replayed: usize = 0;
   for (index, logged) in records.iter().enumerate() {
     if index > 0 {
-      slices.unit_done().await;
+      slices.unit_done("a logged write replayed").await;
     }
     let record = match logged {
       crate::write_log::Logged::Write(record) => record,
