@@ -65155,6 +65155,23 @@ GAPS.
   - Debug, after: `stage.recording` is 1.3 ms in add and copy and out of move's six longest spans (5.2-5.5 ms before).
     The leaders, publication aside: `stage.check` 3.7-3.9 ms and `landing.changeset` 2.3-2.4 ms in all three, then
     move's `stage.build` 2.0.
+  **A revision's record encoded a part at a time** (`slates_svn::commit::record::RevisionEncoding`). `stage.check`
+  named (debug): its first step encoded the revision's record whole (`Record::revision_bytes`): 1.22-1.28 MB, its
+  9,000 rows, at 3.8 ms. `check_begin` was 2-3 µs, and no check step reached 0.5 ms. The record was reserved at its
+  exact length by a walk of every row (`revision_len`), then written whole (`put_revision`).
+  - Now `RevisionEncoding` measures the length an entry a unit and reserves it once, never grown (A-742's rule). It
+    then writes the entries in the record's order an entry a unit, each list's count as the list begins, a content's
+    bytes a copy slice a unit.
+  - `revision_bytes` is the same encoder run to its end; `revision_len` and `put_revision` go.
+  - The check encodes the record first, a slice of the shard's budget a step, contents a copy slice a unit
+    (`staging::encoded_in`), then begins its checks.
+  - Counter: `staging::RECORD_ENCODE_STEPS`; `t_c2c` holds the encoding to more than two steps, red at one with it
+    whole.
+  - Test `a_revisions_record_written_a_unit_a_step_is_its_record`: the tests' revision written a unit a step, contents
+    two bytes a unit. It gives the hand-written layout's bytes, reserved once at its length.
+  - Debug, after: `stage.check` is out of the six longest spans of all three wide tests (3.7-3.9 ms before). The
+    leaders now, publication aside: `stage.canonical` 5.4-5.5 ms, `landing.prepare` 3.8 and `parse` 3.6-3.8, at a
+    load at which the publication read 17-32 ms.
   - Left: a replay's plan is still a pass over the entry in one unit, as is the scan of the runs, linear in them. Both
     are owed their slicing by §3.
 
