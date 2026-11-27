@@ -6614,10 +6614,19 @@
 > `write_wait` (svnsync not reading while it commits into its mirror), 14.6 of `read_wait`, 3.42 waiting for pieces
 > through the node's store, 1.60 for a poll after a yield and 0.54 answering: the server's share is about 5.6 ms. The
 > 28.4 pieces fetched a revision (28.1 over HTTP) were a reader fetching a piece again each turn, fixed (A-876). The
-> sync's 34.2 GB `content.purged_bytes` is the idle sweep giving back the shard's dead recovery memory a slice a tick
-> (A-117, A-226), which an svn read leaves idle, not memory the sync used. Owed: main's rerun after A-876, expected
-> to show under 10 pieces a revision and about 1 ms of fetch waits; and naming the 94k polls of 65 to 131 µs on the
-> svn:// leg (about 8.5 s of the shard's CPU, more than its answers' 1.08 s).
+> sync's 34.2 GB `content.purged_bytes` is unnamed. It is not only dead recovery memory, as this line said before:
+> the counter adds each idle step's purge of the content arena's free pages to the dead recovery memory returned and
+> the emptied write log (`daemon::purge_if_idle`), and 34.2 GB from a daemon that peaked at 1.6 GB is pages purged
+> more than once. The status report now splits it: `content.purged_arena_bytes`, `recovery.returned_bytes`,
+> `write_log.purged_bytes`, with the arena's allocations the sweep saw (`content.allocations_seen`). Measured at a small
+> scale (w-svn, 2026-11-27, debug, stock svnsync 1.15 over a local history of 300 revisions, three 8 KiB files changed
+> each, a 10 MB dump; `an_svnsync_measured`): the sync added 10 idle ticks over svn:// and 12 over HTTP (0.03 and 0.04
+> a revision), 11.9 MB of arena pages purged over each (the import's freed texts, once), 98 and 131 KB of recovery,
+> no write log and no arena allocation, 6.0 pieces fetched a revision and 84 answers. So a read verb's
+> fetch-free-purge-fault cycle is not there at this scale, and the short polls are not idle steps. Owed: main's rerun
+> after A-876, expected to show under 10 pieces a revision and about 1 ms of fetch waits, now reading the split
+> counters; and naming the 94k polls of 65 to 131 µs on the svn:// leg (about 8.5 s of the shard's CPU, more than its
+> answers' 1.08 s), which at 84 answers a revision are likely the conversation's own polls.
 > **svn:// update (P6), recorded (w-svnperf, 2026-11-23):** goal 93's "svn:// update 5.6 s against run 8's 2.7 s"
 > is w-bugs' run 13 (`diag-w-bugs-svnfetch-13`, base 2d3f218cb, GitHub's macOS runner, git-1000) against run 8 (base
 > 1d7a60e1d), one run each. Run 13 spent 1.71 s of its update in 142,705 window units, which w-perf's per-reader

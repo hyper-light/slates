@@ -6247,6 +6247,10 @@ fn purge_write_log_timed(
     _ => crate::write_log::Purged::default(),
   };
   learn_give_back_rate(s, purged.walked, spent_since(started, cpu()));
+  s.count(
+    WRITE_LOG_PURGED,
+    u64::try_from(purged.bytes).unwrap_or(u64::MAX),
+  );
   (purged.bytes, purged.more)
 }
 
@@ -6582,6 +6586,10 @@ async fn purge_if_idle() -> GiveBack {
     let step = state::with_state(|s| {
       let allocations = s.store.content.arena().allocations();
       let idle = allocations == s.purge_seen_allocations;
+      s.count(
+        CONTENT_ALLOCATIONS_SEEN,
+        allocations.saturating_sub(s.purge_seen_allocations),
+      );
       s.purge_seen_allocations = allocations;
       if !idle {
         s.count(TICKS_BUSY, 1);
@@ -6599,6 +6607,10 @@ async fn purge_if_idle() -> GiveBack {
       };
       let bytes = purged.bytes.saturating_add(log);
       s.count(CONTENT_PURGED, u64::try_from(bytes).unwrap_or(u64::MAX));
+      s.count(
+        CONTENT_PURGED_ARENA,
+        u64::try_from(purged.bytes).unwrap_or(u64::MAX),
+      );
       s.count(
         CONTENT_PURGE_KEPT_SHORT,
         u64::try_from(purged.kept_short).unwrap_or(u64::MAX),
@@ -6659,6 +6671,16 @@ pub const TICKS_DEFERRED: &str = "content.ticks.deferred";
 pub const TICKS_BUSY: &str = "content.ticks.busy";
 /// Counter: purge steps that found the shard idle, so the purge ran (A-105).
 pub const TICKS_IDLE: &str = "content.ticks.idle";
+/// Counter: of [`CONTENT_PURGED`], the content arena's free pages an idle step purged (A-105), apart from the dead
+/// recovery memory ([`RECOVERY_RETURNED`]) and the emptied write log ([`WRITE_LOG_PURGED`]) it counts too (goal 93 P7:
+/// svnsync's 34.2 GB of `content.purged_bytes` named by kind). Format: a counter name in the status report.
+pub const CONTENT_PURGED_ARENA: &str = "content.purged_arena_bytes";
+/// Counter: of [`CONTENT_PURGED`], the emptied write log's pages an idle step gave back
+/// (`crate::write_log::WriteLog::purge`). Format: a counter name in the status report.
+pub const WRITE_LOG_PURGED: &str = "write_log.purged_bytes";
+/// Counter: the content arena's allocations the idle sweep saw made since its look before, each of its steps busy or
+/// idle: what a purge of free pages may be refilled by (goal 93 P7). Format: a counter name in the status report.
+pub const CONTENT_ALLOCATIONS_SEEN: &str = "content.allocations_seen";
 
 /// The pressure hold across a daemon's shards (§4.2, admission.md §5.5), from the host's free memory at the daemon's
 /// first sample (`baseline`) and now (`available`), the daemon's own resident growth since then (`own_growth`), and its
