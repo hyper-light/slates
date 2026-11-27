@@ -147,7 +147,10 @@ fn view_of(green: Green, increment: &slates_merge::engine::Increment) -> (Green,
         })
         .unwrap();
       let mut release = lineage.retire(fork).unwrap();
-      while !lineage.release_step(&mut release).unwrap() {}
+      while !lineage
+        .release_step(&mut release, &mut slates_merge::reaped::Reaped::default())
+        .unwrap()
+      {}
       Some(viewed)
     }
     _ => None,

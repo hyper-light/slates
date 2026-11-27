@@ -41,7 +41,7 @@ pub(crate) struct ChainRoom {
   bytes: Vec<u8>,
   /// Each delta above the root, lowest first: its range in `bytes`, with the length of the text it makes.
   deltas: Vec<(core::ops::Range<usize>, u64)>,
-  /// The text the chain makes, as pieces in its order ([`Chain::fold`]).
+  /// The text the chain makes, as pieces in its order (`Chain::fold`).
   pieces: Vec<Piece>,
   /// The pieces a fold step makes, before they take the list's place.
   folding: Vec<Piece>,

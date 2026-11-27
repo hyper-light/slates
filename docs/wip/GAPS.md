@@ -362,15 +362,24 @@
 >     14), are owed again at a warm start to every candidate, and are persisted before they ship. Red first, made
 >     deterministic (a holds its parts off the old holder). "held 1" is measured: every newcomer position at or above
 >     a's restarted hold start.
->   - **OPEN, A-921's second mode's (2) (w-shared, next):** after a's warm restart its merge plane ships no pending
->     version again (v2 acked [a] and shipped once, v3 on none, nothing to the newcomer), so the push still never lands
->     (3 of 3 refused in the deterministic red). Fix by the same rule: a warm start's pending versions owed again, their
->     shipment state rebuilt from their recorded acks; its fix asserts the push in that red.
->   - **OPEN, found 2026-11-26 (w-shared):** `a921_a_warm_restarted_node_never_names_a_false_death_victim_its_old_volumes_owner`
->     fails 3 of 3 on main past 03c736286 (green when A-921 part 2 landed): the warm-restarted stranger's direct route
->     names a (`named a true`, claims 0), while its status is served. It fails alike with A-921 part 3's runtime changes
->     turned off, so it is not that change: something on main since moved the creator skip's case. Owner: w-shared,
->     after (2).
+>   - **FIXED, A-921's second mode's (2) (A-921 part 4, w-shared, 2026-11-27):** a's replay re-derived the green's
+>     pending v2 with a checkpoint floor of 0 where the old holder held 1, refused `ConflictingPosition` (19 a run, then
+>     uncounted on the merge path) so v2 never placed and every push was refused. A holder now joins a record differing
+>     only in its owner's floors (each by its greater) and acknowledges it. And a replica store made before the missed
+>     part arrived refused every build `Missing` (94 a run): after a refused build, the store is made again from every
+>     part held. Red first: the push lands, 5 of 5. Every silent exit of the merge plane's ship and hold is now counted.
+>   - **OPEN, A-921's next (w-shared, after the false-death regression):** 3 of 10 owner-restart scenes, a survivor
+>     adopted a's green with a candidate's death though a lives and its fencing epoch never moved; a's records were
+>     then refused `Unauthorized` (89 to 386 a run) and its repository's `main` left a. The owed-part scene forms afresh
+>     where it happens (`adopted_elsewhere_of`); A919's owner-restart test stays ignored for it. Not yet understood.
+>   - **KNOWN LIMIT (main 01a20182's ruling of 2026-11-27): a forward's first try may go to a readmitted creator.**
+>     A readmission drops the host's completed takeover (`RegionalConfiguration::admit`, A-309) and its retirement is
+>     gone once that completes, so A-921 part 2's creator skip has nothing to read for it: a node that has not yet
+>     learned an object's adopter offers the readmitted creator first. It costs a redirect, never a wrong answer. The
+>     warm-restart scene (`a921_a_warm_restarted_node_serves_a_false_death_victims_old_volume`) asserts the status
+>     served and records the naming (3 of 3 named a on main past 03c736286; no regression: the order of a's eligibility
+>     and the restarted node's routing). Closing it needs a fact kept past A-309's removal (the creator's id counter at
+>     its readmission, or a record for this use only): a design change of its own.
 >   - **FIXED, its prerequisite (A-925):** each node announces its own edges (git HTTP or HTTPS, SSH) to its peers over
 >     stream 33, as a client reaches them, held only from its own authenticated session; an owner of no learned edge is
 >     the typed refusal naming its member id.
@@ -851,9 +860,16 @@
 > ms of the op's 4.29 (debug), and the cost was the identity's hash of the whole op (4.92 ms), which hashes each entry as
 > its digest since 13c. The log write's about 48 bytes a path stays, for a wider probe to judge. Release probe 17's
 > move leader was the test's own setup (the simulated host's copy of the dump), which now holds the dump moved in, never copied; the
-> product's create and begin print apart (`SETUP`). Next: copy's release unit (an allocator's batch of freed pages
-> returned in one free, 1.2-1.3 ms of system time in release), to a reaper thread by main's ruling, then move's
-> `stage.committing` and `landing.apply`. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
+> product's create and begin print apart (`SETUP`). Copy's release unit was an allocator's batch of freed pages returned
+> in one free (1.2-1.3 ms of system time in release); since the reaper, what a release frees is dropped on the daemon's
+> reaper thread (25 µs the longest unit, debug), owed probe 18's release read. The shard's handed and in-place counts are
+> read by the tests alone, not yet the status report. Move's `stage.committing` was the commit's node moves, a walk of
+> every effect in one unit (7.99 ms debug), which walks nothing since where no node has a link; a green with a link
+> anywhere still walks every effect whole there, its slicing next by main's ruling. `landing.apply`'s remaining unit
+> was its begin's plan of a replay's reads (4.46 ms debug), made since only where a run is unread; a replay's plan and
+> the scan of the runs are still one unit each, owed their slicing. Next: the node moves sliced; then by size
+> `stage.judging` (5.8 ms debug, move), `stage.recording` (5.0-5.3) and `stage.check` (3.8-4.2); the landing's
+> publication (9.3-24.8 ms since today's merges) is A-930's image cut, w-perf's. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's

@@ -473,6 +473,7 @@ const CHUNK_HASHED: usize = 1;
 /// The pace kind of one chunk of a checkpoint's encoding copied into its content store stage ([`CheckpointHold::step`]).
 const CHUNK_STAGED: usize = 2;
 /// The pace kind of one copied key read for a checkpoint's build ([`CheckpointHold::step`], A-920 8a).
+/// Shape: its index among the pace kinds.
 const CHECKPOINT_KEY: usize = 3;
 /// The pace kinds a checkpoint's work is measured in: [`IDENTITY_KEY`], [`CHUNK_HASHED`], [`CHUNK_STAGED`],
 /// [`CHECKPOINT_KEY`].
@@ -938,7 +939,7 @@ pub(crate) const CHECKPOINT_IDENTITY_STEPS: &str = "merge.checkpoint.identity_st
 /// of [`CheckpointHold::step`]: more than one for a checkpoint is the hold spread over turns.
 pub(crate) const CHECKPOINT_HOLD_STEPS: &str = "merge.checkpoint.hold_steps";
 
-/// How many units a checkpoint hold's paced step takes where a test pins it ([`HOLD_UNITS_A_STEP`]); none in the
+/// How many units a checkpoint hold's paced step takes where a test pins it (`HOLD_UNITS_A_STEP`); none in the
 /// product, where the step's quantum decides (`slates_pace::Step::more`).
 fn hold_units_a_step() -> Option<u32> {
   #[cfg(test)]
@@ -2472,6 +2473,33 @@ const CORRUPTION_MASK: u8 = 0xff;
 /// Counted each pass a version's record waits for its submitting work's catalog record to commit (A-255).
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const RECORD_AWAITS_WORK_CATALOG: &str = "merge.record.awaits_work_catalog";
+
+/// Counter: a version's record shipment with no session free to any of its targets this pass, so none was sent.
+/// Format: a counter name in the daemon's status report.
+pub(crate) const RECORD_SHIP_NO_SESSION: &str = "merge.record.ship_no_session";
+
+/// Counter: a merge record a holder answered nothing for, its green refused on this holder for good (a recomputation
+/// mismatch, D-27). Format: a counter name in the daemon's status report.
+pub(crate) const RECORD_GREEN_REFUSED: &str = "merge.record.green_refused";
+
+/// Counter: a merge record a holder answered nothing for, having no standing to judge it from (`record_standing`).
+/// Format: a counter name in the daemon's status report.
+pub(crate) const RECORD_NO_STANDING: &str = "merge.record.no_standing";
+
+/// Counter: a version's record shipments sent to their targets. Format: a counter name in the daemon's status report.
+pub(crate) const RECORD_SHIPPED: &str = "merge.record.shipped";
+
+/// Counter: the acknowledgements a version's record shipments gathered, the owner's own among them. Format: a counter name
+/// in the daemon's status report.
+pub(crate) const RECORD_SHIP_ACKS: &str = "merge.record.ship_acks";
+
+/// Counter: a pass over a green with versions pending that shipped none of them because the green's catalog register is
+/// not committed (AUD-29-17). Format: a counter name in the daemon's status report.
+pub(crate) const GREEN_AWAITS_CATALOG: &str = "merge.green.awaits_catalog";
+
+/// Counter: a pass over a green with versions pending that shipped none of them because its version 0's inputs are not
+/// made yet (A-286). Format: a counter name in the daemon's status report.
+pub(crate) const GREEN_AWAITS_ORIGIN: &str = "merge.green.awaits_origin";
 /// Format: a merge record's magic, "GMRC" little-endian, after the register's class byte: an unversioned record an
 /// earlier layout wrote begins with its version number, whose low word is the magic only at version 1,129,467,207.
 const RECORD_MAGIC: u32 = u32::from_le_bytes(*b"GMRC");
@@ -3174,11 +3202,10 @@ pub(crate) fn hold_increment(
 /// step of its landing's entry): the encoding's chunks hashed into the inputs archive's manifest a copy slice a unit
 /// (A-920 7c: a chunk a unit, up to 1 MiB, was 10.4 ms of one step, debug), then its
 /// stage opened in the content store under the green's object, the chunks copied in a chunk a unit
-/// (`stage_lent_piece`, [`hold_lent`]'s piece at a time), and the stage completed. The same identity, charges and
+/// (`stage_lent_piece`, `hold_lent`'s piece at a time), and the stage completed. The same identity, charges and
 /// refusals as [`hold_increment`]; dropped part-way, it leaves only its stage, which the next hold of the green's object
 /// gives way to.
 ///
-/// [`hold_lent`]: slates_cluster::content::ContentStore::hold_lent
 pub(crate) struct IncrementHold {
   /// The green.
   green: DbVolumeId,
@@ -3963,11 +3990,13 @@ pub(crate) fn next_merge_work(
     // The green's catalog register first (AUD-29-17): a successor that adopted a merge record and no catalog could
     // not say who may use the green, so no record ships before the catalog's current version is committed.
     if !crate::fleet::catalog_committed(state, DbVolumeId { bytes: object.0 }, local) {
+      state.count(GREEN_AWAITS_CATALOG, 1);
       continue;
     }
     // Nothing of a green ships while its version 0's inputs are not made (A-286): a holder takes its records in
     // version order, so a later one shipped first would only be refused.
     if crate::merge_origin::inputs_pending(state, object) {
+      state.count(GREEN_AWAITS_ORIGIN, 1);
       continue;
     }
     let placement = config.place(object);
@@ -4507,6 +4536,7 @@ async fn ship_record(
 ) -> Option<Dispatch> {
   let holders = take_sessions("fleet.lent_to.ship_record", |host| targets.contains(&host));
   if holders.is_empty() {
+    let _ = crate::state::with_state_counted(|s| s.count(RECORD_SHIP_NO_SESSION, 1));
     return None;
   }
   let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
@@ -4544,6 +4574,13 @@ async fn ship_record(
   };
   let answers = committed.answers;
   crate::xshard::run_on_counted(origin, shard, move |s| {
+    s.count(RECORD_SHIPPED, 1);
+    if let Some(placement) = placement.as_ref() {
+      s.count(
+        RECORD_SHIP_ACKS,
+        u64::try_from(placement.acked.len()).unwrap_or(u64::MAX),
+      );
+    }
     if let Some(placement) = placement {
       record_merge_acks_in(s, local, object, version, placement, quorum, period);
     }
@@ -5315,7 +5352,41 @@ fn replaces_held_value(state: &ShardState, record: &Record) -> bool {
     .holder_records
     .get(&record.object)
     .and_then(|acceptor| acceptor.value_at(record.object, record.sequence))
-    .is_some_and(|held| held != record.value.as_slice())
+    .is_some_and(|held| replaces(held, &record.value))
+}
+
+/// Whether `sent` replaces `held` at one position: a different value, and not the same version's record re-derived with
+/// other floors ([`joined_floors`]), which joins it instead of replacing it.
+pub(crate) fn replaces(held: &[u8], sent: &[u8]) -> bool {
+  held != sent && joined_floors(held, sent).is_none()
+}
+
+/// Joins two merge records of one version that differ only in the owner's own state when each was made (A-921's second
+/// mode (2), main 01a20182's ruling of 2026-11-27; `slates_db::register::Acceptor::accept_merged`): its checkpoint floor
+/// and its fold floor, each the newest the owner knew then, which a holder already takes monotonically
+/// ([`checkpoint_replica`] keeps a checkpoint below a held one, [`fold_replica`] folds no lower), so each is joined by its
+/// greater. An owner restarted warm re-derives a pending version's record from its replay, and knows no committed floor
+/// yet: its v2 shipped with floor 0 where the holder held floor 1, refused `ConflictingPosition` for good, so the version
+/// never placed and every push stayed refused. Every other field is the version's own content (increment, base, inputs,
+/// head identity, evidence, completion, signature) or its catalog's facts, compared whole: `None` where any differs, or
+/// where either is no merge record, another proposal.
+pub(crate) fn joined_floors(held: &[u8], sent: &[u8]) -> Option<Vec<u8>> {
+  let held = MergeRecordValue::from_record_bytes(held)?;
+  let sent = MergeRecordValue::from_record_bytes(sent)?;
+  let content = |value: &MergeRecordValue| MergeRecordValue {
+    checkpoint_floor: 0,
+    folded_below: 0,
+    ..value.clone()
+  };
+  if content(&held) != content(&sent) {
+    return None;
+  }
+  let joined = MergeRecordValue {
+    checkpoint_floor: held.checkpoint_floor.max(sent.checkpoint_floor),
+    folded_below: held.folded_below.max(sent.folded_below),
+    ..held
+  };
+  Some(joined.to_record_bytes())
 }
 
 /// Holds `record`, a green's merge record, in this holder's register before its inputs and its recomputation when it
@@ -5359,10 +5430,12 @@ pub(crate) fn accept_merge_record(
   record: &Record,
 ) -> Vec<u8> {
   if let Err(error) = crate::fleet::check_held_record(state, local, peer_host, record) {
+    crate::fleet::count_record_refusal(state, record, &error);
     return slates_db::register::encode_refusal(&error);
   }
   let object = record.object;
   if state.merge.refused.contains(&object) {
+    state.count(RECORD_GREEN_REFUSED, 1);
     return Vec::new();
   }
   if state.merge.fault.refuse_records {
@@ -5385,7 +5458,10 @@ pub(crate) fn accept_merge_record(
   // it replaces; the record is then served as the replica's next version (A-373).
   hold_replacing_record(state, local, peer_host, record);
   match record_standing(state, object, value.version, peer_host) {
-    None => return Vec::new(),
+    None => {
+      state.count(RECORD_NO_STANDING, 1);
+      return Vec::new();
+    }
     // A version this replica already applied: re-acknowledge from the acceptor (idempotent).
     Some(RecordStanding::Applied) => {
       return crate::fleet::accept_held_record(state, local, peer_host, record);
@@ -6252,6 +6328,55 @@ mod tests {
       folded_below: 2,
       checkpoint_floor: 1,
     }
+  }
+
+  /// A-921's second mode (2) (main 01a20182's ruling of 2026-11-27): a version's record re-derived by its owner after a
+  /// warm restart joins the one a holder holds where only the owner's floors differ. Do: join records of one version
+  /// differing in their checkpoint floor, then in their fold floor, then in a content field (the head identity), and one
+  /// with a value that is no merge record. Expect: the floors joined by their greater, the rest the held record's; the
+  /// identity's difference another proposal, as is a value that is not a merge record; and neither joined value said to
+  /// replace the held one, while the other proposal does.
+  #[test]
+  fn a_versions_record_with_other_floors_joins_the_held_one_and_other_content_does_not() {
+    let held = MergeRecordValue {
+      checkpoint_floor: 1,
+      folded_below: 3,
+      ..value()
+    };
+    let restarted = MergeRecordValue {
+      checkpoint_floor: 0,
+      folded_below: 4,
+      ..held.clone()
+    };
+    let joined = joined_floors(&held.to_record_bytes(), &restarted.to_record_bytes())
+      .and_then(|bytes| MergeRecordValue::from_record_bytes(&bytes));
+    let expected = MergeRecordValue {
+      checkpoint_floor: 1,
+      folded_below: 4,
+      ..held.clone()
+    };
+    assert_eq!(
+      joined,
+      Some(expected),
+      "each floor its greater, the rest the held record's"
+    );
+    assert!(!replaces(
+      &held.to_record_bytes(),
+      &restarted.to_record_bytes()
+    ));
+    let other = MergeRecordValue {
+      identity: [9; 32],
+      ..held.clone()
+    };
+    assert_eq!(
+      joined_floors(&held.to_record_bytes(), &other.to_record_bytes()),
+      None
+    );
+    assert!(replaces(&held.to_record_bytes(), &other.to_record_bytes()));
+    assert_eq!(
+      joined_floors(&held.to_record_bytes(), b"no merge record"),
+      None
+    );
   }
 
   /// A merge record's value encodes deterministically and round-trips exactly.

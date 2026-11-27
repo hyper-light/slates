@@ -1741,11 +1741,7 @@ fn a_readopted_green_brings_back_the_texts_its_checkpoint_names_first() {
       }
     });
     if let Some((lineage, Ok(mut release))) = state.greens.retire(&green) {
-      while state
-        .greens
-        .release_step(lineage, &mut release)
-        .is_ok_and(|more| more)
-      {}
+      state.greens.release_whole(lineage, &mut release);
     }
     state.greens.remove(&green);
     state.merge.awaiting_adoption.insert(

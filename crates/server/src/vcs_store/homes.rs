@@ -2708,7 +2708,7 @@ pub(crate) enum Resolution {
 
 /// Answers a resolution of `attempt`'s hold of `identity` on this node (A-727 (d1a-3)): on the shard the attempt's
 /// repository's id routes to (its partition, `slates_db::catalog::RepositoryId::partition`), from the repository's
-/// records, a slice of them a turn ([`records_name`]). Asked from shard `origin` of `shards`.
+/// records, a slice of them a turn (`records_name`). Asked from shard `origin` of `shards`.
 async fn answer_resolve(
   origin: u16,
   shards: &[u16],

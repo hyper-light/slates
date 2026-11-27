@@ -654,7 +654,9 @@ impl HeldSegment {
   ) -> Result<slates_store::log::Located, slates_store::owner::OwnerError> {
     use slates_store::store::PIECE_BYTES;
     let mut header = self.header;
-    header.sections = 3;
+    /// Format: a segment's sections: its record, its payload and its texts.
+    const SEGMENT_SECTIONS: u16 = 3;
+    header.sections = SEGMENT_SECTIONS;
     let mut open = self.disk.begin(header).await?;
     let mut buffer = Vec::with_capacity(PIECE_BYTES);
     for (kind, (identity, len)) in self.sections() {

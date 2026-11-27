@@ -53,6 +53,13 @@ pub(crate) const EDGES_RECORD_BYTES: usize = 1 + 8 + 2 * (1 + EDGE_BYTES);
 /// Format: the one-byte answer a node that held a record gives (an older peer answers empty).
 const HELD: u8 = 1;
 
+/// Format: [`Scheme::Http`]'s byte on the wire.
+const SCHEME_HTTP: u8 = 1;
+/// Format: [`Scheme::Https`]'s byte on the wire.
+const SCHEME_HTTPS: u8 = 2;
+/// Format: [`Scheme::Ssh`]'s byte on the wire.
+const SCHEME_SSH: u8 = 3;
+
 /// An edge's scheme: how a client reaches it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Scheme {
@@ -68,18 +75,18 @@ impl Scheme {
   /// Format: the scheme's byte on the wire.
   fn byte(self) -> u8 {
     match self {
-      Scheme::Http => 1,
-      Scheme::Https => 2,
-      Scheme::Ssh => 3,
+      Scheme::Http => SCHEME_HTTP,
+      Scheme::Https => SCHEME_HTTPS,
+      Scheme::Ssh => SCHEME_SSH,
     }
   }
 
   /// The scheme of a byte, or the typed refusal.
   fn of(byte: u8) -> Result<Scheme, EdgesRefused> {
     match byte {
-      1 => Ok(Scheme::Http),
-      2 => Ok(Scheme::Https),
-      3 => Ok(Scheme::Ssh),
+      SCHEME_HTTP => Ok(Scheme::Http),
+      SCHEME_HTTPS => Ok(Scheme::Https),
+      SCHEME_SSH => Ok(Scheme::Ssh),
       other => Err(EdgesRefused::Scheme { byte: other }),
     }
   }
@@ -169,7 +176,7 @@ fn reachable_host(host: &str) -> bool {
     && host.len() <= HOST_BYTES
     && host.bytes().all(|byte| byte.is_ascii_graphic())
     && host
-      .parse::<std::net::IpAddr>()
+      .parse::<core::net::IpAddr>()
       .map_or(true, |address| !address.is_unspecified())
 }
 
@@ -206,7 +213,7 @@ impl EdgesRecord {
       return Err(EdgesRefused::Version { version });
     }
     let (anchor, after) = rest
-      .split_first_chunk::<8>()
+      .split_first_chunk::<{ core::mem::size_of::<u64>() }>()
       .ok_or(EdgesRefused::Truncated)?;
     rest = after;
     let anchor = HostId(u64::from_le_bytes(*anchor));

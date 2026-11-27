@@ -2007,7 +2007,10 @@ impl Oracle {
           })
           .map_err(failed)?;
         let mut release = lineage.retire(fork).map_err(failed)?;
-        while !lineage.release_step(&mut release).map_err(failed)? {}
+        while !lineage
+          .release_step(&mut release, &mut crate::reaped::Reaped::default())
+          .map_err(failed)?
+        {}
         Some(viewed)
       }
       _ => None,

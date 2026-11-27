@@ -235,9 +235,16 @@ impl StateLogs {
       .unwrap_or(u64::MAX);
     let kept = log.parts.split_off(&held_everywhere.saturating_add(1));
     let released: usize = log.parts.values().map(Vec::len).sum();
-    self
-      .changed
-      .extend(log.parts.keys().map(|position| (register, *position)));
+    // A part let go while it is still marked changed was held after the last committed publication, so none carried it:
+    // its mark goes, and the next delta neither puts nor removes it. One a publication carried (or an image restored) is
+    // marked, so the next delta removes its piece. At f = 0 every part is held and let go in one take, so nothing is ever
+    // marked (main 01a20182's ruling of 2026-11-27: before, each kept a key until a publication committed).
+    for position in log.parts.keys() {
+      let key = (register, *position);
+      if !self.changed.remove(&key) {
+        self.changed.insert(key);
+      }
+    }
     log.parts = kept;
     self.bytes = self.bytes.saturating_sub(released);
     if log.parts.is_empty() {

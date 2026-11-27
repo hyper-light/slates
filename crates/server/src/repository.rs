@@ -1634,14 +1634,19 @@ pub(crate) const RETIRE_REFUSED: &str = "repository.retire_refused";
 
 /// Gives the retired members' queued holds back a node a unit, in the shard's slices (`crate::image::sliced`), and
 /// ends once nothing is owed; a slice whose lineage has a member taken out yields and tries again.
+///
+/// What a slice's units free goes to the daemon's reaper at the slice's end ([`crate::reaper::reap`], A-920).
 pub(crate) async fn run_releases() {
   loop {
     let progress = crate::state::with_state(|s| {
-      crate::image::sliced(s, |s| match s.greens.release_unit() {
+      let mut reaped = slates_merge::reaped::Reaped::default();
+      let sliced = crate::image::sliced(s, |s| match s.greens.release_unit(&mut reaped) {
         ReleaseProgress::More => Ok(None),
         ReleaseProgress::Done => Ok(Some(true)),
         ReleaseProgress::Blocked => Ok(Some(false)),
-      })
+      });
+      crate::reaper::reap(reaped);
+      sliced
     });
     match progress {
       Some(Ok(None | Some(false))) => slates_rt::futures::yield_now().await,
@@ -2426,7 +2431,9 @@ mod tests {
         assert_eq!(state.greens.releases_owed(), 1);
         loop {
           let before = state.greens.lineage_nodes(repo).expect("its lineage");
-          let progress = state.greens.release_unit();
+          let progress = state
+            .greens
+            .release_unit(&mut slates_merge::reaped::Reaped::default());
           let after = state.greens.lineage_nodes(repo).expect("its lineage");
           assert!(before - after <= 1, "a unit freed more than one node");
           if progress == ReleaseProgress::Done {

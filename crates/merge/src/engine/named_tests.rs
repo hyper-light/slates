@@ -1702,3 +1702,47 @@ fn a_replays_choice_of_runs_is_linear_in_a_pushs_files() {
     "{took} ns past {REPLAY_CHOICE_NS} for {REPLAY_RUNS} files"
   );
 }
+
+/// A plane holding every run `work` names, each its run's length of bytes.
+fn plane_of(work: &Increment) -> Plane {
+  let mut objects = BTreeMap::new();
+  for run in &work.named.runs {
+    objects.insert(
+      run.identity.hash,
+      vec![7u8; usize::try_from(run.len).unwrap()],
+    );
+  }
+  Plane {
+    objects,
+    reads: Cell::new(0),
+    largest: Cell::new(0),
+  }
+}
+
+/// A-920 (an apply begun over runs all read plans no replay's reads). Do: begin applying a push's entry of
+/// [`REPLAY_RUNS`] files, each whole of a run of its own, once with every run read, as a landing reads them all before
+/// its apply begins, then with none read, as a recovery's replay begins. Expect: both begun; no plan of the replay's
+/// reads made for the first (`Green::replay_plans`), one for the second, which reads no run of an entry naming each
+/// whole. Before, every begin planned it, a pass over every effect and run: 4.46 ms of one step at 9,000 files (debug),
+/// answering that none was unread.
+#[test]
+fn an_apply_begun_with_every_run_read_plans_no_replays_reads() {
+  let (mut read, applied) = pushed_whole(REPLAY_RUNS);
+  let plane = plane_of(&read);
+  while !read.read_step(&plane, 1 << 20).unwrap() {}
+  let mut green = Green::new();
+  let begun = green.begin_applying(&mut read, &applied);
+  assert!(
+    matches!(begun, super::Begun::Applying(_)),
+    "read: not begun"
+  );
+  assert_eq!(green.replay_plans(), 0, "plans with every run read");
+  let (mut unread, applied) = pushed_whole(REPLAY_RUNS);
+  let mut replaying = Green::new();
+  let replayed = replaying.begin_applying(&mut unread, &applied);
+  assert!(
+    matches!(replayed, super::Begun::Applying(_)),
+    "unread: not begun"
+  );
+  assert_eq!(replaying.replay_plans(), 1, "plans with no run read");
+}

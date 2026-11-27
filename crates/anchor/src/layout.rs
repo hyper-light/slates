@@ -287,6 +287,7 @@ pub const RING_BYTES: usize = 64;
 /// raised, page-stepped, before the write that passes it, and falls after a give-back, so a successor walks and gives
 /// back what was written, never a region whole. A segment made before them reads zero here: every region whole until
 /// its daemon adopts it.
+/// Format: an offset in the log ring's header, in bytes.
 pub const RING_MARKS_VERSION: usize = 32;
 /// Format: the log ring's mark's offset ([`RING_MARKS_VERSION`]).
 pub const RING_MARK_RING: usize = 40;
