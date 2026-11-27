@@ -64878,6 +64878,21 @@ GAPS.
     a text put and a row.
   - In debug the walk is now the step's: the add test's longest poll is the register's op (`landing.record`, 19.2
     ms in one run), already on file as owed.
+  **Main's partial probe 14** (4 runs a test in release at 3e98db372, 11a alone, under another session's load). Move
+  was led by `stage.reserving` at 1.82-2.62 ms, against `landing.tail_end`'s 3.32 ms p50 in probe 13, so 11a took
+  about 40% off move's longest.
+- **Piece 12, the staging's reserve.** **12a, the copy entry room from the copy ops alone.** Named before the change
+  (debug, move's revision 3): `stage.reserving`'s whole step was the reservation's shares, and in them
+  `Green::copy_entry_room` was 11.5 ms. Of that, `Green::resolve` walked all 9,002 ops and 9,002 paths, resolving the
+  whole increment, while `copy_fixes`, the one copy's fix, took 13 µs. A resolution's copies are its copy ops' alone:
+  `declare_copy` makes them, and the resolution's end (`split_copies`) moves other ops into their trees, never a copy.
+  So the room now resolves the copy ops alone (`Green::resolve_op` on each), the same copies and fixes.
+  - Oracle: `the_copy_entry_room_from_the_copy_ops_alone_is_the_whole_resolutions`. A copy from before a change, with
+    edits beneath; a copy of the head; two copies each with a fix, one inside the other's tree; and none. Each gives
+    the room the whole resolution gave.
+  - Planted bug, red: only the first copy op resolved, 44 bytes against 88.
+  - After 12a (debug), the move test's longest poll is `storing`, the storing's begin (`stage_texts`' `storing_of`
+    and `hand_over`, 14.0 ms), already on file.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 

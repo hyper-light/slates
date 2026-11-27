@@ -2811,3 +2811,57 @@ fn a_checkpoint_built_a_unit_at_a_time_across_later_versions_is_the_one_built_wh
     "{units} unit(s) for {keys} copied key(s)"
   );
 }
+
+/// The copy entry room `inc` asks of `green` as it was taken before A-920 12a, the whole increment resolved for its
+/// copies' fixes: the oracle `Green::copy_entry_room` is held to.
+fn copy_entry_room_by_a_whole_resolve(green: &Green, inc: &Increment) -> usize {
+  let resolved = Green::resolve(inc);
+  green
+    .copy_fixes(&resolved)
+    .values()
+    .filter_map(|fix| fix.as_ref().ok().and_then(Option::as_ref))
+    .map(chain_entry::fix_bytes)
+    .fold(0, usize::saturating_add)
+}
+
+/// A-920 12a. Do: over `trunk`, with `trunk/a` changed at version 2, ask the copy entry room of increments based at the
+/// head: a copy of the trunk at version 1 (before the change, so it carries a fix) with a file made and one changed
+/// beneath it; a copy of the head with an edit beneath; two copies of the trunk at version 1, one inside the other's
+/// tree, each with a fix; and no copy. Expect: each the room the whole increment resolved gives, a copy from before the
+/// change a room of its own, and two such copies more than one.
+#[test]
+fn the_copy_entry_room_from_the_copy_ops_alone_is_the_whole_resolutions() {
+  let mut green = trunk();
+  accept(&mut green, Work::default().overwrite("trunk/a", 0, b"A"), 2);
+  let mut older = Work::exclusive();
+  older
+    .copy("trunk", "b", 1)
+    .create("b/new", b"new")
+    .overwrite("b/c", 0, b"G");
+  let mut head = Work::exclusive();
+  head.copy("trunk", "c", 2).overwrite("c/a", 0, b"Z");
+  let mut nested = Work::exclusive();
+  nested.copy("trunk", "d", 1).copy("trunk", "d/e", 1);
+  let mut none = Work::default();
+  none.create("x", b"x");
+  let base = green.head();
+  let rooms: Vec<(usize, usize)> = [older, head, nested, none]
+    .iter()
+    .zip(10u64..)
+    .map(|(work, id)| {
+      let inc = work.at(id, base);
+      (
+        green.copy_entry_room(&inc),
+        copy_entry_room_by_a_whole_resolve(&green, &inc),
+      )
+    })
+    .collect();
+  for (from_copies, whole) in &rooms {
+    assert_eq!(from_copies, whole, "the copy entry rooms: {rooms:?}");
+  }
+  assert!(
+    rooms[0].0 > 0,
+    "the copy from before the change carries no fix: {rooms:?}"
+  );
+  assert_eq!(rooms[3].0, 0, "an increment with no copy asks no room");
+}

@@ -1514,12 +1514,17 @@ impl Green {
   /// histories hold now, never a fixed allowance: the service adds it to `chain_entry::entry_bound` before the verdict.
   /// Nothing for an increment without such a copy.
   pub fn copy_entry_room(&self, inc: &Increment) -> usize {
-    // Most increments declare no copy: they are answered without resolving the document, which the admission and the
-    // change index's reservation would each do once more (A-626 part 3).
-    if !inc.doc.ops.iter().any(|op| op.kind == OpKind::Copy) {
+    // Only the copy ops are resolved (A-920 12a): a resolution's copies are its copy ops' alone (`declare_copy`; the
+    // resolution's end moves other ops into the copies' trees, never a copy), so the copies and their fixes are the
+    // whole resolution's. The whole increment resolved for them was 11.5 ms of the reserve's one step for a move of
+    // 9,002 ops, debug; most increments declare no copy and resolve nothing (A-626 part 3).
+    let mut r = Resolved::default();
+    for op in inc.doc.ops.iter().filter(|op| op.kind == OpKind::Copy) {
+      Green::resolve_op(inc, &mut r, op);
+    }
+    if r.copies.is_empty() {
       return 0;
     }
-    let r = Green::resolve(inc);
     self
       .copy_fixes(&r)
       .values()
