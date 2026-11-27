@@ -5,6 +5,8 @@ name: diag red 4 (hg_import overlap on Windows)
 on:
   push:
     branches: ["diag-measurer-red4-*"]
+env:
+  MERCURIAL_VERSION: "7.2.4" # as ci.yml pins it
 jobs:
   x86_64:
     name: hg_import DIAG-LANDING (windows-latest)
@@ -20,6 +22,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install NASM
         uses: ilammy/setup-nasm@v1.5.2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Red 4's test skips with "no `hg` here" without Mercurial (diag-measurer-red4-1, run 46045562251, skipped on
+      # windows-latest): installed as ci.yml's A-300 step installs it, before the tests.
+      - name: Mercurial for red 4
+        run: |
+          python -m pip install --disable-pip-version-check --no-input "mercurial==$env:MERCURIAL_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "pip could not install Mercurial $env:MERCURIAL_VERSION" }
+          python -c "import sysconfig; print(sysconfig.get_path('scripts'))" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: hg answers
+        shell: bash
+        run: hg --version | head -1
       - name: Build the daemon's unit tests
         run: cargo test -p slates-server --lib --no-run
       - name: Three runs of the hg_import unit tests, printing DIAG-LANDING
@@ -31,6 +46,7 @@ jobs:
             echo "== run $run $(date -u +%T)"
             cargo test -p slates-server --lib -- --test-threads=1 --nocapture vcs_store::hg_import:: 2>&1 | tee red4-$run.log || rc=1
           done
+          if grep -q "SKIPPED an_imports_file_texts_held" red4-*.log; then echo "red 4 SKIPPED: no hg"; rc=1; fi
           echo "== summary"
           grep -h "DIAG-LANDING\|test result\|FAILED\|panicked" red4-*.log | head -600
           exit $rc
@@ -49,6 +65,19 @@ jobs:
         with:
           toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Red 4's test skips with "no `hg` here" without Mercurial (diag-measurer-red4-1, run 46045562251, skipped on
+      # windows-latest): installed as ci.yml's A-300 step installs it, before the tests.
+      - name: Mercurial for red 4
+        run: |
+          python -m pip install --disable-pip-version-check --no-input "mercurial==$env:MERCURIAL_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "pip could not install Mercurial $env:MERCURIAL_VERSION" }
+          python -c "import sysconfig; print(sysconfig.get_path('scripts'))" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: hg answers
+        shell: bash
+        run: hg --version | head -1
       - name: Build the daemon's unit tests
         run: cargo test -p slates-server --lib --no-run
       - name: Three runs of the hg_import unit tests, printing DIAG-LANDING
@@ -60,6 +89,7 @@ jobs:
             echo "== run $run $(date -u +%T)"
             cargo test -p slates-server --lib -- --test-threads=1 --nocapture vcs_store::hg_import:: 2>&1 | tee red4-$run.log || rc=1
           done
+          if grep -q "SKIPPED an_imports_file_texts_held" red4-*.log; then echo "red 4 SKIPPED: no hg"; rc=1; fi
           echo "== summary"
           grep -h "DIAG-LANDING\|test result\|FAILED\|panicked" red4-*.log | head -600
           exit $rc
