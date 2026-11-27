@@ -1267,3 +1267,146 @@ fn a864_a_thin_packs_base_let_go_stops_the_resolution_until_it_is_brought_back()
     "refused once nothing came back"
   );
 }
+
+/// A keeper whose kept objects are read back as a push's quarantine reads them (B1b, goal 93 item 2b): the object at
+/// `missing` read through a let-go window, answering none with its let-go named ([`crate::away`]) until `back`; and the
+/// thin pack's outside base held.
+struct ReadBackAway {
+  /// The objects kept.
+  held: super::Held,
+  /// The thin pack's base outside it.
+  base: (ObjectId, Vec<u8>),
+  /// The object read back through a let-go window.
+  missing: usize,
+  /// Whether that window was brought back.
+  back: std::cell::Cell<bool>,
+  /// The let-go the last read back to answer none met.
+  away: std::cell::Cell<Option<u64>>,
+}
+
+/// Shape: the let-go number [`ReadBackAway`]'s window was given back under.
+const READ_BACK_LET_GO: u64 = 5;
+
+impl Contents for ReadBackAway {
+  fn content(&self, at: usize, id: &ObjectId) -> Option<std::borrow::Cow<'_, [u8]>> {
+    self.away.set(None);
+    if at == self.missing && !self.back.get() {
+      self.away.set(Some(READ_BACK_LET_GO));
+      return None;
+    }
+    self.held.content(at, id)
+  }
+
+  fn content_away(&self) -> Option<u64> {
+    self.away.get()
+  }
+}
+
+impl Keep for ReadBackAway {
+  fn keep(
+    &mut self,
+    at: usize,
+    object: super::Object,
+    hold: crate::Hold,
+    admission: &mut Admission,
+  ) -> Result<(), super::Refusal> {
+    self.held.keep(at, object, hold, admission)
+  }
+
+  fn release(&mut self, hold: crate::Hold, admission: &mut Admission) {
+    self.held.release(hold, admission);
+  }
+}
+
+impl Outside for ReadBackAway {
+  fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+    (*id == self.base.0).then_some((Kind::Blob, self.base.1.as_slice()))
+  }
+}
+
+/// B1b of the landed let-go's lift (main's order of 2026-11-26; w-git's read sweep: unpack's read of an in-pack base
+/// back from the quarantine, `Reader::applied`). Do: read a thin pack of a reference delta on a blob held outside it,
+/// then an offset delta on that delta, the first delta's object read back through a let-go window while the second
+/// resolves on it; resolve a turn; bring the window back and resolve again; then the same pack with the window never
+/// brought back, resolved twice. Expect: the first turn stops, the second delta unresolved and nothing refused; the
+/// next resolves it to its object; never brought back, the second turn refuses, so a stop always makes progress or
+/// ends. Red before: refused `DeltaBaseMissing` at once, the read back's miss taken for a base held nowhere.
+#[test]
+fn b1b_a_deltas_in_pack_base_read_back_through_a_let_go_window_stops_the_resolution_until_it_is_back()
+ {
+  let format = ObjectFormat::Sha1;
+  let base = b"a base held outside the pack\n".repeat(8);
+  let middle = [base.as_slice(), b"one line more\n"].concat();
+  let top = [middle.as_slice(), b"and another\n"].concat();
+  let mut builder = Builder::new(format);
+  let first = builder.put(
+    Representation::RefDelta {
+      base: blob_id(format, &base),
+    },
+    &delta_between(&base, &middle),
+  );
+  builder.put(
+    Representation::OfsDelta { base: first },
+    &delta_between(&middle, &top),
+  );
+  let bytes = builder.finish();
+  let index = Placed(vec![]);
+  let mut keep = read_back_away(format, &base);
+  let mut reader = read_back_reader(&bytes, &index, &mut keep);
+  let stopped = read_back_turn(&mut reader, &mut keep);
+  let before = keep.held.objects.get(1).is_some_and(Option::is_some);
+  keep.back.set(true);
+  let resolved = read_back_turn(&mut reader, &mut keep);
+  assert_eq!(
+    (stopped, before),
+    (Ok(false), false),
+    "stopped, the second delta unresolved"
+  );
+  assert_eq!(resolved, Ok(true));
+  assert_eq!(keep.held.take(1).map(|object| object.content), Some(top));
+  let mut never = read_back_away(format, &base);
+  let mut reader = read_back_reader(&bytes, &index, &mut never);
+  assert_eq!(read_back_turn(&mut reader, &mut never), Ok(false));
+  assert!(
+    read_back_turn(&mut reader, &mut never).is_err(),
+    "refused once nothing came back"
+  );
+}
+
+/// A [`ReadBackAway`] over `base`, its first object read back through a let-go window not yet brought back.
+fn read_back_away(format: ObjectFormat, base: &[u8]) -> ReadBackAway {
+  ReadBackAway {
+    held: super::Held::default(),
+    base: (blob_id(format, base), base.to_vec()),
+    missing: 0,
+    back: std::cell::Cell::new(false),
+    away: std::cell::Cell::new(None),
+  }
+}
+
+/// A reader of `bytes` in SHA-1, read whole into `keep`.
+fn read_back_reader<'i>(
+  bytes: &[u8],
+  index: &'i Placed,
+  keep: &mut ReadBackAway,
+) -> Reader<'i, Placed> {
+  let mut reader = Reader::new(ObjectFormat::Sha1, index);
+  reader.read_into(bytes, &mut unbounded(), keep).unwrap();
+  reader
+}
+
+/// One resolution turn of `reader` into `keep`, over a quantum never spent.
+fn read_back_turn(
+  reader: &mut Reader<'_, Placed>,
+  keep: &mut ReadBackAway,
+) -> Result<bool, super::Refusal> {
+  let mut clock = Ticking(0);
+  reader.resolve_turn(
+    &mut unbounded(),
+    keep,
+    crate::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns: u64::MAX,
+    },
+  )
+}

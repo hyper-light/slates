@@ -43,6 +43,29 @@ pub const TIMER_OVERHEAD_FACTOR: u64 = 100;
 /// turns "cannot tell" into "the code's own fault" on exactly the platform that is hardest to reproduce on.
 #[cfg(unix)]
 pub fn involuntary_switches() -> Option<u64> {
+  Some(u64::try_from(self_usage()?.ru_nivcsw).unwrap_or(0))
+}
+
+/// The process's major page faults so far (`getrusage`'s `ru_majflt`): faults the kernel answered by reading a page in
+/// from its file or swap, the thread that took one blocked, not runnable, for as long as the read took. A stretch in
+/// which a thread stood still with no CPU and this count moved names a page-in stall, not a block in the code (main's
+/// ruling of 2026-11-26 for the watchdog's verdict: a debug test binary's text is file-backed, and a first touch of its
+/// code under heavy disk I/O waits on the disk). `None` where the platform has no such counter (Windows, whose
+/// `PageFaultCount` counts soft faults with hard ones) or the read was refused.
+#[cfg(unix)]
+pub fn major_faults() -> Option<u64> {
+  Some(u64::try_from(self_usage()?.ru_majflt).unwrap_or(0))
+}
+
+/// No major-fault counter on this platform ([`major_faults`]).
+#[cfg(not(unix))]
+pub fn major_faults() -> Option<u64> {
+  None
+}
+
+/// The process's resource usage so far (`getrusage(RUSAGE_SELF)`), `None` where the kernel refused the read.
+#[cfg(unix)]
+fn self_usage() -> Option<libc::rusage> {
   let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
   // SAFETY: `getrusage` fills the `rusage` the pointer names and returns zero on success; `RUSAGE_SELF` is a
   // valid selector; the buffer is ours, fully sized and zeroed before the call.
@@ -52,7 +75,7 @@ pub fn involuntary_switches() -> Option<u64> {
     }
     usage.assume_init()
   };
-  Some(u64::try_from(usage.ru_nivcsw).unwrap_or(0))
+  Some(usage)
 }
 
 /// No counter on this platform: the caller cannot attribute, and is told so rather than handed a zero.

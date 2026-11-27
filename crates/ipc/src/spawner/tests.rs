@@ -426,9 +426,42 @@ fn a_spawns_cost_on_its_calling_thread_is_flat_in_the_daemons_descriptors() {
   );
   // Not on arm Linux, whose direct spawn grows too gently for the bound (284 to 333 µs a spawn from 100 to 10,000
   // descriptors on ubuntu-24.04-arm, main's diag run 45666757721), where x86_64's grew 2.75 times.
+  // Its bound is drawn from the median at 100 and its own spread below it, which no one slow spawn widens: drawn from the
+  // most, one direct spawn of 6.79 ms at 100 (its median 1.54) lifted it past a least of 4.9 ms at 100,000 (MacBook,
+  // 2026-11-25, beside the crate's other tests).
+  #[cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "x86_64")))]
+  let steady = |least: usize, median: usize| {
+    figure(0, median) + figure(0, median).saturating_sub(figure(0, least))
+  };
   #[cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "x86_64")))]
   assert!(
-    figure(last, 4) > bound(4, 6),
+    figure(last, 4) > steady(4, 5),
     "the direct spawn's cost grows with the descriptors, so the measure can see growth: {printed}"
+  );
+}
+
+/// Main 01a20182's diag run 45672799755 (both Linux lanes, 2026-11-25): a child started through the spawner held a
+/// descriptor a direct child did not (its listing "0 1 142 145 2 3 6" against "0 1 142 145 2 3"); macOS passed, its
+/// spawn closing by default what its file actions do not name. Do: send a descriptor over a stream pair by `SCM_RIGHTS`
+/// as a spawn request carries a child's stream, and read it with the spawner's [`Inbound`]. Expect: the received
+/// descriptor close-on-exec, so no child the spawner starts on Linux inherits it. Red before: received without the flag,
+/// on every platform (Linux's spawn then handed it to the child).
+#[test]
+fn a_descriptor_riding_a_request_is_received_close_on_exec() {
+  let (sender, receiver) = crate::stream::pair().expect("a pair");
+  let (_read, write) = std::io::pipe().expect("a pipe");
+  let request = frame(FrameKind::Spawn, 1, &[]).expect("a frame");
+  super::send(sender.as_fd(), &request, &[write.as_fd()]).expect("sent with the descriptor");
+  let mut inbound = Inbound::default();
+  wait_ready(&receiver, rustix::event::PollFlags::IN);
+  assert_eq!(inbound.read(receiver.as_fd()).expect("read"), Read::Bytes);
+  let received = inbound.take_descriptors(1);
+  let flags = received
+    .first()
+    .map(|fd| rustix::io::fcntl_getfd(fd).expect("its flags"));
+  assert_eq!(
+    flags.map(|flags| flags.contains(rustix::io::FdFlags::CLOEXEC)),
+    Some(true),
+    "the received descriptor is close-on-exec"
   );
 }

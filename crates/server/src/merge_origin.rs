@@ -199,10 +199,16 @@ fn inputs_extents(bytes: &[u8]) -> (Vec<Extent>, u64) {
 /// of the piece. [`inputs_extents`] a piece at a time, so a large encoding's manifest is hashed over a shard's turns (a
 /// green's checkpoint, A-579, `merge_service::CheckpointHold`).
 pub(crate) fn inputs_extent(offset: u64, piece: &[u8]) -> Extent {
+  inputs_extent_hashed(offset, piece.len(), slates_archive::archive::hash_of(piece))
+}
+
+/// [`inputs_extent`] of a chunk of `len` bytes at `offset` whose identity, the BLAKE3 of its bytes, was hashed already
+/// (`chunk`): a caller that hashes a chunk a slice at a time (`merge_service::IncrementHold`, A-920 7c).
+pub(crate) fn inputs_extent_hashed(offset: u64, len: usize, chunk: [u8; 32]) -> Extent {
   Extent {
     offset,
-    len: u64::try_from(piece.len()).unwrap_or(u64::MAX),
-    chunk: slates_archive::archive::hash_of(piece),
+    len: u64::try_from(len).unwrap_or(u64::MAX),
+    chunk,
     chunk_offset: 0,
   }
 }

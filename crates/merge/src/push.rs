@@ -497,7 +497,10 @@ impl DeferredPush {
     Building::new(&self.push(), room, pace)
   }
 
-  /// Its record: the magic, the version, the push, and the digest of them.
+  /// Its record: the magic, the version, the push, and the digest of them. The push is recorded as owed, based at the
+  /// new green's version 0, so the work its build makes hashes that base (A-618's identity: the push's name and base,
+  /// then the document and post-state): a create whose eager work was hashed at its source's version and rebased to 0
+  /// (Mercurial's new lines before A-929) made the same files, head and head identity under another work id.
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&DEFERRED_MAGIC.to_le_bytes());
@@ -1766,7 +1769,13 @@ fn name_runs(increment: &mut Increment, mut named: Vec<(usize, crate::named::Ide
   };
   let old = core::mem::take(&mut increment.post_state);
   let mut inline = Vec::with_capacity(old.len());
-  let mut buffers = Vec::with_capacity(kept.len());
+  // The runs' bytes in one buffer, sized at their total (A-920 3n: never a buffer a run, each let go at its commit).
+  let runs_bytes = kept
+    .iter()
+    .map(|(_, _, start, end)| usize::try_from(end.saturating_sub(*start)).unwrap_or(0))
+    .fold(0usize, usize::saturating_add);
+  let mut buffer = Vec::with_capacity(runs_bytes);
+  let mut lens = Vec::with_capacity(kept.len());
   let mut at = 0usize;
   for (_, _, start, end) in &kept {
     let (start, end) = (
@@ -1774,7 +1783,9 @@ fn name_runs(increment: &mut Increment, mut named: Vec<(usize, crate::named::Ide
       usize::try_from(*end).unwrap_or(usize::MAX),
     );
     inline.extend_from_slice(old.get(at..start).unwrap_or_default());
-    buffers.push(old.get(start..end).unwrap_or_default().to_vec());
+    let run = old.get(start..end).unwrap_or_default();
+    buffer.extend_from_slice(run);
+    lens.push(run.len());
     at = end;
   }
   inline.extend_from_slice(old.get(at..).unwrap_or_default());
@@ -1796,7 +1807,7 @@ fn name_runs(increment: &mut Increment, mut named: Vec<(usize, crate::named::Ide
       op.src = src;
     }
   }
-  increment.named.read.0 = buffers;
+  increment.named.read = crate::named::Read::whole(buffer, lens);
   to_u64(kept.len())
 }
 

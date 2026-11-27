@@ -246,7 +246,7 @@ mod tests {
   /// repository divides again at once.
   #[test]
   fn t_a724_the_grants_are_divided_at_the_learning_cadence_and_kept_between() {
-    crate::test_store::audit_on_stored_shard("vcs_share-grants", |state| {
+    crate::test_store::on_a_stored_shard(|state| {
       let (first, second) = (id(1), id(2));
       used(state, first, (50, 1), (100, 2_000));
       used(state, second, (50, 1), (300, 6_000));
@@ -290,7 +290,7 @@ mod tests {
   /// the small one's grant.
   #[test]
   fn t_a724_a_contested_room_reads_the_published_grants() {
-    crate::test_store::audit_on_stored_shard("vcs_share-grants", |state| {
+    crate::test_store::on_a_stored_shard(|state| {
       let (small, hot) = (id(5), id(6));
       used(state, small, (50, 1), (100, 2_000));
       used(state, hot, (50, 1), (300, 6_000));
@@ -336,7 +336,7 @@ mod tests {
   /// unmoved) but divided per request as before, so the newcomer is not given all the shard admits.
   #[test]
   fn t_a724_a_live_repository_with_no_curve_leaves_the_room_divided_as_before() {
-    crate::test_store::audit_on_stored_shard("vcs_share-grants", |state| {
+    crate::test_store::on_a_stored_shard(|state| {
       let (curved, newcomer) = (id(7), id(8));
       used(state, curved, (50, 1), (100, 2_000));
       state.vcs_usage.answered(&newcomer, Work::Intake, 100, 1);
@@ -369,44 +369,52 @@ mod tests {
   /// the shared one and the four hot ones kept, counted.
   #[test]
   fn t_a724_a_repositorys_coldest_windows_past_its_grant_are_let_go() {
-    crate::test_store::audit_on_stored_shard("vcs_share-grants", |state| {
-      // A repository made so its shard's content store exists.
-      let (repository, _) =
-        crate::vcs_store::tests::repository(state, "cold", slates_ipc::protocol::VcsTool::Git);
-      let windows: Vec<slates_vcs::ContentId> =
-        crate::vcs_store::within_budget(state, 1 << 16, |stores| {
-          let content = stores.content_mut().expect("a content store");
-          let windows: Vec<_> = (0..10u8)
-            .map(|at| content.put(&[at; 1_000]).expect("put"))
-            .collect();
-          content.put(&[0u8; 1_000]).expect("a second holder");
-          for window in &windows {
-            assert!(content.mark_landed(window));
-          }
-          windows
-        });
-      let content = state.vcs_stores.content().expect("a content store");
-      for (at, window) in windows.iter().enumerate() {
-        let _ = content.bytes_of(window);
-        if at >= 6 {
+    // A repository made so its shard's content store exists, from the test's thread.
+    let asked = [(
+      "cold",
+      slates_ipc::protocol::VcsTool::Git,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      "main",
+    )];
+    let owner = crate::vcs_store::tests::owner();
+    crate::test_store::audit_on_stored_shard_made_all(
+      (&owner, asked),
+      |state, [(repository, _)]| {
+        let windows: Vec<slates_vcs::ContentId> =
+          crate::vcs_store::within_budget(state, 1 << 16, |stores| {
+            let content = stores.content_mut().expect("a content store");
+            let windows: Vec<_> = (0..10u8)
+              .map(|at| content.put(&[at; 1_000]).expect("put"))
+              .collect();
+            content.put(&[0u8; 1_000]).expect("a second holder");
+            for window in &windows {
+              assert!(content.mark_landed(window));
+            }
+            windows
+          });
+        let content = state.vcs_stores.content().expect("a content store");
+        for (at, window) in windows.iter().enumerate() {
           let _ = content.bytes_of(window);
+          if at >= 6 {
+            let _ = content.bytes_of(window);
+          }
         }
-      }
-      state.vcs_grants = Grants {
-        generation: 1,
-        given: [(repository, 4_000)].into_iter().collect(),
-        served: vec![repository],
-        ..Grants::default()
-      };
-      let freed = super::let_go_past_grant(state, repository, &windows);
-      assert_eq!(freed, 6_000);
-      let content = state.vcs_stores.content().expect("a content store");
-      let away: Vec<usize> = (0..10)
-        .filter(|at| content.is_away(&windows[*at]))
-        .collect();
-      assert_eq!(away, vec![1, 2, 3, 4, 5, 6]);
-      assert_eq!(state.refusals.get(super::LET_GO_WINDOWS).copied(), Some(6));
-    });
+        state.vcs_grants = Grants {
+          generation: 1,
+          given: [(repository, 4_000)].into_iter().collect(),
+          served: vec![repository],
+          ..Grants::default()
+        };
+        let freed = super::let_go_past_grant(state, repository, &windows);
+        assert_eq!(freed, 6_000);
+        let content = state.vcs_stores.content().expect("a content store");
+        let away: Vec<usize> = (0..10)
+          .filter(|at| content.is_away(&windows[*at]))
+          .collect();
+        assert_eq!(away, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(state.refusals.get(super::LET_GO_WINDOWS).copied(), Some(6));
+      },
+    );
   }
 
   /// Shape: the brought-back test's texts: how many, and each one's bytes, one window each (under the content plane's

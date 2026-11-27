@@ -10,7 +10,10 @@
 //! **What.** When such a record finds the replica owing ([`wanted`]), the holder makes it through the same door the
 //! owner makes its green (`crate::green_ready`): the owed push's `Building` advanced a turn at a time over the
 //! repository's objects, then `Green::materialize`, which is the eager create's green by construction, so its head
-//! identity is the owner's. The objects are the repository's replica store on this node (`vcs_store::replica`), made
+//! identity is the owner's. A Mercurial line's objects are its trees, laid out before the build's first turn over the
+//! repository's store here as its owner lays them out (`hg_push::owed_layout`) and lent each turn through the same
+//! `vcs_store::with_owed_push_objects` git's are (A-929's replica half); a file text let go is asked of the node's
+//! changeset store and brought back between turns. The objects are the repository's replica store on this node (`vcs_store::replica`), made
 //! first from the names log's parts its acceptors hold. The record is refused meanwhile and shipped again by its owner,
 //! and is judged once the replica is made. Lazily: a holder makes nothing for a branch that never moves again.
 //!
@@ -60,6 +63,9 @@ struct Under {
   slices_done: u64,
   /// When it began, on the shard's clock: its time is counted once it is made ([`MADE_NS`]).
   began_ns: u64,
+  /// A Mercurial line's owed push's trees, laid out before the build's first turn over the repository's store here
+  /// (`hg_push::owed_layout`, A-929) and lent each turn (`vcs_store::with_owed_push_objects`), as its owner's are.
+  layout: Option<slates_hg::push::tree::Layout>,
 }
 
 /// The turns `green`'s replica build under way has done, if one is under way.
@@ -77,6 +83,9 @@ enum Turned {
   More,
   /// A read met a let-go window: brought back before the next turn.
   Waiting(slates_git::store::packed::Waited),
+  /// A Mercurial line's build met a file revision whose text was let go: asked of the node's changeset store and brought
+  /// back before the next turn, as its owner's build brings one back (A-929).
+  Asked(slates_hg::push::held::TextAsk, RepositoryId),
   /// Made, or refused: the build is over.
   Done,
 }
@@ -107,13 +116,20 @@ pub(crate) fn wanted(state: &mut ShardState, green: ObjectId) {
       return;
     }
   }
+  begin(state, green, record.id);
+}
+
+/// `green`'s replica build begun over repository `repository`'s store on this node (made by [`wanted`] first where it is
+/// a replica store), driven by a task of the shard ([`drive`]); counted [`BEGUN`], or [`REFUSED`] with no task to run it.
+pub(crate) fn begin(state: &mut ShardState, green: ObjectId, repository: RepositoryId) {
   state.replica_builds.building.insert(
     green,
     Under {
-      repository: record.id,
+      repository,
       building: None,
       slices_done: 0,
       began_ns: slates_rt::futures::now_ns(),
+      layout: None,
     },
   );
   match slates_rt::futures::spawn(drive(green)).and_then(slates_rt::futures::detach) {
@@ -146,9 +162,28 @@ fn repository_of(state: &ShardState, green: ObjectId) -> Option<RepositoryRecord
 /// let go again once it ends (`read_through::BroughtBack`).
 async fn drive(green: ObjectId) {
   let mut brought = crate::vcs_store::read_through::BroughtBack::default();
+  if !laid_out(green).await {
+    let _ = crate::state::with_state_counted(|state| {
+      state.count(REFUSED, 1);
+      state.replica_builds.building.remove(&green);
+    });
+    return;
+  }
   loop {
     match crate::state::with_state_counted(|state| turn(state, green)) {
       Some(Turned::More) => slates_rt::futures::yield_now().await,
+      Some(Turned::Asked(mut ask, repository)) => {
+        let answered = crate::vcs_store::hg_view::answer_store_wants(&mut ask, repository).await;
+        let brought_back = crate::state::with_state_counted(|state| {
+          let given = ask.taken().filter(|_| answered)?;
+          crate::repository::hg_push::text_brought_back(state, (repository, None), given)
+        })
+        .flatten();
+        if brought_back.is_none() {
+          let _ = crate::state::with_state_counted(|state| state.count(REFUSED, 1));
+          break;
+        }
+      }
       Some(Turned::Waiting(waited)) => {
         let back = crate::vcs_store::upload::bring_back_window_within(waited).await;
         brought.keep(&back);
@@ -163,13 +198,69 @@ async fn drive(green: ObjectId) {
   brought.let_go();
 }
 
+/// A Mercurial line's replica's owed push's trees laid out before its build's first turn (A-929's replica half; main's
+/// order of 2026-11-26): the repository's store on this node waited for while its replay runs, then the push's base
+/// and head laid out over it as its owner lays them out (`hg_push::owed_layout`), a let-go text awaited from the node's
+/// changeset store, and kept for the build's turns. Whether the build may go on: true for any other tool's replica, which
+/// lays nothing out; false where the layout was refused or the shard's state went away.
+async fn laid_out(green: ObjectId) -> bool {
+  /// What the build's start found.
+  enum Found {
+    /// Its repository's store still replaying here: wait a turn.
+    Replaying,
+    /// Nothing to lay out: another tool's replica, or one that owes nothing.
+    Nothing,
+    /// A Mercurial line's replica and the push it owes.
+    Owed(RepositoryId, slates_merge::push::DeferredPush),
+  }
+  let key = crate::merge_service::replica_key(green);
+  loop {
+    let found = crate::state::with_state_counted(|state| {
+      let repository = state.replica_builds.building.get(&green)?.repository;
+      if state.vcs_stores.is_rebuilding(repository) {
+        return Some(Found::Replaying);
+      }
+      if state.vcs_stores.mercurial_ref(repository).is_none() {
+        return Some(Found::Nothing);
+      }
+      let owed = state
+        .merge
+        .replicas
+        .lend(&key)
+        .and_then(|replica| replica.deferred().cloned());
+      Some(owed.map_or(Found::Nothing, |owed| Found::Owed(repository, owed)))
+    })
+    .flatten();
+    match found {
+      Some(Found::Replaying) => slates_rt::futures::yield_now().await,
+      Some(Found::Nothing) => return true,
+      Some(Found::Owed(repository, owed)) => {
+        let Some(Ok(layout)) = crate::repository::hg_push::owed_layout(repository, &owed).await
+        else {
+          return false;
+        };
+        return crate::state::with_state_counted(|state| {
+          let under = state.replica_builds.building.get_mut(&green)?;
+          under.layout = Some(layout);
+          Some(())
+        })
+        .flatten()
+        .is_some();
+      }
+      None => return false,
+    }
+  }
+}
+
 /// One turn of `green`'s build: the repository's store waited for while its replay runs; then the owed push's build
 /// begun and advanced; then the replica made with what it built.
 fn turn(state: &mut ShardState, green: ObjectId) -> Turned {
-  let Some((repository, taken)) = state.replica_builds.building.get_mut(&green).map(|under| {
-    under.slices_done = under.slices_done.saturating_add(1);
-    (under.repository, under.building.take())
-  }) else {
+  let Some((repository, taken, mut layout)) =
+    state.replica_builds.building.get_mut(&green).map(|under| {
+      under.slices_done = under.slices_done.saturating_add(1);
+      (under.repository, under.building.take(), under.layout.take())
+    })
+  else {
     return Turned::Done;
   };
   state.count(SLICES, 1);
@@ -208,11 +299,28 @@ fn turn(state: &mut ShardState, green: ObjectId) -> Turned {
       .replicas
       .lend(&crate::merge_service::replica_key(green))?;
     let mut turned = None;
-    crate::vcs_store::with_owed_push_objects(state, Some(repository), &mut |objects| {
-      turned = Some(building.advance(&replica, objects));
-    });
+    // A Mercurial line's trees laid out before the first turn ([`laid_out`]); git's objects need none.
+    crate::vcs_store::with_owed_push_objects(
+      state,
+      (Some(repository), layout.as_mut()),
+      &mut |objects| {
+        turned = Some(building.advance(&replica, objects));
+      },
+    );
     turned
   });
+  let asked = match (&advanced, &layout) {
+    (Some(None), Some(layout)) => {
+      let most = state.store.admittable();
+      layout
+        .waited(&building, most)
+        .map(|ask| Turned::Asked(ask, repository))
+    }
+    _ => None,
+  };
+  if let Some(under) = state.replica_builds.building.get_mut(&green) {
+    under.layout = layout;
+  }
   match advanced {
     // Not found: no replica, or no store to read.
     None => {
@@ -227,7 +335,11 @@ fn turn(state: &mut ShardState, green: ObjectId) -> Turned {
       if let Some(under) = state.replica_builds.building.get_mut(&green) {
         under.building = Some(building);
       }
-      waited.map_or(Turned::More, Turned::Waiting)
+      match (waited, asked) {
+        (Some(waited), _) => Turned::Waiting(waited),
+        (None, Some(asked)) => asked,
+        (None, None) => Turned::More,
+      }
     }
     Some(Some(Ok(built))) => {
       let made = state

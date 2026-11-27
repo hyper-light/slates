@@ -133,3 +133,55 @@ fn a_task_submitted_from_another_thread_is_labelled_with_its_submitters_line() {
     "{seen}"
   );
 }
+
+/// Shape: how long the long task's one poll holds its shard: past any short poll's length.
+const LONG_POLL: Duration = Duration::from_millis(20);
+
+/// A-920 6b (main 01a20182's ruling of 2026-11-26: a wide import's longest poll names its site). Do: on one shard, spawn
+/// a task that yields, one whose one poll spins [`LONG_POLL`], and another that yields after it. Expect: the shard's
+/// pulse names the long task's spawn site, this file at its spawning line, as its longest poll's task, with the
+/// shorter polls before and after it leaving that name as it is.
+#[test]
+#[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
+fn a_shards_longest_poll_names_its_task() {
+  let runtime = Runtime::start(&config()).unwrap();
+  let shard = *runtime.shard_ids().first().unwrap();
+  let done: &'static AtomicBoolPair = Box::leak(Box::new(AtomicBoolPair::default()));
+  runtime
+    .spawn_on(shard, async move {
+      futures::yield_now().await;
+    })
+    .unwrap();
+  let line = line!() + 2;
+  runtime
+    .spawn_on(shard, async move {
+      let began = Instant::now();
+      while began.elapsed() < LONG_POLL {
+        std::hint::spin_loop();
+      }
+      done.spinning.store(true, Ordering::Release);
+    })
+    .unwrap();
+  let started = Instant::now();
+  while !done.spinning.load(Ordering::Acquire) {
+    assert!(started.elapsed() < WAIT, "the long task never ran");
+    std::thread::yield_now();
+  }
+  runtime
+    .spawn_on(shard, async move {
+      futures::yield_now().await;
+      done.go_on.store(true, Ordering::Release);
+    })
+    .unwrap();
+  while !done.go_on.load(Ordering::Acquire) {
+    assert!(started.elapsed() < WAIT, "the last task never ran");
+    std::thread::yield_now();
+  }
+  let longest =
+    slates_rt::registry::with_entry(shard.0, |entry| entry.pulse.longest_polling()).unwrap();
+  assert!(
+    matches!(longest.label, Some(TaskLabel::Site(site)) if site.file() == file!() && site.line() == line),
+    "{longest}"
+  );
+  runtime.shutdown().unwrap();
+}

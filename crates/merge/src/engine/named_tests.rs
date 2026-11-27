@@ -281,15 +281,78 @@ fn a_named_texts_file_is_its_name_alone() {
     super::Judgment::Accepted(judged) => judged,
     other => panic!("not accepted: {other:?}"),
   };
-  assert!(
-    work.post().runs.iter().all(Vec::is_empty),
-    "the work kept its bytes"
-  );
+  assert!(work.post().runs.is_empty(), "the work kept its bytes");
   assert_eq!(
     green.commit_judged(judged).map(|(version, _)| version),
     Ok(1)
   );
   holds_its_name_alone(&mut green, (object, &plane), &bytes);
+}
+
+/// Each of `files` in `green` named for its text alone, and its bytes, read through `plane`, the text's own.
+fn assert_named_for_their_texts(
+  green: &Green,
+  files: &[(String, Identity)],
+  texts: &[Vec<u8>],
+  plane: &Plane,
+) {
+  for ((path, object), bytes) in files.iter().zip(texts) {
+    assert_eq!(
+      green.content(path),
+      Some(super::Content::Named(*object)),
+      "{path} named for its text"
+    );
+    assert_eq!(
+      read_through(green, path, plane).as_deref(),
+      Some(bytes.as_slice()),
+      "{path}'s bytes"
+    );
+  }
+}
+
+/// A-920 3n (a work's named texts read into one buffer, and a file named for its text given no bytes). Do: name eight
+/// texts of 1 KiB a work creates, each its own file, read them, judge the work with `judge_named` and commit the verdict.
+/// Expect: accepted as version 1; every file its text's name alone, each text's bytes the plane's; and no byte buffer
+/// let go for a named file at the commit (`Green::named_buffers_freed`: each had been a text's own buffer, one freed a
+/// commit unit, and the free that emptied the allocator's region cost a unit about 1 ms of the kernel's time).
+#[test]
+fn a_works_named_texts_commit_with_no_buffer_of_their_own_let_go() {
+  const TEXTS: usize = 8;
+  const TEXT: usize = 1024;
+  let mut plane = Plane::default();
+  let texts: Vec<Vec<u8>> = (0..TEXTS)
+    .map(|text| {
+      (0..TEXT)
+        .map(|at| u8::try_from((at + text) % 241).unwrap())
+        .collect()
+    })
+    .collect();
+  let files: Vec<(String, Identity)> = texts
+    .iter()
+    .enumerate()
+    .map(|(at, bytes)| (format!("f{at}"), plane.put(bytes.clone())))
+    .collect();
+  let mut work = named_creates(&files);
+  while !work.read_step(&plane, 1 << 12).unwrap() {}
+  let mut green = Green::new();
+  assert!(green.track_name_holds().is_empty());
+  let judged = match green.judge_named(&mut work) {
+    super::Judgment::Accepted(judged) => judged,
+    other => panic!("not accepted: {other:?}"),
+  };
+  assert_eq!(
+    green.commit_judged(judged).map(|(version, _)| version),
+    Ok(1)
+  );
+  assert_named_for_their_texts(&green, &files, &texts, &plane);
+  assert_eq!(
+    green.named_buffers_freed(),
+    0,
+    "buffers let go for named files"
+  );
+  // Its holds taken and given back, as an owner drains them, so no tracked green is dropped holding one.
+  assert_eq!(green.take_name_holds().len(), TEXTS);
+  assert_eq!(green.give_back_name_holds().len(), TEXTS);
 }
 
 /// A-920 piece 3c (a verdict computed a slice at a time reads what it read whole). Do: commit a named work creating
@@ -1249,7 +1312,9 @@ impl History {
       while !self.judging.make_step(&mut judged, 5).map_err(moved)?.done {}
       census.stepped += 1;
     }
+    let mapped_before = self.judging.mapped_files_made();
     let (number, applied) = self.judging.commit_judged(judged).map_err(moved)?;
+    let mapped = self.judging.mapped_files_made() - mapped_before;
     // Lent for the verdict and its commit, let go once it is committed.
     self.judging.let_named_bytes_go();
     let (mut recorded, _) = version_work(
@@ -1270,7 +1335,7 @@ impl History {
       ),
       number
     );
-    self.deferred(index, (version, number), census)?;
+    self.deferred(index, (version, (number, mapped)), census)?;
     count_names(&self.model, &after, version, census);
     let before = std::mem::replace(&mut self.model, after);
     self.committed.push(Committed {
@@ -1297,11 +1362,13 @@ impl History {
   }
 
   /// `version`, increment `index`, judged on the deferring green leaving its commit's reads to its commit and committed
-  /// a unit a step ([`committed_reads_later`]): the version `number` the judging green committed, and its head.
+  /// a unit a step ([`committed_reads_later`]): the version `number` the judging green committed, and its head; and,
+  /// where the judging green made none of its files in steps first, as many files made by copying as its commit made
+  /// (`mapped`, `Green::mapped_files_made`): a file whose run makes no other moves the run's buffer, sliced or whole.
   fn deferred(
     &mut self,
     index: usize,
-    (version, number): (&Version, u64),
+    (version, (number, mapped)): (&Version, (u64, u64)),
     census: &mut NameCensus,
   ) -> Result<(), TestCaseError> {
     let (mut work, _) = version_work(
@@ -1313,11 +1380,15 @@ impl History {
     )
     .ok_or_else(|| TestCaseError::fail(format!("version {index} changed nothing deferred")))?;
     read_all(&mut work, &self.plane);
+    let mapped_before = self.deferring.mapped_files_made();
     prop_assert_eq!(
       committed_reads_later(&mut self.deferring, &mut work, (&self.plane, census)),
       Some(number)
     );
     prop_assert_eq!(self.deferring.head_identity(), self.judging.head_identity());
+    if !version.stepped {
+      prop_assert_eq!(self.deferring.mapped_files_made() - mapped_before, mapped);
+    }
     Ok(())
   }
 

@@ -1763,60 +1763,124 @@ fn an_import_writes_the_changegroup_a_push_of_its_history_brings() {
   }
 }
 
-/// Main 01a20182's rulings of 2026-11-22 07:32 and 12:00 (a push lands its segments apart from its repository's landing
-/// turn, at sequences other landings may lie between; its entry names them as ranges, record v11). Do: write a push's
-/// runs reference of segments 4 to 6 and 9 to 11 in a room of 1 MiB; read it back; cut it at every length, add a byte;
-/// write ranges overlapping, out of order, and none; read an import's v9 run. Expect the golden bytes (the magic,
-/// version 11, the push's source byte 1, the room, the count 2, then each range's first and last, each little-endian);
-/// the run read back whole, its sequences 4, 5, 6, 9, 10, 11; every damaged one read as no run; no reference for
-/// ranges not ascending and apart, nor for none; and the import's v9 run one range.
+/// Ruling R (main 01a20182's of 2026-11-26 with its corrections: a push's record names one homed segment list, O(1), and
+/// replaces version 11 outright; version 13 names its attempt too). Do: write a push's homed run reference naming a list
+/// of 88 bytes landed as changeset 12 by attempt (5, 6, 7), in a room of 1 MiB; read it back; cut it at every length, add
+/// a byte; read a version-11 runs reference (as one was written before), a version-12 one (without the attempt) and an
+/// import's v9 run through both readers. Expect the golden bytes (the magic, version 13, the push's source byte 1, the
+/// room, the list's identity, its length, its sequence and its attempt's node, process and number, each little-endian);
+/// the run read back whole; every damaged one read as none; the version-11 and version-12 references read as no run;
+/// and the import's v9 run one range, no homed run.
 #[test]
-fn a_pushs_runs_reference_is_the_golden_bytes_and_reads_back_as_its_ranges() {
+fn a_pushs_homed_run_reference_is_the_golden_bytes_and_v11_and_v12_are_no_longer_read() {
   use crate::import::record::{
-    Run, Source, run_of, write_push_runs_reference, write_run_reference,
+    HomedRun, homed_run_of, run_of, write_homed_run_reference, write_run_reference,
   };
-  let written = write_push_runs_reference(1 << 20, &[(4, 6), (9, 11)]).unwrap();
+  let list = [7u8; 32];
+  let written = write_homed_run_reference(1 << 20, (list, 88), (12, (5, 6, 7)));
   let golden: Vec<u8> = [
+    &b"SHGR"[..],
+    &13u32.to_le_bytes(),
+    &[1],
+    &(1u64 << 20).to_le_bytes(),
+    &list,
+    &88u64.to_le_bytes(),
+    &12u64.to_le_bytes(),
+    &5u64.to_le_bytes(),
+    &6u64.to_le_bytes(),
+    &7u64.to_le_bytes(),
+  ]
+  .concat();
+  assert_eq!(written, golden);
+  assert_eq!(
+    homed_run_of(&written),
+    Some(HomedRun {
+      room: 1 << 20,
+      list,
+      len: 88,
+      sequence: 12,
+      attempt: (5, 6, 7),
+    })
+  );
+  assert_eq!(run_of(&written), None, "a homed run is no v9 run");
+  for cut in 0..written.len() {
+    assert_eq!(homed_run_of(&written[..cut]), None, "cut at {cut}");
+  }
+  let mut trailing = written.clone();
+  trailing.push(0);
+  assert_eq!(homed_run_of(&trailing), None);
+  let v11: Vec<u8> = [
     &b"SHGR"[..],
     &11u32.to_le_bytes(),
     &[1],
     &(1u64 << 20).to_le_bytes(),
-    &2u64.to_le_bytes(),
+    &1u64.to_le_bytes(),
     &4u64.to_le_bytes(),
     &6u64.to_le_bytes(),
-    &9u64.to_le_bytes(),
-    &11u64.to_le_bytes(),
   ]
   .concat();
-  assert_eq!(written, golden);
-  let run = run_of(&written).unwrap();
   assert_eq!(
-    run,
-    Run {
-      source: Source::Push,
-      room: 1 << 20,
-      ranges: vec![(4, 6), (9, 11)]
-    }
+    (run_of(&v11), homed_run_of(&v11)),
+    (None, None),
+    "v11 no longer read"
   );
-  assert_eq!(run.sequences().collect::<Vec<_>>(), [4, 5, 6, 9, 10, 11]);
+  let mut v12 = written.clone();
+  v12[4..8].copy_from_slice(&12u32.to_le_bytes());
+  v12.truncate(v12.len() - 24);
+  assert_eq!(homed_run_of(&v12), None, "v12 no longer read");
+  let imported = write_run_reference(1 << 20, (4, 11));
+  assert_eq!(run_of(&imported).map(|run| run.ranges), Some(vec![(4, 11)]));
+  assert_eq!(homed_run_of(&imported), None);
+}
+
+/// Ruling R: a push's segment list, the one homed object its record names (`record::write_segment_list`). Do: write a
+/// list of two segments, read it back; cut it at every length, add a byte, claim a count past its bytes (`u64::MAX` and
+/// one more than it holds), flip its magic and its version; write lists empty, out of order and repeating a sequence.
+/// Expect the golden bytes ("SHGL", version 2, the count, then each segment's sequence and its record's, payload's and
+/// texts' identity and length, each little-endian); the entries read back; every damaged one read as none, nothing
+/// allocated for a count its bytes cannot hold; and no list written for none, nor for sequences not ascending.
+#[test]
+fn a_segment_list_is_the_golden_bytes_and_reads_back_whole_or_not_at_all() {
+  use crate::import::record::{SegmentEntry, segment_list_of, write_segment_list};
+  let entry = |sequence: u64, seed: u8| SegmentEntry {
+    sequence,
+    record: ([seed; 32], u64::from(seed)),
+    payload: ([seed.wrapping_add(1); 32], u64::from(seed) * 1000),
+    texts: ([seed.wrapping_add(2); 32], u64::from(seed) * 7),
+  };
+  let entries = [entry(3, 1), entry(5, 9)];
+  let written = write_segment_list(&entries).unwrap();
+  let mut golden: Vec<u8> = [&b"SHGL"[..], &2u32.to_le_bytes(), &2u64.to_le_bytes()].concat();
+  for one in &entries {
+    golden.extend_from_slice(&one.sequence.to_le_bytes());
+    golden.extend_from_slice(&one.record.0);
+    golden.extend_from_slice(&one.record.1.to_le_bytes());
+    golden.extend_from_slice(&one.payload.0);
+    golden.extend_from_slice(&one.payload.1.to_le_bytes());
+    golden.extend_from_slice(&one.texts.0);
+    golden.extend_from_slice(&one.texts.1.to_le_bytes());
+  }
+  assert_eq!(written, golden);
+  assert_eq!(segment_list_of(&written).as_deref(), Some(&entries[..]));
   for cut in 0..written.len() {
-    assert_eq!(run_of(&written[..cut]), None, "cut at {cut}");
+    assert_eq!(segment_list_of(&written[..cut]), None, "cut at {cut}");
   }
   let mut trailing = written.clone();
   trailing.push(0);
-  assert_eq!(run_of(&trailing), None);
-  for ranges in [&[(4, 9), (9, 11)][..], &[(9, 11), (4, 6)], &[(6, 4)], &[]] {
-    assert_eq!(
-      write_push_runs_reference(1 << 20, ranges),
-      None,
-      "{ranges:?}"
-    );
+  assert_eq!(segment_list_of(&trailing), None);
+  for count in [u64::MAX, 3] {
+    let mut lying = written.clone();
+    lying[8..16].copy_from_slice(&count.to_le_bytes());
+    assert_eq!(segment_list_of(&lying), None, "count {count}");
   }
-  let imported = run_of(&write_run_reference(1 << 20, (4, 11))).unwrap();
-  assert_eq!(
-    (imported.source, imported.ranges),
-    (Source::Import, vec![(4, 11)])
-  );
+  for at in [0, 4] {
+    let mut flipped = written.clone();
+    flipped[at] ^= 1;
+    assert_eq!(segment_list_of(&flipped), None, "flipped at {at}");
+  }
+  assert_eq!(write_segment_list(&[]), None);
+  assert_eq!(write_segment_list(&[entry(5, 1), entry(3, 2)]), None);
+  assert_eq!(write_segment_list(&[entry(5, 1), entry(5, 2)]), None);
 }
 
 /// A-767 C1 step 3 (an import's run in the register, `record::write_run_reference`). Do: write a run's reference, read

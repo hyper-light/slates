@@ -60,6 +60,9 @@ pub(crate) struct GitReplay {
   moves: Vec<RecordedMove>,
   /// A version-4 record's pack: its identity and length in the content store, where it is read from.
   packed: Option<(ContentId, u64)>,
+  /// Whether the record's hold on its pack is owed: the pack read from the node's store a piece at a time (C2, the
+  /// content store holding none of it as the replay began), its hold taken once the staging has put it.
+  pack_hold_owed: bool,
   /// What comes next.
   stage: Stage,
 }
@@ -165,8 +168,21 @@ impl Outside for Site<'_> {
 pub(crate) enum Stepped {
   /// More turns remain.
   More(Box<GitReplay>),
+  /// The pack's bytes from this offset are not held by the pieces read from the node's store: its caller fills them
+  /// (`StorePacks::fill`, awaited off the step) and steps again.
+  Wants(Box<GitReplay>, u64),
   /// The record is replayed.
   Done,
+}
+
+/// What one unit of a replay left.
+enum UnitDone {
+  /// Another unit is due.
+  Next,
+  /// The push is sealed and staged: the record's moves to commit.
+  Moved(Vec<Move>),
+  /// The pack's bytes from this offset are wanted from the node's store ([`Stepped::Wants`]).
+  Wants(u64),
 }
 
 /// How much a turn may take: its deadline on the shard's clock, and the pack's bytes one read takes.
@@ -204,6 +220,9 @@ impl GitReplay {
     };
     let mut push = Push::new(format);
     push.carried(record.deepest);
+    // Its pack is put again as it is read, each window a landed push let go brought back, so its objects read where they
+    // lie (main's order of 2026-11-26, C3).
+    push.bringing_back();
     // The pack is read from the content store by its identity, a window at a time (A-722's record v4, version 5).
     Ok(Box::new(Self {
       push,
@@ -211,6 +230,7 @@ impl GitReplay {
       names,
       named,
       packed: record.packed,
+      pack_hold_owed: false,
       moves: record.moves,
       stage: Stage::Reading {
         reader: Box::new(Reader::new(format, &NO_INDEX)),
@@ -226,12 +246,22 @@ impl GitReplay {
     mut self: Box<Self>,
     (content, store): (&mut ContentStore, &mut GitStore),
     (turn, now): (Turn, &mut dyn FnMut() -> u64),
+    pieces: Option<&super::store_packs::StorePacks>,
   ) -> Result<Stepped, ReplayRefused> {
+    // A pack read from the node's store a piece at a time is named in the content store only once the staging puts it,
+    // where nothing names it yet: its hold for the record is taken then ([`GitReplay::pack_hold_owed`]).
+    let streamed = self
+      .packed
+      .filter(|(identity, _)| pieces.is_some() && !content.contains(identity));
+    if streamed.is_some() {
+      self.pack_hold_owed = true;
+    }
     let held = self
       .named
       .take()
       .into_iter()
-      .chain(self.packed.map(|(identity, _)| identity));
+      .chain(self.packed.map(|(identity, _)| identity))
+      .filter(|identity| streamed.is_none_or(|(pack, _)| pack != *identity));
     for identity in held.collect::<Vec<_>>() {
       // The region's own hold (this shard its home) is not the record's (`super::replay_push`'s rule).
       if content.holders(&identity) <= super::homes::region_holds_here(&identity)
@@ -243,9 +273,12 @@ impl GitReplay {
       }
     }
     loop {
-      match self.unit((content, store), turn.chunk) {
-        Ok(None) => {}
-        Ok(Some(moves)) => return self.finish(content, store, moves).map(|()| Stepped::Done),
+      match self.unit((content, store), turn.chunk, pieces) {
+        Ok(UnitDone::Next) => {}
+        Ok(UnitDone::Moved(moves)) => {
+          return self.finish(content, store, moves).map(|()| Stepped::Done);
+        }
+        Ok(UnitDone::Wants(offset)) => return Ok(Stepped::Wants(self, offset)),
         Err(refused) => return Err(self.abandon(content).err().unwrap_or(refused)),
       }
       if now() >= turn.deadline_ns {
@@ -260,7 +293,8 @@ impl GitReplay {
     &mut self,
     (content, store): (&mut ContentStore, &mut GitStore),
     chunk: usize,
-  ) -> Result<Option<Vec<Move>>, ReplayRefused> {
+    pieces: Option<&super::store_packs::StorePacks>,
+  ) -> Result<UnitDone, ReplayRefused> {
     let stage = core::mem::replace(
       &mut self.stage,
       Stage::Moving {
@@ -274,16 +308,33 @@ impl GitReplay {
         mut admission,
         read,
       } => {
-        // A version-4 record's pack is read a window at a time from the store, where the record names it.
+        // A version-4 record's pack is read a window at a time from the store, where the record names it; one the
+        // content store holds none of, from the pieces read from the node's store (C2), its caller filling the next.
         let mut stored = None;
         let piece: &[u8] = match self.packed {
           Some((identity, len)) => {
             let offset = u64::try_from(read).unwrap_or(u64::MAX);
-            stored =
-              slates_git::store::packed::PackSource::piece(&*content, &identity, len, offset);
+            let from_pieces = pieces.filter(|_| !content.holds_whole(&identity));
+            stored = match from_pieces {
+              Some(pieces) => {
+                slates_git::store::packed::PackSource::piece(pieces, &identity, len, offset)
+              }
+              None => {
+                slates_git::store::packed::PackSource::piece(&*content, &identity, len, offset)
+              }
+            };
             match &stored {
               Some(window) => window.get(..chunk.max(1)).unwrap_or(window),
               None if offset >= len => &[],
+              None if from_pieces.is_some() => {
+                drop(stored);
+                self.stage = Stage::Reading {
+                  reader,
+                  admission,
+                  read,
+                };
+                return Ok(UnitDone::Wants(offset));
+              }
               None => {
                 return Err(ReplayRefused::Pack(unpack::Refusal::Truncated {
                   at: offset,
@@ -301,9 +352,13 @@ impl GitReplay {
             .map_err(ReplayRefused::Pack)?;
           (took, site.queue)
         };
-        self.push.extend_pack(piece.get(..took).unwrap_or_default());
+        // What the reader took, at most a turn's chunk, copied out before the content store is lent to the push's put.
+        let taken = piece.get(..took).unwrap_or_default().to_vec();
         let piece_was_empty = piece.is_empty();
         drop(stored);
+        self.push.extend_pack(content, &taken).map_err(|refused| {
+          ReplayRefused::Git(GitRefused::Object(PushRefused::Content(refused)))
+        })?;
         self.admit_queued((content, store), queue, &mut admission)?;
         if reader.is_whole() {
           (Stage::Resolving { reader, admission }, None)
@@ -345,7 +400,7 @@ impl GitReplay {
         self.admit_queued((content, store), queue, &mut admission)?;
         if !resolved {
           self.stage = Stage::Resolving { reader, admission };
-          return Ok(None);
+          return Ok(UnitDone::Next);
         }
         let queue = {
           let mut site = self.site(content, store);
@@ -380,6 +435,7 @@ impl GitReplay {
           .stage_turn(content, &mut self.push, &mut staging, quantum)
           .map_err(|refused| ReplayRefused::Git(GitRefused::Store(refused)))?;
         if staged {
+          self.pack_held_for_the_record(content)?;
           (
             Stage::Moving {
               admitted: Vec::new(),
@@ -416,18 +472,27 @@ impl GitReplay {
       }
     };
     self.stage = stage;
-    Ok(done)
+    Ok(done.map_or(UnitDone::Next, UnitDone::Moved))
+  }
+
+  /// The record's hold on its pack where it is owed ([`GitReplay::pack_hold_owed`]): taken once the staging has put the
+  /// pack read from the node's store, as a replay of a pack held takes it at its first turn.
+  fn pack_held_for_the_record(&mut self, content: &mut ContentStore) -> Result<(), ReplayRefused> {
+    let Some((identity, _)) = self.packed.filter(|_| self.pack_hold_owed) else {
+      return Ok(());
+    };
+    content
+      .hold(&identity)
+      .map_err(|refused| ReplayRefused::Git(GitRefused::Object(PushRefused::Content(refused))))?;
+    self.pack_hold_owed = false;
+    Ok(())
   }
 
   /// The site the reader hands its objects to this call ([`Site`]): the push and the repository read only.
   fn site<'s>(&'s self, content: &'s ContentStore, store: &'s GitStore) -> Site<'s> {
     Site {
       queue: BTreeMap::new(),
-      quarantined: Quarantined {
-        push: Some(&self.push),
-        store: content,
-        repository: &store.repository,
-      },
+      quarantined: Quarantined::new(Some(&self.push), content, (&store.repository, None)),
       outside: StoreBases(slates_git::store::views::IndexedObjects::new(
         &store.repository,
         content,
@@ -464,6 +529,9 @@ impl GitReplay {
         .keep_read(object.offset, object.kind, object.content);
       admission.release(hold);
     }
+    // What its reads keep lately widened for the chains it carries now, within the content store's room, as a live
+    // push's is within the shard's.
+    let _ = self.push.widen_reading(&mut Admission::new(content.room()));
     Ok(())
   }
 

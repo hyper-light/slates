@@ -996,7 +996,7 @@ mod tests {
     // runs, a client's ring): each sweep, and one under way, within a percent of it and a step a range.
     let each = all_pages + all_pages / 100 + all_ranges;
     assert!(
-      walked as usize <= (sweeps as usize + 1) * each,
+      usize::try_from(walked).unwrap() <= (usize::try_from(sweeps).unwrap() + 1) * each,
       "{sweeps} sweeps walked {walked} pages, past {each} a sweep"
     );
   }

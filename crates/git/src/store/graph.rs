@@ -121,6 +121,10 @@ pub struct PositionCache {
   met: u64,
   /// The most ids one sent commit resolved.
   most: u64,
+  /// The bytes of the trees the walk opened since its last sent commit began.
+  trees_met: u64,
+  /// The most bytes of trees one sent commit opened: the read cache's breadth ([`Repository::widen_read_cache`]).
+  trees_most: u64,
   /// Whether a size the work asked for was refused room (counted once an answer).
   unroomed: bool,
   /// What it did since it was last asked.
@@ -152,6 +156,30 @@ pub struct PositionCounts {
   pub tree_deltas_most: u64,
   /// The deltas the walk's tree reads applied, summed.
   pub tree_deltas: u64,
+  /// Of those, each read's past its first, summed: what a read cache that kept every chain whole could have spared, since
+  /// a read of a tree stored as a delta applies that delta itself whatever is kept (main 01a20182's A/B of 2026-11-25:
+  /// 1,811,031 deltas over about 1.4 million reads, so whether the cache's order can gain is this share).
+  pub tree_deltas_past_one: u64,
+  /// The walk's tree reads that inflated their chain's root, an entry whole in its pack (`Repository::
+  /// last_read_inflated_base`): the roots inflated, where `tree_deltas` is the steps rebuilt over them. A read walks its
+  /// tree's chain down to the first entry kept or the root, then rebuilds each step back up, keeping the root and every
+  /// step's result; so the read cache spares both a root's inflation and the steps above it, and this count with
+  /// `tree_deltas` is what it did not spare.
+  ///
+  /// Derived: reuse = this ÷ distinct, the times each root was inflated; headroom = this − distinct, the inflations an
+  /// order keeping every root could spare. Distinct, the roots the walk's trees' chains end at, is read offline from
+  /// the pushed pack (`git verify-pack -v`: the whole entries that a delta's chain ends at), never counted here.
+  /// Shape: at least distinct on a walk reading every tree, each root met once at least; a star fixture of 9 bases
+  /// (main's order of 2026-11-26) read 44 kept oldest-laid first.
+  pub tree_bases_inflated: u64,
+  /// The walk's tree reads that found the tree, or an entry of its chain, kept by the read cache.
+  pub read_cache_hits: u64,
+  /// The times the walk widened the read cache before a tree's read (`Repository::widen_read_cache`).
+  pub read_cache_widened: u64,
+  /// The times its admission refused the read cache the room a tree's read asked.
+  pub read_cache_refused: u64,
+  /// The most bytes the read cache was allowed to keep.
+  pub read_cache_budget_most: u64,
 }
 
 impl PositionCache {
@@ -218,6 +246,8 @@ impl PositionCache {
   fn commit_begun(&mut self, admission: &mut Admission) {
     self.most = self.most.max(self.met);
     self.met = 0;
+    self.trees_most = self.trees_most.max(self.trees_met);
+    self.trees_met = 0;
     self.grow_within(admission);
   }
 
@@ -364,6 +394,17 @@ impl<'r> StoreGraph<'r> {
         let mut positions = self.positions.borrow_mut();
         positions.counts.tree_deltas_most = positions.counts.tree_deltas_most.max(deltas);
         positions.counts.tree_deltas = positions.counts.tree_deltas.saturating_add(deltas);
+        positions.counts.tree_deltas_past_one = positions
+          .counts
+          .tree_deltas_past_one
+          .saturating_add(deltas.saturating_sub(1));
+        if self.repository.last_read_found_kept() {
+          positions.counts.read_cache_hits = positions.counts.read_cache_hits.saturating_add(1);
+        }
+        if self.repository.last_read_inflated_base() {
+          positions.counts.tree_bases_inflated =
+            positions.counts.tree_bases_inflated.saturating_add(1);
+        }
         named
       }
       Kind::Tag => self
@@ -586,9 +627,25 @@ impl Graph for StoreGraph<'_> {
   }
 
   fn opening_tree(&self, tree: u64, admission: &mut Admission) {
-    if let Some((_, row)) = self.row(tree) {
-      let _ = self.repository.widen_read_cache(row.len, admission);
+    let Some((_, row)) = self.row(tree) else {
+      return;
+    };
+    let mut positions = self.positions.borrow_mut();
+    positions.trees_met = positions.trees_met.saturating_add(row.len);
+    let breadth = positions.trees_most.max(positions.trees_met);
+    let widening = self.repository.widen_read_cache(breadth, admission);
+    let budget = self.repository.read_cache_budget();
+    let counts = &mut positions.counts;
+    match widening {
+      super::Widening::Grown => {
+        counts.read_cache_widened = counts.read_cache_widened.saturating_add(1);
+      }
+      super::Widening::Refused => {
+        counts.read_cache_refused = counts.read_cache_refused.saturating_add(1);
+      }
+      super::Widening::Enough => {}
     }
+    counts.read_cache_budget_most = counts.read_cache_budget_most.max(budget);
   }
 
   fn named_entries(&self, tree: u64) -> impl Iterator<Item = (u64, Vec<u8>)> {

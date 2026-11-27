@@ -183,6 +183,32 @@ enum Request {
   },
 }
 
+impl Request {
+  /// Its kind's name, as the owner's log names a request.
+  fn kind(&self) -> &'static str {
+    match self {
+      Request::Begin { .. } => "begin",
+      Request::Section { .. } => "section",
+      Request::Part { .. } => "part",
+      Request::Commit { .. } => "commit",
+      Request::Stop => "stop",
+      Request::Dropped => "dropped",
+      Request::Land { .. } => "land",
+      Request::Piece { .. } => "piece",
+      Request::Sections { .. } => "sections",
+      Request::Read { .. } => "read",
+      Request::Changesets { .. } => "changesets",
+      Request::Text { .. } => "text",
+      Request::Texts { .. } => "texts",
+      Request::TextRow { .. } => "text row",
+      Request::Forget { .. } => "forget",
+      Request::PathTexts { .. } => "path texts",
+      Request::TextsByTool { .. } => "texts by tool",
+      Request::Places { .. } => "places",
+    }
+  }
+}
+
 /// A request as the owner receives it: when its asker sent it ([`slates_machine::clock::monotonic_ns`], one clock for
 /// every thread of the host) and where its service's timing goes back ([`Served`]), none for the daemon's own stop.
 struct Asked {
@@ -369,13 +395,17 @@ struct Timer {
   dequeued_ns: u64,
   disk_before: u64,
   met: Met,
+  /// The request's kind ([`Request::kind`]).
+  kind: &'static str,
+  /// Once answered: its service and the log reads within it.
+  served: Option<(u64, u64)>,
 }
 
 impl Timer {
   /// The timing of a request sent at `sent_ns`, taken at `dequeued_ns` by an owner that began waiting for work at
   /// `idle_ns`: sent after it, its wait was the owner's wake; before, it queued behind the owner's other work.
   fn of(
-    asked: (u64, Option<Sender<Served>>),
+    (asked, kind): ((u64, Option<Sender<Served>>), &'static str),
     (idle_ns, dequeued_ns, met): (u64, u64, Met),
     store: &Store,
   ) -> Self {
@@ -393,6 +423,8 @@ impl Timer {
       dequeued_ns,
       disk_before: store.log().read_ns(),
       met,
+      kind,
+      served: None,
     }
   }
 
@@ -400,19 +432,46 @@ impl Timer {
   /// the request left it, served (a figure taken as the owner took the request missed what that request made, so a
   /// clone's last reads left the status a request behind).
   fn reply<T>(&mut self, (store, texts): (&Store, &TextCache), answer: &Sender<T>, value: T) {
+    let done_ns = slates_machine::clock::monotonic_ns();
+    let (serve_ns, disk_ns) = (
+      done_ns.saturating_sub(self.dequeued_ns),
+      store.log().read_ns().saturating_sub(self.disk_before),
+    );
+    self.served = Some((serve_ns, disk_ns));
     if let Some(timed) = self.timed.take() {
-      let done_ns = slates_machine::clock::monotonic_ns();
       let _ = timed.try_send(Served {
         behind_ns: self.behind_ns,
         wake_ns: self.wake_ns,
-        serve_ns: done_ns.saturating_sub(self.dequeued_ns),
-        disk_ns: store.log().read_ns().saturating_sub(self.disk_before),
+        serve_ns,
+        disk_ns,
         done_ns,
         met: self.met,
         texts: texts.figures(),
       });
     }
     let _ = answer.try_send(value);
+  }
+
+  /// Logs this request where its service was the owner's longest yet (`longest_ns`, raised to it): its kind and parts,
+  /// so the slowest request a run met names itself (main's 57k table at 459c07141: one request of 863 ms, unnamed). A
+  /// new longest at most once a doubling past the first, so the log holds a few lines a run however many requests.
+  fn log_if_longest(&self, longest_ns: &mut u64) {
+    let Some((serve_ns, disk_ns)) = self.served else {
+      return;
+    };
+    if serve_ns <= longest_ns.saturating_mul(2) {
+      return;
+    }
+    *longest_ns = serve_ns;
+    slates_machine::log_line!(
+      "slates-store: the owner's longest service yet: a {} request served in {} ns ({} ns of it its log's reads), \
+       {} ns behind other work, {} ns its wake",
+      self.kind,
+      serve_ns,
+      disk_ns,
+      self.behind_ns,
+      self.wake_ns
+    );
   }
 }
 
@@ -798,6 +857,8 @@ fn serve(
   // Whether a request was served yet: the wait before the first is the owner's start, not a gap between asks, and is
   // never learned as one (a slow start, a test's setup under load, read as a long gap, kept a burst parked).
   let mut served_once = false;
+  // The longest service a request has had, for the log ([`Timer::log_if_longest`]).
+  let mut longest_ns = 0u64;
   loop {
     landings.let_go_if_dropped(&mut store);
     // From here the owner waits for work: a request sent after it waited on the owner's wake, one before on its work.
@@ -835,7 +896,11 @@ fn serve(
     else {
       continue;
     };
-    let mut timer = Timer::of((sent_ns, timed), (idle_ns, dequeued_ns, met), &store);
+    let mut timer = Timer::of(
+      ((sent_ns, timed), request.kind()),
+      (idle_ns, dequeued_ns, met),
+      &store,
+    );
     match request {
       Request::Begin {
         header,
@@ -1011,6 +1076,7 @@ fn serve(
         timer.reply((&store, &texts), &answer, answered);
       }
     }
+    timer.log_if_longest(&mut longest_ns);
   }
   store.abandon_landing();
   let checkpointed = store.checkpoint();

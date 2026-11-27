@@ -549,11 +549,6 @@ pub(crate) fn make_deferred(
     crate::made_commit::give_up(state, pending);
     return;
   }
-  #[cfg(test)]
-  if MADE_HELD_FOR_TEST.with(std::cell::Cell::get) {
-    HELD_MADE.with(|held| held.borrow_mut().push((turn, pending)));
-    return;
-  }
   let request = pending.request();
   if slates_rt::futures::spawn(made_landing(turn, pending))
     .and_then(slates_rt::futures::detach)
@@ -775,59 +770,6 @@ async fn made_before_step(pending: &mut crate::made_commit::Pending) -> Before {
   Before::Unlanded
 }
 
-#[cfg(test)]
-thread_local! {
-  /// Whether a test's shard holds its deferred made commits for [`made_landing_now`] rather than spawning their tasks,
-  /// which a test's step never runs.
-  pub(crate) static MADE_HELD_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-  /// The deferred made commits held for [`made_landing_now`].
-  static HELD_MADE: std::cell::RefCell<
-    Vec<(crate::repository::svn_commit::landing::Turn, crate::made_commit::Pending)>,
-  > = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Every held deferred made commit run now, as its task would ([`made_landing`]), its map's turns, its sealing and its
-/// carries through a test's synchronous drivers: for a test that holds the shard, so the task cannot run.
-#[cfg(test)]
-pub(crate) fn made_landing_now(state: &mut ShardState) {
-  while let Some((turn, mut pending)) = HELD_MADE.with(|held| held.borrow_mut().pop()) {
-    let before = made_before_step_blocking(state, &mut pending);
-    made_step(state, (turn, pending), before);
-  }
-}
-
-/// [`made_before_step`] in this step: a whole build it waits for settled between its turns.
-#[cfg(test)]
-fn made_before_step_blocking(
-  state: &mut ShardState,
-  pending: &mut crate::made_commit::Pending,
-) -> Before {
-  let mut head_first = false;
-  let mut building = None;
-  loop {
-    match map_turn(state, pending, (&mut head_first, &mut building)) {
-      Ok(true) => break,
-      Ok(false) => super::paths::whole_build::settle(state),
-      Err(why) => {
-        if let Some(change) = building.take() {
-          change.abandon(state);
-        }
-        return Before::Unmade(why);
-      }
-    }
-  }
-  let mut sealed = match sealed_made(state, pending) {
-    Err(why) => return Before::Unmade(why),
-    Ok(sealed) => sealed,
-  };
-  if home_and_land_blocking(state, &mut sealed).is_some() {
-    return Before::Landed(Box::new(sealed));
-  }
-  sealed.release_homed(state);
-  sealed.abandon(state);
-  Before::Unlanded
-}
-
 /// The status count of the turns git commits the server makes took to put their versions' maps over the preview
 /// ([`map_turn`], A-824): the slicing's non-vacuity count.
 pub(crate) const MAP_TURNS: &str = "vcs_commits.made_map_turns";
@@ -1024,10 +966,14 @@ fn first_ask(state: &mut ShardState, sealed: &mut SealedPush) -> Option<Ask> {
   };
   let (bytes, count) = names.filter(|(_, count)| *count > 0)?;
   let identity = super::put_names(state, &bytes)?;
-  // The attempt its holds in the region are for until its record commits (A-727 (d1a)).
-  let owner = sealed.home_owner(state);
+  // The attempt its holds in the region are for until its record commits (A-727 (d1a)); none where the shard's attempts
+  // and settles owed are at their bound (`homes::settle_bound`), its names given back.
+  let Ok(owner) = sealed.home_owner(state) else {
+    super::release_names(state, &identity);
+    return None;
+  };
   Some((
-    crate::git_push::Carry::Home(bytes, owner),
+    crate::git_push::Carry::Home(super::homes::HomeSource::Bytes(bytes), owner),
     Homing::Names((identity, count)),
   ))
 }
@@ -1048,13 +994,13 @@ fn next_ask(
         return None;
       }
       sealed.homed_as((identity, count));
-      let (bytes, packed) = sealed.pack_to_home()?;
+      let (source, packed) = sealed.pack_to_home()?;
       if !super::hold_for_record(state, &packed.0) {
         return None;
       }
-      let owner = sealed.home_owner(state);
+      let owner = sealed.home_owner(state).ok()?;
       Some(Some((
-        Carry::Home(bytes, owner),
+        Carry::Home(source, owner),
         Homing::Pack(homed.bytes, packed),
       )))
     }
@@ -1064,7 +1010,7 @@ fn next_ask(
         return None;
       }
       sealed.pack_homed_as(packed);
-      let landing = crate::git_push::landing_of(state, sealed.repository(), (names, homed.bytes))?;
+      let landing = crate::git_push::landing_of(state, sealed.repository(), (names, packed))?;
       let sequence = landing.sequence();
       Some(Some((
         Carry::Land(Box::new(landing)),
@@ -1093,7 +1039,7 @@ fn next_ask(
 /// Homes `sealed`'s names and then its pack in the region, and lands them on the node's store as one changeset, through
 /// the edges' own carry (`crate::git_push::carry`, C5 part 2b): the push then names the changeset. None where any of it
 /// fell short; the caller gives back what it holds.
-async fn home_and_land(sealed: &mut SealedPush) -> Option<()> {
+pub(crate) async fn home_and_land(sealed: &mut SealedPush) -> Option<()> {
   let (origin, shards, mut ask) = crate::state::with_state(|state| {
     let ask = first_ask(state, sealed)?;
     Some((state.shard, state.shards.clone(), ask))
@@ -1103,23 +1049,6 @@ async fn home_and_land(sealed: &mut SealedPush) -> Option<()> {
     let (carry, homing) = ask;
     let carried = crate::git_push::carry(origin, &shards, carry).await;
     match crate::state::with_state(|state| next_ask(state, sealed, homing, carried)).flatten()? {
-      Some(next) => ask = next,
-      None => return Some(()),
-    }
-  }
-}
-
-/// [`home_and_land`] carried as a test's synchronous driver carries a push (`git_push::tests::carried_blocking`).
-#[cfg(test)]
-pub(crate) fn home_and_land_blocking(
-  state: &mut ShardState,
-  sealed: &mut SealedPush,
-) -> Option<()> {
-  let mut ask = first_ask(state, sealed)?;
-  loop {
-    let (carry, homing) = ask;
-    let carried = crate::git_push::tests::carried_blocking(state, carry);
-    match next_ask(state, sealed, homing, carried)? {
       Some(next) => ask = next,
       None => return Some(()),
     }

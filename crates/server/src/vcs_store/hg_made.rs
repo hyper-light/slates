@@ -84,8 +84,12 @@ enum Unmade {
   Record,
   /// The register refused the entry.
   Entry(Refusal),
-  /// The changeset store refused the changeset, or the task could not run.
+  /// The made commit's task could not run.
   Unlanded,
+  /// The node's changeset store refused the changeset's landing, in its own typed words: its owner gone, the store's
+  /// own refusal, or its owner busy past the made commit's budget ([`landed_patiently`]). Refused and recorded, never
+  /// answered `Overloaded` for a retry that would meet the same refusal without end.
+  Landing(slates_store::owner::OwnerError),
   /// A client's push landed after the changeset was made: its fork is stale.
   Stale,
   /// A file of the change is held by its content-plane object alone, which an hg green never holds (A-760 (b) 4b).
@@ -93,6 +97,10 @@ enum Unmade {
   /// The parent changeset's or its manifest's text, let go once landed, could not be read back from the node's
   /// changeset store (goal 93, C1 (1)).
   ParentUnread,
+  /// The node's changeset store left a want of the changeset's intake unanswered, in its own typed words (the owner busy
+  /// past its bound, gone, or the store's refusal): never taken for the version not being the head (docs/bugs/
+  /// 2026-11-25-a-made-changeset-over-a-let-go-parent-was-never-made.md).
+  Store(super::hg_view::StoreUnanswered),
 }
 
 /// Written out rather than derived, as a derived `Debug` is all that reads the refusals and dead-code analysis ignores
@@ -109,6 +117,8 @@ impl std::fmt::Debug for Unmade {
       Unmade::Stale => formatter.write_str("Stale"),
       Unmade::Named(unread) => formatter.debug_tuple("Named").field(unread).finish(),
       Unmade::ParentUnread => formatter.write_str("ParentUnread"),
+      Unmade::Store(why) => formatter.debug_tuple("Store").field(why).finish(),
+      Unmade::Landing(refused) => formatter.debug_tuple("Landing").field(refused).finish(),
     }
   }
 }
@@ -224,8 +234,6 @@ async fn made_commit_landing(
           state.count(MADE, 1);
         }
       }
-      // The store refused the changeset: nothing of the accept is applied or durable, and its retry runs.
-      Some(Err(Unmade::Unlanded)) => crate::made_commit::abandon(state, (pending.request(), green)),
       // Its landing refused otherwise: refused typed and recorded, nothing applied.
       Some(Err(why)) => {
         unmade(state, &why);
@@ -444,39 +452,87 @@ type Prepared = (
 async fn landed(
   made: Made,
 ) -> Option<Result<(Made, (crate::repository::hg_push::Forked, Vec<u8>)), Unmade>> {
-  let prepared = crate::state::with_state(|state| prepared(state, &made))?;
+  let forked = match taken(&made).await? {
+    Ok(forked) => forked,
+    Err(why) => return Some(Err(why)),
+  };
+  let prepared = crate::state::with_state(|state| prepared(state, &made, forked))?;
   let (forked, (disk, header, parts, reference)) = match prepared {
     Ok(prepared) => prepared,
     Err(why) => return Some(Err(why)),
   };
-  if disk.land(header, parts).await.is_ok() {
-    return Some(Ok((made, (forked, reference))));
+  match landed_patiently(&disk, header, parts).await {
+    Ok(_) => Some(Ok((made, (forked, reference)))),
+    Err(refused) => {
+      crate::state::with_state(|state| give_back_fork(state, forked.fork))?;
+      Some(Err(Unmade::Landing(refused)))
+    }
   }
-  crate::state::with_state(|state| give_back_fork(state, forked.fork))?;
-  Some(Err(Unmade::Unlanded))
 }
 
-/// [`landed`]'s first half: the changegroup taken into a fork and the changeset made, its sequence taken now.
-fn prepared(state: &mut ShardState, made: &Made) -> Result<Prepared, Unmade> {
+/// `header` and `parts` landed on the node's changeset store: asked again after a yield while its owner is busy past
+/// its queue's bound, until the made commit's budget passes (the fleet's live deadline, `fleet::live_budget`, the bound
+/// every daemon wait is held to); any other refusal, an owner gone among them, answers at once. Until 2026-11-26 every
+/// refusal answered the submit `Overloaded`, unrecorded, so a client's retry met a gone owner again without end.
+async fn landed_patiently(
+  disk: &slates_store::owner::StoreHandle,
+  header: slates_store::log::Header,
+  parts: Vec<slates_store::owner::Part>,
+) -> Result<slates_store::log::Located, slates_store::owner::OwnerError> {
+  let deadline =
+    slates_rt::futures::now_ns().saturating_add(crate::fleet::live_budget().max_deadline_ns());
+  loop {
+    match disk.land(header, parts.clone()).await {
+      Err(slates_store::owner::OwnerError::Busy) if slates_rt::futures::now_ns() < deadline => {
+        slates_rt::futures::yield_now().await;
+      }
+      landed => return landed,
+    }
+  }
+}
+
+/// [`landed`]'s first part: `made`'s changegroup taken into a fork by the push's own intake from the task
+/// (`hg_push::take_made`), a want of the node's changeset store awaited. None where the shard's state is gone.
+async fn taken(made: &Made) -> Option<Result<crate::repository::hg_push::Forked, Unmade>> {
   #[cfg(test)]
   if fault_at(Fault::Prepared) {
-    return Err(Unmade::Record);
+    return Some(Err(Unmade::Record));
   }
-  let room = crate::vcs_share::room(state, made.repository).bytes;
-  let changegroup =
+  let room =
+    crate::state::with_state(|state| crate::vcs_share::room(state, made.repository).bytes)?;
+  let Ok(changegroup) =
     slates_hg::push::made::changegroup(&made.verified, &mut slates_hg::Admission::new(room))
-      .map_err(|_| Unmade::Record)?;
+  else {
+    return Some(Err(Unmade::Record));
+  };
   let taken = crate::repository::hg_push::take_made(
-    state,
     made.repository,
     (slates_hg::push::made::CHANGEGROUP_VERSION, changegroup),
     &mut slates_hg::Admission::new(room),
-  );
-  let mut forked = match taken {
-    Some(Ok(forked)) => forked,
-    Some(Err(_)) => return Err(Unmade::Record),
-    None => return Err(Unmade::NotHead),
-  };
+  )
+  .await;
+  Some(taken.map_err(|why| match why {
+    crate::repository::hg_push::MadeTake::Refused(refused) => {
+      let _ = crate::state::with_state(|state| {
+        slates_machine::log_line!(
+          "slates-server: partition {}: a made changeset's intake refused it: {refused:?}",
+          state.partition
+        );
+      });
+      Unmade::Record
+    }
+    crate::repository::hg_push::MadeTake::Store(why) => Unmade::Store(why),
+    crate::repository::hg_push::MadeTake::Gone => Unmade::NotHead,
+  }))
+}
+
+/// [`landed`]'s second part, in one step: the changeset made of `forked` with its made record and reference, its
+/// sequence taken now.
+fn prepared(
+  state: &mut ShardState,
+  made: &Made,
+  mut forked: crate::repository::hg_push::Forked,
+) -> Result<Prepared, Unmade> {
   let made_key = (green_key(made.green), made.version);
   // A made changeset's payload is named whole, as its intake takes it whole (`hg_push::take_made`; owed, GAPS).
   let name = slates_hg::import::record::PayloadName::of(&forked.changegroup.1);
@@ -640,13 +696,20 @@ fn made_at(state: &ShardState, green: DbVolumeId, version: u64) -> Option<Node> 
     .map(|(_, node)| *node)
 }
 
-/// The changeset `green`'s head attribute names (a push's).
+/// The changeset `green`'s head attribute names (a push's); for a line that owes its push (P2, a new line a push made,
+/// main's ruling (A) of 2026-11-26), the head that push sets, read from the debt without building it, so a push or a
+/// read that lists the lines never materializes one.
 fn named_head(state: &ShardState, green: DbVolumeId) -> Option<Node> {
-  state.greens.get(&green).and_then(|engine| {
-    engine
+  let lent = state.greens.lend(&green)?;
+  match lent.deferred() {
+    Some(owed) => owed
+      .push()
+      .head
+      .and_then(|bytes| Node::try_from(bytes).ok()),
+    None => lent
       .xattr(ROOT, HEAD_ATTRIBUTE)
-      .and_then(|bytes| Node::try_from(bytes).ok())
-  })
+      .and_then(|bytes| Node::try_from(bytes).ok()),
+  }
 }
 
 /// The Mercurial repository `green` is the green of.
@@ -785,7 +848,7 @@ fn branch_of(
 pub(crate) enum Fault {
   /// [`inputs`] refuses.
   Inputs,
-  /// [`prepared`] refuses.
+  /// [`taken`] refuses.
   Prepared,
   /// [`commit_made`] refuses.
   CommitMade,

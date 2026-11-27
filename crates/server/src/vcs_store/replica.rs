@@ -178,52 +178,55 @@ mod tests {
   /// every adoption keeping the store as made.
   #[test]
   fn a_replica_store_from_the_names_log_equals_the_owners_at_every_push_and_after_adoption() {
-    let mismatches = crate::test_store::audit_on_stored_shard("replica", |state| {
-      let repository = crate::git_push::tests::git_repository(state, "replica");
-      let mut parts: Vec<StateLogRecord> = state.db.take_state_log_records();
-      let mut mismatches = Vec::new();
-      for (scenario, _) in crate::git_push::tests::chain() {
-        let _ = crate::git_push::tests::pushed(state, repository, scenario.request);
-        parts.extend(state.db.take_state_log_records());
-        let owner = digest(state, repository);
-        let records = records_of(&parts);
-        let partition: Vec<Vec<u8>> = state
-          .db
-          .partition()
-          .repositories()
-          .objects(repository)
-          .map(<[u8]>::to_vec)
-          .collect();
-        if records != partition {
-          mismatches.push(format!("{}: the parts' records", scenario.name));
+    let mismatches =
+      crate::git_push::tests::on_stored_shard_awaited(["replica"], |[repository]| async move {
+        use crate::git_push::tests::on_state;
+        let mut parts: Vec<StateLogRecord> = on_state(|state| state.db.take_state_log_records());
+        let mut mismatches = Vec::new();
+        for (scenario, _) in crate::git_push::tests::chain() {
+          let _ = crate::git_push::tests::pushed_awaited(repository, scenario.request).await;
+          on_state(|state| {
+            parts.extend(state.db.take_state_log_records());
+            let owner = digest(state, repository);
+            let records = records_of(&parts);
+            let partition: Vec<Vec<u8>> = state
+              .db
+              .partition()
+              .repositories()
+              .objects(repository)
+              .map(<[u8]>::to_vec)
+              .collect();
+            if records != partition {
+              mismatches.push(format!("{}: the parts' records", scenario.name));
+            }
+            let record = state
+              .db
+              .partition()
+              .repositories()
+              .repository(repository)
+              .cloned()
+              .expect("the repository");
+            crate::vcs_store::free(state, repository);
+            assert_eq!(
+              begin(state, &record, records),
+              Ok(true),
+              "{}",
+              scenario.name
+            );
+            settle_rebuild(state, repository);
+            if digest(state, repository) != owner {
+              mismatches.push(format!("{}: the replica", scenario.name));
+            }
+            if !adopt(state, repository) {
+              mismatches.push(format!("{}: not adopted", scenario.name));
+            }
+            if digest(state, repository) != owner {
+              mismatches.push(format!("{}: the adopted store", scenario.name));
+            }
+          });
         }
-        let record = state
-          .db
-          .partition()
-          .repositories()
-          .repository(repository)
-          .cloned()
-          .expect("the repository");
-        crate::vcs_store::free(state, repository);
-        assert_eq!(
-          begin(state, &record, records),
-          Ok(true),
-          "{}",
-          scenario.name
-        );
-        settle_rebuild(state, repository);
-        if digest(state, repository) != owner {
-          mismatches.push(format!("{}: the replica", scenario.name));
-        }
-        if !adopt(state, repository) {
-          mismatches.push(format!("{}: not adopted", scenario.name));
-        }
-        if digest(state, repository) != owner {
-          mismatches.push(format!("{}: the adopted store", scenario.name));
-        }
-      }
-      mismatches
-    });
+        mismatches
+      });
     assert_eq!(mismatches, Vec::<String>::new());
   }
 }

@@ -4,7 +4,7 @@
 
 use super::{
   BlockFile, CHANGESET_ENTRY_BYTES, CHANGESETS, CONTENT_KEY_BYTES, CONTENT_VALUE_BYTES, CONTENTS,
-  Changeset, Identity, Rows, SectionKind, ShardDb, StoreError, U64, content_key, decode_changeset,
+  Changeset, Identity, Rows, ShardDb, StoreError, U64, content_key, decode_changeset,
   decode_content, field, identity_of_range, put, sections_of,
 };
 
@@ -107,7 +107,7 @@ pub(super) fn visit<F: BlockFile>(
   mut each: impl FnMut(&Identity, u64, u64) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
   for section in sections_of(file, end, row)? {
-    if section.kind == SectionKind::Payload {
+    if section.kind.keyed() {
       let identity = identity_of_range(file, section.offset, section.len, buffer)?;
       each(&identity, section.offset, section.len)?;
     }

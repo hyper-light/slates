@@ -156,6 +156,7 @@ fn answered_step<S: HgStores>(
 ) -> Result<Progress, Refused> {
   // A-740: a shard stuck in a step names it.
   let _doing = slates_rt::futures::doing("vcs_ssh::hg::answered_step");
+  let began = thread_cpu_ns();
   let answer_room = stores
     .fetch_turn(repository)
     .map_or(room, |(turn_room, _)| turn_room);
@@ -169,7 +170,36 @@ fn answered_step<S: HgStores>(
     let mut held = Admission::new(room);
     *generation = Some(stores.hold(repository, &mut held).ok_or_else(unheld)?);
   }
+  step_ran(began);
   Ok(progress)
+}
+
+/// Counter: the most thread CPU one step of a Mercurial SSH session's serving took on its shard, kept as a maximum (an
+/// answered step, or a stream's turn past its store asks): what a poll of the session holds the shard for, by the CPU so
+/// that a loaded machine's preemption is not counted (main's watchdog A/B at a95b34dfa: a clone's session held its shard
+/// 1,023 ms at load 54). Format: a counter name in the status report.
+pub(crate) const STEP_MOST_CPU_NS: &str = "vcs_store.hg_ssh_step_most_cpu_ns";
+/// Counter: those serving steps. Format: a counter name in the status report.
+pub(crate) const STEPS: &str = "vcs_store.hg_ssh_steps";
+
+/// The calling thread's CPU time, nanoseconds (`slates_rt::registry::calling_thread_cpu`); none where the platform reads
+/// none.
+pub(crate) fn thread_cpu_ns() -> Option<u64> {
+  slates_rt::registry::calling_thread_cpu().map(|reading| reading.spent_ns)
+}
+
+/// A serving step that began at thread CPU `began` ended: counted ([`STEPS`]), and its CPU ([`STEP_MOST_CPU_NS`]) where
+/// the thread's CPU can be read.
+fn step_ran(began: Option<u64>) {
+  let ran = began
+    .zip(thread_cpu_ns())
+    .map(|(began, ended)| ended.saturating_sub(began));
+  let _ = crate::state::with_state(|state| {
+    state.count(STEPS, 1);
+    if let Some(ran) = ran {
+      state.count_max(STEP_MOST_CPU_NS, ran);
+    }
+  });
 }
 
 /// A stream's turn (A-745, §4.17.1 "A fetch's answer"): what its next step asks of the node's changeset store answered
@@ -191,6 +221,7 @@ async fn streamed_turn<S: HgStores>(
   {
     return Err(unheld());
   }
+  let began = thread_cpu_ns();
   let (turn_room, quantum) = stores.fetch_turn(repository).unwrap_or((room, 0));
   let mut admission = Admission::new(turn_room);
   let start = slates_rt::futures::now_ns();
@@ -212,6 +243,7 @@ async fn streamed_turn<S: HgStores>(
     })
     .ok_or_else(unheld);
   paced.close(slates_rt::futures::now_ns(), costs);
+  step_ran(began);
   crate::vcs_store::hg_view::turn_taken();
   // A-724 piece 3d: what the turn wrote, learned as the fetch's demand once its answer ends.
   stores.wrote(

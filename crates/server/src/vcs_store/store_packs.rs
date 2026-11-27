@@ -109,6 +109,11 @@ impl StorePacks {
     (self.fetched, self.reused)
   }
 
+  /// The bytes of the pieces it holds now: at most its bound.
+  pub(crate) fn held_bytes(&self) -> usize {
+    self.held_bytes
+  }
+
   /// Makes `pack`'s (of `len` bytes) range `offset..until` held: each piece of it fetched from the store unless held,
   /// every one of them marked most recently used. A range past the pack's end is cut at its end.
   pub(crate) async fn fill(

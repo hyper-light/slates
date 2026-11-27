@@ -620,6 +620,158 @@ pub fn encoded_len(increment: &Increment, applied: &[Applied], identity: bool) -
   )
 }
 
+/// [`encoded_len`] taken a slice at a time (A-920 piece 1c: 6.5 ms whole for an import's revision of 9,000 files,
+/// debug, the step its commit ended in): what the increment declares indexed an op a unit, holding its paths' names
+/// itself so that it outlives each step's borrow of the increment, then each effect's bytes added an effect a unit.
+pub struct Measuring {
+  /// What the increment declares, so far.
+  declared: DeclaredBy<String>,
+  /// The next op to index, then the next effect to count.
+  at: usize,
+  /// Whether the ops are indexed.
+  indexed: bool,
+  /// The effects' bytes so far.
+  effects: usize,
+  /// Whether the entry carries a head identity.
+  identity: bool,
+}
+
+/// Begins measuring an entry as [`encoded_len`] does, with a head identity where `identity` ([`measure_step`]).
+pub fn measuring(identity: bool) -> Measuring {
+  Measuring {
+    declared: DeclaredBy::new(),
+    at: 0,
+    indexed: false,
+    effects: 0,
+    identity,
+  }
+}
+
+/// One step of `measuring` ([`measuring`]) for `increment`'s entry recording `applied`, both as they were when it began,
+/// a unit at least, until `spent`: once it ends, [`encoded_len`]'s answer.
+pub fn measure_step(
+  (increment, applied): (&Increment, &[Applied]),
+  measuring: &mut Measuring,
+  spent: &mut dyn FnMut() -> bool,
+) -> Option<usize> {
+  let ops = &increment.doc.ops;
+  while !measuring.indexed {
+    let Some(op) = ops.get(measuring.at) else {
+      measuring.indexed = true;
+      measuring.at = 0;
+      break;
+    };
+    measuring.declared.declare(&increment.doc.paths, op);
+    measuring.at = measuring.at.saturating_add(1);
+    if measuring.at < ops.len() && spent() {
+      return None;
+    }
+  }
+  while let Some(effect) = applied.get(measuring.at) {
+    measuring.effects = measuring
+      .effects
+      .saturating_add(applied_bytes(&measuring.declared, effect));
+    measuring.at = measuring.at.saturating_add(1);
+    if measuring.at < applied.len() && spent() {
+      return None;
+    }
+  }
+  let identity = measuring.identity.then_some([0; HASH_BYTES]);
+  Some(tail_bytes((0, measuring.effects), (None, identity, None)))
+}
+
+/// [`encode`] taken a slice at a time, for an entry carrying none of its increment's encoding and no completion or
+/// signature (A-920 6b: 12.5 ms whole for an import's revision of 9,000 files, debug, one step of its landing's entry):
+/// the entry measured first ([`Measuring`]: what the increment declares indexed an op a unit, then each effect's bytes
+/// added an effect a unit), so its buffer is reserved once at its exact length; then its header, each effect an effect a
+/// unit, and its trailers and digest, the digest hashed as each unit writes (A-920 7c: hashed whole in the last unit, 4.7
+/// ms of one step, debug). Its bytes are [`encode`]'s.
+pub struct Encoding {
+  /// What it names the increment's inputs by.
+  inputs: Inputs,
+  /// The head identity it records, where it records one.
+  identity: Option<[u8; HASH_BYTES]>,
+  /// Its measure, then the index its effects are written by.
+  measuring: Measuring,
+  /// The entry so far, once measured.
+  out: Option<Vec<u8>>,
+  /// The next effect to write.
+  at: usize,
+  /// The digest of the entry's bytes written so far, up to [`Encoding::hashed`].
+  digest: blake3::Hasher,
+  /// How many of the entry's bytes [`Encoding::digest`] has hashed.
+  hashed: usize,
+}
+
+/// Begins encoding an entry as [`encode`] does with no completion or signature ([`encode_step`]).
+pub fn encoding(inputs: Inputs, identity: Option<[u8; HASH_BYTES]>) -> Encoding {
+  Encoding {
+    inputs,
+    identity,
+    measuring: measuring(identity.is_some()),
+    out: None,
+    at: 0,
+    digest: blake3::Hasher::new(),
+    hashed: 0,
+  }
+}
+
+/// One step of `encoding` ([`encoding`]) for `increment`'s entry recording `applied`, both as they were when it began, a
+/// unit at least, until `spent`: once it ends, [`encode`]'s bytes.
+pub fn encode_step(
+  (increment, applied): (&Increment, &[Applied]),
+  encoding: &mut Encoding,
+  spent: &mut dyn FnMut() -> bool,
+) -> Option<Vec<u8>> {
+  let Encoding {
+    inputs,
+    identity,
+    measuring,
+    out,
+    at,
+    digest,
+    hashed,
+  } = encoding;
+  if out.is_none() {
+    let exact = measure_step((increment, applied), measuring, spent)?;
+    let mut begun = Vec::with_capacity(exact);
+    begun.extend_from_slice(&MAGIC.to_le_bytes());
+    begun.extend_from_slice(&VERSION.to_le_bytes());
+    begun.extend_from_slice(&inputs.identity);
+    begun.extend_from_slice(&inputs.len.to_le_bytes());
+    begun.push(ABSENT);
+    put_count(&mut begun, applied.len());
+    *out = Some(begun);
+    if !applied.is_empty() && spent() {
+      return None;
+    }
+  }
+  let written = out.as_mut()?;
+  while let Some(effect) = applied.get(*at) {
+    put_applied(written, &measuring.declared, effect);
+    digest.update(written.get(*hashed..).unwrap_or_default());
+    *hashed = written.len();
+    *at = at.saturating_add(1);
+    if *at < applied.len() && spent() {
+      return None;
+    }
+  }
+  let mut entry = out.take()?;
+  entry.push(ABSENT);
+  match identity {
+    Some(hash) => {
+      entry.push(PRESENT);
+      entry.extend_from_slice(hash.as_slice());
+    }
+    None => entry.push(ABSENT),
+  }
+  put_signature(&mut entry, None);
+  digest.update(entry.get(*hashed..).unwrap_or_default());
+  let digest = *digest.finalize().as_bytes();
+  entry.extend_from_slice(&digest);
+  Some(entry)
+}
+
 /// The bytes [`encode_carrying`] writes for an entry carrying `carried` bytes of its increment's encoding, with `applied`'s
 /// effects and its trailers, without writing them: the entry's exact length, which its buffer is reserved at.
 fn entry_bytes(
@@ -632,6 +784,15 @@ fn entry_bytes(
     .iter()
     .map(|effect| applied_bytes(declared, effect))
     .fold(0usize, usize::saturating_add);
+  tail_bytes((carried, effects), (completion, identity, signature))
+}
+
+/// An entry's bytes once its effects' are known (`effects`), carrying `carried` of its increment's encoding: its header,
+/// those, and its trailers.
+fn tail_bytes(
+  (carried, effects): (usize, usize),
+  (completion, identity, signature): (Option<Completion>, Option<[u8; 32]>, Option<Signature>),
+) -> usize {
   // A completion's marker, and its key with the work's marker, and the work's id where it names one.
   let completion = completion.map_or(1, |key| {
     let without_work = 1usize.saturating_add(COMPLETION_BYTES.saturating_sub(WORK_BYTES));
@@ -651,7 +812,10 @@ fn entry_bytes(
 }
 
 /// The bytes [`put_applied`] writes for `applied`, without writing them.
-fn applied_bytes(declared: &Declared<'_>, applied: &Applied) -> usize {
+fn applied_bytes<K: Ord + core::borrow::Borrow<str>>(
+  declared: &DeclaredBy<K>,
+  applied: &Applied,
+) -> usize {
   let tagged = |paths: &[&str]| {
     paths
       .iter()
@@ -927,42 +1091,59 @@ fn put_tagged_paths(out: &mut Vec<u8>, tag: u8, paths: &[&str]) {
 /// over the increment's ops, once per entry encoded or decoded; finding them by scanning every op
 /// for each splice and each copy cost O(effects × ops), quadratic for a version that splices many
 /// files.
-pub(crate) struct Declared<'a> {
+pub(crate) struct DeclaredBy<K> {
   /// Each path's content ops, in the increment's order.
-  ops: BTreeMap<&'a str, Vec<Op>>,
+  ops: BTreeMap<K, Vec<Op>>,
   /// Each copy's source version and whether it replaces, by destination, then source; the first a
   /// pair declares.
-  copies: BTreeMap<&'a str, BTreeMap<&'a str, (u64, bool)>>,
+  copies: BTreeMap<K, BTreeMap<K, (u64, bool)>>,
 }
+
+/// [`DeclaredBy`] borrowing the increment's paths: what an entry's encoding and decoding read.
+pub(crate) type Declared<'a> = DeclaredBy<&'a str>;
 
 impl<'a> Declared<'a> {
   /// The index of what `increment` declares: every op visited once.
   pub(crate) fn of(increment: &'a Increment) -> Declared<'a> {
-    let mut declared = Declared {
-      ops: BTreeMap::new(),
-      copies: BTreeMap::new(),
-    };
-    let paths = &increment.doc.paths;
+    let mut declared = DeclaredBy::new();
     for op in &increment.doc.ops {
       #[cfg(test)]
       tests::count_visit();
-      let Some(path) = paths.path(op.path) else {
-        continue;
-      };
-      if crate::engine::is_content(op.kind) {
-        declared.ops.entry(path).or_default().push(*op);
-      } else if op.kind == OpKind::Copy
-        && let Some(from) = paths.path(op.src)
-      {
-        declared
-          .copies
-          .entry(path)
-          .or_default()
-          .entry(from)
-          .or_insert((op.at, op.replaces()));
-      }
+      declared.declare(&increment.doc.paths, op);
     }
     declared
+  }
+}
+
+impl<K: Ord + core::borrow::Borrow<str>> DeclaredBy<K> {
+  /// Nothing declared yet.
+  fn new() -> DeclaredBy<K> {
+    DeclaredBy {
+      ops: BTreeMap::new(),
+      copies: BTreeMap::new(),
+    }
+  }
+
+  /// `op`, named in `paths`, added to what is declared: a content op to its path's, a copy to its destination's.
+  fn declare<'p>(&mut self, paths: &'p crate::ops_doc::PathTable, op: &Op)
+  where
+    K: From<&'p str>,
+  {
+    let Some(path) = paths.path(op.path) else {
+      return;
+    };
+    if crate::engine::is_content(op.kind) {
+      self.ops.entry(K::from(path)).or_default().push(*op);
+    } else if op.kind == OpKind::Copy
+      && let Some(from) = paths.path(op.src)
+    {
+      self
+        .copies
+        .entry(K::from(path))
+        .or_default()
+        .entry(K::from(from))
+        .or_insert((op.at, op.replaces()));
+    }
   }
 
   /// The content ops the increment declares for `path`, in order.
@@ -979,7 +1160,11 @@ impl<'a> Declared<'a> {
 
 /// Appends one effect as an entry records it (module docs); a computed verdict's wire form writes its effects so too
 /// (`crate::engine`'s `computed_wire`, A-658 part 3a).
-pub(crate) fn put_applied(out: &mut Vec<u8>, declared: &Declared<'_>, applied: &Applied) {
+pub(crate) fn put_applied<K: Ord + core::borrow::Borrow<str>>(
+  out: &mut Vec<u8>,
+  declared: &DeclaredBy<K>,
+  applied: &Applied,
+) {
   match applied {
     Applied::Special(path, node) => {
       put_tagged_paths(out, tag::SPECIAL, &[path]);
@@ -1486,6 +1671,60 @@ mod tests {
       entry.len(),
       "an entry of every effect kind"
     );
+  }
+
+  /// A-920 6b ([`encode_step`]): an entry encoded a unit a step is the entry encoded whole. Do: encode, whole and a unit
+  /// a step (every step spent once its first unit is taken), the entry of a one-file increment recording an effect of
+  /// every kind, with a head identity and without. Expect the same bytes both ways, in more steps than effects.
+  #[test]
+  fn an_entry_encoded_a_unit_a_step_is_the_entry_encoded_whole() {
+    let small = one_file(b"abc");
+    let bytes = small.encode();
+    let every = every_kind_applied(&small);
+    for identity in [None, Some([6u8; 32])] {
+      let whole = encode(held_for_tests(&bytes), &small, &every, None, identity, None);
+      let mut encoding = super::encoding(held_for_tests(&bytes), identity);
+      let mut steps = 1usize;
+      let sliced = loop {
+        if let Some(entry) = encode_step((&small, &every), &mut encoding, &mut || true) {
+          break entry;
+        }
+        steps = steps.saturating_add(1);
+      };
+      assert_eq!(sliced, whole, "identity {identity:?}");
+      assert!(steps > every.len(), "{steps} steps");
+    }
+  }
+
+  /// A-920 6b (`Increment::encode_step`): an increment encoded a unit a step is the increment encoded whole. Do: encode,
+  /// whole and a unit a step with a byte of its inline bytes a unit, a one-file increment, then the same with evidence
+  /// and a named run. Expect the same bytes both ways, in more steps than its inline bytes.
+  #[test]
+  fn an_increment_encoded_a_unit_a_step_is_the_increment_encoded_whole() {
+    let plain = one_file(b"abcdef");
+    let mut named = one_file(b"xyz");
+    named.evidence.push([4; 32]);
+    named.push_named(crate::named::NamedRun {
+      identity: crate::named::Identity {
+        hash: [5; 32],
+        len: 7,
+      },
+      offset: 0,
+      len: 7,
+    });
+    for increment in [plain, named] {
+      let whole = increment.encode();
+      let mut encoding = crate::engine::IncrementEncoding::default();
+      let mut steps = 1usize;
+      let sliced = loop {
+        if let Some(bytes) = increment.encode_step(&mut encoding, 1, &mut || true) {
+          break bytes;
+        }
+        steps = steps.saturating_add(1);
+      };
+      assert_eq!(sliced, whole);
+      assert!(steps > increment.post_state.len(), "{steps} steps");
+    }
   }
 
   /// One effect of every kind [`put_applied`] writes, each of its encodings: a splice as declared and one mapped, a copy

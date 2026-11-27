@@ -124,6 +124,7 @@ fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
     idle_ratio: 1,
     idle_floor_ns: slates_rt::runtime::NO_IDLE_FLOOR_NS,
     idle_ceiling_ns: slates_rt::runtime::NO_IDLE_CEILING_NS,
+    quantum_ceiling_ns: slates_rt::runtime::NO_QUANTUM_CEILING_NS,
   };
   let rt = LocalRuntime::new(&config(PRIOR_NS, Some(tracking))).unwrap();
   let ctx = rt.context();
@@ -218,6 +219,7 @@ fn a_loaded_shards_idle_window_stays_at_its_floor_while_its_mean_climbs() {
     idle_ratio: NO_RATIO,
     idle_floor_ns: IDLE_FLOOR_NS,
     idle_ceiling_ns: slates_rt::runtime::NO_IDLE_CEILING_NS,
+    quantum_ceiling_ns: slates_rt::runtime::NO_QUANTUM_CEILING_NS,
   };
   let rt = LocalRuntime::new(&config(QUIET_PRIOR_NS, Some(tracking))).unwrap();
   let ctx = rt.context();
@@ -699,4 +701,47 @@ fn a_poll_the_host_kept_off_its_cpu_is_not_its_tasks() {
     (0, 0, LONG_POLLS - 1, 1),
     "{counters:?}"
   );
+}
+
+/// Shape: a wake learned on a loaded machine past 84a's 1 ms loaded bar, as A-920's release probe 5 read the step
+/// quantum at load 38-56 (about 1.05 ms), with room over it: two milliseconds.
+const LOADED_PAST_BAR_NS: u64 = 2_000_000;
+/// Shape: the quantum ceiling the loaded shard is held to, half 84a's 1 ms bar (the daemon's, A-928).
+const QUANTUM_CEILING_NS: u64 = 500_000;
+
+/// A-928: a step runs to the first check at or past its quantum, so it is one quantum and the unit begun before that
+/// check, and a wake learned under load grows the quantum past any bar. Do: track a shard whose wake estimate stands
+/// past 84a's bar, given a quantum ceiling of half the bar. Expect its step quantum, on the shard and as a task on it
+/// reads it (`step_budget_ns`), at the ceiling; its wake cost, the estimate itself, unbent; and a shard given no
+/// ceiling stepping by its estimate as before.
+#[test]
+#[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
+fn a_wake_learned_past_the_bar_steps_by_the_quantum_ceiling() {
+  let held = WakeTracking {
+    prior_ns: LOADED_PAST_BAR_NS,
+    shift: SHIFT,
+    idle_ratio: 1,
+    idle_floor_ns: slates_rt::runtime::NO_IDLE_FLOOR_NS,
+    idle_ceiling_ns: slates_rt::runtime::NO_IDLE_CEILING_NS,
+    quantum_ceiling_ns: QUANTUM_CEILING_NS,
+  };
+  let rt = LocalRuntime::new(&config(LOADED_PAST_BAR_NS, Some(held))).unwrap();
+  let ctx = rt.context();
+  let (tx, rx) = channel::<Option<u64>>();
+  rt.spawn(async move {
+    let _ = tx.send(slates_rt::futures::step_budget_ns());
+  })
+  .unwrap();
+  step_until_idle(ctx);
+  assert_eq!(rx.try_recv().unwrap(), Some(QUANTUM_CEILING_NS));
+  assert_eq!(ctx.quantum_ns(), QUANTUM_CEILING_NS);
+  assert_eq!(ctx.wake_cost_ns(), LOADED_PAST_BAR_NS);
+  assert_eq!(ctx.counters().wake_cost_ns, LOADED_PAST_BAR_NS);
+
+  let unheld = WakeTracking {
+    quantum_ceiling_ns: slates_rt::runtime::NO_QUANTUM_CEILING_NS,
+    ..held
+  };
+  let free = LocalRuntime::new(&config(LOADED_PAST_BAR_NS, Some(unheld))).unwrap();
+  assert_eq!(free.context().quantum_ns(), LOADED_PAST_BAR_NS);
 }

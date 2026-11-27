@@ -3669,18 +3669,18 @@ fn a_shards_start_holds_each_heavy_piece_in_a_slice_of_its_own() {
 
 /// A-226, a give-back holds its shard no longer than a slice: do start a one-shard daemon over a fresh anchor, its
 /// recovery memory taken as written whole (as over an image before A-926's marks, so its first idle ticks give back
-/// both checkpoint slots and the whole log, 18 GB a shard on a 128 GiB Mac), probe the shard with a volume's status while those ticks run, leave
-/// it alone until the journal has nothing left to give back, and probe it again. Expect the recovery give-back counted
-/// (the non-vacuity count) and nothing more given back once it had finished. The probes' latencies are printed and not
-/// judged: a probe's wall time on a loaded host says what the host did (10.4 ms against 2.2 ms at load 65 on Linux,
-/// with nothing of the shard's own in it). Then do restart the daemon over the same anchor and give its recovery memory
-/// back a step at a time, as an idle sweep pass does; expect the p99 step to have held its shard no more than `STEP_QUANTA`
-/// step quanta of the shard thread's own CPU, which load does not inflate. That judge runs wherever a thread clock is
-/// fine enough to time a step by: CI's `gates` job (`cargo test --workspace` on `ubuntu-latest` and `macos-latest`,
-/// `.github/workflows/ci.yml`), and every Linux and macOS development machine whatever its load; it skips loudly on
-/// Windows. Red-checked with the slice made unbounded (one step a whole region, as before A-226's slices). Before the
-/// give-back was sliced, one step marked 18,325,143,552 bytes reusable in 18 to 21 ms (macOS) while every probe that
-/// reached the shard waited.
+/// both checkpoint slots and the whole log, 18 GB a shard on a 128 GiB Mac), probe the shard with a volume's status
+/// while those ticks run, leave it alone until the journal has nothing left to give back, and probe it again. Expect
+/// the recovery give-back counted (the non-vacuity count) and nothing more given back once it had finished. The probes'
+/// latencies are printed and not judged: a probe's wall time on a loaded host says what the host did (10.4 ms against
+/// 2.2 ms at load 65 on Linux, with nothing of the shard's own in it). Then do restart the daemon over the same anchor
+/// and give its recovery memory back a step at a time, as an idle sweep pass does; expect the p99 step to have held its
+/// shard no more than `STEP_QUANTA` step quanta of the shard thread's own CPU, which load does not inflate. That judge
+/// runs wherever a thread clock is fine enough to time a step by: CI's `gates` job (`cargo test --workspace` on
+/// `ubuntu-latest` and `macos-latest`, `.github/workflows/ci.yml`), and every Linux and macOS development machine
+/// whatever its load; it skips loudly on Windows. Red-checked with the slice made unbounded (one step a whole region,
+/// as before A-226's slices). Before the give-back was sliced, one step marked 18,325,143,552 bytes reusable in 18 to
+/// 21 ms (macOS) while every probe that reached the shard waited.
 #[test]
 fn a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step() {
   /// Shape: a probe window, in sweep intervals (`LIVENESS_BUDGET_NS` each): the first pass after the volume's create
@@ -3865,13 +3865,14 @@ fn returned_after_idle(daemon: &Daemon, before: u64) -> u64 {
       .unwrap_or(0)
   };
   // Bounded, so a give-back that never counts fails the test rather than spins it (a 38-minute hang on 2026-11-25, when
-  // A-926 left the journal's dead ranges under a page and the give-back took no whole page).
+  // A-926 left the journal's dead ranges in byte extents off the object's pages and every page-sized piece of the
+  // give-back held no whole page).
   let patience = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(60));
   let began = std::time::Instant::now();
   while cfg!(any(target_os = "linux", target_os = "macos")) && returned() <= before {
     assert!(
       began.elapsed() < patience,
-      "no recovery memory given back within {patience:?}: {} counted",
+      "no recovery memory given back within {patience:?}: {} bytes counted",
       returned()
     );
     std::thread::yield_now();

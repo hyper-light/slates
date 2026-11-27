@@ -146,13 +146,17 @@ impl Query {
           .filter(|owner| *owner != local && eligible(state, *owner, RegionId(self.region)))
       })
       .or_else(|| {
-        let first = state
-          .council
-          .configuration()
+        let configuration = state.council.configuration();
+        let first = configuration
           .moved
           .get(&object.placement_key())
           .map_or_else(|| object.creator(), |moved| moved.owner);
-        eligible(state, first, RegionId(self.region)).then_some(first)
+        // A first owner the configuration keeps a retirement or a completed takeover of lost its objects to a successor
+        // (A-921 part 2): readmitted after a false death it is a member again, but never the owner of what it held
+        // then, so it is not offered; the location round finds the adopter, which claims while it serves.
+        let taken_over = configuration.retired.contains_key(&first)
+          || configuration.completed.contains_key(&first);
+        (!taken_over && eligible(state, first, RegionId(self.region))).then_some(first)
       })
       .filter(|owner| *owner != local)
   }
@@ -659,6 +663,143 @@ fn fold_replies(
   return_sessions(sessions);
 }
 
+/// The query of `object`'s owner at its home region (A-921 part 2): the region the root configuration homes it in, from
+/// its creator's region, else this node's own; what the location round's peers judge it by (`serve`'s home check).
+pub(crate) fn home_query(state: &ShardState, object: ObjectId) -> Query {
+  let local = state.fleet.host();
+  let region = state
+    .node_regions
+    .get(&object.creator())
+    .or_else(|| state.node_regions.get(&local))
+    .map_or(RegionId(0), |creator_region| {
+      state.root.configuration().home_of(object, *creator_region)
+    });
+  Query::new(state, object, region.0)
+}
+
+/// The one lookup of an object's owner a node that does not serve it makes (A-921 part 2, main 01a20182's ruling of
+/// 2026-11-25: lifted from the volume forward, `verbs::resolve_and_forward`, so the volume forward, the version-control
+/// edges and the homes' resolution share it, AUD-08's rule for every object): the direct route
+/// ([`Query::known_owner`]), then a location round, every poll interval, within the membership horizon and the failover
+/// SLO. `None` where no owner claimed within it, which a caller answers `OwnerUnreachable`, typed.
+/// The owner of `query`'s object, resolved again for as long as the location budget allows: the direct route (the
+/// volume's creator while eligible) and then a location round, asked again every poll interval. The requests are not
+/// sent until an owner is found, so a retry can never apply a verb twice. The owner can be briefly unfindable while it
+/// is live: the failure detector condemns a live member within its stated mistake allowance, the death is gossiped,
+/// and every node drops its routes and its link to that member until it refutes and is linked again (2026-10-08: a
+/// foreign node held a live successor dead that another node had condemned, 1 against an allowance of 4.9, and its
+/// client was refused `HomedElsewhere`). A takeover's adoption leaves the same window. Measured
+/// (`a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget`, 10 false deaths per arm): without the
+/// retry every false death refused a call, and the next call 10 ms later was served after 22–217 ms; with location
+/// rounds alone, paced a heartbeat, 1 s and still refused; with the direct route first, paced a heartbeat, none refused
+/// and 111–224 ms; paced a tenth of a heartbeat, none refused and 21–218 ms. Each retry is counted
+/// (`fleet.owner_location.retried`); `None` once the budget is spent with no owner found, counted by how it ended
+/// ([`LOCATION_SPENT`], [`LOCATION_SLO_ENDED`]) and in all ([`LOCATION_GAVE_UP`]).
+///
+/// The budget (A-317) is the membership horizon (`lease::horizon_ns`: the longest a live member can go unanswered
+/// before a detector declares it dead, the window in which a false death is gossiped and refuted; the supervisor's
+/// derivation of 2026-11-07), on the wall from the first look, and it ends only with a look begun after the horizon,
+/// which asks the direct route again once its round returns: a round waits on its peers while the shard runs its other
+/// work, so a refutation the shard read meanwhile is seen before the location gives up. Before, one liveness budget of
+/// wall time ran out on a control shard kept off its CPU while that gossip waited to be read (clients' runs, nice 19
+/// beside two spinners a CPU: 1 or 2 calls refused in every false death), and a single round waiting on silent peers
+/// spent it whole, so the location never looked again. Counted in polls (clients' `3c072f490`), a location whose
+/// rounds each wait a liveness budget on a silent peer ran to the failover SLO, ten times main's second; ended by the
+/// control shard's driver waits (A-292's rule), a busy shard, which rarely waits, held it to the SLO too (A-315 found
+/// the same on the forward lane). The operator's failover SLO caps the whole on the wall.
+pub(crate) async fn locate_owner(query: Query, bound_ns: Option<u64>) -> Option<HostId> {
+  let began = slates_rt::futures::now_ns();
+  let located = locate_within_horizon(query, bound_ns).await;
+  // Its own time, from before its first look to its answer in the poll that made it (A-921 part 2: what a bounded
+  // caller's lane is held for, apart from any task's resume after it).
+  let elapsed = slates_rt::futures::now_ns().saturating_sub(began);
+  crate::state::with_state(|state| state.count_max(ELAPSED_MOST, elapsed));
+  if located.is_none() {
+    // Counted here, so any way the location gives up is seen; its budget's own two ends are counted within it.
+    crate::state::with_state(|state| state.count(LOCATION_GAVE_UP, 1));
+  }
+  located
+}
+
+/// [`locate_owner`]'s loop: a look every poll interval (the direct route, a round, and the direct route again,
+/// with what the shard read while the round waited), until an owner is found, a look begun after the membership
+/// horizon has found none, or the failover SLO has passed. Each round asks under the root this node holds at its look
+/// (`owner_location::Query::under_held_root`, A-504), so a newer root a peer's refusal sent its learner to fetch is the
+/// view the next round asks under; before, every round asked under the root the lookup began with.
+async fn locate_within_horizon(query: Query, bound_ns: Option<u64>) -> Option<HostId> {
+  let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
+  let began = slates_rt::futures::now_ns();
+  let horizon = crate::lease::horizon_ns();
+  // The caller's own bound, where it gave one (A-921 part 2: the home healer's, whose lane must not be held past its
+  // budget), ends the one sequence early; never a second sequence.
+  let ceiling = crate::state::with_state(|state| state.failover_ns)
+    .unwrap_or(horizon)
+    .min(bound_ns.unwrap_or(u64::MAX));
+  let horizon = horizon.min(bound_ns.unwrap_or(u64::MAX));
+  let known = || crate::state::with_state(|state| query.known_owner(state, None)).flatten();
+  loop {
+    let look_at = slates_rt::futures::now_ns();
+    let look_began = look_at.saturating_sub(began);
+    // The direct route first (the volume's creator, while eligible), as a fresh call would take it.
+    if let Some(owner) = known() {
+      return Some(owner);
+    }
+    // Asked under the root this node holds now: one a peer's refusal sent its root learner to fetch since the lookup
+    // began is the view its peers answer under (A-504).
+    let asked = crate::state::with_state(|state| query.under_held_root(state)).unwrap_or(query);
+    if let Ok(owner) = locate(asked).await {
+      return Some(owner);
+    }
+    // The round waited on its peers while the shard ran its other work: a refutation read meanwhile is seen now.
+    if let Some(owner) = known() {
+      return Some(owner);
+    }
+    let looked = slates_rt::futures::now_ns().saturating_sub(look_at);
+    crate::state::with_state(|state| state.count_max(LOOK_MOST, looked));
+    if slates_rt::futures::now_ns().saturating_sub(began) >= ceiling {
+      crate::state::with_state(|state| state.count(LOCATION_SLO_ENDED, 1));
+      return None;
+    }
+    if look_began >= horizon {
+      crate::state::with_state(|state| state.count(LOCATION_SPENT, 1));
+      return None;
+    }
+    // The next look a pace on, never past the ceiling: a bounded caller's lane is held to its bound and a wait's
+    // lateness, never a whole pace past it (A-921 part 2: the home healer's pass ran one pace past its budget).
+    let now = slates_rt::futures::now_ns();
+    let wait = pace.min(ceiling.saturating_sub(now.saturating_sub(began)));
+    if slates_rt::futures::sleep(wait).await.is_err() {
+      return None;
+    }
+    // How late the wait came back to this task past its deadline: the timer's lateness and the task's resume.
+    let late = slates_rt::futures::now_ns().saturating_sub(now.saturating_add(wait));
+    crate::state::with_state(|state| state.count_max(WAIT_LATE_MOST, late));
+    crate::state::with_state(|state| state.count("fleet.owner_location.retried", 1));
+  }
+}
+
+/// Counter: the longest look an owner location took on this shard (the direct route, a round and the direct route
+/// again, [`locate_within_horizon`]), in nanoseconds: what a bounded caller's lane may be held past its bound by the
+/// look begun at it (A-921 part 2). Format: a counter name, read as the most it reached ([`ShardState::count_max`]).
+pub(crate) const LOOK_MOST: &str = "fleet.owner_location.look_most_ns";
+/// Counter: the most an owner location's wait between looks came back past its deadline on this shard, in
+/// nanoseconds (the timer's lateness and the task's resume after it): with [`LOOK_MOST`], what a bounded caller is held
+/// past its bound (A-921 part 2). Format: a counter name, read as the most it reached ([`ShardState::count_max`]).
+pub(crate) const WAIT_LATE_MOST: &str = "fleet.owner_location.wait_late_most_ns";
+/// Counter: the longest an owner location took on this shard, from before its first look to its answer in the poll that
+/// made it, in nanoseconds ([`locate_owner`]): a bounded caller's is within its bound, [`WAIT_LATE_MOST`] and
+/// [`LOOK_MOST`] (A-921 part 2). Format: a counter name, read as the most it reached ([`ShardState::count_max`]).
+pub(crate) const ELAPSED_MOST: &str = "fleet.owner_location.elapsed_most_ns";
+
+/// Counter: a forward's owner location ended by the operator's failover SLO, the owner still not found.
+const LOCATION_SLO_ENDED: &str = "fleet.owner_location.slo_ended";
+/// Counter: a forward's owner location spent its budget, a look begun past the membership horizon having found no
+/// owner.
+const LOCATION_SPENT: &str = "fleet.owner_location.budget_spent";
+/// Counter: a forward's owner location gave up with no owner found, for any reason: at most the budget's two ends,
+/// [`LOCATION_SLO_ENDED`] and [`LOCATION_SPENT`], when nothing gives up early (the shard stopping).
+const LOCATION_GAVE_UP: &str = "fleet.owner_location.gave_up";
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -912,6 +1053,45 @@ mod tests {
     }
   }
 
+  /// A-921 part 2 (main 01a20182's ruling of 2026-11-25: the stale-creator skip's red, on the exact state). Do: on a
+  /// shard whose routing knows nothing of an object, its creator taken over (the configuration keeps its retirement), yet
+  /// held alive in this node's membership and in the object's region; ask the direct route. Expect no owner named (the
+  /// location round finds the adopter), never the creator. Red without the skip: the creator named.
+  #[test]
+  fn the_direct_route_never_names_a_creator_a_kept_takeover_retired() {
+    use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+    use slates_cluster::membership::{Liveness, MemberState};
+    use slates_db::register::Quorum;
+    let named = crate::daemon::audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let (creator, other) = (HostId(local.0 ^ 0x51), HostId(local.0 ^ 0x52));
+      state.council = RegionalCouncil::new(
+        local,
+        vec![local, creator, other],
+        vec![local],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        3,
+        false,
+      );
+      assert!(state.council.propose(Reconfiguration::TakeOver(creator)));
+      assert!(state.council.configuration().retired.contains_key(&creator));
+      for host in [local, creator] {
+        state.node_regions.insert(host, RegionId(0));
+      }
+      state.fleet.observe(
+        creator,
+        MemberState {
+          liveness: Liveness::Alive,
+          incarnation: 1,
+        },
+      );
+      let object = ObjectId::new(creator, 7);
+      Query::new(state, object, 0).known_owner(state, None)
+    });
+    assert_eq!(named, None, "the retired creator is never named");
+  }
+
   /// A-489 (§4.8 Lookup; D-14 root learners): a location query bound to a newer root view than this node holds is
   /// refused, since a reply binds the view it was asked under, and it tells this node that it is behind and that the
   /// asker holds the newer root: the root learner's next period fetches from the asker. Main's runs of the fleet test
@@ -1093,6 +1273,47 @@ mod tests {
       answers.fold(query(), HostId(1), &bytes),
       Err(LocationError::Malformed),
       "a refusal is no reply"
+    );
+  }
+
+  /// A-921 part 2's bound held by the lookup itself (main 01a20182's order of 2026-11-26: the home healer's resolution
+  /// pass over unclaimed attempts ran 10.08 to 10.57 ms past its 1,998 ms budget in 6 of main's last 4 sets, one pace
+  /// and a wait's lateness). Do: on a one-shard daemon, look up the owner of an object no node holds, bounded at two
+  /// paces and a half, so its bound ends inside a pace. Expect: none found, and the lookup's own time
+  /// ([`ELAPSED_MOST`], before its first look to its answer, not the test task's resume after it) within its bound, the
+  /// most its own waits came back late ([`WAIT_LATE_MOST`]) and its longest look ([`LOOK_MOST`]), each measured in the
+  /// lookup. Red before: it slept a whole pace whatever was left of its bound, so it ended at least half a pace past
+  /// it.
+  #[test]
+  fn a921_a_bounded_owner_lookup_ends_within_its_bound_and_its_waits_lateness() {
+    let daemon = crate::daemon::audit_daemon();
+    let (sent, got) = std::sync::mpsc::channel();
+    let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
+    crate::daemon::observe_first(&daemon, move |state| {
+      let object = ObjectId::new(HostId(u64::MAX >> 1), 7);
+      let query = home_query(state, object);
+      let task = slates_rt::futures::spawn(async move {
+        let bound = pace.saturating_mul(2).saturating_add(pace / 2);
+        let found = locate_owner(query, Some(bound)).await;
+        let held = crate::state::with_state(|state| {
+          let most = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+          (most(ELAPSED_MOST), (most(WAIT_LATE_MOST), most(LOOK_MOST)))
+        });
+        let _ = sent.send((found, bound, held));
+      })
+      .expect("the task");
+      slates_rt::futures::detach(task).expect("detached");
+    });
+    let (found, bound, held) = got.recv().expect("the lookup ended");
+    daemon.stop();
+    let (took, (late, look)) = held.expect("the shard's state");
+    assert_eq!(found, None, "no node holds the object");
+    let over = took.saturating_sub(bound).saturating_sub(late);
+    assert!(
+      over < pace / 2,
+      "the lookup overran its bound ({bound} ns) and its waits' lateness ({late} ns) by {over} ns, half a pace \
+       ({} ns) or more: {took} ns, its longest look {look} ns",
+      pace / 2
     );
   }
 }

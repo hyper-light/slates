@@ -1027,6 +1027,53 @@ fn t_a614a_tags_at_old_commits_derive_each_from_the_one_before_a_unit_a_turn() {
   assert!(store.is_empty());
 }
 
+/// Main 01a20182's sample of 2026-11-25 (git/git's clone waiting on the encoding behind its push, a third of it in
+/// `Repository::derivations_due`, which walked every chain's versions on every turn). Do: push [`line_with_old_tags`]'s
+/// line as green 0's create and its tags as the creates of greens 1 on, every version left for its first reader; ask
+/// whether derivations are due; derive every version; ask again, then let the derived sets go and ask once more.
+/// Expect: due, then not, then due again; and once every version is known, the question looks at no version, however
+/// many the repository holds (`StoreCounters::due_looked`). Red before: each ask looked at every version.
+#[test]
+fn t_a614a_whether_derivations_are_due_is_answered_without_walking_the_versions() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let mut repository = Repository::new(format);
+  let (line, tip, tags) = line_with_old_tags(format);
+  let mut push = sealed(&repository, &mut store, line);
+  let created = repository.admit(&store, &push, 0, Some(tip)).unwrap();
+  repository
+    .commit(&mut store, &mut push, &[created])
+    .unwrap();
+  let ids: Vec<ObjectId> = tags.iter().map(|tag| tag.id).collect();
+  let mut push = sealed(&repository, &mut store, tags);
+  let moves: Vec<Move> = (1..)
+    .zip(&ids)
+    .map(|(green, id)| repository.admit(&store, &push, green, Some(*id)).unwrap())
+    .collect();
+  repository.commit(&mut store, &mut push, &moves).unwrap();
+  assert!(
+    repository.derivations_due(),
+    "every version left for its reader"
+  );
+  derive_all(&repository, &mut store);
+  let before = repository.counters().due_looked;
+  assert!(!repository.derivations_due(), "every version known");
+  let looked = repository.counters().due_looked - before;
+  assert_eq!(
+    looked,
+    0,
+    "the question looked at {looked} of {} versions",
+    1 + ids.len()
+  );
+  repository.forget_derived(&mut store).unwrap();
+  assert!(
+    repository.derivations_due(),
+    "due again once the sets are let go"
+  );
+  repository.release(&mut store).unwrap();
+  assert!(store.is_empty());
+}
+
 /// The green and version the landing map gives each position of `positions`.
 fn bringers(repository: &Repository, positions: &Positions) -> BTreeSet<Option<(u64, u64)>> {
   let mut found = BTreeSet::new();

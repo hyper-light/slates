@@ -2427,11 +2427,63 @@ fn planned_both(
   let (Ok(one), Ok(other)) = planned else {
     return Ok(false);
   };
-  let made = (whole.commit_planned(one), sliced.commit_planned(other));
+  let made = (
+    whole.commit_planned(one),
+    committed_a_unit_a_step(sliced, other)?,
+  );
   if made.0 != made.1 {
     return Err(format!("committed {made:?}"));
   }
   Ok(made.0.is_ok())
+}
+
+/// `planned` committed on `index` a unit a step ([`Index::commit_begin`], [`Index::commit_step`], every step spent
+/// after its first unit), the index read between every two steps as it read before the commit began: every path it
+/// names or the revision names, at every revision up to the youngest then. The commit's answer; where a read moved
+/// mid-commit, which.
+pub(crate) fn committed_a_unit_a_step(
+  index: &mut Index,
+  planned: Planned,
+) -> Result<Result<Revision, IndexRefusal>, String> {
+  let names: BTreeSet<String> = index
+    .paths
+    .iter()
+    .map(|entry| entry.path.to_string())
+    .chain(planned.changes().iter().map(|change| change.path.clone()))
+    .collect();
+  let youngest = index.youngest();
+  let before = reads(index, &names, youngest);
+  let mut committing = match index.commit_begin(planned) {
+    Ok(committing) => committing,
+    Err(refusal) => return Ok(Err(refusal)),
+  };
+  loop {
+    match index.commit_step(&mut committing, &mut || true) {
+      Ok(Some(revision)) => return Ok(Ok(revision)),
+      Ok(None) => {}
+      Err(refusal) => return Ok(Err(refusal)),
+    }
+    if reads(index, &names, youngest) != before {
+      return Err(format!(
+        "a read moved mid-commit of revision {}",
+        youngest + 1
+      ));
+    }
+  }
+}
+
+/// What `index` answers of each of `names` at every revision up to `youngest`: its node there, and the youngest.
+fn reads(index: &Index, names: &BTreeSet<String>, youngest: Revision) -> String {
+  let mut read = format!("youngest {}\n", index.youngest());
+  for name in names {
+    for revision in 0..=youngest {
+      read.push_str(&format!(
+        "{name}@{revision}: {:?}\n",
+        index.node(name, revision)
+      ));
+    }
+  }
+  read
 }
 
 proptest! {
@@ -2478,5 +2530,49 @@ fn a_plans_step_is_refused_once_a_revision_was_appended_after_it_began() {
       planned: 2,
       next: 3
     }
+  );
+}
+
+/// A-920 2d (`Index::plan_step`'s rows put in path order a unit at a time, with no sort of the whole). Do: plan after
+/// `trunk`, whole and a unit a step, a record listing its rows out of path order (an added directory and file between
+/// the edits of two files, the later path first); then a record listing one path twice. Expect the first's two plans
+/// the same, and more units taken than the record has rows (each row's check, run, merge, apply and sort); the second
+/// refused `Duplicate` at that path both ways.
+#[test]
+fn a_record_listed_out_of_path_order_plans_a_unit_a_step_as_whole() {
+  let index = trunk();
+  let rows = vec![
+    edit("/trunk/lib/a.c", 3),
+    add_dir("/tags"),
+    add_file("/tags/notes", 4),
+    edit("/trunk/README", 5),
+  ];
+  let record = || RevisionRecord {
+    transaction: TRANSACTION.to_owned(),
+    changes: rows.clone(),
+  };
+  let whole = index.plan(record(), ALL_ROOM).unwrap();
+  let sliced = planned_a_row_a_step(&index, record(), ALL_ROOM).unwrap();
+  assert_eq!(format!("{whole:?}"), format!("{sliced:?}"));
+  assert!(
+    sliced.units() > rows.len() as u64,
+    "{} units",
+    sliced.units()
+  );
+  let twice = || RevisionRecord {
+    transaction: TRANSACTION.to_owned(),
+    changes: vec![
+      edit("/trunk/README", 6),
+      edit("/trunk/lib/a.c", 7),
+      edit("/trunk/README", 8),
+    ],
+  };
+  let duplicate = IndexRefusal::Duplicate {
+    path: "/trunk/README".to_owned(),
+  };
+  assert_eq!(index.plan(twice(), ALL_ROOM).unwrap_err(), duplicate);
+  assert_eq!(
+    planned_a_row_a_step(&index, twice(), ALL_ROOM).unwrap_err(),
+    duplicate
   );
 }

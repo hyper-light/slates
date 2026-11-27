@@ -767,6 +767,14 @@ where
     else {
       return Err(tool.not_found(&shown));
     };
+    // A repository a takeover moved from this node (A-921 part 2): SSH has no redirect, so it is refused typed, never
+    // served from the stale copy.
+    if self.repositories.moved_here(&repository) {
+      crate::fleet::count_refusal(MOVED_REFUSED);
+      return Err(tool.refused(&format!(
+        "{shown}: moved to another node by a takeover; this node no longer serves it"
+      )));
+    }
     match vcs_policy::reaches(&repository, principal, rights(service)) {
       Ok(true) => Ok(repository),
       Ok(false) => Err(tool.refused(&format!(
@@ -844,6 +852,9 @@ where
     }
   }
 }
+
+/// Counter: SSH requests refused for a repository a takeover moved from this node (A-921 part 2). Format: a counter name.
+pub(crate) const MOVED_REFUSED: &str = "vcs_ssh.moved_refused";
 
 #[cfg(test)]
 #[path = "tests/site.rs"]

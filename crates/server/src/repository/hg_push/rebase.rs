@@ -189,27 +189,3 @@ const REBASE_UNREAD: &[u8] =
 
 /// Format: slates' words for a re-base that asked for a changegroup's bytes, which none reads.
 const REBASE_WANTED: &[u8] = b"push refused: its re-base asked for bytes of its changegroup";
-
-/// `stale` re-based every row at once: [`rebase_sliced`]'s steps for a caller that holds the shard's state, the tests'
-/// driver, which lands pushes side by side with no runtime. None where the store went away.
-#[cfg(test)]
-pub(super) fn rebase_whole(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  stale: Forked,
-) -> Option<Result<Forked, PushOutcome>> {
-  let mut rebasing = match begin_rebase(state, repository, stale)? {
-    Ok(rebasing) => rebasing,
-    Err(outcome) => return Some(Err(outcome)),
-  };
-  loop {
-    match rebasing.slice(state)? {
-      Ok(Stepped::More) => {}
-      Ok(Stepped::Done) => return rebasing.finish_in(state).map(Ok),
-      Ok(Stepped::Wanted(_) | Stepped::Store) => {
-        return Some(Err(PushOutcome::refused(&abort(REBASE_WANTED.to_vec()))));
-      }
-      Err(refused) => return Some(Err(PushOutcome::refused(&abort(unindexed_words(&refused))))),
-    }
-  }
-}

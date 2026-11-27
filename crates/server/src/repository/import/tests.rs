@@ -56,25 +56,21 @@ fn stranger() -> Principal {
   }
 }
 
-/// Creates repository `name` of `tool` on the shard: its id.
-fn created(state: &mut ShardState, name: &str, tool: VcsTool) -> RepositoryId {
-  let reply = crate::test_store::create(
-    state,
+/// Creates repository `name` of `tool` on `daemon`'s first shard as a client's creation is made, this thread waiting
+/// for its record (`test_store::create_on`), never the shard: its id.
+fn created_on(daemon: &crate::Daemon, name: &str, tool: VcsTool) -> RepositoryId {
+  crate::test_store::create_on(
+    daemon,
+    0,
     &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool,
-      format: WireFormat::Sha1,
-      default_branch: "default".to_owned(),
-      green: None,
-    },
-  );
-  assert!(
-    matches!(reply, ReplyBody::GreenCreated { .. }),
-    "no repository: {reply:?}"
-  );
-  let repositories = state.db.partition().repositories();
-  repositories.repository_named(name).expect("the record").id
+    (name, tool, WireFormat::Sha1, "default"),
+  )
+  .0
+}
+
+/// The shard's state for `step`, from a task on the shard.
+fn on<T>(step: impl FnOnce(&mut ShardState) -> T) -> T {
+  crate::state::with_state(step).expect("the shard's state")
 }
 
 /// The request `request` as the verb runner leaves it before a verb: its origin and id, and the route its reply goes by
@@ -131,9 +127,11 @@ fn count(state: &ShardState, name: &str) -> u64 {
 /// times, and the host's refusal naming the directory; none deferred, and the directory opened by none but the last.
 #[test]
 fn t_a678_the_verb_refuses_by_kind_before_anything_is_opened() {
-  crate::test_store::audit_on_stored_shard("vcs", |state| {
-    created(state, "hg", VcsTool::Mercurial);
-    created(state, "git", VcsTool::Git);
+  let asked = [
+    ("hg", VcsTool::Mercurial, WireFormat::Sha1, "default"),
+    ("git", VcsTool::Git, WireFormat::Sha1, "default"),
+  ];
+  crate::test_store::audit_on_stored_shard_made_all((&owner(), asked), |state, _| {
     let own = owner();
     let refusals = [
       (ask(state, (&own, "none"), never_opened), "NotFound"),
@@ -191,8 +189,8 @@ fn t_a678_the_verb_refuses_by_kind_before_anything_is_opened() {
 /// directory being opened again, and request 2 refused `UnderWay`, not deferred.
 #[test]
 fn t_a678_a_started_import_holds_its_reply_and_a_resend_takes_the_route_over() {
-  crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let id = created(state, "hg", VcsTool::Mercurial);
+  let asked = ("hg", VcsTool::Mercurial, WireFormat::Sha1, "default");
+  crate::test_store::audit_on_stored_shard_made((&owner(), asked), |state, (id, _)| {
     let own = owner();
     routed(state, 1, NO_CLIENT);
     assert_eq!(
@@ -231,14 +229,16 @@ fn t_a678_a_started_import_holds_its_reply_and_a_resend_takes_the_route_over() {
 #[test]
 fn t_a678_the_held_request_is_answered_when_the_import_ends() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let id = crate::daemon::observe_first(&daemon, |state| {
-    let id = created(state, "hg", VcsTool::Mercurial);
+  let id = created_on(&daemon, "hg", VcsTool::Mercurial);
+  // The creation's own reply goes by its route to a slot no client holds too, so the import's is counted past it.
+  let undelivered_before = crate::daemon::observe_first(&daemon, |state| {
+    let before = count(state, crate::state::REPLY_UNDELIVERABLE);
     routed(state, 1, NO_CLIENT);
     assert_eq!(
       ask(state, (&owner(), "hg"), the_states_repository),
       (ReplyBody::Acknowledged, true)
     );
-    id
+    before
   });
   let began = Instant::now();
   let seen = loop {
@@ -246,7 +246,7 @@ fn t_a678_the_held_request_is_answered_when_the_import_ends() {
       let held = state.vcs_stores.answer(id).is_some() || state.vcs_stores.importing(id);
       let counted = [
         count(state, ANSWERED),
-        count(state, crate::state::REPLY_UNDELIVERABLE),
+        count(state, crate::state::REPLY_UNDELIVERABLE).saturating_sub(undelivered_before),
       ];
       let rows = state
         .vcs_stores
@@ -400,8 +400,30 @@ struct Served {
   bookmarks: Vec<(String, Option<Node>, [u8; 32])>,
 }
 
-/// What repository `id` serves on this shard ([`Served`]).
-fn served(state: &mut ShardState, id: RepositoryId) -> Served {
+/// What repository `id` serves on this shard ([`Served`]), from a task on it: its changesets' texts let go once the import
+/// landed read back through the changeset store as a reader reads them (goal 93, C1 (1) P5), each want awaited
+/// (`hg_view::answer_store_wants`), never on the shard's thread.
+async fn served_awaited(id: RepositoryId) -> Served {
+  let (mut served, asks) = on(|state| served_held(state, id));
+  for (at, mut ask) in asks {
+    assert!(
+      crate::vcs_store::hg_view::answer_store_wants(&mut ask, id).await,
+      "the changeset store answered"
+    );
+    let text = ask.taken().map(|(_, _, text)| text).expect("its text");
+    if let Some(slot) = served.texts.get_mut(at) {
+      *slot = text;
+    }
+  }
+  served
+}
+
+/// [`served_awaited`]'s step on the shard: what repository `id` serves, each changeset's text the content store holds
+/// read now, and an ask of the changeset store, by its place among the texts, for each one let go.
+fn served_held(
+  state: &mut ShardState,
+  id: RepositoryId,
+) -> (Served, Vec<(usize, slates_hg::push::held::TextAsk)>) {
   let repositories = state.db.partition().repositories();
   let roots = repositories
     .phase_roots(id)
@@ -421,7 +443,6 @@ fn served(state: &mut ShardState, id: RepositoryId) -> Served {
       (name, head, engine.head_identity())
     })
     .collect();
-  let disk = state.vcs_disk.clone().expect("a changeset store");
   let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
   let (content, store) = lent.stores.mercurial(id).expect("the store");
   let content: &ContentStore = content;
@@ -432,30 +453,33 @@ fn served(state: &mut ShardState, id: RepositoryId) -> Served {
     .map(|row| (row.key().to_vec(), row.body().to_vec()))
     .collect();
   let index = &store.index;
+  let mut asks = Vec::new();
   let texts = (0..index.len(content, Log::Changelog))
     .map(|rev| {
       let row = index.changeset(content, rev).expect("a changeset");
-      // Let go once the import landed (goal 93, C1 (1) P5): read back through the changeset store, as a reader does.
       content.object_bytes(&row.text, row.len).unwrap_or_else(|| {
-        let mut ask = slates_hg::push::held::TextAsk::new(
-          slates_hg::push::intake::CHANGELOG_PATH.to_vec(),
-          row.node,
-          row.len,
-        );
-        assert!(
-          crate::test_store::answer_wants_blocking(&disk, u128::from_be_bytes(id.bytes), &mut ask),
-          "the changeset store answered"
-        );
-        ask.taken().map(|(_, _, text)| text).expect("its text")
+        let at = usize::try_from(rev).expect("a place");
+        asks.push((
+          at,
+          slates_hg::push::held::TextAsk::new(
+            slates_hg::push::intake::CHANGELOG_PATH.to_vec(),
+            row.node,
+            row.len,
+          ),
+        ));
+        Vec::new()
       })
     })
     .collect();
-  Served {
-    rows,
-    texts,
-    roots,
-    bookmarks,
-  }
+  (
+    Served {
+      rows,
+      texts,
+      roots,
+      bookmarks,
+    },
+    asks,
+  )
 }
 
 /// A recovery's own steps over this shard (A-575, A-662): every green rebuilt from its records in recovery's order
@@ -527,14 +551,13 @@ fn check_served(served: &Served, imported: &Imported) {
 #[test]
 fn t_a687_an_import_and_a_recovery_serve_the_same_repository() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let id = crate::daemon::observe_first(&daemon, |state| {
-    let id = created(state, "hg", VcsTool::Mercurial);
+  let id = created_on(&daemon, "hg", VcsTool::Mercurial);
+  crate::daemon::observe_first(&daemon, |state| {
     routed(state, 1, NO_CLIENT);
     assert_eq!(
       ask(state, (&owner(), "hg"), the_states_repository),
       (ReplyBody::Acknowledged, true)
     );
-    id
   });
   let began = Instant::now();
   while crate::daemon::observe_first(&daemon, move |state| state.vcs_stores.importing(id)) {
@@ -543,13 +566,20 @@ fn t_a687_an_import_and_a_recovery_serve_the_same_repository() {
       "still importing after {TASK_WAIT:?}"
     );
   }
-  let (answered, before, replayed_before) = crate::daemon::observe_first(&daemon, move |state| {
-    let answered = count(state, ANSWERED);
-    let before = served(state, id);
-    let replayed = count(state, crate::vcs_store::REPLAYED);
-    recovered(state, id);
-    (answered, before, replayed)
-  });
+  let (answered, before, replayed_before) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let answered = on(|state| count(state, ANSWERED));
+      let before = served_awaited(id).await;
+      let replayed = on(|state| {
+        let replayed = count(state, crate::vcs_store::REPLAYED);
+        recovered(state, id);
+        replayed
+      });
+      (answered, before, replayed)
+    },
+    TASK_WAIT,
+  );
   let began = Instant::now();
   while crate::daemon::observe_first(&daemon, move |state| state.vcs_stores.rebuilding(id)) {
     assert!(
@@ -557,11 +587,16 @@ fn t_a687_an_import_and_a_recovery_serve_the_same_repository() {
       "still rebuilding after {TASK_WAIT:?}"
     );
   }
-  let (after, replayed) = crate::daemon::observe_first(&daemon, move |state| {
-    let after = served(state, id);
-    let replayed = count(state, crate::vcs_store::REPLAYED).saturating_sub(replayed_before);
-    (after, replayed)
-  });
+  let (after, replayed) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let after = served_awaited(id).await;
+      let replayed =
+        on(|state| count(state, crate::vcs_store::REPLAYED).saturating_sub(replayed_before));
+      (after, replayed)
+    },
+    TASK_WAIT,
+  );
   daemon.stop();
   assert_eq!(answered, 1);
   check_served(&before, &imported_in_one_call());

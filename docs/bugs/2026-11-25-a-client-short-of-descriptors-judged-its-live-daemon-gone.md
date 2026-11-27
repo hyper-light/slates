@@ -38,3 +38,20 @@ its refusal typed; `made_again` reads a refused open as "not made again" and wai
 reported: Windows' `owned_object` (`Err(_)` makes the object anew for any refused open, under the owner's token, so no
 live owner holds it; a refusal other than not-found should be its own refusal). `route.rs` opens nothing by name.
 Linux's liveness is a peek on a socket it holds, which no descriptor shortage reaches.
+
+## Follow-up: the reconnect bound (2026-11-25, w-git for main 01a20182, its order "a client that truly loses its daemon while short of descriptors must still end in a typed refusal")
+
+**Symptom.** With `Unknown` deciding nothing, a macOS client short of descriptors whose daemon stopped inside its own
+process waited for its reply forever: the exit watch fires only when the daemon's process ends, and every look at the
+stamp was refused. Sampled: `map_read` → `round_trip` → `wait_while_daemon_lives` → `park_until_departure`, parked on
+the wake word between looks that never decided.
+
+**Fix.** `Liveness::daemon_gone` (macOS and Windows): a stamp look that cannot tell asks the rendezvous's holder
+(`holder_lives`; on macOS the owner's bootstrap name, a Mach lookup that takes no descriptor). No holder reads gone;
+a holder, or a refused ask, still decides nothing, so a starved client's live daemon is still never judged gone. Once
+gone, the reconnect's claim is refused typed by the descriptor it asks for.
+
+**Red.** `reap_map.rs`'s `a_client_short_of_descriptors_whose_daemon_stopped_is_refused_within_a_bound`: a client
+capped at its lowest free descriptor, its daemon then stopped, maps a file. Before: no answer within the test's five
+liveness windows. Now: `Ipc(Memory(OsRefused { call: "shm_open", code: Some(24) }))` in 0.47 ms. The starved
+hand-off against a live daemon (`a_hand_off_that_fails_in_the_client_gives_its_copy_back`) still passes.

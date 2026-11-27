@@ -29,7 +29,7 @@ use crate::vcs_hooks::{
 };
 use crate::vcs_store::Target;
 use crate::vcs_store::tests::{
-  appended, begun, commit_of, hex, push_through, repository, tree_of, work_of,
+  appended_awaited, begun, commit_of, hex, on_state, owner, push_through_awaited, tree_of, work_of,
 };
 
 /// Format: the variable that makes this test binary, re-invoked, the hook that reports what it
@@ -62,6 +62,12 @@ const FIRST_DATE: u64 = 1_700_000_000;
 const CAP: usize = 1 << 16;
 /// Shape: how long a test lets a run take before giving up on it: ten liveness windows.
 pub(crate) const TEST_BOUND_NS: u64 = 10 * LIVENESS_BUDGET_NS;
+/// Derived: how long [`ran`] waits for a run from before its spawner starts. The hook's own run is held to
+/// [`TEST_BOUND_NS`] from its start (its client leaves then), and before it comes the spawner's start, a start of this
+/// same test binary, which the hook's own bound already covers once: so twice [`TEST_BOUND_NS`]. Counted from before
+/// both starts, ten windows alone raced the machine (main 01a20182's 8a loop of 2026-11-25, round 2, the same round
+/// whose spawners took past a window to start).
+const SPAWNED_AND_RUN_NS: u64 = 2 * TEST_BOUND_NS;
 /// Shape: the most turns a view's sealing may take here, far past what these packs need a unit of
 /// work a turn.
 const TURNS: u32 = 1 << 20;
@@ -283,55 +289,63 @@ struct Scene {
 
 /// [`Scene`], made on the owner shard.
 fn scene() -> Scene {
-  crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (repository, main) = repository(state, "hooked", VcsTool::Git);
-    let readme = |text: &[u8]| [(b"README".to_vec(), text.to_vec())];
-    let (first, old) = commit_of(&readme(b"first\n"), &[], FIRST_DATE);
-    let read = push_through(
-      state,
-      (repository, main),
-      &first,
-      (None, old, tree_of(&first)),
-    );
-    let (second, new) = commit_of(&readme(b"second\n"), &[old], FIRST_DATE + 1);
-    let push = begun(state, repository, &second);
-    let base = (read, Some(tree_of(&first)));
-    let work = work_of(state, (&push, main), base, (new, tree_of(&second)));
-    let mut sealed = push.seal(state).expect("sealed");
-    let refs = [ReadRef {
-      name: MAIN,
-      green: main,
-      version: read,
-    }];
-    let quarantined = Some(ShownPush::Quarantined(&sealed));
-    let pre_receive = shown(state, (repository, &refs), quarantined, true);
-    let migrated = Some(ShownPush::Migrated(&sealed));
-    let update = shown(state, (repository, &refs), migrated, false);
-    let changes = vec![BranchChange::Update { green: main, work }];
-    let moves = [(Target::Green(main), Some(new))];
-    let made = appended(state, repository, changes, (&mut sealed, &moves)).expect("appended");
-    sealed.abandon(state);
-    let Some(BranchAppended::Moved { version, .. }) = made.changes.first() else {
-      panic!("not moved: {:?}", made.changes);
-    };
-    let after = [ReadRef {
-      name: MAIN,
-      green: main,
-      version: *version,
-    }];
-    let post_receive = shown(state, (repository, &after), None, false);
-    Scene {
-      pre_receive,
-      update,
-      post_receive,
-      old: hex(old),
-      new: hex(new),
-    }
-  })
+  let asked = [(
+    "hooked",
+    VcsTool::Git,
+    slates_ipc::protocol::ObjectFormat::Sha1,
+    "main",
+  )];
+  crate::test_store::run_on_stored_shard_made_all(
+    (&owner(), asked),
+    |[(repository, main)]| async move {
+      let readme = |text: &[u8]| [(b"README".to_vec(), text.to_vec())];
+      let (first, old) = commit_of(&readme(b"first\n"), &[], FIRST_DATE);
+      let read =
+        push_through_awaited((repository, main), &first, (None, old, tree_of(&first))).await;
+      let (second, new) = commit_of(&readme(b"second\n"), &[old], FIRST_DATE + 1);
+      let refs = [ReadRef {
+        name: MAIN,
+        green: main,
+        version: read,
+      }];
+      let (mut sealed, work, pre_receive, update) = on_state(|state| {
+        let push = begun(state, repository, &second);
+        let base = (read, Some(tree_of(&first)));
+        let work = work_of(state, (&push, main), base, (new, tree_of(&second)));
+        let sealed = push.seal(state).expect("sealed");
+        let quarantined = Some(ShownPush::Quarantined(&sealed));
+        let pre_receive = shown(state, (repository, &refs), quarantined, true);
+        let migrated = Some(ShownPush::Migrated(&sealed));
+        let update = shown(state, (repository, &refs), migrated, false);
+        (sealed, work, pre_receive, update)
+      });
+      let changes = vec![BranchChange::Update { green: main, work }];
+      let moves = [(Target::Green(main), Some(new))];
+      let made = appended_awaited(repository, changes, (&mut sealed, &moves))
+        .await
+        .expect("appended");
+      let Some(BranchAppended::Moved { version, .. }) = made.changes.first() else {
+        panic!("not moved: {:?}", made.changes);
+      };
+      let after = [ReadRef {
+        name: MAIN,
+        green: main,
+        version: *version,
+      }];
+      on_state(|state| {
+        sealed.abandon(state);
+        let post_receive = shown(state, (repository, &after), None, false);
+        Scene {
+          pre_receive,
+          update,
+          post_receive,
+          old: hex(old),
+          new: hex(new),
+        }
+      })
+    },
+  )
 }
-
-// ---------------------------------------------------------------------------------------------
-// The hook.
 
 /// The hook this binary plays when re-invoked as one ([`ROLE`]): it reports its working
 /// directory, the variables it was handed, what it reads of the repository it runs in, and what
@@ -484,8 +498,10 @@ fn as_role(mut input: HookInput) -> HookInput {
 }
 
 /// Runs `input`'s hook under `policy` in `presented`, as the role, with no learned bound and a
-/// client that stays; the test gives up past [`TEST_BOUND_NS`]. None when the run's task could not
-/// be spawned or the run did not answer within the bound: the test fails on it.
+/// client that leaves [`TEST_BOUND_NS`] after the hook's start (its first look comes once the
+/// spawner has answered the start), which the test reads as the run abandoned; it gives up on the
+/// whole past [`SPAWNED_AND_RUN_NS`]. None when the run's task could not be spawned or the run did
+/// not answer within that: the test fails on it.
 fn ran(
   presented: &Presented,
   policy: &RepositoryPolicy,
@@ -502,8 +518,11 @@ fn ran(
         view: &presented,
         words_cap: CAP,
       };
-      let running = run(&site, &input, None, std::future::pending());
-      let answered = slates_rt::futures::within(TEST_BOUND_NS, running).await;
+      let client = async {
+        let _ = slates_rt::futures::sleep(TEST_BOUND_NS).await;
+      };
+      let running = run(&site, &input, None, client);
+      let answered = slates_rt::futures::within(SPAWNED_AND_RUN_NS, running).await;
       let _ = sent.send(answered.ok().flatten());
     })
     .ok()?;
@@ -682,40 +701,62 @@ fn a_git_hook_runs_in_its_view_at_each_of_receive_packs_points() {
 /// `NoStore`; and after each, the shard holding and charging what it did before.
 #[test]
 fn a_view_the_store_cannot_show_is_refused_by_kind_and_holds_nothing() {
-  let refused = crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (hooked, main) = repository(state, "hooked", VcsTool::Git);
-    let (other, _) = repository(state, "other", VcsTool::Git);
-    let (mercurial, _) = repository(state, "hg", VcsTool::Mercurial);
-    let (first, old) = commit_of(
-      &[(b"README".to_vec(), b"first\n".to_vec())],
-      &[],
-      FIRST_DATE,
-    );
-    let read = push_through(state, (hooked, main), &first, (None, old, tree_of(&first)));
-    let at = |version| ReadRef {
-      name: MAIN,
-      green: main,
-      version,
-    };
-    let foreign = begun(state, other, &first).seal(state).expect("sealed");
-    let before = footprint(state);
-    let mut refused = Vec::new();
-    for (refs, pushed, on) in [
-      (vec![at(read + 1)], None, hooked),
-      (vec![at(read), at(read + 1)], None, hooked),
-      (
-        vec![at(read)],
-        Some(ShownPush::Quarantined(&foreign)),
-        hooked,
-      ),
-      (Vec::new(), None, mercurial),
-    ] {
-      refused.push(GitHookView::open(state, on, (refs.as_slice(), MAIN), pushed).err());
-      assert_eq!(footprint(state), before);
-    }
-    foreign.abandon(state);
-    refused
-  });
+  let asked = [
+    (
+      "hooked",
+      VcsTool::Git,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      "main",
+    ),
+    (
+      "other",
+      VcsTool::Git,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      "main",
+    ),
+    (
+      "hg",
+      VcsTool::Mercurial,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      "main",
+    ),
+  ];
+  let refused = crate::test_store::run_on_stored_shard_made_all(
+    (&owner(), asked),
+    |[(hooked, main), (other, _), (mercurial, _)]| async move {
+      let (first, old) = commit_of(
+        &[(b"README".to_vec(), b"first\n".to_vec())],
+        &[],
+        FIRST_DATE,
+      );
+      let read = push_through_awaited((hooked, main), &first, (None, old, tree_of(&first))).await;
+      on_state(move |state| {
+        let at = |version| ReadRef {
+          name: MAIN,
+          green: main,
+          version,
+        };
+        let foreign = begun(state, other, &first).seal(state).expect("sealed");
+        let before = footprint(state);
+        let mut refused = Vec::new();
+        for (refs, pushed, on) in [
+          (vec![at(read + 1)], None, hooked),
+          (vec![at(read), at(read + 1)], None, hooked),
+          (
+            vec![at(read)],
+            Some(ShownPush::Quarantined(&foreign)),
+            hooked,
+          ),
+          (Vec::new(), None, mercurial),
+        ] {
+          refused.push(GitHookView::open(state, on, (refs.as_slice(), MAIN), pushed).err());
+          assert_eq!(footprint(state), before);
+        }
+        foreign.abandon(state);
+        refused
+      })
+    },
+  );
   assert_eq!(
     refused,
     [

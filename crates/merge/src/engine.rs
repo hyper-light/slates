@@ -69,6 +69,34 @@ use crate::ops_doc::{NodeOrigin, Op, OpKind, OpsDoc};
 use crate::range::Range;
 use crate::verdict::MergeConflictClass;
 
+/// An increment's encoding under way ([`Increment::encode_step`]): its bytes so far and where it stands.
+#[derive(Debug, Default)]
+pub struct IncrementEncoding {
+  out: Vec<u8>,
+  stage: EncodeStage,
+  /// Where the header left the document's length to fill in.
+  at: usize,
+}
+
+/// Where an [`IncrementEncoding`] is.
+#[derive(Debug, Default)]
+enum EncodeStage {
+  /// Its id, base and the document length's place.
+  #[default]
+  Header,
+  /// Its ops document, from this piece.
+  Doc(usize),
+  /// Its inline bytes, from this offset.
+  Inline(usize),
+  /// Its evidence references, from this one.
+  Evidence(usize),
+  /// Its named runs, from this one.
+  Runs(usize),
+}
+
+/// Format: the bytes of an increment's encoded document length (a `u64`, [`Increment::encode`]).
+const DOC_LEN_BYTES: usize = 8;
+
 /// An increment submitted against a base version: the deriver's ops document and the sealed
 /// post-state its content operations' `src` offsets index into, and the evidence references the
 /// submitter attached (§4.16 `Increment.evidence`: "opaque to slates" — a green with
@@ -127,6 +155,87 @@ impl Increment {
     out
   }
 
+  /// [`Increment::encode`] taken a slice at a time (A-920 6b: an import's revision of 9,000 files encoded whole in its
+  /// landing's entry step), from `encoding` ([`IncrementEncoding::default`]), a unit at least, until `spent`: its header,
+  /// its ops document a piece a unit ([`crate::ops_doc::OpsDoc::encode_piece`], its length filled in once every piece
+  /// is written), its inline bytes `chunk` a unit, then each evidence reference and named run a unit. Once it ends,
+  /// [`Increment::encode`]'s bytes.
+  pub fn encode_step(
+    &self,
+    encoding: &mut IncrementEncoding,
+    chunk: usize,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Option<Vec<u8>> {
+    loop {
+      if !self.encode_unit(encoding, chunk.max(1)) {
+        return Some(core::mem::take(&mut encoding.out));
+      }
+      if spent() {
+        return None;
+      }
+    }
+  }
+
+  /// One unit of [`Increment::encode_step`]: whether any is left.
+  fn encode_unit(&self, encoding: &mut IncrementEncoding, chunk: usize) -> bool {
+    let IncrementEncoding { out, stage, at } = encoding;
+    match stage {
+      EncodeStage::Header => {
+        out.extend_from_slice(&self.id);
+        out.extend_from_slice(&self.base.to_le_bytes());
+        *at = out.len();
+        out.extend_from_slice(&0u64.to_le_bytes());
+        *stage = EncodeStage::Doc(0);
+      }
+      EncodeStage::Doc(piece) => {
+        if self.doc.encode_piece(*piece, out) {
+          *piece = piece.saturating_add(1);
+        } else {
+          // The document's length, now that its pieces are written, where the header left its place.
+          let doc = out.len().saturating_sub(at.saturating_add(DOC_LEN_BYTES));
+          if let Some(place) = out.get_mut(*at..at.saturating_add(DOC_LEN_BYTES)) {
+            place.copy_from_slice(&(doc as u64).to_le_bytes());
+          }
+          let inline = self.inline_post_state();
+          out.extend_from_slice(&(inline.len() as u64).to_le_bytes());
+          *stage = EncodeStage::Inline(0);
+        }
+      }
+      EncodeStage::Inline(from) => {
+        let inline = self.inline_post_state();
+        let to = from.saturating_add(chunk).min(inline.len());
+        out.extend_from_slice(inline.get(*from..to).unwrap_or_default());
+        *from = to;
+        if to >= inline.len() {
+          out.extend_from_slice(&(self.evidence.len() as u64).to_le_bytes());
+          *stage = EncodeStage::Evidence(0);
+        }
+      }
+      EncodeStage::Evidence(next) => match self.evidence.get(*next) {
+        Some(reference) => {
+          out.extend_from_slice(reference);
+          *next = next.saturating_add(1);
+        }
+        None if self.named.is_empty() => return false,
+        None => {
+          out.extend_from_slice(&(self.named.runs.len() as u64).to_le_bytes());
+          *stage = EncodeStage::Runs(0);
+        }
+      },
+      EncodeStage::Runs(next) => {
+        let Some(run) = self.named.runs.get(*next) else {
+          return false;
+        };
+        out.extend_from_slice(&run.identity.hash);
+        out.extend_from_slice(&run.identity.len.to_le_bytes());
+        out.extend_from_slice(&run.offset.to_le_bytes());
+        out.extend_from_slice(&run.len.to_le_bytes());
+        *next = next.saturating_add(1);
+      }
+    }
+    true
+  }
+
   /// The post-state's inline bytes: the post-state itself, since a named run's bytes are read into a buffer of their
   /// own (A-760, `crate::named::Read`).
   fn inline_post_state(&self) -> &[u8] {
@@ -135,12 +244,12 @@ impl Increment {
 
   /// The post-state as the engine reads it: the inline bytes, then each named run's as read (A-760).
   pub fn post(&self) -> crate::named::Post<'_> {
-    crate::named::Post::of(&self.post_state, &self.named.read.0, &self.named.runs)
+    crate::named::Post::of(&self.post_state, &self.named.read, &self.named.runs)
   }
 
   /// The bytes of the `at`th named run read so far (A-760): what a turn's reader measures its progress by.
   pub fn read_run(&self, at: usize) -> Option<&[u8]> {
-    self.named.read.0.get(at).map(Vec::as_slice)
+    self.named.read.run_known(at)
   }
 
   /// Names `run` as the post-state's next bytes (A-760): the offset an op's `src` gives them.
@@ -255,7 +364,7 @@ impl Increment {
   /// `wanted` does not reach it.
   pub fn unread_among(&self, wanted: &[bool]) -> Option<&crate::named::NamedRun> {
     self.named.runs.iter().enumerate().find_map(|(at, run)| {
-      let read = self.named.read.0.get(at).map_or(0, Vec::len);
+      let read = self.named.read.read_len(at);
       let wants = wanted.get(at).copied().unwrap_or(true);
       (wants && u64::try_from(read).unwrap_or(u64::MAX) < run.len).then_some(run)
     })
@@ -288,7 +397,7 @@ impl Increment {
     let mut budget = slice.max(1);
     let mut at = 0usize;
     while let Some(run) = self.named.runs.get(at).copied() {
-      let read = self.named.read.0.get(at).map_or(0, Vec::len);
+      let read = self.named.read.read_len(at);
       let read = u64::try_from(read).unwrap_or(u64::MAX);
       if !wanted.get(at).copied().unwrap_or(true) || read >= run.len {
         at = at.saturating_add(1);
@@ -315,24 +424,24 @@ impl Increment {
     let missing = crate::named::ObjectMissing {
       identity: run.identity,
     };
-    while self.named.read.0.len() <= at {
-      self.named.read.0.push(Vec::new());
-    }
-    let buffer = self.named.read.0.get_mut(at).ok_or(missing)?;
-    if buffer.capacity() == 0 {
-      let whole = usize::try_from(run.len).map_err(|_| missing)?;
-      buffer.try_reserve_exact(whole).map_err(|_| missing)?;
-    }
-    let done = u64::try_from(buffer.len()).map_err(|_| missing)?;
-    let take = run.len.saturating_sub(done).min(budget);
-    let from = buffer.len();
-    let to = from
-      .checked_add(usize::try_from(take).map_err(|_| missing)?)
+    let done = self.named.read.read_len(at);
+    let take = run
+      .len
+      .saturating_sub(u64::try_from(done).map_err(|_| missing)?)
+      .min(budget);
+    let room = usize::try_from(take).map_err(|_| missing)?;
+    let total = usize::try_from(self.named.runs.total()).map_err(|_| missing)?;
+    let into = self
+      .named
+      .read
+      .next_room((at, total), room)
       .ok_or(missing)?;
-    buffer.resize(to, 0);
-    let into = buffer.get_mut(from..to).ok_or(missing)?;
-    if let Err(refused) = objects.read(&run.identity, run.offset.saturating_add(done), into) {
-      buffer.truncate(from);
+    let from = run
+      .offset
+      .saturating_add(u64::try_from(done).map_err(|_| missing)?);
+    let refused = objects.read(&run.identity, from, into).err();
+    self.named.read.settle(at, (room, refused.is_none()));
+    if let Some(refused) = refused {
       return Err(refused);
     }
     Ok(take)
@@ -545,8 +654,8 @@ pub struct Judged {
   /// The increment's post-state, from which the commit makes each mapped file ([`Effect::SetContent`]): its added bytes
   /// only, never a file.
   post_state: Vec<u8>,
-  /// Its named runs' bytes, taken from the work ([`Green::judge_named`], A-760): a whole text's buffer becomes the file.
-  read: Vec<Vec<u8>>,
+  /// Its named runs' bytes, taken from the work ([`Green::judge_named`], A-760), one buffer for them all.
+  read: crate::named::Read,
   /// Its named runs, which name the objects a file made whole of one is named for (A-760 (b), [`Green::name_of`]).
   runs: crate::named::RunTable,
   /// Its files made so far, a slice a step before the commit ([`Green::make_step`], A-760).
@@ -828,6 +937,25 @@ pub struct Computed {
   reached: Reached,
 }
 
+/// What [`Green::hold_begin`] begins: the hold of a verdict, or the judgment the cache or the checkpoint answers at once
+/// (an outcome, not a failure, so no `Result` carries it).
+pub(crate) enum HoldBegun {
+  /// Its verdict to hold ([`Green::hold_end`]).
+  Holding(Holding),
+  /// Answered at once.
+  Judged(Judgment),
+}
+
+/// A verdict being held ([`Green::hold_begin`], [`Green::hold_end`]): its units brought to the head, their effects
+/// and windows the verdict's flat lists (A-920 3l: gathered a unit at a time before, a list of each unit's moved and
+/// freed, and the free that emptied the allocator's region cost one step 1.2 ms).
+pub(crate) struct Holding {
+  verdict: position::Verdict,
+  /// What the chain records of the effects, where it was reached at the head with nothing since.
+  reached: Option<Vec<crate::chain_entry::Applied>>,
+  check_reads: bool,
+}
+
 /// What a computed verdict reached ([`Computed`]).
 enum Reached {
   /// The green that computed it had accepted the same increment before, as this version.
@@ -836,7 +964,7 @@ enum Reached {
   /// conflicts.
   Verdict {
     /// The units, in order.
-    units: Vec<position::Unit>,
+    units: position::Verdict,
     /// What the chain records of every effect, when no unit holds a window.
     applied: Vec<crate::chain_entry::Applied>,
     /// Every unit's windows, in order.
@@ -845,17 +973,11 @@ enum Reached {
 }
 
 impl Reached {
-  /// The verdict of `units`.
-  fn of(units: Vec<position::Unit>) -> Reached {
-    let windows: Vec<ConflictWindow> = units
-      .iter()
-      .flat_map(|unit| unit.windows.iter().cloned())
-      .collect();
+  /// The verdict of `units`: its windows, and what the chain records of its effects while it holds none.
+  fn of(units: position::Verdict) -> Reached {
+    let windows = units.windows.clone();
     let applied = if windows.is_empty() {
-      units
-        .iter()
-        .flat_map(|unit| unit.effects.iter().map(Effect::applied))
-        .collect()
+      units.effects.iter().map(Effect::applied).collect()
     } else {
       Vec::new()
     };
@@ -1016,6 +1138,42 @@ pub enum Rebased {
 /// A per-path content history: for each path, the versions at which its bytes changed and the bytes
 /// then (`None` when removed), so any base version's content can be reconstructed for the identity
 /// check. The design's chain shares these copy-on-write; here they are full copies (owed).
+/// A green's checkpoint being built a unit at a time ([`Green::checkpoint_begin`], [`Green::checkpoint_unit`]; A-920 8a:
+/// built whole in one step, 52.5 ms of a wide import's checkpoint turn, debug, 48.3 of it its two copied trees' 18,002
+/// keys).
+#[derive(Debug)]
+pub struct CheckpointBuild {
+  /// The version it is the green's state at.
+  at: u64,
+  /// The copied trees' destinations whose keys it reads.
+  trees: Vec<String>,
+  /// The trees whose keys are gathered.
+  gathered: usize,
+  /// The gathered keys not yet read.
+  keys: BTreeSet<IdentityKey>,
+  /// The copied keys listed so far.
+  copied: crate::checkpoint::Tables,
+  /// The keys listed in [`CheckpointBuild::copied`].
+  listed: BTreeSet<IdentityKey>,
+}
+
+impl CheckpointBuild {
+  /// Whether its next unit is a whole part (a copied tree's keys gathered, or the checkpoint's rest made), which a
+  /// paced caller begins a step with, never ends one past its quantum (A-920 piece 2c's rule); else a key's read.
+  pub fn next_is_part(&self) -> bool {
+    self.gathered < self.trees.len() || self.keys.is_empty()
+  }
+}
+
+/// What a unit of [`Green::checkpoint_unit`] left.
+#[derive(Debug)]
+pub enum CheckpointStep {
+  /// Units are left.
+  More,
+  /// The checkpoint, built.
+  Built(Box<crate::checkpoint::Checkpoint>),
+}
+
 type ContentHistory = BTreeMap<String, Vec<(u64, Option<crate::history::Value>)>>;
 
 /// A per-path value history for a namespace dimension: the value at each version the path changed,
@@ -1390,9 +1548,26 @@ pub struct Green {
   /// is no longer reconstructible. The service keeps the floor at the oldest version any live reader
   /// — a work's base, a pinned attachment — can still name.
   folded_below: u64,
+  /// A fold of the histories below [`Green::folded_below`] still being taken a unit at a time ([`Green::fold_begin`],
+  /// A-920 11a); every fold begun after finishes it first.
+  folding: Option<Box<Folding>>,
   /// The paths merged through the content fast path (the non-vacuity counter). A cell, so the verdict stays a function
   /// of an immutable green (A-658), as `deltas_visited` is.
   fast_path_hits: std::cell::Cell<u64>,
+  /// The effect lists a verdict's units allocated of their own (A-920 3l: none, since a unit writes into its verdict's
+  /// flat lists; one each had been freed a unit at a time, and the free that emptied the allocator's region cost a
+  /// gathering's step 1.2 ms). A cell, as `fast_path_hits` is.
+  unit_effect_lists: std::cell::Cell<u64>,
+  /// The changed paths a commit put in a tree set of its own (A-920 3m: none, since its paths are ordered a unit at a
+  /// time with no tree; 9,000 String clones and their nodes had been 0.73-0.78 ms of one step, debug).
+  commit_tree_paths: u64,
+  /// The changed paths' Strings a commit made, each the one its change entry keeps (A-920 3m's non-vacuity count: one a
+  /// distinct path the effects change, made once).
+  commit_paths_made: u64,
+  /// The byte buffers commits let go for files named for their run's object (A-920 3n's non-vacuity count: none, since
+  /// such a file is given no bytes; each had been a run's own buffer, freed a commit unit at a time, and the free that
+  /// emptied the allocator's region cost one unit about 1 ms of the kernel's time).
+  named_buffers_freed: u64,
   /// The units of computed verdicts judged again because the green moved since they were computed
   /// ([`Green::judged_again`], A-658).
   judged_again: u64,
@@ -1529,7 +1704,71 @@ thread_local! {
   pub(crate) static FOLD_PATHS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// A fold of a green's histories below a floor being taken a unit at a time ([`Green::fold_begin`], A-920 11a).
+#[derive(Debug, Default)]
+struct Folding {
+  /// The floor it folds to.
+  floor: u64,
+  /// The floor it folds from.
+  previous: u64,
+  /// The history and change-index bytes when it began, what it released counted from.
+  before: usize,
+  /// Where it stands.
+  phase: FoldPhase,
+  /// The versions whose change-index entries the phase walks: from the last floor to this one while gathering, the
+  /// floor passed while moving them below it.
+  versions: Vec<u64>,
+  /// The version of [`Folding::versions`] being walked.
+  version_at: usize,
+  /// The entry of that version next.
+  entry_at: usize,
+  /// The paths of the version being moved below the floor, read once at its first unit.
+  version_paths: Option<Vec<String>>,
+  /// The paths gathered so far.
+  touched: BTreeSet<String>,
+  /// The paths to fold, in order, once gathered.
+  paths: Vec<String>,
+  /// The next of the phase's paths, values or alone paths.
+  at: usize,
+  /// The content values the content folds dropped, each let go a unit (taken as it is).
+  dropped: Vec<Option<crate::history::Value>>,
+  /// The paths the content folds left their latest value alone.
+  alone: Vec<String>,
+  /// The special nodes the folds dropped.
+  specials: usize,
+}
+
+/// Where a [`Folding`] stands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FoldPhase {
+  /// Gathering the paths the change index names from the last floor to this one.
+  #[default]
+  Touching,
+  /// Letting the copies' kept fixes go.
+  Fixes,
+  /// Moving the versions the floor passed below the change index's floor.
+  Changes,
+  /// Folding each path's content history.
+  Content,
+  /// Letting go each content value dropped.
+  Release,
+  /// Naming whole each path left its latest value alone.
+  Alone,
+  /// Folding each path's other histories.
+  Rest,
+  /// Ended.
+  Ended,
+}
+
+/// Folds `path`'s history in `histories` below `floor`, where it holds one ([`fold_entries`]).
+fn fold_one<T>(histories: &mut BTreeMap<String, Vec<(u64, T)>>, path: &str, floor: u64) {
+  if let Some(history) = histories.get_mut(path) {
+    fold_entries(history, floor);
+  }
+}
+
 /// Folds the history of each of `paths` that `histories` holds below `floor` ([`fold_entries`]).
+#[cfg(test)]
 fn fold_paths<T>(
   histories: &mut BTreeMap<String, Vec<(u64, T)>>,
   paths: &BTreeSet<String>,
@@ -2063,14 +2302,28 @@ fn sole_run(base_len: u64, ops: &[Op], places: &BTreeMap<(u64, u64), usize>) -> 
   places.get(&(op.src, op.len)).copied()
 }
 
-/// Moves each of `wholes`' runs' buffers into its file (A-760, [`alone`]): last, once every other file is
-/// made, since a moved buffer shortens the post-state's address space under every later run.
-fn move_whole_runs(effects: &mut [Effect], read: &mut [Vec<u8>], wholes: &[(usize, usize)]) {
+/// [`move_whole_runs`]' two lists: each whole file's place with its run, and each file named for its run's object with
+/// that object's identity.
+type WholesAndNames<'lists> = (
+  &'lists [(usize, usize)],
+  &'lists [(usize, crate::named::Identity)],
+);
+
+/// Gives each of `wholes`' files its run's bytes (A-760, [`alone`]): last, once every other file is made. A file named
+/// for its run's object (`names`, [`named_files`]) holds it by its name alone and takes no bytes, so nothing is made for
+/// it, nor let go at its commit (A-920 3n); any other takes a copy of its run's bytes, which it keeps.
+fn move_whole_runs(
+  effects: &mut [Effect],
+  read: &crate::named::Read,
+  (wholes, names): WholesAndNames<'_>,
+) {
   for &(place, run) in wholes {
-    if let (Some(Effect::SetContent(_, bytes @ None, ..)), Some(buffer)) =
-      (effects.get_mut(place), read.get_mut(run))
-    {
-      *bytes = Some(core::mem::take(buffer));
+    if let Some(Effect::SetContent(_, bytes @ None, ..)) = effects.get_mut(place) {
+      *bytes = Some(if holds_place(names, place) {
+        Vec::new()
+      } else {
+        read.run(run).to_vec()
+      });
     }
   }
 }
@@ -2109,11 +2362,36 @@ fn named_files(
 ) -> Vec<(usize, crate::named::Identity)> {
   sole
     .iter()
-    .filter_map(|(place, run)| {
-      let run = runs.get(*run)?;
-      (run.offset == 0 && run.len == run.identity.len).then_some((*place, run.identity))
-    })
+    .filter_map(|(place, run)| Some((*place, whole_object(runs, *run)?)))
     .collect()
+}
+
+/// What the preparation keeps of its sole runs as it finds them ([`note_sole`]): each file's place and run, each run's
+/// count of files, and each whole object's file and name.
+type SoleNotes<'n> = (
+  &'n mut Vec<(usize, usize)>,
+  &'n mut BTreeMap<usize, usize>,
+  &'n mut Vec<(usize, crate::named::Identity)>,
+);
+
+/// The file at `place`, made of run `found` alone, kept as the preparation finds it ([`Prep::Sole`]): its run, its
+/// run's count of files ([`alone`]'s), and its name where the run is its object whole ([`named_files`]'s).
+fn note_sole(
+  (sole, files_of, names): SoleNotes<'_>,
+  (place, found): (usize, usize),
+  runs: &[crate::named::NamedRun],
+) {
+  sole.push((place, found));
+  let count = files_of.entry(found).or_insert(0);
+  *count = count.saturating_add(1);
+  names.extend(whole_object(runs, found).map(|identity| (place, identity)));
+}
+
+/// The object run `run` of `runs` is whole, from its first byte, its length the object's: what a file made of it alone
+/// is named for ([`named_files`]); none for a run that is part of its object.
+fn whole_object(runs: &[crate::named::NamedRun], run: usize) -> Option<crate::named::Identity> {
+  let run = runs.get(run)?;
+  (run.offset == 0 && run.len == run.identity.len).then_some(run.identity)
 }
 
 /// [`apply`], for the history's oracle (`crate::history`'s tests).
@@ -2174,6 +2452,40 @@ struct Resolved {
 }
 
 impl Resolved {
+  /// One entry of the resolution let go, from the first of its collections that holds any, its copies' resolution
+  /// last: whether one was (A-920 piece 3h: let go whole, a revision of 9,000 files' resolution and decision took 1.5 ms
+  /// of one step on a debug build and 1.1 ms on a release one, the judge's).
+  pub(super) fn release_one(&mut self) -> bool {
+    self.content.pop_first().is_some()
+      || self.creates.pop_first().is_some()
+      || self.specials.pop_first().is_some()
+      || self.invalid.pop_first().is_some()
+      || self.across_copies.pop_first().is_some()
+      || self.unlinks.pop_first().is_some()
+      || self.mkdirs.pop_first().is_some()
+      || self.rmdirs.pop_first().is_some()
+      || self.modes.pop_first().is_some()
+      || self.symlinks.pop_first().is_some()
+      || self.hardlinks.pop_first().is_some()
+      || self.renames.pop_first().is_some()
+      || self.xattr_sets.pop().is_some()
+      || self.xattr_removes.pop().is_some()
+      || self.copies.pop_first().is_some()
+      || self.resolution_establishes.pop_first().is_some()
+      || self.release_copied_one()
+  }
+
+  /// One entry of the copies' resolution let go, and it with its last: whether one was.
+  fn release_copied_one(&mut self) -> bool {
+    let Some(copied) = self.copied.as_mut() else {
+      return false;
+    };
+    if !copied.release_one() {
+      self.copied = None;
+    }
+    true
+  }
+
   /// The resolution's end once every op is resolved ([`Green::resolve_some`]): each IPC node made at a path the work
   /// also does anything else at is invalid, and the copies split from what lands in their trees.
   fn finish_resolving(&mut self) {
@@ -2328,8 +2640,8 @@ pub struct Applying {
   at: usize,
   /// The commit's preparation, once every effect is made: a phase at a time, each a slice of the effects at a time.
   prep: Prep,
-  /// The named runs' buffers, read for this apply (A-760), taken from the increment as the preparation begins.
-  read: Vec<Vec<u8>>,
+  /// The named runs' bytes, read for this apply (A-760), taken from the increment as the preparation begins.
+  read: crate::named::Read,
   /// Whether the preparation checks each effect's read of a text held by name alone: a recorded version's apply does; a
   /// judged verdict's commit does not, its judge having checked them ([`Green::commit_reads`]).
   check_reads: bool,
@@ -2337,16 +2649,20 @@ pub struct Applying {
 }
 
 impl Prep {
-  /// The preparation's first phase over `post`: its runs' places, found once (none where it names no run).
+  /// The preparation's first phase over `post`: its runs' places, found a run at a time ([`Prep::Places`]; none where
+  /// it names no run).
   fn sole(post: crate::named::Post<'_>) -> Prep {
-    let places = if post.runs.is_empty() && post.declared.is_empty() {
-      BTreeMap::new()
-    } else {
-      post.run_places()
-    };
-    Prep::Sole {
-      places,
-      sole: Vec::new(),
+    if post.runs.is_empty() && post.declared.is_empty() {
+      return Prep::Sole {
+        places: BTreeMap::new(),
+        sole: Vec::new(),
+        files_of: BTreeMap::new(),
+        names: Vec::new(),
+        at: 0,
+      };
+    }
+    Prep::Places {
+      places: BTreeMap::new(),
       at: 0,
     }
   }
@@ -2356,10 +2672,28 @@ impl Prep {
 enum Prep {
   /// The entry's effects still being made.
   Effects,
+  /// The runs' places found, a run a unit, from the next ([`crate::named::Post::run_place`]; A-920 piece 3d: 4.1 ms
+  /// whole at 9,000 runs, debug, the import judge's last step).
+  Places {
+    places: BTreeMap<(u64, u64), usize>,
+    at: usize,
+  },
   /// Each effect's sole run ([`Green::sole_run_of`]) found, by the runs' places.
   Sole {
     places: BTreeMap<(u64, u64), usize>,
     sole: Vec<(usize, usize)>,
+    /// How many of the files found so far each run makes ([`alone`]'s count, kept as they are found).
+    files_of: BTreeMap<usize, usize>,
+    /// The files found so far named for their run's object ([`named_files`], kept as they are found).
+    names: Vec<(usize, crate::named::Identity)>,
+    at: usize,
+  },
+  /// The files whose run makes no other file kept ([`alone`]), a file a unit (A-920 piece 3e).
+  Alone {
+    names: Vec<(usize, crate::named::Identity)>,
+    sole: Vec<(usize, usize)>,
+    files_of: BTreeMap<usize, usize>,
+    wholes: Vec<(usize, usize)>,
     at: usize,
   },
   /// Each effect's read of a text held by name alone checked ([`Green::note_unlent_read`]).
@@ -2374,6 +2708,216 @@ enum Prep {
     wholes: Vec<(usize, usize)>,
     at: usize,
   },
+  /// The whole runs' buffers moved into their files, a run a unit ([`move_whole_runs`]), once every other file is made.
+  Moving {
+    names: Vec<(usize, crate::named::Identity)>,
+    wholes: Vec<(usize, usize)>,
+    at: usize,
+  },
+  /// The commit begun over the effects, a part a step ([`Beginning`]).
+  Beginning(Box<Beginning>),
+}
+
+/// A commit being begun over its effects, a part a step (A-920 3m): whole, its beginning had been the commit's longest
+/// step, 1.2 ms at 9,000 effects (debug), and its changed-path set of String clones 0.73-0.78 ms of it. Each mapped file
+/// made from the head the verdict judged, a file a unit; the node moves, the copied trees' links and the copies each a
+/// whole part, beginning a step of its own; then the effects' paths put in order a unit at a time ([`PathOrder`]).
+struct Beginning {
+  names: Vec<(usize, crate::named::Identity)>,
+  stage: BeginStage,
+  /// The paths the copies changed, in path order, once they are committed.
+  copied: Vec<String>,
+  order: PathOrder,
+}
+
+/// Where a [`Beginning`] is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BeginStage {
+  /// Each mapped file made, from this effect.
+  Remapping(usize),
+  /// The node moves the version's effects add.
+  Moves,
+  /// The links a copied tree's hard links add.
+  Links,
+  /// The copies committed.
+  Copies,
+  /// The effects' paths' sorted runs found, from this effect.
+  Runs(usize),
+  /// The runs merged in path order, a path a unit.
+  Merging,
+}
+
+/// The effects' paths put in path order, each once, a unit at a time and with no tree (A-920 3m): the paths' sorted runs
+/// found an effect a unit (the verdict pushes each dimension's in path order), then merged by a heap of the runs, least
+/// path first, a path a unit, each distinct path ranked. A rank is where its String goes once its effect is applied
+/// ([`ChangedPaths`]), so each is made once, the one its change entry keeps.
+#[derive(Default)]
+struct PathOrder {
+  /// Each run's next place and its end.
+  runs: Vec<(usize, usize)>,
+  /// The runs' indices not yet merged out, a heap by each one's next path, least at the top.
+  heap: Vec<usize>,
+  /// Each effect's rank among the distinct paths, by place; `u32::MAX` where an effect earlier in the order has its path.
+  slot_of: Vec<u32>,
+  /// The distinct paths ranked.
+  ranked: u32,
+  /// The place of the last path ranked.
+  last: Option<usize>,
+  /// Where the run being found begins.
+  run_start: usize,
+}
+
+/// Format: no rank, for an effect whose path an earlier one in the order has ([`PathOrder::slot_of`]).
+const NO_RANK: u32 = u32::MAX;
+
+impl PathOrder {
+  /// The path of the next place of run `run`.
+  fn key<'e>(&self, effects: &'e [Effect], run: usize) -> Option<&'e str> {
+    let (next, _) = *self.runs.get(run)?;
+    effects.get(next).map(Effect::path)
+  }
+
+  /// Whether the heap's entry at `a` goes before the one at `b`.
+  fn before(&self, effects: &[Effect], (a, b): (usize, usize)) -> bool {
+    let (Some(&a), Some(&b)) = (self.heap.get(a), self.heap.get(b)) else {
+      return false;
+    };
+    self.key(effects, a) < self.key(effects, b)
+  }
+
+  /// Run `run` added to the heap.
+  fn push(&mut self, effects: &[Effect], run: usize) {
+    self.heap.push(run);
+    let mut at = self.heap.len().saturating_sub(1);
+    while at > 0 {
+      let parent = at.saturating_sub(1) / 2;
+      if !self.before(effects, (at, parent)) {
+        break;
+      }
+      self.heap.swap(at, parent);
+      at = parent;
+    }
+  }
+
+  /// The heap's top moved down to its place.
+  fn sift_down(&mut self, effects: &[Effect]) {
+    let mut at = 0usize;
+    loop {
+      let left = at.saturating_mul(2).saturating_add(1);
+      let right = left.saturating_add(1);
+      let mut least = at;
+      if left < self.heap.len() && self.before(effects, (left, least)) {
+        least = left;
+      }
+      if right < self.heap.len() && self.before(effects, (right, least)) {
+        least = right;
+      }
+      if least == at {
+        return;
+      }
+      self.heap.swap(at, least);
+      at = least;
+    }
+  }
+
+  /// The effect at `at` met in the runs' walk: a run ends before it where its path goes before the one before it.
+  /// Whether it was the last.
+  fn find_run(&mut self, effects: &[Effect], at: usize) -> bool {
+    if self.slot_of.len() != effects.len() {
+      self.slot_of = vec![NO_RANK; effects.len()];
+    }
+    let earlier = at.checked_sub(1).and_then(|before| effects.get(before));
+    if let (Some(earlier), Some(effect)) = (earlier, effects.get(at))
+      && effect.path() < earlier.path()
+    {
+      self.close_run(effects, at);
+    }
+    let last = at.saturating_add(1) >= effects.len();
+    if last {
+      self.close_run(effects, effects.len());
+    }
+    last
+  }
+
+  /// The run being found ends before `end`, a run of the heap where it holds any path.
+  fn close_run(&mut self, effects: &[Effect], end: usize) {
+    if end > self.run_start {
+      let run = self.runs.len();
+      self.runs.push((self.run_start, end));
+      self.push(effects, run);
+    }
+    self.run_start = end;
+  }
+
+  /// The least path left ranked, unless it is the last one's: whether any was left.
+  fn merge_one(&mut self, effects: &[Effect]) -> bool {
+    let Some(&top) = self.heap.first() else {
+      return false;
+    };
+    let Some(&(next, end)) = self.runs.get(top) else {
+      return false;
+    };
+    let path = effects.get(next).map(Effect::path);
+    let last = self
+      .last
+      .and_then(|last| effects.get(last))
+      .map(Effect::path);
+    if last != path
+      && let Some(slot) = self.slot_of.get_mut(next)
+    {
+      *slot = self.ranked;
+      self.ranked = self.ranked.saturating_add(1);
+      self.last = Some(next);
+    }
+    let after = next.saturating_add(1);
+    if let Some(run) = self.runs.get_mut(top) {
+      run.0 = after;
+    }
+    if after >= end {
+      self.heap.swap_remove(0);
+    }
+    self.sift_down(effects);
+    true
+  }
+}
+
+/// A commit's changed paths, each once, walked in path order with no tree (A-920 3m): the effects' distinct paths in the
+/// order [`PathOrder`] ranked them, each String made as its effect is applied, the one its change entry keeps; the
+/// paths the copies changed; and the hard links naming a changed special, once found.
+#[derive(Default)]
+struct ChangedPaths {
+  paths: Vec<String>,
+  /// Each effect's rank in `paths`, by place ([`PathOrder::slot_of`]).
+  slot_of: Vec<u32>,
+  copied: Vec<String>,
+  links: Vec<String>,
+  /// The walk's next of `paths`, `copied` and `links`.
+  at: [usize; 3],
+}
+
+impl ChangedPaths {
+  /// Its next path in path order, taken from whichever list holds it ([`Green::change_one`]): none once every one is.
+  fn take_next(&mut self) -> Option<String> {
+    let [paths, copied, links] = self.at;
+    let candidates = [
+      self.paths.get(paths),
+      self.copied.get(copied),
+      self.links.get(links),
+    ];
+    let (least, _) = candidates
+      .iter()
+      .enumerate()
+      .filter_map(|(list, path)| path.map(|path| (list, path)))
+      .min_by(|(_, a), (_, b)| a.cmp(b))?;
+    let (list, at) = match least {
+      0 => (&mut self.paths, &mut self.at[0]),
+      1 => (&mut self.copied, &mut self.at[1]),
+      _ => (&mut self.links, &mut self.at[2]),
+    };
+    let path = list.get_mut(*at).map(core::mem::take);
+    *at = at.saturating_add(1);
+    path
+  }
 }
 
 impl core::fmt::Debug for Applying {
@@ -2387,7 +2931,7 @@ impl core::fmt::Debug for Applying {
   }
 }
 
-/// A commit under way ([`Green::commit_begin`], [`Green::commit_step`]): its version, the effects left to apply and the
+/// A commit under way ([`Green::beginning_some`], [`Green::commit_step`]): its version, the effects left to apply and the
 /// place of the next, the names of the files named whole, what it staged, its delta and the paths it changed.
 struct CommitRun {
   version: u64,
@@ -2396,11 +2940,9 @@ struct CommitRun {
   names: Vec<(usize, crate::named::Identity)>,
   staged: Staged,
   delta: BTreeMap<String, Vec<Op>>,
-  changed: BTreeSet<String>,
-  /// The hard links naming a changed path that was a special, found so far: changed with it (A-920 piece 1b).
-  links: Vec<String>,
-  /// The last changed path whose links were found.
-  links_after: Option<String>,
+  /// The paths it changed, in path order with no tree (A-920 3m); the hard links naming one that was a special join them
+  /// once found (A-920 piece 1b).
+  changed: ChangedPaths,
   /// The version's change entries recorded so far, in path order.
   entries: Vec<ChangeEntry>,
   phase: CommitPhase,
@@ -2794,11 +3336,51 @@ impl Green {
   /// values are no longer reconstructible). With the origin it restores ([`Green::restore`]) a green that answers as
   /// this one does for every version from `at` on.
   pub fn checkpoint(&self, at: u64) -> Option<crate::checkpoint::Checkpoint> {
-    // A green that owes a push has no content to fold into one (P2): nothing.
-    if self.owed.is_some() || at > self.head() || at < self.folded_below || at < self.deltas_from {
+    let mut build = self.checkpoint_begin(at)?;
+    loop {
+      if let CheckpointStep::Built(checkpoint) = self.checkpoint_unit(&mut build)? {
+        return Some(*checkpoint);
+      }
+    }
+  }
+
+  /// [`Green::checkpoint`] at `at` begun, to be built a unit at a time ([`Green::checkpoint_unit`], A-920 8a): none
+  /// where it would be none.
+  pub fn checkpoint_begin(&self, at: u64) -> Option<CheckpointBuild> {
+    if !self.checkpoint_available(at) {
       return None;
     }
-    let (copied, listed) = self.copied_at(at);
+    Some(CheckpointBuild {
+      at,
+      trees: self.copied_trees_at(at),
+      gathered: 0,
+      keys: BTreeSet::new(),
+      copied: crate::checkpoint::Tables::default(),
+      listed: BTreeSet::new(),
+    })
+  }
+
+  /// One unit of `build` ([`Green::checkpoint_begin`]): a copied tree's keys gathered, one of its keys read
+  /// (`copied_key`), or the rest made whole and the checkpoint built: every changed key's value and the increments, the
+  /// copies' records and the sum, the copied keys left out of the changed ones, canonical. Between units the green may
+  /// take versions past `at`, which change nothing a checkpoint at `at` reads; none where the checkpoint is no longer
+  /// available there (a fold past `at`, a push owed).
+  pub fn checkpoint_unit(&self, build: &mut CheckpointBuild) -> Option<CheckpointStep> {
+    let at = build.at;
+    if !self.checkpoint_available(at) {
+      return None;
+    }
+    if let Some(tree) = build.trees.get(build.gathered) {
+      build.keys.extend(self.every_key(tree));
+      build.gathered = build.gathered.saturating_add(1);
+      return Some(CheckpointStep::More);
+    }
+    if let Some(key) = build.keys.pop_first() {
+      self.copied_key(key, at, (&mut build.copied, &mut build.listed));
+      return Some(CheckpointStep::More);
+    }
+    let copied = std::mem::take(&mut build.copied);
+    let listed = std::mem::take(&mut build.listed);
     let copies = self.copy_records_at(at);
     // The sum stands for what the copies' entries hold beyond the restored state's own, so it travels beside a copy's
     // record alone: without one, a restore's own entries are the identity (A-626 part 3, continued (1)).
@@ -2843,7 +3425,13 @@ impl Green {
     };
     Green::leave_out_copied(&mut checkpoint, &listed);
     checkpoint.canonicalize();
-    Some(checkpoint)
+    Some(CheckpointStep::Built(Box::new(checkpoint)))
+  }
+
+  /// Whether a checkpoint at `at` is available: none where the green owes a push (P2: it has no content to fold into
+  /// one), or `at` is past the head or below the folded floor (its values are no longer reconstructible).
+  fn checkpoint_available(&self, at: u64) -> bool {
+    self.owed.is_none() && at <= self.head() && at >= self.folded_below && at >= self.deltas_from
   }
 
   /// A green restored from its `origin` and a `checkpoint` of it (§4.16, §4.8 recovery): the origin's state with every
@@ -3884,6 +4472,37 @@ impl Green {
           last: entry.last,
         })
     })
+  }
+
+  /// The changed paths commits put in a tree set of their own ([`Green::commit_tree_paths`]'s field, A-920 3m).
+  pub fn commit_tree_paths(&self) -> u64 {
+    self.commit_tree_paths
+  }
+
+  /// The byte buffers commits let go for files named for their run's object ([`Green::named_buffers_freed`]'s field,
+  /// A-920 3n).
+  pub fn named_buffers_freed(&self) -> u64 {
+    self.named_buffers_freed
+  }
+
+  /// The changed paths' Strings commits made ([`Green::commit_paths_made`]'s field, A-920 3m).
+  pub fn commit_paths_made(&self) -> u64 {
+    self.commit_paths_made
+  }
+
+  /// The effect lists a verdict's units allocated of their own ([`Green::unit_effect_lists`]'s field, A-920 3l).
+  pub fn unit_effect_lists(&self) -> u64 {
+    self.unit_effect_lists.get()
+  }
+
+  /// Counts what `units` allocated of their own as they were judged.
+  fn note_unit_lists(&self, units: &position::Units) {
+    self.unit_effect_lists.set(
+      self
+        .unit_effect_lists
+        .get()
+        .saturating_add(units.effect_lists()),
+    );
   }
 
   /// The number of paths merged through the content fast path (the non-vacuity counter).
@@ -5078,10 +5697,12 @@ impl Green {
     &self,
     inc: &Increment,
     path: &str,
-    (ops, placed): (&[Op], Option<(u64, Vec<position::Placed>)>),
-  ) -> position::Unit {
+    (ops, placed): (&[Op], Option<(u64, &[position::Placed])>),
+    sink: &mut position::UnitSink<'_>,
+  ) {
     if let Some(class) = self.content_refused(inc, path) {
-      return position::Unit::of(Err(Green::window(path, class)));
+      sink.of(Err(Green::window(path, class)));
+      return;
     }
     let base_changed = self.changed_last(self.last_changed.get(path), path);
     let unchanged = base_changed <= inc.base;
@@ -5090,17 +5711,18 @@ impl Green {
         .fast_path_hits
         .set(self.fast_path_hits.get().saturating_add(1));
     }
-    let placed: Vec<position::Placed> = match placed {
+    // Written into the verdict's placements, never a list of the unit's own (A-920 3l).
+    let start = sink.placed.len();
+    match placed {
       Some((at, placed)) if placed.len() == ops.len() => {
         let since = if unchanged {
           Vec::new()
         } else {
           self.intervening(path, at)
         };
-        placed
-          .into_iter()
-          .map(|place| place.advanced(&since))
-          .collect()
+        sink
+          .placed
+          .extend(placed.iter().map(|place| place.advanced(&since)));
       }
       _ => {
         let intervening = if unchanged {
@@ -5108,15 +5730,14 @@ impl Green {
         } else {
           self.intervening(path, inc.base)
         };
-        ops
-          .iter()
-          .map(|op| position::Placed::of(op, &intervening))
-          .collect()
+        sink
+          .placed
+          .extend(ops.iter().map(|op| position::Placed::of(op, &intervening)));
       }
-    };
-    let mut unit = position::Unit::content(self.content_at_head(inc, path, (ops, &placed)));
-    unit.placed = placed;
-    unit
+    }
+    let placed = sink.placed.get(start..).unwrap_or(&[]);
+    let answer = self.content_at_head(inc, path, (ops, placed));
+    sink.content(answer);
   }
 
   /// Why an edit of `path` is refused before its ops are placed, if it is: no file at the path (a type change, or delete
@@ -5536,56 +6157,53 @@ impl Green {
     Ok(Some(Effect::Special(path.to_owned(), node)))
   }
 
-  /// The paths whose content ops do not fit the content they edit at the increment's base ([`fits_base`]): a
-  /// created path edits nothing, a renamed-into path edits its source, and a link a node passes to with the work's
-  /// writes edits the node's home ([`Green::handed_home`], A-669).
-  fn unfit_content(&self, inc: &Increment, r: &Resolved) -> Vec<String> {
-    let post_len = inc.post().len();
-    let cleared = r.cleared();
-    r.content
-      .iter()
-      .filter(|(path, ops)| {
-        let edited = r
-          .renames
-          .get(*path)
-          .map(String::as_str)
-          .or_else(|| self.handed_home(r, path, &cleared))
-          .unwrap_or(path.as_str());
-        let base_len = if r.creates.contains(*path) {
-          0
-        } else {
-          self
-            .content_len_at(edited, inc.base)
-            .map_or(0, |len| u64::try_from(len).unwrap_or(u64::MAX))
-        };
-        !fits_base(ops, base_len, post_len)
-      })
-      .map(|(path, _)| path.clone())
-      .collect()
+  /// Whether `path`'s content ops fit the content they edit at the increment's base ([`fits_base`]): a created path
+  /// edits nothing, a renamed-into path edits its source, and a link a node passes to with the work's writes edits the
+  /// node's home ([`Green::handed_home`], A-669). `cleared` is the paths the work removes itself ([`Resolved::cleared`]).
+  fn content_fits(
+    &self,
+    inc: &Increment,
+    r: &Resolved,
+    cleared: &BTreeSet<String>,
+    (path, ops): (&str, &[Op]),
+  ) -> bool {
+    let edited = r
+      .renames
+      .get(path)
+      .map(String::as_str)
+      .or_else(|| self.handed_home(r, path, cleared))
+      .unwrap_or(path);
+    let base_len = if r.creates.contains(path) {
+      0
+    } else {
+      self
+        .content_len_at(edited, inc.base)
+        .map_or(0, |len| u64::try_from(len).unwrap_or(u64::MAX))
+    };
+    fits_base(ops, base_len, inc.post().len())
   }
 
   /// Decides every dimension of an increment, collecting the accepted effects or the conflicts.
   fn decide(&self, inc: &Increment, r: &Resolved) -> Result<Vec<Effect>, Vec<ConflictWindow>> {
     let mut units = position::Units::first();
     self.decide_units(inc, r, &mut units);
+    self.note_unit_lists(&units);
     position::verdict(units.into_units().0)
   }
 
   /// A work's copies and what it does in their trees, one unit (A-586, A-626; `position`): the copied ops that do not
   /// fit what a copy brings, then each copy's verdict, then the copied ops'.
-  fn decide_copy_unit(&self, inc: &Increment, r: &Resolved) -> position::Unit {
+  fn decide_copy_unit(&self, inc: &Increment, r: &Resolved, sink: &mut position::UnitSink<'_>) {
     // Each copy's fix once (A-626 part 2): its copied tree is judged against it, and its effect carries it.
     let fixes = self.copy_fixes(r);
-    let mut unit = position::Unit::windows(
+    sink.windows(
       self
         .unfit_copied(inc, (r, &fixes))
         .iter()
-        .map(|path| Green::window(path, MergeConflictClass::TypeChanged))
-        .collect(),
+        .map(|path| Green::window(path, MergeConflictClass::TypeChanged)),
     );
-    self.decide_copies(inc, (r, &fixes), &mut unit.effects, &mut unit.windows);
-    self.decide_copied(inc, (r, &fixes), &mut unit.effects, &mut unit.windows);
-    unit
+    self.decide_copies(inc, (r, &fixes), sink.effects, sink.windows);
+    self.decide_copied(inc, (r, &fixes), sink.effects, sink.windows);
   }
 
   /// Whether `path` changed in any dimension after version `base`: its last change in the change index, or the latest
@@ -5869,40 +6487,6 @@ impl Green {
     }
   }
 
-  /// A commit's work before any effect is applied, its `names` the effects' places whose files are named for the object
-  /// they are the whole of ([`named_files`]): the mapped files made from the head the verdict judged, the node moves and copied links derived from it, and the copies applied, each before the head changes.
-  fn commit_begin(
-    &mut self,
-    mut effects: Vec<Effect>,
-    version: u64,
-    post_state: crate::named::Post<'_>,
-    names: &[(usize, crate::named::Identity)],
-  ) -> CommitRun {
-    // First, before a copy or a node move changes the head: each mapped file from the head the verdict judged.
-    self.make_mapped(&mut effects, post_state, &[]);
-    let moves = self.node_moves(&effects);
-    effects.extend(moves);
-    // A copied tree's hard links name the copy's nodes, or nodes of their own (`Green::copy_link_effects`), read from the
-    // head before the copies land and applied after them.
-    let linked = self.copy_link_effects(&effects);
-    effects.extend(linked);
-    let mut changed: BTreeSet<String> = effects.iter().map(|e| e.path().to_owned()).collect();
-    changed.extend(self.commit_copies(&effects, version));
-    CommitRun {
-      version,
-      effects: effects.into_iter(),
-      place: 0,
-      names: names.to_vec(),
-      staged: Staged::default(),
-      delta: BTreeMap::new(),
-      changed,
-      links: Vec::new(),
-      links_after: None,
-      entries: Vec::new(),
-      phase: CommitPhase::Effects,
-    }
-  }
-
   /// Takes `run` on an effect, a staged removal or a staged file at a time, at least one, until `spent` says its caller's
   /// slice is spent: whether it has ended (its delta pushed and its changes recorded). No count of units: a file set
   /// costs many times a removal, so the caller's clock, not a number, ends the slice.
@@ -5920,6 +6504,15 @@ impl Green {
               .ok()
               .and_then(|at| run.names.get(at))
               .map(|(_, identity)| *identity);
+            if let Some(slot) = run.changed.slot_of.get(place).copied()
+              && let Some(path) = run
+                .changed
+                .paths
+                .get_mut(usize::try_from(slot).unwrap_or(usize::MAX))
+            {
+              *path = effect.path().to_owned();
+              self.commit_paths_made = self.commit_paths_made.saturating_add(1);
+            }
             self.apply_effect(effect, run.version, &mut run.staged, name);
           }
           None => {
@@ -5981,22 +6574,33 @@ impl Green {
   /// The hard links naming the next changed path where it was a special, a path a unit: changed with it. Once every
   /// changed path is looked at, they join the changed paths, and their recording begins.
   fn links_one(&mut self, run: &mut CommitRun) {
-    let after = run.links_after.as_deref();
-    let bounds = (
-      after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
-      std::ops::Bound::Unbounded,
-    );
-    let Some(path) = run.changed.range::<str, _>(bounds).next() else {
-      run.changed.extend(core::mem::take(&mut run.links));
-      run.phase = CommitPhase::Changes;
-      return;
+    let changed = &mut run.changed;
+    let [paths, copied, _] = &mut changed.at;
+    let path = match changed.paths.get(*paths) {
+      Some(path) => {
+        *paths = paths.saturating_add(1);
+        path
+      }
+      None => match changed.copied.get(*copied) {
+        Some(path) => {
+          *copied = copied.saturating_add(1);
+          path
+        }
+        None => {
+          // Every changed path looked at: the links found join them, in path order, each once.
+          changed.links.sort_unstable();
+          changed.links.dedup();
+          changed.at = [0; 3];
+          run.phase = CommitPhase::Changes;
+          return;
+        }
+      },
     };
     if self.was_special(path) {
-      run
+      changed
         .links
         .extend(self.links_to.get(path).into_iter().flatten().cloned());
     }
-    run.links_after = Some(path.clone());
   }
 
   /// The next changed path recorded as changed at the commit's version, a path a unit: the path's last change, its
@@ -6004,7 +6608,14 @@ impl Green {
   /// for a version that changed nothing): whether the commit ended.
   fn change_one(&mut self, run: &mut CommitRun) -> bool {
     let version = run.version;
-    let Some(path) = run.changed.pop_first() else {
+    // The next changed path not the last one recorded: a path both an effect and a copy, or a link, change is one entry.
+    let next = loop {
+      match run.changed.take_next() {
+        Some(path) if run.entries.last().is_some_and(|entry| entry.path == path) => {}
+        next => break next,
+      }
+    };
+    let Some(path) = next else {
       if !run.entries.is_empty() {
         self
           .changes
@@ -6348,7 +6959,12 @@ impl Green {
     // is re-anchored on that block (A-793).
     // A file made whole of one named object holds it by its name alone (A-760 (b) 4d): its bytes, the run's, let go.
     match name {
-      Some(name) => self.content.insert_named(&path, name),
+      Some(name) => {
+        if bytes.capacity() > 0 {
+          self.named_buffers_freed = self.named_buffers_freed.saturating_add(1);
+        }
+        self.content.insert_named(&path, name);
+      }
       None => self.content.insert(&path, bytes),
     }
     self.supersede_latest(&path);
@@ -6428,6 +7044,7 @@ impl Green {
   /// that starts below the floor and ends at or above it is answered as the folded histories answer it. A version
   /// emptied goes too; an entry keeps its place in its version, so a walk's cursor holds. The cost of the entries the
   /// floor passes.
+  #[cfg(test)]
   fn fold_changes_before(&mut self, previous: u64, floor: u64) {
     let passed: Vec<u64> = self
       .changes
@@ -6687,7 +7304,7 @@ impl Green {
     }
     let mut judgment = self.hold_unlent(inc, computed, true);
     if let Judgment::Accepted(held) = &mut judgment {
-      held.read = inc.named.read.0.clone();
+      held.read = inc.named.read.copied();
     }
     Ok(judgment)
   }
@@ -6706,7 +7323,7 @@ impl Green {
   pub fn judge(&mut self, inc: &Increment) -> Judgment {
     let mut judgment = self.judge_held(inc, true);
     if let Judgment::Accepted(held) = &mut judgment {
-      held.read = inc.named.read.0.clone();
+      held.read = inc.named.read.copied();
     }
     judgment
   }
@@ -6716,7 +7333,7 @@ impl Green {
   pub fn judge_named(&mut self, inc: &mut Increment) -> Judgment {
     let mut judgment = self.judge_held(inc, true);
     if let Judgment::Accepted(held) = &mut judgment {
-      held.read = core::mem::take(&mut inc.named.read.0);
+      held.read = core::mem::take(&mut inc.named.read);
     }
     judgment
   }
@@ -6728,7 +7345,7 @@ impl Green {
   pub fn judge_named_reads_later(&mut self, inc: &mut Increment) -> Judgment {
     let mut judgment = self.judge_held(inc, false);
     if let Judgment::Accepted(held) = &mut judgment {
-      held.read = core::mem::take(&mut inc.named.read.0);
+      held.read = core::mem::take(&mut inc.named.read);
     }
     judgment
   }
@@ -6772,6 +7389,18 @@ impl Green {
   fn hold_unlent(&mut self, inc: &Increment, computed: Computed, check_reads: bool) -> Judgment {
     let (judgment, unlent) =
       crate::unlent::scope(|| self.hold_computed(inc, computed, check_reads));
+    self.unlent_rule(inc, judgment, &unlent)
+  }
+
+  /// `judgment`, held over reads of the unlent named blocks `unlent` ([`Green::hold_unlent`]): as it is where none was
+  /// read; else [`Judgment::ContentUnread`] naming the least, and a conflict judged so no verdict, its cached windows
+  /// let go.
+  pub(super) fn unlent_rule(
+    &mut self,
+    inc: &Increment,
+    judgment: Judgment,
+    unlent: &BTreeSet<crate::named::Identity>,
+  ) -> Judgment {
     match (unlent.first(), judgment) {
       (None, judgment) => judgment,
       (Some(identity), judgment) => {
@@ -6791,47 +7420,78 @@ impl Green {
   /// unknown), else brought to the head ([`Green::at_head`]) and held there, a conflict kept in the rejected-result
   /// cache as a submit keeps one. Its commit's reads checked where `check_reads` ([`Green::commit_reads`]).
   fn hold_computed(&mut self, inc: &Increment, computed: Computed, check_reads: bool) -> Judgment {
+    match self.hold_begin(inc, computed, check_reads) {
+      HoldBegun::Holding(mut holding) => self.hold_end(inc, &mut holding),
+      HoldBegun::Judged(answer) => answer,
+    }
+  }
+
+  /// [`Green::hold_computed`] begun: answered at once where the cache or the green's checkpoint answers it, else the
+  /// units brought to the head ([`Green::at_head`]), to be held in a step of their own ([`Green::hold_end`]; A-920 piece
+  /// 3g: `position::verdict` 2.26 ms whole at 9,000 files, debug, the judge's last step, before 3l made it the lists).
+  pub(super) fn hold_begin(
+    &mut self,
+    inc: &Increment,
+    computed: Computed,
+    check_reads: bool,
+  ) -> HoldBegun {
     if let Some(version) = self.accepted.get(&inc.id) {
-      return Judgment::AcceptedBefore { version: *version };
+      return HoldBegun::Judged(Judgment::AcceptedBefore { version: *version });
     }
     if let Some(windows) = self.rejected.get(&inc.id) {
-      return Judgment::Conflict {
+      return HoldBegun::Judged(Judgment::Conflict {
         windows: windows.clone(),
-      };
+      });
     }
     if inc.base < self.deltas_from {
-      return Judgment::BaseUnavailable {
+      return HoldBegun::Judged(Judgment::BaseUnavailable {
         base: inc.base,
         floor: self.deltas_from,
-      };
+      });
     }
-    let units = match computed.reached {
-      Reached::Before(version) => return Judgment::AcceptedBefore { version },
-      Reached::Verdict { units, .. } => self.at_head(inc, (computed.at, computed.floor), units),
+    let (units, reached) = match computed.reached {
+      Reached::Before(version) => return HoldBegun::Judged(Judgment::AcceptedBefore { version }),
+      Reached::Verdict { units, applied, .. } => {
+        // Reached at the head, nothing since: its effects are the ones reached, and so what the chain records of them.
+        let unchanged = self.since(computed.at, computed.floor).is_nothing();
+        let units = self.at_head(inc, (computed.at, computed.floor), units);
+        (units, unchanged.then_some(applied))
+      }
     };
-    match position::verdict(units) {
-      Ok(effects) => {
-        if check_reads {
-          self.commit_reads(&effects, inc.post());
-        }
-        let applied = effects.iter().map(Effect::applied).collect();
-        Judgment::Accepted(Judged {
-          id: inc.id,
-          at: self.head(),
-          effects,
-          applied,
-          post_state: inc.post_state.clone(),
-          read: Vec::new(),
-          runs: inc.named.runs.clone(),
-          making: Making::default(),
-          reads_checked: check_reads,
-        })
-      }
-      Err(windows) => {
-        self.retain_rejected(inc.id, &windows);
-        Judgment::Conflict { windows }
-      }
+    HoldBegun::Holding(Holding {
+      verdict: units,
+      reached,
+      check_reads,
+    })
+  }
+
+  /// `holding`'s verdict, its flat lists taken whole (A-920 3l): accepted and held where no unit holds a window (its
+  /// commit's reads checked where its judge checks them), else a conflict kept in the rejected-result cache.
+  pub(super) fn hold_end(&mut self, inc: &Increment, holding: &mut Holding) -> Judgment {
+    let windows = core::mem::take(&mut holding.verdict.windows);
+    if !windows.is_empty() {
+      self.retain_rejected(inc.id, &windows);
+      return Judgment::Conflict { windows };
     }
+    let effects = core::mem::take(&mut holding.verdict.effects);
+    if holding.check_reads {
+      self.commit_reads(&effects, inc.post());
+    }
+    let applied = holding
+      .reached
+      .take()
+      .unwrap_or_else(|| effects.iter().map(Effect::applied).collect());
+    Judgment::Accepted(Judged {
+      id: inc.id,
+      at: self.head(),
+      effects,
+      applied,
+      post_state: inc.post_state.clone(),
+      read: crate::named::Read::default(),
+      runs: inc.named.runs.clone(),
+      making: Making::default(),
+      reads_checked: holding.check_reads,
+    })
   }
 
   /// The units of `inc`'s verdict reached at `at` over the fold floor `floor`, brought to the head (A-658, `position`):
@@ -6840,8 +7500,8 @@ impl Green {
     &mut self,
     inc: &Increment,
     (at, floor): (u64, u64),
-    units: Vec<position::Unit>,
-  ) -> Vec<position::Unit> {
+    units: position::Verdict,
+  ) -> position::Verdict {
     let since = self.since(at, floor);
     if since.is_nothing() {
       return units;
@@ -6849,6 +7509,7 @@ impl Green {
     let resolved = Green::resolve(inc);
     let mut again = position::Units::again(units, since);
     self.decide_units(inc, &resolved, &mut again);
+    self.note_unit_lists(&again);
     let (units, judged) = again.into_units();
     self.judged_again = self.judged_again.saturating_add(judged);
     units
@@ -6951,7 +7612,8 @@ impl Green {
       }
       let Some(mut file) = judged.making.current.take() else {
         let wholes = judged.making.wholes.clone().unwrap_or_default();
-        move_whole_runs(&mut judged.effects, &mut judged.read, &wholes);
+        let names = judged.making.names.clone().unwrap_or_default();
+        move_whole_runs(&mut judged.effects, &judged.read, (&wholes, &names));
         return Ok(Made { done: true, copied });
       };
       copied =
@@ -7238,7 +7900,7 @@ impl Green {
       effects: Vec::with_capacity(applied.len()),
       at: 0,
       prep: Prep::Effects,
-      read: Vec::new(),
+      read: crate::named::Read::default(),
       check_reads: true,
       commit: None,
     }))
@@ -7302,7 +7964,7 @@ impl Green {
     if let Prep::Effects = run.prep {
       // A file a named run makes whole takes the run's buffer, read for this apply (A-760), with no copy, as a judged
       // verdict's commit does (`Green::commit_held`); every other file is made first, while every buffer is in place.
-      run.read = core::mem::take(&mut inc.named.read.0);
+      run.read = core::mem::take(&mut inc.named.read);
       run.prep = Prep::sole(crate::named::Post::of(
         &inc.post_state,
         &run.read,
@@ -7315,94 +7977,344 @@ impl Green {
   /// [`Green::apply_step`] once every effect is made: the commit's preparation a phase at a time, each an effect at a
   /// time until `spent` (A-917's owed phases, cut 3: it was one call of 30 ms at 9,000 files, debug): each effect's sole
   /// run, then each one's read of a text held by name alone checked (a slice that meets one undone, and the texts asked
-  /// for, [`ApplyStep::Lend`]), then each mapped file made; then the commit begun ([`Green::commit_begin`]).
+  /// for, [`ApplyStep::Lend`]), then each mapped file made; then the commit begun ([`Green::beginning_some`]).
   fn prepare_step(
     &mut self,
     run: &mut Applying,
     (post_state, runs): (&[u8], &crate::named::RunTable),
     spent: &mut dyn FnMut() -> bool,
   ) -> ApplyStep {
+    // Whether no unit has run in this step yet: a whole part runs only as a step's first (A-920 3m).
+    let mut fresh = true;
     loop {
-      match &mut run.prep {
+      let stepped = match run.prep {
         // Begun by its owner ([`Prep::sole`]); never met here.
-        Prep::Effects => return ApplyStep::More,
-        Prep::Sole { places, sole, at } => {
-          if !places.is_empty() {
-            while let Some(effect) = run.effects.get(*at) {
-              if let Some(found) = self.sole_run_of(effect, places) {
-                sole.push((*at, found));
-              }
-              *at = at.saturating_add(1);
-              if run.effects.get(*at).is_some() && spent() {
-                return ApplyStep::More;
-              }
-            }
-          }
-          let sole = core::mem::take(sole);
-          let names = named_files(&sole, runs);
-          let wholes = alone(sole);
-          run.prep = if run.check_reads {
-            Prep::Reads {
-              names,
-              wholes,
-              at: 0,
-            }
-          } else {
-            Prep::Mapped {
-              names,
-              wholes,
-              at: 0,
-            }
-          };
-        }
-        Prep::Reads { names, wholes, at } => {
-          let from = *at;
-          let ((), unlent) = crate::unlent::scope(|| {
-            while let Some(effect) = run.effects.get(*at) {
-              self.note_unlent_read((*at, effect), wholes);
-              *at = at.saturating_add(1);
-              if spent() {
-                break;
-              }
-            }
-          });
-          if !unlent.is_empty() {
-            // The slice undone, to be checked again once its texts are lent.
-            *at = from;
-            return ApplyStep::Lend(unlent);
-          }
-          if run.effects.get(*at).is_some() {
-            return ApplyStep::More;
-          }
-          run.prep = Prep::Mapped {
-            names: core::mem::take(names),
-            wholes: core::mem::take(wholes),
-            at: 0,
-          };
-        }
-        Prep::Mapped { names, wholes, at } => {
-          let post = crate::named::Post::of(post_state, &run.read, runs);
-          while let Some(effect) = run.effects.get_mut(*at) {
-            self.make_mapped_one((*at, effect), post, wholes);
-            *at = at.saturating_add(1);
-            if run.effects.get(*at).is_some() && spent() {
-              return ApplyStep::More;
-            }
-          }
-          let mut effects = core::mem::take(&mut run.effects);
-          move_whole_runs(&mut effects, &mut run.read, wholes);
-          let version = self.head().saturating_add(1);
-          let names = core::mem::take(names);
-          run.commit = Some(self.commit_begin(
-            effects,
-            version,
-            crate::named::Post::of(post_state, &run.read, runs),
-            &names,
-          ));
-          return ApplyStep::More;
-        }
+        Prep::Effects => Some(ApplyStep::More),
+        Prep::Places { .. } => Green::places_some(run, (post_state, runs), spent),
+        Prep::Sole { .. } => self.sole_some(run, runs, spent),
+        Prep::Alone { .. } => Green::alone_some(run, spent),
+        Prep::Reads { .. } => self.reads_some(run, spent),
+        Prep::Mapped { .. } => Some(self.mapped_some(run, (post_state, runs), spent)),
+        Prep::Moving { .. } => Green::moving_some(run, spent),
+        Prep::Beginning(_) => self.beginning_some(run, (post_state, runs), (fresh, spent)),
+      };
+      if let Some(stepped) = stepped {
+        return stepped;
+      }
+      fresh = false;
+    }
+  }
+
+  /// [`Prep::Places`]: the runs' places found, a run a unit, until `spent`: the step where it is spent, none where the
+  /// phase ended ([`Green::prepare_step`]).
+  fn places_some(
+    run: &mut Applying,
+    (post_state, runs): (&[u8], &crate::named::RunTable),
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Option<ApplyStep> {
+    let Prep::Places { places, at } = &mut run.prep else {
+      return Some(ApplyStep::More);
+    };
+    let post = crate::named::Post::of(post_state, &run.read, runs);
+    while let Some(place) = post.run_place(*at) {
+      places.entry(place).or_insert(*at);
+      *at = at.saturating_add(1);
+      if post.run_place(*at).is_some() && spent() {
+        return Some(ApplyStep::More);
       }
     }
+    run.prep = Prep::Sole {
+      places: core::mem::take(places),
+      sole: Vec::new(),
+      files_of: BTreeMap::new(),
+      names: Vec::new(),
+      at: 0,
+    };
+    None
+  }
+
+  /// [`Prep::Sole`]: each effect's sole run found, a file a unit, each file's name and its run's count of files kept as
+  /// found, until `spent`: the step where it is spent, none where the phase ended.
+  fn sole_some(
+    &self,
+    run: &mut Applying,
+    runs: &crate::named::RunTable,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Option<ApplyStep> {
+    let Prep::Sole {
+      places,
+      sole,
+      files_of,
+      names,
+      at,
+    } = &mut run.prep
+    else {
+      return Some(ApplyStep::More);
+    };
+    while !places.is_empty()
+      && let Some(effect) = run.effects.get(*at)
+    {
+      if let Some(found) = self.sole_run_of(effect, places) {
+        note_sole((sole, files_of, names), (*at, found), runs);
+      }
+      *at = at.saturating_add(1);
+      if run.effects.get(*at).is_some() && spent() {
+        return Some(ApplyStep::More);
+      }
+    }
+    run.prep = Prep::Alone {
+      names: core::mem::take(names),
+      sole: core::mem::take(sole),
+      files_of: core::mem::take(files_of),
+      wholes: Vec::new(),
+      at: 0,
+    };
+    None
+  }
+
+  /// [`Prep::Alone`]: the files whose run makes no other kept, a file a unit, until `spent`: the step where it is spent,
+  /// none where the phase ended (to its reads' check, or to the mapped files where its judge checked them).
+  fn alone_some(run: &mut Applying, spent: &mut dyn FnMut() -> bool) -> Option<ApplyStep> {
+    let Prep::Alone {
+      names,
+      sole,
+      files_of,
+      wholes,
+      at,
+    } = &mut run.prep
+    else {
+      return Some(ApplyStep::More);
+    };
+    while let Some(&(place, found)) = sole.get(*at) {
+      if files_of.get(&found) == Some(&1) {
+        wholes.push((place, found));
+      }
+      *at = at.saturating_add(1);
+      if sole.get(*at).is_some() && spent() {
+        return Some(ApplyStep::More);
+      }
+    }
+    let (names, wholes) = (core::mem::take(names), core::mem::take(wholes));
+    run.prep = if run.check_reads {
+      Prep::Reads {
+        names,
+        wholes,
+        at: 0,
+      }
+    } else {
+      Prep::Mapped {
+        names,
+        wholes,
+        at: 0,
+      }
+    };
+    None
+  }
+
+  /// [`Prep::Reads`]: each effect's read of a text held by name alone checked, until `spent`: the step where it is spent,
+  /// the texts to lend where its slice met one unlent (the slice undone), none where the phase ended.
+  fn reads_some(&self, run: &mut Applying, spent: &mut dyn FnMut() -> bool) -> Option<ApplyStep> {
+    let Prep::Reads { names, wholes, at } = &mut run.prep else {
+      return Some(ApplyStep::More);
+    };
+    let from = *at;
+    let ((), unlent) =
+      crate::unlent::scope(|| self.note_reads_from((&run.effects, at), wholes, spent));
+    if !unlent.is_empty() {
+      // The slice undone, to be checked again once its texts are lent.
+      *at = from;
+      return Some(ApplyStep::Lend(unlent));
+    }
+    if run.effects.get(*at).is_some() {
+      return Some(ApplyStep::More);
+    }
+    run.prep = Prep::Mapped {
+      names: core::mem::take(names),
+      wholes: core::mem::take(wholes),
+      at: 0,
+    };
+    None
+  }
+
+  /// Each effect's read from `at` of a text held by name alone noted ([`Green::note_unlent_read`]), an effect a unit,
+  /// until `spent`.
+  fn note_reads_from(
+    &self,
+    (effects, at): (&[Effect], &mut usize),
+    wholes: &[(usize, usize)],
+    spent: &mut dyn FnMut() -> bool,
+  ) {
+    while let Some(effect) = effects.get(*at) {
+      self.note_unlent_read((*at, effect), wholes);
+      *at = at.saturating_add(1);
+      if spent() {
+        break;
+      }
+    }
+  }
+
+  /// [`Prep::Mapped`]: each mapped file made, a file a unit, until `spent`; once every one is, the whole runs' buffers
+  /// moved into their files and the commit begun ([`Green::beginning_some`]).
+  fn mapped_some(
+    &mut self,
+    run: &mut Applying,
+    (post_state, runs): (&[u8], &crate::named::RunTable),
+    spent: &mut dyn FnMut() -> bool,
+  ) -> ApplyStep {
+    let Prep::Mapped { names, wholes, at } = &mut run.prep else {
+      return ApplyStep::More;
+    };
+    let post = crate::named::Post::of(post_state, &run.read, runs);
+    while let Some(effect) = run.effects.get_mut(*at) {
+      self.make_mapped_one((*at, effect), post, wholes);
+      *at = at.saturating_add(1);
+      if run.effects.get(*at).is_some() && spent() {
+        return ApplyStep::More;
+      }
+    }
+    let (names, wholes) = (core::mem::take(names), core::mem::take(wholes));
+    run.prep = Prep::Moving {
+      names,
+      wholes,
+      at: 0,
+    };
+    ApplyStep::More
+  }
+
+  /// [`Prep::Moving`]: the whole runs' buffers moved into their files, a run a unit, until `spent`; once every one is,
+  /// the commit's beginning begun ([`Green::beginning_some`]).
+  fn moving_some(run: &mut Applying, spent: &mut dyn FnMut() -> bool) -> Option<ApplyStep> {
+    let Prep::Moving { names, wholes, at } = &mut run.prep else {
+      return Some(ApplyStep::More);
+    };
+    while let Some(whole) = wholes.get(*at) {
+      move_whole_runs(
+        &mut run.effects,
+        &run.read,
+        (core::slice::from_ref(whole), names),
+      );
+      *at = at.saturating_add(1);
+      if wholes.get(*at).is_some() && spent() {
+        return Some(ApplyStep::More);
+      }
+    }
+    run.prep = Prep::Beginning(Box::new(Beginning {
+      names: core::mem::take(names),
+      stage: BeginStage::Remapping(0),
+      copied: Vec::new(),
+      order: PathOrder::default(),
+    }));
+    None
+  }
+
+  /// [`Prep::Beginning`]: the commit begun over the effects, a part a step ([`Beginning`]), until `spent`; a whole part
+  /// (the node moves, the copied trees' links, the copies) runs only as a step's first unit (`fresh`). Once the paths are
+  /// in order, the commit run made.
+  fn beginning_some(
+    &mut self,
+    run: &mut Applying,
+    (post_state, runs): (&[u8], &crate::named::RunTable),
+    (fresh, spent): (bool, &mut dyn FnMut() -> bool),
+  ) -> Option<ApplyStep> {
+    let Prep::Beginning(beginning) = &mut run.prep else {
+      return Some(ApplyStep::More);
+    };
+    let version = self.head().saturating_add(1);
+    let whole = matches!(
+      beginning.stage,
+      BeginStage::Moves | BeginStage::Links | BeginStage::Copies
+    );
+    if whole && !fresh {
+      return Some(ApplyStep::More);
+    }
+    match beginning.stage {
+      BeginStage::Remapping(at) => {
+        // Each mapped file from the head the verdict judged, before a copy or a node move changes it.
+        let post = crate::named::Post::of(post_state, &run.read, runs);
+        let mut at = at;
+        while let Some(effect) = run.effects.get_mut(at) {
+          self.make_mapped_one((at, effect), post, &[]);
+          at = at.saturating_add(1);
+          if run.effects.get(at).is_some() && spent() {
+            beginning.stage = BeginStage::Remapping(at);
+            return Some(ApplyStep::More);
+          }
+        }
+        beginning.stage = BeginStage::Moves;
+      }
+      BeginStage::Moves => {
+        let moves = self.node_moves(&run.effects);
+        run.effects.extend(moves);
+        beginning.stage = BeginStage::Links;
+      }
+      BeginStage::Links => {
+        // A copied tree's hard links name the copy's nodes, or nodes of their own (`Green::copy_link_effects`), read from
+        // the head before the copies land and applied after them.
+        let linked = self.copy_link_effects(&run.effects);
+        run.effects.extend(linked);
+        beginning.stage = BeginStage::Copies;
+      }
+      BeginStage::Copies => {
+        // The copies' changed paths come as their own set; counted as a tree's (A-920 3m).
+        beginning.copied = self
+          .commit_copies(&run.effects, version)
+          .into_iter()
+          .collect();
+        let copied = u64::try_from(beginning.copied.len()).unwrap_or(u64::MAX);
+        self.commit_tree_paths = self.commit_tree_paths.saturating_add(copied);
+        beginning.stage = BeginStage::Runs(0);
+      }
+      BeginStage::Runs(at) => {
+        let mut at = at;
+        loop {
+          if run.effects.is_empty() || beginning.order.find_run(&run.effects, at) {
+            beginning.stage = BeginStage::Merging;
+            break;
+          }
+          at = at.saturating_add(1);
+          if spent() {
+            beginning.stage = BeginStage::Runs(at);
+            return Some(ApplyStep::More);
+          }
+        }
+      }
+      BeginStage::Merging => {
+        while beginning.order.merge_one(&run.effects) {
+          if spent() {
+            return Some(ApplyStep::More);
+          }
+        }
+        let Prep::Beginning(begun) = core::mem::replace(&mut run.prep, Prep::Effects) else {
+          return Some(ApplyStep::More);
+        };
+        let Beginning {
+          names,
+          copied,
+          order,
+          ..
+        } = *begun;
+        let ranked = usize::try_from(order.ranked).unwrap_or(0);
+        run.commit = Some(CommitRun {
+          version,
+          effects: core::mem::take(&mut run.effects).into_iter(),
+          place: 0,
+          names,
+          staged: Staged::default(),
+          delta: BTreeMap::new(),
+          changed: ChangedPaths {
+            paths: std::iter::repeat_with(String::new).take(ranked).collect(),
+            slot_of: order.slot_of,
+            copied,
+            links: Vec::new(),
+            at: [0; 3],
+          },
+          entries: Vec::new(),
+          phase: CommitPhase::Effects,
+        });
+        return Some(ApplyStep::More);
+      }
+    }
+    None
   }
 
   /// The effects a chain entry records for `inc`, with every read its commit makes of the head checked
@@ -7853,16 +8765,230 @@ impl Green {
   /// than one entry at it (one work setting an attribute twice), which that fold kept as the value at its floor. The cost is the changes since the last fold, never the green: a fold of
   /// every path's history in one step held an import's shard 494 ms a landing at 9,000 files (debug), folding nothing.
   pub fn fold_history_before(&mut self, floor: u64) -> usize {
-    // A green that owes a push has no history of the owed version to fold (P2): nothing.
-    if floor <= self.folded_below || self.owed.is_some() {
-      return 0;
+    let mut whole = || false;
+    let mut released = self.fold_some(&mut whole).unwrap_or(0);
+    if self.fold_begin(floor) {
+      released = released.saturating_add(self.fold_some(&mut whole).unwrap_or(0));
     }
-    let touched: BTreeSet<String> = self
-      .changes
-      .range(self.folded_below..=floor)
-      .flat_map(|(_, entries)| entries.iter().map(|entry| entry.path.clone()))
-      .collect();
-    self.fold_paths_before(floor, &touched)
+    released
+  }
+
+  /// [`Green::fold_history_before`] begun at `floor`, to be taken a unit at a time ([`Green::fold_some`], A-920 11a:
+  /// whole, 7.5-23.4 ms of one step for a landing of 9,001 paths, debug): a fold still under way finished first, then
+  /// the floor raised at once, which every read at or above it answers alike folded or not. Whether a fold began: none
+  /// for a floor at or below the folded one, or a green that owes a push (P2), which has no history of the owed version.
+  pub fn fold_begin(&mut self, floor: u64) -> bool {
+    let _ = self.fold_some(&mut || false);
+    if floor <= self.folded_below || self.owed.is_some() {
+      return false;
+    }
+    // The identity reads its keys' values at the version it was last brought to, so it is brought to the head
+    // before the history below the floor goes (A-202).
+    if self.identity_version < floor {
+      self.fold_identity();
+    }
+    let previous = self.folded_below;
+    self.folded_below = floor;
+    self.folding = Some(Box::new(Folding {
+      floor,
+      previous,
+      before: self.history_bytes().saturating_add(self.changes_bytes),
+      versions: self
+        .changes
+        .range(previous..=floor)
+        .map(|(version, _)| *version)
+        .collect(),
+      ..Folding::default()
+    }));
+    true
+  }
+
+  /// One step of the fold under way ([`Green::fold_begin`]), a unit at least, until `spent`: the paths the change index
+  /// names from the last floor to this one gathered an entry a unit; the copies' kept fixes let go; each version passed
+  /// moved below the change index's floor an entry a unit; each path's content history folded a path a unit, what it
+  /// dropped let go a value a unit, and each path it left its latest value alone named whole a path a unit; then every
+  /// other dimension's history of each path folded a path a unit. None while units are left; once it ends, the bytes it
+  /// released (none where no fold is under way).
+  pub fn fold_some(&mut self, spent: &mut dyn FnMut() -> bool) -> Option<usize> {
+    let Some(mut folding) = self.folding.take() else {
+      return Some(0);
+    };
+    loop {
+      if self.fold_unit(&mut folding) {
+        break;
+      }
+      if spent() {
+        self.folding = Some(folding);
+        return None;
+      }
+    }
+    self.special_history_bytes = self
+      .special_history_bytes
+      .saturating_sub(folding.specials.saturating_mul(SPECIAL_NODE_BYTES));
+    Some(
+      folding
+        .before
+        .saturating_sub(self.history_bytes().saturating_add(self.changes_bytes)),
+    )
+  }
+
+  /// One unit of `folding` ([`Green::fold_some`]): whether the fold has ended.
+  fn fold_unit(&mut self, folding: &mut Folding) -> bool {
+    match folding.phase {
+      FoldPhase::Touching => self.touch_one(folding),
+      FoldPhase::Fixes => {
+        self.release_kept_fixes(folding.floor);
+        folding.versions = self
+          .changes
+          .range(folding.previous..folding.floor)
+          .map(|(version, _)| *version)
+          .collect();
+        folding.version_at = 0;
+        folding.version_paths = None;
+        folding.phase = FoldPhase::Changes;
+      }
+      FoldPhase::Changes => self.pass_one(folding),
+      FoldPhase::Content => self.fold_content_one(folding),
+      FoldPhase::Release => match folding.dropped.get_mut(folding.at).map(Option::take) {
+        Some(value) => {
+          self.release_content(value);
+          folding.at = folding.at.saturating_add(1);
+        }
+        None => {
+          folding.dropped = Vec::new();
+          folding.at = 0;
+          folding.phase = FoldPhase::Alone;
+        }
+      },
+      FoldPhase::Alone => match folding.alone.get(folding.at).cloned() {
+        Some(path) => {
+          self.rename_alone(&path);
+          folding.at = folding.at.saturating_add(1);
+        }
+        None => {
+          folding.alone = Vec::new();
+          folding.at = 0;
+          folding.phase = FoldPhase::Rest;
+        }
+      },
+      FoldPhase::Rest => self.fold_rest_one(folding),
+      FoldPhase::Ended => return true,
+    }
+    false
+  }
+
+  /// One entry of the change index from the last floor to the new one, its path gathered; the paths in order once
+  /// every one is.
+  fn touch_one(&mut self, folding: &mut Folding) {
+    let entry = folding
+      .versions
+      .get(folding.version_at)
+      .and_then(|version| self.changes.get(version))
+      .map(|entries| {
+        entries
+          .get(folding.entry_at)
+          .map(|entry| entry.path.clone())
+      });
+    match entry {
+      Some(Some(path)) => {
+        folding.touched.insert(path);
+        folding.entry_at = folding.entry_at.saturating_add(1);
+      }
+      Some(None) => {
+        folding.version_at = folding.version_at.saturating_add(1);
+        folding.entry_at = 0;
+      }
+      None => {
+        folding.paths = core::mem::take(&mut folding.touched).into_iter().collect();
+        #[cfg(test)]
+        FOLD_PATHS_VISITED.with(|visited| visited.set(visited.get() + folding.paths.len()));
+        folding.phase = FoldPhase::Fixes;
+      }
+    }
+  }
+
+  /// One entry of a version the floor passed moved below the change index's floor (`Green::fold_changes_before`'s
+  /// unit): its path's last change below the floor kept, the one before it dropped. A version's paths are read once,
+  /// as a unit, before its entries.
+  fn pass_one(&mut self, folding: &mut Folding) {
+    let Some(version) = folding.versions.get(folding.version_at).copied() else {
+      folding.at = 0;
+      folding.phase = FoldPhase::Content;
+      return;
+    };
+    let Some(paths) = folding.version_paths.as_mut() else {
+      folding.version_paths = Some(
+        self
+          .changes
+          .get(&version)
+          .map(|entries| entries.iter().map(|entry| entry.path.clone()).collect())
+          .unwrap_or_default(),
+      );
+      folding.entry_at = 0;
+      return;
+    };
+    match paths.get_mut(folding.entry_at).map(core::mem::take) {
+      Some(path) => {
+        folding.entry_at = folding.entry_at.saturating_add(1);
+        match self.below_floor_last.insert(path.clone(), version) {
+          None => self.changes_bytes = self.changes_bytes.saturating_add(change_bytes(&path)),
+          Some(earlier) => self.drop_change_entry(earlier, &path),
+        }
+      }
+      None => {
+        folding.version_paths = None;
+        folding.version_at = folding.version_at.saturating_add(1);
+      }
+    }
+  }
+
+  /// One path's content history folded (`Green::fold_content_before`'s unit): what it dropped kept to let go, and
+  /// the path kept where the fold left it its latest value alone.
+  fn fold_content_one(&mut self, folding: &mut Folding) {
+    let Some(path) = folding.paths.get(folding.at) else {
+      folding.at = 0;
+      folding.phase = FoldPhase::Release;
+      return;
+    };
+    if let Some(history) = self.content_history.get_mut(path) {
+      let folded = fold_entries(history, folding.floor);
+      if !folded.is_empty() && history.len() == 1 {
+        folding.alone.push(path.clone());
+      }
+      folding
+        .dropped
+        .extend(folded.into_iter().map(|(_, value)| value));
+    }
+    folding.at = folding.at.saturating_add(1);
+  }
+
+  /// One path's every other history folded: its special nodes', modes', symbolic links', hard links', directories' and
+  /// attributes'. The fold ends after its last path.
+  fn fold_rest_one(&mut self, folding: &mut Folding) {
+    let floor = folding.floor;
+    let Some(path) = folding.paths.get(folding.at) else {
+      folding.phase = FoldPhase::Ended;
+      return;
+    };
+    if let Some(history) = self.special_history.get_mut(path) {
+      let specials = fold_entries(history, floor)
+        .iter()
+        .filter(|(_, node)| node.is_some())
+        .count();
+      folding.specials = folding.specials.saturating_add(specials);
+    }
+    fold_one(&mut self.mode_history, path, floor);
+    fold_one(&mut self.symlink_history, path, floor);
+    fold_one(&mut self.hardlink_history, path, floor);
+    fold_one(&mut self.dir_history, path, floor);
+    for (_, history) in self
+      .xattr_history
+      .range_mut((path.clone(), String::new())..)
+      .take_while(|((at, _), _)| at == path)
+    {
+      fold_entries(history, floor);
+    }
+    folding.at = folding.at.saturating_add(1);
   }
 
   /// [`Green::fold_history_before`] over every path any history holds: the fold as a walk of the whole green, the
@@ -7886,7 +9012,9 @@ impl Green {
     self.fold_paths_before(floor, &every)
   }
 
-  /// Folds the histories of `paths` below `floor` ([`Green::fold_history_before`]).
+  /// Folds the histories of `paths` below `floor` whole, in one call: what [`Green::fold_history_before`] did before
+  /// A-920 11a, kept as the oracle a fold taken a unit at a time is held to (`fold_tests`).
+  #[cfg(test)]
   fn fold_paths_before(&mut self, floor: u64, paths: &BTreeSet<String>) -> usize {
     #[cfg(test)]
     FOLD_PATHS_VISITED.with(|visited| visited.set(visited.get() + paths.len()));
@@ -7920,6 +9048,7 @@ impl Green {
 
   /// Folds the content history below `floor`: the latest value is never folded, so the current values stand, and each
   /// dropped value releases its chunks.
+  #[cfg(test)]
   fn fold_content_before(&mut self, floor: u64, paths: &BTreeSet<String>) {
     let mut dropped = Vec::new();
     let mut alone = Vec::new();
@@ -7983,6 +9112,7 @@ impl Green {
   }
 
   /// Folds the IPC history below `floor`, its earlier nodes leaving the running total.
+  #[cfg(test)]
   fn fold_specials_before(&mut self, floor: u64, paths: &BTreeSet<String>) {
     let mut specials = 0usize;
     for path in paths {

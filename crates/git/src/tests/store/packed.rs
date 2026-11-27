@@ -260,21 +260,22 @@ fn incoming(object: &unpack::Object) -> Incoming<'_> {
 /// B2, a push read in place while judged (main's ruling B part 2). Do: for each captured push, hand a push its pack
 /// seven bytes a call, as a client's bytes arrive, and admit each object its reader resolved where its entry begins,
 /// keeping none of the objects' bytes; read every object back through the push. Expect: each object's bytes those of
-/// the whole read, deltas against an earlier entry and against an object held outside the pack among them; the content
-/// store holding nothing more; what the push keeps lately within its pack's length.
+/// the whole read, deltas against an earlier entry and against an object held outside the pack among them, read from
+/// the pack's put as it is under way (main's order of 2026-11-26, C3: content once on arrival); the content store grown
+/// by no more than the pack, none of its objects inflated; what the push keeps lately within its pack's length.
 #[test]
 fn b2_every_object_of_a_push_read_where_it_lies_in_its_pack_is_the_object_read_whole() {
   for (name, request, before) in PUSHES {
     let (pack, held) = captured(request, before);
     let whole = read_whole(&pack, &held);
-    let store = ContentStore::new(1 << 26, SMALL_WINDOW).unwrap();
+    let mut store = ContentStore::new(1 << 26, SMALL_WINDOW).unwrap();
     let used = store.used();
     let naming = GitNaming {
       format: ObjectFormat::Sha1,
     };
     let mut push = Push::new(ObjectFormat::Sha1);
     for piece in pack.chunks(7) {
-      push.extend_pack(piece);
+      push.extend_pack(&mut store, piece).unwrap();
     }
     for object in &whole.objects {
       push
@@ -297,10 +298,12 @@ fn b2_every_object_of_a_push_read_where_it_lies_in_its_pack_is_the_object_read_w
         object.offset
       );
     }
-    assert_eq!(
-      store.used(),
-      used,
-      "{name}: the store holds none of the push's objects"
+    // The push's pack is put in the store as it arrives (content once on arrival), never its objects inflated.
+    let grown = store.used().saturating_sub(used);
+    assert!(
+      grown <= u64::try_from(pack.len()).unwrap(),
+      "{name}: the store grew {grown} bytes for a {}-byte pack",
+      pack.len()
     );
     assert!(
       push.kept_lately() <= pack.len(),
@@ -320,14 +323,14 @@ fn r870_an_object_admitted_under_its_readers_name_is_the_object_named_again() {
   for (name, request, before) in PUSHES {
     let (pack, held) = captured(request, before);
     let whole = read_whole(&pack, &held);
-    let store = ContentStore::new(1 << 26, SMALL_WINDOW).unwrap();
+    let mut store = ContentStore::new(1 << 26, SMALL_WINDOW).unwrap();
     let naming = GitNaming {
       format: ObjectFormat::Sha1,
     };
     let (mut named_again, mut named_by_reader) =
       (Push::new(ObjectFormat::Sha1), Push::new(ObjectFormat::Sha1));
-    named_again.extend_pack(&pack);
-    named_by_reader.extend_pack(&pack);
+    named_again.extend_pack(&mut store, &pack).unwrap();
+    named_by_reader.extend_pack(&mut store, &pack).unwrap();
     for object in &whole.objects {
       let again = named_again
         .admit_placed::<_, Infallible>(&store, &naming, (incoming(object), object.offset))
@@ -362,7 +365,7 @@ fn r870_an_object_admitted_under_its_readers_name_is_the_object_named_again() {
 /// byte repeated (git/git's v1.5.0 push is 9.4 MiB of pack for 304.6 MiB of objects; these deflate further), once held
 /// in the content store as they arrive (`Push::admit`, what a push did before) and once where each lies in the pack
 /// (`Push::admit_placed`), its reader's bytes kept as read lately. Expect: held in place, the push's resident (what the
-/// store grew by, its pack and what it keeps lately) within twice its pack; held in the store, past it, every object
+/// store grew by, its pack put there, the window its put holds and what it keeps lately) within twice its pack; held in the store, past it, every object
 /// inflated. Both printed, before and after.
 #[test]
 fn b2_an_in_flight_push_holds_its_pack_and_not_its_objects_inflated() {
@@ -393,7 +396,7 @@ fn b2_an_in_flight_push_holds_its_pack_and_not_its_objects_inflated() {
 
   let used = store.used();
   let mut placed = Push::new(ObjectFormat::Sha1);
-  placed.extend_pack(&pack);
+  placed.extend_pack(&mut store, &pack).unwrap();
   for object in read_whole(&pack, &Held(BTreeMap::new())).objects {
     placed
       .admit_placed::<_, Infallible>(&store, &naming, (incoming(&object), object.offset))
@@ -401,7 +404,7 @@ fn b2_an_in_flight_push_holds_its_pack_and_not_its_objects_inflated() {
     placed.keep_read(object.offset, object.kind, object.content);
   }
   let grown = usize::try_from(store.used().saturating_sub(used)).unwrap();
-  let after = grown + placed.pack().len() + placed.kept_lately();
+  let after = grown + placed.pack_held() + placed.kept_lately();
   println!(
     "b2 in-flight resident: {BLOBS} objects, {inflated} bytes inflated, a pack of {} bytes; held in the store {before} \
      bytes, held in place {after} bytes ({grown} in the store, {} kept lately)",
@@ -436,7 +439,7 @@ fn a_landed_push_is_read_where_it_lies_in_its_stored_pack() {
     format: ObjectFormat::Sha1,
   };
   let mut push = Push::new(ObjectFormat::Sha1);
-  push.extend_pack(&pack);
+  push.extend_pack(&mut store, &pack).unwrap();
   let used = store.used();
   for object in &whole.objects {
     push
@@ -590,7 +593,7 @@ fn landed_create_in(window: usize) -> (Repository, ContentStore, Vec<unpack::Obj
     format: ObjectFormat::Sha1,
   };
   let mut push = Push::new(ObjectFormat::Sha1);
-  push.extend_pack(&pack);
+  push.extend_pack(&mut store, &pack).unwrap();
   for object in &whole.objects {
     push
       .admit_placed::<_, Infallible>(&store, &naming, (incoming(object), object.offset))
@@ -803,7 +806,7 @@ fn landed_ofs_in(window: usize) -> (Repository, ContentStore, Vec<unpack::Object
     format: ObjectFormat::Sha1,
   };
   let mut push = Push::new(ObjectFormat::Sha1);
-  push.extend_pack(&pack);
+  push.extend_pack(&mut store, &pack).unwrap();
   for object in &whole.objects {
     push
       .admit_placed::<_, Infallible>(&store, &naming, (incoming(object), object.offset))
@@ -1278,5 +1281,68 @@ fn a864_a_window_never_brought_back_is_stopped_at_once_then_refused_never_waited
   assert!(
     matches!(ended, Some(Err(_))),
     "then refused, not waited for: {ended:?}"
+  );
+}
+
+/// Main's order of 2026-11-26 (C3 (b): a push's read cache asked within what its admission grants, never sized by its
+/// input alone: one object of 100 MB at depth 50 would ask 5 GB). Do: hand a push the captured `create` push's pack and
+/// admit its objects where they lie; widen its reads with an admission of one byte, then of all it asks. Expect: the
+/// first refused, the budget as it was (none), every object still read back whole, its chain rebuilt; the second grown
+/// to the chain's ask, `Recent::budget_keeping` of (its deepest chain and one) times its longest object.
+#[test]
+fn a_pushs_read_cache_is_widened_within_its_grant_and_reads_past_it_whole() {
+  let (name, request, before) = PUSHES[0];
+  let (pack, held) = captured(request, before);
+  let whole = read_whole(&pack, &held);
+  let mut store = ContentStore::new(1 << 26, SMALL_WINDOW).unwrap();
+  let naming = GitNaming {
+    format: ObjectFormat::Sha1,
+  };
+  let mut push = Push::new(ObjectFormat::Sha1);
+  push.extend_pack(&mut store, &pack).unwrap();
+  for object in &whole.objects {
+    push
+      .admit_placed::<_, Infallible>(&store, &naming, (incoming(object), object.offset))
+      .unwrap_or_else(|refused| panic!("{name} at {}: {refused:?}", object.offset));
+  }
+  let refused = push.widen_reading(&mut Admission::new(1));
+  assert_eq!(
+    refused,
+    crate::store::Widening::Refused,
+    "{name}: past the grant"
+  );
+  assert_eq!(push.reading_budget(), 0, "{name}: the budget as it was");
+  let outside = Located {
+    entries: BTreeMap::new(),
+    held: &held,
+  };
+  for object in &whole.objects {
+    let read = push
+      .bytes(&store, &outside, &object.id)
+      .unwrap_or_else(|| panic!("{name}: {} not held", object.id))
+      .unwrap_or_else(|refused| panic!("{name} at {}: {refused:?}", object.offset));
+    assert_eq!(
+      read.as_ref(),
+      object.content.as_slice(),
+      "{name} at {}",
+      object.offset
+    );
+  }
+  let asked = crate::store::packed::Recent::budget_keeping(
+    push
+      .deepest()
+      .saturating_add(1)
+      .saturating_mul(push.largest()),
+  );
+  let grown = push.widen_reading(&mut Admission::new(u64::MAX));
+  assert_eq!(
+    grown,
+    crate::store::Widening::Grown,
+    "{name}: within the grant"
+  );
+  assert_eq!(
+    u64::try_from(push.reading_budget()).unwrap(),
+    asked,
+    "{name}: the chain's ask"
   );
 }

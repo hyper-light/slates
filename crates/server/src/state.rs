@@ -541,8 +541,10 @@ pub struct ShardState {
   /// partition's attachment cap: one entry per live catalog attachment at most.
   pub mount_attachments: BTreeMap<u64, MountAttachment>,
   /// The volumes this shard's catalog holds that recovery could not rebuild, and why (§4.8): each is listed, and every
-  /// verb on it answers `Refusal::NotRecovered` with its cause (`verbs::find`). Bounded by the partition's volume cap:
-  /// one entry per catalog volume at most, made once at the shard's start.
+  /// verb on it answers `Refusal::NotRecovered` with its cause (`verbs::find`; a write naming a green through its
+  /// repository, [`ShardState::recovered`]). Made at the shard's start and by a takeover that gave an object up (A-304);
+  /// a green's engine may stay lent, a holder's replica (A-908). Bounded by the partition's volume cap: one entry per
+  /// catalog volume at most.
   pub(crate) unrecovered:
     BTreeMap<slates_db::catalog::VolumeId, slates_ipc::protocol::RecoveryCause>,
   /// The volumes this shard catalogued when its node's host epoch last advanced at a configuration it installed: the
@@ -552,6 +554,11 @@ pub struct ShardState {
   /// (`verbs::lease_verdict`). Bounded by the partition's volume cap: a subset of the catalog, pruned to it at each
   /// yield (`crate::readmission`).
   pub(crate) yielded: std::collections::BTreeSet<slates_db::catalog::VolumeId>,
+  /// The repositories this shard's partition held when this host was taken over and admitted again (A-921 part 2,
+  /// beside [`ShardState::yielded`]): each a successor's now, never served here; a request for one is answered with
+  /// where its owner is (`owner_location::locate_owner`). Bounded by the partition's repositories, pruned to them at each
+  /// yield (`crate::readmission`); A-922 releases the copies.
+  pub(crate) yielded_repositories: std::collections::BTreeSet<slates_db::catalog::RepositoryId>,
   /// The slots of stale copies this shard relinquished to a takeover that named this node again (A-362,
   /// `verbs::materialize_taken_over`), each torn down a destroy slice at a time by the serve loop (`verbs::step_destroys`)
   /// after its record went, since the volume made from the adopted state took its id. Bounded by the partition's volume
@@ -1620,6 +1627,23 @@ impl std::fmt::Debug for PendingForward {
 }
 
 impl ShardState {
+  /// `Err(NotRecovered)` with its cause where this shard records `volume` not recovered ([`ShardState::unrecovered`]),
+  /// else `Ok`: the one check every boundary where a verb takes a green to write it, or its repository's name for it,
+  /// asks before it reads the engine (A-927's sweep): a push's plan (`repository::push`), an import batch's append, the
+  /// owner's branch verbs (`repository`) and a submit's verdict (`verbs::judge_submission`). The engine of a green given
+  /// up may still be lent (a holder's replica), so its presence never says the green is recovered.
+  pub(crate) fn recovered(
+    &self,
+    volume: slates_db::catalog::VolumeId,
+  ) -> Result<(), slates_ipc::protocol::Refusal> {
+    match self.unrecovered.get(&volume) {
+      Some(cause) => Err(slates_ipc::protocol::Refusal::NotRecovered {
+        cause: cause.clone(),
+      }),
+      None => Ok(()),
+    }
+  }
+
   /// Runs `with` on `object`'s placement under the configuration in force, computed once a configuration
   /// ([`crate::placement_cache`]); computed afresh only while the cache is already borrowed (a nested ask).
   pub(crate) fn with_placement<R>(

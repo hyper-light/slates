@@ -155,18 +155,23 @@ fn a_spawn_past_its_shards_bound_is_refused_busy() {
   assert_eq!(first, Ok(false));
 }
 
-/// A-924 piece 2b, the back-off (RFC 6298 §5.5's doubling, capped at the liveness window). Do: ask the back-off after
-/// one, two, three and forty deaths in a row of a spawner whose start took a millisecond. Expect: none after one (a
-/// spawner that died once is restarted at once), then the start's length, then twice it, and at forty the liveness
-/// window, never past it.
+/// A-924 piece 2b, the back-off (main's question on (c)'s red: a spawner that ended at once was started 12 times in a
+/// window and a half, the doubling of a few milliseconds' start slow to reach the window). Do: ask the back-off after
+/// one, two, three and forty deaths in a row. Expect: none after one (a spawner that died once is restarted at once),
+/// then a whole liveness window after each later one, so a spawner that cannot stay up is started at most twice a
+/// window. Red before: a millisecond's start waited a millisecond after two deaths, two after three.
 #[test]
-fn the_spawners_back_off_doubles_its_start_up_to_the_liveness_window() {
-  let start_ns = 1_000_000;
-  let waits: Vec<u64> = [1, 2, 3, 40]
-    .into_iter()
-    .map(|deaths| super::back_off_ns(deaths, start_ns))
-    .collect();
-  assert_eq!(waits, [0, start_ns, 2 * start_ns, LIVENESS_BUDGET_NS]);
+fn the_spawners_back_off_is_a_liveness_window_after_its_first_death() {
+  let waits: Vec<u64> = [1, 2, 3, 40].into_iter().map(super::back_off_ns).collect();
+  assert_eq!(
+    waits,
+    [
+      0,
+      LIVENESS_BUDGET_NS,
+      LIVENESS_BUDGET_NS,
+      LIVENESS_BUDGET_NS
+    ]
+  );
 }
 
 /// Shape: how long [`a_lingering_spawner_role`] lives after it drops its ends: three liveness windows, past the bound a
@@ -229,7 +234,7 @@ async fn tick() {
 /// lingering spawner on the shard, a gap of its [`LINGER_NS`].
 #[test]
 fn a_spawner_that_ends_its_conversation_and_lingers_is_reaped_while_its_shard_steps() {
-  let (gap, code) = on_a_thread_within(|| reaped_while_stepping());
+  let (gap, code) = on_a_thread_within(reaped_while_stepping);
   assert_eq!(code, Ok(Some(3)));
   assert!(
     gap < LIVENESS_BUDGET_NS,
@@ -265,7 +270,7 @@ fn reaped_while_stepping() -> (u64, Result<Option<i32>, SpawnRefused>) {
     ];
     let slates_ipc::spawner::Started { child, ends } =
       slates_ipc::spawner::start(&program, &args, 1).expect("the lingering spawner");
-    super::own(child, vec![here], 0, None);
+    super::own(child, vec![here], None);
     for end in ends {
       let placement = super::Placement {
         generation: 0,
@@ -293,5 +298,101 @@ fn reaped_while_stepping() -> (u64, Result<Option<i32>, SpawnRefused>) {
     super::uninstall();
     let _ = super::OWNER.with(|owner| owner.try_borrow_mut().ok().map(|mut owner| owner.take()));
     (TICK_MOST.with(std::cell::Cell::get), code)
+  })
+}
+
+/// Main 01a20182's store-wait at 1948dbdcc (2026-11-25, load about 31: "shard 0 is wedged, unmoved for 1028 ms … in task
+/// spawned at spawning.rs:687"): the restart's start of the next spawner, a `posix_spawn` of the daemon's executable,
+/// ran on the control shard. Do: make this shard its spawner's owner, every start from it slowed by [`LINGER_NS`] as a
+/// loaded machine slows one (`TEST_START_DELAY_NS`); run a task stepping once a tick; kill the spawner; ask for
+/// `sh -c 'exit 4'` until the restarted spawner starts it. Expect: the child exits 4, and the shard never held past a
+/// liveness window while the start ran. Red before: the start ran on the shard, a gap of its [`LINGER_NS`].
+#[test]
+fn a_spawners_start_slowed_past_the_window_never_holds_its_shard() {
+  let (gap, code) = on_a_thread_within(started_while_stepping);
+  assert_eq!(code, Ok(Some(4)));
+  assert!(
+    gap < LIVENESS_BUDGET_NS,
+    "the shard stepped while the next spawner started: its longest gap {gap} ns against {LIVENESS_BUDGET_NS}"
+  );
+}
+
+/// [`a_spawners_start_slowed_past_the_window_never_holds_its_shard`]'s work on its own runtime: the shard's longest gap
+/// between steps, and the child's exit code.
+fn started_while_stepping() -> (u64, Result<Option<i32>, SpawnRefused>) {
+  on_runtime(async {
+    let spawner = TestSpawner::owned();
+    super::TEST_START_DELAY_NS.with(|delay| delay.set(LINGER_NS));
+    TICK_STOP.with(|stop| stop.set(false));
+    TICK_MOST.with(|most| most.set(0));
+    slates_rt::futures::spawn(tick())
+      .and_then(slates_rt::futures::detach)
+      .expect("the ticker");
+    spawner.kill();
+    let exiting = [OsStr::new("-c"), OsStr::new("exit 4")];
+    let child = loop {
+      match spawn(&shell(&exiting)).await {
+        Ok(child) => break child,
+        Err(SpawnRefused::SpawnerGone) => slates_rt::futures::yield_now().await,
+        Err(refused) => panic!("refused {refused:?}"),
+      }
+    };
+    let code = child.exit().await.map(|status| status.code());
+    drop(child);
+    TICK_STOP.with(|stop| stop.set(true));
+    super::TEST_START_DELAY_NS.with(|delay| delay.set(0));
+    drop(spawner);
+    (TICK_MOST.with(std::cell::Cell::get), code)
+  })
+}
+
+/// Main 01a20182's 8a loop at 523c522c2 (2026-11-25, 12 burners: eight wedges in six rounds, every one "in task spawned
+/// at hook_driver.rs:842", no CPU progress and no wait for a CPU, at the task's last poll): a test's [`TestSpawner`]
+/// dropped at the end of its run joined its spawner on the shard, `wait` for one installed and a liveness window then
+/// the kill's `wait` for one owned, while a spawner still starting under load could not yet see its end close. Do: on a
+/// shard of its own, start a spawner ([`TestSpawner::installed`]) and stop it (`SIGSTOP`, a spawner the machine has not
+/// yet run), a thread continuing it after [`LINGER_NS`]; drop it, timing the drop on the shard. Expect: the drop
+/// returns within a liveness window, the join off the shard. Red before: the drop held the shard until the spawner ran.
+#[test]
+fn a_test_spawners_drop_never_joins_its_spawner_on_the_shard() {
+  let held = on_a_thread_within(|| dropped_stopped(TestSpawner::installed));
+  assert!(
+    held < LIVENESS_BUDGET_NS,
+    "the drop held its shard {held} ns against {LIVENESS_BUDGET_NS}"
+  );
+}
+
+/// [`a_test_spawners_drop_never_joins_its_spawner_on_the_shard`] for a spawner the shard owns
+/// ([`TestSpawner::owned`]): its owner's join, with no daemon to hand it to, runs off the shard too.
+#[test]
+fn an_owned_test_spawners_drop_never_joins_its_spawner_on_the_shard() {
+  let held = on_a_thread_within(|| dropped_stopped(TestSpawner::owned));
+  assert!(
+    held < LIVENESS_BUDGET_NS,
+    "the drop held its shard {held} ns against {LIVENESS_BUDGET_NS}"
+  );
+}
+
+/// Starts a spawner by `started`, stops it, has a thread continue it after [`LINGER_NS`], and drops it on its runtime's
+/// shard: how long the drop held the shard.
+fn dropped_stopped(started: fn() -> TestSpawner) -> u64 {
+  on_runtime(async move {
+    let spawner = started();
+    let pid = i32::try_from(spawner.pid())
+      .ok()
+      .and_then(rustix::process::Pid::from_raw)
+      .expect("the spawner's pid");
+    rustix::process::kill_process(pid, rustix::process::Signal::STOP).expect("the spawner stopped");
+    let _continuer = std::thread::spawn(move || {
+      // Parked to its deadline (a park may wake early, so it parks again until the deadline has passed).
+      let until = std::time::Instant::now() + std::time::Duration::from_nanos(LINGER_NS);
+      while std::time::Instant::now() < until {
+        std::thread::park_timeout(until.saturating_duration_since(std::time::Instant::now()));
+      }
+      let _ = rustix::process::kill_process(pid, rustix::process::Signal::CONT);
+    });
+    let began = slates_rt::futures::now_ns();
+    drop(spawner);
+    slates_rt::futures::now_ns().saturating_sub(began)
   })
 }

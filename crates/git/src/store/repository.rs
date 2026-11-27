@@ -211,6 +211,9 @@ pub struct StoreCounters {
   pub deferred: u64,
   /// Versions whose sets a reader derived ([`Repository::derive_turn`]), each once while its memo is kept.
   pub derived: u64,
+  /// Versions [`Repository::derivations_due`] looked at to answer: what a derivation's every turn asks before it begins
+  /// one (main 01a20182's sample of 2026-11-25: the question took a third of a git/git encoding's time behind a push).
+  pub due_looked: u64,
   /// Bytes the versions' values added to the content store as their commits put them: what the store held new, never
   /// what it held already and was held once more by (A-647 part 4).
   pub value_bytes: u64,
@@ -324,6 +327,17 @@ struct Chain {
 }
 
 impl Chain {
+  /// How many of its versions hold no value of their own ([`Repository::unvalued`]).
+  fn unvalued(&self) -> u64 {
+    to_u64(
+      self
+        .versions
+        .iter()
+        .filter(|version| version.value.is_none())
+        .count(),
+    )
+  }
+
   fn head(&self) -> Option<u64> {
     self.versions.last().and_then(|version| version.head)
   }
@@ -520,6 +534,17 @@ impl Bases for IndexBases<'_> {
   }
 }
 
+/// What [`Repository::widen_read_cache`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Widening {
+  /// The cache already kept enough: nothing charged.
+  Enough,
+  /// It was widened, the growth charged.
+  Grown,
+  /// Its admission had no room for the growth: it stays as it is.
+  Refused,
+}
+
 /// What a repository holds outside the content store ([`Repository::held`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RepositoryHeld {
@@ -540,6 +565,10 @@ pub struct Repository {
   index: Index,
   next_position: u64,
   chains: BTreeMap<u64, Chain>,
+  /// The versions its chains hold with no value of their own (each left for its first reader, A-614 amended), counted
+  /// as [`Repository::commit`] adds them: a version's value is never set after its commit, and the memo holds sets for
+  /// such versions alone, so the versions due are this count less the memo's ([`Repository::derivations_due`]).
+  unvalued: u64,
   /// For each commit some green's current head names, by its position, those greens.
   heads: BTreeMap<u64, BTreeSet<u64>>,
   /// For each commit a committed version's head peels to, by its position, the first such version (A-850): what a
@@ -568,6 +597,10 @@ pub struct Repository {
   /// The deltas its last read of a stored object applied (`Scratch::deltas_applied`; none for one held whole): what a
   /// tree's open costs in the store, read by the fetch's walk ([`Repository::last_read_deltas`]).
   last_deltas: std::cell::Cell<u64>,
+  /// Whether its last read of a stored object found an entry of its chain kept ([`Repository::last_read_found_kept`]).
+  last_found_kept: std::cell::Cell<bool>,
+  /// Whether its last read of a stored object inflated its chain's root whole ([`Repository::last_read_inflated_base`]).
+  last_inflated_base: std::cell::Cell<bool>,
   /// The first let-go piece a read met since its owner last asked ([`Repository::waiting`]): a read that meets one answers
   /// none, and its owner brings the piece back and takes the step again.
   waiting: Cell<Option<packed::Waited>>,
@@ -610,6 +643,7 @@ impl Repository {
       index: Index::new(),
       next_position: 0,
       chains: BTreeMap::new(),
+      unvalued: 0,
       heads: BTreeMap::new(),
       peeled: BTreeMap::new(),
       holders: BTreeMap::new(),
@@ -620,6 +654,8 @@ impl Repository {
       packs: BTreeMap::new(),
       reading: RefCell::new(Scratch::default()),
       last_deltas: std::cell::Cell::new(0),
+      last_found_kept: std::cell::Cell::new(false),
+      last_inflated_base: std::cell::Cell::new(false),
       waiting: Cell::new(None),
       largest: 0,
       landings_charged: 0,
@@ -669,26 +705,35 @@ impl Repository {
     self.depth.limit()
   }
 
-  /// Widens what its reads keep of the objects read lately (`packed::Recent`, git's delta base cache) for a tree of `len`
-  /// bytes about to be read: to its learned chain depth ([`Repository::learned_depth`]) times `len`, so the tree's chain,
-  /// each revision no longer than the tree being read, stays whole for the walk's next revisions; the growth alone
-  /// charged to `admission`, a fetch's own (main 01a20182's ruling of 2026-11-25: a fork a fetch reads through kept no
-  /// cache, so every tree read rebuilt its chain from its base, 78 deltas for a 13-tree chain). Refused room, it stays as
-  /// it is: whether it was widened or needed no more.
-  pub fn widen_read_cache(&self, len: u64, admission: &mut Admission) -> bool {
-    let wanted = self.learned_depth().saturating_mul(len);
+  /// Widens what its reads keep of the objects read lately (`packed::Recent`, git's delta base cache) for a walk that
+  /// opens up to `breadth` bytes of trees for one commit (the most one sent commit's trees came to so far, which may
+  /// grow past the first commit's, since a later commit the walk reads can open more): to the entries of a chain as
+  /// deep as its learned depth ([`Repository::learned_depth`], its deltas and its base) times `breadth`, so every
+  /// tree's chain the walk reads between two revisions of one tree stays whole, each revision no longer than the tree
+  /// it leads to. The growth alone is charged to `admission`, a fetch's own (main 01a20182's ruling of 2026-11-25: a
+  /// fork a fetch reads through kept no cache, so every tree read rebuilt its chain from its base, 78 deltas for a
+  /// 13-tree chain). Sized for one tree's chain alone, git/git's clone hit it 6,702 times and applied 2,004,133 deltas
+  /// (main's leg at 47de9566d): the directories read between two of one directory's revisions put its chain out.
+  /// Refused room, it stays as it is.
+  pub fn widen_read_cache(&self, breadth: u64, admission: &mut Admission) -> Widening {
+    let wanted = super::packed::Recent::budget_keeping(
+      self
+        .learned_depth()
+        .saturating_add(1)
+        .saturating_mul(breadth),
+    );
     let mut reading = self.reading.borrow_mut();
     let have = to_u64(reading.recent().budget());
     if wanted <= have {
-      return true;
+      return Widening::Enough;
     }
     if admission.charge(wanted.saturating_sub(have)).is_err() {
-      return false;
+      return Widening::Refused;
     }
     reading
       .recent()
       .set_budget(usize::try_from(wanted).unwrap_or(usize::MAX));
-    true
+    Widening::Grown
   }
 
   /// The bytes its reads keep of the objects read lately (`packed::Recent`, git's delta base cache).
@@ -769,9 +814,29 @@ impl Repository {
     stored: &StoredAt,
     len: u64,
   ) -> Option<Cow<'s, [u8]>> {
+    self
+      .read_stored_waited(store, stored, len)
+      .map_err(|waited| {
+        if let Some(waited) = waited {
+          self.wait_for(waited);
+        }
+      })
+      .ok()
+  }
+
+  /// [`Repository::read_stored`] noting nothing: the bytes, or the let-go window the read met (none for any other
+  /// refusal), for a reader with a slot of its own to note it there alone (`crate::away::Waits`).
+  pub fn read_stored_waited<'s>(
+    &self,
+    store: &'s ContentStore,
+    stored: &StoredAt,
+    len: u64,
+  ) -> Result<Cow<'s, [u8]>, Option<packed::Waited>> {
     self.last_deltas.set(0);
+    self.last_found_kept.set(false);
+    self.last_inflated_base.set(false);
     match stored {
-      StoredAt::Whole(content) => stored_bytes(store, content, len),
+      StoredAt::Whole(content) => stored_bytes(store, content, len).ok_or(None),
       StoredAt::InPack(place) => {
         let bases = IndexBases {
           repository: self,
@@ -786,12 +851,15 @@ impl Repository {
           (&mut *reading, self.largest.max(len)),
           &mut out,
         );
-        self.note_waited(&read);
         self
           .last_deltas
           .set(u64::try_from(reading.deltas_applied()).unwrap_or(u64::MAX));
-        read.ok()?;
-        (u64::try_from(out.len()).ok() == Some(len)).then_some(Cow::Owned(out))
+        self.last_found_kept.set(reading.found_kept());
+        self.last_inflated_base.set(reading.base_inflated());
+        read.map_err(|refused| refused.waited())?;
+        (u64::try_from(out.len()).ok() == Some(len))
+          .then_some(Cow::Owned(out))
+          .ok_or(None)
       }
     }
   }
@@ -891,6 +959,23 @@ impl Repository {
   /// kept lately (`packed::Scratch::deltas_applied`).
   pub fn last_read_deltas(&self) -> u64 {
     self.last_deltas.get()
+  }
+
+  /// Whether its last read of a stored object found the object, or an entry of its chain, among the objects read lately
+  /// (`packed::Scratch::found_kept`): a hit of its read cache.
+  pub fn last_read_found_kept(&self) -> bool {
+    self.last_found_kept.get()
+  }
+
+  /// Whether its last read of a stored object inflated its chain's root, an entry whole in its pack
+  /// (`packed::Scratch::base_inflated`): none for one held whole, kept lately, or a delta whose base was kept.
+  pub fn last_read_inflated_base(&self) -> bool {
+    self.last_inflated_base.get()
+  }
+
+  /// The most bytes its reads keep of the objects read lately now (`packed::Recent`'s budget).
+  pub fn read_cache_budget(&self) -> u64 {
+    to_u64(self.reading.borrow_mut().recent().budget())
   }
 
   /// The tail and runs of its index its lookups have visited since the index's merge rule last took them.
@@ -1507,6 +1592,26 @@ impl Repository {
     store.discharge(self.charged.saturating_sub(total))?;
     self.charged = total;
     self.count(|counters| counters.value_bytes = counters.value_bytes.saturating_add(added));
+    let versions = self.install_versions(store, moves, chains, (heads, next));
+    self.count(|counters| counters.positions = counters.positions.saturating_add(given));
+    self.depth.seen(push.deepest());
+    push.release_holds(store)?;
+    // The push's objects read lately go with it, their charge given back (A-861).
+    push.release_recent(store);
+    Ok(versions)
+  }
+
+  /// The versions `commit` makes, put in place once everything is charged and the stage adopted: `chains` (each moved
+  /// green's chain with its new version) installed, the versions with no value counted (`unvalued`), the head map and
+  /// the next position taken, each version's commit noted for a later create's search back (A-850) and its holders, and
+  /// each version committed with its value noted known. The versions made, one for each move, in order.
+  fn install_versions(
+    &mut self,
+    store: &ContentStore,
+    moves: &[Move],
+    chains: BTreeMap<u64, Chain>,
+    (heads, next): (HeadMap, u64),
+  ) -> Vec<u64> {
     let versions: Vec<u64> = moves
       .iter()
       .map(|movement| {
@@ -1517,6 +1622,13 @@ impl Repository {
         })
       })
       .collect();
+    for (green, chain) in &chains {
+      let was = self.chains.get(green).map_or(0, Chain::unvalued);
+      self.unvalued = self
+        .unvalued
+        .saturating_sub(was)
+        .saturating_add(chain.unvalued());
+    }
     self.chains.extend(chains);
     self.heads = heads;
     self.next_position = next;
@@ -1547,12 +1659,7 @@ impl Repository {
         self.note_known(store, (movement.green(), version));
       }
     }
-    self.count(|counters| counters.positions = counters.positions.saturating_add(given));
-    self.depth.seen(push.deepest());
-    push.release_holds(store)?;
-    // The push's objects read lately go with it, their charge given back (A-861).
-    push.release_recent(store);
-    Ok(versions)
+    versions
   }
 
   /// Goal 93: each version `moves` committed (`versions`, in the same order) noted under its head in the holders' map,
@@ -2070,6 +2177,7 @@ impl Repository {
       index,
       next_position: self.next_position,
       chains: self.chains.clone(),
+      unvalued: self.unvalued,
       heads: self.heads.clone(),
       peeled: self.peeled.clone(),
       holders: self.holders.clone(),
@@ -2080,6 +2188,8 @@ impl Repository {
       packs: self.packs.clone(),
       reading: RefCell::new(Scratch::default()),
       last_deltas: std::cell::Cell::new(0),
+      last_found_kept: std::cell::Cell::new(false),
+      last_inflated_base: std::cell::Cell::new(false),
       waiting: Cell::new(None),
       largest: self.largest,
       landings_charged: self.landings_charged,
