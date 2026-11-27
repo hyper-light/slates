@@ -256,6 +256,10 @@ pub(crate) struct VcsStores {
   /// The repositories whose stores a recovery could not make again, and why: each is served no more until a reviewed
   /// recovery; bounded by the partition's repositories.
   unrecovered: BTreeMap<RepositoryId, ReplayRefused>,
+  /// The windows brought back on the shard (`replica::brought_back_here`) when each replica store was begun
+  /// (`replica::begin`): a refused replica is begun again from the same records only once this has moved. Bounded by
+  /// the repositories this node holds a replica of; [`free`] forgets it.
+  replica_begun: BTreeMap<RepositoryId, u64>,
   /// What the content store holds of the shard's budget, charged as retention.
   charged: u64,
   /// The last generation a Mercurial store's index was given ([`HgStore::generation`]); counts up.
@@ -1248,6 +1252,7 @@ pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
     state.store.budget.credit_retention(charged);
   }
   state.vcs_stores.unrecovered.remove(&id);
+  state.vcs_stores.replica_begun.remove(&id);
   state.vcs_usage.forget(&id);
   keep_held_svn(&mut state.vcs_stores, id);
   if !release_charged(state, id) {
@@ -5305,7 +5310,12 @@ async fn rebuild_turns(id: RepositoryId, generation: u64) {
 }
 
 /// A version-5 record's names and pack read from the node's store where this node lacks them, before its replay begins
-/// in repository `id`'s rebuild of `generation` (A-767 C5; [`read_changeset`], [`put_changeset`]).
+/// in repository `id`'s rebuild of `generation` (A-767 C5; [`read_changeset`], [`put_changeset`]). The node's store is
+/// the first source, not the only one: a changeset it does not hold (a holder's of its owner's pushes, GAPS (d)) leaves
+/// what the content store lacks to the region's homes, asked next ([`names_fetched_for_rebuild`]), and a pack neither
+/// can fill is refused by the replay itself, `Unlanded` (`git_replay`). So a refused read or put here is not the
+/// rebuild's refusal; it is counted ([`CHANGESET_UNREAD`]), never dropped unseen (main 01a20182's ruling of 2026-11-27
+/// 06:00, (d)'s first standing defect; CLAUDE.md §2 item 9: ending the rebuild here refused every holder's replica).
 async fn changeset_read_for_rebuild(id: RepositoryId, generation: u64) {
   let Some(Some((wanted, disk))) = crate::state::with_state(|state| {
     let under_way = state.vcs_stores.rebuild_turns.get(&id).copied()?;
@@ -5318,9 +5328,20 @@ async fn changeset_read_for_rebuild(id: RepositoryId, generation: u64) {
     return;
   };
   let read = read_changeset(&disk, &wanted).await;
-  let _ =
-    crate::state::with_state(|state| read.and_then(|read| put_changeset(state, id, &wanted, read)));
+  let _ = crate::state::with_state(|state| {
+    if read
+      .and_then(|read| put_changeset(state, id, &wanted, read))
+      .is_err()
+    {
+      state.count(CHANGESET_UNREAD, 1);
+    }
+  });
 }
+
+/// Counter: a changeset a rebuild wanted that the node's store did not give ([`changeset_read_for_rebuild`]): left to
+/// the region's homes, and refused by the replay where they cannot give it either. Format: a counter name in the
+/// daemon's status report.
+pub(crate) const CHANGESET_UNREAD: &str = "vcs_store.changeset_unread";
 
 /// A version-4 record's names and pack read from their region homes where this node does not hold them, before its
 /// replay begins in repository `id`'s rebuild of `generation` (A-724 piece 8c; [`names_to_fetch`]): each put into the

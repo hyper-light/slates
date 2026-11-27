@@ -209,6 +209,117 @@ async fn sent_payload(
   Ok((*hasher.finalize().as_bytes(), places, buffer))
 }
 
+/// The bytes of `texts` as a changeset's `Payload` and as its `Texts` section, measured a text a unit, a slice of the
+/// shard's budget a step (A-920: never a walk of a landing's every text in one unit). None where the shard's state is
+/// gone.
+async fn measured(texts: &[LandedText]) -> Result<(u64, u64), Uncommitted> {
+  let (mut payload, mut section) = (0u64, slates_store::texts::COUNT_BYTES);
+  let mut at = 0usize;
+  loop {
+    let deadline = slice_deadline_ns();
+    while let Some(text) = texts.get(at) {
+      payload = payload.saturating_add(text.len);
+      section = section.saturating_add(slates_store::texts::entry_len(&text_entry(
+        text,
+        ([0; 32], 0, 0),
+      )));
+      at = at.saturating_add(1);
+      if slates_rt::futures::now_ns() >= deadline {
+        break;
+      }
+    }
+    if at >= texts.len() {
+      return Ok((payload, u64::try_from(section).unwrap_or(u64::MAX)));
+    }
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// `texts`' `Texts` section sent into `landing` an entry a unit, each text at its place in the payload `payload`
+/// (`places`), the store's piece sent as each fills, through `buffer` (given back by each part, P7's finding (2)); a
+/// yield where the shard's budget is spent between pieces (A-920: the entries made and encoded whole after the payload,
+/// 9,000 of them, 998 KB, 2.5 ms of one step, debug). The bytes are `slates_store::texts::encode`'s; the buffer back.
+async fn sent_texts(
+  landing: &mut slates_store::owner::SlicedLanding,
+  (texts, places, payload): (&[LandedText], &[(u64, u64)], [u8; 32]),
+  mut buffer: Vec<u8>,
+) -> Result<Vec<u8>, Uncommitted> {
+  let mut pending = Vec::with_capacity(slates_store::store::PIECE_BYTES);
+  slates_store::texts::put_count(&mut pending, texts.len());
+  let mut deadline = slice_deadline_ns();
+  // The entries made between two awaits, and the most so far ([`LANDING_TEXT_ENTRIES_MOST`]).
+  let (mut since, mut most) = (0u64, 0u64);
+  for (text, (offset, len)) in texts.iter().zip(places) {
+    slates_store::texts::put_entry(&mut pending, &text_entry(text, (payload, *offset, *len)));
+    since = since.saturating_add(1);
+    most = most.max(since);
+    while pending.len() >= slates_store::store::PIECE_BYTES {
+      buffer = sent_piece(landing, &mut pending, buffer).await?;
+      (since, deadline) = (0, slice_deadline_ns());
+    }
+    if slates_rt::futures::now_ns() >= deadline {
+      slates_rt::futures::yield_now().await;
+      (since, deadline) = (0, slice_deadline_ns());
+    }
+  }
+  while !pending.is_empty() {
+    buffer = sent_piece(landing, &mut pending, buffer).await?;
+  }
+  let _ = crate::state::with_state(|state| {
+    let kept = state.refusals.entry(LANDING_TEXT_ENTRIES_MOST).or_insert(0);
+    *kept = (*kept).max(most);
+  });
+  Ok(buffer)
+}
+
+/// Gauge: the most entries of a changeset's `Texts` section made between two of its landing's awaits ([`sent_texts`],
+/// A-920): about a store's piece of them where its pieces end the steps (64 KiB, some 590 entries of a short path), never
+/// a landing's every text. Format: a counter name in the daemon's status report.
+pub(crate) const LANDING_TEXT_ENTRIES_MOST: &str =
+  "repository.svn_commit.landing_text_entries_most";
+
+/// The first of `pending`'s bytes, a store's piece at most, sent into `landing` through `buffer`, and taken off
+/// `pending`: the buffer back.
+async fn sent_piece(
+  landing: &mut slates_store::owner::SlicedLanding,
+  pending: &mut Vec<u8>,
+  mut buffer: Vec<u8>,
+) -> Result<Vec<u8>, Uncommitted> {
+  let take = pending.len().min(slates_store::store::PIECE_BYTES);
+  buffer.clear();
+  buffer.extend_from_slice(pending.get(..take).unwrap_or_default());
+  pending.drain(..take);
+  landing
+    .part(buffer)
+    .await
+    .map_err(|_| Uncommitted::Unstored)
+}
+
+/// `text`'s entry in a changeset's `Texts` section: its whole, at `offset` for `len` bytes of the payload `payload`.
+fn text_entry(
+  text: &LandedText,
+  (payload, offset, len): ([u8; 32], u64, u64),
+) -> slates_store::texts::TextEntry {
+  slates_store::texts::TextEntry {
+    path: text.path.clone(),
+    tool_id: Vec::new(),
+    text: text.identity,
+    len: text.len,
+    base: None,
+    place: slates_store::texts::Place {
+      payload,
+      offset,
+      len,
+    },
+    form: slates_store::texts::Form::Raw,
+  }
+}
+
+/// The step's deadline: the shard's clock now and its step budget.
+fn slice_deadline_ns() -> u64 {
+  slates_rt::futures::now_ns().saturating_add(slates_rt::futures::step_budget_ns().unwrap_or(0))
+}
+
 /// [`land_changeset`]'s sliced landing.
 async fn land_sliced(
   disk: &StoreHandle,
@@ -222,50 +333,45 @@ async fn land_sliced(
     .ok()
     .and_then(|records| records.checked_add(SECTIONS_BESIDE_RECORDS))
     .ok_or(Uncommitted::Unstored)?;
+  let (payload_len, texts_len) = measured(texts).await?;
   let mut landing = disk.begin(header).await.map_err(unstored)?;
-  let payload_len = texts
-    .iter()
-    .fold(0u64, |total, text| total.saturating_add(text.len));
   landing
     .section(SectionKind::Payload, payload_len)
     .await
     .map_err(unstored)?;
   // One buffer for the landing's every part, given back by each to be filled again (P7's finding (2)).
   let buffer = Vec::with_capacity(slates_store::store::PIECE_BYTES);
-  let (payload, places, mut buffer) = sent_payload(&mut landing, texts, buffer).await?;
-  let entries: Vec<slates_store::texts::TextEntry> = texts
-    .iter()
-    .zip(places)
-    .map(|(text, (offset, len))| slates_store::texts::TextEntry {
-      path: text.path.clone(),
-      tool_id: Vec::new(),
-      text: text.identity,
-      len: text.len,
-      base: None,
-      place: slates_store::texts::Place {
-        payload,
-        offset,
-        len,
-      },
-      form: slates_store::texts::Form::Raw,
-    })
-    .collect();
-  let sections = std::iter::once((SectionKind::Texts, slates_store::texts::encode(&entries)))
-    .chain(
-      records
-        .into_iter()
-        .map(|record| (SectionKind::Record, record)),
-    );
-  for (kind, bytes) in sections {
+  let (payload, places, buffer) = sent_payload(&mut landing, texts, buffer).await?;
+  landing
+    .section(SectionKind::Texts, texts_len)
+    .await
+    .map_err(unstored)?;
+  let buffer = sent_texts(&mut landing, (texts, &places, payload), buffer).await?;
+  sent_records(&mut landing, records, buffer).await?;
+  landing.commit().await.map(drop).map_err(unstored)
+}
+
+/// Sends each of `records` as a record section of its own, a store's piece at a time through the landing's one buffer,
+/// given back by each part to be filled again ([`land_sliced`]); the buffer once all are sent.
+async fn sent_records(
+  landing: &mut slates_store::owner::SlicedLanding,
+  records: Vec<Vec<u8>>,
+  mut buffer: Vec<u8>,
+) -> Result<Vec<u8>, Uncommitted> {
+  let unstored = |_| Uncommitted::Unstored;
+  for bytes in records {
     let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    landing.section(kind, len).await.map_err(unstored)?;
+    landing
+      .section(SectionKind::Record, len)
+      .await
+      .map_err(unstored)?;
     for piece in bytes.chunks(slates_store::store::PIECE_BYTES) {
       buffer.clear();
       buffer.extend_from_slice(piece);
       buffer = landing.part(buffer).await.map_err(unstored)?;
     }
   }
-  landing.commit().await.map(drop).map_err(unstored)
+  Ok(buffer)
 }
 
 /// The next piece of `text` from `offset` as the content store holds it, at most one of the store's pieces, appended to

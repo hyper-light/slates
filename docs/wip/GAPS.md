@@ -270,6 +270,17 @@
 > warm between the branch's versions, c refusing a's records, the branch's next push lands on a and b; red with part 4's
 > rebuild reverted in a scratch copy (`unable to commit`, b's `merge.recompute_mismatch` 1). Gate 16 (`v3_takeover` at
 > b7e65cc63, part 4 in) held: 40 of 40, release and debug.
+> **OPEN (w-interop, 2026-11-27; main's ruling of 07:08; found by reading the code, nothing run yet): a lone green
+> later adopted as a repository's root keeps a standalone replica on its holders, so a branch of it may never reach a
+> holder.** A green created alone is a family root of its own (A-636 part 2b-2), and its version 0 shipped while it
+> stood alone, so each holder made it a replica of no lineage. A repository that adopts it as its root moves the
+> owner's engine into the new lineage (`repository::install_root` with `adopted`) and enqueues no new version 0, so no
+> holder founds the lineage. A later branch's version 0 then meets `Greens::branch` refused `Stale` on each holder (the
+> source is no lineage member there), counted `merge.replica.branch_source_behind` and retried without end (CLAUDE.md
+> §2 item 8). The rebuild after a restart founds it by its join (`merge_origin::rebuild_through`), so only a holder that
+> made the replica before the join is affected. Owed (w-interop, after the lone-green record fix lands): a red test that
+> adopts a lone green as a root, branches it and requires the branch to reach a holder; the fix if it is red, else why
+> it holds and this closed.
 > **FIXED (A-912, w-shared, 2026-11-24; main 01a20182's rulings): a push made right after a member died was refused
 > `retry` for a second or more.** A home behind its sender held the put for its install, which needed the council's next
 > append on the very record session the put held, and the coordinator awaited its healer inline; and a home that died
@@ -770,9 +781,26 @@
 > holder's copy is ever let go, its bring-back must come from the region (`homes::read_in_region`), never its own
 > store.** OWED with the flip: the rule checked, not read: the control scene with the let-go on and no hooks, each
 > holder's landed let-go staying 0 while the owner's moves, so a change that lets a holder's pack go fails it and
-> reopens (d) with a real red. Two defects the runs found stand without any let-go and are their own landing: the
-> swallowed `Unlanded` of `changeset_read_for_rebuild` (CLAUDE.md §2 item 9), and the replica store begun again with
-> no bound after its replay was refused (`replica_build::wanted` → `replica::begin`; §2 item 8).
+> reopens (d) with a real red. Two defects the runs found stood without any let-go:
+> - **FIXED (w-git, 2026-11-27): the dropped `Unlanded` and the false `Truncated`** (CLAUDE.md §2 item 9).
+>   `changeset_read_for_rebuild` dropped a refused changeset read unseen. The node's store is the first source, not
+>   the only one: the region's homes are asked next (`names_fetched_for_rebuild`) for what the content store lacks, and
+>   ending the rebuild at the read refused every holder's replica in the fleet tests (`a908_…`, `a_new_branchs_push_…`:
+>   `unable to commit`). So the refusal is counted, `vcs_store.changeset_unread`, and left to the region. A pack the
+>   content store holds let go is not fetched from the region, so where the node's store cannot fill it either the
+>   replay refused `Pack(Truncated { at: 0 })`, a pack cut short, which it is not; it now refuses `Unlanded`
+>   (`git_replay`'s piece read). Red: `vcs_store::replica::tests::a_replicas_replay_over_a_let_go_pack_nothing_fills_is_
+>   refused_unlanded` (a replica begun from records whose changesets this node's store holds none of, its pack let go:
+>   `Truncated` and nothing counted before; `changeset_unread` counted and `Unlanded` after).
+> - **FIXED (w-git, 2026-11-27): a refused replica store begun again with no bound** (§2 item 8; main's keying of
+>   05:52). `replica_build::wanted` begins a replica store wherever none stands, and a refused replay leaves none, so
+>   each version waited for replayed the same records into the same refusal. Now `replica::begin` refuses at once,
+>   `ReplicaRefused::Unchanged`, counted `vcs_store.replica.unchanged_refused` and not logged, while the store is
+>   unrecovered from the same records and no window has been brought back on the shard since it was begun
+>   (`read_through::BROUGHT_BACK`, `homes::LANDED_BROUGHT_BACK`); other records, or a window brought back, begin it
+>   again. Red: `vcs_store::replica::tests::a_replica_store_refused_is_not_begun_again_from_the_same_records` (records
+>   that are not push records: begun and replayed twice before; refused `Unchanged` the second time after, one replay
+>   refused, other records begun).
 > The lift must also keep `landed_let_go_may`'s wait on live intakes (`intakes_live(id) <= own`, `vcs_store.rs`): it is
 > what keeps a landed pack's windows while a later push of the repository, or the same push's later refs, still reads
 > them (main 01a20182's sibling sweep of 2026-11-25). A lift that drops it opens Mercurial's bug in git: a window let go
@@ -910,12 +938,16 @@
 > read by the tests alone, not yet the status report. Move's `stage.committing` was the commit's node moves, a walk of
 > every effect in one unit (7.99 ms debug), which walks nothing since where no node has a link, and an effect a unit
 > where one has. `landing.apply`'s remaining unit
-> was its begin's plan of a replay's reads (4.46 ms debug), made since only where a run is unread; a replay's plan and
-> the scan of the runs are still one unit each, owed their slicing. Next, by size:
+> was its begin's plan of a replay's reads (4.46 ms debug), made since only where a run is unread; a replay's plan is made
+> a unit a step since and kept with the entry, and the runs read whole are counted, not walked; still one linear unit
+> each: the plan where made whole (`recorded_unlent`, svn_texts' wanted runs, `begin_applying` without one), the
+> begin's list of copies, `named_whole_files`. Next, by size:
 > `stage.judging` is out of move's leaders since a directory removal's children are counted and the resolution's end
 > taken an entry a unit, and `stage.recording` since the staging applies the pending holds a slice a step before its
-> free decision and its walks read a directory a child a unit; `stage.check` (3.7-3.9) and `landing.changeset`
-> (2.3-2.4) are next; the landing's
+> free decision and its walks read a directory a child a unit, and `stage.check` since a revision's record is encoded a
+> part at a time; `stage.canonical`'s 5.4 ms was the named-run reads'
+> re-walk the run count removed, `parse`'s excess preemption, and `landing.changeset`'s `Texts` section is made an entry
+> a unit since; next by CPU, move's `stage.build` (2.1 ms debug) and the cold first `create` (2.3); the landing's
 > publication (9.3-24.8 ms since today's merges) is A-930's image cut, w-perf's. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`

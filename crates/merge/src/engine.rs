@@ -274,39 +274,10 @@ impl Increment {
   /// (`Green::set_file`'s `insert_named`), so a replay that read the run would bring its text back only to drop it. A
   /// file whose length after depends on its base is read, as the apply may make it.
   pub fn replay_reads(&self, applied: &[crate::chain_entry::Applied]) -> Vec<bool> {
-    let changed = changed_files(applied);
-    let spans: Vec<(u64, u64)> = self.run_spans().collect();
-    // Each change makes at most one run whole; each run is marked read by any byte another change or a payload takes
-    // of it, every operation placed by halving the runs' ascending spans: linear in the entry (A-887's watchdog red).
-    let mut whole_of: Vec<Option<usize>> = vec![None; changed.len()];
-    let mut named_whole = vec![false; spans.len()];
-    for (change, run) in self.named_wholes(&changed) {
-      if let Some(slot) = whole_of.get_mut(change) {
-        *slot = Some(run);
-      }
-      if let Some(named) = named_whole.get_mut(run) {
-        *named = true;
-      }
-    }
-    let mut read = vec![false; spans.len()];
-    for ((_, ops, _), whole) in changed.iter().zip(&whole_of) {
-      for op in ops.iter().filter(|op| adds_content(op.kind)) {
-        mark_runs_read(&spans, op, *whole, &mut read);
-      }
-    }
-    for op in self
-      .doc
-      .ops
-      .iter()
-      .filter(|op| matches!(op.kind, OpKind::SetXattr | OpKind::Mknod | OpKind::Symlink))
-    {
-      mark_runs_read(&spans, op, None, &mut read);
-    }
-    named_whole
-      .iter()
-      .zip(read)
-      .map(|(named, read)| !named || read)
-      .collect()
+    // One choice, the stepped one's ([`ReplayReads`]), taken to its end here.
+    let mut choosing = ReplayReads::default();
+    while !choosing.step(self, applied) {}
+    choosing.into_reads()
   }
 
   /// The files its chain entry's apply names whole ([`Increment::replay_reads`]'s rule), each with the object it is the
@@ -363,11 +334,20 @@ impl Increment {
   /// [`Increment::unread`] among the runs `wanted` marks by place (a replay's, `Green::replay_reads`); every run where
   /// `wanted` does not reach it.
   pub fn unread_among(&self, wanted: &[bool]) -> Option<&crate::named::NamedRun> {
-    self.named.runs.iter().enumerate().find_map(|(at, run)| {
-      let read = self.named.read.read_len(at);
-      let wants = wanted.get(at).copied().unwrap_or(true);
-      (wants && u64::try_from(read).unwrap_or(u64::MAX) < run.len).then_some(run)
-    })
+    // From the first run not read whole: the runs before it are, so where every run is it answers with no walk (A-920:
+    // a landing's every apply scanned its 9,000 runs, all read).
+    let whole = self.named.read.whole_runs();
+    self
+      .named
+      .runs
+      .iter()
+      .enumerate()
+      .skip(whole)
+      .find_map(|(at, run)| {
+        let read = self.named.read.read_len(at);
+        let wants = wanted.get(at).copied().unwrap_or(true);
+        (wants && u64::try_from(read).unwrap_or(u64::MAX) < run.len).then_some(run)
+      })
   }
 
   /// Reads the next at most `slice` bytes of the named runs from `objects` (A-760; a step of the owner's, its copy
@@ -395,8 +375,11 @@ impl Increment {
     wanted: &[bool],
   ) -> Result<bool, crate::named::ObjectMissing> {
     let mut budget = slice.max(1);
-    let mut at = 0usize;
+    // From the first run not read whole: every run before it is (A-920: from the first run each call, a revision of 9,000
+    // runs read over many slices walked the runs read before at every one).
+    let mut at = self.named.read.whole_runs();
     while let Some(run) = self.named.runs.get(at).copied() {
+      self.named.read.visit();
       let read = self.named.read.read_len(at);
       let read = u64::try_from(read).unwrap_or(u64::MAX);
       if !wanted.get(at).copied().unwrap_or(true) || read >= run.len {
@@ -441,6 +424,7 @@ impl Increment {
       .saturating_add(u64::try_from(done).map_err(|_| missing)?);
     let refused = objects.read(&run.identity, from, into).err();
     self.named.read.settle(at, (room, refused.is_none()));
+    self.named.read.advance_whole(&self.named.runs);
     if let Some(refused) = refused {
       return Err(refused);
     }
@@ -7874,6 +7858,27 @@ impl Green {
     inc: &mut Increment,
     applied: &[crate::chain_entry::Applied],
   ) -> Begun {
+    // With every run read (a landing reads them all before its apply begins) none is unread whatever the plan says, so
+    // the plan, a pass over every effect and run (A-920: 4.46 ms of one step at 9,000 files, debug), is made only where
+    // one is unread: a replay that did not make it a unit a step first ([`Green::begin_applying_planned`]).
+    let reads = if inc.unread().is_some() {
+      self.replay_plans = self.replay_plans.saturating_add(1);
+      inc.replay_reads(applied)
+    } else {
+      Vec::new()
+    };
+    self.begin_applying_planned(inc, applied, &reads)
+  }
+
+  /// [`Green::begin_applying`] with the replay's choice of runs made already, `reads` by each run's place
+  /// ([`ReplayReads`], a unit a step; a run it does not reach is read): what a recovery's replay begins with, its choice
+  /// made once a unit a step and never again here.
+  pub fn begin_applying_planned(
+    &mut self,
+    inc: &mut Increment,
+    applied: &[crate::chain_entry::Applied],
+    reads: &[bool],
+  ) -> Begun {
     // A green that owes a push takes a later recorded version in order, to apply once it is materialized (P2): the
     // version it stands for is answered, so a replay goes on.
     if let Some(owed) = &self.owed {
@@ -7889,15 +7894,9 @@ impl Green {
     }
     // A named run not read yet (A-760) is never applied as zeros: nothing commits, and the head answered differs from
     // the version the entry was recorded as, which its caller refuses as it refuses any chain that disagrees. A run the
-    // apply names whole, which no op reads, is never read for it (A-887, [`Green::replay_reads`]).
-    // With every run read (a landing reads them all before its apply begins) none is unread whatever the plan says, so
-    // the plan, a pass over every effect and run (A-920: 4.46 ms of one step at 9,000 files, debug), is made only where
-    // one is unread: a recovery's replay, which reads only the runs it plans.
-    if inc.unread().is_some() {
-      self.replay_plans = self.replay_plans.saturating_add(1);
-      if inc.unread_among(&inc.replay_reads(applied)).is_some() {
-        return Begun::Answered(self.head());
-      }
+    // apply names whole, which no op reads, is never read for it (A-887, [`Increment::replay_reads`]).
+    if inc.unread_among(reads).is_some() {
+      return Begun::Answered(self.head());
     }
     let copies = applied
       .iter()
@@ -9615,7 +9614,9 @@ fn special_payload(
 mod branch;
 mod finishing;
 mod node_moves;
+mod replay_reads;
 pub use branch::{Lent, Lineage, LineageGreen, LineageRefused, Release};
+pub use replay_reads::ReplayReads;
 
 mod copy;
 pub use copy::CopyRefusal;
