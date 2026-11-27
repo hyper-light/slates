@@ -1202,8 +1202,15 @@ pub(crate) const IMAGE_SPLIT_DISCARDED_BYTES: &str = "vcs_store.image.split_disc
 pub(crate) const IMAGE_LONGEST_SPLIT_DISCARD: &str = "vcs_store.image.longest_split_discard_bytes";
 /// Format: the status counter of the encoder's turns.
 pub(crate) const IMAGE_TURNS: &str = "vcs_store.image.encode_turns";
-/// Format: the status counter of the bytes the encoder's turns spent: encoded, and read by a split.
+/// Format: the status counter of the bytes the encoder's turns spent encoding, and reading by a split; never what they
+/// copied from committed pieces ([`IMAGE_COPIED_BYTES`]).
 pub(crate) const IMAGE_ENCODED_BYTES: &str = "vcs_store.image.encoded_bytes";
+/// Format: the status counter of the bytes the encoder's turns copied from committed pieces into the pages appended to,
+/// cut or split from them (A-930): spent, encoding none of them.
+pub(crate) const IMAGE_COPIED_BYTES: &str = "vcs_store.image.copied_bytes";
+/// Format: the status counter of the largest page size an encoder turn planned by (`ServerConfig::copy_slice_bytes`,
+/// or a test's pin): what a page holds up to twice of.
+pub(crate) const IMAGE_PAGE_BYTES: &str = "vcs_store.image.page_bytes";
 /// Format: the status counters of the bytes the encoder's turns encoded, by family in `image_pages::Family::ALL`'s
 /// order (goal 93, A-923: which family's pages a publication re-encodes).
 pub(crate) const IMAGE_FAMILY_ENCODED_BYTES: [&str; crate::image_pages::Family::ALL.len()] = [
@@ -1414,7 +1421,12 @@ pub(crate) fn image_turn(state: &mut ShardState) -> crate::image_pages::Turned {
     cut_page_frozen(state, family, (page.start, page.last()), false);
   }
   state.count(IMAGE_TURNS, 1);
-  state.count(IMAGE_ENCODED_BYTES, turned.bytes);
+  state.count(
+    IMAGE_ENCODED_BYTES,
+    turned.bytes.saturating_sub(turned.copied),
+  );
+  state.count(IMAGE_COPIED_BYTES, turned.copied);
+  state.count_max(IMAGE_PAGE_BYTES, u64::try_from(limit).unwrap_or(u64::MAX));
   for (name, bytes) in IMAGE_FAMILY_ENCODED_BYTES
     .iter()
     .zip(turned.encoded_by_family)
