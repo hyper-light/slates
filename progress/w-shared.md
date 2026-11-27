@@ -650,3 +650,15 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
   - Reds first: two fleet tests and three units.
 - Owed (main): the a894 loop after, bar 0 of 40.
 - Moot: the a_resolution_pass flake (w-git landed it as 668c10e99) and my allow-list share (w-hg removed the allow-list).
+
+## 2026-11-26: A-921 part 3 landed (slates ee59aa1c3, commit 9363534f2)
+- An owner's owed state-log parts now ride its shard's recovery image (piece kind 22; image 36, delta 14). At a warm start each part is owed again to every candidate, with no acks known.
+- Parts are persisted before they ship: the record plane publishes first. A refused publication holds the state-log heads back for a pass, counted, and past `held_back_bound` the next change is refused typed.
+- The deterministic red: the old holder now holds every part, with no Behind refusal.
+- "held 1" is now measured: every newcomer position is at or above a's restarted hold start.
+- GAPS: closed the a894 loop's after (0 of 40); narrowed the owner's-hold item (let-go parts are at 2f copies at the candidate floor, but only f where c = f+1; plus the unbounded owner_hold finding).
+- Open, mine, in order:
+  - (2): a warm start's pending merge versions are never re-shipped. Its red is the same fleet test.
+  - The A-921 false-death test, which fails on main.
+  - v3_takeover's "waiting on its adoption" stall.
+- Merge commit 035f8888d doesn't build alone: the OperationIdentity fix landed in 5259bb1b7.
