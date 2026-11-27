@@ -65720,6 +65720,8 @@ Applied in the same change to:
 - **Applied in the same change to:** `crates/vfs/src/{recover,checkpoint_log}.rs` (the versions),
   `crates/server/src/{content_holder,state_log,fleet,verbs,state,daemon}.rs`, `crates/server/src/state_log/tests.rs`,
   `crates/server/tests/fleet.rs`, A-636 part 2b's owed list, GAPS.
+- **Amended by A-921 part 4** (2026-11-27): (2) is fixed. Its cause was not shipping: the record a warm start
+  re-derives differs from the one shipped, which a holder joins now.
 
 ### A-930 — A page changed only past its committed piece's last coordinate appends to it, and its split copies the piece's entries (2026-11-26, w-perf for main 01a20182, its ruling of 2026-11-25 on the 57k churn: the Aways append rule; goal 93, A-870, A-923)
 
@@ -65783,3 +65785,71 @@ Applied in the same change to:
   goal 93 line in GAPS (A-923's entry). Part 2: `image_pages.rs` (`Marked`, `EntryCoordinate`, `Changed`, `PieceCut`,
   `CommittedPiece::coordinates`, `Encoder::changed_since`, `changed_turn`, `cut_committed`; `Encoder::turn` takes the
   coordinate reader beside the family reader) and `crates/server/src/content_holder.rs` (`entry_coordinate`).
+
+### A-921 part 4 — A holder joins a version's record its owner re-derived with other floors, instead of refusing it as another proposal (2026-11-27, w-shared for main 01a20182, its ruling of 2026-11-27 (B); A-921's second mode's (2); amends §4.16 "Apply on holders" and the register's position rule)
+
+- **Why.** After A-921 part 3, the deterministic owner-restart red still refused every push. Counters added on every
+  exit that had recorded nothing showed the cause. The owner sent the green's pending records every pass (184 sends,
+  186 acknowledgements, its own alone), so shipping was never the problem. The old holder refused v2
+  `ConflictingPosition`, 19 times a run, and the merge path had counted none of it. Decoded, the two values differed in
+  one field: `checkpoint_floor`, 1 in the v2 the holder accepted before a's restart, 0 in the v2 a re-derived from its
+  replay after it (`merge_service::enqueue_recovered_record`). A warm-started owner knows no committed floor yet. A
+  different value at a held position and epoch is another proposal, refused for good, so v2 never placed, nothing after
+  it shipped, and every push stayed refused.
+- **The rule.** A merge record carries the version's content and two fields of its owner's own state when it made the
+  record:
+  - `checkpoint_floor`, the newest version known committed; a holder keeps a checkpoint at it only past the one it
+    holds (`checkpoint_replica`), and a committed version stays committed, so the greater of two is always true.
+  - `folded_below`, the owner's fold floor; a holder folds no lower (`fold_replica`), and the owner never unfolds.
+  - Every other field is the version's content, stable per version, or its catalog's facts:
+    - the increment, base, inputs, evidence and completion;
+    - the signature, read from the chain entry recorded when the version became durable, which the replay reads again;
+    - the head identity, for a deferred push (P2) the base's in both the first enqueue and the replay.
+
+  A holder that holds a different record at the position and epoch now asks `merge_service::joined_floors`. Records
+  equal in all but the two floors are one proposal: it holds the join, each floor its greater, at the held epoch, and
+  acknowledges the record sent, so its commit counts the holder (`Acceptor::accept_merged`, `Acceptor::check_merged`).
+  Anything else is another proposal, refused `ConflictingPosition` as before. The register stays opaque to values: the
+  join is its caller's (`ValueMerge`). A joined value is no replacement, so it rewinds no replica
+  (`merge_service::replaces`). Residual: the catalog's facts (`name`, `require_evidence`, `owner`) are read when a
+  record is made, so a catalog changed while a version was pending would re-derive differently and still conflict.
+  They are not floors and are compared whole.
+- **A replica store made again after a refused build.** With the join, v2 placed in most runs. In the rest the old
+  holder's replica, owing v2's deferred push, refused every build `Object { why: Missing }` (94 of 94 a run, the
+  natural mode's ~20). A holder's replica store is made once, from the names-log parts it holds then
+  (`vcs_store::replica::begin`). One made before the missed part arrived never took that push's objects, which ride the
+  names log (A-724 piece 8c). So a refused build now marks its repository (`replica_build::ReplicaBuilds::refused_over`),
+  and the next build wanted makes the store again, where it was made from other push records than the held parts now
+  carry (`vcs_store::replica::drop_if_stale`, counted `vcs_store.replica.made_again`). It happens only after a refusal,
+  so an ordinary build replays no store.
+- **Why not persist the shipped bytes.** The other fix carried each pending version's record in the recovery image and
+  published it before it shipped. That puts an image publication in front of every merge's ship, which is a merge's
+  acknowledgement path, the one 84a's loaded p99 and p999 under 1 ms measure. This fix changes no format and adds no
+  wait.
+- **The silent exits, counted** (§2 item 9):
+  - a green with pending versions skipped for its uncommitted catalog (`merge.green.awaits_catalog`) or its unmade
+    origin (`merge.green.awaits_origin`);
+  - a record shipment with no session free (`merge.record.ship_no_session`), each sent (`merge.record.shipped`) and
+    the acknowledgements gathered (`merge.record.ship_acks`);
+  - on the holder, a green refused for good (`merge.record.green_refused`) and a record with no standing
+    (`merge.record.no_standing`);
+  - the merge path's authority check counted, and noted in the last-refusal record, as the register path's is.
+- **Tests.**
+  - Fleet `a921_a_holder_that_missed_an_owners_part_before_its_warm_restart_is_shipped_it_after` asserts the push
+    lands and no `ConflictingPosition` at the old holder. Before: 19 refusals, 3 of 3 pushes refused, and with the join
+    alone, 2 of 5 runs refused every build `Missing`. After both: none, and the push lands, 5 of 5.
+  - A919's owner-restart scene, one run by name: its push lands, and the start rule holds (the newcomer holds nothing,
+    a's restarted hold starts at 3). It stays ignored, now for A-921's next mode alone.
+  - That mode: a survivor adopts a's green with a candidate's death though a lives and its fencing epoch never moved;
+    a's records are then refused `Unauthorized` and its repository's `main` leaves a. 3 of 10 scenes met it. The
+    owed-part scene forms afresh where any survivor adopted a's repository or green, or holds a's root green under
+    another owner, after a's restart and again after the first candidate's takeover (`adopted_elsewhere_of`,
+    `Daemon::holder_owner`). GAPS keeps it as A-921's next.
+  - Units: `register::tests::a_value_the_merge_joins_is_acknowledged_and_another_is_still_refused` and
+    `merge_service::tests::a_versions_record_with_other_floors_joins_the_held_one_and_other_content_does_not`.
+- **Models.** `docs/wip/models/FencedLedger.tla` holds one value a position per ballot. Agreement now holds over a
+  record's content, its owner's floors joined. Main's TLC run decides whether the model takes the join as a value
+  class.
+- **Applied in the same change to:** `crates/db/src/register.rs`,
+  `crates/server/src/{merge_service,fleet,replica_build,daemon}.rs`, `crates/server/src/vcs_store/replica.rs`,
+  `crates/server/tests/fleet.rs`, A-921 part 3's entry, GAPS.

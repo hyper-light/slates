@@ -362,10 +362,16 @@
 >     14), are owed again at a warm start to every candidate, and are persisted before they ship. Red first, made
 >     deterministic (a holds its parts off the old holder). "held 1" is measured: every newcomer position at or above
 >     a's restarted hold start.
->   - **OPEN, A-921's second mode's (2) (w-shared, next):** after a's warm restart its merge plane ships no pending
->     version again (v2 acked [a] and shipped once, v3 on none, nothing to the newcomer), so the push still never lands
->     (3 of 3 refused in the deterministic red). Fix by the same rule: a warm start's pending versions owed again, their
->     shipment state rebuilt from their recorded acks; its fix asserts the push in that red.
+>   - **FIXED, A-921's second mode's (2) (A-921 part 4, w-shared, 2026-11-27):** a's replay re-derived the green's
+>     pending v2 with a checkpoint floor of 0 where the old holder held 1, refused `ConflictingPosition` (19 a run, then
+>     uncounted on the merge path) so v2 never placed and every push was refused. A holder now joins a record differing
+>     only in its owner's floors (each by its greater) and acknowledges it. And a replica store made before the missed
+>     part arrived refused every build `Missing` (94 a run): after a refused build, the store is made again from every
+>     part held. Red first: the push lands, 5 of 5. Every silent exit of the merge plane's ship and hold is now counted.
+>   - **OPEN, A-921's next (w-shared, after the false-death regression):** 3 of 10 owner-restart scenes, a survivor
+>     adopted a's green with a candidate's death though a lives and its fencing epoch never moved; a's records were
+>     then refused `Unauthorized` (89 to 386 a run) and its repository's `main` left a. The owed-part scene forms afresh
+>     where it happens (`adopted_elsewhere_of`); A919's owner-restart test stays ignored for it. Not yet understood.
 >   - **OPEN, found 2026-11-26 (w-shared):** `a921_a_warm_restarted_node_never_names_a_false_death_victim_its_old_volumes_owner`
 >     fails 3 of 3 on main past 03c736286 (green when A-921 part 2 landed): the warm-restarted stranger's direct route
 >     names a (`named a true`, claims 0), while its status is served. It fails alike with A-921 part 3's runtime changes
