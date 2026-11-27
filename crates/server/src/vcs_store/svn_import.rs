@@ -1059,6 +1059,78 @@ pub(crate) mod phase {
     });
   }
 
+  std::thread_local! {
+    /// The longest single unit of a landing's release of its scratch member on this thread (A-920, main's order
+    /// after release probe 15): its wall, thread-CPU, user and system nanoseconds, and the units timed.
+    static RELEASE_UNITS: std::cell::Cell<ReleaseUnits> = const { std::cell::Cell::new(ReleaseUnits::NONE) };
+  }
+
+  /// The longest unit of a landing's release on a thread, and the units timed.
+  #[derive(Clone, Copy, Debug)]
+  pub(crate) struct ReleaseUnits {
+    /// Its wall nanoseconds, by the shard's clock.
+    pub(crate) wall: u64,
+    /// Its thread-CPU nanoseconds.
+    pub(crate) cpu: u64,
+    /// Of that, the thread's user and system nanoseconds, where the platform keeps them apart (macOS; else zero).
+    pub(crate) user_system: (u64, u64),
+    /// The units timed.
+    pub(crate) units: u64,
+  }
+
+  impl ReleaseUnits {
+    /// None timed.
+    const NONE: ReleaseUnits = ReleaseUnits {
+      wall: 0,
+      cpu: 0,
+      user_system: (0, 0),
+      units: 0,
+    };
+  }
+
+  /// A unit of a landing's release begun: the shard's clock, the thread's CPU and its user and system split now.
+  pub(crate) fn release_unit_begun() -> (u64, u64, (u64, u64)) {
+    (
+      slates_rt::futures::now_ns(),
+      slates_rt::registry::calling_thread_cpu().map_or(0, |reading| reading.spent_ns),
+      slates_rt::registry::calling_thread_user_system_ns().unwrap_or((0, 0)),
+    )
+  }
+
+  /// The unit begun at `began` ([`release_unit_begun`]) ended: kept where it is the longest by the wall.
+  pub(crate) fn release_unit(began: (u64, u64, (u64, u64))) {
+    let (wall, cpu, (user, system)) = release_unit_begun();
+    let unit = ReleaseUnits {
+      wall: wall.saturating_sub(began.0),
+      cpu: cpu.saturating_sub(began.1),
+      user_system: (
+        user.saturating_sub(began.2.0),
+        system.saturating_sub(began.2.1),
+      ),
+      units: 0,
+    };
+    RELEASE_UNITS.with(|units| {
+      let kept = units.get();
+      let count = kept.units.saturating_add(1);
+      units.set(if unit.wall > kept.wall {
+        ReleaseUnits {
+          units: count,
+          ..unit
+        }
+      } else {
+        ReleaseUnits {
+          units: count,
+          ..kept
+        }
+      });
+    });
+  }
+
+  /// The longest unit of a landing's release so far on this thread; cleared.
+  pub(crate) fn release_units_taken() -> ReleaseUnits {
+    RELEASE_UNITS.with(|units| units.replace(ReleaseUnits::NONE))
+  }
+
   /// The poll under way ended: its spans in order, and the phase it ended in.
   pub(crate) fn poll_ended() -> (Vec<Span>, &'static str) {
     TAGS.with(|tags| {

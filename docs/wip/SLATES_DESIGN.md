@@ -64913,6 +64913,25 @@ GAPS.
   - Planted bug, red in `store_tests`: every other imported text skipped. A killed batch's recovery and a clean
     restart's named texts both fail; the import tests alone did not catch it.
   - After 13a (debug), every wide test's longest poll is the register's op (`landing.record`, 9.0-10.0 ms).
+  **Release probe 16** (main, at cb73f520b with 13a; by the history's own longest poll, A-920's measure; 99 quiet runs
+  at load 33-42, then 99 with 12 burners at load 42-62, all rc 0):
+  - add: p50 705 µs and p90 1,106 quiet, then 713 and 912 loaded; over 1 ms in 12 and 7 of 99. Led by
+    `stage.recording`, then the register's op (`landing.record`).
+  - copy: p50 1,578 µs; led by `landing.release` in 98 of 99.
+  - move: p50 1,090 µs; led by `stage.committing`, then `landing.apply`, then `landing.record`.
+  **The landing release's units, timed** (main's order). Each unit of a landing's release of its scratch member is
+  timed by the wall and by the thread's CPU (test-only, `svn_import::phase::release_unit`). The wide tests print the
+  longest: `RELEASE <test> unit_wall_ns=<n> unit_cpu_ns=<n> units=<n>`. In debug, copy's longest unit is 1.3-4.3 ms,
+  its CPU its wall, against 19-36 µs in add and move. Probes of each unit's kind and each map's pop find none large:
+  a history chunk at most 2 µs, a map node 26, a remains entry's pop 20, the emptied shell 15. The long unit lands on a
+  different kind from run to run. That fits a free that empties an allocator region, its kernel work counted as the
+  thread's CPU, but it is a claim until a read of system against user time names it.
+  Since then the line splits the longest unit's thread CPU into user and system time
+  (`slates_rt::registry::calling_thread_user_system_ns`, macOS's `THREAD_BASIC_INFO`, none elsewhere):
+  `RELEASE <test> unit_wall_ns=<n> unit_cpu_ns=<n> unit_user_ns=<n> unit_sys_ns=<n> units=<n>`. In debug, move's
+  longest unit read 3,016 µs of CPU, 3,012 of it system and 5 user: kernel work in the unit, as a free that empties an
+  allocator region would be. If release shows the same, the fix is in how memory is given back (the region kept, or
+  returned off the shard's step), not in the release's walk (main's ruling).
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 

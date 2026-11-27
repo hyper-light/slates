@@ -306,7 +306,14 @@ fn released_some(
   deadline_ns: u64,
 ) -> bool {
   loop {
-    match state.greens.release_step(lineage, release) {
+    #[cfg(test)]
+    let began = crate::vcs_store::svn_import::phase::release_unit_begun();
+    let stepped = state.greens.release_step(lineage, release);
+    // Each unit timed by the wall and the thread's CPU, the longest printed by the wide tests (A-920, main's order
+    // after release probe 15: the release led copy's longest poll at 1.6 ms with no unit past 150 µs in debug).
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::release_unit(began);
+    match stepped {
       Ok(true) => {}
       Ok(false) | Err(_) => return true,
     }
