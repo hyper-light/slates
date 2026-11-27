@@ -712,3 +712,11 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
 - 2026-11-27 08:09 PST: red 2 (store_tests clean restart, image (1, 2) against (0, 3)) is back on diag 9's TSan lane: the
   publish_shard in image_split did not publish the last let-go. Investigating now. Red 4's DIAG-LANDING
   instrumentation is still unpushed on w-interop/windows-fleet-diag.
+- 2026-11-27 09:29 PST: red 2 landed: 899acf485, 9f78ac1f3, 125bbcce6, merged 588b7a653. It was a page-dependent count in the test,
+  not a race: a 106,766-byte text spans two 64 KiB windows at a 4 KiB page. Its diag check rides main's next diag CI.
+- 2026-11-27 09:29 PST: on battery (main's 09:28), no new builds.
+  - red 4: diag branch w-interop/hg-landing-diag (DIAG-LANDING, merged onto 68e6fe9e3) is in its Mac check run; push
+    it once that prints.
+  - ssh patience test: fix committed locally, 8d027b59c in w-interop-ceiling (patch
+    ~/.local/state/w-interop-logs/ssh-patience-2026-11-27.patch), not yet tested. Run its test once back on AC, then
+    push.
