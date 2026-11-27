@@ -1,0 +1,56 @@
+name: diag-main-ringrss
+# Run 1 (main 01a20182, 2026-11-26 21:29 PST). This is the Linux reading A-926 part 2 left owed. GAPS, A-746's line, says
+# "OWED: the same test on Linux, by RSS (main's lane)". On macOS, w-perf's a_released_rings_pages_go_back_to_the_os at
+# d295fc3ca read 98 MiB with the released ring and 4 MiB after the give-back, by the physical footprint. Linux charges
+# the resident size, which a give-back lowers at once, so this lane reads the same figures by RSS. Debug build,
+# ubuntu-latest and ubuntu-24.04-arm, five runs each, all shown. Run only from diag-measurer-main-ringrss-* branches,
+# never main.
+on:
+  push:
+    branches: ["diag-measurer-main-ringrss-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  ringrss:
+    name: ring give-back RSS (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Build the test
+        run: |
+          git log -1 --format='at %h %s' | cut -c1-120
+          cargo test --locked -p slates-db --test segment_give_back_footprint --no-run
+      - name: The give-back test, five runs
+        run: |
+          set +e
+          for n in 1 2 3 4 5; do
+            cargo test --locked -p slates-db --test segment_give_back_footprint a_released_rings_pages_go_back_to_the_os -- --nocapture > "$RUNNER_TEMP/ring-$n.log" 2>&1
+            rc=$?
+            # libtest prints "test <name> ... " without a newline, so the test's line can come glued to it.
+            line=$(grep -a -o 'segment_give_back:.*' "$RUNNER_TEMP/ring-$n.log" | head -1 | cut -c1-300)
+            echo "::notice title=${{ matrix.os }} run $n (exit $rc)::$line"
+            echo "run $n exit $rc: $line"
+            grep -a -A3 -E "panicked" "$RUNNER_TEMP/ring-$n.log" | head -8
+            grep -a -E "test result" "$RUNNER_TEMP/ring-$n.log" | head -2
+          done
+          exit 0
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: main-ringrss-${{ matrix.os }}
+          path: ${{ runner.temp }}/ring-*.log
+          if-no-files-found: warn
