@@ -721,3 +721,13 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - Conflict: A-727 (d1a)'s test models an older version as an empty answer, which is also what a dying peer's broken stream gives.
 - Proposed discriminator: the session's peer_reset() on that reply.
 - Uncommitted: a DIAG log of peer_reset per unreadable reply (patch: ~/.local/state/w-shared/a914-homing-diag.patch). a914 runs to catch one are not started until the Mac is on AC.
+
+## 2026-11-27 09:54 PST: drafted, not built (Mac on battery; main says AC)
+- a914 (A-914 (d)): fleet::settle_replies is the one settle path. A reply with no round trip is no answer, and homes.rs exchange_round routes through it.
+  - Red: a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once, with the home stopped once vcs_store.homes.remote_asked counts it.
+  - GAPS covers A-914 (d) and the sweep's six siblings (OPEN). a914 asserts its second push lands. Design entry written.
+  - Patch: ~/.local/state/w-shared/a914-settle-replies-draft.patch (applied in the w-shared-a894 worktree).
+  - On AC: red with the exchange_round hunk reverted, then fixed; t_a727_d1a; focused set; a914; commit; queue the a914 command in run-requests.md.
+- A-921 Windows bound (main 09:50, approved 09:53), after a914. The watch brackets each re-key (last un-keyed look) and the bound adds both detectors' measured granularity.
+  - Patch: ~/.local/state/w-shared/a921-rekey-lateness.diff (diff -u of tests/fleet.rs, a914-only version vs combined); combined copy at fleet-combined.rs.
+- Then: A-919's past-tolerance edge, shape to main first.
