@@ -827,3 +827,9 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     published_for_ticket (about 1: a byte rule for cuts nobody waits on, plus a cut a ticket asks for and one at idle;
     near 17,745: fold the other waits under A-929's barrier).
   - Waiting on main: that rerun.
+- 2026-11-27 ~04:30 PST:
+  - LANDED 5ce8817dc (8e16d1f39): Windows CI red (run 45948476737) on a_one_page_give_back_...: the test asserted the
+    bytes the OS took, 0 on Windows' section views. It now holds what is asked on every platform: whole pages asked
+    back (new counter recovery.asked_bytes), nothing left dead. Red with the rounding out: 0 asked. MacBook: 16,384.
+  - Waiting on main: its Windows diag run of the tip; its third 57k churn (published_for_ticket, cuts, the text-cache
+    index gauge) and the (i)/(ii) cadence ruling.
