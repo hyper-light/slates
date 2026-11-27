@@ -1440,11 +1440,14 @@ impl AnchorSegment {
         .map_or(u64::MAX, |word| word.load(Ordering::Acquire));
       Ok(usize::try_from(value).unwrap_or(usize::MAX).min(len))
     };
+    /// Format: the mark words after the version word: the ring's, then each snapshot slot's, in that order.
+    const MARK_WORDS: [usize; 3] = [1, 2, 3];
+    let [ring_word, first_slot_word, second_slot_word] = MARK_WORDS;
     Ok(RegionMarks {
-      ring: mark(1, RegionKind::Log(partition))?,
+      ring: mark(ring_word, RegionKind::Log(partition))?,
       snapshots: [
-        mark(2, RegionKind::Snapshot(partition, 0))?,
-        mark(3, RegionKind::Snapshot(partition, 1))?,
+        mark(first_slot_word, RegionKind::Snapshot(partition, 0))?,
+        mark(second_slot_word, RegionKind::Snapshot(partition, 1))?,
       ],
     })
   }

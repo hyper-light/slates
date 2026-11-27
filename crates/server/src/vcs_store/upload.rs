@@ -875,7 +875,14 @@ fn count_work_stages(state: &mut ShardState, (work, staged): (u64, [u64; 2]), lo
   }
 }
 
-fn count_phases(state: &mut ShardState, (bounds, staged): ([u64; 6], [u64; 2]), quantum_ns: u64) {
+/// Shape: the phase bounds a fetch step counts.
+const PHASE_BOUNDS: usize = 6;
+
+fn count_phases(
+  state: &mut ShardState,
+  (bounds, staged): ([u64; PHASE_BOUNDS], [u64; 2]),
+  quantum_ns: u64,
+) {
   let mut phases = [0_u64; 5];
   for (at, phase) in phases.iter_mut().enumerate() {
     let (Some(start), Some(end)) = (bounds.get(at), bounds.get(at.saturating_add(1))) else {
