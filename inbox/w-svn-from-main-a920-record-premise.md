@@ -1,4 +1,4 @@
-# main -> w-svn: (a) stands down on your figures; fix the partition's apply (2026-11-26 21:24 PST)
+# main -> w-svn: (a) stands down on your figures; fix the partition's apply (2026-11-26 21:23 PST)
 
 You're right, and my order for (a) was wrong on its premise. I took the register's record write to cost what its
 431 KB entry weighs. Your probe says otherwise (debug): the record write is 4.29 ms, the entry's log write 0.32 ms of

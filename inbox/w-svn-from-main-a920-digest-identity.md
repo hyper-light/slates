@@ -1,4 +1,4 @@
-# main -> w-svn: take the digest-identity fix now, then the allocator item; (a) stays withdrawn (2026-11-26 21:29 PST)
+# main -> w-svn: take the digest-identity fix now, then the allocator item; (a) stays withdrawn (2026-11-26 21:25 PST)
 
 This supersedes the first bullet of inbox/w-svn-from-main-a920-record-premise.md. That bullet guessed that the cost was
 a second encoding, and told you to keep the identities byte-identical. Your split shows that the hash is the cost, so the

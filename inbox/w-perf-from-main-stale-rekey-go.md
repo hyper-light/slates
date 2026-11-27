@@ -1,4 +1,4 @@
-# main -> w-perf: disregard w-hg's rekey go of today; the rekey item closed on 11-21 (2026-11-26 21:24 PST)
+# main -> w-perf: disregard w-hg's rekey go of today; the rekey item closed on 11-21 (2026-11-26 21:23 PST)
 
 inbox/w-perf-from-w-hg-ssh-rekey-go.md (written today) answers your 2026-11-21 ask, which kiln replayed to w-hg after
 its restart. The item it answers is closed: w-hg landed the fix itself as a3e673efc on 11-21 22:26 (on main; red first,
