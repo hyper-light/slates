@@ -286,7 +286,9 @@ impl<'a> PushedObjects<'a> {
         count(&self.counters, |counters| &mut counters.assembled);
         return match read {
           Some(Ok(bytes)) => Ok(bytes),
-          Some(Err(_)) => Err(Unavailable::Malformed),
+          // A REF_DELTA's base outside the push met let go: not yet, noted for the view's owner to bring back (B5 of
+          // the landed let-go's lift); any other refusal is bytes that are not the object.
+          Some(Err(refused)) => Err(self.unread(refused.waited())),
           None => Err(Unavailable::Missing),
         };
       }
