@@ -809,3 +809,11 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     slates-db); fixed by cleaning every workspace crate from my target and rebuilding. Memory note updated.
   - OWED: main's in-place 57k rerun (publication count and page for the 43.1 MB check).
   - Next: the 35.7 MB keep rows, after that rerun.
+- 2026-11-27 ~00:30 PST:
+  - Main's 57k rerun at c207c9f81: Aways 43.1 to 19.1 MB, windows 21.2 to 12.2 MB, but the image's encoded_bytes 74.3
+    to 295.6 MB. The 263.9 MB in no family was A-930's committed-piece copies, counted as encoding (test scale: the
+    Aways red's 600 cuts encoded 160,860 bytes and copied 5,326,728).
+  - LANDED ca78de951 (0df761bc4): encoded_bytes is encoding plus split reads again; copied_bytes and page_bytes are new;
+    what_holds prints every vcs_store.image.* row. Focused tests: 49 passed.
+  - Waiting on main: the 57k rerun with these counters, then its ruling: (a) carry a piece in parts, which takes the
+    copy out, or (b) fewer cuts, its guess. Then the make_chain keep rows (36.0 MB live after the push, texts.rs:1607).
