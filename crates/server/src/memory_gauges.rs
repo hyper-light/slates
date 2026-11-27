@@ -21,8 +21,9 @@
 //!   runs a purge left resident for being shorter than the discard size. A content object resident past what the arena
 //!   holds is told apart by them: frees not yet purged (an idle pass not yet run), short runs kept, or frees deferred.
 //! - `store.text_cache_*`: the store owner's text cache as the owner took this shard's last read of it, its chunks'
-//!   reserved bytes, its bound, and the walks in flight that hold the bound up with their texts' bytes
-//!   (`slates_store::owner::text_cache_seen`): a read left part-way is a walk until it ends or more walks evict it.
+//!   reserved bytes, its bound, the walks in flight that hold the bound up with their texts' bytes, and its index's
+//!   bytes (`slates_store::owner::text_cache_seen`): a read left part-way is a walk until it ends or more walks evict
+//!   it.
 //! - `process.*` (the control shard alone, the process's figures once): the system allocator's live bytes and the bytes
 //!   it ever allocated (its churn), and the
 //!   mapped blocks live and their resident bytes (`slates_mem::large::heap`). A resident set past the live bytes and
@@ -99,15 +100,17 @@ pub(crate) fn rows(state: &ShardState, memory: bool) -> Vec<RefusalCount> {
 }
 
 /// The store owner's text cache as the owner took this shard's last read of it (`slates_store::owner::text_cache_seen`):
-/// its chunks' reserved bytes, its bound, and the walks in flight that hold the bound up, with their texts' bytes (goal
-/// 93, main's ruling of 2026-11-25: after hg's 57k push the cache's chunks held 32 MB live and nothing said why).
-fn text_cache_rows() -> [(&'static str, u64); 4] {
+/// its chunks' reserved bytes, its bound, the walks in flight that hold the bound up, with their texts' bytes (goal 93,
+/// main's ruling of 2026-11-25: after hg's 57k push the cache's chunks held 32 MB live and nothing said why), and its
+/// index's bytes (main's 57k rerun at c207c9f81: about 46.8 MB of it live with the chunks at their 1 MiB bound).
+fn text_cache_rows() -> [(&'static str, u64); 5] {
   let seen = slates_store::owner::text_cache_seen();
   [
     ("mem.gauge.store.text_cache_reserved_bytes", seen.reserved),
     ("mem.gauge.store.text_cache_bound_bytes", seen.bound),
     ("mem.gauge.store.text_cache_walks", seen.walks),
     ("mem.gauge.store.text_cache_walk_bytes", seen.walk_bytes),
+    ("mem.gauge.store.text_cache_index_bytes", seen.index),
   ]
 }
 
