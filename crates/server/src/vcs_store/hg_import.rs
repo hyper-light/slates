@@ -1299,6 +1299,9 @@ pub(crate) struct SegmentInFlight {
   began: u64,
   /// Its bytes by section, counted once it lands.
   sections: crate::repository::hg_run::SectionBytes,
+  /// DIAG (w-interop, never main): the import's yields beside it while it was in flight, and when its answer was first
+  /// seen ready.
+  diag_yields: u32,
 }
 
 /// Repository `id`'s next segment cut and not yet handed to the store, its payload made into chunks a turn's steps at a
@@ -1328,6 +1331,7 @@ async fn landing_begun(id: RepositoryId) -> Option<Result<Option<SegmentInFlight
     began: slates_rt::futures::now_ns(),
     sections: crate::repository::hg_run::section_bytes(&parts),
     answer: Box::pin(async move { disk.land(header, parts).await.is_ok() }),
+    diag_yields: 0,
   })))
 }
 
@@ -1339,6 +1343,10 @@ fn landing_settled(
   (landed, waited): (bool, Option<u64>),
 ) -> Option<Result<(), ImportFailed>> {
   let took = slates_rt::futures::now_ns().saturating_sub(landing.began);
+  eprintln!(
+    "DIAG-LANDING seq={} took_ns={took} waited_ns={waited:?} yields_beside={}",
+    landing.sequence, landing.diag_yields
+  );
   crate::state::with_state(|state| {
     state.count(SEGMENT_LAND_NS, took);
     match waited {
@@ -1385,7 +1393,10 @@ async fn yielded_beside(
     (slates_rt::futures::Either::First(landed), Some(landing)) => {
       landing_settled(id, &landing, (landed, None))
     }
-    (_, taken) => {
+    (_, mut taken) => {
+      if let Some(landing) = taken.as_mut() {
+        landing.diag_yields = landing.diag_yields.saturating_add(1);
+      }
       *flight = taken;
       Some(Ok(()))
     }
