@@ -871,3 +871,10 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     tree sha1:ad92c4a1 vs sha1:892a5d84 with the old short hash. Bug record and GAPS (live whole builds OPEN; the
     stop's owed publication OPEN by reading, patch in ~/.local/state/w-perf/patches).
   - Next: folding proptest (StateLogs mark toggle), then the arm64 idle_sweep, then the cadence re-land.
+- 2026-11-27 15:02  (ce47f3dcc's commit time; written 2026-11-27 15:11 PST):
+  - LANDED ce47f3dcc (43a8563a2): the held-delta fold's proptest. StateLogs' change mark toggled at a let-go, so a
+    part the checkpoint carried, let go, held again at its position and let go again kept its piece. The mark now
+    records whether the last publication carried the position. Test seeded (daemon.proptest-regressions). Told
+    w-shared (slates-work-fb) to merge it into (C); the generator's floor start is theirs with (C).
+  - Next: the arm64 idle_sweep red (a_pass_cut_short_at_each_start_settles_in_that_pass_at_the_shards_idle_points),
+    then the cadence re-land, then a red for the live whole builds' let-go sibling.
