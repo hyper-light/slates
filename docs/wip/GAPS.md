@@ -372,11 +372,14 @@
 >     adopted a's green with a candidate's death though a lives and its fencing epoch never moved; a's records were
 >     then refused `Unauthorized` (89 to 386 a run) and its repository's `main` left a. The owed-part scene forms afresh
 >     where it happens (`adopted_elsewhere_of`); A919's owner-restart test stays ignored for it. Not yet understood.
->   - **OPEN, found 2026-11-26 (w-shared):** `a921_a_warm_restarted_node_never_names_a_false_death_victim_its_old_volumes_owner`
->     fails 3 of 3 on main past 03c736286 (green when A-921 part 2 landed): the warm-restarted stranger's direct route
->     names a (`named a true`, claims 0), while its status is served. It fails alike with A-921 part 3's runtime changes
->     turned off, so it is not that change: something on main since moved the creator skip's case. Owner: w-shared,
->     after (2).
+>   - **KNOWN LIMIT (main 01a20182's ruling of 2026-11-27): a forward's first try may go to a readmitted creator.**
+>     A readmission drops the host's completed takeover (`RegionalConfiguration::admit`, A-309) and its retirement is
+>     gone once that completes, so A-921 part 2's creator skip has nothing to read for it: a node that has not yet
+>     learned an object's adopter offers the readmitted creator first. It costs a redirect, never a wrong answer. The
+>     warm-restart scene (`a921_a_warm_restarted_node_serves_a_false_death_victims_old_volume`) asserts the status
+>     served and records the naming (3 of 3 named a on main past 03c736286; no regression: the order of a's eligibility
+>     and the restarted node's routing). Closing it needs a fact kept past A-309's removal (the creator's id counter at
+>     its readmission, or a record for this use only): a design change of its own.
 >   - **FIXED, its prerequisite (A-925):** each node announces its own edges (git HTTP or HTTPS, SSH) to its peers over
 >     stream 33, as a client reaches them, held only from its own authenticated session; an owner of no learned edge is
 >     the typed refusal naming its member id.

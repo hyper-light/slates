@@ -1302,7 +1302,7 @@ pub(crate) const CREATE_SLICES: &str = "repository.push.create_slices";
 /// Mercurial line owes its push (P2). Format: a counter name in the daemon's status report.
 pub(crate) const ENTRY_VERSIONS_BYTES_MOST: &str = "repository.push.entry_versions_bytes_most";
 
-/// Counter: a slice of a push's updates judged ahead of its landing's step ([`PreparedUpdates::prepare_some`]): more than
+/// Counter: a slice of a push's updates judged ahead of its landing's step (`PreparedUpdates::prepare_some`): more than
 /// one a push shows its moved lines' works were judged a slice at a time (goal 93, the landing spin's owed (1)). Format:
 /// a counter name in the daemon's status report.
 pub(crate) const UPDATE_SLICES: &str = "repository.push.update_slices";
