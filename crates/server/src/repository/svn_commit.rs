@@ -688,7 +688,7 @@ pub(crate) async fn section_yield() -> Option<()> {
 /// stored ([`take_texts`]), put through repository `repository`'s content store a copy slice a step, as a client's
 /// commit's are, so its changeset carries them as Payload with Texts rows and the records keep none in RAM; and the
 /// texts an import's sink put already, `imported`, each holding one count of the store (`vcs_store::svn_import::texts`),
-/// taken as put ([`hand_over`]). What was put, held until the landing ends ([`release_stored`]), and what the changeset
+/// taken as put (`hand_over`). What was put, held until the landing ends ([`release_stored`]), and what the changeset
 /// carries. None where the shard's state is gone; refused with what was put given back, `imported` too.
 async fn stage_texts(
   repository: RepositoryId,

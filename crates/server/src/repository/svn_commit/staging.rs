@@ -782,7 +782,7 @@ fn build_some_in(
 }
 
 /// Whether a build step's slice is spent ([`build_some_in`]): `by_clock`, but in the tests that take every build a unit a
-/// step or whole ([`BUILD_SPENT`]).
+/// step or whole (`BUILD_SPENT`).
 fn build_spent(by_clock: bool) -> bool {
   #[cfg(test)]
   {
@@ -1292,7 +1292,7 @@ impl Staging {
   /// (its texts in the content store, and again in its increment's post-state). An empty batch never flushes, so a
   /// revision past the bound alone is one batch.
   /// Whether the texts the batch carries and `revision`'s would pass the batch's bound ([`texts_bound`]); never in a
-  /// test that unbounds them ([`TEXTS_UNBOUNDED`]).
+  /// test that unbounds them (`TEXTS_UNBOUNDED`).
   fn texts_past_bound(&self, revision: &Revision) -> bool {
     #[cfg(test)]
     if TEXTS_UNBOUNDED.with(std::cell::Cell::get) {
