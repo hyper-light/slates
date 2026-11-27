@@ -219,19 +219,22 @@ pub fn homed_run_of(bytes: &[u8]) -> Option<HomedRun> {
 
 /// Format: a segment list's magic, "SHGL" (a slates Mercurial list) little-endian ([`write_segment_list`]).
 const LIST_MAGIC: u32 = u32::from_le_bytes(*b"SHGL");
-/// Format: the segment list's version.
-const LIST_VERSION: u32 = 1;
-/// Format: one segment's entry in a segment list: its sequence, then its `Record`'s identity and length, then its
-/// `Payload`'s, each long little-endian.
+/// Format: the segment list's version: 2 names each segment's `Texts` beside its `Record` and `Payload` (main 01a20182's
+/// ruling on ruling R's piece (ii), 2026-11-26: the segment homed as it landed); version 1, without it, is no longer read.
+const LIST_VERSION: u32 = 2;
+/// Format: one segment's entry in a segment list: its sequence, then its `Record`'s identity and length, its
+/// `Payload`'s, and its `Texts`', each long little-endian: 128 bytes.
 const SEGMENT_ENTRY_BYTES: usize = LONG_BYTES
+  + slates_vcs::content::IDENTITY_BYTES
+  + LONG_BYTES
   + slates_vcs::content::IDENTITY_BYTES
   + LONG_BYTES
   + slates_vcs::content::IDENTITY_BYTES
   + LONG_BYTES;
 
 /// One segment changeset of a push's run as its segment list names it ([`write_segment_list`]): its sequence, and its
-/// `Record` and `Payload` sections each by identity (the plain BLAKE3 of its bytes, the key the node's store and the
-/// region's homes keep it under) and length. Its `Texts` is named by neither: it is derived, as a node lands the segment.
+/// `Record`, `Payload` and `Texts` sections each by identity (the plain BLAKE3 of its bytes, the key the node's store and
+/// the region's homes keep it under) and length, so a node that has not landed it lands the owner's segment verbatim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentEntry {
   /// The changeset's sequence in its repository.
@@ -240,6 +243,8 @@ pub struct SegmentEntry {
   pub record: ([u8; 32], u64),
   /// Its `Payload`'s identity and length.
   pub payload: ([u8; 32], u64),
+  /// Its `Texts`' identity and length.
+  pub texts: ([u8; 32], u64),
 }
 
 /// A push's segment list (ruling R: one homed object naming its segments, so the register's record stays O(1)): the
@@ -270,6 +275,8 @@ pub fn write_segment_list(entries: &[SegmentEntry]) -> Option<Vec<u8>> {
     out.extend_from_slice(&entry.record.1.to_le_bytes());
     out.extend_from_slice(&entry.payload.0);
     out.extend_from_slice(&entry.payload.1.to_le_bytes());
+    out.extend_from_slice(&entry.texts.0);
+    out.extend_from_slice(&entry.texts.1.to_le_bytes());
   }
   Some(out)
 }
@@ -294,6 +301,7 @@ pub fn segment_list_of(bytes: &[u8]) -> Option<Vec<SegmentEntry>> {
     let sequence = reader.long().ok()?;
     let record = (identity(&mut reader)?, reader.long().ok()?);
     let payload = (identity(&mut reader)?, reader.long().ok()?);
+    let texts = (identity(&mut reader)?, reader.long().ok()?);
     if entries
       .last()
       .is_some_and(|before: &SegmentEntry| before.sequence >= sequence)
@@ -304,6 +312,7 @@ pub fn segment_list_of(bytes: &[u8]) -> Option<Vec<SegmentEntry>> {
       sequence,
       record,
       payload,
+      texts,
     });
   }
   Some(entries)

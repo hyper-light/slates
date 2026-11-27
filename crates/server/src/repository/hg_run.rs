@@ -17,15 +17,17 @@
 //! exactly the sequences the list names, each record's rows by node over the index as it stands then, so a segment cut
 //! before another push's entry replays where that push left the index.
 //!
-//! **Homed** (main 01a20182's ruling R of 2026-11-26, with its corrections: the changeset homed through git's path and
-//! A-727's barrier, never each named text). Each segment's `Record` and `Payload` are put whole in the origin's content
-//! store, their buffers dropped ([`segment_held`]), and each homed in the region at `f + 1` by its identity for the
-//! push's attempt ([`homed_for`], `homes::home_in_region`: a home answers only once its image holding it is published);
-//! then the segment lands from the content store a piece at a time ([`HeldSegment::landed`]), and each section is let go
-//! at its home as a landed git pack is (`Landed::Pack`: the store keys both sections by identity, `SectionKind::keyed`,
-//! so a home's read brings them back by `disk.piece`). Its `Texts` is not homed: it is the index derived from them, which
-//! a node landing a fetched segment derives. At the entry, the segment list (each segment's sequence and its two sections
-//! by identity and length) is homed and landed as a changeset of its own, then let go the same way ([`list_landed`]), and
+//! **Homed** (main 01a20182's ruling R of 2026-11-26, with its corrections and its ruling on piece (ii): the changeset
+//! homed through git's path and A-727's barrier, as it landed, never each named text). Each segment's `Record`, `Payload`
+//! and `Texts` are put whole in the origin's content store, their buffers dropped ([`segment_held`]), and each homed in
+//! the region at `f + 1` by its identity for the push's attempt ([`homed_for`], `homes::home_in_region`: a home answers
+//! only once its image holding it is published); then the segment lands from the content store a piece at a time
+//! ([`HeldSegment::landed`]), and each section is let go at its home as a landed git pack is (`Landed::Pack`: the store
+//! keys all three by identity, `SectionKind::keyed`, so a home's read brings them back by `disk.piece`). `Texts` is homed
+//! too, not derived where it lands: it is the intake's index (each revision's text identity, base and chunk's place),
+//! which the `Record` alone does not give, so one producer makes it and a holder lands the owner's segment verbatim
+//! (`vcs_store::homed_run_on_store`). At the entry, the segment list (each segment's sequence and its three sections by
+//! identity and length) is homed and landed as a changeset of its own, then let go the same way ([`list_landed`]), and
 //! the register's record names the list alone, O(1) whatever the history. A homing short of `f + 1` within its budget
 //! refuses the push in slates' words that it was not made durable (`hg_push`'s `HOMED_SHORT`), nothing of it recorded,
 //! its attempt's holds let go at every home (A-727 (d1a)); committed, they move to the repository's records. Readers see only what an entry names: the
@@ -581,10 +583,10 @@ async fn parked(repository: RepositoryId) -> Option<Result<Turn, Vec<u8>>> {
   turn.flatten()
 }
 
-/// A push's segment changeset put whole in the origin shard's content store, its `Record` and its `Payload` each by its
-/// identity and length (ruling R: each homed in the region by identity before the segment lands, its buffers dropped
-/// once put, so at most one segment is held twice, briefly; main 01a20182's condition of 2026-11-26), its `Texts` the
-/// index derived from them, and the header at its repository's next sequence. Landed a piece at a time from the content
+/// A push's segment changeset put whole in the origin shard's content store, its `Record`, `Payload` and `Texts` each by
+/// its identity and length (ruling R: each homed in the region by identity before the segment lands, its buffers dropped
+/// once put, so at most one segment is held twice, briefly; main 01a20182's condition of 2026-11-26), and the header at
+/// its repository's next sequence. Landed a piece at a time from the content
 /// store ([`HeldSegment::landed`]), then given back ([`HeldSegment::given_back`]).
 #[derive(Debug)]
 pub(crate) struct HeldSegment {
@@ -596,17 +598,22 @@ pub(crate) struct HeldSegment {
   pub(crate) record: (slates_vcs::ContentId, u64),
   /// Its `Payload`, held whole on the origin: its identity and length.
   pub(crate) payload: (slates_vcs::ContentId, u64),
-  /// Its `Texts` section's bytes.
-  texts: Vec<u8>,
+  /// Its `Texts`, held whole on the origin: its identity and length.
+  pub(crate) texts: (slates_vcs::ContentId, u64),
 }
 
 impl HeldSegment {
   /// Its bytes by section, for [`count_landed`].
   pub(crate) fn section_bytes(&self) -> SectionBytes {
+    [self.record.1, self.payload.1, self.texts.1]
+  }
+
+  /// Its three sections, each by identity and length, in the order it lands them.
+  pub(crate) fn sections(&self) -> [(SectionKind, (slates_vcs::ContentId, u64)); 3] {
     [
-      self.record.1,
-      self.payload.1,
-      u64::try_from(self.texts.len()).unwrap_or(u64::MAX),
+      (SectionKind::Record, self.record),
+      (SectionKind::Payload, self.payload),
+      (SectionKind::Texts, self.texts),
     ]
   }
 
@@ -616,13 +623,14 @@ impl HeldSegment {
       sequence: self.header.sequence,
       record: (self.record.0.0, self.record.1),
       payload: (self.payload.0.0, self.payload.1),
+      texts: (self.texts.0.0, self.texts.1),
     }
   }
 
-  /// Lands it on the node's store through the store's sliced landing: its `Record` and its `Payload` a piece at a time
+  /// Lands it on the node's store through the store's sliced landing: each section a piece at a time
   /// (`slates_store::store::PIECE_BYTES`) read from the origin's content store into one buffer each part hands back, as
-  /// git's push lands its pack (`git_push::landed_in_pieces`), then its `Texts`; committed, answered once durable. A
-  /// piece the content store no longer holds refuses it (`StoreError::NotStaged`).
+  /// git's push lands its pack (`git_push::landed_in_pieces`); committed, answered once durable. A piece the content store
+  /// no longer holds refuses it (`StoreError::NotStaged`).
   pub(crate) async fn landed(
     &self,
   ) -> Result<slates_store::log::Located, slates_store::owner::OwnerError> {
@@ -631,10 +639,7 @@ impl HeldSegment {
     header.sections = 3;
     let mut open = self.disk.begin(header).await?;
     let mut buffer = Vec::with_capacity(PIECE_BYTES);
-    for (kind, (identity, len)) in [
-      (SectionKind::Record, self.record),
-      (SectionKind::Payload, self.payload),
-    ] {
+    for (kind, (identity, len)) in self.sections() {
       open.section(kind, len).await?;
       let mut at = 0u64;
       while at < len {
@@ -656,26 +661,15 @@ impl HeldSegment {
         buffer = open.part(buffer).await?;
       }
     }
-    open
-      .section(
-        SectionKind::Texts,
-        u64::try_from(self.texts.len()).unwrap_or(u64::MAX),
-      )
-      .await?;
-    for piece in self.texts.chunks(PIECE_BYTES) {
-      buffer.clear();
-      buffer.extend_from_slice(piece);
-      buffer = open.part(buffer).await?;
-    }
     open.commit().await
   }
 
-  /// Gives back the origin's holds of its `Record` and `Payload` (`vcs_store::put_names`'). Landed (`landed`), each is
+  /// Gives back the origin's holds of its sections (`vcs_store::put_names`'). Landed (`landed`), each is
   /// let go first where it lies on the node's store ([`crate::vcs_store::let_go_landed_pack_among`]): its home among
   /// `shards`, told, records where its windows lie and lets its copy go, brought back by `disk.piece` on a read, as a
   /// landed git pack is; its region hold stays, the attempt's until the entry commits.
   pub(crate) fn given_back(&self, state: &mut ShardState, (landed, shards): (bool, &[u16])) {
-    for (identity, _) in [self.record, self.payload] {
+    for (_, (identity, _)) in self.sections() {
       if landed {
         crate::vcs_store::let_go_landed_pack_among(state, &identity, shards);
       }
@@ -685,9 +679,9 @@ impl HeldSegment {
 }
 
 /// `segment` of a push to `repository` held for its landing ([`HeldSegment`]): its `Record` `written` (by `hg_push`'s
-/// record turns over the intake's fork, a turn's steps at a time) and its `Payload` its kept revisions' deltas as stock's
-/// revlog chunks (`chunks`, made a step at a time; goal 93, main's ruling (b)) each put whole in the content store, both
-/// buffers dropped here; its `Texts` the index naming each revision held as a chunk there; its sequence the repository's
+/// record turns over the intake's fork, a turn's steps at a time), its `Payload` its kept revisions' deltas as stock's
+/// revlog chunks (`chunks`, made a step at a time; goal 93, main's ruling (b)) and its `Texts` the index naming each
+/// revision held as a chunk there, each put whole in the content store, the buffers dropped here; its sequence the repository's
 /// next, its owner shard's to allocate (module docs). None where the node holds no store; refused where the chunks are
 /// not one a kept revision, or the content store refused a put.
 pub(crate) fn segment_held(
@@ -711,9 +705,15 @@ pub(crate) fn segment_held(
     return Some(Err(record::WriteRefused::Allocation));
   };
   let texts = texts_section(&segment.texts, (payload.0, Some(&places)));
-  let Some(sequence) = state.vcs_stores.next_changeset(repository) else {
+  let Some(texts_held) = crate::vcs_store::put_names(state, &texts) else {
     crate::vcs_store::release_names(state, &record);
     crate::vcs_store::release_names(state, &payload);
+    return Some(Err(record::WriteRefused::Allocation));
+  };
+  let Some(sequence) = state.vcs_stores.next_changeset(repository) else {
+    for put in [record, payload, texts_held] {
+      crate::vcs_store::release_names(state, &put);
+    }
     return None;
   };
   let header = Header {
@@ -731,7 +731,7 @@ pub(crate) fn segment_held(
     header,
     record: (record, length(&written)),
     payload: (payload, length(&chunks)),
-    texts,
+    texts: (texts_held, length(&texts)),
   }))
 }
 

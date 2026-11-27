@@ -2088,8 +2088,11 @@
 > homed list (record v12, v11 withdrawn), a homing short refusing the push with nothing recorded
 > (`a_push_whose_changeset_is_not_durable_at_its_homes_is_refused_and_records_nothing`). CLOSED the same day: its
 > settles, one region exchange an object in an unbounded queue, now one batched settle an attempt (home wire 0x86) in a
-> queue bounded with the attempts in flight (`homes::settle_bound`, refused typed at it). OPEN: (ii) a holder fetching
-> the segments by identity and its recompute accepted with the owner's identity, with svn's holder red and an
+> queue bounded with the attempts in flight (`homes::settle_bound`, refused typed at it). (ii)'s first half BUILT the
+> same day: the segment homed as it landed (`Texts` with `Record` and `Payload`, list v2), and a rebuild lands the
+> segments its store lacks from the region verbatim at the owner's sequences
+> (`a_holders_run_lands_the_owners_segments_byte_for_byte_by_identity`). OPEN: (ii)'s rest: the holder's recompute
+> accepted with the owner's identity, with svn's holder red and an
 > `#[ignore]`d fleet-takeover CLI test for Mercurial, which no test drives yet; then an import's run (v9) and a single
 > changeset (v7) homed the same way.
 > Found and closed (main's order of 2026-11-24 08:55, ahead of P5): a pushed repository was not made again after a
