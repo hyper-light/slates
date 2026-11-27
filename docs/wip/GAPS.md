@@ -369,7 +369,9 @@
 >     `LOOK_MOST`), not a pace, nor the shard's overall overrun and a look timed beforehand, which main's 9 runs found
 >     short by 9 to 110 us under load (after: 0.15 ms past the pass's budget; main's runs 9 to 110 us). The lookup's
 >     test asserts the lookup's own time (`ELAPSED_MOST`, before its first look to its answer), not the test task's
->     resume after it, which main's next 9 found 2.6 to 6.2 us past.
+>     resume after it, which main's next 9 found 2.6 to 6.2 us past; and adds its thread's time off a CPU between its
+>     last wait's return and its answer (`PREEMPTED_MOST`: that stretch's wall time less the thread's CPU time), which
+>     main's 16 under burners found 1.2 and 3.9 us past the rest.
 >   - **OPEN, waits for Ada's word: fleet-wide repository name routing.** A node holding no copy of a repository answers
 >     `404` (the fleet test: the third node's `ls-remote` "not found"): a name resolves only where a partition holds it
 >     (D-12, no directory; D-14, no global catalog), so it cannot even form the owner's query. Not started.
@@ -514,15 +516,17 @@
 > - **B1 BUILT (w-git, 2026-11-26): the push's quarantine reads.** A thin pack's REF_DELTA against the repository's
 >   object is read back through its base's window (`Push::bytes`, `IndexBases`); let go, the read answered none with
 >   nothing noted, and the connectivity check took the object as unreadable: `missing necessary objects`. Now the
->   quarantine notes the window (`PackedRefused::Away`, on the repository for the driver and as
->   `Contents::content_away` for the reader), and the walk stops its turn there in either pass; its second pass took an
->   unread object's edges as none before, which could leave a tip `Complete`, and now takes it as `Missing`. Red:
->   `git_push::tests::b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands` (the base's window let go
->   once the pack is read and its checks are due). The A-753 resend path cannot miss now: a resent object is read from
->   the push's own pack (A-864's noted entry). The fsck stage's read is reached by no push (a session's fsck is made
->   as each object is kept, from its bytes), so it keeps its refusal. Its failures under load (main's 4 of 4 at
->   b95e9ddb1, then 3 of 16 at the diagnostic branch agents/w-git-b1-debug, 884538b14) had two causes, each named by
->   main's lines and fixed red first:
+>   quarantine notes the window (`PackedRefused::Away`, on the repository for the driver and as `Contents::content_away`
+>   for the reader), and the walk stops its turn there in either pass; its second pass took an unread object's edges as
+>   none before, which could leave a tip `Complete`, and now takes it as `Missing`. Red:
+>   `git_push::tests::b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands` (the base's window let go once
+>   the pack is read and its checks are due). The forced interleaving's stand-in reader asks again where the node's
+>   store did not answer within the read-through's patience, as the drivers do (main's run 10 of 16 under 12 burners:
+>   `Unanswered`), its asks bounded by the test's patience over it. The A-753 resend path cannot miss now: a resent
+>   object is read from the push's own pack (A-864's noted entry). The fsck stage's read is reached by no push (a
+>   session's fsck is made as each object is kept, from its bytes), so it keeps its refusal. Its failures under load
+>   (main's 4 of 4 at b95e9ddb1, then 3 of 16 at the diagnostic branch agents/w-git-b1-debug, 884538b14) had two causes,
+>   each named by main's lines and fixed red first:
 >   - a stop ends the check's whole turn (`Walk::stopped`; `Checking::unit` and `Checking::turn` return not done).
 >     The check's own turn loop took the walk again at once after its stop, while its quantum was unspent, and the
 >     same let-go met twice with nothing brought back refused the object (`receive::tests::session::

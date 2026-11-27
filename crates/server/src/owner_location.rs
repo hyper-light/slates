@@ -709,11 +709,20 @@ pub(crate) fn home_query(state: &ShardState, object: ObjectId) -> Query {
 /// the same on the forward lane). The operator's failover SLO caps the whole on the wall.
 pub(crate) async fn locate_owner(query: Query, bound_ns: Option<u64>) -> Option<HostId> {
   let began = slates_rt::futures::now_ns();
-  let located = locate_within_horizon(query, bound_ns).await;
+  let mut resumed = Resumed::now();
+  let located = locate_within_horizon(query, bound_ns, &mut resumed).await;
   // Its own time, from before its first look to its answer in the poll that made it (A-921 part 2: what a bounded
-  // caller's lane is held for, apart from any task's resume after it).
-  let elapsed = slates_rt::futures::now_ns().saturating_sub(began);
-  crate::state::with_state(|state| state.count_max(ELAPSED_MOST, elapsed));
+  // caller's lane is held for, apart from any task's resume after it), and what of it since its last wait returned its
+  // thread spent off a CPU (pre-empted): the wall time less the thread's CPU time over that stretch.
+  let now = slates_rt::futures::now_ns();
+  let elapsed = now.saturating_sub(began);
+  let preempted = now
+    .saturating_sub(resumed.wall_ns)
+    .saturating_sub(thread_cpu_ns().saturating_sub(resumed.cpu_ns));
+  crate::state::with_state(|state| {
+    state.count_max(ELAPSED_MOST, elapsed);
+    state.count_max(PREEMPTED_MOST, preempted);
+  });
   if located.is_none() {
     // Counted here, so any way the location gives up is seen; its budget's own two ends are counted within it.
     crate::state::with_state(|state| state.count(LOCATION_GAVE_UP, 1));
@@ -726,7 +735,11 @@ pub(crate) async fn locate_owner(query: Query, bound_ns: Option<u64>) -> Option<
 /// horizon has found none, or the failover SLO has passed. Each round asks under the root this node holds at its look
 /// (`owner_location::Query::under_held_root`, A-504), so a newer root a peer's refusal sent its learner to fetch is the
 /// view the next round asks under; before, every round asked under the root the lookup began with.
-async fn locate_within_horizon(query: Query, bound_ns: Option<u64>) -> Option<HostId> {
+async fn locate_within_horizon(
+  query: Query,
+  bound_ns: Option<u64>,
+  resumed: &mut Resumed,
+) -> Option<HostId> {
   let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
   let began = slates_rt::futures::now_ns();
   let horizon = crate::lease::horizon_ns();
@@ -772,7 +785,8 @@ async fn locate_within_horizon(query: Query, bound_ns: Option<u64>) -> Option<Ho
       return None;
     }
     // How late the wait came back to this task past its deadline: the timer's lateness and the task's resume.
-    let late = slates_rt::futures::now_ns().saturating_sub(now.saturating_add(wait));
+    *resumed = Resumed::now();
+    let late = resumed.wall_ns.saturating_sub(now.saturating_add(wait));
     crate::state::with_state(|state| state.count_max(WAIT_LATE_MOST, late));
     crate::state::with_state(|state| state.count("fleet.owner_location.retried", 1));
   }
@@ -790,6 +804,37 @@ pub(crate) const WAIT_LATE_MOST: &str = "fleet.owner_location.wait_late_most_ns"
 /// made it, in nanoseconds ([`locate_owner`]): a bounded caller's is within its bound, [`WAIT_LATE_MOST`] and
 /// [`LOOK_MOST`] (A-921 part 2). Format: a counter name, read as the most it reached ([`ShardState::count_max`]).
 pub(crate) const ELAPSED_MOST: &str = "fleet.owner_location.elapsed_most_ns";
+
+/// Counter: the most an owner location's thread spent off a CPU between its last wait's return and its answer on this
+/// shard, in nanoseconds: that stretch's wall time less the thread's CPU time over it ([`locate_owner`]), what no look
+/// and no wait's lateness covers (A-921 part 2: 1.2 and 3.9 us past those two under main's burners). Format: a counter
+/// name, read as the most it reached ([`ShardState::count_max`]).
+pub(crate) const PREEMPTED_MOST: &str = "fleet.owner_location.preempted_most_ns";
+
+/// Where an owner location last resumed: its start, or its last wait's return ([`locate_owner`]'s pre-emption).
+#[derive(Clone, Copy)]
+struct Resumed {
+  /// The wall clock then, nanoseconds.
+  wall_ns: u64,
+  /// The thread's CPU clock then, nanoseconds ([`thread_cpu_ns`]).
+  cpu_ns: u64,
+}
+
+impl Resumed {
+  /// Both clocks now.
+  fn now() -> Self {
+    Self {
+      wall_ns: slates_rt::futures::now_ns(),
+      cpu_ns: thread_cpu_ns(),
+    }
+  }
+}
+
+/// The calling thread's CPU time in nanoseconds (`slates_rt::registry::calling_thread_cpu`); 0 where the platform reads
+/// none, so a stretch's pre-emption reads as its whole wall time, never less than it was.
+fn thread_cpu_ns() -> u64 {
+  slates_rt::registry::calling_thread_cpu().map_or(0, |reading| reading.spent_ns)
+}
 
 /// Counter: a forward's owner location ended by the operator's failover SLO, the owner still not found.
 const LOCATION_SLO_ENDED: &str = "fleet.owner_location.slo_ended";
@@ -1297,7 +1342,10 @@ mod tests {
         let found = locate_owner(query, Some(bound)).await;
         let held = crate::state::with_state(|state| {
           let most = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
-          (most(ELAPSED_MOST), most(WAIT_LATE_MOST), most(LOOK_MOST))
+          (
+            most(ELAPSED_MOST),
+            (most(WAIT_LATE_MOST), most(LOOK_MOST), most(PREEMPTED_MOST)),
+          )
         });
         let _ = sent.send((found, bound, held));
       })
@@ -1306,12 +1354,16 @@ mod tests {
     });
     let (found, bound, held) = got.recv().expect("the lookup ended");
     daemon.stop();
-    let (took, late, look) = held.expect("the shard's state");
+    let (took, (late, look, preempted)) = held.expect("the shard's state");
     assert_eq!(found, None, "no node holds the object");
     assert!(
-      took <= bound.saturating_add(late).saturating_add(look),
-      "the lookup ended within its bound ({bound} ns), its waits' lateness ({late} ns) and its longest look ({look} \
-       ns): {took} ns"
+      took
+        <= bound
+          .saturating_add(late)
+          .saturating_add(look)
+          .saturating_add(preempted),
+      "the lookup ended within its bound ({bound} ns), its waits' lateness ({late} ns), its longest look ({look} ns) \
+       and its thread's pre-emption after its last wait ({preempted} ns): {took} ns"
     );
   }
 }

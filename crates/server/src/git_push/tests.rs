@@ -2184,6 +2184,32 @@ async fn meddled_at_a_stop(
   true
 }
 
+/// `waited` brought back as the product's drivers bring a window back: asked again where the node's store did not
+/// answer within the read-through's patience (`ReadThroughRefused::Unanswered`, a load's legitimate answer: main's run
+/// 10 of 16 under 12 burners), at most as many asks as the test's own patience holds of it ([`HISTORY_PATIENCE`] over
+/// `read_through::PATIENCE_NS`). The last answer, and how many asks it took.
+async fn brought_back_asking_again(
+  waited: slates_git::store::packed::Waited,
+) -> (
+  Result<Option<(slates_vcs::ContentId, u64)>, crate::vcs_store::read_through::ReadThroughRefused>,
+  u64,
+) {
+  let patience = u64::try_from(HISTORY_PATIENCE.as_nanos()).unwrap_or(u64::MAX);
+  let most = (patience / crate::vcs_store::read_through::PATIENCE_NS.max(1)).max(1);
+  let mut asks = 0u64;
+  loop {
+    asks += 1;
+    let brought = crate::vcs_store::read_through::bring_back_window(waited).await;
+    let unanswered = matches!(
+      brought,
+      Err(crate::vcs_store::read_through::ReadThroughRefused::Unanswered { .. })
+    );
+    if !unanswered || asks >= most {
+      return (brought, asks);
+    }
+  }
+}
+
 /// The interleaving a concurrent reader makes (a derivation, which lets go at its end the windows it brought back),
 /// forced: `waited`, the window the push's step met and noted, is brought back by another reader first
 /// (`read_through::bring_back_window`); the push's driver then finds it back and brings nothing
@@ -2193,9 +2219,9 @@ async fn another_reader_brings_back_and_lets_go(
   repository: RepositoryId,
   waited: slates_git::store::packed::Waited,
 ) {
-  let brought = crate::vcs_store::read_through::bring_back_window(waited).await;
+  let (brought, asks) = brought_back_asking_again(waited).await;
   let Ok(Some((window, _))) = brought else {
-    panic!("the other reader brought the window back: {brought:?}");
+    panic!("the other reader brought the window back, in {asks} asks: {brought:?}");
   };
   driven_bring_back(push, repository).await;
   let let_go = on_state(|state| {
