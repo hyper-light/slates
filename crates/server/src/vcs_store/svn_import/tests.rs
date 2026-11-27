@@ -1218,6 +1218,8 @@ struct WideCounts {
   hold_steps: u64,
   /// The steps of the green's fold to its readers' floor (`svn_commit::FOLD_STEPS`, 11a).
   fold_steps: u64,
+  /// The steps of the walk of the texts the changeset carries (`svn_commit::CARRIED_STEPS`, 11c).
+  carried_steps: u64,
 }
 
 /// The calling shard's [`WideCounts`] now.
@@ -1237,6 +1239,7 @@ fn wide_counts() -> WideCounts {
     section_yields: on(|state| count(state, crate::repository::svn_commit::LANDING_SECTION_YIELDS)),
     hold_steps: on(|state| count(state, crate::vcs_store::name_holds::NAME_HOLD_APPLY_STEPS)),
     fold_steps: on(|state| count(state, crate::repository::svn_commit::FOLD_STEPS)),
+    carried_steps: on(|state| count(state, crate::repository::svn_commit::CARRIED_STEPS)),
   }
 }
 
@@ -1257,6 +1260,7 @@ fn wide_landing_sliced(counts: &WideCounts) {
     section_yields,
     hold_steps,
     fold_steps,
+    carried_steps,
     ..
   } = counts;
   // Non-vacuity: the landing's unpin of its 9,000 texts and its scratch member's release each ran in slices (A-920 6a:
@@ -1289,6 +1293,12 @@ fn wide_landing_sliced(counts: &WideCounts) {
   // The green's fold to its readers' floor a slice a step over the revision's 9,001 paths (A-920 11a: whole in the
   // tail's one step, 7.5-23.4 ms, debug).
   assert!(*fold_steps > 2, "the fold took {fold_steps} step(s)");
+  // The texts the changeset carries walked a text put and a row a unit over 9,000 of each (A-920 11c: whole in one
+  // step, 12.3 ms, debug).
+  assert!(
+    *carried_steps > 2,
+    "the carried texts' walk took {carried_steps} step(s)"
+  );
 }
 
 /// The import's parse, staging, apply and tail in steps (A-920 7a, goal 93 piece 3).
