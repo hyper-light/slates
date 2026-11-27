@@ -360,6 +360,7 @@ std::thread_local! {
     bound: 0,
     walks: 0,
     walk_bytes: 0,
+    index: 0,
   }) };
 }
 
