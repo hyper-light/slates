@@ -82,6 +82,16 @@ pub(crate) struct StateLogs {
   /// after the position was held again ([`StateLogs::let_go_held`]). Bounded by the parts held and let go between two
   /// publications.
   changed: BTreeMap<(ObjectId, u64), bool>,
+  /// Each log's committed floor (A-919 (C), main 01a20182's ruling of 2026-11-27 10:57): the highest position this owner
+  /// let go, every part through it held by every candidate when it went, with the chain's digest through it
+  /// (`slates_db::register::chain_digest` over each part's register value from the log's first). A ledger read's answer
+  /// from this owner carries it, so a candidate a death brought in adopts the prefix a single holder reports where its
+  /// digest matches. Kept where this owner let go a chain from the log's start: one that never held it from there (a
+  /// takeover's successor) keeps none. Rides the recovery image (`content_holder`'s floor piece), so a warm restart keeps
+  /// it; one a register this shard owns or owned, 40 bytes each.
+  floors: BTreeMap<ObjectId, slates_db::register::CommittedFloor>,
+  /// The logs whose floor rose since the last committed publication: what its next delta puts of them.
+  floors_changed: std::collections::BTreeSet<ObjectId>,
   /// The record-plane passes in a row whose parts waited because the shard's publication carrying them was refused, and
   /// that publication's refusal (A-921's second mode, main 01a20182's ruling of 2026-11-26: a held-back part never
   /// stalls in silence). Past [`held_back_bound`] passes, [`admit`] refuses the repository's next change with it.
@@ -100,11 +110,21 @@ struct OwedLog {
 }
 
 impl StateLogs {
-  /// Keeps `record` as a part of its log's register, owed to the log's candidates.
-  pub(crate) fn hold(&mut self, record: &StateLogRecord) {
+  /// Keeps `record` as a part of its log's register, owed to the log's candidates; whether it did. A part at or below the
+  /// log's committed floor is refused (A-919 (C), main 01a20182's ruling of 2026-11-27 12:52): a log's positions come
+  /// from its repository's own positions, durable and rising, so a new part never reuses a position let go, and one
+  /// that did would be held under a floor that already witnesses another value there.
+  pub(crate) fn hold(&mut self, record: &StateLogRecord) -> bool {
+    let register = record.log_name().register();
+    if self
+      .floors
+      .get(&register)
+      .is_some_and(|floor| record.to <= floor.position)
+    {
+      return false;
+    }
     let value = value_of(record);
     self.bytes = self.bytes.saturating_add(value.len());
-    let register = record.log_name().register();
     let log = self.logs.entry(register).or_default();
     let carried = log.parts.contains_key(&record.to);
     if let Some(replaced) = log.parts.insert(record.to, value) {
@@ -112,6 +132,7 @@ impl StateLogs {
     }
     // A position first marked here is carried where a part is held there unmarked: one the last publication carried.
     self.changed.entry((register, record.to)).or_insert(carried);
+    true
   }
 
   /// Puts back a part a recovered image carried (A-921's second mode, main 01a20182's ruling of 2026-11-26): owed again
@@ -179,6 +200,41 @@ impl StateLogs {
   /// Forgets the changes a committed publication carried.
   pub(crate) fn clear_changed(&mut self) {
     self.changed.clear();
+    self.floors_changed.clear();
+  }
+
+  /// `register`'s committed floor, where this owner keeps one (A-919 (C)).
+  pub(crate) fn floor(&self, register: ObjectId) -> Option<slates_db::register::CommittedFloor> {
+    self.floors.get(&register).copied()
+  }
+
+  /// Every log's committed floor: what a checkpoint of the shard's recovery image carries of them (A-919 (C)).
+  pub(crate) fn floors(
+    &self,
+  ) -> impl Iterator<Item = (ObjectId, slates_db::register::CommittedFloor)> + '_ {
+    self
+      .floors
+      .iter()
+      .map(|(register, floor)| (*register, *floor))
+  }
+
+  /// The logs whose floor rose since the last committed publication, each with its floor now.
+  pub(crate) fn floors_changed(
+    &self,
+  ) -> impl Iterator<Item = (ObjectId, slates_db::register::CommittedFloor)> + '_ {
+    self
+      .floors_changed
+      .iter()
+      .filter_map(|register| Some((*register, self.floor(*register)?)))
+  }
+
+  /// Puts back a floor a recovered image carried (A-919 (C)); the image carries it, so it is owed to no publication.
+  pub(crate) fn restore_floor(
+    &mut self,
+    register: ObjectId,
+    floor: slates_db::register::CommittedFloor,
+  ) {
+    self.floors.insert(register, floor);
   }
 
   /// Notes the greens `record`'s operation moved, each owed to its newest version the operation took it to.
@@ -239,6 +295,16 @@ impl StateLogs {
       .unwrap_or(u64::MAX);
     let kept = log.parts.split_off(&held_everywhere.saturating_add(1));
     let released: usize = log.parts.values().map(Vec::len).sum();
+    // The floor rises over the parts let go, in order, each continuing the chain from the floor (the first from the
+    // log's start); it rides the same publication as their removal, so a restored image has either the parts or the
+    // floor over them, never neither (main's guard-then-apply).
+    let floor = floor_over(self.floors.get(&register).copied(), &log.parts);
+    if floor != self.floors.get(&register).copied()
+      && let Some(floor) = floor
+    {
+      self.floors.insert(register, floor);
+      self.floors_changed.insert(register);
+    }
     // A part whose position the last committed publication did not carry was held after it, so none carried it: its mark
     // goes, and the next delta neither puts nor removes it. One the publication carried (or an image restored) stays
     // marked, or is marked, so the next delta removes its piece, though it was let go, held again at its position and
@@ -286,6 +352,34 @@ impl StateLogs {
     self.bytes < bound
   }
 }
+
+/// The floor `floor` rises to over `released`, a log's parts let go in position order (A-919 (C)): each part that
+/// continues the chain from the floor (its `from` the floor's position; the first from the log's start, 0, where there
+/// is none yet) advances it to its position, the digest one link on over its register value. It stops at the first that
+/// does not, so an owner that never held the chain from the log's start keeps no floor.
+pub(crate) fn floor_over(
+  floor: Option<slates_db::register::CommittedFloor>,
+  released: &BTreeMap<u64, Vec<u8>>,
+) -> Option<slates_db::register::CommittedFloor> {
+  let mut floor = floor;
+  for (position, value) in released {
+    let (at, digest) = floor.map_or((0, slates_db::register::CHAIN_BASE), |floor| {
+      (floor.position, floor.digest)
+    });
+    if record_of(value).map(|part| part.from) != Some(at) {
+      break;
+    }
+    floor = Some(slates_db::register::CommittedFloor {
+      position: *position,
+      digest: slates_db::register::chain_digest(&digest, value),
+    });
+  }
+  floor
+}
+
+/// Counter: a part the partition made at or below its log's committed floor, refused (A-919 (C), [`StateLogs::hold`]): a
+/// position let go made again, never reached by a log's rising positions. Format: a counter name.
+const PART_BELOW_FLOOR: &str = "repository.state_log.part_below_floor";
 
 /// A state log's record as its register holds it: behind [`STATE_LOG_CLASS`].
 pub(crate) fn value_of(record: &StateLogRecord) -> Vec<u8> {
@@ -340,7 +434,15 @@ pub(crate) fn take_made(state: &mut ShardState) {
   let local = state.fleet.host();
   let config = state.fleet.configuration().clone();
   for record in &records {
-    state.state_logs.hold(record);
+    if !state.state_logs.hold(record) {
+      state.count(PART_BELOW_FLOOR, 1);
+      slates_machine::log_line!(
+        "slates-server: partition {}: a state-log part to {} is at or below its log's committed floor, refused: a position \
+         let go made again",
+        state.partition,
+        record.to
+      );
+    }
     state.state_logs.note_greens(record);
   }
   for record in &records {

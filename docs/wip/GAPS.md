@@ -364,8 +364,15 @@
 >   read it as another home wire version's (A-727 (d1a)), which ends a homing at once, 2 s into its 18 s window. Now
 >   every reply is settled by its round trip (`fleet::settle_replies`, one path for timely replies and stragglers): one
 >   with none is no answer, its host left, its link dialed afresh, and the homing waits and ranks its homes again once
->   the death installs (A-912). Red first: `a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once`.
->   a914 asserts its second push lands.
+>   the death installs (A-912). Red first: `a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once`
+>   (16 of 16 in main's run at 526859d1e). a914 asserts its second push lands.
+> - **OPEN, a914 still fails 4 of 16 at the record barrier** (main 01a20182's run at 526859d1e, load 42-69; its rulings of
+>   2026-11-27 12:02). Every red is the second death's push refused `unable to commit`; no homing ended short at once.
+>   Two shapes:
+>   1. Runs 5 and 13: a green owed at version 3, placed 2, with reads past tolerance ("nothing held, the register's
+>      candidacy owed"): A-919's open edge, which (C) closes. Rerun after (C) lands.
+>   2. Runs 1 and 16: a green owed at version 2, placed 1, no read past tolerance: FIXED by w-interop (the entry below,
+>      a region read that waited out a dead first home).
 > - **FIXED (w-interop, 2026-11-27; main 01a20182's ruling of 12:37): a914's record barrier, placed Some(1) (its runs 1
 >   and 16 of 16).** Not durability: every object was served by a live home. A holder whose replica owed its push
 >   (P2) replayed the repository's replica store, reading each name it lacked from the region (`homes::read_in_region`),
@@ -423,10 +430,14 @@
 >   bytes, refused 12,002 times; green: held 2 positions, the parts let go to 0. OWED (main): the TLC run of
 >   `FencedLedger_forget.cfg` (must hold) and `FencedLedger_forget_norule.cfg` (must fail Continuity), with the three
 >   older configurations (verdicts unchanged); the model is written, its run is not yet made.
-> - **OPEN, the open edge (A-919, the configuration's):** a newcomer whose read is past tolerance (the owner's hold
->   forgotten at its restart, the departed gone) adopts nothing, refused typed (`fleet.ledger_read.past_tolerance`),
->   and pins the owner's let-go of the register's parts. The answer is a candidate that cannot hold a register
->   leaving its candidacy. In the owner-restart test the push after was refused `unable to commit` too.
+> - **FIXED, the open edge (A-919 (C), w-shared, 2026-11-27; main 01a20182's ruling of 10:57):** a newcomer whose read
+>   was past tolerance (the owner's hold forgotten at its restart, the departed gone) adopted nothing and pinned the
+>   owner's let-go. The owner now keeps a committed floor per state log, the highest position it let go with the
+>   chain's digest, durable in its image beside its owed parts; its ledger-read answer carries it, and the fold adopts a
+>   single holder's prefix at or below it only where the digest matches (mismatch refused, a fault; uncovered refused as
+>   before). Red first: a919's owner-restart newcomer now holds the log from its first part and a's parts are let go.
+>   Model: `FencedLedger_floor_bounded` holds (TLC, 50,040,406 states, complete, bounded at one forget); the full
+>   `FencedLedger_floor`'s verdict is owed (no violation at 49.7M states when this landed).
 > - **A-921 (found by A-919's owner-restart scene; main 01a20182's rulings of 2026-11-25).** About 1 run in 3 to 5,
 >   a's warm restart outlasted detection (1.40 to 1.79 s of silence to the takeover installed): a was taken over,
 >   refuted at incarnation 1, and readmitted. A silence past detection is a death by design, and the false-death path
