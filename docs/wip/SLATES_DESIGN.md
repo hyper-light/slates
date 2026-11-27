@@ -65060,6 +65060,22 @@ GAPS.
     still 4.5 ms in move and 4.8 in copy: another unit, named next.
   - Left: a green with a link anywhere still walks every effect whole in this unit (a volume push with a hard link in
     its head; GAPS).
+  **An apply begun over runs all read plans no replay's reads.** `landing.apply`'s remaining unit, named (debug): its
+  slice's `begin_version` at 4.46 ms in one call. The rest of the apply slice was under 1 ms: reads, runs, the
+  retention's settle 17-95 µs and the checkpoint's start 36-64 µs. `Green::begin_applying` planned which named runs a
+  replay of the entry reads (`Increment::replay_reads`: a pass over every applied effect and run, A-887). The plan only
+  answered whether a wanted run was unread, and a landing reads every run before its apply begins
+  (`read_named_slice`), so none was. Now the plan is made only where some run is unread (`Increment::unread`, a scan of
+  the runs that stops at the first unread): a recovery's replay, which reads only the runs it plans. Where every run is
+  read, the plan's answer could only be "none unread", so the answer is the same.
+  - Counter: `Green::replay_plans`.
+  - Test `an_apply_begun_with_every_run_read_plans_no_replays_reads` (2,000 runs): 0 plans with every run read, one
+    with none read; red at 1 with the plan unconditional.
+  - Debug, after: `landing.apply` is out of the eight longest spans of add, copy and move (4.5-4.8 ms before). Their
+    leaders now: `landing.publish` (9.3-24.8 ms, A-930's cut copies), then `stage.judging` (5.8, move),
+    `stage.recording` (5.0-5.3) and `stage.check` (3.8-4.2).
+  - Left: a replay's plan is still a pass over the entry in one unit, as is the scan of the runs, linear in them. Both
+    are owed their slicing by §3.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
