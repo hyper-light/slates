@@ -110,8 +110,10 @@
 > A-926 keeps a high-water mark for each written memory, so a successor knows its extents. Now the sweep is 3,495,300
 > pages, and it completes in 1.6 s both alone (40,988 slices) and loaded (40,730, two hogs a core), held by
 > `a_status_requests_sweep_completes_within_its_bound_under_load` and
-> `a_fresh_daemons_sweep_walks_what_its_marks_cover_not_its_unwritten_journal`. OWED, A-926 part 2: the segment's log
-> and snapshot regions (3,495,255 pages, the register's format) get marks too.
+> `a_fresh_daemons_sweep_walks_what_its_marks_cover_not_its_unwritten_journal`. A-926 part 2 gave the segment's log
+> ring and snapshot slots their marks too: a fresh daemon's sweep is 46 pages, two sweeps completing in one idle slice
+> (the spacing test now holds the rule itself: a request right after a sweep arms none, or one no sooner than the last
+> took).
 > A-926 part 1's sibling red, fixed (w-hg, 2026-11-26, main's order; w-perf held on a permission prompt):
 > `idle_sweep::tests::a_pass_cut_short_at_each_start_settles_in_that_pass_at_the_shards_idle_points` failed 20 of 20
 > from 3aa1ad9e8 (main's bisect: b2af92cae 3 of 3 green), "resumed 0". The product was right; the test's premise was
@@ -784,8 +786,10 @@
 > size: the register's op (`landing.record`, atomic by main's ruling). The reserve's copy entry room resolves the copy
 > ops alone since 12a (11.5 ms whole, debug); move's other named units are the judge's `finish_resolving` (5.8 ms)
 > and a `decide_some` unit (4.9) and the commit's `Prep::Beginning` (7.7-7.9). The storing's begin is a text a unit
-> since 13a (release probe 15's leader at about 1.4 ms p50). Next: copy's `landing.release` (1.6 ms) and the register's
-> op. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
+> since 13a (release probe 15's leader at about 1.4 ms p50). Copy's `landing.release` unit is kernel time in debug
+> (3.0 ms, 99.8% system: an allocator region's return, owed its own piece). The register's op publishes ahead of
+> itself since 13b; the publication is one whole step (8.8 ms debug, owed turns if release finds it past the bar), and
+> the record's inline chain entry (430,978 bytes) is next, (a). Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
@@ -2155,7 +2159,9 @@
 > segments its store lacks from the region verbatim at the owner's sequences
 > (`a_holders_run_lands_the_owners_segments_byte_for_byte_by_identity`). CLOSED the same day: one barrier a home
 > shard on this node (r42's push 89 to 123 s), a crash's holds resolved by the attempt record v13 names, and homes ranked
-> by partition, never by a runtime shard id (A-929). OPEN next: a remote home's barrier, one exchange a home a push. OPEN: (ii)'s rest: the holder's recompute
+> by partition, never by a runtime shard id (A-929). CLOSED the same day: a remote home's barrier, one exchange a home a
+> push (home wire 0x87; `homes::barrier_published`), with the Mercurial fleet-takeover flow `#[ignore]`d with its command
+> (`crates/cli/tests/hg_takeover.rs`), main's to run. OPEN: (ii)'s rest: the holder's recompute
 > accepted with the owner's identity, with svn's holder red and an
 > `#[ignore]`d fleet-takeover CLI test for Mercurial, which no test drives yet; then an import's run (v9) and a single
 > changeset (v7) homed the same way.
@@ -3598,7 +3604,12 @@
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
-> the log ring's released pages given back (88 MiB resident past the live tail); `projected_snapshot_bytes`'s encode.
+> `projected_snapshot_bytes`'s encode. The log ring's released pages given back (88 MiB resident past the live tail):
+> DONE by A-926 part 2 (w-perf, 2026-11-25). An idle shard gives back its partition's ring past its tail, once a
+> snapshot released it (A-71's reset), and each snapshot slot past its payload, a slice at a time beside the
+> journal's give-back, lowering their marks after. `a_released_rings_pages_go_back_to_the_os` (macOS, by the
+> physical footprint): 96 MiB logged and released, the process charged 98 MiB, then 4 MiB after the give-back, 94 MiB
+> given back. OWED: the same test on Linux, by RSS (main's lane).
 >
 > **A-752 (2026-11-20, w-engine; Ada's rule, main's order):** a push's work build a unit at a time: part 1 the
 > deriver's replay indexed (O(n^2) -> O(n log n)); part 2 `push::Building` over the turns before the verdict
@@ -5327,6 +5338,13 @@
 >   included. Run 7 (45612515778) had passed 24 of 30 on Windows: `evo-repository` pasted the binary's Windows path into
 >   its shell's command, which took its backslashes, and the five rows after it failed on the missing repository;
 >   0e73ff11d passes the path through the environment.
+> - **All three matrices on all three runners, green (2026-11-26):** run 10 (45944507454,
+>   `diag-measurer-main-interop-linux-10` at 80eccadbd, main 8eac5188a, release slates), every leg exit 0: git 27 of 27
+>   on ubuntu-latest, ubuntu-24.04-arm and windows-latest; hg 30 of 30 on all three; svn 33 of 33 on both Linux runners
+>   over svn:// and HTTP. Run 9 (45644433352) had passed Windows git 23 of 27: `GIT_SSH_COMMAND` pasted the key's and
+>   known hosts' paths bare, and the shell took the Windows path's backslashes; 9099f5055 quotes them, and every matrix
+>   prints `unmeasured` where ps lists no resident sizes (Windows' every row had read 0 MiB). svn on Windows waits on
+>   Ada's go.
 > - **macOS hg** (P5's round, at a30ffbdb8): 14 ok, 3 ignored, 1 failed and 1 hung. The failure: a pull sent 3 file
 >   revisions whole where stock sends 0. The hang: pulls by a tag over HTTP. Both are w-hg's.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the

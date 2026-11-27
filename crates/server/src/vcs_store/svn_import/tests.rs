@@ -1222,6 +1222,9 @@ struct WideCounts {
   carried_steps: u64,
   /// The steps of the import's texts handed over to the landing (`svn_commit::HAND_OVER_STEPS`, 13a).
   hand_over_steps: u64,
+  /// The landings whose held increments were published ahead of the register's op (`staging::LANDING_PUBLISHED_AHEAD`,
+  /// 13b).
+  published_ahead: u64,
 }
 
 /// The calling shard's [`WideCounts`] now.
@@ -1243,12 +1246,14 @@ fn wide_counts() -> WideCounts {
     fold_steps: on(|state| count(state, crate::repository::svn_commit::FOLD_STEPS)),
     carried_steps: on(|state| count(state, crate::repository::svn_commit::CARRIED_STEPS)),
     hand_over_steps: on(|state| count(state, crate::repository::svn_commit::HAND_OVER_STEPS)),
+    published_ahead: on(|state| count(state, staging::LANDING_PUBLISHED_AHEAD)),
   }
 }
 
 /// Holds a wide landing's [`WideCounts`] to its slicing: each part ran in steps, never whole in one.
 fn wide_counts_sliced(counts: &WideCounts) {
   wide_landing_sliced(counts);
+  wide_landing_stepped(counts);
   wide_import_sliced(counts);
 }
 
@@ -1260,11 +1265,6 @@ fn wide_landing_sliced(counts: &WideCounts) {
     prepares,
     inline,
     in_turns,
-    section_yields,
-    hold_steps,
-    fold_steps,
-    carried_steps,
-    hand_over_steps,
     ..
   } = counts;
   // Non-vacuity: the landing's unpin of its 9,000 texts and its scratch member's release each ran in slices (A-920 6a:
@@ -1284,6 +1284,19 @@ fn wide_landing_sliced(counts: &WideCounts) {
   // piece: the first fold and hold steps inline were 16 ms of one poll, debug).
   assert_eq!(*inline, 0, "checkpoints begun in a landing's step");
   assert!(*in_turns > 0, "no checkpoint taken in turns");
+}
+
+/// The landing's later parts in steps of their own (A-920 7c, 11a, 11c, 13a and 13b).
+fn wide_landing_stepped(counts: &WideCounts) {
+  let WideCounts {
+    section_yields,
+    hold_steps,
+    fold_steps,
+    carried_steps,
+    hand_over_steps,
+    published_ahead,
+    ..
+  } = counts;
   // Each of the landing's sections begins a step of its own (A-920 7c: the storing's begin and the carried texts ran in
   // one poll of 31 ms, debug), and the greens' 9,000 holds were applied a slice at a time, never at one free decision.
   assert!(
@@ -1309,6 +1322,9 @@ fn wide_landing_sliced(counts: &WideCounts) {
     *hand_over_steps > 2,
     "the texts' hand-over took {hand_over_steps} step(s)"
   );
+  // The landing's held increment published ahead of the register's op, the op only recording (A-920 13b: inside it,
+  // 5.8 ms of its 10.5, debug).
+  assert!(*published_ahead > 0, "no landing published ahead of its op");
 }
 
 /// The import's parse, staging, apply and tail in steps (A-920 7a, goal 93 piece 3).

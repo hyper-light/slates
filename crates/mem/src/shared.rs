@@ -738,6 +738,17 @@ impl SparseObject {
     Ok(self.inner.discard(&self.commits, offset, len))
   }
 
+  /// [`SparseObject::discard`] of a span wholly inside one declared racy span (A-926 part 2: a snapshot slot past its
+  /// payload, which a seqlock reader never reads past its length): the same give-back, the racy check in place of the
+  /// plain one. A racy write after it clears a reusable mark first ([`SparseObject::write_racy`]).
+  pub fn discard_racy(&mut self, offset: usize, len: usize) -> Result<usize, MemError> {
+    check_racy(&self.words, offset, len, self.len)?;
+    if crate::region::A_WRITE_NEEDS_THE_MARK_CLEARED {
+      return Ok(self.mark_reusable(offset, len));
+    }
+    Ok(self.inner.discard(&self.commits, offset, len))
+  }
+
   /// Marks the whole pages inside `offset .. offset + len` reusable and records them: the bytes marked.
   fn mark_reusable(&mut self, offset: usize, len: usize) -> usize {
     let page = self.page;

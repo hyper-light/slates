@@ -685,6 +685,11 @@ fn give_back_put_some(
   *at >= put.len()
 }
 
+/// Counter: a landing whose versions' held increments were published ahead of the register's op ([`Staging::land`],
+/// A-920 13b): many a wide import shows the op found them published, its own publication nothing to do. Format: a counter
+/// name in the status report.
+pub(crate) const LANDING_PUBLISHED_AHEAD: &str = "repository.svn_commit.published_ahead";
+
 /// Counter: a step of an imported revision's staging ([`Staging::stage_in`]): its check, its build, each slice of its
 /// named texts' read, and its judge with the records' apply; four or more a revision shows its staging was split.
 /// Format: a counter name in the daemon's status report.
@@ -1737,6 +1742,19 @@ impl Staging {
       Ok(prepared) => prepared,
       Err(refused) => return Some(Err(refused)),
     };
+    // The versions' held increments published ahead of the register's op, in a step of their own (A-920 13b: inside
+    // the op, 5.8 ms of its 10.5 at 9,000 files, debug; published before recorded all the same). A kill between the
+    // two leaves an increment no record names, which a recovery gives back as any unnamed hold.
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("landing.publish");
+    if landed.is_ok() {
+      crate::state::with_state(|state| {
+        if crate::verbs::publish_held_ahead(state) {
+          state.count(LANDING_PUBLISHED_AHEAD, 1);
+        }
+      })?;
+      super::section_yield().await?;
+    }
     #[cfg(test)]
     crate::vcs_store::svn_import::phase::tag("landing.record");
     let recorded = crate::state::with_state(|state| {

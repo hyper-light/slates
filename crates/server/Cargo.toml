@@ -88,7 +88,16 @@ windows-sys = { workspace = true }
 # The WinFsp mount host (§4.6 "Windows"; `crate::winfsp`): the daemon serves a volume at a drive letter.
 slates-bridge-winfsp = { workspace = true }
 
+[features]
+# Test support only (A-926): `Daemon::take_recovery_memory_as_written_whole`, which the recovery tests call to give a
+# fresh daemon's memory back as a daemon over an image before its marks would. Off in every normal build: only this
+# crate's own dev-dependency below turns it on, and with resolver 2 a dev-dependency's features stay out of a normal
+# build (`cargo tree -p slates-cli -e features --edges normal` shows no `test-support`).
+test-support = []
+
 [dev-dependencies]
+# Itself with its test support, for the integration tests (`tests/recovery.rs`).
+slates-server = { path = ".", features = ["test-support"] }
 # The store's log file a store test reads back after a restart (`repository/store_tests.rs`, A-767).
 hyper-block = { path = "../../vendor/hyper-raft/hyper-block" }
 # self-signed fleet identities for the two-daemon membership test (as the cluster tests mint them).

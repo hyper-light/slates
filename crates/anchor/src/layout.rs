@@ -281,6 +281,21 @@ pub const RING_CAPACITY: usize = 16;
 pub const RING_SEQ_BASE: usize = 24;
 /// Format: the byte ring's offset (one cache line of words before it).
 pub const RING_BYTES: usize = 64;
+/// Format: the ring header's marks (A-926; goal 93, main's ruling of 2026-11-25), in the four words after the ring's
+/// own: a version word ([`RING_MARKS`]), then the high-water mark of the partition's log ring and of each of its two
+/// snapshot slots, bytes from each region's start: how far each may hold pages since it was last given back. A mark is
+/// raised, page-stepped, before the write that passes it, and falls after a give-back, so a successor walks and gives
+/// back what was written, never a region whole. A segment made before them reads zero here: every region whole until
+/// its daemon adopts it.
+pub const RING_MARKS_VERSION: usize = 32;
+/// Format: the log ring's mark's offset ([`RING_MARKS_VERSION`]).
+pub const RING_MARK_RING: usize = 40;
+/// Format: the first snapshot slot's mark's offset; the second's is the word after.
+pub const RING_MARK_SNAPSHOTS: usize = 48;
+/// Format: the marks' words, the version word among them.
+pub const RING_MARK_WORDS: usize = 4;
+/// Format: the marks' version word, "RMRK" and version 1.
+pub const RING_MARKS: u64 = u64::from_le_bytes(*b"RMRK\x01\x00\x00\x00");
 
 /// The supervision state word's values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

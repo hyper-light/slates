@@ -19874,6 +19874,26 @@ entry above. Slates' hg stream now sends stock's bytes (73.7 MB against 74.1) bu
 - **What it says.** The owner's own work (serve, disk) is under 8 % of the wait. Nearly all of it is waking a parked
   owner. w-hg is building the owner's spin before it parks, from this split.
 
+**Follow-up, main 7a9cb385e: the clone in 43.150 s (one loaded run).** w-hg's let-go manifests are sent as their stored
+deltas (21f7f7743, 7a9cb385e). The owner requests fell from 593,413 to 3,387, and the store wait from 129.3 s to 11.3 s.
+
+- **Command.** `~/slates-work/main-ship/hg-rerun-7a9.sh`: `hg_clone_store_wait`, release, in process, stock hg 7.2.4
+  as the client, over hg-src (57,036 changesets). 2026-11-25 08:08 to 08:12 PST, the MacBook at load about 24.
+  Record: `~/.cache/main-rounds/hg-rerun-7a9/store-wait.log`.
+- **The clone took 43.150 s and verified**, every manifest equal to the source's.
+
+| build | the clone (s) | this build against it |
+|---|---|---|
+| 44db3dc17 (above) | 225.733 | 5.23x faster |
+| b4aa00ef8 | 176.4 | 4.09x faster |
+| 7a9cb385e | 43.150 | |
+| stock `hg serve`, for scale | 25.810 | slates 1.67x its time |
+
+- **Stock's 25.810 s** is not from this run. It is the hg leg at 15b4f1061 through the harness at 67ec37368, on the
+  MacBook at load 29 to 36, 2026-11-24/25 ("LOADED, the night's rerun on the MacBook", above). That's a different
+  harness and load, so the ratio is a scale only. The harness's hg leg against stock remains the order-of-magnitude
+  record.
+
 ## P7's true F: an svn import's text batches bounded by the machine's own drain time, three arms (goal 93 P7; main 01a20182's bench7, 2026-11-25 04:35 to 04:45 PST)
 
 **No verdict yet.** At this load the wall times do not separate the arms. The bound arm's resident set is about half the
@@ -19931,6 +19951,25 @@ its keep at this scale: free over its bound 1.4 to 2.8 with the purge, 2.5 to 3.
 | before, a387b13c3 | 12.00 / 10.15 / 12.08 | 12.00 | 683 to 684 | | | |
 
 - **Wall** is not separated at this load: the unit arm alone spans 12.65 to 27.92 s.
+
+**The after arm, and P7 closed (main b8b3c741d: w-perf's (a) 50b991d7f, (b) b2b4e00a7, (c) 6e002e057).** The give-back
+holds the arena's free space within its keep at the settled reading in every round.
+
+- **Command.** `~/slates-work/main-ship/p7-after.sh`, three rounds interleaved with the bound arm (eedfd23e1),
+  2026-11-25 08:48 to 08:49 PST, the MacBook at load 18 to 21. Record: `~/.cache/main-rounds/bench7/p7-after.txt`.
+- **Method: on macOS, judge give-back by footprint, never RSS.** Memory given back lazily (`MADV_FREE`) stays counted
+  in RSS until the kernel takes it. `phys_footprint`, what the kernel charges the process, leaves it out, so the
+  give-back is judged by it.
+
+| round | settled `arena_free` (MB), deferred 0 | its keep (MB) | free / keep | `phys_footprint` settled (MB) |
+|---|---|---|---|---|
+| 1 | 14.8 | 53.4 | 0.28 | 130.8 (35.2 before the import, 223.1 at its end) |
+| 2 | 28.1 | 28.2 | 1.00 | 156.5 |
+| 3 | 56.7 | 125.8 | 0.45 | 184.6 |
+
+- **The bound arm's footprint is unmeasured:** its binary predates the footprint gauge.
+- **Verdict: P7 is closed.** The settled free space is within its keep in all three rounds (round 2 at its edge,
+  28.1 against 28.2 MB).
 
 ## The git leg at eedfd23e1, one loaded run: the clone's first pack byte 14.8 s later than at 2dd25afe6, the derivation's units slower (goal 93 perf; main 01a20182's bench7, 2026-11-25 04:53 to 04:59 PST)
 
