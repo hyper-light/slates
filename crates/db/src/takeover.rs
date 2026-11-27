@@ -437,6 +437,7 @@ pub fn answer_ledger(
     next: None,
     fenced: None,
     held_from: None,
+    committed_through: None,
   };
   let Some(acceptor) = acceptors.acceptor_mut(&prepare.object) else {
     return Some(promise);
@@ -519,6 +520,7 @@ pub fn read_ledger(
     next: None,
     fenced: None,
     held_from: None,
+    committed_through: None,
   };
   if let Some(acceptor) = acceptor {
     list_positions(
@@ -561,8 +563,38 @@ pub struct LedgerAdoption {
   /// The first position not adopted, when the range was not adopted whole: its cohorts' promises are not all in, or no
   /// member that promised it reported a value there (which a committed prefix never leaves).
   pub stopped_at: Option<u64>,
-  /// Whether any adopted position was recovered past tolerance ([`Readiness::ReadyPastTolerance`]).
+  /// Whether any adopted position was recovered past tolerance ([`Readiness::ReadyPastTolerance`]) and not witnessed by
+  /// an owner's committed floor ([`Witness`]).
   pub past_tolerance: bool,
+  /// What the owner's committed floor made of the positions at or below it, where a read carried one (A-919 (C)).
+  pub witness: WitnessOutcome,
+}
+
+/// An owner's committed floor as a read's fold uses it (A-919 (C)): the floor, and the chain's digest through the
+/// position before the read's range that the asker holds itself ([`crate::register::CHAIN_BASE`] where its range starts
+/// at the log's first position), so the fold continues the chain over what it adopts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Witness {
+  /// The owner's floor.
+  pub floor: crate::register::CommittedFloor,
+  /// The digest through the position before the range's start.
+  pub prior: [u8; crate::register::DIGEST_BYTES],
+}
+
+/// What a [`Witness`] made of a fold (A-919 (C)).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WitnessOutcome {
+  /// No witness, or none of the positions it covers needed it.
+  #[default]
+  Unused,
+  /// The adopted prefix's digest at the floor matched: its positions past tolerance adopted on one report each.
+  Verified,
+  /// The adoption stopped short of the floor (a holder's reports not covering it), so the positions past tolerance
+  /// below it were not witnessed: refused as past tolerance, typed, never a fault.
+  Uncovered,
+  /// The adopted prefix's digest at the floor differed from the owner's: every position adopted is dropped and the read
+  /// refused (a stale or wrong report, or a wrong floor).
+  Mismatch,
 }
 
 /// The positions of a ledger's range `from..to` phase one adopts from `answers` (A-364), each member's answer counted per
@@ -587,6 +619,7 @@ pub fn ledger_positions(
     quorum,
     (from, to),
     answers,
+    None,
     |last: Option<&Accepted>, next: &Accepted| {
       next.sequence == last.map_or(from, |last| last.sequence.saturating_add(1))
     },
@@ -607,10 +640,17 @@ pub fn ledger_positions_chained(
   quorum: Quorum,
   (from, to): (u64, u64),
   answers: &BTreeMap<HostId, LedgerAnswered>,
+  witness: Option<Witness>,
   continues: impl Fn(Option<&Accepted>, &Accepted) -> bool,
 ) -> LedgerAdoption {
   let mut adoption = LedgerAdoption::default();
   let no_complete = BTreeSet::new();
+  // The chain's digest through the last position adopted (A-919 (C)), where a witness asks for it. A position passed
+  // over with no report adds nothing (a state log's positions between its parts hold none); `continues` keeps what is
+  // adopted one chain, so a holder lacking a link stops the adoption before the floor.
+  let mut chained = witness.map(|witness| witness.prior);
+  // A position adopted past tolerance at or below the floor, awaiting the floor's digest.
+  let mut awaiting = false;
   for position in from..to {
     let reports: BTreeMap<HostId, Accepted> = answers
       .iter()
@@ -657,21 +697,73 @@ pub fn ledger_positions_chained(
       .into_values()
       .reduce(|best, next| if next.epoch > best.epoch { next } else { best });
     let past = matches!(verdict, Readiness::ReadyPastTolerance { .. });
+    let witnessed = witness.is_some_and(|witness| position <= witness.floor.position);
     match (verdict, newest) {
       (Readiness::Ready | Readiness::ReadyPastTolerance { .. }, Some(newest))
         if continues(adoption.adopted.last(), &newest) =>
       {
-        adoption.past_tolerance |= past;
+        if let Some(digest) = chained.as_mut() {
+          *digest = crate::register::chain_digest(digest, &newest.value);
+        }
         adoption.adopted.push(newest);
+        note_past(&mut adoption, &mut awaiting, past, witnessed);
       }
       (Readiness::Ready | Readiness::ReadyPastTolerance { .. }, None) => {
-        adoption.past_tolerance |= past;
+        note_past(&mut adoption, &mut awaiting, past, witnessed);
       }
       _ => {
         adoption.stopped_at = Some(position);
-        return adoption;
+        return witnessed_end(adoption, awaiting);
       }
     }
+    if let Some(witness) = witness
+      && position == witness.floor.position
+    {
+      // The floor is a position its owner let go a value at, so the chain adopted must end there.
+      let reached = adoption
+        .adopted
+        .last()
+        .is_some_and(|last| last.sequence == position);
+      match chained.filter(|_| reached) {
+        Some(digest) if digest == witness.floor.digest => {
+          if awaiting {
+            adoption.witness = WitnessOutcome::Verified;
+          }
+          awaiting = false;
+        }
+        Some(_) => {
+          adoption.adopted.clear();
+          adoption.past_tolerance = true;
+          adoption.witness = WitnessOutcome::Mismatch;
+          adoption.stopped_at = Some(from);
+          return adoption;
+        }
+        None => return witnessed_end(adoption, awaiting),
+      }
+    }
+  }
+  witnessed_end(adoption, awaiting)
+}
+
+/// Notes a position folded `past` tolerance: awaiting the floor's digest where a witness covers it (`witnessed`), else
+/// past tolerance as before (A-919 (C)).
+fn note_past(adoption: &mut LedgerAdoption, awaiting: &mut bool, past: bool, witnessed: bool) {
+  if !past {
+    return;
+  }
+  if witnessed {
+    *awaiting = true;
+  } else {
+    adoption.past_tolerance = true;
+  }
+}
+
+/// A fold ended with positions past tolerance still awaiting a floor it never reached (`awaiting`): unwitnessed, so past
+/// tolerance, typed uncovered (A-919 (C)).
+fn witnessed_end(mut adoption: LedgerAdoption, awaiting: bool) -> LedgerAdoption {
+  if awaiting {
+    adoption.past_tolerance = true;
+    adoption.witness = WitnessOutcome::Uncovered;
   }
   adoption
 }
@@ -776,6 +868,113 @@ mod tests {
     );
   }
 
+  /// The scene of A-919's past-tolerance edge for [`ledger_positions_chained`] (A-919 (C)): a cohort of the owner `a`,
+  /// whose restarted hold begins at 3, the old holder `b` holding 1 to 3, and the asker `d` holding none; positions 1
+  /// and 2 are then past tolerance (`a` and `d` below their starts count as gone), position 3 within it. The fold from
+  /// 1 to 4 with `witness`, each position's value its own byte.
+  fn fold_past_the_owners_start(
+    b_answer: LedgerAnswered,
+    witness: Option<Witness>,
+  ) -> LedgerAdoption {
+    let (a, b, d) = (HostId(1), HostId(2), HostId(4));
+    let cohorts = vec![vec![a, b, d]];
+    let owner = LedgerAnswered {
+      held_from: Some(3),
+      ..answered(&[(3, 1, 3)], 4)
+    };
+    let asker = LedgerAnswered {
+      held_from: None,
+      ..answered(&[], 4)
+    };
+    let answers = BTreeMap::from([(a, owner), (b, b_answer), (d, asker)]);
+    let continues = |last: Option<&Accepted>, next: &Accepted| {
+      next.sequence == last.map_or(1, |last| last.sequence.saturating_add(1))
+    };
+    ledger_positions_chained(
+      (&cohorts, &[]),
+      |_| true,
+      Quorum { f: 1 },
+      (1, 4),
+      &answers,
+      witness,
+      continues,
+    )
+  }
+
+  /// The chain digest of the values `bytes`, one a position, from the log's first ([`crate::register::chain_digest`]).
+  fn digest_of(bytes: &[u8]) -> [u8; crate::register::DIGEST_BYTES] {
+    bytes
+      .iter()
+      .fold(crate::register::CHAIN_BASE, |digest, byte| {
+        crate::register::chain_digest(&digest, &[*byte])
+      })
+  }
+
+  /// The owner's floor at `position` with `digest`, from the log's first position.
+  fn floor_at(position: u64, digest: [u8; crate::register::DIGEST_BYTES]) -> Option<Witness> {
+    Some(Witness {
+      floor: crate::register::CommittedFloor { position, digest },
+      prior: crate::register::CHAIN_BASE,
+    })
+  }
+
+  /// A-919 (C): without a witness the old holder's report alone below the owner's start is past tolerance (the open
+  /// edge, as before); with the owner's committed floor at 2 whose digest the old holder's prefix matches, positions 1
+  /// and 2 are adopted on its one report each, verified, and 3 within tolerance: the whole range, never past tolerance.
+  #[test]
+  fn a_holders_prefix_the_owners_floor_witnesses_is_adopted_past_tolerance() {
+    let whole = || answered(&[(1, 1, 1), (2, 1, 2), (3, 1, 3)], 4);
+    let unwitnessed = fold_past_the_owners_start(whole(), None);
+    assert!(unwitnessed.past_tolerance, "{unwitnessed:?}");
+    let witnessed = fold_past_the_owners_start(whole(), floor_at(2, digest_of(&[1, 2])));
+    assert_eq!(
+      (
+        witnessed
+          .adopted
+          .iter()
+          .map(|accepted| accepted.sequence)
+          .collect::<Vec<_>>(),
+        witnessed.past_tolerance,
+        witnessed.witness
+      ),
+      (vec![1, 2, 3], false, WitnessOutcome::Verified),
+      "{witnessed:?}"
+    );
+  }
+
+  /// A-919 (C), hostile witnesses: a floor whose digest the holder's prefix does not match (a stale or wrong report, or a
+  /// wrong floor) adopts nothing, typed a mismatch; a floor past the log's end, or one the holder's reports do not reach
+  /// (its log starting later than the first position), leaves the positions past tolerance unwitnessed, typed uncovered,
+  /// never a mismatch; and a position past tolerance above the floor is refused as before.
+  #[test]
+  fn a_floor_the_reports_do_not_match_or_reach_adopts_nothing_past_tolerance() {
+    let whole = || answered(&[(1, 1, 1), (2, 1, 2), (3, 1, 3)], 4);
+    let wrong = fold_past_the_owners_start(whole(), floor_at(2, digest_of(&[1, 9])));
+    assert!(
+      wrong.adopted.is_empty() && wrong.past_tolerance && wrong.witness == WitnessOutcome::Mismatch,
+      "{wrong:?}"
+    );
+    let beyond = fold_past_the_owners_start(whole(), floor_at(10, digest_of(&[1, 2, 3])));
+    assert!(
+      beyond.past_tolerance && beyond.witness == WitnessOutcome::Uncovered,
+      "{beyond:?}"
+    );
+    let later = LedgerAnswered {
+      held_from: Some(2),
+      ..answered(&[(2, 1, 2), (3, 1, 3)], 4)
+    };
+    let short = fold_past_the_owners_start(later, floor_at(2, digest_of(&[1, 2])));
+    assert!(
+      short.past_tolerance && short.witness == WitnessOutcome::Uncovered,
+      "{short:?}"
+    );
+    let above = fold_past_the_owners_start(whole(), floor_at(1, digest_of(&[1])));
+    assert!(
+      above.past_tolerance,
+      "position 2 above the floor stays past tolerance: {above:?}"
+    );
+  }
+
   /// A-919 (main 01a20182's ruling of 2026-11-25: continuity one rule, a parameter). Do: a state log's parts at 10 (from
   /// 0) and 30 (from 20), both members reporting both and naming nothing at 20; fold 0 to 31 with a part's continuity
   /// (its `from` the last part's position; the first, from 0). Expect the part at 10 adopted, positions ready and empty
@@ -800,6 +999,7 @@ mod tests {
       Quorum { f: 1 },
       (0, 31),
       &answers,
+      None,
       continues,
     );
     assert_eq!(

@@ -386,6 +386,7 @@ async fn read_once(
     quorum,
     (wanted.from, wanted.to),
     &answers,
+    None,
     |last, next| continues(register, wanted.from, last, next),
   );
   let _ = state::with_state(|s| {
