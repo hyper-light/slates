@@ -486,11 +486,24 @@ const GLOB_FORM: &str = ":glob:";
 /// Format: POSIX character-class open delimiter inside a glob bracket expression (`[:class:]`).
 const POSIX_CLASS_OPEN: &[u8] = b"[:";
 
-/// Format: POSIX character-class close delimiter inside a glob bracket expression (`[:class:]`).
-const POSIX_CLASS_CLOSE: &[u8] = b":]";
-
 /// Format: an escaped byte in a glob pattern (`\x`) spans two raw bytes.
 const ESCAPED_BYTE_LEN: usize = b"\\x".len();
+
+/// Format: `log2(64)` bits select the bit offset within one `u64` word of a 256-bit byte set.
+const BYTE_WORD_SHIFT: u8 = 6;
+
+/// Format: low six bits (`0..64`) index the bit within one `u64` word of a 256-bit byte set.
+const BYTE_BIT_MASK: u8 = 63;
+
+/// Format: diverse printable ASCII byte families (no `/`, `.`, or NUL) used to synthesize distinct
+/// witness segments avoiding literal and glob `Deny` rules.
+const PROBE_SEEDS: &[u8] = b"za0_~Am9-Z!";
+
+/// Derived: per-slot witness probe cap equals the number of distinct byte families in [`PROBE_SEEDS`].
+const MAX_SLOT_CANDIDATES: usize = PROBE_SEEDS.len();
+
+/// Derived: bounded Cartesian pair-variation probe cap (`PROBE_SEEDS.len() * PROBE_SEEDS.len()`).
+const MAX_PAIR_PROBES: usize = PROBE_SEEDS.len() * PROBE_SEEDS.len();
 
 /// One segment of a Subversion path pattern.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -618,69 +631,25 @@ impl PathPattern {
     }
     reached.iter().rposition(|&was| was)
   }
-
-  /// Whether any segment contains a wildcard (`*`, `**`, or an in-segment glob).
-  fn has_wildcard(&self) -> bool {
-    self
-      .segments
-      .iter()
-      .any(|segment| !matches!(segment, Segment::Literal(_)))
-  }
-
-  /// Builds a concrete repository path matched by this pattern, expanding the first `**` to
-  /// `any_expand` copies of `fresh` (and any further `**` to zero segments) and substituting `*`
-  /// inside segment globs with `star_fill`.
-  fn witness(&self, fresh: &[u8], any_expand: usize, star_fill: &[u8]) -> Option<Vec<u8>> {
-    let mut path = Vec::new();
-    let mut expanded_any = false;
-    for segment in &self.segments {
-      match segment {
-        Segment::Literal(bytes) => {
-          path.push(b'/');
-          path.extend_from_slice(bytes);
-        }
-        Segment::One => {
-          path.push(b'/');
-          path.extend_from_slice(fresh);
-        }
-        Segment::Any if !expanded_any => {
-          expanded_any = true;
-          for _ in 0..any_expand {
-            path.push(b'/');
-            path.extend_from_slice(fresh);
-          }
-        }
-        Segment::Any => {}
-        Segment::Glob { raw, glob } => {
-          let concrete = witness_glob_segment(raw, glob, star_fill)?;
-          path.push(b'/');
-          path.extend_from_slice(&concrete);
-        }
-      }
-    }
-    if path.is_empty() {
-      path.push(b'/');
-    }
-    Some(path)
-  }
 }
 
-/// Advances past a POSIX character class `[:...:]` starting at `open`, returning the index
-/// immediately after `:]`, or `None` when no valid class starts there.
+/// Advances past a POSIX character class `[:name:]` starting at `open`, matching
+/// `slates_vcs::wildmatch::class`: closed by the first `]` after `[:` only when preceded by `:`.
 fn skip_posix_class(raw: &[u8], open: usize) -> Option<usize> {
-  let body_start = open.saturating_add(POSIX_CLASS_OPEN.len());
-  if raw.get(open..body_start) != Some(POSIX_CLASS_OPEN) {
+  let name_start = open.saturating_add(POSIX_CLASS_OPEN.len());
+  if raw.get(open..name_start) != Some(POSIX_CLASS_OPEN) {
     return None;
   }
-  let rest = raw.get(body_start..)?;
-  let close = rest
-    .windows(POSIX_CLASS_CLOSE.len())
-    .position(|pair| pair == POSIX_CLASS_CLOSE)?;
-  Some(
-    body_start
-      .saturating_add(close)
-      .saturating_add(POSIX_CLASS_CLOSE.len()),
-  )
+  let offset = raw
+    .get(name_start..)?
+    .iter()
+    .position(|&byte| byte == b']')?;
+  let close = name_start.saturating_add(offset);
+  let colon = close
+    .checked_sub(1)
+    .filter(|&at| at >= name_start && raw.get(at) == Some(&b':'))?;
+  let _ = colon;
+  Some(close.saturating_add(1))
 }
 
 /// Finds the index immediately after the closing `]` of a glob bracket expression starting at
@@ -695,7 +664,10 @@ fn bracket_end(raw: &[u8], open: usize) -> Option<usize> {
   }
   while let Some(&byte) = raw.get(at) {
     match byte {
-      b'\\' => at = at.saturating_add(ESCAPED_BYTE_LEN),
+      b'\\' => {
+        raw.get(at.saturating_add(1))?;
+        at = at.saturating_add(ESCAPED_BYTE_LEN);
+      }
       b'[' => at = skip_posix_class(raw, at).unwrap_or_else(|| at.saturating_add(1)),
       b']' => return Some(at.saturating_add(1)),
       _ => at = at.saturating_add(1),
@@ -704,66 +676,562 @@ fn bracket_end(raw: &[u8], open: usize) -> Option<usize> {
   None
 }
 
-/// Picks a concrete non-slash, non-NUL byte matched by the single bracket expression `slice`
-/// using [`Glob::new`], or `None` when the bracket expression matches nothing.
-fn pick_bracket_byte(slice: &[u8]) -> Option<u8> {
+/// Compiles one `[...]` bracket expression slice into a 256-bit byte set via [`Glob::new`], or
+/// `None` when the bracket matches no byte (empty range or unknown POSIX class).
+fn bracket_byte_set(slice: &[u8]) -> Option<[u64; slates_svn::authz::BYTE_SET_WORDS]> {
   let sub = Glob::new(slice);
-  (b'a'..=b'z')
-    .chain(1_u8..=u8::MAX)
-    .find(|&byte| byte != b'/' && sub.matches(&[byte]))
-}
-
-/// Constructs a non-empty concrete path segment matching `glob` by substituting `*` with
-/// `star_fill`, `?` with `b'a'`, and `[...]` with [`pick_bracket_byte`].
-fn witness_glob_segment(raw: &[u8], glob: &Glob, star_fill: &[u8]) -> Option<Vec<u8>> {
-  let mut out = Vec::new();
-  let mut at = 0;
-  while let Some(&byte) = raw.get(at) {
-    match byte {
-      b'\\' => {
-        let &escaped = raw.get(at.saturating_add(1))?;
-        out.push(escaped);
-        at = at.saturating_add(ESCAPED_BYTE_LEN);
-      }
-      b'*' => {
-        out.extend_from_slice(star_fill);
-        at = at.saturating_add(1);
-      }
-      b'?' => {
-        out.push(b'a');
-        at = at.saturating_add(1);
-      }
-      b'[' => {
-        let end = bracket_end(raw, at)?;
-        let chosen = pick_bracket_byte(raw.get(at..end)?)?;
-        out.push(chosen);
-        at = end;
-      }
-      other => {
-        out.push(other);
-        at = at.saturating_add(1);
+  let mut bits = [0u64; slates_svn::authz::BYTE_SET_WORDS];
+  let mut any = false;
+  for byte in 0u8..=u8::MAX {
+    if sub.matches(&[byte]) {
+      let word = usize::from(byte >> BYTE_WORD_SHIFT);
+      if let Some(slot) = bits.get_mut(word) {
+        *slot |= 1u64 << u32::from(byte & BYTE_BIT_MASK);
+        any = true;
       }
     }
   }
-  (!out.is_empty() && glob.matches(&out)).then_some(out)
+  any.then_some(bits)
 }
 
-/// Returns a deterministic non-empty ASCII path segment distinct from every literal segment in
-/// `rules`, preventing wildcard witnesses from colliding with literal `Deny` rules.
-fn fresh_segment(rules: &[Rule<PathPattern>]) -> Vec<u8> {
-  let has_literal = |candidate: &[u8]| {
-    rules.iter().any(|rule| {
-      rule.pattern.segments.iter().any(|segment| match segment {
-        Segment::Literal(bytes) => bytes.as_slice() == candidate,
-        _ => false,
-      })
-    })
+/// Compiles the bracket expression starting at `at` into one [`slates_svn::authz::GlobToken`]
+/// and the next index in `raw`.
+fn bracket_token(raw: &[u8], at: usize) -> (slates_svn::authz::GlobToken, usize) {
+  use slates_svn::authz::GlobToken;
+  let Some(end) = bracket_end(raw, at) else {
+    return (GlobToken::Never, raw.len());
   };
-  let mut candidate = b"a".to_vec();
-  while has_literal(&candidate) {
-    candidate.push(b'a');
+  let Some(slice) = raw.get(at..end) else {
+    return (GlobToken::Never, raw.len());
+  };
+  let token = bracket_byte_set(slice).map_or(GlobToken::Never, GlobToken::ByteSet);
+  (token, end)
+}
+
+/// Decodes one [`slates_svn::authz::GlobToken`] at `at` and returns `(token, next_at)`.
+fn next_glob_token(raw: &[u8], at: usize) -> (slates_svn::authz::GlobToken, usize) {
+  use slates_svn::authz::GlobToken;
+  match raw.get(at).copied() {
+    Some(b'\\') => {
+      raw
+        .get(at.saturating_add(1))
+        .map_or((GlobToken::Never, raw.len()), |&escaped| {
+          (
+            GlobToken::Byte(escaped),
+            at.saturating_add(ESCAPED_BYTE_LEN),
+          )
+        })
+    }
+    Some(b'*') => (GlobToken::Run, at.saturating_add(1)),
+    Some(b'?') => (GlobToken::AnyByte, at.saturating_add(1)),
+    Some(b'[') => bracket_token(raw, at),
+    Some(other) => (GlobToken::Byte(other), at.saturating_add(1)),
+    None => (GlobToken::Never, raw.len()),
   }
-  candidate
+}
+
+/// Compiles a single-segment glob pattern into [`slates_svn::authz::GlobToken`]s, shared by both
+/// effective-policy witness synthesis and `PrincipalRules::from_read_rules`.
+fn compile_glob_tokens(raw: &[u8]) -> Vec<slates_svn::authz::GlobToken> {
+  use slates_svn::authz::GlobToken;
+  let mut tokens = Vec::new();
+  let mut at = 0usize;
+  while at < raw.len() {
+    let (token, next) = next_glob_token(raw, at);
+    at = next;
+    if token == GlobToken::Never {
+      tokens.push(GlobToken::Never);
+      break;
+    }
+    if !(token == GlobToken::Run && tokens.last() == Some(&GlobToken::Run)) {
+      tokens.push(token);
+    }
+  }
+  tokens
+}
+
+/// Converts a compiled [`Segment`] into a [`slates_svn::authz::PolicySegment`] for `PrincipalRules`.
+fn policy_segment_of(segment: &Segment) -> slates_svn::authz::PolicySegment {
+  use slates_svn::authz::PolicySegment;
+  match segment {
+    Segment::Literal(bytes) => PolicySegment::Literal(bytes.as_slice().into()),
+    Segment::One => PolicySegment::AnyOne,
+    Segment::Any => PolicySegment::AnyMany,
+    Segment::Glob { raw, .. } => PolicySegment::Glob(compile_glob_tokens(raw).into_boxed_slice()),
+  }
+}
+
+/// Pushes `candidate` into `list` when not already present and `list.len() < cap`.
+fn push_unique_bytes(list: &mut Vec<Vec<u8>>, candidate: Vec<u8>, cap: usize) {
+  if list.len() < cap && !list.iter().any(|held| held == &candidate) {
+    list.push(candidate);
+  }
+}
+
+/// Whether `candidate` matches any `Literal` or `Glob` segment appearing in `deny_rules`.
+fn segment_matches_deny(candidate: &[u8], deny_rules: &[&Rule<PathPattern>]) -> bool {
+  deny_rules.iter().any(|rule| {
+    rule.pattern.segments.iter().any(|segment| match segment {
+      Segment::Literal(bytes) => bytes.as_slice() == candidate,
+      Segment::Glob { glob, .. } => glob.matches(candidate),
+      Segment::One | Segment::Any => false,
+    })
+  })
+}
+
+/// Longest literal segment length across `rules`.
+fn max_literal_len(rules: &[&Rule<PathPattern>]) -> usize {
+  rules
+    .iter()
+    .flat_map(|rule| rule.pattern.segments.iter())
+    .filter_map(|segment| match segment {
+      Segment::Literal(bytes) => Some(bytes.len()),
+      _ => None,
+    })
+    .max()
+    .unwrap_or(0)
+}
+
+/// Builds a bounded pool of non-empty ASCII witness segments prioritizing candidates that match no
+/// `Literal` or `Glob` segment in `deny_rules`, followed by diverse family fallbacks and literal
+/// segments from `allow_rules` (to uncover cross-rule wildcard intersections).
+fn fresh_segments(
+  deny_rules: &[&Rule<PathPattern>],
+  allow_rules: &[&Rule<PathPattern>],
+) -> Vec<Vec<u8>> {
+  let cap = MAX_SLOT_CANDIDATES.saturating_add(MAX_SLOT_CANDIDATES);
+  let long_len = max_literal_len(deny_rules).saturating_add(1);
+  let mut pool = Vec::new();
+  for &seed in PROBE_SEEDS {
+    let single = vec![seed];
+    if !segment_matches_deny(&single, deny_rules) {
+      push_unique_bytes(&mut pool, single, cap);
+    }
+  }
+  for &seed in PROBE_SEEDS {
+    let repeated = vec![seed; long_len];
+    if !segment_matches_deny(&repeated, deny_rules) {
+      push_unique_bytes(&mut pool, repeated, cap);
+    }
+  }
+  for &seed in PROBE_SEEDS {
+    push_unique_bytes(&mut pool, vec![seed], cap);
+  }
+  push_unique_bytes(&mut pool, vec![b'z'; long_len], cap);
+  append_allow_literals(&mut pool, allow_rules, cap);
+  pool
+}
+
+/// Appends distinct literal segments from `allow_rules` up to `cap` so overlapping wildcard rules
+/// across rights (such as `:glob:/a/*` and `:glob:/*/b`) share concrete probes.
+fn append_allow_literals(pool: &mut Vec<Vec<u8>>, allow_rules: &[&Rule<PathPattern>], cap: usize) {
+  for rule in allow_rules {
+    for segment in &rule.pattern.segments {
+      if let Segment::Literal(bytes) = segment
+        && !bytes.is_empty()
+      {
+        push_unique_bytes(pool, bytes.clone(), cap);
+      }
+    }
+  }
+}
+
+/// Candidate non-slash, non-NUL bytes matching one variable byte token (`AnyByte` or `ByteSet`),
+/// capped at [`MAX_SLOT_CANDIDATES`].
+fn slot_bytes(token: slates_svn::authz::GlobToken) -> Vec<u8> {
+  use slates_svn::authz::{GlobToken, byte_set_contains};
+  let bits = match token {
+    GlobToken::AnyByte => return PROBE_SEEDS.to_vec(),
+    GlobToken::ByteSet(bits) => bits,
+    GlobToken::Byte(_) | GlobToken::Run | GlobToken::Never => return Vec::new(),
+  };
+  let mut chosen = Vec::new();
+  let preferred = PROBE_SEEDS
+    .iter()
+    .copied()
+    .chain(b'a'..=b'z')
+    .chain(b'A'..=b'Z')
+    .chain(b'0'..=b'9')
+    .chain(1u8..=u8::MAX);
+  for byte in preferred {
+    if chosen.len() >= MAX_SLOT_CANDIDATES {
+      break;
+    }
+    if byte != b'/' && byte_set_contains(&bits, byte) && !chosen.contains(&byte) {
+      chosen.push(byte);
+    }
+  }
+  chosen
+}
+
+/// Instantiates `tokens` into one concrete segment using `slot_picks` for `AnyByte`/`ByteSet`
+/// tokens and `star_fill` for `Run` tokens.
+fn instantiate_glob(
+  tokens: &[slates_svn::authz::GlobToken],
+  slot_picks: &[u8],
+  star_fill: &[u8],
+) -> Vec<u8> {
+  use slates_svn::authz::GlobToken;
+  let mut out = Vec::new();
+  let mut slot = 0usize;
+  for &token in tokens {
+    match token {
+      GlobToken::Byte(byte) => out.push(byte),
+      GlobToken::AnyByte | GlobToken::ByteSet(_) => {
+        if let Some(&byte) = slot_picks.get(slot) {
+          out.push(byte);
+        }
+        slot = slot.saturating_add(1);
+      }
+      GlobToken::Run => out.extend_from_slice(star_fill),
+      GlobToken::Never => {}
+    }
+  }
+  out
+}
+
+/// Collects valid, deduplicated segment candidates for `glob`, prioritizing those matching no deny
+/// rule segment.
+fn glob_segment_candidates(
+  raw: &[u8],
+  glob: &Glob,
+  fresh_pool: &[Vec<u8>],
+  deny_rules: &[&Rule<PathPattern>],
+) -> Vec<Vec<u8>> {
+  use slates_svn::authz::GlobToken;
+  let tokens = compile_glob_tokens(raw);
+  if tokens.contains(&GlobToken::Never) {
+    return Vec::new();
+  }
+  let mut slots: Vec<Vec<u8>> = Vec::new();
+  for &token in &tokens {
+    if matches!(token, GlobToken::AnyByte | GlobToken::ByteSet(_)) {
+      let bytes = slot_bytes(token);
+      if bytes.is_empty() {
+        return Vec::new();
+      }
+      slots.push(bytes);
+    }
+  }
+  let cap = MAX_SLOT_CANDIDATES.saturating_add(MAX_SLOT_CANDIDATES);
+  let mut raw_candidates = Vec::new();
+  collect_glob_variants(&tokens, &slots, fresh_pool, glob, cap, &mut raw_candidates);
+  prioritize_non_colliding(raw_candidates, deny_rules)
+}
+
+/// Pushes a candidate segment if non-empty, valid, and matched by `glob`.
+fn record_glob_candidate(candidate: Vec<u8>, glob: &Glob, cap: usize, out: &mut Vec<Vec<u8>>) {
+  if !candidate.is_empty()
+    && !candidate.contains(&b'/')
+    && !candidate.contains(&0)
+    && glob.matches(&candidate)
+  {
+    push_unique_bytes(out, candidate, cap);
+  }
+}
+
+/// Generates per-slot byte variants for `slot_idx` against `base_picks` and `fills`.
+fn collect_slot_variants(
+  tokens: &[slates_svn::authz::GlobToken],
+  base_picks: &[u8],
+  slot_idx: usize,
+  choices: &[u8],
+  alt_fill: Option<&[u8]>,
+  glob: &Glob,
+  out: &mut Vec<Vec<u8>>,
+) {
+  let cap = MAX_SLOT_CANDIDATES.saturating_add(MAX_SLOT_CANDIDATES);
+  for &byte in choices.iter().skip(1) {
+    let mut picks = base_picks.to_vec();
+    if let Some(target) = picks.get_mut(slot_idx) {
+      *target = byte;
+    }
+    record_glob_candidate(instantiate_glob(tokens, &picks, b""), glob, cap, out);
+    if let Some(fill) = alt_fill {
+      record_glob_candidate(instantiate_glob(tokens, &picks, fill), glob, cap, out);
+    }
+  }
+}
+
+/// Generates base star-fill variants and per-slot byte variants for compiled `tokens`.
+fn collect_glob_variants(
+  tokens: &[slates_svn::authz::GlobToken],
+  slots: &[Vec<u8>],
+  fresh_pool: &[Vec<u8>],
+  glob: &Glob,
+  cap: usize,
+  out: &mut Vec<Vec<u8>>,
+) {
+  let has_run = tokens.contains(&slates_svn::authz::GlobToken::Run);
+  let base_picks: Vec<u8> = slots
+    .iter()
+    .filter_map(|choices| choices.first().copied())
+    .collect();
+  let mut fills: Vec<&[u8]> = vec![b""];
+  if has_run {
+    fills.extend(
+      fresh_pool
+        .iter()
+        .take(MAX_SLOT_CANDIDATES)
+        .map(Vec::as_slice),
+    );
+  }
+  for fill in &fills {
+    let built = instantiate_glob(tokens, &base_picks, fill);
+    record_glob_candidate(built, glob, cap, out);
+  }
+  let alt_fill = has_run.then(|| fills.get(1).copied().unwrap_or(b""));
+  for (slot_idx, choices) in slots.iter().enumerate() {
+    collect_slot_variants(tokens, &base_picks, slot_idx, choices, alt_fill, glob, out);
+  }
+}
+
+/// Orders candidates that match no `Literal`/`Glob` segment in `deny_rules` ahead of colliding ones.
+fn prioritize_non_colliding(
+  candidates: Vec<Vec<u8>>,
+  deny_rules: &[&Rule<PathPattern>],
+) -> Vec<Vec<u8>> {
+  let (mut clean, mut colliding) = (Vec::new(), Vec::new());
+  for candidate in candidates {
+    if segment_matches_deny(&candidate, deny_rules) {
+      colliding.push(candidate);
+    } else {
+      clean.push(candidate);
+    }
+  }
+  clean.extend(colliding);
+  clean
+}
+
+/// Builds bounded `**` repetition schedules covering all-0, all-1, all-`deep_expand`, and
+/// single-slot variations across every `**` segment in a pattern.
+fn any_expansions(any_count: usize, deep_expand: usize) -> Vec<Vec<usize>> {
+  if any_count == 0 {
+    return vec![Vec::new()];
+  }
+  let mut schedules = Vec::new();
+  let mut push = |schedule: Vec<usize>| {
+    if !schedules.contains(&schedule) {
+      schedules.push(schedule);
+    }
+  };
+  push(vec![0; any_count]);
+  push(vec![1; any_count]);
+  push(vec![deep_expand; any_count]);
+  for slot in 0..any_count {
+    for &(base, varied) in &[(0, 1), (0, deep_expand), (1, 0), (1, deep_expand)] {
+      let mut schedule = vec![base; any_count];
+      if let Some(entry) = schedule.get_mut(slot) {
+        *entry = varied;
+      }
+      push(schedule);
+    }
+  }
+  schedules
+}
+
+/// Assembles a concrete canonical repository path from `pattern`, per-segment choices `chosen`,
+/// `**` repeat counts `any_counts`, and filler `fresh_fill`.
+fn assemble_witness(
+  segments: &[Segment],
+  chosen: &[Option<&[u8]>],
+  any_counts: &[usize],
+  fresh_fill: &[u8],
+) -> Vec<u8> {
+  let mut path = Vec::new();
+  let mut any_idx = 0usize;
+  for (seg_idx, segment) in segments.iter().enumerate() {
+    if *segment == Segment::Any {
+      let repeats = any_counts.get(any_idx).copied().unwrap_or(0);
+      any_idx = any_idx.saturating_add(1);
+      for _ in 0..repeats {
+        path.push(b'/');
+        path.extend_from_slice(fresh_fill);
+      }
+      continue;
+    }
+    if let Some(Some(bytes)) = chosen.get(seg_idx) {
+      path.push(b'/');
+      path.extend_from_slice(bytes);
+    }
+  }
+  if path.is_empty() {
+    path.push(b'/');
+  }
+  path
+}
+
+/// Computes per-segment concrete candidate lists for `pattern`, returning `None` if any non-`**`
+/// segment cannot match any concrete byte sequence (such as an unclosed `[`).
+fn pattern_segment_candidates(
+  pattern: &PathPattern,
+  fresh_pool: &[Vec<u8>],
+  deny_rules: &[&Rule<PathPattern>],
+) -> Option<Vec<Vec<Vec<u8>>>> {
+  let mut lists = Vec::with_capacity(pattern.segments.len());
+  for segment in &pattern.segments {
+    let candidates = match segment {
+      Segment::Literal(bytes) => vec![bytes.clone()],
+      Segment::One => fresh_pool.to_vec(),
+      Segment::Any => Vec::new(),
+      Segment::Glob { raw, glob } => {
+        let built = glob_segment_candidates(raw, glob, fresh_pool, deny_rules);
+        if built.is_empty() {
+          return None;
+        }
+        built
+      }
+    };
+    lists.push(candidates);
+  }
+  Some(lists)
+}
+
+/// Tests concrete witnesses generated from `pattern` against `accepts`: Pass 1 tests the best
+/// candidate per segment across all `**` schedules and `fresh_pool` fills; Pass 2 varies each
+/// individual variable segment; Pass 3 varies pairs of multi-candidate segments up to
+/// [`MAX_PAIR_PROBES`].
+fn try_pattern_witnesses(
+  pattern: &PathPattern,
+  fresh_pool: &[Vec<u8>],
+  deny_rules: &[&Rule<PathPattern>],
+  deep_expand: usize,
+  accepts: &impl Fn(&[u8]) -> bool,
+) -> bool {
+  let Some(lists) = pattern_segment_candidates(pattern, fresh_pool, deny_rules) else {
+    return false;
+  };
+  let any_count = pattern
+    .segments
+    .iter()
+    .filter(|segment| **segment == Segment::Any)
+    .count();
+  let schedules = any_expansions(any_count, deep_expand);
+  let base: Vec<Option<&[u8]>> = lists
+    .iter()
+    .map(|items| items.first().map(Vec::as_slice))
+    .collect();
+  if try_default_witnesses(&pattern.segments, &base, &schedules, fresh_pool, accepts) {
+    return true;
+  }
+  let fill = fresh_pool.first().map_or(b"z".as_slice(), Vec::as_slice);
+  if try_single_segment_variants(&pattern.segments, &lists, &base, &schedules, fill, accepts) {
+    return true;
+  }
+  try_pair_segment_variants(&pattern.segments, &lists, &base, &schedules, fill, accepts)
+}
+
+/// Pass 1: checks `base` segment choices across every `**` schedule and `fresh_pool` filler.
+fn try_default_witnesses(
+  segments: &[Segment],
+  base: &[Option<&[u8]>],
+  schedules: &[Vec<usize>],
+  fresh_pool: &[Vec<u8>],
+  accepts: &impl Fn(&[u8]) -> bool,
+) -> bool {
+  let fillers: &[Vec<u8>] = if schedules.iter().any(|s| s.iter().any(|&n| n > 0)) {
+    fresh_pool
+  } else {
+    fresh_pool.get(..1).unwrap_or(fresh_pool)
+  };
+  for schedule in schedules {
+    for fill in fillers {
+      let path = assemble_witness(segments, base, schedule, fill);
+      if accepts(&path) {
+        return true;
+      }
+    }
+  }
+  false
+}
+
+/// Whether `chosen` satisfies `accepts` under any `**` repetition schedule in `schedules`.
+fn matches_any_schedule(
+  segments: &[Segment],
+  chosen: &[Option<&[u8]>],
+  schedules: &[Vec<usize>],
+  fill: &[u8],
+  accepts: &impl Fn(&[u8]) -> bool,
+) -> bool {
+  schedules
+    .iter()
+    .any(|schedule| accepts(&assemble_witness(segments, chosen, schedule, fill)))
+}
+
+/// Pass 2: varies each individual segment with >1 candidate across every `**` schedule.
+fn try_single_segment_variants(
+  segments: &[Segment],
+  lists: &[Vec<Vec<u8>>],
+  base: &[Option<&[u8]>],
+  schedules: &[Vec<usize>],
+  fill: &[u8],
+  accepts: &impl Fn(&[u8]) -> bool,
+) -> bool {
+  for (seg_idx, choices) in lists.iter().enumerate() {
+    for alt in choices.iter().skip(1) {
+      let mut chosen = base.to_vec();
+      if let Some(slot) = chosen.get_mut(seg_idx) {
+        *slot = Some(alt.as_slice());
+      }
+      if matches_any_schedule(segments, &chosen, schedules, fill, accepts) {
+        return true;
+      }
+    }
+  }
+  false
+}
+
+/// Clones `base` with two segment slots replaced by `a` and `b`.
+fn with_pair_choices<'a>(
+  base: &[Option<&'a [u8]>],
+  first: (usize, &'a [u8]),
+  second: (usize, &'a [u8]),
+) -> Vec<Option<&'a [u8]>> {
+  let mut chosen = base.to_vec();
+  if let Some(slot) = chosen.get_mut(first.0) {
+    *slot = Some(first.1);
+  }
+  if let Some(slot) = chosen.get_mut(second.0) {
+    *slot = Some(second.1);
+  }
+  chosen
+}
+
+/// Pass 3: varies pairs of the first two multi-candidate segments up to [`MAX_PAIR_PROBES`].
+fn try_pair_segment_variants(
+  segments: &[Segment],
+  lists: &[Vec<Vec<u8>>],
+  base: &[Option<&[u8]>],
+  schedules: &[Vec<usize>],
+  fill: &[u8],
+  accepts: &impl Fn(&[u8]) -> bool,
+) -> bool {
+  let mut multi = lists
+    .iter()
+    .enumerate()
+    .filter_map(|(idx, choices)| (choices.len() > 1).then_some(idx));
+  let (Some(first), Some(second)) = (multi.next(), multi.next()) else {
+    return false;
+  };
+  let (Some(first_list), Some(second_list)) = (lists.get(first), lists.get(second)) else {
+    return false;
+  };
+  let schedule = schedules.first().map_or(&[][..], Vec::as_slice);
+  let pairs = first_list
+    .iter()
+    .flat_map(|a| {
+      second_list
+        .iter()
+        .map(move |b| (a.as_slice(), b.as_slice()))
+    })
+    .take(MAX_PAIR_PROBES);
+  for (a, b) in pairs {
+    let chosen = with_pair_choices(base, (first, a), (second, b));
+    if accepts(&assemble_witness(segments, &chosen, schedule, fill)) {
+      return true;
+    }
+  }
+  false
 }
 
 /// A repository path's segments, as authz's lookup reads them: repeated slashes as one, leading and trailing ones as
@@ -841,15 +1309,30 @@ impl SvnPolicy {
     decide(&self.rules, best.map(|(_, position)| position))
   }
 
-  /// Whether `principal` effectively holds `right` on at least one path under this policy,
-  /// accounting for `PolicyEffect::Deny` precedence at root and subpaths.
-  fn holds_right(&self, allow_unruled: bool, principal: &Principal, right: Right) -> bool {
-    match self.verdict(b"/", principal, right) {
-      Verdict::Allowed { .. } => return true,
-      Verdict::Unruled if allow_unruled => return true,
-      Verdict::Denied { .. } | Verdict::Unruled | Verdict::NotListed => {}
+  /// Whether at least one concrete repository path satisfies `accepts`, searching `/` and
+  /// synthesized witnesses from every `Allow` rule matching any right in `rights` for `principal`.
+  fn exists_witness(
+    &self,
+    principal: &Principal,
+    rights: &[Right],
+    accepts: impl Fn(&[u8]) -> bool,
+  ) -> bool {
+    if accepts(b"/") {
+      return true;
     }
-    let fresh = fresh_segment(&self.rules);
+    let speaks_any =
+      |rule: &&Rule<PathPattern>| rights.iter().any(|&right| rule.speaks(principal, right));
+    let deny_rules: Vec<&Rule<PathPattern>> = self
+      .rules
+      .iter()
+      .filter(|rule| rule.effect == Effect::Deny && speaks_any(rule))
+      .collect();
+    let allow_rules: Vec<&Rule<PathPattern>> = self
+      .rules
+      .iter()
+      .filter(|rule| rule.effect == Effect::Allow && speaks_any(rule))
+      .collect();
+    let fresh_pool = fresh_segments(&deny_rules, &allow_rules);
     let deep_expand = self
       .rules
       .iter()
@@ -857,37 +1340,14 @@ impl SvnPolicy {
       .max()
       .unwrap_or(0)
       .saturating_add(1);
-    self.rules.iter().any(|rule| {
-      rule.effect == Effect::Allow
-        && rule.speaks(principal, right)
-        && self.rule_survives_deny(&rule.pattern, principal, right, &fresh, deep_expand)
-    })
-  }
-
-  /// Whether at least one concrete witness path generated from `pattern` evaluates to
-  /// [`Verdict::Allowed`] rather than being shadowed by an equal-or-deeper/later `Deny` rule.
-  fn rule_survives_deny(
-    &self,
-    pattern: &PathPattern,
-    principal: &Principal,
-    right: Right,
-    fresh: &[u8],
-    deep_expand: usize,
-  ) -> bool {
-    let passes: &[(usize, &[u8])] = if pattern.has_wildcard() {
-      &[(0, b""), (deep_expand, fresh)]
-    } else {
-      &[(0, b"")]
-    };
-    passes.iter().any(|&(any_expand, star_fill)| {
-      pattern
-        .witness(fresh, any_expand, star_fill)
-        .is_some_and(|path| {
-          matches!(
-            self.verdict(&path, principal, right),
-            Verdict::Allowed { .. }
-          )
-        })
+    allow_rules.iter().any(|rule| {
+      try_pattern_witnesses(
+        &rule.pattern,
+        &fresh_pool,
+        &deny_rules,
+        deep_expand,
+        &accepts,
+      )
     })
   }
 }
@@ -1253,8 +1713,8 @@ fn compile_svn_policy(rules: &[slates_db::catalog::PolicyRule]) -> Result<SvnPol
 }
 
 /// Evaluates `principal`'s effective repository-level Subversion access on `record`, honoring
-/// `PolicyEffect::Deny` precedence and requiring effective `Read` for any access (`None < Read <
-/// Write`).
+/// `PolicyEffect::Deny` precedence and requiring at least one concrete path that is BOTH readable
+/// and writable before granting [`SvnAccess::Write`] (`None < Read < Write`).
 pub(crate) fn svn_access(
   record: &RepositoryRecord,
   principal: &Principal,
@@ -1263,16 +1723,64 @@ pub(crate) fn svn_access(
     return Ok(SvnAccess::None);
   };
   let is_owner = *principal == record.owner;
-  if !policy.holds_right(is_owner, principal, Right::Read) {
+  let readable =
+    |path: &[u8]| verdict_allows(policy.verdict(path, principal, Right::Read), is_owner);
+  if !policy.exists_witness(principal, &[Right::Read], readable) {
     return Ok(SvnAccess::None);
   }
-  let can_write = policy.holds_right(is_owner, principal, Right::Submit)
-    || policy.holds_right(false, principal, Right::Rewrite)
-    || policy.holds_right(false, principal, Right::Delete);
+  let read_and_write = |path: &[u8]| {
+    svn_path_writable(&policy, is_owner, principal, path, false)
+      || svn_path_writable(&policy, is_owner, principal, path, true)
+  };
+  let can_write = policy.exists_witness(
+    principal,
+    &[Right::Read, Right::Submit, Right::Rewrite, Right::Delete],
+    read_and_write,
+  );
   Ok(if can_write {
     SvnAccess::Write
   } else {
     SvnAccess::Read
+  })
+}
+
+/// Compiles `principal`'s per-path Subversion read rules from `record` into
+/// [`slates_svn::authz::PrincipalRules`] for all three transports (HTTP WebDAV, `svn://`, and
+/// `svn+ssh://`). Fails closed to [`slates_svn::authz::PrincipalRules::deny_all`] if `record` is
+/// not a Subversion repository or its policy is unreadable.
+pub(crate) fn svn_read_rules(
+  record: &RepositoryRecord,
+  principal: &Principal,
+) -> slates_svn::authz::PrincipalRules {
+  let Ok(Compiled::Subversion(policy)) = Compiled::of(record) else {
+    return slates_svn::authz::PrincipalRules::deny_all();
+  };
+  let is_owner = *principal == record.owner;
+  let read_rules: Vec<slates_svn::authz::ReadPathRule> = policy
+    .rules
+    .iter()
+    .filter(|rule| rule.speaks(principal, Right::Read))
+    .map(|rule| slates_svn::authz::ReadPathRule {
+      segments: rule
+        .pattern
+        .segments
+        .iter()
+        .map(policy_segment_of)
+        .collect(),
+      allow: rule.effect == Effect::Allow,
+    })
+    .collect();
+  slates_svn::authz::PrincipalRules::from_read_rules(is_owner, &read_rules)
+}
+
+/// Fail-closed wrapper around [`svn_read_rules`]: returns
+/// [`slates_svn::authz::PrincipalRules::deny_all`] when no repository record is held.
+pub(crate) fn svn_read_rules_for(
+  record: Option<&RepositoryRecord>,
+  principal: &Principal,
+) -> slates_svn::authz::PrincipalRules {
+  record.map_or_else(slates_svn::authz::PrincipalRules::deny_all, |record| {
+    svn_read_rules(record, principal)
   })
 }
 
@@ -1339,37 +1847,221 @@ pub(crate) fn svn_path_write_allowed(
   ))
 }
 
+/// Joins a canonical Subversion directory path and one child segment without doubling `/`.
+fn join_svn_child(parent: &str, child: &str) -> String {
+  if parent == "/" || parent.is_empty() {
+    format!("/{child}")
+  } else {
+    format!("{parent}/{child}")
+  }
+}
+
+/// Maps `path` under the deepest strict ancestor in `changes` carrying `copy_from`, so deleting a
+/// subdirectory copied earlier in the same commit still checks its inherited descendants.
+fn copied_ancestor(
+  changes: &[slates_svn::index::ChangedPath],
+  path: &str,
+) -> Option<(String, slates_svn::index::Revision)> {
+  let mut best: Option<(usize, String, slates_svn::index::Revision)> = None;
+  for change in changes {
+    let Some(copy_from) = &change.copy_from else {
+      continue;
+    };
+    let trimmed = change.path.trim_end_matches('/');
+    let suffix = if trimmed.is_empty() {
+      (path != "/").then_some(path)
+    } else {
+      path
+        .strip_prefix(trimmed)
+        .filter(|rest| rest.starts_with('/'))
+    };
+    let Some(suffix) = suffix else {
+      continue;
+    };
+    let mapped = format!("{}{suffix}", copy_from.path.trim_end_matches('/'));
+    if best
+      .as_ref()
+      .is_none_or(|(len, _, _)| trimmed.len() >= *len)
+    {
+      best = Some((trimmed.len(), mapped, copy_from.revision));
+    }
+  }
+  best.map(|(_, mapped, rev)| (mapped, rev))
+}
+
+/// Bundled Subversion policy context for commit-time path and subtree checks.
+struct SvnAuthorizer<'a> {
+  policy: &'a SvnPolicy,
+  is_owner: bool,
+  principal: &'a Principal,
+}
+
+impl SvnAuthorizer<'_> {
+  /// Whether `principal` may read `path`.
+  fn readable(&self, path: &[u8]) -> bool {
+    verdict_allows(
+      self.policy.verdict(path, self.principal, Right::Read),
+      self.is_owner,
+    )
+  }
+
+  /// Whether `principal` may write (or delete when `deleting`) `path`.
+  fn writable(&self, path: &[u8], deleting: bool) -> bool {
+    svn_path_writable(self.policy, self.is_owner, self.principal, path, deleting)
+  }
+
+  /// Checks the changed path itself, requiring BOTH delete and write for `Action::Replace`.
+  fn admit_target(&self, change: &slates_svn::index::ChangedPath) -> bool {
+    use slates_svn::index::Action;
+    let path = change.path.as_bytes();
+    match change.action {
+      Action::Delete => self.writable(path, true),
+      Action::Replace => self.writable(path, true) && self.writable(path, false),
+      Action::Add | Action::Modify => self.writable(path, false),
+    }
+  }
+
+  /// Checks one directory's immediate entries, pushing subdirectories onto `stack`.
+  fn visit_entries(
+    index: &slates_svn::index::Index,
+    (src_dir, dst_dir): (&str, &str),
+    entries: Vec<(String, slates_svn::index::NodeRevisionId)>,
+    stack: &mut Vec<(String, String)>,
+    check: &impl Fn(&str, &str) -> bool,
+  ) -> bool {
+    for (name, node_id) in entries {
+      let src_child = join_svn_child(src_dir, &name);
+      let dst_child = join_svn_child(dst_dir, &name);
+      if !check(&src_child, &dst_child) {
+        return false;
+      }
+      let Ok(node) = index.node_revision(node_id) else {
+        return false;
+      };
+      if node.kind() == slates_svn::index::NodeKind::Directory {
+        stack.push((src_child, dst_child));
+      }
+    }
+    true
+  }
+
+  /// Iteratively checks every existing descendant under `(src_root, rev)` mapped to `dst_root`,
+  /// requiring `check(src_desc, dst_desc)` on every descendant and failing closed on index errors.
+  fn walk_subtree(
+    &self,
+    index: &slates_svn::index::Index,
+    src_root: &str,
+    rev: slates_svn::index::Revision,
+    dst_root: &str,
+    check: impl Fn(&str, &str) -> bool,
+  ) -> bool {
+    let mut stack = vec![(src_root.to_owned(), dst_root.to_owned())];
+    while let Some((src_dir, dst_dir)) = stack.pop() {
+      let Ok(listing) = index.listing(&src_dir, rev) else {
+        return false;
+      };
+      let Some(entries) = listing else {
+        continue;
+      };
+      if !Self::visit_entries(index, (&src_dir, &dst_dir), entries, &mut stack, &check) {
+        return false;
+      }
+    }
+    true
+  }
+
+  /// Checks `copy_from` source readability and destination writability across the copied subtree.
+  fn admit_copy(
+    &self,
+    index: &slates_svn::index::Index,
+    change: &slates_svn::index::ChangedPath,
+    skip_subtrees: bool,
+  ) -> bool {
+    let Some(copy_from) = &change.copy_from else {
+      return true;
+    };
+    if !self.readable(copy_from.path.as_bytes()) {
+      return false;
+    }
+    skip_subtrees
+      || self.walk_subtree(
+        index,
+        &copy_from.path,
+        copy_from.revision,
+        &change.path,
+        |src, dst| self.readable(src.as_bytes()) && self.writable(dst.as_bytes(), false),
+      )
+  }
+
+  /// Checks deleted/replaced descendants at `base` and under any intra-commit copied ancestor.
+  fn admit_delete_subtree(
+    &self,
+    index: &slates_svn::index::Index,
+    base: slates_svn::index::Revision,
+    changes: &[slates_svn::index::ChangedPath],
+    change: &slates_svn::index::ChangedPath,
+    skip_subtrees: bool,
+  ) -> bool {
+    let deletes_tree = matches!(
+      change.action,
+      slates_svn::index::Action::Delete | slates_svn::index::Action::Replace
+    );
+    if skip_subtrees || !deletes_tree {
+      return true;
+    }
+    if !self.walk_subtree(index, &change.path, base, &change.path, |_, dst| {
+      self.writable(dst.as_bytes(), true)
+    }) {
+      return false;
+    }
+    match copied_ancestor(changes, &change.path) {
+      Some((src_mapped, src_rev)) => {
+        self.walk_subtree(index, &src_mapped, src_rev, &change.path, |_, dst| {
+          self.writable(dst.as_bytes(), true)
+        })
+      }
+      None => true,
+    }
+  }
+
+  /// Checks one changed path and any affected directory descendants on `Delete`, `Replace`, or
+  /// `copy_from`.
+  fn admit_change(
+    &self,
+    index: &slates_svn::index::Index,
+    base: slates_svn::index::Revision,
+    changes: &[slates_svn::index::ChangedPath],
+    change: &slates_svn::index::ChangedPath,
+    skip_subtrees: bool,
+  ) -> bool {
+    self.admit_target(change)
+      && self.admit_copy(index, change, skip_subtrees)
+      && self.admit_delete_subtree(index, base, changes, change, skip_subtrees)
+  }
+}
+
 /// Checks whether `principal` is allowed by `policy` (owned by `owner`) to commit every changed
-/// path (and read every copy-source path) in `changes`.
+/// path, deleted/replaced directory descendant at `base`, and copied source subtree in `changes`.
 pub(crate) fn admit_svn_changes(
   owner: &Principal,
   policy: &slates_db::catalog::RepositoryPolicy,
   principal: &Principal,
+  tree: (&slates_svn::index::Index, slates_svn::index::Revision),
   changes: &[slates_svn::index::ChangedPath],
 ) -> Result<(), PushRefusal> {
   let compiled = compile_svn_policy(&policy.rules)?;
   let is_owner = principal == owner;
-  for (index, change) in changes.iter().enumerate() {
-    let deleting = change.action == slates_svn::index::Action::Delete;
-    if !svn_path_writable(
-      &compiled,
-      is_owner,
-      principal,
-      change.path.as_bytes(),
-      deleting,
-    ) {
+  let skip_subtrees = compiled.rules.is_empty() && is_owner;
+  let authorizer = SvnAuthorizer {
+    policy: &compiled,
+    is_owner,
+    principal,
+  };
+  let (index, base) = tree;
+  for (index_pos, change) in changes.iter().enumerate() {
+    if !authorizer.admit_change(index, base, changes, change, skip_subtrees) {
       return Err(PushRefusal::NotPermitted {
-        index: index_of(index),
-      });
-    }
-    if let Some(copy_from) = &change.copy_from
-      && !verdict_allows(
-        compiled.verdict(copy_from.path.as_bytes(), principal, Right::Read),
-        is_owner,
-      )
-    {
-      return Err(PushRefusal::NotPermitted {
-        index: index_of(index),
+        index: index_of(index_pos),
       });
     }
   }
@@ -2875,8 +3567,9 @@ mod tests {
       properties: None,
       mergeinfo_modified: false,
     };
+    let empty = slates_svn::index::Index::new();
     let admitted = |c: ChangedPath| {
-      super::admit_svn_changes(&owner, &commit_policy.policy, &stranger, &[c]).is_ok()
+      super::admit_svn_changes(&owner, &commit_policy.policy, &stranger, (&empty, 0), &[c]).is_ok()
     };
     assert_eq!(
       [
@@ -2904,5 +3597,465 @@ mod tests {
     assert_svn_access_core_cases();
     assert_svn_access_glob_and_damaged_cases();
     assert_svn_commit_change_admission();
+  }
+
+  fn assert_glob_policy_grants_read(
+    label: &str,
+    rules: Vec<slates_db::catalog::PolicyRule>,
+    allowed_path: &[u8],
+    denied_path: &[u8],
+  ) {
+    let rec = record(slates_db::catalog::VcsTool::Subversion, rules);
+    let user = principal(STRANGER);
+    assert_eq!(
+      super::svn_access(&rec, &user),
+      Ok(super::SvnAccess::Read),
+      "{label}: svn_access must grant Read"
+    );
+    assert_eq!(
+      super::svn_path_read_allowed(&rec, &user, allowed_path),
+      Ok(true),
+      "{label}: allowed path must be readable"
+    );
+    assert_eq!(
+      super::svn_path_read_allowed(&rec, &user, denied_path),
+      Ok(false),
+      "{label}: denied path must be refused"
+    );
+  }
+
+  /// Round-4 Blocker 1 (regression in `5713cee6d`): Do evaluate all 5 legitimate allow+deny glob
+  /// policies (`*` vs `a*`, `[ab]` vs `/a`, `file?` vs `/filea`, `/x/**/y/**` vs `/x/**/y`,
+  /// `foo*` vs `/foo` + `/fooa`) plus truly eclipsed and malformed globs. Expect: all 5 grant
+  /// `SvnAccess::Read`, while eclipsed/malformed globs return `SvnAccess::None`.
+  #[test]
+  fn round4_blocker1_glob_witness_grants_five_legitimate_policies_and_blocks_eclipsed() {
+    use slates_db::catalog::{PolicyEffect, PolicyRight, PolicyWho, VcsTool};
+    let allow =
+      |p: &str| svn_path_rule(p, PolicyRight::Read, PolicyEffect::Allow, PolicyWho::Anyone);
+    let deny = |p: &str| svn_path_rule(p, PolicyRight::Read, PolicyEffect::Deny, PolicyWho::Anyone);
+
+    assert_glob_policy_grants_read(
+      "1: /trunk/* minus a*",
+      vec![allow(":glob:/trunk/*"), deny(":glob:/trunk/a*")],
+      b"/trunk/zebra.txt",
+      b"/trunk/apple.txt",
+    );
+    assert_glob_policy_grants_read(
+      "2: /[ab] minus /a",
+      vec![allow(":glob:/[ab]"), deny("/a")],
+      b"/b/ok.txt",
+      b"/a/no.txt",
+    );
+    assert_glob_policy_grants_read(
+      "3: /file? minus /filea",
+      vec![allow(":glob:/file?"), deny("/filea")],
+      b"/fileb",
+      b"/filea",
+    );
+    assert_glob_policy_grants_read(
+      "4: /x/**/y/** minus /x/**/y",
+      vec![allow(":glob:/x/**/y/**"), deny(":glob:/x/**/y")],
+      b"/x/mid/y/ok.txt",
+      b"/x/mid/y",
+    );
+    assert_glob_policy_grants_read(
+      "5: /trunk/foo* minus foo and fooa",
+      vec![
+        allow(":glob:/trunk/foo*"),
+        deny("/trunk/foo"),
+        deny("/trunk/fooa"),
+      ],
+      b"/trunk/foobar.txt",
+      b"/trunk/fooa",
+    );
+
+    let eclipsed_cases = [
+      vec![allow(":glob:/trunk/*"), deny(":glob:/trunk/*")],
+      vec![allow("/a"), deny("/a")],
+      vec![allow(":glob:/[unclosed")],
+      vec![allow(":glob:/trailing\\")],
+    ];
+    for rules in eclipsed_cases {
+      let rec = record(VcsTool::Subversion, rules);
+      assert_eq!(
+        super::svn_access(&rec, &principal(STRANGER)),
+        Ok(super::SvnAccess::None)
+      );
+    }
+  }
+
+  /// Round-4 Blocker 4 (joint Read+Write path requirement in `svn_access`): Do evaluate disjoint
+  /// `[Deny Read /, Allow Read /public, Deny Submit /, Allow Submit /private]` and overlapping
+  /// nested/glob policies. Expect: disjoint returns `SvnAccess::Read` (never `Write`); overlapping
+  /// returns `SvnAccess::Write`.
+  #[test]
+  fn round4_blocker4_svn_access_requires_common_read_and_write_path() {
+    use slates_db::catalog::{PolicyEffect, PolicyRight, PolicyWho, VcsTool};
+    let stranger = principal(STRANGER);
+    let disjoint = record(
+      VcsTool::Subversion,
+      vec![
+        svn_path_rule(
+          "/",
+          PolicyRight::Read,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/public",
+          PolicyRight::Read,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/",
+          PolicyRight::Submit,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/private",
+          PolicyRight::Submit,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+      ],
+    );
+    assert_eq!(
+      super::svn_access(&disjoint, &stranger),
+      Ok(super::SvnAccess::Read)
+    );
+
+    let nested = record(
+      VcsTool::Subversion,
+      vec![
+        svn_path_rule(
+          "/",
+          PolicyRight::Read,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/pub",
+          PolicyRight::Read,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/",
+          PolicyRight::Submit,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/pub/write",
+          PolicyRight::Submit,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+      ],
+    );
+    assert_eq!(
+      super::svn_access(&nested, &stranger),
+      Ok(super::SvnAccess::Write)
+    );
+
+    let glob_overlap = record(
+      VcsTool::Subversion,
+      vec![
+        svn_path_rule(
+          ":glob:/[ab]",
+          PolicyRight::Read,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/a",
+          PolicyRight::Read,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          ":glob:/[bc]",
+          PolicyRight::Submit,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/c",
+          PolicyRight::Submit,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+      ],
+    );
+    assert_eq!(
+      super::svn_access(&glob_overlap, &stranger),
+      Ok(super::SvnAccess::Write)
+    );
+  }
+
+  /// Round-4 Blocker 3 (red-first `Action::Replace`): Do submit an `Action::Replace` on `/trunk/f`
+  /// under `Deny Delete /trunk` and under `Deny Submit /trunk` + `Allow Delete /trunk`. Expect:
+  /// refused in BOTH cases because `Replace` requires both delete and write permission.
+  #[test]
+  fn round4_blocker3_action_replace_requires_both_delete_and_write() {
+    use slates_db::catalog::{PolicyEffect, PolicyRight, PolicyWho, VcsTool};
+    use slates_svn::index::{Action, ChangedPath, NodeKind};
+    let (owner, stranger) = (principal(OWNER), principal(STRANGER));
+    let deny_delete = record(
+      VcsTool::Subversion,
+      vec![
+        svn_path_rule(
+          "/",
+          PolicyRight::Read,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/",
+          PolicyRight::Submit,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/trunk",
+          PolicyRight::Delete,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+      ],
+    );
+    let delete_only = record(
+      VcsTool::Subversion,
+      vec![
+        svn_path_rule(
+          "/",
+          PolicyRight::Read,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/trunk",
+          PolicyRight::Delete,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+      ],
+    );
+    let replace = ChangedPath {
+      path: "/trunk/f".to_owned(),
+      action: Action::Replace,
+      kind: NodeKind::File,
+      copy_from: None,
+      text: None,
+      properties: None,
+      mergeinfo_modified: false,
+    };
+    let empty = slates_svn::index::Index::new();
+    assert!(
+      super::admit_svn_changes(
+        &owner,
+        &deny_delete.policy,
+        &stranger,
+        (&empty, 0),
+        std::slice::from_ref(&replace)
+      )
+      .is_err(),
+      "Action::Replace must be refused under Deny Delete /trunk"
+    );
+    assert!(
+      super::admit_svn_changes(
+        &owner,
+        &delete_only.policy,
+        &stranger,
+        (&empty, 0),
+        &[replace]
+      )
+      .is_err(),
+      "Action::Replace must be refused when user only has Delete without Submit/Rewrite"
+    );
+  }
+
+  fn build_subtree_index() -> slates_svn::index::Index {
+    use slates_svn::index::{Action, ChangedPath, Index, NodeKind, RevisionRecord};
+    let mut index = Index::new();
+    let add = |path: &str, kind: NodeKind| ChangedPath {
+      path: path.to_owned(),
+      action: Action::Add,
+      kind,
+      copy_from: None,
+      text: None,
+      properties: None,
+      mergeinfo_modified: false,
+    };
+    let rec = RevisionRecord {
+      transaction: "0-1".to_owned(),
+      changes: vec![
+        add("/dir", NodeKind::Directory),
+        add("/dir/ok.txt", NodeKind::File),
+        add("/dir/protected", NodeKind::Directory),
+        add("/dir/protected/keep.txt", NodeKind::File),
+        add("/pub", NodeKind::Directory),
+        add("/pub/ok.txt", NodeKind::File),
+        add("/pub/secret", NodeKind::Directory),
+        add("/pub/secret/vault.txt", NodeKind::File),
+        add("/clean", NodeKind::Directory),
+        add("/clean/item.txt", NodeKind::File),
+      ],
+    };
+    index.append(rec, 1 << 10).unwrap();
+    index
+  }
+
+  /// Round-4 Blocker 3 (directory Delete, Replace, and copy_from subtree checks): Do delete or
+  /// replace `/dir` containing denied `/dir/protected/keep.txt`, copy `/pub` containing denied
+  /// `/pub/secret/vault.txt` to `/exfil`, copy `/clean` into a destination with a denied child
+  /// `/dst/item.txt`, and delete/copy `/clean` where all descendants are allowed. Expect: all
+  /// subtree bypasses are refused while permitted subtree operations succeed.
+  #[test]
+  fn round4_blocker3_directory_delete_replace_and_copy_from_check_descendants() {
+    use slates_db::catalog::{PolicyEffect, PolicyRight, PolicyWho, VcsTool};
+    use slates_svn::index::{Action, ChangedPath, CopySource, NodeKind};
+    let index = build_subtree_index();
+    let (owner, stranger) = (principal(OWNER), principal(STRANGER));
+    let pol = record(
+      VcsTool::Subversion,
+      vec![
+        svn_path_rule(
+          "/",
+          PolicyRight::Read,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/",
+          PolicyRight::Submit,
+          PolicyEffect::Allow,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/dir/protected",
+          PolicyRight::Delete,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/pub/secret",
+          PolicyRight::Read,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+        svn_path_rule(
+          "/dst/item.txt",
+          PolicyRight::Submit,
+          PolicyEffect::Deny,
+          PolicyWho::Anyone,
+        ),
+      ],
+    );
+    let ch = |path: &str, action: Action, copy_from: Option<&str>| ChangedPath {
+      path: path.to_owned(),
+      action,
+      kind: NodeKind::Directory,
+      copy_from: copy_from.map(|src| CopySource {
+        path: src.to_owned(),
+        revision: 1,
+      }),
+      text: None,
+      properties: None,
+      mergeinfo_modified: false,
+    };
+    let check = |c: ChangedPath| {
+      super::admit_svn_changes(&owner, &pol.policy, &stranger, (&index, 1), &[c]).is_ok()
+    };
+    assert!(
+      !check(ch("/dir", Action::Delete, None)),
+      "dir delete must check denied descendant"
+    );
+    assert!(
+      !check(ch("/dir", Action::Replace, None)),
+      "dir replace must check denied descendant"
+    );
+    assert!(
+      !check(ch("/exfil", Action::Add, Some("/pub"))),
+      "dir copy_from must check denied source descendant"
+    );
+    assert!(
+      !check(ch("/dst", Action::Add, Some("/clean"))),
+      "dir copy_from must check denied dest descendant"
+    );
+    assert!(
+      check(ch("/clean", Action::Delete, None)),
+      "allowed dir delete must succeed"
+    );
+    assert!(
+      check(ch("/copied", Action::Add, Some("/clean"))),
+      "allowed dir copy must succeed"
+    );
+  }
+
+  /// Round-4 Blocker 2 (equivalence between `svn_read_rules` and `svn_path_read_allowed`): Do
+  /// evaluate both on root, literals, subpaths, `Deny` under `Allow`, `Allow` under `Deny`, owner,
+  /// and globs (`*`, `**`, `?`, `[ab]`, `[[:alpha:]]`, `\x`, unclosed `[`, trailing `\`). Expect:
+  /// bit-exact agreement on every path.
+  #[test]
+  fn round4_blocker2_svn_read_rules_matches_svn_path_read_allowed() {
+    use slates_db::catalog::{PolicyEffect, PolicyRight, PolicyWho, VcsTool};
+    let allow =
+      |p: &str| svn_path_rule(p, PolicyRight::Read, PolicyEffect::Allow, PolicyWho::Anyone);
+    let deny = |p: &str| svn_path_rule(p, PolicyRight::Read, PolicyEffect::Deny, PolicyWho::Anyone);
+    let rec = record(
+      VcsTool::Subversion,
+      vec![
+        allow("/"),
+        deny("/secret"),
+        allow("/secret/public"),
+        deny("/pub/secret"),
+        deny(":glob:/trunk/a*"),
+        deny(":glob:/pick/[ab]"),
+        deny(":glob:/file?"),
+        allow("/fileb"),
+        deny(":glob:/x/**/vault"),
+        allow(":glob:/x/**/vault/open"),
+        deny(":glob:/cls/[[:digit:]]"),
+        deny(":glob:/esc/\\*star"),
+        deny(":glob:/bad/[unclosed"),
+        deny(":glob:/bad/trail\\"),
+      ],
+    );
+    let paths = [
+      "/",
+      "/pub/ok.txt",
+      "/pub/secret",
+      "/pub/secret/vault.txt",
+      "/secret",
+      "/secret/top.txt",
+      "/secret/public/ok.txt",
+      "/trunk/apple.txt",
+      "/trunk/zebra.txt",
+      "/pick/a/f",
+      "/pick/c/f",
+      "/filea",
+      "/fileb",
+      "/x/vault/k",
+      "/x/m/n/vault/k",
+      "/x/m/vault/open/ok",
+      "/cls/7",
+      "/cls/z",
+      "/esc/*star",
+      "/esc/xstar",
+      "/bad/[unclosed",
+      "/bad/trail\\",
+    ];
+    for user in [principal(OWNER), principal(STRANGER)] {
+      let compiled = super::svn_read_rules(&rec, &user);
+      for path in paths {
+        let expected = super::svn_path_read_allowed(&rec, &user, path.as_bytes()).unwrap();
+        let actual = slates_svn::authz::may_read(Some(&compiled), path);
+        assert_eq!(actual, expected, "mismatch for {user:?} at {path}");
+      }
+    }
   }
 }

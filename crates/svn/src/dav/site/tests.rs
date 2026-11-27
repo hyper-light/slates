@@ -1254,6 +1254,192 @@ fn deltav_v1_an_unknown_vcc_or_a_future_baseline_is_refused() {
   assert_eq!((other.status, future.status), (500, 404));
 }
 
+/// Round-4 Blocker 2 (`update-report` on unreadable root): Do send a `REPORT /!svn/vcc/default`
+/// targeting `/trunk/secret` as anonymous (denied by authz rules). Expect: `ReportProgress::Refused`
+/// with HTTP `403 Forbidden`, `<m:human-readable errcode="220000">`, and zero leaked bytes.
+#[test]
+fn update_report_on_unreadable_root_returns_403_with_220000() {
+  let fixture = Fixture::new();
+  let rules = rules_of(None);
+  let body = format!(
+    "<S:update-report send-all=\"true\" xmlns:S=\"svn:\">\
+     <S:src-path>{ROOT}/trunk/secret</S:src-path>\
+     <S:target-revision>6</S:target-revision>\
+     <S:entry rev=\"0\" start-empty=\"true\"></S:entry>\
+     </S:update-report>"
+  );
+  let answer = fixture.ask(
+    Some(&rules),
+    "REPORT",
+    ("/!svn/vcc/default", None),
+    body.as_bytes(),
+  );
+  let (_, out, ended) = reported(&fixture, Some(&rules), answer, ROOM);
+  assert!(out.is_empty(), "must not stream bytes before refusal");
+  let ReportProgress::Refused(refused) = ended else {
+    panic!("expected refusal, got {ended:?}");
+  };
+  let text = text_of(&refused);
+  assert_eq!(refused.status, 403, "expected 403: {text}");
+  assert!(text.contains("errcode=\"220000\""), "{text}");
+}
+
+/// A timed budget whose 1 ns quantum is already spent by the first step boundary.
+fn timed_expired_budget() -> Budget {
+  Budget {
+    room: ROOM,
+    steps: 1,
+    quantum: Some(Quantum {
+      now_ns: tick,
+      ns: 1,
+    }),
+  }
+}
+
+/// Drives an `update-report` on `/trunk/secret` (denied to anonymous) with `budget`, proving slice 1 yields
+/// `ReportProgress::More` with zero bytes written and slice 2 returns `ReportProgress::Refused` (`403`, `220000`)
+/// instead of `ReportProgress::Broken`.
+fn assert_update_refused_after_empty_slice(fixture: &Fixture, budget: Budget) {
+  let rules = rules_of(None);
+  let body = format!(
+    "<S:update-report send-all=\"true\" xmlns:S=\"svn:\">\
+     <S:src-path>{ROOT}/trunk/secret</S:src-path>\
+     <S:target-revision>6</S:target-revision>\
+     <S:entry rev=\"0\" start-empty=\"true\"></S:entry>\
+     </S:update-report>"
+  );
+  let Answer::Report(mut report) = fixture.ask(
+    Some(&rules),
+    "REPORT",
+    ("/!svn/vcc/default", None),
+    body.as_bytes(),
+  ) else {
+    panic!("expected streaming update-report");
+  };
+  let mut out = Vec::new();
+  let first = report.resume(&fixture.served(Some(&rules)), &mut out, budget);
+  assert_eq!(
+    (first, out.is_empty()),
+    (ReportProgress::More, true),
+    "slice 1 must pause with zero bytes written"
+  );
+  let second = report.resume(&fixture.served(Some(&rules)), &mut out, budget);
+  let ReportProgress::Refused(refused) = second else {
+    panic!("expected refusal after empty-slice pause, got {second:?}");
+  };
+  let text = text_of(&refused);
+  assert_eq!(
+    (
+      out.is_empty(),
+      refused.status,
+      text.contains("errcode=\"220000\"")
+    ),
+    (true, 403, true),
+    "{text}"
+  );
+}
+
+/// Regression (`update.rs` `begun` flag on empty-slice pause): Do drive a `REPORT /!svn/vcc/default` on the unreadable
+/// `/trunk/secret` root with both an expired timed quantum and a 1-byte untimed budget so slice 1 pauses with
+/// `ReportProgress::More` and zero bytes written. Expect slice 2 to return `ReportProgress::Refused` (`403`, `220000`),
+/// never `ReportProgress::Broken`.
+#[test]
+fn update_report_on_unreadable_root_refuses_after_empty_slice_pause() {
+  let fixture = Fixture::new();
+  assert_update_refused_after_empty_slice(&fixture, timed_expired_budget());
+  assert_update_refused_after_empty_slice(&fixture, untimed(1));
+}
+
+/// Streams a REPORT under `budget` to its terminal state.
+fn reported_with_budget(
+  fixture: &Fixture,
+  rules: Option<&PrincipalRules>,
+  answer: Answer,
+  budget: Budget,
+) -> (Vec<u8>, ReportProgress) {
+  let Answer::Report(mut report) = answer else {
+    panic!("not a streaming report: {answer:?}");
+  };
+  let mut out = Vec::new();
+  loop {
+    match report.resume(&fixture.served(rules), &mut out, budget) {
+      ReportProgress::More => {}
+      ended => return (out, ended),
+    }
+  }
+}
+
+/// Verifies a streaming REPORT refuses cleanly (never `Broken`) with zero bytes written under `budget`.
+fn assert_report_refused_under(
+  fixture: &Fixture,
+  rules: Option<&PrincipalRules>,
+  (path, body): (&str, &[u8]),
+  budget: Budget,
+  (expected_status, expected_code): (u16, &str),
+) {
+  let answer = fixture.ask(rules, "REPORT", (path, None), body);
+  let (out, ended) = reported_with_budget(fixture, rules, answer, budget);
+  let ReportProgress::Refused(refused) = ended else {
+    panic!("{path}: expected Refused, got {ended:?}");
+  };
+  let text = text_of(&refused);
+  assert_eq!(
+    (out.is_empty(), refused.status, text.contains(expected_code)),
+    (true, expected_status, true),
+    "{path}: {text}"
+  );
+}
+
+/// Verifies a streaming REPORT refuses cleanly under both expired timed quantum and 1-byte untimed budgets.
+fn assert_streamed_report_refused(
+  fixture: &Fixture,
+  rules: Option<&PrincipalRules>,
+  target: (&str, &[u8]),
+  expected: (u16, &str),
+) {
+  assert_report_refused_under(fixture, rules, target, timed_expired_budget(), expected);
+  assert_report_refused_under(fixture, rules, target, untimed(1), expected);
+}
+
+/// Sibling sweep (`replay-report`, `list-report`, `log-report`, `file-revs-report`): Do drive each streaming DAV
+/// report on a refused target under both expired timed quantum and 1-byte untimed budgets. Expect every report to
+/// return `ReportProgress::Refused` with zero output bytes and its typed HTTP status and error code, never `Broken`.
+#[test]
+fn sibling_dav_reports_refuse_cleanly_under_tight_and_expired_budgets() {
+  let fixture = Fixture::new();
+  let anonymous = rules_of(None);
+  let rules = Some(&anonymous);
+  let replay_past = replay_old("<S:revision>99</S:revision>");
+  let list_denied = b"<S:list-report xmlns:S=\"svn:\"><S:path>secret</S:path>\
+    <S:depth>immediates</S:depth></S:list-report>";
+  let log_missing = b"<S:log-report xmlns:S=\"svn:\"><S:path>missing.txt</S:path></S:log-report>";
+  let file_revs_dir = include_bytes!("../fixtures/file-revs-report.xml");
+  assert_streamed_report_refused(
+    &fixture,
+    rules,
+    ("/", &replay_past),
+    (404, "errcode=\"160006\""),
+  );
+  assert_streamed_report_refused(
+    &fixture,
+    rules,
+    ("/trunk", list_denied),
+    (403, "errcode=\"220001\""),
+  );
+  assert_streamed_report_refused(
+    &fixture,
+    rules,
+    ("/trunk", log_missing),
+    (404, "errcode=\"160013\""),
+  );
+  assert_streamed_report_refused(
+    &fixture,
+    rules,
+    ("/!svn/rvr/5/trunk", file_revs_dir),
+    (500, "errcode=\"160017\""),
+  );
+}
+
 /// `bytes` in lowercase hexadecimal, as the digests are written.
 fn hex_of(bytes: &[u8]) -> String {
   let mut out = String::new();

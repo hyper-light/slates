@@ -470,6 +470,9 @@ struct Established {
   /// The rules the session's reads are judged by, with the principal they were compiled for; `None`
   /// until a read needs them ([`Established::reads_session`]).
   read_rules: Option<ReadRules>,
+  /// Caller-supplied per-path read rules compiled from the server's `SvnPolicy`, taking precedence
+  /// over `Policy::authz` when present ([`Connection::set_read_rules`]).
+  policy_read_rules: Option<authz::PrincipalRules>,
 }
 
 /// A session's read rules and the principal they were compiled for (A-606): `svnserve` keeps one
@@ -521,9 +524,13 @@ impl Established {
     }
   }
 
-  /// The session's one read rule ([`ReadRules::for_principal`]), which the read commands, an
-  /// update's target and the update's drive all judge paths by ([`authz::may_read`]).
+  /// The session's one read rule ([`Connection::set_read_rules`] or [`ReadRules::for_principal`]),
+  /// which the read commands, an update's target and the update's drive all judge paths by
+  /// ([`authz::may_read`]).
   fn compiled_read_rules(&mut self, policy: &Policy<'_>) -> Option<&authz::PrincipalRules> {
+    if self.policy_read_rules.is_some() {
+      return self.policy_read_rules.as_ref();
+    }
     ReadRules::for_principal(&mut self.read_rules, &self.session.principal, policy)
   }
 
@@ -568,7 +575,11 @@ impl Established {
     policy: &Policy<'_>,
     authentication: reads::Authentication,
   ) -> reads::Session<'_> {
-    let authz = ReadRules::for_principal(&mut self.read_rules, &self.session.principal, policy);
+    let authz = if self.policy_read_rules.is_some() {
+      self.policy_read_rules.as_ref()
+    } else {
+      ReadRules::for_principal(&mut self.read_rules, &self.session.principal, policy)
+    };
     reads::Session {
       base: &self.base,
       uuid: &self.uuid,
@@ -711,6 +722,8 @@ pub struct Connection {
   url: Vec<u8>,
   /// What the caller's answer to the URL settled, until the session is established.
   resolved: Option<Resolved>,
+  /// Per-path read rules set before establishment, moved into [`Established::policy_read_rules`].
+  pending_read_rules: Option<authz::PrincipalRules>,
 }
 
 impl Connection {
@@ -725,7 +738,41 @@ impl Connection {
       limits,
       url: Vec::new(),
       resolved: None,
+      pending_read_rules: None,
     })
+  }
+
+  /// Sets or clears caller-supplied per-path read rules for this session (`SvnPolicy` compiled via
+  /// [`authz::PrincipalRules::from_read_rules`]). When `Some`, every read, report, replay, and
+  /// revision-property path check uses these rules instead of `Policy::authz`.
+  pub fn set_read_rules(&mut self, rules: Option<authz::PrincipalRules>) {
+    match self.established_mut() {
+      Some(established) => established.policy_read_rules = rules,
+      None => self.pending_read_rules = rules,
+    }
+  }
+
+  /// Mutable access to the established session, when past the handshake and not ended.
+  fn established_mut(&mut self) -> Option<&mut Established> {
+    match &mut self.phase {
+      Phase::Commands(established)
+      | Phase::Streaming(established, _)
+      | Phase::Replaying(established, _)
+      | Phase::Reporting(established, _)
+      | Phase::CommitAsked(established, _)
+      | Phase::Authenticating(established, _, _)
+      | Phase::Resuming(established, _)
+      | Phase::Committing(established, _)
+      | Phase::Hooked(established, _)
+      | Phase::Accepted(established)
+      | Phase::Dropping(established)
+      | Phase::LockAsked(established, _, _)
+      | Phase::LockHooking(established, _)
+      | Phase::Locking(established, _)
+      | Phase::LockFinishing(established, _)
+      | Phase::RevisionProperty(established, _) => Some(established),
+      Phase::Handshake(_) | Phase::Ended => None,
+    }
   }
 
   /// What the connection waits on its client for now.
@@ -1222,6 +1269,7 @@ impl Connection {
       repository_url: resolved.repository_url,
       mechanisms: resolved.mechanisms,
       read_rules: None,
+      policy_read_rules: self.pending_read_rules.take(),
     }));
     Ok(())
   }
@@ -1265,6 +1313,7 @@ impl Connection {
     interrupted: Box<Interrupted>,
   ) -> Result<(), Refused> {
     established.session = server.session().cloned().ok_or(Refused::OutOfTurn)?;
+    established.policy_read_rules = None;
     self.phase = Phase::Resuming(established, interrupted);
     Ok(())
   }
@@ -2544,5 +2593,64 @@ mod redteam_tests {
         );
       }
     }
+  }
+
+  /// Round-4 Blocker 2 (`Connection::set_read_rules` unit check): Do install compiled policy read
+  /// rules via `Connection::set_read_rules` denying the first child directory under `/` while
+  /// keeping `Policy::authz == None`, and send `get-dir` on the denied child and on `/`. Expect:
+  /// `get-dir` on the denied child fails with `E170001` and `get-dir` on `/` omits the denied child.
+  #[test]
+  fn set_read_rules_enforces_per_path_deny_read_without_authz_file() {
+    let (index, green) = repository();
+    let youngest = index.youngest();
+    let entries = index.listing("/", youngest).unwrap().unwrap();
+    let (hidden, _) = entries.first().expect("fixture has root child");
+    let locks = LockTable::new();
+    let texts = crate::commit::drive::HeldTexts::new();
+    let sources = Sources {
+      index: &index,
+      repository: &green,
+      locks: &locks,
+      now: NOW,
+      policy: Policy {
+        anonymous: authz::Access::None,
+        authenticated: authz::Access::Write,
+        authz: None,
+        filesystem: "repo",
+      },
+      texts: &texts,
+    };
+    let rules = authz::PrincipalRules::from_read_rules(
+      false,
+      &[
+        authz::ReadPathRule {
+          segments: vec![],
+          allow: true,
+        },
+        authz::ReadPathRule {
+          segments: vec![authz::PolicySegment::Literal(hidden.as_bytes().into())],
+          allow: false,
+        },
+      ],
+    );
+    let mut conn = authenticated_session(b"alice");
+    conn.set_read_rules(Some(rules));
+    let cmd_hidden = format!(
+      "( get-dir ( {}:{} ( {youngest} ) false true ( kind ) false ) ) ",
+      hidden.len(),
+      hidden
+    );
+    let hidden_out = send_command(&mut conn, &sources, cmd_hidden.as_bytes());
+    assert!(
+      hidden_out.contains("170001"),
+      "denied path must fail E170001: {hidden_out}"
+    );
+    let cmd_root = format!("( get-dir ( 0: ( {youngest} ) false true ( kind ) false ) ) ");
+    let root_out = send_command(&mut conn, &sources, cmd_root.as_bytes());
+    let hidden_token = format!("{}:{}", hidden.len(), hidden);
+    assert!(
+      !root_out.contains(&hidden_token),
+      "root listing must hide denied entry {hidden}: {root_out}"
+    );
   }
 }

@@ -937,3 +937,18 @@ fn a_lock_owner_holding_a_line_break_is_never_written_into_a_header() {
     Err(DavRefusal::Unwritable { .. })
   ));
 }
+
+/// Round-4 Blocker 2 (`dav_svn__convert_err` authz status mapping): Do pass `SVN_ERR_RA_NOT_AUTHORIZED`
+/// (`170001`), `SVN_ERR_AUTHZ_ROOT_UNREADABLE` (`220000`), `SVN_ERR_AUTHZ_UNREADABLE` (`220001`),
+/// and `SVN_ERR_AUTHZ_UNWRITABLE` (`220004`) to `convert_status` with 500 and 400 defaults.
+/// Expect: every authorization error maps to HTTP `403 Forbidden`, while unmapped codes keep the
+/// caller's fallback status.
+#[test]
+fn convert_status_maps_authz_and_not_authorized_errors_to_forbidden() {
+  for code in [170_001, 220_000, 220_001, 220_004] {
+    assert_eq!(convert_status(code, 500), 403, "code {code} from 500");
+    assert_eq!(convert_status(code, 400), 403, "code {code} from 400");
+  }
+  assert_eq!(convert_status(160_005, 500), 500);
+  assert_eq!(convert_status(160_005, 400), 400);
+}

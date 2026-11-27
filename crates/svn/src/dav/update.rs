@@ -253,7 +253,7 @@ impl UpdateWalk {
       }
       (Stop::Full, _) => {
         self.writer = Some(writer);
-        self.begun = true;
+        self.begun |= !written.is_empty();
         out.extend_from_slice(&written);
         ReportProgress::More
       }

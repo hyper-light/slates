@@ -87,8 +87,8 @@ use crate::vcs_http::git::Repositories;
 use crate::vcs_policy::{self, SvnAccess};
 use crate::vcs_store::svn_view::{BroughtText, FetchedPiece};
 use crate::vcs_svn::{
-  HookSite, Hooked, Located, Location, MERGEINFO, NOT_AUTHORIZED, post_lock_hook, pre_lock_hooks,
-  revision_property_hook, run_hook,
+  HookSite, Hooked, Located, Location, MERGEINFO, NOT_AUTHORIZED, authorized_pre_lock_hooks,
+  post_lock_hook, revision_property_hook, run_hook,
 };
 
 /// Format: the refusal count of a command the connection answered "Unknown editor command" because slates does not
@@ -232,6 +232,15 @@ pub(crate) trait SvnStores {
   ) -> Option<T> {
     let _ = principal;
     self.lend(id, texts, step)
+  }
+  /// Compiles `principal`'s per-path read rules for repository `id` when backed by shard state;
+  /// `None` lets the caller compile from its own repository catalog.
+  fn read_rules(
+    &self,
+    _id: RepositoryId,
+    _principal: &Principal,
+  ) -> Option<slates_svn::authz::PrincipalRules> {
+    None
   }
 }
 
@@ -633,6 +642,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     let budget = crate::vcs_svn::timed(self.bounds.budget);
     let Self {
       connection,
+      repositories,
       stores,
       principal,
       texts,
@@ -647,11 +657,16 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
         .receive(sources, input, out, budget)
         .map_or_else(Received::Ended, Received::of);
     }
-    let Some(id) = opened.as_ref().map(|record| record.id) else {
+    let Some(record) = opened.as_ref() else {
       return Received::NotHeld;
     };
+    let rules = stores.read_rules(record.id, principal).unwrap_or_else(|| {
+      let live = repositories.find(&record.name);
+      vcs_policy::svn_read_rules_for(live.as_ref(), principal)
+    });
+    connection.set_read_rules(Some(rules));
     stores
-      .lend_for(id, principal, texts, |sources| {
+      .lend_for(record.id, principal, texts, |sources| {
         connection
           .receive(Some(sources), input, out, budget)
           .map_or_else(Received::Ended, Received::of)
@@ -841,9 +856,12 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       Some(Ok(None)) => return,
       Some(Ok(Some(call))) => call,
     };
+    let live = self.repositories.find(&record.name);
     let site = HookSite::Tunnel(&policy, gone);
     // No verdict: the client left during a run (the module doc's hooks).
-    let Some(verdicts) = pre_lock_hooks(site, &hooked, room, &call).await else {
+    let Some(verdicts) =
+      authorized_pre_lock_hooks(live.as_ref(), &self.principal, site, &hooked, room, &call).await
+    else {
       return self.client_left();
     };
     // The landing turn, held from the judgment to the entries' landing (C2): no other landing moves the lock table
@@ -1092,6 +1110,18 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     }
   }
 
+  /// Refuses an accepted commit with `E170001` ("Authorization failed") and clears staged texts.
+  fn refuse_uncommitted(&mut self) {
+    self.texts.clear();
+    let refused = slates_svn::serve::Uncommitted::Refused {
+      code: NOT_AUTHORIZED,
+      message: "Authorization failed".to_owned(),
+    };
+    if let Err(refused) = self.connection.not_committed(&refused, &mut self.out) {
+      self.end(refused);
+    }
+  }
+
   /// Lands the accepted `work` through the owner's commit step (the module doc's commit) and answers `close-edit` with
   /// the revision it made, or with its refusal.
   async fn land(&mut self, work: Work, gone: ClientGone<'_>) {
@@ -1099,25 +1129,33 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       return self.not_held();
     };
     let id = record.id;
-    let policy = record.policy.clone();
-    let hooked = Hooked::new(id, &record.name, self.stores.hook_views());
-    if vcs_policy::admit_svn_changes(
-      &record.owner,
-      &policy,
-      &self.principal,
-      &work.record.changes,
-    )
-    .is_err()
-    {
-      self.texts.clear();
-      let refused = slates_svn::serve::Uncommitted::Refused {
-        code: NOT_AUTHORIZED,
-        message: "Authorization failed".to_owned(),
-      };
-      if let Err(refused) = self.connection.not_committed(&refused, &mut self.out) {
-        self.end(refused);
-      }
-      return;
+    let name = record.name.clone();
+    let hooked = Hooked::new(id, &name, self.stores.hook_views());
+    let Some(live) = self.repositories.find(&name) else {
+      return self.refuse_uncommitted();
+    };
+    let policy = live.policy.clone();
+    let admitted = {
+      let Self {
+        stores,
+        principal,
+        texts,
+        ..
+      } = self;
+      stores.lend_for(id, principal, texts, |sources| {
+        vcs_policy::admit_svn_changes(
+          &live.owner,
+          &live.policy,
+          principal,
+          (sources.index, work.head),
+          &work.record.changes,
+        )
+      })
+    };
+    match admitted {
+      None => return self.not_held(),
+      Some(Err(_)) => return self.refuse_uncommitted(),
+      Some(Ok(())) => {}
     }
     let transaction = work.record.transaction.clone();
     let landed = self
@@ -1609,11 +1647,11 @@ mod store_unrecovered_tests {
     async fn land_record(
       &mut self,
       _turn: (),
-      _id: RepositoryId,
+      id: RepositoryId,
       _principal: &Principal,
       _record: Record,
     ) -> Option<Result<(), Unlanded>> {
-      None
+      (self.record.is_some() && self.holds(id)).then_some(Ok(()))
     }
 
     fn hook_views(&self) -> crate::vcs_store::svn_presenter::HookViews {
@@ -2119,5 +2157,241 @@ mod store_unrecovered_tests {
       rule(PolicyRight::Submit, PolicyEffect::Deny, only_denied),
     ]);
     assert_ssh_read_allowed_commit_refused(deny_write, &denied);
+  }
+
+  fn seeded_ssh_records() -> &'static Records {
+    use slates_svn::index::{Action, ChangedPath, NodeKind, RevisionRecord, Text};
+    let mut records = Records::new(
+      Uuid::parse(TEST_UUID.as_bytes()).unwrap(),
+      b"2026-11-19T00:00:00.000000Z",
+      Room {
+        entries: 1 << 10,
+        bytes: 1 << 20,
+      },
+    )
+    .unwrap();
+    let add = |path: &str, kind: NodeKind, bytes: Option<&[u8]>| ChangedPath {
+      path: path.to_owned(),
+      action: Action::Add,
+      kind,
+      copy_from: None,
+      text: bytes.map(|b| Text {
+        identity: *blake3::hash(b).as_bytes(),
+        md5: [0; 16],
+        sha1: [0; 20],
+        size: u64::try_from(b.len()).unwrap(),
+      }),
+      properties: None,
+      mergeinfo_modified: false,
+    };
+    let (pub_ok, secret_top, trunk_ok, trunk_unlock, tags_locked) = (
+      b"pub-ok\n".as_slice(),
+      b"SECRET-TOP\n".as_slice(),
+      b"trunk-ok\n".as_slice(),
+      b"trunk-unlock\n".as_slice(),
+      b"tags-locked\n".as_slice(),
+    );
+    records
+      .commit(slates_svn::commit::revision::Revision {
+        head: 0,
+        record: RevisionRecord {
+          transaction: "0-1".to_owned(),
+          changes: vec![
+            add("/pub", NodeKind::Directory, None),
+            add("/pub/ok.txt", NodeKind::File, Some(pub_ok)),
+            add("/pub/secret", NodeKind::Directory, None),
+            add("/pub/secret/vault.txt", NodeKind::File, Some(secret_top)),
+            add("/secret", NodeKind::Directory, None),
+            add("/secret/top.txt", NodeKind::File, Some(secret_top)),
+            add("/trunk", NodeKind::Directory, None),
+            add("/trunk/ok.txt", NodeKind::File, Some(trunk_ok)),
+            add("/trunk/unlock.txt", NodeKind::File, Some(trunk_unlock)),
+            add("/tags", NodeKind::Directory, None),
+            add("/tags/locked.txt", NodeKind::File, Some(tags_locked)),
+          ],
+        },
+        properties: std::collections::BTreeMap::from([
+          (b"svn:author".to_vec(), b"alice".to_vec()),
+          (
+            b"svn:date".to_vec(),
+            b"2026-11-19T00:00:01.000000Z".to_vec(),
+          ),
+          (b"svn:log".to_vec(), b"seed".to_vec()),
+        ]),
+        contents: std::collections::BTreeMap::new(),
+        stored: [pub_ok, secret_top, trunk_ok, trunk_unlock, tags_locked]
+          .into_iter()
+          .map(|b| (*blake3::hash(b).as_bytes(), u64::try_from(b.len()).unwrap()))
+          .collect(),
+        lock_entries: Vec::new(),
+      })
+      .unwrap();
+    let writer_owner = crate::lfs::owner_name(&Principal::Uid {
+      host: HostId(0),
+      uid: WRITER_UID,
+    });
+    let seeded_lock = |path: &str, token: &str| {
+      slates_svn::lock::LockEntry::Set(slates_svn::lock::Lock {
+        path: path.to_owned(),
+        token: slates_svn::lock::LockToken::supplied(token).unwrap(),
+        owner: writer_owner.clone(),
+        comment: None,
+        is_dav_comment: false,
+        created: AprTime(1),
+        expires: None,
+      })
+    };
+    records
+      .commit_record(Record::Locks(vec![
+        seeded_lock("/tags/locked.txt", "opaquelocktoken:tags-lock-1"),
+        seeded_lock("/trunk/unlock.txt", "opaquelocktoken:trunk-lock-1"),
+      ]))
+      .unwrap();
+    Box::leak(Box::new(records))
+  }
+
+  fn assert_ssh_per_path_reads(cmd: &mut SvnCommand<PolicyRepo, DroppableStore>) {
+    cmd
+      .input(b"( get-file ( 14:secret/top.txt ( 1 ) false false ) ) ")
+      .unwrap();
+    let denied_file = drive_until_input(cmd);
+    assert!(
+      denied_file.contains("170001") && !denied_file.contains("SECRET-TOP"),
+      "ssh get-file /secret/top.txt must be refused E170001: {denied_file:?}"
+    );
+
+    cmd
+      .input(b"( get-dir ( 3:pub ( 1 ) false true ( kind ) ) ) ")
+      .unwrap();
+    let pub_dir = drive_until_input(cmd);
+    assert!(
+      pub_dir.contains("ok.txt") && !pub_dir.contains("secret"),
+      "ssh get-dir /pub must hide /pub/secret: {pub_dir:?}"
+    );
+  }
+
+  fn assert_ssh_per_path_locks(cmd: &mut SvnCommand<PolicyRepo, DroppableStore>) {
+    cmd
+      .input(b"( lock-many ( ( 4:mine ) false ( ( 15:tags/locked.txt ( ) ) ) ) ) ")
+      .unwrap();
+    let denied_lock = drive_until_input(cmd);
+    assert!(
+      denied_lock.contains("170001") && !denied_lock.contains("opaquelocktoken"),
+      "ssh lock-many /tags/locked.txt must be refused E170001: {denied_lock:?}"
+    );
+
+    cmd
+      .input(b"( lock-many ( ( 4:mine ) false ( ( 12:trunk/ok.txt ( ) ) ) ) ) ")
+      .unwrap();
+    let allowed_lock = drive_until_input(cmd);
+    assert!(
+      allowed_lock.contains("opaquelocktoken") && !allowed_lock.contains("failure"),
+      "ssh lock-many /trunk/ok.txt must succeed: {allowed_lock:?}"
+    );
+  }
+
+  fn assert_ssh_per_path_unlocks(cmd: &mut SvnCommand<PolicyRepo, DroppableStore>) {
+    cmd
+      .input(b"( unlock-many ( true ( ( 15:tags/locked.txt ( ) ) ) ) ) ")
+      .unwrap();
+    let denied_unlock = drive_until_input(cmd);
+    assert!(
+      denied_unlock.contains("170001") && !denied_unlock.contains("15:tags/locked.txt"),
+      "ssh unlock-many /tags/locked.txt must be refused E170001: {denied_unlock:?}"
+    );
+
+    cmd
+      .input(
+        b"( unlock-many ( false ( ( 16:trunk/unlock.txt ( 28:opaquelocktoken:trunk-lock-1 ) ) ) ) ) ",
+      )
+      .unwrap();
+    let allowed_unlock = drive_until_input(cmd);
+    assert!(
+      allowed_unlock.contains("( success ( 16:trunk/unlock.txt ) )")
+        && !allowed_unlock.contains("failure"),
+      "ssh unlock-many /trunk/unlock.txt must succeed: {allowed_unlock:?}"
+    );
+  }
+
+  /// Round-4 Blockers 2 & 4 (`svn+ssh://` per-path `Deny Read` and per-path `LOCK`/`UNLOCK`):
+  /// Do open an SSH tunnel under `[Allow Read / Anyone, Deny Read /secret, Deny Read /pub/secret,
+  /// Allow Submit /trunk, Deny Submit /tags]` and send `get-file /secret/top.txt`, `get-dir /pub`,
+  /// `lock-many /tags/locked.txt`, `lock-many /trunk/ok.txt`, `unlock-many /tags/locked.txt`, and
+  /// `unlock-many /trunk/unlock.txt`. Expect: `/secret/top.txt` refused `E170001`, `/pub` hides
+  /// `secret`, `/tags/locked.txt` lock and unlock refused `E170001`, and `/trunk/ok.txt` lock +
+  /// `/trunk/unlock.txt` unlock succeed.
+  #[test]
+  fn round4_blockers2_and_4_ssh_tunnel_enforces_per_path_read_and_lock() {
+    use slates_db::catalog::{
+      PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyRule, PolicyWho,
+    };
+    let user = Principal::Uid {
+      host: HostId(0),
+      uid: WRITER_UID,
+    };
+    let only_user = PolicyWho::AnyOf {
+      entries: vec![PolicyEntry::Is {
+        principal: user.clone(),
+      }],
+    };
+    let path_rule =
+      |pattern: &str, right: PolicyRight, effect: PolicyEffect, who: PolicyWho| PolicyRule {
+        names: PolicyNames::Paths,
+        pattern: pattern.to_owned(),
+        right,
+        effect,
+        who,
+      };
+    let record = svn_policy_record(vec![
+      path_rule(
+        "/",
+        PolicyRight::Read,
+        PolicyEffect::Allow,
+        PolicyWho::Anyone,
+      ),
+      path_rule(
+        "/secret",
+        PolicyRight::Read,
+        PolicyEffect::Deny,
+        only_user.clone(),
+      ),
+      path_rule(
+        "/pub/secret",
+        PolicyRight::Read,
+        PolicyEffect::Deny,
+        only_user.clone(),
+      ),
+      path_rule(
+        "/trunk",
+        PolicyRight::Submit,
+        PolicyEffect::Allow,
+        only_user.clone(),
+      ),
+      path_rule("/tags", PolicyRight::Submit, PolicyEffect::Deny, only_user),
+    ]);
+    let alive: &'static Cell<bool> = Box::leak(Box::new(Cell::new(true)));
+    let records = seeded_ssh_records();
+    let mut cmd = SvnCommand::new(
+      PolicyRepo(record.clone()),
+      DroppableStore {
+        alive,
+        unrecovered: false,
+        records,
+        record: Some(record),
+      },
+      &user,
+      test_bounds(),
+    )
+    .expect("tunnel starts");
+
+    let handshake =
+      b"( 2 ( edit-pipeline svndiff1 absent-entries depth mergeinfo log-revprops ) 22:svn+ssh://fixture/demo 8:SVN/1.15 ( ) ) \
+        ( EXTERNAL ( 0: ) ) ";
+    cmd.input(handshake).unwrap();
+    let _ = drive_until_input(&mut cmd);
+
+    assert_ssh_per_path_reads(&mut cmd);
+    assert_ssh_per_path_locks(&mut cmd);
+    assert_ssh_per_path_unlocks(&mut cmd);
   }
 }

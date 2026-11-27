@@ -1138,6 +1138,16 @@ fn answer(conversation: &mut Conversation, out: &mut Vec<u8>) -> Next {
     let turn = connection.receive(None::<&Sources<'_, Unresolved>>, input, out, budget);
     return next_of(connection, turn, out);
   };
+  let read_rules = crate::state::with_state(|state| {
+    let record = state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&opened.name);
+    crate::vcs_policy::svn_read_rules_for(record, principal)
+  })
+  .unwrap_or_else(slates_svn::authz::PrincipalRules::deny_all);
+  connection.set_read_rules(Some(read_rules));
   let lent = held_sources(opened, principal, held.as_ref(), |sources| {
     let turn = connection.receive(Some(sources), input, out, budget);
     next_of(connection, turn, out)
@@ -1431,7 +1441,27 @@ async fn lock(stream: &TcpStream, conversation: &mut Conversation, out: &mut Vec
     LockCallStep::Done => return true,
     LockCallStep::End => return false,
   };
-  let Some(verdicts) = pre_lock_hooks(HookSite::Listener(stream), &hooked, room, &call).await
+  let Some(principal) = conversation.principal.clone() else {
+    return false;
+  };
+  let record = crate::state::with_state(|state| {
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&name)
+      .cloned()
+  })
+  .flatten();
+  let Some(verdicts) = authorized_pre_lock_hooks(
+    record.as_ref(),
+    &principal,
+    HookSite::Listener(stream),
+    &hooked,
+    room,
+    &call,
+  )
+  .await
   else {
     return false;
   };
@@ -1492,17 +1522,21 @@ async fn land_locks(
   })
 }
 
-/// Lands `record` on `repository`'s store and register by `principal` holding its landing `turn`
-/// (`svn_commit::land_record_with`): `Ok`, or the step's refusal as the connection answers it.
+/// Authorizes and lands `record` on `repository`'s store and register for `principal` holding its
+/// landing `turn` (`svn_view::land_authorized_record`): `Ok`, or the step's refusal as the
+/// connection answers it.
 async fn land_record(
   turn: svn_commit::landing::Turn,
   (principal, repository): (&Principal, RepositoryId),
   record: slates_svn::commit::record::Record,
 ) -> Result<(), (u32, String)> {
-  svn_commit::land_record_with(turn, (principal, repository), record)
-    .await
-    .unwrap_or(Err(svn_commit::Uncommitted::NotHeld))
-    .map_err(|refused| refused.failure())
+  use crate::vcs_store::svn_view::{RecordLanding, land_authorized_record};
+  match land_authorized_record(turn, repository, principal, record).await {
+    RecordLanding::Landed => Ok(()),
+    RecordLanding::Denied => Err((NOT_AUTHORIZED, "Authorization failed".to_owned())),
+    RecordLanding::StoreMissing => Err(svn_commit::Uncommitted::NotHeld.failure()),
+    RecordLanding::Refused(refused) => Err(refused.failure()),
+  }
 }
 
 /// Outcome of judging a revision-property change over lent sources.
@@ -1637,50 +1671,76 @@ pub(crate) async fn revision_property_hook(
   .verdict
 }
 
-/// Runs the verb's pre-hook for each path in `call` in turn (A-730): each path's verdict, its refusal's chain or
-/// pre-lock's token; `None` where the client left before a hook ended, which ends the conversation.
-pub(crate) async fn pre_lock_hooks(
+/// Runs one pre-lock or pre-unlock hook for `(path, token)` in `call`; `None` when the client
+/// disconnected mid-hook.
+async fn run_one_lock_hook(
   site: HookSite<'_>,
   hooked: &Hooked,
   words_cap: usize,
   call: &slates_svn::serve::LockHookCall,
-) -> Option<Vec<slates_svn::serve::PreHooked>> {
+  (path, token): (&str, &str),
+) -> Option<slates_svn::serve::PreHooked> {
   let point = if call.locks {
     HookPoint::SvnPreLock
   } else {
     HookPoint::SvnPreUnlock
   };
+  let ran = run_hook(site, hooked, words_cap, point, |env, repos| {
+    let view = CommittedView(0);
+    if call.locks {
+      vcs_hooks::svn_pre_lock(
+        view,
+        env,
+        repos,
+        path,
+        &call.user,
+        &call.comment,
+        call.force,
+      )
+    } else {
+      vcs_hooks::svn_pre_unlock(view, env, repos, path, &call.user, token, call.force)
+    }
+  })
+  .await;
+  let verdict = ran.verdict?;
+  Some(match (verdict, ran.token) {
+    (Err(chain), _) => Err(chain),
+    (Ok(()), Some(vcs_hooks::SvnLockToken::Given(token))) => {
+      Ok(Some(String::from_utf8_lossy(&token).into_owned()))
+    }
+    (Ok(()), Some(vcs_hooks::SvnLockToken::PastCap)) => Err(vec![(
+      LOCK_OPERATION_FAILED,
+      TOKEN_PAST_CAP_WORDS.to_owned(),
+    )]),
+    (Ok(()), Some(vcs_hooks::SvnLockToken::Made) | None) => Ok(None),
+  })
+}
+
+/// Checks per-path Subversion write permission (`svn_path_write_allowed(..., false)`) for every
+/// target path in `call` BEFORE running any pre-lock/pre-unlock hook or landing locks, refusing
+/// denied paths (or a missing repository record) with `E170001` (`Authorization failed`).
+pub(crate) async fn authorized_pre_lock_hooks(
+  record: Option<&slates_db::catalog::RepositoryRecord>,
+  principal: &Principal,
+  site: HookSite<'_>,
+  hooked: &Hooked,
+  words_cap: usize,
+  call: &slates_svn::serve::LockHookCall,
+) -> Option<Vec<slates_svn::serve::PreHooked>> {
   let mut verdicts = Vec::with_capacity(call.paths.len());
   for (path, token) in &call.paths {
-    let ran = run_hook(site, hooked, words_cap, point, |env, repos| {
-      let view = CommittedView(0);
-      if call.locks {
-        vcs_hooks::svn_pre_lock(
-          view,
-          env,
-          repos,
-          path,
-          &call.user,
-          &call.comment,
-          call.force,
-        )
-      } else {
-        vcs_hooks::svn_pre_unlock(view, env, repos, path, &call.user, token, call.force)
-      }
-    })
-    .await;
-    let verdict = ran.verdict?;
-    verdicts.push(match (verdict, ran.token) {
-      (Err(chain), _) => Err(chain),
-      (Ok(()), Some(vcs_hooks::SvnLockToken::Given(token))) => {
-        Ok(Some(String::from_utf8_lossy(&token).into_owned()))
-      }
-      (Ok(()), Some(vcs_hooks::SvnLockToken::PastCap)) => Err(vec![(
-        LOCK_OPERATION_FAILED,
-        TOKEN_PAST_CAP_WORDS.to_owned(),
-      )]),
-      (Ok(()), Some(vcs_hooks::SvnLockToken::Made) | None) => Ok(None),
+    let allowed = record.is_some_and(|rec| {
+      crate::vcs_policy::svn_path_write_allowed(rec, principal, path.as_bytes(), false)
+        .unwrap_or(false)
     });
+    if !allowed {
+      verdicts.push(Err(vec![(
+        NOT_AUTHORIZED,
+        "Authorization failed".to_owned(),
+      )]));
+      continue;
+    }
+    verdicts.push(run_one_lock_hook(site, hooked, words_cap, call, (path, token)).await?);
   }
   Some(verdicts)
 }
@@ -2036,28 +2096,40 @@ async fn run_svn_hook(
   }
 }
 
-/// Checks per-path Subversion policy for every changed path in `work` against the live
-/// repository record held on this shard, returning `false` if the policy denies any change.
-fn svn_commit_authorized(name: &str, principal: &Principal, work: &Work) -> bool {
-  let record = crate::state::with_state(|state| {
-    state
+/// Result of commit-time per-path and subtree authorization on the live shard record and index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CommitAuthz {
+  /// Every changed path and affected subtree is permitted; carries the repository owner for
+  /// A-635's owner-checked log append.
+  Allowed(Principal),
+  /// The repository record is missing, unreadable, or its policy denies at least one path.
+  Denied,
+  /// The repository's Subversion store is not held on this shard.
+  StoreMissing,
+}
+
+/// Checks per-path Subversion policy (including deleted/replaced and copied directory subtrees)
+/// for every changed path in `work` against the live repository record and index held on this
+/// shard, failing closed (`CommitAuthz::Denied`) when no repository record is present.
+fn svn_commit_authorized(name: &str, principal: &Principal, work: &Work) -> CommitAuthz {
+  use crate::vcs_store::svn_view::{LandAuthz, authorize_work_in};
+  crate::state::with_state(|state| {
+    let Some(id) = state
       .db
       .partition()
       .repositories()
       .repository_named(name)
-      .cloned()
+      .map(|record| record.id)
+    else {
+      return CommitAuthz::Denied;
+    };
+    match authorize_work_in(state, id, principal, work) {
+      LandAuthz::Allowed(owner) => CommitAuthz::Allowed(owner),
+      LandAuthz::Denied => CommitAuthz::Denied,
+      LandAuthz::StoreMissing => CommitAuthz::StoreMissing,
+    }
   })
-  .flatten();
-  let Some(record) = record else {
-    return true;
-  };
-  crate::vcs_policy::admit_svn_changes(
-    &record.owner,
-    &record.policy,
-    principal,
-    &work.record.changes,
-  )
-  .is_ok()
+  .unwrap_or(CommitAuthz::Denied)
 }
 
 /// Lands the accepted `work` through the owner's commit step (A-698's `repository::svn_commit::land_work`, which the
@@ -2081,16 +2153,24 @@ async fn land(
   let id = opened.id;
   let name = opened.name.clone();
   let hooked = opened.hooked();
-  if !svn_commit_authorized(&name, principal, &work) {
-    opened.texts.clear();
-    let refused = slates_svn::serve::Uncommitted::Refused {
-      code: NOT_AUTHORIZED,
-      message: "Authorization failed".to_owned(),
-    };
-    return conversation.connection.not_committed(&refused, out).is_ok();
-  }
+  let owner = match svn_commit_authorized(&name, principal, &work) {
+    CommitAuthz::Allowed(owner) => owner,
+    CommitAuthz::Denied => {
+      opened.texts.clear();
+      let refused = slates_svn::serve::Uncommitted::Refused {
+        code: NOT_AUTHORIZED,
+        message: "Authorization failed".to_owned(),
+      };
+      return conversation.connection.not_committed(&refused, out).is_ok();
+    }
+    CommitAuthz::StoreMissing => {
+      opened.texts.clear();
+      fail_store_missing(&mut conversation.connection, &name, out);
+      return false;
+    }
+  };
   let transaction = work.record.transaction.clone();
-  let landed = svn_commit::land_work((principal, id), work, &opened.texts).await;
+  let landed = svn_commit::land_work((&owner, id), work, &opened.texts).await;
   opened.texts.clear();
   let Some(landed) = landed else {
     fail_store_missing(&mut conversation.connection, &name, out);
@@ -3280,5 +3360,310 @@ mod redteam_tests {
         && wire.contains("Repository 'demo' store is unrecovered or corrupt"),
       "fail_store_missing must write canonical E160004 frame: {wire:?}"
     );
+  }
+
+  /// Round-4 Suggestion 1 (fail-closed `svn_commit_authorized`): Do check commit authorization
+  /// when no repository record exists on the shard. Expect: `false` (fail closed), never `true`.
+  #[test]
+  fn round4_suggestion1_svn_commit_authorized_fails_closed_on_missing_record() {
+    let work = slates_svn::commit::drive::Work {
+      head: 0,
+      record: slates_svn::index::RevisionRecord {
+        transaction: "0-1".to_owned(),
+        changes: Vec::new(),
+      },
+      lock_entries: Vec::new(),
+      revision_properties: Vec::new(),
+      texts: std::collections::BTreeSet::new(),
+      property_lists: std::collections::BTreeMap::new(),
+      locks: slates_svn::lock::CommitLocks {
+        user: None,
+        presented: std::collections::BTreeMap::new(),
+        keep: false,
+      },
+    };
+    assert_eq!(
+      super::svn_commit_authorized("missing-repo", &uid_principal(STRANGER), &work),
+      super::CommitAuthz::Denied,
+      "missing repository record must fail closed"
+    );
+  }
+
+  fn seed_policy_tree_revision() -> slates_svn::commit::revision::Revision {
+    use slates_svn::index::{Action, ChangedPath, NodeKind, RevisionRecord, Text};
+    let add = |path: &str, kind: NodeKind, bytes: Option<&[u8]>| ChangedPath {
+      path: path.to_owned(),
+      action: Action::Add,
+      kind,
+      copy_from: None,
+      text: bytes.map(|b| Text {
+        identity: *blake3::hash(b).as_bytes(),
+        md5: [0; 16],
+        sha1: [0; 20],
+        size: u64::try_from(b.len()).unwrap(),
+      }),
+      properties: None,
+      mergeinfo_modified: false,
+    };
+    let (pub_ok, secret_top, trunk_ok, tags_locked) = (
+      b"pub-ok\n".as_slice(),
+      b"SECRET-TOP\n".as_slice(),
+      b"trunk-ok\n".as_slice(),
+      b"tags-locked\n".as_slice(),
+    );
+    slates_svn::commit::revision::Revision {
+      head: 0,
+      record: RevisionRecord {
+        transaction: "0-1".to_owned(),
+        changes: vec![
+          add("/pub", NodeKind::Directory, None),
+          add("/pub/ok.txt", NodeKind::File, Some(pub_ok)),
+          add("/pub/secret", NodeKind::Directory, None),
+          add("/pub/secret/vault.txt", NodeKind::File, Some(secret_top)),
+          add("/secret", NodeKind::Directory, None),
+          add("/secret/top.txt", NodeKind::File, Some(secret_top)),
+          add("/trunk", NodeKind::Directory, None),
+          add("/trunk/ok.txt", NodeKind::File, Some(trunk_ok)),
+          add("/tags", NodeKind::Directory, None),
+          add("/tags/locked.txt", NodeKind::File, Some(tags_locked)),
+        ],
+      },
+      properties: std::collections::BTreeMap::from([
+        (b"svn:author".to_vec(), b"alice".to_vec()),
+        (
+          b"svn:date".to_vec(),
+          b"2026-11-19T00:00:01.000000Z".to_vec(),
+        ),
+        (b"svn:log".to_vec(), b"seed".to_vec()),
+      ]),
+      contents: [pub_ok, secret_top, trunk_ok, tags_locked]
+        .into_iter()
+        .map(|b| (*blake3::hash(b).as_bytes(), b.to_vec()))
+        .collect(),
+      stored: std::collections::BTreeMap::new(),
+      lock_entries: Vec::new(),
+    }
+  }
+
+  fn extract_lock_token(wire: &str) -> &str {
+    let start = wire.find("opaquelocktoken:").expect("lock token in wire");
+    let rest = wire.get(start..).expect("token slice");
+    let end = rest
+      .find(|ch: char| ch.is_ascii_whitespace() || ch == ')')
+      .unwrap_or(rest.len());
+    rest.get(..end).expect("token end")
+  }
+
+  fn assert_svn_per_path_reads(stream: &mut ClientStream) {
+    stream
+      .write_all(b"( get-file ( 14:secret/top.txt ( 1 ) false false ) ) ")
+      .unwrap();
+    let denied_file = read_items(stream, 1);
+    assert!(
+      denied_file.contains("170001") && !denied_file.contains("SECRET-TOP"),
+      "get-file /secret/top.txt must be refused E170001: {denied_file}"
+    );
+
+    stream
+      .write_all(b"( get-dir ( 3:pub ( 1 ) false true ( kind ) ) ) ")
+      .unwrap();
+    let pub_dir = read_items(stream, 2);
+    assert!(
+      pub_dir.contains("ok.txt") && !pub_dir.contains("secret"),
+      "get-dir /pub must hide denied child /pub/secret: {pub_dir}"
+    );
+  }
+
+  fn assert_svn_per_path_locks(stream: &mut ClientStream) -> String {
+    stream
+      .write_all(b"( lock-many ( ( 4:mine ) false ( ( 15:tags/locked.txt ( ) ) ) ) ) ")
+      .unwrap();
+    let denied_lock = read_items(stream, 3);
+    assert!(
+      denied_lock.contains("170001") && !denied_lock.contains("opaquelocktoken"),
+      "lock-many /tags/locked.txt must be refused E170001: {denied_lock}"
+    );
+
+    stream
+      .write_all(b"( lock-many ( ( 4:mine ) false ( ( 12:trunk/ok.txt ( ) ) ) ) ) ")
+      .unwrap();
+    let allowed_lock = read_items(stream, 3);
+    assert!(
+      allowed_lock.contains("opaquelocktoken") && !allowed_lock.contains("failure"),
+      "lock-many /trunk/ok.txt must succeed: {allowed_lock}"
+    );
+    extract_lock_token(&allowed_lock).to_owned()
+  }
+
+  fn assert_svn_per_path_unlocks(stream: &mut ClientStream, trunk_token: &str) {
+    stream
+      .write_all(b"( unlock-many ( true ( ( 15:tags/locked.txt ( ) ) ) ) ) ")
+      .unwrap();
+    let denied_unlock = read_items(stream, 3);
+    assert!(
+      denied_unlock.contains("170001") && !denied_unlock.contains("160040"),
+      "unlock-many /tags/locked.txt must be refused E170001: {denied_unlock}"
+    );
+
+    stream
+      .write_all(b"( get-lock ( 15:tags/locked.txt ) ) ")
+      .unwrap();
+    let kept_lock = read_items(stream, 2);
+    assert!(
+      kept_lock.contains("opaquelocktoken:tags-lock-1"),
+      "denied unlock-many must leave /tags/locked.txt lock intact: {kept_lock}"
+    );
+
+    let unlock_ok = format!(
+      "( unlock-many ( false ( ( 12:trunk/ok.txt ( {}:{} ) ) ) ) ) ",
+      trunk_token.len(),
+      trunk_token
+    );
+    stream.write_all(unlock_ok.as_bytes()).unwrap();
+    let allowed_unlock = read_items(stream, 3);
+    assert!(
+      allowed_unlock.contains("( success ( 12:trunk/ok.txt ) )")
+        && !allowed_unlock.contains("failure"),
+      "unlock-many /trunk/ok.txt must succeed: {allowed_unlock}"
+    );
+  }
+
+  fn seed_owner_tags_lock(daemon: &crate::Daemon, id: slates_db::catalog::RepositoryId) {
+    let locked = crate::test_store::run_at(
+      daemon,
+      OTHER,
+      move || async move {
+        let entry = slates_svn::lock::LockEntry::Set(slates_svn::lock::Lock {
+          path: "/tags/locked.txt".to_owned(),
+          token: slates_svn::lock::LockToken::supplied("opaquelocktoken:tags-lock-1").unwrap(),
+          owner: crate::lfs::owner_name(&uid_principal(OWNER)),
+          comment: None,
+          is_dav_comment: false,
+          created: slates_svn::lock::AprTime(1),
+          expires: None,
+        });
+        crate::repository::svn_commit::land_record(
+          (&uid_principal(OWNER), id),
+          slates_svn::commit::record::Record::Locks(vec![entry]),
+        )
+        .await
+      },
+      std::time::Duration::from_secs(60),
+    );
+    assert_eq!(locked, Some(Ok(())));
+  }
+
+  /// Round-4 Blockers 2 & 4 (`svn://` per-path `Deny Read` and per-path `LOCK`/`UNLOCK`): Do
+  /// grant `STRANGER` `Allow Read /`, `Deny Read /secret`, `Deny Read /pub/secret`,
+  /// `Allow Submit /trunk`, `Deny Submit /tags`, seed an owner lock on `/tags/locked.txt`, then
+  /// over `svn://` run `get-file /secret/top.txt`, `get-dir /pub`, `lock-many /tags/locked.txt`,
+  /// `lock-many /trunk/ok.txt`, `unlock-many /tags/locked.txt`, and `unlock-many /trunk/ok.txt`.
+  /// Expect: `get-file /secret/top.txt` refused `E170001`, `get-dir /pub` hides `secret`,
+  /// `lock-many` and `unlock-many` on `/tags/locked.txt` refused `E170001` leaving the lock
+  /// intact, and `lock-many` + `unlock-many` on `/trunk/ok.txt` succeed.
+  #[test]
+  fn round4_blockers2_and_4_svn_protocol_enforces_per_path_read_and_lock() {
+    use slates_ipc::protocol::{
+      PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyRule, PolicyWho,
+    };
+    let daemon = start_daemon();
+    let port = daemon.vcs_svn_port().expect("listener port");
+    let user = enroll_token(&daemon, STRANGER, STRANGER_TOKEN);
+    let name = name_on("svn-perpath-", OTHER);
+    let asked = (
+      name.as_str(),
+      VcsTool::Subversion,
+      ObjectFormat::Revisions,
+      "trunk",
+    );
+    let (id, _) = crate::test_store::create_on(&daemon, OTHER, &uid_principal(OWNER), asked);
+    let committed = crate::test_store::run_at(
+      &daemon,
+      OTHER,
+      move || async move {
+        crate::repository::svn_commit::tests::commit(
+          (&uid_principal(OWNER), id),
+          seed_policy_tree_revision(),
+          None,
+        )
+        .await
+      },
+      std::time::Duration::from_secs(60),
+    );
+    assert!(committed.is_ok(), "{committed:?}");
+    seed_owner_tags_lock(&daemon, id);
+    let only_stranger = PolicyWho::AnyOf {
+      entries: vec![PolicyEntry::Is {
+        principal: slates_ipc::protocol::Principal::Uid {
+          host: 0,
+          uid: STRANGER,
+        },
+      }],
+    };
+    let rule =
+      |pattern: &str, right: PolicyRight, effect: PolicyEffect, who: PolicyWho| PolicyRule {
+        names: PolicyNames::Paths,
+        pattern: pattern.to_owned(),
+        right,
+        effect,
+        who,
+      };
+    let reply = crate::daemon::observe_at(&daemon, OTHER, {
+      let name = name.clone();
+      move |state| {
+        crate::verbs::dispatch(
+          state,
+          1,
+          &uid_principal(OWNER),
+          RequestBody::SetRepositoryPolicy {
+            repository: name,
+            read: 0,
+            rules: vec![
+              rule(
+                "/",
+                PolicyRight::Read,
+                PolicyEffect::Allow,
+                PolicyWho::Anyone,
+              ),
+              rule(
+                "/secret",
+                PolicyRight::Read,
+                PolicyEffect::Deny,
+                only_stranger.clone(),
+              ),
+              rule(
+                "/pub/secret",
+                PolicyRight::Read,
+                PolicyEffect::Deny,
+                only_stranger.clone(),
+              ),
+              rule(
+                "/trunk",
+                PolicyRight::Submit,
+                PolicyEffect::Allow,
+                only_stranger.clone(),
+              ),
+              rule(
+                "/tags",
+                PolicyRight::Submit,
+                PolicyEffect::Deny,
+                only_stranger,
+              ),
+            ],
+            hooks: Vec::new(),
+            hooks_env: Vec::new(),
+            signers: Vec::new(),
+            hg_publishing: true,
+          },
+        )
+      }
+    });
+    assert_eq!(reply, ReplyBody::Acknowledged);
+
+    let url = format!("svn://127.0.0.1:{port}/{name}");
+    let mut stream = establish_cram(port, &url, &user, STRANGER_TOKEN);
+    assert_svn_per_path_reads(&mut stream);
+    let trunk_token = assert_svn_per_path_locks(&mut stream);
+    assert_svn_per_path_unlocks(&mut stream, &trunk_token);
   }
 }

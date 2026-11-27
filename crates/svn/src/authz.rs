@@ -67,7 +67,9 @@ mod tree;
 #[cfg(test)]
 mod tests;
 
-pub use tree::PrincipalRules;
+pub use tree::{
+  BYTE_SET_WORDS, GlobToken, PolicySegment, PrincipalRules, ReadPathRule, byte_set_contains,
+};
 // APR's `apr_fnmatch` as Subversion calls it, for `list`'s patterns (`crate::reads`, A-613 part 2).
 pub(crate) use glob::fnmatch;
 

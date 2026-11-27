@@ -142,6 +142,11 @@ const HTTP_NOT_IMPLEMENTED: u16 = 501;
 /// Format: `svn_error_codes.h`, the filesystem category's start (160,000) plus 13 and plus 6.
 const NOT_FOUND_CODES: [u32; 2] = [160_013, 160_006];
 
+/// `SVN_ERR_RA_NOT_AUTHORIZED`, `SVN_ERR_AUTHZ_ROOT_UNREADABLE`, `SVN_ERR_AUTHZ_UNREADABLE`, and
+/// `SVN_ERR_AUTHZ_UNWRITABLE`, which `dav_svn__convert_err` answers 403 (`mod_dav_svn/util.c`).
+/// Format: `svn_error_codes.h`, RA category (170,000) + 1 and authz category (220,000) + 0, 1, 4.
+const FORBIDDEN_CODES: [u32; 4] = [170_001, 220_000, 220_001, 220_004];
+
 /// `SVN_ERR_FS_LOCK_OWNER_MISMATCH` and `SVN_ERR_FS_PATH_ALREADY_LOCKED`, which `dav_svn__convert_err` answers 423.
 /// Format: `svn_error_codes.h`, the filesystem category's start (160,000) plus 39 and plus 35.
 const LOCKED_CODES: [u32; 2] = [160_039, 160_035];
@@ -912,11 +917,14 @@ fn malformed_token_message(token: &str) -> String {
   format!("Lock token '{token}' is not ASCII or is a control character at byte {at}")
 }
 
-/// The status `dav_svn__convert_err` gives a Subversion error (`util.c` 140-157): its own for the codes it maps, else
-/// `status`, the one its caller suggests (the lock verbs' 500, a log-report's 400).
+/// The status `dav_svn__convert_err` gives a Subversion error (`util.c` 140-157): its own for the codes it maps
+/// (`404`, `403`, `501`, `423`, `412`), else `status`, the one its caller suggests (the lock verbs' 500, a
+/// log-report's 400).
 pub fn convert_status(code: u32, status: u16) -> u16 {
   if NOT_FOUND_CODES.contains(&code) {
     HTTP_NOT_FOUND
+  } else if FORBIDDEN_CODES.contains(&code) {
+    HTTP_FORBIDDEN
   } else if code == SVN_ERR_UNSUPPORTED_FEATURE {
     HTTP_NOT_IMPLEMENTED
   } else if LOCKED_CODES.contains(&code) {

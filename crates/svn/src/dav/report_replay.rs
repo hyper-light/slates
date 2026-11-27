@@ -164,7 +164,7 @@ impl ReplayWalk {
       Stop::Refused => self.refused_or_broken(),
       Stop::Full => {
         self.drive = Some(drive);
-        self.begun = true;
+        self.begun |= !written.is_empty();
         out.extend_from_slice(&written);
         ReportProgress::More
       }

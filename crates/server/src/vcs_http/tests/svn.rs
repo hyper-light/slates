@@ -3145,3 +3145,391 @@ fn round4_blocker2_http_webdav_enforces_deny_rules_per_path_and_submit_only() {
     false,
   );
 }
+
+/// Revision 1 for the Blocker-2 DAV per-path read-rule test: `/pub/ok.txt`, `/pub/secret/vault.txt`,
+/// `/secret/top.txt`, and `/trunk/ok.txt`.
+fn dav_deny_revision() -> slates_svn::commit::revision::Revision {
+  let ok = b"public-ok\n";
+  let vault = b"TOP-SECRET-VAULT\n";
+  let root_secret = b"TOP-SECRET-ROOT\n";
+  let trunk_ok = b"trunk-ok\n";
+  slates_svn::commit::revision::Revision {
+    head: 0,
+    record: RevisionRecord {
+      transaction: "0-1".to_owned(),
+      changes: vec![
+        added_row("/pub", NodeKind::Directory, None),
+        added_row("/pub/ok.txt", NodeKind::File, Some(ok)),
+        added_row("/pub/secret", NodeKind::Directory, None),
+        added_row("/pub/secret/vault.txt", NodeKind::File, Some(vault)),
+        added_row("/secret", NodeKind::Directory, None),
+        added_row("/secret/top.txt", NodeKind::File, Some(root_secret)),
+        added_row("/trunk", NodeKind::Directory, None),
+        added_row("/trunk/ok.txt", NodeKind::File, Some(trunk_ok)),
+      ],
+    },
+    properties: BTreeMap::from([
+      (b"svn:author".to_vec(), b"alice".to_vec()),
+      (b"svn:date".to_vec(), DATE.as_bytes().to_vec()),
+      (
+        b"svn:log".to_vec(),
+        b"seed secret and public trees".to_vec(),
+      ),
+    ]),
+    contents: [
+      (blake(ok), ok.to_vec()),
+      (blake(vault), vault.to_vec()),
+      (blake(root_secret), root_secret.to_vec()),
+      (blake(trunk_ok), trunk_ok.to_vec()),
+    ]
+    .into_iter()
+    .collect(),
+    stored: BTreeMap::new(),
+    lock_entries: Vec::new(),
+  }
+}
+
+/// Runs one HTTP request `(method, target, extra_headers, body)` against the live shard's
+/// `SvnSite` (`ShardRepositories` + `ServedRecords`) and returns `(status_code, body_utf8)`.
+async fn run_live_dav(
+  method: &str,
+  target: &str,
+  extra_headers: &[&str],
+  body: &[u8],
+) -> (u16, String) {
+  let mut site = SvnSite::new(
+    REALM.to_owned(),
+    ROOM,
+    Tokens,
+    super::super::daemon_edge::ShardRepositories,
+    ServedRecords,
+  );
+  let raw = request(method, target, extra_headers);
+  let decided = site.answer(&head(&raw)).await;
+  match decided.answer {
+    Answer::Refuse { status, .. } => (status.code, String::new()),
+    Answer::Serve { mut exchange, .. } => {
+      if !body.is_empty() {
+        exchange.body(body).await.unwrap();
+      }
+      exchange.body_end(ClientGone::never()).await.unwrap();
+      let status = exchange.reply_status().code;
+      let mut out = Vec::new();
+      while exchange.reply(&mut out, ClientGone::never()).await.unwrap() {}
+      (status, String::from_utf8_lossy(&out).into_owned())
+    }
+    Answer::Move { shard } => panic!("unexpected shard move to {shard}"),
+  }
+}
+
+fn ipc_path_rule(
+  pattern: &str,
+  right: slates_ipc::protocol::PolicyRight,
+  effect: slates_ipc::protocol::PolicyEffect,
+  who: slates_ipc::protocol::PolicyWho,
+) -> slates_ipc::protocol::PolicyRule {
+  slates_ipc::protocol::PolicyRule {
+    names: slates_ipc::protocol::PolicyNames::Paths,
+    pattern: pattern.to_owned(),
+    right,
+    effect,
+    who,
+  }
+}
+
+fn set_repo_policy_on_first(
+  daemon: &crate::Daemon,
+  name: &str,
+  read: u64,
+  rules: Vec<slates_ipc::protocol::PolicyRule>,
+) {
+  let owner = daemon_owner();
+  let repo = name.to_owned();
+  let reply = crate::daemon::observe_first(daemon, move |state| {
+    crate::verbs::dispatch(
+      state,
+      1,
+      &owner,
+      slates_ipc::protocol::RequestBody::SetRepositoryPolicy {
+        repository: repo,
+        read,
+        rules,
+        hooks: Vec::new(),
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+        hg_publishing: true,
+      },
+    )
+  });
+  assert_eq!(reply, slates_ipc::protocol::ReplyBody::Acknowledged);
+}
+
+fn dav_update_report_body(src_path: &str) -> String {
+  format!(
+    "<S:update-report send-all=\"true\" xmlns:S=\"svn:\">\
+     <S:src-path>{src_path}</S:src-path>\
+     <S:target-revision>1</S:target-revision>\
+     <S:entry rev=\"0\" start-empty=\"true\"></S:entry>\
+     </S:update-report>"
+  )
+}
+
+fn assert_dav_checkout_hides_denied(res: &(u16, String)) {
+  assert_eq!(res.0, 200, "REPORT !svn/me checkout: {}", res.1);
+  assert!(res.1.contains("ok.txt"), "public file missing: {}", res.1);
+  assert!(
+    !res.1.contains("TOP-SECRET"),
+    "REPORT !svn/me leaked secret bytes: {}",
+    res.1
+  );
+  assert!(
+    !res.1.contains("vault.txt"),
+    "REPORT !svn/me leaked denied paths: {}",
+    res.1
+  );
+}
+
+fn assert_dav_vcc_denied_root(res: &(u16, String)) {
+  assert_eq!(
+    res.0, 403,
+    "REPORT !svn/vcc/default on /secret must be 403: {}",
+    res.1
+  );
+  assert!(
+    res.1.contains("220000"),
+    "REPORT !svn/vcc/default must carry SVN_ERR_AUTHZ_ROOT_UNREADABLE: {}",
+    res.1
+  );
+  assert!(
+    !res.1.contains("TOP-SECRET"),
+    "vcc leaked secret: {}",
+    res.1
+  );
+}
+
+fn assert_dav_propfind_hides_secret(res: &(u16, String), expected: &str, label: &str) {
+  assert_eq!(res.0, 207, "{label} status: {}", res.1);
+  assert!(res.1.contains(expected), "{label} missing entry: {}", res.1);
+  assert!(!res.1.contains("secret"), "{label} leaked: {}", res.1);
+}
+
+fn assert_dav_log_hides_denied(res: &(u16, String)) {
+  assert_eq!(res.0, 200, "REPORT log-report status: {}", res.1);
+  assert!(
+    res.1.contains("/pub/ok.txt"),
+    "REPORT log-report missing allowed path: {}",
+    res.1
+  );
+  assert!(
+    !res.1.contains("/secret"),
+    "REPORT log-report leaked /secret: {}",
+    res.1
+  );
+  assert!(
+    !res.1.contains("/pub/secret"),
+    "REPORT log-report leaked /pub/secret: {}",
+    res.1
+  );
+}
+
+fn assert_dav_per_path_deny_checks(daemon: &crate::Daemon, name: &str) {
+  let stranger = basic("bob", STRANGER_TOKEN);
+  let update_root = dav_update_report_body(&format!("/{name}"));
+  let update_secret = dav_update_report_body(&format!("/{name}/secret"));
+  let me_target = format!("/{name}/!svn/me");
+  let vcc_target = format!("/{name}/!svn/vcc/default");
+  let root_target = format!("/{name}");
+  let pub_target = format!("/{name}/pub");
+  let (me_res, vcc_res, ls_root, ls_pub, log_res) = crate::test_store::run_on_first(
+    daemon,
+    move || async move {
+      let auth = [stranger.as_str()];
+      let depth1 = [stranger.as_str(), "Depth: 1"];
+      let me = run_live_dav("REPORT", &me_target, &auth, update_root.as_bytes()).await;
+      let vcc = run_live_dav("REPORT", &vcc_target, &auth, update_secret.as_bytes()).await;
+      let pf_root = run_live_dav("PROPFIND", &root_target, &depth1, PROPFIND_KIND).await;
+      let pf_pub = run_live_dav("PROPFIND", &pub_target, &depth1, PROPFIND_KIND).await;
+      let log = run_live_dav("REPORT", &root_target, &auth, LOG_EVERY).await;
+      (me, vcc, pf_root, pf_pub, log)
+    },
+    std::time::Duration::from_secs(60),
+  );
+  assert_dav_checkout_hides_denied(&me_res);
+  assert_dav_vcc_denied_root(&vcc_res);
+  assert_dav_propfind_hides_secret(&ls_root, "/pub/", "PROPFIND /");
+  assert_dav_propfind_hides_secret(&ls_pub, "ok.txt", "PROPFIND /pub");
+  assert_dav_log_hides_denied(&log_res);
+}
+
+fn assert_dav_subpath_allow_and_disjoint(daemon: &crate::Daemon, name: &str) {
+  let stranger = basic("bob", STRANGER_TOKEN);
+  let update_trunk = format!(
+    "<S:update-report send-all=\"true\" xmlns:S=\"svn:\">\
+     <S:src-path>/{name}/trunk</S:src-path>\
+     <S:target-revision>1</S:target-revision>\
+     <S:entry rev=\"1\" start-empty=\"true\"></S:entry>\
+     </S:update-report>"
+  );
+  let trunk_target = format!("/{name}/trunk");
+  let me_target = format!("/{name}/!svn/me");
+  let (opt_res, co_res) = crate::test_store::run_on_first(
+    daemon,
+    move || async move {
+      let auth = [stranger.as_str()];
+      let opt = run_live_dav("OPTIONS", &trunk_target, &auth, b"").await;
+      let co = run_live_dav("REPORT", &me_target, &auth, update_trunk.as_bytes()).await;
+      (opt, co)
+    },
+    std::time::Duration::from_secs(60),
+  );
+  assert_eq!(opt_res.0, 200, "OPTIONS /trunk under Allow Read /trunk");
+  assert_eq!(co_res.0, 200, "REPORT !svn/me /trunk: {}", co_res.1);
+  assert!(
+    co_res.1.contains("ok.txt"),
+    "trunk checkout missing ok.txt: {}",
+    co_res.1
+  );
+}
+
+/// Round-4 Blocker 2 (HTTP WebDAV per-path `Deny Read` through real `ServedRecords`): Do serve
+/// `REPORT /!svn/me` (`svn checkout`), `REPORT /!svn/vcc/default` targeting `/secret`,
+/// `PROPFIND Depth: 1` on `/` and `/pub`, and `REPORT log-report` under `[Allow Read / Anyone,
+/// Deny Read /secret STRANGER, Deny Read /pub/secret STRANGER]`, then test `[Deny Read /,
+/// Allow Read /trunk]` checkout of `/trunk` and disjoint `[Allow Read /pub, Allow Submit /trunk]`
+/// `POST /!svn/me`. Expect: zero denied paths or secret bytes leak on any DAV verb, subpath
+/// `/trunk` checkout succeeds, and disjoint `POST /!svn/me` is refused `403`.
+#[test]
+fn round4_blocker2_http_dav_reports_and_propfind_enforce_per_path_deny_read() {
+  use slates_ipc::protocol::{PolicyEffect, PolicyEntry, PolicyRight, PolicyWho};
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let name = "davdeny";
+  let id = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let asked = (
+        name,
+        slates_ipc::protocol::VcsTool::Subversion,
+        slates_ipc::protocol::ObjectFormat::Revisions,
+        "main",
+      );
+      let (id, _) = crate::test_store::created(&daemon_owner(), asked).await;
+      let committed = crate::repository::svn_commit::tests::commit(
+        (&daemon_owner(), id),
+        dav_deny_revision(),
+        None,
+      )
+      .await;
+      assert!(committed.is_ok(), "{committed:?}");
+      id
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let _ = id;
+  let only_stranger = PolicyWho::AnyOf {
+    entries: vec![PolicyEntry::Is {
+      principal: slates_ipc::protocol::Principal::Uid {
+        host: 0,
+        uid: STRANGER,
+      },
+    }],
+  };
+  set_repo_policy_on_first(
+    &daemon,
+    name,
+    0,
+    vec![
+      ipc_path_rule(
+        "/",
+        PolicyRight::Read,
+        PolicyEffect::Allow,
+        PolicyWho::Anyone,
+      ),
+      ipc_path_rule(
+        "/secret",
+        PolicyRight::Read,
+        PolicyEffect::Deny,
+        only_stranger.clone(),
+      ),
+      ipc_path_rule(
+        "/pub/secret",
+        PolicyRight::Read,
+        PolicyEffect::Deny,
+        only_stranger.clone(),
+      ),
+    ],
+  );
+  assert_dav_per_path_deny_checks(&daemon, name);
+
+  set_repo_policy_on_first(
+    &daemon,
+    name,
+    1,
+    vec![
+      ipc_path_rule(
+        "/",
+        PolicyRight::Read,
+        PolicyEffect::Deny,
+        only_stranger.clone(),
+      ),
+      ipc_path_rule(
+        "/trunk",
+        PolicyRight::Read,
+        PolicyEffect::Allow,
+        only_stranger.clone(),
+      ),
+    ],
+  );
+  assert_dav_subpath_allow_and_disjoint(&daemon, name);
+
+  set_repo_policy_on_first(
+    &daemon,
+    name,
+    2,
+    vec![
+      ipc_path_rule(
+        "/",
+        PolicyRight::Read,
+        PolicyEffect::Deny,
+        only_stranger.clone(),
+      ),
+      ipc_path_rule(
+        "/pub",
+        PolicyRight::Read,
+        PolicyEffect::Allow,
+        only_stranger.clone(),
+      ),
+      ipc_path_rule(
+        "/",
+        PolicyRight::Submit,
+        PolicyEffect::Deny,
+        only_stranger.clone(),
+      ),
+      ipc_path_rule(
+        "/trunk",
+        PolicyRight::Submit,
+        PolicyEffect::Allow,
+        only_stranger,
+      ),
+    ],
+  );
+  let stranger = basic("bob", STRANGER_TOKEN);
+  let post_target = format!("/{name}/!svn/me");
+  let (post_status, _) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      run_live_dav(
+        "POST",
+        &post_target,
+        &[stranger.as_str()],
+        b"( create-txn ( ) )",
+      )
+      .await
+    },
+    std::time::Duration::from_secs(60),
+  );
+  daemon.stop();
+  assert_eq!(
+    post_status, 403,
+    "disjoint Read/Submit POST /!svn/me must be 403"
+  );
+}

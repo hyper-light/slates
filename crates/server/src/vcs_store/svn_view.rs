@@ -11,9 +11,13 @@
 //! (`Index::children`), a property list decoded in place, a text from an offset to its end. And the owner's instant,
 //! its clock's wall time, at which a lock's expiry is judged (`lock.c` `lock_expired`).
 //!
-//! **Read rules.** A repository's record names no Subversion authorization file yet, so no rule narrows a principal's
-//! reads below what the repository's policy lets it read (`crate::vcs_policy::svn_access`, asked before anything is lent),
-//! as `svnserve` and `mod_authz_svn` read every path of a repository whose configuration names no `authz-db` (GAPS).
+//! **Read rules.** Each principal's per-path `SvnPolicy` read rules (`crate::vcs_policy::svn_read_rules_for`) are
+//! compiled into [`slates_svn::authz::PrincipalRules`] and lent via [`Lent::rules`] for HTTP WebDAV (`ServedRecords`)
+//! and via `Connection::set_read_rules` for `svn://` (`crate::vcs_svn`) and `svn+ssh://` (`TunnelRecords::read_rules`),
+//! failing closed to `PrincipalRules::deny_all` when no repository record is held or its policy cannot be compiled.
+//! Authorized non-owner writes verify live policy on the owner shard ([`authorize_record_landing`],
+//! [`authorize_work_landing`]) before passing the repository's owner principal to A-635's owner-checked log append
+//! (`repository::svn_commit`).
 //!
 //! **The tunnel's lender** ([`TunnelRecords`], `svnserve -t` over the daemon's SSH site, A-688): the same records lent
 //! as the tunnel's sources, opened with the UUID as the realm and `EXTERNAL` alone (the SSH key proved the principal,
@@ -63,10 +67,10 @@ impl SvnStores for ServedRecords {
   fn lend_held<T>(
     &mut self,
     hold: &SvnHold,
-    _principal: &Principal,
+    principal: &Principal,
     step: impl FnOnce(&Lent<'_, SvnView<'_>>) -> T,
   ) -> Option<T> {
-    crate::state::with_state(|state| lend_held_in(state, hold, step)).flatten()
+    crate::state::with_state(|state| lend_held_for_in(state, hold, Some(principal), step)).flatten()
   }
 
   fn holds(&self, id: RepositoryId) -> bool {
@@ -76,10 +80,10 @@ impl SvnStores for ServedRecords {
   fn lend<T>(
     &mut self,
     id: RepositoryId,
-    _principal: &Principal,
+    principal: &Principal,
     step: impl FnOnce(&Lent<'_, SvnView<'_>>) -> T,
   ) -> Option<T> {
-    crate::state::with_state(|state| lend_in(state, id, step)).flatten()
+    crate::state::with_state(|state| lend_for_in(state, id, Some(principal), step)).flatten()
   }
 
   fn begin_commit(
@@ -184,8 +188,9 @@ impl SvnStores for ServedRecords {
     work: Work,
     texts: &dyn slates_svn::commit::drive::TextSink,
   ) -> Option<Result<Committed, svn_commit::Uncommitted>> {
-    svn_commit::land_work((principal, id), work, texts).await
+    land_authorized_work(id, principal, work, texts).await
   }
+
   async fn lock_verb(
     &mut self,
     id: RepositoryId,
@@ -207,7 +212,7 @@ impl SvnStores for ServedRecords {
         }
         token
       };
-      let judged = lend_in(state, id, |lent| judge(lent, &mut draw))?;
+      let judged = lend_for_in(state, id, Some(principal), |lent| judge(lent, &mut draw))?;
       if undrawn.get() {
         crate::fleet::count_refusal(TOKEN_UNDRAWN);
         return Some(Err(svn_commit::Uncommitted::NotHeld));
@@ -217,18 +222,33 @@ impl SvnStores for ServedRecords {
     .flatten()?;
     let (entries, answer) = match judged {
       Ok(judged) => judged,
-      Err(refused) => return Some(Err(refused)),
+      Err(refused) => {
+        release_turn(turn);
+        return Some(Err(refused));
+      }
     };
     if entries.is_empty() {
+      release_turn(turn);
       return Some(Ok(answer));
     }
-    let landed = svn_commit::land_record_with(
+    match land_authorized_record(
       turn,
-      (principal, id),
+      id,
+      principal,
       slates_svn::commit::record::Record::Locks(entries),
     )
-    .await?;
-    Some(landed.map(|()| answer))
+    .await
+    {
+      RecordLanding::Landed => Some(Ok(answer)),
+      RecordLanding::Denied => Some(Ok(slates_svn::dav::locking::error_answer(
+        slates_http::reply::Status::FORBIDDEN.code,
+        true,
+        crate::vcs_svn::NOT_AUTHORIZED,
+        "Authorization failed",
+      ))),
+      RecordLanding::StoreMissing => None,
+      RecordLanding::Refused(refused) => Some(Err(refused)),
+    }
   }
 
   async fn change_revision_property(
@@ -240,21 +260,229 @@ impl SvnStores for ServedRecords {
     // The landing turn, held from the judgment to the record's landing (C2): no other change lands in between.
     let turn = svn_commit::landing::turn(id).await?;
     let judged = crate::state::with_state(|state| {
-      lend_in(state, id, |lent| {
+      lend_for_in(state, id, Some(principal), |lent| {
         slates_svn::serve::changed_properties(lent.repository, change)
       })
     })
     .flatten()?;
     let properties = match judged {
       Ok(properties) => properties,
-      Err(chain) => return Some(Err(chain)),
+      Err(chain) => {
+        release_turn(turn);
+        return Some(Err(chain));
+      }
     };
     let record = slates_svn::commit::record::Record::RevisionProperties {
       revision: change.revision,
       properties,
     };
-    let landed = svn_commit::land_record_with(turn, (principal, id), record).await?;
-    Some(landed.map_err(|refused| vec![refused.failure()]))
+    match land_authorized_record(turn, id, principal, record).await {
+      RecordLanding::Landed => Some(Ok(())),
+      RecordLanding::Denied => Some(Err(vec![(
+        crate::vcs_svn::NOT_AUTHORIZED,
+        "Authorization failed".to_owned(),
+      )])),
+      RecordLanding::StoreMissing => None,
+      RecordLanding::Refused(refused) => Some(Err(vec![refused.failure()])),
+    }
+  }
+}
+
+/// Outcome of authorizing a Subversion landing for `principal` against the live repository record
+/// before passing the repository's owner principal to A-635's owner-checked log append
+/// (`repository::svn_commit`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LandAuthz {
+  /// Authorized; carries the repository's owner principal for A-635's append gate.
+  Allowed(Principal),
+  /// Policy denied `principal` (or the repository record is missing or unreadable).
+  Denied,
+  /// The repository's Subversion records are not held on this shard.
+  StoreMissing,
+}
+
+/// Outcome of landing an authorized non-revision Subversion record (`Locks` or
+/// `RevisionProperties`) under a held landing turn.
+pub(crate) enum RecordLanding {
+  /// Landed on the node's changeset store and committed in the register.
+  Landed,
+  /// Live policy denied `principal` (`E170001` / HTTP `403`).
+  Denied,
+  /// The repository's records are not held on this shard.
+  StoreMissing,
+  /// The commit step refused the record.
+  Refused(svn_commit::Uncommitted),
+}
+
+/// Verifies per-path Subversion write permission for every live lock mutation in `entries`: every
+/// newly set lock and every removal of an unexpired lock must satisfy `svn_path_write_allowed`.
+/// Expired locks pruned opportunistically by `LockTable::lock` are not live user unlocks.
+fn lock_entries_authorized(
+  record: &slates_db::catalog::RepositoryRecord,
+  locks: &slates_svn::lock::LockTable,
+  now: AprTime,
+  principal: &Principal,
+  entries: &[LockEntry],
+) -> bool {
+  entries.iter().all(|entry| match entry {
+    LockEntry::Set(lock) => {
+      crate::vcs_policy::svn_path_write_allowed(record, principal, lock.path.as_bytes(), false)
+        .unwrap_or(false)
+    }
+    LockEntry::Removed { path, .. } => {
+      locks.get_lock(path, now).is_none()
+        || crate::vcs_policy::svn_path_write_allowed(record, principal, path.as_bytes(), false)
+          .unwrap_or(false)
+    }
+  })
+}
+
+/// Authorizes landing a non-revision Subversion `record` (`Locks` or `RevisionProperties`) for
+/// `principal` against the live repository record on `state`.
+fn authorize_record_in(
+  state: &mut ShardState,
+  id: RepositoryId,
+  principal: &Principal,
+  record: &slates_svn::commit::record::Record,
+) -> LandAuthz {
+  let Some(repo) = state.db.partition().repositories().repository(id).cloned() else {
+    return LandAuthz::Denied;
+  };
+  if !served(state, id) {
+    return LandAuthz::StoreMissing;
+  }
+  if !matches!(
+    crate::vcs_policy::svn_access(&repo, principal),
+    Ok(crate::vcs_policy::SvnAccess::Write)
+  ) {
+    return LandAuthz::Denied;
+  }
+  let now = AprTime::from_wall_ns(state.clock.wall_ns());
+  let Some(records) = state.vcs_stores.subversion_records(id) else {
+    return LandAuthz::StoreMissing;
+  };
+  let permitted = match record {
+    slates_svn::commit::record::Record::Locks(entries) => {
+      lock_entries_authorized(&repo, records.locks(), now, principal, entries)
+    }
+    slates_svn::commit::record::Record::RevisionProperties { .. } => true,
+    _ => *principal == repo.owner,
+  };
+  if permitted {
+    LandAuthz::Allowed(repo.owner)
+  } else {
+    LandAuthz::Denied
+  }
+}
+
+/// Authorizes landing a non-revision Subversion `record` for `principal` on the owner shard.
+pub(crate) fn authorize_record_landing(
+  id: RepositoryId,
+  principal: &Principal,
+  record: &slates_svn::commit::record::Record,
+) -> LandAuthz {
+  crate::state::with_state(|state| authorize_record_in(state, id, principal, record))
+    .unwrap_or(LandAuthz::Denied)
+}
+
+/// Authorizes landing a Subversion commit `work` for `principal` against the live repository
+/// record and index on `state`, returning the repository's owner principal for A-635's
+/// owner-checked log append when permitted.
+pub(crate) fn authorize_work_in(
+  state: &mut ShardState,
+  id: RepositoryId,
+  principal: &Principal,
+  work: &Work,
+) -> LandAuthz {
+  let Some(repo) = state.db.partition().repositories().repository(id).cloned() else {
+    return LandAuthz::Denied;
+  };
+  if !matches!(
+    crate::vcs_policy::svn_access(&repo, principal),
+    Ok(crate::vcs_policy::SvnAccess::Write)
+  ) {
+    return LandAuthz::Denied;
+  }
+  let admitted = lend_in(state, id, |lent| {
+    crate::vcs_policy::admit_svn_changes(
+      &repo.owner,
+      &repo.policy,
+      principal,
+      (lent.index, work.head),
+      &work.record.changes,
+    )
+  });
+  match admitted {
+    None => LandAuthz::StoreMissing,
+    Some(Ok(())) => LandAuthz::Allowed(repo.owner),
+    Some(Err(_)) => LandAuthz::Denied,
+  }
+}
+
+/// Authorizes landing a Subversion commit `work` for `principal` on the owner shard.
+pub(crate) fn authorize_work_landing(
+  id: RepositoryId,
+  principal: &Principal,
+  work: &Work,
+) -> LandAuthz {
+  crate::state::with_state(|state| authorize_work_in(state, id, principal, work))
+    .unwrap_or(LandAuthz::Denied)
+}
+
+/// Releases a held landing `turn` cleanly on the current shard state.
+fn release_turn(turn: svn_commit::landing::Turn) {
+  let _ = crate::state::with_state(|state| turn.give_back(state));
+}
+
+/// Typed `Uncommitted` refusal for a live policy denial at landing time.
+fn forbidden_uncommitted() -> svn_commit::Uncommitted {
+  svn_commit::Uncommitted::Append(crate::repository::push::AppendRefused::Repository(
+    slates_ipc::protocol::Refusal::Forbidden {
+      verb: "push".to_owned(),
+    },
+  ))
+}
+
+/// Authorizes `work` for `principal` against the live repository record and index and lands it
+/// using the repository's owner principal for A-635's owner-checked log append.
+async fn land_authorized_work(
+  id: RepositoryId,
+  principal: &Principal,
+  work: Work,
+  texts: &dyn slates_svn::commit::drive::TextSink,
+) -> Option<Result<Committed, svn_commit::Uncommitted>> {
+  let owner = match authorize_work_landing(id, principal, &work) {
+    LandAuthz::Allowed(owner) => owner,
+    LandAuthz::Denied => return Some(Err(forbidden_uncommitted())),
+    LandAuthz::StoreMissing => return None,
+  };
+  svn_commit::land_work((&owner, id), work, texts).await
+}
+
+/// Authorizes `record` for `principal` against the live repository record and lands it under
+/// `turn` using the repository's owner principal for A-635's owner-checked log append. Releases
+/// `turn` if authorization fails or the store is missing.
+pub(crate) async fn land_authorized_record(
+  turn: svn_commit::landing::Turn,
+  id: RepositoryId,
+  principal: &Principal,
+  record: slates_svn::commit::record::Record,
+) -> RecordLanding {
+  let owner = match authorize_record_landing(id, principal, &record) {
+    LandAuthz::Allowed(owner) => owner,
+    LandAuthz::Denied => {
+      release_turn(turn);
+      return RecordLanding::Denied;
+    }
+    LandAuthz::StoreMissing => {
+      release_turn(turn);
+      return RecordLanding::StoreMissing;
+    }
+  };
+  match svn_commit::land_record_with(turn, (&owner, id), record).await {
+    None => RecordLanding::StoreMissing,
+    Some(Ok(())) => RecordLanding::Landed,
+    Some(Err(refused)) => RecordLanding::Refused(refused),
   }
 }
 
@@ -272,11 +500,30 @@ pub(crate) fn lend_in<T>(
   id: RepositoryId,
   step: impl FnOnce(&Lent<'_, SvnView<'_>>) -> T,
 ) -> Option<T> {
+  lend_for_in(state, id, None, step)
+}
+
+/// Runs `step` over repository `id`'s records in `state` for `principal` (populating compiled
+/// per-path [`slates_svn::authz::PrincipalRules`] when `Some`, failing closed to `deny_all` if the
+/// repository record is missing or damaged); none when `state` holds none or an import is under way.
+pub(crate) fn lend_for_in<T>(
+  state: &mut ShardState,
+  id: RepositoryId,
+  principal: Option<&Principal>,
+  step: impl FnOnce(&Lent<'_, SvnView<'_>>) -> T,
+) -> Option<T> {
   if !served(state, id) {
     return None;
   }
   let now = AprTime::from_wall_ns(state.clock.wall_ns());
-  with_view(state, (id, None), |view| lent_of(view, now, step)).flatten()
+  let rules = principal.map(|principal| {
+    let record = state.db.partition().repositories().repository(id);
+    crate::vcs_policy::svn_read_rules_for(record, principal)
+  });
+  with_view(state, (id, None), |view| {
+    lent_of(view, now, rules.as_ref(), step)
+  })
+  .flatten()
 }
 
 /// Runs `step` over the view a session reads of repository `id`'s records (its own, or the generation `held` a fetch
@@ -433,18 +680,34 @@ pub(crate) fn lend_held_in<T>(
   hold: &SvnHold,
   step: impl FnOnce(&Lent<'_, SvnView<'_>>) -> T,
 ) -> Option<T> {
+  lend_held_for_in(state, hold, None, step)
+}
+
+/// Runs `step` over the records `hold` holds for `principal` (populating per-path read rules when
+/// `Some`); none when they are gone.
+pub(crate) fn lend_held_for_in<T>(
+  state: &mut ShardState,
+  hold: &SvnHold,
+  principal: Option<&Principal>,
+  step: impl FnOnce(&Lent<'_, SvnView<'_>>) -> T,
+) -> Option<T> {
   let now = AprTime::from_wall_ns(state.clock.wall_ns());
   let generation = hold.generation?;
+  let rules = principal.map(|principal| {
+    let record = state.db.partition().repositories().repository(hold.id);
+    crate::vcs_policy::svn_read_rules_for(record, principal)
+  });
   with_view(state, (hold.id, Some(generation)), |view| {
-    lent_of(view, now, step)
+    lent_of(view, now, rules.as_ref(), step)
   })
   .flatten()
 }
 
-/// Runs `step` over `view` lent at `now`.
+/// Runs `step` over `view` lent at `now` with compiled per-path read `rules`.
 fn lent_of<T>(
   view: &SvnView<'_>,
   now: AprTime,
+  rules: Option<&slates_svn::authz::PrincipalRules>,
   step: impl FnOnce(&Lent<'_, SvnView<'_>>) -> T,
 ) -> Option<T> {
   let records = view.records;
@@ -456,7 +719,7 @@ fn lent_of<T>(
     repository: view,
     uuid,
     locks: records.locks(),
-    rules: None,
+    rules,
     now,
   }))
 }
@@ -566,6 +829,20 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
     Self::lend_with_access(id, texts, |record| tunnel_access(record, principal), step)
   }
 
+  fn read_rules(
+    &self,
+    id: RepositoryId,
+    principal: &Principal,
+  ) -> Option<slates_svn::authz::PrincipalRules> {
+    Some(
+      crate::state::with_state(|state| {
+        let record = state.db.partition().repositories().repository(id);
+        crate::vcs_policy::svn_read_rules_for(record, principal)
+      })
+      .unwrap_or_else(slates_svn::authz::PrincipalRules::deny_all),
+    )
+  }
+
   async fn commit(
     &mut self,
     id: RepositoryId,
@@ -573,7 +850,7 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
     work: Work,
     texts: &dyn slates_svn::commit::drive::TextSink,
   ) -> Option<Result<Committed, svn_commit::Uncommitted>> {
-    svn_commit::land_work((principal, id), work, texts).await
+    land_authorized_work(id, principal, work, texts).await
   }
 
   type Turn = svn_commit::landing::Turn;
@@ -609,6 +886,11 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
     principal: &Principal,
     record: slates_svn::commit::record::Record,
   ) -> Option<Result<(), svn_commit::Uncommitted>> {
-    svn_commit::land_record_with(turn, (principal, id), record).await
+    match land_authorized_record(turn, id, principal, record).await {
+      RecordLanding::Landed => Some(Ok(())),
+      RecordLanding::Denied => Some(Err(forbidden_uncommitted())),
+      RecordLanding::StoreMissing => None,
+      RecordLanding::Refused(refused) => Some(Err(refused)),
+    }
   }
 }

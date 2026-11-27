@@ -195,8 +195,9 @@ pub(crate) fn xml_bounds(room: u64) -> XmlBounds {
   }
 }
 
-/// What a repository's store lends for one step: its index, its green, its UUID, its locks, the principal's compiled
-/// read rules (none where the repository names no authorization file) and the instant locks are judged at.
+/// What a repository's store lends for one step: its index, its green, its UUID, its locks, the principal's
+/// [`PrincipalRules`] compiled from the repository's `SvnPolicy` read rules (`None` only when a lender is not scoped
+/// to a principal), and the instant locks are judged at.
 pub(crate) struct Lent<'a, R: ?Sized> {
   /// The index.
   pub(crate) index: &'a Index,
@@ -1612,28 +1613,35 @@ impl<S: SvnStores> SvnExchange<S> {
     self.land_merged(*work, &*texts, gone).await
   }
 
-  /// Enforces per-path Subversion policy on `work`'s changed paths, lands `work` on the owner
-  /// shard, runs `post-commit`, and formats the MERGE HTTP response.
+  /// Enforces per-path Subversion policy on `work`'s changed paths (and affected directory
+  /// subtrees at `work.head` and copy-source revisions), lands `work` on the owner shard, runs
+  /// `post-commit`, and formats the MERGE HTTP response.
   async fn land_merged(
     &mut self,
     work: Work,
     texts: &dyn slates_svn::commit::drive::TextSink,
     gone: ClientGone<'_>,
   ) -> HttpAnswer {
-    if vcs_policy::admit_svn_changes(
-      &self.owner,
-      &self.policy,
-      &self.principal,
-      &work.record.changes,
-    )
-    .is_err()
-    {
-      return locking::error_answer(
-        Status::FORBIDDEN.code,
-        true,
-        NOT_AUTHORIZED,
-        "Authorization failed",
-      );
+    let admitted = self.stores.lend(self.repository, &self.principal, |lent| {
+      vcs_policy::admit_svn_changes(
+        &self.owner,
+        &self.policy,
+        &self.principal,
+        (lent.index, work.head),
+        &work.record.changes,
+      )
+    });
+    match admitted {
+      None => return commit::unserved("Commits"),
+      Some(Err(_)) => {
+        return locking::error_answer(
+          Status::FORBIDDEN.code,
+          true,
+          NOT_AUTHORIZED,
+          "Authorization failed",
+        );
+      }
+      Some(Ok(())) => {}
     }
     let transaction = work.record.transaction.clone();
     // A-740: a shard stuck landing a revision names it.

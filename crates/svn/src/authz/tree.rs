@@ -29,6 +29,102 @@ const ROOT: usize = 0;
 /// Format: `acl->acl.sequence_number = 0` (`authz_parse.c` 196); rule sections count from one.
 const DEFAULT_SEQUENCE: usize = 0;
 
+/// Format: four 64-bit words cover every possible 8-bit byte (`256 / 64`).
+pub const BYTE_SET_WORDS: usize = 4;
+
+/// Format: `log2(64)` bits select the bit offset within one `u64` word of a 256-bit byte set.
+const BYTE_WORD_SHIFT: u8 = 6;
+
+/// Format: low six bits (`0..64`) index the bit within one `u64` word of a 256-bit byte set.
+const BYTE_BIT_MASK: u8 = 63;
+
+/// One token of a compiled single-segment glob pattern (shared with the server's `SvnPolicy` evaluator).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GlobToken {
+  /// Matches exactly this byte.
+  Byte(u8),
+  /// Matches any single byte (`?`).
+  AnyByte,
+  /// Matches any single byte whose bit is set (`[...]` character class; bit `byte & 63` in word `byte >> 6`).
+  ByteSet([u64; BYTE_SET_WORDS]),
+  /// Matches zero or more arbitrary bytes (`*`).
+  Run,
+  /// Never matches any segment (for example an unclosed `[` or trailing `\`).
+  Never,
+}
+
+/// One segment of a compiled policy read rule ([`PrincipalRules::from_read_rules`]).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PolicySegment {
+  /// An exact path segment.
+  Literal(Box<[u8]>),
+  /// Matches any single non-empty segment (`*`).
+  AnyOne,
+  /// Matches zero or more segments (`**`).
+  AnyMany,
+  /// Matches a single segment against compiled glob tokens.
+  Glob(Box<[GlobToken]>),
+}
+
+/// One path-scoped read rule in definition order (earlier to later; later wins at the same depth).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadPathRule {
+  /// The rule's path segments (empty means the repository root `/`).
+  pub segments: Vec<PolicySegment>,
+  /// Whether this rule grants read (`true`) or denies read (`false`).
+  pub allow: bool,
+}
+
+/// Whether `byte` is present in the 256-bit membership table `bits`.
+pub fn byte_set_contains(bits: &[u64; BYTE_SET_WORDS], byte: u8) -> bool {
+  let word = usize::from(byte >> BYTE_WORD_SHIFT);
+  let mask = 1u64 << u32::from(byte & BYTE_BIT_MASK);
+  bits.get(word).is_some_and(|entry| (*entry & mask) != 0)
+}
+
+/// Whether a single non-run `token` matches `byte`.
+fn token_matches_byte(token: GlobToken, byte: u8) -> bool {
+  match token {
+    GlobToken::Byte(expected) => byte == expected,
+    GlobToken::AnyByte => true,
+    GlobToken::ByteSet(bits) => byte_set_contains(&bits, byte),
+    GlobToken::Run | GlobToken::Never => false,
+  }
+}
+
+/// Whether compiled `tokens` match the path segment `name` whole (iterative two-pointer wildmatch, no recursion).
+fn matches_tokens(tokens: &[GlobToken], name: &[u8]) -> bool {
+  if tokens.contains(&GlobToken::Never) {
+    return false;
+  }
+  let (mut ti, mut ni) = (0usize, 0usize);
+  let mut star: Option<(usize, usize)> = None;
+  while let Some(&byte) = name.get(ni) {
+    match tokens.get(ti).copied() {
+      Some(GlobToken::Run) => {
+        ti = ti.saturating_add(1);
+        star = Some((ti, ni));
+      }
+      Some(token) if token_matches_byte(token, byte) => {
+        ti = ti.saturating_add(1);
+        ni = ni.saturating_add(1);
+      }
+      _ => {
+        let Some((saved_ti, saved_ni)) = star else {
+          return false;
+        };
+        let next_ni = saved_ni.saturating_add(1);
+        ti = saved_ti;
+        ni = next_ni;
+        star = Some((saved_ti, next_ni));
+      }
+    }
+  }
+  tokens
+    .get(ti..)
+    .is_some_and(|rest| rest.iter().all(|token| *token == GlobToken::Run))
+}
+
 /// A rule as placed on a node: its sequence number and what it gives the principal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Mark {
@@ -62,6 +158,7 @@ struct Node {
   prefixes: BTreeMap<Box<[u8]>, usize>,
   suffixes: BTreeMap<Box<[u8]>, usize>,
   patterns: BTreeMap<Box<[u8]>, usize>,
+  globs: BTreeMap<Box<[GlobToken]>, usize>,
   any_one: Option<usize>,
   any_many: Option<usize>,
   /// This node is a `**`, matched again at every level beneath its parent.
@@ -79,6 +176,7 @@ impl Node {
       prefixes: BTreeMap::new(),
       suffixes: BTreeMap::new(),
       patterns: BTreeMap::new(),
+      globs: BTreeMap::new(),
       any_one: None,
       any_many: None,
       repeats,
@@ -94,6 +192,16 @@ impl Node {
       Segment::Pattern(bytes) => self.patterns.get(bytes).copied(),
       Segment::AnyOne => self.any_one,
       Segment::AnyMany => self.any_many,
+    }
+  }
+
+  /// The child for policy `segment`, if there is one.
+  fn policy_child(&self, segment: &PolicySegment) -> Option<usize> {
+    match segment {
+      PolicySegment::Literal(bytes) => self.literals.get(bytes).copied(),
+      PolicySegment::AnyOne => self.any_one,
+      PolicySegment::AnyMany => self.any_many,
+      PolicySegment::Glob(tokens) => self.globs.get(tokens).copied(),
     }
   }
 
@@ -117,6 +225,20 @@ impl Node {
     }
   }
 
+  /// Makes `child` the child for policy `segment`.
+  fn attach_policy(&mut self, segment: &PolicySegment, child: usize) {
+    match segment {
+      PolicySegment::Literal(bytes) => {
+        self.literals.insert(bytes.clone(), child);
+      }
+      PolicySegment::AnyOne => self.any_one = Some(child),
+      PolicySegment::AnyMany => self.any_many = Some(child),
+      PolicySegment::Glob(tokens) => {
+        self.globs.insert(tokens.clone(), child);
+      }
+    }
+  }
+
   /// Every child.
   fn children(&self) -> impl Iterator<Item = usize> + '_ {
     self
@@ -125,6 +247,7 @@ impl Node {
       .chain(self.prefixes.values())
       .chain(self.suffixes.values())
       .chain(self.patterns.values())
+      .chain(self.globs.values())
       .copied()
       .chain(self.any_one)
       .chain(self.any_many)
@@ -202,6 +325,54 @@ impl PrincipalRules {
       anywhere: rights.every_path.max(rights.some_path),
       uniform_answers: Cell::new(0),
     }
+  }
+
+  /// Compiles a principal's path-scoped read rules directly from slates' `SvnPolicy` (deepest match wins,
+  /// last-defined wins at equal depth, `default_read` governs `/` when unruled).
+  pub fn from_read_rules(default_read: bool, rules: &[ReadPathRule]) -> Self {
+    let mut tree = Tree {
+      nodes: vec![Node::new(false)],
+    };
+    for (index, rule) in rules.iter().enumerate() {
+      let mark = Mark {
+        sequence: index.saturating_add(1),
+        access: if rule.allow {
+          Access::Read
+        } else {
+          Access::None
+        },
+      };
+      tree.insert_policy(&rule.segments, mark);
+    }
+    tree.place(
+      ROOT,
+      Mark {
+        sequence: DEFAULT_SEQUENCE,
+        access: if default_read {
+          Access::Read
+        } else {
+          Access::None
+        },
+      },
+    );
+    tree.trim();
+    tree.summarize();
+    let uniform = tree
+      .nodes
+      .get(ROOT)
+      .and_then(|root| (root.least == root.most).then_some(root.least));
+    let anywhere = tree.nodes.get(ROOT).map_or(Access::None, |root| root.most);
+    Self {
+      nodes: tree.nodes,
+      uniform,
+      anywhere,
+      uniform_answers: Cell::new(0),
+    }
+  }
+
+  /// Rules denying every path (fail-closed default when a repository record is absent or unreadable).
+  pub fn deny_all() -> Self {
+    Self::from_read_rules(false, &[])
   }
 
   /// What the principal may do at `path`.
@@ -310,11 +481,12 @@ impl PrincipalRules {
     self.step_patterns(node, name, here, next);
   }
 
-  /// The prefix, suffix and pattern children of `node` that `name` matches.
+  /// The prefix, suffix, pattern and policy-glob children of `node` that `name` matches.
   fn step_patterns(&self, node: &Node, name: &[u8], here: &mut Level, next: &mut Vec<usize>) {
     let matched = matching_prefixes(node, name)
       .chain(matching_suffixes(node, name))
-      .chain(matching_patterns(node, name));
+      .chain(matching_patterns(node, name))
+      .chain(matching_globs(node, name));
     for child in matched {
       self.reach(child, here, next);
     }
@@ -377,6 +549,23 @@ fn matching_patterns<'n>(node: &'n Node, name: &'n [u8]) -> impl Iterator<Item =
     .map(|(_, child)| *child)
 }
 
+/// The compiled policy-glob children of `node` that `name` matches.
+fn matching_globs<'n>(node: &'n Node, name: &'n [u8]) -> impl Iterator<Item = usize> + 'n {
+  node
+    .globs
+    .iter()
+    .filter(move |(tokens, _)| matches_tokens(tokens, name))
+    .map(|(_, child)| *child)
+}
+
+/// Whether a policy rule contains an unmatchable glob token (`GlobToken::Never`).
+fn rule_is_unmatchable(segments: &[PolicySegment]) -> bool {
+  segments.iter().any(|segment| match segment {
+    PolicySegment::Glob(tokens) => tokens.contains(&GlobToken::Never),
+    PolicySegment::Literal(_) | PolicySegment::AnyOne | PolicySegment::AnyMany => false,
+  })
+}
+
 /// The tree while it is built.
 struct Tree {
   nodes: Vec<Node>,
@@ -390,6 +579,44 @@ impl Tree {
       node = self.child(node, segment);
     }
     self.place(node, mark);
+  }
+
+  /// Places `mark` at the node for policy `segments`, collapsing adjacent `**` segments and skipping
+  /// rules containing [`GlobToken::Never`].
+  fn insert_policy(&mut self, segments: &[PolicySegment], mark: Mark) {
+    if rule_is_unmatchable(segments) {
+      return;
+    }
+    let mut node = ROOT;
+    let mut prev_many = false;
+    for segment in segments {
+      let is_many = matches!(segment, PolicySegment::AnyMany);
+      if prev_many && is_many {
+        continue;
+      }
+      prev_many = is_many;
+      node = self.policy_child(node, segment);
+    }
+    self.place(node, mark);
+  }
+
+  /// The child of `node` for policy `segment`, made if missing. A child always comes after its parent in `nodes`.
+  fn policy_child(&mut self, node: usize, segment: &PolicySegment) -> usize {
+    if let Some(existing) = self
+      .nodes
+      .get(node)
+      .and_then(|parent| parent.policy_child(segment))
+    {
+      return existing;
+    }
+    let made = self.nodes.len();
+    self
+      .nodes
+      .push(Node::new(matches!(segment, PolicySegment::AnyMany)));
+    if let Some(parent) = self.nodes.get_mut(node) {
+      parent.attach_policy(segment, made);
+    }
+    made
   }
 
   /// The child of `node` for `segment`, made if missing. A child always comes after its parent in `nodes`.
@@ -693,5 +920,113 @@ fn user_rights(
   match own {
     Some((rights, explicit)) => (rights.combined(everyone), explicit || everyone_explicit),
     None => (everyone, everyone_explicit),
+  }
+}
+
+#[cfg(test)]
+mod read_rules_tests {
+  use super::*;
+  use crate::authz::may_read;
+
+  fn lit(text: &str) -> PolicySegment {
+    PolicySegment::Literal(text.as_bytes().into())
+  }
+
+  fn bitset_of(bytes: &[u8]) -> [u64; BYTE_SET_WORDS] {
+    let mut bits = [0u64; BYTE_SET_WORDS];
+    for &byte in bytes {
+      bits[usize::from(byte >> BYTE_WORD_SHIFT)] |= 1u64 << u32::from(byte & BYTE_BIT_MASK);
+    }
+    bits
+  }
+
+  fn assert_read_cases(rules: &PrincipalRules, cases: &[(&str, bool)]) {
+    for &(path, expected) in cases {
+      assert_eq!(may_read(Some(rules), path), expected, "path {path}");
+    }
+  }
+
+  fn assert_uniform_fast_paths() {
+    let deny = PrincipalRules::deny_all();
+    assert_eq!(deny.uniform(), Some(Access::None));
+    assert_read_cases(&deny, &[("/", false), ("/trunk/a.txt", false)]);
+    assert_eq!(deny.uniform_answers(), 2);
+
+    let owner = PrincipalRules::from_read_rules(true, &[]);
+    assert_eq!(owner.uniform(), Some(Access::Read));
+    assert_read_cases(&owner, &[("/anything/at/all", true)]);
+    assert_eq!(owner.uniform_answers(), 1);
+  }
+
+  fn build_precedence_and_glob_rules() -> PrincipalRules {
+    let ab_glob = PolicySegment::Glob(Box::new([GlobToken::ByteSet(bitset_of(b"ab"))]));
+    let a_star = PolicySegment::Glob(Box::new([GlobToken::Byte(b'a'), GlobToken::Run]));
+    let broken = PolicySegment::Glob(Box::new([GlobToken::Byte(b'z'), GlobToken::Never]));
+    PrincipalRules::from_read_rules(
+      false,
+      &[
+        ReadPathRule {
+          segments: vec![],
+          allow: true,
+        },
+        ReadPathRule {
+          segments: vec![lit("secret")],
+          allow: false,
+        },
+        ReadPathRule {
+          segments: vec![lit("secret"), lit("open")],
+          allow: true,
+        },
+        ReadPathRule {
+          segments: vec![lit("pub"), lit("secret")],
+          allow: false,
+        },
+        ReadPathRule {
+          segments: vec![lit("trunk"), a_star],
+          allow: false,
+        },
+        ReadPathRule {
+          segments: vec![lit("pick"), ab_glob],
+          allow: false,
+        },
+        ReadPathRule {
+          segments: vec![lit("x"), PolicySegment::AnyMany, lit("vault")],
+          allow: false,
+        },
+        ReadPathRule {
+          segments: vec![lit("bad"), broken],
+          allow: false,
+        },
+      ],
+    )
+  }
+
+  /// Round-4 Blocker 2 (`PrincipalRules::from_read_rules` unit check): Do build rules with root
+  /// allow, subpath deny, nested allow, single-segment globs, `**`, and unmatchable `GlobToken::Never`,
+  /// plus `deny_all` and uniform fast-path. Expect: deepest-match and last-defined-wins match
+  /// Subversion semantics, uniform fast-path fires when all rules agree, and `GlobToken::Never`
+  /// never matches or pollutes uniform access.
+  #[test]
+  fn from_read_rules_evaluates_precedence_globs_and_uniform_fast_path() {
+    assert_uniform_fast_paths();
+    let rules = build_precedence_and_glob_rules();
+    assert_eq!(rules.uniform(), None);
+    assert_read_cases(
+      &rules,
+      &[
+        ("/", true),
+        ("/pub/ok.txt", true),
+        ("/secret", false),
+        ("/secret/top.txt", false),
+        ("/secret/open/readme.txt", true),
+        ("/pub/secret/vault.txt", false),
+        ("/trunk/alpha.txt", false),
+        ("/trunk/zebra.txt", true),
+        ("/pick/a/f.txt", false),
+        ("/pick/c/f.txt", true),
+        ("/x/deep/mid/vault/key", false),
+        ("/bad/z", true),
+      ],
+    );
   }
 }
