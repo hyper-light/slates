@@ -7632,3 +7632,17 @@ Part 1, landed at cd7d8c96c (commit 1deedd4f5). Run the TSan lane on ubuntu-late
 Part 2 is still being diagnosed: diagnostics branch `w-interop/tsan-spawner-diag` at 566b11519, to push as a
 `diag-measurer-*` branch (one TSan job, slates-ipc's library tests three times, then natively). It names descriptor 6,
 and the spawner parity test stays red in the lane until its fix lands.
+
+## 2026-11-27 w-interop, A-931 (an anchor's held sockets close-on-exec, handed on to the daemon's child alone), 5f0089f85
+
+On Linux (ubuntu-latest), at or past 5f0089f85:
+- `cargo xtask tsan`, the whole lane. Green: the spawner parity test and the client re-hold tests pass. A
+  `hold_once_released: … refusals` line may still appear (the fork-to-exec window), but no lifetime hold.
+- `cargo test -p slates-ipc --test rendezvous a_child_spawned_beside_a_held_rendezvous_holds_none_of_it`. Red: the
+  child lists `socket:[N]` of the held rendezvous (it did in run 45993337450).
+- `cargo test -p slates-anchor --test anchor`, the whole cross-process file, Linux. Green: all of it, including the new
+  `a_held_listener_reaches_its_daemon_alone` (child holds 1, the shell none), the three `inherits_the_held_*` tests
+  (their listeners close-on-exec now) and `an_anchor_started_again_and_again_hands_each_daemon_its_objects_once`. Red: a
+  child count of 0 (not handed on), or the shell holding the listener.
+- `cargo test -p slates-cli --test svn_interop a_hook_holds_no_descriptor_of_its_daemon`, with stock svn, a real
+  anchor's daemon and hook. Green: the hook holds its streams and its directory alone.
