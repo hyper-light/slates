@@ -24,3 +24,8 @@ files yet.
 - run 2: ~/.local/state/w-interop-logs/a914-run-2.log (narrower dump). B counted `merge.behind.chain_read` 1 and
   `merge.record.no_standing` 13.
 I keep the placed Some(1) shape (main's runs 1 and 16) and am reproducing it now.
+
+## 2026-11-27 14:28 PST: the placed Some(1) half landed (7c46f75e2)
+
+It was a region read waiting out a dead first home, not your chain read. `read_remote` now asks homes live first, each
+within a share of the budget. Runs 2 and 7 (yours, (C)) stand as sent.

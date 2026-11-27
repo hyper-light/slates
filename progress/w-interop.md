@@ -734,3 +734,4 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   4 KiB now. Main's next diag CI confirms on Windows. OPEN: main's call on whether the segment bound needs a change
   for 4 KiB hosts; the A-932 sibling (a lone green adopted as a root) is my next piece.
 - 2026-11-27 12:16 PST: A-932's sibling landed 8d0829e73 (adopted_root_founded; two reds first; merge set 79 of 79). GAPS row FIXED. Waiting on diag CI 11's reads (run 46057905828).
+- 2026-11-27 14:28 PST: a914's placed Some(1) landed 0b7edb153, merged 7c46f75e2. A region read asks homes live first, each within a share of the budget; two fleet reds first. Siblings in GAPS, OPEN. Diag CI 11 confirmed everything else I landed today. Main runs a914 16 times with (C).
