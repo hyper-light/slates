@@ -39,7 +39,7 @@ use slates_cluster::membership::MemberState;
 use slates_db::register::HostId;
 use slates_rt::error::ReceiveRefusal;
 use slates_rt::futures;
-use slates_rt::shard::Kept;
+use slates_rt::shard::{Kept, TaskId};
 use slates_rt::udp::{SocketAddrV4, UdpSocket};
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::Endpoint;
@@ -96,6 +96,10 @@ const FOLD_REFUSED: &str = "fleet.plane.fold_refused";
 /// the pass borrowing sessions that owe nothing.
 const EPOCH_LENT: &str = "fleet.plane.announce_lends";
 const EPOCH_SENT: &str = "fleet.plane.announcements_sent";
+
+/// Counter: a member's announcement run inline because the runtime refused its task ([`announce_epochs`]): it then waits
+/// on the pass as before. Format: a counter name in the daemon's status report.
+const EPOCH_INLINE: &str = "fleet.plane.announce_inline";
 
 /// One side's identity in an epoch exchange.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +185,9 @@ pub(crate) struct PlaneState {
   /// Per member, the process nonce it last announced itself with to this node: another one is a new process under the
   /// same id ([`note_reconnected`]). Bounded by the fleet's peer capacity.
   pub announced_from: BTreeMap<HostId, u64>,
+  /// Members whose announcement task ([`announce_epochs`]) has ended, for the member loop to join on its next turn.
+  /// Bounded by the loop's tasks in flight, one a member.
+  pub announce_done: std::collections::BTreeSet<HostId>,
 }
 
 impl std::fmt::Debug for PlaneState {
@@ -355,14 +362,23 @@ fn forget_address(state: &mut ShardState, anchor: HostId) {
 /// identity; any other announces [`IDENTITY_ONLY`].
 ///
 /// Only a session whose connection has not announced yet is owed, decided in the state's borrow from the session
-/// still in its slot, and each owed session is borrowed alone for its own exchange and returned before the next. The
-/// membership loop runs this on every turn: borrowing every session on each turn, all of them held while one
+/// still in its slot, and each owed member's sessions are borrowed alone on its own task (`announcing`, the loop's
+/// tasks in flight, by member, with its anchor) and returned at its exchange's end. The membership loop runs this on every turn: borrowing every session on each turn, all of them held while one
 /// announcement waited, kept the whole record plane lent about a hundred times a second per node and held every
 /// session for up to 3.1 s behind one unanswered announcement (diagnostic run at 10% loss, 2026-10-09).
-async fn announce_epochs() {
+async fn announce_epochs(announcing: &mut BTreeMap<HostId, (HostId, TaskId)>) {
+  // The tasks that ended since the last turn are joined, so their slots are released; each recorded its end as it
+  // returned, so the join completes at once.
+  let done =
+    state::with_state(|state| std::mem::take(&mut state.plane.announce_done)).unwrap_or_default();
+  for member in done {
+    if let Some((_, task)) = announcing.remove(&member) {
+      let _ = futures::join(task).await;
+    }
+  }
   // Decided in one borrow: `take_sessions` runs its filter inside the state's borrow, so the filter must not borrow the
   // state again.
-  let owed: Vec<(HostId, bool)> = state::with_state(|state| {
+  let owed: Vec<(HostId, HostId, bool)> = state::with_state(|state| {
     let origin = state.origin_anchor;
     let anchors: BTreeMap<HostId, HostId> = state
       .record_sessions
@@ -376,21 +392,57 @@ async fn announce_epochs() {
       .filter_map(|(member, link)| {
         let anchor = anchors.get(member)?;
         let connection = link.endpoint.as_mut()?.connection_id().ok()?;
-        (announced_on.get(member) != Some(&connection)).then_some((*member, *anchor > origin))
+        (announced_on.get(member) != Some(&connection)).then_some((
+          *member,
+          *anchor,
+          *anchor > origin,
+        ))
       })
       .collect()
   })
   .unwrap_or_default();
-  for (member, canonical) in owed {
-    let mut sessions =
-      crate::fleet::take_sessions("fleet.lent_to.announce_epochs", |host| host == member);
-    let lent = u64::try_from(sessions.len()).unwrap_or(u64::MAX);
-    let _ = state::with_state_counted(|s| s.count(EPOCH_LENT, lent));
-    for (_, endpoint) in &mut sessions {
-      announce_on(member, endpoint, canonical).await;
+  // Each member's announcement runs on its own, its session borrowed alone and returned once its exchange ends, so a
+  // peer that took a session and never answers (it died meanwhile) holds no other member's keying (A-921's next mode,
+  // main 01a20182's ruling of 2026-11-27; A-921 part 5). In turn, the pass awaited each exchange before the next: a restarted node's
+  // announcement to a peer that died just then held every later one for its whole exchange budget (4.4 to 7.6 s, past
+  // the node's own detection of 1 s), its peers probed it under its old process's keys, and condemned it beside the dead
+  // one. Nor does the loop wait on them: it steps the detector and answers probes meanwhile, and joins each task once
+  // it ended. Each is the loop's child, so the loop's end cancels and joins any still running. Bounded by the owed
+  // sessions, one a member (a member in flight has its session lent, so it is owed nothing more), and one an anchor: a
+  // canonical announcement reads the anchor's last epoch and records the next once answered, so two at once (its seed
+  // id's session and its learned id's) would both name the same one. A task the runtime refuses runs inline, counted.
+  for (member, anchor, canonical) in owed {
+    if announcing
+      .iter()
+      .any(|(held, (held_anchor, _))| *held == member || *held_anchor == anchor)
+    {
+      continue;
     }
-    crate::fleet::return_sessions(sessions);
+    match futures::spawn_child(announce_member(member, canonical)) {
+      Ok(task) => {
+        announcing.insert(member, (anchor, task));
+      }
+      Err(_) => {
+        let _ = state::with_state_counted(|s| s.count(EPOCH_INLINE, 1));
+        announce_member(member, canonical).await;
+        let _ = state::with_state(|state| state.plane.announce_done.remove(&member));
+      }
+    }
   }
+}
+
+/// The announcement owed `member` on its sessions, each borrowed for its own exchange and returned at its end
+/// ([`announce_epochs`]).
+async fn announce_member(member: HostId, canonical: bool) {
+  let mut sessions =
+    crate::fleet::take_sessions("fleet.lent_to.announce_epochs", |host| host == member);
+  let lent = u64::try_from(sessions.len()).unwrap_or(u64::MAX);
+  let _ = state::with_state_counted(|s| s.count(EPOCH_LENT, lent));
+  for (_, endpoint) in &mut sessions {
+    announce_on(member, endpoint, canonical).await;
+  }
+  crate::fleet::return_sessions(sessions);
+  let _ = state::with_state(|state| state.plane.announce_done.insert(member));
 }
 
 /// One announcement on one borrowed session, once per connection: the pair's next epoch on its `canonical` session,
@@ -905,8 +957,9 @@ pub(crate) async fn run(
   }
   let (origin, shards) = state::with_state(|s| (s.shard, s.shards.clone())).unwrap_or_default();
   let mut buffer = vec![0u8; RECEIVE_BYTES];
+  let mut announcing = BTreeMap::new();
   loop {
-    announce_epochs().await;
+    announce_epochs(&mut announcing).await;
     // And this node's edges, once a session and again as they change (A-925).
     crate::edges::announce_edges().await;
     resolve_peers(resolver).await;

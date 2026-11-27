@@ -65979,3 +65979,46 @@ Applied in the same change to:
 - **Applied in the same change to:** `crates/db/src/register.rs`,
   `crates/server/src/{merge_service,fleet,replica_build,daemon}.rs`, `crates/server/src/vcs_store/replica.rs`,
   `crates/server/tests/fleet.rs`, A-921 part 3's entry, GAPS.
+- **Amended by A-921 part 5** (2026-11-27): A-921's next mode is fixed. The owed-part scene's adoption guard and
+  `Daemon::holder_owner` are gone, and A919's owner-restart test runs again.
+
+### A-921 part 5 — A restarted node announces its new process to each peer on its own task, so a peer that died meanwhile holds no other peer's re-key (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 03:33 and 03:38; A-921's next mode)
+
+- **Why.** In 3 of 10 owner-restart scenes, a survivor adopted a's green when the first candidate died, though a was
+  alive and its fencing epoch never moved. The mode was diagnosed with read-only observations.
+  - `restart_warm` settles once a is a council member at every node and named by no retirement. At that point a's new
+    record plane has not yet announced its epochs.
+  - a's new process announced itself to its peers one at a time, each exchange waited out before the next. Its
+    announcement to the first candidate, stopped by the scene just then, went unanswered (a's
+    `fleet.plane.epoch_unanswered` 1). That held every other peer's re-key for the whole exchange budget.
+  - Meanwhile the survivors still held a under its old process's keys. They probed it, got no answer, and condemned it
+    beside the stopped candidate: two deaths at `f = 1`.
+- **The rule.** The member loop's announcement pass (`member_task::announce_epochs`) spawns each owed member's
+  announcement as its own task, a child of the loop (`futures::spawn_child`). Each task borrows only that member's
+  session and returns it when its exchange ends.
+  - The loop does not wait on these tasks. It keeps stepping the detector and answering probes, and it joins each task
+    on the turn after the task records its end (`PlaneState::announce_done`), so the task's slot is released.
+  - The tasks are bounded at one per member. A member in flight has its session lent, so the pass owes it nothing
+    more. The loop's own end cancels and joins any task still running, so none is orphaned.
+  - At most one task per anchor is in flight. A canonical announcement reads the anchor's last epoch and records the
+    next one once answered. Two at once (the session under the anchor's seed id and the one under its learned id) would
+    both name the same epoch.
+  - A task the runtime refuses runs inline, as the pass did before, counted `fleet.plane.announce_inline`.
+  - main's 03:38 ruling offered two ways: settle only once every peer re-keyed, or announce at once to every peer.
+    This is the second. A peer's re-key no longer depends on any other peer's answer, so the first is not needed.
+- **Observability.** The per-peer route record used in the diagnosis (direct and indirect answers by relay) does not
+  land. Its acknowledgement path would grow entries for any sender, not only the view, and main's 03:33 note asked for
+  counters, not a new interface. The new counter is `fleet.plane.announce_inline`. The others already existed:
+  `fleet.plane.announcements_sent`, `fleet.plane.announce_lends`, `fleet.plane.epoch_unanswered`.
+- **Tests.**
+  - Fleet `a921_a_warm_restarted_node_is_heard_under_its_new_process_within_a_detection` (red first). The peer a
+    announces to first answers no epoch announcement (`Daemon::inject_epoch_withhold`, a test hook as
+    `inject_live_state_withhold` is), and a restarts warm. Each other peer must hold a under its new process (keyed,
+    joined, and a's announced process nonce, `Daemon::member_keying`) within a's own detection term
+    (`Daemon::failover_detection_ns`, 1 s), measured on the wall clock. Before: 3 of 3 red, heard at 4.4 to 7.6 s.
+    After: heard at 22 to 197 ms over two runs.
+  - The owed-part scene and A919's owner-restart scene no longer guard against the adoption (`adopted_elsewhere_of` is
+    removed). A919's test is no longer ignored. After the fix, 4 runs of each formed no scene afresh.
+- **Applied in the same change to:** `crates/server/src/{member_task,fleet,state,daemon}.rs`,
+  `crates/cluster/src/member_plane.rs` (`MemberPlane::is_joined`), `crates/server/tests/fleet.rs`, A-921 part 4's
+  entry, GAPS.

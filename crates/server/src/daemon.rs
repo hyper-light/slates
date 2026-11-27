@@ -1959,22 +1959,6 @@ impl Daemon {
     })
   }
 
-  /// Test support (A-921's owner-restart scenes): the owner this node's acceptor of `object` names, on any shard holding
-  /// one; `None` where it holds none.
-  pub fn holder_owner(&self, object: [u8; 16]) -> Result<Option<slates_db::HostId>, ObserveError> {
-    let object = slates_db::register::ObjectId(object);
-    for shard in self.shards.clone() {
-      if let Some(owner) = self.observe(Some(shard), move |s| {
-        s.holder_records
-          .get(&object)
-          .map(slates_db::register::Acceptor::owner)
-      })? {
-        return Ok(Some(owner));
-      }
-    }
-    Ok(None)
-  }
-
   /// Test support (A-927 part 2): no shard of this node ships the state logs' parts it owes to `peer`, and every other
   /// candidate is shipped them, so a repository's creation here answers once another member holds its names-log part (its
   /// root's join) while `peer`, its successor-to-be, holds none. `Ok` once set on every shard.
@@ -2495,6 +2479,30 @@ impl Daemon {
         .map(slates_cluster::member_plane::MemberPlane::counts)
         .unwrap_or_default()
     })
+  }
+
+  /// Test support (A-921's next mode): how this node's membership plane holds `peer`: whether it is joined to the
+  /// detector, whether it is keyed by an installed epoch (and joined, as `PlaneState::keyed` says), the process nonce it
+  /// last announced itself with here, and the plane's datagrams refused queueing (no epoch for a peer, all peers). A
+  /// one-shot control-shard question.
+  pub fn member_keying(
+    &self,
+    peer: slates_db::HostId,
+  ) -> Result<(bool, Option<bool>, Option<u64>, u64), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let plane = s.plane.plane.as_ref();
+      (
+        plane.is_some_and(|plane| plane.is_joined(peer)),
+        s.plane.keyed.get(&peer).copied(),
+        s.plane.announced_from.get(&peer).copied(),
+        plane.map_or(0, |plane| plane.counts().refused_queue),
+      )
+    })
+  }
+
+  /// Test support (A-921's next mode): this node's member process nonce, which a peer learns it by on each announcement.
+  pub fn member_process_nonce(&self) -> Result<u64, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| s.member_process_nonce)
   }
 
   /// The membership plane's detector's belief about `host` (A-67 H-2): `Suspect` where its probes went unanswered,
@@ -3871,6 +3879,19 @@ impl Daemon {
       self.shard_of_object(slates_db::register::ObjectId(volume.bytes)),
       move |s| crate::live_ship::inject_superseded(s, id, epoch, learned),
     )
+  }
+
+  /// Test support (A-921's next mode): while `withhold`, this node's record serve side holds each plane epoch
+  /// announcement's answer after its request arrived, as a peer that took a restarted node's session and died before
+  /// answering does; every other stream and the probe plane answer as usual. On every shard, as
+  /// [`Self::inject_live_state_withhold`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_epoch_withhold(&self, withhold: bool) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.plane_epoch_withhold_replies = withhold;
+      })?;
+    }
+    Ok(())
   }
 
   /// Test support: while `withhold` is set, this node's record serve side holds each live-state reply (a takeover's
@@ -5784,6 +5805,7 @@ async fn init_shard(
     discovery_withhold_replies: false,
     shards_withhold_replies: false,
     live_state_withhold_replies: false,
+    plane_epoch_withhold_replies: false,
     peer_paths: std::collections::BTreeMap::new(),
     probe_windows: crate::fleet::ProbeWindows::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),

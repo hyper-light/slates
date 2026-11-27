@@ -1832,6 +1832,9 @@ async fn serve_peer_records(
         if stream == slates_cluster::live::LIVE_STATE_STREAM {
           withheld_live_state().await;
         }
+        if stream == crate::member_task::PLANE_EPOCH_STREAM {
+          withheld_epoch_answer().await;
+        }
         match stream {
           crate::member_task::PLANE_EPOCH_STREAM => plane_secret
             .and_then(|secret| {
@@ -2054,6 +2057,14 @@ async fn serve_peer_records(
     if served.is_err() {
       return;
     }
+  }
+}
+
+/// Test support: waits while a test withholds this node's plane epoch answers (`Daemon::inject_epoch_withhold`, A-921's
+/// next mode; `ShardState::plane_epoch_withhold_replies`, never reachable from the wire).
+async fn withheld_epoch_answer() {
+  while state::with_state(|state| state.plane_epoch_withhold_replies).unwrap_or(false) {
+    crate::daemon::pace(HEARTBEAT_NS / POLL_PER_PERIOD).await;
   }
 }
 

@@ -368,10 +368,13 @@
 >     only in its owner's floors (each by its greater) and acknowledges it. And a replica store made before the missed
 >     part arrived refused every build `Missing` (94 a run): after a refused build, the store is made again from every
 >     part held. Red first: the push lands, 5 of 5. Every silent exit of the merge plane's ship and hold is now counted.
->   - **OPEN, A-921's next (w-shared, after the false-death regression):** 3 of 10 owner-restart scenes, a survivor
->     adopted a's green with a candidate's death though a lives and its fencing epoch never moved; a's records were
->     then refused `Unauthorized` (89 to 386 a run) and its repository's `main` left a. The owed-part scene forms afresh
->     where it happens (`adopted_elsewhere_of`); A919's owner-restart test stays ignored for it. Not yet understood.
+>   - **FIXED, A-921's next (A-921 part 5, w-shared, 2026-11-27):** 3 of 10 owner-restart scenes, a survivor adopted
+>     a's green with a candidate's death though a lived. a's new process announced itself to each peer in turn, and its
+>     announcement to the candidate stopped just then went unanswered for the whole exchange budget. Every other peer
+>     kept a under its old keys, probed it unanswered, and condemned it beside the candidate. Each peer's announcement
+>     now runs on its own task, owned by the member loop, which no longer waits on it. Red first: the peers re-keyed a
+>     within its 1 s detection (22 to 197 ms, against 4.4 to 7.6 s before). The adoption guard is gone, and A919's
+>     owner-restart test runs again.
 >   - **KNOWN LIMIT (main 01a20182's ruling of 2026-11-27): a forward's first try may go to a readmitted creator.**
 >     A readmission drops the host's completed takeover (`RegionalConfiguration::admit`, A-309) and its retirement is
 >     gone once that completes, so A-921 part 2's creator skip has nothing to read for it: a node that has not yet

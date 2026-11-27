@@ -37953,13 +37953,13 @@ fn a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_th
 /// the old holder had missed a part a owed it, and every push was refused `unable to commit`. (1), the names-log part, a
 /// owes again after its restart (A-921 part 3); (2), the green's next version, a's replay re-derives with other floors,
 /// which the old holder joins (A-921 part 4). The newcomer's held positions are measured against the start rule: each at
-/// or above a's restarted hold start. A scene where another node adopted a's repository or green at its restart though
-/// a's epoch did not move is formed afresh, as one a's epoch moved in is. Ignored for A-921's next mode (GAPS): about 3
-/// scenes in 10, a survivor adopts a's green with a candidate's death though a lives, and this scene stops one after its
-/// guard, so a push may be refused; run by name with `cargo test -p slates-server --test fleet
-/// a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins -- --ignored --exact`.
+/// or above a's restarted hold start.
+///
+/// A-921 part 5 (main 01a20182's rulings of 2026-11-27): about 3 scenes in 10 before, a survivor adopted a's green with
+/// the first candidate's death though a lived: a's new process announced itself to each peer in turn, the stopped one
+/// first, and every other peer probed a under its old keys and condemned it beside the stopped one. a now announces to
+/// each peer on its own task, so no scene is guarded against that adoption, and the test runs again.
 #[test]
-#[ignore = "A-921's next mode: a survivor adopts a live owner's green with a candidate's death; run by name with --ignored"]
 fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins() {
   let _serial = serialize_fleet_tests();
   let Some((mut fleet, holders)) = (0..SCENE_RESTARTS).find_map(restarted_owner_scene) else {
@@ -38114,13 +38114,12 @@ fn restarted_owner_scene(attempt: usize) -> Option<(GitFleet, Vec<usize>)> {
     both_hold && restarted,
     "a's two remote candidates held version 1 ({holders:?}), and a restarted and settled"
   );
-  let adopted_elsewhere = adopted_elsewhere(&fleet);
-  if before == after && !adopted_elsewhere {
+  if before == after {
     return Some((fleet, holders));
   }
   eprintln!(
     "restarted-owner-log: attempt {attempt}: a was taken over during its warm restart (its epoch {before:?} -> \
-     {after:?}, adopted elsewhere {adopted_elsewhere}), the scene formed afresh"
+     {after:?}), the scene formed afresh"
   );
   fleet.stop();
   None
@@ -38208,12 +38207,94 @@ fn a921_a_holder_that_missed_an_owners_part_before_its_warm_restart_is_shipped_i
 /// off it: the creation's and the first push's.
 const PARTS_BEFORE_THE_HOLD: usize = 2;
 
+/// A-921 part 5 (main 01a20182's rulings of 2026-11-27: a restarted node is not settled until every peer holds it
+/// under its new process). Do: on a four-node `f = 1` anchored git fleet, make the peer a's new process announces itself
+/// to first (the smallest member id, a's record sessions' order) take a's session and answer no epoch announcement
+/// (`Daemon::inject_epoch_withhold`), as a peer that died just then does; restart a warm; once `restart_warm` reports it
+/// settled, watch each other node for as long as a's own detection term states (`Daemon::failover_detection_ns`: how
+/// long its peers take to condemn it). Expect each other node but the silent one to hold a under its new process (the
+/// process nonce a announced to it is a's own now, a keyed by an installed epoch and joined to its detector) within that
+/// detection: past it, a probe under a's old keys goes unanswered and a peer's detector may condemn a live member. Red before: a's announcements waited in turn, each behind the last, so the silent peer's unanswered one held
+/// every other peer's re-key for its whole exchange budget, and a peer's death in that gap retired a beside it
+/// (A-921 part 5; 3 scenes in 10: a's `epoch_unanswered` 1, no survivor re-keyed until a was readmitted).
+#[test]
+fn a921_a_warm_restarted_node_is_heard_under_its_new_process_within_a_detection() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = anchored_git_fleet_of("rekeyed", &["a", "b", "c", "d"]);
+  let a = fleet.hosts[0];
+  let silent = (1..fleet.hosts.len())
+    .min_by_key(|node| fleet.hosts[*node].0)
+    .expect("a peer");
+  fleet.daemons[silent].inject_epoch_withhold(true).unwrap();
+  let restarted = fleet.restart_warm(0);
+  let settled = Instant::now();
+  let process = fleet.daemons[0].member_process_nonce().ok();
+  // How long the other nodes take to condemn a dead a: a's own detection term (`Daemon::failover_detection_ns`, SWIM's
+  // count of its detector's periods at their measured tail).
+  let detection = fleet.daemons[0]
+    .failover_detection_ns()
+    .ok()
+    .flatten()
+    .unwrap_or(HEARTBEAT_NS);
+  let mut heard_at: Vec<Option<u128>> = vec![None; fleet.daemons.len().saturating_sub(1)];
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let _ = poll_until(&observed, Duration::from_nanos(detection), || {
+    for (at, daemon) in fleet.daemons[1..].iter().enumerate() {
+      if heard_at.get(at).is_some_and(Option::is_some) || at.saturating_add(1) == silent {
+        continue;
+      }
+      let new_process = daemon
+        .member_keying(a)
+        .is_ok_and(|(joined, keyed, announced, _)| {
+          joined && keyed == Some(true) && announced.is_some() && announced == process
+        });
+      if new_process && let Some(slot) = heard_at.get_mut(at) {
+        *slot = Some(settled.elapsed().as_millis());
+      }
+    }
+    Ok(
+      heard_at
+        .iter()
+        .enumerate()
+        .all(|(at, heard)| heard.is_some() || at.saturating_add(1) == silent),
+    )
+  });
+  drop(observed);
+  let _ = fleet.daemons[silent].inject_epoch_withhold(false);
+  let unanswered = move_counter(&fleet.daemons[0], "fleet.plane.epoch_unanswered");
+  let keying: Vec<String> = fleet.daemons[1..]
+    .iter()
+    .map(|daemon| format!("{:?}", daemon.member_keying(a).ok()))
+    .collect();
+  fleet.stop();
+  eprintln!(
+    "rekeyed: restarted {restarted}; the silent peer node {silent}; detection {detection} ns; each other node heard a \
+     under its new process at (ms after the settle) {heard_at:?}; keying {keying:?}, a's process {process:?}; a's \
+     unanswered announcements {unanswered:?}"
+  );
+  assert!(restarted, "a restarted warm and settled");
+  // Within the detection on the wall's clock: the watch above is charged in fleet periods, which a loaded host runs late.
+  let within = |heard: &Option<u128>| {
+    heard.is_some_and(|ms| ms.saturating_mul(NANOS_PER_MILLI) <= u128::from(detection))
+  };
+  assert!(
+    heard_at
+      .iter()
+      .enumerate()
+      .all(|(at, heard)| within(heard) || at.saturating_add(1) == silent),
+    "every other node but the silent one heard a under its new process within a detection ({detection} ns) of its \
+     settle: {heard_at:?} ms"
+  );
+}
+
+/// Format: nanoseconds in a millisecond, to compare a time recorded in milliseconds with one in nanoseconds.
+const NANOS_PER_MILLI: u128 = 1_000_000;
+
 /// One attempt at [`a921_a_holder_that_missed_an_owners_part_before_its_warm_restart_is_shipped_it_after`]'s scene: a
 /// four-node anchored git fleet, `main` pushed and held by both of a's remote candidates, a push on top whose state-log
 /// parts a held off the second, then a restarted warm and settled, then the first candidate stopped and taken over. The
-/// fleet, the old holder's member id and whether the first's death was taken over, where a was taken over neither by its
-/// restart nor with the first's death; `None`, printed and stopped, where it was (A-921; GAPS: the second is A-921's
-/// next).
+/// fleet, the old holder's member id and whether the first's death was taken over, where a was not taken over by its
+/// restart; `None`, printed and stopped, where it was (A-921).
 fn part_missed_scene(attempt: usize) -> Option<(GitFleet, HostId, bool)> {
   let mut fleet = anchored_git_fleet_of("owed-parts", &["a", "b", "c", "d"]);
   let green = VolumeId {
@@ -38260,46 +38341,18 @@ fn part_missed_scene(attempt: usize) -> Option<(GitFleet, HostId, bool)> {
     pushed.is_ok() && both_hold && missed.is_ok() && restarted,
     "the pushes before the restart landed ({pushed:?}, {missed:?}), both candidates held version 1, and a restarted"
   );
-  let restart_kept = before == after && !adopted_elsewhere(&fleet);
-  let (gone, old_host) = (fleet.hosts[first], fleet.hosts[old]);
-  let mut taken = false;
-  if restart_kept {
+  if before == after {
+    let (gone, old_host) = (fleet.hosts[first], fleet.hosts[old]);
     fleet.daemons.remove(first).stop();
-    taken = poll_taken_over_and_unseated(&fleet.daemons, gone);
-  }
-  // a kept as the green's owner at every survivor through the first's takeover too (GAPS: A-921's next mode adopts it
-  // with the first's death, though a lives).
-  let kept =
-    restart_kept && !adopted_elsewhere_of(&fleet.daemons[1..], (fleet.repository, fleet.hosts[0]));
-  if kept {
+    let taken = poll_taken_over_and_unseated(&fleet.daemons, gone);
     return Some((fleet, old_host, taken));
   }
   eprintln!(
-    "owed-parts: attempt {attempt}: a was taken over (its epoch {before:?} -> {after:?}, at its restart \
-     {restart_kept}), the scene formed afresh"
+    "owed-parts: attempt {attempt}: a was taken over during its warm restart (its epoch {before:?} -> {after:?}), the \
+     scene formed afresh"
   );
   fleet.stop();
   None
-}
-
-/// Whether a node other than a adopted a's repository or a green of it, or holds a's root green under another owner
-/// (A-921's owner-restart scenes): a taken over by its warm restart though its fencing epoch did not move, the mode GAPS records as A-921's next, so a scene where it
-/// happened is formed afresh, as one a's epoch moved in is.
-fn adopted_elsewhere(fleet: &GitFleet) -> bool {
-  adopted_elsewhere_of(&fleet.daemons[1..], (fleet.repository, fleet.hosts[0]))
-}
-
-/// [`adopted_elsewhere`] over `others`, of repository `repository` owned by `owner`.
-fn adopted_elsewhere_of(others: &[Daemon], (repository, owner): ([u8; 16], HostId)) -> bool {
-  others.iter().any(|daemon| {
-    daemon
-      .repository_takeover(repository)
-      .is_ok_and(|(_, [adopted, ..])| adopted >= 1)
-      || move_counter(daemon, "merge.takeover.adopted").is_ok_and(|adopted| adopted >= 1)
-      || daemon
-        .holder_owner(repository)
-        .is_ok_and(|named| named.is_some_and(|named| named != owner))
-  })
 }
 
 /// Shape: the scenes A-919's owner-restart test forms at most: a warm restart outlasted detection about 1 run in 3 to 5

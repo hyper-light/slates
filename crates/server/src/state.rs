@@ -1170,6 +1170,11 @@ pub struct ShardState {
   /// other stream and the probe plane answer as usual: a holder alive and in contact whose report misses an asker's
   /// budget, as one retransmission on a lossy path made it (`Daemon::inject_live_state_withhold`).
   pub live_state_withhold_replies: bool,
+  /// Test support (A-921's next mode): while set, this node answers no plane epoch announcement
+  /// (`member_task::PLANE_EPOCH_STREAM`) after its request arrived, while every other stream and the probe plane answer
+  /// as usual: a peer that took a restarted node's session and died before answering its announcement
+  /// (`Daemon::inject_epoch_withhold`).
+  pub plane_epoch_withhold_replies: bool,
   /// The measured **path** to each peer (§4.8 "Derived constants": "election timeout ≥ 10 × broadcast RTT
   /// p99"; `slates_cluster::timing::PathRtt`): the transport's RFC 9002 estimator over every round trip
   /// this node timed to that peer — its SWIM probe's acknowledgement each period, and every consensus
