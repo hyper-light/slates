@@ -1558,6 +1558,13 @@ fn b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands() {
   )
   .unwrap();
   let refused = crate::daemon::observe_first(&daemon, bring_backs_refused);
+  let one_call = crate::daemon::observe_first(&daemon, |state| {
+    state
+      .refusals
+      .get(super::ONE_CALL_BUILDS)
+      .copied()
+      .unwrap_or(0)
+  });
   daemon.stop();
   assert_eq!(
     reasons(&updated),
@@ -1569,6 +1576,8 @@ fn b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands() {
     after > at_let_go,
     "the base's window brought back after its let-go: {at_let_go} -> {after}"
   );
+  // B6 (main's ruling of 2026-11-27): the verdict took the build its ready prepared, never one made whole in one call.
+  assert_eq!(one_call, 0, "no work built in one call");
 }
 
 /// B1's one rule keyed by the let-go met, not the window's place (main's order of 2026-11-26: the interleaving forced,

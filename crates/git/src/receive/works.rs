@@ -233,6 +233,8 @@ pub struct Verdicts<'w, G: ?Sized, R: ?Sized, O> {
   /// ([`Verdicts::peel_away`]), kept by the push across its turns: the same let-go met again, the window not brought
   /// back between, lets the command go on to its refusal ([`crate::away`]'s one rule).
   away_seen: WaitOnce<u64>,
+  /// The works it built in one call, with no prepared build of their push to take ([`Verdicts::one_call_builds`]).
+  one_call: Cell<u64>,
 }
 
 /// A command's work built a unit at a time over the turns before its verdict (A-752; §4.3's step budget): a push over
@@ -320,6 +322,10 @@ where
       appends,
     }
   }
+  /// The works its verdicts built in one call ([`Verdicts::one_call_builds`]).
+  pub fn one_call_builds(&self) -> u64 {
+    self.verdicts.one_call_builds()
+  }
 }
 
 /// A read a command's preparation made met a let-go window, to be brought back before the command is prepared again
@@ -345,6 +351,7 @@ where
       room,
       prepared: Cell::new(None),
       away_seen: WaitOnce::default(),
+      one_call: Cell::new(0),
     }
   }
 
@@ -354,6 +361,15 @@ where
       away_seen: WaitOnce::after(away_seen),
       ..self
     }
+  }
+
+  /// The works these verdicts built in one call, with no prepared build of their push to take (B6 of the landed
+  /// let-go's lift, main's ruling of 2026-11-27): a caller that prepares nothing (`Works` over memory, the protected
+  /// fixtures) builds every update so; on the server it stays 0, since every update's verdict takes the build
+  /// [`Verdicts::prepare`] made in the same step over the same base (an update's base is the version its old value
+  /// heads, a moved green declines before any build; a create builds nothing), so no build is made whole in one step.
+  pub fn one_call_builds(&self) -> u64 {
+    self.one_call.get()
   }
 
   /// The let-go a peel stopped for, by its number, for the push to keep across its turns ([`Verdicts::peeled`]).
@@ -600,7 +616,10 @@ where
       .filter(|prepared| prepared.building.is_of(&push))
       .and_then(|prepared| prepared.done);
     prepared
-      .unwrap_or_else(|| build(&push, green, self.objects, self.room))
+      .unwrap_or_else(|| {
+        self.one_call.set(self.one_call.get().saturating_add(1));
+        build(&push, green, self.objects, self.room)
+      })
       .map(|built| built.increment)
       .map_err(|refused| work_refused(&command.name, &refused))
   }

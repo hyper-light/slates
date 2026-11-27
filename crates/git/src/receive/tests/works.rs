@@ -177,6 +177,8 @@ struct Logs {
   /// Each create's owed push built as its green's materialization builds it (P2: the same builder over the same objects
   /// the eager create read), in the order appended.
   materialized: Vec<Increment>,
+  /// The works the verdicts built in one call, with no prepared build to take (`Works::one_call_builds`).
+  one_call: u64,
 }
 
 impl Logs {
@@ -264,7 +266,9 @@ fn pushed(served: &mut Served, bytes: &[u8], logs: &mut Logs) -> Received {
   let mut works = Works::new(&read, &indexed, &objects, logs, NAME, ROOM);
   let mut answer = Vec::new();
   let received = session.answer(&mut works, &mut answer, &mut unbounded());
+  let one_call = works.one_call_builds();
   drop(works);
+  logs.one_call += one_call;
   // A create's green owes its push (P2): built here as its first reader's materialization builds it, over the same
   // objects, against the green it is made at or an empty one.
   let empty = Green::new();
@@ -375,6 +379,9 @@ fn an_update_is_its_branchs_next_work_appended_at_the_position_read() {
     "{verdict:?}"
   );
   assert_holds(&served.green, b"two\n", next);
+  // B6's counter is no vacuous 0: `Works` over memory prepares nothing, so its update was built in one call (the
+  // server's push tests hold it at 0, every verdict taking the build its `ready` prepared).
+  assert_eq!(logs.one_call, 1, "the update built in one call");
 }
 
 /// A-620 part 2 (§4.17.1 item 1: "A value that no version of the green ever held ... is answered as
