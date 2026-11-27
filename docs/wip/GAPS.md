@@ -798,6 +798,39 @@
 >   `git_push::tests::b9_a_hooked_push_over_a_let_go_pack_brings_its_views_windows_back_and_lands` (a new branch at
 >   `main`'s commit over the create's let-go pack: declined `hook not run` before; lands, windows brought back, after;
 >   its driver, like the HTTP edge, now brings back the push's waited window after a turn).
+> - **B10 BUILT (w-git, 2026-11-27, main's rulings of 08:25 and 09:01): an unlanded push's pack windows pinned.**
+>   Found by the flip's focused run (`vcs_store::upload::tests::t_a724_…`, two repositories pushed the same history):
+>   the second push's append refused `Unlanded`. Tagged (`~/.local/state/w-git-logs/b10-diag2.log`): A's commit landed
+>   pack `a2 33 ea 65`, one 214-byte window; B's identical pack was put while A still held it (a put brings a let-go
+>   window back, A-724 piece 4, but it was not let go yet); A's sliced let-go then let it go, a landed window going
+>   whatever its holders; B's landing read it as none. Now a git push pins each of its pack's windows as its put keeps
+>   it, and the finished pack's rest from its layout, through the one pin every let-go honours
+>   (`ContentStore::pin_unlanded`, main's ruling (B) of 2026-11-24, as Mercurial's push does), unpinned once its
+>   changeset lands (`Push::landed`, from `SealedPush::landed_as`) or first thing however it ends (`release_placed`,
+>   which `abandon` and a commit's `release_holds` take: every server end, a refused verdict, a dropped connection,
+>   its hooks' drop). The put paths were read correct as they stand: a one-window put brings a let-go window back
+>   from its bytes, and a replay's multi-window put under a held root keeps let-go windows away (A-767 C1 step 2b).
+>   Red at the push: `store::tests::packed::b10_an_unlanded_pushs_pack_survives_another_pushs_let_go_of_the_same_
+>   windows` (all three of B's windows let go under it before; refused while unlanded, and every window let go after
+>   B lands and after C is abandoned, after). Net: `t_a724` with the let-go on. The test helpers `appended_awaited`
+>   and `push_through_awaited` now assert their landing where the push brings an object, which they dropped (`let _ =`),
+>   so this surfaced late as `ContentUnavailable` rather than at the landing (`home_and_land` answers none for a push
+>   with nothing to home too, so they ask it apart).
+> - OPEN (w-git, 2026-11-27, main's ruling of 13:47; after the flip, red first): a clone of a let-go pack holds more
+>   than a turn's windows under load. `vcs_http::daemon_edge::tests::a_clone_of_a_pushed_pack_let_go_is_whole_holding_
+>   at_most_a_turns_windows` failed 2 of 32 runs under 12 burners with B10 and 0 of 24 without (about p 0.5, not B10's:
+>   its instrumented A/B, d16e6fe20, printed no window pinned after the push and no let-go a pin refused in any of 16
+>   runs), at peaks of 10 and 8 of 13 against 3, and once before B10 under TSan at 4. A clone racing the encoding reads
+>   the let-go pack instead of copying the kept parts, and its let-go behind its cursor lags its bring-backs: ten stops,
+>   ten let go behind, ten held at once. The test prints its stops, peak and let-go-behind every run, with the pinned
+>   windows (`mem.gauge.vcs_content.pinned_unlanded`) and refused let-gos.
+> - OPEN (w-git, 2026-11-27, main's note of 09:17; its own item, not B10's): a git push dropped where the shard's state
+>   is not lent to its drop gives back nothing. `ReceivePack`'s `Drop` and `git_push::hooks::dropped` take the state
+>   with `with_state` and, finding none, log "a git push dropped mid-read could not give back its quarantine: the
+>   shard's state was not lent to its drop" (or "… mid-seal or mid-decision could not give back its push …", "…
+>   mid-answer could not give back its quarantine or its hook's view …"), leaking the push's holds; pins ride the same
+>   path since B10, and a leaked pin is worse than a leaked hold: its windows are never let go, a bounded loss that
+>   lasts until a restart. The fix: a drop with no state lent defers its release to the shard's next turn.
 > - OPEN (sibling of B8; left recorded by main's ruling of 2026-11-27 04:41, by reading alone, its cost time): the
 >   encoding's stop rule (`Encoding::stop_at`, A-864 piece 2) is keyed by a window's place, once an encoding, not by the
 >   let-go's number as `slates_git::away::WaitOnce` is, so a window brought back by another reader and let go again

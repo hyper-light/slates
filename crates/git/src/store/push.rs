@@ -197,6 +197,11 @@ pub struct Push {
   /// name their objects by where they lie in it, never a second copy inflated): its identity and length, held by the
   /// push until its rows hold it.
   stored_pack: Option<(ContentId, u64)>,
+  /// The windows of its pack it pinned against a let-go while no store holds its changeset
+  /// (`ContentStore::pin_unlanded`, B10 of the landed let-go's lift): each window pinned as its put keeps it, every one
+  /// unpinned once its changeset lands ([`Push::landed`]) or however the push ends ([`Push::release_holds`],
+  /// [`Push::abandon`]). Bounded by its pack's windows.
+  unlanded: Vec<ContentId>,
   /// The longest object of its own pack: what a read of its objects, and once it lands its repository's, is held to.
   largest: u64,
   /// The buffers an object is read from the pack with, and the objects read lately (`packed::Scratch`): reused read
@@ -222,6 +227,7 @@ impl Push {
       placed: BTreeMap::new(),
       entries: BTreeMap::new(),
       stored_pack: None,
+      unlanded: Vec::new(),
       largest: 0,
       reading: RefCell::new(Scratch::default()),
     }
@@ -359,7 +365,32 @@ impl Push {
     });
     store.put_window(writing, bytes)?;
     self.pack_len = self.pack_len.saturating_add(crate::to_u64(bytes.len()));
+    let kept = writing
+      .kept_windows()
+      .get(self.unlanded.len()..)
+      .unwrap_or_default()
+      .to_vec();
+    self.pin(store, &kept)
+  }
+
+  /// Pins each of `windows`, its pack's windows kept since the last pin, against a let-go while the push is unlanded
+  /// (B10 of the landed let-go's lift: a landed let-go of the same bytes in another repository took a window this push
+  /// held, and its landing then read its pack as none). Refused (a window's count past its width), what it pinned stays
+  /// noted, unpinned with the rest.
+  fn pin(&mut self, store: &mut ContentStore, windows: &[ContentId]) -> Result<(), ContentRefused> {
+    for window in windows {
+      store.pin_unlanded(window)?;
+      self.unlanded.push(*window);
+    }
     Ok(())
+  }
+
+  /// Its changeset landed on the node's store: every window it pinned unpinned, so a let-go may take them, read back
+  /// from there (B10 of the landed let-go's lift).
+  pub fn landed(&mut self, store: &mut ContentStore) {
+    for window in self.unlanded.drain(..) {
+      store.unpin_unlanded(&window);
+    }
   }
 
   /// Makes its pack's put bring back each window the store holds let go from the bytes it is handed
@@ -398,7 +429,14 @@ impl Push {
     match store.finish_object(&mut writing) {
       Ok(identity) => {
         self.stored_pack = Some((identity, self.pack_len));
-        Ok(())
+        // Its windows past those pinned as they were put, the last kept by the finish, by the pack's own layout.
+        let rest: Vec<ContentId> = store
+          .object_layout(&identity)
+          .into_iter()
+          .map(|(window, _)| window)
+          .skip(self.unlanded.len())
+          .collect();
+        self.pin(store, &rest)
       }
       Err(refused) => {
         store.abandon_object(writing);
@@ -755,6 +793,8 @@ impl Push {
 
   /// Gives back the stored pack's hold and lets go of the pack, its objects, their order and its reading.
   fn release_placed(&mut self, store: &mut ContentStore) -> Result<(), ContentRefused> {
+    // Unpinned before its holds go: an unpin after a window's last release would find no count, or a later pinner's.
+    self.landed(store);
     let given = match self.stored_pack.take() {
       Some((identity, _)) => store.release(&identity).map(drop),
       None => Ok(()),

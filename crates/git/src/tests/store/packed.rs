@@ -1338,6 +1338,64 @@ fn hook_view_sealed(let_go: bool) -> (Vec<crate::store::hook_view::Seal>, usize)
   (seals, stops)
 }
 
+/// B10 of the landed let-go's lift (main 01a20182's rulings of 2026-11-27 08:25: one pin, the content store's, for
+/// every unlanded holder). Two repositories' pushes of the same bytes share their pack's windows by identity, and a
+/// landed let-go takes a window whatever its holders: the second push's landing then read its own pack as none
+/// (`t_a724`, refused `Unlanded`). Do: put the `create` push's pack in a store of 256-byte windows through push A, and
+/// the same bytes through push B, unlanded; let A's windows go as a landed let-go does; read B's pack. Then mark B
+/// landed and let them go again; then put the same bytes through push C and abandon it, and let them go again. Expect:
+/// B's pack read whole while unlanded, every let-go of its windows refused; once B landed, every window let go, and
+/// once C was abandoned, every window let go again: no pin outlives either end of a push (a pin left would refuse its
+/// window's let-go `Unlanded`). Red before: B's pack read none, all three windows let go under it.
+#[test]
+fn b10_an_unlanded_pushs_pack_survives_another_pushs_let_go_of_the_same_windows() {
+  let (_, request, before) = PUSHES[0];
+  let (pack, _) = captured(request, before);
+  let mut store = ContentStore::new(1 << 26, PIECE2_WINDOW).unwrap();
+  let windows: Vec<ContentId> = pack.chunks(PIECE2_WINDOW).map(ContentId::of).collect();
+  let pushed = |store: &mut ContentStore| {
+    let mut push = Push::new(ObjectFormat::Sha1);
+    push.extend_pack(store, &pack).unwrap();
+    push.finish_pack(store).unwrap();
+    push
+  };
+  let let_go = |store: &mut ContentStore| -> usize {
+    windows
+      .iter()
+      .filter(|window| {
+        let _ = store.mark_landed(window);
+        store.let_go(window).is_ok() || store.is_away(window)
+      })
+      .count()
+  };
+  let mut a = pushed(&mut store);
+  a.landed(&mut store);
+  let mut b = pushed(&mut store);
+  let (identity, len) = b.stored_pack().unwrap();
+  assert_eq!(let_go(&mut store), 0, "no window B holds unlanded let go");
+  assert_eq!(
+    store.object_bytes(&identity, len).as_deref(),
+    Some(&pack[..]),
+    "B's pack read whole"
+  );
+  b.landed(&mut store);
+  assert_eq!(
+    let_go(&mut store),
+    windows.len(),
+    "B landed: its windows let go"
+  );
+  bring_back_every_window(&mut store, &pack);
+  let c = pushed(&mut store);
+  c.abandon(&mut store).unwrap();
+  assert_eq!(
+    let_go(&mut store),
+    windows.len(),
+    "C abandoned: no pin left"
+  );
+  a.abandon(&mut store).unwrap();
+  b.abandon(&mut store).unwrap();
+}
+
 /// Lets go every `PIECE2_WINDOW` window of `pack` the store still holds, each marked landed first.
 fn let_go_every_window(store: &mut ContentStore, pack: &[u8]) {
   for window in pack.chunks(PIECE2_WINDOW).map(ContentId::of) {
