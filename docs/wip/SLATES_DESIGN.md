@@ -8954,7 +8954,8 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 >   successor, by computation from the id with nothing stored per green (§2 item 12), and an atomic record across a
 >   green's log and a state log is kept or dropped whole by one takeover. A green joins only its repository's family
 >   (`slates_db::repository::in_family`, both guards; else `NotFound`). A green made alone starts a family of its own, so
->   a repository adopting it joins its family; one minted under no family is refused `Unsupported` (re-keying it would
+>   a repository adopting it joins its family (so the family bit does not say a green is a repository's member: its
+>   merge record does, A-932); one minted under no family is refused `Unsupported` (re-keying it would
 >   move every register it has to another id). Placement follows the family, not the successor alone: a green's
 >   successor adopts it from its own holder ledger (A-333), so it must be one of its holders. The cost: a repository's
 >   greens share their holders, so A-642's copyset spreading gives way for them. An id of no family is placed as
@@ -11890,8 +11891,11 @@ part 2): a green's version 0 is made as its owner made the green, from its membe
 records it (`LoggedChange::Joined`, indexed as each names-log part is accepted). A lineage's root founds the lineage
 (`Greens::found`); a branch is branched from its source's replica at the version it was made at (`Greens::branch`: lent,
 nothing copied), a source that owes its push made first through A-886's door, and the branch's record refused
-`OUT_OF_ORDER` while its source is behind; a family green whose join no part held here records yet waits `OUT_OF_ORDER`,
-since the owner owes its names log to every holder of its greens (one placement: a family's ids share their line key).
+`OUT_OF_ORDER` while its source is behind; a green whose version 0 record names its repository's lineage
+(`MergeRecordValue::lineage`, A-932) while no part held here records its join yet waits `OUT_OF_ORDER`, since the owner
+owes its names log to every holder of its greens (one placement: a family's ids share their line key). A green whose
+record names no lineage stands alone and is made at once: its id cannot say so, since a green made alone is a family of
+its own (A-636 part 2b-2), so its owner's record does, from the join its catalog holds when it makes the record.
 Nothing acknowledged rests on a join only its owner held (A-915): a repository's creation answers once its root's join
 is at `f + 1` as well as its record, so a successor's adoption, which holds the names log its takeover gathered from a
 quorum, finds every acknowledged green's join; one whose join it does not find was never acknowledged a member, and its
@@ -11902,7 +11906,8 @@ A holder restarted warm keeps its records, not its replicas, and rebuilds a repl
 `merge_origin::rebuild_replica_through`): a root founds its lineage at the rebuild's install; a branch is branched from
 its source's replica and advanced from the records held. A source not rebuilt yet is rebuilt first, or the nearest
 missing ancestor whose own source is there, a level an ask (never by recursion), and the branch waits meanwhile
-(`merge.replica.branch_source_behind`). A green seeded from origin inputs stands alone, there as on a record's arrival.
+(`merge.replica.branch_source_behind`). A green seeded from origin inputs stands alone, there as on a record's arrival,
+and so does one whose version 0 record names no lineage (A-932).
 A branch's version 0 arriving as a record makes a missing source the same way (A-913, counted
 `merge.replica.branch_source_made`), so a restarted holder serves a branch created after its restart.
 
@@ -63617,6 +63622,10 @@ Applied in the same change to: §4.16 "Apply on holders", `crates/server/src/{me
 greens,fleet,verbs}.rs`, `crates/db/src/register.rs` (its test), `crates/server/tests/fleet.rs`, GAPS. Part 4: §4.16
 "Apply on holders", `crates/server/src/merge_origin.rs`, GAPS.
 
+- **Amended by A-932** (2026-11-27): a holder decides version 0 from the lineage the green's merge record names, not
+  from the family bit. "Not from a new merge-record field" above is reversed by main's ruling (a) of 2026-11-27, since
+  the bit says nothing: every green made alone has been a family of its own since A-636 part 2b-2, and waited here for
+  a join that never comes (the fleet suite's red, first bad 02bd0ec94).
 - **Amended by A-927 part 2** (2026-11-26): a lineage moves to its successor once every member of its family still
   pending adoption here is in the lineage at its adopted version (`green_adopt::take_engine`). Before, the wait named
   the lineage's current members, which was wrong both ways. A root could take a lineage of one while its branch was
@@ -65207,6 +65216,24 @@ GAPS.
       `begin_applying` without a plan;
     - the begin's list of the entry's copies;
     - `named_whole_files`.
+  **`stage.canonical` named; a changeset's `Texts` section made an entry a unit.**
+  - `stage.canonical`'s 5.4 ms (debug) was `readied_in`'s reads of the named runs, which run after the canonical order
+    under its tag, each call walking the runs read before. The count of runs read whole (above) removed it. With the
+    reads tagged apart, neither is among the leaders.
+  - `landing.changeset` (2.4 ms, all three wide tests) was named in the sliced landing (`landing::land_sliced`). After
+    the payload's last piece, every text's entry was made (0.61 ms, a path cloned each) and the whole `Texts` section
+    encoded (`slates_store::texts::encode`, 998 KB, 1.9 ms) in one unit.
+    - `slates_store::texts` now writes an entry at a time (`put_count`, `put_entry`, `entry_bytes`), and `encode` is
+      that run over every entry.
+    - The landing measures the payload's and the section's lengths a text a unit, a slice of the shard's budget a step
+      (`measured`), before it begins. It makes the section an entry a unit, sending each store piece (64 KiB) as it
+      fills, with a yield where the budget is spent between pieces (`sent_texts`).
+    - Gauge `landing::LANDING_TEXT_ENTRIES_MOST`, the most entries made between two awaits; `t_c2c` holds it under a
+      quarter of the revision's files, red at 9,000.
+  - Debug, after: `landing.changeset` is out of the eight longest spans of all three wide tests. By thread CPU, the
+    leaders now are move's `stage.build` (2.1 ms) and the cold first `create` (2.3), then `stage.recording`,
+    `landing.follow`, `stage.bringing` and `landing.holds` at 1.0-1.4 ms. Copy's `landing.prepare` read 11 ms of wall
+    against 32 µs of CPU: preemption, not work.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
@@ -66025,11 +66052,45 @@ Applied in the same change to:
   carries a page's piece whole; the copy only replaced the encoding. OWED: the 57k's cut count from the rerun with
   these counters, and main's ruling on carrying a piece in parts (the committed bytes by reference), which would take
   the copy out.
+- **Part 3, the cadence: a cut nobody waits on begins once its changes come to its cost** (2026-11-27, main's ruling
+  (ii) on the 57k churn: "a byte rule for cuts nobody waits on, plus a cut a ticket asks for, plus one when the shard
+  settles idle, its threshold derived"; its second churn at ca78de951 began 17,745 cuts, a cut a publication, and
+  copied 874,543,777 bytes). A cut moves its dirty pages' committed bytes whole however few entries changed, so begun
+  at every publication its work is the pages' bytes times the publications. Now the encoder keeps the bytes changed
+  since the last cut began (`Encoder::changed`: each coordinate marked fresh, counted at its page's mean committed
+  entry) and the bytes the content arena holds freed for the committed cut (`Encoder::hold`, read at every drain from
+  `deferred_bytes`). The next cut is due (`Encoder::due`) when asked, or when the changes and the held frees together
+  come to its cost, the dirty pages' committed bytes (`Encoder::cut_cost`). So the cuts' copying is about the changes'
+  own bytes, and the memory a deferred cut keeps is never more than the cut would copy: a derived bound, with no
+  budget of its own (§2 item 8; main's ruling of 07:19 kept the held term, since without it a let-go-heavy push with no
+  ticket holds its whole let-go until idle).
+  - **Asked:** a homes ticket's wait (`homes::PublishedHere` asks before its `publish_shard`, so persistence still
+    precedes the reply); the shard settling idle (the idle sweep arms on a deferred cut, and
+    `content_holder::image_retry_owed` asks, begins it and owes it, counted `vcs_store.image.idle_cuts`).
+  - **Deferred:** a publication whose next cut is not due carries the committed cut again, keeps the arena's deferred
+    frees as any publication that carried no cut does (A-64), owes nothing and starts no catch-up; counted
+    `vcs_store.image.publications_deferred`. A cut's publication answers kept tickets
+    (`homes::publication_committed`) only where nothing is left dirty, so no ticket is answered past changes the image
+    does not hold. `vcs_store.image.held_deferred_peak_bytes` is the most the arena held freed at a drain since start.
+  - **Reds:** `a_cut_nobody_waits_on_begins_once_its_changes_come_to_its_cost` (300 let-goes published one at a time:
+    a cut asked at each, 300 cuts and 2,804,085 bytes copied and encoded; the cadence, 2 cuts and 161,862 bytes; both
+    images the shard's entries once idle; with `due` always true the two equal). And
+    `a_deferred_cut_holds_no_more_freed_bytes_than_it_would_cost` (40 let-goes of a 4,096-byte granule the committed
+    image named, nothing asking: 5 cuts before idle and 35 publications deferred, at most 24,576 bytes held while a cut
+    costing 26,885 to 29,730 was deferred, the gauge's peak 28,672; with the held term taken out, no cut before idle and
+    163,840 bytes held against a cost of 26,885). The cut-mechanics tests ask for their cuts as a ticket's wait does;
+    the generated-histories oracle asks at half its publications and once quiet, and asserts some publication deferred.
+  - OWED: main's 57k rerun at the tip for the cuts, the copied bytes, the held peak and wall time against 894a1e111
+    (3,291 cuts, 697 MB copied).
 - **Applied in the same change to:** `crates/server/src/image_pages.rs` (the encoder's lasts and least changes,
   `append_page`, `entry_ends`, `CommittedPiece`, `Encoder::appends`, `append`, `split_appended`, `dirty_whole`); the
   goal 93 line in GAPS (A-923's entry). Part 2: `image_pages.rs` (`Marked`, `EntryCoordinate`, `Changed`, `PieceCut`,
   `CommittedPiece::coordinates`, `Encoder::changed_since`, `changed_turn`, `cut_committed`; `Encoder::turn` takes the
-  coordinate reader beside the family reader) and `crates/server/src/content_holder.rs` (`entry_coordinate`).
+  coordinate reader beside the family reader) and `crates/server/src/content_holder.rs` (`entry_coordinate`). Part 3:
+  `image_pages.rs` (`Encoder::asked`, `changed`, `held`, `due`, `cut_cost`, `committed_entry_bytes`, `deferred`, `ask`,
+  `hold`; `Turned::caught_up` holds where nothing is due), `content_holder.rs` (`image_committed`, `image_retry_owed`,
+  `image_drain`, `IMAGE_DEFERRED`, `IMAGE_IDLE_CUTS`, `IMAGE_HELD_PEAK`), `idle_sweep.rs` (`after_borrow` arms on a
+  deferred cut) and `vcs_store/homes.rs` (`PublishedHere::poll` asks).
 
 ### A-921 part 4 — A holder joins a version's record its owner re-derived with other floors, instead of refusing it as another proposal (2026-11-27, w-shared for main 01a20182, its ruling of 2026-11-27 (B); A-921's second mode's (2); amends §4.16 "Apply on holders" and the register's position rule)
 
@@ -66213,6 +66274,51 @@ Applied in the same change to:
 - **Applied in the same change to:** `crates/server/src/{member_task,edges,fleet,state,daemon}.rs`,
   `crates/cluster/src/member_plane.rs` (`MemberPlane::is_joined`), `crates/server/tests/fleet.rs`, A-921 part 4's
   entry, GAPS.
+
+### A-932 — A merge record names its green's lineage, and a holder makes a green standing alone at once (2026-11-27, w-interop for main 01a20182, its ruling (a) of 2026-11-27 07:06 and its approval of 07:08; the fleet suite's red; amends A-908 and A-908 part 4; A-636 part 2b-2, A-145, A-255)
+
+- **Why.** In a fleet, a green created alone never committed a version. The owner shipped version 1's record about 10
+  times a second, and its holder refused each `OUT_OF_ORDER`, counted `merge.replica.member_unknown`, about 20 per 2 s
+  each way (sampled on the MacBook, debug, main f7a97ead9).
+  - A-908 decided a green's version 0 by the family bit: a family id with no held join waits for it. But every green
+    made alone is a family of its own (A-636 part 2b-2, `verbs::found_green`), so it waited for a join no names log
+    ships. A-908 part 4's rebuild carried the same predicate.
+  - First bad 02bd0ec94: main's A/B against its parent 41e00948e, run alone A B A B, was good in 9 and 8 s, then bad in
+    39 and 35 s (`client Submit: deadline exceeded`; `~/.local/state/main-01a20182/rounds/ab-02bd/summary.txt`).
+  - A-908's unit test of a green of no repository used an id of no family, which no green has. It certified the
+    degenerate case only (CLAUDE.md's gotcha).
+  - The bug record: `docs/bugs/2026-11-27-a-green-standing-alone-waited-on-its-holders-for-a-join-that-never-comes.md`.
+- **The change.**
+  - `MergeRecordValue::lineage`: the repository whose lineage the green had joined when its owner made the record, from
+    the owner's catalog (`Repositories::member`), or `None` for a green standing alone.
+    - Every version 0 is enqueued after the green's records commit, its join among them: a root's (`install_root`), a
+      branch's (`record_branch`) and a push's create (`push::after`).
+    - A green made alone and adopted as a root later names its lineage only from its next record on. Its holders made
+      it standing alone (GAPS, OPEN: its branches on those holders).
+  - Format 5 (`RECORD_VERSION`). A record of format 4 is refused typed (`RecordRefused::Version`, counted
+    `merge.record.version_refused`), never read as standing alone. There is no second path (A-145: no build crosses).
+    This bump has every earlier bump's rolling-upgrade window (GAPS); A-908 avoided a format change for that reason,
+    and main ruled the window acceptable against a predicate that cannot decide.
+  - `make_origin_replica` and `merge_origin::rebuild_through` decide version 0 from the record:
+    - with no lineage, the green stands alone and an empty green is made at once;
+    - with one, the green's membership decides as before (a root founds, a branch is branched);
+    - with no held join, it waits `OUT_OF_ORDER`, counted `merge.replica.member_unknown`, or for an adoption reads the
+      join from the names log's cohort (A-927 part 2).
+  - A-921's join of a re-derived record compares the lineage as content, as it does the green's name.
+- **Tests** (MacBook, arm64, debug, 2026-11-27).
+  - Red at a05f07e5f, green after:
+    - `merge_service` `a932_a_green_standing_alone_is_made_at_once_and_a_member_waits_for_its_join`;
+    - A-908's `a908_a_version_zero_of_a_green_of_no_repository_is_judged_at_once`, its green now minted as `found_green`
+      mints one;
+    - `merge_origin` `a932_a_restarted_holder_rebuilds_a_green_standing_alone` (red: `[Later, Later, Later]`).
+  - Golden vectors: a member's and a lone green's version 0 at format 5. Format 4 is refused typed.
+  - Focused lib set: 86 of 86.
+  - Fleet: the probe test `a_holders_submit_names_its_increment_and_the_owner_fetches_it_by_identity` passed in
+    5.82 s. A-908's two fleet tests passed too.
+- **Owed (main).** The whole `tests/fleet.rs` on the Mac and the Windows lanes, then the Unix lanes' gap: none runs it.
+- **Applied in the same change to:** §4.16 "Apply on holders", A-636 part 2b-2's note on a green made alone, A-908's
+  entry, `crates/server/src/{merge_service,merge_origin,daemon,content_retention,state,takeover}.rs`,
+  `crates/server/tests/fleet.rs`, GAPS.
 
 ### A-933 — A takeover successor's adoption reaches the record adoption and the replica build it needs (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 06:37 and 06:55; v3_takeover's adoption stall; GAP-A9-7's record half, A-364)
 

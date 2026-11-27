@@ -11468,6 +11468,7 @@ mod tests {
         signature: None,
         folded_below: 0,
         checkpoint_floor: 0,
+        lineage: None,
       };
       let record = Record {
         owner,
@@ -14978,8 +14979,9 @@ mod tests {
 
   /// AC-6.3, §4.16; AUD-12: a stale epoch, foreign generation or conflicting accepted position
   /// must refuse before holder recomputation. A later legitimate origin must still seed and serve.
-  /// The green is one of no repository, so its id is no family's: a family green's version 0 waits for its join to its
-  /// repository's lineage (A-908), and `[20; 16]`, used here before, carries the family bit (TSan diag 3).
+  /// The green is one of no repository, its record naming no lineage (A-932): made at once, whatever its id. Its id is
+  /// still no family's, as A-908 had it here after `[20; 16]`, which carries the family bit, waited (TSan diag 3); that
+  /// wait was the fleet suite's red, a green standing alone being a family of its own (A-636 part 2b-2).
   #[test]
   fn refused_merge_authority_leaves_the_replica_unchanged() {
     use slates_db::register::{Acceptor, Ack, Authority, HostEpoch, ObjectId, Record};
@@ -15005,6 +15007,7 @@ mod tests {
         signature: None,
         folded_below: 0,
         checkpoint_floor: 0,
+        lineage: None,
       };
       let record = Record {
         owner,

@@ -737,6 +737,15 @@ pub(crate) struct Encoder {
   /// twice a page's bytes in entries ([`Encoder::read_cap`]); a page of one coordinate read whole may grow it past that
   /// for its turn, which shrinks it back before it is kept.
   scratch: Vec<Entry>,
+  /// Whether a cut was asked for since the last began: a ticket's wait (`homes::PublishedHere`), or the shard settling
+  /// idle ([`Encoder::ask`]). Such a cut begins whatever its cost (A-930's cadence, main's ruling (ii) of 2026-11-27).
+  asked: bool,
+  /// The bytes changed since the last cut began, as their pages' committed pieces measure them: a change's coordinate
+  /// counted once, at its page's mean committed entry ([`Encoder::mark`]).
+  changed: u64,
+  /// The bytes the content arena holds freed for the committed cut, which may name them ([`Encoder::hold`]): what not
+  /// cutting costs in memory, counted with the changes, so a cut deferred never holds more than it would cost.
+  held: u64,
 }
 
 /// An image cut in flight (F2): the pages dirty at its moment not yet re-encoded, and its
@@ -763,7 +772,9 @@ pub(crate) struct Turned {
   /// Of the bytes spent, those copied from committed pieces into the pages appended to, cut or split from them, encoding
   /// none of them (A-930): what a publication's page costs past what it encodes.
   pub(crate) copied: u64,
-  /// Whether the cut in flight is wholly encoded, or none is and nothing is dirty: a publication carries it.
+  /// Whether the cut in flight is wholly encoded, or none is and nothing is dirty (a publication carries it); or none
+  /// is and none is due, the changes waiting for it (A-930's cadence: a publication carries the committed cut again and
+  /// owes nothing).
   pub(crate) caught_up: bool,
   /// Whether the turn ran while paused.
   pub(crate) paused: bool,
@@ -833,13 +844,20 @@ impl Encoder {
     }
     let paused = self.paused();
     for (page, at) in pages {
+      let entry = self.committed_entry_bytes((family, page));
       let marked = self
         .dirty_marks
         .entry((family, page))
         .or_insert_with(|| Marked::At(BTreeSet::new()));
+      let mut fresh = 0u64;
       if let Marked::At(marks) = marked {
-        marks.extend(at);
+        for coordinate in at {
+          if marks.insert(coordinate) {
+            fresh = fresh.saturating_add(1);
+          }
+        }
       }
+      self.changed = self.changed.saturating_add(fresh.saturating_mul(entry));
       if self.dirty.insert((family, page)) && paused {
         self.dirtied_paused.insert((family, page));
       }
@@ -854,9 +872,65 @@ impl Encoder {
     }
   }
 
-  /// Whether a cut may begin: none in flight, and a page dirty.
+  /// Whether a cut may begin: none in flight, a page dirty, and the cut due ([`Encoder::due`]).
   pub(crate) fn can_begin(&self) -> bool {
-    self.cut.is_none() && !self.dirty.is_empty()
+    self.cut.is_none() && !self.dirty.is_empty() && self.due()
+  }
+
+  /// Whether the next cut is due (A-930's cadence; main's ruling (ii) of 2026-11-27): asked for ([`Encoder::ask`]), or
+  /// the bytes changed since the last cut have come to what the cut costs, its dirty pages' committed bytes
+  /// ([`Encoder::cut_cost`]), the changes counted with the freed bytes the arena holds for the committed cut
+  /// ([`Encoder::hold`]). A cut's cost is its dirty pages whole however they are moved, so begun at that pace the cuts'
+  /// whole work is about the changes' own bytes, whatever a turn costs, and a cut deferred never holds more memory than
+  /// it would cost; until then a publication carries the committed cut again and nothing is owed
+  /// ([`Encoder::deferred`]).
+  pub(crate) fn due(&self) -> bool {
+    self.asked || self.changed.saturating_add(self.held) >= self.cut_cost()
+  }
+
+  /// Notes the bytes the content arena holds freed for the committed cut (A-64's deferred frees): the memory a deferred
+  /// cut keeps, which its cadence counts with the changes ([`Encoder::due`]).
+  pub(crate) fn hold(&mut self, bytes: u64) {
+    self.held = bytes;
+  }
+
+  /// What the next cut costs: the committed bytes of the pages dirty now (a page no cut has committed costs nothing).
+  fn cut_cost(&self) -> u64 {
+    self.dirty.iter().fold(0u64, |cost, page| {
+      cost.saturating_add(
+        self
+          .committed
+          .get(page)
+          .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+      )
+    })
+  }
+
+  /// The mean bytes of an entry of `page`'s committed piece (its bytes over its count), none for a page no cut
+  /// committed: what one change there is counted as ([`Encoder::changed`]).
+  fn committed_entry_bytes(&self, page: (Family, Page)) -> u64 {
+    let Some(bytes) = self.committed.get(&page) else {
+      return 0;
+    };
+    let count = bytes
+      .get(1..PAGE_HEAD)
+      .and_then(|count| count.try_into().ok())
+      .map_or(0, u32::from_le_bytes);
+    u64::try_from(bytes.len())
+      .unwrap_or(u64::MAX)
+      .checked_div(u64::from(count))
+      .unwrap_or(0)
+  }
+
+  /// Whether pages are dirty and no cut is in flight or due: a publication now carries the committed cut again, and
+  /// owes nothing (the changes wait for the cut that is due, asked, or the shard's idle).
+  pub(crate) fn deferred(&self) -> bool {
+    self.cut.is_none() && !self.dirty.is_empty() && !self.due()
+  }
+
+  /// Asks for the next cut whatever its cost: a ticket's wait for its window's publication, or the shard settling idle.
+  pub(crate) fn ask(&mut self) {
+    self.asked = true;
   }
 
   /// Begins a cut of the pages dirty now, of `generation` in homes' tickets, where one may ([`Encoder::can_begin`]): the
@@ -867,6 +941,8 @@ impl Encoder {
     }
     let remaining = core::mem::take(&mut self.dirty);
     let pages: Vec<(Family, Page)> = remaining.iter().copied().collect();
+    self.asked = false;
+    self.changed = 0;
     self.cut = Some(Cut {
       remaining,
       marked: core::mem::take(&mut self.dirty_marks),
@@ -978,7 +1054,7 @@ impl Encoder {
     Turned {
       bytes: u64::try_from(spent).unwrap_or(u64::MAX),
       copied: u64::try_from(copied).unwrap_or(u64::MAX),
-      caught_up: self.complete(),
+      caught_up: self.complete() || self.deferred(),
       paused,
       imposed: u64::try_from(imposed).unwrap_or(u64::MAX),
       split: split_at_stop.0,
@@ -1680,6 +1756,8 @@ mod tests {
       };
       let ids = put_landed(state, (0, KEPT));
       crate::content_holder::image_drain(state);
+      // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
       let (image, carried) = crate::content_holder::held_image_paged(state);
       crate::content_holder::held_committed(state, crate::content_holder::whole_of(&image), true);
@@ -1737,6 +1815,247 @@ mod tests {
     assert!(
       encoded <= u64::try_from(PAGE).unwrap(),
       "{LET_GO} let-goes encoded {encoded} windows bytes, past a page"
+    );
+  }
+
+  /// [`a_cut_nobody_waits_on_begins_once_its_changes_come_to_its_cost`]'s flow on a shard: objects let go and a
+  /// checkpoint published, then [`CADENCE_APPENDS`] let-goes each followed by `verbs::publish_shard` and the catch-up
+  /// it owes, a cut asked at each where `ask_each` (as before A-930's cadence every publication began one), then the
+  /// shard settled idle (`content_holder::image_retry_owed`). The cuts begun and the bytes they copied and encoded
+  /// after the checkpoint, and whether the committed image is then the shard's entries.
+  fn cadenced(ask_each: bool) -> (u64, u64, bool) {
+    crate::daemon::audit_on_shard(move |state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(CADENCE_PAGE));
+      let counted = |state: &crate::state::ShardState| {
+        let of = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        (
+          of(crate::content_holder::IMAGE_CUTS),
+          of(crate::content_holder::IMAGE_COPIED_BYTES)
+            + of(crate::content_holder::IMAGE_ENCODED_BYTES),
+        )
+      };
+      let caught_up_owed = |state: &mut crate::state::ShardState| {
+        while state.image_encoder.owed() {
+          let _ = crate::content_holder::image_catch_up_step(state);
+        }
+      };
+      let _ = let_go_and_note(state, (0, ENTRIES / 10));
+      state.image_encoder.ask();
+      crate::verbs::publish_shard(state).unwrap();
+      caught_up_owed(state);
+      let before = counted(state);
+      for at in 0..CADENCE_APPENDS {
+        let _ = let_go_and_note(state, (ENTRIES / 10 + usize::try_from(at).unwrap(), 1));
+        if ask_each {
+          state.image_encoder.ask();
+        }
+        crate::verbs::publish_shard(state).unwrap();
+        caught_up_owed(state);
+      }
+      let _ = crate::content_holder::image_retry_owed(state);
+      caught_up_owed(state);
+      let committed = crate::verbs::committed_held(state)
+        .map(|held| crate::content_holder::paged_entries_of(&held));
+      let caught_up = committed == Some(crate::content_holder::paged_entries_now(state));
+      let after = counted(state);
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (after.0 - before.0, after.1 - before.1, caught_up)
+    })
+  }
+
+  /// Shape: the page [`cadenced`] pins.
+  const CADENCE_PAGE: usize = 4096;
+  /// Shape: the let-goes [`cadenced`] publishes one at a time.
+  const CADENCE_APPENDS: u64 = 300;
+
+  /// Goal 93, A-930's cadence (main's ruling (ii) of 2026-11-27; its second 57k churn at ca78de951: 17,745 cuts copied
+  /// 874,543,777 bytes, a cut a publication). Do: run [`cadenced`]'s let-goes, each published through
+  /// `verbs::publish_shard`, once with a cut asked at every publication (every publication began one before) and once
+  /// as the cadence begins them, nothing asking (no ticket waits), the shard settled idle after each. Expect, with the
+  /// cadence, at most a tenth of the cuts and at most half the bytes copied and encoded, and once idle the committed
+  /// image the shard's entries both ways. Red before: the two the same, a cut each publication.
+  #[test]
+  fn a_cut_nobody_waits_on_begins_once_its_changes_come_to_its_cost() {
+    let each = cadenced(true);
+    let paced = cadenced(false);
+    println!(
+      "a cut each publication: {} cuts, {} bytes copied and encoded; the cadence: {} cuts, {} bytes ({} \
+       publications, a page of {CADENCE_PAGE})",
+      each.0, each.1, paced.0, paced.1, CADENCE_APPENDS
+    );
+    assert!(
+      each.2 && paced.2,
+      "once idle, the committed image is the shard's entries"
+    );
+    assert!(
+      paced.0 * 10 <= each.0,
+      "{} cuts with the cadence against {} a cut each publication",
+      paced.0,
+      each.0
+    );
+    assert!(
+      paced.1 * 2 <= each.1,
+      "{} bytes copied and encoded with the cadence against {}",
+      paced.1,
+      each.1
+    );
+  }
+
+  /// What [`held_flow`] read: each publication's arena deferred bytes, next cut's cost and whether a cut was deferred;
+  /// the cuts begun before idle, the publications deferred, the held-bytes peak and the granule; and whether, once
+  /// idle, the committed image is the shard's entries.
+  type HeldFlow = (Vec<(u64, u64, bool)>, (u64, u64, u64, u64), bool);
+
+  /// [`a_deferred_cut_holds_no_more_freed_bytes_than_it_would_cost`]'s flow on a shard, its page pinned at
+  /// [`HELD_PAGE_GRANULES`] of the arena's granule: [`HELD_OBJECTS`] objects of a granule each (a chunk each, never a
+  /// slab's slot), then [`HELD_FILL`] small ones after them, so the large ones' entries share a page, all published and
+  /// caught up, so the committed image names their blocks; then each large object let go and `verbs::publish_shard`
+  /// run with nothing asking, as a let-go-heavy push with no ticket waiting publishes. After each publication and its
+  /// catch-up: the arena's deferred bytes, the next cut's cost, and whether a cut is deferred. Then the cuts begun
+  /// before idle, the publications deferred, the held-bytes peak gauge, the granule, and whether once idle the
+  /// committed image is the shard's entries.
+  fn held_flow() -> HeldFlow {
+    crate::daemon::audit_on_shard(move |state| {
+      let granule = state.store.content.arena().granule();
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(granule * HELD_PAGE_GRANULES));
+      let of = |state: &crate::state::ShardState, name: &str| {
+        state.refusals.get(name).copied().unwrap_or(0)
+      };
+      let caught_up_owed = |state: &mut crate::state::ShardState| {
+        while state.image_encoder.owed() {
+          let _ = crate::content_holder::image_catch_up_step(state);
+        }
+      };
+      let window = state.store.content.chunk_bytes();
+      state.vcs_stores.content_made(window).unwrap();
+      let texts: Vec<Vec<u8>> = (0..HELD_OBJECTS)
+        .map(|at| {
+          let mut text =
+            format!("a chunk's text let go after its image named it, number {at}\n").into_bytes();
+          text.resize(granule, b'h');
+          text
+        })
+        .chain(
+          (0..HELD_FILL)
+            .map(|at| format!("a small text kept beside them, number {at}\n").into_bytes()),
+        )
+        .collect();
+      let need: u64 = texts.iter().map(|text| text.len() as u64).sum();
+      let ids: Vec<slates_vcs::ContentId> =
+        crate::vcs_store::within_budget(state, need, |stores| {
+          let content = stores.content_mut().unwrap();
+          texts
+            .iter()
+            .take(HELD_OBJECTS)
+            .map(|text| {
+              let id = content.put_object(text).unwrap();
+              assert!(content.mark_landed(&id));
+              id
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .chain(
+              texts
+                .iter()
+                .skip(HELD_OBJECTS)
+                .map(|text| content.put_object(text).unwrap()),
+            )
+            .collect()
+        });
+      state.image_encoder.ask();
+      crate::verbs::publish_shard(state).unwrap();
+      caught_up_owed(state);
+      let cuts_before = of(state, crate::content_holder::IMAGE_CUTS);
+      let mut steps = Vec::new();
+      for (at, id) in ids.iter().take(HELD_OBJECTS).enumerate() {
+        crate::vcs_store::within_budget(state, 0, |stores| {
+          stores
+            .content_mut()
+            .unwrap()
+            .let_go_landed(id, None)
+            .unwrap();
+        });
+        crate::vcs_store::homes::note_landed(
+          *id,
+          crate::vcs_store::homes::Landed::Pack(crate::vcs_store::homes::LandedAt {
+            pack: *id,
+            len: 1 << 20,
+            offset: u64::try_from(at).unwrap(),
+          }),
+        );
+        crate::verbs::publish_shard(state).unwrap();
+        caught_up_owed(state);
+        steps.push((
+          u64::try_from(state.store.content.arena().deferred_bytes()).unwrap(),
+          state.image_encoder.cut_cost(),
+          state.image_encoder.deferred(),
+        ));
+      }
+      let counted = (
+        of(state, crate::content_holder::IMAGE_CUTS) - cuts_before,
+        of(state, crate::content_holder::IMAGE_DEFERRED),
+        of(state, crate::content_holder::IMAGE_HELD_PEAK),
+        u64::try_from(granule).unwrap(),
+      );
+      let _ = crate::content_holder::image_retry_owed(state);
+      caught_up_owed(state);
+      let committed = crate::verbs::committed_held(state)
+        .map(|held| crate::content_holder::paged_entries_of(&held));
+      let caught_up = committed == Some(crate::content_holder::paged_entries_now(state));
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (steps, counted, caught_up)
+    })
+  }
+
+  /// Shape: the page [`held_flow`] pins, in the arena's granules: a page's entries cost several of the granule
+  /// objects' frees, so a cut is deferred over a few let-goes before their held bytes come to its cost.
+  const HELD_PAGE_GRANULES: usize = 8;
+  /// Shape: the granule objects [`held_flow`] lets go one a publication.
+  const HELD_OBJECTS: usize = 40;
+  /// Shape: the small objects [`held_flow`] keeps after the granule objects, filling their page.
+  const HELD_FILL: usize = 2_000;
+
+  /// Goal 93, A-930's cadence's held term (main's ruling of 2026-11-27 07:19, §2 item 8: a deferred cut's held memory
+  /// bounded by a derived number). Do: run [`held_flow`], granule objects the committed image names let go one a
+  /// publication, nothing asking and the shard not idle. Expect some publications deferred and cuts begun before idle;
+  /// after every publication that leaves a cut deferred, the arena's deferred bytes under that cut's cost; the held
+  /// peak gauge the most the arena held at a publication, within a cut's cost and one let-go's frees; and once idle the
+  /// committed image the shard's entries. Here 40 let-goes of a 4,096-byte granule: 5 cuts before idle, 35
+  /// publications deferred, at most 24,576 bytes held while a cut costing 26,885 to 29,730 was deferred, the gauge's
+  /// peak 28,672. Red with the held term taken out of `Encoder::due`: no cut before idle, and 163,840 bytes held (every
+  /// let-go's) against a cost of 26,885.
+  #[test]
+  fn a_deferred_cut_holds_no_more_freed_bytes_than_it_would_cost() {
+    let (steps, (cuts, deferred, peak, granule), caught_up) = held_flow();
+    for (at, (held, cost, waiting)) in steps.iter().enumerate() {
+      println!(
+        "let-go {at}: {held} bytes held freed, the next cut costs {cost}, deferred {waiting}"
+      );
+    }
+    println!(
+      "{cuts} cuts before idle, {deferred} publications deferred, the held peak gauge {peak} bytes"
+    );
+    assert!(
+      caught_up,
+      "once idle, the committed image is the shard's entries"
+    );
+    assert!(deferred > 0, "some publication deferred its cut");
+    assert!(cuts > 0, "a cut began before idle, nothing asking");
+    for (at, (held, cost, waiting)) in steps.iter().enumerate() {
+      assert!(
+        !waiting || held < cost,
+        "let-go {at}: {held} bytes held freed while the cut costing {cost} is deferred"
+      );
+    }
+    let most_held = steps.iter().map(|(held, _, _)| *held).max().unwrap_or(0);
+    let most_cost = steps.iter().map(|(_, cost, _)| *cost).max().unwrap_or(0);
+    assert!(
+      peak >= most_held,
+      "the gauge {peak} under the {most_held} bytes held at a publication"
+    );
+    assert!(
+      peak <= most_cost + granule,
+      "the held peak {peak} past a cut's cost {most_cost} and one let-go's frees"
     );
   }
 
@@ -1834,6 +2153,8 @@ mod tests {
           let _ = let_go_and_note(state, (0, ENTRIES));
           // Since piece 2 a checkpoint carries the encoder's cut once its turns have caught up, else the committed one.
           crate::content_holder::image_drain(state);
+          // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+          state.image_encoder.ask();
           while !crate::content_holder::image_turn(state).caught_up {}
           let image = crate::content_holder::held_image(state);
           let page = crate::content_holder::image_page_bytes(state);
@@ -1881,6 +2202,8 @@ mod tests {
       // turns to the end, so it carries the cut of that moment.
       let encode_up = |state: &mut crate::state::ShardState| {
         crate::content_holder::image_drain(state);
+        // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+        state.image_encoder.ask();
         while !crate::content_holder::image_turn(state).caught_up {}
       };
       let ids = let_go_and_note(state, (0, ENTRIES));
@@ -2023,6 +2346,8 @@ mod tests {
   /// [`publish_up`]'s body.
   fn publish_up_counted(state: &mut crate::state::ShardState) {
     crate::content_holder::image_drain(state);
+    // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+    state.image_encoder.ask();
     while !crate::content_holder::image_turn(state).caught_up {}
     let changes = crate::content_holder::held_changes_carried(state);
     assert!(changes.image_carried, "the delta carries the encoder's cut");
@@ -2052,6 +2377,8 @@ mod tests {
       };
       let _ = let_go_and_note(state, (0, ENTRIES / 10));
       crate::content_holder::image_drain(state);
+      // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
       let (image, carried) = crate::content_holder::held_image_paged(state);
       crate::content_holder::held_committed(state, crate::content_holder::whole_of(&image), true);
@@ -2136,8 +2463,10 @@ mod tests {
         state.refusals.get(name).copied().unwrap_or(0)
       };
       let _ = let_go_and_note(state, (0, ENTRIES));
+      state.image_encoder.ask();
       let _ = crate::verbs::publish_shard(state);
       let _ = let_go_and_note(state, (ENTRIES, ENTRIES));
+      state.image_encoder.ask();
       let _ = crate::verbs::publish_shard(state);
       let mut longest = 0u64;
       let mut discarded = 0u64;
@@ -2270,7 +2599,10 @@ mod tests {
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
       let ids = put_objects(state, (0, ENTRIES));
       crate::content_holder::image_drain(state);
+      // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let counted = |state: &crate::state::ShardState, name: &str| {
         state.refusals.get(name).copied().unwrap_or(0)
@@ -2294,7 +2626,10 @@ mod tests {
       let at_cut = crate::content_holder::paged_entries_now(state);
       let old = counted(state, crate::content_holder::IMAGE_CUT_PREIMAGES_OLD);
       let_go(state, &[gone]);
+      // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let restored =
         crate::content_holder::paged_entries_of(&crate::verbs::committed_held(state).unwrap());
@@ -2387,7 +2722,10 @@ mod tests {
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
       let ids = put_objects(state, (0, ENTRIES));
       crate::content_holder::image_drain(state);
+      // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let counted = |state: &crate::state::ShardState, name: &str| {
         state.refusals.get(name).copied().unwrap_or(0)
@@ -2397,6 +2735,8 @@ mod tests {
       let allocated = counted(state, crate::content_holder::IMAGE_READ_ALLOCATED_BYTES);
       let encoded = counted(state, crate::content_holder::IMAGE_ENCODED_BYTES);
       crate::content_holder::image_drain(state);
+      // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
       let allocated = counted(state, crate::content_holder::IMAGE_READ_ALLOCATED_BYTES) - allocated;
       let encoded = counted(state, crate::content_holder::IMAGE_ENCODED_BYTES) - encoded;
@@ -2439,13 +2779,19 @@ mod tests {
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
       let ids = put_objects(state, (0, ENTRIES));
       crate::content_holder::image_drain(state);
+      // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let halved: Vec<slates_vcs::ContentId> = ids.iter().step_by(2).copied().collect();
       let_go(state, &halved);
       let before = encoded_of(state, Family::Aways);
       crate::content_holder::image_drain(state);
+      // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let held = encoded_of(state, Family::Aways) - before;
       let spread = ENTRIES / PUSH_LET_GOES;
@@ -2454,6 +2800,8 @@ mod tests {
       let_go(state, &pushed);
       let before = encoded_of(state, Family::Aways);
       crate::content_holder::image_drain(state);
+      // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
       let pushed = encoded_of(state, Family::Aways) - before;
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
@@ -2593,10 +2941,14 @@ mod tests {
           + counted(state, crate::content_holder::IMAGE_COPIED_BYTES)
       };
       let ids = put_objects(state, (0, ENTRIES));
+      // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let every_other: Vec<slates_vcs::ContentId> = ids.iter().step_by(2).copied().collect();
       let_go(state, &every_other);
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let slice = state.config.copy_slice_bytes();
       let turns = counted(state, crate::content_holder::IMAGE_TURNS);
@@ -2636,10 +2988,14 @@ mod tests {
     let outcome = crate::daemon::audit_on_shard(|state| {
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
       let ids = put_objects(state, (0, ENTRIES));
+      // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let every_other: Vec<slates_vcs::ContentId> = ids.iter().step_by(2).copied().collect();
       let_go(state, &every_other);
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let (_, _, owed) = state.image_encoder.progress();
       assert!(owed.is_some(), "a cut owed");
@@ -2918,7 +3274,18 @@ mod tests {
     /// A publication (`verbs::publish_shard`), noting the cut where it carried the encoder's (F2: the shard's entries at
     /// the cut's moment, or now where it began and was carried in this one publication), then the checks.
     fn publish(&mut self, state: &mut crate::state::ShardState, step: usize) {
-      let skipped = Self::counted(state, crate::content_holder::IMAGE_SKIPPED);
+      // A publication that carried the committed cut again: one a change not yet encoded skipped, or one whose next cut
+      // was not due (A-930's cadence), which the oracle holds to the same rule.
+      let carried_again = |state: &crate::state::ShardState| {
+        Self::counted(state, crate::content_holder::IMAGE_SKIPPED)
+          + Self::counted(state, crate::content_holder::IMAGE_DEFERRED)
+      };
+      // Half the publications follow a ticket's wait, which asks for its cut, and half follow A-930's cadence, which
+      // defers a cut nobody waits on until its changes come to its cost: both paths held to the oracle's rules.
+      if draw(&mut self.draws, 2) == 0 {
+        state.image_encoder.ask();
+      }
+      let skipped = carried_again(state);
       let in_flight = state
         .image_encoder
         .cut_in_flight()
@@ -2931,7 +3298,7 @@ mod tests {
           .push(format!("step {step}: the publication refused"));
         return;
       }
-      if Self::counted(state, crate::content_holder::IMAGE_SKIPPED) == skipped {
+      if carried_again(state) == skipped {
         let begun = self.begun.take();
         match begun {
           Some(begun) if Some(begun.generation) == in_flight => {
@@ -3073,6 +3440,8 @@ mod tests {
     preimages: (u64, u64),
     /// The most chunks the windows held for one cut.
     held_most: usize,
+    /// The publications that carried the committed cut again because the next was not due (A-930's cadence).
+    deferred: u64,
   }
 
   /// One oracle history on a shard (the oracle's test docs): `seed` 0 the continuous one.
@@ -3107,6 +3476,9 @@ mod tests {
     // The last steps' changes taken first, so the pages left are all of them: a turn encodes one at least.
     // F2: the cut in flight first, then the next of the pages left, each at most doubled by a split.
     crate::content_holder::image_drain(state);
+    // Quiet: the shard settles idle, which asks for a cut whatever its cost (A-930's cadence: changes not yet due wait
+    // for it; `content_holder::image_retry_owed`'s ask).
+    state.image_encoder.ask();
     let left = state.image_encoder.progress().1 as u64;
     oracle.turns(state, (STEPS + 1, 2 * left + 2));
     oracle.publish(state, STEPS + 1);
@@ -3166,6 +3538,7 @@ mod tests {
         counted(crate::content_holder::IMAGE_CUT_PREIMAGES_ABSENT),
       ),
       held_most: oracle.held_most,
+      deferred: counted(crate::content_holder::IMAGE_DEFERRED),
     }
   }
 
@@ -3180,11 +3553,13 @@ mod tests {
   /// values at most the entries in its pages at its moment (E) and its absent markers at most a turn's inserts times its
   /// pages (I); the chunks held for a cut at most a turn's frees times its pages; no ticket stranded and no pre-image left
   /// at a cut's end; and, the changes stopped, the cut caught up with the shard. Non-vacuous: the cuts kept old values
-  /// and absent markers, the windows held a chunk for a cut, and the images named windows.
+  /// and absent markers, the windows held a chunk for a cut, the images named windows, and some publication deferred
+  /// its cut (A-930's cadence: half the publications ask for theirs, as a ticket's wait does, and the shard asks once
+  /// quiet, as its idle does).
   #[test]
   fn generated_histories_restore_one_committed_cut_reuse_no_named_block_and_keep_their_lag_bound() {
     const PAGE: usize = 4096;
-    let (mut old, mut absent, mut held, mut named) = (0, 0, 0, 0);
+    let (mut old, mut absent, mut held, mut named, mut deferred) = (0, 0, 0, 0, 0);
     for seed in 0..HISTORIES {
       let found = crate::daemon::audit_on_shard(move |state| {
         crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
@@ -3197,6 +3572,7 @@ mod tests {
       absent += found.preimages.1;
       held = held.max(found.held_most);
       named = named.max(found.named);
+      deferred += found.deferred;
     }
     assert!(
       old > 0 && absent > 0,
@@ -3204,5 +3580,9 @@ mod tests {
     );
     assert!(held > 0, "no chunk was held for a cut");
     assert!(named > 0, "no restored image named a window");
+    assert!(
+      deferred > 0,
+      "no publication deferred its cut: A-930's cadence never ran"
+    );
   }
 }

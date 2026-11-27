@@ -2505,8 +2505,8 @@ pub(crate) const GREEN_AWAITS_ORIGIN: &str = "merge.green.awaits_origin";
 const RECORD_MAGIC: u32 = u32::from_le_bytes(*b"GMRC");
 /// Format: a merge record's format version (A-255: 1 is the first versioned format, with the submit's completion key; 2
 /// carries the submitting work beside the key, A-288; 3 carries the owner's fold floor, A-385; 4 its committed floor,
-/// A-404); a decoder refuses any other.
-const RECORD_VERSION: u32 = 4;
+/// A-404; 5 the green's lineage, A-932); a decoder refuses any other.
+const RECORD_VERSION: u32 = 5;
 /// Format: a merge record's magic and its version are each a little-endian `u32`.
 const RECORD_WORD_BYTES: usize = size_of::<u32>();
 /// Format: the magic and version before a merge record's value.
@@ -2562,6 +2562,13 @@ pub struct MergeRecordValue {
   /// version, so every version up to it is placed at `f + 1` and no live reader names one. A holder keeps a durable
   /// checkpoint of its replica there (`checkpoint_replica`). 0 for version 0. Appended.
   pub checkpoint_floor: u64,
+  /// The repository whose lineage the green was a member of when its owner made this record, as the owner's catalog
+  /// records its join (A-932); `None` for a green standing alone. A holder makes version 0 by it
+  /// ([`make_origin_replica`], `crate::merge_origin` on a rebuild): a green standing alone at once, a member by its
+  /// membership once the names log's join is held here. Until A-932 a holder took a family id for a member, and every
+  /// green made alone has been a family of its own since A-636 part 2b-2, so it waited for a join that never comes.
+  /// The id cannot tell the two apart: a green made alone may be adopted as a repository's root later. Appended.
+  pub lineage: Option<slates_db::catalog::RepositoryId>,
 }
 
 /// A submit's completion key as a merge record carries it ([`MergeRecordValue::completion`]): the client's host, the
@@ -3656,6 +3663,14 @@ fn enqueue_record_with(
     .map_or(0, |engine| engine.folded_below());
   // The newest version known committed (A-404): never this one, which waits for its placement.
   let committed = checkpoint_floor(state, green).min(version.saturating_sub(1));
+  // The green's lineage as this owner's catalog records its join (A-932): every version 0 is enqueued once the green's
+  // records, its join among them, are committed.
+  let lineage = state
+    .db
+    .partition()
+    .repositories()
+    .member(green)
+    .map(|member| member.repository);
   let mut value = MergeRecordValue {
     version,
     increment,
@@ -3670,6 +3685,7 @@ fn enqueue_record_with(
     signature,
     folded_below,
     checkpoint_floor: committed,
+    lineage,
   };
   // Version 0 of a green over a base names its origin as its inputs: made a share at a time, and the record enqueued
   // once they are (A-286), never walked, encoded and archived in this poll.
@@ -5618,7 +5634,7 @@ fn recompute(
   let key = crate::merge_service::replica_key(object);
   let made = value.version == 0 && !state.merge.replicas.contains_key(&key);
   if made {
-    make_origin_replica(state, object)?;
+    make_origin_replica(state, object, value.lineage)?;
   }
   let mut replica = state.merge.replicas.take_any(&key).ok_or(OUT_OF_ORDER)?;
   if value.version > 0 {
@@ -5674,14 +5690,24 @@ fn recompute(
 ///   `crate::merge_origin::make_source`, counted [`BRANCH_SOURCE_MADE`]), refused [`OUT_OF_ORDER`] (counted
 ///   [`BRANCH_SOURCE_BEHIND`]) while the source's replica is missing or has not reached that version, a source that owes
 ///   its push made first (A-886's door);
-/// - a green of a repository's family whose membership no names-log part held here records yet waits, [`OUT_OF_ORDER`]
-///   (counted [`MEMBER_UNKNOWN`]): its join is a part of the names log, which the owner owes every holder of the green
-///   (one placement: a family's greens and its names log share their line key), so it comes; the record stays with its
-///   sender, and nothing is kept here meanwhile;
-/// - a green of no repository is an empty green, standing alone, as before.
-fn make_origin_replica(state: &mut ShardState, object: ObjectId) -> Result<(), &'static str> {
+/// - a green whose record names its repository's lineage (`lineage`, A-932) while no names-log part held here records
+///   its join yet waits, [`OUT_OF_ORDER`] (counted [`MEMBER_UNKNOWN`]): its join is a part of the names log, which the
+///   owner owes every holder of the green (one placement: a family's greens and its names log share their line key), so
+///   it comes; the record stays with its sender, and nothing is kept here meanwhile;
+/// - a green whose record names no lineage stands alone, an empty green, made at once. Its id is a family's all the
+///   same (a green made alone is a family of its own, A-636 part 2b-2), which is why the record says it: before A-932
+///   the family bit decided, and such a green waited for a join that never comes.
+fn make_origin_replica(
+  state: &mut ShardState,
+  object: ObjectId,
+  lineage: Option<slates_db::catalog::RepositoryId>,
+) -> Result<(), &'static str> {
   use slates_db::catalog::MemberOrigin;
   let key = crate::merge_service::replica_key(object);
+  if lineage.is_none() {
+    state.merge.replicas.insert(key, Green::new());
+    return Ok(());
+  }
   match membership(state, key) {
     Some(member) => match member.origin {
       MemberOrigin::Root => {
@@ -5720,12 +5746,9 @@ fn make_origin_replica(state: &mut ShardState, object: ObjectId) -> Result<(), &
         state.count(MEMBER_BRANCHED, 1);
       }
     },
-    None if object.is_family() => {
+    None => {
       state.count(MEMBER_UNKNOWN, 1);
       return Err(OUT_OF_ORDER);
-    }
-    None => {
-      state.merge.replicas.insert(key, Green::new());
     }
   }
   Ok(())
@@ -6012,6 +6035,7 @@ mod tests {
         signature: None,
         folded_below: 0,
         checkpoint_floor: 0,
+        lineage: None,
       },
       inputs: Placement {
         candidates: candidates.clone(),
@@ -6132,6 +6156,7 @@ mod tests {
             signature: None,
             folded_below: 0,
             checkpoint_floor: 0,
+            lineage: None,
           },
           inputs: Placement {
             candidates: candidates.clone(),
@@ -6232,6 +6257,7 @@ mod tests {
               signature: None,
               folded_below: 0,
               checkpoint_floor: 0,
+              lineage: None,
             },
             inputs: Placement {
               candidates: candidates.clone(),
@@ -6340,6 +6366,7 @@ mod tests {
       }),
       folded_below: 2,
       checkpoint_floor: 1,
+      lineage: Some(slates_db::catalog::RepositoryId { bytes: [16u8; 16] }),
     }
   }
 
@@ -6415,10 +6442,77 @@ mod tests {
       signature: None,
       folded_below: 0,
       checkpoint_floor: 0,
+      lineage: None,
     };
     assert_eq!(
       MergeRecordValue::from_record_bytes(&origin_only.to_record_bytes()),
       Some(origin_only)
+    );
+  }
+
+  /// A-932, golden vector: version 0's record of a member of a repository's lineage, format 5, byte for byte (the class
+  /// byte, the magic "GMRC", the version 5, then the value by the canonical codec, the lineage last). A change here is a
+  /// wire change between holders: bump [`RECORD_VERSION`] with it.
+  #[test]
+  fn a932_a_members_version_zero_record_is_its_golden_bytes() {
+    let record = MergeRecordValue {
+      version: 0,
+      increment: [0u8; 32],
+      base: 0,
+      inputs: None,
+      identity: [7u8; 32],
+      evidence: Vec::new(),
+      name: "g".to_owned(),
+      require_evidence: false,
+      owner: Principal::Uid {
+        host: slates_db::HostId(2),
+        uid: 1,
+      },
+      completion: None,
+      signature: None,
+      folded_below: 0,
+      checkpoint_floor: 0,
+      lineage: Some(slates_db::catalog::RepositoryId { bytes: [16u8; 16] }),
+    };
+    let bytes = record.to_record_bytes();
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(hex, GOLDEN_MEMBER_VERSION_ZERO);
+    let alone = MergeRecordValue {
+      lineage: None,
+      ..record
+    }
+    .to_record_bytes();
+    let hex: String = alone.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(hex, GOLDEN_ALONE_VERSION_ZERO);
+  }
+
+  /// The golden bytes of [`a932_a_members_version_zero_record_is_its_golden_bytes`]'s member record, in hex.
+  const GOLDEN_MEMBER_VERSION_ZERO: &str = concat!(
+    "02474d524305000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "000000000000000000000707070707070707070707070707070707070707070707070707070707070707000000000100",
+    "000067000000000002000000000000000100000000000000000000000000000000000000000001101010101010101010",
+    "10101010101010"
+  );
+  /// The same record standing alone: its last byte the lineage's absence.
+  const GOLDEN_ALONE_VERSION_ZERO: &str = concat!(
+    "02474d524305000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "000000000000000000000707070707070707070707070707070707070707070707070707070707070707000000000100",
+    "000067000000000002000000000000000100000000000000000000000000000000000000000000"
+  );
+
+  /// A-932, hostile input: a record of format 4, which named no lineage, is refused typed, never read as standing alone.
+  #[test]
+  fn a932_a_merge_record_of_format_4_is_refused_typed() {
+    let mut format_4 = value().to_record_bytes();
+    if let Some(version) = format_4.get_mut(5..9) {
+      version.copy_from_slice(&4u32.to_le_bytes());
+    }
+    assert_eq!(
+      MergeRecordValue::decode_record(&format_4),
+      Err(RecordRefused::Version {
+        found: 4,
+        expected: RECORD_VERSION,
+      })
     );
   }
 
@@ -7014,7 +7108,7 @@ mod tests {
     }
   }
 
-  /// Version 0's record of a green whose head identity is `identity`.
+  /// Version 0's record of a green standing alone whose head identity is `identity`.
   fn version_zero(identity: [u8; 32]) -> MergeRecordValue {
     MergeRecordValue {
       version: 0,
@@ -7026,7 +7120,19 @@ mod tests {
       signature: None,
       folded_below: 0,
       checkpoint_floor: 0,
+      lineage: None,
       ..value()
+    }
+  }
+
+  /// Version 0's record of a member of `repository`'s lineage whose head identity is `identity` (A-932).
+  fn member_version_zero(
+    repository: slates_db::catalog::RepositoryId,
+    identity: [u8; 32],
+  ) -> MergeRecordValue {
+    MergeRecordValue {
+      lineage: Some(repository),
+      ..version_zero(identity)
     }
   }
 
@@ -7063,9 +7169,10 @@ mod tests {
       );
       note_names_part(state, &part);
       state.merge.memberships_built = true;
+      let zero = member_version_zero(repository, empty);
       let outcomes = [
-        recompute(state, root, &version_zero(empty), None),
-        recompute(state, branch, &version_zero(empty), None),
+        recompute(state, root, &zero, None),
+        recompute(state, branch, &zero, None),
       ];
       let counts = [
         counted(state, MEMBER_FOUNDED),
@@ -7109,8 +7216,9 @@ mod tests {
         ),
       );
       state.merge.memberships_built = true;
-      let _ = recompute(state, root, &version_zero(empty), None);
-      let first = recompute(state, branch, &version_zero(empty), None);
+      let zero = member_version_zero(repository, empty);
+      let _ = recompute(state, root, &zero, None);
+      let first = recompute(state, branch, &zero, None);
       let kept = state.merge.replicas.contains_key(&replica_key(branch));
       let unknown = counted(state, MEMBER_UNKNOWN);
       note_names_part(
@@ -7127,7 +7235,7 @@ mod tests {
           )],
         ),
       );
-      let second = recompute(state, branch, &version_zero(empty), None);
+      let second = recompute(state, branch, &zero, None);
       (first, kept, unknown, second)
     });
     assert_eq!(first, Err(OUT_OF_ORDER), "waits for its join");
@@ -7136,18 +7244,72 @@ mod tests {
     assert_eq!(second, Ok(()), "branched once the join is held");
   }
 
-  /// A-908: a green of no repository is judged at once, as before. Do: recompute version 0 of a green whose id is no
-  /// family's, naming a head identity no empty green has. Expect a mismatch at once, no wait counted.
+  /// A green minted as `CreateGreen` mints one standing alone (`verbs::found_green`): a family of its own (A-636 part
+  /// 2b-2), so its id carries the family bit like every repository member's.
+  fn green_standing_alone(state: &mut ShardState) -> ObjectId {
+    let id = crate::verbs::fresh_family_id_at(state, None, 0).expect("a family id");
+    let green = ObjectId(id.bytes);
+    assert!(
+      green.is_family(),
+      "a green standing alone is a family of its own"
+    );
+    green
+  }
+
+  /// A-908, A-932: a green of no repository is judged at once, as before. Do: recompute version 0 of a green minted as
+  /// one standing alone is, naming a head identity no empty green has. Expect a mismatch at once, no wait counted.
+  /// Until A-932 this test minted its green with an id of no family (`ObjectId::new`), which no green has been minted
+  /// with since A-636 part 2b-2, and passed while every real green standing alone waited for a join that never comes
+  /// (the fleet suite's red, `docs/bugs/2026-11-27-a-green-standing-alone-waited-on-its-holders-for-a-join-that-never-comes.md`):
+  /// CLAUDE.md's gotcha, an oracle run at a degenerate parameter certifies nothing about it.
   #[test]
   fn a908_a_version_zero_of_a_green_of_no_repository_is_judged_at_once() {
     let (outcome, unknown) = crate::daemon::audit_on_shard(|state| {
-      let green = ObjectId::new(slates_db::HostId(1), 9);
+      let green = green_standing_alone(state);
       state.merge.memberships_built = true;
       let outcome = recompute(state, green, &version_zero([7u8; 32]), None);
       (outcome, counted(state, MEMBER_UNKNOWN))
     });
     assert_eq!(outcome, Err(RECOMPUTE_MISMATCH));
     assert_eq!(unknown, 0);
+  }
+
+  /// A-932 (main's ruling (a) of 2026-11-27): a holder makes a green standing alone at once and waits for a member's
+  /// join. Do: recompute version 0 of a green minted standing alone, its record naming no lineage; then version 0 of a
+  /// green of a repository's family whose record names that repository, before any names-log part joins it. Expect the
+  /// first's replica made at once with no `merge.replica.member_unknown` counted; the second refused out of order,
+  /// counted once, nothing kept. Red before: both waited, since both ids carry the family bit.
+  #[test]
+  fn a932_a_green_standing_alone_is_made_at_once_and_a_member_waits_for_its_join() {
+    let (alone, made, unknown_after_alone, member, kept, unknown) =
+      crate::daemon::audit_on_shard(|state| {
+        let empty = Green::new().head_identity();
+        let green = green_standing_alone(state);
+        state.merge.memberships_built = true;
+        let alone = recompute(state, green, &version_zero(empty), None);
+        let made = state.merge.replicas.contains_key(&replica_key(green));
+        let unknown_after_alone = counted(state, MEMBER_UNKNOWN);
+        let branch = family_id(2, 3);
+        let repository = slates_db::catalog::RepositoryId {
+          bytes: family_id(1, 1).0,
+        };
+        let member = recompute(state, branch, &member_version_zero(repository, empty), None);
+        let kept = state.merge.replicas.contains_key(&replica_key(branch));
+        (
+          alone,
+          made,
+          unknown_after_alone,
+          member,
+          kept,
+          counted(state, MEMBER_UNKNOWN),
+        )
+      });
+    assert_eq!(alone, Ok(()), "made at once");
+    assert!(made, "its replica kept");
+    assert_eq!(unknown_after_alone, 0, "no wait counted for it");
+    assert_eq!(member, Err(OUT_OF_ORDER), "the member waits for its join");
+    assert!(!kept, "nothing kept for the member meanwhile");
+    assert_eq!(unknown, 1);
   }
 
   /// A-908: a branch whose version 0 the holder's own branch does not reproduce is refused as a mismatch once its join
@@ -7184,9 +7346,14 @@ mod tests {
       );
       state.merge.memberships_built = true;
       let empty = Green::new().head_identity();
-      let _ = recompute(state, root, &version_zero(empty), None);
-      let disagrees = recompute(state, wrong, &version_zero([7u8; 32]), None);
-      let ahead = recompute(state, early, &version_zero(empty), None);
+      let _ = recompute(state, root, &member_version_zero(repository, empty), None);
+      let disagrees = recompute(
+        state,
+        wrong,
+        &member_version_zero(repository, [7u8; 32]),
+        None,
+      );
+      let ahead = recompute(state, early, &member_version_zero(repository, empty), None);
       (disagrees, ahead, counted(state, BRANCH_SOURCE_BEHIND))
     });
     assert_eq!(disagrees, Err(RECOMPUTE_MISMATCH));

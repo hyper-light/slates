@@ -337,6 +337,7 @@ mod tests {
           signature: None,
           folded_below: 0,
           checkpoint_floor: 0,
+          lineage: None,
         };
         state
           .holder_records
