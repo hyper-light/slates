@@ -3228,18 +3228,7 @@ fn pushed_landing_every(cadence: u64) -> Cadenced {
       cut.push(segment);
     }
     if steps % cadence == 0 {
-      for segment in cut.drain(..) {
-        counted.count_out(&mut store, &segment.contents);
-        for contents in &segment.contents {
-          for identity in contents.identities() {
-            store.let_go_object_landed(identity, &|_| None);
-          }
-          let key = (contents.path.clone(), contents.node);
-          if let Some(text) = texts.get(&key) {
-            saved.insert(key, text.clone());
-          }
-        }
-      }
+      land_cut(&mut cut, &mut counted, &mut store, &texts, &mut saved);
     }
     match stepped {
       Stepped::Store => match taking.asked_text() {
@@ -3258,6 +3247,30 @@ fn pushed_landing_every(cadence: u64) -> Cadenced {
     asks,
     steps,
     outcome,
+  }
+}
+
+/// Lands the segments `cut` holds, as a server does between its slices: each counted out of `counted`'s pins, its
+/// objects let go as a durable segment's are, and its log texts (found in the line's `texts`) then kept by the
+/// changeset store, `saved`.
+fn land_cut(
+  cut: &mut Vec<PushSegment>,
+  counted: &mut crate::push::pins::Counted,
+  store: &mut ContentStore,
+  texts: &Saved,
+  saved: &mut Saved,
+) {
+  for segment in cut.drain(..) {
+    counted.count_out(store, &segment.contents);
+    for contents in &segment.contents {
+      for identity in contents.identities() {
+        store.let_go_object_landed(identity, &|_| None);
+      }
+      let key = (contents.path.clone(), contents.node);
+      if let Some(text) = texts.get(&key) {
+        saved.insert(key, text.clone());
+      }
+    }
   }
 }
 
