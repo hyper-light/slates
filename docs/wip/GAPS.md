@@ -905,8 +905,10 @@
 > read by the tests alone, not yet the status report. Move's `stage.committing` was the commit's node moves, a walk of
 > every effect in one unit (7.99 ms debug), which walks nothing since where no node has a link, and an effect a unit
 > where one has. `landing.apply`'s remaining unit
-> was its begin's plan of a replay's reads (4.46 ms debug), made since only where a run is unread; a replay's plan and
-> the scan of the runs are still one unit each, owed their slicing. Next, by size:
+> was its begin's plan of a replay's reads (4.46 ms debug), made since only where a run is unread; a replay's plan is made
+> a unit a step since and kept with the entry, and the runs read whole are counted, not walked; still one linear unit
+> each: the plan where made whole (`recorded_unlent`, svn_texts' wanted runs, `begin_applying` without one), the
+> begin's list of copies, `named_whole_files`. Next, by size:
 > `stage.judging` is out of move's leaders since a directory removal's children are counted and the resolution's end
 > taken an entry a unit, and `stage.recording` since the staging applies the pending holds a slice a step before its
 > free decision and its walks read a directory a child a unit, and `stage.check` since a revision's record is encoded a

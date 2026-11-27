@@ -1746,3 +1746,44 @@ fn an_apply_begun_with_every_run_read_plans_no_replays_reads() {
   );
   assert_eq!(replaying.replay_plans(), 1, "plans with no run read");
 }
+
+/// A-920 (a replay's choice of runs made a unit a step, main's ruling of 2026-11-27 02:03: a recovery's replay made it
+/// whole at each step of an entry's reads). Do: make the choice for a push's entry of [`REPLAY_RUNS`] files, each whole
+/// of a run of its own, a unit a step. Expect no run read, as the whole choice answers, in a step for each run's place,
+/// each change and each run's answer at least.
+#[test]
+fn a_replays_choice_of_runs_is_made_a_unit_a_step() {
+  let (work, applied) = pushed_whole(REPLAY_RUNS);
+  let mut choosing = super::ReplayReads::default();
+  let mut steps = 1usize;
+  while !choosing.step(&work, &applied) {
+    steps += 1;
+  }
+  let reads = choosing.into_reads();
+  assert_eq!(reads, work.replay_reads(&applied));
+  assert_eq!(reads.iter().filter(|read| **read).count(), 0, "no run read");
+  assert!(
+    steps >= 3 * REPLAY_RUNS,
+    "{steps} steps for {REPLAY_RUNS} runs"
+  );
+}
+
+/// A-920 (a read goes on from the first run not read whole). Do: read a push's entry of [`REPLAY_RUNS`] runs a run's
+/// bytes a call. Expect every run read, the runs the calls visited about one a run and one a call, never the runs read
+/// before again at each call (quadratic: about half the runs' square).
+#[test]
+fn a_reads_calls_go_on_from_the_first_run_not_read_whole() {
+  let (mut work, _) = pushed_whole(REPLAY_RUNS);
+  let plane = plane_of(&work);
+  let mut calls = 1u64;
+  while !work.read_step(&plane, 100).unwrap() {
+    calls += 1;
+  }
+  assert!(work.unread().is_none(), "every run read");
+  let visited = work.named.read.runs_visited();
+  let runs = REPLAY_RUNS as u64;
+  assert!(
+    visited <= 2 * (runs + calls),
+    "{visited} runs visited over {calls} calls of {runs} runs"
+  );
+}

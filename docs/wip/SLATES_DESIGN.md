@@ -65180,8 +65180,33 @@ GAPS.
   - Debug, after: `stage.check` is out of the six longest spans of all three wide tests (3.7-3.9 ms before). The
     leaders now, publication aside: `stage.canonical` 5.4-5.5 ms, `landing.prepare` 3.8 and `parse` 3.6-3.8, at a
     load at which the publication read 17-32 ms.
-  - Left: a replay's plan is still a pass over the entry in one unit, as is the scan of the runs, linear in them. Both
-    are owed their slicing by §3.
+  - A replay's plan and the scan of the runs were each still one linear unit: owed by §3, taken next (below).
+  **A replay's choice of runs made a unit a step; the runs read whole counted, never walked.**
+  - The runs' unread scan walked every run, and every read call (`read_step_among`) began again at run 0: reading
+    9,000 runs over many slices walked the runs read before at every call. The read state now counts the runs read
+    whole from the first (`named::Read::whole`, advanced as each read ends, each run passed once). Where every run is
+    read, the unread check answers with no walk, and a read goes on from that count.
+    - Test `a_reads_calls_go_on_from_the_first_run_not_read_whole`: 2,000 runs read a run's bytes a call visit about
+      one run a run and one a call (`Read::visited`). Red with each call from the first: 2,004,999 visits.
+  - The choice of the runs a replay reads (`Increment::replay_reads`, A-887) was a pass over the entry's every change
+    and run in one unit. A recovery's replay made it at each step of an entry's reads (`verbs::replay_chain_entry`),
+    and once more by the apply's begin. It is now `engine::ReplayReads`, a unit a step:
+    - each run's place;
+    - each changed file, its whole run named and the runs its adding operations read marked;
+    - each payload operation of the document;
+    - each run's answer.
+    A change's whole run only excuses its own operations, so one pass over the changes decides what the whole rule's
+    two did. `replay_reads` is it run to its end.
+  - The replay keeps it beside the entry (`ReplayPlan`), made once under the step's apply budget, and begins the apply
+    with it (`Green::begin_applying_planned`). `begin_applying` makes it whole only where a run is unread and no plan
+    was made.
+    - Test `a_replays_choice_of_runs_is_made_a_unit_a_step`: 2,000 runs, the whole choice's answer, three steps a run
+      at least.
+  - Left, each one linear unit:
+    - the choice where it is still made whole: `recorded_unlent`, svn_texts' wanted runs of a recovery's plan,
+      `begin_applying` without a plan;
+    - the begin's list of the entry's copies;
+    - `named_whole_files`.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
