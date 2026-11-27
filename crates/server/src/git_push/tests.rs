@@ -2446,6 +2446,151 @@ fn b4_a_linear_rules_update_of_a_let_go_tag_head_lands() {
   );
 }
 
+/// B5 of the landed let-go's lift (main's order of 2026-11-26; w-git's read sweep: `views::PushedObjects::bytes` of a
+/// pushed object answered `Malformed` where `Push::bytes` met a let-go window, noting nothing, so the verdict's build
+/// refused the command). On one push's own path the push's reads keep the pushed tree its checks resolved, so the build
+/// reads it kept; it bites once the push's read cache has turned that tree over. Its red at its site: do, after
+/// [`thin_update_over_a_create`]'s create, let every window of its pack go; hand a push that has read nothing the
+/// update's thin pack (its new tree a REF_DELTA against the create's tree) and admit each object where it lies; read
+/// the new tree through the view the verdict's build reads (`PushedObjects::tree`). Expect: not yet
+/// (`Unavailable::NotYet`), the let-go noted in the push's own slot and nothing on the repository's shared one. Red
+/// before: `Malformed`.
+#[test]
+fn b5_a_pushed_delta_read_over_a_let_go_base_is_not_yet_and_noted_for_the_push() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository = git_repository_on(&daemon, "pushed-delta-away");
+  let (first, objects) = flat_commit(THIN_TREE_FILES, "base", None);
+  let pack = pack_of_objects(&objects);
+  let create = request(
+    &[("", &first.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack,
+  );
+  let (created, _) = pushed_in_steps(&daemon, repository, &create).unwrap();
+  assert_eq!(reasons(&created), [b"ok"]);
+  assert!(
+    derivation_ended(&daemon, repository),
+    "the create's derivation ended"
+  );
+  let (thin, (tree_id, tree)) = thin_tree_entries(&objects[1].1);
+  let (read, noted, shared) = crate::daemon::observe_first(&daemon, move |state| {
+    let _ = let_go_by_hand(state, &pack);
+    if let Some((content, store)) = state.vcs_stores.git(repository) {
+      let _ = store.repository.let_go_recent(content);
+    }
+    let mut push = slates_git::store::Push::new(ObjectFormat::Sha1);
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().expect("the content store");
+      push.extend_pack(content, &thin.0).expect("the pack put");
+    });
+    let naming = slates_git::store::GitNaming {
+      format: ObjectFormat::Sha1,
+    };
+    let (content, store) = state.vcs_stores.git_ref(repository).expect("the git store");
+    for (offset, kind, bytes, depth) in &thin.1 {
+      let incoming = slates_git::store::Incoming {
+        kind: *kind,
+        claimed: None,
+        content: bytes,
+        depth: *depth,
+      };
+      push
+        .admit_placed::<_, std::convert::Infallible>(content, &naming, (incoming, *offset))
+        .expect("admitted");
+    }
+    let waits = slates_git::away::Waits::default();
+    let objects = slates_git::store::views::PushedObjects::new(&store.repository, content, &push)
+      .noting(&waits);
+    let key = slates_merge::push::ObjectKey::new(tree_id.as_bytes()).expect("its key");
+    let read = slates_merge::push::PushObjects::tree(&objects, key).map(|entries| entries.len());
+    let _ = tree;
+    let shared = store.repository.peek_waiting().is_some();
+    (read, waits.peek().is_some(), shared)
+  });
+  daemon.stop();
+  assert_eq!(
+    read,
+    Err(slates_merge::push::Unavailable::NotYet),
+    "not yet over the let-go base"
+  );
+  assert!(noted, "the let-go noted in the push's own slot");
+  assert!(!shared, "nothing on the repository's shared slot");
+}
+
+/// The thin pack of [`thin_update_over_a_create`]'s update over the create's tree `base`: its bytes and each entry's
+/// offset, type, whole bytes and delta depth (the new tree a REF_DELTA against `base`, which the pack does not carry);
+/// and the new tree's id and bytes.
+#[allow(clippy::type_complexity)]
+fn thin_tree_entries(
+  base: &[u8],
+) -> (
+  (
+    Vec<u8>,
+    Vec<(u64, slates_git::object_name::Kind, Vec<u8>, u64)>,
+  ),
+  (ObjectId, Vec<u8>),
+) {
+  use slates_git::object_name::{Kind, name_of};
+  let blob = b"added\n".to_vec();
+  let mut tree = base.to_vec();
+  tree.extend_from_slice(b"100644 zz\0");
+  tree.extend_from_slice(
+    name_of(ObjectFormat::Sha1, Kind::Blob, &blob)
+      .unwrap()
+      .as_bytes(),
+  );
+  let tree_id = name_of(ObjectFormat::Sha1, Kind::Tree, &tree).unwrap();
+  let delta = slates_git::store::delta_of(base, &tree).expect("a delta shorter than the tree");
+  let base_id = name_of(ObjectFormat::Sha1, Kind::Tree, base).unwrap();
+  let entries = [
+    (Entry::Ref(base_id), delta, Kind::Tree, tree.clone(), 1u64),
+    (
+      Entry::Whole(Kind::Blob),
+      blob.clone(),
+      Kind::Blob,
+      blob,
+      0u64,
+    ),
+  ];
+  let laid: Vec<(Entry, Vec<u8>)> = entries
+    .iter()
+    .map(|(entry, data, ..)| (*entry, data.clone()))
+    .collect();
+  let (pack, offsets) = entries_pack_at(&laid);
+  let objects = entries
+    .into_iter()
+    .zip(offsets)
+    .map(|((_, _, kind, bytes, depth), offset)| (offset, kind, bytes, depth))
+    .collect();
+  ((pack, objects), (tree_id, tree))
+}
+
+/// B5's healed path, kept as its net: on one push's own path its reads keep the pushed tree its checks resolved, so the
+/// verdict's build reads it kept. Do: [`b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands`]'s update,
+/// every window of the first push's pack let go once its verdicts are being decided ([`LetGoAt::Deciding`]). Expect:
+/// `ok`.
+#[test]
+fn b5_a_verdicts_build_of_a_pushed_delta_over_a_let_go_base_lands() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, update, pack) = thin_update_over_a_create(&daemon, "thin-verdict-away");
+  let (updated, _, _, _) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let_go_when(repository, &update, (&pack, LetGoAt::Deciding, Meddle::Not)).await
+    },
+    HISTORY_PATIENCE,
+  )
+  .unwrap();
+  let refused = crate::daemon::observe_first(&daemon, bring_backs_refused);
+  daemon.stop();
+  assert_eq!(
+    reasons(&updated),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    updated.outcomes
+  );
+}
+
 /// B3's healed path, kept as its net (main's ruling of 2026-11-26): a create at a commit a green holds is made at that
 /// green (A-753), no base search read. Do: create `main` at `C2` over `C1` over `C0`, `C0`'s window apart from `C1`'s
 /// ([`three_commit_create`]); let every window go in the next push's task; create `refs/heads/x` at `C1`, the empty
@@ -2698,6 +2843,11 @@ enum Entry {
 
 /// A pack of `entries`, each its data in stored zlib blocks, in order.
 fn entries_pack(entries: &[(Entry, Vec<u8>)]) -> Vec<u8> {
+  entries_pack_at(entries).0
+}
+
+/// [`entries_pack`], with where each entry begins in it.
+fn entries_pack_at(entries: &[(Entry, Vec<u8>)]) -> (Vec<u8>, Vec<u64>) {
   use slates_git::entry::{self, Header, Representation};
   let mut pack = Vec::new();
   let count = u32::try_from(entries.len()).unwrap();
@@ -2723,7 +2873,7 @@ fn entries_pack(entries: &[(Entry, Vec<u8>)]) -> Vec<u8> {
     at += entry::written_len(header, at).unwrap() + u64::try_from(zlib.len()).unwrap();
   }
   writer.finish().unwrap();
-  pack
+  (pack, begun)
 }
 
 /// What another reader of the repository does at the push's first stop after its let-go, in [`let_go_at_its_checks`].
@@ -2761,6 +2911,8 @@ enum LetGoAt {
   Admitted(ObjectId),
   /// Before the push began: its test let the pack go itself, and `let_go` is empty.
   Already,
+  /// Once the push's pack is checked and sealed and its verdicts are being decided.
+  Deciding,
 }
 
 /// [`let_go_at_its_checks`], the pack let go at `at`.
@@ -2824,6 +2976,7 @@ fn is_due(push: &ReceivePack, at: LetGoAt) -> bool {
       .as_ref()
       .is_some_and(|quarantine| quarantine.quarantine().object(&id).is_some()),
     LetGoAt::Already => true,
+    LetGoAt::Deciding => matches!(push.answer, super::AnswerState::Deciding(_)),
   }
 }
 
