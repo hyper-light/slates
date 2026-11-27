@@ -844,3 +844,8 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Debug leaders now (excl. publish): 1.0-1.4 ms spans; cold first create 2.4 ms = first use (warm 0.17-0.2), ruling asked.
 - Owed (GAPS, by main's ruling only when a probe names them): plan where still whole, begin's copies list, named_whole_files.
 - Next: main's ruling on create; probe 18 (release) to name leaders.
+
+## 2026-11-27 13:15 — goal 93 counts
+- be16a2521: an_svn_writing_session_measured (per-step timed, stock svnserve baseline in the same run). Local p7 debug:
+  HTTP 5.75 s, svn:// 5.51 s, stock 7.50 s; no gap; time is the svn client's own. ee7243e7d: an_svnrdump_dump_measured.
+- Owed by main: release rounds of both over git-2000 (they name the step); probe 18 for A-920's cuts.
