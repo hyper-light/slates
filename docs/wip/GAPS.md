@@ -7262,6 +7262,14 @@
 > The restarted daemon's start spin (`daemon.rs:1186`, `start_shard`, "the most CPU in one [slice] 962,859 µs, ending
 > at unit 1") was the catalog's whole replay in one unit of the sliced start: it is replayed a record a unit since this
 > change (w-bugs; `a_shards_start_replays_its_catalog_a_record_a_unit`, 256 records in one unit before, 1 after).
+> Unit 43 (2026-11-26, w-hg; main 01a20182's r42 on hg-src's 57,170 revisions: "the most CPU in one 329,608 µs, ending
+> at unit 43" at 6a4dcbc6a, 952,728 µs at unit 46 at 20a49642c): a green's chain entry naming a whole tree (a push's
+> line from an empty root) was applied in one unit, one `apply_recorded` call. Its replay now applies it a slice's floor
+> a step (`verbs::replay_chain_entry` through `Green::begin_applying` and `apply_step`, `copy_slice_ns`), the run kept
+> with the entry between steps (`a_restarts_replay_applies_a_whole_trees_entry_a_slice_at_a_time`: one entry of 200
+> files in 2,813 steps at a 1 ns budget, one before). The start line now names the heaviest slice's longest unit by its
+> kind and time ("its longest unit a green's chain step of N µs"; `RecoverySlices::unit_done` takes its unit's kind),
+> so the next reading says which unit held it. Owed: main's r42 rerun.
 
 > **A daemon whose control shard was busy with recovered work stopped itself, and its anchor restarted it into the same
 > work (2026-11-20; CLOSED, g226; found by w-interop's git matrix).** On debug main 3e1983bc9, a 56 MB push of git/git

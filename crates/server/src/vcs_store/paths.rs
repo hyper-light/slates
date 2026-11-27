@@ -376,7 +376,7 @@ async fn put_sliced(
   for (name, file) in files {
     let (content, _) = stores.git(repository).ok_or(StepRefused::NoMap)?;
     entries.insert(name, put_file(content, &file, held)?);
-    slices.unit_done().await;
+    slices.unit_done("a path index's put").await;
   }
   Ok(entries)
 }

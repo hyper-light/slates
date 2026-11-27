@@ -335,7 +335,9 @@ pub(crate) async fn bring_back_named(
       let count = u64::try_from(wanted.len()).unwrap_or(u64::MAX);
       state.count(RECOVERY_BROUGHT_BACK, count);
     }
-    slices.unit_done().await;
+    slices
+      .unit_done("a named Mercurial text brought back")
+      .await;
   }
   brought
 }
