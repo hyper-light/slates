@@ -731,3 +731,16 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - A-921 Windows bound (main 09:50, approved 09:53), after a914. The watch brackets each re-key (last un-keyed look) and the bound adds both detectors' measured granularity.
   - Patch: ~/.local/state/w-shared/a921-rekey-lateness.diff (diff -u of tests/fleet.rs, a914-only version vs combined); combined copy at fleet-combined.rs.
 - Then: A-919's past-tolerance edge, shape to main first.
+
+## 2026-11-27 13:26 PST: A-919 start-rule mark and (C), held for main's TLC (model sha256 61b68654ea2e1e31)
+- Local commits, not pushed:
+  - 7d43599ae: the mark (lost[a]; an accept at or below it never moves the start; start-aware ReadSafety). _forget held over 75.9M states on an earlier text.
+  - 87cd91682: the nomark config judges Continuity alone.
+  - c30ea80ed: GAPS records a914 at 4/16 at the barrier.
+- (C), uncommitted (patch ~/.local/state/w-shared/a919c-wip.patch):
+  - db: CommittedFloor/chain_digest, LedgerPromise.committed_through, a fold Witness (verified, uncovered, mismatch).
+  - server: StateLogs floor plus guard; image kind 23 (IMAGE 37, DELTA 15); ledger reads served on their own task with the owner's floor (held_from ≥ floor+1); read_once passes the witness.
+  - model: LetGo/ReadAdopt (newcomer only), readSingle ReadNoLoss.
+  - Red green; unit 12/12; db 204/204; fleet focused 17/17 and 7/7.
+- Landing: one push of the commits above plus (C) as db+model, then server, after _floor and the other seven configs hold on 61b68654ea2e1e31.
+- Next: a914's placed Some(2) shape rerun after (C). (w-interop has Some(1); w-svn has the credential retry bug.)
