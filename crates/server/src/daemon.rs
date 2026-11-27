@@ -6300,6 +6300,11 @@ pub const CONTENT_PURGE_KEPT_SHORT: &str = "content.purge_kept_short_bytes";
 /// Counter: recovery memory an idle shard gave back because no restart reads it (A-117).
 pub const RECOVERY_RETURNED: &str = "recovery.returned_bytes";
 
+/// Counter: the whole pages (`Geometry::page`) of the journal's dead recovery memory an idle shard asked the OS to take
+/// back (A-926's give-back): what the give-back offers, on every platform, whatever the OS then takes
+/// ([`RECOVERY_RETURNED`]; Windows' section views may take none).
+pub const RECOVERY_ASKED: &str = "recovery.asked_bytes";
+
 /// Gives back one slice of an idle shard's recovery memory that no restart reads (A-117): the checkpoint slot older than
 /// the committed one, and its delta log past the tail, each only as far as it was written since its last give-back
 /// (`Journal::dead_ranges`, A-226), taken from the top of each down so the journal can record a slice at a time. A
@@ -6399,20 +6404,31 @@ fn give_back_dead_journal(s: &mut ShardState, left: &mut usize) -> (usize, bool)
   let Some(object) = s.content.as_mut() else {
     return (0, false);
   };
+  let mut asked = 0usize;
   // The top `left` bytes of `(offset, len)` within the region at `base`: given back, the offset they start at (what
-  // the journal records), and the bytes the object took. `None` when the object refused.
+  // the journal records), and the bytes the object took; the whole pages it was asked for counted in `asked`. `None`
+  // when the object refused.
   let mut give_back = |base: usize, (offset, len): (usize, usize)| -> Option<(usize, usize)> {
     let piece = len.min(*left);
     let from = offset.saturating_add(len).saturating_sub(piece);
     if piece == 0 {
       return Some((from, 0));
     }
-    let bytes = object.discard(base.checked_add(from)?, piece).ok()?;
+    let start = base.checked_add(from)?;
+    let bytes = object.discard(start, piece).ok()?;
+    let whole = start
+      .saturating_add(piece)
+      .checked_div(page)
+      .unwrap_or(0)
+      .saturating_mul(page)
+      .saturating_sub(start.checked_next_multiple_of(page).unwrap_or(usize::MAX));
+    asked = asked.saturating_add(whole);
     *left = left.saturating_sub(piece);
     Some((from, bytes))
   };
   let stale_slot = give_back(slots_start, dead.stale_slot);
   let log_past_tail = give_back(log_start, dead.log_past_tail);
+  s.count(RECOVERY_ASKED, u64::try_from(asked).unwrap_or(u64::MAX));
   s.journal.given_back_from(
     stale_slot.map(|(from, _)| from.saturating_sub(dead.stale_slot.0)),
     log_past_tail.map(|(from, _)| from),
@@ -11828,8 +11844,11 @@ mod tests {
   /// range ends where its bytes did, off a page, and a give-back takes whole pages only. Do: on a fresh shard, publish
   /// until a second checkpoint leaves a stale slot and a log written as far as their bytes reached; give back what is
   /// dead with the slice at one page (the shard's thread clock reading nothing, so no rate is learned) until nothing is
-  /// left. Expect the pages given back counted, not only the extents fallen. Red before: every page-sized piece of the
-  /// top-down give-back straddled two pages, so the extents fell to nothing and no page went back.
+  /// left. Expect whole pages asked back of the OS ([`super::RECOVERY_ASKED`]), not only the extents fallen. Red
+  /// before: every page-sized piece of the top-down give-back straddled two pages, so the extents fell to nothing and
+  /// no whole page was asked for. The rule is what is asked, on every platform: what the OS then takes is its own, and
+  /// Windows' section views took none (main's CI run 45948476737, both native Windows jobs, failed this test's earlier
+  /// form, which asserted the bytes taken).
   #[test]
   fn a_one_page_give_back_takes_the_pages_of_extents_that_end_off_a_page() {
     /// Shape: the publications a shard may take to commit its second checkpoint.
@@ -11852,6 +11871,11 @@ mod tests {
       }
       let dead = state.journal.dead_ranges(totals.0, totals.1);
       state.give_back_rate = super::GiveBackRate::default();
+      let asked_before = state
+        .refusals
+        .get(super::RECOVERY_ASKED)
+        .copied()
+        .unwrap_or(0);
       let mut returned = 0;
       for _ in 0..STEPS {
         let (bytes, more) = super::return_dead_recovery_timed(state, &mut || None);
@@ -11864,15 +11888,25 @@ mod tests {
         .journal
         .dead_ranges(totals.0, totals.1)
         .map_or(0, |dead| dead.stale_slot.1 + dead.log_past_tail.1);
-      (dead, returned, left)
+      let asked = state
+        .refusals
+        .get(super::RECOVERY_ASKED)
+        .copied()
+        .unwrap_or(0)
+        - asked_before;
+      (dead, (asked, returned), left)
     });
-    println!("daemon: dead {dead:?}, {returned} bytes given back a page a step, {left} left");
+    let (asked, returned) = returned;
+    println!(
+      "daemon: dead {dead:?}, {asked} bytes of whole pages asked back a page a step ({returned} taken by the \
+       OS), {left} left"
+    );
     let dead = dead.expect("a checkpoint committed");
     assert!(dead.stale_slot.1 > 0, "a stale slot written: {dead:?}");
     assert_eq!(left, 0, "nothing left dead");
     assert!(
-      returned > 0,
-      "pages given back, not only the extents fallen: {dead:?}"
+      asked > 0,
+      "whole pages asked back, not only the extents fallen: {dead:?}"
     );
   }
 

@@ -601,3 +601,113 @@ fn a_cache_lays_its_next_chunk_in_the_one_it_gives_back() {
     cache.chunks_mapped
   );
 }
+
+/// Shape: the tiny texts the index test lands, enough that their index, unbounded, is many times a chunk.
+const TINY_TEXTS: u64 = 100_000;
+/// Shape: a tiny text's length: a file of a few bytes, as many of a history's are.
+const TINY: usize = 8;
+
+/// Lands one changeset of repository 1 at `sequence` holding [`TINY_TEXTS`] whole texts of [`TINY`] bytes, each on its
+/// own path: their identities and bytes, in order.
+fn land_tiny_texts(store: &mut Store, sequence: u64) -> Vec<([u8; 32], Vec<u8>)> {
+  let staging = Staging::new(1 << 20);
+  let texts: Vec<Vec<u8>> = (0..TINY_TEXTS)
+    .map(|nth| nth.to_le_bytes().to_vec())
+    .collect();
+  let payload = texts.concat();
+  let payload_identity = *blake3::hash(&payload).as_bytes();
+  let entries: Vec<TextEntry> = texts
+    .iter()
+    .enumerate()
+    .map(|(nth, text)| TextEntry {
+      path: format!("tiny-{nth}").into_bytes(),
+      tool_id: Vec::new(),
+      text: *blake3::hash(text).as_bytes(),
+      len: text.len() as u64,
+      base: None,
+      place: Place {
+        payload: payload_identity,
+        offset: (nth * TINY) as u64,
+        len: TINY as u64,
+      },
+      form: slates_store::texts::Form::Raw,
+    })
+    .collect();
+  let section = texts::encode(&entries);
+  store
+    .land(
+      Header {
+        tool: Tool::Mercurial,
+        repository: 1,
+        sequence,
+        judged_over: sequence - 1,
+        grant: 1,
+        work: sequence,
+        time_ns: sequence,
+        sections: 0,
+      },
+      &[
+        (SectionKind::Record, Contents::Bytes(b"heads")),
+        (SectionKind::Payload, Contents::Bytes(&payload)),
+        (SectionKind::Texts, Contents::Bytes(&section)),
+      ],
+      &staging,
+    )
+    .unwrap();
+  texts
+    .into_iter()
+    .map(|text| (*blake3::hash(&text).as_bytes(), text))
+    .collect()
+}
+
+/// The process's live heap: the system path's live bytes and the mapped blocks' resident ones.
+fn live() -> u64 {
+  let now = heap();
+  now.system_live + now.mapped_resident
+}
+
+/// Goal 93 (main's 57k rerun at c207c9f81: after the push the cache's texts held 1 MiB, its bound, while 35,951,082
+/// bytes stayed live under `make_chain`'s keep, and 10,827,585 more in the texts map's growth, through the clone). Do:
+/// land [`TINY_TEXTS`] texts of [`TINY`] bytes; read each once through a cache that keeps nothing, so the store's own
+/// caches are warm; then, on a cache made for [`READS`] reads at once, read every one twice, reading the live heap
+/// before and after. Expect every text's bytes as landed; and the live heap grown by at most four times the cache's
+/// bound: its chunks, and the index of the texts they hold (an entry's bytes counted in the chunk's room, and the
+/// index's capacity at most two doublings past what it holds). Red before: the bound counted the texts' bytes alone, so
+/// a chunk took as many tiny texts as fit and the index grew with every text and every read of an older chunk's text.
+#[test]
+fn a_cache_of_tiny_texts_holds_its_index_within_its_bound() {
+  let dir = scratch("tiny-index");
+  let mut store = open(&dir);
+  let texts = land_tiny_texts(&mut store, 1);
+  let staging = Staging::new(0);
+  let mut nothing = TextCache::new(0);
+  for (identity, _) in &texts {
+    store
+      .text_at(&staging, 1, identity, 0, &mut nothing)
+      .unwrap()
+      .unwrap();
+  }
+  let mut cache = TextCache::for_reads(READS);
+  let before = live();
+  for _ in 0..2 {
+    for (identity, text) in &texts {
+      let bytes = store
+        .text_at(&staging, 1, identity, 0, &mut cache)
+        .unwrap()
+        .unwrap();
+      assert_eq!(bytes, text.as_slice(), "a tiny text's bytes as landed");
+    }
+  }
+  let grown = live().saturating_sub(before);
+  let bound = cache.bound();
+  println!(
+    "text_cache_heap: {TINY_TEXTS} texts of {TINY} B read twice: the live heap grew {grown} B, the cache's bound \
+     {bound} B, its texts {} B, its figures {:?}",
+    cache.held_bytes(),
+    cache.figures()
+  );
+  assert!(
+    grown <= 4 * bound,
+    "the live heap grew {grown} B past four times the cache's bound, {bound} B"
+  );
+}

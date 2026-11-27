@@ -15,7 +15,7 @@
 //!
 //! **The directory.** Which pages a family's coordinates lie in ([`Directory`]): rebuilt from the page pieces a
 //! recovered image carries, a coordinate in no page found the largest aligned page its neighbours leave it
-//! ([`Directory::page_of`]). A delta re-encodes only the pages its changes lie in ([`Directory::plan_dirty`]); a
+//! ([`Directory::page_of`]). A delta re-encodes only the pages its changes lie in ([`Encoder::dirty_marks`]); a
 //! checkpoint plans every page afresh ([`plan`]).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -664,14 +664,6 @@ impl Directory {
       self.pages.insert(page.start, page.depth);
     }
   }
-
-  /// The pages `coordinates` lie in, each once ([`Directory::page_of`]): what a delta re-encodes.
-  pub(crate) fn plan_dirty(&self, coordinates: impl IntoIterator<Item = u64>) -> BTreeSet<Page> {
-    coordinates
-      .into_iter()
-      .map(|coordinate| self.page_of(coordinate))
-      .collect()
-  }
 }
 
 /// Every family's [`Directory`], the shard image's paged families as published.
@@ -765,8 +757,12 @@ struct Cut {
 /// What a turn of the encoder did: the bytes it encoded, and whether the cut in flight is wholly encoded after it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Turned {
-  /// The bytes spent: encoded, and read by a split ([`Encoder::split_at_stop`]).
+  /// The bytes spent: encoded, read by a split ([`Encoder::split_at_stop`]), and copied from committed pieces
+  /// ([`Turned::copied`]).
   pub(crate) bytes: u64,
+  /// Of the bytes spent, those copied from committed pieces into the pages appended to, cut or split from them, encoding
+  /// none of them (A-930): what a publication's page costs past what it encodes.
+  pub(crate) copied: u64,
   /// Whether the cut in flight is wholly encoded, or none is and nothing is dirty: a publication carries it.
   pub(crate) caught_up: bool,
   /// Whether the turn ran while paused.
@@ -916,6 +912,7 @@ impl Encoder {
     let mut held = core::mem::take(&mut self.scratch);
     let mut capped_most = held.capacity();
     let mut allocated = 0usize;
+    let mut copied = 0usize;
     let mut read = |held: &mut Vec<Entry>, family: Family, range: (u64, u64), cap: usize| {
       held.clear();
       let capacity = held.capacity();
@@ -939,6 +936,7 @@ impl Encoder {
         )
       {
         spent = spent.saturating_add(len);
+        copied = copied.saturating_add(len.saturating_sub(appended));
         tally(&mut by_family, family, appended);
         if self.dirtied_paused.remove(&(family, page)) {
           imposed = imposed.saturating_add(appended);
@@ -979,6 +977,7 @@ impl Encoder {
     self.scratch = held;
     Turned {
       bytes: u64::try_from(spent).unwrap_or(u64::MAX),
+      copied: u64::try_from(copied).unwrap_or(u64::MAX),
       caught_up: self.complete(),
       paused,
       imposed: u64::try_from(imposed).unwrap_or(u64::MAX),
@@ -1686,6 +1685,7 @@ mod tests {
       crate::content_holder::held_committed(state, crate::content_holder::whole_of(&image), true);
       crate::content_holder::image_committed(state, carried);
       let encoded_before = counted(state);
+      let work = image_work(state);
       let before = family_bytes(&crate::content_holder::held_image(state), Family::Windows);
       for id in ids.iter().step_by(KEPT / LET_GO) {
         crate::vcs_store::within_budget(state, 0, |stores| {
@@ -1719,6 +1719,7 @@ mod tests {
         );
       }
       let after = family_bytes(&image, Family::Windows);
+      print_image_work("windows", state, work);
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
       (
         counted(state).saturating_sub(encoded_before),
@@ -1994,6 +1995,33 @@ mod tests {
   /// Publishes the shard's image as a delta after encoding its cut to the end, and commits it, as the shard's
   /// publication does once its catch-up ends.
   fn publish_up(state: &mut crate::state::ShardState) {
+    publish_up_counted(state);
+  }
+
+  /// The encoder's work as the shard counts it: bytes encoded (with splits' reads), copied from committed pieces, its
+  /// cuts and its turns.
+  fn image_work(state: &crate::state::ShardState) -> [u64; 4] {
+    [
+      crate::content_holder::IMAGE_ENCODED_BYTES,
+      crate::content_holder::IMAGE_COPIED_BYTES,
+      crate::content_holder::IMAGE_CUTS,
+      crate::content_holder::IMAGE_TURNS,
+    ]
+    .map(|name| state.refusals.get(name).copied().unwrap_or(0))
+  }
+
+  /// Prints the encoder's work since `before` ([`image_work`]), as `test` ran it.
+  fn print_image_work(test: &str, state: &crate::state::ShardState, before: [u64; 4]) {
+    let now = image_work(state);
+    let [encoded, copied, cuts, turns] = [0, 1, 2, 3].map(|at| now[at].saturating_sub(before[at]));
+    println!(
+      "{test}: the encoder encoded {encoded} bytes in all and copied {copied} from committed pieces, over {cuts} cuts \
+       and {turns} turns"
+    );
+  }
+
+  /// [`publish_up`]'s body.
+  fn publish_up_counted(state: &mut crate::state::ShardState) {
     crate::content_holder::image_drain(state);
     while !crate::content_holder::image_turn(state).caught_up {}
     let changes = crate::content_holder::held_changes_carried(state);
@@ -2029,6 +2057,7 @@ mod tests {
       crate::content_holder::held_committed(state, crate::content_holder::whole_of(&image), true);
       crate::content_holder::image_committed(state, carried);
       let held = crate::content_holder::held_image(state);
+      let work = image_work(state);
       let before = (
         counted(state),
         family_bytes(&held, Family::Aways),
@@ -2064,6 +2093,7 @@ mod tests {
       }
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
       let pages = (before.2, family_pages(&image, Family::Aways));
+      print_image_work("aways", state, work);
       (
         counted(state).saturating_sub(before.0),
         after.saturating_sub(before.1),
@@ -2557,6 +2587,11 @@ mod tests {
       let counted = |state: &crate::state::ShardState, name: &str| {
         state.refusals.get(name).copied().unwrap_or(0)
       };
+      // A turn spends what it encodes and what it copies from committed pieces (A-930), counted apart.
+      let spent_by = |state: &crate::state::ShardState| {
+        counted(state, crate::content_holder::IMAGE_ENCODED_BYTES)
+          + counted(state, crate::content_holder::IMAGE_COPIED_BYTES)
+      };
       let ids = put_objects(state, (0, ENTRIES));
       while !crate::content_holder::image_turn(state).caught_up {}
       crate::verbs::publish_shard(state).unwrap();
@@ -2565,12 +2600,12 @@ mod tests {
       crate::verbs::publish_shard(state).unwrap();
       let slice = state.config.copy_slice_bytes();
       let turns = counted(state, crate::content_holder::IMAGE_TURNS);
-      let spent = counted(state, crate::content_holder::IMAGE_ENCODED_BYTES);
+      let spent = spent_by(state);
       let ended = crate::content_holder::image_catch_up_slice(state);
       let outcome = (
         slice,
         counted(state, crate::content_holder::IMAGE_TURNS) - turns,
-        counted(state, crate::content_holder::IMAGE_ENCODED_BYTES) - spent,
+        spent_by(state) - spent,
         ended,
       );
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));

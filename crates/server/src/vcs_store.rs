@@ -4761,43 +4761,62 @@ pub(crate) async fn homed_run_on_store(
   id: RepositoryId,
   homed: slates_hg::import::record::HomedRun,
 ) -> Option<(Vec<u64>, u64)> {
-  use slates_store::log::SectionKind;
-  let list = match keyed_bytes(disk, homed.list, homed.len).await {
-    Some(bytes) => bytes,
-    None => {
-      let bytes = fetched(homed.list).await?;
-      landed_verbatim(
-        disk,
-        (id, homed.sequence),
-        vec![(SectionKind::Record, bytes.clone())],
-      )
-      .await?;
-      bytes
-    }
-  };
+  let list = segment_list_on_store(disk, id, &homed).await?;
   let entries = slates_hg::import::record::segment_list_of(&list)?;
-  let repository = u128::from_be_bytes(id.bytes);
   for entry in &entries {
-    let held = segment_record(disk, repository, entry.sequence)
-      .await
-      .is_some_and(|record| blake3::hash(&record).as_bytes() == &entry.record.0);
-    if held {
-      continue;
-    }
-    let mut parts = Vec::new();
-    for (kind, (identity, _)) in [
-      (SectionKind::Record, entry.record),
-      (SectionKind::Payload, entry.payload),
-      (SectionKind::Texts, entry.texts),
-    ] {
-      parts.push((kind, fetched(identity).await?));
-    }
-    landed_verbatim(disk, (id, entry.sequence), parts).await?;
+    segment_on_store(disk, id, entry).await?;
   }
   Some((
     entries.iter().map(|entry| entry.sequence).collect(),
     homed.sequence,
   ))
+}
+
+/// [`homed_run_on_store`]'s segment list: where `disk` holds it by its identity, else read from its region homes and
+/// landed verbatim at the run's sequence. None where it could not be had, counted.
+async fn segment_list_on_store(
+  disk: &slates_store::owner::StoreHandle,
+  id: RepositoryId,
+  homed: &slates_hg::import::record::HomedRun,
+) -> Option<Vec<u8>> {
+  if let Some(bytes) = keyed_bytes(disk, homed.list, homed.len).await {
+    return Some(bytes);
+  }
+  let bytes = fetched(homed.list).await?;
+  landed_verbatim(
+    disk,
+    (id, homed.sequence),
+    vec![(slates_store::log::SectionKind::Record, bytes.clone())],
+  )
+  .await?;
+  Some(bytes)
+}
+
+/// [`homed_run_on_store`]'s segment `entry`: kept where `disk` holds it at its sequence by its `Record`'s identity, else
+/// each of its three sections read from their region homes by identity and landed verbatim at the owner's sequence.
+/// None where any of it could not be had, counted.
+async fn segment_on_store(
+  disk: &slates_store::owner::StoreHandle,
+  id: RepositoryId,
+  entry: &slates_hg::import::record::SegmentEntry,
+) -> Option<()> {
+  use slates_store::log::SectionKind;
+  let repository = u128::from_be_bytes(id.bytes);
+  let held = segment_record(disk, repository, entry.sequence)
+    .await
+    .is_some_and(|record| blake3::hash(&record).as_bytes() == &entry.record.0);
+  if held {
+    return Some(());
+  }
+  let mut parts = Vec::new();
+  for (kind, (identity, _)) in [
+    (SectionKind::Record, entry.record),
+    (SectionKind::Payload, entry.payload),
+    (SectionKind::Texts, entry.texts),
+  ] {
+    parts.push((kind, fetched(identity).await?));
+  }
+  landed_verbatim(disk, (id, entry.sequence), parts).await
 }
 
 /// The object `identity` read from its region homes ([`homes::read_in_region`]) from this shard; none where no home

@@ -838,8 +838,11 @@
 > itself since 13b; the publication is one whole step (8.8 ms debug, owed turns if release finds it past the bar), and
 > the record's inline chain entry (430,978 bytes) was to be next, (a). Measured and rejected: the log's write of it was 0.32
 > ms of the op's 4.29 (debug), and the cost was the identity's hash of the whole op (4.92 ms), which hashes each entry as
-> its digest since 13c. The log write's about 48 bytes a path stays, for a wider probe to judge. Next: copy's release
-> unit (kernel time), then move's `stage.committing` and `landing.apply`. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
+> its digest since 13c. The log write's about 48 bytes a path stays, for a wider probe to judge. Release probe 17's
+> move leader was the test's own setup (the simulated host's copy of the dump), which now holds the dump moved in, never copied; the
+> product's create and begin print apart (`SETUP`). Next: copy's release unit (an allocator's batch of freed pages
+> returned in one free, 1.2-1.3 ms of system time in release), to a reaper thread by main's ruling, then move's
+> `stage.committing` and `landing.apply`. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
@@ -2504,8 +2507,18 @@
 > `_bound_bytes`, `_walks`, `_walk_bytes`; `owner::text_cache_seen`, carried on each read's timing). The lead,
 > shown by `the_owners_text_cache_is_seen_by_its_asker_and_a_read_left_partway_holds_its_bound`: a read left part-way
 > stays a walk in flight and holds the bound (3 reads of 300 KB left: 3 walks, 921,600 bytes walked, bound 2 MiB) until
-> it ends or more walks than the owner's room evict it. OWED: main's next 57k run reads the gauges; if the walks hold
-> the 32 MB, a walk left part-way is ended by its reader's handle as it drops (main's ruling (b)). The clone's scans of
+> it ends or more walks than the owner's room evict it. Main's 57k reruns read the gauges: reserved and bound 1 MiB,
+> walks 0, so no walk held it. Main's rerun at c207c9f81, with symbols, named the holder: 35,951,082 bytes live under
+> `make_chain`'s keep (`texts.rs:1607`) and 10,827,585 in the texts map's growth, the same after the push, at the
+> clone's peak and as it ended. It was the cache's index. Its bound counted the texts' bytes alone, so a chunk took as
+> many tiny texts as fit, and every read of a text in an older chunk added an order entry until that chunk went; the map
+> and the queue kept the capacity they grew to. Fixed (w-perf, 2026-11-27): each text laid costs its chunk an index
+> entry's bytes beside its own (`INDEX_ENTRY_BYTES`, derived from the entries' types), so a chunk of tiny texts fills
+> and goes with its entries; the index shrinks to a doubling past what it holds when it stands two doublings past it
+> (`INDEX_SLACK`); and its bytes are a gauge (`mem.gauge.store.text_cache_index_bytes`). Red:
+> `a_cache_of_tiny_texts_holds_its_index_within_its_bound`, 100,000 texts of 8 B read twice through an owner's cache:
+> the live heap grew 12,304,632 bytes against its 1 MiB bound; now 131,872 (index 46,016). OWED: main's next 57k run for
+> the after. Main's ruling (b) (a walk ended by its reader's handle as it drops) stays owed on its own. The clone's scans of
 > the store's rows (hg's 57k at 35b155312: 2.08 GB of 3.72, `reserve` under mantle's `scan_inner`, 55.8%) laid each page
 > in buffers their caller made afresh, and an ask by tool id kept a set of the asks, a map of the found and two copies
 > of each row's id: the store now keeps one scan's buffers (`Store::scan_rows`), and the ask writes each version into

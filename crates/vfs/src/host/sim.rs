@@ -361,7 +361,7 @@ impl SimHost {
       .collect();
     for edit in due {
       let done = match edit {
-        Interference::Replace { path, bytes } => self.replace_file_reporting(&path, &bytes),
+        Interference::Replace { path, bytes } => self.replace_file_reporting(&path, bytes),
       };
       self.interfered.push(done);
     }
@@ -643,18 +643,26 @@ impl SimHost {
 
   /// Creates or replaces a file with a new inode (what an editor's save-by-rename does).
   pub fn replace_file(&mut self, path: &str, bytes: &[u8]) {
+    self.replace_file_reporting(path, bytes.to_vec());
+  }
+
+  /// [`SimHost::replace_file`] with bytes the caller hands over, held as they are, never copied: a fixture of many
+  /// megabytes costs the host nothing to hold, so a measurement over it measures the product, not the oracle (CLAUDE.md's
+  /// land oracle gotcha; A-920: the copy of a 10.5 MB dump was 1.49 ms of a wide import's first poll, debug, 1.23 of it
+  /// system time faulting the copy's pages in).
+  pub fn replace_file_owned(&mut self, path: &str, bytes: Vec<u8>) {
     self.replace_file_reporting(path, bytes);
   }
 
   /// [`SimHost::replace_file`], saying which inode it created and which it displaced.
-  fn replace_file_reporting(&mut self, path: &str, bytes: &[u8]) -> Interfered {
+  fn replace_file_reporting(&mut self, path: &str, bytes: Vec<u8>) -> Interfered {
     let parts = Self::split(path);
     let (name, parent) = parts
       .split_last()
       .map(|(n, p)| (n.clone(), p.to_vec()))
       .unwrap_or_default();
     let mut node = self.fresh(HostKind::File);
-    node.bytes = bytes.to_vec();
+    node.bytes = bytes;
     let mut done = Interfered {
       created: node.ino,
       displaced: None,
