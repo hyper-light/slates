@@ -480,13 +480,14 @@ impl Drop for BroughtBases {
 
 /// A text's identity in hex, as a refusal names it.
 fn hex_of(identity: &[u8; 32]) -> String {
-  identity
-    .iter()
-    .fold(String::with_capacity(64), |mut out, byte| {
+  identity.iter().fold(
+    String::with_capacity(identity.len().saturating_mul(2)),
+    |mut out, byte| {
       use core::fmt::Write as _;
       let _ = write!(out, "{byte:02x}");
       out
-    })
+    },
+  )
 }
 
 /// Holds repository `id`'s records as `state` holds them now ([`SvnHold`]); none when they are not lent here or an import
