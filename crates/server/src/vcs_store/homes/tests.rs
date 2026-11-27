@@ -634,6 +634,8 @@ fn a_committed_publication_publishes_the_tickets_of_windows_kept_before_it() {
       !published_here(first.generation),
       "a publication that carried an older cut published the ticket"
     );
+    // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+    state.image_encoder.ask();
     while !crate::content_holder::image_turn(state).caught_up {}
     crate::content_holder::image_committed(state, true);
     assert!(
@@ -1030,6 +1032,8 @@ fn a_region_holds_owners_ride_the_image_and_the_ownerless_kind_is_refused() {
       super::keep_for_region(state, b"an object held for two owners", &owners).unwrap();
     // The paged families copy the encoder's cut (A-870 piece 2): turned to its end first.
     crate::content_holder::image_drain(state);
+    // A cut asked for, as a ticket's wait asks (A-930's cadence defers one nobody waits on).
+    state.image_encoder.ask();
     while !crate::content_holder::image_turn(state).caught_up {}
     let image = crate::content_holder::held_image(state);
     let held = crate::content_holder::split_held(&image).map(|held| held.region_holds);

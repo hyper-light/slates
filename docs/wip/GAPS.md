@@ -535,7 +535,12 @@
 > 2,588,710 bytes of the family (600 times a 4,314.5-byte tail) for 46,275 appended; now 46,300. Part 2: a window let
 > go is a cut of its committed piece (the windows family was 21,192,055 bytes, 28.5%): 60 let-goes over 300 kept
 > windows, a publication each, encoded 266,160 bytes of the family; now 0. OWED: main's in-place 57k rerun for the
-> after, with its publication count and page.
+> after, with its publication count and page. Part 3, the cadence (main's ruling (ii) of 2026-11-27): a cut nobody
+> waits on begins once the bytes changed since the last, with the frees the arena holds for the committed cut, come to
+> its cost; a ticket's wait and the shard's idle ask for one. Reds: 300 let-goes published one at a time began 300
+> cuts copying and encoding 2,804,085 bytes, now 2 cuts and 161,862; 40 granule let-goes with no ticket held 163,840
+> freed bytes against a cut costing 26,885 without the held term, now at most 24,576 while deferred. OWED: main's 57k
+> rerun at the tip (cuts, copied bytes, `held_deferred_peak_bytes`, wall time).
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
