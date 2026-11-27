@@ -66049,7 +66049,7 @@ Applied in the same change to:
   - A-878's entry, its bug record, GAPS, and
     docs/bugs/2026-11-27-an-anchors-held-sockets-reached-every-child-of-their-holders-process.md.
 
-### A-921 part 5 — A restarted node announces its new process to each peer on its own task, so a peer that died meanwhile holds no other peer's re-key (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 03:33 and 03:38; A-921's next mode)
+### A-921 part 5 — A restarted node announces its new process and its edges to each peer on its own task, so a peer that died meanwhile holds neither the others' re-key nor its member loop (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 03:33 and 03:38; A-921's next mode)
 
 - **Why.** In 3 of 10 owner-restart scenes, a survivor adopted a's green when the first candidate died, though a was
   alive and its fencing epoch never moved. The mode was diagnosed with read-only observations.
@@ -66060,32 +66060,55 @@ Applied in the same change to:
     `fleet.plane.epoch_unanswered` 1). That held every other peer's re-key for the whole exchange budget.
   - Meanwhile the survivors still held a under its old process's keys. They probed it, got no answer, and condemned it
     beside the stopped candidate: two deaths at `f = 1`.
-- **The rule.** The member loop's announcement pass (`member_task::announce_epochs`) spawns each owed member's
-  announcement as its own task, a child of the loop (`futures::spawn_child`). Each task borrows only that member's
-  session and returns it when its exchange ends.
+- **The second stall.** With the epoch pass fixed, A919's scene still met the mode 1 run in 5. Read at the stop and at
+  the end: every survivor still held a under its old process at the stop, and re-keyed it later. No survivor's
+  detector had condemned a by its own probes; the takeover installed a's death from its silence, 1.46 to 1.7 s from
+  its last answer. The member loop also sends this node's edges record (A-925, `edges::announce_edges`) to each peer
+  in turn and awaited it. A restarted node owes its edges to every peer on its new sessions. Its record to the peer
+  that died just then held the member loop for the exchange budget (about 1.2 s, past a's 1 s detection), and again
+  each turn as the lost exchange is owed again. Meanwhile a answered no probe and refuted nothing.
+- **The rule.** Both of the member loop's announcement passes, its epochs (`member_task::announce_epochs`) and its
+  edges (`edges::announce_edges`), spawn each owed member's announcement as its own task, a child of the loop
+  (`futures::spawn_child`). Each task borrows only that member's session and returns it when its exchange ends.
   - The loop does not wait on these tasks. It keeps stepping the detector and answering probes, and it joins each task
-    on the turn after the task records its end (`PlaneState::announce_done`), so the task's slot is released.
-  - The tasks are bounded at one per member. A member in flight has its session lent, so the pass owes it nothing
-    more. The loop's own end cancels and joins any task still running, so none is orphaned.
-  - At most one task per anchor is in flight. A canonical announcement reads the anchor's last epoch and records the
-    next one once answered. Two at once (the session under the anchor's seed id and the one under its learned id) would
-    both name the same epoch.
-  - A task the runtime refuses runs inline, as the pass did before, counted `fleet.plane.announce_inline`.
+    on the turn after the task records its end (`PlaneState::announce_done`, `Edges::announce_done`), so the task's
+    slot is released.
+  - The tasks are bounded at one per member and pass. A member in flight has its session lent, so the pass owes it
+    nothing more. The loop's own end cancels and joins any task still running, so none is orphaned.
+  - Of the epoch pass, at most one task per anchor is in flight. A canonical announcement reads the anchor's last
+    epoch and records the next one once answered. Two at once (the session under the anchor's seed id and the one
+    under its learned id) would both name the same epoch.
+  - A task the runtime refuses runs inline, as the pass did before, counted `fleet.plane.announce_inline` or
+    `fleet.edges.announce_inline`.
   - main's 03:38 ruling offered two ways: settle only once every peer re-keyed, or announce at once to every peer.
     This is the second. A peer's re-key no longer depends on any other peer's answer, so the first is not needed.
+- **Keyed under which process.** Each side now records the process nonce of the peer its installed epoch was agreed
+  with (`PlaneState::keyed_process`): the acceptor from the announcement, the dialer from the answer. It is bounded as
+  `keyed` is. It is what tells a peer re-keyed under a restarted process from one still on the old keys: `keyed` alone
+  stays set across the redial.
 - **Observability.** The per-peer route record used in the diagnosis (direct and indirect answers by relay) does not
   land. Its acknowledgement path would grow entries for any sender, not only the view, and main's 03:33 note asked for
-  counters, not a new interface. The new counter is `fleet.plane.announce_inline`. The others already existed:
-  `fleet.plane.announcements_sent`, `fleet.plane.announce_lends`, `fleet.plane.epoch_unanswered`.
-- **Tests.**
-  - Fleet `a921_a_warm_restarted_node_is_heard_under_its_new_process_within_a_detection` (red first). The peer a
-    announces to first answers no epoch announcement (`Daemon::inject_epoch_withhold`, a test hook as
-    `inject_live_state_withhold` is), and a restarts warm. Each other peer must hold a under its new process (keyed,
-    joined, and a's announced process nonce, `Daemon::member_keying`) within a's own detection term
-    (`Daemon::failover_detection_ns`, 1 s), measured on the wall clock. Before: 3 of 3 red, heard at 4.4 to 7.6 s.
-    After: heard at 22 to 197 ms over two runs.
-  - The owed-part scene and A919's owner-restart scene no longer guard against the adoption (`adopted_elsewhere_of` is
-    removed). A919's test is no longer ignored. After the fix, 4 runs of each formed no scene afresh.
-- **Applied in the same change to:** `crates/server/src/{member_task,fleet,state,daemon}.rs`,
+  counters, not a new interface. The new counters are the two `announce_inline`. The others already existed:
+  `fleet.plane.announcements_sent`, `fleet.plane.announce_lends`, `fleet.plane.epoch_unanswered`, `fleet.edges.sent`.
+- **Tests.** One test hook: a node withholds its answer to a peer member loop's epoch or edges announcement, or both
+  (`Daemon::inject_member_exchange_withhold`), as `inject_live_state_withhold` does for its kind. Each fleet red runs on
+  a four-node `f = 1` anchored git fleet and judges on the wall clock against the restarted node's own detection term
+  (`Daemon::failover_detection_ns`, 1 s).
+  - `a921_a_warm_restarted_node_is_heard_under_its_new_process_within_a_detection` (red first). The peer a announces
+    to first withholds epochs, and a restarts warm. Each other peer must re-key a within the detection: joined, keyed,
+    and the epoch agreed with a's new process (`Daemon::member_keying`). Before: 3 of 3 red, at 4.4 to 7.6 s. After:
+    22 to 197 ms.
+  - `a921_a_warm_restarted_highest_anchor_is_rekeyed_by_its_dialers_within_a_detection`: the other orientation. The
+    node with the highest anchor restarts, so every peer is its pair's dialer and must redial and announce. 54 to 246
+    ms. It met no red: the slow re-key it was written for was the edges stall.
+  - `a921_a_warm_restarted_node_answers_its_peers_while_a_silent_one_holds_its_announcements` (red first). The silent
+    peer withholds edges only: withholding epochs too, it would never key a and would gossip its own suspicion of it.
+    No other node may hold a dead, or move its fencing epoch, for [`DOUBT_WINDOW_DETECTIONS`] (4) detections. A
+    suspicion is no fault there: a peer's probe under a's old keys goes unanswered until it re-keys a, and a refutes it.
+    With the edges pass in turn: 3 of 3 red (a held dead 119 to 410 ms after the settle). After: 4 of 4 green.
+  - The owed-part scene and A919's owner-restart scene no longer guard against the adoption (`adopted_elsewhere_of`
+    and `Daemon::holder_owner` are removed), and A919's test is no longer ignored. Both, after both fixes: 6 runs each,
+    none formed afresh, none failed.
+- **Applied in the same change to:** `crates/server/src/{member_task,edges,fleet,state,daemon}.rs`,
   `crates/cluster/src/member_plane.rs` (`MemberPlane::is_joined`), `crates/server/tests/fleet.rs`, A-921 part 4's
   entry, GAPS.

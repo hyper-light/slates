@@ -37958,7 +37958,8 @@ fn a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_th
 /// A-921 part 5 (main 01a20182's rulings of 2026-11-27): about 3 scenes in 10 before, a survivor adopted a's green with
 /// the first candidate's death though a lived: a's new process announced itself to each peer in turn, the stopped one
 /// first, and every other peer probed a under its old keys and condemned it beside the stopped one. a now announces to
-/// each peer on its own task, so no scene is guarded against that adoption, and the test runs again.
+/// each peer on its own task, and sends its edges record so too (1 run in 5 met that pass's stall once the first was
+/// fixed), so no scene is guarded against that adoption, and the test runs again.
 #[test]
 fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins() {
   let _serial = serialize_fleet_tests();
@@ -38210,81 +38211,199 @@ const PARTS_BEFORE_THE_HOLD: usize = 2;
 /// A-921 part 5 (main 01a20182's rulings of 2026-11-27: a restarted node is not settled until every peer holds it
 /// under its new process). Do: on a four-node `f = 1` anchored git fleet, make the peer a's new process announces itself
 /// to first (the smallest member id, a's record sessions' order) take a's session and answer no epoch announcement
-/// (`Daemon::inject_epoch_withhold`), as a peer that died just then does; restart a warm; once `restart_warm` reports it
-/// settled, watch each other node for as long as a's own detection term states (`Daemon::failover_detection_ns`: how
-/// long its peers take to condemn it). Expect each other node but the silent one to hold a under its new process (the
-/// process nonce a announced to it is a's own now, a keyed by an installed epoch and joined to its detector) within that
-/// detection: past it, a probe under a's old keys goes unanswered and a peer's detector may condemn a live member. Red before: a's announcements waited in turn, each behind the last, so the silent peer's unanswered one held
-/// every other peer's re-key for its whole exchange budget, and a peer's death in that gap retired a beside it
-/// (A-921 part 5; 3 scenes in 10: a's `epoch_unanswered` 1, no survivor re-keyed until a was readmitted).
+/// (`Daemon::inject_member_exchange_withhold`), as a peer that died just then does; restart a warm. Expect each other
+/// node but the silent one to have re-keyed a within a's detection of the settle ([`rekeyed_after_warm_restart`]). Red before:
+/// a's announcements waited in turn, each behind the last, so the silent peer's unanswered one held every other peer's
+/// re-key for its whole exchange budget (4.4 to 7.6 s), and a peer's death in that gap retired a beside it (3 owner-
+/// restart scenes in 10: a's `epoch_unanswered` 1, no survivor re-keyed until a was readmitted).
 #[test]
 fn a921_a_warm_restarted_node_is_heard_under_its_new_process_within_a_detection() {
   let _serial = serialize_fleet_tests();
   let mut fleet = anchored_git_fleet_of("rekeyed", &["a", "b", "c", "d"]);
+  let silent = (1..fleet.hosts.len())
+    .min_by_key(|node| fleet.hosts[*node].0)
+    .expect("a peer");
+  fleet.daemons[silent]
+    .inject_member_exchange_withhold(true, false)
+    .unwrap();
+  let watched = rekeyed_after_warm_restart(&mut fleet, 0, Some(silent));
+  let _ = fleet.daemons[silent].inject_member_exchange_withhold(false, false);
+  fleet.stop();
+  watched.assert_within("rekeyed");
+}
+
+/// A-921 part 5, the other orientation (found by A919's scene once the first was fixed, 1 run in 5). Do: on a four-node
+/// `f = 1` anchored git fleet, restart warm the node with the highest anchor, so every peer is its pair's canonical
+/// dialer: the restarted node announces only its identity, and each peer, finding a new process, drops the session it
+/// dialed, dials afresh and announces the pair's next epoch. Expect every other node to have re-keyed it within its
+/// detection of the settle ([`rekeyed_after_warm_restart`]). Red before: no peer held it under its new process at the
+/// settle, and a peer's death then retired it beside the dead one, its silence 1.46 to 1.7 s from its last answer.
+#[test]
+fn a921_a_warm_restarted_highest_anchor_is_rekeyed_by_its_dialers_within_a_detection() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = anchored_git_fleet_of("rekeyed-high", &["a", "b", "c", "d"]);
+  let highest = (0..fleet.daemons.len())
+    .max_by_key(|node| fleet.daemons[*node].anchor().unwrap_or(0))
+    .expect("a node");
+  let watched = rekeyed_after_warm_restart(&mut fleet, highest, None);
+  fleet.stop();
+  watched.assert_within("rekeyed-high");
+}
+
+/// A-921 part 5, the member loop's edges pass (A-925; found by A919's owner-restart scene, 1 run in 5, once the epoch
+/// pass was fixed). Do: on a four-node `f = 1` anchored git fleet, make the peer with the smallest member id take a's
+/// sessions and answer none of a's edges announcements (`Daemon::inject_member_exchange_withhold`), as a peer that died
+/// just then does; restart a warm; watch every other node for [`DOUBT_WINDOW_DETECTIONS`] of a's own detection terms. Expect none to condemn a in
+/// that time: its detector never holds a dead, and a's fencing epoch there never moves. A suspicion is no doubt here: a
+/// peer's probe under a's old keys goes unanswered until it re-keys a, and a refutes it. Red before: the member loop
+/// sent its edges record to each peer in turn and awaited it, so a's record to the silent peer held a's loop for the
+/// whole exchange budget (about 1.2 s, past its 1 s detection) and again each turn, a refuted nothing and answered no
+/// probe meanwhile, and its peers
+/// condemned it beside a peer that died then (a's silence 1.46 to 1.7 s at the takeover).
+#[test]
+fn a921_a_warm_restarted_node_answers_its_peers_while_a_silent_one_holds_its_announcements() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = anchored_git_fleet_of("unheld", &["a", "b", "c", "d"]);
   let a = fleet.hosts[0];
   let silent = (1..fleet.hosts.len())
     .min_by_key(|node| fleet.hosts[*node].0)
     .expect("a peer");
-  fleet.daemons[silent].inject_epoch_withhold(true).unwrap();
+  let watched: Vec<(usize, Option<u64>)> = (1..fleet.daemons.len())
+    .filter(|at| *at != silent)
+    .map(|at| (at, fencing_epoch_of(&fleet.daemons[at], a)))
+    .collect();
+  // Its edges alone: holding its epoch too, it would never key a, condemn it, and gossip the death, as a dead peer does
+  // not.
+  fleet.daemons[silent]
+    .inject_member_exchange_withhold(false, true)
+    .unwrap();
   let restarted = fleet.restart_warm(0);
-  let settled = Instant::now();
-  let process = fleet.daemons[0].member_process_nonce().ok();
-  // How long the other nodes take to condemn a dead a: a's own detection term (`Daemon::failover_detection_ns`, SWIM's
-  // count of its detector's periods at their measured tail).
   let detection = fleet.daemons[0]
     .failover_detection_ns()
     .ok()
     .flatten()
     .unwrap_or(HEARTBEAT_NS);
-  let mut heard_at: Vec<Option<u128>> = vec![None; fleet.daemons.len().saturating_sub(1)];
+  let window = Duration::from_nanos(detection.saturating_mul(DOUBT_WINDOW_DETECTIONS));
+  let started = Instant::now();
+  let mut condemned: Vec<(usize, u128, String)> = Vec::new();
   let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
-  let _ = poll_until(&observed, Duration::from_nanos(detection), || {
-    for (at, daemon) in fleet.daemons[1..].iter().enumerate() {
-      if heard_at.get(at).is_some_and(Option::is_some) || at.saturating_add(1) == silent {
-        continue;
-      }
-      let new_process = daemon
-        .member_keying(a)
-        .is_ok_and(|(joined, keyed, announced, _)| {
-          joined && keyed == Some(true) && announced.is_some() && announced == process
-        });
-      if new_process && let Some(slot) = heard_at.get_mut(at) {
-        *slot = Some(settled.elapsed().as_millis());
+  // Watched for the whole window on the wall's clock; the watch's own deadline, in fleet periods, is twice it.
+  let _ = poll_until(&observed, window.saturating_mul(2), || {
+    for (at, before) in &watched {
+      // Each node's first condemnation, kept.
+      if let Some(seen) = condemnation_of(&fleet.daemons[*at], a, *before)
+        && condemned.iter().all(|(node, ..)| node != at)
+      {
+        condemned.push((*at, started.elapsed().as_millis(), seen));
       }
     }
-    Ok(
-      heard_at
-        .iter()
-        .enumerate()
-        .all(|(at, heard)| heard.is_some() || at.saturating_add(1) == silent),
-    )
+    Ok(started.elapsed() >= window)
   });
   drop(observed);
-  let _ = fleet.daemons[silent].inject_epoch_withhold(false);
-  let unanswered = move_counter(&fleet.daemons[0], "fleet.plane.epoch_unanswered");
-  let keying: Vec<String> = fleet.daemons[1..]
-    .iter()
-    .map(|daemon| format!("{:?}", daemon.member_keying(a).ok()))
-    .collect();
+  let _ = fleet.daemons[silent].inject_member_exchange_withhold(false, false);
   fleet.stop();
   eprintln!(
-    "rekeyed: restarted {restarted}; the silent peer node {silent}; detection {detection} ns; each other node heard a \
-     under its new process at (ms after the settle) {heard_at:?}; keying {keying:?}, a's process {process:?}; a's \
-     unanswered announcements {unanswered:?}"
+    "unheld: restarted {restarted}; the silent peer node {silent}; detection {detection} ns; a's epoch before \
+     {watched:?}; condemned (node, ms after the settle, how) {condemned:?}"
   );
   assert!(restarted, "a restarted warm and settled");
-  // Within the detection on the wall's clock: the watch above is charged in fleet periods, which a loaded host runs late.
-  let within = |heard: &Option<u128>| {
-    heard.is_some_and(|ms| ms.saturating_mul(NANOS_PER_MILLI) <= u128::from(detection))
-  };
   assert!(
-    heard_at
-      .iter()
-      .enumerate()
-      .all(|(at, heard)| within(heard) || at.saturating_add(1) == silent),
-    "every other node but the silent one heard a under its new process within a detection ({detection} ns) of its \
-     settle: {heard_at:?} ms"
+    condemned.is_empty(),
+    "no other node condemned a within {DOUBT_WINDOW_DETECTIONS} detections of its settle: {condemned:?}"
   );
+}
+
+/// Shape: the detections [`a921_a_warm_restarted_node_answers_its_peers_while_a_silent_one_holds_its_announcements`]
+/// watches a for. The stall it would show is one exchange budget (about 1.2 s, past a 1 s detection), owed again and
+/// again each turn with one turn between, so a peer may still hear a refute in the gap: measured red 1 run in 2 within
+/// two detections.
+const DOUBT_WINDOW_DETECTIONS: u64 = 4;
+
+/// The fencing epoch `daemon` holds `member` at (`Daemon::council_host_standing`).
+fn fencing_epoch_of(daemon: &Daemon, member: HostId) -> Option<u64> {
+  daemon
+    .council_host_standing(member)
+    .ok()
+    .and_then(|(epoch, _)| epoch)
+}
+
+/// How `daemon` condemned `member`, if it did: its detector holds it dead, or its fencing epoch moved from `before`.
+fn condemnation_of(daemon: &Daemon, member: HostId, before: Option<u64>) -> Option<String> {
+  let held = daemon.fleet_plane_belief(member).ok().flatten();
+  let dead = held.is_some_and(|held| held.liveness == slates_cluster::membership::Liveness::Dead);
+  let epoch = fencing_epoch_of(daemon, member);
+  (dead || epoch != before).then(|| format!("held {held:?}, epoch {before:?} -> {epoch:?}"))
+}
+
+/// What [`rekeyed_after_warm_restart`] watched: whether the node restarted and settled, its detection term, and per
+/// other node (by index, the silent one left out) when it re-keyed the node, in ms after the settle.
+struct Rekeyed {
+  restarted: bool,
+  detection: u64,
+  heard_at: Vec<(usize, Option<u128>)>,
+}
+
+impl Rekeyed {
+  /// Asserts the node restarted and every watched node re-keyed it within its detection on the wall's clock: the watch
+  /// is charged in fleet periods, which a loaded host runs late.
+  fn assert_within(&self, scene: &str) {
+    let detection = u128::from(self.detection);
+    let within = |heard: &Option<u128>| {
+      heard.is_some_and(|ms| ms.saturating_mul(NANOS_PER_MILLI) <= detection)
+    };
+    eprintln!(
+      "{scene}: restarted {}; detection {} ns; each other node re-keyed it at (node, ms after the settle) {:?}",
+      self.restarted, self.detection, self.heard_at
+    );
+    assert!(self.restarted, "the node restarted warm and settled");
+    assert!(
+      self.heard_at.iter().all(|(_, heard)| within(heard)),
+      "every other node but a silent one re-keyed the node under its new process within a detection ({} ns) of its \
+       settle: {:?} ms",
+      self.detection,
+      self.heard_at
+    );
+  }
+}
+
+/// Restarts `node` warm and watches, for as long as its own detection term states (`Daemon::failover_detection_ns`: how
+/// long its peers take to condemn it), each other node but `silent` re-key it under its new process: joined to the
+/// detector, keyed by an installed epoch, and that epoch agreed with the new process (`Daemon::member_keying`). Past
+/// the detection a probe under the old keys goes unanswered, and a peer's detector may condemn a live member.
+fn rekeyed_after_warm_restart(fleet: &mut GitFleet, node: usize, silent: Option<usize>) -> Rekeyed {
+  let member = fleet.hosts[node];
+  let restarted = fleet.restart_warm(node);
+  let settled = Instant::now();
+  let process = fleet.daemons[node].member_process_nonce().ok();
+  let detection = fleet.daemons[node]
+    .failover_detection_ns()
+    .ok()
+    .flatten()
+    .unwrap_or(HEARTBEAT_NS);
+  let mut heard_at: Vec<(usize, Option<u128>)> = (0..fleet.daemons.len())
+    .filter(|at| *at != node && Some(*at) != silent)
+    .map(|at| (at, None))
+    .collect();
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let _ = poll_until(&observed, Duration::from_nanos(detection), || {
+    for (at, heard) in heard_at.iter_mut().filter(|(_, heard)| heard.is_none()) {
+      let rekeyed =
+        fleet.daemons[*at]
+          .member_keying(member)
+          .is_ok_and(|(joined, keyed, agreed)| {
+            joined && keyed == Some(true) && agreed.is_some() && agreed == process
+          });
+      if rekeyed {
+        *heard = Some(settled.elapsed().as_millis());
+      }
+    }
+    Ok(heard_at.iter().all(|(_, heard)| heard.is_some()))
+  });
+  Rekeyed {
+    restarted,
+    detection,
+    heard_at,
+  }
 }
 
 /// Format: nanoseconds in a millisecond, to compare a time recorded in milliseconds with one in nanoseconds.

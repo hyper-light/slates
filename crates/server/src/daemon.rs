@@ -2481,21 +2481,21 @@ impl Daemon {
     })
   }
 
-  /// Test support (A-921's next mode): how this node's membership plane holds `peer`: whether it is joined to the
-  /// detector, whether it is keyed by an installed epoch (and joined, as `PlaneState::keyed` says), the process nonce it
-  /// last announced itself with here, and the plane's datagrams refused queueing (no epoch for a peer, all peers). A
-  /// one-shot control-shard question.
+  /// Test support (A-921 part 5): how this node's membership plane holds `peer`: whether it is joined to the detector,
+  /// whether it is keyed by an installed epoch (and joined, as `PlaneState::keyed` says), and the process nonce of the
+  /// peer that epoch was agreed with (`PlaneState::keyed_process`). A one-shot control-shard question.
   pub fn member_keying(
     &self,
     peer: slates_db::HostId,
-  ) -> Result<(bool, Option<bool>, Option<u64>, u64), ObserveError> {
+  ) -> Result<(bool, Option<bool>, Option<u64>), ObserveError> {
     self.observe(self.shards.first().copied(), move |s| {
-      let plane = s.plane.plane.as_ref();
       (
-        plane.is_some_and(|plane| plane.is_joined(peer)),
+        s.plane
+          .plane
+          .as_ref()
+          .is_some_and(|plane| plane.is_joined(peer)),
         s.plane.keyed.get(&peer).copied(),
-        s.plane.announced_from.get(&peer).copied(),
-        plane.map_or(0, |plane| plane.counts().refused_queue),
+        s.plane.keyed_process.get(&peer).copied(),
       )
     })
   }
@@ -3881,14 +3881,27 @@ impl Daemon {
     )
   }
 
-  /// Test support (A-921's next mode): while `withhold`, this node's record serve side holds each plane epoch
-  /// announcement's answer after its request arrived, as a peer that took a restarted node's session and died before
-  /// answering does; every other stream and the probe plane answer as usual. On every shard, as
-  /// [`Self::inject_live_state_withhold`]; `Ok` once installed, else the typed refusal.
-  pub fn inject_epoch_withhold(&self, withhold: bool) -> Result<(), ObserveError> {
+  /// Test support (A-921 part 5): this node's record serve side holds the answer to each announcement of a peer's member
+  /// loop of the kinds named, its plane epoch (`epochs`) or its edges (`edges`), after its request arrived, as a peer
+  /// that took a restarted node's session and died before answering does; every other stream and the probe plane answer
+  /// as usual, and neither kind lifts every hold. On every shard, as [`Self::inject_live_state_withhold`]; `Ok` once
+  /// installed, else the typed refusal.
+  pub fn inject_member_exchange_withhold(
+    &self,
+    epochs: bool,
+    edges: bool,
+  ) -> Result<(), ObserveError> {
+    let withheld: std::collections::BTreeSet<u64> = [
+      (epochs, crate::member_task::PLANE_EPOCH_STREAM),
+      (edges, crate::edges::EDGES_STREAM),
+    ]
+    .into_iter()
+    .filter_map(|(held, stream)| held.then_some(stream))
+    .collect();
     for shard in self.shards.iter().copied() {
+      let withheld = withheld.clone();
       self.observe(Some(shard), move |s| {
-        s.plane_epoch_withhold_replies = withhold;
+        s.member_exchange_withheld = withheld;
       })?;
     }
     Ok(())
@@ -5805,7 +5818,7 @@ async fn init_shard(
     discovery_withhold_replies: false,
     shards_withhold_replies: false,
     live_state_withhold_replies: false,
-    plane_epoch_withhold_replies: false,
+    member_exchange_withheld: std::collections::BTreeSet::new(),
     peer_paths: std::collections::BTreeMap::new(),
     probe_windows: crate::fleet::ProbeWindows::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),

@@ -185,6 +185,10 @@ pub(crate) struct PlaneState {
   /// Per member, the process nonce it last announced itself with to this node: another one is a new process under the
   /// same id ([`note_reconnected`]). Bounded by the fleet's peer capacity.
   pub announced_from: BTreeMap<HostId, u64>,
+  /// Per member keyed here, the process nonce of the one its installed epoch was agreed with: the announcing dialer's,
+  /// or the answering acceptor's. A member whose process restarted is keyed again only once this names the new one
+  /// (A-921 part 5). Bounded as `keyed` is, by the members keyed.
+  pub keyed_process: BTreeMap<HostId, u64>,
   /// Members whose announcement task ([`announce_epochs`]) has ended, for the member loop to join on its next turn.
   /// Bounded by the loop's tasks in flight, one a member.
   pub announce_done: std::collections::BTreeSet<HostId>,
@@ -282,6 +286,10 @@ pub(crate) fn accept_announcement(
     return refuse(state, EPOCH_REFUSED_INSTALL);
   }
   state.plane.keyed.insert(announced.member, false);
+  state
+    .plane
+    .keyed_process
+    .insert(announced.member, announced.process);
   forget_address(state, anchor);
   answer.encode().to_vec()
 }
@@ -523,6 +531,10 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
     if matches!(installed, Some(Ok(()))) {
       state.plane.announced.insert(anchor, epoch);
       state.plane.keyed.insert(answer.member, false);
+      state
+        .plane
+        .keyed_process
+        .insert(answer.member, answer.process);
       forget_address(state, anchor);
     } else {
       crate::fleet::count_refusal_in(state, EPOCH_REFUSED);
@@ -958,10 +970,11 @@ pub(crate) async fn run(
   let (origin, shards) = state::with_state(|s| (s.shard, s.shards.clone())).unwrap_or_default();
   let mut buffer = vec![0u8; RECEIVE_BYTES];
   let mut announcing = BTreeMap::new();
+  let mut announcing_edges = BTreeMap::new();
   loop {
     announce_epochs(&mut announcing).await;
     // And this node's edges, once a session and again as they change (A-925).
-    crate::edges::announce_edges().await;
+    crate::edges::announce_edges(&mut announcing_edges).await;
     resolve_peers(resolver).await;
     join_addressable();
     let now = slates_machine::clock::monotonic_ns();
