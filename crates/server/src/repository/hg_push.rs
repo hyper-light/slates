@@ -3772,6 +3772,10 @@ pub(crate) const MOST_PREVIOUS_MANIFESTS_ASKED: &str = "vcs.hg.push_previous_man
 /// let go (goal 93, C1 (2): every other base is read from the fork's rows). Format: a counter name in the status report.
 pub(crate) const BASE_STORE_READS: &str = "vcs.hg.push_base_store_reads";
 
+/// Counter: of [`BASE_STORE_READS`], a base asked again because its windows went again after it was brought back,
+/// once a revision at most (main's once rule of 2026-11-27). Format: a counter name in the status report.
+pub(crate) const BASE_STORE_REASKED: &str = "vcs.hg.push_base_store_reasked";
+
 /// Counter: the most runs only a push's fork held where no merge was due (goal 93, the index seal's reland), the most of
 /// every push's: what a lookup of a new row walked past its parent's runs, within `slates_vcs::Index::tiered_due`'s
 /// bound of ⌊log₃(the fork's own tables' bytes ÷ the fewest a seal writes)⌋ + 1. Format: a counter name in the status
@@ -3790,6 +3794,7 @@ pub(crate) const TIERED_MERGES: &str = "vcs.hg.push_tiered_merges";
 /// kept ([`MOST_OWN_RUNS`], [`TIERED_MERGES`]).
 fn count_bases(state: &mut ShardState, intaken: &slates_hg::push::intake::Intaken) {
   state.count(BASE_STORE_READS, intaken.base_store_reads);
+  state.count(BASE_STORE_REASKED, intaken.base_store_reasked);
   state.count(LOG_TEXTS_ASKED, intaken.log_texts_asked);
   state.count(LOG_TEXTS_REASKED, intaken.log_texts_reasked);
   state.count_max(MOST_LOG_TEXTS_ASKED, intaken.log_texts_asked);

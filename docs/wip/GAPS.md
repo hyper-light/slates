@@ -2308,6 +2308,17 @@
 > logs, driven as the server drives it, the cut segments landed every 2, 3, 5, 8 and 16 steps: red, refused landing
 > every 2 steps after 3 asks and 96 steps; now every cadence taken, 79 to 119 asks, 6 to 41 asked again). OWED: whether
 > this race is also main's 57k hang (a stack of the hung build, main's).
+> Main's 57k intake hang found and fixed (2026-11-27, w-perf;
+> docs/bugs/2026-11-27-a-file-base-framed-without-its-let-go-block-was-asked-again-without-end.md): a file delta's base
+> whose metadata block its landing let go before the delta began was framed short (`ContentStore::windows` stops at a
+> window let go) and its bytes read at a length long by the block's, which every read refused; the bring-back restored
+> the windows but not the base captured at begin, so the intake asked the store two asks a slice without end. Now
+> `FileBase::stored` marks a base not whole, the step asks for it before reading any of it, the base is made again from
+> the fork after its bring-back, and a base is asked twice at most (a third refused `UnknownDeltaBase`), counted
+> `vcs.hg.push_base_store_reasked` beside `vcs.hg.push_base_store_reads`. Red:
+> `a_file_delta_on_a_base_whose_block_was_let_go_is_taken_after_its_base_is_brought_back` (still stepping at its derived
+> bound, 16 steps and 11 asks; now 12 steps and one ask). The manifests' race above was a sibling, not the hang. OWED:
+> main's 57k runs on the tip, the new counter moving in them.
 > C1 (2), second piece BUILT (main's ruling (B') of 2026-11-24): a push's manifest is taken a window a step and never
 > whole. Its text is made by `delta::Patching` over its base read front to back over its chain (`push::chain_read`, the
 > chain's deltas loaded: at most the base's length, A-729's bound); its lines checked and its written entries found as it

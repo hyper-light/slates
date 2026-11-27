@@ -45,11 +45,17 @@ pub(super) enum FileBase {
     bytes: ContentId,
     /// Their length.
     bytes_len: u64,
+    /// Whether every window of its block and bytes is held, so it reads as it is: false where its landing let a window
+    /// go, so its framing (read through windows that stop at one let go) may be short and its bytes' length long by
+    /// as much. Read only once brought back and made again ([`Taker::base_brought_back`]; main's 57k push hang,
+    /// docs/bugs/2026-11-27-a-file-base-framed-without-its-let-go-block-was-asked-again-without-end.md).
+    whole: bool,
   },
 }
 
 impl FileBase {
-  /// The base `node` of file `path` as the fork holds it: none where it does not, or holds its block not whole.
+  /// The base `node` of file `path` as the fork holds it, marked not whole where a window of its block or bytes was let
+  /// go ([`FileBase::Stored::whole`]); none where the fork holds no such revision.
   fn stored(taker: &Taker, store: &ContentStore, path: &[u8], node: Node) -> Option<FileBase> {
     if node == NULL_NODE {
       return Some(FileBase::Null);
@@ -68,12 +74,21 @@ impl FileBase {
       }
       None => Vec::new(),
     };
+    // The block whole where the framing read is its markers and every byte of it; the bytes whole where none of their
+    // windows is away. A block read short leaves the bytes' length long by as much, which no read of them meets.
+    let block_whole = row.block.is_none_or(|block| {
+      store
+        .len_of(&block)
+        .is_some_and(|len| to_u64(framing.len()) == len.saturating_add(to_u64(2 * MARKER.len())))
+    });
     let bytes_len = row.len.checked_sub(to_u64(framing.len()))?;
+    let whole = block_whole && store.holds_whole(&row.bytes);
     Some(FileBase::Stored {
       node,
       framing,
       bytes: row.bytes,
       bytes_len,
+      whole,
     })
   }
 
@@ -190,6 +205,9 @@ pub(super) struct Patched {
   after: Stage,
   /// A landed base's bytes and block brought back for it ([`Taker::base_brought_back`]): let go again once it ends.
   brought: Vec<ContentId>,
+  /// The times its base was asked of the store: once where its windows were let go, once more at most where they
+  /// went again after it was brought back (main's once rule of 2026-11-27); a third is refused.
+  asks: u32,
 }
 
 impl Taker {
@@ -257,6 +275,7 @@ impl Taker {
       writing: None,
       after,
       brought: Vec::new(),
+      asks: 0,
     });
     Ok(false)
   }
@@ -290,6 +309,14 @@ impl Taker {
     };
     if let Some(stepped) = self.base_brought_back(store)? {
       return Ok(stepped);
+    }
+    // A base whose windows were let go before any of it is read: asked first, never read framed short.
+    if let Some(FileBase::Stored {
+      node, whole: false, ..
+    }) = self.patched.as_ref().map(|patched| &patched.base)
+    {
+      let node = *node;
+      return self.ask_base(node, admission);
     }
     let window = store.window();
     let mut made = self.spares.take();
@@ -467,14 +494,36 @@ impl Taker {
       patched.brought.push(row.bytes);
       patched.brought.extend(row.block);
     }
+    // Made again from the fork, its windows held now: the base taken at its revision's begin may have been framed
+    // through windows that stopped at one let go, and reading it as it was failed at every step.
+    let rebuilt = FileBase::stored(self, store, &path, base);
+    if let (Some(rebuilt), Some(patched)) = (rebuilt, self.patched.as_mut()) {
+      patched.base = rebuilt;
+    }
     Ok(None)
   }
 
-  /// Asks the store for base `node`'s text, its windows let go: the step taken again once it is given.
+  /// Asks the store for base `node`'s text, its windows let go: the step taken again once it is given. Asked once, and
+  /// once more at most where its windows went again after it was brought back (counted); a third ask is refused
+  /// `UnknownDeltaBase`, since an ask made again without bound is the shape of the 57k push's hang.
   fn ask_base(&mut self, node: Node, admission: &Admission) -> Result<Stepped, Refused> {
-    let Some(patched) = self.patched.as_ref() else {
+    let Some(patched) = self.patched.as_mut() else {
       return Ok(Stepped::More);
     };
+    patched.asks = patched.asks.saturating_add(1);
+    if patched.asks > 2 {
+      return Err(
+        Unverified::UnknownDeltaBase {
+          log: log_of(Log::File(&patched.path)),
+          node: patched.meta.0,
+          base: node,
+        }
+        .into(),
+      );
+    }
+    if patched.asks > 1 {
+      self.intaken.base_store_reasked = self.intaken.base_store_reasked.saturating_add(1);
+    }
     let path = patched.path.clone();
     self.asked = Some(StoreAsk {
       want: Some(crate::render::Want::Rows {
