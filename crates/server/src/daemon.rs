@@ -3890,6 +3890,20 @@ impl Daemon {
     Ok(returned)
   }
 
+  /// Test support, behind the `test-support` feature (a release build of the daemon cannot reach it): every shard's
+  /// recovery memory taken as written whole (A-926), as a daemon over an image before its marks takes it, so a give-back
+  /// test has all of it to give back; a fresh daemon's memory is unwritten, and gives back nothing.
+  #[cfg(any(test, feature = "test-support"))]
+  pub fn take_recovery_memory_as_written_whole(&self) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), |s| {
+        let totals = recovery_totals(s);
+        s.journal.forget_what_was_given_back(totals);
+      })?;
+    }
+    Ok(())
+  }
+
   /// Test support: the bytes of dead recovery memory every shard has still to give back (A-226): what the give-back's
   /// own record says is left, so a test waits on the give-back's completion rather than on how long it usually takes.
   pub fn recovery_left_to_give_back(&self) -> Result<u64, ObserveError> {
@@ -6243,6 +6257,42 @@ fn return_dead_recovery_timed(
     log_end.saturating_sub(log_start),
   ) else {
     return (0, false);
+  };
+  // Each dead range runs to its memory's end (the stale slot whole, the log past its tail), so it is given back to the
+  // object's page boundary at or past its last byte, within that: the journal's extents are bytes (A-926), and a
+  // give-back takes whole pages only, so a range ending off a page left every page-sized piece of the top-down walk
+  // straddling two pages, and a one-page slice gave nothing back at all. In the object's own pages, since a region need
+  // not start on one.
+  let page = usize::try_from(s.config.geometry.page).unwrap_or(1).max(1);
+  // A range already given back whole stays empty: rounded, an empty range's partial page took a share of every slice
+  // and gave nothing back, and the give-back never ended.
+  let page_end = |base: usize, (offset, len): (usize, usize), limit: usize| -> (usize, usize) {
+    if len == 0 {
+      return (offset, 0);
+    }
+    let end = base
+      .saturating_add(offset)
+      .saturating_add(len)
+      .checked_next_multiple_of(page)
+      .unwrap_or(usize::MAX)
+      .saturating_sub(base)
+      .min(limit)
+      .max(offset.saturating_add(len));
+    (offset, end.saturating_sub(offset))
+  };
+  let (first, second) = slates_vfs::recover::slots_of_memory(slots_end.saturating_sub(slots_start));
+  let stale_end = if dead.stale_slot.0 == first.0 {
+    first.0.saturating_add(first.1)
+  } else {
+    second.0.saturating_add(second.1)
+  };
+  let dead = slates_vfs::checkpoint_log::DeadRanges {
+    stale_slot: page_end(slots_start, dead.stale_slot, stale_end),
+    log_past_tail: page_end(
+      log_start,
+      dead.log_past_tail,
+      log_end.saturating_sub(log_start),
+    ),
   };
   let slice = give_back_slice(s);
   let started = cpu();
@@ -11609,6 +11659,58 @@ mod tests {
         "step {step}: a {wall} ns spin read {spent} ns of the thread's CPU"
       );
     }
+  }
+
+  /// A-926's regression (main's ruling of 2026-11-25): since the journal keeps its memories' extents in bytes, a dead
+  /// range ends where its bytes did, off a page, and a give-back takes whole pages only. Do: on a fresh shard, publish
+  /// until a second checkpoint leaves a stale slot and a log written as far as their bytes reached; give back what is
+  /// dead with the slice at one page (the shard's thread clock reading nothing, so no rate is learned) until nothing is
+  /// left. Expect the pages given back counted, not only the extents fallen. Red before: every page-sized piece of the
+  /// top-down give-back straddled two pages, so the extents fell to nothing and no page went back.
+  #[test]
+  fn a_one_page_give_back_takes_the_pages_of_extents_that_end_off_a_page() {
+    /// Shape: the publications a shard may take to commit its second checkpoint.
+    const PUBLICATIONS: usize = 10_000;
+    /// Shape: the give-back steps the dead memory may take, a page each.
+    const STEPS: usize = 100_000;
+    let (dead, returned, left) = audit_on_shard(|state| {
+      let totals = super::recovery_totals(state);
+      let stale = |state: &crate::state::ShardState| {
+        state
+          .journal
+          .dead_ranges(totals.0, totals.1)
+          .map_or(0, |dead| dead.stale_slot.1)
+      };
+      for _ in 0..PUBLICATIONS {
+        let _ = crate::verbs::publish_shard(state);
+        if stale(state) > 0 {
+          break;
+        }
+      }
+      let dead = state.journal.dead_ranges(totals.0, totals.1);
+      state.give_back_rate = super::GiveBackRate::default();
+      let mut returned = 0;
+      for _ in 0..STEPS {
+        let (bytes, more) = super::return_dead_recovery_timed(state, &mut || None);
+        returned += bytes;
+        if !more {
+          break;
+        }
+      }
+      let left = state
+        .journal
+        .dead_ranges(totals.0, totals.1)
+        .map_or(0, |dead| dead.stale_slot.1 + dead.log_past_tail.1);
+      (dead, returned, left)
+    });
+    println!("daemon: dead {dead:?}, {returned} bytes given back a page a step, {left} left");
+    let dead = dead.expect("a checkpoint committed");
+    assert!(dead.stale_slot.1 > 0, "a stale slot written: {dead:?}");
+    assert_eq!(left, 0, "nothing left dead");
+    assert!(
+      returned > 0,
+      "pages given back, not only the extents fallen: {dead:?}"
+    );
   }
 
   /// A-491 (A-226's slice; CLAUDE.md "Bounded work everywhere": a step is held to its shard's quantum of its own CPU).
