@@ -167,31 +167,58 @@ impl fmt::Display for TextsRefused {
 
 impl std::error::Error for TextsRefused {}
 
-/// The section's bytes of `entries`, in order.
+/// The section's bytes of `entries`, in order: [`COUNT_BYTES`] of their count ([`put_count`]), then each entry
+/// ([`put_entry`]), reserved once at the section's length.
 pub fn encode(entries: &[TextEntry]) -> Vec<u8> {
-  let len = entries.iter().fold(LONG, |sum, entry| {
-    sum
-      .saturating_add(ENTRY_FEWEST)
-      .saturating_add(entry.path.len())
-      .saturating_add(entry.tool_id.len())
-      .saturating_add(if entry.base.is_some() { IDENTITY } else { 0 })
+  let len = entries.iter().fold(COUNT_BYTES, |sum, entry| {
+    sum.saturating_add(entry_len(entry))
   });
   let mut out = Vec::with_capacity(len);
-  put_long(&mut out, to_u64(entries.len()));
+  put_count(&mut out, entries.len());
   for entry in entries {
-    put_bytes(&mut out, &entry.path);
-    put_bytes(&mut out, &entry.tool_id);
-    out.extend_from_slice(&entry.text);
-    put_long(&mut out, entry.len);
-    out.push(mark_of(entry.base.is_some(), entry.form));
-    if let Some(base) = &entry.base {
-      out.extend_from_slice(base);
-    }
-    out.extend_from_slice(&entry.place.payload);
-    put_long(&mut out, entry.place.offset);
-    put_long(&mut out, entry.place.len);
+    put_entry(&mut out, entry);
   }
   out
+}
+
+/// Format: the bytes of a section's count of entries, its first.
+pub const COUNT_BYTES: usize = LONG;
+
+/// Appends a section's count of entries ([`encode`]'s first bytes): what a writer that encodes a section an entry at a
+/// time ([`put_entry`]) begins with.
+pub fn put_count(out: &mut Vec<u8>, count: usize) {
+  put_long(out, to_u64(count));
+}
+
+/// The bytes [`put_entry`] writes for `entry`, exactly.
+pub fn entry_len(entry: &TextEntry) -> usize {
+  entry_bytes(entry.path.len(), entry.tool_id.len(), entry.base.is_some())
+}
+
+/// The bytes [`put_entry`] writes for an entry of a path of `path` bytes and a tool id of `tool_id`, with a base where
+/// `based`: [`entry_len`] for a writer that measures a section before it makes its entries.
+pub fn entry_bytes(path: usize, tool_id: usize, based: bool) -> usize {
+  ENTRY_FEWEST
+    .saturating_add(path)
+    .saturating_add(tool_id)
+    .saturating_add(if based { IDENTITY } else { 0 })
+}
+
+/// Appends `entry`'s bytes, as [`encode`] writes each entry: a writer that encodes a section an entry at a time (A-920:
+/// a Subversion landing's 9,000 entries, 998 KB, encoded whole in one step, 1.9 ms debug) writes the section's bytes
+/// [`encode`] would.
+pub fn put_entry(out: &mut Vec<u8>, entry: &TextEntry) {
+  put_bytes(out, &entry.path);
+  put_bytes(out, &entry.tool_id);
+  out.extend_from_slice(&entry.text);
+  put_long(out, entry.len);
+  out.push(mark_of(entry.base.is_some(), entry.form));
+  if let Some(base) = &entry.base {
+    out.extend_from_slice(base);
+  }
+  out.extend_from_slice(&entry.place.payload);
+  put_long(out, entry.place.offset);
+  put_long(out, entry.place.len);
 }
 
 /// The entries `bytes` hold.

@@ -65207,6 +65207,24 @@ GAPS.
       `begin_applying` without a plan;
     - the begin's list of the entry's copies;
     - `named_whole_files`.
+  **`stage.canonical` named; a changeset's `Texts` section made an entry a unit.**
+  - `stage.canonical`'s 5.4 ms (debug) was `readied_in`'s reads of the named runs, which run after the canonical order
+    under its tag, each call walking the runs read before. The count of runs read whole (above) removed it. With the
+    reads tagged apart, neither is among the leaders.
+  - `landing.changeset` (2.4 ms, all three wide tests) was named in the sliced landing (`landing::land_sliced`). After
+    the payload's last piece, every text's entry was made (0.61 ms, a path cloned each) and the whole `Texts` section
+    encoded (`slates_store::texts::encode`, 998 KB, 1.9 ms) in one unit.
+    - `slates_store::texts` now writes an entry at a time (`put_count`, `put_entry`, `entry_bytes`), and `encode` is
+      that run over every entry.
+    - The landing measures the payload's and the section's lengths a text a unit, a slice of the shard's budget a step
+      (`measured`), before it begins. It makes the section an entry a unit, sending each store piece (64 KiB) as it
+      fills, with a yield where the budget is spent between pieces (`sent_texts`).
+    - Gauge `landing::LANDING_TEXT_ENTRIES_MOST`, the most entries made between two awaits; `t_c2c` holds it under a
+      quarter of the revision's files, red at 9,000.
+  - Debug, after: `landing.changeset` is out of the eight longest spans of all three wide tests. By thread CPU, the
+    leaders now are move's `stage.build` (2.1 ms) and the cold first `create` (2.3), then `stage.recording`,
+    `landing.follow`, `stage.bringing` and `landing.holds` at 1.0-1.4 ms. Copy's `landing.prepare` read 11 ms of wall
+    against 32 µs of CPU: preemption, not work.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
