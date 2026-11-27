@@ -181,8 +181,6 @@ pub(crate) fn after_borrow(s: &mut ShardState) {
     // An image publication owed with no catch-up making it (its publication refused, its task unspawned): the pass
     // begins it again (`content_holder::image_retry_owed`, A-870 piece 2).
     || s.image_encoder.owed_unattended()
-    // Changes waiting for a cut not yet due (A-930's cadence): the shard's idle cuts them.
-    || s.image_encoder.deferred()
   {
     arm(s);
   }
