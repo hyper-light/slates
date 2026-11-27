@@ -62,8 +62,18 @@ and asked again at most once.
   as a fresh object or as owned bytes: no capture of a framing made before the bring-back, and no metadata block. Not
   this shape. (`bring_in`'s own race, a row above an asked link let go between the ask and its use, was fixed as
   f925f47d4.)
-- Reported, not changed (main to rule): other readers of an object through `ContentStore::windows`, which yields a
-  short result where a window was let go: `hg/src/render.rs:1426` (a marker), `hg/src/index.rs:1249`,
-  `hg/src/serve/indexed.rs:796` (a length folded from the windows), `hg/src/import/record.rs:1409-1427` (a block and a
-  marker), `server/src/vcs_store/commits.rs:419`, `vcs/src/derived/blame.rs:852`, `git/src/derived/tree.rs:783-793`.
-  Each is safe only where its object cannot have a window let go when it is read.
+- Changed (main's ruling of 2026-11-27 04:41, "make it loud"): `ContentStore::windows` yields a typed miss
+  (`WindowMiss::Away`, `WindowMiss::Unread`) at the first window or list it cannot read, and nothing after, where it
+  ended without a word; `ContentRefused::Missed` carries one. Every reader handles it: `hg` `render.rs` (the
+  obsstore's markers, refused unreadable), `index.rs` (a revision's text none, `framed_text` and `object_text` too,
+  where `framed_text` had dropped a let-go block window by `flat_map`), `serve/indexed.rs` (a marker refused, a lend
+  or framed copy none), `import/record.rs` (`write_text` none, `window_bytes` none, the markers refused),
+  `push/chain_read.rs` (`read_object` none), `push/intake_patched.rs` (a block window missed leaves the base not
+  whole); `server` `vcs_store/commits.rs` (a blob refused `Unmade::Unread`), `vcs_store/homes.rs` (`read_here` not
+  held); `vcs` `ContentStore::object_bytes` (none), `derived/blame.rs` (refused `Content(Missed)`); `git`
+  `derived/tree.rs` (a blob id refused `Content(Missed)`), `store/push.rs` and `store/views.rs` (no lend; `stored_len`
+  counts to the first miss). Reds:
+  `content::tests::a_walk_over_an_object_whose_windows_were_let_go_misses_typed_never_short` (the walk empty before),
+  `derived::blame::tests::t_goal93_a_file_whose_windows_were_let_go_is_refused_never_blamed_short` (blamed short
+  before) and git's `t_goal93_a_file_whose_windows_were_let_go_is_refused_never_named_short` (a tree named over no
+  bytes before); each red with the old silent stop put back.

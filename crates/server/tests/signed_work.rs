@@ -74,6 +74,28 @@ fn counter(daemon: &Daemon, name: &str) -> u64 {
     .unwrap_or(0)
 }
 
+/// Waits until the daemon's `merge.checkpoint.taken`, summed over its shards and read as a user reads it (its status
+/// counters), is past `before`: its new value. A floor move's checkpoint is taken in turns once the verb that moved the
+/// floor has answered (A-579: its hold within the step's quantum, the rest in a task of its own), so it may land after
+/// that verb returns; read at once, it was missed on both of CI's Windows lanes (diag run 45986066740). Bounded by the
+/// client's reply deadline (`deadlines().reply_ns`, the anchor's liveness budget: a shard silent past it is presumed
+/// gone), so a checkpoint that never lands still fails here.
+fn checkpoint_taken_past(daemon: &Daemon, before: u64) -> u64 {
+  let bound = std::time::Duration::from_nanos(common::client::deadlines().reply_ns);
+  let began = std::time::Instant::now();
+  loop {
+    let taken = counter(daemon, "merge.checkpoint.taken");
+    if taken > before {
+      return taken;
+    }
+    assert!(
+      began.elapsed() < bound,
+      "no checkpoint taken within the reply deadline {bound:?}: merge.checkpoint.taken stayed {taken}"
+    );
+    std::thread::yield_now();
+  }
+}
+
 /// The signer `key` names on the wire: an Ed25519 key and its fingerprint.
 fn signer_of(key: &TestSigner) -> Verification {
   Verification::Verified {
@@ -209,7 +231,7 @@ fn expect_a_trusted_merge_verified(client: &mut Client, green: VolumeId, trusted
 /// Non-vacuity for `a_signed_merge_is_judged_recorded_and_read_back`: checkpoints folded the chain entries that carried
 /// the verdicts, and every verdict was the verifier's (one verified, one unregistered key, one bad signature).
 fn expect_the_verdicts_were_the_verifiers(daemon: &Daemon) {
-  assert!(counter(daemon, "merge.checkpoint.taken") > 0);
+  checkpoint_taken_past(daemon, 0);
   assert_eq!(
     [
       "signed_work.verified",
@@ -572,10 +594,8 @@ fn a_merges_verdict_survives_a_daemon_restart() {
   let mut client = connect(&instance);
   expect_the_verdicts_kept(&mut client, green, &key, "from the replayed chain entries");
   client.destroy(laggard).unwrap();
-  assert!(
-    counter(&second, "merge.checkpoint.taken") > 0,
-    "the floor rose past both versions, and a checkpoint folded them"
-  );
+  // The floor rose past both versions: a checkpoint folds them, taken in turns after the destroy answers.
+  checkpoint_taken_past(&second, 0);
   drop(client);
   second.stop();
   let third = start_over(&config, anchor);

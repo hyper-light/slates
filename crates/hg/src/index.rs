@@ -1199,7 +1199,7 @@ impl HgIndex {
     // none is begun and no chain gathered (main's churn at e51d998bf: hg's 57k clone allocated 5.51 GB of texts and 0.79
     // GB of chains reading manifests the store had let go, about a manifest a changeset, none of them made). An object
     // the store holds no entry for (the empty one) is read as before.
-    if store.contains(&row.bytes) && store.windows(&row.bytes).next().is_none() {
+    if store.contains(&row.bytes) && !matches!(store.windows(&row.bytes).next(), Some(Ok(_))) {
       return None;
     }
     if let Some(block) = row.block {
@@ -1208,24 +1208,7 @@ impl HgIndex {
     if row.base == NONE {
       return object_text(store, &row.bytes, row.len);
     }
-    let mut chain = vec![row];
-    let mut at = row.base;
-    let mut over: Option<&[u8]> = None;
-    // Each base is before its revision, so the walk takes at most `rev` steps.
-    while let Some(link) = self.revision(store, log, at) {
-      if let Some(text) = given_text(&link.node) {
-        over = Some(text);
-        break;
-      }
-      chain.push(link);
-      if link.base == NONE {
-        break;
-      }
-      if link.base >= at {
-        return None;
-      }
-      at = link.base;
-    }
+    let (mut chain, over) = self.chain_below(store, log, row, given_text)?;
     // Each delta is applied into the other of two text buffers and read into one reused delta buffer from the store's
     // windows (main's order of 2026-11-20, Ada's no-allocation rule): a chain costs the two longest texts and its
     // longest delta, never a text and a delta a link. A chain is up to its text's length of deltas, so a text a link
@@ -1247,7 +1230,8 @@ impl HgIndex {
     let rebuilt = chain.iter().rev().try_for_each(|step| {
       buffers.delta.clear();
       for window in store.windows(&step.bytes) {
-        buffers.delta.extend_from_slice(&window);
+        // A delta window let go: the text is none here, never rebuilt over a short delta.
+        buffers.delta.extend_from_slice(&window.ok()?);
       }
       if crate::read::to_u64(buffers.delta.len()) != step.stored {
         return None;
@@ -1259,6 +1243,35 @@ impl HgIndex {
     buffers.next = next;
     rebuilt?;
     (crate::read::to_u64(text.len()) == row.len).then_some(text)
+  }
+
+  /// The delta chain of `log` below `row`, `row` first: each base's row down to the nearest whole revision, or to the
+  /// nearest one whose text is `given` by node, which ends the chain as its text instead ([`HgIndex::revision_text_over`]).
+  /// `None` where a base does not come before its revision. Each base is before its revision, so the walk takes at most
+  /// as many steps as `row`'s revision number.
+  fn chain_below<'g>(
+    &self,
+    store: &ContentStore,
+    log: Log<'_>,
+    row: RevisionRow,
+    given_text: impl Fn(&Node) -> Option<&'g [u8]>,
+  ) -> Option<(Vec<RevisionRow>, Option<&'g [u8]>)> {
+    let mut chain = vec![row];
+    let mut at = row.base;
+    while let Some(link) = self.revision(store, log, at) {
+      if let Some(text) = given_text(&link.node) {
+        return Some((chain, Some(text)));
+      }
+      chain.push(link);
+      if link.base == NONE {
+        break;
+      }
+      if link.base >= at {
+        return None;
+      }
+      at = link.base;
+    }
+    Some((chain, None))
   }
 
   /// Writes a group's planned rows, sorted by key, as one batch.
@@ -1506,10 +1519,12 @@ fn framed_text(
   (block, bytes): (&ContentId, &ContentId),
   len: u64,
 ) -> Option<Vec<u8>> {
-  let block: Vec<u8> = store
-    .windows(block)
-    .flat_map(|window| window.into_owned())
-    .collect();
+  // A block window let go is a text not here, never a block framed short (the 57k push's hang's shape).
+  let mut block_bytes: Vec<u8> = Vec::new();
+  for window in store.windows(block) {
+    block_bytes.extend_from_slice(&window.ok()?);
+  }
+  let block = block_bytes;
   let markers = crate::read::to_u64(crate::filerev::MARKER.len()).checked_mul(2)?;
   let framing = crate::read::to_u64(block.len()).checked_add(markers)?;
   let bytes = object_text(store, bytes, len.checked_sub(framing)?)?;
@@ -1529,10 +1544,12 @@ fn object_text(store: &ContentStore, root: &ContentId, len: u64) -> Option<Vec<u
   let Some(first) = windows.next() else {
     return (len == 0).then(Vec::new);
   };
+  // A window let go, or not held: none here, nothing allocated where it is the first.
+  let first = first.ok()?;
   let mut text = Vec::with_capacity(usize::try_from(len).ok()?);
   text.extend_from_slice(&first);
   for window in windows {
-    text.extend_from_slice(&window);
+    text.extend_from_slice(&window.ok()?);
   }
   (crate::read::to_u64(text.len()) == len).then_some(text)
 }

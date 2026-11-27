@@ -333,12 +333,18 @@ fn spawn_cost_role() {
   let null = std::fs::File::open("/dev/null").unwrap();
   let mut held: Vec<OwnedFd> = Vec::new();
   for (round, wanted) in DESCRIPTOR_COUNTS.iter().enumerate() {
-    let count = (*wanted).min(room);
+    let mut count = (*wanted).min(room);
+    // Held until the system refuses one, whatever the limit said: macOS caps a process's descriptors by
+    // `kern.maxfilesperproc` too, below a soft `RLIMIT_NOFILE` the raise was allowed (CI's macOS wall, diag CI 7, job
+    // 140523159665: the role failed before its 100,000 row).
+    while held.len() < count {
+      match null.as_fd().try_clone_to_owned() {
+        Ok(more) => held.push(more),
+        Err(_) => count = held.len(),
+      }
+    }
     if count < *wanted {
       println!("{CAP_TAG} {wanted} {count}");
-    }
-    while held.len() < count {
-      held.push(null.as_fd().try_clone_to_owned().unwrap());
     }
     let first_id = u64::try_from(round * REPS).unwrap() + 1;
     let spawner_took = took(through_the_spawner(end, first_id));
@@ -414,7 +420,9 @@ fn a_spawns_cost_on_its_calling_thread_is_flat_in_the_daemons_descriptors() {
   assert_eq!(
     rows.len(),
     DESCRIPTOR_COUNTS.len(),
-    "a row a count: {printed}"
+    "a row a count: the role {}; it printed:\n{printed}\nand said on standard error:\n{}",
+    output.status,
+    String::from_utf8_lossy(&output.stderr)
   );
   let figure = |row: usize, at: usize| {
     rows

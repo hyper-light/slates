@@ -19949,6 +19949,14 @@ Status: built 2026-10-03. A barrier's publication went from 75.4 ms to 0.11–0.
   over that range, AUD-29-09: no other mapping reaches those bytes; the daemon's copies of the object stay in
   the log and slots, and the anchor never touches the object's bytes). File bytes are written there once, by
   the write itself, and they survive the daemon because the anchor holds the object.
+  Since 2026-11-27 (layout version 21; main's Windows CI red, run 45986066740) every region of the slice is laid in
+  whole pages of the base page: the reserve (each slot's length and the delta log's) and the write log (a quarter of
+  it) are rounded down to pages, one at least (`DaemonConfig::content_reserve`, `write_log_bytes`), so the slots and
+  the delta log begin on a page. A Windows runner's reserve of 5,724,786,688 bytes, no multiple of four pages, had put
+  them 1,024 bytes past one, and a give-back could take no page a region shares with the one before it
+  (`every_region_of_a_shards_content_slice_begins_and_ends_on_a_page`). The give-back's top-down walk also ends a
+  whole dead memory on the last page inside it where the memory's end is off a page (`daemon::dead_to_pages`), so a
+  one-page piece from the top is a whole page on any layout.
 - The image: a file's runs, and a base-backed file's pinned ranges, carry **chunk references**: the block's
   offset and order within the arena range, the bytes used, and the birth epoch. A table lists each block once,
   so CoW sharing between versions, snapshots and clones is preserved by identity, not found by checksum.
@@ -65155,8 +65163,50 @@ GAPS.
   - Debug, after: `stage.recording` is 1.3 ms in add and copy and out of move's six longest spans (5.2-5.5 ms before).
     The leaders, publication aside: `stage.check` 3.7-3.9 ms and `landing.changeset` 2.3-2.4 ms in all three, then
     move's `stage.build` 2.0.
-  - Left: a replay's plan is still a pass over the entry in one unit, as is the scan of the runs, linear in them. Both
-    are owed their slicing by §3.
+  **A revision's record encoded a part at a time** (`slates_svn::commit::record::RevisionEncoding`). `stage.check`
+  named (debug): its first step encoded the revision's record whole (`Record::revision_bytes`): 1.22-1.28 MB, its
+  9,000 rows, at 3.8 ms. `check_begin` was 2-3 µs, and no check step reached 0.5 ms. The record was reserved at its
+  exact length by a walk of every row (`revision_len`), then written whole (`put_revision`).
+  - Now `RevisionEncoding` measures the length an entry a unit and reserves it once, never grown (A-742's rule). It
+    then writes the entries in the record's order an entry a unit, each list's count as the list begins, a content's
+    bytes a copy slice a unit.
+  - `revision_bytes` is the same encoder run to its end; `revision_len` and `put_revision` go.
+  - The check encodes the record first, a slice of the shard's budget a step, contents a copy slice a unit
+    (`staging::encoded_in`), then begins its checks.
+  - Counter: `staging::RECORD_ENCODE_STEPS`; `t_c2c` holds the encoding to more than two steps, red at one with it
+    whole.
+  - Test `a_revisions_record_written_a_unit_a_step_is_its_record`: the tests' revision written a unit a step, contents
+    two bytes a unit. It gives the hand-written layout's bytes, reserved once at its length.
+  - Debug, after: `stage.check` is out of the six longest spans of all three wide tests (3.7-3.9 ms before). The
+    leaders now, publication aside: `stage.canonical` 5.4-5.5 ms, `landing.prepare` 3.8 and `parse` 3.6-3.8, at a
+    load at which the publication read 17-32 ms.
+  - A replay's plan and the scan of the runs were each still one linear unit: owed by §3, taken next (below).
+  **A replay's choice of runs made a unit a step; the runs read whole counted, never walked.**
+  - The runs' unread scan walked every run, and every read call (`read_step_among`) began again at run 0: reading
+    9,000 runs over many slices walked the runs read before at every call. The read state now counts the runs read
+    whole from the first (`named::Read::whole`, advanced as each read ends, each run passed once). Where every run is
+    read, the unread check answers with no walk, and a read goes on from that count.
+    - Test `a_reads_calls_go_on_from_the_first_run_not_read_whole`: 2,000 runs read a run's bytes a call visit about
+      one run a run and one a call (`Read::visited`). Red with each call from the first: 2,004,999 visits.
+  - The choice of the runs a replay reads (`Increment::replay_reads`, A-887) was a pass over the entry's every change
+    and run in one unit. A recovery's replay made it at each step of an entry's reads (`verbs::replay_chain_entry`),
+    and once more by the apply's begin. It is now `engine::ReplayReads`, a unit a step:
+    - each run's place;
+    - each changed file, its whole run named and the runs its adding operations read marked;
+    - each payload operation of the document;
+    - each run's answer.
+    A change's whole run only excuses its own operations, so one pass over the changes decides what the whole rule's
+    two did. `replay_reads` is it run to its end.
+  - The replay keeps it beside the entry (`ReplayPlan`), made once under the step's apply budget, and begins the apply
+    with it (`Green::begin_applying_planned`). `begin_applying` makes it whole only where a run is unread and no plan
+    was made.
+    - Test `a_replays_choice_of_runs_is_made_a_unit_a_step`: 2,000 runs, the whole choice's answer, three steps a run
+      at least.
+  - Left, each one linear unit:
+    - the choice where it is still made whole: `recorded_unlent`, svn_texts' wanted runs of a recovery's plan,
+      `begin_applying` without a plan;
+    - the begin's list of the entry's copies;
+    - `named_whole_files`.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 

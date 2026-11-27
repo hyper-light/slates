@@ -20986,7 +20986,20 @@ enum GreenReplayPhase {
     lending: Option<Box<Lending>>,
     /// The next entry's apply under way, a slice's floor a step (`Green::apply_step`), once its texts are lent.
     applying: Option<Box<slates_merge::engine::Applying>>,
+    /// The next entry's choice of the runs its replay reads, made a unit at a time once and kept until the entry is
+    /// applied ([`ReplayPlan`]).
+    planning: Option<Box<ReplayPlan>>,
   },
+}
+
+/// A replayed entry's choice of the named runs its replay reads (A-887's rule, `Increment::replay_reads`): being made a
+/// unit at a time under the step's budget, or made (A-920: made whole at each of the entry's steps while its runs were
+/// read, a pass over its every change and run, and once more by its apply's begin).
+enum ReplayPlan {
+  /// Being made.
+  Choosing(slates_merge::engine::ReplayReads),
+  /// Made: for each run by its place, whether the replay reads it.
+  Chosen(Vec<bool>),
 }
 
 /// The texts a replayed entry's apply reads that its green holds by name alone (`Green::recorded_unlent`), being read
@@ -21147,12 +21160,13 @@ impl GreenReplay {
         reading,
         lending,
         applying,
+        planning,
       } => {
         return replay_chain_entry(
           state,
           (id, green),
           (*held, *head_check),
-          (next, reading, lending),
+          (next, reading, lending, planning),
           (applying, &mut self.apply_steps),
           replayed,
         );
@@ -21223,10 +21237,11 @@ fn replay_chain_entry(
   state: &ShardState,
   (id, green): (DbVolumeId, &mut slates_merge::engine::Green),
   (held, head_check): (u64, Option<(u64, [u8; 32])>),
-  (next, reading, lending): (
+  (next, reading, lending, planning): (
     &mut usize,
     &mut Option<Box<slates_merge::chain_entry::ChainEntry>>,
     &mut Option<Box<Lending>>,
+    &mut Option<Box<ReplayPlan>>,
   ),
   (applying, apply_steps): (&mut Option<Box<slates_merge::engine::Applying>>, &mut u64),
   replayed: &mut Vec<crate::merge_service::ReplayedVersion>,
@@ -21241,6 +21256,8 @@ fn replay_chain_entry(
   let mut entry = match reading.take() {
     Some(entry) => entry,
     None => {
+      // A fresh entry: no choice of its runs made yet.
+      *planning = None;
       let Some(bytes) = state.db.partition().green_chain(id).get(*next) else {
         return Ok(true);
       };
@@ -21288,13 +21305,16 @@ fn replay_chain_entry(
   // An entry naming its content (A-760) reads it from the content plane first, a copy slice a step, so no step reads
   // a large text whole: the step ends with the entry kept for the next. A run its apply names whole is never read: the
   // apply keeps no byte of its file (A-887, `Increment::replay_reads`).
-  let reads = entry.increment.replay_reads(&entry.applied);
-  if entry.increment.unread_among(&reads).is_some() {
+  let Some(reads) = replay_chosen(state, &entry, planning) else {
+    *reading = Some(entry);
+    return Ok(false);
+  };
+  if entry.increment.unread_among(reads).is_some() {
     let objects = replay_objects(state);
     let slice = state.config.copy_slice_bytes().max(1);
     let read = entry
       .increment
-      .read_step_among(&objects, slice, &reads)
+      .read_step_among(&objects, slice, reads)
       .map_err(|_| GreenFence::ContentMissing { version })?;
     if !read {
       *reading = Some(entry);
@@ -21310,7 +21330,7 @@ fn replay_chain_entry(
   // whole tree (a push's line from an empty root) applied in one unit held a restart's slice 329.6 ms of CPU (r42).
   let run = match applying.take() {
     Some(run) => Ok(run),
-    None => match green.begin_applying(&mut entry.increment, &entry.applied) {
+    None => match green.begin_applying_planned(&mut entry.increment, &entry.applied, reads) {
       slates_merge::engine::Begun::Applying(run) => Ok(run),
       slates_merge::engine::Begun::Answered(version) => Err(version),
     },
@@ -21376,7 +21396,36 @@ fn replay_chain_entry(
       .map(crate::merge_service::SubmitCompletion::of_entry),
   });
   *next = next.saturating_add(1);
+  *planning = None;
   Ok(false)
+}
+
+/// The runs `entry`'s replay reads ([`ReplayPlan`]): its choice made a unit at a time under the replay's apply budget
+/// ([`replay_apply_budget_ns`]), once, and kept with the entry; none while the step is spent before it is made.
+fn replay_chosen<'p>(
+  state: &ShardState,
+  entry: &slates_merge::chain_entry::ChainEntry,
+  planning: &'p mut Option<Box<ReplayPlan>>,
+) -> Option<&'p [bool]> {
+  let plan = planning.get_or_insert_with(|| {
+    Box::new(ReplayPlan::Choosing(
+      slates_merge::engine::ReplayReads::default(),
+    ))
+  });
+  if let ReplayPlan::Choosing(choosing) = &mut **plan {
+    let deadline = slates_rt::futures::now_ns().saturating_add(replay_apply_budget_ns(state));
+    while !choosing.step(&entry.increment, &entry.applied) {
+      if slates_rt::futures::now_ns() >= deadline {
+        return None;
+      }
+    }
+    let chosen = std::mem::take(choosing).into_reads();
+    **plan = ReplayPlan::Chosen(chosen);
+  }
+  match &**plan {
+    ReplayPlan::Chosen(reads) => Some(reads),
+    ReplayPlan::Choosing(_) => None,
+  }
 }
 
 /// The budget of one step of a replayed chain entry's apply ([`replay_chain_entry`]): a slice's floor, half the live step
@@ -21512,6 +21561,7 @@ fn chain_from(
     reading: None,
     lending: None,
     applying: None,
+    planning: None,
   })
 }
 

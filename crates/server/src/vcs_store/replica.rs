@@ -307,8 +307,10 @@ mod tests {
         packs
           .iter()
           .flat_map(|pack| {
+            // Every window of the pack is held before its let-go, so the walk meets no miss.
             content
               .windows(pack)
+              .map_while(Result::ok)
               .map(|window| slates_vcs::ContentId::of(&window))
           })
           .collect()
