@@ -2353,6 +2353,9 @@ pub(crate) const OUT_OF_ORDER: &str = "merge.out_of_order";
 /// Counted on a holder for each merge record it answered behind (A-918, `ContentMessage::Behind`): a version past what
 /// its replica holds that its own ledger cannot bring it to. Format: a counter name.
 pub(crate) const BEHIND_ANSWERED: &str = "merge.behind.answered";
+/// Counter: a read of a green's chain a holder behind it wanted from its cohort (A-918 B, [`read_chain`]). Format: a
+/// counter name in the daemon's status report.
+pub(crate) const CHAIN_READ: &str = "merge.behind.chain_read";
 /// Counted on an owner for each behind answer a target gave a pending version's record (A-918). Format: a counter name.
 pub(crate) const BEHIND_HEARD: &str = "merge.behind.heard";
 /// Counted on a holder whose held inputs did not decode as an increment or origin (a corrupt hold).
@@ -5303,22 +5306,76 @@ fn record_standing(
     // No replica of a green whose records this holder accepted: a warm restart keeps the records and the inputs it held
     // (AUD-29-59), not the engine, which is rebuilt from them a slice at a time (A-313). Before, every later record was
     // refused out of order here, for good.
-    None => match crate::merge_origin::rebuild_replica(state, object) {
-      crate::merge_origin::Rebuild::Installed(head) => Some(head.saturating_add(1)),
-      crate::merge_origin::Rebuild::Later => return None,
-      crate::merge_origin::Rebuild::Nothing => None,
-    },
+    None => {
+      if let RebuildWait::Answered(standing) = rebuild_wait(state, object, sender) {
+        return standing;
+      }
+      match crate::merge_origin::rebuild_replica(state, object) {
+        crate::merge_origin::Rebuild::Installed(head) => Some(head.saturating_add(1)),
+        crate::merge_origin::Rebuild::Later => return None,
+        crate::merge_origin::Rebuild::Nothing => None,
+      }
+    }
   };
   match (next, version) {
     (Some(next), version) if version < next => Some(RecordStanding::Applied),
     (None, 0) => Some(RecordStanding::Next),
     (Some(next), version) if version == next => Some(RecordStanding::Next),
     (Some(next), version) => catch_up(state, object, (next, version), sender),
-    // None of the green held: a candidate a death brought in (A-918).
+    // None of the green held: a candidate a death brought in (A-918), which reads the green's chain from its cohort.
     _ => {
       state.count(OUT_OF_ORDER, 1);
+      read_chain(state, object, sender, version);
       Some(RecordStanding::Behind { reached: None })
     }
+  }
+}
+
+/// Whether a holder with no replica of a green rebuilds it now, or answers the record first ([`rebuild_wait`]).
+enum RebuildWait {
+  /// Every record and input the rebuild reads is held, or no record is: the rebuild's own answer stands.
+  Ready,
+  /// Something the rebuild reads is being brought: the record's standing meanwhile.
+  Answered(Option<RecordStanding>),
+}
+
+/// What a holder with `object`'s records and no replica of it waits on before it rebuilds one (A-918 B): ready where it
+/// holds every record and input the rebuild reads (`merge_origin::rebuild_needs`); a record it lacks is read from the
+/// green's cohort ([`read_chain`]) and the version answered behind; inputs it lacks are fetched from `sender`, the
+/// record's owner (`fleet::fetch_ledger_inputs`, as [`catch_up`] does), and nothing acknowledged yet.
+fn rebuild_wait(state: &mut ShardState, object: ObjectId, sender: HostId) -> RebuildWait {
+  let Some(through) = crate::merge_origin::newest_accepted(state, object) else {
+    return RebuildWait::Ready;
+  };
+  match crate::merge_origin::rebuild_needs(state, object, through) {
+    Ok(unheld) if unheld.is_empty() => RebuildWait::Ready,
+    Ok(unheld) => {
+      crate::fleet::fetch_ledger_inputs(state, object, sender, unheld);
+      RebuildWait::Answered(None)
+    }
+    Err(_) => {
+      read_chain(state, object, sender, through.saturating_add(1));
+      RebuildWait::Answered(Some(RecordStanding::Behind { reached: None }))
+    }
+  }
+}
+
+/// Reads the records of `object`'s versions below `version` this holder lacks from the green's cohort, the owner among
+/// them (A-918 B, main 01a20182's ruling B of 2026-11-25: the takeover successor's own read, A-919's): a candidate a
+/// death brought in holds none of the green, and the owner holds no per-version records below its floor, so it cannot
+/// ship the chain itself. Each position read is held in this holder's acceptor in order, under the start rule
+/// (`ledger_read`); the owner's next shipment then finds the records and rebuilds the replica from them. Counted
+/// [`CHAIN_READ`] where a read is wanted.
+fn read_chain(state: &mut ShardState, object: ObjectId, sender: HostId, version: u64) {
+  let Some(through) = version.checked_sub(1) else {
+    return;
+  };
+  let held = crate::merge_origin::chained_through(state, object, through);
+  if held.is_some_and(|held| held >= through) {
+    return;
+  }
+  if crate::ledger_read::want_chain(state, (object, sender), held, through) {
+    state.count(CHAIN_READ, 1);
   }
 }
 
@@ -5343,9 +5400,10 @@ fn catch_up(
     return Some(RecordStanding::Behind { reached });
   };
   match crate::merge_origin::ledger_unheld(state, object, (next, through)) {
-    // A version between whose record this holder lacks (A-918: answered typed).
+    // A version between whose record this holder lacks (A-918: answered typed), read from the green's cohort (A-918 B).
     Err(_) => {
       state.count(OUT_OF_ORDER, 1);
+      read_chain(state, object, sender, version);
       Some(RecordStanding::Behind { reached })
     }
     Ok(unheld) if !unheld.is_empty() => {
