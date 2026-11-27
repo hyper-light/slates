@@ -128,7 +128,8 @@ use crate::repository::push::{
 use crate::state::ShardState;
 use crate::vcs_policy::{Asked, Brings, Compiled, Name, PushRefusal, Right, admit, admit_right};
 use crate::vcs_store::{
-  GitPush, GitRefused, GitStore, SealTurn, SealedPush, SealingPush, Target, green_key, with_room,
+  GitPush, GitRefused, GitStore, PushTurn, SealTurn, SealedPush, SealingPush, Target, green_key,
+  with_room,
 };
 use crate::verbs::to_wire_volume;
 
@@ -310,6 +311,9 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   /// shard turn before leaving the shard so concurrent pushes on the same repository cannot clear
   /// or overwrite it before [`Self::bring_back_waited`] runs.
   waited: Option<slates_git::store::packed::Waited>,
+  /// Last let-go pack window whose bring-back failed on the current push or command, guarding
+  /// against infinite retry loops when a landed pack window cannot be read back from the store.
+  last_failed: Option<slates_git::store::packed::Waited>,
   /// Unpacked-but-unnamed objects buffered on the owner shard until the batch reaches the derived
   /// scatter target or the pack ends.
   pending_batch: slates_git::unpack::DeferredBatch,
@@ -390,6 +394,46 @@ struct SealingAnswer {
   name: [u8; 32],
 }
 
+/// Explicit preparation stage of the command under way in [`ServerJudge::ready`]. Advancing
+/// monotonically from [`Self::Restage`] through [`Self::Policy`] ensures a stage that gave up on
+/// an unbringable let-go pack window is never re-entered on the same command, preventing
+/// multi-window ping-pong when two distinct packs fail bring-back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ReadyStage {
+  #[default]
+  Restage,
+  Admit,
+  Build,
+  Room,
+  Policy,
+}
+
+impl ReadyStage {
+  /// Returns the next stage in monotonic order, or `None` once the final stage completed.
+  fn next(self) -> Option<Self> {
+    match self {
+      Self::Restage => Some(Self::Admit),
+      Self::Admit => Some(Self::Build),
+      Self::Build => Some(Self::Room),
+      Self::Room => Some(Self::Policy),
+      Self::Policy => None,
+    }
+  }
+}
+
+/// Per-command preparation state carried across [`ServerJudge::ready`] turns into
+/// [`ServerJudge::admitted`]: monotonic stage progression, terminal policy verdict cache, and the
+/// last failed bring-back window.
+#[derive(Debug, Default)]
+struct CommandReady {
+  /// Current monotonic preparation stage (`Restage` -> `Admit` -> `Build` -> `Room` -> `Policy`).
+  stage: ReadyStage,
+  /// Policy verdict computed at [`ReadyStage::Policy`] for the immediately following `admitted`.
+  policy: Option<Result<(), Declined>>,
+  /// Last let-go pack window whose bring-back failed on the current command.
+  last_failed: Option<slates_git::store::packed::Waited>,
+}
+
 /// A push's answer while its commands are decided a step at a time (A-719; `AnswerState::Deciding`):
 /// one command's verdict and append a step, so a push of a thousand refs never runs past its step.
 struct DecidingPush {
@@ -399,7 +443,7 @@ struct DecidingPush {
   sealed: SealedPush,
   /// The push's name (module docs).
   name: [u8; 32],
-  /// What the push's hooks before the verdicts decided of its commands.
+  /// What the push's hooks before the verdicts decided of its commands, plus per-command readiness.
   verdicts: HookVerdicts,
   /// The decision under way.
   deciding: Deciding<Entry>,
@@ -551,12 +595,23 @@ impl<P> ReceivePack<P> {
 
   /// Brings back and pins the let-go window this push's last paused turn met, if any, so
   /// concurrent fetches or sibling pushes cannot evict or overwrite it before this push's next
-  /// turn.
+  /// turn. Records a failed window in `last_failed` (and clears it on success) so persistent
+  /// bring-back failures never spin.
   pub(crate) async fn bring_back_waited(&mut self) {
     let Some(waited) = self.waited.take() else {
       return;
     };
-    let _brought = crate::vcs_store::upload::brought_one(waited, &mut self.resident, None).await;
+    if self.last_failed == Some(waited) {
+      return;
+    }
+    let brought = crate::vcs_store::upload::brought_one(waited, &mut self.resident, None).await;
+    self.last_failed = brought.is_none().then_some(waited);
+  }
+
+  /// Records `waited` for [`Self::bring_back_waited`] unless the identical wait already failed
+  /// bring-back on the current push or command.
+  fn note_waited(&mut self, waited: Option<slates_git::store::packed::Waited>) {
+    self.waited = waited.filter(|window| self.last_failed != Some(*window));
   }
 
   /// Whether the client asked its answer multiplexed (`side-band-64k`), once its request is read.
@@ -629,6 +684,7 @@ impl<P> ReceivePack<P> {
       refusal_names: None,
       resident: crate::vcs_http::git::upload::Resident::new(),
       waited: None,
+      last_failed: None,
       pending_batch: slates_git::unpack::DeferredBatch::default(),
       in_flight: None,
       deferred_error: None,
@@ -934,7 +990,7 @@ impl<P> ReceivePack<P> {
       if step != slates_git::unpack::DeferredResolve::Batch
         || self.pending_batch.bytes() >= batch_target
       {
-        self.waited = waited.filter(|_| step == slates_git::unpack::DeferredResolve::Away);
+        self.note_waited(waited.filter(|_| step == slates_git::unpack::DeferredResolve::Away));
         return Ok(step);
       }
       let now = slates_rt::futures::now_ns();
@@ -1278,7 +1334,7 @@ impl<P> ReceivePack<P> {
         };
         session.resolve_turn_into(site, admission, quantum)
       })?;
-      self.waited = waited.filter(|_| !done);
+      self.note_waited(waited.filter(|_| !done));
       return Ok(false);
     }
     if !self.session.is_checking() {
@@ -1314,7 +1370,7 @@ impl<P> ReceivePack<P> {
         .map_err(PushFailed::Exchange)?;
       Ok((done, waiting.take()))
     })?;
-    self.waited = waited.filter(|_| !done);
+    self.note_waited(waited.filter(|_| !done));
     Ok(done)
   }
 
@@ -1421,6 +1477,7 @@ impl<P> ReceivePack<P> {
   ) -> Result<DecidingPush, PushFailed> {
     let checked = self.session.take_checked().ok_or(PushFailed::Unchecked)?;
     let deciding = Deciding::new(checked, &mut self.admission).map_err(PushFailed::Exchange)?;
+    self.last_failed = None;
     Ok(DecidingPush {
       record,
       sealed,
@@ -1467,6 +1524,7 @@ impl<P> ReceivePack<P> {
         door,
         ..
       } = &mut decision;
+      verdicts.ready.last_failed = self.last_failed;
       let mut judge = ServerJudge {
         state: &mut *state,
         push: sealed,
@@ -1483,9 +1541,11 @@ impl<P> ReceivePack<P> {
         making_room,
         door,
       };
-      deciding
+      let stepped = deciding
         .step(None, &mut judge, &mut self.admission)
-        .map_err(PushFailed::Exchange)?
+        .map_err(PushFailed::Exchange);
+      self.last_failed = verdicts.ready.last_failed;
+      stepped?
     };
     if !done {
       self.answer = AnswerState::Deciding(Box::new(decision));
@@ -1745,7 +1805,8 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
       .map_err(|failed| self.bounded(failed));
     let residual = take_repo_waiting(state, self.repository);
     if matches!(stepped, Ok(Answering::Turned)) {
-      self.waited = self.waited.or(residual);
+      let candidate = self.waited.or(residual);
+      self.note_waited(candidate);
     } else {
       self.waited = None;
     }
@@ -1895,7 +1956,8 @@ impl<P> ReceivePack<P> {
       .map_err(|failed| self.bounded(failed));
     let residual = take_repo_waiting(state, self.repository);
     if matches!(stepped, Ok(Answering::Turned)) {
-      self.waited = self.waited.or(residual);
+      let candidate = self.waited.or(residual);
+      self.note_waited(candidate);
     } else {
       self.waited = None;
     }
@@ -2631,6 +2693,8 @@ struct HookVerdicts {
   every: Option<Every>,
   /// Each `update` hook's refusal, by its command's ref.
   each: BTreeMap<Vec<u8>, Declined>,
+  /// Per-command preparation state carried across `ServerJudge::ready` turns into `admitted`.
+  ready: CommandReady,
 }
 
 /// The refusal every command of a push takes ([`HookVerdicts::every`]).
@@ -2648,6 +2712,11 @@ struct Every {
 }
 
 impl HookVerdicts {
+  /// Whether hooks already declined `name`, without consuming any one-shot hook words.
+  fn is_declined(&self, name: &[u8]) -> bool {
+    self.every.is_some() || self.each.contains_key(name)
+  }
+
   /// The refusal of the command of ref `name`, where the hooks refused it.
   fn declined(&mut self, name: &[u8]) -> Option<Declined> {
     if let Some(every) = &mut self.every {
@@ -2779,7 +2848,7 @@ struct ServerJudge<'j> {
   hidden: &'j PolicyHidden,
   /// The push's name.
   name: [u8; 32],
-  /// What the push's hooks before the verdicts decided of its commands.
+  /// What the push's hooks before the verdicts decided of its commands, plus per-command readiness.
   hooks: &'j mut HookVerdicts,
   /// The admission of the command under way's move, a turn at a time (A-722 part 4c).
   admitting: &'j mut Option<slates_git::store::Admitting>,
@@ -2812,35 +2881,30 @@ impl Judge for ServerJudge<'_> {
     self.push.rank(self.state, command.new)
   }
 
-  /// A turn of the admission of `command`'s move (A-722 part 4c), for the shard's step quantum and a unit at least: the
-  /// walk of what it brings, which its append then takes whole ([`SealedPush::admit`]). A delete needs none.
+  /// Prepares `command` monotonically through [`ReadyStage`] (`Restage` -> `Admit` -> `Build` ->
+  /// `Room` -> `Policy`), pausing whenever a stage needs another shard turn or a let-go pack
+  /// window brought back before [`Judge::judge`] runs in the same synchronous shard turn.
   fn ready(&mut self, command: &Command, pushed: &Pushed<'_>) -> bool {
-    let ns = self.state.config.step_quantum_ns();
-    // A stage another push's landing overtook is made again first, a turn at a time, so the append's commit adopts it
-    // rather than staging the push again whole in its step (A-722 part 4e).
-    if !self.push.restage_turn(self.state, (self.restaging, ns)) {
-      return false;
-    }
-    if command.is_delete() {
-      // A delete peels its old ref (in case it is a tag chain through a let-go pack, A-864) and reaches its own green
-      // so one owing its push enters P2's door before `retire` compares `green.head()`.
-      let began = slates_rt::futures::now_ns();
-      return self.build_turn(command, pushed, began);
-    }
-    let repository = self.record.id;
-    let green = {
-      let state = &*self.state;
-      let Some(store) = state.vcs_stores.git_ref(repository) else {
+    let began = slates_rt::futures::now_ns();
+    loop {
+      let advanced = match self.hooks.ready.stage {
+        ReadyStage::Restage => self.restage_ready(),
+        ReadyStage::Admit => self.admit_ready(command),
+        ReadyStage::Build => self.build_turn(command, pushed, began),
+        ReadyStage::Room => command.is_delete() || self.room_turn(),
+        ReadyStage::Policy => self.policy_ready(command),
+      };
+      if !advanced {
+        return false;
+      }
+      let Some(next) = self.hooks.ready.stage.next() else {
+        self.hooks.ready.stage = ReadyStage::Restage;
+        *self.peel_away = None;
+        self.hooks.ready.last_failed = None;
         return true;
       };
-      born(state, (repository, &command.name), store).unwrap_or_else(|| unheld_key(repository))
-    };
-    let began = slates_rt::futures::now_ns();
-    self
-      .push
-      .admission_turn(self.state, (green, command.new), (self.admitting, ns))
-      && self.build_turn(command, pushed, began)
-      && self.room_turn()
+      self.hooks.ready.stage = next;
+    }
   }
 
   fn judge(&mut self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
@@ -2977,11 +3041,90 @@ impl ServerJudge<'_> {
     false
   }
 
+  /// Pauses the current command for `waited` unless the identical window already failed
+  /// bring-back on this command, returning `true` to advance monotonically past a permanently
+  /// unreadable window without spinning.
+  fn pause_for_wait(&mut self, waited: slates_git::store::packed::Waited) -> bool {
+    if self.hooks.ready.last_failed == Some(waited) {
+      return true;
+    }
+    *self.waited = Some(waited);
+    false
+  }
+
+  /// Runs one restage preparation turn (A-722 part 4e) before admitting the command under way.
+  fn restage_ready(&mut self) -> bool {
+    self.hooks.ready.policy = None;
+    let ns = self.state.config.step_quantum_ns();
+    match self.push.restage_turn(self.state, (self.restaging, ns)) {
+      PushTurn::Done => true,
+      PushTurn::More => false,
+      PushTurn::Waiting(waited) => self.pause_for_wait(waited),
+    }
+  }
+
+  /// Runs one admission preparation turn (A-722 part 4c) for `command` (skipped for deletes).
+  fn admit_ready(&mut self, command: &Command) -> bool {
+    if command.is_delete() {
+      return true;
+    }
+    let repository = self.record.id;
+    let green = {
+      let state = &*self.state;
+      let Some(store) = state.vcs_stores.git_ref(repository) else {
+        return true;
+      };
+      born(state, (repository, &command.name), store).unwrap_or_else(|| unheld_key(repository))
+    };
+    let ns = self.state.config.step_quantum_ns();
+    match self
+      .push
+      .admit_step(self.state, (green, command.new), (self.admitting, ns))
+    {
+      PushTurn::Done => true,
+      PushTurn::More => false,
+      PushTurn::Waiting(waited) => self.pause_for_wait(waited),
+    }
+  }
+
+  /// Pre-evaluates protected-branch policy checks inside `ready` so any let-go pack window read by
+  /// `Repository::change` or `StoreBrings` is brought back before `judge` runs, caching the result
+  /// for the immediately following [`Self::admitted`] call in the same synchronous shard turn.
+  fn policy_ready(&mut self, command: &Command) -> bool {
+    if command.is_delete() || self.hooks.is_declined(&command.name) {
+      return true;
+    }
+    let (checked, waited) = self.eval_admitted(command);
+    if checked.is_err()
+      && let Some(waited) = waited
+      && !self.pause_for_wait(waited)
+    {
+      return false;
+    }
+    self.hooks.ready.policy = Some(checked);
+    true
+  }
+
   /// The policy's verdict on `command` (module docs, "Answering", item 3): A-644's store answers how the change moves
   /// its ref and so the right it needs, and A-622's check point judges that right and, where a rule imposes one, the
   /// requirements on what the change brings (A-644 part 2's `StoreBrings`: a linear history, signed commits); a
   /// refusal in git's words (`git_protect::declined`).
   fn admitted(&mut self, command: &Command) -> Result<(), Declined> {
+    if let Some(checked) = self.hooks.ready.policy.take() {
+      return checked;
+    }
+    self.eval_admitted(command).0
+  }
+
+  /// Evaluates protected-branch policy checks for `command` inside a [`intake::WaitingScope`],
+  /// returning the verdict and any let-go pack window observed during the check.
+  fn eval_admitted(
+    &mut self,
+    command: &Command,
+  ) -> (
+    Result<(), Declined>,
+    Option<slates_git::store::packed::Waited>,
+  ) {
     let Self {
       state,
       push,
@@ -2992,30 +3135,35 @@ impl ServerJudge<'_> {
     let name = command.name.as_slice();
     with_room(state, |state| {
       let Some(store) = state.vcs_stores.git_ref(record.id) else {
-        return Err(refused_declined(name, words(&GitRefused::NoStore)));
+        return (
+          Err(refused_declined(name, words(&GitRefused::NoStore))),
+          None,
+        );
       };
       let (content, git) = store;
-      let _waiting = intake::WaitingScope::enter(&git.repository);
+      let waiting = intake::WaitingScope::enter(&git.repository);
       let green = born(state, (record.id, name), store).unwrap_or_else(|| unheld_key(record.id));
       let to = (!command.is_delete()).then_some(command.new);
-      let change = git
-        .repository
-        .change(content, push.quarantine(), green, to)
-        .map_err(|refused| refused_declined(name, words(&refused)))?;
-      let right = right_of(change);
-      let brings = to.map(|to| StoreBrings {
-        repository: &git.repository,
-        store: content,
-        push: push.quarantine(),
-        green,
-        to,
-      });
-      let asked = [Asked {
-        name: Name::Ref(name),
-        right,
-        brings: brings.as_ref().map(|brings| brings as &dyn Brings),
-      }];
-      admit(record, principal, &asked).map_err(|refusal| declined(&refusal, name, right))
+      let result = match git.repository.change(content, push.quarantine(), green, to) {
+        Ok(change) => {
+          let right = right_of(change);
+          let brings = to.map(|to| StoreBrings {
+            repository: &git.repository,
+            store: content,
+            push: push.quarantine(),
+            green,
+            to,
+          });
+          let asked = [Asked {
+            name: Name::Ref(name),
+            right,
+            brings: brings.as_ref().map(|brings| brings as &dyn Brings),
+          }];
+          admit(record, principal, &asked).map_err(|refusal| declined(&refusal, name, right))
+        }
+        Err(refused) => Err(refused_declined(name, words(&refused))),
+      };
+      (result, waiting.take())
     })
   }
 
@@ -3030,6 +3178,9 @@ impl ServerJudge<'_> {
       preparing,
       ..
     } = self;
+    // Measure `admittable()` BEFORE `with_room`: inside `with_room` (`lent_state`), `state.store.content`
+    // is swapped with a 0-byte placeholder arena (`claimable() == 0`), hiding the shared content pool.
+    let room = state.store.admittable();
     let (entry, examined) = with_room(state, |state| {
       let Some(store) = state.vcs_stores.git_ref(record.id) else {
         return (
@@ -3038,7 +3189,6 @@ impl ServerJudge<'_> {
         );
       };
       let (content, git) = store;
-      let room = state.store.admittable();
       let _waiting = intake::WaitingScope::enter(&git.repository);
       let indexed = intake::TrackedIndexed::new(&git.repository, content, room);
       let objects = PushedObjects::new(&git.repository, content, push.quarantine());
@@ -3098,12 +3248,14 @@ impl ServerJudge<'_> {
       copy_bytes: state.config.copy_slice_bytes_within(quantum).max(1),
       hash_bytes: state.config.archive_slice_bytes_within(quantum).max(1),
     };
+    // Measure `admittable()` BEFORE `with_room` so pool-claimable extents stay visible when the
+    // shard's initial local arena extent is full.
+    let room = state.store.admittable();
     let (built, owing, examined, waited) = with_room(state, |state| {
       let Some(store) = state.vcs_stores.git_ref(record.id) else {
         return Ok::<_, Declined>((true, None, 0, None));
       };
       let (content, git) = store;
-      let room = state.store.admittable();
       let waiting = intake::WaitingScope::enter(&git.repository);
       let indexed = intake::TrackedIndexed::new(&git.repository, content, room);
       let objects = PushedObjects::new(&git.repository, content, push.quarantine());
@@ -3131,11 +3283,17 @@ impl ServerJudge<'_> {
     // turn at a time (P2): its verdict reads it. A turn that only found it builds nothing and is not counted.
     if let Some(green) = owing {
       let ready = self.door(green);
-      *self.waited = waited.filter(|_| !ready);
+      *self.waited =
+        waited.filter(|window| !ready && self.hooks.ready.last_failed != Some(*window));
       return ready;
     }
     *self.door = None;
-    *self.waited = waited.filter(|_| !built);
+    if !built && waited.is_some_and(|window| self.hooks.ready.last_failed == Some(window)) {
+      **preparing = None;
+      *self.waited = None;
+      return true;
+    }
+    *self.waited = waited.filter(|window| !built && self.hooks.ready.last_failed != Some(*window));
     let ended = slates_rt::futures::now_ns();
     // What the turn may pass its budget by: its opening (the admission's turn and the views set up before its first
     // unit, which always runs), one unit, and what it does after its last ask (the views given back). A turn is those

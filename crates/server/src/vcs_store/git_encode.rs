@@ -128,6 +128,9 @@ pub(crate) struct Encodings(
   BTreeMap<RepositoryId, (Encoding, (u64, usize))>,
   /// The repositories whose encoding a task finishes behind a fetch that stopped waiting for it ([`encode_for_fetch`]).
   std::collections::BTreeSet<RepositoryId>,
+  /// Repositories whose shared `Encoding` is currently awaiting a let-go pack window bring-back in
+  /// an owning task so concurrent drivers yield instead of racing into `Encoding::stop_at == false`.
+  std::collections::BTreeSet<RepositoryId>,
 );
 
 impl fmt::Debug for Encodings {
@@ -151,6 +154,9 @@ pub(crate) enum Turned {
 
 /// One turn of repository `id`'s encoding (the module doc), within the shard's quantum on its clock.
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
+  if state.vcs_stores.encodings.2.contains(&id) {
+    return Turned::More;
+  }
   // A-614 amended: a version's D(k), which its fragments are encoded from, derived first where it is not known, so an
   // encoding turned by any path (a fetch's wait, the task behind it) never meets a version left for its first reader.
   match super::git_derive::turn(state, id) {
@@ -546,6 +552,7 @@ pub(crate) fn relieve(
 pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
   drop_under_way(state, id);
   state.vcs_stores.encodings.1.remove(&id);
+  state.vcs_stores.encodings.2.remove(&id);
 }
 
 /// Drops repository `id`'s encoding under way, if any, what it charged the content store given back first (A-856).
@@ -622,12 +629,57 @@ pub(crate) fn ahead_under_way(state: &ShardState, id: RepositoryId) -> bool {
   state.vcs_stores.encodings.1.contains(&id)
 }
 
-/// Brings back the let-go window `waited` for an encoding turn, pinning it until the next turn
-/// enters shard state so concurrent let-go tasks cannot evict it before it is read. Counts
+/// RAII claim marking `id` in `Encodings.2` while the owning encoding task awaits
+/// [`bring_back_waited`]. Dropping the guard (including on task cancellation) releases the claim
+/// so sibling tasks can resume cleanly.
+struct EncodeWaitGuard {
+  id: RepositoryId,
+  armed: bool,
+}
+
+impl EncodeWaitGuard {
+  /// Claims in-flight bring-back ownership for `id` on `state` if no task already holds it.
+  fn claim(state: &mut ShardState, id: RepositoryId) -> Option<Self> {
+    state
+      .vcs_stores
+      .encodings
+      .2
+      .insert(id)
+      .then_some(Self { id, armed: true })
+  }
+
+  /// Releases the claim synchronously while `state` is already borrowed mutably.
+  fn release_in(mut self, state: &mut ShardState) {
+    if self.armed {
+      self.armed = false;
+      state.vcs_stores.encodings.2.remove(&self.id);
+    }
+  }
+}
+
+impl Drop for EncodeWaitGuard {
+  fn drop(&mut self) {
+    if !self.armed {
+      return;
+    }
+    let id = self.id;
+    let _ = crate::state::with_state_counted(|state| {
+      state.vcs_stores.encodings.2.remove(&id);
+    });
+  }
+}
+
+/// An initial waited window handed from a timed-out [`encode_within`] to a newly spawned
+/// [`encode_ahead`] task along with its in-flight wait claim.
+type PendingEncodeWait = (slates_git::store::packed::Waited, Option<EncodeWaitGuard>);
+
+/// Brings back the let-go window `waited` for an encoding turn, pinning it in `pinned` for the
+/// duration of the encoding driver call so concurrent evictions cannot drop an earlier window
+/// while a later window is brought back and trip `Encoding::stop_at == false`. Counts
 /// [`super::upload::RESIDENT_REFUSED`] on failure.
 async fn bring_back_waited(
   waited: slates_git::store::packed::Waited,
-  pinned: &mut Option<super::named_objects::WindowPin>,
+  pinned: &mut Vec<super::named_objects::WindowPin>,
 ) -> bool {
   let window = crate::state::with_state(|state| {
     state
@@ -657,24 +709,28 @@ async fn bring_back_waited(
       .is_some_and(|content| !content.is_away(&window))
   })
   .unwrap_or(false);
-  if resident {
-    *pinned = Some(pin);
+  if resident && !pinned.iter().any(|held| held.window() == window) {
+    pinned.push(pin);
   }
   resident
 }
 
-/// Handles a [`Turned::Waiting`] turn result for [`encode_ahead`] and [`encode_within`], returning
-/// `false` if the identical wait already failed on the previous turn so the driver stops cleanly
-/// instead of spinning.
+/// Handles a [`Turned::Waiting`] turn result for [`encode_ahead`] and [`encode_within`], holding
+/// `claim` across the bring-back `.await` and returning `false` if the identical wait already
+/// failed on the previous turn so the driver stops cleanly instead of spinning.
 async fn await_waited(
   waited: slates_git::store::packed::Waited,
-  pinned: &mut Option<super::named_objects::WindowPin>,
+  claim: Option<EncodeWaitGuard>,
+  pinned: &mut Vec<super::named_objects::WindowPin>,
   last_failed: &mut Option<slates_git::store::packed::Waited>,
 ) -> bool {
   if *last_failed == Some(waited) {
+    drop(claim);
     return false;
   }
-  if bring_back_waited(waited, pinned).await {
+  let brought = bring_back_waited(waited, pinned).await;
+  drop(claim);
+  if brought {
     *last_failed = None;
     return true;
   }
@@ -683,42 +739,59 @@ async fn await_waited(
   true
 }
 
-/// One guarded turn of [`encode_ahead`], stopping and giving back idle state when ahead encoding
-/// is no longer allowed (A-856).
-fn ahead_turn(state: &mut ShardState, id: RepositoryId) -> Turned {
+/// Runs one encoding turn on `state` and atomically claims `Encodings.2` when the turn pauses on
+/// a let-go pack window so sibling drivers yield until bring-back finishes.
+fn claimed_turn(state: &mut ShardState, id: RepositoryId) -> (Turned, Option<EncodeWaitGuard>) {
+  let turned = turn(state, id);
+  let claim = matches!(turned, Turned::Waiting(_))
+    .then(|| EncodeWaitGuard::claim(state, id))
+    .flatten();
+  (turned, claim)
+}
+
+/// One guarded turn of [`encode_ahead`], clearing `pinned` and giving back idle state when ahead
+/// encoding is no longer allowed (A-856).
+fn ahead_turn(
+  state: &mut ShardState,
+  id: RepositoryId,
+  pinned: &mut Vec<super::named_objects::WindowPin>,
+) -> (Turned, Option<EncodeWaitGuard>) {
   if !ahead_allowed(state, id) {
     state.count(AHEAD_STOPPED, 1);
+    pinned.clear();
     if crate::vcs_share::fetches_live(id) == 0 {
       give_back_idle(state, id);
     }
-    return Turned::Idle;
+    return (Turned::Idle, None);
   }
-  turn(state, id)
+  claimed_turn(state, id)
 }
 
 /// Turns repository `id`'s encoding ahead, behind a fetch that stopped waiting (A-718 continued, A-856), yielding
 /// between turns: while [`ahead_allowed`] allows it, until every version's fragments are kept. Where it stops allowed,
 /// counted [`AHEAD_STOPPED`], and its repository has no fetch answered now, what it holds is given back
 /// ([`give_back_idle`]). Returns at once where the shard's state is not lent.
-async fn encode_ahead(id: RepositoryId) {
-  let mut pinned = None;
+async fn encode_ahead(id: RepositoryId, initial: Option<PendingEncodeWait>) {
+  let mut pinned = Vec::new();
   let mut last_failed = None;
+  if let Some((waited, claim)) = initial
+    && !await_waited(waited, claim, &mut pinned, &mut last_failed).await
+  {
+    return;
+  }
   loop {
-    let turned = crate::state::with_state_counted(|state| {
-      pinned = None;
-      ahead_turn(state, id)
-    });
+    let turned = crate::state::with_state_counted(|state| ahead_turn(state, id, &mut pinned));
     match turned {
-      Some(Turned::More) => {
+      Some((Turned::More, _)) => {
         last_failed = None;
         slates_rt::futures::yield_now().await;
       }
-      Some(Turned::Waiting(waited)) => {
-        if !await_waited(waited, &mut pinned, &mut last_failed).await {
+      Some((Turned::Waiting(waited), claim)) => {
+        if !await_waited(waited, claim, &mut pinned, &mut last_failed).await {
           return;
         }
       }
-      Some(Turned::Idle) | None => return,
+      Some((Turned::Idle, _)) | None => return,
     }
   }
 }
@@ -754,33 +827,38 @@ thread_local! {
   pub(crate) static NO_FETCH_WAIT: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
+/// Hands an unfinished [`encode_within`] run off to [`encode_behind`] once `wait_ns` elapses.
+fn hand_off_behind(id: RepositoryId, initial: Option<PendingEncodeWait>) {
+  let _ = crate::state::with_state_counted(|state| encode_behind(state, id, initial));
+}
+
 /// [`encode_for_fetch`] with the wait `wait_ns` long: whether the encoding was idle when it returned.
 pub(crate) async fn encode_within(id: RepositoryId, wait_ns: u64) -> bool {
   let began = slates_rt::futures::now_ns();
-  let mut pinned = None;
+  let mut pinned = Vec::new();
   let mut last_failed = None;
   loop {
-    let turned = crate::state::with_state_counted(|state| {
-      pinned = None;
-      turn(state, id)
-    });
+    let turned = crate::state::with_state_counted(|state| claimed_turn(state, id));
+    let timed_out = slates_rt::futures::now_ns().saturating_sub(began) >= wait_ns;
     match turned {
-      Some(Turned::More | Turned::Waiting(_))
-        if slates_rt::futures::now_ns().saturating_sub(began) >= wait_ns =>
-      {
-        let _ = crate::state::with_state_counted(|state| encode_behind(state, id));
+      Some((Turned::More, _)) if timed_out => {
+        hand_off_behind(id, None);
         return false;
       }
-      Some(Turned::More) => {
+      Some((Turned::Waiting(waited), claim)) if timed_out => {
+        hand_off_behind(id, Some((waited, claim)));
+        return false;
+      }
+      Some((Turned::More, _)) => {
         last_failed = None;
         slates_rt::futures::yield_now().await;
       }
-      Some(Turned::Waiting(waited)) => {
-        if !await_waited(waited, &mut pinned, &mut last_failed).await {
+      Some((Turned::Waiting(waited), claim)) => {
+        if !await_waited(waited, claim, &mut pinned, &mut last_failed).await {
           return false;
         }
       }
-      Some(Turned::Idle) | None => return true,
+      Some((Turned::Idle, _)) | None => return true,
     }
   }
 }
@@ -788,22 +866,30 @@ pub(crate) async fn encode_within(id: RepositoryId, wait_ns: u64) -> bool {
 /// Starts a task finishing repository `id`'s encoding behind a fetch that stopped waiting, unless one is at it already;
 /// counted [`BEHIND`]. The task ends when the encoding is idle, the repository freed or the shard's state gone, or when
 /// it may no longer be made ahead ([`encode_ahead`], A-856).
-fn encode_behind(state: &mut ShardState, id: RepositoryId) {
+fn encode_behind(state: &mut ShardState, id: RepositoryId, initial: Option<PendingEncodeWait>) {
   state.count(BEHIND, 1);
   if !state.vcs_stores.encodings.1.insert(id) {
+    if let Some((_, claim)) = initial {
+      if let Some(claim) = claim {
+        claim.release_in(state);
+      }
+      drop_under_way(state, id);
+    }
     return;
   }
   let behind = async move {
-    encode_ahead(id).await;
+    encode_ahead(id, initial).await;
     let _ = crate::state::with_state_counted(|state| state.vcs_stores.encodings.1.remove(&id));
   };
   match slates_rt::futures::spawn(behind) {
     Ok(task) => {
       let _ = slates_rt::futures::detach(task);
     }
-    // No task to spare: the next fetch turns the encoding on, as before.
+    // No task to spare: clear any claim and drop the encoding so the next fetch restarts cleanly.
     Err(_) => {
       state.vcs_stores.encodings.1.remove(&id);
+      state.vcs_stores.encodings.2.remove(&id);
+      drop_under_way(state, id);
     }
   }
 }

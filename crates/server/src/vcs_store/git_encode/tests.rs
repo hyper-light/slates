@@ -1006,3 +1006,112 @@ fn t_rt_git_encode_turn_returns_waiting_without_stranding_shared_cell() {
   });
   daemon.stop();
 }
+
+/// Shape: generous upper bound on `claimed_turn` calls to reach the first evicted pack window even
+/// when host CPU load trips the shard step quantum after every encoding unit.
+const MAX_TURNS_TO_WAIT: usize = 64;
+
+/// Drives `super::claimed_turn(state, id)` past any quantum-paced `Turned::More` turns (asserting
+/// none acquires a wait claim) until encoding pauses on an evicted pack window.
+fn drive_claimed_turn_until_waiting(
+  state: &mut crate::state::ShardState,
+  id: slates_db::catalog::RepositoryId,
+) -> (
+  slates_git::store::packed::Waited,
+  Option<super::EncodeWaitGuard>,
+) {
+  for _ in 0..MAX_TURNS_TO_WAIT {
+    match super::claimed_turn(state, id) {
+      (Turned::Waiting(waited), claim) => return (waited, claim),
+      (Turned::More, claim) => {
+        assert!(
+          claim.is_none(),
+          "Turned::More must not acquire an EncodeWaitGuard claim"
+        );
+      }
+      (Turned::Idle, _) => {
+        panic!("expected Turned::Waiting on evicted pack encode, got Turned::Idle");
+      }
+    }
+  }
+  panic!("encode did not reach Turned::Waiting within {MAX_TURNS_TO_WAIT} turns");
+}
+
+/// Verifies `EncodeWaitGuard` (`Encodings.2` claim) forces concurrent `turn` calls to return
+/// `Turned::More` without tripping `Encoding::stop_at == false` (`REFUSED`), and releasing the
+/// claim lets encoding finish cleanly.
+fn assert_wait_claim_blocks_concurrent_turn(
+  state: &mut crate::state::ShardState,
+) -> (
+  slates_db::catalog::RepositoryId,
+  (slates_vcs::ContentId, Vec<u8>),
+) {
+  let id = crate::git_push::tests::git_repository(state, "encode-claim");
+  let (c0, objects_0) = commit_with_blob("alpha.txt", b"alpha body for encode claim\n", None);
+  let pack_0 = commit_and_evict_pack(state, id, WAIT_TEST_GREEN, c0, &objects_0);
+  derive_after_first_wait(state, id, pack_0.0, std::slice::from_ref(&pack_0));
+  evict_on_shard(state, id, &pack_0.1);
+
+  let (waited, claim) = drive_claimed_turn_until_waiting(state, id);
+  let concurrent = turn(state, id);
+  let refused_while_claimed = state.refusals.get(super::REFUSED).copied().unwrap_or(0);
+  let had_claim = claim.is_some();
+  if let Some(guard) = claim {
+    guard.release_in(state);
+  }
+  restore_on_shard(state, std::slice::from_ref(&pack_0), waited);
+  let _waits = drive_turn_with_clobbers(state, id, std::slice::from_ref(&pack_0));
+  assert_eq!(
+    (
+      had_claim,
+      concurrent,
+      refused_while_claimed,
+      state.refusals.get(super::ENCODED).copied(),
+      state.refusals.get(super::REFUSED).copied().unwrap_or(0),
+    ),
+    (true, Turned::More, 0, Some(1), 0)
+  );
+  (id, pack_0)
+}
+
+/// Verifies a `WindowPin` retained in `Vec<WindowPin>` blocks `let_go_resident_packs` eviction.
+fn assert_window_pin_blocks_let_go(
+  state: &mut crate::state::ShardState,
+  id: slates_db::catalog::RepositoryId,
+  pack: &(slates_vcs::ContentId, Vec<u8>),
+) {
+  let window = state
+    .vcs_stores
+    .content()
+    .and_then(|content| content.window_holding(&pack.0, u64::try_from(pack.1.len()).unwrap(), 0))
+    .map(|(w, _, _)| w)
+    .expect("window id");
+  let mut pins = vec![super::super::named_objects::WindowPin::of(window)];
+  super::super::let_go_resident_packs(state, id, 0);
+  let still_resident = state
+    .vcs_stores
+    .content()
+    .is_some_and(|content| !content.is_away(&window));
+  pins.clear();
+  assert!(
+    still_resident,
+    "WindowPin kept in Vec<WindowPin> must block let_go_resident_packs eviction"
+  );
+}
+
+/// Red-team regression (`rt-git-waiting` Rung-4 Seam #2, §4.17.2): proves (1) holding an
+/// `EncodeWaitGuard` (`Encodings.2` claim) makes concurrent `git_encode::turn` calls yield
+/// `Turned::More` instead of racing into `Encoding::stop_at == false` and tripping `REFUSED`, and
+/// dropping the guard (including on cancellation) immediately allows encoding to finish; and (2)
+/// retaining `WindowPin`s in `Vec<WindowPin>` blocks `let_go_resident_packs` from evicting an
+/// earlier window while bringing back a later one.
+#[test]
+fn t_rt_git_encode_wait_claim_and_multi_window_pins_prevent_stop_at_race() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (id, pack_0) =
+    crate::daemon::observe_first(&daemon, assert_wait_claim_blocks_concurrent_turn);
+  crate::daemon::observe_first(&daemon, move |state| {
+    assert_window_pin_blocks_let_go(state, id, &pack_0);
+  });
+  daemon.stop();
+}

@@ -476,6 +476,7 @@ fn step_within_quantum<L: StoreLender>(
   (admission, out, before): (&mut Admission, &mut Vec<u8>, usize),
   (start, quantum): (u64, u64),
 ) -> Written {
+  let _waiting = crate::vcs_store::WaitingScope::enter(served.repository);
   loop {
     let left = MAX_LEN.saturating_sub(out.len().saturating_sub(before));
     if left == 0 {
@@ -542,8 +543,9 @@ impl<L: StoreLender> Upload<L> {
     loop {
       let (made, away) = lender
         .lend((*repository, reader), |served, packs| {
+          let waiting = crate::vcs_store::WaitingScope::enter(served.repository);
           let made = upload::serve_in_turns(served, *version, Asked::Advertise, packs, admission);
-          let away = made.refusal().and(served.repository.waiting());
+          let away = waiting.take().filter(|_| made.refusal().is_some());
           (made, away)
         })
         .ok_or(unavailable)?;
@@ -590,6 +592,7 @@ impl<L: StoreLender> Upload<L> {
     let made = loop {
       let (made, away) = lender
         .lend_held(&held, |served, packs| {
+          let waiting = crate::vcs_store::WaitingScope::enter(served.repository);
           let made = upload::serve_in_turns(
             served,
             *version,
@@ -598,7 +601,7 @@ impl<L: StoreLender> Upload<L> {
             admission,
           )
           .holding();
-          let away = made.refusal().and(served.repository.waiting());
+          let away = waiting.take().filter(|_| made.refusal().is_some());
           (made, away)
         })
         .ok_or(unavailable)?;
@@ -655,6 +658,7 @@ impl<L: StoreLender> Upload<L> {
     let mut again_room = Admission::new(*admitted);
     let again = lender
       .lend_held(held, |served, packs| {
+        let _waiting = crate::vcs_store::WaitingScope::enter(served.repository);
         upload::serve_in_turns(
           served,
           *version,
@@ -707,6 +711,7 @@ impl<L: StoreLender> Upload<L> {
       let mut wider = Admission::new(room);
       let again = lender
         .lend_held(held, |served, packs| {
+          let _waiting = crate::vcs_store::WaitingScope::enter(served.repository);
           upload::serve_in_turns(
             served,
             *version,

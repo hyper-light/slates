@@ -387,10 +387,12 @@ enum Step {
 }
 
 /// [`start`]'s task: a turn of the build at each of the shard's turns until it is done, then the commit; a build past its
-/// room waits for room and is made again within it ([`waited`], A-857).
+/// room waits for room and is made again within it ([`waited`], A-857). Holds [`WindowPin`]s for brought-back pack
+/// windows across `.await`s so concurrent evictions cannot drop them before the build reads them.
 async fn materialize(green: DbVolumeId) {
   let mut past: Option<(u64, u64)> = None;
   let mut held = None;
+  let mut pins: Vec<crate::vcs_store::named_objects::WindowPin> = Vec::new();
   loop {
     let step = crate::state::with_state(|state| {
       if let Some(refused) = past {
@@ -417,10 +419,10 @@ async fn materialize(green: DbVolumeId) {
         // A sleep the runtime refuses ends the wait early: the next turn asks again.
         let _ = slates_rt::futures::sleep(ns).await;
       }
-      // The window the build stopped at brought back (bounded by its patience, `read_through::PATIENCE_NS`), then the
+      // The window the build stopped at brought back and pinned (bounded by `read_through::PATIENCE_NS`), then the
       // unit taken again; refused, the build is: a window that cannot come back is never read again in a loop.
       Some(Step::BringBack(waited)) => {
-        match crate::vcs_store::read_through::bring_back(waited).await {
+        match crate::vcs_store::bring_back_pinned(waited, &mut pins).await {
           Ok(_) => {
             let _ = crate::state::with_state(|state| state.count(MATERIALIZE_BROUGHT_BACK, 1));
           }
@@ -490,21 +492,22 @@ fn give_up(state: &mut ShardState, green: DbVolumeId) {
   refuse_parked(state, green, Refusal::ContentUnavailable);
 }
 
-/// One turn of `green`'s build, under half the shard's step quantum: what it came to ([`Turned`]).
-fn turn(state: &mut ShardState, green: DbVolumeId) -> Turned {
-  let Some(mut building) = state.materializations.building.remove(&green) else {
-    return Turned::Done;
-  };
-  let repository = repository_of(state, green);
-  let quantum = state.config.step_quantum_ns() / 2;
-  building
-    .pace()
-    .turn(slates_rt::futures::now_ns().saturating_add(quantum.max(1)));
-  // The build's turn over the green and its tool's objects; why it cannot run, where it cannot. Read with the stores
-  // lent room and the shard's chunk store, as a push's build reads them: a tool's objects lie in windows that chunk
-  // store keeps, and a settled content store admits no parse.
-  let advanced: Option<Result<slates_merge::push::Built, Failed>> =
-    crate::vcs_store::with_room(state, |state| match state.greens.lend(&green) {
+/// Runs one lent advance step of `building` over `green`'s repository inside a [`WaitingScope`],
+/// clearing any stale wait on entry and draining any noted wait on all exit paths.
+fn advance_turn(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  repository: Option<RepositoryId>,
+  building: &mut slates_merge::push::Building,
+) -> (
+  Option<Result<slates_merge::push::Built, Failed>>,
+  Option<slates_git::store::packed::Waited>,
+) {
+  crate::vcs_store::with_room(state, |state| {
+    let waiting = repository
+      .and_then(|id| state.vcs_stores.git_ref(id))
+      .map(|(_, store)| crate::vcs_store::WaitingScope::enter(&store.repository));
+    let advanced = match state.greens.lend(&green) {
       Some(engine) => {
         let mut turned = None;
         let found = with_objects(state, repository, &mut |objects| {
@@ -518,15 +521,30 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> Turned {
         }
       }
       None => Some(Err(Failed::Other("the green is not here".to_owned()))),
-    });
+    };
+    let waited = waiting.and_then(crate::vcs_store::WaitingScope::take);
+    (advanced, waited)
+  })
+}
+
+/// One turn of `green`'s build, under half the shard's step quantum: what it came to ([`Turned`]).
+fn turn(state: &mut ShardState, green: DbVolumeId) -> Turned {
+  let Some(mut building) = state.materializations.building.remove(&green) else {
+    return Turned::Done;
+  };
+  let repository = repository_of(state, green);
+  let quantum = state.config.step_quantum_ns() / 2;
+  building
+    .pace()
+    .turn(slates_rt::futures::now_ns().saturating_add(quantum.max(1)));
+  // The build's turn over the green and its tool's objects; why it cannot run, where it cannot. Read with the stores
+  // lent room and the shard's chunk store, as a push's build reads them: a tool's objects lie in windows that chunk
+  // store keeps, and a settled content store admits no parse.
+  let (advanced, waited) = advance_turn(state, green, repository, &mut building);
   match advanced {
     None => {
       // A unit that met a window let go: the window its read noted on the repository, brought back before the next turn.
-      let waited = building
-        .waiting()
-        .and(repository)
-        .and_then(|repository| state.vcs_stores.git(repository))
-        .and_then(|(_, store)| store.repository.waiting());
+      let waited = building.waiting().and(waited);
       state.materializations.building.insert(green, building);
       waited.map_or(Turned::More, Turned::Waiting)
     }

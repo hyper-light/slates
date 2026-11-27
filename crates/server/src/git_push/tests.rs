@@ -4127,10 +4127,12 @@ async fn sync_path_drive(
   }
 }
 
-/// Counts how many landed pack windows in `packs` are currently let go (`away`) in the shard's
+/// Drains any queued landed-pack let-go slices on shard 0 (`vcs_store::let_go_turn`) and counts
+/// how many landed pack windows in `packs` are currently let go (`away`) in the shard's
 /// `ContentStore`.
 fn count_away_pack_windows(daemon: &crate::Daemon, packs: Vec<Vec<u8>>) -> usize {
   crate::daemon::observe_first(daemon, move |state| {
+    while crate::vcs_store::let_go_turn(state) {}
     let Some(content) = state.vcs_stores.content() else {
       return 0;
     };
@@ -6629,5 +6631,436 @@ fn t_rt_git_concurrent_pushes_interleaved_waiting_survives() {
   .expect("deferred resolve clobber push");
   assert_eq!(reasons(&rec_thin), [b"ok"]);
 
+  daemon.stop();
+}
+
+/// Shape: generous upper bound on turns for a fast-forward push whose let-go pack window cannot be
+/// brought back (spin guard must fail cleanly in a handful of turns, never looping).
+const MAX_UNBRINGABLE_TURNS: usize = 64;
+
+/// Runs one `answer_step` on the current shard, verifying `Repository::waiting` is drained on exit.
+fn step_push_checking_waiting(
+  push: &mut ReceivePack,
+  out: &mut Vec<u8>,
+  turn: usize,
+) -> Result<(Answering, bool), String> {
+  let (step, paused, leaked) = crate::state::with_state(|state| {
+    let step = push.answer_step(state, out);
+    let leaked = state
+      .vcs_stores
+      .git_ref(push.repository())
+      .and_then(|(_, git)| git.repository.peek_waiting());
+    (step, push.waited.is_some(), leaked)
+  })
+  .ok_or("no state for answer_step")?;
+  if leaked.is_some() {
+    return Err(format!(
+      "shared Repository::waiting leaked after turn {turn}: {leaked:?}"
+    ));
+  }
+  let step = step.map_err(|failed| format!("answer_step failed: {failed:?}"))?;
+  Ok((step, paused))
+}
+
+/// Drives `push` asynchronously until answered, returning `(received, waited_pauses, turns)` and
+/// failing if `turns` exceeds `max_turns` (non-vacuous termination guard against wait spins).
+async fn drive_push_counting_waits(
+  push: &mut ReceivePack,
+  max_turns: usize,
+) -> Result<(Received, usize, usize), String> {
+  let mut out = Vec::new();
+  let (mut waits, mut turns) = (0_usize, 0_usize);
+  loop {
+    turns = turns.saturating_add(1);
+    if turns > max_turns {
+      return Err(format!("push spun past {max_turns} turns (waits={waits})"));
+    }
+    match step_push_checking_waiting(push, &mut out, turns)? {
+      (Answering::Answered(received), _) => return Ok((*received, waits, turns)),
+      (Answering::Turned, paused) => {
+        waits = waits.saturating_add(usize::from(paused));
+        push.bring_back_waited().await;
+        carry_awaited(push).await?;
+        slates_rt::futures::yield_now().await;
+      }
+      #[cfg(unix)]
+      (Answering::Hook(_), _) => return Err("unexpected hook".to_owned()),
+    }
+  }
+}
+
+/// Drives a complete `ReceivePack` request on the first shard asynchronously while counting
+/// `waited` pauses and total turns.
+async fn run_push_request_counting_waits(
+  repository: RepositoryId,
+  req: Vec<u8>,
+  max_turns: usize,
+) -> Result<(Received, usize, usize), String> {
+  let mut push = crate::state::with_state(|state| start_and_feed_push(state, repository, &req))
+    .ok_or("no state to start push")?;
+  drive_push_counting_waits(&mut push, max_turns).await
+}
+
+/// Derives all pending reach sets (`D(k)`) for `repository` on `daemon`'s first shard so later
+/// fast-forward admissions enter `Phase::Brought` and walk intermediate commits/trees.
+fn derive_all_on_first(daemon: &crate::Daemon, repository: RepositoryId) {
+  let patience = std::time::Duration::from_secs(WAIT_TASK_TIMEOUT_SECS);
+  crate::test_store::run_on_first(
+    daemon,
+    move || async move {
+      crate::vcs_store::git_derive::derive_for_read(repository).await;
+    },
+    patience,
+  );
+}
+
+/// Builds a one-commit pack from `storm_commit(index, parent, entries)` and returns `(id, pack)`.
+fn storm_pack(
+  index: usize,
+  parent: Option<ObjectId>,
+  entries: &mut Vec<(String, ObjectId)>,
+) -> (ObjectId, Vec<u8>) {
+  use slates_git::object_name::Kind;
+  let (commit, c_bytes, _, t_bytes, _, b_bytes) = storm_commit(index, parent, entries);
+  let pack = pack_of_objects(&[
+    (Kind::Commit, c_bytes),
+    (Kind::Tree, t_bytes),
+    (Kind::Blob, b_bytes),
+  ]);
+  (commit, pack)
+}
+
+/// Seeded `C1 -> C1.5 -> C2` commit chain, pack payloads, and tree entries.
+struct SeededCommitChain {
+  c1: ObjectId,
+  c2: ObjectId,
+  pack_1: Vec<u8>,
+  pack_a: Vec<u8>,
+  pack_b: Vec<u8>,
+  entries: Vec<(String, ObjectId)>,
+}
+
+/// Seeds `C1` on `main` (and `corrupt-ff`), `C1.5` on `staging` (Pack A), and `C2` on `staging`
+/// (Pack B).
+fn seed_three_commit_chain(daemon: &crate::Daemon, repository: RepositoryId) -> SeededCommitChain {
+  let mut entries = Vec::new();
+  let (c1, pack_1) = storm_pack(0, None, &mut entries);
+  let req_1 = request(
+    &[
+      ("", &c1.to_string(), b"refs/heads/main"),
+      ("", &c1.to_string(), b"refs/heads/corrupt-ff"),
+    ],
+    CAPABILITIES,
+    &pack_1,
+  );
+  let (_, rec_1) = pushed_pipelined_in_steps(daemon, repository, &req_1).expect("seed C1");
+
+  let (c15, pack_a) = storm_pack(1, Some(c1), &mut entries);
+  let req_a = request(
+    &[("", &c15.to_string(), b"refs/heads/staging")],
+    CAPABILITIES,
+    &pack_a,
+  );
+  let (_, rec_a) = pushed_pipelined_in_steps(daemon, repository, &req_a).expect("seed C1.5");
+
+  let (c2, pack_b) = storm_pack(2, Some(c15), &mut entries);
+  let req_b = request(
+    &[(&c15.to_string(), &c2.to_string(), b"refs/heads/staging")],
+    CAPABILITIES,
+    &pack_b,
+  );
+  let (_, rec_b) = pushed_pipelined_in_steps(daemon, repository, &req_b).expect("seed C2");
+  assert_eq!(
+    (reasons(&rec_1), reasons(&rec_a), reasons(&rec_b)),
+    (
+      vec![b"ok".to_vec(), b"ok".to_vec()],
+      vec![b"ok".to_vec()],
+      vec![b"ok".to_vec()],
+    )
+  );
+  SeededCommitChain {
+    c1,
+    c2,
+    pack_1,
+    pack_a,
+    pack_b,
+    entries,
+  }
+}
+
+/// Seeds `c0` on materialized `main` and `c1` on `staging` for the Blocker-1 pool-room regression.
+fn seed_materialized_ff_pair(
+  state: &mut ShardState,
+  repository: RepositoryId,
+) -> (ObjectId, ObjectId) {
+  let mut entries = Vec::new();
+  let (c0, pack_0) = storm_pack(0, None, &mut entries);
+  let rec_0 = pushed(
+    state,
+    repository,
+    &request(
+      &[("", &c0.to_string(), b"refs/heads/main")],
+      CAPABILITIES,
+      &pack_0,
+    ),
+  );
+  let (c1, pack_1) = storm_pack(1, Some(c0), &mut entries);
+  let rec_1 = pushed(
+    state,
+    repository,
+    &request(
+      &[("", &c1.to_string(), b"refs/heads/staging")],
+      CAPABILITIES,
+      &pack_1,
+    ),
+  );
+  assert_eq!(
+    (reasons(&rec_0), reasons(&rec_1)),
+    (vec![b"ok".to_vec()], vec![b"ok".to_vec()])
+  );
+  let main_green = state
+    .db
+    .partition()
+    .repositories()
+    .branch(repository, "main")
+    .expect("main green");
+  crate::green_ready::made_now(state, main_green);
+  (c0, c1)
+}
+
+/// Red-team regression (`rt-git-waiting` Blocker 1, §4.17.2): `ServerJudge::build_turn` and
+/// `ServerJudge::verdict` must read `state.store.admittable()` BEFORE entering `with_room` so the
+/// shared content pool's claimable extents stay visible once the shard's initial local arena fills.
+/// Expect: with local arena budget charged to 0 (`with_room` sees 0 while `store.admittable() > 0`),
+/// a fast-forward update on materialized `main` succeeds with `ok` instead of `push past its room`.
+#[test]
+fn t_rt_git_push_sees_pool_admittable_room_when_local_arena_full() {
+  crate::test_store::audit_on_stored_shard("git-push-pool-room", |state| {
+    let repository = git_repository(state, "pool-room");
+    let (c0, c1) = seed_materialized_ff_pair(state, repository);
+    let (_, mut ff_push) = started(state, repository);
+    let ff_req = request(
+      &[(&c0.to_string(), &c1.to_string(), b"refs/heads/main")],
+      CAPABILITIES,
+      empty_pack(),
+    );
+    ff_push.input(state, &ff_req).unwrap();
+    ff_push.end(state).unwrap();
+    let mut decision = take_ready_deciding(state, &mut ff_push);
+
+    let local_room = state.store.budget.admittable();
+    state
+      .store
+      .budget
+      .charge_retention(local_room)
+      .expect("fill local arena extent");
+    let inside_with_room = super::with_room(state, |inner| inner.store.admittable());
+    let outside_with_room = state.store.admittable();
+    while !step_direct_server_judge(state, &mut ff_push, &mut decision, false) {}
+    decision.sealed.abandon(state);
+    state.store.budget.credit_retention(local_room);
+    let received = decision.deciding.received();
+    assert_eq!(
+      (
+        inside_with_room,
+        outside_with_room > 0,
+        reasons(&received),
+        files(state, repository, "main").len(),
+      ),
+      (0, true, vec![b"ok".to_vec()], 2)
+    );
+  });
+}
+
+/// Asserts that fast-forwarding `refs/heads/main` from `c1` to `c2` while intermediate Pack A is
+/// let go pauses to bring back the pack and commits `ok`.
+fn assert_ff_over_letgo_intermediate_pack(
+  daemon: &crate::Daemon,
+  repository: RepositoryId,
+  (c1, c2): (ObjectId, ObjectId),
+  packs: Vec<Vec<u8>>,
+) {
+  let away = count_away_pack_windows(daemon, packs);
+  let patience = std::time::Duration::from_secs(WAIT_TASK_TIMEOUT_SECS);
+  let ff_req = request(
+    &[(&c1.to_string(), &c2.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    empty_pack(),
+  );
+  let (rec, waits, _) = crate::test_store::run_on_first(
+    daemon,
+    move || run_push_request_counting_waits(repository, ff_req.clone(), MAX_UNBRINGABLE_TURNS),
+    patience,
+  )
+  .expect("fast-forward push over let-go intermediate pack");
+  assert_eq!(
+    (away >= 3, waits >= 1, reasons(&rec)),
+    (true, true, vec![b"ok".to_vec()])
+  );
+}
+
+/// Asserts that pushing a new commit `c3` atop `c2` after re-evicting prior packs succeeds `ok`,
+/// returning `pack_c`.
+fn assert_new_commit_after_letgo(
+  daemon: &crate::Daemon,
+  repository: RepositoryId,
+  c2: ObjectId,
+  entries: &mut Vec<(String, ObjectId)>,
+  prior_packs: Vec<Vec<u8>>,
+) -> Vec<u8> {
+  derive_all_on_first(daemon, repository);
+  let away = count_away_pack_windows(daemon, prior_packs);
+  let (c3, pack_c) = storm_pack(3, Some(c2), entries);
+  let req_c3 = request(
+    &[(&c2.to_string(), &c3.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack_c,
+  );
+  let patience = std::time::Duration::from_secs(WAIT_TASK_TIMEOUT_SECS);
+  let (rec, _, _) = crate::test_store::run_on_first(
+    daemon,
+    move || run_push_request_counting_waits(repository, req_c3.clone(), MAX_UNBRINGABLE_TURNS),
+    patience,
+  )
+  .expect("new-commit push C2 -> C3 after let-go");
+  assert_eq!((away >= 3, reasons(&rec)), (true, vec![b"ok".to_vec()]));
+  pack_c
+}
+
+/// Asserts that when the node store cannot bring back a let-go intermediate pack, the `last_failed`
+/// spin guard terminates the push cleanly within `MAX_UNBRINGABLE_TURNS` instead of spinning.
+fn assert_unbringable_pack_stops_boundedly(
+  daemon: &crate::Daemon,
+  repository: RepositoryId,
+  (c1, c2): (ObjectId, ObjectId),
+  packs: Vec<Vec<u8>>,
+) {
+  let away = count_away_pack_windows(daemon, packs);
+  let saved_disk = crate::daemon::observe_first(daemon, |state| state.vcs_disk.take());
+  let corrupt_req = request(
+    &[(&c1.to_string(), &c2.to_string(), b"refs/heads/corrupt-ff")],
+    CAPABILITIES,
+    empty_pack(),
+  );
+  let patience = std::time::Duration::from_secs(WAIT_TASK_TIMEOUT_SECS);
+  let (rec, waits, turns) = crate::test_store::run_on_first(
+    daemon,
+    move || run_push_request_counting_waits(repository, corrupt_req.clone(), MAX_UNBRINGABLE_TURNS),
+    patience,
+  )
+  .expect("unbringable pack must terminate cleanly without spinning");
+  crate::daemon::observe_first(daemon, move |state| {
+    state.vcs_disk = saved_disk;
+  });
+  assert_eq!(
+    (
+      away >= 2,
+      waits >= 1,
+      turns < MAX_UNBRINGABLE_TURNS,
+      reasons(&rec) != [b"ok"],
+    ),
+    (true, true, true, true)
+  );
+}
+
+/// Red-team regression (`rt-git-waiting` Blocker 2, §4.17.2): when `main` has a derived reach set
+/// `D(k)` and an intermediate commit/tree (`C1.5` in Pack A) between `C1` and `C2` lies in a
+/// let-go pack window, `SealedPush::admit_step` must propagate `PushTurn::Waiting` instead of
+/// swallowing `StoreRefused::Unreadable`, letting `ServerJudge::ready` bring back and pin Pack A
+/// before `build_turn` and `append` run. Also verifies a follow-up new-commit push `C2 -> C3`
+/// succeeds and an unbringable let-go pack fails cleanly within bounded turns via `last_failed`.
+#[test]
+fn t_rt_git_push_admission_letgo_intermediate_packs_and_spin_guard() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository =
+    crate::daemon::observe_first(&daemon, |state| git_repository(state, "admit-letgo"));
+  let SeededCommitChain {
+    c1,
+    c2,
+    pack_1,
+    pack_a,
+    pack_b,
+    mut entries,
+  } = seed_three_commit_chain(&daemon, repository);
+  derive_all_on_first(&daemon, repository);
+
+  assert_ff_over_letgo_intermediate_pack(
+    &daemon,
+    repository,
+    (c1, c2),
+    vec![pack_1.clone(), pack_a.clone(), pack_b.clone()],
+  );
+  let pack_c = assert_new_commit_after_letgo(
+    &daemon,
+    repository,
+    c2,
+    &mut entries,
+    vec![pack_1.clone(), pack_a.clone(), pack_b],
+  );
+  assert_unbringable_pack_stops_boundedly(
+    &daemon,
+    repository,
+    (c1, c2),
+    vec![pack_1, pack_a, pack_c],
+  );
+  daemon.stop();
+}
+
+/// Red-team regression (`rt-git-waiting` Rung-4 Seam #1, §4.17.2): when a protected branch requires
+/// signed commits (`PolicyRight::UnsignedCommit`) and the target commit lives in a let-go pack
+/// window, `ServerJudge::ready` (`ReadyStage::Policy`) must capture the let-go wait and bring the
+/// pack window back before `ServerJudge::admitted` judges `StoreBrings::unsigned_commit`, so the
+/// push receives the true `Unsigned::Missing` verdict rather than `PushRefusal::Unjudged`
+/// ("its commits cannot be read").
+#[test]
+fn t_rt_git_push_protected_signed_letgo_commit_brings_back_in_ready() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository =
+    crate::daemon::observe_first(&daemon, |state| git_repository(state, "policy-letgo"));
+  let mut entries = Vec::new();
+  let (c1, pack_a) = storm_pack(0, None, &mut entries);
+  let seed_req = request(
+    &[("", &c1.to_string(), b"refs/heads/staging")],
+    CAPABILITIES,
+    &pack_a,
+  );
+  let (_, rec_seed) = pushed_pipelined_in_steps(&daemon, repository, &seed_req).expect("seed C1");
+
+  crate::daemon::observe_first(&daemon, |state| {
+    set_policy(
+      state,
+      "policy-letgo",
+      0,
+      (
+        vec![deny(PolicyRight::UnsignedCommit, "refs/heads/main")],
+        Vec::new(),
+      ),
+    );
+  });
+
+  let away = count_away_pack_windows(&daemon, vec![pack_a]);
+  let patience = std::time::Duration::from_secs(WAIT_TASK_TIMEOUT_SECS);
+  let push_req = request(
+    &[("", &c1.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    empty_pack(),
+  );
+  let (rec, waits, _) = crate::test_store::run_on_first(
+    &daemon,
+    move || run_push_request_counting_waits(repository, push_req.clone(), MAX_UNBRINGABLE_TURNS),
+    patience,
+  )
+  .expect("protected push over let-go commit");
+  let expected = Outcome::Ng(protected::unsigned_commit::<
+    crate::git_protect::CommitKeys<'static>,
+  >(
+    b"refs/heads/main",
+    &c1,
+    &slates_git::store::Unsigned::Missing,
+  ));
+  assert_eq!(
+    (reasons(&rec_seed), away >= 1, waits >= 1, rec.outcomes),
+    (vec![b"ok".to_vec()], true, true, vec![expected])
+  );
   daemon.stop();
 }

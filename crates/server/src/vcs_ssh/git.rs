@@ -229,6 +229,7 @@ impl<L: StoreLender> UploadCommand<L> {
     let again = self
       .lender
       .lend_held(held, |served, packs| {
+        let _waiting = crate::vcs_store::WaitingScope::enter(served.repository);
         upload::serve_in_turns(
           served,
           version,
@@ -276,6 +277,7 @@ impl<L: StoreLender> UploadCommand<L> {
       let mut wider = Admission::new(room);
       let again = lender
         .lend_held(held, |served, packs| {
+          let _waiting = crate::vcs_store::WaitingScope::enter(served.repository);
           upload::serve_in_turns(
             served,
             *version,
@@ -334,13 +336,14 @@ impl<L: StoreLender> UploadCommand<L> {
     *admission = Admission::new(shard);
     *admitted = shard;
     let answered = |served: &Served<'_>, packs: &mut L::Packs, admission: &mut Admission| {
+      let waiting = crate::vcs_store::WaitingScope::enter(served.repository);
       let made = upload::serve_in_turns(served, *version, asked, packs, admission);
       // A-855: a fetch's negotiation run past its room is held, not answered, until the room grows (`wait_for_room`).
       let made = match asked {
         Asked::Request(_) => made.holding(),
         Asked::Advertise => made,
       };
-      let away = made.refusal().and(served.repository.waiting());
+      let away = waiting.take().filter(|_| made.refusal().is_some());
       (made, away)
     };
     let (made, away) = match asked {
@@ -402,6 +405,7 @@ impl<L: StoreLender> UploadCommand<L> {
     };
     let before = out.len();
     let step = |served: &Served<'_>, packs: &mut L::Packs| {
+      let _waiting = crate::vcs_store::WaitingScope::enter(served.repository);
       let mut spent = packs.turn();
       made.write_within(served, packs, admission, out, MAX_LEN, &mut spent)
     };

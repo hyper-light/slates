@@ -1830,6 +1830,79 @@ pub(crate) fn lent_state<T>(state: &mut ShardState, step: impl FnOnce(&mut Shard
   answer
 }
 
+/// Scoped owner of a git [`Repository`]'s shared `waiting` cell for one synchronous shard turn:
+/// clears any stale wait on entry, captures the current turn's own [`Waited`] via [`Self::take`],
+/// and drains the cell on drop so early returns never leak a wait across concurrent tasks.
+pub(crate) struct WaitingScope<'r> {
+  repository: &'r Repository,
+}
+
+impl<'r> WaitingScope<'r> {
+  /// Clears any stale wait on `repository` and guards the remainder of the current shard turn.
+  pub(crate) fn enter(repository: &'r Repository) -> Self {
+    let _ = repository.waiting();
+    Self { repository }
+  }
+
+  /// Synchronously drains and returns the let-go window noted during this turn, if any.
+  pub(crate) fn take(self) -> Option<slates_git::store::packed::Waited> {
+    self.repository.waiting()
+  }
+}
+
+impl Drop for WaitingScope<'_> {
+  fn drop(&mut self) {
+    let _ = self.repository.waiting();
+  }
+}
+
+/// Brings back the let-go pack window `waited` from the node's store while holding a
+/// [`named_objects::WindowPin`] across the `.await` so concurrent evictions cannot drop it before
+/// the caller's next shard turn reads it. Appends the pin to `pins` on success when not already
+/// held by this caller.
+pub(crate) async fn bring_back_pinned(
+  waited: slates_git::store::packed::Waited,
+  pins: &mut Vec<named_objects::WindowPin>,
+) -> Result<u64, read_through::ReadThroughRefused> {
+  let window = crate::state::with_state(|state| {
+    state
+      .vcs_stores
+      .content()?
+      .window_holding(&waited.pack, waited.len, waited.offset)
+      .map(|(window, _, _)| window)
+  })
+  .flatten()
+  .ok_or(read_through::ReadThroughRefused::Missing { at: waited.offset })?;
+  let pin = named_objects::WindowPin::of(window);
+  let bytes = read_through::bring_back(waited).await?;
+  let resident = crate::state::with_state(|state| {
+    state
+      .vcs_stores
+      .content()
+      .is_some_and(|content| !content.is_away(&window))
+  })
+  .unwrap_or(false);
+  if !resident {
+    return Err(read_through::ReadThroughRefused::Missing { at: waited.offset });
+  }
+  if !pins.iter().any(|held| held.window() == window) {
+    pins.push(pin);
+  }
+  Ok(bytes)
+}
+
+/// Outcome of one cooperative push-preparation turn ([`SealedPush::restage_turn`],
+/// [`SealedPush::admit_step`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PushTurn {
+  /// This stage finished (or hit a non-wait refusal that the terminal append surfaces).
+  Done,
+  /// More synchronous turns remain under the shard's step quantum.
+  More,
+  /// A read encountered a let-go pack window; the caller must bring it back and retry.
+  Waiting(slates_git::store::packed::Waited),
+}
+
 /// Sets the content store's budget back to what is charged after a read lent room ([`lent_to_read`], [`with_room`]).
 fn set_back(stores: &mut VcsStores) {
   let charged = stores.charged;
@@ -2126,48 +2199,30 @@ impl SealedPush {
   }
 
   /// One turn of the push's stage made again where a landing overtook it since its seal (A-722 part 4e), begun where
-  /// `staging` holds none, for `ns` of the shard's clock and a unit at least: whether it is current, so its append's
-  /// commit adopts it rather than staging it again whole. A refusal ends it, the commit staging it and answering the
-  /// refusal there.
+  /// `staging` holds none, for `ns` of the shard's clock and a unit at least: [`PushTurn::Done`] when current so the
+  /// append adopts it, [`PushTurn::More`] when more synchronous turns remain, or [`PushTurn::Waiting`] when a read met
+  /// a let-go pack window. A non-wait refusal ends the stage, the commit staging it and answering the refusal there.
   pub(crate) fn restage_turn(
     &mut self,
     state: &mut ShardState,
     (staging, ns): (&mut Option<slates_git::store::Staging>, u64),
-  ) -> bool {
+  ) -> PushTurn {
     let repository = self.repository;
     let push = &mut self.push;
     // Nothing to stage again, and none under way: current at once, no room reckoned (each decision step asks).
     let room = match state.vcs_stores.git_ref(repository) {
-      Some((_, store)) if staging.is_none() && !store.repository.needs_stage(push) => return true,
+      Some((_, store)) if staging.is_none() && !store.repository.needs_stage(push) => {
+        return PushTurn::Done;
+      }
       Some((_, store)) => store.repository.stage_room(push),
       None => 0,
     };
-    let turned = within_budget(state, room, |stores| {
-      let (content, store) = stores.git(repository).ok_or(GitRefused::NoStore)?;
-      let mut begun = match staging.take() {
-        Some(begun) => begun,
-        None if !store.repository.needs_stage(push) => return Ok(true),
-        None => store
-          .repository
-          .staging(content, push)
-          .map_err(GitRefused::Store)?,
+    within_budget(state, room, |stores| {
+      let Some((content, store)) = stores.git(repository) else {
+        return PushTurn::Done;
       };
-      let mut clock = crate::git_push::ShardClock;
-      let quantum = slates_git::store::hook_view::Quantum {
-        clock: &mut clock,
-        ns,
-      };
-      let done = store
-        .repository
-        .stage_turn(content, push, &mut begun, quantum)
-        .map_err(GitRefused::Store)?;
-      if !done {
-        *staging = Some(begun);
-      }
-      // A stage that a landing overtook while it was made is made again from the next turn.
-      Ok::<bool, GitRefused>(done && !store.repository.needs_stage(push))
-    });
-    turned.unwrap_or(true)
+      restage_lent(content, store, push, (staging, ns))
+    })
   }
 
   /// Gives back what a stage under way ([`SealedPush::restage_turn`]) holds: a push dropped mid-decision.
@@ -2194,52 +2249,142 @@ impl SealedPush {
     lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
       stores
         .git_ref(repository)
-        .and_then(|(content, store)| store.repository.peeled_generation(content, push, to))
+        .and_then(|(content, store)| {
+          let _waiting = WaitingScope::enter(&store.repository);
+          store.repository.peeled_generation(content, push, to)
+        })
         .unwrap_or(0)
     })
   }
 
   /// One turn of the admission of the move of the green keyed `green` to `to` (A-722 part 4c), begun where `admitting`
-  /// holds none, for `ns` of the shard's clock and a unit at least: whether it is done, its move kept for its append
-  /// ([`SealedPush::admit`]). A refusal ends it, the append admitting the move again and answering the refusal there.
-  pub(crate) fn admission_turn(
+  /// holds none, for `ns` of the shard's clock and a unit at least: [`PushTurn::Done`] with the move kept for its
+  /// append ([`SealedPush::admit`]), [`PushTurn::More`] when another synchronous turn remains, or [`PushTurn::Waiting`]
+  /// when a read met a let-go pack window. A non-wait refusal ends the stage, the append admitting the move again and
+  /// answering the refusal there.
+  pub(crate) fn admit_step(
     &mut self,
     state: &mut ShardState,
     (green, to): (u64, ObjectId),
     (admitting, ns): (&mut Option<slates_git::store::Admitting>, u64),
-  ) -> bool {
+  ) -> PushTurn {
     let (repository, push, prepared) = (self.repository, &self.push, &mut self.prepared);
     if prepared.iter().any(|admitted| admitted.to() == Some(to)) {
-      return true;
+      return PushTurn::Done;
     }
-    let turned = lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
-      let (content, store) = stores.git_ref(repository).ok_or(GitRefused::NoStore)?;
-      let mut begun = match admitting.take() {
-        Some(begun) => begun,
-        None => store
+    lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+      let Some((content, store)) = stores.git_ref(repository) else {
+        return PushTurn::Done;
+      };
+      admit_step_lent(
+        content,
+        store,
+        (push, prepared),
+        (green, to),
+        (admitting, ns),
+      )
+    })
+  }
+
+  /// Test-only boolean facade over [`Self::admit_step`] for `vcs_store/tests.rs`.
+  #[cfg(test)]
+  pub(crate) fn admission_turn(
+    &mut self,
+    state: &mut ShardState,
+    move_to: (u64, ObjectId),
+    state_and_ns: (&mut Option<slates_git::store::Admitting>, u64),
+  ) -> bool {
+    matches!(
+      self.admit_step(state, move_to, state_and_ns),
+      PushTurn::Done
+    )
+  }
+}
+
+/// Runs one lent restage turn, clearing any stale wait on entry and draining any noted wait on
+/// every exit so a let-go pack miss returns [`PushTurn::Waiting`] instead of being swallowed. On
+/// `Err`, `stage_turn` has already ended/released `begun`, so `*staging` stays `None` and the next
+/// turn starts cleanly once the window is pinned.
+fn restage_lent(
+  content: &mut ContentStore,
+  store: &mut GitStore,
+  push: &mut Push,
+  (staging, ns): (&mut Option<slates_git::store::Staging>, u64),
+) -> PushTurn {
+  let _ = store.repository.waiting();
+  let mut begun = match staging.take() {
+    Some(begun) => begun,
+    None if !store.repository.needs_stage(push) => return PushTurn::Done,
+    None => match store.repository.staging(content, push) {
+      Ok(begun) => begun,
+      Err(_) => {
+        return store
           .repository
-          .admitting(content, push, green, to)
-          .map_err(GitRefused::Store)?,
-      };
-      let mut clock = crate::git_push::ShardClock;
-      let quantum = slates_git::store::hook_view::Quantum {
-        clock: &mut clock,
-        ns,
-      };
-      let done = store
-        .repository
-        .admit_turn(content, push, &mut begun, quantum)
-        .map_err(GitRefused::Store)?;
-      if done {
-        if let Some(admitted) = begun.admitted() {
-          prepared.push(admitted);
-        }
-      } else {
-        *admitting = Some(begun);
+          .waiting()
+          .map_or(PushTurn::Done, PushTurn::Waiting);
       }
-      Ok::<bool, GitRefused>(done)
-    });
-    turned.unwrap_or(true)
+    },
+  };
+  let mut clock = crate::git_push::ShardClock;
+  let quantum = slates_git::store::hook_view::Quantum {
+    clock: &mut clock,
+    ns,
+  };
+  let turned = store
+    .repository
+    .stage_turn(content, push, &mut begun, quantum);
+  let waited = store.repository.waiting();
+  match turned {
+    // A stage that a landing overtook while it was made is made again from the next turn.
+    Ok(true) if !store.repository.needs_stage(push) => PushTurn::Done,
+    Ok(true) => PushTurn::More,
+    Ok(false) => {
+      *staging = Some(begun);
+      PushTurn::More
+    }
+    Err(_) => waited.map_or(PushTurn::Done, PushTurn::Waiting),
+  }
+}
+
+/// Runs one lent admission turn inside a [`WaitingScope`], returning [`PushTurn::Waiting`] instead
+/// of swallowing a let-go pack miss. On `Err`, `admit_turn` has already moved `begun.phase` to
+/// `Phase::Taken`, so `*admitting` stays `None` and the next turn restarts cleanly once the waited
+/// window is brought back and pinned in the push's resident set.
+fn admit_step_lent(
+  content: &ContentStore,
+  store: &GitStore,
+  (push, prepared): (&Push, &mut Vec<Move>),
+  (green, to): (u64, ObjectId),
+  (admitting, ns): (&mut Option<slates_git::store::Admitting>, u64),
+) -> PushTurn {
+  let waiting = WaitingScope::enter(&store.repository);
+  let mut begun = match admitting.take() {
+    Some(begun) => begun,
+    None => match store.repository.admitting(content, push, green, to) {
+      Ok(begun) => begun,
+      Err(_) => return waiting.take().map_or(PushTurn::Done, PushTurn::Waiting),
+    },
+  };
+  let mut clock = crate::git_push::ShardClock;
+  let quantum = slates_git::store::hook_view::Quantum {
+    clock: &mut clock,
+    ns,
+  };
+  match store
+    .repository
+    .admit_turn(content, push, &mut begun, quantum)
+  {
+    Ok(true) => {
+      if let Some(admitted) = begun.admitted() {
+        prepared.push(admitted);
+      }
+      PushTurn::Done
+    }
+    Ok(false) => {
+      *admitting = Some(begun);
+      PushTurn::More
+    }
+    Err(_) => waiting.take().map_or(PushTurn::Done, PushTurn::Waiting),
   }
 }
 

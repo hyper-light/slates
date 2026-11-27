@@ -142,23 +142,78 @@ fn repository_of(state: &ShardState, green: ObjectId) -> Option<RepositoryRecord
     })
 }
 
-/// `green`'s build driven a turn at a time, a yield between, until it is made or refused.
+/// Brings back and pins `waited` for [`drive`], returning `false` if the identical wait already
+/// failed on the previous turn so persistent bring-back failures exit cleanly instead of spinning.
+async fn await_replica_wait(
+  waited: slates_git::store::packed::Waited,
+  pins: &mut Vec<crate::vcs_store::named_objects::WindowPin>,
+  last_failed: &mut Option<slates_git::store::packed::Waited>,
+) -> bool {
+  if *last_failed == Some(waited) {
+    return false;
+  }
+  if crate::vcs_store::bring_back_pinned(waited, pins)
+    .await
+    .is_ok()
+  {
+    *last_failed = None;
+    return true;
+  }
+  *last_failed = Some(waited);
+  slates_rt::futures::yield_now().await;
+  true
+}
+
+/// `green`'s build driven a turn at a time, a yield between, until it is made or refused. Holds
+/// [`WindowPin`]s across `.await`s so concurrent evictions cannot drop brought-back windows, and
+/// stops with [`REFUSED`] if a window persistently fails bring-back.
 async fn drive(green: ObjectId) {
+  let mut pins: Vec<crate::vcs_store::named_objects::WindowPin> = Vec::new();
+  let mut last_failed: Option<slates_git::store::packed::Waited> = None;
   loop {
     match crate::state::with_state_counted(|state| turn(state, green)) {
-      Some(Turned::More) => slates_rt::futures::yield_now().await,
+      Some(Turned::More) => {
+        last_failed = None;
+        slates_rt::futures::yield_now().await;
+      }
       Some(Turned::Waiting(waited)) => {
-        if crate::vcs_store::upload::bring_back_within(waited)
-          .await
-          .is_err()
-        {
-          slates_rt::futures::yield_now().await;
+        if !await_replica_wait(waited, &mut pins, &mut last_failed).await {
+          let _ = crate::state::with_state_counted(|state| state.count(REFUSED, 1));
+          break;
         }
       }
       Some(Turned::Done) | None => break,
     }
   }
   let _ = crate::state::with_state_counted(|state| state.replica_builds.building.remove(&green));
+}
+
+/// Runs one lent advance step of `building` over `green`'s replica inside a [`WaitingScope`],
+/// clearing any stale wait on entry and draining any noted wait on all exit paths.
+fn advance_replica(
+  state: &mut ShardState,
+  green: ObjectId,
+  repository: RepositoryId,
+  building: &mut slates_merge::push::Building,
+) -> (
+  Option<Option<Result<slates_merge::push::Built, slates_merge::push::PushRefused>>>,
+  Option<slates_git::store::packed::Waited>,
+) {
+  crate::vcs_store::with_room(state, |state| {
+    let waiting = state
+      .vcs_stores
+      .git_ref(repository)
+      .map(|(_, store)| crate::vcs_store::WaitingScope::enter(&store.repository));
+    let advanced = state.merge.replicas.get(&green).and_then(|replica| {
+      let mut turned = None;
+      crate::vcs_store::with_owed_push_objects(state, Some(repository), &mut |objects| {
+        turned = Some(building.advance(replica, objects));
+      });
+      turned
+    });
+    let waited = waiting.and_then(crate::vcs_store::WaitingScope::take);
+    (advanced, waited)
+  })
 }
 
 /// One turn of `green`'s build: the repository's store waited for while its replay runs; then the owed push's build
@@ -195,14 +250,7 @@ fn turn(state: &mut ShardState, green: ObjectId) -> Turned {
   building
     .pace()
     .turn(slates_rt::futures::now_ns().saturating_add(quantum.max(1)));
-  let advanced = crate::vcs_store::with_room(state, |state| {
-    let replica = state.merge.replicas.get(&green)?;
-    let mut turned = None;
-    crate::vcs_store::with_owed_push_objects(state, Some(repository), &mut |objects| {
-      turned = Some(building.advance(replica, objects));
-    });
-    turned
-  });
+  let (advanced, waited) = advance_replica(state, green, repository, &mut building);
   match advanced {
     // Not found: no replica, or no store to read.
     None => {
@@ -210,10 +258,7 @@ fn turn(state: &mut ShardState, green: ObjectId) -> Turned {
       Turned::Done
     }
     Some(None) => {
-      let waited = building
-        .waiting()
-        .and(state.vcs_stores.git(repository))
-        .and_then(|(_, store)| store.repository.waiting());
+      let waited = building.waiting().and(waited);
       if let Some(under) = state.replica_builds.building.get_mut(&green) {
         under.building = Some(building);
       }
