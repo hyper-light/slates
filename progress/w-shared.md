@@ -662,3 +662,13 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
   - The A-921 false-death test, which fails on main.
   - v3_takeover's "waiting on its adoption" stall.
 - Merge commit 035f8888d doesn't build alone: the OperationIdentity fix landed in 5259bb1b7.
+
+## 2026-11-27: A-921 part 4 landed (slates ba2cc7e25, commit 4b137623b)
+- (2)'s cause was not shipping. a's replay re-derived the pending v2 with checkpoint_floor 0 where the old holder held 1, so the old holder refused it ConflictingPosition (19 a run, previously uncounted). Fix (B), per main's ruling:
+  - the register gets `accept_merged`/`check_merged`;
+  - `merge_service::joined_floors` joins the two floors by max and compares all else whole.
+- Also fixed: a replica store made before the missed part arrived never took that part's objects, so every build was refused Missing. A refused build now marks the store, and the next wanted build makes it again.
+- Silent exits on the merge ship and hold paths are now counted.
+- The red now asserts the push lands: 5 of 5.
+- The owed-part scene forms afresh when a survivor adopts a's green with a candidate's death (3 of 10 scenes). A919 stays ignored for that mode.
+- Next: the false-death test regression (bisect command offered to main), then A-921's next mode, then v3_takeover's adoption stall.
