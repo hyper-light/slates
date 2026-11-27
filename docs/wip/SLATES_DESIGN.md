@@ -64893,6 +64893,26 @@ GAPS.
   - Planted bug, red: only the first copy op resolved, 44 bytes against 88.
   - After 12a (debug), the move test's longest poll is `storing`, the storing's begin (`stage_texts`' `storing_of`
     and `hand_over`, 14.0 ms), already on file.
+  **Release probe 15** (main, at 5d9a36bd1 with 11a-12a; 99 quiet runs at load 34-53, then 99 with 12 burners at
+  load 34-70, all rc 0; CPU equals wall on every leader). The longest step's p50, p90 and p99 in ms, quiet then loaded:
+  - add: 1.43, 1.59, 2.11, then 1.43, 1.64, 2.60;
+  - copy: 1.65, 2.02, 2.36, then 1.62, 1.91, 3.72;
+  - move: 1.46, 1.67, 2.79, then 1.45, 1.77, 2.38.
+  Against probe 13's 1.59, 2.72 and 3.49 at p50. The leader is `storing` in 99, 31 and 95 of the quiet runs (p50
+  about 1.4 ms), then copy's `landing.release` (1.60 ms) and the register's op (`landing.record`, which leads more
+  runs under load). Outside the history: the shard's start (`daemon.rs:1274`), the harness's observe closure
+  (`test_store.rs:157`) and a task spawned at `daemon.rs:5829`.
+- **Piece 13, the storing's begin.** **13a.** Named before the change (debug, the add test), the storing's begin was
+  one unit:
+  - `storing_of` built a length map over the revision's 9,000 rows for the 0 texts an import hands it, 5.4 ms;
+  - `hand_over` took the sink's holds on the 9,000 imported texts as put, each checked against the records, 10.5 ms.
+  Now `storing_of` returns at once with no texts to store, and the hand-over is a walk (`svn_commit::HandingOver`): a
+  text taken or kept spare, then a spare text unpinned and given back, a unit each. It is a slice of the shard's
+  budget a step, each counted (`repository.svn_commit.hand_over_steps`, more than two in `t_c2c`; red at 1 with the
+  hand-over whole).
+  - Planted bug, red in `store_tests`: every other imported text skipped. A killed batch's recovery and a clean
+    restart's named texts both fail; the import tests alone did not catch it.
+  - After 13a (debug), every wide test's longest poll is the register's op (`landing.record`, 9.0-10.0 ms).
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
