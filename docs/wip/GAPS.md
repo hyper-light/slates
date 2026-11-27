@@ -352,8 +352,16 @@
 >   read it as another home wire version's (A-727 (d1a)), which ends a homing at once, 2 s into its 18 s window. Now
 >   every reply is settled by its round trip (`fleet::settle_replies`, one path for timely replies and stragglers): one
 >   with none is no answer, its host left, its link dialed afresh, and the homing waits and ranks its homes again once
->   the death installs (A-912). Red first: `a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once`.
->   a914 asserts its second push lands.
+>   the death installs (A-912). Red first: `a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once`
+>   (16 of 16 in main's run at 526859d1e). a914 asserts its second push lands.
+> - **OPEN, a914 still fails 4 of 16 at the record barrier** (main 01a20182's run at 526859d1e, load 42-69; its rulings of
+>   2026-11-27 12:02). Every red is the second death's push refused `unable to commit`; no homing ended short at once.
+>   Two shapes:
+>   1. Runs 5 and 13: a green owed at version 3, placed 2, with reads past tolerance ("nothing held, the register's
+>      candidacy owed"): A-919's open edge, which (C) closes. Rerun after (C) lands.
+>   2. Runs 1 and 16: a green owed at version 2, placed 1, no read past tolerance: a green's record placed on one holder
+>      at the second death, short of the barrier's need. Its own cause, to diagnose after (C) from the barrier's placement
+>      counters (logs: main's `rounds/a914-runs/run-{1,16}-a914.log`).
 > - **OPEN, found by A-914 (d)'s sweep: replies with no round trip read as answers** (to be worked when measured or
 >   blocking; main's ruling of 09:43). `TimedReply::bytes` is empty on a refusal, a deadline or a transport error, and
 >   only `round_trip_ns` says the peer answered. Of 26 readers of a `broadcast` or `request_within` reply, 20 read empty
