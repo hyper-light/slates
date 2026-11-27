@@ -696,3 +696,5 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   daemon's child alone; red in diag run 45993337450) 5f0089f85. The Linux runs are in run-requests.md for main.
 - 8fc8a0210: A-931's siblings. Six CLI suites hand their serve sockets on in the child (support/hand_on.rs). Their
   runs are in run-requests.md.
+- FREE (2026-11-27 05:00 PST): nothing open; inbox/main-from-w-interop-free.md rewritten. Waiting on diag CI 6 and 7's
+  verdicts (main's).
