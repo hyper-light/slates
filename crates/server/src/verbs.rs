@@ -19895,7 +19895,11 @@ fn restore_held_image(
   // The held image's pieces carry the content hold, the held registers and the live copies (§4.8 persistence before
   // reply; A-270): split, the content claimed and rebuilt below, the registers rebuilt with their fences once the hold
   // is.
-  let held = match crate::content_holder::split_held(held) {
+  let split = crate::content_holder::split_held(held).and_then(|held| {
+    crate::content_holder::owed_within_bound(state, &held)?;
+    Ok(held)
+  });
+  let held = match split {
     Ok(held) => Some(held),
     Err(e) => {
       slates_machine::log_line!(

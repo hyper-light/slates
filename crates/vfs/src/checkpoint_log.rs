@@ -46,9 +46,10 @@ const DELTA_MAGIC: u32 = u32::from_le_bytes(*b"SLD1");
 /// so it takes the next) every inode image it carries may be a block or character device node with its number (image
 /// version 28); 12 (A-883, 2026-11-23) a held register's head piece it carries names the retirement its moved-from
 /// owner was moved at (image version 34); 13 (A-890, 2026-11-23) that head piece also names the retirement its node
-/// adopted the object in (image version 35).
+/// adopted the object in (image version 35); 14 (A-921's second mode, 2026-11-26) the held pieces it puts and removes may
+/// be the state-log parts the shard owes as their logs' owner (image version 36).
 /// Format: the delta format's version, the latest entry of the history above.
-pub const DELTA_VERSION: u16 = 13;
+pub const DELTA_VERSION: u16 = 14;
 /// Format: a log frame's header — a little-endian payload length then a CRC-32C of the payload.
 const LOG_HEADER: usize = 2 * size_of::<u32>();
 /// Format: a log frame's payload prefix — its generation and its base checkpoint's generation.

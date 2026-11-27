@@ -37949,13 +37949,14 @@ fn a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_th
 /// was not taken over (its fencing epoch unchanged at every other node) before it stops anyone, and is formed afresh,
 /// at most [`SCENE_RESTARTS`] times, where a was, each such attempt printed.
 ///
-/// Ignored for A-921's second mode (main 01a20182's ruling of 2026-11-25): about 1 run in 6, a not taken over, the old
-/// holder still acknowledged neither a's green's next version nor its names-log part after a's warm restart, so every
-/// push was refused `unable to commit`; and the newcomer held 1 position, whose standing against the start rule is
-/// owed. Run it by name with `cargo test -p slates-server --test fleet
+/// Ignored for A-921's second mode's (2) (main 01a20182's rulings of 2026-11-25 and 2026-11-26): about 1 run in 6, a not
+/// taken over, the old holder had missed a part a owed it; (1), its names-log part, a owes again after its restart, and
+/// (2), the green's next version, a's merge plane ships no more, so a push may stay refused `unable to commit`. The
+/// newcomer's held positions are measured against the start rule: each at or above a's restarted hold start. Run it by
+/// name with `cargo test -p slates-server --test fleet
 /// a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins -- --ignored --exact`.
 #[test]
-#[ignore = "A-921's second mode: the old holder refuses a warm-restarted owner's v2 merge record and names-log part about 1 run in 6; run by name with --ignored"]
+#[ignore = "A-921's second mode (2): a warm-restarted owner's merge plane ships no pending version again, so a push may stay refused; run by name with --ignored"]
 fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins() {
   let _serial = serialize_fleet_tests();
   let Some((mut fleet, holders)) = (0..SCENE_RESTARTS).find_map(restarted_owner_scene) else {
@@ -37970,6 +37971,7 @@ fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_beg
   };
   let newcomer_host = fleet.hosts[newcomer];
   let gone = fleet.hosts[stopped];
+  let old_holder_host = holders.get(1).map(|node| fleet.hosts[*node]);
   fleet.daemons.remove(stopped).stop();
   let newcomer = fleet
     .daemons
@@ -38005,22 +38007,58 @@ fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_beg
     Ok(counted(&fleet, "fleet.ledger_read.past_tolerance")? > 0)
   });
   let held = counted(&fleet, "fleet.ledger_read.positions_held");
+  let start = fleet.daemons[0].owner_hold_start(fleet.repository);
+  let newcomer_positions = fleet.daemons[newcomer].names_log_positions(fleet.repository);
+  let old_holder = fleet.daemons.iter().find(|daemon| {
+    old_holder_host.is_some_and(|host| daemon.member_identity().is_ok_and(|id| id == host))
+  });
+  let (old_refused, old_counts) = old_holder.map_or_else(Default::default, refusals_of);
+  let newcomer_refused = refusals_of(&fleet.daemons[newcomer]);
   fleet.stop();
   eprintln!(
     "restarted-owner-log: holders {holders:?}; taken over {taken}; pushes {pushed:?}; the newcomer's read past \
-     tolerance {refused}, positions held {held:?}"
+     tolerance {refused}, positions held {held:?}, the newcomer's names-log positions {newcomer_positions:?}, a's restarted \
+     hold start {start:?}; the old holder's last refusals {old_refused:?}, its refusal counts \
+     {old_counts:?}; the newcomer's {newcomer_refused:?}"
   );
   assert!(taken, "the death was taken over");
   assert!(
     pushed.iter().any(Result::is_ok),
     "a push after a's warm restart landed: {pushed:?}"
   );
-  assert!(refused, "the newcomer's read was past tolerance");
-  assert_eq!(
-    held,
-    Ok(0),
-    "the newcomer adopted nothing on the old holder's word alone"
+  // The start rule, measured (main 01a20182's ruling of 2026-11-26 on "held 1"): every position the newcomer holds is at
+  // or above where a's restarted hold begins, so none was adopted on the old holder's word alone. The read past tolerance
+  // is recorded: a owes its held parts again after its restart (A-921's second mode), so its hold may begin at the log's
+  // oldest owed part.
+  let _ = (refused, held);
+  let at_or_above = match (&newcomer_positions, &start) {
+    (Ok(positions), Ok(Some(start))) => positions.iter().all(|position| position >= start),
+    (Ok(positions), Ok(None)) => positions.is_empty(),
+    _ => false,
+  };
+  assert!(
+    at_or_above,
+    "every newcomer position at or above a's restarted hold start: {newcomer_positions:?}, {start:?}"
   );
+}
+
+/// What `daemon` last answered with no acknowledgement of a record, by why (`Daemon::last_record_refusals`), and its
+/// counts of refused records and of the merge plane's and the state logs' refusals: A-921's second mode, recorded.
+fn refusals_of(daemon: &Daemon) -> (Vec<(&'static str, String)>, Vec<(&'static str, u64)>) {
+  let last = daemon.last_record_refusals().unwrap_or_default();
+  let counts = daemon
+    .fleet_refusals()
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|(name, count)| {
+      *count > 0
+        && (name.starts_with("fleet.record.")
+          || name.starts_with("merge.")
+          || name.starts_with("fleet.state_log")
+          || name.starts_with("state_log"))
+    })
+    .collect();
+  (last, counts)
 }
 
 /// One attempt at [`a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins`]'s scene: a
@@ -38073,6 +38111,135 @@ fn restarted_owner_scene(attempt: usize) -> Option<(GitFleet, Vec<usize>)> {
   eprintln!(
     "restarted-owner-log: attempt {attempt}: a was taken over during its warm restart (its epoch {before:?} -> \
      {after:?}), the scene formed afresh"
+  );
+  fleet.stop();
+  None
+}
+
+/// A-921's second mode (main 01a20182's ruling of 2026-11-26: the owner's held parts ride its recovery image). Do: on a
+/// four-node `f = 1` anchored git fleet with a repository on a, push `main` and wait for both of a's remote candidates
+/// to hold it; hold a's state logs' parts off the second of them, the old holder (`Daemon::hold_state_log_shipping_from`,
+/// lifted by a's restart), and push on top, which lands at a and the first; restart a warm, a not taken over (the scene
+/// formed afresh where it was); stop the first candidate; push on top again. Expect the old holder to hold a's names log
+/// through its newest part and the push to land: a owes its held parts again after its restart, to every remote
+/// candidate. Red before: a's warm restart rebuilt its parts empty, so the old holder refused every later part
+/// `Behind { held }` (`state_log.discontinuous`) and every push was refused `unable to commit` (the second mode, about 1
+/// run in 6, with the part missed by chance). Recorded, not asserted: the pushes, whose landing is (2)'s (GAPS: a's merge
+/// plane ships no pending version again after its restart, so the green's v2 never places), the old holder's last
+/// refusals and counts, and its names-log positions.
+#[test]
+fn a921_a_holder_that_missed_an_owners_part_before_its_warm_restart_is_shipped_it_after() {
+  let _serial = serialize_fleet_tests();
+  let Some((mut fleet, [first, old])) = (0..SCENE_RESTARTS).find_map(part_missed_scene) else {
+    panic!("a was taken over at every one of {SCENE_RESTARTS} warm restarts");
+  };
+  let (gone, old_host) = (fleet.hosts[first], fleet.hosts[old]);
+  fleet.daemons.remove(first).stop();
+  let at = |fleet: &GitFleet, host: HostId| {
+    fleet
+      .daemons
+      .iter()
+      .position(|daemon| daemon.member_identity().is_ok_and(|id| id == host))
+  };
+  let taken = poll_taken_over_and_unseated(&fleet.daemons, gone);
+  let mut pushes = Vec::new();
+  for attempt in 0..SCENE_PUSHES {
+    let file = format!("after-{attempt}.txt");
+    let pushed = fleet.push_on_top(0, (&file, file.as_bytes()));
+    let landed = pushed.is_ok();
+    pushes.push(pushed);
+    if landed {
+      break;
+    }
+  }
+  let pushed = pushes.last().cloned().unwrap_or(Ok(()));
+  let old = at(&fleet, old_host).expect("the old holder runs");
+  let positions = (
+    fleet.daemons[0].names_log_positions(fleet.repository),
+    fleet.daemons[old].names_log_positions(fleet.repository),
+  );
+  let (old_refused, old_counts) = refusals_of(&fleet.daemons[old]);
+  fleet.stop();
+  eprintln!(
+    "owed-parts: taken over {taken}; the pushes {pushes:?}; names-log positions (a, the old holder) {positions:?}; the \
+     old holder's last refusals {old_refused:?}, its counts {old_counts:?}"
+  );
+  assert!(taken, "the first candidate's death was taken over");
+  let behind = old_counts
+    .iter()
+    .any(|(name, _)| *name == "fleet.record.refused.behind");
+  let runs_on = positions.1.as_ref().is_ok_and(|held| {
+    held.len() > PARTS_BEFORE_THE_HOLD && held.windows(2).all(|pair| pair[1] == pair[0] + 1)
+  });
+  assert!(
+    runs_on && !behind,
+    "the old holder took every part after the one held off it, refusing none Behind: {positions:?}"
+  );
+  // The push's landing is A-921's second mode's (2), named in GAPS: after a's warm restart its merge plane ships no
+  // pending version again. Unasserted here; (2)'s fix asserts it.
+  let _ = pushed;
+}
+
+/// Shape: the names-log parts the old holder of
+/// [`a921_a_holder_that_missed_an_owners_part_before_its_warm_restart_is_shipped_it_after`] holds before a holds a part
+/// off it: the creation's and the first push's.
+const PARTS_BEFORE_THE_HOLD: usize = 2;
+
+/// One attempt at [`a921_a_holder_that_missed_an_owners_part_before_its_warm_restart_is_shipped_it_after`]'s scene: a
+/// four-node anchored git fleet, `main` pushed and held by both of a's remote candidates, a push on top whose state-log
+/// parts a held off the second, then a restarted warm and settled. The fleet and a's two candidates (the first, then the
+/// old holder) where a was not taken over by its restart; `None`, printed and stopped, where it was (A-921).
+fn part_missed_scene(attempt: usize) -> Option<(GitFleet, [usize; 2])> {
+  let mut fleet = anchored_git_fleet_of("owed-parts", &["a", "b", "c", "d"]);
+  let green = VolumeId {
+    bytes: fleet.repository,
+  };
+  let pushed = fleet.push(0, ("first.txt", b"main before the part held off\n"));
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let mut holders = Vec::new();
+  let both_hold = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    holders = (1..fleet.daemons.len())
+      .filter(|node| {
+        fleet.daemons[*node]
+          .merge_holder_state(green)
+          .is_ok_and(|held| held.version.is_some_and(|reached| reached >= 1))
+      })
+      .collect();
+    Ok(holders.len() == 2)
+  });
+  drop(observed);
+  let (Some(&first), Some(&old)) = (holders.first(), holders.get(1)) else {
+    fleet.stop();
+    panic!("a's two remote candidates held version 1: {holders:?} (the push {pushed:?})");
+  };
+  fleet.daemons[0]
+    .hold_state_log_shipping_from(fleet.hosts[old])
+    .unwrap();
+  let missed = fleet.push_on_top(0, ("missed.txt", b"its parts held off the old holder\n"));
+  let owner = fleet.hosts[0];
+  let epochs = |fleet: &GitFleet| -> Vec<Option<u64>> {
+    fleet.daemons[1..]
+      .iter()
+      .map(|daemon| {
+        daemon
+          .council_host_standing(owner)
+          .ok()
+          .and_then(|(epoch, _)| epoch)
+      })
+      .collect()
+  };
+  let before = epochs(&fleet);
+  let restarted = fleet.restart_warm(0);
+  let after = epochs(&fleet);
+  assert!(
+    pushed.is_ok() && both_hold && missed.is_ok() && restarted,
+    "the pushes before the restart landed ({pushed:?}, {missed:?}), both candidates held version 1, and a restarted"
+  );
+  if before == after {
+    return Some((fleet, [first, old]));
+  }
+  eprintln!(
+    "owed-parts: attempt {attempt}: a was taken over during its warm restart, the scene formed afresh"
   );
   fleet.stop();
   None
