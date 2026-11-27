@@ -760,6 +760,10 @@ impl VcsStores {
         ("mem.gauge.vcs_content.objects", census.objects),
         ("mem.gauge.vcs_content.used_bytes", census.used),
         ("mem.gauge.vcs_content.charged_bytes", census.charged),
+        (
+          "mem.gauge.vcs_content.pinned_unlanded",
+          census.pinned_unlanded,
+        ),
       ]);
     }
     // The chunks the windows lie in and the windows let go from slabs still held (goal 93; `arena_windows`, "Slabs").
