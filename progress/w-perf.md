@@ -855,3 +855,12 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     the store, blame and git's tree). Owners noted (74b30917a). GAPS calls the 57k hang fixed (main's 6 of 6).
   - Next: A-930's byte rule (main's ruling (ii): a byte rule for cuts nobody waits on, a cut a ticket asks for, one at
     idle). Waiting on main: the Windows lanes on this tip.
+- 2026-11-27 07:49  (81950e77c's commit time; written 2026-11-27 07:58 PST):
+  - LANDED 81950e77c (7acfd685c): A-930 part 3, the cadence (main's ruling (ii), the held term kept at 07:19). A cut
+    nobody waits on is due once the bytes changed plus the arena's held frees come to its cost; a ticket's wait and
+    idle ask. Reds: 300 cuts / 2,804,085 B before, 2 / 161,862 B now; 40 granule let-goes held 163,840 B with no cut
+    before idle without the held term, at most 24,576 B (cost 26,885+) with it. Gauge
+    vcs_store.image.held_deferred_peak_bytes. Recovery target: 3 failed in the parallel run at load 27, all 3 passed
+    alone; told main.
+  - Waiting on main: its 57k rerun at the tip (cuts, copied, held peak, wall); the Windows lanes on
+    a_one_page_give_back; the arm64 idle_sweep red at the tip (work it only if it reproduces there).
