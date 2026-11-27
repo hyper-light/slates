@@ -1885,10 +1885,9 @@ pub(crate) struct Stood {
 /// A deleted directory's tree being noted gone a path a unit ([`Building::remove_begin`], A-920 9b).
 #[derive(Debug, Default)]
 struct Removing {
-  /// The nodes beneath the place the directory stood, as the green held them, with whether each is a directory.
-  beneath: Vec<(String, bool)>,
-  /// The next of them to note.
-  next: usize,
+  /// The walk of the nodes beneath the place the directory stood, as the green holds them, a node a unit (A-920: listed
+  /// and sorted whole in the row's unit, 2.2 ms for 9,000, debug; [`slates_merge::engine::Green::beneath_cursor`]).
+  beneath: slates_merge::engine::BeneathCursor,
   /// The green path of the place it stood.
   from: String,
   /// The green path of the directory.
@@ -1935,6 +1934,8 @@ struct Building<'b> {
   removing: Option<Removing>,
   /// The most gone paths one unit of the build noted or made ops of ([`BUILD_MOST_GONE_A_UNIT`]).
   most_gone: u64,
+  /// The most nodes one unit of the build listed whole beneath a removed directory ([`BUILD_MOST_LISTED_A_UNIT`]).
+  most_listed: u64,
 }
 
 /// A build's own state between its steps ([`Building::detach`]), without the records, the engine or the checked
@@ -1963,6 +1964,8 @@ pub(super) struct BuildState {
   removing: Option<Removing>,
   /// The most gone paths one unit noted or made ops of.
   most_gone: u64,
+  /// The most nodes one unit listed whole beneath a removed directory.
+  most_listed: u64,
 }
 
 impl BuildState {
@@ -1970,7 +1973,19 @@ impl BuildState {
   pub(super) fn most_gone(&self) -> u64 {
     self.most_gone
   }
+
+  /// The most nodes one unit of the build listed whole beneath a removed directory so far
+  /// ([`BUILD_MOST_LISTED_A_UNIT`]).
+  pub(super) fn most_listed(&self) -> u64 {
+    self.most_listed
+  }
 }
+
+/// Gauge: the most nodes one unit of an increment's build listed whole beneath a directory the revision removes (A-920):
+/// none where a deleted tree is walked a node a unit ([`Removing`]), its every node where a unit listed them (2.2 ms for
+/// 9,000, debug); a replacement's tree is listed whole still ([`Building::remove`]). Format: a counter name in the
+/// daemon's status report, its largest value.
+pub(crate) const BUILD_MOST_LISTED_A_UNIT: &str = "repository.svn_commit.build_most_listed_a_unit";
 
 /// [`Building::listed_beneath`]'s listing: the green paths of the place a path stood before the revision and of the
 /// path itself, and every node the green holds beneath the first, with whether it is a directory.
@@ -1991,6 +2006,7 @@ impl<'b> Building<'b> {
       restores: self.restores,
       removing: self.removing,
       most_gone: self.most_gone,
+      most_listed: self.most_listed,
     }
   }
 
@@ -2014,6 +2030,7 @@ impl<'b> Building<'b> {
       restores: state.restores,
       removing: state.removing,
       most_gone: state.most_gone,
+      most_listed: state.most_listed,
     }
   }
 
@@ -2038,6 +2055,7 @@ impl<'b> Building<'b> {
       restores: BTreeMap::new(),
       removing: None,
       most_gone: 0,
+      most_listed: 0,
     }
   }
 
@@ -2090,6 +2108,7 @@ impl<'b> Building<'b> {
       return Ok(None);
     }
     state.most_gone = building.most_gone;
+    state.most_listed = building.most_listed;
     building.finish(head, id).map(Some)
   }
 
@@ -2177,13 +2196,10 @@ impl<'b> Building<'b> {
     let Some(mut removing) = self.removing.take() else {
       return Ok(());
     };
-    if let Some((found, directory)) = removing.beneath.get(removing.next) {
+    if let Some((found, directory)) = self.engine.beneath_next(&mut removing.beneath) {
       let (place, stood) =
-        self.stood_beneath((found, *directory), (&removing.from, &removing.to))?;
+        self.stood_beneath((&found, directory), (&removing.from, &removing.to))?;
       self.gone.insert(place, stood);
-      removing.next = removing.next.saturating_add(1);
-    }
-    if removing.next < removing.beneath.len() {
       self.removing = Some(removing);
     }
     Ok(())
@@ -2286,15 +2302,12 @@ impl<'b> Building<'b> {
     let stood = self.node_before(&row.path)?;
     self.gone.insert(green_path(&row.path).to_owned(), stood);
     if stood.directory {
-      let (from, to, beneath) = self.listed_beneath(&row.path)?;
-      if !beneath.is_empty() {
-        self.removing = Some(Removing {
-          beneath,
-          next: 0,
-          from,
-          to,
-        });
-      }
+      let (from, to) = self.places_beneath(&row.path)?;
+      self.removing = Some(Removing {
+        beneath: self.engine.beneath_cursor(&from),
+        from,
+        to,
+      });
     }
     Ok(())
   }
@@ -2302,7 +2315,7 @@ impl<'b> Building<'b> {
   /// Every node beneath the directory at `path` as the green holds it before the revision, at its green path: beneath
   /// the path at the head, or beneath a copy's source when the copy is of the head; a copy of an older revision is not
   /// listed (module docs, "Not declared yet").
-  fn tree_beneath(&self, path: &str) -> Result<Vec<(String, Stood)>, Uncommitted> {
+  fn tree_beneath(&mut self, path: &str) -> Result<Vec<(String, Stood)>, Uncommitted> {
     let (from, to, beneath) = self.listed_beneath(path)?;
     beneath
       .iter()
@@ -2312,7 +2325,17 @@ impl<'b> Building<'b> {
 
   /// [`Building::tree_beneath`]'s listing: the green paths of the place `path` stood before the revision (`from`) and of
   /// `path` itself (`to`), and every node the green holds beneath `from`, with whether it is a directory.
-  fn listed_beneath(&self, path: &str) -> Result<Listing, Uncommitted> {
+  fn listed_beneath(&mut self, path: &str) -> Result<Listing, Uncommitted> {
+    let (from, to) = self.places_beneath(path)?;
+    let beneath = self.engine.beneath(&from);
+    let listed = u64::try_from(beneath.len()).unwrap_or(u64::MAX);
+    self.most_listed = self.most_listed.max(listed);
+    Ok((from, to, beneath))
+  }
+
+  /// The green paths of the place `path` stood before the revision (`from`) and of `path` itself (`to`), for a walk of
+  /// what stood beneath it; `Unsupported` where it stood at another revision than the head.
+  fn places_beneath(&self, path: &str) -> Result<(String, String), Uncommitted> {
     let (source, revision) = self.place_before(path).ok_or_else(corrupt)?;
     // The head in the records' numbering: the green's head, or an import batch's whose scratch member counts its own
     // versions from 0 (C2 stage C).
@@ -2321,9 +2344,7 @@ impl<'b> Building<'b> {
         path: path.to_owned(),
       });
     }
-    let (from, to) = (green_path(&source).to_owned(), green_path(path).to_owned());
-    let beneath = self.engine.beneath(&from);
-    Ok((from, to, beneath))
+    Ok((green_path(&source).to_owned(), green_path(path).to_owned()))
   }
 
   /// The node `found` beneath `from`, a directory or not, as it stood, at its place beneath `to`.

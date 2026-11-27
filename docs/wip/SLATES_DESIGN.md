@@ -65225,6 +65225,20 @@ GAPS.
     leaders now are move's `stage.build` (2.1 ms) and the cold first `create` (2.3), then `stage.recording`,
     `landing.follow`, `stage.bringing` and `landing.holds` at 1.0-1.4 ms. Copy's `landing.prepare` read 11 ms of wall
     against 32 µs of CPU: preemption, not work.
+  **A removed directory's tree walked a node a unit in the build** (`ptrie::Cursor`, `Green::beneath_cursor`). Move's
+  `stage.build` (2.1 ms) named (debug): the step that took its trunk's deletion, 2.2 ms. Its `remove_begin` listed
+  every node the green held beneath the directory and sorted them (`Green::beneath`, 9,000) in the row's one unit,
+  then noted them gone a node a unit (9b). Every other build step was under 0.7 ms.
+  - The ptrie's walk is now a `Cursor` that borrows no arena between its keys, each `next` lent the arena; `Iter` is a
+    cursor and its arena, one walk.
+  - `Dim` and `Files` give prefix cursors, and `Green::beneath_cursor` and `beneath_next` walk a path's files, then its
+    directories, a node a call.
+  - The build's `Removing` keeps the cursor between steps in place of the listed tree. The order is the cursor's: each
+    node is only noted in a map of gone paths.
+  - A replacement, which remakes the node in its row, still lists its tree whole (`Building::remove`). Gauge
+    `svn_commit::BUILD_MOST_LISTED_A_UNIT`, the most nodes a build unit listed whole, recorded where one is listed.
+  - The move test bounds a build unit's gone paths and listed nodes at one; red at 9,000 with the deletion's tree
+    listed.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 

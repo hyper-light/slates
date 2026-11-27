@@ -942,7 +942,9 @@
 > free decision and its walks read a directory a child a unit, and `stage.check` since a revision's record is encoded a
 > part at a time; `stage.canonical`'s 5.4 ms was the named-run reads'
 > re-walk the run count removed, `parse`'s excess preemption, and `landing.changeset`'s `Texts` section is made an entry
-> a unit since; next by CPU, move's `stage.build` (2.1 ms debug) and the cold first `create` (2.3); the landing's
+> a unit since; move's `stage.build` (2.1 ms debug) walks a deleted
+> tree a node a unit since (a replacement's tree is still listed whole, gauged `BUILD_MOST_LISTED_A_UNIT`); next by CPU,
+> the cold first `create` (2.3 ms); the landing's
 > publication (9.3-24.8 ms since today's merges) is A-930's image cut, w-perf's. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`

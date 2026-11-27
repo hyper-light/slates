@@ -1176,8 +1176,13 @@ fn imported_whole_and_stepped(name: &'static str, dump: Vec<u8>) -> ImportedWhol
           crate::repository::svn_commit::staging::RECORDING_WALK_MOST_FILES,
         )
       });
-      let gone_most =
-        on(|state| count(state, crate::repository::svn_commit::BUILD_MOST_GONE_A_UNIT));
+      // The most gone paths a build unit noted, or nodes it listed whole beneath a removed directory (A-920).
+      let gone_most = on(|state| {
+        count(state, crate::repository::svn_commit::BUILD_MOST_GONE_A_UNIT).max(count(
+          state,
+          crate::repository::svn_commit::BUILD_MOST_LISTED_A_UNIT,
+        ))
+      });
       let grafted = on(|state| {
         state
           .greens
@@ -1654,8 +1659,9 @@ fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step
   );
   let (loaded, longest_ns, window_ns, (grafted, build_units, walk_most, gone_most)) =
     imported_whole_and_stepped("wide-move", dump);
-  // The move's delete of the trunk noted gone, and its paths made ops, a path a unit in its build (A-920 9b: the row
-  // 13.7 ms and the build's end 6.6 ms for 9,001 paths in one unit each, debug).
+  // The move's delete of the trunk walked, noted gone and its paths made ops a path a unit in its build (A-920 9b: the
+  // row 13.7 ms and the build's end 6.6 ms for 9,001 paths in one unit each, debug; and its tree listed whole in the
+  // row's unit, 2.2 ms, red at 9,000).
   assert!(
     gone_most <= 1,
     "a unit of the move's build noted {gone_most} gone paths"
