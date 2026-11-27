@@ -1695,7 +1695,7 @@ mod tests {
   #[test]
   fn a_crash_after_a_payloads_bytes_leaves_its_slots_mark_covering_them() {
     let mut seg = segment("crash");
-    let payload = vec![7u8; 3 * PAGE as usize];
+    let payload = vec![7u8; 3 * usize::try_from(PAGE).unwrap()];
     STOP_AFTER_PAYLOAD.with(|stop| stop.set(true));
     let stopped = seg.publish(RegionKind::Snapshot(0, 1), &payload);
     STOP_AFTER_PAYLOAD.with(|stop| stop.set(false));

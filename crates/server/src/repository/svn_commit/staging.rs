@@ -1965,6 +1965,14 @@ impl Staging {
   /// tail in one step of 580 ms on a debug build): the green's held table follows the batch, then the batch's texts are
   /// given back and let go; then its landing turn given back. None where the shard's state is gone.
   async fn land_tail(&mut self, cause: Flush) -> Option<()> {
+    self.tail_folded(cause).await?;
+    self.tail_let_go().await
+  }
+
+  /// [`Staging::land_tail`]'s first part: the green's identity brought to its head, the batch counted and checkpointed,
+  /// and the green folded to its readers' floor, each a slice of the shard's budget a step. None where the shard's
+  /// state is gone.
+  async fn tail_folded(&mut self, cause: Flush) -> Option<()> {
     #[cfg(test)]
     crate::vcs_store::svn_import::phase::tag("landing.identity");
     let green = self.green;
@@ -1987,7 +1995,14 @@ impl Staging {
     // 7.5-23.4 ms for a landing of 9,001 paths, debug, the release leader of a wide move's landing).
     #[cfg(test)]
     crate::vcs_store::svn_import::phase::tag("landing.fold");
-    until_done(|state| super::fold_to_readers_some(state, green, slice_deadline_ns())).await?;
+    until_done(|state| super::fold_to_readers_some(state, green, slice_deadline_ns())).await
+  }
+
+  /// [`Staging::land_tail`]'s per-text part, a slice of the shard's budget a step: the green's held table follows the
+  /// batch, the greens' pending holds applied, the batch's texts given back and the content arena's free pages past the
+  /// batch's bound given back; then its landing turn given back. None where the shard's state is gone.
+  async fn tail_let_go(&mut self) -> Option<()> {
+    let green = self.green;
     #[cfg(test)]
     crate::vcs_store::svn_import::phase::tag("landing.follow");
     let holding: Vec<(ContentIdentity, String)> = std::mem::take(&mut self.holding)

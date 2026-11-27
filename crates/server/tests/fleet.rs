@@ -38048,9 +38048,12 @@ fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_beg
   );
 }
 
+/// [`refusals_of`]'s reading: the last refusal of each kind, then the counts.
+type Refusals = (Vec<(&'static str, String)>, Vec<(&'static str, u64)>);
+
 /// What `daemon` last answered with no acknowledgement of a record, by why (`Daemon::last_record_refusals`), and its
 /// counts of refused records and of the merge plane's and the state logs' refusals: A-921's second mode, recorded.
-fn refusals_of(daemon: &Daemon) -> (Vec<(&'static str, String)>, Vec<(&'static str, u64)>) {
+fn refusals_of(daemon: &Daemon) -> Refusals {
   let last = daemon.last_record_refusals().unwrap_or_default();
   let counts = daemon
     .fleet_refusals()

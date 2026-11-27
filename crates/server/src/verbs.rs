@@ -21312,7 +21312,6 @@ fn replay_chain_entry(
   }
   // Then applied a slice's floor a step (`Green::apply_step`), the run kept with the entry between steps: an entry of a
   // whole tree (a push's line from an empty root) applied in one unit held a restart's slice 329.6 ms of CPU (r42).
-  let mut entry = entry;
   let run = match applying.take() {
     Some(run) => Ok(run),
     None => match green.begin_applying(&mut entry.increment, &entry.applied) {

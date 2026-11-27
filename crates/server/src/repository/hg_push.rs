@@ -1522,11 +1522,7 @@ async fn unbundled(
       Err(outcome) => return Some(outcome),
     };
   let outcome = match recorded(repository, &mut forked, &mut run).await? {
-    Ok(()) => {
-      #[cfg(test)]
-      held_before_landing().await;
-      landed_after_builds(repository, (principal, name), &unbundle, Some(forked), room).await
-    }
+    Ok(()) => landed_recorded(repository, (principal, name), &unbundle, forked, room).await,
     Err(outcome) => {
       give_back(Some(forked));
       Some(outcome)
@@ -1534,6 +1530,20 @@ async fn unbundled(
   };
   settle_run(run, outcome.as_ref()).await;
   outcome
+}
+
+/// [`unbundled`]'s landing once its run is recorded ([`landed_after_builds`]), held first where a test asked for it
+/// ([`held_before_landing`]).
+async fn landed_recorded(
+  repository: RepositoryId,
+  (principal, name): (&Principal, [u8; 32]),
+  unbundle: &Unbundle,
+  forked: Forked,
+  room: &mut Admission,
+) -> Option<PushOutcome> {
+  #[cfg(test)]
+  held_before_landing().await;
+  landed_after_builds(repository, (principal, name), unbundle, Some(forked), room).await
 }
 
 #[cfg(test)]
@@ -1998,10 +2008,8 @@ async fn built_works(
   // Each line the push moves that owes its push (P2: a line an earlier push made) is made through the door first, as a
   // command reaches any green, and held made until the push ends: its work is built on its content.
   let moved: BTreeSet<DbVolumeId> = plan.iter().map(|(green, ..)| *green).collect();
-  for green in moved {
-    if !crate::green_ready::made_for(green, pinned).await? {
-      return Some(Err(PushOutcome::refused(&abort(NOT_AVAILABLE.to_vec()))));
-    }
+  if let Err(outcome) = made_for_moved(moved, pinned).await? {
+    return Some(Err(outcome));
   }
   let mut built = BTreeMap::new();
   let mut named: Vec<NamedRevision> = Vec::new();
@@ -2009,25 +2017,9 @@ async fn built_works(
     if built.contains_key(key) {
       continue;
     }
-    let (green, base_version, base, head) = *key;
-    let moved = Move {
-      name,
-      base_version,
-      base: base.as_ref(),
-      head: &head,
-    };
-    let mut building = match begun_work(repository, forked, &moved, room).await? {
-      Ok(building) => building,
-      Err(outcome) => return Some(Err(outcome)),
-    };
-    match work_built(repository, forked, green, &mut building, room).await? {
-      Ok((increment, objects)) => {
-        for object in objects {
-          let Ok(node) = Node::try_from(object.key.as_bytes()) else {
-            continue;
-          };
-          named.push((object.identity, object.path.into_bytes(), node));
-        }
+    match built_one(repository, name, forked, key, room).await? {
+      Ok((increment, mut found)) => {
+        named.append(&mut found);
         built.insert(*key, increment);
       }
       Err(outcome) => return Some(Err(outcome)),
@@ -2037,6 +2029,56 @@ async fn built_works(
   named.sort_unstable();
   named.dedup();
   Some(Ok((plan, (built, named))))
+}
+
+/// [`built_works`]'s lines: each line the push moves that owes its push (P2: a line an earlier push made) made through
+/// the door, as a command reaches any green, and held made until the push ends. Refused not available for a line that
+/// could not be made; none when the store went away.
+async fn made_for_moved(
+  moved: BTreeSet<DbVolumeId>,
+  pinned: &mut crate::green_ready::Pinned,
+) -> Option<Result<(), PushOutcome>> {
+  for green in moved {
+    if !crate::green_ready::made_for(green, pinned).await? {
+      return Some(Err(PushOutcome::refused(&abort(NOT_AVAILABLE.to_vec()))));
+    }
+  }
+  Some(Ok(()))
+}
+
+/// [`built_works`]'s work for one planned `key`: begun ([`begun_work`]) and built ([`work_built`]), with the revisions
+/// its objects name. What refused it; none when the store went away.
+async fn built_one(
+  repository: RepositoryId,
+  name: [u8; 32],
+  forked: Option<&Forked>,
+  key: &WorkKey,
+  room: &Admission,
+) -> Option<Result<(Increment, Vec<NamedRevision>), PushOutcome>> {
+  let (green, base_version, base, head) = *key;
+  let moved = Move {
+    name,
+    base_version,
+    base: base.as_ref(),
+    head: &head,
+  };
+  let mut building = match begun_work(repository, forked, &moved, room).await? {
+    Ok(building) => building,
+    Err(outcome) => return Some(Err(outcome)),
+  };
+  let (increment, objects) =
+    match work_built(repository, forked, green, &mut building, room).await? {
+      Ok(built) => built,
+      Err(outcome) => return Some(Err(outcome)),
+    };
+  let named = objects
+    .into_iter()
+    .filter_map(|object| {
+      let node = Node::try_from(object.key.as_bytes()).ok()?;
+      Some((object.identity, object.path.into_bytes(), node))
+    })
+    .collect();
+  Some(Ok((increment, named)))
 }
 
 /// `moved`'s work begun ([`built_works`]): its base's and its head's trees laid out in a turn of their own

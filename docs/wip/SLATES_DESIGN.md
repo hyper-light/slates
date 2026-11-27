@@ -64985,6 +64985,36 @@ GAPS.
   - Test: `an_ops_identity_hashes_each_entry_as_its_digest_alike_at_the_owner_and_its_replay`. The encoding is the
     same for the op read back as a replay reads it; a 431 KB entry's is no longer than a 100-byte one's; a one-byte
     change of an entry gives a different encoding.
+  **Release probe 17** (main, at a52c0aa1e with 13b and the release's user and system split, before 13c; by the
+  history's longest poll; 99 runs at load 50-56, then 99 with burners; all rc 0):
+  - add: p50 714 µs, then 695 with burners; over 1 ms in 14 and 4 of 99. Led by `stage.recording`.
+  - copy: p50 1,326 µs, then 1,242; led by `landing.release` in 78 and 75. Its longest release unit is p50 1,226 to
+    1,302 µs, all of it system time (user 3 to 5 µs).
+  - move: p50 1,548 µs, then 1,556; over 1 ms in 99 and 98. Led by an untagged span, the whole poll, in 98 and 96.
+  **The untagged span is the test's own setup** (main's ruling: measure the product, not the oracle). A history's
+  phase is "untagged" until its first tag, so the span was what the history did before the import's first turn.
+  Tagged once (debug), move's first poll was 1,623 µs:
+  - the simulated host's copy of the 10.5 MB dump, 1,438 µs. `to_vec` was 1,486 µs, 1,232 of it system time
+    faulting the copy's pages in; `replace_file`'s own work 300. The harness alone: no product code runs in it.
+  - the import's `begin`, 178 µs; the repository's create, 7 µs warm and 1,796 µs cold (the process's first).
+  The host now holds the dump the test's thread made as it is, moved in and never copied
+  (`SimHost::replace_file_owned`), so its hold costs the history nothing that grows with the dump; it was first made
+  before the history under an `Arc` and a `Mutex`, which R2 and D-7 forbid, and is replaced. The product's create and
+  begin stay in the history under tags of their own ("create", "begin"). Their longest spans print apart from the
+  import's turns: `SETUP <test> create_ns=<n> begin_ns=<n>`. In debug, create is 167-202 µs warm and 1,957 µs cold,
+  and begin is 615-1,141 µs. Probe 16 at cb73f520b read move at p50 1,090 µs with the same setup code. Unmeasured
+  guess: 7fcc72414's harness fix removed a clone and drop of the history's dump on the shard just before. Its freed
+  pages had made the host's copy cheap.
+  **Copy's release unit: an allocator's batch of freed pages returned in one free.** By the unit's kind (debug), the
+  long unit is a map node's release in most runs and a remains entry's pop in one. Inside it, the time is in one
+  free whose value varies from run to run: a named block's (1.30-1.56 ms), a node's 160-byte child list (1.32 ms).
+  The task's VM counters (`TASK_VM_INFO`) around that free:
+  - `internal` and `phys_footprint` drop by 39-44 MB;
+  - `reusable` rises by 28-33 MB.
+  That is the allocator marking freed pages reusable in a batch (`madvise`), paid by whichever free crosses its
+  threshold. The release's walk does not decide which free that is. Main's ruling: what the release takes goes by
+  move to a reaper thread the daemon owns, not to a swap of the global allocator (a C dependency on every platform,
+  and every memory figure rebaselined).
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
@@ -65235,7 +65265,11 @@ measured noise of the 100 figure, not a literal.
     unit test's first green run found it, 77,485 steps of nothing).
   - **Red:** `a_one_page_give_back_takes_the_pages_of_extents_that_end_off_a_page` (daemon unit test): on main, dead
     stale slot (0, 46) and log (0, 73) fell to nothing with 0 bytes given back; with the rule, 16,384 bytes given back
-    and 0 left. `returned_after_idle` in `tests/recovery.rs` is bounded at sixty liveness budgets with a typed failure.
+    and 0 left. The test holds what is asked, on every platform (2026-11-27, main's Windows CI run 45948476737: both
+    native Windows jobs failed its first form, which asserted the bytes the OS took, and Windows' section views took
+    none): the whole pages the give-back asks the OS for, counted `recovery.asked_bytes` (`daemon::RECOVERY_ASKED`), 0
+    on the old rounding on any platform, 16,384 with the rule on the MacBook, all of them taken there.
+    `returned_after_idle` in `tests/recovery.rs` is bounded at sixty liveness budgets with a typed failure.
   - **The boot test's premise:** a fresh daemon's marks say its recovery memory is unwritten, so it has nothing to
     give back, and `a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step` failed typed on main. It now takes the
     memory as written whole first (`Daemon::take_recovery_memory_as_written_whole`), as a daemon over an image before
@@ -65780,6 +65814,18 @@ Applied in the same change to:
     checkpointed at a 4,096-byte page, then 60 let go one publication each: 266,160 bytes encoded before (about a 4,436-byte page each publication); 0 bytes encoded with
     the cut, the family 31,535 bytes in the image before and 25,235 after; the same oracle as part 1's (the image the
     shard's entries, each piece a whole encoding's bytes). Part 1's red is unchanged by the cut: 46,300 bytes.
+- **What it costs past encoding (main's 57k rerun at c207c9f81, 2026-11-26 23:37):** the families' encoded bytes fell
+  (aways 43,141,224 to 19,129,720, windows 21,192,055 to 12,235,090), but `vcs_store.image.encoded_bytes` rose from
+  74,340,245 to 295,619,288. Since part 1 a turn's spent bytes count the committed bytes each append, cut or split
+  copies, so 263,910,185 bytes of that were copies, counted as encoding. They are counted apart now
+  (`vcs_store.image.copied_bytes`, `Turned::copied`; `encoded_bytes` is encoding and splits' reads again, as its
+  definition says), with the page size a turn planned by (`vcs_store.image.page_bytes`), and `hg_fetch_heap`'s
+  `what_holds` prints every `vcs_store.image.*` counter. At test scale: the Aways red's 600 cuts encoded 160,860
+  bytes in all and copied 5,326,728 (two pages a cut: the Aways tail and the landed records' page); the windows red's 60
+  cuts encoded 4,625 and copied 402,745. A publication moves its dirty pages' bytes whole either way, since a delta
+  carries a page's piece whole; the copy only replaced the encoding. OWED: the 57k's cut count from the rerun with
+  these counters, and main's ruling on carrying a piece in parts (the committed bytes by reference), which would take
+  the copy out.
 - **Applied in the same change to:** `crates/server/src/image_pages.rs` (the encoder's lasts and least changes,
   `append_page`, `entry_ends`, `CommittedPiece`, `Encoder::appends`, `append`, `split_appended`, `dirty_whole`); the
   goal 93 line in GAPS (A-923's entry). Part 2: `image_pages.rs` (`Marked`, `EntryCoordinate`, `Changed`, `PieceCut`,

@@ -497,6 +497,8 @@ pub struct TextCacheFigures {
   pub walks: u64,
   /// Their texts' bytes.
   pub walk_bytes: u64,
+  /// The bytes its index holds reserved: the texts map's and the order queue's capacity, an entry's bytes each.
+  pub index: u64,
 }
 
 /// Whole texts made from their chains, by identity, the least lately read out first, bounded in bytes; and what the
@@ -522,6 +524,14 @@ pub struct TextCacheFigures {
 /// gives its pages back to the OS; a text a chunk long or longer is a chunk of its own. A chain is made through two
 /// buffers the cache keeps and reuses (`base`, `next`), so a chunk given back while the chain is made loses nothing the
 /// next edit needs; held by `tests/text_cache_heap.rs`.
+///
+/// **The index is in the bound** (goal 93, main's 57k rerun at c207c9f81: the chunks at their 1 MiB bound while
+/// 35,951,082 bytes stayed live under the keep and 10,827,585 in the texts map). A text laid costs its chunk an index
+/// entry's bytes beside its own ([`INDEX_ENTRY_BYTES`]), so a chunk of tiny texts, or of texts read again from older
+/// chunks, fills and goes with its entries; and the index is shrunk once it stands [`INDEX_SLACK`] times past what it
+/// holds, so a bound that fell gives back what the higher one grew
+/// (`a_cache_of_tiny_texts_holds_its_index_within_its_bound`: 12,304,632 bytes grown for 100,000 texts of 8 B against a
+/// 1 MiB bound; now 131,872).
 #[derive(Debug)]
 pub struct TextCache {
   /// Where each text held lies: its chunk's number and its range there. A hash table, which once grown to the texts a
@@ -584,7 +594,22 @@ struct Chunk {
   bytes: Vec<u8>,
   /// Whether it holds one text taken whole, which nothing else is laid after.
   whole: bool,
+  /// What its texts cost against its room: their bytes, and an index entry's ([`INDEX_ENTRY_BYTES`]) for each text laid
+  /// in it, so a chunk of tiny texts fills by its index too and goes, and its entries with it.
+  charged: usize,
 }
+
+/// Derived: the bytes a text laid in a [`TextCache`] costs its index beside its own bytes: its entry in the texts map
+/// (its identity and where it lies, and hashbrown's control byte) and in the order queue (its identity and its chunk's
+/// number). Counted against the chunk it is laid in, so the bound holds the index as well as the texts (goal 93, main's
+/// 57k rerun at c207c9f81: the cache's texts held its 1 MiB bound while about 46.8 MB of its index stayed live).
+const INDEX_ENTRY_BYTES: usize =
+  size_of::<(Identity, Lent)>() + size_of::<u8>() + size_of::<(Identity, u64)>();
+
+/// Derived: how far past what it holds the cache's index may stand before it is shrunk: two doublings, the index's
+/// capacity growing by doubling, so one doubling of headroom stays after a shrink and a cache that fills and empties by
+/// less than half never reallocates its index.
+const INDEX_SLACK: usize = 4;
 
 /// Where a held text's bytes lie: its chunk's number, and its range there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -661,6 +686,18 @@ impl TextCache {
       bound: self.bound,
       walks: to_u64(self.walks.len()),
       walk_bytes: self.walk_bytes,
+      index: to_u64(
+        self
+          .texts
+          .capacity()
+          .saturating_mul(size_of::<(Identity, Lent)>().saturating_add(size_of::<u8>()))
+          .saturating_add(
+            self
+              .order
+              .capacity()
+              .saturating_mul(size_of::<(Identity, u64)>()),
+          ),
+      ),
     }
   }
 
@@ -755,6 +792,7 @@ impl TextCache {
     if to_u64(text.len()) > self.bound || self.texts.contains_key(&identity) {
       return;
     }
+    let cost = text.len().saturating_add(INDEX_ENTRY_BYTES);
     if text.len() >= self.chunk_len() {
       self.make_room(text.len(), false);
       let mut whole = Vec::new();
@@ -769,9 +807,9 @@ impl TextCache {
         .back()
         .filter(|chunk| !chunk.whole)
         .map_or(0, |chunk| {
-          chunk.bytes.capacity().saturating_sub(chunk.bytes.len())
+          chunk.bytes.capacity().saturating_sub(chunk.charged)
         });
-      if room < text.len() {
+      if room < cost {
         let len = self.chunk_len();
         // The chunk the room was made from, when it was an ordinary one of this length, laid again: no fresh mapping
         // faulted in and none unmapped (goal 93, main's churn ruling of 2026-11-25).
@@ -801,6 +839,7 @@ impl TextCache {
     };
     let at = chunk.bytes.len();
     chunk.bytes.extend_from_slice(text);
+    chunk.charged = chunk.charged.saturating_add(cost);
     self.order.push_back((identity, number));
     self.bytes = self.bytes.saturating_add(to_u64(text.len()));
     self.texts.insert(
@@ -816,7 +855,11 @@ impl TextCache {
   /// Adds `bytes` as the newest chunk.
   fn push_chunk(&mut self, bytes: Vec<u8>, whole: bool) {
     self.reserved = self.reserved.saturating_add(to_u64(bytes.capacity()));
-    self.chunks.push_back(Chunk { bytes, whole });
+    self.chunks.push_back(Chunk {
+      bytes,
+      whole,
+      charged: 0,
+    });
   }
 
   /// Gives back the oldest chunks, whole, until `len` bytes more fit the bound, forgetting the texts laid in them; a text
@@ -874,7 +917,21 @@ impl TextCache {
         kept = Some(oldest.bytes);
       }
     }
+    self.shrink_index();
     kept
+  }
+
+  /// Shrinks the index, the texts map and the order queue, where either stands [`INDEX_SLACK`] times past what it
+  /// holds, to one doubling past it: a cache whose bound fell (its walks ended) gives back the index its higher bound
+  /// grew.
+  fn shrink_index(&mut self) {
+    let past = |capacity: usize, len: usize| capacity > len.max(1).saturating_mul(INDEX_SLACK);
+    if past(self.texts.capacity(), self.texts.len()) {
+      self.texts.shrink_to(self.texts.len().saturating_mul(2));
+    }
+    if past(self.order.capacity(), self.order.len()) {
+      self.order.shrink_to(self.order.len().saturating_mul(2));
+    }
   }
 
   /// Gives back a chain buffer that took the mapped path (a text a floor long or longer made it so), before the next

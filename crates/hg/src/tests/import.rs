@@ -1773,9 +1773,7 @@ fn an_import_writes_the_changegroup_a_push_of_its_history_brings() {
 /// and the import's v9 run one range, no homed run.
 #[test]
 fn a_pushs_homed_run_reference_is_the_golden_bytes_and_v11_and_v12_are_no_longer_read() {
-  use crate::import::record::{
-    HomedRun, homed_run_of, run_of, write_homed_run_reference, write_run_reference,
-  };
+  use crate::import::record::{HomedRun, homed_run_of, run_of, write_homed_run_reference};
   let list = [7u8; 32];
   let written = write_homed_run_reference(1 << 20, (list, 88), (12, (5, 6, 7)));
   let golden: Vec<u8> = [
@@ -1809,6 +1807,13 @@ fn a_pushs_homed_run_reference_is_the_golden_bytes_and_v11_and_v12_are_no_longer
   let mut trailing = written.clone();
   trailing.push(0);
   assert_eq!(homed_run_of(&trailing), None);
+  older_runs_read_as_no_homed_run(&written);
+}
+
+/// The older run references beside a homed run of `written`'s: a version-11 reference and `written` rewritten as
+/// version 12 read as no run, and the import's v9 run reads as its one range and no homed run.
+fn older_runs_read_as_no_homed_run(written: &[u8]) {
+  use crate::import::record::{homed_run_of, run_of, write_run_reference};
   let v11: Vec<u8> = [
     &b"SHGR"[..],
     &11u32.to_le_bytes(),
@@ -1824,7 +1829,7 @@ fn a_pushs_homed_run_reference_is_the_golden_bytes_and_v11_and_v12_are_no_longer
     (None, None),
     "v11 no longer read"
   );
-  let mut v12 = written.clone();
+  let mut v12 = written.to_vec();
   v12[4..8].copy_from_slice(&12u32.to_le_bytes());
   v12.truncate(v12.len() - 24);
   assert_eq!(homed_run_of(&v12), None, "v12 no longer read");
@@ -1862,25 +1867,32 @@ fn a_segment_list_is_the_golden_bytes_and_reads_back_whole_or_not_at_all() {
   }
   assert_eq!(written, golden);
   assert_eq!(segment_list_of(&written).as_deref(), Some(&entries[..]));
+  damaged_segment_lists_read_as_none(&written);
+  assert_eq!(write_segment_list(&[]), None);
+  assert_eq!(write_segment_list(&[entry(5, 1), entry(3, 2)]), None);
+  assert_eq!(write_segment_list(&[entry(5, 1), entry(5, 2)]), None);
+}
+
+/// Every damage to the segment list `written` reads as none: cut at every length, a byte added, a count past its bytes
+/// (`u64::MAX`, and one more than the two it holds), its magic or its version flipped.
+fn damaged_segment_lists_read_as_none(written: &[u8]) {
+  use crate::import::record::segment_list_of;
   for cut in 0..written.len() {
     assert_eq!(segment_list_of(&written[..cut]), None, "cut at {cut}");
   }
-  let mut trailing = written.clone();
+  let mut trailing = written.to_vec();
   trailing.push(0);
   assert_eq!(segment_list_of(&trailing), None);
   for count in [u64::MAX, 3] {
-    let mut lying = written.clone();
+    let mut lying = written.to_vec();
     lying[8..16].copy_from_slice(&count.to_le_bytes());
     assert_eq!(segment_list_of(&lying), None, "count {count}");
   }
   for at in [0, 4] {
-    let mut flipped = written.clone();
+    let mut flipped = written.to_vec();
     flipped[at] ^= 1;
     assert_eq!(segment_list_of(&flipped), None, "flipped at {at}");
   }
-  assert_eq!(write_segment_list(&[]), None);
-  assert_eq!(write_segment_list(&[entry(5, 1), entry(3, 2)]), None);
-  assert_eq!(write_segment_list(&[entry(5, 1), entry(5, 2)]), None);
 }
 
 /// A-767 C1 step 3 (an import's run in the register, `record::write_run_reference`). Do: write a run's reference, read
