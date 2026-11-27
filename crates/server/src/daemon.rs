@@ -295,6 +295,8 @@ pub struct Daemon {
   runtime: Option<Runtime>,
   segment: AnchorSegment,
   doorbell: Option<DoorbellThread>,
+  /// The reaper (A-920): drops what the shards' releases took on its own thread, stopped after the shards.
+  reaper: Option<crate::reaper::Reaper>,
   /// The liveness watchdog (A-228): the beat's writer, stopped after the shards.
   watchdog: Option<crate::watchdog::Watchdog>,
   /// The writer of the shards' log lines (A-305), stopped after the shards, so it writes every line they queued.
@@ -1114,6 +1116,9 @@ impl Daemon {
       &mut || start_beat.beat(&beat_block),
     )?;
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
+    // The reaper (A-920), before any shard starts: each shard's thread installs its end as it starts.
+    let reaper =
+      crate::reaper::Reaper::start(shards.first().map_or(0, |shard| shard.0), shards.len());
     // The daemon's spawner (A-924): started now, before any client's descriptor is open, with an end a shard. Every hook
     // and helper a shard starts is started by it, so a spawn never copies this process's descriptor table.
     #[cfg(unix)]
@@ -1232,6 +1237,7 @@ impl Daemon {
         } else {
           None
         },
+        reaper: reaper.as_ref().map(crate::reaper::Reaper::end),
         devices: inherited_devices.next().unwrap_or_default(),
         #[cfg(target_os = "linux")]
         copies: inherited_copies.next().unwrap_or_default(),
@@ -1240,6 +1246,7 @@ impl Daemon {
       #[cfg(windows)]
       let holds = ShardHolds {
         stop_watch,
+        reaper: reaper.as_ref().map(crate::reaper::Reaper::end),
         winfsp: inherited_winfsp.next().unwrap_or_default(),
         channel: if index == 0 {
           windows_channel.take()
@@ -1397,6 +1404,7 @@ impl Daemon {
       runtime: Some(runtime),
       segment,
       doorbell,
+      reaper,
       watchdog: Some(watchdog),
       log_writer: Some(log_writer),
       config,
@@ -4750,6 +4758,11 @@ impl Daemon {
     while let Ok(spawner) = self.spawner_join.try_recv() {
       crate::spawning::join_spawner(spawner);
     }
+    // The reaper after the shards, whose ends went with their threads: every batch they handed it is dropped first
+    // (A-920).
+    if let Some(mut reaper) = self.reaper.take() {
+      reaper.stop();
+    }
     // Last, so a draining daemon still beats while its shards step (A-228).
     if let Some(mut watchdog) = self.watchdog.take() {
       watchdog.stop();
@@ -5046,6 +5059,8 @@ struct ShardHolds {
   /// The spawner itself, the shards it serves in its ends' order, and how long its start took: the control shard's
   /// alone, which owns and restarts it (A-924 piece 2b).
   spawner_owner: Option<SpawnerOwner>,
+  /// This shard's end of the daemon's reaper (A-920).
+  reaper: Option<crate::reaper::ReaperEnd>,
   /// The held devices.
   devices: Vec<crate::fuse_hold::HeldDevice>,
   /// The held writable copies.
@@ -5061,6 +5076,8 @@ struct ShardHolds {
 struct ShardHolds {
   /// Where the process thread's stop watch arrives (the control shard's alone; [`StopWatch`]).
   stop_watch: Option<std::sync::mpsc::Receiver<StopWatch>>,
+  /// This shard's end of the daemon's reaper (A-920).
+  reaper: Option<crate::reaper::ReaperEnd>,
   /// The held WinFsp mounts.
   winfsp: Vec<crate::winfsp::InheritedMount>,
   /// The hold channel's daemon end: the control shard installs it.
@@ -5372,11 +5389,16 @@ async fn init_shard(
   #[cfg(windows)]
   let ShardHolds {
     stop_watch: stop_watch_install,
+    reaper,
     winfsp: inherited_winfsp,
     channel: windows_channel,
     resync: inherited_resync,
     dax: inherited_dax,
   } = holds;
+  #[cfg(unix)]
+  let reaper = holds.reaper;
+  // This shard's end of the daemon's reaper (A-920), before anything on the shard can release a green.
+  crate::reaper::install(reaper);
   #[cfg(unix)]
   let inherited_dax = holds.dax;
   #[cfg(unix)]

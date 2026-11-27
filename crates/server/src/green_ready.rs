@@ -883,11 +883,7 @@ fn dematerialize(state: &mut ShardState, green: DbVolumeId) -> bool {
     return false;
   }
   if let Some((repository, Ok(mut release))) = state.greens.retire(&green) {
-    while state
-      .greens
-      .release_step(repository, &mut release)
-      .is_ok_and(|more| more)
-    {}
+    state.greens.release_whole(repository, &mut release);
   } else {
     return false;
   }

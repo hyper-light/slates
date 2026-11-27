@@ -26,6 +26,7 @@ use std::ops::{Deref, DerefMut};
 
 use slates_db::catalog::{RepositoryId, VolumeId};
 use slates_merge::engine::{Green, Judged, Lent, Lineage, LineageGreen, LineageRefused, Release};
+use slates_merge::reaped::Reaped;
 
 /// The shard's green engines (module docs).
 #[derive(Default)]
@@ -307,10 +308,7 @@ impl Greens {
       .collect();
     for id in gone {
       if let Some((repository, Ok(mut release))) = self.retire(&id) {
-        while self
-          .release_step(repository, &mut release)
-          .is_ok_and(|more| more)
-        {}
+        self.release_whole(repository, &mut release);
       }
     }
   }
@@ -420,10 +418,7 @@ impl Greens {
   /// one version copied, so its release is that version's paths, never the tree.
   pub fn retire_preview(&mut self, preview: Preview) {
     if let Some((repository, mut release)) = self.retire_preview_begun(preview) {
-      while self
-        .release_step(repository, &mut release)
-        .is_ok_and(|more| more)
-      {}
+      self.release_whole(repository, &mut release);
     }
   }
 
@@ -465,12 +460,14 @@ impl Greens {
 
   /// One unit of the queued releases: one node's hold of the oldest owed release given back, the release dropped once
   /// it is done. [`ReleaseProgress::Done`] once nothing is owed, when the release task is marked ended.
-  pub fn release_unit(&mut self) -> ReleaseProgress {
+  ///
+  /// What the unit frees is moved into `reaped`, for the caller to hand to the reaper ([`crate::reaper::reap`]).
+  pub fn release_unit(&mut self, reaped: &mut Reaped) -> ReleaseProgress {
     let Some((repository, mut release)) = self.pending.pop_front() else {
       self.releasing = false;
       return ReleaseProgress::Done;
     };
-    match self.release_step(repository, &mut release) {
+    match self.release_step(repository, &mut release, reaped) {
       Ok(true) => {
         self.pending.push_front((repository, release));
         ReleaseProgress::More
@@ -495,25 +492,41 @@ impl Greens {
   }
 
   /// One step of a retired member's release in `repository`'s lineage: false once it is done, when an emptied lineage
-  /// goes too.
+  /// goes too. What the step frees, the emptied lineage too, is moved into `reaped`, never dropped here: its caller hands
+  /// it to the reaper ([`crate::reaper::reap`], A-920).
   pub fn release_step(
     &mut self,
     repository: RepositoryId,
     release: &mut Release,
+    reaped: &mut Reaped,
   ) -> Result<bool, LineageRefused> {
     let lineage = self
       .lineages
       .get_mut(&repository)
       .ok_or(LineageRefused::Stale)?;
-    let more = lineage.get_mut().release_step(release)?;
+    let more = lineage.get_mut().release_step(release, reaped)?;
     if !more && lineage.get_mut().is_empty() {
       // Its holds given back before its arenas go (A-760 (b) 4d).
       if let Ok(given) = lineage.get_mut().give_back_name_holds() {
         self.given_back.extend(given);
       }
-      self.lineages.remove(&repository);
+      if let Some(lineage) = self.lineages.remove(&repository) {
+        reaped.whole(Box::new(lineage));
+      }
     }
     Ok(more)
+  }
+
+  /// A retired member's `release` in `repository`'s lineage stepped to its end in one call, what it frees handed to the
+  /// reaper ([`crate::reaper::reap`]): what a caller with no budget of its own to step it under does (a preview's
+  /// release, a member dropped whole; GAPS, A-920's unmeasured siblings of 6a). A lineage refused stops it.
+  pub fn release_whole(&mut self, repository: RepositoryId, release: &mut Release) {
+    let mut reaped = Reaped::default();
+    while self
+      .release_step(repository, release, &mut reaped)
+      .is_ok_and(|more| more)
+    {}
+    crate::reaper::reap(reaped);
   }
 
   /// Member `id`'s engine taken out of its lineage with the arenas in it, for a replay that runs over many slices (a
@@ -568,10 +581,7 @@ impl Greens {
       return;
     }
     if let Some((repository, Ok(mut release))) = self.retire(id) {
-      while self
-        .release_step(repository, &mut release)
-        .is_ok_and(|more| more)
-      {}
+      self.release_whole(repository, &mut release);
     }
   }
 

@@ -65015,6 +65015,32 @@ GAPS.
   threshold. The release's walk does not decide which free that is. Main's ruling: what the release takes goes by
   move to a reaper thread the daemon owns, not to a swap of the global allocator (a C dependency on every platform,
   and every memory figure rebaselined).
+  **The reaper** (`slates_merge::reaped`, `crates/server/src/reaper.rs`). A release's walk stays on the shard: a node's
+  hold given back, its slot freed, its children queued, its block's holder let go. What each unit frees is moved into a
+  `Reaped` and never dropped on the shard:
+  - a freed node's label and child list, and its value's heap;
+  - a freed block's bytes and an owned history chunk;
+  - the history arena's emptied lists;
+  - once the holds are back, the retired green's remains whole (11b's pop an entry a step is gone);
+  - an emptied lineage whole.
+  A block's release no longer copies a shared block's bytes only to drop them. The landing gathers its release's
+  `Reaped` over its slices and hands it once, at the release's end, to the daemon's reaper (`reaper::reap`), a thread
+  the daemon starts with its shards and joins after them. Each shard thread holds a sender, installed at its start as the
+  spawner's end is. The channel holds two batches a shard. At the bound, or on a thread with no reaper, the shard drops
+  the batch in place and counts it; it never waits. A batch a slice was tried first: about 2,500 small sends a copy,
+  which a reaper slow to wake under load met at its bound, so 1,872 to 9,245 things were dropped in place.
+  The release task (`repository::run_releases`) hands a slice's `Reaped` at its end. The releases run whole in one call
+  (a preview's, a member dropped whole) go through `Greens::release_whole`, which hands its `Reaped` at its end.
+  - Test: `wide_release_reaped` (in `t_c2c`): the releases handed the reaper more things than the revision's files and
+    dropped none in place. Red with a batch a slice: 1,344 handed, 8,560 in place.
+  - The wide tests print `REAPER <test> handed= batches= inline= reaper_cpu_ns= reaper_user_ns= reaper_sys_ns=
+    reaper_taken=`. The reaper's time is its own thread's, kept per daemon by its control shard as the doorbell's flags
+    are.
+  - Debug, after: copy's longest release unit is 25 µs (22 of it system), against 1.3-1.7 ms before. In each wide test
+    the shard handed 9,904 to 9,916 things in one or two batches, none in place, and the reaper spent 4.8 to 10.3 ms of
+    its own CPU dropping them.
+  - merge test `a_retired_branchs_release_hands_what_it_frees_to_its_reaped` replaces 11b's stepped-remains test: the
+    steps take more things than the nodes they free, and the lineage keeps exactly the root's nodes.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 

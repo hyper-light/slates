@@ -218,6 +218,15 @@ impl Source {
     }
   }
 
+  /// [`Source::let_go`] for a release: an owned chunk's bytes and a freed block's moved into `reaped`, to be dropped
+  /// elsewhere ([`crate::reaped`]).
+  fn let_go_reaping(self, blocks: &mut Blocks, reaped: &mut crate::reaped::Reaped) {
+    match self {
+      Source::Owned(bytes) => reaped.bytes(bytes),
+      Source::Block { block, .. } => blocks.release_reaping(block, reaped),
+    }
+  }
+
   /// Gives back what the chunk holds: the block's holder, for a block.
   fn let_go(self, blocks: &mut Blocks) {
     if let Source::Block { block, .. } = self {
@@ -263,19 +272,37 @@ impl Chunks {
 
   /// One chunk of a retired green's history given back: its slot freed and, for a file's block, the block's holder let
   /// go (module docs, "Lifetimes"). False once no chunk is left. Every value naming the chunks is dropped with the green.
-  pub(crate) fn release_step(&mut self, blocks: &mut Blocks) -> bool {
+  /// What the chunk held, and at the end the arena's emptied lists, are moved into `reaped`, never dropped here (A-920,
+  /// [`crate::reaped`]).
+  pub(crate) fn release_step(
+    &mut self,
+    blocks: &mut Blocks,
+    reaped: &mut crate::reaped::Reaped,
+  ) -> bool {
     let Some(slot) = self.slots.pop() else {
-      self.free.clear();
-      self.layers.clear();
-      self.entries = 0;
-      self.bytes = 0;
-      self.named = 0;
+      self.released_lists(reaped);
       return false;
     };
     if let Some((source, _)) = slot {
-      source.let_go(blocks);
+      source.let_go_reaping(blocks, reaped);
     }
     true
+  }
+
+  /// A released arena's emptied lists, each holding an allocation, moved into `reaped` whole; its counts cleared.
+  fn released_lists(&mut self, reaped: &mut crate::reaped::Reaped) {
+    if self.slots.capacity() > 0 {
+      reaped.whole(Box::new(std::mem::take(&mut self.slots)));
+    }
+    if self.free.capacity() > 0 {
+      reaped.whole(Box::new(std::mem::take(&mut self.free)));
+    }
+    if !self.layers.is_empty() {
+      reaped.whole(Box::new(std::mem::take(&mut self.layers)));
+    }
+    self.entries = 0;
+    self.bytes = 0;
+    self.named = 0;
   }
 
   /// Whether no chunk is left to give back ([`Chunks::release_step`]).

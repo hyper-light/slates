@@ -50,6 +50,7 @@ mod piece_tree;
 pub mod ptrie;
 pub mod push;
 pub mod range;
+pub mod reaped;
 pub mod refine;
 pub mod review;
 pub mod splice;
