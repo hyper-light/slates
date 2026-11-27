@@ -11895,7 +11895,10 @@ nothing copied), a source that owes its push made first through A-886's door, an
 (`MergeRecordValue::lineage`, A-932) while no part held here records its join yet waits `OUT_OF_ORDER`, since the owner
 owes its names log to every holder of its greens (one placement: a family's ids share their line key). A green whose
 record names no lineage stands alone and is made at once: its id cannot say so, since a green made alone is a family of
-its own (A-636 part 2b-2), so its owner's record does, from the join its catalog holds when it makes the record.
+its own (A-636 part 2b-2), so its owner's record does, from the join its catalog holds when it makes the record. A
+green made alone and adopted later as a repository's root was made standing alone, as its record says; where a branch
+of it is first made here, the holder founds the lineage with it, the names log joining it as the root (A-932's sibling,
+`merge_service::adopted_root_founded`).
 Nothing acknowledged rests on a join only its owner held (A-915): a repository's creation answers once its root's join
 is at `f + 1` as well as its record, so a successor's adoption, which holds the names log its takeover gathered from a
 quorum, finds every acknowledged green's join; one whose join it does not find was never acknowledged a member, and its
@@ -56225,6 +56228,16 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   without `restore_away`: 4 lists and names refused) and `daemon::tests::t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes`
   (three warm restarts after seeded let-go rounds, the store whole as published each time, the object brought back the
   same bytes by its identity).
+  - **A recovery's map remake reads its files whole (2026-11-27, w-perf; main's ruling of 11:09).** A recovery makes
+    each git green's map and trees again from its head (`paths::remake_green_sliced`), and the trees hash each file's
+    bytes from the content store. A file whose window the image restored let go is put with
+    `ContentStore::put_object_whole`, which brings the window back from the file's bytes (the green's own, in hand).
+    Each such window was first noted at its let-go number (`ContentStore::aways_of`) and is let go again at that
+    number once the map is made, a unit of the recovery's slices each (`ContentStore::let_go_again`,
+    `paths::let_go_brought_again`; counted `vcs_paths.remake_brought_back`, any kept `vcs_paths.remake_kept`). So the
+    warm restart holds what its predecessor held, and the image's aways are unchanged. A refused remake is logged with
+    its green and why, since with no map the recovery frees what only the map held. Before 11168fab3 the hash ran over
+    the short file and named a wrong tree; from it until this fix the remake was refused and the file freed.
 
 
 - **Slice (d), a holder's replica reads named content (2026-11-23, w-shared; main 01a20182's rulings of 2026-11-23).**
@@ -66016,6 +66029,15 @@ Applied in the same change to:
   (found looking at the 57k hg push's hang, of which part 3 is cleared: a push at ca78de951, which contains it,
   finished). Red first: `state_log::tests::a_part_let_go_before_any_publication_carried_it_leaves_no_change` (4 marks,
   now 0).
+- **Amended 2026-11-27 (w-perf; main's ruling of 13:42):** a mark remembers whether the last committed publication
+  carried its position. The let-go above toggled the mark, so a part the publication carried, let go, held again at
+  its position and let go again lost its mark, and the next delta kept its piece (w-svn's seed, also diag 11's
+  windows-latest: the fold held a part the shard no longer held). Now a let-go drops only a mark for a position no
+  publication carried; one carried is marked for removal however often it is held again. Red: the seed in
+  `crates/server/src/daemon.proptest-regressions` for
+  `daemon::tests::folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds`.
+  Production never holds a part again at a let-go position (a part's positions are its register's growing log
+  positions, w-shared); the generator's start at the floor follows with A-921's (C).
 - **Amended by A-921 part 4** (2026-11-27): (2) is fixed. Its cause was not shipping: the record a warm start
   re-derives differs from the one shipped, which a holder joins now.
 
@@ -66438,3 +66460,12 @@ Applied in the same change to:
   - a914 asserts its second push lands, closing its named debt.
 - **Applied in the same change to:** `crates/server/src/{fleet,vcs_store/homes}.rs`, `crates/server/tests/fleet.rs`
   (`push_on_top_at_edge`, shared by `GitFleet::push_on_top_of`), GAPS.
+
+- **Amended (w-interop, 2026-11-27, main 01a20182's ruling of 12:37; a914's record barrier, placed Some(1)).** A
+  region read asks an object's homes live first by this node's own view of each (alive, suspect, dead; read once per
+  read, the rendezvous order kept within each), and gives each its share of what is left of the read's budget, the
+  last all of it (`vcs_store::homes::read_remote`, `live_first`, `share_of`). Before, it waited each home out in turn
+  for the whole budget, so a name whose first home had just died cost a replica's replay 2 s and a push's barrier gave
+  up first. The other callers that wait a dead home out are in GAPS, reported. Tests: fleet
+  `a_region_read_whose_first_home_died_unseen_is_answered_by_the_next_within_the_budget` and
+  `a_region_read_whose_first_home_is_slow_past_its_share_reads_the_next_and_returns_the_session`.

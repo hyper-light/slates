@@ -280,17 +280,24 @@
 > (`docs/bugs/2026-11-27-a-green-standing-alone-waited-on-its-holders-for-a-join-that-never-comes.md`). Red first: two
 > `merge_service` units and one `merge_origin` unit. The fleet probe test passed in 5.82 s. OWED (main): the whole
 > `tests/fleet.rs` on the Mac and the Windows lanes, then the gap that no Unix lane runs it.
-> **OPEN (w-interop, 2026-11-27; main's ruling of 07:08; found by reading the code, nothing run yet): a lone green
-> later adopted as a repository's root keeps a standalone replica on its holders, so a branch of it may never reach a
-> holder.** A green created alone is a family root of its own (A-636 part 2b-2), and its version 0 shipped while it
-> stood alone, so each holder made it a replica of no lineage. A repository that adopts it as its root moves the
-> owner's engine into the new lineage (`repository::install_root` with `adopted`) and enqueues no new version 0, so no
-> holder founds the lineage. A later branch's version 0 then meets `Greens::branch` refused `Stale` on each holder (the
-> source is no lineage member there), counted `merge.replica.branch_source_behind` and retried without end (CLAUDE.md
-> §2 item 8). The rebuild after a restart founds it by its join (`merge_origin::rebuild_through`), so only a holder that
-> made the replica before the join is affected. Owed (w-interop, after the lone-green record fix lands): a red test that
-> adopts a lone green as a root, branches it and requires the branch to reach a holder; the fix if it is red, else why
-> it holds and this closed.
+> **FIXED (w-interop, 2026-11-27; main's ruling of 07:08; A-932's sibling): a green made alone and adopted later as a
+> repository's root kept a standalone replica on its holders, so a branch of it never reached them.** Its version 0
+> shipped standing alone, and the owner moved its engine into the new lineage without a new version 0
+> (`repository::install_root`), so each holder's `Greens::branch` refused the branch `Stale`, counted
+> `merge.replica.branch_source_behind` without end; a restarted holder's rebuild did the same. Now a holder founds the
+> lineage with the lone replica where the names log joins it as its repository's root, at the first branch of it made
+> there, a record's or a rebuild's (`merge_service::adopted_root_founded`, counted `merge.replica.adopted_root_founded`)
+> (`docs/bugs/2026-11-27-a-lone-green-adopted-as-a-root-left-its-branches-unreplicated.md`). Red first:
+> `merge_service` `a_lone_green_adopted_as_a_root_is_branched_on_its_holder` (`Err("merge.out_of_order")`) and
+> `merge_origin` `a_restarted_holder_rebuilds_a_branch_of_a_lone_green_adopted_as_a_root` (`[Later, Later, Later,
+> Later]`).
+> **OPEN, coverage (w-interop, 2026-11-27; main's ruling of 12:17): the same root adopted by a takeover successor before
+> any branch of it reached the successor.** The successor installs the root alone (`green_adopt`), from the
+> predecessor's lone replica. A later branch record there takes `make_origin_replica`'s same branch arm, so
+> `adopted_root_founded` should found the lineage there as on any holder. No test runs that path: main's fleet run was
+> at bfdacf8ea, before the fix, and a pass would not show the path ran. A fleet test of it must see
+> `merge.replica.adopted_root_founded` move on the successor. Worked when measured, or when w-shared's A-918 B touches
+> `green_adopt`.
 > **FIXED (A-912, w-shared, 2026-11-24; main 01a20182's rulings): a push made right after a member died was refused
 > `retry` for a second or more.** A home behind its sender held the put for its install, which needed the council's next
 > append on the very record session the put held, and the coordinator awaited its healer inline; and a home that died
@@ -359,9 +366,26 @@
 >   Two shapes:
 >   1. Runs 5 and 13: a green owed at version 3, placed 2, with reads past tolerance ("nothing held, the register's
 >      candidacy owed"): A-919's open edge, which (C) closes. Rerun after (C) lands.
->   2. Runs 1 and 16: a green owed at version 2, placed 1, no read past tolerance: a green's record placed on one holder
->      at the second death, short of the barrier's need. Its own cause, to diagnose after (C) from the barrier's placement
->      counters (logs: main's `rounds/a914-runs/run-{1,16}-a914.log`).
+>   2. Runs 1 and 16: a green owed at version 2, placed 1, no read past tolerance: FIXED by w-interop (the entry below,
+>      a region read that waited out a dead first home).
+> - **FIXED (w-interop, 2026-11-27; main 01a20182's ruling of 12:37): a914's record barrier, placed Some(1) (its runs 1
+>   and 16 of 16).** Not durability: every object was served by a live home. A holder whose replica owed its push
+>   (P2) replayed the repository's replica store, reading each name it lacked from the region (`homes::read_in_region`),
+>   and `read_remote` asked the name's homes one at a time in rendezvous order, each waiting the whole live budget. A
+>   name whose first home had just died cost 2 s, and the push's barrier gave up first: the holder made its replica
+>   2.01 s in (`merge.replica_build.made_ns`, a914 run 18). Now the homes are asked live first by this node's own view
+>   (`live_first`: alive, suspect, dead, read once per read), each within its share of what is left of the budget
+>   (`share_of`: the rest divided over the homes still to ask, the last given all of it), a home cut off at its share
+>   abandoned by its exchange and its session given back
+>   (`docs/bugs/2026-11-27-a-region-read-waited-out-a-dead-first-home.md`). Red first, two fleet tests: a dead first
+>   home and a slow one, each read 1,998,960,833 ns against a 1,998,000,000 ns budget before.
+> - **OPEN, found by that fix's sweep (main's ruling of 12:37: reported, not fixed): other callers that wait a dead home
+>   out.** One home at a time, the whole budget each, so a dead home before a live one costs all of it:
+>   `homes::settle_in_region` (each home, each chunk), `homes::announce_rebuilt` (each repository's member) and
+>   `homes::barrier_published` (each remote home's tickets, each part). All homes at once, waiting until every home
+>   answers or the budget is spent, so a dead home costs the whole budget on every part though the live answers are
+>   kept: `homes::put_remote` and `put_in_parts`, and the healer's `offer`. `homes::resolve_elsewhere` asks the one
+>   located owner and has no other to ask.
 > - **OPEN, found by A-914 (d)'s sweep: replies with no round trip read as answers** (to be worked when measured or
 >   blocking; main's ruling of 09:43). `TimedReply::bytes` is empty on a refusal, a deadline or a transport error, and
 >   only `round_trip_ns` says the peer answered. Of 26 readers of a `broadcast` or `request_within` reply, 20 read empty
@@ -418,7 +442,10 @@
 >     `Behind { held }` and every push was refused. The parts owed now ride the shard's recovery image (image 36, delta
 >     14), are owed again at a warm start to every candidate, and are persisted before they ship. Red first, made
 >     deterministic (a holds its parts off the old holder). "held 1" is measured: every newcomer position at or above
->     a's restarted hold start.
+>     a's restarted hold start. FIXED 2026-11-27 (w-perf; main's ruling of 13:42): a part's change mark toggled at its
+>     let-go, so a part the last publication carried, let go, held again at its position and let go again kept its
+>     piece in the next delta (the held-delta fold's proptest, w-svn's seed and diag 11's windows-latest). The mark now
+>     records whether that publication carried the position; red the seed in `daemon.proptest-regressions`.
 >   - **FIXED, A-921's second mode's (2) (A-921 part 4, w-shared, 2026-11-27):** a's replay re-derived the green's
 >     pending v2 with a checkpoint floor of 0 where the old holder held 1, refused `ConflictingPosition` (19 a run, then
 >     uncounted on the merge path) so v2 never placed and every push was refused. A holder now joins a record differing
@@ -548,7 +575,11 @@
 > publications. Counters
 > for main's rounds: `vcs_store.image.*` (skipped, longest lag, pauses, the longest turn's bytes). Ranges per object rejected on arena-5's numbers (main agreed). OWED:
 > piece 3 (pages restored a page a turn, reads waiting), and a 100k-file volume's longest image step measured against
-> the step budget (the volumes' images paged too only if past it).
+> the step budget (the volumes' images paged too only if past it). OPEN, by reading (w-perf, main's ruling of
+> 2026-11-27 11:09): `Daemon::stop` drains no owed publication, so a graceful stop during a catch-up restores an image
+> a cut behind. Measured harmless so far: t_c1's red, first read as this, was the map remake (C1's entry). The drain
+> and its tests are kept at `~/.local/state/w-perf/patches/drain-and-instrument-1109.patch`, to land with a red of
+> its own.
 > **Publication churn (goal 93, w-perf; main's ruling of 2026-11-25 (a), w-shared's go):** at 2,000 changesets about
 > 65% of a push's system allocations were its publications (`crates/server/tests/hg_fetch_heap.rs`'s churn by site): a
 > delta re-encodes only the pages its changes lie in, but a re-encoded page was read a buffer of entries and a heap
@@ -777,6 +808,39 @@
 >   `git_push::tests::b9_a_hooked_push_over_a_let_go_pack_brings_its_views_windows_back_and_lands` (a new branch at
 >   `main`'s commit over the create's let-go pack: declined `hook not run` before; lands, windows brought back, after;
 >   its driver, like the HTTP edge, now brings back the push's waited window after a turn).
+> - **B10 BUILT (w-git, 2026-11-27, main's rulings of 08:25 and 09:01): an unlanded push's pack windows pinned.**
+>   Found by the flip's focused run (`vcs_store::upload::tests::t_a724_…`, two repositories pushed the same history):
+>   the second push's append refused `Unlanded`. Tagged (`~/.local/state/w-git-logs/b10-diag2.log`): A's commit landed
+>   pack `a2 33 ea 65`, one 214-byte window; B's identical pack was put while A still held it (a put brings a let-go
+>   window back, A-724 piece 4, but it was not let go yet); A's sliced let-go then let it go, a landed window going
+>   whatever its holders; B's landing read it as none. Now a git push pins each of its pack's windows as its put keeps
+>   it, and the finished pack's rest from its layout, through the one pin every let-go honours
+>   (`ContentStore::pin_unlanded`, main's ruling (B) of 2026-11-24, as Mercurial's push does), unpinned once its
+>   changeset lands (`Push::landed`, from `SealedPush::landed_as`) or first thing however it ends (`release_placed`,
+>   which `abandon` and a commit's `release_holds` take: every server end, a refused verdict, a dropped connection,
+>   its hooks' drop). The put paths were read correct as they stand: a one-window put brings a let-go window back
+>   from its bytes, and a replay's multi-window put under a held root keeps let-go windows away (A-767 C1 step 2b).
+>   Red at the push: `store::tests::packed::b10_an_unlanded_pushs_pack_survives_another_pushs_let_go_of_the_same_
+>   windows` (all three of B's windows let go under it before; refused while unlanded, and every window let go after
+>   B lands and after C is abandoned, after). Net: `t_a724` with the let-go on. The test helpers `appended_awaited`
+>   and `push_through_awaited` now assert their landing where the push brings an object, which they dropped (`let _ =`),
+>   so this surfaced late as `ContentUnavailable` rather than at the landing (`home_and_land` answers none for a push
+>   with nothing to home too, so they ask it apart).
+> - OPEN (w-git, 2026-11-27, main's ruling of 13:47; after the flip, red first): a clone of a let-go pack holds more
+>   than a turn's windows under load. `vcs_http::daemon_edge::tests::a_clone_of_a_pushed_pack_let_go_is_whole_holding_
+>   at_most_a_turns_windows` failed 2 of 32 runs under 12 burners with B10 and 0 of 24 without (about p 0.5, not B10's:
+>   its instrumented A/B, d16e6fe20, printed no window pinned after the push and no let-go a pin refused in any of 16
+>   runs), at peaks of 10 and 8 of 13 against 3, and once before B10 under TSan at 4. A clone racing the encoding reads
+>   the let-go pack instead of copying the kept parts, and its let-go behind its cursor lags its bring-backs: ten stops,
+>   ten let go behind, ten held at once. The test prints its stops, peak and let-go-behind every run, with the pinned
+>   windows (`mem.gauge.vcs_content.pinned_unlanded`) and refused let-gos.
+> - OPEN (w-git, 2026-11-27, main's note of 09:17; its own item, not B10's): a git push dropped where the shard's state
+>   is not lent to its drop gives back nothing. `ReceivePack`'s `Drop` and `git_push::hooks::dropped` take the state
+>   with `with_state` and, finding none, log "a git push dropped mid-read could not give back its quarantine: the
+>   shard's state was not lent to its drop" (or "… mid-seal or mid-decision could not give back its push …", "…
+>   mid-answer could not give back its quarantine or its hook's view …"), leaking the push's holds; pins ride the same
+>   path since B10, and a leaked pin is worse than a leaked hold: its windows are never let go, a bounded loss that
+>   lasts until a restart. The fix: a drop with no state lent defers its release to the shard's next turn.
 > - OPEN (sibling of B8; left recorded by main's ruling of 2026-11-27 04:41, by reading alone, its cost time): the
 >   encoding's stop rule (`Encoding::stop_at`, A-864 piece 2) is keyed by a window's place, once an encoding, not by the
 >   let-go's number as `slates_git::away::WaitOnce` is, so a window brought back by another reader and let go again
@@ -2277,6 +2341,13 @@
 >   "Windows let go ride the image"); `ContentStore::let_go_object` lets every window of an object go but those
 >   another holds. Held by `vcs content::windows_let_go_survive_a_restart_as_let_go_and_come_back_by_their_bytes` and
 >   `daemon::tests::t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes`.
+>   FIXED 2026-11-27 (w-perf; main's bisect to 11168fab3 and ruling of 11:09; bug record
+>   docs/bugs/2026-11-27-a-warm-restarts-map-remake-hashed-a-let-go-file.md): a recovery's map remake hashed a head file
+>   through a window restored let go. Since 11168fab3 it was refused, silently, and the recovery freed the file (t_c1
+>   red on Windows and macOS); before, it named a wrong tree. The remake now brings the window back from the green's
+>   bytes and lets it go again at its number (`paths::put_file_whole`, `let_go_brought_again`). t_c1 asserts the tree id
+>   and `vcs_paths.refused` 0 each round. OPEN: the live whole builds (`put_whole`, `put_change`) put files the same
+>   plain way, so a live whole build of a green whose file has a window let go is refused the same way.
 > - 2b, next: each import segment's file windows marked landed and let go once the segment is durable; a symlink's
 >   target read again in the walk; main's red (after a fixture import `ContentStore::used` is the changelog's and the
 >   manifests' bytes alone; a clone and a push over the import verify clean against stock 7.2).
@@ -2795,7 +2866,13 @@
 > `segments_landed_overlapped` and the wait held against `segment_land_ns`. Derived bound: two segments' file texts,
 > the one in flight and the one being written, each under the bound plus the text that crosses it: under four times
 > the bound. Held by `an_imports_file_texts_held_between_landings_are_bounded_by_its_segment` on the production step
-> (red: 46,162,339 bytes held after one turn, 8,950 at the end, a 2 MiB bound; then no landing overlapped). Owed:
+> (red: 46,162,339 bytes held after one turn, 8,950 at the end, a 2 MiB bound; then no landing overlapped). Since
+> 2026-11-27 (w-interop, main's ruling (a')) a landing also counts as overlapped where the store's owner sent its
+> answer before the import's hand-over began, by the owner's own stamp (`slates_store::owner::Landed::sent_ns`). At a
+> 4 KiB page the bound is 512 KiB, every turn cuts a segment, and no yield follows the turn a landing ends in, so on
+> diag CI 9's Windows lanes 0 of 67 counted though each landing's answer was sent 0.5 to 3.9 ms into a 49 ms turn
+> (`docs/bugs/2026-11-27-an-imports-landings-overlapped-unseen-where-every-turn-cuts-a-segment.md`; the test now runs
+> at 4 KiB too). Owed:
 > main's interleaved A/B of 0d05da26e^, 1227afcb1 and the pipelined landing over the 57k; the
 > changelog's and manifests' texts held until the import lands (about 90 MB of the 57k's), w-hg's after C1 (2)'s
 > manifest piece (the import's manifest keep reads the previous text in its step, with no ask between turns).
@@ -4848,6 +4925,13 @@
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
 > A-704), git-http-backend, Gitaly, mod_dav_svn, the Linux kernel dataset, server CPU and memory, concurrent clients.
+> Since then: slates' side of each, git-http-backend (`git_scale`'s stock-http), and server CPU and memory
+> (`interop_speed.sh`). Since 2026-11-27 (w-interop, main 01a20182's ruling of 14:31): `mod_dav_svn` under Apache as
+> svn's HTTP competitor (`svn_scale`'s stock-http, beside slates' WebDAV site as slates-http), measured where
+> `HTTPD_MODULES` has it and skipped, said so, where it does not (neither Mac has it). svn's commit and hg's push and
+> pull are each read back and compared across the servers: svn's commit by its served content and changed paths, hg's
+> pull by `hg verify` and exactly the source's changesets and the new one. Smoke run on the MacBook at a debug build:
+> every check passed, each digest one across the servers. Owed: Gitaly, the Linux kernel dataset, concurrent clients.
 >
 > **A stock git command's wait, judged by progress (2026-11-23, w-git; main 01a20182's ruling after r229):** each git
 > command of `crates/cli/tests/git_interop.rs` was killed past a fixed 120 s (`PATIENCE`), and git/git's whole-repository
@@ -6632,6 +6716,29 @@
 > faster on reads (checkout, update and switch within 13%; diff, info, log and revprops 2.6 to 14 times faster) and
 > slower on the dump (3.0×), the writing session (2.1×, down from 24×) and svnsync (1.27×, noisy). See BENCHMARKS,
 > "The svn use test over HTTP with git-2000". The dump and the writing session are w-svn's.
+> **The dump's 3.0×, counted (w-svn, 2026-11-27; main's (b)):** `an_svnrdump_dump_measured` (`crates/cli/tests/svn_interop.rs`)
+> imports a dump into a store-backed daemon, then times stock `svnrdump dump` over the HTTP edge and over svn://,
+> printing what each added to every counter a revision. Over a local history of 300 revisions (three 8 KiB files
+> changed each, a 10 MB dump; debug, stock 1.15) both edges fetched 6.0 pieces a revision through the node's store
+> and polled about 12 times a revision for 2 to 4 ms (`rt.poll_log2.21`): the replay drive's own work, about two
+> polls a piece. The HTTP edge's extra over svn:// (37.4 ms a revision against 24.6, debug) is its reply's yields:
+> 114 a revision (`vcs_http.reply_yields`), each polled again, most of its 34 polls a revision of 128 to 256 µs against
+> svn://'s 3. In debug the daemon's live quantum derives tiny slices (4.4 µs: a 741-byte text piece, a 6.9 KB copy
+> slice), which inflate yield counts. Owed: main's release round of `an_svnrdump_dump_measured` over git-2000 on
+> these counters, which names the 2 to 4 ms polls' task and the reply's yields a revision at the release quantum.
+> **The writing session's 2.1×, counted (w-svn, 2026-11-27; main's order):** `an_svn_writing_session_measured`
+> (`crates/cli/tests/svn_interop.rs`) imports a dump into a store-backed daemon and runs the use test's writing session
+> with stock `svn` a phase at a time (checkout `--depth immediates`, commit, copy, merge, revprop set), each step timed,
+> printing what each phase added to every counter; then the same session against stock `svnserve -t` over the dump
+> loaded by `svnadmin`, in the same run. Over the local 300-revision history (debug, stock 1.15) no gap shows: HTTP
+> 5.75 s, svn:// 5.51 s, stock 7.50 s for the session. Every step is the `svn` client's own: its local verbs (`add`,
+> `revert -R`) take 0.03 to 0.94 s, and a whole phase polls the daemon 77 to 472 times, its longest poll 8 to 16 ms in
+> debug (`rt.poll_log2.23`, in each commit and merge). An earlier run under host load had each phase 4 to 5 s on both
+> edges with the same counts, so wall seconds here swing with the host and the counts are what to read. The use
+> test's `merge -c HEAD` (E205000, `-c` takes a number) and its `propset --revprop` with no `pre-revprop-change` hook
+> (E165006) fail on all three servers alike. Owed: main's release round of it over git-2000, whose 2.1× this local
+> history does not reproduce: the gap lies in what git-2000 adds (its wide tree and long history), and the round's
+> per-step seconds and counters name the step.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon
@@ -6644,10 +6751,19 @@
 > `write_wait` (svnsync not reading while it commits into its mirror), 14.6 of `read_wait`, 3.42 waiting for pieces
 > through the node's store, 1.60 for a poll after a yield and 0.54 answering: the server's share is about 5.6 ms. The
 > 28.4 pieces fetched a revision (28.1 over HTTP) were a reader fetching a piece again each turn, fixed (A-876). The
-> sync's 34.2 GB `content.purged_bytes` is the idle sweep giving back the shard's dead recovery memory a slice a tick
-> (A-117, A-226), which an svn read leaves idle, not memory the sync used. Owed: main's rerun after A-876, expected
-> to show under 10 pieces a revision and about 1 ms of fetch waits; and naming the 94k polls of 65 to 131 µs on the
-> svn:// leg (about 8.5 s of the shard's CPU, more than its answers' 1.08 s).
+> sync's 34.2 GB `content.purged_bytes` is unnamed. It is not only dead recovery memory, as this line said before:
+> the counter adds each idle step's purge of the content arena's free pages to the dead recovery memory returned and
+> the emptied write log (`daemon::purge_if_idle`), and 34.2 GB from a daemon that peaked at 1.6 GB is pages purged
+> more than once. The status report now splits it: `content.purged_arena_bytes`, `recovery.returned_bytes`,
+> `write_log.purged_bytes`, with the arena's allocations the sweep saw (`content.allocations_seen`). Measured at a small
+> scale (w-svn, 2026-11-27, debug, stock svnsync 1.15 over a local history of 300 revisions, three 8 KiB files changed
+> each, a 10 MB dump; `an_svnsync_measured`): the sync added 10 idle ticks over svn:// and 12 over HTTP (0.03 and 0.04
+> a revision), 11.9 MB of arena pages purged over each (the import's freed texts, once), 98 and 131 KB of recovery,
+> no write log and no arena allocation, 6.0 pieces fetched a revision and 84 answers. So a read verb's
+> fetch-free-purge-fault cycle is not there at this scale, and the short polls are not idle steps. Owed: main's rerun
+> after A-876, expected to show under 10 pieces a revision and about 1 ms of fetch waits, now reading the split
+> counters; and naming the 94k polls of 65 to 131 µs on the svn:// leg (about 8.5 s of the shard's CPU, more than its
+> answers' 1.08 s), which at 84 answers a revision are likely the conversation's own polls.
 > **svn:// update (P6), recorded (w-svnperf, 2026-11-23):** goal 93's "svn:// update 5.6 s against run 8's 2.7 s"
 > is w-bugs' run 13 (`diag-w-bugs-svnfetch-13`, base 2d3f218cb, GitHub's macOS runner, git-1000) against run 8 (base
 > 1d7a60e1d), one run each. Run 13 spent 1.71 s of its update in 142,705 window units, which w-perf's per-reader

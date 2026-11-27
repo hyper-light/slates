@@ -793,17 +793,49 @@ fn fronted_history(name: &str) -> Option<std::path::PathBuf> {
 /// landings took (`segment_land_wait_ns` against `segment_land_ns`); each segment chunked in turns
 /// ([`assert_chunked_in_turns`]). Failing first: 46,162,339 bytes held after one turn
 /// against 8,950 at the end and a 2 MiB bound, the whole history's file texts in one segment; then, cut by its texts,
-/// no landing overlapped, each awaited before the next turn. Skips, saying so, where `hg` is not installed.
+/// no landing overlapped, each awaited before the next turn. Skips, saying so, where `hg` is not installed. At the host's
+/// page.
 #[test]
 fn an_imports_file_texts_held_between_landings_are_bounded_by_its_segment() {
-  let Some(repository) = fronted_history("held") else {
-    eprintln!(
-      "SKIPPED an_imports_file_texts_held_between_landings_are_bounded_by_its_segment: no `hg` here"
+  held_between_landings("held", None);
+}
+
+/// [`an_imports_file_texts_held_between_landings_are_bounded_by_its_segment`] at a 4 KiB page, as Windows', Linux's and
+/// CI's runners have: the segment's bound is the content chunk (16 pages) times the store's fanout, 512 KiB there
+/// against 2 MiB on a 16 KiB-page Mac, so each of the history's 1 MiB texts crosses it and every turn cuts a segment.
+/// The hand-over then follows each turn with no yield between, so a landing the store's owner answered inside the turn
+/// is first seen at the hand-over. Expect the same, overlap counted by the owner's own stamp (sent before the hand-over
+/// began), and the bound under one text (non-vacuity). Red before (main's ruling (a') of 2026-11-27): 0 of 67 counted
+/// overlapped, as on diag CI 9's Windows lanes (every landing's answer sent 0.5 to 3.9 ms into a 49 ms turn there), on
+/// the MacBook at this page too. The run at the host's page alone was CLAUDE.md's degenerate-parameter gotcha: there a
+/// yield always followed the turn the landing ended in.
+#[test]
+fn an_imports_landings_overlap_where_every_turn_cuts_a_segment() {
+  /// Shape: a 4 KiB page, the page whose segment bound one of the history's texts crosses.
+  const PAGE: usize = 4096;
+  let bound = held_between_landings("held-paged", Some(PAGE));
+  if let Some(bound) = bound {
+    assert!(
+      bound < u64::try_from(HELD_FILE_BYTES).unwrap(),
+      "the segment's bound {bound} is under one text at a 4 KiB page, so every turn cuts"
     );
-    return;
+  }
+}
+
+/// The body of the held-texts tests, at `page` bytes a page where one is named (its content chunk and so the segment's
+/// bound, `segment_bytes`): the segment's bound, or none where it skipped.
+fn held_between_landings(name: &str, page: Option<usize>) -> Option<u64> {
+  let Some(repository) = fronted_history(name) else {
+    eprintln!("SKIPPED the held-texts test ({name}): no `hg` here");
+    return None;
   };
   let path = repository.clone();
-  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored_configured(|config| {
+    if let Some(page) = page {
+      config.page = page;
+      config.geometry.page = u64::try_from(page).unwrap();
+    }
+  });
   // A task on the shard, a step a turn, as the shard's own task runs an import (`run`): an import of this size in one
   // step spins the shard past its window.
   let held = crate::test_store::run_on_first(&daemon, move || imported_held(path), TASK_WAIT);
@@ -830,6 +862,7 @@ fn an_imports_file_texts_held_between_landings_are_bounded_by_its_segment() {
     "the import held for less than its landings took: {held:?}"
   );
   assert_chunked_in_turns(&held);
+  Some(held.bound)
 }
 
 /// Goal 93, main's ruling (b): each segment's payload made into stock's revlog chunks as it landed, a turn's steps at a

@@ -13,8 +13,11 @@
 # 1. push: every changeset, bookmark and tag of SOURCE pushed in one push, the repository's first;
 # 2. clone: `hg clone -U`; on the first run the clone is checked: `hg verify`, and its changeset ids and its tags equal
 #    SOURCE's;
-# 3. incremental: one changeset (one new file) made on SOURCE's tip in a scratch clone and pushed, then pulled into the
-#    clone, which must then hold it;
+# 3. incremental: one changeset (one new file) made on SOURCE's tip in a scratch clone and pushed
+#    (`incremental-push`), then pulled into the clone (`incremental-pull`), which is then checked as the first clone is:
+#    `hg verify`, and its changeset ids exactly SOURCE's and the new one's. The changeset is made with one user, date and
+#    text on every server, so its id is one id, and each run's clones after the pull hold one set of changesets on every
+#    server: compared across the servers at the end (main 01a20182's ruling of 2026-11-27 14:31);
 # 4. stream: `hg clone -U --stream`, the server's store sent as files.
 #
 # hg runs outside every configuration file (HGRCPATH empty, HGPLAIN), never prompts, and speaks C. Everything is
@@ -239,20 +242,39 @@ step_ok() {
 }
 
 # The incremental steps of server $1's run $2: one changeset made on SOURCE's tip in scratch $4 and pushed, then pulled
-# into clone $3, which must then hold it.
+# into clone $3, which is then verified and must hold exactly SOURCE's changesets and the new one; its changesets'
+# digest is recorded for the comparison across servers.
 incremental() {
   local server=$1 run=$2 clone=$3 scratch=$4 new
   h clone -q -r tip "$SOURCE" "$scratch"
-  echo "one more changeset, $server run $run" > "$scratch/a-699-scale.txt"
-  h -R "$scratch" commit -q -A -m "one more changeset" "$scratch/a-699-scale.txt"
+  echo "one more changeset, run $run" > "$scratch/a-699-scale.txt"
+  # One user, date and text on every server: one changeset id.
+  h -R "$scratch" commit -q -A -u "a-699 <scale@slates.invalid>" -d "2026-11-27 00:00 +0000" -m "one more changeset" \
+    "$scratch/a-699-scale.txt"
   new=$(h -R "$scratch" log -r . -T '{node}')
   timed "$server incremental-push $run" "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} -R "$scratch" push -q -r "$new" "$URL"
   timed "$server incremental-pull $run" "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} -R "$clone" pull -q "$URL"
-  if [ "$(h -R "$clone" log -r "$new" -T '{node}' 2> /dev/null)" = "$new" ]; then
-    echo "$server incremental check pulled" | tee -a "$RESULTS"
-  else
+  if [ "$(h -R "$clone" log -r "$new" -T '{node}' 2> /dev/null)" != "$new" ]; then
     echo "$server incremental check MISSED" | tee -a "$RESULTS"
+    return 0
   fi
+  echo "$server incremental check pulled" | tee -a "$RESULTS"
+  if h -R "$clone" verify -q > "$WORK/$server-verify-$run.out" 2>&1; then
+    echo "$server incremental check verified" | tee -a "$RESULTS"
+  else
+    echo "$server incremental check verify DIFFER: $(tail -1 "$WORK/$server-verify-$run.out")" | tee -a "$RESULTS"
+  fi
+  { cat "$WORK/source.changesets"; echo "$new"; } | LC_ALL=C sort > "$WORK/$server-expected-$run.changesets"
+  h -R "$clone" log -r 'all()' -T '{node}\n' | LC_ALL=C sort > "$WORK/$server-pulled-$run.changesets"
+  if cmp -s "$WORK/$server-expected-$run.changesets" "$WORK/$server-pulled-$run.changesets"; then
+    echo "$server incremental check changesets identical ($(wc -l < "$WORK/$server-pulled-$run.changesets" | tr -d ' '))" \
+      | tee -a "$RESULTS"
+  else
+    echo "$server incremental check changesets DIFFER: $(comm -3 "$WORK/$server-expected-$run.changesets" \
+      "$WORK/$server-pulled-$run.changesets" | wc -l | tr -d ' ') lines" | tee -a "$RESULTS"
+  fi
+  echo "$server incremental digest $run $(shasum -a 256 < "$WORK/$server-pulled-$run.changesets" | cut -d' ' -f1)" \
+    | tee -a "$RESULTS"
 }
 
 # The stream counters w-hg reads (`crates/server/src` `vcs_store.hg_stream_*`), for its stream clone's slowness.
@@ -342,6 +364,13 @@ done
 # A check that found the served data unlike the source (refs, objects, changesets, tree or log DIFFER; an incremental
 # change MISSED) fails the harness too: a check that only prints could let a dropped ref pass (main 01a20182, after
 # r655 narrowed git's object check to what the push sends).
+# Each run's pulled changesets compared across the servers that pulled them: one digest a run (main's ruling of 14:31).
+for run in $(seq 1 "$RUNS"); do
+  digests=$(awk -v run="$run" '$2 == "incremental" && $3 == "digest" && $4 == run { print $1 " " $5 }' "$RESULTS")
+  if [ "$(echo "$digests" | awk 'NF { print $2 }' | sort -u | wc -l | tr -d ' ')" -gt 1 ]; then
+    echo "servers incremental check across servers DIFFER run $run: $(echo "$digests" | tr '\n' ' ')" | tee -a "$RESULTS"
+  fi
+done
 CHECKS_FAILED=$(grep -E '^[^ ]+ (incremental )?check .*(DIFFER|MISSED)' "$RESULTS" | sort -u | tr '\n' ';')
 if [ -n "$FAILED_ROWS" ] || [ -n "$CHECKS_FAILED" ]; then
   [ -n "$FAILED_ROWS" ] && echo "FAILED: every run failed for$FAILED_ROWS"

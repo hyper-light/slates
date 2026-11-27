@@ -88,8 +88,14 @@ pub(crate) const DERIVED: &str = "vcs_paths.derived";
 pub(crate) const BUILT: &str = "vcs_paths.built";
 /// The status count of the maps a recovery built.
 pub(crate) const REMADE: &str = "vcs_paths.remade";
-/// The status count of the steps refused (module docs).
+/// The status count of the steps refused (module docs), each logged with its green and why.
 pub(crate) const REFUSED: &str = "vcs_paths.refused";
+/// The status count of windows let go that a recovery's remake brought back from its green's own bytes to read a head
+/// file whole ([`put_file_whole`]; A-767 C1, main's ruling of 2026-11-27 11:09), each let go again at its end.
+pub(crate) const REMAKE_BROUGHT_BACK: &str = "vcs_paths.remake_brought_back";
+/// The status count of those not let go again, held in RAM until their pack's next let-go: zero in every correct use,
+/// each logged.
+pub(crate) const REMAKE_KEPT: &str = "vcs_paths.remake_kept";
 /// Counter: a git green's file held by its content-plane object alone, which git's map does not read (A-760 (b) 4b;
 /// never met, since only a Subversion green holds a file so). Format: a counter name in the status report.
 pub(crate) const NAMED_UNREAD: &str = "vcs_paths.named_unread";
@@ -314,6 +320,7 @@ pub(crate) async fn remake_green_sliced(
     return;
   };
   let key = super::green_key(green);
+  let mut brought = Vec::new();
   let (answer, charged_whole) = {
     let ShardState {
       store,
@@ -342,7 +349,15 @@ pub(crate) async fn remake_green_sliced(
     };
     let mut held = Vec::new();
     let lent = super::Lent::new(&mut *store, vcs_stores);
-    let answer = match put_sliced(lent.stores, repository, files, &mut held, slices).await {
+    let answer = match put_sliced(
+      lent.stores,
+      repository,
+      files,
+      (&mut held, &mut brought),
+      slices,
+    )
+    .await
+    {
       Ok(entries) => made_holding(
         lent.stores,
         repository,
@@ -362,20 +377,58 @@ pub(crate) async fn remake_green_sliced(
     state.count(super::CHARGE_SHORT, 1);
   }
   count(state, (green, answer), REMADE);
+  let_go_brought_again(state, green, brought, slices).await;
 }
 
-/// Puts each of `files` in `repository`'s content store, a recovery's unit each, noting each hold.
+/// Lets go again, a unit of the recovery's slices each, the windows [`put_file_whole`] brought back for a remake, each
+/// at its own let-go number (`ContentStore::let_go_again`; A-767 C1, main's ruling of 2026-11-27 11:09): the warm
+/// restart keeps out of RAM what its predecessor let go, and the image's aways are as it published them. Counted
+/// [`REMAKE_BROUGHT_BACK`]; one not let go again counted [`REMAKE_KEPT`] and logged.
+async fn let_go_brought_again(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  brought: Vec<slates_vcs::AwayAt>,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) {
+  if brought.is_empty() {
+    return;
+  }
+  state.count(
+    REMAKE_BROUGHT_BACK,
+    u64::try_from(brought.len()).unwrap_or(u64::MAX),
+  );
+  for at in brought {
+    let refused = super::within_budget(state, 0, |stores| match stores.content_mut() {
+      Some(content) => content.let_go_again(at).err(),
+      None => Some(slates_vcs::LetGoRefused::NotHeld),
+    });
+    if let Some(refused) = refused {
+      state.count(REMAKE_KEPT, 1);
+      slates_machine::log_line!(
+        "slates-server: git map of green {}: a window its remake brought back was not let go again ({refused:?}): held \
+         until its pack's next let-go",
+        crate::verbs::hex_of(&green.bytes)
+      );
+    }
+    slices
+      .unit_done("a remade file's window let go again")
+      .await;
+  }
+}
+
+/// Puts each of `files` in `repository`'s content store, a recovery's unit each, noting each hold and each window let
+/// go that a put brought back ([`put_file_whole`]).
 async fn put_sliced(
   stores: &mut VcsStores,
   repository: RepositoryId,
   files: Vec<(Vec<u8>, GitFile<'_>)>,
-  held: &mut Vec<ContentId>,
+  (held, brought): (&mut Vec<ContentId>, &mut Vec<slates_vcs::AwayAt>),
   slices: &mut crate::recovery_slices::RecoverySlices,
 ) -> Result<BTreeMap<Vec<u8>, Entry>, StepRefused> {
   let mut entries = BTreeMap::new();
   for (name, file) in files {
     let (content, _) = stores.git(repository).ok_or(StepRefused::NoMap)?;
-    entries.insert(name, put_file(content, &file, held)?);
+    entries.insert(name, put_file_whole(content, &file, (held, brought))?);
     slices.unit_done("a path index's put").await;
   }
   Ok(entries)
@@ -426,7 +479,15 @@ fn count(
         crate::verbs::hex_of(&green.bytes)
       );
     }
-    Err(_) => state.count(REFUSED, 1),
+    Err(refused) => {
+      // Every refusal said, not only a named file's: a refused remake leaves its green no map, and the recovery then
+      // frees what only the map held (t_c1, main's bisect of 2026-11-27 11:01: counted and silent before).
+      state.count(REFUSED, 1);
+      slates_machine::log_line!(
+        "slates-server: git map of green {} refused: {refused:?}",
+        crate::verbs::hex_of(&green.bytes)
+      );
+    }
   }
 }
 
@@ -1000,6 +1061,29 @@ fn put_whole(
     entries.insert(name, put_file(content, &file, held)?);
   }
   Ok(entries)
+}
+
+/// [`put_file`] for a recovery's remake ([`remake_green_sliced`]): each window of the file the store holds let go
+/// (restored let go from the image, A-767 C1) brought back from the file's bytes, which are the green's own
+/// (`ContentStore::put_object_whole`), so its trees hash the file whole, and noted in `brought` to be let go again once
+/// the remake ends ([`let_go_brought_again`]). Since 11168fab3 a let-go window refused the remake's hash
+/// (`TreesRefused::Content(Missed)`), and the recovery freed the file (t_c1); before it, the hash ran over the short
+/// file and named another tree.
+fn put_file_whole(
+  content: &mut ContentStore,
+  file: &GitFile<'_>,
+  (held, brought): (&mut Vec<ContentId>, &mut Vec<slates_vcs::AwayAt>),
+) -> Result<Entry, StepRefused> {
+  let away = content.aways_of(&ContentId::of(&file.bytes));
+  let id = content
+    .put_object_whole(&file.bytes)
+    .map_err(StepRefused::Content)?;
+  held.push(id);
+  brought.extend(away);
+  Ok(Entry {
+    class: file.class.class(),
+    content: id,
+  })
 }
 
 /// Puts `file`'s bytes as an object, as the git store keeps a blob's (A-664 part 2), noting the hold.

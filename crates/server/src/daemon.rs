@@ -2017,6 +2017,133 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support (a914's record barrier, main 01a20182's ruling of 2026-11-27 12:37): homes `bytes` in the region from
+  /// this node's control shard as a record's names are homed (`vcs_store::homes::home_in_region`), kept for a
+  /// repository's records, the repository all zeros, within the live budget (`fleet::live_budget`). Its identity once
+  /// `f + 1` homes kept it; none otherwise.
+  pub fn home_bytes_in_region(&self, bytes: Vec<u8>) -> Result<Option<[u8; 32]>, ObserveError> {
+    self.run_on_control(move || async move {
+      let (origin, shards) = crate::state::with_state(|state| (state.shard, state.shards.clone()))?;
+      let owner = slates_cluster::homes::HomeOwner::Record {
+        repository: [0; 16],
+      };
+      crate::vcs_store::homes::home_in_region(
+        origin,
+        &shards,
+        (crate::vcs_store::homes::HomeSource::Bytes(bytes), owner),
+        crate::fleet::live_budget(),
+      )
+      .await
+      .outcome
+      .ok()
+      .map(|homed| homed.0)
+    })
+  }
+
+  /// Test support (a914): the object `identity` read from the region from this node's control shard
+  /// (`vcs_store::homes::read_in_region`) within the live budget, and how long the read took, in nanoseconds.
+  pub fn read_from_region(
+    &self,
+    identity: [u8; 32],
+  ) -> Result<(Option<Vec<u8>>, u64), ObserveError> {
+    self
+      .run_on_control(move || async move {
+        let (origin, shards) =
+          crate::state::with_state(|state| (state.shard, state.shards.clone()))?;
+        let began = futures::now_ns();
+        let read = crate::vcs_store::homes::read_in_region(
+          origin,
+          &shards,
+          slates_vcs::ContentId(identity),
+          crate::fleet::live_budget(),
+        )
+        .await;
+        Some((read, futures::now_ns().saturating_sub(began)))
+      })?
+      .ok_or(ObserveError::NoTarget)
+  }
+
+  /// Test support (a914): `identity`'s region homes in their rank order over this node's members, as a read asks them
+  /// before its liveness order (`slates_db::identity_homes::homes`), and the live budget a read of it is given, in
+  /// nanoseconds (`fleet::live_budget`).
+  pub fn homes_of_identity(
+    &self,
+    identity: [u8; 32],
+  ) -> Result<(Vec<slates_db::HostId>, u64), ObserveError> {
+    self.observe(self.shards.first().copied(), move |state| {
+      let members = state.fleet.members().to_vec();
+      let f = usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX);
+      (
+        slates_db::identity_homes::homes(&identity, &members, f),
+        crate::fleet::live_budget().max_deadline_ns(),
+      )
+    })
+  }
+
+  /// Runs the step `make` makes as a task of this node's control shard, made there since a step that holds the shard's
+  /// state is no thread's to move, and waits for its answer within the observe budget plus the live budget (a step that
+  /// waits on the fleet, a region read or homing, runs up to the live budget): the typed refusal where it could not be
+  /// admitted, was refused its task, or did not answer in time.
+  fn run_on_control<T: Send + 'static, F: core::future::Future<Output = T> + 'static>(
+    &self,
+    make: impl FnOnce() -> F + Send + 'static,
+  ) -> Result<T, ObserveError> {
+    let shard = self.shards.first().copied().ok_or(ObserveError::NoTarget)?;
+    let runtime = self.runtime.as_ref().ok_or(ObserveError::NoRuntime)?;
+    let (answer, answered) = std::sync::mpsc::sync_channel::<T>(1);
+    let receipt = runtime
+      .spawn_on_with_receipt(shard, async move {
+        let step = make();
+        // A task refused its slot drops `answer`, which ends the wait below as unanswered.
+        if let Ok(task) = futures::spawn(async move {
+          let _ = answer.send(step.await);
+        }) {
+          let _ = futures::detach(task);
+        }
+      })
+      .map_err(|refusal| ObserveError::Submission {
+        refusal,
+        attempts: 1,
+        waited_ns: 0,
+      })?;
+    let budget_ns = OBSERVE_BUDGET_NS.saturating_add(crate::fleet::live_budget().max_deadline_ns());
+    let budget = std::time::Duration::from_nanos(budget_ns);
+    match receipt.wait(budget) {
+      Some(slates_rt::Admission::Admitted(_)) => {}
+      Some(slates_rt::Admission::Refused(refusal)) => {
+        return Err(ObserveError::Admission {
+          refusal,
+          attempts: 1,
+          waited_ns: 0,
+        });
+      }
+      Some(slates_rt::Admission::Terminated) => {
+        return Err(ObserveError::Terminated {
+          stage: ObserveStage::Admission,
+          attempts: 1,
+        });
+      }
+      None => {
+        return Err(ObserveError::Deadline {
+          stage: ObserveStage::Admission,
+          budget_ns,
+          attempts: 1,
+          waited_ns: budget_ns,
+          last_refusal: None,
+        });
+      }
+    }
+    answered
+      .recv_timeout(budget)
+      .map_err(|_| ObserveError::Deadline {
+        stage: ObserveStage::Execution,
+        budget_ns,
+        attempts: 1,
+        waited_ns: budget_ns,
+        last_refusal: None,
+      })
+  }
+
   /// Test support: the version at which the council's configuration fixed `member`'s settled neighbourhood
   /// and the version its current neighbourhood was fixed at (§4.8 "Neighbourhood changes"): equal once the
   /// member has reported its change placed and the council settled it; `None` for a non-member. A one-shot
@@ -6247,6 +6374,10 @@ fn purge_write_log_timed(
     _ => crate::write_log::Purged::default(),
   };
   learn_give_back_rate(s, purged.walked, spent_since(started, cpu()));
+  s.count(
+    WRITE_LOG_PURGED,
+    u64::try_from(purged.bytes).unwrap_or(u64::MAX),
+  );
   (purged.bytes, purged.more)
 }
 
@@ -6582,6 +6713,10 @@ async fn purge_if_idle() -> GiveBack {
     let step = state::with_state(|s| {
       let allocations = s.store.content.arena().allocations();
       let idle = allocations == s.purge_seen_allocations;
+      s.count(
+        CONTENT_ALLOCATIONS_SEEN,
+        allocations.saturating_sub(s.purge_seen_allocations),
+      );
       s.purge_seen_allocations = allocations;
       if !idle {
         s.count(TICKS_BUSY, 1);
@@ -6599,6 +6734,10 @@ async fn purge_if_idle() -> GiveBack {
       };
       let bytes = purged.bytes.saturating_add(log);
       s.count(CONTENT_PURGED, u64::try_from(bytes).unwrap_or(u64::MAX));
+      s.count(
+        CONTENT_PURGED_ARENA,
+        u64::try_from(purged.bytes).unwrap_or(u64::MAX),
+      );
       s.count(
         CONTENT_PURGE_KEPT_SHORT,
         u64::try_from(purged.kept_short).unwrap_or(u64::MAX),
@@ -6659,6 +6798,16 @@ pub const TICKS_DEFERRED: &str = "content.ticks.deferred";
 pub const TICKS_BUSY: &str = "content.ticks.busy";
 /// Counter: purge steps that found the shard idle, so the purge ran (A-105).
 pub const TICKS_IDLE: &str = "content.ticks.idle";
+/// Counter: of [`CONTENT_PURGED`], the content arena's free pages an idle step purged (A-105), apart from the dead
+/// recovery memory ([`RECOVERY_RETURNED`]) and the emptied write log ([`WRITE_LOG_PURGED`]) it counts too (goal 93 P7:
+/// svnsync's 34.2 GB of `content.purged_bytes` named by kind). Format: a counter name in the status report.
+pub const CONTENT_PURGED_ARENA: &str = "content.purged_arena_bytes";
+/// Counter: of [`CONTENT_PURGED`], the emptied write log's pages an idle step gave back
+/// (`crate::write_log::WriteLog::purge`). Format: a counter name in the status report.
+pub const WRITE_LOG_PURGED: &str = "write_log.purged_bytes";
+/// Counter: the content arena's allocations the idle sweep saw made since its look before, each of its steps busy or
+/// idle: what a purge of free pages may be refilled by (goal 93 P7). Format: a counter name in the status report.
+pub const CONTENT_ALLOCATIONS_SEEN: &str = "content.allocations_seen";
 
 /// The pressure hold across a daemon's shards (§4.2, admission.md §5.5), from the host's free memory at the daemon's
 /// first sample (`baseline`) and now (`available`), the daemon's own resident growth since then (`own_growth`), and its
@@ -10054,13 +10203,29 @@ mod tests {
     }
   }
 
+  /// The git root tree id of `green`'s map head on this shard (`vcs_store::paths::Head::trees`), as its made commit
+  /// names it; none where the store keeps no map for it.
+  fn green_tree_id(
+    state: &crate::state::ShardState,
+    green: slates_client::VolumeId,
+  ) -> Option<slates_git::object_name::ObjectId> {
+    let green = slates_db::catalog::VolumeId { bytes: green.bytes };
+    let repository = crate::vcs_store::paths::git_repository_of(state, green)?;
+    let (content, git) = state.vcs_stores.git_ref(repository)?;
+    let head = git.heads.get(&crate::vcs_store::green_key(green))?;
+    git.trees.as_ref()?.id(content, head.trees).ok()
+  }
+
   /// A-767 C1 step 2b (main's ruling (a) of 2026-11-22 02:52: the image records the windows let go, and restore keeps
   /// them; the recovery oracle's shape, `crates/db/tests/model.rs`). Do: on a daemon over a retained anchor segment and
   /// content object, write `main`'s one file of 1 MiB in a work and submit it; then three times let go a seeded choice of
   /// its still-held windows, publish, stop and start a successor; at the end bring the object back by its bytes. Expect:
   /// each successor's content store whole as its predecessor published it (the same windows let go with the same
-  /// lengths, lists and names), none of the image's pieces refused, at least one window let go in all, and the object
-  /// brought back whole by its identity, the same bytes.
+  /// lengths, lists and names), none of the image's pieces refused, its green's map made again with no step refused and
+  /// its git root tree the predecessor's by id, at least one window let go in all, and the object brought back whole by
+  /// its identity, the same bytes. Red at 11168fab3 (main's bisect of 2026-11-27 11:01): the recovery's remake met the
+  /// file's window let go and was refused (`vcs_paths.refused` 1, no map), and `release_unheld` freed the file's list,
+  /// name and let-go window; before it, the remake hashed the short file and named another tree without a word.
   #[test]
   fn t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes() {
     use slates_anchor::AnchorSegment;
@@ -10122,7 +10287,7 @@ mod tests {
           Some(work)
         });
         let Some(work) = work else {
-          return Vec::new();
+          return (Vec::new(), green);
         };
         // A git green's submit is a client's recorded request (A-896), awaited from a task of the shard: its
         // refinement, made commit and whole build run as the shard's own tasks run them.
@@ -10138,7 +10303,7 @@ mod tests {
           ),
           "{submitted:?}"
         );
-        on_state(|state| {
+        let windows = on_state(|state| {
           let window = state
             .vcs_stores
             .content()
@@ -10147,10 +10312,12 @@ mod tests {
             .chunks(window)
             .map(slates_vcs::ContentId::of)
             .collect::<Vec<_>>()
-        })
+        });
+        (windows, green)
       },
       crate::test_store::HISTORY_PATIENCE,
     );
+    let (windows, green) = windows;
     assert!(windows.len() > 1, "the file past one window");
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     let mut daemon = first;
@@ -10169,7 +10336,7 @@ mod tests {
           // item 2b): turned to its end here, so the store published is the one observed.
           while crate::vcs_store::let_go_turn(state) {}
           let_go_picked(state, &windows, &mut pick);
-          store_whole(state)
+          (store_whole(state), green_tree_id(state, green))
         })
         .unwrap();
       seed = seed.wrapping_add(1);
@@ -10178,7 +10345,7 @@ mod tests {
       daemon = super::Daemon::start(&profile, config.clone(), source()).unwrap();
       let shard = daemon.shards.first().copied();
       let seen = daemon
-        .observe(shard, |state| {
+        .observe(shard, move |state| {
           // The recovery's replay read the landed pack whole and owes its let-go again (`vcs_store::put_changeset`),
           // queued a slice a turn: turned to its end before the store is compared.
           while crate::vcs_store::let_go_turn(state) {}
@@ -10186,13 +10353,25 @@ mod tests {
           (
             store_whole(state),
             count(crate::vcs_store::NODES_UNRESTORED),
+            count(crate::vcs_store::paths::REFUSED),
+            green_tree_id(state, green),
+            (
+              count(crate::vcs_store::paths::REMAKE_BROUGHT_BACK),
+              count(crate::vcs_store::paths::REMAKE_KEPT),
+            ),
           )
         })
         .unwrap();
+      assert!(published.1.is_some(), "the predecessor's green has a map");
+      // Every window let go is the file's, so the remake brought each back to hash it and let each go again.
+      let away = published
+        .0
+        .as_ref()
+        .map_or(0, |(aways, _, _)| u64::try_from(aways.len()).unwrap());
       assert_eq!(
         seen,
-        (published, 0),
-        "the store whole as published, none refused"
+        (published.0, 0, 0, published.1, (away, 0)),
+        "the store whole as published, none refused, the green's map made again to the same tree"
       );
     }
     let blob_back = blob.clone();
@@ -11740,12 +11919,16 @@ mod tests {
         _ if which == 0 => HeldStep::Checkpoint,
         _ => HeldStep::Delta,
       });
-      let mut runner = proptest::test_runner::TestRunner::new(slates_test_seeds::unseeded(
-        proptest::test_runner::Config {
-          cases: slates_test_seeds::cases(64),
-          ..proptest::test_runner::Config::default()
-        },
-      ));
+      let mut runner = proptest::test_runner::TestRunner::new(
+        slates_test_seeds::seeded(
+          proptest::test_runner::Config {
+            cases: slates_test_seeds::cases(64),
+            ..proptest::test_runner::Config::default()
+          },
+          include_str!("daemon.proptest-regressions"),
+        )
+        .unwrap(),
+      );
       // The runner's case is an `Fn`, so each case borrows the one shard's state through a cell.
       let cell = std::cell::RefCell::new(state);
       let outcome = runner.run(&proptest::collection::vec(step, 1..60), |steps| {

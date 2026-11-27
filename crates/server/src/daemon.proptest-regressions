@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+# folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds: a state-log part the checkpoint carried, let go, held
+# again at its position and let go again kept its piece in the fold (w-svn, 2026-11-27; also diag 11's windows-latest).
+cc 1944280ad65a0b2dd21cdc19e6aa77789b2c9b67eaba0e0eb453123e47231fca # shrinks to [Owe(1), Checkpoint, LetGo(1), Owe(1), LetGo(1), Delta]
