@@ -798,3 +798,14 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - OWED: the windows family's removal as a cut of the committed piece (28.5% of the 57k image); main's in-place 57k
     rerun for the after, with its publication count and page.
   - Next: the 35.7 MB keep rows, after main's in-place rerun.
+- 2026-11-27 ~01:00 PST:
+  - LANDED c207c9f81 (4b731fb7a): A-930 part 2. A window let go is a cut of its committed piece: the encoder keeps
+    every coordinate a page's changes lie at, reads each committed entry's coordinate back from its key and bytes
+    (content_holder::entry_coordinate), and copies the unchanged runs. Red, on main's code: 60 let-goes over 300 kept
+    windows, one publication each, encoded 266,160 windows bytes; 0 now, the family 31,535 to 25,235. The same oracle
+    as part 1; part 1's 46,300 unchanged. Focused: content_holder/image/publish plus the restart tests, 47 passed after
+    a clean rebuild and again after the last merge.
+  - Process: a red run in w-perf-fix on my target made w-perf-land's next run reuse that binary (and later a newer
+    slates-db); fixed by cleaning every workspace crate from my target and rebuilding. Memory note updated.
+  - OWED: main's in-place 57k rerun (publication count and page for the 43.1 MB check).
+  - Next: the 35.7 MB keep rows, after that rerun.
