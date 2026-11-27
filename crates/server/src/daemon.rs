@@ -6250,6 +6250,31 @@ fn return_dead_recovery_timed(
   s: &mut ShardState,
   cpu: &mut impl FnMut() -> Option<u64>,
 ) -> (usize, bool) {
+  let slice = give_back_slice(s);
+  let started = cpu();
+  let mut left = slice;
+  let (journal, journal_more) = give_back_dead_journal(s, &mut left);
+  // The partition's log ring past its tail and its snapshot slots past their payloads, in what the slice has left
+  // (A-926 part 2; A-746's owed give-back), whether or not the journal had any: their marks fall after.
+  let partition = s.partition;
+  let segment = s
+    .segment
+    .give_back_dead(partition, (left, None))
+    .unwrap_or_default();
+  left = left.saturating_sub(segment.walked);
+  learn_give_back_rate(s, slice.saturating_sub(left), spent_since(started, cpu()));
+  let returned = journal.saturating_add(segment.bytes);
+  s.count(
+    RECOVERY_RETURNED,
+    u64::try_from(returned).unwrap_or(u64::MAX),
+  );
+  (returned, journal_more || segment.more)
+}
+
+/// The journal's part of [`return_dead_recovery_timed`]: its dead ranges given back from the top, at most `left` bytes,
+/// `left` lowered by what it walked, and the slice's marks lowered after (A-926). The bytes the object took, and whether
+/// some is left; none where nothing is committed or the shard keeps no content object.
+fn give_back_dead_journal(s: &mut ShardState, left: &mut usize) -> (usize, bool) {
   let (slots_start, slots_end) = s.content_range;
   let (log_start, log_end) = s.delta_range;
   let Some(dead) = s.journal.dead_ranges(
@@ -6294,22 +6319,19 @@ fn return_dead_recovery_timed(
       log_end.saturating_sub(log_start),
     ),
   };
-  let slice = give_back_slice(s);
-  let started = cpu();
   let Some(object) = s.content.as_mut() else {
     return (0, false);
   };
-  let mut left = slice;
   // The top `left` bytes of `(offset, len)` within the region at `base`: given back, the offset they start at (what
   // the journal records), and the bytes the object took. `None` when the object refused.
   let mut give_back = |base: usize, (offset, len): (usize, usize)| -> Option<(usize, usize)> {
-    let piece = len.min(left);
+    let piece = len.min(*left);
     let from = offset.saturating_add(len).saturating_sub(piece);
     if piece == 0 {
       return Some((from, 0));
     }
     let bytes = object.discard(base.checked_add(from)?, piece).ok()?;
-    left = left.saturating_sub(piece);
+    *left = left.saturating_sub(piece);
     Some((from, bytes))
   };
   let stale_slot = give_back(slots_start, dead.stale_slot);
@@ -6322,14 +6344,9 @@ fn return_dead_recovery_timed(
   if let (Some(log), Some(object)) = (s.write_log.as_mut(), s.content.as_mut()) {
     let _lowered = log.lower_journal_marks(object, s.journal.written());
   }
-  learn_give_back_rate(s, slice.saturating_sub(left), spent_since(started, cpu()));
   let returned = stale_slot
     .map_or(0, |(_, bytes)| bytes)
     .saturating_add(log_past_tail.map_or(0, |(_, bytes)| bytes));
-  s.count(
-    RECOVERY_RETURNED,
-    u64::try_from(returned).unwrap_or(u64::MAX),
-  );
   let more = stale_slot.is_some_and(|(from, _)| from > dead.stale_slot.0)
     || log_past_tail.is_some_and(|(from, _)| from > dead.log_past_tail.0);
   (returned, more)

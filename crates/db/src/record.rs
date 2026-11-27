@@ -218,6 +218,12 @@ impl LogRing {
       AT_CRC,
       &checksum(seq, LogEntry::SCHEMA_HASH, body).to_le_bytes(),
     );
+    // The ring's mark covers the record before any byte of it is written (A-926): its end, or the whole ring once it
+    // wraps (an offset past the capacity lies at its start again).
+    let end = w.tail.saturating_add(total).min(w.capacity);
+    let reach =
+      slates_anchor::layout::RING_BYTES.saturating_add(usize::try_from(end).unwrap_or(usize::MAX));
+    segment.raise_region_mark(self.kind, reach)?;
     self.write_wrapping(segment, w.capacity, w.tail, &header)?;
     self.write_wrapping(
       segment,
@@ -226,6 +232,14 @@ impl LogRing {
         .saturating_add(u64::try_from(RECORD_HEADER).unwrap_or(u64::MAX)),
       body,
     )?;
+    #[cfg(test)]
+    if STOP_AFTER_RECORD.with(core::cell::Cell::get) {
+      // The crash point A-926 part 2's red holds: the record's bytes written, nothing after.
+      return Err(DbError::Corrupt {
+        seq,
+        reason: "stopped after its bytes (test)",
+      });
+    }
     let words = segment.ring_words(self.kind)?;
     if w.head == w.tail {
       words[3].store(seq, Ordering::Release);
@@ -503,4 +517,81 @@ fn read_u64(bytes: &[u8], at: usize) -> u64 {
     .get(at..at.saturating_add(size_of::<u64>()))
     .and_then(|word| word.try_into().ok())
     .map_or(0, u64::from_le_bytes)
+}
+
+#[cfg(test)]
+std::thread_local! {
+  /// Test support (A-926 part 2's crash red): a ring's write stops right after its record's bytes are written, as a
+  /// daemon killed there leaves its ring.
+  static STOP_AFTER_RECORD: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Shape: the test segment's page.
+  const PAGE: u64 = 4096;
+
+  /// A-926 part 2, the crash point (main's ruling of 2026-11-25: raised before the write, a crash leaves the mark
+  /// ahead of the data, never behind). Do: on a fresh segment, write small records to the log ring until it passes two
+  /// pages, then one of two pages stopped right after its bytes are written, as a daemon killed there. Expect the ring's
+  /// mark covering every byte the stopped record wrote. Red with the mark raised after the record's bytes: pages short.
+  #[test]
+  fn a_crash_after_a_records_bytes_leaves_the_rings_mark_covering_them() {
+    let identity = slates_machine::facts::Identity {
+      cpu: "test".into(),
+      os: "test".into(),
+      arch: "test".into(),
+      cores: 1,
+      memory: 1,
+      page: PAGE,
+    };
+    let mut seg = AnchorSegment::create(
+      &format!("slates-db-ring-crash-{}", std::process::id()),
+      &identity,
+      slates_anchor::Geometry {
+        partitions: 1,
+        page: PAGE,
+        profile_bytes: PAGE,
+        log_bytes: 16 * PAGE,
+        snapshot_bytes: PAGE,
+        landing_slots: 1,
+        landing_slot_bytes: PAGE,
+      },
+    )
+    .unwrap();
+    let ring = LogRing::new(RegionKind::Log(0));
+    let entry = LogEntry {
+      ops: vec![crate::Op::VolumeAccounted {
+        id: crate::catalog::VolumeId { bytes: [1; 16] },
+        referenced_bytes: 1,
+        unique_bytes: 1,
+      }],
+    };
+    let encoded = LogRing::encode(&entry);
+    let mut seq = 0;
+    while seg.ring_words(RegionKind::Log(0)).unwrap()[1].load(Ordering::Acquire) < 2 * PAGE {
+      ring.write(&mut seg, seq, &encoded).unwrap();
+      seq += 1;
+    }
+    let tail = seg.ring_words(RegionKind::Log(0)).unwrap()[1].load(Ordering::Acquire);
+    // A record of two pages, so its bytes pass the page the marks already cover.
+    let large = LogEntry {
+      ops: vec![crate::Op::WorkLogged {
+        work: crate::catalog::VolumeId { bytes: [1; 16] },
+        entry: vec![5; 2 * PAGE as usize],
+      }],
+    };
+    STOP_AFTER_RECORD.with(|stop| stop.set(true));
+    let stopped = ring.write(&mut seg, seq, &LogRing::encode(&large));
+    STOP_AFTER_RECORD.with(|stop| stop.set(false));
+    assert!(stopped.is_err(), "the write stopped after its bytes");
+    let wrote_to = slates_anchor::layout::RING_BYTES as u64 + tail + LogRing::record_bytes(&large);
+    let mark = seg.region_marks(0).unwrap().ring as u64;
+    assert!(
+      mark >= wrote_to,
+      "the ring's mark {mark} covers the record's bytes, to {wrote_to}"
+    );
+  }
 }
