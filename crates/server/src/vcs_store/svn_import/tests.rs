@@ -88,30 +88,16 @@ pub(crate) fn host_holding(dump: &[u8]) -> (SimHost, HostDir) {
   (host, root)
 }
 
-/// A simulated host holding a test's dump, made on the test's thread before the history that imports it begins (A-920,
-/// main's ruling after probe 17: measure the product, not the oracle). Made inside the history, the host's copy of
-/// move's 10.5 MB dump was 1.49 ms of its first poll, debug, 1.23 of it system time faulting the copy's pages in, and
-/// that poll led move's release runs. Shared so a history holding it stays `Clone`; taken once.
-#[derive(Clone)]
-pub(crate) struct HeldDump(std::sync::Arc<std::sync::Mutex<Option<(SimHost, HostDir)>>>);
-
-impl HeldDump {
-  /// `dump` held by a simulated host ([`host_holding`]): the caller's copy goes with it, off the shard.
-  pub(crate) fn holding(dump: Vec<u8>) -> HeldDump {
-    HeldDump(std::sync::Arc::new(std::sync::Mutex::new(Some(
-      host_holding(&dump),
-    ))))
-  }
-
-  /// The host and its root: taken once, by the history that imports from it.
-  fn taken(&self) -> (SimHost, HostDir) {
-    self
-      .0
-      .lock()
-      .expect("the held dump's lock")
-      .take()
-      .expect("the held dump, taken once")
-  }
+/// A simulated host holding `dump` as [`DUMP`] in its root, the bytes moved in, never copied
+/// ([`SimHost::replace_file_owned`]): the host and its root. A wide test's history holds its dump this way (A-920,
+/// main's ruling after probe 17: measure the product, not the oracle). Copied, the host's hold of move's 10.5 MB dump
+/// was 1.49 ms of its first poll, debug, 1.23 of it system time faulting the copy's pages in, and that poll led move's
+/// release runs; moved, its pages are the ones the test's thread made.
+pub(crate) fn host_holding_owned(dump: Vec<u8>) -> (SimHost, HostDir) {
+  let mut host = SimHost::new();
+  host.replace_file_owned(&format!("/{DUMP}"), dump);
+  let root = host.root();
+  (host, root)
 }
 
 /// Imports `dump` into repository `id` from a history running as a task on the shard, a turn at a time, each record
@@ -124,12 +110,14 @@ pub(crate) async fn imported(
   imported_sampling(id, dump, &mut || {}).await
 }
 
-/// [`imported`] from the host `held` holds ([`HeldDump`]), made before the history began.
+/// [`imported`], `dump` held by its simulated host as it is, never copied ([`host_holding_owned`]).
 pub(crate) async fn imported_held(
   id: RepositoryId,
-  held: &HeldDump,
+  dump: Vec<u8>,
 ) -> (Result<Loaded, LoadFailed>, u64) {
-  imported_from(id, held.taken(), &mut || {}).await
+  super::phase::tag("setup.host");
+  let held = host_holding_owned(dump);
+  imported_from(id, held, &mut || {}).await
 }
 
 /// [`imported`], `sampled` run after each turn's landings and owed bases, before the next turn: what a test reads of
@@ -1091,15 +1079,11 @@ const WIDE_TEXT_BYTES: usize = 1024;
 #[test]
 fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shards_window() {
   // Made before the shard's history begins: the fixture's own work is no step of the import's.
-  let held = HeldDump::holding(wide_revisions(
-    WIDE_REVISION_FILES,
-    WIDE_TEXT_BYTES,
-    (1, false),
-  ));
+  let dump = wide_revisions(WIDE_REVISION_FILES, WIDE_TEXT_BYTES, (1, false));
   let (loaded, (longest_ns, window_ns), counts) = stored(move || {
     cpu_timed(async move {
       let (svn, _green) = subversion("wide-revision").await;
-      let (loaded, _turns) = imported_held(svn, &held).await;
+      let (loaded, _turns) = imported_held(svn, dump).await;
       let counts = wide_counts();
       let (longest_ns, longest_task) = longest_poll();
       print_phases("wide-add");
@@ -1180,12 +1164,10 @@ fn imported_whole_and_stepped(
   name: &'static str,
   dump: Vec<u8>,
 ) -> (Result<u64, String>, u64, u64, (u64, u64, u64, u64)) {
-  // Held before the shard's history begins: the oracle host's copy of the dump is no step of the import's.
-  let held = HeldDump::holding(dump);
   let read = stored(move || {
     cpu_timed(async move {
       let (svn, green) = subversion(name).await;
-      let (loaded, _turns) = imported_held(svn, &held).await;
+      let (loaded, _turns) = imported_held(svn, dump).await;
       checkpoints_ended().await;
       let build_units = on(|state| count(state, crate::merge_service::CHECKPOINT_BUILD_UNITS));
       let walk_most = on(|state| {

@@ -64997,7 +64997,9 @@ GAPS.
   - the simulated host's copy of the 10.5 MB dump, 1,438 µs. `to_vec` was 1,486 µs, 1,232 of it system time
     faulting the copy's pages in; `replace_file`'s own work 300. The harness alone: no product code runs in it.
   - the import's `begin`, 178 µs; the repository's create, 7 µs warm and 1,796 µs cold (the process's first).
-  The host is now made on the test's thread before the timed history begins (`HeldDump`). The product's create and
+  The host now holds the dump the test's thread made as it is, moved in and never copied
+  (`SimHost::replace_file_owned`), so its hold costs the history nothing that grows with the dump; it was first made
+  before the history under an `Arc` and a `Mutex`, which R2 and D-7 forbid, and is replaced. The product's create and
   begin stay in the history under tags of their own ("create", "begin"). Their longest spans print apart from the
   import's turns: `SETUP <test> create_ns=<n> begin_ns=<n>`. In debug, create is 167-202 µs warm and 1,957 µs cold,
   and begin is 615-1,141 µs. Probe 16 at cb73f520b read move at p50 1,090 µs with the same setup code. Unmeasured
