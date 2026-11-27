@@ -163,9 +163,12 @@ impl std::fmt::Debug for HeldRendezvous {
 }
 
 impl HeldRendezvous {
-  /// Creates `instance`'s rendezvous for the anchor to hold for its life: an inheritable listening socket (Linux), or
-  /// the bootstrap object with every slot free and nothing published (macOS, Windows), so a client finds no daemon
-  /// until the first one stamps it.
+  /// Creates `instance`'s rendezvous for the anchor to hold for its life: a listening socket, close-on-exec (Linux),
+  /// or the bootstrap object with every slot free and nothing published (macOS, Windows), so a client finds no daemon
+  /// until the first one stamps it. The socket reaches a daemon the anchor spawns only through that spawn, which clears
+  /// close-on-exec on [`HeldRendezvous::handed_descriptor`] in its child alone: held inheritable, every child of the
+  /// holder's process kept the socket, and its address bound, for its whole life (2026-11-27,
+  /// `docs/bugs/2026-11-27-an-anchors-held-sockets-reached-every-child-of-their-holders-process.md`).
   pub fn hold(instance: &str) -> Result<HeldRendezvous, IpcError> {
     Ok(HeldRendezvous {
       inner: platform::Held::hold(instance)?,
@@ -178,6 +181,12 @@ impl HeldRendezvous {
     Adoption {
       value: self.inner.env_value(),
     }
+  }
+
+  /// The descriptor a spawn of the daemon hands on, clearing close-on-exec on it in that child alone (Linux, the held
+  /// socket's number); none where the rendezvous is found by name (macOS, Windows).
+  pub fn handed_descriptor(&self) -> Option<i32> {
+    self.inner.handed_descriptor()
   }
 }
 
@@ -1458,8 +1467,8 @@ pub mod platform {
     }
   }
 
-  /// The anchor's listening socket (A-114): inheritable, so the kernel keeps the address and queues every connect while
-  /// no daemon runs.
+  /// The anchor's listening socket (A-114): held for the anchor's life, so the kernel keeps the address and queues every
+  /// connect while no daemon runs; close-on-exec, handed on to a spawned daemon alone ([`HeldRendezvous::hold`]).
   pub(super) struct Held {
     socket: OwnedFd,
     /// The socket file the anchor bound, removed when it stops (A-187).
@@ -1474,13 +1483,18 @@ pub mod platform {
 
   impl Held {
     pub(super) fn hold(instance: &str) -> Result<Held, IpcError> {
-      let (socket, node) = listening(instance, SocketFlags::empty())?;
+      let (socket, node) = listening(instance, SocketFlags::CLOEXEC)?;
       Ok(Held { socket, node })
     }
 
     pub(super) fn env_value(&self) -> String {
       use std::os::fd::AsRawFd;
       self.socket.as_raw_fd().to_string()
+    }
+
+    pub(super) fn handed_descriptor(&self) -> Option<i32> {
+      use std::os::fd::AsRawFd;
+      Some(self.socket.as_raw_fd())
     }
   }
 
@@ -3799,6 +3813,10 @@ pub mod platform {
 
     pub(super) fn env_value(&self) -> String {
       "held".to_owned()
+    }
+
+    pub(super) fn handed_descriptor(&self) -> Option<i32> {
+      None
     }
   }
 
