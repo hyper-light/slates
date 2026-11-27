@@ -2641,29 +2641,25 @@ fn an_svnsync_measured() {
     return;
   }
   for scheme in ["svn", "http"] {
-    let instance = format!("svn-sync-{scheme}-{}", std::process::id());
-    let edge = format!("--vcs-{scheme}");
-    let (_anchor, lines, issuer) = start_anchor(&instance, &[&edge, "127.0.0.1:0"]);
-    let Some(issuer) = issuer_or_skip(issuer, "svnsync's measurement") else {
+    let Some(served) = served_import(scheme, &dump, "svn-sync") else {
       return;
     };
-    create_repository(&instance);
-    let importing = Instant::now();
-    let (code, out, err) = slates(&instance, &["repository", "import", REPOSITORY, &dump]);
-    assert_eq!(code, 0, "repository import: {out}{err}");
-    let imported = importing.elapsed().as_secs_f64();
-    let after_import = daemon_counters(&instance);
-    let (id, token) = minted_token(&instance, &issuer);
-    let (user, url) = match scheme {
-      "svn" => (
-        id,
-        format!("svn://127.0.0.1:{}/{REPOSITORY}", svn_listener_port(&lines)),
-      ),
-      _ => (
-        USER.to_owned(),
-        format!("http://127.0.0.1:{}/{REPOSITORY}", http_edge_port(&lines)),
-      ),
-    };
+    let Served {
+      instance,
+      url,
+      user,
+      token,
+      after_import,
+      imported,
+      ..
+    } = &served;
+    let (instance, url, user, token, imported) = (
+      instance.as_str(),
+      url.as_str(),
+      user.clone(),
+      token.clone(),
+      *imported,
+    );
     let scratch = Scratch::new(&format!("svn-sync-{scheme}"));
     let mirror = format!("{}/mirror", scratch.path);
     let made = Command::new("svnadmin")
@@ -2686,13 +2682,13 @@ fn an_svnsync_measured() {
       token,
     ];
     let init = Command::new("svnsync")
-      .args(["init", &mirror_url, &url])
+      .args(["init", &mirror_url, url])
       .args(&options)
       .env("LC_ALL", "C")
       .output()
       .unwrap();
     assert!(init.status.success(), "svnsync init: {init:?}");
-    let before = daemon_rss_kib(&instance);
+    let before = daemon_rss_kib(instance);
     let mut child = Command::new("svnsync")
       .args(["sync", &mirror_url])
       .args(&options)
@@ -2706,7 +2702,7 @@ fn an_svnsync_measured() {
     let started = Instant::now();
     let mut peak = 0;
     let code = loop {
-      peak = peak.max(daemon_rss_kib(&instance));
+      peak = peak.max(daemon_rss_kib(instance));
       if let Some(status) = child.try_wait().unwrap() {
         break status.code().unwrap_or(-1);
       }
@@ -2719,17 +2715,134 @@ fn an_svnsync_measured() {
       .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
       .unwrap_or_default();
     let revisions = youngest.parse::<f64>().unwrap_or(0.0).max(1.0);
-    let after_sync = daemon_counters(&instance);
+    let after_sync = daemon_counters(instance);
     println!(
       "an_svnsync_measured {scheme}: import {imported:.1} s; svnsync exit {code} in {seconds:.1} s, {:.1} ms a revision; \
        mirror at r{youngest}; daemon RSS {before} KiB before, peak {peak} KiB\n  svnsync: {}\n  counters after the \
        import:{}\n  counters the sync added:{}",
       seconds * 1e3 / revisions,
       err.join().unwrap().trim(),
-      counters_listed(&after_import),
-      counters_added(&after_import, &after_sync, revisions)
+      counters_listed(after_import),
+      counters_added(after_import, &after_sync, revisions)
     );
   }
+}
+
+/// A daemon serving a dump imported through the CLI, for a measurement ([`served_import`]): its anchor, held for its
+/// life, its instance, the repository's URL over the edge, the user and token stock Subversion signs in with, its
+/// counters after the import, and the import's seconds.
+#[cfg(unix)]
+struct Served {
+  _anchor: Anchor,
+  instance: String,
+  url: String,
+  user: String,
+  token: String,
+  after_import: std::collections::BTreeMap<String, u64>,
+  imported: f64,
+}
+
+/// An anchor started for measurement `leg` whose daemon holds a changeset store and serves `scheme`'s edge (`svn` or
+/// `http`), a Subversion repository made and the dump at `dump` imported into it through the CLI: what a measurement of
+/// a stock tool against it begins with ([`an_svnsync_measured`], [`an_svnrdump_dump_measured`]). None, skipped loudly,
+/// without an issuer surface.
+#[cfg(unix)]
+fn served_import(scheme: &str, dump: &str, leg: &str) -> Option<Served> {
+  let instance = format!("{leg}-{scheme}-{}", std::process::id());
+  let edge = format!("--vcs-{scheme}");
+  let (anchor, lines, issuer) = start_anchor(&instance, &[&edge, "127.0.0.1:0"]);
+  let issuer = issuer_or_skip(issuer, leg)?;
+  create_repository(&instance);
+  let importing = Instant::now();
+  let (code, out, err) = slates(&instance, &["repository", "import", REPOSITORY, dump]);
+  assert_eq!(code, 0, "repository import: {out}{err}");
+  let imported = importing.elapsed().as_secs_f64();
+  let after_import = daemon_counters(&instance);
+  let (id, token) = minted_token(&instance, &issuer);
+  let (user, url) = match scheme {
+    "svn" => (
+      id,
+      format!("svn://127.0.0.1:{}/{REPOSITORY}", svn_listener_port(&lines)),
+    ),
+    _ => (
+      USER.to_owned(),
+      format!("http://127.0.0.1:{}/{REPOSITORY}", http_edge_port(&lines)),
+    ),
+  };
+  Some(Served {
+    _anchor: anchor,
+    instance,
+    url,
+    user,
+    token,
+    after_import,
+    imported,
+  })
+}
+
+/// The HTTPv2 use test's dump row (goal 93; main's round of 2026-11-24: `svnrdump dump` of git-2000 at 7.6 s against
+/// stock svnserve's 2.5, 3.0 times; a measurement, not a gate). Do: for the HTTP edge and svn:// in turn, start an anchor
+/// whose daemon holds a changeset store, import the dump `SLATES_SVN_RDUMP_DUMP` names through the CLI, then dump the
+/// repository with stock `svnrdump dump` 1.15, timed. Expect nothing: print each scheme's import seconds, the dump's
+/// answer, seconds and seconds a revision, and what the dump added to every counter, whole and a revision, so the dump's
+/// share of the server's work is read by counts, which a loaded box does not skew. Skips loudly without stock Subversion
+/// 1.15 or the dump.
+#[test]
+#[cfg(unix)]
+#[ignore = "a measurement: SLATES_SVN_RDUMP_DUMP=... cargo test -p slates-cli --test svn_interop -- --ignored an_svnrdump_dump_measured --nocapture"]
+fn an_svnrdump_dump_measured() {
+  let Ok(dump) = std::env::var("SLATES_SVN_RDUMP_DUMP") else {
+    eprintln!("skipping svnrdump's measurement: SLATES_SVN_RDUMP_DUMP names no dump");
+    return;
+  };
+  if !stock_svn() {
+    eprintln!("skipping svnrdump's measurement: no stock Subversion 1.15 here (svn, svnrdump)");
+    return;
+  }
+  for scheme in ["http", "svn"] {
+    let Some(served) = served_import(scheme, &dump, "svn-rdump") else {
+      return;
+    };
+    let (code, seconds, revisions, err) = rdump_timed(&served, scheme);
+    let after = daemon_counters(&served.instance);
+    println!(
+      "an_svnrdump_dump_measured {scheme}: import {:.1} s; svnrdump dump exit {code} in {seconds:.1} s, {:.1} ms a \
+       revision of {revisions}\n  svnrdump: {}\n  counters the dump added:{}",
+      served.imported,
+      seconds * 1e3 / revisions.max(1.0),
+      err.trim(),
+      counters_added(&served.after_import, &after, revisions.max(1.0))
+    );
+  }
+}
+
+/// Stock `svnrdump dump` of `served`'s repository over `scheme`'s edge, timed, its stream counted and dropped: its exit,
+/// its seconds, the revisions its stream held, and its error output.
+#[cfg(unix)]
+fn rdump_timed(served: &Served, scheme: &str) -> (i32, f64, f64, String) {
+  let scratch = Scratch::new(&format!("svn-rdump-{scheme}"));
+  let started = Instant::now();
+  let out = Command::new("svnrdump")
+    .args(["dump", "-q", &served.url])
+    .args(["--non-interactive", "--no-auth-cache", "--config-dir"])
+    .arg(format!("{}/svn-config", scratch.path))
+    .args(["--username", &served.user, "--password", &served.token])
+    .env("LC_ALL", "C")
+    .stdin(Stdio::null())
+    .output()
+    .unwrap();
+  let seconds = started.elapsed().as_secs_f64();
+  let revisions = out
+    .stdout
+    .windows(b"Revision-number: ".len())
+    .filter(|window| *window == b"Revision-number: ")
+    .count();
+  (
+    out.status.code().unwrap_or(-1),
+    seconds,
+    revisions as f64,
+    String::from_utf8_lossy(&out.stderr).into_owned(),
+  )
 }
 
 /// Shape: the revisions [`an_svn_update_measured`] updates across where `SLATES_SVN_UPDATE_SPAN` names none: the 500

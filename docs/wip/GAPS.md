@@ -6637,6 +6637,16 @@
 > faster on reads (checkout, update and switch within 13%; diff, info, log and revprops 2.6 to 14 times faster) and
 > slower on the dump (3.0×), the writing session (2.1×, down from 24×) and svnsync (1.27×, noisy). See BENCHMARKS,
 > "The svn use test over HTTP with git-2000". The dump and the writing session are w-svn's.
+> **The dump's 3.0×, counted (w-svn, 2026-11-27; main's (b)):** `an_svnrdump_dump_measured` (`crates/cli/tests/svn_interop.rs`)
+> imports a dump into a store-backed daemon, then times stock `svnrdump dump` over the HTTP edge and over svn://,
+> printing what each added to every counter a revision. Over a local history of 300 revisions (three 8 KiB files
+> changed each, a 10 MB dump; debug, stock 1.15) both edges fetched 6.0 pieces a revision through the node's store
+> and polled about 12 times a revision for 2 to 4 ms (`rt.poll_log2.21`): the replay drive's own work, about two
+> polls a piece. The HTTP edge's extra over svn:// (37.4 ms a revision against 24.6, debug) is its reply's yields:
+> 114 a revision (`vcs_http.reply_yields`), each polled again, most of its 34 polls a revision of 128 to 256 µs against
+> svn://'s 3. In debug the daemon's live quantum derives tiny slices (4.4 µs: a 741-byte text piece, a 6.9 KB copy
+> slice), which inflate yield counts. Owed: main's release round of `an_svnrdump_dump_measured` over git-2000 on
+> these counters, which names the 2 to 4 ms polls' task and the reply's yields a revision at the release quantum.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon
