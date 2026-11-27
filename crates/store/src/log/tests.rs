@@ -1070,28 +1070,24 @@ fn ordinary_interrupted_uncommitted_tail_reads_constant_calls_across_tail_sizes(
   }
 }
 
-/// Verifies that flipping `flip_bit` at `head_offset` turns the 16-byte section head to all zeros
-/// and that recovery still resynchronizes past `middle` to recover `prefix` and `trailing`.
+/// Verifies that zeroing the 16-byte section head at `head_offset` turns it to all zeros and that
+/// recovery still resynchronizes past `middle` to recover `prefix` and `trailing`.
 fn assert_zeroed_empty_section_recovers_siblings(
   sim: SimFile,
   head_offset: u64,
-  flip_bit: u8,
   (prefix, trailing): (Located, Located),
   trailing_bytes: &[u8],
   label: &str,
 ) {
   sim
-    .inject(Fault::BitFlip {
-      offset: head_offset,
-      bit: flip_bit,
-      stored: true,
-    })
+    .write_all_at(&[0u8; SECTION_HEAD_BYTES], head_offset)
     .unwrap();
+  sim.sync_data().unwrap();
   let mut head = [0u8; SECTION_HEAD_BYTES];
   sim.read_exact_at(&mut head, head_offset).unwrap();
   assert_eq!(
     head, [0u8; SECTION_HEAD_BYTES],
-    "{label}: bit flip must produce an all-zero section head"
+    "{label}: zeroing must produce an all-zero section head"
   );
   let (log, found) = recovered(sim);
   assert_eq!(found, vec![prefix, trailing], "{label}");
@@ -1100,21 +1096,20 @@ fn assert_zeroed_empty_section_recovers_siblings(
   assert_eq!(read_payload(&log, &trailing), trailing_bytes, "{label}");
 }
 
-/// Do: commit `[prefix, middle, trailing]` where `middle` contains a 0-byte section whose single
-/// set kind bit (`Record=1`, `Payload=2`, `Names=4`) is flipped so its 16-byte head becomes all
-/// zeros — covering single-section records, a 0-byte first section followed by another section,
-/// and a 0-byte last section after a closed first section — and recover.
-/// Expect: recovery never mistakes the flipped head for an unwritten tail; linear resync skips
+/// Do: commit `[prefix, middle, trailing]` where `middle` contains a 0-byte section whose 16-byte
+/// closed head is zeroed — covering single-section records, a 0-byte first section followed by
+/// another section, and a 0-byte last section after a closed first section — and recover.
+/// Expect: recovery never mistakes the zeroed head for an unwritten tail; linear resync skips
 /// `middle` (`skipped() == 1`) and recovers both `prefix` and `trailing` intact.
 #[test]
-fn single_bit_flip_zeroing_empty_section_head_still_recovers_trailing_sibling() {
+fn zeroed_empty_section_head_still_recovers_trailing_sibling() {
   let trailing_bytes = payload(77, 64);
 
   // Single-section 0-byte middle records (last section -> commit trailer sits at `bytes_at`).
-  for (kind, bit, label) in [
-    (SectionKind::Record, 0u8, "1-sec empty Record"),
-    (SectionKind::Payload, 1, "1-sec empty Payload"),
-    (SectionKind::Names, 2, "1-sec empty Names"),
+  for (kind, label) in [
+    (SectionKind::Record, "1-sec empty Record"),
+    (SectionKind::Payload, "1-sec empty Payload"),
+    (SectionKind::Names, "1-sec empty Names"),
   ] {
     let (mut log, _) = recovered(file(99));
     let prefix = append_for(&mut log, Tool::Git, 101, 1, b"prefix");
@@ -1124,7 +1119,6 @@ fn single_bit_flip_zeroing_empty_section_head_still_recovers_trailing_sibling() 
     assert_zeroed_empty_section_recovers_siblings(
       log.into_file(),
       head_offset,
-      bit,
       (prefix, trailing),
       &trailing_bytes,
       label,
@@ -1146,7 +1140,6 @@ fn single_bit_flip_zeroing_empty_section_head_still_recovers_trailing_sibling() 
   assert_zeroed_empty_section_recovers_siblings(
     log.into_file(),
     first_head,
-    0,
     (prefix, trailing),
     &trailing_bytes,
     "2-sec empty first Record",
@@ -1161,7 +1154,6 @@ fn single_bit_flip_zeroing_empty_section_head_still_recovers_trailing_sibling() 
   assert_zeroed_empty_section_recovers_siblings(
     log.into_file(),
     second_head,
-    1,
     (prefix, trailing),
     &trailing_bytes,
     "2-sec empty last Payload",
@@ -1663,4 +1655,99 @@ fn assert_damaged_tail_preserved(seed: u64, with_torn_tail: bool) {
 fn damaged_last_committed_record_preserves_intact_bytes_across_next_append() {
   assert_damaged_tail_preserved(112, false);
   assert_damaged_tail_preserved(113, true);
+}
+
+/// Checks every 1-, 2-, and 3-bit flip on `tag` is refused by `SectionKind::from_byte`.
+fn assert_up_to_3bit_flips_rejected(kind: SectionKind) {
+  let tag = kind.byte();
+  assert_eq!(SectionKind::from_byte(tag), Some(kind));
+  assert!(tag.count_ones() == 4 && tag.count_zeros() == 4);
+  for mask in 1u8..=u8::MAX {
+    if mask.count_ones() <= 3 {
+      assert_eq!(
+        SectionKind::from_byte(tag ^ mask),
+        None,
+        "{kind:?} tag {tag:#04x} ^ {mask:#04x} must not decode"
+      );
+    }
+  }
+}
+
+/// Verifies `^ 0x01` bit-flip in `S_KIND` fails `sections_in`, and an adversarial rewrite of
+/// `S_KIND` to `other` fails `Section::verify_bytes`, `Section::crc_verifier`, and
+/// `verified_identity_of_section`.
+fn assert_s_kind_flip_and_rewrite_rejected(seed: u64, kind: SectionKind, other: SectionKind) {
+  let body = b"section-kind-integrity-payload";
+  let (mut log, _) = recovered(file(seed));
+  let loc = append_one_section(&mut log, Tool::Mercurial, 7, 1, kind, body);
+  let head_off = loc.offset + u64::try_from(HEADER_BYTES).unwrap();
+  let original_sec = log.sections(&loc).unwrap()[0];
+
+  // Single-bit flip in `S_KIND` -> `sections_in` immediately rejects the head.
+  let sim = log.into_file();
+  let image = sim.durable_image().unwrap();
+  sim
+    .inject(Fault::BitFlip {
+      offset: head_off,
+      bit: 0,
+      stored: true,
+    })
+    .unwrap();
+  assert!(matches!(
+    sections_in(&sim, &loc),
+    Err(LogError::Corrupt("a section's head"))
+  ));
+
+  // Adversarial 4-bit rewrite of `S_KIND` to another valid `SectionKind` -> CRC-32C refuses.
+  let forged = file(seed + 100);
+  forged.write_all_at(&image, 0).unwrap();
+  forged.write_all_at(&[other.byte()], head_off).unwrap();
+  forged.sync_data().unwrap();
+  let forged_sec = sections_in(&forged, &loc).unwrap()[0];
+  assert_eq!((forged_sec.kind, forged_sec.crc), (other, original_sec.crc));
+  let mut stream_crc = forged_sec.crc_verifier();
+  stream_crc.update(body);
+  let mut buf = Vec::new();
+  assert!(matches!(
+    (
+      forged_sec.verify_bytes(body),
+      stream_crc.finish(),
+      verified_identity_of_section(&forged, &forged_sec, &mut buf),
+    ),
+    (
+      Err(LogError::Corrupt("a section's bytes")),
+      Err(LogError::Corrupt("a section's bytes")),
+      Err(LogError::Corrupt("a section's bytes")),
+    )
+  ));
+}
+
+/// Round-7 Blocker 2: Do: check pairwise Hamming distance `>= 4` across all five `SectionKind`
+/// wire bytes (and distance 4 from `0x00`/`0xFF`), reject every 1-, 2-, and 3-bit flip in
+/// `S_KIND`, test `^ 0x01` flips on `Texts`, `Payload`, and `Record` heads, and test adversarial
+/// 4-bit rewrites (`Texts -> Names`, `Payload -> Work`, `Record -> Work`).
+/// Expect: every 1..=3-bit flip fails `sections_in` immediately with `Corrupt("a section's head")`,
+/// and every 4-bit kind rewrite fails `verify_bytes`, `crc_verifier`, and
+/// `verified_identity_of_section` with `Corrupt("a section's bytes")`.
+#[test]
+fn s_kind_hamming_and_header_bound_crc_reject_flips_and_rewrites() {
+  let all = [
+    SectionKind::Record,
+    SectionKind::Payload,
+    SectionKind::Work,
+    SectionKind::Names,
+    SectionKind::Texts,
+  ];
+  for (idx, &a) in all.iter().enumerate() {
+    assert_up_to_3bit_flips_rejected(a);
+    for &b in all.iter().skip(idx + 1) {
+      assert!(
+        (a.byte() ^ b.byte()).count_ones() >= 4,
+        "{a:?} and {b:?} must have Hamming distance >= 4"
+      );
+    }
+  }
+  assert_s_kind_flip_and_rewrite_rejected(120, SectionKind::Texts, SectionKind::Names);
+  assert_s_kind_flip_and_rewrite_rejected(121, SectionKind::Payload, SectionKind::Work);
+  assert_s_kind_flip_and_rewrite_rejected(122, SectionKind::Record, SectionKind::Work);
 }

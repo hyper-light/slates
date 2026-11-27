@@ -16,11 +16,13 @@
 //!   changeset's sequence in it, the sequence it was judged over, the grant, the work and the time (the repository a
 //!   `u128`, the rest each a `u64`), the section count (`u16`), two zero bytes, and the CRC-32C of the log's
 //!   32-byte seal, the record's file offset (`u64` little-endian), and the 68 header bytes before the CRC;
-//! - its sections, each a head of [`SECTION_HEAD_BYTES`] followed by the section's bytes. When a section opens before
-//!   its pieces stream, its head holds the kind, [`SECTION_OPEN_FLAG`] (`0x80`), two zero bytes, its declared length
-//!   (`u64`), and the `(seal, section_head_offset)`-keyed CRC-32C of those 12 bytes. When the section closes, those 16
-//!   bytes are overwritten with the closed head (the kind, three zero bytes, the actual length as a `u64`, and the
-//!   CRC-32C of the section's bytes);
+//! - its sections, each a head of [`SECTION_HEAD_BYTES`] followed by the section's bytes. Each section kind uses an
+//!   extended Hamming(8,4) wire tag (pairwise distance `>= 4`, distance `4` from `0x00` and `0xFF`) so any 1-, 2-, or
+//!   3-bit flip in `S_KIND` fails head decoding immediately. When a section opens before its pieces stream, its head
+//!   holds the kind, [`SECTION_OPEN_FLAG`] (`0x80`), two zero bytes, its declared length (`u64`), and the
+//!   `(seal, section_head_offset)`-keyed CRC-32C of those 12 bytes. When the section closes, those 16 bytes are
+//!   overwritten with the closed head (the kind, three zero bytes, the actual length as a `u64`, and the CRC-32C over
+//!   the section's 9-byte `(kind, len)` label followed by its body bytes);
 //! - a trailer of [`TRAILER_BYTES`]: the changeset's identity, the commit magic `SLCC`, the record's whole length
 //!   (`u64`), and the CRC-32C of the trailer before it. The identity is keyed BLAKE3 (keyed by the log's 32-byte seal)
 //!   over the record's file offset (`u64` little-endian), the header bytes, and, for each section in order, its kind,
@@ -208,28 +210,36 @@ pub enum SectionKind {
   Texts,
 }
 
+/// Format: extended Hamming(8,4) wire tag for [`SectionKind::Record`] (pairwise distance `>= 4`
+/// across all five kinds and distance `4` from `0x00`/`0xFF`).
+const KIND_RECORD: u8 = 0x0F;
+/// Format: extended Hamming(8,4) wire tag for [`SectionKind::Payload`] (pairwise distance `>= 4`).
+const KIND_PAYLOAD: u8 = 0x33;
+/// Format: extended Hamming(8,4) wire tag for [`SectionKind::Work`] (pairwise distance `>= 4`).
+const KIND_WORK: u8 = 0x55;
+/// Format: extended Hamming(8,4) wire tag for [`SectionKind::Names`] (pairwise distance `>= 4`).
+const KIND_NAMES: u8 = 0x66;
+/// Format: extended Hamming(8,4) wire tag for [`SectionKind::Texts`] (pairwise distance `>= 4`).
+const KIND_TEXTS: u8 = 0x99;
+
 impl SectionKind {
   fn byte(self) -> u8 {
-    // Format: a section's kind byte (A-767 item 2; the format agreed with w-hg, w-git, w-svn).
     match self {
-      SectionKind::Record => 1,
-      SectionKind::Payload => 2,
-      SectionKind::Work => 3,
-      // Format: as above, in the agreed order.
-      SectionKind::Names => 4,
-      SectionKind::Texts => 5,
+      SectionKind::Record => KIND_RECORD,
+      SectionKind::Payload => KIND_PAYLOAD,
+      SectionKind::Work => KIND_WORK,
+      SectionKind::Names => KIND_NAMES,
+      SectionKind::Texts => KIND_TEXTS,
     }
   }
 
   fn from_byte(byte: u8) -> Option<Self> {
-    // Format: a section's kind byte, as `byte` writes it.
     match byte {
-      1 => Some(SectionKind::Record),
-      2 => Some(SectionKind::Payload),
-      3 => Some(SectionKind::Work),
-      // Format: as above, in the agreed order.
-      4 => Some(SectionKind::Names),
-      5 => Some(SectionKind::Texts),
+      KIND_RECORD => Some(SectionKind::Record),
+      KIND_PAYLOAD => Some(SectionKind::Payload),
+      KIND_WORK => Some(SectionKind::Work),
+      KIND_NAMES => Some(SectionKind::Names),
+      KIND_TEXTS => Some(SectionKind::Texts),
       _ => None,
     }
   }
@@ -286,11 +296,13 @@ pub struct Section {
   pub offset: u64,
   /// Its length.
   pub len: u64,
-  /// CRC-32C of the section's bytes, as recorded in its closed section head.
+  /// CRC-32C of the section's `(kind, len)` label followed by its body bytes, as recorded in its
+  /// closed section head.
   pub crc: u32,
 }
 
-/// Incremental CRC-32C verifier for a [`Section`]'s bytes streamed across pieces.
+/// Incremental CRC-32C verifier for a [`Section`]'s `(kind, len)` label and body bytes streamed
+/// across pieces.
 #[derive(Clone, Copy, Debug)]
 pub struct SectionCrc {
   expected: u32,
@@ -298,11 +310,11 @@ pub struct SectionCrc {
 }
 
 impl SectionCrc {
-  /// Starts verifying a section whose closed head recorded `expected` CRC-32C.
-  pub fn new(expected: u32) -> Self {
+  /// Starts verifying a section of `(kind, len)` whose closed head recorded `expected` CRC-32C.
+  pub fn for_section(kind: SectionKind, len: u64, expected: u32) -> Self {
     Self {
       expected,
-      running: 0,
+      running: section_crc_seed(kind, len),
     }
   }
 
@@ -322,10 +334,11 @@ impl SectionCrc {
 }
 
 impl Section {
-  /// Verifies that `bytes` matches this section's recorded length and CRC-32C.
+  /// Verifies that `bytes` matches this section's recorded length and header-bound CRC-32C.
   pub fn verify_bytes(&self, bytes: &[u8]) -> Result<(), LogError> {
     let len = u64::try_from(bytes.len()).map_err(|_| LogError::TooLarge)?;
-    if len != self.len || mantle_crc::crc32c(bytes) != self.crc {
+    let crc = mantle_crc::crc32c_extend(section_crc_seed(self.kind, self.len), bytes);
+    if len != self.len || crc != self.crc {
       return Err(LogError::Corrupt("a section's bytes"));
     }
     Ok(())
@@ -333,7 +346,7 @@ impl Section {
 
   /// Starts an incremental CRC-32C verifier for streaming this section piece by piece.
   pub fn crc_verifier(&self) -> SectionCrc {
-    SectionCrc::new(self.crc)
+    SectionCrc::for_section(self.kind, self.len, self.crc)
   }
 }
 
@@ -571,7 +584,7 @@ impl<F: BlockFile> ChangesetLog<F> {
       kind,
       len,
       done: 0,
-      crc: 0,
+      crc: section_crc_seed(kind, len),
     });
     Ok(())
   }
@@ -798,26 +811,34 @@ pub fn identity_of_range<F: BlockFile>(
   buffer: &mut Vec<u8>,
 ) -> Result<[u8; IDENTITY], LogError> {
   let mut hasher = blake3::Hasher::new();
-  hash_range(file, &mut hasher, offset, len, buffer)?;
+  hash_range(file, &mut hasher, (offset, len), 0, buffer)?;
   Ok(*hasher.finalize().as_bytes())
 }
 
-/// BLAKE3 of `section`'s bytes in `file`, refusing [`LogError::Corrupt`] if their CRC-32C does
-/// not match `section.crc`.
+/// BLAKE3 of `section`'s bytes in `file`, refusing [`LogError::Corrupt`] if their header-bound
+/// CRC-32C does not match `section.crc`.
 pub fn verified_identity_of_section<F: BlockFile>(
   file: &F,
   section: &Section,
   buffer: &mut Vec<u8>,
 ) -> Result<[u8; IDENTITY], LogError> {
   let mut hasher = blake3::Hasher::new();
-  let crc = hash_range(file, &mut hasher, section.offset, section.len, buffer)?;
+  let seed = section_crc_seed(section.kind, section.len);
+  let crc = hash_range(
+    file,
+    &mut hasher,
+    (section.offset, section.len),
+    seed,
+    buffer,
+  )?;
   if crc != section.crc {
     return Err(LogError::Corrupt("a section's bytes"));
   }
   Ok(*hasher.finalize().as_bytes())
 }
 
-/// Format: what a section adds to its record's identity before its bytes: its kind and its length.
+/// Format: what a section adds to its record's identity and section CRC before its bytes: its kind
+/// and its length.
 fn section_label(kind: SectionKind, len: u64) -> [u8; LABEL_BYTES] {
   let mut label = [0u8; LABEL_BYTES];
   if let Some(byte) = label.first_mut() {
@@ -827,22 +848,28 @@ fn section_label(kind: SectionKind, len: u64) -> [u8; LABEL_BYTES] {
   label
 }
 
+/// Initial CRC-32C seed covering a section's 9-byte `(kind, len)` label before its body bytes.
+fn section_crc_seed(kind: SectionKind, len: u64) -> u32 {
+  mantle_crc::crc32c(&section_label(kind, len))
+}
+
 /// `offset` plus `count` bytes, refused past `u64`.
 fn offset_after(offset: u64, count: usize) -> Result<u64, LogError> {
   let count = u64::try_from(count).map_err(|_| LogError::TooLarge)?;
   offset.checked_add(count).ok_or(LogError::TooLarge)
 }
 
-/// Feeds `len` bytes of `file` from `offset` to `hasher`, `VERIFY_PIECE` at a time, and gives back their CRC-32C.
+/// Feeds `len` bytes of `file` from `offset` to `hasher`, `VERIFY_PIECE` at a time, and extends
+/// `seed_crc` across those bytes to give back the final CRC-32C.
 fn hash_range<F: BlockFile>(
   file: &F,
   hasher: &mut blake3::Hasher,
-  offset: u64,
-  len: u64,
+  (offset, len): (u64, u64),
+  seed_crc: u32,
   buffer: &mut Vec<u8>,
 ) -> Result<u32, LogError> {
   buffer.resize(VERIFY_PIECE, 0);
-  let mut crc = 0u32;
+  let mut crc = seed_crc;
   let mut done = 0u64;
   while done < len {
     let left = len.checked_sub(done).ok_or(LogError::TooLarge)?;
@@ -886,7 +913,8 @@ fn sections_verified<F: BlockFile>(
       return Ok(None);
     };
     identity.update(&section_label(kind, section_len));
-    if hash_range(file, identity, bytes_at, section_len, buffer)? != crc {
+    let seed = section_crc_seed(kind, section_len);
+    if hash_range(file, identity, (bytes_at, section_len), seed, buffer)? != crc {
       return Ok(None);
     }
     at = past;
@@ -1479,12 +1507,13 @@ pub(crate) fn has_valid_record_at<F: BlockFile>(
 
 /// Returns `true` when at least one committed record in `[SEAL_PREAMBLE_BYTES, file_len)` of
 /// `file` verifies as [`Verify::Valid`] under `seal`: checks `hint_offset` (from `rows`) first
-/// when present, and falls back to linear [`resync_from`] filtered by `expected_grant` when the
-/// leading record was damaged alongside the preamble.
+/// when present, and falls back to linear [`resync_from`] without a grant filter (so stores copied
+/// to a new directory retain recovery over records written under a prior grant, authenticated by
+/// the 256-bit keyed BLAKE3 `seal` MAC).
 pub(crate) fn verify_seal_matches_log<F: BlockFile>(
   file: &F,
   file_len: u64,
-  (seal, expected_grant): (&[u8; SEAL_BYTES], Option<u64>),
+  seal: &[u8; SEAL_BYTES],
   hint_offset: Option<u64>,
 ) -> Result<bool, LogError> {
   let preamble_len = u64::try_from(SEAL_PREAMBLE_BYTES).map_err(|_| LogError::TooLarge)?;
@@ -1502,7 +1531,7 @@ pub(crate) fn verify_seal_matches_log<F: BlockFile>(
     resync_from(
       file,
       (preamble_len, file_len),
-      (seal, expected_grant),
+      (seal, None),
       (&mut scan_buf, &mut verify_buf),
     )?
     .is_some(),
@@ -1767,7 +1796,11 @@ fn encode_section_head(kind: SectionKind, len: u64, crc: u32, out: &mut [u8; SEC
   put_u32(out, S_CRC, crc);
 }
 
-fn decode_section_head(bytes: &[u8; SECTION_HEAD_BYTES]) -> Option<(SectionKind, u64, u32)> {
+/// Decodes a 16-byte closed section head into `(kind, len, crc)`, rejecting non-zero flags or
+/// reserved bytes and any invalid Hamming(8,4) `S_KIND` tag.
+pub(crate) fn decode_section_head(
+  bytes: &[u8; SECTION_HEAD_BYTES],
+) -> Option<(SectionKind, u64, u32)> {
   if bytes.get(S_FLAGS..S_LEN)?.iter().any(|byte| *byte != 0) {
     return None;
   }

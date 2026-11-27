@@ -2,12 +2,14 @@
 //! suffix key, so forgetting the place used for reads needs at most one surviving copy. The regression
 //! in `tests/store.rs` lands identical bytes in two repositories and forgets them across a restart.
 
+use crate::log::{SECTION_HEAD_BYTES, Section, decode_section_head};
+
 use super::{
-  BLOCK_DIGESTS, BlockFile, CHANGESET_ENTRY_BYTES, CHANGESETS, CONTENT_KEY_BYTES,
-  CONTENT_VALUE_BYTES, CONTENTS, Changeset, Identity, LogError, Rows, SEAL_BYTES, SectionKind,
-  ShardDb, StoreError, U64, block_key, content_key, decode_changeset, decode_content,
-  delete_block_digests, field, index_verified_payload_from_log, put, sections_of,
-  verified_identity_of_section,
+  AFTER_TAG, BLOCK_DIGESTS, BlockFile, CHANGESET_ENTRY_BYTES, CHANGESETS, CONTENT_KEY_BYTES,
+  CONTENT_VALUE_BYTES, CONTENTS, Changeset, IDENTITY, Identity, LogError, PIECE_BYTES, Rows,
+  SEAL_BYTES, SectionKind, ShardDb, StoreError, U64, block_key, content_key, decode_changeset,
+  decode_content, delete_block_digests, field, index_verified_payload_from_log, keyed_block_tag,
+  put, sections_of, verified_identity_of_section,
 };
 
 /// Width of an alternate place's key. Its final field is the section's unique offset in the log.
@@ -56,19 +58,166 @@ pub(super) fn keep<F: BlockFile>(
   Ok(())
 }
 
-/// Deletes any alternate `P` row for `primary` inside `[exclude_start, exclude_end)` and returns
-/// the first surviving alternate offset outside that range (still present in `rows` until
-/// published) along with the number of in-range alternates deleted.
+/// Reads and checks the closed `Payload` section head immediately preceding `alt_offset` within
+/// the committed prefix `[0, end)`.
+fn read_alternate_head<F: BlockFile>(
+  file: &F,
+  end: u64,
+  (alt_offset, len): (u64, u64),
+) -> Result<Section, StoreError> {
+  let head_width = u64::try_from(SECTION_HEAD_BYTES).map_err(|_| StoreError::BadRow)?;
+  let Some(head_offset) = alt_offset.checked_sub(head_width) else {
+    return Err(StoreError::Log(LogError::Corrupt(
+      "a payload's section head",
+    )));
+  };
+  let Some(payload_end) = alt_offset.checked_add(len) else {
+    return Err(StoreError::Log(LogError::Corrupt("a payload's length")));
+  };
+  if payload_end > end {
+    return Err(StoreError::Log(LogError::Corrupt(
+      "a payload past the committed records",
+    )));
+  }
+  let mut head = [0u8; SECTION_HEAD_BYTES];
+  file
+    .read_exact_at(&mut head, head_offset)
+    .map_err(LogError::from)?;
+  let Some((kind, sec_len, crc)) = decode_section_head(&head) else {
+    return Err(StoreError::Log(LogError::Corrupt("a section's head")));
+  };
+  if kind != SectionKind::Payload || sec_len != len {
+    return Err(StoreError::Log(LogError::Corrupt("a section's head")));
+  }
+  Ok(Section {
+    kind,
+    offset: alt_offset,
+    len,
+    crc,
+  })
+}
+
+/// Checks one [`PIECE_BYTES`] block of a multi-piece candidate alternate against its durable `B`
+/// row in `rows`.
+fn verify_alternate_block<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  seal: &[u8; SEAL_BYTES],
+  (alt_offset, len): (u64, u64),
+  (block_idx, slice): (u64, &[u8]),
+  expected_tag: &mut Vec<u8>,
+) -> Result<(), StoreError> {
+  expected_tag.clear();
+  if !rows.get(&block_key(alt_offset, block_idx), expected_tag)? || expected_tag.len() != IDENTITY {
+    return Err(StoreError::Log(LogError::Corrupt(
+      "a payload's block digest",
+    )));
+  }
+  let tag = keyed_block_tag(seal, alt_offset, len, block_idx, slice);
+  if tag.as_slice() != expected_tag.as_slice() {
+    return Err(StoreError::Log(LogError::Corrupt("a payload's bytes")));
+  }
+  Ok(())
+}
+
+/// Streams a candidate alternate payload section in [`PIECE_BYTES`] chunks (O(1) RAM) to verify
+/// its header-bound CRC-32C, its whole-payload BLAKE3 `identity`, and (when `len > PIECE_BYTES`)
+/// every durable per-block MAC `B` row.
+fn verify_alternate_payload<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  (file, end, seal): (&F, u64, &[u8; SEAL_BYTES]),
+  identity: &Identity,
+  (alt_offset, len): (u64, u64),
+  (buffer, expected_tag): (&mut Vec<u8>, &mut Vec<u8>),
+) -> Result<(), StoreError> {
+  let section = read_alternate_head(file, end, (alt_offset, len))?;
+  let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
+  let check_blocks = section.len > piece_cap;
+  buffer.resize(PIECE_BYTES, 0);
+  let mut crc = section.crc_verifier();
+  let mut hasher = blake3::Hasher::new();
+  let mut done = 0u64;
+  let mut block_idx = 0u64;
+  while done < section.len {
+    let left = section.len.checked_sub(done).ok_or(StoreError::BadRow)?;
+    let step = usize::try_from(left.min(piece_cap)).map_err(|_| StoreError::BadRow)?;
+    let slice = buffer.get_mut(..step).ok_or(StoreError::BadRow)?;
+    let at = section.offset.checked_add(done).ok_or(StoreError::BadRow)?;
+    file.read_exact_at(slice, at).map_err(LogError::from)?;
+    crc.update(slice);
+    hasher.update(slice);
+    if check_blocks {
+      verify_alternate_block(
+        rows,
+        seal,
+        (section.offset, section.len),
+        (block_idx, slice),
+        expected_tag,
+      )?;
+    }
+    done = done
+      .checked_add(u64::try_from(step).map_err(|_| StoreError::BadRow)?)
+      .ok_or(StoreError::BadRow)?;
+    block_idx = block_idx.checked_add(1).ok_or(StoreError::BadRow)?;
+  }
+  crc.finish()?;
+  if *hasher.finalize().as_bytes() != *identity {
+    return Err(StoreError::Log(LogError::Corrupt("a payload's bytes")));
+  }
+  Ok(())
+}
+
+/// Decision for one candidate alternate `P` row during primary promotion.
+enum AlternateOutcome {
+  /// Verified healthy outside `exclude`: promote to primary `P`.
+  Promote,
+  /// Excluded or corrupt: delete this alternate `P` row and keep scanning.
+  Skip,
+}
+
+/// Evaluates one candidate alternate `P` row at `alt_offset`: skips excluded offsets and logs,
+/// cleans `B` rows of, and skips any corrupt alternate rather than promoting it to primary `P`.
+fn check_alternate_candidate<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  log_ctx: (&F, u64, &[u8; SEAL_BYTES]),
+  identity: &Identity,
+  (alt_offset, len): (u64, u64),
+  (exclude_start, exclude_end): (u64, u64),
+  buffers: (&mut Vec<u8>, &mut Vec<u8>),
+) -> Result<AlternateOutcome, StoreError> {
+  if (exclude_start..exclude_end).contains(&alt_offset) {
+    return Ok(AlternateOutcome::Skip);
+  }
+  match verify_alternate_payload(rows, log_ctx, identity, (alt_offset, len), buffers) {
+    Ok(()) => Ok(AlternateOutcome::Promote),
+    Err(StoreError::Log(LogError::Corrupt(what))) => {
+      slates_machine::log_line!(
+        "slates-store: forget skipped corrupt alternate payload offset={alt_offset} len={len} ({what})"
+      );
+      delete_block_digests(rows, alt_offset, len)?;
+      Ok(AlternateOutcome::Skip)
+    }
+    Err(error) => Err(error),
+  }
+}
+
+/// Deletes any alternate `P` row for `primary` inside `exclude` or failing log verification, and
+/// returns the first verified healthy alternate offset outside `exclude` (still present in `rows`
+/// until published) along with the number of skipped alternates deleted.
 fn find_surviving_alternate<F: BlockFile>(
   rows: &mut ShardDb<F>,
+  log_ctx: (&F, u64, &[u8; SEAL_BYTES]),
   primary: &[u8; CONTENT_KEY_BYTES],
-  (exclude_start, exclude_end): (u64, u64),
+  len: u64,
+  exclude: (u64, u64),
 ) -> Result<(Option<u64>, u64), StoreError> {
+  let identity: Identity = field(primary, AFTER_TAG).ok_or(StoreError::BadRow)?;
   // No committed section can start at u64::MAX because a record trailer follows it.
   let mut start = place_key(primary, 0);
   let end = place_key(primary, u64::MAX);
   let mut places = Rows::new();
   let mut next = Vec::new();
+  let mut buffer = Vec::new();
+  let mut expected_tag = Vec::with_capacity(IDENTITY);
   let mut deleted = 0_u64;
   loop {
     places.clear();
@@ -79,7 +228,15 @@ fn find_surviving_alternate<F: BlockFile>(
     let alt_offset = field(key, CONTENT_KEY_BYTES)
       .map(u64::from_be_bytes)
       .ok_or(StoreError::BadRow)?;
-    if !(exclude_start..exclude_end).contains(&alt_offset) {
+    let decision = check_alternate_candidate(
+      rows,
+      log_ctx,
+      &identity,
+      (alt_offset, len),
+      exclude,
+      (&mut buffer, &mut expected_tag),
+    )?;
+    if matches!(decision, AlternateOutcome::Promote) {
       return Ok((Some(alt_offset), deleted));
     }
     rows.delete(key)?;
@@ -91,16 +248,17 @@ fn find_surviving_alternate<F: BlockFile>(
   }
 }
 
-/// Promotes one remaining alternate place outside `exclude` to the primary `P` row (publishing the
-/// promoted primary before retiring its suffix key), or deletes the primary row when no surviving
-/// alternate remains outside `exclude`. Returns the number of `P` rows modified.
+/// Promotes one verified healthy alternate place outside `exclude` to the primary `P` row
+/// (publishing the promoted primary before retiring its suffix key), or deletes the primary row
+/// when no healthy alternate survives outside `exclude`. Returns the number of `P` rows modified.
 fn promote_or_delete_primary_excluding<F: BlockFile>(
   rows: &mut ShardDb<F>,
+  log_ctx: (&F, u64, &[u8; SEAL_BYTES]),
   primary: &[u8; CONTENT_KEY_BYTES],
   len: u64,
   exclude: (u64, u64),
 ) -> Result<u64, StoreError> {
-  let (survivor, deleted) = find_surviving_alternate(rows, primary, exclude)?;
+  let (survivor, deleted) = find_surviving_alternate(rows, log_ctx, primary, len, exclude)?;
   if let Some(next) = survivor {
     publish(rows, primary, next, len)?;
     rows.delete(&place_key(primary, next))?;
@@ -112,9 +270,41 @@ fn promote_or_delete_primary_excluding<F: BlockFile>(
 }
 
 /// Removes this occurrence and its per-block MAC `B` rows (when `len > PIECE_BYTES`). If it
-/// supplied the reads, publishes one remaining occurrence before retiring its suffix key. Retrying
-/// either deletion after a partial error preserves the same result.
-pub(super) fn forget<F: BlockFile>(
+/// supplied the reads, validates and publishes the first healthy remaining occurrence from `log`
+/// before retiring its suffix key (deleting any corrupt alternates and their `B` rows along the
+/// way). Retrying either deletion after a partial error preserves the same result.
+pub(super) fn forget_in_log<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  log_ctx: (&F, u64, &[u8; SEAL_BYTES]),
+  identity: &Identity,
+  offset: u64,
+  value: &mut Vec<u8>,
+) -> Result<u64, StoreError> {
+  let primary = content_key(identity);
+  if !rows.get(&primary, value)? {
+    return Ok(0);
+  }
+  let (current, len) = decode_content(value).ok_or(StoreError::BadRow)?;
+  let own = place_key(&primary, offset);
+  let alternate = rows.get(&own, value)?;
+  if alternate {
+    rows.delete(&own)?;
+  }
+  if current != offset {
+    if alternate {
+      delete_block_digests(rows, offset, len)?;
+    }
+    return Ok(u64::from(alternate));
+  }
+  let changed = promote_or_delete_primary_excluding(rows, log_ctx, &primary, len, (0, 0))?;
+  delete_block_digests(rows, offset, len)?;
+  Ok(changed.saturating_add(u64::from(alternate)))
+}
+
+/// Test-only adapter preserving `payloads/tests.rs`'s log-less call signature; production code
+/// exclusively calls [`forget_in_log`].
+#[cfg(test)]
+fn forget<F: BlockFile>(
   rows: &mut ShardDb<F>,
   identity: &Identity,
   offset: u64,
@@ -136,19 +326,35 @@ pub(super) fn forget<F: BlockFile>(
     }
     return Ok(u64::from(alternate));
   }
-  let changed = promote_or_delete_primary_excluding(rows, &primary, len, (0, 0))?;
+  let start = place_key(&primary, 0);
+  let end = place_key(&primary, u64::MAX);
+  let mut places = Rows::new();
+  rows.scan(&start, Some(&end), 1, &mut places, &mut Vec::new())?;
+  let changed = if let Some((key, _)) = places.get(0) {
+    let alt_offset = field(key, CONTENT_KEY_BYTES)
+      .map(u64::from_be_bytes)
+      .ok_or(StoreError::BadRow)?;
+    publish(rows, &primary, alt_offset, len)?;
+    rows.delete(key)?;
+    2_u64
+  } else {
+    rows.delete(&primary)?;
+    1_u64
+  };
   delete_block_digests(rows, offset, len)?;
   Ok(changed.saturating_add(u64::from(alternate)))
 }
 
 /// Removes one `CONTENTS` row whose offset falls in `[start_offset, end_offset)` (promoting a
-/// surviving duplicate outside that range when `key` is primary, or deleting an alternate suffix
-/// key) and returns the count of `P` rows modified.
+/// verified healthy duplicate outside that range when `key` is primary, or deleting a still-live
+/// alternate suffix key without double-counting rows already retired during promotion) and returns
+/// the count of `P` rows modified.
 fn forget_matching_content_row_in_range<F: BlockFile>(
   rows: &mut ShardDb<F>,
-  key: &[u8],
-  entry: &[u8],
+  log_ctx: (&F, u64, &[u8; SEAL_BYTES]),
+  (key, entry): (&[u8], &[u8]),
   (start_offset, end_offset): (u64, u64),
+  scratch: &mut Vec<u8>,
 ) -> Result<u64, StoreError> {
   if key.len() == CONTENT_KEY_BYTES {
     let (current, current_len) = decode_content(entry).ok_or(StoreError::BadRow)?;
@@ -156,6 +362,7 @@ fn forget_matching_content_row_in_range<F: BlockFile>(
       let primary: [u8; CONTENT_KEY_BYTES] = key.try_into().map_err(|_| StoreError::BadRow)?;
       return promote_or_delete_primary_excluding(
         rows,
+        log_ctx,
         &primary,
         current_len,
         (start_offset, end_offset),
@@ -165,7 +372,7 @@ fn forget_matching_content_row_in_range<F: BlockFile>(
     let alt_offset = field(key, CONTENT_KEY_BYTES)
       .map(u64::from_be_bytes)
       .ok_or(StoreError::BadRow)?;
-    if (start_offset..end_offset).contains(&alt_offset) {
+    if (start_offset..end_offset).contains(&alt_offset) && rows.get(key, scratch)? {
       rows.delete(key)?;
       return Ok(1_u64);
     }
@@ -203,10 +410,11 @@ fn delete_block_digests_in_range<F: BlockFile>(
 /// Fallback cleanup when a record or payload section on disk fails verification during
 /// `Store::forget` or `put_changeset_counted`: scans `CONTENTS` in bounded pages to delete every
 /// primary or alternate `P` row whose offset lies in `[start_offset, end_offset)` (promoting
-/// surviving duplicates outside that range), and deletes every `B` row in `[start_offset,
+/// verified healthy duplicates outside that range), and deletes every `B` row in `[start_offset,
 /// end_offset)` so neither `P` nor `B` rows leak or poison healthy siblings.
 pub(super) fn forget_by_offset_range<F: BlockFile>(
   rows: &mut ShardDb<F>,
+  log_ctx: (&F, u64, &[u8; SEAL_BYTES]),
   (start_offset, end_offset): (u64, u64),
   page_bytes: usize,
 ) -> Result<u64, StoreError> {
@@ -218,9 +426,15 @@ pub(super) fn forget_by_offset_range<F: BlockFile>(
     .unwrap_or(1)
     .max(1);
   let mut changed = 0_u64;
+  let mut scratch = Vec::new();
   scan_table(rows, CONTENTS, per_page, |rows, key, entry| {
-    let removed =
-      forget_matching_content_row_in_range(rows, key, entry, (start_offset, end_offset))?;
+    let removed = forget_matching_content_row_in_range(
+      rows,
+      log_ctx,
+      (key, entry),
+      (start_offset, end_offset),
+      &mut scratch,
+    )?;
     changed = changed.saturating_add(removed);
     Ok(())
   })?;
@@ -232,28 +446,16 @@ pub(super) fn forget_by_offset_range<F: BlockFile>(
 /// [`forget_by_offset_range`].
 pub(super) fn forget_by_offset<F: BlockFile>(
   rows: &mut ShardDb<F>,
+  log_ctx: (&F, u64, &[u8; SEAL_BYTES]),
   offset: u64,
   page_bytes: usize,
 ) -> Result<u64, StoreError> {
-  forget_by_offset_range(rows, (offset, offset.saturating_add(1)), page_bytes)
-}
-
-/// Visits only this record's payloads, verifying each section's CRC-32C alongside BLAKE3 through
-/// the same bounded buffer as log recovery.
-pub(super) fn visit<F: BlockFile>(
-  file: &F,
-  (end, seal): (u64, &[u8; SEAL_BYTES]),
-  row: &Changeset,
-  buffer: &mut Vec<u8>,
-  mut each: impl FnMut(&Identity, u64, u64) -> Result<(), StoreError>,
-) -> Result<(), StoreError> {
-  for section in sections_of(file, end, seal, row)? {
-    if section.kind == SectionKind::Payload {
-      let identity = verified_identity_of_section(file, &section, buffer)?;
-      each(&identity, section.offset, section.len)?;
-    }
-  }
-  Ok(())
+  forget_by_offset_range(
+    rows,
+    log_ctx,
+    (offset, offset.saturating_add(1)),
+    page_bytes,
+  )
 }
 
 /// Rebuilds the `P` and multi-piece `B` rows for one changeset row within `applied`, verifying
