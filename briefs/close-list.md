@@ -83,9 +83,10 @@ w-svn          C: DeltaV v1; svn onto the changeset store with w-store (your sto
     (P: deepen's 217 s, read_objects)
 93 hg   w-hg (list B); w-sizing (R: 7.1 GB resident, extents made on demand; g226's give-back numbers feed it);
     w-perf (R: the import's 5.73 GB peak)
-93 svn  w-svn (list B); w-perf (P: deltify job); w-interop (C: HTTP v2 rows)
+93 svn  w-svn (list B); w-perf (P: deltify job); w-interop (C: HTTP v2 rows, CLOSED r7 + bdf99f92d)
 93 interop  w-reaper (C: the issuer route's EINTR fix, then A-645 (a) svn's revprop rows); w-interop (C: HTTP v2
-    rows, the Linux counts, svn on Windows on Ada's go; R: r110's rerun); w-sizing + w-hg + w-store (R: peak RSS 145x);
+    rows CLOSED r7 + bdf99f92d, the Linux counts CLOSED a00650fe2 (GAPS: git 27/27, svn 33/33, hg 24/24), svn on
+    Windows on Ada's go; R: r110's rerun, main's); w-sizing + w-hg + w-store (R: peak RSS 145x);
     w-hg (P: clone-b); w-svn (P: svnsync)
 93 perf an order of magnitude faster than competing servers, measured and recorded: w-interop, after its items (each
     server's client operations against git daemon/http-backend, hg serve, svnserve/mod_dav_svn; release, best of N)
