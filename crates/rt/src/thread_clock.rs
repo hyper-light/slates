@@ -319,6 +319,31 @@ fn system_snapshot() -> Option<Vec<u8>> {
   None
 }
 
+/// The calling thread's user and system CPU time so far, nanoseconds, kept apart (macOS: `THREAD_BASIC_INFO`'s
+/// `user_time` and `system_time`): what splits a long unit's CPU into the kernel's work and the thread's own (A-920).
+#[cfg(all(target_os = "macos", not(miri)))]
+pub(crate) fn user_system_ns() -> Option<(u64, u64)> {
+  /// Format: nanoseconds per microsecond (`time_value_t` counts seconds and microseconds).
+  const NS_PER_MICRO: u64 = 1_000;
+  /// Format: microseconds per second.
+  const MICROS_PER_SECOND: u64 = 1_000_000;
+  let info = basic_info(current()?)?;
+  let nanos = |time: libc::time_value_t| {
+    u64::try_from(time.seconds)
+      .ok()?
+      .checked_mul(MICROS_PER_SECOND)?
+      .checked_add(u64::try_from(time.microseconds).ok()?)?
+      .checked_mul(NS_PER_MICRO)
+  };
+  Some((nanos(info.user_time)?, nanos(info.system_time)?))
+}
+
+/// No split read here: Linux, Windows and Miri keep no per-thread user and system time this reads.
+#[cfg(any(not(target_os = "macos"), miri))]
+pub(crate) fn user_system_ns() -> Option<(u64, u64)> {
+  None
+}
+
 /// No run state read here, as no clock is.
 #[cfg(any(not(any(target_os = "linux", target_os = "macos", windows)), miri))]
 pub(crate) fn run_readings(handles: &[u64]) -> Vec<Option<RunReading>> {

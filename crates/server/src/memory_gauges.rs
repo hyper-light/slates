@@ -20,6 +20,9 @@
 //!   regions' pages in RAM (`ChunkArena::residency`). Beside them the counter `content.purge_kept_short_bytes`: free
 //!   runs a purge left resident for being shorter than the discard size. A content object resident past what the arena
 //!   holds is told apart by them: frees not yet purged (an idle pass not yet run), short runs kept, or frees deferred.
+//! - `store.text_cache_*`: the store owner's text cache as the owner took this shard's last read of it, its chunks'
+//!   reserved bytes, its bound, and the walks in flight that hold the bound up with their texts' bytes
+//!   (`slates_store::owner::text_cache_seen`): a read left part-way is a walk until it ends or more walks evict it.
 //! - `process.*` (the control shard alone, the process's figures once): the system allocator's live bytes and the bytes
 //!   it ever allocated (its churn), and the
 //!   mapped blocks live and their resident bytes (`slates_mem::large::heap`). A resident set past the live bytes and
@@ -29,6 +32,15 @@
 //!   `fsmblks` already among them, so not added again), measuring that kept memory where elsewhere it is the remainder;
 //!   `malloc_mapped_bytes`, its blocks mapped each on its own (`hblkhd`); `malloc_arena_bytes`, what its arenas hold from
 //!   the OS (`arena`).
+//!
+//!   And the process's resident size, `process.resident_bytes`, with on macOS its physical footprint beside it,
+//!   `process.footprint_bytes` (goal 93 P7, main's ruling of 2026-11-25; `Facts::footprint_now`). On macOS a purge's
+//!   discard marks pages reusable (A-110): they leave the footprint at once and stay in the resident size until the
+//!   kernel takes them (`slates-mem`'s `tests/macos_residency.rs`: 32 MiB given back, footprint 33 MiB to 1, resident
+//!   size 38 flat), so a give-back there is judged by the footprint, never by the resident size. On Linux the resident
+//!   size is honest: the content object's discard is `MADV_REMOVE`, which punches a hole in the shared object, so its
+//!   pages leave at once (`a_deleted_files_memory_goes_back_to_the_os` in `tests/recovery.rs`: the object's allocated
+//!   bytes fall by the deleted file's); there is no footprint row.
 
 use crate::state::ShardState;
 use slates_ipc::protocol::RefusalCount;
@@ -42,6 +54,7 @@ pub(crate) fn rows(state: &ShardState, memory: bool) -> Vec<RefusalCount> {
   rows.extend(green_rows(state));
   rows.extend(held_rows(state));
   rows.extend(content_rows(state));
+  rows.extend(text_cache_rows());
   if crate::verbs::is_control_shard(state) {
     let heap = slates_mem::large::heap();
     rows.extend([
@@ -56,6 +69,14 @@ pub(crate) fn rows(state: &ShardState, memory: bool) -> Vec<RefusalCount> {
         heap.mapped_resident,
       ),
       ("mem.gauge.process.mapped_untracked", heap.untracked),
+      (
+        "mem.gauge.process.resident_bytes",
+        slates_machine::facts::Facts::resident_now().unwrap_or(0),
+      ),
+      (
+        "mem.gauge.process.footprint_bytes",
+        slates_machine::facts::Facts::footprint_now().unwrap_or(0),
+      ),
     ]);
     #[cfg(all(target_os = "linux", target_env = "gnu", not(miri)))]
     {
@@ -75,6 +96,19 @@ pub(crate) fn rows(state: &ShardState, memory: bool) -> Vec<RefusalCount> {
       count,
     })
     .collect()
+}
+
+/// The store owner's text cache as the owner took this shard's last read of it (`slates_store::owner::text_cache_seen`):
+/// its chunks' reserved bytes, its bound, and the walks in flight that hold the bound up, with their texts' bytes (goal
+/// 93, main's ruling of 2026-11-25: after hg's 57k push the cache's chunks held 32 MB live and nothing said why).
+fn text_cache_rows() -> [(&'static str, u64); 4] {
+  let seen = slates_store::owner::text_cache_seen();
+  [
+    ("mem.gauge.store.text_cache_reserved_bytes", seen.reserved),
+    ("mem.gauge.store.text_cache_bound_bytes", seen.bound),
+    ("mem.gauge.store.text_cache_walks", seen.walks),
+    ("mem.gauge.store.text_cache_walk_bytes", seen.walk_bytes),
+  ]
 }
 
 /// The shard's chunk arena over the content object (main 01a20182's ruling of 2026-11-23: arena-12 found the content
@@ -456,6 +490,31 @@ mod tests {
       );
     } else {
       assert!(malloc.is_empty(), "{malloc:?}");
+    }
+  }
+
+  /// The memory status's `process.resident_bytes` and `process.footprint_bytes` (goal 93 P7, main's ruling of
+  /// 2026-11-25). Do: read the control shard's gauges. Expect the process's resident size on every OS, and on macOS its
+  /// physical footprint beside it, the one reading a purge's reusable pages leave at once
+  /// (`crates/mem/tests/macos_residency.rs`); elsewhere no footprint row (the resident size is the honest reading there).
+  #[test]
+  fn the_control_shards_memory_status_names_the_processs_resident_and_on_macos_its_footprint() {
+    let rows = crate::daemon::audit_on_shard(|state| super::rows(state, true));
+    let reading = |kind: &str| {
+      rows
+        .iter()
+        .find(|row| row.kind == kind)
+        .map(|row| row.count)
+    };
+    assert!(
+      reading("mem.gauge.process.resident_bytes").is_some_and(|bytes| bytes > 0),
+      "{rows:?}"
+    );
+    let footprint = reading("mem.gauge.process.footprint_bytes");
+    if cfg!(target_os = "macos") {
+      assert!(footprint.is_some_and(|bytes| bytes > 0), "{rows:?}");
+    } else {
+      assert!(footprint.is_none(), "{rows:?}");
     }
   }
 }

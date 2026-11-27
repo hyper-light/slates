@@ -106,8 +106,9 @@ pub trait Repository {
     self.object(id).is_some()
   }
 
-  /// Where in its pack the last object asked was not read because it lies in a window let go (A-864's push readers,
-  /// [`crate::unpack::Outside::away`]). None by default.
+  /// The let-go, by the content store's number for it (`ContentStore::away_number`), of the window the last object
+  /// asked was not read from (A-864's push readers, [`crate::unpack::Outside::away`]; [`crate::away`]). None by
+  /// default.
   fn away(&self) -> Option<u64> {
     None
   }
@@ -311,6 +312,12 @@ impl<'a> Pushed<'a> {
     self.contents?.content(at, &placed.id)
   }
 
+  /// The let-go, by the store's number for it, of the window the last read of these objects to answer none met, if one
+  /// did ([`Contents::content_away`]): what a reader of them stops for ([`crate::away`]).
+  pub fn away(&self) -> Option<u64> {
+    self.contents?.content_away()
+  }
+
   /// The position in pack order of the object named `id`, if the pack brought it.
   pub fn position(&self, id: &ObjectId) -> Option<usize> {
     self
@@ -389,6 +396,10 @@ impl<S: Repository + ?Sized> Outside for Thin<'_, S> {
 impl<S: Contents + ?Sized> Contents for Thin<'_, S> {
   fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
     self.0.content(at, id)
+  }
+
+  fn content_away(&self) -> Option<u64> {
+    self.0.content_away()
   }
 }
 

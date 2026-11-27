@@ -288,3 +288,8 @@ fn unlinked_file_kept(root: &Path, mut file: std::fs::File) {
   drop(file);
   assert_eq!(silly(root), Vec::<String>::new(), "none after the close");
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

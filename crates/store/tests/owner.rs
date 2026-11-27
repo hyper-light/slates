@@ -53,6 +53,13 @@ fn start_spinning(dir: &Path, spin_cap_ns: u64) -> StoreOwner {
 
 /// Shape: one shard, a few tasks.
 fn runtime() -> LocalRuntime {
+  runtime_spinning(0)
+}
+
+/// [`runtime`], its shard spinning `spin_ns` for work before it parks, as a daemon's shard does while a client is active:
+/// an asker that parks on every answer takes a wake of its own between its asks, as long as the owner's, so its asks
+/// are never back to back.
+fn runtime_spinning(spin_ns: u64) -> LocalRuntime {
   LocalRuntime::new(&RuntimeConfig {
     shards: 1,
     tasks_per_shard: 8,
@@ -64,7 +71,7 @@ fn runtime() -> LocalRuntime {
     pin: false,
     cores: Vec::new(),
     page_bytes: 4096,
-    spin_ns: 0,
+    spin_ns,
     wake_tracking: None,
   })
   .unwrap()
@@ -677,38 +684,45 @@ fn a_reads_wait_on_the_owner_is_split_into_parts_that_sum_to_it() {
   assert_eq!(left.asks, 0, "none left after the take");
 }
 
-/// Shape: the owner's spin cap in [`back_to_back_reads_are_met_spinning_not_parked`], 2 ms: past this machine's wake
-/// (the 57k clone measured 178 us a request), so a gap between asks a task makes back to back fits inside it.
+/// Shape: the wake the spin tests seed their owners with, 2 ms: past every wake this machine measures, so back to back
+/// every gap is within it, and an owner that spun to its seed apart would spin on every wait there.
 const SPIN_CAP_NS: u64 = 2_000_000;
 
-/// Shape: the reads of [`back_to_back_reads_are_met_spinning_not_parked`], each one place of a landed payload.
+/// Shape: the reads of [`back_to_back_reads_are_met_and_their_waits_sum`], each one place of a landed payload.
 const BACK_TO_BACK: u64 = 64;
 
-/// Shape: three in four of those reads, met parked by the owner that never spins (some are queued behind a read, met
-/// neither way: 2 of 64 here). The spinning owner is held to more met spinning than parked, not to a share: on a loaded
-/// machine its asker's thread is descheduled past the window (46 of 64 met spinning at the MacBook's load beside a
-/// build, 61 alone).
-const SPUN_AT_LEAST: u64 = BACK_TO_BACK * 3 / 4;
-
-/// `BACK_TO_BACK` reads asked back to back of a payload landed through an owner spinning at most `spin_cap_ns`: the
-/// thread's read waits.
-fn reads_back_to_back(name: &str, spin_cap_ns: u64) -> slates_store::owner::AskWaits {
+/// [`BACK_TO_BACK`]-sized reads of a landed payload, one place each, asked `apart` after the last answer, through an
+/// owner whose wake is seeded at `wake_seed_ns`: what they waited on.
+fn reads_apart(
+  name: &str,
+  wake_seed_ns: u64,
+  (count, apart): (u64, std::time::Duration),
+) -> slates_store::owner::AskWaits {
   let dir = scratch(name);
   let payload: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
   let identity = *blake3::hash(&payload).as_bytes();
-  let owner = start_spinning(&dir, spin_cap_ns);
+  let owner = start_spinning(&dir, wake_seed_ns);
   let handle = owner.handle();
-  let waits = runtime()
+  let waits = runtime_spinning(SPIN_CAP_NS)
     .block_on(async move {
       handle
         .land(header(1), vec![(SectionKind::Payload, payload)])
         .await
         .unwrap();
-      let _ = slates_store::owner::take_read_waits();
-      for at in 0..BACK_TO_BACK {
+      // One read first, apart as the rest, so the owner has learned their gap (not its start's, before the landing)
+      // when the counted reads begin.
+      for at in 0..=count {
+        if at == 1 {
+          let _ = slates_store::owner::take_read_waits();
+        }
+        if !apart.is_zero() {
+          // The asker idle between its asks, as a fetch whose shard serves others between turns.
+          #[allow(clippy::disallowed_methods, reason = "a test spacing its asks")]
+          std::thread::sleep(apart);
+        }
         let place = slates_store::texts::Place {
           payload: identity,
-          offset: at * 1_024,
+          offset: (at % 64) * 1_024,
           len: 1_024,
         };
         handle.places(vec![place]).await.unwrap();
@@ -721,32 +735,42 @@ fn reads_back_to_back(name: &str, spin_cap_ns: u64) -> slates_store::owner::AskW
   waits
 }
 
-/// Goal 93, main's ruling of 2026-11-25 (the 57k clone's store wait 86.6% the owner's wake, 144.82 s over 812,896
-/// requests, about 178 us each). Do: read a landed payload by [`BACK_TO_BACK`] places asked one after another, through an
-/// owner that never spins, then through one that spins at most [`SPIN_CAP_NS`]. Expect: with no spin every read met
-/// parked (the red: a wake a request, at least [`SPUN_AT_LEAST`]); with the spin, more met spinning than parked (the
-/// window is learned from the gaps), and the owner's wake a read within the spin's window, the parts still summing to
-/// the whole.
+/// Goal 93, main's order of 2026-11-25 (the 57k clone's store wait split into its parts). Do: read a landed payload by
+/// [`BACK_TO_BACK`] places asked one after another, through an owner whose wake is seeded at [`SPIN_CAP_NS`], its asker
+/// spinning as a shard does. Expect: every read answered and counted, the parts summing to the whole. Whether a read is met spinning follows the machine (a descheduled asker is a long gap,
+/// which parks by the rule), so the decision itself is held over fixed histories in `owner/tests.rs`; here it spun 64
+/// of 64 on the MacBook at load 30 in five runs of eight, and parked the rest.
 #[test]
-fn back_to_back_reads_are_met_spinning_not_parked() {
-  let parked = reads_back_to_back("spin-none", 0);
-  assert_eq!(parked.asks, BACK_TO_BACK);
-  assert_eq!(parked.spin_hits, 0, "no spin, no read met spinning");
-  assert!(
-    parked.parks >= SPUN_AT_LEAST,
-    "no spin: a wake a read, but those queued behind one: {parked:?}"
+fn back_to_back_reads_are_met_and_their_waits_sum() {
+  let met = reads_apart(
+    "spin-back-to-back",
+    SPIN_CAP_NS,
+    (BACK_TO_BACK, std::time::Duration::ZERO),
   );
-  let spun = reads_back_to_back("spin-cap", SPIN_CAP_NS);
-  assert_eq!(spun.asks, BACK_TO_BACK);
-  assert!(
-    spun.spin_hits > spun.parks,
-    "more reads met spinning than parked: {spun:?}"
+  assert_eq!(met.asks, BACK_TO_BACK);
+  let parts = met.behind_ns + met.wake_ns + met.serve_ns + met.disk_ns + met.back_ns;
+  assert_eq!(parts, met.total_ns);
+  println!("owner spin, back to back: {met:?}");
+}
+
+/// Shape: the reads of [`reads_further_apart_than_a_wake_park_at_once`] and the time between them: 20 ms, past any wake
+/// this machine has measured (1.36 ms under load 24 on the Studio), yet ten times [`SPIN_CAP_NS`], the seed.
+const APART: (u64, std::time::Duration) = (16, std::time::Duration::from_millis(20));
+
+/// Main's ruling of 2026-11-25 on the 57k split at 7a9cb385e (asks 12.7 ms apart, a wake 1.36 ms: a spin to a cap misses
+/// nearly every time and burns the owner's CPU). Do: read [`APART`]'s count of places, each asked its time after the
+/// last answer, through an owner seeded with a wake of [`SPIN_CAP_NS`]. Expect: every read met parked, none spinning, no
+/// time spun: the gap predicted past a wake parks at once. Red before: the spin was the predicted gap capped at the seed,
+/// 2 ms a wait spun for nothing.
+#[test]
+fn reads_further_apart_than_a_wake_park_at_once() {
+  let parked = reads_apart("spin-apart", SPIN_CAP_NS, APART);
+  assert_eq!(parked.asks, APART.0);
+  assert_eq!(
+    (parked.spin_hits, parked.spin_ns),
+    (0, 0),
+    "no read met spinning, no time spun: {parked:?}"
   );
-  assert!(
-    spun.wake_ns / BACK_TO_BACK <= SPIN_CAP_NS,
-    "the wake within the window: {spun:?}"
-  );
-  let parts = spun.behind_ns + spun.wake_ns + spun.serve_ns + spun.disk_ns + spun.back_ns;
-  assert_eq!(parts, spun.total_ns);
-  println!("owner spin: none {parked:?}; capped {spun:?}");
+  assert_eq!(parked.parks, APART.0, "every read met parked: {parked:?}");
+  println!("owner spin, apart: {parked:?}");
 }

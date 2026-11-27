@@ -722,3 +722,8 @@ fn patient_and_plain(
   let _ = client.destroy(impatient_volume);
   Some((impatient_at, impatient_end, patient_at, patient_end))
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

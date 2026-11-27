@@ -72,8 +72,10 @@
 //! default branch is unborn, a create's push is over an empty green, made from the default branch's green, which must be
 //! empty at its version 0: the default branch itself owes the push as its next version (`BranchChange::UpdateDeferred`),
 //! any other ref is a new branch made at that empty version. A default branch that holds files no git commit names
-//! refuses it, typed: its commit is A-664's. A command reaches greens only through the door: one that owes its push is
-//! made first, the command waiting a turn at a time.
+//! refuses it, typed: its commit is A-664's. One whose green this node has not recovered (`ShardState::unrecovered`)
+//! refuses it naming the green and its cause, and one whose green or store is not made here yet (an adoption still
+//! materializing it) refuses it naming the green, to retry (A-927 part 1): neither is said to hold files. A command
+//! reaches greens only through the door: one that owes its push is made first, the command waiting a turn at a time.
 //!
 //! **A push's name** (A-618: two submits of one push carry one name, and every work's identity begins with it) is
 //! hashed from its repository and its commands, so a push sent again makes the same works, and A-635 answers each the
@@ -235,6 +237,8 @@ pub(crate) enum Unlanded {
   LandingUntaken,
   /// The node's changeset store refused the changeset (busy, gone, or its write failed).
   StoreRefused,
+  /// The shard's pushes in flight and the settles it owes the region were at their bound (`homes::settle_bound`).
+  AttemptsAtBound,
 }
 
 /// One git push over one connection, on its repository's owner shard (module docs), its hooks'
@@ -281,6 +285,10 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   /// ([`ReceivePack::refused_report`]), since the request itself moves on through the answer. None under side-band,
   /// whose refusal is band 3's words alone.
   refusal_names: Option<Vec<Vec<u8>>>,
+  /// The let-go window its last step's readers met, noted in its own slot for its driver alone to bring back
+  /// ([`ReceivePack::take_waited`]; B1's second cause under load, main's lines of agents/w-git-b1-debug: on the
+  /// repository's one slot, a derivation's turn cleared the note before the push's driver looked).
+  waits: slates_git::away::Waits,
 }
 
 /// Counter: a member green checkpointed in a push's turn before its append, making the chains room for the append's
@@ -407,8 +415,13 @@ enum Homing {
   Waiting((slates_vcs::ContentId, u64)),
   /// The names homed, their rows given back for the landing: the pack is asked next.
   PackDue(Vec<u8>),
-  /// Asked: the pack's bytes, for the edge to take, its identity and length (held for the record), and the names' rows.
-  PackAsked(Vec<u8>, (slates_vcs::ContentId, u64), Vec<u8>),
+  /// Asked: the pack, held whole in the content store it was put in as it arrived (b2a: its bytes read only where a
+  /// home needs them), for the edge to take, its identity and length (held for the record), and the names' rows.
+  PackAsked(
+    crate::vcs_store::homes::HomeSource,
+    (slates_vcs::ContentId, u64),
+    Vec<u8>,
+  ),
   /// The pack taken by the edge, its outcome awaited, with the names' rows.
   PackWaiting((slates_vcs::ContentId, u64), Vec<u8>),
   /// Both homed: the changeset to ask of the edge at the decision's next turn.
@@ -423,16 +436,19 @@ enum Homing {
   Done,
 }
 
-/// A push's changeset as the edge lands it on the node's changeset store (A-767 C5): the store's handle, the header, and
-/// the sections, their bytes moved in.
+/// A push's changeset as the edge lands it on the node's changeset store (A-767 C5), a piece at a time through the
+/// store's sliced landing ([`landed_in_pieces`], b2b): the store's handle, the header, its names' rows, and its pack by
+/// the identity and length the origin's content store holds it under, read from there a piece at a time as it lands.
 #[derive(Debug)]
 pub(crate) struct Landing {
   /// The node's store.
   disk: slates_store::owner::StoreHandle,
   /// The changeset's header: the repository, its sequence.
   header: slates_store::log::Header,
-  /// Its `Names` and its `Payload`.
-  parts: Vec<slates_store::owner::Part>,
+  /// Its `Names` section's bytes.
+  names: Vec<u8>,
+  /// Its `Payload`: the push's pack in the origin shard's content store.
+  pack: (slates_vcs::ContentId, u64),
 }
 
 impl Landing {
@@ -445,8 +461,12 @@ impl Landing {
 /// What a push asks its edge to carry off the shard's step ([`ReceivePack::take_homing`]).
 #[derive(Debug)]
 pub(crate) enum Carry {
-  /// Content to home in the region (its names, then its pack), held there for the push's attempt (A-727 (d1a)).
-  Home(Vec<u8>, slates_cluster::homes::HomeOwner),
+  /// Content to home in the region (its names' bytes, then its pack held whole where it was put), held there for the
+  /// push's attempt (A-727 (d1a)).
+  Home(
+    crate::vcs_store::homes::HomeSource,
+    slates_cluster::homes::HomeOwner,
+  ),
   /// Its changeset to land on the node's store.
   Land(Box<Landing>),
 }
@@ -465,24 +485,72 @@ pub(crate) enum Carried {
 /// way every edge (HTTP, SSH, the tests' driver) runs a push's homing.
 pub(crate) async fn carry(origin: u16, shards: &[u16], carry: Carry) -> Carried {
   match carry {
-    Carry::Home(bytes, owner) => Carried::Homed(
+    Carry::Home(source, owner) => Carried::Homed(
       crate::vcs_store::homes::home_in_region(
         origin,
         shards,
-        (bytes, owner),
+        (source, owner),
         crate::fleet::homing_budget(),
       )
       .await,
     ),
-    Carry::Land(landing) => {
-      let Landing {
-        disk,
-        header,
-        parts,
-      } = *landing;
-      Carried::Landed(disk.land(header, parts).await)
-    }
+    Carry::Land(landing) => Carried::Landed(landed_in_pieces(*landing).await),
   }
+}
+
+/// Lands `landing` through the store's sliced landing (b2b, main's order of 2026-11-26): its `Names` and then its
+/// `Payload` a piece at a time (`slates_store::store::PIECE_BYTES`), the pack's pieces read from the origin shard's
+/// content store, where it was put as it arrived, into one buffer each part hands back; then committed, answered once
+/// durable. The landing holds one piece of the pack, never the pack (counted [`LAND_BUFFER_MOST`]). Cut off between
+/// two pieces (dropped, or refused), the store abandons it: nothing of it is visible. A piece the content store no
+/// longer holds refuses it (`StoreError::NotStaged`).
+async fn landed_in_pieces(
+  landing: Landing,
+) -> Result<slates_store::log::Located, slates_store::owner::OwnerError> {
+  use slates_store::log::SectionKind;
+  use slates_store::store::PIECE_BYTES;
+  let Landing {
+    disk,
+    mut header,
+    names,
+    pack: (identity, len),
+  } = landing;
+  header.sections = 2;
+  let mut open = disk.begin(header).await?;
+  let to_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+  open
+    .section(SectionKind::Names, to_u64(names.len()))
+    .await?;
+  let mut buffer = Vec::with_capacity(PIECE_BYTES);
+  for piece in names.chunks(PIECE_BYTES) {
+    buffer.clear();
+    buffer.extend_from_slice(piece);
+    buffer = open.part(buffer).await?;
+  }
+  open.section(SectionKind::Payload, len).await?;
+  let mut at = 0u64;
+  while at < len {
+    buffer.clear();
+    let filled = crate::state::with_state(|state| {
+      crate::vcs_store::homes::held_piece_into(
+        state,
+        (identity, len, at),
+        (PIECE_BYTES, &mut buffer),
+      )
+    })
+    .unwrap_or(false);
+    if !filled || buffer.is_empty() {
+      return Err(slates_store::owner::OwnerError::Store(
+        slates_store::store::StoreError::NotStaged,
+      ));
+    }
+    at = at.saturating_add(to_u64(buffer.len()));
+    let _ = crate::state::with_state(|state| {
+      state.count_max(LAND_BUFFER_MOST, to_u64(buffer.capacity()));
+    });
+    buffer = open.part(buffer).await?;
+  }
+  open.commit().await
 }
 
 /// Where a push's answer stands between its steps.
@@ -510,6 +578,12 @@ impl<P> ReceivePack<P> {
   /// The repository pushed to.
   pub(crate) fn repository(&self) -> RepositoryId {
     self.repository
+  }
+
+  /// The let-go window the push's last step met, taken: what its driver brings back before the next step
+  /// (`vcs_store::upload::brought_back_own`). None where the step met none.
+  pub(crate) fn take_waited(&self) -> Option<slates_git::store::packed::Waited> {
+    self.waits.take()
   }
 
   /// Whether the client asked its answer multiplexed (`side-band-64k`), once its request is read: kept after the session
@@ -583,6 +657,7 @@ impl<P> ReceivePack<P> {
       quarantine: GitPush::begin(&state.vcs_stores, repository),
       unadmitted: None,
       refusal_names: None,
+      waits: slates_git::away::Waits::default(),
       #[cfg(unix)]
       presenter,
       #[cfg(not(unix))]
@@ -724,6 +799,7 @@ impl<P> ReceivePack<P> {
       session,
       admission,
       quarantine,
+      waits,
       ..
     } = self;
     let (called, queue) = with_room(state, |state| {
@@ -732,12 +808,12 @@ impl<P> ReceivePack<P> {
         .git_ref(*repository)
         .ok_or(PushFailed::NoStore)?;
       let mut site = intake::Intake {
-        indexed: IndexedObjects::new(&git.repository, content, admission.left()),
-        quarantined: intake::Quarantined {
-          push: quarantine.as_ref().map(GitPush::quarantine),
-          store: content,
-          repository: &git.repository,
-        },
+        indexed: IndexedObjects::new(&git.repository, content, admission.left()).noting(waits),
+        quarantined: intake::Quarantined::new(
+          quarantine.as_ref().map(GitPush::quarantine),
+          content,
+          (&git.repository, Some(waits)),
+        ),
         queue: BTreeMap::new(),
       };
       let called = call(session, &mut site, admission);
@@ -745,8 +821,16 @@ impl<P> ReceivePack<P> {
     })?;
     match (quarantine.as_mut(), self.unadmitted.is_some()) {
       (Some(quarantine), false) => {
-        quarantine.keep_pack_to(session.pack_len(), input);
-        if let Err(refused) = intake::admit_queued(state, quarantine, queue, admission) {
+        let admitted = match quarantine.keep_pack_to(state, session.pack_len(), input) {
+          Ok(()) => intake::admit_queued(state, quarantine, queue, admission),
+          Err(refused) => {
+            for (_, hold) in queue.into_values() {
+              admission.release(hold);
+            }
+            Err(refused)
+          }
+        };
+        if let Err(refused) = admitted {
           self.unadmitted = Some(refused);
         }
       }
@@ -788,6 +872,7 @@ impl<P> ReceivePack<P> {
       session,
       admission,
       quarantine,
+      waits,
       ..
     } = self;
     with_room(state, |state| {
@@ -795,12 +880,12 @@ impl<P> ReceivePack<P> {
         .vcs_stores
         .git_ref(*repository)
         .ok_or(PushFailed::NoStore)?;
-      let indexed = IndexedObjects::new(&git.repository, content, admission.left());
-      let quarantined = intake::Quarantined {
-        push: quarantine.as_ref().map(GitPush::quarantine),
-        store: content,
-        repository: &git.repository,
-      };
+      let indexed = IndexedObjects::new(&git.repository, content, admission.left()).noting(waits);
+      let quarantined = intake::Quarantined::new(
+        quarantine.as_ref().map(GitPush::quarantine),
+        content,
+        (&git.repository, Some(waits)),
+      );
       let mut clock = ShardClock;
       let quantum = Quantum {
         clock: &mut clock,
@@ -970,6 +1055,7 @@ impl<P> ReceivePack<P> {
         peel_away,
         making_room,
         door,
+        waits: &self.waits,
       };
       deciding
         .step(None, &mut judge, &mut self.admission)
@@ -1012,8 +1098,12 @@ impl<P> ReceivePack<P> {
         let Some(identity) = crate::vcs_store::put_names(state, &bytes) else {
           return Err(PushFailed::Unlanded(Unlanded::NamesNotPut));
         };
-        // The attempt its holds in the region are for until its record commits (A-727 (d1a)).
-        let _ = decision.sealed.home_owner(state);
+        // The attempt its holds in the region are for until its record commits (A-727 (d1a)); refused where the shard's
+        // attempts and settles owed are at their bound, before anything is homed.
+        if decision.sealed.home_owner(state).is_err() {
+          crate::vcs_store::release_names(state, &identity);
+          return Err(PushFailed::Unlanded(Unlanded::AttemptsAtBound));
+        }
         decision.homing = Homing::Asked(bytes, (identity, count));
         Ok(false)
       }
@@ -1029,8 +1119,8 @@ impl<P> ReceivePack<P> {
       // The pack the staging put in the store, held once more for the record (A-722's record v4), and asked of the edge;
       // a push whose pack is not held is refused (C5 part 2b).
       Homing::PackDue(names) => match decision.sealed.pack_to_home() {
-        Some((bytes, packed)) if crate::vcs_store::hold_for_record(state, &packed.0) => {
-          decision.homing = Homing::PackAsked(bytes, packed, names);
+        Some((source, packed)) if crate::vcs_store::hold_for_record(state, &packed.0) => {
+          decision.homing = Homing::PackAsked(source, packed, names);
           Ok(false)
         }
         _ => {
@@ -1070,12 +1160,15 @@ impl<P> ReceivePack<P> {
       Homing::Asked(bytes, named) => {
         let owner = decision.sealed.owner_now()?;
         decision.homing = Homing::Waiting(named);
-        Some(Carry::Home(bytes, owner))
+        Some(Carry::Home(
+          crate::vcs_store::homes::HomeSource::Bytes(bytes),
+          owner,
+        ))
       }
-      Homing::PackAsked(bytes, packed, names) => {
+      Homing::PackAsked(source, packed, names) => {
         let owner = decision.sealed.owner_now()?;
         decision.homing = Homing::PackWaiting(packed, names);
-        Some(Carry::Home(bytes, owner))
+        Some(Carry::Home(source, owner))
       }
       Homing::LandAsked(landing) => {
         decision.homing = Homing::LandWaiting(landing.header.sequence);
@@ -1120,7 +1213,7 @@ impl<P> ReceivePack<P> {
           return;
         }
         decision.sealed.pack_homed_as((identity, len));
-        decision.homing = match landing_of(state, repository, (names, homed.bytes)) {
+        decision.homing = match landing_of(state, repository, (names, (identity, len))) {
           Some(landing) => Homing::LandDue(Box::new(landing)),
           None => Homing::Unlanded(Unlanded::NoLanding),
         };
@@ -1170,14 +1263,19 @@ pub(crate) const PUSH_LANDED: &str = "git_push.landed";
 /// Format: a counter name.
 pub(crate) const PUSH_UNLANDED: &str = "git_push.unlanded";
 
-/// Repository `repository`'s push's changeset as the edge lands it (A-767 C5): `Names` the names' rows and `Payload` the
-/// pack, both the bytes their homing gave back, moved in; its sequence the repository's next, taken now so two pushes
-/// landing side by side never share one. None where the daemon holds no store, or the repository no store here. A git
-/// commit the server makes lands the same way (`vcs_store::commits::make_deferred`, C5 2b piece 3).
+/// Counted most: the most bytes of a pack one landing held in a buffer of its own: its `Payload`'s one reused piece
+/// buffer ([`landed_in_pieces`], b2b), at most `slates_store::store::PIECE_BYTES`. Format: a counter name.
+pub(crate) const LAND_BUFFER_MOST: &str = "git_push.land_buffer_most";
+
+/// Repository `repository`'s push's changeset as the edge lands it (A-767 C5): `Names` the names' rows their homing
+/// gave back, and `Payload` the pack `packed` names in the origin's content store, read a piece at a time as it lands
+/// ([`landed_in_pieces`]); its sequence the repository's next, taken now so two pushes landing side by side never share
+/// one. None where the daemon holds no store, or the repository no store here. A git commit the server makes lands the
+/// same way (`vcs_store::commits::make_deferred`, C5 2b piece 3).
 pub(crate) fn landing_of(
   state: &mut ShardState,
   repository: RepositoryId,
-  (names, pack): (Vec<u8>, Vec<u8>),
+  (names, pack): (Vec<u8>, (slates_vcs::ContentId, u64)),
 ) -> Option<Landing> {
   let disk = state.vcs_disk.clone()?;
   let sequence = state.vcs_stores.next_changeset(repository)?;
@@ -1194,10 +1292,8 @@ pub(crate) fn landing_of(
   Some(Landing {
     disk,
     header,
-    parts: vec![
-      (slates_store::log::SectionKind::Names, names),
-      (slates_store::log::SectionKind::Payload, pack),
-    ],
+    names,
+    pack,
   })
 }
 
@@ -1967,18 +2063,10 @@ pub(crate) fn shard_pace_env(state: &ShardState) -> slates_pace::Env {
 }
 
 /// A unit estimate's target relative error, parts per million (A-783, `slates_pace::Env::target_ppm`): the scheduler's
-/// own measured jitter over the quantum, at least one part, at most the whole.
+/// own measured jitter over the quantum, at least one part, at most the whole ([`slates_pace::target_ppm`], which the
+/// runtime's harvest period reads too).
 pub(crate) fn target_ppm(jitter_ns: u64, quantum_ns: u64) -> u64 {
-  // Format: parts per million.
-  const MILLION: u64 = 1_000_000;
-  u64::try_from(
-    u128::from(jitter_ns)
-      .saturating_mul(u128::from(MILLION))
-      .checked_div(u128::from(quantum_ns.max(1)))
-      .unwrap_or(0),
-  )
-  .unwrap_or(u64::MAX)
-  .clamp(1, MILLION)
+  slates_pace::target_ppm(jitter_ns, quantum_ns)
 }
 
 impl PushTurns {
@@ -2052,6 +2140,8 @@ struct ServerJudge<'j> {
   making_room: &'j mut Option<Vec<DbVolumeId>>,
   /// The green owing its push that the command under way waits at the door for (P2).
   door: &'j mut Option<DbVolumeId>,
+  /// The push's own slot for the let-go window its readers meet ([`ReceivePack::take_waited`]).
+  waits: &'j slates_git::away::Waits,
 }
 
 impl Judge for ServerJudge<'_> {
@@ -2078,15 +2168,13 @@ impl Judge for ServerJudge<'_> {
       return false;
     }
     if command.is_delete() {
-      // A delete builds nothing; it reads only its own green, made first if it owes its push (P2's door).
+      // A delete builds nothing; it reads only its own green, made first if it owes its push (P2's door), then its
+      // version at the old value, which waits where that read meets a let-go window (B2, `Verdicts::prepare`).
       return match bound(self.state, self.record.id, &command.name)
         .filter(|green| self.state.greens.is_owing(green))
       {
         Some(green) => self.door(green),
-        None => {
-          *self.door = None;
-          true
-        }
+        None => self.build_turn(command, pushed, slates_rt::futures::now_ns()),
       };
     }
     let repository = self.record.id;
@@ -2234,6 +2322,7 @@ impl ServerJudge<'_> {
       record,
       name,
       preparing,
+      waits,
       ..
     } = self;
     let (entry, examined) = with_room(state, |state| {
@@ -2245,8 +2334,8 @@ impl ServerJudge<'_> {
       };
       let (content, git) = store;
       let room = state.store.admittable();
-      let indexed = IndexedObjects::new(&git.repository, content, room);
-      let objects = PushedObjects::new(&git.repository, content, push.quarantine());
+      let indexed = IndexedObjects::new(&git.repository, content, room).noting(waits);
+      let objects = PushedObjects::new(&git.repository, content, push.quarantine()).noting(waits);
       let greens = ShardGreens {
         state,
         record,
@@ -2291,6 +2380,7 @@ impl ServerJudge<'_> {
       name,
       preparing,
       peel_away,
+      waits,
       ..
     } = self;
     let quantum = state.config.step_quantum_ns();
@@ -2309,8 +2399,8 @@ impl ServerJudge<'_> {
       };
       let (content, git) = store;
       let room = state.store.admittable();
-      let indexed = IndexedObjects::new(&git.repository, content, room);
-      let objects = PushedObjects::new(&git.repository, content, push.quarantine());
+      let indexed = IndexedObjects::new(&git.repository, content, room).noting(waits);
+      let objects = PushedObjects::new(&git.repository, content, push.quarantine()).noting(waits);
       let greens = ShardGreens {
         state,
         record,
@@ -2446,7 +2536,7 @@ fn created(
       version,
     ),
     None => {
-      let empty = empty_default(state, record).ok_or_else(|| refused_at(at, NO_EMPTY_DEFAULT))?;
+      let empty = empty_default(state, record).map_err(|why| refused_at(at, &why.words()))?;
       let repositories = state.db.partition().repositories();
       if repositories.branch(record.id, &namespace) == Some(empty) {
         // The unborn default's first version owes the push too (P2): the green named already, so an update that defers.
@@ -2466,22 +2556,83 @@ fn created(
   Ok((change, (Target::Created(namespace), Some(new))))
 }
 
+/// Why the default branch has no unborn, empty green to create on (A-927, main 01a20182's ruling of 2026-11-25: every
+/// refusal says its own reason). Before, each was refused "the default branch holds files no commit names", a green a
+/// takeover gave up or had not yet materialized here included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoEmptyDefault {
+  /// The repository names no default branch, or it binds no green: [`NO_EMPTY_DEFAULT`].
+  Unbound,
+  /// Its green holds a git version, a file at its version 0, or owes a push (P2): [`NO_EMPTY_DEFAULT`].
+  NotEmpty,
+  /// Its green was not recovered here (`ShardState::unrecovered`, a takeover that gave it up among them): it answers
+  /// `NotRecovered`; named, with its cause's kind (`RecoveryCause::kind`).
+  NotRecovered(DbVolumeId, &'static str),
+  /// Its green, or the repository's store, is not made here yet (an adoption still materializing it): retry, named.
+  Unavailable(DbVolumeId),
+}
+
+impl NoEmptyDefault {
+  /// The words a create's refusal carries: the green named where it is not recovered or not made here yet.
+  fn words(self) -> Vec<u8> {
+    let named = |green: DbVolumeId| -> String {
+      green
+        .bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+    };
+    match self {
+      NoEmptyDefault::Unbound | NoEmptyDefault::NotEmpty => NO_EMPTY_DEFAULT.to_vec(),
+      NoEmptyDefault::NotRecovered(green, cause) => format!(
+        "the default branch's green {} is not recovered here ({cause})",
+        named(green)
+      )
+      .into_bytes(),
+      NoEmptyDefault::Unavailable(green) => format!(
+        "the default branch's green {} is not made here yet; retry",
+        named(green)
+      )
+      .into_bytes(),
+    }
+  }
+}
+
 /// The default branch's green while it is unborn and empty: no git version in the store, and at its version 0 holding
-/// no file (module docs, "A create").
-fn empty_default(state: &ShardState, record: &RepositoryRecord) -> Option<DbVolumeId> {
-  let name = record.default_branch.as_deref()?;
+/// no file (module docs, "A create"); else why not ([`NoEmptyDefault`]).
+fn empty_default(
+  state: &ShardState,
+  record: &RepositoryRecord,
+) -> Result<DbVolumeId, NoEmptyDefault> {
+  let name = record
+    .default_branch
+    .as_deref()
+    .ok_or(NoEmptyDefault::Unbound)?;
   let green = state
     .db
     .partition()
     .repositories()
-    .branch(record.id, name)?;
-  let (_, git) = state.vcs_stores.git_ref(record.id)?;
-  let unborn = git.repository.versions(green_key(green)) == 0;
-  let empty = state
+    .branch(record.id, name)
+    .ok_or(NoEmptyDefault::Unbound)?;
+  if let Some(cause) = state.unrecovered.get(&green) {
+    return Err(NoEmptyDefault::NotRecovered(green, cause.kind()));
+  }
+  let (_, git) = state
+    .vcs_stores
+    .git_ref(record.id)
+    .ok_or(NoEmptyDefault::Unavailable(green))?;
+  // Lent whether or not it owes a push (a create's lend, `Greens::lend`): one that owes holds that push's tree, not empty.
+  let engine = state
     .greens
-    .get(&green)
-    .is_some_and(|engine| engine.head() == 0 && engine.files().next().is_none());
-  (unborn && empty).then_some(green)
+    .lend(&green)
+    .ok_or(NoEmptyDefault::Unavailable(green))?;
+  let unborn = git.repository.versions(green_key(green)) == 0;
+  let empty = engine.is_materialized() && engine.head() == 0 && engine.files().next().is_none();
+  if unborn && empty {
+    Ok(green)
+  } else {
+    Err(NoEmptyDefault::NotEmpty)
+  }
 }
 
 /// A-635's refusal as receive-pack's (module docs, "Answering", item 5), `greens` naming the green each change moves,

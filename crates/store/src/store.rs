@@ -232,6 +232,43 @@ pub struct Store {
   /// The engine reads (a lookup, or a page of a scan) that answered versions by their tool ids
   /// ([`Store::texts_by_tools`]): the counter its scan is held to.
   tool_reads: u64,
+  /// The buffers every scan of the rows reads into ([`Store::scan_rows`]), kept across scans.
+  scan: ScanScratch,
+  /// The open landing's payloads hashed as their pieces are written ([`Store::landing_part`]), so its commit names each
+  /// by its identity without reading it back from the log.
+  open_payloads: OpenPayloads,
+}
+
+/// The payload sections of the open landing, hashed as their pieces are written: the one under way, and the identities
+/// of those ended, in order.
+#[derive(Debug, Default)]
+struct OpenPayloads {
+  /// The payload section being written.
+  hashing: Option<blake3::Hasher>,
+  /// The identities of the payload sections written, in order.
+  identities: Vec<Identity>,
+}
+
+impl OpenPayloads {
+  /// Ends the payload section under way, if one is, its identity kept.
+  fn end_section(&mut self) {
+    if let Some(hasher) = self.hashing.take() {
+      self.identities.push(*hasher.finalize().as_bytes());
+    }
+  }
+}
+
+/// The buffers a scan of the engine's rows reads into, kept by the store across its scans (goal 93, main's ruling of
+/// 2026-11-25: hg's 57k clone's system churn was 3.72 GB, 55.8% of it `reserve` under the engine's `scan_inner`, each
+/// scan's rows laid in buffers its caller made afresh and grown from nothing). The engine costs a row no allocation once
+/// these have grown. They hold at most the largest page a scan read, which a request's asks bound (a fetch's batch, by
+/// its asker's room).
+#[derive(Debug, Default)]
+struct ScanScratch {
+  /// The page's rows.
+  rows: Rows,
+  /// The key the next page begins at.
+  next: Vec<u8>,
 }
 
 /// A standing grant as the store recorded it (its `G` row, A-767; R10's record of the human's grant): what a landing's
@@ -268,7 +305,7 @@ impl Store {
     let mut buffer = Vec::new();
     let log = ChangesetLog::recover(log_file, applied, |file, located| {
       if replayed.is_ok() {
-        replayed = put_rows_from_log(&mut rows, file, located, (&mut value, &mut buffer));
+        replayed = put_rows_from_log(&mut rows, file, located, (&mut value, &mut buffer), None);
       }
     })?;
     replayed?;
@@ -279,6 +316,8 @@ impl Store {
       value,
       place_reads: 0,
       tool_reads: 0,
+      scan: ScanScratch::default(),
+      open_payloads: OpenPayloads::default(),
       grant: GrantRow {
         id: 0,
         issued_ns: 0,
@@ -369,29 +408,51 @@ impl Store {
   /// Opens a landing whose steps come over many requests (the owner's sliced landing): the record's header written
   /// where the log ends, nothing visible until [`Store::commit_landing`]. Refused while one is open.
   pub fn open_landing(&mut self, header: Header) -> Result<(), StoreError> {
-    Ok(self.log.open_record(header)?)
+    self.log.open_record(header)?;
+    self.open_payloads = OpenPayloads::default();
+    Ok(())
   }
 
-  /// Begins the open landing's next section, `len` bytes of `kind`.
+  /// Begins the open landing's next section, `len` bytes of `kind`: a payload hashed as its pieces are written.
   pub fn landing_section(&mut self, kind: SectionKind, len: u64) -> Result<(), StoreError> {
-    Ok(self.log.open_section(kind, len)?)
+    self.log.open_section(kind, len)?;
+    self.open_payloads.end_section();
+    if kind.keyed() {
+      self.open_payloads.hashing = Some(blake3::Hasher::new());
+    }
+    Ok(())
   }
 
   /// Writes the next `bytes` of the open landing's section.
   pub fn landing_part(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
-    Ok(self.log.open_piece(bytes)?)
+    self.log.open_piece(bytes)?;
+    if let Some(hasher) = self.open_payloads.hashing.as_mut() {
+      hasher.update(bytes);
+    }
+    Ok(())
   }
 
-  /// Commits the open landing (one flush) and applies its rows ([`Store::applied`]).
+  /// Commits the open landing (one flush) and applies its rows ([`Store::applied`]), each payload named by the
+  /// identity its pieces hashed to as they were written.
   pub fn commit_landing(&mut self) -> Result<Located, StoreError> {
+    self.open_payloads.end_section();
+    let identities = core::mem::take(&mut self.open_payloads.identities);
     let located = self.log.commit_open()?;
-    self.applied(&located)?;
+    let mut buffer = Vec::new();
+    put_rows_from_log(
+      &mut self.rows,
+      self.log.file(),
+      &located,
+      (&mut self.value, &mut buffer),
+      Some(&identities),
+    )?;
     Ok(located)
   }
 
   /// Lets the open landing go: the log's end stays where it was, and the next record is written over its bytes.
   pub fn abandon_landing(&mut self) {
     self.log.abandon_open();
+    self.open_payloads = OpenPayloads::default();
   }
 
   /// Applies a committed record's rows: the step after [`Appending::commit`], which made the record durable. Its sections
@@ -404,6 +465,7 @@ impl Store {
       self.log.file(),
       located,
       (&mut self.value, &mut buffer),
+      None,
     )
   }
 
@@ -418,55 +480,36 @@ impl Store {
   ) -> Result<Located, StoreError> {
     header.sections = u16::try_from(sections.len())
       .map_err(|_| StoreError::Sizing("more sections than a record holds"))?;
-    let mut payloads: Vec<Identity> = Vec::new();
-    let located = {
-      let mut record = self.log.begin(header)?;
-      for (kind, contents) in sections {
-        let bytes = match contents {
-          Contents::Bytes(bytes) => *bytes,
-          Contents::Staged(identity) => staging.get(identity).ok_or(StoreError::NotStaged)?,
-        };
-        record.section(
-          *kind,
-          u64::try_from(bytes.len()).map_err(|_| StoreError::Sizing("a section past u64"))?,
-        )?;
-        record.piece(bytes)?;
-        if *kind == SectionKind::Payload {
-          payloads.push(match contents {
-            Contents::Staged(identity) => *identity,
-            Contents::Bytes(bytes) => *blake3::hash(bytes).as_bytes(),
-          });
-        }
-      }
-      record.commit()?
-    };
-    if !put_changeset(&mut self.rows, self.log.file(), &located, &mut self.value)? {
-      return Ok(located);
+    self.open_landing(header)?;
+    let landed = self.land_open(sections, staging);
+    if landed.is_err() {
+      self.abandon_landing();
     }
+    landed
+  }
+
+  /// [`Store::land`]'s sections written into the open landing a piece at a time, then committed: the sliced landing's
+  /// own steps, so a whole landing is a landing in pieces given every piece at once (CLAUDE.md §2 item 7: one landing
+  /// path), never a second way to the log.
+  fn land_open(
+    &mut self,
+    sections: &[(SectionKind, Contents<'_>)],
+    staging: &Staging,
+  ) -> Result<Located, StoreError> {
     for (kind, contents) in sections {
-      if *kind == SectionKind::Texts {
-        let bytes = match contents {
-          Contents::Bytes(bytes) => *bytes,
-          Contents::Staged(identity) => staging.get(identity).ok_or(StoreError::NotStaged)?,
-        };
-        crate::texts::put_rows(&mut self.rows, &located.header, bytes)?;
+      let bytes = match contents {
+        Contents::Bytes(bytes) => *bytes,
+        Contents::Staged(identity) => staging.get(identity).ok_or(StoreError::NotStaged)?,
+      };
+      self.landing_section(
+        *kind,
+        u64::try_from(bytes.len()).map_err(|_| StoreError::Sizing("a section past u64"))?,
+      )?;
+      for piece in bytes.chunks(PIECE_BYTES) {
+        self.landing_part(piece)?;
       }
     }
-    let mut payload = payloads.iter();
-    for section in self.log.sections(&located)? {
-      if section.kind == SectionKind::Payload
-        && let Some(identity) = payload.next()
-      {
-        payloads::keep(
-          &mut self.rows,
-          identity,
-          section.offset,
-          section.len,
-          &mut self.value,
-        )?;
-      }
-    }
-    Ok(located)
+    self.commit_landing()
   }
 
   /// The bytes of the content `identity` (of `len` bytes) from `offset` on, as far as one piece reaches: from `staging`
@@ -557,15 +600,35 @@ impl Store {
       Some(next) => changeset_key(next, 0).to_vec(),
       None => vec![CHANGESETS.saturating_add(1)],
     };
-    let mut rows = Rows::new();
-    let mut next = Vec::new();
-    self
+    let (decoded, _) = self.scan_rows((&start, Some(&end), limit), |rows, _| {
+      rows
+        .iter()
+        .map(|(key, value)| decode_changeset(key, value))
+        .collect::<Result<Vec<Changeset>, StoreError>>()
+    })?;
+    decoded
+  }
+
+  /// One page of the engine's rows from `from` (before `end`, at most `limit` rows), read into the store's own buffers
+  /// ([`ScanScratch`]) and given to `read` with the key the next page begins at: what `read` made of it, and whether
+  /// rows are left past it.
+  ///
+  /// # Errors
+  /// The engine's refusals.
+  pub(crate) fn scan_rows<R>(
+    &mut self,
+    (from, end, limit): (&[u8], Option<&[u8]>, usize),
+    read: impl FnOnce(&Rows, &[u8]) -> R,
+  ) -> Result<(R, bool), StoreError> {
+    let mut scan = core::mem::take(&mut self.scan);
+    scan.rows.clear();
+    let scanned = self
       .rows
-      .scan(&start, Some(&end), limit, &mut rows, &mut next)?;
-    rows
-      .iter()
-      .map(|(key, value)| decode_changeset(key, value))
-      .collect()
+      .scan(from, end, limit, &mut scan.rows, &mut scan.next);
+    let read = scanned.map(|more| (read(&scan.rows, &scan.next), more));
+    scan.rows.clear();
+    self.scan = scan;
+    Ok(read?)
   }
 
   /// Forgets a changeset no register named (A-767 C1, the abandoned push ruling of 2026-11-22).
@@ -585,7 +648,7 @@ impl Store {
     let mut buffer = Vec::new();
     for section in self.sections(&row)? {
       match section.kind {
-        SectionKind::Payload => {
+        SectionKind::Payload | SectionKind::Record => {
           let identity =
             identity_of_range(self.log.file(), section.offset, section.len, &mut buffer)?;
           forgotten = forgotten.saturating_add(payloads::forget(
@@ -596,6 +659,14 @@ impl Store {
           )?);
         }
         SectionKind::Texts => {
+          let identity =
+            identity_of_range(self.log.file(), section.offset, section.len, &mut buffer)?;
+          forgotten = forgotten.saturating_add(payloads::forget(
+            &mut self.rows,
+            &identity,
+            section.offset,
+            &mut self.value,
+          )?);
           let entries = section_texts(self.log.file(), &section, &mut buffer)?;
           let Store { rows, log, .. } = self;
           let mut entries_of = |rows: &mut ShardDb<DeviceFile>, keeper: u64| {
@@ -784,13 +855,19 @@ fn put_rows_from_log<F: BlockFile>(
   file: &F,
   located: &Located,
   (value, buffer): (&mut Vec<u8>, &mut Vec<u8>),
+  known: Option<&[Identity]>,
 ) -> Result<(), StoreError> {
   if !put_changeset(rows, file, located, value)? {
     return Ok(());
   }
+  let mut known = known.map(<[Identity]>::iter);
   for section in sections_in(file, located)? {
-    if section.kind == SectionKind::Payload {
-      let identity = identity_of_range(file, section.offset, section.len, buffer)?;
+    if section.kind.keyed() {
+      // Named by the identity its pieces hashed to as the landing wrote them, else read back and hashed (a replay).
+      let identity = match known.as_mut().and_then(Iterator::next) {
+        Some(identity) => *identity,
+        None => identity_of_range(file, section.offset, section.len, buffer)?,
+      };
       payloads::keep(rows, &identity, section.offset, section.len, value)?;
     }
     if section.kind == SectionKind::Texts {

@@ -3,7 +3,7 @@
 //! before anything is reserved. That every verdict a copy computes reads back to the owner's own verdict is the oracle's
 //! (`compute_tests`, which takes every held verdict through the wire form).
 
-use super::position::{Placed, Unit};
+use super::position::{Placed, Verdict};
 use super::{Computed, ConflictWindow, ContentSource, Effect, Green, Increment, Reached};
 use crate::map::Mapped;
 use crate::ops_doc::{DocDecodeError, Op, OpKind, OpsDoc};
@@ -89,28 +89,29 @@ fn splice() -> Op {
 /// A verdict of two units: the first a splice left unmade, a directory made and its mode; the second a window and where
 /// its op stood.
 fn two_units() -> Computed {
-  computed(Reached::of(vec![
-    Unit {
-      effects: vec![
-        Effect::SetContent("f".to_owned(), None, vec![splice()], ContentSource::Mapped),
-        Effect::MakeDir("d".to_owned()),
-        Effect::Mode("d".to_owned(), 0o755),
-      ],
-      ..Unit::default()
-    },
-    Unit {
-      windows: vec![ConflictWindow {
-        path: "g".to_owned(),
-        range: Range::new(8, 9),
-        class: MergeConflictClass::DeleteModify,
-      }],
-      placed: vec![Placed::from_parts(
-        Mapped::Shifted(Range::new(10, 11)),
-        Mapped::Overlaps,
-      )],
-      ..Unit::default()
-    },
-  ]))
+  let mut units = Verdict::default();
+  units.push_unit((
+    [
+      Effect::SetContent("f".to_owned(), None, vec![splice()], ContentSource::Mapped),
+      Effect::MakeDir("d".to_owned()),
+      Effect::Mode("d".to_owned(), 0o755),
+    ],
+    &[],
+    &[],
+  ));
+  units.push_unit((
+    [],
+    &[ConflictWindow {
+      path: "g".to_owned(),
+      range: Range::new(8, 9),
+      class: MergeConflictClass::DeleteModify,
+    }],
+    &[Placed::from_parts(
+      Mapped::Shifted(Range::new(10, 11)),
+      Mapped::Overlaps,
+    )],
+  ));
+  computed(Reached::of(units))
 }
 
 /// [`two_units`]' form, assembled field by field: the unit count; the first unit's three effects as a chain entry

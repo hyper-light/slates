@@ -106,6 +106,8 @@ pub mod lease;
 mod lease_wait;
 // A candidate a death brought in reads a register's ledger it lacks from its cohort (A-919).
 mod ledger_read;
+// A node's version-control edges announced to its peers, for an answer naming where a client goes (A-925).
+mod edges;
 mod lfs;
 mod live_hold;
 mod live_ship;
@@ -217,6 +219,13 @@ mod vcs_hooks;
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 mod hook_driver;
+// A shard's conversation with the daemon's spawner (A-924 piece 2a): the hooks and helpers this shard starts are
+// started by the spawner, so a spawn costs the shard a message, never a copy of the daemon's descriptor table.
+#[cfg(unix)]
+mod spawning;
+// This test binary's spawner role (A-924): a daemon or a test runtime started in it starts its spawner as it.
+#[cfg(all(test, unix))]
+slates_ipc::spawner_role!();
 // The version-control credentials a human enrolls for a principal (A-625 part 3): SSH keys by fingerprint and HTTP tokens
 // by their hash, on the partition each id routes to; the enroll and revoke verbs the issuer proves, and the lookup the
 // HTTP and SSH edges authenticate through. Public for the issuer's proofs, the token's text and the key line's reading.

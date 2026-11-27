@@ -877,13 +877,13 @@ fn a_manifest_naming_a_file_revision_nobody_holds_is_refused() {
 }
 
 /// A line of changesets' last changeset, manifest and each file revision's node with its text, for a push after it.
-type PushedLine = (Node, Node, Vec<(Node, Vec<u8>)>);
+pub(crate) type PushedLine = (Node, Node, Vec<(Node, Vec<u8>)>);
 
 /// One file `f` whose revisions are pushed as `deltas` name them (each its text and the revision it is a delta against,
 /// none for the null base), each in a changeset of its own on one line of changesets after `parent` (`after`: the
 /// changeset, manifest and file revisions before them, empty for a first push): the changegroup in version 03, and the
 /// line's last changeset, manifest and each file revision's node, for a push after it.
-fn file_push(
+pub(crate) fn file_push(
   texts: &[(&[u8], Option<usize>)],
   after: (Node, Node, &[(Node, Vec<u8>)]),
 ) -> (Vec<u8>, PushedLine) {
@@ -2482,7 +2482,7 @@ fn a_manifest_chain_read_in_ranges_is_its_text() {
   let mut longest_chain = 0usize;
   for rev in 0..fork.len(&store, Log::Manifest) {
     let text = fork.revision_text(&store, Log::Manifest, rev).unwrap();
-    let chain = Chain::of(&fork, &store, rev).unwrap();
+    let chain = Chain::of(&fork, &store, rev, Default::default()).unwrap();
     assert_eq!(chain.len(), to_u64(text.len()));
     longest_chain = longest_chain.max(usize::from(chain.held() > 0));
     for piece in [1usize, 7, 64] {
@@ -3056,4 +3056,35 @@ fn saved_and_let_go_logs(
     .sum();
   assert!(let_go > 0, "objects let go");
   saved
+}
+
+/// A-767 C1 (docs/bugs/2026-11-25-a-made-changeset-over-a-let-go-parent-was-never-made.md, siblings: main's ruling A2 of
+/// 2026-11-26). Do: push one file's first revision into a fork; let its bytes go, as a landing lets a landed text go;
+/// write the record of a second push whose revision is a delta against the first, holding its changegroup whole
+/// (`record::write_changegroup`), and replay it whole over the fork (`record::replay`). Expect the replay refused as a
+/// whole replay refuses a want of the store it cannot wait on (`Refused::StoreWanted`), the ask left pending for a replay
+/// that waits. Red before: a `#[cfg(test)]` arm answered the want from the fork's own texts, so the tests saw
+/// `UnknownDeltaBase` where production refuses `StoreWanted`.
+#[test]
+fn a_whole_records_replay_wanting_a_base_let_go_is_refused_as_production_refuses_it() {
+  use crate::import::record;
+  let (first, after) = file_push(&[(b"a\n", None)], (crate::NULL_NODE, crate::NULL_NODE, &[]));
+  let mut store = store();
+  let (mut fork, _, _) = taken_counting(&first, &mut HgIndex::new(), &mut store);
+  let (node, _) = after.2.first().cloned().unwrap();
+  let rev = fork.rev(&store, Log::File(b"f"), &node).unwrap();
+  let row = fork.revision(&store, Log::File(b"f"), rev).unwrap();
+  assert!(
+    store.let_go_object(&row.bytes) > 0,
+    "the first revision's bytes let go"
+  );
+  let (second, _) = file_push(&[(b"a\nb\n", Some(0))], (after.0, after.1, &after.2));
+  let whole =
+    record::write_changegroup(1 << 20, (crate::changegroup::Version::V03, &second), 3).unwrap();
+  let refused = record::replay(&whole, &mut fork, &mut store).err();
+  assert!(
+    matches!(refused, Some(record::Refused::StoreWanted)),
+    "{refused:?}"
+  );
+  fork.release(&mut store).unwrap();
 }

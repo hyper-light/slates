@@ -331,10 +331,26 @@ fn takes_import(state: &ShardState, id: RepositoryId) -> Result<(), LoadFailed> 
   Ok(())
 }
 
+/// Counter: an import call stopped after a whole event with its turn's slice spent ([`Importer::import_within`], A-920
+/// 7a): many a wide revision shows its parse was taken an event at a time, never a copy slice of bytes a call. Format: a
+/// counter name in the daemon's status report.
+///
+/// [`Importer::import_within`]: slates_svn::migration::Importer::import_within
+pub(crate) const IMPORT_PAUSES: &str = "vcs_store.svn_import.pauses";
+
+/// Counter: an import call stopped in a revision's close with its turn's slice spent ([`Importer::closing`], A-920 7b):
+/// many a wide revision shows its close was taken a unit at a time, never whole in one call. Format: a counter name in
+/// the daemon's status report.
+///
+/// [`Importer::closing`]: slates_svn::migration::Importer::closing
+pub(crate) const IMPORT_CLOSE_STEPS: &str = "vcs_store.svn_import.close_steps";
+
 /// One turn of repository `id`'s import (the module doc): units until the turn's time is spent, at least one. `More`
 /// while there is more, what the import holds then charged; at the stream's end what it did; refused, why. Ended either
 /// way, what it held is given back and its file closed. `None` when no import of `id` is under way.
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Option<Result<Turned, LoadFailed>> {
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("parse");
   let mut importing = state.vcs_stores.svn_imports.remove(&id)?;
   // A record owed its landing first, or a base owed: the import reads on only from the records it made.
   if importing.owed.is_some()
@@ -349,8 +365,9 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Option<Result<Tu
   state.count(TURNS, 1);
   let began = slates_rt::futures::now_ns();
   let spend = state.config.copy_slice_ns();
+  let deadline = began.saturating_add(spend);
   let outcome = loop {
-    match unit(state, id, &mut importing) {
+    match unit(state, id, &mut importing, deadline) {
       Ok(Unit::More) if slates_rt::futures::now_ns().saturating_sub(began) < spend => {}
       // A record handed over ends the turn: it lands before the import reads on ([`land_owed`]).
       Ok(Unit::More | Unit::Owed) => {
@@ -389,6 +406,7 @@ fn unit(
   state: &mut ShardState,
   id: RepositoryId,
   importing: &mut Importing,
+  deadline: u64,
 ) -> Result<Unit, LoadFailed> {
   let slice = usize::try_from(state.config.copy_slice_bytes()).unwrap_or(usize::MAX);
   importing.fill(slice)?;
@@ -407,11 +425,22 @@ fn unit(
       ..
     } = &mut *importing;
     let sink = texts::InStore::new(texts, store);
-    Ok(importer.import(records, &sink, buffer, *ended))
+    // An event a unit within the turn's slice: the call stops after a whole event once its slice is spent (A-920 7a).
+    let mut spent = || slates_rt::futures::now_ns() >= deadline;
+    Ok(importer.import_within((records, &sink), (buffer, *ended), &mut spent))
   });
   crate::vcs_store::settle_svn(state, id);
   match answer? {
     Ok(Imported::NeedMore { consumed, needed }) => {
+      // Stopped with its slice spent, none more needed, after an event (A-920 7a) or in a close (7b): counted.
+      if needed == 0 {
+        let stopped = if importing.importer.closing() {
+          IMPORT_CLOSE_STEPS
+        } else {
+          IMPORT_PAUSES
+        };
+        state.count(stopped, 1);
+      }
       importing.consume(consumed);
       importing.needed = needed;
       Ok(Unit::More)
@@ -583,6 +612,8 @@ impl Importing {
 /// (`svn_commit::land_record`). Refused, the import ends as a refused turn ends it. None where no import of `id` is
 /// under way or the shard's state is gone.
 pub(crate) async fn land_owed(id: RepositoryId) -> Option<Result<(), LoadFailed>> {
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("owed");
   let owed = crate::state::with_state(|state| {
     let importing = state.vcs_stores.svn_imports.get_mut(&id)?;
     let flush = if core::mem::take(&mut importing.flush_admission) {
@@ -952,5 +983,160 @@ pub(crate) async fn run(id: RepositoryId) -> Option<Result<Loaded, LoadFailed>> 
       Ok(Turned::Done(loaded)) => return Some(Ok(loaded)),
       Err(failed) => return Some(Err(failed)),
     }
+  }
+}
+
+/// Test support (A-920, main's order after release probe 12): the phase the import's history is in, tagged as each of
+/// its steps begins ([`phase::tag`]), and the spans a poll of it spends in each, by the wall and by its thread's CPU,
+/// in order. The wide tests print them for their longest poll, so a probe names what holds it.
+#[cfg(test)]
+pub(crate) mod phase {
+  use std::cell::RefCell;
+
+  /// A span of a poll in one phase: its tag, and its wall and thread-CPU nanoseconds.
+  pub(crate) type Span = (&'static str, u64, u64);
+
+  /// The thread's phase now, when it began, and the spans the poll under way has closed.
+  struct Tags {
+    /// The phase now.
+    current: &'static str,
+    /// When it began: the shard clock and the thread's CPU clock, nanoseconds.
+    since: (u64, u64),
+    /// The poll's spans so far, in order.
+    spans: Vec<Span>,
+  }
+
+  std::thread_local! {
+    /// This shard thread's phase and its poll's spans.
+    static TAGS: RefCell<Tags> = const {
+      RefCell::new(Tags {
+        current: "untagged",
+        since: (0, 0),
+        spans: Vec::new(),
+      })
+    };
+  }
+
+  /// The shard clock and the thread's CPU clock now.
+  fn now() -> (u64, u64) {
+    (
+      slates_rt::futures::now_ns(),
+      slates_rt::registry::calling_thread_cpu().map_or(0, |reading| reading.spent_ns),
+    )
+  }
+
+  /// The span of the phase now closed at `at`, merged into the last where that was the same phase.
+  fn close(tags: &mut Tags, at: (u64, u64)) {
+    let wall = at.0.saturating_sub(tags.since.0);
+    let cpu = at.1.saturating_sub(tags.since.1);
+    match tags.spans.last_mut() {
+      Some(last) if last.0 == tags.current => {
+        last.1 = last.1.saturating_add(wall);
+        last.2 = last.2.saturating_add(cpu);
+      }
+      _ => tags.spans.push((tags.current, wall, cpu)),
+    }
+    tags.since = at;
+  }
+
+  /// The import's history enters phase `name` (a step of it begins).
+  pub(crate) fn tag(name: &'static str) {
+    TAGS.with(|tags| {
+      let mut tags = tags.borrow_mut();
+      close(&mut tags, now());
+      tags.current = name;
+    });
+  }
+
+  /// A poll of the history begins, in `resumed`, the phase its last poll ended in: another task's tags on the thread
+  /// meanwhile are not its.
+  pub(crate) fn poll_begun(resumed: &'static str) {
+    TAGS.with(|tags| {
+      let mut tags = tags.borrow_mut();
+      tags.spans.clear();
+      tags.current = resumed;
+      tags.since = now();
+    });
+  }
+
+  std::thread_local! {
+    /// The longest single unit of a landing's release of its scratch member on this thread (A-920, main's order
+    /// after release probe 15): its wall, thread-CPU, user and system nanoseconds, and the units timed.
+    static RELEASE_UNITS: std::cell::Cell<ReleaseUnits> = const { std::cell::Cell::new(ReleaseUnits::NONE) };
+  }
+
+  /// The longest unit of a landing's release on a thread, and the units timed.
+  #[derive(Clone, Copy, Debug)]
+  pub(crate) struct ReleaseUnits {
+    /// Its wall nanoseconds, by the shard's clock.
+    pub(crate) wall: u64,
+    /// Its thread-CPU nanoseconds.
+    pub(crate) cpu: u64,
+    /// Of that, the thread's user and system nanoseconds, where the platform keeps them apart (macOS; else zero).
+    pub(crate) user_system: (u64, u64),
+    /// The units timed.
+    pub(crate) units: u64,
+  }
+
+  impl ReleaseUnits {
+    /// None timed.
+    const NONE: ReleaseUnits = ReleaseUnits {
+      wall: 0,
+      cpu: 0,
+      user_system: (0, 0),
+      units: 0,
+    };
+  }
+
+  /// A unit of a landing's release begun: the shard's clock, the thread's CPU and its user and system split now.
+  pub(crate) fn release_unit_begun() -> (u64, u64, (u64, u64)) {
+    (
+      slates_rt::futures::now_ns(),
+      slates_rt::registry::calling_thread_cpu().map_or(0, |reading| reading.spent_ns),
+      slates_rt::registry::calling_thread_user_system_ns().unwrap_or((0, 0)),
+    )
+  }
+
+  /// The unit begun at `began` ([`release_unit_begun`]) ended: kept where it is the longest by the wall.
+  pub(crate) fn release_unit(began: (u64, u64, (u64, u64))) {
+    let (wall, cpu, (user, system)) = release_unit_begun();
+    let unit = ReleaseUnits {
+      wall: wall.saturating_sub(began.0),
+      cpu: cpu.saturating_sub(began.1),
+      user_system: (
+        user.saturating_sub(began.2.0),
+        system.saturating_sub(began.2.1),
+      ),
+      units: 0,
+    };
+    RELEASE_UNITS.with(|units| {
+      let kept = units.get();
+      let count = kept.units.saturating_add(1);
+      units.set(if unit.wall > kept.wall {
+        ReleaseUnits {
+          units: count,
+          ..unit
+        }
+      } else {
+        ReleaseUnits {
+          units: count,
+          ..kept
+        }
+      });
+    });
+  }
+
+  /// The longest unit of a landing's release so far on this thread; cleared.
+  pub(crate) fn release_units_taken() -> ReleaseUnits {
+    RELEASE_UNITS.with(|units| units.replace(ReleaseUnits::NONE))
+  }
+
+  /// The poll under way ended: its spans in order, and the phase it ended in.
+  pub(crate) fn poll_ended() -> (Vec<Span>, &'static str) {
+    TAGS.with(|tags| {
+      let mut tags = tags.borrow_mut();
+      close(&mut tags, now());
+      (std::mem::take(&mut tags.spans), tags.current)
+    })
   }
 }

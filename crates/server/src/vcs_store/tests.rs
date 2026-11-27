@@ -10,7 +10,7 @@ use slates_git::object_name::{Kind, ObjectFormat, ObjectId, name_of};
 use slates_git::objects::tree::{Entry, Mode, compare, write_entries};
 use slates_git::store::rows::ObjectRow;
 use slates_git::store::{Incoming, Positions, Push, PushRefused, StoreRefused};
-use slates_ipc::protocol::{ObjectFormat as WireFormat, Refusal, ReplyBody, RequestBody, VcsTool};
+use slates_ipc::protocol::{ObjectFormat as WireFormat, Refusal, VcsTool};
 use slates_merge::push as work;
 use slates_vcs::{ContentId, ContentRefused, ContentStore};
 
@@ -21,7 +21,6 @@ use super::{
 };
 use crate::repository::push::{Appended, BranchAppended, BranchChange, EntryParts, StoreMove};
 use crate::state::ShardState;
-use crate::verbs::to_db_volume;
 
 /// Shape: the window the store-level tests' content store holds content in, as A-614's view tests hold theirs: past the
 /// longest row the store writes here with its table's frame (`slates_vcs::index` refuses one past it), and short, so a
@@ -47,7 +46,7 @@ const DEEP: u64 = 2;
 const FORMAT: ObjectFormat = ObjectFormat::Sha1;
 
 /// Format: the first committer date the histories use, seconds since the epoch.
-pub(super) const FIRST_DATE: u64 = 1_700_000_000;
+pub(crate) const FIRST_DATE: u64 = 1_700_000_000;
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Objects as git writes them.
@@ -462,6 +461,8 @@ fn landed_record(
 /// ref its own append), and every object it brought.
 struct Pending {
   push: Push,
+  /// The pack it put, as the model's record writes it (the push's own is in the content store, its put under way).
+  pack: Vec<u8>,
   writer: RecordWriter,
   moves: Vec<Planned>,
   split: bool,
@@ -505,7 +506,9 @@ impl Live {
         .map(|incoming| (incoming.kind, incoming.content)),
     )
     .map_err(|_| GitRefused::Allocation)?;
-    push.extend_pack(&pack);
+    push
+      .extend_pack(&mut self.content, &pack)
+      .map_err(|refused| GitRefused::Object(PushRefused::Content(refused)))?;
     for (arriving, offset) in arriving.into_iter().zip(offsets) {
       admit_object(
         &mut self.content,
@@ -516,6 +519,7 @@ impl Live {
     }
     Ok(Pending {
       push,
+      pack,
       writer,
       moves,
       split,
@@ -565,7 +569,7 @@ impl Live {
     let record = landed_record(
       &mut self.content,
       &self.store,
-      (&pending.writer, deepest, pending.push.pack()),
+      (&pending.writer, deepest, &pending.pack),
       (moves, &bases),
     )?;
     commit_moves(
@@ -1283,29 +1287,10 @@ pub(crate) fn owner() -> Principal {
   }
 }
 
-/// Creates repository `name` of `tool` on the shard: its id and its root green.
-pub(crate) fn repository(
-  state: &mut ShardState,
-  name: &str,
-  tool: VcsTool,
-) -> (RepositoryId, DbVolumeId) {
-  let reply = crate::test_store::create(
-    state,
-    &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool,
-      format: WireFormat::Sha1,
-      default_branch: "main".to_owned(),
-      green: None,
-    },
-  );
-  let ReplyBody::GreenCreated { id } = reply else {
-    panic!("no repository: {reply:?}")
-  };
-  let repositories = state.db.partition().repositories();
-  let record = repositories.repository_named(name).expect("the record");
-  (record.id, to_db_volume(id))
+/// What these tests ask a creation for: git repository `name`, its default `main`, made by [`owner`] as a client's
+/// creation is made (`test_store::created`, awaited in a task of the shard), never landed on the shard's thread.
+fn git(name: &str) -> crate::test_store::Asked<'_> {
+  (name, VcsTool::Git, WireFormat::Sha1, "main")
 }
 
 /// A-662 (one map, each tool's arm, made with the record and freed with it), with A-655 part 2b's Subversion records.
@@ -1406,7 +1391,7 @@ fn assert_bytes_that_are_no_record_are_refused(
 /// admit now, then `ContentUnavailable`, counted.
 #[test]
 fn t_a662_a_store_refusal_reads_as_the_budget_or_unavailable() {
-  crate::test_store::audit_on_stored_shard("vcs", |state| {
+  crate::test_store::on_a_stored_shard(|state| {
     let budget = GitRefused::Store(StoreRefused::Content(ContentRefused::OverBudget {
       need: 10,
       room: 3,
@@ -1485,82 +1470,91 @@ pub(crate) fn work_of(
     .expect("the work")
 }
 
-/// `changes` appended with `sealed`'s objects and `moves` through A-635's append.
-pub(crate) fn appended(
-  state: &mut ShardState,
+/// The shard's state for `f`, in an awaiting history (a task of the shard: [`push_through_awaited`]).
+pub(crate) fn on_state<T>(f: impl FnOnce(&mut ShardState) -> T) -> T {
+  crate::state::with_state(f).expect("the shard's state")
+}
+
+/// `changes` appended with `sealed`'s objects and `moves` through A-635's append, from a task of the shard: its names
+/// and pack homed and landed by awaiting (`vcs_store::commits::home_and_land`), never holding the shard through the
+/// store's commit (main 01a20182's order of 2026-11-26, the shard-blocking allow-list).
+pub(crate) async fn appended_awaited(
   repository: RepositoryId,
   changes: Vec<BranchChange>,
-  sealed: (&mut super::SealedPush, &[StoreMove]),
+  (sealed, moves): (&mut super::SealedPush, &[StoreMove]),
 ) -> Result<Appended, crate::repository::push::AppendRefused> {
-  // Its names and pack homed and landed first, as a client's edge carries them (C5 part 2b: no record carries a push's
-  // objects); nothing to carry where it brings none.
-  let _ = crate::vcs_store::commits::home_and_land_blocking(state, sealed.0);
-  let (pushing, moves) = sealed;
-  let appended = crate::repository::push::push_sealed(
-    state,
-    (&owner(), repository),
-    changes,
-    EntryParts::default(),
-    (&mut *pushing, moves),
-  );
-  // Refused, its homing's holds are given back, as a refused push gives them back.
-  if appended.is_err() {
-    pushing.release_homed(state);
-  }
-  // A push's whole map is built by a task of the shard (A-664's live whole builds), which a test's step never runs:
-  // driven to its end here, so the test reads the store as the build leaves it.
-  crate::vcs_store::paths::whole_build::settle(state);
-  appended
+  let _ = crate::vcs_store::commits::home_and_land(sealed).await;
+  on_state(|state| {
+    let appended = crate::repository::push::push_sealed(
+      state,
+      (&owner(), repository),
+      changes,
+      EntryParts::default(),
+      (&mut *sealed, moves),
+    );
+    if appended.is_err() {
+      sealed.release_homed(state);
+    }
+    crate::vcs_store::paths::whole_build::settle(state);
+    appended
+  })
 }
 
-/// [`push_through`] with the push's whole map left to its build's task (A-664's live whole builds), as a push leaves it
-/// when it is answered: the build is under way, not driven.
-pub(crate) fn push_unsettled(
-  state: &mut ShardState,
-  (repository, green): (RepositoryId, DbVolumeId),
-  objects: &[Brought],
-  (base, head, tree_id): (Option<ObjectId>, ObjectId, ObjectId),
-) {
-  let push = begun(state, repository, objects);
-  let version = state.greens.get(&green).expect("the green's engine").head();
-  let built = work_of(state, (&push, green), (version, base), (head, tree_id));
-  let mut sealed = push.seal(state).expect("sealed");
-  let changes = vec![BranchChange::Update { green, work: built }];
-  let moves = [(Target::Green(green), Some(head))];
-  // Homed and landed first, as a client's edge carries a push (C5 part 2b: no record carries a push's objects).
-  let _ = crate::vcs_store::commits::home_and_land_blocking(state, &mut sealed);
-  crate::repository::push::push_sealed(
-    state,
-    (&owner(), repository),
-    changes,
-    EntryParts::default(),
-    (&mut sealed, &moves),
-  )
-  .expect("appended");
-  sealed.abandon(state);
-}
-
-/// One push through the shard: `objects` admitted, the work from `base` to the commit's tree, the push sealed with its
-/// move and appended. The version it made.
-pub(crate) fn push_through(
-  state: &mut ShardState,
+/// One push through the shard, from a task of it: `objects` admitted, the work from `base` to the commit's tree, the
+/// push sealed with its move and appended ([`appended_awaited`]). The version it made.
+pub(crate) async fn push_through_awaited(
   (repository, green): (RepositoryId, DbVolumeId),
   objects: &[Brought],
   (base, head, tree_id): (Option<ObjectId>, ObjectId, ObjectId),
 ) -> u64 {
-  let push = begun(state, repository, objects);
-  let version = state.greens.get(&green).expect("the green's engine").head();
-  let built = work_of(state, (&push, green), (version, base), (head, tree_id));
-  let mut sealed = push.seal(state).expect("sealed");
+  let (mut sealed, built) = on_state(|state| {
+    let push = begun(state, repository, objects);
+    let version = state.greens.get(&green).expect("the green's engine").head();
+    let built = work_of(state, (&push, green), (version, base), (head, tree_id));
+    (push.seal(state).expect("sealed"), built)
+  });
   let changes = vec![BranchChange::Update { green, work: built }];
   let moves = [(Target::Green(green), Some(head))];
-  let made = appended(state, repository, changes, (&mut sealed, &moves)).expect("appended");
+  let made = appended_awaited(repository, changes, (&mut sealed, &moves))
+    .await
+    .expect("appended");
   // Committed, the push holds nothing: giving it back gives back nothing.
-  sealed.abandon(state);
+  on_state(|state| sealed.abandon(state));
   match made.changes.first() {
     Some(BranchAppended::Moved { version, .. }) => *version,
     other => panic!("not moved: {other:?}"),
   }
+}
+
+/// [`push_through_awaited`] with the push's whole map left to its build's task (A-664's live whole builds), as a push leaves it
+/// when it is answered (the build is under way, not driven), from a task of the shard: its names and pack homed and
+/// landed by awaiting
+/// (`vcs_store::commits::home_and_land`), never holding the shard through the store's commit.
+pub(crate) async fn push_unsettled_awaited(
+  (repository, green): (RepositoryId, DbVolumeId),
+  objects: &[Brought],
+  (base, head, tree_id): (Option<ObjectId>, ObjectId, ObjectId),
+) {
+  let (mut sealed, built) = on_state(|state| {
+    let push = begun(state, repository, objects);
+    let version = state.greens.get(&green).expect("the green's engine").head();
+    let built = work_of(state, (&push, green), (version, base), (head, tree_id));
+    (push.seal(state).expect("sealed"), built)
+  });
+  let changes = vec![BranchChange::Update { green, work: built }];
+  let moves = [(Target::Green(green), Some(head))];
+  let _ = crate::vcs_store::commits::home_and_land(&mut sealed).await;
+  on_state(|state| {
+    crate::repository::push::push_sealed(
+      state,
+      (&owner(), repository),
+      changes,
+      EntryParts::default(),
+      (&mut sealed, &moves),
+    )
+    .expect("appended");
+    sealed.abandon(state);
+  });
 }
 
 /// The root tree a commit's content names.
@@ -1626,6 +1620,10 @@ pub(crate) fn assert_made_again_whole(
   // memo, never recorded (a fetch's read, or the derivation behind a push), which the store made again derives when it is
   // asked; each side is derived whole first (A-916).
   derive_settled(state, repository);
+  // And its index's upkeep: a merge begun by a fetch's first lookups (`index_upkeep::looked_up`) or a rebuild's end
+  // (`index_upkeep::built`) runs as a task of its own, so either side's tables are read merged whole, never mid-merge
+  // (docs/bugs/2026-11-26-a-made-again-compare-read-the-index-mid-upkeep.md).
+  super::index_upkeep::merged_whole(state, repository);
   let live = {
     let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
     facts(content, store, greens)
@@ -1636,6 +1634,7 @@ pub(crate) fn assert_made_again_whole(
   super::settle_rebuild(state, repository);
   assert_eq!(state.vcs_stores.unrecovered(repository), None);
   derive_settled(state, repository);
+  super::index_upkeep::merged_whole(state, repository);
   let made = {
     let (content, store) = state
       .vcs_stores
@@ -1657,29 +1656,35 @@ pub(crate) fn assert_made_again_whole(
 /// made again equal whole, both records replayed and none refused.
 #[test]
 fn t_a662_a_push_appended_a_ref_at_a_time_is_made_again_from_its_records() {
-  crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (repository, root) = repository(state, "split", VcsTool::Git);
+  crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = crate::test_store::created(&owner(), git("split")).await;
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (objects, one) = commit_of(&files, &[], FIRST_DATE);
-    let push = begun_at(state, repository, &objects, DEEP);
-    let work = work_of(state, (&push, root), (0, None), (one, tree_of(&objects)));
-    let mut sealed = push.seal(state).expect("sealed");
+    let (mut sealed, work) = on_state(|state| {
+      let push = begun_at(state, repository, &objects, DEEP);
+      let work = work_of(state, (&push, root), (0, None), (one, tree_of(&objects)));
+      (push.seal(state).expect("sealed"), work)
+    });
     let main = vec![BranchChange::Update { green: root, work }];
     let moves = [(Target::Green(root), Some(one))];
-    appended(state, repository, main, (&mut sealed, &moves)).expect("the default branch");
-    let made = appended(
-      state,
+    appended_awaited(repository, main, (&mut sealed, &moves))
+      .await
+      .expect("the default branch");
+    let made = appended_awaited(
       repository,
       topic_at(root, 1),
       (&mut sealed, &topic_move(one)),
     )
+    .await
     .expect("topic");
-    sealed.abandon(state);
-    let last = records(state, repository).pop().expect("a record");
-    let read = Record::decode(&last, FORMAT).map(|record| (record.deepest, named_count(&record)));
-    assert_eq!(read, Ok((DEEP, 0)));
-    let greens = [green_key(root), green_key(created_green(&made))];
-    assert_made_again_whole(state, repository, &greens);
+    on_state(|state| {
+      sealed.abandon(state);
+      let last = records(state, repository).pop().expect("a record");
+      let read = Record::decode(&last, FORMAT).map(|record| (record.deepest, named_count(&record)));
+      assert_eq!(read, Ok((DEEP, 0)));
+      let greens = [green_key(root), green_key(created_green(&made))];
+      assert_made_again_whole(state, repository, &greens);
+    });
   });
 }
 
@@ -1690,37 +1695,43 @@ fn t_a662_a_push_appended_a_ref_at_a_time_is_made_again_from_its_records() {
 /// second's chain; the store made again equal whole, its learned depth the second's chain, both records replayed.
 #[test]
 fn t_a662_a_push_whose_objects_another_committed_first_records_none_of_them() {
-  crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (repository, root) = repository(state, "twice", VcsTool::Git);
+  crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = crate::test_store::created(&owner(), git("twice")).await;
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (objects, one) = commit_of(&files, &[], FIRST_DATE);
-    let first = begun(state, repository, &objects);
-    let second = begun_at(state, repository, &objects, DEEP);
-    let work = work_of(state, (&first, root), (0, None), (one, tree_of(&objects)));
-    let mut first = first.seal(state).expect("sealed");
-    let mut second = second.seal(state).expect("sealed");
+    let (mut first, mut second, work) = on_state(|state| {
+      let first = begun(state, repository, &objects);
+      let second = begun_at(state, repository, &objects, DEEP);
+      let work = work_of(state, (&first, root), (0, None), (one, tree_of(&objects)));
+      let first = first.seal(state).expect("sealed");
+      (first, second.seal(state).expect("sealed"), work)
+    });
     let main = vec![BranchChange::Update { green: root, work }];
     let moves = [(Target::Green(root), Some(one))];
-    appended(state, repository, main, (&mut first, &moves)).expect("the first");
-    first.abandon(state);
-    let made = appended(
-      state,
+    appended_awaited(repository, main, (&mut first, &moves))
+      .await
+      .expect("the first");
+    on_state(|state| first.abandon(state));
+    let made = appended_awaited(
       repository,
       topic_at(root, 1),
       (&mut second, &topic_move(one)),
     )
+    .await
     .expect("the second");
-    second.abandon(state);
-    let last = records(state, repository).pop().expect("a record");
-    let read = Record::decode(&last, FORMAT).map(|record| (record.deepest, named_count(&record)));
-    assert_eq!(read, Ok((DEEP, 0)));
-    let learned = state
-      .vcs_stores
-      .git_ref(repository)
-      .map(|(_, store)| store.repository.learned_depth());
-    assert_eq!(learned, Some(DEEP));
-    let greens = [green_key(root), green_key(created_green(&made))];
-    assert_made_again_whole(state, repository, &greens);
+    on_state(|state| {
+      second.abandon(state);
+      let last = records(state, repository).pop().expect("a record");
+      let read = Record::decode(&last, FORMAT).map(|record| (record.deepest, named_count(&record)));
+      assert_eq!(read, Ok((DEEP, 0)));
+      let learned = state
+        .vcs_stores
+        .git_ref(repository)
+        .map(|(_, store)| store.repository.learned_depth());
+      assert_eq!(learned, Some(DEEP));
+      let greens = [green_key(root), green_key(created_green(&made))];
+      assert_made_again_whole(state, repository, &greens);
+    });
   });
 }
 
@@ -1731,58 +1742,74 @@ fn t_a662_a_push_whose_objects_another_committed_first_records_none_of_them() {
 /// as version 2, its record holding every object the push brought, and the store's ref at the new head.
 #[test]
 fn t_a662_a_refused_ref_leaves_the_push_whole_for_the_next() {
-  crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (repository, root) = repository(state, "tree", VcsTool::Git);
+  crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = crate::test_store::created(&owner(), git("tree")).await;
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (first, one) = commit_of(&files, &[], FIRST_DATE);
     let first_tree = tree_of(&first);
-    push_through(state, (repository, root), &first, (None, one, first_tree));
+    push_through_awaited((repository, root), &first, (None, one, first_tree)).await;
     let files = [(b"README".to_vec(), b"two\n".to_vec())];
     let (second, two) = commit_of(&files, &[one], FIRST_DATE + 1);
     let second_tree = tree_of(&second);
-    let push = begun(state, repository, &second);
-    let stale = work_of(state, (&push, root), (0, None), (two, second_tree));
-    let fresh = work_of(
-      state,
-      (&push, root),
-      (1, Some(first_tree)),
-      (two, second_tree),
-    );
-    let mut sealed = push.seal(state).expect("sealed");
+    let (mut sealed, (stale, fresh), (held, kept)) = on_state(|state| {
+      let push = begun(state, repository, &second);
+      let stale = work_of(state, (&push, root), (0, None), (two, second_tree));
+      let fresh = work_of(
+        state,
+        (&push, root),
+        (1, Some(first_tree)),
+        (two, second_tree),
+      );
+      let sealed = push.seal(state).expect("sealed");
+      let held = state.vcs_stores.content().map(ContentStore::used);
+      (
+        sealed,
+        (stale, fresh),
+        (held, super::homes::region_held_here()),
+      )
+    });
     let moves = [(Target::Green(root), Some(two))];
-    let held = state.vcs_stores.content().map(ContentStore::used);
-    let kept = super::homes::region_held_here();
     let changes = vec![BranchChange::Update {
       green: root,
       work: stale,
     }];
-    assert!(appended(state, repository, changes, (&mut sealed, &moves)).is_err());
-    // The refused push's homing left its names and pack with their region home (this shard): the home's, let go here
-    // as the home lets go of content no record names; the repository holds nothing more.
-    let_go_region_holds_since(state, &kept);
-    assert_eq!(state.vcs_stores.content().map(ContentStore::used), held);
-    assert_eq!(records(state, repository).len(), 1);
+    assert!(
+      appended_awaited(repository, changes, (&mut sealed, &moves))
+        .await
+        .is_err()
+    );
+    on_state(|state| {
+      // The refused push's homing left its names and pack with their region home (this shard): the home's, let go
+      // here as the home lets go of content no record names; the repository holds nothing more.
+      let_go_region_holds_since(state, &kept);
+      assert_eq!(state.vcs_stores.content().map(ContentStore::used), held);
+      assert_eq!(records(state, repository).len(), 1);
+    });
     let changes = vec![BranchChange::Update {
       green: root,
       work: fresh,
     }];
-    let made = appended(state, repository, changes, (&mut sealed, &moves)).expect("appended");
-    assert!(matches!(
-      made.changes.first(),
-      Some(BranchAppended::Moved { version: 2, .. })
-    ));
-    sealed.abandon(state);
-    let last = records(state, repository).pop().expect("a record");
-    let read = Record::decode(&last, FORMAT).expect("a record");
-    assert_eq!(named_count(&read), second.len());
-    let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
-    let key = green_key(root);
-    let newest = store
-      .repository
-      .versions(key)
-      .checked_sub(1)
-      .expect("a version");
-    assert_eq!(store.repository.head(content, key, newest), Some(two));
+    let made = appended_awaited(repository, changes, (&mut sealed, &moves))
+      .await
+      .expect("appended");
+    on_state(|state| {
+      assert!(matches!(
+        made.changes.first(),
+        Some(BranchAppended::Moved { version: 2, .. })
+      ));
+      sealed.abandon(state);
+      let last = records(state, repository).pop().expect("a record");
+      let read = Record::decode(&last, FORMAT).expect("a record");
+      assert_eq!(named_count(&read), second.len());
+      let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
+      let key = green_key(root);
+      let newest = store
+        .repository
+        .versions(key)
+        .checked_sub(1)
+        .expect("a version");
+      assert_eq!(store.repository.head(content, key, newest), Some(two));
+    });
   });
 }
 
@@ -1795,14 +1822,14 @@ fn t_a662_a_refused_ref_leaves_the_push_whole_for_the_next() {
 /// and replayed both records; freeing gives every byte back.
 #[test]
 fn t_a662_a_pushs_objects_ride_its_entry_and_the_log_makes_the_same_store() {
-  crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (repository, root) = repository(state, "kernel", VcsTool::Git);
+  crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = crate::test_store::created(&owner(), git("kernel")).await;
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (first, one) = commit_of(&files, &[], FIRST_DATE);
-    assert_an_abandoned_push_leaves_nothing(state, repository, &first);
+    on_state(|state| assert_an_abandoned_push_leaves_nothing(state, repository, &first));
     let first_tree = tree_of(&first);
     assert_eq!(
-      push_through(state, (repository, root), &first, (None, one, first_tree)),
+      push_through_awaited((repository, root), &first, (None, one, first_tree)).await,
       1
     );
     let files = [
@@ -1812,30 +1839,32 @@ fn t_a662_a_pushs_objects_ride_its_entry_and_the_log_makes_the_same_store() {
     let (second, two) = commit_of(&files, &[one], FIRST_DATE + 1);
     let second_tree = tree_of(&second);
     assert_eq!(
-      push_through(
-        state,
+      push_through_awaited(
         (repository, root),
         &second,
         (Some(first_tree), two, second_tree)
-      ),
+      )
+      .await,
       2
     );
-    assert_recorded_and_charged(state, repository, root, (first.len(), second.len()));
-    let key = green_key(root);
-    let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
-    assert_eq!(store.version_of(content, key, &one), Some((1, first_tree)));
-    assert_eq!(store.version_of(content, key, &two), Some((2, second_tree)));
-    assert_eq!(store.versions(key), &[1, 2]);
-    assert_made_again_whole(state, repository, &[key]);
-    // The records' own holds of their names and packs, which a free leaves (a rebuild replays the same records), let go
-    // as a destroy of the repository lets them go with its records.
-    super::release_record_holds(state, repository);
-    super::free(state, repository);
-    // The region's own holds of the pushes' names and packs (this shard their home) are the home's, not the
-    // repository's: let go as the home lets go of content no record names, then nothing is held or charged.
-    let_go_region_holds_since(state, &[]);
-    assert_eq!(state.vcs_stores.charged(), 0);
-    assert_eq!(state.vcs_stores.content().map(ContentStore::used), Some(0));
+    on_state(|state| {
+      assert_recorded_and_charged(state, repository, root, (first.len(), second.len()));
+      let key = green_key(root);
+      let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
+      assert_eq!(store.version_of(content, key, &one), Some((1, first_tree)));
+      assert_eq!(store.version_of(content, key, &two), Some((2, second_tree)));
+      assert_eq!(store.versions(key), &[1, 2]);
+      assert_made_again_whole(state, repository, &[key]);
+      // The records' own holds of their names and packs, which a free leaves (a rebuild replays the same records), let go
+      // as a destroy of the repository lets them go with its records.
+      super::release_record_holds(state, repository);
+      super::free(state, repository);
+      // The region's own holds of the pushes' names and packs (this shard their home) are the home's, not the
+      // repository's: let go as the home lets go of content no record names, then nothing is held or charged.
+      let_go_region_holds_since(state, &[]);
+      assert_eq!(state.vcs_stores.charged(), 0);
+      assert_eq!(state.vcs_stores.content().map(ContentStore::used), Some(0));
+    });
   });
 }
 
@@ -1883,41 +1912,47 @@ fn assert_recorded_and_charged(
 /// version 1 with the new head; the record naming that key.
 #[test]
 fn t_a662_a_created_branch_is_keyed_by_the_green_its_append_makes() {
-  crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (repository, root) = repository(state, "made", VcsTool::Git);
+  crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = crate::test_store::created(&owner(), git("made")).await;
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (first, one) = commit_of(&files, &[], FIRST_DATE);
     let first_tree = tree_of(&first);
-    push_through(state, (repository, root), &first, (None, one, first_tree));
+    push_through_awaited((repository, root), &first, (None, one, first_tree)).await;
     let files = [(b"README".to_vec(), b"topic\n".to_vec())];
     let (topic, head) = commit_of(&files, &[one], FIRST_DATE + 1);
-    let push = begun(state, repository, &topic);
-    let work = work_of(
-      state,
-      (&push, root),
-      (1, Some(first_tree)),
-      (head, tree_of(&topic)),
-    );
-    let mut sealed = push.seal(state).expect("sealed");
+    let (mut sealed, work) = on_state(|state| {
+      let push = begun(state, repository, &topic);
+      let work = work_of(
+        state,
+        (&push, root),
+        (1, Some(first_tree)),
+        (head, tree_of(&topic)),
+      );
+      (push.seal(state).expect("sealed"), work)
+    });
     let changes = vec![BranchChange::Create {
       name: "topic".to_owned(),
       from: root,
       version: 1,
       work: Some(work),
     }];
-    let made =
-      appended(state, repository, changes, (&mut sealed, &topic_move(head))).expect("appended");
-    sealed.abandon(state);
-    let Some(BranchAppended::Created { green, version: 1 }) = made.changes.first().cloned() else {
-      panic!("not created: {made:?}");
-    };
-    let key = green_key(green);
-    let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
-    assert_eq!(store.versions(key), &[1]);
-    assert_eq!(store.repository.head(content, key, 0), Some(head));
-    let last = records(state, repository).pop().expect("a record");
-    let read = Record::decode(&last, FORMAT).expect("a record");
-    assert_eq!(read.moves, vec![(key, 1, Some(head))]);
+    let made = appended_awaited(repository, changes, (&mut sealed, &topic_move(head)))
+      .await
+      .expect("appended");
+    on_state(|state| {
+      sealed.abandon(state);
+      let Some(BranchAppended::Created { green, version: 1 }) = made.changes.first().cloned()
+      else {
+        panic!("not created: {made:?}");
+      };
+      let key = green_key(green);
+      let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
+      assert_eq!(store.versions(key), &[1]);
+      assert_eq!(store.repository.head(content, key, 0), Some(head));
+      let last = records(state, repository).pop().expect("a record");
+      let read = Record::decode(&last, FORMAT).expect("a record");
+      assert_eq!(read.moves, vec![(key, 1, Some(head))]);
+    });
   });
 }
 
@@ -1943,8 +1978,8 @@ fn kept_files(
 /// first version) and none refused.
 #[test]
 fn t_a664_p3_a_pushs_version_keeps_its_map_of_gits_files() {
-  crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (repository, green) = repository(state, "pushed", VcsTool::Git);
+  crate::test_store::run_on_stored_shard(|| async {
+    let (repository, green) = crate::test_store::created(&owner(), git("pushed")).await;
     let (a, a_bytes) = blob(b"alpha\n");
     let (b, b_bytes) = blob(b"beta\n");
     let (tree_id, tree_bytes) = tree(&[(b"a".to_vec(), a), (b"b".to_vec(), b)]);
@@ -1955,23 +1990,25 @@ fn t_a664_p3_a_pushs_version_keeps_its_map_of_gits_files() {
       (Kind::Tree, tree_id, tree_bytes),
       (Kind::Commit, head, commit_bytes),
     ];
-    let version = push_through(state, (repository, green), &objects, (None, head, tree_id));
-    let files = kept_files(state, repository, green, version).expect("the version's map");
-    let content = state.vcs_stores.content().expect("the content store");
-    let file = |bytes: &[u8]| slates_vcs::derived::paths::Entry {
-      class: slates_git::derived::FileClass::File.class(),
-      content: content.object_id(bytes),
-    };
-    let expected = BTreeMap::from([
-      (b"a".to_vec(), file(&a_bytes)),
-      (b"b".to_vec(), file(&b_bytes)),
-    ]);
-    assert_eq!(files, expected);
-    let counted = |name: &str| state.refusals.get(name).copied();
-    assert_eq!(
-      (counted(super::paths::BUILT), counted(super::paths::REFUSED)),
-      (Some(1), None)
-    );
+    let version = push_through_awaited((repository, green), &objects, (None, head, tree_id)).await;
+    on_state(|state| {
+      let files = kept_files(state, repository, green, version).expect("the version's map");
+      let content = state.vcs_stores.content().expect("the content store");
+      let file = |bytes: &[u8]| slates_vcs::derived::paths::Entry {
+        class: slates_git::derived::FileClass::File.class(),
+        content: content.object_id(bytes),
+      };
+      let expected = BTreeMap::from([
+        (b"a".to_vec(), file(&a_bytes)),
+        (b"b".to_vec(), file(&b_bytes)),
+      ]);
+      assert_eq!(files, expected);
+      let counted = |name: &str| state.refusals.get(name).copied();
+      assert_eq!(
+        (counted(super::paths::BUILT), counted(super::paths::REFUSED)),
+        (Some(1), None)
+      );
+    });
   });
 }
 
@@ -2033,10 +2070,10 @@ fn an_http_commit_idle_past_the_edges_idle_bound_is_released() {
   assert_eq!((found, kept, after), (true, 1, false));
 }
 
-/// A git repository of `pushes` pushes to its root green, each a commit changing `README` over the one before: its id
-/// and root.
-fn pushed_many(state: &mut ShardState, name: &str, pushes: u64) -> (RepositoryId, DbVolumeId) {
-  let (repository, root) = repository(state, name, VcsTool::Git);
+/// A git repository `name` of `pushes` pushes to its root green, each a commit changing `README` over the one before,
+/// made and pushed from a task of the shard ([`push_through_awaited`]): its id and root.
+async fn pushed_many_awaited(name: &str, pushes: u64) -> (RepositoryId, DbVolumeId) {
+  let (repository, root) = crate::test_store::created(&owner(), git(name)).await;
   let mut parent: Option<(ObjectId, ObjectId)> = None;
   for push in 0..pushes {
     let files = [(b"README".to_vec(), format!("push {push}\n").into_bytes())];
@@ -2044,7 +2081,7 @@ fn pushed_many(state: &mut ShardState, name: &str, pushes: u64) -> (RepositoryId
     let (objects, commit) = commit_of(&files, &parents, FIRST_DATE.saturating_add(push));
     let tree = tree_of(&objects);
     let base = parent.map(|(_, tree)| tree);
-    push_through(state, (repository, root), &objects, (base, commit, tree));
+    push_through_awaited((repository, root), &objects, (base, commit, tree)).await;
     parent = Some((commit, tree));
   }
   (repository, root)
@@ -2057,26 +2094,28 @@ fn pushed_many(state: &mut ShardState, name: &str, pushes: u64) -> (RepositoryId
 /// lent again and its green's map made again by its build. Red before the change: the store was made whole at once.
 #[test]
 fn t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn() {
-  let seen = crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (repository, root) = pushed_many(state, "sliced-rebuild", 5);
-    let records = records(state, repository).len();
-    super::rebuild(state, repository);
-    let during = (
-      state.vcs_stores.rebuilding(repository),
-      state.vcs_stores.git_ref(repository).is_none(),
-    );
-    let mut turns = 0usize;
-    while super::rebuild_turn_once(state, repository) {
-      turns = turns.saturating_add(1);
-    }
-    let lent =
-      state.vcs_stores.git_ref(repository).is_some() && !state.vcs_stores.rebuilding(repository);
-    crate::vcs_store::paths::whole_build::settle(state);
-    let mapped = state
-      .vcs_stores
-      .git_ref(repository)
-      .is_some_and(|(_, git)| git.heads.contains_key(&green_key(root)));
-    (during, turns >= records && records == 5, lent, mapped)
+  let seen = crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = pushed_many_awaited("sliced-rebuild", 5).await;
+    on_state(|state| {
+      let records = records(state, repository).len();
+      super::rebuild(state, repository);
+      let during = (
+        state.vcs_stores.rebuilding(repository),
+        state.vcs_stores.git_ref(repository).is_none(),
+      );
+      let mut turns = 0usize;
+      while super::rebuild_turn_once(state, repository) {
+        turns = turns.saturating_add(1);
+      }
+      let lent =
+        state.vcs_stores.git_ref(repository).is_some() && !state.vcs_stores.rebuilding(repository);
+      crate::vcs_store::paths::whole_build::settle(state);
+      let mapped = state
+        .vcs_stores
+        .git_ref(repository)
+        .is_some_and(|(_, git)| git.heads.contains_key(&green_key(root)));
+      (during, turns >= records && records == 5, lent, mapped)
+    })
   });
   assert_eq!(seen, ((true, true), true, true, true));
 }
@@ -2092,8 +2131,8 @@ const MANY_FILES: usize = 64;
 /// Red before the change: the record was replayed whole in one turn.
 #[test]
 fn t_a722_p4_a_many_object_pack_record_is_replayed_over_many_turns() {
-  let seen = crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (repository, root) = repository(state, "many-objects", VcsTool::Git);
+  let seen = crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = crate::test_store::created(&owner(), git("many-objects")).await;
     let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
       .map(|n| {
         (
@@ -2104,23 +2143,25 @@ fn t_a722_p4_a_many_object_pack_record_is_replayed_over_many_turns() {
       .collect();
     let (objects, commit) = commit_of(&files, &[], FIRST_DATE);
     let tree = tree_of(&objects);
-    push_through(state, (repository, root), &objects, (None, commit, tree));
-    let held = records(state, repository).len();
-    super::rebuild(state, repository);
-    let mut turns = 0usize;
-    while super::rebuild_turn_once_within(state, repository, 0) {
-      turns = turns.saturating_add(1);
-    }
-    crate::vcs_store::paths::whole_build::settle(state);
-    let key = green_key(root);
-    let head = state
-      .vcs_stores
-      .git_ref(repository)
-      .and_then(|(content, git)| {
-        let newest = git.repository.versions(key).checked_sub(1)?;
-        git.repository.head(content, key, newest)
-      });
-    (held, turns >= objects.len(), head == Some(commit))
+    push_through_awaited((repository, root), &objects, (None, commit, tree)).await;
+    on_state(|state| {
+      let held = records(state, repository).len();
+      super::rebuild(state, repository);
+      let mut turns = 0usize;
+      while super::rebuild_turn_once_within(state, repository, 0) {
+        turns = turns.saturating_add(1);
+      }
+      crate::vcs_store::paths::whole_build::settle(state);
+      let key = green_key(root);
+      let head = state
+        .vcs_stores
+        .git_ref(repository)
+        .and_then(|(content, git)| {
+          let newest = git.repository.versions(key).checked_sub(1)?;
+          git.repository.head(content, key, newest)
+        });
+      (held, turns >= objects.len(), head == Some(commit))
+    })
   });
   assert_eq!(seen, (1, true, true));
 }
@@ -2130,8 +2171,8 @@ fn t_a722_p4_a_many_object_pack_record_is_replayed_over_many_turns() {
 /// it. Expect: more turns than the push holds objects; the push landed, its green's head the commit.
 #[test]
 fn t_a722_p4_a_pushs_seal_takes_many_turns_and_lands() {
-  let seen = crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (repository, root) = repository(state, "many-sealed", VcsTool::Git);
+  let seen = crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = crate::test_store::created(&owner(), git("many-sealed")).await;
     let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
       .map(|n| {
         (
@@ -2142,34 +2183,41 @@ fn t_a722_p4_a_pushs_seal_takes_many_turns_and_lands() {
       .collect();
     let (objects, commit) = commit_of(&files, &[], FIRST_DATE);
     let tree = tree_of(&objects);
-    let push = begun(state, repository, &objects);
-    let version = state.greens.get(&root).expect("the green's engine").head();
-    let built = work_of(state, (&push, root), (version, None), (commit, tree));
-    let mut sealing = push.sealing(state).expect("sealing");
-    let mut turns = 0usize;
-    let mut sealed = loop {
-      turns += 1;
-      match sealing.turn(state, 0).expect("a turn") {
-        super::SealTurn::More(more) => sealing = *more,
-        super::SealTurn::Sealed(sealed) => break *sealed,
-      }
-    };
+    let (mut sealed, built, turns) = on_state(|state| {
+      let push = begun(state, repository, &objects);
+      let version = state.greens.get(&root).expect("the green's engine").head();
+      let built = work_of(state, (&push, root), (version, None), (commit, tree));
+      let mut sealing = push.sealing(state).expect("sealing");
+      let mut turns = 0usize;
+      let sealed = loop {
+        turns += 1;
+        match sealing.turn(state, 0).expect("a turn") {
+          super::SealTurn::More(more) => sealing = *more,
+          super::SealTurn::Sealed(sealed) => break *sealed,
+        }
+      };
+      (sealed, built, turns)
+    });
     let changes = vec![BranchChange::Update {
       green: root,
       work: built,
     }];
     let moves = [(Target::Green(root), Some(commit))];
-    appended(state, repository, changes, (&mut sealed, &moves)).expect("appended");
-    sealed.abandon(state);
-    let key = green_key(root);
-    let head = state
-      .vcs_stores
-      .git_ref(repository)
-      .and_then(|(content, git)| {
-        let newest = git.repository.versions(key).checked_sub(1)?;
-        git.repository.head(content, key, newest)
-      });
-    (turns > objects.len(), head == Some(commit))
+    appended_awaited(repository, changes, (&mut sealed, &moves))
+      .await
+      .expect("appended");
+    on_state(|state| {
+      sealed.abandon(state);
+      let key = green_key(root);
+      let head = state
+        .vcs_stores
+        .git_ref(repository)
+        .and_then(|(content, git)| {
+          let newest = git.repository.versions(key).checked_sub(1)?;
+          git.repository.head(content, key, newest)
+        });
+      (turns > objects.len(), head == Some(commit))
+    })
   });
   assert_eq!(seen, (true, true));
 }
@@ -2180,8 +2228,8 @@ fn t_a722_p4_a_pushs_seal_takes_many_turns_and_lands() {
 /// admitted before it (none left kept) and landed it, the green's head the commit.
 #[test]
 fn t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands() {
-  let seen = crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (repository, root) = repository(state, "many-admitted", VcsTool::Git);
+  let seen = crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = crate::test_store::created(&owner(), git("many-admitted")).await;
     let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
       .map(|n| {
         (
@@ -2192,35 +2240,42 @@ fn t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands() {
       .collect();
     let (objects, commit) = commit_of(&files, &[], FIRST_DATE);
     let tree = tree_of(&objects);
-    let push = begun(state, repository, &objects);
-    let version = state.greens.get(&root).expect("the green's engine").head();
-    let built = work_of(state, (&push, root), (version, None), (commit, tree));
-    let mut sealed = push.seal(state).expect("sealed");
-    let (mut admitting, mut turns) = (None, 0usize);
     let key = green_key(root);
-    loop {
-      turns += 1;
-      if sealed.admission_turn(state, (key, commit), (&mut admitting, 0)) {
-        break;
+    let (mut sealed, built, turns) = on_state(|state| {
+      let push = begun(state, repository, &objects);
+      let version = state.greens.get(&root).expect("the green's engine").head();
+      let built = work_of(state, (&push, root), (version, None), (commit, tree));
+      let mut sealed = push.seal(state).expect("sealed");
+      let (mut admitting, mut turns) = (None, 0usize);
+      loop {
+        turns += 1;
+        if sealed.admission_turn(state, (key, commit), (&mut admitting, 0)) {
+          break;
+        }
       }
-    }
+      (sealed, built, turns)
+    });
     let kept = sealed.prepared.len();
     let changes = vec![BranchChange::Update {
       green: root,
       work: built,
     }];
     let moves = [(Target::Green(root), Some(commit))];
-    appended(state, repository, changes, (&mut sealed, &moves)).expect("appended");
+    appended_awaited(repository, changes, (&mut sealed, &moves))
+      .await
+      .expect("appended");
     let left = sealed.prepared.len();
-    sealed.abandon(state);
-    let head = state
-      .vcs_stores
-      .git_ref(repository)
-      .and_then(|(content, git)| {
-        let newest = git.repository.versions(key).checked_sub(1)?;
-        git.repository.head(content, key, newest)
-      });
-    (turns, kept, left, head == Some(commit))
+    on_state(|state| {
+      sealed.abandon(state);
+      let head = state
+        .vcs_stores
+        .git_ref(repository)
+        .and_then(|(content, git)| {
+          let newest = git.repository.versions(key).checked_sub(1)?;
+          git.repository.head(content, key, newest)
+        });
+      (turns, kept, left, head == Some(commit))
+    })
   });
   // A create is admitted with no walk (A-614 amended), in one turn; its sets are its first reader's to derive.
   assert_eq!(seen, (1, 1, 0, true));
@@ -2235,8 +2290,8 @@ fn t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands() {
 /// ones built from the whole head.
 #[test]
 fn t_a752_p3_a_pushs_map_step_runs_a_path_a_slice_and_equals_the_whole_build() {
-  let seen = crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (repository, root) = repository(state, "change-build", VcsTool::Git);
+  let seen = crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = crate::test_store::created(&owner(), git("change-build")).await;
     let files = |word: &str, count: usize| -> Vec<(Vec<u8>, Vec<u8>)> {
       (0..count)
         .map(|n| {
@@ -2251,73 +2306,73 @@ fn t_a752_p3_a_pushs_map_step_runs_a_path_a_slice_and_equals_the_whole_build() {
     };
     let (objects, first) = commit_of(&files("first", MANY_FILES), &[], FIRST_DATE);
     let first_tree = tree_of(&objects);
-    push_through(
-      state,
-      (repository, root),
-      &objects,
-      (None, first, first_tree),
-    );
-    crate::vcs_store::paths::whole_build::settle(state);
+    push_through_awaited((repository, root), &objects, (None, first, first_tree)).await;
     let (objects, second) = commit_of(&files("second", MANY_FILES - 1), &[first], FIRST_DATE + 1);
-    let begun_before = state
-      .refusals
-      .get(super::paths::whole_build::CHANGE_BEGUN)
-      .copied();
-    let derived_before = state
-      .refusals
-      .get(super::paths::DERIVED)
-      .copied()
-      .unwrap_or(0);
-    push_unsettled(
-      state,
+    let (begun_before, derived_before) = on_state(|state| {
+      crate::vcs_store::paths::whole_build::settle(state);
+      let begun_before = state
+        .refusals
+        .get(super::paths::whole_build::CHANGE_BEGUN)
+        .copied();
+      let derived_before = state
+        .refusals
+        .get(super::paths::DERIVED)
+        .copied()
+        .unwrap_or(0);
+      (begun_before, derived_before)
+    });
+    push_unsettled_awaited(
       (repository, root),
       &objects,
       (Some(first_tree), second, tree_of(&objects)),
-    );
-    let version = state.greens.get(&root).expect("the green's engine").head();
-    let key = green_key(root);
-    let head_version = |state: &ShardState| {
-      state
+    )
+    .await;
+    on_state(|state| {
+      let version = state.greens.get(&root).expect("the green's engine").head();
+      let key = green_key(root);
+      let head_version = |state: &ShardState| {
+        state
+          .vcs_stores
+          .git_ref(repository)
+          .and_then(|(_, git)| git.heads.get(&key).map(|head| head.version))
+      };
+      let pending = head_version(state) == Some(version - 1);
+      let mut slices = 0usize;
+      while super::paths::whole_build::building(state, root) {
+        super::paths::whole_build::step_once(state);
+        slices = slices.saturating_add(1);
+      }
+      let derived = state
+        .refusals
+        .get(super::paths::DERIVED)
+        .copied()
+        .unwrap_or(0)
+        - derived_before;
+      let begun = state
+        .refusals
+        .get(super::paths::whole_build::CHANGE_BEGUN)
+        .copied()
+        .unwrap_or(0)
+        - begun_before.unwrap_or(0);
+      let stepped = state
         .vcs_stores
         .git_ref(repository)
-        .and_then(|(_, git)| git.heads.get(&key).map(|head| head.version))
-    };
-    let pending = head_version(state) == Some(version - 1);
-    let mut slices = 0usize;
-    while super::paths::whole_build::building(state, root) {
-      super::paths::whole_build::step_once(state);
-      slices = slices.saturating_add(1);
-    }
-    let derived = state
-      .refusals
-      .get(super::paths::DERIVED)
-      .copied()
-      .unwrap_or(0)
-      - derived_before;
-    let begun = state
-      .refusals
-      .get(super::paths::whole_build::CHANGE_BEGUN)
-      .copied()
-      .unwrap_or(0)
-      - begun_before.unwrap_or(0);
-    let stepped = state
-      .vcs_stores
-      .git_ref(repository)
-      .and_then(|(_, git)| git.heads.get(&key).copied())
-      .expect("the change build's map");
-    super::paths::remake_green(state, root);
-    let whole = state
-      .vcs_stores
-      .git_ref(repository)
-      .and_then(|(_, git)| git.heads.get(&key).copied())
-      .expect("the whole build's map");
-    (
-      pending,
-      begun,
-      slices >= MANY_FILES - 2,
-      derived,
-      (stepped.version, stepped.root, stepped.trees) == (whole.version, whole.root, whole.trees),
-    )
+        .and_then(|(_, git)| git.heads.get(&key).copied())
+        .expect("the change build's map");
+      super::paths::remake_green(state, root);
+      let whole = state
+        .vcs_stores
+        .git_ref(repository)
+        .and_then(|(_, git)| git.heads.get(&key).copied())
+        .expect("the whole build's map");
+      (
+        pending,
+        begun,
+        slices >= MANY_FILES - 2,
+        derived,
+        (stepped.version, stepped.root, stepped.trees) == (whole.version, whole.root, whole.trees),
+      )
+    })
   });
   assert_eq!(seen, (true, 1, true, 1, true));
 }
@@ -2339,8 +2394,8 @@ fn walked(state: &ShardState, id: RepositoryId) -> u64 {
 /// admission walked every object the push brought, an object a turn (and before part 4g, the whole walk in one turn).
 #[test]
 fn t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn() {
-  let (most, total, objects) = crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (repository, root) = repository(state, "admitted-in-turns", VcsTool::Git);
+  let (most, total, objects) = crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = crate::test_store::created(&owner(), git("admitted-in-turns")).await;
     let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
       .map(|n| {
         (
@@ -2351,16 +2406,18 @@ fn t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn() {
       .collect();
     let (objects, commit) = commit_of(&files, &[], FIRST_DATE);
     let tree = tree_of(&objects);
-    push_through(state, (repository, root), &objects, (None, commit, tree));
-    super::rebuild(state, repository);
-    let (mut most, mut before, begun) =
-      (0u64, walked(state, repository), walked(state, repository));
-    while super::rebuild_turn_once_within(state, repository, 0) {
-      let now = walked(state, repository);
-      most = most.max(now.saturating_sub(before));
-      before = now;
-    }
-    (most, before.saturating_sub(begun), objects.len())
+    push_through_awaited((repository, root), &objects, (None, commit, tree)).await;
+    on_state(|state| {
+      super::rebuild(state, repository);
+      let (mut most, mut before, begun) =
+        (0u64, walked(state, repository), walked(state, repository));
+      while super::rebuild_turn_once_within(state, repository, 0) {
+        let now = walked(state, repository);
+        most = most.max(now.saturating_sub(before));
+        before = now;
+      }
+      (most, before.saturating_sub(begun), objects.len())
+    })
   });
   assert!(objects > 0);
   assert_eq!((total, most), (0, 0), "a replay walks nothing");
@@ -2375,94 +2432,96 @@ fn t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn() {
 /// their BLAKE3, which the record does not name), never accepted.
 #[test]
 fn t_identity_rule_a_record_naming_an_object_by_its_old_root_is_refused_typed() {
-  crate::test_store::audit_on_stored_shard("vcs", |state| {
-    // Shape: a file past one window of the content store (its `assert_ne!` below holds it so), and within the room a
-    // wiring test's work is built in ([`ROOM`]).
-    const LARGE: usize = 1 << 19;
-    let (repository, green) = repository(state, "old-form", VcsTool::Git);
+  // Shape: a file past one window of the content store (its `assert_ne!` below holds it so), and within the room a
+  // wiring test's work is built in ([`ROOM`]).
+  const LARGE: usize = 1 << 19;
+  crate::test_store::run_on_stored_shard(|| async {
+    let (repository, green) = crate::test_store::created(&owner(), git("old-form")).await;
     let blob: Vec<u8> = (0..LARGE)
       .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
       .collect();
     let (objects, head) = commit_of(&[(b"large".to_vec(), blob.clone())], &[], FIRST_DATE);
-    push_through(
-      state,
+    push_through_awaited(
       (repository, green),
       &objects,
       (None, head, tree_of(&objects)),
-    );
-    let identity = ContentId::of(&blob);
-    // The root a record before the rule named the file by: the one this store would cut its bytes into (the file is
-    // held where it lies in its push's pack now, A-722's record v4, so the store keeps no root of it).
-    let window = state
-      .vcs_stores
-      .content()
-      .map(ContentStore::window)
-      .unwrap();
-    let mut scratch = ContentStore::new(u64::try_from(4 * LARGE).unwrap(), window).unwrap();
-    let held = scratch.put_object(&blob).unwrap();
-    let root = scratch.root_of(&held);
-    assert_ne!(root, identity, "the file is past one window");
-    // A record names its objects by its names' content (version 5): the file's name in it rewritten to its old root,
-    // the content put again, and the record written again naming that content.
-    let names_of = |state: &mut ShardState, record: &[u8]| {
-      let (named, count) = Record::decode(record, FORMAT).ok()?.named?;
-      // Read with the shard's chunk store lent, where the names' windows are kept.
-      let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
-      super::record_names::names_from_content(lent.stores.content()?, &named, count).ok()
-    };
-    let written = records(state, repository)
-      .into_iter()
-      .find(|record| {
-        names_of(state, record).is_some_and(|names| names.iter().any(|name| name.1 == identity))
-      })
-      .expect("a record naming the file");
-    let read = Record::decode(&written, FORMAT).expect("a record");
-    let mut names = names_of(state, &written).expect("its names");
-    for name in &mut names {
-      if name.1 == identity {
-        name.1 = root;
-      }
-    }
-    let renamed = {
-      // The room the names' content needs, lent as a push's homing lends it (`vcs_store::put_names`).
-      super::lend(
-        &mut state.store,
-        &mut state.vcs_stores,
-        u64::try_from(written.len()).unwrap(),
-      );
-      let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
-      let content = lent.stores.content.as_mut().expect("the content store");
-      super::record_names::names_to_content(content, &names).expect("names put")
-    };
-    super::settle(state);
-    let altered = RecordWriter::finish_packed(
-      (read.deepest, &read.moves, &read.bases),
-      Some(renamed),
-      read.packed,
-      read.sequence,
     )
-    .expect("written");
-    let record = state
-      .db
-      .partition()
-      .repositories()
-      .repository(repository)
-      .cloned()
-      .unwrap();
-    let mut replayed = |bytes: &[u8]| {
-      state.vcs_stores.entries.remove(&repository);
-      super::make(state, &record);
-      // The room a replay is lent, as `replay_record` lends it: the record's bytes.
-      super::lend(
-        &mut state.store,
-        &mut state.vcs_stores,
-        u64::try_from(bytes.len()).unwrap(),
-      );
-      let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
-      super::replay_into(lent.stores, repository, bytes, None).map(|_| ())
-    };
-    assert_eq!(replayed(&written), Ok(()), "the record as written replays");
-    assert_eq!(replayed(&altered), Err(super::ReplayRefused::Diverged));
+    .await;
+    let identity = ContentId::of(&blob);
+    on_state(|state| {
+      // The root a record before the rule named the file by: the one this store would cut its bytes into (the file is
+      // held where it lies in its push's pack now, A-722's record v4, so the store keeps no root of it).
+      let window = state
+        .vcs_stores
+        .content()
+        .map(ContentStore::window)
+        .unwrap();
+      let mut scratch = ContentStore::new(u64::try_from(4 * LARGE).unwrap(), window).unwrap();
+      let held = scratch.put_object(&blob).unwrap();
+      let root = scratch.root_of(&held);
+      assert_ne!(root, identity, "the file is past one window");
+      // A record names its objects by its names' content (version 5): the file's name in it rewritten to its old root,
+      // the content put again, and the record written again naming that content.
+      let names_of = |state: &mut ShardState, record: &[u8]| {
+        let (named, count) = Record::decode(record, FORMAT).ok()?.named?;
+        // Read with the shard's chunk store lent, where the names' windows are kept.
+        let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+        super::record_names::names_from_content(lent.stores.content()?, &named, count).ok()
+      };
+      let written = records(state, repository)
+        .into_iter()
+        .find(|record| {
+          names_of(state, record).is_some_and(|names| names.iter().any(|name| name.1 == identity))
+        })
+        .expect("a record naming the file");
+      let read = Record::decode(&written, FORMAT).expect("a record");
+      let mut names = names_of(state, &written).expect("its names");
+      for name in &mut names {
+        if name.1 == identity {
+          name.1 = root;
+        }
+      }
+      let renamed = {
+        // The room the names' content needs, lent as a push's homing lends it (`vcs_store::put_names`).
+        super::lend(
+          &mut state.store,
+          &mut state.vcs_stores,
+          u64::try_from(written.len()).unwrap(),
+        );
+        let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+        let content = lent.stores.content.as_mut().expect("the content store");
+        super::record_names::names_to_content(content, &names).expect("names put")
+      };
+      super::settle(state);
+      let altered = RecordWriter::finish_packed(
+        (read.deepest, &read.moves, &read.bases),
+        Some(renamed),
+        read.packed,
+        read.sequence,
+      )
+      .expect("written");
+      let record = state
+        .db
+        .partition()
+        .repositories()
+        .repository(repository)
+        .cloned()
+        .unwrap();
+      let mut replayed = |bytes: &[u8]| {
+        state.vcs_stores.entries.remove(&repository);
+        super::make(state, &record);
+        // The room a replay is lent, as `replay_record` lends it: the record's bytes.
+        super::lend(
+          &mut state.store,
+          &mut state.vcs_stores,
+          u64::try_from(bytes.len()).unwrap(),
+        );
+        let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+        super::replay_into(lent.stores, repository, bytes, None).map(|_| ())
+      };
+      assert_eq!(replayed(&written), Ok(()), "the record as written replays");
+      assert_eq!(replayed(&altered), Err(super::ReplayRefused::Diverged));
+    });
   });
 }
 
@@ -2514,8 +2573,7 @@ fn let_go_of_a_pack_of(windows: usize) -> LetGoSeen {
   use super::{
     LANDED_LET_GO_BYTES, LANDED_PINNED, LET_GO_PAST_QUANTUM, LET_GO_SLICES, LET_GO_TRACE,
   };
-  crate::test_store::audit_on_stored_shard("let-go-sliced", move |state| {
-    let id = crate::git_push::tests::git_repository(state, "let-go-sliced");
+  crate::git_push::tests::on_stored_shard_with(["let-go-sliced"], move |state, [id]| {
     let window = state
       .vcs_stores
       .content()
@@ -2654,8 +2712,7 @@ fn room_asked_inside_a_lend_is_refused_out_of_reach_at_its_first_put() {
   let bytes = b"a window put within the room asked for it".to_vec();
   let need = u64::try_from(bytes.len()).unwrap();
   let (slack_inside, inside, held_after, outside, counted) =
-    crate::test_store::audit_on_stored_shard("room-out-of-reach", move |state| {
-      crate::git_push::tests::git_repository(state, "room-out-of-reach");
+    crate::git_push::tests::on_stored_shard_with(["room-out-of-reach"], move |state, [_]| {
       let window = u64::try_from(state.store.content.chunk_bytes()).unwrap();
       super::within_budget(state, window, |_| ());
       let put =
@@ -2693,4 +2750,213 @@ fn room_asked_inside_a_lend_is_refused_out_of_reach_at_its_first_put() {
     "the same put within room asked outside the lend taken: {outside:?}"
   );
   assert_eq!(counted, 1, "the ask inside the lend counted once");
+}
+
+/// Bytes no deflate shortens (a xorshift's stream), `len` of them: a file whose pack is as long as it.
+pub(crate) fn incompressible(len: usize) -> Vec<u8> {
+  let mut word = 0x9e37_79b9_7f4a_7c15u64;
+  (0..len)
+    .map(|_| {
+      word ^= word << 13;
+      word ^= word >> 7;
+      word ^= word << 17;
+      word.to_le_bytes()[0]
+    })
+    .collect()
+}
+
+/// Shape: how many times a replay's pack bound (`vcs_store::replay_pack_bound`) the C2 test's pack is: past it by more
+/// than its pieces' rounding.
+const STREAMED_PACKS: usize = 4;
+
+/// Repository `id`'s one record's pack, its identity and length, and its bytes as the content store holds them, then
+/// every window of it let go (marked landed, as goal 93's landed let-go leaves a landed pack): the content store holds
+/// it whole no more.
+fn pack_let_go(state: &mut ShardState, id: RepositoryId) -> ((ContentId, u64), Vec<u8>) {
+  let record = records(state, id).pop().expect("a record");
+  let packed = Record::decode(&record, FORMAT)
+    .expect("a record")
+    .packed
+    .expect("a pack named");
+  let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+  let content = lent.stores.content_mut().expect("the content store");
+  let root = content.root_of(&packed.0);
+  let bytes = content
+    .object_bytes(&root, packed.1)
+    .expect("the pack held whole");
+  for window in bytes.chunks(content.window()).map(ContentId::of) {
+    if !content.is_away(&window) && content.mark_landed(&window) {
+      let _ = content.let_go(&window);
+    }
+  }
+  assert!(!content.holds_whole(&packed.0), "the pack let go");
+  (packed, bytes)
+}
+
+/// Awaits `ended` of the shard's state, a yield between looks, within the stored runner's patience.
+async fn awaited(ended: impl Fn(&ShardState) -> bool) {
+  let deadline = slates_rt::futures::now_ns().saturating_add(
+    u64::try_from(crate::test_store::HISTORY_PATIENCE.as_nanos()).unwrap_or(u64::MAX),
+  );
+  while !on_state(|state| ended(state)) {
+    assert!(slates_rt::futures::now_ns() < deadline, "never ended");
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// The pack `packed` read back from the node's store (`StorePacks`, one fill of its whole length), its windows the
+/// content store holds let go brought back from those bytes, and the pack the content store names then read whole.
+async fn pack_read_back(packed: (ContentId, u64)) -> Option<Vec<u8>> {
+  let disk = on_state(|state| state.vcs_disk.clone())?;
+  let len = usize::try_from(packed.1).ok()?;
+  let mut pieces = super::store_packs::StorePacks::new(disk, len.saturating_add(1 << 16));
+  pieces.fill(&packed.0, packed.1, 0, packed.1).await.ok()?;
+  let mut bytes = Vec::new();
+  while bytes.len() < len {
+    let at = u64::try_from(bytes.len()).ok()?;
+    let piece = slates_git::store::packed::PackSource::piece(&pieces, &packed.0, packed.1, at)?;
+    bytes.extend_from_slice(&piece);
+  }
+  on_state(|state| {
+    let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+    let content = lent.stores.content_mut()?;
+    content.bring_back_object(&packed.0, &bytes).ok()?;
+    let root = content.root_of(&packed.0);
+    content.object_bytes(&root, packed.1)
+  })
+}
+
+/// Main's order of 2026-11-26 (C2: a replay reads its record's pack from the node's store a piece at a time,
+/// cancellation safe and idempotent). Do: push a create whose one file is incompressible and [`STREAMED_PACKS`] times a
+/// replay's pack bound; let go every window of its pack; rebuild the repository, held between two of its pack's pieces
+/// after its first fill (`vcs_store::REPLAY_FILLS_BEFORE_HOLD`), and there rebuild it again, the first cancelled; let
+/// the second run to its end. Expect: neither the held nor the cancelled replay names the pack whole; the second ends,
+/// no replay refused, the store made again the live one (its rows, refs and learned depth), and the pack it names read
+/// back byte for byte.
+#[test]
+fn t_c2_a_rebuild_cancelled_between_two_pieces_names_no_pack_and_the_next_reads_it_whole() {
+  crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = crate::test_store::created(&owner(), git("streamed")).await;
+    let bound =
+      on_state(|state| super::replay_pack_bound(&state.config, state.config.step_quantum_ns()));
+    let files = [(b"f".to_vec(), incompressible(bound * STREAMED_PACKS))];
+    let (objects, head) = commit_of(&files, &[], FIRST_DATE);
+    push_through_awaited(
+      (repository, root),
+      &objects,
+      (None, head, tree_of(&objects)),
+    )
+    .await;
+    let key = green_key(root);
+    // The store's rows, refs and learned depth: what its records make again. Its contents' residency is not (the pack
+    // let go here, put again by the replay that reads it, as a whole read put it).
+    let made_of = |state: &ShardState| {
+      state
+        .vcs_stores
+        .git_ref(repository)
+        .map(|(content, store)| facts(content, store, &[key]))
+        .map(|facts| (facts.rows, facts.refs, facts.depth))
+    };
+    let (live, (packed, bytes)) =
+      on_state(|state| (made_of(state), pack_let_go(state, repository)));
+    let held = &super::REPLAY_FILLS_BEFORE_HOLD;
+    held.with(|left| left.set(Some(1)));
+    on_state(|state| super::rebuild(state, repository));
+    awaited(|state| {
+      held.with(|left| left.get() == Some(0))
+        && state.vcs_stores.replay_packs.contains_key(&repository)
+    })
+    .await;
+    let whole = |state: &ShardState| {
+      state
+        .vcs_stores
+        .content()
+        .is_some_and(|content| content.holds_whole(&packed.0))
+    };
+    let cancelled = on_state(|state| {
+      let held_whole = whole(state);
+      super::rebuild(state, repository);
+      held.with(|left| left.set(None));
+      (held_whole, whole(state))
+    });
+    assert_eq!(
+      cancelled,
+      (false, false),
+      "a pack named whole held or cancelled"
+    );
+    awaited(|state| {
+      !state.vcs_stores.rebuilding(repository) && state.vcs_stores.unrecovered(repository).is_none()
+    })
+    .await;
+    assert_eq!(
+      on_state(|state| made_of(state)),
+      live,
+      "the store made again the live one"
+    );
+    let (refused, held_most) = on_state(|state| {
+      let count = |name: &str| state.refusals.get(name).copied();
+      (
+        count(super::REPLAY_REFUSED),
+        count(super::REPLAY_PACK_HELD_MOST),
+      )
+    });
+    assert_eq!(refused, None, "no replay refused");
+    assert!(
+      held_most.is_some_and(|most| most > 0 && most <= u64::try_from(bound).unwrap()),
+      "the rebuild read its pack within its bound {bound} B: {held_most:?}"
+    );
+    assert_eq!(
+      pack_read_back(packed).await,
+      Some(bytes),
+      "the pack read back whole"
+    );
+  });
+}
+
+/// The made-again flake (main's 100-a-side A/B of 2026-11-26: 5 and 4 in 100 under load, before and after C3 (b); its
+/// diagnostic run: the made-again store holding two index tables the live one did not, and lacking one it held; docs/bugs/
+/// 2026-11-26-a-made-again-compare-read-the-index-mid-upkeep.md). Do: push three commits, the repository's index three
+/// runs; merge the live index whole first, as a fetch's first lookups merge it by a task of its own
+/// (`index_upkeep::looked_up`), the shape the flake met when that task had ended; then make the store again from the log
+/// and compare (`assert_made_again_whole`). Expect: the store made again the live one, its index tables too, and both
+/// merges counted (`vcs_store.index_upkeep.merged`). Red before the compare merged each side's index whole: the made-again
+/// store's merge, begun by its rebuild's end (`index_upkeep::built`), was a task the compare's one step never ran, its
+/// runs' tables beside the live store's one merged run.
+#[test]
+fn t_a664_a_store_made_again_compares_its_index_tables_merged_whole_on_both_sides() {
+  crate::test_store::run_on_stored_shard(|| async {
+    let (repository, root) = crate::test_store::created(&owner(), git("merged")).await;
+    let mut parent: Option<(ObjectId, ObjectId)> = None;
+    for push in 0..3u64 {
+      let files = [(b"README".to_vec(), format!("push {push}\n").into_bytes())];
+      let parents: Vec<ObjectId> = parent.iter().map(|(commit, _)| *commit).collect();
+      let (objects, commit) = commit_of(&files, &parents, FIRST_DATE.saturating_add(push));
+      let tree = tree_of(&objects);
+      push_through_awaited(
+        (repository, root),
+        &objects,
+        (parent.map(|(_, tree)| tree), commit, tree),
+      )
+      .await;
+      parent = Some((commit, tree));
+    }
+    on_state(|state| {
+      let merged = |state: &ShardState| {
+        state
+          .refusals
+          .get(super::index_upkeep::MERGED)
+          .copied()
+          .unwrap_or(0)
+      };
+      let before = merged(state);
+      super::index_upkeep::merged_whole(state, repository);
+      assert_eq!(merged(state), before + 1, "the live index merged whole");
+      assert_made_again_whole(state, repository, &[green_key(root)]);
+      assert_eq!(
+        merged(state),
+        before + 2,
+        "the made-again index merged whole too"
+      );
+    });
+  });
 }

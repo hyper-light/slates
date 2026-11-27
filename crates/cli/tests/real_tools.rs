@@ -838,3 +838,8 @@ fn make_cargo_and_git_status_hold_under_memory_pressure() {
   drop(mounted);
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

@@ -1055,7 +1055,7 @@ fn svn_hook_failed(point: HookPoint, status: ExitStatus, words: &Words) -> SvnEr
 /// written nothing, and is reported as that exit.
 fn svn_unstartable(point: HookPoint, program: &str, cause: StartRefused) -> Vec<SvnError> {
   match cause {
-    StartRefused::NoRoom => vec![
+    StartRefused::NoRoom | StartRefused::SpawnerGone => vec![
       SvnError {
         code: SVN_ERR_REPOS_BAD_ARGS,
         message: format!("Failed to start '{program}' hook"),
@@ -1177,6 +1177,25 @@ pub(crate) fn svn_told_unconfigured(point: HookPoint) -> Option<SvnTold> {
 /// "the push's connection: a hook ends when its client leaves"); the type's largest value.
 const NO_CEILING_NS: u64 = u64::MAX;
 
+/// Derived: the quantile of a hook's runs its learned bound claims, in percent: a run cut there took longer than all
+/// but one in a hundred of its hook's runs. A cut fails the user's verb (a push refused, a revprop change answered 500),
+/// so the bound claims no more than its runs can show and no less than a hung hook needs to be told from a slow one.
+const BOUND_QUANTILE_PERCENT: u64 = 99;
+/// Format: the whole, in percent.
+const PERCENT: u64 = 100;
+/// Derived: the finished runs a hook's learned bound rests on before it holds any run (main 01a20182's ruling of
+/// 2026-11-25 on A-622: a bound learned from one sample is not a bound). With `n` runs the largest is at best about the
+/// `n/(n+1)` quantile, so [`BOUND_QUANTILE_PERCENT`]'s `q` needs `n ≥ q/(1 − q)`: 99 runs for the 99th. Until then a run's
+/// deadline is its operation's own, the client's connection (every hook here runs inside its client's request: git's
+/// `post-receive` and Subversion's `post-commit` answer it), since a kill before the client's own deadline saves the
+/// client nothing. Measured: one `cat` run of a few milliseconds taught a bound of about a liveness window, and the
+/// hook's next run under load was killed past it, a `post-revprop-change` answered 500 (main's 8a loop, 2026-11-25).
+pub(crate) const RUNS_FOR_A_BOUND: u64 =
+  match BOUND_QUANTILE_PERCENT.checked_div(PERCENT.saturating_sub(BOUND_QUANTILE_PERCENT)) {
+    Some(runs) => runs,
+    None => u64::MAX,
+  };
+
 /// One configured hook's runs, learned (the module doc).
 #[derive(Debug, Default)]
 pub(crate) struct HookTimes {
@@ -1189,11 +1208,12 @@ pub(crate) struct HookTimes {
 }
 
 impl HookTimes {
-  /// Derived: the bound the next run is held to: none before any run has finished, since until then a run's only bound
-  /// is its client's connection; then the tail of the finished runs plus a liveness window, doubled for each run since
-  /// the last finished one that was cut at its bound (`LearnedWait::bound_ns`), with no ceiling of its own.
+  /// Derived: the bound the next run is held to: none before [`RUNS_FOR_A_BOUND`] runs have finished, since until then
+  /// the runs cannot show the quantile the bound claims and a run's only bound is its client's connection; then the
+  /// tail of the finished runs plus a liveness window, doubled for each run since the last finished one that was cut at
+  /// its bound (`LearnedWait::bound_ns`), with no ceiling of its own.
   pub(crate) fn bound_ns(&self) -> Option<u64> {
-    (self.samples > 0).then(|| self.runs.bound_ns(NO_CEILING_NS))
+    (self.samples >= RUNS_FOR_A_BOUND).then(|| self.runs.bound_ns(NO_CEILING_NS))
   }
 
   /// How many runs finished on their own (the samples; a non-vacuity counter for the learned deadline).
@@ -1353,6 +1373,15 @@ pub(crate) enum StartRefused {
   NoRoom,
   /// Another failure, by the operating system's number.
   Other(i32),
+  /// The daemon's spawner was not there to start it or to answer its end (A-924): it never started, or it went.
+  #[cfg_attr(
+    not(unix),
+    allow(
+      dead_code,
+      reason = "Windows starts a hook with CreateProcess directly (A-924), so no spawner can be gone there"
+    )
+  )]
+  SpawnerGone,
 }
 
 /// What a hook wrote: kept up to a cap its caller derives (the connection's share of the shard's admittable memory,
@@ -1690,12 +1719,12 @@ mod tests {
 
   use super::{
     Changegroup, CommittedView, EnvValue, Event, ExitStatus, HookDirectory, HookInput, HookPoint,
-    HookRun, HookTimes, HookTimesTable, Lesson, LockToken, Outcome, PendingView, Phase, RefUpdate,
-    RevpropAction, RevpropChange, StartRefused, Step, SvnError, SvnHooksEnv, SvnLockToken, SvnTold,
-    Unconfigured, View, Words, WordsFrom, git_post_receive, git_pre_receive, git_update,
-    hg_changegroup, hg_pretxnchangegroup, svn_lock_token, svn_post_commit, svn_post_lock,
-    svn_post_revprop_change, svn_post_unlock, svn_pre_commit, svn_pre_lock, svn_pre_revprop_change,
-    svn_pre_unlock, svn_start_commit, svn_told, svn_told_unconfigured,
+    HookRun, HookTimes, HookTimesTable, Learns, Lesson, LockToken, Outcome, PendingView, Phase,
+    RefUpdate, RevpropAction, RevpropChange, StartRefused, Step, SvnError, SvnHooksEnv,
+    SvnLockToken, SvnTold, Unconfigured, View, Words, WordsFrom, git_post_receive, git_pre_receive,
+    git_update, hg_changegroup, hg_pretxnchangegroup, svn_lock_token, svn_post_commit,
+    svn_post_lock, svn_post_revprop_change, svn_post_unlock, svn_pre_commit, svn_pre_lock,
+    svn_pre_revprop_change, svn_pre_unlock, svn_start_commit, svn_told, svn_told_unconfigured,
   };
   use crate::daemon::LIVENESS_BUDGET_NS;
 
@@ -1708,10 +1737,10 @@ mod tests {
   /// Shape: the zero object name of a SHA-1 repository, which a creating command's old value is.
   const ZERO: &str = "0000000000000000000000000000000000000000";
 
-  /// A hook's times after eight quick runs finished.
+  /// A hook's times after [`super::RUNS_FOR_A_BOUND`] quick runs finished, the fewest a bound rests on.
   fn learned() -> HookTimes {
     let mut times = HookTimes::default();
-    for _ in 0..8 {
+    for _ in 0..super::RUNS_FOR_A_BOUND {
       let (mut run, _) = HookRun::started(START_NS, &times, CAP);
       let step = run.on(Event::OutputEnded, &mut times);
       assert_eq!(
@@ -2932,8 +2961,10 @@ mod tests {
   }
 
   /// A-597 (§4.17.1: "Before a hook has run, its deadline is its push's connection ... and that run is the first
-  /// sample"). Do: run a hook with nothing learned; it writes, ends its output and exits 0. Expect: no timer at any
-  /// step, accepted with its words, and the hook now holds a learned bound past the run's own length.
+  /// sample"). Do: run a hook with nothing learned; it writes, ends its output and exits 0; then teach it as many runs
+  /// as long as that one as a bound rests on. Expect: no timer at any step, accepted with its words; the run the hook's
+  /// first sample, which alone holds no later run to a bound ([`super::RUNS_FOR_A_BOUND`], main 01a20182's ruling of
+  /// 2026-11-25); and once the runs are enough, a learned bound past their length.
   #[test]
   fn a_hooks_first_run_has_no_deadline_but_its_client_and_becomes_its_first_sample() {
     let mut times = HookTimes::default();
@@ -2964,15 +2995,23 @@ mod tests {
         end_leftovers: false,
       }
     );
+    assert_eq!(
+      (times.finished_runs(), times.bound_ns()),
+      (1, None),
+      "one run is a sample, not a bound"
+    );
+    for _ in 1..super::RUNS_FOR_A_BOUND {
+      times.finished(ran_ns);
+    }
     assert!(
       times.bound_ns().is_some_and(|bound| bound > ran_ns),
-      "a first run five windows long is waited for past its length next time: {:?}",
+      "runs five windows long are waited for past their length once enough: {:?}",
       times.bound_ns()
     );
   }
 
   /// main 01a20182's flake of 2026-11-22 (the DAV revprop test in the parallel daemon_edge set, 3 of 16 runs under
-  /// load: "Revprop change blocked by pre-revprop-change hook (exit code 0) with no output"). Do: after eight quick
+  /// load: "Revprop change blocked by pre-revprop-change hook (exit code 0) with no output"). Do: after a bound's quick
   /// runs, run the hook again and let the timer fire at its deadline before its exit is seen; the hook had already
   /// exited on its own, status 0, so the kill finds nothing to end and the exit then reports that status. Expect: the
   /// run judged by its own exit, accepted with its words, its leftovers ended; the cut still taught (the next bound
@@ -3006,9 +3045,9 @@ mod tests {
     assert_eq!(times.bound_ns(), Some(2 * bound));
   }
 
-  /// A-597 (the learned deadline, RFC 6298 with Karn's rule and the back-off). Do: after eight quick runs, run the hook
-  /// again and let the timer fire just before, then at, its deadline; it writes while being killed, then exits by the
-  /// kill. Then run it once more and let it finish. Expect: the timer is armed at the start plus the learned bound;
+  /// A-597 (the learned deadline, RFC 6298 with Karn's rule and the back-off). Do: after a bound's quick runs, run the
+  /// hook again and let the timer fire just before, then at, its deadline; it writes while being killed, then exits by
+  /// the kill. Then run it once more and let it finish. Expect: the timer is armed at the start plus the learned bound;
   /// nothing happens before it; at it the hook is killed and timed out naming the bound, with its words; the next
   /// bound is doubled; and a run that finishes ends the back-off.
   #[test]
@@ -3065,7 +3104,10 @@ mod tests {
       Some(2 * bound),
       "a run cut at its bound doubles the next"
     );
-    assert_eq!((times.finished_runs(), times.cut_runs()), (8, 1));
+    assert_eq!(
+      (times.finished_runs(), times.cut_runs()),
+      (super::RUNS_FOR_A_BOUND, 1)
+    );
     let (mut run, _) = HookRun::started(START_NS, &times, CAP);
     run.on(Event::OutputEnded, &mut times);
     run.on(
@@ -3107,7 +3149,11 @@ mod tests {
           end_leftovers: false,
         }
       );
-      assert!(times.bound_ns().is_some());
+      assert_eq!(
+        times.finished_runs(),
+        1,
+        "the run finished on its own: a sample"
+      );
     }
   }
 
@@ -3134,7 +3180,10 @@ mod tests {
       }
     );
     assert_eq!(times.bound_ns(), before);
-    assert_eq!((times.finished_runs(), times.cut_runs()), (8, 0));
+    assert_eq!(
+      (times.finished_runs(), times.cut_runs()),
+      (super::RUNS_FOR_A_BOUND, 0)
+    );
     let mut first = HookTimes::default();
     let (mut run, _) = HookRun::started(START_NS, &first, CAP);
     run.on(Event::ClientLeft, &mut first);
@@ -3218,7 +3267,7 @@ mod tests {
     );
     assert_eq!(
       (times.finished_runs(), times.cut_runs()),
-      (9, 0),
+      (super::RUNS_FOR_A_BOUND + 1, 0),
       "its exit was a sample; the leftovers' end was no cut"
     );
     let (mut run, _) = HookRun::started(START_NS, &times, CAP);
@@ -3557,9 +3606,10 @@ mod tests {
     )
   }
 
-  /// A-665 part 4b (A-622's table of learned times). Do: teach a repository's hook one finished
-  /// run; then reconfigure it to run another program; then teach another hook under a policy that
-  /// no longer configures the first. Expect: the first hook learned a bound past the run's length,
+  /// A-665 part 4b (A-622's table of learned times). Do: teach a repository's hook as many finished
+  /// runs as a bound rests on; then reconfigure it to run another program; then teach another hook
+  /// under a policy that no longer configures the first. Expect: the first hook learned a bound past
+  /// the runs' length,
   /// another repository's hook of the same name nothing; the reconfigured hook starts unlearned;
   /// the hook its policy dropped is forgotten.
   #[test]
@@ -3577,9 +3627,11 @@ mod tests {
       ..Default::default()
     };
     let mut table = HookTimesTable::default();
-    table.teach(repository, &policy, &first, finished);
+    for _ in 0..super::RUNS_FOR_A_BOUND {
+      table.teach(repository, &policy, &first, finished);
+    }
     let (runs, bound) = learned_of(&table, repository, &first);
-    assert_eq!(runs, Some(1));
+    assert_eq!(runs, Some(super::RUNS_FOR_A_BOUND));
     assert!(bound.is_some_and(|bound| bound > QUICK_NS), "{bound:?}");
     assert_eq!(learned_of(&table, other, &first), (None, None));
     let moved = configured_hook("pre-receive", "/hooks/another");

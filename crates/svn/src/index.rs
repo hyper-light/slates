@@ -909,14 +909,196 @@ impl Index {
   /// changes nothing: the revision it makes, ready for [`Index::commit_planned`]. An owner checks a revision so
   /// before its log records it and commits it after, so a record the index refuses is never recorded (A-655).
   pub fn plan(&self, record: RevisionRecord, room: usize) -> Result<Planned, IndexRefusal> {
+    let mut planning = self.plan_begin(record, room)?;
+    loop {
+      match self.plan_step(planning, &mut || false)? {
+        PlanStep::More(more) => planning = *more,
+        PlanStep::Planned(planned) => return Ok(planned),
+      }
+    }
+  }
+
+  /// [`Index::plan`] begun (A-920 piece 2): the record's transaction name checked and its revision's new root made;
+  /// its rows checked, put in path order and applied, and the revision built and checked, by [`Index::plan_step`] a
+  /// unit at a time (A-920 2d).
+  ///
+  /// # Errors
+  /// [`Index::plan`]'s, for the name and the youngest root.
+  pub fn plan_begin(&self, record: RevisionRecord, room: usize) -> Result<Planning, IndexRefusal> {
     let revision = self.youngest.checked_add(1).ok_or(IndexRefusal::Corrupt)?;
     check_transaction_name(&record.transaction)?;
-    let changes = sorted_rows(record.changes)?;
-    let mut builder = Builder::new(self, revision)?;
-    for change in &changes {
-      builder.apply(change)?;
+    let built = Builder::new(self, revision)?.detach();
+    Ok(Planning {
+      revision,
+      transaction: record.transaction,
+      changes: record.changes,
+      phase: PlanPhase::Checking(0),
+      order: RowOrder::default(),
+      room,
+      built,
+      events: Vec::new(),
+      map_bytes: 0,
+      units: 0,
+    })
+  }
+
+  /// One step of `planning` ([`Index::plan_begin`]): its units taken, one at least, until `spent` says the step's slice
+  /// is spent (A-920 2d; whole, the rows' sort and the revision's finish had each been one step's unit, 3.4 and 4.4 ms
+  /// at 9,000 files in debug, 1,013-1,122 µs in release). Its rows checked a row a unit, as [`Index::plan`] checks them;
+  /// their sorted runs found a row a unit and merged by a heap of the runs a row a unit, a path met twice refused
+  /// [`IndexRefusal::Duplicate`] where its two rows meet ([`RowOrder`]); the rows applied in that order a row a unit;
+  /// the revision's paths numbered a path a unit, each event checked against the paths numbered so far; its maps'
+  /// bytes summed a map a unit; then the rows put in path order in place, a swap a unit, and the plan checked against
+  /// the room. The index stands where the plan began between its steps: a revision appended since is refused out of
+  /// date, as [`Index::commit_planned`] refuses one.
+  ///
+  /// # Errors
+  /// [`Index::plan`]'s, and [`IndexRefusal::OutOfDate`] where a revision was appended since the plan began.
+  pub fn plan_step(
+    &self,
+    mut planning: Planning,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<PlanStep, IndexRefusal> {
+    let next = self.youngest.checked_add(1).ok_or(IndexRefusal::Corrupt)?;
+    if planning.revision != next {
+      return Err(IndexRefusal::OutOfDate {
+        planned: planning.revision,
+        next,
+      });
     }
-    let plan = builder.finish()?;
+    loop {
+      if planning.phase == PlanPhase::Done {
+        return self.planned_at_end(planning).map(PlanStep::Planned);
+      }
+      self.plan_unit(&mut planning)?;
+      planning.units = planning.units.saturating_add(1);
+      if planning.phase != PlanPhase::Done && spent() {
+        return Ok(PlanStep::More(Box::new(planning)));
+      }
+    }
+  }
+
+  /// One unit of `planning`'s phase ([`Index::plan_step`]).
+  fn plan_unit(&self, planning: &mut Planning) -> Result<(), IndexRefusal> {
+    let len = planning.changes.len();
+    planning.phase = match planning.phase {
+      PlanPhase::Checking(at) => match planning.changes.get(at) {
+        Some(change) => {
+          check_row(change)?;
+          PlanPhase::Checking(at.saturating_add(1))
+        }
+        None if len == 0 => PlanPhase::Applying(0),
+        None => PlanPhase::Runs(0),
+      },
+      PlanPhase::Runs(at) => {
+        if planning.order.find_run(&planning.changes, at) {
+          PlanPhase::Merging
+        } else {
+          PlanPhase::Runs(at.saturating_add(1))
+        }
+      }
+      PlanPhase::Merging => {
+        if planning.order.merge_one(&planning.changes)? {
+          PlanPhase::Merging
+        } else {
+          PlanPhase::Applying(0)
+        }
+      }
+      PlanPhase::Applying(at) => self.apply_unit(planning, at)?,
+      PlanPhase::Interning => self.intern_unit(planning)?,
+      PlanPhase::Bytes(at) => match planning.built.maps.get(at) {
+        Some(map) => {
+          planning.map_bytes = planning
+            .map_bytes
+            .checked_add(map.bytes())
+            .ok_or(IndexRefusal::Corrupt)?;
+          PlanPhase::Bytes(at.saturating_add(1))
+        }
+        None => PlanPhase::Sorting(0),
+      },
+      PlanPhase::Sorting(at) => {
+        if planning.order.sort_one(&mut planning.changes, at) {
+          PlanPhase::Sorting(at.saturating_add(1))
+        } else {
+          PlanPhase::Done
+        }
+      }
+      PlanPhase::Done => PlanPhase::Done,
+    };
+    Ok(())
+  }
+
+  /// The row ranked `at` in path order applied to the revision being built; once every one is, the paths' numbering
+  /// next.
+  fn apply_unit(&self, planning: &mut Planning, at: usize) -> Result<PlanPhase, IndexRefusal> {
+    let row = planning
+      .order
+      .order
+      .get(at)
+      .and_then(|row| usize::try_from(*row).ok())
+      .and_then(|row| planning.changes.get(row));
+    let Some(change) = row else {
+      return Ok(PlanPhase::Interning);
+    };
+    let built = core::mem::take(&mut planning.built);
+    let mut builder = Builder::attach(self, built);
+    let applied = builder.apply(change);
+    planning.built = builder.detach();
+    applied?;
+    Ok(PlanPhase::Applying(at.saturating_add(1)))
+  }
+
+  /// The next path the revision did something at numbered ([`Builder::intern`]) and its event kept, checked against the
+  /// paths numbered so far, as [`Index::check_plan`] checks a whole plan's; once every one is, the maps' bytes next.
+  fn intern_unit(&self, planning: &mut Planning) -> Result<PlanPhase, IndexRefusal> {
+    let Some((path, done)) = planning.built.staged.pop_first() else {
+      return Ok(PlanPhase::Bytes(0));
+    };
+    let built = core::mem::take(&mut planning.built);
+    let mut builder = Builder::attach(self, built);
+    let numbered = builder.intern(&path);
+    let named = self.paths.len().checked_add(builder.new_paths.len());
+    planning.built = builder.detach();
+    let number = numbered?;
+    if named.is_none_or(|named| number >= named) {
+      return Err(IndexRefusal::Corrupt);
+    }
+    planning.events.push((number, done));
+    Ok(PlanPhase::Interning)
+  }
+
+  /// `planning` at its end: its plan made of what it built and checked against the room ([`Index::planned`]).
+  fn planned_at_end(&self, planning: Planning) -> Result<Planned, IndexRefusal> {
+    let Planning {
+      revision,
+      transaction,
+      changes,
+      room,
+      built,
+      events,
+      map_bytes,
+      units,
+      ..
+    } = planning;
+    let plan = Plan {
+      rows: built.rows,
+      paths: built.new_paths,
+      events,
+      deletions: built.deletions,
+      maps: built.maps,
+      map_bytes,
+    };
+    self.planned(plan, room).map(|plan| Planned {
+      revision,
+      plan,
+      transaction,
+      changes,
+      units,
+    })
+  }
+
+  /// A revision's plan built ([`Index::plan_step`]) checked against the room and the index: the plan.
+  fn planned(&self, plan: Plan, room: usize) -> Result<Plan, IndexRefusal> {
     let needed = self
       .rows
       .len()
@@ -930,34 +1112,121 @@ impl Index {
     if needed > room {
       return Err(IndexRefusal::Room { needed, room });
     }
-    self.check_plan(&plan)?;
-    Ok(Planned {
-      revision,
-      plan,
-      transaction: record.transaction,
-      changes,
-    })
+    Ok(plan)
   }
 
   /// Commits a revision [`Index::plan`] checked, and answers its number. Refused with nothing changed when a revision
   /// was appended since the plan was made ([`IndexRefusal::OutOfDate`]): the plan numbers its rows and paths after the
   /// index as it was then.
   pub fn commit_planned(&mut self, planned: Planned) -> Result<Revision, IndexRefusal> {
-    let next = self.youngest.checked_add(1).ok_or(IndexRefusal::Corrupt)?;
-    if planned.revision != next {
-      return Err(IndexRefusal::OutOfDate {
-        planned: planned.revision,
-        next,
-      });
+    let mut committing = self.commit_begin(planned)?;
+    loop {
+      if let Some(revision) = self.commit_step(&mut committing, &mut || false)? {
+        return Ok(revision);
+      }
     }
+  }
+
+  /// [`Index::commit_planned`] begun (A-920 piece 5b): refused with nothing changed where a revision was appended since
+  /// the plan was made; its paths and their events then added by [`Index::commit_step`] a slice at a time.
+  ///
+  /// # Errors
+  /// [`IndexRefusal::OutOfDate`] where a revision was appended since the plan was made.
+  pub fn commit_begin(&self, planned: Planned) -> Result<Committing, IndexRefusal> {
+    self.next_is(planned.revision)?;
     let Planned {
       revision,
       plan,
       transaction,
       changes,
+      ..
     } = planned;
-    self.commit(revision, plan, transaction, changes);
-    Ok(revision)
+    Ok(Committing {
+      revision,
+      paths: plan.paths.into_iter(),
+      rows: Some((plan.rows, plan.maps)),
+      events: plan.events.into_iter(),
+      deletions: plan.deletions,
+      map_bytes: plan.map_bytes,
+      entry: Some(RevisionEntry {
+        transaction: Some(transaction.into_boxed_str()),
+        changes,
+      }),
+    })
+  }
+
+  /// One step of `committing` ([`Index::commit_begin`]), a unit at least, until `spent`: its new paths named, a path a
+  /// unit; its node-revisions and maps added; its events recorded at its paths, an event a unit; then, in its last
+  /// step, the revision itself, which no read reached before. Until then the index reads as it did before the commit
+  /// began: what a step adds is reached only through the revision, and every read is at or below the youngest. The
+  /// revision once committed; none while more remains.
+  ///
+  /// # Errors
+  /// [`IndexRefusal::OutOfDate`] where a revision was appended since the commit began.
+  pub fn commit_step(
+    &mut self,
+    committing: &mut Committing,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<Option<Revision>, IndexRefusal> {
+    self.next_is(committing.revision)?;
+    loop {
+      if !self.commit_unit(committing) {
+        return Ok(Some(self.commit_end(committing)));
+      }
+      if spent() {
+        return Ok(None);
+      }
+    }
+  }
+
+  /// The next unit of `committing`: a path named, its node-revisions and maps added, or an event recorded. Whether one
+  /// was left to take.
+  fn commit_unit(&mut self, committing: &mut Committing) -> bool {
+    if let Some(path) = committing.paths.next() {
+      self.numbers.insert(path.clone(), self.paths.len());
+      self.paths.push(PathEntry {
+        path,
+        history: Vec::new(),
+        shapes: Vec::new(),
+      });
+      return true;
+    }
+    if let Some((rows, maps)) = committing.rows.take() {
+      self.rows.extend(rows);
+      self.maps.extend(maps);
+      return true;
+    }
+    let Some((number, staged)) = committing.events.next() else {
+      return false;
+    };
+    if let Some(entry) = self.paths.get_mut(number) {
+      entry.record(committing.revision, staged);
+    }
+    true
+  }
+
+  /// `committing`'s last step: the revision, its deletions and its maps' bytes counted. The revision.
+  fn commit_end(&mut self, committing: &mut Committing) -> Revision {
+    if let Some(entry) = committing.entry.take() {
+      self.revisions.push(entry);
+    }
+    self.map_bytes = self.map_bytes.saturating_add(committing.map_bytes);
+    self.deletions = self.deletions.saturating_add(committing.deletions);
+    self.youngest = committing.revision;
+    committing.revision
+  }
+
+  /// Refused out of date unless `revision` is the next.
+  fn next_is(&self, revision: Revision) -> Result<(), IndexRefusal> {
+    let next = self.youngest.checked_add(1).ok_or(IndexRefusal::Corrupt)?;
+    if revision == next {
+      Ok(())
+    } else {
+      Err(IndexRefusal::OutOfDate {
+        planned: revision,
+        next,
+      })
+    }
   }
 
   /// The transaction `work` makes on revision `base` (§4.17.4 item 3), as FSFS builds it from the drive, never
@@ -1254,52 +1523,6 @@ impl Index {
     }
     latest
   }
-
-  /// Refuses a plan naming a path past those it adds, so that [`Index::commit`] cannot miss one.
-  fn check_plan(&self, plan: &Plan) -> Result<(), IndexRefusal> {
-    let named = self
-      .paths
-      .len()
-      .checked_add(plan.paths.len())
-      .ok_or(IndexRefusal::Corrupt)?;
-    if plan.events.iter().all(|(number, _)| *number < named) {
-      Ok(())
-    } else {
-      Err(IndexRefusal::Corrupt)
-    }
-  }
-
-  /// Applies a checked plan: nothing here can be refused.
-  fn commit(
-    &mut self,
-    revision: Revision,
-    plan: Plan,
-    transaction: String,
-    changes: Vec<ChangedPath>,
-  ) {
-    for path in plan.paths {
-      self.numbers.insert(path.clone(), self.paths.len());
-      self.paths.push(PathEntry {
-        path,
-        history: Vec::new(),
-        shapes: Vec::new(),
-      });
-    }
-    self.rows.extend(plan.rows);
-    self.maps.extend(plan.maps);
-    self.map_bytes = self.map_bytes.saturating_add(plan.map_bytes);
-    for (number, staged) in plan.events {
-      if let Some(entry) = self.paths.get_mut(number) {
-        entry.record(revision, staged);
-      }
-    }
-    self.revisions.push(RevisionEntry {
-      transaction: Some(transaction.into_boxed_str()),
-      changes,
-    });
-    self.youngest = revision;
-    self.deletions = self.deletions.saturating_add(plan.deletions);
-  }
 }
 
 impl PathEntry {
@@ -1342,6 +1565,26 @@ pub struct Planned {
   transaction: String,
   /// The changed-path rows, sorted by path.
   changes: Vec<ChangedPath>,
+  /// The units its plan took ([`Index::plan_step`], A-920 2d's non-vacuity count): a row's check, its run's look, its
+  /// merge, its apply and its sort, each path's numbering and each map's bytes.
+  units: u64,
+}
+
+impl Planned {
+  /// The units its plan took ([`Planned::units`]'s field).
+  pub fn units(&self) -> u64 {
+    self.units
+  }
+}
+
+impl Committing {
+  /// The changed-path rows of the revision it commits, sorted by path.
+  pub fn changes(&self) -> &[ChangedPath] {
+    self
+      .entry
+      .as_ref()
+      .map_or(&[][..], |entry| entry.changes.as_slice())
+  }
 }
 
 impl Planned {
@@ -1354,6 +1597,276 @@ impl Planned {
   pub fn changes(&self) -> &[ChangedPath] {
     &self.changes
   }
+}
+
+/// A revision's record being planned a slice at a time ([`Index::plan_begin`], [`Index::plan_step`]; A-920 pieces 2 and
+/// 2d): its rows checked, put in path order and applied, the revision built and checked, a unit at a time.
+#[derive(Debug)]
+pub struct Planning {
+  /// The revision it makes.
+  revision: Revision,
+  /// The transaction's name.
+  transaction: String,
+  /// The changed-path rows, as the record listed them until put in path order at the plan's end.
+  changes: Vec<ChangedPath>,
+  /// Where it stands.
+  phase: PlanPhase,
+  /// The rows' path order.
+  order: RowOrder,
+  /// The entries the index may hold with it.
+  room: usize,
+  /// The revision built so far.
+  built: Built,
+  /// What it did at each path numbered so far, in path order.
+  events: Vec<(usize, Staged)>,
+  /// Its maps' bytes summed so far.
+  map_bytes: usize,
+  /// The units taken so far ([`Planned::units`]).
+  units: u64,
+}
+
+/// Where a [`Planning`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlanPhase {
+  /// Its rows checked, from this one.
+  Checking(usize),
+  /// Its rows' sorted runs found, from this row.
+  Runs(usize),
+  /// The runs merged in path order, a row a unit.
+  Merging,
+  /// Its rows applied in path order, from this rank.
+  Applying(usize),
+  /// The paths the revision did something at numbered, a path a unit.
+  Interning,
+  /// Its maps' bytes summed, from this map.
+  Bytes(usize),
+  /// Its rows put in path order in place, from this rank.
+  Sorting(usize),
+  /// Built and checked; its plan made at the next step.
+  Done,
+}
+
+/// The rows' path order, found a unit at a time with no sort of the whole (A-920 2d): the rows' sorted runs found a row
+/// a unit (a dump lists a revision's paths in path order, so its rows are few runs), then merged by a heap of the runs,
+/// least path first, a row a unit, a path met twice refused where its two rows meet. The order then puts the rows in
+/// place a swap a unit.
+#[derive(Debug, Default)]
+struct RowOrder {
+  /// Each run's next row and its end.
+  runs: Vec<(usize, usize)>,
+  /// The runs' indices not yet merged out, a heap by each one's next path, least at the top.
+  heap: Vec<usize>,
+  /// The rows in path order, by their place in the record.
+  order: Vec<u32>,
+  /// Each row's rank in `order`, by its place now (filled once the merge ends; kept through the sort).
+  rank_of: Vec<u32>,
+  /// Where the run being found begins.
+  run_start: usize,
+}
+
+impl RowOrder {
+  /// The path of run `run`'s next row.
+  fn key<'c>(&self, changes: &'c [ChangedPath], run: usize) -> Option<&'c str> {
+    let (next, _) = *self.runs.get(run)?;
+    changes.get(next).map(|change| change.path.as_str())
+  }
+
+  /// Whether the heap's entry at `a` goes before the one at `b`.
+  fn before(&self, changes: &[ChangedPath], (a, b): (usize, usize)) -> bool {
+    let (Some(&a), Some(&b)) = (self.heap.get(a), self.heap.get(b)) else {
+      return false;
+    };
+    self.key(changes, a) < self.key(changes, b)
+  }
+
+  /// Run `run` added to the heap.
+  fn push(&mut self, changes: &[ChangedPath], run: usize) {
+    self.heap.push(run);
+    let mut at = self.heap.len().saturating_sub(1);
+    while at > 0 {
+      let parent = at.saturating_sub(1) / 2;
+      if !self.before(changes, (at, parent)) {
+        break;
+      }
+      self.heap.swap(at, parent);
+      at = parent;
+    }
+  }
+
+  /// The heap's top moved down to its place.
+  fn sift_down(&mut self, changes: &[ChangedPath]) {
+    let mut at = 0usize;
+    loop {
+      let left = at.saturating_mul(2).saturating_add(1);
+      let right = left.saturating_add(1);
+      let mut least = at;
+      if left < self.heap.len() && self.before(changes, (left, least)) {
+        least = left;
+      }
+      if right < self.heap.len() && self.before(changes, (right, least)) {
+        least = right;
+      }
+      if least == at {
+        return;
+      }
+      self.heap.swap(at, least);
+      at = least;
+    }
+  }
+
+  /// Row `at` met in the runs' walk: a run ends before it where its path goes before the one before it. Whether it was
+  /// the last row.
+  fn find_run(&mut self, changes: &[ChangedPath], at: usize) -> bool {
+    let earlier = at.checked_sub(1).and_then(|before| changes.get(before));
+    if let (Some(earlier), Some(change)) = (earlier, changes.get(at))
+      && change.path < earlier.path
+    {
+      self.close_run(changes, at);
+    }
+    let last = at.saturating_add(1) >= changes.len();
+    if last {
+      self.close_run(changes, changes.len());
+    }
+    last
+  }
+
+  /// The run being found ends before `end`, a run of the heap where it holds any row.
+  fn close_run(&mut self, changes: &[ChangedPath], end: usize) {
+    if end > self.run_start {
+      let run = self.runs.len();
+      self.runs.push((self.run_start, end));
+      self.push(changes, run);
+    }
+    self.run_start = end;
+  }
+
+  /// The row of least path left put next in the order: whether any was left. Its path met twice is refused.
+  ///
+  /// # Errors
+  /// [`IndexRefusal::Duplicate`] where the row's path is the one before it in the order.
+  fn merge_one(&mut self, changes: &[ChangedPath]) -> Result<bool, IndexRefusal> {
+    let Some(&top) = self.heap.first() else {
+      self.ranked(changes.len())?;
+      return Ok(false);
+    };
+    let (next, end) = *self.runs.get(top).ok_or(IndexRefusal::Corrupt)?;
+    let row = changes.get(next).ok_or(IndexRefusal::Corrupt)?;
+    let last = self
+      .order
+      .last()
+      .and_then(|last| usize::try_from(*last).ok())
+      .and_then(|last| changes.get(last));
+    if last.is_some_and(|last| last.path == row.path) {
+      return Err(IndexRefusal::Duplicate {
+        path: row.path.clone(),
+      });
+    }
+    self
+      .order
+      .push(u32::try_from(next).map_err(|_| IndexRefusal::Corrupt)?);
+    let after = next.saturating_add(1);
+    if let Some(run) = self.runs.get_mut(top) {
+      run.0 = after;
+    }
+    if after >= end {
+      self.heap.swap_remove(0);
+    }
+    self.sift_down(changes);
+    Ok(true)
+  }
+
+  /// The merge ended: each row's rank, by its place (one allocation for every row).
+  fn ranked(&mut self, rows: usize) -> Result<(), IndexRefusal> {
+    self.rank_of = vec![0; rows];
+    for (rank, row) in self.order.iter().enumerate() {
+      let rank = u32::try_from(rank).map_err(|_| IndexRefusal::Corrupt)?;
+      let row = usize::try_from(*row).map_err(|_| IndexRefusal::Corrupt)?;
+      *self.rank_of.get_mut(row).ok_or(IndexRefusal::Corrupt)? = rank;
+    }
+    Ok(())
+  }
+
+  /// The row ranked `at` swapped into its place in `changes`, the one there moved to where the ranked one stood: whether
+  /// any was left. `order` then names where each rank's row stands now.
+  fn sort_one(&mut self, changes: &mut [ChangedPath], at: usize) -> bool {
+    let Some(from) = self
+      .order
+      .get(at)
+      .and_then(|from| usize::try_from(*from).ok())
+    else {
+      return false;
+    };
+    if from != at && from < changes.len() && at < changes.len() {
+      changes.swap(at, from);
+      // The row that stood at `at` now stands at `from`: its rank's place is `from`.
+      if let Some(moved) = self.rank_of.get(at).copied() {
+        if let Some(place) = usize::try_from(moved)
+          .ok()
+          .and_then(|moved| self.order.get_mut(moved))
+        {
+          *place = u32::try_from(from).unwrap_or(u32::MAX);
+        }
+        if let Some(rank) = self.rank_of.get_mut(from) {
+          *rank = moved;
+        }
+      }
+    }
+    true
+  }
+}
+
+/// What a step of [`Index::plan_step`] left.
+#[derive(Debug)]
+pub enum PlanStep {
+  /// Rows left to apply, at the next step.
+  More(Box<Planning>),
+  /// Every row applied: the revision planned, for [`Index::commit_planned`].
+  Planned(Planned),
+}
+
+/// A [`Builder`]'s revision without its index, held between a plan's steps ([`Builder::detach`]).
+#[derive(Debug, Default)]
+struct Built {
+  /// The revision being built.
+  revision: Revision,
+  /// The revision it is built against.
+  previous: Revision,
+  /// The node-revisions made so far.
+  rows: Vec<Row>,
+  /// What has been done at each path so far.
+  staged: BTreeMap<String, Staged>,
+  /// The paths named so far that the index has not named, in number order.
+  new_paths: Vec<Box<str>>,
+  /// Their numbers.
+  new_numbers: BTreeMap<Box<str>, usize>,
+  /// The next node identity's number.
+  next_node: u64,
+  /// The next copy identity's number.
+  next_copy: u64,
+  /// The deletions made so far.
+  deletions: usize,
+  /// The children maps' nodes made so far, numbered after the index's (A-759).
+  maps: Vec<children::MapNode>,
+}
+
+/// A planned revision being committed a slice at a time ([`Index::commit_begin`], [`Index::commit_step`]; A-920 piece
+/// 5b).
+#[derive(Debug)]
+pub struct Committing {
+  /// The revision it commits.
+  revision: Revision,
+  /// Its new paths, not yet named.
+  paths: std::vec::IntoIter<Box<str>>,
+  /// Its node-revisions and maps' nodes, until added.
+  rows: Option<(Vec<Row>, Vec<children::MapNode>)>,
+  /// Its events at its paths, not yet recorded.
+  events: std::vec::IntoIter<(usize, Staged)>,
+  /// Its deletions.
+  deletions: usize,
+  /// Its maps' bytes.
+  map_bytes: usize,
+  /// The revision's own entry, until its last step.
+  entry: Option<RevisionEntry>,
 }
 
 /// A revision built and checked, ready to be committed.
@@ -1560,6 +2073,39 @@ impl<'index> Builder<'index> {
     Ok(builder)
   }
 
+  /// The revision built so far, its index let go, to be taken up again by [`Builder::attach`] against the same index.
+  fn detach(self) -> Built {
+    Built {
+      revision: self.revision,
+      previous: self.previous,
+      rows: self.rows,
+      staged: self.staged,
+      new_paths: self.new_paths,
+      new_numbers: self.new_numbers,
+      next_node: self.next_node,
+      next_copy: self.next_copy,
+      deletions: self.deletions,
+      maps: self.maps,
+    }
+  }
+
+  /// The revision [`Builder::detach`] let go, built on against `index`, the index it was built against.
+  fn attach(index: &'index Index, built: Built) -> Self {
+    Self {
+      index,
+      revision: built.revision,
+      previous: built.previous,
+      rows: built.rows,
+      staged: built.staged,
+      new_paths: built.new_paths,
+      new_numbers: built.new_numbers,
+      next_node: built.next_node,
+      next_copy: built.next_copy,
+      deletions: built.deletions,
+      maps: built.maps,
+    }
+  }
+
   /// Applies one row, as FSFS applies the editor call it records.
   fn apply(&mut self, change: &ChangedPath) -> Result<(), IndexRefusal> {
     if change.path == ROOT && change.action != Action::Modify {
@@ -1572,24 +2118,6 @@ impl<'index> Builder<'index> {
       Action::Delete => self.delete(change, &mut ancestors, own),
       Action::Modify => self.modify(change, ancestors, own),
     }
-  }
-
-  /// The revision built: its rows, its new paths, and what it did at each path.
-  fn finish(mut self) -> Result<Plan, IndexRefusal> {
-    let staged = std::mem::take(&mut self.staged);
-    let mut events = Vec::with_capacity(staged.len());
-    for (path, done) in staged {
-      events.push((self.intern(&path)?, done));
-    }
-    let map_bytes = self.maps.iter().map(children::MapNode::bytes).sum();
-    Ok(Plan {
-      rows: self.rows,
-      paths: self.new_paths,
-      events,
-      deletions: self.deletions,
-      maps: self.maps,
-      map_bytes,
-    })
   }
 
   /// `Add`: a new node or a copy at an absent path, its directories made mutable first.

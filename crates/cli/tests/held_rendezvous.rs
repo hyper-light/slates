@@ -205,3 +205,8 @@ fn a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon() {
     "held rendezvous: {KILLS} connects at a kill, all answered by the next daemon, longest {longest:?}"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

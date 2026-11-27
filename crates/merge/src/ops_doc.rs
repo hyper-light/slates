@@ -413,6 +413,14 @@ impl OpsDoc {
     crate::pace::finish(self.canonicalize_paced(&Ticks));
   }
 
+  /// `doc` put into canonical order ([`OpsDoc::canonicalize`]), owned, a unit at a time under the pace that drives
+  /// it ([`crate::pace::Pace::drive`]; A-920 piece 4a: 27 ms whole for an import's revision of 9,000 files, debug):
+  /// what an owner that holds the document across its steps drives a turn a step.
+  pub async fn canonicalized(mut doc: OpsDoc) -> OpsDoc {
+    doc.canonicalize_paced(&Ticks).await;
+    doc
+  }
+
   /// [`OpsDoc::canonicalize`] a unit at a time under `pace` (A-752): a path, a node or an operation a unit, the
   /// operations' sort a paced merge sort.
   pub(crate) async fn canonicalize_paced(&mut self, pace: &Ticks) {

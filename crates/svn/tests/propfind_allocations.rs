@@ -8,7 +8,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use slates_svn::dav::Bounds;
-use slates_svn::dav::site::{Answer, Request, Served, answer};
+use slates_svn::dav::site::{Answer, Budget, ReportProgress, Request, Served, answer};
 use slates_svn::dump::{Admission, Uuid};
 use slates_svn::lock::{AprTime, LockTable};
 use slates_svn::migration::{Importer, Importing, Repository, Room, Standalone};
@@ -129,7 +129,9 @@ fn imported() -> Standalone {
   }
 }
 
-/// The allocations this thread made answering a depth-1 PROPFIND of `/trunk` asking `body`, and the answer's bytes.
+/// The allocations this thread made answering a depth-1 PROPFIND of `/trunk` asking `body`, and the answer's bytes: a
+/// collection's multistatus streamed a child's response a step (A-893), driven to its end in one budget, its output
+/// sized before the count so that its growth is no response's.
 fn counted(repository: &Standalone, locks: &LockTable, body: &[u8]) -> (usize, usize) {
   let served = Served {
     index: repository.index(),
@@ -147,14 +149,40 @@ fn counted(repository: &Standalone, locks: &LockTable, body: &[u8]) -> (usize, u
     label: None,
     body,
   };
+  let mut out = Vec::with_capacity(1 << 24);
   let before = CALLS.get();
-  let answered = answer(&served, &request, &BOUNDS, 1 << 24);
-  let calls = CALLS.get() - before;
-  let Answer::Whole(whole) = answered else {
-    panic!("a whole answer was due")
+  let bytes = match answer(&served, &request, &BOUNDS, 1 << 24) {
+    Answer::Whole(whole) => {
+      assert_eq!(whole.status, 207);
+      whole.body.len()
+    }
+    Answer::Report(mut report) => {
+      assert_eq!(report.status(), 207);
+      streamed(&served, &mut report, &mut out)
+    }
+    Answer::Text { .. } => panic!("a multistatus was due"),
   };
-  assert_eq!(whole.status, 207);
-  (calls, whole.body.len())
+  (CALLS.get() - before, bytes)
+}
+
+/// `report`, a PROPFIND's streamed multistatus, written into `out` to its end: its bytes.
+fn streamed(
+  served: &Served<'_, Standalone>,
+  report: &mut slates_svn::dav::site::Report,
+  out: &mut Vec<u8>,
+) -> usize {
+  loop {
+    let budget = Budget {
+      room: 1 << 24,
+      steps: usize::MAX,
+      quantum: None,
+    };
+    match report.resume(served, out, budget) {
+      ReportProgress::More => {}
+      ReportProgress::Done => return out.len(),
+      _ => panic!("a whole multistatus was due"),
+    }
+  }
 }
 
 /// MEMORY SIZING. Do: PROPFIND `/trunk` (32 files, each with a property) at depth 1, once asking `svn info`'s six

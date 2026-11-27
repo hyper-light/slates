@@ -534,3 +534,8 @@ fn judge_loop(in_loop: Gained, looped: &LoopRun, hold: Duration) {
      {ramp} returns of the longest, {longest_return:?}; {asked} questions) and R9's tail of {tail}"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

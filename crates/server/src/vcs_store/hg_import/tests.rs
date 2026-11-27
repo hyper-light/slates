@@ -14,12 +14,14 @@ use slates_vcs::ContentStore;
 
 use super::{
   ABANDONED, DONE, Finished, ImportFailed, Importing, LANDED, LANDING_REFUSED, REFUSED, STARTED,
-  Stage, TURNS, Turned, begin, land, land_imported, run, turn,
+  Stage, TURNS, Turned, begin, land, land_imported_awaited, run, turn,
 };
 use crate::hg_base::HgBase;
 use crate::hg_base::tests::{Files, STATES, laid_out};
 use crate::repository::hg_push::BOOKMARK_TAG;
+use crate::repository::svn_commit::tests::on;
 use crate::state::ShardState;
+use crate::test_store::run_on_stored_shard;
 use crate::verbs::dispatch;
 
 /// An index's rows, each its key and its body.
@@ -57,7 +59,6 @@ fn owner() -> Principal {
   }
 }
 
-/// Creates repository `name` of `tool` on the shard: its id.
 /// [`created`] on `daemon`'s first shard as a client's creation is made, this thread waiting for its record
 /// ([`crate::test_store::create_on`]), so the shard is never held through the store's commit
 /// (docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md).
@@ -71,25 +72,12 @@ pub(crate) fn created_on(daemon: &crate::Daemon, name: &str, tool: VcsTool) -> R
   .0
 }
 
-pub(crate) fn created(state: &mut ShardState, name: &str, tool: VcsTool) -> RepositoryId {
-  let reply = crate::test_store::create(
-    state,
-    &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool,
-      format: WireFormat::Sha1,
-      // The root's name as the command line spells it (`repository::root_binding`): the first line of `default`.
-      default_branch: "branch:default:0".to_owned(),
-      green: None,
-    },
-  );
-  assert!(
-    matches!(reply, ReplyBody::GreenCreated { .. }),
-    "no repository: {reply:?}"
-  );
-  let repositories = state.db.partition().repositories();
-  repositories.repository_named(name).expect("the record").id
+/// Creates repository `name` of `tool` as a client's request does, from a task on the shard (`test_store::created`): its
+/// id.
+pub(crate) async fn created(name: &str, tool: VcsTool) -> RepositoryId {
+  // The root's name as the command line spells it (`repository::root_binding`): the first line of `default`.
+  let asked = (name, tool, WireFormat::Sha1, "branch:default:0");
+  crate::test_store::created(&owner(), asked).await.0
 }
 
 /// `files` laid out on a simulated host, as an import takes them: the host, and the repository's directory on it.
@@ -204,29 +192,33 @@ fn check_settled(state: &ShardState, id: RepositoryId) {
 /// holds, and each turn, the import's start and end and its landing counted.
 #[test]
 fn t_a675_a_directory_imports_into_its_store_a_turn_at_a_time_as_one_call_imports_it() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let id = created(state, "hg", VcsTool::Mercurial);
-    let (expected_rows, expected) = in_one_call(state, STATES);
-    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
-    assert!(state.vcs_stores.importing(id));
-    let (turns, ended) = to_its_end(state, id);
-    let finished = ended.expect("imported");
+  run_on_stored_shard(|| async move {
+    let id = created("hg", VcsTool::Mercurial).await;
+    let (expected_rows, expected, turns, finished) = on(|state| {
+      let (expected_rows, expected) = in_one_call(state, STATES);
+      assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
+      assert!(state.vcs_stores.importing(id));
+      let (turns, ended) = to_its_end(state, id);
+      (expected_rows, expected, turns, ended.expect("imported"))
+    });
     assert!(
       turns > 1 && finished.turns == turns,
       "{turns} turns, {finished:?}"
     );
     assert!(!expected_rows.is_empty());
-    assert_eq!(land_imported(state, id), Ok(()));
-    assert_eq!(rows_of(state, id), expected_rows);
-    check_found(&finished, &expected);
-    check_settled(state, id);
-    let counted = [
-      count(state, STARTED),
-      count(state, DONE),
-      count(state, TURNS),
-      count(state, LANDED),
-    ];
-    assert_eq!(counted, [1, 1, turns, 1]);
+    assert_eq!(land_imported_awaited(id).await, Ok(()));
+    on(|state| {
+      assert_eq!(rows_of(state, id), expected_rows);
+      check_found(&finished, &expected);
+      check_settled(state, id);
+      let counted = [
+        count(state, STARTED),
+        count(state, DONE),
+        count(state, TURNS),
+        count(state, LANDED),
+      ];
+      assert_eq!(counted, [1, 1, turns, 1]);
+    });
   });
 }
 
@@ -238,41 +230,43 @@ fn t_a675_a_directory_imports_into_its_store_a_turn_at_a_time_as_one_call_import
 /// Mercurial's own repository, is w-perf's run: no fixture here holds more than a page.)
 #[test]
 fn t_a720_an_import_is_bounded_by_its_shard_never_one_region() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let id = created(state, "hg", VcsTool::Mercurial);
-    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
-    let mut clock = Ticking(0);
-    let mut charged_turns = 0_u64;
-    let ended = (1..=TURNS_AT_MOST).find_map(|_| {
-      let turned = turn(state, id, (&mut clock, 1));
-      if let Some(Importing {
-        stage: Stage::Running { import, .. },
-        reserved,
-        ..
-      }) = state.vcs_stores.imports.get(&id)
-      {
-        assert_eq!(
-          *reserved,
-          import.holding(),
-          "the charge is not what the import holds"
-        );
-        charged_turns += u64::from(*reserved > 0);
-      }
-      match turned {
-        Some(Ok(Turned::More)) => None,
-        other => Some(other),
-      }
+  run_on_stored_shard(|| async move {
+    let id = created("hg", VcsTool::Mercurial).await;
+    on(|state| {
+      assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
+      let mut clock = Ticking(0);
+      let mut charged_turns = 0_u64;
+      let ended = (1..=TURNS_AT_MOST).find_map(|_| {
+        let turned = turn(state, id, (&mut clock, 1));
+        if let Some(Importing {
+          stage: Stage::Running { import, .. },
+          reserved,
+          ..
+        }) = state.vcs_stores.imports.get(&id)
+        {
+          assert_eq!(
+            *reserved,
+            import.holding(),
+            "the charge is not what the import holds"
+          );
+          charged_turns += u64::from(*reserved > 0);
+        }
+        match turned {
+          Some(Ok(Turned::More)) => None,
+          other => Some(other),
+        }
+      });
+      assert!(
+        matches!(ended, Some(Some(Ok(Turned::Done(_))))),
+        "{ended:?}"
+      );
+      assert!(
+        charged_turns > 1,
+        "the import was charged on {charged_turns} turns"
+      );
     });
-    assert!(
-      matches!(ended, Some(Some(Ok(Turned::Done(_))))),
-      "{ended:?}"
-    );
-    assert!(
-      charged_turns > 1,
-      "the import was charged on {charged_turns} turns"
-    );
-    assert_eq!(land_imported(state, id), Ok(()));
-    check_settled(state, id);
+    assert_eq!(land_imported_awaited(id).await, Ok(()));
+    on(|state| check_settled(state, id));
   });
 }
 
@@ -282,33 +276,35 @@ fn t_a720_an_import_is_bounded_by_its_shard_never_one_region() {
 /// given back), no import under way, and the refusal counted.
 #[test]
 fn t_a675_an_import_refused_midway_gives_back_everything_it_held() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let id = created(state, "hg", VcsTool::Mercurial);
-    let cut = STATES.iter().map(|&(path, bytes)| {
-      let half = bytes.len() / 2;
-      (
-        path,
-        if path == CUT_FILE {
-          bytes.get(..half).unwrap_or_default()
-        } else {
-          bytes
-        },
-      )
+  run_on_stored_shard(|| async move {
+    let id = created("hg", VcsTool::Mercurial).await;
+    on(|state| {
+      let cut = STATES.iter().map(|&(path, bytes)| {
+        let half = bytes.len() / 2;
+        (
+          path,
+          if path == CUT_FILE {
+            bytes.get(..half).unwrap_or_default()
+          } else {
+            bytes
+          },
+        )
+      });
+      let (held, retained) = (used(state), state.store.budget.retained());
+      assert_eq!(begin(state, id, directory(cut)), Ok(()));
+      let (turns, ended) = to_its_end(state, id);
+      assert!(
+        turns > 1 && matches!(ended, Err(ImportFailed::Refused(_))),
+        "{turns}: {ended:?}"
+      );
+      assert!(rows_of(state, id).is_empty());
+      assert_eq!(
+        (used(state), state.store.budget.retained()),
+        (held, retained)
+      );
+      check_settled(state, id);
+      assert_eq!(count(state, REFUSED), 1);
     });
-    let (held, retained) = (used(state), state.store.budget.retained());
-    assert_eq!(begin(state, id, directory(cut)), Ok(()));
-    let (turns, ended) = to_its_end(state, id);
-    assert!(
-      turns > 1 && matches!(ended, Err(ImportFailed::Refused(_))),
-      "{turns}: {ended:?}"
-    );
-    assert!(rows_of(state, id).is_empty());
-    assert_eq!(
-      (used(state), state.store.budget.retained()),
-      (held, retained)
-    );
-    check_settled(state, id);
-    assert_eq!(count(state, REFUSED), 1);
   });
 }
 
@@ -319,53 +315,59 @@ fn t_a675_an_import_refused_midway_gives_back_everything_it_held() {
 /// store's rows unchanged.
 #[test]
 fn t_a675_an_import_takes_an_empty_mercurial_store_one_at_a_time() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let git = created(state, "git", VcsTool::Git);
-    assert_eq!(
-      begin(state, git, directory(STATES.iter().copied())),
-      Err(ImportFailed::NoStore)
-    );
-    let first = created(state, "first", VcsTool::Mercurial);
-    assert_eq!(
-      begin(state, first, directory(STATES.iter().copied())),
-      Ok(())
-    );
-    assert_eq!(
-      begin(state, first, directory(STATES.iter().copied())),
-      Err(ImportFailed::Busy)
-    );
-    assert!(state.vcs_stores.importing(first));
-    assert_an_imported_store_takes_no_second_import(state);
+  run_on_stored_shard(|| async move {
+    let git = created("git", VcsTool::Git).await;
+    let first = created("first", VcsTool::Mercurial).await;
+    on(|state| {
+      assert_eq!(
+        begin(state, git, directory(STATES.iter().copied())),
+        Err(ImportFailed::NoStore)
+      );
+      assert_eq!(
+        begin(state, first, directory(STATES.iter().copied())),
+        Ok(())
+      );
+      assert_eq!(
+        begin(state, first, directory(STATES.iter().copied())),
+        Err(ImportFailed::Busy)
+      );
+      assert!(state.vcs_stores.importing(first));
+    });
+    assert_an_imported_store_takes_no_second_import().await;
   });
 }
 
 /// The second import of [`t_a675_an_import_takes_an_empty_mercurial_store_one_at_a_time`]: run to its end, a further
 /// import is refused `Busy` while it waits to land and `NotEmpty` once it landed, a second landing `NoStore`, the
 /// store's rows unchanged.
-fn assert_an_imported_store_takes_no_second_import(state: &mut ShardState) {
-  let full = created(state, "full", VcsTool::Mercurial);
-  assert_eq!(
-    begin(state, full, directory(STATES.iter().copied())),
-    Ok(())
-  );
-  assert!(to_its_end(state, full).1.is_ok());
-  assert_eq!(
-    begin(state, full, directory(STATES.iter().copied())),
-    Err(ImportFailed::Busy)
-  );
-  assert_eq!(
-    land(state, full),
-    Err(ImportFailed::Busy),
-    "its segments not landed yet"
-  );
-  assert_eq!(land_imported(state, full), Ok(()));
-  let rows = rows_of(state, full);
-  assert_eq!(
-    begin(state, full, directory(STATES.iter().copied())),
-    Err(ImportFailed::NotEmpty)
-  );
-  assert_eq!(land(state, full), Err(ImportFailed::NoStore));
-  assert_eq!(rows_of(state, full), rows);
+async fn assert_an_imported_store_takes_no_second_import() {
+  let full = created("full", VcsTool::Mercurial).await;
+  on(|state| {
+    assert_eq!(
+      begin(state, full, directory(STATES.iter().copied())),
+      Ok(())
+    );
+    assert!(to_its_end(state, full).1.is_ok());
+    assert_eq!(
+      begin(state, full, directory(STATES.iter().copied())),
+      Err(ImportFailed::Busy)
+    );
+    assert_eq!(
+      land(state, full),
+      Err(ImportFailed::Busy),
+      "its segments not landed yet"
+    );
+  });
+  assert_eq!(land_imported_awaited(full).await, Ok(()));
+  on(|state| {
+    let rows = rows_of(state, full);
+    assert_eq!(
+      begin(state, full, directory(STATES.iter().copied())),
+      Err(ImportFailed::NotEmpty)
+    );
+    assert_eq!(land(state, full), Err(ImportFailed::NoStore));
+    assert_eq!(rows_of(state, full), rows);
+  });
 }
 
 /// A-675 (cancellation): do start an import, run it a unit a turn until the content store holds some of it, then free
@@ -374,29 +376,31 @@ fn assert_an_imported_store_takes_no_second_import(state: &mut ShardState) {
 /// freed, nothing charged and the shard's retention charge what it was before either import.
 #[test]
 fn t_a675_a_repository_freed_midway_gives_its_import_back() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let retained = state.store.budget.retained();
-    assert_an_import_freed_midway_is_given_back(state);
-    let whole = created(state, "whole", VcsTool::Mercurial);
-    assert_eq!(
-      begin(state, whole, directory(STATES.iter().copied())),
-      Ok(())
-    );
-    assert!(to_its_end(state, whole).1.is_ok());
-    super::super::free(state, whole);
-    assert!(!state.vcs_stores.importing(whole));
-    assert_eq!(count(state, ABANDONED), 2);
-    assert_eq!(
-      (state.vcs_stores.charged(), state.store.budget.retained()),
-      (0, retained)
-    );
+  run_on_stored_shard(|| async move {
+    let retained = on(|state| state.store.budget.retained());
+    let midway = created("midway", VcsTool::Mercurial).await;
+    let whole = created("whole", VcsTool::Mercurial).await;
+    on(|state| {
+      assert_an_import_freed_midway_is_given_back(state, midway);
+      assert_eq!(
+        begin(state, whole, directory(STATES.iter().copied())),
+        Ok(())
+      );
+      assert!(to_its_end(state, whole).1.is_ok());
+      super::super::free(state, whole);
+      assert!(!state.vcs_stores.importing(whole));
+      assert_eq!(count(state, ABANDONED), 2);
+      assert_eq!(
+        (state.vcs_stores.charged(), state.store.budget.retained()),
+        (0, retained)
+      );
+    });
   });
 }
 
 /// The first import of [`t_a675_a_repository_freed_midway_gives_its_import_back`]: run a unit a turn until the content
 /// store holds some of it, then its repository freed: no import under way, counted abandoned.
-fn assert_an_import_freed_midway_is_given_back(state: &mut ShardState) {
-  let midway = created(state, "midway", VcsTool::Mercurial);
+fn assert_an_import_freed_midway_is_given_back(state: &mut ShardState, midway: RepositoryId) {
   assert_eq!(
     begin(state, midway, directory(STATES.iter().copied())),
     Ok(())
@@ -417,18 +421,17 @@ fn assert_an_import_freed_midway_is_given_back(state: &mut ShardState) {
 #[test]
 fn t_a675_the_shards_task_runs_an_import_to_its_end() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let id = crate::daemon::observe_first(&daemon, |state| {
-    let id = created(state, "hg", VcsTool::Mercurial);
+  let id = created_on(&daemon, "hg", VcsTool::Mercurial);
+  crate::daemon::observe_first(&daemon, move |state| {
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
     let task = slates_rt::futures::spawn(async move {
       if run(id).await.is_some_and(|ended| ended.is_ok()) {
-        drop(crate::state::with_state(|state| land_imported(state, id)));
+        drop(land_imported_awaited(id).await);
       }
     });
     task
       .and_then(slates_rt::futures::detach)
       .expect("the import's task");
-    id
   });
   let began = Instant::now();
   let (importing, done, turns) = loop {
@@ -501,18 +504,23 @@ fn as_kept(roots: &[slates_hg::phases::PhaseHead]) -> Vec<(u8, Vec<u8>)> {
 /// counted landed, and no landing refused.
 #[test]
 fn t_a687_an_import_lands_its_record_phase_roots_and_bookmarks_in_one_entry() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let id = created(state, "hg", VcsTool::Mercurial);
-    let (_, expected) = in_one_call(state, STATES);
-    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
-    assert!(to_its_end(state, id).1.is_ok());
-    assert!(roots_of(state, id).is_empty());
-    assert_eq!(land_imported(state, id), Ok(()));
-    assert_landed_as_imported(state, id, &expected);
-    assert_eq!(
-      (count(state, LANDED), count(state, LANDING_REFUSED)),
-      (1, 0)
-    );
+  run_on_stored_shard(|| async move {
+    let id = created("hg", VcsTool::Mercurial).await;
+    let expected = on(|state| {
+      let (_, expected) = in_one_call(state, STATES);
+      assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
+      assert!(to_its_end(state, id).1.is_ok());
+      assert!(roots_of(state, id).is_empty());
+      expected
+    });
+    assert_eq!(land_imported_awaited(id).await, Ok(()));
+    on(|state| {
+      assert_landed_as_imported(state, id, &expected);
+      assert_eq!(
+        (count(state, LANDED), count(state, LANDING_REFUSED)),
+        (1, 0)
+      );
+    });
   });
 }
 
@@ -541,41 +549,46 @@ fn assert_landed_as_imported(state: &ShardState, id: RepositoryId, expected: &Im
 /// holds, as it was before the import.
 #[test]
 fn t_a687_a_refused_landing_records_nothing_and_gives_back_everything() {
-  crate::test_store::audit_on_stored_shard("hg", |state| {
-    let id = created(state, "hg", VcsTool::Mercurial);
-    let reply = dispatch(
-      state,
-      1,
-      &owner(),
-      RequestBody::CreateBranch {
-        repository: "hg".to_owned(),
-        name: "bookmark:one:".to_owned(),
-        from: "branch:default:0".to_owned(),
-        version: None,
-      },
-    );
-    let ReplyBody::GreenCreated { id: taken } = reply else {
-      panic!("no branch: {reply:?}")
-    };
-    let (held, retained) = (used(state), state.store.budget.retained());
-    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
-    assert!(to_its_end(state, id).1.is_ok());
-    let refused = land_imported(state, id);
-    assert_eq!(
-      refused,
-      Err(ImportFailed::Landing(Refusal::AlreadyExists {
-        existing: taken
-      }))
-    );
-    assert_eq!(state.db.partition().repositories().objects(id).count(), 0);
-    assert!(roots_of(state, id).is_empty());
-    assert!(rows_of(state, id).is_empty());
-    assert_eq!(
-      (used(state), state.store.budget.retained()),
-      (held, retained)
-    );
-    check_settled(state, id);
-    assert_eq!(count(state, LANDING_REFUSED), 1);
+  run_on_stored_shard(|| async move {
+    let id = created("hg", VcsTool::Mercurial).await;
+    let (taken, held, retained) = on(|state| {
+      let reply = dispatch(
+        state,
+        1,
+        &owner(),
+        RequestBody::CreateBranch {
+          repository: "hg".to_owned(),
+          name: "bookmark:one:".to_owned(),
+          from: "branch:default:0".to_owned(),
+          version: None,
+        },
+      );
+      let ReplyBody::GreenCreated { id: taken } = reply else {
+        panic!("no branch: {reply:?}")
+      };
+      let (held, retained) = (used(state), state.store.budget.retained());
+      assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
+      assert!(to_its_end(state, id).1.is_ok());
+      (taken, held, retained)
+    });
+    let refused = land_imported_awaited(id).await;
+    on(|state| {
+      assert_eq!(
+        refused,
+        Err(ImportFailed::Landing(Refusal::AlreadyExists {
+          existing: taken
+        }))
+      );
+      assert_eq!(state.db.partition().repositories().objects(id).count(), 0);
+      assert!(roots_of(state, id).is_empty());
+      assert!(rows_of(state, id).is_empty());
+      assert_eq!(
+        (used(state), state.store.budget.retained()),
+        (held, retained)
+      );
+      check_settled(state, id);
+      assert_eq!(count(state, LANDING_REFUSED), 1);
+    });
   });
 }
 
@@ -647,8 +660,8 @@ fn t_c1_2b_an_imports_bookmark_works_are_built_over_turns_before_its_landing() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored_configured(|config| {
     config.runtime.step_budget_ns = SHORT_STEP_NS;
   });
-  let id = crate::daemon::observe_first(&daemon, |state| {
-    let id = created(state, "hg", VcsTool::Mercurial);
+  let id = created_on(&daemon, "hg", VcsTool::Mercurial);
+  crate::daemon::observe_first(&daemon, move |state| {
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
     let task = slates_rt::futures::spawn(async move {
       if run(id).await.is_some_and(|ended| ended.is_ok())
@@ -660,7 +673,6 @@ fn t_c1_2b_an_imports_bookmark_works_are_built_over_turns_before_its_landing() {
     task
       .and_then(slates_rt::futures::detach)
       .expect("the import's task");
-    id
   });
   let began = Instant::now();
   let importing = loop {
@@ -778,7 +790,8 @@ fn fronted_history(name: &str) -> Option<std::path::PathBuf> {
 /// most held after any step at most what is held at the end plus four times the segment's bound; segments cut by
 /// their texts (`vcs_store.hg_import.segments_cut_by_texts`), so the bound is the cut's doing; landings answered while
 /// the import went on (`vcs_store.hg_import.segments_landed_overlapped`), and the import held for less than its
-/// landings took (`segment_land_wait_ns` against `segment_land_ns`). Failing first: 46,162,339 bytes held after one turn
+/// landings took (`segment_land_wait_ns` against `segment_land_ns`); each segment chunked in turns
+/// ([`assert_chunked_in_turns`]). Failing first: 46,162,339 bytes held after one turn
 /// against 8,950 at the end and a 2 MiB bound, the whole history's file texts in one segment; then, cut by its texts,
 /// no landing overlapped, each awaited before the next turn. Skips, saying so, where `hg` is not installed.
 #[test]
@@ -816,6 +829,17 @@ fn an_imports_file_texts_held_between_landings_are_bounded_by_its_segment() {
     held.waited < held.landing,
     "the import held for less than its landings took: {held:?}"
   );
+  assert_chunked_in_turns(&held);
+}
+
+/// Goal 93, main's ruling (b): each segment's payload made into stock's revlog chunks as it landed, a turn's steps at a
+/// time between the import's own turns (`vcs.hg.segment_chunk_turns`), no step compressing past the copy slice it was
+/// given (`vcs.hg.segment_compress_past_budget_most`). Red before 2026-11-25: an import's payload landed raw, unchunked.
+fn assert_chunked_in_turns(held: &Held) {
+  assert!(
+    held.chunked.0 > 0 && held.chunked.1 == 0,
+    "the segments chunked in turns, none past its slice: {held:?}"
+  );
 }
 
 /// What [`imported_held`] read: the most windows held after a step and at the end, the segment's bound, the segments
@@ -836,6 +860,8 @@ struct Held {
   waited: u64,
   /// The nanoseconds the landings took.
   landing: u64,
+  /// The turns its segments' payloads were made into chunks in, and the most one step compressed past its copy slice.
+  chunked: (u64, u64),
 }
 
 /// Imports the repository at `path` into a new Mercurial repository by the shard task's own step, reading the windows
@@ -867,6 +893,10 @@ async fn imported_held(path: std::path::PathBuf) -> Held {
     overlapped: count(state, super::SEGMENTS_LANDED_OVERLAPPED),
     waited: count(state, super::SEGMENT_LAND_WAIT_NS),
     landing: count(state, super::SEGMENT_LAND_NS),
+    chunked: (
+      count(state, crate::repository::hg_push::SEGMENT_CHUNK_TURNS),
+      count(state, crate::repository::hg_push::COMPRESS_PAST_BUDGET_MOST),
+    ),
   })
 }
 

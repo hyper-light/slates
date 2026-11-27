@@ -357,35 +357,49 @@ pub struct Journal {
   checkpoint_bytes: usize,
   /// The bytes of delta frames written since it.
   logged_bytes: usize,
-  /// How far into the committed slot pages may be resident: its checkpoint's bytes, or more where the slot held a
-  /// longer image that was never given back. [`UNKNOWN_EXTENT`] for a journal opened over memories a predecessor wrote.
-  committed_written: usize,
-  /// How far into the stale slot pages may be resident since it was last given back ([`Journal::dead_ranges`]).
-  stale_written: usize,
-  /// How far into the log pages may be resident since the log past the tail was last given back: the furthest any
-  /// frame, or the zeroed header after it, reached.
-  log_written: usize,
+  /// How far into each memory pages may be resident since it was last given back ([`WrittenExtents`]): what this
+  /// journal wrote, from the extents it was opened over (A-926).
+  written: WrittenExtents,
 }
 
-/// The extent of a memory whose writes this journal did not see (a predecessor's, or a torn first checkpoint's): all
-/// of it, clipped to the memory's length where a range is asked for. Format: a sentinel, not a size.
-const UNKNOWN_EXTENT: usize = usize::MAX;
+/// How far into each of a shard's recovery memories pages may be resident, each from its start (A-926; goal 93, main's
+/// ruling of 2026-11-25): each checkpoint slot by its place (the first half of the checkpoint memory, then the second),
+/// and the delta log. A journal is opened over the extents its predecessors left, as their high-water marks record them
+/// (the server's slice marks), and keeps them as it writes and gives back, so a residency sweep and a give-back read
+/// only what may hold pages. Before A-926 a journal opened over a predecessor's memories took every one as written
+/// whole, and a fresh daemon's sweep walked 9.1 million pages of slots and log it had never written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WrittenExtents {
+  /// Each checkpoint slot's, by its place in the checkpoint memory.
+  pub slots: [usize; 2],
+  /// The delta log's.
+  pub log: usize,
+}
+
+impl WrittenExtents {
+  /// Every memory whole, for checkpoint memory `checkpoint_total` and log memory `log_total` bytes long: what a journal
+  /// over memories whose marks are unknown (an image written before A-926) must assume, once.
+  pub fn whole(checkpoint_total: usize, log_total: usize) -> WrittenExtents {
+    let (first, second) = crate::recover::slots_of_memory(checkpoint_total);
+    WrittenExtents {
+      slots: [first.1, second.1],
+      log: log_total,
+    }
+  }
+
+  /// [`WrittenExtents::whole`] of the memories `checkpoints` and `log` themselves.
+  pub fn whole_of<C: ImageRead + ?Sized, L: ImageRead + ?Sized>(
+    checkpoints: &C,
+    log: &L,
+  ) -> WrittenExtents {
+    WrittenExtents::whole(checkpoints.image_len(), log.image_len())
+  }
+}
 
 impl Default for Journal {
-  /// A journal that has committed nothing, over memories that may hold anything: a fresh object reads zeros, but one a
-  /// predecessor wrote before its first checkpoint committed holds a torn image, so both slots and the log are given
-  /// back whole the first time ([`Journal::dead_ranges`]).
+  /// A journal that has committed nothing, over memories nothing wrote ([`Journal::over`] with no extent).
   fn default() -> Self {
-    Journal {
-      committed: None,
-      generation: 0,
-      tail: 0,
-      checkpoint_bytes: 0,
-      logged_bytes: 0,
-      committed_written: UNKNOWN_EXTENT,
-      stale_written: UNKNOWN_EXTENT,
-      log_written: UNKNOWN_EXTENT,
-    }
+    Journal::over(WrittenExtents::default())
   }
 }
 
@@ -401,6 +415,30 @@ pub struct DeadRanges {
 }
 
 impl Journal {
+  /// A journal that has committed nothing, over memories whose pages may be resident as far as `written` says: what a
+  /// shard whose journal holds no committed checkpoint opens with.
+  pub fn over(written: WrittenExtents) -> Journal {
+    Journal {
+      committed: None,
+      generation: 0,
+      tail: 0,
+      checkpoint_bytes: 0,
+      logged_bytes: 0,
+      written,
+    }
+  }
+
+  /// How far into each memory pages may be resident now ([`WrittenExtents`]): what the high-water marks a successor
+  /// opens with must cover.
+  pub fn written(&self) -> WrittenExtents {
+    self.written
+  }
+
+  /// The extent of the checkpoint slot at `index` (0 or 1).
+  fn slot_written(&self, index: usize) -> usize {
+    self.written.slots.get(index).copied().unwrap_or(0)
+  }
+
   /// What no restart reads and was written since it was last given back (A-117, A-226), for checkpoint memory
   /// `checkpoint_total` and log memory `log_total` bytes long; `None` before the first checkpoint commits. A restart
   /// takes the newer CRC-valid slot, then the log's frames from its start while each is CRC-valid and names that
@@ -414,29 +452,34 @@ impl Journal {
     let tail = self.tail.min(log_total);
     let (stale_offset, stale_len) = committed.stale_slot(checkpoint_total);
     Some(DeadRanges {
-      stale_slot: (stale_offset, stale_len.min(self.stale_written)),
-      log_past_tail: (tail, self.log_written.min(log_total).saturating_sub(tail)),
+      stale_slot: (
+        stale_offset,
+        stale_len.min(self.slot_written(committed.stale_index())),
+      ),
+      log_past_tail: (tail, self.written.log.min(log_total).saturating_sub(tail)),
     })
   }
 
   /// What of a shard's recovery memories pages may be resident in, each as `(offset, len)` within its own memory, for
   /// checkpoint memory `checkpoint_total` and log memory `log_total` bytes long: each checkpoint slot from its start as
   /// far as it was written since last given back, and the log from its start as far as any frame reached (A-744's
-  /// split, main's ruling on w-sizing's option (a), 2026-11-21: a residency sweep reads only what can hold pages). Before
-  /// the first checkpoint commits, both slots whole as far as a predecessor may have written them.
+  /// split, main's ruling on w-sizing's option (a), 2026-11-21: a residency sweep reads only what can hold pages), each
+  /// as far as the extents this journal was opened over and wrote say (A-926). Before the first checkpoint commits, the
+  /// first slot, then the second.
   pub fn written_ranges(&self, checkpoint_total: usize, log_total: usize) -> [(usize, usize); 3] {
     let (first, second) = crate::recover::slots_of_memory(checkpoint_total);
     let (committed, stale) = match self.committed {
-      Some(slot) => (
-        slot.slot(checkpoint_total),
-        slot.stale_slot(checkpoint_total),
-      ),
-      None => (first, second),
+      Some(slot) => (slot.index(), slot.stale_index()),
+      None => (0, 1),
+    };
+    let slot = |index: usize| {
+      let (offset, len) = if index == 0 { first } else { second };
+      (offset, len.min(self.slot_written(index)))
     };
     [
-      (committed.0, committed.1.min(self.committed_written)),
-      (stale.0, stale.1.min(self.stale_written)),
-      (0, log_total.min(self.log_written)),
+      slot(committed),
+      slot(stale),
+      (0, log_total.min(self.written.log)),
     ]
   }
 
@@ -445,39 +488,37 @@ impl Journal {
   /// log, everything from offset `log_from` (never below the tail). `None` records nothing for that region: a range the
   /// memory refused stays owed, asked for at the next give-back.
   pub fn given_back_from(&mut self, stale_from: Option<usize>, log_from: Option<usize>) {
-    if let Some(from) = stale_from {
-      self.stale_written = self.stale_written.min(from);
+    if let (Some(from), Some(committed)) = (stale_from, self.committed)
+      && let Some(written) = self.written.slots.get_mut(committed.stale_index())
+    {
+      *written = (*written).min(from);
     }
     if let Some(from) = log_from {
-      self.log_written = self.log_written.min(from.max(self.tail));
+      self.written.log = self.written.log.min(from.max(self.tail));
     }
   }
 
-  /// Test support: what a restart leaves: every byte of the dead regions may be resident, so the next give-back covers
-  /// them whole (A-226).
-  pub fn forget_what_was_given_back(&mut self) {
-    self.stale_written = UNKNOWN_EXTENT;
-    self.log_written = UNKNOWN_EXTENT;
+  /// Test support: every byte of the memories `checkpoint_total` and `log_total` bytes long as resident, so the next
+  /// give-back covers them whole (A-226).
+  pub fn forget_what_was_given_back(&mut self, (checkpoint_total, log_total): (usize, usize)) {
+    self.written = WrittenExtents::whole(checkpoint_total, log_total);
   }
 
   /// The journal after a checkpoint of `bytes` committed into what was the stale slot: that slot is now the committed
-  /// one, written as far as this image or the longer one it held and never gave back; the slot that was committed is
-  /// the stale one, written as far as its image reached; the log restarts, its old frames still written.
+  /// one, written as far as this image or the longer one it held and never gave back; the other keeps its extent, now
+  /// the stale one's; the log restarts, its old frames still written.
   fn checkpointed(&self, committed: CommittedSlot, bytes: usize) -> Journal {
+    let mut written = self.written;
+    if let Some(slot) = written.slots.get_mut(committed.index()) {
+      *slot = (*slot).max(bytes);
+    }
     Journal {
       committed: Some(committed),
       generation: committed.generation,
       tail: 0,
       checkpoint_bytes: bytes,
       logged_bytes: 0,
-      committed_written: bytes.max(self.stale_written),
-      stale_written: if self.committed.is_some() {
-        self.committed_written
-      } else {
-        // Nothing was committed, so neither slot's earlier writes are known: the other slot is given back whole.
-        UNKNOWN_EXTENT
-      },
-      log_written: self.log_written,
+      written,
     }
   }
 
@@ -603,20 +644,22 @@ impl Journal {
     self.generation = generation;
     self.tail = end;
     self.logged_bytes = self.logged_bytes.saturating_add(total);
-    self.log_written = self.log_written.max(written);
+    self.written.log = self.written.log.max(written);
     Ok(total)
   }
 
-  /// The journal a restarted publisher resumes from: the committed checkpoint and the log replayed over it, its
-  /// image (`None` when nothing ever committed), and the journal positioned after the last valid frame.
+  /// The journal a restarted publisher resumes from, over memories whose pages may be resident as far as `written`
+  /// says (its predecessors' high-water marks, A-926): the committed checkpoint and the log replayed over it, its image
+  /// (`None` when nothing ever committed), and the journal positioned after the last valid frame.
   pub fn recover<C: ImageRead + ?Sized, L: ImageRead + ?Sized>(
     checkpoints: &C,
     log: &L,
+    written: WrittenExtents,
   ) -> Result<(Option<ShardImage>, Journal), VfsError> {
     // The committed checkpoint found, read and checked once (it was found by checking both slots, then found and
     // read again).
     let Some((committed, mut image)) = ShardImage::read_committed(checkpoints)? else {
-      return Ok((None, Journal::default()));
+      return Ok((None, Journal::over(written)));
     };
     let mut journal = Journal {
       committed: Some(committed),
@@ -626,10 +669,8 @@ impl Journal {
       // checkpoint, which re-establishes the size.
       checkpoint_bytes: 0,
       logged_bytes: 0,
-      // A predecessor wrote these memories, as far as this journal cannot tell: each is given back whole once.
-      committed_written: UNKNOWN_EXTENT,
-      stale_written: UNKNOWN_EXTENT,
-      log_written: UNKNOWN_EXTENT,
+      // What its predecessors wrote of these memories, as their marks record it.
+      written,
     };
     while let Some((generation, delta, total)) =
       read_frame(log, journal.tail, committed.generation)?

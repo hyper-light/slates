@@ -217,10 +217,26 @@ const KIND_VCS_REGION_HOLD_RETIRED: u8 = 14;
 /// one.
 const KIND_VCS_REGION_HOLD: u8 = 20;
 
+/// Format: the piece kind of a window let go before A-923, with no let-go number (A-767 C1 step 2b): its bytes the
+/// identity, then its length (`u64`, little-endian). Read at a restore alone and never written (main's ruling of
+/// 2026-11-25, a migration): each is taken back as let go, numbered after the image's numbered aways
+/// (`ContentStore::restore_away_renumbered`), and the next publication writes it in [`KIND_VCS_AWAY`]'s form. Refused,
+/// a text brought back by its bytes would be lost (a Mercurial named file's read). Its reader goes once every daemon
+/// has published since A-923: images live in RAM alone, so none can carry the kind then (A-923).
+const KIND_VCS_AWAY_RETIRED: u8 = 15;
+
+#[cfg(test)]
+std::thread_local! {
+  /// Test support (A-923's restart red): the shard's Aways family written as an image before A-923 wrote it, each entry
+  /// of the retired kind and form ([`KIND_VCS_AWAY_RETIRED`]: the identity, then the length, no let-go number).
+  pub(crate) static AWAYS_BEFORE_A923: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
 /// Format: the piece kind of a window let go of the shard's repository content store (A-767 C1 step 2b, main's ruling
-/// (a) of 2026-11-22 02:52: the image records it, so a restart keeps it let go, never absent), keyed by the identity's
-/// first 24 bytes; its bytes the identity, then its length (`u64`, little-endian).
-const KIND_VCS_AWAY: u8 = 15;
+/// (a) of 2026-11-22 02:52: the image records it, so a restart keeps it let go, never absent; A-923: at its let-go
+/// number, the Aways family's coordinate), keyed by the identity's first 24 bytes; its bytes the identity, then its
+/// length and its let-go number (each `u64`, little-endian).
+const KIND_VCS_AWAY: u8 = 21;
 
 /// Format: the piece kind of a home's record of where a window a landed pack carried lies on the node's store (goal 93
 /// item 2b(b), `vcs_store::homes::LandedAt`), keyed by the window identity's first 24 bytes; its bytes the identity,
@@ -274,6 +290,7 @@ fn is_paged_entry_kind(kind: u8) -> bool {
       | KIND_VCS_NAME
       | KIND_VCS_REGION_HOLD
       | KIND_VCS_AWAY
+      | KIND_VCS_AWAY_RETIRED
       | KIND_VCS_LANDED_AT
       | KIND_VCS_LANDED_HG
   )
@@ -540,7 +557,7 @@ fn family_entries(
     Family::Windows => {
       let windows = crate::vcs_store::chunk_windows(&state.vcs_stores)?;
       let (pieces, more) = match cap {
-        Some(cap) => windows.pieces_at_cut((lo, hi), cap),
+        Some(cap) => windows.pieces_at_cut((lo, hi), (cap, crate::image_pages::ENTRY_HEAD)),
         None => (windows.pieces_in(lo, hi), None),
       };
       out.extend(pieces.into_iter().map(|(handle, bytes)| {
@@ -552,31 +569,11 @@ fn family_entries(
       }));
       more
     }
-    Family::Lists => {
-      let content = content?;
-      let (lists, more) = match cap {
-        Some(cap) => content.lists_at_cut((lo, hi), cap),
-        None => (
-          content
-            .lists_in(lo, hi)
-            .map(|(identity, bytes)| (identity, Box::from(bytes)))
-            .collect(),
-          None,
-        ),
-      };
-      out.extend(lists.into_iter().map(|(identity, bytes)| {
-        (
-          coordinate_of(&identity),
-          vcs_node_key(KIND_VCS_LIST, &identity),
-          EntryBytes::of(&[identity.0.as_slice(), &bytes]),
-        )
-      }));
-      more
-    }
+    Family::Lists => list_entries(content?, ((lo, hi), cap), out),
     Family::Names => {
       let content = content?;
       let (names, more) = match cap {
-        Some(cap) => content.names_at_cut((lo, hi), cap),
+        Some(cap) => content.names_at_cut((lo, hi), (cap, crate::image_pages::ENTRY_HEAD)),
         None => (content.names_in(lo, hi).collect(), None),
       };
       out.extend(names.into_iter().map(|(identity, root)| {
@@ -588,24 +585,10 @@ fn family_entries(
       }));
       more
     }
-    Family::Aways => {
-      let content = content?;
-      let (aways, more) = match cap {
-        Some(cap) => content.aways_at_cut((lo, hi), cap),
-        None => (content.aways_in(lo, hi).collect(), None),
-      };
-      out.extend(aways.into_iter().map(|(identity, len)| {
-        (
-          coordinate_of(&identity),
-          vcs_node_key(KIND_VCS_AWAY, &identity),
-          EntryBytes::of(&[identity.0.as_slice(), &len.to_le_bytes()]),
-        )
-      }));
-      more
-    }
+    Family::Aways => away_entries(content?, ((lo, hi), cap), out),
     Family::RegionHolds => {
       let (holds, more) = match cap {
-        Some(cap) => homes::region_held_at_cut((lo, hi), cap),
+        Some(cap) => homes::region_held_at_cut((lo, hi), (cap, crate::image_pages::ENTRY_HEAD)),
         None => (homes::region_held_in(lo, hi), None),
       };
       out.extend(holds.into_iter().map(|(identity, owners)| {
@@ -623,7 +606,7 @@ fn family_entries(
     }
     Family::Landed => {
       let (records, more) = match cap {
-        Some(cap) => homes::landed_at_cut((lo, hi), cap),
+        Some(cap) => homes::landed_at_cut((lo, hi), (cap, crate::image_pages::ENTRY_HEAD)),
         None => (homes::landed_in(lo, hi), None),
       };
       out.extend(records.into_iter().map(|(identity, landed)| {
@@ -637,6 +620,69 @@ fn family_entries(
       more
     }
   }
+}
+
+/// [`family_entries`] of the content store's lists.
+fn list_entries(
+  content: &slates_vcs::ContentStore,
+  ((lo, hi), cap): ((u64, u64), Option<usize>),
+  out: &mut Vec<crate::image_pages::Entry>,
+) -> Option<u64> {
+  use crate::image_pages::EntryBytes;
+  let (lists, more) = match cap {
+    Some(cap) => content.lists_at_cut((lo, hi), (cap, crate::image_pages::ENTRY_HEAD)),
+    None => (
+      content
+        .lists_in(lo, hi)
+        .map(|(identity, bytes)| (identity, Box::from(bytes)))
+        .collect(),
+      None,
+    ),
+  };
+  out.extend(lists.into_iter().map(|(identity, bytes)| {
+    (
+      coordinate_of(&identity),
+      vcs_node_key(KIND_VCS_LIST, &identity),
+      EntryBytes::of(&[identity.0.as_slice(), &bytes]),
+    )
+  }));
+  more
+}
+
+/// [`family_entries`] of the content store's windows let go, each at its let-go number (A-923).
+fn away_entries(
+  content: &slates_vcs::ContentStore,
+  ((lo, hi), cap): ((u64, u64), Option<usize>),
+  out: &mut Vec<crate::image_pages::Entry>,
+) -> Option<u64> {
+  use crate::image_pages::EntryBytes;
+  let (aways, more) = match cap {
+    Some(cap) => content.aways_at_cut((lo, hi), (cap, crate::image_pages::ENTRY_HEAD)),
+    None => (content.aways_in(lo, hi).collect(), None),
+  };
+  #[cfg(test)]
+  if AWAYS_BEFORE_A923.with(core::cell::Cell::get) {
+    out.extend(aways.into_iter().map(|(at, len)| {
+      (
+        at.number,
+        vcs_node_key(KIND_VCS_AWAY_RETIRED, &at.identity),
+        EntryBytes::of(&[at.identity.0.as_slice(), &len.to_le_bytes()]),
+      )
+    }));
+    return more;
+  }
+  out.extend(aways.into_iter().map(|(at, len)| {
+    (
+      at.number,
+      vcs_node_key(KIND_VCS_AWAY, &at.identity),
+      EntryBytes::of(&[
+        at.identity.0.as_slice(),
+        &len.to_le_bytes(),
+        &at.number.to_le_bytes(),
+      ]),
+    )
+  }));
+  more
 }
 
 /// The coordinates of `family`'s entries kept or let go since the last committed publication: the pages a delta
@@ -664,13 +710,8 @@ fn changed_coordinates(state: &ShardState, family: crate::image_pages::Family) -
         .map(|(identity, _)| coordinate_of(identity))
         .collect()
     }),
-    Family::Aways => content.map_or_else(Vec::new, |content| {
-      content
-        .away_changes()
-        .iter()
-        .map(|(identity, _)| coordinate_of(identity))
-        .collect()
-    }),
+    // The Aways family's coordinates are let-go numbers (A-923).
+    Family::Aways => content.map_or_else(Vec::new, slates_vcs::ContentStore::away_changes),
     Family::RegionHolds => crate::vcs_store::homes::region_changes()
       .iter()
       .map(|(identity, _)| coordinate_of(identity))
@@ -1138,6 +1179,16 @@ pub(crate) const IMAGE_LONGEST_SPLIT_DISCARD: &str = "vcs_store.image.longest_sp
 pub(crate) const IMAGE_TURNS: &str = "vcs_store.image.encode_turns";
 /// Format: the status counter of the bytes the encoder's turns spent: encoded, and read by a split.
 pub(crate) const IMAGE_ENCODED_BYTES: &str = "vcs_store.image.encoded_bytes";
+/// Format: the status counters of the bytes the encoder's turns encoded, by family in `image_pages::Family::ALL`'s
+/// order (goal 93, A-923: which family's pages a publication re-encodes).
+pub(crate) const IMAGE_FAMILY_ENCODED_BYTES: [&str; crate::image_pages::Family::ALL.len()] = [
+  "vcs_store.image.encoded_bytes.windows",
+  "vcs_store.image.encoded_bytes.lists",
+  "vcs_store.image.encoded_bytes.names",
+  "vcs_store.image.encoded_bytes.aways",
+  "vcs_store.image.encoded_bytes.region_holds",
+  "vcs_store.image.encoded_bytes.landed",
+];
 /// Format: the status counter of the heap bytes the encoder's reads allocated beside the pages they encoded (goal 93,
 /// main's ruling of 2026-11-25): the entries' buffer as it grew, and the entries' own buffers, against
 /// [`IMAGE_ENCODED_BYTES`].
@@ -1336,6 +1387,12 @@ pub(crate) fn image_turn(state: &mut ShardState) -> crate::image_pages::Turned {
   }
   state.count(IMAGE_TURNS, 1);
   state.count(IMAGE_ENCODED_BYTES, turned.bytes);
+  for (name, bytes) in IMAGE_FAMILY_ENCODED_BYTES
+    .iter()
+    .zip(turned.encoded_by_family)
+  {
+    state.count(name, bytes);
+  }
   state.count(IMAGE_READ_ALLOCATED_BYTES, turned.allocated);
   state.count_max(IMAGE_LONGEST_TURN_BYTES, turned.bytes);
   state.count(IMAGE_PAGES_SPLIT, turned.split);
@@ -1571,8 +1628,12 @@ pub(crate) struct RecoveredHeld {
   pub(crate) names: Vec<(slates_vcs::ContentId, slates_vcs::ContentId)>,
   /// The windows and objects the shard held for the region (A-724 piece 8c).
   pub(crate) region_holds: Vec<(slates_vcs::ContentId, Vec<slates_cluster::homes::HomeOwner>)>,
-  /// The repository content store's windows let go, each with its length (A-767 C1 step 2b).
-  pub(crate) aways: Vec<(slates_vcs::ContentId, u64)>,
+  /// The repository content store's windows let go, each at its let-go number with its length (A-767 C1 step 2b;
+  /// A-923).
+  pub(crate) aways: Vec<(slates_vcs::AwayAt, u64)>,
+  /// The windows let go the image carried in the form before A-923, with no let-go number ([`KIND_VCS_AWAY_RETIRED`]),
+  /// each with its length, in the image's order: numbered at the restore.
+  pub(crate) aways_unnumbered: Vec<(slates_vcs::ContentId, u64)>,
   /// Where the windows landed packs carried lie on the node's store, as this shard's homes recorded (goal 93 item 2b(b)).
   pub(crate) landed: Vec<(slates_vcs::ContentId, crate::vcs_store::homes::Landed)>,
 }
@@ -1680,6 +1741,32 @@ pub(crate) fn paged_entries_placed(
         .map(move |(coordinate, key, bytes)| (family, coordinate, key, bytes.to_vec()))
     })
     .collect()
+}
+
+/// Test support (A-923's restart reds): the shard's image written as one before A-923 would be, from its next
+/// publication: every page of the Aways family dirtied and each away written in the old form ([`AWAYS_BEFORE_A923`]),
+/// until the shard's thread ends. The aways it holds now.
+#[cfg(test)]
+pub(crate) fn write_aways_before_a923(state: &mut ShardState) -> usize {
+  AWAYS_BEFORE_A923.with(|before| before.set(true));
+  let numbers: Vec<u64> = state
+    .vcs_stores
+    .content()
+    .map(|content| content.aways().map(|(at, _)| at.number).collect())
+    .unwrap_or_default();
+  state
+    .image_encoder
+    .mark(crate::image_pages::Family::Aways, numbers.iter().copied());
+  numbers.len()
+}
+
+/// Test support (A-923): the entries of the form before A-923 among a paged family's `entries`.
+#[cfg(test)]
+pub(crate) fn aways_before_a923_among(entries: &[(PieceKey, Vec<u8>)]) -> usize {
+  entries
+    .iter()
+    .filter(|(key, _)| split_key(key).0 == KIND_VCS_AWAY_RETIRED)
+    .count()
 }
 
 /// Test support (F2): the windows let go among a paged family's `entries`, by identity.
@@ -1840,6 +1927,28 @@ fn absorb_paged_entry(
     }
     KIND_VCS_REGION_HOLD_RETIRED => return Err(HeldRefused::Retired(kind)),
     KIND_VCS_AWAY => {
+      let (identity, rest) = bytes
+        .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
+        .ok_or(HeldRefused::UnknownKind(kind))?;
+      let identity =
+        slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
+      let (len, number) = rest
+        .split_at_checked(size_of::<u64>())
+        .ok_or(HeldRefused::UnknownKind(kind))?;
+      let len =
+        <[u8; size_of::<u64>()]>::try_from(len).map_err(|_| HeldRefused::UnknownKind(kind))?;
+      let number =
+        <[u8; size_of::<u64>()]>::try_from(number).map_err(|_| HeldRefused::UnknownKind(kind))?;
+      held.aways.push((
+        slates_vcs::AwayAt {
+          number: u64::from_le_bytes(number),
+          identity,
+        },
+        u64::from_le_bytes(len),
+      ));
+    }
+    // A window let go in the form before A-923: taken back and numbered at the restore (a migration).
+    KIND_VCS_AWAY_RETIRED => {
       let (identity, len) = bytes
         .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
         .ok_or(HeldRefused::UnknownKind(kind))?;
@@ -1847,7 +1956,9 @@ fn absorb_paged_entry(
         slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
       let len =
         <[u8; size_of::<u64>()]>::try_from(len).map_err(|_| HeldRefused::UnknownKind(kind))?;
-      held.aways.push((identity, u64::from_le_bytes(len)));
+      held
+        .aways_unnumbered
+        .push((identity, u64::from_le_bytes(len)));
     }
     _ => return Ok(false),
   }
@@ -1871,6 +1982,7 @@ pub(crate) fn split_held(
     names: Vec::new(),
     region_holds: Vec::new(),
     aways: Vec::new(),
+    aways_unnumbered: Vec::new(),
     landed: Vec::new(),
   };
   let mut heads: BTreeMap<[u8; 16], crate::live_ship::HeldLive> = BTreeMap::new();

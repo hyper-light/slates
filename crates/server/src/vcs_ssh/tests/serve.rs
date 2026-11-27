@@ -479,10 +479,94 @@ impl Peer {
 
   /// Waits until the connection ends: whether it ended before the client's patience ran out.
   fn ended(&mut self) -> bool {
-    let started = Instant::now();
-    while self.pump() {}
-    started.elapsed() < Duration::from_nanos(PATIENCE_NS)
+    self.ended_waited().0
   }
+
+  /// [`Peer::ended`], and how long the client waited for the connection to end.
+  fn ended_waited(&mut self) -> (bool, Duration) {
+    let started = Instant::now();
+    let out = self.client.take_output();
+    if !out.is_empty() {
+      let _ = self.stream.write_all(&out);
+    }
+    let client = &mut self.client;
+    let ended = read_until_closed(&mut self.stream, |bytes| client.feed(bytes));
+    (ended, started.elapsed())
+  }
+}
+
+/// Reads `stream` until its peer closes it, each byte handed to `feed`: whether it ended by the peer's close (or a reset),
+/// never by how long it took. A read that waits out the socket's timeout reads again (A-745, A-232's rule): the SSH
+/// edge's own phase waits close a session that is stuck, so a stuck server still ends the wait. Judged instead by the
+/// client's patience (four liveness windows), a whole session whose close the loaded server sent past it read as not
+/// ended (main 01a20182's 8a loop at 228d0dc97, round 4: the three seat tests, each `order [94, 98, 96, 97]`, status 0,
+/// `ended: false`).
+fn read_until_closed(stream: &mut ClientStream, mut feed: impl FnMut(&[u8])) -> bool {
+  let mut chunk = [0u8; 4096];
+  loop {
+    match stream.read(&mut chunk) {
+      Ok(0) => return true,
+      Ok(count) => feed(&chunk[..count]),
+      Err(error)
+        if matches!(
+          error.kind(),
+          std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) => {}
+      Err(error) => {
+        return matches!(
+          error.kind(),
+          std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+        );
+      }
+    }
+  }
+}
+
+/// Shape: the read timeout [`read_until_closed`]'s test reads with: a tenth of a liveness window, so it runs in under a
+/// second; it pins the order of events, not their lengths.
+const TEST_LOOK: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS / 10);
+
+/// The 8a loop's seat tests (`ended: false` on whole sessions under load). Do: from a loopback listener that writes a
+/// byte at once and closes its connection three read timeouts later, read the connection once judging its end by one
+/// timeout, as the seat tests' client did, and once with [`read_until_closed`]. Expect: the first judges it not ended;
+/// the second sees it closed, the byte fed.
+#[test]
+fn a_connection_closed_past_the_clients_patience_is_seen_ended() {
+  let closing = || {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener");
+    let port = listener.local_addr().expect("its address").port();
+    let serving = std::thread::spawn(move || {
+      let (mut taken, _) = listener.accept().expect("the connection");
+      taken.write_all(b"x").expect("a byte");
+      let until = Instant::now() + 3 * TEST_LOOK;
+      while Instant::now() < until {
+        std::thread::park_timeout(until.saturating_duration_since(Instant::now()));
+      }
+    });
+    let stream =
+      ClientStream::connect(std::net::SocketAddr::from(([127, 0, 0, 1], port))).expect("connected");
+    stream
+      .set_read_timeout(Some(TEST_LOOK))
+      .expect("a read timeout");
+    (stream, serving)
+  };
+  let (mut stream, serving) = closing();
+  let started = Instant::now();
+  let mut chunk = [0u8; 16];
+  while matches!(stream.read(&mut chunk), Ok(count) if count > 0) {}
+  // The seat tests' judgement: ended where the wait for the end took less than the patience, the socket's timeout.
+  let judged_by_patience = started.elapsed() < TEST_LOOK;
+  drop(stream);
+  serving.join().expect("the listener's thread");
+  let (mut stream, serving) = closing();
+  let mut fed = Vec::new();
+  let ended = read_until_closed(&mut stream, |bytes| fed.extend_from_slice(bytes));
+  serving.join().expect("the listener's thread");
+  assert_eq!(
+    (judged_by_patience, ended, fed),
+    (false, true, b"x".to_vec()),
+    "a fixed patience judged the end too early; the end itself is seen"
+  );
 }
 
 /// RFC 4252 §7's signed data for the key `key_blob` of `user`, under `session_id`.

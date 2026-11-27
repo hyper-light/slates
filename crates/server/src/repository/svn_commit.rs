@@ -109,6 +109,11 @@ const REVISION_AUTHOR: &[u8] = b"svn:author";
 /// [`fold_to_readers`]): the versions it no longer keeps. Format: a counter name in the status report.
 pub(crate) const FOLDED_BYTES: &str = "repository.svn_commit.folded_bytes";
 
+/// Counter: a step of a green's fold to its reachable floor after an import's landing ([`fold_to_readers_some`], A-920
+/// 11a): many a wide landing shows its fold was taken a unit at a time, never whole in its tail's one step. Format: a
+/// counter name in the status report.
+pub(crate) const FOLD_STEPS: &str = "repository.svn_commit.fold_steps";
+
 /// Counter: a Subversion repository whose green was not at its records' youngest revision, or answered a version other
 /// than the revision's: zero in every correct use, since only the step moves the green. Format: a counter name.
 pub(crate) const DIVERGED: &str = "repository.svn.diverged";
@@ -320,7 +325,7 @@ async fn landed_work(
   // The texts this commit put land in its changeset (C2 stage B): the store holds every text its history names, so no
   // entry names a text that is durable only in the shard's image, and every reader reads one RAM does not hold back
   // from there (C2 stage B part 2). The texts the records already held landed with the changeset that put them.
-  let carried = texts_carried(&work.record.changes, &storing.put);
+  let carried = texts_carried(&work.record.changes, &storing.put).await?;
   // The revision made of the work at the owner's instant, judged again with the commit's locks then, checked, landed on
   // the store and committed in the register (`landing`); every text the landing put given back once it ends.
   let (turn, plans, restoring) = match planned(repository, &work.record.changes).await? {
@@ -453,26 +458,88 @@ async fn bring_texts(
   Some(Ok(brought))
 }
 
+/// Counter: a step of a landing's walk of the texts its changeset carries ([`texts_carried`], A-920 11c): many a wide
+/// revision shows the walk was taken a text and a row a unit, never whole in one step. Format: a counter name in the
+/// status report.
+pub(crate) const CARRIED_STEPS: &str = "repository.svn_commit.carried_steps";
+
 /// The texts of `work` that `put` names (those its landing put whole into the content store), each once, at the first
 /// path a row sets it at, with its length: what its changeset carries (C2 stage B). Each text looked up, not searched
-/// for among every one put and carried (goal 93: 327 ms of one step for a revision of 9,000 texts, debug).
-fn texts_carried(changes: &[ChangedPath], put: &[ContentIdentity]) -> Vec<landing::LandedText> {
-  let mut carried: Vec<landing::LandedText> = Vec::with_capacity(put.len());
-  let put: BTreeSet<&ContentIdentity> = put.iter().collect();
-  let mut seen: BTreeSet<ContentIdentity> = BTreeSet::new();
-  for change in changes {
-    let Some(text) = change.text else {
-      continue;
+/// for among every one put and carried (goal 93: 327 ms of one step for a revision of 9,000 texts, debug). Taken a unit
+/// at a time ([`Carrying`]), a slice of the shard's budget a step, each step counted ([`CARRIED_STEPS`]; A-920 11c:
+/// whole, 12.3 ms of one step at 9,000 texts and rows, debug, the release leader of a wide add's staging). None where
+/// the shard's state is gone.
+async fn texts_carried(
+  changes: &[ChangedPath],
+  put: &[ContentIdentity],
+) -> Option<Vec<landing::LandedText>> {
+  let mut carrying = Carrying::new(put.len());
+  loop {
+    crate::state::with_state(|state| state.count(CARRIED_STEPS, 1))?;
+    let deadline = slates_rt::futures::now_ns()
+      .saturating_add(slates_rt::futures::step_budget_ns().unwrap_or(0));
+    loop {
+      if carrying.unit(changes, put) {
+        return Some(carrying.carried);
+      }
+      if slates_rt::futures::now_ns() >= deadline {
+        break;
+      }
+    }
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// A walk of the texts a changeset carries being taken a unit at a time ([`texts_carried`]).
+struct Carrying {
+  /// The texts put, as noted so far.
+  put: BTreeSet<ContentIdentity>,
+  /// The next text put to note.
+  put_at: usize,
+  /// The texts a row has carried already.
+  seen: BTreeSet<ContentIdentity>,
+  /// The next row.
+  row_at: usize,
+  /// What is carried so far, in row order.
+  carried: Vec<landing::LandedText>,
+}
+
+impl Carrying {
+  /// A walk of a changeset carrying at most `texts` texts, begun.
+  fn new(texts: usize) -> Carrying {
+    Carrying {
+      put: BTreeSet::new(),
+      put_at: 0,
+      seen: BTreeSet::new(),
+      row_at: 0,
+      carried: Vec::with_capacity(texts),
+    }
+  }
+
+  /// One unit: a text of `put` noted, or once every one is, one row of `changes` read, its text carried where it was
+  /// put and no row before carried it. Whether every row is read.
+  fn unit(&mut self, changes: &[ChangedPath], put: &[ContentIdentity]) -> bool {
+    if let Some(identity) = put.get(self.put_at) {
+      self.put.insert(*identity);
+      self.put_at = self.put_at.saturating_add(1);
+      return false;
+    }
+    let Some(change) = changes.get(self.row_at) else {
+      return true;
     };
-    if put.contains(&text.identity) && seen.insert(text.identity) {
-      carried.push(landing::LandedText {
+    self.row_at = self.row_at.saturating_add(1);
+    if let Some(text) = change.text
+      && self.put.contains(&text.identity)
+      && self.seen.insert(text.identity)
+    {
+      self.carried.push(landing::LandedText {
         path: change.path.as_bytes().to_vec(),
         identity: text.identity,
         len: text.size,
       });
     }
+    false
   }
-  carried
 }
 
 /// Lands one changeset of repository `repository` (module docs of [`landing`]) holding its landing turn `turn`, taken by
@@ -590,6 +657,19 @@ pub(crate) async fn land_revision(
   landed
 }
 
+/// Counter: a yield between two of a landing's sections ([`section_yield`], A-920 7c), so the second begins a step of
+/// its own, never the first's tail in one poll. Format: a counter name in the daemon's status report.
+pub(crate) const LANDING_SECTION_YIELDS: &str = "repository.svn_commit.landing_section_yields";
+
+/// A yield between two of a landing's sections, counted (A-920 7c: the storing's begin and the carried texts, 15.4 and
+/// 14.3 ms in debug, ran in one poll of 31 ms at 9,000 files; and each paced loop's last slice ran on into the next
+/// section). None where the shard's state is gone.
+pub(crate) async fn section_yield() -> Option<()> {
+  crate::state::with_state(|state| state.count(LANDING_SECTION_YIELDS, 1))?;
+  slates_rt::futures::yield_now().await;
+  Some(())
+}
+
 /// Stages the texts `revision` brings for its landing (C2 stage B part 2 (b)): each taken out of its contents and named
 /// stored ([`take_texts`]), put through repository `repository`'s content store a copy slice a step, as a client's
 /// commit's are, so its changeset carries them as Payload with Texts rows and the records keep none in RAM; and the
@@ -601,15 +681,14 @@ async fn stage_texts(
   revision: &mut Revision,
   imported: Vec<ContentIdentity>,
 ) -> Option<Result<(Storing, Vec<landing::LandedText>), Uncommitted>> {
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("storing");
   let texts = crate::state::with_state(|state| take_texts(state, repository, revision))?;
   // Taking the texts and beginning their put are steps of their own (goal 93).
   slates_rt::futures::yield_now().await;
   let begun = crate::state::with_state(|state| {
     match storing_of(state, repository, (&revision.record.changes, texts.keys())) {
-      Ok(mut storing) => {
-        hand_over(state, repository, revision, imported, &mut storing);
-        Ok(storing)
-      }
+      Ok(storing) => Ok(storing),
       Err(refused) => {
         crate::vcs_store::name_holds::unpin_texts(state, &imported);
         release_texts(state, None, &imported);
@@ -621,6 +700,25 @@ async fn stage_texts(
     Ok(storing) => storing,
     Err(refused) => return Some(Err(refused)),
   };
+  section_yield().await?;
+  // The import's texts handed over a text a unit, a slice of the shard's budget a step (A-920 13a: 9,000 in one step,
+  // 10.5 ms, debug, with the storing's begin the release leader of every wide import).
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("storing.hand_over");
+  let mut handing = HandingOver::new(&storing, imported);
+  loop {
+    let deadline = slates_rt::futures::now_ns()
+      .saturating_add(slates_rt::futures::step_budget_ns().unwrap_or(0));
+    let done = crate::state::with_state(|state| {
+      state.count(HAND_OVER_STEPS, 1);
+      handing.some(state, (repository, &*revision), &mut storing, deadline)
+    })?;
+    if done {
+      break;
+    }
+    slates_rt::futures::yield_now().await;
+  }
+  section_yield().await?;
   // Each piece lent from the text the landing holds, never copied out (P7's finding (2)).
   let piece = |identity: &ContentIdentity, offset: u64, len: usize| {
     let bytes = texts.get(identity)?;
@@ -641,38 +739,85 @@ async fn stage_texts(
     }
   }
   // The bytes are the content store's now, until the landing ends.
+  #[cfg(test)]
+  crate::vcs_store::svn_import::phase::tag("storing.carried");
   drop(texts);
-  let carried = texts_carried(&revision.record.changes, &storing.put);
+  section_yield().await?;
+  let carried = texts_carried(&revision.record.changes, &storing.put).await?;
+  // What the staging does next begins a step of its own (A-920 11c: the walk's end and the brought texts' first part
+  // shared one poll).
+  section_yield().await?;
   Some(Ok((storing, carried)))
 }
 
-/// Takes the holds an import's sink took on the texts `revision` names stored, `imported`, as texts `storing` put, one
-/// each; gives back every other: one the records hold already, one sealed twice, one the revision does not name.
-fn hand_over(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  revision: &Revision,
+/// Counter: a step of an import's texts handed over to its landing ([`HandingOver`], A-920 13a): many a wide revision
+/// shows its texts were handed over a text a unit, never all in one step. Format: a counter name in the status report.
+pub(crate) const HAND_OVER_STEPS: &str = "repository.svn_commit.hand_over_steps";
+
+/// The holds an import's sink took on the texts `revision` names stored, `imported`, being taken as texts `storing`
+/// put, one each, a text a unit; every other given back a text a unit after: one the records hold already, one sealed
+/// twice, one the revision does not name (A-920 13a: whole, 10.5 ms of one step at 9,000 texts, debug).
+struct HandingOver {
+  /// The texts the sink put.
   imported: Vec<ContentIdentity>,
-  storing: &mut Storing,
-) {
-  let mut spare = Vec::new();
-  // What `storing` put, by identity: a lookup a text, not a search of every one put (goal 93: 166 ms of one step for a
-  // revision of 9,000 texts, debug).
-  let mut put: BTreeSet<ContentIdentity> = storing.put.iter().copied().collect();
-  for identity in imported {
-    let held = state
-      .vcs_stores
-      .subversion_records(repository)
-      .is_none_or(|records| records.holds(&identity));
-    if revision.stored.contains_key(&identity) && !held && put.insert(identity) {
-      storing.put.push(identity);
-      storing.pinned.push(identity);
-    } else {
-      spare.push(identity);
+  /// The next of them.
+  at: usize,
+  /// What `storing` put, by identity: a lookup a text, not a search of every one put (goal 93: 166 ms of one step for
+  /// a revision of 9,000 texts, debug).
+  put: BTreeSet<ContentIdentity>,
+  /// The texts to give back.
+  spare: Vec<ContentIdentity>,
+  /// The next of them.
+  spare_at: usize,
+}
+
+impl HandingOver {
+  /// The hand-over of `imported` to `storing`, begun.
+  fn new(storing: &Storing, imported: Vec<ContentIdentity>) -> HandingOver {
+    HandingOver {
+      put: storing.put.iter().copied().collect(),
+      imported,
+      at: 0,
+      spare: Vec::new(),
+      spare_at: 0,
     }
   }
-  crate::vcs_store::name_holds::unpin_texts(state, &spare);
-  release_texts(state, None, &spare);
+
+  /// Units until the shard's clock passes `deadline_ns`, a unit at least: a text taken or kept spare, then a spare
+  /// text unpinned and given back. Whether every text is.
+  fn some(
+    &mut self,
+    state: &mut ShardState,
+    (repository, revision): (RepositoryId, &Revision),
+    storing: &mut Storing,
+    deadline_ns: u64,
+  ) -> bool {
+    loop {
+      if let Some(identity) = self.imported.get(self.at).copied() {
+        self.at = self.at.saturating_add(1);
+        let held = state
+          .vcs_stores
+          .subversion_records(repository)
+          .is_none_or(|records| records.holds(&identity));
+        if revision.stored.contains_key(&identity) && !held && self.put.insert(identity) {
+          storing.put.push(identity);
+          storing.pinned.push(identity);
+        } else {
+          self.spare.push(identity);
+        }
+      } else if let Some(identity) = self.spare.get(self.spare_at).copied() {
+        self.spare_at = self.spare_at.saturating_add(1);
+        let one = core::slice::from_ref(&identity);
+        crate::vcs_store::name_holds::unpin_texts(state, one);
+        release_texts(state, None, one);
+      } else {
+        return true;
+      }
+      if slates_rt::futures::now_ns() >= deadline_ns {
+        return false;
+      }
+    }
+  }
 }
 
 /// The texts of `revision` repository `repository`'s records do not hold, taken out and named stored
@@ -823,6 +968,12 @@ fn storing_of<'t>(
     .vcs_stores
     .subversion_records(repository)
     .ok_or(Uncommitted::NotHeld)?;
+  // An import's texts are its sink's, none taken here: nothing to put, so its rows are not walked (A-920 13a: their
+  // lengths gathered for none, 5.4 ms of one step at 9,000 rows, debug).
+  let mut texts = texts.into_iter().peekable();
+  if texts.peek().is_none() {
+    return Ok(Storing::default());
+  }
   let lengths: BTreeMap<ContentIdentity, u64> = changes
     .iter()
     .filter_map(|change| change.text.map(|text| (text.identity, text.size)))
@@ -1513,16 +1664,43 @@ fn land(
 /// records), and svn's reads are the records', so only a live reader's version (a work's base, a pinned attachment, a
 /// mount) is kept. Before, it folded only past its retention budget, so git-2000's import kept 440 MB of versions.
 pub(crate) fn fold_to_readers(state: &mut ShardState, green: DbVolumeId) {
+  fold_to_readers_begin(state, green);
+  fold_to_readers_some(state, green, u64::MAX);
+}
+
+/// [`fold_to_readers`] begun (A-920 11a): the green's fold to the oldest version a live reader can name begun
+/// (`slates_merge::engine::Green::fold_begin`), to be taken a unit at a time ([`fold_to_readers_some`]).
+pub(crate) fn fold_to_readers_begin(state: &mut ShardState, green: DbVolumeId) {
   let floor = crate::merge_service::reachable_floor(state, green);
-  let folded = state
+  if let Some(mut engine) = state.greens.get_mut(&green) {
+    engine.fold_begin(floor);
+  }
+}
+
+/// One step of the fold [`fold_to_readers_begin`] began, counted ([`FOLD_STEPS`]), its units taken until the shard's
+/// clock passes `deadline_ns`, a unit at least (A-920 11a: whole, 7.5-23.4 ms of a landing's tail step at 9,001
+/// paths, debug). Once it ends, the bytes it released are counted and the green's retention settled. Whether it ended.
+pub(crate) fn fold_to_readers_some(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  deadline_ns: u64,
+) -> bool {
+  state.count(FOLD_STEPS, 1);
+  let stepped = state
     .greens
     .get_mut(&green)
-    .map_or(0, |mut engine| engine.fold_history_before(floor));
+    .map(|mut engine| engine.fold_some(&mut || slates_rt::futures::now_ns() >= deadline_ns));
+  let folded = match stepped {
+    Some(None) => return false,
+    Some(Some(folded)) => folded,
+    None => 0,
+  };
   if folded > 0 {
     state.count(FOLDED_BYTES, u64::try_from(folded).unwrap_or(u64::MAX));
   }
   // A charge the budget cannot take leaves the fold, which only releases, and is charged again at the next settle.
   let _ = crate::merge_service::settle_green_retention(state, green);
+  true
 }
 
 /// The records once the entry recorded the revision: applied, as the check made certain; the answer `commit-info`
@@ -1638,6 +1816,24 @@ pub(crate) struct Stood {
   props: bool,
 }
 
+/// A deleted directory's tree being noted gone a path a unit ([`Building::remove_begin`], A-920 9b).
+#[derive(Debug, Default)]
+struct Removing {
+  /// The nodes beneath the place the directory stood, as the green held them, with whether each is a directory.
+  beneath: Vec<(String, bool)>,
+  /// The next of them to note.
+  next: usize,
+  /// The green path of the place it stood.
+  from: String,
+  /// The green path of the directory.
+  to: String,
+}
+
+/// Gauge: the most gone paths one unit of an increment's build noted or made ops of (A-920 9b), the shard's largest
+/// so far: one where a deleted tree is noted and removed a path a unit, its every path where a row or the build's end
+/// took them in one. Format: a counter name in the daemon's status report, its largest value.
+pub(crate) const BUILD_MOST_GONE_A_UNIT: &str = "repository.svn_commit.build_most_gone_a_unit";
+
 /// The increment under construction (module docs), as the deriver lays one out: paths interned, bytes in the post-state
 /// by offset, every operation node-exclusive.
 struct Building<'b> {
@@ -1645,10 +1841,10 @@ struct Building<'b> {
   records: &'b Repository,
   /// The repository's green, at the same head.
   engine: &'b Green,
-  /// The revision, checked.
+  /// The revision, checked: its rows sorted by path ([`before`] searches them).
   checked: &'b Checked,
-  /// Its rows, by path.
-  rows: BTreeMap<&'b str, &'b ChangedPath>,
+  /// The next row to build.
+  at: usize,
   /// The document.
   doc: OpsDoc,
   /// The post-state's inline bytes: the property lists' identities, and a text the revision or the records hold
@@ -1669,25 +1865,99 @@ struct Building<'b> {
   plans: restore::CopyPlans,
   /// The green paths a copy from an older revision sets back, merged with the rows that change them, made at the end.
   restores: BTreeMap<String, restore::Restore>,
+  /// A deleted directory's tree being noted gone a path a unit (A-920 9b), where a step ended part-way through it.
+  removing: Option<Removing>,
+  /// The most gone paths one unit of the build noted or made ops of ([`BUILD_MOST_GONE_A_UNIT`]).
+  most_gone: u64,
+}
+
+/// A build's own state between its steps ([`Building::detach`]), without the records, the engine or the checked
+/// revision it borrows, which each step lends it again ([`Building::attach`]).
+#[derive(Default)]
+pub(super) struct BuildState {
+  /// The next row to build.
+  at: usize,
+  /// The document.
+  doc: OpsDoc,
+  /// The post-state's inline bytes.
+  post: Vec<u8>,
+  /// The texts the increment names rather than carries.
+  runs: Vec<slates_merge::named::NamedRun>,
+  /// The named runs' bytes so far.
+  runs_len: u64,
+  /// The ops whose sources lie in the named runs.
+  run_ops: Vec<usize>,
+  /// The green paths the revision removes, unless a later row makes them again.
+  gone: BTreeMap<String, Stood>,
+  /// The restores of the revision's copies, by their rows' paths.
+  plans: restore::CopyPlans,
+  /// The green paths a copy from an older revision sets back.
+  restores: BTreeMap<String, restore::Restore>,
+  /// A deleted directory's tree being noted gone.
+  removing: Option<Removing>,
+  /// The most gone paths one unit noted or made ops of.
+  most_gone: u64,
+}
+
+impl BuildState {
+  /// The most gone paths one unit of the build noted or made ops of so far ([`BUILD_MOST_GONE_A_UNIT`]).
+  pub(super) fn most_gone(&self) -> u64 {
+    self.most_gone
+  }
 }
 
 impl<'b> Building<'b> {
+  /// The build so far, its borrows let go, to be taken up again by [`Building::attach`].
+  fn detach(self) -> BuildState {
+    BuildState {
+      at: self.at,
+      doc: self.doc,
+      post: self.post,
+      runs: self.runs,
+      runs_len: self.runs_len,
+      run_ops: self.run_ops,
+      gone: self.gone,
+      plans: self.plans,
+      restores: self.restores,
+      removing: self.removing,
+      most_gone: self.most_gone,
+    }
+  }
+
+  /// The build [`Building::detach`] let go, over the records, the engine and the checked revision it began on.
+  fn attach(
+    (records, engine, checked): (&'b Repository, &'b Green, &'b Checked),
+    state: BuildState,
+  ) -> Self {
+    Self {
+      records,
+      engine,
+      checked,
+      at: state.at,
+      doc: state.doc,
+      post: state.post,
+      runs: state.runs,
+      runs_len: state.runs_len,
+      run_ops: state.run_ops,
+      gone: state.gone,
+      plans: state.plans,
+      restores: state.restores,
+      removing: state.removing,
+      most_gone: state.most_gone,
+    }
+  }
+
   /// An empty increment for `checked` over `records` and `engine`.
   fn new(
     records: &'b Repository,
     engine: &'b Green,
     (checked, plans): (&'b Checked, restore::CopyPlans),
   ) -> Self {
-    let rows = checked
-      .changes()
-      .iter()
-      .map(|row| (row.path.as_str(), row))
-      .collect();
     Self {
       records,
       engine,
       checked,
-      rows,
+      at: 0,
       doc: OpsDoc::default(),
       post: Vec::new(),
       runs: Vec::new(),
@@ -1696,16 +1966,69 @@ impl<'b> Building<'b> {
       gone: BTreeMap::new(),
       plans,
       restores: BTreeMap::new(),
+      removing: None,
+      most_gone: 0,
     }
   }
 
-  /// The increment, based at `head` and identified by `id`: every row in path order, then what the revision removes.
-  fn build(mut self, head: u64, id: [u8; 32]) -> Result<Increment, Uncommitted> {
-    let checked = self.checked;
-    // The post-state holds each text the rows set that is not named (`Building::insert`): sized once at their length,
-    // so no append grows it (P7 finding (2): grown a text at a time it doubled). A copy's restored texts may still grow
-    // it past them.
-    let texts = checked
+  /// The increment, based at `head` and identified by `id`: every row in path order, then what the revision removes;
+  /// its document in canonical order.
+  fn build(self, head: u64, id: [u8; 32]) -> Result<Increment, Uncommitted> {
+    let mut increment = self.build_unordered(head, id)?;
+    increment.doc.canonicalize();
+    Ok(increment)
+  }
+
+  /// [`Building::build`] but for its document's canonical order, which its caller gives it, a slice at a time where
+  /// it is an import's (A-920 piece 4a, `staging::canonical_in`): nothing of the increment but its document's order
+  /// depends on it.
+  pub(super) fn build_unordered(
+    mut self,
+    head: u64,
+    id: [u8; 32],
+  ) -> Result<Increment, Uncommitted> {
+    self.sized()?;
+    self.rows_some(&mut || false)?;
+    self.finish(head, id)
+  }
+
+  /// Begins building `checked`'s increment a slice at a time (A-920 piece 4c, [`Building::step`]): the post-state
+  /// sized, no row built yet.
+  pub(super) fn begin(
+    records: &'b Repository,
+    engine: &'b Green,
+    (checked, plans): (&'b Checked, restore::CopyPlans),
+  ) -> Result<BuildState, Uncommitted> {
+    let mut building = Building::new(records, engine, (checked, plans));
+    building.sized()?;
+    Ok(building.detach())
+  }
+
+  /// One step of the build `state` holds ([`Building::begin`]), over the records, the engine and the checked revision
+  /// it began on, unchanged since: its rows built a row a unit until `spent`, a row at least; once every row is, what
+  /// the revision removes and restores, and the increment based at `head`, identified by `id`.
+  pub(super) fn step(
+    (records, engine, checked): (&'b Repository, &'b Green, &'b Checked),
+    state: &mut BuildState,
+    spent: &mut dyn FnMut() -> bool,
+    (head, id): (u64, [u8; 32]),
+  ) -> Result<Option<Increment>, Uncommitted> {
+    // The state stays where its owner keeps it between steps, taken up for this one and put back where rows remain.
+    let mut building = Building::attach((records, engine, checked), core::mem::take(state));
+    if !building.rows_some(spent)? || !building.ends_some(spent)? {
+      *state = building.detach();
+      return Ok(None);
+    }
+    state.most_gone = building.most_gone;
+    building.finish(head, id).map(Some)
+  }
+
+  /// The post-state sized once at the length of every text the rows set that is not named (`Building::insert`), so no
+  /// append grows it (P7 finding (2): grown a text at a time it doubled). A copy's restored texts may still grow it
+  /// past them.
+  fn sized(&mut self) -> Result<(), Uncommitted> {
+    let texts = self
+      .checked
       .changes()
       .iter()
       .filter_map(|row| row.text)
@@ -1719,21 +2042,87 @@ impl<'b> Building<'b> {
     self
       .post
       .try_reserve_exact(texts)
-      .map_err(|_| Uncommitted::Budget { available: 0 })?;
-    for row in checked.changes() {
-      self.row(row)?;
+      .map_err(|_| Uncommitted::Budget { available: 0 })
+  }
+
+  /// The rows from the next built in path order, a row a unit until `spent`, a row at least: whether every one is. A
+  /// deleted directory's row notes its tree gone a path a unit after it (A-920 9b), and ends once the last is.
+  fn rows_some(&mut self, spent: &mut dyn FnMut() -> bool) -> Result<bool, Uncommitted> {
+    let checked = self.checked;
+    loop {
+      let gone = self.gone.len();
+      if self.removing.is_some() {
+        self.gone_beneath_one()?;
+      } else {
+        let Some(row) = checked.changes().get(self.at) else {
+          return Ok(true);
+        };
+        self.row(row)?;
+      }
+      self.noted(gone);
+      if self.removing.is_none() {
+        self.at = self.at.saturating_add(1);
+      }
+      if (self.at < checked.changes().len() || self.removing.is_some()) && spent() {
+        return Ok(false);
+      }
     }
-    for (path, restore) in core::mem::take(&mut self.restores) {
+  }
+
+  /// The paths a copy from an older revision sets back made (`restore`), then each path the revision removes made an
+  /// op, each a unit until `spent` (A-920 9b: every one in one unit, 6.6 ms for a deleted tree of 9,001 paths, debug):
+  /// whether every one is.
+  fn ends_some(&mut self, spent: &mut dyn FnMut() -> bool) -> Result<bool, Uncommitted> {
+    while let Some((path, restore)) = self.restores.pop_first() {
+      let gone = self.gone.len();
       self.restored(&path, restore)?;
+      self.noted(gone);
+      if spent() {
+        return Ok(false);
+      }
     }
-    for (path, stood) in core::mem::take(&mut self.gone) {
+    while let Some((path, stood)) = self.gone.pop_first() {
       let kind = if stood.directory {
         OpKind::Rmdir
       } else {
         OpKind::Unlink
       };
       self.op(kind, &path);
+      self.most_gone = self.most_gone.max(1);
+      if spent() {
+        return Ok(false);
+      }
     }
+    Ok(true)
+  }
+
+  /// The gone paths a unit noted, from `before` of them: the most a unit has, kept ([`BUILD_MOST_GONE_A_UNIT`]).
+  fn noted(&mut self, before: usize) {
+    let moved = u64::try_from(self.gone.len().abs_diff(before)).unwrap_or(u64::MAX);
+    self.most_gone = self.most_gone.max(moved);
+  }
+
+  /// One path of the deleted tree [`Building::removing`] holds noted gone; the tree done once its last is.
+  fn gone_beneath_one(&mut self) -> Result<(), Uncommitted> {
+    let Some(mut removing) = self.removing.take() else {
+      return Ok(());
+    };
+    if let Some((found, directory)) = removing.beneath.get(removing.next) {
+      let (place, stood) =
+        self.stood_beneath((found, *directory), (&removing.from, &removing.to))?;
+      self.gone.insert(place, stood);
+      removing.next = removing.next.saturating_add(1);
+    }
+    if removing.next < removing.beneath.len() {
+      self.removing = Some(removing);
+    }
+    Ok(())
+  }
+
+  /// The build's end once every row is built: what the revision restores and removes, each op sourced from a named run
+  /// moved past the inline bytes, and the increment based at `head`, identified by `id`.
+  fn finish(mut self, head: u64, id: [u8; 32]) -> Result<Increment, Uncommitted> {
+    self.ends_some(&mut || false)?;
     // A named run's bytes follow the inline ones in the post-state's one address space (`slates_merge::named`), so each
     // op sourced from a run is moved past them now that their length is known.
     let inline = u64::try_from(self.post.len()).map_err(|_| corrupt())?;
@@ -1742,7 +2131,6 @@ impl<'b> Building<'b> {
       let op = doc.ops.get_mut(*at).ok_or_else(corrupt)?;
       op.src = op.src.checked_add(inline).ok_or_else(corrupt)?;
     }
-    doc.canonicalize();
     let mut increment = Increment {
       id,
       base: head,
@@ -1769,7 +2157,7 @@ impl<'b> Building<'b> {
       return self.over_restore(row, restore);
     }
     match (row.action, &row.copy_from) {
-      (Action::Delete, _) => self.remove(row, true),
+      (Action::Delete, _) => self.remove_begin(row),
       (Action::Add | Action::Replace, Some(source)) => self.copy(row, source),
       (Action::Replace, None) => self.replace(row),
       (Action::Add, None) => self.add(row),
@@ -1794,7 +2182,7 @@ impl<'b> Building<'b> {
   /// Where the node at `path` stood before the revision changed it (`slates_svn::migration::before`): its path and
   /// revision, none where nothing stood.
   fn place_before(&self, path: &str) -> Option<(String, u64)> {
-    match before(&self.rows, path) {
+    match before(self.checked.changes(), path) {
       Before::Head => Some((path.to_owned(), self.records.youngest())),
       Before::Copied { path, revision } => Some((path, revision)),
       Before::Absent => None,
@@ -1821,10 +2209,43 @@ impl<'b> Building<'b> {
     Ok(())
   }
 
+  /// A node a deletion removes, noted gone (A-920 9b): what stands beneath a directory listed now and noted gone a path
+  /// a unit after it ([`Building::gone_beneath_one`]), never the tree in the row's one unit (13.7 ms for 9,001 paths,
+  /// debug). [`Building::remove`] for a replacement, which remakes the node in the same row, notes the tree whole.
+  fn remove_begin(&mut self, row: &ChangedPath) -> Result<(), Uncommitted> {
+    let stood = self.node_before(&row.path)?;
+    self.gone.insert(green_path(&row.path).to_owned(), stood);
+    if stood.directory {
+      let (from, to, beneath) = self.listed_beneath(&row.path)?;
+      if !beneath.is_empty() {
+        self.removing = Some(Removing {
+          beneath,
+          next: 0,
+          from,
+          to,
+        });
+      }
+    }
+    Ok(())
+  }
+
   /// Every node beneath the directory at `path` as the green holds it before the revision, at its green path: beneath
   /// the path at the head, or beneath a copy's source when the copy is of the head; a copy of an older revision is not
   /// listed (module docs, "Not declared yet").
   fn tree_beneath(&self, path: &str) -> Result<Vec<(String, Stood)>, Uncommitted> {
+    let (from, to, beneath) = self.listed_beneath(path)?;
+    beneath
+      .iter()
+      .map(|(found, directory)| self.stood_beneath((found, *directory), (&from, &to)))
+      .collect()
+  }
+
+  /// [`Building::tree_beneath`]'s listing: the green paths of the place `path` stood before the revision (`from`) and of
+  /// `path` itself (`to`), and every node the green holds beneath `from`, with whether it is a directory.
+  fn listed_beneath(
+    &self,
+    path: &str,
+  ) -> Result<(String, String, Vec<(String, bool)>), Uncommitted> {
     let (source, revision) = self.place_before(path).ok_or_else(corrupt)?;
     // The head in the records' numbering: the green's head, or an import batch's whose scratch member counts its own
     // versions from 0 (C2 stage C).
@@ -1833,23 +2254,26 @@ impl<'b> Building<'b> {
         path: path.to_owned(),
       });
     }
-    let (from, to) = (green_path(&source), green_path(path));
-    self
-      .engine
-      .beneath(from)
-      .into_iter()
-      .map(|(found, directory)| {
-        let len = self.engine.content(&found).map_or(0, |bytes| bytes.len());
-        let stood = Stood {
-          directory,
-          len,
-          props: self.engine.xattr(&found, PROPS).is_some(),
-        };
-        moved(&found, from, to)
-          .map(|place| (place, stood))
-          .ok_or_else(corrupt)
-      })
-      .collect()
+    let (from, to) = (green_path(&source).to_owned(), green_path(path).to_owned());
+    let beneath = self.engine.beneath(&from);
+    Ok((from, to, beneath))
+  }
+
+  /// The node `found` beneath `from`, a directory or not, as it stood, at its place beneath `to`.
+  fn stood_beneath(
+    &self,
+    (found, directory): (&str, bool),
+    (from, to): (&str, &str),
+  ) -> Result<(String, Stood), Uncommitted> {
+    let len = self.engine.content(found).map_or(0, |bytes| bytes.len());
+    let stood = Stood {
+      directory,
+      len,
+      props: self.engine.xattr(found, PROPS).is_some(),
+    };
+    moved(found, from, to)
+      .map(|place| (place, stood))
+      .ok_or_else(corrupt)
   }
 
   /// An addition or a replacement by copy: the source's tree at its revision copied by reference, with `REPLACE` where

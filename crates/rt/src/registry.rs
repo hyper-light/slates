@@ -139,6 +139,9 @@ pub struct Pulse {
   /// ([`crate::label::Polling`], A-740), stored by the shard before each poll, so a watchdog that finds the shard
   /// spinning or wedged names the task it was in.
   polling: AtomicU64,
+  /// The task whose poll is the shard's longest ([`Pulse::longest_step_ns`]): its `polling` word as the poll began,
+  /// copied only as a poll sets a new longest (A-920 6b, so a wide import's longest poll names its site).
+  longest_polling: AtomicU64,
   /// An application loop's own forward-progress count on this shard (the fleet coordinator's period
   /// count), bumped by the shard and read by an observer on any thread — kept on the entry so it
   /// needs no allocation of its own and outlives the shard as the entry does.
@@ -239,6 +242,19 @@ impl Pulse {
     self
       .polling
       .store(crate::label::Polling::pack(label, polls), Ordering::Relaxed);
+  }
+
+  /// The owning shard records that the poll it just ended is its longest: the task it was polling's word copied
+  /// ([`Pulse::longest_polling`]), one load and one store, only on a new longest.
+  pub fn record_longest_polling(&self) {
+    self
+      .longest_polling
+      .store(self.polling.load(Ordering::Relaxed), Ordering::Relaxed);
+  }
+
+  /// The task whose poll is the shard's longest (see [`Pulse::record_longest_polling`]).
+  pub fn longest_polling(&self) -> crate::label::Polling {
+    crate::label::Polling::unpack(self.longest_polling.load(Ordering::Relaxed))
   }
 
   /// The task the shard is polling, or polled last (see [`Pulse::record_polling`]).
@@ -706,6 +722,13 @@ impl Drop for WaitingOn {
       let _ = with_entry(shard, |entry| entry.waits_on.store(0, Ordering::Release));
     }
   }
+}
+
+/// The calling thread's user and system CPU time so far, nanoseconds, where the platform keeps them apart per thread
+/// (macOS); `None` elsewhere. What a test splits a long unit's CPU by: the kernel's work against the thread's own
+/// (A-920: a free that empties an allocator region is system time).
+pub fn calling_thread_user_system_ns() -> Option<(u64, u64)> {
+  crate::thread_clock::user_system_ns()
 }
 
 /// The calling thread's CPU clock now, or `None` where the platform reads none (Miri): for a caller that judges its own

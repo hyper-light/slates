@@ -281,15 +281,133 @@ fn a_named_texts_file_is_its_name_alone() {
     super::Judgment::Accepted(judged) => judged,
     other => panic!("not accepted: {other:?}"),
   };
-  assert!(
-    work.post().runs.iter().all(Vec::is_empty),
-    "the work kept its bytes"
-  );
+  assert!(work.post().runs.is_empty(), "the work kept its bytes");
   assert_eq!(
     green.commit_judged(judged).map(|(version, _)| version),
     Ok(1)
   );
   holds_its_name_alone(&mut green, (object, &plane), &bytes);
+}
+
+/// Each of `files` in `green` named for its text alone, and its bytes, read through `plane`, the text's own.
+fn assert_named_for_their_texts(
+  green: &Green,
+  files: &[(String, Identity)],
+  texts: &[Vec<u8>],
+  plane: &Plane,
+) {
+  for ((path, object), bytes) in files.iter().zip(texts) {
+    assert_eq!(
+      green.content(path),
+      Some(super::Content::Named(*object)),
+      "{path} named for its text"
+    );
+    assert_eq!(
+      read_through(green, path, plane).as_deref(),
+      Some(bytes.as_slice()),
+      "{path}'s bytes"
+    );
+  }
+}
+
+/// A-920 3n (a work's named texts read into one buffer, and a file named for its text given no bytes). Do: name eight
+/// texts of 1 KiB a work creates, each its own file, read them, judge the work with `judge_named` and commit the verdict.
+/// Expect: accepted as version 1; every file its text's name alone, each text's bytes the plane's; and no byte buffer
+/// let go for a named file at the commit (`Green::named_buffers_freed`: each had been a text's own buffer, one freed a
+/// commit unit, and the free that emptied the allocator's region cost a unit about 1 ms of the kernel's time).
+#[test]
+fn a_works_named_texts_commit_with_no_buffer_of_their_own_let_go() {
+  const TEXTS: usize = 8;
+  const TEXT: usize = 1024;
+  let mut plane = Plane::default();
+  let texts: Vec<Vec<u8>> = (0..TEXTS)
+    .map(|text| {
+      (0..TEXT)
+        .map(|at| u8::try_from((at + text) % 241).unwrap())
+        .collect()
+    })
+    .collect();
+  let files: Vec<(String, Identity)> = texts
+    .iter()
+    .enumerate()
+    .map(|(at, bytes)| (format!("f{at}"), plane.put(bytes.clone())))
+    .collect();
+  let mut work = named_creates(&files);
+  while !work.read_step(&plane, 1 << 12).unwrap() {}
+  let mut green = Green::new();
+  assert!(green.track_name_holds().is_empty());
+  let judged = match green.judge_named(&mut work) {
+    super::Judgment::Accepted(judged) => judged,
+    other => panic!("not accepted: {other:?}"),
+  };
+  assert_eq!(
+    green.commit_judged(judged).map(|(version, _)| version),
+    Ok(1)
+  );
+  assert_named_for_their_texts(&green, &files, &texts, &plane);
+  assert_eq!(
+    green.named_buffers_freed(),
+    0,
+    "buffers let go for named files"
+  );
+  // Its holds taken and given back, as an owner drains them, so no tracked green is dropped holding one.
+  assert_eq!(green.take_name_holds().len(), TEXTS);
+  assert_eq!(green.give_back_name_holds().len(), TEXTS);
+}
+
+/// A-920 piece 3c (a verdict computed a slice at a time reads what it read whole). Do: commit a named work creating
+/// `a` from a plane's object, so the green holds `a` by the object's name alone with none of it lent; judge a work
+/// renaming `a` to `b`, whose verdict reads `a`'s bytes, whole and a unit a step; lend the object and judge it again a
+/// unit a step. Expect both judges before the lend refused `ContentUnread` naming the object, the sliced one in more
+/// than one step; the one after it accepted.
+#[test]
+fn a_judge_a_unit_a_step_is_refused_for_a_text_its_verdict_reads_unlent() {
+  let bytes = vec![b'r'; 1 << 12];
+  let mut plane = Plane::default();
+  let object = plane.put(bytes.clone());
+  let mut create = named_create("a", object);
+  while !create.read_step(&plane, 1 << 20).unwrap() {}
+  let mut green = Green::new();
+  let super::Judgment::Accepted(judged) = green.judge_named(&mut create) else {
+    panic!("the create not accepted");
+  };
+  assert_eq!(
+    green.commit_judged(judged).map(|(version, _)| version),
+    Ok(1)
+  );
+  green.let_named_bytes_go();
+  let journal = [
+    VolumeOp::Rename {
+      from: "a".to_owned(),
+      to: "b".to_owned(),
+    },
+    VolumeOp::Create {
+      path: "c".to_owned(),
+    },
+  ];
+  let (doc, _) = compose_volume_planned(
+    &Base::of_files(vec![("a".to_owned(), object.len)]),
+    &journal,
+  )
+  .unwrap();
+  let rename = Increment {
+    id: [8; 32],
+    base: 1,
+    doc,
+    post_state: Vec::new(),
+    evidence: Vec::new(),
+    named: Default::default(),
+  };
+  let unread = super::Judgment::ContentUnread { identity: object };
+  let whole = green.judge_named_reads_later(&mut rename.clone());
+  assert_eq!(format!("{whole:?}"), format!("{unread:?}"));
+  let (sliced, steps) =
+    super::applying_tests::judged_a_unit_a_step(&mut green, &mut rename.clone());
+  assert_eq!(format!("{sliced:?}"), format!("{unread:?}"));
+  assert!(steps > 1, "judged in {steps} step");
+  assert!(green.lend(object, bytes) > 0, "a block took the object");
+  let (lent, _) = super::applying_tests::judged_a_unit_a_step(&mut green, &mut rename.clone());
+  assert!(matches!(lent, super::Judgment::Accepted(_)), "{lent:?}");
 }
 
 /// `green`'s file `big` is `object`'s name alone (A-760 (b) 4d): no byte held, one hold of the object taken, its bytes
@@ -677,6 +795,8 @@ struct NameCensus {
   /// Judges and replays refused over an unlent named text, then lent its object and run again (A-760 (b) 4d).
   judges_lent: u64,
   replays_lent: u64,
+  /// Commits whose check of their reads, left to them by their judge, asked for an unlent named text (A-920 piece 3a).
+  commits_lent: u64,
 }
 
 impl NameCensus {
@@ -690,6 +810,7 @@ impl NameCensus {
       && self.restored_below > 0
       && self.named_restored > 0
       && self.judges_lent > 0
+      && self.commits_lent > 0
       && self.replays_lent > 0
   }
 }
@@ -1013,8 +1134,18 @@ fn judge_lending(
   plane: &Plane,
   census: &mut NameCensus,
 ) -> super::Judgment {
+  judge_lending_by(green, (work, plane), census, Green::judge_named)
+}
+
+/// [`judge_lending`] by `judge`, one of the green's named judges.
+fn judge_lending_by(
+  green: &mut Green,
+  (work, plane): (&mut Increment, &Plane),
+  census: &mut NameCensus,
+  judge: fn(&mut Green, &mut Increment) -> super::Judgment,
+) -> super::Judgment {
   for _ in 0..3 {
-    let judgment = green.judge_named(work);
+    let judgment = judge(green, work);
     let super::Judgment::ContentUnread { identity } = judgment else {
       return judgment;
     };
@@ -1027,6 +1158,42 @@ fn judge_lending(
     census.judges_lent += 1;
   }
   panic!("a judge refused again with its objects lent");
+}
+
+/// `work` judged on `green` a unit a step leaving its commit's reads to its commit ([`Green::begin_judging`], as
+/// [`Green::judge_named_reads_later`] judges; A-920 piece 3c), lent as its judge refuses, then committed a unit a step, each text the commit's check asks for lent as it asks, then let go: the
+/// version it committed, none where it was not accepted. No text is asked for again once lent.
+fn committed_reads_later(
+  green: &mut Green,
+  work: &mut Increment,
+  (plane, census): (&Plane, &mut NameCensus),
+) -> Option<u64> {
+  let judgment = judge_lending_by(green, (work, plane), census, judged_a_unit_a_step);
+  let super::Judgment::Accepted(judged) = judgment else {
+    return None;
+  };
+  let mut committing = green.begin_committing(judged);
+  let mut asked = BTreeSet::new();
+  loop {
+    match green.committing_step(&mut committing, &mut || true) {
+      super::CommitStep::More => {}
+      super::CommitStep::Lend(unlent) => {
+        assert!(unlent.is_disjoint(&asked), "asked again for {unlent:?}");
+        lend_all(green, &unlent, plane);
+        asked.extend(unlent);
+        census.commits_lent += 1;
+      }
+      super::CommitStep::Committed(version, _) => {
+        green.let_named_bytes_go();
+        return Some(version);
+      }
+    }
+  }
+}
+
+/// `work` judged on `green` a unit a step ([`super::applying_tests::judged_a_unit_a_step`]): the judgment.
+fn judged_a_unit_a_step(green: &mut Green, work: &mut Increment) -> super::Judgment {
+  super::applying_tests::judged_a_unit_a_step(green, work).0
 }
 
 /// `applied` applied to `green` for `work` as its entry records it, a unit a step (`Green::apply_step`), each named text
@@ -1085,6 +1252,9 @@ struct History {
   identities: Vec<Identity>,
   judging: Green,
   replaying: Green,
+  /// A green judging each version as the judging one does but leaving its commit's reads to its commit, committed a
+  /// unit a step (A-920 piece 3a).
+  deferring: Green,
   /// Each green's content store's holds of the objects (A-760 (b) 4d).
   judging_holds: BTreeMap<Identity, u64>,
   replaying_holds: BTreeMap<Identity, u64>,
@@ -1105,6 +1275,7 @@ impl History {
       identities,
       judging,
       replaying,
+      deferring: Green::new(),
       judging_holds: BTreeMap::new(),
       replaying_holds: BTreeMap::new(),
       model: Model::new(),
@@ -1141,7 +1312,9 @@ impl History {
       while !self.judging.make_step(&mut judged, 5).map_err(moved)?.done {}
       census.stepped += 1;
     }
+    let mapped_before = self.judging.mapped_files_made();
     let (number, applied) = self.judging.commit_judged(judged).map_err(moved)?;
+    let mapped = self.judging.mapped_files_made() - mapped_before;
     // Lent for the verdict and its commit, let go once it is committed.
     self.judging.let_named_bytes_go();
     let (mut recorded, _) = version_work(
@@ -1162,6 +1335,7 @@ impl History {
       ),
       number
     );
+    self.deferred(index, (version, (number, mapped)), census)?;
     count_names(&self.model, &after, version, census);
     let before = std::mem::replace(&mut self.model, after);
     self.committed.push(Committed {
@@ -1184,6 +1358,37 @@ impl History {
       "the replaying green",
     )?;
     prop_assert_eq!(self.replaying.head_identity(), self.judging.head_identity());
+    Ok(())
+  }
+
+  /// `version`, increment `index`, judged on the deferring green leaving its commit's reads to its commit and committed
+  /// a unit a step ([`committed_reads_later`]): the version `number` the judging green committed, and its head; and,
+  /// where the judging green made none of its files in steps first, as many files made by copying as its commit made
+  /// (`mapped`, `Green::mapped_files_made`): a file whose run makes no other moves the run's buffer, sliced or whole.
+  fn deferred(
+    &mut self,
+    index: usize,
+    (version, (number, mapped)): (&Version, (u64, u64)),
+    census: &mut NameCensus,
+  ) -> Result<(), TestCaseError> {
+    let (mut work, _) = version_work(
+      index,
+      self.deferring.head(),
+      &self.model,
+      version,
+      &self.identities,
+    )
+    .ok_or_else(|| TestCaseError::fail(format!("version {index} changed nothing deferred")))?;
+    read_all(&mut work, &self.plane);
+    let mapped_before = self.deferring.mapped_files_made();
+    prop_assert_eq!(
+      committed_reads_later(&mut self.deferring, &mut work, (&self.plane, census)),
+      Some(number)
+    );
+    prop_assert_eq!(self.deferring.head_identity(), self.judging.head_identity());
+    if !version.stepped {
+      prop_assert_eq!(self.deferring.mapped_files_made() - mapped_before, mapped);
+    }
     Ok(())
   }
 

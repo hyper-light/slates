@@ -1181,6 +1181,58 @@ fn a_retired_branch_gives_back_a_node_a_step_and_frees_only_what_it_alone_held()
   );
 }
 
+/// A lineage of a thousand files' root and a branch of it with a tenth of them changed, and the nodes the root held
+/// alone before the branch.
+fn a_branch_with_a_tenth_changed() -> (Lineage, LineageGreen, usize) {
+  let mut origin = Origin::default();
+  for n in 0..1_000u32 {
+    origin.files.push((
+      format!("dir{}/file{n}", n % 10),
+      format!("bytes of {n}").into_bytes(),
+    ));
+  }
+  let (mut lineage, root) = Lineage::new(Green::with_origin(origin));
+  let held_alone = lineage.live_nodes();
+  let branch = lineage.branch(root, 0).unwrap();
+  change_a_tenth(&mut lineage, branch);
+  (lineage, branch, held_alone)
+}
+
+/// The steps `release` takes to its end over `lineage`.
+fn release_steps(lineage: &mut Lineage, release: &mut super::Release) -> u64 {
+  let mut steps = 0u64;
+  while lineage.release_step(release).unwrap() {
+    steps += 1;
+  }
+  steps
+}
+
+/// A-920 11b. Do: in two lineages alike, a green of a thousand files and a branch with a hundred changed, retire the
+/// branch; in one drop what else it held at once, as its retire did before (`Release::remains` let go whole), and in
+/// the other step its release to its end. Expect: the stepped release takes at least one step more a changed file (the
+/// branch's own histories let go an entry a step, never whole in its retire's step), and both lineages hold exactly the
+/// nodes the root held alone.
+#[test]
+fn a_retired_branchs_own_histories_are_let_go_an_entry_a_step() {
+  let (mut whole, branch, held_alone) = a_branch_with_a_tenth_changed();
+  let mut dropped = whole.retire(branch).unwrap();
+  dropped.remains = None;
+  let at_once = release_steps(&mut whole, &mut dropped);
+  let (mut stepped, branch, _) = a_branch_with_a_tenth_changed();
+  let mut release = stepped.retire(branch).unwrap();
+  let in_steps = release_steps(&mut stepped, &mut release);
+  assert!(
+    in_steps >= at_once + 100,
+    "{in_steps} steps against {at_once} with its histories dropped whole"
+  );
+  assert!(release.is_done(), "the stepped release ended");
+  assert_eq!(
+    (whole.live_nodes(), stepped.live_nodes()),
+    (held_alone, held_alone),
+    "each release freed what the branch alone held"
+  );
+}
+
 /// A-575 (a repository's member made empty, §4.17.1). Do: add an empty member to a lineage and create a file in it.
 /// Expect: it holds nothing at version 0 and its file at version 1, and the lineage's root is untouched.
 #[test]

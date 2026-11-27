@@ -80,6 +80,12 @@ pub trait Graph {
   fn entry_ids(&self, tree: Self::Node) -> Vec<ObjectId> {
     self.entries(tree).map(|entry| self.id(entry)).collect()
   }
+  /// Before `tree`'s ids are read ([`Graph::entry_ids`]): room a store's reads may keep for the walk's next trees,
+  /// charged to `admission` (main 01a20182's ruling of 2026-11-25: a fetch's tree reads rebuilt every chain from its
+  /// base). By default, nothing.
+  fn opening_tree(&self, tree: Self::Node, admission: &mut Admission) {
+    let _ = (tree, admission);
+  }
   /// The object a tree's entry `id` names, as [`Graph::entries`] resolves it (a store keeps the first it cannot find as
   /// a fault). By default, [`Graph::node`].
   fn entry_node(&self, id: &ObjectId) -> Option<Self::Node> {
@@ -274,10 +280,14 @@ pub struct Counters {
 /// the units between its `spent` asks can tell them apart without the negotiation keeping a clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnitKind {
-  /// A unit of `ready`'s search, and the cut's or the selection's begun after it.
+  /// A unit of `ready`'s search, and the cut begun after it.
   Ready,
-  /// A unit of the cut's walk, and the selection begun after it.
+  /// A unit of the cut's walk, and the selection begun after it (its sides set out; its tips painted a unit each,
+  /// [`UnitKind::Tips`]).
   Cut,
+  /// A wanted or had tip painted, the selection's start (main's order of 2026-11-25: a clone's tips painted in the cut's
+  /// one unit ran 7.9 to 10.3 ms).
+  Tips,
   /// A tree marked held.
   Mark,
   /// A tree opened: its ids read.
@@ -304,11 +314,16 @@ pub enum UnitKind {
   Done,
 }
 
+/// How many kinds of unit there are ([`UnitKind::ALL`]).
+/// Shape: one a variant of [`UnitKind`].
+pub const KINDS: usize = 15;
+
 impl UnitKind {
   /// Every kind, in order.
-  pub const ALL: [UnitKind; 14] = [
+  pub const ALL: [UnitKind; KINDS] = [
     UnitKind::Ready,
     UnitKind::Cut,
+    UnitKind::Tips,
     UnitKind::Mark,
     UnitKind::OpenTree,
     UnitKind::TakeEntry,
@@ -327,6 +342,19 @@ impl UnitKind {
 thread_local! {
   /// The kind of the unit this thread's negotiation began last ([`last_unit`]).
   static LAST_UNIT: core::cell::Cell<UnitKind> = const { core::cell::Cell::new(UnitKind::Done) };
+  /// The kind of the unit it would do next, marked as it asks whether its step is spent ([`next_unit`]).
+  static NEXT_UNIT: core::cell::Cell<UnitKind> = const { core::cell::Cell::new(UnitKind::Done) };
+}
+
+/// The kind of the unit this thread's negotiation would do next, as it asks its owner whether its step is spent: what a
+/// pace that asks whether the next unit fits (`slates_pace::Step::more_at`, A-783) weighs it by.
+pub fn next_unit() -> UnitKind {
+  NEXT_UNIT.with(core::cell::Cell::get)
+}
+
+/// Marks a unit of `kind` as the next the negotiation would do, before it asks whether its step is spent.
+pub(super) fn ask_next(kind: UnitKind) {
+  NEXT_UNIT.with(|next| next.set(kind));
 }
 
 /// The kind of the unit this thread's negotiation began last: an owner timing its units between `spent` asks reads it
@@ -702,9 +730,20 @@ impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
     spent: &mut dyn FnMut() -> bool,
   ) -> Result<Option<Outcome<G, N>>, Refusal> {
     loop {
+      // The choice asks its own pace between its units and stops where it is spent.
+      let choosing = matches!(self.phase, Phase::Selecting(_));
       if let Some(outcome) = self.unit(graph, admission, spent)? {
         return Ok(Some(outcome));
       }
+      if choosing {
+        return Ok(None);
+      }
+      ask_next(match &self.phase {
+        Phase::Ready(..) => UnitKind::Ready,
+        Phase::Cut(..) => UnitKind::Cut,
+        Phase::Selecting(selecting) => selecting.unit_kind(),
+        Phase::Done => UnitKind::Done,
+      });
       if spent() {
         return Ok(None);
       }
@@ -765,7 +804,7 @@ impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
             self.phase = Phase::Cut(cutting, decided);
             Ok(None)
           }
-          Some(cut) => self.select(graph, cut, *decided, admission).map(|()| None),
+          Some(cut) => self.select(cut, *decided, admission).map(|()| None),
         }
       }
       Phase::Selecting(mut selecting) => {
@@ -808,9 +847,8 @@ impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
   }
 
   /// Begins the choice of the objects, the cut made.
-  fn select<S: Graph<Node = N, Green = G>>(
+  fn select(
     &mut self,
-    graph: &S,
     cut: shallow::Cut<N>,
     decided: Decided<N>,
     admission: &mut Admission,
@@ -820,7 +858,6 @@ impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
       .charge_items::<Run<G>>(self.runs.len())
       .map_err(Refusal::PastAdmission)?;
     let selecting = objects::Selecting::begin(
-      graph,
       decided.asked,
       objects::Sides {
         wants: decided.wants,
@@ -829,8 +866,7 @@ impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
         cut,
       },
       self.runs.clone(),
-      admission,
-    )?;
+    );
     self.phase = Phase::Selecting(Box::new(selecting));
     Ok(())
   }

@@ -72,6 +72,9 @@ pub struct Spawn<'a> {
   pub stdout: ChildStream<'a>,
   /// Its standard error.
   pub stderr: ChildStream<'a>,
+  /// Descriptors of the caller's handed to the child at the numbers after its standard streams, in order (the
+  /// spawner's ends, A-924); none for a hook or a helper.
+  pub handed: &'a [BorrowedFd<'a>],
 }
 
 /// A child [`spawn`] started: its pid, and its status once its owner reaped it.
@@ -83,6 +86,9 @@ pub struct SpawnedChild {
   status: Option<ExitStatus>,
 }
 
+/// Format: the first descriptor number a handed descriptor takes in the child: the one after standard error.
+pub const FIRST_HANDED: i32 = 3;
+
 /// Format: the null device a stream with no other end reads and writes.
 const NULL_DEVICE: &[u8] = b"/dev/null";
 
@@ -91,9 +97,9 @@ fn c_string(bytes: &[u8]) -> io::Result<CString> {
   CString::new(bytes).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
 }
 
-/// The child's environment as `NAME=VALUE` strings (module docs): this process's or none, then the overrides, a name
-/// set once.
-fn environment_of(spawn: &Spawn<'_>) -> io::Result<Vec<CString>> {
+/// The child's environment as `NAME=VALUE` entries (module docs): this process's or none, then the overrides, a name
+/// set once. What a request to the spawner carries, resolved on the daemon's side (A-924).
+pub(crate) fn environment_entries(spawn: &Spawn<'_>) -> Vec<Vec<u8>> {
   let mut by_name: Vec<(OsString, OsString)> = match spawn.environment {
     Environment::Inherited => std::env::vars_os().collect(),
     Environment::Clear => Vec::new(),
@@ -108,8 +114,17 @@ fn environment_of(spawn: &Spawn<'_>) -> io::Result<Vec<CString>> {
       let mut entry = name.as_bytes().to_vec();
       entry.push(b'=');
       entry.extend_from_slice(value.as_bytes());
-      c_string(&entry)
+      entry
     })
+    .collect()
+}
+
+/// The child's environment as `NAME=VALUE` strings (module docs): this process's or none, then the overrides, a name
+/// set once.
+fn environment_of(spawn: &Spawn<'_>) -> io::Result<Vec<CString>> {
+  environment_entries(spawn)
+    .iter()
+    .map(|entry| c_string(entry))
     .collect()
 }
 
@@ -235,6 +250,13 @@ fn prepare(spawn: &Spawn<'_>, directory: &CString, null: &CString) -> io::Result
       },
     };
     checked(answer)?;
+  }
+  for (number, fd) in (FIRST_HANDED..).zip(spawn.handed) {
+    // SAFETY: the actions are initialised; `fd` is the caller's open descriptor, borrowed for this call and the spawn
+    // after it, duplicated to `number` in the child with close-on-exec cleared (`dup2`'s copy).
+    checked(unsafe {
+      libc::posix_spawn_file_actions_adddup2(actions.raw(), fd.as_raw_fd(), number)
+    })?;
   }
   // SAFETY: the actions are initialised; `directory` is a NUL-terminated path the action copies.
   checked(unsafe { posix_spawn_file_actions_addchdir_np(actions.raw(), directory.as_ptr()) })?;
@@ -468,6 +490,7 @@ mod tests {
       stdin: ChildStream::Null,
       stdout: ChildStream::Fd(out_write.as_fd()),
       stderr: ChildStream::Null,
+      handed: &[],
     })
     .unwrap();
     drop(out_write);
@@ -498,6 +521,7 @@ mod tests {
       stdin: ChildStream::Null,
       stdout: ChildStream::Null,
       stderr: ChildStream::Null,
+      handed: &[],
     })
     .unwrap()
   }

@@ -873,6 +873,37 @@ fn wide_revisions(files: usize, size: usize, (revisions, apart): (usize, bool)) 
   dump.into_bytes()
 }
 
+/// A format-2 dump continuing a repository at revision 1 with revision 2, which removes the `files` files `f0`..
+/// [`wide_revisions`]' first revision added, a row each.
+fn wide_removal(files: usize) -> Vec<u8> {
+  let section = "K 10\nsvn:author\nV 5\nalice\nK 8\nsvn:date\nV 27\n2026-11-24T00:00:00.000002Z\nK 7\nsvn:log\nV 2\nr2\nPROPS-END\n";
+  let mut dump = format!(
+    "SVN-fs-dump-format-version: 2\n\nUUID: 00000000-0000-4000-8000-000000000894\n\nRevision-number: 2\n\
+     Prop-content-length: {0}\nContent-length: {0}\n\n{section}\n",
+    section.len()
+  );
+  for file in 0..files {
+    dump.push_str(&format!("Node-path: f{file}\nNode-action: delete\n\n"));
+  }
+  dump.into_bytes()
+}
+
+/// A-920 piece 5 (main's order of 2026-11-25: the released fold's cost). Do: import [`wide_revisions`]' one revision
+/// adding [`WIDE_REVISION_FILES`] files, landed; then import [`wide_removal`]'s revision 2 removing every one, whose
+/// batch lets go every text from before it. Expect both imports whole.
+#[test]
+fn t_a920_a_revision_removing_thousands_of_files_imports_whole() {
+  let added = wide_revisions(WIDE_REVISION_FILES, WIDE_TEXT_BYTES, (1, false));
+  let removed = wide_removal(WIDE_REVISION_FILES);
+  let (first, second) = stored(move || async move {
+    let (svn, _green) = subversion("wide-removal").await;
+    let first = imported(svn, added).await.0.map(|loaded| loaded.youngest);
+    let second = imported(svn, removed).await.0.map(|loaded| loaded.youngest);
+    (first, second)
+  });
+  assert_eq!((first, second), (Ok(1), Ok(2)));
+}
+
 /// Shape: the green's retention cap the lone-revision test runs under: below what one revision adding [`WIDE_FILES`]
 /// paths reserves of the change index alone.
 const TINY_GREEN_CAP: usize = 16 << 10;
@@ -1014,43 +1045,590 @@ const WIDE_TEXT_BYTES: usize = 1024;
 fn t_c2c_a_revision_of_thousands_of_files_imports_with_every_step_under_the_shards_window() {
   // Made before the shard's history begins: the fixture's own work is no step of the import's.
   let dump = wide_revisions(WIDE_REVISION_FILES, WIDE_TEXT_BYTES, (1, false));
-  let (loaded, longest_ns, window_ns, (tail_slices, staging_steps, apply_steps)) =
-    stored(move || async move {
+  let (loaded, (longest_ns, window_ns), counts) = stored(move || {
+    cpu_timed(async move {
       let (svn, _green) = subversion("wide-revision").await;
       let (loaded, _turns) = imported(svn, dump).await;
-      let tail_slices =
-        on(|state| count(state, crate::repository::svn_commit::staging::TAIL_SLICES));
-      let staging_steps =
-        on(|state| count(state, crate::repository::svn_commit::staging::STAGING_STEPS));
-      let apply_steps = on(|state| count(state, crate::repository::push::BATCH_APPLY_STEPS));
-      let shard = slates_rt::registry::current_shard().expect("on a shard");
-      let longest_ns =
-        slates_rt::registry::with_entry(shard, |entry| entry.pulse.longest_step_ns())
-          .expect("the shard's entry");
+      let counts = wide_counts();
+      let (longest_ns, longest_task) = longest_poll();
+      print_phases("wide-add");
+      eprintln!(
+        "wide-add: the longest step {} us ({longest_task})",
+        longest_ns / 1000
+      );
       (
         loaded.map(|loaded| loaded.youngest),
+        (longest_ns, crate::watchdog::own_window_ns()),
+        counts,
+      )
+    })
+  });
+  assert_eq!(loaded, Ok(1));
+  wide_counts_sliced(&counts);
+  assert!(
+    longest_ns < window_ns,
+    "a step of {longest_ns} ns against the shard's window of {window_ns} ns"
+  );
+}
+
+/// A format-2 dump whose revision 1 adds the directory `trunk` and `files` files `trunk/f0`.. of about `size` bytes, and
+/// whose later revisions are `later`'s node records, one revision each (revision 2 the first).
+fn wide_trunk(files: usize, size: usize, later: &[String]) -> Vec<u8> {
+  let section = |number: usize| {
+    let date = format!("2026-11-24T00:00:00.{number:06}Z");
+    let log = format!("r{number}");
+    format!(
+      "K 10\nsvn:author\nV 5\nalice\nK 8\nsvn:date\nV {}\n{date}\nK 7\nsvn:log\nV {}\n{log}\nPROPS-END\n",
+      date.len(),
+      log.len()
+    )
+  };
+  let revision = |number: usize, nodes: &str| {
+    let props = section(number);
+    format!(
+      "Revision-number: {number}\nProp-content-length: {0}\nContent-length: {0}\n\n{props}\n{nodes}",
+      props.len()
+    )
+  };
+  let zero = "K 8\nsvn:date\nV 27\n2026-11-24T00:00:00.000000Z\nPROPS-END\n";
+  let mut dump = format!(
+    "SVN-fs-dump-format-version: 2\n\nUUID: 00000000-0000-4000-8000-000000000894\n\nRevision-number: 0\n\
+     Prop-content-length: {0}\nContent-length: {0}\n\n{zero}\n",
+    zero.len()
+  );
+  let mut first = String::from(
+    "Node-path: trunk\nNode-kind: dir\nNode-action: add\nProp-content-length: 10\nContent-length: 10\n\nPROPS-END\n\n",
+  );
+  for file in 0..files {
+    let line = format!("1:{file:05}\n");
+    let text: String = line.repeat(size / line.len());
+    first.push_str(&format!(
+      "Node-path: trunk/f{file}\nNode-kind: file\nNode-action: add\nProp-content-length: 10\n\
+       Text-content-length: {}\nContent-length: {}\n\nPROPS-END\n{text}\n\n",
+      text.len(),
+      text.len().saturating_add(10)
+    ));
+  }
+  dump.push_str(&revision(1, &first));
+  for (at, nodes) in later.iter().enumerate() {
+    dump.push_str(&revision(at.saturating_add(2), nodes));
+  }
+  dump.into_bytes()
+}
+
+/// A dump record copying directory `from` at revision `rev` to `to`.
+fn copied_dir(to: &str, (from, rev): (&str, u64)) -> String {
+  format!(
+    "Node-path: {to}\nNode-kind: dir\nNode-action: add\nNode-copyfrom-rev: {rev}\nNode-copyfrom-path: {from}\n\n"
+  )
+}
+
+/// `dump` imported on a store-backed shard: its youngest revision, the shard's longest step and its window, and the
+/// copies the green grafted (`Green::copies_grafted`).
+fn imported_whole_and_stepped(
+  name: &'static str,
+  dump: Vec<u8>,
+) -> (Result<u64, String>, u64, u64, (u64, u64, u64, u64)) {
+  let read = stored(move || {
+    cpu_timed(async move {
+      let (svn, green) = subversion(name).await;
+      let (loaded, _turns) = imported(svn, dump).await;
+      checkpoints_ended().await;
+      let build_units = on(|state| count(state, crate::merge_service::CHECKPOINT_BUILD_UNITS));
+      let walk_most = on(|state| {
+        count(
+          state,
+          crate::repository::svn_commit::staging::RECORDING_WALK_MOST_FILES,
+        )
+      });
+      let gone_most =
+        on(|state| count(state, crate::repository::svn_commit::BUILD_MOST_GONE_A_UNIT));
+      let grafted = on(|state| {
+        state
+          .greens
+          .get(&green)
+          .map_or(0, |engine| engine.copies_grafted())
+      });
+      let (longest_ns, longest_task) = longest_poll();
+      print_phases(name);
+      (
+        loaded
+          .map(|loaded| loaded.youngest)
+          .map_err(|failed| format!("{failed:?}")),
         longest_ns,
         crate::watchdog::own_window_ns(),
-        (tail_slices, staging_steps, apply_steps),
+        (grafted, build_units, walk_most, gone_most),
+        longest_task,
       )
-    });
-  assert_eq!(loaded, Ok(1));
+    })
+  });
+  // Every run shows its numbers, so a probe judges each against the 1 ms bar, and names what held the longest.
+  eprintln!(
+    "{name}: youngest {:?}, the longest step {} us of a window of {} us ({}), {} copies grafted, {} checkpoint build \
+     units, {} files at most a recording walk unit, {} gone paths at most a build unit",
+    read.0,
+    read.1 / 1000,
+    read.2 / 1000,
+    read.4,
+    read.3.0,
+    read.3.1,
+    read.3.2,
+    read.3.3
+  );
+  (read.0, read.1, read.2, read.3)
+}
+
+/// Yields until no checkpoint of the calling shard is taken in turns, at most [`TURN_LIMIT`] times: what a test that
+/// reads what a landing's checkpoint did waits for (`merge_service::checkpoint_in_turns`).
+async fn checkpoints_ended() {
+  for _ in 0..TURN_LIMIT {
+    if on(|state| state.merge.checkpointing.is_empty()) {
+      return;
+    }
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// The slicing counts a wide landing moves (A-920), read on the calling shard after its import ([`wide_counts`]).
+#[derive(Debug)]
+struct WideCounts {
+  /// The landing's tail slices (`staging::TAIL_SLICES`).
+  tail_slices: u64,
+  /// The staging's steps (`staging::STAGING_STEPS`).
+  staging_steps: u64,
+  /// The version's apply calls (`push::BATCH_APPLY_STEPS`).
+  apply_steps: u64,
+  /// The landing's unpin slices (`staging::LANDING_UNPIN_SLICES`, 6a).
+  unpins: u64,
+  /// Its scratch member's release steps (`staging::LANDING_RELEASE_STEPS`, 6a).
+  releases: u64,
+  /// Its versions' preparation steps (`staging::LANDING_PREPARE_STEPS`, 6b).
+  prepares: u64,
+  /// Checkpoints begun in a landing's step (`merge_service::CHECKPOINT_BEGUN_INLINE`).
+  inline: u64,
+  /// Checkpoints taken in turns (`merge_service::CHECKPOINT_IN_TURNS`).
+  in_turns: u64,
+  /// The import's calls stopped with their slice spent (`svn_import::IMPORT_PAUSES`, 7a).
+  pauses: u64,
+  /// The import's calls stopped in a revision's close (`svn_import::IMPORT_CLOSE_STEPS`, 7b).
+  close_steps: u64,
+  /// The yields between the landing's sections (`svn_commit::LANDING_SECTION_YIELDS`, 7c).
+  section_yields: u64,
+  /// The steps that applied the greens' pending holds (`name_holds::NAME_HOLD_APPLY_STEPS`, 7c).
+  hold_steps: u64,
+  /// The steps of the green's fold to its readers' floor (`svn_commit::FOLD_STEPS`, 11a).
+  fold_steps: u64,
+  /// The steps of the walk of the texts the changeset carries (`svn_commit::CARRIED_STEPS`, 11c).
+  carried_steps: u64,
+  /// The steps of the import's texts handed over to the landing (`svn_commit::HAND_OVER_STEPS`, 13a).
+  hand_over_steps: u64,
+  /// The landings whose held increments were published ahead of the register's op (`staging::LANDING_PUBLISHED_AHEAD`,
+  /// 13b).
+  published_ahead: u64,
+}
+
+/// The calling shard's [`WideCounts`] now.
+fn wide_counts() -> WideCounts {
+  use crate::repository::svn_commit::staging;
+  WideCounts {
+    tail_slices: on(|state| count(state, staging::TAIL_SLICES)),
+    staging_steps: on(|state| count(state, staging::STAGING_STEPS)),
+    apply_steps: on(|state| count(state, crate::repository::push::BATCH_APPLY_STEPS)),
+    unpins: on(|state| count(state, staging::LANDING_UNPIN_SLICES)),
+    releases: on(|state| count(state, staging::LANDING_RELEASE_STEPS)),
+    prepares: on(|state| count(state, staging::LANDING_PREPARE_STEPS)),
+    inline: on(|state| count(state, crate::merge_service::CHECKPOINT_BEGUN_INLINE)),
+    in_turns: on(|state| count(state, crate::merge_service::CHECKPOINT_IN_TURNS)),
+    pauses: on(|state| count(state, super::IMPORT_PAUSES)),
+    close_steps: on(|state| count(state, super::IMPORT_CLOSE_STEPS)),
+    section_yields: on(|state| count(state, crate::repository::svn_commit::LANDING_SECTION_YIELDS)),
+    hold_steps: on(|state| count(state, crate::vcs_store::name_holds::NAME_HOLD_APPLY_STEPS)),
+    fold_steps: on(|state| count(state, crate::repository::svn_commit::FOLD_STEPS)),
+    carried_steps: on(|state| count(state, crate::repository::svn_commit::CARRIED_STEPS)),
+    hand_over_steps: on(|state| count(state, crate::repository::svn_commit::HAND_OVER_STEPS)),
+    published_ahead: on(|state| count(state, staging::LANDING_PUBLISHED_AHEAD)),
+  }
+}
+
+/// Holds a wide landing's [`WideCounts`] to its slicing: each part ran in steps, never whole in one.
+fn wide_counts_sliced(counts: &WideCounts) {
+  wide_landing_sliced(counts);
+  wide_landing_stepped(counts);
+  wide_import_sliced(counts);
+}
+
+/// The landing's own parts in steps (A-920 6a, 6b and its checkpoint piece).
+fn wide_landing_sliced(counts: &WideCounts) {
+  let WideCounts {
+    unpins,
+    releases,
+    prepares,
+    inline,
+    in_turns,
+    ..
+  } = counts;
+  // Non-vacuity: the landing's unpin of its 9,000 texts and its scratch member's release each ran in slices (A-920 6a:
+  // 14.3 and 16.9 ms whole in one step, debug).
+  assert!(*unpins > 2, "the landing's unpin took {unpins} slice(s)");
+  assert!(
+    *releases > 2,
+    "its scratch member's release took {releases} step(s)"
+  );
+  // Non-vacuity: its version made ready for the register's op in steps (A-920 6b: its increment's encoding, its hold and
+  // its chain entry's encoding, 3.4, 23.6 and 12.5 ms whole in the entry's one step, debug).
+  assert!(
+    *prepares > 2,
+    "its version's making ready took {prepares} step(s)"
+  );
+  // The landing's checkpoints are taken in their task's turns, never begun in a landing's step (A-920's checkpoint
+  // piece: the first fold and hold steps inline were 16 ms of one poll, debug).
+  assert_eq!(*inline, 0, "checkpoints begun in a landing's step");
+  assert!(*in_turns > 0, "no checkpoint taken in turns");
+}
+
+/// The landing's later parts in steps of their own (A-920 7c, 11a, 11c, 13a and 13b).
+fn wide_landing_stepped(counts: &WideCounts) {
+  let WideCounts {
+    section_yields,
+    hold_steps,
+    fold_steps,
+    carried_steps,
+    hand_over_steps,
+    published_ahead,
+    ..
+  } = counts;
+  // Each of the landing's sections begins a step of its own (A-920 7c: the storing's begin and the carried texts ran in
+  // one poll of 31 ms, debug), and the greens' 9,000 holds were applied a slice at a time, never at one free decision.
+  assert!(
+    *section_yields > 2,
+    "the landing yielded {section_yields} time(s) between sections"
+  );
+  assert!(
+    *hold_steps > 2,
+    "the greens' holds were applied in {hold_steps} step(s)"
+  );
+  // The green's fold to its readers' floor a slice a step over the revision's 9,001 paths (A-920 11a: whole in the
+  // tail's one step, 7.5-23.4 ms, debug).
+  assert!(*fold_steps > 2, "the fold took {fold_steps} step(s)");
+  // The texts the changeset carries walked a text put and a row a unit over 9,000 of each (A-920 11c: whole in one
+  // step, 12.3 ms, debug).
+  assert!(
+    *carried_steps > 2,
+    "the carried texts' walk took {carried_steps} step(s)"
+  );
+  // The import's 9,000 texts handed over to the landing a text a unit (A-920 13a: whole in the storing's begin, 10.5
+  // ms of one step, debug).
+  assert!(
+    *hand_over_steps > 2,
+    "the texts' hand-over took {hand_over_steps} step(s)"
+  );
+  // The landing's held increment published ahead of the register's op, the op only recording (A-920 13b: inside it,
+  // 5.8 ms of its 10.5, debug).
+  assert!(*published_ahead > 0, "no landing published ahead of its op");
+}
+
+/// The import's parse, staging, apply and tail in steps (A-920 7a, goal 93 piece 3).
+fn wide_import_sliced(counts: &WideCounts) {
+  let WideCounts {
+    tail_slices,
+    staging_steps,
+    apply_steps,
+    pauses,
+    close_steps,
+    ..
+  } = counts;
+  // The dump parsed an event at a time, its calls stopped as their turn's slice is spent (A-920 7a: a copy slice of 68 KB
+  // a call was 3.9-5.3 ms, debug).
+  assert!(*pauses > 2, "the import's calls paused {pauses} time(s)");
+  // Its revision closed a unit at a time over calls (A-920 7b: `close_revision` whole in one call, 20.4 ms debug).
+  assert!(
+    *close_steps > 2,
+    "the revision's close stopped {close_steps} time(s)"
+  );
   // Non-vacuity: the landing's tail ran in slices, so no loop over its texts ran whole in one step.
-  assert!(tail_slices > 2, "the tail took {tail_slices} slice(s)");
+  assert!(*tail_slices > 2, "the tail took {tail_slices} slice(s)");
   // Non-vacuity: the revision's version was applied a few units a call (goal 93 piece 3), never in one.
   assert!(
-    apply_steps > 2,
+    *apply_steps > 2,
     "its version's apply took {apply_steps} call(s)"
   );
   // Non-vacuity: the revision's staging was split, its check, build, reads and judge each a step of its own.
   assert!(
-    staging_steps >= 4,
+    *staging_steps >= 4,
     "the staging took {staging_steps} step(s)"
+  );
+}
+
+std::thread_local! {
+  /// The longest poll on this thread of a history [`cpu_timed`] times: its wall and its thread-CPU nanoseconds.
+  static TIMED_LONGEST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+  /// That poll's spans in the import's phases, in order (`svn_import::phase`).
+  static TIMED_SPANS: std::cell::RefCell<Vec<super::phase::Span>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A history whose every poll is timed by the wall clock and by its thread's CPU clock
+/// ([`slates_rt::registry::calling_thread_cpu`]), the longest kept in [`TIMED_LONGEST`].
+pub(crate) struct CpuTimed<F> {
+  /// The history.
+  future: std::pin::Pin<Box<F>>,
+  /// The phase its last poll ended in, which its next resumes.
+  phase: &'static str,
+}
+
+impl<F: std::future::Future> std::future::Future for CpuTimed<F> {
+  type Output = F::Output;
+
+  fn poll(
+    mut self: std::pin::Pin<&mut Self>,
+    context: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<F::Output> {
+    let cpu_ns = || slates_rt::registry::calling_thread_cpu().map_or(0, |reading| reading.spent_ns);
+    super::phase::poll_begun(self.phase);
+    let (wall_began, cpu_began) = (slates_rt::futures::now_ns(), cpu_ns());
+    let polled = self.future.as_mut().poll(context);
+    let wall = slates_rt::futures::now_ns().saturating_sub(wall_began);
+    let spent = cpu_ns().saturating_sub(cpu_began);
+    let (spans, ended) = super::phase::poll_ended();
+    self.phase = ended;
+    TIMED_LONGEST.with(|longest| {
+      if wall > longest.get().0 {
+        longest.set((wall, spent));
+        TIMED_SPANS.with(|kept| *kept.borrow_mut() = spans);
+      }
+    });
+    polled
+  }
+}
+
+/// `history` with each of its polls timed by the wall and by its thread's CPU ([`CpuTimed`]; main's order after probe
+/// 9: the pulse's longest step is a poll's wall clock, which a preempted or waiting thread stretches as much as held
+/// work, so the CPU beside it tells the two apart). Made on the shard that polls it, whose longest so far it clears.
+pub(crate) fn cpu_timed<F: std::future::Future>(history: F) -> CpuTimed<F> {
+  TIMED_LONGEST.with(|longest| longest.set((0, 0)));
+  TIMED_SPANS.with(|kept| kept.borrow_mut().clear());
+  let _ = super::phase::release_units_taken();
+  CpuTimed {
+    future: Box::pin(history),
+    phase: "untagged",
+  }
+}
+
+/// The calling shard's longest poll and the task it polled (`registry::Pulse::longest_polling`, A-920 6b), with the
+/// longest a green's checkpoint took in turns, from its first turn to its record (A-579's completion time, which the
+/// fold's bounded share past its deadline lengthens; `merge_service::CHECKPOINT_IN_TURNS_LONGEST_NS`), and the longest
+/// poll of its history by the wall and by its thread's CPU ([`cpu_timed`]).
+pub(crate) fn longest_poll() -> (u64, String) {
+  let shard = slates_rt::registry::current_shard().expect("on a shard");
+  let checkpoint_ns =
+    on(|state| count(state, crate::merge_service::CHECKPOINT_IN_TURNS_LONGEST_NS));
+  let (history_wall_ns, history_cpu_ns) = TIMED_LONGEST.with(std::cell::Cell::get);
+  slates_rt::registry::with_entry(shard, |entry| {
+    (
+      entry.pulse.longest_step_ns(),
+      format!(
+        "{}; the history's longest poll {} us by the wall, {} us of its thread's CPU; a checkpoint's turns took {} us \
+         at most",
+        entry.pulse.longest_polling(),
+        history_wall_ns / 1000,
+        history_cpu_ns / 1000,
+        checkpoint_ns / 1000
+      ),
+    )
+  })
+  .expect("the shard's entry")
+}
+
+/// Prints the phases of `name`'s history's longest poll on this thread ([`cpu_timed`]): its spans in the import's
+/// phases, in order, each by the wall and by the thread's CPU ([`phases_line`]).
+pub(crate) fn print_phases(name: &str) {
+  let longest = TIMED_LONGEST.with(std::cell::Cell::get);
+  let spans = TIMED_SPANS.with(|kept| kept.borrow().clone());
+  eprintln!("{}", phases_line(name, longest, &spans));
+  let unit = super::phase::release_units_taken();
+  eprintln!(
+    "RELEASE {name} unit_wall_ns={} unit_cpu_ns={} unit_user_ns={} unit_sys_ns={} units={}",
+    unit.wall, unit.cpu, unit.user_system.0, unit.user_system.1, unit.units
+  );
+}
+
+/// The line naming the phases of `name`'s history's longest poll (`wall_ns` and `cpu_ns` long), for a probe's parser:
+/// `PHASES <name> wall_ns=<n> cpu_ns=<n> spans=<tag>:<wall_ns>:<cpu_ns>,...`, the spans in the order the poll ran
+/// them, a phase met twice in a row one span.
+fn phases_line(name: &str, (wall_ns, cpu_ns): (u64, u64), spans: &[super::phase::Span]) -> String {
+  let spans: Vec<String> = spans
+    .iter()
+    .map(|(tag, wall, cpu)| format!("{tag}:{wall}:{cpu}"))
+    .collect();
+  format!(
+    "PHASES {name} wall_ns={wall_ns} cpu_ns={cpu_ns} spans={}",
+    spans.join(",")
+  )
+}
+
+/// Goal 93 (main's order of 2026-11-26 after probe 8: no fixture copied or moved a wide tree, so the commit's copies
+/// and node moves never ran wide). Do: import [`wide_trunk`]'s revision 1 adding `trunk` and [`WIDE_REVISION_FILES`]
+/// files of [`WIDE_TEXT_BYTES`] under it, and a revision 2 copying `trunk` at revision 1 to `branch`. Expect the import
+/// whole, a copy grafted (`Green::copies_grafted`), and the shard's longest step under its watchdog window.
+#[test]
+fn t_a920_a_revision_copying_a_tree_of_thousands_of_files_imports_with_every_step_under_the_shards_window()
+ {
+  let dump = wide_trunk(
+    WIDE_REVISION_FILES,
+    WIDE_TEXT_BYTES,
+    &[copied_dir("branch", ("trunk", 1))],
+  );
+  let (loaded, longest_ns, window_ns, (grafted, _, walk_most, _)) =
+    imported_whole_and_stepped("wide-copy", dump);
+  assert_eq!(loaded, Ok(2));
+  assert!(grafted > 0, "no copy grafted");
+  // The copy's tree walked a file a unit in its revision's recording (A-920 9a: its 9,000 files in one unit, 23.5-30.6
+  // ms, debug).
+  assert!(
+    walk_most <= 1,
+    "a unit of the recording's walk found {walk_most} files"
   );
   assert!(
     longest_ns < window_ns,
     "a step of {longest_ns} ns against the shard's window of {window_ns} ns"
   );
+}
+
+/// Goal 93 (as the copy's test). Do: import [`wide_trunk`]'s revision 1, a revision 2 copying `trunk` to `branch`, and
+/// a revision 3 moving `trunk` to `moved` (a copy of `trunk` at revision 2, then its delete). Expect the import whole,
+/// both copies grafted, the landings' checkpoints built a unit at a time (A-920 8a), and the shard's longest step under
+/// its watchdog window.
+#[test]
+fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step_under_the_shards_window()
+ {
+  let moved = format!(
+    "{}Node-path: trunk\nNode-action: delete\n\n",
+    copied_dir("moved", ("trunk", 2))
+  );
+  let dump = wide_trunk(
+    WIDE_REVISION_FILES,
+    WIDE_TEXT_BYTES,
+    &[copied_dir("branch", ("trunk", 1)), moved],
+  );
+  let (loaded, longest_ns, window_ns, (grafted, build_units, walk_most, gone_most)) =
+    imported_whole_and_stepped("wide-move", dump);
+  // The move's delete of the trunk noted gone, and its paths made ops, a path a unit in its build (A-920 9b: the row
+  // 13.7 ms and the build's end 6.6 ms for 9,001 paths in one unit each, debug).
+  assert!(
+    gone_most <= 1,
+    "a unit of the move's build noted {gone_most} gone paths"
+  );
+  // The copies' and the move's trees walked a file a unit in their revisions' recordings (A-920 9a: a copied or
+  // deleted tree's 9,000 files in one unit, 21-31 ms, debug).
+  assert!(
+    walk_most <= 1,
+    "a unit of the recordings' walks found {walk_most} files"
+  );
+  assert_eq!(loaded, Ok(3));
+  assert!(grafted >= 2, "{grafted} copies grafted");
+  // A checkpoint of the green holding the branch's and the move's trees built a unit at a time, a copied key a unit
+  // (A-920 8a: built whole at its begin, 52.5 ms of one checkpoint turn, debug).
+  assert!(
+    build_units > 2,
+    "the checkpoints were built in {build_units} unit(s)"
+  );
+  assert!(
+    longest_ns < window_ns,
+    "a step of {longest_ns} ns against the shard's window of {window_ns} ns"
+  );
+}
+
+/// Shape: the files of the trunk [`a_moves_recording_walked_a_node_a_step_finds_the_texts_the_whole_walk_finds`]
+/// moves: enough for the walk to stop inside a tree many times, few enough for a quick import.
+const WALKED_TRUNK_FILES: usize = 40;
+
+/// The texts of a walk's `found` files by path, each path once (its last).
+fn texts_by_path(
+  found: Vec<crate::vcs_store::svn_texts::FileText>,
+) -> std::collections::BTreeMap<String, slates_svn::index::ContentIdentity> {
+  found
+    .into_iter()
+    .map(|(identity, path)| (path, identity))
+    .collect()
+}
+
+/// A-920 9a. Do: import [`wide_trunk`]'s trunk of [`WALKED_TRUNK_FILES`] files, a revision 2 copying it and a revision 3
+/// moving it (a copy, then the trunk's delete); walk revision 3's rows a node a step, as a recording whose every step is
+/// spent walks them (`staging::walked_a_unit_a_step`), and whole (`svn_texts::released_before` at revision 2,
+/// `held_after` at 3). Expect: the same texts let go and held, by path: the trunk's every file let go, the moved
+/// tree's every file held.
+#[test]
+fn a_moves_recording_walked_a_node_a_step_finds_the_texts_the_whole_walk_finds() {
+  let moved = format!(
+    "{}Node-path: trunk\nNode-action: delete\n\n",
+    copied_dir("moved", ("trunk", 2))
+  );
+  let dump = wide_trunk(
+    WALKED_TRUNK_FILES,
+    WIDE_TEXT_BYTES,
+    &[copied_dir("branch", ("trunk", 1)), moved],
+  );
+  let (stepped, whole) = stored(move || async move {
+    let (svn, _green) = subversion("walked-move").await;
+    let (loaded, _turns) = imported(svn, dump).await;
+    assert_eq!(loaded.map(|loaded| loaded.youngest), Ok(3));
+    on(|state| {
+      use crate::vcs_store::svn_texts::{held_after, released_before};
+      let records = state
+        .vcs_stores
+        .subversion_records(svn)
+        .expect("the records");
+      let changes = records.index().changes(3).expect("revision 3").to_vec();
+      let stepped =
+        crate::repository::svn_commit::staging::walked_a_unit_a_step(records, &changes, (2, 3));
+      let whole = (
+        texts_by_path(released_before(records, &changes, 2)),
+        texts_by_path(held_after(records, &changes, 3)),
+      );
+      (stepped, whole)
+    })
+  });
+  assert_eq!(stepped, whole, "the texts let go and held");
+  assert_eq!(
+    (whole.0.len(), whole.1.len()),
+    (WALKED_TRUNK_FILES, WALKED_TRUNK_FILES),
+    "the trunk's files let go and the moved tree's held"
+  );
+}
+
+/// The green's head and identity after importing `dump` into a fresh repository named `name`, every build step spent
+/// as `spent` says (`staging::BUILD_SPENT`).
+fn green_after_import(name: &'static str, dump: Vec<u8>, spent: bool) -> (u64, [u8; 32]) {
+  stored(move || async move {
+    crate::repository::svn_commit::staging::BUILD_SPENT.with(|cell| cell.set(Some(spent)));
+    let (svn, green) = subversion(name).await;
+    let (loaded, _turns) = imported(svn, dump).await;
+    crate::repository::svn_commit::staging::BUILD_SPENT.with(|cell| cell.set(None));
+    assert_eq!(loaded.map(|loaded| loaded.youngest), Ok(3));
+    on(|state| {
+      let mut engine = state.greens.get_mut(&green).expect("the green");
+      (engine.head(), engine.head_identity())
+    })
+  })
+}
+
+/// A-920 9b. Do: import [`wide_trunk`]'s trunk of [`WALKED_TRUNK_FILES`] files, a revision 2 copying it and a revision 3
+/// moving it (a copy, then the trunk's delete), once with every build step spent after each unit (the delete's tree
+/// noted gone and removed a path a unit) and once with every build whole in one step. Expect: the same green, its head
+/// and identity.
+#[test]
+fn a_moves_build_a_unit_a_step_makes_the_green_its_build_whole_makes() {
+  let moved = format!(
+    "{}Node-path: trunk\nNode-action: delete\n\n",
+    copied_dir("moved", ("trunk", 2))
+  );
+  let dump = wide_trunk(
+    WALKED_TRUNK_FILES,
+    WIDE_TEXT_BYTES,
+    &[copied_dir("branch", ("trunk", 1)), moved],
+  );
+  let stepped = green_after_import("built-stepped", dump.clone(), true);
+  let whole = green_after_import("built-whole", dump, false);
+  assert_eq!(stepped, whole, "the green built a unit a step");
 }
 
 /// Shape: the texts-bound red's rewritten file's bytes, and how many rewrites: each rewrite under the batch's texts
@@ -1245,40 +1823,14 @@ const GIVE_BACK_UNITS: u64 = 2;
 /// counted `repository.svn_import.purged_past_bound_bytes`. Red before: every released batch's texts still resident.
 #[test]
 fn an_imports_arena_keeps_no_more_resident_free_than_its_bound() {
-  use crate::repository::svn_commit::staging::{FLUSH_NS, PURGED_PAST_BOUND};
   let (youngest, resident_free, keep, purged) = stored(|| async move {
-    let (svn, _) = subversion("given-back").await;
-    let (unit, memcpy) = on(|state| {
-      (
-        crate::vcs_store::hg_import::segment_bytes(state) as u64,
-        state.config.memcpy_bytes_per_second.max(1),
-      )
-    });
-    let flush_ns =
-      u64::try_from(u128::from(GIVE_BACK_UNITS * unit) * 1_000_000_000 / u128::from(memcpy))
-        .unwrap();
-    FLUSH_NS.with(|forced| forced.set(Some(flush_ns.max(1))));
-    let (loaded, _) = imported_sampling(
-      svn,
-      rewrites(BOUNDED_REWRITES, BOUNDED_REWRITE_BYTES),
-      &mut || {
-        on(|state| {
-          let _ = crate::verbs::publish_shard(state);
-        });
+    imported_giving_back(
+      |state| {
+        let _ = crate::verbs::publish_shard(state);
       },
+      |state| state.store.content.arena().resident_free_bytes() as u64,
     )
-    .await;
-    FLUSH_NS.with(|forced| forced.set(None));
-    on(|state| {
-      let slice =
-        crate::daemon::purge_slice_blocks(state) as u64 * state.config.discard_from_bytes as u64;
-      (
-        loaded.map(|loaded| loaded.youngest),
-        state.store.content.arena().resident_free_bytes() as u64,
-        GIVE_BACK_UNITS * unit + slice,
-        count(state, PURGED_PAST_BOUND),
-      )
-    })
+    .await
   });
   let expected = u64::try_from(BOUNDED_REWRITES).unwrap_or(u64::MAX);
   assert_eq!(youngest, Ok(expected), "the import whole");
@@ -1289,6 +1841,134 @@ fn an_imports_arena_keeps_no_more_resident_free_than_its_bound() {
     resident_free <= keep,
     "{resident_free} B resident and free in the arena, past the bound and a slice, {keep} B"
   );
+}
+
+/// Goal 93 P7 (main's ruling of 2026-11-25, round 1's settled reading: the arena's resident free 103.7 MB over the
+/// bound's 91.9 once a publication had released the import's deferred texts). Do: import as
+/// [`an_imports_arena_keeps_no_more_resident_free_than_its_bound`] does, and at each turn's publication, which releases
+/// the let-go texts a published image named (A-64), read the arena's resident free bytes in the same step, as the
+/// storage test's settled reading does once the import's deferred bytes are zero. Expect publications that released
+/// deferred bytes, and after each the resident free bytes within the bound and one give-back slice: the purge has its
+/// turn past the keep when a publication releases frees. Red before: the released texts resident and free past the keep
+/// until a later batch's tail or an idle pass.
+#[test]
+fn an_imports_arena_holds_its_keep_once_a_publication_releases_its_deferred_texts() {
+  let (youngest, (releases, most), keep, _) = stored(|| async move {
+    let mut releases = 0u64;
+    let mut most = 0u64;
+    let (youngest, (), keep, purged) = imported_giving_back(
+      |state| {
+        let deferred = state.store.content.arena().deferred_bytes();
+        let _ = crate::verbs::publish_shard(state);
+        if state.store.content.arena().deferred_bytes() < deferred {
+          releases += 1;
+          most = most.max(state.store.content.arena().resident_free_bytes() as u64);
+        }
+      },
+      |_| (),
+    )
+    .await;
+    (youngest, (releases, most), keep, purged)
+  });
+  let expected = u64::try_from(BOUNDED_REWRITES).unwrap_or(u64::MAX);
+  assert_eq!(youngest, Ok(expected), "the import whole");
+  println!(
+    "svn_import: {releases} publications released deferred texts; the arena resident free after one at most {most} B (keep {keep} B)"
+  );
+  assert!(
+    releases > 0,
+    "publications released the import's deferred texts"
+  );
+  assert!(
+    most <= keep,
+    "{most} B resident and free in the arena after a publication released deferred texts, past the keep {keep} B"
+  );
+}
+
+/// Goal 93 P7 (main's ruling of 2026-11-25: [`an_imports_arena_keeps_no_more_resident_free_than_its_bound`] failed once
+/// in a full parallel run, 4,587,520 B against a keep of 4,210,688, and passed alone). Its daemon is its own, so no
+/// other test moves its arena; what a loaded run changes is when the daemon's own idle sweep publishes, and a sweep pass
+/// that finds frees deferred publishes, releasing them (A-64). Do: import as that test does, publishing at each turn
+/// until a turn finds frees deferred and never after, so the batches' let-go texts stay deferred past the last tail;
+/// then run a sweep pass (`daemon::seal_idle_content`) and read the arena's resident free bytes. Expect the pass
+/// released deferred bytes, and the resident free bytes within the bound and one give-back slice. Red before
+/// `give_back_released` (6e002e057's tree with its call taken out): the sweep released 1,048,576 B and left 4,939,776
+/// resident and free against a keep of 4,202,496, the flake's size; now 786,432.
+#[test]
+fn an_imports_arena_holds_its_keep_when_the_sweep_publishes_after_its_last_tail() {
+  let (youngest, (released, resident_free), keep) = stored(|| async move {
+    let mut deferring = false;
+    let (youngest, (), keep, _) = imported_giving_back(
+      |state| {
+        deferring |= state.store.content.arena().deferred_bytes() > 0;
+        if !deferring {
+          let _ = crate::verbs::publish_shard(state);
+        }
+      },
+      |_| (),
+    )
+    .await;
+    let deferred = on(|state| state.store.content.arena().deferred_bytes() as u64);
+    let _ = crate::daemon::seal_idle_content().await;
+    let after = on(|state| {
+      (
+        deferred.saturating_sub(state.store.content.arena().deferred_bytes() as u64),
+        state.store.content.arena().resident_free_bytes() as u64,
+      )
+    });
+    (youngest, after, keep)
+  });
+  let expected = u64::try_from(BOUNDED_REWRITES).unwrap_or(u64::MAX);
+  assert_eq!(youngest, Ok(expected), "the import whole");
+  println!(
+    "svn_import: the sweep's publication released {released} B; the arena resident free {resident_free} B (keep {keep} B)"
+  );
+  assert!(
+    released > 0,
+    "the sweep's publication released the import's deferred texts"
+  );
+  assert!(
+    resident_free <= keep,
+    "{resident_free} B resident and free once the sweep released {released} B, past the keep {keep} B"
+  );
+}
+
+/// The give-back tests' import: [`rewrites`]'s rewrites at a bound of [`GIVE_BACK_UNITS`] units (the flush forced),
+/// `publish` run on the shard after each turn (the shard's publication, as its period would), then `then` run on the
+/// shard as the import ends. Its youngest revision, what `then`
+/// read, the keep (the bound and one give-back slice), and the bytes the batches gave back past the bound.
+async fn imported_giving_back<R>(
+  mut publish: impl FnMut(&mut crate::state::ShardState),
+  then: impl FnOnce(&mut crate::state::ShardState) -> R,
+) -> (Result<u64, LoadFailed>, R, u64, u64) {
+  use crate::repository::svn_commit::staging::{FLUSH_NS, PURGED_PAST_BOUND};
+  let (svn, _) = subversion("given-back").await;
+  let (unit, memcpy) = on(|state| {
+    (
+      crate::vcs_store::hg_import::segment_bytes(state) as u64,
+      state.config.memcpy_bytes_per_second.max(1),
+    )
+  });
+  let flush_ns =
+    u64::try_from(u128::from(GIVE_BACK_UNITS * unit) * 1_000_000_000 / u128::from(memcpy)).unwrap();
+  FLUSH_NS.with(|forced| forced.set(Some(flush_ns.max(1))));
+  let (loaded, _) = imported_sampling(
+    svn,
+    rewrites(BOUNDED_REWRITES, BOUNDED_REWRITE_BYTES),
+    &mut || on(&mut publish),
+  )
+  .await;
+  FLUSH_NS.with(|forced| forced.set(None));
+  on(|state| {
+    let slice =
+      crate::daemon::purge_slice_blocks(state) as u64 * state.config.discard_from_bytes as u64;
+    (
+      loaded.map(|loaded| loaded.youngest),
+      then(state),
+      GIVE_BACK_UNITS * unit + slice,
+      count(state, PURGED_PAST_BOUND),
+    )
+  })
 }
 
 /// Shape: the contended-flush test's look at the import, between its waits.
@@ -1311,14 +1991,15 @@ async fn hog(hold_ns: u64) {
   }
 }
 
-/// Goal 93 P7 (main's ruling of 2026-11-25: the rent-or-buy bound's `F` is the store's own durable flush, not a landing's
-/// await, which holds whatever the shard ran meanwhile, the owner's queue and the writes before the flush, and so
-/// overstates it, enlarging the bound past rent or buy). Do: import `full.dump` alone and take the shard's measured
-/// flush as the hold; on the shard, that flush forgotten, run a hog that holds it a hold between yields, and import
-/// `full.dump` again beside it, so every answer its batch's landing awaits resumes late; once the batch's changeset is durable, read the shard's `F` and that landing's await (as the task
-/// awaited it), then stop the hog. Expect the import whole, and `F` under the await it is part of: the store's own
-/// flush, whatever else the shard ran, judged against the batch's own await rather than a time, so a loaded machine's
-/// slow flush is no failure. Red before: `F` the landing's await itself, equal to it (46,015,129,583 ns beside the hog).
+/// Goal 93 P7 (main's ruling of 2026-11-25: the rent-or-buy bound's `F` is the store's own durable flush, not a
+/// landing's await, which holds whatever the shard ran meanwhile, the owner's queue and the writes before the flush,
+/// and so overstates it, enlarging the bound past rent or buy). Do: import `full.dump` alone and take the shard's
+/// measured flush as the hold; on the shard, that flush forgotten, run a hog that holds it a hold between yields, and
+/// import `full.dump` again beside it, so every answer its batch's landing awaits resumes late; once the batch's
+/// changeset is durable, read the shard's `F` and that landing's await (as the task awaited it), then stop the hog.
+/// Expect the import whole, and `F` under the await it is part of: the store's own flush, whatever else the shard ran,
+/// judged against the batch's own await rather than a time, so a loaded machine's slow flush is no failure. Red before:
+/// `F` the landing's await itself, equal to it (46,015,129,583 ns beside the hog).
 #[test]
 fn an_imports_durable_flush_is_the_stores_own_not_its_await() {
   use crate::repository::svn_commit::staging::{

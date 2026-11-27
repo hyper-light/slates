@@ -2694,3 +2694,174 @@ fn a_checkpoints_sum_taken_mid_fold_is_the_whole_folds() {
   green.fold_identity();
   assert_eq!(mid_fold.bytes(), green.sum_at(head).bytes());
 }
+
+/// Every key of `root`'s tree as a walk of every key the green holds filters them: the reference [`Green::every_key`]
+/// walked before A-920 8a, kept as its oracle.
+fn every_key_by_a_whole_walk(green: &Green, root: &str) -> Vec<super::IdentityKey> {
+  use super::{IdentityKey, union_keys};
+  let inside = |path: &String| in_tree(path, root);
+  let mut keys = Vec::new();
+  let files = union_keys(green.content.keys(), green.content_history.keys().cloned());
+  keys.extend(files.filter(inside).map(IdentityKey::File));
+  let specials = union_keys(green.specials.keys(), green.special_history.keys().cloned());
+  keys.extend(specials.filter(inside).map(IdentityKey::Special));
+  let dirs = union_keys(green.dirs.keys(), green.dir_history.keys().cloned());
+  keys.extend(dirs.filter(inside).map(IdentityKey::Dir));
+  let modes = union_keys(green.modes.keys(), green.mode_history.keys().cloned());
+  keys.extend(modes.filter(inside).map(IdentityKey::Mode));
+  let symlinks = union_keys(green.symlinks.keys(), green.symlink_history.keys().cloned());
+  keys.extend(symlinks.filter(inside).map(IdentityKey::Symlink));
+  let hardlinks = union_keys(
+    green.hardlinks.keys(),
+    green.hardlink_history.keys().cloned(),
+  );
+  keys.extend(hardlinks.filter(inside).map(IdentityKey::Hardlink));
+  let xattrs = union_keys(
+    green.xattrs.iter().map(|(key, _)| key),
+    green.xattr_history.keys().cloned(),
+  );
+  keys.extend(
+    xattrs
+      .filter(|(path, _)| inside(path))
+      .map(|(path, name)| IdentityKey::Xattr(path, name)),
+  );
+  keys
+}
+
+/// A green holding `trunk`, a sibling `trunk-x` whose name begins with the trunk's, a file of the trunk made and unlinked
+/// (held in its history alone), and a copy of the trunk at `b`.
+fn trunk_beside_a_prefixed_sibling() -> Green {
+  let mut green = trunk();
+  let mut sibling = Work::default();
+  sibling
+    .mkdir("trunk-x")
+    .create("trunk-x/a", b"sibling")
+    .mode("trunk-x/a", 0o600)
+    .xattr("trunk-x", PROPS, b"px")
+    .create("trunk/gone", b"soon gone");
+  accept(&mut green, &sibling, 2);
+  accept(&mut green, Work::default().unlink("trunk/gone"), 3);
+  accept(&mut green, Work::exclusive().copy("trunk", "b", 3), 4);
+  green
+}
+
+/// A-920 8a. Do: over [`trunk_beside_a_prefixed_sibling`], list every key of `trunk`, `trunk-x`, `b`, `trunk/d`, a file
+/// and the root (`Green::every_key`, which walks each map from the tree's root alone). Expect: each the keys a walk of
+/// every key the green holds finds in that tree, in the same order: the sibling's never the trunk's, the unlinked
+/// file's history among the trunk's.
+#[test]
+fn every_key_walks_its_tree_alone_and_finds_what_a_whole_walk_finds() {
+  let green = trunk_beside_a_prefixed_sibling();
+  for root in ["trunk", "trunk-x", "b", "trunk/d", "trunk/a", ""] {
+    assert_eq!(
+      green.every_key(root),
+      every_key_by_a_whole_walk(&green, root),
+      "the keys of {root:?}"
+    );
+  }
+  let trunk = green.every_key("trunk");
+  assert!(
+    trunk.iter().all(|key| !key.path().starts_with("trunk-x")),
+    "no sibling key among the trunk's: {trunk:?}"
+  );
+  assert!(
+    trunk.contains(&super::IdentityKey::File("trunk/gone".to_owned())),
+    "the unlinked file's history among the trunk's: {trunk:?}"
+  );
+}
+
+/// A-920 8a. Do: over [`trunk_beside_a_prefixed_sibling`], take the checkpoint at the copy's version whole; then begin
+/// one there, take a unit, accept versions past it (a file made and a copied file unlinked inside the copy, a file made
+/// outside it), and build the rest a unit at a time (`Green::checkpoint_unit`). Expect: the same checkpoint, each copied
+/// key read at the checkpoint's version, not the head's, and a unit for each copied key beside the tree's gathering and
+/// the rest.
+#[test]
+fn a_checkpoint_built_a_unit_at_a_time_across_later_versions_is_the_one_built_whole() {
+  let mut green = trunk_beside_a_prefixed_sibling();
+  let whole = green.checkpoint(4).expect("a checkpoint at the copy");
+  let mut build = green.checkpoint_begin(4).expect("a checkpoint begun");
+  let keys = u32::try_from(green.every_key("b").len()).expect("a count");
+  let mut units = 0u32;
+  let mut step = |green: &Green, build: &mut super::CheckpointBuild| {
+    units += 1;
+    green.checkpoint_unit(build).expect("still available")
+  };
+  assert!(matches!(
+    step(&green, &mut build),
+    super::CheckpointStep::More
+  ));
+  accept(
+    &mut green,
+    Work::default().create("b/new", b"edited").unlink("b/c"),
+    5,
+  );
+  accept(
+    &mut green,
+    Work::default().create("trunk/new", b"edited"),
+    6,
+  );
+  let built = loop {
+    if let super::CheckpointStep::Built(built) = step(&green, &mut build) {
+      break *built;
+    }
+  };
+  assert_eq!(built, whole, "the checkpoint built across versions 5 and 6");
+  assert!(
+    units >= keys + 2,
+    "{units} unit(s) for {keys} copied key(s)"
+  );
+}
+
+/// The copy entry room `inc` asks of `green` as it was taken before A-920 12a, the whole increment resolved for its
+/// copies' fixes: the oracle `Green::copy_entry_room` is held to.
+fn copy_entry_room_by_a_whole_resolve(green: &Green, inc: &Increment) -> usize {
+  let resolved = Green::resolve(inc);
+  green
+    .copy_fixes(&resolved)
+    .values()
+    .filter_map(|fix| fix.as_ref().ok().and_then(Option::as_ref))
+    .map(chain_entry::fix_bytes)
+    .fold(0, usize::saturating_add)
+}
+
+/// A-920 12a. Do: over `trunk`, with `trunk/a` changed at version 2, ask the copy entry room of increments based at the
+/// head: a copy of the trunk at version 1 (before the change, so it carries a fix) with a file made and one changed
+/// beneath it; a copy of the head with an edit beneath; two copies of the trunk at version 1, one inside the other's
+/// tree, each with a fix; and no copy. Expect: each the room the whole increment resolved gives, a copy from before the
+/// change a room of its own, and two such copies more than one.
+#[test]
+fn the_copy_entry_room_from_the_copy_ops_alone_is_the_whole_resolutions() {
+  let mut green = trunk();
+  accept(&mut green, Work::default().overwrite("trunk/a", 0, b"A"), 2);
+  let mut older = Work::exclusive();
+  older
+    .copy("trunk", "b", 1)
+    .create("b/new", b"new")
+    .overwrite("b/c", 0, b"G");
+  let mut head = Work::exclusive();
+  head.copy("trunk", "c", 2).overwrite("c/a", 0, b"Z");
+  let mut nested = Work::exclusive();
+  nested.copy("trunk", "d", 1).copy("trunk", "d/e", 1);
+  let mut none = Work::default();
+  none.create("x", b"x");
+  let base = green.head();
+  let rooms: Vec<(usize, usize)> = [older, head, nested, none]
+    .iter()
+    .zip(10u64..)
+    .map(|(work, id)| {
+      let inc = work.at(id, base);
+      (
+        green.copy_entry_room(&inc),
+        copy_entry_room_by_a_whole_resolve(&green, &inc),
+      )
+    })
+    .collect();
+  for (from_copies, whole) in &rooms {
+    assert_eq!(from_copies, whole, "the copy entry rooms: {rooms:?}");
+  }
+  assert!(
+    rooms[0].0 > 0,
+    "the copy from before the change carries no fix: {rooms:?}"
+  );
+  assert_eq!(rooms[3].0, 0, "an increment with no copy asks no room");
+}

@@ -666,6 +666,9 @@ const COMPRESS_COUNTERS: [&str; 3] = [
   "vcs_store.hg_stream_compress_send_ns",
   "vcs_store.hg_stream_compress_send_plain_bytes",
 ];
+/// Format: the daemon's counter of the chunk bytes a stream's send pass copied as the changeset store keeps them
+/// (`vcs_store::hg_view::STREAM_SEND_KEPT_BYTES` in `slates-server`; goal 93, main's ruling (b)).
+const STREAM_SEND_KEPT_BYTES: &str = "vcs_store.hg_stream_send_kept_bytes";
 
 /// Format: the daemon's counter of the asks a fetch's answer made of the changeset store, each a batch of rows or of
 /// chunks (`crate::vcs_store::hg_view::STORE_ASKS` in `slates-server`): a stream's, and since A-767 C1 step 1a a plain
@@ -695,8 +698,9 @@ const STREAM_OUT_ASKED: &str = "sending stream_out command";
 /// into another; `hg clone --stream` each. Expect both clones to stream as bundle2's `stream2` part (stream clones part
 /// 3; never the legacy `stream_out`), with no warning, each holding the source's
 /// changesets and passing `hg verify` without a warning (the empty file's log streamed split left its `.d` out of the
-/// client's fncache, two warnings on hg-src's prefix; since 2026-11-25 every chunk compressed as 7.2's and small logs
-/// inline, the compression's counters moving for the pushed one); and the pushed one's stream taking at most
+/// client's fncache, two warnings on hg-src's prefix; since 2026-11-25 every chunk as 7.2 stores it and small logs inline,
+/// and since main's ruling (b) each chunk kept so from its landing and copied as it lies: each clone's copied bytes
+/// counted, the compression's counters unmoved); and the pushed one's stream taking at most
 /// [`STREAM_TURNS_AT_MOST`] turns (A-783's pacing: a turn a step, about 460,000 for hg-src, took 15.8 s). Then a plain
 /// `hg clone` of the pushed one (A-767 C1 step 1a): expect it to hold the source's changesets and verify, its file
 /// revisions read from the changeset store ([`STORE_ASKS`] counted). Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or
@@ -788,19 +792,24 @@ fn stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one() {
     (1..=INTAKE_SLICES_AT_MOST).contains(&slices),
     "the push's intake took {slices} slices"
   );
-  let imported = clone_stream("imported");
-  let turns_before = counter(&instance, STREAM_TURNS);
   let compress_before = COMPRESS_COUNTERS.map(|name| counter(&instance, name));
+  let kept_before = counter(&instance, STREAM_SEND_KEPT_BYTES);
+  let imported = clone_stream("imported");
+  let kept_imported = counter(&instance, STREAM_SEND_KEPT_BYTES);
+  let turns_before = counter(&instance, STREAM_TURNS);
   let pushed = clone_stream("pushed");
   let turns = counter(&instance, STREAM_TURNS).saturating_sub(turns_before);
+  let kept_pushed = counter(&instance, STREAM_SEND_KEPT_BYTES);
   let compressed = COMPRESS_COUNTERS.map(|name| counter(&instance, name));
-  // Each chunk was compressed as 7.2 stores it, both passes timed: every counter moved.
+  // Goal 93, main's ruling (b): the store keeps each revision as stock's revlog chunk, from a push's landing and an
+  // import's, so each stream copies its chunks as they lie (counted), compressing none again.
   assert!(
-    compressed
-      .iter()
-      .zip(compress_before)
-      .all(|(after, before)| *after > before),
-    "{COMPRESS_COUNTERS:?}: {compress_before:?} then {compressed:?}"
+    kept_imported > kept_before && kept_pushed > kept_imported,
+    "{STREAM_SEND_KEPT_BYTES}: {kept_before}, then {kept_imported} after the imported clone, {kept_pushed} after the pushed one"
+  );
+  assert_eq!(
+    compressed, compress_before,
+    "{COMPRESS_COUNTERS:?}: the streams compressed nothing again"
   );
   assert_eq!(
     (imported, pushed),
@@ -2302,3 +2311,8 @@ fn stock_hg_clones_a_large_file_whole_over_the_ssh_edge() {
   );
   hg_ok(&hg, &copy, &["verify"]);
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

@@ -179,3 +179,8 @@ fn a_clients_ring_wakes_only_the_shard_that_serves_it() {
     );
   }
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

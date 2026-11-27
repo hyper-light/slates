@@ -46,8 +46,10 @@ pub const HOME_STREAM: u64 = 30;
 /// sender ranked the object's homes by, so a member behind it waits for its own install rather than refusing. 0x85
 /// (A-912, main 01a20182's ruling of 2026-11-24) answers such a put at once, [`HomeOutcome::Behind`] with the member's
 /// installed version, rather than holding it: the hold kept its sender's record session across a wait only that session
-/// could end.
-pub const VERSION: u8 = 0x85;
+/// could end. 0x86 (main 01a20182's order of 2026-11-26 after ruling R piece (i)) settles an attempt's holds in one
+/// message a home ([`HomeMessage::Settle`], answered [`HomeOutcome::Settled`]) rather than one an object: a Mercurial push
+/// homes two objects a segment, about 4,200 for Mercurial's own 57k history.
+pub const VERSION: u8 = 0x86;
 /// Format: the kind byte of a put.
 const KIND_PUT: u8 = 1;
 /// Format: the kind byte of a read.
@@ -66,6 +68,12 @@ const KIND_MOVED: u8 = 7;
 const KIND_RESOLVE: u8 = 8;
 /// Format: the kind byte of a repository's rebuild told to a member (A-727 (d1a-3), version 0x83).
 const KIND_REBUILT: u8 = 9;
+/// Format: the kind byte of an attempt's holds settled together (version 0x86).
+const KIND_SETTLE: u8 = 10;
+/// Format: a settle's kind byte: every hold moved between two owners.
+const SETTLE_MOVED: u8 = 1;
+/// Format: a settle's kind byte: one owner's hold of each let go.
+const SETTLE_LET_GO: u8 = 2;
 /// Format: an owner's tag byte: an attempt in flight.
 const OWNER_ATTEMPT: u8 = 1;
 /// Format: an owner's tag byte: the records naming it.
@@ -100,6 +108,12 @@ const OUTCOME_OWED: u8 = 9;
 /// Format: the outcome byte of a put's answer from a member behind its sender's configuration, then its installed
 /// version (version 0x85, A-912).
 const OUTCOME_BEHIND: u8 = 10;
+/// Format: the outcome byte of a settle's answer, then the count of its objects settled (version 0x86).
+const OUTCOME_SETTLED: u8 = 11;
+
+/// The most objects one settle names ([`HomeMessage::Settle`]): as many identities as one message's byte string may
+/// carry. Derived: `slates_archive::format::MAX_CHUNK_BYTES / 32`, so a settle is no longer than a put's window.
+pub const SETTLE_MOST: u64 = MAX_CHUNK_BYTES / 32;
 
 /// The most bytes one part carries ([`HomeMessage::PutPart`], [`HomeOutcome::Part`]): the chunk cap a message's byte
 /// string is held to. Derived: `slates_archive::format::MAX_CHUNK_BYTES`.
@@ -249,11 +263,34 @@ pub enum HomeOutcome {
   },
   /// A rebuild's answer: the member owes itself a resolution pass (A-727 (d1a-3)); owing it twice is harmless.
   Owed,
+  /// A settle's answer (version 0x86): how many of its objects were settled, each moved or let go, or held for no such
+  /// owner (nothing to settle there).
+  Settled {
+    /// The objects settled.
+    settled: u64,
+  },
   /// A put's answer from a member behind the configuration its sender ranked the window's homes by (A-912): nothing
   /// kept; the sender asks again once the council's next round has passed, which brings the member's install.
   Behind {
     /// The configuration version the member has installed.
     installed: u64,
+  },
+}
+
+/// What a [`HomeMessage::Settle`] does to each of its objects' holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettleOf {
+  /// Moved from owner `from` to owner `to`: the attempt's entry committed, so its records now name them.
+  Moved {
+    /// The owner they were held for.
+    from: HomeOwner,
+    /// The owner they are held for now.
+    to: HomeOwner,
+  },
+  /// `owner`'s hold let go: the attempt refused.
+  LetGo {
+    /// The owner.
+    owner: HomeOwner,
   },
 }
 
@@ -331,6 +368,15 @@ pub enum HomeMessage {
   Rebuilt {
     /// The repository's id.
     repository: [u8; 16],
+  },
+  /// Settle one attempt's holds of every object in `identities` at a home (version 0x86): each moved between owners, or
+  /// one owner's let go, as [`HomeMessage::Moved`] and [`HomeMessage::LetGo`] do for one. On the wire its identity field
+  /// is all zeros, no one object being meant, and the identities follow, at most [`SETTLE_MOST`].
+  Settle {
+    /// The settle.
+    settle: SettleOf,
+    /// The objects.
+    identities: Vec<[u8; 32]>,
   },
   /// A member's answer about the window named `identity`.
   Answer {
@@ -445,6 +491,29 @@ impl HomeMessage {
         out.extend_from_slice(&[0; 32]);
         out.extend_from_slice(repository);
       }
+      HomeMessage::Settle { settle, identities } => {
+        out.push(KIND_SETTLE);
+        out.extend_from_slice(&[0; 32]);
+        match settle {
+          SettleOf::Moved { from, to } => {
+            out.push(SETTLE_MOVED);
+            from.encode_into(&mut out);
+            to.encode_into(&mut out);
+          }
+          SettleOf::LetGo { owner } => {
+            out.push(SETTLE_LET_GO);
+            owner.encode_into(&mut out);
+          }
+        }
+        out.extend_from_slice(
+          &u32::try_from(identities.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+        );
+        for identity in identities {
+          out.extend_from_slice(identity);
+        }
+      }
       HomeMessage::Answer { identity, outcome } => {
         out.push(KIND_ANSWER);
         out.extend_from_slice(identity);
@@ -480,6 +549,10 @@ impl HomeMessage {
           HomeOutcome::Behind { installed } => {
             out.push(OUTCOME_BEHIND);
             out.extend_from_slice(&installed.to_le_bytes());
+          }
+          HomeOutcome::Settled { settled } => {
+            out.push(OUTCOME_SETTLED);
+            out.extend_from_slice(&settled.to_le_bytes());
           }
         }
       }
@@ -538,6 +611,22 @@ impl HomeMessage {
         repository: <[u8; REPOSITORY_BYTES]>::try_from(reader.take(REPOSITORY_BYTES)?)
           .map_err(|_| HomeWireError::Truncated)?,
       },
+      KIND_SETTLE if identity == [0; 32] => {
+        let settle = match reader.byte()? {
+          SETTLE_MOVED => SettleOf::Moved {
+            from: reader.owner()?,
+            to: reader.owner()?,
+          },
+          SETTLE_LET_GO => SettleOf::LetGo {
+            owner: reader.owner()?,
+          },
+          byte => return Err(HomeWireError::Unknown { byte }),
+        };
+        HomeMessage::Settle {
+          settle,
+          identities: reader.identities()?,
+        }
+      }
       KIND_ANSWER => {
         let outcome = match reader.byte()? {
           OUTCOME_KEPT => HomeOutcome::Kept {
@@ -560,6 +649,9 @@ impl HomeMessage {
           OUTCOME_OWED => HomeOutcome::Owed,
           OUTCOME_BEHIND => HomeOutcome::Behind {
             installed: reader.long()?,
+          },
+          OUTCOME_SETTLED => HomeOutcome::Settled {
+            settled: reader.long()?,
           },
           OUTCOME_NAMED => HomeOutcome::Named {
             named: match reader.byte()? {
@@ -665,6 +757,22 @@ impl<'a> Reader<'a> {
     Ok(owners)
   }
 
+  /// A count of identities, then each ([`HomeMessage::Settle`]): the count checked against [`SETTLE_MOST`] and the bytes
+  /// left before anything is reserved, and at least one.
+  fn identities(&mut self) -> Result<Vec<[u8; 32]>, HomeWireError> {
+    let bytes = <[u8; 4]>::try_from(self.take(4)?).map_err(|_| HomeWireError::Truncated)?;
+    let count = usize::try_from(u32::from_le_bytes(bytes)).map_err(|_| HomeWireError::BadLength)?;
+    let most = usize::try_from(SETTLE_MOST).unwrap_or(usize::MAX);
+    if count == 0 || count > most || count > self.rest.len() / IDENTITY_BYTES {
+      return Err(HomeWireError::BadLength);
+    }
+    let mut identities = Vec::with_capacity(count);
+    for _ in 0..count {
+      identities.push(self.identity()?);
+    }
+    Ok(identities)
+  }
+
   /// A length-prefixed byte string, its length checked against the chunk cap and the bytes left before it is copied.
   fn blob(&mut self) -> Result<Vec<u8>, HomeWireError> {
     let bytes = <[u8; 4]>::try_from(self.take(4)?).map_err(|_| HomeWireError::Truncated)?;
@@ -752,6 +860,24 @@ mod tests {
         .boxed(),
       any::<[u8; 16]>()
         .prop_map(|repository| HomeMessage::Rebuilt { repository })
+        .boxed(),
+      (owner(), owner(), proptest::collection::vec(identity, 1..8))
+        .prop_map(|(from, to, identities)| HomeMessage::Settle {
+          settle: super::SettleOf::Moved { from, to },
+          identities,
+        })
+        .boxed(),
+      (owner(), proptest::collection::vec(identity, 1..8))
+        .prop_map(|(owner, identities)| HomeMessage::Settle {
+          settle: super::SettleOf::LetGo { owner },
+          identities,
+        })
+        .boxed(),
+      any::<u64>()
+        .prop_map(|settled| HomeMessage::Answer {
+          identity: [0; 32],
+          outcome: HomeOutcome::Settled { settled },
+        })
         .boxed(),
       identity
         .prop_map(|identity| HomeMessage::Answer {
@@ -874,6 +1000,55 @@ mod tests {
     );
   }
 
+  /// Version 0x86's settle (main 01a20182's order of 2026-11-26), hostile. Do: decode a settle of two objects; then one
+  /// whose count is none, past the bytes it carries, and past [`super::SETTLE_MOST`]; one naming an object in its identity
+  /// field; and one of an unknown settle kind. Expect: the first read back as written; each other refused by its kind,
+  /// nothing reserved for a count its bytes cannot hold.
+  #[test]
+  fn a_settle_reads_back_whole_and_a_hostile_one_is_refused_by_kind() {
+    let owner = HomeOwner::Record {
+      repository: [3; 16],
+    };
+    let settle = HomeMessage::Settle {
+      settle: super::SettleOf::LetGo { owner },
+      identities: vec![[1; 32], [2; 32]],
+    };
+    let written = settle.encode();
+    assert_eq!(HomeMessage::decode(&written), Ok(settle));
+    let head = |count: u32| {
+      let mut bytes = vec![VERSION, super::KIND_SETTLE];
+      bytes.extend_from_slice(&[0; 32]);
+      bytes.push(super::SETTLE_LET_GO);
+      owner.encode_into(&mut bytes);
+      bytes.extend_from_slice(&count.to_le_bytes());
+      bytes
+    };
+    let past_most = u32::try_from(super::SETTLE_MOST + 1).unwrap();
+    for count in [0, 2, u32::MAX, past_most] {
+      let mut lying = head(count);
+      lying.extend_from_slice(&[1; 32]);
+      assert_eq!(
+        HomeMessage::decode(&lying),
+        Err(HomeWireError::BadLength),
+        "count {count}"
+      );
+    }
+    let mut naming = written.clone();
+    naming[2] = 7;
+    assert_eq!(
+      HomeMessage::decode(&naming),
+      Err(HomeWireError::Unknown {
+        byte: super::KIND_SETTLE
+      })
+    );
+    let mut unknown = written.clone();
+    unknown[34] = 9;
+    assert_eq!(
+      HomeMessage::decode(&unknown),
+      Err(HomeWireError::Unknown { byte: 9 })
+    );
+  }
+
   /// A-724 piece 6, hostile lengths. Do: a put whose length prefix passes the bytes, one past the chunk cap, an unknown
   /// kind, a rebuild naming an object (A-727 (d1a-3): its identity field is all zeros), an unknown refusal and trailing
   /// bytes. Expect: each refused by its kind.
@@ -884,12 +1059,12 @@ mod tests {
     long.extend_from_slice(&0u64.to_le_bytes());
     long.extend_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(HomeMessage::decode(&long), Err(HomeWireError::BadLength));
-    let mut unknown = vec![VERSION, super::KIND_REBUILT + 1];
+    let mut unknown = vec![VERSION, super::KIND_SETTLE + 1];
     unknown.extend_from_slice(&[0; 32]);
     assert_eq!(
       HomeMessage::decode(&unknown),
       Err(HomeWireError::Unknown {
-        byte: super::KIND_REBUILT + 1
+        byte: super::KIND_SETTLE + 1
       })
     );
     let mut naming = vec![VERSION, super::KIND_REBUILT];

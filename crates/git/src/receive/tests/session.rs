@@ -388,3 +388,141 @@ fn a_pushs_checks_are_made_a_turn_at_a_time_and_answer_as_made_whole() {
     assert_eq!(written, answer_to(&whole), "{}", scenario.name);
   }
 }
+
+/// A push's objects as a store holds them while a landed pack's window is let go (goal 93 item 2b): each read back
+/// whole, but for the object at `missing`, which answers none with its let-go named ([`crate::away`]) until its window
+/// is brought back (`back`).
+struct LetGoOnce {
+  /// The push's objects, in pack order.
+  objects: Vec<crate::unpack::Object>,
+  /// The object read through the let-go window.
+  missing: usize,
+  /// Whether the window was brought back.
+  back: core::cell::Cell<bool>,
+  /// The let-go the last read to answer none met.
+  away: core::cell::Cell<Option<u64>>,
+}
+
+/// Shape: the let-go number [`LetGoOnce`]'s window was given back under.
+const LET_GO: u64 = 7;
+
+impl crate::unpack::Contents for LetGoOnce {
+  fn content(
+    &self,
+    at: usize,
+    id: &crate::object_name::ObjectId,
+  ) -> Option<std::borrow::Cow<'_, [u8]>> {
+    self.away.set(None);
+    if at == self.missing && !self.back.get() {
+      self.away.set(Some(LET_GO));
+      return None;
+    }
+    let object = self.objects.get(at).filter(|object| object.id == *id)?;
+    Some(std::borrow::Cow::Borrowed(object.content.as_slice()))
+  }
+
+  fn content_away(&self) -> Option<u64> {
+    self.away.get()
+  }
+}
+
+/// A clock that never moves: a quantum over it is never spent.
+struct Still;
+
+impl crate::store::learn::Clock for Still {
+  fn now_ns(&mut self) -> u64 {
+    0
+  }
+}
+
+/// Goal 93 item 2b, B1's stop (main's order of 2026-11-26: the cause of B1's failures under load, from main's lines of
+/// agents/w-git-b1-debug's runs 12, 13 and 15). Do: read the captured `create` whole into a session; check it in one turn
+/// whose quantum is never spent, its commit's bytes read through a let-go window; bring the window back and check it
+/// again. Expect: the first turn not done and not refused, the walk stopped for the window; the second done, the push
+/// answered as held whole. Red before: the check's own turn loop took the walk again after its stop, met the same
+/// let-go with nothing brought back between, and the commit was `Missing` (`missing necessary objects`).
+#[test]
+fn a_checks_turn_ends_at_its_walks_stop_on_a_let_go_window_and_is_whole_once_it_is_back() {
+  let scenario = scenario("create");
+  let repository = Repo::from_pack(scenario.before_pack);
+  let whole = received(&scenario, &repository);
+  let mut session = Session::new(&ADVERTISED, &HIDDEN);
+  let mut read = session.input(scenario.request, &repository, &mut unbounded());
+  if read == Ok(false) {
+    read = session.end(&repository, &mut unbounded());
+  }
+  assert_eq!(read, Ok(true));
+  resolved(&mut session, &repository);
+  let contents = let_go_once(&scenario, crate::object_name::Kind::Commit);
+  assert_eq!(
+    turned_still(&mut session, (&repository, &contents)),
+    Ok(false),
+    "stopped, not refused"
+  );
+  assert!(session.is_checking(), "its checks still to make");
+  contents.back.set(true);
+  assert_eq!(
+    turned_still(&mut session, (&repository, &contents)),
+    Ok(true)
+  );
+  let mut written = Vec::new();
+  let answered = session.answer(&mut git_policy(&repository), &mut written, &mut unbounded());
+  assert_eq!(answered, Ok(Some(whole)));
+}
+
+/// `scenario`'s pushed objects in pack order, the first of `kind` read through a let-go window ([`LetGoOnce`]).
+fn let_go_once(scenario: &Scenario, kind: crate::object_name::Kind) -> LetGoOnce {
+  let at = scenario
+    .request
+    .windows(4)
+    .position(|magic| magic == b"PACK")
+    .unwrap();
+  let pack = &scenario.request[at..];
+  let objects = crate::unpack::read_whole(
+    pack,
+    crate::object_name::ObjectFormat::Sha1,
+    &crate::unpack::NoIndex,
+    &mut unbounded(),
+  )
+  .unwrap()
+  .objects;
+  let missing = objects
+    .iter()
+    .position(|object| object.kind == kind)
+    .unwrap();
+  LetGoOnce {
+    objects,
+    missing,
+    back: core::cell::Cell::new(false),
+    away: core::cell::Cell::new(None),
+  }
+}
+
+/// `session`'s pack's waiting deltas resolved against `repository` (a turn of [`Session::check_turn`] while it is
+/// resolving), so its checks are what its next turn makes.
+fn resolved(session: &mut Session<'_, impl crate::receive::HiddenRefs>, repository: &Repo) {
+  while session.is_resolving() {
+    let mut clock = Still;
+    let quantum = crate::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns: u64::MAX,
+    };
+    assert_eq!(
+      session.check_turn(repository, &mut unbounded(), quantum),
+      Ok(false)
+    );
+  }
+}
+
+/// One turn of `session`'s checks against `repository`, its objects read from `contents`, over a quantum never spent.
+fn turned_still(
+  session: &mut Session<'_, impl crate::receive::HiddenRefs>,
+  (repository, contents): (&Repo, &LetGoOnce),
+) -> Result<bool, Refusal> {
+  let mut clock = Still;
+  let quantum = crate::store::hook_view::Quantum {
+    clock: &mut clock,
+    ns: u64::MAX,
+  };
+  session.check_turn_with((repository, contents), &mut unbounded(), quantum)
+}

@@ -46,6 +46,19 @@
 //! covers it, so a daemon killed mid-append leaves it uncovered, never half-read. A daemon reads only the log its own
 //! image wrote: the anchor restarts its own executable (A-145); a log of another layout that holds records (an
 //! upgrade's) is reported as lost writes, never misread.
+//!
+//! **The slice's marks** (A-926; goal 93, main's ruling of 2026-11-25). The region's last [`MARKS_BYTES`] bytes hold
+//! the high-water marks of the shard slice's written memories ([`Marked`]: this log's region, the journal's two
+//! checkpoint slots and its delta log): its version word, then each mark, bytes from its memory's start. A mark is
+//! raised, its new end rounded up to a page, before the write that passes it (this log's append, and every checkpoint
+//! and delta write through `verbs::ContentSlots`), with a release fence between, so a daemon killed between the two
+//! leaves it ahead of the bytes, never behind; it falls after its memory is given back ([`WriteLog::purge`], the
+//! journal's give-back). A successor reads them as it opens, so it knows how far each memory may hold pages: a
+//! residency sweep and a give-back read that far, never a memory whole. Before them a fresh 1-shard audit daemon's sweep
+//! walked 12,582,958 pages, 8,388,609 of them its slots and log it had never written. Layout version 3 carries the
+//! block; version 2's log has none, and its records may run to the region's end: it is read as before, every memory's
+//! mark whole (the assumption before A-926), until its first clear uncovers its records, writes the block, then the
+//! version 3 word. A slice no daemon opened (every header word zero) has every mark zero.
 
 use slates_mem::SparseObject;
 
@@ -70,10 +83,22 @@ const RESTAMP_OWED: u64 = 2;
 const AT_LAYOUT: usize = 3 * size_of::<u64>();
 /// Format: the header's bytes, its four words.
 const HEADER_BYTES: usize = 4 * size_of::<u64>();
-/// Format: the layout this daemon writes, "WLOG" and version 2: every record names its volume (2026-11-18). The layout
-/// before it had no such word, and its first record began where this word sits, its kind (1 or 2) in the low half; this
-/// word's low half is no record kind, so such a log is never read as this one's.
-const LAYOUT: u64 = u64::from_le_bytes(*b"WLOG\x02\x00\x00\x00");
+/// Format: the layout this daemon writes, "WLOG" and version 3 (A-926, 2026-11-25): version 2's records and header, and
+/// the slice's marks block at the region's end ([`MARKS_BYTES`]), which the record area stops before. Version 2 (every
+/// record names its volume, 2026-11-18) had no marks block; the layout before it had no such word, and its first record
+/// began where this word sits, its kind (1 or 2) in the low half; this word's low half is no record kind, so such a log
+/// is never read as this one's.
+const LAYOUT: u64 = u64::from_le_bytes(*b"WLOG\x03\x00\x00\x00");
+/// Format: version 2's layout word ([`LAYOUT`]'s history): its records are read as this one's, its region has no marks
+/// block, and its record area runs to the region's end.
+const LAYOUT_V2: u64 = u64::from_le_bytes(*b"WLOG\x02\x00\x00\x00");
+/// Format: the marks block's version word, "MARK" and version 1 (A-926).
+const MARKS_VERSION: u64 = u64::from_le_bytes(*b"MARK\x01\x00\x00\x00");
+/// Format: the marks block at the write log region's end (A-926): its version word, then the high-water mark of each
+/// [`Marked`] memory of the shard's slice, in that order, each a little-endian `u64` of bytes from the memory's start.
+const MARKS_BYTES: usize = (1 + MARKED) * size_of::<u64>();
+/// Format: the memories the marks block keeps a mark for ([`Marked`]).
+const MARKED: usize = 4;
 /// Format: a record's head: the kind, the inode, the offset and the length.
 const RECORD_HEAD: usize = 2 * size_of::<u32>() + 2 * size_of::<u64>();
 /// Format: a write record's kind.
@@ -84,6 +109,34 @@ const KIND_FORGET: u32 = 2;
 const VOLUME_BYTES: usize = 16;
 /// Format: a `FORGET` record's bytes: the volume, the attachment and the count.
 const FORGET_BYTES: usize = VOLUME_BYTES + 2 * size_of::<u64>();
+
+/// The memories of a shard's slice whose high-water marks the marks block keeps (A-926; goal 93, main's ruling of
+/// 2026-11-25): how far into each pages may be resident, as far as any write reached since it was last given back, so a
+/// successor knows what its predecessor wrote instead of taking every memory as written whole. A mark is raised, the new
+/// end rounded up to a page, before the write that passes it, so a crash leaves it ahead of the data, never behind; it
+/// falls when its memory is given back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Marked {
+  /// The write log's region: its header and record area.
+  WriteLog = 0,
+  /// The checkpoint memory's first slot.
+  FirstSlot = 1,
+  /// Its second slot.
+  SecondSlot = 2,
+  /// The delta log.
+  Deltas = 3,
+}
+
+/// How a log's marks block was found as it opened (A-926): the migration's record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MarksFound {
+  /// A slice no daemon opened before: every memory unwritten.
+  Fresh,
+  /// A version 3 log's marks.
+  Read,
+  /// A log of version 2 or older, or a block that did not read: every memory taken as written whole, once.
+  Adopted,
+}
 
 /// The content object refused a span of the log (it would not back the memory): the caller counts it, and treats
 /// the write as unlogged.
@@ -169,8 +222,21 @@ pub(crate) struct WriteLog {
   /// ([`RESTAMP_OWED`], A-422).
   restamp_owed: bool,
   /// How far into the record area pages may be resident since they were last given back ([`WriteLog::purge`]): the
-  /// furthest any record reached, or the whole area for a log opened over memory a predecessor may have written.
+  /// furthest any record reached, as far as the marks a predecessor left say (A-926).
   written: usize,
+  /// The slice's high-water marks ([`Marked`]), bytes from each memory's start, as the marks block holds them.
+  marks: [usize; MARKED],
+  /// Whether the marks block is in force: a version 3 log. A version 2 log's records may run into the block's bytes, so
+  /// its marks stay whole and are not written until its first clear makes it version 3.
+  marks_live: bool,
+  /// The page the marks are raised in steps of.
+  page: usize,
+  /// How the marks were found as the log opened.
+  found: MarksFound,
+  /// Marks raised since the log opened: one a page a memory grows by, against the writes ([`WriteLog::appends`]).
+  raises: u64,
+  /// Records appended since the log opened.
+  appends: u64,
 }
 
 fn word(object: &SparseObject, at: usize) -> Option<u64> {
@@ -235,22 +301,45 @@ fn logged_of(head: &RecordHead, bytes: Vec<u8>) -> Option<Logged> {
 impl WriteLog {
   /// The log of `bytes` at `start` in `object`, continued from what the previous daemon left when its stamp is
   /// `image_generation` (the writes since that publication, still owed), else emptied and stamped with it; with what
-  /// it holds to replay. `None` when `bytes` cannot hold the header.
+  /// it holds to replay. Its marks block read as `page`-stepped high-water marks (A-926): a version 2 log's read as every
+  /// memory whole (`journal_whole` for the journal's memories), once, its records read as far as the region's end until
+  /// its first clear writes version 3. `None` when `bytes` cannot hold the header and the marks block.
   pub(crate) fn open(
     object: &mut SparseObject,
-    start: usize,
-    bytes: usize,
+    (start, bytes): (usize, usize),
     image_generation: u64,
+    (page, journal_whole): (usize, slates_vfs::checkpoint_log::WrittenExtents),
   ) -> Option<(WriteLog, Recovered)> {
-    let capacity = bytes.checked_sub(HEADER_BYTES)?;
+    let whole_area = bytes.checked_sub(HEADER_BYTES)?;
+    let capacity = whole_area.checked_sub(MARKS_BYTES)?;
+    let [first, second] = journal_whole.slots;
+    let (found, marks) = read_marks(
+      object,
+      (start, bytes),
+      [bytes, first, second, journal_whole.log],
+    );
+    let live = found == MarksFound::Read;
     let mut log = WriteLog {
       start,
-      capacity,
-      written: capacity,
+      // A version 2 log's records may run to the region's end: read as far, until its first clear.
+      capacity: if found == MarksFound::Adopted {
+        whole_area
+      } else {
+        capacity
+      },
+      written: marks.first().map_or(whole_area, |mark| {
+        mark.saturating_sub(HEADER_BYTES).min(whole_area)
+      }),
       used: 0,
       stamp: image_generation,
       overflowed: false,
       restamp_owed: false,
+      marks,
+      marks_live: live,
+      page: page.max(1),
+      found,
+      raises: 0,
+      appends: 0,
     };
     let (recovered, restamp_lost) = log.read(object, image_generation);
     log.overflowed = recovered.everything_lost;
@@ -298,7 +387,7 @@ impl WriteLog {
     else {
       return (lost, false);
     };
-    if used > 0 && layout != LAYOUT {
+    if used > 0 && layout != LAYOUT && layout != LAYOUT_V2 {
       // Records of another layout (a daemon before every record named its volume): never misread as this one's.
       return (lost, false);
     }
@@ -399,6 +488,11 @@ impl WriteLog {
     head.extend_from_slice(&length.to_le_bytes());
     let at = HEADER_BYTES.checked_add(self.used).ok_or(Refused::Full)?;
     let at_volume = at.checked_add(RECORD_HEAD).ok_or(Refused::Full)?;
+    // The region's mark covers the record before any byte of it is written (A-926).
+    let reach = HEADER_BYTES.checked_add(end).ok_or(Refused::Full)?;
+    self
+      .raise_mark(object, Marked::WriteLog, reach)
+      .map_err(|_| Refused::Unwritten)?;
     self
       .store(object, at, &head)
       .map_err(|_| Refused::Unwritten)?;
@@ -412,12 +506,18 @@ impl WriteLog {
         bytes,
       )
       .map_err(|_| Refused::Unwritten)?;
+    #[cfg(test)]
+    if STOP_AFTER_RECORD.with(core::cell::Cell::get) {
+      // The crash point A-926's red holds: the record's bytes written, nothing after.
+      return Err(Refused::Unwritten);
+    }
     let covered = u64::try_from(end).map_err(|_| Refused::Full)?;
     self
       .store(object, AT_USED, &covered.to_le_bytes())
       .map_err(|_| Refused::Unwritten)?;
     self.used = end;
     self.written = self.written.max(end);
+    self.appends = self.appends.saturating_add(1);
     Ok(())
   }
 
@@ -545,7 +645,7 @@ impl WriteLog {
     let covered = u64::try_from(to).map_err(|_| Unwritten)?;
     self.store(object, AT_USED, &covered.to_le_bytes())?;
     self.used = to;
-    self.store(object, AT_LAYOUT, &LAYOUT.to_le_bytes())?;
+    self.store(object, AT_LAYOUT, &self.layout().to_le_bytes())?;
     self.store(object, AT_STAMP, &stamp.to_le_bytes())?;
     self.stamp = stamp;
     Ok(())
@@ -559,8 +659,15 @@ impl WriteLog {
     object: &mut SparseObject,
     image_generation: u64,
   ) -> Option<Recovered> {
-    let bytes = self.capacity.checked_add(HEADER_BYTES)?;
-    WriteLog::open(object, self.start, bytes, image_generation).map(|(_, recovered)| recovered)
+    let bytes = self.marks_at()?.checked_add(MARKS_BYTES)?;
+    let whole = slates_vfs::checkpoint_log::WrittenExtents::default();
+    WriteLog::open(
+      object,
+      (self.start, bytes),
+      image_generation,
+      (self.page, whole),
+    )
+    .map(|(_, recovered)| recovered)
   }
 
   /// Whether every write acknowledged since the last publication is in the log, so a successor replays them all: then
@@ -584,11 +691,17 @@ impl WriteLog {
     // The header first (a crash mid-scrub then replays nothing), but the scrub runs whatever the header's writes
     // answered: the records are plaintext, and a refused header write that returned early left them in place while
     // this log already counted itself empty, so nothing would scrub them (2026-10-07). The first refusal is returned.
+    // A log not yet version 3 becomes it here (A-926): its records uncovered first, so the marks block may take the
+    // bytes they reached, then the block, then the layout word that puts it in force.
     let header = self
       .store(object, AT_USED, &0u64.to_le_bytes())
       .and(self.store(object, AT_OVERFLOW, &0u64.to_le_bytes()))
-      .and(self.store(object, AT_LAYOUT, &LAYOUT.to_le_bytes()))
+      .and(self.put_marks_in_force(object))
+      .and(self.store(object, AT_LAYOUT, &self.layout().to_le_bytes()))
       .and(self.store(object, AT_STAMP, &stamp.to_le_bytes()));
+    // As far as the record area now reaches: a version 2 log's records past it lay where its marks block now is, which
+    // their bytes are overwritten by (A-926).
+    let logged = logged.min(self.capacity);
     let scrubbed = if logged > 0 {
       self
         .start
@@ -629,6 +742,8 @@ impl WriteLog {
       return Purged::default();
     };
     self.written = from;
+    // The mark falls with what was given back (A-926), after it: a crash between leaves it ahead, never behind.
+    let _lowered = self.lower_mark(object, Marked::WriteLog, HEADER_BYTES.saturating_add(from));
     Purged {
       bytes,
       walked: piece,
@@ -636,10 +751,192 @@ impl WriteLog {
     }
   }
 
+  /// The layout word this log writes: version 3 once its marks block is in force, version 2 until then ([`LAYOUT`]).
+  fn layout(&self) -> u64 {
+    if self.marks_live { LAYOUT } else { LAYOUT_V2 }
+  }
+
+  /// Where the marks block sits in the log's region: its last [`MARKS_BYTES`] bytes.
+  fn marks_at(&self) -> Option<usize> {
+    HEADER_BYTES
+      .checked_add(self.capacity)?
+      .checked_add(if self.marks_live || self.found != MarksFound::Adopted {
+        MARKS_BYTES
+      } else {
+        0
+      })?
+      .checked_sub(MARKS_BYTES)
+  }
+
+  /// Writes the marks block whole (its version word and every mark) where it is not yet in force, a version 2 log's
+  /// first clear (A-926): the record area then stops before it.
+  fn put_marks_in_force(&mut self, object: &mut SparseObject) -> Result<(), Unwritten> {
+    if self.marks_live {
+      return Ok(());
+    }
+    let at = self.marks_at().ok_or(Unwritten)?;
+    let mut block = Vec::with_capacity(MARKS_BYTES);
+    block.extend_from_slice(&MARKS_VERSION.to_le_bytes());
+    for mark in self.marks {
+      block.extend_from_slice(&u64::try_from(mark).unwrap_or(u64::MAX).to_le_bytes());
+    }
+    self.store(object, at, &block)?;
+    self.capacity = at.checked_sub(HEADER_BYTES).ok_or(Unwritten)?;
+    self.marks_live = true;
+    if self.found == MarksFound::Adopted {
+      // The record area now stops before the block: what was written past it is the block's page.
+      self.written = self.written.min(self.capacity);
+    }
+    Ok(())
+  }
+
+  /// Raises `which`'s mark to cover `end` bytes from its memory's start, rounded up to a page, before the write that
+  /// reaches there (A-926): one store a page a memory grows by, its order with the write kept by a release fence. Nothing
+  /// where the mark covers it already, or where the marks block is not in force (a version 2 log's marks are whole).
+  pub(crate) fn raise_mark(
+    &mut self,
+    object: &mut SparseObject,
+    which: Marked,
+    end: usize,
+  ) -> Result<(), Unwritten> {
+    let index = which as usize;
+    let Some(&mark) = self.marks.get(index) else {
+      return Err(Unwritten);
+    };
+    if !self.marks_live || end <= mark {
+      return Ok(());
+    }
+    #[cfg(test)]
+    if MARKS_OFF.with(core::cell::Cell::get) {
+      return Ok(());
+    }
+    let raised = end
+      .checked_next_multiple_of(self.page)
+      .unwrap_or(usize::MAX);
+    self.store_mark(object, index, raised)?;
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    self.raises = self.raises.saturating_add(1);
+    Ok(())
+  }
+
+  /// Lowers `which`'s mark to `end` where it is above it: once its memory past `end` was given back (A-926).
+  pub(crate) fn lower_mark(
+    &mut self,
+    object: &mut SparseObject,
+    which: Marked,
+    end: usize,
+  ) -> Result<(), Unwritten> {
+    let index = which as usize;
+    match self.marks.get(index) {
+      Some(&mark) if self.marks_live && end < mark => self.store_mark(object, index, end),
+      _ => Ok(()),
+    }
+  }
+
+  /// Stores mark `index` as `value` in the block and keeps it.
+  fn store_mark(
+    &mut self,
+    object: &mut SparseObject,
+    index: usize,
+    value: usize,
+  ) -> Result<(), Unwritten> {
+    let at = self
+      .marks_at()
+      .and_then(|at| at.checked_add(size_of::<u64>()))
+      .and_then(|at| at.checked_add(index.checked_mul(size_of::<u64>())?))
+      .ok_or(Unwritten)?;
+    let word = u64::try_from(value).map_err(|_| Unwritten)?;
+    self.store(object, at, &word.to_le_bytes())?;
+    if let Some(mark) = self.marks.get_mut(index) {
+      *mark = value;
+    }
+    Ok(())
+  }
+
+  /// The journal's memories as far as their marks say pages may be resident (A-926): what the shard's journal opens over.
+  pub(crate) fn journal_extents(&self) -> slates_vfs::checkpoint_log::WrittenExtents {
+    let mark = |which: Marked| self.marks.get(which as usize).copied().unwrap_or(0);
+    slates_vfs::checkpoint_log::WrittenExtents {
+      slots: [mark(Marked::FirstSlot), mark(Marked::SecondSlot)],
+      log: mark(Marked::Deltas),
+    }
+  }
+
+  /// Lowers the journal's memories' marks to `written`, the journal's extents after a give-back (A-926).
+  pub(crate) fn lower_journal_marks(
+    &mut self,
+    object: &mut SparseObject,
+    written: slates_vfs::checkpoint_log::WrittenExtents,
+  ) -> Result<(), Unwritten> {
+    let [first, second] = written.slots;
+    self
+      .lower_mark(object, Marked::FirstSlot, first)
+      .and(self.lower_mark(object, Marked::SecondSlot, second))
+      .and(self.lower_mark(object, Marked::Deltas, written.log))
+  }
+
+  /// How the marks were found as the log opened, the marks raised since, and the records appended since (A-926).
+  pub(crate) fn marks_counts(&self) -> (MarksFound, u64, u64) {
+    (self.found, self.raises, self.appends)
+  }
+
+  /// The marks block's byte range in the log's region, `(offset, len)`, while it is in force: a page a residency sweep
+  /// reads beside the record area (A-926).
+  pub(crate) fn marks_block(&self) -> Option<(usize, usize)> {
+    self
+      .marks_live
+      .then(|| self.marks_at().map(|at| (at, MARKS_BYTES)))
+      .flatten()
+  }
+
   fn store(&self, object: &mut SparseObject, offset: usize, bytes: &[u8]) -> Result<(), Unwritten> {
     let at = self.start.checked_add(offset).ok_or(Unwritten)?;
     object.write(at, bytes).map_err(|_| Unwritten)
   }
+}
+
+#[cfg(test)]
+std::thread_local! {
+  /// Test support (A-926's crash red): an append stops right after its record's bytes are written, as a daemon killed
+  /// there leaves its log.
+  static STOP_AFTER_RECORD: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+  /// Test support (A-926's cost measure): marks never raised, the write path as it was before them.
+  static MARKS_OFF: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// The marks a log region `(start, bytes)` of `object` holds (A-926), and how they were found: none written on a slice
+/// no daemon opened (every header word zero); a version 3 log's block, each mark no more than its memory (`whole`, the
+/// region's and the journal's memories' lengths); else every memory whole.
+fn read_marks(
+  object: &SparseObject,
+  (start, bytes): (usize, usize),
+  whole: [usize; MARKED],
+) -> (MarksFound, [usize; MARKED]) {
+  let at = |offset: usize| start.checked_add(offset).and_then(|at| word(object, at));
+  let header = [AT_STAMP, AT_USED, AT_OVERFLOW, AT_LAYOUT].map(at);
+  if header.iter().all(|word| *word == Some(0)) {
+    return (MarksFound::Fresh, [0; MARKED]);
+  }
+  let Some(block) = bytes.checked_sub(MARKS_BYTES) else {
+    return (MarksFound::Adopted, whole);
+  };
+  if header.get(3).copied().flatten() != Some(LAYOUT) || at(block) != Some(MARKS_VERSION) {
+    return (MarksFound::Adopted, whole);
+  }
+  let mut marks = whole;
+  for (index, mark) in marks.iter_mut().enumerate() {
+    let read = index
+      .checked_add(1)
+      .and_then(|word_index| word_index.checked_mul(size_of::<u64>()))
+      .and_then(|offset| block.checked_add(offset))
+      .and_then(at)
+      .and_then(|value| usize::try_from(value).ok());
+    match read {
+      Some(value) => *mark = value.min(*mark),
+      None => return (MarksFound::Adopted, whole),
+    }
+  }
+  (MarksFound::Read, marks)
 }
 
 /// Keeps one record with `append`, an acknowledged write's or a `FORGET`'s through `volume`, before its reply (A-63):
@@ -742,6 +1039,20 @@ mod tests {
   const LOG_BYTES: usize = 16 * 1024;
   /// Shape: where the log starts.
   const LOG_AT: usize = 4096;
+  /// Shape: the page the test log's marks are raised in steps of.
+  const PAGE: usize = 4096;
+
+  /// The log of [`LOG_BYTES`] at [`LOG_AT`] in `object` against a recovered image of `image_generation`, its marks in
+  /// pages of the test object's ([`PAGE`]), the journal's memories none.
+  fn open_at(object: &mut SparseObject, image_generation: u64) -> Option<(WriteLog, Recovered)> {
+    WriteLog::open(
+      object,
+      (LOG_AT, LOG_BYTES),
+      image_generation,
+      (PAGE, slates_vfs::checkpoint_log::WrittenExtents::default()),
+    )
+  }
+
   /// Shape: the volume a test's records are written through.
   const VOLUME: [u8; VOLUME_BYTES] = [7; VOLUME_BYTES];
   /// Shape: another volume, a test's `FORGET`'s.
@@ -765,7 +1076,7 @@ mod tests {
   fn a_cleared_log_keeps_none_of_the_bytes_it_logged() {
     const MARKER: &[u8] = b"PLAINTEXT-MARKER-AT-REST";
     let mut shared = object("scrub");
-    let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 1).unwrap();
+    let (mut log, _) = open_at(&mut shared, 1).unwrap();
     log
       .append(&mut shared, (VOLUME, 1), 0, &MARKER.repeat(8))
       .unwrap();
@@ -776,18 +1087,36 @@ mod tests {
       !region.windows(MARKER.len()).any(|window| window == MARKER),
       "a cleared log keeps no logged byte"
     );
-    let (_, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 2).unwrap();
+    let (_, recovered) = open_at(&mut shared, 2).unwrap();
     assert!(recovered.records.is_empty(), "and replays nothing");
+  }
+
+  /// Writes a version 2 log's empty header at [`LOG_AT`] stamped `stamp`, as a daemon before A-926 left it.
+  fn version_2_header(object: &mut SparseObject, stamp: u64) {
+    let mut header = Vec::new();
+    for word in [stamp, 0, 0, LAYOUT_V2] {
+      header.extend_from_slice(&word.to_le_bytes());
+    }
+    object.write(LOG_AT, &header).unwrap();
   }
 
   /// A-226's sibling (bounded work): do append one small write to a log of many pages, clear it as a publication does,
   /// and give its pages back; expect the give-back to take no more than the pages the record reached, never the log's
   /// whole capacity (which a 128 GiB machine sizes in gigabytes, walked in one step of the idle shard). A log opened
-  /// over a predecessor's object gives back what it cannot know was not written, once.
+  /// over a version 2 predecessor's object gives back what it cannot know was not written, once (A-926: its marks
+  /// whole); a slice no daemon opened gives back nothing.
   #[test]
   fn a_purge_gives_back_only_what_the_log_wrote_since_its_last() {
+    let mut fresh = object("purge-fresh");
+    let (mut unwritten, _) = open_at(&mut fresh, 1).unwrap();
+    assert_eq!(
+      unwritten.purge(&mut fresh, usize::MAX),
+      Purged::default(),
+      "a fresh slice's log gives back nothing"
+    );
     let mut shared = object("purge-extent");
-    let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 1).unwrap();
+    version_2_header(&mut shared, 1);
+    let (mut log, _) = open_at(&mut shared, 1).unwrap();
     // The first give-back after opening covers what a predecessor may have written, a page a call.
     let page = 4096;
     let mut calls = 0;
@@ -825,11 +1154,11 @@ mod tests {
   #[test]
   fn the_writes_since_the_recovered_publication_are_replayed_in_order() {
     let mut shared = object("replay");
-    let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 7).unwrap();
+    let (mut log, _) = open_at(&mut shared, 7).unwrap();
     log.append(&mut shared, (VOLUME, 1), 0, b"alpha").unwrap();
     log.append(&mut shared, (VOLUME, 2), 4096, b"beta").unwrap();
     log.append(&mut shared, (VOLUME, 1), 5, b"gamma").unwrap();
-    let (mut next, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 7).unwrap();
+    let (mut next, recovered) = open_at(&mut shared, 7).unwrap();
     let written: Vec<([u8; VOLUME_BYTES], u64, u64, &[u8])> = recovered
       .records
       .iter()
@@ -853,7 +1182,7 @@ mod tests {
     );
     assert!(!recovered.everything_lost);
     next.append(&mut shared, (VOLUME, 3), 0, b"delta").unwrap();
-    let (_, again) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 7).unwrap();
+    let (_, again) = open_at(&mut shared, 7).unwrap();
     assert_eq!(
       again.records.len(),
       4,
@@ -868,7 +1197,7 @@ mod tests {
   #[test]
   fn a_forget_is_replayed_in_its_place_among_the_writes() {
     let mut shared = object("forget");
-    let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 4).unwrap();
+    let (mut log, _) = open_at(&mut shared, 4).unwrap();
     log.append(&mut shared, (VOLUME, 1), 0, b"alpha").unwrap();
     let forgotten = Forgotten {
       volume: OTHER,
@@ -878,7 +1207,7 @@ mod tests {
     };
     log.append_forget(&mut shared, forgotten).unwrap();
     log.append(&mut shared, (VOLUME, 2), 0, b"beta").unwrap();
-    let (_, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 4).unwrap();
+    let (_, recovered) = open_at(&mut shared, 4).unwrap();
     assert_eq!(
       recovered.records,
       vec![
@@ -901,7 +1230,7 @@ mod tests {
       LOG_AT + HEADER_BYTES + RECORD_HEAD + VOLUME_BYTES + b"alpha".len() + RECORD_HEAD
         - size_of::<u32>();
     shared.write(forget_length, &1u32.to_le_bytes()).unwrap();
-    let (_, torn) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 4).unwrap();
+    let (_, torn) = open_at(&mut shared, 4).unwrap();
     assert!(
       torn.everything_lost,
       "a FORGET of the wrong length is not read short"
@@ -913,13 +1242,13 @@ mod tests {
   #[test]
   fn a_log_from_before_the_recovered_publication_is_not_replayed() {
     let mut shared = object("stale");
-    let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 7).unwrap();
+    let (mut log, _) = open_at(&mut shared, 7).unwrap();
     log
       .append(&mut shared, (VOLUME, 1), 0, b"in the image already")
       .unwrap();
-    let (_, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 8).unwrap();
+    let (_, recovered) = open_at(&mut shared, 8).unwrap();
     assert_eq!(recovered, Recovered::default());
-    let (_, after) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 8).unwrap();
+    let (_, after) = open_at(&mut shared, 8).unwrap();
     assert!(after.records.is_empty());
   }
 
@@ -929,18 +1258,18 @@ mod tests {
   #[test]
   fn an_uncovered_record_is_ignored_a_full_log_refuses_and_an_overflow_is_reported() {
     let mut shared = object("edges");
-    let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 3).unwrap();
+    let (mut log, _) = open_at(&mut shared, 3).unwrap();
     log.append(&mut shared, (VOLUME, 1), 0, b"covered").unwrap();
     let uncovered = LOG_AT + HEADER_BYTES + RECORD_HEAD + VOLUME_BYTES + b"covered".len();
     shared.write(uncovered, &9u64.to_le_bytes()).unwrap();
-    let (mut next, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 3).unwrap();
+    let (mut next, recovered) = open_at(&mut shared, 3).unwrap();
     assert_eq!(recovered.records.len(), 1);
     assert_eq!(
       next.append(&mut shared, (VOLUME, 1), 0, &vec![0u8; LOG_BYTES]),
       Err(Refused::Full)
     );
     next.overflow(&mut shared).unwrap();
-    let (_, overflowed) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 3).unwrap();
+    let (_, overflowed) = open_at(&mut shared, 3).unwrap();
     assert!(overflowed.everything_lost);
   }
 
@@ -948,11 +1277,11 @@ mod tests {
   #[test]
   fn an_impossible_length_in_use_reports_everything_lost() {
     let mut shared = object("hostile");
-    let (_, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 5).unwrap();
+    let (_, _) = open_at(&mut shared, 5).unwrap();
     shared
       .write(LOG_AT + AT_USED, &u64::MAX.to_le_bytes())
       .unwrap();
-    let (_, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 5).unwrap();
+    let (_, recovered) = open_at(&mut shared, 5).unwrap();
     assert!(recovered.everything_lost);
   }
 
@@ -974,14 +1303,14 @@ mod tests {
     old.extend_from_slice(&u32::try_from(b"old".len()).unwrap().to_le_bytes());
     old.extend_from_slice(b"old");
     shared.write(LOG_AT, &old).unwrap();
-    let (_, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 6).unwrap();
+    let (_, recovered) = open_at(&mut shared, 6).unwrap();
     assert!(
       recovered.records.is_empty() && recovered.everything_lost,
       "an old layout's records are reported lost: {recovered:?}"
     );
     let mut empty = object("old-layout-empty");
     empty.write(LOG_AT, &6u64.to_le_bytes()).unwrap();
-    let (_, nothing) = WriteLog::open(&mut empty, LOG_AT, LOG_BYTES, 6).unwrap();
+    let (_, nothing) = open_at(&mut empty, 6).unwrap();
     assert_eq!(nothing, Recovered::default(), "an empty one loses nothing");
   }
 
@@ -1006,7 +1335,7 @@ mod tests {
   fn a_log_keeps_the_left_out_volumes_records_in_order_under_the_new_stamp() {
     const MARKER: &[u8] = b"CARRIED-BY-THE-IMAGE-MARKER";
     let mut shared = object("retain");
-    let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 3).unwrap();
+    let (mut log, _) = open_at(&mut shared, 3).unwrap();
     log.append(&mut shared, (VOLUME, 1), 0, b"alpha").unwrap();
     log
       .append_forget(
@@ -1026,7 +1355,7 @@ mod tests {
     log
       .retain(&mut shared, 4, |volume| *volume == VOLUME)
       .unwrap();
-    let (mut next, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 4).unwrap();
+    let (mut next, recovered) = open_at(&mut shared, 4).unwrap();
     assert!(!recovered.everything_lost, "{recovered:?}");
     assert_eq!(
       recovered.records.len(),
@@ -1048,7 +1377,7 @@ mod tests {
       "a dropped record's bytes are scrubbed"
     );
     next.append(&mut shared, (OTHER, 4), 0, b"delta").unwrap();
-    let (_, again) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 4).unwrap();
+    let (_, again) = open_at(&mut shared, 4).unwrap();
     assert_eq!(
       writes(&again).last(),
       Some(&(OTHER, 4, b"delta".to_vec())),
@@ -1068,34 +1397,34 @@ mod tests {
   #[test]
   fn a_restamp_owed_at_a_death_reports_the_left_out_writes_lost_never_drops_them_in_silence() {
     let mut shared = object("owed");
-    let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 5).unwrap();
+    let (mut log, _) = open_at(&mut shared, 5).unwrap();
     log.append(&mut shared, (VOLUME, 1), 0, b"owed").unwrap();
     log.owe_restamp(&mut shared).unwrap();
-    let (mut next, lost) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 6).unwrap();
+    let (mut next, lost) = open_at(&mut shared, 6).unwrap();
     assert!(lost.everything_lost && lost.records.is_empty(), "{lost:?}");
     next.append(&mut shared, (VOLUME, 2), 0, b"after").unwrap();
-    let (_, later) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 6).unwrap();
+    let (_, later) = open_at(&mut shared, 6).unwrap();
     assert_eq!(writes(&later), [(VOLUME, 2, b"after".to_vec())]);
     assert!(later.everything_lost, "the loss is reported again");
 
     let mut before_commit = object("owed-uncommitted");
-    let (mut log, _) = WriteLog::open(&mut before_commit, LOG_AT, LOG_BYTES, 5).unwrap();
+    let (mut log, _) = open_at(&mut before_commit, 5).unwrap();
     log
       .append(&mut before_commit, (VOLUME, 1), 0, b"owed")
       .unwrap();
     log.owe_restamp(&mut before_commit).unwrap();
-    let (_, kept) = WriteLog::open(&mut before_commit, LOG_AT, LOG_BYTES, 5).unwrap();
+    let (_, kept) = open_at(&mut before_commit, 5).unwrap();
     assert_eq!(writes(&kept), [(VOLUME, 1, b"owed".to_vec())]);
     assert!(!kept.everything_lost, "{kept:?}");
 
     let mut forgiven = object("owed-forgiven");
-    let (mut log, _) = WriteLog::open(&mut forgiven, LOG_AT, LOG_BYTES, 5).unwrap();
+    let (mut log, _) = open_at(&mut forgiven, 5).unwrap();
     log
       .append(&mut forgiven, (VOLUME, 1), 0, b"in the image")
       .unwrap();
     log.owe_restamp(&mut forgiven).unwrap();
     log.forgive_restamp(&mut forgiven).unwrap();
-    let (_, stale) = WriteLog::open(&mut forgiven, LOG_AT, LOG_BYTES, 6).unwrap();
+    let (_, stale) = open_at(&mut forgiven, 6).unwrap();
     assert_eq!(stale, Recovered::default());
   }
 
@@ -1106,15 +1435,204 @@ mod tests {
   #[test]
   fn an_overflow_marked_before_a_restamp_stays_reported() {
     let mut shared = object("retain-overflow");
-    let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 1).unwrap();
+    let (mut log, _) = open_at(&mut shared, 1).unwrap();
     log.append(&mut shared, (VOLUME, 1), 0, b"kept").unwrap();
     log.overflow(&mut shared).unwrap();
     log.owe_restamp(&mut shared).unwrap();
     log
       .retain(&mut shared, 2, |volume| *volume == VOLUME)
       .unwrap();
-    let (_, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 2).unwrap();
+    let (_, recovered) = open_at(&mut shared, 2).unwrap();
     assert_eq!(writes(&recovered), [(VOLUME, 1, b"kept".to_vec())]);
     assert!(recovered.everything_lost, "{recovered:?}");
+  }
+
+  /// The journal's memories whole for the A-926 tests: a checkpoint memory and a delta log of a few pages each.
+  fn journal_whole() -> slates_vfs::checkpoint_log::WrittenExtents {
+    slates_vfs::checkpoint_log::WrittenExtents::whole(8 * PAGE, 4 * PAGE)
+  }
+
+  /// A version 2 log at [`LOG_AT`] stamped `stamp`, its one write record through [`VOLUME`] filling its record area to
+  /// the region's very end (the bytes a marks block takes in version 3 among them): the record's bytes.
+  fn version_2_full(object: &mut SparseObject, stamp: u64) -> Vec<u8> {
+    let area = LOG_BYTES - HEADER_BYTES;
+    let bytes: Vec<u8> = (0..area - RECORD_HEAD - VOLUME_BYTES)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    let mut record = Vec::new();
+    record.extend_from_slice(&KIND_WRITE.to_le_bytes());
+    record.extend_from_slice(&3u64.to_le_bytes());
+    record.extend_from_slice(&0u64.to_le_bytes());
+    record.extend_from_slice(
+      &u32::try_from(VOLUME_BYTES + bytes.len())
+        .unwrap()
+        .to_le_bytes(),
+    );
+    record.extend_from_slice(&VOLUME);
+    record.extend_from_slice(&bytes);
+    assert_eq!(
+      record.len(),
+      area,
+      "the record fills the area to the region's end"
+    );
+    object.write(LOG_AT + HEADER_BYTES, &record).unwrap();
+    let mut header = Vec::new();
+    for word in [stamp, area as u64, 0, LAYOUT_V2] {
+      header.extend_from_slice(&word.to_le_bytes());
+    }
+    object.write(LOG_AT, &header).unwrap();
+    bytes
+  }
+
+  /// A-926, the migration (main's ruling of 2026-11-25). Do: leave a version 2 log whose one record fills its region to
+  /// the very end, the last 40 bytes among it; open it with this code against its image's generation; append a write;
+  /// clear it as a publication does; open it again. Expect the record replayed byte for byte; the log adopted (counted),
+  /// every memory read whole (the log's region and the journal's memories as given) until its first clear; the append
+  /// refused full, which forces that clear; and after it a version 3 log whose marks block reads back, its marks the
+  /// extents it kept.
+  #[test]
+  fn a_version_2_log_filled_to_its_end_is_replayed_whole_then_cleared_into_version_3() {
+    let mut shared = object("v2-full");
+    let bytes = version_2_full(&mut shared, 5);
+    let (mut log, recovered) =
+      WriteLog::open(&mut shared, (LOG_AT, LOG_BYTES), 5, (PAGE, journal_whole())).unwrap();
+    let Some(Logged::Write(record)) = recovered.records.first() else {
+      panic!("the record replayed: {recovered:?}");
+    };
+    assert_eq!(
+      (record.inode, &record.bytes),
+      (3, &bytes),
+      "replayed byte for byte"
+    );
+    assert_eq!(
+      log.marks_counts().0,
+      MarksFound::Adopted,
+      "adopted, counted"
+    );
+    assert_eq!(log.written_bytes(), LOG_BYTES, "the log's region whole");
+    assert_eq!(
+      log.journal_extents(),
+      journal_whole(),
+      "the journal's memories whole"
+    );
+    assert_eq!(
+      log.marks_block(),
+      None,
+      "no marks block in force before the first clear"
+    );
+    assert_eq!(
+      log.append(&mut shared, (VOLUME, 4), 0, b"one more"),
+      Err(Refused::Full),
+      "the append that does not fit forces the clear"
+    );
+    assert_cleared_into_version_3(&mut log, &mut shared);
+  }
+
+  /// The second half of [`a_version_2_log_filled_to_its_end_is_replayed_whole_then_cleared_into_version_3`], after its
+  /// append was refused full: clear `log` as a publication does, append, open it again. Expect a version 3 log whose
+  /// marks block is in force and reads back, its marks the journal's extents, and the record after the clear replayed.
+  fn assert_cleared_into_version_3(log: &mut WriteLog, shared: &mut SparseObject) {
+    log.clear(shared, 6).unwrap();
+    assert_eq!(
+      log.marks_block(),
+      Some((LOG_BYTES - MARKS_BYTES, MARKS_BYTES)),
+      "version 3, its marks block in force"
+    );
+    log.append(shared, (VOLUME, 4), 0, b"one more").unwrap();
+    let (again, replayed) =
+      WriteLog::open(shared, (LOG_AT, LOG_BYTES), 6, (PAGE, journal_whole())).unwrap();
+    assert_eq!(
+      again.marks_counts().0,
+      MarksFound::Read,
+      "its marks read back"
+    );
+    assert_eq!(
+      again.journal_extents(),
+      journal_whole(),
+      "the extents it kept"
+    );
+    assert_eq!(
+      replayed.records.len(),
+      1,
+      "the record after the clear replayed"
+    );
+  }
+
+  /// A-926, the crash point (main's ruling of 2026-11-25: raised before the write, a crash leaves the mark ahead of the
+  /// data, never behind). Do: on a fresh slice, append records until the log passes a page, the last stopped right
+  /// after its bytes are written, as a daemon killed there; open the log again. Expect the successor's mark covering
+  /// every byte the stopped record wrote. Red with the mark raised after the record's bytes: the mark a page short.
+  #[test]
+  fn a_crash_after_a_records_bytes_leaves_the_mark_covering_them() {
+    let mut shared = object("crash-mark");
+    let (mut log, _) = open_at(&mut shared, 1).unwrap();
+    let write = vec![5u8; 700];
+    let mut reached = HEADER_BYTES;
+    while reached <= PAGE {
+      log.append(&mut shared, (VOLUME, 1), 0, &write).unwrap();
+      reached += RECORD_HEAD + VOLUME_BYTES + write.len();
+    }
+    STOP_AFTER_RECORD.with(|stop| stop.set(true));
+    let stopped = log.append(&mut shared, (VOLUME, 1), 0, &vec![6u8; 2 * PAGE]);
+    STOP_AFTER_RECORD.with(|stop| stop.set(false));
+    assert_eq!(
+      stopped,
+      Err(Refused::Unwritten),
+      "the append stopped after its bytes"
+    );
+    let wrote_to = reached + RECORD_HEAD + VOLUME_BYTES + 2 * PAGE;
+    let (successor, _) = open_at(&mut shared, 1).unwrap();
+    assert!(
+      successor.written_bytes() >= wrote_to,
+      "the successor's mark {} covers the stopped record's bytes, to {wrote_to}",
+      successor.written_bytes()
+    );
+  }
+
+  /// A-926, the raises' cost (main's ruling of 2026-11-25: one raise a page, the write path's cost unchanged). Do: on a
+  /// fresh log, append small records until it has grown by several pages, then clear it, five rounds, alternating
+  /// rounds with the marks raised and with them off (the write path before A-926), each round timed. Expect one raise a
+  /// page grown each marked round (the pages the records reached), against far more appends; prints the best round's
+  /// time an append of each.
+  #[test]
+  fn a_growing_log_raises_its_mark_once_a_page() {
+    /// Shape: the rounds of each arm.
+    const ROUNDS: usize = 5;
+    let write = [3u8; 100];
+    let record = RECORD_HEAD + VOLUME_BYTES + write.len();
+    let appends = (LOG_BYTES - HEADER_BYTES - MARKS_BYTES) / record;
+    let pages = (HEADER_BYTES + appends * record).div_ceil(PAGE) as u64;
+    let mut shared = object("raises");
+    let (mut log, _) = open_at(&mut shared, 1).unwrap();
+    let (mut marked_ns, mut unmarked_ns) = (u128::MAX, u128::MAX);
+    for round in 0..2 * ROUNDS {
+      let off = round % 2 == 1;
+      MARKS_OFF.with(|marks_off| marks_off.set(off));
+      log.clear(&mut shared, 1).unwrap();
+      // The marks fall with the pages the clear gave back, so each marked round raises them again.
+      let _ = log.lower_mark(&mut shared, Marked::WriteLog, HEADER_BYTES);
+      let raised = log.marks_counts().1;
+      let began = std::time::Instant::now();
+      for _ in 0..appends {
+        log.append(&mut shared, (VOLUME, 1), 0, &write).unwrap();
+      }
+      let ns = began.elapsed().as_nanos() / appends as u128;
+      if off {
+        unmarked_ns = unmarked_ns.min(ns);
+        assert_eq!(log.marks_counts().1, raised, "no raise with the marks off");
+      } else {
+        marked_ns = marked_ns.min(ns);
+        assert_eq!(
+          log.marks_counts().1 - raised,
+          pages,
+          "one raise a page grown"
+        );
+      }
+    }
+    MARKS_OFF.with(|marks_off| marks_off.set(false));
+    println!(
+      "write_log: {appends} appends a round raised the mark once a page over {pages} pages; best of {ROUNDS}: {marked_ns} \
+       ns an append marked, {unmarked_ns} ns with the marks off"
+    );
   }
 }

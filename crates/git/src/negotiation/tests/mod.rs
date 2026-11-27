@@ -2427,3 +2427,69 @@ fn a_filter_that_reads_no_size_asks_none() {
     assert_eq!(sent, whole, "{filter:?}");
   }
 }
+
+/// Main's order of 2026-11-25 (its git leg at b4aa00ef8: a clone's `cut` unit ran 7.9 to 10.3 ms, once a fetch, as the
+/// selection begun after the cut painted every wanted and had tip in that one unit). Do: over a 600-commit line with a
+/// tag on each of its newest 500, ask as a clone does: the tip and every tag wanted, nothing had, `done`; begin it and
+/// step it a unit a step, counting what each step reads of the graph. Expect: the answer the one made whole; no step
+/// reads more than 2 (a tip a unit: its tag's target, or a commit's parents). Red before: the step that ended the cut
+/// peeled all 500 tags.
+#[test]
+fn a_clones_wanted_tips_are_painted_a_unit_each() {
+  const COMMITS: u64 = 600;
+  const TAGGED: usize = 500;
+  let mut graph = TestGraph::default();
+  let mut commits = Vec::new();
+  for index in 0..COMMITS {
+    let blob = graph.new_blob(index);
+    let tree = graph.new_tree(&[blob]);
+    let parents: Vec<u32> = commits.last().copied().into_iter().collect();
+    commits.push(graph.new_commit(&parents, tree, index * 10));
+  }
+  let tip = *commits.last().unwrap();
+  graph.tips.push(tip);
+  let mut wants = vec![object_id(at(tip))];
+  for commit in &commits[commits.len() - TAGGED..] {
+    let tag = graph.new_tag(*commit);
+    graph.tags.push(tag);
+    wants.push(object_id(at(tag)));
+  }
+  let asked = Asks {
+    wants,
+    haves: vec![],
+    done: true,
+    wait_for_done: false,
+    shallow: vec![],
+    deepen: None,
+    filter: None,
+    include_tag: false,
+    thin: false,
+    sparse: None,
+  };
+  let request = asked.request();
+  let whole = negotiate(&graph, &request, &mut Admission::new(u64::MAX));
+  let counted = Counted {
+    graph: &graph,
+    reads: std::cell::Cell::new(0),
+    sizes: std::cell::Cell::new(0),
+  };
+  let mut admission = Admission::new(u64::MAX);
+  let Ok(super::Begun::Selecting(mut negotiating)) =
+    super::begin(&counted, &request, &mut admission)
+  else {
+    panic!("answered at begin");
+  };
+  counted.taken();
+  let mut most = 0u64;
+  let stepped = loop {
+    let step = negotiating.step(&counted, &mut admission, &mut || true);
+    most = most.max(counted.taken());
+    match step {
+      Err(refusal) => break Err(refusal),
+      Ok(Some(outcome)) => break Ok(outcome),
+      Ok(None) => {}
+    }
+  };
+  assert_eq!(stepped, whole);
+  assert!(most <= 2, "a step read {most}");
+}

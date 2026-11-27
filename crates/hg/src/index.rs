@@ -147,17 +147,30 @@ impl Log<'_> {
     }
   }
 
-  /// The key of this log's row numbered `rev`.
+  /// The bytes [`Log::put_key`] appends.
+  fn key_len(&self) -> usize {
+    match self {
+      Self::Changelog | Self::Manifest => 1,
+      Self::File(path) => path.len().saturating_add(2),
+    }
+  }
+
+  /// The key of this log's row numbered `rev`, made at its length at once: a key grown from one byte was two allocations
+  /// a lookup, and a push's chain walks look up every link (main's churn of hg's 57k push at e51d998bf: 147 MB under
+  /// `put_key`).
   fn row_key(&self, rev: u32) -> Vec<u8> {
-    let mut key = vec![LOG_ROW];
+    let rev = rev.to_be_bytes();
+    let mut key = Vec::with_capacity(self.key_len().saturating_add(rev.len()).saturating_add(1));
+    key.push(LOG_ROW);
     self.put_key(&mut key);
-    key.extend_from_slice(&rev.to_be_bytes());
+    key.extend_from_slice(&rev);
     key
   }
 
-  /// The key of `node`'s row in this log.
+  /// The key of `node`'s row in this log, made at its length at once.
   fn node_key(&self, node: &Node) -> Vec<u8> {
-    let mut key = vec![NODE_ROW];
+    let mut key = Vec::with_capacity(self.key_len().saturating_add(node.len()).saturating_add(1));
+    key.push(NODE_ROW);
     key.extend_from_slice(node);
     self.put_key(&mut key);
     key
@@ -907,8 +920,23 @@ impl HgIndex {
 
   /// How many revisions `log` holds: the first number with no row.
   pub fn len(&self, store: &ContentStore, log: Log<'_>) -> u32 {
+    // One key, its number rewritten for each probe: a key a probe was the push's commonest allocation (18,455 for an
+    // 80-edit history in `push_heap`'s attribution, 2026-11-25).
+    let key = core::cell::RefCell::new(log.row_key(0));
+    let number_at = key
+      .borrow()
+      .len()
+      .saturating_sub(core::mem::size_of::<u32>());
     let held = |rev: u64| {
-      u32::try_from(rev).is_ok_and(|rev| self.rows.get(store, &log.row_key(rev)).is_some())
+      u32::try_from(rev).is_ok_and(|rev| {
+        let Ok(mut key) = key.try_borrow_mut() else {
+          return false;
+        };
+        for (to, from) in key.iter_mut().skip(number_at).zip(rev.to_be_bytes()) {
+          *to = from;
+        }
+        self.rows.get(store, &key).is_some()
+      })
     };
     u32::try_from(first_missing(u64::from(NONE), held)).unwrap_or(NONE)
   }
@@ -1166,6 +1194,13 @@ impl HgIndex {
     let row = self.revision(store, log, rev)?;
     if let Some(text) = given_text(&row.node) {
       return Some(text.to_vec());
+    }
+    // Its own object's first window first: a revision let go once landed (held, its windows away) has no text here, so
+    // none is begun and no chain gathered (main's churn at e51d998bf: hg's 57k clone allocated 5.51 GB of texts and 0.79
+    // GB of chains reading manifests the store had let go, about a manifest a changeset, none of them made). An object
+    // the store holds no entry for (the empty one) is read as before.
+    if store.contains(&row.bytes) && store.windows(&row.bytes).next().is_none() {
+      return None;
     }
     if let Some(block) = row.block {
       return framed_text(store, (&block, &row.bytes), row.len);
@@ -1487,10 +1522,16 @@ fn framed_text(
 }
 
 /// The object `root` names, `len` bytes, read from its windows into a text of that length (no copy grown from empty);
-/// `None` where the store holds another length.
+/// `None` where the store holds another length, or none of it (nothing allocated then).
 fn object_text(store: &ContentStore, root: &ContentId, len: u64) -> Option<Vec<u8>> {
+  // The text is made only once its first window is read: an object let go allocates nothing.
+  let mut windows = store.windows(root);
+  let Some(first) = windows.next() else {
+    return (len == 0).then(Vec::new);
+  };
   let mut text = Vec::with_capacity(usize::try_from(len).ok()?);
-  for window in store.windows(root) {
+  text.extend_from_slice(&first);
+  for window in windows {
     text.extend_from_slice(&window);
   }
   (crate::read::to_u64(text.len()) == len).then_some(text)

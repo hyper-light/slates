@@ -3165,8 +3165,19 @@ pub mod platform {
   }
 
   impl Liveness {
+    /// Whether the daemon has gone: its process exited, or the object names no daemon or another one. A look at the
+    /// object that cannot tell (its open refused for want of a descriptor, a full system table) asks the rendezvous's
+    /// holder instead ([`holder_lives`]; on macOS a bootstrap name's lookup, which takes no descriptor): gone once none
+    /// holds it, and nothing decided while one does or the ask is refused too (main 01a20182's ruling of 2026-11-25: a
+    /// client short of descriptors judged its live daemon gone at its 2 s reply deadline, `reap_map`'s starved hand-off;
+    /// and one whose daemon stopped inside its process, which no exit watch sees, then waited for its reply forever).
     pub(super) fn daemon_gone(&self) -> bool {
-      self.watch.exited() || generation_of(&self.instance).is_none_or(|now| now != self.generation)
+      self.watch.exited()
+        || match stamp_of(&self.instance) {
+          Stamp::Found(now) => now != self.generation,
+          Stamp::Gone => true,
+          Stamp::Unknown => matches!(holder_lives(&self.instance), Ok(false)),
+        }
     }
 
     /// The daemon's process handle (Windows; [`super::Liveness::exit_handle`]).
@@ -3178,10 +3189,12 @@ pub mod platform {
     /// A liveness check on `instance`'s daemon whose process is `pid` ([`super::Liveness::of_daemon`]).
     #[cfg(test)]
     pub(super) fn of_daemon(instance: &str, pid: u32) -> Result<Liveness, IpcError> {
-      let generation = generation_of(instance).ok_or_else(|| IpcError::DaemonUnavailable {
-        endpoint: instance.to_owned(),
-        why: "the daemon has not yet published its rendezvous object",
-      })?;
+      let Stamp::Found(generation) = stamp_of(instance) else {
+        return Err(IpcError::DaemonUnavailable {
+          endpoint: instance.to_owned(),
+          why: "the daemon has not yet published its rendezvous object",
+        });
+      };
       Ok(Liveness {
         instance: instance.to_owned(),
         generation,
@@ -3197,14 +3210,51 @@ pub mod platform {
     }
   }
 
-  /// The start stamp of the daemon holding `instance`'s bootstrap object, if one does. The stamp is
-  /// the object's publication word: zero until the daemon has written the header, so a reader that maps
-  /// the object mid-creation sees "not yet", never a torn header.
-  fn generation_of(instance: &str) -> Option<u64> {
-    let handoff = SharedObject::handoff_for_name(&rendezvous_name(instance))?;
-    let object = SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words()).ok()?;
-    published(&object).ok().flatten()
+  /// What one look at an instance's bootstrap object found of its daemon (main 01a20182's ruling of 2026-11-25).
+  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+  pub(super) enum Stamp {
+    /// The start stamp of the daemon holding it.
+    Found(u64),
+    /// No daemon holds it: no object under the name, a header not yet published, or one that is not ours.
+    Gone,
+    /// The look could not tell: the object's open refused for another cause (this process short of descriptors,
+    /// `EMFILE`; the system's table full). It decides nothing.
+    Unknown,
   }
+
+  /// The start stamp of the daemon holding `instance`'s bootstrap object ([`Stamp`]). The stamp is the object's
+  /// publication word: zero until the daemon has written the header, so a reader that maps the object mid-creation sees
+  /// "not yet", never a torn header.
+  fn stamp_of(instance: &str) -> Stamp {
+    let Some(handoff) = SharedObject::handoff_for_name(&rendezvous_name(instance)) else {
+      return Stamp::Unknown;
+    };
+    match SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words()) {
+      Ok(object) => match published(&object) {
+        Ok(Some(generation)) => Stamp::Found(generation),
+        Ok(None) | Err(_) => Stamp::Gone,
+      },
+      Err(refused) => refused_stamp(&refused),
+    }
+  }
+
+  /// What a refused open of the bootstrap object says of its daemon: gone where no object is under the name; otherwise
+  /// nothing ([`Stamp::Unknown`]): a process short of descriptors cannot open a live daemon's object either.
+  fn refused_stamp(refused: &slates_mem::MemError) -> Stamp {
+    match refused {
+      slates_mem::MemError::OsRefused {
+        code: Some(code), ..
+      } if *code == NO_SUCH_OBJECT => Stamp::Gone,
+      _ => Stamp::Unknown,
+    }
+  }
+
+  /// Format: the error a by-name open of an object no one made answers: `ENOENT` (`shm_open`).
+  #[cfg(not(windows))]
+  const NO_SUCH_OBJECT: i32 = libc::ENOENT;
+  /// Format: the error a by-name open of an object no one made answers: `ERROR_FILE_NOT_FOUND` (`OpenFileMappingW`).
+  #[cfg(windows)]
+  const NO_SUCH_OBJECT: i32 = windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND.cast_signed();
 
   /// The object's start stamp once its header is published (`None` before), with the magic checked.
   fn published(object: &SharedObject) -> Result<Option<u64>, IpcError> {
@@ -3612,6 +3662,35 @@ pub mod platform {
     Ok((owned_object(instance)?, owner))
   }
 
+  /// What an owner does with its open of its bootstrap object's name (Windows' [`owned_object`], A-176): a dead owner's
+  /// object found is taken over; none under the name ([`NO_SUCH_OBJECT`]), one is made; any other refusal (access
+  /// denied, an object of the name another made, a size or a layout the open refused, this process short of handles)
+  /// is the open's own refusal, never taken for absence, since an object made over it is not the one its clients map.
+  #[derive(Debug)]
+  #[cfg_attr(not(windows), allow(dead_code))]
+  enum Owning<T> {
+    /// The dead owner's object, to take over.
+    TakeOver(T),
+    /// None under the name: one is made.
+    MakeNew,
+    /// The open's refusal, the caller's to see.
+    Refused(slates_mem::MemError),
+  }
+
+  /// [`Owning`] for `opened`, an open of the bootstrap object's name: a pure decision over the refusal's kind, decided
+  /// and tested on every host; Windows' arm alone takes it, since macOS makes its object new (its create unlinking a
+  /// dead owner's).
+  #[cfg_attr(not(windows), allow(dead_code))]
+  fn owning<T>(opened: Result<T, slates_mem::MemError>) -> Owning<T> {
+    match opened {
+      Ok(left) => Owning::TakeOver(left),
+      Err(slates_mem::MemError::OsRefused {
+        code: Some(code), ..
+      }) if code == NO_SUCH_OBJECT => Owning::MakeNew,
+      Err(refused) => Owning::Refused(refused),
+    }
+  }
+
   /// macOS: the object made new. `SharedObject::create` unlinks the name first, and the object it unlinks is a dead
   /// owner's: this process holds the owner's token, so no live owner holds the object.
   #[cfg(not(windows))]
@@ -3623,23 +3702,27 @@ pub mod platform {
     )?)
   }
 
-  /// Windows: the object a dead owner left while its clients still map it, taken over; else one made new. This
-  /// process holds the owner's token, so no live owner holds the object, and no other owner makes one by its name
-  /// meanwhile.
+  /// Windows: the object a dead owner left while its clients still map it, taken over; one made new only where none is
+  /// under the name, any other refusal of the open answered as itself ([`owning`]). This process holds the owner's
+  /// token, so no live owner holds the object, and no other owner makes one by its name meanwhile.
   #[cfg(windows)]
   fn owned_object(instance: &str) -> Result<SharedObject, IpcError> {
     let handoff =
       SharedObject::handoff_for_name(&rendezvous_name(instance)).ok_or(IpcError::Unsupported {
         feature: "rendezvous by name",
       })?;
-    match SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words()) {
-      Ok(left) => take_over(left),
-      // None to open: one is made. Whatever kept the open from finding one, a creation that fails too says why.
-      Err(_) => initialized(SharedObject::create(
+    match owning(SharedObject::open(
+      &handoff,
+      OBJECT_BYTES,
+      bootstrap_words(),
+    )) {
+      Owning::TakeOver(left) => take_over(left),
+      Owning::MakeNew => initialized(SharedObject::create(
         &rendezvous_name(instance),
         OBJECT_BYTES,
         bootstrap_words(),
       )?),
+      Owning::Refused(refused) => Err(refused.into()),
     }
   }
 
@@ -4045,8 +4128,18 @@ pub mod platform {
       SharedObject::handoff_for_name(&rendezvous_name(instance)).ok_or(IpcError::Unsupported {
         feature: "rendezvous by name",
       })?;
-    let object = SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words())
-      .map_err(|_| unavailable("the rendezvous object is not there (no daemon has created it)"))?;
+    // Only no object under the name is no daemon; any other refusal (this process short of descriptors) is the refusal
+    // itself, never "no daemon", which a caller might answer by starting a second one (main 01a20182's sweep of
+    // 2026-11-25 on `reap_map`'s starved hand-off).
+    let object =
+      SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words()).map_err(|refused| {
+        match refused_stamp(&refused) {
+          Stamp::Gone => {
+            unavailable("the rendezvous object is not there (no daemon has created it)")
+          }
+          Stamp::Found(_) | Stamp::Unknown => IpcError::from(refused),
+        }
+      })?;
     published(&object)?
       .ok_or_else(|| unavailable("the daemon has not yet published its rendezvous object"))?;
     Ok((handoff, object))
@@ -4620,6 +4713,78 @@ pub mod platform {
 
     use super::*;
     use crate::region::RegionGeometry;
+
+    /// Main 01a20182's ruling of 2026-11-25 (`reap_map`'s starved hand-off: a client capped at its lowest free
+    /// descriptor judged its live daemon gone at its 2 s reply deadline, its stamp look's `shm_open` refused `EMFILE`,
+    /// errno 24, logged in the starved role). Do: read a refused open of the bootstrap object refused for want of a
+    /// descriptor, for a full system table, and for no object under the name. Expect: the first two say nothing
+    /// (`Unknown`), the third says gone. Red before: every refused open read as gone.
+    #[test]
+    fn a_stamp_look_refused_for_want_of_a_descriptor_is_no_departure() {
+      let refused = |code| slates_mem::MemError::OsRefused {
+        call: "shm_open",
+        code: Some(code),
+      };
+      #[cfg(not(windows))]
+      let (out_of_descriptors, table_full) = (libc::EMFILE, libc::ENFILE);
+      #[cfg(windows)]
+      let (out_of_descriptors, table_full) = (
+        windows_sys::Win32::Foundation::ERROR_TOO_MANY_OPEN_FILES.cast_signed(),
+        windows_sys::Win32::Foundation::ERROR_NOT_ENOUGH_MEMORY.cast_signed(),
+      );
+      assert_eq!(refused_stamp(&refused(out_of_descriptors)), Stamp::Unknown);
+      assert_eq!(refused_stamp(&refused(table_full)), Stamp::Unknown);
+      assert_eq!(refused_stamp(&refused(NO_SUCH_OBJECT)), Stamp::Gone);
+    }
+
+    /// Main 01a20182's order of 2026-11-26 (Windows' `owned_object` made a new bootstrap object over any refused open).
+    /// Do: decide an owner's open of its bootstrap object's name ([`owning`]) found, refused for no object under the
+    /// name, and refused for access denied, for want of a handle, by the OS with no code, for a size past the object
+    /// and for a layout. Expect: found taken over; no object made new; every other refusal answered as itself, none
+    /// made new. Red before: every refused open made a new object over the name.
+    #[test]
+    fn an_owners_open_makes_a_new_object_only_where_none_is_under_the_name() {
+      let refused = |code| slates_mem::MemError::OsRefused {
+        call: "open",
+        code: Some(code),
+      };
+      #[cfg(not(windows))]
+      let (denied, out_of_handles) = (libc::EACCES, libc::EMFILE);
+      #[cfg(windows)]
+      let (denied, out_of_handles) = (
+        windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED.cast_signed(),
+        windows_sys::Win32::Foundation::ERROR_TOO_MANY_OPEN_FILES.cast_signed(),
+      );
+      assert!(matches!(owning(Ok(7u8)), Owning::TakeOver(7)));
+      assert!(matches!(
+        owning::<u8>(Err(refused(NO_SUCH_OBJECT))),
+        Owning::MakeNew
+      ));
+      let others = [
+        refused(denied),
+        refused(out_of_handles),
+        slates_mem::MemError::OsRefused {
+          call: "open",
+          code: None,
+        },
+        slates_mem::MemError::OutOfRange {
+          offset: OBJECT_BYTES,
+          len: 0,
+        },
+        slates_mem::MemError::LayoutRefused {
+          offset: 0,
+          len: 8,
+          reason: slates_mem::LayoutRefusal::Overlap,
+        },
+      ];
+      for other in others {
+        let shown = format!("{other:?}");
+        assert!(
+          matches!(owning::<u8>(Err(other)), Owning::Refused(_)),
+          "{shown} made a new object"
+        );
+      }
+    }
 
     fn instance(tag: &str) -> String {
       format!("rdv-{tag}-{}", std::process::id())

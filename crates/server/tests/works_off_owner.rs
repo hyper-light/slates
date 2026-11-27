@@ -1771,3 +1771,8 @@ fn a_resolution_the_owner_composed_leaves_the_work_its_entries() {
     "the submit asked the owner for no file's bytes"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

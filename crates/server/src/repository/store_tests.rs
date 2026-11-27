@@ -1260,11 +1260,65 @@ fn checkpoint_named_now(daemon: &Daemon, repository: RepositoryId, head: u64) ->
   })
 }
 
+/// How the image a restart would restore now holds repository `repository`'s green's checkpoint-named texts, read from
+/// the image's own entries (the shard's committed journal, `verbs::committed_held`, whose Aways family names each text
+/// let go, `content_holder::aways_among`): (held whole, held Away). A stop publishes nothing (§4.8: "the daemon stopped
+/// with nothing more published"), so read just before one, it is what the successor restores. None for no green, no
+/// checkpoint or no journal.
+fn image_split(daemon: &Daemon, repository: RepositoryId) -> Option<(u64, u64)> {
+  crate::daemon::observe_first(daemon, move |state| {
+    let green = super::svn_commit::green_of(state, repository).ok()?;
+    let (_, named) = state.db.partition().green_checkpoint(green)?;
+    let bytes = crate::merge_service::checkpoint_bytes(state, green, &named)?;
+    let checkpoint = slates_merge::checkpoint::Checkpoint::decode(&bytes).ok()?;
+    let named: std::collections::BTreeSet<[u8; 32]> = checkpoint
+      .named
+      .iter()
+      .map(|file| file.identity.hash)
+      .collect();
+    let held = crate::verbs::committed_held(state)?;
+    let away: std::collections::BTreeSet<[u8; 32]> =
+      crate::content_holder::aways_among(&crate::content_holder::paged_entries_of(&held))
+        .into_iter()
+        .map(|window| window.0)
+        .collect();
+    let away = u64::try_from(named.intersection(&away).count()).ok()?;
+    let whole = u64::try_from(named.len()).ok()?.checked_sub(away)?;
+    Some((whole, away))
+  })
+}
+
+/// What the shard holds of repository `repository`'s green's named texts now, so a restart's failure says which side of
+/// its stop lost them (main 01a20182's loaded loop of 2026-11-25, run 6 of 7: all three brought back, none found whole):
+/// the named texts it lacks whole (`svn_texts::named_lacking`), the landed texts' bytes it has let go, and the windows a
+/// reader and a home kept from a let-go. None for no green.
+fn held_named(daemon: &Daemon, repository: RepositoryId) -> Option<(usize, u64, u64, u64)> {
+  crate::daemon::observe_first(daemon, move |state| {
+    use crate::vcs_store::name_holds::{
+      LANDED_TEXT_LET_GO_BYTES, LANDED_TEXT_PINNED_HOMES, LANDED_TEXT_PINNED_READER,
+    };
+    let green = super::svn_commit::green_of(state, repository).ok()?;
+    let lacking = crate::vcs_store::svn_texts::named_lacking(state, green).len();
+    let count = |name| state.refusals.get(name).copied().unwrap_or(0);
+    Some((
+      lacking,
+      count(LANDED_TEXT_LET_GO_BYTES),
+      count(LANDED_TEXT_PINNED_READER),
+      count(LANDED_TEXT_PINNED_HOMES),
+    ))
+  })
+}
+
 /// A-760's pre-pass on the cold path alone (main 01a20182's ruling of 2026-11-22 ~11:35), with A-869's checkpoint naming
-/// its files. Do: import `full.dump` whole on a daemon holding a store; wait for the batch's checkpoint at its head and
-/// count the objects it names; stop the daemon and the store's owner, start both again, read the history. Expect: the batch's checkpoint covers
-/// every entry, so what is brought back is the texts the checkpoint names and nothing for an entry (before A-869 the
-/// checkpoint carried their bytes, and nothing was brought); some named; the history `full.dump` byte for byte.
+/// its files, judged by the image the restart restores (main's ruling of 2026-11-25 on the loaded loop's run 6 of 7). Do:
+/// import `full.dump` whole on a daemon holding a store; wait for the batch's checkpoint at its head and count the
+/// objects it names; read, just before the stop, what the shard holds of them and how the image a restart would restore
+/// holds them; stop the daemon and the store's owner, start both again, read the history. Expect: the batch's checkpoint
+/// covers every entry, so what the recovery accounts for is the texts the checkpoint names; each named text the image
+/// holds whole is found whole (held by the content handoff and checked by identity), and each it holds Away is brought
+/// back: a stop is promised no current image (§4.8), and the import lets each landed text go once its changeset is
+/// durable, so either may hold. After the replay no named text keeps a window (main's ruling (B)), those found whole let
+/// go by the successor. The history `full.dump` byte for byte.
 #[test]
 fn a_cleanly_restarted_import_brings_back_only_its_checkpoints_named_texts() {
   use crate::vcs_store::svn_import::tests::{FULL, FULL_LAST, history, imported};
@@ -1286,22 +1340,49 @@ fn a_cleanly_restarted_import_brings_back_only_its_checkpoints_named_texts() {
   );
   assert_eq!(loaded, Ok(FULL_LAST));
   let named = checkpoint_named(&daemon, repository, FULL_LAST);
+  let before_stop = held_named(&daemon, repository);
+  let image = image_split(&daemon, repository);
   daemon.stop();
   store.restart_owner();
   let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
   let brought = brought_back(&daemon);
+  let after_replay = held_named(&daemon, repository);
   let exported = crate::test_store::run_on_first(
     &daemon,
     move || history(repository),
     std::time::Duration::from_secs(60),
   );
   daemon.stop();
+  let (fetched, found) = brought;
+  // Which branch this run took: every run shows it.
+  eprintln!(
+    "clean restart: {named} named; brought back {fetched}, found whole {found}; the restored image (whole, Away) \
+     {image:?}; before the stop (lacking, let go bytes, kept by a reader, by a home) {before_stop:?}; after the replay \
+     {after_replay:?}"
+  );
   assert!(named > 0, "the checkpoint names no file");
-  // A clean stop's image restores every text the checkpoint names whole: none is brought back, each is found whole.
   assert_eq!(
-    brought,
-    (0, named),
-    "named texts brought back, found whole: the checkpoint's"
+    fetched.saturating_add(found),
+    named,
+    "every named text accounted for once"
+  );
+  // Found whole is what the image held whole, brought back what it held Away, both from the image's own entries.
+  assert_eq!(
+    image,
+    Some((found, fetched)),
+    "the restored image's (whole, Away) against what the recovery found whole and brought back"
+  );
+  // Converged: after the replay no named text keeps a window (main's ruling (B): a landed text's bytes are the node's
+  // store's), whether the predecessor had let it go before the stop or the successor found it whole and let it go.
+  let (lacking, let_go, ..) = after_replay.expect("the green after the replay");
+  assert_eq!(
+    u64::try_from(lacking).unwrap(),
+    named,
+    "named texts lacking a window after the replay"
+  );
+  assert!(
+    found == 0 || let_go > 0,
+    "found whole, and the successor let nothing go: {after_replay:?}"
   );
   assert!(exported == Some((FULL_LAST, FULL.to_vec())), "full.dump");
 }

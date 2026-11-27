@@ -94,7 +94,7 @@ pub(crate) struct Importing {
   /// done, refused or abandoned.
   reserved: u64,
   /// The segments of its changegroup cut and not yet landed on the changeset store (A-767 C1 step 3), oldest first: a
-  /// turn's, landed before the next turn ([`segment_changeset`], [`segment_landed`]).
+  /// turn's, landed before the next turn ([`next_segment`], [`segment_landed`]).
   segments: std::collections::VecDeque<slates_hg::import::emit::Segment>,
   /// Each segment handed to the store to land and not yet landed, oldest first: its file revisions' contents, let go of
   /// the content store once it is durable (A-767 C1 step 2b, [`segment_landed`]).
@@ -403,39 +403,47 @@ pub(crate) type SegmentLanding = (
   [u8; 32],
 );
 
-/// The next segment of repository `id`'s import to land on the changeset store as a changeset (A-767 C1 step 3): its
-/// sequence the repository's next, its sections its `Record` (the index rows of its revisions, by identity), its
-/// `Payload` (its slice of the import's changegroup, moved in, never copied) and its `Texts` (each revision's text,
-/// its delta parent's and the delta's place); none when no segment waits, or no store is held.
-pub(crate) fn segment_changeset(
+/// The next segment of repository `id`'s import to land on the changeset store (A-767 C1 step 3), taken from the queue,
+/// its file revisions moved to the landings awaited ([`segment_landed`] lets them go); none when no segment waits, or
+/// no store is held. Its payload is then made into chunks ([`segment_parts`]).
+fn next_segment(
   state: &mut ShardState,
   id: RepositoryId,
-) -> Option<SegmentLanding> {
+) -> Option<(
+  slates_store::owner::StoreHandle,
+  slates_hg::import::emit::Segment,
+)> {
   let disk = state.vcs_disk.clone()?;
   let importing = state.vcs_stores.imports.get_mut(&id)?;
   let mut segment = importing.segments.pop_front()?;
   importing
     .landing
     .push_back(core::mem::take(&mut segment.contents));
+  Some((disk, segment))
+}
+
+/// `segment` of repository `id`'s import as a changeset at the repository's next sequence: its `Record` (the index rows
+/// of its revisions, by identity, which never read the payload), its `Payload` its revisions' deltas as stock's revlog
+/// chunks (`chunks`, made a turn's steps at a time as a push's segment's are; goal 93, main's ruling (b)) and its
+/// `Texts` each revision's text, its delta parent's and its chunk's place, held as a chunk there. Until 2026-11-25 the
+/// payload was the changegroup's slice, raw, so a stream compressed an imported repository at stream time. None where
+/// the chunks are not one a revision.
+fn segment_parts(
+  state: &mut ShardState,
+  id: RepositoryId,
+  (disk, segment): (
+    slates_store::owner::StoreHandle,
+    slates_hg::import::emit::Segment,
+  ),
+  (chunks, places): crate::repository::hg_run::Chunks,
+) -> Option<SegmentLanding> {
+  if places.len() != segment.texts.len() {
+    return None;
+  }
   let sequence = state.vcs_stores.next_changeset(id)?;
-  let payload_identity = *blake3::hash(&segment.payload).as_bytes();
-  let texts: Vec<slates_store::texts::TextEntry> = segment
-    .texts
-    .iter()
-    .map(|kept| slates_store::texts::TextEntry {
-      path: kept.path.clone(),
-      tool_id: kept.node.to_vec(),
-      text: kept.identity,
-      len: kept.len,
-      base: kept.base,
-      place: slates_store::texts::Place {
-        payload: payload_identity,
-        offset: kept.place.start,
-        len: kept.place.end.saturating_sub(kept.place.start),
-      },
-      form: slates_store::texts::Form::Raw,
-    })
-    .collect();
+  let payload_identity = *blake3::hash(&chunks).as_bytes();
+  let texts =
+    crate::repository::hg_run::texts_section(&segment.texts, (payload_identity, Some(&places)));
   let header = slates_store::log::Header {
     tool: slates_store::log::Tool::Mercurial,
     repository: u128::from_be_bytes(id.bytes),
@@ -449,13 +457,23 @@ pub(crate) fn segment_changeset(
   };
   let parts = vec![
     (slates_store::log::SectionKind::Record, segment.record),
-    (slates_store::log::SectionKind::Payload, segment.payload),
-    (
-      slates_store::log::SectionKind::Texts,
-      slates_store::texts::encode(&texts),
-    ),
+    (slates_store::log::SectionKind::Payload, chunks),
+    (slates_store::log::SectionKind::Texts, texts),
   ];
   Some((disk, header, parts, payload_identity))
+}
+
+/// The next segment of repository `id`'s import made into its changeset whole, on a shard a test holds: its payload
+/// chunked in one go ([`crate::repository::hg_push::chunked_whole_counted`]), else as [`landing_begun`] makes it.
+#[cfg(test)]
+pub(crate) fn segment_changeset(
+  state: &mut ShardState,
+  id: RepositoryId,
+) -> Option<SegmentLanding> {
+  let (disk, segment) = next_segment(state, id)?;
+  let chunks =
+    crate::repository::hg_push::chunked_whole_counted(state, (&segment.texts, &segment.payload))?;
+  segment_parts(state, id, (disk, segment), chunks)
 }
 
 /// Repository `id`'s segment changeset `sequence` landed (`landed`) or refused (A-767 C1 step 3): landed, the run grows
@@ -506,19 +524,42 @@ pub(crate) const FILE_TEXT_BYTES_LET_GO: &str = "vcs_store.hg_import.file_text_b
 /// counter name.
 pub(crate) const FILE_TEXTS_PINNED: &str = "vcs_store.hg_import.file_texts_pinned";
 
-/// [`land`] for a test that holds the shard's state: the segments its import cut landed first
-/// ([`land_segments_blocking`]), as [`run`] lands them between turns.
+/// [`land`] from a test's task on the shard, once its import is done: the segments the import cut landed on the node's
+/// store a segment at a time, each awaited (`StoreHandle::land`) and counted ([`segment_landed`]), as [`run`] lands
+/// them between turns; its bookmark works built a unit a turn ([`built_works`]); then landed, its revisions let go at
+/// once. The shard is never held through a commit or a read of the store.
 #[cfg(test)]
-pub(crate) fn land_imported(state: &mut ShardState, id: RepositoryId) -> Result<(), ImportFailed> {
-  land_segments_blocking(state, id)?;
-  built_works_whole(state, id)?;
-  // A test holds the shard's state through its landing: its revisions let go at once.
-  let contents = land(state, id)?;
-  let (freed, pinned) = crate::repository::hg_run::let_go_windows(state, Some(id), &contents);
-  state.count(FILE_TEXT_BYTES_LET_GO, freed);
-  state.count(FILE_TEXTS_PINNED, pinned);
-  Ok(())
+pub(crate) async fn land_imported_awaited(id: RepositoryId) -> Result<(), ImportFailed> {
+  let gone = || ImportFailed::Landing(Refusal::ContentUnavailable);
+  while let Some((disk, header, parts, identity)) =
+    crate::state::with_state(|state| segment_changeset(state, id)).ok_or_else(gone)?
+  {
+    let sequence = header.sequence;
+    let sections = crate::repository::hg_run::section_bytes(&parts);
+    let landed = disk.land(header, parts).await.is_ok();
+    crate::state::with_state(|state| {
+      if landed {
+        crate::repository::hg_run::count_landed(state, sections);
+      }
+      segment_landed(state, id, (sequence, identity), landed)
+    })
+    .ok_or_else(gone)??;
+  }
+  built_works(id).await.ok_or_else(gone)??;
+  crate::state::with_state(|state| {
+    let contents = land(state, id)?;
+    let (freed, pinned) = crate::repository::hg_run::let_go_windows(state, Some(id), &contents);
+    state.count(FILE_TEXT_BYTES_LET_GO, freed);
+    state.count(FILE_TEXTS_PINNED, pinned);
+    Ok(())
+  })
+  .ok_or_else(gone)?
 }
+
+/// Shape: how long [`land_imported_on`] waits for its landing's task: far past a debug build's landing of a test's
+/// fixture (milliseconds), so only one that never ends reaches it.
+#[cfg(test)]
+const LAND_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Notes a landed import's file revisions `contents` for a home and lets them go, a turn at a time, once its landing is
 /// durable (`repository::import`'s answer): its counters.
@@ -534,49 +575,20 @@ pub(crate) async fn let_go_landed_import(
   .await;
 }
 
-/// [`land_imported`] for a test whose own thread waits on the node's store, never `daemon`'s shard of partition
-/// `partition`: each segment the import cut is taken in one observation, landed from this thread
-/// (`crate::test_store::land_blocking`) and counted in the next, as [`run`] lands them between turns; then the import is
-/// landed in one more. A history that held the shard through a segment's commit outlasted the watchdog's window on a slow
-/// `fdatasync` (docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md).
+/// [`land_imported_awaited`] run as a task on `daemon`'s shard of partition `partition`, for a test on its own thread:
+/// that thread waits, never the shard (docs/bugs/2026-11-24-a-test-creation-held-its-shard-through-the-stores-commit.md).
 #[cfg(test)]
 pub(crate) fn land_imported_on(
   daemon: &crate::Daemon,
   partition: usize,
   id: RepositoryId,
 ) -> Result<(), ImportFailed> {
-  while let Some((disk, header, parts, identity)) =
-    crate::daemon::observe_at(daemon, partition, move |state| segment_changeset(state, id))
-  {
-    let sequence = header.sequence;
-    let landed = crate::test_store::land_blocking(disk, header, parts);
-    crate::daemon::observe_at(daemon, partition, move |state| {
-      segment_landed(state, id, (sequence, identity), landed)
-    })?;
-  }
-  crate::daemon::observe_at(daemon, partition, move |state| {
-    built_works_whole(state, id)?;
-    let contents = land(state, id)?;
-    let (freed, pinned) = crate::repository::hg_run::let_go_windows(state, Some(id), &contents);
-    state.count(FILE_TEXT_BYTES_LET_GO, freed);
-    state.count(FILE_TEXTS_PINNED, pinned);
-    Ok(())
-  })
-}
-
-/// Every segment repository `id`'s import has cut, landed on the changeset store, waiting on a thread of its own for
-/// each (`crate::test_store::land_blocking`): [`run`]'s landing for a test that holds the shard's state.
-#[cfg(test)]
-pub(crate) fn land_segments_blocking(
-  state: &mut ShardState,
-  id: RepositoryId,
-) -> Result<(), ImportFailed> {
-  while let Some((disk, header, parts, identity)) = segment_changeset(state, id) {
-    let sequence = header.sequence;
-    let landed = crate::test_store::land_blocking(disk, header, parts);
-    segment_landed(state, id, (sequence, identity), landed)?;
-  }
-  Ok(())
+  crate::test_store::run_at(
+    daemon,
+    partition,
+    move || async move { land_imported_awaited(id).await },
+    LAND_PATIENCE,
+  )
 }
 
 /// One turn of repository `id`'s import over the map, lent every byte the shard could admit now, then the arena grown
@@ -1233,77 +1245,6 @@ fn keep_work(
   }
 }
 
-/// Repository `id`'s done import's bookmark works built whole, for a test that holds the shard's state and lands it in
-/// one call ([`land_imported`]): [`built_works`]' units at once, a text not at hand read from the node's changeset store
-/// on a thread of its own (`test_store::answer_wants_blocking`) and brought back.
-#[cfg(test)]
-fn built_works_whole(state: &mut ShardState, id: RepositoryId) -> Result<(), ImportFailed> {
-  let unavailable = || ImportFailed::Landing(Refusal::ContentUnavailable);
-  let Some(wanted) = wanted_works(state, id) else {
-    return Ok(());
-  };
-  let verified = Verified::default();
-  let mut admission = Admission::new(wanted.room);
-  for (mark, node) in &wanted.marks {
-    let moved = Move {
-      name: wanted.name,
-      base_version: wanted.version,
-      base: wanted.head.as_ref(),
-      head: node,
-    };
-    let begun = super::lent_state(state, |state| {
-      let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
-      done_held(state, id, |held| {
-        tree::begin_work(
-          &moved,
-          (&verified, held),
-          (admission.left(), pace),
-          &mut admission,
-        )
-      })
-    })
-    .ok_or_else(unavailable)?;
-    let mut building =
-      begun.map_err(|refused| ImportFailed::Landing(work_refused(&refused, wanted.room)))?;
-    loop {
-      // Whole: every unit at once, a text not at hand read from the store on a thread of its own and brought back.
-      building.pace().turn(u64::MAX);
-      let advanced = super::lent_state(state, |state| {
-        let engine = state.greens.get(&wanted.root)?;
-        done_held(state, id, |held| {
-          building.advance(&engine, (&verified, held))
-        })
-      })
-      .ok_or_else(unavailable)?;
-      match advanced {
-        None if building.ask_waited(admission.left()) => {
-          let disk = state.vcs_disk.clone().ok_or_else(unavailable)?;
-          if !crate::test_store::answer_wants_blocking(
-            &disk,
-            u128::from_be_bytes(id.bytes),
-            &mut building,
-          ) {
-            return Err(unavailable());
-          }
-          brought_back(state, id, &mut building).ok_or_else(unavailable)?;
-        }
-        None => {}
-        Some(Ok(built)) => {
-          admission
-            .charge(u64::try_from(built.increment.post_state.len()).unwrap_or(u64::MAX))
-            .map_err(|_| ImportFailed::Landing(past_room(wanted.room)))?;
-          keep_work(state, id, mark.clone(), built.increment);
-          break;
-        }
-        Some(Err(refused)) => {
-          return Err(ImportFailed::Landing(work_refused(&refused, wanted.room)));
-        }
-      }
-    }
-  }
-  Ok(())
-}
-
 /// `ImportRefused { PastRoom }` naming the import's room.
 fn past_room(room: u64) -> Refusal {
   Refusal::ImportRefused {
@@ -1356,18 +1297,38 @@ pub(crate) struct SegmentInFlight {
   identity: [u8; 32],
   /// When it was asked, on the shard's clock.
   began: u64,
+  /// Its bytes by section, counted once it lands.
+  sections: crate::repository::hg_run::SectionBytes,
 }
 
-/// Repository `id`'s next segment cut and not yet handed to the store, its landing begun; none where it has none, and
-/// `None` when the shard's state is gone.
-fn landing_begun(id: RepositoryId) -> Option<Option<SegmentInFlight>> {
-  let next = crate::state::with_state(|state| segment_changeset(state, id))?;
-  Some(next.map(|(disk, header, parts, identity)| SegmentInFlight {
+/// Repository `id`'s next segment cut and not yet handed to the store, its payload made into chunks a turn's steps at a
+/// time ([`crate::repository::hg_push::chunked_paced`]) and its landing begun; none where it has none; refused, as a
+/// landing the store refused is ([`segment_landed`]), where its chunks could not be made. `None` when the shard's state
+/// is gone.
+async fn landing_begun(id: RepositoryId) -> Option<Result<Option<SegmentInFlight>, ImportFailed>> {
+  let Some((disk, segment)) = crate::state::with_state(|state| next_segment(state, id))? else {
+    return Some(Ok(None));
+  };
+  let mut costs = super::TurnCosts::ZERO;
+  let chunks =
+    crate::repository::hg_push::chunked_paced((&segment.texts, &segment.payload), &mut costs)
+      .await?;
+  let landing = crate::state::with_state(|state| match chunks {
+    Some(chunks) => segment_parts(state, id, (disk, segment), chunks).ok_or(()),
+    None => Err(()),
+  })?;
+  let Ok((disk, header, parts, identity)) = landing else {
+    return crate::state::with_state(|state| {
+      segment_landed(state, id, (0, [0; 32]), false).map(|()| None)
+    });
+  };
+  Some(Ok(Some(SegmentInFlight {
     sequence: header.sequence,
     identity,
     began: slates_rt::futures::now_ns(),
+    sections: crate::repository::hg_run::section_bytes(&parts),
     answer: Box::pin(async move { disk.land(header, parts).await.is_ok() }),
-  }))
+  })))
 }
 
 /// `landing` answered `landed` (`segment_landed`): its time counted, and the time the import was held waiting for it,
@@ -1386,6 +1347,9 @@ fn landing_settled(
         state.count_max(SEGMENT_LAND_WAIT_MAX_NS, waited);
       }
       None => state.count(SEGMENTS_LANDED_OVERLAPPED, 1),
+    }
+    if landed {
+      crate::repository::hg_run::count_landed(state, landing.sections);
     }
     segment_landed(state, id, (landing.sequence, landing.identity), landed)
   })
@@ -1451,9 +1415,10 @@ async fn segments_handed(
     if let Err(failed) = landed_in_flight(id, flight).await? {
       return Some(Err(failed));
     }
-    match landing_begun(id)? {
-      Some(landing) => *flight = Some(landing),
-      None => return Some(Ok(())),
+    match landing_begun(id).await? {
+      Ok(Some(landing)) => *flight = Some(landing),
+      Ok(None) => return Some(Ok(())),
+      Err(failed) => return Some(Err(failed)),
     }
   }
 }

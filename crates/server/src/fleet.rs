@@ -1923,6 +1923,11 @@ async fn serve_peer_records(
             crate::takeover::serve_ledger_prepare(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
+          // A peer's version-control edges, held only where they name its authenticated anchor (A-925).
+          crate::edges::EDGES_STREAM => {
+            state::with_state(|s| crate::edges::serve_edges(s, peer_anchor, &request))
+              .unwrap_or_default()
+          }
           // A current candidate reads a register's ledger it lacks (A-919).
           crate::ledger_read::LEDGER_READ_STREAM => state::with_state(|s| {
             let peer_host = s
@@ -12805,7 +12810,7 @@ mod request_kind_tests {
   /// took none of it (2026-11-17, g230).
   #[test]
   fn every_request_kind_the_record_session_dispatches_is_its_own() {
-    let kinds: [(&str, u64); 28] = [
+    let kinds: [(&str, u64); 30] = [
       ("record", slates_cluster::RECORD_STREAM),
       (
         "content offer",
@@ -12843,6 +12848,8 @@ mod request_kind_tests {
       ("ledger promote", slates_cluster::LEDGER_PROMOTE_STREAM),
       ("takeover ledger", crate::takeover::TAKEOVER_LEDGER_STREAM),
       ("move", crate::moves::MOVE_STREAM),
+      ("ledger read", crate::ledger_read::LEDGER_READ_STREAM),
+      ("edges", crate::edges::EDGES_STREAM),
     ];
     let mut shared = Vec::new();
     for (at, (name, kind)) in kinds.iter().enumerate() {
@@ -14153,45 +14160,34 @@ mod state_log_tests {
     }
   }
 
-  /// A repository `name` made on `state`'s shard with its default branch `main`, and a branch `topic` of it: its id.
-  fn repository_and_branch(state: &mut ShardState, name: &str) -> RepositoryId {
-    let created = crate::test_store::create(
-      state,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: name.to_owned(),
-        tool: VcsTool::Git,
-        format: ObjectFormat::Sha1,
-        default_branch: "main".to_owned(),
-        green: None,
-      },
-    );
-    assert!(
-      matches!(created, ReplyBody::GreenCreated { .. }),
-      "{created:?}"
-    );
-    let branched = crate::verbs::dispatch(
-      state,
-      1,
-      &owner(),
-      RequestBody::CreateBranch {
-        repository: name.to_owned(),
-        name: "topic".to_owned(),
-        from: "main".to_owned(),
-        version: None,
-      },
-    );
+  /// `step` on the running shard's state.
+  fn on<T>(step: impl FnOnce(&mut ShardState) -> T) -> T {
+    crate::state::with_state(step).expect("the shard's state")
+  }
+
+  /// A repository `name` made on the running shard with its default branch `main`, as a client's creation is made, the
+  /// task awaiting its record (`test_store::created`), and a branch `topic` of it: its id.
+  async fn repository_and_branch(name: &str) -> RepositoryId {
+    let (repo, _) =
+      crate::test_store::created(&owner(), (name, VcsTool::Git, ObjectFormat::Sha1, "main")).await;
+    let branched = on(|state| {
+      crate::verbs::dispatch(
+        state,
+        1,
+        &owner(),
+        RequestBody::CreateBranch {
+          repository: name.to_owned(),
+          name: "topic".to_owned(),
+          from: "main".to_owned(),
+          version: None,
+        },
+      )
+    });
     assert!(
       matches!(branched, ReplyBody::GreenCreated { .. }),
       "{branched:?}"
     );
-    state
-      .db
-      .partition()
-      .repositories()
-      .repository_named(name)
-      .map(|record| record.id)
-      .unwrap()
+    repo
   }
 
   /// A-636 part 2b. Do: on an owner shard in a region of three at `f = 1`, create a repository and a branch of it, ask
@@ -14203,68 +14199,70 @@ mod state_log_tests {
   /// hold it, the second still owed to both; and no acknowledgement of a part kept as a head's placement.
   #[test]
   fn an_owners_state_log_records_are_owed_to_the_repositorys_candidates_in_order() {
-    crate::test_store::audit_on_stored_shard("fleet-state-log", |state| {
-      let (local, [b, c]) = region_of_three(state);
-      let repo = repository_and_branch(state, "shipped");
-      crate::state_log::take_made(state);
-      let register = LogName::State {
-        repository: repo,
-        log: StateLog::Names,
-      }
-      .register();
-      let config = state.fleet.configuration().clone();
-      let owed = super::owed_state_log_parts(state, &config, local);
-      let candidates = config.place(ObjectId(repo.bytes)).candidates;
-      assert_eq!(candidates.len(), 3, "{candidates:?}");
-      let parts: Vec<(ObjectId, u64, u64, Vec<HostId>)> = owed
-        .iter()
-        .map(|head| {
-          let part = crate::state_log::record_of(&head.record.value).unwrap();
-          assert_eq!(head.shape.candidates, candidates);
-          assert_eq!(
-            head.record.sequence, part.to,
-            "a part sits at the position it leaves"
-          );
-          (head.object, part.from, part.to, head.acked.clone())
-        })
-        .collect();
-      assert_eq!(
-        parts,
-        vec![(register, 0, 2, Vec::new()), (register, 2, 4, Vec::new())]
-      );
-      let placement = Placement {
-        acked: vec![local, b],
-        ..config.place(register)
-      };
-      super::record_acks_in(state, register, 2, FIRST_EPOCH, placement.clone());
-      let owed = super::owed_state_log_parts(state, &config, local);
-      let holding = |acked: &[HostId]| {
-        let mut acked = acked.to_vec();
-        acked.sort_unstable();
-        acked
-      };
-      assert_eq!(
-        owed
+    crate::test_store::run_on_stored_shard(|| async move {
+      let (local, [b, c]) = on(region_of_three);
+      let repo = repository_and_branch("shipped").await;
+      on(move |state| {
+        crate::state_log::take_made(state);
+        let register = LogName::State {
+          repository: repo,
+          log: StateLog::Names,
+        }
+        .register();
+        let config = state.fleet.configuration().clone();
+        let owed = super::owed_state_log_parts(state, &config, local);
+        let candidates = config.place(ObjectId(repo.bytes)).candidates;
+        assert_eq!(candidates.len(), 3, "{candidates:?}");
+        let parts: Vec<(ObjectId, u64, u64, Vec<HostId>)> = owed
           .iter()
-          .map(|head| (head.record.sequence, holding(&head.acked)))
-          .collect::<Vec<_>>(),
-        vec![(2, holding(&[local, b])), (4, Vec::new())],
-        "the owner's own hold and b's"
-      );
-      let placement = Placement {
-        acked: vec![c],
-        ..placement
-      };
-      super::record_acks_in(state, register, 2, FIRST_EPOCH, placement);
-      let owed = super::owed_state_log_parts(state, &config, local);
-      assert_eq!(
-        owed
-          .iter()
-          .map(|head| head.record.sequence)
-          .collect::<Vec<_>>(),
-        vec![4]
-      );
-      assert!(!state.placed_heads.contains_key(&register));
+          .map(|head| {
+            let part = crate::state_log::record_of(&head.record.value).unwrap();
+            assert_eq!(head.shape.candidates, candidates);
+            assert_eq!(
+              head.record.sequence, part.to,
+              "a part sits at the position it leaves"
+            );
+            (head.object, part.from, part.to, head.acked.clone())
+          })
+          .collect();
+        assert_eq!(
+          parts,
+          vec![(register, 0, 2, Vec::new()), (register, 2, 4, Vec::new())]
+        );
+        let placement = Placement {
+          acked: vec![local, b],
+          ..config.place(register)
+        };
+        super::record_acks_in(state, register, 2, FIRST_EPOCH, placement.clone());
+        let owed = super::owed_state_log_parts(state, &config, local);
+        let holding = |acked: &[HostId]| {
+          let mut acked = acked.to_vec();
+          acked.sort_unstable();
+          acked
+        };
+        assert_eq!(
+          owed
+            .iter()
+            .map(|head| (head.record.sequence, holding(&head.acked)))
+            .collect::<Vec<_>>(),
+          vec![(2, holding(&[local, b])), (4, Vec::new())],
+          "the owner's own hold and b's"
+        );
+        let placement = Placement {
+          acked: vec![c],
+          ..placement
+        };
+        super::record_acks_in(state, register, 2, FIRST_EPOCH, placement);
+        let owed = super::owed_state_log_parts(state, &config, local);
+        assert_eq!(
+          owed
+            .iter()
+            .map(|head| head.record.sequence)
+            .collect::<Vec<_>>(),
+          vec![4]
+        );
+        assert!(!state.placed_heads.contains_key(&register));
+      });
     });
   }
 
@@ -14276,66 +14274,68 @@ mod state_log_tests {
   /// the retire, the record owed again at 6 to both.
   #[test]
   fn an_owners_repository_record_is_owed_to_its_familys_candidates_at_each_change() {
-    crate::test_store::audit_on_stored_shard("fleet-state-log", |state| {
-      let (local, [b, c]) = region_of_three(state);
-      let repo = repository_and_branch(state, "recorded");
-      let object = ObjectId(repo.bytes);
-      let config = state.fleet.configuration().clone();
-      let owed_now = |state: &ShardState| {
-        super::owed_repositories(state, &config, local)
+    crate::test_store::run_on_stored_shard(|| async move {
+      let (local, [b, c]) = on(region_of_three);
+      let repo = repository_and_branch("recorded").await;
+      on(move |state| {
+        let object = ObjectId(repo.bytes);
+        let config = state.fleet.configuration().clone();
+        let owed_now = |state: &ShardState| {
+          super::owed_repositories(state, &config, local)
+            .into_iter()
+            .map(|head| {
+              (
+                head.object,
+                head.record.sequence,
+                head.shape.candidates,
+                head.record.value,
+              )
+            })
+            .collect::<Vec<_>>()
+        };
+        let record = state
+          .db
+          .partition()
+          .repositories()
+          .repository(repo)
+          .cloned()
+          .unwrap();
+        let candidates = config.place(object).candidates;
+        assert_eq!(
+          owed_now(state),
+          vec![(
+            object,
+            5,
+            candidates.clone(),
+            crate::catalog::repository_value(&record)
+          )]
+        );
+        assert_eq!(
+          crate::catalog::repository_of(&crate::catalog::repository_value(&record)),
+          Some(record)
+        );
+        let placement = Placement {
+          acked: vec![local, b, c],
+          ..config.place(object)
+        };
+        super::record_acks_in(state, object, 5, FIRST_EPOCH, placement);
+        assert_eq!(owed_now(state), Vec::new());
+        let retired = crate::verbs::dispatch(
+          state,
+          1,
+          &owner(),
+          RequestBody::RetireBranch {
+            repository: "recorded".to_owned(),
+            name: "topic".to_owned(),
+          },
+        );
+        assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
+        let again: Vec<(u64, Vec<HostId>)> = owed_now(state)
           .into_iter()
-          .map(|head| {
-            (
-              head.object,
-              head.record.sequence,
-              head.shape.candidates,
-              head.record.value,
-            )
-          })
-          .collect::<Vec<_>>()
-      };
-      let record = state
-        .db
-        .partition()
-        .repositories()
-        .repository(repo)
-        .cloned()
-        .unwrap();
-      let candidates = config.place(object).candidates;
-      assert_eq!(
-        owed_now(state),
-        vec![(
-          object,
-          5,
-          candidates.clone(),
-          crate::catalog::repository_value(&record)
-        )]
-      );
-      assert_eq!(
-        crate::catalog::repository_of(&crate::catalog::repository_value(&record)),
-        Some(record)
-      );
-      let placement = Placement {
-        acked: vec![local, b, c],
-        ..config.place(object)
-      };
-      super::record_acks_in(state, object, 5, FIRST_EPOCH, placement);
-      assert_eq!(owed_now(state), Vec::new());
-      let retired = crate::verbs::dispatch(
-        state,
-        1,
-        &owner(),
-        RequestBody::RetireBranch {
-          repository: "recorded".to_owned(),
-          name: "topic".to_owned(),
-        },
-      );
-      assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
-      let again: Vec<(u64, Vec<HostId>)> = owed_now(state)
-        .into_iter()
-        .map(|(_, sequence, candidates, _)| (sequence, candidates))
-        .collect();
-      assert_eq!(again, vec![(6, candidates)]);
+          .map(|(_, sequence, candidates, _)| (sequence, candidates))
+          .collect();
+        assert_eq!(again, vec![(6, candidates)]);
+      });
     });
   }
 

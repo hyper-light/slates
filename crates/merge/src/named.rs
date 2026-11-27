@@ -42,20 +42,137 @@ pub struct Named {
   pub inline_len: u64,
   /// The runs, in the post-state's order, with where each ends ([`RunTable`]).
   pub runs: RunTable,
-  /// Each run's bytes as read so far ([`crate::engine::Increment::read_step`]), one buffer a run, so a whole text's
-  /// buffer becomes the green's file at the commit with no copy ([`Read`]).
+  /// Each run's bytes as read so far ([`crate::engine::Increment::read_step`]), one buffer for them all ([`Read`]).
   pub read: Read,
 }
 
-/// The named runs' bytes read so far, one buffer a run: what the plane holds, read here a slice a step. Not part of
-/// the work's value: two works naming the same runs are equal whatever each has read, and a clone names the runs and
-/// reads them again (a clone that copied a 500 MB text would break the sizing rule A-760 keeps), so it carries none.
+/// The named runs' bytes read so far: what the plane holds, read here a slice a step, into one buffer for every run
+/// (A-920 3n). Each run takes its place in it as its first byte is read, after the run read before it (a read step
+/// finishes the first unread run before it begins the next, [`crate::engine::Increment::read_step_among`]), and the
+/// buffer's room is reserved once at every run's total, its pages made only as bytes are read, so a run a replay leaves
+/// unread costs none. One buffer, not one a run: a revision of 9,000 files of 1 KiB read a buffer each, and its commit
+/// let one go a unit; the free that emptied the system allocator's region spent about 1 ms in the kernel (debug, macOS:
+/// 947 and 1,226 µs of system time, one minor fault), whichever unit met it. A file whose bytes are exactly one whole
+/// run is named for the run's object and holds no bytes; any other takes a copy of its run's bytes once.
+///
+/// Not part of the work's value: two works naming the same runs are equal whatever each has read, and a clone names the
+/// runs and reads them again (a clone that copied a 500 MB text would break the sizing rule A-760 keeps), so it carries
+/// none.
 #[derive(Debug, Default)]
-pub struct Read(pub(crate) Vec<Vec<u8>>);
+pub struct Read {
+  /// Every run's bytes read so far, each run's at its place.
+  bytes: Vec<u8>,
+  /// Each run's place in `bytes` (none until its first byte is read) and its bytes read so far, by the run's place.
+  spans: Vec<(Option<usize>, usize)>,
+}
+
+/// No run read: a post-state of inline bytes alone.
+static NO_READ: Read = Read {
+  bytes: Vec::new(),
+  spans: Vec::new(),
+};
+
+impl Read {
+  /// The `at`th run's bytes read so far.
+  pub(crate) fn run(&self, at: usize) -> &[u8] {
+    match self.spans.get(at) {
+      Some(&(Some(start), read)) => start
+        .checked_add(read)
+        .and_then(|end| self.bytes.get(start..end))
+        .unwrap_or_default(),
+      _ => &[],
+    }
+  }
+
+  /// The `at`th run's bytes read so far, where this run or one after it has been begun; none past them.
+  pub(crate) fn run_known(&self, at: usize) -> Option<&[u8]> {
+    (at < self.spans.len()).then(|| self.run(at))
+  }
+
+  /// Whether no run's read has begun.
+  pub(crate) fn is_empty(&self) -> bool {
+    self.spans.is_empty()
+  }
+
+  /// How many of the `at`th run's bytes are read.
+  pub(crate) fn read_len(&self, at: usize) -> usize {
+    self.spans.get(at).map_or(0, |(_, read)| *read)
+  }
+
+  /// The next `take` bytes of the `at`th run made room for, zeroed, to be read into: the room is reserved once at
+  /// `total`, every run's bytes, and the run's place given at its first byte. None where the room cannot be had, or
+  /// where another run was begun after this one (a run's bytes are taken in one stretch).
+  pub(crate) fn next_room(
+    &mut self,
+    (at, total): (usize, usize),
+    take: usize,
+  ) -> Option<&mut [u8]> {
+    if self.bytes.capacity() == 0 && total > 0 {
+      self.bytes.try_reserve_exact(total).ok()?;
+    }
+    while self.spans.len() <= at {
+      self.spans.push((None, 0));
+    }
+    let end_now = self.bytes.len();
+    let (start, read) = *self.spans.get(at)?;
+    let start = match start {
+      Some(start) if start.checked_add(read)? == end_now => start,
+      Some(_) => return None,
+      None => end_now,
+    };
+    let to = end_now.checked_add(take)?;
+    self.bytes.resize(to, 0);
+    if let Some(span) = self.spans.get_mut(at) {
+      span.0 = Some(start);
+    }
+    self.bytes.get_mut(end_now..to)
+  }
+
+  /// The `at`th run's last `took` bytes made room for by [`Read::next_room`] kept as read, or let go where its read was
+  /// refused (`kept` false).
+  pub(crate) fn settle(&mut self, at: usize, (took, kept): (usize, bool)) {
+    if kept {
+      if let Some(span) = self.spans.get_mut(at) {
+        span.1 = span.1.saturating_add(took);
+      }
+    } else {
+      let end = self.bytes.len().saturating_sub(took);
+      self.bytes.truncate(end);
+      if let Some(span) = self.spans.get_mut(at)
+        && span.1 == 0
+      {
+        span.0 = None;
+      }
+    }
+  }
+
+  /// Runs read whole already, laid in `bytes` one after another in order, each `lens` long: a push's runs taken out of
+  /// its inline bytes ([`crate::push`]).
+  pub(crate) fn whole(bytes: Vec<u8>, lens: impl IntoIterator<Item = usize>) -> Read {
+    let mut start = 0usize;
+    let spans = lens
+      .into_iter()
+      .map(|len| {
+        let span = (Some(start), len);
+        start = start.saturating_add(len);
+        span
+      })
+      .collect();
+    Read { bytes, spans }
+  }
+
+  /// A copy of the runs read so far, in one buffer: a held verdict's own, for its commit ([`crate::engine::Judged`]).
+  pub(crate) fn copied(&self) -> Read {
+    Read {
+      bytes: self.bytes.clone(),
+      spans: self.spans.clone(),
+    }
+  }
+}
 
 impl Clone for Read {
   fn clone(&self) -> Read {
-    Read(Vec::new())
+    Read::default()
   }
 }
 
@@ -151,14 +268,14 @@ pub struct Post<'a> {
   /// The inline bytes.
   pub(crate) inline: &'a [u8],
   /// Each run's bytes as read.
-  pub(crate) runs: &'a [Vec<u8>],
+  pub(crate) runs: &'a Read,
   /// Each run as named, its declared length its place in the address space.
   pub(crate) declared: &'a RunTable,
 }
 
 impl<'a> Post<'a> {
   /// The post-state of `inline` bytes and `runs` as read, each the run `declared` names at its place.
-  pub(crate) fn of(inline: &'a [u8], runs: &'a [Vec<u8>], declared: &'a RunTable) -> Post<'a> {
+  pub(crate) fn of(inline: &'a [u8], runs: &'a Read, declared: &'a RunTable) -> Post<'a> {
     Post {
       inline,
       runs,
@@ -168,7 +285,7 @@ impl<'a> Post<'a> {
 
   /// The post-state of `inline` bytes alone, no run named.
   pub(crate) fn inline(inline: &'a [u8]) -> Post<'a> {
-    Post::of(inline, &[], &NO_RUNS)
+    Post::of(inline, &NO_READ, &NO_RUNS)
   }
 
   /// The inline bytes' length: where the first run starts.
@@ -185,13 +302,24 @@ impl<'a> Post<'a> {
   /// exactly the `len` bytes at `src` is the one under `(src, len)`, what a whole text's file is made of. Made once for
   /// a version's files (`Green::sole_runs`), so each file's lookup is a logarithm of the runs, not a walk of them all.
   pub(crate) fn run_places(&self) -> std::collections::BTreeMap<(u64, u64), usize> {
-    let inline = self.inline_len();
     let mut places = std::collections::BTreeMap::new();
-    for (at, run) in self.declared.iter().enumerate() {
-      let start = inline.saturating_add(self.declared.start(at));
-      places.entry((start, run.len)).or_insert(at);
+    let mut at = 0;
+    while let Some(place) = self.run_place(at) {
+      places.entry(place).or_insert(at);
+      at = at.saturating_add(1);
     }
     places
+  }
+
+  /// The `at`th declared run's place in the post-state's one address space, its start and length: what
+  /// [`Post::run_places`] keys it by, found a run at a time where a commit's preparation is sliced (A-920 piece 3d);
+  /// none past the last run.
+  pub(crate) fn run_place(&self, at: usize) -> Option<(u64, u64)> {
+    let run = self.declared.get(at)?;
+    Some((
+      self.inline_len().saturating_add(self.declared.start(at)),
+      run.len,
+    ))
   }
 
   /// The `len` bytes at `src`, clamped to its length (as a slice of one buffer was); a run's bytes not read span none.
@@ -214,7 +342,7 @@ impl<'a> Post<'a> {
         if start >= to_run {
           break;
         }
-        let bytes: &'a [u8] = self.runs.get(at).map_or(&[], Vec::as_slice);
+        let bytes: &'a [u8] = self.runs.run(at);
         let from = usize::try_from(from_run.saturating_sub(start)).unwrap_or(usize::MAX);
         let to = usize::try_from(to_run.min(run_end).saturating_sub(start)).unwrap_or(usize::MAX);
         let to = to.min(bytes.len());
@@ -290,7 +418,8 @@ mod tests {
         .collect();
       read.push(if at == unread { Vec::new() } else { bytes });
     }
-    let post = Post::of(&inline, &read, &table);
+    let bytes = super::Read::whole(read.concat(), read.iter().map(Vec::len));
+    let post = Post::of(&inline, &bytes, &table);
     let total = inline.len() as u64 + lens.iter().sum::<u64>();
     assert_eq!(post.len(), total);
     // The address space byte by byte: `None` where an unread run's place is.

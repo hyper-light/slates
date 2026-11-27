@@ -261,3 +261,8 @@ fn creating_a_green_over_a_large_base_never_holds_its_shard() {
     "no probe waited for half the walk or more ({longest:?} of {took:?})"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

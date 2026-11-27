@@ -527,3 +527,8 @@ fn a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
     "once the candidates are back, a flush succeeds: {resumed:?}"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

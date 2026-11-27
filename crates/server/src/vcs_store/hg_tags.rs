@@ -176,29 +176,34 @@ async fn read(id: RepositoryId) {
   });
 }
 
-/// A request's door run in a test's synchronous history, which holds the shard so no task of it runs: the tags its name
-/// needs read from the node's store and waited for on a thread of its own (`test_store::answer_wants_blocking`), held
-/// while the request is dispatched over them as [`read`] runs it again, then let go. Its reply, and whether a read was
-/// made.
+/// A request's door run from a test's task on the shard, which reads the reply itself: the tags its name needs read from
+/// the node's store as [`read`]'s task reads them (`hg_view::answer_store_wants`, awaited), held while the request is
+/// dispatched over them as [`read`] runs it again, then let go. Its reply, and whether a read was made.
 #[cfg(test)]
-pub(crate) fn dispatch_blocking(
-  state: &mut ShardState,
+pub(crate) async fn dispatch_awaited(
   principal: &slates_db::catalog::Principal,
   body: RequestBody,
 ) -> (ReplyBody, bool) {
-  let Some((id, mut begun)) = owing(state, &body) else {
-    return (crate::verbs::dispatch(state, 1, principal, body), false);
+  let dispatch = |body| {
+    crate::state::with_state(|state| crate::verbs::dispatch(state, 1, principal, body))
+      .expect("the shard's state")
   };
-  let answered = state.vcs_disk.clone().is_some_and(|disk| {
-    crate::test_store::answer_wants_blocking(&disk, u128::from_be_bytes(id.bytes), &mut begun)
-  });
+  let owed = crate::state::with_state(|state| owing(state, &body)).flatten();
+  let Some((id, mut begun)) = owed else {
+    return (dispatch(body), false);
+  };
+  let answered = super::hg_view::answer_store_wants(&mut begun, id).await;
   assert!(
     answered,
     "the store answered the .hgtags read: left {:?}",
     begun.wants()
   );
-  state.hg_tags.read.insert(id, begun);
-  let reply = crate::verbs::dispatch(state, 1, principal, body);
-  state.hg_tags.read.remove(&id);
+  let reply = crate::state::with_state(|state| {
+    state.hg_tags.read.insert(id, begun);
+    let reply = crate::verbs::dispatch(state, 1, principal, body);
+    state.hg_tags.read.remove(&id);
+    reply
+  })
+  .expect("the shard's state");
   (reply, true)
 }

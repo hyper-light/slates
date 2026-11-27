@@ -1415,6 +1415,107 @@ fn a_streamed_changelog_has_no_generaldelta_and_its_deltas_name_their_chains_sta
   assert_eq!(streamed_changelog(&mut skipping, &view).0, b"1");
 }
 
+/// A changeset store that keeps every revision as stock's revlog chunk of its whole (`Form::Chunk`, main's ruling (b)),
+/// over [`WholeTexts`]: and the chunk places' bytes it was asked for, summed.
+struct KeptAsChunks<'s> {
+  /// The store the rows come from, whole.
+  inner: WholeTexts<'s>,
+  /// The bytes of chunk places asked for.
+  chunk_bytes_asked: u64,
+}
+
+impl crate::render::StoredSource for KeptAsChunks<'_> {
+  fn rows(
+    &mut self,
+    logs: &[(Vec<u8>, Vec<Node>)],
+  ) -> Option<Vec<Vec<Option<crate::render::StoredRevision>>>> {
+    let mut answered = self.inner.rows(logs)?;
+    for row in answered.iter_mut().flatten().flatten() {
+      let whole = self.inner.texts.get(&row.place.payload)?.clone();
+      let mut chunk = Vec::new();
+      crate::revlog_chunk::chunk(&whole, crate::revlog_chunk::Pass::Send, &mut chunk).ok()?;
+      let payload = *blake3::hash(&chunk).as_bytes();
+      row.place = crate::render::StoredPlace {
+        payload,
+        offset: 0,
+        len: u64::try_from(chunk.len()).ok()?,
+        chunk: true,
+      };
+      self.inner.texts.insert(payload, chunk);
+    }
+    Some(answered)
+  }
+
+  fn chunks(&mut self, places: &[crate::render::StoredPlace]) -> Option<Vec<Vec<u8>>> {
+    for place in places.iter().filter(|place| place.chunk) {
+      self.chunk_bytes_asked = self.chunk_bytes_asked.saturating_add(place.len);
+    }
+    self.inner.chunks(places)
+  }
+}
+
+/// Goal 93, main's ruling (b), its owed half (2026-11-25). Do: stream the `states` repository from a changeset store
+/// keeping each revision as its stock chunk, then from one keeping each whole. Expect: the two streams byte for byte the
+/// same (a chunk sent as it lies is the chunk the stream made of the whole); the chunk places' bytes asked for once
+/// each, by the send pass, the count pass sizing each by its place's length (non-vacuity: some asked). Red before: the
+/// count pass read every chunk place's bytes too, twice the store's reads.
+#[test]
+fn a_streams_count_pass_sizes_a_chunk_place_by_its_length_never_reading_it() {
+  use super::super::stream::stream_out;
+  let (imported, store, public) = streaming_states();
+  let state = State {
+    roots: &public,
+    ..state_of(&imported)
+  };
+  let view = Indexed::new(&imported.index, &store, state, (UNSTEPPED, &mut room())).unwrap();
+  let mut chunked = KeptAsChunks {
+    inner: whole_texts(&imported.index, &store),
+    chunk_bytes_asked: 0,
+  };
+  let mut from_chunks = Vec::new();
+  stream_out(&view, &mut chunked, &mut room(), &mut from_chunks).unwrap();
+  let mut from_wholes = Vec::new();
+  stream_out(
+    &view,
+    &mut whole_texts(&imported.index, &store),
+    &mut room(),
+    &mut from_wholes,
+  )
+  .unwrap();
+  assert!(from_chunks.starts_with(b"0\n"), "the stream served");
+  assert_eq!(from_chunks, from_wholes, "the same stream either way");
+  let sent = sent_chunk_bytes(&from_chunks);
+  assert!(sent > 0, "chunks streamed");
+  assert_eq!(
+    chunked.chunk_bytes_asked, sent,
+    "each chunk place read once, by the send pass"
+  );
+}
+
+/// The bytes of the revlog chunks a version 1 stream carried: each `.d` file whole, and each inline `.i` file less its
+/// entries (one [`ENTRY_BYTES`](crate::render) each).
+fn sent_chunk_bytes(answer: &[u8]) -> u64 {
+  let (_, sent) = streamed(answer);
+  sent
+    .iter()
+    .map(|(name, bytes)| {
+      if name.ends_with(b".d") {
+        return u64::try_from(bytes.len()).unwrap();
+      }
+      if !name.ends_with(b".i") {
+        return 0;
+      }
+      let log = crate::revlog::Revlog::open(bytes, &[], &mut room()).unwrap();
+      let entries = u64::from(log.len()) * 64;
+      if log.outline().inline() {
+        u64::try_from(bytes.len()).unwrap() - entries
+      } else {
+        0
+      }
+    })
+    .sum()
+}
+
 /// Each manifest and file revision a changegroup carries, with its link, as a set: what a fetch brings, whatever the
 /// order its packer took.
 fn carried(packed: &[u8]) -> BTreeSet<(Vec<u8>, Node, Node)> {
@@ -2791,8 +2892,14 @@ fn a_stream_clone_over_bundle2_is_refused_without_a_common_version_or_a_served_s
 /// A repository of the stock bundle and `count` changesets made over it in a line, each pushed through the intake as a
 /// client's push of one (its manifest kept as the push keeps one: a diff on the manifest before it, A-729): the index.
 fn a_pushed_line(store: &mut ContentStore, count: usize) -> HgIndex {
-  use crate::push::intake::{Intake, Stepped};
-  use crate::push::made::{Authored, CHANGEGROUP_VERSION, Change, changegroup, made};
+  a_pushed_lines(store, (count, 1))
+}
+
+/// A repository of the stock bundle and `lines` lines of `count` changesets each, every line made over the stock tip
+/// (so each line after the first is a branch whose first manifest's parent is not the manifest before it), each changeset
+/// pushed through the intake as a client's push of one: the index.
+fn a_pushed_lines(store: &mut ContentStore, (count, lines): (usize, usize)) -> HgIndex {
+  use crate::push::made::{CHANGEGROUP_VERSION, changegroup};
   let bundle = crate::bundle2::Bundle2::decode(crate::fixtures::CG03, &mut room()).unwrap();
   let stock = crate::push::read(&bundle, &mut room())
     .unwrap()
@@ -2800,49 +2907,68 @@ fn a_pushed_line(store: &mut ContentStore, count: usize) -> HgIndex {
     .unwrap()
     .1
     .clone();
-  let take = |index: &mut HgIndex,
-              store: &mut ContentStore,
-              (version, payload): (crate::changegroup::Version, &[u8])| {
-    let mut intake = Intake::begin((version, payload), index, store, &mut room()).unwrap();
-    loop {
-      match intake.step(payload, store, &mut room()).unwrap() {
-        Stepped::Store => intake.answer_from_fork(store),
-        Stepped::More => {}
-        _ => break,
-      }
+  let mut index = taken_whole_into(&mut HgIndex::new(), store, (stock.version, &stock.payload));
+  let stock_tip = index
+    .changeset(store, index.len(store, Log::Changelog) - 1)
+    .unwrap()
+    .node;
+  for line in 0..lines {
+    let mut tip = stock_tip;
+    for at in 0..count {
+      let verified = made_one(&index, store, tip, (line, at));
+      tip = verified.changesets[0].node;
+      let payload = changegroup(&verified, &mut room()).unwrap();
+      index = taken_whole_into(&mut index, store, (CHANGEGROUP_VERSION, &payload));
     }
-    intake.finish().ok().unwrap().0
-  };
-  let mut index = take(&mut HgIndex::new(), store, (stock.version, &stock.payload));
-  for at in 0..count {
-    let tip = index
-      .changeset(store, index.len(store, Log::Changelog) - 1)
-      .unwrap()
-      .node;
-    let path = format!("line/{at:04}.txt");
-    let text = format!("revision {at} of the line\n");
-    let authored = Authored {
-      user: b"Client <c@example.com>",
-      seconds: 1,
-      branch: b"default",
-      message: b"a line",
-    };
-    let verified = made(
-      &crate::push::held::IndexHeld::new(&index, store),
-      tip,
-      &[Change {
-        path: path.as_bytes(),
-        after: Some((text.as_bytes(), crate::manifest::Flag::Regular)),
-        copied_from: None,
-      }],
-      &authored,
-      &mut room(),
-    )
-    .unwrap();
-    let payload = changegroup(&verified, &mut room()).unwrap();
-    index = take(&mut index, store, (CHANGEGROUP_VERSION, &payload));
   }
   index
+}
+
+/// `payload` taken whole into a fork of `index` through the push's intake, its store's asks answered from the fork.
+fn taken_whole_into(
+  index: &mut HgIndex,
+  store: &mut ContentStore,
+  (version, payload): (crate::changegroup::Version, &[u8]),
+) -> HgIndex {
+  use crate::push::intake::{Intake, Stepped};
+  let mut intake = Intake::begin((version, payload), index, store, &mut room()).unwrap();
+  loop {
+    match intake.step(payload, store, &mut room()).unwrap() {
+      Stepped::Store => intake.answer_from_fork(store),
+      Stepped::More => {}
+      _ => break,
+    }
+  }
+  intake.finish().ok().unwrap().0
+}
+
+/// Changeset `at` of line `line`, made over `tip`: one new file of its own.
+fn made_one(
+  index: &HgIndex,
+  store: &ContentStore,
+  tip: Node,
+  (line, at): (usize, usize),
+) -> crate::push::verify::Verified {
+  let path = format!("line{line}/{at:04}.txt");
+  let text = format!("revision {at} of line {line}\n");
+  let authored = crate::push::made::Authored {
+    user: b"Client <c@example.com>",
+    seconds: 1,
+    branch: b"default",
+    message: b"a line",
+  };
+  crate::push::made::made(
+    &crate::push::held::IndexHeld::new(index, store),
+    tip,
+    &[crate::push::made::Change {
+      path: path.as_bytes(),
+      after: Some((text.as_bytes(), crate::manifest::Flag::Regular)),
+      copied_from: None,
+    }],
+    &authored,
+    &mut room(),
+  )
+  .unwrap()
 }
 
 /// Main's churn at fed0b8164 (2026-11-25: a 57k clone's system churn 40.89 GB, 30.7% of it manifests rebuilt whole from
@@ -2967,6 +3093,141 @@ impl crate::render::StoredSource for StoredManifests<'_> {
       })
       .collect()
   }
+}
+
+/// A [`StoredManifests`]' manifests as a client's generaldelta push keeps them (stock 7.2's packer: each manifest's
+/// delta on its first parent), each made with the server's own manifest diff: what the changeset store keeps of a
+/// pushed branch or merge, whose first parent is not the manifest before it.
+fn rows_on_p1(index: &HgIndex, store: &ContentStore) -> StoredRows {
+  let mut rows = BTreeMap::new();
+  let mut places = BTreeMap::new();
+  for rev in 0..index.len(store, Log::Manifest) {
+    let row = index.revision(store, Log::Manifest, rev).unwrap();
+    let text = index.revision_text(store, Log::Manifest, rev).unwrap();
+    let (base, bytes) = if row.p1 == crate::index::NONE {
+      (None, text.clone())
+    } else {
+      let parent = index.revision_text(store, Log::Manifest, row.p1).unwrap();
+      let diff = crate::push::manifest_row::diff_of(&parent, &text, store.window()).unwrap();
+      (Some(*blake3::hash(&parent).as_bytes()), diff)
+    };
+    let payload = *blake3::hash(&bytes).as_bytes();
+    let len = bytes.len() as u64;
+    places.insert(payload, bytes);
+    rows.insert(
+      row.node,
+      crate::render::StoredRevision {
+        text: *blake3::hash(&text).as_bytes(),
+        base,
+        place: crate::render::StoredPlace {
+          payload,
+          offset: 0,
+          len,
+          chunk: false,
+        },
+      },
+    );
+  }
+  (rows, places)
+}
+
+/// Main's ruling of 2026-11-25 (the rule's exact form: a let-go manifest's stored delta sent where the client holds its
+/// base, sent earlier in the changegroup). Do: push two lines over the stock tip, the second a branch whose first
+/// manifest's first parent is the stock tip's, not the manifest before it; let every manifest go; clone it whole, the
+/// store keeping each manifest as a client's generaldelta push does, a delta on its first parent. Expect: the branch's
+/// first manifest sent as its stored delta on its first parent (`stored_parent_delta`), the rest on the one before,
+/// none made whole (no want of a text); and every manifest the changegroup carries, applied on the base it names, the
+/// repository's text. Red before: the branch's first manifest asked whole of the store.
+#[test]
+fn a_clone_sends_a_let_go_manifest_on_its_first_parent_sent_earlier() {
+  let mut store = store();
+  let index = a_pushed_lines(&mut store, (4, 2));
+  let (answer, saved, paths) = cloned_let_go_on_p1(&index, &mut store);
+  assert!(
+    paths.stored_parent_delta >= 1,
+    "the branch's first manifest on its first parent: {paths:?}"
+  );
+  assert_eq!(paths.stored_fallback, 0, "none made whole: {paths:?}");
+  assert_manifests_carried(&answer, &saved);
+}
+
+/// Do: clone a repository of one changeset pushed by a client, its manifest let go, so the walk's first batch read ahead
+/// is the root alone, whose parents are null. Expect: the clone answered, its manifest sent as the whole the store keeps
+/// and the repository's text. Red before: the root's batch asked an empty log of parents beside its own, the read ahead
+/// took the answer's two logs for one asked as a store that lost a row, and the clone was refused "a manifest revision"
+/// (so were the daemon's edge and ssh clones of more than a request's room, whose first batch held the root alone).
+#[test]
+fn a_clone_whose_first_manifest_batch_is_the_root_alone_sends_it() {
+  let mut store = store();
+  let verified = made_one(&HgIndex::new(), &store, NULL_NODE, (0, 0));
+  let payload = crate::push::made::changegroup(&verified, &mut room()).unwrap();
+  let index = taken_whole_into(
+    &mut HgIndex::new(),
+    &mut store,
+    (crate::push::made::CHANGEGROUP_VERSION, &payload),
+  );
+  assert_eq!(index.len(&store, Log::Manifest), 1, "one manifest");
+  let (answer, saved, paths) = cloned_let_go_on_p1(&index, &mut store);
+  assert_eq!(
+    paths.stored_whole, 1,
+    "the root as its stored whole: {paths:?}"
+  );
+  assert_manifests_carried(&answer, &saved);
+}
+
+/// `index`'s manifests kept as deltas on their first parents ([`rows_on_p1`]) and let go from `store`, then cloned
+/// through the changeset store's stand-in ([`StoredManifests`]): the answer, each manifest's text by node as it was
+/// before, and the ways the manifests went.
+fn cloned_let_go_on_p1(
+  index: &HgIndex,
+  store: &mut ContentStore,
+) -> (
+  Vec<u8>,
+  BTreeMap<Node, Vec<u8>>,
+  super::super::getbundle::ManifestPaths,
+) {
+  let saved: BTreeMap<Node, Vec<u8>> = (0..index.len(store, Log::Manifest))
+    .map(|rev| {
+      let node = index.revision(store, Log::Manifest, rev).unwrap().node;
+      (
+        node,
+        index.revision_text(store, Log::Manifest, rev).unwrap(),
+      )
+    })
+    .collect();
+  let (rows, places) = rows_on_p1(index, store);
+  let objects: Vec<ContentId> = (0..index.len(store, Log::Manifest))
+    .map(|rev| index.revision(store, Log::Manifest, rev).unwrap().bytes)
+    .collect();
+  let freed: u64 = objects
+    .iter()
+    .map(|object| store.let_go_object(object))
+    .sum();
+  assert!(freed > 0, "the manifests let go");
+  let state = State {
+    roots: &[],
+    bookmarks: &[],
+    publishing: true,
+    markers: &[],
+  };
+  let view = Indexed::new(index, store, state, (UNSTEPPED, &mut room())).unwrap();
+  let mut source = StoredManifests {
+    rows,
+    places,
+    files: whole_texts(index, store),
+  };
+  let caps = stream_caps(b"HG20\nchangegroup=01,02,03");
+  let asked = super::super::getbundle::Asked {
+    bundlecaps: &caps,
+    ..super::super::getbundle::Asked::default()
+  };
+  let _ = super::super::getbundle::take_manifest_paths();
+  let answer = answered_getbundle(&view, &asked, &mut source).unwrap();
+  (
+    answer,
+    saved,
+    super::super::getbundle::take_manifest_paths(),
+  )
 }
 
 /// Each revision of `revisions` in `changegroup` made whole, its delta applied to the text of the base it names (one

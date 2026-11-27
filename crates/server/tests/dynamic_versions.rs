@@ -191,3 +191,8 @@ fn a_dynamic_volume_grows_into_unpromised_slots_only_and_a_bounded_claim_stays_s
   }
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

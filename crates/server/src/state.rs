@@ -305,6 +305,11 @@ pub struct ShardState {
   /// The content arena's allocation count at the last sweep pass: unchanged at the next means the shard allocated
   /// nothing in between, so its free blocks can go back to the OS (A-105, `daemon::purge_if_idle`).
   pub(crate) purge_seen_allocations: u64,
+  /// The resident free bytes the content arena's last give-back past a bound held it to (goal 93 P7: a Subversion
+  /// import's batch bound, `repository::svn_commit::staging::give_back_past`), so a publication that releases deferred
+  /// frees gives back past it too (`staging::give_back_released`); `None` until such a give-back, and again once an idle
+  /// purge settles, which gives back every free page.
+  pub(crate) give_back_keep: Option<usize>,
   /// The sweep of the shard's slice of the anchor content object that the status report advances (A-744,
   /// `crate::content_ranges`).
   pub(crate) content_sweep: crate::content_ranges::Sweep,
@@ -536,8 +541,10 @@ pub struct ShardState {
   /// partition's attachment cap: one entry per live catalog attachment at most.
   pub mount_attachments: BTreeMap<u64, MountAttachment>,
   /// The volumes this shard's catalog holds that recovery could not rebuild, and why (§4.8): each is listed, and every
-  /// verb on it answers `Refusal::NotRecovered` with its cause (`verbs::find`). Bounded by the partition's volume cap:
-  /// one entry per catalog volume at most, made once at the shard's start.
+  /// verb on it answers `Refusal::NotRecovered` with its cause (`verbs::find`; a write naming a green through its
+  /// repository, [`ShardState::recovered`]). Made at the shard's start and by a takeover that gave an object up (A-304);
+  /// a green's engine may stay lent, a holder's replica (A-908). Bounded by the partition's volume cap: one entry per
+  /// catalog volume at most.
   pub(crate) unrecovered:
     BTreeMap<slates_db::catalog::VolumeId, slates_ipc::protocol::RecoveryCause>,
   /// The volumes this shard catalogued when its node's host epoch last advanced at a configuration it installed: the
@@ -547,6 +554,11 @@ pub struct ShardState {
   /// (`verbs::lease_verdict`). Bounded by the partition's volume cap: a subset of the catalog, pruned to it at each
   /// yield (`crate::readmission`).
   pub(crate) yielded: std::collections::BTreeSet<slates_db::catalog::VolumeId>,
+  /// The repositories this shard's partition held when this host was taken over and admitted again (A-921 part 2,
+  /// beside [`ShardState::yielded`]): each a successor's now, never served here; a request for one is answered with
+  /// where its owner is (`owner_location::locate_owner`). Bounded by the partition's repositories, pruned to them at each
+  /// yield (`crate::readmission`); A-922 releases the copies.
+  pub(crate) yielded_repositories: std::collections::BTreeSet<slates_db::catalog::RepositoryId>,
   /// The slots of stale copies this shard relinquished to a takeover that named this node again (A-362,
   /// `verbs::materialize_taken_over`), each torn down a destroy slice at a time by the serve loop (`verbs::step_destroys`)
   /// after its record went, since the volume made from the adopted state took its id. Bounded by the partition's volume
@@ -1369,6 +1381,9 @@ pub struct ShardState {
   /// The registers this node reads a ledger range of from its cohort, a part past its copy refused (A-919,
   /// `crate::ledger_read`). At most one a register.
   pub(crate) ledger_reads: crate::ledger_read::LedgerReads,
+  /// This node's version-control edges as a client reaches them, and its peers' as they announced them (A-925,
+  /// `crate::edges`), on the control shard. Bounded by the members.
+  pub(crate) edges: crate::edges::Edges,
   /// Test support (A-914): the nanoseconds each coordinator period waits before it runs
   /// (`Daemon::inject_period_stretch`), 0 in production.
   pub(crate) period_stretch_ns: u64,
@@ -1612,6 +1627,23 @@ impl std::fmt::Debug for PendingForward {
 }
 
 impl ShardState {
+  /// `Err(NotRecovered)` with its cause where this shard records `volume` not recovered ([`ShardState::unrecovered`]),
+  /// else `Ok`: the one check every boundary where a verb takes a green to write it, or its repository's name for it,
+  /// asks before it reads the engine (A-927's sweep): a push's plan (`repository::push`), an import batch's append, the
+  /// owner's branch verbs (`repository`) and a submit's verdict (`verbs::judge_submission`). The engine of a green given
+  /// up may still be lent (a holder's replica), so its presence never says the green is recovered.
+  pub(crate) fn recovered(
+    &self,
+    volume: slates_db::catalog::VolumeId,
+  ) -> Result<(), slates_ipc::protocol::Refusal> {
+    match self.unrecovered.get(&volume) {
+      Some(cause) => Err(slates_ipc::protocol::Refusal::NotRecovered {
+        cause: cause.clone(),
+      }),
+      None => Ok(()),
+    }
+  }
+
   /// Runs `with` on `object`'s placement under the configuration in force, computed once a configuration
   /// ([`crate::placement_cache`]); computed afresh only while the cache is already borrowed (a nested ask).
   pub(crate) fn with_placement<R>(

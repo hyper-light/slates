@@ -24,6 +24,12 @@ impl Status {
     code: 100,
     reason: "Continue",
   };
+  /// Format: `307 Temporary Redirect` (RFC 9110 §15.4.8): the resource is elsewhere for now, the method and body kept;
+  /// a repository's owner moved by a takeover, which may move it again (A-921 part 2).
+  pub const TEMPORARY_REDIRECT: Status = Status {
+    code: 307,
+    reason: "Temporary Redirect",
+  };
   /// Format: `200 OK` (RFC 9110 §15.3.1).
   pub const OK: Status = Status {
     code: 200,

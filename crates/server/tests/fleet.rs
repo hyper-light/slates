@@ -36245,6 +36245,15 @@ fn started_git_fleet_of(
   name: &str,
   names: &[&str],
 ) -> ((Vec<Daemon>, Vec<HostId>), Vec<NodeStore>, PortLease) {
+  started_git_fleet_with(name, names, false)
+}
+
+/// [`started_git_fleet_of`], each node serving an SSH edge too where `ssh` (bound at port 0, its own host key).
+fn started_git_fleet_with(
+  name: &str,
+  names: &[&str],
+  ssh: bool,
+) -> ((Vec<Daemon>, Vec<HostId>), Vec<NodeStore>, PortLease) {
   let n = names.len();
   let nodes: Vec<(MachineProfile, HostId, Identity)> = names
     .iter()
@@ -36261,6 +36270,12 @@ fn started_git_fleet_of(
       address: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
       identity: None,
     });
+    if ssh {
+      config.vcs_ssh = Some(slates_server::config::VcsSshConfig {
+        address: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
+        identity: None,
+      });
+    }
     config.vcs_disk = handles.get(i).cloned();
   };
   let none = std::collections::BTreeMap::new();
@@ -36410,14 +36425,26 @@ fn push_to_edge(
   let work = dir.path.clone();
   committed_in(&dir, (file, bytes));
   let header = format!("http.extraHeader=Authorization: Bearer {token}");
+  let helper = token_helper(token);
   let url = format!("http://127.0.0.1:{port}/project");
   let refspec = format!("HEAD:refs/heads/{branch}");
-  let pushed = git_in(&work, &["-c", &header, "push", "-q", &url, &refspec]);
+  let pushed = git_in(
+    &work,
+    &["-c", &header, "-c", &helper, "push", "-q", &url, &refspec],
+  );
   if pushed.status.success() {
     Ok(())
   } else {
     Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
   }
+}
+
+/// A git credential helper answering the fleet's token as Basic's password for whatever origin asks (A-921 part 2):
+/// git follows a repository's `307` to its owner's edge, and curl drops a custom `Authorization` field (the
+/// extraHeader's bearer) once a redirect leaves the origin, so the owner's `401` is answered by the helper, as a user's
+/// credential helper answers it. Asked only on a `401`; the extraHeader still carries the token on the first request.
+fn token_helper(token: &str) -> String {
+  format!("credential.helper=!f() {{ echo username=slates; echo password={token}; }}; f")
 }
 
 /// Stock git in `dir`, never prompting, its messages C's.
@@ -36505,10 +36532,13 @@ impl GitFleet {
       .vcs_http_port()
       .expect("the edge listens");
     let header = format!("http.extraHeader=Authorization: Bearer {}", self.token);
+    let helper = token_helper(&self.token);
     let url = format!("http://127.0.0.1:{port}/project");
     let cloned = git_in(
       &dir.path,
-      &["-c", &header, "clone", "-q", "-b", branch, &url, "copy"],
+      &[
+        "-c", &header, "-c", &helper, "clone", "-q", "-b", branch, &url, "copy",
+      ],
     );
     if !cloned.status.success() {
       return Err(String::from_utf8_lossy(&cloned.stderr).into_owned());
@@ -36516,7 +36546,10 @@ impl GitFleet {
     commit_in(&dir, "copy", (file, bytes));
     let work = format!("{}/copy", dir.path);
     let refspec = format!("HEAD:refs/heads/{branch}");
-    let pushed = git_in(&work, &["-c", &header, "push", "-q", &url, &refspec]);
+    let pushed = git_in(
+      &work,
+      &["-c", &header, "-c", &helper, "push", "-q", &url, &refspec],
+    );
     if pushed.status.success() {
       Ok(())
     } else {
@@ -36544,12 +36577,18 @@ impl GitFleet {
       return false;
     };
     let observed: Vec<&Daemon> = self.daemons.iter().collect();
+    // Seen alive by every other node, then settled (A-921, main 01a20182's ruling): a council member at every node and
+    // named by no kept retirement, so a takeover the restart's silence brought on, if one did, is complete.
     poll_until(&observed, PLACEMENT_DEADLINE, || {
       Ok(observed.iter().enumerate().all(|(at, daemon)| {
         at == node
           || daemon
             .fleet_members()
             .is_ok_and(|members| members.contains(&member))
+      }))
+    }) && poll_until(&observed, PLACEMENT_DEADLINE, || {
+      all_hold(observed.iter().map(|daemon| {
+        Ok(daemon.council_members()?.contains(&member) && !daemon.council_host_standing(member)?.1)
       }))
     })
   }
@@ -37653,46 +37692,37 @@ fn a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_th
 
 /// A-919 (main 01a20182's start rule of 2026-11-25). Do: on a four-node `f = 1` anchored git fleet with a repository on a,
 /// push `main` and wait for both of a's remote candidates to hold it; restart a warm (its own hold of the repository's
-/// state logs rebuilt empty, as no image carries it); stop one of the candidates, so the fourth node, which holds none
-/// of the logs, becomes a candidate; push on top. Expect the newcomer to adopt nothing of the logs' prefix (no position
-/// held from a read) and its read counted past tolerance: below where a's hold now begins, a counts as one gone, and the
-/// old holder alone is no quorum, so the newest surviving value is never taken for the committed one (the open edge:
-/// refused typed, the register's candidacy owed). Red without the start rule: a's empty answer named nothing there,
-/// the old holder's prefix adopted on its word alone. The scene is asserted to form (a push after the restart lands, so
-/// the old holder acknowledged a's parts and its green's version, and a part reached the newcomer): about 1 run in 3
-/// it does not, the old holder refusing a's records after its warm restart, which is A-921's red (main 01a20182's
-/// ruling of 2026-11-25). Ignored until A-921: run it by name with `cargo test -p slates-server --test fleet
+/// state logs rebuilt empty, as no image carries it), a still the repository's owner after it; stop one of the
+/// candidates, so the fourth node, which holds none of the logs, becomes a candidate; push on top. Expect the newcomer
+/// to adopt nothing of the logs' prefix (no position held from a read) and its read counted past tolerance: below where
+/// a's hold now begins, a counts as one gone, and the old holder alone is no quorum, so the newest surviving value is
+/// never taken for the committed one (the open edge: refused typed, the register's candidacy owed). Red without the
+/// start rule: a's empty answer named nothing there, the old holder's prefix adopted on its word alone.
+///
+/// A-921 (main 01a20182's rulings of 2026-11-25): a warm restart whose silence outlasts detection is a death by design,
+/// and a's takeover then leaves the scene two deaths at `f = 1`, outside the fault model (measured 1 run in 3 to 5:
+/// silences of 1.40 to 1.79 s to the takeover installed, and a refuted at incarnation 1 after). So the scene asserts a
+/// was not taken over (its fencing epoch unchanged at every other node) before it stops anyone, and is formed afresh,
+/// at most [`SCENE_RESTARTS`] times, where a was, each such attempt printed.
+///
+/// Ignored for A-921's second mode (main 01a20182's ruling of 2026-11-25): about 1 run in 6, a not taken over, the old
+/// holder still acknowledged neither a's green's next version nor its names-log part after a's warm restart, so every
+/// push was refused `unable to commit`; and the newcomer held 1 position, whose standing against the start rule is
+/// owed. Run it by name with `cargo test -p slates-server --test fleet
 /// a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins -- --ignored --exact`.
 #[test]
-#[ignore = "A-921: a warm-restarted owner's records refused by the surviving holder about 1 run in 3; run by name with --ignored"]
+#[ignore = "A-921's second mode: the old holder refuses a warm-restarted owner's v2 merge record and names-log part about 1 run in 6; run by name with --ignored"]
 fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins() {
   let _serial = serialize_fleet_tests();
-  let mut fleet = anchored_git_fleet_of("restarted-owner-log", &["a", "b", "c", "d"]);
-  let green = VolumeId {
-    bytes: fleet.repository,
+  let Some((mut fleet, holders)) = (0..SCENE_RESTARTS).find_map(restarted_owner_scene) else {
+    panic!("a was taken over at every one of {SCENE_RESTARTS} warm restarts");
   };
-  let first = fleet.push(0, ("first.txt", b"main before the restart\n"));
-  let holders_of = |fleet: &GitFleet| -> Vec<usize> {
-    (1..fleet.daemons.len())
-      .filter(|node| {
-        fleet.daemons[*node]
-          .merge_holder_state(green)
-          .is_ok_and(|held| held.version.is_some_and(|reached| reached >= 1))
-      })
-      .collect()
-  };
-  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
-  let both_hold = poll_until(&observed, RETIREMENT_DEADLINE, || {
-    Ok(holders_of(&fleet).len() == 2)
-  });
-  let holders = holders_of(&fleet);
-  let restarted = fleet.restart_warm(0);
   let (Some(&stopped), Some(newcomer)) = (
     holders.first(),
     (1..fleet.daemons.len()).find(|node| !holders.contains(node)),
   ) else {
     fleet.stop();
-    panic!("a's two remote candidates held version 1 ({both_hold}): {holders:?}");
+    panic!("a's two remote candidates held version 1: {holders:?}");
   };
   let newcomer_host = fleet.hosts[newcomer];
   let gone = fleet.hosts[stopped];
@@ -37733,17 +37763,13 @@ fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_beg
   let held = counted(&fleet, "fleet.ledger_read.positions_held");
   fleet.stop();
   eprintln!(
-    "restarted-owner-log: first {first:?}; holders {holders:?} (both {both_hold}); restarted {restarted}; taken over \
-     {taken}; pushes {pushed:?}; the newcomer's read past tolerance {refused}, positions held {held:?}"
+    "restarted-owner-log: holders {holders:?}; taken over {taken}; pushes {pushed:?}; the newcomer's read past \
+     tolerance {refused}, positions held {held:?}"
   );
-  assert_eq!(first, Ok(()), "the push before the restart landed");
-  assert!(
-    both_hold && restarted && taken,
-    "the fleet formed, a restarted, the death taken over"
-  );
+  assert!(taken, "the death was taken over");
   assert!(
     pushed.iter().any(Result::is_ok),
-    "a push after a's warm restart landed (A-921's red: the old holder refused a's records): {pushed:?}"
+    "a push after a's warm restart landed: {pushed:?}"
   );
   assert!(refused, "the newcomer's read was past tolerance");
   assert_eq!(
@@ -37753,9 +37779,388 @@ fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_beg
   );
 }
 
+/// One attempt at [`a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins`]'s scene: a
+/// four-node anchored git fleet, `main` pushed and held by both of a's remote candidates, then a restarted warm and
+/// settled. The fleet and those candidates where a was not taken over by its restart (its fencing epoch unchanged at
+/// every other node); `None`, the attempt printed and its fleet stopped, where it was (A-921).
+fn restarted_owner_scene(attempt: usize) -> Option<(GitFleet, Vec<usize>)> {
+  let mut fleet = anchored_git_fleet_of("restarted-owner-log", &["a", "b", "c", "d"]);
+  let green = VolumeId {
+    bytes: fleet.repository,
+  };
+  let first = fleet.push(0, ("first.txt", b"main before the restart\n"));
+  let holders_of = |fleet: &GitFleet| -> Vec<usize> {
+    (1..fleet.daemons.len())
+      .filter(|node| {
+        fleet.daemons[*node]
+          .merge_holder_state(green)
+          .is_ok_and(|held| held.version.is_some_and(|reached| reached >= 1))
+      })
+      .collect()
+  };
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let both_hold = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(holders_of(&fleet).len() == 2)
+  });
+  let holders = holders_of(&fleet);
+  let owner = fleet.hosts[0];
+  let epochs = |fleet: &GitFleet| -> Vec<Option<u64>> {
+    fleet.daemons[1..]
+      .iter()
+      .map(|daemon| {
+        daemon
+          .council_host_standing(owner)
+          .ok()
+          .and_then(|(epoch, _)| epoch)
+      })
+      .collect()
+  };
+  let before = epochs(&fleet);
+  let restarted = fleet.restart_warm(0);
+  let after = epochs(&fleet);
+  assert_eq!(first, Ok(()), "the push before the restart landed");
+  assert!(
+    both_hold && restarted,
+    "a's two remote candidates held version 1 ({holders:?}), and a restarted and settled"
+  );
+  if before == after {
+    return Some((fleet, holders));
+  }
+  eprintln!(
+    "restarted-owner-log: attempt {attempt}: a was taken over during its warm restart (its epoch {before:?} -> \
+     {after:?}), the scene formed afresh"
+  );
+  fleet.stop();
+  None
+}
+
+/// Shape: the scenes A-919's owner-restart test forms at most: a warm restart outlasted detection about 1 run in 3 to 5
+/// (A-921), so three attempts all taken over is about 1 run in 27 to 125.
+const SCENE_RESTARTS: usize = 3;
+
 /// Shape: the pushes A-919's owner-restart test makes for a part to reach the newcomer: a few, as a push during a death
 /// may be refused before it writes its records.
 const SCENE_PUSHES: usize = 3;
+
+/// A-925 (main 01a20182's rulings of 2026-11-25). Do: form a three-node git fleet whose nodes serve a git HTTP edge and
+/// an SSH edge, each bound at port 0; ask a where it would send a client of a repository b owns, over git's HTTP and over
+/// SSH; and of a member it holds no record of. Expect b's own edges as b bound them (127.0.0.1, its HTTP edge's port, its
+/// SSH edge's port; never port 0), each learned from b's edges record over b's authenticated session; and the typed
+/// refusal naming the member it knows none of. Red before A-925: no node knew another's edges, so a could name b's
+/// member id only.
+#[test]
+fn a925_a_node_learns_its_peers_edges_as_each_bound_them() {
+  let _serial = serialize_fleet_tests();
+  let ((daemons, hosts), _stores, _lease) = started_git_fleet_with("edges", &["a", "b", "c"], true);
+  let b_http = daemons[1].vcs_http_port();
+  let b_ssh = daemons[1].vcs_ssh().map(|edge| edge.port);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let learned = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(
+      daemons[0].peer_edge(hosts[1], false)?.is_ok()
+        && daemons[0].peer_edge(hosts[1], true)?.is_ok(),
+    )
+  });
+  let http = daemons[0].peer_edge(hosts[1], false);
+  let ssh = daemons[0].peer_edge(hosts[1], true);
+  let stranger = HostId(hosts[1].0 ^ 0x5a5a);
+  let none = daemons[0].peer_edge(stranger, false);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "edges: b bound http {b_http:?} ssh {b_ssh:?}; a learned http {http:?} ssh {ssh:?} ({learned}); none {none:?}"
+  );
+  assert!(learned, "a learned b's edges");
+  assert_eq!(
+    http,
+    Ok(Ok((
+      "http",
+      "127.0.0.1".to_owned(),
+      b_http.unwrap_or_default()
+    )))
+  );
+  assert_eq!(
+    ssh,
+    Ok(Ok((
+      "ssh",
+      "127.0.0.1".to_owned(),
+      b_ssh.unwrap_or_default()
+    )))
+  );
+  assert!(b_http.is_some_and(|port| port != 0) && b_ssh.is_some_and(|port| port != 0));
+  assert_eq!(
+    none,
+    Ok(Err(stranger)),
+    "a member of no record: the typed refusal naming it"
+  );
+}
+
+/// A-921 (main 01a20182's ruling of 2026-11-25: a stale owner after a false death keeps claiming what it lost). Do: on a
+/// three-node `f = 1` git fleet with a repository on a, push `main`; cut a off on the probe plane until b and c hold a
+/// configuration without it (its takeover installed: the repository's registers moved to a successor); heal it, and
+/// wait until every node's configuration names a a member again (readmitted, its refutation at a higher incarnation);
+/// push on top at a's edge. Expect the push to land, through the repository's successor. Red before A-921: a, readmitted,
+/// still ran the push as the repository's owner, its records refused `Unauthorized` by the holders whose authority the
+/// takeover moved, and the push refused `unable to commit` for as long as a believed it owned the repository (found by
+/// A-919's owner-restart scene, a's warm restart outlasting detection: 1.40 to 1.79 s of silence to the takeover).
+#[test]
+fn a921_a_push_to_an_owner_readmitted_after_a_false_death_lands_through_its_successor() {
+  let _serial = serialize_fleet_tests();
+  let fleet = git_fleet("stale-owner");
+  let first = fleet.push(0, ("first.txt", b"main before the false death\n"));
+  let owner = fleet.hosts[0];
+  let survivors = &fleet.daemons[1..];
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let cut = probe_plane_cut(&fleet.daemons, &fleet.hosts, true);
+  let taken = cut
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_council(survivors, |members| !members.contains(&owner))
+    });
+  let healed = probe_plane_cut(&fleet.daemons, &fleet.hosts, false);
+  let readmitted = healed
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_council(&fleet.daemons, |members| members.contains(&owner))
+    });
+  // a learns it was taken over when it installs the configuration that bumped its epoch, which can come after every
+  // node's council names it a member again: until then it believes it owns the repository, and its records are refused.
+  let learned = readmitted
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      Ok(summed_count(&fleet.daemons[0], "fleet.readmission.repositories_yielded") > 0)
+    });
+  let pushed = fleet.push_on_top(0, ("after.txt", b"after the false death\n"));
+  // At each survivor: the adopter serves the repository; the node that never held it answers not found, as before, since
+  // a name resolves only where a partition holds it (D-12, no directory; fleet-wide name routing is owed, GAPS).
+  let listed: Vec<(bool, String)> = (1..fleet.daemons.len())
+    .map(|node| {
+      let port = fleet.daemons[node].vcs_http_port().unwrap_or_default();
+      let dir = common::target::target_dir();
+      let header = format!("http.extraHeader=Authorization: Bearer {}", fleet.token);
+      let url = format!("http://127.0.0.1:{port}/project");
+      let out = git_in(&dir.path, &["-c", &header, "ls-remote", &url]);
+      (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+      )
+    })
+    .collect();
+  let refusals: Vec<_> = fleet
+    .daemons
+    .iter()
+    .map(|daemon| {
+      daemon.fleet_refusals().map(|counters| {
+        counters
+          .into_iter()
+          .filter(|(kind, _)| {
+            kind.starts_with("fleet.record.refused")
+              || kind.contains("push_uncommitted")
+              || kind.contains("readmission")
+              || kind.contains("moved")
+              || kind.contains("owner_location")
+          })
+          .collect::<Vec<_>>()
+      })
+    })
+    .collect();
+  fleet.stop();
+  eprintln!(
+    "stale-owner: first {first:?}; cut {cut}, taken over {taken}; healed {healed}, readmitted {readmitted}; the push at \
+     a {pushed:?}; refusals {refusals:?}"
+  );
+  assert_eq!(first, Ok(()), "the push before the false death landed");
+  assert!(
+    taken && readmitted && learned,
+    "a was taken over, readmitted, and learned it"
+  );
+  assert_eq!(
+    pushed,
+    Ok(()),
+    "the push at the readmitted old owner landed through its successor"
+  );
+  assert_eq!(
+    listed.iter().filter(|(served, _)| *served).count(),
+    1,
+    "the adopter alone serves it: {listed:?}"
+  );
+  assert!(
+    listed
+      .iter()
+      .any(|(served, said)| !served && said.contains("not found")),
+    "the node that never held it answers not found: {listed:?}"
+  );
+}
+
+/// A-921 part 2 (main 01a20182's ruling of 2026-11-25: the stale-creator skip, for every caller of the one owner
+/// lookup). Do: on a four-node fleet, a volume on a, placed, held by two of its peers; the fourth holds none of it, so its
+/// routing names no owner; cut a off on the probe plane until the survivors hold a configuration without it (taken over),
+/// then heal it until every node names a a member again; ask the volume's status from the fourth node's client. Expect it
+/// served, forwarded to the adopter found by the location round, and a never asked (its `not_owner_here` count 0). Red
+/// before: the lookup offered the volume's creator, a, readmitted and a member again, and the forward went to a first,
+/// refused there `NotOwnerHere`.
+#[test]
+fn a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it() {
+  let _serial = serialize_fleet_tests();
+  let (_lease, daemons, hosts) = formed_mesh(&["a", "b", "c", "d"]);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = owner_client.call(&scratch("victims-volume")) else {
+    panic!("create on a")
+  };
+  share_with_fleet(&mut owner_client, id, &daemons);
+  let object = ObjectId(id.bytes);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let holders_of = || -> Vec<usize> {
+    (1..daemons.len())
+      .filter(|node| {
+        daemons[*node]
+          .fleet_holder_head(object)
+          .is_ok_and(|held| held.is_some())
+      })
+      .collect()
+  };
+  let placed = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    Ok(holders_of().len() == 2)
+  });
+  let holders = holders_of();
+  let Some(stranger) = (1..daemons.len()).find(|node| !holders.contains(node)) else {
+    panic!("a's two remote holders held its volume ({placed}): {holders:?}");
+  };
+  let owner = hosts[0];
+  let owner_host_of_a = owner;
+  let survivors = &daemons[1..];
+  let cut = probe_plane_cut(&daemons, &hosts, true);
+  let taken = cut
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_council(survivors, |members| !members.contains(&owner))
+    });
+  let healed = probe_plane_cut(&daemons, &hosts, false);
+  let readmitted = healed
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_council(&daemons, |members| members.contains(&owner))
+    });
+  // What the node holding none of it would try first: never a, the stale creator (the skip); before, a.
+  let tried_first = daemons[stranger].known_owner(object);
+  let asked_a_before = summed_count(&daemons[0], "fleet.forward.refused.not_owner_here");
+  let mut forwarded = Client::connect(daemons[stranger].instance());
+  let served = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(matches!(
+      forwarded.call(&RequestBody::Status { volume: id }),
+      ReplyBody::Status { .. }
+    ))
+  });
+  let asked_a = summed_count(&daemons[0], "fleet.forward.refused.not_owner_here")
+    .saturating_sub(asked_a_before);
+  let claims = summed_count(&daemons[stranger], "fleet.owner_location.claim");
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "victims-volume: holders {holders:?}, stranger {stranger}; cut {cut} taken {taken} healed {healed} readmitted \
+     {readmitted}; served {served}; a asked {asked_a}; the stranger's claims {claims}; tried first {tried_first:?}"
+  );
+  assert!(
+    placed && taken && readmitted,
+    "the volume placed, a taken over, then readmitted"
+  );
+  assert!(
+    served,
+    "the volume's status served from the node holding none of it"
+  );
+  assert_eq!(asked_a, 0, "a, the stale creator, was never asked");
+  assert!(
+    tried_first
+      .as_ref()
+      .is_ok_and(|owner| *owner != Some(owner_host_of_a)),
+    "the direct route never names a: {tried_first:?}"
+  );
+}
+
+/// A-921 part 2 (main 01a20182's ruling of 2026-11-25: the one case the stale-creator skip exists for). Do: on a
+/// four-node anchored fleet, a volume on a, held by two of its peers; cut a off until the survivors take it over, heal it
+/// until every node names a a member again; restart the fourth node (which holds none of the volume) warm, so it comes
+/// back knowing nothing of the volume's owner (its routing is not persisted); ask what its direct route names, then the
+/// volume's status from its client. Expect the direct route never to name a, and the status served, found by the location
+/// round (`fleet.owner_location.claim` moved on the restarted node). Red without the skip: its direct route named a,
+/// readmitted and a member again, the creator of a volume it no longer owns, and the request went there first.
+#[test]
+fn a921_a_warm_restarted_node_never_names_a_false_death_victim_its_old_volumes_owner() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = anchored_git_fleet_of("restarted-stranger", &["a", "b", "c", "d"]);
+  let mut owner_client = Client::connect(fleet.daemons[0].instance());
+  let ReplyBody::Created { id } = owner_client.call(&scratch("victims-volume")) else {
+    panic!("create on a")
+  };
+  share_with_fleet(&mut owner_client, id, &fleet.daemons);
+  let object = ObjectId(id.bytes);
+  let holders_of = |fleet: &GitFleet| -> Vec<usize> {
+    (1..fleet.daemons.len())
+      .filter(|node| {
+        fleet.daemons[*node]
+          .fleet_holder_head(object)
+          .is_ok_and(|held| held.is_some())
+      })
+      .collect()
+  };
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let placed = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    Ok(holders_of(&fleet).len() == 2)
+  });
+  let holders = holders_of(&fleet);
+  let Some(stranger) = (1..fleet.daemons.len()).find(|node| !holders.contains(node)) else {
+    fleet.stop();
+    panic!("a's two remote holders held its volume ({placed}): {holders:?}");
+  };
+  let owner = fleet.hosts[0];
+  let cut = probe_plane_cut(&fleet.daemons, &fleet.hosts, true);
+  let taken = cut
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_council(&fleet.daemons[1..], |members| !members.contains(&owner))
+    });
+  let healed = probe_plane_cut(&fleet.daemons, &fleet.hosts, false);
+  let readmitted = healed
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_council(&fleet.daemons, |members| members.contains(&owner))
+    });
+  let restarted = fleet.restart_warm(stranger);
+  // Watched until it names an owner or the placement deadline passes: just after its restart the node may not yet hold a
+  // eligible, and only once it does would its direct route fall to the creator (the skip's case).
+  let mut named_a = false;
+  let mut tried_first: Result<Option<HostId>, ObserveError> = Ok(None);
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let _ = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    let named = fleet.daemons[stranger].known_owner(object)?;
+    named_a |= named == Some(owner);
+    tried_first = Ok(named);
+    Ok(named.is_some())
+  });
+  let claims_before = summed_count(&fleet.daemons[stranger], "fleet.owner_location.claim");
+  let mut forwarded = Client::connect(fleet.daemons[stranger].instance());
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let served = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(matches!(
+      forwarded.call(&RequestBody::Status { volume: id }),
+      ReplyBody::Status { .. }
+    ))
+  });
+  let claims = summed_count(&fleet.daemons[stranger], "fleet.owner_location.claim")
+    .saturating_sub(claims_before);
+  drop(forwarded);
+  drop(owner_client);
+  fleet.stop();
+  eprintln!(
+    "restarted-stranger: holders {holders:?}, stranger {stranger}; cut {cut} taken {taken} healed {healed} readmitted \
+     {readmitted} restarted {restarted}; tried first {tried_first:?}, named a {named_a} (a {owner:?}); served {served}; claims {claims}"
+  );
+  assert!(
+    placed && taken && readmitted && restarted,
+    "the scene formed"
+  );
+  assert!(
+    !named_a,
+    "the restarted node's direct route never names a: last {tried_first:?}"
+  );
+  assert!(served, "the volume's status served from the restarted node");
+  // Claims are recorded, not asserted: the restarted node's routing, learned again, may name the adopter before a round.
+}
 
 /// Shape: A-914's test's stretch of each coordinator period: a few heartbeats, past the pace the failover
 /// estimate measured before the death, as a host loaded several times over runs.
@@ -37838,3 +38243,8 @@ fn t_a727_d1a3_a_hold_whose_holder_is_unreachable_is_kept_then_resolved_on_the_n
     "resolved to the records by the rebuild's event alone: {held:?}; {state}"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

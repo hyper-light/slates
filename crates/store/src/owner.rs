@@ -24,10 +24,13 @@
 //!
 //! **Spinning before it parks** (main's ruling of 2026-11-25: hg's 57k clone, 812,896 requests, waited 144.82 s of
 //! 167.27 s on the owner's wake, about 178 µs a request). A fetch asks again as soon as its shard has taken the last
-//! answer, so the owner, waiting for work, spins through the gap before it parks: for the gap it has learned (RFC 6298's
-//! smoothed mean and four mean deviations, [`Gaps`]), at most the machine's measured wake (`spin_before_park_ns`, which
-//! the daemon passes), so it spins only while asks arrive back to back. Counted, a request at a time: met spinning,
-//! met parked, and the nanoseconds spun ([`AskWaits`]).
+//! answer, so the owner, waiting for work, may spin through the gap rather than park. It does by rent or buy: it learns
+//! the gaps (RFC 6298's smoothed mean and four mean deviations, [`Gaps`]) and what a park's wake costs it where it runs
+//! ([`Wake`], seeded by the machine's profiled wake, `spin_before_park_ns`, which the daemon passes), and spins, at most a
+//! wake's cost, only where the next ask is predicted within it; else it parks at once (main's ruling on the 57k split at
+//! 7a9cb385e: asks 12.7 ms apart, a wake 1.36 ms; spinning to the profile's cap there met 52 asks and parked for
+//! 3,237). Until then the spin was the predicted gap capped at the profile's wake, which spun on gaps longer than any
+//! wake. Counted, a request at a time: met spinning, met parked, and the nanoseconds spun ([`AskWaits`]).
 //!
 //! **A sliced landing** ([`StoreHandle::begin`], then [`SlicedLanding`]'s `section`, `part` and `commit`) lands a
 //! changeset too large to hold whole (an import, a large pack) one bounded part a request: each part is written where
@@ -62,7 +65,7 @@ use crate::log::Section;
 use crate::log::{Header, Located, SectionKind};
 use crate::staging::{Identity, Staging};
 use crate::store::{Changeset, Contents, PIECE_BYTES, Sizing, Store, StoreError};
-use crate::texts::{Place, TextCache, TextRow};
+use crate::texts::{Place, TextCache, TextCacheFigures, TextRow};
 
 /// A landed changeset's section as a replay reads it: its kind, where its bytes are in the log and their length, and
 /// the bytes themselves when they fit one read piece ([`PIECE_BYTES`]: a record, a small `Texts`); a longer section is
@@ -180,6 +183,32 @@ enum Request {
   },
 }
 
+impl Request {
+  /// Its kind's name, as the owner's log names a request.
+  fn kind(&self) -> &'static str {
+    match self {
+      Request::Begin { .. } => "begin",
+      Request::Section { .. } => "section",
+      Request::Part { .. } => "part",
+      Request::Commit { .. } => "commit",
+      Request::Stop => "stop",
+      Request::Dropped => "dropped",
+      Request::Land { .. } => "land",
+      Request::Piece { .. } => "piece",
+      Request::Sections { .. } => "sections",
+      Request::Read { .. } => "read",
+      Request::Changesets { .. } => "changesets",
+      Request::Text { .. } => "text",
+      Request::Texts { .. } => "texts",
+      Request::TextRow { .. } => "text row",
+      Request::Forget { .. } => "forget",
+      Request::PathTexts { .. } => "path texts",
+      Request::TextsByTool { .. } => "texts by tool",
+      Request::Places { .. } => "places",
+    }
+  }
+}
+
 /// A request as the owner receives it: when its asker sent it ([`slates_machine::clock::monotonic_ns`], one clock for
 /// every thread of the host) and where its service's timing goes back ([`Served`]), none for the daemon's own stop.
 struct Asked {
@@ -224,6 +253,8 @@ struct Served {
   done_ns: u64,
   /// How the owner, waiting for work, met it: spinning (a hit), parked, or neither (it was queued).
   met: Met,
+  /// The owner's text cache as the request left it ([`text_cache_seen`]).
+  texts: TextCacheFigures,
 }
 
 /// How the owner met a request while it waited for work (goal 93, main's ruling of 2026-11-25: the 57k clone's store
@@ -323,6 +354,22 @@ pub fn take_read_waits() -> AskWaits {
 }
 
 std::thread_local! {
+  /// The owner's text cache as this thread's last read left it ([`text_cache_seen`]).
+  static TEXT_CACHE_SEEN: core::cell::Cell<TextCacheFigures> = const { core::cell::Cell::new(TextCacheFigures {
+    reserved: 0,
+    bound: 0,
+    walks: 0,
+    walk_bytes: 0,
+  }) };
+}
+
+/// The owner's text cache (its reserved bytes, its bound, its walks in flight) as this thread's last read left it: what the asking shard's memory status reports of it, the owner's state crossing to no other thread (goal 93,
+/// main's ruling of 2026-11-25: the 32 MB the cache's chunks held after hg's 57k push, with nothing to say why).
+pub fn text_cache_seen() -> TextCacheFigures {
+  TEXT_CACHE_SEEN.with(core::cell::Cell::get)
+}
+
+std::thread_local! {
   /// The flush of the last changeset this thread's asks landed ([`StoreHandle::land`], [`SlicedLanding::commit`]):
   /// the store's own `sync_data` (`Located::flush_ns`), none since it was last taken.
   static LANDED_FLUSH_NS: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
@@ -348,13 +395,17 @@ struct Timer {
   dequeued_ns: u64,
   disk_before: u64,
   met: Met,
+  /// The request's kind ([`Request::kind`]).
+  kind: &'static str,
+  /// Once answered: its service and the log reads within it.
+  served: Option<(u64, u64)>,
 }
 
 impl Timer {
   /// The timing of a request sent at `sent_ns`, taken at `dequeued_ns` by an owner that began waiting for work at
   /// `idle_ns`: sent after it, its wait was the owner's wake; before, it queued behind the owner's other work.
   fn of(
-    asked: (u64, Option<Sender<Served>>),
+    (asked, kind): ((u64, Option<Sender<Served>>), &'static str),
     (idle_ns, dequeued_ns, met): (u64, u64, Met),
     store: &Store,
   ) -> Self {
@@ -372,23 +423,55 @@ impl Timer {
       dequeued_ns,
       disk_before: store.log().read_ns(),
       met,
+      kind,
+      served: None,
     }
   }
 
-  /// Answers `value` on `answer`, its timing sent first so the asker finds it with the answer.
-  fn reply<T>(&mut self, store: &Store, answer: &Sender<T>, value: T) {
+  /// Answers `value` on `answer`, its timing sent first so the asker finds it with the answer: with the text cache as
+  /// the request left it, served (a figure taken as the owner took the request missed what that request made, so a
+  /// clone's last reads left the status a request behind).
+  fn reply<T>(&mut self, (store, texts): (&Store, &TextCache), answer: &Sender<T>, value: T) {
+    let done_ns = slates_machine::clock::monotonic_ns();
+    let (serve_ns, disk_ns) = (
+      done_ns.saturating_sub(self.dequeued_ns),
+      store.log().read_ns().saturating_sub(self.disk_before),
+    );
+    self.served = Some((serve_ns, disk_ns));
     if let Some(timed) = self.timed.take() {
-      let done_ns = slates_machine::clock::monotonic_ns();
       let _ = timed.try_send(Served {
         behind_ns: self.behind_ns,
         wake_ns: self.wake_ns,
-        serve_ns: done_ns.saturating_sub(self.dequeued_ns),
-        disk_ns: store.log().read_ns().saturating_sub(self.disk_before),
+        serve_ns,
+        disk_ns,
         done_ns,
         met: self.met,
+        texts: texts.figures(),
       });
     }
     let _ = answer.try_send(value);
+  }
+
+  /// Logs this request where its service was the owner's longest yet (`longest_ns`, raised to it): its kind and parts,
+  /// so the slowest request a run met names itself (main's 57k table at 459c07141: one request of 863 ms, unnamed). A
+  /// new longest at most once a doubling past the first, so the log holds a few lines a run however many requests.
+  fn log_if_longest(&self, longest_ns: &mut u64) {
+    let Some((serve_ns, disk_ns)) = self.served else {
+      return;
+    };
+    if serve_ns <= longest_ns.saturating_mul(2) {
+      return;
+    }
+    *longest_ns = serve_ns;
+    slates_machine::log_line!(
+      "slates-store: the owner's longest service yet: a {} request served in {} ns ({} ns of it its log's reads), \
+       {} ns behind other work, {} ns its wake",
+      self.kind,
+      serve_ns,
+      disk_ns,
+      self.behind_ns,
+      self.wake_ns
+    );
   }
 }
 
@@ -542,18 +625,19 @@ impl fmt::Debug for Request {
 
 impl StoreOwner {
   /// Opens the store in `root` on a thread of its own (the store recovers there before the first request is served),
-  /// with room for `waiting` requests at once; waiting for work, it spins at most `spin_cap_ns` (the machine's
-  /// `spin_before_park_ns`: a wake's measured cost) before it parks ([`Gaps`]).
+  /// with room for `waiting` requests at once; waiting for work, it spins only where the next request is predicted
+  /// within a park's wake, which it learns as it runs from `wake_seed_ns` (the machine's `spin_before_park_ns`; 0 where
+  /// none is known: no spin until a wake is measured) ([`Gaps`], [`Wake`]).
   pub fn start(
     root: StoreRoot,
     sizing: Sizing,
-    (waiting, spin_cap_ns): (usize, u64),
+    (waiting, wake_seed_ns): (usize, u64),
   ) -> Result<Self, OwnerError> {
     let grant = crate::store::grant_id(root.grant().target.device, root.grant().target.inode);
     let (requests, incoming) = sync::channel(waiting).map_err(|_| OwnerError::Busy)?;
     let thread = slates_rt::registry::spawn_waited(
       std::thread::Builder::new().name("slates-store".to_owned()),
-      move || serve(root, sizing, incoming, (waiting, spin_cap_ns)),
+      move || serve(root, sizing, incoming, (waiting, wake_seed_ns)),
     )
     .map_err(|_| OwnerError::Gone)?;
     Ok(Self {
@@ -639,13 +723,47 @@ impl Gaps {
     }
   }
 
-  /// How long to spin before parking: the mean and four deviations, at most `cap_ns`; none before a gap is learned.
-  fn window(&self, cap_ns: u64) -> u64 {
-    self.mean_ns.map_or(0, |mean| {
-      mean
-        .saturating_add(self.deviation_ns.saturating_mul(DEVIATION_WEIGHT))
-        .min(cap_ns)
-    })
+  /// The next gap predicted: the mean and four deviations (a retransmission timeout's); none before a gap is learned.
+  fn predicted(&self) -> Option<u64> {
+    self
+      .mean_ns
+      .map(|mean| mean.saturating_add(self.deviation_ns.saturating_mul(DEVIATION_WEIGHT)))
+  }
+
+  /// How long to spin before parking, by rent or buy (main's ruling of 2026-11-25 on the 57k split at 7a9cb385e: asks
+  /// 12.7 ms apart against a wake of 1.36 ms, where spinning to a cap would burn about 4.4 s of the owner's CPU for
+  /// nothing): spin, at most as long as a park's wake costs, only where the next ask is predicted within that wake;
+  /// else park at once. None before a gap is learned.
+  fn window(&self, wake: &Wake) -> u64 {
+    match self.predicted() {
+      Some(predicted) if predicted <= wake.mean_ns => wake.mean_ns,
+      _ => 0,
+    }
+  }
+}
+
+/// What a park's wake costs the owner, learned from the requests it met parked (from the later of the request's send and
+/// the park, to its taking), smoothed as [`Gaps`] smooths a gap (gain 1/8): measured where it runs, under the load it runs
+/// in, never one machine's figure (the 57k split at 7a9cb385e: about 1.36 ms a wake under load 24, against the idle
+/// probe's 9.4 us). Seeded, until the first wake is measured, by the machine's profiled wake (`spin_before_park_ns`).
+#[derive(Clone, Copy, Debug, Default)]
+struct Wake {
+  /// The smoothed wake.
+  mean_ns: u64,
+}
+
+impl Wake {
+  /// A wake seeded at `seed_ns`.
+  fn seeded(seed_ns: u64) -> Wake {
+    Wake { mean_ns: seed_ns }
+  }
+
+  /// One wake more.
+  fn learn(&mut self, wake_ns: u64) {
+    self.mean_ns = self
+      .mean_ns
+      .saturating_sub(self.mean_ns >> MEAN_GAIN_SHIFT)
+      .saturating_add(wake_ns >> MEAN_GAIN_SHIFT);
   }
 }
 
@@ -706,9 +824,10 @@ fn serve(
   root: StoreRoot,
   sizing: Sizing,
   mut incoming: ChannelReceiver<Asked>,
-  (waiting, spin_cap_ns): (usize, u64),
+  (waiting, wake_seed_ns): (usize, u64),
 ) -> Result<(), StoreError> {
   let mut gaps = Gaps::default();
+  let mut wake = Wake::seeded(wake_seed_ns);
   let at = root.target().key.clone();
   let mut store = match Store::open(root, sizing) {
     Ok(store) => store,
@@ -735,20 +854,38 @@ fn serve(
     waiting,
     next: 0,
   };
+  // Whether a request was served yet: the wait before the first is the owner's start, not a gap between asks, and is
+  // never learned as one (a slow start, a test's setup under load, read as a long gap, kept a burst parked).
+  let mut served_once = false;
+  // The longest service a request has had, for the log ([`Timer::log_if_longest`]).
+  let mut longest_ns = 0u64;
   loop {
     landings.let_go_if_dropped(&mut store);
     // From here the owner waits for work: a request sent after it waited on the owner's wake, one before on its work.
     let idle_ns = slates_machine::clock::monotonic_ns();
     let (asked, met) = match landings.next_held() {
       Some(asked) => (asked, Met::Queued),
-      None => match waited_for(&mut incoming, gaps.window(spin_cap_ns)) {
+      None => match waited_for(&mut incoming, gaps.window(&wake)) {
         Some(waited) => waited,
         None => break,
       },
     };
     let dequeued_ns = slates_machine::clock::monotonic_ns();
-    if met != Met::Queued {
-      gaps.learn(dequeued_ns.saturating_sub(idle_ns));
+    // The gap is the asker's: from the wait's start to the request's send, where it carries one sent after it, never to
+    // its taking, which for one met parked adds the wake itself (a gap and a wake learned so, the next gap always
+    // predicted past the wake, and one park kept the owner parked for good).
+    if met != Met::Queued && served_once {
+      let arrived_ns = match asked.timed {
+        Some(_) if asked.sent_ns >= idle_ns => asked.sent_ns.min(dequeued_ns),
+        _ => dequeued_ns,
+      };
+      gaps.learn(arrived_ns.saturating_sub(idle_ns));
+    }
+    served_once = true;
+    // A timed request met parked carries what the park's wake cost: from the later of its send and the park.
+    if let (Met::Parked(spun), true) = (met, asked.timed.is_some()) {
+      let parked_ns = idle_ns.saturating_add(spun).max(asked.sent_ns);
+      wake.learn(dequeued_ns.saturating_sub(parked_ns));
     }
     landings.let_go_if_dropped(&mut store);
     let Some(Asked {
@@ -759,7 +896,11 @@ fn serve(
     else {
       continue;
     };
-    let mut timer = Timer::of((sent_ns, timed), (idle_ns, dequeued_ns, met), &store);
+    let mut timer = Timer::of(
+      ((sent_ns, timed), request.kind()),
+      (idle_ns, dequeued_ns, met),
+      &store,
+    );
     match request {
       Request::Begin {
         header,
@@ -767,7 +908,7 @@ fn serve(
         answer,
       } => {
         let answered = landings.begin(&mut store, header, alive);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Section {
         landing,
@@ -779,7 +920,7 @@ fn serve(
           .check(landing)
           .and_then(|()| store.landing_section(kind, len));
         let answered = landings.failed_lets_go(&mut store, step);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Part {
         landing,
@@ -798,7 +939,7 @@ fn serve(
           bytes
         });
         let answered = given;
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Commit { landing, answer } => {
         // A commit that fails lets the record go (`commit_open` took it); a stranger's commit touches nothing.
@@ -807,7 +948,7 @@ fn serve(
           store.commit_landing()
         });
         let answered = committed;
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       // The daemon's stop: the loop ends here, and the open landing is let go and the checkpoint written below.
       Request::Stop => break,
@@ -822,7 +963,7 @@ fn serve(
           .map(|(kind, bytes)| (*kind, Contents::Bytes(bytes)))
           .collect();
         let answered = store.land(header, &sections, &staging);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Piece {
         identity,
@@ -834,7 +975,7 @@ fn serve(
           .piece(&staging, &identity, len, offset)
           .map(|piece| piece.map(std::borrow::Cow::into_owned));
         let answered = read;
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Changesets {
         repository,
@@ -843,11 +984,11 @@ fn serve(
         answer,
       } => {
         let answered = store.changesets(repository, from, limit);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Sections { row, answer } => {
         let answered = sections_of(&store, &row);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Text {
         repository,
@@ -869,7 +1010,7 @@ fn serve(
             })
           });
         let answered = read;
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Texts {
         repository,
@@ -882,7 +1023,7 @@ fn serve(
           repository,
           (&identities, most),
         );
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::TextRow {
         repository,
@@ -890,7 +1031,7 @@ fn serve(
         answer,
       } => {
         let answered = store.text_row(repository, &identity);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Forget {
         repository,
@@ -898,7 +1039,7 @@ fn serve(
         answer,
       } => {
         let answered = store.forget(repository, sequence);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::PathTexts {
         repository,
@@ -908,7 +1049,7 @@ fn serve(
         answer,
       } => {
         let answered = store.path_texts(repository, &path, from, limit);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::TextsByTool {
         repository,
@@ -920,11 +1061,11 @@ fn serve(
           .map(|(path, tool_ids)| store.texts_by_tools(repository, path, tool_ids))
           .collect();
         let answered = found;
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Places { places, answer } => {
         let answered = store.places_bytes(&staging, &places);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
       Request::Read {
         offset,
@@ -932,9 +1073,10 @@ fn serve(
         answer,
       } => {
         let answered = store.read(offset, len);
-        timer.reply(&store, &answer, answered);
+        timer.reply((&store, &texts), &answer, answered);
       }
     }
+    timer.log_if_longest(&mut longest_ns);
   }
   store.abandon_landing();
   let checkpointed = store.checkpoint();
@@ -1100,6 +1242,7 @@ impl StoreHandle {
         sum.add(&served, (sent_ns, taken_ns));
         waits.set(sum);
       });
+      TEXT_CACHE_SEEN.with(|seen| seen.set(served.texts));
     }
     match answer {
       Ok(Err(StoreError::Held)) => Err(OwnerError::Busy),
@@ -1484,3 +1627,6 @@ fn texts_made(
   }
   Ok(MadeTexts::Made(made))
 }
+
+#[cfg(test)]
+mod tests;

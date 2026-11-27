@@ -24,7 +24,7 @@
 //! record plane compares at every version (§4.16 "Apply on holders").
 
 use super::copy::EntryCopies;
-use super::position::{Placed, Unit};
+use super::position::{Placed, UnitRef, Verdict};
 use super::{Computed, ConflictWindow, ContentSource, Effect, Green, Increment, Reached};
 use crate::chain_entry::{Applied, Declared, put_applied, take_applied};
 use crate::map::Mapped;
@@ -89,8 +89,8 @@ impl Computed {
         out.push(VERDICT);
         let declared = Declared::of(inc);
         put_count(&mut out, units.len());
-        for unit in units {
-          put_unit(&mut out, &declared, unit);
+        for unit in units.units() {
+          put_unit(&mut out, &declared, &unit);
         }
       }
     }
@@ -135,7 +135,7 @@ impl Green {
     &self,
     reader: &mut Reader<'_>,
     inc: &Increment,
-  ) -> Result<Vec<Unit>, DocDecodeError> {
+  ) -> Result<Verdict, DocDecodeError> {
     let declared = Declared::of(inc);
     let count = count_of(reader, UNIT_MIN_BYTES)?;
     let mut read = Vec::with_capacity(count);
@@ -147,20 +147,15 @@ impl Green {
       .flat_map(|unit| unit.applied.iter().cloned())
       .collect();
     let copies = EntryCopies::of(&every);
-    Ok(
-      read
-        .into_iter()
-        .map(|unit| Unit {
-          effects: unit
-            .applied
-            .iter()
-            .map(|applied| self.verdict_effect(applied, (inc.post(), &copies)))
-            .collect(),
-          windows: unit.windows,
-          placed: unit.placed,
-        })
-        .collect(),
-    )
+    let mut verdict = Verdict::default();
+    for unit in &read {
+      let effects = unit
+        .applied
+        .iter()
+        .map(|applied| self.verdict_effect(applied, (inc.post(), &copies)));
+      verdict.push_unit((effects, &unit.windows, &unit.placed));
+    }
+    Ok(verdict)
   }
 
   /// The effect the live verdict holds for `applied` (module docs): a splice unmade, every other as a replay rebuilds it.
@@ -189,19 +184,19 @@ struct ReadUnit {
 }
 
 /// Appends one unit: its effects, its windows, its placements, each counted.
-fn put_unit(out: &mut Vec<u8>, declared: &Declared<'_>, unit: &Unit) {
+fn put_unit(out: &mut Vec<u8>, declared: &Declared<'_>, unit: &UnitRef<'_>) {
   put_count(out, unit.effects.len());
-  for effect in &unit.effects {
+  for effect in unit.effects {
     put_applied(out, declared, &effect.applied());
   }
   put_count(out, unit.windows.len());
-  for window in &unit.windows {
+  for window in unit.windows {
     put_bytes(out, window.path.as_bytes());
     put_range(out, window.range);
     out.push(class_tag(window.class));
   }
   put_count(out, unit.placed.len());
-  for placed in &unit.placed {
+  for placed in unit.placed {
     let (range, point) = placed.parts();
     put_mapped(out, range);
     put_mapped(out, point);

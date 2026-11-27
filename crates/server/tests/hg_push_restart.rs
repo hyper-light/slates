@@ -142,3 +142,8 @@ fn a_restart_after_a_push_brings_back_none_of_its_texts() {
     "no green rebuilt after the stores"
   );
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

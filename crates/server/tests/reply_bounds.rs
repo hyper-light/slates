@@ -386,3 +386,8 @@ fn a_volume_under_the_longest_name_a_create_accepts_is_listed_and_statused() {
   drop(client);
   daemon.stop();
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

@@ -3529,3 +3529,81 @@ fn a_submit_over_a_subversion_green_whose_repository_awaits_its_rebuild_is_refus
     );
   });
 }
+
+proptest::proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+  /// A-920 piece 4b (oracle). Do: hash records of up to 4 KiB, the empty one among them, a slice a step
+  /// (`staging::hash_some`, every step spent after its first slice) in slices of 1 to 64 bytes. Expect the record's
+  /// identity (`identity`), byte for byte, in as many steps as it has slices.
+  #[test]
+  fn a_records_identity_hashed_a_slice_a_step_is_its_identity_whole(
+    record in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096),
+    slice in 1usize..64,
+  ) {
+    let mut hasher = blake3::Hasher::new_derive_key(super::IDENTITY_CONTEXT);
+    let mut rest = record.as_slice();
+    let mut steps = 1usize;
+    while !super::staging::hash_some((&mut hasher, &mut rest), slice, &mut || true) {
+      steps += 1;
+    }
+    proptest::prop_assert_eq!(*hasher.finalize().as_bytes(), super::identity(&record));
+    proptest::prop_assert_eq!(steps, record.len().div_ceil(slice).max(1));
+  }
+}
+
+/// The texts a changeset carries as the walk took them whole before A-920 11c (`texts_carried` then): its oracle.
+fn carried_whole(
+  changes: &[ChangedPath],
+  put: &[ContentIdentity],
+) -> Vec<super::landing::LandedText> {
+  let put: std::collections::BTreeSet<&ContentIdentity> = put.iter().collect();
+  let mut seen = std::collections::BTreeSet::new();
+  let mut carried = Vec::new();
+  for change in changes {
+    let Some(text) = change.text else {
+      continue;
+    };
+    if put.contains(&text.identity) && seen.insert(text.identity) {
+      carried.push(super::landing::LandedText {
+        path: change.path.as_bytes().to_vec(),
+        identity: text.identity,
+        len: text.size,
+      });
+    }
+  }
+  carried
+}
+
+/// A-920 11c. Do: walk the texts a changeset of six rows carries a unit a call (`Carrying::unit`): rows whose texts
+/// were put, one whose text was not, one text set at two paths, a deletion with none. Expect: what the whole walk
+/// carries, in the same order (each text once, at its first path), in a unit for every text put and every row.
+#[test]
+fn the_texts_a_changeset_carries_walked_a_unit_a_call_are_the_whole_walks() {
+  let rows = vec![
+    file("/a", Action::Add, b"alpha"),
+    file("/b", Action::Add, b"beta"),
+    file("/c", Action::Add, b"gamma"),
+    file("/d", Action::Add, b"alpha"),
+    row("/e", Action::Delete, NodeKind::File),
+    file("/f", Action::Modify, b"delta"),
+  ];
+  let put = vec![identity(b"alpha"), identity(b"beta"), identity(b"delta")];
+  let mut carrying = super::Carrying::new(put.len());
+  let mut units = 1usize;
+  while !carrying.unit(&rows, &put) {
+    units += 1;
+  }
+  assert_eq!(carrying.carried, carried_whole(&rows, &put));
+  let paths: Vec<Vec<u8>> = carrying
+    .carried
+    .iter()
+    .map(|text| text.path.clone())
+    .collect();
+  assert_eq!(paths, vec![b"/a".to_vec(), b"/b".to_vec(), b"/f".to_vec()]);
+  assert_eq!(
+    units,
+    put.len() + rows.len() + 1,
+    "a unit a text put and a row, then the end"
+  );
+}

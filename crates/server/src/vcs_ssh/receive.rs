@@ -263,7 +263,7 @@ async fn answer_step<S: ShardLender>(
     }
     Answering::Turned => {
       // A-864's push readers: a base or object a turn met in a let-go window is brought back before the next turn.
-      crate::vcs_store::upload::brought_back_waited(push.repository()).await;
+      crate::vcs_store::upload::brought_back_own(push.take_waited()).await;
       Ok((Next::More, Some(turn)))
     }
     #[cfg(unix)]

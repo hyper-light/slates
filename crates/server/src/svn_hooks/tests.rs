@@ -72,6 +72,8 @@ fn ended(outcome: Outcome, standard_output: Option<&[u8]>) -> Ended {
       kept: bytes.to_vec(),
       dropped: 0,
     }),
+    started_at_ns: None,
+    exited_at_ns: None,
   }
 }
 
@@ -209,6 +211,7 @@ fn ran(policy: RepositoryPolicy, input: HookInput) -> SvnHookRan {
   let view: PathBuf = program.parent().expect("its directory").to_path_buf();
   runtime
     .spawn(async move {
+      let _spawner = crate::spawning::TestSpawner::installed();
       let site = SvnHookSite {
         policy: &policy,
         view_root: &view,

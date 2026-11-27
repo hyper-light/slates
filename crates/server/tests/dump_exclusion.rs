@@ -414,3 +414,8 @@ fn an_administrators_local_full_dump_carries_every_mapping() {
     );
   }
 }
+
+// This test binary's spawner role (A-924): a daemon it starts in process starts its spawner as this binary, which runs
+// this test alone and serves.
+#[cfg(unix)]
+slates_ipc::spawner_role!();

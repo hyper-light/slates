@@ -300,6 +300,17 @@ impl Facts {
     platform::resident_bytes()
   }
 
+  /// This process's physical footprint right now (one cheap query), where the OS reads it apart from the resident size:
+  /// macOS's `phys_footprint` (`proc_pid_rusage`), what memory pressure and jetsam count. A page given back as reusable
+  /// (`MADV_FREE_REUSABLE`, A-110) leaves it at once while the resident size keeps counting the page until the kernel
+  /// takes it (measured, `slates-mem`'s `tests/macos_residency.rs`: 32 MiB given back, footprint 33 MiB to 1, resident
+  /// size 38 flat), so on macOS this, not [`Facts::resident_now`], is what a give-back is judged by (goal 93 P7). `None`
+  /// elsewhere: Linux's shared discard punches a hole (`MADV_REMOVE`), which leaves the resident size at once, and
+  /// Windows' leaves the working set, so the resident size is the honest reading there.
+  pub fn footprint_now() -> Option<u64> {
+    platform::footprint_bytes()
+  }
+
   /// The machine's physical memory in bytes (one cheap query; 0 where the OS refuses it): what bounds the bytes any file
   /// of a RAM-only volume can hold, so it sizes what must cover any such file (a Windows DAX section, `slates-mem`).
   pub fn memory_total() -> u64 {
@@ -591,6 +602,10 @@ mod platform {
 
   pub(super) fn resident_bytes() -> Option<u64> {
     rusage_v0().map(|info| info.resident_size)
+  }
+
+  pub(super) fn footprint_bytes() -> Option<u64> {
+    rusage_v0().map(|info| info.phys_footprint)
   }
 
   pub(super) fn available_bytes() -> Option<u64> {
@@ -1280,6 +1295,12 @@ mod platform {
     bound
   }
 
+  /// Linux reads no footprint apart from the resident size: a shared discard punches a hole, which leaves the resident
+  /// size at once ([`super::Facts::footprint_now`]).
+  pub(super) fn footprint_bytes() -> Option<u64> {
+    None
+  }
+
   /// Memory available to a new allocation without reclaim, as the kernel estimates it now
   /// (`MemAvailable` of `/proc/meminfo`).
   pub(super) fn resident_bytes() -> Option<u64> {
@@ -1365,6 +1386,12 @@ mod platform {
   /// The live "available" probe arrives with the Windows bridge (Phase 4); the facts' value
   /// stands until then.
   pub(super) fn available_bytes() -> Option<u64> {
+    None
+  }
+
+  /// Windows reads no footprint apart from the working set: a discard leaves it at once
+  /// ([`super::Facts::footprint_now`]).
+  pub(super) fn footprint_bytes() -> Option<u64> {
     None
   }
 
