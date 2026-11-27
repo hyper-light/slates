@@ -1091,8 +1091,43 @@ pub(crate) fn ledger_unheld(
   Ok(unheld)
 }
 
+/// What a rebuild of `object`'s replica through `through` reads, checked before it begins (A-933, A-918 B): version 0's
+/// record, then each version's from its durable checkpoint's (or 1) through `through`, as [`ledger_unheld`] answers
+/// them: `Err` with the first version whose record this node lacks, else `Ok` with each one whose inputs it does not
+/// hold. A takeover's adoption (`green_adopt::rebuild`) and a holder's record path (`merge_service::record_standing`)
+/// each ask it, and bring what is missing their own way.
+pub(crate) fn rebuild_needs(
+  state: &ShardState,
+  object: ObjectId,
+  through: u64,
+) -> Result<Vec<(u64, [u8; 32])>, u64> {
+  if ledger_value(state, object, 0).is_none() {
+    return Err(0);
+  }
+  let from = state
+    .merge
+    .checkpoints
+    .get(&object)
+    .filter(|held| held.at <= through)
+    .map_or(1, |held| held.at);
+  ledger_unheld(state, object, (from.min(through), through))
+}
+
+/// The newest version of `object` through which this holder's ledger holds every record from version 0, looked at
+/// through `through` (A-918 B: where a read of the green's chain begins); `None` where it lacks version 0's.
+pub(crate) fn chained_through(state: &ShardState, object: ObjectId, through: u64) -> Option<u64> {
+  let mut held = None;
+  for version in 0..=through {
+    if ledger_value(state, object, version).is_none() {
+      break;
+    }
+    held = Some(version);
+  }
+  held
+}
+
 /// The newest version of `object` this holder accepted (its acceptor's highest position), if it accepted any.
-fn newest_accepted(state: &ShardState, object: ObjectId) -> Option<u64> {
+pub(crate) fn newest_accepted(state: &ShardState, object: ObjectId) -> Option<u64> {
   state
     .holder_records
     .get(&object)?
