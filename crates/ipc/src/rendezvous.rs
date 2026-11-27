@@ -1468,7 +1468,7 @@ pub mod platform {
   }
 
   /// The anchor's listening socket (A-114): held for the anchor's life, so the kernel keeps the address and queues every
-  /// connect while no daemon runs; close-on-exec, handed on to a spawned daemon alone ([`HeldRendezvous::hold`]).
+  /// connect while no daemon runs; close-on-exec, handed on to a spawned daemon alone ([`super::HeldRendezvous::hold`]).
   pub(super) struct Held {
     socket: OwnedFd,
     /// The socket file the anchor bound, removed when it stops (A-187).
