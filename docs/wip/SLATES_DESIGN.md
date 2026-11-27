@@ -64039,6 +64039,19 @@ owner's acceptor in the control shard's state), the state_log module doc (its ow
   join it lacks (`ledger_read::join_read`). It reads the names log's positions below its adopted position. A read past
   tolerance is kept per register, bounded by the registers held, so that adoption refuses on it. A read's held
   names-log parts are noted as a shipped part's are.
+- **Amended: the forget's mark** (2026-11-27, main 01a20182's TLC of 11:17). `FencedLedger_forget.cfg` failed: with
+  ReadSafety removed, Continuity broke in 17 states with the rule on. A holder forgot, accepted a late proposal at
+  position 1 again, took its start back to 1, and promised nothing at position 2, which it had held: epoch 2 adopted
+  nothing there, losing epoch 1's committed value. ReadSafety as written failed too, at state 10, a forgotten holder's
+  silence counted in a majority. The model now keeps a mark per holder, the highest position it held when it forgot
+  (`lost`), and an accept at or below the mark never moves its start (`ForgetMark`): it counts below the mark only once
+  it holds that prefix again. ReadSafety is start-aware: it judges a majority only at positions every one of its
+  holdings reaches. `FencedLedger_forget_nomark.cfg`, the rule without the mark, must fail Continuity. The product has
+  no such path: the owner's hold, the one acceptor that forgets (rebuilt at a warm restart), refills only through its
+  commits (`fleet::owner_hold`). Those come in each log's position order from its oldest owed part
+  (`fleet::owed_state_log_parts`), and what it lost is exactly the let-go prefix below that part (`let_go_held` splits
+  at the point every remote candidate holds). Every other holder's acceptor persists across restarts, and a candidate a
+  death brings in held nothing before. A-919 (C)'s committed floor is that prefix's mark, made explicit on the owner.
 
 ### A-921 part 2 — A repository a takeover moved from a node is answered there with where it went, found by the one owner lookup (2026-11-25, w-shared for main 01a20182, its rulings of 2026-11-25; amends AUD-08's lookup status)
 
