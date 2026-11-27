@@ -817,7 +817,7 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     what_holds prints every vcs_store.image.* row. Focused tests: 49 passed.
   - Waiting on main: the 57k rerun with these counters, then its ruling: (a) carry a piece in parts, which takes the
     copy out, or (b) fewer cuts, its guess. Then the make_chain keep rows (36.0 MB live after the push, texts.rs:1607).
-- 2026-11-27 ~03:00 PST:
+- 2026-11-27 00:23 PST (279688c64's commit time; first stamped ~03:00 in error):
   - LANDED 279688c64 (1ae227e91): the text cache's index counts against its bound (INDEX_ENTRY_BYTES, 97 B a text)
     and shrinks after it (INDEX_SLACK); gauge mem.gauge.store.text_cache_index_bytes. The 35.7 MB keep row was the
     index (tiny texts and refresh entries per 1 MiB chunk). Red: 100,000 texts of 8 B read twice grew the heap
@@ -827,9 +827,16 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     published_for_ticket (about 1: a byte rule for cuts nobody waits on, plus a cut a ticket asks for and one at idle;
     near 17,745: fold the other waits under A-929's barrier).
   - Waiting on main: that rerun.
-- 2026-11-27 ~04:30 PST:
+- 2026-11-27 00:57 PST (5ce8817dc's commit time; first stamped ~04:30 in error):
   - LANDED 5ce8817dc (8e16d1f39): Windows CI red (run 45948476737) on a_one_page_give_back_...: the test asserted the
     bytes the OS took, 0 on Windows' section views. It now holds what is asked on every platform: whole pages asked
     back (new counter recovery.asked_bytes), nothing left dead. Red with the rounding out: 0 asked. MacBook: 16,384.
   - Waiting on main: its Windows diag run of the tip; its third 57k churn (published_for_ticket, cuts, the text-cache
     index gauge) and the (i)/(ii) cadence ruling.
+- 2026-11-27 03:12  (f925f47d4's commit time; written 2026-11-27 03:28 PST):
+  - LANDED f925f47d4 (8784d9d76): hg's bring_in asks a manifest base again once when a landing lets a row above its
+    asked let-go link go between the ask and its use (Base::Asked::again; vcs.hg.push_log_texts_reasked). Red: the
+    landing-cadence harness (a_pushs_logs_taken_while_its_segments_land_..., pushed_landing_every) refused
+    UnknownDeltaBase landing every 2 steps; now every cadence 2-16 taken, 6 to 41 re-asks. w-hg noted (1a730cb13).
+  - Found hunting main's 57k intake hang; whether it is that hang: open (main's hang control, sampled runs).
+  - Waiting on main: the hang control's samples; the third churn's (i)/(ii) reading; the Windows diag's test lanes.
