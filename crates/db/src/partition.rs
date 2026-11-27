@@ -2302,8 +2302,13 @@ impl Partition {
     self.apply_op(op)?;
     self
       .repositories
-      .seal_made(|| slates_wire::Wire::to_bytes(op));
+      .seal_made(|| crate::repository::identity_encoding(op));
     Ok(())
+  }
+
+  /// The bytes the last operation's identity hashed (`Repositories::seal_made`, A-920 13c).
+  pub fn sealed_bytes(&self) -> usize {
+    self.repositories.sealed_bytes()
   }
 
   /// The state logs' records the operation last applied made, each stamped with the operation's identity and spans

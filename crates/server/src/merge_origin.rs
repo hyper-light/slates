@@ -2269,7 +2269,7 @@ mod tests {
       log: slates_db::catalog::StateLog::Names,
       from: 0,
       to: u64::try_from(changes.len()).unwrap(),
-      identity: [3; 32],
+      identity: slates_db::catalog::OperationIdentity { digest: [3; 32] },
       spans: Vec::new(),
       changes,
     };

@@ -2608,6 +2608,12 @@ fn chain_entry_of(
 /// whatever it met, as a verb's is (`verbs::run_recorded`), and a refused publication's in-memory effects reconciled
 /// with what the log holds (`verbs::reconcile_unpublished_effects`). Each op was judged whole beforehand
 /// (`Partition::check_creating`), so none is refused here; one that is, is counted.
+/// Gauge: the most bytes a register op's identity hashed when its state-log records were stamped
+/// (`slates_db::partition::Partition::sealed_bytes`, A-920 13c), the shard's largest so far: a chain entry stands in as
+/// its 32-byte digest, so it is bounded by the op's versions, never by the paths a version records. Format: a counter
+/// name in the status report, its largest value.
+pub(crate) const SEALED_BYTES_MOST: &str = "repository.push.sealed_bytes_most";
+
 fn record_all(state: &mut ShardState, ops: Vec<Op>) -> Result<(), AppendRefused> {
   let now = state.clock.monotonic_ns();
   let own = !state.db.in_transaction();
@@ -2622,6 +2628,11 @@ fn record_all(state: &mut ShardState, ops: Vec<Op>) -> Result<(), AppendRefused>
       recorded = Err(AppendRefused::Entry(refusal_of_db(&error)));
       break;
     }
+    // What the op's identity hashed, the most kept: bounded by its versions' count, never a revision's width (A-920
+    // 13c: a 9,000-path revision's 431 KB entry hashed whole before).
+    let sealed = u64::try_from(state.db.partition().sealed_bytes()).unwrap_or(u64::MAX);
+    let most = state.refusals.entry(SEALED_BYTES_MOST).or_insert(0);
+    *most = (*most).max(sealed);
   }
   if own && let Err(error) = state.db.commit(&mut state.segment) {
     crate::verbs::reconcile_unpublished_effects(state);

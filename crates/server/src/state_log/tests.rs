@@ -38,7 +38,9 @@ fn part(repository: RepositoryId, log: StateLog, (from, to): (u64, u64)) -> Stat
     log,
     from,
     to,
-    identity: [u8::try_from(to).unwrap_or(u8::MAX); 32],
+    identity: slates_db::catalog::OperationIdentity {
+      digest: [u8::try_from(to).unwrap_or(u8::MAX); 32],
+    },
     spans: Vec::new(),
     changes,
   };

@@ -3945,7 +3945,7 @@ mod tests {
       log: slates_db::catalog::StateLog::Names,
       from: 0,
       to: 2,
-      identity: [2; 32],
+      identity: slates_db::catalog::OperationIdentity { digest: [2; 32] },
       spans: vec![slates_db::catalog::LogSpan {
         log,
         from: 0,

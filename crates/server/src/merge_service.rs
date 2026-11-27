@@ -6840,7 +6840,7 @@ mod tests {
       log: slates_db::catalog::StateLog::Names,
       from: 0,
       to,
-      identity: [3u8; 32],
+      identity: slates_db::catalog::OperationIdentity { digest: [3u8; 32] },
       spans: Vec::new(),
       changes,
     };
