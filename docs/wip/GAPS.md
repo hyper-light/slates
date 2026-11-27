@@ -290,8 +290,14 @@
 > (`docs/bugs/2026-11-27-a-lone-green-adopted-as-a-root-left-its-branches-unreplicated.md`). Red first:
 > `merge_service` `a_lone_green_adopted_as_a_root_is_branched_on_its_holder` (`Err("merge.out_of_order")`) and
 > `merge_origin` `a_restarted_holder_rebuilds_a_branch_of_a_lone_green_adopted_as_a_root` (`[Later, Later, Later,
-> Later]`). Not covered: a takeover's adoption of such a root before any branch of it reached the successor (w-shared's
-> A-918 B area); main's fleet run decides whether it needs a test.
+> Later]`).
+> **OPEN, coverage (w-interop, 2026-11-27; main's ruling of 12:17): the same root adopted by a takeover successor before
+> any branch of it reached the successor.** The successor installs the root alone (`green_adopt`), from the
+> predecessor's lone replica. A later branch record there takes `make_origin_replica`'s same branch arm, so
+> `adopted_root_founded` should found the lineage there as on any holder. No test runs that path: main's fleet run was
+> at bfdacf8ea, before the fix, and a pass would not show the path ran. A fleet test of it must see
+> `merge.replica.adopted_root_founded` move on the successor. Worked when measured, or when w-shared's A-918 B touches
+> `green_adopt`.
 > **FIXED (A-912, w-shared, 2026-11-24; main 01a20182's rulings): a push made right after a member died was refused
 > `retry` for a second or more.** A home behind its sender held the put for its install, which needed the council's next
 > append on the very record session the put held, and the coordinator awaited its healer inline; and a home that died
