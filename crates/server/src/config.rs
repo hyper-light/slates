@@ -692,6 +692,15 @@ pub struct ShardContentLayout {
   pub arena: (usize, usize),
 }
 
+/// `bytes` rounded down to whole `page`s, one page at least: what a region of a shard's content slice is laid in, so
+/// the next begins on a page and a give-back's whole pages are the region's own.
+fn whole_pages(bytes: usize, page: usize) -> usize {
+  let page = page.max(1);
+  bytes
+    .saturating_sub(bytes.checked_rem(page).unwrap_or(0))
+    .max(page)
+}
+
 /// Format: one slot of a shard's DAX range table (A-365): the attachment, the inode, the range's index and its flags, a
 /// little-endian `u64` each.
 pub(crate) const DAX_RANGE_SLOT_BYTES: usize = 4 * size_of::<u64>();
@@ -770,7 +779,24 @@ impl DaemonConfig {
   pub fn write_log_bytes(&self) -> usize {
     /// Shape: the share of the reserve the log takes (see the method).
     const RESERVE_SHARE: usize = 4;
-    usize::try_from(self.reserve_per_shard).unwrap_or(usize::MAX) / RESERVE_SHARE
+    // Whole pages, one at least, so every region laid after it begins on a page (main's Windows CI red of 2026-11-27:
+    // a reserve no multiple of four pages put the slots and the delta log 1,024 bytes past one).
+    whole_pages(
+      self
+        .content_reserve()
+        .checked_div(RESERVE_SHARE)
+        .unwrap_or(0),
+      self.page,
+    )
+  }
+
+  /// Derived: the reserve as the content slice lays it out ([`DaemonConfig::shard_content_layout`]):
+  /// `reserve_per_shard` in whole pages, one at least, so each checkpoint slot and the delta log is whole pages.
+  fn content_reserve(&self) -> usize {
+    whole_pages(
+      usize::try_from(self.reserve_per_shard).unwrap_or(usize::MAX),
+      self.page,
+    )
   }
 
   /// Derived: where each part of one shard's slice of the anchor's content object lies, relative to the slice's
@@ -788,9 +814,7 @@ impl DaemonConfig {
       .unwrap_or(self.page)
       .max(self.page)
       .max(1);
-    let reserve = usize::try_from(self.reserve_per_shard)
-      .unwrap_or(usize::MAX)
-      .max(self.page);
+    let reserve = self.content_reserve();
     let log = self.write_log_bytes();
     let images_end = reserve.saturating_mul(PUBLISH_SLOTS).saturating_add(log);
     // Derived (A-68): the delta log holds one reserve, a checkpoint slot's size: the journal checkpoints once the
@@ -2333,6 +2357,58 @@ mod tests {
   /// on the derived caps accepts its class and offers a positive records ledger. Non-vacuous: with
   /// the directory-block bound tied to the directory count over the node's size alone, the blocks
   /// alone were several times the class and the class was refused.
+  /// Shape: a Windows CI runner's measured reserve per shard (main's diag CI 2, run 45986066740: its effective capacity
+  /// of 17,174,360,064 bytes over one shard and its memory classes), no multiple of four pages.
+  const WINDOWS_RESERVE: u64 = 5_724_786_688;
+
+  /// Main's Windows CI red of 2026-11-27 (run 45986066740): the write log is a quarter of the reserve, so with Windows'
+  /// reserve the checkpoint slots and the delta log began 1,024 bytes past a page, and a give-back could take no page
+  /// they share with the region before. Do: lay a shard's slice of the content object out for [`WINDOWS_RESERVE`] at a
+  /// 4 KiB page. Expect every region's start and end (the write log, both slots, the delta log, the DAX range table's
+  /// start) on a page. Red before: the slots and the delta log 1,024 bytes past one.
+  #[test]
+  fn every_region_of_a_shards_content_slice_begins_and_ends_on_a_page() {
+    let profile = crate::daemon::test_profile();
+    let mut config = DaemonConfig::derive(&profile, "content-pages", Some(1));
+    config.page = 4096;
+    config.geometry.page = 4096;
+    config.reserve_per_shard = WINDOWS_RESERVE;
+    let layout = config.shard_content_layout();
+    let page = config.page;
+    for (name, (start, end)) in [
+      ("the write log", layout.write_log),
+      ("the slots", layout.images),
+      ("the delta log", layout.delta_log),
+    ] {
+      assert_eq!(
+        start % page,
+        0,
+        "{name} begins {} bytes past a page",
+        start % page
+      );
+      assert_eq!(
+        end % page,
+        0,
+        "{name} ends {} bytes past a page",
+        end % page
+      );
+    }
+    assert_eq!(
+      layout.dax_ranges.0 % page,
+      0,
+      "the DAX range table begins on a page"
+    );
+    let (first, second) = slates_vfs::recover::slots_of_memory(layout.images.1 - layout.images.0);
+    for (name, (offset, len)) in [("the first slot", first), ("the second slot", second)] {
+      assert_eq!(
+        (layout.images.0 + offset) % page,
+        0,
+        "{name} begins on a page"
+      );
+      assert_eq!(len % page, 0, "{name} is whole pages");
+    }
+  }
+
   #[test]
   fn the_derived_slab_bounds_lay_the_metadata_class_out_with_room_for_records() {
     use slates_mem::arena::ChunkArena;
