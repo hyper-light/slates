@@ -549,8 +549,10 @@
 >   (a delete was answered ready at once by `ServerJudge::ready`, and now takes the build turn its preparation needs);
 >   `IndexedObjects` drops a let-go met by an earlier ask before one answered from what it kept. Reds:
 >   `git_push::tests::b2_an_update_of_a_ref_whose_green_is_headed_by_a_let_go_tag_brings_it_back_and_lands` and
->   `b2_a_delete_of_...` (the tag in a window of its own past a filler blob, every window let go and the repository
->   idle; both `failed to update ref` before). No unit red below the server: the miss is `ShardGreens`', and
+>   `b2_a_delete_of_...` (the tag in a window of its own past a filler blob; once the create's derivation has ended,
+>   every window let go and the repository idle in the push's own task before its first step, the tag's window asserted
+>   let go by its number; both `failed to update ref` before, and after, the push's own driver bringing it back; main's
+>   run 10 of 16 had the delete pass with nothing brought back when the let-go was made before the push's task). No unit red below the server: the miss is `ShardGreens`', and
 >   `prepare` is driven only by the server's judge.
 > - OPEN: B3 (the admission's peel and references), B4 (the policy's reads), B5 (`PushedObjects::bytes` of a pushed
 >   object, `Malformed`), B6 (a verdict's one-call build), B7 (`push_of`'s peel at judge time, after `prepare`'s), B8
