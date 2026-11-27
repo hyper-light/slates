@@ -124,6 +124,10 @@ pub(super) struct PushHooks {
   open: Option<Open>,
   /// The views this push has opened: each one's number, as its hook's input names it.
   views: u64,
+  /// The let-go window its view's open or seal last stopped at, by the let-go's number: the readers' one rule
+  /// (`slates_git::away::WaitOnce`; B9 of the landed let-go's lift), so the same let-go met again with nothing read
+  /// between ends the hook's run typed.
+  wait: slates_git::away::WaitOnce<u64>,
 }
 
 /// A push's answer while its hooks before the verdicts run (`AnswerState::Hooking`).
@@ -222,6 +226,7 @@ impl Hooking {
       at: At::PreReceive,
       open: None,
       views: 0,
+      wait: slates_git::away::WaitOnce::default(),
     };
     Hooking {
       record,
@@ -239,7 +244,7 @@ impl PushHooks {
   /// `presenter`; or why the hook cannot run, the view closed.
   fn turn<P: PresentView>(
     &mut self,
-    state: &mut ShardState,
+    (state, waits): (&mut ShardState, &slates_git::away::Waits),
     presenter: &mut P,
     (repository, pushed): (RepositoryId, Option<ShownPush<'_>>),
   ) -> Turn {
@@ -255,9 +260,11 @@ impl PushHooks {
         .collect();
       match GitHookView::open(state, repository, (&read, &self.head), pushed) {
         Ok(view) => {
+          self.wait.answered();
           self.open = Some(Open { view, root: None });
           self.views = self.views.saturating_add(1);
         }
+        Err(refused) if stops_at(&self.wait, (state, waits), &refused) => return Turn::Sealing,
         Err(refused) => return Turn::NotRun(words(&refused)),
       }
     }
@@ -265,7 +272,12 @@ impl PushHooks {
       return Turn::NotRun(b"its view was not opened".to_vec());
     };
     let sealed = match open.view.seal_turn(state) {
-      Ok(sealed) => sealed,
+      Ok(sealed) => {
+        self.wait.answered();
+        sealed
+      }
+      // The view kept as it stands: its sealing is taken again once the push's driver brought the window back.
+      Err(refused) if stops_at(&self.wait, (state, waits), &refused) => return Turn::Sealing,
       Err(refused) => {
         self.close(state, presenter);
         return Turn::NotRun(words(&refused));
@@ -341,6 +353,40 @@ impl PushHooks {
   }
 }
 
+/// Whether a hook's view stops at the let-go window `refused` met opening or sealing (B9 of the landed let-go's lift):
+/// noted in the push's own slot, `waits`, for the push's driver to bring back after the turn, the first time the hook
+/// meets that let-go (`wait`, keyed by the let-go's number, `ContentStore::away_number`); never where `refused` met
+/// none or meets the same let-go again with nothing read between, which ends the hook's run typed.
+fn stops_at(
+  wait: &slates_git::away::WaitOnce<u64>,
+  (state, waits): (&ShardState, &slates_git::away::Waits),
+  refused: &GitHookRefused,
+) -> bool {
+  let Some(waited) = away_of(refused) else {
+    return false;
+  };
+  let number = state
+    .vcs_stores
+    .content()
+    .and_then(|content| content.away_number(&waited.pack, waited.len, waited.offset));
+  if !wait.waits(number) {
+    return false;
+  }
+  waits.note(waited);
+  true
+}
+
+/// The let-go window a view's open, seal or read met, where `refused` is that stop (`NotYet`).
+fn away_of(refused: &GitHookRefused) -> Option<slates_git::store::packed::Waited> {
+  use slates_git::store::hook_view::{ReadRefused, SealRefused, ViewRefused};
+  match refused {
+    GitHookRefused::View(ViewRefused::NotYet { waited })
+    | GitHookRefused::Seal(SealRefused::Read(ReadRefused::NotYet { waited }))
+    | GitHookRefused::Read(ReadRefused::NotYet { waited }) => Some(*waited),
+    _ => None,
+  }
+}
+
 /// One step of the hooks before the verdicts (the module docs): a turn of the point's view sealed,
 /// its hook handed to the edge, or, past the last, the verdicts, the report but its last flush,
 /// then `post-receive`'s first step.
@@ -356,10 +402,11 @@ pub(super) fn before<P: PresentView>(
       _ => ShownPush::Migrated(&hooking.sealed),
     });
     let repository = hooking.record.id;
-    match hooking
-      .hooks
-      .turn(state, &mut push.presenter, (repository, pushed))
-    {
+    match hooking.hooks.turn(
+      (state, &push.waits),
+      &mut push.presenter,
+      (repository, pushed),
+    ) {
       Turn::Sealing => {
         push.answer = AnswerState::Hooking(Box::new(hooking));
         return Ok(Answering::Turned);
@@ -537,10 +584,11 @@ pub(super) fn observe<P: PresentView>(
   if applied.is_empty() || !observing.hooks.configures(HookPoint::GitPostReceive) {
     return finish(observing.received, out);
   }
-  match observing
-    .hooks
-    .turn(state, &mut push.presenter, (push.repository, None))
-  {
+  match observing.hooks.turn(
+    (state, &push.waits),
+    &mut push.presenter,
+    (push.repository, None),
+  ) {
     Turn::Sealing => {
       push.answer = AnswerState::Observing(Box::new(observing));
       Ok(Answering::Turned)

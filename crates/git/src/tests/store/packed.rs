@@ -1266,6 +1266,78 @@ fn bring_back_from_either(store: &mut ContentStore, packs: &[Vec<u8>], waited: &
   store.bring_back(&window, bytes).unwrap();
 }
 
+/// B9 of the landed let-go's lift (main 01a20182's ruling of 2026-11-27 07:21: a hook's view, a reader the read sweep
+/// missed). A hook's view holds whole the objects no kept part holds, each read where it lies in its landed pack, which
+/// may be let go. Do: land the `create` push in a store of 256-byte windows, nothing encoded; open the view of `main`
+/// at its version; let every window of the pack go; seal each of the view's packs a unit a turn, bringing back the
+/// window a refused step names and taking the step again; then the same with nothing let go. Expect: the let-go seal
+/// stopped at least once, each stop `ReadRefused::NotYet` naming a let-go window, and its seals the resident ones.
+/// Red before: the seal refused `Read(Unreadable)`.
+#[test]
+fn b9_a_hook_views_seal_stops_at_a_let_go_window_and_seals_as_it_would_resident() {
+  let (resident, _) = hook_view_sealed(false);
+  let (let_go, stops) = hook_view_sealed(true);
+  assert!(stops > 0, "a let-go window met");
+  assert!(let_go == resident, "the same seals");
+}
+
+/// [`b9_a_hook_views_seal_stops_at_a_let_go_window_and_seals_as_it_would_resident`]'s view of the landed `create`
+/// push sealed, every window let go first where `let_go`: its packs' seals, and the stops the sealing made.
+fn hook_view_sealed(let_go: bool) -> (Vec<crate::store::hook_view::Seal>, usize) {
+  use crate::store::hook_view::{HookView, Quantum, ReadRefused, SealRefused, ShownRef, Snapshot};
+  let (repository, mut store, _, pack) = landed_create_in(PIECE2_WINDOW);
+  let refs = [ShownRef {
+    name: b"refs/heads/main",
+    green: 1,
+    version: 0,
+  }];
+  let snapshot = Snapshot {
+    refs: &refs,
+    head: b"refs/heads/main",
+  };
+  let view = HookView::open(
+    &repository,
+    &mut store,
+    &snapshot,
+    None,
+    &mut Admission::new(1 << 26),
+  )
+  .unwrap();
+  if let_go {
+    let_go_every_window(&mut store, &pack);
+  }
+  let names: Vec<ObjectId> = view.packs().map(|(name, _)| name).collect();
+  let mut stops = 0;
+  let mut seals = Vec::new();
+  for name in names {
+    let mut sealing = view.sealing(&name).unwrap();
+    let mut clock = super::Ticks(0);
+    for _ in 0..100_000 {
+      let quantum = Quantum {
+        clock: &mut clock,
+        ns: 0,
+      };
+      match view.seal_step(&mut sealing, (&store, &repository), quantum) {
+        Ok(true) => break,
+        Ok(false) => {}
+        Err(SealRefused::Read(ReadRefused::NotYet { waited })) => {
+          stops += 1;
+          bring_back_the_window_met(&mut store, &pack, &waited);
+        }
+        Err(other) => panic!("the seal after {stops} stops: {other:?}"),
+      }
+    }
+    let seal = view.seal(
+      sealing,
+      &repository,
+      &mut store,
+      &mut Admission::new(1 << 26),
+    );
+    seals.push(seal.unwrap());
+  }
+  (seals, stops)
+}
+
 /// Lets go every `PIECE2_WINDOW` window of `pack` the store still holds, each marked landed first.
 fn let_go_every_window(store: &mut ContentStore, pack: &[u8]) {
   for window in pack.chunks(PIECE2_WINDOW).map(ContentId::of) {

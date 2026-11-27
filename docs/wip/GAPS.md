@@ -555,12 +555,15 @@
 > 2,588,710 bytes of the family (600 times a 4,314.5-byte tail) for 46,275 appended; now 46,300. Part 2: a window let
 > go is a cut of its committed piece (the windows family was 21,192,055 bytes, 28.5%): 60 let-goes over 300 kept
 > windows, a publication each, encoded 266,160 bytes of the family; now 0. OWED: main's in-place 57k rerun for the
-> after, with its publication count and page. Part 3, the cadence (main's ruling (ii) of 2026-11-27): a cut nobody
-> waits on begins once the bytes changed since the last, with the frees the arena holds for the committed cut, come to
-> its cost; a ticket's wait and the shard's idle ask for one. Reds: 300 let-goes published one at a time began 300
-> cuts copying and encoding 2,804,085 bytes, now 2 cuts and 161,862; 40 granule let-goes with no ticket held 163,840
-> freed bytes against a cut costing 26,885 without the held term, now at most 24,576 while deferred. OWED: main's 57k
-> rerun at the tip (cuts, copied bytes, `held_deferred_peak_bytes`, wall time).
+> after, with its publication count and page.
+> **Part 3 REVERTED (main 01a20182, 2026-11-27 08:33):** 7acfd685c's cadence (a cut nobody waits on deferred until its
+> changes and held frees reach its cost) lost a named text across a Subversion restart:
+> `repository::store_tests::a_subversion_restart_replays_a_named_text_with_one_released_window` and
+> `…a_subversion_restart_replays_two_named_texts_whose_windows_are_resident` failed at store_tests.rs:1695, 2 of 2,
+> "(0, 6) named texts brought back", the text reading None after the reboot; w-svn's bisect: with 7acfd685c's crates
+> diff reversed both pass, 2 of 2. Its 57k effect, measured before the revert (main's a930-57k run 1 at 81950e77c, load
+> 62-66): cuts 3,291 to 5, bytes copied 697,376,174 to 7,084,213, held-deferred peak 148,221,952 bytes, resident after
+> the push 845,504 KiB (834,960 at 894a1e111). Re-lands with the restart's red first (w-perf).
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
@@ -729,6 +732,21 @@
 >   `store::tests::packed::b8_an_encodings_tree_walk_stops_at_a_let_go_tree_and_keeps_the_same_fragments` (two
 >   versions landed as packs of whole entries, every window let go: `Unreadable` on the walk's tree before; after, the
 >   walk stops, walks the one pair the resident encoding walks, and the clone is byte for byte the resident one's).
+> - **B9 BUILT (w-git, 2026-11-27, main's ruling of 07:21): a hook's view**, a reader the read sweep missed, found by
+>   the flip's focused run (`git_hooks::tests::a_git_hook_runs_in_its_view_at_each_of_receive_packs_points`: `a turn of
+>   sealing: Seal(Read(Unreadable))`). A view holds whole the objects no kept part holds, each read where it lies in
+>   its landed pack (`hook_view::units::stored_range`), and opening reads each tag a ref names; a let-go window answered
+>   none, `Unreadable`, and the view was closed, the hook not run and the push declined. Now both reads answer `NotYet`
+>   naming the window (`ReadRefused::NotYet`, `ViewRefused::NotYet`); `GitHookView::seal_within` keeps its sealing
+>   where it stopped; and the push's hook turn (`git_push::hooks`) notes the window in the push's own slot, keyed by
+>   the let-go's number (`slates_git::away::WaitOnce`), for its driver to bring back, the same let-go met again with
+>   nothing read between ending the hook's run typed. A hook's file reads follow its seal, which read every byte, while
+>   the push's intake holds the landed let-go off; one that meets a let-go window is refused `NotYet`, typed. Red at the
+>   site: `store::tests::packed::b9_a_hook_views_seal_stops_at_a_let_go_window_and_seals_as_it_would_resident`
+>   (`Read(Unreadable)` before; stops, then the resident seals, after). Net:
+>   `git_push::tests::b9_a_hooked_push_over_a_let_go_pack_brings_its_views_windows_back_and_lands` (a new branch at
+>   `main`'s commit over the create's let-go pack: declined `hook not run` before; lands, windows brought back, after;
+>   its driver, like the HTTP edge, now brings back the push's waited window after a turn).
 > - OPEN (sibling of B8; left recorded by main's ruling of 2026-11-27 04:41, by reading alone, its cost time): the
 >   encoding's stop rule (`Encoding::stop_at`, A-864 piece 2) is keyed by a window's place, once an encoding, not by the
 >   let-go's number as `slates_git::away::WaitOnce` is, so a window brought back by another reader and let go again
