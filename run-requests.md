@@ -7620,3 +7620,15 @@ The dense spec covers a state log's AdoptedIsPrefix (the chain check makes it th
 Red is a forget config holding with the rule off, or failing with it on.
 
 Also by name, once A-921 lands: `cargo test -p slates-server --test fleet a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins -- --ignored --exact` (macOS arm64, debug). It fails about 1 run in 3 at 90cabe801: that is A-921's red.
+
+## 2026-11-27 w-interop, the TSan lane's two reds (main's brief inbox/w-interop-from-main-tsan-lane.md)
+
+Part 1, landed at cd7d8c96c (commit 1deedd4f5). Run the TSan lane on ubuntu-latest, at or past cd7d8c96c:
+`cargo xtask tsan`, as CI's "TSan (mem, rt, ipc, client)" job runs it.
+- Green: `a_restarted_daemon_adopts_its_anchors_sealing_root_and_a_fresh_anchor_mints_another` passes. A
+  `hold_once_released: … held after N refusals as held` line in its output means the wait was exercised, not dead.
+- Red: the same `OsRefused { call: "bind", code: Some(98) }` at a client test's re-hold.
+
+Part 2 is still being diagnosed: diagnostics branch `w-interop/tsan-spawner-diag` at 566b11519, to push as a
+`diag-measurer-*` branch (one TSan job, slates-ipc's library tests three times, then natively). It names descriptor 6,
+and the spawner parity test stays red in the lane until its fix lands.
