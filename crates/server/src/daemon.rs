@@ -1934,6 +1934,23 @@ impl Daemon {
     Ok(positions)
   }
 
+  /// Test support (A-921's second mode, A-919's start rule): the first position of the names log of `member`'s family
+  /// (a repository's id, or a green's of it) this node's own hold as an owner holds (`ShardState::owner_hold`), where its
+  /// holding begins; `None` where it holds none.
+  pub fn owner_hold_start(&self, member: [u8; 16]) -> Result<Option<u64>, ObserveError> {
+    let family = slates_db::register::ObjectId(member).line_key();
+    let names = slates_db::register::RegisterClass::State(slates_db::catalog::StateLog::Names);
+    self.observe(self.shards.first().copied(), move |s| {
+      s.owner_hold.as_ref().and_then(|hold| {
+        hold
+          .positions()
+          .filter(|(object, ..)| object.class() == names && object.line_key() == family)
+          .map(|(_, sequence, ..)| sequence)
+          .min()
+      })
+    })
+  }
+
   /// Test support (A-927 part 2): no shard of this node ships the state logs' parts it owes to `peer`, and every other
   /// candidate is shipped them, so a repository's creation here answers once another member holds its names-log part (its
   /// root's join) while `peer`, its successor-to-be, holds none. `Ok` once set on every shard.
@@ -2872,6 +2889,21 @@ impl Daemon {
     &self,
   ) -> Result<std::collections::BTreeMap<&'static str, u64>, ObserveError> {
     self.observe(self.shards.first().copied(), |s| s.refusals.clone())
+  }
+
+  /// Test support (A-921's second mode): the record each shard of this node last answered with no acknowledgement, by
+  /// why, each as its refusal kind and the record's and this holder's standing then (`fleet::RefusedRecord`), described.
+  pub fn last_record_refusals(&self) -> Result<Vec<(&'static str, String)>, ObserveError> {
+    let mut refusals = Vec::new();
+    for shard in self.shards.clone() {
+      refusals.extend(self.observe(Some(shard), |s| {
+        s.last_record_refusals
+          .iter()
+          .map(|(kind, refused)| (*kind, format!("{refused:?}")))
+          .collect::<Vec<_>>()
+      })?);
+    }
+    Ok(refusals)
   }
 
   /// [`Self::fleet_refusals`] within `budget_ns` rather than the generous observation budget: for a reader that
@@ -5733,6 +5765,7 @@ async fn init_shard(
     served_sessions: std::collections::BTreeMap::new(),
     campaign_session_hold: None,
     record_refused_from: std::collections::BTreeSet::new(),
+    last_record_refusals: std::collections::BTreeMap::new(),
     // The owner lease starts its bounded startup allowance at boot (§4.8 "Leases and reads", AUD-08): the
     // node has just installed its initial configuration, so within the first membership horizon it serves
     // its objects while its first probe acks accumulate, and no takeover can yet have committed.
@@ -11443,10 +11476,73 @@ mod tests {
     Put(u8),
     /// Everything held for object `object` released, as a tombstone releases it (A-376).
     Release(u8),
+    /// The next part of repository `which`'s names log owed to its candidates, as its owner shard holds it (A-921's second
+    /// mode).
+    Owe(u8),
+    /// Repository `which`'s names log's parts through its oldest owed one held by every candidate, so let go.
+    LetGo(u8),
     /// A delta published: what `held_changes` carries, folded over the model.
     Delta,
     /// A checkpoint published: everything held.
     Checkpoint,
+  }
+
+  /// The names log of the held-pieces oracle's repository `which` (A-921's second mode).
+  fn oracle_names_log(which: u8) -> slates_db::catalog::LogName {
+    slates_db::catalog::LogName::State {
+      repository: slates_db::catalog::RepositoryId {
+        bytes: [which.saturating_add(0x40); 16],
+      },
+      log: slates_db::catalog::StateLog::Names,
+    }
+  }
+
+  /// Owes the next part of repository `which`'s names log, from the position its newest owed part left the log at (or
+  /// the log's start), as its owner shard holds a part an operation made: its own operation, named by `at`.
+  fn owe_next_part(state: &mut crate::state::ShardState, which: u8, at: usize) {
+    let name = oracle_names_log(which);
+    let register = name.register();
+    let from = state
+      .state_logs
+      .parts()
+      .filter(|(owed, ..)| *owed == register)
+      .map(|(_, position, _)| position)
+      .max()
+      .unwrap_or(0);
+    let slates_db::catalog::LogName::State { repository, log } = name else {
+      return;
+    };
+    let record = slates_db::catalog::StateLogRecord {
+      repository,
+      log,
+      from,
+      to: from.saturating_add(1),
+      identity: slates_db::catalog::OperationIdentity {
+        digest: [u8::try_from(at % 256).unwrap(); 32],
+      },
+      spans: Vec::new(),
+      changes: Vec::new(),
+    };
+    state.state_logs.hold(&record);
+  }
+
+  /// Lets go of repository `which`'s names log's parts through its oldest owed one, as each of its candidates
+  /// acknowledging it does.
+  fn let_go_oldest_part(state: &mut crate::state::ShardState, which: u8) {
+    let register = oracle_names_log(which).register();
+    let oldest = state
+      .state_logs
+      .parts()
+      .find(|(owed, ..)| *owed == register)
+      .map(|(_, position, _)| position);
+    let Some(oldest) = oldest else {
+      return;
+    };
+    let candidate = slates_db::register::HostId(9);
+    state
+      .state_logs
+      .acknowledged(register, oldest, &[candidate]);
+    state.state_logs.let_go_held(register, &[candidate]);
   }
 
   /// Accepts into `acceptor` a record of `object` from the owner its authority names, under its generation: at
@@ -11486,9 +11582,10 @@ mod tests {
       .is_ok()
   }
 
-  /// A-270, A-367, the oracle of the incremental held image: do run a generated history of live copies kept, cleared,
-  /// let go and made again, and registers held, dropped, grown a position at a time, accepted again at a newer epoch,
-  /// compacted and replaced, publishing deltas and checkpoints between them. Expect after every publication the pieces a
+  /// A-270, A-367, A-921 part 3, the oracle of the incremental held image: do run a generated history of live copies
+  /// kept, cleared, let go and made again, registers held, dropped, grown a position at a time, accepted again at a newer
+  /// epoch, compacted and replaced, and state-log parts owed and let go as their owner's (a nonzero owed count, so the
+  /// owed pieces are under test), publishing deltas and checkpoints between them. Expect after every publication the pieces a
   /// restart would fold (each checkpoint's, each delta's put and removed applied in order) to equal everything the shard
   /// holds (`held_image`). A change the tracked maps or an acceptor's changes missed, a live slot reused by a copy made
   /// again, or a key both put and removed fails here as a difference, before it is a record a restart lost.
@@ -11500,7 +11597,7 @@ mod tests {
       type Model =
         std::collections::BTreeMap<[u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES], Vec<u8>>;
       let local = state.fleet.host();
-      let step = (0u8..14, 0u8..3).prop_map(|(kind, which)| match kind {
+      let step = (0u8..16, 0u8..3).prop_map(|(kind, which)| match kind {
         0 | 1 => HeldStep::Push(which),
         2 => HeldStep::Clear(which),
         3 => HeldStep::Drop(which),
@@ -11512,6 +11609,8 @@ mod tests {
         10 => HeldStep::Renew(which),
         12 => HeldStep::Put(which),
         13 => HeldStep::Release(which),
+        14 => HeldStep::Owe(which),
+        15 => HeldStep::LetGo(which),
         _ if which == 0 => HeldStep::Checkpoint,
         _ => HeldStep::Delta,
       });
@@ -11531,6 +11630,7 @@ mod tests {
         state
           .held_content
           .forget_all(&mut crate::content_holder::hold_space(&mut state.store));
+        state.state_logs = crate::state_log::StateLogs::default();
         state.published_held = crate::content_holder::PublishedHeld::default();
         crate::content_holder::held_committed(state, std::collections::BTreeMap::new(), true);
         let mut model: Model = Model::new();
@@ -11615,6 +11715,8 @@ mod tests {
                 object(which),
               );
             }
+            HeldStep::Owe(which) => owe_next_part(state, which, at),
+            HeldStep::LetGo(which) => let_go_oldest_part(state, which),
             HeldStep::Renew(which) => {
               let mut fresh = Acceptor::new(
                 local,

@@ -54013,7 +54013,8 @@ Applied in the same change to:
   which needs the log's state installed before its next part (a state-log checkpoint, which also lets holders and the
   owner's acceptor drop the records below it, as A-404 does for a green's chain); a neighbourhood change's settle
   waiting for the state logs' parts on the new cohort (`records_placed_on_current_neighbourhood` reads heads and greens
-  only); the parts rebuilt after the owner restarts (the partition's replay hands none on); parts batched a shipment; a
+  only); ~~the parts rebuilt after the owner restarts (the partition's replay hands none on)~~ (done, A-921 part 3: the
+  parts owed ride the shard's recovery image and are owed again at a warm start); parts batched a shipment; a
   destroyed repository's four state-log registers forgotten by its holders and its owner; the repository record and
   its policy replicated (their own register); the greens placed on their repository's holders (2b-2); the successor
   adopting a repository's logs and each operation whole (2c). Main's gates: clippy, xtask, the doc build, other
@@ -65652,6 +65653,73 @@ Applied in the same change to:
     no bound, the push accepted), the wire's `a_settle_reads_back_whole_and_a_hostile_one_is_refused_by_kind`, and git's
     A-727 (d1a) tests, which now wait for one settle an attempt.
 - **Owed.** The release measure of the first read's wait on the 452-head history (main's probe).
+
+### A-921 part 3 — An owner's owed state-log parts ride its shard's recovery image, are owed again at a warm start, and are persisted before they ship (2026-11-26, w-shared for main 01a20182, its rulings of 2026-11-26 22:39 to 23:00; A-921's second mode's (1); closes A-636's owed "parts rebuilt after the owner restarts")
+
+- **Why.** A-921's second mode, about 1 run in 6 of the owner-restart scene: a not taken over by its warm restart,
+  every push after it refused `unable to commit`. Red with the old holder's refusals printed
+  (`fleet::RefusedRecord`, `Daemon::last_record_refusals`): a's post-restart names-log part refused 21 times
+  `Behind { held: Some(2) }` at position 4. Record and holder agreed on generation, epoch and authority; the holder
+  lacked position 3. Part 3 had shipped before the restart. The candidate the scene later stops acknowledged it, and
+  the old holder had not yet. A warm restart rebuilt the owner's parts (`ShardState::state_logs`) empty, so nothing
+  re-shipped part 3. The old holder's own read could not fill it either: below where a's restarted hold begins, a
+  counts as one gone, and the newcomer held nothing.
+- **The image's new field.** The shard's held image carries every part its owner shard still owes some candidate, a
+  piece each (`content_holder`'s kind 22), keyed by the log's register and the part's position; its bytes are the
+  part's register value. It rides the one held-piece path: a checkpoint's every piece (`held_image_unpaged`), a
+  delta's put and removed pieces from the parts held or let go since the last committed publication
+  (`StateLogs::changed`, `held_changes`), the commit (`held_committed`), the split (`split_held`, a part that is not
+  its register's record refused typed) and the restore. Image layout 36 and delta format 14. No reader of 35 or 13 is
+  kept: an older image never carried the parts, so reading it as owing none would lose them without a word, and it is
+  refused by its version (CLAUDE.md §2.7). Key order is register, then position, so two builds encode alike.
+- **The warm start's re-owe rule.** Each restored part is owed again to every candidate, none of their
+  acknowledgements known, so the record plane ships it once more. A holder acknowledges a record it already holds
+  (the same value at the same epoch is accepted, `Acceptor::check`), so a re-ack is idempotent, and the part is let
+  go once every candidate's acknowledgement comes, as before. Restore is guard-then-apply: an image whose parts pass
+  the bound `state_log::admit` keeps is refused typed before anything of it is restored (`state_log::restorable`,
+  `HeldRefused::OwedPastBound`). The check is exact: `admit` holds the parts under `state_log::bound` before each
+  operation, so they pass it by at most the newest admitted operation's own parts, which all name its identity. The
+  parts' bytes, less the largest share one operation's identity holds, must be under the bound.
+- **Persisted before shipped.** A part was taken into `StateLogs` after its operation's publication (`take_made`),
+  so a restart before the shard's next publication lost it with the image none the wiser. This was the fix's first
+  run, still red. The record plane now publishes the shard when it holds a part no committed image carries yet,
+  before that pass's heads ship (`fleet::ship_shard_heads`), as a holder publishes before it acknowledges. A refused
+  publication holds the state logs' heads back that pass, counted `fleet.state_log.parts_unpublished`. Past
+  `state_log::held_back_bound` passes in a row (the failover delay's worth of the fleet's periods, the bound a
+  taken-over object's materialization gets), `admit` refuses the repository's next change with the publication's
+  own refusal, counted `repository.state_log.parts_held_back`. A refusal that persists is then surfaced typed, never
+  left to stall at the barrier in silence.
+- **Copies once a part is let go.** A part is let go once every remote candidate acknowledged it
+  (`StateLogs::let_go_held`). At the candidate floor `2f + 1` (`register::candidates_for`, a domain-rich
+  neighbourhood) that is `2f` copies without the owner, at least `f + 1` for every `f >= 1`, so the owner's hold is
+  surplus for a let-go part. A placement short of the floor (a region of fewer members, or a domain-poor
+  neighbourhood) has `c` candidates, `c >= f + 1` since a commit needs `f + 1`, and lets a part go at `c - 1` copies:
+  exactly `f` where `c = f + 1`. There an owner's warm restart still spends one of `f` on a let-go part, so GAPS keeps
+  the owner's-hold item open, narrowed to that case. The owner's hold itself keeps a state log whole, unbounded
+  (`compact_below` is for single-value registers only), a §2 item 8 finding recorded with it.
+- **(2), owed and named.** The green's next version stayed unacknowledged at the old holder. Before the restart that
+  follows from (1): a holder builds an owing replica from the repository's objects, which ride the names log
+  (`replica_build`), so v2's deferred push could not build without the missed part. With (1) fixed the build runs
+  (`replica_build.made` 1), but a's merge plane never ships a pending version again after its restart: v2 acked [a]
+  and shipped once, v3 and on shipped none, nothing to the newcomer. So the push still never lands, 3 of 3 pushes
+  refused. GAPS names it; its fix will owe a warm start's pending versions again by the same rule, and assert the push.
+- **"held 1", measured.** The owner-restart scene asserts that every position the newcomer holds is at or above where
+  a's restarted hold begins (`Daemon::owner_hold_start`), so none was adopted on the old holder's word alone; both are
+  recorded. The scene stays ignored for (2).
+- **Tests.**
+  - Fleet `a921_a_holder_that_missed_an_owners_part_before_its_warm_restart_is_shipped_it_after`. Its red is
+    deterministic: a holds its state-log parts off the old holder (`Daemon::hold_state_log_shipping_from`, lifted by
+    a's restart), so the old holder misses a push's part every run. Before: the old holder held positions 2 and 3 and
+    refused position 5 `Behind { held: Some(3) }` 21 times. After: it holds 2 to 7, none refused.
+  - Units: `state_log::tests::an_owners_parts_restored_from_its_image_are_owed_again_to_every_candidate`,
+    `an_images_owed_parts_past_one_operations_share_of_the_bound_are_refused`,
+    `parts_held_back_past_the_bound_surface_the_publications_refusal`; the held-pieces oracle
+    (`daemon::tests::folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds`) now owes and lets go
+    parts in its histories, so it runs at a nonzero owed count.
+- **Models.** None of `docs/wip/models/` models the recovery image's pieces or the owner's parts; no spec changed.
+- **Applied in the same change to:** `crates/vfs/src/{recover,checkpoint_log}.rs` (the versions),
+  `crates/server/src/{content_holder,state_log,fleet,verbs,state,daemon}.rs`, `crates/server/src/state_log/tests.rs`,
+  `crates/server/tests/fleet.rs`, A-636 part 2b's owed list, GAPS.
 
 ### A-930 — A page changed only past its committed piece's last coordinate appends to it, and its split copies the piece's entries (2026-11-26, w-perf for main 01a20182, its ruling of 2026-11-25 on the 57k churn: the Aways append rule; goal 93, A-870, A-923)
 

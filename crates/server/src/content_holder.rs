@@ -254,6 +254,11 @@ const KIND_VCS_LANDED_HG: u8 = 17;
 /// records), which a restore expands and reads as before.
 const KIND_VCS_PAGE: u8 = 18;
 
+/// Format: the piece kind of a part of a repository's state log this shard owes some candidate as the log's owner
+/// (A-921's second mode, main 01a20182's ruling of 2026-11-26; `state_log::StateLogs`), keyed by the log's register and
+/// the part's position; its bytes the part's register value. A warm start owes each again to every candidate.
+const KIND_OWED_PART: u8 = 22;
+
 /// The key of `family`'s `page`.
 fn page_key(family: crate::image_pages::Family, page: crate::image_pages::Page) -> PieceKey {
   let object: [u8; 16] = core::array::from_fn(|at| match at {
@@ -443,7 +448,40 @@ pub(crate) fn held_image_unpaged(state: &ShardState) -> Vec<slates_vfs::recover:
   for (object, held) in &state.merge.checkpoints {
     pieces.push(checkpoint_piece(*object, held));
   }
+  // Every state-log part this shard owes some candidate as the log's owner (A-921's second mode).
+  pieces.extend(
+    state
+      .state_logs
+      .parts()
+      .map(|(register, position, value)| owed_part_piece(register, position, value)),
+  );
   pieces
+}
+
+/// An owed state-log part's piece (A-921's second mode), keyed by its register and position.
+fn owed_part_piece(
+  register: ObjectId,
+  position: u64,
+  value: &[u8],
+) -> slates_vfs::recover::HeldPiece {
+  slates_vfs::recover::HeldPiece {
+    key: piece_key(KIND_OWED_PART, register.0, position),
+    bytes: value.to_vec(),
+  }
+}
+
+/// The owed state-log parts held or let go since the last committed publication (A-921's second mode): each held now
+/// put, each let go removed.
+fn owed_part_changes(
+  state: &ShardState,
+  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
+) {
+  for (register, position) in state.state_logs.changed() {
+    match state.state_logs.part(register, position) {
+      Some(value) => put.push(owed_part_piece(register, position, value)),
+      None => removed.push(piece_key(KIND_OWED_PART, register.0, position)),
+    }
+  }
 }
 
 /// The repository content store's and homes' entries, a page a range of each family (A-870 piece 1): its windows kept
@@ -1046,6 +1084,8 @@ pub(crate) fn held_changes(state: &ShardState) -> HeldChanges {
   // The replica checkpoints this holder changed since the last committed publication (A-404): each kept now put, each
   // dropped removed.
   checkpoint_changes(state, (&mut put, &mut removed));
+  // The state-log parts this shard owes as their logs' owner, held or let go since then (A-921's second mode).
+  owed_part_changes(state, (&mut put, &mut removed));
   // The repository content store's and homes' entries kept or let go since then, a page each change lies in (A-870
   // piece 1): windows (A-727 slice a3), lists, names and windows let go (a3b), region holds (A-724 piece 8c) and landed
   // records (goal 93 item 2b(b)).
@@ -1553,6 +1593,7 @@ pub(crate) fn held_committed(
   state.holder_records.clear_changed();
   state.live.held.clear_changed();
   state.merge.checkpoints_changed.clear();
+  state.state_logs.clear_changed();
   // The content store's and homes' changes are the encoder's (`image_drain`), and their tickets durable with its cut
   // (`image_committed`, A-870 piece 2).
 }
@@ -1676,6 +1717,9 @@ pub(crate) struct RecoveredHeld {
   pub(crate) aways_unnumbered: Vec<(slates_vcs::ContentId, u64)>,
   /// Where the windows landed packs carried lie on the node's store, as this shard's homes recorded (goal 93 item 2b(b)).
   pub(crate) landed: Vec<(slates_vcs::ContentId, crate::vcs_store::homes::Landed)>,
+  /// The state-log parts this shard owed some candidate as their logs' owner, each by register and position, in key
+  /// order (A-921's second mode).
+  owed: Vec<(ObjectId, u64, Vec<u8>)>,
 }
 
 /// Why a recovered image's held pieces were refused (A-270): never read as less than was held, since a holder that
@@ -1698,6 +1742,16 @@ pub(crate) enum HeldRefused {
   Checkpoint([u8; 16]),
   /// A piece of a kind this build retired and reads no more (A-727 (d1a): a region hold without its owners).
   Retired(u8),
+  /// An owed state-log part whose bytes are no state log's record, or not its register's (A-921's second mode).
+  OwedPart([u8; 16]),
+  /// Owed state-log parts past what the owner's bound lets it hold (A-921's second mode, `state_log::restorable`): their
+  /// bytes past the largest share one operation holds, and the bound.
+  OwedPastBound {
+    /// The parts' bytes less the largest share one operation's identity holds.
+    bytes: usize,
+    /// The bound (`state_log::bound`).
+    bound: usize,
+  },
 }
 
 impl std::fmt::Display for HeldRefused {
@@ -1726,6 +1780,16 @@ impl std::fmt::Display for HeldRefused {
       HeldRefused::Checkpoint(object) => {
         write!(f, "the replica checkpoint of {object:02x?} did not decode")
       }
+      HeldRefused::OwedPart(register) => {
+        write!(
+          f,
+          "an owed state-log part of {register:02x?} is not its log's record"
+        )
+      }
+      HeldRefused::OwedPastBound { bytes, bound } => write!(
+        f,
+        "owed state-log parts of {bytes} bytes past one operation's share, at or past the owner's bound of {bound}"
+      ),
       HeldRefused::Retired(kind) => write!(
         f,
         "a held piece of retired kind {kind} (a region hold without its owners, before A-727 (d1a)): this build reads \
@@ -2024,6 +2088,7 @@ pub(crate) fn split_held(
     aways: Vec::new(),
     aways_unnumbered: Vec::new(),
     landed: Vec::new(),
+    owed: Vec::new(),
   };
   let mut heads: BTreeMap<[u8; 16], crate::live_ship::HeldLive> = BTreeMap::new();
   let mut entries: BTreeMap<[u8; 16], Vec<(u64, Vec<u8>)>> = BTreeMap::new();
@@ -2065,6 +2130,15 @@ pub(crate) fn split_held(
         object,
         crate::live_ship::OwnedLive::from_bytes(&piece.bytes)?,
       )),
+      KIND_OWED_PART => {
+        let register = ObjectId(object);
+        let owned = crate::state_log::record_of(&piece.bytes)
+          .is_some_and(|part| part.log_name().register() == register && part.to == slot);
+        if !owned {
+          return Err(HeldRefused::OwedPart(object));
+        }
+        held.owed.push((register, slot, piece.bytes.clone()));
+      }
       KIND_REPLICA_CHECKPOINT => held.checkpoints.push((
         ObjectId(object),
         crate::merge_service::HeldCheckpoint::from_piece(&piece.bytes)
@@ -2132,6 +2206,17 @@ fn join_positions(
   }
 }
 
+/// Whether a recovered image's owed state-log parts are within what this shard's bound lets its owner hold (A-921's
+/// second mode, `state_log::restorable`), refused typed where they are past it: checked before anything of the image is
+/// restored.
+pub(crate) fn owed_within_bound(
+  state: &ShardState,
+  held: &RecoveredHeld,
+) -> Result<(), HeldRefused> {
+  crate::state_log::restorable(&held.owed, crate::state_log::bound(state))
+    .map_err(|(bytes, bound)| HeldRefused::OwedPastBound { bytes, bound })
+}
+
 /// Rebuilds the held registers of a recovered image as `local`, each the acceptor it persisted
 /// (`Acceptor::from_persisted`: its fence, accepted positions and moved-from owner); the count rebuilt.
 pub(crate) fn restore_held_registers(
@@ -2145,6 +2230,13 @@ pub(crate) fn restore_held_registers(
   // The replica checkpoints (A-404): the image carries each, so none is owed to the next publication.
   state.merge.checkpoints = std::mem::take(&mut held.checkpoints).into_iter().collect();
   state.merge.checkpoints_changed.clear();
+  // The state-log parts this shard owed as their logs' owner (A-921's second mode): each owed again to every candidate,
+  // none of their acknowledgements known, so the record plane ships each once more. The image carries them, so none is
+  // owed to the next publication.
+  for (register, position, value) in std::mem::take(&mut held.owed) {
+    state.state_logs.restore(register, position, value);
+  }
+  state.state_logs.clear_changed();
   // The mirror records, each the newest of its object as it was published. One that does not decode, or that the
   // register refuses, is counted: the image held it, and this holder no longer does.
   for bytes in &held.mirrored {

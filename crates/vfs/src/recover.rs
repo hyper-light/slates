@@ -112,9 +112,14 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// retirement's successor (`slates_db::register::Acceptor::adopted`), so a successor restarted warm settles its own
 /// adoption in the round it runs again instead of taking the object over again. No reader of 34's layout is kept: it is
 /// refused by its version (CLAUDE.md §2.7).
+/// 36 (A-921's second mode, 2026-11-26) the held replicas' image may carry the state-log parts the shard owes some
+/// candidate as their logs' owner, a piece each, so a warm restart owes each again instead of forgetting it (a holder
+/// that had missed one refused every later part, and every push was refused). An image of 35 never carried them, so
+/// reading it as owing none would lose them without a word: no reader of 35's layout is kept, and it is refused by its
+/// version (CLAUDE.md §2.7).
 /// Format: the image layout version, bumped with any change to the types below, to what they may hold, or to the held
 /// replicas' image they carry.
-pub const IMAGE_VERSION: u16 = 35;
+pub const IMAGE_VERSION: u16 = 36;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
