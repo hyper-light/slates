@@ -7668,3 +7668,11 @@ At or past fedcbaf96:
 - The TSan lane (`cargo xtask tsan`): `a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_log_is_held` and
   its siblings print "judged … after t0 against W + B + L" and "the end line read … after the verdict". Red: judged past
   W + B + L (the watchdog late, product) or a read past a beat after the verdict.
+
+## 2026-11-27 w-interop, red 1 and the spawner cost role, 2386b45f1
+
+- Windows, both lanes: `cargo test -p slates-server --test signed_work`. Green: 13/13. Red: "no checkpoint taken within
+  the reply deadline".
+- macOS (the wall's lane): `cargo test -p slates-ipc --lib spawner::tests::a_spawns_cost_on_its_calling_thread_is_flat_in_the_daemons_descriptors`.
+  Green: three rows (a `SPAWN-HELD` line if the runner caps under 100,000). Red: "a row a count", now with the role's
+  status and stderr naming the cause.

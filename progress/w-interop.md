@@ -702,3 +702,6 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   after a publish) landed e9a2ceab2; the TSan wedge line (judged instant in the end line) landed 8d2692e00, both in
   fedcbaf96. OPEN: red 1 (signed_work checkpoint in turns: hook choice asked of main) and red 4 (hg_import
   overlapped=0 on arm64: diag 6's arm64 lane, then a diag branch).
+- Red 1 (signed_work waits for the checkpoint within the reply deadline) landed 0408a5b26. The spawner cost role (holds
+  until refused; the parent prints the role's stderr and status) landed 2386b45f1. OPEN: red 4 (arm64 hg_import overlap),
+  on diag 6, 7 and 8's arm64 lanes.
