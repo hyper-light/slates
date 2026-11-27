@@ -77,9 +77,11 @@ pub(crate) struct StateLogs {
   greens_owed:
     BTreeMap<slates_db::catalog::RepositoryId, BTreeMap<slates_db::catalog::VolumeId, u64>>,
   /// The parts held or let go since the shard's last committed publication, each by its register and position (A-921's
-  /// second mode): what the next delta of its recovery image carries of them (`content_holder::held_changes`). Bounded
-  /// by the parts held and let go between two publications.
-  changed: std::collections::BTreeSet<(ObjectId, u64)>,
+  /// second mode), with whether that publication carried the position (its image holds a piece there): what the next
+  /// delta of its recovery image carries of them (`content_holder::held_changes`), and what a let-go must still remove
+  /// after the position was held again ([`StateLogs::let_go_held`]). Bounded by the parts held and let go between two
+  /// publications.
+  changed: BTreeMap<(ObjectId, u64), bool>,
   /// The record-plane passes in a row whose parts waited because the shard's publication carrying them was refused, and
   /// that publication's refusal (A-921's second mode, main 01a20182's ruling of 2026-11-26: a held-back part never
   /// stalls in silence). Past [`held_back_bound`] passes, [`admit`] refuses the repository's next change with it.
@@ -104,10 +106,12 @@ impl StateLogs {
     self.bytes = self.bytes.saturating_add(value.len());
     let register = record.log_name().register();
     let log = self.logs.entry(register).or_default();
+    let carried = log.parts.contains_key(&record.to);
     if let Some(replaced) = log.parts.insert(record.to, value) {
       self.bytes = self.bytes.saturating_sub(replaced.len());
     }
-    self.changed.insert((register, record.to));
+    // A position first marked here is carried where a part is held there unmarked: one the last publication carried.
+    self.changed.entry((register, record.to)).or_insert(carried);
   }
 
   /// Puts back a part a recovered image carried (A-921's second mode, main 01a20182's ruling of 2026-11-26): owed again
@@ -143,7 +147,7 @@ impl StateLogs {
 
   /// The parts held or let go since the last committed publication, in order.
   pub(crate) fn changed(&self) -> impl Iterator<Item = (ObjectId, u64)> + '_ {
-    self.changed.iter().copied()
+    self.changed.keys().copied()
   }
 
   /// Whether a part held now is not yet carried by a committed publication: one the record plane must not ship before
@@ -152,7 +156,7 @@ impl StateLogs {
   pub(crate) fn holds_unpublished(&self) -> bool {
     self
       .changed
-      .iter()
+      .keys()
       .any(|(register, position)| self.part(*register, *position).is_some())
   }
 
@@ -235,14 +239,23 @@ impl StateLogs {
       .unwrap_or(u64::MAX);
     let kept = log.parts.split_off(&held_everywhere.saturating_add(1));
     let released: usize = log.parts.values().map(Vec::len).sum();
-    // A part let go while it is still marked changed was held after the last committed publication, so none carried it:
-    // its mark goes, and the next delta neither puts nor removes it. One a publication carried (or an image restored) is
-    // marked, so the next delta removes its piece. At f = 0 every part is held and let go in one take, so nothing is ever
-    // marked (main 01a20182's ruling of 2026-11-27: before, each kept a key until a publication committed).
+    // A part whose position the last committed publication did not carry was held after it, so none carried it: its mark
+    // goes, and the next delta neither puts nor removes it. One the publication carried (or an image restored) stays
+    // marked, or is marked, so the next delta removes its piece, though it was let go, held again at its position and
+    // let go again since: a toggle of the mark kept that piece in the fold (w-svn's seed of 2026-11-27,
+    // `daemon::tests::folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds`). At f = 0 every part is
+    // held and let go in one take, so nothing is ever marked (main 01a20182's ruling of 2026-11-27: before, each kept a
+    // key until a publication committed).
     for position in log.parts.keys() {
       let key = (register, *position);
-      if !self.changed.remove(&key) {
-        self.changed.insert(key);
+      match self.changed.get(&key) {
+        Some(true) => {}
+        Some(false) => {
+          self.changed.remove(&key);
+        }
+        None => {
+          self.changed.insert(key, true);
+        }
       }
     }
     log.parts = kept;
