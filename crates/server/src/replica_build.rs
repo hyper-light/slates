@@ -52,6 +52,10 @@ pub(crate) const REFUSED: &str = "merge.replica_build.refused";
 #[derive(Default)]
 pub(crate) struct ReplicaBuilds {
   building: BTreeMap<ObjectId, Under>,
+  /// The repositories a replica's build over their store was refused (A-921 part 4): at the next build wanted, a store
+  /// made from fewer push records than this node now holds is made again ([`wanted`]). Bounded by the repositories this
+  /// node holds a replica store of; one leaves at that next build.
+  refused_over: std::collections::BTreeSet<RepositoryId>,
 }
 
 /// One replica build under way: its repository, and the owed push's build once the repository's store is whole.
@@ -101,12 +105,17 @@ pub(crate) fn wanted(state: &mut ShardState, green: ObjectId) {
     state.count(REFUSED, 1);
     return;
   };
+  let parts = crate::takeover::held_parts(state, record.id);
+  let records = crate::vcs_store::replica::records_of(&parts);
+  // A replica store a build over was refused, made before a part this node now holds, is made again from all of them
+  // (A-921 part 4); only after a refusal, so an ordinary build replays no store.
+  if state.replica_builds.refused_over.remove(&record.id) {
+    crate::vcs_store::replica::drop_if_stale(state, record.id, &records);
+  }
   if !matches!(
     state.vcs_stores.store(record.id),
     Some(crate::vcs_store::RepositoryStore::Git(_))
   ) {
-    let parts = crate::takeover::held_parts(state, record.id);
-    let records = crate::vcs_store::replica::records_of(&parts);
     if let Err(refused) = crate::vcs_store::replica::begin(state, &record, records) {
       slates_machine::log_line!(
         "slates-server: partition {}: a replica's repository store was refused: {refused:?}",
@@ -373,6 +382,7 @@ fn turn(state: &mut ShardState, green: ObjectId) -> Turned {
         state.partition
       );
       state.count(REFUSED, 1);
+      state.replica_builds.refused_over.insert(repository);
       Turned::Done
     }
   }

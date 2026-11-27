@@ -34,6 +34,9 @@ pub(crate) const BEGUN: &str = "vcs_store.replica.begun";
 pub(crate) const REFUSED: &str = "vcs_store.replica.refused";
 /// Counter: replica stores a takeover adopted as they stood ([`adopt`]). Format: a counter name.
 pub(crate) const ADOPTED: &str = "vcs_store.replica.adopted";
+/// Counter: a replica store dropped to be made again, made from fewer push records than this node's names-log parts now
+/// carry (A-921 part 4, [`drop_if_stale`]). Format: a counter name in the daemon's status report.
+pub(crate) const MADE_AGAIN: &str = "vcs_store.replica.made_again";
 
 /// Why a replica store was not begun.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +90,25 @@ pub(crate) fn begin(
   super::rebuild_sliced_from(state, record);
   state.count(BEGUN, 1);
   Ok(true)
+}
+
+/// Drops repository `id`'s replica store where it was made from other push records than the names-log parts this node
+/// holds now carry (`records`, [`records_of`]), so the next [`begin`] makes it again from all of them (A-921 part 4):
+/// whether it was dropped. Made once, a store never took the objects of a part held after it, so a holder that had
+/// missed a part (its owner holding it off, then owing it again after a warm restart, A-921 part 3) built its replica's
+/// owed push over a store without that push's objects, refused `Missing` for good. A store still being rebuilt stands,
+/// and is judged again at the next build; the owner's own store keeps no replica records and is never dropped.
+pub(crate) fn drop_if_stale(state: &mut ShardState, id: RepositoryId, records: &[Vec<u8>]) -> bool {
+  let Some(made_from) = state.vcs_replica_records.get(&id) else {
+    return false;
+  };
+  if made_from.as_slice() == records || state.vcs_stores.rebuilding.contains(&id) {
+    return false;
+  }
+  super::free(state, id);
+  state.vcs_replica_records.remove(&id);
+  state.count(MADE_AGAIN, 1);
+  true
 }
 
 /// A takeover's adoption of repository `id`'s replica store, its record now the partition's: whether it stands as made

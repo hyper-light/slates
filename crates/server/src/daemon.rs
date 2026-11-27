@@ -1959,6 +1959,22 @@ impl Daemon {
     })
   }
 
+  /// Test support (A-921's owner-restart scenes): the owner this node's acceptor of `object` names, on any shard holding
+  /// one; `None` where it holds none.
+  pub fn holder_owner(&self, object: [u8; 16]) -> Result<Option<slates_db::HostId>, ObserveError> {
+    let object = slates_db::register::ObjectId(object);
+    for shard in self.shards.clone() {
+      if let Some(owner) = self.observe(Some(shard), move |s| {
+        s.holder_records
+          .get(&object)
+          .map(slates_db::register::Acceptor::owner)
+      })? {
+        return Ok(Some(owner));
+      }
+    }
+    Ok(None)
+  }
+
   /// Test support (A-927 part 2): no shard of this node ships the state logs' parts it owes to `peer`, and every other
   /// candidate is shipped them, so a repository's creation here answers once another member holds its names-log part (its
   /// root's join) while `peer`, its successor-to-be, holds none. `Ok` once set on every shard.

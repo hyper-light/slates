@@ -37949,14 +37949,17 @@ fn a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_th
 /// was not taken over (its fencing epoch unchanged at every other node) before it stops anyone, and is formed afresh,
 /// at most [`SCENE_RESTARTS`] times, where a was, each such attempt printed.
 ///
-/// Ignored for A-921's second mode's (2) (main 01a20182's rulings of 2026-11-25 and 2026-11-26): about 1 run in 6, a not
-/// taken over, the old holder had missed a part a owed it; (1), its names-log part, a owes again after its restart, and
-/// (2), the green's next version, a's merge plane ships no more, so a push may stay refused `unable to commit`. The
-/// newcomer's held positions are measured against the start rule: each at or above a's restarted hold start. Run it by
-/// name with `cargo test -p slates-server --test fleet
+/// A-921's second mode (main 01a20182's rulings of 2026-11-25 to 2026-11-27): about 1 run in 6 before, a not taken over,
+/// the old holder had missed a part a owed it, and every push was refused `unable to commit`. (1), the names-log part, a
+/// owes again after its restart (A-921 part 3); (2), the green's next version, a's replay re-derives with other floors,
+/// which the old holder joins (A-921 part 4). The newcomer's held positions are measured against the start rule: each at
+/// or above a's restarted hold start. A scene where another node adopted a's repository or green at its restart though
+/// a's epoch did not move is formed afresh, as one a's epoch moved in is. Ignored for A-921's next mode (GAPS): about 3
+/// scenes in 10, a survivor adopts a's green with a candidate's death though a lives, and this scene stops one after its
+/// guard, so a push may be refused; run by name with `cargo test -p slates-server --test fleet
 /// a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins -- --ignored --exact`.
 #[test]
-#[ignore = "A-921's second mode (2): a warm-restarted owner's merge plane ships no pending version again, so a push may stay refused; run by name with --ignored"]
+#[ignore = "A-921's next mode: a survivor adopts a live owner's green with a candidate's death; run by name with --ignored"]
 fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins() {
   let _serial = serialize_fleet_tests();
   let Some((mut fleet, holders)) = (0..SCENE_RESTARTS).find_map(restarted_owner_scene) else {
@@ -37988,24 +37991,27 @@ fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_beg
       .fleet_refusals()
       .map(|counters| counters.get(name).copied().unwrap_or(0))
   };
-  // The scene needs a part shipped to the newcomer: the restarted owner holds no part from before it, so only a push's
-  // own records reach the newcomer, and a push refused before its records ships none. Pushed again until one did, at
-  // most `SCENE_PUSHES` times.
+  // The scene needs a part shipped to the newcomer: one it holds, or one it refused `Behind` past its copy. A pushed
+  // again until one reached it, at most `SCENE_PUSHES` times. Since A-921 part 3, a owes its parts again after its
+  // restart, so the newcomer may take them from the log's start and never refuse one.
   let mut pushed = Vec::new();
   for attempt in 0..SCENE_PUSHES {
     let file = format!("after-{attempt}.txt");
     pushed.push(fleet.push_on_top(0, (&file, file.as_bytes())));
     let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
     if poll_until(&observed, RETIREMENT_DEADLINE, || {
-      Ok(counted(&fleet, "fleet.record.refused.behind")? > 0)
+      Ok(
+        counted(&fleet, "fleet.record.refused.behind")? > 0
+          || !fleet.daemons[newcomer]
+            .names_log_positions(fleet.repository)?
+            .is_empty(),
+      )
     }) {
       break;
     }
   }
-  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
-  let refused = poll_until(&observed, RETIREMENT_DEADLINE, || {
-    Ok(counted(&fleet, "fleet.ledger_read.past_tolerance")? > 0)
-  });
+  // Recorded, read once: whether the newcomer's read was past tolerance.
+  let refused = counted(&fleet, "fleet.ledger_read.past_tolerance").is_ok_and(|count| count > 0);
   let held = counted(&fleet, "fleet.ledger_read.positions_held");
   let start = fleet.daemons[0].owner_hold_start(fleet.repository);
   let newcomer_positions = fleet.daemons[newcomer].names_log_positions(fleet.repository);
@@ -38108,12 +38114,13 @@ fn restarted_owner_scene(attempt: usize) -> Option<(GitFleet, Vec<usize>)> {
     both_hold && restarted,
     "a's two remote candidates held version 1 ({holders:?}), and a restarted and settled"
   );
-  if before == after {
+  let adopted_elsewhere = adopted_elsewhere(&fleet);
+  if before == after && !adopted_elsewhere {
     return Some((fleet, holders));
   }
   eprintln!(
     "restarted-owner-log: attempt {attempt}: a was taken over during its warm restart (its epoch {before:?} -> \
-     {after:?}), the scene formed afresh"
+     {after:?}, adopted elsewhere {adopted_elsewhere}), the scene formed afresh"
   );
   fleet.stop();
   None
@@ -38127,24 +38134,22 @@ fn restarted_owner_scene(attempt: usize) -> Option<(GitFleet, Vec<usize>)> {
 /// through its newest part and the push to land: a owes its held parts again after its restart, to every remote
 /// candidate. Red before: a's warm restart rebuilt its parts empty, so the old holder refused every later part
 /// `Behind { held }` (`state_log.discontinuous`) and every push was refused `unable to commit` (the second mode, about 1
-/// run in 6, with the part missed by chance). Recorded, not asserted: the pushes, whose landing is (2)'s (GAPS: a's merge
-/// plane ships no pending version again after its restart, so the green's v2 never places), the old holder's last
+/// run in 6, with the part missed by chance). And (2) (A-921 part 4): a's replay re-derived the green's pending v2 with a
+/// checkpoint floor of 0 where the old holder held 1, refused `ConflictingPosition` (19 a run) so v2 never placed; the
+/// old holder now joins it, so none is refused so and the push lands. Recorded: every push, the old holder's last
 /// refusals and counts, and its names-log positions.
 #[test]
 fn a921_a_holder_that_missed_an_owners_part_before_its_warm_restart_is_shipped_it_after() {
   let _serial = serialize_fleet_tests();
-  let Some((mut fleet, [first, old])) = (0..SCENE_RESTARTS).find_map(part_missed_scene) else {
-    panic!("a was taken over at every one of {SCENE_RESTARTS} warm restarts");
+  let Some((mut fleet, old_host, taken)) = (0..SCENE_RESTARTS).find_map(part_missed_scene) else {
+    panic!("a was taken over at every one of {SCENE_RESTARTS} scenes");
   };
-  let (gone, old_host) = (fleet.hosts[first], fleet.hosts[old]);
-  fleet.daemons.remove(first).stop();
   let at = |fleet: &GitFleet, host: HostId| {
     fleet
       .daemons
       .iter()
       .position(|daemon| daemon.member_identity().is_ok_and(|id| id == host))
   };
-  let taken = poll_taken_over_and_unseated(&fleet.daemons, gone);
   let mut pushes = Vec::new();
   for attempt in 0..SCENE_PUSHES {
     let file = format!("after-{attempt}.txt");
@@ -38162,7 +38167,10 @@ fn a921_a_holder_that_missed_an_owners_part_before_its_warm_restart_is_shipped_i
     fleet.daemons[old].names_log_positions(fleet.repository),
   );
   let (old_refused, old_counts) = refusals_of(&fleet.daemons[old]);
+  let newcomer = (1..fleet.daemons.len()).find(|node| *node != old);
+  let newcomer_refusals = newcomer.map(|node| refusals_of(&fleet.daemons[node]));
   fleet.stop();
+  eprintln!("owed-parts: the newcomer's refusals {newcomer_refusals:?}");
   eprintln!(
     "owed-parts: taken over {taken}; the pushes {pushes:?}; names-log positions (a, the old holder) {positions:?}; the \
      old holder's last refusals {old_refused:?}, its counts {old_counts:?}"
@@ -38178,9 +38186,21 @@ fn a921_a_holder_that_missed_an_owners_part_before_its_warm_restart_is_shipped_i
     runs_on && !behind,
     "the old holder took every part after the one held off it, refusing none Behind: {positions:?}"
   );
-  // The push's landing is A-921's second mode's (2), named in GAPS: after a's warm restart its merge plane ships no
-  // pending version again. Unasserted here; (2)'s fix asserts it.
-  let _ = pushed;
+  // (2) (main 01a20182's ruling of 2026-11-27): a's pending versions, re-derived from its replay with other floors, are
+  // joined by the old holder, never refused as another proposal, so the green's next version places and the push lands.
+  let conflicting = old_counts
+    .iter()
+    .find(|(name, _)| *name == "fleet.record.refused.conflicting_position")
+    .map_or(0, |(_, count)| *count);
+  assert_eq!(
+    conflicting, 0,
+    "the old holder joined a's re-derived versions, refusing none as another proposal"
+  );
+  assert_eq!(
+    pushed,
+    Ok(()),
+    "a push after a's warm restart landed: {pushes:?}"
+  );
 }
 
 /// Shape: the names-log parts the old holder of
@@ -38190,9 +38210,11 @@ const PARTS_BEFORE_THE_HOLD: usize = 2;
 
 /// One attempt at [`a921_a_holder_that_missed_an_owners_part_before_its_warm_restart_is_shipped_it_after`]'s scene: a
 /// four-node anchored git fleet, `main` pushed and held by both of a's remote candidates, a push on top whose state-log
-/// parts a held off the second, then a restarted warm and settled. The fleet and a's two candidates (the first, then the
-/// old holder) where a was not taken over by its restart; `None`, printed and stopped, where it was (A-921).
-fn part_missed_scene(attempt: usize) -> Option<(GitFleet, [usize; 2])> {
+/// parts a held off the second, then a restarted warm and settled, then the first candidate stopped and taken over. The
+/// fleet, the old holder's member id and whether the first's death was taken over, where a was taken over neither by its
+/// restart nor with the first's death; `None`, printed and stopped, where it was (A-921; GAPS: the second is A-921's
+/// next).
+fn part_missed_scene(attempt: usize) -> Option<(GitFleet, HostId, bool)> {
   let mut fleet = anchored_git_fleet_of("owed-parts", &["a", "b", "c", "d"]);
   let green = VolumeId {
     bytes: fleet.repository,
@@ -38238,14 +38260,46 @@ fn part_missed_scene(attempt: usize) -> Option<(GitFleet, [usize; 2])> {
     pushed.is_ok() && both_hold && missed.is_ok() && restarted,
     "the pushes before the restart landed ({pushed:?}, {missed:?}), both candidates held version 1, and a restarted"
   );
-  if before == after {
-    return Some((fleet, [first, old]));
+  let restart_kept = before == after && !adopted_elsewhere(&fleet);
+  let (gone, old_host) = (fleet.hosts[first], fleet.hosts[old]);
+  let mut taken = false;
+  if restart_kept {
+    fleet.daemons.remove(first).stop();
+    taken = poll_taken_over_and_unseated(&fleet.daemons, gone);
+  }
+  // a kept as the green's owner at every survivor through the first's takeover too (GAPS: A-921's next mode adopts it
+  // with the first's death, though a lives).
+  let kept =
+    restart_kept && !adopted_elsewhere_of(&fleet.daemons[1..], (fleet.repository, fleet.hosts[0]));
+  if kept {
+    return Some((fleet, old_host, taken));
   }
   eprintln!(
-    "owed-parts: attempt {attempt}: a was taken over during its warm restart, the scene formed afresh"
+    "owed-parts: attempt {attempt}: a was taken over (its epoch {before:?} -> {after:?}, at its restart \
+     {restart_kept}), the scene formed afresh"
   );
   fleet.stop();
   None
+}
+
+/// Whether a node other than a adopted a's repository or a green of it, or holds a's root green under another owner
+/// (A-921's owner-restart scenes): a taken over by its warm restart though its fencing epoch did not move, the mode GAPS records as A-921's next, so a scene where it
+/// happened is formed afresh, as one a's epoch moved in is.
+fn adopted_elsewhere(fleet: &GitFleet) -> bool {
+  adopted_elsewhere_of(&fleet.daemons[1..], (fleet.repository, fleet.hosts[0]))
+}
+
+/// [`adopted_elsewhere`] over `others`, of repository `repository` owned by `owner`.
+fn adopted_elsewhere_of(others: &[Daemon], (repository, owner): ([u8; 16], HostId)) -> bool {
+  others.iter().any(|daemon| {
+    daemon
+      .repository_takeover(repository)
+      .is_ok_and(|(_, [adopted, ..])| adopted >= 1)
+      || move_counter(daemon, "merge.takeover.adopted").is_ok_and(|adopted| adopted >= 1)
+      || daemon
+        .holder_owner(repository)
+        .is_ok_and(|named| named.is_some_and(|named| named != owner))
+  })
 }
 
 /// Shape: the scenes A-919's owner-restart test forms at most: a warm restart outlasted detection about 1 run in 3 to 5
