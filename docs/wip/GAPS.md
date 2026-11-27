@@ -2787,7 +2787,13 @@
 > `segments_landed_overlapped` and the wait held against `segment_land_ns`. Derived bound: two segments' file texts,
 > the one in flight and the one being written, each under the bound plus the text that crosses it: under four times
 > the bound. Held by `an_imports_file_texts_held_between_landings_are_bounded_by_its_segment` on the production step
-> (red: 46,162,339 bytes held after one turn, 8,950 at the end, a 2 MiB bound; then no landing overlapped). Owed:
+> (red: 46,162,339 bytes held after one turn, 8,950 at the end, a 2 MiB bound; then no landing overlapped). Since
+> 2026-11-27 (w-interop, main's ruling (a')) a landing also counts as overlapped where the store's owner sent its
+> answer before the import's hand-over began, by the owner's own stamp (`slates_store::owner::Landed::sent_ns`). At a
+> 4 KiB page the bound is 512 KiB, every turn cuts a segment, and no yield follows the turn a landing ends in, so on
+> diag CI 9's Windows lanes 0 of 67 counted though each landing's answer was sent 0.5 to 3.9 ms into a 49 ms turn
+> (`docs/bugs/2026-11-27-an-imports-landings-overlapped-unseen-where-every-turn-cuts-a-segment.md`; the test now runs
+> at 4 KiB too). Owed:
 > main's interleaved A/B of 0d05da26e^, 1227afcb1 and the pipelined landing over the 57k; the
 > changelog's and manifests' texts held until the import lands (about 90 MB of the 57k's), w-hg's after C1 (2)'s
 > manifest piece (the import's manifest keep reads the previous text in its step, with no ask between turns).
