@@ -40,5 +40,5 @@ timeout, or any error, means not ended. No second clock is read.
 - **The red:** diag CI 9's Windows x86_64 lane, above. The Mac's socket timer and `Instant` agree, so the test was
   never red here.
 - **On the MacBook (debug):** `cargo test -p slates-server --lib -- vcs_ssh::tests::a_connection_closed_past_the_clients_patience_is_seen_ended`.
-  The result is in the landing's commit message.
+  Passed, 1 of 1 (2026-11-27).
 - **Owed (main):** the next diag CI's Windows x86_64 lane.

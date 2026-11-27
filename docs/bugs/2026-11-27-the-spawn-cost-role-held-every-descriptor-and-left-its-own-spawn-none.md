@@ -41,5 +41,6 @@ The parent then counted two rows against three counts and failed. That was not t
 ## Verification
 
 - The red: diag CI 10's macos-latest, above. The MacBook's own cap is far higher, so it never reached this here.
-- The focused test on the MacBook: recorded in the landing's commit message.
+- On the MacBook (debug, 2026-11-27): `cargo test -p slates-ipc --lib -- spawner::` passed 8 of 8. The MacBook's
+  cap holds every row.
 - Owed (main): the next diag CI's macOS lane.
