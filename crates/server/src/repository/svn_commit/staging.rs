@@ -1098,10 +1098,10 @@ enum StagingAt {
 }
 
 /// [`Staging::stage_in`]'s record check, a slice a step each lending the records' room (A-920 piece 2: the index's
-/// plan of a revision's rows one call of 87 ms at 9,000 files, debug): the record encoded and every other check made in
-/// the first, then the rows planned as far as each step's slice holds, so a revision that fits a slice is checked in
-/// one step. The landing turn keeps every other commit out between steps, and the index refuses a plan's step once a
-/// revision was committed since it began. None where the shard's state is gone.
+/// plan of a revision's rows one call of 87 ms at 9,000 files, debug): the record encoded first in steps of its own
+/// ([`encoded_in`]), then every other check made in the next, and the rows planned as far as each step's slice holds.
+/// The landing turn keeps every other commit out between steps, and the index refuses a plan's step once a revision was
+/// committed since it began. None where the shard's state is gone.
 async fn checked_in(
   repository: RepositoryId,
   lent: u64,
@@ -1109,13 +1109,11 @@ async fn checked_in(
 ) -> Option<Result<(Checked, Vec<u8>), Uncommitted>> {
   #[cfg(test)]
   crate::vcs_store::svn_import::phase::tag("stage.check");
+  let (revision, record) = encoded_in(revision).await?;
   let mut at = CheckAt::Begin(revision);
-  let mut record = Vec::new();
   loop {
-    let stepped = within_records(repository, lent, |state| {
-      check_slice(state, repository, (at, &mut record))
-    })
-    .await?;
+    let stepped =
+      within_records(repository, lent, |state| check_slice(state, repository, at)).await?;
     match stepped {
       Ok(CheckStep::Checked(checked)) => return Some(Ok((*checked, record))),
       Ok(CheckStep::More(more)) => at = CheckAt::Going(more),
@@ -1124,12 +1122,41 @@ async fn checked_in(
   }
 }
 
-/// One of [`checked_in`]'s steps, from `at`, until the shard's clock passes its quantum: begun, the revision's record
-/// encoded into `record`.
+/// `revision`'s record encoded a unit at a time, a slice of the shard's budget a step, a content's bytes a copy slice a
+/// unit ([`slates_svn::commit::record::RevisionEncoding`]; A-920: a revision of 9,000 rows, 1.2 MB, encoded whole in its
+/// check's first step, 3.8 ms debug): the revision and its record's bytes. None where the shard's state is gone.
+async fn encoded_in(revision: Revision) -> Option<(Revision, Vec<u8>)> {
+  let mut encoding = slates_svn::commit::record::RevisionEncoding::default();
+  loop {
+    let encoded = crate::state::with_state(|state| {
+      state.count(RECORD_ENCODE_STEPS, 1);
+      let slice = usize::try_from(state.config.copy_slice_bytes()).unwrap_or(usize::MAX);
+      let deadline = slice_deadline_ns();
+      loop {
+        if encoding.step(&revision, slice) {
+          break true;
+        }
+        if slates_rt::futures::now_ns() >= deadline {
+          break false;
+        }
+      }
+    })?;
+    if encoded {
+      return Some((revision, encoding.into_bytes()));
+    }
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// Counter: a step of a revision's record encoding ([`encoded_in`], A-920): many a wide revision shows its record was
+/// encoded a slice a step, never whole in its check's first. Format: a counter name in the daemon's status report.
+pub(crate) const RECORD_ENCODE_STEPS: &str = "repository.svn_commit.record_encode_steps";
+
+/// One of [`checked_in`]'s steps, from `at`, until the shard's clock passes its quantum.
 fn check_slice(
   state: &mut ShardState,
   repository: RepositoryId,
-  (at, record): (CheckAt, &mut Vec<u8>),
+  at: CheckAt,
 ) -> Result<CheckStep, Uncommitted> {
   let records = state
     .vcs_stores
@@ -1137,10 +1164,7 @@ fn check_slice(
     .ok_or(Uncommitted::NotHeld)?;
   let deadline = slice_deadline_ns();
   let checking = match at {
-    CheckAt::Begin(revision) => {
-      *record = slates_svn::commit::record::Record::revision_bytes(&revision);
-      records.check_begin(revision).map_err(Uncommitted::Step)?
-    }
+    CheckAt::Begin(revision) => records.check_begin(revision).map_err(Uncommitted::Step)?,
     CheckAt::Going(checking) => *checking,
   };
   records

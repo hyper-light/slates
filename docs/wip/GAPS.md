@@ -909,8 +909,9 @@
 > the scan of the runs are still one unit each, owed their slicing. Next, by size:
 > `stage.judging` is out of move's leaders since a directory removal's children are counted and the resolution's end
 > taken an entry a unit, and `stage.recording` since the staging applies the pending holds a slice a step before its
-> free decision and its walks read a directory a child a unit; `stage.check` (3.7-3.9) and `landing.changeset`
-> (2.3-2.4) are next; the landing's
+> free decision and its walks read a directory a child a unit, and `stage.check` since a revision's record is encoded a
+> part at a time; next by size, `stage.canonical` (5.4-5.5 ms debug), `landing.prepare` (3.8), `parse` (3.6-3.8) and
+> `landing.changeset` (2.3-2.5); the landing's
 > publication (9.3-24.8 ms since today's merges) is A-930's image cut, w-perf's. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`

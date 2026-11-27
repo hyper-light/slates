@@ -237,12 +237,10 @@ impl Record {
   /// The bytes of `revision`'s record, as [`Record::encode`] writes a [`Record::Revision`], without taking the
   /// revision: what the owner's step writes before it hands the revision to the check (A-655 part 2b).
   pub fn revision_bytes(revision: &Revision) -> Vec<u8> {
-    // Reserved at the record's exact length once, never grown: a revision carries its texts, and growing a buffer of
-    // that size by doubling copied it again at each step (A-742: 265 MiB of such copies in a 1,000-revision import).
-    let mut out = Vec::with_capacity(HEADER_LEN.saturating_add(revision_len(revision)));
-    put_header(&mut out, REVISION);
-    put_revision(&mut out, revision);
-    out
+    // The one encoding, taken whole: [`RevisionEncoding`] run to its end with no slice to its contents' copies.
+    let mut encoding = RevisionEncoding::default();
+    while !encoding.step(revision, usize::MAX) {}
+    encoding.into_bytes()
   }
 
   /// The record `bytes` hold.
@@ -300,37 +298,6 @@ const LONG: usize = size_of::<u64>();
 /// A length-prefixed byte string's encoded length ([`put_bytes`]).
 fn bytes_len(bytes: &[u8]) -> usize {
   LONG.saturating_add(bytes.len())
-}
-
-/// The bytes [`put_revision`] writes for `revision`, exactly.
-fn revision_len(revision: &Revision) -> usize {
-  let rows = revision.record.changes.iter().map(row_len);
-  let properties = revision
-    .properties
-    .iter()
-    .map(|(name, value)| bytes_len(name).saturating_add(bytes_len(value)));
-  let contents = revision
-    .contents
-    .iter()
-    .map(|(identity, bytes)| size_of_val(identity).saturating_add(bytes_len(bytes)));
-  let stored = revision.stored.len().saturating_mul(CONTENT_FEWEST);
-  let locks = revision.lock_entries.iter().map(lock_len);
-  [
-    LONG,
-    bytes_len(revision.record.transaction.as_bytes()),
-    LONG,
-    rows.fold(0usize, usize::saturating_add),
-    LONG,
-    properties.fold(0usize, usize::saturating_add),
-    LONG,
-    contents.fold(0usize, usize::saturating_add),
-    LONG,
-    stored,
-    LONG,
-    locks.fold(0usize, usize::saturating_add),
-  ]
-  .into_iter()
-  .fold(0usize, usize::saturating_add)
 }
 
 /// The bytes [`put_row`] writes for `row`, exactly.
@@ -428,31 +395,6 @@ fn index_of<T: PartialEq>(all: &[T], value: &T) -> u8 {
     .position(|each| each == value)
     .and_then(|place| u8::try_from(place).ok())
     .unwrap_or(u8::MAX)
-}
-
-/// Appends a revision.
-fn put_revision(out: &mut Vec<u8>, revision: &Revision) {
-  put_long(out, revision.head);
-  put_bytes(out, revision.record.transaction.as_bytes());
-  put_count(out, revision.record.changes.len());
-  for row in &revision.record.changes {
-    put_row(out, row);
-  }
-  put_properties(out, &revision.properties);
-  put_count(out, revision.contents.len());
-  for (identity, bytes) in &revision.contents {
-    out.extend_from_slice(identity);
-    put_bytes(out, bytes);
-  }
-  put_count(out, revision.stored.len());
-  for (identity, len) in &revision.stored {
-    out.extend_from_slice(identity);
-    put_long(out, *len);
-  }
-  put_count(out, revision.lock_entries.len());
-  for entry in &revision.lock_entries {
-    put_lock_entry(out, entry);
-  }
 }
 
 /// Appends a revision's properties: their count, then each name and value.
@@ -815,3 +757,204 @@ fn token(reader: &mut Reader<'_>) -> Result<LockToken, RecordRefused> {
 
 #[cfg(test)]
 mod tests;
+
+/// A revision's record written a part at a time ([`Record::revision_bytes`] taken in units; A-920: a revision of 9,000
+/// rows, 1.2 MB, encoded whole in one step of its check, 3.8 ms debug). Its length is measured an entry a unit and
+/// reserved exactly once, never grown (A-742: growing a buffer of a revision's size by doubling copied it again at each
+/// doubling, 265 MiB of such copies in a 1,000-revision import); then its entries are written in the record's order an
+/// entry a unit, each list's count as the list begins, a content's bytes a copy slice a unit. Its bytes are
+/// [`Record::revision_bytes`]'s, which is this run to its end.
+#[derive(Debug, Default)]
+pub struct RevisionEncoding {
+  /// The bytes written so far, reserved at the record's length once it is measured.
+  out: Vec<u8>,
+  /// The record's length measured so far.
+  len: usize,
+  /// Whether the length is measured and the entries are being written.
+  writing: bool,
+  /// The part under way.
+  part: Part,
+  /// The next entry of a list part.
+  at: usize,
+  /// The last key written or measured of a map part.
+  after: Option<Vec<u8>>,
+  /// The bytes of the content under way written so far.
+  written: usize,
+}
+
+/// The parts of a revision's record, in its order ([`RevisionEncoding`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Part {
+  /// The header, the head and the transaction's name.
+  #[default]
+  Head,
+  /// The changed-path rows.
+  Rows,
+  /// The revision properties.
+  Properties,
+  /// The texts carried.
+  Contents,
+  /// The texts named stored.
+  Stored,
+  /// The lock entries.
+  Locks,
+  /// Every part.
+  End,
+}
+
+impl RevisionEncoding {
+  /// One unit of `revision`'s record, a content's bytes `slice` at most: whether the record is written whole.
+  pub fn step(&mut self, revision: &Revision, slice: usize) -> bool {
+    match self.part {
+      Part::Head => self.head(revision),
+      Part::Rows => self.row(revision),
+      Part::Properties => self.property(revision),
+      Part::Contents => self.content(revision, slice.max(1)),
+      Part::Stored => self.stored(revision),
+      Part::Locks => self.lock(revision),
+      Part::End => return self.ended(),
+    }
+    false
+  }
+
+  /// The record's bytes, once written whole.
+  pub fn into_bytes(self) -> Vec<u8> {
+    self.out
+  }
+
+  /// [`Part::End`]: the length measured, the record's buffer reserved and its writing begun; or the record written.
+  fn ended(&mut self) -> bool {
+    if self.writing {
+      return true;
+    }
+    self.out = Vec::with_capacity(self.len);
+    self.writing = true;
+    self.part = Part::Head;
+    false
+  }
+
+  /// `part` begun, its list's `count` first.
+  fn begin(&mut self, part: Part, count: usize) {
+    if self.writing {
+      put_count(&mut self.out, count);
+    } else {
+      self.len = self.len.saturating_add(LONG);
+    }
+    (self.part, self.at, self.after, self.written) = (part, 0, None, 0);
+  }
+
+  /// [`Part::Head`].
+  fn head(&mut self, revision: &Revision) {
+    let transaction = revision.record.transaction.as_bytes();
+    if self.writing {
+      put_header(&mut self.out, REVISION);
+      put_long(&mut self.out, revision.head);
+      put_bytes(&mut self.out, transaction);
+    } else {
+      self.len = [HEADER_LEN, LONG, bytes_len(transaction)]
+        .into_iter()
+        .fold(self.len, usize::saturating_add);
+    }
+    self.begin(Part::Rows, revision.record.changes.len());
+  }
+
+  /// [`Part::Rows`]: the next row.
+  fn row(&mut self, revision: &Revision) {
+    let Some(row) = revision.record.changes.get(self.at) else {
+      // The properties' count is their part's first bytes ([`put_properties`]).
+      self.begin(Part::Properties, revision.properties.len());
+      return;
+    };
+    if self.writing {
+      put_row(&mut self.out, row);
+    } else {
+      self.len = self.len.saturating_add(row_len(row));
+    }
+    self.at = self.at.saturating_add(1);
+  }
+
+  /// [`Part::Properties`]: the next property after the last.
+  fn property(&mut self, revision: &Revision) {
+    let Some((name, value)) = next_after(&revision.properties, self.after.as_deref()) else {
+      self.begin(Part::Contents, revision.contents.len());
+      return;
+    };
+    if self.writing {
+      put_bytes(&mut self.out, name);
+      put_bytes(&mut self.out, value);
+    } else {
+      self.len = self
+        .len
+        .saturating_add(bytes_len(name).saturating_add(bytes_len(value)));
+    }
+    self.after = Some(name.clone());
+  }
+
+  /// [`Part::Contents`]: the next content after the last, or `slice` more of the one under way.
+  fn content(&mut self, revision: &Revision, slice: usize) {
+    let Some((identity, bytes)) = next_after(&revision.contents, self.after.as_deref()) else {
+      self.begin(Part::Stored, revision.stored.len());
+      return;
+    };
+    if !self.writing {
+      self.len = self
+        .len
+        .saturating_add(size_of_val(identity).saturating_add(bytes_len(bytes)));
+      self.after = Some(identity.to_vec());
+      return;
+    }
+    if self.written == 0 {
+      self.out.extend_from_slice(identity);
+      put_count(&mut self.out, bytes.len());
+    }
+    let end = self.written.saturating_add(slice).min(bytes.len());
+    self
+      .out
+      .extend_from_slice(bytes.get(self.written..end).unwrap_or_default());
+    self.written = end;
+    if self.written >= bytes.len() {
+      self.after = Some(identity.to_vec());
+      self.written = 0;
+    }
+  }
+
+  /// [`Part::Stored`]: the next text named stored after the last.
+  fn stored(&mut self, revision: &Revision) {
+    let Some((identity, len)) = next_after(&revision.stored, self.after.as_deref()) else {
+      self.begin(Part::Locks, revision.lock_entries.len());
+      return;
+    };
+    if self.writing {
+      self.out.extend_from_slice(identity);
+      put_long(&mut self.out, *len);
+    } else {
+      self.len = self.len.saturating_add(CONTENT_FEWEST);
+    }
+    self.after = Some(identity.to_vec());
+  }
+
+  /// [`Part::Locks`]: the next lock entry.
+  fn lock(&mut self, revision: &Revision) {
+    let Some(entry) = revision.lock_entries.get(self.at) else {
+      self.part = Part::End;
+      return;
+    };
+    if self.writing {
+      put_lock_entry(&mut self.out, entry);
+    } else {
+      self.len = self.len.saturating_add(lock_len(entry));
+    }
+    self.at = self.at.saturating_add(1);
+  }
+}
+
+/// The entry of `map` after the key `after` (its first without one), its key read as bytes.
+fn next_after<'m, K: AsRef<[u8]> + Ord + std::borrow::Borrow<[u8]>, V>(
+  map: &'m BTreeMap<K, V>,
+  after: Option<&[u8]>,
+) -> Option<(&'m K, &'m V)> {
+  let from = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+  map
+    .range::<[u8], _>((from, std::ops::Bound::Unbounded))
+    .next()
+}
