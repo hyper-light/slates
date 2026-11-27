@@ -724,6 +724,13 @@ impl Drop for WaitingOn {
   }
 }
 
+/// The calling thread's user and system CPU time so far, nanoseconds, where the platform keeps them apart per thread
+/// (macOS); `None` elsewhere. What a test splits a long unit's CPU by: the kernel's work against the thread's own
+/// (A-920: a free that empties an allocator region is system time).
+pub fn calling_thread_user_system_ns() -> Option<(u64, u64)> {
+  crate::thread_clock::user_system_ns()
+}
+
 /// The calling thread's CPU clock now, or `None` where the platform reads none (Miri): for a caller that judges its own
 /// work by the CPU it spent rather than the wall time it took, which a loaded machine stretches (§4.14's rule for an
 /// observation's budget, applied by `crates/db/tests/snapshot_cadence.rs` to a recovery's cost). Windows charges the
