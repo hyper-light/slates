@@ -435,7 +435,10 @@
 >     `Behind { held }` and every push was refused. The parts owed now ride the shard's recovery image (image 36, delta
 >     14), are owed again at a warm start to every candidate, and are persisted before they ship. Red first, made
 >     deterministic (a holds its parts off the old holder). "held 1" is measured: every newcomer position at or above
->     a's restarted hold start.
+>     a's restarted hold start. FIXED 2026-11-27 (w-perf; main's ruling of 13:42): a part's change mark toggled at its
+>     let-go, so a part the last publication carried, let go, held again at its position and let go again kept its
+>     piece in the next delta (the held-delta fold's proptest, w-svn's seed and diag 11's windows-latest). The mark now
+>     records whether that publication carried the position; red the seed in `daemon.proptest-regressions`.
 >   - **FIXED, A-921's second mode's (2) (A-921 part 4, w-shared, 2026-11-27):** a's replay re-derived the green's
 >     pending v2 with a checkpoint floor of 0 where the old holder held 1, refused `ConflictingPosition` (19 a run, then
 >     uncounted on the merge path) so v2 never placed and every push was refused. A holder now joins a record differing

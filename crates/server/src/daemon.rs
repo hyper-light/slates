@@ -11919,12 +11919,16 @@ mod tests {
         _ if which == 0 => HeldStep::Checkpoint,
         _ => HeldStep::Delta,
       });
-      let mut runner = proptest::test_runner::TestRunner::new(slates_test_seeds::unseeded(
-        proptest::test_runner::Config {
-          cases: slates_test_seeds::cases(64),
-          ..proptest::test_runner::Config::default()
-        },
-      ));
+      let mut runner = proptest::test_runner::TestRunner::new(
+        slates_test_seeds::seeded(
+          proptest::test_runner::Config {
+            cases: slates_test_seeds::cases(64),
+            ..proptest::test_runner::Config::default()
+          },
+          include_str!("daemon.proptest-regressions"),
+        )
+        .unwrap(),
+      );
       // The runner's case is an `Fn`, so each case borrows the one shard's state through a cell.
       let cell = std::cell::RefCell::new(state);
       let outcome = runner.run(&proptest::collection::vec(step, 1..60), |steps| {
