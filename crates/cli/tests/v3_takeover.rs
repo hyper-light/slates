@@ -527,6 +527,17 @@ fn survivors_seen(nodes: &[Node], survivors: &[usize], (work, token): (&str, &st
     .collect()
 }
 
+/// `node`'s status lines of the two counter families a green's adoption moves, its replica's (`merge.replica.`, its
+/// builds `merge.replica_build.` among them) and its takeover's (`merge.takeover_`), bounded to those.
+fn adoption_counts(node: &Node) -> Vec<String> {
+  let (_, status, _) = slates(&node.instance, &node.issuer, &["status"]);
+  status
+    .lines()
+    .filter(|line| line.contains("merge.replica") || line.contains("merge.takeover_"))
+    .map(str::to_owned)
+    .collect()
+}
+
 /// The survivor that serves the repository once the owner is gone, waited for under [`FLEET_WAIT`] three times over: its
 /// place, `main` there and its own token. Fails naming what each survivor answered.
 fn successor_after(
@@ -542,6 +553,15 @@ fn successor_after(
       return (at, head, token);
     }
     if Instant::now() >= deadline {
+      // Each survivor's adoption counts first, each on a line of its own ahead of the panic's long payload, so a gate's
+      // log names CI's mode (main 01a20182's order of 2026-11-27 06:37): a successor short of the green's records
+      // (`merge.replica.records_short`) or of a push's objects (`Missing`).
+      for at in survivors {
+        eprintln!(
+          "V3TAKEOVER: node {at} adoption counts {:?}",
+          adoption_counts(&nodes[*at])
+        );
+      }
       // What each survivor answers, and what its takeover counted, so a failure names its cause.
       let seen = survivors_seen(nodes, survivors, (work, token));
       panic!("no survivor served the repository: {seen:#?}");
