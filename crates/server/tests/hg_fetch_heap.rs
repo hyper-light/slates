@@ -437,12 +437,14 @@ fn print_held(when: &str, (listed, total): &Listed, rows: &BTreeMap<String, u64>
   }
 }
 
-/// Prints, `when`, the bytes the shard image's publications encoded by family (`vcs_store.image.encoded_bytes.<family>`,
-/// each shard's), and their growth since `since` where given (main's order of 2026-11-25: whether a push's let-gos
-/// re-encode the Aways family's tail page whole each publication).
+/// Prints, `when`, the shard image encoder's counters, each shard's (`vcs_store.image.*`): the bytes its publications
+/// encoded by family and in all, those copied from committed pieces (A-930), its turns, cuts, splits, page size and
+/// reads' allocations; and their growth since `since` where given (main's orders of 2026-11-25 and 2026-11-27: whether a
+/// push's let-gos re-encode the Aways family's tail page whole each publication; what the encoder's work past the
+/// families is).
 fn print_encoded(when: &str, rows: &BTreeMap<String, u64>, since: Option<&BTreeMap<String, u64>>) {
   for (name, value) in rows {
-    if !name.contains(":vcs_store.image.encoded_bytes") {
+    if !name.contains(":vcs_store.image.") {
       continue;
     }
     match since.map(|since| value.saturating_sub(since.get(name).copied().unwrap_or(0))) {
