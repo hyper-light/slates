@@ -1262,11 +1262,15 @@ fn checkpoint_named_now(daemon: &Daemon, repository: RepositoryId, head: u64) ->
 
 /// How the image a restart would restore now holds repository `repository`'s green's checkpoint-named texts, read from
 /// the image's own entries (the shard's committed journal, `verbs::committed_held`, whose Aways family names each text
-/// let go, `content_holder::aways_among`): (held whole, held Away). A stop publishes nothing (§4.8: "the daemon stopped
-/// with nothing more published"), so read just before one, it is what the successor restores. None for no green, no
-/// checkpoint or no journal.
+/// let go, `content_holder::aways_among`): (held whole, held Away). The shard is published first, in the same step, so
+/// the journal carries every let-go the shard has made: a let-go not yet published was read as whole here and then
+/// committed before the stop, which the successor restored as Away (CI's windows-latest, diag run 45986066740: the shard
+/// lacked all 3 named texts, the journal read held 1 whole, and the restart found 0 whole and brought 3 back). A stop
+/// publishes nothing more (§4.8: "the daemon stopped with nothing more published"), so read just before one, it is what
+/// the successor restores. None for no green, no checkpoint, no journal or a refused publish.
 fn image_split(daemon: &Daemon, repository: RepositoryId) -> Option<(u64, u64)> {
   crate::daemon::observe_first(daemon, move |state| {
+    crate::verbs::publish_shard(state).ok()?;
     let green = super::svn_commit::green_of(state, repository).ok()?;
     let (_, named) = state.db.partition().green_checkpoint(green)?;
     let bytes = crate::merge_service::checkpoint_bytes(state, green, &named)?;

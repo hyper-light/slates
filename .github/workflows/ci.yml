@@ -124,6 +124,11 @@ jobs:
       # tests run under the runner's default mlock limit — no `ulimit` bump, which the runners ignore.
       - name: Test
         env:
+          # The workspace's test binaries with full debug info outgrew the runner's disk: diag CI 7 (run 46004209050,
+          # job 140523159706, 2026-11-27) had 113G free once the unused SDKs went, and the workspace tests then failed
+          # linking with "No space left on device" (60 MB left). Line tables keep every panic's file and line at a
+          # fraction of the size; "Disk after the workspace tests" prints the margin left.
+          CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
           # The fleet harness's wait trace (crates/server/tests/common/trace.rs): held in memory per test and printed
           # only with a failing test, so a takeover that never completes says which daemon stopped advancing (fleet
           # tests failed on 4 of 8 runs on 2026-10-06 with no evidence beyond a timeout).

@@ -184,8 +184,18 @@ pub(crate) const STEPS: &str = "vcs_store.hg_ssh_steps";
 
 /// The calling thread's CPU time, nanoseconds (`slates_rt::registry::calling_thread_cpu`); none where the platform reads
 /// none.
+#[cfg(not(windows))]
 pub(crate) fn thread_cpu_ns() -> Option<u64> {
   slates_rt::registry::calling_thread_cpu().map(|reading| reading.spent_ns)
+}
+
+/// [`thread_cpu_ns`] on Windows: the thread's cycles at the rate measured once a process (`slates_machine::own_cpu`, as
+/// `daemon::shard_thread_cpu_ns` reads it). The thread time Windows keeps (`GetThreadTimes`) is charged a scheduler tick
+/// at a time, about 15.6 ms, so a serving step of under a millisecond read none: on CI's windows-11-arm (diag run
+/// 45986066740) a clone's 6 serving steps and 13 polls all read 0 ns, and its step counter recorded nothing.
+#[cfg(windows)]
+pub(crate) fn thread_cpu_ns() -> Option<u64> {
+  slates_machine::own_cpu::own_cpu_ns()
 }
 
 /// A serving step that began at thread CPU `began` ended: counted ([`STEPS`]), and its CPU ([`STEP_MOST_CPU_NS`]) where

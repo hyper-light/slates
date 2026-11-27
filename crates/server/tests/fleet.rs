@@ -38313,6 +38313,108 @@ fn a921_a_warm_restarted_node_answers_its_peers_while_a_silent_one_holds_its_ann
   );
 }
 
+/// A-921 part 5's follow-up (main 01a20182's ruling of 2026-11-27 05:11: a refused spawn left owed, never awaited in the
+/// loop, its refusal counted by kind). Do: on a four-node `f = 1` anchored git fleet, make node c hold every edges
+/// announcement unanswered (`Daemon::inject_member_exchange_withhold`), make node b's member loop refused each task it
+/// spawns for an announcement (`Daemon::inject_member_spawn_refusal`), and make b owe its edges record to every peer
+/// again (`Daemon::owe_edges_again`); watch every other node for [`DOUBT_WINDOW_DETECTIONS`] of b's detection terms;
+/// then lift the refusal. Expect no node to condemn b meanwhile (its detector never holds b dead, b's fencing epoch
+/// never moves there), b's refusals counted by kind, once a turn (`fleet.edges.announce_refused.too_many_tasks`, more
+/// than one), and b's record sent once the refusal lifts, a later turn trying again. Red before: a refused spawn ran its
+/// exchange inline, awaited in the loop, so b's record to c held b's loop for the whole exchange budget and again
+/// each turn, the two-deaths mechanism A-921 part 5 removed, and nothing counted the refusal's kind.
+#[test]
+fn a921_a_member_loop_refused_a_task_keeps_answering_and_tries_again() {
+  let _serial = serialize_fleet_tests();
+  let fleet = anchored_git_fleet_of("refused-spawn", &["a", "b", "c", "d"]);
+  let (b, silent) = (1, 2);
+  let b_host = fleet.hosts[b];
+  let watched: Vec<(usize, Option<u64>)> = (0..fleet.daemons.len())
+    .filter(|at| *at != b)
+    .map(|at| (at, fencing_epoch_of(&fleet.daemons[at], b_host)))
+    .collect();
+  let detection = fleet.daemons[b]
+    .failover_detection_ns()
+    .ok()
+    .flatten()
+    .unwrap_or(HEARTBEAT_NS);
+  fleet.daemons[silent]
+    .inject_member_exchange_withhold(false, true)
+    .unwrap();
+  let turns_before = move_counter(&fleet.daemons[b], LOOP_TURNS).unwrap_or(0);
+  fleet.daemons[b].inject_member_spawn_refusal(true).unwrap();
+  fleet.daemons[b].owe_edges_again().unwrap();
+  let condemned = condemned_within(&fleet, (b_host, &watched), detection);
+  let refused = move_counter(&fleet.daemons[b], REFUSED_EDGES_SPAWN);
+  // b's member loop turns over the same window, and the members it owes (every peer): one refusal a member a turn at
+  // most, so a loop woken again because it is still owed, a spin, cannot pass as its turn rate.
+  let turns =
+    move_counter(&fleet.daemons[b], LOOP_TURNS).map(|now| now.saturating_sub(turns_before));
+  let owed = u64::try_from(fleet.daemons.len().saturating_sub(1)).unwrap_or(u64::MAX);
+  let sent_before = move_counter(&fleet.daemons[b], "fleet.edges.sent").unwrap_or(0);
+  fleet.daemons[b].inject_member_spawn_refusal(false).unwrap();
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let sent = poll_until(&observed, Duration::from_nanos(detection), || {
+    Ok(move_counter(&fleet.daemons[b], "fleet.edges.sent")? > sent_before)
+  });
+  drop(observed);
+  let _ = fleet.daemons[silent].inject_member_exchange_withhold(false, false);
+  fleet.stop();
+  eprintln!(
+    "refused-spawn: detection {detection} ns; condemned (node, ms, how) {condemned:?}; refused {refused:?} over the \
+     loop's {turns:?} turns, {owed} members owed; sent again {sent} (from {sent_before})"
+  );
+  assert!(
+    condemned.is_empty(),
+    "no node condemned b while its spawns were refused: {condemned:?}"
+  );
+  assert!(
+    refused.as_ref().is_ok_and(|count| *count > 1),
+    "b's refusals counted by kind, once a turn: {refused:?}"
+  );
+  assert!(
+    refused.as_ref().is_ok_and(|refused| turns
+      .as_ref()
+      .is_ok_and(|turns| *refused <= owed.saturating_mul(*turns))),
+    "at most one refusal a member a turn of b's member loop: {refused:?} over {turns:?} turns, {owed} owed"
+  );
+  assert!(
+    sent,
+    "b sent its edges record once its spawns were admitted again"
+  );
+}
+
+/// Counter: the member loop's turns (`member_task::run`).
+const LOOP_TURNS: &str = "fleet.plane.loop_turns";
+
+/// Counter: a refused edges announcement task, by its kind (`member_task::spawn_exchange`).
+const REFUSED_EDGES_SPAWN: &str = "fleet.edges.announce_refused.too_many_tasks";
+
+/// Each node of `watched` (with `member`'s fencing epoch there before) that condemned `member` within
+/// [`DOUBT_WINDOW_DETECTIONS`] of `detection` on the wall's clock, first condemnation each: (node, ms, how).
+fn condemned_within(
+  fleet: &GitFleet,
+  (member, watched): (HostId, &[(usize, Option<u64>)]),
+  detection: u64,
+) -> Vec<(usize, u128, String)> {
+  let window = Duration::from_nanos(detection.saturating_mul(DOUBT_WINDOW_DETECTIONS));
+  let started = Instant::now();
+  let mut condemned: Vec<(usize, u128, String)> = Vec::new();
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  // The watch's own deadline, in fleet periods, is twice the window.
+  let _ = poll_until(&observed, window.saturating_mul(2), || {
+    for (at, before) in watched {
+      if let Some(seen) = condemnation_of(&fleet.daemons[*at], member, *before)
+        && condemned.iter().all(|(node, ..)| node != at)
+      {
+        condemned.push((*at, started.elapsed().as_millis(), seen));
+      }
+    }
+    Ok(started.elapsed() >= window)
+  });
+  condemned
+}
+
 /// Shape: the detections [`a921_a_warm_restarted_node_answers_its_peers_while_a_silent_one_holds_its_announcements`]
 /// watches a for. The stall it would show is one exchange budget (about 1.2 s, past a 1 s detection), owed again and
 /// again each turn with one turn between, so a peer may still hear a refute in the gap: measured red 1 run in 2 within
