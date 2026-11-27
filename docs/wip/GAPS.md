@@ -773,7 +773,10 @@
 > since 13a (release probe 15's leader at about 1.4 ms p50). Copy's `landing.release` unit is kernel time in debug
 > (3.0 ms, 99.8% system: an allocator region's return, owed its own piece). The register's op publishes ahead of
 > itself since 13b; the publication is one whole step (8.8 ms debug, owed turns if release finds it past the bar), and
-> the record's inline chain entry (430,978 bytes) is next, (a). Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
+> the record's inline chain entry (430,978 bytes) was to be next, (a). Measured and rejected: the log's write of it was 0.32
+> ms of the op's 4.29 (debug), and the cost was the identity's hash of the whole op (4.92 ms), which hashes each entry as
+> its digest since 13c. The log write's about 48 bytes a path stays, for a wider probe to judge. Next: copy's release
+> unit (kernel time), then move's `stage.committing` and `landing.apply`. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's

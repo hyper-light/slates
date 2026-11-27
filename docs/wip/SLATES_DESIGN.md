@@ -64947,7 +64947,29 @@ GAPS.
     - move's is `landing.apply` (8.5 ms);
     - add's is `stage.recording` (5.4 ms).
   - The publication is not yet a piece a step: the delta carries the held pieces whole, so carrying them in turns is
-    owed if release finds the step past the bar. (a), the record naming its chain entry held, is next.
+    owed if release finds the step past the bar.
+  **(a), the record naming its chain entry held, measured and rejected** (main's ruling of 2026-11-26 21:24, on these
+  figures). After 13b the op was `record_all`, 4.29 ms in debug at 9,000 paths:
+  - the log's write of the record with its 431 KB chain entry inline: 0.32 ms;
+  - the partition's check: 1 µs;
+  - the partition's apply: 4.25 ms. Of that, `apply_op` was 148 µs and `Repositories::seal_made` 4.06 ms, its
+    re-encoding of the op 15.6 µs and its BLAKE3 over 431,081 bytes 4.92 ms.
+  So the record's inline bytes were not the cost, and a chain-entry format change across `slates-merge`, the server and
+  recovery would have left most of it. The log write's about 48 bytes a path stays, for a wider probe to judge.
+  **13c, the op's identity over each chain entry's digest.** `seal_made` stamps the op's state-log records with its
+  identity, which hashed the op's whole encoding, so what it hashed grew with the revision's width in one step (bounded
+  work, §3). The identity is now `catalog::OperationIdentity`: BLAKE3 over the spans and the op's identity encoding
+  (`repository::identity_encoding`), the op's encoding with each chain entry standing in as its own trailing 32-byte
+  digest (chain entry format 6's).
+  - Its own type: every record and message carrying one changes schema, so no identity of the definition before is
+    read beside one of this.
+  - An entry's digest is verified against its bytes where they are read back: the log record's CRC32C at a replay,
+    the chain entry's own check at its decode. Holders never recompute an identity; they keep the owner's.
+  - Gauge: `repository.push.sealed_bytes_most`, the most an op's identity hashed, under 4 KB in `t_c2c`; red at about
+    431 KB with the definition before.
+  - Test: `an_ops_identity_hashes_each_entry_as_its_digest_alike_at_the_owner_and_its_replay`. The encoding is the
+    same for the op read back as a replay reads it; a 431 KB entry's is no longer than a 100-byte one's; a one-byte
+    change of an entry gives a different encoding.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
