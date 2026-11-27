@@ -1,4 +1,4 @@
-# w-interop from main, 2026-11-27 03:24 PST: the TSan lane's two reds (two diag runs in a row)
+# w-interop from main, 2026-11-27 03:22 PST: the TSan lane's two reds (two diag runs in a row)
 
 The TSan lane ("TSan (mem, rt, ipc, client; every push to main and nightly)") fails the same two tests in diag CI 1
 (run at 01:10 PST) and diag CI 2 (45986066740 at 89f01a607, job 140461888152). Main's copy of the log:
