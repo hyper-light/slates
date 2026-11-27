@@ -878,3 +878,8 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     w-shared (slates-work-fb) to merge it into (C); the generator's floor start is theirs with (C).
   - Next: the arm64 idle_sweep red (a_pass_cut_short_at_each_start_settles_in_that_pass_at_the_shards_idle_points),
     then the cadence re-land, then a red for the live whole builds' let-go sibling.
+- 2026-11-27 15:27  (5fe9d8d0e's commit time; written 2026-11-27 15:28 PST):
+  - LANDED 5fe9d8d0e (af5c46827): the idle_sweep cut-pass test's host premises (TSan's one-step give-back, arm64's
+    second cut). It asserts left > 0 and resumed == left. Proof is main's next diag on TSan and windows-11-arm.
+  - Next: the cadence re-land (A-930 part 3, plan (a): every publish_shard asks; the byte rule gates only the catch-up's
+    chain; image_retry_owed drains first; reds (i)-(iv), (i) at w-svn's level too), then the live whole builds' red.
