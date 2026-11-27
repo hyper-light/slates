@@ -547,7 +547,11 @@
 > publications. Counters
 > for main's rounds: `vcs_store.image.*` (skipped, longest lag, pauses, the longest turn's bytes). Ranges per object rejected on arena-5's numbers (main agreed). OWED:
 > piece 3 (pages restored a page a turn, reads waiting), and a 100k-file volume's longest image step measured against
-> the step budget (the volumes' images paged too only if past it).
+> the step budget (the volumes' images paged too only if past it). OPEN, by reading (w-perf, main's ruling of
+> 2026-11-27 11:09): `Daemon::stop` drains no owed publication, so a graceful stop during a catch-up restores an image
+> a cut behind. Measured harmless so far: t_c1's red, first read as this, was the map remake (C1's entry). The drain
+> and its tests are kept at `~/.local/state/w-perf/patches/drain-and-instrument-1109.patch`, to land with a red of
+> its own.
 > **Publication churn (goal 93, w-perf; main's ruling of 2026-11-25 (a), w-shared's go):** at 2,000 changesets about
 > 65% of a push's system allocations were its publications (`crates/server/tests/hg_fetch_heap.rs`'s churn by site): a
 > delta re-encodes only the pages its changes lie in, but a re-encoded page was read a buffer of entries and a heap
@@ -2276,6 +2280,13 @@
 >   "Windows let go ride the image"); `ContentStore::let_go_object` lets every window of an object go but those
 >   another holds. Held by `vcs content::windows_let_go_survive_a_restart_as_let_go_and_come_back_by_their_bytes` and
 >   `daemon::tests::t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes`.
+>   FIXED 2026-11-27 (w-perf; main's bisect to 11168fab3 and ruling of 11:09; bug record
+>   docs/bugs/2026-11-27-a-warm-restarts-map-remake-hashed-a-let-go-file.md): a recovery's map remake hashed a head file
+>   through a window restored let go. Since 11168fab3 it was refused, silently, and the recovery freed the file (t_c1
+>   red on Windows and macOS); before, it named a wrong tree. The remake now brings the window back from the green's
+>   bytes and lets it go again at its number (`paths::put_file_whole`, `let_go_brought_again`). t_c1 asserts the tree id
+>   and `vcs_paths.refused` 0 each round. OPEN: the live whole builds (`put_whole`, `put_change`) put files the same
+>   plain way, so a live whole build of a green whose file has a window let go is refused the same way.
 > - 2b, next: each import segment's file windows marked landed and let go once the segment is durable; a symlink's
 >   target read again in the walk; main's red (after a fixture import `ContentStore::used` is the changelog's and the
 >   manifests' bytes alone; a clone and a push over the import verify clean against stock 7.2).

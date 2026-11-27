@@ -56230,6 +56230,16 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   without `restore_away`: 4 lists and names refused) and `daemon::tests::t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes`
   (three warm restarts after seeded let-go rounds, the store whole as published each time, the object brought back the
   same bytes by its identity).
+  - **A recovery's map remake reads its files whole (2026-11-27, w-perf; main's ruling of 11:09).** A recovery makes
+    each git green's map and trees again from its head (`paths::remake_green_sliced`), and the trees hash each file's
+    bytes from the content store. A file whose window the image restored let go is put with
+    `ContentStore::put_object_whole`, which brings the window back from the file's bytes (the green's own, in hand).
+    Each such window was first noted at its let-go number (`ContentStore::aways_of`) and is let go again at that
+    number once the map is made, a unit of the recovery's slices each (`ContentStore::let_go_again`,
+    `paths::let_go_brought_again`; counted `vcs_paths.remake_brought_back`, any kept `vcs_paths.remake_kept`). So the
+    warm restart holds what its predecessor held, and the image's aways are unchanged. A refused remake is logged with
+    its green and why, since with no map the recovery frees what only the map held. Before 11168fab3 the hash ran over
+    the short file and named a wrong tree; from it until this fix the remake was refused and the file freed.
 
 
 - **Slice (d), a holder's replica reads named content (2026-11-23, w-shared; main 01a20182's rulings of 2026-11-23).**
