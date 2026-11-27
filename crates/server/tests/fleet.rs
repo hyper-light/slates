@@ -36537,34 +36537,10 @@ impl GitFleet {
     (file, bytes): (&str, &[u8]),
     branch: &str,
   ) -> Result<(), String> {
-    let dir = common::target::target_dir();
     let port = self.daemons[node]
       .vcs_http_port()
       .expect("the edge listens");
-    let header = format!("http.extraHeader=Authorization: Bearer {}", self.token);
-    let helper = token_helper(&self.token);
-    let url = format!("http://127.0.0.1:{port}/project");
-    let cloned = git_in(
-      &dir.path,
-      &[
-        "-c", &header, "-c", &helper, "clone", "-q", "-b", branch, &url, "copy",
-      ],
-    );
-    if !cloned.status.success() {
-      return Err(String::from_utf8_lossy(&cloned.stderr).into_owned());
-    }
-    commit_in(&dir, "copy", (file, bytes));
-    let work = format!("{}/copy", dir.path);
-    let refspec = format!("HEAD:refs/heads/{branch}");
-    let pushed = git_in(
-      &work,
-      &["-c", &header, "-c", &helper, "push", "-q", &url, &refspec],
-    );
-    if pushed.status.success() {
-      Ok(())
-    } else {
-      Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
-    }
+    push_on_top_at_edge((port, &self.token), (file, bytes), branch)
   }
 
   /// [`GitFleet::push`] of a fresh history to branch `branch` rather than `main`: a create of a new branch, its own green.
@@ -36957,6 +36933,124 @@ fn a894_a_repository_whose_owner_dies_as_its_creation_answers_is_taken_over_and_
 /// holds a window for the region: each push homes two windows at two of the three nodes, so a is a home of neither one
 /// time in nine, and of none after this many more pushes one time in 3^16, about 43 million.
 const PUSHES_FOR_A_HOME: usize = 8;
+
+/// A-914's homing shortfall (main 01a20182's rulings of 2026-11-27 09:33 and 09:43; a914's second push refused `retry`,
+/// 1 of 3). Do: on a three-node `f = 1` git fleet, push `main`; make b and c hold each home message they are asked a
+/// whole homing budget before they answer (`Daemon::delay_home_answers`); push on top from a, and as soon as b or c is
+/// asked a home put (`vcs_store.homes.remote_asked`: so it is one of the window's homes), stop it, its exchange broken
+/// with no answer (no round trip, a transport error, empty bytes); the other answers at once again. Expect a to read no
+/// reply as another home wire version's (`vcs_store.homes.reply_other_version` 0) and to have settled the broken one as
+/// no answer (`vcs_store.homes.reply_unanswered` at least 1), and the push to land, or be refused only once its homing
+/// waited its window out: a home that died unseen costs a round, then the homes are ranked again once its takeover
+/// installs (A-912). Red before: the empty bytes were read as another version's reply (A-727 (d1a)) and the homing ended
+/// short at once.
+#[test]
+fn a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = git_fleet("died-mid-put");
+  let first = fleet.push(0, ("first.txt", b"main before the home dies\n"));
+  let window_ns = fleet.daemons[0]
+    .homing_window()
+    .map_or(0, |reading| reading.window_ns);
+  let budget_ns = fleet.daemons[0].homing_budget_ns();
+  let asked_before: Vec<u64> = fleet.daemons[1..]
+    .iter()
+    .map(|daemon| move_counter(daemon, REMOTE_ASKED).unwrap_or(0))
+    .collect();
+  for daemon in &fleet.daemons[1..] {
+    daemon.delay_home_answers(budget_ns).unwrap();
+  }
+  let port = fleet.daemons[0].vcs_http_port().expect("the edge listens");
+  let token = fleet.token.clone();
+  let began = Instant::now();
+  let pushing = std::thread::spawn(move || {
+    push_on_top_at((port, &token), ("second.txt", b"pushed as a home dies\n"))
+  });
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let mut asked = None;
+  let found = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    asked = (1..fleet.daemons.len()).find(|node| {
+      move_counter(&fleet.daemons[*node], REMOTE_ASKED)
+        .is_ok_and(|now| now > asked_before[node.saturating_sub(1)])
+    });
+    Ok(asked.is_some())
+  });
+  drop(observed);
+  let Some(home) = asked else {
+    fleet.stop();
+    panic!("neither b nor c was asked a home put of the push ({found})");
+  };
+  fleet.daemons.remove(home).stop();
+  for daemon in &fleet.daemons[1..] {
+    daemon.delay_home_answers(0).unwrap();
+  }
+  let pushed = pushing.join().expect("the pushing thread");
+  let elapsed = began.elapsed();
+  let counts = [
+    move_counter(&fleet.daemons[0], "vcs_store.homes.reply_other_version").unwrap_or(0),
+    move_counter(&fleet.daemons[0], "vcs_store.homes.reply_unanswered").unwrap_or(0),
+  ];
+  fleet.stop();
+  eprintln!(
+    "died-mid-put: first {first:?}; home node {home} stopped once asked; pushed {pushed:?} after {elapsed:?}, window \
+     {window_ns} ns; (other version, unanswered) {counts:?}"
+  );
+  assert_eq!(first, Ok(()), "the push before the home's death landed");
+  assert!(
+    counts[0].saturating_add(counts[1]) >= 1,
+    "the dead home's broken exchange was settled one way or the other: {counts:?}"
+  );
+  assert_eq!(
+    counts[0], 0,
+    "no reply was read as another home wire version's: {counts:?}"
+  );
+  assert!(
+    pushed.is_ok() || elapsed.as_nanos() >= u128::from(window_ns),
+    "the push landed, or its homing waited its window ({window_ns} ns) out: {pushed:?} after {elapsed:?}"
+  );
+}
+
+/// [`GitFleet::push_on_top`] at the edge on `port` with `token`, needing no fleet, for a push run on a thread of its own.
+fn push_on_top_at((port, token): (u16, &str), (file, bytes): (&str, &[u8])) -> Result<(), String> {
+  push_on_top_at_edge((port, token), (file, bytes), "main")
+}
+
+/// [`GitFleet::push_on_top_of`] at the edge on `port` with `token`: cloned at `branch`, `bytes` committed as `file` on
+/// top, and pushed back to it.
+fn push_on_top_at_edge(
+  (port, token): (u16, &str),
+  (file, bytes): (&str, &[u8]),
+  branch: &str,
+) -> Result<(), String> {
+  let dir = common::target::target_dir();
+  let header = format!("http.extraHeader=Authorization: Bearer {token}");
+  let helper = token_helper(token);
+  let url = format!("http://127.0.0.1:{port}/project");
+  let cloned = git_in(
+    &dir.path,
+    &[
+      "-c", &header, "-c", &helper, "clone", "-q", "-b", branch, &url, "copy",
+    ],
+  );
+  if !cloned.status.success() {
+    return Err(String::from_utf8_lossy(&cloned.stderr).into_owned());
+  }
+  commit_in(&dir, "copy", (file, bytes));
+  let work = format!("{}/copy", dir.path);
+  let refspec = format!("HEAD:refs/heads/{branch}");
+  let pushed = git_in(
+    &work,
+    &["-c", &header, "-c", &helper, "push", "-q", &url, &refspec],
+  );
+  if pushed.status.success() {
+    Ok(())
+  } else {
+    Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
+  }
+}
+
+/// Counter: home exchanges a node was asked, counted as each arrives (`vcs_store::homes::REMOTE_ASKED`).
+const REMOTE_ASKED: &str = "vcs_store.homes.remote_asked";
 
 /// Shape: the share of a push's homing budget each home waits before it answers in
 /// [`a907_a_home_slower_than_its_senders_round_costs_the_sender_no_session`]: a quarter, past the coordinator's round
@@ -37855,7 +37949,7 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
   assert_eq!(first, Ok(()), "the push before any death landed");
   let [
     (first_window, _, first_taken, first_after),
-    (second_window, _, second_taken, _),
+    (second_window, second_push, second_taken, _),
   ] = &during[..]
   else {
     panic!("two deaths: {during:?}");
@@ -37877,6 +37971,14 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
       .as_ref()
       .is_ok_and(|reading| reading.samples >= 1 && reading.learned),
     "the second death's window came from the learned silence: {second_window:?}"
+  );
+  // A-918 B: the candidate the first death brought in reads the green's chain from its cohort, so the record barrier
+  // finds its f + 1; A-914 (d): a home whose put broke as it died is no answer, so the homing waits and ranks again
+  // once the death installs. Before, refused `unable to commit` (2 of 7, then 4 of 6) or `retry` (1 of 7, then 1 of 3).
+  assert_eq!(
+    *second_push,
+    Ok(()),
+    "the push during the second death landed"
   );
 }
 
@@ -38516,33 +38618,54 @@ fn condemnation_of(daemon: &Daemon, member: HostId, before: Option<u64>) -> Opti
   (dead || epoch != before).then(|| format!("held {held:?}, epoch {before:?} -> {epoch:?}"))
 }
 
-/// What [`rekeyed_after_warm_restart`] watched: whether the node restarted and settled, its detection term, and per
-/// other node (by index, the silent one left out) when it re-keyed the node, in ms after the settle.
+/// What [`rekeyed_after_warm_restart`] watched: whether the node restarted and settled, its detection term, its own
+/// measured wake lateness, and per other node (by index, the silent one left out) when it was last seen not yet
+/// re-keying the node and when first seen re-keyed, in ns after the settle, with that node's measured wake lateness.
 struct Rekeyed {
   restarted: bool,
   detection: u64,
-  heard_at: Vec<(usize, Option<u128>)>,
+  lateness: u64,
+  watched: Vec<Watched>,
+}
+
+/// One node's watch in [`Rekeyed`]: the re-key happened after `unkeyed_ns` (the last look that saw it not yet) and by
+/// `seen_ns` (the first that saw it), so the test's own looks, one control-shard question per node in turn, add nothing
+/// to what is judged.
+#[derive(Debug)]
+struct Watched {
+  node: usize,
+  unkeyed_ns: u128,
+  seen_ns: Option<u128>,
+  lateness: u64,
 }
 
 impl Rekeyed {
-  /// Asserts the node restarted and every watched node re-keyed it within its detection on the wall's clock: the watch
-  /// is charged in fleet periods, which a loaded host runs late.
+  /// Asserts the node restarted and every watched node re-keyed it within its detection on the wall's clock, allowing
+  /// the measured wake lateness of the two nodes whose waits the re-key rides (A-921 part 5, main 01a20182's order of
+  /// 2026-11-27 09:50: Windows' timer tick of 15.625 ms put one node 10 ms past a bare 1 s). Judged from the last look
+  /// that saw it not yet, so the looks' own lag is never counted; the watch is charged in fleet periods, which a loaded
+  /// host runs late.
   fn assert_within(&self, scene: &str) {
-    let detection = u128::from(self.detection);
-    let within = |heard: &Option<u128>| {
-      heard.is_some_and(|ms| ms.saturating_mul(NANOS_PER_MILLI) <= detection)
+    let within = |watched: &Watched| {
+      let bound = u128::from(
+        self
+          .detection
+          .saturating_add(self.lateness)
+          .saturating_add(watched.lateness),
+      );
+      watched.seen_ns.is_some() && watched.unkeyed_ns <= bound
     };
     eprintln!(
-      "{scene}: restarted {}; detection {} ns; each other node re-keyed it at (node, ms after the settle) {:?}",
-      self.restarted, self.detection, self.heard_at
+      "{scene}: restarted {}; detection {} ns, its lateness {} ns; each other node's watch (ns after the settle) {:?}",
+      self.restarted, self.detection, self.lateness, self.watched
     );
     assert!(self.restarted, "the node restarted warm and settled");
     assert!(
-      self.heard_at.iter().all(|(_, heard)| within(heard)),
+      self.watched.iter().all(within),
       "every other node but a silent one re-keyed the node under its new process within a detection ({} ns) of its \
-       settle: {:?} ms",
+       settle, with the two nodes' wake lateness: {:?}",
       self.detection,
-      self.heard_at
+      self.watched
     );
   }
 }
@@ -38550,7 +38673,8 @@ impl Rekeyed {
 /// Restarts `node` warm and watches, for as long as its own detection term states (`Daemon::failover_detection_ns`: how
 /// long its peers take to condemn it), each other node but `silent` re-key it under its new process: joined to the
 /// detector, keyed by an installed epoch, and that epoch agreed with the new process (`Daemon::member_keying`). Past
-/// the detection a probe under the old keys goes unanswered, and a peer's detector may condemn a live member.
+/// the detection a probe under the old keys goes unanswered, and a peer's detector may condemn a live member. Each
+/// node's measured wake lateness (`detector_lateness_ns`) read once the watch ends.
 fn rekeyed_after_warm_restart(fleet: &mut GitFleet, node: usize, silent: Option<usize>) -> Rekeyed {
   let member = fleet.hosts[node];
   let restarted = fleet.restart_warm(node);
@@ -38561,34 +38685,53 @@ fn rekeyed_after_warm_restart(fleet: &mut GitFleet, node: usize, silent: Option<
     .ok()
     .flatten()
     .unwrap_or(HEARTBEAT_NS);
-  let mut heard_at: Vec<(usize, Option<u128>)> = (0..fleet.daemons.len())
+  let mut watched: Vec<Watched> = (0..fleet.daemons.len())
     .filter(|at| *at != node && Some(*at) != silent)
-    .map(|at| (at, None))
+    .map(|at| Watched {
+      node: at,
+      unkeyed_ns: 0,
+      seen_ns: None,
+      lateness: 0,
+    })
     .collect();
   let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
   let _ = poll_until(&observed, Duration::from_nanos(detection), || {
-    for (at, heard) in heard_at.iter_mut().filter(|(_, heard)| heard.is_none()) {
+    for watch in watched.iter_mut().filter(|watch| watch.seen_ns.is_none()) {
+      let looked = settled.elapsed().as_nanos();
       let rekeyed =
-        fleet.daemons[*at]
+        fleet.daemons[watch.node]
           .member_keying(member)
           .is_ok_and(|(joined, keyed, agreed)| {
             joined && keyed == Some(true) && agreed.is_some() && agreed == process
           });
       if rekeyed {
-        *heard = Some(settled.elapsed().as_millis());
+        watch.seen_ns = Some(settled.elapsed().as_nanos());
+      } else {
+        watch.unkeyed_ns = looked;
       }
     }
-    Ok(heard_at.iter().all(|(_, heard)| heard.is_some()))
+    Ok(watched.iter().all(|watch| watch.seen_ns.is_some()))
   });
+  drop(observed);
+  for watch in &mut watched {
+    watch.lateness = detector_lateness_ns(&fleet.daemons[watch.node]);
+  }
   Rekeyed {
     restarted,
     detection,
-    heard_at,
+    lateness: detector_lateness_ns(&fleet.daemons[node]),
+    watched,
   }
 }
 
-/// Format: nanoseconds in a millisecond, to compare a time recorded in milliseconds with one in nanoseconds.
-const NANOS_PER_MILLI: u128 = 1_000_000;
+/// `daemon`'s own wake lateness as its detector measured it (`FleetReport::detector_granularity_ns`), nanoseconds; zero
+/// where its status did not answer or it has not measured yet.
+fn detector_lateness_ns(daemon: &Daemon) -> u64 {
+  match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus { memory: false }) {
+    ReplyBody::DaemonStatus { report } => report.fleet.detector_granularity_ns,
+    _ => 0,
+  }
+}
 
 /// One attempt at [`a921_a_holder_that_missed_an_owners_part_before_its_warm_restart_is_shipped_it_after`]'s scene: a
 /// four-node anchored git fleet, `main` pushed and held by both of a's remote candidates, a push on top whose state-log
@@ -38981,6 +39124,95 @@ fn a921_a_warm_restarted_node_serves_a_false_death_victims_old_volume() {
   );
   assert!(served, "the volume's status served from the restarted node");
   // Claims are recorded, not asserted: the restarted node's routing, learned again, may name the adopter before a round.
+}
+
+/// A-918 B (main 01a20182's rulings (3) and B of 2026-11-25; A-912's sibling; AUD-14's transfer to a new candidate set).
+/// Do: on a four-node `f = 1` git fleet with a repository on a, push `main` (its green's version 1) and wait for both of
+/// a's remote candidates to hold it; stop one of them, so the fourth node, which holds nothing of the green, becomes a
+/// candidate once the survivors took the dead one over; push a commit on top (version 2). Expect the push to land and
+/// the newcomer to hold the green's chain through version 2. Red before A-918: the newcomer answered every record of
+/// the green out of order, untyped, for good (`merge.out_of_order` rising), and nothing ever shipped it the versions
+/// placed before it became a candidate.
+#[test]
+fn a918_a_candidate_a_death_brings_in_is_shipped_the_greens_chain_and_holds_the_next_version() {
+  let _serial = serialize_fleet_tests();
+  let ((daemons, hosts), stores, lease) =
+    started_git_fleet_of("fresh-candidate", &["a", "b", "c", "d"]);
+  let mut fleet = founded_git_fleet(
+    "fresh-candidate",
+    (daemons, hosts),
+    stores,
+    (Some(lease), None),
+  );
+  let green = VolumeId {
+    bytes: fleet.repository,
+  };
+  let first = fleet.push(0, ("first.txt", b"main before the death\n"));
+  let holders_of = |fleet: &GitFleet, version: u64| -> Vec<usize> {
+    (1..fleet.daemons.len())
+      .filter(|node| {
+        fleet.daemons[*node]
+          .merge_holder_state(green)
+          .is_ok_and(|held| held.version.is_some_and(|reached| reached >= version))
+      })
+      .collect()
+  };
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let both_hold = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(holders_of(&fleet, 1).len() == 2)
+  });
+  drop(observed);
+  let holders = holders_of(&fleet, 1);
+  let (Some(&stopped), Some(newcomer)) = (
+    holders.first(),
+    (1..fleet.daemons.len()).find(|node| !holders.contains(node)),
+  ) else {
+    fleet.stop();
+    panic!("a's two remote candidates held version 1 ({both_hold}): {holders:?}");
+  };
+  let newcomer_host = fleet.hosts[newcomer];
+  let gone = fleet.hosts[stopped];
+  fleet.daemons.remove(stopped).stop();
+  let newcomer = fleet
+    .daemons
+    .iter()
+    .position(|daemon| {
+      daemon
+        .member_identity()
+        .is_ok_and(|host| host == newcomer_host)
+    })
+    .unwrap_or(newcomer);
+  let taken = poll_taken_over_and_unseated(&fleet.daemons, gone);
+  let pushed = fleet.push_on_top(0, ("second.txt", b"main after the death\n"));
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let caught_up = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(fleet.daemons[newcomer].merge_holder_state(green)?.version == Some(2))
+  });
+  drop(observed);
+  let newcomer_state = fleet.daemons[newcomer].merge_holder_state(green);
+  let newcomer_counters = fleet.daemons[newcomer].fleet_refusals().map(|counters| {
+    counters
+      .into_iter()
+      .filter(|(kind, _)| kind.starts_with("merge.") || kind.starts_with("fleet.ledger_read"))
+      .collect::<Vec<_>>()
+  });
+  fleet.stop();
+  eprintln!(
+    "fresh-candidate: first {first:?}; holders of v1 {holders:?} (both {both_hold}); stopped {stopped}, newcomer \
+     {newcomer_host:?}; taken over {taken}; second {pushed:?}; newcomer {newcomer_state:?} caught up {caught_up}; its \
+     counters {newcomer_counters:?}"
+  );
+  assert_eq!(first, Ok(()), "the push before the death landed");
+  assert!(
+    both_hold,
+    "both remote candidates held version 1 before the death"
+  );
+  assert!(taken, "the survivors took the dead candidate over");
+  assert_eq!(pushed, Ok(()), "the push after the death landed");
+  assert!(
+    caught_up,
+    "the newcomer holds the green's chain through version 2: {newcomer_state:?}"
+  );
 }
 
 /// Shape: A-914's test's stretch of each coordinator period: a few heartbeats, past the pace the failover

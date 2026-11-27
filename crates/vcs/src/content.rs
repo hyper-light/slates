@@ -1533,6 +1533,58 @@ impl ContentStore {
   /// # Errors
   /// [`LetGoRefused`] by kind, the store unchanged.
   pub fn let_go(&mut self, identity: &ContentId) -> Result<u64, LetGoRefused> {
+    let (identity, window, len) = self.lettable(identity)?;
+    Ok(self.released_away(identity, window, len))
+  }
+
+  /// Lets go again the window `at` names, brought back by a reader that had to read its object whole and was not its
+  /// holder ([`ContentStore::aways_of`] before the put that brought it back, [`ContentStore::put_object_whole`]): at
+  /// its own let-go number, so the reader leaves the store, and the image that carries the number, as it found them
+  /// (A-767 C1; main's ruling of 2026-11-27 11:09, a recovery's remake of a git green's map). The bytes freed.
+  ///
+  /// # Errors
+  /// As [`ContentStore::let_go`]; `Away` where another window holds the number now.
+  pub fn let_go_again(&mut self, at: AwayAt) -> Result<u64, LetGoRefused> {
+    if self.aways_by_number.contains_key(&at.number) {
+      return Err(LetGoRefused::Away);
+    }
+    let (identity, window, len) = self.lettable(&at.identity)?;
+    Ok(self.released_away_at(
+      AwayAt {
+        number: at.number,
+        identity,
+      },
+      window,
+      len,
+    ))
+  }
+
+  /// The windows of the object `identity` names that the store holds let go, each at its let-go number, in the object's
+  /// order: what a reader that brings them back to read the object whole notes first, to let each go again at the same
+  /// number once it ends ([`ContentStore::let_go_again`]). None for an object held whole or not held.
+  pub fn aways_of(&self, identity: &ContentId) -> Vec<AwayAt> {
+    let mut aways = Vec::new();
+    if !self.contains(identity) {
+      return aways;
+    }
+    let mut walk = self.windows(identity);
+    while let Some(window) = walk.next_window() {
+      if let Some(Kept::Away { number, .. }) = self.entries.get(&window).map(|held| &held.kept) {
+        aways.push(AwayAt {
+          number: *number,
+          identity: window,
+        });
+      }
+    }
+    aways
+  }
+
+  /// What [`ContentStore::let_go`] lets go of `identity`: the window's identity, where it is kept and its length;
+  /// refused as it refuses.
+  fn lettable(
+    &mut self,
+    identity: &ContentId,
+  ) -> Result<(ContentId, StoredWindow, usize), LetGoRefused> {
     let identity = self.resolve(identity);
     let held = self
       .entries
@@ -1556,7 +1608,7 @@ impl ContentStore {
     if held.holders > 1 {
       return Err(LetGoRefused::Shared);
     }
-    Ok(self.released_away(identity, window, len))
+    Ok((identity, window, len))
   }
 
   /// Lets go of the window `identity` names, marked landed ([`ContentStore::mark_landed`]: a landed changeset on the
@@ -1641,13 +1693,19 @@ impl ContentStore {
       number: self.next_away,
       identity,
     };
+    self.released_away_at(at, window, len)
+  }
+
+  /// [`ContentStore::released_away`] at the let-go number `at` names: the bytes freed.
+  fn released_away_at(&mut self, at: AwayAt, window: StoredWindow, len: usize) -> u64 {
+    let identity = at.identity;
     self.before_away_change(at);
     if let Some(held) = self.entries.get_mut(&identity) {
       held.kept = Kept::Away {
         len,
         number: at.number,
       };
-      self.next_away = self.next_away.saturating_add(1);
+      self.next_away = self.next_away.max(at.number.saturating_add(1));
       self.aways_by_number.insert(at.number, identity);
       self.away_changed.insert(at.number);
     }
@@ -3873,6 +3931,49 @@ mod tests {
       "nothing brought back by other bytes"
     );
     brought_back_whole(&mut store, (&object, &bytes), (&windows, window), before);
+  }
+
+  /// A-767 C1 (main's ruling of 2026-11-27 11:09: a recovery's remake of a git green's map reads its files whole). Do:
+  /// put an object of three windows and a part, let two of its windows go, note them (`aways_of`), put the object
+  /// whole from its bytes (`put_object_whole`), then let each noted window go again (`let_go_again`). Expect: the two
+  /// noted at their let-go numbers; the object read whole after the put; after the let-go, the same windows away at the
+  /// same numbers, the store's aways as before, and the count as before; a number taken again refused `Away`.
+  #[test]
+  fn a_window_brought_back_to_read_its_object_whole_is_let_go_again_at_its_number() {
+    let window = 4096usize;
+    let mut store = ContentStore::new(1 << 22, window).unwrap();
+    let bytes = patterned(window * 3 + 100);
+    let object = store.put_object(&bytes).unwrap();
+    let windows: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
+    let_go_each(&mut store, &windows[1..3]);
+    let before: Vec<(AwayAt, u64)> = store.aways().collect();
+    let counted = store.content_bytes;
+    let noted = store.aways_of(&object);
+    assert_eq!(
+      noted,
+      before.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
+      "the windows let go, at their numbers"
+    );
+    assert_eq!(store.put_object_whole(&bytes).unwrap(), object);
+    assert!(store.holds_whole(&object), "read whole after the put");
+    assert!(
+      store.release(&object).is_ok(),
+      "the put's own hold given back"
+    );
+    for at in &noted {
+      assert!(store.let_go_again(*at).is_ok(), "{at:?} let go again");
+    }
+    assert_eq!(
+      store.aways().collect::<Vec<_>>(),
+      before,
+      "away at the same numbers"
+    );
+    assert_eq!(store.content_bytes, counted, "the count as before");
+    assert_eq!(
+      store.let_go_again(noted[0]),
+      Err(LetGoRefused::Away),
+      "a number held already"
+    );
   }
 
   /// A-767 C5 and A-863. A recovery has a pack's lists and the lengths of its released

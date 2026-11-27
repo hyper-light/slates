@@ -11895,7 +11895,10 @@ nothing copied), a source that owes its push made first through A-886's door, an
 (`MergeRecordValue::lineage`, A-932) while no part held here records its join yet waits `OUT_OF_ORDER`, since the owner
 owes its names log to every holder of its greens (one placement: a family's ids share their line key). A green whose
 record names no lineage stands alone and is made at once: its id cannot say so, since a green made alone is a family of
-its own (A-636 part 2b-2), so its owner's record does, from the join its catalog holds when it makes the record.
+its own (A-636 part 2b-2), so its owner's record does, from the join its catalog holds when it makes the record. A
+green made alone and adopted later as a repository's root was made standing alone, as its record says; where a branch
+of it is first made here, the holder founds the lineage with it, the names log joining it as the root (A-932's sibling,
+`merge_service::adopted_root_founded`).
 Nothing acknowledged rests on a join only its owner held (A-915): a repository's creation answers once its root's join
 is at `f + 1` as well as its record, so a successor's adoption, which holds the names log its takeover gathered from a
 quorum, finds every acknowledged green's join; one whose join it does not find was never acknowledged a member, and its
@@ -56225,6 +56228,16 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   without `restore_away`: 4 lists and names refused) and `daemon::tests::t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes`
   (three warm restarts after seeded let-go rounds, the store whole as published each time, the object brought back the
   same bytes by its identity).
+  - **A recovery's map remake reads its files whole (2026-11-27, w-perf; main's ruling of 11:09).** A recovery makes
+    each git green's map and trees again from its head (`paths::remake_green_sliced`), and the trees hash each file's
+    bytes from the content store. A file whose window the image restored let go is put with
+    `ContentStore::put_object_whole`, which brings the window back from the file's bytes (the green's own, in hand).
+    Each such window was first noted at its let-go number (`ContentStore::aways_of`) and is let go again at that
+    number once the map is made, a unit of the recovery's slices each (`ContentStore::let_go_again`,
+    `paths::let_go_brought_again`; counted `vcs_paths.remake_brought_back`, any kept `vcs_paths.remake_kept`). So the
+    warm restart holds what its predecessor held, and the image's aways are unchanged. A refused remake is logged with
+    its green and why, since with no map the recovery frees what only the map held. Before 11168fab3 the hash ran over
+    the short file and named a wrong tree; from it until this fix the remake was refused and the file freed.
 
 
 - **Slice (d), a holder's replica reads named content (2026-11-23, w-shared; main 01a20182's rulings of 2026-11-23).**
@@ -63923,6 +63936,7 @@ GAPS.
   - `merge_service::tests::an_owner_records_a_targets_behind_answer_on_its_pending_version`.
   - The fleet test `a918_a_candidate_a_death_brings_in_is_shipped_the_greens_chain_and_holds_the_next_version` is red
     until B and lands with it.
+- **Amended by A-918 B** (2026-11-27): B landed with that test; a holder behind reads the chain from its cohort.
 - **Models.** None of `docs/wip/models/` models a holder's merge answers; no spec changed.
 
 Applied in the same change to: the A-412 note in `merge_service::catch_up`'s doc (it now answers behind),
@@ -65234,6 +65248,26 @@ GAPS.
     leaders now are move's `stage.build` (2.1 ms) and the cold first `create` (2.3), then `stage.recording`,
     `landing.follow`, `stage.bringing` and `landing.holds` at 1.0-1.4 ms. Copy's `landing.prepare` read 11 ms of wall
     against 32 µs of CPU: preemption, not work.
+  **A removed directory's tree walked a node a unit in the build** (`ptrie::Cursor`, `Green::beneath_cursor`). Move's
+  `stage.build` (2.1 ms) named (debug): the step that took its trunk's deletion, 2.2 ms. Its `remove_begin` listed
+  every node the green held beneath the directory and sorted them (`Green::beneath`, 9,000) in the row's one unit,
+  then noted them gone a node a unit (9b). Every other build step was under 0.7 ms.
+  - The ptrie's walk is now a `Cursor` that borrows no arena between its keys, each `next` lent the arena; `Iter` is a
+    cursor and its arena, one walk.
+  - `Dim` and `Files` give prefix cursors, and `Green::beneath_cursor` and `beneath_next` walk a path's files, then its
+    directories, a node a call.
+  - The build's `Removing` keeps the cursor between steps in place of the listed tree. The order is the cursor's: each
+    node is only noted in a map of gone paths.
+  - A replacement, which remakes the node in its row, still lists its tree whole (`Building::remove`). Gauge
+    `svn_commit::BUILD_MOST_LISTED_A_UNIT`, the most nodes a build unit listed whole, recorded where one is listed.
+  - The move test bounds a build unit's gone paths and listed nodes at one; red at 9,000 with the deletion's tree
+    listed.
+  **The wide tests under ThreadSanitizer** (main's order, diag 46018002586 at 56b609053). The copy's and the move's
+  wide tests hold every step to the shard's native window, which the lane's 10 to 20 times slowdown cannot keep; their
+  histories did not even end within the 120 s patience. They join `t_c2c` in the lane's `SERVER_SKIPPED`
+  (`xtask/src/tsan.rs`), with the run cited. The removal's wide test asserts no step's time, so its history's patience
+  is the lane's (`svn_commit::tests::lane_patience`: 120 s times `test_lane::slowdown`, 25 in that lane), through
+  `stored_patient`, of which `stored_configured` is the unscaled case.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
@@ -65293,7 +65327,9 @@ measured noise of the 100 figure, not a literal.
 > the same descriptors as a direct one. Linux (main's diag run 45666757721, 4-core runners, debug): through the
 > spawner 69.9 and 69.8 µs at 100 and 10,000 descriptors on x86_64, 96.9 and 98.5 on arm; direct 193.1 → 531.9 µs on
 > x86_64, 284.3 → 332.7 on arm. The runners' hard `RLIMIT_NOFILE` is 65,536, so the measure holds the most it may and
-> says so (`SPAWN-HELD`).
+> says so (`SPAWN-HELD`). Since 2026-11-27 (diag CI 10's macos-latest, whose per-process cap is about 10,240) the most is
+> also the system's own cap, less the descriptor numbers a spawn's streams need (`SPAWN_STREAMS`, 3). A count no
+> larger than the row before makes no row, and fewer than two rows skip the test, saying so.
 >
 > **Piece 2a built (2026-11-25).** `Daemon::start` starts the spawner once its runtime is built, before any client's
 > descriptor is open (`slates_ipc::spawner::start_here`: this executable with `spawner_role --exact --nocapture`; the
@@ -66240,6 +66276,10 @@ Applied in the same change to:
 - **Applied in the same change to:** `crates/server/src/{member_task,edges,fleet,state,daemon}.rs`,
   `crates/cluster/src/member_plane.rs` (`MemberPlane::is_joined`), `crates/server/tests/fleet.rs`, A-921 part 4's
   entry, GAPS.
+- **Amended** (2026-11-27, main 01a20182's order of 09:50): the re-key watch is judged from each node's last look that
+  saw it not yet re-keyed, so the test's own looks (one control-shard question a node in turn) add nothing, and its
+  bound is the restarted node's detection plus both nodes' measured wake lateness (`detector_granularity_ns`), never a
+  bare 1 s. Diag 10's Windows x86_64 lane met node 2 first seen at 1,010 ms: a timer tick of 15.625 ms on each look.
 
 ### A-932 — A merge record names its green's lineage, and a holder makes a green standing alone at once (2026-11-27, w-interop for main 01a20182, its ruling (a) of 2026-11-27 07:06 and its approval of 07:08; the fleet suite's red; amends A-908 and A-908 part 4; A-636 part 2b-2, A-145, A-255)
 
@@ -66328,3 +66368,73 @@ Applied in the same change to:
 - **Applied in the same change to:** `crates/server/src/{green_adopt,merge_origin,merge_service}.rs`,
   `crates/server/tests/fleet.rs`, GAPS.
 
+### A-918 B — A holder behind a green reads its chain from the green's cohort, and its inputs from there too (2026-11-27, w-shared for main 01a20182, its rulings B of 2026-11-25 and (ii) of 2026-11-27 06:55; A-918's newcomer half; amends A-412 and A-918 (i))
+
+- **Why.** After a death at three members every member is a green's candidate, so a node that held none of a green
+  joined its cohort. Since A-918 (i) it answers each record behind, typed, and nothing brought it the chain. In the
+  A-918 fleet test it answered `Behind` 4,002 times and held none of the green 424 s after the push. A push whose next
+  version's `f + 1` needs it is refused at its record barrier (a914: `unable to commit` 2 of 7, then 4 of 6). The
+  owner cannot ship the chain itself: below the green's floor (its checkpoint or adoption) it holds no per-version
+  records or inputs.
+- **The rule.** One read, A-919's, the same a takeover successor's join read makes.
+  - A holder that answers a record `Behind` (it holds none of the green, or `catch_up` met a version whose record it
+    lacks) wants a read of the green's register, its records' positions from past the version through which it holds
+    every record from 0 (`merge_origin::chained_through`) to the version before the record's
+    (`merge_service::read_chain`, `ledger_read::want_chain`, counted `merge.behind.chain_read`). The read asks the
+    green's other current candidates, the owner among them from its own hold, folds their answers under the start rule,
+    and holds each position in order in this holder's acceptor. A read whose fold went past tolerance is not wanted
+    again; the record is answered behind, typed, as before (A-919's open edge).
+  - A holder with records and no replica checks what a rebuild reads before it begins (`merge_origin::rebuild_needs`,
+    A-933's check, now shared by both askers): a record it lacks is read as above, and the version answered behind;
+    inputs it lacks are fetched; then the rebuild goes ahead (A-313).
+  - The inputs fetch (`fleet::fetch_ledger_inputs`, A-412's) asks the record's sender first, then the green's other
+    current candidates, hedged across them. Before, it asked the sender alone, the owner, which holds no inputs below
+    its floor; the cohort that answered the read holds them (A-244).
+- **Bounds.** One read in flight per register, a page a period, its range what the record named; wanted registers at
+  most the greens this node is a candidate of (A-919's). One inputs fetch a green at a time (A-412's), its holders the
+  placement's candidates. The read is wanted again only on a later `Behind`, never by itself.
+- **Not done here.** Folding A-364's record adoption onto `ledger_read` is not ordered (main's (ii)): a successor adopts
+  missing records through its takeover round (A-933), a newcomer through this read.
+- **Tests.**
+  - Fleet `a918_a_candidate_a_death_brings_in_is_shipped_the_greens_chain_and_holds_the_next_version` (red first; A-918
+    (i) named it, uncommitted until now). Four nodes at `f = 1`; push `main`; stop one of a's two remote candidates, so
+    the fourth node, holding none of the green, becomes a candidate; push on top. The newcomer must hold the green
+    through version 2.
+    - Red on main: `version: None` after 424 s, `Behind` 4,002.
+    - With the read alone (the inputs fetched from the sender): the records held (`chain_read` 1, 2 positions), but
+      the fetch began 4,001 times and never finished.
+    - With the cohort asked for inputs too: version 2 in 21 s (`catch_up.fetched` 1, its replica's owed push built,
+      `replica_build.made` 1).
+  - Fleet a914 now asserts the second death's push is never refused at its record barrier, A-912's sibling, which
+    this closes. It may still be refused `retry` at its homing (1 of 3), a mode of its own, recorded.
+- **Applied in the same change to:** `crates/server/src/{merge_service,merge_origin,ledger_read,green_adopt,fleet}.rs`,
+  `crates/server/tests/fleet.rs`, A-918 (i)'s entry, GAPS.
+
+### A-914 (d) — A reply with no round trip is no answer: a home whose put broke as it died never ends a homing short (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 09:33 and 09:43; a914's named debt; amends A-907 and A-727 (d1a))
+
+- **Why.** a914's second push, during the second stretched death, was refused `retry` at its homing (1 of 7, then 1 of
+  3), its window 18 s. The failing run's log names it: the dying home "answered a put … other than kept after 1999 ms:
+  unreadable: Truncated", and the homing "fell short: 1 of 2 homes kept it" at once. The home's stream broke, so the
+  exchange reported empty bytes with no round trip (`TimedReply::round_trip_ns` is `None`: a deadline or a transport
+  error, Karn's rule). `vcs_store::homes::exchange_round` never read the round trip. It decoded the empty bytes,
+  failed, and counted them a member of another home wire version's reply (A-727 (d1a)), which ends a homing at once.
+  The straggler path already read the round trip (`fleet::settle_late`); the timely one did not.
+- **The rule.** One settle path for every reply an exchange gets, timely or late (`fleet::settle_replies`). A reply
+  with a round trip is an answer, its session given back on its link. One without is no answer: its empty bytes are
+  never read, its link (still out on loan) is dropped to be dialed afresh, counted `fleet.replies.no_round_trip`.
+  `settle_late` is that path with its own count. A homes exchange takes only the answered replies, timely or late; a home
+  with none stays left (counted `vcs_store.homes.reply_unanswered`), and the homing waits within its budget and ranks its homes
+  again once a configuration installs (A-912), as for any home that died unseen. A peer of another home wire version
+  answers empty with a round trip, so A-727 (d1a) still ends that homing at once, unchanged.
+- **Not done here (main's ruling).** The sweep's siblings, the other readers of a reply's bytes that never read its
+  round trip, are recorded in GAPS under A-914 and worked when measured or blocking; one of them changes state (a
+  commit's holder dropped from a version's inputs acks on a transport failure).
+- **Tests.**
+  - Fleet `a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once` (red first). Three nodes at
+    `f = 1`. b and c hold each home message a homing budget before answering (`Daemon::delay_home_answers`). a pushes,
+    and the node first asked a home put (`vcs_store.homes.remote_asked`, counted as a message arrives: so it is one of
+    the window's homes, never vacuous) is stopped. a must count no reply of another version, at least one settled as
+    unanswered, and its push land or be refused only after its window.
+  - a914 asserts its second push lands, closing its named debt.
+- **Applied in the same change to:** `crates/server/src/{fleet,vcs_store/homes}.rs`, `crates/server/tests/fleet.rs`
+  (`push_on_top_at_edge`, shared by `GitFleet::push_on_top_of`), GAPS.

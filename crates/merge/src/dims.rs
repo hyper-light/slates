@@ -128,6 +128,19 @@ impl<V: Clone> Dim<V> {
     self.root.prefix_len(&self.nodes, prefix.as_bytes())
   }
 
+  /// [`Dim::prefix`] as a cursor that borrows nothing between its keys: one descent now, a key a
+  /// [`Dim::cursor_next`].
+  pub(crate) fn prefix_cursor(&self, prefix: &str) -> crate::ptrie::Cursor {
+    self.root.prefix_cursor(&self.nodes, prefix.as_bytes())
+  }
+
+  /// `cursor`'s next key and value in this map: none once its walk has ended.
+  pub(crate) fn cursor_next(&self, cursor: &mut crate::ptrie::Cursor) -> Option<(String, &V)> {
+    cursor
+      .next(&self.nodes)
+      .map(|(key, value)| (text(key), value))
+  }
+
   /// The keys that start with `prefix` and their values, in key order: one descent, then the keys it answers.
   pub(crate) fn prefix(&self, prefix: &str) -> impl Iterator<Item = (String, &V)> + '_ {
     self
@@ -681,6 +694,24 @@ impl Files {
   /// The files under `prefix`, counted with no walk: one descent.
   pub(crate) fn prefix_len(&self, prefix: &str) -> usize {
     self.map.prefix_len(prefix)
+  }
+
+  /// [`Files::prefix`] as a cursor that borrows nothing between its files ([`Files::cursor_next`]).
+  pub(crate) fn prefix_cursor(&self, prefix: &str) -> crate::ptrie::Cursor {
+    self.map.prefix_cursor(prefix)
+  }
+
+  /// `cursor`'s next file and its content, as [`Files::prefix`] answers them: none once its walk has ended.
+  pub(crate) fn cursor_next(
+    &self,
+    cursor: &mut crate::ptrie::Cursor,
+  ) -> Option<(String, crate::engine::Content<'_>)> {
+    loop {
+      let (path, block) = self.map.cursor_next(cursor)?;
+      if let Some(content) = self.blocks.content(*block) {
+        return Some((path, content));
+      }
+    }
   }
 
   /// The files under `prefix` and their content, in path order.

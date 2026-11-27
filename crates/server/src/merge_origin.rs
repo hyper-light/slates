@@ -908,6 +908,7 @@ fn rebuild_branch(
     state.count(crate::merge_service::BRANCH_SOURCE_BEHIND, 1);
     return Rebuild::Later;
   }
+  crate::merge_service::adopted_root_founded(state, from);
   if state.merge.replicas.branch(&from, version, key).is_err() {
     state.count(crate::merge_service::BRANCH_SOURCE_BEHIND, 1);
     // A source owing its push (a created ref's, P2) is made through its door first (A-886), as a record's branch is.
@@ -1091,8 +1092,43 @@ pub(crate) fn ledger_unheld(
   Ok(unheld)
 }
 
+/// What a rebuild of `object`'s replica through `through` reads, checked before it begins (A-933, A-918 B): version 0's
+/// record, then each version's from its durable checkpoint's (or 1) through `through`, as [`ledger_unheld`] answers
+/// them: `Err` with the first version whose record this node lacks, else `Ok` with each one whose inputs it does not
+/// hold. A takeover's adoption (`green_adopt::rebuild`) and a holder's record path (`merge_service::record_standing`)
+/// each ask it, and bring what is missing their own way.
+pub(crate) fn rebuild_needs(
+  state: &ShardState,
+  object: ObjectId,
+  through: u64,
+) -> Result<Vec<(u64, [u8; 32])>, u64> {
+  if ledger_value(state, object, 0).is_none() {
+    return Err(0);
+  }
+  let from = state
+    .merge
+    .checkpoints
+    .get(&object)
+    .filter(|held| held.at <= through)
+    .map_or(1, |held| held.at);
+  ledger_unheld(state, object, (from.min(through), through))
+}
+
+/// The newest version of `object` through which this holder's ledger holds every record from version 0, looked at
+/// through `through` (A-918 B: where a read of the green's chain begins); `None` where it lacks version 0's.
+pub(crate) fn chained_through(state: &ShardState, object: ObjectId, through: u64) -> Option<u64> {
+  let mut held = None;
+  for version in 0..=through {
+    if ledger_value(state, object, version).is_none() {
+      break;
+    }
+    held = Some(version);
+  }
+  held
+}
+
 /// The newest version of `object` this holder accepted (its acceptor's highest position), if it accepted any.
-fn newest_accepted(state: &ShardState, object: ObjectId) -> Option<u64> {
+pub(crate) fn newest_accepted(state: &ShardState, object: ObjectId) -> Option<u64> {
   state
     .holder_records
     .get(&object)?
@@ -2517,6 +2553,61 @@ mod tests {
     );
     assert_eq!(identity, Some(one), "the owner's identity");
     assert_eq!(unknown, 0, "no wait counted");
+  }
+
+  /// A-932's sibling (GAPS, main's ruling of 2026-11-27 07:08): a restarted holder rebuilds a branch of a green made alone
+  /// and adopted later as its repository's root. Do: give a holder with no replicas the version 0 record of a green
+  /// minted standing alone (its record naming no lineage, as it was made), a branch's version 0 made from it at version
+  /// 0 (its record naming the repository), and the names-log part joining both, as a warm restart leaves them; ask for
+  /// the branch as its next records arriving would. Expect the branch installed at version 0, the adopted root founding
+  /// the lineage and the branch its member. Red before: the root rebuilt standing alone, as its version 0 says, so the
+  /// branch could not be branched from it, `Later` at every ask.
+  #[test]
+  fn a_restarted_holder_rebuilds_a_branch_of_a_lone_green_adopted_as_a_root() {
+    let daemon = one_unit_slices();
+    let repository = slates_db::catalog::RepositoryId {
+      bytes: family(1, 1).0,
+    };
+    let branch = family(2, 3);
+    let root = crate::daemon::observe_first(&daemon, move |state| {
+      let id = crate::verbs::fresh_family_id_at(state, None, 0).expect("a family id");
+      let root = ObjectId(id.bytes);
+      let zero = Green::new().head_identity();
+      accept_lineage_records(state, root, None, &[((0, None, zero), 0)]);
+      accept_records(state, branch, &[(0, None, zero)]);
+      note_joins(
+        state,
+        repository,
+        &[
+          (root, slates_db::catalog::MemberOrigin::Root),
+          (
+            branch,
+            slates_db::catalog::MemberOrigin::Branch {
+              from: DbVolumeId { bytes: root.0 },
+              version: 0,
+            },
+          ),
+        ],
+      );
+      root
+    });
+    let asks = rebuild_asks(&daemon, branch, 4);
+    let (lineages, _) = lineage_seen(
+      &daemon,
+      [root, branch],
+      [crate::merge_service::MEMBER_BRANCHED],
+    );
+    daemon.stop();
+    assert_eq!(
+      asks.last(),
+      Some(&Rebuild::Installed(0)),
+      "installed within its asks: {asks:?}"
+    );
+    assert_eq!(
+      lineages,
+      [Some(repository), Some(repository)],
+      "the adopted root founds the lineage, the branch its member"
+    );
   }
 
   /// A-908 part 4, §4.16 "Apply on holders": a restarted holder rebuilds a branch by its lineage, as it first made it. Do:

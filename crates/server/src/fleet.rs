@@ -5839,10 +5839,12 @@ const CATCH_UP_FETCHED: &str = "merge.catch_up.fetched";
 /// a refusal name in the daemon's status report.
 const CATCH_UP_UNSPAWNED: &str = "merge.catch_up.unspawned";
 
-/// Fetches by identity from `sender`, a merge record's owner, the inputs of the versions of the green `object` this holder's
-/// ledger holds without them (`unheld`, each version and manifest, lowest first), its replica behind that ledger (A-412,
-/// `merge_service::catch_up`): a takeover committed those versions again here through the register path, which carries no
-/// inputs. Each is staged as placed for its version, so the retention rule keeps it by that version's ledger position
+/// Fetches by identity from `sender`, a merge record's owner, and the green's other current candidates, hedged across
+/// them, the inputs of the versions of the green `object` this holder's ledger holds without them (`unheld`, each version
+/// and manifest, lowest first), its replica behind that ledger (A-412, `merge_service::catch_up`): a takeover committed
+/// those versions again here through the register path, which carries no inputs. A candidate a death brought in, which
+/// read the green's chain from its cohort (A-918 B), lacks every version's inputs, and the owner holds none below its
+/// floor (its checkpoint or adoption): the cohort that answered the read holds them (A-244), so it is asked too. Each is staged as placed for its version, so the retention rule keeps it by that version's ledger position
 /// ([`fetch_manifest_into_hold`]); the record's next shipment finds them held and advances the replica. One fetch a green
 /// at a time (`MergeShardState::catching_up`), in a detached task of this shard, each manifest within one live exchange's
 /// budget; it ends at the first manifest not fetched, and the next shipment begins another.
@@ -5856,10 +5858,23 @@ pub(crate) fn fetch_ledger_inputs(
     return;
   }
   state.count(CATCH_UP_BEGUN, 1);
+  // The sender first, then the green's other candidates: bounded by the placement's candidates.
+  let local = state.fleet.host();
+  let holders: Vec<HostId> = std::iter::once(sender)
+    .chain(
+      state
+        .fleet
+        .configuration()
+        .place(object)
+        .candidates
+        .into_iter()
+        .filter(|host| *host != sender && *host != local),
+    )
+    .collect();
   let fetching = async move {
     let budget = live_budget();
     for (version, manifest) in unheld {
-      if !fetch_manifest_into_hold(object, &[sender], move |_| version, manifest, budget).await {
+      if !fetch_manifest_into_hold(object, &holders, move |_| version, manifest, budget).await {
         break;
       }
       count_refusal(CATCH_UP_FETCHED);
@@ -12578,6 +12593,9 @@ pub(crate) const STRAGGLER_RETURNED: &str = "fleet.stragglers.returned";
 /// Format: the status count of a straggler's link dropped to be dialed afresh, its request unanswered at its deadline
 /// (A-907).
 pub(crate) const STRAGGLER_REDIALED: &str = "fleet.stragglers.redialed";
+/// Format: the status count of an exchange's reply with no round trip (a deadline, a transport error), settled as no
+/// answer ([`settle_replies`], A-914).
+pub(crate) const REPLY_NO_ROUND_TRIP: &str = "fleet.replies.no_round_trip";
 
 /// A broadcast's stragglers settled by their caller (A-907): waited for within their dispatch's deadline
 /// (`Stragglers::settle`, woken by each report), each answered one's session put back on its link and its reply given
@@ -12590,13 +12608,33 @@ pub(crate) async fn settled_stragglers(
   settle_late(late)
 }
 
-/// Puts late stragglers where they belong, on the control shard (A-907): an answered one's session back on its link
-/// ([`return_sessions`]), an unanswered one's link, still out on loan, dropped to be dialed afresh. The answered replies.
-fn settle_late(late: Vec<(HostId, TimedReply, Endpoint)>) -> Vec<(HostId, Vec<u8>)> {
+/// Puts late stragglers where they belong, on the control shard (A-907), as [`settle_replies`] does, counting the
+/// sessions given back. The answered replies.
+pub(crate) fn settle_late(late: Vec<(HostId, TimedReply, Endpoint)>) -> Vec<(HostId, Vec<u8>)> {
+  let (answers, returned) = settle_replies(late);
+  let _ = state::with_state(|s| {
+    s.count(
+      STRAGGLER_RETURNED,
+      u64::try_from(returned).unwrap_or(u64::MAX),
+    );
+  });
+  answers
+}
+
+/// Settles an exchange's replies on the control shard, timely or late, by whether each peer answered (A-907, A-914):
+/// one with a round trip (`TimedReply::round_trip_ns`, Karn's rule: a reply that came back, however empty) is an answer,
+/// its session given back on its link ([`return_sessions`]); one without (a deadline, a transport error, its stream
+/// broken mid-exchange) is no answer, and its link, still out on loan, is dropped to be dialed afresh. Its empty bytes
+/// are never read as a reply. The answered replies, and how many sessions went back. Before (A-914), a home's put whose
+/// stream broke as the home died was read empty, so undecodable, and taken for a member of another home wire version,
+/// which ends a homing at once (A-727 (d1a)): a914's second push refused `retry` 2 s into its 18 s budget.
+pub(crate) fn settle_replies(
+  replies: Vec<(HostId, TimedReply, Endpoint)>,
+) -> (Vec<(HostId, Vec<u8>)>, usize) {
   let mut answers = Vec::new();
   let mut sessions = Vec::new();
   let mut lost = Vec::new();
-  for (host, reply, endpoint) in late {
+  for (host, reply, endpoint) in replies {
     if reply.round_trip_ns.is_none() {
       lost.push(host);
       continue;
@@ -12604,15 +12642,16 @@ fn settle_late(late: Vec<(HostId, TimedReply, Endpoint)>) -> Vec<(HostId, Vec<u8
     answers.push((host, reply.bytes));
     sessions.push((host, endpoint));
   }
+  let returned = sessions.len();
   let _ = state::with_state(|s| {
-    redial_lent(s, &lost);
     s.count(
-      STRAGGLER_RETURNED,
-      u64::try_from(sessions.len()).unwrap_or(u64::MAX),
+      REPLY_NO_ROUND_TRIP,
+      u64::try_from(lost.len()).unwrap_or(u64::MAX),
     );
+    redial_lent(s, &lost);
   });
   return_sessions(sessions);
-  answers
+  (answers, returned)
 }
 
 /// Drops the links of `hosts` still out on loan (their session gone with a straggler), so each link task dials afresh,

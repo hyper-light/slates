@@ -529,11 +529,27 @@ fn a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset(
 /// restart starts again over the segment and store the dead daemon left.
 pub(crate) fn daemon_over(
   instance: &str,
-  (segment, rendezvous): (&slates_anchor::AnchorSegment, &slates_ipc::HeldRendezvous),
+  anchor: (&slates_anchor::AnchorSegment, &slates_ipc::HeldRendezvous),
   store: &TestStore,
 ) -> Daemon {
+  daemon_over_paged(instance, anchor, store, None)
+}
+
+/// [`daemon_over`] at `page` bytes a page where one is named, else the host's: a page and so a content window (16 pages,
+/// `slates_vfs::content::chunk_bytes`) as another host derives them, so a text spans as many windows here as there
+/// (diag CI 9's TSan lane: a 106,766-byte text is one 256 KiB window on a 16 KiB-page Mac and two 64 KiB ones on a
+/// 4 KiB-page host). Its anchor must be made at the same page ([`anchor_of_paged`]).
+fn daemon_over_paged(
+  instance: &str,
+  (segment, rendezvous): (&slates_anchor::AnchorSegment, &slates_ipc::HeldRendezvous),
+  store: &TestStore,
+  page: Option<usize>,
+) -> Daemon {
   let profile = crate::daemon::test_profile();
-  let mut config = crate::DaemonConfig::derive(&profile, instance, Some(1));
+  let mut config = paged_config(
+    crate::DaemonConfig::derive(&profile, instance, Some(1)),
+    page,
+  );
   config.vcs_disk = Some(store.handle());
   let (handoff, len) = segment.handoff().unwrap();
   let source = SegmentSource::Handoff {
@@ -549,8 +565,28 @@ pub(crate) fn daemon_over(
 pub(crate) fn anchor_of(
   instance: &str,
 ) -> (slates_anchor::AnchorSegment, slates_ipc::HeldRendezvous) {
+  anchor_of_paged(instance, None)
+}
+
+/// `config` at `page` bytes a page where one is named ([`daemon_over_paged`]).
+fn paged_config(mut config: crate::DaemonConfig, page: Option<usize>) -> crate::DaemonConfig {
+  if let Some(page) = page {
+    config.page = page;
+    config.geometry.page = u64::try_from(page).expect("a page fits a u64");
+  }
+  config
+}
+
+/// [`anchor_of`] at `page` bytes a page where one is named ([`daemon_over_paged`]).
+fn anchor_of_paged(
+  instance: &str,
+  page: Option<usize>,
+) -> (slates_anchor::AnchorSegment, slates_ipc::HeldRendezvous) {
   let profile = crate::daemon::test_profile();
-  let config = crate::DaemonConfig::derive(&profile, instance, Some(1));
+  let config = paged_config(
+    crate::DaemonConfig::derive(&profile, instance, Some(1)),
+    page,
+  );
   let segment = slates_anchor::AnchorSegment::create(
     &format!("{instance}-seg"),
     &profile.facts.identity,
@@ -1261,35 +1297,64 @@ fn checkpoint_named_now(daemon: &Daemon, repository: RepositoryId, head: u64) ->
 }
 
 /// How the image a restart would restore now holds repository `repository`'s green's checkpoint-named texts, read from
-/// the image's own entries (the shard's committed journal, `verbs::committed_held`, whose Aways family names each text
-/// let go, `content_holder::aways_among`): (held whole, held Away). The shard is published first, in the same step, so
-/// the journal carries every let-go the shard has made: a let-go not yet published was read as whole here and then
-/// committed before the stop, which the successor restored as Away (CI's windows-latest, diag run 45986066740: the shard
-/// lacked all 3 named texts, the journal read held 1 whole, and the restart found 0 whole and brought 3 back). A stop
-/// publishes nothing more (§4.8: "the daemon stopped with nothing more published"), so read just before one, it is what
-/// the successor restores. None for no green, no checkpoint, no journal or a refused publish.
-fn image_split(daemon: &Daemon, repository: RepositoryId) -> Option<(u64, u64)> {
+/// the image's own entries (the shard's committed journal, `verbs::committed_held`, whose Aways family names each window
+/// let go, `content_holder::aways_among`): (held whole, held Away, texts of more than one window). A text is held Away
+/// when any of its windows is, as the store judges a text whole (`ContentStore::holds_whole`), each window found by the
+/// text's identity and length (`ContentStore::window_holding`). Until 2026-11-27 a text was matched to the Aways by its
+/// own identity, which names only a text of one window: a 106,766-byte text spans two 64 KiB windows on a 4 KiB-page
+/// host, so it read as whole, (1, 2) against the recovery's (0, 3), on every such host (diag CI 2's windows-latest, diag
+/// CI 9's TSan lane), and a 16 KiB-page Mac, one 256 KiB window, never saw it.
+///
+/// The image is made current in the same step: the shard's changes taken and its cut encoded whole, then published. A
+/// stop publishes nothing more (§4.8: "the daemon stopped with nothing more published"), so read just before one, it is
+/// what the successor restores. None for no green, no checkpoint, no content store, no journal or a refused publish.
+fn image_split(daemon: &Daemon, repository: RepositoryId) -> Option<(u64, u64, u64)> {
   crate::daemon::observe_first(daemon, move |state| {
+    crate::content_holder::image_drain(state);
+    while !crate::content_holder::image_turn(state).caught_up {}
     crate::verbs::publish_shard(state).ok()?;
     let green = super::svn_commit::green_of(state, repository).ok()?;
     let (_, named) = state.db.partition().green_checkpoint(green)?;
     let bytes = crate::merge_service::checkpoint_bytes(state, green, &named)?;
     let checkpoint = slates_merge::checkpoint::Checkpoint::decode(&bytes).ok()?;
-    let named: std::collections::BTreeSet<[u8; 32]> = checkpoint
-      .named
-      .iter()
-      .map(|file| file.identity.hash)
-      .collect();
     let held = crate::verbs::committed_held(state)?;
-    let away: std::collections::BTreeSet<[u8; 32]> =
+    let away: std::collections::BTreeSet<slates_vcs::ContentId> =
       crate::content_holder::aways_among(&crate::content_holder::paged_entries_of(&held))
         .into_iter()
-        .map(|window| window.0)
         .collect();
-    let away = u64::try_from(named.intersection(&away).count()).ok()?;
-    let whole = u64::try_from(named.len()).ok()?.checked_sub(away)?;
-    Some((whole, away))
+    let content = state.vcs_stores.content()?;
+    let texts: std::collections::BTreeMap<[u8; 32], u64> = checkpoint
+      .named
+      .iter()
+      .map(|file| (file.identity.hash, file.identity.len))
+      .collect();
+    let window = u64::try_from(content.window()).ok()?;
+    let spanning = texts.values().filter(|len| **len > window).count();
+    let away_texts = texts
+      .iter()
+      .filter(|(text, len)| text_away(content, &away, (**text, **len)))
+      .count();
+    let count = |n: usize| u64::try_from(n).ok();
+    let whole = texts.len().checked_sub(away_texts)?;
+    Some((count(whole)?, count(away_texts)?, count(spanning)?))
   })
+}
+
+/// Whether any window of the text `text`, `len` bytes, is among `away` ([`image_split`]).
+fn text_away(
+  content: &slates_vcs::ContentStore,
+  away: &std::collections::BTreeSet<slates_vcs::ContentId>,
+  (text, len): ([u8; 32], u64),
+) -> bool {
+  let root = slates_vcs::ContentId(text);
+  let mut at = 0u64;
+  while let Some((window, start, width)) = content.window_holding(&root, len, at) {
+    if away.contains(&window) {
+      return true;
+    }
+    at = start.saturating_add(width.max(1));
+  }
+  false
 }
 
 /// What the shard holds of repository `repository`'s green's named texts now, so a restart's failure says which side of
@@ -1322,14 +1387,40 @@ fn held_named(daemon: &Daemon, repository: RepositoryId) -> Option<(usize, u64, 
 /// holds whole is found whole (held by the content handoff and checked by identity), and each it holds Away is brought
 /// back: a stop is promised no current image (§4.8), and the import lets each landed text go once its changeset is
 /// durable, so either may hold. After the replay no named text keeps a window (main's ruling (B)), those found whole let
-/// go by the successor. The history `full.dump` byte for byte.
+/// go by the successor. The history `full.dump` byte for byte. At the host's page.
 #[test]
 fn a_cleanly_restarted_import_brings_back_only_its_checkpoints_named_texts() {
+  let spanning = cleanly_restarted_import("vcs-store-svn-clean", None);
+  eprintln!("clean restart: {spanning} named texts of more than one window at the host's page");
+}
+
+/// [`a_cleanly_restarted_import_brings_back_only_its_checkpoints_named_texts`] at a 4 KiB page, as Linux, Windows and
+/// CI's runners have, so the content window is 64 KiB and `full.dump`'s 106,766-byte text spans two (diag CI 9's TSan
+/// lane, 2026-11-27). Expect the same, and at least one named text of more than one window (non-vacuity). Red before the
+/// fix to `image_split` on any host: the image's (whole, Away) read (1, 2) against the recovery's (0, 3), the text of
+/// two windows read whole.
+/// This run closes CLAUDE.md's degenerate-parameter gotcha for the test: at a 16 KiB page every text of `full.dump` is
+/// one window, a degenerate case of the counting that certified nothing about a text of several, so the miscount stayed
+/// green on every Mac while it failed every 4 KiB-page lane.
+#[test]
+fn a_cleanly_restarted_import_counts_a_text_of_several_windows_by_its_windows() {
+  /// Shape: a 4 KiB page, the page of the hosts whose window a text of `full.dump` spans more than one of.
+  const PAGE: usize = 4096;
+  let spanning = cleanly_restarted_import("vcs-store-svn-paged", Some(PAGE));
+  assert!(
+    spanning > 0,
+    "no named text spans more than one window at a 4 KiB page"
+  );
+}
+
+/// The body of the clean restart's tests, at `page` bytes a page where one is named ([`daemon_over_paged`]): the named
+/// texts of more than one window.
+fn cleanly_restarted_import(prefix: &str, page: Option<usize>) -> u64 {
   use crate::vcs_store::svn_import::tests::{FULL, FULL_LAST, history, imported};
-  let instance = format!("vcs-store-svn-clean-{}", std::process::id());
-  let mut store = TestStore::start("svn-clean-restart");
-  let anchor = anchor_of(&instance);
-  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let instance = format!("{prefix}-{}", std::process::id());
+  let mut store = TestStore::start(prefix);
+  let anchor = anchor_of_paged(&instance, page);
+  let daemon = daemon_over_paged(&instance, (&anchor.0, &anchor.1), &store, page);
   daemon.bootstrap(true).unwrap();
   let repository = created_subversion(&daemon, "clean");
   let loaded = crate::test_store::run_on_first(
@@ -1348,7 +1439,7 @@ fn a_cleanly_restarted_import_brings_back_only_its_checkpoints_named_texts() {
   let image = image_split(&daemon, repository);
   daemon.stop();
   store.restart_owner();
-  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let daemon = daemon_over_paged(&instance, (&anchor.0, &anchor.1), &store, page);
   let brought = brought_back(&daemon);
   let after_replay = held_named(&daemon, repository);
   let exported = crate::test_store::run_on_first(
@@ -1372,7 +1463,7 @@ fn a_cleanly_restarted_import_brings_back_only_its_checkpoints_named_texts() {
   );
   // Found whole is what the image held whole, brought back what it held Away, both from the image's own entries.
   assert_eq!(
-    image,
+    image.map(|(whole, away, _)| (whole, away)),
     Some((found, fetched)),
     "the restored image's (whole, Away) against what the recovery found whole and brought back"
   );
@@ -1389,6 +1480,7 @@ fn a_cleanly_restarted_import_brings_back_only_its_checkpoints_named_texts() {
     "found whole, and the successor let nothing go: {after_replay:?}"
   );
   assert!(exported == Some((FULL_LAST, FULL.to_vec())), "full.dump");
+  image.map_or(0, |(_, _, spanning)| spanning)
 }
 
 /// A-760's pre-pass beside the image's own restores (main 01a20182's ruling of 2026-11-22 ~11:55): the pre-pass makes

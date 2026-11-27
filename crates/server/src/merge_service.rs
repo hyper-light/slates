@@ -2353,6 +2353,9 @@ pub(crate) const OUT_OF_ORDER: &str = "merge.out_of_order";
 /// Counted on a holder for each merge record it answered behind (A-918, `ContentMessage::Behind`): a version past what
 /// its replica holds that its own ledger cannot bring it to. Format: a counter name.
 pub(crate) const BEHIND_ANSWERED: &str = "merge.behind.answered";
+/// Counter: a read of a green's chain a holder behind it wanted from its cohort (A-918 B, [`read_chain`]). Format: a
+/// counter name in the daemon's status report.
+pub(crate) const CHAIN_READ: &str = "merge.behind.chain_read";
 /// Counted on an owner for each behind answer a target gave a pending version's record (A-918). Format: a counter name.
 pub(crate) const BEHIND_HEARD: &str = "merge.behind.heard";
 /// Counted on a holder whose held inputs did not decode as an increment or origin (a corrupt hold).
@@ -5303,22 +5306,76 @@ fn record_standing(
     // No replica of a green whose records this holder accepted: a warm restart keeps the records and the inputs it held
     // (AUD-29-59), not the engine, which is rebuilt from them a slice at a time (A-313). Before, every later record was
     // refused out of order here, for good.
-    None => match crate::merge_origin::rebuild_replica(state, object) {
-      crate::merge_origin::Rebuild::Installed(head) => Some(head.saturating_add(1)),
-      crate::merge_origin::Rebuild::Later => return None,
-      crate::merge_origin::Rebuild::Nothing => None,
-    },
+    None => {
+      if let RebuildWait::Answered(standing) = rebuild_wait(state, object, sender) {
+        return standing;
+      }
+      match crate::merge_origin::rebuild_replica(state, object) {
+        crate::merge_origin::Rebuild::Installed(head) => Some(head.saturating_add(1)),
+        crate::merge_origin::Rebuild::Later => return None,
+        crate::merge_origin::Rebuild::Nothing => None,
+      }
+    }
   };
   match (next, version) {
     (Some(next), version) if version < next => Some(RecordStanding::Applied),
     (None, 0) => Some(RecordStanding::Next),
     (Some(next), version) if version == next => Some(RecordStanding::Next),
     (Some(next), version) => catch_up(state, object, (next, version), sender),
-    // None of the green held: a candidate a death brought in (A-918).
+    // None of the green held: a candidate a death brought in (A-918), which reads the green's chain from its cohort.
     _ => {
       state.count(OUT_OF_ORDER, 1);
+      read_chain(state, object, sender, version);
       Some(RecordStanding::Behind { reached: None })
     }
+  }
+}
+
+/// Whether a holder with no replica of a green rebuilds it now, or answers the record first ([`rebuild_wait`]).
+enum RebuildWait {
+  /// Every record and input the rebuild reads is held, or no record is: the rebuild's own answer stands.
+  Ready,
+  /// Something the rebuild reads is being brought: the record's standing meanwhile.
+  Answered(Option<RecordStanding>),
+}
+
+/// What a holder with `object`'s records and no replica of it waits on before it rebuilds one (A-918 B): ready where it
+/// holds every record and input the rebuild reads (`merge_origin::rebuild_needs`); a record it lacks is read from the
+/// green's cohort ([`read_chain`]) and the version answered behind; inputs it lacks are fetched from `sender`, the
+/// record's owner (`fleet::fetch_ledger_inputs`, as [`catch_up`] does), and nothing acknowledged yet.
+fn rebuild_wait(state: &mut ShardState, object: ObjectId, sender: HostId) -> RebuildWait {
+  let Some(through) = crate::merge_origin::newest_accepted(state, object) else {
+    return RebuildWait::Ready;
+  };
+  match crate::merge_origin::rebuild_needs(state, object, through) {
+    Ok(unheld) if unheld.is_empty() => RebuildWait::Ready,
+    Ok(unheld) => {
+      crate::fleet::fetch_ledger_inputs(state, object, sender, unheld);
+      RebuildWait::Answered(None)
+    }
+    Err(_) => {
+      read_chain(state, object, sender, through.saturating_add(1));
+      RebuildWait::Answered(Some(RecordStanding::Behind { reached: None }))
+    }
+  }
+}
+
+/// Reads the records of `object`'s versions below `version` this holder lacks from the green's cohort, the owner among
+/// them (A-918 B, main 01a20182's ruling B of 2026-11-25: the takeover successor's own read, A-919's): a candidate a
+/// death brought in holds none of the green, and the owner holds no per-version records below its floor, so it cannot
+/// ship the chain itself. Each position read is held in this holder's acceptor in order, under the start rule
+/// (`ledger_read`); the owner's next shipment then finds the records and rebuilds the replica from them. Counted
+/// [`CHAIN_READ`] where a read is wanted.
+fn read_chain(state: &mut ShardState, object: ObjectId, sender: HostId, version: u64) {
+  let Some(through) = version.checked_sub(1) else {
+    return;
+  };
+  let held = crate::merge_origin::chained_through(state, object, through);
+  if held.is_some_and(|held| held >= through) {
+    return;
+  }
+  if crate::ledger_read::want_chain(state, (object, sender), held, through) {
+    state.count(CHAIN_READ, 1);
   }
 }
 
@@ -5343,9 +5400,10 @@ fn catch_up(
     return Some(RecordStanding::Behind { reached });
   };
   match crate::merge_origin::ledger_unheld(state, object, (next, through)) {
-    // A version between whose record this holder lacks (A-918: answered typed).
+    // A version between whose record this holder lacks (A-918: answered typed), read from the green's cohort (A-918 B).
     Err(_) => {
       state.count(OUT_OF_ORDER, 1);
+      read_chain(state, object, sender, version);
       Some(RecordStanding::Behind { reached })
     }
     Ok(unheld) if !unheld.is_empty() => {
@@ -5729,6 +5787,7 @@ fn make_origin_replica(
           state.count(BRANCH_SOURCE_MADE, 1);
           let _ = crate::merge_origin::make_source(state, from, version);
         }
+        adopted_root_founded(state, from);
         if state.merge.replicas.branch(&from, version, key).is_err() {
           state.count(BRANCH_SOURCE_BEHIND, 1);
           // A source whose replica owes its push (a created ref's, P2) is made first, through the door its owner made it
@@ -5753,6 +5812,42 @@ fn make_origin_replica(
   }
   Ok(())
 }
+
+/// Founds `from`'s repository's lineage with `from`'s replica where it stands alone here and the names log held here
+/// joins it as its repository's root: a green made alone and adopted later as a root (`repository::install_root` with
+/// an adopted green, A-636 part 2b-2), whose version 0 its holders made standing alone, as its record says (A-932). The
+/// owner moved its engine into the new lineage and shipped no new version 0, so before this a branch of it was refused
+/// on every holder (`Greens::branch`: `Stale`, no lineage's member), counted [`BRANCH_SOURCE_BEHIND`] and retried
+/// without end (GAPS, A-932's sibling). Founded where a branch of it is first made here, a record's or a rebuild's
+/// (`crate::merge_origin`), so a holder restarted warm, whose rebuild of the root follows its version 0, does the same.
+/// A lineage the repository already has here refuses it (counted `crate::merge_origin::LINEAGE_FOUND_REFUSED`, a bug
+/// signal) and the replica stands alone as before.
+pub(crate) fn adopted_root_founded(state: &mut ShardState, from: DbVolumeId) {
+  if state.merge.replicas.lineage_of(&from).is_some() || !state.merge.replicas.contains_key(&from) {
+    return;
+  }
+  let Some(member) = membership(state, from) else {
+    return;
+  };
+  if !matches!(member.origin, slates_db::catalog::MemberOrigin::Root) {
+    return;
+  }
+  let Some(root) = state.merge.replicas.take_any(&from) else {
+    return;
+  };
+  match state.merge.replicas.found(member.repository, from, root) {
+    Ok(()) => state.count(ADOPTED_ROOT_FOUNDED, 1),
+    Err(root) => {
+      state.merge.replicas.insert(from, *root);
+      state.count(crate::merge_origin::LINEAGE_FOUND_REFUSED, 1);
+    }
+  }
+}
+
+/// Counter: a green made alone and adopted later as its repository's root, whose lone replica founded its lineage on
+/// this holder when a branch of it was first made here ([`adopted_root_founded`]). Format: a counter name in the
+/// daemon's status report.
+pub(crate) const ADOPTED_ROOT_FOUNDED: &str = "merge.replica.adopted_root_founded";
 
 /// Counter: a lineage's root whose replica founded its lineage on this holder (A-908).
 /// Format: a counter name in the daemon's status report.
@@ -6448,6 +6543,60 @@ mod tests {
       MergeRecordValue::from_record_bytes(&origin_only.to_record_bytes()),
       Some(origin_only)
     );
+  }
+
+  /// A-932's sibling (GAPS, main's ruling of 2026-11-27 07:08): a green made alone and adopted later as a repository's
+  /// root is a lineage's root on its holder too. Do: recompute version 0 of a green minted standing alone, its record
+  /// naming no lineage, so its replica stands alone; then note the names-log part a repository's creation ships when it
+  /// adopts it as its root, and a branch made from it at version 0; recompute the branch's version 0. Expect the branch
+  /// made (branched, lent, nothing copied), the root and the branch members of the repository's lineage, no
+  /// `merge.replica.branch_source_behind`. Red before: the branch refused out of order, its source standing alone and
+  /// so no lineage's member (`Greens::branch` refuses it `Stale`), counted behind, retried without end.
+  #[test]
+  fn a_lone_green_adopted_as_a_root_is_branched_on_its_holder() {
+    let (zero, branched, lineages, behind) = crate::daemon::audit_on_shard(|state| {
+      let empty = Green::new().head_identity();
+      let root = green_standing_alone(state);
+      state.merge.memberships_built = true;
+      let zero = recompute(state, root, &version_zero(empty), None);
+      let repository = slates_db::catalog::RepositoryId { bytes: root.0 };
+      let branch = family_id(2, 3);
+      note_names_part(
+        state,
+        &names_part(
+          repository,
+          vec![
+            joined(repository, root, slates_db::catalog::MemberOrigin::Root),
+            joined(
+              repository,
+              branch,
+              slates_db::catalog::MemberOrigin::Branch {
+                from: DbVolumeId { bytes: root.0 },
+                version: 0,
+              },
+            ),
+          ],
+        ),
+      );
+      let branched = recompute(state, branch, &member_version_zero(repository, empty), None);
+      let lineages =
+        [root, branch].map(|green| state.merge.replicas.lineage_of(&replica_key(green)));
+      (
+        zero,
+        branched,
+        (lineages, repository),
+        counted(state, BRANCH_SOURCE_BEHIND),
+      )
+    });
+    assert_eq!(zero, Ok(()), "the lone green made at once");
+    assert_eq!(branched, Ok(()), "the branch made from the adopted root");
+    let (lineages, repository) = lineages;
+    assert_eq!(
+      lineages,
+      [Some(repository), Some(repository)],
+      "one lineage, founded by the adopted root"
+    );
+    assert_eq!(behind, 0, "never behind its source");
   }
 
   /// A-932, golden vector: version 0's record of a member of a repository's lineage, format 5, byte for byte (the class

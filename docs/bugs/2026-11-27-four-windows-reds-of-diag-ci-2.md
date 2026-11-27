@@ -29,6 +29,26 @@
   restores, holds only once the shard's changes are published.
 - **Fix.** `image_split` publishes the shard (`verbs::publish_shard`) in the same step as its read. On the MacBook the
   test reads (whole 0, Away 3) against the shard's 3 lacking, and passes.
+- **Corrected (w-interop, 2026-11-27, after diag CI 9).** The cause given above was wrong.
+  - **The real cause.** It is a test counting error, deterministic on every host with a 4 KiB page:
+    - `image_split` matched the image's Away windows to each named text by the text's own identity, which names only
+      a text of one window;
+    - the content window is 16 pages (`slates_vfs::content::chunk_bytes`), so 64 KiB at a 4 KiB page;
+    - `full.dump`'s `trunk/big.txt` is 106,766 bytes, so it spans two windows there and was read as whole.
+  - **Why only some lanes failed.** A 16 KiB-page Mac makes the window 256 KiB, one window for that text, so the Mac
+    never failed. Windows (diag CI 2) and the TSan lane (diag CI 9, run 46018002586, at 56b609053 with the fix above
+    in) did fail.
+  - **The red.** The test at a 4 KiB page on the MacBook gave (1, 2) against (0, 3) on its first run
+    (`~/.local/state/w-interop-logs/red2-page4k.log`).
+  - **The fix.**
+    - A text is counted Away when any of its windows is, each found by the text's identity and length
+      (`ContentStore::window_holding`), as `ContentStore::holds_whole` judges it.
+    - The test runs at the host's page and again at a 4 KiB page; the second run requires at least one named text of
+      more than one window, so it can't pass vacuously.
+    - The publish stays. Before it, `image_split` now drives the encoder's cut to its end, so the publication carries
+      every change the shard has made. (A-930 part 3's cadence, 7acfd685c, would have needed an ask here as well; main
+      reverted it in 68e6fe9e3.)
+  - **Green on the MacBook (debug):** (0, 3) at the host's page, and (0, 3) with one text of two windows at 4 KiB.
 
 ## 1. The signed-work restart test read the checkpoint's count at once (test; both lanes)
 
