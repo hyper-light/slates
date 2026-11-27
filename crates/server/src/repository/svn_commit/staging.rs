@@ -1956,8 +1956,13 @@ impl Staging {
       state.count(cause.counter(), 1);
       crate::vcs_store::svn_import::batch_landed(state, self.repository, (cause, self.bound));
       crate::merge_service::checkpoint_green_in_turns(state, green);
-      super::fold_to_readers(state, green);
+      super::fold_to_readers_begin(state, green);
     })?;
+    // The green's fold to its readers' floor a slice of the shard's budget a step (A-920 11a: whole in this section,
+    // 7.5-23.4 ms for a landing of 9,001 paths, debug, the release leader of a wide move's landing).
+    #[cfg(test)]
+    crate::vcs_store::svn_import::phase::tag("landing.fold");
+    until_done(|state| super::fold_to_readers_some(state, green, slice_deadline_ns())).await?;
     #[cfg(test)]
     crate::vcs_store::svn_import::phase::tag("landing.follow");
     let holding: Vec<(ContentIdentity, String)> = std::mem::take(&mut self.holding)

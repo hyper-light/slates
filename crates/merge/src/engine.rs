@@ -1548,6 +1548,9 @@ pub struct Green {
   /// is no longer reconstructible. The service keeps the floor at the oldest version any live reader
   /// — a work's base, a pinned attachment — can still name.
   folded_below: u64,
+  /// A fold of the histories below [`Green::folded_below`] still being taken a unit at a time ([`Green::fold_begin`],
+  /// A-920 11a); every fold begun after finishes it first.
+  folding: Option<Box<Folding>>,
   /// The paths merged through the content fast path (the non-vacuity counter). A cell, so the verdict stays a function
   /// of an immutable green (A-658), as `deltas_visited` is.
   fast_path_hits: std::cell::Cell<u64>,
@@ -1701,7 +1704,71 @@ thread_local! {
   pub(crate) static FOLD_PATHS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// A fold of a green's histories below a floor being taken a unit at a time ([`Green::fold_begin`], A-920 11a).
+#[derive(Debug, Default)]
+struct Folding {
+  /// The floor it folds to.
+  floor: u64,
+  /// The floor it folds from.
+  previous: u64,
+  /// The history and change-index bytes when it began, what it released counted from.
+  before: usize,
+  /// Where it stands.
+  phase: FoldPhase,
+  /// The versions whose change-index entries the phase walks: from the last floor to this one while gathering, the
+  /// floor passed while moving them below it.
+  versions: Vec<u64>,
+  /// The version of [`Folding::versions`] being walked.
+  version_at: usize,
+  /// The entry of that version next.
+  entry_at: usize,
+  /// The paths of the version being moved below the floor, read once at its first unit.
+  version_paths: Option<Vec<String>>,
+  /// The paths gathered so far.
+  touched: BTreeSet<String>,
+  /// The paths to fold, in order, once gathered.
+  paths: Vec<String>,
+  /// The next of the phase's paths, values or alone paths.
+  at: usize,
+  /// The content values the content folds dropped, each let go a unit (taken as it is).
+  dropped: Vec<Option<crate::history::Value>>,
+  /// The paths the content folds left their latest value alone.
+  alone: Vec<String>,
+  /// The special nodes the folds dropped.
+  specials: usize,
+}
+
+/// Where a [`Folding`] stands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FoldPhase {
+  /// Gathering the paths the change index names from the last floor to this one.
+  #[default]
+  Touching,
+  /// Letting the copies' kept fixes go.
+  Fixes,
+  /// Moving the versions the floor passed below the change index's floor.
+  Changes,
+  /// Folding each path's content history.
+  Content,
+  /// Letting go each content value dropped.
+  Release,
+  /// Naming whole each path left its latest value alone.
+  Alone,
+  /// Folding each path's other histories.
+  Rest,
+  /// Ended.
+  Ended,
+}
+
+/// Folds `path`'s history in `histories` below `floor`, where it holds one ([`fold_entries`]).
+fn fold_one<T>(histories: &mut BTreeMap<String, Vec<(u64, T)>>, path: &str, floor: u64) {
+  if let Some(history) = histories.get_mut(path) {
+    fold_entries(history, floor);
+  }
+}
+
 /// Folds the history of each of `paths` that `histories` holds below `floor` ([`fold_entries`]).
+#[cfg(test)]
 fn fold_paths<T>(
   histories: &mut BTreeMap<String, Vec<(u64, T)>>,
   paths: &BTreeSet<String>,
@@ -6977,6 +7044,7 @@ impl Green {
   /// that starts below the floor and ends at or above it is answered as the folded histories answer it. A version
   /// emptied goes too; an entry keeps its place in its version, so a walk's cursor holds. The cost of the entries the
   /// floor passes.
+  #[cfg(test)]
   fn fold_changes_before(&mut self, previous: u64, floor: u64) {
     let passed: Vec<u64> = self
       .changes
@@ -8697,16 +8765,230 @@ impl Green {
   /// than one entry at it (one work setting an attribute twice), which that fold kept as the value at its floor. The cost is the changes since the last fold, never the green: a fold of
   /// every path's history in one step held an import's shard 494 ms a landing at 9,000 files (debug), folding nothing.
   pub fn fold_history_before(&mut self, floor: u64) -> usize {
-    // A green that owes a push has no history of the owed version to fold (P2): nothing.
-    if floor <= self.folded_below || self.owed.is_some() {
-      return 0;
+    let mut whole = || false;
+    let mut released = self.fold_some(&mut whole).unwrap_or(0);
+    if self.fold_begin(floor) {
+      released = released.saturating_add(self.fold_some(&mut whole).unwrap_or(0));
     }
-    let touched: BTreeSet<String> = self
-      .changes
-      .range(self.folded_below..=floor)
-      .flat_map(|(_, entries)| entries.iter().map(|entry| entry.path.clone()))
-      .collect();
-    self.fold_paths_before(floor, &touched)
+    released
+  }
+
+  /// [`Green::fold_history_before`] begun at `floor`, to be taken a unit at a time ([`Green::fold_some`], A-920 11a:
+  /// whole, 7.5-23.4 ms of one step for a landing of 9,001 paths, debug): a fold still under way finished first, then
+  /// the floor raised at once, which every read at or above it answers alike folded or not. Whether a fold began: none
+  /// for a floor at or below the folded one, or a green that owes a push (P2), which has no history of the owed version.
+  pub fn fold_begin(&mut self, floor: u64) -> bool {
+    let _ = self.fold_some(&mut || false);
+    if floor <= self.folded_below || self.owed.is_some() {
+      return false;
+    }
+    // The identity reads its keys' values at the version it was last brought to, so it is brought to the head
+    // before the history below the floor goes (A-202).
+    if self.identity_version < floor {
+      self.fold_identity();
+    }
+    let previous = self.folded_below;
+    self.folded_below = floor;
+    self.folding = Some(Box::new(Folding {
+      floor,
+      previous,
+      before: self.history_bytes().saturating_add(self.changes_bytes),
+      versions: self
+        .changes
+        .range(previous..=floor)
+        .map(|(version, _)| *version)
+        .collect(),
+      ..Folding::default()
+    }));
+    true
+  }
+
+  /// One step of the fold under way ([`Green::fold_begin`]), a unit at least, until `spent`: the paths the change index
+  /// names from the last floor to this one gathered an entry a unit; the copies' kept fixes let go; each version passed
+  /// moved below the change index's floor an entry a unit; each path's content history folded a path a unit, what it
+  /// dropped let go a value a unit, and each path it left its latest value alone named whole a path a unit; then every
+  /// other dimension's history of each path folded a path a unit. None while units are left; once it ends, the bytes it
+  /// released (none where no fold is under way).
+  pub fn fold_some(&mut self, spent: &mut dyn FnMut() -> bool) -> Option<usize> {
+    let Some(mut folding) = self.folding.take() else {
+      return Some(0);
+    };
+    loop {
+      if self.fold_unit(&mut folding) {
+        break;
+      }
+      if spent() {
+        self.folding = Some(folding);
+        return None;
+      }
+    }
+    self.special_history_bytes = self
+      .special_history_bytes
+      .saturating_sub(folding.specials.saturating_mul(SPECIAL_NODE_BYTES));
+    Some(
+      folding
+        .before
+        .saturating_sub(self.history_bytes().saturating_add(self.changes_bytes)),
+    )
+  }
+
+  /// One unit of `folding` ([`Green::fold_some`]): whether the fold has ended.
+  fn fold_unit(&mut self, folding: &mut Folding) -> bool {
+    match folding.phase {
+      FoldPhase::Touching => self.touch_one(folding),
+      FoldPhase::Fixes => {
+        self.release_kept_fixes(folding.floor);
+        folding.versions = self
+          .changes
+          .range(folding.previous..folding.floor)
+          .map(|(version, _)| *version)
+          .collect();
+        folding.version_at = 0;
+        folding.version_paths = None;
+        folding.phase = FoldPhase::Changes;
+      }
+      FoldPhase::Changes => self.pass_one(folding),
+      FoldPhase::Content => self.fold_content_one(folding),
+      FoldPhase::Release => match folding.dropped.get_mut(folding.at).map(Option::take) {
+        Some(value) => {
+          self.release_content(value);
+          folding.at = folding.at.saturating_add(1);
+        }
+        None => {
+          folding.dropped = Vec::new();
+          folding.at = 0;
+          folding.phase = FoldPhase::Alone;
+        }
+      },
+      FoldPhase::Alone => match folding.alone.get(folding.at).cloned() {
+        Some(path) => {
+          self.rename_alone(&path);
+          folding.at = folding.at.saturating_add(1);
+        }
+        None => {
+          folding.alone = Vec::new();
+          folding.at = 0;
+          folding.phase = FoldPhase::Rest;
+        }
+      },
+      FoldPhase::Rest => self.fold_rest_one(folding),
+      FoldPhase::Ended => return true,
+    }
+    false
+  }
+
+  /// One entry of the change index from the last floor to the new one, its path gathered; the paths in order once
+  /// every one is.
+  fn touch_one(&mut self, folding: &mut Folding) {
+    let entry = folding
+      .versions
+      .get(folding.version_at)
+      .and_then(|version| self.changes.get(version))
+      .map(|entries| {
+        entries
+          .get(folding.entry_at)
+          .map(|entry| entry.path.clone())
+      });
+    match entry {
+      Some(Some(path)) => {
+        folding.touched.insert(path);
+        folding.entry_at = folding.entry_at.saturating_add(1);
+      }
+      Some(None) => {
+        folding.version_at = folding.version_at.saturating_add(1);
+        folding.entry_at = 0;
+      }
+      None => {
+        folding.paths = core::mem::take(&mut folding.touched).into_iter().collect();
+        #[cfg(test)]
+        FOLD_PATHS_VISITED.with(|visited| visited.set(visited.get() + folding.paths.len()));
+        folding.phase = FoldPhase::Fixes;
+      }
+    }
+  }
+
+  /// One entry of a version the floor passed moved below the change index's floor (`Green::fold_changes_before`'s
+  /// unit): its path's last change below the floor kept, the one before it dropped. A version's paths are read once,
+  /// as a unit, before its entries.
+  fn pass_one(&mut self, folding: &mut Folding) {
+    let Some(version) = folding.versions.get(folding.version_at).copied() else {
+      folding.at = 0;
+      folding.phase = FoldPhase::Content;
+      return;
+    };
+    let Some(paths) = folding.version_paths.as_mut() else {
+      folding.version_paths = Some(
+        self
+          .changes
+          .get(&version)
+          .map(|entries| entries.iter().map(|entry| entry.path.clone()).collect())
+          .unwrap_or_default(),
+      );
+      folding.entry_at = 0;
+      return;
+    };
+    match paths.get_mut(folding.entry_at).map(core::mem::take) {
+      Some(path) => {
+        folding.entry_at = folding.entry_at.saturating_add(1);
+        match self.below_floor_last.insert(path.clone(), version) {
+          None => self.changes_bytes = self.changes_bytes.saturating_add(change_bytes(&path)),
+          Some(earlier) => self.drop_change_entry(earlier, &path),
+        }
+      }
+      None => {
+        folding.version_paths = None;
+        folding.version_at = folding.version_at.saturating_add(1);
+      }
+    }
+  }
+
+  /// One path's content history folded (`Green::fold_content_before`'s unit): what it dropped kept to let go, and
+  /// the path kept where the fold left it its latest value alone.
+  fn fold_content_one(&mut self, folding: &mut Folding) {
+    let Some(path) = folding.paths.get(folding.at) else {
+      folding.at = 0;
+      folding.phase = FoldPhase::Release;
+      return;
+    };
+    if let Some(history) = self.content_history.get_mut(path) {
+      let folded = fold_entries(history, folding.floor);
+      if !folded.is_empty() && history.len() == 1 {
+        folding.alone.push(path.clone());
+      }
+      folding
+        .dropped
+        .extend(folded.into_iter().map(|(_, value)| value));
+    }
+    folding.at = folding.at.saturating_add(1);
+  }
+
+  /// One path's every other history folded: its special nodes', modes', symbolic links', hard links', directories' and
+  /// attributes'. The fold ends after its last path.
+  fn fold_rest_one(&mut self, folding: &mut Folding) {
+    let floor = folding.floor;
+    let Some(path) = folding.paths.get(folding.at) else {
+      folding.phase = FoldPhase::Ended;
+      return;
+    };
+    if let Some(history) = self.special_history.get_mut(path) {
+      let specials = fold_entries(history, floor)
+        .iter()
+        .filter(|(_, node)| node.is_some())
+        .count();
+      folding.specials = folding.specials.saturating_add(specials);
+    }
+    fold_one(&mut self.mode_history, path, floor);
+    fold_one(&mut self.symlink_history, path, floor);
+    fold_one(&mut self.hardlink_history, path, floor);
+    fold_one(&mut self.dir_history, path, floor);
+    for (_, history) in self
+      .xattr_history
+      .range_mut((path.clone(), String::new())..)
+      .take_while(|((at, _), _)| at == path)
+    {
+      fold_entries(history, floor);
+    }
+    folding.at = folding.at.saturating_add(1);
   }
 
   /// [`Green::fold_history_before`] over every path any history holds: the fold as a walk of the whole green, the
@@ -8730,7 +9012,9 @@ impl Green {
     self.fold_paths_before(floor, &every)
   }
 
-  /// Folds the histories of `paths` below `floor` ([`Green::fold_history_before`]).
+  /// Folds the histories of `paths` below `floor` whole, in one call: what [`Green::fold_history_before`] did before
+  /// A-920 11a, kept as the oracle a fold taken a unit at a time is held to (`fold_tests`).
+  #[cfg(test)]
   fn fold_paths_before(&mut self, floor: u64, paths: &BTreeSet<String>) -> usize {
     #[cfg(test)]
     FOLD_PATHS_VISITED.with(|visited| visited.set(visited.get() + paths.len()));
@@ -8764,6 +9048,7 @@ impl Green {
 
   /// Folds the content history below `floor`: the latest value is never folded, so the current values stand, and each
   /// dropped value releases its chunks.
+  #[cfg(test)]
   fn fold_content_before(&mut self, floor: u64, paths: &BTreeSet<String>) {
     let mut dropped = Vec::new();
     let mut alone = Vec::new();
@@ -8827,6 +9112,7 @@ impl Green {
   }
 
   /// Folds the IPC history below `floor`, its earlier nodes leaving the running total.
+  #[cfg(test)]
   fn fold_specials_before(&mut self, floor: u64, paths: &BTreeSet<String>) {
     let mut specials = 0usize;
     for path in paths {

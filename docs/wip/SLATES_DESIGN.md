@@ -64815,6 +64815,38 @@ GAPS.
   `PHASES <test> wall_ns=<n> cpu_ns=<n> spans=<tag>:<wall_ns>:<cpu_ns>,...`. In debug: add's and copy's longest poll
   was `storing.carried` (13.2 and 18.2 ms) and then `stage.bringing` (1.2 ms) in the same poll; move's was
   `landing.tail_end` (21.7 ms) between brief `landing.identity` and `landing.follow` spans.
+  **Release probe 13** (main, at 932a0aa92 with the tag; the quiet half, 99 runs each, all rc 0; every leader's CPU
+  within 1% of its wall):
+  - add: led by `storing.carried` in 94 of 99 runs, its span p50 1.27 and p90 1.41 ms;
+  - copy: led by `landing.release` in 92 runs, 2.69 and 3.00 ms;
+  - move: led by `landing.tail_end` in 98 runs, 3.32 and 4.36 ms, at most 14.2 ms.
+  Main's order: slice all three, biggest first.
+- **Piece 11, the leaders of release probe 13.** **11a, the landing's fold a unit a step.** Named before the change
+  (debug, the move test): `landing.tail_end` was `fold_to_readers`, nearly all of it `Green::fold_history_before`
+  (7.5 ms folding nothing at floor 1, 23.4 ms releasing 9.3 MB at floor 3). Its parts:
+  - gathering the 9,001-9,003 paths the change index names: 0.7-1.8 ms;
+  - moving the versions passed below the change index's floor: 6.5 ms;
+  - folding the content histories: 4.0-14.6 ms;
+  - folding the other dimensions: 2.4-2.9 ms.
+  The count, `batch_landed`, the checkpoint's begin and the retention's settle were 1-16 µs each. Now the fold is held
+  in the green (`Green::folding`, `engine::Folding`). `Green::fold_begin` finishes any fold under way, raises the
+  floor at once (every read at or above it answers alike, folded or not) and begins. `Green::fold_some` then takes it
+  a unit at a time:
+  - each change-index entry's path gathered;
+  - the copies' kept fixes let go;
+  - each passed version's entry moved below the floor;
+  - each path's content history folded, each dropped value let go, each path left alone named whole;
+  - each path's other histories folded.
+  `fold_history_before` is that run to its end, and the old whole fold (`fold_paths_before`) is kept, test-only, as
+  the oracle it is held to. The landing's tail begins the fold (`svn_commit::fold_to_readers_begin`) and steps it
+  (`fold_to_readers_some`, counted `repository.svn_commit.fold_steps`, more than two in `t_c2c`; red at 2 with the
+  fold whole).
+  - Oracle: `a_fold_taken_a_unit_at_a_time_across_later_works_equals_the_fold_whole` (generated histories). One twin
+    folds whole; the other takes a few units and judges the next works with the fold part-way. They keep the same
+    head after every work, and at the end the same reads from the floor to the head, histories and counted bytes.
+    Chunk numbers are left out: a later release lets a new work's chunk take another number.
+  - Planted bug, red: a begin that does not finish the fold under way.
+  - After 11a (debug), the move test's longest poll is `storing.carried`, as add's and copy's are, no longer the tail.
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
