@@ -247,18 +247,21 @@ pub struct Supervisor {
   /// The NFS loopback listener the anchor holds, if any (§4.6): a bound, listening socket whose
   /// descriptor is handed to each daemon it spawns (via [`ENV_NFS_LISTENER`], inherited across the
   /// spawn) so the loopback port survives a restart. The anchor owns it for its whole life, past any
-  /// one daemon; the descriptor must be inheritable (not close-on-exec) — the caller clears that
-  /// before [`Supervisor::hold_nfs_listener`]. Unix only: NFS is the macOS/Linux bridge (Windows uses
-  /// WinFsp), and the descriptor type is Unix's.
+  /// one daemon. It is close-on-exec here and handed on to each daemon's child alone ([`hand_on_in_child`]).
+  /// Unix only: NFS is the macOS/Linux bridge (Windows uses WinFsp), and the descriptor type is Unix's.
   #[cfg(unix)]
   nfs_listener: Option<OwnedFd>,
   /// Environment variables every daemon this supervisor spawns receives: the handoffs of endpoints the owner holds for
   /// the daemon's successors (the client rendezvous, A-114), whose objects the owner keeps alive itself.
   environment: Vec<(String, String)>,
+  /// The descriptors the owner holds and those variables name ([`Supervisor::hand_on_descriptor`]): close-on-exec in
+  /// this process, cleared in each daemon's child alone ([`hand_on_in_child`]).
+  #[cfg(unix)]
+  handed_on: Vec<i32>,
   /// A fleet node's two serve sockets (probe, record) and its network export's listener when the plan has
   /// one, if this daemon is a fleet node (§4.8): bound once by the anchor and handed to each daemon it spawns
   /// (via [`ENV_FLEET_SERVE`]), so the manifest's ports are never free between a daemon's stop and its
-  /// restart. Inheritable, as the NFS listener is.
+  /// restart. Close-on-exec and handed on to each daemon's child alone, as the NFS listener is.
   #[cfg(unix)]
   fleet_serve: Option<(OwnedFd, OwnedFd, Option<OwnedFd>)>,
   /// The version-control edge's listener the anchor holds, if any (A-625 part 3): bound once at the operator's address
@@ -315,6 +318,9 @@ struct HeldHandoff {
   env: Vec<(String, String)>,
   /// The table's object.
   table: Option<crate::held::TableObject>,
+  /// The descriptors the spawn hands on to the daemon's child alone ([`hand_on_in_child`]): the device channel's end,
+  /// every held device, connection and copy, and the table's object, each close-on-exec in this process.
+  handed: Vec<i32>,
 }
 
 /// The most messages one drain applies per device the bound allows: a hold, its session and its release are
@@ -376,6 +382,8 @@ impl Supervisor {
       started_at_ns: 0,
       lifetime: lifetime::Tie::new(),
       environment: Vec::new(),
+      #[cfg(unix)]
+      handed_on: Vec::new(),
       #[cfg(unix)]
       nfs_listener: None,
       #[cfg(unix)]
@@ -593,64 +601,34 @@ impl Supervisor {
   }
 
   /// The handoff to a daemon about to be spawned (A-462): the device channel and every held device, connection and copy,
-  /// each descriptor made inheritable, in one table written into a sealed, read-only object whose descriptor the spawn
-  /// inherits too ([`crate::held::TableObject`]), and the environment naming it ([`crate::held::ENV_HELD`]). The caller
-  /// keeps the object until the spawn holds its own copy. A descriptor that cannot be made inheritable is left out (and
-  /// counted): handing a number the daemon does not inherit would have it adopt whatever that number names in its own
-  /// table. A table that cannot be made refuses the spawn ([`AnchorError::Handoff`]): a daemon started without it would
-  /// take every held entry for none.
+  /// in one table written into a sealed, read-only object ([`crate::held::TableObject`]), the environment naming it
+  /// ([`crate::held::ENV_HELD`]), and every one of those descriptors to hand on to the daemon's child alone: each stays
+  /// close-on-exec here, as it was received or made, so no other child of this process inherits it. Until 2026-11-27
+  /// each was made inheritable here at every spawn and stayed so
+  /// (`docs/bugs/2026-11-27-an-anchors-held-sockets-reached-every-child-of-their-holders-process.md`). The caller keeps
+  /// the object until the spawn holds its own copy. A table that cannot be made refuses the spawn
+  /// ([`AnchorError::Handoff`]): a daemon started without it would take every held entry for none.
   #[cfg(unix)]
   fn device_env(&mut self) -> Result<HeldHandoff, AnchorError> {
+    use std::os::fd::AsRawFd;
     self.drain_devices();
     let Some(hold) = self.devices.as_mut() else {
       return Ok(HeldHandoff::default());
     };
-    let inheritable = |fd: &OwnedFd| rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty());
-    if let Err(e) = inheritable(&hold.daemon_end) {
-      hold.refuse(&crate::held::HoldRefusal::Os {
-        call: "fcntl(F_SETFD) on the channel",
-        code: e.raw_os_error(),
-      });
-      return Ok(HeldHandoff::default());
-    }
-    let mut lost = Vec::new();
-    for (attachment, held) in hold.held.iter() {
-      if inheritable(&held.device).is_err() {
-        lost.push(attachment);
-      }
-    }
-    for attachment in lost {
-      let _ = hold
+    let mut handed = vec![hold.daemon_end.as_raw_fd()];
+    handed.extend(hold.held.iter().map(|(_, held)| held.device.as_raw_fd()));
+    handed.extend(
+      hold
         .held
-        .apply(crate::held::Incoming::Release { attachment });
-      hold.refuse(&crate::held::HoldRefusal::Malformed {
-        reason: "a held device could not be made inheritable",
-      });
-    }
-    let mut lost_connections = Vec::new();
-    for (connection, socket) in hold.held.iter_connections() {
-      if inheritable(socket).is_err() {
-        lost_connections.push(connection);
-      }
-    }
-    for connection in lost_connections {
-      hold.held.drop_connection(connection);
-      hold.refuse(&crate::held::HoldRefusal::Malformed {
-        reason: "a held connection could not be made inheritable",
-      });
-    }
-    let mut lost_copies = Vec::new();
-    for (copy, held) in hold.held.iter_copies() {
-      if inheritable(&held.object).is_err() {
-        lost_copies.push(copy);
-      }
-    }
-    for copy in lost_copies {
-      hold.held.drop_copy(copy);
-      hold.refuse(&crate::held::HoldRefusal::Malformed {
-        reason: "a held copy could not be made inheritable",
-      });
-    }
+        .iter_connections()
+        .map(|(_, socket)| socket.as_raw_fd()),
+    );
+    handed.extend(
+      hold
+        .held
+        .iter_copies()
+        .map(|(_, held)| held.object.as_raw_fd()),
+    );
     let table = crate::held::Table {
       devices: hold
         .held
@@ -659,29 +637,34 @@ impl Supervisor {
       copies: hold.held.copies_part(),
     };
     let object = crate::held::TableObject::new(&table).map_err(AnchorError::Handoff)?;
-    rustix::io::fcntl_setfd(object.descriptor(), rustix::io::FdFlags::empty()).map_err(|e| {
-      AnchorError::Handoff(crate::held::HoldRefusal::Os {
-        call: "fcntl(F_SETFD) on the handoff table",
-        code: e.raw_os_error(),
-      })
-    })?;
+    handed.push(object.descriptor().as_raw_fd());
     Ok(HeldHandoff {
       env: vec![(crate::held::ENV_HELD.to_owned(), object.pointer())],
       table: Some(object),
+      handed,
     })
   }
 
   /// Hands `name=value` to every daemon this supervisor spawns: the handoff of an endpoint the owner holds across
-  /// restarts (the client rendezvous, A-114). The owner keeps the endpoint itself alive, and any descriptor it names
-  /// inheritable.
+  /// restarts (the client rendezvous, A-114). The owner keeps the endpoint itself alive; a descriptor it names is handed
+  /// on with [`Supervisor::hand_on_descriptor`].
   pub fn hold_environment(&mut self, name: &str, value: String) {
     self.environment.push((name.to_owned(), value));
   }
 
+  /// Hands descriptor `number`, which the owner holds open for the supervisor's life and keeps close-on-exec, to every
+  /// daemon this supervisor spawns, at the same number: its close-on-exec is cleared in each daemon's child alone
+  /// ([`hand_on_in_child`]), so no other child of the owner's process inherits it (the client rendezvous's listening
+  /// socket on Linux, `slates_ipc::rendezvous::HeldRendezvous::handed_descriptor`).
+  #[cfg(unix)]
+  pub fn hand_on_descriptor(&mut self, number: i32) {
+    self.handed_on.push(number);
+  }
+
   /// Holds `fd` — a bound, listening loopback socket — as the NFS listener handed to every daemon this
-  /// supervisor spawns, so its port is stable across restarts (§4.6). The descriptor must be
-  /// inheritable (the caller clears close-on-exec, since it is passed to the daemon across the spawn);
-  /// the supervisor owns it for its life, past any one daemon.
+  /// supervisor spawns, so its port is stable across restarts (§4.6). The descriptor stays close-on-exec, as it was
+  /// made: the supervisor hands it on to each daemon's child alone ([`hand_on_in_child`]) and owns it for its life,
+  /// past any one daemon.
   #[cfg(unix)]
   pub fn hold_nfs_listener(&mut self, fd: OwnedFd) {
     self.nfs_listener = Some(fd);
@@ -689,8 +672,8 @@ impl Supervisor {
 
   /// Holds a fleet node's two serve sockets — `probe` and `record`, bound where the node's plan says — and its
   /// network export's listener when the plan has one, and hands them to every daemon this supervisor spawns
-  /// (§4.8; §4.6 AUD-29-75). Each must be inheritable (the caller clears close-on-exec); the supervisor owns
-  /// them for its life, past any one daemon.
+  /// (§4.8; §4.6 AUD-29-75). Each stays close-on-exec and is handed on to each daemon's child alone; the
+  /// supervisor owns them for its life, past any one daemon.
   #[cfg(unix)]
   pub fn hold_fleet_serve(&mut self, probe: OwnedFd, record: OwnedFd, export: Option<OwnedFd>) {
     self.fleet_serve = Some((probe, record, export));
@@ -698,7 +681,7 @@ impl Supervisor {
 
   /// Holds `fd` — a bound, listening socket at the address the operator gave the version-control edge — as the edge's
   /// listener handed to every daemon this supervisor spawns, so its port is stable across restarts (A-625 part 3). It
-  /// must be inheritable, as [`Supervisor::hold_nfs_listener`]'s is; the supervisor owns it for its life.
+  /// is handed on as [`Supervisor::hold_nfs_listener`]'s is; the supervisor owns it for its life.
   #[cfg(unix)]
   pub fn hold_vcs_http_listener(&mut self, fd: OwnedFd) {
     self.vcs_http_listener = Some(fd);
@@ -706,7 +689,7 @@ impl Supervisor {
 
   /// Holds `fd` — a bound, listening socket at the address the operator gave the version-control SSH edge — as the
   /// edge's listener handed to every daemon this supervisor spawns, so its port is stable across restarts (A-684). It
-  /// must be inheritable, as [`Supervisor::hold_vcs_http_listener`]'s is; the supervisor owns it for its life.
+  /// is handed on as [`Supervisor::hold_vcs_http_listener`]'s is; the supervisor owns it for its life.
   #[cfg(unix)]
   pub fn hold_vcs_ssh_listener(&mut self, fd: OwnedFd) {
     self.vcs_ssh_listener = Some(fd);
@@ -759,18 +742,26 @@ impl Supervisor {
     self.serving_seen_ns = None;
     let mut env = self.segment.handoff_env()?;
     env.push((ENV_ANCHOR_PID.to_owned(), std::process::id().to_string()));
-    // Hand the held NFS listener's descriptor over: it is inheritable (not close-on-exec), so the
-    // spawned daemon inherits it at the same number and adopts it, keeping the loopback port (§4.6).
+    // The descriptors handed on to the daemon's child alone: each is close-on-exec here, so no other child of this
+    // process inherits it, and the spawn clears that in its child, which inherits each at the number its environment
+    // names ([`hand_on_in_child`]).
+    #[cfg(unix)]
+    let mut handed = self.handed_on.clone();
+    // Hand the held NFS listener's descriptor over: the spawned daemon inherits it at the same number and adopts it,
+    // keeping the loopback port (§4.6).
     #[cfg(unix)]
     if let Some(fd) = &self.nfs_listener {
       env.push((ENV_NFS_LISTENER.to_owned(), fd.as_raw_fd().to_string()));
+      handed.push(fd.as_raw_fd());
     }
     // And the held fleet serve sockets, the same way: the daemon adopts them rather than binding (§4.8).
     #[cfg(unix)]
     if let Some((probe, record, export)) = &self.fleet_serve {
       let mut numbers = format!("{},{}", probe.as_raw_fd(), record.as_raw_fd());
+      handed.extend([probe.as_raw_fd(), record.as_raw_fd()]);
       if let Some(export) = export {
         numbers.push_str(&format!(",{}", export.as_raw_fd()));
+        handed.push(export.as_raw_fd());
       }
       env.push((ENV_FLEET_SERVE.to_owned(), numbers));
     }
@@ -779,16 +770,19 @@ impl Supervisor {
     #[cfg(unix)]
     if let Some(fd) = &self.vcs_http_listener {
       env.push((ENV_VCS_HTTP.to_owned(), fd.as_raw_fd().to_string()));
+      handed.push(fd.as_raw_fd());
     }
     // And the SSH edge's, the same way (A-684).
     #[cfg(unix)]
     if let Some(fd) = &self.vcs_ssh_listener {
       env.push((ENV_VCS_SSH.to_owned(), fd.as_raw_fd().to_string()));
+      handed.push(fd.as_raw_fd());
     }
     // And the held svn:// listener, the same way (A-689).
     #[cfg(unix)]
     if let Some(fd) = &self.vcs_svn_listener {
       env.push((ENV_VCS_SVN.to_owned(), fd.as_raw_fd().to_string()));
+      handed.push(fd.as_raw_fd());
     }
     // And the hold channel with every FUSE device (A-61), NFS connection (A-113) and copy (A-197, A-365) held, in one
     // table the spawn inherits (A-462): the daemon takes back the mounts it recovers and answers the connections the
@@ -797,9 +791,12 @@ impl Supervisor {
     let HeldHandoff {
       env: held_env,
       table: _table,
+      handed: held_handed,
     } = self.device_env()?;
     #[cfg(unix)]
     env.extend(held_env);
+    #[cfg(unix)]
+    handed.extend(held_handed);
     env.extend(self.environment.iter().cloned());
     // The daemon before this one may have died inside its republication of the profile; the anchor's is whole again
     // before the next reads it. No daemon runs now, so nothing else writes it.
@@ -813,7 +810,11 @@ impl Supervisor {
     // forked to clear close-on-exec in its child (2026-11-23, adacachy2).
     let restart = self.segment.supervision()?.generation() > 0;
     self.segment.supervision()?.record_start(0, now_ns, restart);
-    let child = match self.spawn_child(env) {
+    #[cfg(unix)]
+    let spawned = self.spawn_child(env, handed);
+    #[cfg(windows)]
+    let spawned = self.spawn_child(env);
+    let child = match spawned {
       Ok(child) => child,
       Err(refusal) => {
         self.segment.supervision()?.record_exit(false);
@@ -828,13 +829,18 @@ impl Supervisor {
     Ok(())
   }
 
-  /// Unix retains its descriptor-based spawn and the existing executable-identity check (A-145).
+  /// Unix retains its descriptor-based spawn and the existing executable-identity check (A-145). `handed` are the
+  /// descriptors the daemon inherits beside the segment's, each close-on-exec here and cleared in its child alone.
   #[cfg(unix)]
-  fn spawn_child(&mut self, env: Vec<(String, String)>) -> Result<Child, AnchorError> {
+  fn spawn_child(
+    &mut self,
+    env: Vec<(String, String)>,
+    mut handed: Vec<i32>,
+  ) -> Result<Child, AnchorError> {
     let mut command = own_image::command(&self.program, self.image)?;
     command.args(&self.args).envs(env);
-    #[cfg(target_os = "linux")]
-    hand_on_in_child(&mut command, self.segment.handed_descriptors()?);
+    handed.extend(self.segment.handed_descriptors()?);
+    hand_on_in_child(&mut command, handed);
     let child = command.spawn().map_err(|error| AnchorError::Spawn {
       code: error.raw_os_error(),
     })?;
@@ -1232,13 +1238,17 @@ mod lifetime {
   }
 }
 
-/// Clears close-on-exec on `numbers` in the spawned child alone, between its fork and its exec: the segment's and the
-/// content object's descriptors are close-on-exec in the anchor, so no other child it starts inherits them, and the
-/// daemon inherits each at the number its environment names ([`AnchorSegment::handed_descriptors`]). Until 2026-11-23
-/// every start made an inheritable duplicate of both and never closed it: an anchor started 7 times held 8 descriptors
-/// of each, and its seventh daemon inherited 7 of each
-/// (docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md).
-#[cfg(target_os = "linux")]
+/// Clears close-on-exec on `numbers` in the spawned child alone, between its fork and its exec: every descriptor the
+/// anchor hands a daemon is close-on-exec in the anchor, so no other child of its process inherits it, and the daemon
+/// inherits each at the number its environment names. These are the segment's and the content object's descriptors on
+/// Linux ([`AnchorSegment::handed_descriptors`]), and on every Unix the held listeners, the fleet's serve sockets, the
+/// hold table's descriptors and the rendezvous ([`Supervisor::hand_on_descriptor`]). Until 2026-11-23 every start made
+/// an inheritable duplicate of both objects and never closed it: an anchor started 7 times held 8 descriptors of each,
+/// and its seventh daemon inherited 7 of each (docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md).
+/// Until 2026-11-27 the listeners and the table's descriptors were inheritable in the anchor itself, so any other child
+/// of its process kept them for its life
+/// (docs/bugs/2026-11-27-an-anchors-held-sockets-reached-every-child-of-their-holders-process.md).
+#[cfg(unix)]
 fn hand_on_in_child(command: &mut std::process::Command, numbers: Vec<i32>) {
   use std::os::unix::process::CommandExt;
   if numbers.is_empty() {
@@ -1247,8 +1257,9 @@ fn hand_on_in_child(command: &mut std::process::Command, numbers: Vec<i32>) {
   // SAFETY: the closure runs in the child between its fork and its exec and makes one `fcntl(F_SETFD)` per number in
   // `numbers`, which was moved in and allocated before the fork, returning the error it reads: no allocation, no lock
   // and no other state, which is what `pre_exec` asks. Each number is open in the child for its one call, since the
-  // fork copied this process's descriptor table, in which the segment holds both objects open through the spawn; the
-  // flag cleared is the child's table's own, so this process's descriptors stay close-on-exec.
+  // fork copied this process's descriptor table, in which the supervisor holds every one open through the spawn (the
+  // segment its objects, the supervisor its listeners and table, the owner the rendezvous); the flag cleared is the
+  // child's table's own, so this process's descriptors stay close-on-exec.
   unsafe {
     command.pre_exec(move || {
       for &number in &numbers {

@@ -84,6 +84,12 @@
 >   - `an_anchor_started_again_and_again_hands_each_daemon_its_objects_once`: `[8, 8]` after 7 starts, then `[1, 1]`.
 >   - `a_claim_refused_for_want_of_a_descriptor_leaves_none_of_its_region`: `remaining=1`, then 0.
 >   - Doc: docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md.
+> - **Amended 2026-11-27 (A-931, w-interop; main's TSan sweep):** what A-878 left inheritable in the anchor (its
+>   listeners, the rendezvous, its hold table) reached every child of a process an anchor shares (tests, embeddings):
+>   an unrelated shell held a held rendezvous (run 45993337450). Each is now close-on-exec in the anchor and cleared in
+>   the daemon's child alone, on every Unix. Red then green: `a_child_spawned_beside_a_held_rendezvous_holds_none_of_it`;
+>   with it `a_held_listener_reaches_its_daemon_alone`. OWED (main): the TSan lane and the anchor's cross-process tests
+>   on Linux. Doc: docs/bugs/2026-11-27-an-anchors-held-sockets-reached-every-child-of-their-holders-process.md.
 > **Open (Windows, recorded, not changed):** a map reply whose operation was abandoned is dropped on arrival
 > (`Client::buffer`'s `unawaited_dropped` branch), so the section handle the daemon duplicated into the client stays in
 > its table, and the daemon keeps the copy for the client until its release or reap. Closing the handle there is one
@@ -868,7 +874,8 @@
 > where one has. `landing.apply`'s remaining unit
 > was its begin's plan of a replay's reads (4.46 ms debug), made since only where a run is unread; a replay's plan and
 > the scan of the runs are still one unit each, owed their slicing. Next, by size:
-> `stage.judging` (5.8 ms debug, move), `stage.recording` (5.0-5.3) and `stage.check` (3.8-4.2); the landing's
+> `stage.judging` (5.8 ms debug, move: a directory removal's children are counted a unit a step since; the resolution's
+> end, `split_copies`, 5.86 ms whole, is left), `stage.recording` (5.0-5.3) and `stage.check` (3.8-4.2); the landing's
 > publication (9.3-24.8 ms since today's merges) is A-930's image cut, w-perf's. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
