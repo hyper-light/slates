@@ -40,6 +40,32 @@ pub(super) fn clear_waiting(repository: &GitRepository) {
   let _cleared = repository.waiting();
 }
 
+/// Scoped owner of `repository`'s shared `waiting` cell for one synchronous shard turn: clears
+/// any stale wait on entry, lets the turn capture its own [`Waited`] via [`Self::take`], and
+/// drains the cell on drop so early `?` returns never leak a wait across concurrent pushes.
+pub(super) struct WaitingScope<'r> {
+  repository: &'r GitRepository,
+}
+
+impl<'r> WaitingScope<'r> {
+  /// Clears any stale wait on `repository` and guards the remainder of the current shard turn.
+  pub(super) fn enter(repository: &'r GitRepository) -> Self {
+    clear_waiting(repository);
+    Self { repository }
+  }
+
+  /// Synchronously drains and returns the let-go window noted during this turn, if any.
+  pub(super) fn take(self) -> Option<Waited> {
+    self.repository.waiting()
+  }
+}
+
+impl Drop for WaitingScope<'_> {
+  fn drop(&mut self) {
+    clear_waiting(self.repository);
+  }
+}
+
 /// Hashes `waited`'s pack identity and byte offset into a 64-bit BLAKE3 prefix used as a progress
 /// token by `away()` callers (`unpack::Reader`, `receive::Checking`, `receive::Verdicts`).
 ///
@@ -320,5 +346,34 @@ mod tests {
       ),
       (None, None, None)
     );
+  }
+
+  /// §4.17.2 (no-shared-writes `WaitingScope` invariant): do enter a `WaitingScope` over a
+  /// repository holding a stale wait, record a new wait, and capture it via `take`; then enter a
+  /// second `WaitingScope`, record a wait, and drop the scope without `take` (simulating an early
+  /// `?` return). Expect: entry clears any stale wait, `take` returns the turn's own wait while
+  /// draining the shared cell to `None`, and drop always drains the shared cell to `None`.
+  #[test]
+  fn waiting_scope_clears_on_entry_captures_on_take_and_drains_on_drop() {
+    let repository = GitRepository::new(ObjectFormat::Sha1);
+    plant_stale_wait(&repository);
+
+    let scope = WaitingScope::enter(&repository);
+    assert_eq!(repository.peek_waiting(), None);
+    let own = Waited {
+      pack: ContentId::of(b"own-pack"),
+      len: STALE_PACK_LEN,
+      offset: STALE_WAIT_OFFSET.saturating_mul(2),
+    };
+    repository.wait_for(own);
+    let captured = scope.take();
+    assert_eq!((captured, repository.peek_waiting()), (Some(own), None));
+
+    {
+      let _early_exit = WaitingScope::enter(&repository);
+      repository.wait_for(own);
+      assert_eq!(repository.peek_waiting(), Some(own));
+    }
+    assert_eq!(repository.peek_waiting(), None);
   }
 }

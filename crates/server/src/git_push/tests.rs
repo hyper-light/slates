@@ -2005,7 +2005,7 @@ pub(crate) async fn homed_drive(
       Answering::Turned => {
         slates_rt::futures::yield_now().await;
         // As the edges do (goal 93 item 2b(b), push reader (b)): the window a step met let go, brought back.
-        crate::vcs_store::upload::brought_back_waited(repository).await;
+        push.bring_back_waited().await;
         if let Some(asked) = push.take_homing() {
           let (origin, shards) =
             with_state(|state| (state.shard, state.shards.clone())).ok_or("no state")?;
@@ -2439,13 +2439,7 @@ fn t_goal93_a_whole_clone_of_a_line_with_an_annotated_tag_of_every_commit_is_who
     // daemon serves a clone once its encoding has run.
     for round in ["before the encoding", "from the kept fragments"] {
       if round == "from the kept fragments" {
-        let mut turns = 0usize;
-        while crate::vcs_store::git_encode::turn(state, repository)
-          != crate::vcs_store::git_encode::Turned::Idle
-        {
-          turns += 1;
-          assert!(turns < ENCODE_TURNS_BOUND, "an encoding that never ended");
-        }
+        let turns = encode_synchronous_to_idle(state, repository);
         let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
         eprintln!(
           "goal 93 tagged line: {} versions encoded in {turns} turns",
@@ -2535,15 +2529,7 @@ fn t_goal93_a_clone_answered_while_the_encoding_is_under_way_is_whole() {
     let wanting = wants.clone();
     // A round: a few turns of the encoding, then a fetch of every ref's object as a clone that stopped waiting asks.
     let (fetched, idle) = crate::daemon::observe_first(&daemon, move |state| {
-      let mut idle = false;
-      for _ in 0..ENCODING_TURNS_BETWEEN_FETCHES {
-        if crate::vcs_store::git_encode::turn(state, repository)
-          == crate::vcs_store::git_encode::Turned::Idle
-        {
-          idle = true;
-          break;
-        }
-      }
+      let idle = encode_synchronous_steps(state, repository, ENCODING_TURNS_BETWEEN_FETCHES);
       (fetched_ids(state, repository, &wanting), idle)
     });
     fetches += 1;
@@ -2694,18 +2680,143 @@ fn r16_history() -> PushedHistory {
   (objects, named)
 }
 
-/// Turns `turn` a poll at a time on `daemon` until it answers `idle`, at most [`ENCODE_TURNS_BOUND`] times: the turns.
-fn turned_to_idle<T: PartialEq + Send + 'static>(
-  daemon: &crate::daemon::Daemon,
-  turn: impl Fn(&mut ShardState) -> T + Clone + Send + 'static,
-  idle: T,
-) -> usize {
-  let mut turns = 0usize;
-  while crate::daemon::observe_first(daemon, turn.clone()) != idle {
-    turns += 1;
-    assert!(turns < ENCODE_TURNS_BOUND, "a turn that never ended");
+/// Turns `repository`'s encoding synchronously until [`crate::vcs_store::git_encode::Turned::Idle`]
+/// (for tests whose landed packs stay resident), panicking on an unexpected let-go wait or overrun.
+fn encode_synchronous_to_idle(state: &mut ShardState, repository: RepositoryId) -> usize {
+  use crate::vcs_store::git_encode::{Turned, turn};
+  let mut turns = 0_usize;
+  loop {
+    match turn(state, repository) {
+      Turned::Idle => return turns,
+      Turned::More => {
+        turns += 1;
+        assert!(turns < ENCODE_TURNS_BOUND, "an encoding that never ended");
+      }
+      Turned::Waiting(waited) => {
+        panic!("unexpected let-go wait in synchronous encoding: {waited:?}");
+      }
+    }
   }
-  turns
+}
+
+/// Runs at most `steps` synchronous turns of `repository`'s encoding, returning whether it reached
+/// [`crate::vcs_store::git_encode::Turned::Idle`] and panicking on an unexpected let-go wait.
+fn encode_synchronous_steps(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  steps: usize,
+) -> bool {
+  use crate::vcs_store::git_encode::{Turned, turn};
+  for _ in 0..steps {
+    match turn(state, repository) {
+      Turned::More => {}
+      Turned::Idle => return true,
+      Turned::Waiting(waited) => {
+        panic!("unexpected let-go wait in synchronous encode round: {waited:?}");
+      }
+    }
+  }
+  false
+}
+
+/// Drives `repository`'s derivation asynchronously on `daemon`'s first shard via
+/// [`crate::vcs_store::git_derive::derive_for_read`], bringing back any let-go pack windows.
+fn derive_to_idle(daemon: &crate::daemon::Daemon, repository: RepositoryId) {
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(daemon, move |_| {
+    let task = slates_rt::futures::spawn(async move {
+      crate::vcs_store::git_derive::derive_for_read(repository).await;
+      let _ = sent.send(());
+    })
+    .expect("the derivation task");
+    slates_rt::futures::detach(task).expect("the derivation task detached");
+  });
+  got.recv().expect("the derivation task reported");
+}
+
+/// Pins and brings back `waited`'s pack window on the current shard, returning the pin once
+/// resident.
+async fn bring_back_pinned(
+  waited: slates_git::store::packed::Waited,
+) -> Result<crate::vcs_store::named_objects::WindowPin, String> {
+  let window = crate::state::with_state(|state| {
+    state
+      .vcs_stores
+      .content()?
+      .window_holding(&waited.pack, waited.len, waited.offset)
+      .map(|(window, _, _)| window)
+  })
+  .flatten()
+  .ok_or_else(|| format!("no window holding {waited:?}"))?;
+  let pin = crate::vcs_store::named_objects::WindowPin::of(window);
+  crate::vcs_store::upload::bring_back_within(waited)
+    .await
+    .map_err(|refused| format!("bring_back failed for {waited:?}: {refused:?}"))?;
+  let resident = crate::state::with_state(|state| {
+    state
+      .vcs_stores
+      .content()
+      .is_some_and(|content| !content.is_away(&window))
+  })
+  .unwrap_or(false);
+  if !resident {
+    return Err(format!("window stayed away after bring_back: {waited:?}"));
+  }
+  Ok(pin)
+}
+
+/// Drives `repository`'s encoding asynchronously on the current shard until
+/// [`crate::vcs_store::git_encode::Turned::Idle`], bringing back let-go pack windows and verifying
+/// no turn leaves `Repository::waiting` populated.
+async fn encode_stepped(repository: RepositoryId) -> Result<usize, String> {
+  use crate::vcs_store::git_encode::{Turned, turn};
+  let mut turns = 0_usize;
+  let mut pinned = None;
+  loop {
+    let (turned, leaked) = crate::state::with_state_counted(|state| {
+      pinned = None;
+      let turned = turn(state, repository);
+      let leaked = state
+        .vcs_stores
+        .git_ref(repository)
+        .and_then(|(_, git)| git.repository.peek_waiting());
+      (turned, leaked)
+    })
+    .ok_or_else(|| "no shard state for encoding".to_owned())?;
+    if let Some(waited) = leaked {
+      return Err(format!(
+        "git_encode::turn leaked shared waiting: {waited:?}"
+      ));
+    }
+    match turned {
+      Turned::Idle => return Ok(turns),
+      Turned::More => slates_rt::futures::yield_now().await,
+      Turned::Waiting(waited) => {
+        pinned = Some(bring_back_pinned(waited).await?);
+      }
+    }
+    turns = turns.saturating_add(1);
+    if turns >= ENCODE_TURNS_BOUND {
+      return Err(format!("an encoding that never ended after {turns} turns"));
+    }
+  }
+}
+
+/// Drives `repository`'s encoding asynchronously on `daemon`'s first shard until idle, bringing
+/// back any let-go pack windows, and returns the turns taken.
+fn encode_to_idle(daemon: &crate::daemon::Daemon, repository: RepositoryId) -> usize {
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(daemon, move |_| {
+    let task = slates_rt::futures::spawn(async move {
+      let _ = sent.send(encode_stepped(repository).await);
+    })
+    .expect("the encoding task");
+    slates_rt::futures::detach(task).expect("the encoding task detached");
+  });
+  got
+    .recv()
+    .expect("the encoding task reported")
+    .expect("the encoding finished")
 }
 
 /// What every version of each of `names`' refs in `repository` brought, summed (D(k), what its fragments encode), and the
@@ -2803,7 +2914,7 @@ async fn stepped_drive(repository: RepositoryId, request: &[u8]) -> Result<Vec<V
     match step {
       Answering::Answered(received) => return Ok(reasons(&received)),
       Answering::Turned => {
-        crate::vcs_store::upload::brought_back_waited(repository).await;
+        push.bring_back_waited().await;
         carry_awaited(&mut push).await?;
       }
       #[cfg(unix)]
@@ -2845,11 +2956,7 @@ fn t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring
     reasons_pushed.iter().all(|reason| reason == b"ok"),
     "{reasons_pushed:?}"
   );
-  turned_to_idle(
-    &daemon,
-    move |state| crate::vcs_store::git_derive::turn(state, repository),
-    crate::vcs_store::git_derive::Turned::Idle,
-  );
+  derive_to_idle(&daemon, repository);
   let names: Vec<Vec<u8>> = named.iter().map(|(_, name)| name.clone()).collect();
   let (brought, searched) = crate::daemon::observe_first(&daemon, move |state| {
     brought_and_searched(state, repository, &names)
@@ -2863,11 +2970,7 @@ fn t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring
     searched > 0 && searched <= u64::try_from(R16_HISTORY).unwrap(),
     "the search back met {searched} commits"
   );
-  let turns = turned_to_idle(
-    &daemon,
-    move |state| crate::vcs_store::git_encode::turn(state, repository),
-    crate::vcs_store::git_encode::Turned::Idle,
-  );
+  let turns = encode_to_idle(&daemon, repository);
   eprintln!("A-850 r16 shape: the encoding ended in {turns} turns");
   let pushed_ids: std::collections::BTreeSet<ObjectId> = objects
     .iter()
@@ -3472,9 +3575,7 @@ fn t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie() {
     let deltas = u64::try_from(TAGGED_LINE - 1).unwrap();
     assert_the_stream_sent_every_pushed_entry_as_it_lies(&counted_streamed, deltas, objects.len());
     assert_whole_clone(&streamed, objects.len());
-    while crate::vcs_store::git_encode::turn(state, repository)
-      != crate::vcs_store::git_encode::Turned::Idle
-    {}
+    let _ = encode_synchronous_to_idle(state, repository);
     let (answer, counted) =
       crate::vcs_store::upload::tests::fetched_with_counters(state, (repository, &owner()), &fetch);
     let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
@@ -3597,9 +3698,7 @@ fn t_a859_an_encoding_places_a_pushed_deltas_base_before_it() {
     while crate::vcs_store::git_derive::turn(state, repository)
       != crate::vcs_store::git_derive::Turned::Idle
     {}
-    while crate::vcs_store::git_encode::turn(state, repository)
-      != crate::vcs_store::git_encode::Turned::Idle
-    {}
+    let _ = encode_synchronous_to_idle(state, repository);
     let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
     let reused = (
       count(crate::vcs_store::git_encode::REUSED_DELTAS),
@@ -5680,6 +5779,7 @@ fn step_direct_server_judge(
     restaging,
     preparing,
     peel_away,
+    waited: &mut None,
     making_room,
     door,
   };
@@ -5825,6 +5925,7 @@ fn assert_server_judge_fails_closed_without_git_store(state: &mut ShardState) {
       restaging,
       preparing,
       peel_away,
+      waited: &mut None,
       making_room,
       door,
     };
@@ -5950,4 +6051,583 @@ fn t_rt_git_atomic_unborn_default_branch_with_existing_other_branch() {
       );
     }
   });
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Red-team regression (`rt-git-waiting`): concurrent push `Repository::waiting` race elimination.
+
+/// Shape: 4 KiB content-store window for the in-memory let-go pack waiting test.
+const WAIT_TEST_WINDOW: usize = 1 << 12;
+
+/// Shape: content-store budget for the in-memory let-go pack waiting test.
+const WAIT_TEST_BUDGET: u64 = 1 << 24;
+
+/// Shape: pack chunk size fed to `input_pipelined` in the concurrent waiting regression test.
+const WAIT_FEED_CHUNK: usize = 4096;
+
+/// Shape: generous wait bound for a single-shard async concurrent push test task.
+const WAIT_TASK_TIMEOUT_SECS: u64 = 60;
+
+/// Empty `Greens` stub for exercising `Verdicts::prepare` (`peel_away`) in pure RAM without a
+/// daemon or `TestStore`.
+struct EmptyGreens;
+
+impl slates_git::receive::works::Greens for EmptyGreens {
+  fn read<T>(
+    &self,
+    _name: &[u8],
+    _with: impl FnOnce(slates_git::receive::works::GreenRead<'_>) -> T,
+  ) -> Option<T> {
+    None
+  }
+
+  fn version_of(
+    &self,
+    _green: u64,
+    _head: &ObjectId,
+  ) -> Option<slates_git::receive::works::Version> {
+    None
+  }
+
+  fn base_of_create<T>(
+    &self,
+    _parent: Option<&ObjectId>,
+    _with: impl FnOnce(
+      slates_git::receive::works::GreenRead<'_>,
+      slates_git::receive::works::Version,
+    ) -> T,
+  ) -> Option<T> {
+    None
+  }
+
+  fn holding_head<T>(
+    &self,
+    _head: &ObjectId,
+    _with: impl FnOnce(
+      slates_git::receive::works::GreenRead<'_>,
+      slates_git::receive::works::Version,
+    ) -> T,
+  ) -> Option<T> {
+    None
+  }
+
+  fn is_unborn_default(&self, _name: &[u8]) -> bool {
+    false
+  }
+}
+
+/// Builds a pack holding `objects` whole (stored zlib), returning `(pack_bytes, offsets)`.
+pub(crate) fn whole_pack_with_offsets(
+  objects: &[(slates_git::object_name::Kind, Vec<u8>)],
+) -> (Vec<u8>, Vec<u64>) {
+  use slates_git::entry::{self, Header, Representation};
+  let mut pack = Vec::new();
+  let count = u32::try_from(objects.len()).unwrap();
+  let mut writer = slates_git::pack::Writer::new(ObjectFormat::Sha1, count, &mut pack);
+  let mut at = entry::PACK_HEADER_LEN;
+  let mut offsets = Vec::with_capacity(objects.len());
+  for (kind, content) in objects {
+    offsets.push(at);
+    let header = Header {
+      representation: Representation::Whole(*kind),
+      size: u64::try_from(content.len()).unwrap(),
+    };
+    let deflated = stored_zlib(content);
+    entry::write(header, at, &mut writer).unwrap();
+    slates_git::out::Out::put(&mut writer, &deflated);
+    at += entry::written_len(header, at).unwrap() + u64::try_from(deflated.len()).unwrap();
+  }
+  writer.finish().unwrap();
+  (pack, offsets)
+}
+
+/// Commits `objects` as one landed pack on `green` in `repository`/`store` and lets every pack
+/// window go (`away`), returning the raw pack bytes so the test can bring any window back in RAM.
+fn commit_and_let_go_pack(
+  store: &mut slates_vcs::ContentStore,
+  repository: &mut slates_git::store::Repository,
+  green: u64,
+  head: ObjectId,
+  objects: &[(slates_git::object_name::Kind, Vec<u8>)],
+) -> Vec<u8> {
+  let (pack, offsets) = whole_pack_with_offsets(objects);
+  let naming = slates_git::store::GitNaming {
+    format: ObjectFormat::Sha1,
+  };
+  let mut push = slates_git::store::Push::new(ObjectFormat::Sha1);
+  push.extend_pack(&pack);
+  for ((kind, content), offset) in objects.iter().zip(offsets) {
+    let incoming = slates_git::store::Incoming {
+      kind: *kind,
+      content: content.as_slice(),
+      claimed: None,
+      depth: 0,
+    };
+    push
+      .admit_placed::<_, core::convert::Infallible>(store, &naming, (incoming, offset))
+      .unwrap();
+  }
+  repository.seal(store, &mut push).unwrap();
+  repository.stage(store, &mut push).unwrap();
+  let mv = repository.admit(store, &push, green, Some(head)).unwrap();
+  repository.commit(store, &mut push, &[mv]).unwrap();
+  push.abandon(store).unwrap();
+  for window in pack.chunks(WAIT_TEST_WINDOW).map(slates_vcs::ContentId::of) {
+    assert!(store.mark_landed(&window));
+    store.let_go_landed(&window, None).unwrap();
+  }
+  repository.let_go_recent(store);
+  pack
+}
+
+/// Runs one `Verdicts::prepare` (`peel_away`) turn for `command` over `repository`/`store` inside
+/// a [`super::intake::WaitingScope`], returning `(ready, away_seen, captured_waited)`.
+fn run_scoped_peel_turn(
+  store: &slates_vcs::ContentStore,
+  repository: &slates_git::store::Repository,
+  command: &slates_git::receive::Command,
+  peel_away: Option<u64>,
+) -> (bool, Option<u64>, Option<slates_git::store::packed::Waited>) {
+  let waiting = super::intake::WaitingScope::enter(repository);
+  let indexed = super::intake::TrackedIndexed::new(repository, store, u64::MAX);
+  let empty_push = slates_git::store::Push::new(ObjectFormat::Sha1);
+  let objects = slates_git::store::views::PushedObjects::new(repository, store, &empty_push);
+  let verdicts =
+    slates_git::receive::works::Verdicts::new(&EmptyGreens, &indexed, &objects, [0; 32], u64::MAX)
+      .peeled(peel_away);
+  let mut admission = slates_git::Admission::new(u64::MAX);
+  let pushed = slates_git::receive::Pushed::new(&[], None, &mut admission).unwrap();
+  let mut preparing = None;
+  let env = slates_pace::Env {
+    clock: || 0,
+    waiting: || false,
+    quantum_ns: 1,
+    ceiling_ns: 1,
+    target_ppm: 1,
+  };
+  let slices = slates_merge::pace::Slices {
+    copy_bytes: 1,
+    hash_bytes: 1,
+  };
+  let ready = verdicts.prepare(command, &pushed, &mut preparing, (0, env), slices);
+  (ready, verdicts.away_seen(), waiting.take())
+}
+
+/// Restores `waited`'s window from `pack` back into `store` in pure RAM.
+fn restore_pack_window(
+  store: &mut slates_vcs::ContentStore,
+  pack: &[u8],
+  waited: slates_git::store::packed::Waited,
+) {
+  let (window, start, len) = store
+    .away_window(&waited.pack, waited.len, waited.offset)
+    .expect("waited window is away");
+  let from = usize::try_from(start).unwrap();
+  let to = from + usize::try_from(len).unwrap();
+  store.bring_back(&window, &pack[from..to]).unwrap();
+}
+
+/// Pure in-memory non-`TestStore` regression (`rt-git-waiting`): two concurrent pushes referencing
+/// commits in distinct let-go packs interleave `WaitingScope` turns on one shared `Repository`.
+/// Push 1 hits `Away` on pack A; Push 2 runs a turn hitting `Away` on pack B (which under the old
+/// shared-cell design cleared and overwrote `Repository::waiting`) before Push 1 brings back its
+/// window. Expect: `Repository::waiting` is drained to `None` after every turn, Push 1 retains its
+/// own `Waited` for pack A, Push 2 retains its own `Waited` for pack B, and both retries succeed
+/// with `ready == true` and `away_seen == None`.
+#[test]
+fn t_rt_git_in_memory_waiting_scope_survives_interleaved_push() {
+  use slates_git::object_name::Kind;
+  let mut store = slates_vcs::ContentStore::new(WAIT_TEST_BUDGET, WAIT_TEST_WINDOW).unwrap();
+  let mut repository = slates_git::store::Repository::new(ObjectFormat::Sha1);
+  let mut entries_a = Vec::new();
+  let (c0, c0_bytes, _, t0_bytes, _, b0_bytes) = storm_commit(0, None, &mut entries_a);
+  let pack_a = commit_and_let_go_pack(
+    &mut store,
+    &mut repository,
+    1,
+    c0,
+    &[
+      (Kind::Commit, c0_bytes),
+      (Kind::Tree, t0_bytes),
+      (Kind::Blob, b0_bytes),
+    ],
+  );
+  let mut entries_b = Vec::new();
+  let (c1, c1_bytes, _, t1_bytes, _, b1_bytes) = storm_commit(1, None, &mut entries_b);
+  let pack_b = commit_and_let_go_pack(
+    &mut store,
+    &mut repository,
+    2,
+    c1,
+    &[
+      (Kind::Commit, c1_bytes),
+      (Kind::Tree, t1_bytes),
+      (Kind::Blob, b1_bytes),
+    ],
+  );
+
+  let cmd_a = slates_git::receive::Command {
+    old: ObjectId::null(ObjectFormat::Sha1),
+    new: c0,
+    name: b"refs/heads/from-a".to_vec(),
+  };
+  let cmd_b = slates_git::receive::Command {
+    old: ObjectId::null(ObjectFormat::Sha1),
+    new: c1,
+    name: b"refs/heads/from-b".to_vec(),
+  };
+
+  let (ready_a1, seen_a1, waited_a) = run_scoped_peel_turn(&store, &repository, &cmd_a, None);
+  assert_eq!((ready_a1, repository.peek_waiting()), (false, None));
+  let waited_a = waited_a.expect("push A captured its own pack A wait");
+
+  // Interleaved Push B runs before Push A brings back pack A.
+  let (ready_b1, seen_b1, waited_b) = run_scoped_peel_turn(&store, &repository, &cmd_b, None);
+  assert_eq!((ready_b1, repository.peek_waiting()), (false, None));
+  let waited_b = waited_b.expect("push B captured its own pack B wait");
+  assert_ne!(waited_a.pack, waited_b.pack);
+
+  // Non-vacuity negative control: if Push A did NOT bring back pack A (what happened when Push B
+  // cleared/overwrote the shared cell), retrying with the same `seen_a1` stops waiting and fails.
+  let (clobbered_ready, _, _) = run_scoped_peel_turn(&store, &repository, &cmd_a, seen_a1);
+  assert!(
+    clobbered_ready,
+    "repeating the same away token without bring-back falls through to refusal"
+  );
+  let clobbered_declined = {
+    let indexed = super::intake::TrackedIndexed::new(&repository, &store, u64::MAX);
+    let empty_push = slates_git::store::Push::new(ObjectFormat::Sha1);
+    let objects = slates_git::store::views::PushedObjects::new(&repository, &store, &empty_push);
+    let verdicts = slates_git::receive::works::Verdicts::new(
+      &EmptyGreens,
+      &indexed,
+      &objects,
+      [0; 32],
+      u64::MAX,
+    );
+    let mut admission = slates_git::Admission::new(u64::MAX);
+    let pushed = slates_git::receive::Pushed::new(&[], None, &mut admission).unwrap();
+    verdicts.judge(&cmd_a, &pushed).unwrap_err()
+  };
+  assert_eq!(
+    clobbered_declined.reason,
+    slates_git::receive::MISSING_OBJECTS
+  );
+
+  // With each push owning its captured `Waited`, both packs are brought back and both retries pass.
+  restore_pack_window(&mut store, &pack_a, waited_a);
+  restore_pack_window(&mut store, &pack_b, waited_b);
+
+  let (ready_a2, seen_a2, waited_a2) = run_scoped_peel_turn(&store, &repository, &cmd_a, seen_a1);
+  let (ready_b2, seen_b2, waited_b2) = run_scoped_peel_turn(&store, &repository, &cmd_b, seen_b1);
+  assert_eq!(
+    (ready_a2, seen_a2, waited_a2, ready_b2, seen_b2, waited_b2),
+    (true, None, None, true, None, None)
+  );
+}
+
+/// Starts a `ReceivePack` on `state`, feeds `req` via `input` + `end`, and returns it.
+fn start_and_feed_push(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  req: &[u8],
+) -> ReceivePack {
+  let mut push = ReceivePack::start(
+    state,
+    (&owner(), repository),
+    false,
+    &mut Vec::new(),
+    Unpresented,
+  )
+  .expect("push starts");
+  push.input(state, req).expect("input");
+  push.end(state).expect("end");
+  push
+}
+
+/// Steps `push` on `state` until it pauses with its own captured `push.waited`, asserting the
+/// shared `Repository::waiting` cell is drained to `None` upon leaving the turn.
+fn step_push_until_waited(state: &mut ShardState, push: &mut ReceivePack, out: &mut Vec<u8>) {
+  loop {
+    match push.answer_step(state, out).expect("answer_step") {
+      Answering::Turned if push.waited.is_some() => break,
+      Answering::Turned => {}
+      other => panic!("expected push to pause on let-go pack window, got {other:?}"),
+    }
+  }
+  let shared = state
+    .vcs_stores
+    .git_ref(push.repository())
+    .and_then(|(_, git)| git.repository.peek_waiting());
+  assert_eq!(
+    shared, None,
+    "shared Repository::waiting must be drained synchronously at turn exit"
+  );
+}
+
+/// Finishes `push` asynchronously after its first bring-back, handling any further waited windows
+/// or homing/landing steps.
+async fn finish_push_after_waited(
+  push: &mut ReceivePack,
+  out: &mut Vec<u8>,
+) -> Result<Received, String> {
+  use crate::state::with_state;
+  loop {
+    let step = with_state(|state| push.answer_step(state, out))
+      .ok_or("no state for answer_step")?
+      .map_err(|failed| format!("answer_step failed: {failed:?}"))?;
+    match step {
+      Answering::Answered(received) => return Ok(*received),
+      Answering::Turned => {
+        push.bring_back_waited().await;
+        carry_awaited(push).await?;
+        slates_rt::futures::yield_now().await;
+      }
+      #[cfg(unix)]
+      Answering::Hook(_) => return Err("unexpected hook".to_owned()),
+    }
+  }
+}
+
+/// Interleaving 1 (clear clobber): `push_1` hits `Away` in `build_turn` (`peel_away`) on a let-go
+/// pack; before `push_1.bring_back_waited().await`, sibling `push_2` runs `input` + `end` on the
+/// same repository (clearing `Repository::waiting`). `push_1` must still bring back its own waited
+/// window and commit `ok`.
+async fn drive_clear_clobber(
+  repository: RepositoryId,
+  target_commit: ObjectId,
+  clobber_req: Vec<u8>,
+) -> Result<Received, String> {
+  use crate::state::with_state;
+  let req_1 = request(
+    &[("", &target_commit.to_string(), b"refs/heads/clear-race")],
+    CAPABILITIES,
+    empty_pack(),
+  );
+  let mut out_1 = Vec::new();
+  let mut push_1 = with_state(|state| {
+    let mut push = start_and_feed_push(state, repository, &req_1);
+    step_push_until_waited(state, &mut push, &mut out_1);
+    push
+  })
+  .ok_or("no state for push_1")?;
+
+  // Sibling push runs on the same repository before push_1 calls `bring_back_waited().await`.
+  let push_2 = with_state(|state| start_and_feed_push(state, repository, &clobber_req))
+    .ok_or("no state for push_2")?;
+  drop(push_2);
+
+  push_1.bring_back_waited().await;
+  finish_push_after_waited(&mut push_1, &mut out_1).await
+}
+
+/// Interleaving 2 (overwrite clobber): `push_a` hits `Away` on let-go `pack_a`, then `push_b` hits
+/// `Away` on let-go `pack_b` before `push_a.bring_back_waited().await`; both then bring back their
+/// own captured windows and must commit `ok`.
+async fn drive_overwrite_clobber(
+  repository: RepositoryId,
+  commit_a: ObjectId,
+  commit_b: ObjectId,
+) -> Result<(Received, Received), String> {
+  use crate::state::with_state;
+  let req_a = request(
+    &[("", &commit_a.to_string(), b"refs/heads/from-pack-a")],
+    CAPABILITIES,
+    empty_pack(),
+  );
+  let req_b = request(
+    &[("", &commit_b.to_string(), b"refs/heads/from-pack-b")],
+    CAPABILITIES,
+    empty_pack(),
+  );
+  let (mut out_a, mut out_b) = (Vec::new(), Vec::new());
+  let (mut push_a, mut push_b) = with_state(|state| {
+    let mut push_a = start_and_feed_push(state, repository, &req_a);
+    step_push_until_waited(state, &mut push_a, &mut out_a);
+    let mut push_b = start_and_feed_push(state, repository, &req_b);
+    step_push_until_waited(state, &mut push_b, &mut out_b);
+    assert_ne!(
+      push_a.waited, push_b.waited,
+      "non-vacuity: concurrent pushes must wait on distinct let-go packs"
+    );
+    (push_a, push_b)
+  })
+  .ok_or("no state for overwrite clobber")?;
+
+  push_a.bring_back_waited().await;
+  push_b.bring_back_waited().await;
+  let rec_a = finish_push_after_waited(&mut push_a, &mut out_a).await?;
+  let rec_b = finish_push_after_waited(&mut push_b, &mut out_b).await?;
+  Ok((rec_a, rec_b))
+}
+
+/// Interleaving 3 (pipelined `DeferredResolve::Away` clobber): thin pack `push_thin` hits
+/// `DeferredResolve::Away` in `resolve_deferred_on_shard`, sibling `push_2` runs on the same
+/// repository before `push_thin.bring_back_waited().await`, and `push_thin` must still resolve and
+/// commit `ok`.
+async fn drive_deferred_resolve_clobber(
+  repository: RepositoryId,
+  thin_req: Vec<u8>,
+  clobber_req: Vec<u8>,
+) -> Result<Received, String> {
+  use crate::state::with_state;
+  let mut lender = crate::vcs_http::git::ThisShard;
+  let mut push_thin = with_state(|state| {
+    ReceivePack::start(
+      state,
+      (&owner(), repository),
+      false,
+      &mut Vec::new(),
+      Unpresented,
+    )
+  })
+  .ok_or("no state to start thin")?
+  .map_err(|failed| format!("thin start: {failed:?}"))?;
+  for piece in thin_req.chunks(WAIT_FEED_CHUNK) {
+    push_thin
+      .input_pipelined(&mut lender, piece)
+      .await
+      .ok_or("no state for input_pipelined")?
+      .map_err(|failed| format!("input_pipelined: {failed:?}"))?;
+  }
+  push_thin
+    .end_pipelined(&mut lender)
+    .await
+    .ok_or("no state for end_pipelined")?
+    .map_err(|failed| format!("end_pipelined: {failed:?}"))?;
+
+  with_state(|state| {
+    let (outcome, _) = push_thin
+      .resolve_deferred_on_shard(state)
+      .expect("resolve_deferred_on_shard");
+    assert_eq!(outcome, slates_git::unpack::DeferredResolve::Away);
+    assert!(push_thin.waited.is_some());
+    let shared = state
+      .vcs_stores
+      .git_ref(repository)
+      .and_then(|(_, git)| git.repository.peek_waiting());
+    assert_eq!(shared, None);
+  })
+  .ok_or("no state for resolve_deferred_on_shard")?;
+
+  let push_2 = with_state(|state| start_and_feed_push(state, repository, &clobber_req))
+    .ok_or("no state for sibling clobber")?;
+  drop(push_2);
+
+  push_thin.bring_back_waited().await;
+  while push_thin.is_resolving() {
+    push_thin
+      .resolve_step_pipelined(&mut lender)
+      .await
+      .ok_or("no state for resolve_step_pipelined")?
+      .map_err(|failed| format!("resolve_step_pipelined: {failed:?}"))?;
+  }
+  let mut out = Vec::new();
+  finish_push_after_waited(&mut push_thin, &mut out).await
+}
+
+/// Red-team regression (`rt-git-waiting`, §4.17.2): concurrent `ReceivePack` turns on one
+/// repository whose landed packs have been let go must never clobber each other's waited pack
+/// window across `.await` boundaries. Exercises (1) clear clobber on `build_turn`/`peel_away`,
+/// (2) two-pack overwrite clobber across concurrent pushes, and (3) clear clobber on pipelined
+/// `resolve_deferred_on_shard` (`DeferredResolve::Away`). Expect: every push commits `ok` with
+/// zero `missing necessary objects` / `unpacker error` refusals.
+#[test]
+fn t_rt_git_concurrent_pushes_interleaved_waiting_survives() {
+  use slates_git::object_name::Kind;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository =
+    crate::daemon::observe_first(&daemon, |state| git_repository(state, "wait-race"));
+
+  let mut entries = Vec::new();
+  let (c0, c0_bytes, t0, t0_bytes, _, b0_bytes) = storm_commit(0, None, &mut entries);
+  let pack_a = pack_of_objects(&[
+    (Kind::Commit, c0_bytes),
+    (Kind::Tree, t0_bytes.clone()),
+    (Kind::Blob, b0_bytes),
+  ]);
+  let req_a = request(
+    &[("", &c0.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack_a,
+  );
+  let (_, rec_a) = pushed_pipelined_in_steps(&daemon, repository, &req_a).expect("seed pack_a");
+  assert_eq!(reasons(&rec_a), [b"ok"]);
+
+  let (c1, c1_bytes, _, t1_bytes, _, b1_bytes) = storm_commit(1, Some(c0), &mut entries);
+  let pack_b = pack_of_objects(&[
+    (Kind::Commit, c1_bytes),
+    (Kind::Tree, t1_bytes),
+    (Kind::Blob, b1_bytes),
+  ]);
+  let req_b = request(
+    &[(&c0.to_string(), &c1.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack_b,
+  );
+  let (_, rec_b) = pushed_pipelined_in_steps(&daemon, repository, &req_b).expect("seed pack_b");
+  assert_eq!(reasons(&rec_b), [b"ok"]);
+
+  let clobber_req = request(
+    &[("", &c0.to_string(), b"refs/heads/sibling")],
+    CAPABILITIES,
+    empty_pack(),
+  );
+  let away_1 = count_away_pack_windows(&daemon, vec![pack_a.clone(), pack_b.clone()]);
+  assert!(away_1 >= 2, "expected both seeded packs away, got {away_1}");
+
+  let patience = std::time::Duration::from_secs(WAIT_TASK_TIMEOUT_SECS);
+  let clobber_for_clear = clobber_req.clone();
+  let rec_clear = crate::test_store::run_on_first(
+    &daemon,
+    move || drive_clear_clobber(repository, c0, clobber_for_clear.clone()),
+    patience,
+  )
+  .expect("clear clobber push");
+  assert_eq!(reasons(&rec_clear), [b"ok"]);
+
+  let away_2 = count_away_pack_windows(&daemon, vec![pack_a.clone(), pack_b.clone()]);
+  assert!(
+    away_2 >= 2,
+    "expected both packs let go again, got {away_2}"
+  );
+
+  let (rec_over_a, rec_over_b) = crate::test_store::run_on_first(
+    &daemon,
+    move || drive_overwrite_clobber(repository, c0, c1),
+    patience,
+  )
+  .expect("overwrite clobber pushes");
+  assert_eq!(
+    (reasons(&rec_over_a), reasons(&rec_over_b)),
+    (vec![b"ok".to_vec()], vec![b"ok".to_vec()])
+  );
+
+  let away_3 = count_away_pack_windows(&daemon, vec![pack_a, pack_b]);
+  assert!(
+    away_3 >= 2,
+    "expected both packs let go before thin race, got {away_3}"
+  );
+
+  let mut thin_entries = vec![(
+    "f00.txt".to_owned(),
+    slates_git::object_name::name_of(ObjectFormat::Sha1, Kind::Blob, b"storm-payload-00\n")
+      .unwrap(),
+  )];
+  let (c2, c2_bytes, _, t2_bytes, _, b2_bytes) = storm_commit(2, Some(c0), &mut thin_entries);
+  let (thin_pack, _) = thin_storm_pack(&c2_bytes, (t0, &t0_bytes), &t2_bytes, &b2_bytes);
+  let thin_req = request(
+    &[("", &c2.to_string(), b"refs/heads/thin-race")],
+    CAPABILITIES,
+    &thin_pack,
+  );
+  let rec_thin = crate::test_store::run_on_first(
+    &daemon,
+    move || drive_deferred_resolve_clobber(repository, thin_req.clone(), clobber_req.clone()),
+    patience,
+  )
+  .expect("deferred resolve clobber push");
+  assert_eq!(reasons(&rec_thin), [b"ok"]);
+
+  daemon.stop();
 }

@@ -380,8 +380,10 @@ where
   ) -> bool {
     // A-864's push readers (main 01a20182's r18: a push of a tag of a tag declined "an object it names cannot be read",
     // the tag it names read from a pack let go): a peel of the old or new value whose read met a let-go window is not
-    // ready, so the push's driver brings the window back (`brought_back_waited`) and the command is prepared again,
-    // never declined. Runs before `is_delete()` because `retire` peels `command.old` when checking `version_of`.
+    // ready, so the push captures the wait synchronously during its turn and brings the window back per push
+    // (`ReceivePack::bring_back_waited`, isolated from `git_encode::Turned::Waiting`), then prepares the command again
+    // instead of declining it. Runs before `is_delete()` because `retire` peels `command.old` when checking
+    // `version_of`.
     if self.peel_away(command, pushed) {
       return false;
     }

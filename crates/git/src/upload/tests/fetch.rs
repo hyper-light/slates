@@ -315,6 +315,121 @@ fn object_info_answers_the_sizes_stock_git_printed() {
   }
 }
 
+/// Counting wrapper over [`super::super::VisibleObjects`] asserting each OID lookup runs at most
+/// once per measure/emit pass (2x total, never 4x).
+struct CountingVisible<'g, 'r> {
+  inner: super::super::VisibleObjects<'g, 'r>,
+  lookups: core::cell::Cell<usize>,
+}
+
+impl ObjectInfo for CountingVisible<'_, '_> {
+  fn info(&self, id: &ObjectId) -> Option<ObjectMeta> {
+    self.lookups.set(self.lookups.get().saturating_add(1));
+    self.inner.info(id)
+  }
+}
+
+/// Non-vacuity test (Fix 2, §4.17.2 "A fetch" item 4): do answer a charged `object-info` request
+/// across visible, missing, and hidden OIDs through `upload::object_info_charged` with a counting
+/// `VisibleObjects` wrapper, and also verify admission refusal and wrong-format refusal. Expect:
+/// byte-exact output matching `object_info::answer`, exactly `2 * oids` visibility lookups (1
+/// measure + 1 emit, strictly less than `4 * oids`), and `<= oids` lookups on refusal.
+#[test]
+fn object_info_charged_avoids_double_measure_pass() {
+  let fixture = served::served();
+  let visible_refs = [served::REFS[0]];
+  let served = super::serving(&fixture, &visible_refs, super::MAIN_REF);
+  let graph = crate::store::StoreGraph::new(served.repository, served.store, served.refs);
+  let visible_oid = id(THIRD);
+  let missing_oid = id("1111111111111111111111111111111111111111");
+  let hidden_oid = id(TAG);
+  let oids = [visible_oid, missing_oid, hidden_oid];
+  let arguments = [
+    crate::v2::Line::lf(object_info::Argument::Size),
+    crate::v2::Line::lf(object_info::Argument::Type),
+    crate::v2::Line::lf(object_info::Argument::Oid(oids[0])),
+    crate::v2::Line::lf(object_info::Argument::Oid(oids[1])),
+    crate::v2::Line::lf(object_info::Argument::Oid(oids[2])),
+  ];
+  let counting = CountingVisible {
+    inner: super::super::VisibleObjects {
+      graph: &graph,
+      stored: object_info::Stored {
+        repository: served.repository,
+        content: served.store,
+      },
+    },
+    lookups: core::cell::Cell::new(0),
+  };
+
+  let mut admission = Admission::new(u64::MAX);
+  let bytes = super::super::object_info_charged(
+    &graph,
+    &arguments,
+    ObjectFormat::Sha1,
+    &counting,
+    &mut admission,
+  )
+  .unwrap();
+  let lookups = counting.lookups.get();
+  let expected_max = oids.len().saturating_mul(2);
+  let double_measured = oids.len().saturating_mul(4);
+  assert!(
+    lookups <= expected_max && lookups < double_measured,
+    "expected at most 2 * {} = {} lookups (strictly < {}), got {}",
+    oids.len(),
+    expected_max,
+    double_measured,
+    lookups
+  );
+  assert_eq!(lookups, expected_max);
+
+  let mut reference = Vec::new();
+  object_info::answer(
+    &arguments,
+    ObjectFormat::Sha1,
+    &counting.inner,
+    &mut reference,
+  )
+  .unwrap();
+  assert_eq!(bytes, reference);
+
+  // Refused past admission: only the measure pass runs (1 * oids lookups).
+  counting.lookups.set(0);
+  let mut tight = Admission::new(1);
+  let past = super::super::object_info_charged(
+    &graph,
+    &arguments,
+    ObjectFormat::Sha1,
+    &counting,
+    &mut tight,
+  );
+  assert!(matches!(past, Err(Refusal::PastAdmission(_))));
+  assert_eq!(counting.lookups.get(), oids.len());
+
+  // Refused on wire format mismatch: fails in pass 1 before emitting, <= 1 lookup.
+  counting.lookups.set(0);
+  let sha256_oid = ObjectId::from_hex(
+    ObjectFormat::Sha256,
+    b"a4ed1f355afb02d88cd291d0e4463910c5061ece48a49aa2b1539b9af973b286",
+  )
+  .unwrap();
+  let wrong_format = [
+    crate::v2::Line::lf(object_info::Argument::Size),
+    crate::v2::Line::lf(object_info::Argument::Oid(sha256_oid)),
+  ];
+  let mut roomy = Admission::new(u64::MAX);
+  let wire_err = super::super::object_info_charged(
+    &graph,
+    &wrong_format,
+    ObjectFormat::Sha1,
+    &counting,
+    &mut roomy,
+  );
+  assert!(matches!(wire_err, Err(Refusal::Wire(_))));
+  assert!(counting.lookups.get() <= 1);
+}
+
 /// Format: the tree `main:dir` names, which a `sparse:oid` filter cannot read patterns from (`fixtures/objects.txt`).
 const DIR_TREE: &str = "cc01dbca1db1ab97354bc849d5631a785fcb68ab";
 

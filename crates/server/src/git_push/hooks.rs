@@ -465,6 +465,7 @@ fn admitted<P>(
     restaging: &mut None,
     preparing: &mut None,
     peel_away: &mut None,
+    waited: &mut None,
     making_room: &mut None,
     door: &mut None,
   };

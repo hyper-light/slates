@@ -541,8 +541,21 @@ fn object_info_answer(
   // A note an earlier read left is not this request's (matching `upload/answer.rs` and
   // `store/upload.rs`): clear stale waiting state before proving visibility.
   let _ = served.repository.waiting();
+  object_info_charged(graph, arguments, format, &objects, admission)
+}
+
+/// Measures, charges to `admission`, and emits an `object-info` response using `objects` in two
+/// total passes (one measure pass + one write pass via [`object_info::write_answer_to`]), aborting
+/// with [`Refusal::Store`] on any store fault recorded on `graph`.
+fn object_info_charged(
+  graph: &StoreGraph<'_>,
+  arguments: &[Line<object_info::Argument>],
+  format: crate::object_name::ObjectFormat,
+  objects: &impl object_info::ObjectInfo,
+  admission: &mut Admission,
+) -> Result<Vec<u8>, Refusal> {
   let (bytes, ()) = charged(admission, |out| {
-    object_info::answer(arguments, format, &objects, out).map_err(Refusal::Wire)?;
+    object_info::write_answer_to(arguments, format, objects, out).map_err(Refusal::Wire)?;
     match graph.fault() {
       Some(fault) => Err(Refusal::Store(fault)),
       None => Ok(()),

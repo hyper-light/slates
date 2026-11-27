@@ -319,7 +319,7 @@ pub(crate) const LET_GO_BEHIND: &str = "vcs_store.git_resident.let_go_behind";
 /// Brings back and pins `waited`'s window in `resident` so concurrent fetches/pushes cannot evict it while this reader
 /// needs it: returns `Some(bytes_fetched)` when the window is now resident and pinned (`0` if it was already resident
 /// or another concurrent reader brought it back first), or `None` if bring-back failed and the window remains away.
-async fn brought_one(
+pub(crate) async fn brought_one(
   waited: slates_git::store::packed::Waited,
   resident: &mut crate::vcs_http::git::upload::Resident,
   pinned: Option<slates_git::store::packed::Waited>,
@@ -459,50 +459,6 @@ pub(crate) async fn bring_back_within(
       Err(super::read_through::ReadThroughRefused::NoStore)
     }
   }
-}
-
-/// Brings back the let-go window a read of git repository `id` met and noted (`Repository::waiting`), pinning it in
-/// `resident` so concurrent fetches cannot evict it before the caller's next turn.
-pub(crate) async fn brought_back_waited_into(
-  id: RepositoryId,
-  resident: &mut crate::vcs_http::git::upload::Resident,
-) -> bool {
-  let waited = crate::state::with_state(|state| {
-    state.vcs_stores.stopped_encoding(id).or_else(|| {
-      state
-        .vcs_stores
-        .git(id)
-        .and_then(|(_, store)| store.repository.waiting())
-    })
-  })
-  .flatten();
-  let Some(waited) = waited else {
-    return false;
-  };
-  let _ = brought_one(waited, resident, None).await;
-  true
-}
-
-/// Brings back the let-go window a read of git repository `id` met and noted (`Repository::waiting`), where one did;
-/// whether one did (goal 93 item 2a: what a driver checks after every turn, so the next turn reads it).
-pub(crate) async fn brought_back_waited(id: RepositoryId) -> bool {
-  // A-864 piece 2: the window an encoding unit stopped at, else one a read met and noted.
-  let waited = crate::state::with_state(|state| {
-    state.vcs_stores.stopped_encoding(id).or_else(|| {
-      state
-        .vcs_stores
-        .git(id)
-        .and_then(|(_, store)| store.repository.waiting())
-    })
-  })
-  .flatten();
-  let Some(waited) = waited else {
-    return false;
-  };
-  if bring_back_within(waited).await.is_err() {
-    let _ = crate::state::with_state_counted(|state| state.count(RESIDENT_REFUSED, 1));
-  }
-  true
 }
 
 /// `len` as a word.

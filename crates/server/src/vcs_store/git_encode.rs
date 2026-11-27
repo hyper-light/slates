@@ -143,37 +143,19 @@ pub(crate) enum Turned {
   More,
   /// Every version's fragments are kept (or the store is not a git store held here): nothing to do.
   Idle,
+  /// A read met a let-go pack window (A-864 piece 2): the caller brings it back
+  /// ([`super::upload::bring_back_within`]) and turns again, owning this wait per task rather
+  /// than through the shared `Repository::waiting` cell.
+  Waiting(slates_git::store::packed::Waited),
 }
 
 /// One turn of repository `id`'s encoding (the module doc), within the shard's quantum on its clock.
-impl super::VcsStores {
-  /// The let-go window repository `id`'s encoding last stopped at, taken (A-864 piece 2's encoding side): what its
-  /// driver brings back before the next turn.
-  pub(crate) fn stopped_encoding(
-    &self,
-    id: RepositoryId,
-  ) -> Option<slates_git::store::packed::Waited> {
-    self
-      .encodings
-      .0
-      .get(&id)
-      .and_then(|(encoding, _)| encoding.waiting())
-  }
-}
-
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
   // A-614 amended: a version's D(k), which its fragments are encoded from, derived first where it is not known, so an
   // encoding turned by any path (a fetch's wait, the task behind it) never meets a version left for its first reader.
   match super::git_derive::turn(state, id) {
     super::git_derive::Turned::More => return Turned::More,
-    // A derivation's read met a window let go: kept on the repository for the encoding's driver to bring back
-    // (`Repository::waiting`, `read_through::bring_back`), the turn answered not done.
-    super::git_derive::Turned::Waiting(waited) => {
-      if let Some((_, store)) = state.vcs_stores.git_ref(id) {
-        store.repository.wait_for(waited);
-      }
-      return Turned::More;
-    }
+    super::git_derive::Turned::Waiting(waited) => return Turned::Waiting(waited),
     super::git_derive::Turned::Idle => {}
   }
   let began = slates_rt::futures::now_ns();
@@ -181,7 +163,7 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
   // A-724 piece 4: the turn's time and, once a version's fragments are kept, their bytes, on the repository's usage row,
   // so what making a byte of fragments again costs is learned from this repository's own encodings.
   let now = slates_rt::futures::now_ns();
-  if turned == Turned::More || kept > 0 {
+  if !matches!(turned, Turned::Idle) || kept > 0 {
     state
       .vcs_usage
       .derived(&id, (now.saturating_sub(began), kept), now);
@@ -209,6 +191,194 @@ fn turn_uncounted(state: &mut ShardState, id: RepositoryId) -> (Turned, u64) {
   })
 }
 
+/// Outcome of ensuring an encoding is under way at the start of [`turn_lent`].
+enum Begun {
+  /// A new encoding was started and inserted.
+  Started,
+  /// An encoding was already under way.
+  Existing,
+  /// Nothing unencoded (or not a git store held here).
+  Idle,
+  /// Starting the encoding met a let-go pack window.
+  Waiting(slates_git::store::packed::Waited),
+  /// Starting the encoding was refused for a reason other than a let-go window.
+  Refused,
+}
+
+/// Outcome of advancing one encoding turn inside [`turn_lent`].
+struct Advanced {
+  /// Progress returned by `Encoding::advance`.
+  progress: Result<Progress, StoreRefused>,
+  /// Let-go pack window noted by `encoding` or `repository`, drained synchronously on turn exit.
+  waited: Option<slates_git::store::packed::Waited>,
+  /// Units past quantum observed during this turn.
+  past: u64,
+  /// Per-stage breakdown of [`Self::past`].
+  past_by_stage: [u64; UNITS_PAST_BUDGET_BY_STAGE.len()],
+}
+
+/// Per-turn metrics applied to `ShardState` once an encoding turn finishes.
+struct TurnCounts {
+  /// Whether this turn began a new version's encoding.
+  begun: bool,
+  /// Pack-reuse counters from a finished version's encoding (all zero while in progress).
+  reused: [u64; REUSE_COUNTED.len()],
+  /// Units past quantum observed during this turn.
+  past: u64,
+  /// Per-stage breakdown of [`Self::past`].
+  past_by_stage: [u64; UNITS_PAST_BUDGET_BY_STAGE.len()],
+}
+
+/// Ensures repository `id` has an encoding under way when an unencoded version exists.
+fn begin_encoding(stores: &mut super::VcsStores, id: RepositoryId) -> Begun {
+  if stores.encodings.0.contains_key(&id) {
+    return Begun::Existing;
+  }
+  let (Some(content), Some(super::RepositoryStore::Git(store))) =
+    (stores.content.as_ref(), stores.entries.get(&id))
+  else {
+    return Begun::Idle;
+  };
+  let Some((green, version)) = store.repository.first_unencoded() else {
+    return Begun::Idle;
+  };
+  match Encoding::fragments(&store.repository, content, green, version) {
+    Ok(encoding) => {
+      let _ = store.repository.waiting();
+      stores.encodings.0.insert(id, (encoding, (green, version)));
+      Begun::Started
+    }
+    Err(_) => store
+      .repository
+      .waiting()
+      .map_or(Begun::Refused, Begun::Waiting),
+  }
+}
+
+/// Runs paced [`Encoding::advance`] units for one turn, clearing any stale wait on entry and
+/// draining both `encoding.waiting()` and `repository.waiting()` synchronously on exit so no
+/// let-go wait is ever stranded in the shared `Repository::waiting` cell across an `.await`.
+fn advance_encoding(
+  encoding: &mut Encoding,
+  repository: &mut slates_git::store::Repository,
+  content: &mut slates_vcs::ContentStore,
+  (clock, quantum_ns, exchange): (&mut dyn Clock, u64, Exchange),
+) -> Advanced {
+  let _ = repository.waiting();
+  let before = encoding.counters().units_past_quantum;
+  let before_by_stage = encoding.counters().units_past_quantum_by_stage;
+  // A-783: advances of a quantum each, to the quantum while someone waits on the shard, on to its ceiling while
+  // no one does, so units sized within the quantum (A-718) are not each a turn of their own.
+  let mut costs = super::TurnCosts::ZERO;
+  let mut paced = super::paced_turn(quantum_ns, slates_rt::futures::now_ns());
+  let progress = loop {
+    if !paced.more(super::ANSWER_STEP, &mut costs) {
+      break Ok(Progress::More);
+    }
+    match encoding.advance(
+      repository,
+      content,
+      Turn {
+        clock: &mut *clock,
+        exchange,
+        quantum_ns,
+      },
+    ) {
+      // A-864 piece 2: a unit stopped at a let-go window ends the turn; its driver brings the window back.
+      Ok(Progress::More) if encoding.stopped() => break Ok(Progress::More),
+      Ok(Progress::More) => {}
+      other => break other,
+    }
+  };
+  paced.close(slates_rt::futures::now_ns(), &mut costs);
+  let encoding_waited = encoding.waiting();
+  let repo_waited = repository.waiting();
+  let waited = encoding_waited.or(repo_waited);
+  let counters = encoding.counters();
+  let past = counters.units_past_quantum.saturating_sub(before);
+  let mut past_by_stage = [0_u64; UNITS_PAST_BUDGET_BY_STAGE.len()];
+  for ((now, was), into) in counters
+    .units_past_quantum_by_stage
+    .iter()
+    .zip(before_by_stage)
+    .zip(&mut past_by_stage)
+  {
+    *into = now.saturating_sub(was);
+  }
+  Advanced {
+    progress,
+    waited,
+    past,
+    past_by_stage,
+  }
+}
+
+/// Extracts [`REUSE_COUNTED`]-ordered counts from a finished encoding's counters.
+fn reuse_counts(counted: slates_git::store::EncodingCounters) -> [u64; REUSE_COUNTED.len()] {
+  [
+    counted.reused_whole,
+    counted.reused_deltas,
+    counted.reuse_refused,
+    counted.reuse_no_entry,
+    counted.reuse_unread,
+    counted.reuse_crc_missed,
+  ]
+}
+
+/// Applies the outcome of [`advance_encoding`] to `state`'s encoding table and returns
+/// `(turned, kept_bytes, reused_counts)`.
+fn finish_turn(
+  state: &mut ShardState,
+  id: RepositoryId,
+  encoding_at: Option<(u64, usize)>,
+  progress: Option<Result<Progress, StoreRefused>>,
+  waited: Option<slates_git::store::packed::Waited>,
+) -> (Turned, u64, [u64; REUSE_COUNTED.len()]) {
+  let mut kept = 0;
+  let mut reused = [0_u64; REUSE_COUNTED.len()];
+  let turned = match (progress, waited) {
+    (Some(Ok(Progress::More)), Some(waited)) => Turned::Waiting(waited),
+    (Some(Ok(Progress::More)), None) => Turned::More,
+    (Some(Ok(Progress::Done)), _) => {
+      if let Some((encoding, _)) = state.vcs_stores.encodings.0.remove(&id) {
+        reused = reuse_counts(encoding.counters());
+      }
+      kept = encoded_bytes(&state.vcs_stores, id, encoding_at);
+      state.count(ENCODED, 1);
+      Turned::More
+    }
+    (Some(Err(_)), Some(waited)) => {
+      state.vcs_stores.encodings.0.remove(&id);
+      Turned::Waiting(waited)
+    }
+    (Some(Err(_)), None) | (None, _) => {
+      state.vcs_stores.encodings.0.remove(&id);
+      state.count(REFUSED, 1);
+      Turned::Idle
+    }
+  };
+  (turned, kept, reused)
+}
+
+/// Records the per-turn encoding counters on `state`.
+fn record_turn_counts(state: &mut ShardState, counts: TurnCounts) {
+  if counts.begun {
+    state.count(BEGUN, 1);
+  }
+  for (name, by) in REUSE_COUNTED.iter().zip(counts.reused) {
+    if by > 0 {
+      state.count(name, by);
+    }
+  }
+  if counts.past > 0 {
+    state.count(UNITS_PAST_BUDGET, counts.past);
+    for (name, by) in UNITS_PAST_BUDGET_BY_STAGE.iter().zip(counts.past_by_stage) {
+      state.count(name, by);
+    }
+  }
+  state.count(TURNS, 1);
+}
+
 /// [`turn_uncounted`]'s work inside its lend.
 fn turn_lent(
   state: &mut ShardState,
@@ -217,118 +387,64 @@ fn turn_lent(
   quantum_ns: u64,
   exchange: Exchange,
 ) -> (Turned, u64) {
-  let stores = &mut state.vcs_stores;
-  let (Some(content), Some(super::RepositoryStore::Git(store))) =
-    (stores.content.as_mut(), stores.entries.get_mut(&id))
-  else {
-    super::settle(state);
-    return (Turned::Idle, 0);
-  };
-  let mut begun = false;
-  if let std::collections::btree_map::Entry::Vacant(unencoded) = stores.encodings.0.entry(id) {
-    let Some((green, version)) = store.repository.first_unencoded() else {
+  if let Some((_, store)) = state.vcs_stores.git_ref(id) {
+    let _ = store.repository.waiting();
+  }
+  let begun = match begin_encoding(&mut state.vcs_stores, id) {
+    Begun::Started => true,
+    Begun::Existing => false,
+    Begun::Idle => {
       super::settle(state);
       return (Turned::Idle, 0);
-    };
-    match Encoding::fragments(&store.repository, content, green, version) {
-      Ok(encoding) => {
-        unencoded.insert((encoding, (green, version)));
-        begun = true;
-      }
-      Err(_) => {
-        super::settle(state);
-        state.count(REFUSED, 1);
-        return (Turned::Idle, 0);
-      }
     }
-  }
-  let encoding_at = stores.encodings.0.get(&id).map(|(_, at)| *at);
-  let mut kept = 0;
-  let mut past = 0;
-  let mut reused = [0_u64; REUSE_COUNTED.len()];
-  let mut past_by_stage = [0_u64; UNITS_PAST_BUDGET_BY_STAGE.len()];
-  let advanced: Option<Result<Progress, StoreRefused>> =
-    stores.encodings.0.get_mut(&id).map(|(encoding, _)| {
-      let before = encoding.counters().units_past_quantum;
-      let before_by_stage = encoding.counters().units_past_quantum_by_stage;
-      // A-783: advances of a quantum each, to the quantum while someone waits on the shard, on to its ceiling while
-      // no one does, so units sized within the quantum (A-718) are not each a turn of their own.
-      let mut costs = super::TurnCosts::ZERO;
-      let mut paced = super::paced_turn(quantum_ns, slates_rt::futures::now_ns());
-      let advanced = loop {
-        if !paced.more(super::ANSWER_STEP, &mut costs) {
-          break Ok(Progress::More);
-        }
-        match encoding.advance(
-          &mut store.repository,
-          content,
-          Turn {
-            clock: &mut *clock,
-            exchange,
-            quantum_ns,
-          },
-        ) {
-          // A-864 piece 2: a unit stopped at a let-go window ends the turn; its driver brings the window back.
-          Ok(Progress::More) if encoding.stopped() => break Ok(Progress::More),
-          Ok(Progress::More) => {}
-          other => break other,
-        }
-      };
-      paced.close(slates_rt::futures::now_ns(), &mut costs);
-      past = encoding
-        .counters()
-        .units_past_quantum
-        .saturating_sub(before);
-      for ((now, was), into) in encoding
-        .counters()
-        .units_past_quantum_by_stage
-        .iter()
-        .zip(before_by_stage)
-        .zip(&mut past_by_stage)
-      {
-        *into = now.saturating_sub(was);
-      }
-      advanced
-    });
-  let turned = match advanced {
-    Some(Ok(Progress::More)) => Turned::More,
-    Some(Ok(Progress::Done)) => {
-      if let Some((encoding, _)) = stores.encodings.0.remove(&id) {
-        let counted = encoding.counters();
-        reused = [
-          counted.reused_whole,
-          counted.reused_deltas,
-          counted.reuse_refused,
-          counted.reuse_no_entry,
-          counted.reuse_unread,
-          counted.reuse_crc_missed,
-        ];
-      }
-      kept = encoded_bytes(stores, id, encoding_at);
-      state.count(ENCODED, 1);
-      Turned::More
+    Begun::Waiting(waited) => {
+      super::settle(state);
+      return (Turned::Waiting(waited), 0);
     }
-    Some(Err(_)) | None => {
-      stores.encodings.0.remove(&id);
+    Begun::Refused => {
+      super::settle(state);
       state.count(REFUSED, 1);
-      Turned::Idle
+      return (Turned::Idle, 0);
     }
   };
-  if begun {
-    state.count(BEGUN, 1);
-  }
-  for (name, by) in REUSE_COUNTED.iter().zip(reused) {
-    if by > 0 {
-      state.count(name, by);
+  let encoding_at = state.vcs_stores.encodings.0.get(&id).map(|(_, at)| *at);
+  let advanced = {
+    let stores = &mut state.vcs_stores;
+    match (
+      stores.content.as_mut(),
+      stores.entries.get_mut(&id),
+      stores.encodings.0.get_mut(&id),
+    ) {
+      (Some(content), Some(super::RepositoryStore::Git(store)), Some((encoding, _))) => {
+        Some(advance_encoding(
+          encoding,
+          &mut store.repository,
+          content,
+          (clock, quantum_ns, exchange),
+        ))
+      }
+      _ => None,
     }
-  }
-  if past > 0 {
-    state.count(UNITS_PAST_BUDGET, past);
-    for (name, by) in UNITS_PAST_BUDGET_BY_STAGE.iter().zip(past_by_stage) {
-      state.count(name, by);
-    }
-  }
-  state.count(TURNS, 1);
+  };
+  let (progress, waited, past, past_by_stage) = match advanced {
+    Some(advanced) => (
+      Some(advanced.progress),
+      advanced.waited,
+      advanced.past,
+      advanced.past_by_stage,
+    ),
+    None => (None, None, 0, [0_u64; UNITS_PAST_BUDGET_BY_STAGE.len()]),
+  };
+  let (turned, kept, reused) = finish_turn(state, id, encoding_at, progress, waited);
+  record_turn_counts(
+    state,
+    TurnCounts {
+      begun,
+      reused,
+      past,
+      past_by_stage,
+    },
+  );
   super::settle(state);
   (turned, kept)
 }
@@ -506,27 +622,100 @@ pub(crate) fn ahead_under_way(state: &ShardState, id: RepositoryId) -> bool {
   state.vcs_stores.encodings.1.contains(&id)
 }
 
+/// Brings back the let-go window `waited` for an encoding turn, pinning it until the next turn
+/// enters shard state so concurrent let-go tasks cannot evict it before it is read. Counts
+/// [`super::upload::RESIDENT_REFUSED`] on failure.
+async fn bring_back_waited(
+  waited: slates_git::store::packed::Waited,
+  pinned: &mut Option<super::named_objects::WindowPin>,
+) -> bool {
+  let window = crate::state::with_state(|state| {
+    state
+      .vcs_stores
+      .content()?
+      .window_holding(&waited.pack, waited.len, waited.offset)
+      .map(|(window, _, _)| window)
+  })
+  .flatten();
+  let Some(window) = window else {
+    let _ = crate::state::with_state_counted(|state| {
+      state.count(super::upload::RESIDENT_REFUSED, 1);
+    });
+    return false;
+  };
+  let pin = super::named_objects::WindowPin::of(window);
+  if super::upload::bring_back_within(waited).await.is_err() {
+    let _ = crate::state::with_state_counted(|state| {
+      state.count(super::upload::RESIDENT_REFUSED, 1);
+    });
+    return false;
+  }
+  let resident = crate::state::with_state(|state| {
+    state
+      .vcs_stores
+      .content()
+      .is_some_and(|content| !content.is_away(&window))
+  })
+  .unwrap_or(false);
+  if resident {
+    *pinned = Some(pin);
+  }
+  resident
+}
+
+/// Handles a [`Turned::Waiting`] turn result for [`encode_ahead`] and [`encode_within`], returning
+/// `false` if the identical wait already failed on the previous turn so the driver stops cleanly
+/// instead of spinning.
+async fn await_waited(
+  waited: slates_git::store::packed::Waited,
+  pinned: &mut Option<super::named_objects::WindowPin>,
+  last_failed: &mut Option<slates_git::store::packed::Waited>,
+) -> bool {
+  if *last_failed == Some(waited) {
+    return false;
+  }
+  if bring_back_waited(waited, pinned).await {
+    *last_failed = None;
+    return true;
+  }
+  *last_failed = Some(waited);
+  slates_rt::futures::yield_now().await;
+  true
+}
+
+/// One guarded turn of [`encode_ahead`], stopping and giving back idle state when ahead encoding
+/// is no longer allowed (A-856).
+fn ahead_turn(state: &mut ShardState, id: RepositoryId) -> Turned {
+  if !ahead_allowed(state, id) {
+    state.count(AHEAD_STOPPED, 1);
+    if crate::vcs_share::fetches_live(id) == 0 {
+      give_back_idle(state, id);
+    }
+    return Turned::Idle;
+  }
+  turn(state, id)
+}
+
 /// Turns repository `id`'s encoding ahead, behind a fetch that stopped waiting (A-718 continued, A-856), yielding
 /// between turns: while [`ahead_allowed`] allows it, until every version's fragments are kept. Where it stops allowed,
 /// counted [`AHEAD_STOPPED`], and its repository has no fetch answered now, what it holds is given back
 /// ([`give_back_idle`]). Returns at once where the shard's state is not lent.
 async fn encode_ahead(id: RepositoryId) {
+  let mut pinned = None;
+  let mut last_failed = None;
   loop {
     let turned = crate::state::with_state_counted(|state| {
-      if !ahead_allowed(state, id) {
-        state.count(AHEAD_STOPPED, 1);
-        if crate::vcs_share::fetches_live(id) == 0 {
-          give_back_idle(state, id);
-        }
-        return Turned::Idle;
-      }
-      turn(state, id)
+      pinned = None;
+      ahead_turn(state, id)
     });
     match turned {
       Some(Turned::More) => {
-        // A window a turn's read met let go is brought back before the next turn reads it again.
-        if !super::upload::brought_back_waited(id).await {
-          slates_rt::futures::yield_now().await;
+        last_failed = None;
+        slates_rt::futures::yield_now().await;
+      }
+      Some(Turned::Waiting(waited)) => {
+        if !await_waited(waited, &mut pinned, &mut last_failed).await {
+          return;
         }
       }
       Some(Turned::Idle) | None => return,
@@ -568,16 +757,27 @@ thread_local! {
 /// [`encode_for_fetch`] with the wait `wait_ns` long: whether the encoding was idle when it returned.
 pub(crate) async fn encode_within(id: RepositoryId, wait_ns: u64) -> bool {
   let began = slates_rt::futures::now_ns();
+  let mut pinned = None;
+  let mut last_failed = None;
   loop {
-    match crate::state::with_state_counted(|state| turn(state, id)) {
-      Some(Turned::More) if slates_rt::futures::now_ns().saturating_sub(began) >= wait_ns => {
+    let turned = crate::state::with_state_counted(|state| {
+      pinned = None;
+      turn(state, id)
+    });
+    match turned {
+      Some(Turned::More | Turned::Waiting(_))
+        if slates_rt::futures::now_ns().saturating_sub(began) >= wait_ns =>
+      {
         let _ = crate::state::with_state_counted(|state| encode_behind(state, id));
         return false;
       }
       Some(Turned::More) => {
-        // A window a turn's read met let go is brought back before the next turn reads it again.
-        if !super::upload::brought_back_waited(id).await {
-          slates_rt::futures::yield_now().await;
+        last_failed = None;
+        slates_rt::futures::yield_now().await;
+      }
+      Some(Turned::Waiting(waited)) => {
+        if !await_waited(waited, &mut pinned, &mut last_failed).await {
+          return false;
         }
       }
       Some(Turned::Idle) | None => return true,

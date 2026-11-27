@@ -778,3 +778,45 @@ fn an_object_info_request_without_arguments_is_read_and_written_back() {
     (Command::ObjectInfo, 0, stream)
   );
 }
+
+/// Counting [`ObjectInfo`] wrapper asserting exact lookup multiplicity per pass.
+struct CountingObjects {
+  inner: Objects,
+  lookups: core::cell::Cell<usize>,
+}
+
+impl ObjectInfo for CountingObjects {
+  fn info(&self, id: &ObjectId) -> Option<ObjectMeta> {
+    self.lookups.set(self.lookups.get().saturating_add(1));
+    self.inner.info(id)
+  }
+}
+
+/// A-624 (single-pass writer): do emit an `object-info` response through [`super::write_answer_to`]
+/// and through [`answer`] over a counting [`ObjectInfo`]. Expect: byte-exact output, with
+/// `write_answer_to` invoking `info` once per OID and `answer` twice per OID (measure + emit).
+#[test]
+fn write_answer_to_queries_each_oid_once_per_pass_matching_answer() {
+  let store = CountingObjects {
+    inner: sha1_objects(),
+    lookups: core::cell::Cell::new(0),
+  };
+  let asked = arguments(rest::OBJECT_INFO_SIZES_REQUEST);
+  let oid_count = asked
+    .iter()
+    .filter(|line| matches!(line.value, Argument::Oid(_)))
+    .count();
+  let mut single = Vec::new();
+  super::write_answer_to(&asked, ObjectFormat::Sha1, &store, &mut single).unwrap();
+  let single_lookups = store.lookups.get();
+
+  store.lookups.set(0);
+  let mut atomic = Vec::new();
+  answer(&asked, ObjectFormat::Sha1, &store, &mut atomic).unwrap();
+  let atomic_lookups = store.lookups.get();
+
+  assert_eq!(
+    (single, single_lookups, atomic_lookups),
+    (atomic, oid_count, oid_count.saturating_mul(2))
+  );
+}

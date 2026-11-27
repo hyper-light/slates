@@ -284,14 +284,8 @@ async fn drive(id: slates_db::catalog::RepositoryId, request: Vec<u8>) -> Driven
       eprintln!("turn {turns} took {took} ns, counters {counters:?}");
     }
     longest = longest.max(took);
-    match turned {
-      Some((Turned::More, counted)) => {
-        if counted.is_some() {
-          counters = counted;
-        }
-        slates_rt::futures::yield_now().await;
-      }
-      Some((Turned::Idle, _)) | None => break,
+    if !await_drive_turn(turned, &mut counters).await {
+      break;
     }
   }
   let past = crate::state::with_state_counted(|state| {
@@ -312,6 +306,28 @@ async fn drive(id: slates_db::catalog::RepositoryId, request: Vec<u8>) -> Driven
     quantum,
     counters.map(|counters| (counters, window)),
   )
+}
+
+/// Advances [`drive`] past one encoding turn, bringing back any let-go pack window and returning
+/// whether encoding should continue.
+async fn await_drive_turn(
+  turned: Option<(Turned, Option<slates_git::store::EncodingCounters>)>,
+  counters: &mut Option<slates_git::store::EncodingCounters>,
+) -> bool {
+  match turned {
+    Some((Turned::More, counted)) => {
+      *counters = counted.or(*counters);
+      slates_rt::futures::yield_now().await;
+      true
+    }
+    Some((Turned::Waiting(waited), counted)) => {
+      *counters = counted.or(*counters);
+      super::super::upload::bring_back_within(waited)
+        .await
+        .is_ok()
+    }
+    Some((Turned::Idle, _)) | None => false,
+  }
 }
 
 /// Shape: [`t_a856_a_grant_is_learned_from_reads_and_given_back_when_idle`]'s larger repository's one file: a few of the
@@ -349,6 +365,18 @@ fn fetched_main(
   assert_eq!(refused, None);
 }
 
+/// Releases `id`'s cached recent reads and settles the shard's VCS charge without bumping
+/// [`super::GIVEN_BACK_IDLE`], matching the idle post-fetch baseline before an encoding starts.
+fn let_go_recent_on_shard(
+  state: &mut crate::state::ShardState,
+  id: slates_db::catalog::RepositoryId,
+) {
+  if let Some((content, store)) = state.vcs_stores.git(id) {
+    let _ = store.repository.let_go_recent(content);
+  }
+  super::super::settle(state);
+}
+
 /// A-856 (main's check of 2026-11-22 02:29: a grant learned, not a floor, a cap or a region's size passed through; and
 /// what is held given back when idle). Do: clone the fixtures' small repository whole, and a repository of one
 /// incompressible [`LARGER_FILE`]-byte file whole, reading each one's grant (`vcs_share::budget`: the shard's room
@@ -382,6 +410,7 @@ fn t_a856_a_grant_is_learned_from_reads_and_given_back_when_idle() {
     while crate::vcs_store::git_derive::turn(state, larger)
       == crate::vcs_store::git_derive::Turned::More
     {}
+    let_go_recent_on_shard(state, larger);
     let idle_charged = state
       .vcs_stores
       .content()
@@ -473,7 +502,13 @@ fn t_a860_a_repository_gone_idle_lets_go_of_the_objects_its_reads_keep() {
         .map_or(0, |(_, store)| store.repository.recent_bytes())
     };
     let before = recent(state);
-    while turn(state, id) == Turned::More {}
+    loop {
+      match turn(state, id) {
+        Turned::More => {}
+        Turned::Idle => break,
+        Turned::Waiting(waited) => panic!("unexpected let-go wait before idle: {waited:?}"),
+      }
+    }
     let during = recent(state);
     let held = crate::vcs_store::upload::hold_in(state, id, &crate::git_push::tests::owner())
       .expect("a fetch's hold");
@@ -503,4 +538,471 @@ fn t_a860_a_repository_gone_idle_lets_go_of_the_objects_its_reads_keep() {
     after.0 <= before && after.1 > 0,
     "after the fetch: {after:?}, before {before}"
   );
+}
+
+/// Shape: synthetic green key used by the in-memory `git_encode` let-go regression tests.
+const WAIT_TEST_GREEN: u64 = 1;
+/// Shape: small pure-RAM content store budget for in-memory `git_encode` unit tests.
+const WAIT_TEST_BUDGET: u64 = 1 << 20;
+/// Shape: small window size for pure-RAM `git_encode` unit tests.
+const WAIT_TEST_WINDOW: usize = 4096;
+/// Shape: synthetic pack length used to plant a stale foreign wait on `Repository::waiting`.
+const STALE_PACK_LEN: u64 = 128;
+/// Shape: synthetic pack offset used to plant a stale foreign wait on `Repository::waiting`.
+const STALE_WAIT_OFFSET: u64 = 16;
+
+/// Builds a commit, its single-file tree, and its blob for an in-memory pack, returning
+/// `(commit_id, objects)`.
+fn commit_with_blob(
+  name: &str,
+  body: &[u8],
+  parent: Option<slates_git::object_name::ObjectId>,
+) -> (
+  slates_git::object_name::ObjectId,
+  Vec<(slates_git::object_name::Kind, Vec<u8>)>,
+) {
+  use slates_git::object_name::{Kind, ObjectFormat, name_of};
+  let blob_id = name_of(ObjectFormat::Sha1, Kind::Blob, body).unwrap();
+  let mut tree = Vec::new();
+  tree.extend_from_slice(format!("100644 {name}\0").as_bytes());
+  tree.extend_from_slice(blob_id.as_bytes());
+  let tree_id = name_of(ObjectFormat::Sha1, Kind::Tree, &tree).unwrap();
+  let mut commit = format!("tree {tree_id}\n");
+  if let Some(parent) = parent {
+    commit.push_str(&format!("parent {parent}\n"));
+  }
+  commit.push_str(
+    "author A <a@example.com> 1700000000 +0000\n\
+     committer A <a@example.com> 1700000000 +0000\n\n\
+     commit\n",
+  );
+  let commit_bytes = commit.into_bytes();
+  let commit_id = name_of(ObjectFormat::Sha1, Kind::Commit, &commit_bytes).unwrap();
+  (
+    commit_id,
+    vec![
+      (Kind::Commit, commit_bytes),
+      (Kind::Tree, tree),
+      (Kind::Blob, body.to_vec()),
+    ],
+  )
+}
+
+/// Commits `objects` as a landed pack on `green` directly into `repository`/`content`, returning
+/// `(pack_id, pack_bytes)`.
+fn commit_pack_in_store(
+  content: &mut slates_vcs::ContentStore,
+  repository: &mut slates_git::store::Repository,
+  green: u64,
+  head: slates_git::object_name::ObjectId,
+  objects: &[(slates_git::object_name::Kind, Vec<u8>)],
+) -> (slates_vcs::ContentId, Vec<u8>) {
+  use slates_git::object_name::ObjectFormat;
+  let (pack, offsets) = crate::git_push::tests::whole_pack_with_offsets(objects);
+  let naming = slates_git::store::GitNaming {
+    format: ObjectFormat::Sha1,
+  };
+  let mut push = slates_git::store::Push::new(ObjectFormat::Sha1);
+  push.extend_pack(&pack);
+  for ((kind, bytes), offset) in objects.iter().zip(offsets) {
+    let incoming = slates_git::store::Incoming {
+      kind: *kind,
+      content: bytes.as_slice(),
+      claimed: None,
+      depth: 0,
+    };
+    push
+      .admit_placed::<_, core::convert::Infallible>(content, &naming, (incoming, offset))
+      .unwrap();
+  }
+  repository.seal(content, &mut push).unwrap();
+  repository.stage(content, &mut push).unwrap();
+  let pack_id = push.stored_pack().expect("stored pack").0;
+  let mv = repository.admit(content, &push, green, Some(head)).unwrap();
+  repository.commit(content, &mut push, &[mv]).unwrap();
+  push.abandon(content).unwrap();
+  (pack_id, pack)
+}
+
+/// Marks every window of `pack` landed and lets it go (`away`) in `content`, also dropping recent
+/// object cache entries from `repository`.
+fn evict_pack_windows(
+  content: &mut slates_vcs::ContentStore,
+  repository: &mut slates_git::store::Repository,
+  pack: &[u8],
+) {
+  let window_size = content.window();
+  for window in pack.chunks(window_size).map(slates_vcs::ContentId::of) {
+    assert!(content.mark_landed(&window));
+    content.let_go_landed(&window, None).unwrap();
+  }
+  repository.let_go_recent(content);
+}
+
+/// Restores `waited`'s away window from `packs` back into `content` in pure RAM.
+fn restore_waited_window(
+  content: &mut slates_vcs::ContentStore,
+  packs: &[(slates_vcs::ContentId, Vec<u8>)],
+  waited: slates_git::store::packed::Waited,
+) {
+  let (_, pack) = packs
+    .iter()
+    .find(|(id, _)| *id == waited.pack)
+    .expect("waited pack present in fixture");
+  let (window, start, len) = content
+    .away_window(&waited.pack, waited.len, waited.offset)
+    .expect("waited window is away");
+  let from = usize::try_from(start).unwrap();
+  let to = from + usize::try_from(len).unwrap();
+  content.bring_back(&window, &pack[from..to]).unwrap();
+}
+
+/// Drives all pending derivations on `repository` synchronously in pure RAM.
+fn derive_all_in_store(
+  content: &mut slates_vcs::ContentStore,
+  repository: &slates_git::store::Repository,
+) {
+  let mut deriving = repository.deriving_due(content);
+  let mut clock = super::ShardClock;
+  loop {
+    let quantum = slates_git::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns: u64::MAX,
+    };
+    match repository
+      .derive_turn(content, &mut deriving, quantum)
+      .unwrap()
+    {
+      slates_git::store::Derived::More => {}
+      slates_git::store::Derived::Sets {
+        green,
+        version,
+        sets,
+      } => repository
+        .keep_derived(content, (green, version), &sets)
+        .unwrap(),
+      slates_git::store::Derived::Done => break,
+    }
+  }
+}
+
+/// Returns a synthetic stale `Waited` pointing at a foreign pack not owned by the test repository.
+fn stale_wait() -> slates_git::store::packed::Waited {
+  slates_git::store::packed::Waited {
+    pack: slates_vcs::ContentId::of(b"stale-foreign-pack"),
+    len: STALE_PACK_LEN,
+    offset: STALE_WAIT_OFFSET,
+  }
+}
+
+/// Simulates a concurrent `ReceivePack` turn wiping `repository.waiting` between encoding turns.
+fn simulate_concurrent_push_clobber(repository: &slates_git::store::Repository) {
+  repository.wait_for(stale_wait());
+  let _ = repository.waiting();
+  assert_eq!(repository.peek_waiting(), None);
+}
+
+/// Pure-RAM store and repository fixture for driving [`super::advance_encoding`] directly.
+struct AdvanceFixture {
+  store: slates_vcs::ContentStore,
+  repository: slates_git::store::Repository,
+  clock: super::ShardClock,
+  exchange: slates_git::store::learn::Exchange,
+}
+
+impl AdvanceFixture {
+  /// Builds an empty pure-RAM fixture calibrated with [`super::ShardClock`].
+  fn new() -> Self {
+    use slates_git::object_name::ObjectFormat;
+    use slates_git::store::Repository;
+    use slates_git::store::learn::{Exchange, Rates};
+
+    let store = slates_vcs::ContentStore::new(WAIT_TEST_BUDGET, WAIT_TEST_WINDOW).unwrap();
+    let repository = Repository::new(ObjectFormat::Sha1);
+    let mut clock = super::ShardClock;
+    let exchange = Exchange::cold(Rates::measure(&mut clock));
+    Self {
+      store,
+      repository,
+      clock,
+      exchange,
+    }
+  }
+
+  /// Commits a single-file `"alpha.txt"` pack on [`WAIT_TEST_GREEN`] and derives it synchronously.
+  fn commit_derived(
+    &mut self,
+    body: &[u8],
+    parent: Option<slates_git::object_name::ObjectId>,
+  ) -> (
+    slates_git::object_name::ObjectId,
+    slates_vcs::ContentId,
+    Vec<u8>,
+  ) {
+    let (commit_id, objects) = commit_with_blob("alpha.txt", body, parent);
+    let (pack_id, pack) = commit_pack_in_store(
+      &mut self.store,
+      &mut self.repository,
+      WAIT_TEST_GREEN,
+      commit_id,
+      &objects,
+    );
+    derive_all_in_store(&mut self.store, &self.repository);
+    (commit_id, pack_id, pack)
+  }
+
+  /// Runs one [`super::advance_encoding`] turn with an unbounded budget.
+  fn advance(&mut self, encoding: &mut slates_git::store::Encoding) -> super::Advanced {
+    use slates_git::store::learn::Clock;
+
+    super::advance_encoding(
+      encoding,
+      &mut self.repository,
+      &mut self.store,
+      (&mut self.clock as &mut dyn Clock, u64::MAX, self.exchange),
+    )
+  }
+
+  /// Plants a stale foreign wait on `Repository::waiting`, runs the first encoding turn, asserts
+  /// both wait cells are drained on exit, and returns the directly returned `Waited`.
+  fn assert_first_encode_wait_drains_cells(
+    &mut self,
+    encoding: &mut slates_git::store::Encoding,
+  ) -> slates_git::store::packed::Waited {
+    use slates_git::store::Progress;
+
+    self.repository.wait_for(stale_wait());
+    let first = self.advance(encoding);
+    assert!(matches!(first.progress, Ok(Progress::More)));
+    let waited = first.waited.expect("encoding stop returns Waited directly");
+    assert_eq!(encoding.waiting(), None, "encoding.waiting drained on exit");
+    assert_eq!(
+      self.repository.peek_waiting(),
+      None,
+      "shared Repository::waiting drained on exit"
+    );
+    waited
+  }
+
+  /// Drives `encoding` to `Progress::Done` while simulating concurrent push clobbers and restoring
+  /// each directly returned `Waited` window.
+  fn finish_encoding_with_clobbers(
+    &mut self,
+    encoding: &mut slates_git::store::Encoding,
+    packs: &[(slates_vcs::ContentId, Vec<u8>)],
+  ) {
+    use slates_git::store::Progress;
+
+    loop {
+      let stepped = self.advance(encoding);
+      assert_eq!(self.repository.peek_waiting(), None);
+      match (stepped.progress, stepped.waited) {
+        (Ok(Progress::Done), _) => break,
+        (Ok(Progress::More), Some(waited)) => {
+          simulate_concurrent_push_clobber(&self.repository);
+          restore_waited_window(&mut self.store, packs, waited);
+        }
+        other => panic!("unexpected v0 advance outcome: {other:?}"),
+      }
+    }
+  }
+
+  /// Commits version 1 over `c0` so encoding enters `Stage::Walk` (tree diff), evicts both packs
+  /// to force the `Err` path with `repository.waiting()` set, and asserts `advance_encoding`
+  /// captures and drains that wait synchronously.
+  fn assert_walk_stage_wait_drains_shared_cell(
+    &mut self,
+    c0: slates_git::object_name::ObjectId,
+    pack_0_id: slates_vcs::ContentId,
+    pack_0: &[u8],
+  ) {
+    use slates_git::store::Encoding;
+
+    let (_c1, pack_1_id, pack_1) = self.commit_derived(b"beta body for walk wait\n", Some(c0));
+    evict_pack_windows(&mut self.store, &mut self.repository, pack_0);
+    evict_pack_windows(&mut self.store, &mut self.repository, &pack_1);
+
+    let mut walk_encoding =
+      Encoding::fragments(&self.repository, &self.store, WAIT_TEST_GREEN, 1).unwrap();
+    let walk = self.advance(&mut walk_encoding);
+    assert!(walk.progress.is_err(), "walk hit away tree pack window");
+    let walk_waited = walk.waited.expect("walk captured away tree window");
+    assert!(walk_waited.pack == pack_0_id || walk_waited.pack == pack_1_id);
+    assert_eq!(
+      self.repository.peek_waiting(),
+      None,
+      "shared Repository::waiting drained after walk wait"
+    );
+  }
+}
+
+/// Pure in-memory non-`TestStore`, non-daemon regression (`rt-git-waiting`, §4.17.2): proves
+/// `git_encode::advance_encoding` clears stale waits on entry, returns `waited` synchronously for
+/// both `Stage::Encode` stops and `Stage::Walk` tree-diff reads without ever leaving
+/// `Repository::waiting` or `Encoding::waiting` populated across `.await`, and finishes encoding
+/// cleanly even when a concurrent push clobbers `Repository::waiting` between turns.
+#[test]
+fn t_rt_git_encode_advance_returns_waiting_directly_and_drains_shared_cell() {
+  use slates_git::store::Encoding;
+
+  let mut fixture = AdvanceFixture::new();
+  let (c0, pack_0_id, pack_0) = fixture.commit_derived(b"alpha body for encode wait\n", None);
+  evict_pack_windows(&mut fixture.store, &mut fixture.repository, &pack_0);
+
+  let mut encoding =
+    Encoding::fragments(&fixture.repository, &fixture.store, WAIT_TEST_GREEN, 0).unwrap();
+  let waited_0 = fixture.assert_first_encode_wait_drains_cells(&mut encoding);
+  assert_eq!(waited_0.pack, pack_0_id, "stale foreign wait was cleared");
+
+  simulate_concurrent_push_clobber(&fixture.repository);
+  let packs = [(pack_0_id, pack_0)];
+  restore_waited_window(&mut fixture.store, &packs, waited_0);
+  fixture.finish_encoding_with_clobbers(&mut encoding, &packs);
+  assert_eq!(fixture.repository.first_unencoded(), None);
+
+  let [(_, pack_0)] = packs;
+  fixture.assert_walk_stage_wait_drains_shared_cell(c0, pack_0_id, &pack_0);
+}
+
+/// Restores `waited`'s away window on `state`'s content store inside a shard lend.
+fn restore_on_shard(
+  state: &mut crate::state::ShardState,
+  packs: &[(slates_vcs::ContentId, Vec<u8>)],
+  waited: slates_git::store::packed::Waited,
+) {
+  super::super::lend(&mut state.store, &mut state.vcs_stores, 0);
+  {
+    let lent = super::super::Lent::new(&mut state.store, &mut state.vcs_stores);
+    let content = lent.stores.content_mut().expect("content store");
+    restore_waited_window(content, packs, waited);
+  }
+  super::super::settle(state);
+}
+
+/// Drives `git_encode::turn(state, id)` to `Turned::Idle`, asserting that every `Turned::Waiting`
+/// leaves `Repository::waiting` drained (`None`), simulating a concurrent push clobber before
+/// restoring each waited window, and returning the number of `Turned::Waiting` stops observed.
+fn drive_turn_with_clobbers(
+  state: &mut crate::state::ShardState,
+  id: slates_db::catalog::RepositoryId,
+  packs: &[(slates_vcs::ContentId, Vec<u8>)],
+) -> usize {
+  let mut waits = 0_usize;
+  loop {
+    let outcome = turn(state, id);
+    let leaked = state
+      .vcs_stores
+      .git_ref(id)
+      .and_then(|(_, store)| store.repository.peek_waiting());
+    assert_eq!(
+      leaked, None,
+      "git_encode::turn leaked wait into shared Repository::waiting"
+    );
+    match outcome {
+      Turned::Idle => return waits,
+      Turned::More => {}
+      Turned::Waiting(waited) => {
+        waits += 1;
+        if let Some((_, store)) = state.vcs_stores.git_ref(id) {
+          simulate_concurrent_push_clobber(&store.repository);
+        }
+        restore_on_shard(state, packs, waited);
+      }
+    }
+  }
+}
+
+/// Commits `objects` as a landed pack on `green` in `id`'s store on `state` and lets every pack
+/// window go (`away`), returning `(pack_id, pack_bytes)`.
+fn commit_and_evict_pack(
+  state: &mut crate::state::ShardState,
+  id: slates_db::catalog::RepositoryId,
+  green: u64,
+  head: slates_git::object_name::ObjectId,
+  objects: &[(slates_git::object_name::Kind, Vec<u8>)],
+) -> (slates_vcs::ContentId, Vec<u8>) {
+  super::super::lend(&mut state.store, &mut state.vcs_stores, 0);
+  let committed = {
+    let lent = super::super::Lent::new(&mut state.store, &mut state.vcs_stores);
+    let (content, store) = lent.stores.git(id).expect("git store");
+    let committed = commit_pack_in_store(content, &mut store.repository, green, head, objects);
+    evict_pack_windows(content, &mut store.repository, &committed.1);
+    committed
+  };
+  super::super::settle(state);
+  committed
+}
+
+/// Evicts every window of `pack` and clears recent object cache on `state`'s shard lend.
+fn evict_on_shard(
+  state: &mut crate::state::ShardState,
+  id: slates_db::catalog::RepositoryId,
+  pack: &[u8],
+) {
+  super::super::lend(&mut state.store, &mut state.vcs_stores, 0);
+  {
+    let lent = super::super::Lent::new(&mut state.store, &mut state.vcs_stores);
+    let (content, store) = lent.stores.git(id).expect("git store");
+    evict_pack_windows(content, &mut store.repository, pack);
+  }
+  super::super::settle(state);
+}
+
+/// Drives the first `git_encode::turn` on `id` into `git_derive::Turned::Waiting`, asserts that
+/// shared `Repository::waiting` is drained and names `expected_pack`, restores the waited window,
+/// and completes derivation.
+fn derive_after_first_wait(
+  state: &mut crate::state::ShardState,
+  id: slates_db::catalog::RepositoryId,
+  expected_pack: slates_vcs::ContentId,
+  packs: &[(slates_vcs::ContentId, Vec<u8>)],
+) {
+  let first = turn(state, id);
+  let leaked = state
+    .vcs_stores
+    .git_ref(id)
+    .and_then(|(_, store)| store.repository.peek_waiting());
+  assert_eq!(leaked, None);
+  let Turned::Waiting(waited) = first else {
+    panic!("expected Turned::Waiting from git_derive, got {first:?}");
+  };
+  assert_eq!(waited.pack, expected_pack);
+  restore_on_shard(state, packs, waited);
+  while super::super::git_derive::turn(state, id) == super::super::git_derive::Turned::More {}
+}
+
+/// End-to-end shard regression (`rt-git-waiting`, §4.17.2): proves `git_encode::turn` propagates
+/// `Turned::Waiting(waited)` directly across derivation, encoding, and `Stage::Walk` tree diffs
+/// without ever parking a wait into shared `Repository::waiting`, and finishes encoding cleanly
+/// even when concurrent pushes clobber `Repository::waiting` between turns.
+#[test]
+fn t_rt_git_encode_turn_returns_waiting_without_stranding_shared_cell() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  crate::daemon::observe_first(&daemon, |state| {
+    let id = crate::git_push::tests::git_repository(state, "encode-wait");
+    let (c0, objects_0) = commit_with_blob("alpha.txt", b"alpha body for pack window\n", None);
+    let pack_0 = commit_and_evict_pack(state, id, WAIT_TEST_GREEN, c0, &objects_0);
+    let mut packs = vec![pack_0.clone()];
+
+    derive_after_first_wait(state, id, pack_0.0, &packs);
+    evict_on_shard(state, id, &pack_0.1);
+    let encode_waits = drive_turn_with_clobbers(state, id, &packs);
+    assert!(
+      encode_waits >= 1,
+      "expected Turned::Waiting from encoding after re-evicting pack_0"
+    );
+    assert_eq!(state.refusals.get(super::ENCODED).copied(), Some(1));
+
+    // Second version on the same green exercises `Stage::Walk` tree-diff against evicted packs.
+    let (c1, objects_1) = commit_with_blob("alpha.txt", b"beta body for pack window\n", Some(c0));
+    let pack_1 = commit_and_evict_pack(state, id, WAIT_TEST_GREEN, c1, &objects_1);
+    evict_on_shard(state, id, &pack_0.1);
+    packs.push(pack_1);
+
+    let waits = drive_turn_with_clobbers(state, id, &packs);
+    assert!(waits >= 1, "expected at least one Turned::Waiting on v1");
+    assert_eq!(state.refusals.get(super::ENCODED).copied(), Some(2));
+    assert_eq!(state.refusals.get(super::REFUSED).copied().unwrap_or(0), 0);
+  });
+  daemon.stop();
 }

@@ -230,7 +230,14 @@ fn encoded(state: &mut ShardState, id: RepositoryId) -> usize {
   };
   let mut judge = Judge::new("an encoding", seen(state));
   let mut turns = 0;
-  while git_encode::turn(state, id) != git_encode::Turned::Idle {
+  loop {
+    match git_encode::turn(state, id) {
+      git_encode::Turned::More => {}
+      git_encode::Turned::Idle => break,
+      git_encode::Turned::Waiting(waited) => {
+        panic!("unexpected let-go wait in synchronous encoding: {waited:?}");
+      }
+    }
     turns += 1;
     if let Err(stalled) = judge.stepped(seen(state)) {
       panic!("{stalled}: (its units, versions derived, versions encoded)")

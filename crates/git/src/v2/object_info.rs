@@ -496,8 +496,10 @@ pub fn answer(
   write_answer_to(arguments, format, objects, out)
 }
 
-/// Writes the answer to `arguments` to `out`, checking each line before it writes it.
-fn write_answer_to(
+/// Writes one pass of the answer to `arguments` into `out`, checking each line before writing it.
+/// Callers that already bracket emission with their own measuring pass (such as `upload::charged`)
+/// call this directly so `ObjectInfo::info` runs once per pass instead of twice per pass.
+pub(crate) fn write_answer_to(
   arguments: &[Line<Argument>],
   format: ObjectFormat,
   objects: &impl ObjectInfo,

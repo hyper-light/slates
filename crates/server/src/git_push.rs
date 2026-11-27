@@ -306,6 +306,10 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   /// Let-go pack windows brought back for this push's reads, pinned until the push ends so
   /// concurrent fetches cannot evict them mid-push.
   resident: crate::vcs_http::git::upload::Resident,
+  /// Let-go pack window this push's last paused turn met, captured synchronously inside the owner
+  /// shard turn before leaving the shard so concurrent pushes on the same repository cannot clear
+  /// or overwrite it before [`Self::bring_back_waited`] runs.
+  waited: Option<slates_git::store::packed::Waited>,
   /// Unpacked-but-unnamed objects buffered on the owner shard until the batch reaches the derived
   /// scatter target or the pack ends.
   pending_batch: slates_git::unpack::DeferredBatch,
@@ -545,31 +549,14 @@ impl<P> ReceivePack<P> {
     self.repository
   }
 
-  /// Brings back and pins the let-go window the push's last turn met, if any, so concurrent
-  /// fetches cannot evict it before the push's next turn.
+  /// Brings back and pins the let-go window this push's last paused turn met, if any, so
+  /// concurrent fetches or sibling pushes cannot evict or overwrite it before this push's next
+  /// turn.
   pub(crate) async fn bring_back_waited(&mut self) {
-    if !crate::vcs_store::upload::brought_back_waited_into(self.repository, &mut self.resident)
-      .await
-    {
+    let Some(waited) = self.waited.take() else {
       return;
-    }
-    // `brought_back_waited_into` drains a stopped background encoding before `Repository::waiting`;
-    // if an encoding consumed the first call while this push's own let-go window is still noted on
-    // the repository, drain it now so the next turn finds its window resident and pinned.
-    match crate::state::with_state(|state| {
-      state
-        .vcs_stores
-        .git_ref(self.repository)
-        .and_then(|(_, store)| store.repository.peek_waiting())
-    }) {
-      Some(Some(_waited)) => {
-        let _brought_back =
-          crate::vcs_store::upload::brought_back_waited_into(self.repository, &mut self.resident)
-            .await;
-      }
-      Some(None) => {}
-      None => {}
-    }
+    };
+    let _brought = crate::vcs_store::upload::brought_one(waited, &mut self.resident, None).await;
   }
 
   /// Whether the client asked its answer multiplexed (`side-band-64k`), once its request is read.
@@ -641,6 +628,7 @@ impl<P> ReceivePack<P> {
       unadmitted: None,
       refusal_names: None,
       resident: crate::vcs_http::git::upload::Resident::new(),
+      waited: None,
       pending_batch: slates_git::unpack::DeferredBatch::default(),
       in_flight: None,
       deferred_error: None,
@@ -888,6 +876,7 @@ impl<P> ReceivePack<P> {
     state: &mut ShardState,
   ) -> Result<(slates_git::unpack::DeferredResolve, DispatchMeta), PushFailed> {
     let began = slates_rt::futures::now_ns();
+    self.waited = None;
     let meta = self.dispatch_meta(state);
     let batch_target = self.deferred_batch_target(state, &meta);
     let quantum_ns = meta.quantum_ns;
@@ -907,7 +896,7 @@ impl<P> ReceivePack<P> {
   ) -> Result<slates_git::unpack::DeferredResolve, PushFailed> {
     let mut next_ask = began.saturating_add(quantum_ns);
     loop {
-      let step = {
+      let (step, waited) = {
         let Self {
           repository,
           session,
@@ -921,7 +910,7 @@ impl<P> ReceivePack<P> {
             .vcs_stores
             .git_ref(*repository)
             .ok_or(PushFailed::NoStore)?;
-          intake::clear_waiting(&git.repository);
+          let waiting = intake::WaitingScope::enter(&git.repository);
           let mut site = intake::Intake {
             indexed: IndexedObjects::new(&git.repository, content, admission.left()),
             quarantined: intake::Quarantined {
@@ -936,14 +925,16 @@ impl<P> ReceivePack<P> {
             clock: &mut clock,
             ns: quantum_ns,
           };
-          session
+          let step = session
             .resolve_turn_deferred(&mut site, admission, pending_batch, (batch_target, quantum))
-            .map_err(PushFailed::Exchange)
+            .map_err(PushFailed::Exchange)?;
+          Ok((step, waiting.take()))
         })?
       };
       if step != slates_git::unpack::DeferredResolve::Batch
         || self.pending_batch.bytes() >= batch_target
       {
+        self.waited = waited.filter(|_| step == slates_git::unpack::DeferredResolve::Away);
         return Ok(step);
       }
       let now = slates_rt::futures::now_ns();
@@ -966,6 +957,7 @@ impl<P> ReceivePack<P> {
     state: &mut ShardState,
     err: slates_git::unpack::Refusal,
   ) {
+    self.waited = None;
     let Self {
       repository,
       session,
@@ -977,7 +969,7 @@ impl<P> ReceivePack<P> {
       let Some((content, git)) = state.vcs_stores.git_ref(*repository) else {
         return;
       };
-      intake::clear_waiting(&git.repository);
+      let _waiting = intake::WaitingScope::enter(&git.repository);
       let mut site = intake::Intake {
         indexed: IndexedObjects::new(&git.repository, content, admission.left()),
         quarantined: intake::Quarantined {
@@ -999,6 +991,7 @@ impl<P> ReceivePack<P> {
     bytes: &[u8],
   ) -> Result<DeferredStep, PushFailed> {
     let began = slates_rt::futures::now_ns();
+    self.waited = None;
     let (deferred, queue) = {
       let Self {
         repository,
@@ -1013,7 +1006,7 @@ impl<P> ReceivePack<P> {
           .vcs_stores
           .git_ref(*repository)
           .ok_or(PushFailed::NoStore)?;
-        intake::clear_waiting(&git.repository);
+        let _waiting = intake::WaitingScope::enter(&git.repository);
         let mut site = intake::Intake {
           indexed: IndexedObjects::new(&git.repository, content, admission.left()),
           quarantined: intake::Quarantined {
@@ -1085,6 +1078,7 @@ impl<P> ReceivePack<P> {
           }
           return (Vec::new(), None);
         };
+        let _waiting = intake::WaitingScope::enter(&git.repository);
         let indexed = IndexedObjects::new(&git.repository, content, admission.left());
         session.settle_deferred(verified, &indexed, admission)
       })
@@ -1116,9 +1110,12 @@ impl<P> ReceivePack<P> {
     read: Result<(), slates_git::unpack::Refusal>,
   ) -> Result<bool, PushFailed> {
     let began = slates_rt::futures::now_ns();
-    let finished = self.intake(state, &[], |session, site, admission| {
-      session.finish_deferred(read, site, admission)
-    });
+    self.waited = None;
+    let finished = self
+      .intake(state, &[], |session, site, admission| {
+        session.finish_deferred(read, site, admission)
+      })
+      .map(|(done, _)| done);
     charge_step(state, self.repository, began, 0);
     let finished = finished.map_err(|failed| self.bounded(failed))?;
     self
@@ -1132,9 +1129,12 @@ impl<P> ReceivePack<P> {
   /// exchange ends the push.
   pub(crate) fn input(&mut self, state: &mut ShardState, bytes: &[u8]) -> Result<bool, PushFailed> {
     let began = slates_rt::futures::now_ns();
-    let read = self.intake(state, bytes, |session, site, admission| {
-      session.input_into(bytes, site, admission)
-    });
+    self.waited = None;
+    let read = self
+      .intake(state, bytes, |session, site, admission| {
+        session.input_into(bytes, site, admission)
+      })
+      .map(|(done, _)| done);
     let bytes_in = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     self.read_bytes = self.read_bytes.saturating_add(bytes_in);
     charge_step(state, self.repository, began, bytes_in);
@@ -1189,9 +1189,12 @@ impl<P> ReceivePack<P> {
   /// push; a pack cut short is checked as git answers a short pack.
   pub(crate) fn end(&mut self, state: &mut ShardState) -> Result<bool, PushFailed> {
     let began = slates_rt::futures::now_ns();
-    let ended = self.intake(state, &[], |session, site, admission| {
-      session.end_into(site, admission)
-    });
+    self.waited = None;
+    let ended = self
+      .intake(state, &[], |session, site, admission| {
+        session.end_into(site, admission)
+      })
+      .map(|(done, _)| done);
     charge_step(state, self.repository, began, 0);
     let ended = ended.map_err(|failed| self.bounded(failed))?;
     self
@@ -1203,6 +1206,7 @@ impl<P> ReceivePack<P> {
   /// Runs `call` of the session over the push's intake site, read only over the repository's index
   /// and the quarantine, then keeps the pack `input` brought and admits what it resolved to the quarantine (`intake`'s
   /// module docs). A store's refusal is kept to answer every command, and nothing more is admitted after it.
+  /// Synchronously drains any let-go pack window noted on `git.repository` before leaving the shard closure.
   fn intake(
     &mut self,
     state: &mut ShardState,
@@ -1212,7 +1216,7 @@ impl<P> ReceivePack<P> {
       &mut intake::Intake<'_>,
       &mut Admission,
     ) -> Result<bool, receive::Refusal>,
-  ) -> Result<bool, PushFailed> {
+  ) -> Result<(bool, Option<slates_git::store::packed::Waited>), PushFailed> {
     let Self {
       repository,
       session,
@@ -1220,12 +1224,12 @@ impl<P> ReceivePack<P> {
       quarantine,
       ..
     } = self;
-    let (called, queue) = with_room(state, |state| {
+    let (called, queue, waited) = with_room(state, |state| {
       let (content, git) = state
         .vcs_stores
         .git_ref(*repository)
         .ok_or(PushFailed::NoStore)?;
-      intake::clear_waiting(&git.repository);
+      let waiting = intake::WaitingScope::enter(&git.repository);
       let mut site = intake::Intake {
         indexed: IndexedObjects::new(&git.repository, content, admission.left()),
         quarantined: intake::Quarantined {
@@ -1236,7 +1240,7 @@ impl<P> ReceivePack<P> {
         queue: BTreeMap::new(),
       };
       let called = call(session, &mut site, admission);
-      Ok::<_, PushFailed>((called, site.queue))
+      Ok::<_, PushFailed>((called, site.queue, waiting.take()))
     })?;
     match (quarantine.as_mut(), self.unadmitted.is_some()) {
       (Some(quarantine), false) => {
@@ -1251,7 +1255,9 @@ impl<P> ReceivePack<P> {
         }
       }
     }
-    called.map_err(PushFailed::Exchange)
+    called
+      .map(|done| (done, waited))
+      .map_err(PushFailed::Exchange)
   }
 
   /// One turn of the pack's checks (A-719), for the shard's step quantum and at least one object,
@@ -1264,7 +1270,7 @@ impl<P> ReceivePack<P> {
     // admitted to the quarantine as an input's is.
     if self.session.is_resolving() {
       let ns = state.config.step_quantum_ns();
-      self.intake(state, &[], |session, site, admission| {
+      let (done, waited) = self.intake(state, &[], |session, site, admission| {
         let mut clock = ShardClock;
         let quantum = Quantum {
           clock: &mut clock,
@@ -1272,6 +1278,7 @@ impl<P> ReceivePack<P> {
         };
         session.resolve_turn_into(site, admission, quantum)
       })?;
+      self.waited = waited.filter(|_| !done);
       return Ok(false);
     }
     if !self.session.is_checking() {
@@ -1285,12 +1292,12 @@ impl<P> ReceivePack<P> {
       quarantine,
       ..
     } = self;
-    with_room(state, |state| {
+    let (done, waited) = with_room(state, |state| {
       let (content, git) = state
         .vcs_stores
         .git_ref(*repository)
         .ok_or(PushFailed::NoStore)?;
-      intake::clear_waiting(&git.repository);
+      let waiting = intake::WaitingScope::enter(&git.repository);
       let indexed = intake::TrackedIndexed::new(&git.repository, content, admission.left());
       let quarantined = intake::Quarantined {
         push: quarantine.as_ref().map(GitPush::quarantine),
@@ -1302,10 +1309,13 @@ impl<P> ReceivePack<P> {
         clock: &mut clock,
         ns,
       };
-      session
+      let done = session
         .check_turn_with((&indexed, &quarantined), admission, quantum)
-        .map_err(PushFailed::Exchange)
-    })
+        .map_err(PushFailed::Exchange)?;
+      Ok((done, waiting.take()))
+    })?;
+    self.waited = waited.filter(|_| !done);
+    Ok(done)
   }
 
   /// Gives back the quarantine the push's pack was read into, holding nothing of the shard after.
@@ -1469,6 +1479,7 @@ impl<P> ReceivePack<P> {
         restaging,
         preparing,
         peel_away,
+        waited: &mut self.waited,
         making_room,
         door,
       };
@@ -1563,7 +1574,7 @@ impl<P> ReceivePack<P> {
 
   /// Whether the edge must step out after `answer_step` to bring back a let-go window or run a
   /// homing/landing carry task off the shard.
-  fn needs_edge_io(&self, state: &ShardState) -> bool {
+  fn needs_edge_io(&self) -> bool {
     let homing_asked = matches!(
       &self.answer,
       AnswerState::Deciding(decision)
@@ -1572,11 +1583,7 @@ impl<P> ReceivePack<P> {
           Homing::Asked(..) | Homing::PackAsked(..) | Homing::LandAsked(..)
         )
     );
-    homing_asked
-      || state
-        .vcs_stores
-        .git_ref(self.repository)
-        .is_some_and(|(_, store)| store.repository.peek_waiting().is_some())
+    homing_asked || self.waited.is_some()
   }
 
   /// What a decision asks the edge to carry off the shard's step ([`Homing`], [`Carry`]), once: the edge awaits
@@ -1701,6 +1708,24 @@ type Then = Option<hooks::PushHooks>;
 #[cfg(not(unix))]
 type Then = ();
 
+/// Clears any stale let-go window noted on `repository`'s shared `waiting` cell in `state`.
+fn clear_repo_waiting(state: &ShardState, repository: RepositoryId) {
+  if let Some((_, git)) = state.vcs_stores.git_ref(repository) {
+    intake::clear_waiting(&git.repository);
+  }
+}
+
+/// Synchronously drains any let-go window noted on `repository`'s shared `waiting` cell in `state`.
+fn take_repo_waiting(
+  state: &ShardState,
+  repository: RepositoryId,
+) -> Option<slates_git::store::packed::Waited> {
+  state
+    .vcs_stores
+    .git_ref(repository)
+    .and_then(|(_, git)| git.repository.waiting())
+}
+
 #[cfg(unix)]
 impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
   /// One step of the checked push's answer (module docs, "A step at a time"), writing what git
@@ -1713,9 +1738,17 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
     out: &mut impl Out,
   ) -> Result<Answering, PushFailed> {
     let began = slates_rt::futures::now_ns();
+    self.waited = None;
+    clear_repo_waiting(state, self.repository);
     let stepped = self
       .answer_turn(state, out)
       .map_err(|failed| self.bounded(failed));
+    let residual = take_repo_waiting(state, self.repository);
+    if matches!(stepped, Ok(Answering::Turned)) {
+      self.waited = self.waited.or(residual);
+    } else {
+      self.waited = None;
+    }
     charge_answer(state, (self.repository, self.read_bytes), began, &stepped);
     stepped
   }
@@ -1741,7 +1774,7 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
       }
       let now = slates_rt::futures::now_ns();
       if out.len() > before_out
-        || self.needs_edge_io(state)
+        || self.needs_edge_io()
         || silent_until.is_some_and(|until| now >= until)
         || now.saturating_sub(began) >= ceiling
       {
@@ -1826,7 +1859,10 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
     answer: HookAnswer,
     out: &mut impl Out,
   ) -> Result<(), PushFailed> {
-    hooks::ran(self, state, answer, out)
+    clear_repo_waiting(state, self.repository);
+    let result = hooks::ran(self, state, answer, out);
+    clear_repo_waiting(state, self.repository);
+    result
   }
 
   /// A step of the hooks before the verdicts, then the verdicts once they have answered.
@@ -1852,9 +1888,17 @@ impl<P> ReceivePack<P> {
     out: &mut impl Out,
   ) -> Result<Answering, PushFailed> {
     let began = slates_rt::futures::now_ns();
+    self.waited = None;
+    clear_repo_waiting(state, self.repository);
     let stepped = self
       .answer_turn(state, out)
       .map_err(|failed| self.bounded(failed));
+    let residual = take_repo_waiting(state, self.repository);
+    if matches!(stepped, Ok(Answering::Turned)) {
+      self.waited = self.waited.or(residual);
+    } else {
+      self.waited = None;
+    }
     charge_answer(state, (self.repository, self.read_bytes), began, &stepped);
     stepped
   }
@@ -1880,7 +1924,7 @@ impl<P> ReceivePack<P> {
       }
       let now = slates_rt::futures::now_ns();
       if out.len() > before_out
-        || self.needs_edge_io(state)
+        || self.needs_edge_io()
         || silent_until.is_some_and(|until| now >= until)
         || now.saturating_sub(began) >= ceiling
       {
@@ -2745,6 +2789,9 @@ struct ServerJudge<'j> {
   preparing: &'j mut Option<slates_git::receive::works::Preparing>,
   /// Where the let-go window the command under way's peel last stopped for lies (A-864's push readers, r18).
   peel_away: &'j mut Option<u64>,
+  /// Let-go pack window captured synchronously inside the current decision turn, if it paused
+  /// waiting for one.
+  waited: &'j mut Option<slates_git::store::packed::Waited>,
   /// The member greens still to checkpoint before the command under way's append ([`DecidingPush::making_room`]).
   making_room: &'j mut Option<Vec<DbVolumeId>>,
   /// The green owing its push that the command under way waits at the door for (P2).
@@ -2948,6 +2995,7 @@ impl ServerJudge<'_> {
         return Err(refused_declined(name, words(&GitRefused::NoStore)));
       };
       let (content, git) = store;
+      let _waiting = intake::WaitingScope::enter(&git.repository);
       let green = born(state, (record.id, name), store).unwrap_or_else(|| unheld_key(record.id));
       let to = (!command.is_delete()).then_some(command.new);
       let change = git
@@ -2991,7 +3039,7 @@ impl ServerJudge<'_> {
       };
       let (content, git) = store;
       let room = state.store.admittable();
-      intake::clear_waiting(&git.repository);
+      let _waiting = intake::WaitingScope::enter(&git.repository);
       let indexed = intake::TrackedIndexed::new(&git.repository, content, room);
       let objects = PushedObjects::new(&git.repository, content, push.quarantine());
       let greens = ShardGreens {
@@ -3050,13 +3098,13 @@ impl ServerJudge<'_> {
       copy_bytes: state.config.copy_slice_bytes_within(quantum).max(1),
       hash_bytes: state.config.archive_slice_bytes_within(quantum).max(1),
     };
-    let (built, owing, examined) = with_room(state, |state| {
+    let (built, owing, examined, waited) = with_room(state, |state| {
       let Some(store) = state.vcs_stores.git_ref(record.id) else {
-        return Ok::<_, Declined>((true, None, 0));
+        return Ok::<_, Declined>((true, None, 0, None));
       };
       let (content, git) = store;
       let room = state.store.admittable();
-      intake::clear_waiting(&git.repository);
+      let waiting = intake::WaitingScope::enter(&git.repository);
       let indexed = intake::TrackedIndexed::new(&git.repository, content, room);
       let objects = PushedObjects::new(&git.repository, content, push.quarantine());
       let greens = ShardGreens {
@@ -3070,16 +3118,24 @@ impl ServerJudge<'_> {
       let verdicts = Verdicts::new(&greens, &indexed, &objects, *name, room).peeled(**peel_away);
       let built = verdicts.prepare(command, pushed, preparing, (began, env), slices);
       **peel_away = verdicts.away_seen();
-      Ok((built, greens.owing.get(), greens.examined.get()))
+      Ok((
+        built,
+        greens.owing.get(),
+        greens.examined.get(),
+        waiting.take(),
+      ))
     })
-    .unwrap_or((true, None, 0));
+    .unwrap_or((true, None, 0, None));
     state.count(HOLDING_EXAMINED, examined);
     // A green the command reached that owes its push is made first, through the door, and the command waits for it a
     // turn at a time (P2): its verdict reads it. A turn that only found it builds nothing and is not counted.
     if let Some(green) = owing {
-      return self.door(green);
+      let ready = self.door(green);
+      *self.waited = waited.filter(|_| !ready);
+      return ready;
     }
     *self.door = None;
+    *self.waited = waited.filter(|_| !built);
     let ended = slates_rt::futures::now_ns();
     // What the turn may pass its budget by: its opening (the admission's turn and the views set up before its first
     // unit, which always runs), one unit, and what it does after its last ask (the views given back). A turn is those
