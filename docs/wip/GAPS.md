@@ -296,8 +296,11 @@
 > or with no names log, counted by why. And a lineage's hand-over waited without end on a member never pending (its
 > branch rebuilt a second root after the first had gone, 2 of 5 runs of the read test): it now waits for the family's
 > members pending here, each in the lineage at its adopted version, bounded by their own attempts. Red first (two
-> `a927_` fleet tests, the join held off the successor-to-be alone; three `merge_origin` units). OWED (main): the a894
-> loop's after (bar 0 of 40).
+> `a927_` fleet tests, the join held off the successor-to-be alone; three `merge_origin` units). The a894 loop's after met its
+> bar (main, 2026-11-26, c207c9f81 with a52c0aa1e, debug): 0 of 40, 20 ambient (mean 7.2 s, max 15 s) and 20 under 12
+> burners (mean 12.3 s, max 62 s), interleaved, load 17 to 31, every marker zero (files-no-commit, not-materialized,
+> not-recovered, barrier, wedged); before, 3 of 41 at 03c736286, each "files no commit names"
+> (~/.local/state/main-01a20182/rounds/loop-a894-after/summary.txt).
 > **FIXED (A-913, w-shared, 2026-11-24; A-912's sibling): a branch created while a member died refused `unable to
 > commit` at its record barrier (3 of 25 runs).** The restarted holder held its source's records but no replica, and
 > the record path branched only from a replica already there; now it makes a missing source first, as a branch's
@@ -363,6 +366,11 @@
 >     version again (v2 acked [a] and shipped once, v3 on none, nothing to the newcomer), so the push still never lands
 >     (3 of 3 refused in the deterministic red). Fix by the same rule: a warm start's pending versions owed again, their
 >     shipment state rebuilt from their recorded acks; its fix asserts the push in that red.
+>   - **OPEN, found 2026-11-26 (w-shared):** `a921_a_warm_restarted_node_never_names_a_false_death_victim_its_old_volumes_owner`
+>     fails 3 of 3 on main past 03c736286 (green when A-921 part 2 landed): the warm-restarted stranger's direct route
+>     names a (`named a true`, claims 0), while its status is served. It fails alike with A-921 part 3's runtime changes
+>     turned off, so it is not that change: something on main since moved the creator skip's case. Owner: w-shared,
+>     after (2).
 >   - **FIXED, its prerequisite (A-925):** each node announces its own edges (git HTTP or HTTPS, SSH) to its peers over
 >     stream 33, as a client reaches them, held only from its own authenticated session; an owner of no learned edge is
 >     the typed refusal naming its member id.
