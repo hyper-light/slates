@@ -682,7 +682,22 @@
 >   `Verdicts::peel_away` peels the new value at the top of every `Verdicts::prepare`, before its done check, waiting on
 >   a let-go window it meets (A-864's tag peel, precondition (a)), and the verdict runs in the same synchronous step as
 >   the `ready` that answered true, so its peel meets what `peel_away` read in that step.
-> - OPEN: B8 (the encoding's tree walk: time, not correctness).
+> - **B8 BUILT (w-git, 2026-11-27): the encoding's tree walk.** `Encoding::walk` read a version's root tree and its
+>   previous version's through `Repository::tree_entries`, whose let-go read answered `Unreadable`, so a walk that met a
+>   let-go window refused the whole encoding: the version left unencoded and counted `vcs_store.git_encode.refused`, and
+>   the fetch's stream searched its objects again, offered again at the next fetch (time, not an answer; goal 93 item
+>   2a makes an encoding's packs resident before it begins, so only a let-go during the encoding reached it). Now both
+>   trees are read quietly before the pair is noted, and a read that met a let-go window stops the walk with the pair
+>   held to walk again once the window is brought back, as the encoding's other units stop (`stopped_unit`); a window
+>   met again, or a read that met none, refuses as before. Red at the site:
+>   `store::tests::packed::b8_an_encodings_tree_walk_stops_at_a_let_go_tree_and_keeps_the_same_fragments` (two
+>   versions landed as packs of whole entries, every window let go: `Unreadable` on the walk's tree before; after, the
+>   walk stops, walks the one pair the resident encoding walks, and the clone is byte for byte the resident one's).
+> - OPEN (sibling of B8; left recorded by main's ruling of 2026-11-27 04:41, by reading alone, its cost time): the
+>   encoding's stop rule (`Encoding::stop_at`, A-864 piece 2) is keyed by a window's place, once an encoding, not by the
+>   let-go's number as `slates_git::away::WaitOnce` is, so a window brought back by another reader and let go again
+>   before the encoding reads it refuses the encoding (time, as B8's was). It becomes an item, that run its red, if a
+>   57k or interop fetch shows `vcs_store.git_encode.refused` moving.
 > **P OPEN (w-git; main's r229, 2026-11-23): git/git's HTTP mirror clone takes about 100 s** (97.9 and 107.7 s, 556 MB
 > against stock git's 612 MB; the work clone 92.9 and 97.2 s), the daemon CPU-bound at 97% of one core: blake3,
 > `Index::get`, `ContentStore::get` / `len_of` / `window_at_in`, `Positions::settle`. No stall; to be profiled.
