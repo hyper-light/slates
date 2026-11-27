@@ -76,3 +76,12 @@ older form.
 - `a_claim_begun_before_a_restart_judges_the_daemon_that_answered_it_alive` (`crates/ipc/tests/rendezvous.rs`) hands
   the held rendezvous on in its re-invoked child, as the anchor's spawn does.
 - The Linux tests run on Linux CI (main's): the TSan lane and the anchor's cross-process tests (`run-requests.md`).
+
+## Siblings, converted the same day
+
+The CLI suites that hand a fleet node's serve sockets to a `slates` process they spawn made an inheritable duplicate
+of each in the test process first (`fs_server`, `live_fleet`, `cli` four times, `hg_takeover`, `v3_takeover`,
+`live_chaos`). That is the same defect, with the same flake: every other child a test of the binary started meanwhile
+kept the duplicate and the port. Each now makes a close-on-exec duplicate and hands it on to its one child through
+`crates/cli/tests/support/hand_on.rs` (`HandOn::handing_on`, `pre_exec` in the child alone), included by `#[path]`.
+`crates/server/tests/virtiofs.rs` already cleared the flag in its child, and needed no change.

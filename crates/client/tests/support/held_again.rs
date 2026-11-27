@@ -23,7 +23,7 @@ const RELEASE_WAIT: Duration = Duration::from_nanos(CLAIM_WAIT_NS);
 /// Holds `instance`'s rendezvous, retried while it is refused as held ([`refused_as_held`]) within [`RELEASE_WAIT`],
 /// for the reason in the module doc. Prints how many refusals it waited out, so a log shows when another test's spawn
 /// held the address.
-pub fn hold_once_released(instance: &str) -> HeldRendezvous {
+pub(crate) fn hold_once_released(instance: &str) -> HeldRendezvous {
   let deadline = Instant::now() + RELEASE_WAIT;
   let mut refusals = 0u32;
   loop {

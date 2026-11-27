@@ -374,10 +374,14 @@
 >     only in its owner's floors (each by its greater) and acknowledges it. And a replica store made before the missed
 >     part arrived refused every build `Missing` (94 a run): after a refused build, the store is made again from every
 >     part held. Red first: the push lands, 5 of 5. Every silent exit of the merge plane's ship and hold is now counted.
->   - **OPEN, A-921's next (w-shared, after the false-death regression):** 3 of 10 owner-restart scenes, a survivor
->     adopted a's green with a candidate's death though a lives and its fencing epoch never moved; a's records were
->     then refused `Unauthorized` (89 to 386 a run) and its repository's `main` left a. The owed-part scene forms afresh
->     where it happens (`adopted_elsewhere_of`); A919's owner-restart test stays ignored for it. Not yet understood.
+>   - **FIXED, A-921's next (A-921 part 5, w-shared, 2026-11-27):** 3 of 10 owner-restart scenes, a survivor adopted
+>     a's green with a candidate's death though a lived. Two stalls on a's restart, each behind its record to the
+>     candidate stopped just then. Its epoch announcements went in turn, so every other peer kept a under its old keys
+>     and condemned it. Its member loop awaited its edges records (A-925) in turn, so a answered no probe for an
+>     exchange budget and more. Both passes now run each peer's announcement on its own task, owned by the member loop,
+>     which no longer waits on them. Red first, both: the peers re-keyed a within its 1 s detection (22 to 197 ms,
+>     against 4.4 to 7.6 s), and no peer condemned a while a silent one held its edges (3 of 3 red before). The
+>     adoption guard is gone, and A919's owner-restart test runs again (6 of 6 with the owed-part scene).
 >   - **KNOWN LIMIT (main 01a20182's ruling of 2026-11-27): a forward's first try may go to a readmitted creator.**
 >     A readmission drops the host's completed takeover (`RegionalConfiguration::admit`, A-309) and its retirement is
 >     gone once that completes, so A-921 part 2's creator skip has nothing to read for it: a node that has not yet
@@ -663,8 +667,22 @@
 >   `git_push::tests::b5_a_pushed_delta_read_over_a_let_go_base_is_not_yet_and_noted_for_the_push` (a push that has read
 >   nothing over the create's let-go pack: `Malformed` before; `NotYet`, the push's slot noted and the shared one empty,
 >   after). Net: `b5_a_verdicts_build_of_a_pushed_delta_over_a_let_go_base_lands`.
-> - OPEN: B6 (a verdict's one-call build), B7 (`push_of`'s peel at judge time, after `prepare`'s), B8 (the encoding's
->   tree walk: time, not correctness).
+> - **B6 CLOSED ON THE SERVER PATH (w-git, 2026-11-27, main's ruling): a verdict's one-call build.** `Verdicts::work`
+>   builds an update's work in one call where no prepared build of its push is left to take, and its `build` answers a
+>   let-go read `NotYet`, which `work_refused` takes for `MISSING_OBJECTS`. The server never reaches it: a create's
+>   verdict builds nothing (a deferred push its green owes, P2) and `Verdicts::prepare` returns at once for one; an
+>   update's verdict takes its base from `version_of` of its old value, which answers only while that is still the
+>   green's head at its current version, the base its preparation began from, and a moved green declines both before any
+>   build; and `receive::atomic_step` judges each command in the step that readied it. Pinned by a counter, not a mode
+>   (CLAUDE.md §2 item 7): `Verdicts::one_call_builds`, counted `git_push.verdict.one_call_builds`, 0 across
+>   `git_push::tests::b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands` and 1 for
+>   `receive::tests::works::an_update_is_its_branchs_next_work_appended_at_the_position_read` over memory, which
+>   prepares nothing.
+> - **B7 CLOSED ON THE SERVER PATH (w-git, 2026-11-27, main's ruling): `push_of`'s peel at judge time.**
+>   `Verdicts::peel_away` peels the new value at the top of every `Verdicts::prepare`, before its done check, waiting on
+>   a let-go window it meets (A-864's tag peel, precondition (a)), and the verdict runs in the same synchronous step as
+>   the `ready` that answered true, so its peel meets what `peel_away` read in that step.
+> - OPEN: B8 (the encoding's tree walk: time, not correctness).
 > **P OPEN (w-git; main's r229, 2026-11-23): git/git's HTTP mirror clone takes about 100 s** (97.9 and 107.7 s, 556 MB
 > against stock git's 612 MB; the work clone 92.9 and 97.2 s), the daemon CPU-bound at 97% of one core: blake3,
 > `Index::get`, `ContentStore::get` / `len_of` / `window_at_in`, `Positions::settle`. No stall; to be profiled.
@@ -2317,6 +2335,17 @@
 > logs, driven as the server drives it, the cut segments landed every 2, 3, 5, 8 and 16 steps: red, refused landing
 > every 2 steps after 3 asks and 96 steps; now every cadence taken, 79 to 119 asks, 6 to 41 asked again). OWED: whether
 > this race is also main's 57k hang (a stack of the hung build, main's).
+> Main's 57k intake hang found and fixed (2026-11-27, w-perf;
+> docs/bugs/2026-11-27-a-file-base-framed-without-its-let-go-block-was-asked-again-without-end.md): a file delta's base
+> whose metadata block its landing let go before the delta began was framed short (`ContentStore::windows` stops at a
+> window let go) and its bytes read at a length long by the block's, which every read refused; the bring-back restored
+> the windows but not the base captured at begin, so the intake asked the store two asks a slice without end. Now
+> `FileBase::stored` marks a base not whole, the step asks for it before reading any of it, the base is made again from
+> the fork after its bring-back, and a base is asked twice at most (a third refused `UnknownDeltaBase`), counted
+> `vcs.hg.push_base_store_reasked` beside `vcs.hg.push_base_store_reads`. Red:
+> `a_file_delta_on_a_base_whose_block_was_let_go_is_taken_after_its_base_is_brought_back` (still stepping at its derived
+> bound, 16 steps and 11 asks; now 12 steps and one ask). The manifests' race above was a sibling, not the hang. OWED:
+> main's 57k runs on the tip, the new counter moving in them.
 > C1 (2), second piece BUILT (main's ruling (B') of 2026-11-24): a push's manifest is taken a window a step and never
 > whole. Its text is made by `delta::Patching` over its base read front to back over its chain (`push::chain_read`, the
 > chain's deltas loaded: at most the base's length, A-729's bound); its lines checked and its written entries found as it

@@ -619,6 +619,11 @@ impl MemberPlane {
     }
   }
 
+  /// Whether `peer` is joined to the detector's view ([`join`](Self::join)), so its probes are judged.
+  pub fn is_joined(&self, peer: HostId) -> bool {
+    self.joined.contains(&peer.0)
+  }
+
   /// The detector's belief about `peer`, if it holds one.
   pub fn belief(&self, peer: HostId) -> Option<MemberState> {
     self.detector.membership().state(hyper_swim::HostId(peer.0))
