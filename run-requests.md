@@ -7657,3 +7657,14 @@ At or past 8fc8a0210, where these suites already run (Linux and macOS lanes, the
 - Red: a node refusing its serve sockets ("not a socket", or "bound at" a port other than its own), which would mean
   `handing_on` did not reach the child.
 - Already run on the MacBook: `a_daemon_refuses_inherited_serve_sockets_bound_elsewhere_or_malformed`, 1/1.
+
+## 2026-11-27 w-interop, diag CI 2's Windows reds 2 and 3, and the TSan wedge line, fedcbaf96
+
+At or past fedcbaf96:
+- Windows, both lanes: `cargo test -p slates-server --lib vcs_ssh::tests::hg::a_clone_over_ssh_under_burners_holds_its_shard_a_step_a_poll`
+  and `repository::store_tests::a_cleanly_restarted_import_brings_back_only_its_checkpoints_named_texts`. Green: the
+  burner test's polls and steps read nonzero CPU (the cycles clock); the import test's image split matches what
+  recovery found whole and brought back. Red: `most_ns: 0`, or image != (found, fetched).
+- The TSan lane (`cargo xtask tsan`): `a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_log_is_held` and
+  its siblings print "judged … after t0 against W + B + L" and "the end line read … after the verdict". Red: judged past
+  W + B + L (the watchdog late, product) or a read past a beat after the verdict.

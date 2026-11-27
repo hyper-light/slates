@@ -698,3 +698,7 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   runs are in run-requests.md.
 - FREE (2026-11-27 05:00 PST): nothing open; inbox/main-from-w-interop-free.md rewritten. Waiting on diag CI 6 and 7's
   verdicts (main's).
+- 2026-11-27, main's Windows reds piece: 3 (vcs_ssh step CPU on Windows from the cycles clock) and 2 (image read
+  after a publish) landed e9a2ceab2; the TSan wedge line (judged instant in the end line) landed 8d2692e00, both in
+  fedcbaf96. OPEN: red 1 (signed_work checkpoint in turns: hook choice asked of main) and red 4 (hg_import
+  overlapped=0 on arm64: diag 6's arm64 lane, then a diag branch).
