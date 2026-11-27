@@ -636,7 +636,8 @@
 >   own site, `b4_a_linear_rules_check_over_a_let_go_old_tag_waits_for_it_before_its_verdict` (ready over the let-go old
 >   tag before, the verdict `Unjudged`; after, not ready with the push's slot noted and the shared one empty, the same
 >   let-go twice its typed refusal, brought back its verdict `Ok`). The healed path's net:
->   `b4_a_linear_rules_update_of_a_let_go_tag_head_lands`.
+>   `b4_a_linear_rules_update_of_a_let_go_tag_head_lands`. The reds were taken with the policy step alone disabled
+>   (`true || policy_ready`), the tests needing its new field to compile.
 > - OPEN: B5 (`PushedObjects::bytes` of a pushed object, `Malformed`), B6 (a verdict's one-call build), B7 (`push_of`'s
 >   peel at judge time, after `prepare`'s), B8 (the encoding's tree walk: time, not correctness).
 > **P OPEN (w-git; main's r229, 2026-11-23): git/git's HTTP mirror clone takes about 100 s** (97.9 and 107.7 s, 556 MB
