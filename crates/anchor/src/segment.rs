@@ -9,7 +9,8 @@ use crate::error::AnchorError;
 use crate::layout::{
   AT_GENERATION, AT_GEOMETRY, AT_IDENTITY, AT_MAGIC, AT_TOTAL, AT_VERSION, GEOMETRY_BYTES,
   Geometry, HEADER_BYTES, IDENTITY_BYTES, ISSUER_SECRET_BYTES, LAUNCHER_SECRET_BYTES,
-  LAYOUT_VERSION, MAGIC, PAYLOAD_BYTES, PAYLOAD_GENERATION, PAYLOAD_LEN, RING_CAPACITY, RING_HEAD,
+  LAYOUT_VERSION, MAGIC, PAYLOAD_BYTES, PAYLOAD_GENERATION, PAYLOAD_LEN, RING_BYTES, RING_CAPACITY,
+  RING_HEAD, RING_MARK_RING, RING_MARK_SNAPSHOTS, RING_MARK_WORDS, RING_MARKS, RING_MARKS_VERSION,
   RING_SEQ_BASE, RING_TAIL, RegionKind, RegionSpec, SEAL_ROOT_ID_BYTES, SEAL_ROOT_KEY_BYTES,
   SESSION_SECRET_BYTES, SSH_HOST_SEED_BYTES, STUCK_LABEL_WORDS, SUP_GENERATION, SUP_HEARTBEAT,
   SUP_HOLD_REFUSALS, SUP_ISSUER, SUP_LAPSE_BOUND, SUP_LAUNCHER_PRESENT, SUP_LAUNCHER_SECRET,
@@ -18,6 +19,28 @@ use crate::layout::{
   SUP_SSH_HOST_SEED, SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, SUP_STUCK_LABEL,
   SUP_STUCK_LABEL_LEN, SUP_STUCK_POLLS, SUP_STUCK_SHARD, SUP_STUCK_WRITTEN, State,
 };
+
+/// How far a partition's log ring and snapshot slots may hold pages, bytes from each region's start
+/// ([`AnchorSegment::region_marks`], A-926).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegionMarks {
+  /// The log ring's.
+  pub ring: usize,
+  /// Each snapshot slot's.
+  pub snapshots: [usize; 2],
+}
+
+/// What one step of [`AnchorSegment::give_back_dead`] did: the bytes the OS took, the bytes it walked, and whether some
+/// is left.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GivenBack {
+  /// The bytes the OS took (whole pages).
+  pub bytes: usize,
+  /// The bytes walked: the step's cost.
+  pub walked: usize,
+  /// Whether some is left to give back.
+  pub more: bool,
+}
 
 /// The node's sealing root as the anchor holds it (A-92): its key id and its key bytes.
 pub type SealRoot = ([u8; SEAL_ROOT_ID_BYTES], [u8; SEAL_ROOT_KEY_BYTES]);
@@ -138,10 +161,11 @@ fn segment_words(geometry: &Geometry) -> Words {
           1,
           Width::U64,
         )),
+      // The ring's words, then its partition's marks (A-926).
       RegionKind::Log(_) => words.with(WordRun::strided(
         at.saturating_add(RING_HEAD),
         size_of::<u64>(),
-        RING_WORDS,
+        RING_WORDS.saturating_add(RING_MARK_WORDS),
         Width::U64,
       )),
       RegionKind::Profile
@@ -572,12 +596,14 @@ impl AnchorSegment {
     // Declared rather than opened again, since every open maps the whole object and on macOS marks it whole (84a: two
     // opens an attach, 2.4-5.3 ms each on a debug build).
     let object = object.declare(segment_words(&geometry))?;
-    Ok(AnchorSegment {
+    let segment = AnchorSegment {
       object,
       geometry,
       content: None,
       content_created: false,
-    })
+    };
+    segment.adopt_marks();
+    Ok(segment)
   }
 
   /// Attaches the metadata and content objects from the environment the anchor gave the daemon.
@@ -1326,7 +1352,205 @@ impl AnchorSegment {
           .saturating_sub(u64::try_from(crate::layout::RING_BYTES).unwrap_or(u64::MAX));
         words[2].store(capacity, Ordering::Release);
       }
+      // A fresh segment's regions are unwritten: its marks zero, in force from the start (A-926).
+      if let Ok(spec) = self.spec(kind)
+        && let Ok(version) = self.word_at(spec, RING_MARKS_VERSION)
+      {
+        version.store(RING_MARKS, Ordering::Release);
+      }
     }
+  }
+
+  /// The marks' words of `partition` (A-926): its ring header's version word, then the ring's mark and each snapshot
+  /// slot's.
+  fn mark_words(&self, partition: u16) -> Result<[&AtomicU64; RING_MARK_WORDS], AnchorError> {
+    let spec = self.spec(RegionKind::Log(partition))?;
+    Ok([
+      self.word_at(spec, RING_MARKS_VERSION)?,
+      self.word_at(spec, RING_MARK_RING)?,
+      self.word_at(spec, RING_MARK_SNAPSHOTS)?,
+      self.word_at(spec, RING_MARK_SNAPSHOTS.saturating_add(size_of::<u64>()))?,
+    ])
+  }
+
+  /// The partition and the mark's place ([`AnchorSegment::mark_words`]) a region's mark is kept at: its log ring's and
+  /// its snapshot slots'; none for any other region.
+  fn mark_of(kind: RegionKind) -> Option<(u16, usize)> {
+    match kind {
+      RegionKind::Log(partition) => Some((partition, 1)),
+      RegionKind::Snapshot(partition, slot) => {
+        Some((partition, 2usize.saturating_add(usize::from(slot.min(1)))))
+      }
+      _ => None,
+    }
+  }
+
+  /// Takes an attached segment's marks into force where its creator made none (A-926: a segment from before them): each
+  /// partition's ring and snapshot slots marked whole, today's assumption, then the version word, so a crash between
+  /// leaves them unmarked, read whole again. From then they fall at a give-back.
+  fn adopt_marks(&self) {
+    let partitions: Vec<u16> = self
+      .geometry
+      .regions()
+      .iter()
+      .filter_map(|region| match region.kind {
+        RegionKind::Log(partition) => Some(partition),
+        _ => None,
+      })
+      .collect();
+    for partition in partitions {
+      let Ok(words) = self.mark_words(partition) else {
+        continue;
+      };
+      if words[0].load(Ordering::Acquire) == RING_MARKS {
+        continue;
+      }
+      let whole = |kind: RegionKind| {
+        self
+          .region_len(kind)
+          .map_or(u64::MAX, |len| u64::try_from(len).unwrap_or(u64::MAX))
+      };
+      words[1].store(whole(RegionKind::Log(partition)), Ordering::Release);
+      words[2].store(whole(RegionKind::Snapshot(partition, 0)), Ordering::Release);
+      words[3].store(whole(RegionKind::Snapshot(partition, 1)), Ordering::Release);
+      words[0].store(RING_MARKS, Ordering::Release);
+    }
+  }
+
+  /// Test support (A-926 part 2's migration red): `partition`'s marks as an anchor before them left the segment, none in
+  /// force, so the next attach adopts them whole.
+  pub fn unmark(&self, partition: u16) -> Result<(), AnchorError> {
+    for word in self.mark_words(partition)? {
+      word.store(0, Ordering::Release);
+    }
+    Ok(())
+  }
+
+  /// How far each of `partition`'s log ring and snapshot slots may hold pages, bytes from each region's start (A-926):
+  /// what a residency sweep reads of them. Each whole where the segment keeps no marks.
+  pub fn region_marks(&self, partition: u16) -> Result<RegionMarks, AnchorError> {
+    let words = self.mark_words(partition)?;
+    let mark = |index: usize, kind: RegionKind| -> Result<usize, AnchorError> {
+      let len = self.region_len(kind)?;
+      if words[0].load(Ordering::Acquire) != RING_MARKS {
+        return Ok(len);
+      }
+      let value = words
+        .get(index)
+        .map_or(u64::MAX, |word| word.load(Ordering::Acquire));
+      Ok(usize::try_from(value).unwrap_or(usize::MAX).min(len))
+    };
+    Ok(RegionMarks {
+      ring: mark(1, RegionKind::Log(partition))?,
+      snapshots: [
+        mark(2, RegionKind::Snapshot(partition, 0))?,
+        mark(3, RegionKind::Snapshot(partition, 1))?,
+      ],
+    })
+  }
+
+  /// Raises `kind`'s mark to cover `end` bytes from the region's start, rounded up to a page, before the write that
+  /// reaches there (A-926): one store a page the region grows by, a release fence after it so the write follows it.
+  /// Nothing for a region that keeps no mark, or where the mark covers it.
+  pub fn raise_region_mark(&self, kind: RegionKind, end: usize) -> Result<(), AnchorError> {
+    let Some((partition, index)) = Self::mark_of(kind) else {
+      return Ok(());
+    };
+    let words = self.mark_words(partition)?;
+    let Some(word) = words.get(index) else {
+      return Ok(());
+    };
+    let end = u64::try_from(end).unwrap_or(u64::MAX);
+    if word.load(Ordering::Acquire) >= end {
+      return Ok(());
+    }
+    let page = self.geometry.page.max(1);
+    word.store(
+      end.checked_next_multiple_of(page).unwrap_or(u64::MAX),
+      Ordering::Release,
+    );
+    std::sync::atomic::fence(Ordering::Release);
+    Ok(())
+  }
+
+  /// One step of the give-back of `partition`'s pages no read reaches again (A-926; A-746's owed give-back): its log ring
+  /// past its tail while the ring has not wrapped since a committed snapshot released it (A-71's reset: replay reads only
+  /// from the head to the tail), and each snapshot slot past its current payload (a read takes only the payload's
+  /// length), each from the top down, as far as its mark, at most `budget` bytes in all. Each mark falls after its pages
+  /// are given back, so a crash between leaves it ahead, never behind. For the region's single writer, between its own
+  /// writes. A step stopped after `stop_after` of its stores (test support, the crash oracle) leaves the rest undone.
+  pub fn give_back_dead(
+    &mut self,
+    partition: u16,
+    (budget, stop_after): (usize, Option<usize>),
+  ) -> Result<GivenBack, AnchorError> {
+    let marks = self.region_marks(partition)?;
+    let ring = RegionKind::Log(partition);
+    let [_, tail, capacity, _] = self
+      .ring_words(ring)?
+      .map(|word| word.load(Ordering::Acquire));
+    let mut dead: Vec<(RegionKind, usize, usize)> = Vec::new();
+    if tail <= capacity {
+      let from = RING_BYTES.saturating_add(usize::try_from(tail).unwrap_or(usize::MAX));
+      dead.push((ring, from, marks.ring));
+    }
+    for (slot, mark) in [0u8, 1].into_iter().zip(marks.snapshots) {
+      let kind = RegionKind::Snapshot(partition, slot);
+      let mut len = [0u8; size_of::<u64>()];
+      self.region_read_racy(kind, PAYLOAD_LEN, &mut len)?;
+      let payload = usize::try_from(u64::from_le_bytes(len)).unwrap_or(usize::MAX);
+      dead.push((kind, PAYLOAD_BYTES.saturating_add(payload), mark));
+    }
+    let mut given = GivenBack::default();
+    let mut left = budget;
+    let mut stores = 0usize;
+    for (kind, from, mark) in dead {
+      if mark <= from {
+        continue;
+      }
+      let piece = mark.saturating_sub(from).min(left);
+      if piece == 0 {
+        given.more = true;
+        continue;
+      }
+      let lowered_to = mark.saturating_sub(piece);
+      if stop_after.is_some_and(|stop| stores >= stop) {
+        return Ok(given);
+      }
+      let start = self.region_span(kind, lowered_to, piece)?;
+      // A snapshot slot's payload bytes are racy (its seqlock's), the ring's plain.
+      let taken = if matches!(kind, RegionKind::Snapshot(..)) {
+        self.object.discard_racy(start, piece)?
+      } else {
+        self.object.discard(start, piece)?
+      };
+      given.bytes = given.bytes.saturating_add(taken);
+      given.walked = given.walked.saturating_add(piece);
+      stores = stores.saturating_add(1);
+      left = left.saturating_sub(piece);
+      if stop_after.is_some_and(|stop| stores >= stop) {
+        return Ok(given);
+      }
+      self.lower_mark(kind, lowered_to)?;
+      stores = stores.saturating_add(1);
+      given.more |= lowered_to > from;
+    }
+    Ok(given)
+  }
+
+  /// Lowers `kind`'s mark to `end` where it is above it: after its pages past `end` were given back (A-926).
+  fn lower_mark(&self, kind: RegionKind, end: usize) -> Result<(), AnchorError> {
+    let Some((partition, index)) = Self::mark_of(kind) else {
+      return Ok(());
+    };
+    let words = self.mark_words(partition)?;
+    if let Some(word) = words.get(index) {
+      let end = u64::try_from(end).unwrap_or(u64::MAX);
+      if word.load(Ordering::Acquire) > end {
+        word.store(end, Ordering::Release);
+      }
+    }
+    Ok(())
   }
 
   /// Publishes a payload into a payload region (the profile, a snapshot slot, a landing
@@ -1343,6 +1567,8 @@ impl AnchorSegment {
         capacity,
       });
     }
+    // A snapshot slot's mark covers the payload before any byte of it is written (A-926).
+    self.raise_region_mark(kind, PAYLOAD_BYTES.saturating_add(payload.len()))?;
     let generation = self.word_at(spec, PAYLOAD_GENERATION)?;
     let start = generation.load(Ordering::Acquire);
     generation.store(start | 1, Ordering::Release);
@@ -1354,6 +1580,11 @@ impl AnchorSegment {
         .to_le_bytes(),
     )?;
     self.region_write_racy(kind, PAYLOAD_BYTES, payload)?;
+    #[cfg(test)]
+    if STOP_AFTER_PAYLOAD.with(core::cell::Cell::get) {
+      // The crash point A-926 part 2's red holds: the payload's bytes written, nothing after.
+      return Err(AnchorError::PublicationInProgress);
+    }
     let generation = self.word_at(spec, PAYLOAD_GENERATION)?;
     generation.store((start | 1).wrapping_add(1), Ordering::Release);
     Ok(())
@@ -1415,4 +1646,65 @@ fn read_u64(bytes: &[u8], at: usize) -> u64 {
 
 fn hex(bytes: &[u8]) -> String {
   bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+std::thread_local! {
+  /// Test support (A-926 part 2's crash red): a publish stops right after its payload's bytes are written, as an
+  /// anchor or daemon killed there leaves its slot.
+  static STOP_AFTER_PAYLOAD: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Shape: the test segment's page.
+  const PAGE: u64 = 4096;
+
+  /// A one-partition segment named for `tag`.
+  fn segment(tag: &str) -> AnchorSegment {
+    let identity = Identity {
+      cpu: "test".into(),
+      os: "test".into(),
+      arch: "test".into(),
+      cores: 1,
+      memory: 1,
+      page: PAGE,
+    };
+    AnchorSegment::create(
+      &format!("slates-anchor-marks-{tag}-{}", std::process::id()),
+      &identity,
+      Geometry {
+        partitions: 1,
+        page: PAGE,
+        profile_bytes: PAGE,
+        log_bytes: 16 * PAGE,
+        snapshot_bytes: 16 * PAGE,
+        landing_slots: 1,
+        landing_slot_bytes: PAGE,
+      },
+    )
+    .unwrap()
+  }
+
+  /// A-926 part 2, the crash point (main's ruling of 2026-11-25: raised before the write, a crash leaves the mark
+  /// ahead of the data, never behind). Do: publish a payload of three pages into a fresh segment's snapshot slot,
+  /// stopped right after its bytes are written, as a process killed there. Expect the slot's mark covering every byte
+  /// the payload wrote. Red with the mark raised after the payload's bytes: the mark nowhere near them.
+  #[test]
+  fn a_crash_after_a_payloads_bytes_leaves_its_slots_mark_covering_them() {
+    let mut seg = segment("crash");
+    let payload = vec![7u8; 3 * PAGE as usize];
+    STOP_AFTER_PAYLOAD.with(|stop| stop.set(true));
+    let stopped = seg.publish(RegionKind::Snapshot(0, 1), &payload);
+    STOP_AFTER_PAYLOAD.with(|stop| stop.set(false));
+    assert!(stopped.is_err(), "the publish stopped after its bytes");
+    let mark = seg.region_marks(0).unwrap().snapshots[1];
+    assert!(
+      mark >= PAYLOAD_BYTES + payload.len(),
+      "the slot's mark {mark} covers the payload's bytes, to {}",
+      PAYLOAD_BYTES + payload.len()
+    );
+  }
 }

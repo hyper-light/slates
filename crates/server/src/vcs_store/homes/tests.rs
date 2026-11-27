@@ -258,6 +258,99 @@ fn a_homed_windows_ticket_is_published_only_once_its_homes_image_is() {
   assert!(outcome.is_empty(), "{outcome:#?}");
 }
 
+/// Home wire 0x87 (main 01a20182's order of 2026-11-26 after r42: a homed object's put waited for its remote home's image,
+/// once an object). Do: on a two-shard daemon, the region's one member at f = 0 (so every window's home), serve eight
+/// puts from the region asked at once (`durable` false); then one barrier naming the tickets they answered, each home
+/// shard's latest. Expect: each put answered `Kept` at once with its home shard's place, no publication made for any of
+/// them (`vcs_store.homes.published_for_ticket` unmoved); the barrier answered `Published` with all its tickets, the
+/// publications its home shards' alone, at most two. Red before 0x87: each put waited for its own home's publication.
+#[test]
+fn puts_asked_at_once_are_kept_unpublished_and_one_barrier_a_home_publishes_them() {
+  use super::{HOME_PUBLISHED, serve_remote};
+  use slates_cluster::homes::{HomeMessage, HomeOutcome};
+  let daemon = crate::daemon::audit_daemon_of(2);
+  let (sent, answered) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |state| {
+    let origin = state.shard;
+    let local = state.fleet.host();
+    let shards = state.shards.clone();
+    let task = slates_rt::futures::spawn(async move {
+      let budget = crate::daemon::LIVENESS_BUDGET_NS;
+      let published = || {
+        let shards = shards.clone();
+        async move {
+          let mut total = 0u64;
+          for shard in shards {
+            total += crate::xshard::call_in_shard_time(
+              origin,
+              shard,
+              |state| state.refusals.get(HOME_PUBLISHED).copied().unwrap_or(0),
+              budget,
+            )
+            .await
+            .unwrap_or(0);
+          }
+          total
+        }
+      };
+      let before = published().await;
+      let mut latest: std::collections::BTreeMap<u16, u64> = std::collections::BTreeMap::new();
+      let mut unkept = Vec::new();
+      for index in 0..8 {
+        let bytes = window(index);
+        let put = HomeMessage::Put {
+          identity: ContentId::of(&bytes).0,
+          configuration: 0,
+          owners: vec![super::TEST_OWNER],
+          durable: false,
+          bytes,
+        }
+        .encode();
+        match HomeMessage::decode(&serve_remote((origin, local), &put, budget).await) {
+          Ok(HomeMessage::Answer {
+            outcome: HomeOutcome::Kept { place, generation },
+            ..
+          }) => {
+            let at = latest.entry(place).or_insert(generation);
+            *at = (*at).max(generation);
+          }
+          other => unkept.push(format!("{other:?}")),
+        }
+      }
+      let after_puts = published().await;
+      let tickets: Vec<(u16, u64)> = latest.into_iter().collect();
+      let count = u64::try_from(tickets.len()).unwrap();
+      let barrier = HomeMessage::Durable { tickets }.encode();
+      let answer = HomeMessage::decode(&serve_remote((origin, local), &barrier, budget).await);
+      let after_barrier = published().await;
+      let _ = sent.send((
+        unkept,
+        after_puts - before,
+        answer,
+        count,
+        after_barrier - after_puts,
+      ));
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let (unkept, for_puts, answer, count, for_barrier) = answered.recv().unwrap();
+  assert!(unkept.is_empty(), "each put kept at once: {unkept:?}");
+  assert_eq!(for_puts, 0, "no publication made for a put asked at once");
+  assert_eq!(
+    answer,
+    Ok(HomeMessage::Answer {
+      identity: [0; 32],
+      outcome: HomeOutcome::Published { published: count },
+    }),
+    "every ticket published"
+  );
+  assert!(
+    (1..=2).contains(&for_barrier),
+    "one publication a home shard: {for_barrier} for {count} tickets"
+  );
+}
+
 /// A-724 piece 6's region half (main's ruling: a home acknowledges only once its image holds the window). Do: on a
 /// two-shard daemon, the region's one member at f = 0 (so every window's home), serve a put from the region before the
 /// home shard has published the image that holds it, then while that image is published; read it back; let it go; read
@@ -285,6 +378,7 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
       let put = HomeMessage::Put {
         configuration: 0,
         owners: vec![super::TEST_OWNER],
+        durable: true,
         identity,
         bytes: bytes.clone(),
       }
@@ -294,7 +388,7 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
       let before = HomeMessage::decode(&serve_remote((origin, local), &put, short).await);
       let durable = match &before {
         Ok(HomeMessage::Answer {
-          outcome: HomeOutcome::Kept { generation },
+          outcome: HomeOutcome::Kept { generation, .. },
           ..
         }) => home_published(origin, home, *generation, budget).await,
         Ok(HomeMessage::Answer {
@@ -326,7 +420,7 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
       let again = HomeMessage::decode(&serve_remote((origin, local), &put, budget).await);
       let published = match &again {
         Ok(HomeMessage::Answer {
-          outcome: HomeOutcome::Kept { generation },
+          outcome: HomeOutcome::Kept { generation, .. },
           ..
         }) => home_published(origin, home, *generation, budget).await,
         _ => false,
@@ -403,6 +497,7 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
       let misnamed = HomeMessage::Put {
         configuration: 0,
         owners: vec![super::TEST_OWNER],
+        durable: true,
         identity,
         bytes: b"other bytes".to_vec(),
       }
@@ -1128,6 +1223,7 @@ fn a_home_behind_its_senders_configuration_answers_behind_at_once_and_keeps_once
           identity: ContentId::of(&bytes).0,
           configuration,
           owners: vec![super::TEST_OWNER],
+          durable: true,
           bytes,
         }
         .encode()
