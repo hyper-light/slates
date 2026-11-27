@@ -11517,7 +11517,9 @@ mod tests {
       log,
       from,
       to: from.saturating_add(1),
-      identity: [u8::try_from(at % 256).unwrap(); 32],
+      identity: slates_db::catalog::OperationIdentity {
+        digest: [u8::try_from(at % 256).unwrap(); 32],
+      },
       spans: Vec::new(),
       changes: Vec::new(),
     };

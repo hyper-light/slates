@@ -648,7 +648,7 @@ pub(crate) fn restorable(
   for (_, _, value) in parts {
     bytes = bytes.saturating_add(value.len());
     if let Some(part) = record_of(value) {
-      let share = shares.entry(part.identity).or_insert(0);
+      let share = shares.entry(part.identity.digest).or_insert(0);
       *share = share.saturating_add(value.len());
     }
   }
