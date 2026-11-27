@@ -298,12 +298,6 @@ fn unpin_some(
   *at >= texts.len()
 }
 
-/// The calling thread's CPU clock, nanoseconds (0 where it reads none): what a release unit's test timing reads.
-#[cfg(test)]
-fn thread_cpu_ns() -> u64 {
-  slates_rt::registry::calling_thread_cpu().map_or(0, |reading| reading.spent_ns)
-}
-
 /// Steps `release`, a retired scratch member's in `lineage`, until the shard's clock passes `deadline_ns`, at least one
 /// unit: whether it is done ([`Staging::land`]); a lineage gone is done.
 fn released_some(
@@ -313,15 +307,12 @@ fn released_some(
 ) -> bool {
   loop {
     #[cfg(test)]
-    let began = (slates_rt::futures::now_ns(), thread_cpu_ns());
+    let began = crate::vcs_store::svn_import::phase::release_unit_begun();
     let stepped = state.greens.release_step(lineage, release);
     // Each unit timed by the wall and the thread's CPU, the longest printed by the wide tests (A-920, main's order
     // after release probe 15: the release led copy's longest poll at 1.6 ms with no unit past 150 µs in debug).
     #[cfg(test)]
-    crate::vcs_store::svn_import::phase::release_unit(
-      slates_rt::futures::now_ns().saturating_sub(began.0),
-      thread_cpu_ns().saturating_sub(began.1),
-    );
+    crate::vcs_store::svn_import::phase::release_unit(began);
     match stepped {
       Ok(true) => {}
       Ok(false) | Err(_) => return true,
