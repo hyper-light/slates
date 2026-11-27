@@ -733,3 +733,4 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   page makes the segment bound 512 KiB, so every turn cut a segment and no yield saw the answer. The test also runs at
   4 KiB now. Main's next diag CI confirms on Windows. OPEN: main's call on whether the segment bound needs a change
   for 4 KiB hosts; the A-932 sibling (a lone green adopted as a root) is my next piece.
+- 2026-11-27 12:16 PST: A-932's sibling landed 8d0829e73 (adopted_root_founded; two reds first; merge set 79 of 79). GAPS row FIXED. Waiting on diag CI 11's reads (run 46057905828).
