@@ -5787,6 +5787,7 @@ fn make_origin_replica(
           state.count(BRANCH_SOURCE_MADE, 1);
           let _ = crate::merge_origin::make_source(state, from, version);
         }
+        adopted_root_founded(state, from);
         if state.merge.replicas.branch(&from, version, key).is_err() {
           state.count(BRANCH_SOURCE_BEHIND, 1);
           // A source whose replica owes its push (a created ref's, P2) is made first, through the door its owner made it
@@ -5811,6 +5812,42 @@ fn make_origin_replica(
   }
   Ok(())
 }
+
+/// Founds `from`'s repository's lineage with `from`'s replica where it stands alone here and the names log held here
+/// joins it as its repository's root: a green made alone and adopted later as a root (`repository::install_root` with
+/// an adopted green, A-636 part 2b-2), whose version 0 its holders made standing alone, as its record says (A-932). The
+/// owner moved its engine into the new lineage and shipped no new version 0, so before this a branch of it was refused
+/// on every holder (`Greens::branch`: `Stale`, no lineage's member), counted [`BRANCH_SOURCE_BEHIND`] and retried
+/// without end (GAPS, A-932's sibling). Founded where a branch of it is first made here, a record's or a rebuild's
+/// (`crate::merge_origin`), so a holder restarted warm, whose rebuild of the root follows its version 0, does the same.
+/// A lineage the repository already has here refuses it (counted `crate::merge_origin::LINEAGE_FOUND_REFUSED`, a bug
+/// signal) and the replica stands alone as before.
+pub(crate) fn adopted_root_founded(state: &mut ShardState, from: DbVolumeId) {
+  if state.merge.replicas.lineage_of(&from).is_some() || !state.merge.replicas.contains_key(&from) {
+    return;
+  }
+  let Some(member) = membership(state, from) else {
+    return;
+  };
+  if !matches!(member.origin, slates_db::catalog::MemberOrigin::Root) {
+    return;
+  }
+  let Some(root) = state.merge.replicas.take_any(&from) else {
+    return;
+  };
+  match state.merge.replicas.found(member.repository, from, root) {
+    Ok(()) => state.count(ADOPTED_ROOT_FOUNDED, 1),
+    Err(root) => {
+      state.merge.replicas.insert(from, *root);
+      state.count(crate::merge_origin::LINEAGE_FOUND_REFUSED, 1);
+    }
+  }
+}
+
+/// Counter: a green made alone and adopted later as its repository's root, whose lone replica founded its lineage on
+/// this holder when a branch of it was first made here ([`adopted_root_founded`]). Format: a counter name in the
+/// daemon's status report.
+pub(crate) const ADOPTED_ROOT_FOUNDED: &str = "merge.replica.adopted_root_founded";
 
 /// Counter: a lineage's root whose replica founded its lineage on this holder (A-908).
 /// Format: a counter name in the daemon's status report.
@@ -6506,6 +6543,60 @@ mod tests {
       MergeRecordValue::from_record_bytes(&origin_only.to_record_bytes()),
       Some(origin_only)
     );
+  }
+
+  /// A-932's sibling (GAPS, main's ruling of 2026-11-27 07:08): a green made alone and adopted later as a repository's
+  /// root is a lineage's root on its holder too. Do: recompute version 0 of a green minted standing alone, its record
+  /// naming no lineage, so its replica stands alone; then note the names-log part a repository's creation ships when it
+  /// adopts it as its root, and a branch made from it at version 0; recompute the branch's version 0. Expect the branch
+  /// made (branched, lent, nothing copied), the root and the branch members of the repository's lineage, no
+  /// `merge.replica.branch_source_behind`. Red before: the branch refused out of order, its source standing alone and
+  /// so no lineage's member (`Greens::branch` refuses it `Stale`), counted behind, retried without end.
+  #[test]
+  fn a_lone_green_adopted_as_a_root_is_branched_on_its_holder() {
+    let (zero, branched, lineages, behind) = crate::daemon::audit_on_shard(|state| {
+      let empty = Green::new().head_identity();
+      let root = green_standing_alone(state);
+      state.merge.memberships_built = true;
+      let zero = recompute(state, root, &version_zero(empty), None);
+      let repository = slates_db::catalog::RepositoryId { bytes: root.0 };
+      let branch = family_id(2, 3);
+      note_names_part(
+        state,
+        &names_part(
+          repository,
+          vec![
+            joined(repository, root, slates_db::catalog::MemberOrigin::Root),
+            joined(
+              repository,
+              branch,
+              slates_db::catalog::MemberOrigin::Branch {
+                from: DbVolumeId { bytes: root.0 },
+                version: 0,
+              },
+            ),
+          ],
+        ),
+      );
+      let branched = recompute(state, branch, &member_version_zero(repository, empty), None);
+      let lineages =
+        [root, branch].map(|green| state.merge.replicas.lineage_of(&replica_key(green)));
+      (
+        zero,
+        branched,
+        (lineages, repository),
+        counted(state, BRANCH_SOURCE_BEHIND),
+      )
+    });
+    assert_eq!(zero, Ok(()), "the lone green made at once");
+    assert_eq!(branched, Ok(()), "the branch made from the adopted root");
+    let (lineages, repository) = lineages;
+    assert_eq!(
+      lineages,
+      [Some(repository), Some(repository)],
+      "one lineage, founded by the adopted root"
+    );
+    assert_eq!(behind, 0, "never behind its source");
   }
 
   /// A-932, golden vector: version 0's record of a member of a repository's lineage, format 5, byte for byte (the class

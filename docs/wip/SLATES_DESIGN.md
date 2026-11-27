@@ -11895,7 +11895,10 @@ nothing copied), a source that owes its push made first through A-886's door, an
 (`MergeRecordValue::lineage`, A-932) while no part held here records its join yet waits `OUT_OF_ORDER`, since the owner
 owes its names log to every holder of its greens (one placement: a family's ids share their line key). A green whose
 record names no lineage stands alone and is made at once: its id cannot say so, since a green made alone is a family of
-its own (A-636 part 2b-2), so its owner's record does, from the join its catalog holds when it makes the record.
+its own (A-636 part 2b-2), so its owner's record does, from the join its catalog holds when it makes the record. A
+green made alone and adopted later as a repository's root was made standing alone, as its record says; where a branch
+of it is first made here, the holder founds the lineage with it, the names log joining it as the root (A-932's sibling,
+`merge_service::adopted_root_founded`).
 Nothing acknowledged rests on a join only its owner held (A-915): a repository's creation answers once its root's join
 is at `f + 1` as well as its record, so a successor's adoption, which holds the names log its takeover gathered from a
 quorum, finds every acknowledged green's join; one whose join it does not find was never acknowledged a member, and its

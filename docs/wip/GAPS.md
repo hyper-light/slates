@@ -280,17 +280,24 @@
 > (`docs/bugs/2026-11-27-a-green-standing-alone-waited-on-its-holders-for-a-join-that-never-comes.md`). Red first: two
 > `merge_service` units and one `merge_origin` unit. The fleet probe test passed in 5.82 s. OWED (main): the whole
 > `tests/fleet.rs` on the Mac and the Windows lanes, then the gap that no Unix lane runs it.
-> **OPEN (w-interop, 2026-11-27; main's ruling of 07:08; found by reading the code, nothing run yet): a lone green
-> later adopted as a repository's root keeps a standalone replica on its holders, so a branch of it may never reach a
-> holder.** A green created alone is a family root of its own (A-636 part 2b-2), and its version 0 shipped while it
-> stood alone, so each holder made it a replica of no lineage. A repository that adopts it as its root moves the
-> owner's engine into the new lineage (`repository::install_root` with `adopted`) and enqueues no new version 0, so no
-> holder founds the lineage. A later branch's version 0 then meets `Greens::branch` refused `Stale` on each holder (the
-> source is no lineage member there), counted `merge.replica.branch_source_behind` and retried without end (CLAUDE.md
-> §2 item 8). The rebuild after a restart founds it by its join (`merge_origin::rebuild_through`), so only a holder that
-> made the replica before the join is affected. Owed (w-interop, after the lone-green record fix lands): a red test that
-> adopts a lone green as a root, branches it and requires the branch to reach a holder; the fix if it is red, else why
-> it holds and this closed.
+> **FIXED (w-interop, 2026-11-27; main's ruling of 07:08; A-932's sibling): a green made alone and adopted later as a
+> repository's root kept a standalone replica on its holders, so a branch of it never reached them.** Its version 0
+> shipped standing alone, and the owner moved its engine into the new lineage without a new version 0
+> (`repository::install_root`), so each holder's `Greens::branch` refused the branch `Stale`, counted
+> `merge.replica.branch_source_behind` without end; a restarted holder's rebuild did the same. Now a holder founds the
+> lineage with the lone replica where the names log joins it as its repository's root, at the first branch of it made
+> there, a record's or a rebuild's (`merge_service::adopted_root_founded`, counted `merge.replica.adopted_root_founded`)
+> (`docs/bugs/2026-11-27-a-lone-green-adopted-as-a-root-left-its-branches-unreplicated.md`). Red first:
+> `merge_service` `a_lone_green_adopted_as_a_root_is_branched_on_its_holder` (`Err("merge.out_of_order")`) and
+> `merge_origin` `a_restarted_holder_rebuilds_a_branch_of_a_lone_green_adopted_as_a_root` (`[Later, Later, Later,
+> Later]`).
+> **OPEN, coverage (w-interop, 2026-11-27; main's ruling of 12:17): the same root adopted by a takeover successor before
+> any branch of it reached the successor.** The successor installs the root alone (`green_adopt`), from the
+> predecessor's lone replica. A later branch record there takes `make_origin_replica`'s same branch arm, so
+> `adopted_root_founded` should found the lineage there as on any holder. No test runs that path: main's fleet run was
+> at bfdacf8ea, before the fix, and a pass would not show the path ran. A fleet test of it must see
+> `merge.replica.adopted_root_founded` move on the successor. Worked when measured, or when w-shared's A-918 B touches
+> `green_adopt`.
 > **FIXED (A-912, w-shared, 2026-11-24; main 01a20182's rulings): a push made right after a member died was refused
 > `retry` for a second or more.** A home behind its sender held the put for its install, which needed the council's next
 > append on the very record session the put held, and the coordinator awaited its healer inline; and a home that died
@@ -2798,7 +2805,13 @@
 > `segments_landed_overlapped` and the wait held against `segment_land_ns`. Derived bound: two segments' file texts,
 > the one in flight and the one being written, each under the bound plus the text that crosses it: under four times
 > the bound. Held by `an_imports_file_texts_held_between_landings_are_bounded_by_its_segment` on the production step
-> (red: 46,162,339 bytes held after one turn, 8,950 at the end, a 2 MiB bound; then no landing overlapped). Owed:
+> (red: 46,162,339 bytes held after one turn, 8,950 at the end, a 2 MiB bound; then no landing overlapped). Since
+> 2026-11-27 (w-interop, main's ruling (a')) a landing also counts as overlapped where the store's owner sent its
+> answer before the import's hand-over began, by the owner's own stamp (`slates_store::owner::Landed::sent_ns`). At a
+> 4 KiB page the bound is 512 KiB, every turn cuts a segment, and no yield follows the turn a landing ends in, so on
+> diag CI 9's Windows lanes 0 of 67 counted though each landing's answer was sent 0.5 to 3.9 ms into a 49 ms turn
+> (`docs/bugs/2026-11-27-an-imports-landings-overlapped-unseen-where-every-turn-cuts-a-segment.md`; the test now runs
+> at 4 KiB too). Owed:
 > main's interleaved A/B of 0d05da26e^, 1227afcb1 and the pipelined landing over the 57k; the
 > changelog's and manifests' texts held until the import lands (about 90 MB of the 57k's), w-hg's after C1 (2)'s
 > manifest piece (the import's manifest keep reads the previous text in its step, with no ask between turns).
@@ -6635,6 +6648,29 @@
 > faster on reads (checkout, update and switch within 13%; diff, info, log and revprops 2.6 to 14 times faster) and
 > slower on the dump (3.0×), the writing session (2.1×, down from 24×) and svnsync (1.27×, noisy). See BENCHMARKS,
 > "The svn use test over HTTP with git-2000". The dump and the writing session are w-svn's.
+> **The dump's 3.0×, counted (w-svn, 2026-11-27; main's (b)):** `an_svnrdump_dump_measured` (`crates/cli/tests/svn_interop.rs`)
+> imports a dump into a store-backed daemon, then times stock `svnrdump dump` over the HTTP edge and over svn://,
+> printing what each added to every counter a revision. Over a local history of 300 revisions (three 8 KiB files
+> changed each, a 10 MB dump; debug, stock 1.15) both edges fetched 6.0 pieces a revision through the node's store
+> and polled about 12 times a revision for 2 to 4 ms (`rt.poll_log2.21`): the replay drive's own work, about two
+> polls a piece. The HTTP edge's extra over svn:// (37.4 ms a revision against 24.6, debug) is its reply's yields:
+> 114 a revision (`vcs_http.reply_yields`), each polled again, most of its 34 polls a revision of 128 to 256 µs against
+> svn://'s 3. In debug the daemon's live quantum derives tiny slices (4.4 µs: a 741-byte text piece, a 6.9 KB copy
+> slice), which inflate yield counts. Owed: main's release round of `an_svnrdump_dump_measured` over git-2000 on
+> these counters, which names the 2 to 4 ms polls' task and the reply's yields a revision at the release quantum.
+> **The writing session's 2.1×, counted (w-svn, 2026-11-27; main's order):** `an_svn_writing_session_measured`
+> (`crates/cli/tests/svn_interop.rs`) imports a dump into a store-backed daemon and runs the use test's writing session
+> with stock `svn` a phase at a time (checkout `--depth immediates`, commit, copy, merge, revprop set), each step timed,
+> printing what each phase added to every counter; then the same session against stock `svnserve -t` over the dump
+> loaded by `svnadmin`, in the same run. Over the local 300-revision history (debug, stock 1.15) no gap shows: HTTP
+> 5.75 s, svn:// 5.51 s, stock 7.50 s for the session. Every step is the `svn` client's own: its local verbs (`add`,
+> `revert -R`) take 0.03 to 0.94 s, and a whole phase polls the daemon 77 to 472 times, its longest poll 8 to 16 ms in
+> debug (`rt.poll_log2.23`, in each commit and merge). An earlier run under host load had each phase 4 to 5 s on both
+> edges with the same counts, so wall seconds here swing with the host and the counts are what to read. The use
+> test's `merge -c HEAD` (E205000, `-c` takes a number) and its `propset --revprop` with no `pre-revprop-change` hook
+> (E165006) fail on all three servers alike. Owed: main's release round of it over git-2000, whose 2.1× this local
+> history does not reproduce: the gap lies in what git-2000 adds (its wide tree and long history), and the round's
+> per-step seconds and counters name the step.
 > **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
 > main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
 > svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon
@@ -6647,10 +6683,19 @@
 > `write_wait` (svnsync not reading while it commits into its mirror), 14.6 of `read_wait`, 3.42 waiting for pieces
 > through the node's store, 1.60 for a poll after a yield and 0.54 answering: the server's share is about 5.6 ms. The
 > 28.4 pieces fetched a revision (28.1 over HTTP) were a reader fetching a piece again each turn, fixed (A-876). The
-> sync's 34.2 GB `content.purged_bytes` is the idle sweep giving back the shard's dead recovery memory a slice a tick
-> (A-117, A-226), which an svn read leaves idle, not memory the sync used. Owed: main's rerun after A-876, expected
-> to show under 10 pieces a revision and about 1 ms of fetch waits; and naming the 94k polls of 65 to 131 µs on the
-> svn:// leg (about 8.5 s of the shard's CPU, more than its answers' 1.08 s).
+> sync's 34.2 GB `content.purged_bytes` is unnamed. It is not only dead recovery memory, as this line said before:
+> the counter adds each idle step's purge of the content arena's free pages to the dead recovery memory returned and
+> the emptied write log (`daemon::purge_if_idle`), and 34.2 GB from a daemon that peaked at 1.6 GB is pages purged
+> more than once. The status report now splits it: `content.purged_arena_bytes`, `recovery.returned_bytes`,
+> `write_log.purged_bytes`, with the arena's allocations the sweep saw (`content.allocations_seen`). Measured at a small
+> scale (w-svn, 2026-11-27, debug, stock svnsync 1.15 over a local history of 300 revisions, three 8 KiB files changed
+> each, a 10 MB dump; `an_svnsync_measured`): the sync added 10 idle ticks over svn:// and 12 over HTTP (0.03 and 0.04
+> a revision), 11.9 MB of arena pages purged over each (the import's freed texts, once), 98 and 131 KB of recovery,
+> no write log and no arena allocation, 6.0 pieces fetched a revision and 84 answers. So a read verb's
+> fetch-free-purge-fault cycle is not there at this scale, and the short polls are not idle steps. Owed: main's rerun
+> after A-876, expected to show under 10 pieces a revision and about 1 ms of fetch waits, now reading the split
+> counters; and naming the 94k polls of 65 to 131 µs on the svn:// leg (about 8.5 s of the shard's CPU, more than its
+> answers' 1.08 s), which at 84 answers a revision are likely the conversation's own polls.
 > **svn:// update (P6), recorded (w-svnperf, 2026-11-23):** goal 93's "svn:// update 5.6 s against run 8's 2.7 s"
 > is w-bugs' run 13 (`diag-w-bugs-svnfetch-13`, base 2d3f218cb, GitHub's macOS runner, git-1000) against run 8 (base
 > 1d7a60e1d), one run each. Run 13 spent 1.71 s of its update in 142,705 window units, which w-perf's per-reader
