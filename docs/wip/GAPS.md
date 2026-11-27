@@ -357,6 +357,23 @@
 >     none claimed it; SSH refused typed. Found by the one owner lookup (`owner_location::locate_owner`), shared with the
 >     volume forward and the homes' resolution. For a cross-node `307`, git needs a credential helper answering every
 >     node's edge (curl drops a custom `Authorization` field on an origin change).
+>   - **FIXED (w-git, 2026-11-26; main's order, from w-shared's A-921 test): the shared owner lookup holds a bounded
+>     caller to its bound.** `locate_within_horizon` slept a whole pace (`HEARTBEAT_NS / POLL_PER_PERIOD`, 10 ms)
+>     between looks whatever was left of its caller's bound, so the home healer's resolution pass, which bounds it by
+>     what is left of its own budget, ran one pace and a wait's lateness past that budget (main's sets: 10.08 to 10.57
+>     ms past 1,998 ms, 6 times in 4 sets). Now it sleeps the pace or what is left before its ceiling, whichever is
+>     less. Red: `owner_location::tests::a921_a_bounded_owner_lookup_ends_within_its_bound_and_its_waits_lateness` (a
+>     lookup bounded at two paces and a half: 33.2 ms against 25 ms, 1.87 ms of measured lateness and a 0.55 ms look);
+>     both tests bound the lookup by its bound (the pass by its budget), the most its own waits came back late and its
+>     longest look, each measured in the lookup and counted on its shard (`owner_location::WAIT_LATE_MOST`,
+>     `LOOK_MOST`), not a pace, nor the shard's overall overrun and a look timed beforehand, which main's 9 runs found
+>     short by 9 to 110 us under load (after: 0.15 ms past the pass's budget; main's runs 9 to 110 us). The lookup's
+>     test asserts the lookup's own time (`ELAPSED_MOST`, before its first look to its answer), not the test task's
+>     resume after it, which main's next 9 found 2.6 to 6.2 us past. Each finer term in turn (a pre-emption term, the
+>     thread's CPU clock read at each wait) left the lookup's own fixed cost, microseconds, over it, and the reads added
+>     cost, so the lookup's test asserts the regression itself: its own time past its bound and its waits' lateness
+>     under half a pace (`HEARTBEAT_NS / POLL_PER_PERIOD / 2`); a whole pace's sleep past the bound overruns it by 8 ms
+>     against that 5 ms. The resolution pass's test keeps its bound, which passed every run.
 >   - **OPEN, waits for Ada's word: fleet-wide repository name routing.** A node holding no copy of a repository answers
 >     `404` (the fleet test: the third node's `ls-remote` "not found"): a name resolves only where a partition holds it
 >     (D-12, no directory; D-14, no global catalog), so it cannot even form the owner's query. Not started.
@@ -501,15 +518,17 @@
 > - **B1 BUILT (w-git, 2026-11-26): the push's quarantine reads.** A thin pack's REF_DELTA against the repository's
 >   object is read back through its base's window (`Push::bytes`, `IndexBases`); let go, the read answered none with
 >   nothing noted, and the connectivity check took the object as unreadable: `missing necessary objects`. Now the
->   quarantine notes the window (`PackedRefused::Away`, on the repository for the driver and as
->   `Contents::content_away` for the reader), and the walk stops its turn there in either pass; its second pass took an
->   unread object's edges as none before, which could leave a tip `Complete`, and now takes it as `Missing`. Red:
->   `git_push::tests::b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands` (the base's window let go
->   once the pack is read and its checks are due). The A-753 resend path cannot miss now: a resent object is read from
->   the push's own pack (A-864's noted entry). The fsck stage's read is reached by no push (a session's fsck is made
->   as each object is kept, from its bytes), so it keeps its refusal. Its failures under load (main's 4 of 4 at
->   b95e9ddb1, then 3 of 16 at the diagnostic branch agents/w-git-b1-debug, 884538b14) had two causes, each named by
->   main's lines and fixed red first:
+>   quarantine notes the window (`PackedRefused::Away`, on the repository for the driver and as `Contents::content_away`
+>   for the reader), and the walk stops its turn there in either pass; its second pass took an unread object's edges as
+>   none before, which could leave a tip `Complete`, and now takes it as `Missing`. Red:
+>   `git_push::tests::b1_a_thin_pushs_check_brings_its_trees_let_go_base_back_and_lands` (the base's window let go once
+>   the pack is read and its checks are due). The forced interleaving's stand-in reader asks again where the node's
+>   store did not answer within the read-through's patience, as the drivers do (main's run 10 of 16 under 12 burners:
+>   `Unanswered`), its asks bounded by the test's patience over it. The A-753 resend path cannot miss now: a resent
+>   object is read from the push's own pack (A-864's noted entry). The fsck stage's read is reached by no push (a
+>   session's fsck is made as each object is kept, from its bytes), so it keeps its refusal. Its failures under load
+>   (main's 4 of 4 at b95e9ddb1, then 3 of 16 at the diagnostic branch agents/w-git-b1-debug, 884538b14) had two causes,
+>   each named by main's lines and fixed red first:
 >   - a stop ends the check's whole turn (`Walk::stopped`; `Checking::unit` and `Checking::turn` return not done).
 >     The check's own turn loop took the walk again at once after its stop, while its quantum was unspent, and the
 >     same let-go met twice with nothing brought back refused the object (`receive::tests::session::
@@ -2122,7 +2141,9 @@
 > queue bounded with the attempts in flight (`homes::settle_bound`, refused typed at it). (ii)'s first half BUILT the
 > same day: the segment homed as it landed (`Texts` with `Record` and `Payload`, list v2), and a rebuild lands the
 > segments its store lacks from the region verbatim at the owner's sequences
-> (`a_holders_run_lands_the_owners_segments_byte_for_byte_by_identity`). OPEN: (ii)'s rest: the holder's recompute
+> (`a_holders_run_lands_the_owners_segments_byte_for_byte_by_identity`). CLOSED the same day: one barrier a home
+> shard on this node (r42's push 89 to 123 s), a crash's holds resolved by the attempt record v13 names, and homes ranked
+> by partition, never by a runtime shard id (A-929). OPEN next: a remote home's barrier, one exchange a home a push. OPEN: (ii)'s rest: the holder's recompute
 > accepted with the owner's identity, with svn's holder red and an
 > `#[ignore]`d fleet-takeover CLI test for Mercurial, which no test drives yet; then an import's run (v9) and a single
 > changeset (v7) homed the same way.

@@ -233,6 +233,9 @@ pub(crate) struct Run {
   /// The push's holds in the region while it is in flight (A-727 (d1a)): each homed object's, moved to the repository's
   /// records once its entry commits, let go at every home otherwise.
   attempt: crate::vcs_store::homes::AttemptHolds,
+  /// The latest ticket of each home shard on this node its objects were kept on, waited on once before its entry names
+  /// them ([`list_landed`]; group commit per shard). Bounded by the node's shards.
+  tickets: std::collections::BTreeMap<u16, crate::vcs_store::homes::HomeTicket>,
   /// Whether it is settled.
   settled: bool,
 }
@@ -248,6 +251,7 @@ impl Run {
       admission_held: 0,
       entries: Vec::new(),
       attempt: crate::vcs_store::homes::AttemptHolds::default(),
+      tickets: std::collections::BTreeMap::new(),
       settled: false,
     }
   }
@@ -265,6 +269,20 @@ impl Run {
     match self.ranges.last_mut() {
       Some((_, last)) if last.checked_add(1) == Some(sequence) => *last = sequence,
       _ => self.ranges.push((sequence, sequence)),
+    }
+  }
+
+  /// Its attempt as its register record names it (record v13: the node, the process and the number its holds in the
+  /// region are for), once its homing began.
+  pub(crate) fn attempt(&self) -> Option<(u64, u64, u64)> {
+    match self.attempt.owner_now()? {
+      slates_cluster::homes::HomeOwner::Attempt {
+        node,
+        process,
+        attempt,
+        ..
+      } => Some((node.0, process, attempt)),
+      slates_cluster::homes::HomeOwner::Record { .. } => None,
     }
   }
 
@@ -760,11 +778,14 @@ pub(crate) async fn homed_for(
     Ok(owner) => owner,
     Err(refused) => return Some((Err(refused), source.into_given_back())),
   };
-  let homed = crate::vcs_store::homes::home_in_region(
+  // This node's keep is not waited for here: its home shard's ticket is kept, and the push waits once a home shard
+  // before its entry names what it kept ([`list_landed`]).
+  let homed = crate::vcs_store::homes::home_in_region_deferred(
     origin,
     &shards,
     (source, owner),
     crate::fleet::homing_budget(),
+    &mut run.tickets,
   )
   .await;
   let outcome = match homed.outcome {
@@ -830,7 +851,7 @@ pub(crate) async fn list_landed(
     sections: 0,
   };
   let landed = disk.land(header, vec![(SectionKind::Record, bytes)]).await;
-  crate::state::with_state(|state| {
+  let shards = crate::state::with_state(|state| {
     if landed.is_err() {
       return Err(ListUnlanded::StoreRefused);
     }
@@ -838,8 +859,24 @@ pub(crate) async fn list_landed(
     state.count(LIST_RECORD_BYTES, len);
     let shards = state.shards.clone();
     crate::vcs_store::let_go_landed_pack_among(state, &identity, &shards);
-    Ok((identity, len, sequence))
-  })
+    Ok(state.shard)
+  })?;
+  let origin = match shards {
+    Ok(origin) => origin,
+    Err(unlanded) => return Some(Err(unlanded)),
+  };
+  // The one barrier (A-727's rule, group commit per shard): every object the record will name, through its list, durable
+  // at this node's homes, each home shard's latest ticket published, before the record is written.
+  let budget_ns = crate::fleet::homing_budget().max_deadline_ns();
+  for ticket in core::mem::take(&mut run.tickets).into_values() {
+    if !crate::vcs_store::homes::published(origin, ticket, budget_ns).await {
+      crate::state::with_state(|state| state.count(HOMED_SHORT, 1))?;
+      return Some(Err(ListUnlanded::Unhomed(
+        crate::vcs_store::homes::HomeRefused::Unanswered,
+      )));
+    }
+  }
+  Some(Ok((identity, len, sequence)))
 }
 
 /// Counter: the bytes of pushes' segment lists landed (ruling R: one homed list a push, 88 bytes a segment). Format: a
