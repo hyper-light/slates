@@ -52,6 +52,9 @@ fn unlanded_words(why: crate::git_push::Unlanded) -> &'static str {
     Unlanded::NoLanding => "this node holds no changeset store for the repository",
     Unlanded::LandingUntaken => "the push's changeset was not carried to the node's store",
     Unlanded::StoreRefused => "the node's store refused the push's changeset",
+    Unlanded::AttemptsAtBound => {
+      "the server has as many pushes in flight as it holds at once; send it again once they end"
+    }
   }
 }
 

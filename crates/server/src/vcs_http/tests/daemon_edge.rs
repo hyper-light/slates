@@ -63,6 +63,250 @@ fn patience_ns() -> u64 {
   PATIENCE_NS.saturating_mul(crate::test_lane::slowdown())
 }
 
+/// Derived: how long a client's read waits for a byte before it asks whether the daemon serving it still steps (main
+/// 01a20182's ruling of 2026-11-25 on `daemon_edge.rs:418`: a push's answer has no deadline of its own, and stock git
+/// waits as long as its server works): one liveness window, the watchdog's own judgement of a shard stuck.
+const STALL_LOOK: Duration = Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS);
+/// Derived: how long a stalled read waits between two looks at the daemon's steps: the heartbeat, the cadence the
+/// watchdog itself looks at its shards in (`daemon::HEARTBEAT_NS`).
+const STALL_BEAT: Duration = Duration::from_nanos(crate::daemon::HEARTBEAT_NS);
+
+/// The shards serving each edge port's daemon in this test process: registered as [`daemon_configured`] starts one,
+/// read by a client's stalled read ([`edge_steps`]).
+#[allow(clippy::disallowed_types)] // D-8's test-harness exception: two owners, the test thread that starts a daemon and any client thread that reads its edge.
+static EDGE_SHARDS: std::sync::Mutex<std::collections::BTreeMap<u16, Vec<u16>>> =
+  std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The steps the shards of the daemon serving `port` have run, summed (`slates_rt::registry`'s pulse, read on any
+/// thread): none for a port no daemon of this process registered.
+fn edge_steps(port: u16) -> Option<u64> {
+  let shards = EDGE_SHARDS.lock().ok()?.get(&port).cloned()?;
+  Some(
+    shards
+      .iter()
+      .filter_map(|shard| slates_rt::registry::with_entry(*shard, |entry| entry.pulse.steps()))
+      .sum(),
+  )
+}
+
+/// A client's socket that waits for its answer as long as the daemon serving it works (main 01a20182's ruling of
+/// 2026-11-25, CLAUDE.md's liveness pattern: a liveness question asked on a cold path only). Each read waits
+/// [`STALL_LOOK`] for a byte; only when one passes with none does it look at the daemon's steps (`steps`), wait a beat
+/// ([`STALL_BEAT`]) and look again: stepped, it reads on; not, it gives up, typed `TimedOut`, naming how long it waited
+/// and the steps it saw. A fixed patience gave up on a working daemon under load (main's join A/B, load 52 to 99: "the
+/// answer ended inside a line (WouldBlock)" in both arms).
+struct PatientSocket<P> {
+  /// The connection.
+  socket: ClientStream,
+  /// The daemon's steps now; none where it cannot be asked.
+  steps: P,
+  /// How long a look and a beat last.
+  look: (Duration, Duration),
+  /// How far past their length its waits woke, summed (each look's read and each beat's park, timed on the reading
+  /// thread as it waited): what a loaded host's scheduler added, which a bound on the give-up allows for.
+  overrun: Duration,
+}
+
+impl<P: FnMut() -> Option<u64>> PatientSocket<P> {
+  /// `socket` read patiently, the daemon's steps asked of `steps`, each read waiting `look` before it asks and `beat`
+  /// between its two looks.
+  fn new(socket: ClientStream, steps: P, (look, beat): (Duration, Duration)) -> Self {
+    socket.set_read_timeout(Some(look)).expect("a read timeout");
+    PatientSocket {
+      socket,
+      steps,
+      look: (look, beat),
+      overrun: Duration::ZERO,
+    }
+  }
+}
+
+impl<P: FnMut() -> Option<u64>> Read for PatientSocket<P> {
+  fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    let began = std::time::Instant::now();
+    loop {
+      let asked = std::time::Instant::now();
+      match self.socket.read(buf) {
+        Err(error)
+          if matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+          ) =>
+        {
+          let late = asked.elapsed().saturating_sub(self.look.0);
+          self.overrun = self.overrun.saturating_add(late);
+          let before = (self.steps)();
+          let parked = std::time::Instant::now();
+          std::thread::park_timeout(self.look.1);
+          let late = parked.elapsed().saturating_sub(self.look.1);
+          self.overrun = self.overrun.saturating_add(late);
+          let after = (self.steps)();
+          if before.is_some() && after != before {
+            continue;
+          }
+          return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+              "no byte for {:?} and the daemon made no step over a beat ({:?}): its shards at {after:?} steps",
+              began.elapsed(),
+              self.look.1
+            ),
+          ));
+        }
+        other => return other,
+      }
+    }
+  }
+}
+
+impl<P> Write for PatientSocket<P> {
+  fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    self.socket.write(buf)
+  }
+
+  fn flush(&mut self) -> std::io::Result<()> {
+    self.socket.flush()
+  }
+}
+
+/// Shape: the look and the beat [`PatientSocket`]'s own tests use: a tenth of [`STALL_LOOK`] and of [`STALL_BEAT`], so
+/// they run in a second; what they pin is the order of events, not the lengths.
+const TEST_LOOK: (Duration, Duration) = (
+  Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS / 10),
+  Duration::from_nanos(crate::daemon::HEARTBEAT_NS / 10),
+);
+
+/// Parks this thread until `ending` has passed (a park may wake early, so it parks again until then).
+fn parked_until(ending: std::time::Instant) {
+  while std::time::Instant::now() < ending {
+    std::thread::park_timeout(ending.saturating_duration_since(std::time::Instant::now()));
+  }
+}
+
+/// A loopback listener that takes one connection and, `delay` after, writes `answer` (none: writes nothing) and holds
+/// the connection a further `delay`: its port, and its thread.
+fn answering_after(
+  delay: Duration,
+  answer: Option<&'static [u8]>,
+) -> (u16, std::thread::JoinHandle<()>) {
+  let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener");
+  let port = listener.local_addr().expect("its address").port();
+  let serving = std::thread::spawn(move || {
+    let (mut taken, _) = listener.accept().expect("the connection");
+    parked_until(std::time::Instant::now() + delay);
+    if let Some(answer) = answer {
+      taken.write_all(answer).expect("the answer written");
+    }
+    parked_until(std::time::Instant::now() + delay);
+  });
+  (port, serving)
+}
+
+/// Main 01a20182's ruling of 2026-11-25 (`daemon_edge.rs:418`: a client gave up on a working daemon at a fixed patience
+/// under load, in both arms of the join A/B). Do: from a loopback listener answering only three looks after it takes the
+/// connection, read a line once through a socket of a fixed patience of one look, as the edge's clients read before,
+/// and once through a [`PatientSocket`] whose daemon steps at every look. Expect: the fixed patience gives up, nothing
+/// read; the patient read answered.
+#[test]
+fn a_patient_read_waits_for_an_answer_while_its_daemon_steps() {
+  let (look, _) = TEST_LOOK;
+  let (port, serving) = answering_after(3 * look, Some(b"answered\n"));
+  let mut fixed =
+    ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).expect("connected");
+  fixed.set_read_timeout(Some(look)).expect("a read timeout");
+  let gave_up = fixed.read(&mut [0u8; 16]);
+  drop(fixed);
+  serving.join().expect("the listener's thread");
+  assert!(
+    gave_up.as_ref().is_err_and(|error| matches!(
+      error.kind(),
+      std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )),
+    "a fixed patience gave up: {gave_up:?}"
+  );
+  let (port, serving) = answering_after(3 * look, Some(b"answered\n"));
+  let socket =
+    ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).expect("connected");
+  let mut stepped = 0u64;
+  let mut patient = PatientSocket::new(
+    socket,
+    move || {
+      stepped += 1;
+      Some(stepped)
+    },
+    TEST_LOOK,
+  );
+  assert_eq!(line_of(&mut patient), b"answered\n");
+  serving.join().expect("the listener's thread");
+}
+
+/// The same ruling's other half. Do: from a loopback listener that never answers, read through a [`PatientSocket`]
+/// whose daemon makes no step, once as the host wakes it and once with its look's wait woken twelve beats late (its
+/// socket's timeout set past the look, as a loaded host's scheduler wakes a thread late: main's reading of w-hg's gate
+/// at load 56 to 62, given up after 221.76 ms against a look of 100 ms and a beat of 10 ms). Expect: each given up
+/// typed (`TimedOut`, naming the steps it saw), after one look and one beat (the daemon's steps asked twice, before
+/// and after the beat), never before the look, and within [`gave_up_within`]'s bound, which allows the overrun its
+/// waits measured. Red before the overrun was allowed: the late one past two looks and a beat.
+#[test]
+fn a_patient_read_gives_up_on_a_daemon_that_makes_no_step() {
+  let (look, beat) = TEST_LOOK;
+  for late in [Duration::ZERO, 12 * beat] {
+    let (port, serving) = answering_after(4 * look + late, None);
+    let socket =
+      ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).expect("connected");
+    let mut asked = 0u32;
+    let mut patient = PatientSocket::new(
+      socket,
+      || {
+        asked = asked.saturating_add(1);
+        Some(7)
+      },
+      TEST_LOOK,
+    );
+    patient
+      .socket
+      .set_read_timeout(Some(look + late))
+      .expect("a read timeout");
+    let began = std::time::Instant::now();
+    let read = patient.read(&mut [0u8; 16]);
+    let waited = began.elapsed();
+    let overrun = patient.overrun;
+    drop(patient);
+    serving.join().expect("the listener's thread");
+    let error = read.expect_err("given up");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+    assert!(error.to_string().contains("Some(7) steps"), "{error}");
+    assert_eq!(asked, 2, "one look and one beat, then given up");
+    gave_up_within(waited, overrun);
+  }
+}
+
+/// Asserts a patient read that gave up after `waited`, its waits woken `overrun` past their lengths in all, waited at
+/// least a look ([`TEST_LOOK`]) and less than two looks and a beat past what its host's scheduler added.
+fn gave_up_within(waited: Duration, overrun: Duration) {
+  let (look, beat) = TEST_LOOK;
+  assert!(
+    waited >= look,
+    "given up after {waited:?}, before a look {look:?}"
+  );
+  assert!(
+    waited < 2 * look + beat + overrun,
+    "given up after {waited:?}, a look {look:?}, a beat {beat:?} and its waits {overrun:?} late"
+  );
+}
+
+/// A client's socket to the edge on `port`, read patiently ([`PatientSocket`]).
+type EdgeSocket = PatientSocket<Box<dyn FnMut() -> Option<u64> + Send>>;
+
+/// [`PatientSocket`] over `socket`, a connection to the edge on `port` of a daemon [`daemon_configured`] started.
+fn patient(socket: ClientStream, port: u16) -> EdgeSocket {
+  PatientSocket::new(
+    socket,
+    Box::new(move || edge_steps(port)),
+    (STALL_LOOK, STALL_BEAT),
+  )
+}
+
 /// The repository's owner, the principal of the human's channel that created it.
 fn owner() -> Principal {
   Principal::Uid {
@@ -117,6 +361,9 @@ fn daemon_configured(
   daemon
     .bootstrap(true)
     .expect("the daemon creates its initial group");
+  if let (Some(port), Ok(mut ports)) = (daemon.vcs_http_port(), EDGE_SHARDS.lock()) {
+    ports.insert(port, daemon.shards().iter().map(|shard| shard.0).collect());
+  }
   (daemon, instance)
 }
 
@@ -195,17 +442,31 @@ fn enroll(daemon: &Daemon, token: &str, uid: u32, expires_ns: Option<u64>) {
 fn tls_client(
   port: u16,
   certificate: &CertificateDer<'static>,
-) -> StreamOwned<ClientConnection, ClientStream> {
-  tls_client_within(port, certificate, Duration::from_nanos(patience_ns()))
+) -> StreamOwned<ClientConnection, EdgeSocket> {
+  let (connection, socket) = tls_connection(port, certificate);
+  StreamOwned::new(connection, patient(socket, port))
 }
 
-/// [`tls_client`], its reads waiting at most `patience` for an answer.
-#[allow(clippy::disallowed_types)] // rustls takes its configuration and provider as `Arc` by signature (D-8's test-harness exception).
+/// [`tls_client`], its reads waiting at most `patience` for an answer, however the daemon steps: a test that asks
+/// whether an answer comes within a bound of its own.
 fn tls_client_within(
   port: u16,
   certificate: &CertificateDer<'static>,
   patience: Duration,
 ) -> StreamOwned<ClientConnection, ClientStream> {
+  let (connection, socket) = tls_connection(port, certificate);
+  socket
+    .set_read_timeout(Some(patience))
+    .expect("a read timeout");
+  StreamOwned::new(connection, socket)
+}
+
+/// A TLS client's connection trusting `certificate`, and its socket to the edge on `port`.
+#[allow(clippy::disallowed_types)] // rustls takes its configuration and provider as `Arc` by signature (D-8's test-harness exception).
+fn tls_connection(
+  port: u16,
+  certificate: &CertificateDer<'static>,
+) -> (ClientConnection, ClientStream) {
   let mut roots = RootCertStore::empty();
   roots
     .add(certificate.clone())
@@ -223,10 +484,7 @@ fn tls_client_within(
   .expect("a client connection");
   let socket = ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
     .expect("the edge's listener takes the connection");
-  socket
-    .set_read_timeout(Some(patience))
-    .expect("a read timeout");
-  StreamOwned::new(connection, socket)
+  (connection, socket)
 }
 
 /// The status of the answer to `GET target` with `fields`, on a new TLS connection to the edge on `port`.
@@ -1054,6 +1312,99 @@ fn tagged_create() -> (Vec<u8>, ObjectId, Vec<ObjectId>) {
   pktline::write(Packet::Flush, &mut request).expect("the flush");
   request.extend_from_slice(&stored_pack(&objects));
   (request, commit_id, tag_ids)
+}
+
+/// Precondition (a) of the landed let-go's lift (main's order of 2026-11-26; r18's push-tag-of-a-tag, fixed at
+/// 6eae9f8bb, its unit red at the edge owed: an earlier one never reached the miss, the inner tag read from what the
+/// repository's reads kept lately). Do: on a daemon with its edge, push as stock git posts it a commit of [`TAGS`]
+/// files and an annotated tag of it for each, each tag in a window of its own; let every window of the pushed pack go as
+/// a landed pack's let-go lets it go (its home told first, each window marked landed) and the repository go idle, what
+/// its reads keep lately given back (`git_encode::give_back_idle`); then push a tag of the first tag, its pack that tag
+/// alone. Expect: the second push `200` and `ok refs/tags/b`, the peel having read the inner tag from its let-go window
+/// brought back (`vcs_store.read_through.brought_back` moved). Red before 6eae9f8bb: declined "an object it names cannot
+/// be read", the peel's miss the ref's refusal.
+#[test]
+fn a_push_of_a_tag_of_a_tag_whose_inner_tags_window_was_let_go_brings_it_back_and_lands() {
+  use slates_git::object_name::Kind;
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, _, tags) = tagged_create();
+  assert_git_pushed(&pushed(edge, &name, &request));
+  let (_, commands_end) = packets_from(&request, 0);
+  let pack = request
+    .get(commands_end..)
+    .expect("the push's pack")
+    .to_vec();
+  let brought_before = let_go_pack_by_hand(&daemon, &pack);
+  let inner = *tags.first().expect("a tag");
+  let outer = format!(
+    "object {inner}\ntype tag\ntag b\ntagger A <a@example.com> 1700000001 +0000\n\na tag of a tag\n"
+  )
+  .into_bytes();
+  let outer_id = git_name(Kind::Tag, &outer);
+  let mut second = Vec::new();
+  let line = format!("{ZERO} {outer_id} refs/tags/b\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut second).expect("the command");
+  pktline::write(Packet::Flush, &mut second).expect("the flush");
+  second.extend_from_slice(&stored_pack(&[(Kind::Tag, &outer)]));
+  let tagged = pushed(edge, &name, &second);
+  let brought = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::read_through::BROUGHT_BACK,
+  );
+  daemon.stop();
+  let report = String::from_utf8_lossy(&tagged.1).into_owned();
+  assert_eq!(tagged.0, 200, "{report}");
+  assert!(
+    report.contains("ok refs/tags/b"),
+    "the tag of a tag landed: {report}"
+  );
+  assert!(
+    brought > brought_before,
+    "the inner tag's window brought back: {brought_before} -> {brought}"
+  );
+}
+
+/// Every window of `pack`, pushed to the repository on [`REPOSITORY`]'s partition, let go by hand as a landed pack's
+/// let-go lets it go (its home told first, each window marked landed), and every repository gone idle, what its reads
+/// keep lately given back (`git_encode::give_back_idle`): the windows brought back so far (`read_through.brought_back`).
+fn let_go_pack_by_hand(daemon: &Daemon, pack: &[u8]) -> u64 {
+  let window = crate::daemon::observe_at(daemon, REPOSITORY, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .expect("the repository's content store");
+  let ids: Vec<slates_vcs::ContentId> =
+    pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let pack_identity = slates_vcs::ContentId::of(pack);
+  crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().expect("the content store");
+      for id in &ids {
+        content.mark_landed(id);
+      }
+    });
+    for id in &ids {
+      let _ = crate::vcs_store::let_go_read(state, id);
+    }
+    for id in state.vcs_stores.git_repositories() {
+      crate::vcs_store::git_encode::give_back_idle(state, id);
+    }
+    state
+      .refusals
+      .get(crate::vcs_store::read_through::BROUGHT_BACK)
+      .copied()
+      .unwrap_or(0)
+  })
 }
 
 /// Goal 93 item 2b(a) (main 01a20182's r52, 2026-11-22: once git/git's push ended its landed pack was let go, and every
@@ -2166,9 +2517,11 @@ fn a_mercurial_stream_clone_larger_than_one_ring_region_is_answered_through_the_
 /// edge, push one changeset whose file is twice a request's room and compresses (every byte odd); stream-clone it; clone
 /// it. Expect: the push's segment made into chunks as it landed, no step compressing past the copy slice it was given;
 /// the stream sending the file's chunk byte for byte with nothing compressed again (its count and send passes' zstd at
-/// zero); the clone's changegroup carrying the file's bytes whole, its chunk decoded on the shard (non-vacuity: the
-/// decoded bytes at least the file's). Red before: the stream compressed every chunk twice, and nothing was chunked at
-/// arrival.
+/// zero), its copy counted (`vcs_store.hg_stream_send_kept_bytes` at least the chunk's length); the clone's
+/// changegroup carrying the file's bytes whole, its chunk decoded on the shard (non-vacuity: the decoded bytes at least
+/// the file's). Red before: the stream compressed every chunk twice, and nothing was chunked at arrival; and, for the
+/// copy's count, nothing counted a chunk sent as it lies (main's hg_interop round at b8ba82ad3 read the compress
+/// counters at zero and could not tell a copy from a count dropped).
 #[test]
 fn a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes() {
   let (identity, certificate) = identity();
@@ -2217,6 +2570,11 @@ fn a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes() {
     REPOSITORY,
     crate::vcs_store::hg_view::COMPRESS_SEND_NS,
   );
+  let kept = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_view::STREAM_SEND_KEPT_BYTES,
+  );
   let tip = crate::verbs::hex_of(&made[0].node);
   let cloned = hg_getbundle(edge, &name, &tip);
   let decoded = counted_on(
@@ -2245,6 +2603,11 @@ fn a_pushs_file_lands_as_a_chunk_the_stream_copies_and_the_clone_decodes() {
     "the stream carries the file's chunk"
   );
   assert_eq!(recompressed, 0, "the stream compressed nothing again");
+  assert!(
+    kept >= chunk.len() as u64,
+    "the stream copied the file's chunk as the store keeps it: {kept} bytes counted, the chunk {}",
+    chunk.len()
+  );
   assert!(
     decoded >= large.len() as u64,
     "the clone decoded the file's chunk: {decoded}"
@@ -2422,13 +2785,10 @@ fn reply_parts(stream: &[u8], outputs: bool) -> Vec<(Vec<u8>, PartParameters)> {
 }
 
 /// A plain connection to the edge on loopback `port`, its reads waiting [`patience_ns`].
-fn cleartext_client(port: u16) -> ClientStream {
+fn cleartext_client(port: u16) -> EdgeSocket {
   let socket = ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
     .expect("the edge's listener takes the connection");
-  socket
-    .set_read_timeout(Some(Duration::from_nanos(patience_ns())))
-    .expect("a read timeout");
-  socket
+  patient(socket, port)
 }
 
 /// The head and the body of the answer to `request`, sent whole on `stream`.
@@ -3064,6 +3424,74 @@ fn a_dav_proppatch_of_a_revision_changes_its_property_through_its_revprop_hooks(
     "pre-revprop-change {args:?}"
   );
 }
+
+/// Main 01a20182's ruling of 2026-11-25 on A-622 (its 8a loop: a `post-revprop-change` whose first run was a few
+/// milliseconds taught a bound of about a liveness window, and its next run under load was killed past it, the PROPPATCH
+/// answered 500 "did not exit cleanly ... exitcode was 9"). Do: through a repository whose `post-revprop-change` records
+/// its input, fast the first time and sleeping [`SLOWER_SECOND_RUN_NS`] the second, PROPPATCH `!svn/rev/1`'s `svn:log`
+/// twice. Expect: both `207`, the second run's input recorded: a bound learned from one run holds no run, so the slower
+/// run ends by its own exit inside its client's patience. Red before: the second answered `500`, its hook killed.
+#[cfg(unix)]
+#[test]
+fn a_revprop_hook_slower_than_its_one_fast_run_is_not_killed() {
+  use slates_ipc::protocol::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let at = dir.path.display().to_string();
+  let seconds = SLOWER_SECOND_RUN_NS.div_ceil(1_000_000_000);
+  let post = crate::vcs_svn::tests::hook_script(
+    &dir.path,
+    "post-revprop-change",
+    &format!(
+      // A run with no arguments is `hook_script`'s own, in place, before any revision's: no run of the hook's.
+      "[ -n \"$1\" ] || exit 0\nif [ -e {at}/post.ran ]; then sleep {seconds}; fi\ntouch {at}/post.ran\n\
+       cat > {at}/post.in"
+    ),
+  );
+  let pre = crate::vcs_svn::tests::hook_script(&dir.path, "pre-revprop-change", "cat > /dev/null");
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge serves");
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let name = svn_name_on_the_repositorys_partition();
+  create_svn_hooked(
+    &daemon,
+    &name,
+    vec![
+      (HookPointName::SvnPreRevpropChange, pre),
+      (HookPointName::SvnPostRevpropChange, post),
+    ],
+  );
+  let (_, _, merged, _) = dav_commit((port, &certificate), &name, b"hello\n");
+  let revision = format!("/{name}/!svn/rev/1");
+  let patch = |body: Vec<u8>| {
+    dav(
+      (port, &certificate),
+      ("PROPPATCH", &revision),
+      &["Content-Type: text/xml"],
+      &body,
+    )
+  };
+  let first = patch(log_proppatch("an edit", None));
+  let second = patch(log_proppatch("a second edit", Some("an edit")));
+  daemon.stop();
+  #[allow(clippy::disallowed_methods)]
+  // test code: what the hook recorded in its own scratch directory
+  let recorded = std::fs::read_to_string(dir.path.join("post.in")).unwrap_or_default();
+  assert_eq!(
+    (merged, first.0, second.0),
+    (200, 207, 207),
+    "first: {}\nsecond: {}",
+    first.2,
+    second.2
+  );
+  assert_eq!(recorded, "an edit", "the second run's input, the old value");
+}
+
+/// Shape: how long [`a_revprop_hook_slower_than_its_one_fast_run_is_not_killed`]'s hook sleeps on its second run: past
+/// the bound one fast run would teach (its tail of a few milliseconds and a liveness window), two windows, and inside
+/// its client's patience ([`PATIENCE_NS`], ten).
+#[cfg(unix)]
+const SLOWER_SECOND_RUN_NS: u64 = 2 * crate::daemon::LIVENESS_BUDGET_NS;
 
 /// A-733 (`mod_dav_svn`'s LOCK runs pre-lock through `svn_repos_fs_lock`, its refusal "Failed to create new lock." with
 /// the hook's error, `lock.c`). Do: commit a file over DAV, then LOCK it as stock svn does, through a repository whose
@@ -6994,6 +7422,7 @@ fn the_choosing_units_counters_follow_the_negotiations_kinds() {
   ];
   for (at, (kind, name)) in named.iter().enumerate() {
     assert_eq!(UnitKind::ALL[at], *kind);
+    assert!(crate::vcs_store::upload::UNITS_BY_KIND[at].ends_with(&format!(".{name}")));
     assert!(crate::vcs_store::upload::LONG_UNITS[at].ends_with(&format!(".{name}")));
     assert!(crate::vcs_store::upload::UNIT_NS_MOST[at].ends_with(&format!(".{name}")));
   }
@@ -7165,8 +7594,10 @@ fn tree_chained_create(depth: usize) -> (Vec<u8>, ObjectId) {
 /// (`vcs_store.git_upload.tree_deltas` past zero, `tree_deltas_most` at least one), so a clone's `open_tree` can be read
 /// against what its reads apply; and the chain built once over the whole walk, at most [`TREE_CHAIN`] deltas, each tree
 /// after the first read found in the read cache (the walk reads the newest first, so that first read applies the whole
-/// chain). Red before the fetch's read cache: 78 deltas, 0+1+...+12, every tree's chain rebuilt from its base, since the
-/// fork a fetch reads through kept no cache.
+/// chain), so `tree_deltas_past_one` is that read's all but one. Red before the fetch's read cache: 78 deltas,
+/// 0+1+...+12, every tree's chain rebuilt from its base, since the fork a fetch reads through kept no cache. Red before
+/// the fetch summed `tree_deltas_past_one` with the others: 0 counted, so git/git's leg read 0 past one over 1,810,257
+/// deltas.
 #[test]
 fn a_fetchs_tree_reads_count_the_deltas_they_apply_and_build_a_chain_once() {
   let (identity, certificate) = identity();
@@ -7189,12 +7620,24 @@ fn a_fetchs_tree_reads_count_the_deltas_they_apply_and_build_a_chain_once() {
     REPOSITORY,
     crate::vcs_store::upload::TREE_DELTAS_MOST,
   );
+  let past_one = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::upload::TREE_DELTAS_PAST_ONE,
+  );
   daemon.stop();
-  eprintln!("tree reads: {deltas} deltas applied, at most {most} in one");
+  eprintln!(
+    "tree reads: {deltas} deltas applied, at most {most} in one, {past_one} past each read's first"
+  );
   assert_eq!(fetched.0, 200);
   assert_eq!(ids_in(&fetched_pack(&fetched.1)).len(), pushed_pack_objects);
   assert!(deltas > 0, "the tree reads applied deltas: {deltas}");
   assert!(most >= 1, "one tree read applied at least one: {most}");
+  assert_eq!(
+    past_one,
+    most.saturating_sub(1),
+    "the one read building the chain applied all but its first past one"
+  );
   assert!(
     deltas <= u64::try_from(TREE_CHAIN).expect("a count"),
     "the chain built once over the walk: {deltas} deltas against {TREE_CHAIN}"
@@ -7213,6 +7656,21 @@ const SPREAD_DEPTH: usize = 12;
 /// directories. A walk reading the newest commit first meets every directory's chain in turn, interleaved, as a real
 /// clone's walk does. The request, the last commit, and the trees it holds.
 fn spread_chained_create(dirs: usize, depth: usize) -> (Vec<u8>, ObjectId, usize) {
+  spread_create(dirs, depth, Deltas::Chained)
+}
+
+/// How [`spread_create`]'s revisions of each directory are stored.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Deltas {
+  /// Each against the revision before it: one chain a directory.
+  Chained,
+  /// Each against the directory's first revision, held whole: a base every revision shares, as `git pack-objects`'s
+  /// window often deltas many of a path's revisions against one of them.
+  Star,
+}
+
+/// [`spread_chained_create`]'s history, its directories' revisions stored as `deltas` says.
+fn spread_create(dirs: usize, depth: usize, deltas: Deltas) -> (Vec<u8>, ObjectId, usize) {
   use slates_git::entry::{self, Header, Representation};
   use slates_git::object_name::Kind;
   let mut blobs: Vec<Vec<u8>> = Vec::new();
@@ -7278,10 +7736,15 @@ fn spread_chained_create(dirs: usize, depth: usize) -> (Vec<u8>, ObjectId, usize
       revisions[0].len(),
       &mut at,
     );
+    let first = base;
     for k in 1..revisions.len() {
-      let delta = slates_git::store::delta_of(&revisions[k - 1], &revisions[k]).expect("a delta");
+      let (from, against) = match deltas {
+        Deltas::Chained => (&revisions[k - 1], base),
+        Deltas::Star => (&revisions[0], first),
+      };
+      let delta = slates_git::store::delta_of(from, &revisions[k]).expect("a delta");
       base = put(
-        Representation::OfsDelta { base },
+        Representation::OfsDelta { base: against },
         &delta,
         delta.len(),
         &mut at,
@@ -7304,6 +7767,62 @@ fn spread_chained_create(dirs: usize, depth: usize) -> (Vec<u8>, ObjectId, usize
   pktline::write(Packet::Flush, &mut request).expect("the flush");
   request.extend_from_slice(&pack);
   (request, tip, trees)
+}
+
+/// Main's order of 2026-11-26 (the eviction order needs what a fetch's tree reads inflate whole, against the distinct
+/// bases `git verify-pack -v` finds in the pack offline). Do: push [`spread_create`] of [`SPREAD_DIRS`] directories
+/// [`SPREAD_DEPTH`] revisions deep, each directory's revisions (and the root's) a delta against its first
+/// ([`Deltas::Star`]); fetch its last commit. Expect: `200`, the pack whole; `tree_bases_inflated` at least the
+/// fixture's distinct bases (one a directory and the root's, known from its construction: the floor, every base kept),
+/// and every read that found nothing kept inflating its root (a star's chain is one step, so a read either finds its
+/// tree or its base kept, or inflates the base), its headroom over the floor those reads past each base's first. Red
+/// before the count: 0. Kept oldest-laid first it read 44 (9 first reads and 35 bases given back while their
+/// revisions were still read); with a base found kept again laid again with the newest (`packed::Recent::refresh`), 23
+/// (94 hits), the rest the budget's turnover, its capacity and not its order. With the budget asked past the two chunks
+/// its turnover holds idle (`packed::Recent::budget_keeping`), each base inflated less than twice on average over the
+/// walk (reuse = inflated ÷ distinct under 2): 11 (106 hits). Red before: 23, reuse 2.6.
+#[test]
+fn a_fetchs_tree_reads_count_the_bases_they_inflate_whole() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, tip, trees) = spread_create(SPREAD_DIRS, SPREAD_DEPTH, Deltas::Star);
+  let pushed_pack_objects = {
+    let (_, commands_end) = packets_from(&request, 0);
+    ids_in(&request[commands_end..]).len()
+  };
+  assert_git_pushed(&pushed(edge, &name, &request));
+  let fetched = uploaded(edge, &name, &fetch_of(tip));
+  let read = |counter| counted_on(&daemon, REPOSITORY, counter);
+  let (inflated, hits) = (
+    read(crate::vcs_store::upload::TREE_BASES_INFLATED),
+    read(crate::vcs_store::upload::READ_CACHE_HITS),
+  );
+  daemon.stop();
+  let distinct = u64::try_from(SPREAD_DIRS.saturating_add(1)).expect("a count");
+  let trees = u64::try_from(trees).expect("a count");
+  eprintln!(
+    "{trees} star tree reads: {inflated} bases inflated, {distinct} distinct, {hits} read cache hits"
+  );
+  assert_eq!(fetched.0, 200);
+  assert_eq!(ids_in(&fetched_pack(&fetched.1)).len(), pushed_pack_objects);
+  assert!(
+    inflated >= distinct,
+    "each base inflated at least once: {inflated} of {distinct}"
+  );
+  assert!(
+    inflated < distinct.saturating_mul(2),
+    "each base inflated less than twice on average: {inflated} for {distinct}"
+  );
+  assert_eq!(
+    inflated,
+    trees.saturating_sub(hits),
+    "every read finding nothing kept inflated its base"
+  );
 }
 
 /// Main 01a20182's reading of 2026-11-25: on git/git the fetch's read cache cut chain rebuilds by 2.1 % (2,047,136
@@ -7337,9 +7856,19 @@ fn a_fetchs_read_cache_keeps_every_interleaved_chain_whole() {
     read(crate::vcs_store::upload::READ_CACHE_BUDGET_MOST),
     read(crate::vcs_store::upload::TREE_DELTAS),
   );
+  let open_tree = slates_git::negotiation::UnitKind::ALL
+    .iter()
+    .position(|kind| *kind == slates_git::negotiation::UnitKind::OpenTree)
+    .expect("an open_tree kind");
+  let opened = read(crate::vcs_store::upload::UNITS_BY_KIND[open_tree]);
   daemon.stop();
   eprintln!(
-    "read cache over {trees} tree reads: {hits} hits, widened {widened}, refused {refused}, budget {budget} B, {deltas} deltas applied"
+    "read cache over {trees} tree reads: {hits} hits, widened {widened}, refused {refused}, budget {budget} B, {deltas} deltas applied, {opened} open_tree units"
+  );
+  assert_eq!(
+    opened,
+    u64::try_from(trees).expect("a count"),
+    "every tree read counted among the open_tree units, what the hits are a share of"
   );
   assert_eq!(fetched.0, 200);
   assert_eq!(ids_in(&fetched_pack(&fetched.1)).len(), pushed_pack_objects);

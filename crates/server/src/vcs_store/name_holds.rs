@@ -56,6 +56,64 @@ pub(crate) fn freeing<T>(
   answer
 }
 
+/// Counted for each step of [`apply_some`] that applied some of the greens' pending holds: many a wide landing shows its
+/// holds were applied a slice at a time, never all at its first free decision (A-920 7c). Format: a counter name in the
+/// daemon's status report.
+pub(crate) const NAME_HOLD_APPLY_STEPS: &str = "merge.name_hold.apply_steps";
+
+/// The greens' pending holds applied a hold a unit until `deadline_ns`, at least one: every take before any give, as
+/// [`freeing`] applies them, those left put back first in line (A-920 7c: a wide landing's 9,000 holds applied at its
+/// first free decision, 7.8 ms of one step, debug). A free decision between steps applies the rest whole, so no text a
+/// green names is freed before its take, and no give comes before a take it follows. Whether none is left.
+pub(crate) fn apply_some(state: &mut crate::state::ShardState, deadline_ns: u64) -> bool {
+  let holds = state.greens.take_name_holds();
+  if holds.is_empty() {
+    return true;
+  }
+  state.count(NAME_HOLD_APPLY_STEPS, 1);
+  let (unheld, left) = super::within_budget(state, 0, |stores| {
+    apply_within(stores.content_mut(), holds, deadline_ns)
+  });
+  if unheld > 0 {
+    state.count(NAME_HOLD_UNHELD, unheld);
+  }
+  let done = left.is_empty();
+  state.greens.put_back_name_holds(left);
+  done
+}
+
+/// [`apply`] until `deadline_ns`, a hold a unit, at least one: the takes in order while any is left, then the gives;
+/// the takes refused and the holds not yet applied, in order.
+fn apply_within(
+  store: Option<&mut ContentStore>,
+  holds: Vec<NameHold>,
+  deadline_ns: u64,
+) -> (u64, Vec<NameHold>) {
+  let Some(store) = store else {
+    return (apply(None, holds), Vec::new());
+  };
+  let taking = holds.iter().any(|hold| matches!(hold, NameHold::Take(_)));
+  let mut unheld = 0u64;
+  let mut left = Vec::new();
+  let mut spent = false;
+  for hold in holds {
+    match hold {
+      NameHold::Take(identity) if taking && !spent => {
+        if store.hold(&ContentId(identity.hash)).is_err() {
+          unheld = unheld.saturating_add(1);
+        }
+        spent = slates_rt::futures::now_ns() >= deadline_ns;
+      }
+      NameHold::Give(identity) if !taking && !spent => {
+        let _ = store.release(&ContentId(identity.hash));
+        spent = slates_rt::futures::now_ns() >= deadline_ns;
+      }
+      other => left.push(other),
+    }
+  }
+  (unheld, left)
+}
+
 /// Applies `holds` to `store`, the takes first: the takes refused (no such object, or no store).
 fn apply(store: Option<&mut ContentStore>, holds: Vec<NameHold>) -> u64 {
   if holds.is_empty() {
@@ -434,4 +492,67 @@ pub(crate) fn resident(store: &ContentStore, identity: [u8; 32], len: u64) -> bo
     at = start.saturating_add(width.max(1));
   }
   false
+}
+
+#[cfg(test)]
+mod tests {
+  use slates_merge::engine::NameHold;
+  use slates_merge::named::Identity;
+  use slates_vcs::{ContentId, ContentStore};
+
+  /// The window the test's stores are made with: small, so a text is one window.
+  const WINDOW: usize = 256;
+
+  /// A store holding `texts` put once each, and their names.
+  fn holding(texts: &[&[u8]]) -> (ContentStore, Vec<Identity>) {
+    let mut store = ContentStore::new(1 << 20, WINDOW).expect("a store");
+    let names = texts
+      .iter()
+      .map(|text| {
+        let id = store.put(text).expect("room for the text");
+        Identity {
+          hash: id.0,
+          len: u64::try_from(text.len()).expect("a length"),
+        }
+      })
+      .collect();
+    (store, names)
+  }
+
+  /// Each of `names`' holders in `store`.
+  fn holders(store: &ContentStore, names: &[Identity]) -> Vec<u64> {
+    names
+      .iter()
+      .map(|name| store.holders(&ContentId(name.hash)))
+      .collect()
+  }
+
+  /// A-920 7c. Do: in a store holding two texts once each, apply a drain that gives the first back and takes it again
+  /// (a block freed and another naming the same object), then takes the second and gives it back, a hold a unit
+  /// (`apply_within` with its deadline passed, what each step left fed back to the next), and the same drain whole
+  /// (`apply`). Expect: each text's holders the same after either, both still held, and the drain taken in a step a hold.
+  #[test]
+  fn a_drain_applied_a_hold_a_step_leaves_the_holders_applied_whole_leaves() {
+    let texts: [&[u8]; 2] = [b"the first named text", b"the second named text"];
+    let drain = |names: &[Identity]| {
+      vec![
+        NameHold::Give(names[0]),
+        NameHold::Take(names[0]),
+        NameHold::Take(names[1]),
+        NameHold::Give(names[1]),
+      ]
+    };
+    let (mut whole, names) = holding(&texts);
+    let unheld_whole = super::apply(Some(&mut whole), drain(&names));
+    let (mut stepped, _) = holding(&texts);
+    let (mut left, mut unheld_stepped, mut steps) = (drain(&names), 0, 0);
+    while !left.is_empty() {
+      let (unheld, rest) = super::apply_within(Some(&mut stepped), left, 0);
+      (left, unheld_stepped, steps) = (rest, unheld_stepped + unheld, steps + 1);
+    }
+    assert_eq!(holders(&stepped, &names), holders(&whole, &names));
+    assert_eq!(holders(&whole, &names), [1, 1], "both texts still held");
+    assert_eq!((unheld_stepped, unheld_whole), (0, 0), "no take refused");
+    assert_eq!(steps, 4, "a hold a step");
+  }
 }

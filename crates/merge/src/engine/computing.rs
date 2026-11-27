@@ -40,11 +40,58 @@ enum ComputePhase {
 }
 
 /// The units decided, what they reach being found from the next ([`ComputePhase::Reaching`]).
+#[derive(Default)]
 struct Reaching {
-  units: Vec<position::Unit>,
-  at: usize,
+  /// The resolution and the decision's sets, let go a unit a unit before any unit is reached (A-920 piece 3h).
+  releasing: Option<Box<(Resolved, Deciding)>>,
+  units: position::Verdict,
+  /// The next of the verdict's windows to take, a window a unit of the walk.
+  window_at: usize,
+  /// The next of the verdict's effects to map, an effect a unit of the walk (A-920 3k): one unit can hold most of a
+  /// work's effects (its copies' is one unit whole), and mapped whole it was the reach's step.
+  effect_at: usize,
   windows: Vec<crate::ConflictWindow>,
   applied: Vec<crate::chain_entry::Applied>,
+}
+
+impl Reaching {
+  /// The resolution and the decision's sets let go a unit at a time until `spent`: whether all of them are.
+  fn release_some(&mut self, spent: &mut dyn FnMut() -> bool) -> bool {
+    if let Some((resolved, cursor)) = self.releasing.as_deref_mut() {
+      loop {
+        if !resolved.release_one() && !cursor.release_one() {
+          break;
+        }
+        if spent() {
+          return false;
+        }
+      }
+    }
+    self.releasing = None;
+    true
+  }
+
+  /// `Reached::of`, an item at a time until `spent`: every window, then, while none is held, what the chain records of
+  /// each effect. Whether all of it is reached.
+  fn reach_some(&mut self, spent: &mut dyn FnMut() -> bool) -> bool {
+    while let Some(window) = self.units.windows.get(self.window_at) {
+      self.windows.push(window.clone());
+      self.window_at = self.window_at.saturating_add(1);
+      if spent() {
+        return false;
+      }
+    }
+    if self.windows.is_empty() {
+      while let Some(effect) = self.units.effects.get(self.effect_at) {
+        self.applied.push(effect.applied());
+        self.effect_at = self.effect_at.saturating_add(1);
+        if spent() {
+          return false;
+        }
+      }
+    }
+    true
+  }
 }
 
 impl core::fmt::Debug for ComputePhase {
@@ -54,7 +101,10 @@ impl core::fmt::Debug for ComputePhase {
       ComputePhase::Ended(answer) => f.debug_tuple("Ended").field(answer).finish(),
       ComputePhase::Resolving(at, _) => f.debug_tuple("Resolving").field(at).finish(),
       ComputePhase::Deciding(_) => f.write_str("Deciding"),
-      ComputePhase::Reaching(reaching) => f.debug_tuple("Reaching").field(&reaching.at).finish(),
+      ComputePhase::Reaching(reaching) => f
+        .debug_tuple("Reaching")
+        .field(&(reaching.window_at, reaching.effect_at))
+        .finish(),
     }
   }
 }
@@ -67,12 +117,24 @@ pub struct Judging {
 }
 
 /// Where a judge stands between its steps.
-#[derive(Debug)]
 enum JudgingPhase {
   /// The rejected-result cache answered it.
   Answered(Option<Box<Judgment>>),
   /// Its verdict being computed.
   Computing(Box<Computing>),
+  /// Its verdict being held, a unit at a time (A-920 piece 3g), with the unlent named blocks its hold has read.
+  Holding(Box<(super::Holding, BTreeSet<Identity>)>),
+}
+
+impl core::fmt::Debug for JudgingPhase {
+  /// Where it stands.
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      JudgingPhase::Answered(answer) => f.debug_tuple("Answered").field(answer).finish(),
+      JudgingPhase::Computing(computing) => f.debug_tuple("Computing").field(computing).finish(),
+      JudgingPhase::Holding(_) => f.write_str("Holding"),
+    }
+  }
 }
 
 impl Green {
@@ -153,71 +215,103 @@ impl Green {
   ) -> Option<Result<Computed, ComputeRefused>> {
     match &mut computing.phase {
       ComputePhase::Ended(answer) => answer.take(),
-      ComputePhase::Resolving(at, resolved) => {
-        if !Green::resolve_some(inc, (resolved, at), spent) {
-          return None;
-        }
-        let mut resolved = core::mem::take(resolved);
-        resolved.finish_resolving();
-        if let Some((path, case)) = self.copy_refusal(&resolved) {
-          return Some(Err(ComputeRefused::CopyRefused { path, case }));
-        }
-        computing.phase = ComputePhase::Deciding(Box::new((
-          *resolved,
-          Deciding::default(),
-          position::Units::first(),
-        )));
-        None
-      }
-      ComputePhase::Deciding(deciding) => {
-        let (resolved, cursor, units) = &mut **deciding;
-        if !self.decide_some(inc, resolved, (units, cursor), spent) {
-          return None;
-        }
-        let units = core::mem::replace(units, position::Units::first());
-        computing.phase = ComputePhase::Reaching(Box::new(Reaching {
-          units: units.into_units().0,
-          at: 0,
-          windows: Vec::new(),
-          applied: Vec::new(),
-        }));
-        None
-      }
-      ComputePhase::Reaching(reaching) => {
-        while let Some(unit) = reaching.units.get(reaching.at) {
-          Reached::reach_unit(unit, (&mut reaching.windows, &mut reaching.applied));
-          reaching.at = reaching.at.saturating_add(1);
-          if reaching.at < reaching.units.len() && spent() {
-            return None;
-          }
-        }
-        let Reaching {
-          units,
-          windows,
-          applied,
-          ..
-        } = core::mem::replace(
-          &mut **reaching,
-          Reaching {
-            units: Vec::new(),
-            at: 0,
-            windows: Vec::new(),
-            applied: Vec::new(),
-          },
-        );
-        Some(Ok(Computed {
-          id: inc.id,
-          base: inc.base,
-          at: computing.at,
-          floor: computing.floor,
-          reached: Reached::Verdict {
-            units,
-            applied,
-            windows,
-          },
-        }))
-      }
+      ComputePhase::Resolving(..) => self.resolving_step(inc, computing, spent),
+      ComputePhase::Deciding(_) => self.deciding_step(inc, computing, spent),
+      ComputePhase::Reaching(_) => Green::reaching_step(inc, computing, spent),
     }
+  }
+
+  /// One step of the resolution: its ops a unit at a time; once every one is, the copies checked and the decision begun.
+  fn resolving_step(
+    &self,
+    inc: &Increment,
+    computing: &mut Computing,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Option<Result<Computed, ComputeRefused>> {
+    let ComputePhase::Resolving(at, resolved) = &mut computing.phase else {
+      return None;
+    };
+    if !Green::resolve_some(inc, (resolved, at), spent) {
+      return None;
+    }
+    let mut resolved = core::mem::take(resolved);
+    resolved.finish_resolving();
+    if let Some((path, case)) = self.copy_refusal(&resolved) {
+      return Some(Err(ComputeRefused::CopyRefused { path, case }));
+    }
+    computing.phase = ComputePhase::Deciding(Box::new((
+      *resolved,
+      Deciding::default(),
+      position::Units::first(),
+    )));
+    None
+  }
+
+  /// One step of the decision: its units a unit at a time; once every one is, the reach begun over the verdict's lists.
+  fn deciding_step(
+    &self,
+    inc: &Increment,
+    computing: &mut Computing,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Option<Result<Computed, ComputeRefused>> {
+    let ComputePhase::Deciding(deciding) = &mut computing.phase else {
+      return None;
+    };
+    let (resolved, cursor, units) = &mut **deciding;
+    if !self.decide_some(inc, resolved, (units, cursor), spent) {
+      return None;
+    }
+    let ComputePhase::Deciding(decided) =
+      core::mem::replace(&mut computing.phase, ComputePhase::Ended(None))
+    else {
+      return None;
+    };
+    let (resolved, cursor, units) = *decided;
+    self.note_unit_lists(&units);
+    let units = units.into_units().0;
+    // Sized once at the verdict's effects: grown, it copied itself whole at each doubling (A-920 3i).
+    let effects = units.effects.len();
+    computing.phase = ComputePhase::Reaching(Box::new(Reaching {
+      releasing: Some(Box::new((resolved, cursor))),
+      units,
+      window_at: 0,
+      effect_at: 0,
+      windows: Vec::new(),
+      applied: Vec::with_capacity(effects),
+    }));
+    None
+  }
+
+  /// One step of the reach: the resolution let go a unit at a time, then what the verdict reaches an item at a time
+  /// ([`Reaching::reach_some`]); once all of it is, the computed verdict.
+  fn reaching_step(
+    inc: &Increment,
+    computing: &mut Computing,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Option<Result<Computed, ComputeRefused>> {
+    let ComputePhase::Reaching(reaching) = &mut computing.phase else {
+      return None;
+    };
+    if !reaching.release_some(spent) || !reaching.reach_some(spent) {
+      return None;
+    }
+    let Reaching {
+      units,
+      windows,
+      applied,
+      ..
+    } = core::mem::take(&mut **reaching);
+    Some(Ok(Computed {
+      id: inc.id,
+      base: inc.base,
+      at: computing.at,
+      floor: computing.floor,
+      reached: Reached::Verdict {
+        units,
+        applied,
+        windows,
+      },
+    }))
   }
 
   /// [`Green::compute`] with its reads of unlent named blocks noted, not refused: what [`Green::unlent_reads`] walks.
@@ -254,16 +348,31 @@ impl Green {
     judging: &mut Judging,
     spent: &mut dyn FnMut() -> bool,
   ) -> Option<Judgment> {
-    let computed = match &mut judging.phase {
+    let mut judgment = match &mut judging.phase {
       JudgingPhase::Answered(answer) => return answer.take().map(|answer| *answer),
-      JudgingPhase::Computing(computing) => self.computing_step(inc, computing, spent)?,
-    };
-    let mut judgment = match computed {
-      Ok(computed) => self.hold_unlent(inc, computed, false),
-      Err(refused) => self.refused_judgment(refused),
+      JudgingPhase::Computing(computing) => match self.computing_step(inc, computing, spent)? {
+        Err(refused) => self.refused_judgment(refused),
+        Ok(computed) => {
+          let (begun, unlent) = crate::unlent::scope(|| self.hold_begin(inc, computed, false));
+          match begun {
+            super::HoldBegun::Judged(answer) => self.unlent_rule(inc, answer, &unlent),
+            super::HoldBegun::Holding(holding) => {
+              judging.phase = JudgingPhase::Holding(Box::new((holding, unlent)));
+              return None;
+            }
+          }
+        }
+      },
+      JudgingPhase::Holding(held) => {
+        let (holding, unlent) = &mut **held;
+        let (judgment, more) = crate::unlent::scope(|| self.hold_end(inc, holding));
+        unlent.extend(more);
+        let unlent = core::mem::take(unlent);
+        self.unlent_rule(inc, judgment, &unlent)
+      }
     };
     if let Judgment::Accepted(held) = &mut judgment {
-      held.read = core::mem::take(&mut inc.named.read.0);
+      held.read = core::mem::take(&mut inc.named.read);
     }
     Some(judgment)
   }

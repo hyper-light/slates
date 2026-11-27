@@ -268,6 +268,14 @@ fn paced(
   }
 }
 
+/// Where repository `id`'s derivation behind a push stands (a test's look, for a read that must arrive mid-derivation):
+/// whether the task behind still runs ([`derive_behind`]), and whether a derivation is kept under way between its turns.
+#[cfg(test)]
+pub(crate) fn behind_and_under_way(state: &ShardState, id: RepositoryId) -> (bool, bool) {
+  let derivings = &state.vcs_stores.derivings;
+  (derivings.1.contains(&id), derivings.0.contains_key(&id))
+}
+
 /// Drops repository `id`'s derivation under way, if any: its repository is freed.
 pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
   state.vcs_stores.derivings.0.remove(&id);

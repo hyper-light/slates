@@ -40,6 +40,7 @@ use super::{Followed, Repository, StoreRefused};
 use crate::object_name::{Kind, ObjectId};
 use crate::store::hook_view::Quantum;
 use crate::store::{Positions, Push};
+use crate::to_u64;
 
 /// A derivation under way of one version's sets and those its own follow from (module docs).
 #[derive(Debug)]
@@ -170,14 +171,13 @@ impl Repository {
     }
   }
 
-  /// Whether any version's sets are not known: whether [`Self::deriving_due`] has anything to do.
+  /// Whether any version's sets are not known: whether [`Self::deriving_due`] has anything to do. Asked before every
+  /// turn of a derivation or an encoding (`slates_server::vcs_store::git_derive`), so it is answered from counts and
+  /// looks at no version: the versions with no value of their own (`Repository::unvalued`) outnumber the sets the memo
+  /// derived for them, which it holds for such versions alone (module docs, "Kept"). It walked every chain's versions
+  /// before: a third of a git/git encoding's time behind its push (main 01a20182's sample of 2026-11-25).
   pub fn derivations_due(&self) -> bool {
-    let memo = self.memo.borrow();
-    self.chains.iter().any(|(green, chain)| {
-      chain.versions.iter().enumerate().any(|(version, record)| {
-        record.value.is_none() && !memo.values.contains_key(&(*green, version))
-      })
-    })
+    to_u64(self.memo.borrow().values.len()) < self.unvalued
   }
 
   /// The generation number of the commit the object at `position` peels to; none for one that peels to no commit.

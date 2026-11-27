@@ -1,7 +1,7 @@
 //! Mercurial's pushes landed (A-657; §4.17.3 "Push" steps 3 to 7, decisions 1 to 3 and 6; A-641 part 3): a push's
 //! bundle, read and verified by slates-hg, placed by its classifier on the repository's lines and bookmarks (each a
 //! green of the repository's namespace), its race checks made positions the append compares (A-642), its phase roots
-//! moved in the same entry, one entry appended through A-635's [`RepositoryLogs::append`], its revisions kept in the
+//! moved in the same entry, one entry appended through A-635's [`push::RepositoryLogs::append`], its revisions kept in the
 //! repository's index once the entry commits, and its reply written as 7.2's server writes it.
 //!
 //! **The namespace (decided here).** A Mercurial repository's namespace holds two kinds of name, each its own range:
@@ -87,7 +87,7 @@ use slates_ipc::protocol::{DatabaseRefusal, Refusal};
 use slates_merge::engine::Increment;
 use slates_vcs::{ContentStore, IndexRefused};
 
-use super::push::{self, AppendRefused, BranchChange, ChangeRefusal, EntryParts, RepositoryLogs};
+use super::push::{self, AppendRefused, BranchChange, ChangeRefusal, EntryParts};
 #[cfg(unix)]
 use crate::hook_driver::{self, Launch};
 use crate::state::ShardState;
@@ -152,8 +152,6 @@ const SHORT_DIGITS: usize = 12;
 const NOT_AUTHORIZED: &[u8] = b"push not authorized";
 /// Slates' words: the repository's policy holds a rule its matcher cannot read (the guard keeps such rules out).
 const POLICY_UNREADABLE: &[u8] = b"the repository's policy cannot be read";
-/// Slates' words: the repository's store is not held on this shard (the lender lends none it does not hold).
-const NO_STORE: &[u8] = b"the repository's store is not held here";
 /// Slates' words for a push whose fork was made from an index another push replaced before it landed (A-720 part 2a; a
 /// later part re-bases it instead).
 const MOVED: &[u8] = b"the repository changed while this push was taken; push again";
@@ -163,6 +161,22 @@ const UNREAD: &[u8] = b"the push's changesets could not be read back";
 const UNRECORDED: &[u8] = b"the push's record could not be written";
 /// Format: slates' words for a push the node's changeset log refused (its owner busy or gone, or its write failed).
 const UNLANDED: &[u8] = b"the push could not be landed on the repository's changeset log";
+/// Format: slates' words for a push whose changeset fell short of its homes in the region within its budget (ruling R;
+/// A-727's rule: no record names content not durable at `f + 1`): nothing of it is recorded, so it may be sent again.
+const HOMED_SHORT: &[u8] =
+  b"the push's changeset was not made durable at its homes in the region in time: send it again";
+/// Format: slates' words for a push refused before it homed anything because the shard's pushes in flight and the
+/// settles it owes the region were at their bound (`homes::settle_bound`): nothing of it is recorded.
+const PUSHES_AT_BOUND: &[u8] =
+  b"the server has as many pushes in flight as it holds at once: send it again once they end";
+
+/// Slates' words for a push whose object's homing `refused` it ([`HOMED_SHORT`], [`PUSHES_AT_BOUND`]).
+fn unhomed_words(refused: &crate::vcs_store::homes::HomeRefused) -> &'static [u8] {
+  match refused {
+    crate::vcs_store::homes::HomeRefused::AttemptsAtBound => PUSHES_AT_BOUND,
+    _ => HOMED_SHORT,
+  }
+}
 
 /// Counter: pushes landed as a changeset on the node's changeset log (A-767 C4).
 pub(crate) const PUSH_LANDED: &str = "hg_push.landed";
@@ -504,20 +518,10 @@ pub(crate) struct Prepared {
   replied: Vec<Replied>,
   /// Whether the client asked for a reply (`replycaps`).
   wanted: bool,
-  /// The first and last changesets it adds, which its hooks name (`HG_NODE`, `HG_NODE_LAST`).
-  pub(crate) added: Option<(Node, Node)>,
   /// Each name it changes as its admission asks about it.
   pub(crate) asked: Vec<Ask>,
-  /// Its changegroup part's id, which a hook's `output` part names.
-  pub(crate) changegroup: Option<u32>,
-  /// Its transaction's id, which every hook of it reads (`HG_TXNID`; [`transaction_id`]).
-  pub(crate) transaction: String,
   /// Its works' increments held before its landing's step (`crate::held_ahead`): none for works built in that step.
   held_ahead: Vec<crate::held_ahead::HeldAhead>,
-  /// The file revisions its works name by their stored bytes' object (A-887), brought back before a test's landing
-  /// judges them, as the driver brings them back ([`bring_back_named`]).
-  #[cfg(test)]
-  named: Vec<NamedRevision>,
 }
 
 /// One name a push changes as its admission asks about it (A-622 part 2's `admit`): its namespace and label, the right
@@ -549,19 +553,6 @@ impl Prepared {
       })
       .collect()
   }
-
-  /// Adds the `output` parts admission hooks wrote, after the changegroup's reply, as 7.2 writes them after the reply of
-  /// the part whose handler ran the hooks.
-  pub(crate) fn with_output(&mut self, output: Vec<Replied>) {
-    let at = self
-      .replied
-      .iter()
-      .position(|replied| matches!(replied, Replied::Changegroup { .. }))
-      .map_or(self.replied.len(), |at| at.saturating_add(1));
-    let tail = self.replied.split_off(at.min(self.replied.len()));
-    self.replied.extend(output);
-    self.replied.extend(tail);
-  }
 }
 
 /// The push's own terms: whether the repository publishes, the push's name (every work's identity begins with it), and
@@ -584,7 +575,7 @@ pub(crate) fn prepare<V: Repository>(
     CheckRefusal::View(_) => abort(VIEW_REFUSED.to_vec()),
   })?;
   let read = Read::of(state, repository, unbundle);
-  let (publishing, ..) = terms;
+  let (publishing, name, _) = terms;
   let plan = classify::classify(
     unbundle,
     (brought, held_changesets),
@@ -594,21 +585,16 @@ pub(crate) fn prepare<V: Repository>(
     admission,
   )
   .map_err(|refused| refused.refused())?;
-  let changes = changes((&plan, &read), works)?;
+  let changes = changes((&plan, &read), (name, works))?;
   let parts = entry_parts(unbundle, &plan, &read);
   Ok(Prepared {
     changes,
     parts,
     replied: plan.replied.clone(),
     wanted: unbundle.reply_caps().is_some(),
-    added: plan.added,
     asked: asked(&plan, &read),
-    changegroup: unbundle.changegroup().map(|(id, _)| id),
-    transaction: transaction_id(&terms.1),
     forked: None,
     held_ahead: Vec::new(),
-    #[cfg(test)]
-    named: Vec::new(),
   })
 }
 
@@ -711,10 +697,11 @@ fn work((named, head): (&Named, &Node), works: &mut Works<'_>) -> Result<Increme
   }
 }
 
-/// The branches the plan changes, as A-635's append takes them.
+/// The branches the plan changes, as A-635's append takes them: each moved line's work, and each new line owing its push
+/// ([`owed_line`]), so no new line's work is built before its green is first reached.
 fn changes(
   (plan, read): (&Plan, &Read),
-  works: &mut Works<'_>,
+  (name, works): ([u8; 32], &mut Works<'_>),
 ) -> Result<Vec<BranchChange>, Box<Refused>> {
   let mut changes = Vec::new();
   for moved in &plan.lines {
@@ -737,17 +724,48 @@ fn changes(
   }
   for made in &plan.created {
     let base = read.line(made.base)?;
-    changes.push(BranchChange::Create {
+    changes.push(BranchChange::CreateDeferred {
       name: line_name(&made.branch, made.number),
       from: base.green,
       version: base.version,
-      work: Some(work((base, &made.head), works)?),
+      push: owed_line(name, base, &made.head)?,
     });
   }
   for moved in &plan.bookmarks {
     changes.push(mark_change((moved, read), works)?);
   }
   Ok(changes)
+}
+
+/// The push a new line owes from `base`, the line it is made from as the push read it, to changeset `head` (P2 for
+/// Mercurial, main's ruling (A) of 2026-11-26; the many-heads push's (2) and (3)): based at the new green's version 0,
+/// which holds `base`'s version, its trees named by their changesets (`slates_hg::push::tree::changeset_tree`), its head
+/// the changeset. Its work is built, a unit a turn, only when the green is first reached (`crate::green_ready`), over the
+/// trees laid out then: the work its eager create would have made, the same builder over the same trees, though the
+/// work's identity hashes its base (0 here; the eager create hashed `base`'s version and was rebased to 0). Before, every
+/// new line's work was built ahead of the landing and committed in it, its whole tree when its base was empty (a fresh
+/// history's every line), and its chain entry carried that tree into the landing's one record.
+fn owed_line(
+  name: [u8; 32],
+  base: &Named,
+  head: &Node,
+) -> Result<slates_merge::push::DeferredPush, Box<Refused>> {
+  let tree =
+    slates_hg::push::tree::changeset_tree(head).ok_or_else(|| abort(NOT_AVAILABLE.to_vec()))?;
+  let base_tree = base
+    .head
+    .filter(|node| *node != slates_hg::NULL_NODE)
+    .as_ref()
+    .and_then(slates_hg::push::tree::changeset_tree);
+  Ok(slates_merge::push::DeferredPush::of(
+    &slates_merge::push::Push {
+      name,
+      base_version: 0,
+      base_tree,
+      tree,
+      head: Some(head.as_slice()),
+    },
+  ))
 }
 
 /// One bookmark's change as A-635's append takes it: a move on its own green, a green made from a line's version (no
@@ -1277,7 +1295,14 @@ pub(crate) fn land(
     ..
   }) = forked
   else {
-    let appended = RepositoryLogs::append(state, principal, repository, changes, parts);
+    // A push bringing no changesets (`hg push -B` over changesets held) lands its creates made ahead too: their works
+    // were taken out of `changes` when they were planned.
+    let appended = push::push_unrecorded(
+      state,
+      (principal, repository),
+      (changes, &held_ahead, creates),
+      parts,
+    );
     return Landed {
       answer: appended
         .map(|_| Reply::accepted(&replied, wanted))
@@ -1308,7 +1333,12 @@ pub(crate) fn land(
       parts,
       record,
     ),
-    None => RepositoryLogs::append(state, principal, repository, changes, parts),
+    None => push::push_unrecorded(
+      state,
+      (principal, repository),
+      (changes, &held_ahead, creates),
+      parts,
+    ),
   };
   match appended {
     Ok(_) => Landed {
@@ -1486,12 +1516,15 @@ async fn unbundled(
   };
   // Taken, its segments landed as they are cut, apart from the landing turn (`hg_run`); its entry committed in one step
   // under the turn, its fork re-based first where another landing replaced its index meanwhile (`Committing`).
-  let (mut forked, run) = match take_sliced(repository, changegroup, lend_of(bundle), room).await? {
-    Ok(taken) => taken,
-    Err(outcome) => return Some(outcome),
-  };
-  let outcome = match crate::state::with_state(|state| recorded(state, &mut forked, &run))? {
+  let (mut forked, mut run) =
+    match take_sliced(repository, changegroup, lend_of(bundle), room).await? {
+      Ok(taken) => taken,
+      Err(outcome) => return Some(outcome),
+    };
+  let outcome = match recorded(repository, &mut forked, &mut run).await? {
     Ok(()) => {
+      #[cfg(test)]
+      held_before_landing().await;
       landed_after_builds(repository, (principal, name), &unbundle, Some(forked), room).await
     }
     Err(outcome) => {
@@ -1501,6 +1534,64 @@ async fn unbundled(
   };
   settle_run(run, outcome.as_ref()).await;
   outcome
+}
+
+#[cfg(test)]
+std::thread_local! {
+  /// Set by a test on this shard's thread ([`hold_next_landing`]): the next push to reach its landing, its changegroup
+  /// taken and its segments landed, holds there until the test releases it ([`release_held_landing`]), so another push
+  /// can land between its intake and its landing. A test hold, since the product holds a push before its landing nowhere:
+  /// a green whose write policy asks for an approval refuses a push `ApprovalRequired` (`repository::push`), never
+  /// waiting on one, so a race between a push's read and its landing can be staged only so (main's ruling of
+  /// 2026-11-26 for hg_push's race histories).
+  static TEST_HOLD_NEXT_LANDING: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+  /// Whether a push is held at its landing now ([`landing_held`]).
+  static TEST_LANDING_HELD: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+  /// Set by [`release_held_landing`]: the held push goes on.
+  static TEST_LANDING_RELEASED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+  /// The held push's task, woken by its release.
+  static TEST_HELD_LANDING: core::cell::RefCell<Option<core::task::Waker>> =
+    const { core::cell::RefCell::new(None) };
+}
+
+/// Holds a push at its landing where a test asked for the next one to hold ([`TEST_HOLD_NEXT_LANDING`]), until the test
+/// releases it: woken by the release itself, no timed poll (R3).
+#[cfg(test)]
+async fn held_before_landing() {
+  if !TEST_HOLD_NEXT_LANDING.with(|hold| hold.replace(false)) {
+    return;
+  }
+  TEST_LANDING_HELD.with(|held| held.set(true));
+  core::future::poll_fn(|context| {
+    if TEST_LANDING_RELEASED.with(|released| released.replace(false)) {
+      return core::task::Poll::Ready(());
+    }
+    TEST_HELD_LANDING.with(|held| *held.borrow_mut() = Some(context.waker().clone()));
+    core::task::Poll::Pending
+  })
+  .await;
+  TEST_LANDING_HELD.with(|held| held.set(false));
+}
+
+/// Asks the next push to reach its landing on this shard's thread to hold there ([`held_before_landing`]).
+#[cfg(test)]
+pub(crate) fn hold_next_landing() {
+  TEST_HOLD_NEXT_LANDING.with(|hold| hold.set(true));
+}
+
+/// Whether a push is held at its landing on this shard's thread now.
+#[cfg(test)]
+pub(crate) fn landing_held() -> bool {
+  TEST_LANDING_HELD.with(core::cell::Cell::get)
+}
+
+/// Releases the push held at its landing on this shard's thread: its flag set and its task woken.
+#[cfg(test)]
+pub(crate) fn release_held_landing() {
+  TEST_LANDING_RELEASED.with(|released| released.set(true));
+  if let Some(waker) = TEST_HELD_LANDING.with(|held| held.borrow_mut().take()) {
+    waker.wake();
+  }
 }
 
 /// A push's run once its outcome stands. Committed, its file revisions are noted for a home and let go a turn at a time
@@ -1535,13 +1626,15 @@ async fn landed_after_builds(
 ) -> Option<PushOutcome> {
   let mut last_plan: Option<Vec<WorkKey>> = None;
   let mut committing = Committing::default();
+  // The lines owing their pushes this push moves, made through the door and held until it ends (P2).
+  let mut pinned = crate::green_ready::Pinned::default();
   loop {
     let held = fresh_works_held_ahead(
       repository,
       (principal, name),
       unbundle,
       (&mut committing, &mut forked),
-      room,
+      (room, &mut pinned),
     )
     .await?;
     let (plan, (mut built, named), ahead) = match held {
@@ -1780,7 +1873,7 @@ async fn fresh_works_held_ahead(
   (principal, name): (&Principal, [u8; 32]),
   unbundle: &Unbundle,
   (committing, forked): (&mut Committing, &mut Option<Forked>),
-  room: &Admission,
+  (room, pinned): (&Admission, &mut crate::green_ready::Pinned),
 ) -> Option<Result<(Vec<WorkKey>, BuiltWorks, Vec<crate::held_ahead::HeldAhead>), PushOutcome>> {
   if let Err(outcome) = committing.fresh(repository, forked).await? {
     return Some(Err(outcome));
@@ -1790,7 +1883,7 @@ async fn fresh_works_held_ahead(
     (principal, name),
     unbundle,
     forked.as_ref(),
-    room,
+    (room, pinned),
   )
   .await
 }
@@ -1804,13 +1897,20 @@ async fn works_held_ahead(
   (principal, name): (&Principal, [u8; 32]),
   unbundle: &Unbundle,
   forked: Option<&Forked>,
-  room: &Admission,
+  (room, pinned): (&Admission, &mut crate::green_ready::Pinned),
 ) -> Option<Result<(Vec<WorkKey>, BuiltWorks, Vec<crate::held_ahead::HeldAhead>), PushOutcome>> {
-  let (plan, built) =
-    match built_works(repository, (principal, name), unbundle, forked, room).await? {
-      Ok(planned) => planned,
-      Err(outcome) => return Some(Err(outcome)),
-    };
+  let (plan, built) = match built_works(
+    repository,
+    (principal, name),
+    unbundle,
+    forked,
+    (room, pinned),
+  )
+  .await?
+  {
+    Ok(planned) => planned,
+    Err(outcome) => return Some(Err(outcome)),
+  };
   let Ok(ahead) = held_ahead_waiting(repository, &built.0).await? else {
     return Some(Err(PushOutcome::refused(&abort(UNHELD.to_vec()))));
   };
@@ -1873,7 +1973,7 @@ async fn built_works(
   (principal, name): (&Principal, [u8; 32]),
   unbundle: &Unbundle,
   forked: Option<&Forked>,
-  room: &Admission,
+  (room, pinned): (&Admission, &mut crate::green_ready::Pinned),
 ) -> Option<Result<(Vec<WorkKey>, BuiltWorks), PushOutcome>> {
   // A-740: a shard stuck in a work's turn names it.
   let _doing = slates_rt::futures::doing("hg_push::works");
@@ -1894,6 +1994,14 @@ async fn built_works(
   .flatten()?;
   if let Err(outcome) = planned {
     return Some(Err(outcome));
+  }
+  // Each line the push moves that owes its push (P2: a line an earlier push made) is made through the door first, as a
+  // command reaches any green, and held made until the push ends: its work is built on its content.
+  let moved: BTreeSet<DbVolumeId> = plan.iter().map(|(green, ..)| *green).collect();
+  for green in moved {
+    if !crate::green_ready::made_for(green, pinned).await? {
+      return Some(Err(PushOutcome::refused(&abort(NOT_AVAILABLE.to_vec()))));
+    }
   }
   let mut built = BTreeMap::new();
   let mut named: Vec<NamedRevision> = Vec::new();
@@ -2164,7 +2272,18 @@ fn brought_back(
   forked: Option<&Forked>,
   building: &mut tree::WorkBuild,
 ) -> Option<()> {
-  let (path, node, text) = building.take_given()?;
+  let given = building.take_given()?;
+  text_brought_back(state, (id, forked), given)
+}
+
+/// The text `given` for a file revision (its path, node and text), brought back into repository `id`'s content store
+/// by the identities the index names (`forked`'s, else the store's): [`brought_back`]'s, and a new line's owed build's
+/// at its materialization (`crate::green_ready`). None where the store refused it. Called outside any `lent_state`.
+pub(crate) fn text_brought_back(
+  state: &mut ShardState,
+  (id, forked): (RepositoryId, Option<&Forked>),
+  (path, node, text): (Vec<u8>, Node, Vec<u8>),
+) -> Option<()> {
   // Brought back within the room its bytes take, lent to the content store for the step.
   let lend = u64::try_from(text.len()).unwrap_or(u64::MAX);
   vcs_store::within_budget(state, lend, |stores| {
@@ -2485,6 +2604,75 @@ fn held_whole(
   })
 }
 
+/// The trees a new line's owed push reads, laid out for its materialization (P2 for Mercurial, main's ruling (A) of
+/// 2026-11-26; `crate::green_ready`): its base's changeset and its head's, as the push names them
+/// (`slates_hg::push::tree::changeset_tree`), a turn each over the repository's committed index, within its room now. A
+/// changeset's or manifest's text let go once landed is read whole from the node's changeset store and given in its
+/// object's place, then the layout made again, as a push's work's layout reads one ([`begun_work`]), each text once, at
+/// most [`LAYOUT_TEXTS`]. The layout, or slates' words for why not; none when the shard's state went away.
+pub(crate) async fn owed_layout(
+  repository: RepositoryId,
+  owed: &slates_merge::push::DeferredPush,
+) -> Option<Result<tree::Layout, Vec<u8>>> {
+  let push = owed.push();
+  let changesets: Vec<Node> = [push.base_tree, Some(push.tree)]
+    .into_iter()
+    .flatten()
+    .filter_map(|key| Node::try_from(key.as_bytes()).ok())
+    .collect();
+  let verified = Verified::default();
+  let mut layout = tree::Layout::default();
+  let mut given: Vec<(Node, Vec<u8>)> = Vec::new();
+  for changeset in &changesets {
+    loop {
+      let laid = crate::state::with_state(|state| {
+        let mut room = Admission::new(crate::vcs_share::room(state, repository).bytes);
+        let held = held_over(state, repository, None, &given)?;
+        Some(layout.lay_out_owed(changeset, (&verified, &held), &mut room))
+      })
+      .flatten()?;
+      match laid {
+        Ok(()) => break,
+        Err(tree::LayoutRefusal::NotAtHand { log, node })
+          if given.len() < LAYOUT_TEXTS && !given.iter().any(|(read, _)| *read == node) =>
+        {
+          match log_text_read(&mut ThisShard, (repository, Committed), (log, node)).await {
+            Some(text) => {
+              let _ = crate::state::with_state(|state| state.count(OWED_LOG_TEXTS_READ, 1));
+              given.push((node, text));
+            }
+            None => return Some(Err(WORK_TEXT_UNREAD.to_vec())),
+          }
+        }
+        Err(refused) => return Some(Err(refused_words(&refused))),
+      }
+    }
+    slates_rt::futures::yield_now().await;
+  }
+  Some(Ok(layout))
+}
+
+/// Counter: a changeset's or a manifest's text a new line's owed build read from the node's changeset store, let go once
+/// landed, before its trees were laid out at its materialization ([`owed_layout`]). Format: a counter name in the status
+/// report.
+pub(crate) const OWED_LOG_TEXTS_READ: &str = "vcs.hg.owed_log_texts_read";
+
+/// `layout`, a new line's owed push's trees ([`owed_layout`]), over repository `id`'s committed index and content store,
+/// handed to `read` as the objects its owed build reads this turn: the Mercurial half of
+/// `vcs_store::with_owed_push_objects`. Whether the repository's store is held here.
+pub(crate) fn lend_owed(
+  state: &ShardState,
+  id: RepositoryId,
+  layout: &mut tree::Layout,
+  read: &mut dyn FnMut(&dyn slates_merge::push::PushObjects),
+) -> bool {
+  let Some(held) = held_over(state, id, None, &[]) else {
+    return false;
+  };
+  layout.lend((&Verified::default(), &held), read);
+  true
+}
+
 /// What repository `id` holds as a push's works read it: through the push's fork where it has one, else the store's
 /// own index, the changesets' and manifests' texts `given` by node read in their let-go objects' place; none where the
 /// store is not held here.
@@ -2499,25 +2687,46 @@ fn held_over<'s>(
   Some(IndexHeld::with_given(index, content, given))
 }
 
-/// A push's record once its run of segment changesets landed ([`hg_run`](super::hg_run); main's ruling (b1)): the run's
-/// reference (record v9), so its entry names the run, counted landed. A push that kept no revision records none; one
-/// that kept some with no run landed is refused `UNLANDED`, nothing of it in the register (main's ruling of 2026-11-20,
-/// decision 1: no changeset store, no history).
-fn recorded(
-  state: &mut ShardState,
+/// A push's record once its run of segment changesets landed ([`hg_run`](super::hg_run); main's ruling (b1)): its
+/// segment list homed in the region and landed ([`hg_run::list_landed`](super::hg_run::list_landed); ruling R), and the
+/// register's reference naming it (record v12), so its entry names the run by one homed object, counted landed. A push
+/// that kept no revision records none; one that kept some with no list landed is refused, `HOMED_SHORT` where the list's
+/// homing fell short and `UNLANDED` otherwise, nothing of it in the register (main's ruling of 2026-11-20, decision 1: no
+/// changeset store, no history). None when the shard's state is gone.
+async fn recorded(
+  repository: RepositoryId,
   forked: &mut Forked,
-  run: &super::hg_run::Run,
-) -> Result<(), PushOutcome> {
+  run: &mut super::hg_run::Run,
+) -> Option<Result<(), PushOutcome>> {
   if forked.record.is_some() || forked.intaken.logs.is_empty() {
-    return Ok(());
+    return Some(Ok(()));
   }
-  let Some(reference) = run.reference(forked.room) else {
-    state.count(PUSH_UNLANDED, 1);
-    return Err(PushOutcome::refused(&abort(UNLANDED.to_vec())));
-  };
-  state.count(PUSH_LANDED, 1);
-  forked.record = Some(reference);
-  Ok(())
+  let listed = super::hg_run::list_landed(run, repository).await?;
+  let attempt = run.attempt();
+  crate::state::with_state(|state| match (listed, attempt) {
+    (Ok((list, len, sequence)), Some(attempt)) => {
+      state.count(PUSH_LANDED, 1);
+      forked.record = Some(slates_hg::import::record::write_homed_run_reference(
+        forked.room,
+        (list.0, len),
+        (sequence, attempt),
+      ));
+      Ok(())
+    }
+    // A list homed has its attempt: none is no run this push homed.
+    (Ok(_), None) => {
+      state.count(PUSH_UNLANDED, 1);
+      Err(PushOutcome::refused(&abort(UNLANDED.to_vec())))
+    }
+    (Err(unlanded), _) => {
+      state.count(PUSH_UNLANDED, 1);
+      let words = match unlanded {
+        super::hg_run::ListUnlanded::Unhomed(refused) => unhomed_words(&refused),
+        _ => UNLANDED,
+      };
+      Err(PushOutcome::refused(&abort(words.to_vec())))
+    }
+  })
 }
 
 /// A push's changeset as the node's store lands it (A-767 C4): the store's handle, the header at the repository's next
@@ -2600,103 +2809,12 @@ pub(crate) fn changeset_landing(
   Some((disk, header, parts, reference))
 }
 
-/// [`recorded`]'s landing for a test on a shard: `forked`'s segments landed on the shard's store as a run, apart from
-/// its repository's landing turn as the daemon's driver lands them ([`hg_run`](super::hg_run)), each through
-/// [`hg_run::segment_changeset`](super::hg_run::segment_changeset) and the store's own `land`, waited for on a thread
-/// of its own (`crate::test_store::land_blocking`); its record the run's reference (v11). A fork that brought no revision, or
-/// already names its run, lands nothing. A refused segment is the landing's refusal. The run is kept whatever the
-/// landing then answers: its caller settles it once its landing answers ([`settled_whole`]), as the driver does.
-#[cfg(test)]
-pub(crate) fn store_blocking(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  forked: &mut Forked,
-) -> Result<Option<super::hg_run::Run>, PushOutcome> {
-  if forked.record.is_some() || forked.intaken.logs.is_empty() {
-    return Ok(None);
-  }
-  let unlanded = || PushOutcome::refused(&abort(UNLANDED.to_vec()));
-  let mut run = super::hg_run::Run::new(repository);
-  let segments = core::mem::take(&mut forked.segments);
-  let landed = segments.into_iter().try_for_each(|(segment, record)| {
-    let Some(chunks) = chunked_whole(&segment, &forked.changegroup.1) else {
-      return Err(unlanded());
-    };
-    let changeset = super::hg_run::segment_changeset(state, repository, &segment, (record, chunks));
-    let Some(Ok((disk, header, parts))) = changeset else {
-      return Err(unlanded());
-    };
-    let sequence = header.sequence;
-    let ok = crate::test_store::land_blocking(disk, header, parts);
-    landed_segment(state, (&mut run, &segment), (sequence, ok), None)
-  });
-  let reference = run.reference(forked.room);
-  if let Err(outcome) = landed {
-    run.abandon(state);
-    return Err(outcome);
-  }
-  let Some(reference) = reference else {
-    run.abandon(state);
-    return Err(unlanded());
-  };
-  forked.record = Some(reference);
-  Ok(Some(run))
-}
-
-/// A test's run settled once its push's landing answered (`accepted`), as the driver settles one, every revision at once:
-/// a test holds the shard's state through its push. Committed, its file revisions noted and let go; else forgotten.
-#[cfg(test)]
-fn settled_whole(state: &mut ShardState, run: Option<super::hg_run::Run>, accepted: bool) {
-  let Some(run) = run else {
-    return;
-  };
-  if accepted {
-    let (repository, contents) = run.committed();
-    super::hg_run::let_go_landed(state, Some(repository), &contents);
-  } else {
-    run.abandon(state);
-  }
-}
-
-/// [`land`] for a test on a shard (main's ruling of 2026-11-20: the one landing path, the store first): `prepared`'s
-/// push landed on the shard's store ([`store_blocking`]), then landed as the driver lands it; a refused store landing
-/// leaves the fork naming no changeset, which [`land`] refuses.
-#[cfg(test)]
-pub(crate) fn land_stored(
-  state: &mut ShardState,
-  (principal, repository): (&Principal, RepositoryId),
-  mut prepared: Prepared,
-) -> Landed {
-  let run = match prepared.forked.as_mut() {
-    Some(forked) => store_blocking(state, repository, forked).ok().flatten(),
-    None => None,
-  };
-  // Its segments durable, their texts let go: those its works name brought back before it is judged (A-887).
-  if let Err(refused) =
-    bring_back_named_whole(state, repository, prepared.forked.as_ref(), &prepared.named)
-  {
-    settled_whole(state, run, false);
-    if let Some(forked) = prepared.forked
-      && release_index(state, forked.fork).is_err()
-    {
-      state.count(vcs_store::RELEASE_REFUSED, 1);
-    }
-    return Landed {
-      answer: Err(*refused),
-      released: Ok(()),
-    };
-  }
-  let landed = land(state, (principal, repository), prepared, None);
-  settled_whole(state, run, landed.answer.is_ok());
-  landed
-}
-
 /// A push's segment changeset `sequence` landed (`ok`) or refused by the store ([`hg_run`](super::hg_run)): counted;
 /// landed, the run grows; refused, the push is answered `UNLANDED`, and its run, never named, is abandoned with it.
 fn landed_segment(
   state: &mut ShardState,
   (run, segment): (&mut super::hg_run::Run, &PushSegment),
-  (sequence, ok): (u64, bool),
+  (entry, ok): (slates_hg::import::record::SegmentEntry, bool),
   counted: Option<&mut slates_hg::push::pins::Counted>,
 ) -> Result<(), PushOutcome> {
   if !ok {
@@ -2704,7 +2822,7 @@ fn landed_segment(
     return Err(PushOutcome::refused(&abort(UNLANDED.to_vec())));
   }
   state.count(super::hg_run::SEGMENTS_LANDED, 1);
-  run.landed(sequence, &segment.contents);
+  run.landed(entry, &segment.contents);
   // Durable on the node's changeset store, which serves them from here: its file texts leave the content store, their
   // entries kept, each brought back by the read that meets it (`hg_run`, "Let go"). What the push held just before,
   // its admission and its texts resident, is its high-water's sample.
@@ -3116,9 +3234,12 @@ async fn segments_landed(
   Some(Ok(()))
 }
 
-/// `segment` of `taking` landed on the node's store as a changeset at its repository's next sequence
-/// ([`hg_run::segment_changeset`](super::hg_run::segment_changeset)), noted in `run` ([`landed_segment`]); `UNLANDED`
-/// where it could not be made or the store refused it; none where the store went away.
+/// `segment` of `taking` landed on the node's store as a changeset at its repository's next sequence, noted in `run`
+/// ([`landed_segment`]): its `Record` and `Payload` put whole in the content store
+/// ([`hg_run::segment_held`](super::hg_run::segment_held)), each homed in the region at `f + 1` for the push's attempt
+/// ([`hg_run::homed_for`](super::hg_run::homed_for); ruling R, A-727's rule), then landed from there a piece at a time and
+/// let go. `HOMED_SHORT` where a homing fell short; `UNLANDED` where it could not be made or the store refused it; none
+/// where the store went away.
 async fn segment_landed(
   repository: RepositoryId,
   taking: &mut Taking,
@@ -3159,16 +3280,30 @@ async fn segment_landed(
   let Some(chunks) = chunked_paced((&segment.texts, slice), &mut costs).await? else {
     return unlanded();
   };
-  let changeset = crate::state::with_state(|state| {
-    super::hg_run::segment_changeset(state, repository, segment, (written, chunks))
+  let held = crate::state::with_state(|state| {
+    super::hg_run::segment_held(state, repository, segment, (written, chunks))
   })?;
-  let Some(Ok((disk, header, parts))) = changeset else {
-    return Some(Err(PushOutcome::refused(&abort(UNLANDED.to_vec()))));
+  let Some(Ok(held)) = held else {
+    return unlanded();
   };
-  let sequence = header.sequence;
-  let ok = disk.land(header, parts).await.is_ok();
+  for (_, (identity, len)) in held.sections() {
+    let source = crate::vcs_store::homes::HomeSource::Held(identity, len);
+    let (homed, _) = super::hg_run::homed_for(run, source).await?;
+    if let Err(refused) = homed {
+      crate::state::with_state(|state| held.given_back(state, (false, &[])))?;
+      return Some(Err(PushOutcome::refused(&abort(
+        unhomed_words(&refused).to_vec(),
+      ))));
+    }
+  }
+  let ok = held.landed().await.is_ok();
   crate::state::with_state(|state| {
-    landed_segment(state, (run, segment), (sequence, ok), Some(counted))
+    let shards = state.shards.clone();
+    held.given_back(state, (ok, &shards));
+    if ok {
+      super::hg_run::count_landed(state, held.section_bytes());
+    }
+    landed_segment(state, (run, segment), (held.entry(), ok), Some(counted))
   })
 }
 
@@ -3264,15 +3399,6 @@ fn chunk_turn(
   state.count(COMPRESS_STORED_BYTES, stored.saturating_sub(stored_before));
   state.count(COMPRESS_NS, ended.saturating_sub(began));
   stepped
-}
-
-/// `segment`'s payload made into chunks whole, every step at once: a test's landing, whose caller holds the shard.
-#[cfg(test)]
-fn chunked_whole(segment: &PushSegment, payload: &[u8]) -> Option<super::hg_run::Chunks> {
-  let slice = segment_slice(segment, payload)?;
-  let mut chunked = slates_hg::push::chunked::Chunked::begin(segment.texts.len()).ok()?;
-  while chunked.step((&segment.texts, slice), u64::MAX).ok()? {}
-  Some(chunked.finish())
 }
 
 /// Counter: the turns a push's segment records were written in, a turn's steps under the shard's paced turn each
@@ -3644,412 +3770,105 @@ fn whole_wanted(payload: &[u8], range: core::ops::Range<u64>) -> IntakeRefused {
   ))
 }
 
-/// `changegroup` taken into its fork every slice at once, its kept texts cut into segments
-/// ([`hg_run`](super::hg_run)'s, landed by [`store_blocking`]): [`take_sliced`]'s steps for a caller that holds the
-/// shard's state, the tests'.
-#[cfg(test)]
-pub(crate) fn take_whole(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  changegroup: (Version, Vec<u8>),
-  room: &mut Admission,
-) -> Option<Result<Forked, Box<Refused>>> {
-  let bound = super::hg_run::segment_bytes(state);
-  taken_whole(state, repository, changegroup, (room, Some(bound)))
+/// Why a made changeset's changegroup was not taken into a fork ([`take_made`]).
+pub(crate) enum MadeTake {
+  /// The intake refused the changegroup, in its words.
+  Refused(Box<Refused>),
+  /// The node's changeset store left a want of the intake unanswered (a delta base of the parent's, let go once its
+  /// push landed): the store's own typed refusal, never taken for the version not being the head.
+  Store(vcs_store::hg_view::StoreUnanswered),
+  /// The repository's store is not held here, or the shard's state went away.
+  Gone,
 }
 
-/// `changegroup` taken into its fork every slice at once, uncut: a changeset the server made (`vcs_store::hg_made`),
-/// one version's change, taken in its task's step and landed as one changeset (record v7), its texts its own.
-pub(crate) fn take_made(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  changegroup: (Version, Vec<u8>),
-  room: &mut Admission,
-) -> Option<Result<Forked, Box<Refused>>> {
-  taken_whole(state, repository, changegroup, (room, None))
-}
-
-/// [`take_made`] and the tests' `take_whole`: cut at `cut` where given, the segments in the fork for its landing.
-fn taken_whole(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  changegroup: (Version, Vec<u8>),
-  (room, cut): (&mut Admission, Option<u64>),
-) -> Option<Result<Forked, Box<Refused>>> {
-  let lend = u64::MAX;
-  let mut taking = match begin_intake(state, repository, changegroup, lend, room)? {
-    Ok(taking) => taking,
-    Err(refused) => return Some(Err(intake_refused(&refused))),
-  };
-  if let Some(bound) = cut {
-    taking.cut_at(bound);
+/// Written out rather than derived, as `hg_made::Unmade`'s is: a refusal's words are all that read its fields, and
+/// dead-code analysis ignores derived impls; the output is the derived one's.
+impl core::fmt::Debug for MadeTake {
+  fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      MadeTake::Refused(refused) => formatter.debug_tuple("Refused").field(refused).finish(),
+      MadeTake::Store(why) => formatter.debug_tuple("Store").field(why).finish(),
+      MadeTake::Gone => formatter.write_str("Gone"),
+    }
   }
-  let mut segments = Vec::new();
+}
+
+/// `changegroup` taken into its fork, uncut, from a made changeset's task (`vcs_store::hg_made`): one version's change,
+/// landed as one changeset (record v7), its texts its own. Its slices are taken a step each, and a want of the node's
+/// changeset store between them (a delta base the client's push before it let go) is answered by awaiting the store
+/// in the task, as a push's are ([`take_sliced`]'s [`store_wants_answered`]). Until 2026-11-25 the take was one step and
+/// such a want was answered `false` in production and by a blocking read in tests, so a made changeset over a let-go
+/// parent was never made there and was made here (docs/bugs/2026-11-25-a-made-changeset-over-a-let-go-parent-was-never-
+/// made.md).
+pub(crate) async fn take_made(
+  repository: RepositoryId,
+  changegroup: (Version, Vec<u8>),
+  room: &mut Admission,
+) -> Result<Forked, MadeTake> {
+  let lend = u64::MAX;
+  let begun =
+    crate::state::with_state(|state| begin_intake(state, repository, changegroup, lend, room))
+      .flatten();
+  let mut taking = match begun {
+    Some(Ok(taking)) => taking,
+    Some(Err(refused)) => return Err(MadeTake::Refused(intake_refused(&refused))),
+    None => return Err(MadeTake::Gone),
+  };
   loop {
-    let sliced = taking.slice(state, lend, room);
-    let Some(recorded) = recorded_segments(state, &mut taking) else {
-      taking.abandon_in(state);
-      return None;
-    };
-    segments.extend(recorded);
-    match sliced {
-      Some(Ok(Stepped::More)) => {}
-      Some(Ok(Stepped::Done)) => {
-        taking.cut_rest();
-        let Some(recorded) = recorded_segments(state, &mut taking) else {
-          taking.abandon_in(state);
-          return None;
-        };
-        segments.extend(recorded);
-        // Its caller holds the shard's state, so the taking's drop could not give its pins back. Unpinned before their
-        // landing: a made changeset's (`hg_made::prepared`) intake and record are made in this one step, so nothing
-        // reads its texts while they are unpinned and not durable (its `disk.land` awaits after); once landed, a window
-        // let go meanwhile is brought back from the store. A reader of a made text before its landing would need pins
-        // kept to the landing's let-go, as a push's segments keep them (GAPS).
-        taking.unpinned_in(state);
-        let mut forked = taking.finish()?;
-        forked.segments = segments;
-        return Some(Ok(forked));
+    let sliced = crate::state::with_state(|state| taking.slice(state, lend, room)).flatten();
+    let refused = match sliced {
+      Some(Ok(Stepped::More)) => {
+        slates_rt::futures::yield_now().await;
+        continue;
       }
-      Some(Ok(Stepped::Store)) => {
-        if !stored_now(state, repository, &mut taking) {
-          taking.abandon_in(state);
-          return None;
-        }
-      }
+      Some(Ok(Stepped::Done)) => return made_taken(taking),
+      Some(Ok(Stepped::Store)) => match made_wants_answered(&mut taking, repository).await {
+        Ok(()) => continue,
+        Err(why) => MadeTake::Store(why),
+      },
       Some(Ok(Stepped::Wanted(range))) => {
-        let refused = match taking.changegroup.as_ref() {
+        let wanted = match taking.changegroup.as_ref() {
           Some((_, payload)) => whole_wanted(payload, range),
           None => whole_wanted(&[], range),
         };
-        taking.abandon_in(state);
-        return Some(Err(intake_refused(&refused)));
+        MadeTake::Refused(intake_refused(&wanted))
       }
-      Some(Err(refused)) => {
-        taking.abandon_in(state);
-        return Some(Err(intake_refused(&refused)));
-      }
-      None => {
-        taking.abandon_in(state);
-        return None;
-      }
-    }
-  }
-}
-
-/// The segments `taking` has cut, each with its record written now from its fork ([`RecordedSegment`]); none where the
-/// store went away or a record could not be written.
-fn recorded_segments(state: &mut ShardState, taking: &mut Taking) -> Option<Vec<RecordedSegment>> {
-  let mut recorded = Vec::new();
-  while let Some(segment) = taking.take_segment() {
-    let intake = taking.intake.as_ref()?;
-    let mut writer = intake.record_writer(&segment, taking.room).ok()?;
-    let mut costs = vcs_store::TurnCosts::ZERO;
-    // The daemon's record turns, taken one after another: the test's caller holds the shard and cannot yield.
-    while record_turn(state, intake, &mut writer, &mut costs)?.ok()? {}
-    recorded.push((segment, writer.finish()?));
-  }
-  Some(recorded)
-}
-
-/// Answers the intake's want of the node's changeset store at once, for a caller that holds the shard's state and so
-/// cannot wait between steps: a test's, from the store on a thread of its own (`test_store::answer_wants_blocking`).
-/// Whether it was answered.
-#[cfg(test)]
-fn stored_now(state: &mut ShardState, repository: RepositoryId, taking: &mut Taking) -> bool {
-  let (Some(disk), Some(intake)) = (state.vcs_disk.clone(), taking.intake.as_mut()) else {
-    return false;
-  };
-  crate::test_store::answer_wants_blocking(&disk, u128::from_be_bytes(repository.bytes), intake)
-}
-
-/// The intake's want of the store, met by a caller that cannot wait between steps: a made changeset's, which sends
-/// every revision whole (`slates_hg::push::made::changegroup`), so never asks; unanswered.
-#[cfg(not(test))]
-fn stored_now(_state: &mut ShardState, _repository: RepositoryId, _taking: &mut Taking) -> bool {
-  false
-}
-
-/// A prepared push landed as the driver lands it once its intake is done: a fork another push made stale taken again
-/// from its changegroup, every slice at once (the driver takes it again inside its repository's landing turn,
-/// `hg_run`), then its segments landed on the store ([`store_blocking`]), then judged at landing and landed: the
-/// driver's steps for the tests, which land pushes side by side with no runtime.
-#[cfg(test)]
-pub(crate) fn land_in(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  (principal, bundle): (&Principal, &[u8]),
-  unbundle: &Unbundle,
-  forked: Option<Forked>,
-  room: &mut Admission,
-) -> Option<PushOutcome> {
-  let forked = match forked {
-    Some(stale) if is_stale(state, repository, &stale) => {
-      state.count(super::hg_run::REBASED, 1);
-      match rebase::rebase_whole(state, repository, stale)? {
-        Ok(rebased) => Some(rebased),
-        Err(outcome) => return Some(outcome),
-      }
-    }
-    fresh => fresh,
-  };
-  let mut forked = forked;
-  let mut run = None;
-  if let Some(fork) = forked.as_mut() {
-    match store_blocking(state, repository, fork) {
-      Ok(stored) => run = stored,
-      Err(outcome) => return Some(outcome),
-    }
-  }
-  // Its works planned as the landing judges them and built whole, as the driver plans and builds them a unit a turn.
-  let name = push_name(repository, bundle);
-  let mut plan = Vec::new();
-  let mut planning_room = *room;
-  let planned = vcs_store::lent_state(state, |state| {
-    judged_over(
-      state,
-      repository,
-      (principal, name),
-      unbundle,
-      forked.as_ref(),
-      (&mut Works::Planning(&mut plan), &mut planning_room),
-    )
-  });
-  let built = match planned {
-    Some(Ok(_)) => works_whole(state, repository, (forked.as_ref(), name), &plan, room)
-      .and_then(|(built, named)| {
-        bring_back_named_whole(state, repository, forked.as_ref(), &named)?;
-        Ok(built)
-      })
-      .map_err(|refused| PushOutcome::refused(&refused)),
-    Some(Err(outcome)) => Err(outcome),
-    None => Err(PushOutcome::refused(&abort(NO_STORE.to_vec()))),
-  };
-  let mut built = match built {
-    Ok(built) => built,
-    Err(outcome) => {
-      if let Some(forked) = forked
-        && release_index(state, forked.fork).is_err()
-      {
-        state.count(vcs_store::RELEASE_REFUSED, 1);
-      }
-      settled_whole(state, run, false);
-      return Some(outcome);
-    }
-  };
-  let mut uses = uses_of(&plan);
-  let mut works = Works::Built {
-    built: &mut built,
-    missed: false,
-    uses: &mut uses,
-    ahead: &[],
-  };
-  match landing(
-    state,
-    repository,
-    (principal, name),
-    unbundle,
-    forked,
-    (&mut works, room),
-  ) {
-    Landing::Done(outcome) => {
-      let accepted = matches!(outcome, Some(PushOutcome::Accepted(_)));
-      settled_whole(state, run, accepted);
-      outcome
-    }
-    // Built from the plan its landing judges, it misses no work; were it to, its fork goes back as a refusal's does.
-    Landing::Unbuilt(back) => {
-      give_back_in(state, *back);
-      settled_whole(state, run, false);
-      None
-    }
-  }
-}
-
-/// `moved`'s work begun for [`works_whole`], as [`begun_work`] begins it: a changeset or manifest its layout found not
-/// at hand (its text let go once landed, goal 93 C1 (1) P5) read whole from the node's changeset store on a thread of
-/// its own and given to the layout in its object's place, then laid out again, at most [`LAYOUT_TEXTS`].
-#[cfg(test)]
-fn begun_whole(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  forked: Option<&Forked>,
-  moved: &Move<'_>,
-  room: &Admission,
-) -> Result<tree::WorkBuild, Box<Refused>> {
-  let verified = Verified::default();
-  let mut given: Vec<(Node, Vec<u8>)> = Vec::new();
-  loop {
-    let mut layout_room = *room;
-    let begun = vcs_store::lent_state(state, |state| {
-      let held = held_over(state, repository, forked, &given)?;
-      let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
-      Some(tree::begin_work(
-        moved,
-        (&verified, &held),
-        (room.left(), pace),
-        &mut layout_room,
-      ))
-    })
-    .ok_or_else(|| abort(NO_STORE.to_vec()))?;
-    match begun {
-      Err(tree::WorkRefused::Layout(tree::LayoutRefusal::NotAtHand { log, node }))
-        if given.len() < LAYOUT_TEXTS && !given.iter().any(|(read, _)| *read == node) =>
-      {
-        let text = log_text_read_blocking(state, (repository, forked), (log, node))
-          .ok_or_else(|| abort(WORK_TEXT_UNREAD.to_vec()))?;
-        given.push((node, text));
-      }
-      other => return other.map_err(|refused| abort(refused_words(&refused))),
-    }
-  }
-}
-
-/// The whole text of the changeset or manifest `node` of `log`, let go once landed, read from the node's changeset store
-/// on a thread of its own (`test_store::answer_wants_blocking`) within the length its row records, for a test that holds
-/// the shard's state; none where the repository holds no such revision or the store gave no text.
-#[cfg(test)]
-fn log_text_read_blocking(
-  state: &mut ShardState,
-  (repository, forked): (RepositoryId, Option<&Forked>),
-  (log, node): (slates_hg::index::Log<'static>, Node),
-) -> Option<Vec<u8>> {
-  let disk = state.vcs_disk.clone()?;
-  let path = match log {
-    slates_hg::index::Log::Changelog => slates_hg::push::intake::CHANGELOG_PATH,
-    _ => slates_hg::push::intake::MANIFEST_PATH,
-  };
-  let len = log_held(state, (repository, forked), log, &node)?.len;
-  let mut ask = slates_hg::push::held::TextAsk::new(path.to_vec(), node, len);
-  crate::test_store::answer_wants_blocking(&disk, u128::from_be_bytes(repository.bytes), &mut ask)
-    .then(|| ask.taken().map(|(_, _, text)| text))
-    .flatten()
-}
-
-/// The works `plan` names, built whole for a test that holds the shard's state through its push ([`land_in`],
-/// [`prepare_whole`], [`prepare_served`]): [`built_works`]' units at once over the push's fork (`forked`, else the
-/// store's index), a text not at hand read from the node's changeset store on a thread of its own
-/// (`test_store::answer_wants_blocking`) and brought back, as the driver reads one between turns. With each file
-/// revision the works name by its stored bytes' object (A-887).
-#[cfg(test)]
-fn works_whole(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  (forked, name): (Option<&Forked>, [u8; 32]),
-  plan: &[WorkKey],
-  room: &Admission,
-) -> Result<BuiltWorks, Box<Refused>> {
-  let unread = || abort(WORK_TEXT_UNREAD.to_vec());
-  let verified = Verified::default();
-  let mut built = BTreeMap::new();
-  let mut named: Vec<NamedRevision> = Vec::new();
-  for key in plan {
-    if built.contains_key(key) {
-      continue;
-    }
-    let (green, base_version, base, head) = *key;
-    let moved = Move {
-      name,
-      base_version,
-      base: base.as_ref(),
-      head: &head,
+      Some(Err(refused)) => MadeTake::Refused(intake_refused(&refused)),
+      None => MadeTake::Gone,
     };
-    let mut building = begun_whole(state, repository, forked, &moved, room)?;
-    loop {
-      // Whole: every unit at once.
-      building.pace().turn(u64::MAX);
-      let advanced = vcs_store::lent_state(state, |state| {
-        let engine = state.greens.get(&green)?;
-        let held = held_over(state, repository, forked, &[])?;
-        Some(building.advance(&engine, (&verified, &held)))
-      })
-      .ok_or_else(|| abort(NOT_AVAILABLE.to_vec()))?;
-      match advanced {
-        None if building.ask_waited(room.left()) => {
-          let disk = state.vcs_disk.clone().ok_or_else(unread)?;
-          if !crate::test_store::answer_wants_blocking(
-            &disk,
-            u128::from_be_bytes(repository.bytes),
-            &mut building,
-          ) {
-            return Err(unread());
-          }
-          brought_back(state, repository, forked, &mut building).ok_or_else(unread)?;
-        }
-        None => {}
-        Some(Ok(work)) => {
-          for object in work.named {
-            if let Ok(node) = Node::try_from(object.key.as_bytes()) {
-              named.push((object.identity, object.path.into_bytes(), node));
-            }
-          }
-          built.insert(*key, work.increment);
-          break;
-        }
-        Some(Err(refused)) => return Err(abort(refused_words(&refused))),
-      }
-    }
+    let _ = crate::state::with_state(move |state| taking.abandon_in(state));
+    return Err(refused);
   }
-  Ok((built, named))
 }
 
-/// Brings back each of `named` whose windows the content store let go, through `forked`'s fork, its text read from the
-/// node's changeset store on a thread of its own (`test_store::answer_wants_blocking`): what the driver does before its
-/// landing's step ([`bring_back_named`]), for a test that holds the shard's state through its push.
-#[cfg(test)]
-fn bring_back_named_whole(
-  state: &mut ShardState,
+/// [`take_made`]'s want of the node's changeset store answered by awaiting it ([`store_wants_answered`]'s, its refusal
+/// typed).
+async fn made_wants_answered(
+  taking: &mut Taking,
   repository: RepositoryId,
-  forked: Option<&Forked>,
-  named: &[NamedRevision],
-) -> Result<(), Box<Refused>> {
-  let unread = || abort(WORK_TEXT_UNREAD.to_vec());
-  for (identity, path, node) in named {
-    if vcs_store::hg_named::held_whole(state, *identity) {
-      continue;
-    }
-    let (len, _) = held_whole(state, (repository, forked), (path, node)).ok_or_else(unread)?;
-    let disk = state.vcs_disk.clone().ok_or_else(unread)?;
-    let mut ask = slates_hg::push::held::TextAsk::new(path.clone(), *node, len);
-    if !crate::test_store::answer_wants_blocking(
-      &disk,
-      u128::from_be_bytes(repository.bytes),
-      &mut ask,
-    ) {
-      return Err(unread());
-    }
-    let (path, node, text) = ask.taken().ok_or_else(unread)?;
-    file_put_back(state, (repository, forked), (&path, &node), &text).map_err(|_| unread())?;
-  }
-  Ok(())
-}
-
-/// `judge` run as the driver runs a push's judging for a test holding the shard's state ([`prepare_whole`],
-/// [`prepare_served`]): once planning its works (its answer dropped), then over the works [`works_whole`] built.
-#[cfg(test)]
-fn judged_whole<T>(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  (forked, name): (Option<&Forked>, [u8; 32]),
-  room: &mut Admission,
-  mut judge: impl FnMut(&mut ShardState, &mut Works<'_>, &mut Admission) -> T,
-) -> Result<(T, Vec<NamedRevision>), Box<Refused>> {
-  let mut plan = Vec::new();
-  let mut planning_room = *room;
-  drop(judge(
-    state,
-    &mut Works::Planning(&mut plan),
-    &mut planning_room,
-  ));
-  let (mut built, named) = works_whole(state, repository, (forked, name), &plan, room)?;
-  let mut uses = uses_of(&plan);
-  let mut works = Works::Built {
-    built: &mut built,
-    missed: false,
-    uses: &mut uses,
-    ahead: &[],
+) -> Result<(), vcs_store::hg_view::StoreUnanswered> {
+  let Some(intake) = taking.intake.as_mut() else {
+    return Err(vcs_store::hg_view::StoreUnanswered::ShardGone);
   };
-  Ok((judge(state, &mut works, room), named))
+  vcs_store::hg_view::answered_store_wants_on(
+    &mut crate::vcs_http::git::ThisShard,
+    intake,
+    repository,
+  )
+  .await
+}
+
+/// [`take_made`]'s end once its intake is done, in one step: its pins given back and its fork made. Unpinned before its
+/// landing: a made changeset's intake and record are made by its task holding its repository's landing turn, so
+/// nothing reads its texts while they are unpinned and not durable (its `disk.land` awaits after); once landed, a
+/// window let go meanwhile is brought back from the store.
+fn made_taken(mut taking: Taking) -> Result<Forked, MadeTake> {
+  crate::state::with_state(move |state| {
+    taking.cut_rest();
+    taking.unpinned_in(state);
+    taking.finish().ok_or(MadeTake::Gone)
+  })
+  .unwrap_or(Err(MadeTake::Gone))
 }
 
 /// What an intake's refusal answers: verification's and the keeping's words, as 7.2 aborts.
@@ -4063,131 +3882,6 @@ fn intake_refused(refused: &IntakeRefused) -> Box<Refused> {
 /// [`intake_refused`] as the push's outcome.
 fn intake_outcome(refused: &IntakeRefused) -> PushOutcome {
   PushOutcome::refused(&intake_refused(refused))
-}
-
-/// [`prepare`] over `view` with `unbundle`'s changegroup taken whole into a fork first, the prepared push holding the
-/// fork: the driver's steps for the tests, which judge a push over a view of their own.
-#[cfg(test)]
-pub(crate) fn prepare_whole<V: Repository>(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  unbundle: &Unbundle,
-  view: &V,
-  terms: Terms,
-  room: &mut Admission,
-) -> Result<Prepared, Box<Refused>> {
-  let forked = forked_whole(state, repository, unbundle, room)?;
-  let over = (forked.as_ref(), terms.1);
-  let prepared = judged_whole(state, repository, over, room, |state, works, room| {
-    vcs_store::lent_state(state, |state| {
-      match state.vcs_stores.mercurial_ref(repository) {
-        None => Err(abort(NO_STORE.to_vec())),
-        Some((content, _)) => {
-          brought_of(forked.as_ref(), content, room).and_then(|(brought, held_changesets)| {
-            prepare(
-              state,
-              repository,
-              unbundle,
-              view,
-              (&brought, &held_changesets),
-              terms,
-              (works, room),
-            )
-          })
-        }
-      }
-    })
-  })
-  .and_then(named_onto);
-  attach(state, prepared, forked)
-}
-
-/// [`prepare_whole`] over the served view.
-#[cfg(test)]
-pub(crate) fn prepare_served(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  unbundle: &Unbundle,
-  terms: Terms,
-  room: &mut Admission,
-) -> Result<Prepared, Box<Refused>> {
-  let forked = forked_whole(state, repository, unbundle, room)?;
-  let over = forked.as_ref().map(|forked| &forked.fork);
-  let named = (forked.as_ref(), terms.1);
-  let prepared = judged_whole(state, repository, named, room, |state, works, room| {
-    vcs_store::lent_state(state, |state| {
-      hg_view::with_view_over(state, repository, over, room, |view, _, content, room| {
-        brought_of(forked.as_ref(), content, room).and_then(|(brought, held_changesets)| {
-          prepare(
-            state,
-            repository,
-            unbundle,
-            view,
-            (&brought, &held_changesets),
-            terms,
-            (works, room),
-          )
-        })
-      })
-    })
-    .unwrap_or_else(|| Err(abort(NO_STORE.to_vec())))
-  })
-  .and_then(named_onto);
-  attach(state, prepared, forked)
-}
-
-/// `unbundle`'s changegroup taken whole into a fork, none without one.
-#[cfg(test)]
-fn forked_whole(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  unbundle: &Unbundle,
-  room: &mut Admission,
-) -> Result<Option<Forked>, Box<Refused>> {
-  // The tests keep their unbundle whole, so its changegroup is copied rather than moved out as the driver moves it.
-  let Some((_, part)) = unbundle.changegroup() else {
-    return Ok(None);
-  };
-  let changegroup = (part.version, part.payload.clone());
-  match take_whole(state, repository, changegroup, room) {
-    Some(Ok(forked)) => Ok(Some(forked)),
-    Some(Err(refused)) => Err(refused),
-    None => Err(abort(NO_STORE.to_vec())),
-  }
-}
-
-/// A test's prepared push with the file revisions its works name (`Prepared::named`).
-#[cfg(test)]
-fn named_onto(
-  (prepared, named): (Result<Prepared, Box<Refused>>, Vec<NamedRevision>),
-) -> Result<Prepared, Box<Refused>> {
-  prepared.map(|mut prepared| {
-    prepared.named = named;
-    prepared
-  })
-}
-
-/// The prepared push holding `forked`, or the refusal with the fork given back.
-#[cfg(test)]
-fn attach(
-  state: &mut ShardState,
-  prepared: Result<Prepared, Box<Refused>>,
-  forked: Option<Forked>,
-) -> Result<Prepared, Box<Refused>> {
-  match prepared {
-    Ok(mut prepared) => {
-      prepared.forked = forked;
-      Ok(prepared)
-    }
-    Err(refused) => {
-      if let Some(forked) = forked
-        && release_index(state, forked.fork).is_err()
-      {
-        state.count(vcs_store::RELEASE_REFUSED, 1);
-      }
-      Err(refused)
-    }
-  }
 }
 
 /// The changesets a fork's push brought, read back from its rows, and those its changegroup carried that were held:
@@ -4204,35 +3898,6 @@ fn brought_of(
     .map_err(|past| abort(unverified_words(&Unverified::PastAdmission(past))))?
     .ok_or_else(|| abort(UNREAD.to_vec()))?;
   Ok((read, forked.intaken.held_changesets.clone()))
-}
-
-/// The driver's last step (A-720) in one step: [`judged_landing`], then [`landed_judged`] making every create within it
-/// (a test's whole landing, which holds the shard through its push). Every refusal gives the fork back.
-fn landing(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  (principal, name): (&Principal, [u8; 32]),
-  unbundle: &Unbundle,
-  forked: Option<Forked>,
-  (works, room): (&mut Works<'_>, &mut Admission),
-) -> Landing {
-  match judged_landing(
-    state,
-    repository,
-    (principal, name),
-    unbundle,
-    forked,
-    (works, room),
-  ) {
-    Judging::Done(outcome) => Landing::Done(outcome),
-    Judging::Unbuilt(back) => Landing::Unbuilt(back),
-    Judging::Judged(prepared) => Landing::Done(landed_judged(
-      state,
-      (principal, repository),
-      *prepared,
-      None,
-    )),
-  }
 }
 
 /// A landing judged ([`judged_landing`]).
@@ -4369,6 +4034,17 @@ async fn land_sliced(
       }
     }
   }
+  // The moved lines' works judged ahead of the step too, a slice a step (goal 93, the landing spin's owed (1)): the step
+  // commits each verdict while its green is still at the head it was judged at.
+  loop {
+    let judged = crate::state::with_state(|state| {
+      creates.judge_updates_some(state, (repository, &mut prepared.changes))
+    })?;
+    if judged {
+      break;
+    }
+    slates_rt::futures::yield_now().await;
+  }
   slates_rt::futures::yield_now().await;
   let landing_step = slates_rt::futures::doing("hg_push::landing");
   let landed = crate::state::with_state(|state| {
@@ -4383,14 +4059,6 @@ async fn land_sliced(
   });
   drop(landing_step);
   landed.flatten()
-}
-
-/// What a landing came to ([`landing`]).
-enum Landing {
-  /// Its outcome; none when no view could be made.
-  Done(Option<PushOutcome>),
-  /// A work its plan names was not built before it ([`Works::Built`]): its fork, for its driver to build again.
-  Unbuilt(Box<Option<Forked>>),
 }
 
 /// The landing's judging, in 7.2's order (module docs, "The driver"): over the served view as it is at landing, the
@@ -4443,18 +4111,8 @@ fn heads_hold(
 }
 
 /// A push's name (module docs, "The driver"; A-618: every work's identity begins with it), hashed from its repository
-/// and its bundle's bytes, whole: a test's, which holds the shard through its push ([`named_push`] hashes it a quantum
-/// at a time).
-#[cfg(test)]
-fn push_name(repository: RepositoryId, bundle: &[u8]) -> [u8; 32] {
-  let mut hasher = blake3::Hasher::new_derive_key(PUSH_NAME_CONTEXT);
-  hasher.update(&repository.bytes);
-  hasher.update(bundle);
-  *hasher.finalize().as_bytes()
-}
-
-/// A push's name as the tests' `push_name` hashes it, hashed once a quantum at a time (A-767 C1, the push spin: a 96 MiB
-/// bundle hashed in each judging's one step held the shard for seconds), so its judgings take it, never hash it again.
+/// and its bundle's bytes a quantum at a time (A-767 C1, the push spin: a 96 MiB bundle hashed in each judging's one
+/// step held the shard for seconds), so its judgings take it, never hash it again.
 async fn named_push(repository: RepositoryId, bundle: &[u8]) -> [u8; 32] {
   let mut hasher = blake3::Hasher::new_derive_key(PUSH_NAME_CONTEXT);
   hasher.update(&repository.bytes);

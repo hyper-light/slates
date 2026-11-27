@@ -386,6 +386,13 @@ pub(crate) async fn brought_back_waited(id: RepositoryId) -> bool {
     })
   })
   .flatten();
+  brought_back_own(waited).await
+}
+
+/// Brings back `waited`, the let-go window a reader with a slot of its own met (a push's,
+/// `git_push::ReceivePack::take_waited`), within its patience; whether there was one. A bring-back refused is counted
+/// [`RESIDENT_REFUSED`], and the read that met it refuses typed next turn (`slates_git::away`).
+pub(crate) async fn brought_back_own(waited: Option<slates_git::store::packed::Waited>) -> bool {
   let Some(waited) = waited else {
     return false;
   };
@@ -631,6 +638,27 @@ pub(crate) const LONG_UNITS: [&str; slates_git::negotiation::KINDS] = [
   "vcs_store.git_upload.long_units.done",
 ];
 
+/// Counters: a fetch's choosing units of each kind, all of them, in [`LONG_UNITS`]'s order: what each kind's long units
+/// and the read cache's hits are a share of (main 01a20182's A/B of 2026-11-25: the long ones alone move with the
+/// shard's live quantum, so a total read from them was an inference). Format: counter names.
+pub(crate) const UNITS_BY_KIND: [&str; slates_git::negotiation::KINDS] = [
+  "vcs_store.git_upload.units.ready",
+  "vcs_store.git_upload.units.cut",
+  "vcs_store.git_upload.units.tips",
+  "vcs_store.git_upload.units.mark",
+  "vcs_store.git_upload.units.open_tree",
+  "vcs_store.git_upload.units.take_entry",
+  "vcs_store.git_upload.units.frame",
+  "vcs_store.git_upload.units.commits",
+  "vcs_store.git_upload.units.edges",
+  "vcs_store.git_upload.units.haves",
+  "vcs_store.git_upload.units.choose",
+  "vcs_store.git_upload.units.wants",
+  "vcs_store.git_upload.units.carried",
+  "vcs_store.git_upload.units.tags",
+  "vcs_store.git_upload.units.done",
+];
+
 /// Counted most: the longest unit of each kind, in nanoseconds, in [`LONG_UNITS`]'s order. Format: counter names.
 pub(crate) const UNIT_NS_MOST: [&str; slates_git::negotiation::KINDS] = [
   "vcs_store.git_upload.unit_ns_most.ready",
@@ -659,10 +687,10 @@ pub(crate) const UNIT_NS_MOST: [&str; slates_git::negotiation::KINDS] = [
 pub(crate) const CHOOSE_OVERRAN: &str = "vcs_store.git_upload.choose_overran";
 
 thread_local! {
-  /// This shard thread's choosing units since its last count ([`count_units`]): by kind, those past the quantum and the
-  /// longest, filled by the `spent` asks of [`ShardPacks`]'s turns.
-  static UNITS: core::cell::RefCell<[(u64, u64); slates_git::negotiation::KINDS]> =
-    const { core::cell::RefCell::new([(0, 0); slates_git::negotiation::KINDS]) };
+  /// This shard thread's choosing units since its last count ([`count_units`]): by kind, all of them, those past the
+  /// quantum and the longest, filled by the `spent` asks of [`ShardPacks`]'s turns.
+  static UNITS: core::cell::RefCell<[(u64, u64, u64); slates_git::negotiation::KINDS]> =
+    const { core::cell::RefCell::new([(0, 0, 0); slates_git::negotiation::KINDS]) };
   /// What each kind of choosing unit costs on this shard thread, learned across steps (`slates_pace::Costs`, A-783).
   static CHOOSE_COSTS: core::cell::RefCell<slates_pace::Costs<{ slates_git::negotiation::KINDS }>> =
     const { core::cell::RefCell::new(slates_pace::Costs::ZERO) };
@@ -784,8 +812,9 @@ fn note_unit(took: u64, quantum_ns: u64) {
   };
   UNITS.with(|units| {
     if let Ok(mut units) = units.try_borrow_mut()
-      && let Some((long, most)) = units.get_mut(at)
+      && let Some((all, long, most)) = units.get_mut(at)
     {
+      *all = all.saturating_add(1);
       if took > quantum_ns {
         *long = long.saturating_add(1);
       }
@@ -809,10 +838,15 @@ fn count_units(state: &mut ShardState) {
   if overran > 0 {
     state.count(CHOOSE_OVERRAN, overran);
   }
-  for ((long, most), (long_name, most_name)) in noted
-    .into_iter()
-    .zip(LONG_UNITS.iter().zip(UNIT_NS_MOST.iter()))
-  {
+  for ((all, long, most), ((all_name, long_name), most_name)) in noted.into_iter().zip(
+    UNITS_BY_KIND
+      .iter()
+      .zip(LONG_UNITS.iter())
+      .zip(UNIT_NS_MOST.iter()),
+  ) {
+    if all > 0 {
+      state.count(all_name, all);
+    }
     if long > 0 {
       state.count(long_name, long);
     }
@@ -1115,10 +1149,20 @@ pub(crate) const TREE_DELTAS_MOST: &str = "vcs_store.git_upload.tree_deltas_most
 /// Counter: the deltas a fetch's tree reads applied, summed: against the walk's trees opened, a tree's mean chain read.
 /// Format: a counter name.
 pub(crate) const TREE_DELTAS: &str = "vcs_store.git_upload.tree_deltas";
+/// Counter: of [`TREE_DELTAS`], each tree read's past its first, summed (`slates_git::store::PositionCounts::
+/// tree_deltas_past_one`): the most a read cache keeping every chain could spare, a read of a delta applying its own.
+/// Format: a counter name.
+pub(crate) const TREE_DELTAS_PAST_ONE: &str = "vcs_store.git_upload.tree_deltas_past_one";
 /// Counter: a fetch's tree reads that found the tree, or an entry of its chain, kept by its fork's read cache
 /// (`slates_git::store::PositionCounts::read_cache_hits`; main 01a20182's reading of 2026-11-25: on git/git the cache cut
 /// chain rebuilds by 2.1 % where a one-directory fixture cut 85 %). Format: a counter name.
 pub(crate) const READ_CACHE_HITS: &str = "vcs_store.git_upload.read_cache_hits";
+/// Counter: a fetch's tree reads that inflated their chain's root, an entry whole in its pack: the roots inflated,
+/// beside [`TREE_DELTAS`], the steps rebuilt over them (`slates_git::store::PositionCounts::tree_bases_inflated`; main's
+/// order of 2026-11-26). The read cache keeps the root and every step's result, so its saving is roots and steps both.
+/// Derived: reuse = this ÷ distinct, headroom = this − distinct, distinct the roots the pushed pack's trees' chains end
+/// at, read offline by `git verify-pack -v` and never counted here. Format: a counter name.
+pub(crate) const TREE_BASES_INFLATED: &str = "vcs_store.git_upload.tree_bases_inflated";
 /// Counter: the times a fetch's walk widened its read cache before a tree's read. Format: a counter name.
 pub(crate) const READ_CACHE_WIDENED: &str = "vcs_store.git_upload.read_cache_widened";
 /// Counter: the times a fetch's admission refused its read cache the room a tree's read asked. Format: a counter name.
@@ -1222,19 +1266,38 @@ impl ShardPacks {
   fn count_on(&self, state: &mut ShardState) {
     count_deflaters(state);
     count_units(state);
-    state.count_max(UNIT_ENTRIES_MOST, self.chose.entries_most);
-    state.count_max(TREE_PARSE_BYTES_MOST, self.chose.tree_bytes_most);
-    state.count_max(TREE_DELTAS_MOST, self.chose.tree_deltas_most);
-    state.count_max(READ_CACHE_BUDGET_MOST, self.chose.read_cache_budget_most);
+    // Each field named, so one added to `PositionCounts` fails to build until it is told here (as in `chose`).
+    let slates_git::store::PositionCounts {
+      lookups,
+      hits,
+      conflicts,
+      unroomed,
+      entries_most,
+      tree_bytes_most,
+      tree_deltas_most,
+      tree_deltas,
+      tree_deltas_past_one,
+      tree_bases_inflated,
+      read_cache_hits,
+      read_cache_widened,
+      read_cache_refused,
+      read_cache_budget_most,
+    } = self.chose;
+    state.count_max(UNIT_ENTRIES_MOST, entries_most);
+    state.count_max(TREE_PARSE_BYTES_MOST, tree_bytes_most);
+    state.count_max(TREE_DELTAS_MOST, tree_deltas_most);
+    state.count_max(READ_CACHE_BUDGET_MOST, read_cache_budget_most);
     for (name, by) in [
-      (POSITION_LOOKUPS, self.chose.lookups),
-      (POSITION_CACHE_HITS, self.chose.hits),
-      (POSITION_CACHE_CONFLICTS, self.chose.conflicts),
-      (POSITION_CACHE_UNROOMED, self.chose.unroomed),
-      (TREE_DELTAS, self.chose.tree_deltas),
-      (READ_CACHE_HITS, self.chose.read_cache_hits),
-      (READ_CACHE_WIDENED, self.chose.read_cache_widened),
-      (READ_CACHE_REFUSED, self.chose.read_cache_refused),
+      (POSITION_LOOKUPS, lookups),
+      (POSITION_CACHE_HITS, hits),
+      (POSITION_CACHE_CONFLICTS, conflicts),
+      (POSITION_CACHE_UNROOMED, unroomed),
+      (TREE_DELTAS, tree_deltas),
+      (TREE_DELTAS_PAST_ONE, tree_deltas_past_one),
+      (TREE_BASES_INFLATED, tree_bases_inflated),
+      (READ_CACHE_HITS, read_cache_hits),
+      (READ_CACHE_WIDENED, read_cache_widened),
+      (READ_CACHE_REFUSED, read_cache_refused),
     ] {
       if by > 0 {
         state.count(name, by);
@@ -1317,31 +1380,48 @@ impl PackSource for ShardPacks {
     written
   }
 
+  /// Adds a walk's `counts` to the step's: each field named, so a field added to `PositionCounts` fails to build until
+  /// it is summed here (`tree_deltas_past_one` was left out once, and the fetch counted 0 whatever the store counted).
   fn chose(&mut self, counts: slates_git::store::PositionCounts) {
-    self.chose.lookups = self.chose.lookups.saturating_add(counts.lookups);
-    self.chose.hits = self.chose.hits.saturating_add(counts.hits);
-    self.chose.conflicts = self.chose.conflicts.saturating_add(counts.conflicts);
-    self.chose.entries_most = self.chose.entries_most.max(counts.entries_most);
-    self.chose.tree_bytes_most = self.chose.tree_bytes_most.max(counts.tree_bytes_most);
-    self.chose.tree_deltas_most = self.chose.tree_deltas_most.max(counts.tree_deltas_most);
-    self.chose.tree_deltas = self.chose.tree_deltas.saturating_add(counts.tree_deltas);
-    self.chose.read_cache_hits = self
-      .chose
-      .read_cache_hits
-      .saturating_add(counts.read_cache_hits);
-    self.chose.read_cache_widened = self
-      .chose
-      .read_cache_widened
-      .saturating_add(counts.read_cache_widened);
-    self.chose.read_cache_refused = self
-      .chose
-      .read_cache_refused
-      .saturating_add(counts.read_cache_refused);
-    self.chose.read_cache_budget_most = self
-      .chose
-      .read_cache_budget_most
-      .max(counts.read_cache_budget_most);
-    self.chose.unroomed = self.chose.unroomed.saturating_add(counts.unroomed);
+    let slates_git::store::PositionCounts {
+      lookups,
+      hits,
+      conflicts,
+      unroomed,
+      entries_most,
+      tree_bytes_most,
+      tree_deltas_most,
+      tree_deltas,
+      tree_deltas_past_one,
+      tree_bases_inflated,
+      read_cache_hits,
+      read_cache_widened,
+      read_cache_refused,
+      read_cache_budget_most,
+    } = counts;
+    let chose = &mut self.chose;
+    for (sum, by) in [
+      (&mut chose.lookups, lookups),
+      (&mut chose.hits, hits),
+      (&mut chose.conflicts, conflicts),
+      (&mut chose.unroomed, unroomed),
+      (&mut chose.tree_deltas, tree_deltas),
+      (&mut chose.tree_deltas_past_one, tree_deltas_past_one),
+      (&mut chose.tree_bases_inflated, tree_bases_inflated),
+      (&mut chose.read_cache_hits, read_cache_hits),
+      (&mut chose.read_cache_widened, read_cache_widened),
+      (&mut chose.read_cache_refused, read_cache_refused),
+    ] {
+      *sum = sum.saturating_add(by);
+    }
+    for (most, of) in [
+      (&mut chose.entries_most, entries_most),
+      (&mut chose.tree_bytes_most, tree_bytes_most),
+      (&mut chose.tree_deltas_most, tree_deltas_most),
+      (&mut chose.read_cache_budget_most, read_cache_budget_most),
+    ] {
+      *most = (*most).max(of);
+    }
   }
 }
 

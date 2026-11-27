@@ -13,9 +13,24 @@
 //! **Apart from the turn.** A segment lands at its repository's next sequence, which its owner shard allocates
 //! (`VcsStores::next_changeset`): the shard runs one step at a time, so sequences are serialized with no lock, and other
 //! landings (another push's segments, its entry, a made changeset) may take the sequences between a push's. The push's
-//! entry names its segments' sequences as ranges (record v11, `record::write_push_runs_reference`, at most one range a
-//! segment); a replay reads exactly those, each record's rows by node over the index as it stands then, so a segment
-//! cut before another push's entry replays where that push left the index. Readers see only what an entry names: the
+//! entry names its segments by one homed list (record v12, `record::write_homed_run_reference`, below); a replay reads
+//! exactly the sequences the list names, each record's rows by node over the index as it stands then, so a segment cut
+//! before another push's entry replays where that push left the index.
+//!
+//! **Homed** (main 01a20182's ruling R of 2026-11-26, with its corrections and its ruling on piece (ii): the changeset
+//! homed through git's path and A-727's barrier, as it landed, never each named text). Each segment's `Record`, `Payload`
+//! and `Texts` are put whole in the origin's content store, their buffers dropped ([`segment_held`]), and each homed in
+//! the region at `f + 1` by its identity for the push's attempt ([`homed_for`], `homes::home_in_region`: a home answers
+//! only once its image holding it is published); then the segment lands from the content store a piece at a time
+//! ([`HeldSegment::landed`]), and each section is let go at its home as a landed git pack is (`Landed::Pack`: the store
+//! keys all three by identity, `SectionKind::keyed`, so a home's read brings them back by `disk.piece`). `Texts` is homed
+//! too, not derived where it lands: it is the intake's index (each revision's text identity, base and chunk's place),
+//! which the `Record` alone does not give, so one producer makes it and a holder lands the owner's segment verbatim
+//! (`vcs_store::homed_run_on_store`). At the entry, the segment list (each segment's sequence and its three sections by
+//! identity and length) is homed and landed as a changeset of its own, then let go the same way ([`list_landed`]), and
+//! the register's record names the list alone, O(1) whatever the history. A homing short of `f + 1` within its budget
+//! refuses the push in slates' words that it was not made durable (`hg_push`'s `HOMED_SHORT`), nothing of it recorded,
+//! its attempt's holds let go at every home (A-727 (d1a)); committed, they move to the repository's records. Readers see only what an entry names: the
 //! served view is the index the entries made, and a landed segment's texts are reached only through it. The push takes
 //! its repository's landing turn only for its entry's commit (`hg_push`'s landing), so a small push waits for another's
 //! commit, never for its segments.
@@ -51,6 +66,46 @@ use slates_store::owner::{Part, StoreHandle};
 
 use crate::repository::svn_commit::landing::{self, Turn};
 use crate::state::ShardState;
+
+/// Counter: the `Record` bytes of a Mercurial push's or import's segment changesets landed on the node's changeset store
+/// (main's order of 2026-11-26 on ruling R: what each section of a segment holds, read from the status report, the held
+/// bytes' check beside the store's file sizes). Format: a counter name in the status report.
+pub(crate) const LANDED_RECORD_BYTES: &str = "vcs.hg.segment_landed_record_bytes";
+/// Counter: their `Payload` bytes, the received deltas as stock's revlog chunks ([`LANDED_RECORD_BYTES`]'s sibling).
+/// Format: a counter name in the status report.
+pub(crate) const LANDED_PAYLOAD_BYTES: &str = "vcs.hg.segment_landed_payload_bytes";
+/// Counter: their `Texts` bytes, the index of each kept revision's text, base and place ([`LANDED_RECORD_BYTES`]'s
+/// sibling). Format: a counter name in the status report.
+pub(crate) const LANDED_TEXTS_BYTES: &str = "vcs.hg.segment_landed_texts_bytes";
+
+/// A segment changeset's bytes by section, `Record`, `Payload` and `Texts` ([`section_bytes`]), taken before its parts
+/// move into the landing and counted once it lands ([`count_landed`]).
+pub(crate) type SectionBytes = [u64; 3];
+
+/// `parts`' bytes by section ([`SectionBytes`]); a section of another kind counts in none.
+pub(crate) fn section_bytes(parts: &[Part]) -> SectionBytes {
+  let mut bytes = [0u64; 3];
+  for (kind, part) in parts {
+    let at = match kind {
+      SectionKind::Record => 0,
+      SectionKind::Payload => 1,
+      SectionKind::Texts => 2,
+      SectionKind::Work | SectionKind::Names => continue,
+    };
+    if let Some(sum) = bytes.get_mut(at) {
+      *sum = sum.saturating_add(u64::try_from(part.len()).unwrap_or(u64::MAX));
+    }
+  }
+  bytes
+}
+
+/// Counts a landed segment's `bytes` by section ([`LANDED_RECORD_BYTES`] and its siblings).
+pub(crate) fn count_landed(state: &mut ShardState, bytes: SectionBytes) {
+  let [record, payload, texts] = bytes;
+  state.count(LANDED_RECORD_BYTES, record);
+  state.count(LANDED_PAYLOAD_BYTES, payload);
+  state.count(LANDED_TEXTS_BYTES, texts);
+}
 
 /// Derived: how long a push waits for its repository's landing turn before it is refused, the patience a push waits
 /// for room (`vcs_share::wait::PATIENCE_NS`): a push parked past it would be parked past a client's patience too.
@@ -172,6 +227,15 @@ pub(crate) struct Run {
   texts_resident: u64,
   /// The push's admission held as its latest segment landed (`hg_push::segments_landed`).
   admission_held: u64,
+  /// Each landed segment as its segment list names it (ruling R): its sequence, and its `Record` and `Payload` by
+  /// identity and length, each homed in the region before the segment landed.
+  entries: Vec<record::SegmentEntry>,
+  /// The push's holds in the region while it is in flight (A-727 (d1a)): each homed object's, moved to the repository's
+  /// records once its entry commits, let go at every home otherwise.
+  attempt: crate::vcs_store::homes::AttemptHolds,
+  /// The latest ticket of each home shard on this node its objects were kept on, waited on once before its entry names
+  /// them ([`list_landed`]; group commit per shard). Bounded by the node's shards.
+  tickets: std::collections::BTreeMap<u16, crate::vcs_store::homes::HomeTicket>,
   /// Whether it is settled.
   settled: bool,
 }
@@ -185,17 +249,49 @@ impl Run {
       contents: Vec::new(),
       texts_resident: 0,
       admission_held: 0,
+      entries: Vec::new(),
+      attempt: crate::vcs_store::homes::AttemptHolds::default(),
+      tickets: std::collections::BTreeMap::new(),
       settled: false,
     }
   }
 
-  /// Notes segment changeset `sequence` landed, after every one before, its file revisions kept as `contents`.
-  pub(crate) fn landed(&mut self, sequence: u64, contents: &[FileContents]) {
+  /// Notes segment changeset `entry` landed, after every one before, its file revisions kept as `contents`.
+  pub(crate) fn landed(&mut self, entry: record::SegmentEntry, contents: &[FileContents]) {
     self.contents.extend_from_slice(contents);
+    self.landed_at(entry.sequence);
+    self.entries.push(entry);
+  }
+
+  /// Notes changeset `sequence` of the run landed (a segment's, or its list's): forgotten with the run if no entry names
+  /// it.
+  fn landed_at(&mut self, sequence: u64) {
     match self.ranges.last_mut() {
       Some((_, last)) if last.checked_add(1) == Some(sequence) => *last = sequence,
       _ => self.ranges.push((sequence, sequence)),
     }
+  }
+
+  /// Its attempt as its register record names it (record v13: the node, the process and the number its holds in the
+  /// region are for), once its homing began.
+  pub(crate) fn attempt(&self) -> Option<(u64, u64, u64)> {
+    match self.attempt.owner_now()? {
+      slates_cluster::homes::HomeOwner::Attempt {
+        node,
+        process,
+        attempt,
+        ..
+      } => Some((node.0, process, attempt)),
+      slates_cluster::homes::HomeOwner::Record { .. } => None,
+    }
+  }
+
+  /// The owner its holds in the region are for (A-727 (d1a)), made at its first homing.
+  fn owner(
+    &mut self,
+    state: &mut ShardState,
+  ) -> Result<slates_cluster::homes::HomeOwner, crate::vcs_store::homes::HomeRefused> {
+    self.attempt.owner(state, self.repository.bytes)
   }
 
   /// Notes the push's admission held as its next segment lands: what the high-water its landing samples reads.
@@ -221,15 +317,10 @@ impl Run {
     })
   }
 
-  /// The register's record naming the run (record v11), its push's intake begun within `room`; none before a segment
-  /// landed.
-  pub(crate) fn reference(&self, room: u64) -> Option<Vec<u8>> {
-    record::write_push_runs_reference(room, &self.ranges)
-  }
-
   /// Ends a run no entry named (module docs, "Abandoned"): forgotten.
   pub(crate) fn abandon(mut self, state: &mut ShardState) {
     self.settled = true;
+    self.attempt.released();
     abandoned(state, self.repository, core::mem::take(&mut self.ranges));
   }
 
@@ -237,6 +328,7 @@ impl Run {
   /// home and their let-go once more, whatever its works brought back, a turn at a time ([`let_go_committed`]).
   pub(crate) fn committed(mut self) -> (RepositoryId, Vec<FileContents>) {
     self.settled = true;
+    self.attempt.committed(self.repository.bytes);
     (self.repository, core::mem::take(&mut self.contents))
   }
 }
@@ -509,27 +601,139 @@ async fn parked(repository: RepositoryId) -> Option<Result<Turn, Vec<u8>>> {
   turn.flatten()
 }
 
-/// A segment changeset to land: the store, its header, and its sections.
-pub(crate) type SegmentChangeset = (StoreHandle, Header, Vec<Part>);
+/// A push's segment changeset put whole in the origin shard's content store, its `Record`, `Payload` and `Texts` each by
+/// its identity and length (ruling R: each homed in the region by identity before the segment lands, its buffers dropped
+/// once put, so at most one segment is held twice, briefly; main 01a20182's condition of 2026-11-26), and the header at
+/// its repository's next sequence. Landed a piece at a time from the content
+/// store ([`HeldSegment::landed`]), then given back ([`HeldSegment::given_back`]).
+#[derive(Debug)]
+pub(crate) struct HeldSegment {
+  /// The node's store.
+  disk: StoreHandle,
+  /// The changeset's header.
+  header: Header,
+  /// Its `Record`, held whole on the origin: its identity and length.
+  pub(crate) record: (slates_vcs::ContentId, u64),
+  /// Its `Payload`, held whole on the origin: its identity and length.
+  pub(crate) payload: (slates_vcs::ContentId, u64),
+  /// Its `Texts`, held whole on the origin: its identity and length.
+  pub(crate) texts: (slates_vcs::ContentId, u64),
+}
 
-/// `segment` of a push to `repository` as a changeset at the repository's next sequence, its owner shard's to allocate
-/// (module docs): its `Record` `written` (by `hg_push`'s record turns over the intake's fork, a turn's steps at a
-/// time), its `Payload` its kept revisions' deltas as stock's revlog chunks (`chunks`, made a step at a time as it lands;
-/// goal 93, main's ruling (b)), its `Texts` its texts, each held as a chunk there. None where the node holds no store;
-/// refused where the chunks are not one a kept revision.
-pub(crate) fn segment_changeset(
+impl HeldSegment {
+  /// Its bytes by section, for [`count_landed`].
+  pub(crate) fn section_bytes(&self) -> SectionBytes {
+    [self.record.1, self.payload.1, self.texts.1]
+  }
+
+  /// Its three sections, each by identity and length, in the order it lands them.
+  pub(crate) fn sections(&self) -> [(SectionKind, (slates_vcs::ContentId, u64)); 3] {
+    [
+      (SectionKind::Record, self.record),
+      (SectionKind::Payload, self.payload),
+      (SectionKind::Texts, self.texts),
+    ]
+  }
+
+  /// The segment as its list names it ([`record::SegmentEntry`]).
+  pub(crate) fn entry(&self) -> record::SegmentEntry {
+    record::SegmentEntry {
+      sequence: self.header.sequence,
+      record: (self.record.0.0, self.record.1),
+      payload: (self.payload.0.0, self.payload.1),
+      texts: (self.texts.0.0, self.texts.1),
+    }
+  }
+
+  /// Lands it on the node's store through the store's sliced landing: each section a piece at a time
+  /// (`slates_store::store::PIECE_BYTES`) read from the origin's content store into one buffer each part hands back, as
+  /// git's push lands its pack (`git_push::landed_in_pieces`); committed, answered once durable. A piece the content store
+  /// no longer holds refuses it (`StoreError::NotStaged`).
+  pub(crate) async fn landed(
+    &self,
+  ) -> Result<slates_store::log::Located, slates_store::owner::OwnerError> {
+    use slates_store::store::PIECE_BYTES;
+    let mut header = self.header;
+    header.sections = 3;
+    let mut open = self.disk.begin(header).await?;
+    let mut buffer = Vec::with_capacity(PIECE_BYTES);
+    for (kind, (identity, len)) in self.sections() {
+      open.section(kind, len).await?;
+      let mut at = 0u64;
+      while at < len {
+        buffer.clear();
+        let filled = crate::state::with_state(|state| {
+          crate::vcs_store::homes::held_piece_into(
+            state,
+            (identity, len, at),
+            (PIECE_BYTES, &mut buffer),
+          )
+        })
+        .unwrap_or(false);
+        if !filled || buffer.is_empty() {
+          return Err(slates_store::owner::OwnerError::Store(
+            slates_store::store::StoreError::NotStaged,
+          ));
+        }
+        at = at.saturating_add(u64::try_from(buffer.len()).unwrap_or(u64::MAX));
+        buffer = open.part(buffer).await?;
+      }
+    }
+    open.commit().await
+  }
+
+  /// Gives back the origin's holds of its sections (`vcs_store::put_names`'). Landed (`landed`), each is
+  /// let go first where it lies on the node's store ([`crate::vcs_store::let_go_landed_pack_among`]): its home among
+  /// `shards`, told, records where its windows lie and lets its copy go, brought back by `disk.piece` on a read, as a
+  /// landed git pack is; its region hold stays, the attempt's until the entry commits.
+  pub(crate) fn given_back(&self, state: &mut ShardState, (landed, shards): (bool, &[u16])) {
+    for (_, (identity, _)) in self.sections() {
+      if landed {
+        crate::vcs_store::let_go_landed_pack_among(state, &identity, shards);
+      }
+      crate::vcs_store::release_names(state, &identity);
+    }
+  }
+}
+
+/// `segment` of a push to `repository` held for its landing ([`HeldSegment`]): its `Record` `written` (by `hg_push`'s
+/// record turns over the intake's fork, a turn's steps at a time), its `Payload` its kept revisions' deltas as stock's
+/// revlog chunks (`chunks`, made a step at a time; goal 93, main's ruling (b)) and its `Texts` the index naming each
+/// revision held as a chunk there, each put whole in the content store, the buffers dropped here; its sequence the repository's
+/// next, its owner shard's to allocate (module docs). None where the node holds no store; refused where the chunks are
+/// not one a kept revision, or the content store refused a put.
+pub(crate) fn segment_held(
   state: &mut ShardState,
   repository: RepositoryId,
   segment: &PushSegment,
   (written, (chunks, places)): (Vec<u8>, Chunks),
-) -> Option<Result<SegmentChangeset, record::WriteRefused>> {
+) -> Option<Result<HeldSegment, record::WriteRefused>> {
   let disk = state.vcs_disk.clone()?;
   if places.len() != segment.texts.len() {
     return Some(Err(record::WriteRefused::Allocation));
   }
-  let identity = *blake3::hash(&chunks).as_bytes();
-  let texts = texts_section(&segment.texts, (identity, Some(&places)));
-  let sequence = state.vcs_stores.next_changeset(repository)?;
+  let length = |bytes: &[u8]| u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+  // Put as any object is (the content store cuts it at its windows and names it by the plain BLAKE3 of its bytes, the
+  // key the node's store keeps a keyed section under: `SectionKind::keyed`).
+  let Some(record) = crate::vcs_store::put_names(state, &written) else {
+    return Some(Err(record::WriteRefused::Allocation));
+  };
+  let Some(payload) = crate::vcs_store::put_names(state, &chunks) else {
+    crate::vcs_store::release_names(state, &record);
+    return Some(Err(record::WriteRefused::Allocation));
+  };
+  let texts = texts_section(&segment.texts, (payload.0, Some(&places)));
+  let Some(texts_held) = crate::vcs_store::put_names(state, &texts) else {
+    crate::vcs_store::release_names(state, &record);
+    crate::vcs_store::release_names(state, &payload);
+    return Some(Err(record::WriteRefused::Allocation));
+  };
+  let Some(sequence) = state.vcs_stores.next_changeset(repository) else {
+    for put in [record, payload, texts_held] {
+      crate::vcs_store::release_names(state, &put);
+    }
+    return None;
+  };
   let header = Header {
     tool: Tool::Mercurial,
     repository: u128::from_be_bytes(repository.bytes),
@@ -540,12 +744,156 @@ pub(crate) fn segment_changeset(
     time_ns: slates_rt::futures::now_ns(),
     sections: 0,
   };
-  let parts = vec![
-    (SectionKind::Record, written),
-    (SectionKind::Payload, chunks),
-    (SectionKind::Texts, texts),
-  ];
-  Some(Ok((disk, header, parts)))
+  Some(Ok(HeldSegment {
+    disk,
+    header,
+    record: (record, length(&written)),
+    payload: (payload, length(&chunks)),
+    texts: (texts_held, length(&texts)),
+  }))
+}
+
+/// Counter: a push's object (a segment's `Record` or `Payload`, or its run's segment list) homed in the region at
+/// `f + 1` before the segment landed or the entry named the list (ruling R). Format: a counter name in the status report.
+pub(crate) const OBJECTS_HOMED: &str = "vcs.hg.push_objects_homed";
+/// Counter: a push refused because one of its objects' homing fell short of `f + 1` within its budget (ruling R; A-727's
+/// rule: no record names content not durable at its homes). Format: a counter name in the status report.
+pub(crate) const HOMED_SHORT: &str = "vcs.hg.push_homed_short";
+
+/// The object `source` homed in the region for `run`'s attempt (ruling R, git's path: `homes::home_in_region` within the
+/// fleet's homing budget, each home answering once its image holding it is published): its identity once `f + 1` homes
+/// kept it, the attempt holding it there; refused otherwise, logged and counted, the attempt's hold of it let go. The
+/// homing's bytes are given back (none for content held whole). None when the shard's state is gone.
+pub(crate) async fn homed_for(
+  run: &mut Run,
+  source: crate::vcs_store::homes::HomeSource,
+) -> Option<(
+  Result<slates_vcs::ContentId, crate::vcs_store::homes::HomeRefused>,
+  Vec<u8>,
+)> {
+  let identity = source.identity();
+  let (origin, shards, owner) =
+    crate::state::with_state(|state| (state.shard, state.shards.clone(), run.owner(state)))?;
+  let owner = match owner {
+    Ok(owner) => owner,
+    Err(refused) => return Some((Err(refused), source.into_given_back())),
+  };
+  // This node's keep is not waited for here: its home shard's ticket is kept, and the push waits once a home shard
+  // before its entry names what it kept ([`list_landed`]).
+  let homed = crate::vcs_store::homes::home_in_region_deferred(
+    origin,
+    &shards,
+    (source, owner),
+    crate::fleet::homing_budget(),
+    &mut run.tickets,
+  )
+  .await;
+  let outcome = match homed.outcome {
+    Ok(at) if at == identity => {
+      run.attempt.homed(identity);
+      crate::state::with_state(|state| state.count(OBJECTS_HOMED, 1))?;
+      Ok(identity)
+    }
+    other => {
+      run.attempt.release_one(identity);
+      crate::state::with_state(|state| {
+        state.count(HOMED_SHORT, 1);
+        slates_machine::log_line!(
+          "slates-server: partition {}: a Mercurial push's object {identity:?} homed short of f + 1 homes: {other:?}",
+          state.partition
+        );
+      })?;
+      Err(
+        other
+          .err()
+          .unwrap_or(crate::vcs_store::homes::HomeRefused::Unanswered),
+      )
+    }
+  };
+  Some((outcome, homed.bytes))
+}
+
+/// `run`'s segment list ([`record::write_segment_list`]) homed in the region and landed on the node's store as a
+/// changeset of its own at its repository's next sequence, its one `Record` keyed by identity (main 01a20182's
+/// correction 3 of ruling R: never held for the region past its landing, so nothing grows with the history), then let go
+/// at its home as a segment's sections are. The list's identity, length and sequence, for the register's record
+/// ([`record::write_homed_run_reference`]); refused where no segment landed, its homing fell short or the store refused
+/// it. None when the shard's state is gone.
+pub(crate) async fn list_landed(
+  run: &mut Run,
+  repository: RepositoryId,
+) -> Option<Result<(slates_vcs::ContentId, u64, u64), ListUnlanded>> {
+  let Some(list) = record::write_segment_list(&run.entries) else {
+    return Some(Err(ListUnlanded::NoSegment));
+  };
+  let len = u64::try_from(list.len()).unwrap_or(u64::MAX);
+  let (homed, bytes) = homed_for(run, crate::vcs_store::homes::HomeSource::Bytes(list)).await?;
+  let identity = match homed {
+    Ok(identity) => identity,
+    Err(refused) => return Some(Err(ListUnlanded::Unhomed(refused))),
+  };
+  let landing = crate::state::with_state(|state| {
+    let disk = state.vcs_disk.clone()?;
+    let sequence = state.vcs_stores.next_changeset(repository)?;
+    Some((disk, sequence))
+  })?;
+  let Some((disk, sequence)) = landing else {
+    return Some(Err(ListUnlanded::NoStore));
+  };
+  let header = Header {
+    tool: Tool::Mercurial,
+    repository: u128::from_be_bytes(repository.bytes),
+    sequence,
+    judged_over: sequence.saturating_sub(1),
+    grant: 0,
+    work: 0,
+    time_ns: slates_rt::futures::now_ns(),
+    sections: 0,
+  };
+  let landed = disk.land(header, vec![(SectionKind::Record, bytes)]).await;
+  let shards = crate::state::with_state(|state| {
+    if landed.is_err() {
+      return Err(ListUnlanded::StoreRefused);
+    }
+    run.landed_at(sequence);
+    state.count(LIST_RECORD_BYTES, len);
+    let shards = state.shards.clone();
+    crate::vcs_store::let_go_landed_pack_among(state, &identity, &shards);
+    Ok(state.shard)
+  })?;
+  let origin = match shards {
+    Ok(origin) => origin,
+    Err(unlanded) => return Some(Err(unlanded)),
+  };
+  // The one barrier (A-727's rule, group commit per shard): every object the record will name, through its list, durable
+  // at this node's homes, each home shard's latest ticket published, before the record is written.
+  let budget_ns = crate::fleet::homing_budget().max_deadline_ns();
+  for ticket in core::mem::take(&mut run.tickets).into_values() {
+    if !crate::vcs_store::homes::published(origin, ticket, budget_ns).await {
+      crate::state::with_state(|state| state.count(HOMED_SHORT, 1))?;
+      return Some(Err(ListUnlanded::Unhomed(
+        crate::vcs_store::homes::HomeRefused::Unanswered,
+      )));
+    }
+  }
+  Some(Ok((identity, len, sequence)))
+}
+
+/// Counter: the bytes of pushes' segment lists landed (ruling R: one homed list a push, 88 bytes a segment). Format: a
+/// counter name in the status report.
+pub(crate) const LIST_RECORD_BYTES: &str = "vcs.hg.push_list_bytes";
+
+/// Why a push's segment list was not landed ([`list_landed`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ListUnlanded {
+  /// No segment landed: nothing to name.
+  NoSegment,
+  /// Its homing was refused: short of `f + 1` within its budget, or no attempt could begin.
+  Unhomed(crate::vcs_store::homes::HomeRefused),
+  /// The node holds no changeset store.
+  NoStore,
+  /// The store refused its landing.
+  StoreRefused,
 }
 
 /// A segment's payload as stock's revlog chunks and each kept revision's chunk's range in it

@@ -1514,12 +1514,17 @@ impl Green {
   /// histories hold now, never a fixed allowance: the service adds it to `chain_entry::entry_bound` before the verdict.
   /// Nothing for an increment without such a copy.
   pub fn copy_entry_room(&self, inc: &Increment) -> usize {
-    // Most increments declare no copy: they are answered without resolving the document, which the admission and the
-    // change index's reservation would each do once more (A-626 part 3).
-    if !inc.doc.ops.iter().any(|op| op.kind == OpKind::Copy) {
+    // Only the copy ops are resolved (A-920 12a): a resolution's copies are its copy ops' alone (`declare_copy`; the
+    // resolution's end moves other ops into the copies' trees, never a copy), so the copies and their fixes are the
+    // whole resolution's. The whole increment resolved for them was 11.5 ms of the reserve's one step for a move of
+    // 9,002 ops, debug; most increments declare no copy and resolve nothing (A-626 part 3).
+    let mut r = Resolved::default();
+    for op in inc.doc.ops.iter().filter(|op| op.kind == OpKind::Copy) {
+      Green::resolve_op(inc, &mut r, op);
+    }
+    if r.copies.is_empty() {
       return 0;
     }
-    let r = Green::resolve(inc);
     self
       .copy_fixes(&r)
       .values()
@@ -1964,33 +1969,92 @@ impl Green {
       .collect()
   }
 
-  /// Every key of every dimension the green holds or held in `root`'s tree, current or recorded.
+  /// Every key of every dimension the green holds or held in `root`'s tree, current or recorded, in dimension order and
+  /// key order within each. Each map is walked from `root` alone (a descent of each trie, a range of each history), not
+  /// over every key the green holds (A-920 8a: a checkpoint of a green holding two copied trees of 9,000 files spent
+  /// 21.8 ms in this, debug, filtering every key of the green once a tree).
   pub(super) fn every_key(&self, root: &str) -> Vec<IdentityKey> {
     let inside = |path: &String| in_tree(path, root);
     let mut keys: Vec<IdentityKey> = Vec::new();
-    let files = union_keys(self.content.keys(), self.content_history.keys().cloned());
-    keys.extend(files.filter(inside).map(IdentityKey::File));
-    let specials = union_keys(self.specials.keys(), self.special_history.keys().cloned());
-    keys.extend(specials.filter(inside).map(IdentityKey::Special));
-    let dirs = union_keys(self.dirs.keys(), self.dir_history.keys().cloned());
-    keys.extend(dirs.filter(inside).map(IdentityKey::Dir));
-    let modes = union_keys(self.modes.keys(), self.mode_history.keys().cloned());
-    keys.extend(modes.filter(inside).map(IdentityKey::Mode));
-    let symlinks = union_keys(self.symlinks.keys(), self.symlink_history.keys().cloned());
-    keys.extend(symlinks.filter(inside).map(IdentityKey::Symlink));
-    let hardlinks = union_keys(self.hardlinks.keys(), self.hardlink_history.keys().cloned());
-    keys.extend(hardlinks.filter(inside).map(IdentityKey::Hardlink));
-    let xattrs = union_keys(
-      self.xattrs.iter().map(|(key, _)| key),
-      self.xattr_history.keys().cloned(),
+    let files = union_keys(
+      self.content.keys_with_prefix(root),
+      recorded_from(&self.content_history, root),
     );
+    keys.extend(files.filter(inside).map(IdentityKey::File));
+    let specials = union_keys(
+      prefixed(self.specials.prefix(root)),
+      recorded_from(&self.special_history, root),
+    );
+    keys.extend(specials.filter(inside).map(IdentityKey::Special));
+    let dirs = union_keys(
+      prefixed(self.dirs.prefix(root)),
+      recorded_from(&self.dir_history, root),
+    );
+    keys.extend(dirs.filter(inside).map(IdentityKey::Dir));
+    let modes = union_keys(
+      prefixed(self.modes.prefix(root)),
+      recorded_from(&self.mode_history, root),
+    );
+    keys.extend(modes.filter(inside).map(IdentityKey::Mode));
+    let symlinks = union_keys(
+      prefixed(self.symlinks.prefix(root)),
+      recorded_from(&self.symlink_history, root),
+    );
+    keys.extend(symlinks.filter(inside).map(IdentityKey::Symlink));
+    let hardlinks = union_keys(
+      prefixed(self.hardlinks.prefix(root)),
+      recorded_from(&self.hardlink_history, root),
+    );
+    keys.extend(hardlinks.filter(inside).map(IdentityKey::Hardlink));
     keys.extend(
-      xattrs
-        .filter(|(path, _)| inside(path))
+      self
+        .attribute_keys(root)
         .map(|(path, name)| IdentityKey::Xattr(path, name)),
     );
     keys
   }
+
+  /// Every attribute key the green holds or held in `root`'s tree, `(path, name)` in order: the root's whole map walked
+  /// for the root of everything, else its tree's own descents and its history's range.
+  fn attribute_keys<'a>(
+    &'a self,
+    root: &'a str,
+  ) -> Box<dyn Iterator<Item = (String, String)> + 'a> {
+    let inside = move |(path, _): &(String, String)| in_tree(path, root);
+    if root.is_empty() {
+      return Box::new(
+        union_keys(
+          self.xattrs.iter().map(|(key, _)| key),
+          self.xattr_history.keys().cloned(),
+        )
+        .filter(inside),
+      );
+    }
+    let recorded = self
+      .xattr_history
+      .range((root.to_owned(), String::new())..)
+      .take_while(move |((path, _), _)| path.starts_with(root))
+      .map(|(key, _)| key.clone());
+    Box::new(union_keys(self.xattrs.iter_tree(root), recorded).filter(inside))
+  }
+}
+
+/// The keys of a trie's `prefix` walk, without their values.
+fn prefixed<'a, V: 'a>(
+  walk: impl Iterator<Item = (String, &'a V)> + 'a,
+) -> impl Iterator<Item = String> + 'a {
+  walk.map(|(key, _)| key)
+}
+
+/// The keys of `history` from `root` on that start with it, in order: a range, not a walk of the whole map.
+fn recorded_from<'a, V>(
+  history: &'a BTreeMap<String, V>,
+  root: &'a str,
+) -> impl Iterator<Item = String> + 'a {
+  history
+    .range::<str, _>((std::ops::Bound::Included(root), std::ops::Bound::Unbounded))
+    .take_while(move |(key, _)| key.starts_with(root))
+    .map(|(key, _)| key.clone())
 }
 
 impl IdentityKey {

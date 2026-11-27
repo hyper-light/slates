@@ -962,6 +962,41 @@ impl Daemon {
     Self::start_with_fleet(profile, config, source, None)
   }
 
+  /// The anchor segment a start serves, from wherever `source` says it is (§4.7, A-114): made at its name with its
+  /// content region, attached from the environment an anchor across the spawn set, or attached from the handoff an
+  /// anchor in this process made, adopting the content object it handed over with it.
+  fn segment_from(
+    source: SegmentSource,
+    identity: &Identity,
+    config: &DaemonConfig,
+  ) -> Result<AnchorSegment, ServerError> {
+    match source {
+      SegmentSource::Create { name } => {
+        let content_name = content_name_of(&name);
+        Ok(
+          AnchorSegment::create(&name, identity, config.geometry)?
+            .with_content(&content_name, config.content_bytes())?,
+        )
+      }
+      SegmentSource::FromEnv => Ok(AnchorSegment::attach_from_env(identity)?),
+      SegmentSource::Handoff {
+        handoff,
+        len,
+        content,
+        rendezvous: _,
+      } => {
+        let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
+        if let Some((content_handoff, content_len)) = content {
+          let object =
+            slates_mem::SparseObject::open(&content_handoff, content_len, slates_mem::Words::new())
+              .map_err(slates_anchor::AnchorError::from)?;
+          segment.adopt_content(object);
+        }
+        Ok(segment)
+      }
+    }
+  }
+
   /// The observability gate (§2.6, §4.14): refused, naming what is missing, unless every chokepoint span has
   /// registered its emitter.
   fn chokepoints_ready() -> Result<(), ServerError> {
@@ -1023,29 +1058,7 @@ impl Daemon {
     // of 2026-11-25), which the store cannot build; a second daemon in this process finds it installed.
     let _ = slates_store::texts::install_chunk_decoder(slates_hg::revlog_chunk::decode_within);
     let listener = Listener::open(&config.instance, adoption.as_ref())?;
-    let mut segment = match source {
-      SegmentSource::Create { name } => {
-        let content_name = content_name_of(&name);
-        AnchorSegment::create(&name, &identity, config.geometry)?
-          .with_content(&content_name, config.content_bytes())?
-      }
-      SegmentSource::FromEnv => AnchorSegment::attach_from_env(&identity)?,
-      SegmentSource::Handoff {
-        handoff,
-        len,
-        content,
-        rendezvous: _,
-      } => {
-        let mut segment = AnchorSegment::attach(&handoff, len, &identity)?;
-        if let Some((content_handoff, content_len)) = content {
-          let object =
-            slates_mem::SparseObject::open(&content_handoff, content_len, slates_mem::Words::new())
-              .map_err(slates_anchor::AnchorError::from)?;
-          segment.adopt_content(object);
-        }
-        segment
-      }
-    };
+    let mut segment = Self::segment_from(source, &identity, &config)?;
     // The start beats from here until the watchdog takes the beat over (§2.6 boot step 2, A-312; [`StartBeat`]).
     let mut start_beat = StartBeat::new();
     start_beat.beat(&segment.supervision()?);
@@ -5027,7 +5040,7 @@ async fn start_shard(
   }
   match outcome {
     Ok(sliced) => slates_machine::log_line!(
-      "slates-server: shard {partition} initialized in {took_us} µs, {} µs of its CPU, in {} slices of {} units; the longest slice {} µs, the most CPU in one {} µs, ending at unit {} (a slice's floor {} µs, {} µs yielding)",
+      "slates-server: shard {partition} initialized in {took_us} µs, {} µs of its CPU, in {} slices of {} units; the longest slice {} µs, the most CPU in one {} µs, ending at unit {}, its longest unit {} (a slice's floor {} µs, {} µs yielding)",
       sliced.cpu_ns.map_or_else(
         || "unread".to_owned(),
         |cpu| (cpu / NANOS_PER_MICRO).to_string()
@@ -5037,6 +5050,10 @@ async fn start_shard(
       sliced.longest_ns / NANOS_PER_MICRO,
       sliced.longest_cpu_ns / NANOS_PER_MICRO,
       sliced.longest_cpu_ended_at,
+      sliced.longest_cpu_unit.map_or_else(
+        || "unnamed".to_owned(),
+        |(kind, took)| format!("{kind} of {} µs", took / NANOS_PER_MICRO)
+      ),
       sliced.budget_ns / NANOS_PER_MICRO,
       sliced.yielding_ns / NANOS_PER_MICRO
     ),
@@ -5071,7 +5088,7 @@ async fn hold_start(fault: crate::config::BootFault, slice_ns: u64) {
       let mut slices = crate::recovery_slices::RecoverySlices::begin(slice_ns);
       while started.elapsed() < duration {
         std::hint::spin_loop();
-        slices.unit_done().await;
+        slices.unit_done("a boot fault's hold").await;
       }
       let _report = slices.finish();
     }
@@ -5161,13 +5178,13 @@ async fn replay_catalog(
   slices: &mut crate::recovery_slices::RecoverySlices,
 ) -> Result<(slates_db::Db, slates_db::Recovered, u64), ServerError> {
   let mut recovering = slates_db::replay::Recovering::begin(segment, partition, caps, now)?;
-  slices.unit_done().await;
+  slices.unit_done("the catalog's opening").await;
   let mut most = 0_u64;
   loop {
     let before = recovering.records();
     let done = recovering.step(segment, CATALOG_RECORDS_A_UNIT)?;
     most = most.max(recovering.records().saturating_sub(before));
-    slices.unit_done().await;
+    slices.unit_done("a catalog record").await;
     if done {
       break;
     }
@@ -8508,13 +8525,13 @@ mod tests {
     let (sent, got) = std::sync::mpsc::channel();
     let put = object.clone();
     let (made, repository) = std::sync::mpsc::channel();
+    // A repository beside the object, so the successor's recovery replays its records and then frees every restored
+    // window nothing holds (`release_unheld`): the region hold must be what keeps the object.
+    let beside = crate::git_push::tests::git_repository_on(&first, "beside");
+    crate::git_push::tests::pushed_from_the_fixtures_on(&first, beside, &["create"]);
     first
-      .observe(shard, move |state| {
-        // A repository beside the object, so the successor's recovery replays its records and then frees every restored
-        // window nothing holds (`release_unheld`): the region hold must be what keeps the object.
-        let repository = crate::git_push::tests::git_repository(state, "beside");
-        crate::git_push::tests::pushed_from_the_fixtures(state, repository, &["create"]);
-        let _ = made.send(repository);
+      .observe(shard, move |_| {
+        let _ = made.send(beside);
       })
       .unwrap();
     let repository = repository.recv().expect("the repository made");
@@ -8673,9 +8690,9 @@ mod tests {
     first.bootstrap(true).unwrap();
     let shard = first.shards.first().copied();
     let (sent, got) = std::sync::mpsc::channel();
+    let repository = crate::git_push::tests::git_repository_on(&first, "barrier");
     first
-      .observe(shard, move |state| {
-        let repository = crate::git_push::tests::git_repository(state, "barrier");
+      .observe(shard, move |_| {
         let request = crate::git_push::tests::chain()
           .into_iter()
           .next()
@@ -8900,7 +8917,7 @@ mod tests {
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
     let shard = first.shards.first().copied();
-    let (pack, bytes, before) = first
+    let (pack, bytes, landing) = first
       .observe(shard, |state| {
         let window = state.store.content.chunk_bytes();
         state.vcs_stores.content_made(window).unwrap();
@@ -8928,11 +8945,19 @@ mod tests {
           sections: 0,
         };
         let parts = vec![(slates_store::log::SectionKind::Payload, bytes.clone())];
-        assert!(crate::test_store::land_blocking(
-          state.vcs_disk.clone().unwrap(),
-          header,
-          parts
-        ));
+        (
+          pack,
+          bytes,
+          (state.vcs_disk.clone().unwrap(), header, parts),
+        )
+      })
+      .unwrap();
+    // Landed from the test's thread, between observations: waited for on the shard's own thread, the store's commit
+    // would hold the shard (test_store::refuse_on_a_shard).
+    let (disk, header, parts) = landing;
+    assert!(crate::test_store::land_blocking(disk, header, parts));
+    let before = first
+      .observe(shard, move |state| {
         let here = state.shard;
         crate::vcs_store::let_go_landed_pack_among(state, &pack, &[here]);
         crate::verbs::publish_shard(state).unwrap();
@@ -8943,7 +8968,7 @@ mod tests {
             .filter(|(window, _)| content.is_away(window))
             .count()
         });
-        (pack, bytes, (records, gone))
+        (records, gone)
       })
       .unwrap();
     first.stop();
@@ -9141,63 +9166,72 @@ mod tests {
       .collect();
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
-    let (repository, packs) = first
-      .observe(first.shards.first().copied(), move |state| {
-        use crate::vcs_store::paths::tests::{ask, git_repository};
+    let (repository, packs) = crate::test_store::run_on_first(
+      &first,
+      move || async move {
+        use crate::vcs_store::paths::tests::{ask, git_made, recorded_git_submit_awaited};
+        use crate::vcs_store::tests::on_state;
         use slates_ipc::protocol::{ReplyBody, RequestBody};
-        let (repository, green) = git_repository(state, "held");
-        let ReplyBody::WorkCreated { id: work, .. } = ask(
-          state,
-          RequestBody::CreateWork {
-            green,
-            name: "work-held".to_owned(),
-          },
-        ) else {
+        let (repository, green) = git_made("held").await;
+        let work = on_state(|state| {
+          let ReplyBody::WorkCreated { id: work, .. } = ask(
+            state,
+            RequestBody::CreateWork {
+              green,
+              name: "work-held".to_owned(),
+            },
+          ) else {
+            return None;
+          };
+          ask(
+            state,
+            RequestBody::Edit {
+              work,
+              path: "/large".to_owned(),
+              at: 0,
+              delete_len: 0,
+              bytes: blob.clone(),
+            },
+          );
+          Some(work)
+        });
+        let Some(work) = work else {
           panic!("no work");
         };
-        ask(
-          state,
-          RequestBody::Edit {
-            work,
-            path: "/large".to_owned(),
-            at: 0,
-            delete_len: 0,
-            bytes: blob.clone(),
-          },
-        );
-        // A git green's submit is a client's recorded request (A-896), its refinement, made commit and whole build
-        // taken in this step.
-        let submitted = crate::vcs_store::paths::tests::recorded_git_submit(
-          state,
-          crate::identities::authored(work, "held"),
-        );
+        // A git green's submit is a client's recorded request (A-896), awaited from a task of the shard: its
+        // refinement, made commit and whole build run as the shard's own tasks run them.
+        let submitted =
+          recorded_git_submit_awaited(crate::identities::authored(work, "held")).await;
         assert!(
           matches!(
             submitted,
-            Some(ReplyBody::Submitted {
+            ReplyBody::Submitted {
               version: Some(_),
               ..
-            })
+            }
           ),
           "{submitted:?}"
         );
-        let packs: Vec<slates_vcs::ContentId> = state
-          .vcs_stores
-          .git_ref(repository)
-          .map(|(_, store)| store.repository.packs().map(|(pack, _)| pack).collect())
-          .unwrap_or_default();
-        let here = state.shard;
-        for pack in &packs {
-          crate::vcs_store::let_go_landed_pack_among(state, pack, &[here]);
-        }
-        let away = state
-          .vcs_stores
-          .content()
-          .is_some_and(|content| packs.iter().any(|pack| !content.holds_whole(pack)));
-        assert!(away, "the commit's pack let go by hand");
-        (repository, packs)
-      })
-      .unwrap();
+        on_state(|state| {
+          let packs: Vec<slates_vcs::ContentId> = state
+            .vcs_stores
+            .git_ref(repository)
+            .map(|(_, store)| store.repository.packs().map(|(pack, _)| pack).collect())
+            .unwrap_or_default();
+          let here = state.shard;
+          for pack in &packs {
+            crate::vcs_store::let_go_landed_pack_among(state, pack, &[here]);
+          }
+          let away = state
+            .vcs_stores
+            .content()
+            .is_some_and(|content| packs.iter().any(|pack| !content.holds_whole(pack)));
+          assert!(away, "the commit's pack let go by hand");
+          (repository, packs)
+        })
+      },
+      crate::test_store::HISTORY_PATIENCE,
+    );
     assert!(!packs.is_empty(), "the commit landed a pack");
     first.publish_every_shard().unwrap();
     first.stop();
@@ -9252,6 +9286,185 @@ mod tests {
     }
   }
 
+  /// Bytes no deflate shortens (a xorshift's stream), `len` of them: a file whose pack is as long as it.
+  fn incompressible(len: usize) -> Vec<u8> {
+    let mut word = 0x9e37_79b9_7f4a_7c15u64;
+    (0..len)
+      .map(|_| {
+        word ^= word << 13;
+        word ^= word >> 7;
+        word ^= word << 17;
+        word.to_le_bytes()[0]
+      })
+      .collect()
+  }
+
+  /// What keeps a restarted daemon's segment, rendezvous and store alive: dropped after the daemon stops.
+  type Restarted = (
+    crate::test_store::TestStore,
+    slates_anchor::AnchorSegment,
+    slates_ipc::HeldRendezvous,
+  );
+
+  /// A store-backed daemon `instance` over a fresh segment, `request` pushed to its repository `landed` as an edge
+  /// drives a push (`git_push::tests::homed_drive`), every window of the pushed pack let go (marked landed, as goal
+  /// 93's landed let-go leaves it: [`let_go_picked`]) and the image published, then stopped (a crash) and a successor
+  /// started over the same segment and store, its content store holding none of the pack: the successor, what keeps it
+  /// alive, and the repository.
+  fn pushed_and_restarted(
+    instance: &str,
+    request: Vec<u8>,
+  ) -> (super::Daemon, Restarted, slates_db::catalog::RepositoryId) {
+    let store = crate::test_store::TestStore::start(instance);
+    let profile = test_profile();
+    let instance = format!("{instance}-{}", std::process::id());
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
+    let segment =
+      slates_anchor::AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+        .unwrap()
+        .with_content(&super::content_name_of(&instance), config.content_bytes())
+        .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let repository = crate::git_push::tests::git_repository_on(&first, "landed");
+    let pack = request
+      .windows(4)
+      .position(|magic| magic == b"PACK")
+      .and_then(|at| request.get(at..))
+      .expect("the request's pack")
+      .to_vec();
+    let (sent, got) = std::sync::mpsc::channel();
+    first
+      .observe(first.shards.first().copied(), move |_| {
+        let task = slates_rt::futures::spawn(async move {
+          let answered = crate::git_push::tests::homed_drive(repository, &request).await;
+          let _ = sent.send(answered.map(|_| ()));
+        })
+        .unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      })
+      .unwrap();
+    got
+      .recv()
+      .expect("the push answered")
+      .expect("the push homed, landed and answered");
+    first
+      .observe(first.shards.first().copied(), move |state| {
+        let window = state
+          .vcs_stores
+          .content()
+          .map_or(1, slates_vcs::ContentStore::window);
+        let windows: Vec<_> = pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+        let_go_picked(state, &windows, &mut || true);
+      })
+      .unwrap();
+    first.publish_every_shard().unwrap();
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    (second, (store, segment, rendezvous), repository)
+  }
+
+  /// What a successor's recovery of `repository` read, once it ended (recovered, or a replay refused): whether it
+  /// recovered, the replays refused, the changesets read, the most of its pack a replay held at once, and the bound a
+  /// replay's read of its pack is held within ([`crate::vcs_store::replay_pack_bound`]).
+  fn recovered_reading(
+    daemon: &super::Daemon,
+    repository: slates_db::catalog::RepositoryId,
+  ) -> (bool, u64, u64, u64, usize) {
+    let (sent, got) = std::sync::mpsc::channel();
+    let watch = move |_: &mut crate::state::ShardState| {
+      let sent = sent.clone();
+      let task = slates_rt::futures::spawn(async move {
+        loop {
+          let seen = crate::state::with_state(|state| {
+            let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+            let recovered = state.vcs_stores.unrecovered(repository).is_none()
+              && !state.vcs_stores.rebuilding(repository)
+              && state.vcs_stores.holds(repository);
+            let quantum = state.config.step_quantum_ns();
+            (
+              recovered,
+              count(crate::vcs_store::REPLAY_REFUSED),
+              count(crate::vcs_store::CHANGESET_READ),
+              count(crate::vcs_store::REPLAY_PACK_HELD_MOST),
+              crate::vcs_store::replay_pack_bound(&state.config, quantum),
+            )
+          });
+          if let Some(seen) = seen
+            && (seen.0 || seen.1 > 0)
+          {
+            let _ = sent.send(seen);
+            break;
+          }
+          slates_rt::futures::yield_now().await;
+        }
+      });
+      if let Ok(task) = task {
+        let _ = slates_rt::futures::detach(task);
+      }
+    };
+    let shard = daemon.shards.first().copied();
+    let started = std::time::Instant::now();
+    let bound = std::time::Duration::from_nanos(10 * crate::daemon::LIVENESS_BUDGET_NS);
+    while daemon.observe(shard, watch.clone()).is_err() {
+      assert!(
+        started.elapsed() < bound,
+        "the successor's shard never took the watch"
+      );
+      std::thread::park_timeout(std::time::Duration::from_millis(50));
+    }
+    got.recv().expect("recovered")
+  }
+
+  /// Main's order of 2026-11-26 (C2 of w-git's close list: a replay read its record's pack whole from the node's store,
+  /// one buffer as long as the pack, a working set that grows with the push, §2 item 8). Do: push a create whose one
+  /// file is incompressible and [`REPLAY_PACKS`] times the bound a replay's read of its pack is held within, its pack
+  /// as long; start a successor over the same segment and store, which recovers the repository by reading the push's
+  /// changeset. Expect: recovered, no replay refused, one changeset read; the most of its pack the replay held at once
+  /// (`vcs_store.git_replay_pack_held_most`) within the bound, the pack past it. Red before: the whole pack in one
+  /// buffer.
+  #[test]
+  fn t_c2_a_restarts_replay_reads_its_records_pack_a_piece_at_a_time_within_its_bound() {
+    let profile = test_profile();
+    let config = crate::DaemonConfig::derive(&profile, "c2-replay-bound", Some(1));
+    let bound = crate::vcs_store::replay_pack_bound(&config, config.step_quantum_ns());
+    let file = incompressible(bound.saturating_mul(REPLAY_PACKS));
+    let (request, _) = crate::git_push::tests::create_of_file(file.clone());
+    let (successor, kept, repository) = pushed_and_restarted("c2-replay-bound", request);
+    let (recovered, refused, read, held_most, bound) = recovered_reading(&successor, repository);
+    successor.stop();
+    drop(kept);
+    eprintln!(
+      "replay held at most {held_most} B of a pack past {} B, bound {bound} B",
+      file.len()
+    );
+    assert!(file.len() > bound, "the pack past the bound");
+    assert_eq!(
+      (recovered, refused, read),
+      (true, 0, 1),
+      "recovered from its changeset"
+    );
+    assert!(
+      held_most > 0 && held_most <= u64::try_from(bound).unwrap(),
+      "the replay held {held_most} B of its pack at once, past the bound {bound} B"
+    );
+  }
+
+  /// Shape: how many times [`crate::vcs_store::replay_pack_bound`] the C2 test's pack is: past it by more than its
+  /// pieces' rounding.
+  const REPLAY_PACKS: usize = 4;
+
   /// A-767 C5 (git onto the changeset store; main's order of 2026-11-20 ~21:20: "red first: a stock git push lands as
   /// one changeset, and a daemon restarted with kill -9 replays it"). Do: on a daemon over a retained anchor segment
   /// holding a store (the one shared test store), create a git repository and push the fixtures' `create` as stock git
@@ -9288,9 +9501,9 @@ mod tests {
     first.bootstrap(true).unwrap();
     let shard = first.shards.first().copied();
     let (sent, got) = std::sync::mpsc::channel();
+    let repository = crate::git_push::tests::git_repository_on(&first, "landed");
     first
-      .observe(shard, move |state| {
-        let repository = crate::git_push::tests::git_repository(state, "landed");
+      .observe(shard, move |_| {
         let request = crate::git_push::tests::chain()
           .into_iter()
           .next()
@@ -9483,50 +9696,55 @@ mod tests {
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
     let written = blob.clone();
-    let before = first
-      .observe(first.shards.first().copied(), move |state| {
-        use crate::vcs_store::paths::tests::{ask, git_repository};
+    let before = crate::test_store::run_on_first(
+      &first,
+      move || async move {
+        use crate::vcs_store::paths::tests::{ask, git_made, recorded_git_submit_awaited};
+        use crate::vcs_store::tests::on_state;
         use slates_ipc::protocol::{ReplyBody, RequestBody};
-        let (_, green) = git_repository(state, "large");
-        let made = ask(
-          state,
-          RequestBody::CreateWork {
-            green,
-            name: "work-large".to_owned(),
-          },
-        );
-        let ReplyBody::WorkCreated { id: work, .. } = made else {
-          return None;
-        };
-        ask(
-          state,
-          RequestBody::Edit {
-            work,
-            path: "/large".to_owned(),
-            at: 0,
-            delete_len: 0,
-            bytes: written,
-          },
-        );
-        // A git green's submit is a client's recorded request (A-896), its refinement, made commit and whole build
-        // taken in this step.
-        let submitted = crate::vcs_store::paths::tests::recorded_git_submit(
-          state,
-          crate::identities::authored(work, "large"),
-        );
+        let (_, green) = git_made("large").await;
+        let work = on_state(|state| {
+          let made = ask(
+            state,
+            RequestBody::CreateWork {
+              green,
+              name: "work-large".to_owned(),
+            },
+          );
+          let ReplyBody::WorkCreated { id: work, .. } = made else {
+            return None;
+          };
+          ask(
+            state,
+            RequestBody::Edit {
+              work,
+              path: "/large".to_owned(),
+              at: 0,
+              delete_len: 0,
+              bytes: written,
+            },
+          );
+          Some(work)
+        });
+        let work = work?;
+        // A git green's submit is a client's recorded request (A-896), awaited from a task of the shard: its
+        // refinement, made commit and whole build run as the shard's own tasks run them.
+        let submitted =
+          recorded_git_submit_awaited(crate::identities::authored(work, "large")).await;
         assert!(
           matches!(
             submitted,
-            Some(ReplyBody::Submitted {
+            ReplyBody::Submitted {
               version: Some(_),
               ..
-            })
+            }
           ),
           "{submitted:?}"
         );
-        read(state)
-      })
-      .unwrap();
+        on_state(|state| read(state))
+      },
+      crate::test_store::HISTORY_PATIENCE,
+    );
     first.publish_every_shard().unwrap();
     first.stop();
     let second = super::Daemon::start(&profile, config, source()).unwrap();
@@ -9654,56 +9872,65 @@ mod tests {
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
     let written = blob.clone();
-    let windows = first
-      .observe(first.shards.first().copied(), move |state| {
-        use crate::vcs_store::paths::tests::{ask, git_repository};
+    let windows = crate::test_store::run_on_first(
+      &first,
+      move || async move {
+        use crate::vcs_store::paths::tests::{ask, git_made, recorded_git_submit_awaited};
+        use crate::vcs_store::tests::on_state;
         use slates_ipc::protocol::{ReplyBody, RequestBody};
-        let (_, green) = git_repository(state, "large");
-        let ReplyBody::WorkCreated { id: work, .. } = ask(
-          state,
-          RequestBody::CreateWork {
-            green,
-            name: "work-large".to_owned(),
-          },
-        ) else {
+        let (_, green) = git_made("large").await;
+        let work = on_state(|state| {
+          let ReplyBody::WorkCreated { id: work, .. } = ask(
+            state,
+            RequestBody::CreateWork {
+              green,
+              name: "work-large".to_owned(),
+            },
+          ) else {
+            return None;
+          };
+          ask(
+            state,
+            RequestBody::Edit {
+              work,
+              path: "/large".to_owned(),
+              at: 0,
+              delete_len: 0,
+              bytes: written.clone(),
+            },
+          );
+          Some(work)
+        });
+        let Some(work) = work else {
           return Vec::new();
         };
-        ask(
-          state,
-          RequestBody::Edit {
-            work,
-            path: "/large".to_owned(),
-            at: 0,
-            delete_len: 0,
-            bytes: written.clone(),
-          },
-        );
-        // A git green's submit is a client's recorded request (A-896), its refinement, made commit and whole build
-        // taken in this step.
-        let submitted = crate::vcs_store::paths::tests::recorded_git_submit(
-          state,
-          crate::identities::authored(work, "large"),
-        );
+        // A git green's submit is a client's recorded request (A-896), awaited from a task of the shard: its
+        // refinement, made commit and whole build run as the shard's own tasks run them.
+        let submitted =
+          recorded_git_submit_awaited(crate::identities::authored(work, "large")).await;
         assert!(
           matches!(
             submitted,
-            Some(ReplyBody::Submitted {
+            ReplyBody::Submitted {
               version: Some(_),
               ..
-            })
+            }
           ),
           "{submitted:?}"
         );
-        let window = state
-          .vcs_stores
-          .content()
-          .map_or(1, slates_vcs::ContentStore::window);
-        written
-          .chunks(window)
-          .map(slates_vcs::ContentId::of)
-          .collect::<Vec<_>>()
-      })
-      .unwrap();
+        on_state(|state| {
+          let window = state
+            .vcs_stores
+            .content()
+            .map_or(1, slates_vcs::ContentStore::window);
+          written
+            .chunks(window)
+            .map(slates_vcs::ContentId::of)
+            .collect::<Vec<_>>()
+        })
+      },
+      crate::test_store::HISTORY_PATIENCE,
+    );
     assert!(windows.len() > 1, "the file past one window");
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     let mut daemon = first;
@@ -9849,13 +10076,10 @@ mod tests {
     };
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
+    let repository = crate::git_push::tests::git_repository_on(&first, "large");
+    let _ = crate::git_push::tests::pushed_on(&first, repository, &request);
     let unread = first
-      .observe(first.shards.first().copied(), move |state| {
-        let repository = crate::git_push::tests::git_repository(state, "large");
-        let received = crate::git_push::tests::pushed(state, repository, &request);
-        let _ = received;
-        read(state)
-      })
+      .observe(first.shards.first().copied(), move |state| read(state))
       .unwrap();
     let before = until_read(&first);
     first.publish_every_shard().unwrap();
@@ -10357,10 +10581,10 @@ mod tests {
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
     let shard = first.shards.first().copied();
+    let repository = crate::git_push::tests::git_repository_on(&first, "kept");
+    crate::git_push::tests::pushed_from_the_fixtures_on(&first, repository, &["create", "update"]);
     let map_before = first
-      .observe(shard, |state| {
-        let repository = crate::git_push::tests::git_repository(state, "kept");
-        crate::git_push::tests::pushed_from_the_fixtures(state, repository, &["create", "update"]);
+      .observe(shard, move |state| {
         crate::vcs_store::paths::whole_build::settle(state);
         let map = main_map(state).and_then(|(_, map)| map);
         // The greens' maps are derived data: a successor replays a created green owing its push again, and derives its
@@ -10467,21 +10691,35 @@ mod tests {
   /// The `states` repository imported into a Mercurial repository a unit a turn and landed, as segment changesets
   /// whose records hold its rows by identity (A-767 C1 step 3), the register naming the import's run: the repository
   /// and its index's rows.
-  fn a729_imported_and_landed(
+  async fn a729_imported_and_landed() -> (
+    slates_db::catalog::RepositoryId,
+    crate::vcs_store::hg_import::tests::Rows,
+  ) {
+    use crate::repository::svn_commit::tests::on;
+    use crate::vcs_store::hg_import::tests::{created, directory, to_its_end};
+    let id = created("hg", slates_ipc::protocol::VcsTool::Mercurial).await;
+    on(|state| {
+      let laid = directory(crate::hg_base::tests::STATES.iter().copied());
+      assert_eq!(crate::vcs_store::hg_import::begin(state, id, laid), Ok(()));
+      assert!(to_its_end(state, id).1.is_ok(), "imported");
+    });
+    assert_eq!(
+      crate::vcs_store::hg_import::land_imported_awaited(id).await,
+      Ok(())
+    );
+    on(|state| a729_landed(state, id))
+  }
+
+  /// [`a729_imported_and_landed`]'s landing as the test reads it: segment changesets landed, the register naming the
+  /// import's run once; the repository and its index's rows.
+  fn a729_landed(
     state: &mut crate::state::ShardState,
+    id: slates_db::catalog::RepositoryId,
   ) -> (
     slates_db::catalog::RepositoryId,
     crate::vcs_store::hg_import::tests::Rows,
   ) {
-    use crate::vcs_store::hg_import::tests::{created, directory, rows_of, to_its_end};
-    let id = created(state, "hg", slates_ipc::protocol::VcsTool::Mercurial);
-    let laid = directory(crate::hg_base::tests::STATES.iter().copied());
-    assert_eq!(crate::vcs_store::hg_import::begin(state, id, laid), Ok(()));
-    assert!(to_its_end(state, id).1.is_ok(), "imported");
-    assert_eq!(
-      crate::vcs_store::hg_import::land_imported(state, id),
-      Ok(())
-    );
+    use crate::vcs_store::hg_import::tests::rows_of;
     let segments = state
       .refusals
       .get(crate::vcs_store::hg_import::SEGMENTS_LANDED)
@@ -10529,8 +10767,11 @@ mod tests {
     };
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
-    let shard = first.shards.first().copied();
-    let (id, before) = first.observe(shard, a729_imported_and_landed).unwrap();
+    let (id, before) = crate::test_store::run_on_first(
+      &first,
+      a729_imported_and_landed,
+      std::time::Duration::from_secs(60),
+    );
     first.publish_every_shard().unwrap();
     first.stop();
     let second = super::Daemon::start(&profile, config, source()).unwrap();
@@ -14579,14 +14820,42 @@ mod tests {
   }
 
   /// What a daemon over a retained segment saw of the oracle's repository: its changesets, the last sequence it counts
-  /// landed, the run its register names last, and the replays refused.
-  type B1Seen = (u32, u64, Option<slates_hg::import::record::Run>, u64);
+  /// landed, the sequences of the segments its register's last run names (record v12's list, read back from the node's
+  /// store), and the replays refused.
+  type B1Seen = (u32, u64, Option<Vec<u64>>, u64);
+
+  /// [`B1Seen`] as the shard sees it, the run named by its homed list (record v12), not yet read back.
+  type B1Look = (u32, u64, Option<slates_hg::import::record::HomedRun>, u64);
+
+  /// The oracle's look at `repository` on `daemon`'s shard ([`b1_seen`]), its run's segment sequences read back from the
+  /// node's store from a task there ([`crate::vcs_store::keyed_bytes`]), as a replay reads them.
+  fn b1_seen_on(daemon: &super::Daemon, look: B1Look) -> B1Seen {
+    let (changesets, landed, homed, refused) = look;
+    let sequences = homed.and_then(|homed| {
+      crate::test_store::run_on_first(
+        daemon,
+        move || async move {
+          let disk = crate::state::with_state(|state| state.vcs_disk.clone()).flatten()?;
+          let list = crate::vcs_store::keyed_bytes(&disk, homed.list, homed.len).await?;
+          let entries = slates_hg::import::record::segment_list_of(&list)?;
+          Some(
+            entries
+              .iter()
+              .map(|entry| entry.sequence)
+              .collect::<Vec<u64>>(),
+          )
+        },
+        std::time::Duration::from_nanos(10 * crate::daemon::LIVENESS_BUDGET_NS),
+      )
+    });
+    (changesets, landed, sequences, refused)
+  }
 
   /// The oracle's look at `repository` on `state`.
   fn b1_seen(
     state: &mut crate::state::ShardState,
     repository: slates_db::catalog::RepositoryId,
-  ) -> B1Seen {
+  ) -> B1Look {
     let changesets = state
       .vcs_stores
       .mercurial_ref(repository)
@@ -14596,7 +14865,7 @@ mod tests {
     let records = state.db.partition().repositories();
     let run = (0..)
       .map_while(|index| records.object_record(repository, index))
-      .filter_map(slates_hg::import::record::run_of)
+      .filter_map(slates_hg::import::record::homed_run_of)
       .last();
     (
       changesets,
@@ -14698,34 +14967,21 @@ mod tests {
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
     let at = crash.unwrap_or(0);
-    let repository = first
-      .observe(first.shards.first().copied(), move |state| {
+    first
+      .observe(first.shards.first().copied(), move |_state| {
         crate::repository::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(B1_SEGMENT_BYTES));
         crate::repository::hg_run::TEST_PARK_AFTER_SEGMENTS.with(|park| park.set(at));
-        let reply = crate::test_store::create(
-          state,
-          &b1_owner(),
-          slates_ipc::protocol::RequestBody::CreateRepository {
-            name: "oracle".to_owned(),
-            tool: slates_ipc::protocol::VcsTool::Mercurial,
-            format: slates_ipc::protocol::ObjectFormat::Sha1,
-            default_branch: crate::repository::hg_push::line_name(b"default", 0),
-            green: None,
-          },
-        );
-        assert!(
-          matches!(reply, slates_ipc::protocol::ReplyBody::GreenCreated { .. }),
-          "{reply:?}"
-        );
-        state
-          .db
-          .partition()
-          .repositories()
-          .repository_named("oracle")
-          .unwrap()
-          .id
       })
       .unwrap();
+    // Made as a client's creation is, from the test's thread, the shard never held through its commit.
+    let line = crate::repository::hg_push::line_name(b"default", 0);
+    let asked = (
+      "oracle",
+      slates_ipc::protocol::VcsTool::Mercurial,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      line.as_str(),
+    );
+    let (repository, _) = crate::test_store::create_on(&first, 0, &b1_owner(), asked);
     let (sent, answered) = std::sync::mpsc::channel();
     b1_push(&first, repository, bundle, sent);
     let (outcome, unnamed) = match crash {
@@ -14748,6 +15004,7 @@ mod tests {
         b1_seen(state, repository)
       })
       .unwrap();
+    let before = b1_seen_on(&first, before);
     // The crash: nothing more published.
     first.stop();
     let second = super::Daemon::start(&profile, config, source()).unwrap();
@@ -14763,6 +15020,7 @@ mod tests {
       (done || refused > 0).then(|| b1_seen(state, repository))
     })
     .expect("the successor recovered the repository or refused its replay");
+    let recovered = b1_seen_on(&second, recovered);
     second
       .observe(second.shards.first().copied(), |_| {
         crate::repository::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(B1_SEGMENT_BYTES));
@@ -14780,6 +15038,7 @@ mod tests {
         b1_seen(state, repository)
       })
       .unwrap();
+    let after = b1_seen_on(&second, after);
     second.stop();
     drop(segment);
     (before, recovered, after, outcome, unnamed)
@@ -14789,7 +15048,7 @@ mod tests {
   /// changesets apart from its repository's landing turn; a crash oracle at each segment boundary,
   /// `crates/land/tests/oracle.rs`'s pattern, killed with an unnamed run's rows present). Do: push four changesets of 1.5
   /// KiB files cut at [`B1_SEGMENT_BYTES`] through [`b1_crash`]: once to its answer, then with a crash after each count of
-  /// segments its run lands. Expect, answered: the push accepted, its run named (record v11), and a successor holding its
+  /// segments its run lands. Expect, answered: the push accepted, its run named (record v12's list), and a successor holding its
   /// four changesets with no replay refused (a second push of the same bundle lands nothing new). Each crash: the run's
   /// segments landed, unnamed; a successor holding none of the push's changesets, counting its next sequence from the
   /// creation's, no replay refused; its push again accepted, its four changesets held, and its run beginning at the
@@ -14803,7 +15062,7 @@ mod tests {
       "{outcome:?}"
     );
     let named = before.2.expect("the answered push's run is named");
-    let segments = u64::try_from(named.sequences().count()).unwrap();
+    let segments = u64::try_from(named.len()).unwrap();
     assert!(segments > 1, "the push landed as {segments} segments");
     assert_eq!(
       recovered.0, 4,
@@ -14824,10 +15083,11 @@ mod tests {
   /// Goal 93, the landing spin (main's order of 2026-11-24 10:18 and 14:26: a 4,067-changeset history with 452 heads
   /// spun shard 0 for 3,553 ms of CPU in one poll of `hg_push::landing`, the daemon ended by its watchdog). Do: push a
   /// root and [`MANY_HEADS`] - 1 changesets on it, each a head of its own, through the daemon's driver
-  /// (`hg_push::unbundle`). Expect the push accepted, a line green for every head, and the landing's one step doing the
-  /// work of the line that existed alone (`repository.push.landing_step_works_most` 1), each new line's made before it a
-  /// slice a step (`repository.push.create_slices` moved) and taken by it (`repository.push.create_misses` 0). Red
-  /// before: every head's work in the one step (64).
+  /// (`hg_push::unbundle`). Expect the push accepted, a line green for every head, and the landing's one step doing no
+  /// line's work itself (`repository.push.landing_step_works_most` 0: the existing line's judged ahead of it), each new
+  /// line made in the step owing its push, its work built only when it is first reached (P2 for Mercurial, main's ruling
+  /// (A) of 2026-11-26), none counted a miss (`repository.push.create_misses` 0). Red before 2026-11-24: every head's
+  /// work in the one step (64); until 2026-11-26 each new line's work was built and committed ahead a slice a step.
   #[test]
   fn t_goal93_a_push_of_many_heads_lands_its_new_lines_outside_its_landing_step() {
     use crate::repository::hg_push::tests::history_of;
@@ -14862,49 +15122,37 @@ mod tests {
     )
     .unwrap();
     daemon.bootstrap(true).unwrap();
-    let repository = daemon
-      .observe(daemon.shards.first().copied(), move |state| {
-        let reply = crate::test_store::create(
-          state,
-          &b1_owner(),
-          slates_ipc::protocol::RequestBody::CreateRepository {
-            name: "many-heads".to_owned(),
-            tool: slates_ipc::protocol::VcsTool::Mercurial,
-            format: slates_ipc::protocol::ObjectFormat::Sha1,
-            default_branch: crate::repository::hg_push::line_name(b"default", 0),
-            green: None,
-          },
-        );
-        assert!(
-          matches!(reply, slates_ipc::protocol::ReplyBody::GreenCreated { .. }),
-          "{reply:?}"
-        );
-        state
-          .db
-          .partition()
-          .repositories()
-          .repository_named("many-heads")
-          .unwrap()
-          .id
-      })
-      .unwrap();
+    // Made as a client's creation is, from the test's thread, the shard never held through its commit.
+    let line = crate::repository::hg_push::line_name(b"default", 0);
+    let asked = (
+      "many-heads",
+      slates_ipc::protocol::VcsTool::Mercurial,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      line.as_str(),
+    );
+    let (repository, _) = crate::test_store::create_on(&daemon, 0, &b1_owner(), asked);
     let (sent, answered) = std::sync::mpsc::channel();
     b1_push(&daemon, repository, &bundle, sent);
     let outcome = answered.recv().ok().flatten();
-    let (lines, (in_step, slices, misses)) = daemon
+    let (lines, owing, (in_step, misses)) = daemon
       .observe(daemon.shards.first().copied(), move |state| {
-        let lines = state
+        let members: Vec<_> = state
           .db
           .partition()
           .repositories()
           .members_of(repository)
+          .map(|member| member.green)
+          .collect();
+        let owing = members
+          .iter()
+          .filter(|green| state.greens.is_owing(green))
           .count();
         let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
         (
-          lines,
+          members.len(),
+          owing,
           (
             counted(crate::repository::push::LANDING_STEP_WORKS),
-            counted(crate::repository::push::CREATE_SLICES),
             counted(crate::repository::push::CREATE_MISSES),
           ),
         )
@@ -14917,14 +15165,13 @@ mod tests {
     );
     assert_eq!(lines, MANY_HEADS, "a line green for every head");
     assert_eq!(
-      in_step, 1,
-      "the landing's step did the existing line's work alone"
+      in_step, 0,
+      "the landing's step did no line's work itself (the existing line's judged ahead, as each new one's was made)"
     );
-    assert!(slices > 0, "the new lines made a slice at a time: {slices}");
-    assert_eq!(
-      misses, 0,
-      "every line made ahead taken by the landing's step"
-    );
+    // The root's [`MANY_HEADS`] - 1 heads: one moves `default`, every other is a new line; the bookmark `main` is a green
+    // of its own, made at a line's version with no work.
+    assert_eq!(owing, MANY_HEADS - 2, "every new line owes its push");
+    assert_eq!(misses, 0, "no owed line counted a miss");
   }
 
   /// The oracle's push: four changesets on one line, each a file of 1,536 bytes, so that a push cut at
@@ -14961,12 +15208,7 @@ mod tests {
   /// held before the crash or after the successor's recovery (nothing unnamed applied), no replay is refused and no
   /// entry names the crashed run; and the push again is held whole, its run beginning at the sequence the answered
   /// push's run `named` began at, the last named plus one, each row there the newest landing's.
-  fn b1_crash_leaves_none_then_whole(
-    bundle: &[u8],
-    crash: u64,
-    segments: u64,
-    named: &slates_hg::import::record::Run,
-  ) {
+  fn b1_crash_leaves_none_then_whole(bundle: &[u8], crash: u64, segments: u64, named: &[u64]) {
     let (before, recovered, after, outcome, unnamed) =
       b1_crash(&format!("b1-crash-{crash}"), bundle, Some(crash));
     println!(

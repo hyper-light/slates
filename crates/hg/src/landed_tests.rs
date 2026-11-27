@@ -160,3 +160,57 @@ fn a_changeset_missing_its_payload_is_refused_by_kind() {
   assert_eq!(rows(&mut index, &store), Vec::new());
   assert_eq!(store.len(), 0);
 }
+
+/// A-767 C4 (docs/bugs/2026-11-25-a-made-changeset-over-a-let-go-parent-was-never-made.md, siblings: main's ruling A1 of
+/// 2026-11-26). Do: land two pushes of one file `f` as two changesets, the second's revision a delta against the
+/// first's; replay the log until the first changeset is in the index, let the first revision's bytes go (as a landing
+/// lets a landed text go), and replay on. Expect the replay refused as this seam refuses a want of the store, which it
+/// keeps none of (`RecordRefused::StoreWanted`, naming the second changeset), never answered from anything else. Red
+/// before: a `#[cfg(test)]` arm answered the want from the fork's own texts, so the tests saw `UnknownDeltaBase` where
+/// production refuses `StoreWanted`.
+#[test]
+fn a_replay_wanting_a_base_let_go_between_its_changesets_is_refused_as_production_refuses_it() {
+  use crate::import::record::Refused as RecordRefused;
+  use crate::index::Log;
+  use crate::push::intake::tests::file_push;
+  let (first, after) = file_push(&[(b"a\n", None)], (crate::NULL_NODE, crate::NULL_NODE, &[]));
+  let (second, _) = file_push(&[(b"a\nb\n", Some(0))], (after.0, after.1, &after.2));
+  let mut log = Held::default();
+  let version = crate::changegroup::Version::V03;
+  land_push(&mut log, 1 << 20, (version, &first)).unwrap();
+  land_push(&mut log, 1 << 20, (version, &second)).unwrap();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut replaying = Replaying::new();
+  while replaying.replayed().is_empty() {
+    assert_eq!(
+      replaying.step(&log, &mut index, &mut store).unwrap(),
+      Stepped::More
+    );
+  }
+  let (node, _) = after.2.first().cloned().unwrap();
+  let rev = index.rev(&store, Log::File(b"f"), &node).unwrap();
+  let row = index.revision(&store, Log::File(b"f"), rev).unwrap();
+  assert!(
+    store.let_go_object(&row.bytes) > 0,
+    "the first revision's bytes let go"
+  );
+  let refused = loop {
+    match replaying.step(&log, &mut index, &mut store) {
+      Ok(Stepped::More) => {}
+      Ok(Stepped::Done) => panic!("the replay ended without its let-go base"),
+      Err(refused) => break refused,
+    }
+  };
+  assert!(
+    matches!(
+      refused,
+      Refused::Record {
+        sequence: 1,
+        refused: RecordRefused::StoreWanted
+      }
+    ),
+    "{refused:?}"
+  );
+  index.release(&mut store).unwrap();
+}

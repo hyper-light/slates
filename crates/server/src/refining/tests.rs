@@ -1,6 +1,7 @@
-//! The refinement job's two drivers held equal (A-787 part 2; main 01a20182's ruling of 2026-11-24 02:17): the task a
-//! shard runs ([`super::job`]) and the turns a test holding the shard takes ([`super::refined_now`]) are the same
-//! [`super::RefineJob::turn`], so a test that refines under a held shard certifies what the shard does.
+//! The refinement job as the shard's own task runs it ([`super::job`], A-787 part 2): a recorded submit parked on its
+//! refinement until the task's turns end, and a base whose windows were let go brought back and copied again (A-760 (b)
+//! 4d). The test-only driver that took the turns on a held shard (`refined_now`) is gone: it gave such a job up (main's
+//! ruling of 2026-11-26).
 
 use slates_ipc::protocol::{ReplyBody, RequestBody, VolumeId};
 use slates_wire::request::{RequestId, Seen};
@@ -21,7 +22,7 @@ fn on<R>(step: impl FnOnce(&mut ShardState) -> R) -> R {
 
 /// `body` asked of `state` as the owner, outside a recorded request.
 fn ask(state: &mut ShardState, body: RequestBody) -> ReplyBody {
-  crate::test_store::create(state, &crate::vcs_store::tests::owner(), body)
+  crate::verbs::dispatch(state, 1, &crate::vcs_store::tests::owner(), body)
 }
 
 /// The file the green holds, a generated function a line pair.
@@ -143,8 +144,8 @@ struct Driven {
   kept: Kept,
 }
 
-/// A green whose `/f` is [`original`], seeded through a recorded submit, and two works on it re-indenting `/f` whole.
-fn two_rewrites(state: &mut ShardState) -> (VolumeId, VolumeId) {
+/// A green whose `/f` is [`original`], seeded through a recorded submit, and a work on it re-indenting `/f` whole.
+fn a_rewrite(state: &mut ShardState) -> VolumeId {
   let made = ask(
     state,
     RequestBody::CreateGreen {
@@ -169,10 +170,7 @@ fn two_rewrites(state: &mut ShardState) -> (VolumeId, VolumeId) {
     "{seeded:?}"
   );
   let whole = u64::try_from(original().len()).expect("a length");
-  (
-    work_writing(state, (green, "by-task"), (whole, reindented())),
-    work_writing(state, (green, "by-turns"), (whole, reindented())),
-  )
+  work_writing(state, (green, "by-task"), (whole, reindented()))
 }
 
 /// `work` submitted as request `sequence`, its refinement run by the shard's own task, awaited until it is answered.
@@ -193,22 +191,6 @@ async fn by_task(work: VolumeId, sequence: u32) -> Driven {
   })
 }
 
-/// `work` submitted as request `sequence` under a held shard, its refinement's turns taken through `refined_now`.
-fn by_turns(state: &mut ShardState, work: VolumeId, sequence: u32) -> Driven {
-  super::HELD_FOR_TEST.with(|held| held.set(true));
-  let (id, parked) = submit(state, work, sequence);
-  let before_job = completed(state, id);
-  super::refined_now(state);
-  super::HELD_FOR_TEST.with(|held| held.set(false));
-  Driven {
-    parked,
-    before_job,
-    answer: completed(state, id),
-    counts: counted(state),
-    kept: kept_of(state, work),
-  }
-}
-
 /// What `driven` moved of the counters since `before`: each job-moved counter's delta, and the turns'.
 fn moved(before: Counts, driven: &Driven) -> ([u64; 5], u64) {
   let mut deltas = [0; 5];
@@ -218,19 +200,15 @@ fn moved(before: Counts, driven: &Driven) -> ([u64; 5], u64) {
   (deltas, driven.counts.1.saturating_sub(before.1))
 }
 
-/// What each driver moved of the counters, and what each left ([`by_task`], [`by_turns`]).
-type BothDriven = (([u64; 5], u64), ([u64; 5], u64), Driven, Driven);
-
-/// Two whole-file rewrites of one green on a stored audit daemon's shard ([`two_rewrites`]), the first refined by the
-/// shard's own task and the second by `refined_now`: what each moved and left.
-fn driven_both_ways() -> BothDriven {
+/// A whole-file rewrite of a green on a stored audit daemon's shard ([`a_rewrite`]), refined by the shard's own task:
+/// what it moved of the counters, and what it left.
+fn driven_by_its_task() -> (([u64; 5], u64), Driven) {
   let (store, daemon) = crate::test_store::audit_daemon_stored();
   let history = || async move {
-    let (task_work, turns_work) = on(two_rewrites);
+    let work = on(a_rewrite);
     let before = on(|state| counted(state));
-    let task = by_task(task_work, 2).await;
-    let held = on(|state| by_turns(state, turns_work, 3));
-    (moved(before, &task), moved(task.counts, &held), task, held)
+    let task = by_task(work, 2).await;
+    (moved(before, &task), task)
   };
   let driven = crate::test_store::run_on_first(&daemon, history, PATIENCE);
   daemon.stop();
@@ -252,18 +230,15 @@ fn assert_parked_until_its_job(driven: &Driven) {
   );
 }
 
-/// A-787 part 2 (the job's drivers; main's ruling of 2026-11-24 02:17). Do: make two works on one green, each
-/// re-indenting the green's 2,000-function file whole; submit the first as a client's recorded request and let the
-/// shard's own refinement task run it, awaited; then submit the second the same way under a held shard and take its
-/// job's turns through `refined_now`. Expect: each submit parked on its refinement and was answered once the job ended,
-/// the first accepted; both jobs kept the same refined document and plan; and each moved the same counters (one job
-/// started, its submit's increment prepared and checked, none given up or mismatched), and took more than one turn
-/// (the slicing's non-vacuity count), so the held driver takes the turns the task takes.
+/// A-787 part 2 (the job's task; main's ruling of 2026-11-24 02:17). Do: make a work on a green re-indenting the
+/// green's 2,000-function file whole, and submit it as a client's recorded request, the shard's own refinement task
+/// running its job, awaited. Expect: the submit parked on its refinement and was answered once the job ended, accepted;
+/// the job kept a refined document and plan; it moved the counters a job moves (one started, its submit's increment
+/// prepared and checked, none given up or mismatched), and took more than one turn (the slicing's non-vacuity count).
 #[test]
-fn t_a787_a_recorded_submits_refinement_by_its_task_and_by_refined_now_agree() {
-  let (task_moved, held_moved, task, held) = driven_both_ways();
+fn t_a787_a_recorded_submit_parks_until_its_refinements_task_ends_in_turns() {
+  let ((counters, turns), task) = driven_by_its_task();
   assert_parked_until_its_job(&task);
-  assert_parked_until_its_job(&held);
   let accepted = matches!(
     task.answer,
     Some(ReplyBody::Submitted {
@@ -272,26 +247,92 @@ fn t_a787_a_recorded_submits_refinement_by_its_task_and_by_refined_now_agree() {
     })
   );
   assert!(accepted, "{:?}", task.answer);
-  assert!(
-    held.answer.is_some(),
-    "the held submit was answered once its job ended"
-  );
   assert!(task.kept.is_some(), "the task kept a refinement");
-  assert_eq!(task.kept, held.kept, "the two drivers refined alike");
   assert_eq!(
-    task_moved.0,
+    counters,
     [1, 0, 1, 1, 0],
     "the task's job: started, prepared, checked"
   );
-  assert_eq!(
-    held_moved.0, task_moved.0,
-    "the held job moved the task's counters"
+  assert!(turns > 1, "the job took turns: {turns}");
+}
+
+/// The copy steps that met a let-go window: brought back, and not brought back (the job given up).
+fn copy_counts(state: &mut ShardState) -> [u64; 2] {
+  [super::COPY_BROUGHT_BACK, super::COPY_NOT_BROUGHT_BACK]
+    .map(|name| state.refusals.get(name).copied().unwrap_or(0))
+}
+
+/// A work on the green of `repository`'s `trunk` re-indenting `/trunk/a.bin`, a named text of [`original`] whose
+/// windows are away (`test_store::a_text_whose_windows_are_away`), whole: the work.
+fn a_rewrite_over_a_let_go_base(
+  state: &mut ShardState,
+  repository: slates_db::catalog::RepositoryId,
+) -> VolumeId {
+  let trunk = state
+    .db
+    .partition()
+    .repositories()
+    .branch(repository, "trunk")
+    .expect("trunk");
+  let green = crate::verbs::to_wire_volume(trunk);
+  let made = ask(
+    state,
+    RequestBody::CreateWork {
+      green,
+      name: "rewrite".to_owned(),
+    },
   );
-  assert_eq!(
-    (task_moved.1 > 1, held_moved.1 > 1),
-    (true, true),
-    "both took turns: {} and {}",
-    task_moved.1,
-    held_moved.1
+  let ReplyBody::WorkCreated { id: work, .. } = made else {
+    panic!("no work: {made:?}")
+  };
+  let edited = ask(
+    state,
+    RequestBody::Edit {
+      work,
+      path: "/trunk/a.bin".to_owned(),
+      at: 0,
+      delete_len: u64::try_from(original().len()).expect("a length"),
+      bytes: reindented(),
+    },
+  );
+  assert!(!matches!(edited, ReplyBody::Refused { .. }), "{edited:?}");
+  work
+}
+
+/// A-760 (b) 4d (a refinement's copy over a let-go window), and why `refined_now` went (main's ruling of 2026-11-26).
+/// Do: commit [`original`] as a Subversion repository's `/trunk/a.bin`, a named text, every window of it then let go
+/// (`test_store::a_text_whose_windows_are_away`); submit a work re-indenting it whole as a client's recorded request,
+/// its refinement run by the shard's own task. Expect: the job met the base's let-go window, brought it back and copied
+/// the slice again (counted brought back, never not brought back), and kept its refinement. Red with the test driver
+/// `refined_now` in place of the task: brought back 0, not brought back 1, and the submit never answered, where the task
+/// accepted it at version 2 (`~/.local/state/w-hg-logs/2026-11-26-refined-now-red.txt`).
+#[test]
+fn a_refinement_whose_base_was_let_go_brings_it_back_and_refines() {
+  let (store, daemon, repository) = crate::test_store::a_text_whose_windows_are_away(
+    &crate::vcs_store::tests::owner(),
+    "away",
+    &original(),
+  );
+  let history = move || async move {
+    let work = on(|state| a_rewrite_over_a_let_go_base(state, repository));
+    let before = on(copy_counts);
+    let driven = by_task(work, 1).await;
+    (driven, before, on(copy_counts))
+  };
+  let (driven, before, after) = crate::test_store::run_on_first(&daemon, history, PATIENCE);
+  daemon.stop();
+  drop(store);
+  let moved = [after[0] - before[0], after[1] - before[1]];
+  eprintln!(
+    "copy over a let-go base: brought back {}, not brought back {}; answered {:?}",
+    moved[0], moved[1], driven.answer
+  );
+  assert!(
+    moved[0] >= 1 && moved[1] == 0,
+    "brought back, never given up: {moved:?}"
+  );
+  assert!(
+    driven.kept.is_some(),
+    "the job kept no refinement: {moved:?}"
   );
 }

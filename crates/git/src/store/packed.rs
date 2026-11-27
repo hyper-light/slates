@@ -23,8 +23,10 @@
 //! **Objects read lately** ([`Recent`]; git's delta base cache, `core.deltaBaseCacheLimit`). A chain read whole for
 //! each of its members costs its depth for each (git/git's v1.5.0 pack: 23,653 deltas, chains 12.6 deep on average,
 //! 297,700 deltas applied where 23,653 suffice). A read stops at the first entry of its chain the scratch keeps, and
-//! keeps each object it builds, the oldest given back past a budget its caller learns from the work (a push's: its
-//! pack's length, so what it keeps is held to what it was sent).
+//! keeps each object it builds, the one read longest ago given back past a budget its caller learns from the work (a
+//! push's: its pack's length, so what it keeps is held to what it was sent): an object found kept is laid again with the
+//! newest where it lies in the older half of what is kept ([`Recent::refresh`]), as git's cache gives back its least
+//! recently used, so a base many chains share outlives the chains read once.
 //!
 //! **Bounds (§4.9).** Every size a header names is held to the caller's room before any buffer grows to it. An
 //! OFS_DELTA's base lies before its entry ([`entry::read`] refuses one that does not), so a chain within one pack ends; a
@@ -212,6 +214,8 @@ pub struct Scratch {
   recent: Recent,
   /// Whether its last read found an entry of its chain among the objects read lately ([`Scratch::found_kept`]).
   found_kept: bool,
+  /// Whether its last read inflated its chain's root, an entry whole in a pack ([`Scratch::base_inflated`]).
+  base_inflated: bool,
 }
 
 impl Scratch {
@@ -227,6 +231,13 @@ impl Scratch {
   pub fn found_kept(&self) -> bool {
     self.found_kept
   }
+
+  /// Whether its last read inflated its chain's root: an entry held whole in a pack, met with nothing of the chain kept
+  /// above it. A read finding an entry kept, or a REF_DELTA's base held whole outside every pack, inflates none. The
+  /// steps it rebuilt over that root are [`Scratch::deltas_applied`]; both the root and every step's result are kept.
+  pub fn base_inflated(&self) -> bool {
+    self.base_inflated
+  }
 }
 
 /// Derived: the fewest chunks a [`Recent`]'s budget is laid in. The oldest chunk goes whole to make room for the next,
@@ -237,7 +248,7 @@ impl Scratch {
 const CHUNKS_A_BUDGET: usize = 8;
 
 /// Objects read lately, by where their entries begin (module docs, "Objects read lately"): none kept past `budget`
-/// bytes, the oldest given back first. Their bytes lie in chunks of the mapped allocation's floor, laid end to end, the
+/// bytes, the one read longest ago given back first (one found kept laid again with the newest, [`Recent::refresh`]). Their bytes lie in chunks of the mapped allocation's floor, laid end to end, the
 /// oldest chunk given back whole (goal 93, main 01a20182's ruling of 2026-11-22 04:56): kept as a buffer each, a git/git
 /// push's 164,488 objects passed through the system allocator one by one, freed oldest first as newer came, and it kept
 /// 550-600 MB of them after the push. Each chunk takes the mapped path, so its going gives its pages back to the OS; an
@@ -284,6 +295,8 @@ struct Lent {
   at: usize,
   /// Their length.
   len: usize,
+  /// Whether a read found it kept before ([`Recent::refresh`]).
+  again: bool,
 }
 
 impl Recent {
@@ -310,6 +323,39 @@ impl Recent {
       self.keep_whole(place, kind, bytes);
     } else {
       self.lay(place, kind, &bytes);
+    }
+  }
+
+  /// Keeps the object at `place`, found kept and read back as `bytes`, as used lately (git's delta base cache gives back
+  /// its least recently used): one found kept before, whose chunk lies in the older half of the chunks, has its copy
+  /// laid again in the newest, so the oldest chunk's going gives back what was read longest ago, never what a walk reads
+  /// again and again (a base its chains share). Its old copy lies dead in its chunk until that goes, its index entry
+  /// moved, so a hot object is copied at most once each half of the chunks it lives through. An object found kept the
+  /// first time is only marked: a copy takes room until its old chunk goes, and a chain read newest first finds each of
+  /// its older revisions kept once and never again, where copying them gave back an entry the walk still read
+  /// (`a_fetchs_tree_reads_count_the_deltas_they_apply_and_build_a_chain_once`: 13 deltas for its 12-delta chain).
+  /// Main 01a20182's git/git leg of 2026-11-25: kept oldest-laid first, its read cache hit about 2 % of a clone's tree
+  /// reads.
+  fn refresh(&mut self, place: InPack, kind: Kind, bytes: &[u8]) {
+    let key = (place.pack, place.offset);
+    let Some((_, lent)) = self.objects.get_mut(&key) else {
+      return;
+    };
+    if !lent.again {
+      lent.again = true;
+      return;
+    }
+    let age = lent.chunk.saturating_sub(self.first);
+    let half = u64::try_from(self.chunks.len().checked_div(2).unwrap_or(0)).unwrap_or(u64::MAX);
+    if age >= half {
+      return;
+    }
+    let len = lent.len;
+    self.objects.remove(&key);
+    self.bytes = self.bytes.saturating_sub(len);
+    self.keep_copy(place, kind, bytes);
+    if let Some((_, lent)) = self.objects.get_mut(&key) {
+      lent.again = true;
     }
   }
 
@@ -372,6 +418,7 @@ impl Recent {
       place,
       kind,
       Lent {
+        again: false,
         chunk: number,
         at,
         len: bytes.len(),
@@ -389,6 +436,7 @@ impl Recent {
       place,
       kind,
       Lent {
+        again: false,
         chunk: number,
         at: 0,
         len,
@@ -513,6 +561,37 @@ impl Recent {
     self.charged
   }
 
+  /// The budget that keeps `bytes` of objects whatever its chunks hold idle. At a moment two chunks keep nothing: the
+  /// oldest, given back whole to make room for the next, and the newest, whose room is not yet laid
+  /// ([`CHUNKS_A_BUDGET`]'s doc). Each is as long as the budget lays them ([`Recent::chunk_len`]): the mapped
+  /// allocation's floor where the budget is at least [`CHUNKS_A_BUDGET`] floors, so the budget is `bytes` and two
+  /// floors; else a [`CHUNKS_A_BUDGET`]th of the budget, so `bytes` is the rest of its chunks' share, `bytes` times
+  /// [`CHUNKS_A_BUDGET`] over its chunks less the two. Sized for what it keeps alone, a fetch's cache gave back a base
+  /// its revisions shared each time its chunks turned over (`a_fetchs_tree_reads_count_the_bases_they_inflate_whole`:
+  /// 23 bases inflated of 117 reads, 9 distinct).
+  ///
+  /// Derived: the idle chunks, the one going and the one laid; their length, the floor or the budget's share.
+  pub fn budget_keeping(bytes: u64) -> u64 {
+    let to_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    let (going, laid) = (1u64, 1u64);
+    let idle = going.saturating_add(laid);
+    let (floor, chunks) = (to_u64(slates_mem::large::floor()), to_u64(CHUNKS_A_BUDGET));
+    let floored = bytes.saturating_add(floor.saturating_mul(idle));
+    if floored.checked_div(chunks).unwrap_or(0) >= floor {
+      return floored;
+    }
+    // Rounded up, so the budget's share less its idle chunks is never a byte short of `bytes`.
+    let busy = u128::from(chunks.saturating_sub(idle).max(1));
+    u64::try_from(
+      u128::from(bytes)
+        .saturating_mul(u128::from(chunks))
+        .saturating_add(busy.saturating_sub(1))
+        .checked_div(busy)
+        .unwrap_or(u128::MAX),
+    )
+    .unwrap_or(u64::MAX)
+  }
+
   /// The most bytes it keeps.
   pub fn budget(&self) -> usize {
     self.budget
@@ -567,12 +646,14 @@ pub fn read(
 ) -> Result<Kind, PackedRefused> {
   scratch.chain.clear();
   scratch.found_kept = false;
+  scratch.base_inflated = false;
   let mut at = place;
   let (kind, base) = loop {
     if let Some((kind, kept)) = scratch.recent.get(at) {
       scratch.built.clear();
       scratch.built.extend_from_slice(kept);
       scratch.found_kept = true;
+      scratch.recent.refresh(at, kind, &scratch.built);
       break (kind, None);
     }
     let (header, data) = header_at(store, at, format, (&mut scratch.header, room))?;
@@ -617,6 +698,7 @@ pub fn read(
   // A base whole in a pack is inflated now; one held whole outside every pack is in `built` already.
   if let Some(link) = base {
     inflate_into(store, link, room, &mut scratch.built)?;
+    scratch.base_inflated = true;
     scratch.recent.keep_copy(link.entry, kind, &scratch.built);
   }
   let Scratch {
@@ -916,6 +998,61 @@ mod recent_tests {
     assert!(recent.get(at(3)).is_some());
     assert!(recent.chunks.get(1).is_some_and(|chunk| chunk.whole));
     assert!(recent.held <= 4 * chunk());
+  }
+
+  /// Main 01a20182's order of 2026-11-26 (the read cache's capacity: its budget sized for what it keeps alone). Do: size a
+  /// budget for byte counts from a few chunks' share to past [`super::CHUNKS_A_BUDGET`] floors with
+  /// [`Recent::budget_keeping`], and read the chunks it lays. Expect: the budget less two of its chunks (the one given
+  /// back and the one being laid) still holds the bytes; at or past the floors' regime, exactly the bytes and two floors.
+  #[test]
+  fn a_budget_sized_to_keep_its_bytes_holds_them_past_its_two_idle_chunks() {
+    let floor = chunk();
+    for bytes in [64, 4096, floor / 3, 6 * floor - 1, 6 * floor, 40 * floor] {
+      let budget = Recent::budget_keeping(u64::try_from(bytes).unwrap());
+      let mut recent = Recent::default();
+      recent.set_budget(usize::try_from(budget).unwrap());
+      let idle = 2 * recent.chunk_len();
+      assert!(
+        recent.budget() >= bytes + idle,
+        "{bytes} B asked a budget of {budget} B, its chunks {} B",
+        recent.chunk_len()
+      );
+      if bytes >= 6 * floor {
+        assert_eq!(budget, u64::try_from(bytes + 2 * floor).unwrap());
+      }
+    }
+  }
+
+  /// Main 01a20182's git/git leg of 2026-11-25 (the fork's read cache, kept oldest-laid first, hit about 2 % of a clone's
+  /// tree reads: a base many chains share was given back as a deep miss laid its whole chain after it). Do: with a
+  /// budget of [`super::CHUNKS_A_BUDGET`] floor chunks, keep one object, then three budgets' worth of others a quarter
+  /// chunk each, reading the first again (found, and refreshed as `read` refreshes a hit) before each. Expect: the first
+  /// still kept at the end, and never past the budget. Red before: given back with its chunk, its reads no use.
+  #[test]
+  fn an_object_read_again_and_again_outlives_those_read_once() {
+    let mut recent = Recent::default();
+    recent.set_budget(super::CHUNKS_A_BUDGET * chunk());
+    let hot = at(0);
+    recent.keep(hot, Kind::Tree, vec![7; chunk() / 4]);
+    let fitting = 4 * super::CHUNKS_A_BUDGET;
+    for n in 1..=3 * fitting {
+      let (kind, bytes) = recent.get(hot).expect("the hot object kept");
+      let copy = bytes.to_vec();
+      recent.refresh(hot, kind, &copy);
+      recent.keep(
+        at(u64::try_from(n).unwrap()),
+        Kind::Tree,
+        vec![1; chunk() / 4],
+      );
+      assert!(
+        recent.held <= super::CHUNKS_A_BUDGET * chunk(),
+        "held past the budget"
+      );
+    }
+    assert!(
+      recent.get(hot).is_some_and(|(_, bytes)| bytes[0] == 7),
+      "the object read again was given back"
+    );
   }
 
   /// A-861's charge (main 01a20182, 2026-11-22 05:17: an uncharged holder makes the admission's numbers lie). Do: with a

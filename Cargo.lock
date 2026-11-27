@@ -1888,6 +1888,7 @@ dependencies = [
  "rustix",
  "slates-machine",
  "slates-mem",
+ "slates-pace",
  "windows-sys 0.60.2",
 ]
 

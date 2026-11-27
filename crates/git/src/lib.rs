@@ -43,6 +43,7 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 mod admission;
+pub mod away;
 pub mod delta;
 pub mod derived;
 pub mod entry;

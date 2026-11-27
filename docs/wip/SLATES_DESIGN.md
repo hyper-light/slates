@@ -1040,8 +1040,9 @@ volume requires a matching profile), `MeasurementTimeout`.
 **Derived constants.** Spin window = wake_ns.mean (Karlin: the 2-competitive threshold is the
 expected cost of parking, and the wake's heavy tail is part of that cost, not noise), the runtime's own
 spin-then-park; the daemon's idle window is §4.7's, which no estimate prices on Linux and macOS (A-223); the cooperative
-step quantum = wake_ns.mean — both as the prior of the online estimate a shard and a client refine
-from their own confirmed wakes (A-31), weighted over about 2^shift wakes with shift =
+step quantum = wake_ns.mean, at most half 84a's 1 ms loaded bar (A-928: a step is at most its quantum and the unit
+begun before its check, a unit within a quantum, so two quanta within the bar) — both as the prior of the online
+estimate a shard and a client refine from their own confirmed wakes (A-31), the estimate itself unbent by the ceiling, weighted over about 2^shift wakes with shift =
 ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉, the sample size at which the estimate is as
 precise as the probe asks of itself; shard count = performance-class physical cores minus one control core
 (minimum one); ring depth = ceil(arrival_rate × service_time × safety) from measured rates with a
@@ -10255,7 +10256,12 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > neither wedge nor end a daemon serving held mounts (the rule A-213 set for a closed one). Every other thread writes as
 > before. Regressions: `a_lone_daemon_whose_log_stalls_lives_on_and_serves` (`crates/client/tests/lone_daemon.rs`:
 > standard error held three windows while each shard logs; exit 4 within the stall before) and
-> `a_routed_thread_never_waits_on_standard_error_and_a_full_queue_refuses` (`crates/machine/src/log.rs`).
+> `a_routed_thread_never_waits_on_standard_error_and_a_full_queue_refuses` (`crates/machine/src/log.rs`). Since
+> 2026-11-25 the watchdog's end line is written past that lock as well (`watchdog::write_end_line`, the system's own
+> write), so a thread holding it no longer costs the verdict of an exit 4
+> (`a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_log_is_held`), and on Unix by the watchdog's own
+> thread within the beat, behind `poll` for `POLLOUT`, so the end waits on no thread being started or scheduled
+> (`a_lone_daemons_wedged_shard_ends_it_with_its_verdict_when_no_thread_can_start`, Linux).
 
 > **Status (2026-11-18, A-308): a wedge is judged only over a window the watchdog watched.** The rule calls a shard
 > wedged once a window passed with no CPU progress and never seen runnable, and "never seen" is sampled at each look. A
@@ -15404,7 +15410,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    pushback (decision 8). Status (A-731): a version a work submits to a line's green is the changeset the server
    makes of it (`vcs_store::hg_made`, as 7.2's `commit` writes one), recorded in the submit's transaction
    (`Source::Made`) and its line's head until a push on top is the newer version; merged requests, rebases and
-   pushback owed.
+   pushback owed. Its changegroup is taken by the push's own intake in the made commit's task, a slice a step, a want
+   of the node's changeset store (a parent's text a push let go) answered by awaiting the store, and a store that
+   answers nothing refuses the version in the store's own words (`Unmade::Store`), never `NotHead`
+   (docs/bugs/2026-11-25-a-made-changeset-over-a-let-go-parent-was-never-made.md).
 7. Markers and their exchange; topics as review requests.
 8. Access and hooks: the repository's rules, acl's, the narrow ACL, the admission and observing hooks, the built-in
    ones.
@@ -32161,6 +32170,25 @@ shard routed, stopped after them).
   without end.
 - **What it does not change.** The watchdog's verdicts, window and ends (A-228, A-232); the lines' text; the CLI's, the
   anchor's and every other thread's direct writes, whose order with their output stays as it was.
+- **The end's line (2026-11-25, main's order after w-hg's exit 4 with no verdict).** The watchdog's end line is written
+  past the process's standard-error lock too: its writer thread writes the line with the system's own write to the
+  descriptor (`rustix::io::write`; `WriteFile` on Windows), a part at a time, and the end still waits at most a beat for
+  it (`watchdog::write_end_line`). Through the lock the verdict was lost behind any thread holding it: w-hg's 28-module
+  run at loads 21 to 27 exited 4 with no end line, and the red
+  `a_lone_daemons_wedged_shard_ends_it_with_its_verdict_while_the_log_is_held` (`crates/client/tests/lone_daemon.rs`,
+  the lock held for good from the wedge) exited 4 without the line, 1 of 1, before; the line is read after. A pipe
+  nobody drains still blocks the write itself, which the beat bounds.
+- **The end's line from the watchdog's own thread (2026-11-25, main's ruling after the line was lost at load 124).**
+  The writer thread was not scheduled within its beat at load 124, and the line was lost again (w-hg's guarded run,
+  `~/.local/state/w-hg-logs/2026-11-25-guarded-modules-exit4-b.log`); a writer that could not be spawned was skipped. So on
+  Unix the watchdog's own thread, already running as it judges, writes the line in parts of at most `PIPE_BUF` bytes,
+  each behind `poll` for `POLLOUT` bounded by what is left of the beat (an interrupted wait or write taken again), and
+  then exits: no thread is started for it. Red where it is deterministic:
+  `a_lone_daemons_wedged_shard_ends_it_with_its_verdict_when_no_thread_can_start` (Linux, new threads refused by
+  `RLIMIT_NPROC` from just after the wedge). Measured on CI run 45762765907 (diag-a305-nproc, ubuntu-latest and
+  ubuntu-24.04-arm, uid 1001, the limit bound on both): green at f582d50bf in 2.53 s and 2.71 s; red with 48e8f83a5's
+  `watchdog.rs`, "exited (exit status: 4) without the watchdog's end line", on both. Windows has no wait for a pipe's write side, so its arm keeps a writer
+  thread bounded by the same beat.
 
 ### A-308 — The watchdog judges a wedge only over a window it watched (2026-11-18, goal g251: every open slates bug fixed)
 Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 entry), `crates/server/src/watchdog.rs`
@@ -46619,6 +46647,20 @@ Applied in the same change to:
   (unstartable, not found). Red on a mutated copy, each caught by its test: no kill at the runner's kill (the deadline
   test ran to the test's own bound), no kill of leftovers (the child outlived the run), the client's leaving never seen
   (the first run never ended).
+- **The bound rests on enough runs (2026-11-25, w-git for main 01a20182, its ruling on A-622).** A hook's learned
+  bound held its second run: one finished run taught the tail of that one sample plus a liveness window. Main's 8a
+  loop showed the cost: a `post-revprop-change` (`cat > post.in`) whose first run took a few milliseconds was held to
+  about a window, its next run under load was killed past it (exit 9), and the PROPPATCH answered 500. A kill before
+  the client's own deadline saves the client nothing and fails its verb. Now `HookTimes::bound_ns` answers no bound
+  until `RUNS_FOR_A_BOUND` runs have finished: the bound claims the 99th percentile of its hook's runs
+  (`BOUND_QUANTILE_PERCENT`), and with `n` runs the largest is at best about the `n/(n+1)` quantile, so `q/(1 − q)` =
+  99 runs. Until then a run's deadline is its operation's own, its client's connection: every hook here runs inside its
+  client's request (git's `post-receive`, Subversion's `post-commit` and `post-revprop-change` answer it). Once the runs
+  are in, the learned bound cuts as before, backing off on each cut. Red:
+  `vcs_http::daemon_edge::tests::a_revprop_hook_slower_than_its_one_fast_run_is_not_killed`, a `post-revprop-change`
+  fast once and two windows slower the second time: the second PROPPATCH 500, "exitcode was 9", under the one-sample
+  rule; 207 now. The hung hook's red stays (`a_hook_past_its_learned_bound_is_killed_with_its_group_and_reaped`, its
+  times taught the full count).
 - **Owed:** the Windows driver (a job object for the hook's descendants and `slates_ipc::win_spawn`'s handle-list
   spawn); the launcher's namespace for a hook on Linux (§4.6); the push pieces' calls, each with its view and its tool's
   words for the outcomes; the hook times' table on the owner shard, one a configured hook.
@@ -58833,7 +58875,11 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > `Payload` its slice of the changegroup, `Texts` its texts; what the texts charged the push's admission is given back
 > once each lands. Segments land at the repository's next sequences, which its owner shard allocates, other landings
 > between them; the push's entry names them as ranges (record v11), and a restart replays exactly those, each record's
-> rows by node over the index as it stands then. The repository's landing turn (Subversion's, which Mercurial's made
+> rows by node over the index as it stands then. Since ruling R piece (i) (2026-11-26, A-929) each segment's `Record`
+> and `Payload` are homed in the region before it lands and the entry names one homed segment list (record v12, since
+> the same day v13, which names the push's attempt too), which replaced v11 outright: v11 and v12 are no longer read. Since piece (ii) (same day) the segment is homed as it landed, its `Texts`
+> with its `Record` and `Payload`, and a holder lands the owner's segments verbatim from the region before it replays
+> them (A-929). The repository's landing turn (Subversion's, which Mercurial's made
 > changesets hold too) is taken for the entry's commit alone: a fork another landing made stale is re-based by node
 > first, off the turn, and once more holding it at most. Readers see only what an entry names. A run no entry names
 > is forgotten as it ends. The store drops its rows and retains every payload another changeset still holds (C3).
@@ -59566,6 +59612,27 @@ C1's, keeps the paths the verb's fetch holds only lengths of), `verbs.rs` (`edit
   polls' length histogram; `futures`; `tests/pacing.rs`), `crates/merge` (`pace`, `push`), `crates/git`
   (`receive::works`), `crates/server` (`git_push`, `daemon`, `content_ranges`: the runtime's counters as status rows),
   `crates/cli/bench/pacing_ab.py` (new), §4.3, GAPS, BENCHMARKS.md, amendments.tsv.
+- **The ask harvests I/O once a harvest period (2026-11-25, w-git for main 01a20182, its ruling on the period).** A
+  3 s sample of git/git's clone waiting for its first pack bytes found the encoding behind the push spending 39 % of
+  its time in the `kevent` of `harvest_io` under `others_waiting` (375 of its 951 samples): one ask a quantum, as
+  built, but the quantum is the wake estimate, a few microseconds, raised to the ask's own measured cost, so asking
+  could take half a step. Now an ask looks at the inbound rings, the ready queue and the step's batch, due timers,
+  ready pollers and the driver's pending completions every time, and harvests I/O only once the last harvest (by any
+  path) is `ShardContext::harvest_period_ns` old: `P = max(c, o)`, `c` a harvest's cost measured as the pace measures
+  its probe (`slates_pace::UnitCost`), `o` the shard's measured scheduler overrun. No waiter on the shard is woken more
+  precisely than the scheduler lets it run, so a harvest sooner than `o` buys nothing, and a harvest takes at most
+  `c / o` of a paced step; on a quiet host every ask a harvest's cost apart harvests, as before. Its cost: a socket's
+  arrival mid-step is seen up to `P` later, never past the step's end (where the run loop harvests); a ring's word, a
+  due timer, a ready task or poller at the next ask, so the client ring path is untouched. The first rule tried, `P =
+  c / s` with `s` the pace's target error (`slates_pace::target_ppm`, moved there from the server so the runtime reads
+  it), fell at both ends: `s` clamps to the whole wherever the overrun passes a quantum, so every ask harvested under
+  load, and to a part in a million on a quiet host, so `tests/pacing.rs`'s
+  `a_connection_arriving_on_a_busy_shard_is_seen_waiting` saw no connection for its 2 s. Counted:
+  `Counters::paced_harvests` beside `waiting_asked`. Reds (`shard::harvest_tests`):
+  `a_loaded_shards_asks_harvest_io_once_its_overrun`, the overrun held at 200 µs and the loop asking for 4 ms, 219
+  harvests of 219 asks before, the harvests within the time over the period plus one now, the asks many more; and
+  `a_quiet_shards_asks_a_harvests_cost_apart_each_harvest`, every ask harvesting with no overrun. Main judges it on the
+  interleaved git/git A/B: first pack bytes, and the VCS edge's socket latency under load against the overrun.
 
 ### A-791 — A volume over an S3 base is made through the wire, its credential handed with the create (2026-11-20, w-k90-whp; main's dispatch 15:52 PST, goal 92's A-555 parts 2 and 3; §4.15 "An S3 base", A-464, A-524, A-555; R1, R3)
 > **Removed (A-795, 2026-11-20).** The S3 base this entry built is removed whole (Ada: never asked for; she said
@@ -60587,6 +60654,25 @@ Applied in the same change to:
   to 47.6-52.6 s at 1,000 clients (hot files change several times a second), past its doubling deadline, where a turn's
   share is all that is left: steps of up to the ceiling for the rest of the run. Reverted; owed again with a slice that
   keeps a hot file's partial short and a share past the deadline that stays bounded (main's 23:50 ruling).
+- **The share past the deadline, bounded (A-920's checkpoint piece, w-svn for main 01a20182, its ruling of 2026-11-26).**
+  A wide import's checkpoint task (`merge_service.rs:359`) held its shard 400,899-405,990 µs in one fold step (debug, a
+  7,441-key backlog), its turn's budget everything left once the deadline had passed (`left.max(quantum)`), and its
+  spread share 40-44 ms before it. `turn_budget_ns` now clamps the share to between the quantum and the step ceiling
+  (`config::STEP_QUANTUM_CEILING_NS`, A-928's cap, half 84a's loaded bar), and past the deadline a turn takes the
+  ceiling, never everything left. A key's hash stays the unit (no slicing inside a key: d4c7e1f42's lesson), so a turn
+  takes keys until the next would pass its budget, at least one. The checkpoint then lands later, by its backlog over a
+  ceiling-turn's keys; the chain's cap stays the hard bound (`Doubling::Now` at the cap), so nothing grows without end.
+  Measured after (debug, the three wide tests): no checkpoint task's poll is the shard's longest any more, and a
+  checkpoint took 477-686 ms in turns (`in_turns_longest_ns`, which the wide tests print). Red first:
+  `a_folds_turn_budget_spreads_what_is_left_over_the_turns_before_its_deadline` expects the ceiling past the deadline
+  and for a share past it (red: 80 ms, everything left). The begin's build and encode (`CheckpointHold::begin`), first
+  taken for the 428 ms, are 1.6 and 1.2 ms (debug, 9,000 files, 512 KB): the 428 ms poll was the fold in the same task.
+  Main's A/B at A-579's Z, before and after, is owed (completion must not fall back into seconds).
+  An import's landing begins its checkpoints in their task's turns (`checkpoint_green_in_turns`), at its versions'
+  apply's end and its tail: `checkpoint_green` took the first fold and hold steps in its caller's step, 16 ms of one
+  landing poll (debug, 9,000 files), since a paced step with no one waiting runs on past its quantum (A-783). Other
+  callers keep the inline first steps. Counter `merge.checkpoint.begun_inline`: none from a wide landing in `t_c2c`
+  (red: one, before).
 - **The checkpoint by name, held in turns (A-579's last step, piece 1; main's order of 15:00, goal 93's, since it
   scales).** w-work-cow measured a 1 GiB green's checkpoint right after its sliced submit at 650-1,063 ms in one step:
   build 52, encode 71, record 527 ms of `db.mutate_owned`. That stalls the watchdog for any green that large, a big
@@ -63110,7 +63196,8 @@ Applied in the same change to: GAPS (the svn HTTP edge), `crates/svn/src/dav/sit
   owed record of key 0's version 2: refused `OwedCommit { key: 0, version: 2 }`, the store as the push left it; before
   this change the replay kept it owed, by reading, not run red). Moved to recorded submits (`paths::tests::
   submit_as_taken` and `recorded_git_submit`, which take the refinement through `refining::refined_now` and the made
-  commit through `commits::made_landing_now`): every git `version` of the paths, commits, identities and repository
+  commit through `commits::made_landing_now`; all three gone 2026-11-26, the submits awaited from tasks and the
+  refinement run by its task alone, since `refined_now` gave a job up over a let-go window): every git `version` of the paths, commits, identities and repository
   tests, the NUL message test and the copy of nothing. Removed: the two owed tests. `cargo test -p slates-server
   --lib -- vcs_store:: identities:: made_commit:: repository:: git_push:: refining:: verbs::` 389 of 389 in 7 of 10
   runs. One ended at the watchdog (exit 4: `t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step`'s
@@ -64028,7 +64115,9 @@ daemon}.rs`, `crates/server/src/vcs_http/{git,hg,svn,daemon_edge}.rs`, `crates/s
   - Fleet `a925_a_node_learns_its_peers_edges_as_each_bound_them`: three nodes, each with a git HTTP and an SSH edge at
     port 0. a learned b's edges as b bound them (127.0.0.1:60773 HTTP, :60774 SSH in the run), and a member it holds no
     record of got the typed refusal naming it.
-  - Unit `edges::tests::{an_edges_record_reads_back_whole_and_refuses_every_damaged_form,
+  - Unit `edges::tests::{an_edges_record_reads_back_whole_and_refuses_every_cut_of_it,
+    an_edges_record_refuses_a_trailing_byte_an_oversized_record_and_another_version,
+    an_edges_record_refuses_an_unknown_scheme_and_a_host_past_a_dns_name, an_edges_record_refuses_a_bind_address_and_port_0,
     a_node_announces_only_edges_a_client_reaches, an_https_edge_is_announced_only_at_a_name_its_certificate_carries,
     a_record_naming_another_anchor_is_refused_and_teaches_nothing}`.
   - `fleet::every_request_kind_the_record_session_dispatches_is_its_own`, with streams 32 and 33 added.
@@ -64132,6 +64221,16 @@ GAPS.
   against 1 and 47.3 ms, handed once. `vcs_http::daemon_edge::tests::a_ref_listing_during_a_derivation_behind_a_push_drives_none_of_it`:
   red with one count of every derive turn (100 → 117 across the listing); green, a reader's turns 0 → 0 while the task
   behind turned 364, the listing answered in 14.8 ms (its patience scaled by `test_lane::slowdown`).
+- **Whether any is due, from counts (2026-11-25, main 01a20182's sample).** A 3 s sample of git/git's clone waiting for
+  its first pack bytes found the encoding behind the push spending a third of its time in
+  `Repository::derivations_due` (309 of its 951 samples), which every derivation and encoding turn asks before it
+  begins one, and which walked every chain's versions to answer. It now looks at none: the repository counts the
+  versions it commits with no value of their own (`unvalued`, kept at `commit`'s one place versions are added; a
+  version's value is never set after), the memo holds derived sets for such versions alone, so derivations are due
+  while the memo holds fewer than that count. Red: `t_a614a_whether_derivations_are_due_is_answered_without_walking_the_versions`,
+  one ask after every version was derived looked at 9 of 9 versions (`StoreCounters::due_looked`); now 0, and due,
+  known and due again after `forget_derived` as before. The same sample's other third, the pace's I/O harvest on every
+  ask, awaits main's ruling on its period (A-783).
 
 ### A-917 — A recorded version is applied a slice at a time, and `apply_recorded` is that run carried to its end (2026-11-25, w-svn for main 01a20182, goal 93's slicing piece 3; §4.16, A-760, A-910)
 
@@ -64253,6 +64352,32 @@ GAPS.
   taken a unit a step holds `full.dump`'s history and exports it byte for byte
   (`every_dump_svnadmin_wrote_imports_alike_with_every_check_a_unit_a_step`; a resumed naming that skips a row
   fails it).
+  **2c, the plan's two whole parts begin a step.** The plan's begin (`Index::plan_begin`: the rows sorted, the new
+  root made; 3.4 ms whole at 9,000 files, debug) ran in the step its stored filter's last text ended, and its finish
+  (the revision built and checked as `Index::plan` checks it; 4.4 ms, debug) in the step its last row was applied in,
+  each past that step's quantum: release probe 5's check steps reached 1,030 µs twice in 413, probe 6's 1,368 µs
+  (15 of 1,673 over 1 ms). Each is now the first unit of a step of its own: the stored filter leaves the plan to
+  begin next (`CheckPhase::PlanBegin`, begun only as a step's first unit), and the plan's last row ends its step, its
+  finish taken at the next. Each is still whole (3.4-4.4 ms a unit in debug at a 4 µs quantum); release probe 7 reads
+  them. No test observes which step a whole part runs in; the dump oracle with every check a unit a step holds the
+  history.
+  **2d, the plan a unit a step.** Release probe 7 (99 runs at 67db69be9): the check's only steps over 1 ms were 2c's
+  whole parts alone in their steps (5 steps, 1,013-1,122 µs, at a quantum of 4-16 µs). `Index::plan_begin` now checks
+  the transaction's name and makes the new root, nothing more. `Index::plan_step` takes the rest a unit at a time:
+  - each row checked, as `Index::plan` checks it;
+  - the rows put in path order with no sort of the whole (`RowOrder`): their sorted runs found a row a unit (a dump
+    lists a revision's paths in path order), then merged by a heap of the runs a row a unit, a path met twice refused
+    `Duplicate` where its two rows meet;
+  - the rows applied in that order;
+  - the revision's paths numbered a path a unit, each event checked against the paths numbered so far (which is
+    `check_plan`'s check, made as each is numbered);
+  - its maps' bytes summed a map a unit;
+  - the rows put in path order in place, a swap a unit, then the plan checked against the room.
+
+  Counter: `Planned::units`, the units a plan took, more than its rows. Oracles: the proptest of a record planned a row
+  a step against whole, the dump oracle, and `a_record_listed_out_of_path_order_plans_a_unit_a_step_as_whole` (rows out
+  of path order, and a path listed twice refused alike both ways). Planted: a merge that drops its second row fails the
+  commit drive's and the index's tests.
 - **Piece 3, the judge** (89-92 ms at 9,000 files after piece 1: the reservation's history walk 19.6 ms and changes
   walk 10.9, `resolve` 11.6, `decide_units` 24.5, `Reached::of` 1.5, `position::verdict` 2.6, `commit_reads` 15.3),
   in parts. **3a, the commit's reads.** `commit_reads` is the check the commit's own preparation makes a slice at a
@@ -64382,6 +64507,108 @@ GAPS.
   after the head moved fails three tests. A list kept after a window appears fails none: no reader takes a conflicted
   verdict's list (`Computed::applied` answers none for it, the wire form writes the units, the hold reuses it only
   for an accepted verdict).
+  **3g, the verdict's gathering.** In release the judge's last step was the only one past 84a's 1 ms loaded bar
+  (1.32-1.52 ms, labelled release probe on bcb1e4106; 2.7 ms debug), and in it `position::verdict`'s gathering of
+  every unit's effects and windows into one list was 2.26 of the hold's 2.34 ms (debug; `since` and `at_head` 6 and 1
+  µs with nothing since, the held verdict built in 53). The hold is now `Green::hold_begin` (the cache's and the
+  checkpoint's answers, the units brought to the head), `holding_step` (each unit's effects and windows gathered, a unit
+  at least a step) and `hold_end` (the verdict held, or a conflict cached: the judge's one write, in its last step);
+  `hold_computed` is the three carried to their end, and `Green::unlent_rule` applies a hold's unlent reads alike to
+  the whole and the sliced judge, which keeps every step's. The judge's last step 2.7 ms → under 1 ms (debug, 2 runs,
+  load 22-26). Oracle: the applying and named oracles judge a unit a step; a resumed gathering that drops a unit fails
+  two of them.
+  **3h, the judge's release of its resolution.** After 3g one release step was still past the bar: the judge's third
+  step, 1,107 µs (labelled release probe on 02602af52, run 2; run 1's steps all filled a learned quantum near 0.73
+  ms). It was no work but a drop: the resolution and the decision's sets let go whole as the decision ended (9,000
+  paths with their ops, and the node-exclusive rule's 9,000 judged paths), 1.53 ms debug. They are now let go a unit
+  at a time before the reach begins (`Resolved::release_one`, its copies' resolution last; `Deciding::release_one`),
+  until the step is spent. In debug the judge's third step over 1 ms is gone (2 runs, load 22-32): its steps past 1
+  ms are its first unit (3.9) and its second (1.1-1.2, 0.33 ms in release).
+  **3i, the gathered lists sized once.** Release probe 5 (99 runs on 352866fca with each part timed, load 38-56) put
+  554 steps of every label over 1 ms. Two causes. First, the learned quantum itself was about 1.05 ms, which A-928
+  holds to half the bar. Second, the judge's gathering ran a median 0.27 ms past it (gather the largest part in 93 of
+  172 judge steps over 1 ms, median 1,320 µs): the list a held verdict gathers its units' effects into, and the one the
+  reach maps them into, grew as they were gathered, so the unit that crossed a doubling copied the whole list. Both are
+  now sized once at every unit's effects (`Green::hold_begin`, the decision's end in `computing.rs`). The hold's end is
+  40 µs median, 100 µs at most. Still past a quantum: the judge's first unit (`Green::decide_first`, every content
+  path's fit to its base walked whole; 557 µs median, past 1 ms in 39 steps), next.
+  **3j, the judge's first unit.** The first unit (`Green::decide_first`: the work's invalid operations and every
+  content path whose ops do not fit what they edit at its base, A-669's links naming the files it removes its
+  footprint) was one unit, whole, so its step walked every content path with a base-length lookup each. It is now
+  judged over steps. Its first asks whether it is judged at all (`position::Units::judges`, the peek `Units::unit`
+  decides by), so a unit taken as reached costs nothing, and finds the paths the work removes itself, which the
+  cleared phase then reuses. Each content path's fit is then a unit of the walk (`Green::content_fits`), the unfit
+  kept in the decision, and the unit is pushed whole when the walk ends, so the units are the same however it is
+  sliced. Oracle: `a_works_first_unit_walked_a_content_path_a_step_is_its_first_unit_decided_whole` decides a work
+  with fitting and unfitting writes whole and a unit a step. A walk that drops the path a step ends on fails it, and
+  no other test.
+  **3k, a unit's effects an effect at a time.** With each step's quantum printed (a debug probe at 4e048d71d, where the
+  test daemon's quantum is 4 µs, so every step is one unit), the gathering's one long step was one unit, 1,058 µs:
+  a unit can hold most of a work's effects (its copies' is one unit whole), and the hold moved them in one extend
+  and the reach mapped them in one go (probe 5's reach: 592 µs median, 978 at most). Both now walk a unit's effects
+  an effect a unit (`Holding::gathering`, `Reaching::effect_at`), a unit's windows taken as it is begun. Oracles: the
+  applying and named oracles' judges a unit a step fail when the gathering drops the effect a step ends on. A reach
+  that dropped it failed no test, so `a_verdict_reached_an_effect_a_step_records_what_the_verdict_reached_whole_does`
+  now compares what the chain records of a work computed whole and a unit a step: red with that drop (none against
+  five), green without.
+  **3l, one flat list a verdict.** With the gathering an effect a step (3k), its one long step was a single free. A
+  debug probe timing each operation of a gather step (at 4e048d71d, load ~50) read `judge 1219 us q 3 [g_swap 1204]`,
+  and 1,397 µs with `g_swap` 1,380 before: `g_swap` dropped the drained list of the unit before, of capacity at most 4,
+  since the work's 18,001 units hold 0 or 1 effect each. About 9,000 such lists were freed a unit at a time, and the
+  free that emptied the system allocator's region cost 1.2 ms of thread CPU wherever it landed. Release probe 6 (99
+  runs at ad01a4a61 with each step's quantum, load 66-88): the judge's only steps over 1 ms, one a run, are the
+  gathering's, 1,046-2,136 µs (median 1,271), many at a quantum of 4-77 µs, so each is one unit. A verdict's units are
+  now flat (`position::Verdict`): every unit's effects, windows and placements in three lists in unit order, each unit
+  its ends in them, written by its verdict function through a `position::UnitSink`. A unit allocates nothing of its
+  own. The hold takes the lists whole (`Green::hold_end`, the gathering gone), the reach maps them an item a step, and
+  a verdict judged again at a later head moves each standing unit's parts across in order. The wire form's bytes are
+  unchanged (`put_unit` writes each unit from its ranges, `units_from` builds the lists; nothing persists it, since it
+  rides a sealed work to its owner in memory), so its golden test is the proof. Counter: `Green::unit_effect_lists`,
+  the effect lists units allocated of their own, red first at 10 for a work of five effects computed whole and a unit
+  a step, 0 after (`a_verdicts_units_allocate_no_effect_list_of_their_own`). Planted: a standing unit that moves one
+  effect too few fails three position oracles.
+  **3m, the commit's beginning a part a step, its paths ordered with no tree.** Release probe 7 (99 runs at 67db69be9,
+  load 17-40, quanta mostly 2-5 µs): the judge's steps were all under 1 ms (at most 664 µs), and the only steps over it
+  were the check's whole parts (5 steps, 1,013-1,122 µs; 2c) and one commit step a run (97 steps, 1,120-1,864 µs, at a
+  quantum of 2-3 µs, so one unit each). A debug pass timing each commit unit named it: the preparation's last mapped
+  file, then in the same step `move_whole_runs` (107-110 µs over 9,000 runs) and `commit_begin` (`make_mapped` again
+  117, `node_moves` 37-51, `copy_link_effects` 25, `commit_copies` 39-51, and the changed-path set 730-778: 9,000
+  String clones into a tree, its nodes then freed as the commit's changes took them). The preparation now ends there,
+  and the whole runs are moved a run a unit (`Prep::Moving`). The beginning is its own phase (`Prep::Beginning`):
+  - each mapped file made a file a unit;
+  - the node moves, the copied trees' links and the copies each a whole part, run only as a step's first unit;
+  - the effects' paths put in order with no tree (`PathOrder`): their sorted runs found an effect a unit, then merged
+    by a heap of the runs a path a unit, each distinct path ranked;
+  - the commit's paths (`ChangedPaths`) are those ranks, each String made as its effect is applied, the one its change
+    entry keeps; the links and the changes walk them, the copies' paths and the links found by cursor, with no tree and
+    no clone of a path a unit (the links' walk had cloned each).
+
+  Counters: `Green::commit_tree_paths` (changed paths a commit put in a tree of its own), red first at 5 for a work of
+  five distinct paths, 0 after; a copy's paths still come as `commit_copies`' set and count there. And
+  `Green::commit_paths_made`, one a distinct path, so each String is made once
+  (`a_commits_changed_paths_are_ordered_without_a_tree_each_made_once`). Planted: a merge that never ranks its second
+  path fails fourteen oracles (position, copy, branch, fold, node-exclusive and replaced-node).
+  **3n, a work's named texts in one buffer.** Release probe 8 (198 runs at f930fe857, ambient and with 12 burners):
+  the commit's steps were the only ones over 1 ms, 71 of 202 ambient (1,012-1,473 µs) and 92 of 313 with burners,
+  one a run, each at a quantum of 4-10 µs, so each one unit. Debug passes named it:
+  - a Set unit, at a different file each run (the 2,096th, 2,579th, 3,550th), with no arena growing in it;
+  - all of it system time (`getrusage`: 947 of 959 µs, 1,226 of 1,237; one minor fault), so the allocator returning a
+    region to the kernel;
+  - for a file named for its run's object, `set_file` let go the run's own buffer, moved into the file's bytes: 9,000
+    frees of about 1 KiB, one a unit, and the free that emptied the region cost about 1 ms, whichever unit met it.
+    With those buffers kept instead of freed (a probe), the longest commit step was 364-410 µs in 3 of 3 runs.
+
+  A work's named runs are now read into one buffer (`named::Read`): each run takes its place as its first byte is read,
+  after the run before it (a read step finishes the first unread run before it begins the next), and the buffer's room
+  is reserved once at every run's total, its pages made only as bytes are read, so a run a replay leaves unread costs
+  none. A push's runs taken out of its inline bytes go into one buffer too (`push.rs`). A whole file named for its
+  run's object is given no bytes (`move_whole_runs`); any other takes a copy of its run's bytes, which it keeps. A held
+  verdict's copy of the runs is one buffer's copy (`Read::copied`), not a buffer each. Counter:
+  `Green::named_buffers_freed`, the byte buffers commits let go for named files, red at 8 for a work of eight named
+  texts with each given a copy, 0 now (`a_works_named_texts_commit_with_no_buffer_of_their_own_let_go`). The one free
+  left a work, of its one buffer, is measured by `crates/merge/examples/text_frees.rs` (a buffer each against one
+  buffer, every round printed; macOS debug: the longest single free of a buffer each median 8-37 µs, most 168-407 µs;
+  the one buffer's 0-1 µs; release on macOS and Linux is main's to run).
 - **Piece 4, the build** (51-55 ms at 9,000 files: `OpsDoc::canonicalize` 27.2 ms, the record's identity hash 13.4,
   the rows 12.3, the rest 2), in parts by size. **4a, the canonical order.** Nothing of an import's increment but its
   document's order depends on `canonicalize`, so its build leaves it unordered (`Building::build_unordered`; `build`
@@ -64391,6 +64618,320 @@ GAPS.
   generated documents of every op kind with hard links, declared in random order, the document canonicalized a unit
   a turn encodes as the one canonicalized whole, in more than one turn wherever it has more than one op
   (`a_document_canonicalized_a_unit_a_turn_is_the_document_canonicalized_whole`).
+- **Piece 6, the landing** (main's ruling of 2026-11-26: the import's landing is A-920's own). A runtime probe printing
+  every poll over 20 ms with its task's spawn site named the wide import's longest polls outside its staging steps
+  (debug, t_c2c at 9,000 files): the landing's entry, `Staging::record_landed`, 75 ms in one synchronous section, and
+  one poll of its versions' apply, 40 ms (the inline checkpoint's begin, the checkpoint's own piece, A-869). The entry's
+  parts: `unpin_texts` 14.3 ms over 9,000 texts, the scratch member's retire 16.9, then the append's increment encoding
+  3.4, its hold in the content store 23.6, its chain entry's encoding 12.5, and the register's op 8.5 (publish and
+  record). **6a, the unpin and the release.** The texts are unpinned a text a unit (`staging::unpin_some`), still
+  before the entry (a kill after the entry never reaches the tail; a kill between slices leaves texts unpinned whose
+  changeset is durable), and the scratch member is retired before the append, its release stepped a unit at a time
+  (`Greens::retire_preview_begun`, `staging::released_some`); the batch's commit and abandon then retire nothing more.
+  Counters: `LANDING_UNPIN_SLICES` and `LANDING_RELEASE_STEPS`, each more than two a wide landing in `t_c2c`; red with
+  both run whole (one slice each).
+  **6b, the append made ready before the register's op.** Each of the batch's versions is made ready by the landing a
+  unit a step (`Staging::prepared`, `push::Prepared`), at the version it takes after the green's head then: its
+  increment encoded (`Increment::encode_step`: its ops document a piece a unit, `OpsDoc::encode_piece`, its length
+  filled in after; its inline bytes a copy slice a unit; each evidence reference and named run a unit), held where its
+  chain entry names it (`merge_service::IncrementHold`: the encoding's chunks hashed a chunk a unit, the green
+  object's stage opened, each chunk copied in by `stage_lent_piece`, the stage completed; `hold_increment`'s identity,
+  charges and refusals), and its entry encoded (`chain_entry::encode_step`: the entry measured first a unit at a time,
+  `Measuring`, so its buffer is reserved once at its exact length, then an effect a unit). `append_versions` then
+  takes the versions made ready and does the register's one op alone (`publish_held_increments`, `record_all`); a
+  head moved since, a version not made ready, or any refusal before the op gives every hold back
+  (`push::release_prepared`). The wide tests print their longest poll's task (`registry::Pulse::longest_polling`, the
+  polling word copied only as a poll sets a new longest): after 6b it is the checkpoint task (`merge_service.rs:359`,
+  236-344 ms debug), the checkpoint's own piece (A-869, A-579). Oracles: an entry and an increment encoded a unit a
+  step are the ones encoded whole (`an_entry_encoded_a_unit_a_step_is_the_entry_encoded_whole`,
+  `an_increment_encoded_a_unit_a_step_is_the_increment_encoded_whole`), and the batch's commit tests through the same
+  preparation run whole (`staging::prepared_whole`). Counter: `LANDING_PREPARE_STEPS`, more than two a wide landing;
+  red with the preparation run whole (one step). `a_shards_longest_poll_names_its_task` (`slates-rt`): red with the
+  longest poll's task never recorded.
+- **Piece 7, the import's turn** (main's ruling of 2026-11-26: a turn's units, t1 then t2). The history task's longest
+  polls after 6b (debug, 9,000 files) were a turn's units: its parse, a copy slice of 68 KB of the dump a call, 3.9-5.3
+  ms each, since a dump's parse costs far more than its bytes' copy; and its close, `Importer::close_revision`'s
+  `revision_of` whole, 20.4 ms. **7a, an event a unit.** `Importer::import_within` stops after any whole event once the
+  caller's `spent` says its slice is spent, at least one event a call, and answers `Importing::NeedMore` with the bytes
+  done with and none more needed; `Importer::import` is it never spent. The import's `unit` passes its turn's deadline,
+  so a turn is units of events until its copy slice of time is spent. Counter: `vcs_store.svn_import.pauses`
+  (`svn_import::IMPORT_PAUSES`), more than two a wide revision in `t_c2c`; red at 0 with the call taking its whole
+  buffer. The landing's own step, `Staging::land`, is split into its parts (`recorded`, `let_go`,
+  `prepared_if_landed`, `applied`), each await-bearing part a helper, the order unchanged. The wide tests now print
+  their history's longest poll by the wall and by its thread's CPU (`cpu_timed`, `registry::calling_thread_cpu`
+  around each poll; main's order after probe 9, whose release longest steps of 22-98 ms were wall clock on loaded,
+  time-shared shard threads): in debug, after 7a, 27.3, 30.2 and 30.1 ms by the wall against 27.3, 27.0 and 29.6 ms
+  of CPU (add, copy, move), so held work, not a paused thread.
+  **7b, the close a unit a step.** A revision's close (`Repository::close_begin`, `close_step`, `records::Closing`)
+  makes its rows a path a unit, names their contents a row a unit, takes each named content the repository does not
+  hold out of the transaction a name a unit (a set, where a list's search made it quadratic), then names stored each
+  text the transaction set that the rows name, a row a unit. It stops between units once the caller's `spent` says so,
+  at least one unit a step. The importer keeps a stopped close (`Importer::closing`) and steps it first at its next
+  call, which answers `NeedMore` with none of the buffer done with and none more needed until the record is handed
+  over. `Importer::import`, never spent, closes whole in its call as before. Oracle:
+  `every_dump_svnadmin_wrote_imports_alike_with_every_close_a_unit_a_step` (golden: every close a unit a step,
+  `records::CLOSE_A_UNIT_A_STEP`; each dump holds the history `full.dump` makes closed whole and exports as `full.dump`
+  byte for byte). Planted bugs: a stop that drops the next path's row, and a stop that skips a row's stored text, each
+  red. Counter: `vcs_store.svn_import.close_steps` (`svn_import::IMPORT_CLOSE_STEPS`), more than two in `t_c2c`; red at
+  0 with the close whole. After 7b, every one of `t_c2c`'s turns is under 6 ms (debug), but its history's longest poll
+  is still 29-30 ms of thread CPU. It is the landing (`land_owed`), not a turn. A probe of every state borrow over 3 ms
+  (debug, kept in `~/.local/state/w-svn/logs/t2-probe-sites-kept.log`) named:
+  - `svn_commit::stage_texts`'s storing and hand-over (`storing_of`, `hand_over`), 14.2 ms;
+  - three paced steps past their deadline (`staging::until_done`), 10.7, 8.2 and 4.6 ms;
+  - `record_landed`, the register's op, 9.1 ms;
+  - the tail's end (`checkpoint_green_in_turns` and `fold_to_readers`), 7.4 ms;
+  - `apply_slice`, 4.5 ms;
+  - `retire_begun`, 4.5 ms;
+  - a staging step, 4.3 ms;
+  - the landing's text release, 4.2 ms;
+  - the checkpoint's turns, 5.0 and 3.9 ms.
+  The longest poll runs several of these with no yield between them. Owed: their release sizes (main's probe 10).
+  **Release probe 10** (main, at 9a8ab7387, after 7a and 7b; 99 runs of each wide test at load 21-31, then 99 with 12
+  burners at load 27-44, all rc 0; record `~/.local/state/main-01a20182/rounds/svn-probe10/summary.txt`). The longest
+  step's p50, p90 and p99 in ms, ambient then with burners, with probe 9's ambient figures in brackets:
+  - add: 3.04, 3.18, 3.31, then 2.96, 3.09, 3.36 [23.0, 72.2, 97.4];
+  - copy: 3.12, 3.57, 4.04, then 3.13, 3.84, 4.19 [23.6, 54.7, 85.7];
+  - move: 5.34, 6.45, 7.50, then 5.30, 5.85, 7.75 [39.2, 84.2, 97.3].
+  The history's thread CPU equals its wall time, and the burners leave it where it was: held work, not a preempted
+  thread. Every run of every test is still past 1 ms. Add's and copy's longest step is the history's (the landing's
+  sections, 3.0-4.2 ms of CPU). Move's is the checkpoint task's (`merge_service.rs:374`, 5.3-7.8 ms), so
+  `CheckpointHold::begin`'s build and encode is past the bar in release for a tree of copies and a move (main's next
+  order: a file a unit inside the hold).
+  **7c, each of the landing's sections a step of its own** (main's order after probe 10). A debug probe of every state
+  borrow over 300 µs inside each long poll named two chains: the storing's begin (`stage_texts`: `storing_of` and
+  `hand_over`, 15.4 ms) ran on into the carried texts (`texts_carried`, 14.3 ms, outside any borrow) in one poll of
+  31 ms, and each paced loop's last slice ran on into the section after it. Now `svn_commit::section_yield` yields,
+  counted, after the storing begins and before the carried texts, and `until_done` yields after its last slice. Three
+  paced loops ran units past their deadline. Each now stops at it:
+  - The preparation's hold hashed a content chunk a unit, up to 1 MiB (10.4 ms of one step, debug). It now hashes a
+    copy slice a unit (`IncrementHold::chunk_hasher`, `merge_origin::inputs_extent_hashed`). Oracle:
+    `an_increment_held_a_slice_a_unit_names_the_inputs_held_whole`, the same inputs as `hold_increment`. Since main's
+    finding of 2026-11-26, the hold takes its slice as an argument (`IncrementHold::unit`; the preparation passes
+    `copy_slice_bytes`), and the test passes a quarter chunk and asserts the exact count it makes, 15. Before, the
+    test read the shard's live copy slice: a loaded shard's slice is a chunk or more, so it took 8 units against
+    `> 8`, in w-hg's focused set at load 50-60. Red at 8 with a chunk's slice. The model is
+    `vcs_store/named_objects.rs`'s `read_step(&objects, slice)`.
+  - The chain entry's encoding hashed the whole entry in its last unit (4.7 ms, debug). It now hashes what each unit
+    writes (`chain_entry::Encoding::digest`). Oracle: `an_entry_encoded_a_unit_a_step_is_the_entry_encoded_whole`,
+    unchanged.
+  - The tail's first text release applied the greens' 9,000 pending name holds at one free decision (7.8 ms, debug).
+    `name_holds::apply_some` now applies them a hold a unit before the release, every take before any give, putting
+    those left first in line (`Greens::put_back_name_holds`), so a free decision between steps applies the rest whole
+    as before. Oracle: `a_drain_applied_a_hold_a_step_leaves_the_holders_applied_whole_leaves` (a drain that gives a
+    text back and takes it again: the same holders a hold a step as whole). Planted bug, red: the holds applied in
+    order, which frees the text before its take.
+  Counters, each more than two in `t_c2c`: `repository.svn_commit.landing_section_yields` and
+  `merge.name_hold.apply_steps`; red at 0 before. After 7c (debug), add's longest poll is 14.4 ms, its largest single
+  section (the storing's begin), where it had been 31 ms. In copy and move every long poll is one section. What is
+  left, each one section (debug, the probe's largest):
+  - a staging step (`staging::within_records`, its check, build, reads or judge), 29-30 ms for copy and move;
+  - the tail's end (checkpoint begun, `fold_to_readers`), 13-21 ms;
+  - the storing's begin, 14-19 ms;
+  - `texts_carried`, 14-19 ms;
+  - `record_landed`'s register op, 9.7-16 ms;
+  - `apply_slice`, `retire_begun` and the text release, 4-5 ms each.
+  These are to be sized in release next (main's order: each section left judged against the bar).
+- **Piece 8, the checkpoint's build a unit at a time** (main's order after probe 10: move's longest step, 5.3-7.8 ms in
+  release, was the checkpoint task's). A debug probe of `CheckpointHold::begin` on the move test read the green's
+  second checkpoint at 52.5 ms of one turn, nearly all of it the build (`Green::checkpoint`), 48.3 ms of that its two
+  copied trees' 18,002 keys. 21.8 ms went to gathering them: `every_key` walked every key of the green once a tree,
+  keeping those inside it. The rest was reading each key at the checkpoint's version. The encode was 1.0 ms.
+  **8a.** `every_key` now walks each map from the tree's root alone: a descent of each trie (`Dim::prefix`,
+  `Files::keys_with_prefix`, `Xattrs::iter_tree`) and a range of each history, with the same keys in the same order.
+  The build is `Green::checkpoint_begin` and `checkpoint_unit` (`engine::CheckpointBuild`), and `Green::checkpoint`
+  runs its units to their end:
+  - each copied tree's keys gathered, a tree a unit;
+  - each key read at the checkpoint's version, a key a unit (`copied_key`);
+  - then the rest made whole: the changed keys, the increments, the copies' records and the sum, the copied keys left
+    out of the changed ones, canonical.
+  Between units the green may take versions past the checkpoint's, which change nothing it reads. A fold past it or a
+  push owed ends it, unavailable. `CheckpointHold` builds it this way (`Making`), then encodes it in a unit of its own
+  before hashing. A gathering, the rest and the encoding each begin a step, never end one past its quantum. A copied key
+  is its own pace kind (`CHECKPOINT_KEY`). Oracles:
+  - `every_key_walks_its_tree_alone_and_finds_what_a_whole_walk_finds`: the keys a walk of every key finds, beside a
+    sibling `trunk-x` whose name begins with the trunk's. Planted bug, red: the in-tree filter dropped from the files.
+  - `a_checkpoint_built_a_unit_at_a_time_across_later_versions_is_the_one_built_whole`: versions accepted part-way, a
+    file made and a copied file unlinked inside the copy. Planted bug, red: a key read at the head, not the
+    checkpoint's version.
+  Counter: `merge.checkpoint.build_units`, more than two in the move test (18,006 in debug). After 8a the move test's
+  longest step is the history's (a staging step, 30-33 ms in debug), not the checkpoint task's (54 ms before). With the
+  import's own longest poll at 14.9 ms, the add test's longest step is now the daemon's shard start
+  (`daemon.rs:1274`'s `start_shard`, its sixth poll, 32.6 ms in debug), outside the import.
+  **Release probe 11** (main, at bdfcb33ff with 7c and 8a; 99 runs at load 43-58, then 99 with 12 burners at load
+  55-64, all rc 0; `~/.local/state/main-01a20182/rounds/svn-probe11/summary.txt`). The longest step's p50, p90 and p99
+  in ms, quiet then loaded:
+  - add: 1.59, 1.72, 2.31, then 1.60, 1.83, 2.09;
+  - copy: 2.87, 3.40, 4.11, then 2.83, 3.28, 4.02;
+  - move: 3.55, 4.16, 5.24, then 3.49, 4.11, 6.07.
+  The history's thread CPU is within 1-3% of its wall time. The longest step is almost always the history's own poll,
+  no longer the checkpoint task's on move.
+- **Piece 9, the staging's units on a copy and a move** (main's order after 8a: name the 29-33 ms staging step first).
+  Measured before any change (debug): on copy and on move it was the recording phase, `Recording::walk`'s row a unit.
+  An added or replaced directory's row (`svn_texts::held_by`) and a deleted or replaced one's (`released_by`) ran
+  `files_at` over the whole tree beneath it, 9,000 files in one unit: `After(0)` 21.6-30.6 ms, the move's `Before(1)`
+  21.4 ms. Move also had a build unit of 20.2 ms and commit steps of 4.9-12.1 ms, named next, before any change.
+  **9a, the walk a node a unit.** `svn_texts::FilesWalk` (`tree`, `file`) visits a node a unit: a file's text found, or
+  a directory's children put next in byte order. `files_at` and `file_at` run it to its end, and `held_walk` and
+  `released_walk` give a row's walk. The recording keeps a row's walk left part-way (`Recording::walking`) and takes it
+  up where it stopped. A directory's listing is still one unit, its children named at once by `Index::children`.
+  - Oracle: `a_moves_recording_walked_a_node_a_step_finds_the_texts_the_whole_walk_finds`. A move's rows walked a
+    node a step (`staging::walked_a_unit_a_step`) let go and hold the texts the whole walks do (`released_before`,
+    `held_after`), by path. Planted bug, red: a stop that ends its row.
+  - Gauge: `repository.svn_commit.recording_walk_most_files`, the most files one unit found, at most one in the copy
+    and move tests; red at 9,000 with a row a unit. Counter: `repository.svn_commit.recording_walk_units`.
+  - After 9a (debug), the copy test's longest step is 14.2 ms (30-33 before) and the move test's 23.4 ms, now its
+    build unit.
+  **9b, a deleted tree in the build a path a unit.** Named before the change (debug, the move test): the 20.2 ms build
+  unit was revision 3's last step. The `/trunk` Delete row (`Building::remove`, 13.7-14.4 ms) listed the green's
+  9,001 paths beneath it into `gone`; `engine.beneath` alone was 2.2 ms of that. Then, in the same unit, `finish`
+  made an Unlink or Rmdir op for each, 6.5-6.6 ms. Now a Delete row (`Building::remove_begin`) notes its own path and
+  lists the tree beneath, a unit, then notes it gone a path a unit (`Removing`, `gone_beneath_one`), the row ending
+  once its last path is. `Building::ends_some` then takes the restores and each gone path's op a unit each, before
+  `finish`'s tail. A replacement without history still notes its tree whole, since it remakes the node in the same
+  row (`replace`).
+  - Gauge: `repository.svn_commit.build_most_gone_a_unit`, the most gone paths one unit noted or made ops of. It is 1
+    in the move test, and 9,001 red with a Delete row noted whole.
+  - Oracle: `a_moves_build_a_unit_a_step_makes_the_green_its_build_whole_makes`. A move imported with every build
+    step spent after each unit, and with every build whole (`staging::BUILD_SPENT`), makes the same green, head and
+    identity. Planted bug, red: a step that stops inside a tree drops the rest (the import is refused).
+  - Move's commit steps were measured on revision 3 (`ImportBatch::stage_step`): reserve 12.3 ms in one call, judge
+    6.0 and 4.8, a committing step 8.3. They are inside `slates-merge`, to be named there next.
+  - Named inside `slates-merge` (debug, revision 3), kept on file until a release read says which leads:
+    - the reserve's `Green::copy_entry_room`, 11.6-11.8 ms: the whole increment resolved and its `copy_fixes` taken
+      in one call;
+    - the judge's `Resolved::finish_resolving`, 5.8 ms, and one `decide_some` unit, 4.9 ms;
+    - the commit's `Prep::Beginning` unit, 7.7-7.9 ms, twice.
+  **The phase tag** (main's order after release probe 12, where 9a moved copy's p50 by 4-7% and move's not at all, so
+  release's longest unit is not debug's). `svn_import::phase` is test support: each step of the import's history tags
+  its phase as it begins (`phase::tag`), as follows:
+  - `parse`, `owed`;
+  - `storing`, `storing.carried`;
+  - `stage.check`, `.identify`, `.build`, `.ready`, `.canonical`, `.bringing`, `.judge`, `.reserving`, `.judging`,
+    `.measuring`, `.committing`, `.recording`;
+  - `landing.place`, `.changeset`, `.unpin`, `.release`, `.prepare`, `.record`, `.apply`, `.identity`, `.tail_end`,
+    `.follow`, `.holds`, `.give_back`, `.purge`.
+
+  The history's poll timer (`cpu_timed`) charges each poll's time to the phases set in it, in order, by the wall and
+  by the thread's CPU. Each poll resumes in the phase its last one ended in, so the checkpoint task's polls on the same
+  thread are not the history's. The wide tests print the longest poll's spans:
+  `PHASES <test> wall_ns=<n> cpu_ns=<n> spans=<tag>:<wall_ns>:<cpu_ns>,...`. In debug: add's and copy's longest poll
+  was `storing.carried` (13.2 and 18.2 ms) and then `stage.bringing` (1.2 ms) in the same poll; move's was
+  `landing.tail_end` (21.7 ms) between brief `landing.identity` and `landing.follow` spans.
+  **Release probe 13** (main, at 932a0aa92 with the tag; the quiet half, 99 runs each, all rc 0; every leader's CPU
+  within 1% of its wall):
+  - add: led by `storing.carried` in 94 of 99 runs, its span p50 1.27 and p90 1.41 ms;
+  - copy: led by `landing.release` in 92 runs, 2.69 and 3.00 ms;
+  - move: led by `landing.tail_end` in 98 runs, 3.32 and 4.36 ms, at most 14.2 ms.
+  Main's order: slice all three, biggest first.
+- **Piece 11, the leaders of release probe 13.** **11a, the landing's fold a unit a step.** Named before the change
+  (debug, the move test): `landing.tail_end` was `fold_to_readers`, nearly all of it `Green::fold_history_before`
+  (7.5 ms folding nothing at floor 1, 23.4 ms releasing 9.3 MB at floor 3). Its parts:
+  - gathering the 9,001-9,003 paths the change index names: 0.7-1.8 ms;
+  - moving the versions passed below the change index's floor: 6.5 ms;
+  - folding the content histories: 4.0-14.6 ms;
+  - folding the other dimensions: 2.4-2.9 ms.
+  The count, `batch_landed`, the checkpoint's begin and the retention's settle were 1-16 µs each. Now the fold is held
+  in the green (`Green::folding`, `engine::Folding`). `Green::fold_begin` finishes any fold under way, raises the
+  floor at once (every read at or above it answers alike, folded or not) and begins. `Green::fold_some` then takes it
+  a unit at a time:
+  - each change-index entry's path gathered;
+  - the copies' kept fixes let go;
+  - each passed version's entry moved below the floor;
+  - each path's content history folded, each dropped value let go, each path left alone named whole;
+  - each path's other histories folded.
+  `fold_history_before` is that run to its end, and the old whole fold (`fold_paths_before`) is kept, test-only, as
+  the oracle it is held to. The landing's tail begins the fold (`svn_commit::fold_to_readers_begin`) and steps it
+  (`fold_to_readers_some`, counted `repository.svn_commit.fold_steps`, more than two in `t_c2c`; red at 2 with the
+  fold whole).
+  - Oracle: `a_fold_taken_a_unit_at_a_time_across_later_works_equals_the_fold_whole` (generated histories). One twin
+    folds whole; the other takes a few units and judges the next works with the fold part-way. They keep the same
+    head after every work, and at the end the same reads from the floor to the head, histories and counted bytes.
+    Chunk numbers are left out: a later release lets a new work's chunk take another number.
+  - Planted bug, red: a begin that does not finish the fold under way.
+  - After 11a (debug), the move test's longest poll is `storing.carried`, as add's and copy's are, no longer the tail.
+  **11b, a retired scratch member's own histories let go an entry a step.** Named before the change (debug, the copy
+  test): `landing.release`'s retire (`Lineage::retire`) unseated the member, took its maps and chunks for the stepped
+  release (1-6 µs) and dropped the rest of the green whole, 5.2 ms. The largest parts of that drop:
+  - `content_history`, 3.0 ms;
+  - `deltas`, 0.58 ms;
+  - `identity_dirty`, 0.57 ms;
+  - `identity_out`, 0.51 ms;
+  - `last_changed`, 0.50 ms;
+  - `latest_change`, 0.49 ms.
+  Now the retire keeps the rest of the green in the `Release` (`remains`). Once its holds are back,
+  `Lineage::release_step` lets the green's own maps go an entry a step (`Green::let_go_entry`: its histories, its
+  deltas, its change index, its identity's sets and its records, the largest first), then drops the emptied shell.
+  `Release::is_done` waits for them.
+  - Oracle: `a_retired_branchs_own_histories_are_let_go_an_entry_a_step`. Twin lineages retire the same branch of a
+    thousand files with a hundred changed; one drops the remains whole. The stepped one takes at least a step more
+    for each changed file, and both free exactly what the branch alone held.
+  - Red: 321 steps against 321 with the remains dropped at the retire.
+  **11c, the texts a changeset carries walked a unit at a time.** Named before the change (debug, the add test):
+  `storing.carried` was `texts_carried` in one unit. It made the set of the 9,000 texts put (4.2 ms), then read the
+  9,000 rows, carrying each text once at its first path (8.1 ms). Its end and the brought texts' first part
+  (`stage.bringing`, 1.1-1.3 ms) shared a poll. Now `texts_carried` is a walk (`svn_commit::Carrying`): a text put
+  noted, or a row read, a unit; a slice of the shard's budget a step; each step counted
+  (`repository.svn_commit.carried_steps`, more than two in `t_c2c`). `stage_texts` yields after it, so the staging's
+  next part begins a step of its own. A client commit's landing walks it the same way.
+  - Oracle: `the_texts_a_changeset_carries_walked_a_unit_a_call_are_the_whole_walks`. Rows whose texts were put, one
+    whose text was not, one text at two paths and a deletion give what the old whole walk carried, in order, a unit
+    a text put and a row.
+  - In debug the walk is now the step's: the add test's longest poll is the register's op (`landing.record`, 19.2
+    ms in one run), already on file as owed.
+  **Main's partial probe 14** (4 runs a test in release at 3e98db372, 11a alone, under another session's load). Move
+  was led by `stage.reserving` at 1.82-2.62 ms, against `landing.tail_end`'s 3.32 ms p50 in probe 13, so 11a took
+  about 40% off move's longest.
+- **Piece 12, the staging's reserve.** **12a, the copy entry room from the copy ops alone.** Named before the change
+  (debug, move's revision 3): `stage.reserving`'s whole step was the reservation's shares, and in them
+  `Green::copy_entry_room` was 11.5 ms. Of that, `Green::resolve` walked all 9,002 ops and 9,002 paths, resolving the
+  whole increment, while `copy_fixes`, the one copy's fix, took 13 µs. A resolution's copies are its copy ops' alone:
+  `declare_copy` makes them, and the resolution's end (`split_copies`) moves other ops into their trees, never a copy.
+  So the room now resolves the copy ops alone (`Green::resolve_op` on each), the same copies and fixes.
+  - Oracle: `the_copy_entry_room_from_the_copy_ops_alone_is_the_whole_resolutions`. A copy from before a change, with
+    edits beneath; a copy of the head; two copies each with a fix, one inside the other's tree; and none. Each gives
+    the room the whole resolution gave.
+  - Planted bug, red: only the first copy op resolved, 44 bytes against 88.
+  - After 12a (debug), the move test's longest poll is `storing`, the storing's begin (`stage_texts`' `storing_of`
+    and `hand_over`, 14.0 ms), already on file.
+  **Release probe 15** (main, at 5d9a36bd1 with 11a-12a; 99 quiet runs at load 34-53, then 99 with 12 burners at
+  load 34-70, all rc 0; CPU equals wall on every leader). The longest step's p50, p90 and p99 in ms, quiet then loaded:
+  - add: 1.43, 1.59, 2.11, then 1.43, 1.64, 2.60;
+  - copy: 1.65, 2.02, 2.36, then 1.62, 1.91, 3.72;
+  - move: 1.46, 1.67, 2.79, then 1.45, 1.77, 2.38.
+  Against probe 13's 1.59, 2.72 and 3.49 at p50. The leader is `storing` in 99, 31 and 95 of the quiet runs (p50
+  about 1.4 ms), then copy's `landing.release` (1.60 ms) and the register's op (`landing.record`, which leads more
+  runs under load). Outside the history: the shard's start (`daemon.rs:1274`), the harness's observe closure
+  (`test_store.rs:157`) and a task spawned at `daemon.rs:5829`.
+- **Piece 13, the storing's begin.** **13a.** Named before the change (debug, the add test), the storing's begin was
+  one unit:
+  - `storing_of` built a length map over the revision's 9,000 rows for the 0 texts an import hands it, 5.4 ms;
+  - `hand_over` took the sink's holds on the 9,000 imported texts as put, each checked against the records, 10.5 ms.
+  Now `storing_of` returns at once with no texts to store, and the hand-over is a walk (`svn_commit::HandingOver`): a
+  text taken or kept spare, then a spare text unpinned and given back, a unit each. It is a slice of the shard's
+  budget a step, each counted (`repository.svn_commit.hand_over_steps`, more than two in `t_c2c`; red at 1 with the
+  hand-over whole).
+  - Planted bug, red in `store_tests`: every other imported text skipped. A killed batch's recovery and a clean
+    restart's named texts both fail; the import tests alone did not catch it.
+  - After 13a (debug), every wide test's longest poll is the register's op (`landing.record`, 9.0-10.0 ms).
+  **Release probe 16** (main, at cb73f520b with 13a; by the history's own longest poll, A-920's measure; 99 quiet runs
+  at load 33-42, then 99 with 12 burners at load 42-62, all rc 0):
+  - add: p50 705 µs and p90 1,106 quiet, then 713 and 912 loaded; over 1 ms in 12 and 7 of 99. Led by
+    `stage.recording`, then the register's op (`landing.record`).
+  - copy: p50 1,578 µs; led by `landing.release` in 98 of 99.
+  - move: p50 1,090 µs; led by `stage.committing`, then `landing.apply`, then `landing.record`.
+  **The landing release's units, timed** (main's order). Each unit of a landing's release of its scratch member is
+  timed by the wall and by the thread's CPU (test-only, `svn_import::phase::release_unit`). The wide tests print the
+  longest: `RELEASE <test> unit_wall_ns=<n> unit_cpu_ns=<n> units=<n>`. In debug, copy's longest unit is 1.3-4.3 ms,
+  its CPU its wall, against 19-36 µs in add and move. Probes of each unit's kind and each map's pop find none large:
+  a history chunk at most 2 µs, a map node 26, a remains entry's pop 20, the emptied shell 15. The long unit lands on a
+  different kind from run to run. That fits a free that empties an allocator region, its kernel work counted as the
+  thread's CPU, but it is a claim until a read of system against user time names it.
+  Since then the line splits the longest unit's thread CPU into user and system time
+  (`slates_rt::registry::calling_thread_user_system_ns`, macOS's `THREAD_BASIC_INFO`, none elsewhere):
+  `RELEASE <test> unit_wall_ns=<n> unit_cpu_ns=<n> unit_user_ns=<n> unit_sys_ns=<n> units=<n>`. In debug, move's
+  longest unit read 3,016 µs of CPU, 3,012 of it system and 5 user: kernel work in the unit, as a free that empties an
+  allocator region would be. If release shows the same, the fix is in how memory is given back (the region kept, or
+  returned off the shard's step), not in the release's walk (main's ruling).
 
 ### A-924 — A child is started by the daemon's spawner, so a spawn costs the calling shard nothing that grows with the daemon's descriptors (2026-11-25, w-git for main 01a20182, its rulings of 2026-11-25 on 8a-hook-exit; amends A-622's driver and `slates_ipc::confined_spawn`; R1, R3, R8)
 
@@ -64721,3 +65262,226 @@ measured noise of the 100 figure, not a literal.
 - **Models.** None of `docs/wip/models/` models a give-up's record or a verb's refusal of it; no spec changed.
 - **Applied in the same change to:** `crates/server/src/{state,repository,merge_service,verbs}.rs`,
   `crates/server/src/repository/push.rs` and its tests, A-304's entry, GAPS (A-915's entry).
+
+### A-928 — A shard's step quantum is its wake estimate held to half 84a's loaded bar (2026-11-25, w-svn for main 01a20182, its rulings of 2026-11-25 on release probe 5 (a) and (b); goal 93, 84a; amends §4.3's derived quantum and A-31)
+
+- **Why.** A step runs to the first check at or past its quantum, so it is one quantum and the unit begun before that
+  check. The quantum is the shard's online wake estimate (§4.3, A-31), seeded with the boot probe's mean wake, and the
+  daemon's fixed step budget is that mean too. Load delays wakes, so it grows both, and nothing bounded them. In A-920's
+  release probe 5 (99 runs, load 38-56) the learned quantum read about 1.05 ms: every step that filled it, of every
+  label, was past 84a's 1 ms loaded bar, which goal 93 holds each step to. 554 steps were over 1 ms. While the quantum
+  stands above the bar, no slicing meets it.
+- **The change.** `WakeTracking::quantum_ceiling_ns` bounds `ShardContext::quantum_ns`, the estimate min the ceiling,
+  so the harvest cadence, the long-step count and every cooperative slice (`step_budget_ns`,
+  `DaemonConfig::step_quantum_ns`) read the bounded quantum. `wake_cost_ns` stays the estimate, since what a wake
+  costs (a hold's pay-off, the counters, the pulse) is not a step's length. The daemon derives the ceiling as
+  `STEP_QUANTUM_CEILING = LOADED_LATENCY_BAR / 2 = 500 µs` and holds its fixed step budget to it too, so the boot's
+  slices are sized by it. The runtime's own configuration has no ceiling (`NO_QUANTUM_CEILING_NS`).
+- **The formula and its premise.** A step is at most its quantum plus one unit. A unit is sized within a quantum, so a
+  step is at most two quanta, and 2q ≤ bar is q ≤ bar / 2. Each slicing's own size holds a unit there: a copy-bound or
+  hashed slice is half the live quantum at the machine's measured rate; a paced walk's unit is one key, path or
+  effect; and a gathered list is sized once (A-920 3i), so no unit's extend copies the list at a doubling (probe 5's
+  gather ran 0.27 ms past the check before it). The import judge's first unit was not (`Green::decide_first`,
+  557 µs median, past 1 ms in 39 steps), and A-920 3j walks it a content path a step. A quiet wake is 1.7-10 µs (A-223), so the
+  ceiling binds only under load.
+- **Tests.** Red first: `a_wake_learned_past_the_bar_steps_by_the_quantum_ceiling` (`crates/rt/tests/wake_estimate.rs`)
+  tracks a shard whose estimate stands at 2 ms, with a 500 µs ceiling. With the field present but unread, its task's
+  `step_budget_ns` was `Some(2000000)` against `Some(500000)`. It now reads the ceiling, the wake cost stays 2 ms, and
+  a shard with no ceiling steps by its estimate. `a_quantum_learned_past_the_loaded_bar_is_held_to_half_of_it` (server
+  `config`) holds a 2 ms boot's budget to the ceiling and leaves a 10 µs boot's its own, both estimates ceilinged.
+- **Owed:** main's macOS 84a round, since the ceiling changes loaded latency; release probe 6, each step judged against
+  the quantum it ran under; and the loaded long-step counts, which a smaller loaded quantum can raise.
+- **Models.** None of `docs/wip/models/` models the step quantum; no spec changed.
+- **Applied in the same change to:** `crates/rt/src/runtime.rs` (`WakeTracking`, `NO_QUANTUM_CEILING_NS`),
+  `crates/rt/src/shard.rs` (`quantum_ns`, `wake_cost_ns`), `crates/server/src/config.rs` (`LOADED_LATENCY_BAR`,
+  `STEP_QUANTUM_CEILING`, `hold_quantum_to_bar`), `crates/merge/src/engine.rs` and `engine/computing.rs` (A-920 3i's
+  sizing), §4.3's derived constants, A-920's 3i, GAPS (84a's step quantum).
+
+### A-929 — A new Mercurial line owes its push and is made when first reached, through the one door: P2's Mercurial half (2026-11-26, w-hg for main 01a20182, its ruling (A) of 2026-11-26 on the many-heads push's (2) and (3); A-812, A-823, A-857, A-618, A-641)
+Applied in the same change to:
+- `crates/hg/src/push/tree.rs`: `changeset_tree`, the name an owed push gives a changeset's tree (its node); a
+  `Layout` laid out for an owed push (`Layout::lay_out_owed`, a changeset a call), each changeset resolved to its root
+  directory (`Trees`' roots), and lent as the build's objects for a turn (`Layout::lend`); the file revision a turn
+  waited for asked of the node's changeset store (`Layout::waited`). Held by
+  `push::work_tests::a_lines_owed_push_materialized_is_the_eager_work_byte_for_byte`.
+- `crates/server/src/repository/hg_push.rs`: a new line is `BranchChange::CreateDeferred` (`owed_line`), its work never
+  built at the push; its trees laid out at materialization (`owed_layout`, a let-go changeset or manifest text read from
+  the node's changeset store and given in its object's place, as a push's work's layout reads one) and lent
+  (`lend_owed`); a waited file text brought back (`text_brought_back`, the push's own); a push moving a line that owes
+  makes it through the door first (`built_works`, `green_ready::made_for`), pinned until the push ends.
+- `crates/server/src/vcs_store.rs`: `with_owed_push_objects` takes the owed line's layout beside its repository and
+  lends Mercurial's objects through it; git's unchanged.
+- `crates/server/src/vcs_store/hg_made.rs`: `head_of` answers a line that owes its push from the debt's head, so a
+  push's read of the lines and the served view's bookmarks never materialize one.
+- `crates/server/src/green_ready.rs`: a Mercurial line's trees laid out before its build's first turn (`laid_out`),
+  kept for its turns and dropped at its end; a waited file revision asked and brought back (`Turned::Asked`,
+  counted `merge.green.materialize_texts_asked`); the first read's wait counted most
+  (`merge.green.materialize_wait_ns_most`); pins (`Pinned`, `made_for`), never dropped back to owing by the bound
+  while held.
+- `crates/server/src/repository/push.rs`: a deferred create counts no miss; the record's version bytes counted most
+  (`repository.push.entry_versions_bytes_most`).
+- `crates/server/src/replica_build.rs`: a holder's replica of an owing line laid out and lent as its owner's (`laid_out`,
+  `Turned::Asked`; the replica half, below); `begin`, the build `wanted` begins, apart from it.
+- GAPS (the landing spin's (2) and (3); A-812).
+
+- **Why.** A push of a history with many heads made each new line from the line it branched from at the version read
+  before the push. In a fresh history that base is the empty `default`, so each new line's work was its whole tree: its
+  build and commit walked the tree (the landing spin's (3): 123 ms a line at 452 heads, debug), and its chain entry
+  carried the tree into the landing's one record, which grew with heads times tree (the landing spin's (2): 377 ms of
+  the 452-head step; w-hg's probe, 2026-11-26, debug: 32 lines of a 200-file tree, 33 versions in 329,007 bytes, about
+  10 KB a line for a one-file change). git's creates had owed their pushes since A-823; Mercurial was the one tool left
+  making a whole tree a new line, eagerly. Main ruled (A): P2 for Mercurial, over (B) (a create from a version its own
+  entry makes, which still leaves a lone new line whole) and (C) (the chain entries out of the record and the judge in
+  units, which changes the most and fixes nothing at the root).
+- **What.**
+  - A new line's change is `BranchChange::CreateDeferred`: the push its green owes is `DeferredPush::of` the push the
+    eager create would have built, based at the new green's version 0, its trees named by their changesets' nodes
+    (`changeset_tree`), its head the head changeset. The landing makes the green and makes it owe (A-812): no work is
+    built, judged or committed for it, and the record carries the debt's encoding (about 150 bytes), not a tree.
+  - A materialization lays out the push's base changeset's tree and its head's, a turn each, over the repository's
+    committed index. A changeset's or manifest's text let go once landed (A-767 C1's P5) is read whole from the node's
+    changeset store and given in its object's place. The layout is then lent each turn of the green's own owed build
+    (`Green::materializing`) as its objects, through `with_owed_push_objects`, the one lend behind which git's objects
+    are lent too: one builder over one input, A-618's, as the eager create's and a push's work's. A file revision whose
+    text was let go stops the turn `NotYet`; its text is asked of the changeset store and brought back into the content
+    store, then the unit taken again.
+  - The work's identity hashes its push's name and base (A-618), so an owed line's work is a hash apart from the eager
+    create's, which hashed the base line's version and was rebased to 0; its files, its head and its head's identity
+    are the eager create's, by construction, and held so twice: the work byte for byte in the hg crate, and a line made
+    after a restart against a repository whose `default` holds the same head eagerly.
+  - A line's head is read from its debt while it owes (`hg_made::head_of`): the push's classifier and the served view
+    read the lines' heads without making any. A push moving a line that owes makes it first, through the door
+    (`green_ready::made_for`), as git's commands do, since its work is built on the line's content; the lines it made
+    stay pinned until the push ends, so the bound on materialized greens drops none of them back meanwhile.
+  - A line's first read waits for its build (P2's rule), counted most from the build's start to its commit.
+- **Measured** (debug, this Mac, 2026-11-26): the 200-file, 32-head push's record carries 14,335 bytes of versions
+  against the eager 329,007, its landing step building no line's work; a line's first read waited 156 ms for its build.
+  Release: main's probe on the 452-head history.
+- **Held by.** `hg_push::tests::t_goal93_a_push_of_many_new_lines_records_each_as_its_owed_push_not_its_tree` (red:
+  329,007 bytes of versions, a tenth the bound), `an_owed_line_made_after_a_restart_reads_as_the_eager_line`,
+  `an_owed_lines_build_dropped_mid_way_names_nothing_and_is_made_again`,
+  `t_goal93_a_push_moving_many_heads_judges_their_works_ahead_of_its_landing_step` (the moved lines made through the
+  door, then judged ahead), `daemon::tests::t_goal93_a_push_of_many_heads_lands_its_new_lines_outside_its_landing_step`,
+  and the hg crate's oracle above.
+- **The replica half** (same day, main's order): a holder's replica of a line that owes is made as its owner's line is.
+  `replica_build` lays the push's trees out before the build's first turn over the repository's store on the holder
+  (`laid_out`, `hg_push::owed_layout`, its store's replay waited for first), lends them each turn through
+  `with_owed_push_objects`, and brings a waited file text back from the changeset store. Red first:
+  `hg_push::tests::a_holders_replica_of_an_owed_line_is_made_and_reads_as_the_owners_line` (made 0, refused 1 before;
+  made 1, refused 0 after), its replica's files and head identity the owner's line's.
+- **Ruling R, piece (i)** (main 01a20182's ruling of 2026-11-26 ~09:55 with its corrections of 10:50: a holder replica
+  can only be made of a changeset the region holds, so the changeset is homed, through git's homing path and A-727's
+  barrier, never each named text; shipping bytes inline, S, rejected). Applied in the same change to:
+  - `crates/store`: a changeset's `Record` section keyed by its identity as its `Payload` is (`SectionKind::keyed`):
+    hashed as written, kept on replay, forgotten with the changeset, read back by `Store::piece`.
+  - `crates/hg/src/import/record.rs`: record v12 (`write_homed_run_reference`, `homed_run_of`): the head, then the
+    segment list's identity, length and the sequence it landed at. The segment list (`write_segment_list`,
+    `segment_list_of`: "SHGL", version 1, a count, then each segment's sequence and its `Record` and `Payload` by
+    identity and length, 88 bytes a segment). v11 (ranges) is withdrawn, no longer written or read (CLAUDE.md §2
+    item 7).
+  - `crates/server/src/repository/hg_run.rs`: a segment's `Record` and `Payload` are put whole in the content store,
+    their buffers dropped (`segment_held`), and each is homed at `f + 1` for the push's attempt (`homed_for`). It then
+    lands from the content store a piece at a time (`HeldSegment::landed`), and each section is let go at its home as
+    a landed git pack is (`Landed::Pack`, brought back by `disk.piece`). (`Texts` not homed, an index derived from the
+    other two, was main's ruling 1, superseded on piece (ii), below.) At the entry, the list is homed, landed as a changeset of its own and let go (`list_landed`);
+    it is never held for the region past its landing (correction 3). A homing short refuses the push (`hg_push`'s
+    `HOMED_SHORT`) with nothing recorded and the attempt's holds let go (A-727 (d1a)); committed, they move to the
+    repository's records.
+  - `crates/server/src/vcs_store.rs`: a v12 record's replay reads its list back from the node's store by identity
+    (`keyed_bytes`, held to its BLAKE3 before it is decoded) and replays the sequences it names.
+  - Each landed segment is counted by section (`vcs.hg.segment_landed_{record,payload,texts}_bytes`, for a push and an
+    import), so main reads the held bytes from status.
+- **Held by.**
+  - `hg_push::tests::a_push_whose_changeset_is_not_durable_at_its_homes_is_refused_and_records_nothing`. A successor
+    daemon over the same segment, its anchor's content object gone, publishes no image, so no home can make anything
+    durable. The push is refused `HOMED_SHORT`, its homing counted short, with nothing in the register and nothing held
+    for the region. Red with the homing bypassed: accepted, its entry naming segments no home held.
+  - `a_pushs_landed_segments_are_counted_by_section` (red: 0 payload bytes against 410 chunked).
+  - The store's `a_landed_record_is_read_back_by_its_identity_until_its_changeset_is_forgotten` (red: the record read
+    `None`).
+  - The hg crate's golden and hostile tests of v12 and the list, and `a_dropped_run_is_forgotten_and_the_next_push_lands_past_it`,
+    which now reads the run's first sequence from the list.
+  - Conditions tried for the red that the product cannot reach: a daemon with no content object refuses the
+    repository's create (`ContentUnavailable`) before any push, and the homing budget has no input a configuration can
+    shorten (`fleet::homing_budget`: the live commit's deadline or the homing window, whichever is longer).
+- **Owed** (ruling R, piece by piece). (ii): a holder fetches the segments its store lacks by identity from the region
+  before each replay, and its recompute of an hg line's second version is accepted with the owner's identity (today
+  `merge.recompute_mismatch`); svn's holder path red in the same piece; the Mercurial fleet-takeover CLI test
+  `#[ignore]`d with its command. Then an import's run (v9) and a single pushed or made changeset (v7), homed the same
+  way, before unit 43.
+- **Ruling R, piece (ii): the segment homed as it landed, and a holder lands it verbatim** (main 01a20182's ruling of
+  2026-11-26 on w-hg's finding, Option A; its ruling 1, `Texts` derived on the holder, superseded). Why: `Texts` is the
+  intake's index (each revision's text identity and length, its base text's identity, its chunk's place in the
+  `Payload`), which a segment's `Record` does not carry (its rows name the base by node and the plain delta's length,
+  and a stock chunk is not self-delimiting). Deriving it on a holder would be a second producer that must equal the
+  intake's byte for byte: a chunk-boundary walker, a new parser of external bytes (zstd's frame size), a dependence on
+  the `Record`'s row order and base resolution through a part-replayed index (CLAUDE.md §2 item 7). Homed as landed, it
+  has one producer, and each holder appends "the same changesets with the same identities" (A-767 item 5) by
+  construction. It holds no RAM: about 150 bytes a revision, homed and let go at its home once landed, as the other two
+  are (about 150 MB more of region wire and disk for the 57k, read from the section counters). Applied in the same
+  change to:
+  - `crates/store`: a `Texts` section keyed by its identity too (`SectionKind::keyed`), forgotten with its changeset.
+  - `crates/hg/src/import/record.rs`: segment list version 2, each entry naming its `Texts` by identity and length (128
+    bytes a segment); version 1 no longer read.
+  - `crates/server/src/repository/hg_run.rs`: a segment's `Texts` put, homed, landed from the content store and let go as
+    its `Record` and `Payload` are.
+  - `crates/server/src/vcs_store.rs`: `homed_run_on_store`. Before a rebuild replays a v12 run (a holder's replica, a
+    takeover's rebuild), the list and each segment the node's store lacks at its sequence (by its `Record`'s identity)
+    are read from their region homes by identity (`homes::read_in_region`, which takes only bytes of the identity asked)
+    and landed verbatim at the owner's sequence (counted `vcs_store.hg_run_fetched`, refused `Unlanded` and counted
+    `..._unfetched` where a section could not be had). A recovery's own replay reads its own store.
+  - Held by `hg_push::tests::a_holders_run_lands_the_owners_segments_byte_for_byte_by_identity`, the oracle: a push of
+    several segments made whole on a second node's store, each segment and the list fetched once and none on a second
+    pass, every section on the second store the owner's byte for byte by identity. Red with the fetch refused: the run
+    not made whole.
+  - Owed in R (ii)'s next pieces: the holder's recompute of an hg line's second version accepted with the owner's
+    identity (today `merge.recompute_mismatch`); svn's holder path red; the Mercurial fleet-takeover CLI test
+    `#[ignore]`d with its command. A remote home that never lands an object it keeps holds it in RAM, as git's do.
+- **One barrier a home shard, and a crash's holds resolved by the attempt** (main 01a20182's order of 2026-11-26 after
+  r42 at 20a49642c: a push 89 to 123 s and a restart's CPU 48.0 to 57.7 s; each homed object waited for its own home's
+  publication, and `verbs::publish_shard` re-images every volume of the shard; homes.rs: "One barrier serves every
+  window kept before it: group commit per shard"). Applied in the same change to:
+  - `crates/server/src/vcs_store/homes.rs`: `home_in_region_deferred`, this node's keep not waited for, its home shard's
+    latest ticket kept for the caller. A remote home still answers kept once its own image is published: the next piece
+    (main's order: the remote acknowledges at once, and one "published through ticket N" exchange a home a push carries
+    the barrier, a wire version of its own, with the Mercurial fleet-takeover CLI test `#[ignore]`d with its command).
+  - `crates/server/src/repository/hg_run.rs`: a push's homings deferred, and after its list is homed and landed it waits
+    once on each home shard's latest ticket (`list_landed`), before its record names anything. A wait short refuses it
+    `HOMED_SHORT`.
+  - Record v13 (`crates/hg/src/import/record.rs`) names the push's attempt (its node, process and number); v12 is no
+    longer read. A resolution of a hold a crash left (`homes::resolve_step`) now has a Mercurial arm: the hold of an
+    attempt some record committed is named, since the record names its segments only through its list. Before, no
+    Mercurial record named a hold, so a crash between the entry and its settle let every segment's hold go.
+  - `homes::home_of` ranks a node's shards by their place (their partition), never by their runtime id. A shard's id is
+    made afresh each start and numbered across a process's daemons. Ranked by it, an in-process successor numbered 1 and
+    3 where its predecessor had 0 and 2 moved every home and read 54 of 55 homed objects as held nowhere, while the shard
+    image keeps what each partition held. A sibling, not changed here: `vcs_share::place` ranks the node's shards by id
+    for where a push's work runs, which nothing persists.
+  - Held by:
+    - `hg_push::tests::a_many_segment_pushs_homing_publishes_once_a_home_shard`: red 55 publications for 55 objects on one
+      shard, at most the shards after.
+    - `a_crash_after_a_pushs_answer_loses_no_object_its_record_names`: two shards, crash after the answer. Red with the
+      barrier taken out: 29 of 55 lost.
+    - `a_crash_between_a_pushs_entry_and_its_settle_resolves_every_hold_by_the_attempt_its_record_names`: settles held
+      unsent, then a resolution pass on the successor. Red with the Mercurial arm off: 26 of 55 lost.
+    - `homes::tests::an_identitys_home_is_the_head_of_the_one_rendezvous_ranking_and_homes_spread`: the same place
+      whatever the shards' ids.
+- **The settle queue, batched and bounded** (main 01a20182's order of 2026-11-26, after piece (i): its settles were one
+  region exchange an object, two a segment, about 4,200 for the 57k, in a queue with no bound; CLAUDE.md §2 item 8).
+  Applied in the same change to:
+  - `crates/cluster/src/homes.rs`: home wire 0x86, `HomeMessage::Settle` (an attempt's holds of many objects moved or
+    let go in one message, its identity field all zeros, at most `SETTLE_MOST`, the chunk cap over 32) answered
+    `HomeOutcome::Settled { settled }`; a member of 0x85 is refused typed by the version rule.
+  - `crates/server/src/vcs_store/homes.rs`: an attempt owes one `Settle` of every object it homed (a short homing's
+    object let go with the rest); `settle_in_region` settles it with one call a home shard on this node and one message
+    a remote home (in parts of `SETTLE_MOST`); a home serves one with one call a shard, a move counted once that shard's
+    image holding it is published. Bound: `settle_bound`, `clients_per_shard × region slots` (the requests a shard holds
+    at once), over the attempts in flight and the settles owed together, so the queue never passes it; an attempt past
+    it is refused its owner, `HomeRefused::AttemptsAtBound`, counted `vcs_store.homes.attempts_at_bound`, before
+    anything is homed. A git push so refused answers `Unlanded::AttemptsAtBound`, a Mercurial push `PUSHES_AT_BOUND`,
+    each in slates' words to send it again.
+  - Held by `hg_push::tests::a_many_segment_pushs_attempt_settles_its_homed_objects_as_one` (red: 37 settles for a
+    push of 18 segments; 1 after) and `a_push_past_the_shards_attempts_bound_is_refused_typed_and_the_next_lands` (red:
+    no bound, the push accepted), the wire's `a_settle_reads_back_whole_and_a_hostile_one_is_refused_by_kind`, and git's
+    A-727 (d1a) tests, which now wait for one settle an attempt.
+- **Owed.** The release measure of the first read's wait on the 452-head history (main's probe).

@@ -51,6 +51,7 @@ use std::borrow::Cow;
 
 use flate2::{Decompress, FlushDecompress, Status};
 
+use crate::away::WaitOnce;
 use crate::delta;
 use crate::entry::{self, PACK_HEADER_LEN, Representation};
 use crate::object_name::{CollisionAttack, Hasher, Kind, ObjectFormat, ObjectId, name_of};
@@ -85,9 +86,10 @@ pub trait Outside {
   /// The object named `id`, its type and content, if it is held outside the pack.
   fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])>;
 
-  /// Where in its pack the last object asked was not read because it lies in a window let go, to be brought back before
-  /// it is asked again (A-864's push readers; main 01a20182's ruling of 2026-11-22): the resolution stops there and is
-  /// taken again on its next turn. None by default, for an outside that lets nothing go.
+  /// The let-go, by the content store's number for it (`ContentStore::away_number`), of the window the last object
+  /// asked was not read from, to be brought back before it is asked again (A-864's push readers; main 01a20182's ruling
+  /// of 2026-11-22; [`crate::away`]): the resolution stops there and is taken again on its next turn. None by default,
+  /// for an outside that lets nothing go.
   fn away(&self) -> Option<u64> {
     None
   }
@@ -165,6 +167,13 @@ pub trait Keep: Contents {
 pub trait Contents {
   /// The content of the object kept at position `at` in pack order, named `id`; `None` when none is kept there.
   fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>>;
+
+  /// The let-go, by the content store's number for it (`ContentStore::away_number`), of the window the last
+  /// [`Contents::content`] to answer none met (goal 93 item 2b, held on the node's store, its owner to bring it back:
+  /// [`crate::away`]); none where it met none, as keepers in memory never do.
+  fn content_away(&self) -> Option<u64> {
+    None
+  }
 }
 
 /// A keeper that holds every object's bytes itself, each charged for as long as the reader's admission lasts: the pack
@@ -584,6 +593,26 @@ impl crate::store::learn::Clock for Unhurried {
   }
 }
 
+/// What a delta's application to an entry of the pack came to ([`Reader::applied`]).
+enum Applied<M = Made> {
+  /// Applied: what it made.
+  Made(M),
+  /// Its base is itself a delta still waiting.
+  BaseWaiting,
+  /// Its base's read back met a let-go window, by its let-go's number ([`Contents::content_away`]).
+  BaseAway(u64),
+}
+
+/// Where a resolution turn last stopped at a let-go window ([`crate::away`]'s one rule): a row of the outside bases'
+/// table, or a waiting delta whose in-pack base's read back met it (B1b), each with that let-go's number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+  /// The row of the waiting table whose outside base was let go.
+  Outside(usize, u64),
+  /// The delta whose base, an entry of the pack, was read back through a let-go window.
+  Base(usize, u64),
+}
+
 /// The waiting deltas' resolution between its turns (A-724's starvation fix): their table by base, the deltas found
 /// waiting on a resolved base and still to apply, the next entry whose waiting children are looked for, and the next
 /// row of the table looked at for a base outside the pack. A unit of a turn applies one delta, or lists one entry's
@@ -600,10 +629,10 @@ struct Resolving {
   /// The next row of `waiting` looked at for a base outside the pack; its length once all are.
   outside: usize,
   /// The row of `waiting` whose base, outside the pack, lay in a let-go window when the turn last stopped there, and
-  /// where in its pack, until a unit resolves after it (A-864's push readers): met so again at the same place with
+  /// that let-go's number, until a unit resolves after it (A-864's push readers): met so again at the same place with
   /// nothing resolved between, it is refused as one not held, so a stop always makes progress or ends (an object across
-  /// several let-go windows stops at each in turn).
-  stopped: Option<(usize, u64)>,
+  /// several let-go windows stops at each in turn; [`crate::away`]'s one rule).
+  stopped: WaitOnce<Stop>,
 }
 
 impl<'index, L: Locate + ?Sized> Reader<'index, L> {
@@ -999,7 +1028,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     (admission, keep): (&mut Admission, &mut K),
   ) -> Result<(State, Option<Made>), Refusal> {
     if let Base::Entry(entry) = base
-      && let Some(made) = self.applied(entry, &delta, expected, at, (admission, &*keep))?
+      && let Applied::Made(made) = self.applied(entry, &delta, expected, at, (admission, &*keep))?
     {
       keep.release(hold, admission);
       return Ok((State::Resolved(made.named), Some(made)));
@@ -1013,8 +1042,10 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     Ok((State::Waiting(waiting), None))
   }
 
-  /// `delta` applied to the entry at `base`, its bytes read back from `keep`, or `None` when that entry is itself a
-  /// delta still waiting. The object found must have the name an index placed it by.
+  /// `delta` applied to the entry at `base`, its bytes read back from `keep`: the object it made; or not yet, where
+  /// that entry is itself a delta still waiting, or where its read back met a let-go window `keep` names (B1b, goal 93
+  /// item 2b: a push's quarantine reads an in-pack base back through its own base's window; [`crate::away`]). The
+  /// object found must have the name an index placed it by.
   fn applied<K: Keep + ?Sized>(
     &self,
     base: usize,
@@ -1022,14 +1053,14 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     expected: Option<ObjectId>,
     at: u64,
     (admission, keep): (&mut Admission, &K),
-  ) -> Result<Option<Made>, Refusal> {
+  ) -> Result<Applied, Refusal> {
     let Some(Record {
       state: State::Resolved(source),
       offset,
       ..
     }) = self.entries.get(base)
     else {
-      return Ok(None);
+      return Ok(Applied::BaseWaiting);
     };
     if let Some(name) = expected
       && name != source.id
@@ -1040,12 +1071,15 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
         found: source.id,
       });
     }
-    let content = keep
-      .content(base, &source.id)
-      .ok_or(Refusal::DeltaBaseMissing {
-        at: *offset,
-        base: source.id,
-      })?;
+    let Some(content) = keep.content(base, &source.id) else {
+      return match keep.content_away() {
+        Some(away) => Ok(Applied::BaseAway(away)),
+        None => Err(Refusal::DeltaBaseMissing {
+          at: *offset,
+          base: source.id,
+        }),
+      };
+    };
     let depth = source.chain.map_or(0, |chain| chain.depth);
     let source = Source {
       kind: source.kind,
@@ -1053,7 +1087,9 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       content: &content,
       depth,
     };
-    self.apply_to_source(source, delta, at, admission).map(Some)
+    self
+      .apply_to_source(source, delta, at, admission)
+      .map(Applied::Made)
   }
 
   /// `delta`, the entry at `at`'s, applied to `source`: the object it makes, of the source's type, one delta deeper,
@@ -1151,7 +1187,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
           pending,
           next: 0,
           outside: 0,
-          stopped: None,
+          stopped: WaitOnce::default(),
         }
       }
     };
@@ -1163,9 +1199,21 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       }
       units = units.saturating_add(1);
       if let Some((parent, child)) = resolving.pending.pop() {
-        if self.resolve_child(parent, child, (admission, &mut *keep))? {
-          resolving.stopped = None;
-          self.list_children(child, &resolving.waiting, &mut resolving.pending)?;
+        match self.resolve_child(parent, child, (admission, &mut *keep))? {
+          Applied::Made(()) => {
+            resolving.stopped.answered();
+            self.list_children(child, &resolving.waiting, &mut resolving.pending)?;
+          }
+          Applied::BaseWaiting => {}
+          // Its base read back through a let-go window (B1b): the turn stops here, the pair taken again once the
+          // window is brought back; the same let-go met again with nothing resolved between is refused as a base held
+          // nowhere.
+          Applied::BaseAway(away) if resolving.stopped.waits(Some(Stop::Base(child, away))) => {
+            resolving.pending.push((parent, child));
+            self.resolving = Some(resolving);
+            return Ok(false);
+          }
+          Applied::BaseAway(_) => return Err(self.unresolved(child)),
         }
         continue;
       }
@@ -1179,14 +1227,14 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
         let row = resolving.outside;
         resolving.outside = resolving.outside.saturating_add(1);
         if self.resolve_outside(key, child, (admission, &mut *keep))? {
-          resolving.stopped = None;
+          resolving.stopped.answered();
           self.list_children(child, &resolving.waiting, &mut resolving.pending)?;
-        } else if let Some(at) = keep.away()
-          && resolving.stopped != Some((row, at))
+        } else if resolving
+          .stopped
+          .waits(keep.away().map(|at| Stop::Outside(row, at)))
         {
           // Its base lies in a let-go window: the turn stops here, the base to be brought back, the row taken again.
           resolving.outside = row;
-          resolving.stopped = Some((row, at));
           self.resolving = Some(resolving);
           return Ok(false);
         }
@@ -1333,20 +1381,20 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
   }
 
   /// Applies the delta at `child`, if still waiting, to the object at `parent`, and hands what it makes to `keep`:
-  /// whether it did.
+  /// whether it did ([`Applied::Made`]), or why not: the base still waiting, or its read back met a let-go window.
   fn resolve_child<K: Keep + ?Sized>(
     &mut self,
     parent: usize,
     child: usize,
     (admission, keep): (&mut Admission, &mut K),
-  ) -> Result<bool, Refusal> {
+  ) -> Result<Applied<()>, Refusal> {
     let Some(Record {
       offset,
       state: State::Waiting(waiting),
       ..
     }) = self.entries.get(child)
     else {
-      return Ok(false);
+      return Ok(Applied::BaseWaiting);
     };
     let applied = self.applied(
       parent,
@@ -1355,11 +1403,13 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       *offset,
       (admission, &*keep),
     )?;
-    let Some(made) = applied else {
-      return Ok(false);
+    let made = match applied {
+      Applied::Made(made) => made,
+      Applied::BaseWaiting => return Ok(Applied::BaseWaiting),
+      Applied::BaseAway(away) => return Ok(Applied::BaseAway(away)),
     };
     self.settle(child, made, (admission, keep))?;
-    Ok(true)
+    Ok(Applied::Made(()))
   }
 
   /// The waiting delta at `child` resolved as `made`: its record named, its delta's bytes given back to `keep`, and the

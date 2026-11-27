@@ -147,6 +147,18 @@ pub enum SectionKind {
 }
 
 impl SectionKind {
+  /// Whether the store keys a section of this kind by its identity, the plain BLAKE3 of its bytes, so a reader brings it
+  /// back by that identity alone (`Store::piece`): a `Payload` (A-767 C5: git's pack, Mercurial's chunks), a `Record` and
+  /// a `Texts` (main 01a20182's ruling R of 2026-11-26 and its ruling on piece (ii): a Mercurial segment is homed in the
+  /// region as it landed, each section by its identity, and let go at its home once landed, as git's pack is).
+  #[must_use]
+  pub fn keyed(self) -> bool {
+    matches!(
+      self,
+      SectionKind::Payload | SectionKind::Record | SectionKind::Texts
+    )
+  }
+
   fn byte(self) -> u8 {
     // Format: a section's kind byte (A-767 item 2; the format agreed with w-hg, w-git, w-svn).
     match self {

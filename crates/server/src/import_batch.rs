@@ -533,9 +533,13 @@ impl ImportBatch {
     spent: &mut dyn FnMut() -> bool,
   ) -> Option<Result<u64, StageRefused>> {
     if let Some(reserving) = self.reserving.take() {
+      #[cfg(test)]
+      crate::vcs_store::svn_import::phase::tag("stage.reserving");
       return self.reserve_step(state, reserving, spent);
     }
     if let Some(judging) = self.judging.take() {
+      #[cfg(test)]
+      crate::vcs_store::svn_import::phase::tag("stage.judging");
       return self.judge_step(state, judging, spent);
     }
     // A step with nothing begun is refused, never "more": its caller steps until an end.
@@ -543,12 +547,16 @@ impl ImportBatch {
       return Some(Err(StageRefused::Unavailable));
     };
     if pending.measured.is_some() {
+      #[cfg(test)]
+      crate::vcs_store::svn_import::phase::tag("stage.measuring");
       return self.measure_pending(state, pending, spent);
     }
     let Some(preview) = self.preview.as_ref() else {
       return Some(Err(StageRefused::Unavailable));
     };
     let stepped = state.greens.with_preview_mut(preview, |engine| {
+      #[cfg(test)]
+      crate::vcs_store::svn_import::phase::tag("stage.committing");
       match engine.committing_step(&mut pending.committing, spent) {
         CommitStep::More => Stepped::More,
         CommitStep::Lend(unlent) => Stepped::Lend(unlent),
@@ -683,7 +691,7 @@ impl ImportBatch {
     mut self,
     state: &mut ShardState,
     (principal, repository): (&Principal, RepositoryId),
-    parts: EntryParts,
+    (parts, prepared): (EntryParts, Vec<crate::repository::push::Prepared>),
   ) -> Result<crate::repository::push::RecordedBatch, AppendRefused> {
     let staged = std::mem::take(&mut self.staged);
     let green = self.green;
@@ -692,7 +700,7 @@ impl ImportBatch {
       state,
       (principal, repository),
       green,
-      staged,
+      (staged, prepared),
       parts,
     )?;
     state.count(COMMITTED, 1);
@@ -702,6 +710,29 @@ impl ImportBatch {
   /// Gives the batch up: nothing of it applied or recorded, the scratch member retired.
   pub(crate) fn abandon(mut self, state: &mut ShardState) {
     self.retire(state);
+  }
+
+  /// The works staged, in order: what the landing makes ready for the register's op ([`crate::repository::push::Prepared`]).
+  pub(crate) fn staged_works(&self) -> &[Staged] {
+    &self.staged
+  }
+
+  /// The batch's green.
+  pub(crate) fn green(&self) -> DbVolumeId {
+    self.green
+  }
+
+  /// Retires the scratch member, its release answered for the caller to step a unit at a time (A-920 6a); none where it
+  /// was retired already. The batch's commit and abandon then retire nothing more.
+  pub(crate) fn retire_begun(
+    &mut self,
+    state: &mut ShardState,
+  ) -> Option<(
+    slates_db::catalog::RepositoryId,
+    slates_merge::engine::Release,
+  )> {
+    let preview = self.preview.take()?;
+    state.greens.retire_preview_begun(preview)
   }
 
   /// Retires the scratch member, once.

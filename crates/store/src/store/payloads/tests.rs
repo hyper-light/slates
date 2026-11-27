@@ -7,7 +7,7 @@ use mantle_engine::store::{Config, IntoFile, MIN_PAGE};
 use mantle_engine::trunk::TrunkConfig;
 
 use super::*;
-use crate::log::{ChangesetLog, Header, Located, Tool};
+use crate::log::{ChangesetLog, Header, Located, SectionKind, Tool};
 use crate::store::put_changeset;
 
 fn file(seed: u64) -> SimFile {

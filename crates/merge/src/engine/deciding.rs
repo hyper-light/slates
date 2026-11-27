@@ -26,6 +26,10 @@ pub(crate) struct Deciding {
   homes: BTreeSet<String>,
   /// The paths the node-exclusive rule has judged ([`Green::decide_node_exclusive_some`]).
   judged: BTreeSet<String>,
+  /// Whether [`Deciding::cleared`] is found: by the first unit's first step where it is judged, else by its own phase.
+  cleared_found: bool,
+  /// The content paths whose ops do not fit what they edit at the work's base, found so far by the first unit's walk.
+  unfit: Vec<String>,
 }
 
 /// What a phase decides from: the increment and its resolution.
@@ -39,6 +43,17 @@ struct Walk<'w> {
   units: &'w mut position::Units,
   deciding: &'w mut Deciding,
   spent: &'w mut dyn FnMut() -> bool,
+}
+
+impl Deciding {
+  /// One path of what the decision's earlier phases left for its later ones let go: whether one was (A-920 piece 3h,
+  /// [`super::Resolved::release_one`]).
+  pub(crate) fn release_one(&mut self) -> bool {
+    self.cleared.pop_first().is_some()
+      || self.homes.pop_first().is_some()
+      || self.judged.pop_first().is_some()
+      || self.unfit.pop().is_some()
+  }
 }
 
 impl Walk<'_> {
@@ -91,6 +106,15 @@ const PHASES: [Phase; 17] = [
   Green::decide_node_exclusive_some,
 ];
 
+/// The files the work removes or replaces: the first unit's footprint names the links to them (A-669).
+fn leaving(r: &Resolved) -> Vec<&str> {
+  r.unlinks
+    .iter()
+    .chain(r.renames.keys())
+    .map(String::as_str)
+    .collect()
+}
+
 impl Green {
   /// Decides every dimension of an increment unit by unit into `units` (A-658, `position`): each unit one verdict
   /// function over its own paths, in the order the whole verdict pushes its effects and windows, so the verdict reached
@@ -127,25 +151,69 @@ impl Green {
 
   /// What the work and its base decide: an operation no verdict applies, an edit that does not fit what it edits. The
   /// head decides one thing of it, the file an edit declared at a link edits when the work hands that file's node on to
-  /// the link (A-669), which turns only with the links naming the files the work removes or replaces. One unit, whole.
+  /// the link (A-669), which turns only with the links naming the files the work removes or replaces. One unit, judged
+  /// over steps (A-920 3j): its first asks whether it is judged at all ([`position::Units::judges`]) and finds the paths
+  /// the work removes itself; then each content path's fit to its base is a unit of the walk ([`Green::content_fits`]),
+  /// the unfit kept; and the unit is pushed whole when the walk ends, so the units are the same however it is sliced.
   fn decide_first(&self, from: &DecideIn<'_>, walk: &mut Walk<'_>) -> bool {
+    let r = from.r;
+    if walk.deciding.at == 0 {
+      walk.deciding.at = 1;
+      if !walk
+        .units
+        .judges(&position::Footprint::links_naming(&leaving(r)))
+      {
+        return self.first_unit_pushed(from, walk);
+      }
+      walk.deciding.cleared = r.cleared();
+      walk.deciding.cleared_found = true;
+      if (walk.spent)() {
+        return false;
+      }
+    }
+    for (path, ops) in r.content.range::<str, _>(walk.after()) {
+      if !self.content_fits(
+        from.inc,
+        r,
+        &walk.deciding.cleared,
+        (path.as_str(), ops.as_slice()),
+      ) {
+        walk.deciding.unfit.push(path.clone());
+      }
+      if walk.spent_after(path) {
+        return false;
+      }
+    }
+    self.first_unit_pushed(from, walk)
+  }
+
+  /// The first unit pushed ([`Green::decide_first`]): its windows the work's invalid operations and its unfit content,
+  /// as found by its walk; judged whole here should the units judge it where its first step found they would not.
+  fn first_unit_pushed(&self, from: &DecideIn<'_>, walk: &mut Walk<'_>) -> bool {
     let (inc, r) = (from.inc, from.r);
-    let leaving: Vec<&str> = r
-      .unlinks
-      .iter()
-      .chain(r.renames.keys())
-      .map(String::as_str)
-      .collect();
+    let unfit = core::mem::take(&mut walk.deciding.unfit);
+    let walked = walk.deciding.cleared_found;
     walk
       .units
-      .unit(position::Footprint::links_naming(&leaving), |_| {
-        position::Unit::windows(
+      .unit(position::Footprint::links_naming(&leaving(r)), |_, sink| {
+        let unfit = if walked {
+          unfit
+        } else {
+          let cleared = r.cleared();
+          r.content
+            .iter()
+            .filter(|(path, ops)| {
+              !self.content_fits(inc, r, &cleared, (path.as_str(), ops.as_slice()))
+            })
+            .map(|(path, _)| path.clone())
+            .collect()
+        };
+        sink.windows(
           r.invalid
             .iter()
-            .chain(self.unfit_content(inc, r).iter())
-            .map(|path| Green::window(path, MergeConflictClass::TypeChanged))
-            .collect(),
-        )
+            .chain(unfit.iter())
+            .map(|path| Green::window(path, MergeConflictClass::TypeChanged)),
+        );
       });
     true
   }
@@ -156,7 +224,7 @@ impl Green {
     if !from.r.copies.is_empty() {
       walk
         .units
-        .copies(|| self.decide_copy_unit(from.inc, from.r));
+        .copies(|sink| self.decide_copy_unit(from.inc, from.r, sink));
     }
     true
   }
@@ -165,8 +233,8 @@ impl Green {
   fn decide_specials_some(&self, from: &DecideIn<'_>, walk: &mut Walk<'_>) -> bool {
     let r = from.r;
     for (path, node) in r.specials.range::<str, _>(walk.after()) {
-      walk.units.unit(position::Footprint::path(path), |_| {
-        position::Unit::of(self.merge_special(path, from.inc.base, *node))
+      walk.units.unit(position::Footprint::path(path), |_, sink| {
+        sink.of(self.merge_special(path, from.inc.base, *node))
       });
       if walk.spent_after(path) {
         return false;
@@ -177,7 +245,10 @@ impl Green {
 
   /// The paths the increment removes itself: a rename over a file and a directory's removal read them.
   fn decide_cleared(&self, from: &DecideIn<'_>, walk: &mut Walk<'_>) -> bool {
-    walk.deciding.cleared = from.r.cleared();
+    if !walk.deciding.cleared_found {
+      walk.deciding.cleared = from.r.cleared();
+      walk.deciding.cleared_found = true;
+    }
     true
   }
 
@@ -200,17 +271,14 @@ impl Green {
         let footprint = home.map_or(position::Footprint::path(heir), |home| {
           position::Footprint::pair(heir, home)
         });
-        walk.units.unit(footprint, |_| {
+        walk.units.unit(footprint, |_, sink| {
           let Some(home) = home else {
-            return position::Unit::default();
+            return;
           };
           let unlinked = r.unlinks.contains(home);
           match self.merge_handed((heir, ops), (home, unlinked), (inc.base, inc.post())) {
-            Ok(effects) => position::Unit {
-              effects,
-              ..position::Unit::default()
-            },
-            Err(window) => position::Unit::windows(vec![window]),
+            Ok(effects) => sink.effect_list(effects),
+            Err(window) => sink.windows([window]),
           }
         });
       }
@@ -233,25 +301,18 @@ impl Green {
       let replaced = [dst.as_str()];
       let footprint = position::Footprint::pair(dst, source).and_links_naming(&replaced);
       let (cleared, homes) = (&walk.deciding.cleared, &walk.deciding.homes);
-      walk.units.unit(footprint, |_| {
-        let mut unit = position::Unit::default();
+      walk.units.unit(footprint, |_, sink| {
         let unseen =
           !cleared.contains(dst) && self.leaves_to_an_unseen_link(dst, inc.base, (r, homes));
         let merged = if unseen {
           Err(Green::window(dst, MergeConflictClass::RenameRename))
         } else {
           let moved = (inc.base, inc.post());
-          self.merge_rename(
-            (dst, ops),
-            moved,
-            (source.as_str(), cleared),
-            &mut unit.effects,
-          )
+          self.merge_rename((dst, ops), moved, (source.as_str(), cleared), sink.effects)
         };
         if let Err(window) = merged {
-          unit.windows.push(window);
+          sink.windows.push(window);
         }
-        unit
       });
       if walk.spent_after(dst) {
         return false;
@@ -264,9 +325,9 @@ impl Green {
   fn decide_creates_some(&self, from: &DecideIn<'_>, walk: &mut Walk<'_>) -> bool {
     let (inc, r) = (from.inc, from.r);
     for path in r.creates.range::<str, _>(walk.after()) {
-      walk.units.unit(position::Footprint::path(path), |_| {
+      walk.units.unit(position::Footprint::path(path), |_, sink| {
         let content = r.content.get(path).map(Vec::as_slice).unwrap_or(&[]);
-        position::Unit::of(self.merge_create(path, (content, inc.post())))
+        sink.of(self.merge_create(path, (content, inc.post())))
       });
       if walk.spent_after(path) {
         return false;
@@ -284,8 +345,8 @@ impl Green {
       let removed = [path.as_str()];
       let footprint = position::Footprint::path(path).and_links_naming(&removed);
       let homes = &walk.deciding.homes;
-      walk.units.unit(footprint, |_| {
-        position::Unit::of(if self.leaves_to_an_unseen_link(path, base, (r, homes)) {
+      walk.units.unit(footprint, |_, sink| {
+        sink.of(if self.leaves_to_an_unseen_link(path, base, (r, homes)) {
           Err(Green::window(path, MergeConflictClass::DeleteModify))
         } else {
           self.merge_unlink(path, base)
@@ -305,14 +366,16 @@ impl Green {
     for (path, ops) in r.content.range::<str, _>(walk.after()) {
       if !r.creates.contains(path) && !r.renames.contains_key(path) {
         let cleared = &walk.deciding.cleared;
-        walk.units.unit(position::Footprint::path(path), |placed| {
-          // A link's writes go with the node handed on to it (`decide_handed_some`); only a change at the link turns
-          // that.
-          if self.handed_home(r, path, cleared).is_some() {
-            return position::Unit::default();
-          }
-          self.merge_content(inc, path, (ops, placed))
-        });
+        walk
+          .units
+          .unit(position::Footprint::path(path), |placed, sink| {
+            // A link's writes go with the node handed on to it (`decide_handed_some`); only a change at the link turns
+            // that.
+            if self.handed_home(r, path, cleared).is_some() {
+              return;
+            }
+            self.merge_content(inc, path, (ops, placed), sink);
+          });
       }
       if walk.spent_after(path) {
         return false;
@@ -324,8 +387,8 @@ impl Green {
   /// The directories the increment makes, a unit each.
   fn decide_mkdirs_some(&self, from: &DecideIn<'_>, walk: &mut Walk<'_>) -> bool {
     for path in from.r.mkdirs.range::<str, _>(walk.after()) {
-      walk.units.unit(position::Footprint::path(path), |_| {
-        position::Unit::of(self.merge_mkdir(path))
+      walk.units.unit(position::Footprint::path(path), |_, sink| {
+        sink.of(self.merge_mkdir(path))
       });
       if walk.spent_after(path) {
         return false;
@@ -339,9 +402,11 @@ impl Green {
     let base = from.inc.base;
     for path in from.r.rmdirs.range::<str, _>(walk.after()) {
       let cleared = &walk.deciding.cleared;
-      walk.units.unit(position::Footprint::directory(path), |_| {
-        position::Unit::of(self.merge_rmdir(path, base, cleared))
-      });
+      walk
+        .units
+        .unit(position::Footprint::directory(path), |_, sink| {
+          sink.of(self.merge_rmdir(path, base, cleared))
+        });
       if walk.spent_after(path) {
         return false;
       }
@@ -353,8 +418,8 @@ impl Green {
   fn decide_modes_some(&self, from: &DecideIn<'_>, walk: &mut Walk<'_>) -> bool {
     let (base, r) = (from.inc.base, from.r);
     for (path, mode) in r.modes.range::<str, _>(walk.after()) {
-      walk.units.unit(position::Footprint::path(path), |_| {
-        position::Unit::of(self.merge_setmode(path, base, *mode, r.establishes(path)))
+      walk.units.unit(position::Footprint::path(path), |_, sink| {
+        sink.of(self.merge_setmode(path, base, *mode, r.establishes(path)))
       });
       if walk.spent_after(path) {
         return false;
@@ -367,8 +432,8 @@ impl Green {
   fn decide_symlinks_some(&self, from: &DecideIn<'_>, walk: &mut Walk<'_>) -> bool {
     let base = from.inc.base;
     for (path, target) in from.r.symlinks.range::<str, _>(walk.after()) {
-      walk.units.unit(position::Footprint::path(path), |_| {
-        position::Unit::of(self.merge_symlink(path, base, target))
+      walk.units.unit(position::Footprint::path(path), |_, sink| {
+        sink.of(self.merge_symlink(path, base, target))
       });
       if walk.spent_after(path) {
         return false;
@@ -387,8 +452,8 @@ impl Green {
       let footprint = node.map_or(position::Footprint::path(path), |(home, _)| {
         position::Footprint::pair(path, home)
       });
-      walk.units.unit(footprint, |_| {
-        position::Unit::of(match node {
+      walk.units.unit(footprint, |_, sink| {
+        sink.of(match node {
           Some(node) => self.merge_hardlink(path, base, node),
           None => Err(Green::window(path, MergeConflictClass::TypeChanged)),
         })
@@ -405,8 +470,8 @@ impl Green {
     let (base, r) = (from.inc.base, from.r);
     let mut at = walk.deciding.at;
     while let Some((path, name, value)) = r.xattr_sets.get(at) {
-      walk.units.unit(position::Footprint::path(path), |_| {
-        position::Unit::of(self.merge_set_xattr(path, name, base, value, r.establishes(path)))
+      walk.units.unit(position::Footprint::path(path), |_, sink| {
+        sink.of(self.merge_set_xattr(path, name, base, value, r.establishes(path)))
       });
       if walk.spent_at(at) {
         return false;
@@ -421,8 +486,8 @@ impl Green {
     let (base, r) = (from.inc.base, from.r);
     let mut at = walk.deciding.at;
     while let Some((path, name)) = r.xattr_removes.get(at) {
-      walk.units.unit(position::Footprint::path(path), |_| {
-        position::Unit::of(self.merge_remove_xattr(path, name, base, r.establishes(path)))
+      walk.units.unit(position::Footprint::path(path), |_, sink| {
+        sink.of(self.merge_remove_xattr(path, name, base, r.establishes(path)))
       });
       if walk.spent_at(at) {
         return false;
@@ -466,14 +531,9 @@ impl Green {
         continue;
       };
       if walk.deciding.judged.insert(path.to_owned()) {
-        walk.units.unit(position::Footprint::path(path), |_| {
+        walk.units.unit(position::Footprint::path(path), |_, sink| {
           let changed = self.changed_after(path, inc.base);
-          position::Unit::windows(
-            changed
-              .then(|| Green::window(path, class))
-              .into_iter()
-              .collect(),
-          )
+          sink.windows(changed.then(|| Green::window(path, class)));
         });
       }
     }

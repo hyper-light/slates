@@ -151,8 +151,7 @@ mod tests {
   #[test]
   fn a_wait_answers_again_when_the_room_grows_waits_until_then_and_gives_up_past_patience_or_the_ceiling()
    {
-    crate::test_store::audit_on_stored_shard("room-wait", |state| {
-      let repository = crate::git_push::tests::git_repository(state, "waiting");
+    crate::git_push::tests::on_stored_shard_with(["waiting"], |state, [repository]| {
       let room = super::super::room(state, repository).bytes;
       let mut small = RoomWait::new(1, 0);
       assert_eq!(
@@ -183,8 +182,7 @@ mod tests {
   #[test]
   fn a_need_past_the_room_admittable_now_but_within_the_shards_whole_waits_and_is_taken_once_a_holder_lets_go()
    {
-    crate::test_store::audit_on_stored_shard("room-wait-released", |state| {
-      let repository = crate::git_push::tests::git_repository(state, "released");
+    crate::git_push::tests::on_stored_shard_with(["released"], |state, [repository]| {
       let before = super::super::room(state, repository).bytes;
       state.store.budget.set_hold(state.store.admittable() / 2);
       let now = super::super::room(state, repository).bytes;

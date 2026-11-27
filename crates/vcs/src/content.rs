@@ -421,12 +421,20 @@ pub struct Writing {
   hasher: blake3::Hasher,
   /// The identities kept so far, in order.
   windows: Vec<ContentId>,
+  /// Whether each window it keeps that the store holds let go is brought back from its bytes
+  /// ([`ContentStore::begin_object_whole`]).
+  whole: bool,
 }
 
 impl Writing {
   /// The windows kept so far.
   pub fn windows_kept(&self) -> usize {
     self.windows.len()
+  }
+
+  /// The bytes of the window being filled: at most a window, what the writer itself holds.
+  pub fn pending_len(&self) -> usize {
+    self.pending.len()
   }
 
   /// The buffer the object's windows were filled in, taken out, emptied: what a writer that puts object after object
@@ -956,6 +964,34 @@ impl ContentStore {
     Writing::default()
   }
 
+  /// Starts an object put a window at a time as [`ContentStore::begin_object`] does, each window it keeps that the store
+  /// holds let go brought back from the bytes it is handed, as [`ContentStore::put_object_whole`] brings one back: what a
+  /// replay reading a let-go pack from the node's store puts, so the object it names reads whole by its identity.
+  pub fn begin_object_whole(&self) -> Writing {
+    Writing {
+      whole: true,
+      ..Writing::default()
+    }
+  }
+
+  /// The bytes of `writing`, an object put a window at a time and not yet finished, from `offset` to the end of the
+  /// window that holds them: lent from the window the store keeps (or copied out, as [`ContentStore::bytes_of`]), or
+  /// borrowed from its pending bytes. None past what it has taken, or where that window is let go.
+  pub fn writing_piece<'s>(&'s self, writing: &'s Writing, offset: u64) -> Option<Cow<'s, [u8]>> {
+    let offset = usize::try_from(offset).ok()?;
+    let window = self.window.get();
+    let (index, within) = (offset.checked_div(window)?, offset.checked_rem(window)?);
+    let piece = match writing.windows.get(index) {
+      Some(identity) => match self.bytes_of(identity)? {
+        Cow::Borrowed(bytes) => Cow::Borrowed(bytes.get(within..)?),
+        Cow::Owned(bytes) => Cow::Owned(bytes.get(within..)?.to_vec()),
+      },
+      None if index == writing.windows.len() => Cow::Borrowed(writing.pending.get(within..)?),
+      None => return None,
+    };
+    (!piece.is_empty()).then_some(piece)
+  }
+
   /// Starts an object of `len` bytes put a window at a time, as [`ContentStore::begin_object`] does, its window's buffer
   /// reserved once now at the window or `len` if shorter, so no piece grows or moves it (goal 93, svn finding (2)):
   /// begun empty, the buffer doubled from the first piece, and a 256 KiB text put in 65 KB copy slices made allocations
@@ -1006,12 +1042,24 @@ impl ContentStore {
       writing.pending.extend_from_slice(taken);
       rest = left;
       if writing.pending.len() == window {
-        let identity = self.put(&writing.pending)?;
+        let identity = self.put_kept(&writing.pending, writing.whole)?;
         writing.windows.push(identity);
         writing.pending.clear();
       }
     }
     Ok(())
+  }
+
+  /// [`ContentStore::put`] of a writer's window, brought back first where the store holds it let go and the writer is
+  /// whole ([`ContentStore::begin_object_whole`]).
+  fn put_kept(&mut self, bytes: &[u8], whole: bool) -> Result<ContentId, ContentRefused> {
+    if whole {
+      let identity = ContentId::of(bytes);
+      if self.is_away(&identity) {
+        self.bring_back(&identity, bytes)?;
+      }
+    }
+    self.put(bytes)
   }
 
   /// Ends the object: its last window kept, then the lists naming its windows, `fanout` a list, level by level, as
@@ -1029,7 +1077,7 @@ impl ContentStore {
   /// [`ContentStore::finish_object`]'s tree: its root.
   fn finish_root(&mut self, writing: &mut Writing) -> Result<ContentId, ContentRefused> {
     if !writing.pending.is_empty() || writing.windows.is_empty() {
-      let identity = self.put(&writing.pending)?;
+      let identity = self.put_kept(&writing.pending, writing.whole)?;
       writing.windows.push(identity);
       writing.pending.clear();
     }
@@ -2356,6 +2404,19 @@ impl ContentStore {
     Some((identity, start, u64::try_from(away).ok()?))
   }
 
+  /// The number of the let-go that gave back the window holding byte `offset` of the object `root` names (`len` bytes
+  /// long), where that window is let go. Each let-go numbers its window afresh (`next_away`), so a window brought back
+  /// and let go again has a new number: a reader that met it once tells a second let-go from the same one met again
+  /// (`slates_git::away`, the push readers' one rule: the same let-go twice with nothing brought back between ends the
+  /// read typed). `None` where the window is held, or the store does not hold the path down to it.
+  pub fn away_number(&self, root: &ContentId, len: u64, offset: u64) -> Option<u64> {
+    let (identity, _, _) = self.away_window(root, len, offset)?;
+    match self.entries.get(&identity)?.kept {
+      Kept::Away { number, .. } => Some(number),
+      _ => None,
+    }
+  }
+
   /// The window holding byte `offset` of the object `root` names (`len` bytes long), let go or held: its identity and its
   /// range in the object, for a reader that keeps it while it reads (A-760 (b) 4d). `None` past the object's end, or
   /// where the store does not hold the path down to it.
@@ -3533,6 +3594,28 @@ mod tests {
     assert_eq!(store.bytes_of(id).as_deref(), Some(bytes));
     assert_eq!(store.counters.brought_back, 1);
     assert_eq!(store.content_bytes, before);
+  }
+
+  /// Goal 93 item 2b, the push readers' one rule (`slates_git::away`). Do: let a landed window go, read its let-go's
+  /// number, bring it back, let it go again. Expect: a number while it is away, none while it is held, and a new one
+  /// for the second let-go, so a reader that met the first tells the two apart.
+  #[test]
+  fn a_window_let_go_again_after_its_bring_back_has_a_new_let_go_number() {
+    let mut store = ContentStore::new(1 << 20, 4096).unwrap();
+    let bytes = vec![7u8; 1000];
+    let id = store.put(&bytes).unwrap();
+    assert!(store.mark_landed(&id));
+    store.let_go(&id).unwrap();
+    let first = store.away_number(&id, 1000, 0);
+    assert!(first.is_some(), "a number while away");
+    store.bring_back(&id, &bytes).unwrap();
+    assert_eq!(store.away_number(&id, 1000, 0), None, "none while held");
+    store.let_go(&id).unwrap();
+    let second = store.away_number(&id, 1000, 0);
+    assert!(
+      second.is_some() && second != first,
+      "{first:?} then {second:?}"
+    );
   }
 
   /// `len` bytes of a pattern that repeats every 251, so no two windows of a test's object are alike.
