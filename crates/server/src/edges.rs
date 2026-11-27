@@ -279,9 +279,6 @@ const HELD_BY_PEER: &str = "fleet.edges.held_by_peer";
 const UNREAD_BY_PEER: &str = "fleet.edges.unread_by_peer";
 /// Counter: edges records learned from a peer. Format: a counter name.
 const LEARNED: &str = "fleet.edges.learned";
-/// Counter: a member's edges record sent inline because the runtime refused its task ([`announce_edges`]): it then waits
-/// on the member loop as before. Format: a counter name in the daemon's status report.
-const INLINE: &str = "fleet.edges.announce_inline";
 
 /// This node's edges and what it learned of its peers' (one field of the control shard's [`ShardState`], A-925).
 #[derive(Debug, Default)]
@@ -347,7 +344,8 @@ pub(crate) fn serve_edges(state: &mut ShardState, peer_anchor: HostId, request: 
 /// ended and never waits on it (A-921 part 5): sent in turn and awaited by the loop, a restarted node's record to a peer
 /// that died just then held the loop for the exchange budget, so it answered no probe, and its peers condemned it
 /// beside the dead one (1 run of A919's owner-restart scene in 5, its silence 1.46 s at the takeover). Bounded by the
-/// record sessions, one a member; a task the runtime refuses runs inline, counted.
+/// record sessions, one a member; a task the runtime refuses leaves the member owed for a later turn, counted by its
+/// kind (`member_task::count_spawn_refused`).
 pub(crate) async fn announce_edges(announcing: &mut BTreeMap<HostId, TaskId>) {
   let done =
     state::with_state(|state| core::mem::take(&mut state.edges.announce_done)).unwrap_or_default();
@@ -376,17 +374,22 @@ pub(crate) async fn announce_edges(announcing: &mut BTreeMap<HostId, TaskId>) {
     if announcing.contains_key(&member) {
       continue;
     }
-    match futures::spawn_child(announce_member(member)) {
+    match crate::member_task::spawn_exchange(announce_member(member)) {
       Ok(task) => {
         announcing.insert(member, task);
       }
-      Err(_) => {
-        let _ = state::with_state_counted(|state| state.count(INLINE, 1));
-        announce_member(member).await;
-        let _ = state::with_state(|state| state.edges.announce_done.remove(&member));
+      // Left owed, so a later turn tries again; never awaited here (main 01a20182's ruling of 2026-11-27 05:11).
+      Err(refusal) => {
+        crate::member_task::count_spawn_refused(crate::member_task::Pass::Edges, &refusal);
       }
     }
   }
+}
+
+/// Makes this node owe its edges record again to every peer, as a change of its edges does (test support for
+/// `Daemon::owe_edges_again`, A-921 part 5 follow-up).
+pub(crate) fn owe_again(state: &mut ShardState) {
+  state.edges.sent_on.clear();
 }
 
 /// This node's edges record owed `member`, on its sessions, each borrowed for its own exchange and returned at its end

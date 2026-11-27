@@ -66095,8 +66095,13 @@ Applied in the same change to:
   - Of the epoch pass, at most one task per anchor is in flight. A canonical announcement reads the anchor's last
     epoch and records the next one once answered. Two at once (the session under the anchor's seed id and the one
     under its learned id) would both name the same epoch.
-  - A task the runtime refuses runs inline, as the pass did before, counted `fleet.plane.announce_inline` or
-    `fleet.edges.announce_inline`.
+  - A task the runtime refuses leaves its member owed, so a later turn tries again, and is counted by pass and by the
+    refusal's kind (`member_task::count_spawn_refused`: `fleet.plane.announce_refused.<kind>` and
+    `fleet.edges.announce_refused.<kind>`, the kinds admission refuses with, `too_many_tasks`, `mem` and
+    `not_on_shard_thread`, and `other`). The loop never runs an exchange itself. As landed first, a refused task ran
+    inline: under the very pressure that refuses a spawn, the loop again held for an exchange budget a member, the
+    mechanism this part removed, and the refusal's kind was dropped (main 01a20182's ruling of 2026-11-27 05:11, §2
+    items 7 and 9). Off a shard thread cannot happen in the member loop; its count would be a bug's, surfaced typed.
   - main's 03:38 ruling offered two ways: settle only once every peer re-keyed, or announce at once to every peer.
     This is the second. A peer's re-key no longer depends on any other peer's answer, so the first is not needed.
 - **Keyed under which process.** Each side now records the process nonce of the peer its installed epoch was agreed
@@ -66105,7 +66110,7 @@ Applied in the same change to:
   stays set across the redial.
 - **Observability.** The per-peer route record used in the diagnosis (direct and indirect answers by relay) does not
   land. Its acknowledgement path would grow entries for any sender, not only the view, and main's 03:33 note asked for
-  counters, not a new interface. The new counters are the two `announce_inline`. The others already existed:
+  counters, not a new interface. The new counters are the refused tasks by kind, above. The others already existed:
   `fleet.plane.announcements_sent`, `fleet.plane.announce_lends`, `fleet.plane.epoch_unanswered`, `fleet.edges.sent`.
 - **Tests.** One test hook: a node withholds its answer to a peer member loop's epoch or edges announcement, or both
   (`Daemon::inject_member_exchange_withhold`), as `inject_live_state_withhold` does for its kind. Each fleet red runs on
@@ -66123,6 +66128,12 @@ Applied in the same change to:
     No other node may hold a dead, or move its fencing epoch, for [`DOUBT_WINDOW_DETECTIONS`] (4) detections. A
     suspicion is no fault there: a peer's probe under a's old keys goes unanswered until it re-keys a, and a refutes it.
     With the edges pass in turn: 3 of 3 red (a held dead 119 to 410 ms after the settle). After: 4 of 4 green.
+  - `a921_a_member_loop_refused_a_task_keeps_answering_and_tries_again` (red first, the follow-up). Node c withholds
+    edges; node b's member loop has every announcement task refused (`Daemon::inject_member_spawn_refusal`, as a full
+    arena refuses) and owes its edges to every peer again (`Daemon::owe_edges_again`). No node may condemn b for four
+    of b's detections, b's refusals are counted by kind more than once, and its record is sent once the refusal lifts.
+    With the inline path: red, every other node held b dead within 460 ms, and no refusal counted. After: 3 of 3
+    green, the refusals counted once a member a turn (2,042 to 24,899 over the window).
   - The owed-part scene and A919's owner-restart scene no longer guard against the adoption (`adopted_elsewhere_of`
     and `Daemon::holder_owner` are removed), and A919's test is no longer ignored. Both, after both fixes: 6 runs each,
     none formed afresh, none failed.
