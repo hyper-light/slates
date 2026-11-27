@@ -8110,30 +8110,13 @@ mod tests {
   fn a_hostile_ledger_question_or_answer_is_refused() {
     let question = sample_ledger_prepare().encode();
     let answer = sample_ledger_promise().encode();
-    for cut in 0..question.len() {
-      assert_eq!(
-        LedgerPrepare::decode(&question[..cut]),
-        Err(RegisterError::MalformedRecord)
-      );
-    }
+    every_cut_of_a_question_is_refused(&question);
     // An answer ending at its positions is a holder's of the build before A-919 (C): no committed floor. Any other cut,
     // the floor's own bytes among them, is refused.
     let floor_at = answer
       .len()
       .saturating_sub(1 + size_of::<u64>() + DIGEST_BYTES);
-    for cut in 0..answer.len() {
-      if cut == floor_at {
-        assert_eq!(
-          LedgerPromise::decode(&answer[..cut]).map(|decoded| decoded.committed_through),
-          Ok(None)
-        );
-        continue;
-      }
-      assert_eq!(
-        LedgerPromise::decode(&answer[..cut]),
-        Err(RegisterError::MalformedRecord)
-      );
-    }
+    every_cut_of_an_answer_but_its_floorless_end_is_refused(&answer, floor_at);
     // The floor's presence byte past its two values.
     let mut floor_flag = answer.clone();
     floor_flag[floor_at] = 2;
@@ -8165,6 +8148,34 @@ mod tests {
       LedgerPromise::decode(&lying),
       Err(RegisterError::MalformedRecord)
     );
+  }
+
+  /// Hostile input (A-364): every cut of a ledger question short of its end is refused.
+  fn every_cut_of_a_question_is_refused(question: &[u8]) {
+    for cut in 0..question.len() {
+      assert_eq!(
+        LedgerPrepare::decode(&question[..cut]),
+        Err(RegisterError::MalformedRecord)
+      );
+    }
+  }
+
+  /// Hostile input (A-364, A-919 (C)): every cut of a ledger answer is refused but the one ending where its committed
+  /// floor begins, a holder's answer of the build before (C), which decodes with no floor.
+  fn every_cut_of_an_answer_but_its_floorless_end_is_refused(answer: &[u8], floor_at: usize) {
+    for cut in 0..answer.len() {
+      if cut == floor_at {
+        assert_eq!(
+          LedgerPromise::decode(&answer[..cut]).map(|decoded| decoded.committed_through),
+          Ok(None)
+        );
+        continue;
+      }
+      assert_eq!(
+        LedgerPromise::decode(&answer[..cut]),
+        Err(RegisterError::MalformedRecord)
+      );
+    }
   }
 
   /// A-364: an acceptor's answer for a ledger's positions is every position it accepted in the range, ascending, each
