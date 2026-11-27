@@ -7676,3 +7676,15 @@ At or past fedcbaf96:
 - macOS (the wall's lane): `cargo test -p slates-ipc --lib spawner::tests::a_spawns_cost_on_its_calling_thread_is_flat_in_the_daemons_descriptors`.
   Green: three rows (a `SPAWN-HELD` line if the runner caps under 100,000). Red: "a row a count", now with the role's
   status and stderr naming the cause.
+
+## 2026-11-27 w-shared, A-914 (d): a914's second push, 6ef619631
+
+At or past 6ef619631, on AC, N runs of each, alone (debug, macOS arm64):
+- `cargo test -p slates-server --test fleet -- --exact --nocapture a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first`
+  Green: its second push landed (`the push during the second death landed`). Red: refused `retry` at its homing
+  ("objects were not kept by enough homes"), or `unable to commit` at its record barrier. For each red, the log's
+  `home … answered a put … other than kept` and `fell short: n of m homes` lines, and a's
+  `vcs_store.homes.reply_unanswered` / `reply_other_version`.
+- `cargo test -p slates-server --test fleet -- --exact --nocapture a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once`
+  Green: `(other version, unanswered) [0, n>=1]`, the push landed or refused only after its window. Red: other version
+  >= 1, or `[0, 0]` (the dead home's exchange settled neither way: tell me).
