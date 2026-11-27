@@ -864,3 +864,10 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     alone; told main.
   - Waiting on main: its 57k rerun at the tip (cuts, copied, held peak, wall); the Windows lanes on
     a_one_page_give_back; the arm64 idle_sweep red at the tip (work it only if it reproduces there).
+- 2026-11-27 13:17  (ace3d298d's commit time; written 2026-11-27 13:42 PST):
+  - LANDED ace3d298d (d4e851d61): t_c1's fix. A recovery's map remake hashed a head file through a window restored let
+    go: refused since 11168fab3 (silently), the file freed; before, a wrong tree. Now brought back from the green's
+    bytes (put_object_whole) and let go again at its number. Reds: (empty store, refused 1, no tree) at main's tip;
+    tree sha1:ad92c4a1 vs sha1:892a5d84 with the old short hash. Bug record and GAPS (live whole builds OPEN; the
+    stop's owed publication OPEN by reading, patch in ~/.local/state/w-perf/patches).
+  - Next: folding proptest (StateLogs mark toggle), then the arm64 idle_sweep, then the cadence re-land.

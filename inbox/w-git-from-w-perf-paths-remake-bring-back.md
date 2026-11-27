@@ -17,3 +17,8 @@ Functions I'm changing in your area:
 - A new helper beside them for that bring-back.
 
 I'll tell you the landed hash.
+
+Landed 2026-11-27 13:42 PST: ace3d298d (commit d4e851d61). paths::count logs every refusal;
+paths::remake_green_sliced puts head files through put_file_whole (ContentStore::put_object_whole from the green's own
+bytes) and lets the brought-back windows go again at their numbers (let_go_brought_again, ContentStore::let_go_again).
+Counters vcs_paths.remake_brought_back and vcs_paths.remake_kept. Merge it before your flip.
