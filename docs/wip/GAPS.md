@@ -491,6 +491,13 @@
 > change: every capped cut read (lists, names, windows let go, windows, region holds, landed records) counted entries
 > without the page head each costs, so it held past its cap, 1.9 times it for the aways (a split's step encoded 14,814
 > bytes against a three-page bound of 12,288); red `a_capped_cut_read_holds_its_cap_counting_each_entrys_head`.
+> A-930 (w-perf; main's ruling of 2026-11-25 on the 57k churn, whose push encoded 43,141,224 Aways bytes, 58% of its
+> image): a page changed only past its committed piece's last coordinate appends to the piece, and its split copies the
+> piece's entries, so a publication encodes only what was appended. Red: 600 let-goes published one at a time encoded
+> 2,588,710 bytes of the family (600 times a 4,314.5-byte tail) for 46,275 appended; now 46,300. Part 2: a window let
+> go is a cut of its committed piece (the windows family was 21,192,055 bytes, 28.5%): 60 let-goes over 300 kept
+> windows, a publication each, encoded 266,160 bytes of the family; now 0. OWED: main's in-place 57k rerun for the
+> after, with its publication count and page.
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
@@ -591,9 +598,23 @@
 >   let go by its number; both `failed to update ref` before, and after, the push's own driver bringing it back; main's
 >   run 10 of 16 had the delete pass with nothing brought back when the let-go was made before the push's task). No unit
 >   red below the server: the miss is `ShardGreens`', and `prepare` is driven only by the server's judge.
-> - OPEN: B3 (the admission's peel and references), B4 (the policy's reads), B5 (`PushedObjects::bytes` of a pushed
->   object, `Malformed`), B6 (a verdict's one-call build), B7 (`push_of`'s peel at judge time, after `prepare`'s), B8
->   (the encoding's tree walk: time, not correctness).
+> - **B3 BUILT (w-git, 2026-11-26): the admission's reads.** The admission (`admitting.rs`) reads bytes through
+>   `Repository::bytes_of` for a tag's peel and for the trees its walk of an update meets unreached (a commit's parents,
+>   generation and references come from its index row), and the server's `SealedPush::admission_turn` answered ready
+>   over its refusal, so the append's own admission answered it: a lost error (CLAUDE.md §2 item 9, main's ruling). Its
+>   harm is narrow: in the same `ServerJudge::ready` the command's preparation re-reads the same tag or trees, waits on
+>   their let-go window and its driver brings it back, so on any one push's path it heals; it bites where another party
+>   lets the window go between a finished preparation and an unfinished admission. Now the turn's reads are quiet
+>   (`Repository::reading_quietly`: `wait_for` keeps a read's let-go for its reader, never the repository's shared slot;
+>   `bytes_of`'s pushed arm names `Push::bytes`'s let-go), and `admission_turn` notes the let-go in the push's own slot
+>   and answers not ready, by the one rule keyed by its number (`SealedPush::admission_seen`). Red at the site:
+>   `git_push::tests::b3_an_admission_turn_over_a_let_go_tag_answers_not_ready_and_notes_the_push_alone` (ready before).
+>   The healed path's net: `b3_a_create_at_a_commit_a_green_holds_lands_over_let_go_windows`,
+>   `b3_a_create_whose_base_search_runs_over_a_let_go_commit_lands`,
+>   `b3_a_merge_whose_admission_walks_a_let_go_parent_brings_it_back_and_lands`.
+> - OPEN: B4 (the policy's reads), B5 (`PushedObjects::bytes` of a pushed object, `Malformed`), B6 (a verdict's one-call
+>   build), B7 (`push_of`'s peel at judge time, after `prepare`'s), B8 (the encoding's tree walk: time, not
+>   correctness).
 > **P OPEN (w-git; main's r229, 2026-11-23): git/git's HTTP mirror clone takes about 100 s** (97.9 and 107.7 s, 556 MB
 > against stock git's 612 MB; the work clone 92.9 and 97.2 s), the daemon CPU-bound at 97% of one core: blake3,
 > `Index::get`, `ContentStore::get` / `len_of` / `window_at_in`, `Positions::settle`. No stall; to be profiled.
@@ -791,7 +812,10 @@
 > since 13a (release probe 15's leader at about 1.4 ms p50). Copy's `landing.release` unit is kernel time in debug
 > (3.0 ms, 99.8% system: an allocator region's return, owed its own piece). The register's op publishes ahead of
 > itself since 13b; the publication is one whole step (8.8 ms debug, owed turns if release finds it past the bar), and
-> the record's inline chain entry (430,978 bytes) is next, (a). Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
+> the record's inline chain entry (430,978 bytes) was to be next, (a). Measured and rejected: the log's write of it was 0.32
+> ms of the op's 4.29 (debug), and the cost was the identity's hash of the whole op (4.92 ms), which hashes each entry as
+> its digest since 13c. The log write's about 48 bytes a path stays, for a wider probe to judge. Next: copy's release
+> unit (kernel time), then move's `stage.committing` and `landing.apply`. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's
@@ -3611,7 +3635,9 @@
 > snapshot released it (A-71's reset), and each snapshot slot past its payload, a slice at a time beside the
 > journal's give-back, lowering their marks after. `a_released_rings_pages_go_back_to_the_os` (macOS, by the
 > physical footprint): 96 MiB logged and released, the process charged 98 MiB, then 4 MiB after the give-back, 94 MiB
-> given back. OWED: the same test on Linux, by RSS (main's lane).
+> given back. On Linux, by RSS (main's diag run 45946142955 at d295fc3ca, debug, five runs a runner, every one exit 0
+> and identical): ubuntu-latest (x86_64) 3 MiB before, 99 MiB with the released ring, 3 MiB after its give-back, 96 MiB
+> given back; ubuntu-24.04-arm 2, 99 and 2 MiB, 96 MiB given back; on both the ring's mark 64 and its tail 0.
 >
 > **A-752 (2026-11-20, w-engine; Ada's rule, main's order):** a push's work build a unit at a time: part 1 the
 > deriver's replay indexed (O(n^2) -> O(n log n)); part 2 `push::Building` over the turns before the verdict

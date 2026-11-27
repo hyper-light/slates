@@ -5062,7 +5062,7 @@ fn a_push_whose_barrier_sees_no_progress_is_reported_ng_not_cut_off() {
       log: slates_db::catalog::StateLog::Names,
       from: 0,
       to: 0,
-      identity: [0; 32],
+      identity: slates_db::catalog::OperationIdentity { digest: [0; 32] },
       spans: vec![slates_db::catalog::LogSpan {
         log: slates_db::catalog::LogName::Green { green: main },
         from: 0,

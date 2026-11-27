@@ -766,7 +766,7 @@ fn main_bound((repository, root): (RepositoryId, VolumeId)) -> slates_db::catalo
     log: StateLog::Names,
     from: 0,
     to: 1,
-    identity: [1; 32],
+    identity: slates_db::catalog::OperationIdentity { digest: [1; 32] },
     spans: vec![LogSpan {
       log,
       from: 0,
