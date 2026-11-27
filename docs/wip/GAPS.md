@@ -256,9 +256,10 @@
 > upgrade it therefore cannot rebuild a replica from the old-format records it holds (`merge_origin::rebuild_replica_through`
 > finds nothing), and the owner reships only versions not yet placed. Until each green's next version places at f + 1 in
 > the new format, its acknowledged versions are held only on the owner's own chain, and an owner lost for good in that
-> window leaves its successor records it refuses: those versions lost. Every bump so far (formats 1 to 4: A-255, A-288,
-> A-385, A-404) had this window; nothing written says whether a fleet is upgraded whole or rolling. A-908 avoids a
-> format change for this reason (a holder reads a green's lineage membership from the names log it already holds).
+> window leaves its successor records it refuses: those versions lost. Every bump so far (formats 1 to 5: A-255, A-288,
+> A-385, A-404, A-932) had this window; nothing written says whether a fleet is upgraded whole or rolling. A-908 avoided
+> a format change for this reason (a holder reads a green's lineage membership from the names log it already holds);
+> A-932 made one anyway, by main's ruling (a) of 2026-11-27, since the family bit A-908 read instead cannot decide.
 > Nothing is built on either answer.
 > **BUILT (A-908 with part 4, w-shared, 2026-11-24): a branch's green is replicated by its lineage.** A holder reads a
 > green's membership from the names log it holds and makes version 0 as the owner made the green (a root founds its
@@ -270,6 +271,15 @@
 > warm between the branch's versions, c refusing a's records, the branch's next push lands on a and b; red with part 4's
 > rebuild reverted in a scratch copy (`unable to commit`, b's `merge.recompute_mismatch` 1). Gate 16 (`v3_takeover` at
 > b7e65cc63, part 4 in) held: 40 of 40, release and debug.
+> **FIXED (A-932, w-interop, 2026-11-27; main's ruling (a)): in a fleet, a green created alone never committed a
+> version.** A holder made version 0 by the family bit, waiting for a family green's join (A-908), and every green made
+> alone has been a family of its own since A-636 part 2b-2. So its holders refused each of its records
+> `merge.replica.member_unknown` without end, and a restarted holder's rebuild did too. First bad 02bd0ec94: main's A/B
+> against 41e00948e, good 9 s and 8 s, bad 39 s and 35 s. Now the merge record names the green's lineage (format 5; 4
+> refused typed), and a holder makes a green whose record names none at once
+> (`docs/bugs/2026-11-27-a-green-standing-alone-waited-on-its-holders-for-a-join-that-never-comes.md`). Red first: two
+> `merge_service` units and one `merge_origin` unit. The fleet probe test passed in 5.82 s. OWED (main): the whole
+> `tests/fleet.rs` on the Mac and the Windows lanes, then the gap that no Unix lane runs it.
 > **OPEN (w-interop, 2026-11-27; main's ruling of 07:08; found by reading the code, nothing run yet): a lone green
 > later adopted as a repository's root keeps a standalone replica on its holders, so a branch of it may never reach a
 > holder.** A green created alone is a family root of its own (A-636 part 2b-2), and its version 0 shipped while it
@@ -393,6 +403,13 @@
 >     which no longer waits on them. Red first, both: the peers re-keyed a within its 1 s detection (22 to 197 ms,
 >     against 4.4 to 7.6 s), and no peer condemned a while a silent one held its edges (3 of 3 red before). The
 >     adoption guard is gone, and A919's owner-restart test runs again (6 of 6 with the owed-part scene).
+>   - **FIXED, v3_takeover's adoption stall (A-933, w-shared, 2026-11-27):** about 1 run in 80 on Linux CI, a
+>     successor gave a taken-over green up "waiting on its adoption". Its rebuild could reach neither the record
+>     adoption (A-364: it checked the adopted record alone, so a successor short of version 0 never became
+>     `RecordsShort`) nor its owed push's build (a chain refused `REPLICA_OWES` dropped the replica and began again
+>     from version 0). Both are reached now. Red first: a successor holding none of the green's records gave it up after
+>     37 attempts; it adopts it in 7 now, and takes a push. A-918 B's newcomer half stays open below. **Owed (main):**
+>     gate 24.
 >   - **KNOWN LIMIT (main 01a20182's ruling of 2026-11-27): a forward's first try may go to a readmitted creator.**
 >     A readmission drops the host's completed takeover (`RegionalConfiguration::admit`, A-309) and its retirement is
 >     gone once that completes, so A-921 part 2's creator skip has nothing to read for it: a node that has not yet
@@ -536,6 +553,14 @@
 > go is a cut of its committed piece (the windows family was 21,192,055 bytes, 28.5%): 60 let-goes over 300 kept
 > windows, a publication each, encoded 266,160 bytes of the family; now 0. OWED: main's in-place 57k rerun for the
 > after, with its publication count and page.
+> **Part 3 REVERTED (main 01a20182, 2026-11-27 08:33):** 7acfd685c's cadence (a cut nobody waits on deferred until its
+> changes and held frees reach its cost) lost a named text across a Subversion restart:
+> `repository::store_tests::a_subversion_restart_replays_a_named_text_with_one_released_window` and
+> `…a_subversion_restart_replays_two_named_texts_whose_windows_are_resident` failed at store_tests.rs:1695, 2 of 2,
+> "(0, 6) named texts brought back", the text reading None after the reboot; w-svn's bisect: with 7acfd685c's crates
+> diff reversed both pass, 2 of 2. Its 57k effect, measured before the revert (main's a930-57k run 1 at 81950e77c, load
+> 62-66): cuts 3,291 to 5, bytes copied 697,376,174 to 7,084,213, held-deferred peak 148,221,952 bytes, resident after
+> the push 845,504 KiB (834,960 at 894a1e111). Re-lands with the restart's red first (w-perf).
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
