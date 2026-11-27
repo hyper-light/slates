@@ -38618,33 +38618,54 @@ fn condemnation_of(daemon: &Daemon, member: HostId, before: Option<u64>) -> Opti
   (dead || epoch != before).then(|| format!("held {held:?}, epoch {before:?} -> {epoch:?}"))
 }
 
-/// What [`rekeyed_after_warm_restart`] watched: whether the node restarted and settled, its detection term, and per
-/// other node (by index, the silent one left out) when it re-keyed the node, in ms after the settle.
+/// What [`rekeyed_after_warm_restart`] watched: whether the node restarted and settled, its detection term, its own
+/// measured wake lateness, and per other node (by index, the silent one left out) when it was last seen not yet
+/// re-keying the node and when first seen re-keyed, in ns after the settle, with that node's measured wake lateness.
 struct Rekeyed {
   restarted: bool,
   detection: u64,
-  heard_at: Vec<(usize, Option<u128>)>,
+  lateness: u64,
+  watched: Vec<Watched>,
+}
+
+/// One node's watch in [`Rekeyed`]: the re-key happened after `unkeyed_ns` (the last look that saw it not yet) and by
+/// `seen_ns` (the first that saw it), so the test's own looks, one control-shard question per node in turn, add nothing
+/// to what is judged.
+#[derive(Debug)]
+struct Watched {
+  node: usize,
+  unkeyed_ns: u128,
+  seen_ns: Option<u128>,
+  lateness: u64,
 }
 
 impl Rekeyed {
-  /// Asserts the node restarted and every watched node re-keyed it within its detection on the wall's clock: the watch
-  /// is charged in fleet periods, which a loaded host runs late.
+  /// Asserts the node restarted and every watched node re-keyed it within its detection on the wall's clock, allowing
+  /// the measured wake lateness of the two nodes whose waits the re-key rides (A-921 part 5, main 01a20182's order of
+  /// 2026-11-27 09:50: Windows' timer tick of 15.625 ms put one node 10 ms past a bare 1 s). Judged from the last look
+  /// that saw it not yet, so the looks' own lag is never counted; the watch is charged in fleet periods, which a loaded
+  /// host runs late.
   fn assert_within(&self, scene: &str) {
-    let detection = u128::from(self.detection);
-    let within = |heard: &Option<u128>| {
-      heard.is_some_and(|ms| ms.saturating_mul(NANOS_PER_MILLI) <= detection)
+    let within = |watched: &Watched| {
+      let bound = u128::from(
+        self
+          .detection
+          .saturating_add(self.lateness)
+          .saturating_add(watched.lateness),
+      );
+      watched.seen_ns.is_some() && watched.unkeyed_ns <= bound
     };
     eprintln!(
-      "{scene}: restarted {}; detection {} ns; each other node re-keyed it at (node, ms after the settle) {:?}",
-      self.restarted, self.detection, self.heard_at
+      "{scene}: restarted {}; detection {} ns, its lateness {} ns; each other node's watch (ns after the settle) {:?}",
+      self.restarted, self.detection, self.lateness, self.watched
     );
     assert!(self.restarted, "the node restarted warm and settled");
     assert!(
-      self.heard_at.iter().all(|(_, heard)| within(heard)),
+      self.watched.iter().all(within),
       "every other node but a silent one re-keyed the node under its new process within a detection ({} ns) of its \
-       settle: {:?} ms",
+       settle, with the two nodes' wake lateness: {:?}",
       self.detection,
-      self.heard_at
+      self.watched
     );
   }
 }
@@ -38652,7 +38673,8 @@ impl Rekeyed {
 /// Restarts `node` warm and watches, for as long as its own detection term states (`Daemon::failover_detection_ns`: how
 /// long its peers take to condemn it), each other node but `silent` re-key it under its new process: joined to the
 /// detector, keyed by an installed epoch, and that epoch agreed with the new process (`Daemon::member_keying`). Past
-/// the detection a probe under the old keys goes unanswered, and a peer's detector may condemn a live member.
+/// the detection a probe under the old keys goes unanswered, and a peer's detector may condemn a live member. Each
+/// node's measured wake lateness (`detector_lateness_ns`) read once the watch ends.
 fn rekeyed_after_warm_restart(fleet: &mut GitFleet, node: usize, silent: Option<usize>) -> Rekeyed {
   let member = fleet.hosts[node];
   let restarted = fleet.restart_warm(node);
@@ -38663,34 +38685,53 @@ fn rekeyed_after_warm_restart(fleet: &mut GitFleet, node: usize, silent: Option<
     .ok()
     .flatten()
     .unwrap_or(HEARTBEAT_NS);
-  let mut heard_at: Vec<(usize, Option<u128>)> = (0..fleet.daemons.len())
+  let mut watched: Vec<Watched> = (0..fleet.daemons.len())
     .filter(|at| *at != node && Some(*at) != silent)
-    .map(|at| (at, None))
+    .map(|at| Watched {
+      node: at,
+      unkeyed_ns: 0,
+      seen_ns: None,
+      lateness: 0,
+    })
     .collect();
   let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
   let _ = poll_until(&observed, Duration::from_nanos(detection), || {
-    for (at, heard) in heard_at.iter_mut().filter(|(_, heard)| heard.is_none()) {
+    for watch in watched.iter_mut().filter(|watch| watch.seen_ns.is_none()) {
+      let looked = settled.elapsed().as_nanos();
       let rekeyed =
-        fleet.daemons[*at]
+        fleet.daemons[watch.node]
           .member_keying(member)
           .is_ok_and(|(joined, keyed, agreed)| {
             joined && keyed == Some(true) && agreed.is_some() && agreed == process
           });
       if rekeyed {
-        *heard = Some(settled.elapsed().as_millis());
+        watch.seen_ns = Some(settled.elapsed().as_nanos());
+      } else {
+        watch.unkeyed_ns = looked;
       }
     }
-    Ok(heard_at.iter().all(|(_, heard)| heard.is_some()))
+    Ok(watched.iter().all(|watch| watch.seen_ns.is_some()))
   });
+  drop(observed);
+  for watch in &mut watched {
+    watch.lateness = detector_lateness_ns(&fleet.daemons[watch.node]);
+  }
   Rekeyed {
     restarted,
     detection,
-    heard_at,
+    lateness: detector_lateness_ns(&fleet.daemons[node]),
+    watched,
   }
 }
 
-/// Format: nanoseconds in a millisecond, to compare a time recorded in milliseconds with one in nanoseconds.
-const NANOS_PER_MILLI: u128 = 1_000_000;
+/// `daemon`'s own wake lateness as its detector measured it (`FleetReport::detector_granularity_ns`), nanoseconds; zero
+/// where its status did not answer or it has not measured yet.
+fn detector_lateness_ns(daemon: &Daemon) -> u64 {
+  match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus { memory: false }) {
+    ReplyBody::DaemonStatus { report } => report.fleet.detector_granularity_ns,
+    _ => 0,
+  }
+}
 
 /// One attempt at [`a921_a_holder_that_missed_an_owners_part_before_its_warm_restart_is_shipped_it_after`]'s scene: a
 /// four-node anchored git fleet, `main` pushed and held by both of a's remote candidates, a push on top whose state-log
