@@ -71,6 +71,20 @@ impl Drop for Decoding {
   }
 }
 
+/// The shard of the node's `shards` that rendezvous ranks first for `key`, each ranked by its place among them (its
+/// partition), never by its id: the one ranking of a node's shards every placement of this crate uses (a homed object's
+/// home, `vcs_store::homes::home_of`; a push's intake, [`intake_shard`]). A shard's id is the runtime's, made afresh each
+/// start and numbered across a process's daemons, so a ranking by it moves with the process: an in-process successor
+/// with shards 1 and 3 where its predecessor had 0 and 2 read 54 of 55 homed objects as held nowhere (w-hg, 2026-11-26).
+/// None for no shards.
+pub(crate) fn first_by_place(shards: &[u16], key: &[u8]) -> Option<u16> {
+  let places: Vec<u64> = (0..shards.len())
+    .map(|place| u64::try_from(place).unwrap_or(u64::MAX))
+    .collect();
+  let first = rendezvous_ranked_by_key(&places, key).first().copied()?;
+  shards.get(usize::try_from(first).ok()?).copied()
+}
+
 /// The shard of `shards` a push keyed `key` that arrived on `arrived` is decoded on (module docs): the arrival shard or
 /// the one rendezvous ranks first for `key`, whichever `load` says has fewer intakes decoding, the arrival shard on a
 /// tie. `load` is [`decoding_on`] in the daemon; a test passes its own.
@@ -83,11 +97,7 @@ pub(crate) fn intake_shard(
   shards: &[u16],
   load: impl Fn(u16) -> u64,
 ) -> u16 {
-  let members: Vec<u64> = shards.iter().map(|shard| u64::from(*shard)).collect();
-  let other = rendezvous_ranked_by_key(&members, key)
-    .first()
-    .and_then(|member| u16::try_from(*member).ok())
-    .unwrap_or(arrived);
+  let other = first_by_place(shards, key).unwrap_or(arrived);
   if load(other) < load(arrived) {
     other
   } else {
@@ -295,5 +305,26 @@ mod tests {
       4,
       "a tie stays where it arrived"
     );
+  }
+
+  /// One ranking of a node's shards (main 01a20182's order of 2026-11-26: the shard's place, never its runtime id). Do:
+  /// place many pushes' intakes over four shards, every other one busy, then over the same four renumbered as a
+  /// successor's start numbers them. Expect each push placed at the same place among the shards either way. Red before:
+  /// ranked by id, renumbered shards moved the choice.
+  #[test]
+  fn a_pushs_intake_shard_is_ranked_by_place_whatever_the_shards_ids() {
+    let shards = [0u16, 2, 4, 6];
+    let renumbered = [1u16, 3, 5, 7];
+    let place = |shards: &[u16], shard: u16| shards.iter().position(|at| *at == shard);
+    for push in 0..64u32 {
+      let key = format!("push {push}");
+      let chosen = intake_shard(shards[0], key.as_bytes(), &shards, |shard| {
+        u64::from(shard == shards[0])
+      });
+      let again = intake_shard(renumbered[0], key.as_bytes(), &renumbered, |shard| {
+        u64::from(shard == renumbered[0])
+      });
+      assert_eq!(place(&shards, chosen), place(&renumbered, again), "{key}");
+    }
   }
 }

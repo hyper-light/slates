@@ -5,7 +5,8 @@
 //! hot set (§4.10's family placement). Everything else of a repository need not live there: a monorepo's content past
 //! one shard's budget would otherwise bound the repository by that shard, and its CPU by that shard's core. Content
 //! outside the owner's hot set is homed by its identity instead: the content id ranks the node's shards by rendezvous
-//! (`slates_db::register::rendezvous_ranked_by_key`, the one weight every placement in slates ranks by), and the first is
+//! over their places (their partitions, never their runtime ids: `vcs_share::place::first_by_place`, over
+//! `slates_db::register::rendezvous_ranked_by_key`, the one weight every placement in slates ranks by), and the first is
 //! its home. The fleet's half (piece 6) ranks the region's members by the same weight, holding f+1 homes; within one
 //! node one home, since every shard of a node shares its RAM and fails with it.
 //!
@@ -55,7 +56,6 @@
 //! nearest kind the wire carries.
 
 use slates_cluster::homes::HomeOwner;
-use slates_db::register::rendezvous_ranked_by_key;
 use slates_vcs::preimage::Preimages;
 use slates_vcs::{ContentId, ContentRefused};
 
@@ -396,13 +396,7 @@ pub(crate) async fn published_within(
 /// predecessor had 0 and 2, and read 54 of 55 homed objects as held nowhere, w-hg's crash test of 2026-11-26), while the
 /// shard image keeps what each partition held.
 pub(crate) fn home_of(shards: &[u16], identity: &ContentId) -> Option<u16> {
-  let places: Vec<u64> = (0..shards.len())
-    .map(|place| u64::try_from(place).unwrap_or(u64::MAX))
-    .collect();
-  let first = rendezvous_ranked_by_key(&places, &identity.0)
-    .first()
-    .copied()?;
-  shards.get(usize::try_from(first).ok()?).copied()
+  crate::vcs_share::place::first_by_place(shards, &identity.0)
 }
 
 /// Keeps the object `bytes` on this shard, its home, held once more for its sender (cut at the store's windows, named by
