@@ -541,9 +541,20 @@
 >   stops_the_resolution_until_it_is_back` and `git_push::tests::b1b_a_thin_pushs_delta_on_a_delta_whose_base_was_
 >   let_go_is_resolved_once_it_is_back` (a nanosecond step budget, the first push's pack let go once the middle tree
 >   is admitted).
-> - OPEN: B2 (the server's tag-headed green, `ShardGreens::tree_of`), B3 (the admission's peel and references), B4 (the
->   policy's reads), B5 (`PushedObjects::bytes` of a pushed object, `Malformed`), B6 (a verdict's one-call build), B7
->   (`push_of`'s peel at judge time, after `prepare`'s), B8 (the encoding's tree walk: time, not correctness).
+> - **B2 BUILT (w-git, 2026-11-26): the server's tag-headed green.** `ShardGreens::tree_of` reads the annotated tag at
+>   a green's head through the push's `IndexedObjects`; on a let-go window it answered no version, and the verdicts
+>   took the ref as moved (`failed to update ref`, "cannot lock ref"), for an update and for a delete alike. Now
+>   `Verdicts::prepare` asks an update's and a delete's base through `Verdicts::base_of`, which answers wait where the
+>   version is none and the repository names a let-go window, by the one rule, so the push's driver brings it back
+>   (a delete was answered ready at once by `ServerJudge::ready`, and now takes the build turn its preparation needs);
+>   `IndexedObjects` drops a let-go met by an earlier ask before one answered from what it kept. Reds:
+>   `git_push::tests::b2_an_update_of_a_ref_whose_green_is_headed_by_a_let_go_tag_brings_it_back_and_lands` and
+>   `b2_a_delete_of_...` (the tag in a window of its own past a filler blob, every window let go and the repository
+>   idle; both `failed to update ref` before). No unit red below the server: the miss is `ShardGreens`', and
+>   `prepare` is driven only by the server's judge.
+> - OPEN: B3 (the admission's peel and references), B4 (the policy's reads), B5 (`PushedObjects::bytes` of a pushed
+>   object, `Malformed`), B6 (a verdict's one-call build), B7 (`push_of`'s peel at judge time, after `prepare`'s), B8
+>   (the encoding's tree walk: time, not correctness).
 > **P OPEN (w-git; main's r229, 2026-11-23): git/git's HTTP mirror clone takes about 100 s** (97.9 and 107.7 s, 556 MB
 > against stock git's 612 MB; the work clone 92.9 and 97.2 s), the daemon CPU-bound at 97% of one core: blake3,
 > `Index::get`, `ContentStore::get` / `len_of` / `window_at_in`, `Positions::settle`. No stall; to be profiled.

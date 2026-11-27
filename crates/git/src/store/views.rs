@@ -137,11 +137,12 @@ impl<'a> IndexedObjects<'a> {
 
 impl receive::Repository for IndexedObjects<'_> {
   fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+    // A let-go met by an earlier ask is not this ask's, even where this one is answered from what the view kept.
+    self.away.set(None);
     if let Some(kept) = self.kept.get(id) {
       count(&self.counters, |counters| &mut counters.lent_again);
       return Some(kept);
     }
-    self.away.set(None);
     let (row, content) = self.repository.indexed(self.store, id)?;
     // A window the store lends is lent again with no copy; one it copies out, or one read where it lies in its pack,
     // is kept below, as an assembled object is.

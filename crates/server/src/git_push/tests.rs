@@ -1763,6 +1763,130 @@ fn thin_chain_update_over_a_create(
   (repository, update, pack, middle)
 }
 
+/// B2 of the landed let-go's lift (main's order of 2026-11-26; w-git's read sweep: the server's tag-headed green,
+/// `ShardGreens::tree_of`, read the annotated tag at its green's head through `IndexedObjects`, and on a let-go window
+/// answered no version, which the verdicts took as a ref that moved). Do: create `main` and `refs/tags/v1`, an
+/// annotated tag of `main`'s commit lying in a window of its own past a filler blob ([`tag_headed_create`]); let every
+/// window of that pack go and the repository go idle, its reads' cache given back; then update `refs/tags/v1` to
+/// another annotated tag of the same commit, the pack that tag alone. Expect: `ok`, the old tag's window brought back
+/// (`vcs_store.read_through.brought_back` moved). Red before: `ng refs/tags/v1 failed to update ref` ("cannot lock
+/// ref"), the old value read as moved.
+#[test]
+fn b2_an_update_of_a_ref_whose_green_is_headed_by_a_let_go_tag_brings_it_back_and_lands() {
+  let (updated, (at_let_go, after), refused) =
+    tag_headed_pushed("tag-headed-update", |old, commit| {
+      let (new, tag) = tag_object("v1 again", (commit, "commit"));
+      let pack = pack_of_objects(&[(slates_git::object_name::Kind::Tag, tag)]);
+      request(
+        &[(&old.to_string(), &new.to_string(), b"refs/tags/v1")],
+        CAPABILITIES,
+        &pack,
+      )
+    });
+  assert_eq!(
+    reasons(&updated),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    updated.outcomes
+  );
+  assert!(
+    after > at_let_go,
+    "the old tag's window brought back: {at_let_go} -> {after}"
+  );
+}
+
+/// B2's delete: [`b2_an_update_of_a_ref_whose_green_is_headed_by_a_let_go_tag_brings_it_back_and_lands`]'s create and
+/// let-go, then a delete of `refs/tags/v1`. Expect: `ok`, the old tag's window brought back. Red before: `ng
+/// refs/tags/v1`, the delete's check that its old value is its green's head reading no version.
+#[test]
+fn b2_a_delete_of_a_ref_whose_green_is_headed_by_a_let_go_tag_brings_it_back_and_lands() {
+  let (deleted, (at_let_go, after), refused) = tag_headed_pushed("tag-headed-delete", |old, _| {
+    request(
+      &[(&old.to_string(), "", b"refs/tags/v1")],
+      CAPABILITIES,
+      &[],
+    )
+  });
+  assert_eq!(
+    reasons(&deleted),
+    [b"ok"],
+    "{:?}; bring-backs refused, past patience, unanswered: {refused:?}",
+    deleted.outcomes
+  );
+  assert!(
+    after > at_let_go,
+    "the old tag's window brought back: {at_let_go} -> {after}"
+  );
+}
+
+/// On a stored daemon's repository `name`: [`tag_headed_create`] pushed, `ok`; every window of its pack let go by hand
+/// and the repository idle (`git_encode::give_back_idle`, so no read is served from what its reads kept); then the
+/// request `second` makes of the tag's id and its commit's, driven as an edge drives it ([`let_go_when`]). What that
+/// push received, the windows brought back before and after it, and the bring-backs refused.
+fn tag_headed_pushed(
+  name: &str,
+  second: impl FnOnce(ObjectId, ObjectId) -> Vec<u8>,
+) -> (Received, (u64, u64), (u64, u64, u64)) {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository = git_repository_on(&daemon, name);
+  let window = crate::daemon::observe_first(&daemon, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .expect("the content store");
+  let (create, pack, (tag, commit)) = tag_headed_create(window);
+  let (created, _) = pushed_in_steps(&daemon, repository, &create).unwrap();
+  assert_eq!(reasons(&created), [b"ok", b"ok"]);
+  crate::daemon::observe_first(&daemon, move |state| {
+    let _ = let_go_by_hand(state, &pack);
+    crate::vcs_store::git_encode::give_back_idle(state, repository);
+  });
+  let request = second(tag, commit);
+  let (received, counts, _) =
+    crate::test_store::run_on_first(
+      &daemon,
+      move || async move {
+        let_go_when(repository, &request, (&[], LetGoAt::Already, Meddle::Not)).await
+      },
+      HISTORY_PATIENCE,
+    )
+    .unwrap();
+  let refused = crate::daemon::observe_first(&daemon, bring_backs_refused);
+  daemon.stop();
+  (received, counts, refused)
+}
+
+/// Shape: the filler blob [`tag_headed_create`] lays between its commit and its tag, in content store windows: past
+/// one, so the tag lies in a window of its own.
+const FILLER_WINDOWS: usize = 2;
+
+/// A create of `main` at a commit of one file and of `refs/tags/v1` at an annotated tag of it, the pack laid commit,
+/// tree, file, a filler blob of [`FILLER_WINDOWS`] content store windows of bytes that do not compress, then the tag,
+/// so the tag's window (each `window` bytes) is not its commit's: the request, its pack, and the tag's and the commit's
+/// ids.
+fn tag_headed_create(window: usize) -> (Vec<u8>, Vec<u8>, (ObjectId, ObjectId)) {
+  use slates_git::object_name::Kind;
+  let (commit, mut objects) = flat_commit(1, "tagged", None);
+  objects.push((
+    Kind::Blob,
+    crate::vcs_store::tests::incompressible(window * FILLER_WINDOWS),
+  ));
+  let (tag, tag_bytes) = tag_object("v1", (commit, "commit"));
+  objects.push((Kind::Tag, tag_bytes));
+  let pack = pack_of_objects(&objects);
+  let create = request(
+    &[
+      ("", &commit.to_string(), b"refs/heads/main"),
+      ("", &tag.to_string(), b"refs/tags/v1"),
+    ],
+    CAPABILITIES,
+    &pack,
+  );
+  (create, pack, (tag, commit))
+}
+
 /// On a repository `name` of `daemon`: `main` created, `ok`, at a commit of a flat tree of [`THIN_TREE_FILES`] files,
 /// then the request updating it to a commit whose tree adds a file, sent as git sends a thin pack (the tree a REF_DELTA
 /// against the first tree, which the pack does not carry): the repository, that request, and the create's pack.
@@ -1893,6 +2017,8 @@ enum LetGoAt {
   Checks,
   /// Once the object of this name is admitted to the push's quarantine.
   Admitted(ObjectId),
+  /// Before the push began: its test let the pack go itself, and `let_go` is empty.
+  Already,
 }
 
 /// [`let_go_at_its_checks`], the pack let go at `at`.
@@ -1912,7 +2038,9 @@ async fn let_go_when(
   let received = loop {
     if at_let_go.is_none() && is_due(&push, at) {
       at_let_go = Some(on_state(|state| {
-        let _ = let_go_by_hand(state, let_go);
+        if !let_go.is_empty() {
+          let _ = let_go_by_hand(state, let_go);
+        }
         brought_back_count(state)
       }));
     }
@@ -1951,6 +2079,7 @@ fn is_due(push: &ReceivePack, at: LetGoAt) -> bool {
       .quarantine
       .as_ref()
       .is_some_and(|quarantine| quarantine.quarantine().object(&id).is_some()),
+    LetGoAt::Already => true,
   }
 }
 
