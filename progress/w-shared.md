@@ -744,3 +744,13 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
   - Red green; unit 12/12; db 204/204; fleet focused 17/17 and 7/7.
 - Landing: one push of the commits above plus (C) as db+model, then server, after _floor and the other seven configs hold on 61b68654ea2e1e31.
 - Next: a914's placed Some(2) shape rerun after (C). (w-interop has Some(1); w-svn has the credential retry bug.)
+
+## 2026-11-27 15:33 PST: A-919 mark and (C) landed (slates 41aa47870)
+- In the push:
+  - 7d43599ae and 87cd91682: the forget's mark (model);
+  - c30ea80ed: GAPS a914 4/16;
+  - 0360259ef: merge of w-perf's StateLogs mark fix;
+  - 4bd396c76: (C) db and model, with the TLC table;
+  - 5974f9462: (C) server and vfs.
+- TLC on sha256 61b68654ea2e1e31: _floor_bounded holds (50.0M, bounded); _forget and the base config hold; all four non-vacuity configs fail as required; the full _floor is still running; _3 partial.
+- Owed (main): the wall; a914 x16 (does (C) clear runs 5/13's shape?); the full _floor's verdict.
