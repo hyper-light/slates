@@ -132,6 +132,11 @@
 > (`~/.local/state/w-hg-logs/2026-11-26-idle-sweep-no-poller.txt`), so the count is not vacuous. Its old
 > `started == 1` could not hold: written files take their sealing and busy passes first (4 started), so it counts the
 > one cut and its one resume instead, which a give-back left for later passes would exceed.
+> Amended 2026-11-27 (w-perf; main's diag 11): two more host premises did not hold. Under ThreadSanitizer a give-back
+> step took all 16 runs (`daemon::purge_slice_blocks` is an archive slice over the discard size: 3 steps for 65,536
+> bytes), so "a step a run" failed; on windows-11-arm a resumed give-back met the poller again, cut twice and resumed
+> twice in its one pass, so "once" failed. The product was right both times. The test now holds every cut to its
+> resume in the pass (`left > 0`, `resumed == left`): a give-back left for later passes resumes none at an idle point.
 
 > **Open (w-shared, 2026-11-21; closed by A-826 when it lands): a holder-route submit of 320 MiB and above does not
 > complete under load.** Its `SubmitComputed` carried the whole increment over the forward lane; on a loaded machine
@@ -4924,7 +4929,13 @@
 > `HTTPD_MODULES` has it and skipped, said so, where it does not (neither Mac has it). svn's commit and hg's push and
 > pull are each read back and compared across the servers: svn's commit by its served content and changed paths, hg's
 > pull by `hg verify` and exactly the source's changesets and the new one. Smoke run on the MacBook at a debug build:
-> every check passed, each digest one across the servers. Owed: Gitaly, the Linux kernel dataset, concurrent clients.
+> every check passed, each digest one across the servers. Concurrent clients since 2026-11-27 (w-interop, main's
+> ruling of 15:02; `crates/cli/bench/concurrent.sh`): N stock clients at once per server, git's clone, fetch and push,
+> hg's clone and pull, svn's checkout and update, each client checked as the single client is, with the wall time
+> for all N, each client's median and most, and the server's peak resident memory. N is the fewer of the cores and
+> the clients the available memory holds at one sampled client's server growth (`CONCURRENCY` overrides). Smoke run on
+> the MacBook at a debug build: 18 clients, every client's check passed on every server. Owed: Gitaly (an install,
+> Ada's yes) and the Linux kernel dataset (a multi-GB download).
 >
 > **A stock git command's wait, judged by progress (2026-11-23, w-git; main 01a20182's ruling after r229):** each git
 > command of `crates/cli/tests/git_interop.rs` was killed past a fixed 120 s (`PATIENCE`), and git/git's whole-repository
