@@ -65135,6 +65135,26 @@ GAPS.
   - Debug, after: move's `stage.judging` is out of its eight longest spans (5.8-6.4 ms before). The leaders of all
     three wide tests now, publication aside: `stage.recording` 5.3-5.5 ms, `stage.check` 3.6-3.9, `landing.changeset`
     2.3-2.4.
+  **`stage.recording` named: a free decision's whole apply of the pending holds, and a directory listed whole.**
+  - The recording's phases were each under 1.9 ms (debug). The 5.2-5.5 ms span, in all three wide tests and in add, was
+    what ran after the staging's last step under its tag. A probe split it at `stage_deferred`'s release of the texts
+    brought for the increment: `release_texts` took 4.72 ms with no text to release. It is a free decision
+    (`name_holds::freeing`), which applies the greens' pending holds whole before it frees, and the revision's
+    staging had just named its 9,000 texts.
+  - Now the staging applies the pending holds a slice a step first (`name_holds::apply_some`, as the landing's tail
+    does since 7c), so the free decision finds none.
+    - Counter: `name_holds::NAME_HOLD_APPLIED_FREEING`, the holds a free decision applied whole.
+    - `t_c2c` holds it at 0; red at 9,000 without the sliced apply.
+  - The recording's walks of the texts a revision lets go and holds (`svn_texts::FilesWalk`, 9a) visited a node a
+    unit, but a directory's visit listed all its children, sorted them and made their paths in that one unit: 1.8 ms
+    for 9,000, in move's and copy's walks. Now each directory is read a child a unit through the index's cursor
+    (`Index::listing_after`, one entry), the directory's place kept after the child it put next. That is the same
+    visit: children in byte order, each one's tree before the next.
+    - The 9a test (`a_moves_recording_walked_a_node_a_step_finds_the_texts_the_whole_walk_finds`) holds the stepped
+      walks to the whole ones and at least two units a file; red at 84 units for 80 files with the listing whole.
+  - Debug, after: `stage.recording` is 1.3 ms in add and copy and out of move's six longest spans (5.2-5.5 ms before).
+    The leaders, publication aside: `stage.check` 3.7-3.9 ms and `landing.changeset` 2.3-2.4 ms in all three, then
+    move's `stage.build` 2.0.
   - Left: a replay's plan is still a pass over the entry in one unit, as is the scan of the runs, linear in them. Both
     are owed their slicing by §3.
 
