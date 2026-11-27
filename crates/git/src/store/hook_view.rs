@@ -60,7 +60,11 @@
 //!
 //! **Holds.** The view holds every content it reads: [`HookView::open`] takes the holds and
 //! [`HookView::close`] gives them back, so a base pack made again or a push let go while a hook
-//! runs leaves the view's bytes as they were.
+//! runs leaves the view's bytes as they were. An object held whole may lie in a landed pack whose
+//! windows were let go (goal 93 item 2b): a read of one, opening's of a tag, a seal's or a file's,
+//! answers [`ReadRefused::NotYet`] (opening's [`ViewRefused::NotYet`]) naming the window, never the
+//! object's absence, and the seal stands where it stopped, so its owner brings the window back and
+//! takes the step again (B9 of the landed let-go's lift).
 //!
 //! **On the owner shard** (part 2): `slates-server`'s `git_hooks` opens the view over the
 //! repository's store, seals its packs in the shard's slices, lending each seal the room
@@ -80,6 +84,7 @@ use crate::entry;
 use crate::object_name::{CollisionAttack, ObjectFormat, ObjectId};
 use crate::{Admission, PastAdmission, refname, to_u64};
 
+use super::packed::Waited;
 use super::{Push, Repository, StoreRefused, StoredAt};
 
 mod environment;
@@ -244,6 +249,12 @@ pub enum ViewRefused {
   PastAdmission(PastAdmission),
   /// The store refused a hold.
   Content(ContentRefused),
+  /// Opening read a tag in a window of a landed pack let go, `waited` naming it: not yet, opened again once its owner's
+  /// driver brought it back ([`ReadRefused::NotYet`]; B9 of the landed let-go's lift).
+  NotYet {
+    /// The let-go window met.
+    waited: Waited,
+  },
 }
 
 impl From<PastAdmission> for ViewRefused {
@@ -272,6 +283,13 @@ pub enum ReadRefused {
   Unreadable,
   /// A whole object's entry header cannot be written.
   Entry(entry::Refusal),
+  /// The read met a window of a landed pack let go (goal 93 item 2b), `waited` naming it: not yet. Its reader stops
+  /// there for its owner's driver to bring the window back and takes the read again (B9 of the landed let-go's lift,
+  /// main 01a20182's ruling of 2026-11-27 07:21: a hook's view, a reader the read sweep missed).
+  NotYet {
+    /// The let-go window met.
+    waited: Waited,
+  },
 }
 
 /// What a path of the view names.
