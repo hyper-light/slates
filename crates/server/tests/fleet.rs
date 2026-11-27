@@ -38341,10 +38341,16 @@ fn a921_a_member_loop_refused_a_task_keeps_answering_and_tries_again() {
   fleet.daemons[silent]
     .inject_member_exchange_withhold(false, true)
     .unwrap();
+  let turns_before = move_counter(&fleet.daemons[b], LOOP_TURNS).unwrap_or(0);
   fleet.daemons[b].inject_member_spawn_refusal(true).unwrap();
   fleet.daemons[b].owe_edges_again().unwrap();
   let condemned = condemned_within(&fleet, (b_host, &watched), detection);
   let refused = move_counter(&fleet.daemons[b], REFUSED_EDGES_SPAWN);
+  // b's member loop turns over the same window, and the members it owes (every peer): one refusal a member a turn at
+  // most, so a loop woken again because it is still owed, a spin, cannot pass as its turn rate.
+  let turns =
+    move_counter(&fleet.daemons[b], LOOP_TURNS).map(|now| now.saturating_sub(turns_before));
+  let owed = u64::try_from(fleet.daemons.len().saturating_sub(1)).unwrap_or(u64::MAX);
   let sent_before = move_counter(&fleet.daemons[b], "fleet.edges.sent").unwrap_or(0);
   fleet.daemons[b].inject_member_spawn_refusal(false).unwrap();
   let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
@@ -38355,8 +38361,8 @@ fn a921_a_member_loop_refused_a_task_keeps_answering_and_tries_again() {
   let _ = fleet.daemons[silent].inject_member_exchange_withhold(false, false);
   fleet.stop();
   eprintln!(
-    "refused-spawn: detection {detection} ns; condemned (node, ms, how) {condemned:?}; refused {refused:?}; sent again \
-     {sent} (from {sent_before})"
+    "refused-spawn: detection {detection} ns; condemned (node, ms, how) {condemned:?}; refused {refused:?} over the \
+     loop's {turns:?} turns, {owed} members owed; sent again {sent} (from {sent_before})"
   );
   assert!(
     condemned.is_empty(),
@@ -38367,10 +38373,19 @@ fn a921_a_member_loop_refused_a_task_keeps_answering_and_tries_again() {
     "b's refusals counted by kind, once a turn: {refused:?}"
   );
   assert!(
+    refused.as_ref().is_ok_and(|refused| turns
+      .as_ref()
+      .is_ok_and(|turns| *refused <= owed.saturating_mul(*turns))),
+    "at most one refusal a member a turn of b's member loop: {refused:?} over {turns:?} turns, {owed} owed"
+  );
+  assert!(
     sent,
     "b sent its edges record once its spawns were admitted again"
   );
 }
+
+/// Counter: the member loop's turns (`member_task::run`).
+const LOOP_TURNS: &str = "fleet.plane.loop_turns";
 
 /// Counter: a refused edges announcement task, by its kind (`member_task::spawn_exchange`).
 const REFUSED_EDGES_SPAWN: &str = "fleet.edges.announce_refused.too_many_tasks";

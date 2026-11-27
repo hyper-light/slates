@@ -982,7 +982,7 @@ fn run(
       );
       end_process(
         cause,
-        lateness.since_beat(false, late_ns),
+        (lateness.since_beat(false, late_ns), now),
         judged,
         (faults, started_on),
       );
@@ -1177,10 +1177,14 @@ fn verdict_lateness_ns(now_ns: u64, still_after_ns: u64, window_ns: u64) -> Opti
 /// libtest names after its test (main's ruling of 2026-11-26: an exit 4 in a test binary named no test).
 ///
 /// `judged` is what the line names of a stuck shard: its verdict's lateness ([`verdict_lateness_ns`]) and the window it
-/// was judged by ([`watch_window_ns`], A-455); none for an ended control loop.
+/// was judged by ([`watch_window_ns`], A-455); none for an ended control loop. `judged_at_ns` is the look that judged
+/// it, on the host's monotonic clock, which the line names beside the lateness: the lateness is measured at that look,
+/// and the line is written after it (formatted, then written within a beat), so a reader can judge the verdict by its
+/// own instant and the line's delivery apart (the TSan lane, diag CI 7, run 46004209050: the line was read 0.63 ms
+/// past the verdict's rule, with nothing to tell the verdict from the line's way to its reader).
 fn end_process(
   cause: Cause,
-  late_ns: u64,
+  (late_ns, judged_at_ns): (u64, u64),
   judged: Option<(Option<u64>, u64)>,
   (faults, started_on): (MajorFaults, &str),
 ) -> ! {
@@ -1194,7 +1198,8 @@ fn end_process(
       judged.and_then(|(late, _)| late).map_or_else(
         || "the shard last moved at the watchdog's first look of it, so the verdict's lateness is not known".to_owned(),
         |late| format!(
-          "the verdict came {} us past its window and a beat after the watchdog's last look before the shard last moved",
+          "the verdict came {} us past its window and a beat after the watchdog's last look before the shard last moved, \
+           judged at monotonic {judged_at_ns} ns",
           late / NS_PER_US
         )
       ),

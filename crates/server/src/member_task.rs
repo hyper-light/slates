@@ -386,6 +386,11 @@ const PEER_RECONNECTED: &str = "fleet.plane.peer_reconnected";
 /// Counter: an announcement from a member this node held dead, whose contact is kept so it can refute the death.
 const MEMBER_RETURNED: &str = "fleet.plane.member_returned";
 
+/// Counter: the member loop's turns ([`run`]), each one step of the detector and at most one announcement attempt a
+/// member a pass, so a per-turn count (a refused announcement's, `count_spawn_refused`) is bounded by its owed members
+/// times this, and one past it is a spin.
+const LOOP_TURNS: &str = "fleet.plane.loop_turns";
+
 /// Marks `anchor`'s resolved plane address stale so the next turn resolves it afresh: a new connection may come from a
 /// new address (a replaced pod keeps its name and certificate, not its IP). The address stays the manifest's or
 /// discovery's, never a datagram's source, which only path validation could vouch for. The old address is kept until
@@ -1018,6 +1023,7 @@ pub(crate) async fn run(
   let mut announcing = BTreeMap::new();
   let mut announcing_edges = BTreeMap::new();
   loop {
+    let _ = crate::fleet::count_refusal(LOOP_TURNS);
     announce_epochs(&mut announcing).await;
     // And this node's edges, once a session and again as they change (A-925).
     crate::edges::announce_edges(&mut announcing_edges).await;
