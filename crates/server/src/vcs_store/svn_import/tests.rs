@@ -1158,12 +1158,12 @@ fn copied_dir(to: &str, (from, rev): (&str, u64)) -> String {
   )
 }
 
+/// [`imported_whole_and_stepped`]'s reading: the youngest revision, the longest step, its window, and the copies grafted.
+type ImportedWholeAndStepped = (Result<u64, String>, u64, u64, (u64, u64, u64, u64));
+
 /// `dump` imported on a store-backed shard: its youngest revision, the shard's longest step and its window, and the
 /// copies the green grafted (`Green::copies_grafted`).
-fn imported_whole_and_stepped(
-  name: &'static str,
-  dump: Vec<u8>,
-) -> (Result<u64, String>, u64, u64, (u64, u64, u64, u64)) {
+fn imported_whole_and_stepped(name: &'static str, dump: Vec<u8>) -> ImportedWholeAndStepped {
   let read = stored(move || {
     cpu_timed(async move {
       let (svn, green) = subversion(name).await;

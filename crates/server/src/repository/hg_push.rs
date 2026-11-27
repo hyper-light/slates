@@ -1522,11 +1522,7 @@ async fn unbundled(
       Err(outcome) => return Some(outcome),
     };
   let outcome = match recorded(repository, &mut forked, &mut run).await? {
-    Ok(()) => {
-      #[cfg(test)]
-      held_before_landing().await;
-      landed_after_builds(repository, (principal, name), &unbundle, Some(forked), room).await
-    }
+    Ok(()) => landed_recorded(repository, (principal, name), &unbundle, forked, room).await,
     Err(outcome) => {
       give_back(Some(forked));
       Some(outcome)
@@ -1534,6 +1530,20 @@ async fn unbundled(
   };
   settle_run(run, outcome.as_ref()).await;
   outcome
+}
+
+/// [`unbundled`]'s landing once its run is recorded ([`landed_after_builds`]), held first where a test asked for it
+/// ([`held_before_landing`]).
+async fn landed_recorded(
+  repository: RepositoryId,
+  (principal, name): (&Principal, [u8; 32]),
+  unbundle: &Unbundle,
+  forked: Forked,
+  room: &mut Admission,
+) -> Option<PushOutcome> {
+  #[cfg(test)]
+  held_before_landing().await;
+  landed_after_builds(repository, (principal, name), unbundle, Some(forked), room).await
 }
 
 #[cfg(test)]
