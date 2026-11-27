@@ -820,6 +820,12 @@ fn refuse_all(incoming: &mut ChannelReceiver<Asked>, reason: &str) {
   }
 }
 
+/// DIAG (w-interop, never main): when the owner took its last Land request, on `slates_machine::clock::monotonic_ns`.
+pub static DIAG_LAND_RECEIVED_NS: std::sync::atomic::AtomicU64 =
+  std::sync::atomic::AtomicU64::new(0);
+/// DIAG (w-interop, never main): when the owner sent its last Land answer, on the same clock.
+pub static DIAG_LAND_SENT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The owner's loop: open (recovering), then answer requests until every handle is gone, then checkpoint.
 fn serve(
   root: StoreRoot,
@@ -963,7 +969,15 @@ fn serve(
           .iter()
           .map(|(kind, bytes)| (*kind, Contents::Bytes(bytes)))
           .collect();
+        DIAG_LAND_RECEIVED_NS.store(
+          slates_machine::clock::monotonic_ns(),
+          std::sync::atomic::Ordering::Release,
+        );
         let answered = store.land(header, &sections, &staging);
+        DIAG_LAND_SENT_NS.store(
+          slates_machine::clock::monotonic_ns(),
+          std::sync::atomic::Ordering::Release,
+        );
         timer.reply((&store, &texts), &answer, answered);
       }
       Request::Piece {

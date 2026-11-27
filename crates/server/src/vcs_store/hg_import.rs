@@ -1302,6 +1302,10 @@ pub(crate) struct SegmentInFlight {
   /// DIAG (w-interop, never main): the import's yields beside it while it was in flight, and when its answer was first
   /// seen ready.
   diag_yields: u32,
+  /// DIAG: when it began, on `slates_machine::clock::monotonic_ns` (the store owner's clock too).
+  diag_begun_mono: u64,
+  /// DIAG: the import's turns' own time while it was in flight, and their count.
+  diag_turns: (u64, u32),
 }
 
 /// Repository `id`'s next segment cut and not yet handed to the store, its payload made into chunks a turn's steps at a
@@ -1332,6 +1336,8 @@ async fn landing_begun(id: RepositoryId) -> Option<Result<Option<SegmentInFlight
     sections: crate::repository::hg_run::section_bytes(&parts),
     answer: Box::pin(async move { disk.land(header, parts).await.is_ok() }),
     diag_yields: 0,
+    diag_begun_mono: slates_machine::clock::monotonic_ns(),
+    diag_turns: (0, 0),
   })))
 }
 
@@ -1343,9 +1349,23 @@ fn landing_settled(
   (landed, waited): (bool, Option<u64>),
 ) -> Option<Result<(), ImportFailed>> {
   let took = slates_rt::futures::now_ns().saturating_sub(landing.began);
+  let rel = |at: u64| i128::from(at) - i128::from(landing.diag_begun_mono);
+  let received =
+    slates_store::owner::DIAG_LAND_RECEIVED_NS.load(std::sync::atomic::Ordering::Acquire);
+  let sent = slates_store::owner::DIAG_LAND_SENT_NS.load(std::sync::atomic::Ordering::Acquire);
+  let settled = slates_machine::clock::monotonic_ns();
+  let handover = DIAG_HANDOVER_MONO.with(core::cell::Cell::take);
   eprintln!(
-    "DIAG-LANDING seq={} took_ns={took} waited_ns={waited:?} yields_beside={}",
-    landing.sequence, landing.diag_yields
+    "DIAG-LANDING seq={} took_ns={took} waited_ns={waited:?} yields_beside={} turns={} turn_ns={} received_rel={} \
+     sent_rel={} handover_rel={} settled_rel={}",
+    landing.sequence,
+    landing.diag_yields,
+    landing.diag_turns.1,
+    landing.diag_turns.0,
+    rel(received),
+    rel(sent),
+    handover.map_or(-1, rel),
+    rel(settled)
   );
   crate::state::with_state(|state| {
     state.count(SEGMENT_LAND_NS, took);
@@ -1371,10 +1391,16 @@ pub(crate) async fn landed_in_flight(
   let Some(mut landing) = flight.take() else {
     return Some(Ok(()));
   };
+  DIAG_HANDOVER_MONO.with(|cell| cell.set(Some(slates_machine::clock::monotonic_ns())));
   let held = slates_rt::futures::now_ns();
   let landed = landing.answer.as_mut().await;
   let waited = slates_rt::futures::now_ns().saturating_sub(held);
   landing_settled(id, &landing, (landed, Some(waited)))
+}
+
+thread_local! {
+  /// DIAG: when the hand-over of the landing now settling began, on `slates_machine::clock::monotonic_ns`.
+  static DIAG_HANDOVER_MONO: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
 }
 
 /// Yields the shard, the landing in `flight` answering meanwhile if it can: settled then, overlapped with the import's
@@ -1445,7 +1471,15 @@ pub(crate) async fn step(
   if let Err(failed) = yielded_beside(id, flight).await? {
     return Some(Err(failed));
   }
+  let turn_began = slates_machine::clock::monotonic_ns();
   let turned = crate::state::with_state(|state| turn(state, id, (clock, quantum_ns)))??;
+  if let Some(landing) = flight.as_mut() {
+    let spent = slates_machine::clock::monotonic_ns().saturating_sub(turn_began);
+    landing.diag_turns = (
+      landing.diag_turns.0.saturating_add(spent),
+      landing.diag_turns.1.saturating_add(1),
+    );
+  }
   if turned.is_ok()
     && let Err(failed) = segments_handed(id, flight).await?
   {
