@@ -40,9 +40,18 @@
 //! continues; where its read is past tolerance it holds nothing, refused typed, and the owner keeps the parts until its
 //! candidacy is left (owed, the configuration's).
 //!
-//! **Owed** (A-636's entry): a state-log checkpoint, which would let holders drop the records below it; the parts
-//! rebuilt after the owner restarts; parts batched a shipment; a repository's destroy forgetting its four state logs' registers; and
-//! the successor's adoption of the logs (part 2c).
+//! **An owner's warm restart** (A-921's second mode, main 01a20182's ruling of 2026-11-26). The parts owed ride the
+//! shard's recovery image, a piece each (`content_holder`'s owed-part kind), and a warm start owes each again to every
+//! candidate, no acknowledgement known; a holder acknowledges the very record it holds again. A part is persisted before
+//! it ships: the record plane publishes the shard when it holds a part no committed image carries yet, and holds the
+//! state logs' heads back a pass where that publication is refused, counted; past [`held_back_bound`] passes in a row,
+//! [`admit`] refuses the repository's next change with the publication's refusal. An image whose parts pass the bound
+//! [`admit`] keeps is refused typed ([`restorable`]). Before, a warm restart rebuilt the parts empty: a holder that had
+//! missed one refused every later part `Behind`, and every push was refused.
+//!
+//! **Owed** (A-636's entry): a state-log checkpoint, which would let holders drop the records below it; parts batched a
+//! shipment; a repository's destroy forgetting its four state logs' registers; and the successor's adoption of the logs
+//! (part 2c).
 
 use std::collections::BTreeMap;
 
@@ -67,6 +76,14 @@ pub(crate) struct StateLogs {
   /// ([`take_made`]); a green leaves once placed or gone, so it holds at most the repository's greens.
   greens_owed:
     BTreeMap<slates_db::catalog::RepositoryId, BTreeMap<slates_db::catalog::VolumeId, u64>>,
+  /// The parts held or let go since the shard's last committed publication, each by its register and position (A-921's
+  /// second mode): what the next delta of its recovery image carries of them (`content_holder::held_changes`). Bounded
+  /// by the parts held and let go between two publications.
+  changed: std::collections::BTreeSet<(ObjectId, u64)>,
+  /// The record-plane passes in a row whose parts waited because the shard's publication carrying them was refused, and
+  /// that publication's refusal (A-921's second mode, main 01a20182's ruling of 2026-11-26: a held-back part never
+  /// stalls in silence). Past [`held_back_bound`] passes, [`admit`] refuses the repository's next change with it.
+  held_back: (u32, Option<Refusal>),
 }
 
 /// One state log's parts and what its candidates acknowledged.
@@ -85,10 +102,79 @@ impl StateLogs {
   pub(crate) fn hold(&mut self, record: &StateLogRecord) {
     let value = value_of(record);
     self.bytes = self.bytes.saturating_add(value.len());
-    let log = self.logs.entry(record.log_name().register()).or_default();
+    let register = record.log_name().register();
+    let log = self.logs.entry(register).or_default();
     if let Some(replaced) = log.parts.insert(record.to, value) {
       self.bytes = self.bytes.saturating_sub(replaced.len());
     }
+    self.changed.insert((register, record.to));
+  }
+
+  /// Puts back a part a recovered image carried (A-921's second mode, main 01a20182's ruling of 2026-11-26): owed again
+  /// to every candidate, none of their acknowledgements known, so each is shipped it once more and acknowledges it again
+  /// (a holder accepts the very record it holds). The image carries it, so it is owed to no publication.
+  pub(crate) fn restore(&mut self, register: ObjectId, position: u64, value: Vec<u8>) {
+    self.bytes = self.bytes.saturating_add(value.len());
+    let log = self.logs.entry(register).or_default();
+    if let Some(replaced) = log.parts.insert(position, value) {
+      self.bytes = self.bytes.saturating_sub(replaced.len());
+    }
+  }
+
+  /// Every part held, by register and position in order, with its value: what a checkpoint of the shard's recovery image
+  /// carries of them (A-921's second mode).
+  pub(crate) fn parts(&self) -> impl Iterator<Item = (ObjectId, u64, &[u8])> + '_ {
+    self.logs.iter().flat_map(|(register, log)| {
+      log
+        .parts
+        .iter()
+        .map(|(position, value)| (*register, *position, value.as_slice()))
+    })
+  }
+
+  /// The part held at `register`'s `position`, if any.
+  pub(crate) fn part(&self, register: ObjectId, position: u64) -> Option<&[u8]> {
+    self
+      .logs
+      .get(&register)
+      .and_then(|log| log.parts.get(&position))
+      .map(Vec::as_slice)
+  }
+
+  /// The parts held or let go since the last committed publication, in order.
+  pub(crate) fn changed(&self) -> impl Iterator<Item = (ObjectId, u64)> + '_ {
+    self.changed.iter().copied()
+  }
+
+  /// Whether a part held now is not yet carried by a committed publication: one the record plane must not ship before
+  /// the shard's image carries it (A-921's second mode, `fleet::ship_shard_heads`). A part held and let go since then
+  /// needs none.
+  pub(crate) fn holds_unpublished(&self) -> bool {
+    self
+      .changed
+      .iter()
+      .any(|(register, position)| self.part(*register, *position).is_some())
+  }
+
+  /// Notes a record-plane pass whose parts waited, the shard's publication carrying them refused `refusal`.
+  pub(crate) fn held_back(&mut self, refusal: Refusal) {
+    self.held_back = (self.held_back.0.saturating_add(1), Some(refusal));
+  }
+
+  /// Notes a record-plane pass whose parts a committed publication carries: the passes held back start again.
+  pub(crate) fn carried(&mut self) {
+    self.held_back = (0, None);
+  }
+
+  /// The refusal that held the parts back, where `bound` passes in a row or more have.
+  pub(crate) fn held_back_past(&self, bound: u32) -> Option<&Refusal> {
+    let (passes, refusal) = &self.held_back;
+    refusal.as_ref().filter(|_| *passes >= bound)
+  }
+
+  /// Forgets the changes a committed publication carried.
+  pub(crate) fn clear_changed(&mut self) {
+    self.changed.clear();
   }
 
   /// Notes the greens `record`'s operation moved, each owed to its newest version the operation took it to.
@@ -149,6 +235,9 @@ impl StateLogs {
       .unwrap_or(u64::MAX);
     let kept = log.parts.split_off(&held_everywhere.saturating_add(1));
     let released: usize = log.parts.values().map(Vec::len).sum();
+    self
+      .changed
+      .extend(log.parts.keys().map(|position| (register, *position)));
     log.parts = kept;
     self.bytes = self.bytes.saturating_sub(released);
     if log.parts.is_empty() {
@@ -545,6 +634,45 @@ pub(crate) fn bound(state: &ShardState) -> usize {
   state.db.partition().caps().green_chain_bytes
 }
 
+/// Whether owed parts a recovered image carried are within what [`admit`] lets an owner shard hold (A-921's second mode,
+/// main 01a20182's ruling of 2026-11-26: an image past it is refused typed): `Err` with their bytes less the largest
+/// share one operation's identity holds, beside `bound`. [`admit`] holds the parts under `bound` before each operation, so
+/// they pass it by at most the last admitted operation's own parts, which all name its identity: every state it lets
+/// stand, its newest operation's share taken away, is under `bound`, and so is checked exactly, with no margin.
+pub(crate) fn restorable(
+  parts: &[(ObjectId, u64, Vec<u8>)],
+  bound: usize,
+) -> Result<(), (usize, usize)> {
+  let mut shares: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+  let mut bytes = 0usize;
+  for (_, _, value) in parts {
+    bytes = bytes.saturating_add(value.len());
+    if let Some(part) = record_of(value) {
+      let share = shares.entry(part.identity).or_insert(0);
+      *share = share.saturating_add(value.len());
+    }
+  }
+  let largest = shares.values().copied().max().unwrap_or(0);
+  let past = bytes.saturating_sub(largest);
+  if bytes == 0 || past < bound {
+    Ok(())
+  } else {
+    Err((past, bound))
+  }
+}
+
+/// Derived: the record-plane passes in a row an owner shard's state-log parts may wait on a refused publication before
+/// its repositories' next changes are refused with it: the failover delay's worth of the fleet's periods
+/// (`fleet::takeover_attempts`), the bound a taken-over object's materialization gets, one pass a period.
+pub(crate) fn held_back_bound(state: &ShardState) -> u32 {
+  crate::fleet::takeover_attempts(state.failover_ns)
+}
+
+/// Counter: a repository's change refused because its owner shard's state-log parts were held back past
+/// [`held_back_bound`] passes, their publication refused (A-921's second mode). Format: a refusal name in the daemon's
+/// status report.
+pub(crate) const STATE_LOG_PARTS_HELD_BACK: &str = "repository.state_log.parts_held_back";
+
 /// Counter: a repository's change refused `Overloaded` because the state logs' parts its owner shard holds reached
 /// [`bound`].
 /// Format: a refusal name in the daemon's status report.
@@ -555,6 +683,16 @@ pub(crate) const STATE_LOG_PARTS_FULL: &str = "repository.state_log.parts_full";
 /// acknowledgements let parts go.
 pub(crate) fn admit(state: &mut ShardState) -> Result<(), Refusal> {
   take_made(state);
+  // Parts held back past the bound, their publication refused pass after pass (A-921's second mode): the change is
+  // refused with the publication's own refusal, typed, never left to wait at its barrier in silence.
+  if let Some(refusal) = state
+    .state_logs
+    .held_back_past(held_back_bound(state))
+    .cloned()
+  {
+    state.count(STATE_LOG_PARTS_HELD_BACK, 1);
+    return Err(refusal);
+  }
   if state.state_logs.within(bound(state)) {
     return Ok(());
   }

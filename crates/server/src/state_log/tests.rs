@@ -247,3 +247,87 @@ fn a_push_is_held_until_every_green_it_moved_is_placed_through_its_version() {
     "nothing noted"
   );
 }
+
+/// A-921's second mode (main 01a20182's ruling of 2026-11-26): an owner's parts ride its shard's recovery image and are
+/// owed again after a warm restart. Do: hold two names-log parts and a phases part, one names part acknowledged by one
+/// candidate; take each part as a checkpoint carries it; restore them into an owner that holds none. Expect: every
+/// part owed again at its position with its bytes, no acknowledgement known (so each ships to every candidate again),
+/// the bytes counted, and none owed to the next publication; the changes a delta carries are those held and let go.
+#[test]
+fn an_owners_parts_restored_from_its_image_are_owed_again_to_every_candidate() {
+  let repo = repository(7);
+  let (one, two, phases) = (
+    part(repo, StateLog::Names, (0, 2)),
+    part(repo, StateLog::Names, (2, 3)),
+    part(repo, StateLog::Phases, (0, 1)),
+  );
+  let mut logs = StateLogs::default();
+  for held in [&one, &two, &phases] {
+    logs.hold(held);
+  }
+  let names = one.log_name().register();
+  logs.acknowledged(names, 2, &[HostId(2)]);
+  assert!(
+    logs.holds_unpublished(),
+    "held parts owed to the next publication"
+  );
+  let carried: Vec<(ObjectId, u64, Vec<u8>)> = logs
+    .parts()
+    .map(|(register, position, value)| (register, position, value.to_vec()))
+    .collect();
+  let mut restored = StateLogs::default();
+  for (register, position, value) in carried.clone() {
+    restored.restore(register, position, value);
+  }
+  let again: Vec<(ObjectId, u64, Vec<u8>)> = restored
+    .parts()
+    .map(|(register, position, value)| (register, position, value.to_vec()))
+    .collect();
+  assert_eq!(again, carried, "every part owed again, at its position");
+  assert!(
+    restored.owed().all(|(_, _, acked)| acked.is_empty()),
+    "no acknowledgement known"
+  );
+  assert_eq!(restored.bytes(), logs.bytes());
+  assert!(!restored.holds_unpublished(), "the image carries them");
+}
+
+/// A-921's second mode: an image's owed parts are held to the bound `admit` keeps them under, which they pass by at most
+/// the last admitted operation's own parts. Do: judge parts of two operations against bounds at and just past their
+/// bytes less the larger operation's share, and no parts at a bound of zero. Expect: within at exactly the bytes less
+/// that share plus one; refused, naming those bytes and the bound, at exactly them; no parts always within.
+#[test]
+fn an_images_owed_parts_past_one_operations_share_of_the_bound_are_refused() {
+  let repo = repository(6);
+  let (older, newer) = (
+    part(repo, StateLog::Names, (0, 1)),
+    part(repo, StateLog::Names, (1, 4)),
+  );
+  let parts: Vec<(ObjectId, u64, Vec<u8>)> = [&older, &newer]
+    .iter()
+    .map(|record| (record.log_name().register(), record.to, value_of(record)))
+    .collect();
+  let (small, large) = (value_of(&older).len(), value_of(&newer).len());
+  let past = small.min(large);
+  assert_eq!(super::restorable(&parts, past + 1), Ok(()));
+  assert_eq!(super::restorable(&parts, past), Err((past, past)));
+  assert_eq!(super::restorable(&[], 0), Ok(()));
+}
+
+/// A-921's second mode (main 01a20182's ruling of 2026-11-26: a held-back part never stalls in silence). Do: hold a
+/// shard's parts back pass after pass, each refused; then carry them. Expect: no refusal below the bound, the refusal at
+/// it, and none again once a publication carries them.
+#[test]
+fn parts_held_back_past_the_bound_surface_the_publications_refusal() {
+  let mut logs = StateLogs::default();
+  let refusal = slates_ipc::protocol::Refusal::NoSpace;
+  let bound = 3;
+  for _ in 1..bound {
+    logs.held_back(refusal.clone());
+  }
+  assert_eq!(logs.held_back_past(bound), None, "below the bound");
+  logs.held_back(refusal.clone());
+  assert_eq!(logs.held_back_past(bound), Some(&refusal), "at the bound");
+  logs.carried();
+  assert_eq!(logs.held_back_past(bound), None, "carried again");
+}

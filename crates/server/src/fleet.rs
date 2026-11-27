@@ -2138,7 +2138,7 @@ pub(crate) fn accept_held_record(
     return Vec::new();
   }
   if let Err(error) = check_held_record(state, local, peer_host, record) {
-    count_record_refusal(state, &error);
+    count_record_refusal(state, record, &error);
     return encode_refusal(&error);
   }
   hold_checked_record(state, local, peer_host, record)
@@ -2152,7 +2152,7 @@ const RECORD_REFUSED_UNTRACKED: &str = "fleet.record.refused.untracked";
 /// Counts a held record this holder refused, by its register refusal kind (`fleet.record.refused.<kind>`), so a sender
 /// whose commit never places shows on the holder why: before these, a holder restarted warm refused a successor's
 /// adoption `ForeignGeneration` every period without a trace. Format: refusal names in the daemon's status report.
-fn count_record_refusal(state: &mut ShardState, error: &RegisterError) {
+fn count_record_refusal(state: &mut ShardState, record: &Record, error: &RegisterError) {
   let kind = match error {
     RegisterError::StaleEpoch { .. } => "fleet.record.refused.stale_epoch",
     RegisterError::ConfigurationStale { .. } => "fleet.record.refused.configuration_stale",
@@ -2164,6 +2164,57 @@ fn count_record_refusal(state: &mut ShardState, error: &RegisterError) {
     RegisterError::Behind { .. } => "fleet.record.refused.behind",
   };
   state.count(kind, 1);
+  note_unacknowledged(state, kind, record, Some(*error));
+}
+
+/// What a holder last answered with no acknowledgement of a record, by why (A-921's second mode; main 01a20182's order
+/// of 2026-11-26: which refusal, at what epoch and position): the record's object, position, epoch, generation and
+/// owner; the refusal, where a register refused it; and this holder's standing for the object then (its newest position
+/// held, at its epoch, its acceptor's authority) and its installed configuration's version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RefusedRecord {
+  /// The record's object.
+  pub(crate) object: ObjectId,
+  /// Its position.
+  pub(crate) sequence: u64,
+  /// Its epoch.
+  pub(crate) epoch: HostEpoch,
+  /// The configuration generation it names.
+  pub(crate) generation: u64,
+  /// Its owner.
+  pub(crate) owner: HostId,
+  /// The register's refusal, where one refused it; `None` for one accepted and not acknowledged.
+  pub(crate) error: Option<RegisterError>,
+  /// This holder's newest position of the object, at its epoch.
+  pub(crate) held: Option<(u64, HostEpoch)>,
+  /// This holder's acceptor's authority for the object.
+  pub(crate) authority: Option<Authority>,
+  /// This holder's installed configuration's version.
+  pub(crate) installed: u64,
+}
+
+/// Notes `record`, answered with no acknowledgement for `kind`, as this holder's last of that kind ([`RefusedRecord`]).
+fn note_unacknowledged(
+  state: &mut ShardState,
+  kind: &'static str,
+  record: &Record,
+  error: Option<RegisterError>,
+) {
+  let acceptor = state.holder_records.get(&record.object);
+  let refused = RefusedRecord {
+    object: record.object,
+    sequence: record.sequence,
+    epoch: record.epoch,
+    generation: record.generation,
+    owner: record.owner,
+    error,
+    held: acceptor
+      .and_then(|acceptor| acceptor.highest_accepted(record.object))
+      .map(|accepted| (accepted.sequence, accepted.epoch)),
+    authority: acceptor.map(Acceptor::authority),
+    installed: state.fleet.configuration().version,
+  };
+  state.last_record_refusals.insert(kind, refused);
 }
 
 /// The status count of held records accepted but not acknowledged because the shard's publish carrying them was
@@ -2243,12 +2294,14 @@ pub(crate) fn hold_checked_record(
           // publish answers no acknowledgement, and the record rides the next publish that commits.
           if crate::verbs::publish_shard(state).is_err() {
             state.count(RECORD_UNPUBLISHED, 1);
+            note_unacknowledged(state, RECORD_UNPUBLISHED, record, None);
             return Vec::new();
           }
           ack.encode()
         }
         Err(error) => {
           state.count(RECORD_REFUSED_UNTRACKED, 1);
+          note_unacknowledged(state, RECORD_REFUSED_UNTRACKED, record, None);
           encode_refusal(&error)
         }
       }
@@ -2257,7 +2310,7 @@ pub(crate) fn hold_checked_record(
     // version, so a stale sender refreshes and retries); every other refusal is an empty reply the sender
     // counts as no acknowledgement ([`encode_refusal`]).
     Err(error) => {
-      count_record_refusal(state, &error);
+      count_record_refusal(state, record, &error);
       encode_refusal(&error)
     }
   }
@@ -11946,6 +11999,11 @@ const PAIR_SERVED: &str = "fleet.seal.pair_served";
 /// Counter: a pair key delivery too short for its partition and key id, answered empty.
 const PAIR_MALFORMED: &str = "fleet.seal.pair_malformed";
 
+/// Counter: a record-plane pass whose state-log parts waited, since the shard's publication carrying them was refused
+/// (A-921's second mode: a part ships only once its owner's image carries it). Format: a counter name in the daemon's
+/// status report.
+const STATE_LOG_PARTS_UNPUBLISHED: &str = "fleet.state_log.parts_unpublished";
+
 /// Ships each of `shard`'s unplaced heads — catalogs, heads and tombstones — to all its candidate holders at
 /// once, committed at `f + 1`.
 async fn ship_shard_heads(
@@ -11961,7 +12019,27 @@ async fn ship_shard_heads(
     move |s| {
       // The state logs' records the partition handed on since the last pass become parts owed (A-636 part 2b).
       crate::state_log::take_made(s);
-      unplaced_heads(s, local)
+      // Persisted before shipped (A-921's second mode): a part a candidate acknowledges is owed again after this node's
+      // warm restart only where its shard's image carries it, so a part not yet carried is published first, as a holder
+      // publishes before it acknowledges. Refused, the state logs' parts wait for the next pass, counted.
+      // Held back past `state_log::held_back_bound` passes, the repositories' next changes are refused with the
+      // publication's refusal (`state_log::admit`).
+      let published = if s.state_logs.holds_unpublished() {
+        crate::verbs::publish_shard(s).map(|_| ())
+      } else {
+        Ok(())
+      };
+      let mut heads = unplaced_heads(s, local);
+      match published {
+        Ok(()) => s.state_logs.carried(),
+        Err(refused) => {
+          s.count(STATE_LOG_PARTS_UNPUBLISHED, 1);
+          s.state_logs
+            .held_back(crate::error::refusal_of_vfs(&refused));
+          heads.retain(|head| !matches!(head.object.class(), RegisterClass::State(_)));
+        }
+      }
+      heads
     },
     HEARTBEAT_NS,
   )
