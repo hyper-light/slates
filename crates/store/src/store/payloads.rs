@@ -3,9 +3,10 @@
 //! in `tests/store.rs` lands identical bytes in two repositories and forgets them across a restart.
 
 use super::{
-  BlockFile, CHANGESET_ENTRY_BYTES, CHANGESETS, CONTENT_KEY_BYTES, CONTENT_VALUE_BYTES, CONTENTS,
-  Changeset, Identity, LogError, Rows, SEAL_BYTES, SectionKind, ShardDb, StoreError, U64,
-  content_key, decode_changeset, decode_content, field, identity_of_range, put, sections_of,
+  BLOCK_DIGESTS, BlockFile, CHANGESET_ENTRY_BYTES, CHANGESETS, CONTENT_KEY_BYTES,
+  CONTENT_VALUE_BYTES, CONTENTS, Changeset, Identity, LogError, Rows, SEAL_BYTES, SectionKind,
+  ShardDb, StoreError, U64, content_key, decode_changeset, decode_content, delete_block_digests,
+  field, identity_of_range, index_payload_from_log, put, sections_of,
 };
 
 /// Width of an alternate place's key. Its final field is the section's unique offset in the log.
@@ -54,8 +55,38 @@ pub(super) fn keep<F: BlockFile>(
   Ok(())
 }
 
-/// Removes this occurrence. If it supplied the reads, publishes one remaining occurrence before
-/// retiring its suffix key. Retrying either deletion after a partial error preserves the same result.
+/// Promotes one remaining alternate place to the primary `P` row, or deletes the primary row when
+/// no alternate remains. Returns the number of `P` rows modified.
+fn promote_or_delete_primary<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  primary: &[u8; CONTENT_KEY_BYTES],
+  len: u64,
+) -> Result<u64, StoreError> {
+  // No committed section can start at u64::MAX because a record trailer follows it.
+  let mut places = Rows::new();
+  rows.scan(
+    &place_key(primary, 0),
+    Some(&place_key(primary, u64::MAX)),
+    1,
+    &mut places,
+    &mut Vec::new(),
+  )?;
+  if let Some((key, _)) = places.get(0) {
+    let next = field(key, CONTENT_KEY_BYTES)
+      .map(u64::from_be_bytes)
+      .ok_or(StoreError::BadRow)?;
+    publish(rows, primary, next, len)?;
+    rows.delete(key)?;
+    Ok(2_u64)
+  } else {
+    rows.delete(primary)?;
+    Ok(1_u64)
+  }
+}
+
+/// Removes this occurrence and its per-block MAC `B` rows (when `len > PIECE_BYTES`). If it
+/// supplied the reads, publishes one remaining occurrence before retiring its suffix key. Retrying
+/// either deletion after a partial error preserves the same result.
 pub(super) fn forget<F: BlockFile>(
   rows: &mut ShardDb<F>,
   identity: &Identity,
@@ -73,28 +104,13 @@ pub(super) fn forget<F: BlockFile>(
     rows.delete(&own)?;
   }
   if current != offset {
+    if alternate {
+      delete_block_digests(rows, offset, len)?;
+    }
     return Ok(u64::from(alternate));
   }
-  // No committed section can start at u64::MAX because a record trailer follows it.
-  let mut places = Rows::new();
-  rows.scan(
-    &place_key(&primary, 0),
-    Some(&place_key(&primary, u64::MAX)),
-    1,
-    &mut places,
-    &mut Vec::new(),
-  )?;
-  let changed = if let Some((key, _)) = places.get(0) {
-    let next = field(key, CONTENT_KEY_BYTES)
-      .map(u64::from_be_bytes)
-      .ok_or(StoreError::BadRow)?;
-    publish(rows, &primary, next, len)?;
-    rows.delete(key)?;
-    2_u64
-  } else {
-    rows.delete(&primary)?;
-    1_u64
-  };
+  let changed = promote_or_delete_primary(rows, &primary, len)?;
+  delete_block_digests(rows, offset, len)?;
   Ok(changed.saturating_add(u64::from(alternate)))
 }
 
@@ -115,8 +131,31 @@ pub(super) fn visit<F: BlockFile>(
   Ok(())
 }
 
-/// Rebuilds `CONTENTS` rows from all surviving `CHANGESETS` rows in the checkpointed prefix up to
-/// `applied`, logging and counting any row whose log header or section heads no longer verify.
+/// Rebuilds the `P` and multi-piece `B` rows for one changeset row within `applied`.
+fn rebuild_changeset_payloads<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  file: &F,
+  (applied, seal): (u64, &[u8; SEAL_BYTES]),
+  row: &Changeset,
+  buffers: (&mut Vec<u8>, &mut Vec<u8>),
+) -> Result<(), StoreError> {
+  for section in sections_of(file, applied, seal, row)? {
+    if section.kind == SectionKind::Payload {
+      index_payload_from_log(
+        rows,
+        file,
+        seal,
+        (section.offset, section.len),
+        (buffers.0, buffers.1),
+      )?;
+    }
+  }
+  Ok(())
+}
+
+/// Rebuilds `CONTENTS` (`P`) and multi-piece `BLOCK_DIGESTS` (`B`) rows from all surviving
+/// `CHANGESETS` rows in the checkpointed prefix up to `applied`, logging and counting any row
+/// whose log header or section heads no longer verify.
 fn rebuild_payload_places<F: BlockFile>(
   rows: &mut ShardDb<F>,
   file: &F,
@@ -127,17 +166,14 @@ fn rebuild_payload_places<F: BlockFile>(
   scan_table(rows, CONTENTS, per_page, |rows, key, _| {
     Ok(rows.delete(key)?)
   })?;
+  scan_table(rows, BLOCK_DIGESTS, per_page, |rows, key, _| {
+    Ok(rows.delete(key)?)
+  })?;
   let mut buffer = Vec::new();
   let mut corrupt_rows_skipped = 0u64;
   scan_table(rows, CHANGESETS, per_page, |rows, key, entry| {
     let row = decode_changeset(key, entry)?;
-    match visit(
-      file,
-      (applied, seal),
-      &row,
-      &mut buffer,
-      |identity, offset, len| keep(rows, identity, offset, len, value),
-    ) {
+    match rebuild_changeset_payloads(rows, file, (applied, seal), &row, (value, &mut buffer)) {
       Ok(()) => Ok(()),
       Err(StoreError::Log(LogError::Corrupt(what))) => {
         corrupt_rows_skipped = corrupt_rows_skipped.saturating_add(1);
@@ -155,10 +191,10 @@ fn rebuild_payload_places<F: BlockFile>(
   Ok(corrupt_rows_skipped)
 }
 
-/// The bare table tag marks a complete checkpoint of payload ownership. An older checkpoint knows
-/// only one place per identity and can already lack a live payload's lookup. Rebuild once from its
-/// surviving changesets. The marker commits with all the places before replay resumes at `applied`.
-/// Returns the number of corrupt changeset rows skipped during the rebuild.
+/// The bare table tags `[CONTENTS]` and `[BLOCK_DIGESTS]` mark a complete checkpoint of payload
+/// ownership and per-block MACs. An older checkpoint lacking either marker is rebuilt once from
+/// its surviving changesets, and the markers commit with all rebuilt rows before replay resumes at
+/// `applied`. Returns the number of corrupt changeset rows skipped during the rebuild.
 pub(super) fn index_checkpoint<F: BlockFile>(
   rows: &mut ShardDb<F>,
   file: &F,
@@ -166,7 +202,7 @@ pub(super) fn index_checkpoint<F: BlockFile>(
   page_bytes: usize,
 ) -> Result<u64, StoreError> {
   let mut value = Vec::new();
-  if rows.get(&[CONTENTS], &mut value)? {
+  if rows.get(&[CONTENTS], &mut value)? && rows.get(&[BLOCK_DIGESTS], &mut value)? {
     return Ok(0);
   }
   let corrupt_rows_skipped = if applied > 0 {
@@ -180,6 +216,7 @@ pub(super) fn index_checkpoint<F: BlockFile>(
     0
   };
   rows.put(&[CONTENTS], &[])?;
+  rows.put(&[BLOCK_DIGESTS], &[])?;
   if applied > 0 {
     rows.checkpoint(applied)?;
   }

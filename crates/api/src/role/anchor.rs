@@ -784,6 +784,8 @@ fn on_lapse(
     )
   }) {
     Lapse::Withheld => {
+      let stuck_words = stuck_task_words(supervisor.stuck_task());
+      supervisor.kill().map_err(|e| failed("kill", e))?;
       slates_machine::log_line!(
         "slates anchor: the daemon's heartbeat lapsed ({} ms old, past {} ms: the {} ms window plus this anchor's \
          lateness p99 of {} ms over {} waits, at most {} ms); {}; killing it",
@@ -793,19 +795,18 @@ fn on_lapse(
         lateness.p99_ns() / NS_PER_MS,
         lateness.len(),
         slates_server::watchdog::WINDOW_CEILING_NS / NS_PER_MS,
-        stuck_task_words(supervisor.stuck_task())
+        stuck_words
       );
-      supervisor.kill().map_err(|e| failed("kill", e))?;
       Ok(true)
     }
     Lapse::Stuck(said) => {
+      supervisor.kill().map_err(|e| failed("kill", e))?;
       slates_machine::log_line!(
         "slates anchor: the daemon's watchdog has not looked for {} ms, its heartbeat {} ms old; its process {said}; \
          killing it",
         looked_age / NS_PER_MS,
         beat_age / NS_PER_MS
       );
-      supervisor.kill().map_err(|e| failed("kill", e))?;
       Ok(true)
     }
     Lapse::Starved => {
@@ -1023,14 +1024,15 @@ fn observe(
               ),
               window,
             ) {
+              let child_pid = supervisor
+                .child_pid()
+                .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
+              supervisor.kill().map_err(|e| failed("kill", e))?;
               slates_machine::log_line!(
                 "slates anchor: the starting daemon (pid {}, spawned {} ms ago) {said}; killing it",
-                supervisor
-                  .child_pid()
-                  .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
+                child_pid,
                 now.saturating_sub(since) / NS_PER_MS
               );
-              supervisor.kill().map_err(|e| failed("kill", e))?;
               kill_sent = true;
               starting_since = None;
             }

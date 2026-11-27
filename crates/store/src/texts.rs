@@ -1362,14 +1362,10 @@ impl Store {
       if span_end > payload_len {
         return Err(StoreError::BadRow);
       }
-      let mut span = vec![
-        0u8;
-        usize::try_from(span_end.saturating_sub(span_start))
-          .map_err(|_| StoreError::BadRow)?
-      ];
-      self.log().read_at(
-        &mut span,
-        base.checked_add(span_start).ok_or(StoreError::BadRow)?,
+      let span = self.read_verified_span(
+        &first.payload,
+        (base, payload_len),
+        (span_start, span_end.saturating_sub(span_start)),
       )?;
       self.place_read();
       for place in places.get(at..end).unwrap_or_default() {
@@ -1434,7 +1430,8 @@ impl Store {
   }
 
   /// Makes the texts of `chain` (newest first, its oldest a whole or an edit of a text the cache holds), oldest first,
-  /// each applied to the one before in `base` and made into `next`, and keeps each.
+  /// each applied to the one before in `base` and made into `next`, verifying each rebuilt text's BLAKE3 against its
+  /// expected `identity` before keeping it in `cache`.
   fn make_chain(
     &mut self,
     staging: &Staging,
@@ -1454,27 +1451,14 @@ impl Store {
     while let Some((identity, row)) = chain.pop() {
       let bytes = self.read_place(staging, &row.place, cache)?;
       cache.changesets.insert(row.sequence);
-      match row.base {
-        None => {
-          if to_u64(bytes.len()) != row.len {
-            return Err(StoreError::BadRow);
-          }
-          next.clear();
-          next.extend_from_slice(&bytes);
-        }
-        Some(_) => {
-          apply_into(base, &bytes, row.len, next).map_err(|_| StoreError::BadRow)?;
-          cache.edits = cache.edits.saturating_add(1);
-        }
-      }
-      cache.made = cache.made.saturating_add(1);
-      cache.keep(identity, next);
+      apply_and_verify_chain_step(&identity, &row, &bytes, base, next, cache)?;
       std::mem::swap(base, next);
     }
     Ok(())
   }
 
-  /// The bytes at `place`: from the staging while its payload is in flight, else from the log, a piece at a time.
+  /// The bytes at `place`: from the staging while its payload is in flight, else from the log with
+  /// every touched [`crate::store::PIECE_BYTES`] block verified against its digest.
   fn read_place(
     &mut self,
     staging: &Staging,
@@ -1482,9 +1466,9 @@ impl Store {
     cache: &mut TextCache,
   ) -> Result<Vec<u8>, StoreError> {
     cache.places = cache.places.saturating_add(1);
-    let start = usize::try_from(place.offset).map_err(|_| StoreError::BadRow)?;
-    let len = usize::try_from(place.len).map_err(|_| StoreError::BadRow)?;
     if let Some(bytes) = staging.get(&place.payload) {
+      let start = usize::try_from(place.offset).map_err(|_| StoreError::BadRow)?;
+      let len = usize::try_from(place.len).map_err(|_| StoreError::BadRow)?;
       return bytes
         .get(start..start.checked_add(len).ok_or(StoreError::BadRow)?)
         .map(<[u8]>::to_vec)
@@ -1500,13 +1484,42 @@ impl Store {
     if end > payload_len {
       return Err(StoreError::BadRow);
     }
-    let mut bytes = vec![0u8; len];
-    self.log().read_at(
-      &mut bytes,
-      at.checked_add(place.offset).ok_or(StoreError::BadRow)?,
-    )?;
-    Ok(bytes)
+    self.read_verified_span(&place.payload, (at, payload_len), (place.offset, place.len))
   }
+}
+
+/// Materializes one chain step into `next` (whole copy or delta edit over `base`), verifies its
+/// whole-text BLAKE3 against `identity`, and inserts into `cache` only on a match so corrupted
+/// bytes never poison [`TextCache`].
+fn apply_and_verify_chain_step(
+  identity: &Identity,
+  row: &TextRow,
+  bytes: &[u8],
+  base: &[u8],
+  next: &mut Vec<u8>,
+  cache: &mut TextCache,
+) -> Result<(), StoreError> {
+  match row.base {
+    None => {
+      if to_u64(bytes.len()) != row.len {
+        return Err(StoreError::BadRow);
+      }
+      next.clear();
+      next.extend_from_slice(bytes);
+    }
+    Some(_) => {
+      apply_into(base, bytes, row.len, next).map_err(|_| StoreError::BadRow)?;
+      cache.edits = cache.edits.saturating_add(1);
+    }
+  }
+  if *blake3::hash(next).as_bytes() != *identity {
+    return Err(StoreError::Log(crate::log::LogError::Corrupt(
+      "a text's bytes",
+    )));
+  }
+  cache.made = cache.made.saturating_add(1);
+  cache.keep(*identity, next);
+  Ok(())
 }
 
 #[cfg(test)]

@@ -10,15 +10,17 @@ use hyper_block::block::BlockFile;
 use slates_land::store_root::{StoreGrant, StoreRoot};
 
 use super::{
-  CHANGESET_ENTRY_BYTES, Contents, LOG_FILE, LogHead, PIECE_BYTES, PieceDigests, ROWS_FILE, Sizing,
-  Store, StoreError, inspect_log_file, payloads, prepare_damaged_preamble_log, prepare_empty_log,
-  prepare_sealed_log, put_changeset_counted, read_seal_row, read_verified_piece,
+  CHANGESET_ENTRY_BYTES, Contents, LOG_FILE, LogHead, PIECE_BYTES, PieceMetrics, ROWS_FILE, Sizing,
+  Store, StoreError, block_key, index_payload_from_log, inspect_log_file, keyed_block_tag,
+  payloads, prepare_damaged_preamble_log, prepare_empty_log, prepare_sealed_log,
+  put_changeset_counted, read_seal_row, read_verified_span_with, validate_sizing_bounds,
 };
 use crate::log::{
   ChangesetLog, FORMAT, HEADER_BYTES, Header, LogError, SEAL_BYTES, SEAL_PREAMBLE_BYTES,
   SECTION_HEAD_BYTES, SectionKind, TRAILER_BYTES, Tool, encode_seal_preamble,
 };
 use crate::staging::Staging;
+use crate::texts::{self, Place, TextCache, TextEntry};
 
 /// Scratch directory beside the test binary, removed on drop (never `/tmp`, R1).
 struct ScratchDir {
@@ -296,14 +298,27 @@ fn read_all_pieces(
   Ok((out, pieces))
 }
 
+/// Encodes a checksummed `SLSE` preamble for a foreign format version `format` with valid CRC-32C
+/// and bitwise complement so `decode_seal_preamble` classifies it as `UnsupportedFormat(format)`.
+fn encode_future_preamble(format: u16, seal: &[u8; SEAL_BYTES]) -> [u8; SEAL_PREAMBLE_BYTES] {
+  let mut out = encode_seal_preamble(seal);
+  out[4..6].copy_from_slice(&format.to_le_bytes());
+  let crc = mantle_crc::crc32c(&out[..40]);
+  out[40..44].copy_from_slice(&crc.to_le_bytes());
+  out[44..48].copy_from_slice(&(!crc).to_le_bytes());
+  out
+}
+
 /// Lands `payload` and a healthy sibling, checkpoints, flips one bit at `payload + flip_at`,
-/// reopens, and asserts the VERY FIRST `Store::piece` call at `start_offset` refuses
-/// `LogError::Corrupt` (even when `flip_at` lies outside the requested window).
+/// reopens, and asserts that walking from `start_offset` refuses `LogError::Corrupt` (and when
+/// `expect_first_call_refused`, asserts the very first `Store::piece` call refuses with 0 verified
+/// reads).
 fn assert_corrupt_checkpointed_piece_refused(
   name: &str,
   payload_len: usize,
   flip_at: u64,
   start_offset: u64,
+  expect_first_call_refused: bool,
 ) {
   let dir = ScratchDir::new(name);
   let git_bytes = pattern_bytes(payload_len, 31, 7);
@@ -318,31 +333,53 @@ fn assert_corrupt_checkpointed_piece_refused(
   flip_bit_in_file(&dir.path().join(LOG_FILE), r1_payload_offset + flip_at, 4);
 
   let mut store = open_store(dir.path());
-  let staging = Staging::new(0);
-  let id = *blake3::hash(&git_bytes).as_bytes();
-  let first = store.piece(&staging, &id, to_u64(git_bytes.len()), start_offset);
-  assert!(
-    matches!(first, Err(StoreError::Log(LogError::Corrupt(_)))),
-    "{name}: very first Store::piece(offset={start_offset}) must refuse Corrupt, got {first:?}"
-  );
-  assert_eq!(store.payload_verifications(), 0);
+  if expect_first_call_refused {
+    let staging = Staging::new(0);
+    let id = *blake3::hash(&git_bytes).as_bytes();
+    let first = store.piece(&staging, &id, to_u64(git_bytes.len()), start_offset);
+    assert!(
+      matches!(first, Err(StoreError::Log(LogError::Corrupt(_)))),
+      "{name}: first Store::piece(offset={start_offset}) must refuse Corrupt, got {first:?}"
+    );
+    assert_eq!(store.payload_verifications(), 0);
+  } else {
+    let walk = read_all_pieces(&mut store, &git_bytes, start_offset);
+    assert!(
+      matches!(walk, Err(StoreError::Log(LogError::Corrupt(_)))),
+      "{name}: full walk from offset={start_offset} must refuse Corrupt, got {walk:?}"
+    );
+  }
   assert_eq!(read_piece_whole(&mut store, &hg_bytes), Some(hg_bytes));
 }
 
-/// SEAM-1 item 3 / Blocker 3 / A5: Do: land and checkpoint payloads of (a) 1 piece (1,000 B),
-/// (b) exact 65,536 B read from suffix offset 1, (c) 200,000 B with a bit-flip in piece 1 (+5)
-/// and in piece 3 (+150,000) requested at offset 0 and offset 1; and (d) a healthy 131,089-byte
-/// 3-piece payload.
-/// Expect: (a)-(c) all refuse `LogError::Corrupt` on the very first `Store::piece` call before
-/// returning any byte while healthy Hg reads intact; (d) returns exact bytes in 3 pieces, verifying
-/// every disk piece read against BLAKE3 (`payload_verifications() == 3`).
+/// SEAM-1 item 3 / Blocker 3 / Round-4 B-rows A5: Do: land and checkpoint payloads of (a) 1 piece
+/// (1,000 B), (b) exact 65,536 B read from suffix offset 1, (c) 200,000 B with a bit-flip in
+/// piece 1 (+5) and in piece 3 (+150,000) requested at block 2, unaligned across block 2, and
+/// walked from offset 0/1; and (d) a healthy 131,089-byte 3-piece payload.
+/// Expect: every read touching a flipped block refuses `LogError::Corrupt` before returning any
+/// corrupt byte while healthy Hg reads intact; (d) returns exact bytes in 3 pieces hashing each
+/// block once (`payload_verifications() == 3`, `piece_bytes_hashed() == 131_089`).
 #[test]
 fn checkpointed_stale_row_does_not_mask_corrupt_payload_on_piece_read() {
-  assert_corrupt_checkpointed_piece_refused("seam1-ckpt-1piece", 1_000, 5, 0);
-  assert_corrupt_checkpointed_piece_refused("seam1-ckpt-suffix", PIECE_BYTES, 5, 1);
-  assert_corrupt_checkpointed_piece_refused("seam1-ckpt-mp-first", 200_000, 5, 0);
-  assert_corrupt_checkpointed_piece_refused("seam1-ckpt-mp-third-off0", 200_000, 150_000, 0);
-  assert_corrupt_checkpointed_piece_refused("seam1-ckpt-mp-third-off1", 200_000, 150_000, 1);
+  assert_corrupt_checkpointed_piece_refused("seam1-ckpt-1piece", 1_000, 5, 0, true);
+  assert_corrupt_checkpointed_piece_refused("seam1-ckpt-suffix", PIECE_BYTES, 5, 1, true);
+  assert_corrupt_checkpointed_piece_refused("seam1-ckpt-mp-first", 200_000, 5, 0, true);
+  assert_corrupt_checkpointed_piece_refused(
+    "seam1-ckpt-mp-third-direct",
+    200_000,
+    150_000,
+    to_u64(2 * PIECE_BYTES),
+    true,
+  );
+  assert_corrupt_checkpointed_piece_refused(
+    "seam1-ckpt-mp-third-unaligned",
+    200_000,
+    150_000,
+    to_u64(2 * PIECE_BYTES - 16),
+    true,
+  );
+  assert_corrupt_checkpointed_piece_refused("seam1-ckpt-mp-third-off0", 200_000, 150_000, 0, false);
+  assert_corrupt_checkpointed_piece_refused("seam1-ckpt-mp-third-off1", 200_000, 150_000, 1, false);
 
   let dir = ScratchDir::new("seam1-ckpt-healthy-3piece");
   let healthy = pattern_bytes(131_089, 17, 3);
@@ -355,6 +392,7 @@ fn checkpointed_stale_row_does_not_mask_corrupt_payload_on_piece_read() {
   let (got, pieces) = read_all_pieces(&mut store, &healthy, 0).unwrap();
   assert_eq!((got, pieces), (healthy, 3));
   assert_eq!(store.payload_verifications(), 3);
+  assert_eq!(store.piece_bytes_hashed(), 131_089);
 }
 
 /// Builds raw serialized bytes of a valid committed record for repository 2 from a separate store.
@@ -693,9 +731,8 @@ fn opening_unsupported_format_store_refuses_without_mutating_files() {
     Some(1),
   );
 
-  let mut future = encode_seal_preamble(&[0x33u8; SEAL_BYTES]);
-  future[4..6].copy_from_slice(&3u16.to_le_bytes());
-  assert_open_refused_without_mutation("seam3-refuse-v3", &[(LOG_FILE, &future)], Some(3));
+  let future = encode_future_preamble(FORMAT + 1, &[0x33u8; SEAL_BYTES]);
+  assert_open_refused_without_mutation("seam3-refuse-v3", &[(LOG_FILE, &future)], Some(FORMAT + 1));
 
   let mut damaged = encode_seal_preamble(&[0x44u8; SEAL_BYTES]);
   damaged[12] ^= 0xFF;
@@ -811,8 +848,313 @@ fn a5_disk_bitflip_after_piece_zero_is_caught_on_piece_one() {
   assert_eq!(store.payload_verifications(), 1);
 }
 
-/// Pure `SimFile` unit tests for piece authentication, `SLSE` preamble / format versioning /
-/// index rebuild, and corrupt-row accounting (runnable without `StoreRoot::identify`).
+/// Opens a store in `dir` with caller-chosen `sizing`, returning the full `Result`.
+fn try_open_store_with(dir: &Path, sizing: Sizing) -> Result<Store, StoreError> {
+  let grant = StoreGrant {
+    repository: 1,
+    target: StoreRoot::identify(dir)?,
+    issued_ns: 0,
+  };
+  let root = StoreRoot::open(dir, &grant)?;
+  Store::open(root, sizing)
+}
+
+/// Round-4 Item 1 (`Store` end-to-end): Do: land two oversized 512 KiB payloads under small
+/// `Sizing`, interleave piece reads across both payloads, copy only `changesets` into a fresh
+/// directory without `rows`, reopen, and re-read.
+/// Expect: every `Store::piece` call hashes at most `2 * PIECE_BYTES` (O(1) bytes hashed, zero
+/// cache cliff) both before and after rebuilding `rows` from `changesets`.
+#[test]
+fn oversized_and_interleaved_piece_reads_stay_o1_before_and_after_rows_rebuild() {
+  let dir = ScratchDir::new("rt4-o1-interleaved");
+  let sizing = Sizing {
+    memory: 1 << 20,
+    disk: 1 << 30,
+    extent_bytes: 128 << 10,
+    fanout: 8,
+  };
+  let payload_a = pattern_bytes(8 * PIECE_BYTES + 37, 13, 5);
+  let payload_b = pattern_bytes(8 * PIECE_BYTES + 91, 29, 7);
+  {
+    let mut store = try_open_store_with(dir.path(), sizing).unwrap();
+    land_for(&mut store, Tool::Git, 1, 1, &payload_a);
+    land_for(&mut store, Tool::Mercurial, 2, 1, &payload_b);
+    store.checkpoint().unwrap();
+  }
+  assert_interleaved_piece_o1(dir.path(), sizing, &payload_a, &payload_b);
+  let rebuilt = ScratchDir::new("rt4-o1-interleaved-rebuilt");
+  let log_bytes = std::fs::read(dir.path().join(LOG_FILE)).unwrap();
+  create_file_with(&rebuilt.path().join(LOG_FILE), &log_bytes);
+  assert!(!rebuilt.path().join(ROWS_FILE).exists());
+  assert_interleaved_piece_o1(rebuilt.path(), sizing, &payload_a, &payload_b);
+}
+
+/// Reads one piece at `off` from `store` and asserts exact bytes and `<= 2 * PIECE_BYTES` hashed.
+fn assert_one_o1_piece(
+  store: &mut Store,
+  staging: &Staging,
+  (id, expected): ([u8; blake3::OUT_LEN], &[u8]),
+  off: u64,
+) {
+  let cap = to_u64(PIECE_BYTES);
+  let hashed_before = store.piece_bytes_hashed();
+  let got = store
+    .piece(staging, &id, to_u64(expected.len()), off)
+    .unwrap()
+    .unwrap();
+  let hashed_delta = store.piece_bytes_hashed() - hashed_before;
+  let start = usize::try_from(off).unwrap();
+  let end = (start + PIECE_BYTES).min(expected.len());
+  assert_eq!(got.as_ref(), &expected[start..end]);
+  assert!(
+    hashed_delta <= 2 * cap,
+    "piece(off={off}) hashed {hashed_delta} bytes (> 2 * PIECE_BYTES)"
+  );
+}
+
+/// Interleaves piece reads across `payload_a` and `payload_b`, asserting every call hashes
+/// `<= 2 * PIECE_BYTES` and returns exact bytes.
+fn assert_interleaved_piece_o1(dir: &Path, sizing: Sizing, payload_a: &[u8], payload_b: &[u8]) {
+  let mut store = try_open_store_with(dir, sizing).unwrap();
+  let staging = Staging::new(0);
+  let id_a = *blake3::hash(payload_a).as_bytes();
+  let id_b = *blake3::hash(payload_b).as_bytes();
+  let cap = to_u64(PIECE_BYTES);
+  for block in 0..9u64 {
+    let off = block * cap;
+    assert_one_o1_piece(&mut store, &staging, (id_a, payload_a), off);
+    assert_one_o1_piece(&mut store, &staging, (id_b, payload_b), off);
+  }
+}
+
+/// Round-4 Item 1 (A5 on `places_bytes` & `text_at`/`make_chain`): Do: land a multi-piece payload
+/// carrying two full texts and a `Texts` section, checkpoint, flip 1 bit in the second text on
+/// disk, and read through both `places_bytes` and `text_at`.
+/// Expect: both `places_bytes` and `text_at` refuse `LogError::Corrupt`, and `TextCache` is NOT
+/// poisoned (the corrupted text identity stays absent from `cache`).
+#[test]
+fn a5_disk_bitflip_caught_by_places_bytes_and_text_at_without_poisoning_cache() {
+  let dir = ScratchDir::new("rt4-a5-texts");
+  let first_text = pattern_bytes(PIECE_BYTES + 64, 17, 3);
+  let second_text = pattern_bytes(4_096, 31, 9);
+  let payload = [first_text.as_slice(), second_text.as_slice()].concat();
+  let payload_id = *blake3::hash(&payload).as_bytes();
+  let place1 = Place {
+    payload: payload_id,
+    offset: 0,
+    len: to_u64(first_text.len()),
+  };
+  let place2 = Place {
+    payload: payload_id,
+    offset: to_u64(first_text.len()),
+    len: to_u64(second_text.len()),
+  };
+  let id1 = *blake3::hash(&first_text).as_bytes();
+  let id2 = *blake3::hash(&second_text).as_bytes();
+  let section = texts::encode(&[
+    TextEntry {
+      path: b"a.bin".to_vec(),
+      tool_id: b"n1".to_vec(),
+      text: id1,
+      len: place1.len,
+      base: None,
+      place: place1,
+    },
+    TextEntry {
+      path: b"b.bin".to_vec(),
+      tool_id: b"n2".to_vec(),
+      text: id2,
+      len: place2.len,
+      base: None,
+      place: place2,
+    },
+  ]);
+  let payload_offset = {
+    let mut store = open_store(dir.path());
+    let staging = Staging::new(0);
+    let located = store
+      .land(
+        Header {
+          tool: Tool::Mercurial,
+          repository: 1,
+          sequence: 1,
+          judged_over: 0,
+          grant: store.grant().id,
+          work: 1,
+          time_ns: 1,
+          sections: 0,
+        },
+        &[
+          (SectionKind::Payload, Contents::Bytes(&payload)),
+          (SectionKind::Texts, Contents::Bytes(&section)),
+        ],
+        &staging,
+      )
+      .unwrap();
+    store.checkpoint().unwrap();
+    store.log().sections(&located).unwrap()[0].offset
+  };
+  flip_bit_in_file(
+    &dir.path().join(LOG_FILE),
+    payload_offset + place2.offset + 77,
+    2,
+  );
+  let mut store = open_store(dir.path());
+  let staging = Staging::new(0);
+  let places_err = store.places_bytes(&staging, &[place2]);
+  assert!(matches!(
+    places_err,
+    Err(StoreError::Log(LogError::Corrupt(_)))
+  ));
+  let mut cache = TextCache::new(1 << 20);
+  let text_err = store.text_at(&staging, 1, &id2, 0, &mut cache);
+  assert!(matches!(
+    text_err,
+    Err(StoreError::Log(LogError::Corrupt(_)))
+  ));
+  assert!(
+    cache.get(&id2).is_none(),
+    "corrupt text must never poison TextCache"
+  );
+}
+
+/// Round-4 Items 2 & S1 (`P_FORMAT` bit-flip recovery + preamble self-repair): Do: land and
+/// checkpoint a record, flip bit 0 of `P_FORMAT` (offset 4) in `changesets`, reopen `Store` (which
+/// must recover via `rows`'s backup `SEAL_ROW` AND repair the 48-byte preamble on disk), then
+/// copy only the repaired `changesets` into a fresh directory without `rows` and reopen again.
+/// Expect: both reopens succeed with 100% of records intact and `changesets`'s 48-byte preamble
+/// repaired cleanly on disk.
+#[test]
+fn p_format_bitflip_recovers_repairs_preamble_and_survives_rows_deletion() {
+  let dir = ScratchDir::new("rt4-pformat-repair");
+  let body = b"survives P_FORMAT bit-flip and subsequent rows loss".to_vec();
+  let (r1, seal) = {
+    let mut store = open_store(dir.path());
+    let r1 = land_for(&mut store, Tool::Git, 1, 1, &body);
+    store.checkpoint().unwrap();
+    (r1, store.seal())
+  };
+  flip_bit_in_file(&dir.path().join(LOG_FILE), 4, 0);
+  {
+    let mut repaired = open_store(dir.path());
+    assert_eq!(repaired.seal(), seal);
+    assert_single_changeset_intact(&mut repaired, 1, r1.identity, &body);
+  }
+  let log_bytes = std::fs::read(dir.path().join(LOG_FILE)).unwrap();
+  assert_eq!(
+    &log_bytes[..SEAL_PREAMBLE_BYTES],
+    &encode_seal_preamble(&seal),
+    "damaged preamble must be durably repaired on disk"
+  );
+  let rebuilt_dir = ScratchDir::new("rt4-pformat-rebuilt");
+  create_file_with(&rebuilt_dir.path().join(LOG_FILE), &log_bytes);
+  assert!(!rebuilt_dir.path().join(ROWS_FILE).exists());
+  let mut rebuilt = open_store(rebuilt_dir.path());
+  assert_eq!(rebuilt.seal(), seal);
+  assert_single_changeset_intact(&mut rebuilt, 1, r1.identity, &body);
+}
+
+/// Round-4 Item 4 (Truncated `changesets` refusal): Do: checkpoint a Format-2 store, then truncate
+/// `changesets` to (a) 48 bytes (`48 < applied`) and (b) 20 bytes (`1..47` with `SEAL_ROW` in
+/// `rows`), and call `Store::open`.
+/// Expect: both refuse `Err(StoreError::Log(LogError::Corrupt(_)))` without mutating `changesets`
+/// or `rows`.
+#[test]
+fn truncated_changesets_log_refuses_without_mutating_files() {
+  for (name, cut) in [("rt4-trunc-48", SEAL_PREAMBLE_BYTES), ("rt4-trunc-20", 20)] {
+    let dir = ScratchDir::new(name);
+    {
+      let mut store = open_store(dir.path());
+      land_for(&mut store, Tool::Git, 1, 1, b"checkpointed record");
+      store.checkpoint().unwrap();
+    }
+    let log_path = dir.path().join(LOG_FILE);
+    let mut truncated = std::fs::read(&log_path).unwrap();
+    truncated.truncate(cut);
+    overwrite_file(&log_path, &truncated);
+    let before = snapshot_dir(dir.path());
+    let err = try_open_store(dir.path());
+    assert!(
+      matches!(err, Err(StoreError::Log(LogError::Corrupt(_)))),
+      "{name} (cut={cut}): expected Corrupt, got {err:?}"
+    );
+    assert_eq!(snapshot_dir(dir.path()), before, "{name}: mutated files");
+  }
+}
+
+/// Round-4 Item 5 (`expected_grant: None` on resync across directory copy): Do: land 3 records in
+/// `src`, copy `changesets` to a fresh directory `dst` (different inode -> different `grant_id`),
+/// flip 1 bit in record 1's header, and open `Store` on `dst`.
+/// Expect: `dst`'s grant id differs from `src`, record 1 is skipped, and records 2 & 3 recover
+/// 100% intact.
+#[test]
+fn copied_changesets_with_flipped_first_header_resyncs_trailing_records() {
+  let src = ScratchDir::new("rt4-copy-resync-src");
+  let git_bytes = b"record 1 damaged after copy".to_vec();
+  let hg_bytes = b"record 2 healthy Hg after copy".to_vec();
+  let svn_bytes = b"record 3 healthy SVN after copy".to_vec();
+  let (src_grant, r1, r2, r3) = {
+    let mut store = open_store(src.path());
+    let r1 = land_for(&mut store, Tool::Git, 1, 1, &git_bytes);
+    let r2 = land_for(&mut store, Tool::Mercurial, 2, 1, &hg_bytes);
+    let r3 = land_for(&mut store, Tool::Subversion, 3, 1, &svn_bytes);
+    (store.grant().id, r1, r2, r3)
+  };
+  let dst = ScratchDir::new("rt4-copy-resync-dst");
+  let copied = std::fs::read(src.path().join(LOG_FILE)).unwrap();
+  create_file_with(&dst.path().join(LOG_FILE), &copied);
+  flip_bit_in_file(&dst.path().join(LOG_FILE), r1.offset + 12, 1);
+
+  let mut recovered = open_store(dst.path());
+  assert_ne!(recovered.grant().id, src_grant);
+  assert!(recovered.changesets(1, 0, 10).unwrap().is_empty());
+  assert_single_changeset_intact(&mut recovered, 2, r2.identity, &hg_bytes);
+  assert_single_changeset_intact(&mut recovered, 3, r3.identity, &svn_bytes);
+  assert_eq!(recovered.log().end(), r3.end());
+}
+
+/// Round-4 Item 5 (0-byte `rows` recovery): Do: call `Store::open` with invalid `memory: 0`, then
+/// with invalid `extent_bytes: 1`, then with a manually left 0-byte `rows` file beside a sealed
+/// `changesets`, and reopen with valid `Sizing` each time.
+/// Expect: invalid sizings refuse `StoreError::Sizing`, and reopening with valid `Sizing` succeeds
+/// cleanly every time.
+#[test]
+fn zero_byte_rows_and_bad_sizing_recover_on_valid_reopen() {
+  let valid = Sizing {
+    memory: 8 << 20,
+    disk: 1 << 30,
+    extent_bytes: 128 << 10,
+    fanout: 8,
+  };
+  let dir = ScratchDir::new("rt4-zero-rows");
+  let bad_mem = try_open_store_with(dir.path(), Sizing { memory: 0, ..valid });
+  assert!(matches!(bad_mem, Err(StoreError::Sizing(_))));
+  assert!(!dir.path().join(ROWS_FILE).exists());
+
+  let bad_extent = try_open_store_with(
+    dir.path(),
+    Sizing {
+      extent_bytes: 1,
+      ..valid
+    },
+  );
+  assert!(matches!(bad_extent, Err(StoreError::Sizing(_))));
+
+  let body = b"lands cleanly after bad sizing".to_vec();
+  let r1 = {
+    let mut store = try_open_store_with(dir.path(), valid).unwrap();
+    let r1 = land_for(&mut store, Tool::Git, 1, 1, &body);
+    store.checkpoint().unwrap();
+    r1
+  };
+  overwrite_file(&dir.path().join(ROWS_FILE), &[]);
+  let mut rebuilt = try_open_store_with(dir.path(), valid).unwrap();
+  assert_single_changeset_intact(&mut rebuilt, 1, r1.identity, &body);
+}
+
+/// Pure `SimFile` unit tests for durable `B`-row piece/span authentication, `SLSE` preamble
+/// self-repair & format versioning, truncation refusal, `expected_grant: None` resync, sizing
+/// bounds, and corrupt-row accounting (runnable without `StoreRoot::identify`).
 mod sim_tests {
   use hyper_block::buf::Alignment;
   use hyper_block::sim::{Crash, Fault, SimFile};
@@ -840,14 +1182,28 @@ mod sim_tests {
     )
   }
 
+  fn create_sim_rows(seed: u64) -> ShardDb<SimFile> {
+    let (config, trunk) = sim_db_config();
+    ShardDb::create(sim_file(seed), config, 1 << 20, trunk).unwrap()
+  }
+
   fn append_sim(log: &mut ChangesetLog<SimFile>, seq: u64, bytes: &[u8]) -> crate::log::Located {
+    append_sim_with_grant(log, seq, 7, bytes)
+  }
+
+  fn append_sim_with_grant(
+    log: &mut ChangesetLog<SimFile>,
+    seq: u64,
+    grant: u64,
+    bytes: &[u8],
+  ) -> crate::log::Located {
     let mut rec = log
       .begin(Header {
         tool: Tool::Git,
         repository: 1,
         sequence: seq,
         judged_over: seq.saturating_sub(1),
-        grant: 7,
+        grant,
         work: seq,
         time_ns: seq,
         sections: 1,
@@ -860,9 +1216,50 @@ mod sim_tests {
     rec.commit().unwrap()
   }
 
-  fn read_sim_pieces(
+  /// Appends one payload section to `log`, indexes its `P` and multi-piece `B` rows into `rows`,
+  /// and returns its `(offset, len)` section range.
+  fn append_and_index(
+    log: &mut ChangesetLog<SimFile>,
+    rows: &mut ShardDb<SimFile>,
+    seq: u64,
+    bytes: &[u8],
+  ) -> (u64, u64) {
+    let located = append_sim(log, seq, bytes);
+    let sec = log.sections(&located).unwrap()[0];
+    let seal = log.seal();
+    let (mut value, mut buffer) = (Vec::new(), Vec::new());
+    index_payload_from_log(
+      rows,
+      log.file(),
+      &seal,
+      (sec.offset, sec.len),
+      (&mut value, &mut buffer),
+    )
+    .unwrap();
+    (sec.offset, sec.len)
+  }
+
+  /// Reads one piece (at most `PIECE_BYTES` from `offset`) via `read_verified_span_with`.
+  fn read_sim_piece(
     log: &ChangesetLog<SimFile>,
-    digests: &mut PieceDigests,
+    rows: &mut ShardDb<SimFile>,
+    metrics: &mut PieceMetrics,
+    id: &[u8; blake3::OUT_LEN],
+    place: (u64, u64),
+    offset: u64,
+  ) -> Result<Vec<u8>, StoreError> {
+    let take = place
+      .1
+      .checked_sub(offset)
+      .ok_or(StoreError::BadRow)?
+      .min(to_u64(PIECE_BYTES));
+    read_verified_span_with(log, rows, metrics, id, place, (offset, take))
+  }
+
+  fn read_sim_all_pieces(
+    log: &ChangesetLog<SimFile>,
+    rows: &mut ShardDb<SimFile>,
+    metrics: &mut PieceMetrics,
     payload: &[u8],
     place: (u64, u64),
     start_offset: u64,
@@ -870,7 +1267,7 @@ mod sim_tests {
     let id = *blake3::hash(payload).as_bytes();
     let (mut out, mut offset, mut pieces) = (Vec::new(), start_offset, 0usize);
     while offset < place.1 {
-      let chunk = read_verified_piece(log, digests, &id, place, offset)?;
+      let chunk = read_sim_piece(log, rows, metrics, &id, place, offset)?;
       pieces += 1;
       offset += to_u64(chunk.len());
       out.extend_from_slice(&chunk);
@@ -878,64 +1275,87 @@ mod sim_tests {
     Ok((out, pieces))
   }
 
-  fn assert_sim_flip_refused(seed: u64, payload_len: usize, flip_at: u64, start_offset: u64) {
+  fn assert_corrupt_piece(res: Result<Vec<u8>, StoreError>, label: &str) {
+    assert!(
+      matches!(res, Err(StoreError::Log(LogError::Corrupt(_)))),
+      "{label}: expected Corrupt, got {res:?}"
+    );
+  }
+
+  fn assert_sim_flip_refused(
+    seed: u64,
+    payload_len: usize,
+    flip_at: u64,
+    start_offset: u64,
+    first_call_refused: bool,
+  ) {
     let bytes = pattern_bytes(payload_len, 31, 7);
+    let mut rows = create_sim_rows(seed + 1_000);
     let mut log = ChangesetLog::recover(sim_file(seed), 0, |_, _| {}).unwrap();
-    let located = append_sim(&mut log, 1, &bytes);
-    let section = log.sections(&located).unwrap()[0];
+    let place = append_and_index(&mut log, &mut rows, 1, &bytes);
     log
       .file()
       .inject(Fault::BitFlip {
-        offset: section.offset + flip_at,
+        offset: place.0 + flip_at,
         bit: 4,
         stored: true,
       })
       .unwrap();
-    let mut digests = PieceDigests::with_budget(PIECE_BYTES);
+    let mut metrics = PieceMetrics::default();
     let id = *blake3::hash(&bytes).as_bytes();
-    let first = read_verified_piece(
-      &log,
-      &mut digests,
-      &id,
-      (section.offset, section.len),
-      start_offset,
-    );
-    assert!(
-      matches!(first, Err(StoreError::Log(LogError::Corrupt(_)))),
-      "very first piece read (flip +{flip_at}, start {start_offset}) must refuse Corrupt, got {first:?}"
-    );
-    assert_eq!(digests.verifications(), 0);
+    if first_call_refused {
+      let first = read_sim_piece(&log, &mut rows, &mut metrics, &id, place, start_offset);
+      assert_corrupt_piece(first, "first piece touching flipped block");
+      assert_eq!(metrics.verifications, 0);
+    } else {
+      let walk = read_sim_all_pieces(&log, &mut rows, &mut metrics, &bytes, place, start_offset);
+      assert!(matches!(walk, Err(StoreError::Log(LogError::Corrupt(_)))));
+    }
   }
 
-  /// Blocker 3 / A5 (`SimFile` oracle): Do: run `read_verified_piece` on (a) 1-piece control,
-  /// (b) suffix `offset = 1` on 65,536-byte payload with bit-flip, (c) 200,000-byte payload
-  /// flipped at +5 and +150,000 requested at offset 0 and offset 1, and (d) healthy 131,089-byte
-  /// 3-piece reads.
-  /// Expect: (a)-(c) refuse `LogError::Corrupt` on the very first piece call; (d) returns exact
-  /// bytes in 3 pieces verifying on EVERY disk piece read (`verifications == 3`, and `6` after a
-  /// second full read).
+  /// Blocker 3 / Round-4 B-rows A5 (`SimFile` oracle): Do: run `read_verified_span_with` on
+  /// (a) 1-piece control (verifying ZERO `B` rows are written for `<= PIECE_BYTES`), (b) suffix
+  /// `offset = 1` on exact `PIECE_BYTES`, (c) 200,000-byte payload flipped at +5 and +150,000,
+  /// and (d) healthy 131,089-byte 3-piece reads.
+  /// Expect: small payloads write zero `B` rows; every read touching a flipped block refuses
+  /// `LogError::Corrupt`; healthy 3-piece read hashes exact `131_089` bytes across 3 verified calls.
   #[test]
   fn sim_piece_verification_covers_one_piece_suffix_and_multipiece() {
-    assert_sim_flip_refused(90, 1_000, 5, 0);
-    assert_sim_flip_refused(91, PIECE_BYTES, 5, 1);
-    assert_sim_flip_refused(92, 200_000, 5, 0);
-    assert_sim_flip_refused(93, 200_000, 150_000, 0);
-    assert_sim_flip_refused(98, 200_000, 150_000, 1);
+    assert_sim_flip_refused(90, 1_000, 5, 0, true);
+    assert_sim_flip_refused(91, PIECE_BYTES, 5, 1, true);
+    assert_sim_flip_refused(92, 200_000, 5, 0, true);
+    assert_sim_flip_refused(93, 200_000, 150_000, to_u64(2 * PIECE_BYTES), true);
+    assert_sim_flip_refused(98, 200_000, 150_000, 0, false);
 
-    let healthy = pattern_bytes(131_089, 17, 3);
+    // Small payload <= PIECE_BYTES writes zero B rows.
+    let small = pattern_bytes(PIECE_BYTES, 19, 1);
+    let mut rows = create_sim_rows(1094);
     let mut log = ChangesetLog::recover(sim_file(94), 0, |_, _| {}).unwrap();
-    let r1 = append_sim(&mut log, 1, &healthy);
-    let s1 = log.sections(&r1).unwrap()[0];
-    let mut digests = PieceDigests::with_budget(PIECE_BYTES);
+    let small_place = append_and_index(&mut log, &mut rows, 1, &small);
+    let mut scratch = Vec::new();
+    assert!(
+      !rows
+        .get(&block_key(small_place.0, 0), &mut scratch)
+        .unwrap(),
+      "single-piece payload <= PIECE_BYTES must not write B rows"
+    );
+
+    // Healthy 3-piece payload verifies in O(1) bytes per piece.
+    let healthy = pattern_bytes(131_089, 17, 3);
+    let place = append_and_index(&mut log, &mut rows, 2, &healthy);
+    let mut metrics = PieceMetrics::default();
     let (got, pieces) =
-      read_sim_pieces(&log, &mut digests, &healthy, (s1.offset, s1.len), 0).unwrap();
+      read_sim_all_pieces(&log, &mut rows, &mut metrics, &healthy, place, 0).unwrap();
     assert_eq!(
-      (got, pieces, digests.verifications()),
-      (healthy.clone(), 3, 3)
+      (got, pieces, metrics.verifications, metrics.bytes_hashed),
+      (healthy.clone(), 3, 3, 131_089)
     );
     let (again, pieces2) =
-      read_sim_pieces(&log, &mut digests, &healthy, (s1.offset, s1.len), 0).unwrap();
-    assert_eq!((again, pieces2, digests.verifications()), (healthy, 3, 6));
+      read_sim_all_pieces(&log, &mut rows, &mut metrics, &healthy, place, 0).unwrap();
+    assert_eq!(
+      (again, pieces2, metrics.verifications, metrics.bytes_hashed),
+      (healthy, 3, 6, 2 * 131_089)
+    );
   }
 
   /// Suggestion 2 (`SimFile` oracle): Do: corrupt an already-indexed record's header in `SimFile`
@@ -1017,7 +1437,7 @@ mod sim_tests {
       rebuilt.log_file,
       rebuilt.replay_from,
       rebuilt.seal,
-      Some(7),
+      None,
       |_, entry| found.push(*entry),
     )
     .unwrap();
@@ -1030,18 +1450,20 @@ mod sim_tests {
     log_file
   }
 
-  /// Damages `log_file`'s preamble, checks refusal without `rows`, and verifies backup `SEAL_ROW`
-  /// recovery with `saved_rows`.
-  fn assert_sim_damaged_preamble_fallback(
+  /// Flips `P_FORMAT` bit 0 (offset 4) on `log_file`, verifies refusal without `rows`, verifies
+  /// backup `SEAL_ROW` recovery repairs the 48-byte preamble durably on disk, and verifies a
+  /// subsequent rebuild with fresh empty `rows` succeeds.
+  fn assert_sim_damaged_preamble_fallback_and_repair(
     log_file: SimFile,
     saved_rows: ShardDb<SimFile>,
     seal: [u8; SEAL_BYTES],
     expected: &[crate::log::Located],
+    image_before: &[u8],
   ) {
     let (config, trunk) = sim_db_config();
     log_file
       .inject(Fault::BitFlip {
-        offset: 10,
+        offset: 4,
         bit: 0,
         stored: true,
       })
@@ -1073,7 +1495,7 @@ mod sim_tests {
       fallback.log_file,
       fallback.replay_from,
       fallback.seal,
-      Some(7),
+      None,
       |_, entry| found.push(*entry),
     )
     .unwrap();
@@ -1091,15 +1513,22 @@ mod sim_tests {
         expected.last().unwrap().end(),
       )
     );
+    let repaired_log = recovered.into_file();
+    repaired_log.crash(Crash::LoseAll).unwrap();
+    assert_eq!(
+      inspect_log_file(&repaired_log).unwrap(),
+      LogHead::Sealed(seal),
+      "repaired preamble must survive LoseAll crash and classify as Sealed"
+    );
+    assert_sim_rebuild_from_sealed_log(repaired_log, seal, expected, image_before);
   }
 
-  /// Round-3 Blocker 2 (`SimFile` oracle for `SLSE` preamble, crash durability, `rows` rebuild,
-  /// and backup `SEAL_ROW` fallback): Do: initialize a fresh store log via `prepare_empty_log`,
-  /// land records, crash `LoseAll`, rebuild with a brand-new `ShardDb`, and then damage the
-  /// preamble and recover via backup `SEAL_ROW`.
-  /// Expect: preamble survives crash, rebuild recovers 100% of records with `log` byte-identical,
-  /// damaged preamble without `rows` fails `Corrupt`, and damaged preamble with backup `SEAL_ROW`
-  /// recovers 100% of records.
+  /// Round-3 Blocker 2 / Round-4 B2+S1 (`SimFile` oracle): Do: initialize a store log via
+  /// `prepare_empty_log`, land records, crash `LoseAll`, rebuild with a fresh `ShardDb`, then flip
+  /// `P_FORMAT` bit 0, recover via backup `SEAL_ROW`, crash `LoseAll`, and rebuild again from
+  /// scratch without `rows`.
+  /// Expect: `P_FORMAT` bit-flip classifies as `DamagedPreamble`, recovery durably self-repairs
+  /// the 48-byte preamble on disk, and subsequent deletion of `rows` rebuilds 100% cleanly.
   #[test]
   fn sim_seal_preamble_survives_crash_rebuilds_deleted_rows_and_falls_back_to_backup() {
     let (config, trunk) = sim_db_config();
@@ -1114,14 +1543,9 @@ mod sim_tests {
 
     let mut rows = opened.rows;
     rows.checkpoint(opened.replay_from).unwrap();
-    let mut log = ChangesetLog::recover_sealed(
-      opened.log_file,
-      opened.replay_from,
-      seal,
-      Some(7),
-      |_, _| {},
-    )
-    .unwrap();
+    let mut log =
+      ChangesetLog::recover_sealed(opened.log_file, opened.replay_from, seal, None, |_, _| {})
+        .unwrap();
     let r1 = append_sim(&mut log, 1, b"first sealed changeset");
     let r2 = append_sim(&mut log, 2, b"second sealed changeset");
     let log_file = log.into_file();
@@ -1129,7 +1553,13 @@ mod sim_tests {
     let log_image_before = log_file.durable_image().unwrap();
 
     let log_file = assert_sim_rebuild_from_sealed_log(log_file, seal, &[r1, r2], &log_image_before);
-    assert_sim_damaged_preamble_fallback(log_file, rows, seal, &[r1, r2]);
+    assert_sim_damaged_preamble_fallback_and_repair(
+      log_file,
+      rows,
+      seal,
+      &[r1, r2],
+      &log_image_before,
+    );
   }
 
   /// Writes `bytes` into a fresh `SimFile`, asserts `inspect_log_file` refuses
@@ -1146,11 +1576,38 @@ mod sim_tests {
     assert_eq!(sim.durable_image().unwrap(), before);
   }
 
-  /// Round-3 Blocker 2 (`SimFile` format-version & seal-mismatch refusal oracle): Do: run
-  /// `inspect_log_file` on legacy `FORMAT = 1` `SLCS` and future `FORMAT = 3` `SLSE`, and run
-  /// `prepare_sealed_log` when `rows` carries a different store's `SEAL_ROW`.
-  /// Expect: `UnsupportedFormat(1)`, `UnsupportedFormat(3)`, and `Corrupt("a store seal mismatch")`,
-  /// each with zero bytes written to the log file.
+  /// Verifies truncated `changesets` logs (`48 < applied` and `20 < 48`) are refused without
+  /// mutating `log_file` in both `prepare_sealed_log` and `prepare_damaged_preamble_log`.
+  fn assert_sim_truncated_logs_refused_without_mutation() {
+    let (config, trunk) = sim_db_config();
+    let seal = [0xCCu8; SEAL_BYTES];
+    let preamble = encode_seal_preamble(&seal);
+
+    // 48-byte valid preamble with applied = 256 -> refused without mutation.
+    let sealed_trunc = sim_file(120);
+    sealed_trunc.write_all_at(&preamble, 0).unwrap();
+    sealed_trunc.sync_data().unwrap();
+    let mut rows_a = ShardDb::create(sim_file(121), config, 1 << 20, trunk).unwrap();
+    rows_a.put(&[super::super::SEAL_ROW], &seal).unwrap();
+    let err_a = prepare_sealed_log(sealed_trunc, seal, (rows_a, 256, config.page_size));
+    assert!(matches!(err_a, Err(StoreError::Log(LogError::Corrupt(_)))));
+
+    // 20-byte truncated preamble with backup SEAL_ROW -> refused before rewriting preamble.
+    let short_trunc = sim_file(122);
+    short_trunc.write_all_at(&preamble[..20], 0).unwrap();
+    short_trunc.sync_data().unwrap();
+    let mut rows_b = ShardDb::create(sim_file(123), config, 1 << 20, trunk).unwrap();
+    rows_b.put(&[super::super::SEAL_ROW], &seal).unwrap();
+    let err_b = prepare_damaged_preamble_log(short_trunc, Some((rows_b, 256, config.page_size)));
+    assert!(matches!(err_b, Err(StoreError::Log(LogError::Corrupt(_)))));
+  }
+
+  /// Round-3 Blocker 2 / Round-4 Item 4 (`SimFile` format-version, seal-mismatch, and truncation
+  /// refusal oracle): Do: run `inspect_log_file` on legacy `FORMAT = 1` `SLCS` and checksummed
+  /// future `FORMAT + 1` `SLSE`, run `prepare_sealed_log` with a mismatched `SEAL_ROW`, and test
+  /// truncated logs (`48 < applied` and `20 < 48`).
+  /// Expect: `UnsupportedFormat(1)`, `UnsupportedFormat(FORMAT + 1)`, and `Corrupt` on mismatch
+  /// and truncation, with zero mutation.
   #[test]
   fn sim_inspect_log_refuses_foreign_formats_and_mismatched_seal_row() {
     let mut v1_head = [0u8; HEADER_BYTES];
@@ -1158,8 +1615,7 @@ mod sim_tests {
     v1_head[4..6].copy_from_slice(&1u16.to_le_bytes());
     assert_sim_foreign_format_refused(105, &v1_head, 1);
 
-    let mut v3_preamble = encode_seal_preamble(&[0x33u8; SEAL_BYTES]);
-    v3_preamble[4..6].copy_from_slice(&(FORMAT + 1).to_le_bytes());
+    let v3_preamble = encode_future_preamble(FORMAT + 1, &[0x33u8; SEAL_BYTES]);
     assert_sim_foreign_format_refused(106, &v3_preamble, FORMAT + 1);
 
     let (config, trunk) = sim_db_config();
@@ -1167,246 +1623,322 @@ mod sim_tests {
     foreign_rows
       .put(&[super::super::SEAL_ROW], &[0xAAu8; SEAL_BYTES])
       .unwrap();
+    let sealed_file = sim_file(108);
+    sealed_file
+      .write_all_at(&encode_seal_preamble(&[0xBBu8; SEAL_BYTES]), 0)
+      .unwrap();
+    sealed_file.sync_data().unwrap();
     let mismatch = prepare_sealed_log(
-      sim_file(108),
+      sealed_file,
       [0xBBu8; SEAL_BYTES],
       (foreign_rows, 0, config.page_size),
     );
     assert!(matches!(
       mismatch,
-      Err(StoreError::Log(LogError::Corrupt(_)))
+      Err(StoreError::Log(LogError::Corrupt("a store seal mismatch")))
     ));
+    assert_sim_truncated_logs_refused_without_mutation();
   }
 
   /// Reads one verified piece and returns both its result and the exact `SimFile` read call delta.
   fn sim_read_counted(
     log: &ChangesetLog<SimFile>,
-    digests: &mut PieceDigests,
+    rows: &mut ShardDb<SimFile>,
+    metrics: &mut PieceMetrics,
     id: &[u8; blake3::OUT_LEN],
     place: (u64, u64),
     offset: u64,
   ) -> (Result<Vec<u8>, StoreError>, u64) {
     let before = log.file().stats().unwrap().reads;
-    let res = read_verified_piece(log, digests, id, place, offset);
+    let res = read_sim_piece(log, rows, metrics, id, place, offset);
     let delta = log.file().stats().unwrap().reads - before;
     (res, delta)
   }
 
-  /// Asserts a piece read failed closed with [`LogError::Corrupt`].
-  fn assert_corrupt_piece(res: Result<Vec<u8>, StoreError>, label: &str) {
-    assert!(
-      matches!(res, Err(StoreError::Log(LogError::Corrupt(_)))),
-      "{label}: expected Corrupt, got {res:?}"
+  /// Round-4 A5 (`SimFile` oracle): Do: read piece 0 of a 3-piece landed payload cleanly, then
+  /// flip 1 stored bit on disk in block 1, delete a `B` row, corrupt a `B` row, and also read a
+  /// coalesced multi-block span via `read_verified_span_with` before and after a bit-flip.
+  /// Expect: every flipped block, missing `B` row, or tampered `B` row refuses `LogError::Corrupt`
+  /// immediately, and a clean coalesced span spanning blocks 0..=2 reads in ONE `SimFile` read.
+  #[test]
+  fn sim_a5_bitflip_and_missing_block_digest_caught_immediately() {
+    let payload = pattern_bytes(131_089, 23, 5);
+    let id = *blake3::hash(&payload).as_bytes();
+    let mut rows = create_sim_rows(1110);
+    let mut log = ChangesetLog::recover(sim_file(110), 0, |_, _| {}).unwrap();
+    let place = append_and_index(&mut log, &mut rows, 1, &payload);
+    let mut metrics = PieceMetrics::default();
+
+    // Clean coalesced span across all 3 blocks takes exactly 1 disk read call.
+    let reads_before = log.file().stats().unwrap().reads;
+    let span =
+      read_verified_span_with(&log, &mut rows, &mut metrics, &id, place, (100, 130_900)).unwrap();
+    assert_eq!(span, payload[100..131_000]);
+    assert_eq!(log.file().stats().unwrap().reads - reads_before, 1);
+    assert_eq!(metrics.verifications, 1);
+
+    // Missing B row refuses Corrupt("a payload's block digest").
+    rows.delete(&block_key(place.0, 1)).unwrap();
+    let missing = read_sim_piece(
+      &log,
+      &mut rows,
+      &mut metrics,
+      &id,
+      place,
+      to_u64(PIECE_BYTES),
     );
-  }
+    assert!(matches!(
+      missing,
+      Err(StoreError::Log(LogError::Corrupt(
+        "a payload's block digest"
+      )))
+    ));
 
-  /// Caches piece 0, injects a bit-flip at `flip_at`, asserts reading the corrupted block at
-  /// `corrupt_read` refuses `Corrupt`, and asserts reading the intact sibling block at
-  /// `eviction_probe` also refuses `Corrupt` (proving mismatch evicted the cache entry).
-  fn assert_sim_a5_flip_caught_and_evicts(
-    seed: u64,
-    payload: &[u8],
-    flip_at: u64,
-    corrupt_read: u64,
-    eviction_probe: u64,
-  ) {
-    let id = *blake3::hash(payload).as_bytes();
-    let mut log = ChangesetLog::recover(sim_file(seed), 0, |_, _| {}).unwrap();
-    let located = append_sim(&mut log, 1, payload);
-    let section = log.sections(&located).unwrap()[0];
-    let place = (section.offset, section.len);
-    let mut digests = PieceDigests::with_budget(PIECE_BYTES);
-
-    let piece0 = read_verified_piece(&log, &mut digests, &id, place, 0).unwrap();
-    assert_eq!(
-      (piece0.as_slice(), digests.verifications()),
-      (&payload[..PIECE_BYTES], 1)
+    // Restore block 1's B row, then flip 1 bit in block 1 on disk -> refuses Corrupt.
+    let seal = log.seal();
+    let tag1 = keyed_block_tag(
+      &seal,
+      place.0,
+      place.1,
+      1,
+      &payload[PIECE_BYTES..2 * PIECE_BYTES],
     );
-
+    rows.put(&block_key(place.0, 1), &tag1).unwrap();
     log
       .file()
       .inject(Fault::BitFlip {
-        offset: section.offset + flip_at,
+        offset: place.0 + to_u64(PIECE_BYTES) + 17,
         bit: 2,
         stored: true,
       })
       .unwrap();
-    let caught = read_verified_piece(&log, &mut digests, &id, place, corrupt_read);
-    assert_corrupt_piece(caught, "A5 post-cache corrupted block read");
-    let after_evict = read_verified_piece(&log, &mut digests, &id, place, eviction_probe);
-    assert_corrupt_piece(after_evict, "A5 post-eviction sibling probe");
-    assert_eq!(digests.verifications(), 1);
-  }
-
-  /// Round-3 A5 (`SimFile` oracle): Do: read piece 0 of a 3-piece landed payload cleanly, then
-  /// flip 1 stored bit on disk (both inside piece 1 and inside piece 0), read the corrupted piece,
-  /// and then probe the intact sibling piece.
-  /// Expect: reading the corrupted piece refuses `Err(StoreError::Log(LogError::Corrupt(_)))`
-  /// against its per-block digest AND evicts the cached entry so the subsequent sibling read also
-  /// refuses `Corrupt` via full-payload re-verification.
-  #[test]
-  fn sim_a5_bitflip_after_first_piece_is_caught_on_second_piece() {
-    let payload = pattern_bytes(131_089, 23, 5);
-    assert_sim_a5_flip_caught_and_evicts(
-      110,
-      &payload,
-      to_u64(PIECE_BYTES) + 17,
-      to_u64(PIECE_BYTES),
-      0,
-    );
-    assert_sim_a5_flip_caught_and_evicts(111, &payload, 17, 0, to_u64(PIECE_BYTES));
-  }
-
-  /// Proves O(N) disk reads across 4 sequential piece reads (`4 + 1 + 1 + 1 = 7 < 16`).
-  fn assert_sim_four_piece_linear_reads() {
-    let payload = pattern_bytes(4 * PIECE_BYTES, 41, 9);
-    let mut log = ChangesetLog::recover(sim_file(112), 0, |_, _| {}).unwrap();
-    let located = append_sim(&mut log, 1, &payload);
-    let section = log.sections(&located).unwrap()[0];
-    let id = *blake3::hash(&payload).as_bytes();
-    let mut digests = PieceDigests::with_budget(PIECE_BYTES);
-    let (mut per_piece, mut out) = (Vec::new(), Vec::new());
-    for piece_idx in 0..4usize {
-      let offset = to_u64(piece_idx * PIECE_BYTES);
-      let (res, reads) = sim_read_counted(
+    assert_corrupt_piece(
+      read_sim_piece(
         &log,
-        &mut digests,
+        &mut rows,
+        &mut metrics,
         &id,
-        (section.offset, section.len),
-        offset,
-      );
-      per_piece.push(reads);
-      out.extend_from_slice(&res.unwrap());
-    }
-    let total: u64 = per_piece.iter().sum();
-    assert_eq!(out, payload);
-    assert_eq!(
-      (per_piece, total, digests.verifications()),
-      (vec![4, 1, 1, 1], 7, 4)
+        place,
+        to_u64(PIECE_BYTES),
+      ),
+      "A5 flipped block 1 piece read",
     );
-    assert!(total < 16);
+    assert_corrupt_piece(
+      read_verified_span_with(&log, &mut rows, &mut metrics, &id, place, (100, 130_900)),
+      "A5 flipped block 1 coalesced span read",
+    );
+    assert_eq!(metrics.verifications, 1);
   }
 
-  /// Proves an unaligned read spanning blocks 0 and 1 verifies only those 2 blocks when clean,
-  /// refuses `Corrupt` when block 1 is flipped after piece 0 is cached, and evicts the entry.
-  fn assert_sim_unaligned_boundary_read_and_bitflip() {
-    let payload = pattern_bytes(4 * PIECE_BYTES, 53, 13);
-    let mut log = ChangesetLog::recover(sim_file(113), 0, |_, _| {}).unwrap();
-    let located = append_sim(&mut log, 1, &payload);
-    let section = log.sections(&located).unwrap()[0];
-    let place = (section.offset, section.len);
-    let id = *blake3::hash(&payload).as_bytes();
-    let mut digests = PieceDigests::with_budget(PIECE_BYTES);
+  /// Asserts one aligned `SimFile` piece read takes exactly 1 read call and hashes `<= PIECE_BYTES`.
+  fn assert_sim_one_o1_piece(
+    log: &ChangesetLog<SimFile>,
+    rows: &mut ShardDb<SimFile>,
+    metrics: &mut PieceMetrics,
+    (id, place, expected): ([u8; blake3::OUT_LEN], (u64, u64), &[u8]),
+    off: u64,
+  ) {
+    let cap = to_u64(PIECE_BYTES);
+    let hashed_before = metrics.bytes_hashed;
+    let (res, reads) = sim_read_counted(log, rows, metrics, &id, place, off);
+    let hashed_delta = metrics.bytes_hashed - hashed_before;
+    let start = usize::try_from(off).unwrap();
+    let end = (start + PIECE_BYTES).min(expected.len());
+    assert_eq!((res.unwrap().as_slice(), reads), (&expected[start..end], 1));
+    assert!(hashed_delta <= cap);
+  }
 
-    let (piece0, miss_reads) = sim_read_counted(&log, &mut digests, &id, place, 0);
-    assert_eq!(
-      (piece0.unwrap().as_slice(), miss_reads),
-      (&payload[..PIECE_BYTES], 4)
+  /// Proves O(1) reads (1 read per piece) and O(1) bytes hashed (`<= 2 * PIECE_BYTES` per call)
+  /// on oversized and interleaved payloads, plus unaligned boundary reads.
+  fn assert_sim_o1_interleaved_and_unaligned_reads() {
+    let payload_a = pattern_bytes(8 * PIECE_BYTES + 19, 11, 1);
+    let payload_b = pattern_bytes(8 * PIECE_BYTES + 73, 17, 2);
+    let (id_a, id_b) = (
+      *blake3::hash(&payload_a).as_bytes(),
+      *blake3::hash(&payload_b).as_bytes(),
     );
+    let mut rows = create_sim_rows(1114);
+    let mut log = ChangesetLog::recover(sim_file(114), 0, |_, _| {}).unwrap();
+    let place_a = append_and_index(&mut log, &mut rows, 1, &payload_a);
+    let place_b = append_and_index(&mut log, &mut rows, 2, &payload_b);
+    let mut metrics = PieceMetrics::default();
+    let cap = to_u64(PIECE_BYTES);
 
+    for block in 0..9u64 {
+      let off = block * cap;
+      assert_sim_one_o1_piece(
+        &log,
+        &mut rows,
+        &mut metrics,
+        (id_a, place_a, &payload_a),
+        off,
+      );
+      assert_sim_one_o1_piece(
+        &log,
+        &mut rows,
+        &mut metrics,
+        (id_b, place_b, &payload_b),
+        off,
+      );
+    }
+
+    // Unaligned read spanning blocks 0 and 1: 1 disk read, <= 2 * PIECE_BYTES hashed.
     let unaligned = PIECE_BYTES - 16;
-    let (clean, span_reads) = sim_read_counted(&log, &mut digests, &id, place, to_u64(unaligned));
+    let hashed_before = metrics.bytes_hashed;
+    let (span, reads) = sim_read_counted(
+      &log,
+      &mut rows,
+      &mut metrics,
+      &id_a,
+      place_a,
+      to_u64(unaligned),
+    );
     assert_eq!(
       (
-        clean.unwrap().as_slice(),
-        span_reads,
-        digests.verifications()
+        span.unwrap().as_slice(),
+        reads,
+        metrics.bytes_hashed - hashed_before
       ),
-      (&payload[unaligned..unaligned + PIECE_BYTES], 2, 2)
+      (&payload_a[unaligned..unaligned + PIECE_BYTES], 1, 2 * cap)
     );
+  }
 
-    log
-      .file()
+  /// Proves `payloads::forget` deletes `B` rows of the forgotten multi-piece occurrence while
+  /// keeping a duplicate occurrence's `B` rows intact so reads continue verifying after promotion.
+  fn assert_sim_forget_cleans_block_digests_and_keeps_duplicate() {
+    let dup = pattern_bytes(3 * PIECE_BYTES + 17, 41, 9);
+    let id = *blake3::hash(&dup).as_bytes();
+    let mut rows = create_sim_rows(1115);
+    let mut log = ChangesetLog::recover(sim_file(115), 0, |_, _| {}).unwrap();
+    let first = append_and_index(&mut log, &mut rows, 1, &dup);
+    let second = append_and_index(&mut log, &mut rows, 2, &dup);
+
+    let mut scratch = Vec::new();
+    assert!(rows.get(&block_key(first.0, 0), &mut scratch).unwrap());
+    assert!(rows.get(&block_key(second.0, 0), &mut scratch).unwrap());
+    payloads::forget(&mut rows, &id, first.0, &mut scratch).unwrap();
+
+    for blk in 0..4u64 {
+      assert!(
+        !rows.get(&block_key(first.0, blk), &mut scratch).unwrap(),
+        "forgotten occurrence block {blk} must be deleted"
+      );
+      assert!(
+        rows.get(&block_key(second.0, blk), &mut scratch).unwrap(),
+        "surviving duplicate block {blk} must stay intact"
+      );
+    }
+    let mut metrics = PieceMetrics::default();
+    let (got, _) = read_sim_all_pieces(&log, &mut rows, &mut metrics, &dup, second, 0).unwrap();
+    assert_eq!(got, dup);
+  }
+
+  /// Proves `validate_sizing_bounds` rejects `memory: 0` / `extent_bytes: 0` and
+  /// `ChangesetLog::recover_sealed(..., None, ...)` resyncs records carrying another directory's
+  /// grant id after a mid-file header bit-flip.
+  fn assert_sim_sizing_validation_and_grantless_resync() {
+    let valid = Sizing {
+      memory: 8 << 20,
+      disk: 1 << 30,
+      extent_bytes: 128 << 10,
+      fanout: 8,
+    };
+    assert!(validate_sizing_bounds(valid).is_ok());
+    assert!(matches!(
+      validate_sizing_bounds(Sizing { memory: 0, ..valid }),
+      Err(StoreError::Sizing(_))
+    ));
+    assert!(matches!(
+      validate_sizing_bounds(Sizing {
+        extent_bytes: 0,
+        ..valid
+      }),
+      Err(StoreError::Sizing(_))
+    ));
+
+    let seal = [0x77u8; SEAL_BYTES];
+    let sim = sim_file(116);
+    sim.write_all_at(&encode_seal_preamble(&seal), 0).unwrap();
+    sim.sync_data().unwrap();
+    let start = to_u64(SEAL_PREAMBLE_BYTES);
+    let mut log = ChangesetLog::recover_sealed(sim, start, seal, None, |_, _| {}).unwrap();
+    let r1 = append_sim_with_grant(&mut log, 1, 999, b"old dir record 1");
+    let r2 = append_sim_with_grant(&mut log, 2, 999, b"old dir record 2");
+    let r3 = append_sim_with_grant(&mut log, 3, 999, b"old dir record 3");
+    let sim = log.into_file();
+    sim
       .inject(Fault::BitFlip {
-        offset: section.offset + to_u64(PIECE_BYTES) + 24,
-        bit: 5,
+        offset: r1.offset + 12,
+        bit: 1,
         stored: true,
       })
       .unwrap();
-    let (corrupt, _) = sim_read_counted(&log, &mut digests, &id, place, to_u64(unaligned));
-    assert_corrupt_piece(corrupt, "unaligned read spanning flipped block 1");
-    let (evicted, _) = sim_read_counted(&log, &mut digests, &id, place, 0);
-    assert_corrupt_piece(evicted, "block 0 read after unaligned mismatch eviction");
-    assert_eq!(digests.verifications(), 2);
+    let mut found = Vec::new();
+    let recovered =
+      ChangesetLog::recover_sealed(sim, start, seal, None, |_, entry| found.push(*entry)).unwrap();
+    assert_eq!((found, recovered.end()), (vec![r2, r3], r3.end()));
   }
 
-  /// Appends one payload changeset to `log` and returns its `(offset, len)` section range.
-  fn append_sim_place(log: &mut ChangesetLog<SimFile>, seq: u64, bytes: &[u8]) -> (u64, u64) {
-    let located = append_sim(log, seq, bytes);
+  /// Proves `payloads::index_checkpoint` rebuilds multi-piece `B` rows when a checkpoint carries
+  /// `[CONTENTS]` without `[BLOCK_DIGESTS]` so subsequent `read_verified_span_with` calls succeed.
+  fn assert_sim_index_checkpoint_rebuilds_missing_block_digests() {
+    let mut rows = create_sim_rows(1117);
+    let mut log = ChangesetLog::recover(sim_file(117), 0, |_, _| {}).unwrap();
+    let seal = log.seal();
+    let multi = pattern_bytes(3 * PIECE_BYTES + 11, 19, 4);
+    let located = append_sim(&mut log, 1, &multi);
     let sec = log.sections(&located).unwrap()[0];
-    (sec.offset, sec.len)
+    let mut value = Vec::new();
+    let mut skipped = 0u64;
+    put_changeset_counted(
+      &mut rows,
+      log.file(),
+      &seal,
+      &located,
+      &mut value,
+      &mut skipped,
+    )
+    .unwrap();
+    // Simulate an older checkpoint that had the `[CONTENTS]` marker but no `B` rows / `[BLOCK_DIGESTS]`.
+    rows.put(&[super::super::CONTENTS], &[]).unwrap();
+    rows.checkpoint(log.end()).unwrap();
+    assert!(!rows.get(&block_key(sec.offset, 0), &mut value).unwrap());
+
+    let ckpt_skipped = payloads::index_checkpoint(
+      &mut rows,
+      log.file(),
+      (log.end(), &seal),
+      CHANGESET_ENTRY_BYTES,
+    )
+    .unwrap();
+    assert_eq!(ckpt_skipped, 0);
+    let mut metrics = PieceMetrics::default();
+    let (got, _) = read_sim_all_pieces(
+      &log,
+      &mut rows,
+      &mut metrics,
+      &multi,
+      (sec.offset, sec.len),
+      0,
+    )
+    .unwrap();
+    assert_eq!((got, metrics.verifications), (multi, 4));
   }
 
-  /// Proves FIFO eviction under a 1-entry budget re-verifies cleanly on re-read without unbounded
-  /// growth, and an oversized entry falls back cleanly without evicting resident entries.
-  fn assert_sim_digest_budget_eviction_and_oversized_fallback() {
-    let a = pattern_bytes(4 * PIECE_BYTES, 11, 1);
-    let b = pattern_bytes(4 * PIECE_BYTES, 17, 2);
-    let c = pattern_bytes(5 * PIECE_BYTES, 23, 3);
-    let mut log = ChangesetLog::recover(sim_file(114), 0, |_, _| {}).unwrap();
-    let place_a = append_sim_place(&mut log, 1, &a);
-    let place_b = append_sim_place(&mut log, 2, &b);
-    let place_c = append_sim_place(&mut log, 3, &c);
-    let (id_a, id_b, id_c) = (
-      *blake3::hash(&a).as_bytes(),
-      *blake3::hash(&b).as_bytes(),
-      *blake3::hash(&c).as_bytes(),
-    );
-    let mut digests = PieceDigests::with_budget(4 * blake3::OUT_LEN);
-    let p1 = to_u64(PIECE_BYTES);
-
-    let (_, a_miss) = sim_read_counted(&log, &mut digests, &id_a, place_a, 0);
-    let (_, a_hit) = sim_read_counted(&log, &mut digests, &id_a, place_a, p1);
-    let (_, b_miss) = sim_read_counted(&log, &mut digests, &id_b, place_b, 0);
-    let (_, b_hit) = sim_read_counted(&log, &mut digests, &id_b, place_b, p1);
-    assert_eq!((a_miss, a_hit, b_miss, b_hit), (4, 1, 4, 1));
-
-    // A was evicted when B filled the 1-entry budget; re-reading A misses (4 reads) and re-verifies.
-    let (a_re, a_re_reads) = sim_read_counted(&log, &mut digests, &id_a, place_a, p1);
-    assert_eq!(
-      (a_re.unwrap().as_slice(), a_re_reads),
-      (&a[PIECE_BYTES..2 * PIECE_BYTES], 4)
-    );
-
-    // Oversized 5-piece C exceeds budget: both reads fall back to full stream without evicting A.
-    let (c0, c0_reads) = sim_read_counted(&log, &mut digests, &id_c, place_c, 0);
-    let (c1, c1_reads) = sim_read_counted(&log, &mut digests, &id_c, place_c, p1);
-    let (_, a_still_hit) = sim_read_counted(&log, &mut digests, &id_a, place_a, 2 * p1);
-    assert_eq!(
-      (c0.unwrap().len(), c1.unwrap().len()),
-      (PIECE_BYTES, PIECE_BYTES)
-    );
-    assert_eq!((c0_reads, c1_reads, a_still_hit), (5, 5, 1));
-  }
-
-  /// Proves `PieceDigests::from_sizing` handles `fanout = 0` and floors tiny memory at `PIECE_BYTES`.
-  fn assert_sim_sizing_floor_caches_without_division_by_zero() {
-    let payload = pattern_bytes(4 * PIECE_BYTES, 29, 7);
-    let mut log = ChangesetLog::recover(sim_file(115), 0, |_, _| {}).unwrap();
-    let place = append_sim_place(&mut log, 1, &payload);
-    let id = *blake3::hash(&payload).as_bytes();
-    let mut digests = PieceDigests::from_sizing(Sizing {
-      memory: 1,
-      disk: 1 << 20,
-      extent_bytes: 128 << 10,
-      fanout: 0,
-    });
-    let (_, miss) = sim_read_counted(&log, &mut digests, &id, place, 0);
-    let (_, hit) = sim_read_counted(&log, &mut digests, &id, place, to_u64(PIECE_BYTES));
-    assert_eq!((miss, hit), (4, 1));
-  }
-
-  /// Round-3 A5 (`PieceDigests` oracle): Do: (1) stream a 4-piece payload piece by piece,
-  /// (2) perform an unaligned read spanning blocks 0 and 1 before and after flipping block 1,
-  /// (3) exercise FIFO eviction and oversized fallback under a 1-entry budget, and (4) verify
-  /// `PieceDigests::from_sizing` floors safely when `fanout == 0`.
-  /// Expect: O(N) reads (`7 < 16`), clean unaligned hits (`2` reads), immediate `Corrupt` +
-  /// eviction on post-cache block-1 bit-flip, bounded FIFO eviction without growth, and safe sizing.
+  /// Round-4 (`B`-row O(1) work, `forget` cleanup, `validate_sizing_bounds`, `index_checkpoint`
+  /// `B`-row rebuild, and `expected_grant: None` resync `SimFile` oracle): Do: (1) interleave
+  /// aligned and unaligned reads across two 512 KiB payloads, (2) forget one of two duplicate
+  /// multi-piece occurrences and verify `B`-row cleanup and survivor reads, (3) validate sizing
+  /// bounds and resync after directory copy, and (4) rebuild missing `B` rows via
+  /// `payloads::index_checkpoint`.
+  /// Expect: 1 disk read and `<= 2 * PIECE_BYTES` hashed per call (zero cache cliff), clean `B`-row
+  /// deletion without disturbing duplicates, sizing rejection before file creation, full trailing
+  /// recovery with `expected_grant: None`, and automatic `B`-row backfill on older checkpoints.
   #[test]
-  fn sim_piece_digests_linear_reads_unaligned_flip_and_bounded_eviction() {
-    assert_sim_four_piece_linear_reads();
-    assert_sim_unaligned_boundary_read_and_bitflip();
-    assert_sim_digest_budget_eviction_and_oversized_fallback();
-    assert_sim_sizing_floor_caches_without_division_by_zero();
+  fn sim_b_rows_o1_work_oversized_interleaved_and_forget_cleanup() {
+    assert_sim_o1_interleaved_and_unaligned_reads();
+    assert_sim_forget_cleans_block_digests_and_keeps_duplicate();
+    assert_sim_sizing_validation_and_grantless_resync();
+    assert_sim_index_checkpoint_rebuilds_missing_block_digests();
   }
 }

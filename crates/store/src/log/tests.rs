@@ -585,7 +585,8 @@ fn torn_record_carrying_valid_forged_record_never_indexes_it() {
     "truncated-mid-payload variant must ignore forged payload",
   );
 
-  // Variant C: uncommitted Appending dropped mid-payload (section 1 head left zeroed).
+  // Variant C: uncommitted Appending dropped mid-payload (section 1 retains its authenticated
+  // open-section head, SECTION_OPEN_FLAG = 0x80).
   let (mut log, _) = recovered(file(85));
   let r1 = append_for(&mut log, Tool::Git, 101, 1, b"legit git push one");
   {
@@ -616,15 +617,18 @@ fn chained_headers_payload(sections: u16, count: usize) -> Vec<u8> {
 }
 
 /// Blocker 2: Do: fill a record's payload with `K` chained valid `[header][section_head]` pairs
-/// (declaring 4096 sections each) under both (a) a torn trailer at EOF and (b) a mid-file
-/// corrupted header, and count `BlockFile::read_exact_at` calls during recovery.
-/// Expect: (a) does O(1) reads without scanning the payload, and (b) stays strictly within the
-/// linear section-head read budget rather than blowing up quadratically (~K^2/2 reads).
+/// (declaring 4096 sections each) under both (a) a closed-section torn trailer at EOF and (b) a
+/// mid-file corrupted header, and count `BlockFile::read_exact_at` calls during recovery.
+/// Expect: both (a) and (b) stay strictly within their linear scan bounds (rejecting embedded
+/// chained headers in memory by `(offset, seal)` CRC without quadratic blowup; O(1) non-scanning
+/// applies to authenticated open-section tails tested separately in
+/// `ordinary_interrupted_uncommitted_tail_reads_constant_calls_across_tail_sizes`).
 #[test]
 fn resync_over_chained_valid_headers_does_linear_work() {
   let chained_payload = chained_headers_payload(4_096, 400);
 
-  // Case A: torn trailer at EOF carrying chained valid headers -> stops at r1 with O(1) reads.
+  // Case A: closed-section torn trailer at EOF carrying chained valid headers -> scans linearly
+  // in `VERIFY_PIECE` chunks while rejecting embedded headers in memory, stopping at r1.
   let (mut log, _) = recovered(file(86));
   let r1 = append_for(&mut log, Tool::Git, 101, 1, b"legit");
   let torn = append_for(&mut log, Tool::Git, 101, 2, &chained_payload);
@@ -633,13 +637,15 @@ fn resync_over_chained_valid_headers_does_linear_work() {
     .write_all_at(&[0u8; TRAILER_BYTES], torn.end() - TRAILER_BYTES as u64)
     .unwrap();
   sim.sync_data().unwrap();
+  let total_len_a = sim.len().unwrap();
   let mut found = Vec::new();
   let log =
     ChangesetLog::recover(CountingFile::new(sim), 0, |_, located| found.push(*located)).unwrap();
+  let linear_chunks_a = total_len_a.div_ceil(VERIFY_PIECE as u64) + 16;
   assert_eq!((found, log.end()), (vec![r1], r1.end()));
   assert!(
-    log.file().reads() <= 32,
-    "torn trailer must not scan payload; got {} reads",
+    log.file().reads() <= linear_chunks_a,
+    "closed-section torn trailer must stay within linear chunk scan bound (<= {linear_chunks_a} reads); got {} reads",
     log.file().reads()
   );
 
@@ -1440,26 +1446,19 @@ fn zeroed_section_head_mid_file_recovers_trailing_siblings_and_preserves_them_on
   }
 }
 
-/// Verifies every single-bit flip across all 48 bytes of `encoded` is rejected as either
-/// `UnsupportedFormat` (inside the format field) or `Damaged` (every other byte).
+/// Verifies every single-bit flip across all 48 bytes of `encoded` (including `P_FORMAT`)
+/// classifies as `SealPreamble::Damaged` so media bit-flips can recover from `rows`'s backup seal.
 fn assert_preamble_bitflips_rejected(encoded: [u8; SEAL_PREAMBLE_BYTES]) {
   for byte_idx in 0..SEAL_PREAMBLE_BYTES {
     for bit in 0..8u8 {
       let mut flipped = encoded;
       flipped[byte_idx] ^= 1u8 << bit;
       let decoded = decode_seal_preamble(&flipped);
-      if (P_FORMAT..P_RESERVED).contains(&byte_idx) {
-        assert!(
-          matches!(decoded, SealPreamble::UnsupportedFormat(found) if found != FORMAT),
-          "flip in format byte {byte_idx} bit {bit} got {decoded:?}"
-        );
-      } else {
-        assert_eq!(
-          decoded,
-          SealPreamble::Damaged,
-          "flip at preamble+{byte_idx} bit {bit}"
-        );
-      }
+      assert_eq!(
+        decoded,
+        SealPreamble::Damaged,
+        "flip at preamble+{byte_idx} bit {bit}"
+      );
     }
   }
 }
@@ -1493,14 +1492,14 @@ fn assert_recover_from_zero_steps_past_preamble(
   );
 }
 
-/// Round-3 Blocker 2: Do: round-trip `encode_seal_preamble` / `decode_seal_preamble`, flip every
-/// single bit across all 48 bytes, feed all-zeroes, legacy `FORMAT = 1` `SLCS`, future
-/// `FORMAT = 3` `SLSE`, and truncated `SLSE`, and recover a `ChangesetLog` starting at offset 0
-/// over an `SLSE`-prefixed file.
-/// Expect: valid `FORMAT = 2` preambles decode identically; `SLCS` v1 yields
-/// `UnsupportedFormat(1)`; `SLSE` v3 yields `UnsupportedFormat(3)`; all-zeroes, truncated, and
-/// bit-flipped non-format bytes yield `Damaged`; and `recover_sealed` from 0 steps past a matching
-/// `SLSE` preamble cleanly with `skipped() == 0`.
+/// Round-3 Blocker 2 / Round-4 B2: Do: round-trip `encode_seal_preamble` / `decode_seal_preamble`,
+/// flip every single bit across all 48 bytes, feed all-zeroes, legacy `FORMAT = 1` `SLCS`, valid-CRC
+/// future `FORMAT + 1` `SLSE`, and truncated `SLSE`, and recover a `ChangesetLog` starting at
+/// offset 0 over an `SLSE`-prefixed file.
+/// Expect: valid `FORMAT = 2` preambles decode identically; `SLCS` v1 yields `UnsupportedFormat(1)`;
+/// checksummed `SLSE` `FORMAT + 1` yields `UnsupportedFormat(FORMAT + 1)`; all-zeroes, truncated,
+/// and EVERY single-bit flip across all 48 bytes (including `P_FORMAT`) yield `Damaged`; and
+/// `recover_sealed` from 0 steps past a matching `SLSE` preamble cleanly with `skipped() == 0`.
 #[test]
 fn seal_preamble_round_trips_and_refuses_foreign_formats_and_damage() {
   let seal = [0x6Bu8; SEAL_BYTES];
@@ -1525,7 +1524,10 @@ fn seal_preamble_round_trips_and_refuses_foreign_formats_and_damage() {
   legacy_slcs[..4].copy_from_slice(b"SLCS");
   legacy_slcs[4..6].copy_from_slice(&1u16.to_le_bytes());
   let mut future_slse = encoded;
-  future_slse[4..6].copy_from_slice(&3u16.to_le_bytes());
+  future_slse[P_FORMAT..P_RESERVED].copy_from_slice(&(FORMAT + 1).to_le_bytes());
+  let future_crc = mantle_crc::crc32c(&future_slse[..SEAL_PREAMBLE_COVERED]);
+  future_slse[SEAL_PREAMBLE_COVERED..P_CRC_COMPLEMENT].copy_from_slice(&future_crc.to_le_bytes());
+  future_slse[P_CRC_COMPLEMENT..SEAL_PREAMBLE_BYTES].copy_from_slice(&(!future_crc).to_le_bytes());
   assert_eq!(
     (
       decode_seal_preamble(&legacy_slcs),
@@ -1533,8 +1535,64 @@ fn seal_preamble_round_trips_and_refuses_foreign_formats_and_damage() {
     ),
     (
       SealPreamble::UnsupportedFormat(1),
-      SealPreamble::UnsupportedFormat(3),
+      SealPreamble::UnsupportedFormat(FORMAT + 1),
     )
   );
   assert_recover_from_zero_steps_past_preamble(seal, &encoded);
+}
+
+/// Round-4 Truncation Check: Do: call `ChangesetLog::recover_sealed` with `from > file.len()`
+/// (both a 20-byte file with `from = 48` and a 48-byte file with `from = 256`).
+/// Expect: `Err(LogError::Corrupt(_))` without mutating the file.
+#[test]
+fn recover_sealed_refuses_recovery_offset_past_log_end() {
+  let seal = [0x5Au8; SEAL_BYTES];
+  let preamble = encode_seal_preamble(&seal);
+
+  let short = file(109);
+  short.write_all_at(&preamble[..20], 0).unwrap();
+  short.sync_data().unwrap();
+  let err_short = ChangesetLog::recover_sealed(
+    short,
+    u64::try_from(SEAL_PREAMBLE_BYTES).unwrap(),
+    seal,
+    None,
+    |_, _| {},
+  );
+  assert!(
+    matches!(err_short, Err(LogError::Corrupt(_))),
+    "from=48 on 20-byte log must refuse Corrupt, got {err_short:?}"
+  );
+
+  let only_preamble = file(110);
+  only_preamble.write_all_at(&preamble, 0).unwrap();
+  only_preamble.sync_data().unwrap();
+  let err_applied = ChangesetLog::recover_sealed(only_preamble, 256, seal, None, |_, _| {});
+  assert!(
+    matches!(err_applied, Err(LogError::Corrupt(_))),
+    "from=256 on 48-byte log must refuse Corrupt, got {err_applied:?}"
+  );
+}
+
+/// Round-4 `close_section` Ordering: Do: open a 1-section record declaring 16 bytes, write only 4
+/// bytes, trigger `close_section` via a failing `open_section` call, and then call `commit_open`.
+/// Expect: both `open_section` and the subsequent `commit_open` refuse `LogError::OutOfOrder`
+/// instead of committing a record with an unclosed `0x80` section head, leaving `log.end()` at 0.
+#[test]
+fn close_section_refuses_commit_after_incomplete_section_error() {
+  let (mut log, _) = recovered(file(111));
+  log.open_record(header(1, 1)).unwrap();
+  log.open_section(SectionKind::Payload, 16).unwrap();
+  log.open_piece(b"part").unwrap();
+  let next_err = log.open_section(SectionKind::Record, 4);
+  assert!(
+    matches!(next_err, Err(LogError::OutOfOrder(_))),
+    "opening a second section before finishing the first must refuse, got {next_err:?}"
+  );
+  let commit_err = log.commit_open();
+  assert!(
+    matches!(commit_err, Err(LogError::OutOfOrder(_))),
+    "commit after failed close_section must refuse instead of committing unclosed 0x80 head, got {commit_err:?}"
+  );
+  assert_eq!(log.end(), 0);
 }

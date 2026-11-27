@@ -12,22 +12,24 @@
 //! **Recovery.** [`LOG_FILE`] opens with a [`SEAL_PREAMBLE_BYTES`]-byte `SLSE` preamble naming its format version and
 //! 32-byte random secret seal, mirrored as a backup `S` row in [`ROWS_FILE`]. Opening the store inspects [`LOG_FILE`]
 //! before touching [`ROWS_FILE`], refusing unsupported formats without mutating any file; when [`ROWS_FILE`] is
-//! absent, the engine is recreated and rebuilt byte-identically from [`LOG_FILE`]'s self-contained preamble and
-//! records. Otherwise the engine opens at its checkpoint offset and replays [`LOG_FILE`] from there, so the rows never
-//! name a changeset the log lacks and lack none it holds.
+//! absent, the engine is recreated and rebuilt with every committed record intact and the log byte-identical from
+//! [`LOG_FILE`]'s self-contained preamble and records. Otherwise the engine opens at its checkpoint offset and replays
+//! [`LOG_FILE`] from there, so the rows never name a changeset the log lacks and lack none it holds.
 //!
 //! **Rows** (item 3), keyed so a repository's rows are one contiguous range: `C`, then the repository and the
 //! changeset's sequence (big-endian, a `u128` and a `u64`, so the order of the bytes is the order of the numbers), whose value
-//! is the record's offset and length in the log, its identity, its tool byte and its work; and `P`, then a payload
+//! is the record's offset and length in the log, its identity, its tool byte and its work; `P`, then a payload
 //! section's identity (BLAKE3 of its bytes), whose value is where those bytes are in the log and their length, so a
-//! landed content is read by identity as a staged one is ([`Store::piece`]). Further copies have the log offset
-//! appended to that key so forgetting any copy preserves reads from the others (A-767 C3). The other tables of item 3
-//! (names, versions, object places, derived values) are each tool's, derived from its sections the same way (C4 to C6).
+//! landed content is read by identity as a staged one is ([`Store::piece`]); and `B`, then a multi-piece (`> PIECE_BYTES`)
+//! payload section's log offset and block index (each big-endian `u64`), whose value is its 32-byte keyed BLAKE3 MAC
+//! bound to `(seal, section_offset, section_len, block_idx)`, giving O(1)-time and O(1)-RAM per-block authentication on
+//! every disk read. Further copies have the log offset appended to the `P` key so forgetting any copy preserves reads
+//! from the others (A-767 C3). The other tables of item 3 (names, versions, object places, derived values) are each
+//! tool's, derived from its sections the same way (C4 to C6).
 
 mod payloads;
 
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
@@ -55,6 +57,8 @@ pub const ROWS_FILE: &str = "rows";
 const CHANGESETS: u8 = b'C';
 /// Format: the content table's tag: a payload section's identity to its place in the log.
 const CONTENTS: u8 = b'P';
+/// Format: the block-digest table's tag: per-[`PIECE_BYTES`] keyed BLAKE3 MACs for multi-piece payloads.
+const BLOCK_DIGESTS: u8 = b'B';
 /// Format: the tag of a standing grant's row (A-767's `G`: the grant the store's directory was opened under, R10).
 const GRANTS: u8 = b'G';
 /// Format: the tag of the store's per-store changeset log seal row (`S`), holding the 32-byte
@@ -66,6 +70,8 @@ const GRANT_KEY_BYTES: usize = AFTER_TAG + U64;
 const GRANT_VALUE_BYTES: usize = U64 + U64 + U64;
 /// Format: the BLAKE3 key-derivation context of a standing grant's id, from its directory's device and inode.
 const GRANT_ID_CONTEXT: &str = "slates 2026-11-20 store standing grant id";
+/// Format: domain separator mixed into per-block keyed BLAKE3 MAC rows (`B` rows).
+const BLOCK_MAC_DOMAIN: &[u8] = b"slates-store-block-v2\0";
 /// Format: a `u64` field's width.
 const U64: usize = size_of::<u64>();
 /// Format: a repository id's width (`u128`, A-515).
@@ -74,6 +80,10 @@ const U128: usize = size_of::<u128>();
 const IDENTITY: usize = blake3::OUT_LEN;
 /// Format: a row key's first field, after its one-byte tag.
 const AFTER_TAG: usize = 1;
+/// Format: a block-digest row key's block index, after the tag and section log offset.
+const BK_INDEX: usize = AFTER_TAG + U64;
+/// Format: a block-digest row's key: the tag, the section's log offset, and the block index.
+const BLOCK_KEY_BYTES: usize = BK_INDEX + U64;
 /// Format: a content row's key: the tag and the identity.
 const CONTENT_KEY_BYTES: usize = AFTER_TAG + IDENTITY;
 /// Format: a content row's value: the bytes' offset in the log, then their length.
@@ -215,109 +225,13 @@ pub struct Changeset {
   pub work: u64,
 }
 
-/// One 32-byte BLAKE3 digest of a single [`PIECE_BYTES`] payload block.
-type BlockDigest = [u8; blake3::OUT_LEN];
-/// Owned per-[`PIECE_BYTES`] block-digest slice for one authenticated landed payload.
-type BlockDigests = Box<[BlockDigest]>;
-
-/// Authenticated payload range key: its log offset, exact byte length, and expected BLAKE3 identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct VerifiedKey {
-  at: u64,
-  len: u64,
-  identity: Identity,
-}
-
-/// Bounded FIFO cache of authenticated per-[`PIECE_BYTES`] BLAKE3 block digests for multi-piece
-/// landed payloads.
-///
-/// An entry is inserted only after a full-payload streaming BLAKE3 pass verifies `identity`.
-/// Cached reads still hash every disk block they touch against these digests and evict on mismatch,
-/// giving O(N) sequential streaming while preserving per-piece integrity against mid-session disk
-/// bit-flips (A5).
-#[derive(Debug)]
-struct PieceDigests {
-  budget_bytes: usize,
-  used_bytes: usize,
-  entries: HashMap<VerifiedKey, BlockDigests>,
-  order: VecDeque<VerifiedKey>,
-  payload_verifications: u64,
-}
-
-impl PieceDigests {
-  /// Derived: cache budget from `sizing.memory / sizing.fanout` floored at one [`PIECE_BYTES`]
-  /// read unit, matching [`Sizing`]'s lent memory and engine trunk fanout inputs.
-  fn from_sizing(sizing: Sizing) -> Self {
-    let budget_bytes = sizing
-      .memory
-      .checked_div(sizing.fanout.max(1))
-      .unwrap_or(PIECE_BYTES)
-      .max(PIECE_BYTES);
-    Self::with_budget(budget_bytes)
-  }
-
-  fn with_budget(budget_bytes: usize) -> Self {
-    Self {
-      budget_bytes,
-      used_bytes: 0,
-      entries: HashMap::new(),
-      order: VecDeque::new(),
-      payload_verifications: 0,
-    }
-  }
-
-  fn budget_bytes(&self) -> usize {
-    self.budget_bytes
-  }
-
-  fn get(&self, key: &VerifiedKey) -> Option<&[BlockDigest]> {
-    self.entries.get(key).map(Box::as_ref)
-  }
-
-  fn insert(&mut self, key: VerifiedKey, digests: BlockDigests) {
-    if self.entries.contains_key(&key) {
-      return;
-    }
-    let Some(entry_bytes) = digests.len().checked_mul(blake3::OUT_LEN) else {
-      return;
-    };
-    if entry_bytes > self.budget_bytes {
-      return;
-    }
-    let limit = self.budget_bytes.saturating_sub(entry_bytes);
-    self.evict_until(limit);
-    self.used_bytes = self.used_bytes.saturating_add(entry_bytes);
-    self.order.push_back(key);
-    self.entries.insert(key, digests);
-  }
-
-  fn evict_until(&mut self, max_used_bytes: usize) {
-    while self.used_bytes > max_used_bytes {
-      let Some(oldest) = self.order.pop_front() else {
-        break;
-      };
-      if let Some(evicted) = self.entries.remove(&oldest) {
-        let evicted_bytes = evicted.len().saturating_mul(blake3::OUT_LEN);
-        self.used_bytes = self.used_bytes.saturating_sub(evicted_bytes);
-      }
-    }
-  }
-
-  fn remove(&mut self, key: &VerifiedKey) {
-    if let Some(digests) = self.entries.remove(key) {
-      let removed_bytes = digests.len().saturating_mul(blake3::OUT_LEN);
-      self.used_bytes = self.used_bytes.saturating_sub(removed_bytes);
-      self.order.retain(|queued| queued != key);
-    }
-  }
-
-  fn record_verification(&mut self) {
-    self.payload_verifications = self.payload_verifications.saturating_add(1);
-  }
-
-  fn verifications(&self) -> u64 {
-    self.payload_verifications
-  }
+/// Non-vacuity and O(1)-work counters updated by verified disk payload reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PieceMetrics {
+  /// Verified disk payload reads completed (single-piece or multi-piece).
+  verifications: u64,
+  /// Total payload bytes fed to BLAKE3 during verified disk reads.
+  bytes_hashed: u64,
 }
 
 /// The store, open.
@@ -330,8 +244,8 @@ pub struct Store {
   value: Vec<u8>,
   /// The standing grant its directory is written under, as first recorded.
   grant: GrantRow,
-  /// Bounded per-[`PIECE_BYTES`] BLAKE3 block-digest cache for landed payloads (A5).
-  piece_digests: PieceDigests,
+  /// Non-vacuity and bytes-hashed counters for verified disk payload reads (A5).
+  piece_metrics: PieceMetrics,
   /// Corrupt changeset rows encountered and skipped during checkpoint indexing or row replacement.
   corrupt_rows_skipped: u64,
   /// The log reads that answered places ([`Store::places_bytes`]): the counter its coalescing is held to.
@@ -372,35 +286,28 @@ impl Store {
     } = open_store_files(&root, sizing)?;
     let mut corrupt_rows_skipped =
       payloads::index_checkpoint(&mut rows, &log_file, (applied, &seal), page_size)?;
-    let expected_grant = grant_id(root.grant().target.device, root.grant().target.inode);
     let mut replayed = Ok(());
     let mut value = Vec::new();
     let mut buffer = Vec::new();
-    let log = ChangesetLog::recover_sealed(
-      log_file,
-      replay_from,
-      seal,
-      Some(expected_grant),
-      |file, located| {
-        if replayed.is_ok() {
-          replayed = put_rows_from_log(
-            &mut rows,
-            file,
-            &seal,
-            located,
-            (&mut value, &mut buffer),
-            &mut corrupt_rows_skipped,
-          );
-        }
-      },
-    )?;
+    let log = ChangesetLog::recover_sealed(log_file, replay_from, seal, None, |file, located| {
+      if replayed.is_ok() {
+        replayed = put_rows_from_log(
+          &mut rows,
+          file,
+          &seal,
+          located,
+          (&mut value, &mut buffer),
+          &mut corrupt_rows_skipped,
+        );
+      }
+    })?;
     replayed?;
     let mut store = Self {
       root,
       log,
       rows,
       value,
-      piece_digests: PieceDigests::from_sizing(sizing),
+      piece_metrics: PieceMetrics::default(),
       corrupt_rows_skipped,
       place_reads: 0,
       tool_reads: 0,
@@ -430,9 +337,20 @@ impl Store {
     &self.grant
   }
 
-  /// Verified disk piece reads completed by [`Store::piece`] so far (non-vacuity counter).
+  /// Verified disk payload reads completed by [`Store::piece`] / [`Store::places_bytes`] /
+  /// [`Store::text_at`] so far (non-vacuity counter).
   pub fn payload_verifications(&self) -> u64 {
-    self.piece_digests.verifications()
+    self.piece_metrics.verifications
+  }
+
+  /// Verified disk payload reads completed so far (non-vacuity counter).
+  pub fn piece_verifications(&self) -> u64 {
+    self.piece_metrics.verifications
+  }
+
+  /// Total payload bytes hashed through BLAKE3 during verified disk reads (O(1)-per-piece work counter).
+  pub fn piece_bytes_hashed(&self) -> u64 {
+    self.piece_metrics.bytes_hashed
   }
 
   /// Corrupt changeset rows logged and skipped during checkpoint indexing or changeset replacement.
@@ -560,7 +478,8 @@ impl Store {
 
   /// Lands a changeset whose sections are `sections`, each bytes the caller holds or a content staged in `staging`
   /// (written from the staged bytes, never copied first): appended, committed (one flush), then its rows applied, a
-  /// `P` row for each payload section, named by its identity. The header's section count is the list's.
+  /// `P` row (and per-block keyed MAC `B` rows when `> PIECE_BYTES`) for each payload section. The header's section
+  /// count is the list's.
   pub fn land(
     &mut self,
     mut header: Header,
@@ -573,10 +492,7 @@ impl Store {
     let located = {
       let mut record = self.log.begin(header)?;
       for (kind, contents) in sections {
-        let bytes = match contents {
-          Contents::Bytes(bytes) => *bytes,
-          Contents::Staged(identity) => staging.get(identity).ok_or(StoreError::NotStaged)?,
-        };
+        let bytes = resolve_contents(contents, staging)?;
         record.section(
           *kind,
           u64::try_from(bytes.len()).map_err(|_| StoreError::Sizing("a section past u64"))?,
@@ -591,31 +507,57 @@ impl Store {
       }
       record.commit()?
     };
+    self.index_landed_sections(&located, sections, &payloads, staging)?;
+    Ok(located)
+  }
+
+  /// Indexes the `C`, `T`/`H`/`I`/`K`, `B`, and `P` rows of a record just committed by [`Store::land`].
+  fn index_landed_sections(
+    &mut self,
+    located: &Located,
+    sections: &[(SectionKind, Contents<'_>)],
+    payloads: &[Identity],
+    staging: &Staging,
+  ) -> Result<(), StoreError> {
     let seal = self.log.seal();
     if !put_changeset_counted(
       &mut self.rows,
       self.log.file(),
       &seal,
-      &located,
+      located,
       &mut self.value,
       &mut self.corrupt_rows_skipped,
     )? {
-      return Ok(located);
+      return Ok(());
     }
     for (kind, contents) in sections {
       if *kind == SectionKind::Texts {
-        let bytes = match contents {
-          Contents::Bytes(bytes) => *bytes,
-          Contents::Staged(identity) => staging.get(identity).ok_or(StoreError::NotStaged)?,
-        };
+        let bytes = resolve_contents(contents, staging)?;
         crate::texts::put_rows(&mut self.rows, &located.header, bytes)?;
       }
     }
-    let mut payload = payloads.iter();
-    for section in self.log.sections(&located)? {
+    self.index_landed_payloads(located, &seal, sections, payloads, staging)
+  }
+
+  /// Writes multi-piece `B` rows and `P` rows for each payload section of a newly landed record.
+  fn index_landed_payloads(
+    &mut self,
+    located: &Located,
+    seal: &[u8; SEAL_BYTES],
+    sections: &[(SectionKind, Contents<'_>)],
+    payloads: &[Identity],
+    staging: &Staging,
+  ) -> Result<(), StoreError> {
+    let mut payload_ids = payloads.iter();
+    let mut payload_inputs = sections
+      .iter()
+      .filter(|(kind, _)| *kind == SectionKind::Payload);
+    for section in self.log.sections(located)? {
       if section.kind == SectionKind::Payload
-        && let Some(identity) = payload.next()
+        && let (Some(identity), Some((_, contents))) = (payload_ids.next(), payload_inputs.next())
       {
+        let bytes = resolve_contents(contents, staging)?;
+        put_block_digests_from_slice(&mut self.rows, seal, section.offset, bytes)?;
         payloads::keep(
           &mut self.rows,
           identity,
@@ -625,18 +567,17 @@ impl Store {
         )?;
       }
     }
-    Ok(located)
+    Ok(())
   }
 
   /// Returns up to [`PIECE_BYTES`] of the content `identity` (expected length `len`) starting at
   /// `offset`, or `None` when neither `staging` nor the log holds it or `offset >= len`.
   ///
   /// While `identity` is staged in flight, the remaining slice from `offset` is borrowed from
-  /// `staging` without copying. For a landed payload in the log, every call verifies the disk
-  /// bytes it reads against `identity`—the full payload on single-piece reads and cache misses,
-  /// and each touched [`PIECE_BYTES`] block against its authenticated digest on cache hits
-  /// (evicting and refusing [`LogError::Corrupt`] on any mismatch)—returning at most
-  /// [`PIECE_BYTES`] from `offset`.
+  /// `staging` without copying. For a landed payload in the log, every call authenticates every
+  /// touched [`PIECE_BYTES`] disk block in O(1) time and O(1) RAM—against `identity` directly when
+  /// `len <= PIECE_BYTES` and against the section's durable keyed BLAKE3 `B` rows when
+  /// `len > PIECE_BYTES`—returning [`LogError::Corrupt`] on any mismatch or missing digest.
   pub fn piece<'a>(
     &mut self,
     staging: &'a Staging,
@@ -659,14 +600,32 @@ impl Store {
     if landed_len != len || offset >= landed_len {
       return Ok(None);
     }
-    let bytes = read_verified_piece(
-      &self.log,
-      &mut self.piece_digests,
-      identity,
-      (at, landed_len),
-      offset,
-    )?;
+    let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
+    let take = landed_len
+      .checked_sub(offset)
+      .ok_or(StoreError::BadRow)?
+      .min(piece_cap);
+    let bytes = self.read_verified_span(identity, (at, landed_len), (offset, take))?;
     Ok(Some(Cow::Owned(bytes)))
+  }
+
+  /// Reads `[span_start, span_start + span_len)` from a landed payload at `(at, landed_len)`,
+  /// authenticating every touched [`PIECE_BYTES`] block against `identity` (for single-piece
+  /// payloads) or durable keyed `B` rows (for multi-piece payloads) in one log read.
+  pub(crate) fn read_verified_span(
+    &mut self,
+    identity: &Identity,
+    place: (u64, u64),
+    span: (u64, u64),
+  ) -> Result<Vec<u8>, StoreError> {
+    read_verified_span_with(
+      &self.log,
+      &mut self.rows,
+      &mut self.piece_metrics,
+      identity,
+      place,
+      span,
+    )
   }
 
   /// Where the landed content `identity` lies in the log: its offset and length; none where no `P` row names it.
@@ -862,14 +821,20 @@ fn write_seal_preamble<F: BlockFile>(file: &F, seal: &[u8; SEAL_BYTES]) -> Resul
   Ok(())
 }
 
-/// Pairs an already-sealed `log_file` with `rows`, mirroring `seal` into `rows` when rebuilding
-/// and refusing a mismatched `SEAL_ROW` without mutating either file.
+/// Pairs an already-sealed `log_file` with `rows`, refusing a truncated log or a mismatched
+/// `SEAL_ROW` without mutating either file, and mirroring `seal` into `rows` when rebuilding.
 fn prepare_sealed_log<F: BlockFile>(
   log_file: F,
   seal: [u8; SEAL_BYTES],
   (mut rows, applied, page_size): (ShardDb<F>, u64, usize),
 ) -> Result<OpenedStoreFiles<F>, StoreError> {
   let preamble_len = u64::try_from(SEAL_PREAMBLE_BYTES).map_err(|_| LogError::TooLarge)?;
+  let replay_from = applied.max(preamble_len);
+  if log_file.len()? < replay_from {
+    return Err(StoreError::Log(LogError::Corrupt(
+      "a missing or truncated changeset log",
+    )));
+  }
   let seal_written_to_rows = match read_seal_row(&mut rows)? {
     Some(existing) if existing != seal => {
       return Err(StoreError::Log(LogError::Corrupt("a store seal mismatch")));
@@ -885,14 +850,15 @@ fn prepare_sealed_log<F: BlockFile>(
     rows,
     seal,
     applied,
-    replay_from: applied.max(preamble_len),
+    replay_from,
     page_size,
     seal_written_to_rows,
   })
 }
 
 /// Recovers a log whose leading `SLSE` preamble is damaged only when an existing `rows` holds the
-/// backup `SEAL_ROW`, refusing without mutating any file otherwise.
+/// backup `SEAL_ROW` and `log_file` reaches `applied.max(SEAL_PREAMBLE_BYTES)`, durably repairing
+/// the 48-byte preamble on disk so a subsequent loss of `rows` still rebuilds cleanly.
 fn prepare_damaged_preamble_log<F: BlockFile>(
   log_file: F,
   existing_rows: Option<(ShardDb<F>, u64, usize)>,
@@ -901,15 +867,23 @@ fn prepare_damaged_preamble_log<F: BlockFile>(
   let Some((mut rows, applied, page_size)) = existing_rows else {
     return Err(StoreError::Log(LogError::Corrupt("a store seal preamble")));
   };
+  let replay_from = applied.max(preamble_len);
+  if log_file.len()? < replay_from {
+    return Err(StoreError::Log(LogError::Corrupt(
+      "a missing or truncated changeset log",
+    )));
+  }
   let Some(seal) = read_seal_row(&mut rows)? else {
     return Err(StoreError::Log(LogError::Corrupt("a store seal preamble")));
   };
+  write_seal_preamble(&log_file, &seal)?;
+  slates_machine::log_line!("slates-store: repaired damaged seal preamble from rows backup");
   Ok(OpenedStoreFiles {
     log_file,
     rows,
     seal,
     applied,
-    replay_from: applied.max(preamble_len),
+    replay_from,
     page_size,
     seal_written_to_rows: false,
   })
@@ -972,19 +946,41 @@ fn adopt(root: &StoreRoot, name: &str) -> Result<DeviceFile, StoreError> {
   )?)
 }
 
-/// Opens an existing [`ROWS_FILE`] without mutating it.
+/// Rejects device-independent invalid `Sizing` parameters before creating any store file on disk.
+fn validate_sizing_bounds(sizing: Sizing) -> Result<(), StoreError> {
+  if sizing.memory < CHANGESET_ENTRY_BYTES {
+    return Err(StoreError::Sizing("no memory for a row"));
+  }
+  if sizing.extent_bytes == 0
+    || sizing
+      .disk
+      .checked_div(sizing.extent_bytes)
+      .is_none_or(|extents| extents <= 1)
+  {
+    return Err(StoreError::Sizing(
+      "a disk allowance under two extents (the superblocks' and one of rows)",
+    ));
+  }
+  Ok(())
+}
+
+/// Opens an existing non-empty [`ROWS_FILE`] without mutating it, returning `None` when the file
+/// is 0 bytes (uninitialized).
 fn open_rows_existing(
   root: &StoreRoot,
   sizing: Sizing,
-) -> Result<(ShardDb<DeviceFile>, u64, usize), StoreError> {
+) -> Result<Option<(ShardDb<DeviceFile>, u64, usize)>, StoreError> {
   let rows_file = open_existing(root, ROWS_FILE)?;
+  if rows_file.len()? == 0 {
+    return Ok(None);
+  }
   let (config, mem_limit, trunk) = engine_sizing(&rows_file, sizing)?;
   let page_size = config.page_size;
   let (rows, applied) = ShardDb::open(rows_file, config, mem_limit, trunk)?;
-  Ok((rows, applied, page_size))
+  Ok(Some((rows, applied, page_size)))
 }
 
-/// Creates a new [`ROWS_FILE`] and empty [`ShardDb`] (`applied == 0`).
+/// Creates (or initializes an existing 0-byte) [`ROWS_FILE`] and empty [`ShardDb`] (`applied == 0`).
 fn create_rows_fresh(
   root: &StoreRoot,
   sizing: Sizing,
@@ -996,17 +992,18 @@ fn create_rows_fresh(
   Ok((rows, 0, page_size))
 }
 
-/// Opens existing [`ROWS_FILE`] or creates a fresh one when absent.
+/// Opens an existing non-empty [`ROWS_FILE`], or creates/initializes a fresh one when absent or
+/// 0 bytes, validating sizing bounds before creating any file.
 fn open_or_create_rows(
   root: &StoreRoot,
   rows_existed: bool,
   sizing: Sizing,
 ) -> Result<(ShardDb<DeviceFile>, u64, usize), StoreError> {
-  if rows_existed {
-    open_rows_existing(root, sizing)
-  } else {
-    create_rows_fresh(root, sizing)
+  validate_sizing_bounds(sizing)?;
+  if rows_existed && let Some(opened) = open_rows_existing(root, sizing)? {
+    return Ok(opened);
   }
+  create_rows_fresh(root, sizing)
 }
 
 /// Initializes a store whose [`LOG_FILE`] is absent or empty, checking `rows` before creating the
@@ -1048,9 +1045,11 @@ fn open_store_files(
       prepare_sealed_log(log_file, seal, rows_state)
     }
     LogHead::DamagedPreamble => {
-      let existing = rows_existed
-        .then(|| open_rows_existing(root, sizing))
-        .transpose()?;
+      let existing = if rows_existed {
+        open_rows_existing(root, sizing)?
+      } else {
+        None
+      };
       prepare_damaged_preamble_log(log_file, existing)
     }
   }
@@ -1195,244 +1194,306 @@ fn changeset_key(repository: u128, sequence: u64) -> [u8; KEY_BYTES] {
   key
 }
 
-/// Reads `take` raw bytes from `log` at `offset` within its committed prefix.
-fn read_piece_raw<F: BlockFile>(
-  log: &ChangesetLog<F>,
-  offset: u64,
-  take: usize,
-) -> Result<Vec<u8>, StoreError> {
-  let mut bytes = vec![0u8; take];
-  log.read_at(&mut bytes, offset)?;
-  Ok(bytes)
+/// Resolves one section's raw bytes from either caller bytes or `staging`.
+fn resolve_contents<'a>(
+  contents: &Contents<'a>,
+  staging: &'a Staging,
+) -> Result<&'a [u8], StoreError> {
+  match contents {
+    Contents::Bytes(bytes) => Ok(*bytes),
+    Contents::Staged(identity) => staging.get(identity).ok_or(StoreError::NotStaged),
+  }
 }
 
-/// Copies the intersection of chunk `[done, chunk_end)` and requested window `[offset, req_end)`
-/// from `slice` into `out`.
-fn capture_overlap(
-  slice: &[u8],
-  (done, chunk_end): (u64, u64),
-  (offset, req_end): (u64, u64),
-  out: &mut Vec<u8>,
+/// Key of block `block_idx` of the multi-piece payload section at `section_offset` in the log.
+fn block_key(section_offset: u64, block_idx: u64) -> [u8; BLOCK_KEY_BYTES] {
+  let mut key = [0u8; BLOCK_KEY_BYTES];
+  put(&mut key, 0, &[BLOCK_DIGESTS]);
+  put(&mut key, AFTER_TAG, &section_offset.to_be_bytes());
+  put(&mut key, BK_INDEX, &block_idx.to_be_bytes());
+  key
+}
+
+/// Computes the 32-byte keyed BLAKE3 MAC for block `block_idx` of the payload section at
+/// `(section_offset, section_len)`.
+fn keyed_block_tag(
+  seal: &[u8; SEAL_BYTES],
+  section_offset: u64,
+  section_len: u64,
+  block_idx: u64,
+  block_bytes: &[u8],
+) -> Identity {
+  let mut hasher = blake3::Hasher::new_keyed(seal);
+  hasher.update(BLOCK_MAC_DOMAIN);
+  hasher.update(&section_offset.to_le_bytes());
+  hasher.update(&section_len.to_le_bytes());
+  hasher.update(&block_idx.to_le_bytes());
+  hasher.update(block_bytes);
+  *hasher.finalize().as_bytes()
+}
+
+/// Writes per-[`PIECE_BYTES`] keyed MAC `B` rows for an in-memory multi-piece payload slice.
+/// Writes zero rows when `bytes.len() <= PIECE_BYTES`.
+fn put_block_digests_from_slice<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  seal: &[u8; SEAL_BYTES],
+  section_offset: u64,
+  bytes: &[u8],
 ) -> Result<(), StoreError> {
-  let copy_start = done.max(offset);
-  let copy_end = chunk_end.min(req_end);
-  if copy_start >= copy_end {
+  if bytes.len() <= PIECE_BYTES {
     return Ok(());
   }
-  let local_start =
-    usize::try_from(copy_start.saturating_sub(done)).map_err(|_| StoreError::BadRow)?;
-  let local_end = usize::try_from(copy_end.saturating_sub(done)).map_err(|_| StoreError::BadRow)?;
-  let part = slice
-    .get(local_start..local_end)
-    .ok_or(StoreError::BadRow)?;
-  out.extend_from_slice(part);
+  let section_len = u64::try_from(bytes.len()).map_err(|_| StoreError::BadRow)?;
+  for (idx, chunk) in bytes.chunks(PIECE_BYTES).enumerate() {
+    let block_idx = u64::try_from(idx).map_err(|_| StoreError::BadRow)?;
+    let tag = keyed_block_tag(seal, section_offset, section_len, block_idx, chunk);
+    rows.put(&block_key(section_offset, block_idx), &tag)?;
+  }
   Ok(())
 }
 
-/// Returns the number of [`PIECE_BYTES`] block digests needed for `landed_len` when the full
-/// digest slice fits within `budget_bytes`, or `None` when empty or over budget.
-fn digest_capacity(landed_len: u64, piece_cap: u64, budget_bytes: usize) -> Option<usize> {
-  if landed_len == 0 {
-    return None;
+/// Deletes every per-block MAC `B` row belonging to a multi-piece payload section at
+/// `(section_offset, section_len)`. No-op when `section_len <= PIECE_BYTES`.
+fn delete_block_digests<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  section_offset: u64,
+  section_len: u64,
+) -> Result<(), StoreError> {
+  let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
+  if section_len <= piece_cap {
+    return Ok(());
   }
-  let blocks = usize::try_from(landed_len.div_ceil(piece_cap.max(1))).ok()?;
-  let bytes = blocks.checked_mul(blake3::OUT_LEN)?;
-  (bytes <= budget_bytes).then_some(blocks)
+  let blocks = section_len.div_ceil(piece_cap);
+  for block_idx in 0..blocks {
+    rows.delete(&block_key(section_offset, block_idx))?;
+  }
+  Ok(())
 }
 
-/// Converts a payload byte offset into its zero-based [`PIECE_BYTES`] block index.
-fn block_index(byte_offset: u64, piece_cap: u64) -> Result<usize, StoreError> {
-  byte_offset
-    .checked_div(piece_cap)
-    .and_then(|idx| usize::try_from(idx).ok())
+/// Streams a multi-piece payload `[section_offset, section_offset + section_len)` once in
+/// [`PIECE_BYTES`] blocks (peak RAM = one [`PIECE_BYTES`] buffer), updating the whole-payload
+/// BLAKE3 identity and persisting each block's keyed MAC `B` row in `rows`.
+fn hash_and_put_blocks<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  file: &F,
+  seal: &[u8; SEAL_BYTES],
+  (section_offset, section_len): (u64, u64),
+  buffer: &mut Vec<u8>,
+) -> Result<Identity, StoreError> {
+  let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
+  buffer.resize(PIECE_BYTES, 0);
+  let mut whole = blake3::Hasher::new();
+  let mut done = 0u64;
+  let mut block_idx = 0u64;
+  while done < section_len {
+    let left = section_len.checked_sub(done).ok_or(StoreError::BadRow)?;
+    let step = usize::try_from(left.min(piece_cap)).map_err(|_| StoreError::BadRow)?;
+    let slice = buffer.get_mut(..step).ok_or(StoreError::BadRow)?;
+    let at = section_offset.checked_add(done).ok_or(StoreError::BadRow)?;
+    file.read_exact_at(slice, at).map_err(LogError::from)?;
+    whole.update(slice);
+    let tag = keyed_block_tag(seal, section_offset, section_len, block_idx, slice);
+    rows.put(&block_key(section_offset, block_idx), &tag)?;
+    done = done
+      .checked_add(u64::try_from(step).map_err(|_| StoreError::BadRow)?)
+      .ok_or(StoreError::BadRow)?;
+    block_idx = block_idx.checked_add(1).ok_or(StoreError::BadRow)?;
+  }
+  Ok(*whole.finalize().as_bytes())
+}
+
+/// Indexes one `SectionKind::Payload` from `file`: single-piece (`<= PIECE_BYTES`) writes only its
+/// `P` row; multi-piece (`> PIECE_BYTES`) streams once to write its `B` rows and its `P` row.
+fn index_payload_from_log<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  file: &F,
+  seal: &[u8; SEAL_BYTES],
+  (section_offset, section_len): (u64, u64),
+  (value, buffer): (&mut Vec<u8>, &mut Vec<u8>),
+) -> Result<(), StoreError> {
+  let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
+  let identity = if section_len <= piece_cap {
+    identity_of_range(file, section_offset, section_len, buffer)?
+  } else {
+    hash_and_put_blocks(rows, file, seal, (section_offset, section_len), buffer)?
+  };
+  payloads::keep(rows, &identity, section_offset, section_len, value)
+}
+
+/// Verifies a zero-length span request (checking the empty-bytes BLAKE3 identity when the whole
+/// payload is empty).
+fn verify_empty_span(identity: &Identity, landed_len: u64) -> Result<Vec<u8>, StoreError> {
+  if landed_len == 0 && *blake3::hash(&[]).as_bytes() != *identity {
+    return Err(StoreError::Log(LogError::Corrupt("a payload's bytes")));
+  }
+  Ok(Vec::new())
+}
+
+/// Reads a single-piece (`<= PIECE_BYTES`) payload in one log read, verifies its whole-payload
+/// BLAKE3 against `identity`, and returns `[span_start..span_end)`.
+fn read_verified_single_piece<F: BlockFile>(
+  log: &ChangesetLog<F>,
+  metrics: &mut PieceMetrics,
+  identity: &Identity,
+  (at, landed_len): (u64, u64),
+  (span_start, span_end): (u64, u64),
+) -> Result<Vec<u8>, StoreError> {
+  let total = usize::try_from(landed_len).map_err(|_| StoreError::BadRow)?;
+  let mut bytes = vec![0u8; total];
+  log.read_at(&mut bytes, at)?;
+  metrics.bytes_hashed = metrics.bytes_hashed.saturating_add(landed_len);
+  if *blake3::hash(&bytes).as_bytes() != *identity {
+    return Err(StoreError::Log(LogError::Corrupt("a payload's bytes")));
+  }
+  metrics.verifications = metrics.verifications.saturating_add(1);
+  if span_start == 0 && span_end == landed_len {
+    return Ok(bytes);
+  }
+  let from = usize::try_from(span_start).map_err(|_| StoreError::BadRow)?;
+  let to = usize::try_from(span_end).map_err(|_| StoreError::BadRow)?;
+  bytes
+    .get(from..to)
+    .map(<[u8]>::to_vec)
     .ok_or(StoreError::BadRow)
 }
 
-/// Returns `[block_start, block_end)` within `[0, landed_len)` for `block_idx`.
-fn block_bounds(
-  block_idx: usize,
-  piece_cap: u64,
-  landed_len: u64,
-) -> Result<(u64, u64), StoreError> {
-  let start = u64::try_from(block_idx)
-    .ok()
-    .and_then(|idx| idx.checked_mul(piece_cap))
-    .ok_or(StoreError::BadRow)?;
-  let end = start.saturating_add(piece_cap).min(landed_len);
-  Ok((start, end))
+/// Authenticates every [`PIECE_BYTES`] block in `aligned` (starting at `first_block`) against its
+/// durable keyed BLAKE3 `B` row in `rows`.
+fn verify_aligned_blocks<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  metrics: &mut PieceMetrics,
+  seal: &[u8; SEAL_BYTES],
+  (at, landed_len): (u64, u64),
+  first_block: u64,
+  aligned: &[u8],
+) -> Result<(), StoreError> {
+  let mut expected = Vec::with_capacity(IDENTITY);
+  for (rel_idx, block_bytes) in aligned.chunks(PIECE_BYTES).enumerate() {
+    let rel_u64 = u64::try_from(rel_idx).map_err(|_| StoreError::BadRow)?;
+    let block_idx = first_block.checked_add(rel_u64).ok_or(StoreError::BadRow)?;
+    expected.clear();
+    if !rows.get(&block_key(at, block_idx), &mut expected)? || expected.len() != IDENTITY {
+      return Err(StoreError::Log(LogError::Corrupt(
+        "a payload's block digest",
+      )));
+    }
+    let hashed = u64::try_from(block_bytes.len()).map_err(|_| StoreError::BadRow)?;
+    metrics.bytes_hashed = metrics.bytes_hashed.saturating_add(hashed);
+    let tag = keyed_block_tag(seal, at, landed_len, block_idx, block_bytes);
+    if tag.as_slice() != expected.as_slice() {
+      return Err(StoreError::Log(LogError::Corrupt("a payload's bytes")));
+    }
+  }
+  Ok(())
 }
 
-/// Streams `[at, at + landed_len)` through BLAKE3 in [`PIECE_BYTES`] blocks (enforcing the
-/// committed log boundary via [`ChangesetLog::read_at`]), collecting per-block digests when they
-/// fit within `budget_bytes` and capturing `[offset, offset + take)` in a single pass. Returns
-/// [`LogError::Corrupt`] before exposing any byte on whole-payload identity mismatch.
-fn stream_verify_and_capture<F: BlockFile>(
+/// Reads the block-aligned span covering `[span_start, span_end)` of a multi-piece payload in one
+/// [`ChangesetLog::read_at`] call, verifies every touched block against its `B` row, and returns
+/// the exact requested slice.
+fn read_verified_multi_piece<F: BlockFile>(
   log: &ChangesetLog<F>,
+  rows: &mut ShardDb<F>,
+  metrics: &mut PieceMetrics,
+  (at, landed_len): (u64, u64),
+  (span_start, span_end): (u64, u64),
+) -> Result<Vec<u8>, StoreError> {
+  let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
+  let last_byte = span_end.checked_sub(1).ok_or(StoreError::BadRow)?;
+  let first_block = span_start
+    .checked_div(piece_cap)
+    .ok_or(StoreError::BadRow)?;
+  let last_block = last_byte.checked_div(piece_cap).ok_or(StoreError::BadRow)?;
+  let aligned_start = first_block
+    .checked_mul(piece_cap)
+    .ok_or(StoreError::BadRow)?;
+  let aligned_end = last_block
+    .checked_add(1)
+    .and_then(|next| next.checked_mul(piece_cap))
+    .map_or(landed_len, |end| end.min(landed_len));
+  let aligned_len = usize::try_from(
+    aligned_end
+      .checked_sub(aligned_start)
+      .ok_or(StoreError::BadRow)?,
+  )
+  .map_err(|_| StoreError::BadRow)?;
+  let mut aligned = vec![0u8; aligned_len];
+  log.read_at(
+    &mut aligned,
+    at.checked_add(aligned_start).ok_or(StoreError::BadRow)?,
+  )?;
+  let seal = log.seal();
+  verify_aligned_blocks(
+    rows,
+    metrics,
+    &seal,
+    (at, landed_len),
+    first_block,
+    &aligned,
+  )?;
+  metrics.verifications = metrics.verifications.saturating_add(1);
+  if span_start == aligned_start && span_end == aligned_end {
+    return Ok(aligned);
+  }
+  let from = usize::try_from(
+    span_start
+      .checked_sub(aligned_start)
+      .ok_or(StoreError::BadRow)?,
+  )
+  .map_err(|_| StoreError::BadRow)?;
+  let to = usize::try_from(
+    span_end
+      .checked_sub(aligned_start)
+      .ok_or(StoreError::BadRow)?,
+  )
+  .map_err(|_| StoreError::BadRow)?;
+  aligned
+    .get(from..to)
+    .map(<[u8]>::to_vec)
+    .ok_or(StoreError::BadRow)
+}
+
+/// Shared verified span reader for [`Store::piece`], [`Store::places_bytes`], and `read_place`:
+/// checks the committed log boundary, authenticates every touched [`PIECE_BYTES`] block against
+/// `identity` (`<= PIECE_BYTES`) or `B` rows (`> PIECE_BYTES`) in one log read, and updates
+/// `metrics`.
+fn read_verified_span_with<F: BlockFile>(
+  log: &ChangesetLog<F>,
+  rows: &mut ShardDb<F>,
+  metrics: &mut PieceMetrics,
   identity: &Identity,
   (at, landed_len): (u64, u64),
-  (offset, take): (u64, usize),
-  budget_bytes: usize,
-) -> Result<(Vec<u8>, Option<BlockDigests>), StoreError> {
+  (span_start, span_len): (u64, u64),
+) -> Result<Vec<u8>, StoreError> {
   let payload_end = at.checked_add(landed_len).ok_or(StoreError::BadRow)?;
   if payload_end > log.end() {
     return Err(StoreError::Log(LogError::Corrupt(
       "a read past the committed records",
     )));
   }
-  let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
-  let req_end = offset
-    .checked_add(u64::try_from(take).map_err(|_| StoreError::BadRow)?)
-    .ok_or(StoreError::BadRow)?;
-  let mut out = Vec::with_capacity(take);
-  let mut digests = digest_capacity(landed_len, piece_cap, budget_bytes).map(Vec::with_capacity);
-  let mut chunk_buf = vec![0u8; PIECE_BYTES];
-  let mut hasher = blake3::Hasher::new();
-  let mut done = 0u64;
-  while done < landed_len {
-    let left = landed_len.checked_sub(done).ok_or(StoreError::BadRow)?;
-    let step = usize::try_from(left.min(piece_cap)).map_err(|_| StoreError::BadRow)?;
-    let slice = chunk_buf.get_mut(..step).ok_or(StoreError::BadRow)?;
-    log.read_at(slice, at.checked_add(done).ok_or(StoreError::BadRow)?)?;
-    hasher.update(slice);
-    if let Some(list) = &mut digests {
-      list.push(*blake3::hash(slice).as_bytes());
-    }
-    let chunk_end = done
-      .checked_add(u64::try_from(step).map_err(|_| StoreError::BadRow)?)
-      .ok_or(StoreError::BadRow)?;
-    capture_overlap(slice, (done, chunk_end), (offset, req_end), &mut out)?;
-    done = chunk_end;
-  }
-  if *hasher.finalize().as_bytes() != *identity {
-    return Err(StoreError::Log(LogError::Corrupt("a payload's bytes")));
-  }
-  if out.len() != take {
+  let span_end = span_start.checked_add(span_len).ok_or(StoreError::BadRow)?;
+  if span_end > landed_len {
     return Err(StoreError::BadRow);
   }
-  Ok((out, digests.map(Vec::into_boxed_slice)))
-}
-
-/// Reads and verifies only the [`PIECE_BYTES`] blocks overlapping `[offset, offset + take)`
-/// against their authenticated BLAKE3 digests in `block_digests`.
-fn read_cached_blocks<F: BlockFile>(
-  log: &ChangesetLog<F>,
-  block_digests: &[BlockDigest],
-  (at, landed_len): (u64, u64),
-  (offset, take): (u64, usize),
-) -> Result<Vec<u8>, StoreError> {
+  if span_len == 0 {
+    return verify_empty_span(identity, landed_len);
+  }
   let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
-  let take_u64 = u64::try_from(take).map_err(|_| StoreError::BadRow)?;
-  let req_end = offset.checked_add(take_u64).ok_or(StoreError::BadRow)?;
-  let last_byte = req_end.checked_sub(1).ok_or(StoreError::BadRow)?;
-  let first_block = block_index(offset, piece_cap)?;
-  let last_block = block_index(last_byte, piece_cap)?;
-  let mut out = Vec::with_capacity(take);
-  let mut block_buf = vec![0u8; PIECE_BYTES];
-  for block_idx in first_block..=last_block {
-    let expected = block_digests.get(block_idx).ok_or(StoreError::BadRow)?;
-    let (block_start, block_end) = block_bounds(block_idx, piece_cap, landed_len)?;
-    let block_len = usize::try_from(
-      block_end
-        .checked_sub(block_start)
-        .ok_or(StoreError::BadRow)?,
-    )
-    .map_err(|_| StoreError::BadRow)?;
-    let slice = block_buf.get_mut(..block_len).ok_or(StoreError::BadRow)?;
-    log.read_at(
-      slice,
-      at.checked_add(block_start).ok_or(StoreError::BadRow)?,
-    )?;
-    if *blake3::hash(slice).as_bytes() != *expected {
-      return Err(StoreError::Log(LogError::Corrupt("a payload's bytes")));
-    }
-    capture_overlap(slice, (block_start, block_end), (offset, req_end), &mut out)?;
+  if landed_len <= piece_cap {
+    return read_verified_single_piece(
+      log,
+      metrics,
+      identity,
+      (at, landed_len),
+      (span_start, span_end),
+    );
   }
-  if out.len() != take {
-    return Err(StoreError::BadRow);
-  }
-  Ok(out)
+  read_verified_multi_piece(log, rows, metrics, (at, landed_len), (span_start, span_end))
 }
 
-/// Reads a whole single-piece payload from `at` and authenticates it directly against `identity`.
-fn read_single_piece<F: BlockFile>(
-  log: &ChangesetLog<F>,
-  digests: &mut PieceDigests,
-  identity: &Identity,
-  at: u64,
-  take: usize,
-) -> Result<Vec<u8>, StoreError> {
-  let bytes = read_piece_raw(log, at, take)?;
-  if *blake3::hash(&bytes).as_bytes() != *identity {
-    return Err(StoreError::Log(LogError::Corrupt("a payload's bytes")));
-  }
-  digests.record_verification();
-  Ok(bytes)
-}
-
-/// Records a cached block-digest read on success, or evicts `key` before returning corruption.
-fn finish_cached_read(
-  digests: &mut PieceDigests,
-  key: &VerifiedKey,
-  result: Result<Vec<u8>, StoreError>,
-) -> Result<Vec<u8>, StoreError> {
-  match result {
-    Ok(bytes) => {
-      digests.record_verification();
-      Ok(bytes)
-    }
-    Err(error @ StoreError::Log(LogError::Corrupt(_))) => {
-      digests.remove(key);
-      Err(error)
-    }
-    Err(error) => Err(error),
-  }
-}
-
-/// Reads one piece (at most [`PIECE_BYTES`] from `offset`) of a landed payload at `(at, landed_len)`,
-/// authenticating every disk block read against `identity` (whole payload on single-piece reads
-/// and cache misses; cached per-[`PIECE_BYTES`] block digests on hits, evicting on any mismatch).
-fn read_verified_piece<F: BlockFile>(
-  log: &ChangesetLog<F>,
-  digests: &mut PieceDigests,
-  identity: &Identity,
-  (at, landed_len): (u64, u64),
-  offset: u64,
-) -> Result<Vec<u8>, StoreError> {
-  let piece_cap = u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?;
-  let left = landed_len.checked_sub(offset).ok_or(StoreError::BadRow)?;
-  let take = usize::try_from(left.min(piece_cap)).map_err(|_| StoreError::BadRow)?;
-  if offset == 0 && u64::try_from(take).ok() == Some(landed_len) {
-    return read_single_piece(log, digests, identity, at, take);
-  }
-  if take == 0 {
-    return Err(StoreError::BadRow);
-  }
-  let key = VerifiedKey {
-    at,
-    len: landed_len,
-    identity: *identity,
-  };
-  if let Some(cached) = digests.get(&key) {
-    let result = read_cached_blocks(log, cached, (at, landed_len), (offset, take));
-    return finish_cached_read(digests, &key, result);
-  }
-  let (bytes, block_digests) = stream_verify_and_capture(
-    log,
-    identity,
-    (at, landed_len),
-    (offset, take),
-    digests.budget_bytes(),
-  )?;
-  if let Some(block_digests) = block_digests {
-    digests.insert(key, block_digests);
-  }
-  digests.record_verification();
-  Ok(bytes)
-}
-
-/// Puts every row of the committed record `located`, its sections read back from `file`: the `C` row, a `P` row for each
-/// payload (its identity hashed from the log), the `T`/`H` rows of its `Texts`. One function for a recovery's replay and
-/// for [`Store::applied`], so a record is indexed the same whichever way it landed.
+/// Puts every row of the committed record `located`, its sections read back from `file`: the `C` row, a `P` row (and
+/// per-block keyed MAC `B` rows when `> PIECE_BYTES`) for each payload, and the `T`/`H`/`I`/`K` rows of its `Texts`.
+/// One function for a recovery's replay and for [`Store::applied`], so a record is indexed the same whichever way it
+/// landed.
 fn put_rows_from_log<F: BlockFile>(
   rows: &mut ShardDb<F>,
   file: &F,
@@ -1446,8 +1507,13 @@ fn put_rows_from_log<F: BlockFile>(
   }
   for section in sections_in(file, located)? {
     if section.kind == SectionKind::Payload {
-      let identity = identity_of_range(file, section.offset, section.len, buffer)?;
-      payloads::keep(rows, &identity, section.offset, section.len, value)?;
+      index_payload_from_log(
+        rows,
+        file,
+        seal,
+        (section.offset, section.len),
+        (value, buffer),
+      )?;
     }
     if section.kind == SectionKind::Texts {
       buffer.clear();

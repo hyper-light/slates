@@ -2,8 +2,12 @@
 //!
 //! **Store preamble.** A [`crate::store::Store`]'s changeset log begins at offset 0 with a [`SEAL_PREAMBLE_BYTES`]-byte
 //! self-describing `SLSE` preamble (`SLSE`, [`FORMAT`] as little-endian `u16`, two reserved zero bytes, the store's
-//! 32-byte random secret seal, the CRC-32C of those 40 bytes, and its bitwise complement). The preamble makes the log
-//! self-contained so the derived `rows` index can be deleted and rebuilt byte-identically from the log alone, and lets
+//! 32-byte random secret seal, the CRC-32C of those 40 bytes, and its bitwise complement). Later `SLSE` formats keep
+//! this 48-byte preamble layout and trailing CRC-32C + complement placement so [`decode_seal_preamble`] validates the
+//! preamble checksum before checking `P_FORMAT`: a single-bit media flip in `P_FORMAT` classifies as
+//! [`SealPreamble::Damaged`] (recoverable from `rows`'s backup `S` row) while a genuine future format classifies as
+//! [`SealPreamble::UnsupportedFormat`]. The preamble makes the log self-contained so the derived `rows` index can be
+//! deleted and rebuilt with every committed record intact and the log byte-identical from the log alone, and lets
 //! `Store::open` refuse legacy `FORMAT = 1` or future format versions with [`LogError::UnsupportedFormat`] before
 //! creating or mutating any file. Direct [`ChangesetLog::recover`] callers over bare logs still start at offset 0.
 //!
@@ -258,7 +262,8 @@ pub struct Located {
   pub offset: u64,
   /// Its header.
   pub header: Header,
-  /// Its identity (BLAKE3 of the header and each section's kind, length and bytes).
+  /// Its identity (keyed BLAKE3 bound to `(offset, seal)` over the header and each section's kind,
+  /// length and bytes).
   pub identity: [u8; IDENTITY],
   /// Its whole length, trailer included.
   pub len: u64,
@@ -401,6 +406,9 @@ impl<F: BlockFile> ChangesetLog<F> {
     mut each: impl FnMut(&F, &Located),
   ) -> Result<Self, LogError> {
     let len = file.len()?;
+    if from > len {
+      return Err(LogError::Corrupt("a recovery offset past the log's end"));
+    }
     let mut progress = RecoverState {
       end: from,
       cursor: from,
@@ -543,10 +551,7 @@ impl<F: BlockFile> ChangesetLog<F> {
 
   /// Writes the open section's head now that its bytes are whole and their CRC known.
   fn close_section(&mut self) -> Result<(), LogError> {
-    let Some(record) = self.open.as_mut() else {
-      return Ok(());
-    };
-    let Some(section) = record.section.take() else {
+    let Some(section) = self.open.as_ref().and_then(|record| record.section) else {
       return Ok(());
     };
     if section.done != section.len {
@@ -557,6 +562,9 @@ impl<F: BlockFile> ChangesetLog<F> {
     let mut head = [0u8; SECTION_HEAD_BYTES];
     encode_section_head(section.kind, section.len, section.crc, &mut head);
     self.file.write_all_at(&head, section.head)?;
+    if let Some(record) = self.open.as_mut() {
+      record.section = None;
+    }
     Ok(())
   }
 
@@ -1398,15 +1406,11 @@ pub fn encode_seal_preamble(seal: &[u8; SEAL_BYTES]) -> [u8; SEAL_PREAMBLE_BYTES
   out
 }
 
-/// Validates the reserved bytes, CRC-32C, and complement guard of a `FORMAT`-matched `SLSE` preamble.
-fn verify_seal_preamble_body(prefix: &[u8]) -> SealPreamble {
+/// Validates the 48-byte `SLSE` preamble's length and CRC-32C + bitwise complement first so a
+/// single-bit flip in `P_FORMAT` classifies as [`SealPreamble::Damaged`], then checks `P_FORMAT`
+/// and reserved zero bytes.
+fn verify_seal_preamble(prefix: &[u8]) -> SealPreamble {
   if prefix.len() != SEAL_PREAMBLE_BYTES {
-    return SealPreamble::Damaged;
-  }
-  let Some(reserved) = prefix.get(P_RESERVED..P_SEAL) else {
-    return SealPreamble::Damaged;
-  };
-  if reserved.iter().any(|byte| *byte != 0) {
     return SealPreamble::Damaged;
   }
   let Some(covered) = prefix.get(..SEAL_PREAMBLE_COVERED) else {
@@ -1418,6 +1422,18 @@ fn verify_seal_preamble_body(prefix: &[u8]) -> SealPreamble {
   if !crc_ok {
     return SealPreamble::Damaged;
   }
+  let Some(found) = get_u16(prefix, P_FORMAT) else {
+    return SealPreamble::Damaged;
+  };
+  if found != FORMAT {
+    return SealPreamble::UnsupportedFormat(found);
+  }
+  let Some(reserved) = prefix.get(P_RESERVED..P_SEAL) else {
+    return SealPreamble::Damaged;
+  };
+  if reserved.iter().any(|byte| *byte != 0) {
+    return SealPreamble::Damaged;
+  }
   get_array::<SEAL_BYTES>(prefix, P_SEAL).map_or(SealPreamble::Damaged, SealPreamble::Valid)
 }
 
@@ -1427,13 +1443,7 @@ pub fn decode_seal_preamble(prefix: &[u8]) -> SealPreamble {
     return SealPreamble::Damaged;
   };
   if magic == SEAL_MAGIC {
-    let Some(found) = get_u16(prefix, P_FORMAT) else {
-      return SealPreamble::Damaged;
-    };
-    if found != FORMAT {
-      return SealPreamble::UnsupportedFormat(found);
-    }
-    return verify_seal_preamble_body(prefix);
+    return verify_seal_preamble(prefix);
   }
   if magic == MAGIC
     && let Some(found) = get_u16(prefix, H_FORMAT)
