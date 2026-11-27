@@ -750,7 +750,9 @@
 > whole, debug), and `texts_carried` since 11c (a text put and a row a unit, 12.3 ms whole, debug). Next by release
 > size: the register's op (`landing.record`, atomic by main's ruling). The reserve's copy entry room resolves the copy
 > ops alone since 12a (11.5 ms whole, debug); move's other named units are the judge's `finish_resolving` (5.8 ms)
-> and a `decide_some` unit (4.9), the commit's `Prep::Beginning` (7.7-7.9), and the storing's begin (14.0). Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
+> and a `decide_some` unit (4.9) and the commit's `Prep::Beginning` (7.7-7.9). The storing's begin is a text a unit
+> since 13a (release probe 15's leader at about 1.4 ms p50). Next: copy's `landing.release` (1.6 ms) and the register's
+> op. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`
 > steps a release to its end in one call; what scales with it is the scratch member's nodes, so a wide made commit's

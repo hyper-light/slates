@@ -1220,6 +1220,8 @@ struct WideCounts {
   fold_steps: u64,
   /// The steps of the walk of the texts the changeset carries (`svn_commit::CARRIED_STEPS`, 11c).
   carried_steps: u64,
+  /// The steps of the import's texts handed over to the landing (`svn_commit::HAND_OVER_STEPS`, 13a).
+  hand_over_steps: u64,
 }
 
 /// The calling shard's [`WideCounts`] now.
@@ -1240,6 +1242,7 @@ fn wide_counts() -> WideCounts {
     hold_steps: on(|state| count(state, crate::vcs_store::name_holds::NAME_HOLD_APPLY_STEPS)),
     fold_steps: on(|state| count(state, crate::repository::svn_commit::FOLD_STEPS)),
     carried_steps: on(|state| count(state, crate::repository::svn_commit::CARRIED_STEPS)),
+    hand_over_steps: on(|state| count(state, crate::repository::svn_commit::HAND_OVER_STEPS)),
   }
 }
 
@@ -1261,6 +1264,7 @@ fn wide_landing_sliced(counts: &WideCounts) {
     hold_steps,
     fold_steps,
     carried_steps,
+    hand_over_steps,
     ..
   } = counts;
   // Non-vacuity: the landing's unpin of its 9,000 texts and its scratch member's release each ran in slices (A-920 6a:
@@ -1298,6 +1302,12 @@ fn wide_landing_sliced(counts: &WideCounts) {
   assert!(
     *carried_steps > 2,
     "the carried texts' walk took {carried_steps} step(s)"
+  );
+  // The import's 9,000 texts handed over to the landing a text a unit (A-920 13a: whole in the storing's begin, 10.5
+  // ms of one step, debug).
+  assert!(
+    *hand_over_steps > 2,
+    "the texts' hand-over took {hand_over_steps} step(s)"
   );
 }
 
