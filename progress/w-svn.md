@@ -834,3 +834,13 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Debug leaders now (excl. landing.publish, A-930/w-perf): stage.judging 5.8 (move), stage.recording 5.0-5.3, stage.check 3.8-4.2, landing.changeset 2.3.
 - Owed (§3, GAPS): a replay's read plan and the runs' unread scan, each one linear unit.
 - Next (proposed to main): name stage.judging and stage.recording.
+
+## 2026-11-27 ~10:50 (A-920, the staging's whole units)
+- Landed, each named first and red first: ee0c95e8f (rmdir children counted), 8c552a68c (resolution end an entry a unit),
+  829985455 (free decision's holds applied a slice a step; svn walks read a directory a child a unit), adb06c93b (revision
+  record encoded a part at a time), ce5e6eb4e (replay's read plan stepped, runs read whole counted), 65d96339a (Texts
+  section an entry a unit), 3e29efc9f (deleted tree walked by ptrie cursor), f0c8c7c96 (TSan skips + lane patience).
+- Bisected main's restart red to w-perf's 7acfd685c; main reverted it (68e6fe9e3).
+- Debug leaders now (excl. publish): 1.0-1.4 ms spans; cold first create 2.4 ms = first use (warm 0.17-0.2), ruling asked.
+- Owed (GAPS, by main's ruling only when a probe names them): plan where still whole, begin's copies list, named_whole_files.
+- Next: main's ruling on create; probe 18 (release) to name leaders.
