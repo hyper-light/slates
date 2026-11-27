@@ -280,17 +280,24 @@
 > (`docs/bugs/2026-11-27-a-green-standing-alone-waited-on-its-holders-for-a-join-that-never-comes.md`). Red first: two
 > `merge_service` units and one `merge_origin` unit. The fleet probe test passed in 5.82 s. OWED (main): the whole
 > `tests/fleet.rs` on the Mac and the Windows lanes, then the gap that no Unix lane runs it.
-> **OPEN (w-interop, 2026-11-27; main's ruling of 07:08; found by reading the code, nothing run yet): a lone green
-> later adopted as a repository's root keeps a standalone replica on its holders, so a branch of it may never reach a
-> holder.** A green created alone is a family root of its own (A-636 part 2b-2), and its version 0 shipped while it
-> stood alone, so each holder made it a replica of no lineage. A repository that adopts it as its root moves the
-> owner's engine into the new lineage (`repository::install_root` with `adopted`) and enqueues no new version 0, so no
-> holder founds the lineage. A later branch's version 0 then meets `Greens::branch` refused `Stale` on each holder (the
-> source is no lineage member there), counted `merge.replica.branch_source_behind` and retried without end (CLAUDE.md
-> §2 item 8). The rebuild after a restart founds it by its join (`merge_origin::rebuild_through`), so only a holder that
-> made the replica before the join is affected. Owed (w-interop, after the lone-green record fix lands): a red test that
-> adopts a lone green as a root, branches it and requires the branch to reach a holder; the fix if it is red, else why
-> it holds and this closed.
+> **FIXED (w-interop, 2026-11-27; main's ruling of 07:08; A-932's sibling): a green made alone and adopted later as a
+> repository's root kept a standalone replica on its holders, so a branch of it never reached them.** Its version 0
+> shipped standing alone, and the owner moved its engine into the new lineage without a new version 0
+> (`repository::install_root`), so each holder's `Greens::branch` refused the branch `Stale`, counted
+> `merge.replica.branch_source_behind` without end; a restarted holder's rebuild did the same. Now a holder founds the
+> lineage with the lone replica where the names log joins it as its repository's root, at the first branch of it made
+> there, a record's or a rebuild's (`merge_service::adopted_root_founded`, counted `merge.replica.adopted_root_founded`)
+> (`docs/bugs/2026-11-27-a-lone-green-adopted-as-a-root-left-its-branches-unreplicated.md`). Red first:
+> `merge_service` `a_lone_green_adopted_as_a_root_is_branched_on_its_holder` (`Err("merge.out_of_order")`) and
+> `merge_origin` `a_restarted_holder_rebuilds_a_branch_of_a_lone_green_adopted_as_a_root` (`[Later, Later, Later,
+> Later]`).
+> **OPEN, coverage (w-interop, 2026-11-27; main's ruling of 12:17): the same root adopted by a takeover successor before
+> any branch of it reached the successor.** The successor installs the root alone (`green_adopt`), from the
+> predecessor's lone replica. A later branch record there takes `make_origin_replica`'s same branch arm, so
+> `adopted_root_founded` should found the lineage there as on any holder. No test runs that path: main's fleet run was
+> at bfdacf8ea, before the fix, and a pass would not show the path ran. A fleet test of it must see
+> `merge.replica.adopted_root_founded` move on the successor. Worked when measured, or when w-shared's A-918 B touches
+> `green_adopt`.
 > **FIXED (A-912, w-shared, 2026-11-24; main 01a20182's rulings): a push made right after a member died was refused
 > `retry` for a second or more.** A home behind its sender held the put for its install, which needed the council's next
 > append on the very record session the put held, and the coordinator awaited its healer inline; and a home that died
