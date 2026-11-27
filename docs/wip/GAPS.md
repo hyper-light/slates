@@ -364,8 +364,10 @@
 >     ms past 1,998 ms, 6 times in 4 sets). Now it sleeps the pace or what is left before its ceiling, whichever is
 >     less. Red: `owner_location::tests::a921_a_bounded_owner_lookup_ends_within_its_bound_and_its_waits_lateness` (a
 >     lookup bounded at two paces and a half: 33.2 ms against 25 ms, 1.87 ms of measured lateness and a 0.55 ms look);
->     the resolution pass's test now bounds it by its budget, the shard's measured lateness of its waits
->     (`futures::scheduler_overrun_ns`) and one look's measured time, not a pace (after: 0.15 ms past its budget).
+>     both tests bound the lookup by its bound (the pass by its budget), the most its own waits came back late and its
+>     longest look, each measured in the lookup and counted on its shard (`owner_location::WAIT_LATE_MOST`,
+>     `LOOK_MOST`), not a pace, nor the shard's overall overrun and a look timed beforehand, which main's 9 runs found
+>     short by 9 to 110 us under load (after: 0.15 ms past the pass's budget; main's runs 9 to 110 us).
 >   - **OPEN, waits for Ada's word: fleet-wide repository name routing.** A node holding no copy of a repository answers
 >     `404` (the fleet test: the third node's `ls-remote` "not found"): a name resolves only where a partition holds it
 >     (D-12, no directory; D-14, no global catalog), so it cannot even form the owner's query. Not started.
