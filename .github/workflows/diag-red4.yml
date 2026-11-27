@@ -1,0 +1,70 @@
+name: diag red 4 (hg_import overlap on Windows)
+# Diag only (main 01a20182, 2026-11-27): w-interop's DIAG-LANDING lines (5da8d0daf on w-interop/hg-landing-diag, red 4:
+# hg_import counted overlapped=0 on Windows) from the hg_import unit tests on both native Windows lanes, three runs each,
+# one test at a time as ci.yml's daemon unit tests run. Never merged to main.
+on:
+  push:
+    branches: ["diag-measurer-red4-*"]
+jobs:
+  x86_64:
+    name: hg_import DIAG-LANDING (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the daemon's unit tests
+        run: cargo test -p slates-server --lib --no-run
+      - name: Three runs of the hg_import unit tests, printing DIAG-LANDING
+        shell: bash
+        run: |
+          set -o pipefail
+          rc=0
+          for run in 1 2 3; do
+            echo "== run $run $(date -u +%T)"
+            cargo test -p slates-server --lib -- --test-threads=1 --nocapture vcs_store::hg_import:: 2>&1 | tee red4-$run.log || rc=1
+          done
+          echo "== summary"
+          grep -h "DIAG-LANDING\|test result\|FAILED\|panicked" red4-*.log | head -600
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: red4-windows-x86_64
+          path: red4-*.log
+  arm64:
+    name: hg_import DIAG-LANDING (windows-11-arm)
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the daemon's unit tests
+        run: cargo test -p slates-server --lib --no-run
+      - name: Three runs of the hg_import unit tests, printing DIAG-LANDING
+        shell: bash
+        run: |
+          set -o pipefail
+          rc=0
+          for run in 1 2 3; do
+            echo "== run $run $(date -u +%T)"
+            cargo test -p slates-server --lib -- --test-threads=1 --nocapture vcs_store::hg_import:: 2>&1 | tee red4-$run.log || rc=1
+          done
+          echo "== summary"
+          grep -h "DIAG-LANDING\|test result\|FAILED\|panicked" red4-*.log | head -600
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: red4-windows-arm64
+          path: red4-*.log
