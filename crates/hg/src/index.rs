@@ -1208,24 +1208,7 @@ impl HgIndex {
     if row.base == NONE {
       return object_text(store, &row.bytes, row.len);
     }
-    let mut chain = vec![row];
-    let mut at = row.base;
-    let mut over: Option<&[u8]> = None;
-    // Each base is before its revision, so the walk takes at most `rev` steps.
-    while let Some(link) = self.revision(store, log, at) {
-      if let Some(text) = given_text(&link.node) {
-        over = Some(text);
-        break;
-      }
-      chain.push(link);
-      if link.base == NONE {
-        break;
-      }
-      if link.base >= at {
-        return None;
-      }
-      at = link.base;
-    }
+    let (mut chain, over) = self.chain_below(store, log, row, given_text)?;
     // Each delta is applied into the other of two text buffers and read into one reused delta buffer from the store's
     // windows (main's order of 2026-11-20, Ada's no-allocation rule): a chain costs the two longest texts and its
     // longest delta, never a text and a delta a link. A chain is up to its text's length of deltas, so a text a link
@@ -1260,6 +1243,35 @@ impl HgIndex {
     buffers.next = next;
     rebuilt?;
     (crate::read::to_u64(text.len()) == row.len).then_some(text)
+  }
+
+  /// The delta chain of `log` below `row`, `row` first: each base's row down to the nearest whole revision, or to the
+  /// nearest one whose text is `given` by node, which ends the chain as its text instead ([`HgIndex::revision_text_over`]).
+  /// `None` where a base does not come before its revision. Each base is before its revision, so the walk takes at most
+  /// as many steps as `row`'s revision number.
+  fn chain_below<'g>(
+    &self,
+    store: &ContentStore,
+    log: Log<'_>,
+    row: RevisionRow,
+    given_text: impl Fn(&Node) -> Option<&'g [u8]>,
+  ) -> Option<(Vec<RevisionRow>, Option<&'g [u8]>)> {
+    let mut chain = vec![row];
+    let mut at = row.base;
+    while let Some(link) = self.revision(store, log, at) {
+      if let Some(text) = given_text(&link.node) {
+        return Some((chain, Some(text)));
+      }
+      chain.push(link);
+      if link.base == NONE {
+        break;
+      }
+      if link.base >= at {
+        return None;
+      }
+      at = link.base;
+    }
+    Some((chain, None))
   }
 
   /// Writes a group's planned rows, sorted by key, as one batch.
