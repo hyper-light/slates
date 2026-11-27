@@ -417,6 +417,10 @@ impl Lacked<'_> {
     };
     let mut bytes = Vec::new();
     for window in self.content.windows(&file.content) {
+      // A window let go, or not held: refused unread, never a blob made of a short file.
+      let Ok(window) = window else {
+        return Err(Unmade::Unread { path });
+      };
       bytes.extend_from_slice(&window);
     }
     self.objects.push((Kind::Blob, id, bytes));

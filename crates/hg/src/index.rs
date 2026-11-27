@@ -1199,7 +1199,7 @@ impl HgIndex {
     // none is begun and no chain gathered (main's churn at e51d998bf: hg's 57k clone allocated 5.51 GB of texts and 0.79
     // GB of chains reading manifests the store had let go, about a manifest a changeset, none of them made). An object
     // the store holds no entry for (the empty one) is read as before.
-    if store.contains(&row.bytes) && store.windows(&row.bytes).next().is_none() {
+    if store.contains(&row.bytes) && !matches!(store.windows(&row.bytes).next(), Some(Ok(_))) {
       return None;
     }
     if let Some(block) = row.block {
@@ -1247,7 +1247,8 @@ impl HgIndex {
     let rebuilt = chain.iter().rev().try_for_each(|step| {
       buffers.delta.clear();
       for window in store.windows(&step.bytes) {
-        buffers.delta.extend_from_slice(&window);
+        // A delta window let go: the text is none here, never rebuilt over a short delta.
+        buffers.delta.extend_from_slice(&window.ok()?);
       }
       if crate::read::to_u64(buffers.delta.len()) != step.stored {
         return None;
@@ -1506,10 +1507,12 @@ fn framed_text(
   (block, bytes): (&ContentId, &ContentId),
   len: u64,
 ) -> Option<Vec<u8>> {
-  let block: Vec<u8> = store
-    .windows(block)
-    .flat_map(|window| window.into_owned())
-    .collect();
+  // A block window let go is a text not here, never a block framed short (the 57k push's hang's shape).
+  let mut block_bytes: Vec<u8> = Vec::new();
+  for window in store.windows(block) {
+    block_bytes.extend_from_slice(&window.ok()?);
+  }
+  let block = block_bytes;
   let markers = crate::read::to_u64(crate::filerev::MARKER.len()).checked_mul(2)?;
   let framing = crate::read::to_u64(block.len()).checked_add(markers)?;
   let bytes = object_text(store, bytes, len.checked_sub(framing)?)?;
@@ -1529,10 +1532,12 @@ fn object_text(store: &ContentStore, root: &ContentId, len: u64) -> Option<Vec<u
   let Some(first) = windows.next() else {
     return (len == 0).then(Vec::new);
   };
+  // A window let go, or not held: none here, nothing allocated where it is the first.
+  let first = first.ok()?;
   let mut text = Vec::with_capacity(usize::try_from(len).ok()?);
   text.extend_from_slice(&first);
   for window in windows {
-    text.extend_from_slice(&window);
+    text.extend_from_slice(&window.ok()?);
   }
   (crate::read::to_u64(text.len()) == len).then_some(text)
 }

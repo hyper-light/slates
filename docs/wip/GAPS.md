@@ -2343,6 +2343,11 @@
 > went 6 of 6 under its 360 s bound (113, 98, 119, 108, 108 and 136 s at load 30 to 56), `vcs.hg.push_base_store_reads`
 > 1, 1, 3, 2, 2 and 0 by run, no re-ask; with the deterministic unit red, the hang is called fixed. Record:
 > `~/.local/state/main-01a20182/rounds/hang-final/summary.txt`.
+> Its root made loud (main's ruling of 2026-11-27 04:41; w-perf): `ContentStore::windows` yields a typed miss
+> (`WindowMiss`) at the first window or list it cannot read, never a short object, and all its readers (hg's render,
+> index, serve, record, chain read and file intake; the server's commits and homes; vcs's blame and `object_bytes`;
+> git's tree, push and views) take it as a refusal or a none their callers already handle. Reds at the store, blame and
+> git's tree, each red with the old silent stop. Record: the hang's bug record, its siblings section.
 > C1 (2), second piece BUILT (main's ruling (B') of 2026-11-24): a push's manifest is taken a window a step and never
 > whole. Its text is made by `delta::Patching` over its base read front to back over its chain (`push::chain_read`, the
 > chain's deltas loaded: at most the base's length, A-729's bound); its lines checked and its written entries found as it

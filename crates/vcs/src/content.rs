@@ -171,6 +171,10 @@ pub enum ContentRefused {
     /// The bytes the request needed.
     need: u64,
   },
+  /// A window or list of the content could not be read ([`WindowMiss`]): let go and not brought back, or a node the
+  /// store does not hold. Its reader brings it back where its path can, else refuses (main's ruling of 2026-11-27:
+  /// never a short content read as whole).
+  Missed(WindowMiss),
 }
 
 /// A window kept by a [`WindowStorage`]: the handle the storage names it by, opaque to the store.
@@ -2267,14 +2271,18 @@ impl ContentStore {
     self.entries.get(identity).map(|held| held.form)
   }
 
-  /// An object's windows in order, read from its root ([`ContentStore::put_object`]). A tree the store no longer holds
-  /// whole ends the walk early, so a reader holds the object's length (its row's) against what it read.
+  /// An object's windows in order, read from its root ([`ContentStore::put_object`]). Where the store no longer holds
+  /// the tree whole, the walk yields a typed miss ([`WindowMiss`]) at the first window or list it cannot read, and
+  /// nothing after (main's ruling of 2026-11-27): until then it ended early without a word, and a reader that did not
+  /// hold the object's length against what it read took a short object for a whole one (the 57k hg push's intake hang,
+  /// docs/bugs/2026-11-27-a-file-base-framed-without-its-let-go-block-was-asked-again-without-end.md).
   pub fn windows(&self, root: &ContentId) -> Windows<'_> {
     let root = &self.resolve(root);
     Windows {
       store: self,
       stack: Vec::new(),
       root: Some(*root),
+      missed: false,
     }
   }
 
@@ -2473,7 +2481,7 @@ impl ContentStore {
   pub fn object_bytes(&self, root: &ContentId, len: u64) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     for window in self.windows(root) {
-      bytes.extend_from_slice(&window);
+      bytes.extend_from_slice(&window.ok()?);
     }
     (u64::try_from(bytes.len()).ok()? == len).then_some(bytes)
   }
@@ -2688,7 +2696,25 @@ impl<'a> DerivedNode<'a> {
   }
 }
 
-/// An object's windows in order ([`ContentStore::windows`]).
+/// Why an object's window could not be read ([`ContentStore::windows`]): a typed miss, never a short object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowMiss {
+  /// The window was let go ([`ContentStore::let_go`]) and not brought back: its bytes are the node's store's to give.
+  Away(ContentId),
+  /// The store holds no entry for this node of the tree, or could not read it.
+  Unread(ContentId),
+}
+
+impl WindowMiss {
+  /// The node of the tree that could not be read.
+  pub fn identity(&self) -> ContentId {
+    match self {
+      WindowMiss::Away(identity) | WindowMiss::Unread(identity) => *identity,
+    }
+  }
+}
+
+/// An object's windows in order ([`ContentStore::windows`]), or a typed miss at the first it cannot read.
 #[derive(Debug)]
 pub struct Windows<'s> {
   store: &'s ContentStore,
@@ -2696,6 +2722,8 @@ pub struct Windows<'s> {
   stack: Vec<(&'s [u8], usize)>,
   /// The root, until it is read.
   root: Option<ContentId>,
+  /// Whether a miss was yielded: nothing is read after it.
+  missed: bool,
 }
 
 impl Windows<'_> {
@@ -2730,20 +2758,41 @@ impl Windows<'_> {
 }
 
 impl<'s> Iterator for Windows<'s> {
-  type Item = Cow<'s, [u8]>;
+  type Item = Result<Cow<'s, [u8]>, WindowMiss>;
 
-  fn next(&mut self) -> Option<Cow<'s, [u8]>> {
+  fn next(&mut self) -> Option<Result<Cow<'s, [u8]>, WindowMiss>> {
+    if self.missed {
+      return None;
+    }
+    let read = self.read_next()?;
+    self.missed = read.is_err();
+    Some(read)
+  }
+}
+
+impl<'s> Windows<'s> {
+  /// The next window's bytes, or the miss at the first node of the tree it cannot read; none once every list is read.
+  fn read_next(&mut self) -> Option<Result<Cow<'s, [u8]>, WindowMiss>> {
     loop {
       let identity = self.next_identity()?;
-      let held = self.store.entries.get(&identity)?;
+      let Some(held) = self.store.entries.get(&identity) else {
+        return Some(Err(WindowMiss::Unread(identity)));
+      };
       if held.form != Form::List {
-        return match &held.kept {
-          Kept::Here(bytes) => Some(Cow::Borrowed(bytes)),
-          Kept::Stored { window, .. } => self.store.storage.read(*window),
-          Kept::Away { .. } => None,
-        };
+        return Some(match &held.kept {
+          Kept::Here(bytes) => Ok(Cow::Borrowed(bytes)),
+          Kept::Stored { window, .. } => self
+            .store
+            .storage
+            .read(*window)
+            .ok_or(WindowMiss::Unread(identity)),
+          Kept::Away { .. } => Err(WindowMiss::Away(identity)),
+        });
       }
-      self.stack.push((held.here()?, 0));
+      let Some(list) = held.here() else {
+        return Some(Err(WindowMiss::Unread(identity)));
+      };
+      self.stack.push((list, 0));
     }
   }
 }
@@ -3040,7 +3089,8 @@ mod tests {
       ] {
         let bytes: Vec<u8> = (0..len).map(|at| u8::try_from(at % 251).unwrap()).collect();
         let root = store.put_object(&bytes).unwrap();
-        let walked: Vec<std::borrow::Cow<'_, [u8]>> = store.windows(&root).collect();
+        let walked: Vec<std::borrow::Cow<'_, [u8]>> =
+          store.windows(&root).collect::<Result<_, _>>().unwrap();
         let whole = u64::try_from(len).unwrap();
         for (index, expected) in walked.iter().enumerate() {
           let at = u64::try_from(index).unwrap();
@@ -3100,7 +3150,7 @@ mod tests {
     assert!(
       store
         .windows(&root)
-        .all(|window| matches!(window, Cow::Owned(_)))
+        .all(|window| matches!(window, Ok(Cow::Owned(_))))
     );
     assert!(
       store.get(&root).is_some(),
@@ -4143,6 +4193,28 @@ mod tests {
       0,
       "nothing refused at the restart"
     );
+  }
+
+  /// Main's ruling of 2026-11-27 (the 57k hg push's hang: a walk that stopped silently at a window let go framed a file
+  /// base short). Do: put an object several windows long, let its windows go as a landing does, and walk it. Expect the
+  /// walk's first item a typed miss naming the window let go (`WindowMiss::Away`) and nothing after it; the object's
+  /// bytes none. Before: the walk ended at once, as an empty object's would.
+  #[test]
+  fn a_walk_over_an_object_whose_windows_were_let_go_misses_typed_never_short() {
+    let mut store = ContentStore::new(1 << 20, 64).unwrap();
+    let bytes: Vec<u8> = (0..400u32)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    let root = store.put_object(&bytes).unwrap();
+    assert!(store.let_go_object(&root) > 0, "its windows let go");
+    let walked: Vec<Result<std::borrow::Cow<'_, [u8]>, WindowMiss>> =
+      store.windows(&root).collect();
+    assert_eq!(walked.len(), 1, "a miss and nothing after it: {walked:?}");
+    assert!(
+      matches!(walked[0], Err(WindowMiss::Away(_))),
+      "the window let go named: {walked:?}"
+    );
+    assert_eq!(store.object_bytes(&root, 400), None);
   }
 
   /// A-724 piece 4. Do: let go a landed window, then put the same bytes again (a new push bringing them). Expect: the put

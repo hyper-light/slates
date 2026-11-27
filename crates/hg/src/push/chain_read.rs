@@ -238,6 +238,10 @@ fn read_object(
 ) -> Option<core::ops::Range<usize>> {
   let start = buffer.len();
   for window in store.windows(root) {
+    let Ok(window) = window else {
+      buffer.truncate(start);
+      return None;
+    };
     buffer.extend_from_slice(&window);
   }
   if to_u64(buffer.len().saturating_sub(start)) != len {
