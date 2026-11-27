@@ -874,8 +874,8 @@
 > where one has. `landing.apply`'s remaining unit
 > was its begin's plan of a replay's reads (4.46 ms debug), made since only where a run is unread; a replay's plan and
 > the scan of the runs are still one unit each, owed their slicing. Next, by size:
-> `stage.judging` (5.8 ms debug, move: a directory removal's children are counted a unit a step since; the resolution's
-> end, `split_copies`, 5.86 ms whole, is left), `stage.recording` (5.0-5.3) and `stage.check` (3.8-4.2); the landing's
+> `stage.judging` is out of move's leaders since a directory removal's children are counted and the resolution's end
+> taken an entry a unit; `stage.recording` (5.0-5.3) and `stage.check` (3.8-4.2); the landing's
 > publication (9.3-24.8 ms since today's merges) is A-930's image cut, w-perf's. Each section left is owed its release size: a staging step 29-30 ms in debug (copy and move), the tail's end
 > 13-21, the storing's begin and `texts_carried` 14-19 each, `record_landed`'s op 9.7-16. Owed:
 > the release reads of all of these (probe 9). Unmeasured siblings of 6a's whole release of a scratch member (`Greens::retire_preview`

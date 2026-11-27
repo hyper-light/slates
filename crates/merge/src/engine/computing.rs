@@ -33,6 +33,8 @@ enum ComputePhase {
   Ended(Option<Result<Computed, ComputeRefused>>),
   /// Resolving the ops from the next one.
   Resolving(usize, Box<Resolved>),
+  /// The resolution's end, an entry a unit ([`super::finishing::Finishing`]; A-920: 5.86 ms whole at 9,000 paths, debug).
+  Finishing(Box<(Resolved, super::finishing::Finishing)>),
   /// Deciding the units.
   Deciding(Box<(Resolved, Deciding, position::Units)>),
   /// What the units reach, a unit a unit ([`Reached::of`]'s walk; A-920 piece 3f).
@@ -100,6 +102,7 @@ impl core::fmt::Debug for ComputePhase {
     match self {
       ComputePhase::Ended(answer) => f.debug_tuple("Ended").field(answer).finish(),
       ComputePhase::Resolving(at, _) => f.debug_tuple("Resolving").field(at).finish(),
+      ComputePhase::Finishing(_) => f.write_str("Finishing"),
       ComputePhase::Deciding(_) => f.write_str("Deciding"),
       ComputePhase::Reaching(reaching) => f
         .debug_tuple("Reaching")
@@ -216,6 +219,7 @@ impl Green {
     match &mut computing.phase {
       ComputePhase::Ended(answer) => answer.take(),
       ComputePhase::Resolving(..) => self.resolving_step(inc, computing, spent),
+      ComputePhase::Finishing(_) => self.finishing_step(computing, spent),
       ComputePhase::Deciding(_) => self.deciding_step(inc, computing, spent),
       ComputePhase::Reaching(_) => Green::reaching_step(inc, computing, spent),
     }
@@ -234,13 +238,50 @@ impl Green {
     if !Green::resolve_some(inc, (resolved, at), spent) {
       return None;
     }
-    let mut resolved = core::mem::take(resolved);
-    resolved.finish_resolving();
+    let resolved = core::mem::take(resolved);
+    computing.phase = ComputePhase::Finishing(Box::new((
+      *resolved,
+      super::finishing::Finishing::default(),
+    )));
+    None
+  }
+
+  /// One step of the resolution's end, an entry a unit until `spent`; once it is whole, the copies checked and the
+  /// decision begun.
+  fn finishing_step(
+    &self,
+    computing: &mut Computing,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Option<Result<Computed, ComputeRefused>> {
+    let ComputePhase::Finishing(finishing) = &mut computing.phase else {
+      return None;
+    };
+    let (resolved, end) = &mut **finishing;
+    let mut taken = 0u64;
+    let whole = loop {
+      taken = taken.saturating_add(1);
+      if end.step(resolved) {
+        break true;
+      }
+      if spent() {
+        break false;
+      }
+    };
+    self.resolution_end_noted(taken);
+    if !whole {
+      return None;
+    }
+    let ComputePhase::Finishing(finished) =
+      core::mem::replace(&mut computing.phase, ComputePhase::Ended(None))
+    else {
+      return None;
+    };
+    let (resolved, _) = *finished;
     if let Some((path, case)) = self.copy_refusal(&resolved) {
       return Some(Err(ComputeRefused::CopyRefused { path, case }));
     }
     computing.phase = ComputePhase::Deciding(Box::new((
-      *resolved,
+      resolved,
       Deciding::default(),
       position::Units::first(),
     )));

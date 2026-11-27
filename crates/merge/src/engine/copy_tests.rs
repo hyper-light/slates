@@ -2868,3 +2868,44 @@ fn the_copy_entry_room_from_the_copy_ops_alone_is_the_whole_resolutions() {
   );
   assert_eq!(rooms[3].0, 0, "an increment with no copy asks no room");
 }
+
+/// Shape: the files a wide work with a copy makes inside the copy's tree, and as many outside it.
+const SPLIT_FILES: usize = 300;
+
+/// A-920 (a resolution's end an entry a unit). Do: on `trunk`, compute, whole and a unit a step, one work copying `trunk`
+/// to `b` and making [`SPLIT_FILES`] files under `b` and as many outside it. Expect both accepted with the same effects
+/// recorded, and a unit a step, the resolution's end one entry a unit (`Green::resolution_ends`). Before, the end split
+/// every container of the resolution whole in one call (5.86 ms debug at 9,000 paths), each path tested against every
+/// copy's destination.
+#[test]
+fn a_resolutions_end_with_a_copy_is_taken_an_entry_a_unit() {
+  let green = trunk();
+  let mut work = Work::exclusive();
+  work.copy("trunk", "b", 1);
+  for at in 0..SPLIT_FILES {
+    work.create(&format!("b/n{at}"), b"in");
+    work.create(&format!("o{at}"), b"out");
+  }
+  let inc = work.at(2, 1);
+  let whole = green.compute(&inc).expect("computed whole");
+  let before = green.resolution_ends();
+  let mut computing = green.begin_computing(&inc);
+  let sliced = loop {
+    if let Some(computed) = green.computing_step(&inc, &mut computing, &mut || true) {
+      break computed.expect("computed a unit a step");
+    }
+  };
+  let after = green.resolution_ends();
+  let (entries, units) = (after.0 - before.0, after.1 - before.1);
+  let recorded = whole.applied().expect("accepted whole");
+  assert!(
+    recorded.len() > 2 * SPLIT_FILES,
+    "{} effects",
+    recorded.len()
+  );
+  assert_eq!(sliced.applied(), Some(recorded));
+  assert!(
+    entries > 2 * SPLIT_FILES as u64 && units == entries,
+    "{entries} entries in {units} units"
+  );
+}
