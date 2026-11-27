@@ -886,3 +886,9 @@
   B6/B7 closed on the server path: commit 4c0b3e2c5 (Verdicts::one_call_builds counter, 0 over B1's push), focused
   running, tip to main for the 16. NEXT: B8 (the encoding's tree walk, time not correctness), then (d) the replica red,
   the flip with C5's 2N + O×R + W, C4, P1, P2.
+- 11-27 04:57 PST: LANDED B6 00a1bd150..65f664d87 (B6/B7 closed on the server path; Verdicts::one_call_builds counted, 0 over B1's
+  push; main's 16/16 at 4c0b3e2c5). B8 BUILT 2cde8d4f3 (agents/w-git-b8): the encoding's tree walk stops at a let-go
+  tree and walks the pair again (red b8_an_encodings_tree_walk_stops_at_a_let_go_tree_and_keeps_the_same_fragments:
+  Unreadable before; clone byte-identical after); git lib 630/630, server focused 295/295; in main's 16, push held for
+  the verdict. Sibling left OPEN by main's ruling (Encoding::stop_at keyed by place). NEXT: (d) the replica red, then
+  the flip with C5's 2N + O×R + W, C4, P1, P2.
