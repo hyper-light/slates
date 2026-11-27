@@ -3533,3 +3533,326 @@ fn round4_blocker2_http_dav_reports_and_propfind_enforce_per_path_deny_read() {
     "disjoint Read/Submit POST /!svn/me must be 403"
   );
 }
+
+/// Single-threaded slot holding the active DAV commit transaction for `MergeHookStores`.
+type HeldDavCommit = std::cell::RefCell<Option<(String, slates_svn::dav::commit::DavCommit)>>;
+
+/// Pure in-memory `SvnStores` for HTTP `MERGE` pre-commit ordering tests (zero `TestStore`/daemon).
+#[derive(Clone)]
+struct MergeHookStores {
+  records: &'static slates_svn::migration::Repository,
+  commit: &'static HeldDavCommit,
+}
+
+impl MergeHookStores {
+  fn build() -> Self {
+    let mut records = slates_svn::migration::Repository::new(
+      slates_svn::dump::Uuid::parse(UUID.as_bytes()).unwrap(),
+      DATE.as_bytes(),
+      slates_svn::migration::Room {
+        entries: 1 << 10,
+        bytes: 1 << 20,
+      },
+    )
+    .unwrap();
+    let seed = slates_svn::commit::revision::Revision {
+      head: 0,
+      record: RevisionRecord {
+        transaction: "0-1".to_owned(),
+        changes: vec![
+          added_row("/pub", NodeKind::Directory, None),
+          added_row("/pub/ok.txt", NodeKind::File, None),
+          added_row("/pub/secret", NodeKind::Directory, None),
+          added_row("/pub/secret/vault.txt", NodeKind::File, None),
+          added_row("/trunk", NodeKind::Directory, None),
+          added_row("/trunk/ok.txt", NodeKind::File, None),
+        ],
+      },
+      properties: BTreeMap::from([
+        (b"svn:author".to_vec(), b"alice".to_vec()),
+        (b"svn:date".to_vec(), DATE.as_bytes().to_vec()),
+        (b"svn:log".to_vec(), b"seed".to_vec()),
+      ]),
+      contents: BTreeMap::new(),
+      stored: BTreeMap::new(),
+      lock_entries: Vec::new(),
+    };
+    records.commit(seed).unwrap();
+    Self {
+      records: Box::leak(Box::new(records)),
+      commit: Box::leak(Box::new(std::cell::RefCell::new(None))),
+    }
+  }
+}
+
+impl SvnStores for MergeHookStores {
+  type Repository<'a> = crate::vcs_store::svn_texts::SvnView<'a>;
+  type Hold = RepositoryId;
+
+  fn holds(&self, id: RepositoryId) -> bool {
+    id == REPO
+  }
+
+  fn hold(&mut self, id: RepositoryId) -> Option<RepositoryId> {
+    self.holds(id).then_some(id)
+  }
+
+  fn lend_held<T>(
+    &mut self,
+    hold: &RepositoryId,
+    principal: &Principal,
+    step: impl FnOnce(&Lent<'_, Self::Repository<'_>>) -> T,
+  ) -> Option<T> {
+    self.lend(*hold, principal, step)
+  }
+
+  fn lend<T>(
+    &mut self,
+    id: RepositoryId,
+    _principal: &Principal,
+    step: impl FnOnce(&Lent<'_, Self::Repository<'_>>) -> T,
+  ) -> Option<T> {
+    if id != REPO {
+      return None;
+    }
+    let texts = crate::vcs_store::svn_texts::HeadTexts {
+      green: None,
+      store: None,
+      records: self.records,
+      pieces: None,
+    };
+    let view = slates_svn::migration::WithTexts {
+      records: self.records,
+      texts: &texts,
+    };
+    Some(step(&Lent {
+      index: self.records.index(),
+      repository: &view,
+      uuid: UUID,
+      locks: self.records.locks(),
+      rules: None,
+      now: NOW,
+    }))
+  }
+
+  fn begin_commit(
+    &mut self,
+    id: RepositoryId,
+    _principal: &Principal,
+    setup_of: impl FnOnce(String, AprTime) -> slates_svn::commit::drive::Setup,
+  ) -> Option<
+    Result<(String, Option<slates_svn::commit::drive::Due>), slates_svn::dav::locking::HttpAnswer>,
+  > {
+    if id != REPO {
+      return None;
+    }
+    let name = "1-1".to_owned();
+    let texts = Box::new(slates_svn::commit::drive::HeldTexts::new());
+    let setup = setup_of(name.clone(), NOW);
+    let head = crate::vcs_store::svn_texts::HeadTexts {
+      green: None,
+      store: None,
+      records: self.records,
+      pieces: None,
+    };
+    let view = slates_svn::migration::WithTexts {
+      records: self.records,
+      texts: &head,
+    };
+    let world = slates_svn::dav::commit::World {
+      index: self.records.index(),
+      green: &view,
+      locks: self.records.locks(),
+    };
+    let (commit, due) = match slates_svn::dav::commit::DavCommit::begin_hooked(setup, &world, texts)
+    {
+      Ok(begun) => begun,
+      Err(refused) => return Some(Err(refused)),
+    };
+    *self.commit.borrow_mut() = Some((name.clone(), commit));
+    Some(Ok((name, due)))
+  }
+
+  fn on_commit<T>(
+    &mut self,
+    id: RepositoryId,
+    _principal: &Principal,
+    name: &str,
+    step: impl FnOnce(
+      &mut slates_svn::dav::commit::DavCommit,
+      &slates_svn::dav::commit::World<'_, crate::vcs_store::svn_texts::SvnView<'_>>,
+    ) -> T,
+  ) -> Option<Option<T>> {
+    if id != REPO {
+      return None;
+    }
+    let mut slot = self.commit.borrow_mut();
+    let Some((held_name, commit)) = slot.as_mut() else {
+      return Some(None);
+    };
+    if held_name != name {
+      return Some(None);
+    }
+    let head = crate::vcs_store::svn_texts::HeadTexts {
+      green: None,
+      store: None,
+      records: self.records,
+      pieces: None,
+    };
+    let view = slates_svn::migration::WithTexts {
+      records: self.records,
+      texts: &head,
+    };
+    let world = slates_svn::dav::commit::World {
+      index: self.records.index(),
+      green: &view,
+      locks: self.records.locks(),
+    };
+    Some(Some(step(commit, &world)))
+  }
+}
+
+struct HookedPolicyHeld {
+  policy: RepositoryPolicy,
+}
+
+impl Repositories for HookedPolicyHeld {
+  fn locate(&self, _name: &str) -> Located {
+    Located::Here
+  }
+
+  fn find(&self, name: &str) -> Option<RepositoryRecord> {
+    (name == "repo").then(|| RepositoryRecord {
+      index_bits: 0,
+      id: REPO,
+      name: "repo".to_owned(),
+      tool: VcsTool::Subversion,
+      format: ObjectFormat::Revisions,
+      default_branch: None,
+      owner: principal(OWNER),
+      policy: self.policy.clone(),
+    })
+  }
+}
+
+fn drive_merge_exchange(
+  site: &mut SvnSite<Tokens, HookedPolicyHeld, MergeHookStores>,
+  method: &str,
+  target: &str,
+  headers: &[&str],
+  body: &[u8],
+) -> (Status, String) {
+  let req = request(method, target, headers);
+  let decided = ready(site.answer(&head(&req)));
+  let Answer::Serve { mut exchange, .. } = decided.answer else {
+    panic!("{method} {target}: expected Answer::Serve");
+  };
+  let mut out = Vec::new();
+  ready(async {
+    if !body.is_empty() {
+      exchange.body(body).await.unwrap();
+    }
+    exchange.body_end(ClientGone::never()).await.unwrap();
+    while exchange.reply(&mut out, ClientGone::never()).await.unwrap() {}
+  });
+  (exchange.reply_status(), String::from_utf8(out).unwrap())
+}
+
+fn run_dav_delete_merge(
+  site: &mut SvnSite<Tokens, HookedPolicyHeld, MergeHookStores>,
+  auth: &str,
+  delete_path: &str,
+) -> (Status, String) {
+  let (post_status, post_body) = drive_merge_exchange(
+    site,
+    "POST",
+    "/repo/!svn/me",
+    &[auth, "Content-Type: application/vnd.svn-skel"],
+    b"( create-txn )",
+  );
+  assert_eq!(post_status, Status::CREATED, "POST !svn/me: {post_body}");
+  let (del_status, _) = drive_merge_exchange(
+    site,
+    "DELETE",
+    &format!("/repo/!svn/txr/1-1{delete_path}"),
+    &[auth, "X-SVN-Version-Name: 1"],
+    b"",
+  );
+  assert_eq!(del_status, Status::NO_CONTENT);
+  let merge_body = b"<?xml version=\"1.0\" encoding=\"utf-8\"?><D:merge xmlns:D=\"DAV:\">\
+<D:source><D:href>/repo/!svn/txn/1-1</D:href></D:source><D:no-auto-merge/></D:merge>";
+  drive_merge_exchange(
+    site,
+    "MERGE",
+    "/repo",
+    &[auth, "Content-Type: text/xml"],
+    merge_body,
+  )
+}
+
+/// Round-5 Suggestion 1 (HTTP `MERGE` authz before `pre-commit` hook): Do configure a repository
+/// with `SvnPreCommit` hook, `Allow Read /`, `Allow Submit /`, and `Deny Read /pub/secret`, then
+/// submit two HTTP `MERGE` commits as stranger: (1) deleting `/pub` (which contains denied
+/// descendant `/pub/secret/vault.txt`, passing per-request `DELETE` head authz) and (2) deleting
+/// `/trunk` (all descendants allowed). Expect: (1) is refused `403 Forbidden` (`errcode="170001"`)
+/// BEFORE running `SvnPreCommit`; (2) passes `admit_svn_changes` and reaches `SvnPreCommit`
+/// (returning `501`/`200007` outside a hook-granted shard).
+#[test]
+fn round5_suggestion1_http_merge_checks_authz_before_pre_commit_hook() {
+  use slates_db::catalog::{
+    HookConfig, HookPointName, PolicyEffect, PolicyNames, PolicyRight, PolicyRule, PolicyWho,
+  };
+  let rule = |pattern: &str, right: PolicyRight, effect: PolicyEffect| PolicyRule {
+    names: PolicyNames::Paths,
+    pattern: pattern.to_owned(),
+    right,
+    effect,
+    who: PolicyWho::Anyone,
+  };
+  let policy = RepositoryPolicy {
+    version: 1,
+    rules: vec![
+      rule("/", PolicyRight::Read, PolicyEffect::Allow),
+      rule("/", PolicyRight::Submit, PolicyEffect::Allow),
+      rule("/pub/secret", PolicyRight::Read, PolicyEffect::Deny),
+    ],
+    hooks: vec![HookConfig {
+      point: HookPointName::SvnPreCommit,
+      name: "pre-commit".to_owned(),
+      program: "/bin/true".to_owned(),
+    }],
+    hooks_env: Vec::new(),
+    signers: Vec::new(),
+    hg_publishing: true,
+  };
+  let mut site = SvnSite::new(
+    REALM.to_owned(),
+    ROOM,
+    Tokens,
+    HookedPolicyHeld { policy },
+    MergeHookStores::build(),
+  );
+  let stranger = basic("bob", STRANGER_TOKEN);
+
+  let (denied_status, denied_body) = run_dav_delete_merge(&mut site, &stranger, "/pub");
+  assert_eq!(
+    denied_status,
+    Status::FORBIDDEN,
+    "denied subtree MERGE must return 403 before pre-commit hook: {denied_body}"
+  );
+  assert!(
+    denied_body.contains("errcode=\"170001\""),
+    "expected NOT_AUTHORIZED 170001, got: {denied_body}"
+  );
+
+  let (allowed_status, allowed_body) = run_dav_delete_merge(&mut site, &stranger, "/trunk");
+  assert_eq!(
+    allowed_status,
+    Status::NOT_IMPLEMENTED,
+    "allowed subtree MERGE must proceed to SvnPreCommit hook: {allowed_body}"
+  );
+  assert!(
+    allowed_body.contains("errcode=\"200007\""),
+    "expected hook refusal 200007 when authorized commit reaches pre-commit: {allowed_body}"
+  );
+}

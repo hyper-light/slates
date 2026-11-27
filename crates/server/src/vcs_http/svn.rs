@@ -1528,8 +1528,110 @@ impl<S: SvnStores> SvnExchange<S> {
     revprops::revision_proppatched(&changes)
   }
 
-  /// A MERGE of the transaction its body names: closed, judged, landed through the owner's step, answered with the new
-  /// revision (`merge.c` `dav_svn__merge_response`).
+  /// Resolves the transaction name from a MERGE `<D:source>` path (`!svn/txn/NAME` or DeltaV v1
+  /// `!svn/act/ACTIVITY`).
+  fn merge_transaction_name(&mut self, source: &str) -> Result<String, HttpAnswer> {
+    let segments: Vec<&str> = source.split('/').filter(|name| !name.is_empty()).collect();
+    match segments.as_slice() {
+      [first, "txn", name] if *first == site::SPECIAL => Ok((*name).to_owned()),
+      // DeltaV v1 merges its activity (A-766 part 2).
+      [first, "act", activity] if *first == site::SPECIAL => self
+        .transaction_of_activity(activity)
+        .ok_or_else(|| commit::no_such_transaction(activity)),
+      _ => Err(commit::unserved(
+        "A MERGE of something but a transaction or an activity",
+      )),
+    }
+  }
+
+  /// Runs `HookPoint::SvnPreCommit` for an authorized HTTP MERGE transaction, returning `Some`
+  /// refusal when the hook rejects or the client disconnects.
+  async fn run_pre_commit_hook(
+    &self,
+    due: Due,
+    base: u64,
+    presented: Vec<(String, String)>,
+    gone: ClientGone<'_>,
+  ) -> Option<HttpAnswer> {
+    let named = match due {
+      Due::StartCommit { transaction } | Due::PreCommit { transaction } => transaction,
+    };
+    let tokens: Vec<LockToken> = presented
+      .into_iter()
+      .map(|(path, token)| LockToken { path, token })
+      .collect();
+    let ran = run_hook(
+      HookSite::Http(gone, &self.policy),
+      &self.hooked(),
+      to_usize(self.request_room),
+      HookPoint::SvnPreCommit,
+      |env, repos| vcs_hooks::svn_pre_commit(PendingView(base), env, repos, &named, &tokens),
+    )
+    .await;
+    match ran.verdict {
+      Some(Ok(())) => None,
+      Some(Err(chain)) => Some(hook_refused(&chain)),
+      None => Some(hook_refused(&[(
+        UNSUPPORTED_FEATURE,
+        CLIENT_LEFT_WORDS.to_owned(),
+      )])),
+    }
+  }
+
+  /// Closes and judges transaction `name`, evaluating `admit_svn_changes` against the transaction's
+  /// base head and changed paths before any `pre-commit` hook runs.
+  fn step_merge_transaction(
+    &mut self,
+    name: &str,
+    target: &str,
+    keep: bool,
+    tokens: &[(String, String)],
+  ) -> Result<SteppedMerge, HttpAnswer> {
+    let (owner, policy) = (&self.owner, &self.policy);
+    let stepped = self
+      .stores
+      .on_commit(self.repository, &self.principal, name, |commit, world| {
+        for (path, token) in tokens {
+          commit.present(&format!("{}/{path}", target.trim_end_matches('/')), token);
+        }
+        commit.keep_locks(keep);
+        let step = commit.merge_hooked(world);
+        let base = commit.pending_base();
+        let presented = commit.pending_tokens();
+        let (merged, due) = match step {
+          MergeStep::Done(merged) => (merged, None),
+          MergeStep::Hook(due) => (commit.resume_merge(world, Ok(())), Some(due)),
+        };
+        let authorized = match &merged {
+          Merged::Accepted(work, _) => vcs_policy::admit_svn_changes(
+            owner,
+            policy,
+            &self.principal,
+            (world.index, work.head),
+            &work.record.changes,
+          )
+          .is_ok(),
+          Merged::Refused(_) => true,
+        };
+        SteppedMerge {
+          merged,
+          due,
+          authorized,
+          base,
+          presented,
+        }
+      });
+    match stepped {
+      Some(Some(stepped)) => Ok(stepped),
+      Some(None) => Err(commit::no_such_transaction(name)),
+      None => Err(commit::unserved("Commits")),
+    }
+  }
+
+  /// A MERGE of the transaction its body names: closed, judged, authorized per-path BEFORE
+  /// `HookPoint::SvnPreCommit`, landed through the owner's step (which re-checks live shard
+  /// authorization inside `authorize_work_in`), and answered with the new revision (`merge.c`
+  /// `dav_svn__merge_response`).
   async fn merge(&mut self, gone: ClientGone<'_>) -> HttpAnswer {
     let bounds = xml_bounds(self.request_room);
     let Ok(request) = slates_svn::dav::request::merge(&self.body, &bounds) else {
@@ -1538,17 +1640,9 @@ impl<S: SvnStores> SvnExchange<S> {
     let Some(source) = below_root(&request.source, &self.root) else {
       return commit::unserved("A MERGE of something outside this repository");
     };
-    let segments: Vec<&str> = source.split('/').filter(|name| !name.is_empty()).collect();
-    let name = match segments.as_slice() {
-      [first, "txn", name] if *first == site::SPECIAL => (*name).to_owned(),
-      // DeltaV v1 merges its activity (A-766 part 2).
-      [first, "act", activity] if *first == site::SPECIAL => {
-        match self.transaction_of_activity(activity) {
-          Some(name) => name,
-          None => return commit::no_such_transaction(activity),
-        }
-      }
-      _ => return commit::unserved("A MERGE of something but a transaction or an activity"),
+    let name = match self.merge_transaction_name(&source) {
+      Ok(name) => name,
+      Err(refused) => return refused,
     };
     let target = self.path.clone();
     let keep = self
@@ -1556,93 +1650,44 @@ impl<S: SvnStores> SvnExchange<S> {
       .options
       .as_deref()
       .is_some_and(|options| options.contains(KEEP_LOCKS));
-    let tokens = request.lock_tokens;
-    let stepped =
-      self
-        .stores
-        .on_commit(self.repository, &self.principal, &name, |commit, world| {
-          for (path, token) in &tokens {
-            commit.present(&format!("{}/{path}", target.trim_end_matches('/')), token);
-          }
-          commit.keep_locks(keep);
-          let step = commit.merge_hooked(world);
-          (step, commit.pending_base(), commit.pending_tokens())
-        });
-    let (step, base, presented) = match stepped {
-      Some(Some(stepped)) => stepped,
-      Some(None) => return commit::no_such_transaction(&name),
-      None => return commit::unserved("Commits"),
-    };
-    let merged = match step {
-      MergeStep::Done(merged) => merged,
-      MergeStep::Hook(due) => {
-        // pre-commit, run where `mod_dav_svn` runs it: before the verdict (A-733).
-        let named = match &due {
-          Due::StartCommit { transaction } | Due::PreCommit { transaction } => transaction.clone(),
-        };
-        let tokens: Vec<LockToken> = presented
-          .into_iter()
-          .map(|(path, token)| LockToken { path, token })
-          .collect();
-        let ran = run_hook(
-          HookSite::Http(gone, &self.policy),
-          &self.hooked(),
-          to_usize(self.request_room),
-          HookPoint::SvnPreCommit,
-          |env, repos| vcs_hooks::svn_pre_commit(PendingView(base), env, repos, &named, &tokens),
-        )
-        .await;
-        let answer = ran
-          .verdict
-          .unwrap_or_else(|| Err(vec![(UNSUPPORTED_FEATURE, CLIENT_LEFT_WORDS.to_owned())]));
-        match self
-          .stores
-          .on_commit(self.repository, &self.principal, &name, |commit, world| {
-            commit.resume_merge(world, answer)
-          }) {
-          Some(Some(merged)) => merged,
-          Some(None) => return commit::no_such_transaction(&name),
-          None => return commit::unserved("Commits"),
-        }
-      }
+    let SteppedMerge {
+      merged,
+      due,
+      authorized,
+      base,
+      presented,
+    } = match self.step_merge_transaction(&name, &target, keep, &request.lock_tokens) {
+      Ok(stepped) => stepped,
+      Err(refused) => return refused,
     };
     let (work, texts) = match merged {
       Merged::Accepted(work, texts) => (work, texts),
       Merged::Refused(refused) => return refused,
     };
+    if !authorized {
+      return locking::error_answer(
+        Status::FORBIDDEN.code,
+        true,
+        NOT_AUTHORIZED,
+        "Authorization failed",
+      );
+    }
+    if let Some(due) = due
+      && let Some(refused) = self.run_pre_commit_hook(due, base, presented, gone).await
+    {
+      return refused;
+    }
     self.land_merged(*work, &*texts, gone).await
   }
 
-  /// Enforces per-path Subversion policy on `work`'s changed paths (and affected directory
-  /// subtrees at `work.head` and copy-source revisions), lands `work` on the owner shard, runs
-  /// `post-commit`, and formats the MERGE HTTP response.
+  /// Lands authorized `work` on the owner shard (where `authorize_work_in` re-checks the live
+  /// shard policy and index before committing), runs `post-commit`, and formats the MERGE reply.
   async fn land_merged(
     &mut self,
     work: Work,
     texts: &dyn slates_svn::commit::drive::TextSink,
     gone: ClientGone<'_>,
   ) -> HttpAnswer {
-    let admitted = self.stores.lend(self.repository, &self.principal, |lent| {
-      vcs_policy::admit_svn_changes(
-        &self.owner,
-        &self.policy,
-        &self.principal,
-        (lent.index, work.head),
-        &work.record.changes,
-      )
-    });
-    match admitted {
-      None => return commit::unserved("Commits"),
-      Some(Err(_)) => {
-        return locking::error_answer(
-          Status::FORBIDDEN.code,
-          true,
-          NOT_AUTHORIZED,
-          "Authorization failed",
-        );
-      }
-      Some(Ok(())) => {}
-    }
     let transaction = work.record.transaction.clone();
     // A-740: a shard stuck landing a revision names it.
     let landing = slates_rt::futures::doing("vcs_http::svn::land");
@@ -1676,6 +1721,21 @@ impl<S: SvnStores> SvnExchange<S> {
       None => commit::unserved("Commits"),
     }
   }
+}
+
+/// Outcome of closing, judging, and checking per-path authorization on an HTTP `MERGE` transaction
+/// before any `pre-commit` hook runs.
+struct SteppedMerge {
+  /// Merge judgment (`Accepted` or `Refused`).
+  merged: Merged,
+  /// Pending `pre-commit` hook, if configured on the repository.
+  due: Option<Due>,
+  /// Whether `admit_svn_changes` admitted all changed paths against the base head.
+  authorized: bool,
+  /// Transaction base revision supplied to `SvnPreCommit`.
+  base: u64,
+  /// Lock tokens presented by the transaction for `SvnPreCommit`.
+  presented: Vec<(String, String)>,
 }
 
 impl<S: SvnStores> SvnExchange<S> {

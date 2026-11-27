@@ -39,7 +39,7 @@ pub struct Glob {
 
 /// One step of a compiled pattern (the module doc).
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Token {
+pub enum Token {
   /// This byte.
   Byte(u8),
   /// `?`: one byte other than `/`.
@@ -102,6 +102,11 @@ impl Glob {
       }
     }
     reached.last().copied().unwrap_or(false)
+  }
+
+  /// The compiled tokens of this pattern, in order.
+  pub fn tokens(&self) -> &[Token] {
+    &self.tokens
   }
 
   /// The bytes the compiled pattern keeps beyond its own size: its tokens' room, which holds nothing on the heap of its
@@ -308,10 +313,14 @@ fn class(pattern: &[u8], open: usize, set: &mut ByteSet) -> Option<Member> {
   })
 }
 
+/// Number of 64-bit words in a [`ByteSet`].
+/// Format: 256 byte values represented as four 64-bit words (`256 / 64`).
+pub const BYTE_SET_WORDS: usize = 4;
+
 /// A set of bytes, one bit each.
 /// Shape: the 256 byte values in four 64-bit words.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ByteSet([u64; 4]);
+pub struct ByteSet([u64; BYTE_SET_WORDS]);
 
 /// Format: a byte's word in a [`ByteSet`] is its top two bits (four words of 64 bits hold 256 bytes).
 const WORD_SHIFT: u32 = 6;
@@ -351,8 +360,13 @@ impl ByteSet {
     }
   }
 
+  /// The 256-bit membership table (four 64-bit words; bit `byte & 63` of word `byte >> 6`).
+  pub fn bits(&self) -> &[u64; BYTE_SET_WORDS] {
+    &self.0
+  }
+
   /// Whether `byte` is in the set.
-  fn contains(&self, byte: u8) -> bool {
+  pub fn contains(&self, byte: u8) -> bool {
     let (word, bit) = Self::place(byte);
     self.0.get(word).is_some_and(|word| word & bit != 0)
   }

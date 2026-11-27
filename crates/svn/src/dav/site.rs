@@ -1368,9 +1368,44 @@ fn propfind<R: Repository + ?Sized>(
 const MULTISTATUS_OPEN: &str =
   "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n";
 
+/// One revision's `(name, value)` property pairs borrowed from the served repository.
+type RevisionProperties<'a> = Vec<(&'a [u8], &'a [u8])>;
+
+/// Loads `revision`'s properties filtered by `svn_repos_check_revision_access` so HTTP WebDAV
+/// `PROPFIND` on `!svn/rev/N`, `!svn/bln/N`, and `!svn/vcc/default` matches `svn://` and
+/// `svn+ssh://`: `Full` exposes all revprops, `Partial` exposes `svn:author` and `svn:date` alone,
+/// and `Nothing` exposes none.
+fn filtered_revision_properties<'a, R: Repository + ?Sized>(
+  served: &'a Served<'_, R>,
+  revision: Revision,
+) -> Result<RevisionProperties<'a>, HttpAnswer> {
+  let access =
+    crate::reads::revision_access(served.index, served.rules, revision).map_err(|refusal| {
+      let code = refusal.subversion_code();
+      error_answer(
+        convert_status(code, HTTP_INTERNAL_SERVER_ERROR),
+        true,
+        code,
+        "The repository's index refused the request",
+      )
+    })?;
+  if access == crate::reads::RevisionAccess::Nothing {
+    return Ok(Vec::new());
+  }
+  Ok(
+    served
+      .repository
+      .revision_properties(revision)
+      .unwrap_or_default()
+      .into_iter()
+      .filter(|(name, _)| access.shows(name))
+      .collect(),
+  )
+}
+
 /// A PROPFIND of DeltaV v1's VCC or a baseline (`repos.c` `prep_vcc`, `prep_version`): one response, neither being a
 /// collection, its live properties those its kind has; a baseline's dead properties are its revision's properties
-/// (`deadprops.c`, a baselined resource's), the VCC has none.
+/// (`deadprops.c`, a baselined resource's), the VCC has none, both filtered by [`crate::reads::revision_access`].
 fn private_propfind<R: Repository + ?Sized>(
   served: &Served<'_, R>,
   resource: &Resource,
@@ -1405,10 +1440,10 @@ fn private_propfind<R: Repository + ?Sized>(
     public: false,
     version: false,
   };
-  let revision_properties = served
-    .repository
-    .revision_properties(revision)
-    .unwrap_or_default();
+  let revision_properties = match filtered_revision_properties(served, revision) {
+    Ok(properties) => properties,
+    Err(refused) => return refused,
+  };
   let find = |name: &[u8]| {
     revision_properties
       .iter()

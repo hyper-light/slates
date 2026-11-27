@@ -1446,3 +1446,243 @@ fn hex_of(bytes: &[u8]) -> String {
   push_hex(&mut out, bytes);
   out
 }
+
+/// Owned `(name, value)` revision properties stored for one test revision.
+type OwnedRevprops = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Minimal in-memory repository for testing `PROPFIND` revprop filtering across `Full`, `Partial`,
+/// and `Nothing` revisions.
+struct RevpropRepo {
+  revisions: Vec<OwnedRevprops>,
+}
+
+impl crate::mergeinfo::Contents for RevpropRepo {
+  fn entries(&self, _directory: &str, _revision: Revision) -> Option<Vec<String>> {
+    None
+  }
+
+  fn mergeinfo_value(&self, _properties: &crate::index::ContentIdentity) -> Option<&[u8]> {
+    None
+  }
+}
+
+impl Repository for RevpropRepo {
+  fn revision_properties(&self, revision: Revision) -> Option<Vec<(&[u8], &[u8])>> {
+    let props = self.revisions.get(usize::try_from(revision).ok()?)?;
+    Some(
+      props
+        .iter()
+        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        .collect(),
+    )
+  }
+
+  fn properties(&self, _identity: &crate::index::ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+    None
+  }
+
+  fn text(
+    &self,
+    _identity: &crate::index::ContentIdentity,
+    _offset: u64,
+  ) -> Option<std::borrow::Cow<'_, [u8]>> {
+    None
+  }
+}
+
+fn revprop_test_repo() -> (Index, RevpropRepo, PrincipalRules) {
+  use crate::authz::{PolicySegment, ReadPathRule};
+  use crate::index::{Action, ChangedPath, NodeKind, RevisionRecord};
+  let mut index = Index::new();
+  let add = |path: &str, kind: NodeKind| ChangedPath {
+    path: path.to_owned(),
+    action: Action::Add,
+    kind,
+    copy_from: None,
+    text: None,
+    properties: None,
+    mergeinfo_modified: false,
+  };
+  let revisions_changes = [
+    vec![
+      add("/pub", NodeKind::Directory),
+      add("/pub/full.txt", NodeKind::File),
+    ],
+    vec![
+      add("/pub/part.txt", NodeKind::File),
+      add("/secret", NodeKind::Directory),
+      add("/secret/part.txt", NodeKind::File),
+    ],
+    vec![add("/secret/hidden.txt", NodeKind::File)],
+  ];
+  for (i, changes) in revisions_changes.into_iter().enumerate() {
+    let rec = RevisionRecord {
+      transaction: format!("0-{}", i + 1),
+      changes,
+    };
+    index.append(rec, 1 << 10).unwrap();
+  }
+  let props = |log: &str, custom: &str, author: &str, date: &str| {
+    vec![
+      (b"svn:log".to_vec(), log.as_bytes().to_vec()),
+      (b"note".to_vec(), custom.as_bytes().to_vec()),
+      (b"svn:author".to_vec(), author.as_bytes().to_vec()),
+      (b"svn:date".to_vec(), date.as_bytes().to_vec()),
+    ]
+  };
+  let repo = RevpropRepo {
+    revisions: vec![
+      Vec::new(),
+      props(
+        "full-log",
+        "full-secret",
+        "alice",
+        "2026-01-01T00:00:01.000000Z",
+      ),
+      props(
+        "partial-log",
+        "partial-secret",
+        "bob",
+        "2026-01-02T00:00:02.000000Z",
+      ),
+      props(
+        "hidden-log",
+        "hidden-secret",
+        "mallory",
+        "2026-01-03T00:00:03.000000Z",
+      ),
+    ],
+  };
+  let rules = PrincipalRules::from_read_rules(
+    false,
+    &[
+      ReadPathRule {
+        segments: vec![],
+        allow: true,
+      },
+      ReadPathRule {
+        segments: vec![PolicySegment::Literal(b"secret".as_slice().into())],
+        allow: false,
+      },
+    ],
+  );
+  (index, repo, rules)
+}
+
+fn propfind_revprop_body(
+  served: &Served<'_, RevpropRepo>,
+  path: &str,
+  label: Option<&str>,
+  body: &[u8],
+) -> String {
+  let req = Request {
+    method: "PROPFIND",
+    path,
+    depth: Some("0"),
+    label,
+    body,
+  };
+  let ans = whole(answer(served, &req, &BOUNDS, ROOM));
+  assert_eq!(ans.status, 207, "{path} (label={label:?})");
+  text_of(&ans)
+}
+
+/// Named-property PROPFIND body requesting `svn:log`, custom `note`, author, and date.
+const PROPFIND_NAMED_REVPROPS: &[u8] = b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+<D:propfind xmlns:D=\"DAV:\" xmlns:S=\"http://subversion.tigris.org/xmlns/svn/\" \
+xmlns:C=\"http://subversion.tigris.org/xmlns/custom/\"><D:prop>\
+<S:log/><C:note/><D:creator-displayname/><D:creationdate/></D:prop></D:propfind>";
+
+fn assert_revprop_visibility(
+  served: &Served<'_, RevpropRepo>,
+  (path, label): (&str, Option<&str>),
+  visible: &[&str],
+  hidden: &[&str],
+) {
+  for req_body in [PROPFIND_ALL, PROPFIND_NAMED_REVPROPS] {
+    let body = propfind_revprop_body(served, path, label, req_body);
+    for needle in visible {
+      assert!(
+        body.contains(needle),
+        "{path} ({label:?}) missing {needle}: {body}"
+      );
+    }
+    for needle in hidden {
+      assert!(
+        !body.contains(needle),
+        "{path} ({label:?}) leaked {needle}: {body}"
+      );
+    }
+  }
+}
+
+/// Round-5 Blocker 1 (HTTP WebDAV `PROPFIND` revprop filtering on `!svn/rev/N`, `!svn/bln/N`, and
+/// `!svn/vcc/default`): Do PROPFIND `allprop` and named revprops across `Full` (r1), `Partial` (r2),
+/// and `Nothing` (r3, also youngest) revisions under rules denying `/secret`. Expect: r1 shows all
+/// revprops; r2 shows `svn:author`/`svn:date` (and live `creator-displayname`/`creationdate`) while
+/// stripping `svn:log` and custom revprops; r3 and unlabelled `!svn/vcc/default` leak none of
+/// `svn:log`, custom revprops, `creator-displayname`, or `creationdate`.
+#[test]
+fn round5_blocker1_private_propfind_filters_revprops_by_revision_access() {
+  let (index, repo, rules) = revprop_test_repo();
+  let locks = LockTable::new();
+  let unrestricted = Served {
+    index: &index,
+    repository: &repo,
+    root: ROOT,
+    uuid: UUID,
+    locks: &locks,
+    rules: None,
+    now: NOW,
+  };
+  let restricted = Served {
+    rules: Some(&rules),
+    ..unrestricted
+  };
+
+  // Non-vacuity: without authz restrictions, r3's revprops are visible.
+  assert_revprop_visibility(
+    &unrestricted,
+    ("/!svn/rev/3", None),
+    &["hidden-log", "hidden-secret", "mallory", "2026-01-03"],
+    &[],
+  );
+
+  for target in [
+    ("/!svn/rev/1", None),
+    ("/!svn/bln/1", None),
+    ("/!svn/vcc/default", Some("1")),
+  ] {
+    assert_revprop_visibility(
+      &restricted,
+      target,
+      &["full-log", "full-secret", "alice", "2026-01-01"],
+      &[],
+    );
+  }
+  for target in [
+    ("/!svn/rev/2", None),
+    ("/!svn/bln/2", None),
+    ("/!svn/vcc/default", Some("2")),
+  ] {
+    assert_revprop_visibility(
+      &restricted,
+      target,
+      &["bob", "2026-01-02"],
+      &["partial-log", "partial-secret"],
+    );
+  }
+  for target in [
+    ("/!svn/rev/3", None),
+    ("/!svn/bln/3", None),
+    ("/!svn/vcc/default", Some("3")),
+    ("/!svn/vcc/default", None),
+  ] {
+    assert_revprop_visibility(
+      &restricted,
+      target,
+      &[],
+      &["hidden-log", "hidden-secret", "mallory", "2026-01-03"],
+    );
+  }
+}

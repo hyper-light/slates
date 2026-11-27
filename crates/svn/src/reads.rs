@@ -369,7 +369,7 @@ pub enum Authentication {
 /// How much of a revision the session may read (`svn_repos_revision_access_level_t`), judged from its changed paths
 /// and the sources of those copied (`svn_repos_check_revision_access`, `detect_changed`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RevisionAccess {
+pub(crate) enum RevisionAccess {
   /// Every changed path and copy source is readable, or the revision changed nothing: every revision property shows.
   Full,
   /// Some changed path or copy source is not: the author and the date alone show.
@@ -389,7 +389,7 @@ impl RevisionAccess {
   }
 
   /// Whether a revision property named `name` shows at this level.
-  fn shows(self, name: &[u8]) -> bool {
+  pub(crate) fn shows(self, name: &[u8]) -> bool {
     match self {
       Self::Full => true,
       Self::Partial => PARTLY_READABLE_PROPERTIES.contains(&name),
@@ -570,17 +570,15 @@ pub fn answer_lock_read<R: Repository + ?Sized>(
 /// `svn_repos_check_revision_access` (`repos.c`): how much of `revision` a session reading by `authz` may read. Without
 /// rules, or for a revision that changed nothing, all of it; else from each changed path and, for one a copy added, its
 /// source, until one of each kind is found.
-fn revision_access_in(
+pub(crate) fn revision_access(
   index: &Index,
   authz: Option<&PrincipalRules>,
   revision: Revision,
-) -> Result<RevisionAccess, Failure> {
+) -> Result<RevisionAccess, IndexRefusal> {
   if authz.is_none() {
     return Ok(RevisionAccess::Full);
   }
-  let changes = index
-    .changes(revision)
-    .map_err(|refusal| Failure::of_index(&refusal))?;
+  let changes = index.changes(revision)?;
   if changes.is_empty() {
     return Ok(RevisionAccess::Full);
   }
@@ -603,6 +601,15 @@ fn revision_access_in(
     }
   }
   Ok(RevisionAccess::of(found_readable, found_unreadable))
+}
+
+/// [`revision_access`] with index refusals formatted for `ra_svn`.
+fn revision_access_in(
+  index: &Index,
+  authz: Option<&PrincipalRules>,
+  revision: Revision,
+) -> Result<RevisionAccess, Failure> {
+  revision_access(index, authz, revision).map_err(|refusal| Failure::of_index(&refusal))
 }
 
 /// Whether a session reading by `authz` may read all of `revision` (`svn_repos_check_revision_access`'s

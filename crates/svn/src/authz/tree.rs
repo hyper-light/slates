@@ -241,6 +241,11 @@ impl Node {
 
   /// Every child.
   fn children(&self) -> impl Iterator<Item = usize> + '_ {
+    self.single_segment_children().chain(self.any_many)
+  }
+
+  /// Immediate children matching strictly one segment at depth +1 (everything except `**`).
+  fn single_segment_children(&self) -> impl Iterator<Item = usize> + '_ {
     self
       .literals
       .values()
@@ -250,7 +255,6 @@ impl Node {
       .chain(self.globs.values())
       .copied()
       .chain(self.any_one)
-      .chain(self.any_many)
   }
 }
 
@@ -356,6 +360,7 @@ impl PrincipalRules {
       },
     );
     tree.trim();
+    tree.trim_single_segment_wildcards();
     tree.summarize();
     let uniform = tree
       .nodes
@@ -558,6 +563,12 @@ fn matching_globs<'n>(node: &'n Node, name: &'n [u8]) -> impl Iterator<Item = us
     .map(|(_, child)| *child)
 }
 
+/// Whether `tokens` is a non-empty single-segment wildcard matching every non-empty segment
+/// (`*` or `***`, composed solely of [`GlobToken::Run`]).
+fn is_run_only_glob(tokens: &[GlobToken]) -> bool {
+  !tokens.is_empty() && tokens.iter().all(|token| *token == GlobToken::Run)
+}
+
 /// Whether a policy rule contains an unmatchable glob token (`GlobToken::Never`).
 fn rule_is_unmatchable(segments: &[PolicySegment]) -> bool {
   segments.iter().any(|segment| match segment {
@@ -666,6 +677,54 @@ impl Tree {
         node.rule = None;
       }
       pending.extend(children.into_iter().map(|child| (child, latest)));
+    }
+  }
+
+  /// Highest rule sequence among immediate `*` or [`GlobToken::Run`]-only glob children of `node`
+  /// that match every non-empty segment at depth +1.
+  fn single_wildcard_sequence(&self, node: &Node) -> Option<usize> {
+    let star_seq = node
+      .any_one
+      .and_then(|child| self.nodes.get(child))
+      .and_then(|child| child.rule)
+      .map(|mark| mark.sequence);
+    let glob_seq = node
+      .globs
+      .iter()
+      .filter(|(tokens, _)| is_run_only_glob(tokens))
+      .filter_map(|(_, &child)| self.nodes.get(child))
+      .filter_map(|child| child.rule)
+      .map(|mark| mark.sequence)
+      .max();
+    star_seq.max(glob_seq)
+  }
+
+  /// Clears rules on immediate single-segment `children` strictly older than `eclipsing`.
+  fn clear_eclipsed_children(&mut self, children: &[usize], eclipsing: usize) {
+    for &child_id in children {
+      if let Some(child) = self.nodes.get_mut(child_id)
+        && child.rule.is_some_and(|mark| mark.sequence < eclipsing)
+      {
+        child.rule = None;
+      }
+    }
+  }
+
+  /// Takes out immediate single-segment child rules eclipsed by a later same-level `*` or
+  /// [`GlobToken::Run`]-only glob child (without touching `**` children or deeper descendants),
+  /// so `[Allow Read /a, Deny Read :glob:/*]` does not over-approximate `access_anywhere()`.
+  fn trim_single_segment_wildcards(&mut self) {
+    for id in 0..self.nodes.len() {
+      let Some((eclipsing, children)) = self.nodes.get(id).and_then(|node| {
+        let eclipsing = self.single_wildcard_sequence(node)?;
+        Some((
+          eclipsing,
+          node.single_segment_children().collect::<Vec<_>>(),
+        ))
+      }) else {
+        continue;
+      };
+      self.clear_eclipsed_children(&children, eclipsing);
     }
   }
 
@@ -1027,6 +1086,84 @@ mod read_rules_tests {
         ("/x/deep/mid/vault/key", false),
         ("/bad/z", true),
       ],
+    );
+  }
+
+  /// Round-5 Suggestion 2 (`Tree::trim` single-segment wildcard eclipsing): Do compile
+  /// `[Allow Read /a, Deny Read :glob:/*]` and `[Allow Read /a, Deny Read :glob:/***]` plus
+  /// non-eclipsed `[Allow Read /a/b, Deny Read :glob:/*]` and `[Allow Read :glob:/**, Deny Read :glob:/*]`.
+  /// Expect: same-level `*` and `GlobToken::Run`-only globs eclipse earlier sibling child rules so
+  /// `access_anywhere()` is `Access::None` and `uniform()` is `Some(Access::None)`, while deeper
+  /// descendants (`/a/b`) and `**` rules are preserved.
+  #[test]
+  fn round5_suggestion2_single_star_trims_eclipsed_sibling_without_trimming_deeper_or_double_star()
+  {
+    let eclipsed_star = PrincipalRules::from_read_rules(
+      false,
+      &[
+        ReadPathRule {
+          segments: vec![lit("a")],
+          allow: true,
+        },
+        ReadPathRule {
+          segments: vec![PolicySegment::AnyOne],
+          allow: false,
+        },
+      ],
+    );
+    assert_eq!(eclipsed_star.access_anywhere(), Access::None);
+    assert_eq!(eclipsed_star.uniform(), Some(Access::None));
+
+    let run_only = PolicySegment::Glob(Box::new([GlobToken::Run]));
+    let eclipsed_run = PrincipalRules::from_read_rules(
+      false,
+      &[
+        ReadPathRule {
+          segments: vec![lit("a")],
+          allow: true,
+        },
+        ReadPathRule {
+          segments: vec![run_only],
+          allow: false,
+        },
+      ],
+    );
+    assert_eq!(eclipsed_run.access_anywhere(), Access::None);
+    assert_eq!(eclipsed_run.uniform(), Some(Access::None));
+
+    let deeper_survives = PrincipalRules::from_read_rules(
+      false,
+      &[
+        ReadPathRule {
+          segments: vec![lit("a"), lit("b")],
+          allow: true,
+        },
+        ReadPathRule {
+          segments: vec![PolicySegment::AnyOne],
+          allow: false,
+        },
+      ],
+    );
+    assert_eq!(deeper_survives.access_anywhere(), Access::Read);
+    assert_read_cases(&deeper_survives, &[("/a", false), ("/a/b", true)]);
+
+    let double_star_survives = PrincipalRules::from_read_rules(
+      false,
+      &[
+        ReadPathRule {
+          segments: vec![PolicySegment::AnyMany],
+          allow: true,
+        },
+        ReadPathRule {
+          segments: vec![PolicySegment::AnyOne],
+          allow: false,
+        },
+      ],
+    );
+    assert_eq!(double_star_survives.access_anywhere(), Access::Read);
+    assert_read_cases(
+      &double_star_survives,
+      &[("/", true), ("/a", false), ("/a/b", true)],
     );
   }
 }
