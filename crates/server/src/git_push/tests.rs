@@ -4997,8 +4997,8 @@ fn t_a727_d1a_a_push_refused_after_its_names_were_homed_leaves_no_hold_in_the_re
       .expect("create");
     let task = slates_rt::futures::spawn(async move {
       let outcome = half_homed_drive(repository, &request).await;
-      // Two releases: the names' (homed) and the pack's (its homing fallen).
-      let settled = settled(2).await;
+      // One settle, its release of the names (homed) and the pack (its homing fallen) together.
+      let settled = settled(1).await;
       let held = crate::vcs_store::homes::region_held_here();
       let unanswered = crate::state::with_state(|state| {
         state
@@ -5038,11 +5038,11 @@ fn t_a727_d1a_a_refused_push_leaves_another_repositorys_hold_of_the_same_object(
       .expect("create");
     let task = slates_rt::futures::spawn(async move {
       let answered = homed_drive(first, &request).await.is_ok();
-      // Two moves: the names' and the pack's; then b's two releases.
-      let moved = settled(2).await;
+      // One settle moving the names and the pack; then b's one releasing its two.
+      let moved = settled(1).await;
       let after_first = crate::vcs_store::homes::region_held_here();
       let refused = half_homed_drive(second, &request).await;
-      let released = settled(4).await;
+      let released = settled(2).await;
       let held = crate::vcs_store::homes::region_held_here();
       let owners: Vec<Vec<slates_cluster::homes::HomeOwner>> = held
         .iter()
@@ -5170,7 +5170,7 @@ fn t_a727_d1a3_a_crash_left_attempts_holds_resolve_by_the_repositorys_records() 
       .map(|(scenario, _)| scenario.request.to_vec())
       .expect("create");
     let task = slates_rt::futures::spawn(async move {
-      let pushed = homed_drive(repository, &request).await.is_ok() && settled(2).await;
+      let pushed = homed_drive(repository, &request).await.is_ok() && settled(1).await;
       let outcome = crate::state::with_state(|state| {
         let (node, process) = (state.fleet.host(), state.member_process_nonce ^ 1);
         let earlier = move |repository: [u8; 16], attempt| HomeOwner::Attempt {
@@ -5187,7 +5187,7 @@ fn t_a727_d1a3_a_crash_left_attempts_holds_resolve_by_the_repositorys_records() 
           &[earlier(repository.bytes, 2)],
         )
         .ok()?;
-        let live = homes::attempt_owner(state, repository.bytes);
+        let live = homes::attempt_owner(state, repository.bytes).ok()?;
         let (lived, _) =
           homes::keep_for_region(state, b"an object a live attempt holds", &[live]).ok()?;
         let (orphan, _) = homes::keep_for_region(

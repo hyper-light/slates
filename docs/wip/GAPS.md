@@ -2087,7 +2087,9 @@
 > record naming one homed segment list. Piece (i) BUILT (2026-11-26, w-hg; A-929's ruling R): each push segment's
 > `Record` and `Payload` homed at `f + 1` before it lands and let go at its home once landed, the entry naming one
 > homed list (record v12, v11 withdrawn), a homing short refusing the push with nothing recorded
-> (`a_push_whose_changeset_is_not_durable_at_its_homes_is_refused_and_records_nothing`). OPEN: (ii) a holder fetching
+> (`a_push_whose_changeset_is_not_durable_at_its_homes_is_refused_and_records_nothing`). CLOSED the same day: its
+> settles, one region exchange an object in an unbounded queue, now one batched settle an attempt (home wire 0x86) in a
+> queue bounded with the attempts in flight (`homes::settle_bound`, refused typed at it). OPEN: (ii) a holder fetching
 > the segments by identity and its recompute accepted with the owner's identity, with svn's holder red and an
 > `#[ignore]`d fleet-takeover CLI test for Mercurial, which no test drives yet; then an import's run (v9) and a single
 > changeset (v7) homed the same way.

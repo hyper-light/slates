@@ -499,6 +499,106 @@ fn a_push_whose_changeset_is_not_durable_at_its_homes_is_refused_and_records_not
   );
 }
 
+/// The settle queue's shape (main 01a20182's order of 2026-11-26 after ruling R piece (i): an unbounded queue is CLAUDE.md
+/// §2 item 8). Do: on a stored shard, cut a push's segments at one byte so each of its six changesets lands as segments
+/// of their own, and push it. Expect: the push accepted, landed as several segments (each homing its `Record` and its
+/// `Payload`, and its list), and its attempt's end owed the region as one settle carrying every object it homed
+/// (`vcs_store.homes.settles_queued` 1). Red before: one settle an object homed, two a segment and one the list.
+#[test]
+fn a_many_segment_pushs_attempt_settles_its_homed_objects_as_one() {
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = Hg::made("settled-once").await;
+    let made = history_of(&[
+      ("one", "one", b"one\n", None, "default"),
+      ("two", "two", b"two\n", Some(0), "default"),
+      ("three", "three", b"three\n", Some(1), "default"),
+      ("four", "four", b"four\n", Some(2), "default"),
+      ("five", "five", b"five\n", Some(3), "default"),
+      ("six", "six", b"six\n", Some(4), "default"),
+    ]);
+    super::super::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(1));
+    let count = |name: &str| {
+      crate::repository::svn_commit::tests::on(|state| {
+        state.refusals.get(name).copied().unwrap_or(0)
+      })
+    };
+    let queued = count(crate::vcs_store::homes::SETTLES_QUEUED);
+    let landed = count(super::super::hg_run::SEGMENTS_LANDED);
+    let outcome = pushed_bytes_to(
+      hg.repository,
+      &crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0, 1, 2, 3, 4, 5]),
+    )
+    .await;
+    super::super::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(0));
+    assert!(matches!(outcome, Outcome::Accepted(_)), "{outcome:?}");
+    let segments = count(super::super::hg_run::SEGMENTS_LANDED) - landed;
+    assert!(segments >= 3, "landed as several segments: {segments}");
+    assert_eq!(
+      count(crate::vcs_store::homes::SETTLES_QUEUED) - queued,
+      1,
+      "one settle for the attempt's {segments} segments and its list"
+    );
+  });
+}
+
+/// The settle queue's bound (main 01a20182's order of 2026-11-26: a derived bound, a typed refusal at it, a counter).
+/// Do: on a stored shard, begin as many attempts as the shard holds at once (`homes::settle_bound`), then push a
+/// changeset; end those attempts and push it again. Expect: the first push refused in slates' words that the server has
+/// as many pushes in flight as it holds (`PUSHES_AT_BOUND`), counted (`vcs_store.homes.attempts_at_bound`), nothing of
+/// it in the register; the second accepted. Red before: no bound, so the attempts and the settles they owe grew without
+/// one.
+#[test]
+fn a_push_past_the_shards_attempts_bound_is_refused_typed_and_the_next_lands() {
+  crate::test_store::run_on_stored_shard(|| async move {
+    let hg = Hg::made("at-bound").await;
+    let made = history_of(&[("one", "one", b"one\n", None, "default")]);
+    let bundle = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0]);
+    let held: Vec<slates_cluster::homes::HomeOwner> =
+      crate::repository::svn_commit::tests::on(|state| {
+        let bound = crate::vcs_store::homes::settle_bound(state);
+        (0..bound)
+          .map_while(|_| crate::vcs_store::homes::attempt_owner(state, hg.repository.bytes).ok())
+          .collect()
+      });
+    let refused = pushed_bytes_to(hg.repository, &bundle).await;
+    let (counted, records) = crate::repository::svn_commit::tests::on(|state| {
+      let counted = state
+        .refusals
+        .get(crate::vcs_store::homes::ATTEMPTS_AT_BOUND)
+        .copied()
+        .unwrap_or(0);
+      let records = (0..)
+        .map_while(|index| {
+          state
+            .db
+            .partition()
+            .repositories()
+            .object_record(hg.repository, index)
+        })
+        .count();
+      (counted, records)
+    });
+    for owner in &held {
+      crate::vcs_store::homes::attempt_ended(owner);
+    }
+    let accepted = pushed_bytes_to(hg.repository, &bundle).await;
+    let words = match &refused {
+      Outcome::Refused(reply) => encoded(reply),
+      other => panic!("the push past the bound was not refused: {other:?}"),
+    };
+    assert!(
+      words
+        .windows(super::PUSHES_AT_BOUND.len())
+        .any(|at| at == super::PUSHES_AT_BOUND),
+      "{}",
+      String::from_utf8_lossy(&words)
+    );
+    assert!(counted > 0, "the refusal counted");
+    assert_eq!(records, 0, "nothing of the refused push recorded");
+    assert!(matches!(accepted, Outcome::Accepted(_)), "{accepted:?}");
+  });
+}
+
 /// Ruling R, its first piece's counter (main's order of 2026-11-26: a segment's bytes by section, read from the status
 /// report). Do: on a stored shard push three changesets, each adding a file. Expect: the push accepted and its segments'
 /// landed bytes counted by section: the `Payload` bytes exactly the bytes its deltas' chunks took

@@ -966,8 +966,12 @@ fn first_ask(state: &mut ShardState, sealed: &mut SealedPush) -> Option<Ask> {
   };
   let (bytes, count) = names.filter(|(_, count)| *count > 0)?;
   let identity = super::put_names(state, &bytes)?;
-  // The attempt its holds in the region are for until its record commits (A-727 (d1a)).
-  let owner = sealed.home_owner(state);
+  // The attempt its holds in the region are for until its record commits (A-727 (d1a)); none where the shard's attempts
+  // and settles owed are at their bound (`homes::settle_bound`), its names given back.
+  let Ok(owner) = sealed.home_owner(state) else {
+    super::release_names(state, &identity);
+    return None;
+  };
   Some((
     crate::git_push::Carry::Home(super::homes::HomeSource::Bytes(bytes), owner),
     Homing::Names((identity, count)),
@@ -994,7 +998,7 @@ fn next_ask(
       if !super::hold_for_record(state, &packed.0) {
         return None;
       }
-      let owner = sealed.home_owner(state);
+      let owner = sealed.home_owner(state).ok()?;
       Some(Some((
         Carry::Home(source, owner),
         Homing::Pack(homed.bytes, packed),

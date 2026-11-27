@@ -267,7 +267,10 @@ impl Run {
   }
 
   /// The owner its holds in the region are for (A-727 (d1a)), made at its first homing.
-  fn owner(&mut self, state: &ShardState) -> slates_cluster::homes::HomeOwner {
+  fn owner(
+    &mut self,
+    state: &mut ShardState,
+  ) -> Result<slates_cluster::homes::HomeOwner, crate::vcs_store::homes::HomeRefused> {
     self.attempt.owner(state, self.repository.bytes)
   }
 
@@ -753,6 +756,10 @@ pub(crate) async fn homed_for(
   let identity = source.identity();
   let (origin, shards, owner) =
     crate::state::with_state(|state| (state.shard, state.shards.clone(), run.owner(state)))?;
+  let owner = match owner {
+    Ok(owner) => owner,
+    Err(refused) => return Some((Err(refused), source.into_given_back())),
+  };
   let homed = crate::vcs_store::homes::home_in_region(
     origin,
     &shards,
@@ -800,8 +807,9 @@ pub(crate) async fn list_landed(
   };
   let len = u64::try_from(list.len()).unwrap_or(u64::MAX);
   let (homed, bytes) = homed_for(run, crate::vcs_store::homes::HomeSource::Bytes(list)).await?;
-  let Ok(identity) = homed else {
-    return Some(Err(ListUnlanded::HomedShort));
+  let identity = match homed {
+    Ok(identity) => identity,
+    Err(refused) => return Some(Err(ListUnlanded::Unhomed(refused))),
   };
   let landing = crate::state::with_state(|state| {
     let disk = state.vcs_disk.clone()?;
@@ -839,12 +847,12 @@ pub(crate) async fn list_landed(
 pub(crate) const LIST_RECORD_BYTES: &str = "vcs.hg.push_list_bytes";
 
 /// Why a push's segment list was not landed ([`list_landed`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ListUnlanded {
   /// No segment landed: nothing to name.
   NoSegment,
-  /// Its homing fell short of `f + 1` within its budget.
-  HomedShort,
+  /// Its homing was refused: short of `f + 1` within its budget, or no attempt could begin.
+  Unhomed(crate::vcs_store::homes::HomeRefused),
   /// The node holds no changeset store.
   NoStore,
   /// The store refused its landing.

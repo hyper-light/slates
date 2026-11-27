@@ -237,6 +237,8 @@ pub(crate) enum Unlanded {
   LandingUntaken,
   /// The node's changeset store refused the changeset (busy, gone, or its write failed).
   StoreRefused,
+  /// The shard's pushes in flight and the settles it owes the region were at their bound (`homes::settle_bound`).
+  AttemptsAtBound,
 }
 
 /// One git push over one connection, on its repository's owner shard (module docs), its hooks'
@@ -1096,8 +1098,12 @@ impl<P> ReceivePack<P> {
         let Some(identity) = crate::vcs_store::put_names(state, &bytes) else {
           return Err(PushFailed::Unlanded(Unlanded::NamesNotPut));
         };
-        // The attempt its holds in the region are for until its record commits (A-727 (d1a)).
-        let _ = decision.sealed.home_owner(state);
+        // The attempt its holds in the region are for until its record commits (A-727 (d1a)); refused where the shard's
+        // attempts and settles owed are at their bound, before anything is homed.
+        if decision.sealed.home_owner(state).is_err() {
+          crate::vcs_store::release_names(state, &identity);
+          return Err(PushFailed::Unlanded(Unlanded::AttemptsAtBound));
+        }
         decision.homing = Homing::Asked(bytes, (identity, count));
         Ok(false)
       }
