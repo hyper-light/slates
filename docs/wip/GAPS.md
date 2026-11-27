@@ -2296,6 +2296,18 @@
 > manifest was pushed as a delta, let go; two more pushed in one changegroup, each manifest a client's delta, asks
 > answered from the store alone: red, refused on the first's manifest itself; now both taken). File revisions are not of
 > this shape: a file row holds its whole text, and one this push kept is pinned unlanded.
+> Found by w-perf's harness hunting main's 57k intake hang and fixed (2026-11-27, main's ruling the same day): the chain
+> above an asked link is read from the fork once the store answers, and a segment that lands between the ask and that
+> read (the server lands segments between slices, after the slice that asked and before the one that uses the answer)
+> lets go a row above the link, so the push was refused `UnknownDeltaBase { log: Manifests }`, a transient refused as
+> final. Now `Taker::bring_in` asks again, once, for the topmost link let go then, which, landed, the store keeps
+> (`Base::Asked::again`); a chain that fails so a second time, or a link that did not move, is refused as before, since
+> an ask made again without bound is a livelock's shape. Counted `vcs.hg.push_log_texts_reasked`
+> (`Intaken::log_texts_reasked`). Held by
+> `a_pushs_logs_taken_while_its_segments_land_ask_the_store_a_bounded_number_of_times` (an 80-changeset line over let-go
+> logs, driven as the server drives it, the cut segments landed every 2, 3, 5, 8 and 16 steps: red, refused landing
+> every 2 steps after 3 asks and 96 steps; now every cadence taken, 79 to 119 asks, 6 to 41 asked again). OWED: whether
+> this race is also main's 57k hang (a stack of the hung build, main's).
 > C1 (2), second piece BUILT (main's ruling (B') of 2026-11-24): a push's manifest is taken a window a step and never
 > whole. Its text is made by `delta::Patching` over its base read front to back over its chain (`push::chain_read`, the
 > chain's deltas loaded: at most the base's length, A-729's bound); its lines checked and its written entries found as it

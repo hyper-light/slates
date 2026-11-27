@@ -122,3 +122,22 @@ retries only when it expects to own the address.
   - The race still happened. `once_released` waited it out 25 times: 8 after one refusal, 3 after two, and the
     longest after 598, all far inside `RELEASE_WAIT`. So the retry path is exercised, not dead code.
 - **macOS:** the suite passes, 14 of 14. `cargo clippy -p slates-ipc --all-targets -- -D warnings` is clean.
+
+## Recurrence: the client tests (2026-11-27, the TSan lane)
+
+- **Symptom.** The TSan lane (mem, rt, ipc, client) failed
+  `a_restarted_daemon_adopts_its_anchors_sealing_root_and_a_fresh_anchor_mints_another` in two diag runs in a row (diag CI
+  1 at 01:10 PST; diag CI 2, run 45986066740 at 89f01a607, job 140461888152): `crates/client/tests/client.rs:3161`
+  (`played_anchor`'s `HeldRendezvous::hold`) refused `OsRefused { call: "bind", code: Some(98) }`.
+- **Cause.** The same race in another binary. The test drops its anchor and at once plays a fresh one for the same
+  instance, while a child another client test spawned still holds a copy of the dropped listener. TSan's slower
+  fork-to-exec widens the window.
+- **Fix.** One wait shared by the client test binaries, `crates/client/tests/support/held_again.rs`
+  (`hold_once_released`, this record's `once_released` for a rendezvous hold, within one claim wait), included by
+  `#[path]`. It is used where a test holds an instance again: `played_anchor` in `client.rs` (the sealing test's fresh
+  anchor, and once a partition in `a_restarted_daemons_first_answer_is_awaited_for_the_reconnect_budget` and
+  `a_resumed_session_waits_out_a_shard_start_its_supervisor_allows`) and `Anchor::hold_again` in `driver.rs`. Every
+  other client test holds a fresh instance once and needs no wait.
+- **Verification.** The race is Linux's: a dropped owner's macOS name is no descriptor a child copies, so the red is the
+  lane's, not reproducible on the MacBook. On the MacBook (debug, 2026-11-27) the four tests that hold again pass. The
+  lane's rerun is main's.
