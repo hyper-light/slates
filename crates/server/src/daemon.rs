@@ -8498,6 +8498,7 @@ mod tests {
             let request = HomeMessage::PutPart {
               configuration: 0,
               owners: vec![crate::vcs_store::homes::TEST_OWNER],
+              durable: true,
               identity,
               total,
               offset: u64::try_from(at * part).unwrap(),

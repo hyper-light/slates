@@ -1661,16 +1661,20 @@ async fn keep_put(
   shards: &[u16],
   (local, members, f): (slates_db::HostId, &[slates_db::HostId], usize),
   (identity, owners, bytes): ([u8; 32], Vec<HomeOwner>, Vec<u8>),
-  budget_ns: u64,
+  (durable, budget_ns): (bool, u64),
 ) -> slates_cluster::homes::HomeOutcome {
   use slates_cluster::homes::{HomeOutcome, HomeRefusal, admits};
   if let Err(refusal) = admits(&identity, &bytes, (local, members, f)) {
     return HomeOutcome::Refused(refusal);
   }
+  let kept = |ticket: HomeTicket| HomeOutcome::Kept {
+    place: place_of(shards, ticket.shard),
+    generation: ticket.generation,
+  };
   match keep_region_at_home(origin, shards, (bytes, owners), budget_ns).await {
-    Ok((_, ticket)) if published(origin, ticket, budget_ns).await => HomeOutcome::Kept {
-      generation: ticket.generation,
-    },
+    // Asked at once (version 0x87): kept, its durability the sender's one barrier at this home ([`durable_answer`]).
+    Ok((_, ticket)) if !durable => kept(ticket),
+    Ok((_, ticket)) if published(origin, ticket, budget_ns).await => kept(ticket),
     Ok(_) | Err(HomeRefused::Unanswered) => HomeOutcome::Refused(HomeRefusal::Unanswered),
     Err(HomeRefused::PastWindow) => HomeOutcome::Refused(HomeRefusal::Misnamed),
     Err(HomeRefused::Content(_)) => HomeOutcome::Refused(HomeRefusal::Room),
@@ -1678,6 +1682,37 @@ async fn keep_put(
     // A put from the region starts no attempt: answered as the busy home it would be.
     Err(HomeRefused::AttemptsAtBound) => HomeOutcome::Refused(HomeRefusal::Unanswered),
   }
+}
+
+/// The place of shard `shard` among `shards` (its partition), as a barrier names a home shard on the wire: never the
+/// runtime's id ([`crate::vcs_share::place::first_by_place`]); past the shards where it is none of them.
+fn place_of(shards: &[u16], shard: u16) -> u16 {
+  shards
+    .iter()
+    .position(|at| *at == shard)
+    .and_then(|place| u16::try_from(place).ok())
+    .unwrap_or(u16::MAX)
+}
+
+/// [`serve_remote`]'s answer to a barrier (version 0x87): each of `tickets` (a home shard's place here and an image
+/// generation) waited on at its shard ([`published`]), within `budget_ns`; `Published` with how many were. A place past
+/// this node's shards is never published.
+async fn durable_answer(
+  origin: u16,
+  shards: &[u16],
+  tickets: Vec<(u16, u64)>,
+  budget_ns: u64,
+) -> slates_cluster::homes::HomeOutcome {
+  let mut count = 0u64;
+  for (place, generation) in tickets {
+    let Some(shard) = shards.get(usize::from(place)).copied() else {
+      continue;
+    };
+    if published(origin, HomeTicket { shard, generation }, budget_ns).await {
+      count = count.saturating_add(1);
+    }
+  }
+  slates_cluster::homes::HomeOutcome::Published { published: count }
 }
 
 /// What a put's part did to its object's staging ([`stage_part`]).
@@ -1918,6 +1953,7 @@ async fn outcome_of(
     HomeMessage::Put {
       identity,
       owners,
+      durable,
       bytes,
       ..
     } => (
@@ -1927,13 +1963,14 @@ async fn outcome_of(
         shards,
         (local, members, f),
         (identity, owners, bytes),
-        budget_ns,
+        (durable, budget_ns),
       )
       .await,
     ),
     HomeMessage::PutPart {
       identity,
       owners,
+      durable,
       total,
       offset,
       bytes,
@@ -1944,9 +1981,14 @@ async fn outcome_of(
         (origin, shards),
         (local, members, f),
         (identity, owners, (total, offset)),
-        (bytes, budget_ns),
+        (bytes, (durable, budget_ns)),
       )
       .await,
+    ),
+    // A sender's barrier at this home (version 0x87): its tickets waited on together.
+    HomeMessage::Durable { tickets } => (
+      [0; 32],
+      durable_answer(origin, shards, tickets, budget_ns).await,
     ),
     HomeMessage::ReadPart { identity, offset } => (
       identity,
@@ -2030,7 +2072,7 @@ async fn part_answer(
   (origin, shards): (u16, &[u16]),
   (local, members, f): (slates_db::HostId, &[slates_db::HostId], usize),
   (identity, owners, (total, offset)): ([u8; 32], Vec<HomeOwner>, (u64, u64)),
-  (bytes, budget_ns): (Vec<u8>, u64),
+  (bytes, (durable, budget_ns)): (Vec<u8>, (bool, u64)),
 ) -> slates_cluster::homes::HomeOutcome {
   use slates_cluster::homes::HomeOutcome;
   match stage_part((local, members, f), (identity, total, offset), bytes) {
@@ -2042,7 +2084,7 @@ async fn part_answer(
         shards,
         (local, members, f),
         (identity, owners, bytes),
-        budget_ns,
+        (durable, budget_ns),
       )
       .await
     }
@@ -3102,18 +3144,107 @@ pub(crate) async fn home_in_region(
   homed_in_region(origin, shards, (source, owner), budget, None).await
 }
 
-/// [`home_in_region`] with this node's own keep not waited for (main 01a20182's order of 2026-11-26: "One barrier
-/// serves every window kept before it: group commit per shard"): kept on its home shard here, and that shard's ticket
-/// put in `tickets`, the latest a shard, for the caller to wait on once ([`published`]) before any record names what it
-/// kept. A remote home still answers kept only once its own image holding it is published.
+/// [`home_in_region`] with no home's keep waited for (main 01a20182's orders of 2026-11-26: "One barrier serves every
+/// window kept before it: group commit per shard", here and at every remote home): kept on its home shard here and put
+/// to each remote home asked at once (home wire 0x87), each home shard's latest ticket kept in `barrier` for the caller
+/// to wait on once ([`barrier_published`]) before any record names what it kept.
 pub(crate) async fn home_in_region_deferred(
   origin: u16,
   shards: &[u16],
   (source, owner): (HomeSource, HomeOwner),
   budget: slates_cluster::CommitBudget,
-  tickets: &mut std::collections::BTreeMap<u16, HomeTicket>,
+  barrier: &mut Barrier,
 ) -> Homed {
-  homed_in_region(origin, shards, (source, owner), budget, Some(tickets)).await
+  homed_in_region(origin, shards, (source, owner), budget, Some(barrier)).await
+}
+
+/// The tickets a caller's deferred homings left to wait on once ([`home_in_region_deferred`], [`barrier_published`]):
+/// this node's home shards' latest, and each remote home's, by its home shard's place there. Bounded by the shards of the
+/// homes it kept on: one ticket a home shard.
+#[derive(Debug, Default)]
+pub(crate) struct Barrier {
+  /// This node's home shards, each its latest ticket.
+  local: std::collections::BTreeMap<u16, HomeTicket>,
+  /// Each remote home (by its host id), each of its home shards' places there with its latest generation.
+  remote:
+    std::collections::BTreeMap<u64, (slates_db::HostId, std::collections::BTreeMap<u16, u64>)>,
+}
+
+impl Barrier {
+  /// This node's keep's `ticket`, kept where it is its shard's latest.
+  fn local_kept(&mut self, ticket: HomeTicket) {
+    let latest = self.local.entry(ticket.shard).or_insert(ticket);
+    if ticket.generation > latest.generation {
+      *latest = ticket;
+    }
+  }
+
+  /// Remote home `host`'s keep, at its home shard's place there from `generation` on, kept where it is that shard's
+  /// latest.
+  fn remote_kept(&mut self, host: slates_db::HostId, (place, generation): (u16, u64)) {
+    let (_, shards) = self
+      .remote
+      .entry(host.0)
+      .or_insert_with(|| (host, std::collections::BTreeMap::new()));
+    let latest = shards.entry(place).or_insert(generation);
+    *latest = (*latest).max(generation);
+  }
+}
+
+/// Counter: a barrier sent to a remote home ([`barrier_published`]): one a home a push. Format: a counter name.
+pub(crate) const REMOTE_BARRIERS: &str = "vcs_store.homes.remote_barriers";
+
+/// Waits once for every ticket `barrier` holds to be published (the one barrier of a caller's deferred homings, group
+/// commit per shard): this node's home shards' each at its shard, from shard `origin` of `shards`; each remote home's by
+/// one [`HomeMessage::Durable`](slates_cluster::homes::HomeMessage::Durable) of its tickets, from the control shard, in
+/// parts of [`slates_cluster::homes::DURABLE_MOST`], answered `Published` with all of them. Whether every one was, within
+/// `budget`; the barrier emptied either way.
+pub(crate) async fn barrier_published(
+  (origin, shards): (u16, &[u16]),
+  barrier: &mut Barrier,
+  budget: slates_cluster::CommitBudget,
+) -> bool {
+  use slates_cluster::homes::{DURABLE_MOST, HomeMessage, HomeOutcome};
+  let budget_ns = budget.max_deadline_ns();
+  for ticket in core::mem::take(&mut barrier.local).into_values() {
+    if !published(origin, ticket, budget_ns).await {
+      return false;
+    }
+  }
+  let control = shards.first().copied().unwrap_or(origin);
+  let most = usize::try_from(DURABLE_MOST).unwrap_or(1).max(1);
+  for (_, (home, tickets)) in core::mem::take(&mut barrier.remote) {
+    let tickets: Vec<(u16, u64)> = tickets.into_iter().collect();
+    for part in tickets.chunks(most) {
+      let count = u64::try_from(part.len()).unwrap_or(u64::MAX);
+      let request = HomeMessage::Durable {
+        tickets: part.to_vec(),
+      }
+      .encode();
+      let _ = crate::state::with_state(|state| state.count(REMOTE_BARRIERS, 1));
+      let replies = crate::xshard::task_in_shard_time(
+        origin,
+        control,
+        move || async move { exchange(&[home], &request, budget).await },
+        budget_ns,
+      )
+      .await
+      .unwrap_or_default();
+      let durable = replies.iter().any(|(_, reply)| {
+        matches!(
+          HomeMessage::decode(reply),
+          Ok(HomeMessage::Answer {
+            outcome: HomeOutcome::Published { published },
+            ..
+          }) if published == count
+        )
+      });
+      if !durable {
+        return false;
+      }
+    }
+  }
+  true
 }
 
 /// [`home_in_region`]'s body: this node's keep waited for durable, or its ticket kept in `deferred`.
@@ -3122,7 +3253,7 @@ async fn homed_in_region(
   shards: &[u16],
   (source, owner): (HomeSource, HomeOwner),
   budget: slates_cluster::CommitBudget,
-  deferred: Option<&mut std::collections::BTreeMap<u16, HomeTicket>>,
+  deferred: Option<&mut Barrier>,
 ) -> Homed {
   let identity = source.identity();
   let budget_ns = budget.max_deadline_ns();
@@ -3210,9 +3341,9 @@ struct Homing<'h> {
   reranked: bool,
   /// A home answered as a member of another home wire version: no install changes that (A-727 (d1a)).
   other_version: bool,
-  /// Where this node's keep's ticket goes, its durability left to the caller's one barrier
-  /// ([`home_in_region_deferred`]); none to wait for it here.
-  deferred: Option<&'h mut std::collections::BTreeMap<u16, HomeTicket>>,
+  /// Where each home's ticket goes, its durability left to the caller's one barrier ([`home_in_region_deferred`]); none
+  /// to wait for each here.
+  deferred: Option<&'h mut Barrier>,
 }
 
 impl Homing<'_> {
@@ -3255,6 +3386,7 @@ impl Homing<'_> {
       .filter(|home| *home != local)
       .collect();
     let began = slates_rt::futures::now_ns();
+    let deferred = self.deferred.is_some();
     if !others.is_empty() {
       let control = shards.first().copied().unwrap_or(origin);
       let bytes = self.bytes_now()?;
@@ -3263,7 +3395,7 @@ impl Homing<'_> {
       let answered = crate::xshard::task_in_shard_time(
         origin,
         control,
-        move || put_remote(others, identity, (vec![owner], bytes), round),
+        move || put_remote(others, identity, (vec![owner], bytes), (round, !deferred)),
         round_ns,
       )
       .await;
@@ -3271,6 +3403,12 @@ impl Homing<'_> {
         self.kept_by.extend(remote.kept);
         self.other_version |= remote.other_version;
         self.source = HomeSource::Bytes(back);
+        // Kept at once (version 0x87): each home's ticket kept for the caller's one barrier there.
+        if let Some(barrier) = self.deferred.as_deref_mut() {
+          for (host, ticket) in remote.tickets {
+            barrier.remote_kept(host, ticket);
+          }
+        }
       }
     }
     let region_ns = slates_rt::futures::now_ns().saturating_sub(began);
@@ -3320,11 +3458,8 @@ impl Homing<'_> {
       }
     };
     // Kept; its durability the caller's one barrier, a home shard's latest ticket kept.
-    if let Some(tickets) = self.deferred.as_deref_mut() {
-      let latest = tickets.entry(ticket.shard).or_insert(ticket);
-      if ticket.generation > latest.generation {
-        *latest = ticket;
-      }
+    if let Some(barrier) = self.deferred.as_deref_mut() {
+      barrier.local_kept(ticket);
       return Ok((1, None));
     }
     Ok(
@@ -3722,15 +3857,16 @@ async fn put_remote(
   homes: Vec<slates_db::HostId>,
   identity: ContentId,
   (owners, bytes): (Vec<HomeOwner>, Vec<u8>),
-  budget: slates_cluster::CommitBudget,
+  (budget, durable): (slates_cluster::CommitBudget, bool),
 ) -> (RemoteKept, Vec<u8>) {
   use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal, PART_BYTES};
   if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > PART_BYTES {
-    let kept = put_in_parts(&homes, (identity, &owners), &bytes, budget).await;
+    let tickets = put_in_parts(&homes, (identity, &owners), &bytes, (budget, durable)).await;
     return (
       RemoteKept {
-        kept,
+        kept: tickets.iter().map(|(host, _)| *host).collect(),
         other_version: false,
+        tickets,
       },
       bytes,
     );
@@ -3739,6 +3875,7 @@ async fn put_remote(
     identity: identity.0,
     configuration: installed_configuration(),
     owners,
+    durable,
     bytes,
   };
   let request = message.encode();
@@ -3757,14 +3894,21 @@ async fn put_remote(
       }) | Err(_)
     )
   });
+  let mut tickets = Vec::new();
   let kept = answers
     .into_iter()
     .filter(|(host, reply)| {
       let decoded = HomeMessage::decode(reply);
-      let kept = matches!(
-        decoded,
-        Ok(HomeMessage::Answer { identity: answered, outcome: HomeOutcome::Kept { .. } }) if answered == identity.0
-      );
+      let kept = match decoded {
+        Ok(HomeMessage::Answer {
+          identity: answered,
+          outcome: HomeOutcome::Kept { place, generation },
+        }) if answered == identity.0 => {
+          tickets.push((*host, (place, generation)));
+          true
+        }
+        _ => false,
+      };
       if !kept {
         // What a home answered other than kept, and when (gate 8; w-shared agreed this line in writing, 2026-11-24).
         slates_machine::log_line!(
@@ -3785,6 +3929,7 @@ async fn put_remote(
     RemoteKept {
       kept,
       other_version,
+      tickets,
     },
     bytes,
   )
@@ -3796,6 +3941,9 @@ async fn put_remote(
 struct RemoteKept {
   kept: Vec<slates_db::HostId>,
   other_version: bool,
+  /// Each home's ticket as it answered kept (its home shard's place there and the generation), for a put asked at once
+  /// ([`Barrier`]).
+  tickets: Vec<(slates_db::HostId, (u16, u64))>,
 }
 
 /// The object named `identity` read from one of the other homes `homes`, a part at a time from each in turn
@@ -3820,8 +3968,8 @@ async fn put_in_parts(
   homes: &[slates_db::HostId],
   (identity, owners): (ContentId, &[HomeOwner]),
   bytes: &[u8],
-  budget: slates_cluster::CommitBudget,
-) -> Vec<slates_db::HostId> {
+  (budget, durable): (slates_cluster::CommitBudget, bool),
+) -> Vec<(slates_db::HostId, (u16, u64))> {
   use slates_cluster::homes::{HomeMessage, HomeOutcome, PART_BYTES};
   let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
   let part = usize::try_from(PART_BYTES).unwrap_or(usize::MAX).max(1);
@@ -3834,6 +3982,7 @@ async fn put_in_parts(
       identity: identity.0,
       configuration: installed_configuration(),
       owners: owners.to_vec(),
+      durable,
       total,
       offset,
       bytes: chunk.to_vec(),
@@ -3848,8 +3997,8 @@ async fn put_in_parts(
         }) if answered == identity.0 && received == end && end < total => still.push(host),
         Ok(HomeMessage::Answer {
           identity: answered,
-          outcome: HomeOutcome::Kept { .. },
-        }) if answered == identity.0 && end == total => kept.push(host),
+          outcome: HomeOutcome::Kept { place, generation },
+        }) if answered == identity.0 && end == total => kept.push((host, (place, generation))),
         _ => {}
       }
     }
@@ -4103,7 +4252,11 @@ async fn offer(
   budget: slates_cluster::CommitBudget,
 ) -> Vec<slates_db::HostId> {
   if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > slates_cluster::homes::PART_BYTES {
-    put_in_parts(others, (identity, &owners), &bytes, budget).await
+    put_in_parts(others, (identity, &owners), &bytes, (budget, true))
+      .await
+      .into_iter()
+      .map(|(host, _)| host)
+      .collect()
   } else {
     put_whole(others, (identity, owners), bytes, budget).await
   }
@@ -4122,6 +4275,7 @@ async fn put_whole(
     identity: identity.0,
     configuration: installed_configuration(),
     owners,
+    durable: true,
     bytes,
   }
   .encode();

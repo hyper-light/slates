@@ -48,8 +48,12 @@ pub const HOME_STREAM: u64 = 30;
 /// installed version, rather than holding it: the hold kept its sender's record session across a wait only that session
 /// could end. 0x86 (main 01a20182's order of 2026-11-26 after ruling R piece (i)) settles an attempt's holds in one
 /// message a home ([`HomeMessage::Settle`], answered [`HomeOutcome::Settled`]) rather than one an object: a Mercurial push
-/// homes two objects a segment, about 4,200 for Mercurial's own 57k history.
-pub const VERSION: u8 = 0x86;
+/// homes two objects a segment, about 4,200 for Mercurial's own 57k history. 0x87 (main 01a20182's order of 2026-11-26
+/// after r42: a homed object's put waited for its remote home's image, once an object) lets a put say whether it is
+/// answered once durable (`durable`, as before) or at once, its `Kept` naming the home shard's place and the generation
+/// it is durable from; one [`HomeMessage::Durable`] a home then carries a push's barrier, answered
+/// [`HomeOutcome::Published`] once those images are published (homes.rs: group commit per shard).
+pub const VERSION: u8 = 0x87;
 /// Format: the kind byte of a put.
 const KIND_PUT: u8 = 1;
 /// Format: the kind byte of a read.
@@ -74,6 +78,10 @@ const KIND_SETTLE: u8 = 10;
 const SETTLE_MOVED: u8 = 1;
 /// Format: a settle's kind byte: one owner's hold of each let go.
 const SETTLE_LET_GO: u8 = 2;
+/// Format: the kind byte of a barrier: a sender's tickets at one home, waited on together (version 0x87).
+const KIND_DURABLE: u8 = 11;
+/// Format: the bytes one ticket takes in a barrier: its home shard's place (`u16`) and the generation (`u64`).
+const TICKET_BYTES: usize = size_of::<u16>() + size_of::<u64>();
 /// Format: an owner's tag byte: an attempt in flight.
 const OWNER_ATTEMPT: u8 = 1;
 /// Format: an owner's tag byte: the records naming it.
@@ -110,6 +118,12 @@ const OUTCOME_OWED: u8 = 9;
 const OUTCOME_BEHIND: u8 = 10;
 /// Format: the outcome byte of a settle's answer, then the count of its objects settled (version 0x86).
 const OUTCOME_SETTLED: u8 = 11;
+/// Format: the outcome byte of a barrier's answer, then the count of its tickets published (version 0x87).
+const OUTCOME_PUBLISHED: u8 = 12;
+
+/// The most tickets one barrier names ([`HomeMessage::Durable`]): as many as one message's byte string may carry.
+/// Derived: `slates_archive::format::MAX_CHUNK_BYTES / 10`, a ticket's bytes; a node's shards are far fewer.
+pub const DURABLE_MOST: u64 = MAX_CHUNK_BYTES / 10;
 
 /// The most objects one settle names ([`HomeMessage::Settle`]): as many identities as one message's byte string may
 /// carry. Derived: `slates_archive::format::MAX_CHUNK_BYTES / 32`, so a settle is no longer than a put's window.
@@ -233,6 +247,9 @@ pub enum HomeOutcome {
   /// The window is kept, durable from this image generation of the member's home shard on (answered only once that
   /// image is published).
   Kept {
+    /// The home shard's place among the member's shards (its partition), by which a barrier names it
+    /// ([`HomeMessage::Durable`]): never the runtime's shard id, which a restart renumbers.
+    place: u16,
     /// The image generation.
     generation: u64,
   },
@@ -268,6 +285,11 @@ pub enum HomeOutcome {
   Settled {
     /// The objects settled.
     settled: u64,
+  },
+  /// A barrier's answer (version 0x87): how many of its tickets' images are published.
+  Published {
+    /// The tickets published.
+    published: u64,
   },
   /// A put's answer from a member behind the configuration its sender ranked the window's homes by (A-912): nothing
   /// kept; the sender asks again once the council's next round has passed, which brings the member's install.
@@ -306,6 +328,9 @@ pub enum HomeMessage {
     configuration: u64,
     /// Who it is kept for (at least one).
     owners: Vec<HomeOwner>,
+    /// Whether it is answered only once durable (its home's image holding it published), else at once, its durability
+    /// left to the sender's barrier ([`HomeMessage::Durable`], version 0x87).
+    durable: bool,
     /// Its bytes.
     bytes: Vec<u8>,
   },
@@ -330,6 +355,8 @@ pub enum HomeMessage {
     configuration: u64,
     /// Who it is kept for, once whole (at least one).
     owners: Vec<HomeOwner>,
+    /// Whether the last part is answered only once the object is durable, else at once ([`HomeMessage::Put`]'s).
+    durable: bool,
     /// The object's length.
     total: u64,
     /// Where this part begins.
@@ -377,6 +404,13 @@ pub enum HomeMessage {
     settle: SettleOf,
     /// The objects.
     identities: Vec<[u8; 32]>,
+  },
+  /// Wait for every one of `tickets` (each a home shard's place on the member and an image generation) to be published,
+  /// a push's barrier at this home (version 0x87). On the wire its identity field is all zeros, no one object being meant,
+  /// and the tickets follow, at most [`DURABLE_MOST`].
+  Durable {
+    /// The tickets.
+    tickets: Vec<(u16, u64)>,
   },
   /// A member's answer about the window named `identity`.
   Answer {
@@ -431,12 +465,14 @@ impl HomeMessage {
         identity,
         configuration,
         owners,
+        durable,
         bytes,
       } => {
         out.push(KIND_PUT);
         out.extend_from_slice(identity);
         out.extend_from_slice(&configuration.to_le_bytes());
         put_owners(&mut out, owners);
+        out.push(u8::from(*durable));
         put_blob(&mut out, bytes);
       }
       HomeMessage::Read { identity } => {
@@ -458,6 +494,7 @@ impl HomeMessage {
         identity,
         configuration,
         owners,
+        durable,
         total,
         offset,
         bytes,
@@ -466,6 +503,7 @@ impl HomeMessage {
         out.extend_from_slice(identity);
         out.extend_from_slice(&configuration.to_le_bytes());
         put_owners(&mut out, owners);
+        out.push(u8::from(*durable));
         out.extend_from_slice(&total.to_le_bytes());
         out.extend_from_slice(&offset.to_le_bytes());
         put_blob(&mut out, bytes);
@@ -490,6 +528,19 @@ impl HomeMessage {
         out.push(KIND_REBUILT);
         out.extend_from_slice(&[0; 32]);
         out.extend_from_slice(repository);
+      }
+      HomeMessage::Durable { tickets } => {
+        out.push(KIND_DURABLE);
+        out.extend_from_slice(&[0; 32]);
+        out.extend_from_slice(
+          &u32::try_from(tickets.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+        );
+        for (place, generation) in tickets {
+          out.extend_from_slice(&place.to_le_bytes());
+          out.extend_from_slice(&generation.to_le_bytes());
+        }
       }
       HomeMessage::Settle { settle, identities } => {
         out.push(KIND_SETTLE);
@@ -518,8 +569,9 @@ impl HomeMessage {
         out.push(KIND_ANSWER);
         out.extend_from_slice(identity);
         match outcome {
-          HomeOutcome::Kept { generation } => {
+          HomeOutcome::Kept { place, generation } => {
             out.push(OUTCOME_KEPT);
+            out.extend_from_slice(&place.to_le_bytes());
             out.extend_from_slice(&generation.to_le_bytes());
           }
           HomeOutcome::Bytes(bytes) => {
@@ -554,6 +606,10 @@ impl HomeMessage {
             out.push(OUTCOME_SETTLED);
             out.extend_from_slice(&settled.to_le_bytes());
           }
+          HomeOutcome::Published { published } => {
+            out.push(OUTCOME_PUBLISHED);
+            out.extend_from_slice(&published.to_le_bytes());
+          }
         }
       }
     }
@@ -574,6 +630,7 @@ impl HomeMessage {
         identity,
         configuration: reader.long()?,
         owners: reader.owners()?,
+        durable: reader.flag()?,
         bytes: reader.blob()?,
       },
       KIND_READ => HomeMessage::Read { identity },
@@ -589,6 +646,7 @@ impl HomeMessage {
         identity,
         configuration: reader.long()?,
         owners: reader.owners()?,
+        durable: reader.flag()?,
         total: reader.long()?,
         offset: reader.long()?,
         bytes: reader.blob()?,
@@ -611,6 +669,9 @@ impl HomeMessage {
         repository: <[u8; REPOSITORY_BYTES]>::try_from(reader.take(REPOSITORY_BYTES)?)
           .map_err(|_| HomeWireError::Truncated)?,
       },
+      KIND_DURABLE if identity == [0; 32] => HomeMessage::Durable {
+        tickets: reader.tickets()?,
+      },
       KIND_SETTLE if identity == [0; 32] => {
         let settle = match reader.byte()? {
           SETTLE_MOVED => SettleOf::Moved {
@@ -630,6 +691,7 @@ impl HomeMessage {
       KIND_ANSWER => {
         let outcome = match reader.byte()? {
           OUTCOME_KEPT => HomeOutcome::Kept {
+            place: reader.short()?,
             generation: reader.long()?,
           },
           OUTCOME_BYTES => HomeOutcome::Bytes(reader.blob()?),
@@ -652,6 +714,9 @@ impl HomeMessage {
           },
           OUTCOME_SETTLED => HomeOutcome::Settled {
             settled: reader.long()?,
+          },
+          OUTCOME_PUBLISHED => HomeOutcome::Published {
+            published: reader.long()?,
           },
           OUTCOME_NAMED => HomeOutcome::Named {
             named: match reader.byte()? {
@@ -712,6 +777,37 @@ impl<'a> Reader<'a> {
       .first()
       .copied()
       .ok_or(HomeWireError::Truncated)
+  }
+
+  fn short(&mut self) -> Result<u16, HomeWireError> {
+    let bytes = <[u8; size_of::<u16>()]>::try_from(self.take(size_of::<u16>())?)
+      .map_err(|_| HomeWireError::Truncated)?;
+    Ok(u16::from_le_bytes(bytes))
+  }
+
+  /// A flag byte, 0 or 1; any other byte is no flag.
+  fn flag(&mut self) -> Result<bool, HomeWireError> {
+    match self.byte()? {
+      0 => Ok(false),
+      1 => Ok(true),
+      byte => Err(HomeWireError::Unknown { byte }),
+    }
+  }
+
+  /// A count of tickets, then each ([`HomeMessage::Durable`]): the count checked against [`DURABLE_MOST`] and the bytes
+  /// left before anything is reserved, and at least one.
+  fn tickets(&mut self) -> Result<Vec<(u16, u64)>, HomeWireError> {
+    let bytes = <[u8; 4]>::try_from(self.take(4)?).map_err(|_| HomeWireError::Truncated)?;
+    let count = usize::try_from(u32::from_le_bytes(bytes)).map_err(|_| HomeWireError::BadLength)?;
+    let most = usize::try_from(DURABLE_MOST).unwrap_or(usize::MAX);
+    if count == 0 || count > most || count > self.rest.len() / TICKET_BYTES {
+      return Err(HomeWireError::BadLength);
+    }
+    let mut tickets = Vec::with_capacity(count);
+    for _ in 0..count {
+      tickets.push((self.short()?, self.long()?));
+    }
+    Ok(tickets)
   }
 
   fn long(&mut self) -> Result<u64, HomeWireError> {
@@ -817,15 +913,31 @@ mod tests {
     let bytes = proptest::collection::vec(any::<u8>(), 0..2048);
     let owners = || proptest::collection::vec(owner(), 1..4);
     proptest::strategy::Union::new([
-      (identity, any::<u64>(), owners(), bytes.clone())
+      (
+        identity,
+        any::<u64>(),
+        owners(),
+        any::<bool>(),
+        bytes.clone(),
+      )
         .prop_map(
-          |(identity, configuration, owners, bytes)| HomeMessage::Put {
+          |(identity, configuration, owners, durable, bytes)| HomeMessage::Put {
             identity,
             configuration,
             owners,
+            durable,
             bytes,
           },
         )
+        .boxed(),
+      proptest::collection::vec((any::<u16>(), any::<u64>()), 1..8)
+        .prop_map(|tickets| HomeMessage::Durable { tickets })
+        .boxed(),
+      any::<u64>()
+        .prop_map(|published| HomeMessage::Answer {
+          identity: [0; 32],
+          outcome: HomeOutcome::Published { published },
+        })
         .boxed(),
       identity
         .prop_map(|identity| HomeMessage::Read { identity })
@@ -846,6 +958,7 @@ mod tests {
             identity,
             configuration,
             owners,
+            durable: total % 2 == 0,
             total,
             offset,
             bytes,
@@ -918,10 +1031,10 @@ mod tests {
           outcome: HomeOutcome::Part { total, bytes },
         })
         .boxed(),
-      (identity, any::<u64>())
-        .prop_map(|(identity, generation)| HomeMessage::Answer {
+      (identity, any::<u16>(), any::<u64>())
+        .prop_map(|(identity, place, generation)| HomeMessage::Answer {
           identity,
-          outcome: HomeOutcome::Kept { generation },
+          outcome: HomeOutcome::Kept { place, generation },
         })
         .boxed(),
       (identity, bytes)
@@ -1000,6 +1113,61 @@ mod tests {
     );
   }
 
+  /// Version 0x87's barrier (main 01a20182's order of 2026-11-26), hostile. Do: decode a barrier of two tickets; then one
+  /// whose count is none, past the bytes it carries, and past [`super::DURABLE_MOST`]; one naming an object in its
+  /// identity field; and a put whose durable flag is neither 0 nor 1. Expect: the first read back as written; each other
+  /// refused by its kind, nothing reserved for a count its bytes cannot hold.
+  #[test]
+  fn a_barrier_reads_back_whole_and_a_hostile_one_is_refused_by_kind() {
+    let barrier = HomeMessage::Durable {
+      tickets: vec![(0, 7), (3, 9)],
+    };
+    let written = barrier.encode();
+    assert_eq!(HomeMessage::decode(&written), Ok(barrier));
+    let head = |count: u32| {
+      let mut bytes = vec![VERSION, super::KIND_DURABLE];
+      bytes.extend_from_slice(&[0; 32]);
+      bytes.extend_from_slice(&count.to_le_bytes());
+      bytes
+    };
+    let past_most = u32::try_from(super::DURABLE_MOST + 1).unwrap();
+    for count in [0, 2, u32::MAX, past_most] {
+      let mut lying = head(count);
+      lying.extend_from_slice(&[1; 10]);
+      assert_eq!(
+        HomeMessage::decode(&lying),
+        Err(HomeWireError::BadLength),
+        "count {count}"
+      );
+    }
+    let mut naming = written.clone();
+    naming[2] = 7;
+    assert_eq!(
+      HomeMessage::decode(&naming),
+      Err(HomeWireError::Unknown {
+        byte: super::KIND_DURABLE
+      })
+    );
+    let put = HomeMessage::Put {
+      identity: [5; 32],
+      configuration: 1,
+      owners: vec![HomeOwner::Record {
+        repository: [3; 16],
+      }],
+      durable: false,
+      bytes: vec![1, 2, 3],
+    }
+    .encode();
+    // The flag lies after the head (version, kind, identity), the configuration and the owners' count and one record owner.
+    let flag = 2 + 32 + 8 + 4 + 1 + 16;
+    let mut flagged = put.clone();
+    flagged[flag] = 2;
+    assert_eq!(
+      HomeMessage::decode(&flagged),
+      Err(HomeWireError::Unknown { byte: 2 })
+    );
+  }
+
   /// Version 0x86's settle (main 01a20182's order of 2026-11-26), hostile. Do: decode a settle of two objects; then one
   /// whose count is none, past the bytes it carries, and past [`super::SETTLE_MOST`]; one naming an object in its identity
   /// field; and one of an unknown settle kind. Expect: the first read back as written; each other refused by its kind,
@@ -1059,12 +1227,12 @@ mod tests {
     long.extend_from_slice(&0u64.to_le_bytes());
     long.extend_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(HomeMessage::decode(&long), Err(HomeWireError::BadLength));
-    let mut unknown = vec![VERSION, super::KIND_SETTLE + 1];
+    let mut unknown = vec![VERSION, super::KIND_DURABLE + 1];
     unknown.extend_from_slice(&[0; 32]);
     assert_eq!(
       HomeMessage::decode(&unknown),
       Err(HomeWireError::Unknown {
-        byte: super::KIND_SETTLE + 1
+        byte: super::KIND_DURABLE + 1
       })
     );
     let mut naming = vec![VERSION, super::KIND_REBUILT];

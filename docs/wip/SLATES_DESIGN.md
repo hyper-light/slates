@@ -65447,6 +65447,34 @@ Applied in the same change to:
       unsent, then a resolution pass on the successor. Red with the Mercurial arm off: 26 of 55 lost.
     - `homes::tests::an_identitys_home_is_the_head_of_the_one_rendezvous_ranking_and_homes_spread`: the same place
       whatever the shards' ids.
+- **The remote home's barrier, one exchange a home a push** (main 01a20182's order of 2026-11-26: "a measured gap is
+  fixed now, never left owed"; r42 at 30de9030f read the local barrier once a home shard, push 63 s). Applied in the same
+  change to:
+  - `crates/cluster/src/homes.rs`: home wire 0x87. A put and a put's part say whether they are answered once durable
+    (`durable`, as every put was) or at once. `Kept` names the home shard's place among the member's shards (never its
+    runtime id) beside the generation. `HomeMessage::Durable` carries a sender's tickets at one home (at most
+    `DURABLE_MOST`) and is answered `Published` with how many of their images are. A member of 0x86 is refused typed by
+    the version rule.
+  - `crates/server/src/vcs_store/homes.rs`:
+    - a remote home answers a put asked at once as soon as it is kept (`keep_put`), and serves a barrier
+      (`durable_answer`);
+    - `home_in_region_deferred` asks remote homes at once and keeps each home shard's latest ticket in a `Barrier`;
+    - `barrier_published` waits on this node's tickets and sends one `Durable` a remote home, counted
+      `vcs_store.homes.remote_barriers`;
+    - git's homings and the healer still ask durable, unchanged.
+  - `crates/server/src/repository/hg_run.rs`: a push's one barrier is `barrier_published` over its run's `Barrier`.
+  - `crates/server/src/vcs_share/place.rs`: `first_by_place`, the one ranking of a node's shards by place.
+    `homes::home_of` and a push's `intake_shard` both use it (the sibling found above).
+  - Held by:
+    - `homes::tests::puts_asked_at_once_are_kept_unpublished_and_one_barrier_a_home_publishes_them`: eight puts kept with
+      no publication, then one barrier publishing once a home shard. Red with the flag ignored: 8 publications.
+    - `vcs_share::place::tests::a_pushs_intake_shard_is_ranked_by_place_whatever_the_shards_ids`: red, renumbered shards
+      moved push 0 from place 3 to 0.
+    - The wire's `a_barrier_reads_back_whole_and_a_hostile_one_is_refused_by_kind`.
+    - Across real processes, `crates/cli/tests/hg_takeover.rs` (`#[ignore]`d, run as
+      `SLATES_TEST_HG=hg cargo test -p slates-cli --test hg_takeover -- --ignored`): three anchors at `f = 1`, stock hg
+      pushes, the owner killed with one in flight, a survivor serving every acknowledged changeset in order, `hg verify`
+      clean.
 - **The settle queue, batched and bounded** (main 01a20182's order of 2026-11-26, after piece (i): its settles were one
   region exchange an object, two a segment, about 4,200 for the 57k, in a queue with no bound; CLAUDE.md §2 item 8).
   Applied in the same change to:
