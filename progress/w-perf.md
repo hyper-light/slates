@@ -817,3 +817,13 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     what_holds prints every vcs_store.image.* row. Focused tests: 49 passed.
   - Waiting on main: the 57k rerun with these counters, then its ruling: (a) carry a piece in parts, which takes the
     copy out, or (b) fewer cuts, its guess. Then the make_chain keep rows (36.0 MB live after the push, texts.rs:1607).
+- 2026-11-27 ~03:00 PST:
+  - LANDED 279688c64 (1ae227e91): the text cache's index counts against its bound (INDEX_ENTRY_BYTES, 97 B a text)
+    and shrinks after it (INDEX_SLACK); gauge mem.gauge.store.text_cache_index_bytes. The 35.7 MB keep row was the
+    index (tiny texts and refresh entries per 1 MiB chunk). Red: 100,000 texts of 8 B read twice grew the heap
+    12,304,632 B against a 1 MiB bound; now 131,872.
+  - LANDED 279688c64 (6d2f9bcd3, alone): what_holds prints vcs_store.homes.* beside vcs_store.image.*.
+  - Main's ruling (b) reworded: persistence before reply stands; the cadence rule waits on the 57k rerun's
+    published_for_ticket (about 1: a byte rule for cuts nobody waits on, plus a cut a ticket asks for and one at idle;
+    near 17,745: fold the other waits under A-929's barrier).
+  - Waiting on main: that rerun.
