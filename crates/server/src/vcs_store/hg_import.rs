@@ -391,7 +391,12 @@ pub(crate) const SEGMENT_LAND_WAIT_MAX_NS: &str = "vcs_store.hg_import.segment_l
 /// waiting or not: what [`SEGMENT_LAND_WAIT_NS`] is held against. Format: a counter name.
 pub(crate) const SEGMENT_LAND_NS: &str = "vcs_store.hg_import.segment_land_ns";
 /// Counter: a segment's landing the store answered while the import went on with its turns, its wait overlapped with
-/// the import's work (`run`'s pipelined landing). Format: a counter name.
+/// the import's work (`run`'s pipelined landing): its answer seen at a yield beside the import's turns, or sent by the
+/// store's owner before the import began to wait for it, by the owner's own stamp (`slates_store::owner::Landed`).
+/// Until 2026-11-27 only the first counted: where every turn cut a segment, the hand-over came right after the turn in
+/// which the landing ended, no yield between, so a landing sent 0.8 ms into a 49 ms turn read as awaited (diag CI 9's
+/// Windows lanes, 0 of 67). A landing begun and awaited at once is sent after its wait began, and is not counted.
+/// Format: a counter name.
 pub(crate) const SEGMENTS_LANDED_OVERLAPPED: &str =
   "vcs_store.hg_import.segments_landed_overlapped";
 
@@ -1289,8 +1294,9 @@ fn landing_refusal(refused: AppendRefused) -> Refusal {
 /// the 57k import at 1227afcb1 waited 20.3 s, about 18 % of it, for 2,087 landings awaited one by one, each its one
 /// durable flush): the store's answer to come, the segment's sequence and payload identity, and when it was asked.
 pub(crate) struct SegmentInFlight {
-  /// Whether the store landed it, once it answers.
-  answer: core::pin::Pin<Box<dyn core::future::Future<Output = bool>>>,
+  /// When the store's owner sent its answer, on `slates_machine::clock::monotonic_ns`, where it landed it; none where it
+  /// refused it.
+  answer: core::pin::Pin<Box<dyn core::future::Future<Output = Option<u64>>>>,
   /// Its changeset's sequence.
   sequence: u64,
   /// Its payload's identity.
@@ -1327,26 +1333,52 @@ async fn landing_begun(id: RepositoryId) -> Option<Result<Option<SegmentInFlight
     identity,
     began: slates_rt::futures::now_ns(),
     sections: crate::repository::hg_run::section_bytes(&parts),
-    answer: Box::pin(async move { disk.land(header, parts).await.is_ok() }),
+    answer: Box::pin(async move {
+      disk
+        .land_stamped(header, parts)
+        .await
+        .ok()
+        .map(|landed| landed.sent_ns)
+    }),
   })))
 }
 
-/// `landing` answered `landed` (`segment_landed`): its time counted, and the time the import was held waiting for it,
-/// where `waited`, else counted overlapped with the import's work.
+/// How a landing's answer met the import: seen at a yield beside its turns, or waited for at its hand-over.
+#[derive(Clone, Copy)]
+enum Met {
+  /// Seen at a yield: the import never waited for it.
+  Beside,
+  /// Waited for at the hand-over.
+  HandedOver {
+    /// When the wait began, on `slates_machine::clock::monotonic_ns` (the store owner's stamp's clock).
+    began: u64,
+    /// How long the import was held, on the shard's clock.
+    waited: u64,
+  },
+}
+
+/// `landing` answered `sent` (when its owner sent a landed answer; none for a refusal, `segment_landed`): its time
+/// counted, the time the import was held waiting for it where it was, and counted overlapped with the import's work
+/// where it was seen at a yield or sent before its hand-over began ([`SEGMENTS_LANDED_OVERLAPPED`]).
 fn landing_settled(
   id: RepositoryId,
   landing: &SegmentInFlight,
-  (landed, waited): (bool, Option<u64>),
+  (sent, met): (Option<u64>, Met),
 ) -> Option<Result<(), ImportFailed>> {
   let took = slates_rt::futures::now_ns().saturating_sub(landing.began);
+  let landed = sent.is_some();
+  let overlapped = match met {
+    Met::Beside => true,
+    Met::HandedOver { began, .. } => sent.is_some_and(|sent| sent < began),
+  };
   crate::state::with_state(|state| {
     state.count(SEGMENT_LAND_NS, took);
-    match waited {
-      Some(waited) => {
-        state.count(SEGMENT_LAND_WAIT_NS, waited);
-        state.count_max(SEGMENT_LAND_WAIT_MAX_NS, waited);
-      }
-      None => state.count(SEGMENTS_LANDED_OVERLAPPED, 1),
+    if let Met::HandedOver { waited, .. } = met {
+      state.count(SEGMENT_LAND_WAIT_NS, waited);
+      state.count_max(SEGMENT_LAND_WAIT_MAX_NS, waited);
+    }
+    if overlapped {
+      state.count(SEGMENTS_LANDED_OVERLAPPED, 1);
     }
     if landed {
       crate::repository::hg_run::count_landed(state, landing.sections);
@@ -1363,10 +1395,11 @@ pub(crate) async fn landed_in_flight(
   let Some(mut landing) = flight.take() else {
     return Some(Ok(()));
   };
+  let began = slates_machine::clock::monotonic_ns();
   let held = slates_rt::futures::now_ns();
-  let landed = landing.answer.as_mut().await;
+  let sent = landing.answer.as_mut().await;
   let waited = slates_rt::futures::now_ns().saturating_sub(held);
-  landing_settled(id, &landing, (landed, Some(waited)))
+  landing_settled(id, &landing, (sent, Met::HandedOver { began, waited }))
 }
 
 /// Yields the shard, the landing in `flight` answering meanwhile if it can: settled then, overlapped with the import's
@@ -1382,8 +1415,8 @@ async fn yielded_beside(
   let raced =
     slates_rt::futures::race2(landing.answer.as_mut(), slates_rt::futures::yield_now()).await;
   match (raced, flight.take()) {
-    (slates_rt::futures::Either::First(landed), Some(landing)) => {
-      landing_settled(id, &landing, (landed, None))
+    (slates_rt::futures::Either::First(sent), Some(landing)) => {
+      landing_settled(id, &landing, (sent, Met::Beside))
     }
     (_, taken) => {
       *flight = taken;

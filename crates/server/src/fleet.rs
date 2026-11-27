@@ -12593,6 +12593,9 @@ pub(crate) const STRAGGLER_RETURNED: &str = "fleet.stragglers.returned";
 /// Format: the status count of a straggler's link dropped to be dialed afresh, its request unanswered at its deadline
 /// (A-907).
 pub(crate) const STRAGGLER_REDIALED: &str = "fleet.stragglers.redialed";
+/// Format: the status count of an exchange's reply with no round trip (a deadline, a transport error), settled as no
+/// answer ([`settle_replies`], A-914).
+pub(crate) const REPLY_NO_ROUND_TRIP: &str = "fleet.replies.no_round_trip";
 
 /// A broadcast's stragglers settled by their caller (A-907): waited for within their dispatch's deadline
 /// (`Stragglers::settle`, woken by each report), each answered one's session put back on its link and its reply given
@@ -12605,13 +12608,33 @@ pub(crate) async fn settled_stragglers(
   settle_late(late)
 }
 
-/// Puts late stragglers where they belong, on the control shard (A-907): an answered one's session back on its link
-/// ([`return_sessions`]), an unanswered one's link, still out on loan, dropped to be dialed afresh. The answered replies.
-fn settle_late(late: Vec<(HostId, TimedReply, Endpoint)>) -> Vec<(HostId, Vec<u8>)> {
+/// Puts late stragglers where they belong, on the control shard (A-907), as [`settle_replies`] does, counting the
+/// sessions given back. The answered replies.
+pub(crate) fn settle_late(late: Vec<(HostId, TimedReply, Endpoint)>) -> Vec<(HostId, Vec<u8>)> {
+  let (answers, returned) = settle_replies(late);
+  let _ = state::with_state(|s| {
+    s.count(
+      STRAGGLER_RETURNED,
+      u64::try_from(returned).unwrap_or(u64::MAX),
+    );
+  });
+  answers
+}
+
+/// Settles an exchange's replies on the control shard, timely or late, by whether each peer answered (A-907, A-914):
+/// one with a round trip (`TimedReply::round_trip_ns`, Karn's rule: a reply that came back, however empty) is an answer,
+/// its session given back on its link ([`return_sessions`]); one without (a deadline, a transport error, its stream
+/// broken mid-exchange) is no answer, and its link, still out on loan, is dropped to be dialed afresh. Its empty bytes
+/// are never read as a reply. The answered replies, and how many sessions went back. Before (A-914), a home's put whose
+/// stream broke as the home died was read empty, so undecodable, and taken for a member of another home wire version,
+/// which ends a homing at once (A-727 (d1a)): a914's second push refused `retry` 2 s into its 18 s budget.
+pub(crate) fn settle_replies(
+  replies: Vec<(HostId, TimedReply, Endpoint)>,
+) -> (Vec<(HostId, Vec<u8>)>, usize) {
   let mut answers = Vec::new();
   let mut sessions = Vec::new();
   let mut lost = Vec::new();
-  for (host, reply, endpoint) in late {
+  for (host, reply, endpoint) in replies {
     if reply.round_trip_ns.is_none() {
       lost.push(host);
       continue;
@@ -12619,15 +12642,16 @@ fn settle_late(late: Vec<(HostId, TimedReply, Endpoint)>) -> Vec<(HostId, Vec<u8
     answers.push((host, reply.bytes));
     sessions.push((host, endpoint));
   }
+  let returned = sessions.len();
   let _ = state::with_state(|s| {
-    redial_lent(s, &lost);
     s.count(
-      STRAGGLER_RETURNED,
-      u64::try_from(sessions.len()).unwrap_or(u64::MAX),
+      REPLY_NO_ROUND_TRIP,
+      u64::try_from(lost.len()).unwrap_or(u64::MAX),
     );
+    redial_lent(s, &lost);
   });
   return_sessions(sessions);
-  answers
+  (answers, returned)
 }
 
 /// Drops the links of `hosts` still out on loan (their session gone with a straggler), so each link task dials afresh,

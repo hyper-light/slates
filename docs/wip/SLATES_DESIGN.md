@@ -66263,6 +66263,10 @@ Applied in the same change to:
 - **Applied in the same change to:** `crates/server/src/{member_task,edges,fleet,state,daemon}.rs`,
   `crates/cluster/src/member_plane.rs` (`MemberPlane::is_joined`), `crates/server/tests/fleet.rs`, A-921 part 4's
   entry, GAPS.
+- **Amended** (2026-11-27, main 01a20182's order of 09:50): the re-key watch is judged from each node's last look that
+  saw it not yet re-keyed, so the test's own looks (one control-shard question a node in turn) add nothing, and its
+  bound is the restarted node's detection plus both nodes' measured wake lateness (`detector_granularity_ns`), never a
+  bare 1 s. Diag 10's Windows x86_64 lane met node 2 first seen at 1,010 ms: a timer tick of 15.625 ms on each look.
 
 ### A-932 — A merge record names its green's lineage, and a holder makes a green standing alone at once (2026-11-27, w-interop for main 01a20182, its ruling (a) of 2026-11-27 07:06 and its approval of 07:08; the fleet suite's red; amends A-908 and A-908 part 4; A-636 part 2b-2, A-145, A-255)
 
@@ -66393,3 +66397,31 @@ Applied in the same change to:
 - **Applied in the same change to:** `crates/server/src/{merge_service,merge_origin,ledger_read,green_adopt,fleet}.rs`,
   `crates/server/tests/fleet.rs`, A-918 (i)'s entry, GAPS.
 
+### A-914 (d) — A reply with no round trip is no answer: a home whose put broke as it died never ends a homing short (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 09:33 and 09:43; a914's named debt; amends A-907 and A-727 (d1a))
+
+- **Why.** a914's second push, during the second stretched death, was refused `retry` at its homing (1 of 7, then 1 of
+  3), its window 18 s. The failing run's log names it: the dying home "answered a put … other than kept after 1999 ms:
+  unreadable: Truncated", and the homing "fell short: 1 of 2 homes kept it" at once. The home's stream broke, so the
+  exchange reported empty bytes with no round trip (`TimedReply::round_trip_ns` is `None`: a deadline or a transport
+  error, Karn's rule). `vcs_store::homes::exchange_round` never read the round trip. It decoded the empty bytes,
+  failed, and counted them a member of another home wire version's reply (A-727 (d1a)), which ends a homing at once.
+  The straggler path already read the round trip (`fleet::settle_late`); the timely one did not.
+- **The rule.** One settle path for every reply an exchange gets, timely or late (`fleet::settle_replies`). A reply
+  with a round trip is an answer, its session given back on its link. One without is no answer: its empty bytes are
+  never read, its link (still out on loan) is dropped to be dialed afresh, counted `fleet.replies.no_round_trip`.
+  `settle_late` is that path with its own count. A homes exchange takes only the answered replies, timely or late; a home
+  with none stays left (counted `vcs_store.homes.reply_unanswered`), and the homing waits within its budget and ranks its homes
+  again once a configuration installs (A-912), as for any home that died unseen. A peer of another home wire version
+  answers empty with a round trip, so A-727 (d1a) still ends that homing at once, unchanged.
+- **Not done here (main's ruling).** The sweep's siblings, the other readers of a reply's bytes that never read its
+  round trip, are recorded in GAPS under A-914 and worked when measured or blocking; one of them changes state (a
+  commit's holder dropped from a version's inputs acks on a transport failure).
+- **Tests.**
+  - Fleet `a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once` (red first). Three nodes at
+    `f = 1`. b and c hold each home message a homing budget before answering (`Daemon::delay_home_answers`). a pushes,
+    and the node first asked a home put (`vcs_store.homes.remote_asked`, counted as a message arrives: so it is one of
+    the window's homes, never vacuous) is stopped. a must count no reply of another version, at least one settled as
+    unanswered, and its push land or be refused only after its window.
+  - a914 asserts its second push lands, closing its named debt.
+- **Applied in the same change to:** `crates/server/src/{fleet,vcs_store/homes}.rs`, `crates/server/tests/fleet.rs`
+  (`push_on_top_at_edge`, shared by `GitFleet::push_on_top_of`), GAPS.

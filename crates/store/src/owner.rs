@@ -116,7 +116,7 @@ enum Request {
   Land {
     header: Header,
     parts: Vec<Part>,
-    answer: Sender<Result<Located, StoreError>>,
+    answer: Sender<Result<Landed, StoreError>>,
   },
   Piece {
     identity: Identity,
@@ -799,9 +799,8 @@ fn refuse_all(incoming: &mut ChannelReceiver<Asked>, reason: &str) {
       Request::Begin { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::Section { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::Part { answer, .. } => drop(answer.try_send(unopened(reason))),
-      Request::Commit { answer, .. } | Request::Land { answer, .. } => {
-        drop(answer.try_send(unopened(reason)))
-      }
+      Request::Commit { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::Land { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::Stop => return,
       Request::Dropped => {}
       Request::Piece { answer, .. } | Request::Text { answer, .. } => {
@@ -818,6 +817,16 @@ fn refuse_all(incoming: &mut ChannelReceiver<Asked>, reason: &str) {
       Request::Places { answer, .. } => drop(answer.try_send(unopened(reason))),
     }
   }
+}
+
+/// A landed changeset and when the owner sent its answer, on `slates_machine::clock::monotonic_ns` (red 4 of diag CI 9,
+/// main 01a20182's ruling (a') of 2026-11-27): one read on the owner's thread a landing.
+#[derive(Debug, Clone, Copy)]
+pub struct Landed {
+  /// Where it landed.
+  pub located: Located,
+  /// When the owner sent the answer, on the machine's monotonic clock, which every thread of the process reads alike.
+  pub sent_ns: u64,
 }
 
 /// The owner's loop: open (recovering), then answer requests until every handle is gone, then checkpoint.
@@ -963,7 +972,14 @@ fn serve(
           .iter()
           .map(|(kind, bytes)| (*kind, Contents::Bytes(bytes)))
           .collect();
-        let answered = store.land(header, &sections, &staging);
+        // Stamped as the answer goes, on this thread: what tells its asker whether the landing ended before it began to
+        // wait for it (`Landed::sent_ns`).
+        let answered = store
+          .land(header, &sections, &staging)
+          .map(|located| Landed {
+            located,
+            sent_ns: slates_machine::clock::monotonic_ns(),
+          });
         timer.reply((&store, &texts), &answer, answered);
       }
       Request::Piece {
@@ -1278,6 +1294,16 @@ impl StoreHandle {
   /// Lands a changeset whose sections are `parts` (their bytes moved in): appended, committed with one flush, its rows
   /// applied; answered once it is durable.
   pub async fn land(&self, header: Header, parts: Vec<Part>) -> Result<Located, OwnerError> {
+    self
+      .land_stamped(header, parts)
+      .await
+      .map(|landed| landed.located)
+  }
+
+  /// [`StoreHandle::land`], with when the owner sent its answer ([`Landed::sent_ns`]): what an asker that went on
+  /// meanwhile compares with when it began to wait (an import's pipelined segment landing, `slates-server`'s
+  /// `vcs_store::hg_import`).
+  pub async fn land_stamped(&self, header: Header, parts: Vec<Part>) -> Result<Landed, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
     let landed = self
       .ask(
@@ -1289,8 +1315,8 @@ impl StoreHandle {
         answers,
       )
       .await;
-    if let Ok(located) = &landed {
-      landed_flush(located);
+    if let Ok(landed) = &landed {
+      landed_flush(&landed.located);
     }
     landed
   }
