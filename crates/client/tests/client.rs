@@ -19,6 +19,9 @@ use slates_client::{
   Client, ClientError, CreateSpec, Deadlines, Intent, NamePolicy, SizeClass, Submitted,
 };
 use slates_ipc::HeldRendezvous;
+
+#[path = "support/held_again.rs"]
+mod held_again;
 use slates_ipc::protocol::{Refusal, RequestBody, VolumeRefusal};
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::daemon::LIVENESS_BUDGET_NS;
@@ -3158,7 +3161,8 @@ fn played_anchor(profile: &MachineProfile, config: &DaemonConfig, tag: &str) -> 
   .unwrap();
   PlayedAnchor {
     segment,
-    rendezvous: HeldRendezvous::hold(&config.instance).unwrap(),
+    // Held again for the same instance by a test's second anchor and by each partition's (support/held_again.rs).
+    rendezvous: held_again::hold_once_released(&config.instance),
   }
 }
 

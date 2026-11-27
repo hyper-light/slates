@@ -8215,6 +8215,58 @@ impl Green {
     None
   }
 
+  /// [`Self::beginning_some`]'s node moves. A node moves only to a link that survives its home: where the head names no
+  /// link (the map's count, read with no walk) and the version makes none, there is none, and no effect is walked
+  /// (A-920: every import's case; a move of 9,000 files walked its 18,000 effects in one unit, 7.99 ms debug, finding
+  /// none). Otherwise they are found an effect a unit until `spent` ([`node_moves::NodeMoves`]; main's ruling of
+  /// 2026-11-27: a green holding one link anywhere walked every effect in one unit). True once the moves are found and
+  /// added to `effects`; false where `spent` ended the step first.
+  fn begin_moves(
+    &mut self,
+    beginning: &mut Beginning,
+    effects: &mut Vec<Effect>,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> bool {
+    if beginning.links == 0 && self.links_to.len() == 0 {
+      return true;
+    }
+    let finding = beginning.moves.get_or_insert_with(Box::default);
+    let (found, walked) = self.walk_moves(finding, effects, spent);
+    self.node_moves_walked = self.node_moves_walked.saturating_add(walked);
+    if walked > 0 {
+      self.node_moves_units = self.node_moves_units.saturating_add(1);
+    }
+    if !found {
+      return false;
+    }
+    if let Some(finding) = beginning.moves.take() {
+      effects.extend(finding.into_moves());
+    }
+    true
+  }
+
+  /// [`Self::begin_moves`]'s walk, an effect a unit until the moves are found or `spent` ends the step: whether they
+  /// were found, and the effects walked.
+  fn walk_moves(
+    &self,
+    finding: &mut node_moves::NodeMoves,
+    effects: &[Effect],
+    spent: &mut dyn FnMut() -> bool,
+  ) -> (bool, u64) {
+    let mut walked = 0u64;
+    loop {
+      if finding.walking() {
+        walked = walked.saturating_add(1);
+      }
+      if finding.step(self, effects) {
+        return (true, walked);
+      }
+      if spent() {
+        return (false, walked);
+      }
+    }
+  }
+
   /// [`Prep::Beginning`]: the commit begun over the effects, a part a step ([`Beginning`]), until `spent`; a whole part
   /// (the node moves, the copied trees' links, the copies) runs only as a step's first unit (`fresh`). Once the paths are
   /// in order, the commit run made.
@@ -8251,35 +8303,8 @@ impl Green {
         beginning.stage = BeginStage::Moves;
       }
       BeginStage::Moves => {
-        // A node moves only to a link that survives its home: where the head names no link (the map's count, read with
-        // no walk) and the version makes none, there is none, and no effect is walked (A-920: every import's case; a
-        // move of 9,000 files walked its 18,000 effects in this one unit, 7.99 ms debug, finding none).
-        // Otherwise they are found an effect a unit until `spent` ([`node_moves::NodeMoves`]; main's ruling of
-        // 2026-11-27 02:03: a green holding one link anywhere walked every effect in this one unit).
-        if beginning.links != 0 || self.links_to.len() != 0 {
-          let finding = beginning.moves.get_or_insert_with(Box::default);
-          let mut walked = 0u64;
-          let found = loop {
-            if finding.walking() {
-              walked = walked.saturating_add(1);
-            }
-            if finding.step(self, &run.effects) {
-              break true;
-            }
-            if spent() {
-              break false;
-            }
-          };
-          self.node_moves_walked = self.node_moves_walked.saturating_add(walked);
-          if walked > 0 {
-            self.node_moves_units = self.node_moves_units.saturating_add(1);
-          }
-          if !found {
-            return Some(ApplyStep::More);
-          }
-          if let Some(finding) = beginning.moves.take() {
-            run.effects.extend(finding.into_moves());
-          }
+        if !self.begin_moves(beginning, &mut run.effects, &mut *spent) {
+          return Some(ApplyStep::More);
         }
         beginning.stage = BeginStage::Links;
       }
