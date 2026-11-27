@@ -944,7 +944,7 @@ fn write_kept_revision(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -> 
   }
   out.extend_from_slice(&kept.flags.to_le_bytes());
   out.extend_from_slice(&kept.len.to_le_bytes());
-  (write_text(out, store, kept) == kept.len).then_some(())
+  (write_text(out, store, kept) == Some(kept.len)).then_some(())
 }
 
 /// One revision as a [`IDENTITY_VERSION`] record names it (A-729 part 2): its node, its parents' nodes, a manifest's or
@@ -1314,10 +1314,13 @@ fn write_revision_head(out: &mut Vec<u8>, log: Log<'_>, revision: &Revision<'_>)
 }
 
 /// The bytes a content's windows hold.
-fn window_bytes(store: &ContentStore, root: &ContentId) -> u64 {
-  store.windows(root).fold(0, |bytes, window| {
-    bytes.saturating_add(to_u64(window.len()))
-  })
+fn window_bytes(store: &ContentStore, root: &ContentId) -> Option<u64> {
+  store
+    .windows(root)
+    .try_fold(0_u64, |bytes, window| {
+      window.map(|window| bytes.saturating_add(to_u64(window.len())))
+    })
+    .ok()
 }
 
 /// A record writer's refusal naming `radix` and `rev`.
@@ -1393,8 +1396,10 @@ fn changeset_node(index: &HgIndex, store: &ContentStore, number: u32) -> Option<
   index.changeset(store, number).map(|row| row.node)
 }
 
-/// Writes a revision's text as 7.2 stores it, a file revision's block between its markers first: the bytes written.
-pub(crate) fn write_text(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -> u64 {
+/// Writes a revision's text as 7.2 stores it, a file revision's block between its markers first: the bytes written, or
+/// none where a window of its block or bytes could not be read (let go, or not held), its caller then refusing it
+/// rather than writing a short text.
+pub(crate) fn write_text(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -> Option<u64> {
   let mut written = 0u64;
   let mut put = |bytes: &[u8], written: &mut u64| {
     out.extend_from_slice(bytes);
@@ -1402,19 +1407,19 @@ pub(crate) fn write_text(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -
   };
   if let Some(text) = &kept.rebuilt {
     put(text, &mut written);
-    return written;
+    return Some(written);
   }
   if let Some(block) = kept.block {
     put(MARKER, &mut written);
     for window in store.windows(&block) {
-      put(&window, &mut written);
+      put(&window.ok()?, &mut written);
     }
     put(MARKER, &mut written);
   }
   for window in store.windows(&kept.bytes) {
-    put(&window, &mut written);
+    put(&window.ok()?, &mut written);
   }
-  written
+  Some(written)
 }
 
 /// Writes the markers: their count, then each one's length and bytes; refused naming a marker the store lacks.
@@ -1423,9 +1428,9 @@ fn write_markers(out: &mut Vec<u8>, index: &HgIndex, store: &ContentStore) -> Re
   out.extend_from_slice(&count.to_le_bytes());
   for number in 0..count {
     let marker = index.marker(store, number).ok_or(number)?;
-    out.extend_from_slice(&window_bytes(store, &marker).to_le_bytes());
+    out.extend_from_slice(&window_bytes(store, &marker).ok_or(number)?.to_le_bytes());
     for window in store.windows(&marker) {
-      out.extend_from_slice(&window);
+      out.extend_from_slice(&window.map_err(|_| number)?);
     }
   }
   Ok(())

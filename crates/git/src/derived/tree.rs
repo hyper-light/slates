@@ -780,9 +780,15 @@ impl Work<'_> {
       }
       None => return Err(TreesRefused::Content(ContentRefused::NotHeld)),
     }
-    let size = self.store.windows(&content).fold(0_u64, |size, window| {
-      size.saturating_add(crate::to_u64(window.len()))
-    });
+    // A window let go, or not held: refused typed, never a blob id named over a short file.
+    let missed = |miss| TreesRefused::Content(ContentRefused::Missed(miss));
+    let size = self
+      .store
+      .windows(&content)
+      .try_fold(0_u64, |size, window| {
+        window.map(|window| size.saturating_add(crate::to_u64(window.len())))
+      })
+      .map_err(missed)?;
     let mut hasher = Hasher::object(
       self.format,
       Header {
@@ -791,7 +797,7 @@ impl Work<'_> {
       },
     );
     for window in self.store.windows(&content) {
-      hasher.update(&window);
+      hasher.update(&window.map_err(missed)?);
     }
     self.counters.blobs = self.counters.blobs.saturating_add(1);
     hasher.finish().map_err(|attack| TreesRefused::Collision {

@@ -556,3 +556,21 @@ fn a_retired_deltified_record_is_refused_typed_by_its_kind() {
     );
   }
 }
+
+/// A-920 (a revision's record written a part at a time: a revision of 9,000 rows, 1.2 MB, was encoded whole in one step
+/// of its check, 3.8 ms debug). Do: write the tests' revision a unit a step, a content's bytes two at a time. Expect the
+/// hand-written layout's bytes, the buffer reserved once at the record's length, and at least a unit for each of its
+/// six entries measured and again written, its content's bytes over more than one.
+#[test]
+fn a_revisions_record_written_a_unit_a_step_is_its_record() {
+  let revision = revision();
+  let mut encoding = super::RevisionEncoding::default();
+  let mut units = 1u32;
+  while !encoding.step(&revision, 2) {
+    units += 1;
+  }
+  let bytes = encoding.into_bytes();
+  assert_eq!(bytes, revision_bytes());
+  assert_eq!(bytes.capacity(), bytes.len(), "reserved once at its length");
+  assert!(units > 2 * 6 + 1, "{units} units");
+}

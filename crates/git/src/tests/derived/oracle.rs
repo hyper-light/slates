@@ -711,7 +711,7 @@ impl Run {
       let bytes: Vec<u8> = self
         .store
         .windows(&entry.content)
-        .flat_map(|window| window.into_owned())
+        .flat_map(|window| window.unwrap().into_owned())
         .collect();
       store.put_object(&bytes).unwrap();
     }

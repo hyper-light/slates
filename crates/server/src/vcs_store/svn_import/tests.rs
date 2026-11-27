@@ -1266,6 +1266,8 @@ struct WideCounts {
   reaped: crate::reaper::ReapCounts,
   /// The greens' pending holds free decisions applied whole (`name_holds::NAME_HOLD_APPLIED_FREEING`).
   freeing_applied: u64,
+  /// The steps of its revisions' record encodings (`staging::RECORD_ENCODE_STEPS`).
+  encode_steps: u64,
 }
 
 /// The calling shard's [`WideCounts`] now.
@@ -1296,6 +1298,7 @@ fn wide_counts() -> WideCounts {
         crate::vcs_store::name_holds::NAME_HOLD_APPLIED_FREEING,
       )
     }),
+    encode_steps: on(|state| count(state, staging::RECORD_ENCODE_STEPS)),
   }
 }
 
@@ -1310,6 +1313,13 @@ fn wide_counts_sliced(counts: &WideCounts) {
   assert_eq!(
     counts.freeing_applied, 0,
     "the greens' pending holds a free decision applied whole"
+  );
+  // The wide revision's record, 1.2 MB of 9,000 rows, encoded a slice a step (A-920: whole in its check's first step,
+  // 3.8 ms debug; red at one step a revision).
+  assert!(
+    counts.encode_steps > 2,
+    "the records encoded in {} step(s)",
+    counts.encode_steps
   );
 }
 

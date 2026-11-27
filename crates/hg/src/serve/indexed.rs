@@ -793,9 +793,13 @@ fn lend_markers<'a>(
   let mut markers = Vec::with_capacity(all);
   for number in 0..count {
     let content = index.marker(store, number).ok_or_else(unreadable_marker)?;
-    let len = store.windows(&content).fold(0_u64, |total, window| {
-      total.saturating_add(to_u64(window.len()))
-    });
+    // A window let go: refused unreadable, never lent at a short length.
+    let len = store
+      .windows(&content)
+      .try_fold(0_u64, |total, window| {
+        window.map(|window| total.saturating_add(to_u64(window.len())))
+      })
+      .map_err(|_| unreadable_marker())?;
     let lent = lend(store, &content, len, lends, room)?.ok_or_else(unreadable_marker)?;
     obsmarkers::decode(&lent).map_err(|_| unreadable_marker())?;
     markers.push(lent);
@@ -1089,7 +1093,8 @@ fn lend<'a>(
   room: &mut Admission,
 ) -> Result<Option<Cow<'a, [u8]>>, PastAdmission> {
   let mut windows = store.windows(root);
-  let Some(first) = windows.next() else {
+  // A window let go, or not held: none, never lent or copied short.
+  let Some(Ok(first)) = windows.next() else {
     return Ok(None);
   };
   if windows.next().is_none() {
@@ -1099,7 +1104,7 @@ fn lend<'a>(
     count_lend(lends, matches!(first, Cow::Borrowed(_)));
     return Ok(Some(first));
   }
-  let bytes = copied(store.windows(root), len, room)?;
+  let bytes = copied(store.windows(root).map_while(Result::ok), len, room)?;
   if bytes.is_some() {
     count_lend(lends, false);
   }
@@ -1117,9 +1122,9 @@ fn framed<'a>(
   room: &mut Admission,
 ) -> Result<Option<Cow<'a, [u8]>>, PastAdmission> {
   let parts = core::iter::once(Cow::Borrowed(MARKER))
-    .chain(store.windows(block))
+    .chain(store.windows(block).map_while(Result::ok))
     .chain(core::iter::once(Cow::Borrowed(MARKER)))
-    .chain(store.windows(bytes));
+    .chain(store.windows(bytes).map_while(Result::ok));
   let text = copied(parts, len, room)?;
   if text.is_some() {
     count_lend(lends, false);

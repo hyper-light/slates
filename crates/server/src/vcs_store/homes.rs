@@ -480,7 +480,8 @@ pub(crate) fn read_here(
       // BLAKE3 through the store's alias): answered only when they hash to its identity.
       let mut bytes = Vec::new();
       for window in content.windows(identity) {
-        bytes.extend_from_slice(&window);
+        // A window let go, or not held: not held here, never answered short.
+        bytes.extend_from_slice(&window.ok()?);
       }
       (!bytes.is_empty() && ContentId::of(&bytes) == *identity).then_some(bytes)
     })
