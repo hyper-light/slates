@@ -705,3 +705,12 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - After merging A-932: the focused set plus the five 02bd0ec94 failures, 18 of 18.
 - CI's giver-up (gate 22) counted no records_short, which fits the owed-push half; gate 24 is main's.
 - A-918 B's newcomer half stays open.
+
+## 2026-11-27 09:19 PST: A-918 B landed (slates c6d0ab92b, commit 4eb555353)
+- On Behind, a newcomer reads the green's chain from its cohort through A-919's read (read_chain/want_chain).
+- A holder with records and no replica checks what its rebuild reads (rebuild_needs, now shared with A-933).
+- fetch_ledger_inputs now asks the green's cohort, not just the sender.
+- Red first: a918 test (uncommitted since A-918 (i)). On main: None after 424 s. With the read alone: inputs never fetched. Both together: version 2 in 21 s.
+- a914 now asserts no record-barrier refusal; homing's retry stays a separate mode (1 of 3).
+- Focused set 17/17, unit tests 59/59.
+- Open: homing retry in a914; A-919's open edge (past tolerance).
