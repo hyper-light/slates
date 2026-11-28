@@ -3736,6 +3736,12 @@ pub(crate) async fn read_in_region(
     live_first(state, homes)
   })?;
   if others.is_empty() {
+    // Logged, the replica build's stall's evidence (main 01a20182's order of 2026-11-27 18:08): an object no home besides
+    // this node is ranked for, and this node not holding it.
+    slates_machine::log_line!(
+      "slates-server: a region read of {identity:?} found no home besides this node at {} ns",
+      slates_rt::futures::now_ns()
+    );
     return None;
   }
   // From the control shard, which holds the record sessions, a part at a time from each home in turn (A-724 piece 8c).
@@ -4052,10 +4058,24 @@ async fn read_remote(
   for (asked, home) in homes.iter().enumerate() {
     let left = whole.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
     let share = share_of(left, count.saturating_sub(asked))?;
+    let asked_at = slates_rt::futures::now_ns();
     if let Some(bytes) = read_in_parts(*home, identity, (share, budget.poll_interval_ns)).await {
       return Some(bytes);
     }
+    // Logged, the replica build's stall's evidence (main 01a20182's order of 2026-11-27 18:08): each home that gave no
+    // bytes, its share and how long it was waited, so a read that waited out a dead home shows which.
+    slates_machine::log_line!(
+      "slates-server: a region read of {identity:?} got nothing from {home:?} (home {} of {count}) in {} ns of its \
+       {share} ns share, at {} ns",
+      asked.saturating_add(1),
+      slates_rt::futures::now_ns().saturating_sub(asked_at),
+      slates_rt::futures::now_ns()
+    );
   }
+  slates_machine::log_line!(
+    "slates-server: a region read of {identity:?} ended with no home's bytes after {} ns of {whole} ns, homes {homes:?}",
+    slates_rt::futures::now_ns().saturating_sub(began)
+  );
   None
 }
 

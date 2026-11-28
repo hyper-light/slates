@@ -66640,7 +66640,9 @@ Applied in the same change to:
     tail's smoothed value and deviation each at most the ceiling): `(4 (m − 1) − 1) + (max(base, floor) + 1) +
     (2 + 2 (m − 1))` periods and a round trip, 1,550 s at four members and the floor's base. The detector's periods and
     a learned silence are held by that maximum. So a window that keeps growing still ends, and a live deadline with it.
-  - Nothing changes below the ceiling.
+  - Nothing changes below the ceiling: there the deadline follows the measured window. 1,550 s is the formula's maximum
+    with every period at the watchdog's ceiling, a cluster in wedge territory, not a wait anyone should see (main's
+    reading of 18:23).
 - **Counted.** `vcs_store.homes.homing_waited_ns_most` (the longest a homing waited before it homed) and
   `vcs_store.homes.homing_deadline_ns_most` (the largest deadline one homed under).
 - **Tests.**

@@ -5472,6 +5472,15 @@ async fn names_fetched_for_rebuild(id: RepositoryId, generation: u64) {
       }
       _ => {
         state.count(NAMES_UNFETCHED, 1);
+        // Logged, the replica build's stall's evidence (main 01a20182's order of 2026-11-27 18:08): the names a rebuild
+        // could not fetch, which leave its replay refused.
+        slates_machine::log_line!(
+          "slates-server: partition {}: repository {:?}'s rebuild could not fetch the names {identity:?} from the region \
+           at {} ns",
+          state.partition,
+          id,
+          slates_rt::futures::now_ns()
+        );
         false
       }
     });

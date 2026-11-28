@@ -409,6 +409,17 @@
 >   each log's newest part stays owed while it has remote candidates, so the owed-part ship re-ships it to a candidate a
 >   change brings in, and the settle waits for it on `f + 1` of the new cohort, naming the log it waits for. Bounded:
 >   one part a state log of a repository the partition holds (design A-934).
+> - **OPEN, being logged (w-shared; main 01a20182's order of 2026-11-27 18:08): a holder's replica build stalls at the
+>   second death.** a914 at 604aa12a0 run 10 and at d08595c7e runs 1, 3, 5, 7 and 9 (each after a refused first-death
+>   push): the second death's v2 placed at the owner alone, its other live candidate answering `ReplicaBuilding` at 0
+>   turns through the barrier window (`building {X: 0}`), so the push was refused `unable to commit`. A build at 0 turns
+>   has not left `replica_build::laid_out`, which waits while the repository's replica store replays; that replay
+>   fetches each push record's names from the region (`vcs_store::names_fetched_for_rebuild`). Not a refused push's
+>   leftovers: a refused attempt lets go of every hold it made at every home (`homes::Attempt::released`), and nothing
+>   homes them again. Now logged: the build's wait on the replay as it begins and ends; each home a region read got
+>   nothing from, with its share and its wait, and a read that ended with none, or found no home besides this node;
+>   each names a rebuild could not fetch. Unproven guess: an object of an earlier landed record whose homes were the two
+>   dead (d and c), the healer not yet re-homing it before c died.
 > - **OPEN, being logged (w-shared; main 01a20182's ruling of 2026-11-27 17:05): a live node's own HTTP edge refused a
 >   connect at 0 ms.** 2816da877's a914 run 3: the first death's push failed "Failed to connect to 127.0.0.1 port 55009
 >   after 0 ms: Couldn't connect to server" on a's own `vcs_http_port` while a was alive, and no "the HTTP edge

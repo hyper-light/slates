@@ -1602,12 +1602,7 @@ fn stock_history(name: &str) -> Option<Dot> {
   };
   hg(&["init"])?;
   for changeset in 0..LONG_CHANGESETS {
-    for touched in [changeset % LONG_FILES, (changeset * 3 + 1) % LONG_FILES] {
-      let path = dir.join(format!("f{touched}.txt"));
-      let mut text = std::fs::read(&path).unwrap_or_default();
-      text.extend_from_slice(format!("changeset {changeset}\n").as_bytes());
-      std::fs::write(&path, text).ok()?;
-    }
+    append_changeset_lines(&dir, changeset)?;
     let message = format!("changeset {changeset}");
     hg(&[
       "commit",
@@ -1619,6 +1614,27 @@ fn stock_history(name: &str) -> Option<Dot> {
       &message,
     ])?;
   }
+  let files = dot_files(&dir)?;
+  let _ = std::fs::remove_dir_all(&dir);
+  Some(Dot(files))
+}
+
+/// Appends changeset `changeset`'s line to the two of [`LONG_FILES`] files it changes, in [`stock_history`]'s directory.
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+fn append_changeset_lines(dir: &std::path::Path, changeset: usize) -> Option<()> {
+  for touched in [changeset % LONG_FILES, (changeset * 3 + 1) % LONG_FILES] {
+    let path = dir.join(format!("f{touched}.txt"));
+    let mut text = std::fs::read(&path).unwrap_or_default();
+    text.extend_from_slice(format!("changeset {changeset}\n").as_bytes());
+    std::fs::write(&path, text).ok()?;
+  }
+  Some(())
+}
+
+/// The files of `dir`'s `.hg` an import takes ([`Dot`]): `requires`, and the store's revlogs, `fncache`, `phaseroots`
+/// and `requires`.
+#[allow(clippy::disallowed_methods)] // test code: reads its own scratch directory
+fn dot_files(dir: &std::path::Path) -> Option<BTreeMap<Vec<u8>, Vec<u8>>> {
   let mut files = BTreeMap::new();
   files.insert(
     b"requires".to_vec(),
@@ -1645,8 +1661,7 @@ fn stock_history(name: &str) -> Option<Dot> {
       }
     }
   }
-  let _ = std::fs::remove_dir_all(&dir);
-  Some(Dot(files))
+  Some(files)
 }
 
 /// Goal 93, hg's whole-history gap, the cut after the stage counts (main 01a20182's ruling of 2026-11-27 16:23, its
@@ -1674,20 +1689,17 @@ fn a_streams_index_rows_are_written_a_run_a_step() {
     imported.index.rows().compaction_due(&store)
   );
   imported.index.rows().seal_all(&mut store).unwrap();
-  let revisions = u64::try_from(
-    [Log::Changelog, Log::Manifest]
-      .iter()
-      .map(|log| imported.index.len(&store, *log))
-      .chain(
-        imported
-          .index
-          .file_logs(&store)
-          .map(|path| imported.index.len(&store, Log::File(path))),
-      )
-      .map(u64::from)
-      .sum::<u64>(),
-  )
-  .unwrap();
+  let revisions: u64 = [Log::Changelog, Log::Manifest]
+    .iter()
+    .map(|log| imported.index.len(&store, *log))
+    .chain(
+      imported
+        .index
+        .file_logs(&store)
+        .map(|path| imported.index.len(&store, Log::File(path))),
+    )
+    .map(u64::from)
+    .sum();
   let mut streaming = crate::render::Streaming::default();
   streaming.set_step_bytes(STEP_BYTES);
   let mut source = whole_texts(&imported.index, &store);
