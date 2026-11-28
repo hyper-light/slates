@@ -2854,6 +2854,34 @@ impl PendingGreen {
     }
   }
 
+  /// Releases each version every candidate holds but the newest, and returns the versions released (A-935, main
+  /// 01a20182's rulings of 2026-11-27 17:12 and 17:29). The newest stays pending once held everywhere: a neighbourhood
+  /// change retargets it ([`PendingGreen::retarget`]) and ships it to the candidate the change brought in, which answers
+  /// `Behind` and reads the chain before it (A-918 B), so the first death's repair window closes with no push. Before, a
+  /// version held everywhere was forgotten, and nothing shipped a newcomer the green until a new version did. Bounded:
+  /// one version a green this node owns beyond those still owed, its value and placements, dropped with the green (its
+  /// destroy) and released once a later version is held everywhere.
+  fn release_held(&mut self, local: HostId) -> Vec<u64> {
+    let newest = self.records.keys().next_back().copied();
+    let held: Vec<u64> = self
+      .records
+      .iter()
+      .filter(|(version, pending)| {
+        Some(**version) != newest
+          && pending
+            .record
+            .candidates
+            .iter()
+            .all(|host| *host == local || pending.record.acked.contains(host))
+      })
+      .map(|(version, _)| *version)
+      .collect();
+    for version in &held {
+      self.records.remove(version);
+    }
+    held
+  }
+
   /// One first missing position per remote holder, grouped into the record dispatches that may
   /// share a quorum. A holder cannot skip its own prefix to follow a faster holder.
   fn next(&self, local: HostId) -> BTreeMap<u64, Vec<HostId>> {
@@ -4827,12 +4855,9 @@ fn record_merge_acks(
     }
   }
   if everyone {
-    pending_green.records.remove(&version);
-    if pending_green.records.is_empty() {
-      state.merge.pending.remove(&object);
-    }
+    let released = pending_green.release_held(local);
     // Version 0's inputs are kept until every candidate holds them, and no later version names them (A-286).
-    if version == 0 {
+    if released.contains(&0) {
       state.merge.origin_inputs.remove(&object);
     }
   }

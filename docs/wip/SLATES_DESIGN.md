@@ -66581,3 +66581,31 @@ Applied in the same change to:
     `a_log_kept_for_its_newest_part_is_forgettable_only_once_every_candidate_holds_it`.
 - **Applied in the same change to:** `crates/server/src/{state_log,fleet,daemon}.rs`,
   `crates/server/src/state_log/tests.rs`, `crates/server/tests/fleet.rs`, GAPS.
+
+### A-935 — An owner keeps each green's newest version pending once every candidate holds it, so a candidate a death brings in is shipped it with no push (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 17:12 and 17:29; the green sibling of A-934; corrects GAP-A9-7's record half, A-918 B)
+
+- **Why.** A newcomer reads a green's chain on `Behind` (A-918 B), and it answers `Behind` only to a record shipped to
+  it. An owner released a version's pending record once every candidate held it (`record_merge_acks`), and nothing
+  ships a placed version again (A-412). So a candidate a death brought in was shipped the green only by the next push's
+  version, and in a quiet stretch the first death's repair window never closed: a second death then lost a green
+  `f = 1` keeps. 2816da877's a914 run 3: its first death's push never reached a, and the newcomer stayed outside the
+  green's holders for 400 s while it held the names log (A-934).
+- **The rule.** `PendingGreen::release_held` releases each version every candidate holds **but the newest**. The
+  newest stays pending, its placements kept; a neighbourhood change retargets it (`PendingGreen::retarget`, every pass
+  of `next_merge_work`), so it is owed to the candidate the change brought in and ships to it. The newcomer, holding
+  none of the chain, answers `Behind` and reads the chain before it from its cohort, with the versions' inputs, and
+  rebuilds (A-918 B). An older version kept is released once a later one is held everywhere. Version 0's inputs go
+  when version 0 is released.
+- **Not changed.** The settle counts each green's newest version on `f + 1` of the current cohort, the owner among
+  them (`greens_placed_on_current_cohort`), the design's settle rule (main's ruling of 17:29). What this adds is that
+  the repair window closes with no traffic, which a914's precondition tests.
+- **The bound.** One version a green this node owns beyond those still owed: its value and its two placements, dropped
+  with the green at its destroy, as the pending map always was.
+- **Tests.** Fleet `a935_a_candidate_a_death_brings_in_holds_each_greens_newest_version_with_no_push` (red first): four
+  nodes at `f = 1`, one push, both candidates holding the green, one of them stopped and taken over, nothing pushed.
+  The newcomer must hold the green's newest placed version within the repair path's bound, derived in the test
+  (the retarget's ship, the `Behind` heard and the read asked, the read's answers, the inputs fetched and the rebuild:
+  5 passes of up to 10 periods each). Red: the newcomer's replica at `None` after its 50 periods.
+  - a914 goes back to main's (d): its first death's push refused `retry` (A-914 (c)'s prior, OPEN) goes on to the
+    repair-window precondition, which then proves the repair needs no traffic; any other refusal fails at once.
+- **Applied in the same change to:** `crates/server/src/merge_service.rs`, `crates/server/tests/fleet.rs`, GAPS.
