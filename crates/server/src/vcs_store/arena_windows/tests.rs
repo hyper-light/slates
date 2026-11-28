@@ -569,6 +569,11 @@ fn a_trimmed_chunk_owed_a_free_is_counted_at_the_bytes_its_free_holds() {
   let window = trimmed_and_named(&mut windows, &mut chunks);
   windows.release(window);
   let owed = windows.held_outside_the_arena();
+  assert_eq!(
+    windows.held_outside_parts(),
+    (0, owed),
+    "owed, not held for a cut"
+  );
   assert!(windows.lend_in(&mut chunks));
   assert_eq!(windows.held_outside_the_arena(), 0, "the lend freed it");
   assert_eq!(
@@ -593,6 +598,11 @@ fn a_trimmed_chunk_held_for_a_cut_is_counted_at_the_bytes_its_free_holds() {
   windows.begin_cut();
   windows.release(window);
   let held = windows.held_outside_the_arena();
+  assert_eq!(
+    windows.held_outside_parts(),
+    (held, 0),
+    "held for the cut, not owed"
+  );
   let _left = windows.end_cut();
   assert_eq!(
     held,

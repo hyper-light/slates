@@ -1306,18 +1306,28 @@ pub(crate) const IMAGE_CHAIN_STOPPED: &str = "vcs_store.image.chain_stopped";
 /// so a long cut's held chunks (main's 57k: 4.7 GB) were seen only when the next lend freed them into the arena. The
 /// arena is read from the lent chunk store inside a lend, the shard's own store being a placeholder then.
 pub(crate) fn held_now(state: &ShardState) -> u64 {
+  let (deferred, for_cut, owed) = held_parts(state);
+  deferred.saturating_add(for_cut).saturating_add(owed)
+}
+
+/// [`held_now`] by where each byte is held: the arena's deferred frees, the window chunks held for the cut in flight,
+/// and those owed a free at the next lend (`ChunkWindows::held_outside_parts`).
+pub(crate) fn held_parts(state: &ShardState) -> (u64, u64, u64) {
   let windows = crate::vcs_store::chunk_windows(&state.vcs_stores);
   let arena = windows
     .map(crate::vcs_store::arena_windows::ChunkWindows::lent_chunks)
     .filter(|chunks| chunks.arena().capacity() > 0)
     .unwrap_or(&state.store.content)
     .arena();
-  u64::try_from(arena.deferred_bytes())
-    .unwrap_or(u64::MAX)
-    .saturating_add(windows.map_or(
-      0,
-      crate::vcs_store::arena_windows::ChunkWindows::held_outside_the_arena,
-    ))
+  let (for_cut, owed) = windows.map_or(
+    (0, 0),
+    crate::vcs_store::arena_windows::ChunkWindows::held_outside_parts,
+  );
+  (
+    u64::try_from(arena.deferred_bytes()).unwrap_or(u64::MAX),
+    for_cut,
+    owed,
+  )
 }
 
 /// [`held_now`] read through a content store its shard's chunk store is lent to: inside a lend, where the shard's own
@@ -1382,10 +1392,13 @@ pub(crate) fn note_borrow_held(
     slates_machine::log_line!(
       "slates-server: partition {}: one borrow at {site} freed {freed} bytes into the frees held for the committed \
        image ({after} held now; the most one borrow freed before, {most}), {} of them slabs sealed since the latest \
-       cut began; the arena before and after: capacity \
+       cut began; held before (the arena's deferred, for the cut, owed) {:?} and after {:?}; the arena before and \
+       after: capacity \
        {} and {}, mapped {} and {}, allocations {} and {}; the process's footprint {:?}, resident {:?}",
       state.partition,
       now.fresh.saturating_sub(before.fresh),
+      before.parts,
+      now.parts,
       before.capacity,
       now.capacity,
       before.mapped,
@@ -1407,6 +1420,8 @@ pub(crate) struct BorrowArena {
   deferred: u64,
   /// Of all frees held so far, the bytes of slabs sealed since the latest cut began ([`fresh_held_now`]).
   fresh: u64,
+  /// The held frees by where they are held ([`held_parts`]).
+  parts: (u64, u64, u64),
   /// The arena's capacity.
   capacity: usize,
   /// Its mapped bytes.
@@ -1419,9 +1434,11 @@ impl BorrowArena {
   /// The shard's content arena now.
   pub(crate) fn read(state: &ShardState) -> Self {
     let arena = state.store.content.arena();
+    let parts = held_parts(state);
     Self {
-      deferred: held_now(state),
+      deferred: parts.0.saturating_add(parts.1).saturating_add(parts.2),
       fresh: fresh_held_now(state),
+      parts,
       capacity: arena.capacity(),
       mapped: arena.mapped_bytes(),
       allocations: arena.allocations(),

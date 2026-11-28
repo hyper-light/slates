@@ -498,6 +498,12 @@ impl ChunkWindows {
     self.held_bytes.0.saturating_add(self.held_bytes.1)
   }
 
+  /// [`ChunkWindows::held_outside_the_arena`] apart: the bytes held for the cut in flight, and those owed a free at the
+  /// next lend.
+  pub(crate) fn held_outside_parts(&self) -> (u64, u64) {
+    self.held_bytes
+  }
+
   /// The pre-images kept since this was last asked, the counts started again.
   pub(crate) fn take_cut_counts(&mut self) -> slates_vcs::preimage::PreimageCounts {
     self.cut.take_counts()
