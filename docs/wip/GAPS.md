@@ -385,8 +385,8 @@
 >   placed version's holders and each holds the names log through its position at a (`Daemon::repair_window_holders`), and
 >   fails there, named, if that never holds (one focused run: closed with the names log at 4, both survivors holding 2
 >   to 4, the second push landed). The reads past tolerance now name their reader and who answered.
-> - **OPEN, A-934 (w-shared; main 01a20182's ruling of 2026-11-27 15:51, item 2): the settle asks nothing of the state
->   logs.** `fleet::records_placed_on_current_neighbourhood` asks each volume's head and catalog and each green's newest
+> - **FIXED, A-934 (w-shared, 2026-11-27; main 01a20182's rulings of 15:51, item 2, and 16:20): the settle asked nothing
+>   of the state logs.** `fleet::records_placed_on_current_neighbourhood` asks each volume's head and catalog and each green's newest
 >   merge record to be held by `f + 1` of the new cohort, no state log, so the old set can retire while a log's newest
 >   part is held by the owner alone of the cohort a takeover of it recovers through (parts let go before a change are
 >   not shipped again; a part owed ships to the current candidates). The owner keeps no placed head of a state log, and
@@ -395,7 +395,10 @@
 >   43a8563a2's fold fix removed (main 01a20182's finding of 16:06). Red first:
 >   `a934_a_neighbourhood_change_waits_for_its_state_logs_newest_part_on_the_new_cohort` (the names log's newest part
 >   held off y and then off every member, x stopped): settled while held, a's names log at 4, y holding positions 2 and
->   3, the newcomer none (macOS arm64 debug, 2026-11-27, `~/.local/state/w-shared/logs/a914-a934-red-1.log`).
+>   3, the newcomer none (macOS arm64 debug, 2026-11-27, `~/.local/state/w-shared/logs/a914-a934-red-1.log`). Now
+>   each log's newest part stays owed while it has remote candidates, so the owed-part ship re-ships it to a candidate a
+>   change brings in, and the settle waits for it on `f + 1` of the new cohort, naming the log it waits for. Bounded:
+>   one part a state log of a repository the partition holds (design A-934).
 > - **OPEN, a design question (main 01a20182's ruling of 2026-11-27 15:51, item 3; not now): may a newcomer adopt a live,
 >   never-restarted owner's chain on its report alone?** In run 7 above, after the second death the owner was the one
 >   live holder of the green's chain and the names log above its floor; the newcomer's reads were past tolerance, so

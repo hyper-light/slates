@@ -1918,6 +1918,19 @@ impl Daemon {
     Ok(held)
   }
 
+  /// Test support (A-934): the state logs' parts this node's shards hold as an owner that are not their log's newest
+  /// (`state_log::StateLogs::parts_past_newest`): each log keeps its newest part once every candidate holds it, so this
+  /// falls back to zero, where `state_log_parts_bytes` keeps one part a log, once each candidate has caught up. Summed
+  /// over the shards; the typed refusal when one could not be observed.
+  pub fn state_log_parts_past_newest(&self) -> Result<usize, ObserveError> {
+    let mut parts = 0usize;
+    for shard in self.shards.clone() {
+      parts =
+        parts.saturating_add(self.observe(Some(shard), |s| s.state_logs.parts_past_newest())?);
+    }
+    Ok(parts)
+  }
+
   /// Test support (A-919): the bytes of the state logs' parts this node's shards still hold as an owner, owed to some
   /// candidate (`state_log::StateLogs::bytes`): a part is let go once every candidate holds it, so this falls back to
   /// zero once each has caught up. Summed over the shards; the typed refusal when one could not be observed.

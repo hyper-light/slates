@@ -38417,7 +38417,8 @@ fn names_positions(fleet: &GitFleet) -> Vec<Result<Vec<u64>, ObserveError>> {
 /// `f = 1` git fleet with a repository on a, push `main` and wait for both of a's remote candidates to hold its green's
 /// version 1 (and so the repository's state logs); stop one of them, so the fourth node, which holds none of the
 /// repository's state logs, becomes a candidate once the survivors took the dead one over; push on top twice. Expect
-/// a's state logs' parts let go again (`Daemon::state_log_parts_bytes` back to zero): the newcomer caught up on each
+/// a's state logs' parts let go again but each log's newest (`Daemon::state_log_parts_past_newest` back to zero, A-934):
+/// the newcomer caught up on each
 /// log's prefix and acknowledged its next parts. Red before A-919: the newcomer refused every part past its empty copy
 /// (`discontinuous`), untyped, so its acknowledgement stayed below every part and a kept every part from then on,
 /// until its parts reached the partition's bound and every change to the repository was refused `Overloaded`.
@@ -38466,8 +38467,10 @@ fn a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_th
   .map(|change| fleet.push_on_top(0, change))
   .collect();
   let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  // Each log keeps its newest part once every candidate holds it (A-934: what a candidate a change brings in is shipped,
+  // and what a settle counts), so a's parts fall back to one a log, not to none: none past each log's newest.
   let let_go = poll_until(&observed, RETIREMENT_DEADLINE, || {
-    Ok(fleet.daemons[0].state_log_parts_bytes()? == 0)
+    Ok(fleet.daemons[0].state_log_parts_past_newest()? == 0)
   });
   let bytes = fleet.daemons[0].state_log_parts_bytes();
   let refusals: Vec<_> = fleet
@@ -38508,7 +38511,8 @@ fn a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_th
 /// so the fourth node, which holds none of the logs, becomes a candidate; push on top. Expect the newcomer's read never
 /// past tolerance and the names log held from its first part, as the old holder holds it: below where a's hold begins, the old holder's
 /// report alone is adopted where a's committed floor (the highest position a let go, with the chain's digest there)
-/// witnesses it; and a's parts let go again (`Daemon::state_log_parts_bytes` back to zero). Red before (C): a counted as
+/// witnesses it; and a's parts let go again but each log's newest (`Daemon::state_log_parts_past_newest` back to zero,
+/// A-934). Red before (C): a counted as
 /// one gone below its hold's start and the departed another, so the read went past tolerance, the newcomer adopted
 /// nothing below a's start, refused every part, and a kept its parts from then on (the open edge, A-919).
 ///
@@ -38592,8 +38596,9 @@ fn a919_a_newcomer_holds_a_restarted_owners_let_go_prefix_on_its_committed_floor
   let old_positions = old_holder.map(|daemon| daemon.names_log_positions(fleet.repository));
   let newcomer_refused = refusals_of(&fleet.daemons[newcomer]);
   let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  // One part a log stays, its newest (A-934), so the parts let go are those past each log's newest.
   let let_go = poll_until(&observed, RETIREMENT_DEADLINE, || {
-    Ok(fleet.daemons[0].state_log_parts_bytes()? == 0)
+    Ok(fleet.daemons[0].state_log_parts_past_newest()? == 0)
   });
   drop(observed);
   let parts_bytes = fleet.daemons[0].state_log_parts_bytes();
