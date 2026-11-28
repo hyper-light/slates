@@ -911,3 +911,10 @@
   restart's renumbering, ContentStore::let_go_landed_again at the image's number, a pin only delaying it). OPEN, mine:
   the clone's window peak under load (GAPS). NEXT: C4, P1, P2, as main orders; main runs the wall, suites, a914 and
   C5's git/git rounds.
+- 11-27 20:02 PST: LANDED C4 02548a267..bfc1aa324 (a replica reads the names its node lacks from their region home,
+  its own test). LANDED P2 piece 1 (A-722 part 4h) 531a006f0, on main as d90f117f5: a commit reads and charges its own
+  greens' records alone (one move over 1,000 greens x 20 versions: 22,021 records read, now 3). Versions are pushed and
+  heads moved in place after adoption, and the charge is trued to its whole recomputation. A refused commit leaves the
+  store as it was, every point held by A-614's oracle. Found: the stage's fork was dropped holding its tables on a
+  refusal before adoption (397 bytes), now given back. NEXT, P2 in order: landed_runs over a several-move push's
+  positions; the release's per-object map drops; a stale restage; then the clone's window peak; then P1 (bisect first).
