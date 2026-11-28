@@ -146,6 +146,10 @@ impl Store for Served {
     u64::MAX
   }
 
+  fn cache_line(&self) -> u64 {
+    super::super::tests::TEST_LINE
+  }
+
   /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole, its identity the
   /// plain BLAKE3 of its text, its place named by that identity, its chunk its raw text (a whole) or its delta; none where its text is
   /// lost.

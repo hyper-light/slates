@@ -208,6 +208,11 @@ impl Store for Empty {
     u64::MAX
   }
 
+  /// Shape: the cache line a stream over this store charges a read in: Apple M-series' 128 bytes, the Mac's.
+  fn cache_line(&self) -> u64 {
+    128
+  }
+
   fn changeset_text(
     &self,
     _rev: Rev,
@@ -899,6 +904,11 @@ impl Store for Charging {
 
   fn text_bytes_a_step(&self) -> u64 {
     u64::MAX
+  }
+
+  /// Shape: the cache line a stream over this store charges a read in: Apple M-series' 128 bytes, the Mac's.
+  fn cache_line(&self) -> u64 {
+    128
   }
 
   fn changeset_text(

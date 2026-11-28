@@ -200,8 +200,9 @@ fn slice(state: &mut ShardState, id: RepositoryId, generation: u64, walk: &mut R
   }
   let budget = slates_rt::futures::step_budget_ns().unwrap_or(0);
   let began = slates_rt::futures::now_ns();
-  let step_bytes = super::hg_view::text_bytes_a_step(state);
-  walk.set_step_bytes(step_bytes);
+  let copy = super::hg_view::step_copy(state);
+  walk.set_step_copy(copy);
+  let step_bytes = copy.bytes;
   loop {
     let stepped = state
       .vcs_stores

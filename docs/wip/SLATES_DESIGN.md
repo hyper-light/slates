@@ -15255,6 +15255,11 @@ serves no stream (`1\n`, the client clones) until a sliced recount, the count wa
 Status (2026-11-27, the data stage a run a step): a split log's data file is written a run of chunks a step, within the
 step's copy budget or the room, whichever first, its first chunk whatever: on a 1,200-revision stock history one step
 for 300 chunks, where each chunk took a step.
+Status (2026-11-27, the gathering's read charge): a step's gathering charges a read of the content store the cache
+lines it moves (a table lent in place: its frame, its offsets' search, the store's lookups), not a content window, and
+walks the log rows on past each log into the next with no search; a range walk opens a run's table only once its keys
+reach it. At the server's 256 KiB window and a 94,797-byte step, 27 index steps for 1,200 revisions, where a read's
+window charge had made it a step a row. Owed: a row's measured cost (84.5 ns, against 180 B charged).
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
