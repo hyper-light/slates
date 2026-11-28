@@ -1573,6 +1573,9 @@ pub struct Green {
   /// The last changes the commit under way wrote, moved into the six maps above at its publish (A-752 part 3c U4,
   /// [`last_changes`]): written, never read.
   aside: last_changes::Aside,
+  /// The identity marks of the commit under way, moved in at its publish (A-752 part 3c U5,
+  /// [`last_changes::IdentityAside`]): written, never read.
+  identity_aside: last_changes::IdentityAside,
   /// Every accepted increment's identity and the version it committed: the idempotency record a
   /// retry of an accepted submit is answered from. Bounded by the chain (one entry per committed
   /// version), which the partition caps in bytes; recovery rebuilds it by replaying the chain.
@@ -3742,22 +3745,27 @@ impl Green {
   /// a copy's entry may stand for, A-586) its entry is taken out of the sum now, from its current bytes, so the fold
   /// adds its entry at the head and reads no history for it: one hash a changed file, not two and a reconstruction.
   /// Every other key is only marked, its move made whole by the fold.
+  ///
+  /// Written aside until the commit's publish (A-752 part 3c U5, [`last_changes::IdentityAside`]). A key a published
+  /// commit left dirty is folded with it already; a staged commit drains every such key first
+  /// ([`Green::staging_step`]), so no reader's fold between its turns reads a key it changes in place. That rule ends
+  /// with the current maps forked into the stage (w-svn's), and is deleted in that change.
   fn mark_dirty(&mut self, key: IdentityKey) {
-    if self.identity_dirty.contains(&key) {
+    if self.identity_dirty.contains(&key) || !self.identity_aside.dirty(key.clone()) {
       return;
     }
     if let IdentityKey::File(path) = &key
       && self.copies.is_empty()
     {
       if let Some(digest) = self.content.digest_of(path) {
-        self.identity.remove(&file_entry(path, digest));
+        self
+          .identity_aside
+          .taken(key.clone(), file_entry(path, digest));
       }
-      self.identity_out.insert(key.clone());
       self
         .identities_taken_at_change
         .set(self.identities_taken_at_change.get().saturating_add(1));
     }
-    self.identity_dirty.insert(key);
   }
 
   /// `key`'s own entries at the head (none where it is absent; a copy's are its records', none here).
@@ -6581,8 +6589,8 @@ impl Green {
     );
     if self.modes.remove(path).is_some() {
       self
-        .identity_dirty
-        .insert(IdentityKey::Mode(path.to_owned()));
+        .identity_aside
+        .dirty(IdentityKey::Mode(path.to_owned()));
       self.aside.mode(path.to_owned(), version);
       self
         .mode_history
@@ -6602,8 +6610,8 @@ impl Green {
       let at = self.seed_of(&self.xattr_history, &key, path, version);
       seed(&mut self.xattr_history, &key, Some(Some(value)), at);
       self
-        .identity_dirty
-        .insert(IdentityKey::Xattr(key.0.clone(), key.1.clone()));
+        .identity_aside
+        .dirty(IdentityKey::Xattr(key.0.clone(), key.1.clone()));
       self.aside.xattr(key.clone(), version);
       self
         .xattr_history
@@ -6718,6 +6726,11 @@ impl Green {
         entry.last = false;
       }
     }
+    core::mem::take(&mut self.identity_aside).publish_into((
+      &mut self.identity_dirty,
+      &mut self.identity_out,
+      &mut self.identity,
+    ));
     core::mem::take(&mut self.aside).publish_into(last_changes::Targets {
       removed: &mut self.file_removed,
       modes: &mut self.mode_changed,

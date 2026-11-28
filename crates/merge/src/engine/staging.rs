@@ -67,6 +67,8 @@ fn take_back<K: Ord, E>(marks: BTreeMap<K, Option<usize>>, histories: &mut BTree
 pub struct Staging {
   committing: Committing,
   staged: bool,
+  /// Whether the identity's published backlog is folded ([`Green::staging_step`]'s first steps).
+  drained: bool,
   units: u64,
 }
 
@@ -117,6 +119,7 @@ impl Green {
     Staging {
       committing: self.begin_committing(judged),
       staged: false,
+      drained: false,
       units: 0,
     }
   }
@@ -128,6 +131,15 @@ impl Green {
     spent: &mut dyn FnMut() -> bool,
   ) -> StagingStep {
     staging.units = staging.units.saturating_add(1);
+    // The identity's published backlog first, a key a step, before any of the commit's in-place writes (A-752 part 3c
+    // U5): a reader's fold between the stage's turns then finds nothing but what is published, and no key it would
+    // recompute from the current maps is one the commit wrote. Ends with the current maps forked into the stage.
+    if !staging.drained {
+      staging.drained = self.fold_identity_step(1);
+      if !staging.drained {
+        return StagingStep::More;
+      }
+    }
     let Committing {
       run,
       post_state,
@@ -177,8 +189,9 @@ impl Green {
       self.changes.remove(&version);
     }
     drop(staging);
-    // The last changes it wrote aside are dropped (A-752 part 3c U4).
+    // The last changes and identity marks it wrote aside are dropped (A-752 part 3c U4, U5).
     self.aside = super::last_changes::Aside::default();
+    self.identity_aside = super::last_changes::IdentityAside::default();
     let Some(marks) = self.stage_marks.take() else {
       return;
     };

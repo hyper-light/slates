@@ -58361,6 +58361,24 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
     first (`engine::publish_tests`): what the verdict reads of each path's last changes reads as before between
     every two steps (red: a reader saw the stage's last changes at unit 8), and a stage given up after any turn,
     its last included, leaves the six maps as they were (red: given up after 8 turns, a map was changed).
+  - **U5, the identity's marks aside, its published backlog drained first.** Every reader of the head identity folds
+    first (`Green::head_identity` → `fold_identity_step`: each key in `identity_dirty` popped and recomputed from the
+    current maps), so a commit that marked its keys dirty and took a changed file's entry out of the sum in place let
+    a reader's fold between its turns take the stage into the sum with the head unmoved. The marks go aside
+    (`last_changes::IdentityAside`: the keys changed, those taken out at their first change and the entries taken;
+    inserts and no read), and `publish_run` moves them in. A key a published commit left dirty, unfolded, is still
+    recomputed from the current maps, which the commit writes in place until they are forked (w-svn's), and a key's
+    fold reads beyond it (`copied_entries`, a copy's `copy_entries_after`); so a staged commit's first steps fold the
+    published backlog, a key a step, before its first write (`Green::staging_step`), and `identity_dirty` stays
+    empty through its writes (main's rulings of 02:46 and 02:47, drain-first). `identity_dirty` and `identity_out`
+    themselves stay plain sets, written only at the publish and by the fold. Both rules end with the current maps
+    forked into the stage, and are deleted in that change. Red first (`engine::publish_tests`): over works in every
+    dimension on a green whose identity owes the earlier works' keys, a reader folding between every two steps from
+    the first, the second and so on reads the serial twin's identity at the head (its sum and its fold's bookkeeping),
+    and after the publish the twin's at the new head; a stage given up after any turn leaves the identity a reader
+    reads at the twin's (red, marks in place: a reader's fold saw the stage at unit 8; red, marks aside but no drain:
+    the same at unit 8 and after a refusal at 8 turns); and main's move case, `a` renamed onto `e` unfolded and `a`
+    made again (holds with or without the drain: that key's fold reads no partner the stage wrote).
 - **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
   hard links, a copy's tree; the change build's end (the map's and trees' apply, O(the change)). Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;
