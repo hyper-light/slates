@@ -161,6 +161,14 @@ pub trait Judge {
     true
   }
 
+  /// A turn of what an atomic push's append needs once every command is judged, in a step of its own (P2 piece 4: a
+  /// landing between the last command's turn and the append overtook the push's stage, which the append's commit made
+  /// again whole): whether it is ready, so this step appends; not ready, the step ends and the next asks again. A judge
+  /// that needs nothing first is ready at once.
+  fn ready_to_append(&mut self) -> bool {
+    true
+  }
+
   /// Where `command` comes in a push without `atomic` (A-850): its commands are decided by rank, lowest first, ties in
   /// the order sent, and their outcomes reported in the order sent whatever their rank. A store whose moves are made at
   /// the versions below them ranks each by the generation number of the commit its new value peels to, so a push of a
@@ -851,6 +859,10 @@ fn atomic_step<A, J: Judge<Accepted = A> + ?Sized>(
         }
       })),
     }
+    return Ok(());
+  }
+  if !judge.ready_to_append() {
+    deciding.done = false;
     return Ok(());
   }
   let accepted = core::mem::take(&mut deciding.accepted);

@@ -788,6 +788,48 @@ fn a_landing_of_several_refs_is_mapped_by_the_shards_task_after_its_step() {
   });
 }
 
+/// P2 piece 3 (CLAUDE.md §3: a step over user-scaled data is bounded; `slates_git::store::Shedding`). Do: push the
+/// fixtures' `create`, its objects in its pack. Expect: `ok`; its maps by object given up by its landing and freed by
+/// the shard's task after its step (`vcs_store.landed.shed_entries` moved by three entries an object at least: its
+/// place, its pack entry and its position; none left queued, the task ended).
+#[test]
+fn a_landed_pushs_maps_by_object_are_freed_by_the_shards_task_after_its_step() {
+  on_stored_shard_awaited(["shed"], |[repository]| async move {
+    let created = scenario!("create");
+    let received = pushed_awaited(repository, created.request).await;
+    assert_eq!(reasons(&received), [b"ok"]);
+    let shed = |state: &mut ShardState| {
+      let freed = state
+        .refusals
+        .get(crate::vcs_store::SHED_ENTRIES)
+        .copied()
+        .unwrap_or(0);
+      (state.vcs_stores.sheds(), freed)
+    };
+    let mut turns = 0;
+    while on_state(shed).0 != (0, false) {
+      turns += 1;
+      assert!(
+        turns < MAPPING_TURNS,
+        "the landed push's maps were never freed"
+      );
+      slates_rt::futures::yield_now().await;
+    }
+    let positions = on_state(|state| {
+      state
+        .vcs_stores
+        .git_ref(repository)
+        .map_or(0, |(_, store)| store.repository.counters().positions)
+    });
+    let (_, freed) = on_state(shed);
+    // Each object its place, its pack entry and its position: three entries an object at least.
+    assert!(
+      positions > 0 && freed >= positions.saturating_mul(3),
+      "freed {freed} entries for {positions} objects"
+    );
+  });
+}
+
 /// Format: the ref the atomic test's fixtures push as `copy`.
 const COPY_REF: &[u8] = b"refs/heads/copy";
 /// Format: the tag the atomic test's fixtures push.
@@ -1129,6 +1171,32 @@ fn t_goal93_a_pushs_search_for_the_green_holding_a_commit_is_flat_in_the_reposit
   assert_eq!(few.0, many.0, "the search followed the repository's greens");
 }
 
+/// A-658 3c's measure first (main 01a20182's ruling of 2026-11-27 22:48): a push's judging on its owner's shard is timed,
+/// so a bench can read what share of the owner's push work it is. Do: push one create of `main`. Expect it `ok`, and
+/// `git_push.judge_ns` and `git_push.judge_ns_most` both moved, the most no more than the sum: the counter is not dead.
+#[test]
+fn t_a658_3c_a_pushs_judging_is_timed_on_its_owner_shard() {
+  let ((sum, most), received) = on_stored_shard_awaited(["judged"], |[repository]| async move {
+    let read =
+      |name: &'static str| on_state(move |state| state.refusals.get(name).copied().unwrap_or(0));
+    let before = (read(super::JUDGE_NS), read(super::JUDGE_NS_MOST));
+    let create = pack_of(scenario!("create").request);
+    let created = [("", FIRST, b"refs/heads/main".as_slice())];
+    let received = pushed_awaited(repository, &request(&created, CAPABILITIES, create)).await;
+    let after = (read(super::JUDGE_NS), read(super::JUDGE_NS_MOST));
+    (
+      (after.0 - before.0, after.1.max(before.1)),
+      reasons(&received),
+    )
+  });
+  assert_eq!(received, [b"ok".to_vec()], "the create landed");
+  assert!(sum > 0, "the push's judging was timed: {sum} ns");
+  assert!(
+    most > 0 && most <= sum,
+    "the most within the sum: {most} of {sum} ns"
+  );
+}
+
 /// Shape: the files of each tree [`t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step`] pushes:
 /// enough that each create's work is a large part of [`SMALL_CHAIN_BUDGET`].
 const ROOMY_FILES: usize = 64;
@@ -1187,7 +1255,8 @@ const PACED_HISTORY: usize = 600;
 
 /// Shape: the turns that line's one derivation takes besides those its work fills while nobody else waits on the shard:
 /// a turn to begin it, one to end the turn its work ends in, one to find nothing due, with room for a scheduler's
-/// spurious wake or two.
+/// spurious wake or two. Turns it yields to the shard's other work are not its own and are not counted against it
+/// ([`own_turns`]).
 const PACED_TURNS: u64 = 8;
 
 /// A-614 amended, paced (main's report of 2026-11-21, r52: a clone of git/git's branches took 465 s, its derivation of 8
@@ -1359,14 +1428,17 @@ fn tagged_line_request() -> Vec<u8> {
 }
 
 /// The derivation as this shard counted it: a reader's turns, the task behind's, handed over, and its nanoseconds.
-fn derive_driven(state: &mut ShardState) -> [u64; 4] {
-  use crate::vcs_store::git_derive::{BEHIND_HANDED, BEHIND_TURNS, NS, READ_TURNS};
+fn derive_driven(state: &mut ShardState) -> [u64; 5] {
+  use crate::vcs_store::git_derive::{
+    BEHIND_HANDED, BEHIND_TURNS, NS, READ_TURNS, READ_TURNS_YIELDED,
+  };
   let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
   [
     count(READ_TURNS),
     count(BEHIND_TURNS),
     count(BEHIND_HANDED),
     count(NS),
+    count(READ_TURNS_YIELDED),
   ]
 }
 
@@ -1380,8 +1452,8 @@ fn derive_driven(state: &mut ShardState) -> [u64; 4] {
 fn fetch_after_tagged_push(
   daemon: &crate::Daemon,
   name: &'static str,
-  behind: bool,
-) -> (u64, u64, u64) {
+  (behind, neighbour): (bool, bool),
+) -> Fetched {
   let repository = git_repository_on(daemon, name);
   let request = tagged_line_request();
   let before = crate::daemon::observe_first(daemon, derive_driven);
@@ -1389,7 +1461,7 @@ fn fetch_after_tagged_push(
     // Shared by this thread and the shard's task: leaked for the test's life, so neither owns it (D-8, no `Arc`).
     let pushed: &'static std::sync::atomic::AtomicBool =
       Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
-    let read = read_on_the_shard(daemon, repository, Some(pushed));
+    let read = read_on_the_shard(daemon, repository, (Some(pushed), neighbour));
     let (created, _) = pushed_in_steps(daemon, repository, &request).unwrap();
     pushed.store(true, std::sync::atomic::Ordering::Release);
     assert!(reasons(&created).iter().all(|reason| reason == b"ok"));
@@ -1397,14 +1469,29 @@ fn fetch_after_tagged_push(
   } else {
     let said = reasons(&pushed_on(daemon, repository, &request));
     assert!(said.iter().all(|reason| reason == b"ok"));
-    read_on_the_shard(daemon, repository, None)
+    read_on_the_shard(daemon, repository, (None, neighbour))
   };
   let took_ns = read
     .recv()
     .expect("the read answered")
     .unwrap_or_else(|missed| panic!("{missed}"));
   let after = crate::daemon::observe_first(daemon, derive_driven);
-  (after[0] - before[0], after[2] - before[2], took_ns)
+  Fetched {
+    turns: after[0] - before[0],
+    yielded: after[4] - before[4],
+    handed: after[2] - before[2],
+    took_ns,
+  }
+}
+
+/// What [`fetch_after_tagged_push`] saw of a fetch's derivation: its read turns, those of them it gave the shard's
+/// other tasks, the hand-overs, and its own time.
+#[derive(Debug)]
+struct Fetched {
+  turns: u64,
+  yielded: u64,
+  handed: u64,
+  took_ns: u64,
 }
 
 /// A fetch's read of `repository` ([`git_derive::derive_for_read`]) as a task of the shard, timed there from its start to
@@ -1417,7 +1504,7 @@ fn fetch_after_tagged_push(
 fn read_on_the_shard(
   daemon: &crate::Daemon,
   repository: RepositoryId,
-  pushed: Option<&'static std::sync::atomic::AtomicBool>,
+  (pushed, neighbour): (Option<&'static std::sync::atomic::AtomicBool>, bool),
 ) -> std::sync::mpsc::Receiver<Result<u64, String>> {
   use crate::vcs_store::git_derive::{BEHIND, behind_and_under_way, derive_for_read};
   let (done, read) = std::sync::mpsc::channel();
@@ -1447,14 +1534,36 @@ fn read_on_the_shard(
           }
         }
       }
+      let neighbour = neighbour.then(yielding_neighbour);
       let began = slates_rt::futures::now_ns();
       derive_for_read(repository).await;
-      let _ = done.send(Ok(slates_rt::futures::now_ns().saturating_sub(began)));
+      let took = slates_rt::futures::now_ns().saturating_sub(began);
+      if let Some(ended) = neighbour {
+        ended.store(true, std::sync::atomic::Ordering::Release);
+      }
+      let _ = done.send(Ok(took));
     })
     .expect("the read's task");
     slates_rt::futures::detach(task).expect("the read's task detached");
   });
   read
+}
+
+/// A task of this shard that waits on it, a yield at a time, until the flag it answers is set: the shard's other work a
+/// slow host keeps waiting through a fetch's derivation (diag CI 12's TSan lane), which ends each of the reader's turns
+/// early ([`crate::vcs_store::git_derive::READ_TURNS_YIELDED`]). The flag is leaked for the test's life, shared by the
+/// reader and this task (D-8, no `Arc`).
+fn yielding_neighbour() -> &'static std::sync::atomic::AtomicBool {
+  let ended: &'static std::sync::atomic::AtomicBool =
+    Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+  let task = slates_rt::futures::spawn(async move {
+    while !ended.load(std::sync::atomic::Ordering::Acquire) {
+      slates_rt::futures::yield_now().await;
+    }
+  })
+  .expect("the neighbour's task");
+  slates_rt::futures::detach(task).expect("the neighbour's task detached");
+  ended
 }
 
 /// Main 01a20182's ruling of 2026-11-25 (derive_behind withdrawn: a clone arriving mid-derivation ran it in slivers, the
@@ -1495,7 +1604,7 @@ fn by_driver(state: &mut ShardState) -> ([[u64; 3]; 3], u64) {
 #[test]
 fn a_derivations_turns_time_and_versions_are_counted_by_who_drove_them() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let _ = fetch_after_tagged_push(&daemon, "by-driver", true);
+  let _ = fetch_after_tagged_push(&daemon, "by-driver", (true, false));
   let (counted, left_due) = crate::daemon::observe_first(&daemon, by_driver);
   daemon.stop();
   let [read, behind, all] = counted;
@@ -1513,27 +1622,65 @@ fn a_derivations_turns_time_and_versions_are_counted_by_who_drove_them() {
   assert_eq!(left_due, 0, "no reader left versions due");
 }
 
+/// Main 01a20182's ruling of 2026-11-25 (a fetch arriving mid-derivation is handed it, never run in slivers beside the
+/// task behind). Do: push the tagged line as the edge does, a fetch reading it mid-derivation behind the push, then the
+/// same push and read with nothing behind. Expect: the fetch handed the derivation; no more of its own turns than alone
+/// but the hand-over's ([`own_turns`], [`PACED_TURNS`]); and no later than twice alone. A turn the shard's other work
+/// asked for is not the derivation's: diag CI 12's TSan lane counted 21 turns against 9 when they were counted in.
 #[test]
 fn a_fetch_arriving_mid_derivation_is_no_later_than_one_with_nothing_behind() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (turns, handed, took) = fetch_after_tagged_push(&daemon, "mid-derivation", true);
-  let (alone_turns, _, alone_took) = fetch_after_tagged_push(&daemon, "nothing-behind", false);
+  let mid = fetch_after_tagged_push(&daemon, "mid-derivation", (true, false));
+  let alone = fetch_after_tagged_push(&daemon, "nothing-behind", (false, false));
   daemon.stop();
-  eprintln!(
-    "mid-derivation: {turns} turns, {took} ns, {handed} handed; alone: {alone_turns} turns, {alone_took} ns"
-  );
+  eprintln!("mid-derivation: {mid:?}; alone: {alone:?}");
+  assert_turns_alone_but_the_hand_overs(&mid, &alone);
   assert!(
-    turns <= alone_turns + PACED_TURNS,
-    "no more turns than alone, but the hand-over's: {turns} against {alone_turns}"
+    mid.took_ns <= 2 * alone.took_ns,
+    "no later than alone: {} ns against {}",
+    mid.took_ns,
+    alone.took_ns
   );
+}
+
+/// The turns of a fetch's derivation its own work's ceiling ended ([`Fetched::turns`] less [`Fetched::yielded`]): a
+/// reader runs to the step's ceiling unless another task waits on the shard (`git_derive::paced`), so each turn it
+/// yields is the shard's other work's, never the derivation's.
+fn own_turns(fetched: &Fetched) -> u64 {
+  fetched.turns.saturating_sub(fetched.yielded)
+}
+
+/// Holds `mid`, a fetch handed a derivation, to no more of its own turns than `alone` but the hand-over's
+/// ([`PACED_TURNS`]), and to having been handed it.
+fn assert_turns_alone_but_the_hand_overs(mid: &Fetched, alone: &Fetched) {
   assert!(
-    took <= 2 * alone_took,
-    "no later than alone: {took} ns against {alone_took}"
-  );
-  assert!(
-    handed >= 1,
+    mid.handed >= 1,
     "the fetch arrived mid-derivation and was handed it"
   );
+  assert!(
+    own_turns(mid) <= own_turns(alone) + PACED_TURNS,
+    "no more of its own turns than alone, but the hand-over's: {mid:?} against {alone:?}"
+  );
+}
+
+/// Main 01a20182's diag CI 12 (TSan lane, run 46099781322: "no more turns than alone, but the hand-over's: 21 against
+/// 9"). Do: as [`a_fetch_arriving_mid_derivation_is_no_later_than_one_with_nothing_behind`], with a task of the shard
+/// waiting through the mid-derivation fetch's read, a yield at a time ([`yielding_neighbour`]), as a slow host's other
+/// work does. Expect: the fetch handed the derivation, turns of it yielded to the neighbour, and no more of its own
+/// turns than alone but the hand-over's ([`own_turns`]). Red with every turn counted: 935 against 3, 934 of them
+/// yielded.
+#[test]
+fn a_fetch_handed_a_derivation_while_its_shard_has_other_work_takes_no_more_turns_than_alone() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let mid = fetch_after_tagged_push(&daemon, "mid-neighboured", (true, true));
+  let alone = fetch_after_tagged_push(&daemon, "alone-quiet", (false, false));
+  daemon.stop();
+  eprintln!("mid-derivation beside a neighbour: {mid:?}; alone: {alone:?}");
+  assert!(
+    mid.yielded >= 1,
+    "the neighbour waited through the read: {mid:?}"
+  );
+  assert_turns_alone_but_the_hand_overs(&mid, &alone);
 }
 
 /// Lets go of every window of `pack` on this shard by hand, as a landed pack's let-go would (its home told first, each
@@ -3453,14 +3600,45 @@ const INTERLEAVED: usize = 12;
 #[cfg(unix)]
 #[test]
 fn t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_append() {
-  let (outcomes, restaged) = on_stored_shard_awaited(["overtaken"], |[repository]| async move {
+  let (outcomes, restaged) = interleaved_creates("overtaken", CAPABILITIES);
+  assert!(
+    outcomes.iter().all(|reasons| reasons == &[b"ok".to_vec()]),
+    "{outcomes:?}"
+  );
+  assert_eq!(restaged, Some(0));
+}
+
+/// P2 piece 4 (CLAUDE.md §3; A-722 part 4e's owed "a stale restage"): an atomic push judges its commands a step each
+/// and appends in a step of its own, so a landing between its last command's turn and its append overtook its stage,
+/// and the append's commit staged it again whole. Do: as A-722 part 4e's test above ([`interleaved_creates`]), each
+/// push `atomic`. Expect: every push `ok`, and no commit staged a push again whole (`restaged` none): the append waits
+/// for the stage made again in its push's turns. Red before: commits staged pushes again whole.
+#[cfg(unix)]
+#[test]
+fn an_atomic_pushs_stage_a_landing_overtook_before_its_append_is_made_again_in_turns() {
+  let (outcomes, restaged) = interleaved_creates("overtaken-atomic", ATOMIC);
+  assert!(
+    outcomes.iter().all(|reasons| reasons == &[b"ok".to_vec()]),
+    "{outcomes:?}"
+  );
+  assert_eq!(restaged, Some(0));
+}
+
+/// [`INTERLEAVED`] pushes to repository `name`, each creating its own branch at the fixtures' first commit with its
+/// whole pack under `capabilities`, answered a step of each in turn: each push's reasons, and the store's `restaged`.
+#[cfg(unix)]
+fn interleaved_creates(
+  name: &'static str,
+  capabilities: &'static [u8],
+) -> (Vec<Vec<Vec<u8>>>, Option<u64>) {
+  on_stored_shard_awaited([name], move |[repository]| async move {
     let pack = pack_of(scenario!("create").request);
     let mut pushes: Vec<Option<ReceivePack>> = on_state(|state| {
       (0..INTERLEAVED)
         .map(|k| {
           let name = format!("refs/heads/p{k}");
           let created = [("", FIRST, name.as_bytes())];
-          let body = request(&created, CAPABILITIES, pack);
+          let body = request(&created, capabilities, pack);
           let (_, mut push) = started(state, repository);
           for piece in body.chunks(PIECE) {
             push.input(state, piece).expect("taken");
@@ -3496,12 +3674,7 @@ fn t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_appen
         .map(|(_, git)| git.repository.counters().restaged)
     });
     (outcomes, restaged)
-  });
-  assert!(
-    outcomes.iter().all(|reasons| reasons == &[b"ok".to_vec()]),
-    "{outcomes:?}"
-  );
-  assert_eq!(restaged, Some(0));
+  })
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

@@ -103,7 +103,11 @@
 > watch only). Main's bridge-fuse changes since the branch: A-795 removed the S3 base from `bridge.rs`/`channel.rs`.
 > **Main's, not family three's:** the same 2 fail on origin/main 3b664fb alone (kiln r29, adacachy): the zero-budget
 > round's slices are `[1, 1, ...]` (41) where the test expects the root and one file first, `[2, 1, ...]` (40)
-> (`takeover_round.rs:259`, `:294`). Owner to be assigned by main.
+> (`takeover_round.rs:259`, `:294`). Owner to be assigned by main. **Not reproduced on GitHub's 7.0 kernels at
+> 93b7d6b42, 2 of 2 on each architecture** (diag-measurer-fuse-1, run 46118278438: ubuntu-latest x86_64 and
+> ubuntu-24.04-arm, kernel 7.0.0-1020-azure, the whole slates-bridge-fuse suite twice; family three's `fuse_mount` test 8
+> of 8 on each, no SKIP, which closes family three's Linux run). It may depend on the kernel or have been fixed since;
+> recheck on adacachy (7.2.9) when kiln returns.
 > **CLOSED by A-926 part 1 (w-perf, 2026-11-25; opened by w-shared, 2026-11-21): `content_ranges`
 > `a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length` failed some runs** (macOS arm64;
 > main's full suite at f954135af: (sweeps, idle slices, armed) (0, 3,348,409, true) at its bound, passing alone in
@@ -435,6 +439,19 @@
 >   v1 retargeted to the newcomer meanwhile: not yet A-935's, one red against none in 16). Unproven guess for the stall:
 >   an object of an earlier landed record whose homes were the two dead (d and c), the healer not yet re-homing it before
 >   c died.
+> - **Not done, by ruling (main 01a20182's of 2026-11-27 22:35): a tighter reship rate for a holder answering `Behind`.**
+>   A record reships a target once a pass until it acknowledges (`merge_service::PendingGreen::next`, the stated bound:
+>   3 and 9 `Behind` a run in the stall red). Reshipping an unchanged `Behind` only after its chain read ends would need
+>   the read's end reported to the owner, a protocol step with no measured cost behind it; not once per install either,
+>   which would leave a quiet stretch's newcomer behind (the gap A-935 closed).
+> - **FIXED (w-shared, 2026-11-27; main 01a20182's reading of 22:09, winfleet-3's a935 arm64 red): a read past tolerance
+>   was never read again.** A newcomer's one chain read went past tolerance while its candidacy was owed ("answered by
+>   [c, the newcomer, a], nothing held"), and `ledger_read`'s mark refused every later read of the register for good: 52
+>   `Behind` answers after it, chain reads still 1, until a935's bound ran out. The mark now keeps the configuration
+>   version it was made under and refuses only while that configuration stands; once an install moves it the next ask
+>   reads again, counted `fleet.ledger_read.read_again_after_install` (one read an install, bounded by the registers
+>   held). Red first at the mark's own level (the fleet shape is 1 of 8 on a slow runner):
+>   `ledger_read::past_tolerance_tests::a_read_past_tolerance_is_read_again_once_an_install_moves_the_configuration`.
 > - **Not recurred since A-936 (main 01a20182's ruling of 2026-11-27 21:08): a superseded owner's write answered
 >   `FsDone` on Windows** (`a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost`, diag 12 at a0d39a8c1,
 >   both lanes). Suspected: a holder whose install walk had not reached the volume's copy still named the old owner and
@@ -468,7 +485,13 @@
 >   abandoned by its exchange and its session given back
 >   (`docs/bugs/2026-11-27-a-region-read-waited-out-a-dead-first-home.md`). Red first, two fleet tests: a dead first
 >   home and a slow one, each read 1,998,960,833 ns against a 1,998,000,000 ns budget before.
-> - **OPEN, a risk of that fix (main 01a20182's ruling of 2026-11-27 15:48; to be worked if measured): a live home slow
+> - **Addressed by A-936's hedged read (w-shared, 2026-11-27; main 01a20182's ruling of 20:11):** a read asks its first
+>   home only until that home's path tail, then the next its share, then the first again with the rest
+>   (`homes::hedged_asks`). A dead first home not yet suspected costs its path tail, not a share (red first: 1.000 s of
+>   a 1.998 s budget before; 2.2 ms hedged), and a slow live first home is asked again with what is left, as much as
+>   its share was before. What stays: a live home slower than about half the budget, with every other home dead, is
+>   still cut, as below.
+> - **Was OPEN, a risk of that fix (main 01a20182's ruling of 2026-11-27 15:48; to be worked if measured): a live home slow
 >   past its share is cut, and the read moves on to a dead one.** The budget is shared over the homes asked, so with two
 >   homes the first gets half of it. Before the fix only the first home was ever asked: the read's outer bound
 >   (`xshard::task_in_shard_time`) ended at the same budget, so a live home slow under load answered within the whole of
@@ -1226,11 +1249,25 @@
 > off its CPU while the process footprint fell 40.1 MB, the steps pages were returned in held all of a run's off-CPU
 > time (1.7-2.5 ms), and a run with no return during a landing step spent at most 18 µs off its CPU although 1,218 steps
 > met the reaper dropping. So it is the page return, not the reaper's drops, and neither slicing the reaper's drops
-> (measured: 804-2,442 µs, no better) nor dropping on the shard can split one return. The wide copy test holds
-> `LANDING_OFF_CPU_MOST_NS` to 84a's 1 ms bar and fails where a return stalls a step (2 of 4 debug runs; another run's
-> 8 return steps, 71 MB, stalled none, at most 22 µs off its CPU, so the stall is intermittent): the red the arena piece turns
+> (measured: 804-2,442 µs, no better) nor dropping on the shard can split one return. The footprint is the process's,
+> so the page-return reading is process-wide: in a suite, other tests' frees count against a step (w-git's 22:10 run,
+> 273 tests in one process: a prepare step 39.7 ms off its CPU while the footprint fell 376 MB), and an in-suite figure
+> is not this test's. The wide copy test prints `LANDING_OFF_CPU_MOST_NS` (its `OFFCPU` line); its 1 ms assert is out
+> until the fix lands with it (main's ruling of 2026-11-27 22:16 reversed 20:31's: a red lands with its fix), as it
+> failed where a return stalled a step (2 of 4 debug runs; another run's 8 return steps, 71 MB, stalled none): the red the arena piece turns
 > green (the landing's structures in the shard's arena, so a free never hands pages back mid-step). Unexplained, logged,
 > not attributed: one run's 5,025 µs in a step whose footprint did not fall.
+
+> **FIXED 2026-11-27 (w-svn; main's ruling of 21:46): the greens' pending holds were copied whole every step.**
+> `name_holds::apply_some` took the whole owed list, applied a few holds before its step was spent and rebuilt the
+> rest, so a landing's 9,000-text holds were copied and regrown each step: 22.4 GB freed over 16,000 steps of one wide
+> copy import (debug; A-920 7c, 829985455). `Greens` now keeps them as two queues, takes and gives, each in order; a
+> step applies from the front and moves no hold it does not apply (`merge.name_hold.requeued`, 7,998,000 for 4,000
+> owed before, 0 after). The wide copy test runs in 8.5-9.6 s, from 14-17 s; the ~50 MB page return remains (3.2-4.6 ms
+> off the CPU in a step whose footprint fell 41-42 MB, 2 of 3 runs), so the arena piece stands. Siblings of the shape,
+> owed their own look: the import's read buffer drained from its front at every consume (`Importing::consume`,
+> `buffer.drain(..consumed)`, the rest moved each time) and a landing's pending section drained a store piece at a
+> time (`landing::sent_piece`, `pending.drain(..take)`).
 
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
@@ -3509,14 +3546,17 @@
 > after its plan leaves the store as it was (found: the stage's fork was dropped holding its tables, 397 bytes a
 > refusal), held at every point by the store's oracle. Piece 2 BUILT (A-722 part 4i): a landing of several moves
 > maps none of its positions in its step (599 before), its moves' brought sets recorded and mapped by the shard's task a
-> slice a turn. OWED, each its own piece: the release's drops of the push's placed and positions maps; a stale stage
-> restaged whole (with a stale stage's members positioned by id); a replayed store's landings of several moves mapped
-> before its next live commit.
+> slice a turn. Piece 3 BUILT (A-722 part 4j): a landed push's maps by object are freed by the shard's task after its
+> step (1,202 entries freed in the step before for a push of 600 commits). Piece 4 BUILT (A-722 part 4k): an atomic
+> push's stage a landing overtook before its append is made again in turns (10 of 12 restaged whole before). OWED,
+> each its own piece: a stale stage's admitted moves positioned by id in the commit's step; a replayed store's
+> landings of several moves mapped before its next live commit; an abandoned or replayed push's maps freed in its own
+> step.
 >
 > **A-722 part 4e (2026-11-20, w-git).** BUILT: an overtaken stage made again in the judge's turns; a stage giving no
-> position never overtaken; `Judge::ready` asked for every unrefused command (part 4c's turns now run live). Owed: the
-> store commit's whole passes (part 4h above began them: the chains' and the head map's); the check's propagation in
-> one unit (57.9 ms at 100 pushes).
+> position never overtaken; `Judge::ready` asked for every unrefused command (part 4c's turns now run live), and an
+> atomic push's append asks its own turns (part 4k). Owed: the store commit's whole passes (parts 4h to 4k above:
+> what is left is listed there); the check's propagation in one unit (57.9 ms at 100 pushes).
 >
 > **A-753 (2026-11-20, w-git).** BUILT: a create at a commit another branch holds is made from it (empty work); a
 > resent object is read from the index; at the chains' cap a push checkpoints the repository's other members too.

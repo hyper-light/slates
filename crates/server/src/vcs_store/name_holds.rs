@@ -74,57 +74,66 @@ pub(crate) const NAME_HOLD_APPLIED_FREEING: &str = "merge.name_hold.applied_free
 pub(crate) const NAME_HOLD_APPLY_STEPS: &str = "merge.name_hold.apply_steps";
 
 /// The greens' pending holds applied a hold a unit until `deadline_ns`, at least one: every take before any give, as
-/// [`freeing`] applies them, those left put back first in line (A-920 7c: a wide landing's 9,000 holds applied at its
-/// first free decision, 7.8 ms of one step, debug). A free decision between steps applies the rest whole, so no text a
-/// green names is freed before its take, and no give comes before a take it follows. Whether none is left.
+/// [`freeing`] applies them, each from the front of its queue in the order owed (A-920 7c: a wide landing's 9,000 holds
+/// applied at its first free decision, 7.8 ms of one step, debug). A step takes the owed holds out whole and puts back
+/// what it did not reach, each a move of the two queues, so it moves no hold it does not apply (main's ruling of
+/// 2026-11-27 21:46: each step took the whole list, applied a few and rebuilt the rest, 22.4 GB freed over 16,000 steps
+/// of one wide copy import, debug). A free decision between steps applies the rest whole, so no text a green names is
+/// freed before its take, and no give comes before a take it follows. Whether none is left.
 pub(crate) fn apply_some(state: &mut crate::state::ShardState, deadline_ns: u64) -> bool {
-  let holds = state.greens.take_name_holds();
-  if holds.is_empty() {
+  let mut owed = state.greens.take_owed_holds();
+  if owed.is_empty() {
     return true;
   }
   state.count(NAME_HOLD_APPLY_STEPS, 1);
-  let (unheld, left) = super::within_budget(state, 0, |stores| {
-    apply_within(stores.content_mut(), holds, deadline_ns)
+  let unheld = super::within_budget(state, 0, |stores| {
+    apply_from_front(stores.content_mut(), &mut owed, deadline_ns)
   });
   if unheld > 0 {
     state.count(NAME_HOLD_UNHELD, unheld);
   }
-  let done = left.is_empty();
-  state.greens.put_back_name_holds(left);
+  let done = owed.is_empty();
+  let moved = state.greens.put_back_owed_holds(owed);
+  if moved > 0 {
+    state.count(NAME_HOLD_REQUEUED, u64::try_from(moved).unwrap_or(u64::MAX));
+  }
   done
 }
 
-/// [`apply`] until `deadline_ns`, a hold a unit, at least one: the takes in order while any is left, then the gives;
-/// the takes refused and the holds not yet applied, in order.
-fn apply_within(
+/// `owed` applied from its front, a hold a unit, until `deadline_ns`, at least one: its takes in order while any is
+/// left, then its gives; the takes refused. With no store, every hold at once, its takes refused (as [`apply`]).
+fn apply_from_front(
   store: Option<&mut ContentStore>,
-  holds: Vec<NameHold>,
+  owed: &mut crate::greens::OwedHolds,
   deadline_ns: u64,
-) -> (u64, Vec<NameHold>) {
+) -> u64 {
   let Some(store) = store else {
-    return (apply(None, holds), Vec::new());
+    let takes = u64::try_from(owed.takes.len()).unwrap_or(u64::MAX);
+    *owed = crate::greens::OwedHolds::default();
+    return takes;
   };
-  let taking = holds.iter().any(|hold| matches!(hold, NameHold::Take(_)));
   let mut unheld = 0u64;
-  let mut left = Vec::new();
-  let mut spent = false;
-  for hold in holds {
-    match hold {
-      NameHold::Take(identity) if taking && !spent => {
-        if store.hold(&ContentId(identity.hash)).is_err() {
-          unheld = unheld.saturating_add(1);
-        }
-        spent = slates_rt::futures::now_ns() >= deadline_ns;
+  loop {
+    if let Some(name) = owed.takes.pop_front() {
+      if store.hold(&ContentId(name.hash)).is_err() {
+        unheld = unheld.saturating_add(1);
       }
-      NameHold::Give(identity) if !taking && !spent => {
-        let _ = store.release(&ContentId(identity.hash));
-        spent = slates_rt::futures::now_ns() >= deadline_ns;
-      }
-      other => left.push(other),
+    } else if let Some(name) = owed.gives.pop_front() {
+      let _ = store.release(&ContentId(name.hash));
+    } else {
+      return unheld;
+    }
+    if slates_rt::futures::now_ns() >= deadline_ns {
+      return unheld;
     }
   }
-  (unheld, left)
 }
+
+/// Counter: a pending hold a step of [`apply_some`] moved without applying it, owed while the step held the queues
+/// out: zero in every correct use, as a step applies from the front of what is owed only the holds it reaches (red
+/// before: each step took the whole list, applied a few and put the rest back, 7,998,000 holds moved for 4,000 owed in
+/// the bound's test). Format: a counter name in the daemon's status report.
+pub(crate) const NAME_HOLD_REQUEUED: &str = "merge.name_hold.requeued";
 
 /// Applies `holds` to `store`, the takes first: the takes refused (no such object, or no store).
 fn apply(store: Option<&mut ContentStore>, holds: Vec<NameHold>) -> u64 {
@@ -539,9 +548,46 @@ mod tests {
       .collect()
   }
 
+  /// Shape: the holds of each kind the bounded-step test owes, enough that a step moving what it does not apply shows.
+  const OWED: usize = 2000;
+
+  /// A-920 7c's bound (main's ruling of 2026-11-27 21:46; CLAUDE.md §3). Do: on a shard, owe [`OWED`] takes of texts
+  /// the content plane does not hold and as many gives, interleaved, then apply them with every step spent at its
+  /// first hold (`apply_some` with its deadline passed) until none is left. Expect every hold applied, a step a hold,
+  /// and none moved without being applied (`merge.name_hold.requeued` 0). Red before: each step took the whole list,
+  /// applied one and put the rest back, so the count was the sum of what each step left, quadratic in the holds.
+  #[test]
+  fn each_step_of_the_owed_holds_moves_only_the_holds_it_applies() {
+    let (requeued, steps) = crate::test_store::run_on_stored_shard(|| async {
+      // A repository, so the shard holds a content store the holds apply to.
+      crate::vcs_store::paths::tests::git_made("owed-holds").await;
+      crate::vcs_store::tests::on_state(|state| {
+        assert!(state.vcs_stores.content().is_some(), "a content store");
+        let owed: Vec<NameHold> = (0..OWED)
+          .flat_map(|at| {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&(at as u64).to_le_bytes());
+            let name = Identity { hash, len: 1 };
+            [NameHold::Take(name), NameHold::Give(name)]
+          })
+          .collect();
+        state.greens.owe_name_holds(owed);
+        let mut steps = 0usize;
+        while !super::apply_some(state, 0) {
+          steps += 1;
+          assert!(steps <= 4 * OWED, "the owed holds never ended");
+        }
+        let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        (count(super::NAME_HOLD_REQUEUED), steps + 1)
+      })
+    });
+    assert_eq!(steps, 2 * OWED, "a step a hold");
+    assert_eq!(requeued, 0, "holds moved without being applied");
+  }
+
   /// A-920 7c. Do: in a store holding two texts once each, apply a drain that gives the first back and takes it again
   /// (a block freed and another naming the same object), then takes the second and gives it back, a hold a unit
-  /// (`apply_within` with its deadline passed, what each step left fed back to the next), and the same drain whole
+  /// (`apply_from_front` with its deadline passed, from the front of the owed takes and gives), and the same drain whole
   /// (`apply`). Expect: each text's holders the same after either, both still held, and the drain taken in a step a hold.
   #[test]
   fn a_drain_applied_a_hold_a_step_leaves_the_holders_applied_whole_leaves() {
@@ -557,10 +603,17 @@ mod tests {
     let (mut whole, names) = holding(&texts);
     let unheld_whole = super::apply(Some(&mut whole), drain(&names));
     let (mut stepped, _) = holding(&texts);
-    let (mut left, mut unheld_stepped, mut steps) = (drain(&names), 0, 0);
-    while !left.is_empty() {
-      let (unheld, rest) = super::apply_within(Some(&mut stepped), left, 0);
-      (left, unheld_stepped, steps) = (rest, unheld_stepped + unheld, steps + 1);
+    let mut owed = crate::greens::OwedHolds::default();
+    for hold in drain(&names) {
+      match hold {
+        NameHold::Take(name) => owed.takes.push_back(name),
+        NameHold::Give(name) => owed.gives.push_back(name),
+      }
+    }
+    let (mut unheld_stepped, mut steps) = (0, 0);
+    while !owed.is_empty() {
+      unheld_stepped += super::apply_from_front(Some(&mut stepped), &mut owed, 0);
+      steps += 1;
     }
     assert_eq!(holders(&stepped, &names), holders(&whole, &names));
     assert_eq!(holders(&whole, &names), [1, 1], "both texts still held");

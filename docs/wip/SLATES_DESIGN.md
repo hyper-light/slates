@@ -57065,6 +57065,41 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   made durable, `Unanswered`: Subversion's commit path, which this change does not touch); fmt clean (macOS arm64,
   this Mac, local).
 
+### A-722 part 4k — An atomic push's stage a landing overtook before its append is made again in turns (P2 piece 4, 2026-11-27, w-git; main 01a20182's order of 18:44)
+- **Why.** A-722 part 4e made an overtaken stage again in the judge's turns (`Judge::ready`), and a push without
+  `atomic` appends each command in the step its `ready` answered, so its stage is current at its commit. An atomic
+  push judges its commands a step each and appends in a step of its own (`receive::atomic_step`), which asked nothing
+  first. A landing between its last command's turn and its append overtook its stage, and the append's commit staged
+  the push again whole in its step (`StoreCounters::restaged`): 10 of 12 interleaved atomic creates.
+- **Change.** `Judge::ready_to_append`, asked by the atomic step before its append; not ready, the step ends and the
+  next asks again, as `ready` does. Ready at once by default. The server's judge turns the push's stage made again
+  (`SealedPush::restage_turn`), so the append's commit adopts a current stage.
+- **Tests.** `slates-server` `git_push::tests::an_atomic_pushs_stage_a_landing_overtook_before_its_append_is_made_again_in_turns`
+  (12 atomic creates answered a step of each in turn: every one `ok`, `restaged` 0; red 10), beside A-722 part 4e's
+  test, now sharing its driver (`interleaved_creates`).
+- **Owed.** The moves admitted against the stage before it was made again have their new objects positioned by id in
+  the commit's step (`Repository::members_positions`), O(their objects), its own piece.
+
+### A-722 part 4j — A landed push's maps by object are freed after its step, a slice a turn (P2 piece 3, 2026-11-27, w-git; main 01a20182's order of 18:44)
+- **Why.** CLAUDE.md §3 (bounded work). A commit's release freed the push's maps by object inside the landing's step:
+  its commits, its objects' places in its pack, and the positions its stage gave. A pack push's entries by offset
+  waited for the push's drop, a step of their own. Each is one entry an object, so the free grew with the push:
+  1,202 entries in one step for a push of 600 commits held whole (600 commits, 602 positions).
+- **Change.** The release gives the maps up whole into the push's `Shedding`, which moves them and frees nothing; the
+  commit adds its stage's positions. They hold nothing of the content store, so when they are freed changes nothing a
+  reader sees. The live commit (`vcs_store::commit`) queues the push's `Shedding` on the shard. A task frees the queue
+  an entry a unit under the step quantum (`shed_turn`, counted `vcs_store.landed.shed_entries`), as the landed
+  let-go's queue is turned. Unspawned, it waits for the next landing, counted `vcs_store.landed.shed_unspawned`.
+- **Tests.** `slates-git` `store::tests::commit_walk::a_landing_frees_none_of_its_pushs_maps_by_object_in_its_step`
+  (600 commits: the push holds no map entry after its landing and gives up all 1,202 with its stage's positions, red
+  0 given up; freed in more than one turn; the store empty once released). `slates-server`
+  `git_push::tests::a_landed_pushs_maps_by_object_are_freed_by_the_shards_task_after_its_step` (the fixtures' pack
+  push: three entries an object at least freed by the task, none left queued, the task ended; red with the queue not
+  fed: none freed).
+- **Owed.** A push refused or abandoned frees its maps in its own step (`Push::abandon`), and a replay's push is
+  dropped whole in its replay turn. Each is O(its objects), its own piece. A push of objects held whole still gives
+  each object's hold back in the step (`Quarantine::abandon`): no pack push holds any.
+
 ### A-722 part 4i — A landing of several moves is mapped by position after its step, a slice a turn (P2 piece 2, 2026-11-27, w-git; main 01a20182's order of 18:44)
 - **Why.** The landing map names the green and version that brought each position (A-722, `Repository::bringer_of`:
   a fetch's offers and a hook view's bringer read it). A commit of several moves (an atomic push, a first push of
@@ -57081,6 +57116,9 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   runs in place, the store's charge moved from the sets' bytes to the runs', the room lent for them
   (`settle_room`). A refused charge leaves the landing answered by its sets for the next commit's task, counted
   `vcs_store.landings.settle_refused`.
+- **Fixed the same day.** A turn whose quantum ran out on the last landing's runs answered more, so the server's task
+  held its slot a turn past the mapping. Its test met that at load 44. A turn now answers done exactly when none is
+  left; the git test's driver holds every turn to that (red: turn 4 answered more with none left).
 - **Tests.** `slates-git` `store::tests::commit_walk::a_landing_of_several_moves_maps_none_of_its_positions_in_its_step`
   (599 commits, two greens: 0 positions mapped in the step, red 599; every bringer as the line says before and after
   the turns; all 599 mapped in more than one turn; the store empty once released). The refusal oracle's two-move push
@@ -64393,6 +64431,15 @@ GAPS.
   against 1 and 47.3 ms, handed once. `vcs_http::daemon_edge::tests::a_ref_listing_during_a_derivation_behind_a_push_drives_none_of_it`:
   red with one count of every derive turn (100 → 117 across the listing); green, a reader's turns 0 → 0 while the task
   behind turned 364, the listing answered in 14.8 ms (its patience scaled by `test_lane::slowdown`).
+- **A turn yielded is the shard's, not the derivation's (2026-11-27, w-git; main 01a20182's diag CI 12, TSan run
+  46099781322: "no more turns than alone, but the hand-over's: 21 against 9").** A reader's turn runs to the step's
+  ceiling unless another task waits on the shard (`paced`), so a slow host, whose other tasks wait longer, ends more
+  of them early. The bound the design holds is on the reader's own turns, those its ceiling ended: handed a
+  derivation, no more than alone but the hand-over's (`PACED_TURNS`, a turn to begin, one to end, one to find
+  nothing due, room for a spurious wake). Counted `vcs_store.git_derive.read_turns_yielded` beside `read_turns`.
+  Red, made deterministic with a task waiting through the read a yield at a time
+  (`a_fetch_handed_a_derivation_while_its_shard_has_other_work_takes_no_more_turns_than_alone`): every turn counted,
+  935 against 3, 934 of them yielded. Green with the reader's own turns, 1 against 1.
 - **Whether any is due, from counts (2026-11-25, main 01a20182's sample).** A 3 s sample of git/git's clone waiting for
   its first pack bytes found the encoding behind the push spending a third of its time in
   `Repository::derivations_due` (309 of its 951 samples), which every derivation and encoding turn asks before it
@@ -66802,6 +66849,17 @@ Applied in the same change to:
   `replica_build::tests::a_waiting_builds_replay_seen_rises_with_its_steps_and_never_falls`,
   `vcs_store::tests::a_rebuilds_steps_are_its_records_replayed_and_names_fetched`; main's ×16's run 2 is the field
   evidence.
+- **The hedged region read (main 01a20182's ruling of 2026-11-27 20:11, its (b); Dean and Barroso, "The Tail at Scale",
+  CACM 2013, hedged requests).** A region read with two homes or more asks its first home only until that home's
+  measured path tail (`homes::hedge_delay_ns`, the `PathRtt` tail RFC 9002's probe timeout gives), then each next
+  home its share of what is left, then the first again with the rest (`homes::hedged_asks`); one home, or a first home
+  with no measured path, is asked as before. Fan-out stays within the identity's homes, one at a time, so no read is
+  sent to two homes at once; the first home's late answer is its exchange's straggler, settled there with its session
+  given back, and the hedge counted `vcs_store.homes.reads_hedged`. Not a concurrent hedge: an exchange waits its
+  stragglers out to its own budget, and one cut short to race another would need its stragglers settled off the read's
+  path, which no task here owns. A dead first home not yet suspected costs a read its path tail and the next home's
+  round trips. Fleet red first: `a_region_read_whose_first_home_died_unseen_is_hedged_to_the_next_within_its_path_tail`
+  (1.000 s of a 1.998 s budget before, the stopped home's whole share; 2.2 ms hedged).
 
 ### A-937 — A Mercurial revision's chunk length is kept where it lands, so a stream clone walks nothing before its head (2026-11-27, w-interop for main 01a20182, its order of 2026-11-27 16:23 (cut 2) and its rulings of 18:56, 18:58 and 20:19; goal 93's hg whole-history gap; §4.17.3 "Stream clones: the revlog view")
 

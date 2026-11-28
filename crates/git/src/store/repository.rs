@@ -1775,6 +1775,9 @@ impl Repository {
     self.charged = exact;
     self.count(|counters| counters.positions = counters.positions.saturating_add(given));
     self.depth.seen(push.deepest());
+    // The positions the stage gave, one entry an object, are given up with the push's maps, freed after the step (P2
+    // piece 3, `Shedding`).
+    push.shed_positions(positions);
     push.release_holds(store)?;
     // The push's objects read lately go with it, their charge given back (A-861).
     push.release_recent(store);
@@ -1782,8 +1785,9 @@ impl Repository {
   }
 
   /// Adopts the stage's `fork` into the index ([`Index::adopt`]). In a test that asks to refuse a commit at its
-  /// adoption ([`REFUSE_COMMIT_AT`]) it is refused as a stale fork is, since a current fork's adoption seals no tail
-  /// and charges nothing a budget could refuse, and the commit's give-back after it must still be exercised.
+  /// adoption (the test-only `REFUSE_COMMIT_AT`) it is refused as a stale fork is, since a current fork's adoption
+  /// seals no tail and charges nothing a budget could refuse, and the commit's give-back after it must still be
+  /// exercised.
   fn adopted(
     &mut self,
     store: &mut ContentStore,
@@ -2132,8 +2136,9 @@ impl Repository {
         Ok(SettleUnit::Settled) => {}
         Err(refused) => break Err(refused),
       }
+      // A quantum spent on the last unit answers done where none is left, so its task ends this turn, never one later.
       if quantum.clock.now_ns() >= deadline {
-        break Ok(false);
+        break Ok(self.unsettled.is_empty());
       }
     };
     self.count(|counters| counters.landing_mapped = counters.landing_mapped.saturating_add(mapped));
