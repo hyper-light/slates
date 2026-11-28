@@ -878,3 +878,7 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 ## 2026-11-28 04:38 PST: A-752 3c U8 landed
 - 52714b48b (d830133b1): content history forked with chunk-holding copies (HistoryHolders), staged re-anchor in full (layered false while staging); closes U7's block gap. Server sets 170, merge 348.
 - Next (main's 03:10 order): scalars written back at publish, then wiring into repository::push landing (t_a752 14 ms bar). Asked main whether to fold or keep the uncommitted six-guard staging red.
+
+## 2026-11-28 05:13 PST: A-752 3c U9 landed
+- e418c7a47 (bdf539768): commit scalars + chunk counters are the stage's own (staging::Scalars); staging_bytes / staging_bound(inc); six-guard red retired. Merge 350, server 170 on final merged tree.
+- Left of 3c: wiring the staged commit into repository::push's landing, own integration red, t_a752 14 ms bar. Asked main to go on.
