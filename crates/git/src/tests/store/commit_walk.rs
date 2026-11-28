@@ -13,6 +13,9 @@ use super::{
   tree,
 };
 
+/// A push's moves: each green it moves, by key, and the head it moves the green to (none: the green deleted).
+type Moves = Vec<(u64, Option<ObjectId>)>;
+
 /// Shape: the greens the long-lived repository holds, each moved by every push of its line.
 const GREENS: u64 = 1_000;
 
@@ -56,7 +59,7 @@ fn a_commit_reads_its_own_moves_records_whatever_the_repositorys_other_greens_ho
   let mut pushes = line(format, LINE.saturating_add(1));
   let last = pushes.pop().unwrap();
   for objects in pushes {
-    let moves: Vec<(u64, Option<ObjectId>)> = (1..=GREENS)
+    let moves: Moves = (1..=GREENS)
       .map(|green| (green, Some(head_of(&objects))))
       .collect();
     push_and_move(&mut repository, &mut store, objects, &moves).unwrap();
@@ -92,7 +95,7 @@ fn a_commit_refused_at_each_point_after_its_plan_leaves_the_store_as_it_was() {
   let pushes = line(format, 3);
   let mut refused = BTreeSet::new();
   let heads: Vec<ObjectId> = pushes.iter().map(|objects| head_of(objects)).collect();
-  let histories: [(&[Made], Vec<(u64, Option<ObjectId>)>); 3] = [
+  let histories: [(&[Made], Moves); 3] = [
     (&pushes[0], vec![(1, Some(heads[0]))]),
     (&pushes[1], vec![(1, Some(heads[1]))]),
     (&pushes[2], vec![(1, Some(heads[2])), (2, Some(heads[2]))]),
