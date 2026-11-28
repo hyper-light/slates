@@ -58390,6 +58390,41 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
     stage's current maps at unit 10), and a stage given up after any turn leaves them and their arenas' live nodes
     as they were (red with the release a no-op: given up after 10 turns, nodes [0, 0, 2, 0, 0, 0, 0] from all 0).
     The content map is U7's (hold-on-copy holders), and U5's drain-first rule stays until it: the fold reads it.
+  - **U7, the content map forked; the drain-first rule deleted** (main's rulings of 03:10 to 03:41). The content map
+    (`Files`) joins the stage's forks: `Files::swap_with_fork` and `release_fork` give a freed node's blocks back
+    through the block table as holders, so a node the stage copied and the published one it shares release each block
+    once. The fold's copy reads are bounded by the head (`copy_entries_after`, `copies_above_after`, every caller a
+    reader: the fold, `identity_moves`, a branch's reverts). With every current map forked, a reader's fold reads only
+    published maps, so U5's drain-first rule is deleted. Deleting it exposed `mark_dirty` skipping a key dirty in the
+    published set: a reader's fold between turns folded that key at the head and the stage's own change to it was never
+    marked, so the identity after the publish kept the old entry; `mark_dirty` now marks every key it changes aside and
+    takes an entry out of the sum only for a key first changed since the identity was read. Red first: the content map
+    read between every two steps as before (red: a reader saw the stage's content map at unit 12) and a stage given up
+    leaving the map and its arena's live nodes as they were (red: given up after 12 turns, changed); U5's identity
+    reds hold with the drain gone and go red with the content fork stubbed out (a reader's fold saw the stage at unit
+    8); the published identity red that found `mark_dirty`'s skip shrank to one unlink of `a`; `engine::copy_tests`'s
+    staged replace over `dst/a`, unfolded, reads the serial twin's identity from every turn (red with the head bound
+    taken off the copy reads: a reader's fold saw the stage at unit 4). **Gap until U8, and its rule** (ruling (b)):
+    the content history is still written in place, so a stage given up after `set_file`'s re-anchor leaves the
+    published history naming the stage's new block (blocks 6 live against 5); the refusal's blocks assertion is U8's
+    red, and no production path drives a staged commit until U8 has landed (`repository::push`'s landing is wired to it
+    after U8, not before).
+  - **U8, the content history forked with chunk-holding copies** (main's rulings of 01:29, 03:10, 03:41 and 04:01).
+    The content history (`Dim<history::Entries>`, A-920 arena unit 1) joins the stage's forks. Its every mutation goes
+    through `history::HistoryHolders` (`Dim::{get_mut_held, insert_held, remove_held, release_fork_held}`): a node a
+    fork copies holds every chunk its values name (`Value::hold`, a piece's first reference each), and the last node
+    holding entries freed gives their chunks back, so a stage's copies and the published values release each chunk
+    once. A staged commit re-anchors a changed file's history in full (`history::reanchor`'s `layered` false while a
+    stage runs): the layered route repoints the path's shared anchor chunk to the new block and layers it, which every
+    published value naming it would read. That closes U7's gap. Red first: a stage given up after any turn leaves the
+    content history, every value's bytes read through the chunks, the content map's live blocks and nodes and the
+    chunk guard as they were (red: a reader saw the stage's content history at unit 8, and a stage given up after 8
+    turns left it changed; U7's blocks, 6 against 5, back to the twin's); guards removed, each red: copies holding no
+    chunks (chunk 0 freed while a value named it: holds {1, 2, 3, 4} against named {0, 1, 2, 3, 4}), and a stage
+    allowed the layered route (`copy_tests`'s staged one-byte overwrites: a reader saw the stage's content history at
+    unit 9, the anchor repointed). The chunk recount holds of a history with no layered anchor; a layer holds its
+    overwritten bytes' chunk outside any value, so the overwrite tests hold every chunk's holds to what they were.
+    Removed: `Dim::get_mut` (unit 1's), its one caller now `get_mut_held`.
 - **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
   hard links, a copy's tree; the change build's end (the map's and trees' apply, O(the change)). Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;

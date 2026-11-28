@@ -1163,13 +1163,14 @@ fn copied_dir(to: &str, (from, rev): (&str, u64)) -> String {
 }
 
 /// [`imported_whole_and_stepped`]'s reading: the youngest revision, the longest step, its window, and the copies grafted;
-/// and its landing steps' most off the CPU with the large frees its prepare steps made (`staging::returned`).
+/// and its landing steps' most off the CPU with the large frees its prepare steps made (`staging::returned`) and the
+/// fewer of its shard's two kept rooms' reuses (`staging::IncrementBuffer`).
 type ImportedWholeAndStepped = (
   Result<u64, String>,
   u64,
   u64,
   (u64, u64, u64, u64),
-  (u64, u64),
+  (u64, u64, u64),
 );
 
 /// `dump` imported on a store-backed shard: its youngest revision, the shard's longest step and its window, and the
@@ -1204,12 +1205,16 @@ fn imported_whole_and_stepped(name: &'static str, dump: Vec<u8>) -> ImportedWhol
       print_phases(name);
       // Each landing step's most off its CPU, and the steps the allocator handed pages back in (`staging::returned`).
       let off_cpu = on(|state| {
-        use crate::repository::svn_commit::staging::{LANDING_OFF_CPU_MOST_NS, returned};
+        use crate::repository::svn_commit::staging::{
+          ENTRY_INDEX_REUSED, INCREMENT_BUFFER_REUSED, LANDING_OFF_CPU_MOST_NS, returned,
+        };
         let back = returned::taken();
         let most = count(state, LANDING_OFF_CPU_MOST_NS);
+        // The fewer of the two kept rooms' reuses: both rooms are taken again once a first use has given them back.
+        let reused = count(state, INCREMENT_BUFFER_REUSED).min(count(state, ENTRY_INDEX_REUSED));
         eprintln!(
           "OFFCPU {name} landing_off_cpu_most_ns={most} returned_steps={} returned_off_ns={} returned_bytes={} \
-           slowest_fell_bytes={} slowest_off_ns={} prepare_large_frees={}",
+           slowest_fell_bytes={} slowest_off_ns={} prepare_large_frees={} kept_rooms_reused={reused}",
           back.steps,
           back.off_ns,
           back.bytes,
@@ -1217,7 +1222,7 @@ fn imported_whole_and_stepped(name: &'static str, dump: Vec<u8>) -> ImportedWhol
           back.slowest.1,
           back.prepare_large_frees
         );
-        (most, back.prepare_large_frees)
+        (most, back.prepare_large_frees, reused)
       });
       (
         loaded
@@ -1697,11 +1702,19 @@ fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step
     WIDE_TEXT_BYTES,
     &[copied_dir("branch", ("trunk", 1)), moved],
   );
-  let (loaded, longest_ns, window_ns, (grafted, build_units, walk_most, gone_most), (_, large)) =
-    imported_whole_and_stepped("wide-move", dump);
+  let (
+    loaded,
+    longest_ns,
+    window_ns,
+    (grafted, build_units, walk_most, gone_most),
+    (_, large, reused),
+  ) = imported_whole_and_stepped("wide-move", dump);
   // A landing's prepare frees no large buffer on its shard: each version's increment encoded into the shard's kept
   // buffer, reserved once at its exact length (A-920, main's ruling of 2026-11-28 01:38: its buffer doubled through 64
   // KiB to 2 MiB, freeing each smaller one, the 512 KiB one inside the step whose footprint fell 29.8 MB, debug).
+  // Each of the shard's kept rooms was taken again with its room (its non-vacuity count): the increment's buffer by a
+  // later version's encoding, the entry's index by a later entry or import measure.
+  assert!(reused > 0, "a kept room was never reused");
   assert_eq!(
     large, 0,
     "the landings' prepare steps freed {large} buffers of 64 KiB or more"

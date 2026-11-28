@@ -624,12 +624,10 @@ pub fn encoded_len(increment: &Increment, applied: &[Applied], identity: bool) -
 /// debug, the step its commit ended in): what the increment declares indexed an op a unit, holding its paths' names
 /// itself so that it outlives each step's borrow of the increment, then each effect's bytes added an effect a unit.
 pub struct Measuring {
-  /// What the increment declares, so far.
-  declared: DeclaredBy<String>,
-  /// The next op to index, then the next effect to count.
+  /// What the increment declares, so far ([`DeclaredIndex`]: no allocation a path).
+  declared: DeclaredIndex,
+  /// The next effect to count.
   at: usize,
-  /// Whether the ops are indexed.
-  indexed: bool,
   /// The effects' bytes so far.
   effects: usize,
   /// Whether the entry carries a head identity.
@@ -638,12 +636,24 @@ pub struct Measuring {
 
 /// Begins measuring an entry as [`encoded_len`] does, with a head identity where `identity` ([`measure_step`]).
 pub fn measuring(identity: bool) -> Measuring {
+  measuring_in(identity, Vec::new())
+}
+
+/// [`measuring`], its index laid out in `room` when that holds it ([`DeclaredIndex::with_room`]).
+pub fn measuring_in(identity: bool, room: Vec<u32>) -> Measuring {
   Measuring {
-    declared: DeclaredBy::new(),
+    declared: DeclaredIndex::with_room(room),
     at: 0,
-    indexed: false,
     effects: 0,
     identity,
+  }
+}
+
+impl Measuring {
+  /// Its index's room, emptied, and the room handed in when that was too small ([`DeclaredIndex::take_outgrown`]).
+  pub fn into_room(mut self) -> (Vec<u32>, Option<Vec<u32>>) {
+    let outgrown = self.declared.take_outgrown();
+    (self.declared.into_room(), outgrown)
   }
 }
 
@@ -654,27 +664,29 @@ pub fn measure_step(
   measuring: &mut Measuring,
   spent: &mut dyn FnMut() -> bool,
 ) -> Option<usize> {
-  let ops = &increment.doc.ops;
-  while !measuring.indexed {
-    let Some(op) = ops.get(measuring.at) else {
-      measuring.indexed = true;
-      measuring.at = 0;
-      break;
-    };
-    measuring.declared.declare(&increment.doc.paths, op);
-    measuring.at = measuring.at.saturating_add(1);
-    if measuring.at < ops.len() && spent() {
+  if !measuring.declared.begun {
+    measuring.declared.begin(&increment.doc);
+  }
+  while measuring.declared.index_unit(&increment.doc) {
+    if measuring.declared.left > 0 && spent() {
       return None;
     }
   }
+  let declared = Declared::over(&increment.doc, core::mem::take(&mut measuring.declared));
+  let mut cut = false;
   while let Some(effect) = applied.get(measuring.at) {
     measuring.effects = measuring
       .effects
-      .saturating_add(applied_bytes(&measuring.declared, effect));
+      .saturating_add(applied_bytes(&declared, effect));
     measuring.at = measuring.at.saturating_add(1);
     if measuring.at < applied.len() && spent() {
-      return None;
+      cut = true;
+      break;
     }
+  }
+  measuring.declared = declared.into_index();
+  if cut {
+    return None;
   }
   let identity = measuring.identity.then_some([0; HASH_BYTES]);
   Some(tail_bytes((0, measuring.effects), (None, identity, None)))
@@ -705,14 +717,27 @@ pub struct Encoding {
 
 /// Begins encoding an entry as [`encode`] does with no completion or signature ([`encode_step`]).
 pub fn encoding(inputs: Inputs, identity: Option<[u8; HASH_BYTES]>) -> Encoding {
+  encoding_in(inputs, identity, Vec::new())
+}
+
+/// [`encoding`], its index laid out in `room` when that holds it ([`DeclaredIndex::with_room`]; A-920: a landing's
+/// entries index into the shard's kept room).
+pub fn encoding_in(inputs: Inputs, identity: Option<[u8; HASH_BYTES]>, room: Vec<u32>) -> Encoding {
   Encoding {
     inputs,
     identity,
-    measuring: measuring(identity.is_some()),
+    measuring: measuring_in(identity.is_some(), room),
     out: None,
     at: 0,
     digest: blake3::Hasher::new(),
     hashed: 0,
+  }
+}
+
+impl Encoding {
+  /// Its index's room, emptied, and the room handed in when that was too small ([`Measuring::into_room`]).
+  pub fn into_room(self) -> (Vec<u32>, Option<Vec<u32>>) {
+    self.measuring.into_room()
   }
 }
 
@@ -747,14 +772,21 @@ pub fn encode_step(
     }
   }
   let written = out.as_mut()?;
+  let declared = Declared::over(&increment.doc, core::mem::take(&mut measuring.declared));
+  let mut cut = false;
   while let Some(effect) = applied.get(*at) {
-    put_applied(written, &measuring.declared, effect);
+    put_applied(written, &declared, effect);
     digest.update(written.get(*hashed..).unwrap_or_default());
     *hashed = written.len();
     *at = at.saturating_add(1);
     if *at < applied.len() && spent() {
-      return None;
+      cut = true;
+      break;
     }
+  }
+  measuring.declared = declared.into_index();
+  if cut {
+    return None;
   }
   let mut entry = out.take()?;
   entry.push(ABSENT);
@@ -812,10 +844,7 @@ fn tail_bytes(
 }
 
 /// The bytes [`put_applied`] writes for `applied`, without writing them.
-fn applied_bytes<K: Ord + core::borrow::Borrow<str>>(
-  declared: &DeclaredBy<K>,
-  applied: &Applied,
-) -> usize {
+fn applied_bytes(declared: &Declared<'_>, applied: &Applied) -> usize {
   let tagged = |paths: &[&str]| {
     paths
       .iter()
@@ -827,9 +856,7 @@ fn applied_bytes<K: Ord + core::borrow::Borrow<str>>(
     Applied::Special(path, node) => {
       tagged(&[path]).saturating_add(WORD_BYTES.saturating_add(node.encoded_len()))
     }
-    Applied::Spliced(path, applied) if applied.as_slice() == declared.ops_for(path) => {
-      tagged(&[path])
-    }
+    Applied::Spliced(path, applied) if applied.iter().eq(declared.ops_for(path)) => tagged(&[path]),
     Applied::Spliced(path, applied) | Applied::Created(path, applied) => {
       tagged(&[path]).saturating_add(ops(applied))
     }
@@ -1085,93 +1112,176 @@ fn put_tagged_paths(out: &mut Vec<u8>, tag: u8, paths: &[&str]) {
   }
 }
 
-/// What an increment declares, indexed for its entry's effects (A-632): each path's content ops in
-/// order, and each copy's source version and whether it replaces, by its destination and source
-/// (A-586, A-626). Built in one pass
-/// over the increment's ops, once per entry encoded or decoded; finding them by scanning every op
-/// for each splice and each copy cost O(effects × ops), quadratic for a version that splices many
-/// files.
-pub(crate) struct DeclaredBy<K> {
-  /// Each path's content ops, in the increment's order.
-  ops: BTreeMap<K, Vec<Op>>,
-  /// Each copy's source version and whether it replaces, by destination, then source; the first a
-  /// pair declares.
-  copies: BTreeMap<K, BTreeMap<K, (u64, bool)>>,
+/// Format: an index word that names no op: the end of a path's list ([`DeclaredIndex`]).
+const NO_OP: u32 = u32::MAX;
+
+/// What an increment declares, indexed for its entry's effects (A-632): each path's content ops in order, and each
+/// copy's source version and whether it replaces, by its destination and source (A-586, A-626). Built once per entry
+/// encoded or decoded, an op a unit; finding them by scanning every op for each splice and each copy cost O(effects ×
+/// ops), quadratic for a version that splices many files.
+///
+/// **No allocation a path** (A-920, main's order of 2026-11-28 03:41). The index is one list a path, threaded through
+/// the ops by their path table's indices: a word a path, the index of its first op, then a word an op, the index of the
+/// next op on its path, in the increment's order. A path's string, its content ops and its copies are read off the
+/// increment itself. The index had been an ordered map of each path's name to a list of its ops: 19,499 heap blocks and
+/// 2,373,794 bytes freed in the one step a landing's entry for 9,000 files ended in (debug). Its words are one buffer,
+/// handed in ([`DeclaredIndex::with_room`]) and given back ([`DeclaredIndex::into_room`]) so a caller may keep it. An
+/// op whose place does not fit a word is left out of every list (an increment of 2^32 ops, 136 GB of records, which no
+/// bound admits); its path's effects are then written whole, never as declared, so the entry still decodes.
+#[derive(Debug, Default)]
+pub struct DeclaredIndex {
+  /// The paths' list heads (the first `paths` words), then each op's next op on its path.
+  words: Vec<u32>,
+  /// The paths the index heads, once begun.
+  paths: usize,
+  /// The ops left to index, the last first: an op is put at its path's head, so each list keeps the increment's order.
+  left: usize,
+  /// Whether the words are laid out for an increment ([`DeclaredIndex::begin`]).
+  begun: bool,
+  /// The room handed in, when it was too small for the increment: the caller's to free where it chooses.
+  outgrown: Option<Vec<u32>>,
 }
 
-/// [`DeclaredBy`] borrowing the increment's paths: what an entry's encoding and decoding read.
-pub(crate) type Declared<'a> = DeclaredBy<&'a str>;
+impl DeclaredIndex {
+  /// An index that lays its words out in `room`, emptied, when it holds them.
+  pub fn with_room(mut room: Vec<u32>) -> DeclaredIndex {
+    room.clear();
+    DeclaredIndex {
+      words: room,
+      ..DeclaredIndex::default()
+    }
+  }
+
+  /// Its words' buffer, emptied: the room to hand to the next index.
+  pub fn into_room(mut self) -> Vec<u32> {
+    self.words.clear();
+    self.words
+  }
+
+  /// The handed-in room, when it was too small for the increment and a buffer of the words' exact length was made in
+  /// its place: the caller's to free where it chooses.
+  pub fn take_outgrown(&mut self) -> Option<Vec<u32>> {
+    self.outgrown.take()
+  }
+
+  /// The words laid out for `doc`: every list empty, every op left to index.
+  fn begin(&mut self, doc: &crate::ops_doc::OpsDoc) {
+    self.paths = doc.paths.paths().len();
+    let needed = self.paths.saturating_add(doc.ops.len());
+    if self.words.capacity() < needed {
+      let small = core::mem::replace(&mut self.words, Vec::with_capacity(needed));
+      self.outgrown = (small.capacity() > 0).then_some(small);
+    }
+    self.words.clear();
+    self.words.resize(needed, NO_OP);
+    self.left = doc.ops.len();
+    self.begun = true;
+  }
+
+  /// One op of `doc` indexed, the last left, put at the head of its path's list: whether one was.
+  fn index_unit(&mut self, doc: &crate::ops_doc::OpsDoc) -> bool {
+    let Some(at) = self.left.checked_sub(1) else {
+      return false;
+    };
+    self.left = at;
+    let (Some(op), Ok(word)) = (doc.ops.get(at), u32::try_from(at)) else {
+      return true;
+    };
+    let Some(path) = usize::try_from(op.path)
+      .ok()
+      .filter(|path| *path < self.paths)
+    else {
+      return true;
+    };
+    let head = self.words.get(path).copied().unwrap_or(NO_OP);
+    if let Some(next) = self.words.get_mut(self.paths.saturating_add(at)) {
+      *next = head;
+    }
+    if let Some(first) = self.words.get_mut(path) {
+      *first = word;
+    }
+    true
+  }
+}
+
+/// [`DeclaredIndex`] over the increment it indexes: what an entry's encoding and decoding read.
+pub(crate) struct Declared<'a> {
+  doc: &'a crate::ops_doc::OpsDoc,
+  index: DeclaredIndex,
+}
 
 impl<'a> Declared<'a> {
   /// The index of what `increment` declares: every op visited once.
   pub(crate) fn of(increment: &'a Increment) -> Declared<'a> {
-    let mut declared = DeclaredBy::new();
-    for op in &increment.doc.ops {
+    let mut index = DeclaredIndex::default();
+    index.begin(&increment.doc);
+    while index.index_unit(&increment.doc) {
       #[cfg(test)]
       tests::count_visit();
-      declared.declare(&increment.doc.paths, op);
     }
-    declared
-  }
-}
-
-impl<K: Ord + core::borrow::Borrow<str>> DeclaredBy<K> {
-  /// Nothing declared yet.
-  fn new() -> DeclaredBy<K> {
-    DeclaredBy {
-      ops: BTreeMap::new(),
-      copies: BTreeMap::new(),
+    Declared {
+      doc: &increment.doc,
+      index,
     }
   }
 
-  /// `op`, named in `paths`, added to what is declared: a content op to its path's, a copy to its destination's.
-  fn declare<'p>(&mut self, paths: &'p crate::ops_doc::PathTable, op: &Op)
-  where
-    K: From<&'p str>,
-  {
-    let Some(path) = paths.path(op.path) else {
-      return;
-    };
-    if crate::engine::is_content(op.kind) {
-      self.ops.entry(K::from(path)).or_default().push(*op);
-    } else if op.kind == OpKind::Copy
-      && let Some(from) = paths.path(op.src)
-    {
-      self
-        .copies
-        .entry(K::from(path))
-        .or_default()
-        .entry(K::from(from))
-        .or_insert((op.at, op.replaces()));
-    }
+  /// `index`, indexed whole, read over `doc`, the document it was built from.
+  fn over(doc: &'a crate::ops_doc::OpsDoc, index: DeclaredIndex) -> Declared<'a> {
+    Declared { doc, index }
+  }
+
+  /// The index, to keep between steps.
+  fn into_index(self) -> DeclaredIndex {
+    self.index
+  }
+
+  /// The ops on `path`'s list, in the increment's order.
+  fn listed(&self, path: &str) -> impl Iterator<Item = &'a Op> + '_ {
+    let doc = self.doc;
+    let first = doc
+      .paths
+      .index_of(path)
+      .and_then(|path| usize::try_from(path).ok())
+      .and_then(|path| self.index.words.get(path).copied())
+      .unwrap_or(NO_OP);
+    let paths = self.index.paths;
+    let words = &self.index.words;
+    core::iter::successors(Some(first), move |at| {
+      let at = usize::try_from(*at).ok()?;
+      words.get(paths.saturating_add(at)).copied()
+    })
+    .take_while(|at| *at != NO_OP)
+    .filter_map(move |at| doc.ops.get(usize::try_from(at).ok()?))
   }
 
   /// The content ops the increment declares for `path`, in order.
-  fn ops_for(&self, path: &str) -> &[Op] {
-    self.ops.get(path).map_or(&[][..], Vec::as_slice)
+  fn ops_for(&self, path: &str) -> impl Iterator<Item = &'a Op> + '_ {
+    self
+      .listed(path)
+      .filter(|op| crate::engine::is_content(op.kind))
   }
 
   /// The source version of the copy the increment declares from `from` to `dst`, and whether it
-  /// replaces; `None` when it declares none, which no entry the engine recorded holds.
+  /// replaces; `None` when it declares none, which no entry the engine recorded holds. The first such copy declared.
   fn copy(&self, dst: &str, from: &str) -> Option<(u64, bool)> {
-    self.copies.get(dst)?.get(from).copied()
+    let doc = self.doc;
+    self
+      .listed(dst)
+      .find(|op| op.kind == OpKind::Copy && doc.paths.path(op.src) == Some(from))
+      .map(|op| (op.at, op.replaces()))
   }
 }
 
 /// Appends one effect as an entry records it (module docs); a computed verdict's wire form writes its effects so too
 /// (`crate::engine`'s `computed_wire`, A-658 part 3a).
-pub(crate) fn put_applied<K: Ord + core::borrow::Borrow<str>>(
-  out: &mut Vec<u8>,
-  declared: &DeclaredBy<K>,
-  applied: &Applied,
-) {
+pub(crate) fn put_applied(out: &mut Vec<u8>, declared: &Declared<'_>, applied: &Applied) {
   match applied {
     Applied::Special(path, node) => {
       put_tagged_paths(out, tag::SPECIAL, &[path]);
       put_bytes(out, &node.encode());
     }
     Applied::RemoveSpecial(path) => put_tagged_paths(out, tag::REMOVE_SPECIAL, &[path]),
-    Applied::Spliced(path, ops) if ops.as_slice() == declared.ops_for(path) => {
+    Applied::Spliced(path, ops) if ops.iter().eq(declared.ops_for(path)) => {
       put_tagged_paths(out, tag::SPLICED_AS_DECLARED, &[path]);
     }
     Applied::Spliced(path, ops) => {
@@ -1240,7 +1350,7 @@ pub(crate) fn take_applied(
     }
     tag::SPLICED_AS_DECLARED => {
       let path = take_str(reader)?;
-      let ops = declared.ops_for(&path).to_vec();
+      let ops = declared.ops_for(&path).copied().collect();
       Applied::Spliced(path, ops)
     }
     tag::CREATED => {
@@ -1725,6 +1835,126 @@ mod tests {
       assert_eq!(sliced, whole);
       assert!(steps > increment.post_state.len(), "{steps} steps");
     }
+  }
+
+  /// Shape: the files of A-920's wide revision, whose landing's entry these tests stand for.
+  const WIDE_FILES: u32 = 9_000;
+
+  /// A version of [`WIDE_FILES`] files, each overwritten by one op, and its effects: every file spliced as declared.
+  fn wide_version() -> (Increment, Vec<Applied>) {
+    let mut doc = OpsDoc::new();
+    let mut applied = Vec::new();
+    for n in 0..WIDE_FILES {
+      let name = format!("trunk/src/dir{:04}/file{:03}.c", n / 30, n % 30);
+      let path = doc.paths.intern(&name);
+      let op = Op {
+        kind: OpKind::Overwrite,
+        flags: 0,
+        path,
+        at: 0,
+        len: 1,
+        src: 0,
+      };
+      doc.ops.push(op);
+      applied.push((name, op));
+    }
+    doc.canonicalize();
+    let increment = Increment {
+      id: [8; 32],
+      base: 1,
+      doc,
+      post_state: b"x".to_vec(),
+      evidence: Vec::new(),
+      named: Default::default(),
+    };
+    // The canonical document renumbered the paths: each effect names its op as the document now holds it.
+    let declared = Declared::of(&increment);
+    let effects = applied
+      .into_iter()
+      .map(|(name, _)| {
+        let ops = declared.ops_for(&name).copied().collect();
+        Applied::Spliced(name, ops)
+      })
+      .collect();
+    drop(declared);
+    (increment, effects)
+  }
+
+  /// `increment`'s entry recording `applied`, encoded from `encoding` a unit a step to its end.
+  fn entry_stepped(
+    (increment, applied): (&Increment, &[Applied]),
+    encoding: &mut Encoding,
+  ) -> Vec<u8> {
+    loop {
+      if let Some(entry) = encode_step((increment, applied), encoding, &mut || true) {
+        return entry;
+      }
+    }
+  }
+
+  /// A-920 (main's order of 2026-11-28 03:41: a landing's entry measure freed 19,499 heap blocks, 2,373,794 bytes, in
+  /// one step, debug). Do: encode a unit a step the entry of a version splicing [`WIDE_FILES`] files as declared, from
+  /// an empty room, then drop what the encoding kept, counting the heap frees of both. Expect the entry encode's bytes,
+  /// and at most two frees: its index's one buffer, and nothing a path. Red before: the index was an ordered map of
+  /// each path's name to a list of its ops.
+  #[test]
+  fn a_wide_entrys_stepped_encoding_frees_nothing_a_path() {
+    let (increment, applied) = wide_version();
+    let whole = encode(
+      held_for_tests(b"inc"),
+      &increment,
+      &applied,
+      None,
+      None,
+      None,
+    );
+    let before = crate::counting::frees();
+    let mut encoding = super::encoding(held_for_tests(b"inc"), None);
+    let entry = entry_stepped((&increment, &applied), &mut encoding);
+    drop(encoding);
+    let frees = crate::counting::frees() - before;
+    assert_eq!(entry, whole);
+    assert!(
+      frees <= 2,
+      "a {WIDE_FILES}-file entry's encoding freed {frees} heap blocks"
+    );
+  }
+
+  /// A-920 (as above: the room kept by the shard across landings). Do: encode the wide version's entry with its index
+  /// laid out in a room of its size, then in one too small. Expect no heap free with the room there and the room given
+  /// back whole; with too little, the small room given back as outgrown (not freed) and the entry the same.
+  #[test]
+  fn a_wide_entry_indexed_in_a_room_with_its_size_frees_nothing() {
+    let (increment, applied) = wide_version();
+    let whole = encode(
+      held_for_tests(b"inc"),
+      &increment,
+      &applied,
+      None,
+      None,
+      None,
+    );
+    let needed = increment.doc.paths.paths().len() + increment.doc.ops.len();
+    let before = crate::counting::frees();
+    let mut encoding = encoding_in(held_for_tests(b"inc"), None, Vec::with_capacity(needed));
+    let entry = entry_stepped((&increment, &applied), &mut encoding);
+    let (room, outgrown) = encoding.into_room();
+    assert_eq!(
+      crate::counting::frees() - before,
+      0,
+      "frees indexing in a room of its size"
+    );
+    assert_eq!(
+      (entry.as_slice(), room.capacity(), outgrown.is_none()),
+      (whole.as_slice(), needed, true)
+    );
+    let mut small = encoding_in(held_for_tests(b"inc"), None, Vec::with_capacity(16));
+    let entry = entry_stepped((&increment, &applied), &mut small);
+    let (_, outgrown) = small.into_room();
+    assert_eq!(
+      (entry, outgrown.map(|room| room.capacity())),
+      (whole, Some(16))
+    );
   }
 
   /// Shape: the files of [`several_files`], so its ops document has several paths, a node and several ops.

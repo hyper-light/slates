@@ -3747,11 +3747,12 @@ impl Green {
   /// Every other key is only marked, its move made whole by the fold.
   ///
   /// Written aside until the commit's publish (A-752 part 3c U5, [`last_changes::IdentityAside`]). A key a published
-  /// commit left dirty is folded with it already; a staged commit drains every such key first
-  /// ([`Green::staging_step`]), so no reader's fold between its turns reads a key it changes in place. That rule ends
-  /// with the current maps forked into the stage (w-svn's), and is deleted in that change.
+  /// commit left dirty, unfolded, is marked too, its entry left as it is: a reader's fold between a staged commit's turns
+  /// may fold it at the head from the published maps, which the stage's forks leave as they were (U7), and the stage's
+  /// mark makes the fold after the publish move it again, from there; with no fold between, the publish's mark is the
+  /// key's own. Only a key first changed since the identity was read has its entry taken out here.
   fn mark_dirty(&mut self, key: IdentityKey) {
-    if self.identity_dirty.contains(&key) || !self.identity_aside.dirty(key.clone()) {
+    if !self.identity_aside.dirty(key.clone()) || self.identity_dirty.contains(&key) {
       return;
     }
     if let IdentityKey::File(path) = &key
@@ -5227,10 +5228,17 @@ impl Green {
       self.history_lists = self.history_lists.saturating_add(value.list_bytes());
       self.history_current = self.history_current.saturating_add(current_bytes(value));
     }
-    match self.content_history.get_mut(&path) {
+    // Its map's copied nodes hold their values' chunks (A-752 part 3c U8, a stage's fork).
+    let mut holders = crate::history::HistoryHolders {
+      chunks: &mut self.chunks,
+      blocks: self.content.blocks_mut(),
+    };
+    match self.content_history.get_mut_held(&path, &mut holders) {
       Some(history) => history.push((version, value)),
       None => {
-        self.content_history.insert(path, vec![(version, value)]);
+        self
+          .content_history
+          .insert_held(path, vec![(version, value)], &mut holders);
       }
     }
   }
@@ -5295,22 +5303,36 @@ impl Green {
   /// go and the history keeps only what the change overwrote or removed. The file's block named whole (A-728) with
   /// nothing re-anchored for a path with no latest value, or one the ops keep nothing of.
   fn content_value(&mut self, path: &str, ops: &[Op]) -> crate::history::Value {
+    // A staged commit re-anchors in full: the layered route repoints the path's shared anchor chunk, which the
+    // published values name too (A-752 part 3c U8).
+    let layered = self.stage_marks.is_none();
     let Green {
       content_history,
       chunks,
       content,
       ..
     } = self;
-    let anchored = content
-      .block_of(path)
-      .zip(content_history.get_mut(path))
+    let block = content.block_of(path);
+    let mut holders = crate::history::HistoryHolders {
+      chunks,
+      blocks: content.blocks_mut(),
+    };
+    let history = content_history.get_mut_held(path, &mut holders);
+    let anchored = block
+      .zip(history)
       .filter(|(_, history)| history.last().is_some_and(|(_, latest)| latest.is_some()))
       .and_then(|(block, history)| {
         let values = history
           .iter_mut()
           .filter_map(|(_, value)| value.as_mut())
           .collect();
-        crate::history::reanchor(values, chunks, content.blocks_mut(), (block, ops))
+        crate::history::reanchor(
+          values,
+          holders.chunks,
+          holders.blocks,
+          (block, ops),
+          layered,
+        )
       });
     let Some(anchored) = anchored else {
       return self.named_value(path);
@@ -5364,9 +5386,13 @@ impl Green {
   /// (`crate::history::Value::supersede`): its own block is history from here, whole or, once the change re-anchors the
   /// path's history, cut to what the change removed (A-728 part 4, A-793).
   fn supersede_latest(&mut self, path: &str) {
+    let mut holders = crate::history::HistoryHolders {
+      chunks: &mut self.chunks,
+      blocks: self.content.blocks_mut(),
+    };
     let Some(latest) = self
       .content_history
-      .get_mut(path)
+      .get_mut_held(path, &mut holders)
       .and_then(|history| history.last_mut())
       .and_then(|(_, value)| value.as_mut())
     else {
@@ -5443,7 +5469,11 @@ impl Green {
 
   /// Drops `path`'s content history, its chunks released and the running totals with it.
   fn clear_content_history(&mut self, path: &str) {
-    let Some(history) = self.content_history.remove(path) else {
+    let mut holders = crate::history::HistoryHolders {
+      chunks: &mut self.chunks,
+      blocks: self.content.blocks_mut(),
+    };
+    let Some(history) = self.content_history.remove_held(path, &mut holders) else {
       return;
     };
     if let Some((_, Some(latest))) = history.last() {
@@ -9235,7 +9265,11 @@ impl Green {
       folding.phase = FoldPhase::Release;
       return;
     };
-    if let Some(history) = self.content_history.get_mut(path) {
+    let mut holders = crate::history::HistoryHolders {
+      chunks: &mut self.chunks,
+      blocks: self.content.blocks_mut(),
+    };
+    if let Some(history) = self.content_history.get_mut_held(path, &mut holders) {
       let folded = fold_entries(history, folding.floor);
       if !folded.is_empty() && history.len() == 1 {
         folding.alone.push(path.clone());
@@ -9338,7 +9372,11 @@ impl Green {
     let mut dropped = Vec::new();
     let mut alone = Vec::new();
     for path in paths {
-      let Some(history) = self.content_history.get_mut(path) else {
+      let mut holders = crate::history::HistoryHolders {
+        chunks: &mut self.chunks,
+        blocks: self.content.blocks_mut(),
+      };
+      let Some(history) = self.content_history.get_mut_held(path, &mut holders) else {
         continue;
       };
       let folded = fold_entries(history, floor);
@@ -9381,9 +9419,13 @@ impl Green {
       return;
     }
     let named = self.named_value(path);
+    let mut holders = crate::history::HistoryHolders {
+      chunks: &mut self.chunks,
+      blocks: self.content.blocks_mut(),
+    };
     let Some((_, slot)) = self
       .content_history
-      .get_mut(path)
+      .get_mut_held(path, &mut holders)
       .and_then(|history| history.last_mut())
     else {
       return;

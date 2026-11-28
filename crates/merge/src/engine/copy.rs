@@ -680,17 +680,19 @@ impl Green {
     latest
   }
 
-  /// Every copy whose tree holds `path` made after `since`, with its destination.
+  /// Every copy whose tree holds `path` made after `since`, at or below the head (A-752 part 3c U0, U7: a copy a commit
+  /// records before it publishes is above it), with its destination.
   pub(super) fn copies_above_after(&self, path: &str, since: u64) -> Vec<(&str, &Appearance)> {
     if self.copies.is_empty() {
       return Vec::new();
     }
+    let head = self.head();
     ancestors(path)
       .filter_map(|prefix| self.copies.get_key_value(prefix))
       .flat_map(|(dst, records)| {
         records
           .iter()
-          .filter(move |record| record.version > since)
+          .filter(move |record| record.version > since && record.version <= head)
           .map(move |record| (dst.as_str(), record))
       })
       .collect()
@@ -1794,12 +1796,14 @@ impl Green {
 
   /// The entries of the copies made at `dst` after `since`: what a copy puts into the set hash (module docs).
   pub(super) fn copy_entries_after(&self, dst: &str, since: u64) -> Vec<Entry> {
+    // At or below the head (A-752 part 3c U0, U7): a copy a commit records before it publishes is above it.
+    let head = self.head();
     self
       .copies
       .get(dst)
       .into_iter()
       .flatten()
-      .filter(|record| record.version > since)
+      .filter(|record| record.version > since && record.version <= head)
       .map(|record| copy_entry(dst, &record.source, record.source_version))
       .collect()
   }
