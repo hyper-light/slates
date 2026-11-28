@@ -3453,9 +3453,17 @@
 > pack's length (resident at most twice the pack while judged); staging puts what lands. Owed: the landed half
 > (changesets, a clone's pack derived from them, with w-store); a replay still reads its record's pack whole.
 >
+> **A-722 part 4h (P2, 2026-11-27, w-git; main's order of 18:44).** BUILT: a commit reads and charges its own greens'
+> records alone (one move over 1,000 greens of 20 versions: 3 records read, 22,021 before), its versions pushed and
+> its heads moved in place after its stage's adoption, the charge trued up to its whole recomputation; a commit refused
+> after its plan leaves the store as it was (found: the stage's fork was dropped holding its tables, 397 bytes a
+> refusal), held at every point by the store's oracle. OWED, each its own piece: `landed_runs` over a several-move
+> push's positions; the release's drops of the push's placed and positions maps; a stale stage restaged whole.
+>
 > **A-722 part 4e (2026-11-20, w-git).** BUILT: an overtaken stage made again in the judge's turns; a stage giving no
 > position never overtaken; `Judge::ready` asked for every unrefused command (part 4c's turns now run live). Owed: the
-> store commit's whole passes; the check's propagation in one unit (57.9 ms at 100 pushes).
+> store commit's whole passes (part 4h above began them: the chains' and the head map's); the check's propagation in
+> one unit (57.9 ms at 100 pushes).
 >
 > **A-753 (2026-11-20, w-git).** BUILT: a create at a commit another branch holds is made from it (empty work); a
 > resent object is read from the index; at the chains' cap a push checkpoints the repository's other members too.

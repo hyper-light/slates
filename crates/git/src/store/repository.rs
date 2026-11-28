@@ -230,6 +230,9 @@ pub struct StoreCounters {
   /// Pushes a commit staged again whole, their stage overtaken by a landing since (A-722 part 4e: a push's judge
   /// stages it again a turn at a time before its append, [`Repository::needs_stage`], so a commit meets none).
   pub restaged: u64,
+  /// Chain records and head-map entries the commits read to make and charge their versions (P2, CLAUDE.md §3 bounded
+  /// work): each commit's own moves' worth, whatever the repository's other greens and their histories hold.
+  pub commit_walked: u64,
 }
 
 /// The entry a path names in a version's tree.
@@ -327,17 +330,6 @@ struct Chain {
 }
 
 impl Chain {
-  /// How many of its versions hold no value of their own ([`Repository::unvalued`]).
-  fn unvalued(&self) -> u64 {
-    to_u64(
-      self
-        .versions
-        .iter()
-        .filter(|version| version.value.is_none())
-        .count(),
-    )
-  }
-
   fn head(&self) -> Option<u64> {
     self.versions.last().and_then(|version| version.head)
   }
@@ -376,6 +368,74 @@ impl Chain {
       .chain(self.base.as_ref().map(|base| &base.parts))
       .flat_map(|fragments| [&fragments.objects, &fragments.blobs])
   }
+}
+
+/// A point after a commit's plan where it may be refused ([`Repository::commit`]): its versions' values put, its
+/// records charged, its landing map charged, its stage adopted (refused as stale, `Repository::adopted`). Named so the
+/// store's oracle refuses a commit at each and holds the store to what it was (P2, main 01a20182's condition of
+/// 2026-11-27 19:22).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CommitPoint {
+  /// The versions' values put ([`put_values`]).
+  Values,
+  /// The records' difference charged: the versions, the head map's entries and the maps' bound.
+  Records,
+  /// The landing map's runs charged.
+  Landings,
+  /// The stage's fork adopted into the index.
+  Adopt,
+}
+
+impl CommitPoint {
+  /// Every point, in the commit's order.
+  #[cfg(test)]
+  pub(crate) const ALL: [CommitPoint; 4] = [
+    CommitPoint::Values,
+    CommitPoint::Records,
+    CommitPoint::Landings,
+    CommitPoint::Adopt,
+  ];
+}
+
+// The tests' switch, kept on the thread that runs the commit.
+#[cfg(test)]
+thread_local! {
+  /// The point a test asks the next commits to be refused at ([`at_point`]); none: no commit is.
+  pub(crate) static REFUSE_COMMIT_AT: Cell<Option<CommitPoint>> = const { Cell::new(None) };
+  /// The points a commit was refused at since the test last took them, so a test that asks knows each refusal happened.
+  pub(crate) static COMMIT_REFUSED_AT: RefCell<BTreeSet<CommitPoint>> = const { RefCell::new(BTreeSet::new()) };
+}
+
+/// A commit's `step` at `point`, as it is; in a test that asks to refuse there ([`REFUSE_COMMIT_AT`]), with the
+/// store's budget held to what it holds for the step, so whatever the step charges is refused as a full store refuses
+/// it.
+#[cfg(test)]
+fn at_point<T, E>(
+  store: &mut ContentStore,
+  point: CommitPoint,
+  step: impl FnOnce(&mut ContentStore) -> Result<T, E>,
+) -> Result<T, E> {
+  if REFUSE_COMMIT_AT.with(Cell::get) != Some(point) {
+    return step(store);
+  }
+  let budget = store.budget();
+  store.set_budget(store.used());
+  let answer = step(store);
+  store.set_budget(budget);
+  if answer.is_err() {
+    COMMIT_REFUSED_AT.with(|refused| refused.borrow_mut().insert(point));
+  }
+  answer
+}
+
+/// A commit's `step` at `point`, as it is (the tests' twin refuses there on asking).
+#[cfg(not(test))]
+fn at_point<T, E>(
+  store: &mut ContentStore,
+  _point: CommitPoint,
+  step: impl FnOnce(&mut ContentStore) -> Result<T, E>,
+) -> Result<T, E> {
+  step(store)
 }
 
 /// `count` records of `each` bytes.
@@ -558,6 +618,28 @@ pub struct RepositoryHeld {
   pub charged: u64,
 }
 
+/// A repository's records a commit changes, and the bytes its store holds ([`Repository::commit_state`]).
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct CommitState {
+  next_position: u64,
+  chains: BTreeMap<u64, Chain>,
+  unvalued: u64,
+  heads: HeadMap,
+  peeled: BTreeMap<u64, (u64, usize)>,
+  holders: BTreeMap<u64, BTreeMap<u64, usize>>,
+  holder_entries: usize,
+  charged: u64,
+  chains_charged: u64,
+  head_entries: usize,
+  largest_pack: u64,
+  landings: BTreeMap<u64, (u64, u64, u64)>,
+  landings_charged: u64,
+  kinds: BTreeMap<u64, (u64, Kind)>,
+  packs: BTreeMap<ContentId, u64>,
+  used: u64,
+}
+
 /// A git repository's store (module docs).
 #[derive(Debug)]
 pub struct Repository {
@@ -584,6 +666,11 @@ pub struct Repository {
   holder_entries: usize,
   /// What the chains, the head map, the peeled map and the holders' map charge the store.
   charged: u64,
+  /// The chains' footprints summed ([`Chain::footprint`]), kept as each changes, so a commit or a recharge charges by
+  /// the changed chain's difference and never sums every chain again (P2).
+  chains_charged: u64,
+  /// The entries the head map holds, green by green, kept as each head moves.
+  head_entries: usize,
   /// The version that brought each position, as runs: each run's first position to its end (exclusive), the green and
   /// that green's version (A-722: kept beside the rows, which no longer carry it, so a push can write its rows before it
   /// lands).
@@ -607,6 +694,9 @@ pub struct Repository {
   /// While a reader with a slot of its own reads ([`Repository::reading_quietly`]): the first let-go its reads met,
   /// kept here and never on [`Repository::waiting`]'s shared slot. None outside such a read.
   quiet: Cell<Option<Option<packed::Waited>>>,
+  /// The longest of its packs (`packs`' greatest length), kept as each lands: what its read-lately budget follows, read
+  /// with no walk over the packs, one a landing (P2).
+  largest_pack: u64,
   /// The longest object its packs hold: what a read from them is held to (§4.9: every size a stored entry's header
   /// names, and its chain's, checked against it before a buffer grows to it; a read allocates nothing in the store, so
   /// the store's lent room is no bound for it).
@@ -652,6 +742,9 @@ impl Repository {
       holders: BTreeMap::new(),
       holder_entries: 0,
       charged: 0,
+      chains_charged: 0,
+      head_entries: 0,
+      largest_pack: 0,
       landings: BTreeMap::new(),
       kinds: BTreeMap::new(),
       packs: BTreeMap::new(),
@@ -865,6 +958,46 @@ impl Repository {
           .then_some(Cow::Owned(out))
           .ok_or(None)
       }
+    }
+  }
+
+  /// Holds what the repository charged its store to the whole recomputation over every chain, the head map, the peeled
+  /// map and the holders' map (P2's oracle: a commit charges by difference).
+  #[cfg(test)]
+  pub(crate) fn assert_charged_whole(&self) {
+    let (chains, entries) = charged_whole(&self.chains, &self.heads);
+    assert_eq!(
+      (self.chains_charged, self.head_entries),
+      (chains, entries),
+      "the chains' charge and the head map's entries kept against the whole recomputation"
+    );
+    let whole = charge_of(chains, (entries, self.peeled.len(), self.holder_entries));
+    assert_eq!(
+      self.charged, whole,
+      "the charge kept against the whole recomputation"
+    );
+  }
+
+  /// What a refused commit leaves as it was (P2's oracle): every record a commit changes, and what the store holds.
+  #[cfg(test)]
+  pub(crate) fn commit_state(&self, store: &ContentStore) -> CommitState {
+    CommitState {
+      next_position: self.next_position,
+      chains: self.chains.clone(),
+      unvalued: self.unvalued,
+      heads: self.heads.clone(),
+      peeled: self.peeled.clone(),
+      holders: self.holders.clone(),
+      holder_entries: self.holder_entries,
+      charged: self.charged,
+      chains_charged: self.chains_charged,
+      head_entries: self.head_entries,
+      largest_pack: self.largest_pack,
+      landings: self.landings.clone(),
+      landings_charged: self.landings_charged,
+      kinds: self.kinds.clone(),
+      packs: self.packs.clone(),
+      used: store.used(),
     }
   }
 
@@ -1550,75 +1683,76 @@ impl Repository {
     } else {
       base.saturating_add(given)
     };
-    let landed = self.landed_runs(moves, first, (base, &positions));
-    let (planned, heads) = self.plan(store, moves, (base, &positions))?;
-    let before = store.used();
-    let values = put_values(store, &planned)?;
-    let put: Vec<ContentId> = values.iter().flatten().copied().collect();
-    let added = store.used().saturating_sub(before);
-    let chains = self.chains_with(planned, &values);
-    // Each move notes at most one commit more in the peeled map and one green more in the holders' map: charged at
-    // that bound, the next charge exact.
-    let peeled = self.peeled.len().saturating_add(moves.len());
-    let holders = self.holder_entries.saturating_add(moves.len());
-    let total = footprint(&self.chains, &chains, (&heads, peeled, holders));
-    let more = total.saturating_sub(self.charged);
-    if let Err(refused) = store.charge(more) {
-      give_back(store, &put)?;
-      return Err(refused.into());
-    }
-    let landing_cost = bytes(landed.len().saturating_add(kinds.len()), LANDING_BYTES);
-    if let Err(refused) = store.charge(landing_cost) {
-      store.discharge(more)?;
-      give_back(store, &put)?;
-      return Err(refused.into());
-    }
+    // Refused before its adoption, the stage's fork is given back with whatever else the commit took, so a refused
+    // commit leaves the store as it was (P2's oracle: it was dropped holding its tables, 598 bytes a refusal).
+    let prepared = match self.prepared(store, moves, (first, base, &positions, kinds.len())) {
+      Ok(prepared) => prepared,
+      Err(refused) => {
+        let _ = fork.release(store);
+        return Err(refused);
+      }
+    };
+    let Prepared {
+      landed,
+      planned,
+      values,
+      entries,
+      charge,
+    } = prepared;
     // A stage that gives no position writes no row: its fork is given back, never adopted.
     let inserted = if positions.is_empty() {
       fork.release(store).map_err(StoreRefused::from)
     } else {
-      self
-        .index
-        .adopt(store, fork)
-        .map_err(|refused| match refused {
-          slates_vcs::AdoptRefused::Refused(refused, fork) => {
-            let _ = fork.release(store);
-            StoreRefused::from(refused)
-          }
-          slates_vcs::AdoptRefused::Stale(fork) | slates_vcs::AdoptRefused::NotAFork(fork) => {
-            let _ = fork.release(store);
-            StoreRefused::Moved { green: first.green }
-          }
-        })
+      self.adopted(store, fork).map_err(|refused| match refused {
+        slates_vcs::AdoptRefused::Refused(refused, fork) => {
+          let _ = fork.release(store);
+          StoreRefused::from(refused)
+        }
+        slates_vcs::AdoptRefused::Stale(fork) | slates_vcs::AdoptRefused::NotAFork(fork) => {
+          let _ = fork.release(store);
+          StoreRefused::Moved { green: first.green }
+        }
+      })
     };
     if let Err(refused) = inserted {
-      store.discharge(more.saturating_add(landing_cost))?;
-      give_back(store, &put)?;
+      store.discharge(charge.records.saturating_add(charge.landings))?;
+      give_back(store, &values.iter().flatten().copied().collect::<Vec<_>>())?;
       return Err(refused);
     }
+    // Nothing of the repository changed before this point; nothing refuses after it but a discharge or a release past
+    // what was held, which no commit's own charge and holds can be.
     self.landings.extend(landed);
     if !positions.is_empty()
       && let Some((pack, len)) = push.stored_pack()
     {
       self.packs.insert(pack, len);
       self.largest = self.largest.max(push.largest());
-      let largest = self.packs.values().copied().max().unwrap_or(0);
+      self.largest_pack = self.largest_pack.max(len);
       self
         .reading
         .get_mut()
         .recent()
-        .set_budget(usize::try_from(largest).unwrap_or(usize::MAX));
+        .set_budget(usize::try_from(self.largest_pack).unwrap_or(usize::MAX));
     }
     self.kinds.extend(
       kinds
         .into_iter()
         .map(|(start, end, kind)| (start, (end, kind))),
     );
-    self.landings_charged = self.landings_charged.saturating_add(landing_cost);
-    store.discharge(self.charged.saturating_sub(total))?;
-    self.charged = total;
-    self.count(|counters| counters.value_bytes = counters.value_bytes.saturating_add(added));
-    let versions = self.install_versions(store, moves, chains, (heads, next));
+    self.landings_charged = self.landings_charged.saturating_add(charge.landings);
+    self
+      .count(|counters| counters.value_bytes = counters.value_bytes.saturating_add(charge.values));
+    let versions = self.install_versions(store, moves, (planned, &values), (entries, next));
+    // Charged at the peeled and holders' maps' bound, now trued up to what they hold, so the charge is always the whole
+    // recomputation's.
+    let exact = self.charge_now();
+    store.discharge(
+      self
+        .charged
+        .saturating_add(charge.records)
+        .saturating_sub(exact),
+    )?;
+    self.charged = exact;
     self.count(|counters| counters.positions = counters.positions.saturating_add(given));
     self.depth.seen(push.deepest());
     push.release_holds(store)?;
@@ -1627,36 +1761,116 @@ impl Repository {
     Ok(versions)
   }
 
-  /// The versions `commit` makes, put in place once everything is charged and the stage adopted: `chains` (each moved
-  /// green's chain with its new version) installed, the versions with no value counted (`unvalued`), the head map and
-  /// the next position taken, each version's commit noted for a later create's search back (A-850) and its holders, and
-  /// each version committed with its value noted known. The versions made, one for each move, in order.
+  /// Adopts the stage's `fork` into the index ([`Index::adopt`]). In a test that asks to refuse a commit at its
+  /// adoption ([`REFUSE_COMMIT_AT`]) it is refused as a stale fork is, since a current fork's adoption seals no tail
+  /// and charges nothing a budget could refuse, and the commit's give-back after it must still be exercised.
+  fn adopted(
+    &mut self,
+    store: &mut ContentStore,
+    fork: Index,
+  ) -> Result<(), slates_vcs::AdoptRefused> {
+    #[cfg(test)]
+    if REFUSE_COMMIT_AT.with(Cell::get) == Some(CommitPoint::Adopt) {
+      COMMIT_REFUSED_AT.with(|refused| refused.borrow_mut().insert(CommitPoint::Adopt));
+      return Err(slates_vcs::AdoptRefused::Stale(Box::new(fork)));
+    }
+    self.index.adopt(store, fork)
+  }
+
+  /// What `commit` makes before its stage is adopted, changing nothing of the repository: the landing map's runs for
+  /// the stage's `positions` from `base` (`first` bringing what no other move did), each move's planned version
+  /// ([`Repository::plan`]), their values put, the head map's entries once moved, and the records' and the landing
+  /// map's charges taken. Each move adds one version record to its chain (a new version keeps no fragment) and notes at
+  /// most one commit more in the peeled map and one green more in the holders' map, so the records are charged by that
+  /// difference at that bound, never by summing every chain again (P2: 22,021 chain records and head entries read for
+  /// one move over 1,000 greens of 20 versions each); the commit trues the bound up once they are noted. Refused at any
+  /// step, everything it took is given back.
+  fn prepared(
+    &self,
+    store: &mut ContentStore,
+    moves: &[Move],
+    (first, base, positions, kinds): (&Move, u64, &BTreeMap<ObjectId, u64>, usize),
+  ) -> Result<Prepared, StoreRefused> {
+    let landed = self.landed_runs(moves, first, (base, positions));
+    let (planned, entries) = self.plan(store, moves, (base, positions))?;
+    let before = store.used();
+    let values = at_point(store, CommitPoint::Values, |store| {
+      put_values(store, &planned)
+    })?;
+    let put: Vec<ContentId> = values.iter().flatten().copied().collect();
+    let added = store.used().saturating_sub(before);
+    let chains = self
+      .chains_charged
+      .saturating_add(bytes(moves.len(), VERSION_BYTES));
+    let peeled = self.peeled.len().saturating_add(moves.len());
+    let holders = self.holder_entries.saturating_add(moves.len());
+    let total = charge_of(chains, (entries, peeled, holders));
+    let records = total.saturating_sub(self.charged);
+    if let Err(refused) = at_point(store, CommitPoint::Records, |store| store.charge(records)) {
+      give_back(store, &put)?;
+      return Err(refused.into());
+    }
+    let landings = bytes(landed.len().saturating_add(kinds), LANDING_BYTES);
+    if let Err(refused) = at_point(store, CommitPoint::Landings, |store| store.charge(landings)) {
+      store.discharge(records)?;
+      give_back(store, &put)?;
+      return Err(refused.into());
+    }
+    Ok(Prepared {
+      landed,
+      planned,
+      values,
+      entries,
+      charge: Charge {
+        records,
+        landings,
+        values: added,
+      },
+    })
+  }
+
+  /// What the chains, the head map, the peeled map and the holders' map charge as they stand: the chains' kept sum
+  /// (`chains_charged`) and the maps' entries.
+  fn charge_now(&self) -> u64 {
+    charge_of(
+      self.chains_charged,
+      (self.head_entries, self.peeled.len(), self.holder_entries),
+    )
+  }
+
+  /// The versions `commit` makes, put in place once everything is charged and the stage adopted: each move's planned
+  /// version pushed onto its green's chain in place with its value (`values`, in order), the versions with no value
+  /// counted (`unvalued`), each green's head moved in the head map in place, the chains' charge and the map's
+  /// `entries` (`plan`'s count) taken, the next position taken, each version's commit noted for a later create's search
+  /// back (A-850) and its holders, and each version committed with its value noted known. The versions made, one for
+  /// each move, in order. It reads each moved green's chain and head entries alone (P2: it cloned each moved chain and
+  /// took a copy of the whole head map before).
   fn install_versions(
     &mut self,
     store: &ContentStore,
     moves: &[Move],
-    chains: BTreeMap<u64, Chain>,
-    (heads, next): (HeadMap, u64),
+    (planned, values): (Vec<Planned>, &[Option<ContentId>]),
+    (entries, next): (usize, u64),
   ) -> Vec<u64> {
-    let versions: Vec<u64> = moves
-      .iter()
-      .map(|movement| {
-        chains.get(&movement.green).map_or(0, |chain| {
-          u64::try_from(chain.versions.len())
-            .unwrap_or(u64::MAX)
-            .saturating_sub(1)
-        })
-      })
-      .collect();
-    for (green, chain) in &chains {
-      let was = self.chains.get(green).map_or(0, Chain::unvalued);
-      self.unvalued = self
-        .unvalued
-        .saturating_sub(was)
-        .saturating_add(chain.unvalued());
+    let mut versions = Vec::with_capacity(planned.len());
+    for (planned, value) in planned.into_iter().zip(values) {
+      let chain = self.chains.entry(planned.green).or_default();
+      chain.versions.push(Version {
+        head: planned.head,
+        value: *value,
+        fragments: None,
+        followed: planned.followed,
+      });
+      versions.push(to_u64(chain.versions.len()).saturating_sub(1));
+      if value.is_none() {
+        self.unvalued = self.unvalued.saturating_add(1);
+      }
+      move_head(&mut self.heads, planned.green, planned.from, planned.head);
     }
-    self.chains.extend(chains);
-    self.heads = heads;
+    self.chains_charged = self
+      .chains_charged
+      .saturating_add(bytes(versions.len(), VERSION_BYTES));
+    self.head_entries = entries;
     self.next_position = next;
     // A-850: each version's commit, the first version noted under it, for a later create's search back.
     for (movement, version) in moves.iter().zip(&versions) {
@@ -1915,15 +2129,19 @@ impl Repository {
     }))
   }
 
-  /// The versions the moves make, their sets computed and their values not yet put, and the head map after them.
+  /// Each move's version as `commit` will make it, read from the repository as it stands and changing nothing: its
+  /// reached set grown by what it brought where its green's sets are known (A-647 part 3), and its head's position;
+  /// and the head map's entries once every move is made ([`Repository::entries_moved`]). It reads each moved green's
+  /// newest version and its two head entries (counted in `commit_walked`), never the whole map: it took a copy of the
+  /// map before (P2).
   fn plan(
     &self,
     store: &ContentStore,
     moves: &[Move],
     (base, positions): (u64, &BTreeMap<ObjectId, u64>),
-  ) -> Result<(Vec<Planned>, HeadMap), StoreRefused> {
+  ) -> Result<(Vec<Planned>, usize), StoreRefused> {
     let mut planned = Vec::with_capacity(moves.len());
-    let mut heads = self.heads.clone();
+    let mut entries = self.head_entries;
     for movement in moves {
       // A fast-forward over sets known when it was admitted grows them now; one whose green's sets went unknown since (a
       // memo let go) is left for its first reader, as one admitted so; a create, a rewrite and a fast-forward over sets
@@ -1945,36 +2163,44 @@ impl Repository {
         .to
         .map(|to| self.position_of(store, positions, &to))
         .transpose()?;
-      move_head(&mut heads, movement.green, movement.from, head);
+      entries = self.entries_moved(entries, movement.green, (movement.from, head));
       planned.push(Planned {
         green: movement.green,
+        from: movement.from,
         head,
         followed: followed(&movement.reach),
         sets,
       });
     }
-    Ok((planned, heads))
+    self.count(|counters| {
+      counters.commit_walked = counters
+        .commit_walked
+        .saturating_add(to_u64(moves.len().saturating_mul(RECORDS_A_MOVE)));
+    });
+    Ok((planned, entries))
   }
 
-  /// The chains the planned versions make, on copies: each version with its value, `values`' in order (none for one left
-  /// for its first reader).
-  fn chains_with(
+  /// The head map's entries once `green` moves from the head at `from` to the one at `to` ([`move_head`]), from
+  /// `entries`: its entry under its old head taken out, and one under its new head put in unless the map holds it
+  /// there after the move out. A commit moves each green once (`check_moves`), so each move's change is its own.
+  fn entries_moved(
     &self,
-    planned: Vec<Planned>,
-    values: &[Option<ContentId>],
-  ) -> BTreeMap<u64, Chain> {
-    let mut chains: BTreeMap<u64, Chain> = BTreeMap::new();
-    for (planned, value) in planned.into_iter().zip(values) {
-      let mut chain = self.chains.get(&planned.green).cloned().unwrap_or_default();
-      chain.versions.push(Version {
-        head: planned.head,
-        value: *value,
-        fragments: None,
-        followed: planned.followed,
-      });
-      chains.insert(planned.green, chain);
-    }
-    chains
+    entries: usize,
+    green: u64,
+    (from, to): (Option<u64>, Option<u64>),
+  ) -> usize {
+    let held = |head: u64| {
+      self
+        .heads
+        .get(&head)
+        .is_some_and(|greens| greens.contains(&green))
+    };
+    let out = from.is_some_and(held);
+    let kept = to.is_some_and(|to| held(to) && !(out && from == Some(to)));
+    let put = to.is_some() && !kept;
+    entries
+      .saturating_sub(usize::from(out))
+      .saturating_add(usize::from(put))
   }
 
   /// A walk's members as positions, the new ones by the positions given them now: as the walk found them staged where
@@ -2209,6 +2435,9 @@ impl Repository {
       holders: self.holders.clone(),
       holder_entries: self.holder_entries,
       charged: self.charged,
+      chains_charged: self.chains_charged,
+      head_entries: self.head_entries,
+      largest_pack: self.largest_pack,
       landings: self.landings.clone(),
       kinds: self.kinds.clone(),
       packs: self.packs.clone(),
@@ -2273,10 +2502,34 @@ impl Repository {
   }
 }
 
+/// What a commit makes before its stage is adopted ([`Repository::prepared`]): the landing map's runs, each move's
+/// planned version and its value, the head map's entries once moved, and what was charged.
+struct Prepared {
+  landed: Vec<(u64, (u64, u64, u64))>,
+  planned: Vec<Planned>,
+  values: Vec<Option<ContentId>>,
+  entries: usize,
+  charge: Charge,
+}
+
+/// What a commit charged the store before its stage was adopted: its records' difference at the bound, its landing
+/// map's runs, and the bytes its values added.
+struct Charge {
+  records: u64,
+  landings: u64,
+  values: u64,
+}
+
+/// Shape: what a commit reads of the repository's records for each move it plans: its green's newest version, and the
+/// head entries it moves out and in.
+const RECORDS_A_MOVE: usize = 3;
+
 /// A move's version as its commit plans it: its green, its head's position, how its reached set followed, and its sets,
 /// which become its value once the commit puts them; none for a version left for its first reader (A-614 amended).
 struct Planned {
   green: u64,
+  /// Its green's head before the move ([`Move::from_head`]).
+  from: Option<u64>,
   head: Option<u64>,
   followed: Followed,
   sets: Option<Sets>,
@@ -2357,27 +2610,26 @@ fn move_head(
   }
 }
 
-/// What the chains, the head map, the peeled map and the holders' map charge once the planned chains replace theirs.
-fn footprint(
-  current: &BTreeMap<u64, Chain>,
-  planned: &BTreeMap<u64, Chain>,
-  (heads, peeled, holders): (&BTreeMap<u64, BTreeSet<u64>>, usize, usize),
-) -> u64 {
-  let chains = current
-    .iter()
-    .filter(|(green, _)| !planned.contains_key(green))
-    .map(|(_, chain)| chain)
-    .chain(planned.values())
-    .fold(0_u64, |total, chain| {
-      total.saturating_add(chain.footprint())
-    });
+/// What `chains` (the chains' footprints summed) and the head map's, the peeled map's and the holders' map's entries
+/// charge the store.
+fn charge_of(chains: u64, (heads, peeled, holders): (usize, usize, usize)) -> u64 {
+  chains
+    .saturating_add(bytes(heads, HEAD_BYTES))
+    .saturating_add(bytes(peeled, PEELED_BYTES))
+    .saturating_add(bytes(holders, HOLDER_BYTES))
+}
+
+/// The chains' footprints summed and the head map's entries, recomputed whole: the oracle of the commit's and the
+/// recharge's kept sums (P2).
+#[cfg(test)]
+fn charged_whole(chains: &BTreeMap<u64, Chain>, heads: &HeadMap) -> (u64, usize) {
+  let footprints = chains.values().fold(0_u64, |total, chain| {
+    total.saturating_add(chain.footprint())
+  });
   let entries = heads
     .values()
     .fold(0_usize, |total, greens| total.saturating_add(greens.len()));
-  chains
-    .saturating_add(bytes(entries, HEAD_BYTES))
-    .saturating_add(bytes(peeled, PEELED_BYTES))
-    .saturating_add(bytes(holders, HOLDER_BYTES))
+  (footprints, entries)
 }
 
 /// Derived: what one green of the holders' map charges the store: its key and its version, two words, the commit's
@@ -2543,12 +2795,26 @@ impl Repository {
     }
   }
 
-  /// Charges what the chains and the head map take now against what was charged.
-  fn recharge(&mut self, store: &mut ContentStore) -> Result<(), StoreRefused> {
-    let total = footprint(
-      &self.chains,
-      &BTreeMap::new(),
-      (&self.heads, self.peeled.len(), self.holder_entries),
+  /// What `green`'s chain charges the store now ([`Chain::footprint`]); none for a green with no chain.
+  fn chain_footprint(&self, green: u64) -> u64 {
+    self.chains.get(&green).map_or(0, Chain::footprint)
+  }
+
+  /// Charges what the chains and the maps take now against what was charged, `green`'s chain changed alone since it
+  /// charged `before`: the chains' kept sum moved by that chain's difference, never every chain summed again (P2).
+  /// Refused, nothing of the charge changed.
+  fn recharge(
+    &mut self,
+    store: &mut ContentStore,
+    (green, before): (u64, u64),
+  ) -> Result<(), StoreRefused> {
+    let chains = self
+      .chains_charged
+      .saturating_sub(before)
+      .saturating_add(self.chain_footprint(green));
+    let total = charge_of(
+      chains,
+      (self.head_entries, self.peeled.len(), self.holder_entries),
     );
     if total > self.charged {
       store.charge(total.saturating_sub(self.charged))?;
@@ -2556,6 +2822,7 @@ impl Repository {
       store.discharge(self.charged.saturating_sub(total))?;
     }
     self.charged = total;
+    self.chains_charged = chains;
     Ok(())
   }
 
@@ -2641,13 +2908,14 @@ impl Repository {
     store: &mut ContentStore,
     (green, version): (u64, usize),
   ) -> Result<bool, StoreRefused> {
+    let before = self.chain_footprint(green);
     let Some(fragments) = fragments_slot(&mut self.chains, green, version).and_then(Option::take)
     else {
       return Ok(false);
     };
     store.release(&fragments.objects.content)?;
     store.release(&fragments.blobs.content)?;
-    self.recharge(store)?;
+    self.recharge(store, (green, before))?;
     Ok(true)
   }
 
@@ -2738,10 +3006,11 @@ impl Repository {
     let contents = [fragments.objects.content, fragments.blobs.content];
     self.count_entries(&fragments.objects.placed);
     self.count_entries(&fragments.blobs.placed);
+    let before = self.chain_footprint(green);
     if let Some(kept) = fragments_slot(&mut self.chains, green, version) {
       *kept = Some(fragments);
     }
-    if let Err(refused) = self.recharge(store) {
+    if let Err(refused) = self.recharge(store, (green, before)) {
       if let Some(kept) = fragments_slot(&mut self.chains, green, version) {
         *kept = None;
       }
@@ -2783,11 +3052,12 @@ impl Repository {
       .into_iter()
       .flat_map(|kept| kept.placed.iter().copied())
       .collect();
+    let before = self.chain_footprint(green);
     let old = self
       .chains
       .get_mut(&green)
       .and_then(|chain| chain.base.replace(base));
-    if let Err(refused) = self.recharge(store) {
+    if let Err(refused) = self.recharge(store, (green, before)) {
       if let Some(chain) = self.chains.get_mut(&green) {
         chain.base = old;
       }

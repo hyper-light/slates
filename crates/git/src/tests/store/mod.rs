@@ -12,6 +12,7 @@ use crate::negotiation::Filter;
 use crate::object_name::{CollisionAttack, Hasher, Kind, ObjectFormat, ObjectId, name_of};
 use crate::objects::tree::{Entry, Mode, compare, write_entries};
 use crate::store::learn::{Clock, Exchange};
+use crate::store::repository::{COMMIT_REFUSED_AT, CommitPoint, REFUSE_COMMIT_AT};
 use crate::store::rows::{self, CommitRow, ObjectRow};
 use crate::store::{
   Answered, COLLISION_WORDS, Derived, Entries, Found, GitNaming, Incoming, Move, NameRefused,
@@ -28,6 +29,8 @@ mod packed;
 mod protect;
 mod reach;
 mod upload;
+
+mod commit_walk;
 
 /// Shape: the window the tests' content store holds content in.
 const WINDOW: usize = 1 << 10;
@@ -171,6 +174,44 @@ fn push_and_move(
     derive_all(repository, store);
   }
   committed
+}
+
+/// [`push_and_move`], its commit refused first at each point after its plan in turn ([`CommitPoint`]), each refusal
+/// held to leave the repository's records and its store's bytes as they were (P2, main 01a20182's condition of
+/// 2026-11-27 19:22), until a point charges nothing and the commit is made there, or else made after every point
+/// refused. The push is sealed and its moves admitted once: a refused commit's push and moves commit again as they
+/// are. The points it was refused at, and the versions made.
+fn push_and_move_refused_first(
+  repository: &mut Repository,
+  store: &mut ContentStore,
+  objects: &[Made],
+  moves: &[(u64, Option<ObjectId>)],
+) -> (BTreeSet<CommitPoint>, Vec<u64>) {
+  let mut push = sealed(repository, store, objects.to_vec());
+  let admitted: Vec<Move> = moves
+    .iter()
+    .map(|(green, to)| repository.admit(store, &push, *green, *to).unwrap())
+    .collect();
+  let before = repository.commit_state(store);
+  COMMIT_REFUSED_AT.with(|refused| refused.borrow_mut().clear());
+  let mut made = None;
+  for point in CommitPoint::ALL {
+    REFUSE_COMMIT_AT.with(|at| at.set(Some(point)));
+    let committed = repository.commit(store, &mut push, &admitted);
+    REFUSE_COMMIT_AT.with(|at| at.set(None));
+    if let Ok(versions) = committed {
+      made = Some(versions);
+      break;
+    }
+    assert_eq!(
+      repository.commit_state(store),
+      before,
+      "refused at {point:?}"
+    );
+  }
+  let versions = made.unwrap_or_else(|| repository.commit(store, &mut push, &admitted).unwrap());
+  derive_all(repository, store);
+  (COMMIT_REFUSED_AT.with(|refused| refused.take()), versions)
 }
 
 pub(super) use crate::served::derive_all;

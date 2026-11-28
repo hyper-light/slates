@@ -57050,6 +57050,38 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   made durable, `Unanswered`: Subversion's commit path, which this change does not touch); fmt clean (macOS arm64,
   this Mac, local).
 
+### A-722 part 4h — A commit reads and charges its own greens' records alone (P2, 2026-11-27, w-git; main 01a20182's order of 18:44 and its condition of 19:22)
+- **Why.** CLAUDE.md §3 (bounded work): a push's landing step ran `Repository::commit` with passes that grew with the
+  repository's life, not the push. Its charge summed every chain of every green (`footprint`, each chain's kept
+  fragments folded), cloned each moved green's whole chain to push one version, and copied the whole head map to move
+  its heads. A commit of one move over 1,000 greens of 20 versions each read 22,021 chain records and head entries
+  (`StoreCounters::commit_walked`, new). The release run of record v4 part A (BENCHMARKS, git/git v1.5.0) had the
+  store commit at 1.2 ms, over the 1 ms step.
+- **Change.** The repository keeps the chains' footprints summed (`chains_charged`) and the head map's entries
+  (`head_entries`), moved as each changes. A commit's plan reads each moved green's newest version and its two head
+  entries (`entries_moved`), and charges the records' difference at the peeled and holders' maps' bound
+  (`Repository::prepared`). Once the stage is adopted, it pushes each version onto its chain in place, moves each head
+  in the map in place, and trues the bound up, so the charge always equals the whole recomputation (the next charge
+  had trued it before). A fragment's or a base pack's recharge moves the sum by its one chain's difference. The read
+  budget follows the largest pack kept as each lands, not a walk over the packs, one a landing.
+- **A refused commit leaves the store as it was** (main's condition: with the clones gone, every refusal after the
+  plan must put things back exactly). Nothing of the repository changes before the stage's adoption; after it nothing
+  refuses but a discharge or a release past what was held. Found by the condition's oracle, a bug since A-722 part 3:
+  a commit refused at its values, its records' charge or its landing map's charge dropped the stage's index fork with
+  its tables still held, 397 bytes in the test. It is given back now.
+- **Tests.** `slates-git` `store::tests::commit_walk::a_commit_reads_its_own_moves_records_whatever_the_repositorys_other_greens_hold`
+  (3, red 22,021). `a_commit_refused_at_each_point_after_its_plan_leaves_the_store_as_it_was`: every point refused
+  (`CommitPoint`; a current fork's adoption charges nothing, so a test refuses it as a stale fork is), each refusal
+  leaving the records and the store's bytes as they were, then the same push and moves committed. Red with the fork
+  dropped: 397 bytes held. A-614's map oracle
+  (`the_git_store_reads_as_its_map_model_over_every_history`) now refuses every generated push's commit at each point
+  first, and holds the charge to its whole recomputation after every step, fragments' recharges included.
+  `slates-git --lib -- store::` 113 passed, 4 ignored; `slates-server --lib -- vcs_store:: git_push::` 270 passed,
+  1 ignored; fmt clean (macOS arm64, this Mac, local).
+- **Owed (P2, in order).** `landed_runs` for a push of several moves walks the push's positions in the step; the
+  release drops the push's placed map and the stage's positions map, one entry an object, in the step; a stale stage
+  restaged whole (A-722 part 4e's owed). Each is its own piece.
+
 ### A-722 part 4g — A replayed record's moves are admitted an object a turn (bug, 2026-11-20, w-git for UI goal 93; main's report: a restarted daemon recovering git/git's v2.0.0 spun and was killed again)
 - **Found by use.** r110 (w-interop, git v2.0.0): every daemon restarted after the push spun in A-662's recovery of the
   pushed repository (`daemon.rs` `spawn_alone`) and the watchdog killed it again, 7 of 27 steps answered.
