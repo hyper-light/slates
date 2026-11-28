@@ -294,3 +294,8 @@ part closed between 07:20 and 16:00.
 - A-NUMBERS (2026-11-21): claim an A-number by adding its row to amendments.tsv and pushing that claim BEFORE writing the
   number in a commit, doc or test. If the push is refused, fetch, and if the number was taken meanwhile, take the next
   free one. Three collisions in one morning (A-815, A-821, A-822) cost renumbering commits.
+
+## SESSION NAMES FOR DIRECT MESSAGES (main 01a20182, 2026-11-27 16:08)
+Agents reach each other with SendMessage to the session name ListAgents shows, not the w-* name: w-svn = slates-work-c5,
+w-interop = slates-work-15, w-git = slates-work-bc, w-perf = slates-work-08, w-shared = slates-work-fb, w-hg =
+slates-work-13. A note in inbox/<agent>-from-<you>-<topic>.md on agents/fanout-state reaches an agent that is blocked.
