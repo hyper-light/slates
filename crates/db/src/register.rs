@@ -1735,13 +1735,52 @@ pub struct LedgerPromise {
   /// The lowest position the holder's acceptor holds of the ledger, `None` for none (A-919, main 01a20182's start
   /// rule): its answer names nothing only from here; below it, it covers nothing.
   pub held_from: Option<u64>,
+  /// The owner's committed floor of a state log, where it answers as the log's owner and keeps one (A-919 (C)): every
+  /// position at or below it was let go once every candidate held it, so committed with one value, witnessed by the
+  /// chain's digest there ([`CommittedFloor`]). `None` from any other holder, and from an owner that does not hold the
+  /// chain from the log's first position.
+  pub committed_through: Option<CommittedFloor>,
+}
+
+/// An owner's committed floor of a state log (A-919 (C), main 01a20182's ruling of 2026-11-27 10:57): the highest
+/// position it let go, every position at or below it committed (let go only once every candidate held it), and the
+/// chain's digest through it ([`chain_digest`] from [`CHAIN_BASE`] over each position's value from the log's first).
+/// A read's fold adopts a single holder's report of a position at or below it only where its prefix's digest matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommittedFloor {
+  /// The highest position let go.
+  pub position: u64,
+  /// The chain's digest through it.
+  pub digest: [u8; DIGEST_BYTES],
+}
+
+/// Format: the bytes of a chain digest (blake3's output).
+pub const DIGEST_BYTES: usize = 32;
+
+/// Format: the chain digest before the log's first position: all zeros, so the first link is `H(0^32 || value)`.
+pub const CHAIN_BASE: [u8; DIGEST_BYTES] = [0; DIGEST_BYTES];
+
+/// The chain digest one position on from `previous`: blake3 of `previous` then `value` (A-919 (C)). The owner advances
+/// it over each part it lets go, in position order; a read's fold over each position it adopts.
+pub fn chain_digest(previous: &[u8; DIGEST_BYTES], value: &[u8]) -> [u8; DIGEST_BYTES] {
+  let mut hasher = blake3::Hasher::new();
+  hasher.update(previous);
+  hasher.update(value);
+  *hasher.finalize().as_bytes()
 }
 
 /// Format: the widest [`LedgerPromise`] header: holder, departed, epoch, generation (u64 LE each), the object, the next
-/// position's, the fence's and the held start's presence bytes and values (u64 LE each, A-919 the third), and the
-/// position count (u32 LE). A holder pages against it, so an answer with any of them absent stays within its frame too.
-pub const LEDGER_PROMISE_HEADER_BYTES: usize =
-  4 * size_of::<u64>() + OBJECT_BYTES + 3 * (1 + size_of::<u64>()) + size_of::<u32>();
+/// position's, the fence's and the held start's presence bytes and values (u64 LE each, A-919 the third), the position
+/// count (u32 LE), and the committed floor's presence byte, position (u64 LE) and digest (A-919 (C), after the
+/// positions). A holder pages against it, so an answer with any of them absent stays within its frame too.
+pub const LEDGER_PROMISE_HEADER_BYTES: usize = 4 * size_of::<u64>()
+  + OBJECT_BYTES
+  // Format: the three optional u64s (next position, fence, held start), each a presence byte then its value.
+  + 3 * (1 + size_of::<u64>())
+  + size_of::<u32>()
+  + 1
+  + size_of::<u64>()
+  + DIGEST_BYTES;
 
 /// Format: one [`LedgerPromise`] position's fixed bytes: its sequence and epoch (u64 LE each) and its value's length
 /// (u32 LE).
@@ -1783,12 +1822,21 @@ impl LedgerPromise {
       out.extend_from_slice(&value_len.to_le_bytes());
       out.extend_from_slice(&accepted.value);
     }
+    match self.committed_through {
+      None => out.push(FIELD_ABSENT),
+      Some(floor) => {
+        out.push(FIELD_PRESENT);
+        out.extend_from_slice(&floor.position.to_le_bytes());
+        out.extend_from_slice(&floor.digest);
+      }
+    }
     out
   }
 
   /// Reconstructs an answer from its bytes, checking every length against what remains before reading or allocating:
   /// a count beyond what the bytes could hold, a value length past the end, an unknown presence byte or trailing bytes
-  /// are [`RegisterError::MalformedRecord`], never a panic or an over-read.
+  /// are [`RegisterError::MalformedRecord`], never a panic or an over-read. An answer ending at its positions, a holder's
+  /// of the build before A-919 (C), carries no committed floor.
   pub fn decode(bytes: &[u8]) -> Result<LedgerPromise, RegisterError> {
     let mut reader = WireReader::new(bytes);
     let holder = HostId(reader.word()?);
@@ -1816,6 +1864,11 @@ impl LedgerPromise {
         value,
       });
     }
+    let committed_through = if reader.remaining() == 0 {
+      None
+    } else {
+      reader.optional_floor()?
+    };
     reader.finish()?;
     Ok(LedgerPromise {
       holder,
@@ -1827,6 +1880,7 @@ impl LedgerPromise {
       next,
       fenced,
       held_from,
+      committed_through,
     })
   }
 }
@@ -1936,6 +1990,22 @@ impl<'a> WireReader<'a> {
     match self.byte()? {
       FIELD_ABSENT => Ok(None),
       FIELD_PRESENT => Ok(Some(self.word()?)),
+      _ => Err(RegisterError::MalformedRecord),
+    }
+  }
+
+  /// An optional committed floor (A-919 (C)): a presence byte, then its position (u64 LE) and digest when present.
+  fn optional_floor(&mut self) -> Result<Option<CommittedFloor>, RegisterError> {
+    match self.byte()? {
+      FIELD_ABSENT => Ok(None),
+      FIELD_PRESENT => {
+        let position = self.word()?;
+        let digest = self
+          .take(DIGEST_BYTES)?
+          .try_into()
+          .map_err(|_| RegisterError::MalformedRecord)?;
+        Ok(Some(CommittedFloor { position, digest }))
+      }
       _ => Err(RegisterError::MalformedRecord),
     }
   }
@@ -7972,6 +8042,10 @@ mod tests {
       next: Some(5),
       fenced: None,
       held_from: Some(3),
+      committed_through: Some(CommittedFloor {
+        position: 2,
+        digest: [7; DIGEST_BYTES],
+      }),
     }
   }
 
@@ -8037,18 +8111,20 @@ mod tests {
   fn a_hostile_ledger_question_or_answer_is_refused() {
     let question = sample_ledger_prepare().encode();
     let answer = sample_ledger_promise().encode();
-    for cut in 0..question.len() {
-      assert_eq!(
-        LedgerPrepare::decode(&question[..cut]),
-        Err(RegisterError::MalformedRecord)
-      );
-    }
-    for cut in 0..answer.len() {
-      assert_eq!(
-        LedgerPromise::decode(&answer[..cut]),
-        Err(RegisterError::MalformedRecord)
-      );
-    }
+    every_cut_of_a_question_is_refused(&question);
+    // An answer ending at its positions is a holder's of the build before A-919 (C): no committed floor. Any other cut,
+    // the floor's own bytes among them, is refused.
+    let floor_at = answer
+      .len()
+      .saturating_sub(1 + size_of::<u64>() + DIGEST_BYTES);
+    every_cut_of_an_answer_but_its_floorless_end_is_refused(&answer, floor_at);
+    // The floor's presence byte past its two values.
+    let mut floor_flag = answer.clone();
+    floor_flag[floor_at] = 2;
+    assert_eq!(
+      LedgerPromise::decode(&floor_flag),
+      Err(RegisterError::MalformedRecord)
+    );
     for bytes in [&question, &answer] {
       let mut trailing = bytes.clone();
       trailing.push(0);
@@ -8073,6 +8149,34 @@ mod tests {
       LedgerPromise::decode(&lying),
       Err(RegisterError::MalformedRecord)
     );
+  }
+
+  /// Hostile input (A-364): every cut of a ledger question short of its end is refused.
+  fn every_cut_of_a_question_is_refused(question: &[u8]) {
+    for cut in 0..question.len() {
+      assert_eq!(
+        LedgerPrepare::decode(&question[..cut]),
+        Err(RegisterError::MalformedRecord)
+      );
+    }
+  }
+
+  /// Hostile input (A-364, A-919 (C)): every cut of a ledger answer is refused but the one ending where its committed
+  /// floor begins, a holder's answer of the build before (C), which decodes with no floor.
+  fn every_cut_of_an_answer_but_its_floorless_end_is_refused(answer: &[u8], floor_at: usize) {
+    for cut in 0..answer.len() {
+      if cut == floor_at {
+        assert_eq!(
+          LedgerPromise::decode(&answer[..cut]).map(|decoded| decoded.committed_through),
+          Ok(None)
+        );
+        continue;
+      }
+      assert_eq!(
+        LedgerPromise::decode(&answer[..cut]),
+        Err(RegisterError::MalformedRecord)
+      );
+    }
   }
 
   /// A-364: an acceptor's answer for a ledger's positions is every position it accepted in the range, ascending, each

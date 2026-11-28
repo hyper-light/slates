@@ -1731,6 +1731,24 @@ fn dispatched_request(
       });
       PeerRequestServed::Spawned(stream_id, served)
     }
+    // A current candidate reads a register's ledger it lacks (A-919), on its own task: a state log's read carries its
+    // owner's committed floor, asked of the shard that keeps it (A-919 (C)).
+    crate::forward_lane::Next::Request {
+      stream_id,
+      kind,
+      request,
+    } if kind == crate::ledger_read::LEDGER_READ_STREAM && enrolled => {
+      let peer_host = state::with_state(|s| {
+        s.learned_members
+          .get(&peer_anchor)
+          .map_or(seed, |learned| learned.host)
+      })
+      .unwrap_or(seed);
+      let served = forwards.spawn(stream_id, async move {
+        crate::ledger_read::serve_ledger_read_witnessed((control, local), peer_host, request).await
+      });
+      PeerRequestServed::Spawned(stream_id, served)
+    }
     // A work route's question (A-288) is answered on the green's shard, so it too runs on its own task.
     crate::forward_lane::Next::Request {
       stream_id,
@@ -1932,15 +1950,6 @@ async fn serve_peer_records(
             state::with_state(|s| crate::edges::serve_edges(s, peer_anchor, &request))
               .unwrap_or_default()
           }
-          // A current candidate reads a register's ledger it lacks (A-919).
-          crate::ledger_read::LEDGER_READ_STREAM => state::with_state(|s| {
-            let peer_host = s
-              .learned_members
-              .get(&peer_anchor)
-              .map_or(seed, |learned| learned.host);
-            crate::ledger_read::serve_ledger_read(s, local, peer_host, &request)
-          })
-          .unwrap_or_default(),
           // A moved volume's new owner asks its cohort by name (A-291).
           crate::moves::MOVE_STREAM => state::with_state(|s| {
             let peer_host = s

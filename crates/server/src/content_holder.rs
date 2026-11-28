@@ -260,6 +260,14 @@ const KIND_VCS_PAGE: u8 = 18;
 /// the part's position; its bytes the part's register value. A warm start owes each again to every candidate.
 const KIND_OWED_PART: u8 = 22;
 
+/// Format: the piece kind of a state log's committed floor this shard keeps as the log's owner (A-919 (C),
+/// `state_log::StateLogs::floor`), keyed by the log's register at slot 0; its bytes the floor's position (u64 LE) and
+/// the chain's digest through it ([`FLOOR_PIECE_BYTES`]).
+const KIND_LOG_FLOOR: u8 = 23;
+
+/// Format: a floor piece's bytes: its position (u64 LE), then the chain's digest.
+const FLOOR_PIECE_BYTES: usize = size_of::<u64>() + slates_db::register::DIGEST_BYTES;
+
 /// The key of `family`'s `page`.
 fn page_key(family: crate::image_pages::Family, page: crate::image_pages::Page) -> PieceKey {
   let object: [u8; 16] = core::array::from_fn(|at| match at {
@@ -456,7 +464,40 @@ pub(crate) fn held_image_unpaged(state: &ShardState) -> Vec<slates_vfs::recover:
       .parts()
       .map(|(register, position, value)| owed_part_piece(register, position, value)),
   );
+  // Every state log's committed floor this shard keeps as the log's owner (A-919 (C)).
+  pieces.extend(
+    state
+      .state_logs
+      .floors()
+      .map(|(register, floor)| floor_piece(register, floor)),
+  );
   pieces
+}
+
+/// A state log's committed floor's piece (A-919 (C)), keyed by its register.
+fn floor_piece(
+  register: ObjectId,
+  floor: slates_db::register::CommittedFloor,
+) -> slates_vfs::recover::HeldPiece {
+  let mut bytes = Vec::with_capacity(FLOOR_PIECE_BYTES);
+  bytes.extend_from_slice(&floor.position.to_le_bytes());
+  bytes.extend_from_slice(&floor.digest);
+  slates_vfs::recover::HeldPiece {
+    key: piece_key(KIND_LOG_FLOOR, register.0, 0),
+    bytes,
+  }
+}
+
+/// The floor a floor piece's `bytes` hold (A-919 (C)), none where they are not exactly a floor's.
+fn floor_of_piece(bytes: &[u8]) -> Option<slates_db::register::CommittedFloor> {
+  if bytes.len() != FLOOR_PIECE_BYTES {
+    return None;
+  }
+  let (position, digest) = bytes.split_first_chunk::<{ size_of::<u64>() }>()?;
+  Some(slates_db::register::CommittedFloor {
+    position: u64::from_le_bytes(*position),
+    digest: digest.try_into().ok()?,
+  })
 }
 
 /// An owed state-log part's piece (A-921's second mode), keyed by its register and position.
@@ -482,6 +523,10 @@ fn owed_part_changes(
       Some(value) => put.push(owed_part_piece(register, position, value)),
       None => removed.push(piece_key(KIND_OWED_PART, register.0, position)),
     }
+  }
+  // Each floor that rose since then (A-919 (C)), in the same delta as the parts let go under it.
+  for (register, floor) in state.state_logs.floors_changed() {
+    put.push(floor_piece(register, floor));
   }
 }
 
@@ -1769,6 +1814,8 @@ pub(crate) struct RecoveredHeld {
   /// The state-log parts this shard owed some candidate as their logs' owner, each by register and position, in key
   /// order (A-921's second mode).
   owed: Vec<(ObjectId, u64, Vec<u8>)>,
+  /// The state logs' committed floors this shard kept as their owner (A-919 (C)), by register.
+  floors: Vec<(ObjectId, slates_db::register::CommittedFloor)>,
 }
 
 /// Why a recovered image's held pieces were refused (A-270): never read as less than was held, since a holder that
@@ -1793,6 +1840,9 @@ pub(crate) enum HeldRefused {
   Retired(u8),
   /// An owed state-log part whose bytes are no state log's record, or not its register's (A-921's second mode).
   OwedPart([u8; 16]),
+  /// A state log's committed floor whose bytes are no floor's, that lies at or above a part still owed, or that the
+  /// log's lowest part owed does not continue (A-919 (C)): the log's parts and its floor disagree on what was let go.
+  Floor([u8; 16]),
   /// Owed state-log parts past what the owner's bound lets it hold (A-921's second mode, `state_log::restorable`): their
   /// bytes past the largest share one operation holds, and the bound.
   OwedPastBound {
@@ -1833,6 +1883,12 @@ impl std::fmt::Display for HeldRefused {
         write!(
           f,
           "an owed state-log part of {register:02x?} is not its log's record"
+        )
+      }
+      HeldRefused::Floor(register) => {
+        write!(
+          f,
+          "the committed floor of {register:02x?} is no floor, or disagrees with the log's parts owed"
         )
       }
       HeldRefused::OwedPastBound { bytes, bound } => write!(
@@ -2138,6 +2194,7 @@ pub(crate) fn split_held(
     aways_unnumbered: Vec::new(),
     landed: Vec::new(),
     owed: Vec::new(),
+    floors: Vec::new(),
   };
   let mut heads: BTreeMap<[u8; 16], crate::live_ship::HeldLive> = BTreeMap::new();
   let mut entries: BTreeMap<[u8; 16], Vec<(u64, Vec<u8>)>> = BTreeMap::new();
@@ -2187,6 +2244,12 @@ pub(crate) fn split_held(
           return Err(HeldRefused::OwedPart(object));
         }
         held.owed.push((register, slot, piece.bytes.clone()));
+      }
+      KIND_LOG_FLOOR => {
+        let floor = floor_of_piece(&piece.bytes)
+          .filter(|_| slot == 0)
+          .ok_or(HeldRefused::Floor(object))?;
+        held.floors.push((ObjectId(object), floor));
       }
       KIND_REPLICA_CHECKPOINT => held.checkpoints.push((
         ObjectId(object),
@@ -2263,7 +2326,31 @@ pub(crate) fn owed_within_bound(
   held: &RecoveredHeld,
 ) -> Result<(), HeldRefused> {
   crate::state_log::restorable(&held.owed, crate::state_log::bound(state))
-    .map_err(|(bytes, bound)| HeldRefused::OwedPastBound { bytes, bound })
+    .map_err(|(bytes, bound)| HeldRefused::OwedPastBound { bytes, bound })?;
+  floors_agree(held)
+}
+
+/// Whether each committed floor a recovered image carries agrees with the log's parts still owed (A-919 (C)): every
+/// part owed lies above the floor (each at or below it was let go), and the lowest continues from it (its `from` the
+/// floor's position). Refused typed where not, before anything of the image is restored: a floor past the log's end
+/// would witness positions never let go.
+fn floors_agree(held: &RecoveredHeld) -> Result<(), HeldRefused> {
+  for (register, floor) in &held.floors {
+    let lowest = held
+      .owed
+      .iter()
+      .filter(|(owed, ..)| owed == register)
+      .min_by_key(|(_, position, _)| *position);
+    let Some((_, position, value)) = lowest else {
+      continue;
+    };
+    let continues =
+      crate::state_log::record_of(value).is_some_and(|part| part.from == floor.position);
+    if *position <= floor.position || !continues {
+      return Err(HeldRefused::Floor(register.0));
+    }
+  }
+  Ok(())
 }
 
 /// Rebuilds the held registers of a recovered image as `local`, each the acceptor it persisted
@@ -2284,6 +2371,10 @@ pub(crate) fn restore_held_registers(
   // owed to the next publication.
   for (register, position, value) in std::mem::take(&mut held.owed) {
     state.state_logs.restore(register, position, value);
+  }
+  // Their committed floors (A-919 (C)), likewise carried by the image.
+  for (register, floor) in std::mem::take(&mut held.floors) {
+    state.state_logs.restore_floor(register, floor);
   }
   state.state_logs.clear_changed();
   // The mirror records, each the newest of its object as it was published. One that does not decode, or that the
@@ -2318,3 +2409,151 @@ pub(crate) fn restore_held_registers(
 /// The status count of mirror records a recovered held image carried that could not be held again.
 /// Format: a refusal name in the daemon's status report.
 const MIRROR_RESTORE_REFUSED: &str = "fleet.mirror.restore_refused";
+
+#[cfg(test)]
+mod floor_tests {
+  use slates_db::catalog::{LogSpan, StateLog, StateLogRecord};
+  use slates_db::register::{CommittedFloor, ObjectId};
+
+  use super::{
+    HeldRefused, floor_piece, floors_agree, held_image_unpaged, owed_part_changes, owed_part_piece,
+    split_held,
+  };
+
+  /// A names log's part from `from` to `to` of one repository, with no changes, as its register value.
+  fn part_value(from: u64, to: u64) -> (ObjectId, Vec<u8>) {
+    let record = StateLogRecord {
+      repository: slates_db::catalog::RepositoryId { bytes: [7; 16] },
+      log: StateLog::Names,
+      from,
+      to,
+      identity: slates_db::catalog::OperationIdentity { digest: [1; 32] },
+      spans: Vec::new(),
+      changes: Vec::new(),
+    };
+    let record = StateLogRecord {
+      spans: vec![LogSpan {
+        log: record.log_name(),
+        from,
+        to,
+      }],
+      ..record
+    };
+    (
+      record.log_name().register(),
+      crate::state_log::value_of(&record),
+    )
+  }
+
+  /// Whether a recovered image of an owed part from `from` to `to` and a floor at `floor_at` is refused for its floor.
+  fn refused_for_floor((from, to): (u64, u64), floor_at: u64) -> bool {
+    let (register, value) = part_value(from, to);
+    let floor = CommittedFloor {
+      position: floor_at,
+      digest: [3; 32],
+    };
+    let pieces = [
+      owed_part_piece(register, to, &value),
+      floor_piece(register, floor),
+    ];
+    let held = split_held(&pieces).expect("the pieces decode");
+    matches!(floors_agree(&held), Err(HeldRefused::Floor(_)))
+  }
+
+  /// A-919 (C), hostile images: a floor the log's lowest owed part continues is kept; a floor at or above a part still
+  /// owed (past the log's end as the owner let it go) or one that part does not continue is refused typed; and a floor
+  /// piece whose bytes are not a floor's is refused as it is split.
+  #[test]
+  fn an_images_floor_that_disagrees_with_its_logs_owed_parts_is_refused() {
+    assert!(
+      !refused_for_floor((2, 3), 2),
+      "a part from the floor continues it"
+    );
+    assert!(refused_for_floor((2, 3), 3), "a floor at a part still owed");
+    assert!(refused_for_floor((2, 3), 9), "a floor past the log's end");
+    assert!(
+      refused_for_floor((4, 5), 2),
+      "a part that does not continue the floor"
+    );
+    let (register, _) = part_value(0, 1);
+    let mut short = floor_piece(
+      register,
+      CommittedFloor {
+        position: 1,
+        digest: [3; 32],
+      },
+    );
+    short.bytes.pop();
+    assert!(matches!(split_held(&[short]), Err(HeldRefused::Floor(_))));
+  }
+
+  /// The pieces `image` holds once `put` and `removed` (a committed publication's delta) are applied to it.
+  fn applied(
+    image: &[slates_vfs::recover::HeldPiece],
+    (put, removed): (Vec<slates_vfs::recover::HeldPiece>, Vec<super::PieceKey>),
+  ) -> Vec<slates_vfs::recover::HeldPiece> {
+    let mut pieces: std::collections::BTreeMap<super::PieceKey, Vec<u8>> = image
+      .iter()
+      .map(|piece| (piece.key, piece.bytes.clone()))
+      .collect();
+    for key in removed {
+      pieces.remove(&key);
+    }
+    for piece in put {
+      pieces.insert(piece.key, piece.bytes);
+    }
+    pieces
+      .into_iter()
+      .map(|(key, bytes)| slates_vfs::recover::HeldPiece { key, bytes })
+      .collect()
+  }
+
+  /// Whether a recovered `image` keeps position `position` of `register`'s log: its part still owed, or a floor at or
+  /// above it, which a candidate's read is witnessed by (A-919 (C)).
+  fn keeps(image: &[slates_vfs::recover::HeldPiece], register: ObjectId, position: u64) -> bool {
+    let held = split_held(image).expect("the image decodes");
+    floors_agree(&held).is_ok()
+      && (held
+        .owed
+        .iter()
+        .any(|(owed, at, _)| *owed == register && *at == position)
+        || held
+          .floors
+          .iter()
+          .any(|(floored, floor)| *floored == register && floor.position >= position))
+  }
+
+  /// A-919 (C), main 01a20182's guard-then-apply (crash at every step): an owner lets a part go, and its shard crashes
+  /// either before the publication carrying the let-go commits or after. Do: on a shard, hold a log's two parts and
+  /// take the image a committed checkpoint carries; let the first go once every candidate holds it; restore the image
+  /// as it was (the crash before) and with the let-go's delta applied (the crash after). Expect both to keep the first
+  /// part's position, the first by the part still owed, the second by the floor over it: never the part gone without
+  /// the floor.
+  #[test]
+  fn a_crash_on_either_side_of_a_let_gos_publication_keeps_the_part_or_the_floor_over_it() {
+    let kept = crate::daemon::audit_on_shard(|state| {
+      let (register, one) = part_value(0, 2);
+      let (_, two) = part_value(2, 3);
+      let parts = [
+        crate::state_log::record_of(&one).expect("a part"),
+        crate::state_log::record_of(&two).expect("a part"),
+      ];
+      for part in &parts {
+        state.state_logs.hold(part);
+      }
+      let committed = held_image_unpaged(state);
+      state.state_logs.clear_changed();
+      let (b, c) = (
+        slates_db::register::HostId(2),
+        slates_db::register::HostId(3),
+      );
+      state.state_logs.acknowledged(register, 2, &[b, c]);
+      state.state_logs.let_go_held(register, &[b, c]);
+      let (mut put, mut removed) = (Vec::new(), Vec::new());
+      owed_part_changes(state, (&mut put, &mut removed));
+      let after = applied(&committed, (put, removed));
+      (keeps(&committed, register, 2), keeps(&after, register, 2))
+    });
+    assert_eq!(kept, (true, true), "(the crash before, the crash after)");
+  }
+}

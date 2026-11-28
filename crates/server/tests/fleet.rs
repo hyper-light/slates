@@ -36344,31 +36344,146 @@ fn anchored_git_fleet_of(name: &str, nodes: &[&str]) -> GitFleet {
 /// A token named for `name`, enrolled at `daemon` for this uid through `client` (connected to it), once a quorum holds
 /// it: the bearer a [`GitFleet`]'s pushes carry.
 fn enrolled_token(name: &str, daemon: &Daemon, client: &mut slates_client::Client) -> String {
+  // Enrolled once a quorum holds it (A-764): refused `CredentialUnreplicated` while the other members' credential planes
+  // are still coming up, so asked again within the placement deadline (a flake of the A-727 runs, 1 in 8).
+  let asked = token_enrollment(name, daemon, client);
+  if let Err(error) = enrolled_once_replicated(client, &asked) {
+    panic!("the credential enrolled: {error:?}");
+  }
+  asked.token
+}
+
+/// A-764's retry (diag CI 11, diagnosed by w-shared; main's order of 2026-11-27): an enrollment refused
+/// `CredentialUnreplicated` promises that the same request again reaches the rest (`Refusal::CredentialUnreplicated`),
+/// but the enrolling partition refused its own held id `AlreadyExists` before any fan-out, so the retry reached no other
+/// member, the client met `AlreadyExists` for its own credential, and the enrollment could stay short of `f + 1` for
+/// good. Do: form a three-node fleet at `f = 1`; make b and c answer no credential message
+/// (`Daemon::inject_credential_deafness`); enroll a token at a; give c back its answers; ask the same enrollment again
+/// (again while it is refused `CredentialUnreplicated`, as [`enrolled_token`] does, within [`PLACEMENT_DEADLINE`]).
+/// Expect: the first refused `CredentialUnreplicated { held: 1, needed: 2 }`; the retry `CredentialEnrolled` naming the
+/// token's id; c holding it and b, still deaf, not; and a counting the repeat (`credential.enroll.repeated`) at least
+/// once. Before the fix the retry was refused `AlreadyExists` and c never held the token.
+#[test]
+fn a764_an_enrollment_short_of_f_plus_one_completes_when_the_same_request_is_asked_again() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  for deaf in &daemons[1..] {
+    deaf.inject_credential_deafness(true).unwrap();
+  }
+  let mut client = common::client::connect(daemons[0].instance());
+  let asked = token_enrollment("a764-retry", &daemons[0], &mut client);
+  let first = enrolled_by(&mut client, &asked);
+  daemons[2].inject_credential_deafness(false).unwrap();
+  let retried = enrolled_once_replicated(&mut client, &asked);
+  let held: Vec<_> = daemons[1..]
+    .iter()
+    .map(|member| member.credential_held(asked.id))
+    .collect();
+  let repeated = move_counter(&daemons[0], "credential.enroll.repeated");
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    matches!(
+      first,
+      Err(slates_client::ClientError::Refused(
+        Refusal::CredentialUnreplicated { held: 1, needed: 2 }
+      ))
+    ),
+    "the first enrollment, b and c deaf, is held at a alone: {first:?}"
+  );
+  assert_eq!(
+    retried.as_ref().ok(),
+    Some(&asked.id),
+    "the same request again enrolls the token: {retried:?}"
+  );
+  assert_eq!(
+    held,
+    [Ok(false), Ok(true)],
+    "c holds the token, b (still deaf) does not"
+  );
+  assert!(
+    repeated.as_ref().is_ok_and(|count| *count >= 1),
+    "a counted the repeat: {repeated:?}"
+  );
+}
+
+/// A token's enrollment for this uid as a client asks it: the token (a bearer), its id, and the request's principal,
+/// credential and proof under the enrolling daemon's issuer secret.
+struct TokenEnrollment {
+  token: String,
+  id: [u8; 32],
+  principal: slates_ipc::protocol::Principal,
+  material: slates_ipc::protocol::CredentialMaterial,
+  proof: [u8; 32],
+}
+
+/// A token named for `name` to be enrolled at `daemon` for this uid through `client` (connected to it), never expiring.
+fn token_enrollment(
+  name: &str,
+  daemon: &Daemon,
+  client: &mut slates_client::Client,
+) -> TokenEnrollment {
   use slates_ipc::protocol::{CredentialMaterial, Principal};
   let token = format!("{name}-token-{}", std::process::id());
   let principal = Principal::Uid {
     host: client.daemon_status().unwrap().anchor,
     uid: this_account(),
   };
+  let id = slates_server::credentials::token_id(token.as_bytes());
   let material = CredentialMaterial::HttpToken {
-    id: slates_server::credentials::token_id(token.as_bytes()),
+    id,
     cram_md5_contexts: slates_server::credentials::cram_md5_contexts(token.as_bytes()),
   };
   let secret = daemon.segment().issuer_secret().unwrap();
   let proof = slates_server::credentials::enroll_proof(&secret, &principal, &material, None);
-  // Enrolled once a quorum holds it (A-764): refused `CredentialUnreplicated` while the other members' credential planes
-  // are still coming up, so asked again within the placement deadline (a flake of the A-727 runs, 1 in 8).
+  TokenEnrollment {
+    token,
+    id,
+    principal,
+    material,
+    proof,
+  }
+}
+
+/// `asked` through `client`, asked again while it is refused `CredentialUnreplicated` (the members' credential planes
+/// still coming up; the refusal's contract: the same request again reaches the rest), within [`PLACEMENT_DEADLINE`]:
+/// the id it enrolled, or the last refusal.
+fn enrolled_once_replicated(
+  client: &mut slates_client::Client,
+  asked: &TokenEnrollment,
+) -> Result<[u8; 32], slates_client::ClientError> {
   let began = Instant::now();
   loop {
-    match client.enroll_credential(principal.clone(), material.clone(), None, proof) {
-      Ok(_) => break,
-      Err(slates_client::ClientError::Refused(
-        slates_ipc::protocol::Refusal::CredentialUnreplicated { .. },
-      )) if began.elapsed() < PLACEMENT_DEADLINE => std::thread::yield_now(),
-      Err(error) => panic!("the credential enrolled: {error:?}"),
+    match enrolled_by(client, asked) {
+      Err(slates_client::ClientError::Refused(Refusal::CredentialUnreplicated { .. }))
+        if began.elapsed() < PLACEMENT_DEADLINE =>
+      {
+        std::thread::yield_now();
+      }
+      answer => return answer,
     }
   }
-  token
+}
+
+/// `asked` through `client`: the id it enrolled, or the refusal.
+fn enrolled_by(
+  client: &mut slates_client::Client,
+  asked: &TokenEnrollment,
+) -> Result<[u8; 32], slates_client::ClientError> {
+  client.enroll_credential(
+    asked.principal.clone(),
+    asked.material.clone(),
+    None,
+    asked.proof,
+  )
 }
 
 /// The [`GitFleet`] of `daemons`, formed: its repository `project` made on the first, held by another node as its
@@ -38215,14 +38330,16 @@ fn a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_th
   assert!(let_go, "a let its state logs' parts go again: {bytes:?}");
 }
 
-/// A-919 (main 01a20182's start rule of 2026-11-25). Do: on a four-node `f = 1` anchored git fleet with a repository on a,
-/// push `main` and wait for both of a's remote candidates to hold it; restart a warm (its own hold of the repository's
-/// state logs rebuilt empty, as no image carries it), a still the repository's owner after it; stop one of the
-/// candidates, so the fourth node, which holds none of the logs, becomes a candidate; push on top. Expect the newcomer
-/// to adopt nothing of the logs' prefix (no position held from a read) and its read counted past tolerance: below where
-/// a's hold now begins, a counts as one gone, and the old holder alone is no quorum, so the newest surviving value is
-/// never taken for the committed one (the open edge: refused typed, the register's candidacy owed). Red without the
-/// start rule: a's empty answer named nothing there, the old holder's prefix adopted on its word alone.
+/// A-919's past-tolerance edge, closed by (C) (main 01a20182's ruling of 2026-11-27 10:57: an owner's committed floor,
+/// verified). Do: on a four-node `f = 1` anchored git fleet with a repository on a, push `main` and wait for both of a's
+/// remote candidates to hold it, so a lets the repository's state-log parts go; restart a warm (its hold of the logs
+/// rebuilt from its owed parts alone, A-921 part 3), a still the repository's owner after it; stop one of the candidates,
+/// so the fourth node, which holds none of the logs, becomes a candidate; push on top. Expect the newcomer's read never
+/// past tolerance and the names log held from its first part, as the old holder holds it: below where a's hold begins, the old holder's
+/// report alone is adopted where a's committed floor (the highest position a let go, with the chain's digest there)
+/// witnesses it; and a's parts let go again (`Daemon::state_log_parts_bytes` back to zero). Red before (C): a counted as
+/// one gone below its hold's start and the departed another, so the read went past tolerance, the newcomer adopted
+/// nothing below a's start, refused every part, and a kept its parts from then on (the open edge, A-919).
 ///
 /// A-921 (main 01a20182's rulings of 2026-11-25): a warm restart whose silence outlasts detection is a death by design,
 /// and a's takeover then leaves the scene two deaths at `f = 1`, outside the fault model (measured 1 run in 3 to 5:
@@ -38242,7 +38359,7 @@ fn a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_th
 /// each peer on its own task, and sends its edges record so too (1 run in 5 met that pass's stall once the first was
 /// fixed), so no scene is guarded against that adoption, and the test runs again.
 #[test]
-fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins() {
+fn a919_a_newcomer_holds_a_restarted_owners_let_go_prefix_on_its_committed_floor() {
   let _serial = serialize_fleet_tests();
   let Some((mut fleet, holders)) = (0..SCENE_RESTARTS).find_map(restarted_owner_scene) else {
     panic!("a was taken over at every one of {SCENE_RESTARTS} warm restarts");
@@ -38301,7 +38418,14 @@ fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_beg
     old_holder_host.is_some_and(|host| daemon.member_identity().is_ok_and(|id| id == host))
   });
   let (old_refused, old_counts) = old_holder.map_or_else(Default::default, refusals_of);
+  let old_positions = old_holder.map(|daemon| daemon.names_log_positions(fleet.repository));
   let newcomer_refused = refusals_of(&fleet.daemons[newcomer]);
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let let_go = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(fleet.daemons[0].state_log_parts_bytes()? == 0)
+  });
+  drop(observed);
+  let parts_bytes = fleet.daemons[0].state_log_parts_bytes();
   fleet.stop();
   eprintln!(
     "restarted-owner-log: holders {holders:?}; taken over {taken}; pushes {pushed:?}; the newcomer's read past \
@@ -38314,19 +38438,33 @@ fn a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_beg
     pushed.iter().any(Result::is_ok),
     "a push after a's warm restart landed: {pushed:?}"
   );
-  // The start rule, measured (main 01a20182's ruling of 2026-11-26 on "held 1"): every position the newcomer holds is at
-  // or above where a's restarted hold begins, so none was adopted on the old holder's word alone. The read past tolerance
-  // is recorded: a owes its held parts again after its restart (A-921's second mode), so its hold may begin at the log's
-  // oldest owed part.
-  let _ = (refused, held);
-  let at_or_above = match (&newcomer_positions, &start) {
-    (Ok(positions), Ok(Some(start))) => positions.iter().all(|position| position >= start),
-    (Ok(positions), Ok(None)) => positions.is_empty(),
-    _ => false,
-  };
+  // (C): the old holder's report below a's restarted hold start adopted on a's committed floor, so the read is never
+  // past tolerance, the newcomer holds the log from its first position, and a's parts are let go again.
+  let _ = held;
   assert!(
-    at_or_above,
-    "every newcomer position at or above a's restarted hold start: {newcomer_positions:?}, {start:?}"
+    !refused,
+    "the newcomer's read was never past tolerance: positions held {held:?}"
+  );
+  // The log's first part, as the old holder holds it whole, and below where a's restarted hold begins: adopted on a's
+  // floor alone.
+  let first = |positions: &Result<Vec<u64>, ObserveError>| {
+    positions
+      .as_ref()
+      .ok()
+      .and_then(|positions| positions.first().copied())
+  };
+  let old_first = old_positions.as_ref().and_then(first);
+  assert!(
+    first(&newcomer_positions).is_some_and(|newcomer_first| Some(newcomer_first) == old_first
+      && start
+        .as_ref()
+        .is_ok_and(|start| start.is_some_and(|start| newcomer_first < start))),
+    "the newcomer holds the names log from its first part, as the old holder does ({old_positions:?}), below a's hold \
+     start {start:?}: {newcomer_positions:?}"
+  );
+  assert!(
+    let_go,
+    "a let its state logs' parts go again: {parts_bytes:?}"
   );
 }
 
@@ -38352,7 +38490,7 @@ fn refusals_of(daemon: &Daemon) -> Refusals {
   (last, counts)
 }
 
-/// One attempt at [`a919_a_newcomer_never_adopts_a_prefix_below_where_a_restarted_owners_hold_begins`]'s scene: a
+/// One attempt at [`a919_a_newcomer_holds_a_restarted_owners_let_go_prefix_on_its_committed_floor`]'s scene: a
 /// four-node anchored git fleet, `main` pushed and held by both of a's remote candidates, then a restarted warm and
 /// settled. The fleet and those candidates where a was not taken over by its restart (its fencing epoch unchanged at
 /// every other node); `None`, the attempt printed and its fleet stopped, where it was (A-921).

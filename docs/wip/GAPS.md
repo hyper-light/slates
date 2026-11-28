@@ -364,8 +364,15 @@
 >   read it as another home wire version's (A-727 (d1a)), which ends a homing at once, 2 s into its 18 s window. Now
 >   every reply is settled by its round trip (`fleet::settle_replies`, one path for timely replies and stragglers): one
 >   with none is no answer, its host left, its link dialed afresh, and the homing waits and ranks its homes again once
->   the death installs (A-912). Red first: `a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once`.
->   a914 asserts its second push lands.
+>   the death installs (A-912). Red first: `a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once`
+>   (16 of 16 in main's run at 526859d1e). a914 asserts its second push lands.
+> - **OPEN, a914 still fails 4 of 16 at the record barrier** (main 01a20182's run at 526859d1e, load 42-69; its rulings of
+>   2026-11-27 12:02). Every red is the second death's push refused `unable to commit`; no homing ended short at once.
+>   Two shapes:
+>   1. Runs 5 and 13: a green owed at version 3, placed 2, with reads past tolerance ("nothing held, the register's
+>      candidacy owed"): A-919's open edge, which (C) closes. Rerun after (C) lands.
+>   2. Runs 1 and 16: a green owed at version 2, placed 1, no read past tolerance: FIXED by w-interop (the entry below,
+>      a region read that waited out a dead first home).
 > - **FIXED (w-interop, 2026-11-27; main 01a20182's ruling of 12:37): a914's record barrier, placed Some(1) (its runs 1
 >   and 16 of 16).** Not durability: every object was served by a live home. A holder whose replica owed its push
 >   (P2) replayed the repository's replica store, reading each name it lacked from the region (`homes::read_in_region`),
@@ -377,6 +384,15 @@
 >   abandoned by its exchange and its session given back
 >   (`docs/bugs/2026-11-27-a-region-read-waited-out-a-dead-first-home.md`). Red first, two fleet tests: a dead first
 >   home and a slow one, each read 1,998,960,833 ns against a 1,998,000,000 ns budget before.
+> - **OPEN, a risk of that fix (main 01a20182's ruling of 2026-11-27 15:48; to be worked if measured): a live home slow
+>   past its share is cut, and the read moves on to a dead one.** The budget is shared over the homes asked, so with two
+>   homes the first gets half of it. Before the fix only the first home was ever asked: the read's outer bound
+>   (`xshard::task_in_shard_time`) ended at the same budget, so a live home slow under load answered within the whole of
+>   it. Now one slower than half is cut, and where the second home has just died the read gets nothing. Not seen yet:
+>   a914's regression at 41aa47870 logged no exchange cut near a share (every one ran the whole ~2 s), and its signature
+>   is a names log acknowledged by no host. The cut, when measured: a hedged read, where the first home's exchange goes on
+>   past its share while the next is asked, the first good answer taken and the other exchange finishing in a detached
+>   task that gives its session back.
 > - **OPEN, found by that fix's sweep (main's ruling of 12:37: reported, not fixed): other callers that wait a dead home
 >   out.** One home at a time, the whole budget each, so a dead home before a live one costs all of it:
 >   `homes::settle_in_region` (each home, each chunk), `homes::announce_rebuilt` (each repository's member) and
@@ -423,10 +439,14 @@
 >   bytes, refused 12,002 times; green: held 2 positions, the parts let go to 0. OWED (main): the TLC run of
 >   `FencedLedger_forget.cfg` (must hold) and `FencedLedger_forget_norule.cfg` (must fail Continuity), with the three
 >   older configurations (verdicts unchanged); the model is written, its run is not yet made.
-> - **OPEN, the open edge (A-919, the configuration's):** a newcomer whose read is past tolerance (the owner's hold
->   forgotten at its restart, the departed gone) adopts nothing, refused typed (`fleet.ledger_read.past_tolerance`),
->   and pins the owner's let-go of the register's parts. The answer is a candidate that cannot hold a register
->   leaving its candidacy. In the owner-restart test the push after was refused `unable to commit` too.
+> - **FIXED, the open edge (A-919 (C), w-shared, 2026-11-27; main 01a20182's ruling of 10:57):** a newcomer whose read
+>   was past tolerance (the owner's hold forgotten at its restart, the departed gone) adopted nothing and pinned the
+>   owner's let-go. The owner now keeps a committed floor per state log, the highest position it let go with the
+>   chain's digest, durable in its image beside its owed parts; its ledger-read answer carries it, and the fold adopts a
+>   single holder's prefix at or below it only where the digest matches (mismatch refused, a fault; uncovered refused as
+>   before). Red first: a919's owner-restart newcomer now holds the log from its first part and a's parts are let go.
+>   Model: `FencedLedger_floor_bounded` holds (TLC, 50,040,406 states, complete, bounded at one forget); the full
+>   `FencedLedger_floor`'s verdict is owed (no violation at 49.7M states when this landed).
 > - **A-921 (found by A-919's owner-restart scene; main 01a20182's rulings of 2026-11-25).** About 1 run in 3 to 5,
 >   a's warm restart outlasted detection (1.40 to 1.79 s of silence to the takeover installed): a was taken over,
 >   refuted at incarnation 1, and readmitted. A silence past detection is a death by design, and the false-death path
@@ -440,10 +460,16 @@
 >     `Behind { held }` and every push was refused. The parts owed now ride the shard's recovery image (image 36, delta
 >     14), are owed again at a warm start to every candidate, and are persisted before they ship. Red first, made
 >     deterministic (a holds its parts off the old holder). "held 1" is measured: every newcomer position at or above
->     a's restarted hold start. FIXED 2026-11-27 (w-perf; main's ruling of 13:42): a part's change mark toggled at its
->     let-go, so a part the last publication carried, let go, held again at its position and let go again kept its
->     piece in the next delta (the held-delta fold's proptest, w-svn's seed and diag 11's windows-latest). The mark now
->     records whether that publication carried the position; red the seed in `daemon.proptest-regressions`.
+>     a's restarted hold start. REVERTED 2026-11-27 (w-perf; main's ruling of 16:02): 43a8563a2 made a part's change
+>     mark record whether the last publication carried its position, so a let-go of a carried, marked part removed its
+>     piece in the next delta, where the toggle had left it. main's a914 bisect put a rise in its reds on it
+>     (c4d1c1bc0 3 of 6, 5fe9d8d0e 4 of 6 with a new "names log at Some(4), acknowledged []"; 41aa47870 13 of 16).
+>     The barrier's refusal is greens owed (v2 placed Some(1), a holder's replica building at 0), not the names log,
+>     which a forgotten log reads committed. Suspected mechanism, unproven: the piece the toggle left let a warm restart
+>     restore a let-go part and owe it again to every candidate, which fed a holder still building its replica; the
+>     correct removal took that away. OWED (w-shared, main's ruling of 16:06): a red, and a real path by which a lagging
+>     candidate gets the state-log parts it lacks; then the mark fix again. The fold's proptest stays seeded; under
+>     A-919 (C)'s floor its generator never holds a let-go position again, so the seed no longer reaches the toggle.
 >   - **FIXED, A-921's second mode's (2) (A-921 part 4, w-shared, 2026-11-27):** a's replay re-derived the green's
 >     pending v2 with a checkpoint floor of 0 where the old holder held 1, refused `ConflictingPosition` (19 a run, then
 >     uncounted on the merge path) so v2 never placed and every push was refused. A holder now joins a record differing
@@ -5293,7 +5319,11 @@
 > to every member of the region and held on each, acknowledged at `f + 1` (a revocation at every member), healed at each
 > configuration change, so a token proves its principal on a takeover's successor (w-balance's `v3_takeover`: 401 before,
 > authenticated after). A revocation leaves a tombstone the healer offers too, so a member partitioned through it lets
-> its record go and no member's offer enrolls a revoked credential again.
+> its record go and no member's offer enrolls a revoked credential again. **The retry (2026-11-27, diag CI 11; w-svn,
+> diagnosed by w-shared):** the same enrollment asked again after `CredentialUnreplicated` met `AlreadyExists` at the
+> enrolling partition, before any fan-out, so it never reached the rest. Now the very record held there is answered
+> enrolled and sent on to the region (`credential.enroll.repeated`); a different record under the id, or a revoked id,
+> stays `AlreadyExists` (`docs/bugs/2026-11-27-a-retried-enrollment-met-its-own-credential-already-held.md`).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads (A-545)
 > and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its objects and

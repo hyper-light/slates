@@ -375,3 +375,97 @@ fn a_part_let_go_before_any_publication_carried_it_leaves_no_change() {
     "the restored part's piece removed"
   );
 }
+
+/// A-919 (C): an owner's committed floor rises over the parts it lets go, in order, each continuing the chain from the
+/// log's start, the digest one link a part over its register value, and is marked changed for the next delta. Do: hold
+/// names parts 0..2 and 2..3; both candidates acknowledge through 2, then through 3. Expect the floor at 2 with
+/// `H(0^32 || part one)`, then at 3 with the next link, each time marked changed; a publication clears the mark.
+#[test]
+fn an_owners_committed_floor_rises_over_the_parts_it_lets_go_with_the_chains_digest() {
+  use slates_db::register::{CHAIN_BASE, CommittedFloor, chain_digest};
+  let repo = repository(11);
+  let (one, two) = (
+    part(repo, StateLog::Names, (0, 2)),
+    part(repo, StateLog::Names, (2, 3)),
+  );
+  let register = one.log_name().register();
+  let (b, c) = (HostId(2), HostId(3));
+  let mut logs = StateLogs::default();
+  logs.hold(&one);
+  logs.hold(&two);
+  assert_eq!(logs.floor(register), None, "nothing let go yet");
+  logs.acknowledged(register, 2, &[b, c]);
+  logs.let_go_held(register, &[b, c]);
+  let first = chain_digest(&CHAIN_BASE, &value_of(&one));
+  assert_eq!(
+    logs.floor(register),
+    Some(CommittedFloor {
+      position: 2,
+      digest: first
+    })
+  );
+  assert_eq!(
+    logs.floors_changed().count(),
+    1,
+    "the floor rides the next delta"
+  );
+  logs.clear_changed();
+  logs.acknowledged(register, 3, &[b, c]);
+  logs.let_go_held(register, &[b, c]);
+  assert_eq!(
+    logs.floor(register),
+    Some(CommittedFloor {
+      position: 3,
+      digest: chain_digest(&first, &value_of(&two))
+    })
+  );
+}
+
+/// A-919 (C), the base: an owner that never let go a chain from the log's start (a takeover's successor, whose first
+/// owed part continues from a later position) keeps no floor, and a part that does not continue the floor stops it.
+/// Do: let go a lone part from 5 to 6, then, on another log, a part from 0 to 2 followed by a stray from 4 to 5.
+/// Expect no floor on the first log, and the second's at 2.
+#[test]
+fn a_floor_rises_only_over_parts_that_continue_its_chain_from_the_logs_start() {
+  let repo = repository(12);
+  let late = part(repo, StateLog::Names, (5, 6));
+  let (start, stray) = (
+    part(repo, StateLog::Phases, (0, 2)),
+    part(repo, StateLog::Phases, (4, 5)),
+  );
+  let mut logs = StateLogs::default();
+  logs.hold(&late);
+  logs.hold(&start);
+  logs.hold(&stray);
+  logs.let_go_held(late.log_name().register(), &[]);
+  logs.let_go_held(start.log_name().register(), &[]);
+  assert_eq!(logs.floor(late.log_name().register()), None);
+  assert_eq!(
+    logs
+      .floor(start.log_name().register())
+      .map(|floor| floor.position),
+    Some(2)
+  );
+}
+
+/// A-919 (C), the guard (main 01a20182's ruling of 2026-11-27 12:52): a part at or below its log's committed floor is
+/// refused, as a position let go made again would be; one above it is held. Do: hold and let go a part from 0 to 2 (the
+/// floor at 2), then offer a part to 2 again and one from 2 to 3. Expect the first refused, the second held.
+#[test]
+fn a_part_at_or_below_its_logs_floor_is_refused() {
+  let repo = repository(13);
+  let first = part(repo, StateLog::Names, (0, 2));
+  let register = first.log_name().register();
+  let mut logs = StateLogs::default();
+  assert!(logs.hold(&first));
+  logs.let_go_held(register, &[]);
+  assert_eq!(logs.floor(register).map(|floor| floor.position), Some(2));
+  assert!(
+    !logs.hold(&part(repo, StateLog::Names, (1, 2))),
+    "a position let go"
+  );
+  assert!(
+    logs.hold(&part(repo, StateLog::Names, (2, 3))),
+    "the next position"
+  );
+}

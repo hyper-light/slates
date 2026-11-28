@@ -58,6 +58,34 @@
 (* FencedLedger_forget_norule.cfg, without it, must fail Continuity (a     *)
 (* forgotten holder's silence taken as a promise of nothing, a lower       *)
 (* epoch's surviving value adopted over the committed one).                *)
+(*                                                                          *)
+(* The forget's mark (main 01a20182's TLC of 2026-11-27 11:17): a holder   *)
+(* that forgot, then accepted again below a position it had held (a late    *)
+(* accept), took its start back to that position and promised nothing at   *)
+(* the positions it lost: Continuity failed in 17 states with the rule on.  *)
+(* Now a forget keeps a mark, the highest position the holder held, and an  *)
+(* accept at or below it never moves the start: the holder counts below it  *)
+(* only once it holds the prefix again.  ReadSafety is start-aware: a       *)
+(* majority's highest entry is every committed value at each position its  *)
+(* holdings all reach (a forgotten holder's silence is no report).          *)
+(* FencedLedger_forget_nomark.cfg, the rule without the mark, must fail     *)
+(* Continuity.                                                              *)
+(*                                                                          *)
+(* A-919 (C) (main 01a20182's ruling of 2026-11-27 10:57): an owner's       *)
+(* committed floor.  The owner lets a position go once every holder holds   *)
+(* its committed value there, and keeps, durably (its shard image, which a  *)
+(* forget never reaches), the highest such position with the chain's digest *)
+(* through it, modelled by the values themselves.  A holder holding none of *)
+(* the log reads it from the others without a promotion: past tolerance, it *)
+(* adopts a position on one report only at or below the floor, and only     *)
+(* where the reports match the floor's values (the digest).  A state log is *)
+(* never trimmed: each holder its owner's shipments fed holds it from its   *)
+(* first position, so a report covers the floor or the read is refused.     *)
+(* Only a holder that held none of the log reads it (a candidate a death    *)
+(* brings in).  FencedLedger_floor.cfg holds every invariant with           *)
+(* ReadNoLoss and ReadIsPrefix; FencedLedger_floor_nocheck.cfg, a single    *)
+(* report adopted at any position, must fail ReadNoLoss (a holder that kept *)
+(* a lower epoch's value where a higher one committed without it).          *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -72,15 +100,27 @@ CONSTANTS Acceptors,    \* the record holders, e.g. {a1, a2, a3}
                         \* which the checker must refute (non-vacuity)
           MaxForgets,   \* how many times any holder may forget its log
                         \* (A-919; 0 is the model before it)
-          StartRule     \* TRUE: a report names nothing only from its start
+          StartRule,    \* TRUE: a report names nothing only from its start
                         \* (A-919); FALSE: from the first position, which
                         \* the checker must refute once a holder forgets
+          ForgetMark,   \* TRUE: an accept at or below what a holder lost
+                        \* never moves its start; FALSE: A-919's rule
+                        \* before it, which the checker must refute
+          FloorRead,    \* TRUE: a forgotten holder may read the log on the
+                        \* owner's committed floor (A-919 (C)); FALSE: the
+                        \* model before it
+          FloorBound    \* TRUE: a single report adopted only at or below the
+                        \* floor, matching its values; FALSE: at any position,
+                        \* which the checker must refute
 
 ASSUME MaxEpoch \in Nat /\ MaxEpoch >= 1
 ASSUME MaxPos \in Nat /\ MaxPos >= 1
 ASSUME PerPosition \in BOOLEAN
 ASSUME MaxForgets \in Nat
 ASSUME StartRule \in BOOLEAN
+ASSUME ForgetMark \in BOOLEAN
+ASSUME FloorRead \in BOOLEAN
+ASSUME FloorBound \in BOOLEAN
 
 Majority == {Q \in SUBSET Acceptors : 2 * Cardinality(Q) > Cardinality(Acceptors)}
 
@@ -114,10 +154,19 @@ VARIABLES
   acks,         \* [Proposals -> SUBSET Acceptors]: phase-two acceptances
   start,        \* [Acceptors -> 1..NoStart]: the lowest position each holds (A-919)
   promStart,    \* [Epochs -> [Acceptors -> 1..NoStart]]: the start each reported
-  forgets       \* how many forgets happened
+  forgets,      \* how many forgets happened
+  lost,         \* [Acceptors -> 0..MaxPos]: the highest position each held when it forgot
+  floorPos,     \* 0..MaxPos: the owner's committed floor (A-919 (C))
+  floorVals,    \* [Positions -> Values \cup {"none"}]: its values through it (the digest)
+  readAdopted,  \* [Acceptors -> [Positions -> Values \cup {"none"}]]: what a read held
+  readSingle    \* [Acceptors -> [Positions -> Values \cup {"none"}]]: what it adopted past tolerance, on one report
 
 vars == <<epochOwner, nextEpoch, promise, accepted, promAcked, promVal, promoted,
-          adopted, log, nextPos, issued, stale, acks, start, promStart, forgets>>
+          adopted, log, nextPos, issued, stale, acks, start, promStart, forgets, lost,
+          floorPos, floorVals, readAdopted, readSingle>>
+
+\* The variables (C) adds, unchanged by every action but its own.
+floorVars == <<floorPos, floorVals, readAdopted, readSingle>>
 
 CommittedProposals == {r \in Proposals : acks[r] \in Majority}
 
@@ -143,13 +192,19 @@ Init ==
   /\ start = [a \in Acceptors |-> 1]
   /\ promStart = [e \in Epochs |-> [a \in Acceptors |-> NoStart]]
   /\ forgets = 0
+  /\ lost = [a \in Acceptors |-> 0]
+  /\ floorPos = 0
+  /\ floorVals = EmptyLog
+  /\ readAdopted = [a \in Acceptors |-> EmptyLog]
+  /\ readSingle = [a \in Acceptors |-> EmptyLog]
 
 MasterAssign(h) ==
   /\ nextEpoch <= MaxEpoch
   /\ epochOwner' = [epochOwner EXCEPT ![nextEpoch] = h]
   /\ nextEpoch' = nextEpoch + 1
   /\ UNCHANGED <<promise, accepted, promAcked, promVal, promoted, adopted, log,
-                 nextPos, issued, stale, acks, start, promStart, forgets>>
+                 nextPos, issued, stale, acks, start, promStart, forgets, lost>>
+  /\ UNCHANGED floorVars
 
 (***************************************************************************)
 (* Phase one, one holder at a time: it raises its promise to e and reports  *)
@@ -164,7 +219,8 @@ PromoteAck(e, a) ==
   /\ promVal' = [promVal EXCEPT ![e][a] = accepted[a]]
   /\ promStart' = [promStart EXCEPT ![e][a] = start[a]]
   /\ UNCHANGED <<epochOwner, nextEpoch, accepted, promoted, adopted, log, nextPos,
-                 issued, stale, acks, start, forgets>>
+                 issued, stale, acks, start, forgets, lost>>
+  /\ UNCHANGED floorVars
 
 (***************************************************************************)
 (* The owner of epoch e adopts, at every position, the value accepted under *)
@@ -194,7 +250,8 @@ Adopt(e) ==
   /\ adopted' = [adopted EXCEPT ![e] = IF PerPosition THEN PerPositionLog(e) ELSE TopLog(e)]
   /\ promoted' = [promoted EXCEPT ![e] = TRUE]
   /\ UNCHANGED <<epochOwner, nextEpoch, promise, accepted, promAcked, promVal, log,
-                 nextPos, issued, stale, acks, start, promStart, forgets>>
+                 nextPos, issued, stale, acks, start, promStart, forgets, lost>>
+  /\ UNCHANGED floorVars
 
 (***************************************************************************)
 (* Phase two, in order: the owner of e proposes its next position, the      *)
@@ -216,7 +273,8 @@ Propose(e, v) ==
         /\ log' = [log EXCEPT ![e][p] = value]
         /\ nextPos' = [nextPos EXCEPT ![e] = p + 1]
   /\ UNCHANGED <<epochOwner, nextEpoch, promise, accepted, promAcked, promVal,
-                 promoted, adopted, acks, start, promStart, forgets>>
+                 promoted, adopted, acks, start, promStart, forgets, lost>>
+  /\ UNCHANGED floorVars
 
 Accept(r, a) ==
   /\ r \in issued
@@ -225,22 +283,95 @@ Accept(r, a) ==
   /\ promise' = [promise EXCEPT ![a] = r.epoch]
   /\ accepted' = [accepted EXCEPT ![a][r.pos] = [epoch |-> r.epoch, value |-> r.value]]
   /\ acks' = [acks EXCEPT ![r] = acks[r] \cup {a}]
-  /\ start' = [start EXCEPT ![a] = IF r.pos < start[a] THEN r.pos ELSE start[a]]
+  \* An accept at or below the forget's mark never moves the start (it holds the position again, not what it lost).
+  /\ start' = [start EXCEPT ![a] =
+                IF r.pos < start[a] /\ ~(ForgetMark /\ r.pos <= lost[a]) THEN r.pos ELSE start[a]]
   /\ UNCHANGED <<epochOwner, nextEpoch, promAcked, promVal, promoted, adopted, log,
-                 nextPos, issued, stale, promStart, forgets>>
+                 nextPos, issued, stale, promStart, forgets, lost>>
+  /\ UNCHANGED floorVars
 
 (***************************************************************************)
 (* A-919: a holder forgets its log (an owner's hold rebuilt empty at a     *)
 (* restart; a candidate holding none of it): its entries and its start go; *)
 (* its promise stays (a holder's fence is durable).                         *)
 (***************************************************************************)
+\* The highest position `a` holds an entry at, 0 for none.
+HighestHeld(a) ==
+  LET held == {p \in Positions : accepted[a][p] # NoEntry}
+  IN IF held = {} THEN 0 ELSE CHOOSE p \in held : \A q \in held : p >= q
+
 Forget(a) ==
   /\ forgets < MaxForgets
   /\ accepted' = [accepted EXCEPT ![a] = [p \in Positions |-> NoEntry]]
   /\ start' = [start EXCEPT ![a] = NoStart]
   /\ forgets' = forgets + 1
+  /\ lost' = [lost EXCEPT ![a] = IF HighestHeld(a) > lost[a] THEN HighestHeld(a) ELSE lost[a]]
   /\ UNCHANGED <<epochOwner, nextEpoch, promise, promAcked, promVal, promoted, adopted,
                  log, nextPos, issued, stale, acks, promStart>>
+  /\ UNCHANGED floorVars
+
+(***************************************************************************)
+(* A-919 (C): the owner of a promoted epoch e lets its log go through k     *)
+(* once every position through k committed under e and every holder holds  *)
+(* its value there; the floor (and its digest, the values) is published    *)
+(* before anything below it is freed, so it only rises.                    *)
+(***************************************************************************)
+LetGo(e, k) ==
+  \* Only where the read on the floor is modelled: off, the floor is never read, and keeping it adds states for nothing.
+  /\ FloorRead
+  /\ promoted[e]
+  /\ k \in Positions
+  /\ k > floorPos
+  /\ \A p \in 1..k :
+       /\ log[e][p] # Nothing
+       /\ acks[[epoch |-> e, pos |-> p, value |-> log[e][p]]] \in Majority
+       /\ \A a \in Acceptors : accepted[a][p].value = log[e][p]
+  /\ floorPos' = k
+  /\ floorVals' = [p \in Positions |-> IF p <= k THEN log[e][p] ELSE Nothing]
+  /\ UNCHANGED <<epochOwner, nextEpoch, promise, accepted, promAcked, promVal, promoted,
+                 adopted, log, nextPos, issued, stale, acks, start, promStart, forgets, lost,
+                 readAdopted, readSingle>>
+
+(***************************************************************************)
+(* A-919 (C): holder n, a candidate a death brings in, holding none of the  *)
+(* log and having held none of it (it forgot holding nothing: its mark 0), *)
+(* reads it from the others (no promotion, no fence): at each position,    *)
+(* with a majority counted under the start rule, the highest report; past  *)
+(* tolerance, a single report only at or below the floor (FloorBound), and *)
+(* the whole read only where its values through the floor match the       *)
+(* floor's (the digest).  It holds the prefix it adopted, each entry as    *)
+(* reported.  A holder that acked and forgot (the owner's hold rebuilt at  *)
+(* a warm restart) never reads: in the product every ledger read runs on a *)
+(* holder's own acceptor, which persists across restarts, and the owner's  *)
+(* hold is never written by one (main 01a20182's TLC of 2026-11-27 12:52:  *)
+(* such a reader adopted a stale report while its own earlier ack's value  *)
+(* committed, failing ReadSafety).                                          *)
+(***************************************************************************)
+ReadAdopt(n) ==
+  /\ FloorRead
+  /\ start[n] = NoStart
+  /\ lost[n] = 0
+  /\ LET others == Acceptors \ {n}
+         counted(p) == {a \in others : start[a] <= p}
+         reports(p) == {accepted[a][p] : a \in counted(p)} \ {NoEntry}
+         within(p) == 2 * Cardinality(counted(p)) > Cardinality(Acceptors)
+         single(p) == reports(p) # {} /\ (FloorBound => p <= floorPos)
+         val(p) == IF reports(p) # {} /\ (within(p) \/ single(p))
+                     THEN Highest(reports(p)).value ELSE Nothing
+         reach == CHOOSE k \in 0..MaxPos :
+                    /\ \A p \in 1..k : val(p) # Nothing
+                    /\ (k = MaxPos \/ val(k + 1) = Nothing)
+     IN /\ reach >= 1
+        /\ FloorBound => \A p \in 1..floorPos : (p <= reach /\ ~within(p)) => val(p) = floorVals[p]
+        /\ readAdopted' = [readAdopted EXCEPT ![n] =
+                              [p \in Positions |-> IF p <= reach THEN val(p) ELSE Nothing]]
+        /\ readSingle' = [readSingle EXCEPT ![n] =
+                             [p \in Positions |-> IF p <= reach /\ ~within(p) THEN val(p) ELSE Nothing]]
+        /\ accepted' = [accepted EXCEPT ![n] =
+                           [p \in Positions |-> IF p <= reach THEN Highest(reports(p)) ELSE NoEntry]]
+        /\ start' = [start EXCEPT ![n] = 1]
+  /\ UNCHANGED <<epochOwner, nextEpoch, promise, promAcked, promVal, promoted, adopted,
+                 log, nextPos, issued, stale, acks, promStart, forgets, lost, floorPos, floorVals>>
 
 Next ==
   \/ \E h \in Hosts : MasterAssign(h)
@@ -249,6 +380,8 @@ Next ==
   \/ \E e \in Epochs, v \in Values : Propose(e, v)
   \/ \E r \in Proposals, a \in Acceptors : Accept(r, a)
   \/ \E a \in Acceptors : Forget(a)
+  \/ \E e \in Epochs, k \in Positions : LetGo(e, k)
+  \/ \E a \in Acceptors : ReadAdopt(a)
 
 Spec == Init /\ [][Next]_vars
 
@@ -272,9 +405,22 @@ AdoptedIsPrefix ==
 StaleNeverCommits ==
   stale \cap CommittedProposals = {}
 
+\* A-919 (C): what a read adopted past tolerance, on one report, is the value committed there. (What it adopted within
+\* tolerance is A-919's unfenced read, which a later accept may supersede in its holding; ReadSafety judges holdings.)
+ReadNoLoss ==
+  \A a \in Acceptors, p \in Positions, v \in Values :
+    (readSingle[a][p] # Nothing /\ Committed(p, v)) => readSingle[a][p] = v
+
+\* A-919 (C): what a read holds has no hole below a position it holds.
+ReadIsPrefix ==
+  \A a \in Acceptors, p \in Positions :
+    (p > 1 /\ readAdopted[a][p] # Nothing) => readAdopted[a][p - 1] # Nothing
+
+\* Start-aware: over a majority whose holdings all reach the position (a forgotten holder's silence there is no report).
 ReadSafety ==
   \A Q \in Majority, r \in CommittedProposals :
-    Highest({accepted[a][r.pos] : a \in Q} \ {NoEntry}).value = r.value
+    (\A a \in Q : start[a] <= r.pos) =>
+      Highest({accepted[a][r.pos] : a \in Q} \ {NoEntry}).value = r.value
 
 TypeOK ==
   /\ nextEpoch \in 1..(MaxEpoch + 1)
@@ -285,6 +431,8 @@ TypeOK ==
   /\ stale \subseteq issued
   /\ \A a \in Acceptors : start[a] \in 1..NoStart
   /\ forgets \in 0..MaxForgets
+  /\ \A a \in Acceptors : lost[a] \in 0..MaxPos
+  /\ floorPos \in 0..MaxPos
 
 \* Holders are interchangeable: TLC explores one ordering of them.
 Symmetric == Permutations(Acceptors)
