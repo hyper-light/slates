@@ -964,3 +964,9 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     - The doubling lines log at twice their own last mark (red (1, 1), green (12, 12)).
     - Focused slates-server set, 105 passing.
   - Next: the retention charge (held frees trued up to held_now at each borrow's end), red first.
+- 2026-11-28 04:39 PST (written then):
+  - BUILT, not on main: agents/w-perf-admission at dfbd22d11 (on 27691e4d2): held frees charged against admission
+    (reserve, trued up to held_now at borrow ends and lends), and seal's pool growth by make_room's rule (growth room
+    = claimable less debt; absorb_debt at hand-back). Reds: put kept / grown 262,144 past the debt, both scenes.
+    Focused 107 + admission-named 95.
+  - agents/w-perf-held-bytes stays at 27691e4d2 for main's queued 57k.
