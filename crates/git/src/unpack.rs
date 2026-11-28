@@ -15,7 +15,7 @@
 //! - `conclude_pack`, a delta never resolved refused ("pack has %d unresolved deltas").
 //!
 //! The pack's header and trailer are A-591's ([`pack::read_header`], [`pack::Refusal`]); each entry's header and each
-//! delta are A-582 part 3's ([`entry::read`], [`delta::apply`]); each name is A-600's ([`name_of`]). The inflater is
+//! delta are A-582 part 3's ([`entry::read`], [`delta::apply`]); each name is A-600's ([`name_of`](crate::object_name::name_of)). The inflater is
 //! flate2 over zlib-rs, the workspace's one deflate engine (A-607).
 //!
 //! **What it does.** [`Reader::read`] takes the bytes a stream has delivered, in any cuts, and reads as far as they go:
@@ -639,6 +639,10 @@ struct Made {
   hold: Hold,
 }
 
+/// What an entry's end settles beside `T`, its record or its delta's state: the object made, for its keeper, and the
+/// delta's buffer once applied, for the next entry.
+type Settled<T> = (T, Option<Made>, Option<Vec<u8>>);
+
 /// An object a delta is applied to: one of the pack's, or one outside it.
 struct Source<'s> {
   /// Its type.
@@ -799,8 +803,6 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     buffer.clear();
     if self.inflating.capacity() == 0 {
       self.inflating = buffer;
-    } else if self.making.capacity() == 0 {
-      self.making = buffer;
     } else if buffer.capacity() > self.making.capacity() {
       self.making = buffer;
     }
@@ -1098,7 +1100,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     stored: u64,
     (admission, keep): (&mut Admission, &mut K),
     making: &mut Vec<u8>,
-  ) -> Result<(Record, Option<Made>, Option<Vec<u8>>), Refusal> {
+  ) -> Result<Settled<Record>, Refusal> {
     let Data {
       header,
       began,
@@ -1194,7 +1196,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     at: u64,
     (admission, keep): (&mut Admission, &mut K),
     making: &mut Vec<u8>,
-  ) -> Result<(State, Option<Made>, Option<Vec<u8>>), Refusal> {
+  ) -> Result<Settled<State>, Refusal> {
     if let Base::Entry(entry) = base
       && let Applied::Made(made) =
         self.applied(entry, (&delta, expected), at, (admission, &*keep), making)?

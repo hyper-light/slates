@@ -114,3 +114,54 @@ impl Aside {
     into.specials.publish(self.specials);
   }
 }
+
+/// A commit's identity marks, written aside until its publish (A-752 part 3c U5; main 01a20182's rulings of
+/// 2026-11-28 02:46 and 02:47): the keys it changed, those whose entry it took out of the sum at their first change,
+/// and the entries it took. A reader's fold folds published keys alone, so it never reads the stage's changes into the
+/// sum. Inserts and no read; bounded by the keys the commit changes.
+#[derive(Default)]
+pub(super) struct IdentityAside {
+  dirty: std::collections::BTreeSet<super::IdentityKey>,
+  out: std::collections::BTreeSet<super::IdentityKey>,
+  taken: Vec<crate::identity::Entry>,
+}
+
+impl core::fmt::Debug for IdentityAside {
+  fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    formatter
+      .debug_struct("IdentityAside")
+      .field("dirty", &self.dirty)
+      .field("out", &self.out)
+      .field("taken", &self.taken.len())
+      .finish()
+  }
+}
+
+impl IdentityAside {
+  /// `key` changed by the commit: whether it is the commit's first change of it.
+  pub(super) fn dirty(&mut self, key: super::IdentityKey) -> bool {
+    self.dirty.insert(key)
+  }
+
+  /// `key`'s entry, `entry`, taken out of the sum at its first change (`Green::mark_dirty`).
+  pub(super) fn taken(&mut self, key: super::IdentityKey, entry: crate::identity::Entry) {
+    self.out.insert(key);
+    self.taken.push(entry);
+  }
+
+  /// Moves the marks in at the commit's publish: each key dirty and out, each entry taken out of `identity`.
+  pub(super) fn publish_into(
+    self,
+    (dirty, out, identity): (
+      &mut std::collections::BTreeSet<super::IdentityKey>,
+      &mut std::collections::BTreeSet<super::IdentityKey>,
+      &mut crate::identity::SetHash,
+    ),
+  ) {
+    for entry in &self.taken {
+      identity.remove(entry);
+    }
+    out.extend(self.out);
+    dirty.extend(self.dirty);
+  }
+}

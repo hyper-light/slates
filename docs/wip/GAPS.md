@@ -4320,10 +4320,12 @@
 > last-turn units and quanta counted again. Part 3c (the engine's commit staged and published whole, main's rulings of
 > 2026-11-28 00:42 to 01:42): U0 BUILT, every read names its version; U1 BUILT, the head bump and `accepted` at the
 > publish, last, and the mode history appended in place and taken back at a refusal; U2 BUILT, every value history
-> alike; U3 BUILT, the change index; U4 BUILT, `file_removed` and the `*_changed` maps written aside (design's part
-> 3c); owed: the
-> identity, the current-state Dims (w-svn: deltas, the identity's sets, `latest_change`, `last_changed` and the change index as arena conversions, keeping U0's bounded reads), and the
-> content history after A-920 arena unit 1. Found by reading (2026-11-28, not worked): `file_removed` keeps only a
+> alike; U3 BUILT, the change index; U4 BUILT, `file_removed` and the `*_changed` maps written aside; U5 BUILT, the
+> identity's marks aside and its published backlog drained first (design's part 3c); owed: the current maps forked
+> into the stage (the eight Dims, and w-svn's arena conversions of the deltas, the identity's sets, `latest_change`,
+> `last_changed` and the change index, keeping U0's bounded reads), deleting U5's drain-first rule with them; the
+> commit's scalars written back at the publish; and the content history (A-920 arena unit 1 landed), its stage
+> copies holding their chunks. Found by reading (2026-11-28, not worked): `file_removed` keeps only a
 > path's latest removal, so `stack::levels`'s `== version` read (`levels.rs`:293) and its span read (:326) miss an
 > earlier removal that a later one overwrote.
 >

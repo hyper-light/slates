@@ -1652,8 +1652,8 @@ impl Green {
     }
     for path in &tree.specials {
       self
-        .identity_dirty
-        .insert(IdentityKey::Special(path.clone()));
+        .identity_aside
+        .dirty(IdentityKey::Special(path.clone()));
       self.remove_special(path.clone(), version);
     }
     let mut staged = super::Staged::default();
