@@ -8073,6 +8073,14 @@
 > under it. The same matrix on the Mac Studio (release 907c246ac, load 13-30) was 24 of 24 with no spin. git v2.0.0 on
 > the same Linux run: 26 of 27, two spins in `git_encode.rs:359` (`settle_encodings`, w-k90-vendor's encode spin) and
 > no kill; deepen's bad pack is w-bugs'. Report: adacachy `~/.cache/w-interop/r-linuxc-2239.txt`, anchor logs beside it.
+> Deepen's bad pack checked on today's main (w-git, 2026-11-28, main's order of 00:33): w-interop bisected it on
+> 2026-11-21 to the matrix's annotated tag pushed and deleted before the row ran (deepen over a fresh v2.0.0 passed
+> every N 1 to 100), the whole-clone failure of the same night to git/git's annotated tags, which A-855 then fixed (an
+> answer was admitted one ring region, 256 KiB). The row's sequence through the daemon's edge, history, tag push, tag
+> delete, then `fetch --deepen 100` from a shallow clone, answers whole now:
+> `vcs_http::daemon_edge::tests::a_shallow_clone_is_deepened_whole_after_an_annotated_tag_was_pushed_and_deleted`. Stock
+> git's own row, and its seconds against the 217 s of 2026-11-20, are read in main's v2.0.0 matrix run under load
+> (run-requests.md, 2026-11-28).
 > The restarted daemon's start spin (`daemon.rs:1186`, `start_shard`, "the most CPU in one [slice] 962,859 µs, ending
 > at unit 1") was the catalog's whole replay in one unit of the sliced start: it is replayed a record a unit since this
 > change (w-bugs; `a_shards_start_replays_its_catalog_a_record_a_unit`, 256 records in one unit before, 1 after).
