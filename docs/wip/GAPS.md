@@ -4243,7 +4243,11 @@
 > 1.5 and commit 0.2 (w-git's). Part 3b CLOSED the step that ran the build's last turn and the landing in one poll
 > (80.8 + 42.8 = 124 ms; now the landing is a step of its own). Next: the engine's commit, sliced as the paths map was.
 > A-658 3c (the owner's judging under load) waits: creates measured at about 1e-6 of the answer time (main's bench
-> 2026-11-27, R=100); an update's judging is measured only here.
+> 2026-11-27, R=100); an update's judging is measured only here. Found by reading (2026-11-28, w-shared, in part 3b; not worked, main's
+> ruling: no test or round shows it costing anything yet): a create command's `ServerJudge::build_turn` builds
+> nothing (`Verdicts::prepare` reaches its greens and returns), yet the turn is counted with whatever step report the
+> push's `preparing` still holds, an earlier command's or none: `push.build.turns` one more, and an earlier command's
+> last-turn units and quanta counted again.
 >
 > **A-760 (2026-11-20, w-engine; main's ruling ~09:10, "1b"):** part 1 BUILT: an increment names content by identity
 > (`Increment::named`, plain BLAKE3 + length), read a slice a step through the owner's `named::Objects`, refused
