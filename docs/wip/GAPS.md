@@ -1197,7 +1197,11 @@
 > one's children left the phase's place before the first, so the next decided it again and refused the revision
 > `DeleteModify` (`Green::decide_rmdirs_some`, A-920's ee0c95e8f). Each decided directory now keeps its place. Bug
 > record `docs/bugs/2026-11-27-an-imports-directory-removals-were-judged-again-over-a-half-made-count.md`; a refused
-> staging now logs what the member holds and the work does there (`ImportBatch::refusal_logged`).
+> staging now logs what the member holds and the work does there (`ImportBatch::refusal_logged`). Its sibling, latent:
+> the ptrie's removal descent (`ptrie::remove_at`) went on past a child's label without checking the key held it, so
+> below the root removing "ax" beside "ab" took "ab"'s value; `Ptrie::remove` asks `get` first, so no caller met it.
+> Now matched as `get` matches it; the sweep found every other descent (`get`, `insert_at`, `graft_at`, `cut_at`,
+> `under_any`) already matching its labels whole. The oracle asserts an absent key's removal copies no node.
 
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
