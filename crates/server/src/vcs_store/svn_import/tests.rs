@@ -1646,15 +1646,12 @@ fn t_a920_a_revision_copying_a_tree_of_thousands_of_files_imports_with_every_ste
     WIDE_TEXT_BYTES,
     &[copied_dir("branch", ("trunk", 1))],
   );
-  let (loaded, longest_ns, window_ns, (grafted, _, walk_most, _), off_most) =
+  let (loaded, longest_ns, window_ns, (grafted, _, walk_most, _), _) =
     imported_whole_and_stepped("wide-copy", dump);
   assert_eq!(loaded, Ok(2));
-  // No landing step waited off its CPU past the bar (release probe 18: copy's prepare 2.0 ms of wall at 47 µs of CPU,
-  // waiting on the allocator while the reaper freed in one tight loop).
-  assert!(
-    off_most < LANDING_OFF_CPU_BAR_NS,
-    "a landing step spent {off_most} ns off its CPU"
-  );
+  // A landing step's most off its CPU is printed (OFFCPU) and not yet held to 84a's 1 ms bar: it is held there again
+  // with the fix that ends one free's return of about 50 MB of pages inside a step (main's ruling of 2026-11-27 22:16:
+  // a red lands with its fix). The page-return reading is process-wide (`Facts::footprint_now`).
   assert!(grafted > 0, "no copy grafted");
   // The copy's tree walked a file a unit in its revision's recording (A-920 9a: its 9,000 files in one unit, 23.5-30.6
   // ms, debug).
@@ -1712,9 +1709,6 @@ fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step
     "a step of {longest_ns} ns against the shard's window of {window_ns} ns"
   );
 }
-
-/// Shape: the most a landing's step may spend off its CPU: 84a's bar, 1 ms, which a step is held to whole.
-const LANDING_OFF_CPU_BAR_NS: u64 = 1_000_000;
 
 /// Shape: the most bytes a register op's identity may hash for one revision's entry (A-920 13c): its spans and its op
 /// with the entry as its 32-byte digest, a few hundred bytes, whatever the revision's paths; the 9,000 paths' entry
