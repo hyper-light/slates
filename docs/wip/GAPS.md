@@ -1294,10 +1294,14 @@
 > ruling of 2026-11-28 00:38), so a lookup reads no store for a short label: warmed, `get` at 9,000 keys had run at
 > about 1.16 times the tree's median before the arena with every label a run (52.9 against 45.6 ns); the node stays
 > 56 bytes (the inline form's 4 bytes past a run's fall in padding the node had). Its bound is stated on `ptrie::Nodes` (main's ruling of 00:03: no accounting charges the current
-> maps, the finding above, so (a) the retention charge is not owed under the freeze). Owed: (b) a dead
-> arena's chunks freed on its own shard a chunk at a time in the release step, the reaper handed only the rest. Until
-> (b), a dead arena's chunks still go to the reaper, as a few dozen 4 KiB frees, not thousands. Then unit 1:
-> `Green::content_history` onto `Dim`, and the remains' other fields by bytes.
+> maps, the finding above, so (a) the retention charge is not owed under the freeze). Next, unit 1 (main's ruling of
+> 2026-11-28 01:04): `Green::content_history` joins the lineage's `dims::Arenas` like the green's other maps, one arena
+> a lineage, released into it a node a step and reused by the next member, so no chunk is freed on any landing; then the
+> remains' other fields by bytes. (b), narrowed: on the landing path a retired member releases into the lineage's
+> arenas, which live on, so the remains the reaper gets hold no chunks; chunks die only where a whole lineage is reaped
+> (`greens.rs`, `reaped.whole(Box::new(lineage))` once a repository's last member goes) and where a lone green is
+> dropped. Worked only if a figure shows either in a step; a lineage's reap is a cross-thread free of all its chunks,
+> so a round that drops a large repository is where it would show.
 
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
