@@ -848,3 +848,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 ## 2026-11-27 22:58 PST: A-658 3c measure first (slates 36bd21cad, 7f6af7ae4)
 - git_push.judge_ns / judge_ns_most timed on the owner (unit red), takeover_round GAPS evidence; multi_repo_load prints them and the summed push times.
 - Sent main the bench command; 3c waits on its figures. Main's diags: winfleet-4 32/32 both lanes (a935, a921 fixes hold); fuse-1 green (family three closed).
+
+## 2026-11-28 00:00 PST: A-752 part 3 re-measured; 3b (a build's last turn no longer lands in its step)
+- Phases on main 7f6af7ae4 (t_a752 debug 1,500 files, update): landing 42.8/38.6 ms; engine commit 15.6/14.2, verdict 9.7/8.5, hold_increments 3.9/3.7, secure 3.9/3.5, recorded entry 2.7/2.4, paths advance 2.5/2.3; git record 1.6/1.5, commit 0.2. Logs ~/.local/state/w-shared/logs/a752-probe-{1,2}.log, probes patch a752-probes.patch.
+- 124 ms step = last build turn (80.8, A-783 ceiling) + landing in one poll. 3b red (Drive::built_and_landed 1, 127 ms step) then green (build_turn hands the step back); double count of re-entered turns fixed. Commit d7b76b1a1, merged; landing after git_push rerun.
+- 3c waits (main's bench: creates ~1e-6 of answer time). Next: the engine's commit sliced; a921 windows-arm diag (winfleet-5) may go first.
