@@ -887,14 +887,22 @@
 >     15). `Repository::read_stored_waited` answers the let-go a read met and writes no slot, so each reader notes its
 >     own and never a stale one. Red: `b1_a_note_cleared_on_the_repository_between_a_pushs_stop_and_its_driver_leaves_
 >     the_push_its_own` (`missing necessary objects` before).
-> **OPEN (w-git, 2026-11-26): the repository's one wait slot is still shared by every owner but a push**, and each can
-> lose another's note of a let-go window: a derivation's turn clears it at its start (`git_derive::turn`), the
-> encoding's read clears it (`store/encoding.rs`) and takes it, a fetch's stream clears it before every read
-> (`store/upload.rs` `read_or_stop`) and its edges and answer take it, and a green build and a replica build take it
-> (`green_ready`, `replica_build`). A lost note is a window not brought back, so that owner's read refuses typed where
-> it should have waited. The fix is B1's: each owner its own `Waits`. Also still on the repository's slot from inside a
-> push: the admission's peel and references (B3), which refuse anyway until B3 moves them onto the push's slot. The
-> upload stream's and the encoding's stop rules are their own copies of the one rule, keyed by a window's place, not
+> **LATENT, not lost by use today (w-git, 2026-11-26; read again 2026-11-28, main's ruling of 01:19): the repository's
+> one wait slot is still shared by every owner but a push**, so any reader may clear another's note of a let-go window.
+> Today every owner takes its note in the same poll as the read that set it, on a shard that runs one task at a time, so
+> no other owner runs between a note and its take: the green build and the replica build right after their unit
+> (`green_ready.rs` after `building`'s advance, `replica_build.rs` likewise); the edges' answers inside their lend
+> (`vcs_http/git/upload.rs`, `vcs_ssh/git.rs`, `answer.rs`'s held refusal, which the filter and shallow walks end in
+> before any pack is begun); the stream's `read_or_stop` and its delta base's read, and the encoding's reads, each in
+> the same call (`store/upload.rs`, `store/encoding.rs`); a derivation's turn after its refusal
+> (`git_derive::turn_lent`); and `encode_within`'s `brought_back_waited` right after its `turn`, with no await between.
+> The slot is cleared only at five sites (a derivation's turn's start, two encoding reads, `read_or_stop` and the
+> stream's base read), and none runs inside another owner's unit between a miss and its take. Still writing the shared
+> slot from inside a push: the admission's peel and references (B3), which refuse anyway until B3 moves them onto the
+> push's slot. The hardening, not worked under the freeze: each owner reads in a scope of its own
+> (`Repository::reading_quietly`, as B3's admission turn does) and the shared slot is removed, with a unit red (owner
+> A's read notes a let-go, owner B's read on the same repository runs, A takes its note: none today, its window after).
+> The upload stream's and the encoding's stop rules are their own copies of the one rule, keyed by a window's place, not
 > its let-go's number (`Upload::stop_at`; the encoding's `stopped_at` set never waits twice for one window in a whole
 > encoding): owed onto `slates_git::away::WaitOnce`, as B1's readers are.
 > - **B1b BUILT (w-git, 2026-11-26): unpack's read of an in-pack base back from the quarantine** (`Reader::applied`),
