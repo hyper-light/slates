@@ -275,11 +275,117 @@ pub(crate) const PURGE_KEPT_SHORT: &str = "repository.svn_import.purged_kept_sho
 /// budget, as the step bounds itself. Its last slice yields too, so what the caller runs next begins a step of its own
 /// ([`super::section_yield`], A-920 7c). None where the shard's state is gone.
 async fn until_done(mut step: impl FnMut(&mut ShardState) -> bool) -> Option<()> {
-  while !crate::state::with_state(&mut step)? {
+  while !crate::state::with_state(|state| step_off_cpu_kept(state, &mut step))? {
     slates_rt::futures::yield_now().await;
   }
   super::section_yield().await
 }
+
+/// One step of a landing's section, its time off its thread's CPU kept the most of ([`LANDING_OFF_CPU_MOST_NS`]), and in
+/// tests whether the allocator handed pages back to the system during it ([`returned`]). Release probe 18 read copy's
+/// prepare at 2.0 ms of wall on 47 µs of CPU; debug logs put it in steps where one free returned about 40 MB of pages
+/// (1.7-2.5 ms off the CPU; main's ruling of 2026-11-27 20:31). Whether the section is done.
+fn step_off_cpu_kept(
+  state: &mut ShardState,
+  step: &mut impl FnMut(&mut ShardState) -> bool,
+) -> bool {
+  #[cfg(test)]
+  let footprint = slates_machine::facts::Facts::footprint_now();
+  let (began, cpu) = (slates_rt::futures::now_ns(), thread_cpu_ns());
+  let done = step(state);
+  let wall = slates_rt::futures::now_ns().saturating_sub(began);
+  let off = wall.saturating_sub(thread_cpu_ns().saturating_sub(cpu));
+  if off
+    > state
+      .refusals
+      .get(LANDING_OFF_CPU_MOST_NS)
+      .copied()
+      .unwrap_or(0)
+  {
+    state.refusals.insert(LANDING_OFF_CPU_MOST_NS, off);
+    #[cfg(test)]
+    returned::slowest(footprint, off);
+  }
+  #[cfg(test)]
+  returned::step(footprint, off);
+  done
+}
+
+/// Whether the allocator handed pages back to the system during a landing's steps (main's order of 2026-11-27 20:19,
+/// which told the page return from a wait on the allocator's lock): each step whose process footprint fell (`Facts::footprint_now`, macOS's `phys_footprint`), how many and
+/// their time off the CPU, and how far it fell in the step that spent the most off its CPU. Tests only: two reads of
+/// the footprint a step, for the measurement.
+#[cfg(test)]
+pub(crate) mod returned {
+  use std::cell::Cell;
+
+  /// What the calling thread's landing steps saw of pages handed back ([`taken`]).
+  #[derive(Clone, Copy, Debug, Default)]
+  pub(crate) struct Returned {
+    /// The steps the process footprint fell in.
+    pub(crate) steps: u64,
+    /// Their time off the CPU, nanoseconds.
+    pub(crate) off_ns: u64,
+    /// The bytes the footprint fell in all.
+    pub(crate) bytes: u64,
+    /// How far it fell in the step that spent the most off its CPU, and that step's off-CPU time.
+    pub(crate) slowest: (u64, u64),
+  }
+
+  std::thread_local! {
+    static RETURNED: Cell<Returned> = const {
+      Cell::new(Returned { steps: 0, off_ns: 0, bytes: 0, slowest: (0, 0) })
+    };
+  }
+
+  /// How far the footprint read before a step as `before` has fallen now.
+  fn fallen(before: Option<u64>) -> u64 {
+    match (before, slates_machine::facts::Facts::footprint_now()) {
+      (Some(before), Some(now)) => before.saturating_sub(now),
+      _ => 0,
+    }
+  }
+
+  /// A step that spent `off` nanoseconds off its CPU, the footprint `before` it.
+  pub(super) fn step(before: Option<u64>, off: u64) {
+    let fell = fallen(before);
+    if fell == 0 {
+      return;
+    }
+    RETURNED.with(|kept| {
+      let mut now = kept.get();
+      now.steps = now.steps.saturating_add(1);
+      now.off_ns = now.off_ns.saturating_add(off);
+      now.bytes = now.bytes.saturating_add(fell);
+      kept.set(now);
+    });
+  }
+
+  /// The step that spent the most off its CPU so far, `off`, the footprint `before` it.
+  pub(super) fn slowest(before: Option<u64>, off: u64) {
+    let fell = fallen(before);
+    RETURNED.with(|kept| {
+      let mut now = kept.get();
+      now.slowest = (fell, off);
+      kept.set(now);
+    });
+  }
+
+  /// What the calling thread's landing steps saw so far, cleared.
+  pub(crate) fn taken() -> Returned {
+    RETURNED.with(|kept| kept.replace(Returned::default()))
+  }
+}
+
+/// The calling thread's CPU time, nanoseconds; zero where the platform reads none.
+fn thread_cpu_ns() -> u64 {
+  slates_rt::registry::calling_thread_cpu().map_or(0, |reading| reading.spent_ns)
+}
+
+/// Gauge: the most nanoseconds one landing's step spent off its thread's CPU, whatever held it
+/// ([`step_off_cpu_kept`]): the measure of the allocator's page return inside a step (main's ruling of 2026-11-27
+/// 20:31), held to 84a's bar by the wide copy test. Format: a counter name in the daemon's status report.
+pub(crate) const LANDING_OFF_CPU_MOST_NS: &str = "repository.svn_import.landing_off_cpu_most_ns";
 
 /// Unpins `texts` from `at`, a text a unit, until the shard's clock passes `deadline_ns`, at least one: whether every one
 /// is ([`Staging::land`]).

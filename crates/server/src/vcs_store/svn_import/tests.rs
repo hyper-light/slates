@@ -1163,7 +1163,7 @@ fn copied_dir(to: &str, (from, rev): (&str, u64)) -> String {
 }
 
 /// [`imported_whole_and_stepped`]'s reading: the youngest revision, the longest step, its window, and the copies grafted.
-type ImportedWholeAndStepped = (Result<u64, String>, u64, u64, (u64, u64, u64, u64));
+type ImportedWholeAndStepped = (Result<u64, String>, u64, u64, (u64, u64, u64, u64), u64);
 
 /// `dump` imported on a store-backed shard: its youngest revision, the shard's longest step and its window, and the
 /// copies the green grafted (`Green::copies_grafted`).
@@ -1195,6 +1195,18 @@ fn imported_whole_and_stepped(name: &'static str, dump: Vec<u8>) -> ImportedWhol
       });
       let (longest_ns, longest_task) = longest_poll();
       print_phases(name);
+      // Each landing step's most off its CPU, and the steps the allocator handed pages back in (`staging::returned`).
+      let off_cpu = on(|state| {
+        use crate::repository::svn_commit::staging::{LANDING_OFF_CPU_MOST_NS, returned};
+        let back = returned::taken();
+        let most = count(state, LANDING_OFF_CPU_MOST_NS);
+        eprintln!(
+          "OFFCPU {name} landing_off_cpu_most_ns={most} returned_steps={} returned_off_ns={} returned_bytes={} \
+           slowest_fell_bytes={} slowest_off_ns={}",
+          back.steps, back.off_ns, back.bytes, back.slowest.0, back.slowest.1
+        );
+        most
+      });
       (
         loaded
           .map(|loaded| loaded.youngest)
@@ -1203,6 +1215,7 @@ fn imported_whole_and_stepped(name: &'static str, dump: Vec<u8>) -> ImportedWhol
         crate::watchdog::own_window_ns(),
         (grafted, build_units, walk_most, gone_most),
         longest_task,
+        off_cpu,
       )
     })
   });
@@ -1219,7 +1232,11 @@ fn imported_whole_and_stepped(name: &'static str, dump: Vec<u8>) -> ImportedWhol
     read.3.2,
     read.3.3
   );
-  (read.0, read.1, read.2, read.3)
+  eprintln!(
+    "{name}: a landing step's most off its CPU {} us",
+    read.5 / 1000
+  );
+  (read.0, read.1, read.2, read.3, read.5)
 }
 
 /// Yields until no checkpoint of the calling shard is taken in turns, at most [`TURN_LIMIT`] times: what a test that
@@ -1629,9 +1646,15 @@ fn t_a920_a_revision_copying_a_tree_of_thousands_of_files_imports_with_every_ste
     WIDE_TEXT_BYTES,
     &[copied_dir("branch", ("trunk", 1))],
   );
-  let (loaded, longest_ns, window_ns, (grafted, _, walk_most, _)) =
+  let (loaded, longest_ns, window_ns, (grafted, _, walk_most, _), off_most) =
     imported_whole_and_stepped("wide-copy", dump);
   assert_eq!(loaded, Ok(2));
+  // No landing step waited off its CPU past the bar (release probe 18: copy's prepare 2.0 ms of wall at 47 µs of CPU,
+  // waiting on the allocator while the reaper freed in one tight loop).
+  assert!(
+    off_most < LANDING_OFF_CPU_BAR_NS,
+    "a landing step spent {off_most} ns off its CPU"
+  );
   assert!(grafted > 0, "no copy grafted");
   // The copy's tree walked a file a unit in its revision's recording (A-920 9a: its 9,000 files in one unit, 23.5-30.6
   // ms, debug).
@@ -1661,7 +1684,7 @@ fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step
     WIDE_TEXT_BYTES,
     &[copied_dir("branch", ("trunk", 1)), moved],
   );
-  let (loaded, longest_ns, window_ns, (grafted, build_units, walk_most, gone_most)) =
+  let (loaded, longest_ns, window_ns, (grafted, build_units, walk_most, gone_most), _) =
     imported_whole_and_stepped("wide-move", dump);
   // The move's delete of the trunk walked, noted gone and its paths made ops a path a unit in its build (A-920 9b: the
   // row 13.7 ms and the build's end 6.6 ms for 9,001 paths in one unit each, debug; and its tree listed whole in the
@@ -1689,6 +1712,9 @@ fn t_a920_a_revision_moving_a_tree_of_thousands_of_files_imports_with_every_step
     "a step of {longest_ns} ns against the shard's window of {window_ns} ns"
   );
 }
+
+/// Shape: the most a landing's step may spend off its CPU: 84a's bar, 1 ms, which a step is held to whole.
+const LANDING_OFF_CPU_BAR_NS: u64 = 1_000_000;
 
 /// Shape: the most bytes a register op's identity may hash for one revision's entry (A-920 13c): its spans and its op
 /// with the entry as its 32-byte digest, a few hundred bytes, whatever the revision's paths; the 9,000 paths' entry

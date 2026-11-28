@@ -1208,6 +1208,18 @@
 > Now matched as `get` matches it; the sweep found every other descent (`get`, `insert_at`, `graft_at`, `cut_at`,
 > `under_any`) already matching its labels whole. The oracle asserts an absent key's removal copies no node.
 
+> **Open, measured red on main (A-920, w-svn, 2026-11-27; main's ruling of 20:31): one free returns about 40 MB of pages
+> to the system inside a landing's step.** Release probe 18 read copy's prepare at 2.0 ms of wall on 47 µs of CPU.
+> Debug logs, a footprint read before and after each landing step (`staging::returned`): the slowest step spent 1.7 ms
+> off its CPU while the process footprint fell 40.1 MB, the steps pages were returned in held all of a run's off-CPU
+> time (1.7-2.5 ms), and a run with no return during a landing step spent at most 18 µs off its CPU although 1,218 steps
+> met the reaper dropping. So it is the page return, not the reaper's drops, and neither slicing the reaper's drops
+> (measured: 804-2,442 µs, no better) nor dropping on the shard can split one return. The wide copy test holds
+> `LANDING_OFF_CPU_MOST_NS` to 84a's 1 ms bar and fails where a return stalls a step (2 of 4 debug runs; another run's
+> 8 return steps, 71 MB, stalled none, at most 22 µs off its CPU, so the stall is intermittent): the red the arena piece turns
+> green (the landing's structures in the shard's arena, so a free never hands pages back mid-step). Unexplained, logged,
+> not attributed: one run's 5,025 µs in a step whose footprint did not fall.
+
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
 > turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history
