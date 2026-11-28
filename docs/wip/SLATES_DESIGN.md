@@ -66500,6 +66500,29 @@ Applied in the same change to:
   saw it not yet re-keyed, so the test's own looks (one control-shard question a node in turn) add nothing, and its
   bound is the restarted node's detection plus both nodes' measured wake lateness (`detector_granularity_ns`), never a
   bare 1 s. Diag 10's Windows x86_64 lane met node 2 first seen at 1,010 ms: a timer tick of 15.625 ms on each look.
+- **Amended, the re-key window** (2026-11-28, w-shared; main 01a20182's ruling of 00:42; winfleet-5 and -6 on
+  windows-11-arm, 5 and 7 runs in 16 of the answers-peers test). The rule that a peer re-keys a restarted node within
+  one detection did not fit SWIM: until a peer re-keys it, its probes reach the node under its old process's keys,
+  unanswered, the node cannot refute a suspicion it cannot hear, and the detector condemns it two or three periods
+  later. That is not under any floor (`detection_bound` is an upper bound and the detector keeps none), but at 65 to
+  87 ms periods it is 327 to 669 ms, before the slower host's re-key (run 3: the new process listening at 502.914 s,
+  the condemnation pending at 503.140). Now a peer that learns a member's process restarted (`note_reconnected`: a
+  changed process nonce) opens the member's re-key window (`PlaneState::rekeying`), and its detector holds the
+  member's probes unjudged (`MemberPlane::hold_judging`, a local change to vendored hyper-swim, its README's item 4):
+  an unanswered one is counted (`fleet.plane.rekey_unjudged`), never suspecting the member or making its condemnation
+  pending. The window closes at the re-key's install (the installed epoch's process the one last announced,
+  `fleet.plane.rekey_closed.keyed`) or one detection after it opened (`fleet.plane.rekey_closed.expired`), checked
+  on the member loop's own turn, no timer of its own; bounded by the fleet's peer capacity. **Bound:** a process that
+  dies just after its restart is condemned within one detection plus `detection_bound`; that is the window's price,
+  paid only while it is open. The takeover's preconditions are unchanged: it reads condemnations as before, later by
+  at most the window. Red first: at the plane (`crates/cluster/tests/member_plane.rs`
+  `a_restarted_member_held_unjudged_through_its_rekey_is_condemned_only_once_released`), a silent member held by both
+  holders is condemned by neither while held, six of its probes held each (red with the hook a no-op: condemned while
+  held), and by both once released; at the window (`member_task` tests), it opens at a changed process and closes at
+  the re-key, or at one detection when never re-keyed (red with the opening a no-op). Applied to
+  `vendor/hyper-raft/hyper-swim/src/detector.rs` (`Detector::{hold_judging, unjudged}`, `PeerReport::unjudged`),
+  `crates/cluster/src/member_plane.rs`, `crates/server/src/member_task.rs`, the vendor README, GAPS,
+  `docs/bugs/2026-11-28-a-warm-restarted-node-was-condemned-before-its-peers-re-keyed-it.md`.
 
 ### A-932 — A merge record names its green's lineage, and a holder makes a green standing alone at once (2026-11-27, w-interop for main 01a20182, its ruling (a) of 2026-11-27 07:06 and its approval of 07:08; the fleet suite's red; amends A-908 and A-908 part 4; A-636 part 2b-2, A-145, A-255)
 
