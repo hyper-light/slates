@@ -2851,11 +2851,13 @@ mod tests {
     );
   }
 
+  /// What [`lent_step_scene`] read: the slices paid and whether the cut ended, inside the lend and after the outer
+  /// borrow's end, then the frees held and their bound.
+  type LentStepOutcome = ((u64, bool), (u64, bool), (u64, u64));
+
   /// [`a_lent_steps_frees_are_paid_at_its_outer_borrows_end`]'s scene: the slices paid and whether the cut ended, inside
   /// the lend and after the outer borrow's end; the frees held then, and their bound.
-  fn lent_step_scene(
-    state: &mut crate::state::ShardState,
-  ) -> ((u64, bool), (u64, bool), (u64, u64)) {
+  fn lent_step_scene(state: &mut crate::state::ShardState) -> LentStepOutcome {
     let begun = starved_cut(state);
     let cost = state
       .image_encoder
