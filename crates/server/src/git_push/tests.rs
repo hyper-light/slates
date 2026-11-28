@@ -1499,7 +1499,8 @@ struct Fetched {
 }
 
 /// A fetch's read of `repository` ([`git_derive::derive_for_read`]) as a task of the shard, timed there from its start to
-/// its end, with the let-go windows brought back on the shard meanwhile. Given `pushed` (set once the push behind which the read must arrive has answered), it waits first, a step
+/// its end, with the let-go windows brought back on the shard meanwhile; a live fetch from its arrival, as a fetch's
+/// answer is. Given `pushed` (set once the push behind which the read must arrive has answered), it waits first, a step
 /// quantum at a time, until the derivation behind that push has kept a turn under way while its task still runs, and
 /// begins in that same poll, so the task behind cannot finish between the look and the read. Refused where the task
 /// behind ended before a look found its derivation under way, or where none began behind a push that answered.
@@ -1515,7 +1516,11 @@ fn read_on_the_shard(
   crate::daemon::observe_first(daemon, move |state| {
     let begun_before = state.refusals.get(BEHIND).copied().unwrap_or(0);
     let quantum_ns = state.config.step_quantum_ns();
+    // A fetch's answer is counted live from its arrival (`vcs_share::Live::fetch`), as an edge's request is: a landed
+    // pack's let-go behind the push is owed past it, never made under it (`vcs_store::landed_let_go_may`).
+    let live = crate::vcs_share::Live::fetch(repository);
     let task = slates_rt::futures::spawn(async move {
+      let _live = live;
       while let Some(pushed) = pushed {
         let look = crate::state::with_state_counted(|state| {
           let begun = state.refusals.get(BEHIND).copied().unwrap_or(0) > begun_before;
@@ -1662,8 +1667,11 @@ fn own_turns(fetched: &Fetched) -> u64 {
 }
 
 /// Holds `mid`, a fetch handed a derivation, to no more of its own turns than `alone` but the hand-over's
-/// ([`PACED_TURNS`]), and to having been handed it.
+/// ([`PACED_TURNS`]), to having been handed it, and to having brought no window back: its let-go owed past it.
 fn assert_turns_alone_but_the_hand_overs(mid: &Fetched, alone: &Fetched) {
+  // A landed pack's let-go is never made under a fetch's answer (`vcs_store::landed_let_go_may`): the read is a live
+  // fetch, so it meets no window let go behind the push (main 01a20182's ruling of 2026-11-28 03:02).
+  assert_eq!(mid.brought, 0, "a live fetch brought windows back: {mid:?}");
   assert!(
     mid.handed >= 1,
     "the fetch arrived mid-derivation and was handed it"
