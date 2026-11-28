@@ -376,7 +376,11 @@
 >   with none is no answer, its host left, its link dialed afresh, and the homing waits and ranks its homes again once
 >   the death installs (A-912). Red first: `a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once`
 >   (16 of 16 in main's run at 526859d1e). a914 asserts its second push lands.
-> - **OPEN, a914 still fails 4 of 16 at the record barrier** (main 01a20182's run at 526859d1e, load 42-69; its rulings of
+> - **FIXED, a914 16 of 16 (main 01a20182's run at 02548a267, macOS arm64 debug, load 17-53, 2026-11-27 19:02):** every
+>   run with no homing `retry` and no barrier refusal, A-914 (d)'s red 16 of 16 beside it; at 604aa12a0 and d08595c7e 11 of
+>   16, every red beginning with the first death's push refused `retry`. Closed by A-934 (state logs), A-935 (greens) and
+>   A-914 (c) (the live homing deadline). The history below stays as it was.
+> - **Was OPEN, a914 still fails 4 of 16 at the record barrier** (main 01a20182's run at 526859d1e, load 42-69; its rulings of
 >   2026-11-27 12:02). Every red is the second death's push refused `unable to commit`; no homing ended short at once.
 >   Two shapes:
 >   1. Runs 5 and 13: a green owed at version 3, placed 2, with reads past tolerance ("nothing held, the register's
@@ -410,7 +414,9 @@
 >   change brings in, and the settle waits for it on `f + 1` of the new cohort, naming the log it waits for. Bounded:
 >   one part a state log of a repository the partition holds (design A-934).
 > - **OPEN, being logged (w-shared; main 01a20182's order of 2026-11-27 18:08): a holder's replica build stalls at the
->   second death.** a914 at 604aa12a0 run 10 and at d08595c7e runs 1, 3, 5, 7 and 9 (each after a refused first-death
+>   second death.** Not seen in a914 since A-914 (c) (16 of 16 at 02548a267): every stalled red followed a refused first
+>   push, so its red must make the condition on purpose, or the logs show a refused push is its only door (main's ruling
+>   of 19:02). a914 at 604aa12a0 run 10 and at d08595c7e runs 1, 3, 5, 7 and 9 (each after a refused first-death
 >   push): the second death's v2 placed at the owner alone, its other live candidate answering `ReplicaBuilding` at 0
 >   turns through the barrier window (`building {X: 0}`), so the push was refused `unable to commit`. A build at 0 turns
 >   has not left `replica_build::laid_out`, which waits while the repository's replica store replays; that replay
