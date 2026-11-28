@@ -58349,6 +58349,18 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
     version read as before (red: a reader saw the stage's changes at unit 15), and a stage given up after any turn,
     its last included, leaves the change index as it was (red: given up after 15 turns, it was changed).
     `latest_change` and `changes_bytes`, which the commit still writes as it goes, are the current maps' unit's.
+  - **U4, each key's last change written aside.** The commit wrote `file_removed` and the mode, symbolic link, hard
+    link, attribute and IPC node maps in place as it went, which the verdict reads (`file_removed_since`, the
+    `merge_*` reads, `links_unseen`, `merge_handed`, `stack`'s judge and levels), so a reader between its turns saw
+    its last changes. The commit never reads them, so it writes them aside (`engine::last_changes::Aside`: inserts
+    and no read, so a commit reading its own pending last change does not compile), and its publish moves them in
+    (`Published::publish`, O(the keys it changed), each a move); a refusal drops them. The six maps
+    (`last_changes::Published`) have no insert but the publish's and a checkpoint's restore, so every commit, whole,
+    a unit at a time or a replay's apply, writes them through the one path. Not structural: a commit-path read of a
+    published map's `get` compiles and reads the value before the commit; the module states that none is made. Red
+    first (`engine::publish_tests`): what the verdict reads of each path's last changes reads as before between
+    every two steps (red: a reader saw the stage's last changes at unit 8), and a stage given up after any turn,
+    its last included, leaves the six maps as they were (red: given up after 8 turns, a map was changed).
 - **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
   hard links, a copy's tree; the change build's end (the map's and trees' apply, O(the change)). Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;

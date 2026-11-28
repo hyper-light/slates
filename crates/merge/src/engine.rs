@@ -1465,7 +1465,7 @@ pub struct Green {
   /// them), a running total: what [`Green::history_bytes`] leaves out, as the current values were always left out.
   specials: Dim<SpecialNode>,
   special_history: ValueHistory<SpecialNode>,
-  special_changed: BTreeMap<String, u64>,
+  special_changed: last_changes::Published<String>,
   dirs: Dim<()>,
   modes: Dim<u32>,
   symlinks: Dim<String>,
@@ -1492,11 +1492,14 @@ pub struct Green {
   /// fold floor meets it too. One entry a path the green ever removed a file at, as `last_changed`
   /// holds one a path it ever changed; empty in a green restored from a checkpoint or made as a
   /// branch, whose bases are never before its first version.
-  file_removed: BTreeMap<String, u64>,
-  mode_changed: BTreeMap<String, u64>,
-  symlink_changed: BTreeMap<String, u64>,
-  hardlink_changed: BTreeMap<String, u64>,
-  xattr_changed: BTreeMap<(String, String), u64>,
+  file_removed: last_changes::Published<String>,
+  mode_changed: last_changes::Published<String>,
+  symlink_changed: last_changes::Published<String>,
+  hardlink_changed: last_changes::Published<String>,
+  xattr_changed: last_changes::Published<(String, String)>,
+  /// The last changes the commit under way wrote, moved into the six maps above at its publish (A-752 part 3c U4,
+  /// [`last_changes`]): written, never read.
+  aside: last_changes::Aside,
   /// Every accepted increment's identity and the version it committed: the idempotency record a
   /// retry of an accepted submit is answered from. Bounded by the chain (one entry per committed
   /// version), which the partition caps in bytes; recovery rebuilds it by replaying the chain.
@@ -3539,7 +3542,7 @@ impl Green {
 
   fn restore_mode(&mut self, changed: &crate::checkpoint::Changed<String, u32>) {
     self.place_mode(&changed.key, changed.value);
-    self.mode_changed.insert(changed.key.clone(), changed.at);
+    self.mode_changed.restore(changed.key.clone(), changed.at);
     self
       .mode_history
       .insert(changed.key.clone(), vec![(changed.at, changed.value)]);
@@ -3552,7 +3555,7 @@ impl Green {
     } else {
       (&mut self.hardlink_changed, &mut self.hardlink_history)
     };
-    changed_map.insert(changed.key.clone(), changed.at);
+    changed_map.restore(changed.key.clone(), changed.at);
     history.insert(
       changed.key.clone(),
       vec![(changed.at, changed.value.clone())],
@@ -3561,7 +3564,9 @@ impl Green {
 
   fn restore_special(&mut self, changed: &crate::checkpoint::Changed<String, SpecialNode>) {
     self.place_special(&changed.key, changed.value);
-    self.special_changed.insert(changed.key.clone(), changed.at);
+    self
+      .special_changed
+      .restore(changed.key.clone(), changed.at);
     self
       .special_history
       .insert(changed.key.clone(), vec![(changed.at, changed.value)]);
@@ -3570,7 +3575,7 @@ impl Green {
   fn restore_xattr(&mut self, changed: &crate::checkpoint::Changed<(String, String), Vec<u8>>) {
     let (path, name) = &changed.key;
     self.place_xattr(path, name, changed.value.as_deref());
-    self.xattr_changed.insert(changed.key.clone(), changed.at);
+    self.xattr_changed.restore(changed.key.clone(), changed.at);
     self.xattr_history.insert(
       changed.key.clone(),
       vec![(changed.at, changed.value.clone())],
@@ -6454,7 +6459,7 @@ impl Green {
         .special_history_bytes
         .saturating_add(SPECIAL_NODE_BYTES);
     }
-    self.special_changed.insert(path.clone(), version);
+    self.aside.special(path.clone(), version);
     self
       .special_history
       .entry(path)
@@ -6464,7 +6469,7 @@ impl Green {
 
   /// Remove the live inode and its metadata while retaining their historical values.
   fn remove_special(&mut self, path: String, version: u64) {
-    self.file_removed.insert(path.clone(), version);
+    self.aside.removed(path.clone(), version);
     // The inode's own key is marked by its effect; its mode and attributes go with it and are marked here.
     self.mark_special(&path);
     let at = self.seed_of(&self.special_history, &path, &path, version);
@@ -6479,7 +6484,7 @@ impl Green {
         .special_history_bytes
         .saturating_add(SPECIAL_NODE_BYTES);
     }
-    self.special_changed.insert(path.clone(), version);
+    self.aside.special(path.clone(), version);
     self.drop_metadata(&path, version);
     self
       .special_history
@@ -6505,7 +6510,7 @@ impl Green {
       self
         .identity_dirty
         .insert(IdentityKey::Mode(path.to_owned()));
-      self.mode_changed.insert(path.to_owned(), version);
+      self.aside.mode(path.to_owned(), version);
       self
         .mode_history
         .entry(path.to_owned())
@@ -6526,7 +6531,7 @@ impl Green {
       self
         .identity_dirty
         .insert(IdentityKey::Xattr(key.0.clone(), key.1.clone()));
-      self.xattr_changed.insert(key.clone(), version);
+      self.aside.xattr(key.clone(), version);
       self
         .xattr_history
         .entry(key)
@@ -6640,6 +6645,14 @@ impl Green {
         entry.last = false;
       }
     }
+    core::mem::take(&mut self.aside).publish_into(last_changes::Targets {
+      removed: &mut self.file_removed,
+      modes: &mut self.mode_changed,
+      symlinks: &mut self.symlink_changed,
+      hardlinks: &mut self.hardlink_changed,
+      xattrs: &mut self.xattr_changed,
+      specials: &mut self.special_changed,
+    });
     self.deltas.push(core::mem::take(&mut run.delta));
     self.accepted.insert(id, run.version);
     run.version
@@ -6911,7 +6924,7 @@ impl Green {
           .push((version, true));
       }
       Effect::RemoveDir(path) => {
-        self.file_removed.insert(path.clone(), version);
+        self.aside.removed(path.clone(), version);
         staged.emptied.push(path.clone());
         let stood = self.dirs.contains_key(&path).then_some(true);
         self.mark_dir(&path);
@@ -6934,7 +6947,7 @@ impl Green {
           at,
         );
         self.modes.insert(&path, mode);
-        self.mode_changed.insert(path.clone(), version);
+        self.aside.mode(path.clone(), version);
         self
           .mode_history
           .entry(path)
@@ -6943,13 +6956,13 @@ impl Green {
       }
       Effect::Symlink(path, target) => self.set_symlink(path, Some(target), version),
       Effect::RemoveSymlink(path) => {
-        self.file_removed.insert(path.clone(), version);
+        self.aside.removed(path.clone(), version);
         staged.emptied.push(path.clone());
         self.set_symlink(path, None, version);
       }
       Effect::Hardlink(path, target) => self.set_hardlink(path, Some(target), version),
       Effect::RemoveHardlink(path) => {
-        self.file_removed.insert(path.clone(), version);
+        self.aside.removed(path.clone(), version);
         staged.emptied.push(path.clone());
         self.set_hardlink(path, None, version);
       }
@@ -6978,7 +6991,7 @@ impl Green {
         self.symlinks.remove(&path);
       }
     }
-    self.symlink_changed.insert(path.clone(), version);
+    self.aside.symlink(path.clone(), version);
     self
       .symlink_history
       .entry(path)
@@ -7002,7 +7015,7 @@ impl Green {
       None => self.hardlinks.remove(&path),
     };
     relink(&mut self.links_to, &path, old.as_deref(), target.as_deref());
-    self.hardlink_changed.insert(path.clone(), version);
+    self.aside.hardlink(path.clone(), version);
     self
       .hardlink_history
       .entry(path)
@@ -7020,7 +7033,7 @@ impl Green {
     self.mark_xattr(&key);
     let at = self.seed_of(&self.xattr_history, &key, &key.0, version);
     seed(&mut self.xattr_history, &key, before, at);
-    self.xattr_changed.insert(key.clone(), version);
+    self.aside.xattr(key.clone(), version);
     self
       .xattr_history
       .entry(key)
@@ -7036,7 +7049,7 @@ impl Green {
     self.content.remove(path);
     self.supersede_latest(path);
     self.last_changed.insert(path.to_owned(), version);
-    self.file_removed.insert(path.to_owned(), version);
+    self.aside.removed(path.to_owned(), version);
     self.push_content(path.to_owned(), version, None);
   }
 
@@ -7052,7 +7065,7 @@ impl Green {
     // A rename onto a file removes it (A-612); onto a path this commit emptied, the removal is recorded already. A file
     // this version's own copy brought and its increment edited (A-586) was no other file: nothing was removed.
     if renamed && self.content.contains_key(&path) && !self.copied_in(&path, version) {
-      self.file_removed.insert(path.clone(), version);
+      self.aside.removed(path.clone(), version);
     }
     // The value this one supersedes stays in the history, sharing every run the new one kept (W2): what the history
     // gains is the bytes the new value added, its piece list, and whatever the old one held that the new one does not,
@@ -9829,6 +9842,8 @@ mod head_under_tests;
 
 // A held verdict staged a unit a step and published whole (A-752 part 3c).
 mod staging;
+// Each key's last change, written by a commit aside and moved in at its publish (A-752 part 3c U4).
+mod last_changes;
 pub use staging::{Staging, StagingStep};
 
 #[cfg(test)]

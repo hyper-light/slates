@@ -177,6 +177,8 @@ impl Green {
       self.changes.remove(&version);
     }
     drop(staging);
+    // The last changes it wrote aside are dropped (A-752 part 3c U4).
+    self.aside = super::last_changes::Aside::default();
     let Some(marks) = self.stage_marks.take() else {
       return;
     };

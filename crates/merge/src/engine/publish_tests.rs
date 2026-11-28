@@ -306,6 +306,95 @@ fn changes_given_up_after(works: &[Changes], turns: u64) -> Result<bool, String>
   Ok(staged)
 }
 
+/// What the verdict reads of each path's last changes at the head ([`super::Green::changed_last`] over the removals' and
+/// every dimension's maps, and whether its file was removed since each version), and the head.
+fn last_changes_read(green: &Green) -> String {
+  let head = green.head();
+  let mut read = format!("head {head}\n");
+  for path in PATHS {
+    let key = (path.to_owned(), "user.k".to_owned());
+    read.push_str(&format!(
+      "{path}: {} {} {} {} {} {}",
+      green.changed_last(green.file_removed.get(path), path),
+      green.changed_last(green.mode_changed.get(path), path),
+      green.changed_last(green.symlink_changed.get(path), path),
+      green.changed_last(green.hardlink_changed.get(path), path),
+      green.changed_last(green.xattr_changed.get(&key), path),
+      green.changed_last(green.special_changed.get(path), path),
+    ));
+    for version in 0..=head {
+      read.push_str(&format!(" {}", green.file_removed_since(path, version)));
+    }
+    read.push('\n');
+  }
+  read
+}
+
+/// The removals' and every dimension's last-change maps as they are held: what a refusal leaves as it was.
+fn last_changes_held(green: &Green) -> String {
+  format!(
+    "{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
+    green.file_removed,
+    green.mode_changed,
+    green.symlink_changed,
+    green.hardlink_changed,
+    green.xattr_changed,
+    green.special_changed
+  )
+}
+
+/// [`changes_unseen`] with the last changes read between the steps ([`last_changes_read`]).
+fn last_changes_unseen(green: &mut Green, inc: &Increment) -> Result<Option<u64>, String> {
+  let Judgment::Accepted(held) = green.judge(inc) else {
+    return Ok(None);
+  };
+  let before = last_changes_read(green);
+  let mut staging = green.begin_staging(held);
+  loop {
+    let stepped = green.staging_step(&mut staging, &mut || true);
+    if last_changes_read(green) != before {
+      return Err(format!(
+        "a reader saw the stage's last changes at unit {}",
+        staging.units()
+      ));
+    }
+    match stepped {
+      StagingStep::More => {}
+      StagingStep::Staged => break,
+      StagingStep::Lend(unlent) => return Err(format!("no named text here, yet {unlent:?}")),
+    }
+  }
+  Ok(green.publish(staging).map(|(version, _)| version))
+}
+
+/// [`changes_given_up_after`] with the last-change maps the guard ([`last_changes_held`]).
+fn last_changes_given_up_after(works: &[Changes], turns: u64) -> Result<bool, String> {
+  let Some((last, before)) = works.split_last() else {
+    return Ok(true);
+  };
+  let mut green = submitted_in_every_dimension(before);
+  let inc = work_in_every_dimension(&green, last, u64::MAX);
+  let Judgment::Accepted(held) = green.judge(&inc) else {
+    return Ok(true);
+  };
+  let was = last_changes_held(&green);
+  let mut staging = green.begin_staging(held);
+  let mut staged = false;
+  for _ in 0..turns {
+    if let StagingStep::Staged = green.staging_step(&mut staging, &mut || true) {
+      staged = true;
+      break;
+    }
+  }
+  green.abandon_staging(staging);
+  if last_changes_held(&green) != was {
+    return Err(format!(
+      "a stage given up after {turns} turns left a last-change map changed"
+    ));
+  }
+  Ok(staged)
+}
+
 /// The works [`proptest`] generates: one to eight, each of one to four changes.
 fn works() -> impl Strategy<Value = Vec<Changes>> {
   prop::collection::vec(
@@ -420,6 +509,39 @@ proptest! {
       let prefix = steps.get(..end).unwrap_or_default();
       for turns in 0u64.. {
         if changes_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
+          break;
+        }
+      }
+    }
+  }
+
+  /// A-752 part 3c U4 (the last-change maps, the reader at v). Do: as U2's, what the verdict reads of each path's last
+  /// changes read between every two steps. Expect it as before the stage, and the same version and reads as the twin's
+  /// after each work. Red before: the commit wrote each path's last change in place as it went.
+  #[test]
+  fn a_staged_verdicts_last_changes_move_only_at_its_publish(steps in works()) {
+    let (mut whole, mut staged) = (submitted_in_every_dimension(&[]), submitted_in_every_dimension(&[]));
+    for (id, changes) in (1u64..).zip(&steps) {
+      let inc = work_in_every_dimension(&whole, changes, id);
+      let (outcome, _) = whole.submit_resolved(&inc);
+      let version = last_changes_unseen(&mut staged, &inc).map_err(TestCaseError::fail)?;
+      let accepted = match outcome {
+        super::Outcome::Accepted { version } | super::Outcome::Identical { version } => Some(version),
+        _ => None,
+      };
+      prop_assert_eq!(version, accepted);
+      prop_assert_eq!(last_changes_held(&staged), last_changes_held(&whole));
+    }
+  }
+
+  /// A-752 part 3c U4 (the last-change maps, a refusal at every turn, its last too). Expect the removals' and every
+  /// dimension's last-change maps held exactly as before. Red before: a refusal kept every last change the stage wrote.
+  #[test]
+  fn a_stage_given_up_at_any_turn_leaves_the_last_changes_as_they_were(steps in works()) {
+    for end in 1..=steps.len() {
+      let prefix = steps.get(..end).unwrap_or_default();
+      for turns in 0u64.. {
+        if last_changes_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
           break;
         }
       }
