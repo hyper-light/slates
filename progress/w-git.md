@@ -927,3 +927,8 @@
   its step (1,202 entries freed in the step before for 600 commits). Seen and sent to main: svn_import's t_a920 wide
   copy failed here twice on its off-CPU bar (2.28 ms, load 24-28), from ff8edd3e4, not this change. NEXT: the stale
   restage (P2 piece 4, with a stale stage's members positioned by id); then main's TSan turn-bound test.
+- 11-27 22:44 PST: LANDED P2 piece 4 (A-722 part 4k) f40da4ef8, on main as 93b7d6b42: an atomic push's stage a landing overtook
+  before its append is made again in turns (Judge::ready_to_append); 10 of 12 restaged whole before, 0 now. Main's
+  v4 part A A/B closed dead even (727.0 vs 728.2 us median), as expected for a one-green push. NEXT: main's TSan
+  turn-bound test (a_fetch_arriving_mid_derivation...: 21 turns against 9); owed P2 items listed in GAPS (a stale
+  stage's moves positioned by id; replayed landings; abandoned/replayed push maps).
