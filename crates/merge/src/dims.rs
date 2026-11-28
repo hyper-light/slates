@@ -185,6 +185,25 @@ impl<V: Clone> Dim<V> {
     self.root.releasing()
   }
 
+  /// Exchanges this map with `fork`, a fork of it holding no arena, the arena staying in this field (A-752 part 3c
+  /// U6): the fork's root here, with the arena, and this one's in `fork`. Twice is none.
+  pub(crate) fn swap_with_fork(&mut self, fork: &mut Dim<V>) {
+    std::mem::swap(self, fork);
+    self.lend(fork);
+  }
+
+  /// Gives `fork`'s hold on its nodes back in this map's arena, `fork` holding none: what a stage's copies of nodes
+  /// cost, freed; the nodes this map shares with it stay (A-752 part 3c U6).
+  pub(crate) fn release_fork(&mut self, mut fork: Dim<V>) {
+    fork.root.release(&mut self.nodes, &mut Plain);
+  }
+
+  /// The nodes this map's arena holds live: what a test holds a stage's release to (A-752 part 3c U6).
+  #[cfg(test)]
+  pub(crate) fn live_nodes(&self) -> usize {
+    self.nodes.live()
+  }
+
   /// The nodes walks of this map's arena visited, while it holds its arena ([`Nodes::visited`]).
   pub(crate) fn visited(&self) -> u64 {
     self.nodes.visited()
@@ -955,6 +974,22 @@ impl Xattrs {
   /// [`Dim::lend`].
   pub(crate) fn lend(&mut self, other: &mut Xattrs) {
     self.map.lend(&mut other.map);
+  }
+
+  /// [`Dim::swap_with_fork`].
+  pub(crate) fn swap_with_fork(&mut self, fork: &mut Xattrs) {
+    self.map.swap_with_fork(&mut fork.map);
+  }
+
+  /// [`Dim::release_fork`].
+  pub(crate) fn release_fork(&mut self, fork: Xattrs) {
+    self.map.release_fork(fork.map);
+  }
+
+  /// [`Dim::live_nodes`].
+  #[cfg(test)]
+  pub(crate) fn live_nodes(&self) -> usize {
+    self.map.live_nodes()
   }
 
   /// [`Dim::releasing`].
