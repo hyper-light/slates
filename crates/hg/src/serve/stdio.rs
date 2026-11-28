@@ -109,6 +109,8 @@ pub struct Stdio {
   push_room: Option<u64>,
   /// A `getbundle`'s answer being made a slice at a time (A-745): the session serves no other request until it ends.
   answering: Option<session::Producing>,
+  /// The tally of a stream whose answer ended, until its next take ([`Stdio::take_stream_tally`]).
+  ended_tally: crate::render::StageTally,
   /// Whether an answer was refused past its stream's start: the session ends as a process that failed does, its
   /// refusal on standard error, never with the status of one that served (A-745).
   failed: bool,
@@ -203,6 +205,7 @@ impl Stdio {
       push: Pushing::None,
       push_room: None,
       answering: None,
+      ended_tally: crate::render::StageTally::default(),
       failed: false,
       batching: None,
     }
@@ -272,6 +275,19 @@ impl Stdio {
       Read::More { needed } => self.more(needed),
     }
   }
+  /// Its stream clone's steps and reads by stage since the last take ([`session::Producing::take_stream_tally`]); none
+  /// while it answers no stream.
+  pub fn take_stream_tally(&mut self) -> Option<crate::render::StageTally> {
+    let ended = core::mem::take(&mut self.ended_tally);
+    match self
+      .answering
+      .as_mut()
+      .and_then(session::Producing::take_stream_tally)
+    {
+      Some(live) => Some(live.plus(ended)),
+      None => (ended != crate::render::StageTally::default()).then_some(ended),
+    }
+  }
 
   /// What the stream's next step needs of the changeset store, if anything (a `stream_out`'s,
   /// [`crate::render::Streaming::wants`]).
@@ -321,10 +337,16 @@ impl Stdio {
     match answering.step(store, &mut admission, self.stdout.buffer()) {
       Ok(true) => Progress::Streamed { more: true },
       Ok(false) => {
+        if let Some(tally) = answering.take_stream_tally() {
+          self.ended_tally = self.ended_tally.plus(tally);
+        }
         self.answering = None;
         Progress::Streamed { more: false }
       }
       Err(refusal) => {
+        if let Some(tally) = answering.take_stream_tally() {
+          self.ended_tally = self.ended_tally.plus(tally);
+        }
         // Past its start a stream cannot carry an error part where the client reads one, so the session ends as 7.2's
         // process does when it fails mid-stream: its words on standard error, a failing status.
         self.answering = None;

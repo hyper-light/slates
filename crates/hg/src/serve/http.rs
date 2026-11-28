@@ -251,6 +251,11 @@ impl crate::render::StoreWants for Streamed {
 }
 
 impl Streamed {
+  /// Its stream clone's steps and reads by stage since the last take ([`session::Producing::take_stream_tally`]).
+  pub fn take_stream_tally(&mut self) -> Option<crate::render::StageTally> {
+    self.answering.take_stream_tally()
+  }
+
   /// The answer's media type: the reply's `Content-Type`.
   pub fn media_type(&self) -> &'static [u8] {
     self.media_type

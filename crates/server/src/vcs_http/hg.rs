@@ -775,6 +775,7 @@ impl<S: HgStores> HgExchange<S> {
     let report = paced.close(ended, costs);
     crate::vcs_store::hg_view::turn_taken();
     crate::vcs_store::hg_view::turn_lasted(ended.saturating_sub(start), &report);
+    crate::vcs_store::hg_view::stage_tallied(streamed.take_stream_tally());
     // A-724 piece 3d: what the turn wrote, learned as the fetch's demand once its answer ends.
     self.stores.wrote(
       generation,

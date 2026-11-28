@@ -337,6 +337,85 @@ enum Stage {
   Done,
 }
 
+/// The steps a stream took in one kind of stage, and the content store's reads during them ([`StageTally`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tally {
+  /// The steps.
+  pub steps: u64,
+  /// The content store's reads during them (`ContentStore::reads`).
+  pub reads: u64,
+}
+
+/// A stream's steps and reads by the kind of stage they were taken in (goal 93, hg's whole-history gap; main
+/// 01a20182's ruling of 2026-11-27 16:23): the count walk, a row a step, which sizes the answer's head; the index rows a
+/// step; the data chunks; and the rest (the start, the head). A stream of R revisions took about R count steps and R
+/// index steps (2.3 steps and 4.9 to 6.4 reads a revision on a local history of 300 to 600 changesets).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageTally {
+  /// The count walk's (`Stage::Counting`).
+  pub count: Tally,
+  /// The index rows' (`Stage::Index`).
+  pub index: Tally,
+  /// The data chunks' (`Stage::Data`).
+  pub data: Tally,
+  /// The start's and the head's.
+  pub other: Tally,
+}
+
+impl StageTally {
+  /// Both tallies' steps and reads summed, stage by stage: an ended stream's kept beside a live one's.
+  #[must_use]
+  pub fn plus(self, other: StageTally) -> StageTally {
+    let sum = |a: Tally, b: Tally| Tally {
+      steps: a.steps.saturating_add(b.steps),
+      reads: a.reads.saturating_add(b.reads),
+    };
+    StageTally {
+      count: sum(self.count, other.count),
+      index: sum(self.index, other.index),
+      data: sum(self.data, other.data),
+      other: sum(self.other, other.other),
+    }
+  }
+
+  /// One step of kind `kind` that read the content store `reads` times.
+  fn add(&mut self, kind: StageKind, reads: u64) {
+    let tally = match kind {
+      StageKind::Count => &mut self.count,
+      StageKind::Index => &mut self.index,
+      StageKind::Data => &mut self.data,
+      StageKind::Other => &mut self.other,
+    };
+    tally.steps = tally.steps.saturating_add(1);
+    tally.reads = tally.reads.saturating_add(reads);
+  }
+}
+
+/// The kind of a [`Stage`], as [`StageTally`] counts it.
+#[derive(Clone, Copy)]
+enum StageKind {
+  /// `Stage::Counting`.
+  Count,
+  /// `Stage::Index`.
+  Index,
+  /// `Stage::Data`.
+  Data,
+  /// The rest.
+  Other,
+}
+
+impl StageKind {
+  /// `stage`'s kind.
+  fn of(stage: &Stage) -> StageKind {
+    match stage {
+      Stage::Counting(..) => StageKind::Count,
+      Stage::Index(..) => StageKind::Index,
+      Stage::Data(..) => StageKind::Data,
+      Stage::Start | Stage::Head | Stage::Done => StageKind::Other,
+    }
+  }
+}
+
 /// Which places a stream's batch of stored bytes asks for ([`Streaming`]'s `chunk_at`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Places {
@@ -558,6 +637,8 @@ pub struct Streaming {
   sized: VecDeque<SizedLog>,
   /// The chunk lengths of the log the count is sizing, so far.
   sizing: Vec<u32>,
+  /// The steps taken in each stage since the last [`Streaming::take_tally`], and the content store's reads during them.
+  tally: StageTally,
   /// The base the last entry written names: for the changelog, its delta chain's start ([`CHANGELOG_HEADER`]).
   chain_base: u32,
 }
@@ -638,6 +719,7 @@ impl Default for Streaming {
       sized: VecDeque::new(),
       sizing: Vec::new(),
       chain_base: 0,
+      tally: StageTally::default(),
     }
   }
 }
@@ -725,9 +807,29 @@ impl Streaming {
     if self.want.is_some() {
       return Ok(true);
     }
+    if self.stage == Stage::Done {
+      return Ok(false);
+    }
     self.room_hint = admission.left();
     let stage = self.stage.clone();
-    self.stage = match stage {
+    let kind = StageKind::of(&stage);
+    let reads = store.reads();
+    let advanced = self.advance(stage, index, store, admission, out);
+    self.tally.add(kind, store.reads().saturating_sub(reads));
+    self.stage = advanced?;
+    Ok(self.stage != Stage::Done)
+  }
+
+  /// The stage after `stage`, its step's bytes appended to `out` ([`Streaming::step`]).
+  fn advance(
+    &mut self,
+    stage: Stage,
+    index: &HgIndex,
+    store: &ContentStore,
+    admission: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<Stage, Refused> {
+    Ok(match stage {
       Stage::Start => first_log(index, store).map_or(Stage::Head, |log| Stage::Counting(log, 0)),
       Stage::Counting(log, rev) => self.count(index, store, (log, rev))?,
       Stage::Head => self.head(index, store, admission, out)?,
@@ -735,9 +837,14 @@ impl Streaming {
         self.index_entry(index, store, (log, rev, offset), admission, out)?
       }
       Stage::Data(log, rev) => self.data_chunk(index, store, (log, rev), admission, out)?,
-      Stage::Done => return Ok(false),
-    };
-    Ok(self.stage != Stage::Done)
+      Stage::Done => Stage::Done,
+    })
+  }
+
+  /// The steps taken in each stage since the last take, and the content store's reads during them, given back and
+  /// zeroed: what a server counts a turn at a time (the stream's counters by stage).
+  pub fn take_tally(&mut self) -> StageTally {
+    core::mem::take(&mut self.tally)
   }
 
   /// Whether the rows of `log` are held, the logs walked before it let go; asks for them when not, with the logs after
