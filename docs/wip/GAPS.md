@@ -1269,6 +1269,18 @@
 > `buffer.drain(..consumed)`, the rest moved each time) and a landing's pending section drained a store piece at a
 > time (`landing::sent_piece`, `pending.drain(..take)`).
 
+> **A-920 arena unit 0 BUILT (w-svn, 2026-11-27; main's rulings of 23:06, 23:08 and 23:25): a radix tree's labels and
+> child lists are runs in its arena.** `ptrie::store::Store` (chunks never reallocated, power-of-two classes with free
+> lists; under 2 × Σ peak live + classes × chunk, Wilson et al. 1995; runs reused, bumped and chunks added counted) holds
+> every node's label and child list, so a release gives them back to the arena, never to the heap: a 9,000-path map's
+> release freed 11,485 heap blocks for its 10,235 nodes before, at most its walk stack's 64 doublings after; the ptrie
+> oracle unchanged. Owed, in order: (a) its bytes charged to the green's retention accounting, exactly and admitted
+> before the arena grows, with an oracle-histories test that they never pass what was admitted and each Dim user
+> (content, dirs, modes, symlinks, hardlinks, specials, links_to, the verdict's) named with what admits it; (b) a dead
+> arena's chunks freed on its own shard a chunk at a time in the release step, the reaper handed only the rest. Until
+> (b), a dead arena's chunks still go to the reaper, as a few dozen 4 KiB frees, not thousands. Then unit 1:
+> `Green::content_history` onto `Dim`, and the remains' other fields by bytes.
+
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
 > turn (A-579's bounded share past its deadline: it had taken 406 ms in one step, debug). Left, on the import's history

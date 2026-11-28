@@ -575,16 +575,11 @@ impl<V: Reapable> Holders<V> for ReapValues<'_> {
   fn freed(&mut self, value: V) {
     value.reap(self.0);
   }
-
-  fn node_freed(&mut self, label: Vec<u8>, children: Vec<(u8, usize)>) {
-    self.0.bytes(label);
-    self.0.children(children);
-  }
 }
 
 /// The files' blocks as the holders of a released files map ([`Arenas::release_step`]): a freed node's block let go as
-/// [`Blocks`] lets it go, the bytes a freed block held and each freed node's label and child list moved into the
-/// [`Reaped`] (A-920).
+/// [`Blocks`] lets it go, the bytes a freed block held moved into the [`Reaped`] (A-920); a freed node's label and child list
+/// go back to the arena's stores (A-920 unit 0).
 struct ReapBlocks<'a> {
   blocks: &'a mut Blocks,
   reaped: &'a mut Reaped,
@@ -597,11 +592,6 @@ impl Holders<Block> for ReapBlocks<'_> {
 
   fn freed(&mut self, value: Block) {
     self.blocks.release_reaping(value, self.reaped);
-  }
-
-  fn node_freed(&mut self, label: Vec<u8>, children: Vec<(u8, usize)>) {
-    self.reaped.bytes(label);
-    self.reaped.children(children);
   }
 }
 

@@ -34,18 +34,21 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 
+mod store;
+
 /// A node's place in its arena.
 type Slot = usize;
 
-/// One node: the edge bytes from its parent, the value whose key ends here, and its children.
+/// One node: the edge bytes from its parent, the value whose key ends here, and its children. Its label and its child
+/// list are runs of its arena's stores ([`Nodes`]), no allocations of their own (A-920 unit 0).
 #[derive(Debug)]
 struct Node<V> {
-  /// The edge's bytes from the parent: empty only at a map's root.
-  label: Vec<u8>,
+  /// The edge's bytes from the parent, a run of the arena's labels: empty only at a map's root.
+  label: store::Run,
   /// The value whose key ends here.
   value: Option<V>,
-  /// The children, each under the first byte of its label (distinct), ascending.
-  children: Vec<(u8, Slot)>,
+  /// The children, each under the first byte of its label (distinct), ascending: a run of the arena's child lists.
+  children: store::Run,
   /// The values in this node's subtree, its own included.
   count: usize,
   /// The maps, parents and held subtrees that name this node.
@@ -58,9 +61,6 @@ pub trait Holders<V> {
   fn copied(&mut self, value: &V);
   /// The last node holding `value` was freed.
   fn freed(&mut self, value: V);
-  /// A node no holder names any more was freed by a release ([`Nodes::release_step`]): its label and its child list,
-  /// which a release moves out to be dropped on another thread ([`crate::reaped`]). Dropped here by default.
-  fn node_freed(&mut self, _label: Vec<u8>, _children: Vec<(u8, usize)>) {}
 }
 
 /// The holders of values that name nothing outside the arena: both events are nothing to them.
@@ -71,12 +71,32 @@ impl<V> Holders<V> for Plain {
   fn freed(&mut self, _value: V) {}
 }
 
-/// The arena of nodes the maps made from one another share.
+/// The most children a node holds: one a byte value, as each child's label starts with a distinct byte.
+///
+/// Derived: a child list's first bytes are distinct bytes, so at most 256 (the byte's values).
+const MOST_CHILDREN: usize = 256;
+
+/// The child lists' chunk, in children: the widest child list a node can have.
+///
+/// Derived: [`MOST_CHILDREN`], so every child list's class fits one chunk.
+const CHILD_CHUNK: usize = MOST_CHILDREN;
+
+/// The labels' chunk, in bytes: as many as a child chunk holds.
+///
+/// Derived: [`CHILD_CHUNK`] times a child's bytes (a byte and a slot), so both stores grow by the same bytes a chunk; a
+/// label wider than it (a key's tail past it) takes a chunk of its own class.
+const LABEL_CHUNK: usize = CHILD_CHUNK * size_of::<(u8, Slot)>();
+
+/// The arena of nodes the maps made from one another share, and the runs their labels and child lists are kept in.
 #[derive(Debug)]
 pub struct Nodes<V> {
   slots: Vec<Option<Node<V>>>,
   /// Freed slots, reused before the arena grows.
   free: Vec<Slot>,
+  /// The nodes' labels (A-920 unit 0: a node's label no allocation of its own, so a release frees none to the heap).
+  labels: store::Store<u8>,
+  /// The nodes' child lists, likewise.
+  kids: store::Store<(u8, Slot)>,
   /// Nodes copied because another holder named them (module docs, "What it costs").
   copied: u64,
   /// Nodes a walk visited (module docs, "Walks are counted"); a cell, as walks borrow the arena.
@@ -90,6 +110,8 @@ impl<V> Default for Nodes<V> {
     Nodes {
       slots: Vec::new(),
       free: Vec::new(),
+      labels: store::Store::new(LABEL_CHUNK),
+      kids: store::Store::new(CHILD_CHUNK),
       copied: 0,
       visited: Cell::new(0),
       missing: Cell::new(0),
@@ -116,6 +138,30 @@ impl<V> Nodes<V> {
   /// The nodes alive in the arena.
   pub fn live(&self) -> usize {
     self.slots.len().saturating_sub(self.free.len())
+  }
+
+  /// The bytes the arena's label and child-list stores hold, exactly: what the arena's runs take (A-920 unit 0).
+  pub fn run_bytes(&self) -> usize {
+    self.labels.bytes().saturating_add(self.kids.bytes())
+  }
+
+  /// Of both stores, the runs taken from a free list, the runs bumped into a chunk, and the chunks added: the
+  /// non-vacuity counts of the runs' reuse (A-920 unit 0).
+  pub fn run_counts(&self) -> (u64, u64, u64) {
+    let (a, b) = (self.labels.counts(), self.kids.counts());
+    (
+      a.0.saturating_add(b.0),
+      a.1.saturating_add(b.1),
+      a.2.saturating_add(b.2),
+    )
+  }
+
+  /// Takes the node at `slot` out and gives its label's and child list's runs back: a node no map names any more.
+  fn discard(&mut self, slot: Slot) {
+    if let Some(node) = self.take(slot) {
+      self.labels.free(node.label);
+      self.kids.free(node.children);
+    }
   }
 
   fn node(&self, slot: Slot) -> Option<&Node<V>> {
@@ -198,11 +244,13 @@ impl<V> Nodes<V> {
       } = node;
       releasing
         .pending
-        .extend(children.iter().map(|(_, child)| *child));
+        .extend(self.kids.get(children).iter().map(|(_, child)| *child));
+      // The runs go back to the arena's stores, never to the heap (A-920 unit 0).
+      self.kids.free(children);
+      self.labels.free(label);
       if let Some(value) = value {
         holders.freed(value);
       }
-      holders.node_freed(label, children);
     }
     true
   }
@@ -224,18 +272,47 @@ impl Releasing {
 }
 
 /// The child of `node` whose label starts with `byte`: its index in the children and its slot.
-fn child_of<V>(node: &Node<V>, byte: u8) -> Option<(usize, Slot)> {
-  node
-    .children
+/// The child of `node` whose label starts with `byte`: its index in the children and its slot.
+fn child_of<V>(nodes: &Nodes<V>, node: &Node<V>, byte: u8) -> Option<(usize, Slot)> {
+  let children = nodes.kids.get(node.children);
+  children
     .binary_search_by_key(&byte, |(first, _)| *first)
     .ok()
-    .and_then(|index| node.children.get(index).map(|(_, slot)| (index, *slot)))
+    .and_then(|index| children.get(index).map(|(_, slot)| (index, *slot)))
 }
 
 /// Puts `child` among `children`, keeping them ordered by first byte.
-fn add_child(children: &mut Vec<(u8, Slot)>, first: u8, child: Slot) {
-  let at = children.partition_point(|(byte, _)| *byte < first);
-  children.insert(at, (first, child));
+/// `children` with `child` put among them, keeping them ordered by first byte.
+fn with_child(
+  kids: &mut store::Store<(u8, Slot)>,
+  children: store::Run,
+  first: u8,
+  child: Slot,
+) -> store::Run {
+  let at = kids
+    .get(children)
+    .partition_point(|(byte, _)| *byte < first);
+  kids.inserted(children, at, (first, child))
+}
+
+/// Puts `child` among the children of the unique-made node at `slot`, keeping them ordered by first byte.
+fn add_child<V>(nodes: &mut Nodes<V>, slot: Slot, first: u8, child: Slot) {
+  let Some(children) = nodes.node(slot).map(|node| node.children) else {
+    return;
+  };
+  let children = with_child(&mut nodes.kids, children, first, child);
+  if let Some(node) = nodes.node_mut(slot) {
+    node.children = children;
+  }
+}
+
+/// One more hold on each child of the list `children`.
+fn hold_children<V>(nodes: &mut Nodes<V>, children: store::Run) {
+  for at in 0..children.len() {
+    if let Some(&(_, child)) = nodes.kids.get(children).get(at) {
+      nodes.hold(child);
+    }
+  }
 }
 
 /// The bytes `a` and `b` begin with alike.
@@ -243,6 +320,8 @@ fn common_prefix(a: &[u8], b: &[u8]) -> usize {
   a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
+/// The node at `slot` with its referrer as its only holder: itself when it is, otherwise a copy that takes the
+/// referrer's hold from it, holding the same children once more and telling its value it has one more holder.
 /// The node at `slot` with its referrer as its only holder: itself when it is, otherwise a copy that takes the
 /// referrer's hold from it, holding the same children once more and telling its value it has one more holder.
 fn unique<V: Clone>(nodes: &mut Nodes<V>, slot: Slot, holders: &mut impl Holders<V>) -> Slot {
@@ -253,19 +332,18 @@ fn unique<V: Clone>(nodes: &mut Nodes<V>, slot: Slot, holders: &mut impl Holders
     return slot;
   }
   node.holders = node.holders.saturating_sub(1);
+  let (label, value, children, count) = (node.label, node.value.clone(), node.children, node.count);
   let copy = Node {
-    label: node.label.clone(),
-    value: node.value.clone(),
-    children: node.children.clone(),
-    count: node.count,
+    label: nodes.labels.duplicate(label, 0),
+    value,
+    children: nodes.kids.duplicate(children, 0),
+    count,
     holders: 1,
   };
   if let Some(value) = &copy.value {
     holders.copied(value);
   }
-  for (_, child) in &copy.children {
-    nodes.hold(*child);
-  }
+  hold_children(nodes, copy.children);
   nodes.copied = nodes.copied.saturating_add(1);
   nodes.alloc(copy)
 }
@@ -338,9 +416,9 @@ impl<V: Clone> Ptrie<V> {
       let Some(first) = rest.first() else {
         return node.value.as_ref();
       };
-      let (_, child) = child_of(node, *first)?;
-      let label = &nodes.node(child)?.label;
-      rest = rest.strip_prefix(label.as_slice())?;
+      let (_, child) = child_of(nodes, node, *first)?;
+      let label = nodes.labels.get(nodes.node(child)?.label);
+      rest = rest.strip_prefix(label)?;
       at = child;
     }
   }
@@ -367,9 +445,9 @@ impl<V: Clone> Ptrie<V> {
       Some(root) => root,
       None => {
         let root = nodes.alloc(Node {
-          label: Vec::new(),
+          label: store::Run::EMPTY,
           value: None,
-          children: Vec::new(),
+          children: store::Run::EMPTY,
           count: 0,
           holders: 1,
         });
@@ -450,8 +528,8 @@ impl<V: Clone> Ptrie<V> {
         above.truncate(before);
         return Some((at, above, label));
       };
-      let (_, child) = child_of(node, *first)?;
-      let label = &nodes.node(child)?.label;
+      let (_, child) = child_of(nodes, node, *first)?;
+      let label = nodes.labels.get(nodes.node(child)?.label);
       let common = common_prefix(label, rest);
       if common == rest.len() {
         return Some((child, above, common));
@@ -573,29 +651,32 @@ impl<V: Clone> Ptrie<V> {
 
 /// The node a held subtree grafts as: a copy of its top node, its label's first `skip` bytes dropped, holding the same
 /// children once more. The subtree's hold on its top node is given back.
+/// The node a held subtree grafts as: a copy of its top node, its label's first `skip` bytes dropped, holding the same
+/// children once more. The subtree's hold on its top node is given back.
 fn graft_top<V: Clone>(
   nodes: &mut Nodes<V>,
   shared: Shared,
   holders: &mut impl Holders<V>,
 ) -> Node<V> {
-  let mut top = copy_of(nodes, shared.slot, shared.skip, holders);
+  let top = copy_of(nodes, shared.slot, shared.skip, holders);
   nodes.release(shared.slot, holders);
   // A map's root may be a bare edge (no value, one child); a grafted node may not, so the child takes its place, the
   // edge's bytes before its own.
-  if top.value.is_none()
-    && let [(_, only)] = top.children.as_slice()
-  {
-    let only = *only;
-    let mut below = copy_of(nodes, only, 0, holders);
-    nodes.release(only, holders);
-    let mut label = std::mem::take(&mut top.label);
-    label.append(&mut below.label);
-    below.label = label;
-    top = below;
-  }
-  top
+  let only = (top.value.is_none() && top.children.len() == 1)
+    .then(|| nodes.kids.get(top.children).first().map(|(_, only)| *only))
+    .flatten();
+  let Some(only) = only else {
+    return top;
+  };
+  let below = copy_of(nodes, only, 0, holders);
+  nodes.release(only, holders);
+  nodes.kids.free(top.children);
+  let label = nodes.labels.joined(top.label, below.label);
+  Node { label, ..below }
 }
 
+/// A new node like the one at `slot`, its label's first `skip` bytes dropped: its value told it has one more holder
+/// and each child held once more.
 /// A new node like the one at `slot`, its label's first `skip` bytes dropped: its value told it has one more holder
 /// and each child held once more.
 fn copy_of<V: Clone>(
@@ -604,45 +685,67 @@ fn copy_of<V: Clone>(
   skip: usize,
   holders: &mut impl Holders<V>,
 ) -> Node<V> {
-  let copy = nodes.node(slot).map(|node| Node {
-    label: node
-      .label
-      .get(skip..)
-      .map(<[u8]>::to_vec)
-      .unwrap_or_default(),
-    value: node.value.clone(),
-    children: node.children.clone(),
-    count: node.count,
-    holders: 1,
-  });
-  let Some(copy) = copy else {
+  let Some((label, value, children, count)) = nodes
+    .node(slot)
+    .map(|node| (node.label, node.value.clone(), node.children, node.count))
+  else {
     return Node {
-      label: Vec::new(),
+      label: store::Run::EMPTY,
       value: None,
-      children: Vec::new(),
+      children: store::Run::EMPTY,
       count: 0,
       holders: 1,
     };
   };
+  let copy = Node {
+    label: nodes.labels.duplicate(label, skip),
+    value,
+    children: nodes.kids.duplicate(children, 0),
+    count,
+    holders: 1,
+  };
   if let Some(value) = &copy.value {
     holders.copied(value);
   }
-  for (_, child) in &copy.children {
-    nodes.hold(*child);
-  }
+  hold_children(nodes, copy.children);
   copy
 }
 
 /// Points the child at `index` of the node at `slot` at `child`: the node's slot is unique-made already, so the
 /// edit touches no other map's node.
+/// Points the child at `index` of the node at `slot` at `child`: the node's slot is unique-made already, so the
+/// edit touches no other map's node.
 fn set_child<V>(nodes: &mut Nodes<V>, slot: Slot, index: usize, child: Slot) {
-  if let Some(node) = nodes.node_mut(slot)
-    && let Some(entry) = node.children.get_mut(index)
-  {
+  let Some(children) = nodes.node(slot).map(|node| node.children) else {
+    return;
+  };
+  if let Some(entry) = nodes.kids.get_mut(children).get_mut(index) {
     entry.1 = child;
   }
 }
 
+/// The label run of the node at `slot`: empty for a slot that names no node.
+fn label_of<V>(nodes: &Nodes<V>, slot: Slot) -> store::Run {
+  nodes
+    .node(slot)
+    .map_or(store::Run::EMPTY, |node| node.label)
+}
+
+/// The unique-made node at `slot`'s label split after its first `common` bytes, for a key that leaves it there: the
+/// split's first part (a new run), the node's label made its rest, and the rest's first byte.
+fn split_label<V>(nodes: &mut Nodes<V>, slot: Slot, common: usize) -> (store::Run, u8) {
+  let label = label_of(nodes, slot);
+  let head = nodes.labels.prefix(label, common);
+  let tail = nodes.labels.suffix(label, common);
+  let tail_first = nodes.labels.get(tail).first().copied().unwrap_or_default();
+  if let Some(node) = nodes.node_mut(slot) {
+    node.label = tail;
+  }
+  (head, tail_first)
+}
+
+/// Hangs `top` (a subtree's top node, its label relative to the graft point) under `rest` below the unique-made node
+/// at `slot`, where no key starts with `rest`: the node's new slot.
 /// Hangs `top` (a subtree's top node, its label relative to the graft point) under `rest` below the unique-made node
 /// at `slot`, where no key starts with `rest`: the node's new slot.
 fn graft_at<V: Clone>(
@@ -660,39 +763,35 @@ fn graft_at<V: Clone>(
   let Some(first) = rest.first().copied() else {
     // Only an empty map's root stands where `rest` is empty and nothing starts with it: the subtree's top takes the
     // root's place, or hangs from it under its own label's bytes.
-    match top.label.first().copied() {
+    match nodes.labels.get(top.label).first().copied() {
       None => {
-        if let Some(node) = nodes.node_mut(slot) {
+        let replaced = nodes.node_mut(slot).map(|node| {
           node.value = top.value;
-          node.children = top.children;
+          std::mem::replace(&mut node.children, top.children)
+        });
+        if let Some(replaced) = replaced {
+          nodes.kids.free(replaced);
         }
       }
       Some(first) => {
         let child = nodes.alloc(top);
-        if let Some(node) = nodes.node_mut(slot) {
-          add_child(&mut node.children, first, child);
-        }
+        add_child(nodes, slot, first, child);
       }
     }
     return slot;
   };
-  let found = nodes.node(slot).and_then(|node| child_of(node, first));
+  let found = nodes
+    .node(slot)
+    .and_then(|node| child_of(nodes, node, first));
   match found {
     None => {
-      let mut label = rest.to_vec();
-      label.append(&mut top.label);
-      top.label = label;
+      top.label = nodes.labels.prepended(rest, top.label);
       let child = nodes.alloc(top);
-      if let Some(node) = nodes.node_mut(slot) {
-        add_child(&mut node.children, first, child);
-      }
+      add_child(nodes, slot, first, child);
     }
     Some((index, child)) => {
-      let label = nodes
-        .node(child)
-        .map(|node| node.label.clone())
-        .unwrap_or_default();
-      let common = common_prefix(&label, rest);
+      let label = label_of(nodes, child);
+      let common = common_prefix(nodes.labels.get(label), rest);
       if common == label.len() {
         let below = rest.get(common..).unwrap_or_default();
         let child = graft_at(nodes, child, below, top, holders);
@@ -700,21 +799,16 @@ fn graft_at<V: Clone>(
       } else {
         // The destination and the child part within the child's label: split it there.
         let child = unique(nodes, child, holders);
-        let tail = label.get(common..).map(<[u8]>::to_vec).unwrap_or_default();
+        let (head, tail_first) = split_label(nodes, child, common);
         let child_count = nodes.count(child);
-        let tail_first = tail.first().copied().unwrap_or_default();
-        if let Some(node) = nodes.node_mut(child) {
-          node.label = tail;
-        }
-        let mut grafted_label = rest.get(common..).map(<[u8]>::to_vec).unwrap_or_default();
-        let grafted_first = grafted_label.first().copied().unwrap_or_default();
-        grafted_label.append(&mut top.label);
-        top.label = grafted_label;
+        let grafted_rest = rest.get(common..).unwrap_or_default();
+        let grafted_first = grafted_rest.first().copied().unwrap_or_default();
+        top.label = nodes.labels.prepended(grafted_rest, top.label);
         let grafted = nodes.alloc(top);
-        let mut children = vec![(tail_first, child)];
-        add_child(&mut children, grafted_first, grafted);
+        let children = nodes.kids.alloc(&[(tail_first, child)]);
+        let children = with_child(&mut nodes.kids, children, grafted_first, grafted);
         let middle = nodes.alloc(Node {
-          label: label.get(..common).map(<[u8]>::to_vec).unwrap_or_default(),
+          label: head,
           value: None,
           children,
           count: child_count.saturating_add(added),
@@ -727,6 +821,8 @@ fn graft_at<V: Clone>(
   slot
 }
 
+/// Inserts `rest` below the node at `slot` (whose own label is matched already): the node's new slot and the value the
+/// key held before, if any.
 /// Inserts `rest` below the node at `slot` (whose own label is matched already): the node's new slot and the value the
 /// key held before, if any.
 fn insert_at<V: Clone>(
@@ -748,27 +844,18 @@ fn insert_at<V: Clone>(
     }
     return (slot, replaced);
   };
-  let found = nodes.node(slot).and_then(|node| child_of(node, first));
+  let found = nodes
+    .node(slot)
+    .and_then(|node| child_of(nodes, node, first));
   let replaced = match found {
     None => {
-      let leaf = nodes.alloc(Node {
-        label: rest.to_vec(),
-        value: Some(value),
-        children: Vec::new(),
-        count: 1,
-        holders: 1,
-      });
-      if let Some(node) = nodes.node_mut(slot) {
-        add_child(&mut node.children, first, leaf);
-      }
+      let leaf = leaf_of(nodes, rest, value);
+      add_child(nodes, slot, first, leaf);
       None
     }
     Some((index, child)) => {
-      let label = nodes
-        .node(child)
-        .map(|node| node.label.clone())
-        .unwrap_or_default();
-      let common = common_prefix(&label, rest);
+      let label = label_of(nodes, child);
+      let common = common_prefix(nodes.labels.get(label), rest);
       if common == label.len() {
         let below = rest.get(common..).unwrap_or_default();
         let (child, replaced) = insert_at(nodes, child, below, value, holders);
@@ -777,37 +864,25 @@ fn insert_at<V: Clone>(
       } else {
         // The key leaves the child's label partway: split the label there.
         let child = unique(nodes, child, holders);
-        let tail = label.get(common..).map(<[u8]>::to_vec).unwrap_or_default();
-        let tail_first = tail.first().copied().unwrap_or_default();
+        let (head, tail_first) = split_label(nodes, child, common);
         let child_count = nodes.count(child);
-        if let Some(node) = nodes.node_mut(child) {
-          node.label = tail;
-        }
-        let mut middle = Node {
-          label: label.get(..common).map(<[u8]>::to_vec).unwrap_or_default(),
-          value: None,
-          children: vec![(tail_first, child)],
-          count: child_count.saturating_add(1),
-          holders: 1,
-        };
+        let mut children = nodes.kids.alloc(&[(tail_first, child)]);
+        let mut middle_value = None;
         match rest.get(common..) {
           Some(below) if !below.is_empty() => {
-            let leaf = nodes.alloc(Node {
-              label: below.to_vec(),
-              value: Some(value),
-              children: Vec::new(),
-              count: 1,
-              holders: 1,
-            });
-            add_child(
-              &mut middle.children,
-              below.first().copied().unwrap_or_default(),
-              leaf,
-            );
+            let below_first = below.first().copied().unwrap_or_default();
+            let leaf = leaf_of(nodes, below, value);
+            children = with_child(&mut nodes.kids, children, below_first, leaf);
           }
-          _ => middle.value = Some(value),
+          _ => middle_value = Some(value),
         }
-        let middle = nodes.alloc(middle);
+        let middle = nodes.alloc(Node {
+          label: head,
+          value: middle_value,
+          children,
+          count: child_count.saturating_add(1),
+          holders: 1,
+        });
         set_child(nodes, slot, index, middle);
         None
       }
@@ -819,6 +894,18 @@ fn insert_at<V: Clone>(
     node.count = node.count.saturating_add(1);
   }
   (slot, replaced)
+}
+
+/// A new leaf holding `value` under the label `label`: its slot.
+fn leaf_of<V>(nodes: &mut Nodes<V>, label: &[u8], value: V) -> Slot {
+  let label = nodes.labels.alloc(label);
+  nodes.alloc(Node {
+    label,
+    value: Some(value),
+    children: store::Run::EMPTY,
+    count: 1,
+    holders: 1,
+  })
 }
 
 /// Removes `rest` below the node at `slot`, which holds it: the node's replacement (none when it is left empty, its
@@ -834,35 +921,24 @@ fn remove_at<V: Clone>(
   let removed = match rest.first().copied() {
     None => nodes.node_mut(slot).and_then(|node| node.value.take()),
     Some(first) => {
-      let found = nodes.node(slot).and_then(|node| child_of(node, first));
+      let found = nodes
+        .node(slot)
+        .and_then(|node| child_of(nodes, node, first));
       let Some((index, child)) = found else {
         return (Some(slot), None);
       };
       // The key goes on below the child only where it holds the child's whole label, as `get` matches it: a key that
       // leaves the label or ends inside it is not held, and takes nothing (red before: removing "ax" beside "ab" took
       // "ab"'s value; [`Ptrie::remove`] asks `get` first, so no caller met it).
-      let Some(label) = nodes
-        .node(child)
-        .filter(|node| rest.starts_with(&node.label))
-        .map(|node| node.label.len())
-      else {
+      let label = label_of(nodes, child);
+      if !rest.starts_with(nodes.labels.get(label)) {
         return (Some(slot), None);
-      };
-      let below = rest.get(label..).unwrap_or_default();
+      }
+      let below = rest.get(label.len()..).unwrap_or_default();
       let (child, removed) = remove_at(nodes, child, below, false, holders);
-      if let Some(node) = nodes.node_mut(slot) {
-        match child {
-          Some(child) => {
-            if let Some(entry) = node.children.get_mut(index) {
-              entry.1 = child;
-            }
-          }
-          None => {
-            if index < node.children.len() {
-              node.children.remove(index);
-            }
-          }
-        }
+      match child {
+        Some(child) => set_child(nodes, slot, index, child),
+        None => remove_child(nodes, slot, index),
       }
       removed
     }
@@ -878,6 +954,17 @@ fn remove_at<V: Clone>(
   (tidied(nodes, slot, holders), removed)
 }
 
+/// Drops the child at `index` of the unique-made node at `slot`.
+fn remove_child<V>(nodes: &mut Nodes<V>, slot: Slot, index: usize) {
+  let Some(children) = nodes.node(slot).map(|node| node.children) else {
+    return;
+  };
+  let children = nodes.kids.removed(children, index);
+  if let Some(node) = nodes.node_mut(slot) {
+    node.children = children;
+  }
+}
+
 /// The node at `slot`, below a map's root, after a change beneath it: freed when it is left with no value and no child,
 /// replaced by its only child when it is left a bare edge (the child takes the edge's bytes before its own), else itself.
 fn tidied<V: Clone>(
@@ -886,26 +973,28 @@ fn tidied<V: Clone>(
   holders: &mut impl Holders<V>,
 ) -> Option<Slot> {
   let node = nodes.node(slot)?;
-  let (bare, children) = (node.value.is_none(), node.children.clone());
+  let (bare, children) = (node.value.is_none(), node.children);
   if !bare {
     return Some(slot);
   }
-  match children.as_slice() {
-    [] => {
-      nodes.take(slot);
+  match children.len() {
+    0 => {
+      nodes.discard(slot);
       None
     }
-    [(_, only)] => {
-      let only = unique(nodes, *only, holders);
-      let mut label = nodes
-        .node(slot)
-        .map(|node| node.label.clone())
-        .unwrap_or_default();
+    1 => {
+      let only = nodes.kids.get(children).first().map(|(_, only)| *only)?;
+      let only = unique(nodes, only, holders);
+      let label = nodes
+        .labels
+        .joined(label_of(nodes, slot), label_of(nodes, only));
       if let Some(node) = nodes.node_mut(only) {
-        label.append(&mut node.label);
         node.label = label;
       }
-      nodes.take(slot);
+      // Its label went into the child's; its child list goes back to the store with its slot.
+      if let Some(node) = nodes.take(slot) {
+        nodes.kids.free(node.children);
+      }
       Some(only)
     }
     _ => Some(slot),
@@ -923,16 +1012,16 @@ fn cut_at<V: Clone>(
   holders: &mut impl Holders<V>,
 ) -> (Option<Slot>, Option<Shared>) {
   let slot = unique(nodes, slot, holders);
-  let found = rest
-    .first()
-    .and_then(|first| nodes.node(slot).and_then(|node| child_of(node, *first)));
+  let found = rest.first().and_then(|first| {
+    nodes
+      .node(slot)
+      .and_then(|node| child_of(nodes, node, *first))
+  });
   let Some((index, child)) = found else {
     return (Some(slot), None);
   };
-  let label = nodes.node(child).map_or(0, |node| node.label.len());
-  let common = nodes
-    .node(child)
-    .map_or(0, |node| common_prefix(&node.label, rest));
+  let label = label_of(nodes, child).len();
+  let common = common_prefix(nodes.labels.get(label_of(nodes, child)), rest);
   let (replacement, cut) = if common == rest.len() {
     // The prefix ends inside the child's label or at its end: every key below the child starts with it, and the link
     // to the child is the subtree's hold.
@@ -971,22 +1060,13 @@ fn relink_child<V>(
   replacement: Option<Slot>,
   taken: usize,
 ) {
-  let Some(node) = nodes.node_mut(slot) else {
-    return;
-  };
   match replacement {
-    Some(replacement) => {
-      if let Some(entry) = node.children.get_mut(index) {
-        entry.1 = replacement;
-      }
-    }
-    None => {
-      if index < node.children.len() {
-        node.children.remove(index);
-      }
-    }
+    Some(replacement) => set_child(nodes, slot, index, replacement),
+    None => remove_child(nodes, slot, index),
   }
-  node.count = node.count.saturating_sub(taken);
+  if let Some(node) = nodes.node_mut(slot) {
+    node.count = node.count.saturating_sub(taken);
+  }
 }
 
 /// A walk of a map in byte order, each node it visits counted.
@@ -1051,13 +1131,13 @@ impl Cursor {
         }
         nodes.visited.set(nodes.visited.get().saturating_add(1));
         self.key.truncate(base);
-        self.key.extend_from_slice(&node.label);
+        self.key.extend_from_slice(nodes.labels.get(node.label));
         if let Some(value) = &node.value {
           return Some((self.key.clone(), value));
         }
         continue;
       }
-      match node.children.get(next) {
+      match nodes.kids.get(node.children).get(next) {
         Some((_, child)) => {
           if let Some(top) = self.stack.last_mut() {
             top.1 = next.saturating_add(1);
@@ -1160,8 +1240,8 @@ mod tests {
   /// Every node's count is its subtree's values, and every non-root node has a label and is not a bare single edge.
   fn checked(nodes: &Nodes<u32>, slot: Slot, root: bool) -> usize {
     let node = nodes.node(slot).expect("a live node");
-    let below: usize = node
-      .children
+    let children = nodes.kids.get(node.children);
+    let below: usize = children
       .iter()
       .map(|(_, child)| checked(nodes, *child, false))
       .sum();
@@ -1170,18 +1250,16 @@ mod tests {
     if !root {
       assert!(!node.label.is_empty(), "an empty label below the root");
       assert!(
-        node.value.is_some() || node.children.len() > 1,
+        node.value.is_some() || children.len() > 1,
         "a bare edge left in place"
       );
     }
-    for pair in node.children.windows(2) {
+    for pair in children.windows(2) {
       assert!(pair[0].0 < pair[1].0, "children out of order");
     }
-    for (first, child) in &node.children {
-      assert_eq!(
-        nodes.node(*child).expect("a child").label.first(),
-        Some(first)
-      );
+    for (first, child) in children {
+      let label = nodes.node(*child).expect("a child").label;
+      assert_eq!(nodes.labels.get(label).first(), Some(first));
     }
     count
   }
@@ -1214,6 +1292,104 @@ mod tests {
       assert_eq!(trie.len(&nodes), 1);
       trie.release(&mut nodes, &mut counted);
     }
+  }
+
+  /// The frees made on each thread of this test binary, so a test counts its own (A-920 unit 0).
+  mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    struct Counting;
+
+    std::thread_local! {
+      static FREES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// The frees the calling thread has made so far.
+    pub(super) fn frees() -> u64 {
+      FREES.try_with(Cell::get).unwrap_or(0)
+    }
+
+    // SAFETY: every call is passed on to the system allocator unchanged; only a thread-local count is kept beside it.
+    unsafe impl GlobalAlloc for Counting {
+      unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { System.alloc(layout) }
+      }
+      unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _ = FREES.try_with(|frees| frees.set(frees.get() + 1));
+        // SAFETY: the caller's contract, passed on.
+        unsafe { System.dealloc(ptr, layout) }
+      }
+    }
+
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+  }
+
+  /// Shape: the paths of A-920's wide revision, whose retired member's release this test stands for.
+  const WIDE_PATHS: usize = 9000;
+
+  /// The `n` keys of a source tree's paths, 30 files a directory.
+  fn tree_paths(n: usize) -> Vec<Vec<u8>> {
+    (0..n)
+      .map(|at| format!("trunk/src/dir{:04}/file{:03}.c", at / 30, at % 30).into_bytes())
+      .collect()
+  }
+
+  /// A-920 unit 0 (main's ruling of 2026-11-27 23:08). Do: make a map of [`WIDE_PATHS`] source-tree paths, then
+  /// release it a node a step ([`Ptrie::releasing`], [`Nodes::release_step`]), counting the heap frees the release
+  /// makes on this thread. Expect every node freed, and at most one heap free a doubling of the release's own walk
+  /// stack (64, a `usize`'s bits): the nodes' labels and child lists go back to the arena's runs, never to the heap.
+  /// Red before: every node's label and child list was a heap block of its own (9,905 at a wide import's release).
+  #[test]
+  fn a_released_map_of_a_wide_revisions_paths_frees_no_label_or_child_list_to_the_heap() {
+    let mut nodes: Nodes<u32> = Nodes::default();
+    let mut map = Ptrie::new();
+    for (at, key) in tree_paths(WIDE_PATHS).iter().enumerate() {
+      map.insert(&mut nodes, key, at as u32, &mut Plain);
+    }
+    let live = nodes.live();
+    let mut releasing = map.releasing();
+    let before = counting::frees();
+    while nodes.release_step(&mut releasing, &mut Plain) {}
+    let freed = counting::frees() - before;
+    assert_eq!(nodes.live(), 0, "every node freed");
+    assert!(
+      freed <= u64::from(usize::BITS),
+      "the release of {live} nodes freed {freed} heap blocks"
+    );
+  }
+
+  /// A-920 unit 0's reuse, non-vacuous. Do: make a map of [`WIDE_PATHS`] paths, release it, and make it again in the
+  /// same arena. Expect the second making to take its runs from the freed ones (runs reused past the paths), and the
+  /// arena's run bytes no more after it than after the first.
+  #[test]
+  fn a_map_made_again_in_its_arena_takes_the_runs_its_release_gave_back() {
+    let mut nodes: Nodes<u32> = Nodes::default();
+    let keys = tree_paths(WIDE_PATHS);
+    let mut first = Ptrie::new();
+    for (at, key) in keys.iter().enumerate() {
+      first.insert(&mut nodes, key, at as u32, &mut Plain);
+    }
+    let bytes = nodes.run_bytes();
+    let (reused_before, _, _) = nodes.run_counts();
+    first.release(&mut nodes, &mut Plain);
+    let mut again = Ptrie::new();
+    for (at, key) in keys.iter().enumerate() {
+      again.insert(&mut nodes, key, at as u32, &mut Plain);
+    }
+    let (reused, _, _) = nodes.run_counts();
+    assert!(
+      reused - reused_before >= WIDE_PATHS as u64,
+      "{} runs reused",
+      reused - reused_before
+    );
+    assert_eq!(
+      nodes.run_bytes(),
+      bytes,
+      "the arena grew making the map again"
+    );
   }
 
   /// A map of the oracle's and the ordered map it is held to.
