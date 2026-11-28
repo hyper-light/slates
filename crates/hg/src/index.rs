@@ -246,6 +246,24 @@ pub struct ChangesetRow<'s> {
   pub branch: &'s [u8],
 }
 
+/// A log's row as a stream's index entry reads it ([`HgIndex::numbers_from`]): its number, its parents' and its link's
+/// numbers (a changeset links to itself), its node, its flags and its text's length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryNumbers {
+  /// Its number in its log.
+  pub rev: u32,
+  /// Its parents' numbers, [`NONE`] for none, as the rows keep them.
+  pub parents: [u32; 2],
+  /// The changeset's number it links to.
+  pub link: u32,
+  /// Its node.
+  pub node: Node,
+  /// Its flags.
+  pub flags: u16,
+  /// Its text's length.
+  pub len: u64,
+}
+
 /// A manifest's or file revision's row, read back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RevisionRow {
@@ -989,6 +1007,60 @@ impl HgIndex {
     }
     let row = self.rows.get(store, &log.row_key(rev))?;
     read_revision(&row)
+  }
+
+  /// `log`'s rows from revision `rev` on, in order, each as a stream's index entry reads it ([`EntryNumbers`]; none for
+  /// a row that does not decode), to the log's last: one range walk of the index (`Index::iter_range`, which opens only
+  /// the tables that can hold the log's keys), then a row a step, where a row looked up by its number searches them each time (goal 93,
+  /// hg's whole-history gap: a stream's index rows read 4.5 times a revision so).
+  pub fn numbers_from<'s>(
+    &'s self,
+    store: &'s ContentStore,
+    log: Log<'_>,
+    rev: u32,
+  ) -> impl Iterator<Item = Option<EntryNumbers>> + use<'s> {
+    let start = log.row_key(rev);
+    let changelog = log == Log::Changelog;
+    let prefix_len = start.len().saturating_sub(REV_BYTES);
+    let prefix = start
+      .get(..prefix_len)
+      .map(<[u8]>::to_vec)
+      .unwrap_or_default();
+    // The range's end: past every key of the log's rows (its prefix and any four bytes).
+    let end: Vec<u8> = prefix
+      .iter()
+      .copied()
+      .chain([u8::MAX; REV_BYTES + 1])
+      .collect();
+    self
+      .rows
+      .iter_range(store, (&start, &end))
+      .take_while(move |row| {
+        row.key().len() == prefix.len().saturating_add(REV_BYTES) && row.key().starts_with(&prefix)
+      })
+      .map(move |row| {
+        let rev = u32::from_be_bytes(row.key().get(prefix_len..)?.try_into().ok()?);
+        if changelog {
+          let found = read_changeset(&row)?;
+          return Some(EntryNumbers {
+            rev,
+            parents: [found.p1, found.p2],
+            link: rev,
+            node: found.node,
+            flags: found.flags,
+            len: found.len,
+          });
+        }
+        let found = read_revision(&row)?;
+        Some(EntryNumbers {
+          rev,
+          parents: [found.p1, found.p2],
+          link: found.link,
+          node: found.node,
+          flags: found.flags,
+          len: found.len,
+        })
+      })
   }
 
   /// Appends a group of changesets in the order it arrived; each one's number, the number it had already for one the

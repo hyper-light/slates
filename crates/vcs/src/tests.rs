@@ -446,7 +446,8 @@ fn parent_and_fork(store: &mut ContentStore) -> (Index, Index, u64) {
     (counters, IndexCounters::default())
   );
   assert_eq!(store.len(), contents);
-  let fences = u64::try_from(3 * (2 + FENCE_SLOT_BYTES)).unwrap();
+  // Each table's fence keeps its first and last keys, two bytes each, and its slot.
+  let fences = u64::try_from(3 * (2 + 2 + FENCE_SLOT_BYTES)).unwrap();
   assert_eq!(store.used(), used + fences);
   (parent, fork, fences)
 }
@@ -1841,6 +1842,102 @@ proptest! {
     prop_assert!(real.store.is_empty());
     prop_assert_eq!((real.store.used(), real.store.charged()), (0, 0));
   }
+}
+
+/// Inserts a row naming nothing under the two-byte `key`, its payload the key once more.
+fn insert_keyed(index: &mut Index, store: &mut ContentStore, key: [u8; 2]) {
+  assert_eq!(index.insert(store, row(&key, &[], &key)), Ok(Inserted::New));
+}
+
+/// The rows of `index` whose keys are in `[start, end)`, read through the range walk ([`Index::iter_range`]).
+fn read_range(
+  index: &Index,
+  store: &ContentStore,
+  (start, end): (&[u8], &[u8]),
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+  index
+    .iter_range(store, (start, end))
+    .map(|row| (row.key().to_vec(), row.body().to_vec()))
+    .collect()
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(200), ..ProptestConfig::default() }))]
+
+  /// Goal 93, hg's whole-history gap (main 01a20182's ruling of 2026-11-27 17:28): a range walk is the whole walk cut to
+  /// its range, whatever the runs' layout. Do: insert generated batches of two-byte keys, each batch sealed into a run of
+  /// its own or left in the tail (some into many tables, the tests' window being small), then walk generated ranges,
+  /// empty and inverted ones among them. Expect each range walk to read exactly the rows of the whole walk whose keys are
+  /// in `[start, end)`, in order.
+  #[test]
+  fn a_range_walk_is_the_whole_walk_cut_to_its_range(
+    batches in proptest::collection::vec((proptest::collection::btree_set(any::<[u8; 2]>(), 0..40), any::<bool>()), 0..8),
+    ranges in proptest::collection::vec((any::<[u8; 2]>(), any::<[u8; 2]>()), 1..12),
+  ) {
+    let mut store = ContentStore::new(1 << 22, WINDOW).unwrap();
+    let mut index = Index::new();
+    let mut held = BTreeSet::new();
+    for (keys, sealed) in &batches {
+      for key in keys {
+        if held.insert(*key) {
+          insert_keyed(&mut index, &mut store, *key);
+        }
+      }
+      if *sealed {
+        index.seal_all(&mut store).unwrap();
+      }
+    }
+    let whole = read(&index, &store);
+    for (start, end) in &ranges {
+      let expected: Vec<(Vec<u8>, Vec<u8>)> = whole
+        .iter()
+        .filter(|(key, _)| key.as_slice() >= start.as_slice() && key.as_slice() < end.as_slice())
+        .cloned()
+        .collect();
+      prop_assert_eq!(read_range(&index, &store, (start, end)), expected);
+    }
+    index.release(&mut store).unwrap();
+  }
+}
+
+/// Goal 93, hg's whole-history gap: a range walk opens no run outside its range (the non-vacuity count beside the oracle
+/// above). Do: seal three runs of keys `[round, item]` for rounds 0, 1 and 2, sixteen rows a round (more than one table a
+/// run at the tests' window), then walk round 1's keys, `[[1], [2])`, once by the range walk and once by `iter_from`
+/// stopped at its end, counting the content store's reads (`ContentStore::reads`) each takes. Expect the range walk to
+/// read exactly round 1's run's tables, and `iter_from` more: it opens a table of each other run to merge them.
+#[test]
+fn a_range_walk_opens_no_run_outside_its_range() {
+  let mut store = ContentStore::new(1 << 22, WINDOW).unwrap();
+  let mut index = Index::new();
+  for round in 0..3u8 {
+    for item in 0..16u8 {
+      insert_keyed(&mut index, &mut store, [round, item]);
+    }
+    index.seal_all(&mut store).unwrap();
+  }
+  let tables = index.run_tables();
+  assert_eq!(tables.len(), 3, "three runs");
+  let round_one = u64::try_from(tables.get(1).map_or(0, Vec::len)).unwrap();
+  let before = store.reads();
+  let ranged = index.iter_range(&store, (&[1], &[2])).count();
+  let range_reads = store.reads() - before;
+  let before = store.reads();
+  let from = index
+    .iter_from(&store, &[1])
+    .take_while(|row| row.key() < &[2][..])
+    .count();
+  let from_reads = store.reads() - before;
+  assert_eq!(
+    (ranged, from),
+    (16, 16),
+    "round 1's sixteen rows either way"
+  );
+  assert_eq!(range_reads, round_one, "only round 1's run's tables read");
+  assert!(
+    from_reads > range_reads,
+    "iter_from opens the other runs: {from_reads} against {range_reads}"
+  );
+  index.release(&mut store).unwrap();
 }
 
 /// A-722 part 4 (a large tail sealed over many turns). Do: insert the same forty rows into two indexes over two stores,
