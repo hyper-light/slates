@@ -435,6 +435,19 @@
 >   v1 retargeted to the newcomer meanwhile: not yet A-935's, one red against none in 16). Unproven guess for the stall:
 >   an object of an earlier landed record whose homes were the two dead (d and c), the healer not yet re-homing it before
 >   c died.
+> - **Not done, by ruling (main 01a20182's of 2026-11-27 22:35): a tighter reship rate for a holder answering `Behind`.**
+>   A record reships a target once a pass until it acknowledges (`merge_service::PendingGreen::next`, the stated bound:
+>   3 and 9 `Behind` a run in the stall red). Reshipping an unchanged `Behind` only after its chain read ends would need
+>   the read's end reported to the owner, a protocol step with no measured cost behind it; not once per install either,
+>   which would leave a quiet stretch's newcomer behind (the gap A-935 closed).
+> - **FIXED (w-shared, 2026-11-27; main 01a20182's reading of 22:09, winfleet-3's a935 arm64 red): a read past tolerance
+>   was never read again.** A newcomer's one chain read went past tolerance while its candidacy was owed ("answered by
+>   [c, the newcomer, a], nothing held"), and `ledger_read`'s mark refused every later read of the register for good: 52
+>   `Behind` answers after it, chain reads still 1, until a935's bound ran out. The mark now keeps the configuration
+>   version it was made under and refuses only while that configuration stands; once an install moves it the next ask
+>   reads again, counted `fleet.ledger_read.read_again_after_install` (one read an install, bounded by the registers
+>   held). Red first at the mark's own level (the fleet shape is 1 of 8 on a slow runner):
+>   `ledger_read::past_tolerance_tests::a_read_past_tolerance_is_read_again_once_an_install_moves_the_configuration`.
 > - **Not recurred since A-936 (main 01a20182's ruling of 2026-11-27 21:08): a superseded owner's write answered
 >   `FsDone` on Windows** (`a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost`, diag 12 at a0d39a8c1,
 >   both lanes). Suspected: a holder whose install walk had not reached the volume's copy still named the old owner and
