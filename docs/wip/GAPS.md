@@ -4360,9 +4360,9 @@
 > alike; U3 BUILT, the change index; U4 BUILT, `file_removed` and the `*_changed` maps written aside; U5 BUILT, the
 > identity's marks aside; U6 BUILT, the seven chunk-free current maps forked into the stage; U7 BUILT, the content map
 > forked and U5's drain-first rule deleted; U8 BUILT, the content history forked with chunk-holding copies and a
-> stage's re-anchor in full, closing U7's gap (design's part 3c). Owed, in main's order of 03:10: the commit's scalars
-> written back at the publish, then the staged commit wired into `repository::push`'s landing (t_a752's 14 ms the
-> bar). Found by reading (2026-11-28, not worked): `file_removed` keeps only a
+> stage's re-anchor in full, closing U7's gap; U9 BUILT, the commit's scalars the stage's own and the stage charged
+> (design's part 3c). Owed, in main's order of 03:10: the staged commit wired into `repository::push`'s landing, its
+> own integration red on that path (t_a752's 14 ms the bar). Found by reading (2026-11-28, not worked): `file_removed` keeps only a
 > path's latest removal, so `stack::levels`'s `== version` read (`levels.rs`:293) and its span read (:326) miss an
 > earlier removal that a later one overwrote.
 >

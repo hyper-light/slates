@@ -58425,6 +58425,21 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
     unit 9, the anchor repointed). The chunk recount holds of a history with no layered anchor; a layer holds its
     overwritten bytes' chunk outside any value, so the overwrite tests hold every chunk's holds to what they were.
     Removed: `Dim::get_mut` (unit 1's), its one caller now `get_mut_held`.
+  - **U9, the commit's scalars the stage's own, and its stage charged** (main's rulings of 03:10 and 04:44). The
+    commit wrote its running totals in place as it went (the history's current, list, named and re-anchored figures,
+    the IPC history's bytes, the change index's bytes, the commit's counters) and so did the chunk table's byte
+    counters, all of which the retention charge and the status read. They are the stage's own now
+    (`staging::Scalars`, `history::ChunkCounters`): copied at its begin, swapped in for each step with its forks and
+    back after, written in at its publish, dropped at a refusal. The forks are given back against the stage's scalars,
+    at a refusal and at a publish alike, so what they alone held leaves the stage's totals, never the published ones.
+    The stage is charged: `Green::staging_bytes` is the retention its scalars charge past the published ones,
+    `Green::staging_bound` the increment's reservation (`history_reservation` and `changes_reservation`, A-16), stated
+    before the stage begins. The six-guard red written before U1 is retired (main's ruling of 04:44): its reader,
+    refusal and fork guards are U0 to U8's, its bytes and bound these. Red first (`engine::publish_tests`): the scalars
+    unchanged between every two steps and after a refusal at any turn (red: a reader saw the stage's scalars at unit
+    8; a stage given up after 8 turns left them changed; the same with the swap a no-op); after each publish the
+    serial twin's scalars and the history's running total its recount; the stage's bytes within the bound and, at its
+    last step, exactly the serial twin's retention growth by the same work (red with the bytes held at 0).
 - **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
   hard links, a copy's tree; the change build's end (the map's and trees' apply, O(the change)). Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;

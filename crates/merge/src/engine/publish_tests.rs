@@ -788,6 +788,94 @@ fn content_history_given_up_after(works: &[Changes], turns: u64) -> Result<bool,
   Ok(staged)
 }
 
+/// The commit's retention-bearing scalars as every reader reads them (the retention charge, the history's running
+/// totals, the change index's bytes) and its counters: what a stage's turns must leave as published.
+fn scalars_read(green: &Green) -> String {
+  format!(
+    "{} {} {} {} {:?} {:?} {} {}",
+    green.retention_charge(),
+    green.history_current,
+    green.history_lists,
+    green.special_history_bytes,
+    green.history_named,
+    green.history_reanchored,
+    green.history_reanchored_values,
+    green.changes_bytes,
+  )
+}
+
+/// What staging `inc`'s accepted verdict on `green` showed of its scalars: the most bytes its stage held, the bound
+/// stated before it began, and whether a reader between two steps saw the stage's scalars.
+struct ScalarsSeen {
+  version: Option<u64>,
+  most_bytes: u64,
+  /// The stage's bytes at its last step, staged whole: what its publish adds to the retention charge.
+  staged_bytes: u64,
+  bound: u64,
+}
+
+/// Stages `inc`'s accepted verdict on `green` one unit a step, its scalars read between every two steps
+/// ([`scalars_read`]) and its stage's bytes taken after each ([`Green::staging_bytes`]), then publishes it.
+fn scalars_unseen(green: &mut Green, inc: &Increment) -> Result<ScalarsSeen, String> {
+  let mut seen = ScalarsSeen {
+    version: None,
+    most_bytes: 0,
+    staged_bytes: 0,
+    bound: green.staging_bound(inc),
+  };
+  let Judgment::Accepted(held) = green.judge(inc) else {
+    return Ok(seen);
+  };
+  let before = scalars_read(green);
+  let mut staging = green.begin_staging(held);
+  loop {
+    let stepped = green.staging_step(&mut staging, &mut || true);
+    seen.staged_bytes = green.staging_bytes(&staging);
+    seen.most_bytes = seen.most_bytes.max(seen.staged_bytes);
+    if scalars_read(green) != before {
+      return Err(format!(
+        "a reader saw the stage's scalars at unit {}",
+        staging.units()
+      ));
+    }
+    match stepped {
+      StagingStep::More => {}
+      StagingStep::Staged => break,
+      StagingStep::Lend(unlent) => return Err(format!("no named text here, yet {unlent:?}")),
+    }
+  }
+  seen.version = green.publish(staging).map(|(version, _)| version);
+  Ok(seen)
+}
+
+/// [`changes_given_up_after`] with the scalars the guard ([`scalars_read`]).
+fn scalars_given_up_after(works: &[Changes], turns: u64) -> Result<bool, String> {
+  let Some((last, before)) = works.split_last() else {
+    return Ok(true);
+  };
+  let mut green = submitted_in_every_dimension(before);
+  let inc = work_in_every_dimension(&green, last, u64::MAX);
+  let Judgment::Accepted(held) = green.judge(&inc) else {
+    return Ok(true);
+  };
+  let was = scalars_read(&green);
+  let mut staging = green.begin_staging(held);
+  let mut staged = false;
+  for _ in 0..turns {
+    if let StagingStep::Staged = green.staging_step(&mut staging, &mut || true) {
+      staged = true;
+      break;
+    }
+  }
+  green.abandon_staging(staging);
+  if scalars_read(&green) != was {
+    return Err(format!(
+      "a stage given up after {turns} turns left the scalars changed"
+    ));
+  }
+  Ok(staged)
+}
+
 /// The works [`proptest`] generates: one to eight, each of one to four changes.
 fn works() -> impl Strategy<Value = Vec<Changes>> {
   prop::collection::vec(
@@ -1080,6 +1168,51 @@ proptest! {
       let prefix = steps.get(..end).unwrap_or_default();
       for turns in 0u64.. {
         if content_history_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
+          break;
+        }
+      }
+    }
+  }
+
+  /// A-752 part 3c U9 (the commit's scalars written back at its publish, and its stage charged; main 01a20182's rulings
+  /// of 2026-11-28 03:10 and 04:44, the six-guard red's bytes and bound folded in). Do: as U2's, the scalars read
+  /// between every two steps and the stage's bytes after each. Expect the scalars as before the stage between its steps;
+  /// after each publish the same version and scalars as the serial twin's, and the history's running total its recount
+  /// (balanced accounting); the stage's bytes within the bound stated before it began, and at its last step exactly
+  /// what the work grows the serial twin's retention charge by. Red before: the commit wrote its scalars in place, and
+  /// the stage charged nothing.
+  #[test]
+  fn a_staged_verdicts_scalars_move_only_at_its_publish_and_its_stage_is_charged(steps in works()) {
+    let (mut whole, mut staged) = (submitted_in_every_dimension(&[]), submitted_in_every_dimension(&[]));
+    for (id, changes) in (1u64..).zip(&steps) {
+      let inc = work_in_every_dimension(&whole, changes, id);
+      let retained = whole.retention_charge();
+      let (outcome, _) = whole.submit_resolved(&inc);
+      let grown = u64::try_from(whole.retention_charge().saturating_sub(retained)).unwrap_or(u64::MAX);
+      let seen = scalars_unseen(&mut staged, &inc).map_err(TestCaseError::fail)?;
+      let accepted = match outcome {
+        super::Outcome::Accepted { version } | super::Outcome::Identical { version } => Some(version),
+        _ => None,
+      };
+      prop_assert_eq!(seen.version, accepted);
+      prop_assert!(seen.most_bytes <= seen.bound, "stage {} past its bound {}", seen.most_bytes, seen.bound);
+      // Charged exactly: a staged verdict's bytes are what its publish adds to the retention charge, the serial twin's
+      // growth by the same work (non-vacuous wherever the work retains anything).
+      if seen.version.is_some() {
+        prop_assert_eq!(seen.staged_bytes, grown, "the stage charged otherwise than the work retains");
+      }
+      prop_assert_eq!(scalars_read(&staged), scalars_read(&whole));
+      prop_assert_eq!(staged.history_bytes(), staged.history_bytes_recounted());
+    }
+  }
+
+  /// A-752 part 3c U9 (a refusal at every turn, its last too). Expect the scalars as before.
+  #[test]
+  fn a_stage_given_up_at_any_turn_leaves_the_scalars_as_they_were(steps in works()) {
+    for end in 1..=steps.len() {
+      let prefix = steps.get(..end).unwrap_or_default();
+      for turns in 0u64.. {
+        if scalars_given_up_after(prefix, turns).map_err(TestCaseError::fail)? {
           break;
         }
       }

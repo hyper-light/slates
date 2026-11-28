@@ -235,6 +235,22 @@ impl Source {
   }
 }
 
+/// A chunk table's byte counters (A-752 part 3c U9): what a stage keeps of its own while it runs, so a reader between its
+/// steps reads the published bytes ([`Chunks::swap_counters`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ChunkCounters {
+  bytes: usize,
+  named: usize,
+  entries: usize,
+}
+
+impl ChunkCounters {
+  /// The bytes the live chunks hold, owned or named, and the layers' entries ([`Chunks::bytes`]).
+  pub(crate) fn bytes(&self) -> usize {
+    self.bytes.saturating_add(self.entries)
+  }
+}
+
 /// The arena of immutable chunks a green's history values share (module docs).
 #[derive(Debug, Default)]
 pub(crate) struct Chunks {
@@ -275,6 +291,23 @@ impl Chunks {
   /// The bytes the live chunks hold, owned or named, and the layers' entries.
   pub(crate) fn bytes(&self) -> usize {
     self.bytes.saturating_add(self.entries)
+  }
+
+  /// Exchanges this table's byte counters with `counters` (A-752 part 3c U9): a stage's in place for its step, the
+  /// published back after it. Twice is none.
+  pub(crate) fn swap_counters(&mut self, counters: &mut ChunkCounters) {
+    std::mem::swap(&mut self.bytes, &mut counters.bytes);
+    std::mem::swap(&mut self.named, &mut counters.named);
+    std::mem::swap(&mut self.entries, &mut counters.entries);
+  }
+
+  /// This table's byte counters, copied: where a stage's begin.
+  pub(crate) fn counters(&self) -> ChunkCounters {
+    ChunkCounters {
+      bytes: self.bytes,
+      named: self.named,
+      entries: self.entries,
+    }
   }
 
   /// The bytes the live chunks own: what the history copied (A-728: none for a value stored whole).

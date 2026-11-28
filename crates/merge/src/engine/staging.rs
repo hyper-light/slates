@@ -13,8 +13,12 @@
 //! a reader's fold of the identity reads only what is published, and a node of the content history the stage copies
 //! holds its values' chunks (`history::HistoryHolders`), so the stage's copies and the published values release each
 //! chunk once. A staged commit re-anchors a changed file's history in full, never by the layered route, which repoints
-//! the path's shared anchor chunk (U8). **Owed:** the commit's scalars written back at the publish, then the staged
-//! commit wired into a push's landing (main 01a20182's order of 2026-11-28 03:10).
+//! the path's shared anchor chunk (U8). The commit's scalars (the history's and the change index's running totals,
+//! the chunk table's byte counters, the commit's counters) are the stage's own while it runs ([`Scalars`], U9): a
+//! reader's retention charge between steps is the published one, the stage's bytes are what its scalars charge past
+//! it ([`Green::staging_bytes`]), at most the increment's reservation ([`Green::staging_bound`]). **Owed:** the
+//! staged commit wired into a push's landing (main 01a20182's order of 2026-11-28 03:10), with its own integration
+//! red on that path.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -90,9 +94,49 @@ fn take_back<K: Ord, E>(marks: BTreeMap<K, Option<usize>>, histories: &mut BTree
   }
 }
 
+/// The commit's scalars, a stage's own while it runs (A-752 part 3c U9; main 01a20182's rulings of 2026-11-28 03:10 and
+/// 04:44): the history's and the change index's running totals, the chunk table's byte counters and the commit's
+/// counters. Swapped in for each of the stage's steps with its forks and back after it, so a reader between steps
+/// reads the published ones (the retention charge among them); written in at the publish, and dropped at a refusal.
+#[derive(Debug)]
+struct Scalars {
+  history_current: usize,
+  history_lists: usize,
+  history_named: (u64, u64),
+  history_reanchored: (u64, u64, u64),
+  history_reanchored_values: u64,
+  special_history_bytes: usize,
+  changes_bytes: usize,
+  chunks: crate::history::ChunkCounters,
+  commit_paths_made: u64,
+  named_buffers_freed: u64,
+  commit_tree_paths: u64,
+  node_moves_walked: u64,
+  node_moves_units: u64,
+  copies_grafted: u64,
+  copies_refused: u64,
+  mapped_files_made: u64,
+  identities_taken_at_change: u64,
+}
+
+impl Scalars {
+  /// The retention these scalars charge ([`Green::retention_charge`]'s rule, over them).
+  fn retention(&self) -> usize {
+    self
+      .chunks
+      .bytes()
+      .saturating_add(self.history_lists)
+      .saturating_sub(self.history_current)
+      .saturating_add(self.special_history_bytes)
+      .saturating_add(self.changes_bytes)
+  }
+}
+
 /// A held verdict being staged ([`Green::begin_staging`]): its commit under way, and whether it is staged whole.
 pub struct Staging {
   committing: Committing,
+  /// The stage's scalars ([`Scalars`]), out of place between its steps.
+  scalars: Scalars,
   /// The stage's forks of the current maps; `None` once given back.
   forks: Option<Forks>,
   staged: bool,
@@ -121,12 +165,6 @@ pub enum StagingStep {
 }
 
 impl Staging {
-  /// The bytes its stage holds now, charged to its owner: at most [`Green::staging_bound`] of its verdict. None yet:
-  /// what it appends in place is charged as the commit's own retention (owed: the forked maps' and the held copies').
-  pub fn bytes(&self) -> u64 {
-    0
-  }
-
   /// The steps it has taken.
   pub fn units(&self) -> u64 {
     self.units
@@ -134,18 +172,90 @@ impl Staging {
 }
 
 impl Green {
-  /// The most bytes a stage of `judged` holds ([`Staging::bytes`]), stated before it begins so its owner charges it.
-  /// None yet (module docs).
-  pub fn staging_bound(&self, _judged: &Judged) -> u64 {
-    0
+  /// The most bytes a stage of increment `inc` holds ([`Green::staging_bytes`]), stated before it begins so its owner
+  /// charges it: the retention its commit may add, as the owner secures it before a verdict (`history_reservation` and
+  /// `changes_reservation`, A-16). The nodes the stage's forks copy are the arenas' own, counted there.
+  pub fn staging_bound(&self, inc: &crate::engine::Increment) -> u64 {
+    let reserved = self
+      .history_reservation(inc)
+      .saturating_add(self.changes_reservation(inc));
+    u64::try_from(reserved).unwrap_or(u64::MAX)
+  }
+
+  /// The bytes `staging`'s stage holds now, charged to its owner: the retention its scalars charge past the published
+  /// ones (A-752 part 3c U9), at most [`Green::staging_bound`] of its increment.
+  pub fn staging_bytes(&self, staging: &Staging) -> u64 {
+    let published = self.scalars_now().retention();
+    u64::try_from(staging.scalars.retention().saturating_sub(published)).unwrap_or(u64::MAX)
+  }
+
+  /// The green's scalars now ([`Scalars`]).
+  fn scalars_now(&self) -> Scalars {
+    Scalars {
+      history_current: self.history_current,
+      history_lists: self.history_lists,
+      history_named: self.history_named,
+      history_reanchored: self.history_reanchored,
+      history_reanchored_values: self.history_reanchored_values,
+      special_history_bytes: self.special_history_bytes,
+      changes_bytes: self.changes_bytes,
+      chunks: self.chunks.counters(),
+      commit_paths_made: self.commit_paths_made,
+      named_buffers_freed: self.named_buffers_freed,
+      commit_tree_paths: self.commit_tree_paths,
+      node_moves_walked: self.node_moves_walked,
+      node_moves_units: self.node_moves_units,
+      copies_grafted: self.copies_grafted,
+      copies_refused: self.copies_refused,
+      mapped_files_made: self.mapped_files_made.get(),
+      identities_taken_at_change: self.identities_taken_at_change.get(),
+    }
+  }
+
+  /// Exchanges the green's scalars with `scalars`: a stage's in place for its step, the published back after it. Twice
+  /// is none.
+  fn swap_scalars(&mut self, scalars: &mut Scalars) {
+    std::mem::swap(&mut self.history_current, &mut scalars.history_current);
+    std::mem::swap(&mut self.history_lists, &mut scalars.history_lists);
+    std::mem::swap(&mut self.history_named, &mut scalars.history_named);
+    std::mem::swap(
+      &mut self.history_reanchored,
+      &mut scalars.history_reanchored,
+    );
+    std::mem::swap(
+      &mut self.history_reanchored_values,
+      &mut scalars.history_reanchored_values,
+    );
+    std::mem::swap(
+      &mut self.special_history_bytes,
+      &mut scalars.special_history_bytes,
+    );
+    std::mem::swap(&mut self.changes_bytes, &mut scalars.changes_bytes);
+    self.chunks.swap_counters(&mut scalars.chunks);
+    std::mem::swap(&mut self.commit_paths_made, &mut scalars.commit_paths_made);
+    std::mem::swap(
+      &mut self.named_buffers_freed,
+      &mut scalars.named_buffers_freed,
+    );
+    std::mem::swap(&mut self.commit_tree_paths, &mut scalars.commit_tree_paths);
+    std::mem::swap(&mut self.node_moves_walked, &mut scalars.node_moves_walked);
+    std::mem::swap(&mut self.node_moves_units, &mut scalars.node_moves_units);
+    std::mem::swap(&mut self.copies_grafted, &mut scalars.copies_grafted);
+    std::mem::swap(&mut self.copies_refused, &mut scalars.copies_refused);
+    scalars.mapped_files_made = self.mapped_files_made.replace(scalars.mapped_files_made);
+    scalars.identities_taken_at_change = self
+      .identities_taken_at_change
+      .replace(scalars.identities_taken_at_change);
   }
 
   /// Begins staging `judged`, a verdict held at this green's head ([`Green::staging_step`]): one stage at a time.
   pub fn begin_staging(&mut self, judged: Judged) -> Staging {
     self.stage_marks = Some(Box::default());
     let forks = self.fork_maps();
+    let scalars = self.scalars_now();
     Staging {
       committing: self.begin_committing(judged),
+      scalars,
       forks: Some(forks),
       staged: false,
       units: 0,
@@ -162,9 +272,11 @@ impl Green {
     let Some(forks) = staging.forks.as_mut() else {
       return StagingStep::Staged;
     };
-    // The commit reads and writes the stage's forks, never the published maps (A-752 part 3c U6).
+    // The commit reads and writes the stage's forks and scalars, never the published ones (A-752 part 3c U6, U9).
     self.swap_forks(forks);
+    self.swap_scalars(&mut staging.scalars);
     let stepped = self.commit_unit(&mut staging.committing, spent);
+    self.swap_scalars(&mut staging.scalars);
     self.swap_forks(forks);
     if let StagingStep::Staged = stepped {
       staging.staged = true;
@@ -255,7 +367,9 @@ impl Green {
       return None;
     }
     let mut staging = staging;
-    // The stage's forks become the green's maps; the published roots they replace are given back (A-752 part 3c U6).
+    // The stage's scalars become the green's, then its forks the green's maps, the published roots they replace given
+    // back against the stage's scalars (A-752 part 3c U6, U9): what those roots alone held leaves the new totals.
+    self.swap_scalars(&mut staging.scalars);
     if let Some(mut forks) = staging.forks.take() {
       self.swap_forks(&mut forks);
       self.release_forks(forks);
@@ -273,8 +387,12 @@ impl Green {
     // A run that ended recorded its version's change entries, above the head (A-752 part 3c U3): taken out. The earlier
     // entries it would have marked no longer last are marked only at a publish.
     let mut staging = staging;
+    // The forks given back against the stage's scalars, which are then dropped: the published ones never moved (A-752
+    // part 3c U9).
     if let Some(forks) = staging.forks.take() {
+      self.swap_scalars(&mut staging.scalars);
       self.release_forks(forks);
+      self.swap_scalars(&mut staging.scalars);
     }
     let ended = staging
       .committing
