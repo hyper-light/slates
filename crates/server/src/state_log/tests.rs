@@ -7,7 +7,7 @@ use slates_db::catalog::{
 };
 use slates_db::register::{HostId, ObjectId, Record};
 
-use super::{PartRefusal, StateLogs, judge, record_of, value_of};
+use super::{PartRefusal, StateLogs, Waited, judge, record_of, value_of};
 
 /// A repository on a partition, its id's last byte `serial`.
 fn repository(serial: u8) -> RepositoryId {
@@ -526,4 +526,27 @@ fn a_log_kept_for_its_newest_part_is_forgettable_only_once_every_candidate_holds
   }
   assert!(owed_positions(&logs, names_register).is_empty());
   assert_eq!(logs.bytes(), value_of(&phases).len());
+}
+
+/// A-936's replay half, the barrier's rule (main 01a20182's ruling of 2026-11-27 20:19): a push's barrier is not given up
+/// while what it waits for moves, and is once it stands still a whole window. Do: a window of 10; a mark rising by one
+/// every 6 (a replica build's work done rising as its store's replay fetches a name a second, run 2's shape), then the
+/// same wait with the mark flat (the work done as it was before the replay counted). Expect the rising one never
+/// expired over 60, and the flat one expired at 10.
+#[test]
+fn a_barrier_is_not_given_up_while_its_mark_rises_and_is_once_it_stands_still() {
+  let window = 10;
+  let mut rising = Waited::begun_at(0, 0);
+  for step in 1..=10u64 {
+    assert!(
+      !rising.expired_at((step, window), step * 6),
+      "rising at {step}"
+    );
+  }
+  let mut flat = Waited::begun_at(0, 0);
+  assert!(!flat.expired_at((0, window), 6), "within the window");
+  assert!(
+    flat.expired_at((0, window), 10),
+    "a whole window standing still"
+  );
 }

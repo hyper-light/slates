@@ -66735,3 +66735,15 @@ Applied in the same change to:
     kind in `every_message`'s round trip and the unknown-kind refusal moved past it.
 - **Applied in the same change to:** `crates/cluster/src/content.rs`, `crates/server/src/{fleet,merge_service,
   state_log,replica_build}.rs`, `crates/server/tests/fleet.rs`, GAPS.
+- **The replay half (main 01a20182's ruling of 2026-11-27 20:19, its (i)).** A replica build that waits on its
+  repository's store's replay (`replica_build::laid_out`) made no turn, so it answered `ReplicaBuilding` at 0 through
+  the replay, and the barrier gave up while the replay moved (a914 at 69fbc8de0 run 2: two region reads, each spending
+  its whole share on d, just dead and not yet suspected, 2 s at 0 turns). Now the work done a build reports is its turns
+  and the most of its store's replay it saw (`VcsStores::rebuild_steps`: the records replayed and the names fetched from
+  the region, `rebuild_fetched`, reset at each rebuild's start and bounded by the partition's repositories), which only
+  rises (`replica_build::replayed_seen`). The barrier's rule is unchanged: movement counts once per target, version and
+  work done, which only rises. The barrier is right whatever a read costs; a read's cost itself is A-936's next item,
+  the hedged region read. Units: `state_log::tests::a_barrier_is_not_given_up_while_its_mark_rises_and_is_once_it_stands_still`,
+  `replica_build::tests::a_waiting_builds_replay_seen_rises_with_its_steps_and_never_falls`,
+  `vcs_store::tests::a_rebuilds_steps_are_its_records_replayed_and_names_fetched`; main's ×16's run 2 is the field
+  evidence.
