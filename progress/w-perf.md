@@ -883,3 +883,11 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     second cut). It asserts left > 0 and resumed == left. Proof is main's next diag on TSan and windows-11-arm.
   - Next: the cadence re-land (A-930 part 3, plan (a): every publish_shard asks; the byte rule gates only the catch-up's
     chain; image_retry_owed drains first; reds (i)-(iv), (i) at w-svn's level too), then the live whole builds' red.
+- 2026-11-27 16:41 PST (written then):
+  - LANDED 791ea60c5: revert of 43a8563a2's mark rule (main's a914 bisect; (C)'s floor kept; the proptest stays seeded
+    and passes under the floor). Suspected mechanism in GAPS, OWED to w-shared with a red.
+  - BUILT, not on main: the cadence re-land under plan (a), agents/w-perf-cadence at 8974631df (77c2b23d4 over
+    791ea60c5). Every publish_shard asks; the catch-up's publication does not (publish_shard_unasked); the sweep
+    drains first, begins a due cut while busy, asks once idle. Four reds, each checked against what it guards; chain
+    132 cuts / 1,884,475 B against 2 / 171,629 B. Focused 68 on the merge.
+  - Waiting on main: the 57k round with samplers on that tip; it lands only if clean.
