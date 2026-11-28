@@ -823,3 +823,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - ce318a92b: a build waiting on its store's replay reports the replay's steps (units as ruled).
 - 9c2a54f75: a log for live entries admitted under a walk-lagged copy (item 1, superseded owner's FsDone); Daemon::route_view (item 2: the stale-creator skip reads retired/completed, both false after readmission, even on the Mac); a934's held watch bounded at 150 periods (item 3 was the test).
 - Waiting: main's focused Windows diag; rulings on item 2's product gap and on item 1's fix (install_on_copy before admission). Then (b), the hedged region read.
+
+## 2026-11-27 21:05 PST: A-921 part 2 skip fixed (slates bd92839b7)
+- RegionalConfiguration::superseded kept past readmission, read by routing alone; regional layout 8 (layout 7 read with none); bound completed_bound, a let-go costing one refused forward.
+- Red on the Mac: the stranger's route of an unrouted object of a's named a; now None. db 103/103, cluster 260/260, fleet A-921 3/3.
+- Waiting: main's Windows diag (item 1 lagging-copy count). Then items 4 and 5, then the hedged read (b) and the kept-v1 Behind bound.
