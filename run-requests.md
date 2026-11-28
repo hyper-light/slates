@@ -7688,3 +7688,20 @@ At or past 6ef619631, on AC, N runs of each, alone (debug, macOS arm64):
 - `cargo test -p slates-server --test fleet -- --exact --nocapture a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once`
   Green: `(other version, unanswered) [0, n>=1]`, the push landed or refused only after its window. Red: other version
   >= 1, or `[0, 0]` (the dead home's exchange settled neither way: tell me).
+
+## 2026-11-28 w-git, the encode keep's slice: git/git v2.0.0's push encoded under load (main 01a20182's ruling of 00:33)
+
+At or past the tip carrying the encode keep's slice (named in w-git's landing note), release, a loaded host (the
+11-20 spin was adacachy at load 31-55; the Studio or this Mac under its usual load is fine, the load named):
+- `PUSH_REFS='v2.0.0^{commit}:refs/heads/master' ci/interop/git-matrix.sh target/release/slates
+  ~/.local/state/w-svn/fixtures/git-2000/src.git <empty scratch dir>` (src.git is a bare git/git clone holding
+  v2.0.0; any git/git mirror does). The push, then the clone rows, encode its first version's fragments.
+- Read before the push and after the last row, from the anchor's daemon (`slates status --json`, the daemon's
+  counters): `vcs_store.git_encode.units_past_budget`, its `.walk` / `.gather` / `.encode` / `.keep`, and
+  `vcs_store.git_encode.turns`.
+- Read in the anchor's log: every `slates daemon: shard N is spinning: ... ms of CPU without a step` line (the task
+  it names), and the run's spins / kills / restarts.
+- Green: no spinning line naming the git encode (`git_encode`, `encode_ahead`, `encode_within`); `.keep` 0 past
+  budget, or where any, fewer units past than before the slice. Red: a spinning line in the encode, or `.keep` past
+  budget as before; send me the line and the four by-stage counts. The encoding's start (`Encoding::fragments`
+  reading D(k) whole) is the next piece, so a `.walk` count past budget is expected until it lands.
