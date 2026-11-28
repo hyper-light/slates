@@ -885,3 +885,9 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   stepped encoding 19,499 frees to at most 2 (0 in the shard's kept room); the import batch's measure takes the room too;
   the wide move asserts both kept rooms reused.
 - Next: the pile by phase, stage.recording first, probe first (test-only); main's three-arm regime table owed to me.
+
+## 2026-11-28 04:46 — A-920 measure's commit state to the reaper (main at a5340e6ff)
+- a5340e6ff (commit e8deb6ee3): ImportBatch::measure_pending hands the Committing to the reaper whole; the measures'
+  frees of 64 KiB or more 8/12 to 0; committing_reaped and committing_dropped_inline counted.
+- Pile by phase probe (patch 162): between polls 53-91 MB, landing.apply 26-37, stage.recording 24-30 (GAPS).
+- Next: (2) tag the between-polls frees by task and size (probe first), then (3) landing.apply, stage.recording.
