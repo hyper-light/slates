@@ -1285,6 +1285,40 @@ pub(crate) const IMAGE_SKIPPED: &str = "vcs_store.image.publications_skipped";
 /// yet due (A-930's cadence, plan (a) of 2026-11-27: the byte rule gates only the catch-up's chain; every publication
 /// asks, so none defers).
 pub(crate) const IMAGE_CHAIN_STOPPED: &str = "vcs_store.image.chain_stopped";
+/// Format: the status counter of the most bytes one borrow of the shard's state freed into the frees the arena holds
+/// for the committed image ([`note_borrow_held`]).
+pub(crate) const IMAGE_HELD_BORROW_MOST: &str = "vcs_store.image.held_borrow_most_bytes";
+
+/// Notes what one borrow of the shard's state, at `site`, freed into the frees the content arena holds for the
+/// committed image, `before` bytes when it began (main's 57k at 1361cd1b6, 2026-11-27 18:27: each run's held peak was
+/// reached inside one borrow, 190 to 290 MB, which no look at a borrow's close can bound). The most any borrow freed
+/// is counted ([`IMAGE_HELD_BORROW_MOST`]), and each doubling of it past a copy slice logged with the borrow's site,
+/// so the borrow that frees without bound is named. One subtraction a borrow, none past it where nothing was freed.
+pub(crate) fn note_borrow_held(
+  state: &mut ShardState,
+  before: usize,
+  site: &'static std::panic::Location<'static>,
+) {
+  let after = state.store.content.arena().deferred_bytes();
+  let freed = u64::try_from(after.saturating_sub(before)).unwrap_or(u64::MAX);
+  if freed == 0 {
+    return;
+  }
+  let most = state
+    .refusals
+    .get(IMAGE_HELD_BORROW_MOST)
+    .copied()
+    .unwrap_or(0);
+  if freed > most.saturating_mul(2) && freed > state.config.copy_slice_bytes() {
+    slates_machine::log_line!(
+      "slates-server: partition {}: one borrow at {site} freed {freed} bytes into the frees held for the committed \
+       image ({after} held now; the most one borrow freed before, {most})",
+      state.partition
+    );
+  }
+  state.count_max(IMAGE_HELD_BORROW_MOST, freed);
+}
+
 /// Format: the status counter of cuts begun because the shard went idle with changes waiting for a cut not yet due.
 pub(crate) const IMAGE_IDLE_CUTS: &str = "vcs_store.image.idle_cuts";
 /// Format: the status counter of cuts a sweep pass began because the changes waiting, with the arena's held frees, had
