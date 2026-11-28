@@ -52,7 +52,8 @@ use super::learn::{Clock, Exchange};
 use super::packed::{self, InPack, PackSource};
 use super::positions::Positions;
 use super::push::StoredAt;
-use super::repository::{Repository, StoreRefused, TreeEntries};
+use super::repository::reach::SetReading;
+use super::repository::{Keeping, Repository, StoreRefused, TreeEntries, kept_both};
 use super::rows::{self, ObjectRow};
 use super::upload::{Progress, Turn};
 
@@ -234,6 +235,12 @@ impl Reading {
 
 /// Where an encoding is.
 enum Stage {
+  /// Reading the set the encoding sends from its value's tree a node a unit (its start, CLAUDE.md §3): a version's D(k),
+  /// or a head's reached set for a base pack; then the stage it begins with.
+  Read {
+    reading: Box<SetReading>,
+    then: Box<Stage>,
+  },
   /// Walking the two root trees for the bases a reference delta may name: the pairs still to walk.
   Walk { pending: Vec<(ObjectId, ObjectId)> },
   /// Reading the objects' rows into the order, from position `from` on.
@@ -255,6 +262,9 @@ enum Stage {
     writing: Box<Writing>,
     objects_root: Option<ContentId>,
   },
+  /// Each part's record made from its placed entries a unit at a time, the commits, trees and tags' part first, its
+  /// bytes kept already (the encode keep's slice, CLAUDE.md §3; [`super::repository::Keeping`]).
+  Record { parts: Box<(Keeping, Keeping)> },
   /// Kept, or nothing to encode.
   Done,
   /// Refused; every later turn is refused the same.
@@ -291,6 +301,12 @@ pub struct EncodingCounters {
   pub most_put_bytes: u64,
   /// The most rows one unit read into the order (A-718: one).
   pub most_rows_a_unit: u64,
+  /// The most of a part's placed entries one unit took into the part's record (its position order, its sets, its
+  /// entries' counts; the encode keep's slice, CLAUDE.md §3): one.
+  pub most_entries_a_unit: u64,
+  /// The most runs of a version's D(k), or of a head's reached set, one unit read into the encoding (its start; CLAUDE.md
+  /// §3): a node of the set's tree at most, a leaf's runs.
+  pub most_runs_a_unit: u64,
   /// Objects sent on whole as their pushed entry lies, its compressed data copied (A-859, git's pack reuse).
   pub reused_whole: u64,
   /// Objects sent on as their pushed delta (A-859): its data copied, its base named in this part or an earlier version.
@@ -350,7 +366,7 @@ impl Encoding {
     version: usize,
   ) -> Result<Encoding, StoreRefused> {
     let target = Target::Version { green, version };
-    let Some(brought) = repository.unencoded(store, green, version)? else {
+    let Some(reading) = repository.unencoded_reading(store, green, version)? else {
       return Ok(Encoding::new(target, Positions::new(), Stage::Done));
     };
     let old = version
@@ -360,7 +376,14 @@ impl Encoding {
       (Some(new), Some(old)) => vec![(new, old)],
       _ => Vec::new(),
     };
-    Ok(Encoding::new(target, brought, Stage::Walk { pending }))
+    Ok(Encoding::new(
+      target,
+      Positions::new(),
+      Stage::Read {
+        reading: Box::new(reading),
+        then: Box::new(Stage::Walk { pending }),
+      },
+    ))
   }
 
   /// The making of `green`'s base pack again, from every object its head reaches, no base named.
@@ -369,9 +392,16 @@ impl Encoding {
     store: &ContentStore,
     green: u64,
   ) -> Result<Encoding, StoreRefused> {
-    let (version, reached) = repository.head_reach(store, green)?;
+    let (version, reading) = repository.head_reach_reading(store, green)?;
     let target = Target::Base { green, version };
-    Ok(Encoding::new(target, reached, Stage::Gather { from: 0 }))
+    Ok(Encoding::new(
+      target,
+      Positions::new(),
+      Stage::Read {
+        reading: Box::new(reading),
+        then: Box::new(Stage::Gather { from: 0 }),
+      },
+    ))
   }
 
   /// An encoding of `positions` for `target`, at `stage`.
@@ -406,6 +436,7 @@ impl Encoding {
       Stage::Keep { objects, blobs, .. } => {
         to_u64(objects.0.len()).saturating_add(to_u64(blobs.0.len()))
       }
+      Stage::Record { parts } => parts.0.held_bytes().saturating_add(parts.1.held_bytes()),
       _ => 0,
     };
     objects.saturating_add(stage)
@@ -587,11 +618,12 @@ impl Encoding {
   /// The stage's index among [`EncodingCounters::longest_unit_ns`]'s.
   pub fn stage_index(&self) -> usize {
     match self.stage {
-      Stage::Walk { .. } => 0,
+      // The start's read counted with the walk it begins.
+      Stage::Read { .. } | Stage::Walk { .. } => 0,
       Stage::Gather { .. } => 1,
       Stage::Encode { .. } => 2,
       // Format: each stage's index, in the order of `longest_unit_ns`.
-      Stage::Keep { .. } | Stage::Done | Stage::Refused(_) => 3,
+      Stage::Keep { .. } | Stage::Record { .. } | Stage::Done | Stage::Refused(_) => 3,
     }
   }
 
@@ -604,6 +636,7 @@ impl Encoding {
   ) -> Result<Progress, StoreRefused> {
     let stage = core::mem::replace(&mut self.stage, Stage::Done);
     self.stage = match stage {
+      Stage::Read { reading, then } => self.read(store, reading, then)?,
       Stage::Walk { pending } => self.walk(repository, store, pending)?,
       Stage::Gather { from } => self.gather(repository, store, from)?,
       Stage::Encode {
@@ -616,7 +649,8 @@ impl Encoding {
         (exchange, quantum_ns),
         (blobs, *part, current),
       )?,
-      keeping @ Stage::Keep { .. } => self.keep(repository, store, keeping)?,
+      keeping @ Stage::Keep { .. } => self.keep(store, keeping)?,
+      Stage::Record { parts } => self.record(repository, store, parts)?,
       Stage::Done => return Ok(Progress::Done),
       Stage::Refused(refused) => return Err(refused),
     };
@@ -626,6 +660,30 @@ impl Encoding {
     } else {
       Progress::More
     })
+  }
+
+  /// One node of the start's set read ([`SetReading::step`], at most a leaf's runs); read whole, the stage it begins.
+  /// Refused as an unreadable value is, by its green and version.
+  fn read(
+    &mut self,
+    store: &ContentStore,
+    mut reading: Box<SetReading>,
+    then: Box<Stage>,
+  ) -> Result<Stage, StoreRefused> {
+    let (green, version) = match self.target {
+      Target::Version { green, version } | Target::Base { green, version } => (green, version),
+    };
+    let unreadable = StoreRefused::SetsUnreadable {
+      green,
+      version: to_u64(version),
+    };
+    let (whole, runs) = reading.step(store).ok_or(unreadable)?;
+    self.counters.most_runs_a_unit = self.counters.most_runs_a_unit.max(to_u64(runs));
+    if !whole {
+      return Ok(Stage::Read { reading, then });
+    }
+    self.positions = reading.finish().ok_or(unreadable)?;
+    Ok(*then)
   }
 
   /// One pair of trees walked (module docs); with none left, the rows read next.
@@ -1275,12 +1333,7 @@ impl Encoding {
   /// One unit of keeping both parts (module docs; A-718): a window of a part put into the content store, a part's
   /// object finished, or, both kept, both recorded (a version's fragments, or a base pack in place of the old).
   /// Refused, what was put is given back.
-  fn keep(
-    &mut self,
-    repository: &mut Repository,
-    store: &mut ContentStore,
-    keeping: Stage,
-  ) -> Result<Stage, StoreRefused> {
+  fn keep(&mut self, store: &mut ContentStore, keeping: Stage) -> Result<Stage, StoreRefused> {
     let Stage::Keep {
       objects,
       blobs,
@@ -1341,13 +1394,47 @@ impl Encoding {
       let _ = store.release(&root);
       return Err(StoreRefused::FragmentUnreadable);
     };
-    let parts = ((objects, objects_root), (blobs, root));
+    Ok(Stage::Record {
+      parts: Box::new((
+        Keeping::new((objects, objects_root)),
+        Keeping::new((blobs, root)),
+      )),
+    })
+  }
+
+  /// One unit of the parts' records ([`Keeping::step`]): the commits, trees and tags' part's, then the blobs'; once
+  /// both are made, the version's fragments or the base pack installed with them. Refused, both parts' content is given
+  /// back.
+  fn record(
+    &mut self,
+    repository: &mut Repository,
+    store: &mut ContentStore,
+    mut parts: Box<(Keeping, Keeping)>,
+  ) -> Result<Stage, StoreRefused> {
+    let stepped = match parts.0.step() {
+      Ok(true) => parts.1.step(),
+      other => other.map(|_| false),
+    };
+    let made = match stepped {
+      Ok(made) => made,
+      Err(refused) => {
+        for content in [parts.0.content(), parts.1.content()] {
+          let _ = store.release(&content);
+        }
+        return Err(refused);
+      }
+    };
+    if !made {
+      self.counters.most_entries_a_unit = self.counters.most_entries_a_unit.max(1);
+      return Ok(Stage::Record { parts });
+    }
+    let kept = kept_both(store, *parts);
     match self.target {
       Target::Version { green, version } => {
-        repository.keep_version(store, (green, version), parts)?
+        repository.keep_version(store, (green, version), kept)?
       }
       Target::Base { green, version } => {
-        repository.keep_base(store, (green, version), parts, self.spent_ns)?;
+        repository.keep_base(store, (green, version), kept, self.spent_ns)?;
       }
     }
     Ok(Stage::Done)

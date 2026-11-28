@@ -77,7 +77,7 @@ fn two_versions(format: ObjectFormat, store: &mut ContentStore) -> Repository {
 }
 
 /// One turn at a quantum of nothing did one unit: at most one object encoded, one pair of trees walked, a window's
-/// worth of rows read.
+/// worth of rows read, one placed entry taken into a part's record.
 fn one_unit(before: EncodingCounters, after: EncodingCounters) {
   assert_eq!(after.units - before.units, 1, "{before:?} {after:?}");
   assert!(after.objects - before.objects <= 1, "{before:?} {after:?}");
@@ -89,6 +89,8 @@ fn one_unit(before: EncodingCounters, after: EncodingCounters) {
     after.rows_read - before.rows_read <= handles(),
     "{before:?} {after:?}"
   );
+  // The encode keep's slice (CLAUDE.md §3): the part's record made a placed entry a unit, never all of them at once.
+  assert!(after.most_entries_a_unit <= 1, "{before:?} {after:?}");
 }
 
 /// `encoding` driven to its end a turn at a time, each with a quantum of nothing, each turn checked by [`one_unit`]:
@@ -324,4 +326,96 @@ fn an_encodings_parts_are_charged_to_the_store_as_they_grow_and_given_back_at_it
   encoding.release(&mut store);
   assert_eq!(store.charged(), charged, "released, nothing charged");
   repository.release(&mut store).unwrap();
+}
+
+/// Shape: the blobs green 2's tree holds, of which the scattered version brings every fourth.
+const SCATTERED_POOL: usize = 600;
+
+/// Shape: the most runs one unit may read into an encoding at its start: a leaf of the set's tree, a window of runs of
+/// two positions each (16 bytes a run).
+fn runs_a_leaf() -> u64 {
+  u64::try_from(WINDOW / 16).unwrap()
+}
+
+/// A commit over `blobs`, named `f{index}` at their indexes, at `seconds`, its parent `parent`: the commit and its tree.
+fn over(
+  format: ObjectFormat,
+  blobs: &[(usize, &Made)],
+  parent: Option<ObjectId>,
+  seconds: u64,
+) -> Vec<Made> {
+  let names: Vec<String> = blobs.iter().map(|(at, _)| format!("f{at:04}")).collect();
+  let entries: Vec<(Mode, &[u8], ObjectId)> = names
+    .iter()
+    .zip(blobs)
+    .map(|(name, (_, blob))| (Mode::File, name.as_bytes(), blob.id))
+    .collect();
+  let root = tree(format, &entries);
+  let parents: Vec<ObjectId> = parent.into_iter().collect();
+  vec![commit(format, root.id, &parents, seconds), root]
+}
+
+/// The encoding's start (CLAUDE.md §3; main 01a20182's ruling of 2026-11-28 00:50). Do: make green 2 at a commit over
+/// 600 blobs and green 3 at a commit over one other; then fast-forward green 3 to a commit over its blob and every
+/// fourth of green 2's, so its second version's D(k) is a new commit and tree and 150 blobs scattered among green 2's
+/// positions; encode that version a unit a turn. Expect: its D(k) of more runs than a leaf holds, and no unit reading more
+/// of them than a leaf's (`most_runs_a_unit`); and its fragments the one-pass encoding's, byte for byte. Red before:
+/// the start read the whole D(k) at once.
+#[test]
+fn an_encodings_start_reads_its_versions_d_k_a_node_a_unit() {
+  let format = ObjectFormat::Sha1;
+  let (mut store_turned, mut store_whole) = (store(), store());
+  let scattered = |store: &mut ContentStore| {
+    let mut repository = Repository::new(format);
+    let pool: Vec<Made> = (0..SCATTERED_POOL)
+      .map(|at| blob(format, format!("pool {at}\n").as_bytes()))
+      .collect();
+    let indexed: Vec<(usize, &Made)> = pool.iter().enumerate().collect();
+    let mut two = over(format, &indexed, None, 1);
+    let two_head = two[0].id;
+    two.extend(pool.iter().cloned());
+    push_and_move(&mut repository, store, two, &[(2, Some(two_head))]).unwrap();
+    let own = blob(format, b"own\n");
+    let mut three = over(format, &[(SCATTERED_POOL, &own)], None, 2);
+    let three_head = three[0].id;
+    three.push(own.clone());
+    push_and_move(&mut repository, store, three, &[(3, Some(three_head))]).unwrap();
+    let mut chosen: Vec<(usize, &Made)> = indexed
+      .iter()
+      .copied()
+      .filter(|(at, _)| at % 4 == 0)
+      .collect();
+    chosen.push((SCATTERED_POOL, &own));
+    let next = over(format, &chosen, Some(three_head), 3);
+    let next_head = next[0].id;
+    push_and_move(&mut repository, store, next, &[(3, Some(next_head))]).unwrap();
+    repository
+  };
+  let mut turned = scattered(&mut store_turned);
+  let mut whole = scattered(&mut store_whole);
+  let brought = turned.brought(&store_turned, 3, 1).unwrap();
+  assert!(
+    u64::try_from(brought.runs()).unwrap() > runs_a_leaf(),
+    "a D(k) of more runs than a leaf: {}",
+    brought.runs()
+  );
+  whole
+    .encode_fragments(&mut store_whole, (3, 1), &mut Ticks(0), EXCHANGE)
+    .unwrap();
+  let mut encoding = Encoding::fragments(&turned, &store_turned, 3, 1).unwrap();
+  one_unit_a_turn(&mut encoding, &mut turned, &mut store_turned);
+  let most = encoding.counters().most_runs_a_unit;
+  assert!(
+    most <= runs_a_leaf(),
+    "{most} runs in one unit of {}",
+    brought.runs()
+  );
+  for blobs in [false, true] {
+    assert_eq!(
+      turned.fragment_part(3, 1, blobs),
+      whole.fragment_part(3, 1, blobs)
+    );
+  }
+  turned.release(&mut store_turned).unwrap();
+  whole.release(&mut store_whole).unwrap();
 }

@@ -3714,6 +3714,75 @@ fn a_shallow_clone_of_a_merge_heavy_history_is_deepened_over_the_daemons_edge() 
   );
 }
 
+/// w-interop's git matrix row `deepen` (2026-11-21, 1a35ab091: "remote: aborting due to possible repository corruption
+/// on the remote side / protocol error: bad pack header", where deepen over a fresh repository of git v2.0.0 passed):
+/// the matrix had pushed an annotated tag and deleted it before the row ran (rows `tag-push`, `tag-delete`). Do: push
+/// [`merge_history`] through the daemon's edge, then an annotated tag of its tip, then that tag's delete; then, as a
+/// shallow clone of the tip, fetch at protocol v2 as `git fetch --deepen 100` asks. Expect: each push `200`, the fetch
+/// `200` with a `shallow-info` section and a packfile section whose pack reads whole, as git's index-pack reads one.
+#[test]
+fn a_shallow_clone_is_deepened_whole_after_an_annotated_tag_was_pushed_and_deleted() {
+  use slates_git::object_name::Kind;
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, tip) = merge_history();
+  let created = pushed(edge, &name, &request);
+  let tag = format!(
+    "object {tip}\ntype commit\ntag v-matrix\ntagger A <a@example.com> 1700000002 +0000\n\nthe matrix's tag\n"
+  )
+  .into_bytes();
+  let tag_id = git_name(Kind::Tag, &tag);
+  let tag_push = {
+    let mut request = Vec::new();
+    let line = format!("{ZERO} {tag_id} refs/tags/v-matrix\0{CAPABILITIES}");
+    pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+    pktline::write(Packet::Flush, &mut request).expect("the flush");
+    request.extend_from_slice(&stored_pack(&[(Kind::Tag, tag.as_slice())]));
+    request
+  };
+  let tagged = pushed(edge, &name, &tag_push);
+  let tag_delete = {
+    let mut request = Vec::new();
+    let line = format!("{tag_id} {ZERO} refs/tags/v-matrix\0{CAPABILITIES}");
+    pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+    pktline::write(Packet::Flush, &mut request).expect("the flush");
+    request
+  };
+  let untagged = pushed(edge, &name, &tag_delete);
+  let deepened = uploaded(edge, &name, &deepen_of(tip, 100));
+  daemon.stop();
+  assert_git_pushed(&created);
+  for (row, answer) in [("tag-push", &tagged), ("tag-delete", &untagged)] {
+    assert_eq!(
+      answer.0,
+      200,
+      "{row}: {}",
+      String::from_utf8_lossy(&answer.1)
+    );
+    assert!(
+      !String::from_utf8_lossy(&answer.1).contains("ng refs/tags"),
+      "{row}: {}",
+      String::from_utf8_lossy(&answer.1)
+    );
+  }
+  let head = String::from_utf8_lossy(
+    deepened
+      .1
+      .get(..deepened.1.len().min(400))
+      .unwrap_or_default(),
+  )
+  .into_owned();
+  assert_eq!(deepened.0, 200, "{head}");
+  assert!(head.contains("shallow-info"), "{head}");
+  let pack = fetched_pack_after(&deepened.1);
+  assert!(!ids_in(&pack).is_empty(), "a pack read whole");
+}
+
 /// The v2 `fetch` stock git 2.50's `git fetch --deepen <depth>` sends from a shallow clone of `tip` (its
 /// `GIT_TRACE_PACKET` against slates, read): its choices with `sideband-all`, the tip its `shallow` line, `deepen <depth>`
 /// and `deepen-relative`, `want-ref` its branch (slates advertises `ref-in-want`), `have` the tip, and no `done`, so its

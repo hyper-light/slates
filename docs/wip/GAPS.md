@@ -591,6 +591,17 @@
 >     which no longer waits on them. Red first, both: the peers re-keyed a within its 1 s detection (22 to 197 ms,
 >     against 4.4 to 7.6 s), and no peer condemned a while a silent one held its edges (3 of 3 red before). The
 >     adoption guard is gone, and A919's owner-restart test runs again (6 of 6 with the owed-part scene).
+>   - **FIXED, A-921 part 5's re-key window (w-shared, 2026-11-28; main 01a20182's ruling of 00:42):** on
+>     windows-11-arm the answers-peers test went red 5 then 7 runs in 16 (winfleet-5, -6): a peer's detector condemned
+>     the warm-restarted a by its own probes 327 to 669 ms after its last answer, two or three 65-87 ms periods, before
+>     it re-keyed a (a refuted at incarnation 1 once keyed). A peer now holds a's probes unjudged from learning of its
+>     new process until the re-key's install or one detection (`fleet.plane.rekey_*`), a local change to vendored
+>     hyper-swim (`Detector::hold_judging`, vendor README item 4). Bound: a process that dies just after its restart
+>     is condemned within one detection plus `detection_bound`. Measured (winfleet-7, GitHub run 46129937528, main
+>     6be709db6, 16 runs a test a lane): windows-11-arm 32 of 32, answers-its-peers 16 of 16 (11 and 9 of 16 in
+>     winfleet-5 and -6) and the warm-restart volume test 16 of 16; windows-latest 32 of 32; the logs carry 368 and
+>     341 rekey lines, the window running on both lanes. **Owed:** proposed to hyper-raft's owner as a feature gate
+>     (through Ada).
 >   - **FIXED, v3_takeover's adoption stall (A-933, w-shared, 2026-11-27):** about 1 run in 80 on Linux CI, a
 >     successor gave a taken-over green up "waiting on its adoption". Its rebuild could reach neither the record
 >     adoption (A-364: it checked the adopted record alone, so a successor short of version 0 never became
@@ -887,14 +898,22 @@
 >     15). `Repository::read_stored_waited` answers the let-go a read met and writes no slot, so each reader notes its
 >     own and never a stale one. Red: `b1_a_note_cleared_on_the_repository_between_a_pushs_stop_and_its_driver_leaves_
 >     the_push_its_own` (`missing necessary objects` before).
-> **OPEN (w-git, 2026-11-26): the repository's one wait slot is still shared by every owner but a push**, and each can
-> lose another's note of a let-go window: a derivation's turn clears it at its start (`git_derive::turn`), the
-> encoding's read clears it (`store/encoding.rs`) and takes it, a fetch's stream clears it before every read
-> (`store/upload.rs` `read_or_stop`) and its edges and answer take it, and a green build and a replica build take it
-> (`green_ready`, `replica_build`). A lost note is a window not brought back, so that owner's read refuses typed where
-> it should have waited. The fix is B1's: each owner its own `Waits`. Also still on the repository's slot from inside a
-> push: the admission's peel and references (B3), which refuse anyway until B3 moves them onto the push's slot. The
-> upload stream's and the encoding's stop rules are their own copies of the one rule, keyed by a window's place, not
+> **LATENT, not lost by use today (w-git, 2026-11-26; read again 2026-11-28, main's ruling of 01:19): the repository's
+> one wait slot is still shared by every owner but a push**, so any reader may clear another's note of a let-go window.
+> Today every owner takes its note in the same poll as the read that set it, on a shard that runs one task at a time, so
+> no other owner runs between a note and its take: the green build and the replica build right after their unit
+> (`green_ready.rs` after `building`'s advance, `replica_build.rs` likewise); the edges' answers inside their lend
+> (`vcs_http/git/upload.rs`, `vcs_ssh/git.rs`, `answer.rs`'s held refusal, which the filter and shallow walks end in
+> before any pack is begun); the stream's `read_or_stop` and its delta base's read, and the encoding's reads, each in
+> the same call (`store/upload.rs`, `store/encoding.rs`); a derivation's turn after its refusal
+> (`git_derive::turn_lent`); and `encode_within`'s `brought_back_waited` right after its `turn`, with no await between.
+> The slot is cleared only at five sites (a derivation's turn's start, two encoding reads, `read_or_stop` and the
+> stream's base read), and none runs inside another owner's unit between a miss and its take. Still writing the shared
+> slot from inside a push: the admission's peel and references (B3), which refuse anyway until B3 moves them onto the
+> push's slot. The hardening, not worked under the freeze: each owner reads in a scope of its own
+> (`Repository::reading_quietly`, as B3's admission turn does) and the shared slot is removed, with a unit red (owner
+> A's read notes a let-go, owner B's read on the same repository runs, A takes its note: none today, its window after).
+> The upload stream's and the encoding's stop rules are their own copies of the one rule, keyed by a window's place, not
 > its let-go's number (`Upload::stop_at`; the encoding's `stopped_at` set never waits twice for one window in a whole
 > encoding): owed onto `slates_git::away::WaitOnce`, as B1's readers are.
 > - **B1b BUILT (w-git, 2026-11-26): unpack's read of an in-pack base back from the quarantine** (`Reader::applied`),
@@ -8090,6 +8109,14 @@
 > under it. The same matrix on the Mac Studio (release 907c246ac, load 13-30) was 24 of 24 with no spin. git v2.0.0 on
 > the same Linux run: 26 of 27, two spins in `git_encode.rs:359` (`settle_encodings`, w-k90-vendor's encode spin) and
 > no kill; deepen's bad pack is w-bugs'. Report: adacachy `~/.cache/w-interop/r-linuxc-2239.txt`, anchor logs beside it.
+> Deepen's bad pack checked on today's main (w-git, 2026-11-28, main's order of 00:33): w-interop bisected it on
+> 2026-11-21 to the matrix's annotated tag pushed and deleted before the row ran (deepen over a fresh v2.0.0 passed
+> every N 1 to 100), the whole-clone failure of the same night to git/git's annotated tags, which A-855 then fixed (an
+> answer was admitted one ring region, 256 KiB). The row's sequence through the daemon's edge, history, tag push, tag
+> delete, then `fetch --deepen 100` from a shallow clone, answers whole now:
+> `vcs_http::daemon_edge::tests::a_shallow_clone_is_deepened_whole_after_an_annotated_tag_was_pushed_and_deleted`. Stock
+> git's own row, and its seconds against the 217 s of 2026-11-20, are read in main's v2.0.0 matrix run under load
+> (run-requests.md, 2026-11-28).
 > The restarted daemon's start spin (`daemon.rs:1186`, `start_shard`, "the most CPU in one [slice] 962,859 µs, ending
 > at unit 1") was the catalog's whole replay in one unit of the sliced start: it is replayed a record a unit since this
 > change (w-bugs; `a_shards_start_replays_its_catalog_a_record_a_unit`, 256 records in one unit before, 1 after).
@@ -8117,12 +8144,18 @@
 > the control shard held alone by busy work for the old budget at this build's cost and a window more; Adas-Mac-Studio-4,
 > base cdfbb4020: busy 31.8 s and the watch still waiting after it, ending at its reason at 32.3 s; with the change
 > reversed, the wait ended at 31.4 s while the shard was busy for 32.2 s, the refusal the daemon stopped on). Owed (w-k90-vendor):
-> slicing the encode poll (`git_encode.rs:345`). The same hazard in every other default observation since 2026-11-20
-> (g226, main's ruling): `Daemon::observe` had the observe budget, ten liveness windows, and a shard that stepped busy
-> past that budget's CPU without reaching the question refused it; a default observation now waits while its shard
-> lives (`Observation::patient`, looked at every liveness window, ended only by the shard's going; A-232's rule), and its
-> watchdog ends a stuck one (`a_default_observation_of_a_busy_control_shard_is_answered_once_it_runs`, base 26e125adb:
-> the control shard held alone 31.6 s, answered after it; with the change reversed, refused at 31.9 s mid-work; and
+> slicing the encode poll (`git_encode.rs:345`).
+> Taken by w-git (2026-11-28, main's ruling of 00:33): that spin's site, `settle_encodings`, was deleted in 262d21ff5
+> and the turn is paced (A-783); the encoding's last whole unit, its parts' records, is sliced a placed entry a unit
+> ("The encode keep's slice", 152 and 454 entries in one unit before). The encoding's start is sliced too, its D(k) read
+> a node a unit (113 runs in one unit before). Owed: main's v2.0.0 run under load (run-requests.md). The same hazard in
+> every other default
+> observation since 2026-11-20 (g226, main's ruling): `Daemon::observe` had the observe budget, ten liveness windows,
+> and a shard that stepped busy past that budget's CPU without reaching the question refused it; a default observation
+> now waits while its shard lives (`Observation::patient`, looked at every liveness window, ended only by the shard's
+> going; A-232's rule), and its watchdog ends a stuck one
+> (`a_default_observation_of_a_busy_control_shard_is_answered_once_it_runs`, base 26e125adb: the control shard held
+> alone 31.6 s, answered after it; with the change reversed, refused at 31.9 s mid-work; and
 > `a_patient_wait_goes_on_while_the_shard_lives_and_ends_at_its_going`). Owed (R3): `OBSERVE_BUDGET_NS` still caps the
 > watchdog's window (`WINDOW_CEILING_NS`), the anchor's lapse bound and `live_ship`'s key wait, and bounds the daemon's
 > test-support waits (an explicit observation's budget is its asker's).

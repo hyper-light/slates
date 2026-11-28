@@ -62,6 +62,16 @@ sources return to upstream's bytes:
    (`F_NOCACHE` on macOS, `O_DIRECT` through `F_SETFL` on Linux) and buffered elsewhere, as `open` falls back; `open`
    and `adopt` share the steps after the open (`finish`). So the store's files are never opened by path in a vendored
    crate (A-767 C2; main's ruling: the engine's disk writes sit behind `land`'s write seam).
+4. `hyper-swim`'s `Detector::hold_judging` and `Detector::unjudged` (and `PeerReport::unjudged`): its owner may hold a
+   peer's probes unjudged, so an unanswered one is counted, never accounted, suspecting the peer or making its
+   condemnation pending, and a pending condemnation waits for the release; nothing changes for a peer not held, and an
+   answered probe is handled as ever. slates holds a peer whose process restarted under its id until it re-keys it, or
+   for one detection (A-921 part 5's re-key window, main's ruling of 2026-11-28): until then its probes reach the peer
+   under its old process's keys, and SWIM condemned it in two or three periods, before a slower host's re-key
+   (windows-11-arm, winfleet-5 and -6, 5 and 7 runs in 16;
+   `docs/bugs/2026-11-28-a-warm-restarted-node-was-condemned-before-its-peers-re-keyed-it.md`). Its tests run here:
+   `cargo test --manifest-path vendor/hyper-raft/hyper-swim/Cargo.toml --lib`, 96 of 96 on macOS arm64 (the hook's own
+   `slates_a_held_peer_s_unanswered_probes_are_unjudged_until_it_is_released` among them), 2026-11-28.
 
 A change slates needs in one of these crates is proposed to hyper-raft's owner, lands there once every consumer's suite
 passes, and reaches slates as a new snapshot in its own gated commit.
