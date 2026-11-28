@@ -932,3 +932,8 @@
   v4 part A A/B closed dead even (727.0 vs 728.2 us median), as expected for a one-green push. NEXT: main's TSan
   turn-bound test (a_fetch_arriving_mid_derivation...: 21 turns against 9); owed P2 items listed in GAPS (a stale
   stage's moves positioned by id; replayed landings; abandoned/replayed push maps).
+- 11-27 23:18 PST: LANDED 6f20bc816 + 5f60cbb88, on main as 5e6bcb92a. (1) main's TSan turn bound: a fetch handed a derivation is held
+  to its own turns (read_turns less the new read_turns_yielded), red made deterministic with a yielding neighbour, 935
+  against 3 counted whole, 1 against 1 own. (2) P2 piece 2's settle turn answered more when its quantum ended on the
+  last landing (its task held its slot a turn; red turn 4). NEXT, per 18:44: the clone's window peak under load (OPEN
+  in GAPS), then P1 (bisect first).

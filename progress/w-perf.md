@@ -936,3 +936,14 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - BUILT, not on main: agents/w-perf-slice-reading at ea1898ac5 (on d475c91fd): an intake slice's frees into held by
     stage, a line a doubling (Intake::stage_kind read-only, w-hg noted). Focused server 90, hg 43.
   - Waiting on main: the 57k on d475c91fd (about 23:05). Next: (ii), the naming proof with the arena oracle.
+- 2026-11-27 23:13 PST (written then):
+  - BUILT, not on main: agents/w-perf-naming at 5c699423d (on ea1898ac5): (ii) part 1, the oracle checks every block
+    an image names stays in the arena's held runs. Red on a no-hold copy: 32 findings at step 104; the old reuse check
+    found 0 there.
+  - Main's 23:11 57k on d475c91fd: step 2 left the peak unmoved (382 MB). The cadence stays on its branch.
+  - Asked main: a reading of the borrow frees' share sealed since the latest cut began (the uncapture's reach).
+- 2026-11-27 23:45 PST (written then):
+  - BUILT, not on main: agents/w-perf-slice-reading at 3d24ec5b3: the held frees of slabs sealed since the latest
+    cut began (fresh_held), read on the borrow and intake-slice lines. Main's 57k on it started 23:33.
+  - BUILT, red, tests only: agents/w-perf-uncapture at f664eb84c: the oracle asserts no fresh free is held (327,680 B
+    now). The uncapture (Buddy::free_unnamed) waits for the 57k's F-of-N share.
