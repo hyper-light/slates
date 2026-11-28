@@ -832,3 +832,10 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 ## 2026-11-27 21:28 PST: creation check and greens_placed (slates d2175d73b)
 - 6bc68e2ec: greens_placed reads Option (never placed != placed at 0); placement_done states why a creation owes no root v0 (every path checked); founded_git_fleet checks the repository's own record + names log (holds_repository_record_of); a935 prints its repair counts; GAPS item 1 not recurred since A-936.
 - Next: (b) the hedged region read, red first; then the kept-v1 Behind bound on the code.
+
+## 2026-11-27 22:35 PST: hedged read, a935 re-read, a921 watch, Behind bound (slates 20d832d46, 219522a33, 793df8069)
+- 4178d0d7b (b): hedged region read (first home asked to its path tail, then the next, then the first again); red 1.000 s to 2.2 ms.
+- 4d227a29b: a past-tolerance mark refuses only while its configuration stands; reads again after an install.
+- 219522a33: a921 warm-restart watch bounded and asserting never-a (my bd92839b7 made the old watch never converge); RouteView shows superseded.
+- 793df8069: the Behind reship bound stated (once a pass, ends at the ack); not once per install (would stall A-935).
+- Next: diag 12 item 5 (live-ship BudgetExceeded, arm64) unless main has higher.
