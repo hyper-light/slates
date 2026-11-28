@@ -798,3 +798,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 ## 2026-11-27 18:52 PST: holder-side merge log landed (slates 02548a267)
 - 1598dcede: judge_merge_record returns its reply and why; note_unaccepted logs holder, green, version, sender and reason once per (green, version, reason). Units 55/55.
 - Main runs a914 x16 at 02548a267. Next: read its reds (A-935 or not; the stall's object/homes).
+
+## 2026-11-27 19:09 PST: stall reproduced on purpose (local, uncommitted)
+- Red: a_holders_first_replica_build_at_a_second_death_after_a_refused_push_lands_the_push. b and c delay home answers 30 s (first push refused on purpose), then the second death; its push is refused "unable to commit", building {b: 0}.
+- Logs: b refused v2 foreign_generation (config one step behind a), then replica.owes (build: replay 5 ms), then foreign_generation again. Not region reads.
+- Asked main: lag handling or eager replica builds; whether to add a build-turns/made log first.
