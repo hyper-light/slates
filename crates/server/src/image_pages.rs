@@ -2549,13 +2549,11 @@ mod tests {
   }
 
   /// [`a_cut_in_flight_keeps_its_held_frees_within_twice_what_it_spends`]'s scene on a shard, its page pinned at
-  /// [`LOADED_PAGE`], the catch-up's wake held to a copy slice where `fixed` (`content_holder::TEST_FIXED_SLICE`, the
-  /// rule before): granule objects put and published, a cut begun over [`ENTRIES`] let-goes' pages, then a wake of its
-  /// catch-up after each batch of four copy slices' worth of the objects released, until that cut commits. The most
+  /// [`LOADED_PAGE`]: granule objects put and published, a cut begun over [`ENTRIES`] let-goes' pages, then a wake of
+  /// its catch-up after each batch of four copy slices' worth of the objects released, until that cut commits. The most
   /// held after a wake, the bytes the cut spent (copied and encoded), one batch's bytes, and the wakes.
-  fn a_stretched_cut(fixed: bool) -> (u64, u64, u64, u64) {
+  fn a_stretched_cut() -> (u64, u64, u64, u64) {
     crate::daemon::audit_on_shard(move |state| {
-      crate::content_holder::TEST_FIXED_SLICE.with(|cell| cell.set(fixed));
       let granule = state.store.content.arena().granule();
       let slice = usize::try_from(state.config.copy_slice_bytes()).unwrap();
       let batch = (4 * slice).div_ceil(granule).max(1);
@@ -2615,7 +2613,6 @@ mod tests {
       }
       let cut = spent(state).saturating_sub(spent_before);
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
-      crate::content_holder::TEST_FIXED_SLICE.with(|cell| cell.set(false));
       (most, cut, u64::try_from(batch * granule).unwrap(), wakes)
     })
   }
@@ -2624,26 +2621,20 @@ mod tests {
   const STRETCHED_BATCHES: usize = 16;
 
   /// Goal 93, A-930's cadence on the true held (main's 57k of 2026-11-27 20:41: a long cut held its window frees until
-  /// it committed). Do: run [`a_stretched_cut`] both ways, four copy slices' worth of chunks freed before each wake of
-  /// the cut's catch-up: each wake spending the held frees past what the cut has left, and each held to a copy slice
-  /// as before. Expect, spending the excess, the most held at most twice what the cut spent and a batch, under the
-  /// most held with a copy slice a wake. Red before: a copy slice a wake whatever was held.
+  /// it committed). Do: run [`a_stretched_cut`], four copy slices' worth of chunks freed before each wake of the cut's
+  /// catch-up. Expect the most held at most twice what the cut really spent (copied and encoded) and a batch. Red on
+  /// the tree with a wake held to a copy slice, as before (reverted, never kept): 2,887,680 bytes held over 15 wakes,
+  /// the cut spending 797,914, a batch 192,512; now 389,120 over 5 wakes, the cut spending 750,734, a batch 77,824.
   #[test]
   fn a_cut_in_flight_keeps_its_held_frees_within_twice_what_it_spends() {
-    let (most, cut, batch, wakes) = a_stretched_cut(false);
-    let (fixed_most, fixed_cut, _, fixed_wakes) = a_stretched_cut(true);
+    let (most, cut, batch, wakes) = a_stretched_cut();
     println!(
-      "the excess spent: {most} bytes held at most over {wakes} wakes, the cut spending {cut}; a copy slice a wake: \
-       {fixed_most} over {fixed_wakes} wakes, spending {fixed_cut}; a batch {batch} bytes"
+      "{most} bytes held at most over {wakes} wakes, the cut spending {cut}; a batch {batch} bytes"
     );
     assert!(cut > 0, "a cut was in flight and spent");
     assert!(
       most <= 2 * cut + batch,
       "{most} bytes held while the cut was in flight, past twice what it spent ({cut}) and a batch ({batch})"
-    );
-    assert!(
-      most < fixed_most,
-      "the excess spent holds less than a copy slice a wake: {most} against {fixed_most}"
     );
   }
 
