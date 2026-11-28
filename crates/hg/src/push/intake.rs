@@ -317,6 +317,19 @@ pub struct Intake {
 }
 
 impl Intake {
+  /// The stage its next step takes, by name: "changelog", "manifests", "files", "manifests present", "files present"
+  /// or "done". A reading for its owner's logs (the server's slice by stage), no behaviour.
+  pub fn stage_kind(&self) -> &'static str {
+    match self.taker.stage {
+      Stage::Changelog(_) => "changelog",
+      Stage::Manifests(_) => "manifests",
+      Stage::Files { .. } => "files",
+      Stage::ManifestsPresent(_) => "manifests present",
+      Stage::FilesPresent => "files present",
+      Stage::Done => "done",
+    }
+  }
+
   /// The most its steps keep charged to the push's admission from the first to the last (main 01a20182's ruling (a) of
   /// 2026-11-22 04:23: a push's need is known at its begin, so it is admitted it up front, never the learned demand that
   /// predicts an unknown one): told from its framing before any revision is taken, by the charges the steps make

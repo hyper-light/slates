@@ -2987,6 +2987,52 @@ pub(crate) struct Taking {
   sized: Vec<slates_hg::push::sized::Landed>,
 }
 
+/// The intake's stages by name, as `slates_hg::push::intake::Intake::stage_kind` names them: the slots of a slice's
+/// reading of what it freed ([`note_slice_held`]).
+const INTAKE_STAGES: [&str; 6] = [
+  "changelog",
+  "manifests",
+  "files",
+  "manifests present",
+  "files present",
+  "done",
+];
+
+/// Counter: the most bytes one intake slice freed into the frees held for the committed image (`Taking::slice`;
+/// main's 57k of 2026-11-27: 42.0 MB in one slice). Format: a counter name in the status report.
+pub(crate) const INTAKE_SLICE_HELD_MOST: &str = "vcs.hg.intake_slice_held_most";
+
+/// Notes what one intake slice freed into the frees held for the committed image, `freed` by stage
+/// ([`INTAKE_STAGES`]): the most any slice freed counted ([`INTAKE_SLICE_HELD_MOST`]), and at each doubling of it past
+/// a copy slice a line naming each stage's share, so the kind of a slice that frees without bound is named.
+fn note_slice_held(state: &mut ShardState, freed: &[u64; INTAKE_STAGES.len()]) {
+  let total = freed
+    .iter()
+    .fold(0u64, |total, bytes| total.saturating_add(*bytes));
+  if total == 0 {
+    return;
+  }
+  let most = state
+    .refusals
+    .get(INTAKE_SLICE_HELD_MOST)
+    .copied()
+    .unwrap_or(0);
+  if total > most.saturating_mul(2) && total > state.config.copy_slice_bytes() {
+    let shares: Vec<(&str, u64)> = INTAKE_STAGES
+      .iter()
+      .copied()
+      .zip(freed.iter().copied())
+      .filter(|(_, bytes)| *bytes > 0)
+      .collect();
+    slates_machine::log_line!(
+      "slates-server: partition {}: one intake slice freed {total} bytes into the frees held for the committed image \
+       (the most one slice freed before, {most}), by stage {shares:?}",
+      state.partition
+    );
+  }
+  state.count_max(INTAKE_SLICE_HELD_MOST, total);
+}
+
 impl Taking {
   /// One slice: units taken until the intake is done or the shard's quantum is spent, within the room `lend` gives the
   /// stores; none when the content store is gone.
@@ -3005,13 +3051,26 @@ impl Taking {
     let costs = &mut self.costs;
     let counted = &mut self.counted;
     let mut most = slates_hg::push::pins::PinLook::default();
+    // What the slice's steps freed into the frees held for the committed image, by the stage each took (main's 57k of
+    // 2026-11-27 19:00: one slice freed 42.0 MB, its kind unknown): a reading, no bound.
+    let mut freed = [0u64; INTAKE_STAGES.len()];
     let sliced = vcs_store::within_budget(state, lend, |stores| {
       let content = stores.content_mut()?;
       let stepped = loop {
         if !paced.more(vcs_store::ANSWER_STEP, costs) {
           break Ok(Stepped::More);
         }
+        let kind = intake.stage_kind();
+        let held_before = crate::content_holder::held_lent(content);
         let step = intake.step(payload.as_slice(), content, room);
+        let grown = crate::content_holder::held_lent(content).saturating_sub(held_before);
+        if let Some(slot) = INTAKE_STAGES
+          .iter()
+          .position(|stage| *stage == kind)
+          .and_then(|at| freed.get_mut(at))
+        {
+          *slot = slot.saturating_add(grown);
+        }
         // What the step kept pins the windows it names until its own segment lands (goal 93, main's ruling of
         // 2026-11-24): a pin past the bound refused typed, never grown. Pinned within the step, so the pace measures it
         // as the step's own (main's A/B at 608930048: one slice's pins, after its steps, took 3,646 revisions at once).
@@ -3036,6 +3095,7 @@ impl Taking {
       Some(stepped)
     });
     paced.close(slates_rt::futures::now_ns(), costs);
+    note_slice_held(state, &freed);
     state.count(INTAKE_SLICES, 1);
     state.count_max(PIN_REVISIONS_STEP_MOST, most.revisions);
     state.count_max(PIN_WINDOWS_STEP_MOST, most.windows);

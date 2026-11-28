@@ -1320,6 +1320,20 @@ pub(crate) fn held_now(state: &ShardState) -> u64 {
     ))
 }
 
+/// [`held_now`] read through a content store its shard's chunk store is lent to: inside a lend, where the shard's own
+/// store is a placeholder and the state is borrowed by the step (`hg_push`'s intake slice).
+pub(crate) fn held_lent(content: &slates_vcs::ContentStore) -> u64 {
+  content
+    .storage()
+    .as_any()
+    .and_then(|any| any.downcast_ref::<crate::vcs_store::arena_windows::ChunkWindows>())
+    .map_or(0, |windows| {
+      u64::try_from(windows.lent_chunks().arena().deferred_bytes())
+        .unwrap_or(u64::MAX)
+        .saturating_add(windows.held_outside_the_arena())
+    })
+}
+
 /// Format: the status counter of the most bytes one borrow of the shard's state freed into the frees the arena holds
 /// for the committed image ([`note_borrow_held`]).
 pub(crate) const IMAGE_HELD_BORROW_MOST: &str = "vcs_store.image.held_borrow_most_bytes";
