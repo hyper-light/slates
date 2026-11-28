@@ -187,7 +187,7 @@ pub(crate) fn after_borrow(s: &mut ShardState) {
   // Frees held for the committed image past the waiting cut's cost (A-930's cadence): the pass looks now, not an
   // interval on, so the cut is begun where due before more pile up (main's 57k of 2026-11-27: 357,847,040 bytes
   // between looks an interval apart).
-  let held = u64::try_from(s.store.content.arena().deferred_bytes()).unwrap_or(u64::MAX);
+  let held = crate::content_holder::held_now(s);
   if s.image_encoder.held_past_look(held) {
     arm_now(s);
     return;

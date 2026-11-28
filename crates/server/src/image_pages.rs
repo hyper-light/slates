@@ -1851,11 +1851,11 @@ mod tests {
     );
   }
 
-  /// [`a_cut_nobody_waits_on_begins_once_its_changes_come_to_its_cost`]'s flow on a shard: objects let go and a
-  /// checkpoint published, then [`CADENCE_APPENDS`] let-goes each followed by `verbs::publish_shard` and the catch-up
-  /// it owes, a cut asked at each where `ask_each` (as before A-930's cadence every publication began one), then the
-  /// shard settled idle (`content_holder::image_retry_owed`). The cuts begun and the bytes they copied and encoded
-  /// after the checkpoint, and whether the committed image is then the shard's entries.
+  /// [`a_cut_nobody_waits_on_begins_once_its_changes_come_to_its_cost`]'s flow on a shard: objects let go and a cut of
+  /// them begun, then [`CADENCE_APPENDS`] landed records noted (paged changes that free nothing), each followed by a
+  /// catch-up turn and no publication, the next cut asked at each commit where `ask_each` (as every commit began one
+  /// before A-930's cadence), then the shard settled idle (`content_holder::image_retry_owed`). The cuts begun and the
+  /// bytes they copied and encoded after the checkpoint, and whether the committed image is then the shard's entries.
   fn cadenced(ask_each: bool) -> (u64, u64, bool) {
     crate::daemon::audit_on_shard(move |state| {
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(CADENCE_PAGE));
@@ -1879,7 +1879,20 @@ mod tests {
       // asked at every commit where `ask_each`, as every commit began one before A-930's cadence.
       crate::verbs::publish_shard(state).unwrap();
       for at in 0..CADENCE_APPENDS {
-        let _ = let_go_and_note(state, (ENTRIES / 10 + usize::try_from(at).unwrap(), 1));
+        // A paged change that frees nothing (a landed record noted): this flow weighs change bytes against a cut's
+        // cost; frees held for a cut are the held tests'
+        // (`a_deferred_cut_holds_no_more_freed_bytes_than_it_would_cost`).
+        let record = slates_vcs::ContentId::of(
+          format!("a landed record noted in the chain, number {at}").as_bytes(),
+        );
+        crate::vcs_store::homes::note_landed(
+          record,
+          crate::vcs_store::homes::Landed::Pack(crate::vcs_store::homes::LandedAt {
+            pack: record,
+            len: 1 << 20,
+            offset: at,
+          }),
+        );
         if ask_each {
           state.image_encoder.ask();
         }
@@ -2443,6 +2456,80 @@ mod tests {
     assert!(
       taken < SEGMENT_REVISIONS && taken > 0,
       "one slice took {taken} of {SEGMENT_REVISIONS} revisions"
+    );
+  }
+
+  /// [`windows_freed_while_a_cut_is_in_flight_are_counted_held`]'s scene on a shard, its page pinned at
+  /// [`LOADED_PAGE`]: [`HELD_OBJECTS`] objects of a granule each (a chunk each) put and published, then a cut begun
+  /// over [`ENTRIES`] let-goes' pages and left in flight (a turn of it encoded, its catch-up owed), then every granule
+  /// object released while it is: their chunks held for the cut. The bytes released, the held gauge (`held_now`),
+  /// the arena's deferred bytes alone, and whether the cut was still in flight.
+  fn freed_during_a_cut() -> (u64, u64, u64, bool) {
+    crate::daemon::audit_on_shard(move |state| {
+      let granule = state.store.content.arena().granule();
+      let window = state.store.content.chunk_bytes();
+      state.vcs_stores.content_made(window).unwrap();
+      let ids: Vec<slates_vcs::ContentId> =
+        crate::vcs_store::within_budget(state, 1 << 24, |stores| {
+          let content = stores.content_mut().unwrap();
+          (0..HELD_OBJECTS)
+            .map(|at| {
+              let mut text =
+                format!("a chunk's text freed while a cut is in flight, number {at}\n")
+                  .into_bytes();
+              text.resize(granule, b'c');
+              content.put_object(&text).unwrap()
+            })
+            .collect()
+        });
+      crate::verbs::publish_shard(state).unwrap();
+      while state.image_encoder.owed() {
+        let _ = crate::content_holder::image_catch_up_step(state);
+      }
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(LOADED_PAGE));
+      let _ = let_go_and_note(state, (0, ENTRIES));
+      crate::verbs::publish_shard(state).unwrap();
+      let in_flight = state.image_encoder.cut_is_in_flight();
+      let deferred_before = state.store.content.arena().deferred_bytes();
+      crate::vcs_store::within_budget(state, 0, |stores| {
+        let content = stores.content_mut().unwrap();
+        for id in &ids {
+          let _ = content.release(id);
+        }
+      });
+      let released = u64::try_from(granule * HELD_OBJECTS).unwrap();
+      let held = crate::content_holder::held_now(state);
+      let deferred = u64::try_from(
+        state
+          .store
+          .content
+          .arena()
+          .deferred_bytes()
+          .saturating_sub(deferred_before),
+      )
+      .unwrap();
+      while state.image_encoder.owed() {
+        let _ = crate::content_holder::image_catch_up_step(state);
+      }
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (released, held, deferred, in_flight)
+    })
+  }
+
+  /// Goal 93, A-930's held count (main's 57k of 2026-11-27 20:41: a long cut's held window chunks, 4.7 GB, unseen by
+  /// the held gauge until the next lend freed them into the arena). Do: run [`freed_during_a_cut`]. Expect the cut
+  /// still in flight as the objects go, and the held gauge counting every released chunk, which the arena's deferred
+  /// frees alone do not. Red before: the gauge was the arena's deferred bytes, none of them.
+  #[test]
+  fn windows_freed_while_a_cut_is_in_flight_are_counted_held() {
+    let (released, held, deferred, in_flight) = freed_during_a_cut();
+    println!(
+      "{released} bytes released while a cut was in flight: held {held}, the arena's deferred alone {deferred}"
+    );
+    assert!(in_flight, "the cut was in flight as the objects went");
+    assert!(
+      held >= released,
+      "the held gauge counts the {released} bytes held for the cut: {held}"
     );
   }
 

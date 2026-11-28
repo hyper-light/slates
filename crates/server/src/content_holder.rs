@@ -1285,6 +1285,26 @@ pub(crate) const IMAGE_SKIPPED: &str = "vcs_store.image.publications_skipped";
 /// yet due (A-930's cadence, plan (a) of 2026-11-27: the byte rule gates only the catch-up's chain; every publication
 /// asks, so none defers).
 pub(crate) const IMAGE_CHAIN_STOPPED: &str = "vcs_store.image.chain_stopped";
+/// The bytes the shard holds freed for the committed image: the content arena's deferred frees (A-64), and the window
+/// chunks its repository content store holds outside them, freed while a cut in flight may name them or owed a free at
+/// the next lend (`arena_windows::ChunkWindows::held_outside_the_arena`). Before 2026-11-27 only the first was counted,
+/// so a long cut's held chunks (main's 57k: 4.7 GB) were seen only when the next lend freed them into the arena. The
+/// arena is read from the lent chunk store inside a lend, the shard's own store being a placeholder then.
+pub(crate) fn held_now(state: &ShardState) -> u64 {
+  let windows = crate::vcs_store::chunk_windows(&state.vcs_stores);
+  let arena = windows
+    .map(crate::vcs_store::arena_windows::ChunkWindows::lent_chunks)
+    .filter(|chunks| chunks.arena().capacity() > 0)
+    .unwrap_or(&state.store.content)
+    .arena();
+  u64::try_from(arena.deferred_bytes())
+    .unwrap_or(u64::MAX)
+    .saturating_add(windows.map_or(
+      0,
+      crate::vcs_store::arena_windows::ChunkWindows::held_outside_the_arena,
+    ))
+}
+
 /// Format: the status counter of the most bytes one borrow of the shard's state freed into the frees the arena holds
 /// for the committed image ([`note_borrow_held`]).
 pub(crate) const IMAGE_HELD_BORROW_MOST: &str = "vcs_store.image.held_borrow_most_bytes";
@@ -1299,8 +1319,8 @@ pub(crate) fn note_borrow_held(
   before: BorrowArena,
   site: &'static std::panic::Location<'static>,
 ) {
-  let after = state.store.content.arena().deferred_bytes();
-  let freed = u64::try_from(after.saturating_sub(before.deferred)).unwrap_or(u64::MAX);
+  let after = held_now(state);
+  let freed = after.saturating_sub(before.deferred);
   if freed == 0 {
     return;
   }
@@ -1336,8 +1356,8 @@ pub(crate) fn note_borrow_held(
 /// whether it is the arena itself (its capacity, mapped bytes and allocations).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BorrowArena {
-  /// The frees held for the committed image.
-  deferred: usize,
+  /// The frees held for the committed image ([`held_now`]).
+  deferred: u64,
   /// The arena's capacity.
   capacity: usize,
   /// Its mapped bytes.
@@ -1351,7 +1371,7 @@ impl BorrowArena {
   pub(crate) fn read(state: &ShardState) -> Self {
     let arena = state.store.content.arena();
     Self {
-      deferred: arena.deferred_bytes(),
+      deferred: held_now(state),
       capacity: arena.capacity(),
       mapped: arena.mapped_bytes(),
       allocations: arena.allocations(),
@@ -1502,7 +1522,7 @@ pub(crate) fn image_drain(state: &mut ShardState) {
   crate::vcs_store::homes::region_changes_committed();
   crate::vcs_store::homes::landed_changes_committed();
   // What a deferred cut keeps in memory (A-930's cadence): the frees the arena holds for the committed cut.
-  let held = u64::try_from(state.store.content.arena().deferred_bytes()).unwrap_or(u64::MAX);
+  let held = held_now(state);
   state.image_encoder.hold(held);
   // Each doubling of the held peak said with the cadence's state (main's 57k of 2026-11-27: a 357,847,040-byte peak to
   // explain), a line a doubling, so at most the bits of a byte count.

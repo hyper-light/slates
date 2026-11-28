@@ -225,6 +225,10 @@ pub(crate) struct ChunkWindows {
   /// step's let-gos are bounded by its step budget's bytes), times the turns the cut lasts, at most its pages and the
   /// pages its splits put back, since a turn encodes or splits one at least (`slates_vcs::preimage`, "Bound").
   held_for_cut: Vec<Handle<Chunk>>,
+  /// The block bytes of [`ChunkWindows::held_for_cut`] and of the chunks owed a free at the next lend: memory held for
+  /// the committed image that the arena does not count as deferred, still allocated (main's 57k of 2026-11-27 20:41:
+  /// held for a long cut, then surfacing in one lend, 4.7 GB).
+  held_bytes: (u64, u64),
 }
 
 impl std::fmt::Debug for ChunkWindows {
@@ -409,6 +413,7 @@ impl ChunkWindows {
       cut: Preimages::default(),
       cutting: false,
       held_for_cut: Vec::new(),
+      held_bytes: (0, 0),
     }
   }
 
@@ -445,10 +450,24 @@ impl ChunkWindows {
   /// ranges were left, none where every page was thawed as it was encoded.
   pub(crate) fn end_cut(&mut self) -> usize {
     self.cutting = false;
-    for chunk in core::mem::take(&mut self.held_for_cut) {
-      self.free_or_owe(chunk);
+    let held = core::mem::take(&mut self.held_bytes.0);
+    let chunks = core::mem::take(&mut self.held_for_cut);
+    if self.lent {
+      for chunk in chunks {
+        let _freed = self.chunks.free_chunk(chunk);
+      }
+    } else {
+      self.owed.extend(chunks);
+      self.held_bytes.1 = self.held_bytes.1.saturating_add(held);
     }
     self.cut.end()
+  }
+
+  /// The bytes held for the committed image outside the arena's deferred frees: those freed while the cut in flight
+  /// may name them ([`ChunkWindows::end_cut`]), and those owed a free at the next lend. What the shard's held gauge
+  /// adds to the arena's (`content_holder::held_now`).
+  pub(crate) fn held_outside_the_arena(&self) -> u64 {
+    self.held_bytes.0.saturating_add(self.held_bytes.1)
   }
 
   /// The pre-images kept since this was last asked, the counts started again.
@@ -635,15 +654,17 @@ impl ChunkWindows {
   }
 
   /// Frees a chunk now when the store is lent, at the next lend otherwise.
-  fn free_or_owe(&mut self, chunk: Handle<Chunk>) {
+  fn free_or_owe(&mut self, (chunk, block): (Handle<Chunk>, u64)) {
     if self.cutting {
       self.held_for_cut.push(chunk);
+      self.held_bytes.0 = self.held_bytes.0.saturating_add(block);
     } else if self.lent {
       // A chunk the store cannot free stays held until the arena goes; the content store's own counts are settled.
       // A block a committed image names is not reused before a newer one commits: the arena defers it (A-64).
       let _freed = self.chunks.free_chunk(chunk);
     } else {
       self.owed.push(chunk);
+      self.held_bytes.1 = self.held_bytes.1.saturating_add(block);
     }
   }
 
@@ -992,6 +1013,7 @@ impl WindowStorage for ChunkWindows {
       return;
     }
     let chunk = slab.chunk;
+    let block = slab.block;
     let freed = slab.freed;
     self.slabs.remove(&key);
     self.reask_owed.remove(&key);
@@ -1002,7 +1024,7 @@ impl WindowStorage for ChunkWindows {
     if self.filling.is_some_and(|(filling, _, _)| filling == key) {
       self.filling = None;
     }
-    self.free_or_owe(chunk);
+    self.free_or_owe((chunk, block));
   }
 
   fn lend_in(&mut self, lent: &mut dyn Any) -> bool {
@@ -1013,6 +1035,7 @@ impl WindowStorage for ChunkWindows {
         for chunk in std::mem::take(&mut self.owed) {
           let _freed = self.chunks.free_chunk(chunk);
         }
+        self.held_bytes.1 = 0;
         for key in std::mem::take(&mut self.reask_owed) {
           self.reask(key);
         }
