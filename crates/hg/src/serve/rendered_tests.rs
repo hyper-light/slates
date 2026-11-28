@@ -7,6 +7,14 @@
 //! must reach them by its recount; and the landed history's stream is served, every text it sends read back through
 //! the entries the kept values wrote, which holds each kept length to the chunk actually sent.
 
+// Test harness code: proptest's strategy types carry `Arc` (D-8's harness exception), and its test bodies return a
+// `Result`, inside which an unwrap or an assertion is a failed case, which is what it should be.
+#![allow(
+  clippy::disallowed_types,
+  clippy::unwrap_in_result,
+  clippy::panic_in_result_fn
+)]
+
 use std::collections::BTreeSet;
 
 use super::*;
