@@ -251,8 +251,8 @@ pub(crate) fn stage_tallied(tally: Option<slates_hg::render::StageTally>) {
       if let (Some(steps), Some(reads)) =
         (STREAM_STEPS_BY_STAGE.get(at), STREAM_READS_BY_STAGE.get(at))
       {
-        state.count(*steps, stage.steps);
-        state.count(*reads, stage.reads);
+        state.count(steps, stage.steps);
+        state.count(reads, stage.reads);
       }
     }
   });
