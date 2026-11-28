@@ -911,3 +911,11 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     commit's turns bounded by bytes too. Red: 4,194,304 B in one slice before, 262,144 now. Focused 132.
   - Waiting on main: the 57k on 1f0b26651 (planning lines). Open: site 2 (taking.slice), record_turn (3309), the
     clone (hg_view.rs:68), the planning's working set, then the uncapture with a naming proof.
+- 2026-11-27 21:38 PST (written then):
+  - FOUND: the held peaks "in one borrow" were window chunks held for an in-flight cut (ChunkWindows::held_for_cut),
+    owed at its commit, freed at the next lend by whatever borrow lent, then arena-deferred; the planning held nothing
+    (main's four points, 1f0b26651). BUILT, not on main: agents/w-perf-cadence at 864cb01c4, one held gauge
+    (content_holder::held_now) read by the cadence, the look and the borrow line; red 163,840 B held vs 0 before.
+  - Step 2 (catch-up spends the held excess a wake) written, red not trustworthy yet (a 2-page cut lasted 4 wakes;
+    the old-slice red tripped the watchdog): patch at ~/.local/state/w-perf/patches/step2-catch-up-excess.patch.
+  - Waiting on main: its call on running the 57k on 864cb01c4 first. Then site 2's delta scene, then (ii).
