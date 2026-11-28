@@ -1865,11 +1865,21 @@ impl Recorded for bool {
   }
 }
 
-/// A history's last entry: its version, and whether it records the key's removal. `None` for a key with no history.
-fn last_entry<T: Recorded>(history: Option<&Vec<(u64, T)>>) -> Option<(u64, bool)> {
+/// A history's latest entry at or below `at`: its version, and whether it records the key's removal. `None` for a key
+/// with none there. A reader names its version, the head (A-752 part 3c U0): an entry a commit appends before it
+/// publishes is above the head, and no reader at the head takes it for the head's; the commit's own reads name its
+/// version.
+fn last_entry<T: Recorded>(history: Option<&Vec<(u64, T)>>, at: u64) -> Option<(u64, bool)> {
   history
-    .and_then(|history| history.last())
+    .and_then(|history| entries_to(history, at).last())
     .map(|(version, value)| (*version, value.removed()))
+}
+
+/// A history's entries at or below `at`: the prefix a reader at version `at` reads (A-752 part 3c U0).
+fn entries_to<T>(history: &[(u64, T)], at: u64) -> &[(u64, T)] {
+  history
+    .get(..history.partition_point(|(recorded, _)| *recorded <= at))
+    .unwrap_or_default()
 }
 
 /// Where a file's bytes at a version are read from ([`Green::content_read`]).
@@ -3785,7 +3795,8 @@ impl Green {
     current: Option<&T>,
     version: u64,
   ) -> Option<T> {
-    match self.covered_since(path, last_entry(history)) {
+    let head = self.head();
+    match self.covered_since(path, last_entry(history, head), head) {
       Some(since) if version >= since => current.cloned(),
       Some(_) => history.and_then(|history| history_at(history, version)),
       None => value_at(history, current, version),
@@ -3805,7 +3816,7 @@ impl Green {
   /// Whether a directory stood at `path` at `version`, by the module's one history rule and its copies (A-534, A-586).
   fn dir_at(&self, path: &str, version: u64) -> bool {
     let history = self.dir_history.get(path);
-    match self.covered_since(path, last_entry(history)) {
+    match self.covered_since(path, last_entry(history, self.head()), self.head()) {
       Some(since) if version >= since => self.dirs.contains_key(path),
       Some(_) => history.is_some_and(|history| present_at(history, version)),
       None => match history {
@@ -4503,23 +4514,30 @@ impl Green {
       Some((at, passed)) if at > version => (at, passed),
       _ => (version.saturating_add(1), 0),
     };
-    self.changes.range(start..).flat_map(move |(at, entries)| {
-      let from = if *at == start {
-        entries.partition_point(|entry| usize::try_from(entry.index).unwrap_or(usize::MAX) < skip)
-      } else {
-        0
-      };
-      entries
-        .get(from..)
-        .unwrap_or_default()
-        .iter()
-        .map(move |entry| ChangeAt {
-          version: *at,
-          index: usize::try_from(entry.index).unwrap_or(usize::MAX),
-          path: &entry.path,
-          last: entry.last,
-        })
-    })
+    // At or below the head (A-752 part 3c U0): a version a commit records before it publishes is above it.
+    let head = self.head();
+    let below = move |(at, _): &(&u64, &Vec<ChangeEntry>)| **at <= head;
+    self
+      .changes
+      .range(start..)
+      .take_while(below)
+      .flat_map(move |(at, entries)| {
+        let from = if *at == start {
+          entries.partition_point(|entry| usize::try_from(entry.index).unwrap_or(usize::MAX) < skip)
+        } else {
+          0
+        };
+        entries
+          .get(from..)
+          .unwrap_or_default()
+          .iter()
+          .map(move |entry| ChangeAt {
+            version: *at,
+            index: usize::try_from(entry.index).unwrap_or(usize::MAX),
+            path: &entry.path,
+            last: entry.last,
+          })
+      })
   }
 
   /// The changed paths commits put in a tree set of their own ([`Green::commit_tree_paths`]'s field, A-920 3m).
@@ -4937,7 +4955,8 @@ impl Green {
   /// the copy's version on), else the history's value in effect, else nowhere.
   fn content_read(&self, path: &str, version: u64) -> ContentRead<'_> {
     let history = self.content_history.get(path);
-    let covered = self.covered_since(path, last_entry(history));
+    let head = self.head();
+    let covered = self.covered_since(path, last_entry(history, head), head);
     if covered.is_some_and(|since| version >= since) {
       return ContentRead::Head;
     }
@@ -4954,7 +4973,8 @@ impl Green {
     else {
       return ContentRead::Absent;
     };
-    let latest = covered.is_none() && index.saturating_add(1) == history.len();
+    // The head's value is the latest at or below the head, never an entry above it (A-752 part 3c U0).
+    let latest = covered.is_none() && index.saturating_add(1) == entries_to(history, head).len();
     match history.get(index) {
       Some((_, Some(_))) if latest => ContentRead::Head,
       Some((_, Some(value))) => ContentRead::Value(value),
@@ -5127,9 +5147,9 @@ impl Green {
   /// version of the copy that gave them (A-586), so the change's value shares its runs as every later one does. A path
   /// whose history holds them, or with no bytes, records nothing, and neither does a change in its copy's own version.
   fn seed_content(&mut self, path: &str, version: u64) {
-    let own_last = last_entry(self.content_history.get(path));
+    let own_last = last_entry(self.content_history.get(path), version);
     let Some(since) = self
-      .seed_since(path, own_last)
+      .seed_since(path, own_last, version)
       .filter(|since| *since != version)
     else {
       return;
@@ -5297,7 +5317,14 @@ impl Green {
       return digest == head;
     }
     let history = self.content_history.get(path);
-    let Some(history) = history.filter(|_| self.covered_since(path, last_entry(history)).is_none())
+    let at = self.head();
+    let Some(history) = history
+      .filter(|_| {
+        self
+          .covered_since(path, last_entry(history, at), at)
+          .is_none()
+      })
+      .map(|history| entries_to(history, at))
     else {
       // No history, or a copy's value (A-586), whose history's last value is no head's: the bytes at the base against
       // the head's (at the base they are the head's, unless a copy since replaced them).
@@ -6507,7 +6534,7 @@ impl Green {
     version: u64,
   ) -> Seed {
     Seed {
-      since: self.seed_since(path, last_entry(history.get(key))),
+      since: self.seed_since(path, last_entry(history.get(key), version), version),
       version,
     }
   }
@@ -8753,9 +8780,15 @@ impl Green {
         .saturating_mul(2)
         .saturating_mul(crate::history::PIECE_BYTES)
     };
+    let head = self.head();
     let history = self.content_history.get(path);
-    let covered = self.covered_since(path, last_entry(history)).is_some();
-    let Some(history) = history.filter(|_| !covered) else {
+    let covered = self
+      .covered_since(path, last_entry(history, head), head)
+      .is_some();
+    let Some(history) = history
+      .filter(|_| !covered)
+      .map(|history| entries_to(history, head))
+    else {
       // A file held by its object's name alone retains no bytes here.
       return self
         .content
@@ -8804,7 +8837,8 @@ impl Green {
 
   /// The content and IPC histories' retained bytes **recounted** from the histories themselves — the oracle
   /// the running totals are checked against (balanced accounting): the distinct chunks the content values name and
-  /// their piece lists, less the current values, and every earlier IPC node.
+  /// their piece lists, less the current values, and every earlier IPC node. Every entry held, bounded by no version (A-752
+  /// part 3c U0): it audits the running totals, which charge an entry a commit appends as it appends it.
   pub fn history_bytes_recounted(&self) -> usize {
     let values = || {
       self
@@ -8827,7 +8861,8 @@ impl Green {
       .saturating_add(self.special_history_recounted())
   }
 
-  /// The IPC history's earlier nodes, recounted: every node but each path's latest.
+  /// The IPC history's earlier nodes, recounted: every node but each path's latest. Every entry held, bounded by no
+  /// version (A-752 part 3c U0): it audits the running totals, which charge an appended entry as it is appended.
   fn special_history_recounted(&self) -> usize {
     self
       .special_history
@@ -9193,15 +9228,19 @@ impl Green {
   /// the head's, and the verdict's head value is the file's bytes either way. A path whose value is a copy's (A-586), or
   /// whose latest value is a removal or names the block already, is left as it is.
   fn rename_alone(&mut self, path: &str) {
+    let head = self.head();
     let history = self.content_history.get(path);
-    if self.covered_since(path, last_entry(history)).is_some() {
+    if self
+      .covered_since(path, last_entry(history, head), head)
+      .is_some()
+    {
       return;
     }
     let Some(block) = self.content.block_of(path) else {
       return;
     };
     let Some(latest) = history
-      .and_then(|history| history.last())
+      .and_then(|history| entries_to(history, head).last())
       .and_then(|(_, value)| value.as_ref())
     else {
       return;
@@ -9754,6 +9793,9 @@ mod copy_restate_tests;
 
 #[cfg(test)]
 mod head_under_tests;
+
+#[cfg(test)]
+mod head_bound_tests;
 
 #[cfg(test)]
 mod tests {

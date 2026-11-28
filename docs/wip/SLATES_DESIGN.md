@@ -58299,6 +58299,31 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   command leaves its build done. A step entered with the build done runs no turn, and is not counted as one (before, such a step, after a room or policy turn, counted the last turn's units again). Red first: in t_a752's
   scene, no step runs build units and records the entry (`Drive::built_and_landed` 0; it was 1, a 127 ms step), and
   every whole step within the ceiling by a unit and its opening.
+- **Part 3c, the engine's commit staged and published whole (2026-11-28, w-shared; main 01a20182's rulings of 00:42 to
+  01:42).** The commit is 14.2 to 15.6 ms of the landing (`commit_step` 11.2 to 14.0 ms: `set_file` 9.1 to 9.4, the
+  effects 0.8 to 2.6, the change index 1.0). It is to run in turns into a stage no reader sees, published at its end
+  with the head bump last, a refusal at any turn publishing nothing; never the green held out across turns. Of the
+  state it writes, the versioned (every history, the deltas, the change index, the copies' records) is appended at
+  the new version in place and refused by taking its entries above the head out; the current state (the eight Dims,
+  `file_removed`, the `*_changed` maps, `latest_change`, `last_changed`, the identity's sets) is forked; the entries
+  at or below the head the commit changes in place (`supersede_latest`, `history::reanchor`'s re-anchoring,
+  `change_one`'s `last`, `mark_dirty`'s identity sum) write the stage's held copies or wait for the publish. Units,
+  each red first: U0, every read names its version; U1, the head bump and `accepted` moved to the publish with one
+  history appended in place; then the other histories, the change index, the identity, the current-state Dims, and
+  the content history once it is a lineage Dim (A-920 arena unit 1, w-svn), its stage copies holding their chunks.
+  - **U0, every read names its version.** A reader at the head read a history's last entry, the latest copy record
+    and the change index unbounded as the head's (`content_read`'s "latest", `lands_on_head`'s head value,
+    `last_entry` under `covered_since` and `seed_since`, `copy_above`, `superseded_bytes`, `rename_alone`,
+    `changes_after`, `tree_changed_after`, `copy_fix`), so an entry a commit appended before it published would have
+    been read as the head's. Each now reads the latest at or below its version (`last_entry(history, at)`,
+    `entries_to`, `copy_above(path, at)`, `covered_since`'s and `seed_since`'s `at`): a reader the head, the commit's
+    own reads (`seed_content`, `seed_of`, `copied_in`) the version it commits. The recounts
+    (`history_bytes_recounted`, `special_history_recounted`) count every entry held, bounded by nothing: they audit
+    the running totals, which charge what a commit appends as it appends it. Red first
+    (`engine::head_bound_tests`): a green carrying an entry above its head in every history, a copy record over `a`'s
+    tree and a change-index entry above it reads as its twin at every version up to the head, every dimension, the
+    changed paths, the change walk and a probe verdict of every kind at the head and the version before; before, the
+    walk named the version above the head and the probes conflicted against the copy above it.
 - **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
   hard links, a copy's tree; the change build's end (the map's and trees' apply, O(the change)). Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;
