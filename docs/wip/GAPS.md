@@ -4241,7 +4241,14 @@
 > Mercurial greens), a copy's tree (a push makes none); Mercurial's trees still listed whole. OWED (part 3): the
 > entry apply in one step: part 3a moved the paths map's step after a push into slices (94 -> 42 ms, 1,500 files
 > debug); left: the engine's verdict (8.3 ms) and commit (10.9), the recorded entry (4.7), retention's secure (5.0),
-> and the git store's record and commit (11.5, w-git's A-722).
+> and the git store's record and commit (11.5, w-git's A-722). Measured again 2026-11-27 on main 7f6af7ae4 (t_a752,
+> debug, 1,500 files, the update, runs 1 and 2): the landing step 42.8 and 38.6 ms; the engine's commit 15.6 and 14.2,
+> its verdict 9.7 and 8.5, `hold_increments` 3.9 and 3.7, retention's secure 3.9 and 3.5, the recorded entry 2.7 and
+> 2.4, the paths map's advance after the push 2.5 and 2.3, each still over 84a's 1 ms; the git store's record 1.6 and
+> 1.5 and commit 0.2 (w-git's). Part 3b CLOSED the step that ran the build's last turn and the landing in one poll
+> (80.8 + 42.8 = 124 ms; now the landing is a step of its own). Next: the engine's commit, sliced as the paths map was.
+> A-658 3c (the owner's judging under load) waits: creates measured at about 1e-6 of the answer time (main's bench
+> 2026-11-27, R=100); an update's judging is measured only here.
 >
 > **A-760 (2026-11-20, w-engine; main's ruling ~09:10, "1b"):** part 1 BUILT: an increment names content by identity
 > (`Increment::named`, plain BLAKE3 + length), read a slice a step through the owner's `named::Objects`, refused
