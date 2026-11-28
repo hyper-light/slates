@@ -5109,6 +5109,21 @@
 > search. Held by `a_streams_index_rows_are_written_a_run_a_step` (1,200 revisions of a stock-hg history imported, 48
 > sealed runs): index reads 5,369 (4.47 a revision) before, 449 (0.37) after; index steps 1,249 before, 57 after. Count
 > stage on the same history: 1,215 steps, 1,298 reads. Cut 2, the kept rendered length, is next.
+> Cut 2, the kept rendered length, BUILT (2026-11-27, w-interop; A-937, main's rulings of 18:56, 18:58 and 20:19). Each
+> revision's chunk length as a stream sends it is kept where it lands, in the index that takes the revisions' place: a
+> sized row a revision (`S`, the log's number and the revision's, its length and offset; 21 bytes of key and body), a
+> number row a log (`X`), and the head's totals as a field of the index its fork copies. A push sizes its fork at its
+> landing, after any re-base, its segments' chunk lengths noted as each landed and the rest compressed once; a made
+> changeset and an import size theirs the same way. A stream names its head from them, no walk before its first byte,
+> and a length that is stale is refused typed (`render::Refused::StaleLength`; before the head, no stream, `1\n`). A
+> rebuild names no length (a replay appends what its records name), so a sliced recount follows it
+> (`vcs_store::hg_sized`, the count walk once, `render::Recount`), and the stream answers `1\n` until it ends: the
+> recovery is not lengthened, and a stream clone meanwhile falls back to a clone. Held by the hg crate's three-way
+> oracle (`serve::indexed::tests::rendered`, landed, recounted and replayed histories), the stale refusal, and the
+> server's `t_cut2_an_import_is_sized_where_it_lands_and_recounted_after_its_rebuild` and the edge's push-then-stream
+> test: no count step. Owed (main): the hg leg's rerun at the tip (the round at 343703bd7 is in BENCHMARKS: count stage
+> 464,254 of 842,218 steps). Next: the data stage a run a step; the index stage's reads on hg-src; the incremental
+> push's 8.4×.
 > **A stock git command's wait, judged by progress (2026-11-23, w-git; main 01a20182's ruling after r229):** each git
 > command of `crates/cli/tests/git_interop.rs` was killed past a fixed 120 s (`PATIENCE`), and git/git's whole-repository
 > session failed correct but slow steps (80-100 s of single-shard CPU, git's own index-pack among it). Now each waits

@@ -536,6 +536,8 @@ fn prepared(
   let made_key = (green_key(made.green), made.version);
   // A made changeset's payload is named whole, as its intake takes it whole (`hg_push::take_made`; owed, GAPS).
   let name = slates_hg::import::record::PayloadName::of(&forked.changegroup.1);
+  // Its revisions sized in its fork where they land (goal 93, cut 2).
+  super::hg_sized::size_fork(state, &mut forked);
   match crate::repository::hg_push::changeset_landing(
     state,
     made.repository,

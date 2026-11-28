@@ -113,6 +113,7 @@ pub(crate) mod git_replay;
 pub(crate) mod hg_import;
 pub(crate) mod hg_made;
 pub(crate) mod hg_named;
+pub(crate) mod hg_sized;
 pub(crate) mod hg_tags;
 pub(crate) mod hg_view;
 pub(crate) mod homes;
@@ -365,6 +366,9 @@ pub(crate) struct VcsStores {
   /// Each repository's index merge under way between its slices ([`index_upkeep`]): one a repository, so bounded by the
   /// partition's repositories.
   index_upkeep: index_upkeep::Upkeep,
+  /// Each Mercurial repository's recount of its kept rendered length under way after a rebuild ([`hg_sized`]): one a
+  /// repository, so bounded by the partition's repositories.
+  pub(crate) hg_recounts: hg_sized::Recounts,
   /// Each HTTP commit under way (A-681 part C: a transaction a POST made, between its requests), by repository and
   /// transaction name, with the key of the principal that made it and the monotonic instant of its last step: at most
   /// one a repository and principal, a new POST replacing the older ([`VcsStores::begin_dav_commit`]), so bounded by the
@@ -4593,13 +4597,16 @@ fn svn_texts_inline(revision: &slates_svn::commit::revision::Revision) -> bool {
     })
 }
 
-/// Replay's end for repository `id`: its index, built whole, merged a slice at a time ([`index_upkeep::built`]); a
+/// Replay's end for repository `id`: its index, built whole, merged a slice at a time ([`index_upkeep::built`]), and a
+/// Mercurial one's kept rendered length recounted ([`hg_sized::rebuilt`]); a
 /// Mercurial store's revisions its replays kept from texts the node's changeset store gave noted for a home and let go,
 /// a turn at a time, as a landed push's are ([`let_go_brought_back`]). A Subversion repository's stored texts are not
 /// held again: they are its changesets' on the node's store, read through it (C2 stage B part 2 (b)). A git store's
 /// rebuild holds what its records name, as its live store does: nothing brought back to let go.
 fn replay_ended(state: &mut ShardState, id: RepositoryId) {
   index_upkeep::built(state, id);
+  // A replay names no chunk length: a Mercurial index rebuilt serves no stream until its recount ends.
+  hg_sized::rebuilt(state, id);
   let brought_back = match state.vcs_stores.entries.get_mut(&id) {
     Some(RepositoryStore::Mercurial(store)) => core::mem::take(&mut store.brought_back),
     _ => return,
