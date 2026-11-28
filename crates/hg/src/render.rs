@@ -405,6 +405,9 @@ pub struct StageTally {
   pub data: Tally,
   /// The start's and the head's.
   pub other: Tally,
+  /// The gathering steps' rows and their time on the step's clock ([`StepCopy::clock`]): what the shard's
+  /// [`RowCost`] learns from. Zero time where no clock was given.
+  pub gathered: (u64, u64),
 }
 
 impl StageTally {
@@ -420,6 +423,10 @@ impl StageTally {
       index: sum(self.index, other.index),
       data: sum(self.data, other.data),
       other: sum(self.other, other.other),
+      gathered: (
+        self.gathered.0.saturating_add(other.gathered.0),
+        self.gathered.1.saturating_add(other.gathered.1),
+      ),
     }
   }
 
@@ -888,13 +895,16 @@ impl GatherStep {
     }
   }
 
-  /// Whether it has spent what it may (a row at least, so a budget below a row's cost still moves).
+  /// Whether it has spent what it may: whether one more row would take it past its budget (a row at least, so a budget
+  /// below a row's cost still moves). Judged before the row, so a step passes its budget only by a table the row's walk
+  /// opens, a read it cannot see coming (main 01a20182's ruling of 2026-11-27 23:39: no step past its slice by more than
+  /// a row's or a read's cost).
   fn spent(&self, store: &ContentStore) -> bool {
     self.rows > 0
       && match self.copy {
         Some(copy) => {
           let reads = store.reads().saturating_sub(self.reads_at);
-          gather_spent(store, copy, (self.rows, reads)) >= copy.bytes
+          gather_spent(store, copy, (self.rows.saturating_add(1), reads)) > copy.bytes
         }
         None => self.rows >= self.rows_most,
       }
@@ -1109,10 +1119,19 @@ impl Streaming {
     }
     let mut step = GatherStep::begin(store, self.step_copy);
     let room = self.room_hint;
+    let clock = self.step_copy.and_then(|copy| copy.clock);
+    let began = clock.map(|now| now());
     let ended = match self.gathering.as_mut() {
       Some(gathering) => gather(gathering, (index, store), (&mut step, room))?,
       None => GatherEnd::Logs,
     };
+    let took = clock
+      .zip(began)
+      .map_or(0, |(now, began)| now().saturating_sub(began));
+    self.tally.gathered = (
+      self.tally.gathered.0.saturating_add(step.rows),
+      self.tally.gathered.1.saturating_add(took),
+    );
     #[cfg(test)]
     self.gather_trace.push(GatherTraced {
       rows: step.rows,
@@ -1843,15 +1862,87 @@ fn unreadable_at(gathering: &Gathering) -> Refused {
   }
 }
 
-/// What one step may move (goal 93; main 01a20182's rulings of 2026-11-27 17:57 and 22:13): its copy budget's bytes (the
-/// daemon's `copy_slice_bytes`) and the machine's cache line, which a read of the content store is charged in
-/// ([`read_charge`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What one step may move (goal 93; main 01a20182's rulings of 2026-11-27 17:57, 22:13 and 23:39): its copy budget's
+/// bytes (the daemon's `copy_slice_bytes`), the machine's cache line a read of the content store is charged in
+/// ([`read_charge`]), what a gathered row is charged ([`RowCost`], the shard's learned cost), and the clock a stream
+/// times its gathering steps by for that cost (the shard's; none off a shard, where nothing is learned).
+#[derive(Clone, Copy, Debug)]
 pub struct StepCopy {
   /// The bytes.
   pub bytes: u64,
   /// The machine's cache line, in bytes (`slates_machine`'s facts).
   pub line: u64,
+  /// What a gathered row is charged, in bytes at the copy rate the budget is written in ([`RowCost::row_bytes`]).
+  pub row: u64,
+  /// The clock gathering steps are timed by, in nanoseconds ([`StageTally::gathered`]); none to time nothing.
+  pub clock: Option<fn() -> u64>,
+}
+
+impl StepCopy {
+  /// A step of `bytes` at a `line`-byte cache line whose rows are charged their first, derived cost
+  /// ([`RowCost::first`]), timed by no clock: what a caller with no shard's learned cost streams with (the tests).
+  pub fn derived(bytes: u64, line: u64) -> StepCopy {
+    StepCopy {
+      bytes,
+      line,
+      row: RowCost::first(line),
+      clock: None,
+    }
+  }
+}
+
+/// Format: the nanoseconds a second, which a copy rate in bytes a second is over.
+const NANOS_A_SECOND: u64 = 1_000_000_000;
+
+/// A shard's learned cost of a gathered row (goal 93; main 01a20182's ruling of 2026-11-27 23:39, under §4.17.1's
+/// rule for a learned tunable). Measured in release on the MacBook at 1eed2782a: 84.5 ns a row, while a row was charged
+/// its held form's 180 bytes, about 3 ns at 57.1 GB/s, so gathering steps ran about ten times past their 1,660 ns
+/// slice.
+/// - **Estimator:** the gathering steps' time over their rows, every step the shard's streams and recounts took
+///   (a cumulative mean), as bytes at the copy rate the step's budget is written in.
+/// - **Inputs:** each gathering step's rows and its time on the shard's clock ([`StageTally::gathered`]).
+/// - **Updates:** each turn a stream's tally is taken, and each recount's slice.
+/// - **Bounds:** at least a row's held form ([`row_charge`]); at most a whole step's bytes, since a row past its step's
+///   budget is gathered alone whatever.
+/// - **First value:** the cache lines a row moves, until a step is measured ([`RowCost::first`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowCost {
+  /// The rows measured.
+  rows: u64,
+  /// Their time.
+  ns: u64,
+}
+
+impl RowCost {
+  /// One measured stretch of gathering: `rows` rows in `ns` nanoseconds.
+  pub fn observe(&mut self, (rows, ns): (u64, u64)) {
+    self.rows = self.rows.saturating_add(rows);
+    self.ns = self.ns.saturating_add(ns);
+  }
+
+  /// Derived: a row's first cost, before any step is measured: the cache lines it moves, each `line` bytes: its held
+  /// forms written ([`row_charge`] over a line), and in its table its offset word's line and its row's (key and body),
+  /// and the merge's comparison of its source's head, a line.
+  pub fn first(line: u64) -> u64 {
+    let line = line.max(1);
+    row_charge()
+      .div_ceil(line)
+      .saturating_add(3)
+      .saturating_mul(line)
+  }
+
+  /// What a row is charged in a step of `step_bytes` at a `line`-byte cache line, the copy rate `bytes_per_second`:
+  /// its measured time a row at that rate, or its first cost before any is measured, held to its bounds.
+  pub fn row_bytes(&self, line: u64, (bytes_per_second, step_bytes): (u64, u64)) -> u64 {
+    let learned = if self.rows == 0 {
+      RowCost::first(line)
+    } else {
+      let ns = u128::from(self.ns) / u128::from(self.rows.max(1));
+      let bytes = ns.saturating_mul(u128::from(bytes_per_second)) / u128::from(NANOS_A_SECOND);
+      u64::try_from(bytes).unwrap_or(u64::MAX)
+    };
+    learned.clamp(row_charge(), step_bytes.max(row_charge()))
+  }
 }
 
 /// Format: the branching of std's B-tree (`alloc::collections::btree::node`'s `B`), whose nodes hold `2B - 1` keys: the
@@ -1923,7 +2014,7 @@ pub(crate) fn row_charge() -> u64 {
 /// gap; main 01a20182's rulings of 2026-11-27 17:57 and 22:13).
 fn gather_spent(store: &ContentStore, copy: StepCopy, (rows, reads): (u64, u64)) -> u64 {
   rows
-    .saturating_mul(row_charge())
+    .saturating_mul(copy.row.max(row_charge()))
     .saturating_add(reads.saturating_mul(read_charge(store, copy.line)))
 }
 

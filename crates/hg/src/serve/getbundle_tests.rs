@@ -146,8 +146,8 @@ impl Store for Served {
     u64::MAX
   }
 
-  fn cache_line(&self) -> u64 {
-    super::super::tests::TEST_LINE
+  fn step_copy(&self) -> crate::render::StepCopy {
+    crate::render::StepCopy::derived(u64::MAX, super::super::tests::TEST_LINE)
   }
 
   /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole, its identity the
