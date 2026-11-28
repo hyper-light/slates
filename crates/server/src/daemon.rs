@@ -1986,6 +1986,30 @@ impl Daemon {
     self.set_state_log_ship_hold(hold)
   }
 
+  /// Test support (main 01a20182's ruling of 2026-11-27 21:11, the creation check): whether this node holds the record of
+  /// the repository `member` (a green's id of its family) belongs to: a register of the family other than `member`'s
+  /// own whose held value is a repository's record, as a holder finds its repository (`replica_build`). What a creation
+  /// answers only once it is at `f + 1` (A-894). Across the shards.
+  pub fn holds_repository_record_of(&self, member: [u8; 16]) -> Result<bool, ObserveError> {
+    let member = slates_db::register::ObjectId(member);
+    let family = member.line_key();
+    for shard in self.shards.clone() {
+      let held = self.observe(Some(shard), move |s| {
+        s.holder_records.iter().any(|(register, acceptor)| {
+          register.line_key() == family
+            && *register != member
+            && acceptor
+              .values(*register)
+              .any(|value| crate::catalog::repository_of(value).is_some())
+        })
+      })?;
+      if held {
+        return Ok(true);
+      }
+    }
+    Ok(false)
+  }
+
   /// Test support (A-927 part 2): the positions of the names log of `member`'s family (a repository's id, or a green's of
   /// it) this node's acceptors hold, ascending, across its shards.
   pub fn names_log_positions(&self, member: [u8; 16]) -> Result<Vec<u64>, ObserveError> {
