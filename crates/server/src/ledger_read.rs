@@ -473,11 +473,14 @@ async fn read_once(
       u64::try_from(answers.len().saturating_sub(1)).unwrap_or(u64::MAX),
     );
     if adoption.past_tolerance {
-      // The open edge: what committed is the owner's applied state, not the newest surviving older value.
+      // The open edge: what committed is the owner's applied state, not the newest surviving older value. The line names
+      // the reader and who answered it, its own answer among them (main 01a20182's ask of 2026-11-27 15:51: 41aa47870
+      // run 7's names-log read did not say whose it was).
       s.count(PAST_TOLERANCE, 1);
+      let answered: Vec<HostId> = answers.keys().copied().collect();
       slates_machine::log_line!(
-        "slates-server: a read of {register:?} from {} was past tolerance: nothing held, the register's candidacy \
-         owed",
+        "slates-server: a read of {register:?} from {} by {local:?} was past tolerance: answered by {answered:?}, \
+         nothing held, the register's candidacy owed",
         wanted.from
       );
       s.ledger_reads.wanted.remove(&register);

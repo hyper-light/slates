@@ -568,6 +568,9 @@ pub struct Answering {
   head: Option<Vec<u8>>,
   /// A stream clone's files ([`crate::render::Streaming`] framed as a `stream2` part's payload), while they are sent.
   stream: Option<Box<crate::render::Streaming>>,
+  /// The tally of a stream that ended, until its next take ([`Answering::take_stream_tally`]): the stream goes at its
+  /// end, and its last steps' counts with it otherwise.
+  ended_tally: crate::render::StageTally,
   /// A stream clone's `phaseroots`, sent after its revlogs where the repository is not publishing.
   phaseroots: Option<Vec<u8>>,
   /// The changegroup, while one is sent.
@@ -577,6 +580,16 @@ pub struct Answering {
 }
 
 impl Answering {
+  /// A stream clone's steps and reads by stage since the last take ([`crate::render::Streaming::take_tally`]); none for
+  /// an answer that streams no files.
+  pub fn take_stream_tally(&mut self) -> Option<crate::render::StageTally> {
+    let ended = core::mem::take(&mut self.ended_tally);
+    match self.stream.as_mut() {
+      Some(streaming) => Some(streaming.take_tally().plus(ended)),
+      None => (ended != crate::render::StageTally::default()).then_some(ended),
+    }
+  }
+
   /// What the answer's next step asks of the changeset store, if anything (its changegroup's file section, [`Walk`]).
   pub fn wants(&self) -> Option<&crate::render::Want> {
     if let Some(stream) = &self.stream {
@@ -663,6 +676,7 @@ impl Answering {
     Ok(Answering {
       head: Some(head),
       stream,
+      ended_tally: crate::render::StageTally::default(),
       phaseroots,
       walk,
       tail: Some(tail),
@@ -679,12 +693,11 @@ impl Answering {
   ) -> Result<bool, Refusal> {
     if let Some(stream) = &mut self.stream {
       let streaming = (&mut **stream, &mut self.head, &mut self.phaseroots);
-      return streamed_step(streaming, store, room, out).map(|more| {
-        if !more {
-          self.stream = None;
-        }
-        true
-      });
+      let more = streamed_step(streaming, store, room, out)?;
+      if !more && let Some(mut ended) = self.stream.take() {
+        self.ended_tally = self.ended_tally.plus(ended.take_tally());
+      }
+      return Ok(true);
     }
     if let Some(head) = self.head.take() {
       out.extend_from_slice(&head);

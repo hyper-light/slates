@@ -82,7 +82,8 @@ use slates_ipc::{ClientEnd, HeldRendezvous, IpcError, connect};
 use slates_machine::MachineProfile;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 use slates_server::daemon::{
-  HEARTBEAT_NS, HomingWindowReading, LIVENESS_BUDGET_NS, LinkAfter, SessionHold, host_id_of,
+  HEARTBEAT_NS, HomingWindowReading, LIVENESS_BUDGET_NS, LinkAfter, RepairWindowHolders,
+  SessionHold, host_id_of,
 };
 use slates_server::deploy::member_id;
 use slates_server::head::HeadValue;
@@ -37248,7 +37249,9 @@ fn push_on_top_at_edge(
     ],
   );
   if !cloned.status.success() {
-    return Err(String::from_utf8_lossy(&cloned.stderr).into_owned());
+    let refused = String::from_utf8_lossy(&cloned.stderr).into_owned();
+    note_unreachable_edge(port, &refused);
+    return Err(refused);
   }
   commit_in(&dir, "copy", (file, bytes));
   let work = format!("{}/copy", dir.path);
@@ -37260,8 +37263,34 @@ fn push_on_top_at_edge(
   if pushed.status.success() {
     Ok(())
   } else {
-    Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
+    let refused = String::from_utf8_lossy(&pushed.stderr).into_owned();
+    note_unreachable_edge(port, &refused);
+    Err(refused)
   }
+}
+
+/// Where a git client's `refused` says it could not connect to the edge at `port` (main 01a20182's ask of 2026-11-27
+/// 17:05: a914's run 3, refused at 0 ms on a live node's own port): logs, on the fleet trace and stderr, the process's
+/// monotonic time, the port, and whether a connect to it made at once from here is accepted, so the edge's own
+/// "listens on" and "closed" lines (`vcs_http`) place the refusal: before the bind, after a close, or with the listener
+/// bound.
+fn note_unreachable_edge(port: u16, refused: &str) {
+  if !refused.contains("Failed to connect") {
+    return;
+  }
+  let at = slates_machine::clock::monotonic_ns();
+  let probe = std::net::TcpStream::connect_timeout(
+    &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+    Duration::from_secs(1),
+  )
+  .map(|_| ())
+  .map_err(|error| format!("{:?}: {error}", error.kind()));
+  common::trace::record(format_args!(
+    "edge unreachable: port {port} refused at {at} ns; a connect from here at once {probe:?}"
+  ));
+  eprintln!(
+    "edge unreachable: port {port} refused at {at} ns; a connect from here at once {probe:?}"
+  );
 }
 
 /// Counter: home exchanges a node was asked, counted as each arrives (`vcs_store::homes::REMOTE_ASKED`).
@@ -38136,11 +38165,23 @@ const CREATION_WATCH_PERIODS: u64 = 20;
 ///
 /// Recorded, not asserted: the first death's measured silence beside the estimate's window at it, the red for the
 /// prior a first death still lacks (A-914 (c)): 7 runs, macOS arm64 debug, 2026-11-25, silence 3.99 to 5.24 s against a
-/// window of 3.3 to 3.8 s, that push refused `retry` at its homing in 4 of 7. **Owed, a named debt:** the push during the
-/// second death is not asserted to land. On the learned window (16.9 to 18.7 s) it landed 4 of 7; 2 were refused at
-/// the record barrier (`unable to commit`, the new version's merge records unplaced 13 s after the takeover installed:
-/// A-912's sibling, w-shared's next piece), 1 fell short at its homing. With each death awaited to its unseating, 2 of
-/// 6 landed, 4 refused at the barrier. That piece adds the assertion here.
+/// window of 3.3 to 3.8 s, that push refused `retry` at its homing in 4 of 7.
+///
+/// **f = 1's repair-window precondition** (main 01a20182's ruling of 2026-11-27 15:51): before the second death, every
+/// survivor holds what a owns of the repository, so the first death's repair is over ([`repair_window_closed`]): a
+/// counts each among the holders of its green's newest placed version, and each holds its names log's newest placed
+/// head. §4.8 settles a's neighbourhood change once `f + 1` of its new cohort hold the newest record, a among them
+/// (`Configuration::placed_on_current`), so a and c may settle it while the candidate d's death brought in still holds
+/// nothing. Killing c then is a second failure inside the first's repair window, more than `f = 1` promises, and the
+/// push's `unable to commit` is the typed answer (41aa47870 run 7: the green placed at 2 of 3, the newcomer behind,
+/// `merge.behind.heard` 9). A precondition that never holds fails here, before the second death, named.
+///
+/// A refused push during the first death fails the run at once, named, with the verdict the precondition would give 400 s
+/// later ([`first_death_push_refused`], main 01a20182's ruling of 2026-11-27 17:12, its (d2)): that push's new version is,
+/// until GAP-A9-7's record half re-ships a green's placed version, the one way the newcomer reaches the green's chain (it
+/// reads it on `Behind`, A-918 B); A-934 re-ships the state logs' parts alone. Its homing's `retry` is A-914 (c)'s prior,
+/// OPEN; any other refusal (2816da877's run 3: a's own HTTP port refusing the connection at 0 ms) is unexpected. Once
+/// the green's re-ship lands, a `retry` goes on to the precondition, which then proves the repair needs no traffic.
 #[test]
 fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first() {
   let _serial = serialize_fleet_tests();
@@ -38153,15 +38194,24 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
     (Some(lease), None),
   );
   let first = fleet.push(0, ("first.txt", b"main before any death\n"));
-  let mut during = Vec::new();
-  for (death, file) in [(3, "after-d.txt"), (2, "after-c.txt")] {
-    during.push(stretched_death(&mut fleet, death, file));
+  let at_d = stretched_death(&mut fleet, 3, "after-d.txt");
+  if let Err(refused) = &at_d.1 {
+    fleet.stop();
+    first_death_push_refused(refused);
   }
+  let (repaired, holders) = repair_window_closed(&fleet);
+  let during = [at_d, stretched_death(&mut fleet, 2, "after-c.txt")];
   fleet.stop();
   eprintln!(
-    "two stretched deaths: first push {first:?}; each (window at it, its push, taken over, after) {during:?}"
+    "two stretched deaths: first push {first:?}; each (window at it, its push, taken over, after) {during:?}; the \
+     first's repair window closed {repaired} at {holders:?}"
   );
   assert_eq!(first, Ok(()), "the push before any death landed");
+  assert!(
+    repaired,
+    "f = 1's repair-window precondition: every survivor held a's green and names log before the second death: \
+     {holders:?}"
+  );
   let [
     (first_window, _, first_taken, first_after),
     (second_window, second_push, second_taken, _),
@@ -38199,6 +38249,64 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
 
 /// A node's homing window as read from its status, or why it could not be ([`stretched_death`]'s readings).
 type WindowRead = Result<HomingWindowReading, ObserveError>;
+
+/// Fails A-914 (a)'s test at the first death's refused push (its doc, main's (d2)), naming which: the homing's `retry`,
+/// told by the words the server answers it in ([`slates_server::HOMED_SHORT`]), or any other refusal, unexpected.
+fn first_death_push_refused(refused: &str) -> ! {
+  if refused.contains(slates_server::HOMED_SHORT) {
+    panic!(
+      "the first death's push refused retry (A-914 (c)'s prior, OPEN; until the green sibling lands, the newcomer reaches \
+       the green's chain only through a new version): {refused}"
+    );
+  }
+  panic!("the first death's push refused, unexpected: {refused}");
+}
+
+/// What [`repair_window_closed`] last read: a's count of its repository's holders ([`RepairWindowHolders`]) and each
+/// survivor's names-log positions but a's, or why either could not be read.
+type RepairRead = (
+  Result<RepairWindowHolders, ObserveError>,
+  Vec<Result<Vec<u64>, ObserveError>>,
+);
+
+/// f = 1's repair-window precondition of A-914 (a)'s test
+/// ([`a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first`]): whether, within [`RETIREMENT_DEADLINE`], a counts every other survivor among the holders of its repository's green's
+/// newest placed version and every other survivor holds a's names log through its position
+/// (`Daemon::repair_window_holders`, `Daemon::names_log_positions`); with what it last read.
+fn repair_window_closed(fleet: &GitFleet) -> (bool, RepairRead) {
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let others = 1..fleet.daemons.len();
+  let closed = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    let held = fleet.daemons[0].repair_window_holders(fleet.repository)?;
+    others.clone().try_fold(true, |all, node| {
+      Ok(all && survivor_repaired(fleet, node, &held)?)
+    })
+  });
+  let positions = others
+    .map(|node| fleet.daemons[node].names_log_positions(fleet.repository))
+    .collect();
+  let held = fleet.daemons[0].repair_window_holders(fleet.repository);
+  (closed, (held, positions))
+}
+
+/// Whether survivor `node` holds what a counts of its repository ([`repair_window_closed`]): it is among the holders of
+/// the green's newest placed version, and its names-log positions reach the log's position at a.
+fn survivor_repaired(
+  fleet: &GitFleet,
+  node: usize,
+  held: &RepairWindowHolders,
+) -> Result<bool, ObserveError> {
+  let host = fleet.hosts[node];
+  let in_green = held
+    .green
+    .as_ref()
+    .is_some_and(|(_, holders)| holders.contains(&host));
+  let Some(head) = held.names_head else {
+    return Ok(false);
+  };
+  let positions = fleet.daemons[node].names_log_positions(fleet.repository)?;
+  Ok(in_green && positions.last().is_some_and(|last| *last >= head))
+}
 
 /// One of [`a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first`]'s deaths: every node's
 /// periods stretched, node `death` stopped, a push on top from a, every survivor's takeover of it and its unseating from
@@ -38242,11 +38350,126 @@ fn poll_taken_over_and_unseated(survivors: &[Daemon], gone: HostId) -> bool {
     })
 }
 
+/// A-934 (main 01a20182's ruling of 2026-11-27 15:51, its item 2: §4.8's settle and the state logs). Do: on a four-node
+/// `f = 1` git fleet with a repository on a, push `main`; hold a's state-log parts off y, one of its two remote
+/// candidates (`Daemon::hold_state_log_shipping_from`), and push on top, so the names log's newest part is held by a and
+/// the other candidate, x, alone; hold every part off every member (`Daemon::hold_state_log_shipping`); stop x and await
+/// its takeover and unseating, so a's new cohort is a, y and the fourth node, z, and only a holds that part of it. Expect
+/// a's neighbourhood change not to settle while the hold stands (`Daemon::council_settlement`), and to settle once it is
+/// lifted and y and z hold the part. Red before A-934: the settle asked each volume's head and catalog and each green's
+/// newest merge record to be held by `f + 1` of the new cohort (`fleet::records_placed_on_current_neighbourhood`) but no
+/// state log, so a and y settled it, the old set retired, and the names log's newest part was held by one member of the
+/// cohort a takeover of a recovers through.
+#[test]
+fn a934_a_neighbourhood_change_waits_for_its_state_logs_newest_part_on_the_new_cohort() {
+  let _serial = serialize_fleet_tests();
+  let ((daemons, hosts), stores, lease) =
+    started_git_fleet_of("settle-state-logs", &["a", "b", "c", "d"]);
+  let mut fleet = founded_git_fleet(
+    "settle-state-logs",
+    (daemons, hosts),
+    stores,
+    (Some(lease), None),
+  );
+  let first = fleet.push(0, ("first.txt", b"main, its parts held everywhere\n"));
+  let (x, y) = remote_candidates(&fleet);
+  let second = push_with_part_held_from(&mut fleet, y);
+  let taken = stop_and_take_over(&mut fleet, x);
+  let while_held = settled_within(&fleet, x);
+  let held = (
+    names_positions(&fleet),
+    fleet.daemons[0].repair_window_holders(fleet.repository),
+  );
+  fleet.daemons[0].hold_state_log_shipping(false).unwrap();
+  let lifted = settled_within(&fleet, x);
+  let after = names_positions(&fleet);
+  fleet.stop();
+  eprintln!(
+    "settle-state-logs: pushes {first:?} {second:?}; x {x:?} y {y:?}; taken over {taken}; settled while held \
+     {while_held}, the names-log positions of a and the survivors and a's count of its holders then {held:?}; settled \
+     once lifted {lifted}, positions {after:?}"
+  );
+  assert!(
+    first.is_ok() && second.is_ok(),
+    "both pushes landed: {first:?} {second:?}"
+  );
+  assert!(taken, "the survivors took x over and unseated it");
+  assert!(
+    !while_held,
+    "a's neighbourhood change did not settle while its names log's newest part was held by a alone of its new cohort: \
+     {held:?}"
+  );
+  assert!(
+    lifted,
+    "a's neighbourhood change settled once its parts reached the new cohort: {after:?}"
+  );
+}
+
+/// a's two remote candidates in a [`GitFleet`] of four (A-934's test): the hosts of its placement neighbourhood but a.
+fn remote_candidates(fleet: &GitFleet) -> (HostId, HostId) {
+  let own = fleet.hosts[0];
+  let others: Vec<HostId> = fleet.daemons[0]
+    .placement_neighbourhood()
+    .unwrap()
+    .into_iter()
+    .filter(|host| *host != own)
+    .collect();
+  let [x, y] = others[..] else {
+    panic!("a's neighbourhood holds two other hosts: {others:?}");
+  };
+  (x, y)
+}
+
+/// Pushes on top at a with its state-log parts held off `y` (A-934's test), so the push's names-log part is held by a and
+/// its other candidate alone; then holds every part off every member. The push's answer.
+fn push_with_part_held_from(fleet: &mut GitFleet, y: HostId) -> Result<(), String> {
+  fleet.daemons[0].hold_state_log_shipping_from(y).unwrap();
+  let pushed = fleet.push_on_top(0, ("second.txt", b"on top, its part held off y\n"));
+  fleet.daemons[0].hold_state_log_shipping(true).unwrap();
+  pushed
+}
+
+/// Stops the node of `gone` (dropping it from the fleet's hosts too, so they stay aligned with its daemons) and awaits
+/// every survivor's takeover of it and its unseating ([`poll_taken_over_and_unseated`]).
+fn stop_and_take_over(fleet: &mut GitFleet, gone: HostId) -> bool {
+  let node = fleet
+    .hosts
+    .iter()
+    .position(|host| *host == gone)
+    .expect("a node of the fleet");
+  fleet.daemons.remove(node).stop();
+  fleet.hosts.remove(node);
+  poll_taken_over_and_unseated(&fleet.daemons, gone)
+}
+
+/// Whether a's neighbourhood change away from `gone` settles within [`RETIREMENT_DEADLINE`] (A-934's test): its placement
+/// neighbourhood without `gone`, and the council's settled neighbourhood for a fixed at its current one's version
+/// (`Daemon::council_settlement`).
+fn settled_within(fleet: &GitFleet, gone: HostId) -> bool {
+  let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  let own = fleet.hosts[0];
+  poll_until(&observed, RETIREMENT_DEADLINE, || {
+    let moved = !fleet.daemons[0].placement_neighbourhood()?.contains(&gone);
+    let settlement = fleet.daemons[0].council_settlement(own)?;
+    Ok(moved && settlement.is_some_and(|(settled, current)| settled == current))
+  })
+}
+
+/// Each node's held names-log positions of the fleet's repository (`Daemon::names_log_positions`), in node order.
+fn names_positions(fleet: &GitFleet) -> Vec<Result<Vec<u64>, ObserveError>> {
+  fleet
+    .daemons
+    .iter()
+    .map(|daemon| daemon.names_log_positions(fleet.repository))
+    .collect()
+}
+
 /// A-919 (main 01a20182's rulings of 2026-11-25: the worse failure of a candidate a death brings in). Do: on a four-node
 /// `f = 1` git fleet with a repository on a, push `main` and wait for both of a's remote candidates to hold its green's
 /// version 1 (and so the repository's state logs); stop one of them, so the fourth node, which holds none of the
 /// repository's state logs, becomes a candidate once the survivors took the dead one over; push on top twice. Expect
-/// a's state logs' parts let go again (`Daemon::state_log_parts_bytes` back to zero): the newcomer caught up on each
+/// a's state logs' parts let go again but each log's newest (`Daemon::state_log_parts_past_newest` back to zero, A-934):
+/// the newcomer caught up on each
 /// log's prefix and acknowledged its next parts. Red before A-919: the newcomer refused every part past its empty copy
 /// (`discontinuous`), untyped, so its acknowledgement stayed below every part and a kept every part from then on,
 /// until its parts reached the partition's bound and every change to the repository was refused `Overloaded`.
@@ -38295,8 +38518,10 @@ fn a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_th
   .map(|change| fleet.push_on_top(0, change))
   .collect();
   let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  // Each log keeps its newest part once every candidate holds it (A-934: what a candidate a change brings in is shipped,
+  // and what a settle counts), so a's parts fall back to one a log, not to none: none past each log's newest.
   let let_go = poll_until(&observed, RETIREMENT_DEADLINE, || {
-    Ok(fleet.daemons[0].state_log_parts_bytes()? == 0)
+    Ok(fleet.daemons[0].state_log_parts_past_newest()? == 0)
   });
   let bytes = fleet.daemons[0].state_log_parts_bytes();
   let refusals: Vec<_> = fleet
@@ -38337,7 +38562,8 @@ fn a919_a_candidate_a_death_brings_in_catches_up_a_repositorys_state_logs_and_th
 /// so the fourth node, which holds none of the logs, becomes a candidate; push on top. Expect the newcomer's read never
 /// past tolerance and the names log held from its first part, as the old holder holds it: below where a's hold begins, the old holder's
 /// report alone is adopted where a's committed floor (the highest position a let go, with the chain's digest there)
-/// witnesses it; and a's parts let go again (`Daemon::state_log_parts_bytes` back to zero). Red before (C): a counted as
+/// witnesses it; and a's parts let go again but each log's newest (`Daemon::state_log_parts_past_newest` back to zero,
+/// A-934). Red before (C): a counted as
 /// one gone below its hold's start and the departed another, so the read went past tolerance, the newcomer adopted
 /// nothing below a's start, refused every part, and a kept its parts from then on (the open edge, A-919).
 ///
@@ -38421,8 +38647,9 @@ fn a919_a_newcomer_holds_a_restarted_owners_let_go_prefix_on_its_committed_floor
   let old_positions = old_holder.map(|daemon| daemon.names_log_positions(fleet.repository));
   let newcomer_refused = refusals_of(&fleet.daemons[newcomer]);
   let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
+  // One part a log stays, its newest (A-934), so the parts let go are those past each log's newest.
   let let_go = poll_until(&observed, RETIREMENT_DEADLINE, || {
-    Ok(fleet.daemons[0].state_log_parts_bytes()? == 0)
+    Ok(fleet.daemons[0].state_log_parts_past_newest()? == 0)
   });
   drop(observed);
   let parts_bytes = fleet.daemons[0].state_log_parts_bytes();

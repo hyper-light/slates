@@ -373,6 +373,48 @@
 >      candidacy owed"): A-919's open edge, which (C) closes. Rerun after (C) lands.
 >   2. Runs 1 and 16: a green owed at version 2, placed 1, no read past tolerance: FIXED by w-interop (the entry below,
 >      a region read that waited out a dead first home).
+> - **Shape 1 after (C), a test precondition (w-shared, 2026-11-27; main 01a20182's ruling of 15:51).** At 41aa47870
+>   (1 of 11 green; its placed Some(1) reds, "acknowledged []", bisected to 43a8563a2, main's finding of 16:02), run
+>   7's two reads past tolerance came after the
+>   second death, from the candidate the first death brought in: the root green's merge chain (no floor by design, (C)
+>   covers state logs) and the names log above a's floor. §4.8 settles a neighbourhood change once `f + 1` of the new
+>   cohort hold the newest record, the owner among them (`Configuration::placed_on_current`; the owner's own hold,
+>   `cluster/src/lib.rs` ~1040), so a and c settled the first death's change while the newcomer held nothing; c's death
+>   then was a second failure inside the first's repair window, more than `f = 1` promises, and `unable to commit` is
+>   the typed answer. a914 now waits, before the second death, until a counts every survivor among its green's newest
+>   placed version's holders and each holds the names log through its position at a (`Daemon::repair_window_holders`), and
+>   fails there, named, if that never holds (one focused run: closed with the names log at 4, both survivors holding 2
+>   to 4, the second push landed). The reads past tolerance now name their reader and who answered.
+> - **FIXED, A-934 (w-shared, 2026-11-27; main 01a20182's rulings of 15:51, item 2, and 16:20): the settle asked nothing
+>   of the state logs.** `fleet::records_placed_on_current_neighbourhood` asks each volume's head and catalog and each green's newest
+>   merge record to be held by `f + 1` of the new cohort, no state log, so the old set can retire while a log's newest
+>   part is held by the owner alone of the cohort a takeover of it recovers through (parts let go before a change are
+>   not shipped again; a part owed ships to the current candidates). The owner keeps no placed head of a state log, and
+>   forgets a log's acknowledgements once it let every part go, so it cannot count a log's holders on a new cohort, and
+>   nothing ships a newcomer the parts it lacks: a914's lagging candidate got its missing part only by the accident
+>   43a8563a2's fold fix removed (main 01a20182's finding of 16:06). Red first:
+>   `a934_a_neighbourhood_change_waits_for_its_state_logs_newest_part_on_the_new_cohort` (the names log's newest part
+>   held off y and then off every member, x stopped): settled while held, a's names log at 4, y holding positions 2 and
+>   3, the newcomer none (macOS arm64 debug, 2026-11-27, `~/.local/state/w-shared/logs/a914-a934-red-1.log`). Now
+>   each log's newest part stays owed while it has remote candidates, so the owed-part ship re-ships it to a candidate a
+>   change brings in, and the settle waits for it on `f + 1` of the new cohort, naming the log it waits for. Bounded:
+>   one part a state log of a repository the partition holds (design A-934).
+> - **OPEN, being logged (w-shared; main 01a20182's ruling of 2026-11-27 17:05): a live node's own HTTP edge refused a
+>   connect at 0 ms.** 2816da877's a914 run 3: the first death's push failed "Failed to connect to 127.0.0.1 port 55009
+>   after 0 ms: Couldn't connect to server" on a's own `vcs_http_port` while a was alive, and no "the HTTP edge
+>   stopped" line was logged. Most likely a refused connect, with nothing listening on the port at that instant
+>   (inferred from the 0 ms). The edge now logs its listener's bind and its close, however `serve` ends (its own refusal
+>   or its task dropped), with the process's monotonic time. A fleet test's git client that fails to connect logs the
+>   port, that time and an immediate probe connect, so the next such run says which it was: not yet bound, closed, or
+>   bound with the connect refused.
+> - **OPEN, a design question (main 01a20182's ruling of 2026-11-27 15:51, item 3; not now): may a newcomer adopt a live,
+>   never-restarted owner's chain on its report alone?** In run 7 above, after the second death the owner was the one
+>   live holder of the green's chain and the names log above its floor; the newcomer's reads were past tolerance, so
+>   it could not hold the green's next version, and that version could not place on the two survivors.
+>   The fold's tolerance (A-919's start rule, `FencedLedger`'s ReadSafety) does not tell an owner that never restarted
+>   (its hold never forgotten) from one that did. Adopting on such an owner's word would let a repository take pushes
+>   again with one copy left; it changes (C)'s rule and the model (the owner's lost mark as a reported fact), so it is
+>   designed and model-checked before any code.
 > - **FIXED (w-interop, 2026-11-27; main 01a20182's ruling of 12:37): a914's record barrier, placed Some(1) (its runs 1
 >   and 16 of 16).** Not durability: every object was served by a live home. A holder whose replica owed its push
 >   (P2) replayed the repository's replica store, reading each name it lacked from the region (`homes::read_in_region`),
@@ -4970,6 +5012,18 @@
 > the MacBook at a debug build: 18 clients, every client's check passed on every server. Owed: Gitaly (an install,
 > Ada's yes) and the Linux kernel dataset (a multi-GB download).
 >
+> **OPEN (w-interop, 2026-11-27; main 01a20182's rulings of 15:29 and 16:23, taken from w-hg while it is blocked):
+> hg's stream clone is 8.82× slower than `hg serve`'s (round 3: 3.571 s against 0.405 s).** It walks every revlog row
+> twice: a count walk only to size the answer's head (`<files> <bytes>`), then the index rows, each a step of its own,
+> each reading the index from the content store. Stock sends its store files in one pass. Counted by stage since
+> 2026-11-27 (`slates_hg::render::StageTally`, `vcs_store.hg_stream_steps.{count,index,data,other}` and
+> `vcs_store.hg_stream_reads.*`): one debug stream clone of a local history of 600 changesets (2,418 revisions) took
+> 2,502 count steps reading the content store 4,018 times, 2,503 index steps reading it 10,054 times (4.2 a revision,
+> rising with the logs: 4.9 to 6.4 reads a revision as the history doubled), and 601 data steps. The cuts, in main's
+> order, each red first: the index rows written a run a step with one index lend a run (the per-row reads, the
+> superlinear term); then each log's rendered length kept where its revisions land, so the count walk goes, with an
+> oracle over generated landing histories, a recovery story, and a stale length refused typed, never sent. The
+> whole-history push (5.60×) waits until these land.
 > **A stock git command's wait, judged by progress (2026-11-23, w-git; main 01a20182's ruling after r229):** each git
 > command of `crates/cli/tests/git_interop.rs` was killed past a fixed 120 s (`PATIENCE`), and git/git's whole-repository
 > session failed correct but slow steps (80-100 s of single-shard CPU, git's own index-pack among it). Now each waits

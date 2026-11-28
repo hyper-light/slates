@@ -41,6 +41,11 @@ pub(crate) fn failed(failed: &PushFailed, name: &str) -> String {
   }
 }
 
+/// The words of a push whose objects too few homes kept within its homing window (`Unlanded::HomedShort`, answered
+/// `retry`): a fleet test tells this typed answer from a push that never reached the edge by them (A-914 (c)'s prior;
+/// main 01a20182's ruling of 2026-11-27 17:12).
+pub const HOMED_SHORT: &str = "the push's objects were not kept by enough homes in the region yet";
+
 /// Where a push's homing and landing fell short ([`crate::git_push::Unlanded`]), in words a client's user can act on.
 fn unlanded_words(why: crate::git_push::Unlanded) -> &'static str {
   use crate::git_push::Unlanded;
@@ -48,7 +53,7 @@ fn unlanded_words(why: crate::git_push::Unlanded) -> &'static str {
     Unlanded::NamesNotPut => "the push's object names could not be put in the repository's store",
     Unlanded::HomingUntaken => "the push's objects were not carried to their homes in the region",
     Unlanded::PackNotHeld => "the push's pack was not held for its record",
-    Unlanded::HomedShort => "the push's objects were not kept by enough homes in the region yet",
+    Unlanded::HomedShort => HOMED_SHORT,
     Unlanded::NoLanding => "this node holds no changeset store for the repository",
     Unlanded::LandingUntaken => "the push's changeset was not carried to the node's store",
     Unlanded::StoreRefused => "the node's store refused the push's changeset",

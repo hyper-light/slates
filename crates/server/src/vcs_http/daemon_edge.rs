@@ -302,6 +302,12 @@ pub(crate) fn start(
     Ok(address) => address.port(),
     Err(error) => return Ok(not_started(&format!("its address is unread: {error}"))),
   };
+  // The listener's life, logged with the process's monotonic time at each end (main 01a20182's ask of 2026-11-27 17:05:
+  // a914's run 3 was refused a connect at 0 ms on a live node's own port), so a refused connect's time places it.
+  slates_machine::log_line!(
+    "slates-server: the version-control HTTP edge listens on port {port} at {} ns",
+    slates_machine::clock::monotonic_ns()
+  );
   for shard in shards.iter().copied().filter(|shard| *shard != control) {
     runtime.spawn_on(shard, async move {
       if keep_here(EdgeState::new(bounds, None)).is_err() {

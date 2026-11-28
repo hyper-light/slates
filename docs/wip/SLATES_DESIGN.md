@@ -66574,3 +66574,50 @@ Applied in the same change to:
   `crates/vfs/src/{recover,checkpoint_log}.rs`, `crates/server/tests/fleet.rs`, `docs/wip/models/FencedLedger.tla` and
   its configurations, A-919's entry, GAPS.
 
+
+### A-934 — An owner keeps each state log's newest part until its cohort changes no more, and a settle waits for it on f + 1 of the new cohort (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 15:51 (item 2) and 16:20; §4.8 "Neighbourhood changes"; amends A-919 (C) and A-636 part 2b)
+
+- **Why.** §4.8 retires the old set "only after ... the newest committed record is held by f+1 of the new candidates".
+  The settle (`fleet::records_placed_on_current_neighbourhood`) asked that of each volume's head and catalog and each
+  green's newest merge record, but of no state log. The owner kept no placed head of a state log, and forgot a log with
+  its acknowledgements once it let every part go, so it could neither count a log's holders on a new cohort nor ship
+  a candidate the change brought in what it lacked. The old set could retire with a log's newest part held by the owner
+  alone of the cohort a takeover of it recovers through. a914's lagging candidate got its missing names-log part only
+  by an accident: a let-go part's stale piece in the image, re-shipped at a warm restart, which 43a8563a2's fold fix
+  removed (main's bisect of 16:02; its finding of 16:06).
+- **The rule.**
+  - `StateLogs::let_go_held` lets go of a log's parts every remote candidate holds **but its newest**, while the log has
+    a remote candidate. The newest stays owed, in the shard's image, with each candidate's acknowledgement. A laptop (no
+    remote candidate) still lets everything go, and its log is forgotten.
+  - Re-ship is the owed-part ship as it was: `fleet::owed_state_log_parts` ships a part to every current candidate not
+    acknowledged at it, so a candidate a neighbourhood change brings in is shipped the newest part. It finds it past its
+    empty copy and reads the prefix before it (A-919 (iii)), witnessed by the owner's floor ((C)), holds it and
+    acknowledges. A holder already at that position accepts the very record it holds, and acknowledges again.
+  - The settle also asks, of each state log the shard owns, that its newest part be held by `f + 1` of its cohort in
+    the current neighbourhood, the owner among them (`state_log::placed_on_current`, by the candidates acknowledged at
+    or past it; `fleet::state_logs_placed_on_current_neighbourhood`). A settle that waits names the log: counted
+    `fleet.settle.waits_on_state_log` each period, and logged as the wait begins with the log's register, its newest
+    position and its acknowledgements.
+  - A log kept for its newest part alone is forgotten once its repository is no longer held by the partition
+    (destroyed, or moved to another owner), and only once every remote candidate holds that part, so a repository's
+    last change still reaches its holders (`state_log::forget_unheld`, each record-plane pass before its take).
+- **The bound.** One part per state log of a repository the partition holds, each one operation's changes of its log,
+  held under `state_log::bound` with the parts owed (`state_log::admit`). The acknowledgements kept with it are one per
+  candidate.
+- **The floor.** (C)'s floor rises over the parts let go, so it now stops below each log's newest part; the newest is
+  held by the owner and shipped, never read under the floor. The guard (a part at or below the floor refused) is
+  unchanged. The model's `LetGo` releases a subset of what it released, so `FencedLedger`'s results hold as they were
+  (main's ruling of 16:20: no rerun owed).
+- **Tests.**
+  - Fleet `a934_a_neighbourhood_change_waits_for_its_state_logs_newest_part_on_the_new_cohort` (red first). Four nodes
+    at `f = 1`; a's parts held off y and a push made, so a and x hold the names log's newest part; then held off every
+    member, and x stopped. The change must not settle while the hold stands, and must settle once it is lifted. Red: it
+    settled while held, a's names log at 4, y holding positions 2 and 3 and the newcomer none.
+  - Fleet a919's two tests now expect a's parts to fall back to each log's newest (`Daemon::state_log_parts_past_newest`
+    back to zero), not to no part at all; a914 waits for f = 1's repair window (A-914, 9feb04958).
+  - Units: `state_log::tests::an_owner_keeps_each_part_until_every_candidate_holds_it_and_counts_its_bytes` (the phases
+    log's newest part kept), `an_owners_committed_floor_rises_over_the_parts_it_lets_go_with_the_chains_digest` (the
+    floor below the newest part until a later one comes), and
+    `a_log_kept_for_its_newest_part_is_forgettable_only_once_every_candidate_holds_it`.
+- **Applied in the same change to:** `crates/server/src/{state_log,fleet,daemon}.rs`,
+  `crates/server/src/state_log/tests.rs`, `crates/server/tests/fleet.rs`, GAPS.
