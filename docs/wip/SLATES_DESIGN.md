@@ -15259,7 +15259,9 @@ Status (2026-11-27, the gathering's read charge): a step's gathering charges a r
 lines it moves (a table lent in place: its frame, its offsets' search, the store's lookups), not a content window, and
 walks the log rows on past each log into the next with no search; a range walk opens a run's table only once its keys
 reach it. At the server's 256 KiB window and a 94,797-byte step, 27 index steps for 1,200 revisions, where a read's
-window charge had made it a step a row. Owed: a row's measured cost (84.5 ns, against 180 B charged).
+window charge had made it a step a row. A row is charged the shard's learned cost of one (§4.17.1's rule, the
+gathering's own steps timed on the shard's clock, as bytes at the copy rate), so a step takes about its slice: p50 1.3
+to 2.5 µs against a 2.4 µs slice once learned, from 11.8 µs with a row charged its held form.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:

@@ -37,6 +37,8 @@ const WINDOW: usize = 1 << 12;
 const UNSTEPPED: crate::render::StepCopy = crate::render::StepCopy {
   bytes: u64::MAX,
   line: super::super::tests::TEST_LINE,
+  row: 0,
+  clock: None,
 };
 
 /// A store with room for every history the tests make, many times over.
@@ -1837,6 +1839,8 @@ const SERVER_LAYOUT: (usize, crate::render::StepCopy) = (
   crate::render::StepCopy {
     bytes: 94_797,
     line: super::super::tests::TEST_LINE,
+    row: 0,
+    clock: None,
   },
 );
 
@@ -1847,6 +1851,8 @@ const TEST_LAYOUT: (usize, crate::render::StepCopy) = (
   crate::render::StepCopy {
     bytes: STEP_BYTES,
     line: super::super::tests::TEST_LINE,
+    row: 0,
+    clock: None,
   },
 );
 
@@ -1919,7 +1925,7 @@ fn check_gathered(
   gathered: &[crate::render::GatherTraced],
 ) {
   let (row, read) = (
-    crate::render::row_charge(),
+    copy.row.max(crate::render::row_charge()),
     crate::render::read_charge(store, copy.line),
   );
   for (at, step) in gathered.iter().enumerate() {
@@ -1934,6 +1940,60 @@ fn check_gathered(
     assert!(
       step.reads <= step.tables,
       "step {at} read a table twice: {step:?}"
+    );
+  }
+}
+
+/// Measured: a stream's gathering in release on the MacBook at 1eed2782a (main 01a20182's ask of 2026-11-27 22:13; the
+/// scratch probe's log `~/.local/state/w-interop-logs/probe-step-time2.log`): the 25 gathering steps its budget ended
+/// over five streams of [`stock_history`] at the server's layout, 5,205 rows in 439,955 ns (84.5 ns a row, reads among
+/// them), the copy rate 57.1 GB/s (the best of eight copies of 64 MiB).
+const MEASURED_GATHERING: (u64, u64, u64) = (5_205, 439_955, 57_090_000_000);
+
+/// Goal 93, hg's whole-history gap, the row's learned cost (main 01a20182's ruling of 2026-11-27 23:39: a measured gap
+/// fixed now; its red, a gathering step past its slice by more than one row's learned cost). Do: learn a row's cost from
+/// the measured gathering ([`MEASURED_GATHERING`], `render::RowCost`) and stream a history stock `hg` makes at the
+/// server's layout, each row charged that cost. Expect every gathering step its budget ended to take, at the measured
+/// cost a row and a read's charge at the measured copy rate, its slice (94,797 B at that rate) and one row's or one
+/// read's cost at most (a step judges each row before it, so only a table its last row's walk opens passes the budget);
+/// and the gathering's rule held ([`check_gathered`]). Red before: a row charged its held form's 180 bytes, so a
+/// step gathered about 158 rows, about 13 µs against a 1.66 µs slice. Skips, saying so, where stock `hg` does not run.
+#[test]
+fn a_streams_gathering_steps_are_held_to_their_slice_at_the_learned_row_cost() {
+  let Some(mut dot) = stock_history("learned-rows") else {
+    eprintln!(
+      "SKIPPED a_streams_gathering_steps_are_held_to_their_slice_at_the_learned_row_cost: no `hg` here"
+    );
+    return;
+  };
+  let (rows, ns, rate) = MEASURED_GATHERING;
+  let mut cost = crate::render::RowCost::default();
+  cost.observe((rows, ns));
+  let (window, unlearned) = SERVER_LAYOUT;
+  let line = unlearned.line;
+  let copy = crate::render::StepCopy {
+    row: cost.row_bytes(line, (rate, unlearned.bytes)),
+    ..unlearned
+  };
+  let streamed = stock_streamed_at(&mut dot, (window, copy));
+  let store = ContentStore::new(1 << 26, window).unwrap();
+  let read_ns = crate::render::read_charge(&store, line) * 1_000_000_000 / rate;
+  let (row_ns, slice_ns) = (ns / rows, copy.bytes * 1_000_000_000 / rate);
+  eprintln!(
+    "learned: a row {} B ({row_ns} ns), a read {read_ns} ns, the slice {slice_ns} ns",
+    copy.row
+  );
+  let budgeted: Vec<_> = streamed
+    .gathered
+    .iter()
+    .filter(|step| step.ended == crate::render::GatherEnd::Budget)
+    .collect();
+  assert!(!budgeted.is_empty(), "some step its budget ended");
+  for step in budgeted {
+    let took = step.rows * row_ns + step.reads * read_ns;
+    assert!(
+      took <= slice_ns + row_ns.max(read_ns),
+      "a gathering step past its slice: {took} ns at the measured costs against {slice_ns} ns ({step:?})"
     );
   }
 }

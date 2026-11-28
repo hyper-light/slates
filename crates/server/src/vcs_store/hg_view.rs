@@ -244,6 +244,7 @@ pub(crate) fn stage_tallied(tally: Option<slates_hg::render::StageTally>) {
     return;
   };
   let _ = crate::state::with_state(|state| {
+    gathering_noted(state, tally.gathered);
     for (at, stage) in [tally.count, tally.index, tally.data, tally.other]
       .iter()
       .enumerate()
@@ -729,13 +730,37 @@ pub(crate) fn text_bytes_a_step(state: &ShardState) -> u64 {
 }
 
 /// What one step of a fetch or a stream over the shard's view may move ([`slates_hg::render::StepCopy`]; main 01a20182's
-/// ruling of 2026-11-27 22:13): [`text_bytes_a_step`], and the machine's cache line a read of the content store is
-/// charged in (`slates_machine`'s facts, `DaemonConfig::cache_line`).
+/// rulings of 2026-11-27 22:13 and 23:39): [`text_bytes_a_step`]; the machine's cache line a read of the content store
+/// is charged in (`slates_machine`'s facts, `DaemonConfig::cache_line`); a gathered row's cost the shard learned from its
+/// streams' own steps (`VcsStores::hg_row_cost`), at the measured copy rate the step's budget is derived from
+/// (`DaemonConfig::memcpy_bytes_per_second`); and the shard's clock, which those steps are timed by.
 pub(crate) fn step_copy(state: &ShardState) -> slates_hg::render::StepCopy {
+  let (bytes, line) = (
+    text_bytes_a_step(state),
+    u64::try_from(state.config.cache_line).unwrap_or(u64::MAX),
+  );
   slates_hg::render::StepCopy {
-    bytes: text_bytes_a_step(state),
-    line: u64::try_from(state.config.cache_line).unwrap_or(u64::MAX),
+    bytes,
+    line,
+    row: state
+      .vcs_stores
+      .hg_row_cost
+      .row_bytes(line, (state.config.memcpy_bytes_per_second, bytes)),
+    clock: Some(slates_rt::futures::now_ns),
   }
+}
+
+/// Counter: the rows a stream's or a recount's gathering steps walked, which the shard's row cost learns from
+/// (`VcsStores::hg_row_cost`). Format: a counter name in the status report.
+pub(crate) const GATHERED_ROWS: &str = "vcs_store.hg_gathered_rows";
+/// Counter: the nanoseconds those steps took on the shard's clock. Format: a counter name.
+pub(crate) const GATHERED_NS: &str = "vcs_store.hg_gathered_ns";
+
+/// Folds a gathering's `rows` and their time `ns` into the shard's learned row cost, counted (non-vacuity).
+pub(crate) fn gathering_noted(state: &mut ShardState, (rows, ns): (u64, u64)) {
+  state.vcs_stores.hg_row_cost.observe((rows, ns));
+  state.count(GATHERED_ROWS, rows);
+  state.count(GATHERED_NS, ns);
 }
 
 /// [`held`], for the tests.
