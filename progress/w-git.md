@@ -923,3 +923,7 @@
   Earlier: main's lint fix b5ea7ecee took my two lib warnings; diag branch agents/w-git-p2-diag (f651a0913) plus
   ~/.local/state/w-git-logs/v150.request for main's v4 part A A/B (~21:30). NEXT: P2 piece 3, the release's per-object
   map drops; then the stale restage; then main's TSan turn-bound test; then the clone's window peak; then P1.
+- 11-27 22:12 PST: LANDED P2 piece 3 (A-722 part 4j) 877e2368e: a landed push's maps by object are freed by the shard's task after
+  its step (1,202 entries freed in the step before for 600 commits). Seen and sent to main: svn_import's t_a920 wide
+  copy failed here twice on its off-CPU bar (2.28 ms, load 24-28), from ff8edd3e4, not this change. NEXT: the stale
+  restage (P2 piece 4, with a stale stage's members positioned by id); then main's TSan turn-bound test.
