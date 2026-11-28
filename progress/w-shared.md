@@ -789,3 +789,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - a914c red to green (pushes until one homing waits); a914 asserts the first-death push landed (r2).
 - Focused: failover:: 16/16, server units 17/17, fleet 6/6.
 - Next: run 10's replica-build stall, logs first (each build turn's waited object and homes; whether a refused push's partly homed objects are homed again or released).
+
+## 2026-11-27 18:33 PST: stall logs landed (slates 79c6e75fd)
+- 7563eb2d2: replica_build logs its wait on the store's replay; homes::read_remote logs each home that gave nothing; the rebuild logs names it could not fetch. GAPS: the stall, OPEN, being logged.
+- A refused push's holds are let go at every home and never homed again.
+- New: one a914 run red at the first death's barrier, "unable to commit": A-935's kept v1 retargeted to the newcomer, and b never acked v2. Asked main: holder-side log first (recommended) or narrow A-935.
