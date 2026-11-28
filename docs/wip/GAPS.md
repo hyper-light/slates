@@ -103,7 +103,11 @@
 > watch only). Main's bridge-fuse changes since the branch: A-795 removed the S3 base from `bridge.rs`/`channel.rs`.
 > **Main's, not family three's:** the same 2 fail on origin/main 3b664fb alone (kiln r29, adacachy): the zero-budget
 > round's slices are `[1, 1, ...]` (41) where the test expects the root and one file first, `[2, 1, ...]` (40)
-> (`takeover_round.rs:259`, `:294`). Owner to be assigned by main.
+> (`takeover_round.rs:259`, `:294`). Owner to be assigned by main. **Not reproduced on GitHub's 7.0 kernels at
+> 93b7d6b42, 2 of 2 on each architecture** (diag-measurer-fuse-1, run 46118278438: ubuntu-latest x86_64 and
+> ubuntu-24.04-arm, kernel 7.0.0-1020-azure, the whole slates-bridge-fuse suite twice; family three's `fuse_mount` test 8
+> of 8 on each, no SKIP, which closes family three's Linux run). It may depend on the kernel or have been fixed since;
+> recheck on adacachy (7.2.9) when kiln returns.
 > **CLOSED by A-926 part 1 (w-perf, 2026-11-25; opened by w-shared, 2026-11-21): `content_ranges`
 > `a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length` failed some runs** (macOS arm64;
 > main's full suite at f954135af: (sweeps, idle slices, armed) (0, 3,348,409, true) at its bound, passing alone in

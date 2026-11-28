@@ -101,6 +101,7 @@
 //! tag of a tag.
 
 use core::convert::Infallible;
+use slates_vfs::clock::Clock as _;
 use std::collections::BTreeMap;
 
 use slates_db::catalog::{
@@ -2399,6 +2400,7 @@ impl ServerJudge<'_> {
       waits,
       ..
     } = self;
+    let began = state.clock.monotonic_ns();
     let (entry, (examined, one_call)) = with_room(state, |state| {
       let Some(store) = state.vcs_stores.git_ref(record.id) else {
         return (
@@ -2425,6 +2427,9 @@ impl ServerJudge<'_> {
     });
     state.count(HOLDING_EXAMINED, examined);
     state.count(ONE_CALL_BUILDS, one_call);
+    let took = state.clock.monotonic_ns().saturating_sub(began);
+    state.count(JUDGE_NS, took);
+    state.count_max(JUDGE_NS_MOST, took);
     entry
   }
 
@@ -2815,6 +2820,17 @@ pub(crate) fn uncommitted_report(received: &Received) -> Vec<u8> {
 /// same base), so a build is never made whole in one step nor a let-go read under it declined as missing. Format: a
 /// counter name.
 pub(crate) const ONE_CALL_BUILDS: &str = "git_push.verdict.one_call_builds";
+
+/// Counter: the nanoseconds a push's commands spent judged on their owner's shard (`Verdicts::judge`, its search for the
+/// green holding each commit and each work's verdict), summed on the shard's clock (A-658 3c's measure first, main
+/// 01a20182's ruling of 2026-11-27 22:48): beside [`crate::repository::push::LANDING_STEP_NS`], the share judging takes of
+/// an owner's push work, which says whether judging on a holder (3c) is worth building. Format: a counter name in the
+/// daemon's status report.
+pub(crate) const JUDGE_NS: &str = "git_push.judge_ns";
+
+/// Counted most: the nanoseconds one command's judging took on its owner's shard ([`JUDGE_NS`]). Format: a counter name in
+/// the daemon's status report.
+pub(crate) const JUDGE_NS_MOST: &str = "git_push.judge_ns_most";
 
 /// Format: the status counter of the greens a push's search for the green holding a commit examined
 /// (`ShardGreens::holding`): each one lent or whose versions were read.
