@@ -1,0 +1,69 @@
+name: diag Windows fleet, a921 with the re-key window at 6be709db6
+# Diag only (main 01a20182, 2026-11-28 01:20 PST): winfleet-5 and -6 red a921's answers-its-peers 5 and 7 of 16 on
+# windows-11-arm (a detector's own probes condemned a warm-restarted member before its peers re-keyed it). Main's tip
+# carries w-shared's 90cfdc04d: a peer that learns a member's new process holds its probes of it unjudged until it
+# re-keys it, or one detection passes. This runs that test and a921's warm-restart volume test alone, RUNS times each,
+# on both lanes, every run's output kept. Never merged to main.
+on:
+  push:
+    branches: ["diag-measurer-winfleet-*"]
+env:
+  TESTS: >-
+    a921_a_warm_restarted_node_answers_its_peers_while_a_silent_one_holds_its_announcements
+    a921_a_warm_restarted_node_serves_a_false_death_victims_old_volume
+  RUNS: "16"
+jobs:
+  windows:
+    name: fleet reds (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      CARGO_TERM_COLOR: never
+      SLATES_FLEET_TRACE: "1"
+      SLATES_TEST_HEDGE_STARVATION_SECS: "20"
+      SLATES_TEST_RESTART_SLOWDOWN: "10"
+      SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the fleet tests
+        shell: bash
+        run: cargo test --locked -p slates-server --test fleet --no-run 2>&1 | tee build.log
+      - name: The reds, one at a time, RUNS each
+        shell: bash
+        run: |
+          set +e
+          exe=$(sed 's/\x1b\[[0-9;]*m//g' build.log | sed -n 's/.*Executable tests.fleet.rs (\(.*\))/\1/p' | tail -1 | tr '\\' '/')
+          echo "binary: $exe"
+          [ -n "$exe" ] || { echo "no fleet binary found in build.log"; exit 1; }
+          mkdir -p logs
+          for run in $(seq 1 "$RUNS"); do
+            for t in $TESTS; do
+              start=$(date +%s)
+              (cd crates/server && timeout 300 "../../$exe" "$t" --exact --nocapture) > "logs/$t-$run.log" 2>&1
+              rc=$?
+              verdict=$(grep -m1 -E 'test result' "logs/$t-$run.log" | cut -c1-40)
+              echo "run $run $t rc=$rc $(( $(date +%s) - start )) s: ${verdict:-no result}" | tee -a summary.txt
+              grep -m2 -A3 'panicked at' "logs/$t-$run.log" | head -6 | sed 's/^/    /' | tee -a summary.txt
+            done
+          done
+          echo "== dead folds (all runs): $(cat logs/*.log | grep -c ' dead: '); rekey lines: $(cat logs/*.log | grep -c -i 'rekey')"
+          echo "== route views:"; grep -h 'RouteView' logs/*.log | sort | uniq -c | head -20
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: winfleet-${{ matrix.os }}
+          path: |
+            logs/
+            summary.txt
