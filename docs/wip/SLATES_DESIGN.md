@@ -66609,3 +66609,40 @@ Applied in the same change to:
   - a914 goes back to main's (d): its first death's push refused `retry` (A-914 (c)'s prior, OPEN) goes on to the
     repair-window precondition, which then proves the repair needs no traffic; any other refusal fails at once.
 - **Applied in the same change to:** `crates/server/src/merge_service.rs`, `crates/server/tests/fleet.rs`, GAPS.
+
+### A-914 (c) — A push's homing deadline follows the homing window as it is measured during the death, held to its formula at the watchdog's window ceiling (2026-11-27, w-shared for main 01a20182, its rulings of 2026-11-27 17:57 and 17:58; amends A-912 and A-914 (a))
+
+- **Why.** A first death under load refused its push `retry` at the homing (A-914 (c)'s prior: 4 of 7, then 5 of 16 a914
+  runs at load). `vcs_store::homes::homed_in_region` fixed its deadline once, from `fleet::homing_budget()` at the push's
+  start: detection, confirmation and the configuration changes at the coordinator period measured before the death.
+  A load spike arrives with the death, the council's confirmation runs in the stretched periods, and the silence to the
+  install was 4.2 to 5.3 s against a window of 3.7 s; the estimate read 6 to 9 s of confirmation once those periods were
+  measured, but the homing never read it again.
+- **The rule.**
+  - The homing's deadline is its start plus the longer of the window it began with and this shard's window now
+    (`live_deadline_ns`; `refresh_failover` re-derives the window each period and fans it to every shard). It is read
+    each turn, and the wait for an install is waited again while the window grew meanwhile
+    (`install_within_live_deadline`). Still no timer: the homing waits on installs within a derived bound.
+  - The window is held to its formula at the watchdog's window ceiling (`watchdog::WINDOW_CEILING_NS`, the observation
+    budget): a coordinator or detector period longer than it is a wedge the watchdog ends, not a slow period. Each
+    coordinator period sample is clamped there (`Failover::period_began`), and `fleet::homing_window_ceiling` is the
+    formula with every period tail and the broadcast round trip at their maximum, five times the ceiling (a running
+    tail's smoothed value and deviation each at most the ceiling): `(4 (m − 1) − 1) + (max(base, floor) + 1) +
+    (2 + 2 (m − 1))` periods and a round trip, 1,550 s at four members and the floor's base. The detector's periods and
+    a learned silence are held by that maximum. So a window that keeps growing still ends, and a live deadline with it.
+  - Nothing changes below the ceiling.
+- **Counted.** `vcs_store.homes.homing_waited_ns_most` (the longest a homing waited before it homed) and
+  `vcs_store.homes.homing_deadline_ns_most` (the largest deadline one homed under).
+- **Tests.**
+  - Fleet `a914c_a_push_homed_on_a_member_dying_under_load_waits_for_its_install_and_lands` (red first). Four nodes at
+    `f = 1`; every node's periods stretched as a914 stretches them and d stopped; a pushes again and again until one
+    homing is ranked again after the install and kept (`homing_reranked_kept`), a push is refused, or the death
+    installs. No count is chosen: each push homes two identities, so a run where none waits has probability `4^-n`.
+    Every push must land, and one must have waited, its deadline past the window the death began with. Red: the first
+    push refused `retry`, a 3.76 s window, nothing waited.
+  - Units: `slates_cluster::failover::tests::a_period_past_the_ceiling_counts_as_the_ceiling` and
+    `fleet::tests::a_homing_window_is_held_to_its_formula_at_the_window_ceiling`.
+  - a914 now asserts its first death's push lands (main's (r2)), `retry` included; the server's `HOMED_SHORT` words
+    are no longer told apart by a test, so they go back to the crate.
+- **Applied in the same change to:** `crates/cluster/src/failover.rs`, `crates/server/src/{fleet,vcs_store/homes}.rs`,
+  `crates/server/tests/fleet.rs`, GAPS.

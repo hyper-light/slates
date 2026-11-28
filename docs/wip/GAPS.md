@@ -355,9 +355,19 @@
 > `silence_longest_ns`, `silence_unmeasured`, each death logged beside the detector's and the coordinator's period tails
 > and their recent maxima. Red first: `a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first`
 > (coordinator periods stretched 300 ms; 7 of 7 learned) and a unit test of the install's sample. Still OPEN:
-> - **(c) A first death's prior** (w-shared, after the barrier piece below), from main's batch of 10 ambient and 10
->   loaded runs of A-912's push test. Recorded red: the first stretched death's silence 3.99 to 5.24 s against the
->   estimate's window of 3.3 to 3.8 s, that push refused `retry` at its homing 4 of 7.
+> - **FIXED, (c) a first death's prior (A-914 (c), w-shared, 2026-11-27; main 01a20182's rulings of 17:57 and
+>   17:58).** Recorded red: the first stretched death's silence 3.99 to 5.24 s against the estimate's window of 3.3 to
+>   3.8 s, that push refused `retry` at its homing 4 of 7, then 5 of 16 at load (a914 at 604aa12a0 and d08595c7e, each red
+>   beginning there). The window was right, its use was not: a homing fixed its deadline from the window at its start,
+>   derived from periods measured before the death, and the death's confirmation ran in the stretched ones (the estimate
+>   read 6 to 9 s once they were measured). Now the homing's deadline is its start plus the longer of the window then and
+>   the window now, re-read each turn and while it waits for an install (`vcs_store::homes::live_deadline_ns`), and the
+>   window is held to its formula at the watchdog's window ceiling (each coordinator period sample clamped there,
+>   `Failover::period_began`; `fleet::homing_window_ceiling`, 1,550 s at four members), so a growing window still ends.
+>   Nothing below the ceiling changes. Red first:
+>   `a914c_a_push_homed_on_a_member_dying_under_load_waits_for_its_install_and_lands` (pushes during one stretched first
+>   death until one homing waits for the install; red: its first push refused `retry` at a 3.76 s window), and units
+>   for the clamp and the ceiling.
 > - **FIXED, the named debt: a914's second push (A-914 (d), w-shared, 2026-11-27; main 01a20182's rulings of 09:33 and
 >   09:43).** Its record-barrier refusals were A-918 B's (fixed). Its homing shortfall (1 of 7, then 1 of 3) was a
 >   home's put whose stream broke as the home died: the reply came back empty with no round trip, and `exchange_round`

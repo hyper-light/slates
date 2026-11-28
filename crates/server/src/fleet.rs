@@ -11099,9 +11099,11 @@ pub(crate) fn homing_window(state: &ShardState) -> slates_machine::Derived<u64> 
     .period_tail_ns()
     .unwrap_or(HEARTBEAT_NS)
     .max(HEARTBEAT_NS);
+  let window = window_within_ceiling(condemned, (members, period), &state.council_timing);
   slates_machine::derived!(
-    condemned.saturating_add(takeover_steps(members).saturating_mul(period)),
-    "(learned silence to a takeover install, else detection + confirmation) + (2 + 2 (members − 1)) × coordinator period",
+    window,
+    "min((learned silence to a takeover install, else detection + confirmation) + (2 + 2 (members − 1)) × coordinator \
+     period, the formula at the window ceiling)",
     [
       "a death's silence to its takeover install, learned (A-914)",
       "failover detection (A-363)",
@@ -11110,6 +11112,51 @@ pub(crate) fn homing_window(state: &ShardState) -> slates_machine::Derived<u64> 
       "coordinator period, measured (A-363)"
     ]
   )
+}
+
+/// [`homing_window`]'s arithmetic: `condemned` (the learned silence, else detection and confirmation) and the
+/// configuration changes of a council of `members` at the coordinator's `period`, held to [`homing_window_ceiling`].
+fn window_within_ceiling(
+  condemned: u64,
+  (members, period): (u64, u64),
+  timing: &slates_cluster::timing::ElectionTiming,
+) -> u64 {
+  condemned
+    .saturating_add(takeover_steps(members).saturating_mul(period))
+    .min(homing_window_ceiling(members, timing))
+}
+
+/// Derived: the most a period's running tail may reach once its samples are held to the watchdog's window ceiling
+/// (`watchdog::WINDOW_CEILING_NS`, the observation budget; `Failover::period_began`): its smoothed value and its deviation
+/// each at most the ceiling, and the tail `smoothed + 4 · deviation` (`slates_cluster::failover::RunningDuration`).
+const PERIOD_TAIL_CEILING_NS: u64 = crate::watchdog::WINDOW_CEILING_NS.saturating_mul(5);
+
+/// The most a push's homing window may be at a council of `members` timed by `timing` (A-914 (c), main 01a20182's
+/// ruling of 2026-11-27 17:57): its own formula ([`homing_window`]) with every period it counts, and the council's
+/// broadcast round trip, at [`PERIOD_TAIL_CEILING_NS`]. A period past the watchdog's window ceiling is a wedge the
+/// watchdog ends, not a slow period, so the coordinator's samples are held there; the detector's periods and a learned
+/// silence are held by this maximum. Its periods: detection's `4 (m − 1) − 1` (A-363), confirmation's
+/// `max(base, floor) + 1` with the council's base as it derives it from its measured round trips, and the configuration
+/// changes' [`takeover_steps`]; at four members and the floor's base, 30 periods and a round trip, 1,550 s. A live
+/// homing's deadline follows the window and so ends within this (`vcs_store::homes`). Changes nothing below it.
+pub(crate) fn homing_window_ceiling(
+  members: u64,
+  timing: &slates_cluster::timing::ElectionTiming,
+) -> u64 {
+  // Format: the members besides the one that died's watcher.
+  let besides = members.saturating_sub(1);
+  // Format: SWIM's periods to condemn a peer among `besides` others, `2 (2 b − 1) + 1 = 4 b − 1` (A-363).
+  let detection = besides.saturating_mul(4).saturating_sub(1);
+  let base = timing
+    .base_periods
+    .max(slates_cluster::timing::ElectionTiming::floor().base_periods);
+  // Format: the watch's periods and the install's one more.
+  let confirmation = u64::from(base).saturating_add(1);
+  detection
+    .saturating_add(confirmation)
+    .saturating_add(takeover_steps(members))
+    .saturating_mul(PERIOD_TAIL_CEILING_NS)
+    .saturating_add(PERIOD_TAIL_CEILING_NS)
 }
 
 /// The configuration changes one death makes at a council of `members` (A-912): the takeover, each survivor's settlement
@@ -11214,7 +11261,12 @@ async fn run_record_plane(local: HostId) {
       s.merge.coordinator_period = s.merge.coordinator_period.saturating_add(1);
       // The period's length is a sample of the coordinator's period, which the council's death watch counts in
       // (A-363): a starved coordinator's periods stretch, and its failover estimate with them.
-      s.failover.period_began(slates_rt::futures::now_ns());
+      // A period past the watchdog's window ceiling is a wedge it ends, not a slow period: it counts as the ceiling,
+      // so every window counted in periods has a maximum (A-914 (c), main 01a20182's ruling of 2026-11-27 17:57).
+      s.failover.period_began(
+        slates_rt::futures::now_ns(),
+        crate::watchdog::WINDOW_CEILING_NS,
+      );
     });
     in_flight.retain_mut(|dispatch| !dispatch.settle());
     // This period's round budget, derived from the slowest measured peer path — every dispatch below (a
@@ -14832,5 +14884,28 @@ mod state_log_tests {
         "fleet.ship.state_log.no_session"
       );
     }
+  }
+
+  /// A-914 (c), the ceiling (main 01a20182's ruling of 2026-11-27 17:57): a push's homing window is held to its formula at
+  /// the watchdog's window ceiling, and nothing below it changes. Do: derive the window at four members and the floor's
+  /// timing from a measured silence of 4.4 s at a 100 ms period, then from a period tail and a silence past every
+  /// ceiling. Expect the first as its formula gives it, and the second at the stated maximum: 30 periods and a round
+  /// trip at five times the observation budget, 1,550 s.
+  #[test]
+  fn a_homing_window_is_held_to_its_formula_at_the_window_ceiling() {
+    let timing = slates_cluster::timing::ElectionTiming::floor();
+    let (silence, period) = (4_400_000_000, 100_000_000);
+    assert_eq!(
+      super::window_within_ceiling(silence, (4, period), &timing),
+      silence + 8 * period,
+      "below the ceiling the formula alone"
+    );
+    let ceiling = super::homing_window_ceiling(4, &timing);
+    assert_eq!(ceiling, 31 * 5 * crate::watchdog::WINDOW_CEILING_NS);
+    assert_eq!(
+      super::window_within_ceiling(u64::MAX / 2, (4, u64::MAX / 16), &timing),
+      ceiling,
+      "past it the stated maximum"
+    );
   }
 }
