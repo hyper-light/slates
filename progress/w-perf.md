@@ -942,3 +942,8 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     found 0 there.
   - Main's 23:11 57k on d475c91fd: step 2 left the peak unmoved (382 MB). The cadence stays on its branch.
   - Asked main: a reading of the borrow frees' share sealed since the latest cut began (the uncapture's reach).
+- 2026-11-27 23:45 PST (written then):
+  - BUILT, not on main: agents/w-perf-slice-reading at 3d24ec5b3: the held frees of slabs sealed since the latest
+    cut began (fresh_held), read on the borrow and intake-slice lines. Main's 57k on it started 23:33.
+  - BUILT, red, tests only: agents/w-perf-uncapture at f664eb84c: the oracle asserts no fresh free is held (327,680 B
+    now). The uncapture (Buddy::free_unnamed) waits for the 57k's F-of-N share.
