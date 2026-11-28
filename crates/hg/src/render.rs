@@ -1776,11 +1776,10 @@ fn gather(
         .saturating_add(index.numbers_onward_tables(log.log(), rev));
     }
     let mut walk = index.numbers_onward(store, log.log(), rev);
-    match gather_walk(gathering, (index, store), (&mut walk, step, room))? {
-      Some(ended) => return Ok(ended),
-      // The walk's logs gathered and the changelog next: a walk of its own.
-      None => {}
+    if let Some(ended) = gather_walk(gathering, (index, store), (&mut walk, step, room))? {
+      return Ok(ended);
     }
+    // The walk's logs gathered and the changelog next: a walk of its own.
   }
 }
 

@@ -2449,10 +2449,32 @@ impl ServerJudge<'_> {
   }
 
   /// A turn of `command`'s work build (A-752), begun at `began` on the shard's clock: units until half the step quantum
-  /// is spent, the build kept for the next turn. Whether it is built (or needs none), so this step judges it. The turn
+  /// is spent, the build kept for the next turn. Whether it is built (or needs none) and this step ran none of its
+  /// units, so this step judges it: a turn that finishes the build hands the step back, and the verdict and the landing
+  /// begin the next (A-752 part 3: the last turn and the landing ran in one poll, 80.8 + 42.8 ms). A turn that ran units
   /// is counted ([`PushTurns`]): one that ran past its budget by more than its longest unit and the scheduler's own
   /// overrun is past budget.
   fn build_turn(&mut self, command: &Command, pushed: &Pushed<'_>, began: u64) -> bool {
+    // Of this command's build only: a push's earlier command leaves its own built.
+    let of = |preparing: Option<&slates_git::receive::works::Preparing>| {
+      preparing.map_or((false, false), |prepared| prepared.of(command))
+    };
+    let was_built = of(self.preparing.as_ref()).1;
+    let built = self.built_turn(command, pushed, began, was_built);
+    // A build that ran a turn here is judged in the next step, never in this one.
+    let ran = !was_built && of(self.preparing.as_ref()).0;
+    built && !ran
+  }
+
+  /// [`Self::build_turn`]'s turn: whether the work is built, the turn counted unless it was built before it began
+  /// (`was_built`: no unit ran).
+  fn built_turn(
+    &mut self,
+    command: &Command,
+    pushed: &Pushed<'_>,
+    began: u64,
+    was_built: bool,
+  ) -> bool {
     let Self {
       state,
       push,
@@ -2502,6 +2524,9 @@ impl ServerJudge<'_> {
       return self.door(green);
     }
     *self.door = None;
+    if was_built {
+      return built;
+    }
     let ended = slates_rt::futures::now_ns();
     // What the turn may pass its budget by: its opening (the admission's turn and the views set up before its first
     // unit, which always runs), one unit, and what it does after its last ask (the views given back). A turn is those

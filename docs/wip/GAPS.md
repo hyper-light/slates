@@ -1020,14 +1020,19 @@
 >   and `push_through_awaited` now assert their landing where the push brings an object, which they dropped (`let _ =`),
 >   so this surfaced late as `ContentUnavailable` rather than at the landing (`home_and_land` answers none for a push
 >   with nothing to home too, so they ask it apart).
-> - OPEN (w-git, 2026-11-27, main's ruling of 13:47; after the flip, red first): a clone of a let-go pack holds more
->   than a turn's windows under load. `vcs_http::daemon_edge::tests::a_clone_of_a_pushed_pack_let_go_is_whole_holding_
->   at_most_a_turns_windows` failed 2 of 32 runs under 12 burners with B10 and 0 of 24 without (about p 0.5, not B10's:
->   its instrumented A/B, d16e6fe20, printed no window pinned after the push and no let-go a pin refused in any of 16
->   runs), at peaks of 10 and 8 of 13 against 3, and once before B10 under TSan at 4. A clone racing the encoding reads
->   the let-go pack instead of copying the kept parts, and its let-go behind its cursor lags its bring-backs: ten stops,
->   ten let go behind, ten held at once. The test prints its stops, peak and let-go-behind every run, with the pinned
->   windows (`mem.gauge.vcs_content.pinned_unlanded`) and refused let-gos.
+> - CLOSED (w-git, 2026-11-27, main's ruling of 23:25; OPEN since 13:47): a clone of a let-go pack held more than a
+>   turn's windows under load (2 of 32 runs under 12 burners, peaks 10 and 8 of 13 against 3). Cause: a clone whose
+>   answer begins before its repository's encoding is kept reads the let-go pack, and its check of a pushed entry's
+>   CRC32 (`Upload::reused_as_kept`, `packed::raw_crc`) read the entry's raw bytes in one call, all 13 windows of a 3
+>   MiB blob. Each let-go window stopped the turn and retook the entry from its start, while the windows brought back
+>   for it stayed ahead of the cursor. Red made deterministic (`git_encode::NO_FETCH_WAIT`, test-only):
+>   `vcs_http::daemon_edge::tests::a_clone_racing_its_encoding_of_a_let_go_pack_holds_at_most_a_turns_windows`, peak 12
+>   every run. Fixed: the check goes on where it stopped (`packed::RawCrc`, kept in the stream with the entry's header),
+>   its cursor what the look-ahead and the let-go behind follow (`Upload::reading_next`). The let-go behind lets go too
+>   what lies past the look-ahead's reach, which the copy's return to the entry's start leaves. Peak 2 against
+>   `LOOK_AHEAD_WINDOWS` + 1; each window the check passed brought back again for the copy, counted
+>   `vcs_store.git_resident.brought_again` (12).
+
 > - OPEN (w-git, 2026-11-27, main's note of 09:17; its own item, not B10's): a git push dropped where the shard's state
 >   is not lent to its drop gives back nothing. `ReceivePack`'s `Drop` and `git_push::hooks::dropped` take the state
 >   with `with_state` and, finding none, log "a git push dropped mid-read could not give back its quarantine: the
@@ -4236,7 +4241,18 @@
 > Mercurial greens), a copy's tree (a push makes none); Mercurial's trees still listed whole. OWED (part 3): the
 > entry apply in one step: part 3a moved the paths map's step after a push into slices (94 -> 42 ms, 1,500 files
 > debug); left: the engine's verdict (8.3 ms) and commit (10.9), the recorded entry (4.7), retention's secure (5.0),
-> and the git store's record and commit (11.5, w-git's A-722).
+> and the git store's record and commit (11.5, w-git's A-722). Measured again 2026-11-27 on main 7f6af7ae4 (t_a752,
+> debug, 1,500 files, the update, runs 1 and 2): the landing step 42.8 and 38.6 ms; the engine's commit 15.6 and 14.2,
+> its verdict 9.7 and 8.5, `hold_increments` 3.9 and 3.7, retention's secure 3.9 and 3.5, the recorded entry 2.7 and
+> 2.4, the paths map's advance after the push 2.5 and 2.3, each still over 84a's 1 ms; the git store's record 1.6 and
+> 1.5 and commit 0.2 (w-git's). Part 3b CLOSED the step that ran the build's last turn and the landing in one poll
+> (80.8 + 42.8 = 124 ms; now the landing is a step of its own). Next: the engine's commit, sliced as the paths map was.
+> A-658 3c (the owner's judging under load) waits: creates measured at about 1e-6 of the answer time (main's bench
+> 2026-11-27, R=100); an update's judging is measured only here. Found by reading (2026-11-28, w-shared, in part 3b; not worked, main's
+> ruling: no test or round shows it costing anything yet): a create command's `ServerJudge::build_turn` builds
+> nothing (`Verdicts::prepare` reaches its greens and returns), yet the turn is counted with whatever step report the
+> push's `preparing` still holds, an earlier command's or none: `push.build.turns` one more, and an earlier command's
+> last-turn units and quanta counted again.
 >
 > **A-760 (2026-11-20, w-engine; main's ruling ~09:10, "1b"):** part 1 BUILT: an increment names content by identity
 > (`Increment::named`, plain BLAKE3 + length), read a slice a step through the owner's `named::Objects`, refused

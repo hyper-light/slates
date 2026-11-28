@@ -58284,6 +58284,19 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   (removals noted), the change applied to the map and trees before at its end, its first path in the push's step. The
   update's longest step 94 -> 42 ms. Its map equals the one built from the whole head, roots and all
   (`t_a752_p3_a_pushs_map_step_runs_a_path_a_slice_and_equals_the_whole_build`).
+- **Part 3b, a step that finishes the build never also lands (2026-11-27, w-shared; main's ruling 23:21).** Measured
+  again on main 7f6af7ae4 (t_a752, debug, 1,500 files, the update; two runs): the landing step 42.8 and 38.6 ms, the
+  engine's commit 15.6 and 14.2, its verdict 9.7 and 8.5, `hold_increments` 3.9 and 3.7, retention's secure 3.9 and
+  3.5, the recorded entry 2.7 and 2.4, the paths map's advance 2.5 and 2.3, the git store's record 1.6 and 1.5 and
+  commit 0.2. But the update's longest step was 124 ms: its build's last turn (80.8 ms, the ceiling A-783 grants when
+  no one waits) and the landing ran in one poll, since `ServerJudge::ready` went on from a turn that finished the build
+  to the verdict and the append. Every turn kept its bound; the step did not, past the watchdog's look by the landing,
+  and `push.build.longest_ns` (the turn alone) could not show it. So `ServerJudge::build_turn` answers built only
+  where its step ran none of the build's units: a turn that finishes the build hands the step back, and the verdict and
+  the landing begin the next, one yield a push. Judged of the command's own build (`Preparing::of`): a push's earlier
+  command leaves its build done. A step entered with the build done runs no turn, and is not counted as one (before, such a step, after a room or policy turn, counted the last turn's units again). Red first: in t_a752's
+  scene, no step runs build units and records the entry (`Drive::built_and_landed` 0; it was 1, a 127 ms step), and
+  every whole step within the ceiling by a unit and its opening.
 - **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
   hard links, a copy's tree; the change build's end (the map's and trees' apply, O(the change)). Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;
@@ -58292,7 +58305,8 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
 - **Applied in the same change to** `crates/merge` (`pace`, `push::Building`, `increment::compose_paced` and its
   stages, `ops_doc::OpsDoc::{canonicalize_paced, encode_piece}`, `special::Composition`, `Green::{base_entries,
   base_links, base_copied}`), `crates/git` (`receive::works::{Preparing, Verdicts::prepare, Verdicts::prepared}`),
-  `crates/server` (`git_push::{PushTurns, ServerJudge::build_turn}`, status rows), GAPS, BENCHMARKS.md, amendments.tsv.
+  `crates/server` (`git_push::{PushTurns, ServerJudge::build_turn}`, status rows; part 3b
+  `ServerJudge::built_turn`, `receive::works::Preparing::of`), GAPS, BENCHMARKS.md, amendments.tsv.
 
 ### A-756 — A volume made on a node by materialization is found there by its name: it claims its name's alias (bug, 2026-11-20, w-fed-move, kiln goal 91; found by use: kiln's live move of an agent's captured clone, its mount refused `NOENT` on the new owner in four runs of five; §4.8 "Lookup", §4.10 "Ownership follows the writer"; A-236, A-291)
 - **Why.** A clone named for another partition than its origin's lives beside its origin and is found by name only
@@ -61897,6 +61911,19 @@ landing (item 2b) lifted 2026-11-27 (GAPS "LIFTED").
   `a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed` (1,115,127 bytes let go before the
   listing); `an_advertisement_over_a_let_go_pack_is_the_one_over_it_held`; `t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed`;
   `a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`.
+- **A pushed entry's check across turns (2026-11-27, w-git; main 01a20182's ruling of 23:25; GAPS' clone window peak,
+  OPEN since 13:47).** A clone whose answer begins before its repository's encoding is kept reads the let-go pack.
+  Its check of a pushed entry's CRC32 before reusing it (`Upload::reused_as_kept`) read the entry's raw bytes in one
+  call (`packed::raw_crc`), so a 3 MiB blob's check held each window it had brought back until the entry was sent: 12 of
+  13, against the look-ahead's two and the window a turn stopped at. The check now goes on where it stopped
+  (`packed::RawCrc`: the CRC32's state and how far it hashed, kept in the stream with the entry's header), and its
+  cursor is the one the look-ahead and the let-go behind follow (`Upload::reading_next`). The copy follows only on a
+  match, as git's `check_pack_crc` reads an entry before it writes it, so each window the check passed is brought
+  back again for the copy (`vcs_store.git_resident.brought_again`). The let-go behind also lets go what lies past the
+  look-ahead's reach from the cursor (`let_go_behind`), which the copy's return to the entry's start leaves: four held
+  before that. An answer holds at most `LOOK_AHEAD_WINDOWS` and one window at once, whatever its objects' sizes. Test:
+  `a_clone_racing_its_encoding_of_a_let_go_pack_holds_at_most_a_turns_windows` (`git_encode::NO_FETCH_WAIT`, test-only:
+  6 stops, peak 2, 12 brought again, the clone whole; red 12, every run).
 - **The encoding's side** (main 01a20182's note of 2026-11-22: the last whole-pack residency). An encoding unit whose
   pushed entry lies in a let-go window, or a copy reaching one, stops the same way (`Encoding::waiting`, `stopped`), its
   object put back first in line; its driver brings that window back before the next turn. Nothing makes a repository's
