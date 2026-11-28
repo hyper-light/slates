@@ -57060,6 +57060,26 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   made durable, `Unanswered`: Subversion's commit path, which this change does not touch); fmt clean (macOS arm64,
   this Mac, local).
 
+### A-722 part 4j — A landed push's maps by object are freed after its step, a slice a turn (P2 piece 3, 2026-11-27, w-git; main 01a20182's order of 18:44)
+- **Why.** CLAUDE.md §3 (bounded work). A commit's release freed the push's maps by object inside the landing's step:
+  its commits, its objects' places in its pack, and the positions its stage gave. A pack push's entries by offset
+  waited for the push's drop, a step of their own. Each is one entry an object, so the free grew with the push:
+  1,202 entries in one step for a push of 600 commits held whole (600 commits, 602 positions).
+- **Change.** The release gives the maps up whole into the push's `Shedding`, which moves them and frees nothing; the
+  commit adds its stage's positions. They hold nothing of the content store, so when they are freed changes nothing a
+  reader sees. The live commit (`vcs_store::commit`) queues the push's `Shedding` on the shard. A task frees the queue
+  an entry a unit under the step quantum (`shed_turn`, counted `vcs_store.landed.shed_entries`), as the landed
+  let-go's queue is turned. Unspawned, it waits for the next landing, counted `vcs_store.landed.shed_unspawned`.
+- **Tests.** `slates-git` `store::tests::commit_walk::a_landing_frees_none_of_its_pushs_maps_by_object_in_its_step`
+  (600 commits: the push holds no map entry after its landing and gives up all 1,202 with its stage's positions, red
+  0 given up; freed in more than one turn; the store empty once released). `slates-server`
+  `git_push::tests::a_landed_pushs_maps_by_object_are_freed_by_the_shards_task_after_its_step` (the fixtures' pack
+  push: three entries an object at least freed by the task, none left queued, the task ended; red with the queue not
+  fed: none freed).
+- **Owed.** A push refused or abandoned frees its maps in its own step (`Push::abandon`), and a replay's push is
+  dropped whole in its replay turn. Each is O(its objects), its own piece. A push of objects held whole still gives
+  each object's hold back in the step (`Quarantine::abandon`): no pack push holds any.
+
 ### A-722 part 4i — A landing of several moves is mapped by position after its step, a slice a turn (P2 piece 2, 2026-11-27, w-git; main 01a20182's order of 18:44)
 - **Why.** The landing map names the green and version that brought each position (A-722, `Repository::bringer_of`:
   a fetch's offers and a hook view's bringer read it). A commit of several moves (an atomic push, a first push of
