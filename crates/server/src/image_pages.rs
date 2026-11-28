@@ -746,6 +746,10 @@ pub(crate) struct Encoder {
   /// The bytes the content arena holds freed for the committed cut, which may name them ([`Encoder::hold`]): what not
   /// cutting costs in memory, counted with the changes, so a cut deferred never holds more than it would cost.
   held: u64,
+  /// The held frees past which the shard's sweep looks at once rather than an interval on
+  /// ([`Encoder::held_past_look`]): the waiting cut's cost at the last drain, or twice what was held then, whichever
+  /// is more.
+  look_at: u64,
 }
 
 /// An image cut in flight (F2): the pages dirty at its moment not yet re-encoded, and its
@@ -892,6 +896,35 @@ impl Encoder {
   /// cut keeps, which its cadence counts with the changes ([`Encoder::due`]).
   pub(crate) fn hold(&mut self, bytes: u64) {
     self.held = bytes;
+    self.look_at = self.cut_cost().max(bytes.saturating_mul(2)).max(1);
+  }
+
+  /// Whether the arena's held frees, `held` bytes now, call for the sweep's look at once (A-930's cadence; main's 57k
+  /// of 2026-11-27 16:55 on 8974631df: a sweep an interval apart let 357,847,040 bytes pile up between its looks): no
+  /// cut in flight, whose commit gives them back, and `held` past the look the last drain set (`look_at`). So a
+  /// push that frees faster than an interval has its waiting cut looked at, begun where due ([`Encoder::due`]), as
+  /// soon as its frees pass its cost, and frees no cut can give back (none of a paged change) ask a look only at each
+  /// doubling.
+  ///
+  /// Its bound: each look sets the next at twice the frees held then or the cut's cost, whichever is more
+  /// ([`Encoder::hold`]), so past the cost the held frees ask at most one look a doubling, at most log2(held / cost)
+  /// and one looks however long they rise. Its cost at each borrow's close: one gauge, the arena's deferred bytes (a
+  /// sum of the count each of its regions keeps, no walk of blocks or pages), against one threshold kept here.
+  pub(crate) fn held_past_look(&self, held: u64) -> bool {
+    self.cut.is_none() && held > 0 && held >= self.look_at
+  }
+
+  /// The cadence's state for a log line: a cut in flight, the pages dirty, the next cut's cost, the bytes changed and
+  /// held, and whether it is due.
+  pub(crate) fn cadence_reading(&self) -> (bool, usize, u64, u64, u64, bool) {
+    (
+      self.cut.is_some(),
+      self.dirty.len(),
+      self.cut_cost(),
+      self.changed,
+      self.held,
+      self.due(),
+    )
   }
 
   /// What the next cut costs: the committed bytes of the pages dirty now (a page no cut has committed costs nothing).
@@ -2157,6 +2190,107 @@ mod tests {
     assert!(
       whole,
       "the committed image holds the let-goes once its cut is caught up"
+    );
+  }
+
+  /// [`frees_held_past_the_waiting_cuts_cost_bring_the_sweep_forward`]'s scene on a shard, its page pinned at
+  /// [`HELD_PAGE_GRANULES`] granules: [`HELD_OBJECTS`] granule objects and [`HELD_FILL`] small ones published and
+  /// caught up, then every granule object let go with nothing published, then a borrow closed as every step closes
+  /// one (`idle_sweep::after_borrow`). The frees held, the waiting cut's cost, when the sweep's pass is armed, and now.
+  fn held_past_the_look() -> (u64, u64, Option<u64>, u64) {
+    use slates_vfs::clock::Clock;
+    crate::daemon::audit_on_shard(move |state| {
+      let granule = state.store.content.arena().granule();
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(granule * HELD_PAGE_GRANULES));
+      let window = state.store.content.chunk_bytes();
+      state.vcs_stores.content_made(window).unwrap();
+      let big = |at: usize| {
+        let mut text = format!("a chunk's text the image named, number {at}\n").into_bytes();
+        text.resize(granule, b'h');
+        text
+      };
+      let ids: Vec<slates_vcs::ContentId> =
+        crate::vcs_store::within_budget(state, 1 << 24, |stores| {
+          let content = stores.content_mut().unwrap();
+          let ids: Vec<slates_vcs::ContentId> = (0..HELD_OBJECTS)
+            .map(|at| {
+              let id = content.put_object(&big(at)).unwrap();
+              assert!(content.mark_landed(&id));
+              id
+            })
+            .collect();
+          for at in 0..HELD_FILL {
+            let _ =
+              content.put_object(format!("a small text beside them, number {at}\n").as_bytes());
+          }
+          ids
+        });
+      crate::verbs::publish_shard(state).unwrap();
+      while state.image_encoder.owed() {
+        let _ = crate::content_holder::image_catch_up_step(state);
+      }
+      crate::vcs_store::within_budget(state, 0, |stores| {
+        let content = stores.content_mut().unwrap();
+        for id in &ids {
+          content.let_go_landed(id, None).unwrap();
+        }
+      });
+      // The borrow closes over the frees as they piled up since the last drain, the catch-up's publication; the drain
+      // after it only reads the waiting cut's cost for the expectation.
+      crate::idle_sweep::after_borrow(state);
+      let armed = state.idle_sweep_at;
+      let held = u64::try_from(state.store.content.arena().deferred_bytes()).unwrap();
+      crate::content_holder::image_drain(state);
+      let cost = state.image_encoder.cut_cost();
+      let now = state.clock.monotonic_ns();
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (held, cost, armed, now)
+    })
+  }
+
+  /// A-930's cadence (main's 57k of 2026-11-27 16:55 on 8974631df: a held peak of 357,847,040 bytes, the sweep looking
+  /// an interval apart, so a push freeing faster than that held whatever it freed between looks). Do: run
+  /// [`held_past_the_look`]. Expect the frees held past the waiting cut's cost, and the sweep's pass armed for now.
+  /// Red before: armed an interval on (or left armed for later), as for any free deferred.
+  #[test]
+  fn frees_held_past_the_waiting_cuts_cost_bring_the_sweep_forward() {
+    let (held, cost, armed, now) = held_past_the_look();
+    println!(
+      "{held} bytes held freed against a waiting cut costing {cost}; the pass armed at {armed:?}, now {now}"
+    );
+    assert!(
+      held >= cost && held > 0,
+      "the frees held past the waiting cut's cost"
+    );
+    assert!(
+      armed.is_some_and(|at| at <= now),
+      "the sweep's pass armed for now: {armed:?} against {now}"
+    );
+  }
+
+  /// Shape: how far [`frees_no_cut_gives_back_ask_one_look_a_doubling`] raises the held frees, a byte at a time.
+  const RISING_HELD: u64 = 1 << 16;
+
+  /// A-930's cadence, the twin of [`frees_held_past_the_waiting_cuts_cost_bring_the_sweep_forward`] (main's ruling of
+  /// 2026-11-27 16:59: the looks stay one a doubling). Do: on an encoder with nothing dirty, so no cut can give back
+  /// what is held, raise the held frees a byte at a time from one to [`RISING_HELD`], as a borrow's close reads them,
+  /// and look (a drain's `Encoder::hold`) wherever `Encoder::held_past_look` asks. Expect one look a doubling: log2 of
+  /// the rise and one, never a look a borrow.
+  #[test]
+  fn frees_no_cut_gives_back_ask_one_look_a_doubling() {
+    let mut encoder = Encoder::default();
+    let mut looks = 0u32;
+    for held in 1..=RISING_HELD {
+      if encoder.held_past_look(held) {
+        looks += 1;
+        encoder.hold(held);
+      }
+    }
+    println!("{looks} looks as the held frees rose a byte at a time to {RISING_HELD}");
+    assert_eq!(
+      looks,
+      RISING_HELD.ilog2() + 1,
+      "one look a doubling of the held frees"
     );
   }
 

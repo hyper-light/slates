@@ -156,6 +156,17 @@ fn arena_seen(s: &ShardState) -> (u64, usize) {
   (arena.allocations(), arena.allocated_bytes())
 }
 
+/// Arms a pass now, or brings one armed for later forward to now (A-930's cadence, [`after_borrow`]); nothing while
+/// one is armed for now or sooner.
+fn arm_now(s: &mut ShardState) {
+  let now = s.clock.monotonic_ns();
+  if s.idle_sweep_at.is_some_and(|at| at <= now) {
+    return;
+  }
+  s.idle_sweep_at = Some(now);
+  crate::deadlines::noted(s, now);
+}
+
 /// Arms the next pass a sweep's interval from now, unless one is armed or under way.
 fn arm(s: &mut ShardState) {
   if s.idle_sweep_at.is_some() || s.idle_sweep_running {
@@ -167,9 +178,21 @@ fn arm(s: &mut ShardState) {
 }
 
 /// Closes every state borrow (`state::try_with_state`): a write stamped for the seal, an allocation or a free since the
-/// last pass, or a free deferred behind the image arms a pass. Nothing is read while one is armed or under way.
+/// last pass, or a free deferred behind the image arms a pass. Nothing more is read while one is armed or under way,
+/// but for frees held past the waiting cut's look (`Encoder::held_past_look`), which bring the pass forward to now.
 pub(crate) fn after_borrow(s: &mut ShardState) {
-  if s.idle_sweep_at.is_some() || s.idle_sweep_running {
+  if s.idle_sweep_running {
+    return;
+  }
+  // Frees held for the committed image past the waiting cut's cost (A-930's cadence): the pass looks now, not an
+  // interval on, so the cut is begun where due before more pile up (main's 57k of 2026-11-27: 357,847,040 bytes
+  // between looks an interval apart).
+  let held = u64::try_from(s.store.content.arena().deferred_bytes()).unwrap_or(u64::MAX);
+  if s.image_encoder.held_past_look(held) {
+    arm_now(s);
+    return;
+  }
+  if s.idle_sweep_at.is_some() {
     return;
   }
   let written = std::mem::take(&mut s.store.sweep_owed);

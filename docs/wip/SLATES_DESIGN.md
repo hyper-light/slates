@@ -66130,7 +66130,19 @@ Applied in the same change to:
     before idle, at most a cut's cost and one let-go's frees held; red without the held term);
     `a_settled_sweep_pass_cuts_the_changes_no_publication_drained` (red at 81950e77c: no cut). The oracle's catch-up
     publishes unasked, as the task does, and asserts some commit stopped the chain.
-  - OWED: main's 57k round with samplers on this tip (cuts, copied bytes, held peak, wall time, any hang).
+  - **The sweep looks early when frees pile up** (main's 57k of 2026-11-27 16:55 on 8974631df: 3 of 3 good, 104 to
+    124 s, but a held peak of 357,847,040 bytes in run 3, against 81950e77c's 148 to 162 MB). The sweep looked once an
+    interval (the liveness budget, seconds), so the cut's cost was measured only that often and a push that freed
+    faster held an interval's frees before each look. Now each drain sets a look (`Encoder::hold`): the waiting cut's
+    cost, or twice the frees held then, whichever is more; and every borrow's close compares the arena's deferred
+    bytes with it, one gauge against one threshold, bringing the pass forward to now (`idle_sweep::arm_now`) where no
+    cut is in flight and the frees have passed it (`Encoder::held_past_look`). Past the cost that is at most one look
+    a doubling, log2(held / cost) and one. Each doubling of the held peak is logged with the cadence's state. Reds:
+    `frees_held_past_the_waiting_cuts_cost_bring_the_sweep_forward` (163,840 bytes held against a cut costing 26,885:
+    the pass armed for now; an interval on without the look) and its twin
+    `frees_no_cut_gives_back_ask_one_look_a_doubling` (nothing dirty, frees rising a byte at a time to 65,536: 17
+    looks).
+  - OWED: main's 57k round with samplers on this tip (cuts, copied bytes, held peak well under 149 MB, wall time).
 - **Applied in the same change to:** `crates/server/src/image_pages.rs` (the encoder's lasts and least changes,
   `append_page`, `entry_ends`, `CommittedPiece`, `Encoder::appends`, `append`, `split_appended`, `dirty_whole`); the
   goal 93 line in GAPS (A-923's entry). Part 2: `image_pages.rs` (`Marked`, `EntryCoordinate`, `Changed`, `PieceCut`,

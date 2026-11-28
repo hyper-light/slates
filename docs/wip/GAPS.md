@@ -653,7 +653,9 @@
 > cut, so no barrier defers one; the byte rule gates only the catch-up's chain (`verbs::publish_shard_unasked`); the
 > sweep drains before it looks, begins a due cut while busy and asks for one once idle. Reds: the restart rule
 > (image-level and w-svn's two tests), the chain, the held bound under a busy sweep, the sweep's look. HELD for main's
-> 57k round with samplers (it reverted once on persistence).
+> 57k round with samplers (it reverted once on persistence). Its first round (8974631df): 3 of 3 good at 104 to 124 s,
+> but a held peak of 357,847,040 bytes, the sweep looking an interval apart; the pass now comes forward once the frees
+> pass the waiting cut's cost (at most a look a doubling).
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
