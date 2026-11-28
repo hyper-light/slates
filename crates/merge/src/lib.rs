@@ -34,6 +34,8 @@
 mod byte_places;
 pub mod chain_entry;
 pub mod checkpoint;
+#[cfg(test)]
+mod counting;
 pub mod derive;
 mod dims;
 pub mod engine;

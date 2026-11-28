@@ -1364,14 +1364,16 @@ fn wide_counts_sliced(counts: &WideCounts) {
   );
 }
 
-/// The landing's release of its scratch member frees nothing on the shard (A-920, the reaper): what its units took, more
-/// things than the revision's files, went to the daemon's reaper, and none was dropped in place. Red before: nothing handed, the release's units dropping all
-/// of it themselves, one free among them paying the allocator's return of a batch of pages (release probe 17: copy's
+/// The landing's release of its scratch member frees nothing on the shard (A-920, the reaper): what its units took went
+/// to the daemon's reaper, and none was dropped in place. Its maps' labels and child lists are its arena's runs since
+/// A-920 unit 0, given back to the arena rather than taken, so what goes to the reaper is the member's remains and its
+/// arenas' emptied lists, whole, a few things. Red before the reaper: nothing handed, the release's units dropping all of
+/// it themselves, one free among them paying the allocator's return of a batch of pages (release probe 17: copy's
 /// longest unit p50 1,226-1,302 µs, all of it system time).
 fn wide_release_reaped(counts: &WideCounts) {
   let reaped = counts.reaped;
   assert!(
-    reaped.handed > u64::try_from(WIDE_REVISION_FILES).unwrap() && reaped.batches > 0,
+    reaped.handed > 0 && reaped.batches > 0,
     "the releases handed the reaper {reaped:?}"
   );
   assert_eq!(reaped.inline, 0, "dropped in place: {reaped:?}");
