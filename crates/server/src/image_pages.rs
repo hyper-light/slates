@@ -4073,6 +4073,9 @@ mod tests {
     held_most: usize,
     /// The most blocks a cut in flight named at a check of the blocks kept.
     in_flight_named: usize,
+    /// The bytes of slabs sealed since the latest cut began whose frees were held all the same
+    /// (`ChunkWindows::fresh_held`): held for no image ((ii)'s uncapture).
+    fresh_held: u64,
     /// The publications that carried the committed cut again because the next was not due (A-930's cadence).
     deferred: u64,
   }
@@ -4172,6 +4175,8 @@ mod tests {
       ),
       held_most: oracle.held_most,
       in_flight_named: oracle.in_flight_named,
+      fresh_held: crate::vcs_store::chunk_windows(&state.vcs_stores)
+        .map_or(0, crate::vcs_store::arena_windows::ChunkWindows::fresh_held),
       deferred: counted(crate::content_holder::IMAGE_CHAIN_STOPPED),
     }
   }
@@ -4185,7 +4190,8 @@ mod tests {
   /// never a mix of two, whatever changed while it was encoded); no window that image names with its chunk's block held
   /// now by another window (the arena reused none); after every change, turn and publication, every slot the committed
   /// cut's windows name and every slot the cut in flight's named at its moment still allocated in the arena (none
-  /// released early, (ii)'s naming proof); the owed publication's lag within its bound; each carried cut's old
+  /// released early, (ii)'s naming proof); no free of a slab sealed since the latest cut began held (no image names
+  /// it: (ii)'s uncapture); the owed publication's lag within its bound; each carried cut's old
   /// values at most the entries in its pages at its moment (E) and its absent markers at most a turn's inserts times its
   /// pages (I); the chunks held for a cut at most a turn's frees times its pages; no ticket stranded and no pre-image left
   /// at a cut's end; and, the changes stopped, the cut caught up with the shard. Non-vacuous: the cuts kept old values
@@ -4197,7 +4203,7 @@ mod tests {
   fn generated_histories_restore_one_committed_cut_reuse_no_named_block_and_keep_their_lag_bound() {
     const PAGE: usize = 4096;
     let (mut old, mut absent, mut held, mut named, mut deferred) = (0, 0, 0, 0, 0);
-    let mut in_flight_named = 0;
+    let (mut in_flight_named, mut fresh_held) = (0, 0);
     for seed in 0..HISTORIES {
       let found = crate::daemon::audit_on_shard(move |state| {
         crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
@@ -4211,6 +4217,7 @@ mod tests {
       held = held.max(found.held_most);
       named = named.max(found.named);
       in_flight_named = in_flight_named.max(found.in_flight_named);
+      fresh_held += found.fresh_held;
       deferred += found.deferred;
     }
     assert!(
@@ -4222,6 +4229,10 @@ mod tests {
     assert!(
       in_flight_named > 0,
       "no cut in flight named a block at a check of the blocks kept"
+    );
+    assert_eq!(
+      fresh_held, 0,
+      "bytes of slabs sealed since the latest cut began held all the same, though no image names them"
     );
     assert!(
       deferred > 0,
