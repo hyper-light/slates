@@ -399,6 +399,14 @@
 >   each log's newest part stays owed while it has remote candidates, so the owed-part ship re-ships it to a candidate a
 >   change brings in, and the settle waits for it on `f + 1` of the new cohort, naming the log it waits for. Bounded:
 >   one part a state log of a repository the partition holds (design A-934).
+> - **OPEN, being logged (w-shared; main 01a20182's ruling of 2026-11-27 17:05): a live node's own HTTP edge refused a
+>   connect at 0 ms.** 2816da877's a914 run 3: the first death's push failed "Failed to connect to 127.0.0.1 port 55009
+>   after 0 ms: Couldn't connect to server" on a's own `vcs_http_port` while a was alive, and no "the HTTP edge
+>   stopped" line was logged. Most likely a refused connect, with nothing listening on the port at that instant
+>   (inferred from the 0 ms). The edge now logs its listener's bind and its close, however `serve` ends (its own refusal
+>   or its task dropped), with the process's monotonic time. A fleet test's git client that fails to connect logs the
+>   port, that time and an immediate probe connect, so the next such run says which it was: not yet bound, closed, or
+>   bound with the connect refused.
 > - **OPEN, a design question (main 01a20182's ruling of 2026-11-27 15:51, item 3; not now): may a newcomer adopt a live,
 >   never-restarted owner's chain on its report alone?** In run 7 above, after the second death the owner was the one
 >   live holder of the green's chain and the names log above its floor; the newcomer's reads were past tolerance, so
@@ -577,7 +585,14 @@
 >   holds none below its floor), and rebuilds. Red first: the A-918 fleet test's newcomer, at `None` after 424 s and
 >   4,002 `Behind`, holds version 2 in 21 s. a914 asserts its second death's push is never refused at its record
 >   barrier. GAP-A9-7's record half is closed for both askers: a successor through its takeover round (A-933), a
->   newcomer through this read. **Still open:** the second death's push may be refused `retry` at its homing (a914, 1
+>   newcomer through this read. **Corrected (A-935, w-shared, 2026-11-27; main 01a20182's rulings of 17:12 and 17:29):**
+>   the read starts on `Behind`, which a newcomer answers only to a version shipped to it, and an owner forgot a
+>   version once every candidate held it, so the newcomer's half was closed only while pushes came: in a quiet stretch
+>   after a death the repair window never closed, and a later second death lost a green `f = 1` keeps (2816da877's
+>   a914 run 3, the newcomer outside the green's holders for 400 s). Now each green's newest version stays pending once
+>   held everywhere, so the neighbourhood change's retarget ships it to the newcomer with no push. Red first:
+>   `a935_a_candidate_a_death_brings_in_holds_each_greens_newest_version_with_no_push` (the newcomer's replica at `None`
+>   after the repair path's 50 periods). **Still open:** the second death's push may be refused `retry` at its homing (a914, 1
 >   of 3), a mode of its own; AUD-14's new candidate set needs the configuration's answer to a read past tolerance
 >   (A-919's open edge, above).
 > **OPEN, a piece (A-912's (3); main 01a20182's rulings of 2026-11-24): a council session of its own per peer.** The

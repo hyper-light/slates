@@ -11,9 +11,10 @@
 //! **Waiting for the first answer.** The anchor measures the machine and creates the segment before it holds the
 //! instance's rendezvous; until then a connect is refused at once, so the wait asks again at the anchor's own heartbeat
 //! cadence (`slates_server::daemon::HEARTBEAT_NS`, the cadence the anchor looks at its daemon). Once the rendezvous is
-//! held, a connect itself waits for the daemon (A-114) up to the client's reconnect deadline ([`crate::deadlines`]). A
-//! started anchor's exit ends the wait at once with its exit code ([`StartFault::AnchorExited`]); a wait without a
-//! child to watch ends at the host's deadline, as `Unavailable`.
+//! held, a claim waits while its holder lives (A-114, A-468), which under an anchor is as long as the anchor lives, so
+//! the wait polls the claim and looks at the anchor and its deadline between polls. A started anchor's exit ends the
+//! wait at once with its exit code ([`StartFault::AnchorExited`]); a wait without a child to watch ends at the host's
+//! deadline, as `Unavailable`, however long the daemon takes to answer.
 //!
 //! **Waiting while the anchor starts (A-366).** The anchor judges its starting daemon by the daemon's own CPU progress,
 //! never by a wall-clock second (A-232), and never gives an instance up once a daemon has served (A-119): a client may
@@ -31,6 +32,9 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use slates_client::Client;
+use slates_ipc::IpcError;
 
 use crate::error::{Error, StartFault};
 use crate::instance::Instance;
@@ -334,12 +338,13 @@ impl Instance {
   }
 
   /// Waits until the instance `name` answers, and attaches to it: a connect refused at once (no rendezvous yet: the
-  /// anchor is still measuring the machine) is asked again a heartbeat later; a held rendezvous is waited on by the
-  /// connect itself. With `anchor`, the anchor's exit ends the wait ([`StartFault::AnchorExited`], or
-  /// [`StartFault::NeverServed`] for one started [`StartSpec::until_served`] whose daemons never served), and a host
-  /// needs no deadline of its own: the anchor judges its daemon's start by its progress (A-366, the module doc); with
-  /// `until`, the deadline does, refused `Unavailable` as the last connect was. With neither, it waits as long as no
-  /// daemon answers, so a host that launched the anchor through a service manager passes a deadline.
+  /// anchor is still measuring the machine) is asked again a heartbeat later; a held rendezvous's claim is polled
+  /// ([`claim_within`]), so neither the anchor's exit nor the deadline waits on it. With `anchor`, the anchor's exit
+  /// ends the wait ([`StartFault::AnchorExited`], or [`StartFault::NeverServed`] for one started
+  /// [`StartSpec::until_served`] whose daemons never served), and a host needs no deadline of its own: the anchor judges
+  /// its daemon's start by its progress (A-366, the module doc); with `until`, the deadline does, refused `Unavailable`
+  /// as the last connect was. With neither, it waits as long as no daemon answers, so a host that launched the anchor
+  /// through a service manager passes a deadline.
   pub fn wait_for(
     name: &str,
     mut anchor: Option<&mut Child>,
@@ -349,7 +354,7 @@ impl Instance {
       if let Some(child) = anchor.as_deref_mut() {
         anchor_still_runs(child)?;
       }
-      match Instance::attach(name) {
+      match claim_within(name, anchor.as_deref_mut(), until) {
         Ok(instance) => return Ok(instance),
         Err(error) if error.is_unavailable() => {
           if until.is_some_and(|until| Instant::now() >= until) {
@@ -360,6 +365,48 @@ impl Instance {
       }
       std::thread::park_timeout(pause());
     }
+  }
+}
+
+/// One claim on the instance `name`'s rendezvous, polled until its daemon answers, `anchor` exits or `until` passes
+/// (A-366). A claim waits while the rendezvous's holder lives (A-468), and on Linux the holder is the listening socket an
+/// anchor keeps across its daemon's restarts, so a claim queued under an anchor whose daemons never accept it (a crash
+/// loop) waits as long as the anchor lives. Blocked in that claim, the wait never looked at its deadline, and CI's
+/// Ubuntu job waited out its six hours on a looping anchor
+/// (`docs/bugs/2026-11-27-a-hosts-wait-on-a-looping-anchor-passed-its-deadline-on-linux.md`). Polled as an event loop's
+/// connect is ([`slates_client::Connecting::next_poll_ns`]), the wait looks at the anchor and the deadline between
+/// polls, and a claim still unanswered at `until` is refused `Unavailable`, as a connect refused at once is.
+fn claim_within(
+  name: &str,
+  mut anchor: Option<&mut Child>,
+  until: Option<Instant>,
+) -> Result<Instance, Error> {
+  let refused = |error| Error::of_client(name, error, None, slates_server::daemon::HEARTBEAT_NS);
+  let mut connecting = Client::begin_connect(name, crate::deadlines()).map_err(refused)?;
+  loop {
+    if let Some(client) = connecting.poll().map_err(refused)? {
+      return Ok(Instance::from_client(name, client));
+    }
+    if let Some(child) = anchor.as_deref_mut() {
+      anchor_still_runs(child)?;
+    }
+    let mut pause = Duration::from_nanos(connecting.next_poll_ns());
+    if let Some(until) = until {
+      let left = until.saturating_duration_since(Instant::now());
+      if left.is_zero() {
+        let unanswered = IpcError::DaemonUnavailable {
+          endpoint: name.to_owned(),
+          why: "the rendezvous is held, but no daemon answered the claim by the caller's deadline",
+        };
+        return Err(Error::of_ipc(
+          name,
+          unanswered,
+          slates_server::daemon::HEARTBEAT_NS,
+        ));
+      }
+      pause = pause.min(left);
+    }
+    std::thread::park_timeout(pause);
   }
 }
 
