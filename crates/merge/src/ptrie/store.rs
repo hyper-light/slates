@@ -309,6 +309,24 @@ impl<T: Copy + Default> Store<T> {
     joined
   }
 
+  /// A new run holding `run`'s items then `items`; `run` freed.
+  pub(super) fn appended(&mut self, run: Run, items: &[T]) -> Run {
+    let (a, b) = (run.len(), items.len());
+    let len = a.saturating_add(b);
+    if len == 0 {
+      self.free(run);
+      return Run::EMPTY;
+    }
+    let mut grown = self.room(class_of(len));
+    grown.len = u32::try_from(len).unwrap_or(u32::MAX);
+    self.copy_items(run, 0, grown, 0, a);
+    if let Some(place) = self.get_mut(grown).get_mut(a..len) {
+      place.copy_from_slice(items);
+    }
+    self.free(run);
+    grown
+  }
+
   /// A new run holding `items` then `run`'s; `run` freed.
   pub(super) fn prepended(&mut self, items: &[T], run: Run) -> Run {
     let head = self.alloc(items);
@@ -316,6 +334,7 @@ impl<T: Copy + Default> Store<T> {
   }
 
   /// `run` without its first `skip` items: a new run, `run` freed.
+  #[cfg(test)]
   pub(super) fn suffix(&mut self, run: Run, skip: usize) -> Run {
     let tail = self.duplicate(run, skip);
     self.free(run);

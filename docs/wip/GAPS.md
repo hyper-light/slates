@@ -1290,7 +1290,10 @@
 > lists; under 2 × Σ peak live + classes × chunk, Wilson et al. 1995; runs reused, bumped and chunks added counted) holds
 > every node's label and child list, so a release gives them back to the arena, never to the heap: a 9,000-path map's
 > release freed 11,485 heap blocks for its 10,235 nodes before, at most its walk stack's 64 doublings after; the ptrie
-> oracle unchanged. Its bound is stated on `ptrie::Nodes` (main's ruling of 00:03: no accounting charges the current
+> oracle unchanged. A label of up to 15 bytes is kept inline in its node, a longer one a run (`ptrie::label`; main's
+> ruling of 2026-11-28 00:38), so a lookup reads no store for a short label: warmed, `get` at 9,000 keys had run at
+> about 1.16 times the tree's median before the arena with every label a run (52.9 against 45.6 ns); the node stays
+> 56 bytes (the inline form's 4 bytes past a run's fall in padding the node had). Its bound is stated on `ptrie::Nodes` (main's ruling of 00:03: no accounting charges the current
 > maps, the finding above, so (a) the retention charge is not owed under the freeze). Owed: (b) a dead
 > arena's chunks freed on its own shard a chunk at a time in the release step, the reaper handed only the rest. Until
 > (b), a dead arena's chunks still go to the reaper, as a few dozen 4 KiB frees, not thousands. Then unit 1:
