@@ -762,3 +762,9 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
   - the past-tolerance log line now names the reader and who answered;
   - A-934's red, a934_a_neighbourhood_change_waits_for_its_state_logs_newest_part_on_the_new_cohort;
   - GAPS: shape 1, A-934 OPEN, and the design question (adopting a live owner's word) OPEN.
+
+## 2026-11-27 17:03 PST: A-934 fixed, held for main's word
+- Commits: 9feb04958 (a914 precondition), 834c9a3dc (A-934 red), bda853c47 (A-934 fix: newest part kept, re-ship, settle on f + 1, forget_unheld) and 2816da877 (merge of 791ea60c5, w-perf's revert).
+- Focused on the merge: fleet 8/8 (a934 green, a919 x2, a921 missed-part, a918, a927 x2, a933's); units 14/14; a914 2 of 3.
+- a914 run 3 failed at the precondition: the first death's push was refused a connection on a's own HTTP port at 0 ms, so the newcomer never got the green.
+- Asked main whether to push.
