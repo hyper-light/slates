@@ -2897,7 +2897,7 @@ fn landed_segment(
   (run, segment): (&mut super::hg_run::Run, &PushSegment),
   (entry, ok): (slates_hg::import::record::SegmentEntry, bool),
   counted: Option<&mut slates_hg::push::pins::Counted>,
-) -> Result<(), PushOutcome> {
+) -> Result<u64, PushOutcome> {
   if !ok {
     state.count(super::hg_run::SEGMENTS_UNLANDED, 1);
     return Err(PushOutcome::refused(&abort(UNLANDED.to_vec())));
@@ -2917,17 +2917,8 @@ fn landed_segment(
         .map(|content| counted.count_out(content, &segment.contents))
     });
   }
-  // An elective change: none while a publication of the shard's image is owed past its bound (A-870 piece 2, main's
-  // progress rule); the texts then stay until the run commits, whose let-go waits for the pause to end.
-  let freed = if crate::content_holder::image_paused(state) {
-    0
-  } else {
-    super::hg_run::let_go_landed(state, None, &segment.contents)
-  };
-  let (held, texts) = run.texts_landed((kept, freed));
-  state.count_max(PUSH_HELD_HIGH_BYTES, held);
-  state.count_max(PUSH_TEXTS_HIGH_BYTES, texts);
-  Ok(())
+  // Its texts let go a slice a borrow by its caller (`segment_let_go`), which notes the high-water after.
+  Ok(kept)
 }
 
 /// Counter: the most a push held at once, bytes (goal 93, the 410 MiB bar; main's ruling of 2026-11-23): its admission
@@ -3378,12 +3369,50 @@ async fn segment_landed(
     }
   }
   let ok = held.landed().await.is_ok();
-  crate::state::with_state(|state| {
+  let kept = crate::state::with_state(|state| {
     held.given_back(state, ok);
     if ok {
       super::hg_run::count_landed(state, held.section_bytes());
     }
     landed_segment(state, (run, segment), (held.entry(), ok), Some(counted))
+  })?;
+  match kept {
+    Ok(kept) => segment_let_go(run, segment, kept).await.map(Ok),
+    Err(outcome) => Some(Err(outcome)),
+  }
+}
+
+/// Lets go of a landed segment's file texts a slice a borrow, yielding between (`hg_run::let_go_landed_slice`: a copy
+/// slice of bytes, a revision at least, within half the step quantum), then notes the push's high-water with what they
+/// held, `kept` bytes, and what was let go. Before (main's 57k of 2026-11-27 19:57) they were let go whole inside the
+/// landing's borrow: 357.6 MB into the frees held for the committed image in one borrow. None where the shard's state
+/// went away. A publication owed past its bound stops it: the rest stays until the run commits, whose let-go waits for
+/// the pause to end (A-870 piece 2, main's progress rule).
+async fn segment_let_go(
+  run: &mut super::hg_run::Run,
+  segment: &PushSegment,
+  kept: u64,
+) -> Option<()> {
+  let mut freed = 0u64;
+  let mut at = 0usize;
+  while let Some(rest) = segment.contents.get(at..).filter(|rest| !rest.is_empty()) {
+    let step = crate::state::with_state(|state| {
+      if crate::content_holder::image_paused(state) {
+        return None;
+      }
+      Some(super::hg_run::let_go_landed_slice(state, rest))
+    })?;
+    let Some((more, taken)) = step else {
+      break;
+    };
+    freed = freed.saturating_add(more);
+    at = at.saturating_add(taken.max(1));
+    slates_rt::futures::yield_now().await;
+  }
+  crate::state::with_state(|state| {
+    let (held, texts) = run.texts_landed((kept, freed));
+    state.count_max(PUSH_HELD_HIGH_BYTES, held);
+    state.count_max(PUSH_TEXTS_HIGH_BYTES, texts);
   })
 }
 

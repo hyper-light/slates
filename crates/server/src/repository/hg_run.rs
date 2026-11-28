@@ -420,17 +420,39 @@ pub(crate) fn let_go_windows(
   noting: Option<RepositoryId>,
   contents: &[FileContents],
 ) -> (u64, u64) {
-  let (freed, pinned, _) = let_go_windows_until(state, noting, contents, u64::MAX);
+  let (freed, pinned, _) = let_go_windows_until(state, noting, contents, (u64::MAX, u64::MAX));
   (freed, pinned)
 }
 
-/// [`let_go_windows`] over `contents` a revision at a time until the clock passes `deadline_ns`, one revision at least:
-/// the bytes freed, the windows kept pinned, and how many revisions were taken.
+/// One slice of a landed segment's file texts let go (`hg_push::segment_let_go`): `contents` a revision at a time
+/// until a copy slice of bytes is let go (`DaemonConfig::copy_slice_bytes`) or half the step quantum is spent, a
+/// revision at least, counted as [`let_go_landed`] counts. The bytes freed and the revisions taken.
+pub(crate) fn let_go_landed_slice(
+  state: &mut ShardState,
+  contents: &[FileContents],
+) -> (u64, usize) {
+  let deadline = slates_rt::futures::now_ns()
+    .saturating_add(state.config.step_quantum_ns().checked_div(2).unwrap_or(0));
+  let budget = state.config.copy_slice_bytes();
+  let (freed, pinned, taken) = let_go_windows_until(state, None, contents, (deadline, budget));
+  if freed > 0 {
+    state.count(TEXT_BYTES_LET_GO, freed);
+  }
+  if pinned > 0 {
+    state.count(TEXTS_PINNED, pinned);
+  }
+  (freed, taken)
+}
+
+/// [`let_go_windows`] over `contents` a revision at a time until the clock passes `deadline_ns` or `budget` bytes are
+/// let go, one revision at least: the bytes freed, the windows kept pinned, and how many revisions were taken. The
+/// budget bounds what one borrow frees into the frees held for the committed image, which the clock alone did not (a
+/// window's let-go costs the same whatever its length).
 fn let_go_windows_until(
   state: &mut ShardState,
   noting: Option<RepositoryId>,
   contents: &[FileContents],
-  deadline_ns: u64,
+  (deadline_ns, budget): (u64, u64),
 ) -> (u64, u64, usize) {
   #[cfg(test)]
   if crate::vcs_store::KEEP_LANDED.with(core::cell::Cell::get) {
@@ -460,7 +482,7 @@ fn let_go_windows_until(
           pinned = pinned.saturating_add(kept);
         }
         taken = taken.saturating_add(1);
-        if slates_rt::futures::now_ns() >= deadline_ns {
+        if slates_rt::futures::now_ns() >= deadline_ns || freed >= budget {
           break;
         }
       }
@@ -493,7 +515,7 @@ fn let_go_turn_ns(state: &ShardState) -> u64 {
       return set;
     }
   }
-  (state.config.step_quantum_ns() / 2).max(1)
+  (state.config.step_quantum_ns().checked_div(2).unwrap_or(0)).max(1)
 }
 
 /// Notes `contents`, the file revisions of `repository` its index now holds (a push's entry committed, an import
@@ -514,7 +536,9 @@ pub(crate) async fn let_go_committed(
     let taken = crate::state::with_state(|state| {
       let began = slates_rt::futures::now_ns();
       let deadline = began.saturating_add(let_go_turn_ns(state));
-      let (freed, pinned, taken) = let_go_windows_until(state, Some(repository), rest, deadline);
+      let budget = state.config.copy_slice_bytes();
+      let (freed, pinned, taken) =
+        let_go_windows_until(state, Some(repository), rest, (deadline, budget));
       state.count(freed_pinned.0, freed);
       state.count(freed_pinned.1, pinned);
       state.count(LET_GO_TURNS, 1);

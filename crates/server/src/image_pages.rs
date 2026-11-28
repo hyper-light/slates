@@ -2374,6 +2374,78 @@ mod tests {
     assert!(!still, "the section's names released once its let-go ended");
   }
 
+  /// [`a_landed_segments_texts_let_go_a_copy_slice_a_borrow`]'s scene on a shard: [`SEGMENT_REVISIONS`] file texts of a
+  /// window each put and published, so the committed image names them, then one slice of their let-go as a landed
+  /// segment's (`hg_run::let_go_landed_slice`). The bytes that slice freed and the revisions it took, the frees it
+  /// held, the copy slice and a window.
+  fn segment_slice() -> (u64, usize, u64, (u64, u64)) {
+    crate::daemon::audit_on_shard(move |state| {
+      let window = state.store.content.chunk_bytes();
+      state.vcs_stores.content_made(window).unwrap();
+      let need = u64::try_from(window * SEGMENT_REVISIONS).unwrap();
+      let files: Vec<slates_hg::filerev::FileContents> =
+        crate::vcs_store::within_budget(state, need, |stores| {
+          let content = stores.content_mut().unwrap();
+          (0..SEGMENT_REVISIONS)
+            .map(|at| {
+              let mut text = format!("a file revision's text, number {at}\n").into_bytes();
+              text.resize(window, b't');
+              slates_hg::filerev::FileContents {
+                path: format!("file-{at}").into_bytes(),
+                node: [0; 20],
+                bytes: content.put_object(&text).unwrap(),
+                block: None,
+              }
+            })
+            .collect()
+        });
+      crate::verbs::publish_shard(state).unwrap();
+      while state.image_encoder.owed() {
+        let _ = crate::content_holder::image_catch_up_step(state);
+      }
+      let held = |state: &crate::state::ShardState| {
+        u64::try_from(state.store.content.arena().deferred_bytes()).unwrap()
+      };
+      let before = held(state);
+      let (freed, taken) = crate::repository::hg_run::let_go_landed_slice(state, &files);
+      let slice = state.config.copy_slice_bytes();
+      (
+        freed,
+        taken,
+        held(state).saturating_sub(before),
+        (slice, u64::try_from(window).unwrap()),
+      )
+    })
+  }
+
+  /// Shape: the file revisions [`segment_slice`]'s segment lands, so a slice takes some of them, not all.
+  const SEGMENT_REVISIONS: usize = 16;
+
+  /// Goal 93, A-930's held bound (main's 57k of 2026-11-27 19:57 on a6477ec16: 357.6 MB into the frees held for the
+  /// committed image in the landing's one borrow, `hg_push`'s `landed_segment` letting a segment's texts go whole).
+  /// Do: run [`segment_slice`]. Expect one slice to free and hold at most a copy slice and one revision's window, and
+  /// to take fewer than the segment's revisions. Red before: the landing let every revision go in its one borrow.
+  #[test]
+  fn a_landed_segments_texts_let_go_a_copy_slice_a_borrow() {
+    let (freed, taken, held, (slice, window)) = segment_slice();
+    println!(
+      "one slice let go {freed} bytes of {taken} of {SEGMENT_REVISIONS} revisions, holding {held} (a copy slice \
+       {slice}, a window {window})"
+    );
+    assert!(
+      freed <= slice + window,
+      "one slice freed {freed} bytes, past a copy slice and a window"
+    );
+    assert!(
+      held <= slice + window,
+      "one slice held {held} bytes, past a copy slice and a window"
+    );
+    assert!(
+      taken < SEGMENT_REVISIONS && taken > 0,
+      "one slice took {taken} of {SEGMENT_REVISIONS} revisions"
+    );
+  }
+
   /// Goal 93, the Aways append rule's encoding. Do: append generated entries to a page piece of generated entries, and
   /// to bytes no page wrote. Expect the appended piece byte for byte the whole encoding of both, only the appended
   /// entries' bytes counted encoded ([`encoded_bytes`]), and the foreign bytes refused.
