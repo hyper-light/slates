@@ -474,6 +474,9 @@ pub struct Layout {
   paths: BTreeMap<Node, Vec<u8>>,
   /// The changesets laid out for a line's owed push, each with its root directory's name ([`Trees::roots`]).
   roots: BTreeMap<ObjectKey, ObjectKey>,
+  /// The file revisions it names whose bytes were let go and not yet asked for, each with its text's length: found
+  /// once, at the build's first wait, and asked for a batch at a time ([`Layout::waited_batch`]).
+  let_go: Option<std::collections::VecDeque<(Node, u64)>>,
 }
 
 /// The name a line's owed push gives changeset `node`'s tree (P2 for Mercurial, main's ruling (A) of 2026-11-26): the
@@ -554,6 +557,62 @@ impl Layout {
     let path = self.paths.get(&node).cloned()?;
     Some(super::held::TextAsk::new(path, node, most))
   }
+
+  /// The ask of the node's changeset store for the file revision `building`'s last turn waited for and the others these
+  /// trees name whose bytes were let go, as many as `batch` bytes of texts hold (the first whatever its length), every
+  /// row in one want and every text in one, the texts within `most` bytes together ([`super::held::FilesAsk`]; goal 93,
+  /// main 01a20182's ruling of 2026-11-28 03:47: an owed build reads every file its line holds, and asked them a text an
+  /// ask). The let-go revisions are found once, over `index`'s rows in `store` (each revision's bytes object with a
+  /// window away), then taken a batch an ask. None where it waited for nothing these trees name.
+  pub fn waited_batch(
+    &mut self,
+    building: &push::Building,
+    (index, store): (&crate::index::HgIndex, &slates_vcs::ContentStore),
+    (batch, most): (u64, u64),
+  ) -> Option<super::held::FilesAsk> {
+    let node = building
+      .waiting()
+      .and_then(|id| Node::try_from(id.as_bytes()).ok())?;
+    let path = self.paths.get(&node).cloned()?;
+    let paths = &self.paths;
+    let let_go = self
+      .let_go
+      .get_or_insert_with(|| let_go_of(paths, (index, store)));
+    let mut asked = vec![(path, node)];
+    let mut bytes = 0_u64;
+    while let Some((next, len)) = let_go.front().copied() {
+      if next != node && bytes.saturating_add(len) > batch.min(most) {
+        break;
+      }
+      let_go.pop_front();
+      bytes = bytes.saturating_add(len);
+      if next != node
+        && let Some(path) = paths.get(&next)
+      {
+        asked.push((path.clone(), next));
+      }
+    }
+    Some(super::held::FilesAsk::new(asked, most))
+  }
+}
+
+/// The file revisions `paths` names whose bytes object `store` holds with a window let go, each with its text's length
+/// (its row's), by `index`'s rows: what a line's owed build will wait for, in node order.
+fn let_go_of(
+  paths: &BTreeMap<Node, Vec<u8>>,
+  (index, store): (&crate::index::HgIndex, &slates_vcs::ContentStore),
+) -> std::collections::VecDeque<(Node, u64)> {
+  paths
+    .iter()
+    .filter_map(|(node, path)| {
+      let log = crate::index::Log::File(path);
+      let row = index
+        .rev(store, log, node)
+        .and_then(|rev| index.revision(store, log, rev))
+        .filter(|row| row.node == *node)?;
+      (!store.aways_of(&row.bytes).is_empty()).then_some((*node, row.len))
+    })
+    .collect()
 }
 
 /// A push's work built a unit a turn (A-767 C1, the push spin: a 64 MiB file's work built in one step spun its shard
@@ -604,6 +663,7 @@ pub fn begin_work(
       dirs: trees.dirs,
       paths: trees.paths,
       roots: trees.roots,
+      let_go: None,
     },
     building,
     asked: None,
@@ -660,6 +720,7 @@ impl WorkBuild {
       dirs: trees.dirs,
       paths: trees.paths,
       roots: trees.roots,
+      let_go: self.layout.let_go.take(),
     };
     advanced.map(|built| built.map_err(WorkRefused::Push))
   }

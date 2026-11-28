@@ -5409,10 +5409,11 @@
 > each at what the one before measured, and keeps the last round's (a walk of the whole history in one go missed the
 > walks' restart a step pays). Held by `a_shards_first_gathering_steps_are_held_to_their_slice_at_the_probes_first_cost`
 > (hg), `t_first_cost_a_fresh_daemons_first_stream_is_held_to_its_slice` (a fresh daemon's first stream, its median
-> gathering step) and `the_boot_profile_measures_a_gathered_rows_cost_with_its_inputs`. OPEN: one release run before
-> main's 01:19 ruling (the measurement is main's) read the probe at 739 ns a row against about 84 learned online, so a
-> shard's first stream is held to its slices but about a row a step until it learns; main's release run is requested
-> (run-requests.md) to read the probe against the learned cost.
+> gathering step) and `the_boot_profile_measures_a_gathered_rows_cost_with_its_inputs`. Main's release runs at
+> 86a8f9885 (2026-11-28 03:46, load 24 to 38): the test passed 3 of 3, its first cost 428, 280 and 308 ns a row,
+> against about 84 learned online, so 3.3 to 5.1 times high, the safe side: a shard's first stream is held to its
+> slices (p50 1,750, 2,209 and 2,125 ns against slices of 2,198, 2,147 and 2,460) and takes smaller steps than it needs
+> until the online cost takes over. OPEN, the probe's excess (main's guess, inferred: its small history's tables).
 > OPEN (main's hg round 3 at 47e37df66, 2026-11-28 01:47; the read charge in, the row cost not; record
 > `~/.local/state/main-01a20182/rounds/hg-stream-3/`): the stream clone 4.717 s best against stock's 1.482 (3.18x;
 > stock's own fell 3.046, 2.274, 1.482 s run to run), clone even, push 1.98x, incremental push 12.2x. The count stage is
@@ -5421,6 +5422,21 @@
 > after a push drives the stage (the run merge's timing, below); and the server's own span (0.94 to 1.99 s, store waits
 > 0.49 to 0.63 s) is well under the client's 4.7 to 6.4 s, hg reporting 13 to 18 MB/s from slates against 37 to 77 from
 > stock: the stream's write path (the socket, the write slices, the chunks' sizes sent) is where the wall's time is.
+> The incremental push's 11.3x, a first cut BUILT (2026-11-28, w-interop; main's rulings of 03:44 and 03:47). Main's
+> run at 86a8f9885 (03:05 to 03:38, hg_scale's counters around the push, 1360fd527): slates 9.527 s against stock's
+> 0.841, its largest counters waits: `merge.green.materialize_wait_ns_most` 6.46 s and `vcs_store.hg_stream_store_wait_ns`
+> 5.96 s over 4,780 store asks. The whole-history push left its line owing its tree (A-647, built when first reached),
+> and the one-changeset push was the first to reach it: its build read the line's 2,384 let-go file texts back
+> (`merge.green.materialize_texts_asked`), each a `TextAsk` of two wants (its row, then its text), about 1.25 ms of
+> waiting an ask: per ask, not per byte. Now the build asks its let-go texts a batch at a time
+> (`slates_hg::push::held::FilesAsk`, `push::tree::Layout::waited_batch`): the revision it waits for and the line's
+> other let-go revisions as many as the step's bytes hold (`hg_view::text_bytes_a_step`), every row in one want and
+> every text in one, counted `merge.green.materialize_text_asks`. Held by
+> `t_goal93_an_owed_lines_let_go_texts_are_asked_a_batch_an_ask`: 201 texts in 1 ask and 6 store asks (2 of them the
+> layout's changeset and manifest), from 201 asks and 406 store asks. Owed: main's next hg round reads whether
+> `materialize_wait_ns_most` is still the largest. Not taken (main's ruling of 03:47): beginning the owed build at the
+> landing, which A-647 leaves to the first reach. A sibling, not taken: a holder's replica build asks the same texts one
+> at a time (`replica_build`, `Layout::waited`).
 > OPEN, on the index's run merge: an index of many unmerged runs makes every restart costly. On the tests' 4 KiB layout
 > (55 runs, each one table holding a slice of every log) at a 94,797-byte step, 999 index steps and 31,888 reads for
 > 1,200 revisions: a restart opens about 32 tables, about 4.2 KB each, more than a step, so a step moves one row. The
