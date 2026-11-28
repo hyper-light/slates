@@ -5183,6 +5183,14 @@
 > test: no count step. Owed (main): the hg leg's rerun at the tip (the round at 343703bd7 is in BENCHMARKS: count stage
 > 464,254 of 842,218 steps). Next: the data stage a run a step; the index stage's reads on hg-src; the incremental
 > push's 8.4×.
+> The data stage a run a step, BUILT (2026-11-27, w-interop; main's reading of 19:39 and order of 20:30: hg-src's
+> data stage moved 529 bytes a step, 139,403 steps for 73.8 MB, about 30 µs a step). A split log's data file is
+> written a run of chunks a step, ending at the log's last chunk, at a chunk the store must be asked for, or before one
+> that would pass the step's copy budget (the one the gathering and a push's chunking are held to) or the room. Held by
+> `a_streams_data_chunks_are_written_a_run_a_step` (the 1,200-revision stock history): 1 data step for 300 chunks, from
+> 301. On the same history the index stage reads 971 times since cut 2 (449 before it: the sized rows' walk beside the
+> numbers, and a search for each next log now the count's list is gone), still under one read a revision; with
+> hg-src's 524,131 index reads, owed an explanation next.
 > **A stock git command's wait, judged by progress (2026-11-23, w-git; main 01a20182's ruling after r229):** each git
 > command of `crates/cli/tests/git_interop.rs` was killed past a fixed 120 s (`PATIENCE`), and git/git's whole-repository
 > session failed correct but slow steps (80-100 s of single-shard CPU, git's own index-pack among it). Now each waits

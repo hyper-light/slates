@@ -15252,6 +15252,9 @@ landing, after any re-base, a made changeset's and an import's index likewise. T
 entries and data are written from the sized rows the gathering reads beside the numbers, and a kept length that is not
 the chunk's is refused typed, never sent past the head. A rebuilt index is unsized (no record names a length) and
 serves no stream (`1\n`, the client clones) until a sliced recount, the count walk once, ends.
+Status (2026-11-27, the data stage a run a step): a split log's data file is written a run of chunks a step, within the
+step's copy budget or the room, whichever first, its first chunk whatever: on a 1,200-revision stock history one step
+for 300 chunks, where each chunk took a step.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:

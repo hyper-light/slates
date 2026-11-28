@@ -1755,23 +1755,87 @@ fn dot_files(dir: &std::path::Path) -> Option<BTreeMap<Vec<u8>, Vec<u8>>> {
 /// `hg` does not run.
 #[test]
 fn a_streams_index_rows_are_written_a_run_a_step() {
-  let Some(mut dot) = stock_history("index-runs") else {
+  let Some(streamed) = stock_streamed("index-runs") else {
     eprintln!("SKIPPED a_streams_index_rows_are_written_a_run_a_step: no `hg` here");
     return;
   };
+  let (revisions, tally) = (streamed.revisions, streamed.tally);
+  assert!(revisions > 600, "a long history: {revisions} revisions");
+  assert!(streamed.out.starts_with(b"0\n"), "the stream served");
+  assert_eq!(
+    tally.count,
+    crate::render::Tally::default(),
+    "no count walk: the head named from what the index kept (goal 93, cut 2)"
+  );
+  assert!(
+    tally.index.steps * 2 < revisions,
+    "index rows a run a step: {} steps for {revisions} revisions",
+    tally.index.steps
+  );
+  assert!(
+    tally.index.reads <= revisions,
+    "at most a read a revision: {} reads for {revisions} revisions",
+    tally.index.reads
+  );
+}
+
+/// Goal 93, hg's whole-history gap, the cut after the kept rendered length (main 01a20182's reading of 2026-11-27 19:39
+/// and its order of 20:30: hg-src's data stage moved 529 bytes a step, 139,403 steps for 73.8 MB, about 30 µs a step).
+/// Do: stream a history stock `hg` makes ([`stock_streamed`]) a step at a time to its end in one room, each step held to
+/// a copy budget's bytes ([`STEP_BYTES`]). Expect the data files' chunks written a run a step: the data stage's steps
+/// under half the chunks the data files carry (each split log's revisions), and the answer read back whole. Red before:
+/// a chunk a step (the data stage stepped each chunk). Skips, saying so, where stock `hg` does not run.
+#[test]
+fn a_streams_data_chunks_are_written_a_run_a_step() {
+  let Some(stock) = stock_streamed("data-runs") else {
+    eprintln!("SKIPPED a_streams_data_chunks_are_written_a_run_a_step: no `hg` here");
+    return;
+  };
+  let (_, sent) = streamed(&stock.out);
+  let chunks: u64 = sent
+    .iter()
+    .filter(|(name, _)| name.ends_with(b".d"))
+    .map(|(name, data)| {
+      let index_name = [&name[..name.len() - 2], b".i"].concat();
+      let (_, index) = sent
+        .iter()
+        .find(|(sent_name, _)| *sent_name == index_name)
+        .unwrap();
+      u64::from(
+        crate::revlog::Revlog::open(index, data, &mut room())
+          .unwrap()
+          .len(),
+      )
+    })
+    .sum();
+  let tally = stock.tally;
+  assert!(chunks > 200, "split logs' chunks: {chunks}");
+  assert!(
+    tally.data.steps * 2 < chunks,
+    "data chunks a run a step: {} steps for {chunks} chunks",
+    tally.data.steps
+  );
+}
+
+/// What [`stock_streamed`] streamed: the history's revisions, the stream's answer and its tally by stage.
+struct StockStreamed {
+  revisions: u64,
+  out: Vec<u8>,
+  tally: crate::render::StageTally,
+}
+
+/// A history stock `hg` makes ([`stock_history`]: 300 changesets over 8 files) imported, sized from its whole texts
+/// ([`sized_by`]), its index sealed into runs (so its rows are read from the content store, as a landed repository's
+/// are: 48 runs of one table each), and streamed a step at a time to its end in one room, each step held to
+/// [`STEP_BYTES`]. None where `hg` does not run.
+fn stock_streamed(name: &str) -> Option<StockStreamed> {
+  let mut dot = stock_history(name)?;
   let mut store = store();
   let mut imported = import(&mut dot, &mut store, Admission::new(1 << 26)).unwrap();
-  // Recorded, not asserted (main's question of 17:57): whether the size-tiered rule would merge the import's runs.
-  eprintln!(
-    "index runs: before seal_all {} runs, tiered due {:?}, compaction due {:?}",
-    imported.index.rows().run_tables().len(),
-    imported.index.rows().tiered_due(),
-    imported.index.rows().compaction_due(&store)
-  );
   let recount = sized_by(&mut imported.index, &mut store, &|index, store| {
     Box::new(whole_texts(index, store))
   });
-  eprintln!("index runs: sized once, {recount:?}");
+  eprintln!("{name}: sized once, {recount:?}");
   imported.index.rows().seal_all(&mut store).unwrap();
   let revisions: u64 = [Log::Changelog, Log::Manifest]
     .iter()
@@ -1799,26 +1863,14 @@ fn a_streams_index_rows_are_written_a_run_a_step() {
   }
   let tally = streaming.take_tally();
   eprintln!(
-    "index runs: {revisions} revisions over {} runs; {tally:?}",
+    "{name}: {revisions} revisions over {} runs; {tally:?}",
     imported.index.rows().run_tables().len()
   );
-  assert!(revisions > 600, "a long history: {revisions} revisions");
-  assert!(out.starts_with(b"0\n"), "the stream served");
-  assert_eq!(
-    tally.count,
-    crate::render::Tally::default(),
-    "no count walk: the head named from what the index kept (goal 93, cut 2)"
-  );
-  assert!(
-    tally.index.steps * 2 < revisions,
-    "index rows a run a step: {} steps for {revisions} revisions",
-    tally.index.steps
-  );
-  assert!(
-    tally.index.reads <= revisions,
-    "at most a read a revision: {} reads for {revisions} revisions",
-    tally.index.reads
-  );
+  Some(StockStreamed {
+    revisions,
+    out,
+    tally,
+  })
 }
 
 /// Goal 93, hg's whole-history gap (main 01a20182's ruling of 2026-11-27 16:23): a stream's steps and the content

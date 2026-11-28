@@ -1444,35 +1444,67 @@ impl Streaming {
     })
   }
 
-  /// A split log's data file's next chunk, its stored bytes (asked for a batch at a time) compressed to the length the
-  /// count gave it, or the log's end and the next log's index file.
+  /// A split log's data file's next chunks, a run a step (goal 93; main 01a20182's reading of 2026-11-27 19:39 and its
+  /// order of 20:30): each its stored bytes (asked for a batch at a time) as a stream sends them, held to the length the
+  /// index kept; the run ends at the log's last chunk (the next log's index file next), at a chunk the store must be
+  /// asked for, or before a chunk that would take its bytes past the step's copy budget ([`Streaming::set_step_bytes`],
+  /// the one a push's chunking and the gathering are held to) or the room, its first chunk written whatever. Before: a
+  /// chunk a step (hg-src at 343703bd7: 139,403 steps for 73.8 MB, 529 bytes and about 30 µs a step).
   fn data_chunk(
     &mut self,
     (log, rev): (Walked, u32),
     admission: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<Stage, Refused> {
-    let unreadable = || Refused::Unreadable {
-      log: unreadable_name(&log),
-      rev,
-    };
     let (seq, count) = self.front_log()?;
-    if rev >= count {
-      // The next log's rows let go of this one's ([`Streaming::rows_held`]); chunks asked for after it are kept.
-      return Ok(self.next_sized());
+    let budget = self.step_bytes.unwrap_or(u64::MAX);
+    let (mut rev, mut written) = (rev, 0_u64);
+    while rev < count {
+      match self.data_one((&log, seq, rev), (written, budget), admission, out)? {
+        Some(length) => {
+          written = written.saturating_add(length);
+          rev = rev.saturating_add(1);
+        }
+        None => return Ok(Stage::Data(log, rev)),
+      }
     }
-    let length = self.sized_at(&log, rev)?.2.ok_or_else(unreadable)?;
+    // The next log's rows let go of this one's ([`Streaming::rows_held`]); chunks asked for after it are kept.
+    Ok(self.next_sized())
+  }
+
+  /// Revision `rev`'s chunk of `log` (numbered `seq`) written to `out`, its stored bytes as a stream sends them: its
+  /// length. None, nothing written, where its run has written `written` bytes already and the chunk would take them past
+  /// `budget` or past the room, or where the store must be asked for it ([`Streaming::wants`]). Refused stale where the
+  /// chunk is not the length the index kept.
+  fn data_one(
+    &mut self,
+    (log, seq, rev): (&Walked, u64, u32),
+    (written, budget): (u64, u64),
+    admission: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<Option<u64>, Refused> {
+    let length = self
+      .sized_at(log, rev)?
+      .2
+      .map(u64::from)
+      .ok_or_else(|| Refused::Unreadable {
+        log: unreadable_name(log),
+        rev,
+      })?;
+    if written > 0 && (written.saturating_add(length) > budget || admission.left() < length) {
+      return Ok(None);
+    }
     let Some(plain) = self.chunk_at(seq, rev, Places::All)? else {
-      return Ok(Stage::Data(log, rev));
+      return Ok(None);
     };
-    admission.charge(u64::from(length))?;
-    if self.stored_into((seq, rev), &plain, out)? != u64::from(length) {
+    admission.charge(length)?;
+    if self.stored_into((seq, rev), &plain, out)? != length {
       return Err(Refused::StaleLength {
-        log: unreadable_name(&log),
+        log: unreadable_name(log),
         rev,
       });
     }
-    Ok(Stage::Data(log, rev.saturating_add(1)))
+    Ok(Some(length))
   }
 }
 
