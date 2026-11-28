@@ -64618,6 +64618,12 @@ GAPS.
   Red, made deterministic with a task waiting through the read a yield at a time
   (`a_fetch_handed_a_derivation_while_its_shard_has_other_work_takes_no_more_turns_than_alone`): every turn counted,
   935 against 3, 934 of them yielded. Green with the reader's own turns, 1 against 1.
+- **The handed read is a live fetch (2026-11-28, w-git; main 01a20182's ruling of 03:02, after its intake-buffers
+  A/B).** Every handed run of both arms brought one window back, 8 to 11 ms of the read: the landed pack's let-go behind
+  the push ran during the read, since the test's read held no live fetch, where a fetch's answer is counted live from
+  its arrival (`vcs_share::Live::fetch`) and a let-go is never made under one (`vcs_store::landed_let_go_may`). The
+  test's read now holds the live fetch, and the handed read is held to bringing back none (red: 1; green: 0, handed
+  43.1 ms against alone's 44.2).
 - **Whether any is due, from counts (2026-11-25, main 01a20182's sample).** A 3 s sample of git/git's clone waiting for
   its first pack bytes found the encoding behind the push spending a third of its time in
   `Repository::derivations_due` (309 of its 951 samples), which every derivation and encoding turn asks before it
