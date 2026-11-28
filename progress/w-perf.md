@@ -919,3 +919,8 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - Step 2 (catch-up spends the held excess a wake) written, red not trustworthy yet (a 2-page cut lasted 4 wakes;
     the old-slice red tripped the watchdog): patch at ~/.local/state/w-perf/patches/step2-catch-up-excess.patch.
   - Waiting on main: its call on running the 57k on 864cb01c4 first. Then site 2's delta scene, then (ii).
+- 2026-11-27 21:59 PST (written then):
+  - BUILT, not on main: agents/w-perf-cadence-step2 at 7762cf2a8 (step 2: a catch-up wake spends the held frees past
+    what its cut has left). Test switch dropped per main's 21:45 ruling; red run on the reverted rule (2,887,680 B
+    held over 15 wakes) against green (389,120 over 5). Focused 117.
+  - Waiting on main: the 57k on 864cb01c4 (true held gauge), table about 22:30; then whether step 2 lands.
