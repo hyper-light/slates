@@ -954,3 +954,13 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     every piece (red 32,768 vs 49,152), the borrow line's held split, and the catch-up state at each held doubling at
     a borrow's end. Main runs the 57k on it, two runs loaded on purpose.
   - Worktrees: w-perf-held (current) and w-perf-land share my target; check "Compiling slates-server" on a switch.
+- 2026-11-28 03:32 PST (written then):
+  - WITHDRAWN: "no drain ran on shard 0 from 313 MB to 3.68 GB" (run 1, 57k on 3d24ec5b3), and with it "nothing
+    turned the cut". It was the silence of a doubling line that compared against a max every reading moved, so it
+    says nothing about drains. What stands: 918 encode turns against run 3's 33,300, and one cut holding 3.68 GB.
+  - BUILT, not on main: agents/w-perf-held-bytes at 27691e4d2 (main's 1db147761 merged in):
+    - (A) a borrow whose frees pass what the cut in flight has left pays one catch-up slice at its end. Red: 2,097,152
+      held against 800,290, the cut never ending. Green: 425,984. The lent case is paid at the outer borrow's end.
+    - The doubling lines log at twice their own last mark (red (1, 1), green (12, 12)).
+    - Focused slates-server set, 105 passing.
+  - Next: the retention charge (held frees trued up to held_now at each borrow's end), red first.
