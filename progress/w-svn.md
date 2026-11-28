@@ -867,3 +867,15 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - 87914fc2f ptrie removal label match (latent); f9762faba BENCHMARKS writing session win.
 - Open: ~50 MB page return in landing steps (arena piece, ruled (ii)); siblings Importing::consume and sent_piece drains; svnsync gap.
 - Probes saved: ~/.local/state/w-svn/patches/100-alloc-probes.patch (counting allocator, field drops, frees by phase).
+
+## 2026-11-28 03:42 — A-920 arena units 0 and 1, the landing's increment buffer (main at 2d9768746)
+- 86a8f9885: unit 0 (ptrie labels and child lists as arena runs, inline labels) and unit 1 (content_history a lineage
+  Dim: a retired member's history 28,499 frees to 18,001), with main's A/B in BENCHMARKS (insert/fork/remove 19-41 %
+  faster, get 0.95).
+- 2d9768746 (commit 7bfc6d880): IncrementEncoding measured and reserved once; the shard's kept IncrementBuffer; the
+  prepare's frees of 64 KiB or more 10 to 0. No off-CPU assert (main's 02:42: preemption on a loaded debug suite).
+- Next (main's order): the chain entry's measuring frees (19,499, 2.4 MB) on agents/w-svn-entry-measure, red first; then
+  the pile by phase, stage.recording first, probe first (run 154: a 5.33 ms step with an 18.2 MB fall outside prepare).
+- Owed later: 1c (Value pieces as runs) then 1b (entry lists as runs); deltas, identity_dirty/out, latest_change,
+  last_changed, changes as arena units after w-shared's U0 (deltas and changes keep version-bounded reads).
+- Main's: the regime change (no footprint fall on 86a8f9885's head), its three-arm run.
