@@ -3130,8 +3130,11 @@
 > per landing (41 bytes an object); and the Mac's footprint and Linux's RSS readings after b2b (main's). Unmeasured,
 > owed (w-git) once a fleet
 > RSS round measures it: `put_remote` ships the whole pack in one buffer to each remote home (f ≥ 1); another shard of
-> this node as the pack's home is handed its bytes too. Owed (w-git): a node whose store lacks a record's changeset
-> reading its names from their region homes, held by a test of its own (the rebuild test now reads the node's store).
+> this node as the pack's home is handed its bytes too. C4 CLOSED (w-git, 2026-11-27, main's
+> order of 18:44): a node whose store lacks a record's changeset reads its names from their region home, held by a test
+> of its own, `vcs_store::replica::tests::a_replica_reads_the_names_its_node_lacks_from_their_region_home` (a two-shard
+> node: a replica of A's records begun on the shard not homing their names, its changeset read refused
+> `changeset_unread`, the names fetched from their home `names_fetched`, none unfetched, its rows A's).
 > OPEN (goal 93, w-git; w-sessionlog's reduction 2026-11-21): a whole clone of git/git with 506 tags or more is aborted
 > "possible repository corruption on the remote side". The repository's encoding never finishes (its first version,
 > master's whole history, begun and never kept; each tag's first version is encoded over everything it reaches, so the
