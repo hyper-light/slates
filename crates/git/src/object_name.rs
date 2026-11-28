@@ -543,21 +543,20 @@ impl Hasher {
 
   /// [`Hasher::finish`] of what was hashed, the hasher made fresh in its place.
   fn take(&mut self) -> Result<ObjectId, CollisionAttack> {
-    let done = match &mut self.state {
-      State::Sha1(hash) => Done::Sha1(core::mem::replace(hash.as_mut(), fresh_sha1())),
-      State::Sha256(context) => Done::Sha256(core::mem::replace(
+    match &mut self.state {
+      State::Sha1(hash) => finished_sha1(core::mem::replace(hash.as_mut(), fresh_sha1())),
+      State::Sha256(context) => Ok(finished_sha256(core::mem::replace(
         context,
         aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256),
-      )),
-    };
-    done.finish()
+      ))),
+    }
   }
 
   /// The name of what was hashed, or the attack SHA-1's detection found in it.
   pub fn finish(self) -> Result<ObjectId, CollisionAttack> {
     match self.state {
-      State::Sha1(hash) => Done::Sha1(*hash).finish(),
-      State::Sha256(context) => Done::Sha256(context).finish(),
+      State::Sha1(hash) => finished_sha1(*hash),
+      State::Sha256(context) => Ok(finished_sha256(context)),
     }
   }
 }
@@ -570,39 +569,27 @@ fn fresh_sha1() -> sha1_checked::Sha1 {
     .build()
 }
 
-/// A hash taken out of its [`Hasher`] to be finished.
-enum Done {
-  Sha1(sha1_checked::Sha1),
-  Sha256(aws_lc_rs::digest::Context),
+/// The name a SHA-1 hash taken out of its [`Hasher`] finishes as, or the attack its collision detection found.
+fn finished_sha1(hash: sha1_checked::Sha1) -> Result<ObjectId, CollisionAttack> {
+  let result = hash.try_finalize();
+  let name = ObjectId::from_bytes(ObjectFormat::Sha1, result.hash().as_slice());
+  let name = name.unwrap_or(ObjectId {
+    format: ObjectFormat::Sha1,
+    bytes: [0; MAX_RAW_LEN],
+  });
+  if result.has_collision() {
+    return Err(CollisionAttack { sha1: name });
+  }
+  Ok(name)
 }
 
-impl Done {
-  /// The name, or the attack SHA-1's detection found.
-  fn finish(self) -> Result<ObjectId, CollisionAttack> {
-    match self {
-      Done::Sha1(hash) => {
-        let result = hash.try_finalize();
-        let name = ObjectId::from_bytes(ObjectFormat::Sha1, result.hash().as_slice());
-        let name = name.unwrap_or(ObjectId {
-          format: ObjectFormat::Sha1,
-          bytes: [0; MAX_RAW_LEN],
-        });
-        if result.has_collision() {
-          return Err(CollisionAttack { sha1: name });
-        }
-        Ok(name)
-      }
-      Done::Sha256(context) => {
-        let digest = context.finish();
-        Ok(
-          ObjectId::from_bytes(ObjectFormat::Sha256, digest.as_ref()).unwrap_or(ObjectId {
-            format: ObjectFormat::Sha256,
-            bytes: [0; MAX_RAW_LEN],
-          }),
-        )
-      }
-    }
-  }
+/// The name a SHA-256 hash taken out of its [`Hasher`] finishes as.
+fn finished_sha256(context: aws_lc_rs::digest::Context) -> ObjectId {
+  let digest = context.finish();
+  ObjectId::from_bytes(ObjectFormat::Sha256, digest.as_ref()).unwrap_or(ObjectId {
+    format: ObjectFormat::Sha256,
+    bytes: [0; MAX_RAW_LEN],
+  })
 }
 
 impl Out for Hasher {
