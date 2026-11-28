@@ -27,6 +27,7 @@ jobs:
     timeout-minutes: 180
     env:
       AWS_LC_SYS_PREBUILT_NASM: "0"
+      CARGO_TERM_COLOR: never
       SLATES_FLEET_TRACE: "1"
       SLATES_TEST_HEDGE_STARVATION_SECS: "20"
       SLATES_TEST_RESTART_SLOWDOWN: "10"
@@ -46,8 +47,10 @@ jobs:
       - name: The reds, one at a time, RUNS each
         shell: bash
         run: |
-          exe=$(sed -n 's/.*Executable tests[\\/]fleet.rs (\(.*\))/\1/p' build.log | tail -1)
+          set +e
+          exe=$(sed 's/\x1b\[[0-9;]*m//g' build.log | sed -n 's/.*Executable tests.fleet.rs (\(.*\))/\1/p' | tail -1 | tr '\\' '/')
           echo "binary: $exe"
+          [ -n "$exe" ] || { echo "no fleet binary found in build.log"; exit 1; }
           mkdir -p logs
           for run in $(seq 1 "$RUNS"); do
             for t in $TESTS; do
