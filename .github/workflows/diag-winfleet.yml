@@ -1,0 +1,70 @@
+name: diag Windows fleet reds (diag CI 12's, with w-shared's logs)
+# Diag only (main 01a20182, 2026-11-27): diag CI 12 (run 46099781322, at a0d39a8c1) failed these fleet tests on the native
+# Windows lanes, and all but a934 passed on macOS. This runs them alone at main's tip 3b0015fa6, which carries w-shared's
+# logs for them (9c2a54f75: live_ship::note_admitted_under_a_lagging_copy, the stranger's route view), RUNS times each,
+# one at a time, with the fleet lane's own environment, every run's output kept. Never merged to main.
+on:
+  push:
+    branches: ["diag-measurer-winfleet-*"]
+env:
+  TESTS: >-
+    a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost
+    a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it
+    a921_a_warm_restarted_node_serves_a_false_death_victims_old_volume
+    a934_a_neighbourhood_change_waits_for_its_state_logs_newest_part_on_the_new_cohort
+    a935_a_candidate_a_death_brings_in_holds_each_greens_newest_version_with_no_push
+    a_live_ship_a_candidate_cannot_admit_is_refused_and_ships_once_it_can
+    a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first
+  RUNS: "4"
+jobs:
+  windows:
+    name: fleet reds (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      SLATES_FLEET_TRACE: "1"
+      SLATES_TEST_HEDGE_STARVATION_SECS: "20"
+      SLATES_TEST_RESTART_SLOWDOWN: "10"
+      SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the fleet tests
+        shell: bash
+        run: cargo test --locked -p slates-server --test fleet --no-run 2>&1 | tee build.log
+      - name: The reds, one at a time, RUNS each
+        shell: bash
+        run: |
+          exe=$(sed -n 's/.*Executable tests[\\/]fleet.rs (\(.*\))/\1/p' build.log | tail -1)
+          echo "binary: $exe"
+          mkdir -p logs
+          for run in $(seq 1 "$RUNS"); do
+            for t in $TESTS; do
+              start=$(date +%s)
+              (cd crates/server && timeout 300 "../../$exe" "$t" --exact --nocapture) > "logs/$t-$run.log" 2>&1
+              rc=$?
+              verdict=$(grep -m1 -E 'test result' "logs/$t-$run.log" | cut -c1-40)
+              echo "run $run $t rc=$rc $(( $(date +%s) - start )) s: ${verdict:-no result}" | tee -a summary.txt
+              grep -m2 -A2 'panicked at' "logs/$t-$run.log" | head -4 | sed 's/^/    /' | tee -a summary.txt
+            done
+          done
+          echo "== lagging-copy admissions: $(cat logs/*.log | grep -c 'admitted under a copy whose authority')"
+          echo "== route views:"; grep -h 'RouteView' logs/*.log | sort | uniq -c | head -20
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: winfleet-${{ matrix.os }}
+          path: |
+            logs/
+            summary.txt
