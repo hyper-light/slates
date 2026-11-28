@@ -858,3 +858,8 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - 832ecc2b9: fold-to-dead logged with call site; a921 reading carries council_death_view (diag). winfleet-6 named own-probe condemnations 327-669 ms (no floor: detection_bound is an upper bound).
 - 6be709db6 (90cfdc04d): A-921 part 5 re-key window: hyper-swim local change Detector::hold_judging (README item 4), member_task window (note_reconnected -> keyed or one detection), plane + window reds. Main reruns winfleet.
 - A-752 engine commit: commit_step 11.2-14 ms of commit_held; Set (set_file) 9.1-9.4 ms, Effects 0.8-2.6, Changes 1.0. Main's call: stage and publish whole (ptrie fork), never hold the green out.
+
+## 2026-11-28 01:56 PST: A-752 3c U0 + U1 built locally, waiting on w-svn unit 1
+- a921 closed (winfleet-7 32/32 both lanes; GAPS 89d56d639).
+- 3c: six-guard staging red written (uncommitted, lands with its fix). Classification table sent; main approved U0 -> U1 -> ... with split vs w-svn.
+- U0 (every read names its version: head_bound_tests) and U1 (head bump + accepted at publish_run; mode_history marks: publish_tests) green: merge lib 319, engine+changed_since_cost 50. Land after unit 1 (~02:15). Patch: ~/.local/state/w-shared/logs/a752-3c-u0-u1-wip.patch
