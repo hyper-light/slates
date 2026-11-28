@@ -1359,9 +1359,22 @@
 > run), so main's bare-metal release rounds hold it, and the count holds the fix. On main's head after 86a8f9885 the old
 > encoder's runs showed no footprint fall at all (three debug runs, returned_bytes 0), where 1b7ea3a12's had 20-185 MB:
 > a change of regime main attributes by its own three-arm run (C = 1b7ea3a12, A = 86a8f9885, B = A less 0bf1837a7).
-> Left: the chain entry's measure (19,499 frees, 2.4 MB, in one prepare unit), then the pile the
+> Left: the chain entry's measure (19,499 frees, 2.4 MB, in one prepare unit; built below), then the pile the
 > shard frees before a return: 838,930 blocks and 179,702,034 bytes before the move's first, against the reaper's
 > 64,933 and 5,353,567. By phase, stage.recording first (374 MB freed in one copy import), probe first.
+
+> **A-920 an entry's declared index BUILT (w-svn, 2026-11-28; main's order of 03:41): no allocation a path.** A chain
+> entry's index of what its increment declares (each path's content ops, each copy by destination and source; A-632)
+> was an ordered map of each path's name to a list of its ops, and a stepped entry kept the names as strings: a 9,000-file
+> entry's encoding freed 19,499 heap blocks and 2,373,794 bytes in the step it ended in (debug, the probe's count and
+> the red's, `a_wide_entrys_stepped_encoding_frees_nothing_a_path`). Now `chain_entry::DeclaredIndex` is one buffer of
+> words threaded through the ops by the path table's indices (a word a path, its list's first op; a word an op, the
+> next on its path), the paths read off the increment (`PathTable::index_of`): at most two frees for the same entry
+> from an empty room, none from a room of its size (`a_wide_entry_indexed_in_a_room_with_its_size_frees_nothing`). The
+> shard keeps that room beside the increment buffer (`staging::IncrementBuffer`'s index, its own counters
+> `repository.svn_commit.entry_index_reused`, `_made`, `_let_go`, charged and bounded as the buffer is), taken by a
+> landing's entry and an import batch's measure in turn; the wide move's test holds both rooms reused. The whole
+> (unstepped) encoder, `encoded_len`, the decoder and the computed verdict's wire read the same index, built fresh.
 
 > **Open (A-920, w-svn, 2026-11-26; goal 93): a wide import's steps under 1 ms.** The staging's steps, the commit and
 > the landing's entry are sliced (A-920 pieces 1-6b, 7a, 7b), and the checkpoint's identity fold takes at most the step ceiling a
