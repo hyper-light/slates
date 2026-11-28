@@ -904,3 +904,10 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     Red: give-back borrow 1,048,576 B before, 0 now. Site 3's borrow line reads the arena and the process.
     Focused: server 119, fleet 3 (holder, a908 pair), slates-git 634.
   - Next: site 2 (taking.slice's 42 MB, its own byte budget). Waiting on main's 57k round on a6477ec16.
+- 2026-11-27 20:37 PST (written then):
+  - BUILT, not on main: agents/w-perf-cadence at 34b654b01. The planning log (1f0b26651: arena and content census at
+    a push planning's four points) and site 1's last whole drop: landed_segment let a segment's texts go whole in the
+    landing's borrow; now the push lets them go a copy slice a borrow (segment_let_go, let_go_landed_slice), the
+    commit's turns bounded by bytes too. Red: 4,194,304 B in one slice before, 262,144 now. Focused 132.
+  - Waiting on main: the 57k on 1f0b26651 (planning lines). Open: site 2 (taking.slice), record_turn (3309), the
+    clone (hg_view.rs:68), the planning's working set, then the uncapture with a naming proof.
