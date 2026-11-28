@@ -3657,6 +3657,8 @@ mod tests {
     most_a_turn: (u64, u64),
     /// The most chunks the windows held for one cut.
     held_most: usize,
+    /// The most blocks the cut in flight named at a check of the blocks kept (that check is never vacuous).
+    in_flight_named: usize,
     /// What the checks found.
     found: Vec<String>,
   }
@@ -3765,6 +3767,33 @@ mod tests {
         self.found.push(format!(
           "step {step}: {held} chunks held for the cut, past {bound} (a turn's frees times its {turns} turns)"
         ));
+      }
+    }
+
+    /// The blocks an image may name kept allocated (A-64, F2; (ii)'s naming proof): every slot the committed cut's
+    /// windows name, and every slot the cut in flight's windows named at its moment, lies in the arena's held runs
+    /// (a block deferred is held), whatever the windows freed since. Checked after every change, turn and
+    /// publication, so a block released early is caught as it is released, before any window reuses it.
+    fn check_named_kept(&mut self, state: &crate::state::ShardState, step: usize) {
+      let runs = state.store.content.arena().held_runs();
+      let in_flight = self
+        .begun
+        .as_ref()
+        .map_or(&[][..], |begun| begun.entries.as_slice());
+      let committed = crate::content_holder::window_blocks(&self.cut);
+      let named_in_flight = crate::content_holder::window_blocks(in_flight);
+      self.in_flight_named = self.in_flight_named.max(named_in_flight.len());
+      for (image, named) in [
+        ("the committed cut", committed),
+        ("the cut in flight", named_in_flight),
+      ] {
+        for (_, region, offset, len) in named {
+          if !within_runs(&runs, (region, offset, len)) {
+            self.found.push(format!(
+              "step {step}: the block at {region}:{offset} {image} names was released"
+            ));
+          }
+        }
       }
     }
 
@@ -3895,6 +3924,7 @@ mod tests {
       }
       self.note_cut(state);
       self.check_held(state, step);
+      self.check_named_kept(state, step);
       self.check(state, step);
     }
 
@@ -3904,6 +3934,7 @@ mod tests {
         self.turning();
         let turned = crate::content_holder::image_turn(state);
         self.note_cut(state);
+        self.check_named_kept(state, step);
         if turned.caught_up && state.image_encoder.owed() {
           self.publish_as(state, step, true);
         }
@@ -3953,6 +3984,7 @@ mod tests {
         + landed;
       self.since_turn.1 += (after.freed - before.freed) + (after.let_go - before.let_go);
       self.check_held(state, 0);
+      self.check_named_kept(state, 0);
     }
 
     /// The change itself ([`Oracle::change`]).
@@ -4014,6 +4046,21 @@ mod tests {
     }
   }
 
+  /// Whether the bytes `(region, offset, len)` lie inside one of `runs`, the arena's held runs
+  /// (`slates_mem::arena::ChunkArena::held_runs`: by region, then offset, adjacent blocks joined).
+  fn within_runs(runs: &[(u16, usize, usize)], (region, offset, len): (u16, u64, u64)) -> bool {
+    let (Ok(offset), Ok(len)) = (usize::try_from(offset), usize::try_from(len)) else {
+      return false;
+    };
+    let after = runs.partition_point(|&(id, start, _)| (id, start) <= (region, offset));
+    after
+      .checked_sub(1)
+      .and_then(|at| runs.get(at))
+      .is_some_and(|&(id, start, run)| {
+        id == region && offset.saturating_add(len) <= start.saturating_add(run)
+      })
+  }
+
   /// What one oracle history found, and its non-vacuity counts.
   struct Found {
     /// What its checks found.
@@ -4024,6 +4071,8 @@ mod tests {
     preimages: (u64, u64),
     /// The most chunks the windows held for one cut.
     held_most: usize,
+    /// The most blocks a cut in flight named at a check of the blocks kept.
+    in_flight_named: usize,
     /// The publications that carried the committed cut again because the next was not due (A-930's cadence).
     deferred: u64,
   }
@@ -4122,6 +4171,7 @@ mod tests {
         counted(crate::content_holder::IMAGE_CUT_PREIMAGES_ABSENT),
       ),
       held_most: oracle.held_most,
+      in_flight_named: oracle.in_flight_named,
       deferred: counted(crate::content_holder::IMAGE_CHAIN_STOPPED),
     }
   }
@@ -4133,17 +4183,21 @@ mod tests {
   /// the encoder pauses them, as the shard's let-go sites hold theirs. Expect, at every publication and crash: the image a
   /// restart reads equal, entry for entry, to the shard's entries at the moment the last carried cut began (one moment,
   /// never a mix of two, whatever changed while it was encoded); no window that image names with its chunk's block held
-  /// now by another window (the arena reused none); the owed publication's lag within its bound; each carried cut's old
+  /// now by another window (the arena reused none); after every change, turn and publication, every slot the committed
+  /// cut's windows name and every slot the cut in flight's named at its moment still allocated in the arena (none
+  /// released early, (ii)'s naming proof); the owed publication's lag within its bound; each carried cut's old
   /// values at most the entries in its pages at its moment (E) and its absent markers at most a turn's inserts times its
   /// pages (I); the chunks held for a cut at most a turn's frees times its pages; no ticket stranded and no pre-image left
   /// at a cut's end; and, the changes stopped, the cut caught up with the shard. Non-vacuous: the cuts kept old values
-  /// and absent markers, the windows held a chunk for a cut, the images named windows, and some cut's commit began no
-  /// next one (A-930's cadence, plan (a): every publication asks for its cut, the chain a commit begins waits for its
-  /// changes' bytes, and the shard asks once quiet, as its idle does).
+  /// and absent markers, the windows held a chunk for a cut, the images named windows, a cut in flight named blocks at a
+  /// check of the blocks kept, and some cut's commit began no next one (A-930's cadence, plan (a): every publication asks
+  /// for its cut, the chain a commit begins waits for its changes' bytes, and the shard asks once quiet, as its idle
+  /// does).
   #[test]
   fn generated_histories_restore_one_committed_cut_reuse_no_named_block_and_keep_their_lag_bound() {
     const PAGE: usize = 4096;
     let (mut old, mut absent, mut held, mut named, mut deferred) = (0, 0, 0, 0, 0);
+    let mut in_flight_named = 0;
     for seed in 0..HISTORIES {
       let found = crate::daemon::audit_on_shard(move |state| {
         crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
@@ -4156,6 +4210,7 @@ mod tests {
       absent += found.preimages.1;
       held = held.max(found.held_most);
       named = named.max(found.named);
+      in_flight_named = in_flight_named.max(found.in_flight_named);
       deferred += found.deferred;
     }
     assert!(
@@ -4164,6 +4219,10 @@ mod tests {
     );
     assert!(held > 0, "no chunk was held for a cut");
     assert!(named > 0, "no restored image named a window");
+    assert!(
+      in_flight_named > 0,
+      "no cut in flight named a block at a check of the blocks kept"
+    );
     assert!(
       deferred > 0,
       "no cut's commit stopped the chain: A-930's cadence never ran"
