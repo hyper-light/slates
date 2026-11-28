@@ -4315,7 +4315,15 @@
 > ruling: no test or round shows it costing anything yet): a create command's `ServerJudge::build_turn` builds
 > nothing (`Verdicts::prepare` reaches its greens and returns), yet the turn is counted with whatever step report the
 > push's `preparing` still holds, an earlier command's or none: `push.build.turns` one more, and an earlier command's
-> last-turn units and quanta counted again.
+> last-turn units and quanta counted again. Part 3c (the engine's commit staged and published whole, main's rulings of
+> 2026-11-28 00:42 to 01:42): U0 BUILT, every read names its version; U1 BUILT, the head bump and `accepted` at the
+> publish, last, and the mode history appended in place and taken back at a refusal; U2 BUILT, every value history
+> alike; U3 BUILT, the change index; U4 BUILT, `file_removed` and the `*_changed` maps written aside (design's part
+> 3c); owed: the
+> identity, the current-state Dims (w-svn: deltas, the identity's sets, `latest_change`, `last_changed` and the change index as arena conversions, keeping U0's bounded reads), and the
+> content history after A-920 arena unit 1. Found by reading (2026-11-28, not worked): `file_removed` keeps only a
+> path's latest removal, so `stack::levels`'s `== version` read (`levels.rs`:293) and its span read (:326) miss an
+> earlier removal that a later one overwrote.
 >
 > **A-760 (2026-11-20, w-engine; main's ruling ~09:10, "1b"):** part 1 BUILT: an increment names content by identity
 > (`Increment::named`, plain BLAKE3 + length), read a slice a step through the owner's `named::Objects`, refused
