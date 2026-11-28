@@ -828,3 +828,7 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - RegionalConfiguration::superseded kept past readmission, read by routing alone; regional layout 8 (layout 7 read with none); bound completed_bound, a let-go costing one refused forward.
 - Red on the Mac: the stranger's route of an unrouted object of a's named a; now None. db 103/103, cluster 260/260, fleet A-921 3/3.
 - Waiting: main's Windows diag (item 1 lagging-copy count). Then items 4 and 5, then the hedged read (b) and the kept-v1 Behind bound.
+
+## 2026-11-27 21:28 PST: creation check and greens_placed (slates d2175d73b)
+- 6bc68e2ec: greens_placed reads Option (never placed != placed at 0); placement_done states why a creation owes no root v0 (every path checked); founded_git_fleet checks the repository's own record + names log (holds_repository_record_of); a935 prints its repair counts; GAPS item 1 not recurred since A-936.
+- Next: (b) the hedged region read, red first; then the kept-v1 Behind bound on the code.
