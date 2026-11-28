@@ -854,3 +854,9 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - c5d77ed2c (on main at c9e273092): a held identical record answers enrolled and fans out; red-then-green fleet scene
   a764_an_enrollment_short_of_f_plus_one_completes_when_the_same_request_is_asked_again; bug record in docs/bugs.
 - git-2000 rebuild: answered main what it needs (bare clone of git/git, REF = f7de81456940, ~0.8 GB, ~2 min convert); not built, awaiting go.
+
+## 2026-11-27 19:33 — r593 import fix, SimHost cut (main at 46635ab40)
+- 912d891c9: decide_rmdirs_some keeps each decided directory's place (my ee0c95e8f bug; git-2000 r593 refused 4/5).
+- 5633c5d1f: SimHost open copies nothing (probe 18's move begin was the sim's dump copy).
+- Earlier: c5d77ed2c A-764 retried enrollment; git-2000 fixture rebuilt (sha e005db1c...).
+- Next: copy's landing.prepare off-CPU encode (probes in ~/.local/state/w-svn/patches/73-prepare-probes.patch); put_whole callers item.
