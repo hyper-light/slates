@@ -1,0 +1,61 @@
+name: diag FUSE on Linux, family three and takeover_round at 93b7d6b42
+# Diag only (main 01a20182, 2026-11-27 22:50 PST): w-shared's family three (731331eef, the FUSE helper's exit awaited by
+# its ExitWatch, on main as c5051eb51) was green on the Mac, and its Linux run (kiln r14) never ran: kiln has been
+# down all session. GAPS' open "slates-bridge-fuse --test takeover_round fails 2 of 2 on Linux" (adacachy, kiln r25 and
+# r29, 2026-11-21; the zero-budget round's slices [1, 1, ...] where the test expects [2, 1, ...]) has no owner and no
+# run since. This runs family three's changed test RUNS times and slates-bridge-fuse's whole suite twice on GitHub's
+# x86_64 and arm64 Ubuntu, with fuse3 and the operator's user_allow_other as CI's lanes grant them, and fails a run
+# that skipped. Never merged to main.
+on:
+  push:
+    branches: ["diag-measurer-fuse-*"]
+env:
+  RUNS: "8"
+jobs:
+  linux:
+    name: fuse (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: FUSE and the operator's grant
+        run: |
+          command -v fusermount3 >/dev/null || { sudo apt-get update && sudo apt-get install -y fuse3; }
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+          ls -l /dev/fuse; fusermount3 --version; uname -a
+      - name: Build
+        run: cargo test --locked -p slates-server --test fuse_mount --no-run && cargo test --locked -p slates-bridge-fuse --no-run
+      - name: The runs
+        shell: bash
+        run: |
+          set +e
+          mkdir -p logs
+          for run in $(seq 1 "$RUNS"); do
+            cargo test --locked -p slates-server --test fuse_mount -- --exact a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount --nocapture > "logs/fuse_mount-$run.log" 2>&1
+            rc=$?
+            echo "run $run fuse_mount family three rc=$rc skip=$(grep -c '^SKIP' logs/fuse_mount-$run.log): $(grep -m1 'test result' logs/fuse_mount-$run.log | cut -c1-40)" | tee -a summary.txt
+          done
+          for run in 1 2; do
+            cargo test --locked -p slates-bridge-fuse -- --nocapture > "logs/bridge-fuse-$run.log" 2>&1
+            rc=$?
+            echo "run $run bridge-fuse rc=$rc skip=$(grep -c '^SKIP' logs/bridge-fuse-$run.log)" | tee -a summary.txt
+            grep -E '^test .* FAILED$|^test result' "logs/bridge-fuse-$run.log" | head -16 | sed 's/^/    /' | tee -a summary.txt
+          done
+          grep -q -E 'rc=[1-9]|skip=[1-9]' summary.txt && exit 1 || exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuse-${{ matrix.os }}
+          path: |
+            logs/
+            summary.txt
