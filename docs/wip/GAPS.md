@@ -355,9 +355,19 @@
 > `silence_longest_ns`, `silence_unmeasured`, each death logged beside the detector's and the coordinator's period tails
 > and their recent maxima. Red first: `a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first`
 > (coordinator periods stretched 300 ms; 7 of 7 learned) and a unit test of the install's sample. Still OPEN:
-> - **(c) A first death's prior** (w-shared, after the barrier piece below), from main's batch of 10 ambient and 10
->   loaded runs of A-912's push test. Recorded red: the first stretched death's silence 3.99 to 5.24 s against the
->   estimate's window of 3.3 to 3.8 s, that push refused `retry` at its homing 4 of 7.
+> - **FIXED, (c) a first death's prior (A-914 (c), w-shared, 2026-11-27; main 01a20182's rulings of 17:57 and
+>   17:58).** Recorded red: the first stretched death's silence 3.99 to 5.24 s against the estimate's window of 3.3 to
+>   3.8 s, that push refused `retry` at its homing 4 of 7, then 5 of 16 at load (a914 at 604aa12a0 and d08595c7e, each red
+>   beginning there). The window was right, its use was not: a homing fixed its deadline from the window at its start,
+>   derived from periods measured before the death, and the death's confirmation ran in the stretched ones (the estimate
+>   read 6 to 9 s once they were measured). Now the homing's deadline is its start plus the longer of the window then and
+>   the window now, re-read each turn and while it waits for an install (`vcs_store::homes::live_deadline_ns`), and the
+>   window is held to its formula at the watchdog's window ceiling (each coordinator period sample clamped there,
+>   `Failover::period_began`; `fleet::homing_window_ceiling`, 1,550 s at four members), so a growing window still ends.
+>   Nothing below the ceiling changes. Red first:
+>   `a914c_a_push_homed_on_a_member_dying_under_load_waits_for_its_install_and_lands` (pushes during one stretched first
+>   death until one homing waits for the install; red: its first push refused `retry` at a 3.76 s window), and units
+>   for the clamp and the ceiling.
 > - **FIXED, the named debt: a914's second push (A-914 (d), w-shared, 2026-11-27; main 01a20182's rulings of 09:33 and
 >   09:43).** Its record-barrier refusals were A-918 B's (fixed). Its homing shortfall (1 of 7, then 1 of 3) was a
 >   home's put whose stream broke as the home died: the reply came back empty with no round trip, and `exchange_round`
@@ -366,13 +376,76 @@
 >   with none is no answer, its host left, its link dialed afresh, and the homing waits and ranks its homes again once
 >   the death installs (A-912). Red first: `a_home_that_died_mid_put_leaves_the_homing_waiting_never_short_at_once`
 >   (16 of 16 in main's run at 526859d1e). a914 asserts its second push lands.
-> - **OPEN, a914 still fails 4 of 16 at the record barrier** (main 01a20182's run at 526859d1e, load 42-69; its rulings of
+> - **FIXED, a914 16 of 16 (main 01a20182's run at 02548a267, macOS arm64 debug, load 17-53, 2026-11-27 19:02):** every
+>   run with no homing `retry` and no barrier refusal, A-914 (d)'s red 16 of 16 beside it; at 604aa12a0 and d08595c7e 11 of
+>   16, every red beginning with the first death's push refused `retry`. Closed by A-934 (state logs), A-935 (greens) and
+>   A-914 (c) (the live homing deadline). The history below stays as it was.
+> - **Was OPEN, a914 still fails 4 of 16 at the record barrier** (main 01a20182's run at 526859d1e, load 42-69; its rulings of
 >   2026-11-27 12:02). Every red is the second death's push refused `unable to commit`; no homing ended short at once.
 >   Two shapes:
 >   1. Runs 5 and 13: a green owed at version 3, placed 2, with reads past tolerance ("nothing held, the register's
 >      candidacy owed"): A-919's open edge, which (C) closes. Rerun after (C) lands.
 >   2. Runs 1 and 16: a green owed at version 2, placed 1, no read past tolerance: FIXED by w-interop (the entry below,
 >      a region read that waited out a dead first home).
+> - **Shape 1 after (C), a test precondition (w-shared, 2026-11-27; main 01a20182's ruling of 15:51).** At 41aa47870
+>   (1 of 11 green; its placed Some(1) reds, "acknowledged []", bisected to 43a8563a2, main's finding of 16:02), run
+>   7's two reads past tolerance came after the
+>   second death, from the candidate the first death brought in: the root green's merge chain (no floor by design, (C)
+>   covers state logs) and the names log above a's floor. §4.8 settles a neighbourhood change once `f + 1` of the new
+>   cohort hold the newest record, the owner among them (`Configuration::placed_on_current`; the owner's own hold,
+>   `cluster/src/lib.rs` ~1040), so a and c settled the first death's change while the newcomer held nothing; c's death
+>   then was a second failure inside the first's repair window, more than `f = 1` promises, and `unable to commit` is
+>   the typed answer. a914 now waits, before the second death, until a counts every survivor among its green's newest
+>   placed version's holders and each holds the names log through its position at a (`Daemon::repair_window_holders`), and
+>   fails there, named, if that never holds (one focused run: closed with the names log at 4, both survivors holding 2
+>   to 4, the second push landed). The reads past tolerance now name their reader and who answered.
+> - **FIXED, A-934 (w-shared, 2026-11-27; main 01a20182's rulings of 15:51, item 2, and 16:20): the settle asked nothing
+>   of the state logs.** `fleet::records_placed_on_current_neighbourhood` asks each volume's head and catalog and each green's newest
+>   merge record to be held by `f + 1` of the new cohort, no state log, so the old set can retire while a log's newest
+>   part is held by the owner alone of the cohort a takeover of it recovers through (parts let go before a change are
+>   not shipped again; a part owed ships to the current candidates). The owner keeps no placed head of a state log, and
+>   forgets a log's acknowledgements once it let every part go, so it cannot count a log's holders on a new cohort, and
+>   nothing ships a newcomer the parts it lacks: a914's lagging candidate got its missing part only by the accident
+>   43a8563a2's fold fix removed (main 01a20182's finding of 16:06). Red first:
+>   `a934_a_neighbourhood_change_waits_for_its_state_logs_newest_part_on_the_new_cohort` (the names log's newest part
+>   held off y and then off every member, x stopped): settled while held, a's names log at 4, y holding positions 2 and
+>   3, the newcomer none (macOS arm64 debug, 2026-11-27, `~/.local/state/w-shared/logs/a914-a934-red-1.log`). Now
+>   each log's newest part stays owed while it has remote candidates, so the owed-part ship re-ships it to a candidate a
+>   change brings in, and the settle waits for it on `f + 1` of the new cohort, naming the log it waits for. Bounded:
+>   one part a state log of a repository the partition holds (design A-934).
+> - **OPEN, being logged (w-shared; main 01a20182's order of 2026-11-27 18:08): a holder's replica build stalls at the
+>   second death.** Not seen in a914 since A-914 (c) (16 of 16 at 02548a267): every stalled red followed a refused first
+>   push, so its red must make the condition on purpose, or the logs show a refused push is its only door (main's ruling
+>   of 19:02). a914 at 604aa12a0 run 10 and at d08595c7e runs 1, 3, 5, 7 and 9 (each after a refused first-death
+>   push): the second death's v2 placed at the owner alone, its other live candidate answering `ReplicaBuilding` at 0
+>   turns through the barrier window (`building {X: 0}`), so the push was refused `unable to commit`. A build at 0 turns
+>   has not left `replica_build::laid_out`, which waits while the repository's replica store replays; that replay
+>   fetches each push record's names from the region (`vcs_store::names_fetched_for_rebuild`). Not a refused push's
+>   leftovers: a refused attempt lets go of every hold it made at every home (`homes::Attempt::released`), and nothing
+>   homes them again. Now logged: the build's wait on the replay as it begins and ends; each home a region read got
+>   nothing from, with its share and its wait, and a read that ended with none, or found no home besides this node;
+>   each names a rebuild could not fetch; and each merge record a holder does not accept, with its green, version, sender
+>   and reason (the counter it counts), once per green, version and reason (`merge_service::note_unaccepted`, main's
+>   ruling of 18:33), for the first-death barrier red where a candidate holding v1 never acknowledged v2 (A-935's kept
+>   v1 retargeted to the newcomer meanwhile: not yet A-935's, one red against none in 16). Unproven guess for the stall:
+>   an object of an earlier landed record whose homes were the two dead (d and c), the healer not yet re-homing it before
+>   c died.
+> - **OPEN, being logged (w-shared; main 01a20182's ruling of 2026-11-27 17:05): a live node's own HTTP edge refused a
+>   connect at 0 ms.** 2816da877's a914 run 3: the first death's push failed "Failed to connect to 127.0.0.1 port 55009
+>   after 0 ms: Couldn't connect to server" on a's own `vcs_http_port` while a was alive, and no "the HTTP edge
+>   stopped" line was logged. Most likely a refused connect, with nothing listening on the port at that instant
+>   (inferred from the 0 ms). The edge now logs its listener's bind and its close, however `serve` ends (its own refusal
+>   or its task dropped), with the process's monotonic time. A fleet test's git client that fails to connect logs the
+>   port, that time and an immediate probe connect, so the next such run says which it was: not yet bound, closed, or
+>   bound with the connect refused.
+> - **OPEN, a design question (main 01a20182's ruling of 2026-11-27 15:51, item 3; not now): may a newcomer adopt a live,
+>   never-restarted owner's chain on its report alone?** In run 7 above, after the second death the owner was the one
+>   live holder of the green's chain and the names log above its floor; the newcomer's reads were past tolerance, so
+>   it could not hold the green's next version, and that version could not place on the two survivors.
+>   The fold's tolerance (A-919's start rule, `FencedLedger`'s ReadSafety) does not tell an owner that never restarted
+>   (its hold never forgotten) from one that did. Adopting on such an owner's word would let a repository take pushes
+>   again with one copy left; it changes (C)'s rule and the model (the owner's lost mark as a reported fact), so it is
+>   designed and model-checked before any code.
 > - **FIXED (w-interop, 2026-11-27; main 01a20182's ruling of 12:37): a914's record barrier, placed Some(1) (its runs 1
 >   and 16 of 16).** Not durability: every object was served by a live home. A holder whose replica owed its push
 >   (P2) replayed the repository's replica store, reading each name it lacked from the region (`homes::read_in_region`),
@@ -543,7 +616,14 @@
 >   holds none below its floor), and rebuilds. Red first: the A-918 fleet test's newcomer, at `None` after 424 s and
 >   4,002 `Behind`, holds version 2 in 21 s. a914 asserts its second death's push is never refused at its record
 >   barrier. GAP-A9-7's record half is closed for both askers: a successor through its takeover round (A-933), a
->   newcomer through this read. **Still open:** the second death's push may be refused `retry` at its homing (a914, 1
+>   newcomer through this read. **Corrected (A-935, w-shared, 2026-11-27; main 01a20182's rulings of 17:12 and 17:29):**
+>   the read starts on `Behind`, which a newcomer answers only to a version shipped to it, and an owner forgot a
+>   version once every candidate held it, so the newcomer's half was closed only while pushes came: in a quiet stretch
+>   after a death the repair window never closed, and a later second death lost a green `f = 1` keeps (2816da877's
+>   a914 run 3, the newcomer outside the green's holders for 400 s). Now each green's newest version stays pending once
+>   held everywhere, so the neighbourhood change's retarget ships it to the newcomer with no push. Red first:
+>   `a935_a_candidate_a_death_brings_in_holds_each_greens_newest_version_with_no_push` (the newcomer's replica at `None`
+>   after the repair path's 50 periods). **Still open:** the second death's push may be refused `retry` at its homing (a914, 1
 >   of 3), a mode of its own; AUD-14's new candidate set needs the configuration's answer to a read past tolerance
 >   (A-919's open edge, above).
 > **OPEN, a piece (A-912's (3); main 01a20182's rulings of 2026-11-24): a council session of its own per peer.** The
@@ -656,6 +736,56 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
+> **LIFTED (w-git, 2026-11-27, main 01a20182's order of 2026-11-26):** `vcs_store::LANDED_LET_GO` on again, once every
+> reader that meets a let-go window stops and has it brought back, each precondition landed alone, red first through
+> the store's own let-go, through main's 16: (a) the tag-of-a-tag peel (6eae9f8bb); (b) the shallow fetch (050ef43c2);
+> the read sweep's B1 (92f5189db) and B1b (3e98db372), B2 (8987e6f6a), B3 (a9c8aeaec), B4 (c6d97a069), B5 (aaa27b376),
+> B6 and B7 closed on the server path (65f664d87), B8 (fa73e2322), each reader keyed by the let-go's number
+> (`slates_git::away::WaitOnce`) with its waits in its owner's own slot (`Waits`); (d) found unreachable on holders
+> (62c389858), its loop bounded (a05f07e5f); and the two the flip's first focused run found, B9, a hook's view
+> (3b889f115), and B10, an unlanded push's windows pinned against another push's let-go of the same bytes. Kept: the
+> let-go waits while a fetch, an encoding or another intake of the repository is under way (`landed_let_go_may`; red
+> `read_through::tests::a_landed_pack_owed_its_let_go_stays_whole_while_a_push_of_it_is_under_way`). Checked with the
+> flip: C5's held bound (`2N + O × R + W`, its entry below) and (d)'s rule
+> (`fleet::a_holder_lets_no_landed_pack_go_while_its_owner_does`: a holder's landed let-go stays 0 while its owner's
+> moves). Each red the flip's first run produced was classed by main's rule of 2026-11-27 10:33: a test judging
+> resident bytes where the design promises whole by identity has its measure changed
+> (`t_a662_a_refused_ref_leaves_the_push_whole_for_the_next`: the refused push's objects read whole by id, the store
+> holding no more); the two made-again compares whose rebuild a let-go pack's fill needs await its task
+> (`assert_made_again_whole_awaited`); only a test whose own point needs a landed-and-held scene keeps its landed packs
+> resident (`test_store::keep_landed`, `keep_landed_here`: ten sites, one-step clones, fetches, builds, settled
+> rebuilds, counted turns and hand-sealed views), each naming at the site the test that covers the same path with its
+> windows let go. A git commit the server makes over let-go content, live with the flip (main's rulings of 10:37 and
+> 16:07): a made commit reads a file's bytes from its green's map only for a blob the repository lacks
+> (`commits::Lacked`), so the let-go it can meet is a lacked blob whose bytes another repository holds let go, over
+> several windows (a one-window put brings its window back, A-724 piece 4; a multi-window put under a held root keeps
+> it away, A-767 C1 2b). FIXED in the flip with w-svn's draft (one helper for every put of a file whose bytes are in
+> hand, `paths::put_object_bringing_back`: `ContentStore::aways_of`, `put_object_whole`, then
+> `let_go_again_after_build` at each window's own number, counted `vcs_paths.build_brought_back`, a refusal
+> `vcs_paths.build_kept` and logged; d4e851d61's remake folded into it), threaded through `put_file`, the made map
+> (`made_holding`), the live whole builds (`whole_build`'s slices, `finish`, `retire`) and the made commit's preview
+> change, whose let-go again waits until the commit has read its files (`commits::made_before_step`, after
+> `sealed_made`). Reds: `commits::tests::a_git_commit_made_of_bytes_another_repository_let_go_brings_them_back_and_
+> reads_whole` (B's make over A's let-go file: refused `NoTrees`, then `Unread` with the put alone fixed; made, read
+> back whole and its bring-backs counted after) and w-svn's `paths::tests::a_live_whole_build_over_a_file_whose_windows_
+> are_let_go_reads_it_whole_and_lets_them_go_again` (a copy's whole build over a head file every other window of
+> which a warm restart left let go: the submit refused `NoTrees` before; kept, the windows let go again at their
+> numbers, after). A warm restart keeps every window's published let-go number, a landed pack's included (main's ruling
+> of 17:22; A-923: the number is the Aways family's page coordinate): a recovery's replay reads a landed pack the image
+> holds let go back from the node's store, since its seal reads the pushed objects through the push's own copy
+> (`Repository::bytes_of`), so it brings the windows back; `put_changeset` notes their aways (`VcsStores::
+> replay_aways`) and the owed let-go lets each go again at its number first (`ContentStore::let_go_landed_again`, the
+> landed let-go's rule at the image's number; the home's record of where each lies came back with the image,
+> `homes::restore_landed`, so homes need nothing new), counted `vcs_store.replay_let_go_again`. A pin only delays it
+> (main's ruling of 17:55): an unlanded push of the same bytes, or a home holding the window without its record, leaves
+> it owed at its image number, still free (numbers are never reused), counted `vcs_store.replay_let_go_waited`, and the
+> repository's next owed let-go lets it go there, the sliced let-go leaving it alone meanwhile; any other refusal is a
+> bug signal, counted `vcs_store.replay_kept_again` (renumbered) and logged, held to 0 by t_c1. Red of the wait:
+> `vcs_store::tests::a_replays_owed_window_a_push_pins_waits_and_is_let_go_at_its_image_number`. Red:
+> `daemon::tests::t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes` with the let-go on (the
+> pack's window renumbered 0 to 2, the store not as published,
+> before; as published, the replay's let-go again counted, after) and
+> `content::tests::a_landed_shared_window_is_let_go_again_at_its_number_by_the_landed_rule`.
 > **LIFT WITHDRAWN (w-git, 2026-11-23, main 01a20182's order after r18):** `vcs_store::LANDED_LET_GO` false again, every
 > landed let-go held (a commit's, a recovery's and a rebuild's). The lift surfaced a reader on main four times: the fetch
 > stream's choice and object reads (fixed, 0c3f42cea, 7f7793c58), the SSH edge's held answer (fixed, 56fbf0381), the
@@ -3011,13 +3141,21 @@
 > `a_landing_crashed_at_each_piece_recovers_to_the_changeset_before_and_lands_again_whole` (a crash after every count of
 > pieces: the changeset before alone, then landed again to the reference's log). The C5 test prints the daemon's gauges
 > beside its resident figure at each settled point, and since d350346f5 the bytes it holds by them (`held_of`: the
-> live heap, the mapped blocks, each shard's stored windows, no overlap), judged in the landed let-go's flip by
-> `2N + O × R + W` (O the push's objects, R a row's held cost from the index's own layout; main's ruling B of
-> 2026-11-26), the resident bound until then. Owed: the names' rows still one buffer per landing (about 40 B an
-> object); and the Mac's footprint and Linux's RSS readings after b2b (main's). Unmeasured, owed (w-git) once a fleet
+> live heap, the mapped blocks, each shard's stored windows, no overlap), judged since the landed let-go's flip
+> by `2N + O × R + W` (main's ruling B of 2026-11-26 and of 2026-11-27 07:02): O the objects the pack's header counts,
+> at least those the push admitted, so the bound is safe rather than exact; R an object's rows held, 246 bytes for
+> SHA-1 and 270 for SHA-256 (`slates_server::git_held_bytes_per_object`): its object and position rows in the index by
+> the index's own layout, 205 and 229 (`slates_git::store::rows::held_bytes_per_object`, held to a real index, 20,000
+> objects' rows holding 171 bytes an object), and its names row, 41 (`record_names::NAME_BYTES`); W the warm-up's held
+> range; the settled readings alone, the peak staying on the resident bound. Owed: the names' rows still one buffer
+> per landing (41 bytes an object); and the Mac's footprint and Linux's RSS readings after b2b (main's). Unmeasured,
+> owed (w-git) once a fleet
 > RSS round measures it: `put_remote` ships the whole pack in one buffer to each remote home (f ≥ 1); another shard of
-> this node as the pack's home is handed its bytes too. Owed (w-git): a node whose store lacks a record's changeset
-> reading its names from their region homes, held by a test of its own (the rebuild test now reads the node's store).
+> this node as the pack's home is handed its bytes too. C4 CLOSED (w-git, 2026-11-27, main's
+> order of 18:44): a node whose store lacks a record's changeset reads its names from their region home, held by a test
+> of its own, `vcs_store::replica::tests::a_replica_reads_the_names_its_node_lacks_from_their_region_home` (a two-shard
+> node: a replica of A's records begun on the shard not homing their names, its changeset read refused
+> `changeset_unread`, the names fetched from their home `names_fetched`, none unfetched, its rows A's).
 > OPEN (goal 93, w-git; w-sessionlog's reduction 2026-11-21): a whole clone of git/git with 506 tags or more is aborted
 > "possible repository corruption on the remote side". The repository's encoding never finishes (its first version,
 > master's whole history, begun and never kept; each tag's first version is encoded over everything it reaches, so the
@@ -4986,6 +5124,15 @@
 > superlinear term); then each log's rendered length kept where its revisions land, so the count walk goes, with an
 > oracle over generated landing histories, a recovery story, and a stale length refused typed, never sent. The
 > whole-history push (5.60×) waits until these land.
+> Cut 1, the index rows a run a step, BUILT (2026-11-27, w-interop; main's rulings of 17:28 and 17:57). The index's
+> fences keep their table's last key beside its first (`slates_vcs::Index::iter_range`, which opens only the tables
+> whose keys can meet its range; charged, not persisted). `rows_held` gathers each log's numbers in one range walk
+> (`HgIndex::numbers_from`), within a per-step budget of bytes touched derived from the step quantum and the measured
+> copy rate (`Store::text_bytes_a_step`), or the room, whichever first. The index stage writes a run of rows from the
+> gathered numbers with no lookups, and the send pass takes its next log from the count's sized list, with no index
+> search. Held by `a_streams_index_rows_are_written_a_run_a_step` (1,200 revisions of a stock-hg history imported, 48
+> sealed runs): index reads 5,369 (4.47 a revision) before, 449 (0.37) after; index steps 1,249 before, 57 after. Count
+> stage on the same history: 1,215 steps, 1,298 reads. Cut 2, the kept rendered length, is next.
 > **A stock git command's wait, judged by progress (2026-11-23, w-git; main 01a20182's ruling after r229):** each git
 > command of `crates/cli/tests/git_interop.rs` was killed past a fixed 120 s (`PATIENCE`), and git/git's whole-repository
 > session failed correct but slow steps (80-100 s of single-shard CPU, git's own index-pack among it). Now each waits
@@ -6323,8 +6470,9 @@
 > `vcs_store.hg_brought_back_let_go`, equal to the texts asked
 > (`a_successors_rebuild_lets_go_the_texts_it_brought_back_once_it_lands`, `a_restarts_replay_lets_go_the_texts_it_brought_back`;
 > w-perf, w-hg's review note (c)). Not owed by the other tools (main's ruling of 13:22): a git rebuild keeps the pack it reads whole
-> (`put_changeset`), as a live commit keeps its landed pack while `LANDED_LET_GO` is held (whether a landed pack goes
-> at all is w-git's); a Subversion rebuild keeps none, its texts read through the node's store. (c) a Mercurial
+> (`put_changeset`), as a live commit kept its landed pack while `LANDED_LET_GO` was held (lifted 2026-11-27; whether a
+> landed pack goes at all is w-git's); a Subversion rebuild keeps none, its texts read through the node's store. (c) a
+> Mercurial
 > repository's made changeset takes the hook since A-807 (the turn first, the verdict held, the version and the
 > changeset committed in one step after it, then the answer;
 > `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,

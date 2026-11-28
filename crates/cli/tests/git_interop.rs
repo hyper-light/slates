@@ -1010,10 +1010,11 @@ fn history_path(file: usize) -> String {
 /// Makes a history on [`BRANCH`] in a fresh repository at `dir` with stock `git fast-import`: a first commit adding
 /// [`HISTORY_FILES`] files ([`history_path`], [`HISTORY_FILE_LINES`] lines each), then `commits` commits each
 /// rewriting one line of one file ([`history_line`]); then packs it with `git repack -a -d`: the bytes of the pack
-/// stock git made of the history, which a push sends near enough (both deltify each version against the one before).
+/// stock git made of the history, which a push sends near enough (both deltify each version against the one before),
+/// and the objects its header counts ([`objects_in_header`]).
 #[allow(clippy::disallowed_methods)]
 #[cfg(unix)]
-fn made_history(git: &Git, dir: &str, commits: usize) -> u64 {
+fn made_history(git: &Git, dir: &str, commits: usize) -> (u64, u64) {
   git.ok(&git.scratch, &["init", "-q", "-b", BRANCH, dir]);
   let (program, leading) = git.program.split_first().expect("a command");
   let mut importer = Command::new(program)
@@ -1077,8 +1078,28 @@ fn made_history(git: &Git, dir: &str, commits: usize) -> u64 {
         .extension()
         .is_some_and(|extension| extension == "pack")
     })
-    .map(|entry| entry.metadata().unwrap().len())
-    .sum()
+    .map(|entry| {
+      let mut header = [0; PACK_HEADER_BYTES];
+      std::fs::File::open(entry.path())
+        .and_then(|mut pack| pack.read_exact(&mut header))
+        .unwrap();
+      (entry.metadata().unwrap().len(), objects_in_header(&header))
+    })
+    .fold((0, 0), |(bytes, objects), (more, counted)| {
+      (bytes + more, objects + counted)
+    })
+}
+
+/// Format: a pack's header (gitformat-pack): `PACK`, its version and its object count, four bytes each.
+#[cfg(unix)]
+const PACK_HEADER_BYTES: usize = 12;
+
+/// The objects a pack's header counts: its third word, big-endian (gitformat-pack). Panics on bytes that are not a
+/// pack's header: a test's own pack.
+#[cfg(unix)]
+fn objects_in_header(header: &[u8; PACK_HEADER_BYTES]) -> u64 {
+  assert_eq!(&header[..4], b"PACK", "a pack's header");
+  u64::from(u32::from_be_bytes(header[8..].try_into().unwrap()))
 }
 
 /// The daemon's pid, as `slates status --json` names it.
@@ -1094,9 +1115,10 @@ fn daemon_pid(instance: &str) -> String {
 }
 
 /// The bytes of the pack stock git makes of everything `cut` reaches in the repository at `dir` (`git pack-objects
-/// --revs --stdout`), which a first push of `cut` sends near enough.
+/// --revs --stdout`), which a first push of `cut` sends near enough, and the objects its header counts
+/// ([`objects_in_header`]).
 #[cfg(unix)]
-fn pack_bytes(git: &Git, dir: &str, cut: &str) -> u64 {
+fn pack_bytes(git: &Git, dir: &str, cut: &str) -> (u64, u64) {
   let (program, leading) = git.program.split_first().expect("a command");
   let mut packer = Command::new(program)
     .args(leading)
@@ -1112,7 +1134,15 @@ fn pack_bytes(git: &Git, dir: &str, cut: &str) -> u64 {
   writeln!(asked, "{cut}").unwrap();
   drop(asked);
   let mut pack = packer.stdout.take().unwrap();
-  let counted = std::thread::spawn(move || std::io::copy(&mut pack, &mut std::io::sink()).unwrap());
+  let counted = std::thread::spawn(move || {
+    let mut header = [0; PACK_HEADER_BYTES];
+    pack.read_exact(&mut header).unwrap();
+    let rest = std::io::copy(&mut pack, &mut std::io::sink()).unwrap();
+    (
+      rest + u64::try_from(PACK_HEADER_BYTES).unwrap(),
+      objects_in_header(&header),
+    )
+  });
   let code = exit_progressing(&mut packer, "git pack-objects", None);
   assert_eq!(code, 0, "git pack-objects --revs of {cut} in {dir}");
   counted.join().unwrap()
@@ -1248,6 +1278,9 @@ fn held_of(report: &str) -> u64 {
 #[cfg(unix)]
 struct Measured {
   pack: u64,
+  /// The objects the pack's header counts: at least those the push admitted, since a thin pack's bases are the
+  /// server's already (O in the held bound, main's ruling of 2026-11-27 07:02).
+  objects: u64,
   peak: u64,
   pushed: u64,
   cloned: u64,
@@ -1266,9 +1299,11 @@ struct Measured {
 /// [`HISTORY_SOURCE_VARIABLE`] and [`HISTORY_CUT_VARIABLE`] name them, a real repository's cut (its pack `N` bytes),
 /// and clone it back. Expect: the push and the clone succeed, the clone at the pushed head; the daemon at its peak, settled
 /// after the push and settled after the clone, each at most the warm-up's end plus `2N + W`: the pack held once as the change landed and once more as derived data cached by identity (A-767 item 1;
-/// A-718's fragments), judged for now by its resident set (macOS's physical footprint, Linux's RSS) at its peak and
-/// settled, the bytes it holds by its own gauges ([`held_of`]) printed beside it at each settled point until the
-/// landed let-go's flip judges them (main's ruling B of 2026-11-26). Red where the daemon keeps the history expanded, or something per object or per path of every version. The
+/// A-718's fragments), judged by its resident set (macOS's physical footprint, Linux's RSS) at its peak and settled;
+/// and the bytes it holds by its own gauges ([`held_of`]), settled after the push and after the clone, each at most the
+/// warm-up's held end plus `2N + O × R + W`, O the objects the pack's header counts and R an object's rows held
+/// (`slates_server::git_held_bytes_per_object`), judged since the landed let-go's flip (main's ruling B of 2026-11-26).
+/// Red where the daemon keeps the history expanded, or something per object or per path of every version. The
 /// made history is a focused run's size (passed on current main, this Mac, debug, 2026-11-21: N 258,770 bytes, the peak
 /// and the settled sets at most 68.2 MiB against a bound of 90.5 MiB); git/git's cut is main's measurement run
 /// (run-requests.md). Unix (`ps`); skips loudly without stock git.
@@ -1303,7 +1338,7 @@ fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the
       create_named(&leg.instance, name);
     }
     let url = format!("{site}/{name}");
-    let (source, pack, refspec) = match real {
+    let (source, (pack, objects), refspec) = match real {
       Some((source, cut)) => (
         source.clone(),
         pack_bytes(&git, source, cut),
@@ -1337,6 +1372,7 @@ fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the
     let held_cloned = print_gauges(&leg.instance, (&format!("{name} after the clone"), cloned));
     Measured {
       pack,
+      objects,
       peak: push_peak.max(clone_peak),
       pushed,
       cloned,
@@ -1351,9 +1387,8 @@ fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the
   // they bring.
   let warm_cost = warm.peak.saturating_sub(start.min(warm.cloned));
   let measured = round(REPOSITORY, HISTORY_COMMITS, real.as_ref());
-  // The design's claim, judged in held bytes once the landed let-go lifts (main's ruling B of 2026-11-26: the held
-  // assertion goes on in the flip's landing, its bound then with the change's objects as a term): printed now, beside
-  // the resident figure the bound judges until then.
+  // The design's claim in held bytes (main's ruling B of 2026-11-26, put on in the landed let-go's flip; its terms
+  // ruled 2026-11-27 07:02): judged beside the resident figure below.
   let warm_held = warm
     .held
     .0
@@ -1384,6 +1419,29 @@ fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the
     mib(warm_held),
     mib(measured.held.0),
     mib(measured.held.1)
+  );
+  // The held bound: the warm-up's held end plus 2N + O × R + W, W the warm-up's held range. The pack once as the change
+  // landed and once as derived data cached by identity, and each object's rows: R by the index's own layout and the
+  // names row (`slates_server::git_held_bytes_per_object`), O the pack header's count, at least the objects the push
+  // admitted, so the bound is safe rather than exact. Settled readings alone: the gauges are not read at a peak, which
+  // the resident bound judges.
+  let per_object = slates_server::git_held_bytes_per_object(slates_db::catalog::ObjectFormat::Sha1)
+    .expect("git's format");
+  let held_bound = warm.held.1 + 2 * measured.pack + measured.objects * per_object + warm_held;
+  eprintln!(
+    "held bound {} MiB: N {} bytes, O {} objects, R {} bytes",
+    mib(held_bound),
+    measured.pack,
+    measured.objects,
+    per_object
+  );
+  assert!(
+    measured.held.0 <= held_bound && measured.held.1 <= held_bound,
+    "the daemon held {} MiB after the push and {} MiB after the clone by its own gauges, past {} MiB (the warm-up's \
+     held end plus 2N + O × R + W): it holds the history, not the change",
+    mib(measured.held.0),
+    mib(measured.held.1),
+    mib(held_bound)
   );
   assert!(
     measured.pushed <= bound && measured.cloned <= bound && measured.peak <= bound,

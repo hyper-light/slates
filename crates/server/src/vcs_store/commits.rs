@@ -743,9 +743,16 @@ fn made_step(
 async fn made_before_step(pending: &mut crate::made_commit::Pending) -> Before {
   let mut head_first = false;
   let mut building = None;
+  // The windows let go the map's puts brought back of the green's files, let go again once the commit's objects are
+  // made (`sealed_made` reads a lacked blob's bytes from the map), whatever that answered.
+  let mut brought = Vec::new();
   loop {
     match crate::state::with_state(|state| {
-      map_turn(state, pending, (&mut head_first, &mut building))
+      map_turn(
+        state,
+        pending,
+        (&mut head_first, &mut building, &mut brought),
+      )
     }) {
       None => return Before::Gone,
       Some(Ok(true)) => break,
@@ -753,13 +760,20 @@ async fn made_before_step(pending: &mut crate::made_commit::Pending) -> Before {
       Some(Err(why)) => {
         // A build begun and not finished gives back what its puts held.
         if let Some(change) = building.take() {
-          let _ = crate::state::with_state(|state| change.abandon(state));
+          let (green, _) = pending.version();
+          let _ = crate::state::with_state(|state| change.abandon(state, green));
         }
         return Before::Unmade(why);
       }
     }
   }
-  let mut sealed = match crate::state::with_state(|state| sealed_made(state, pending)) {
+  let (green, _) = pending.version();
+  let made = crate::state::with_state(|state| {
+    let made = sealed_made(state, pending);
+    super::paths::let_go_again_after_build(state, green, core::mem::take(&mut brought));
+    made
+  });
+  let mut sealed = match made {
     None => return Before::Gone,
     Some(Err(why)) => return Before::Unmade(why),
     Some(Ok(sealed)) => sealed,
@@ -816,9 +830,10 @@ enum MapTurned {
 fn map_turn(
   state: &mut ShardState,
   pending: &mut crate::made_commit::Pending,
-  (head_first, building): (
+  (head_first, building, brought): (
     &mut bool,
     &mut Option<super::paths::whole_build::PreviewChange>,
+    &mut Vec<slates_vcs::AwayAt>,
   ),
 ) -> Result<bool, Unmade> {
   use super::paths::OverPreviewStep;
@@ -869,18 +884,21 @@ fn map_turn(
       Ok(false)
     }
     MapTurned::Put => {
-      let kept = building
-        .take()
-        .is_some_and(|change| change.finish(state, green));
+      let Some((kept, let_go)) = building.take().map(|change| change.finish(state, green)) else {
+        return Err(Unmade::NoTrees);
+      };
       if !kept {
+        // Not kept: nothing reads the files; let go again at once.
+        super::paths::let_go_again_after_build(state, green, let_go);
         return Err(Unmade::NoTrees);
       }
+      brought.extend(let_go);
       state.count(MAP_TURNS, 1);
       Ok(true)
     }
     MapTurned::HeadFirst | MapTurned::Refused => {
       if let Some(change) = building.take() {
-        change.abandon(state);
+        change.abandon(state, green);
       }
       Err(Unmade::NoTrees)
     }

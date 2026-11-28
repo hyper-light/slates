@@ -475,6 +475,52 @@ fn an_anchor_started_under_an_exec_wrapper_keeps_the_launchers_secret() {
   }
 }
 
+/// Shape: how far past its deadline a host's wait may answer: one claim wait (`CLAIM_WAIT_NS`), the span within which a
+/// claim's polls are paced (at most a tenth of it apart), so a wait that keeps its deadline answers inside it.
+const PAST_DEADLINE: Duration = Duration::from_nanos(slates_ipc::rendezvous::CLAIM_WAIT_NS);
+
+/// [`Instance::wait_for`] on `name` with the child `anchor` holds and the deadline `until`, run on a thread of its own and
+/// held to the deadline and [`PAST_DEADLINE`] more: whether it answered by then, and its answer. A wait still blocked
+/// then is ended by killing the anchor, so the kernel resets the claim queued on its socket and the thread ends; the
+/// child is handed back to `anchor` either way, for its guard to reap.
+fn wait_held_to_its_deadline(
+  name: &str,
+  anchor: &mut Spawned,
+  until: Instant,
+) -> (bool, Result<(), Error>) {
+  let mut child = anchor.0.take().unwrap();
+  let pid = child.id();
+  let waited_name = name.to_owned();
+  let (answered, answer) = std::sync::mpsc::sync_channel(1);
+  let waiter = std::thread::spawn(move || {
+    let waited =
+      Instance::wait_for(&waited_name, Some(&mut child), Some(until)).map(|_attached| ());
+    answered.send(()).unwrap();
+    (waited, child)
+  });
+  let bound = until.saturating_duration_since(Instant::now()) + PAST_DEADLINE;
+  let in_time = answer.recv_timeout(bound).is_ok();
+  if !in_time {
+    kill_process(pid);
+  }
+  let (waited, child) = waiter.join().unwrap();
+  anchor.0 = Some(child);
+  (in_time, waited)
+}
+
+/// Kills the process `pid` with the OS's own tool, for a child another thread holds.
+fn kill_process(pid: u32) {
+  let pid = pid.to_string();
+  #[cfg(unix)]
+  let _killed = std::process::Command::new("kill")
+    .args(["-9", &pid])
+    .status();
+  #[cfg(windows)]
+  let _killed = std::process::Command::new("taskkill")
+    .args(["/F", "/PID", &pid])
+    .status();
+}
+
 /// Ends the anchor it holds when dropped (killed, then reaped), so a failed assertion leaves no instance behind.
 struct Spawned(Option<std::process::Child>);
 
@@ -490,9 +536,12 @@ impl Drop for Spawned {
 /// A-366. Do: start an anchor from this binary whose every daemon exits before it serves (a daemon that cannot start),
 /// asking `until_served`, and wait on the anchor with no deadline of the host's own. Expect the wait to end
 /// `NeverServed`, the anchor gone with `EXIT_NEVER_SERVED`, and (Unix) no process of the instance left. Then start the
-/// same, not asking, and wait twice as long as the first took, with that as the deadline: expect `Unavailable` and the
-/// anchor still running, looping on its daemon as an anchor does (A-119), so it is the ask that stops it. Before A-366
-/// no anchor stopped, and a host's wait on one whose daemons could not start lasted until its own wall-clock deadline.
+/// same, not asking, and wait twice as long as the first took, with that as the deadline: expect `Unavailable` within a
+/// claim wait of the deadline and the anchor still running, looping on its daemon as an anchor does (A-119), so it is
+/// the ask that stops it. Before A-366 no anchor stopped, and a host's wait on one whose daemons could not start lasted
+/// until its own wall-clock deadline. Red on Linux before 2026-11-27's fix: the second wait blocked in a claim queued on
+/// the anchor's listening socket, which waits while the anchor lives (A-468), and passed its deadline for the six hours
+/// of CI's Ubuntu job (diag 10, run 46033104507; diag 11, run 46057905828).
 fn an_anchor_asked_until_served_stops_when_none_of_its_daemons_serves() {
   let instance = instance_name("unserved");
   let mut command = spec(&instance).until_served().anchor_command().unwrap();
@@ -524,7 +573,11 @@ fn an_anchor_asked_until_served_stops_when_none_of_its_daemons_serves() {
   command.env(DAEMON_FAILS, "1");
   let mut unasked = Spawned(Some(command.spawn().unwrap()));
   let until = Instant::now() + took * 2;
-  let waited = Instance::wait_for(&looping, unasked.0.as_mut(), Some(until));
+  let (in_time, waited) = wait_held_to_its_deadline(&looping, &mut unasked, until);
+  assert!(
+    in_time,
+    "the wait answered within {PAST_DEADLINE:?} of its deadline: {waited:?}"
+  );
   assert!(
     matches!(&waited, Err(Error::Unavailable { instance, .. }) if *instance == looping),
     "{waited:?}"

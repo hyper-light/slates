@@ -56,10 +56,11 @@ use std::mem::{size_of, take};
 use std::ops::Bound;
 
 use crate::content::{ContentId, ContentRefused, ContentStore, Stored};
-use crate::filter::{KeyFilter, KeyHash};
+use crate::filter::{KeyFilter, KeyHash, bytes_per_key_most};
 use crate::rule::Compaction;
 use crate::table::{
-  RowRef, TABLE_FRAME_BYTES, TableBuilder, TableRefused, TableView, encode_body, row_bytes,
+  RowRef, TABLE_FRAME_BYTES, TableBuilder, TableRefused, TableView, body_len, encode_body,
+  row_bytes, row_len,
 };
 
 /// Shape: what one tail row costs the budget beyond its key's and its body's bytes: its boxed key and boxed body, the
@@ -80,6 +81,19 @@ pub const TIER_BASE: u64 = TIER_RATIO.saturating_add(1);
 /// Shape: what one table of a run costs the budget beside the store beyond its first key's bytes: its fence's record.
 /// Derived from the type.
 pub const FENCE_SLOT_BYTES: usize = size_of::<Fence>();
+
+/// Derived: the most bytes one sealed row holds in the store, its key `key_len` bytes and its body naming `contents`
+/// contents with a `payload_len`-byte payload: its bytes in a table ([`crate::table::row_len`] of its key and of
+/// [`crate::table::body_len`]) and its key's bits in its run's filter at the most a key takes
+/// (`crate::filter::bytes_per_key_most`). A run's fences and its filter's rounding to words are a table's and a run's,
+/// not a row's, and a tail row's slot ([`TAIL_SLOT_BYTES`]) is the tail's, a window's rows at most: neither grows with
+/// the rows, so neither is here. `None` past the integers. What a repository's held cost a row is read from (C5's `R`,
+/// `slates_git::store::rows::held_bytes_per_object`).
+pub fn held_bytes_per_row(key_len: usize, contents: usize, payload_len: usize) -> Option<u64> {
+  let body = body_len(contents, payload_len)?;
+  let row = u64::try_from(row_len(key_len, body)?).ok()?;
+  row.checked_add(bytes_per_key_most())
+}
 
 /// Why the index refused a request. Each leaves the index and the store as they were, unless it says otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,6 +187,9 @@ pub struct IndexCounters {
 struct Fence {
   table: ContentId,
   first: Box<[u8]>,
+  /// The table's last key: with `first`, the keys it can hold, so a range walk reads a table only where its range meets
+  /// the walk's ([`Index::iter_range`]).
+  last: Box<[u8]>,
   rows: u64,
 }
 
@@ -247,6 +264,37 @@ impl Run {
       .flat_map(|table| table.iter());
     first_rows.chain(later)
   }
+
+  /// This run's rows whose keys are in `[start, end)`, in key order, reading only the tables whose keys can meet it: from
+  /// the first whose last key is not before `start` to the last whose first key is before `end` ([`Fence::last`]). The
+  /// first is opened only once a row is asked of it, so a run with no table in range is never read.
+  fn rows_range<'s>(
+    &'s self,
+    store: &'s ContentStore,
+    (start, end): (&[u8], &[u8]),
+  ) -> impl Iterator<Item = RowRef<'s>> + use<'s> {
+    let from = self
+      .fences
+      .partition_point(|fence| fence.last.as_ref() < start);
+    let to = self
+      .fences
+      .partition_point(|fence| fence.first.as_ref() < end)
+      .max(from);
+    let tables = self.fences.get(from..to).unwrap_or_default();
+    let start: Box<[u8]> = Box::from(start);
+    let first_rows = tables
+      .first()
+      .into_iter()
+      .filter_map(move |fence| view(store, &fence.table))
+      .flat_map(move |table| table.iter_from(&start));
+    let later = tables
+      .get(1..)
+      .unwrap_or_default()
+      .iter()
+      .filter_map(move |fence| view(store, &fence.table))
+      .flat_map(|table| table.iter());
+    first_rows.chain(later)
+  }
 }
 
 /// What one lookup visited: the tail and the runs, and of those runs the ones only this index holds.
@@ -277,11 +325,12 @@ struct FirstTable {
   kept_from: Option<Box<[u8]>>,
 }
 
-/// Rows cut into one table: its bytes, its first key and its rows.
+/// Rows cut into one table: its bytes, its first and last keys and its rows.
 #[derive(Debug)]
 struct Cut {
   bytes: Vec<u8>,
   first: Box<[u8]>,
+  last: Box<[u8]>,
   rows: u64,
 }
 
@@ -306,13 +355,13 @@ impl Merge {
   }
 
   /// Derived: the most one step puts into the content store ([`Index::merge_step`]), so the room a step is lent: one
-  /// table of at most the window and its fence's charge (its first key, a row's at most a window, and the fence's slot),
-  /// and the merged run's key filter, charged with its first table.
+  /// table of at most the window and its fence's charge (its first and last keys, each a row's at most a window, and the
+  /// fence's slot), and the merged run's key filter, charged with its first table.
   pub fn step_room(&self) -> u64 {
     let table = u64::try_from(self.window).unwrap_or(u64::MAX);
     let slot = u64::try_from(FENCE_SLOT_BYTES).unwrap_or(u64::MAX);
     table
-      .saturating_mul(2)
+      .saturating_mul(3)
       .saturating_add(slot)
       .saturating_add(self.filter_bytes)
   }
@@ -510,24 +559,29 @@ fn cut<'a>(
   let mut cuts = Vec::new();
   let mut builder = TableBuilder::new();
   let mut first: Option<Box<[u8]>> = None;
+  let mut last: Option<Box<[u8]>> = None;
   for row in rows {
     let bytes = row_bytes(row.key(), row.body()).ok_or(TableRefused::TooLarge)?;
     if !builder.is_empty() && builder.len().saturating_add(bytes) > window {
-      cuts.push(finish(take(&mut builder), first.take())?);
+      cuts.push(finish(take(&mut builder), (first.take(), last.take()))?);
     }
     if builder.is_empty() {
       first = Some(Box::from(row.key()));
     }
     builder.push(row.key(), row.body())?;
+    last = Some(Box::from(row.key()));
   }
   if !builder.is_empty() {
-    cuts.push(finish(builder, first)?);
+    cuts.push(finish(builder, (first, last))?);
   }
   Ok(cuts)
 }
 
 /// A table cut from rows: its cut, and its first key (none: no row was left).
 type OneTable = (Option<Cut>, Option<Box<[u8]>>);
+
+/// A table's first and last keys as its rows were pushed (none: no row pushed yet).
+type KeySpan = (Option<Box<[u8]>>, Option<Box<[u8]>>);
 
 /// The first table of `rows` (in key order) cut as [`cut`] cuts each, at most `window` bytes, and its last key; none when
 /// no row is left.
@@ -552,30 +606,38 @@ fn one_table<'a>(
   if builder.is_empty() {
     return Ok((None, None));
   }
-  Ok((Some(finish(builder, first)?), last))
+  Ok((Some(finish(builder, (first, last.clone()))?), last))
 }
 
-/// A finished table's cut.
-fn finish(builder: TableBuilder, first: Option<Box<[u8]>>) -> Result<Cut, IndexRefused> {
+/// A finished table's cut, its first and last keys.
+fn finish(builder: TableBuilder, (first, last): KeySpan) -> Result<Cut, IndexRefused> {
   let rows = builder.rows();
   Ok(Cut {
     bytes: builder.finish()?,
     first: first.unwrap_or_default(),
+    last: last.unwrap_or_default(),
     rows,
   })
 }
 
-/// What the fences of `cuts` charge: each first key and its slot.
+/// What one fence charges: its first and last keys and its slot.
+fn fence_charge(cut: &Cut) -> Result<u64, IndexRefused> {
+  cut
+    .first
+    .len()
+    .checked_add(cut.last.len())
+    .and_then(|bytes| bytes.checked_add(FENCE_SLOT_BYTES))
+    .and_then(|bytes| u64::try_from(bytes).ok())
+    .ok_or(TableRefused::TooLarge.into())
+}
+
+/// What the fences of `cuts` charge: each one's keys and its slot ([`fence_charge`]).
 fn fences_charge(cuts: &[Cut]) -> Result<u64, IndexRefused> {
   let mut charge: u64 = 0;
   for cut in cuts {
-    let bytes = cut
-      .first
-      .len()
-      .checked_add(FENCE_SLOT_BYTES)
-      .and_then(|bytes| u64::try_from(bytes).ok())
+    charge = charge
+      .checked_add(fence_charge(cut)?)
       .ok_or(TableRefused::TooLarge)?;
-    charge = charge.checked_add(bytes).ok_or(TableRefused::TooLarge)?;
   }
   Ok(charge)
 }
@@ -600,6 +662,7 @@ fn run_of(cuts: Vec<Cut>, stored: &[Stored], charged: u64, filter: KeyFilter) ->
     .map(|(cut, put)| Fence {
       table: put.identity,
       first: cut.first,
+      last: cut.last,
       rows: cut.rows,
     })
     .collect();
@@ -878,13 +941,7 @@ impl Index {
       self.sealed_whole();
       return Ok(true);
     };
-    let fence = table
-      .cut
-      .first
-      .len()
-      .checked_add(FENCE_SLOT_BYTES)
-      .and_then(|bytes| u64::try_from(bytes).ok())
-      .ok_or(TableRefused::TooLarge)?;
+    let fence = fence_charge(&table.cut)?;
     // The run's key filter, sized for the whole tail's rows, is charged with its first table (rows the tail takes in
     // meanwhile only raise its rate of a wrong yes, never make it say no to a key the run holds).
     let mut filter = match self.sealing {
@@ -930,6 +987,7 @@ impl Index {
       run.fences.push(Fence {
         table: put.identity,
         first: table.cut.first,
+        last: table.cut.last,
         rows,
       });
       run.rows = run.rows.saturating_add(rows);
@@ -955,7 +1013,7 @@ impl Index {
   /// in tables, and the first key past them; none for an empty tail.
   fn first_table(&self, window: usize) -> Result<Option<FirstTable>, IndexRefused> {
     let mut builder = TableBuilder::new();
-    let mut first: Option<Box<[u8]>> = None;
+    let (mut first, mut last): KeySpan = (None, None);
     let (mut discharged, mut bytes) = (0_u64, 0_usize);
     let mut kept_from = None;
     for row in tail_rows(&self.tail) {
@@ -968,6 +1026,7 @@ impl Index {
         first = Some(Box::from(row.key()));
       }
       builder.push(row.key(), row.body())?;
+      last = Some(Box::from(row.key()));
       discharged = discharged.saturating_add(tail_cost(row.key(), row.body())?);
       bytes = bytes.saturating_add(row_len);
     }
@@ -975,7 +1034,7 @@ impl Index {
       return Ok(None);
     }
     Ok(Some(FirstTable {
-      cut: finish(builder, first)?,
+      cut: finish(builder, (first, last))?,
       discharged,
       bytes,
       kept_from,
@@ -1312,6 +1371,7 @@ impl Index {
     work.fences.push(Fence {
       table: put.identity,
       first: cut.first,
+      last: cut.last,
       rows: cut.rows,
     });
     work.rows = work.rows.saturating_add(cut.rows);
@@ -1462,17 +1522,17 @@ impl Index {
   }
 
   /// Derived: the most a fork of this index could charge the store as it is made ([`Index::fork`]): its tail sealed into
-  /// tables (the rows' bytes, a frame and a fence a table, held beside the tail they replace until it is given back) and
-  /// every run's fences copied.
+  /// tables (the rows' bytes, a frame and a fence a table, the fences' first and last keys at most the rows' bytes once
+  /// more, held beside the tail they replace until it is given back) and every run's fences copied.
   pub fn fork_room(&self) -> u64 {
     let fences = self.runs.iter().fold(0_u64, |charged, run| {
       charged.saturating_add(run.charged.saturating_sub(run.filter.bytes()))
     });
-    let tail = self
-      .tail_bytes
-      .saturating_add(TABLE_FRAME_BYTES)
-      .saturating_add(FENCE_SLOT_BYTES)
-      .saturating_mul(2);
+    let tail = self.tail_bytes.saturating_mul(3).saturating_add(
+      TABLE_FRAME_BYTES
+        .saturating_add(FENCE_SLOT_BYTES)
+        .saturating_mul(2),
+    );
     fences.saturating_add(u64::try_from(tail).unwrap_or(u64::MAX))
   }
 
@@ -1565,6 +1625,37 @@ impl Index {
       sources.push(rows.peekable());
     }
     Merged { sources }
+  }
+
+  /// Every row whose key is in `[start, end)`, in key order: [`Index::iter_from`] bounded at `end`, which reads a run's
+  /// table only where its keys can meet the range (each fence's first and last keys), so a run that holds no key in it
+  /// is never opened. LevelDB's version set keeps each table's smallest and largest key for the same end: a seek opens
+  /// only the tables that overlap it (goal 93, hg's whole-history gap: a stream's walk of one log opened the first table
+  /// of every run, about 23 a walk on a sealed history of 1,200 revisions).
+  pub fn iter_range<'s>(
+    &'s self,
+    store: &'s ContentStore,
+    (start, end): (&[u8], &[u8]),
+  ) -> impl Iterator<Item = RowRef<'s>> + use<'s> {
+    // An empty range reads nothing; `BTreeMap::range` would refuse one whose start passes its end.
+    let tail: Box<dyn Iterator<Item = RowRef<'s>> + 's> = if start < end {
+      Box::new(
+        self
+          .tail
+          .range::<[u8], _>((Bound::Included(start), Bound::Excluded(end)))
+          .filter_map(|(key, body)| RowRef::new(key, body)),
+      )
+    } else {
+      Box::new(core::iter::empty())
+    };
+    let mut sources: Vec<Source<'s>> = vec![tail.peekable()];
+    for run in &self.runs {
+      let rows: Box<dyn Iterator<Item = RowRef<'s>> + 's> =
+        Box::new(run.rows_range(store, (start, end)));
+      sources.push(rows.peekable());
+    }
+    let end: Box<[u8]> = Box::from(end);
+    Merged { sources }.take_while(move |row| row.key() < end.as_ref())
   }
 
   /// The rows the index holds.

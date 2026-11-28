@@ -382,6 +382,156 @@ mod tests {
     assert_eq!(unrecovered, Some(crate::vcs_store::ReplayRefused::Unlanded));
   }
 
+  /// A git repository `name`, its default `main`, as these tests create it on a partition of their choosing.
+  fn git_named(name: &str) -> crate::test_store::Asked<'_> {
+    (
+      name,
+      slates_ipc::protocol::VcsTool::Git,
+      slates_ipc::protocol::ObjectFormat::Sha1,
+      "main",
+    )
+  }
+
+  /// Repository `id`'s last record's names, by their content identity (`vcs_store::record::Record::named`).
+  fn names_of(state: &ShardState, id: RepositoryId) -> Option<slates_vcs::ContentId> {
+    let records = crate::vcs_store::tests::records(state, id);
+    let last = records.last()?;
+    let record =
+      crate::vcs_store::record::Record::decode(last, slates_git::object_name::ObjectFormat::Sha1)
+        .ok()?;
+    record.named.map(|(identity, _)| identity)
+  }
+
+  /// The partition of a two-shard node holding a store whose shard is the region home of the fixtures' first push's
+  /// names (`homes::home_of`, by the names' identity, so the same for every repository that push is made to), and the
+  /// other: learned on a daemon of its own, so the test's daemon holds those names on the home's shard alone.
+  fn names_home_and_other() -> (usize, usize) {
+    let (_store, daemon) = crate::test_store::audit_daemon_of_stored(2);
+    let owner = crate::git_push::tests::owner();
+    let (probe, _) = crate::test_store::create_on(&daemon, 0, &owner, git_named("probe"));
+    let home = crate::test_store::run_at(
+      &daemon,
+      0,
+      move || async move {
+        let [(scenario, _), ..] = crate::git_push::tests::chain();
+        let _ = crate::git_push::tests::pushed_awaited(probe, scenario.request).await;
+        crate::git_push::tests::on_state(|state| {
+          let home = crate::vcs_store::homes::home_of(&state.shards, &names_of(state, probe)?)?;
+          state.shards.iter().position(|shard| *shard == home)
+        })
+      },
+      crate::test_store::HISTORY_PATIENCE,
+    );
+    daemon.stop();
+    let home = home.expect("the names' home");
+    (home, 1 - home)
+  }
+
+  /// C4 of w-git's close list (main 01a20182's order of 2026-11-27 18:44: the region-homes read, a read path without a
+  /// test of its own). A store made from records the node's store holds no changeset of (a holder's replica, whose
+  /// node's store holds none of its owner's pushes; GAPS (d)) reads each record's names from their region home
+  /// (`vcs_store::names_fetched_for_rebuild`, `homes::read_in_region`) where its shard's content store lacks them. Do:
+  /// on a two-shard node holding a store, push the fixtures' first push to repository A on the shard homing its names
+  /// ([`names_home_and_other`]); on the other shard, begin a replica store of repository B from A's records, whose
+  /// changesets the node's store holds none of under B, that shard's content store holding none of A's names; await
+  /// its rebuild. Expect: the names absent there before; B's store made, none unrecovered; its changeset read refused
+  /// and counted (`vcs_store.changeset_unread`); the names read from their home (`vcs_store.names_fetched` > 0, none
+  /// unfetched); and B's every row A's.
+  #[test]
+  fn a_replica_reads_the_names_its_node_lacks_from_their_region_home() {
+    let (home, other) = names_home_and_other();
+    let (_store, daemon) = crate::test_store::audit_daemon_of_stored(2);
+    let owner = crate::git_push::tests::owner();
+    let (a, _) = crate::test_store::create_on(&daemon, home, &owner, git_named("holder"));
+    let (b, _) = crate::test_store::create_on(&daemon, other, &owner, git_named("replica"));
+    let (parts, names, rows_a) = crate::test_store::run_at(
+      &daemon,
+      home,
+      move || async move {
+        let [(scenario, _), ..] = crate::git_push::tests::chain();
+        let _ = crate::git_push::tests::pushed_awaited(a, scenario.request).await;
+        crate::git_push::tests::on_state(|state| {
+          let rows = state
+            .vcs_stores
+            .git_ref(a)
+            .map(|(content, git)| rows_of(content, &git.repository));
+          (state.db.take_state_log_records(), names_of(state, a), rows)
+        })
+      },
+      crate::test_store::HISTORY_PATIENCE,
+    );
+    let names = names.expect("A's names");
+    let records = records_of(&parts);
+    let seen = crate::test_store::run_at(
+      &daemon,
+      other,
+      move || async move {
+        use crate::git_push::tests::on_state;
+        let absent = on_state(|state| {
+          !state
+            .vcs_stores
+            .content()
+            .is_some_and(|content| content.contains(&names))
+        });
+        let begun = on_state(|state| {
+          let record = state
+            .db
+            .partition()
+            .repositories()
+            .repository(b)
+            .cloned()
+            .expect("B");
+          // B's own store as its creation made it given up, so its store is the replica made from A's records.
+          crate::vcs_store::free(state, b);
+          begin(state, &record, records)
+        });
+        crate::vcs_store::rebuilt(b).await;
+        on_state(|state| {
+          let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+          (
+            absent,
+            begun,
+            state.vcs_stores.unrecovered(b).cloned(),
+            (
+              count(crate::vcs_store::CHANGESET_UNREAD) > 0,
+              count(crate::vcs_store::NAMES_FETCHED) > 0,
+              count(crate::vcs_store::NAMES_UNFETCHED),
+            ),
+            state
+              .vcs_stores
+              .git_ref(b)
+              .map(|(content, git)| rows_of(content, &git.repository)),
+          )
+        })
+      },
+      crate::test_store::HISTORY_PATIENCE,
+    );
+    daemon.stop();
+    let (absent, begun, unrecovered, counted, rows_b) = seen;
+    assert!(absent, "the names absent from B's shard before");
+    assert_eq!((begun, unrecovered), (Ok(true), None), "B's store made");
+    assert_eq!(
+      counted,
+      (true, true, 0),
+      "the changeset unread, the names read from their home"
+    );
+    assert_eq!(rows_b, rows_a, "B's rows A's");
+  }
+
+  /// Every position's id and row of `repository` in `content`.
+  fn rows_of(
+    content: &slates_vcs::ContentStore,
+    repository: &slates_git::store::Repository,
+  ) -> Vec<(ObjectId, Option<ObjectRow>)> {
+    let mut rows = Vec::new();
+    let mut position = 0u64;
+    while let Some(id) = repository.id_at(content, position) {
+      rows.push((id, repository.object(content, &id)));
+      position += 1;
+    }
+    rows
+  }
+
   /// Main 01a20182's ruling of 2026-11-27 05:52 and 06:00 ((d)'s second standing defect; CLAUDE.md §2 item 8: no
   /// unbounded retry; a holder's replica store was begun again about 8,000 times in one fleet test, each replay refused
   /// the same way). Do: begin a replica store of a repository from records that are not push records, so its replay is

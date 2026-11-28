@@ -54,10 +54,25 @@ pub const TABLE_FRAME_BYTES: usize = HEADER_BYTES + WORD_BYTES;
 /// The bytes a row of `key` and `body` takes in a table: its offset, its key's length, its key and its body; `None` past
 /// the integers. A table of rows is [`TABLE_FRAME_BYTES`] plus each row's.
 pub fn row_bytes(key: &[u8], body: &[u8]) -> Option<usize> {
+  row_len(key.len(), body.len())
+}
+
+/// The bytes a row of a `key_len`-byte key and a `body_len`-byte body takes in a table ([`row_bytes`] by lengths
+/// alone); `None` past the integers.
+pub fn row_len(key_len: usize, body_len: usize) -> Option<usize> {
   WORD_BYTES
     .checked_add(KEY_LENGTH_BYTES)?
-    .checked_add(key.len())?
-    .checked_add(body.len())
+    .checked_add(key_len)?
+    .checked_add(body_len)
+}
+
+/// The bytes of the body of a row naming `contents` contents with a `payload_len`-byte payload ([`encode_body`]'s
+/// length): the contents' count, each content's identity, the payload; `None` past the integers.
+pub fn body_len(contents: usize, payload_len: usize) -> Option<usize> {
+  contents
+    .checked_mul(IDENTITY_BYTES)?
+    .checked_add(COUNT_BYTES)?
+    .checked_add(payload_len)
 }
 
 /// Why bytes are not a table, or why a row cannot be written into one.
@@ -139,12 +154,7 @@ impl<'a> RowRef<'a> {
 /// The body of a row naming `contents` with `payload`.
 pub fn encode_body(contents: &[ContentId], payload: &[u8]) -> Result<Vec<u8>, TableRefused> {
   let count = u8::try_from(contents.len()).map_err(|_| TableRefused::TooManyContents)?;
-  let len = contents
-    .len()
-    .checked_mul(IDENTITY_BYTES)
-    .and_then(|bytes| bytes.checked_add(COUNT_BYTES))
-    .and_then(|bytes| bytes.checked_add(payload.len()))
-    .ok_or(TableRefused::TooLarge)?;
+  let len = body_len(contents.len(), payload.len()).ok_or(TableRefused::TooLarge)?;
   let mut body = Vec::with_capacity(len);
   body.push(count);
   for content in contents {

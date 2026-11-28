@@ -405,6 +405,91 @@ fn commit_row() -> ObjectRow {
   }
 }
 
+/// Shape: the objects whose rows [`an_objects_rows_hold_at_most_r_in_a_real_index_and_more_than_half_of_it`] inserts:
+/// enough tables for their fences and frames to count as they do in a repository.
+const R_OBJECTS: u64 = 20_000;
+
+/// Shape: that test's window: tables of tens of rows' worth and more, as a store's derived window gives (a window of a
+/// few rows makes each table's fence and frame a row's share, which no repository's index pays).
+const R_WINDOW: usize = 1 << 16;
+
+/// C5's `R` (main's ruling B of 2026-11-26 and of 2026-11-27 07:02: a row's held cost from the index's own layout, held
+/// to a real index). Do: put one pack's bytes; insert into a fresh index the object and position rows of
+/// [`R_OBJECTS`] objects as a landing writes them, each an in-pack row naming that pack, every fourth a commit of two
+/// parents, sealing as the tail fills and at the end; read the store's bytes used before and after. Expect: `R` the
+/// figure its derivation states for each format; the index's growth at most `objects × R` and more than half of it, so
+/// `R` bounds what a landed object's rows hold and is not slack.
+#[test]
+fn an_objects_rows_hold_at_most_r_in_a_real_index_and_more_than_half_of_it() {
+  assert_eq!(
+    (
+      rows::held_bytes_per_object(ObjectFormat::Sha1),
+      rows::held_bytes_per_object(ObjectFormat::Sha256)
+    ),
+    (205, 229),
+    "R as its derivation states"
+  );
+  let format = ObjectFormat::Sha1;
+  let mut store = ContentStore::new(BUDGET, R_WINDOW).unwrap();
+  let pack = store.put_object(&[7; 4096]).unwrap();
+  let mut index = slates_vcs::Index::new();
+  let before = store.used();
+  for position in 0..R_OBJECTS {
+    let id = name_of(format, Kind::Blob, &position.to_le_bytes()).unwrap();
+    let commit = position.is_multiple_of(4).then(|| CommitRow {
+      tree: position,
+      date: position,
+      generation: position,
+      parents: vec![position, position],
+    });
+    let row = ObjectRow {
+      kind: if commit.is_some() {
+        Kind::Commit
+      } else {
+        Kind::Blob
+      },
+      len: 1 << 12,
+      position,
+      pack: Some(rows::PackedRow {
+        offset: position,
+        len: 1 << 10,
+        crc: 0,
+        base: None,
+      }),
+      commit,
+    };
+    let (object, payload) = (rows::object_key(&id), rows::encode(&row));
+    let at = rows::position_key(position);
+    for (key, contents, payload) in [
+      (&object[..], &[pack][..], &payload[..]),
+      (&at[..], &[][..], id.as_bytes()),
+    ] {
+      index
+        .insert(
+          &mut store,
+          slates_vcs::NewRow {
+            key,
+            contents,
+            payload,
+          },
+        )
+        .unwrap();
+    }
+    if index.seal_due(&store) {
+      index.seal(&mut store).unwrap();
+    }
+  }
+  index.seal_all(&mut store).unwrap();
+  let grown = store.used() - before;
+  let bound = R_OBJECTS * rows::held_bytes_per_object(format);
+  eprintln!(
+    "R {}: {R_OBJECTS} objects' rows hold {grown} bytes, the bound {bound}",
+    bound / R_OBJECTS
+  );
+  assert!(grown <= bound, "{grown} bytes past {bound}");
+  assert!(grown > bound / 2, "{grown} bytes, R slack against {bound}");
+}
+
 /// A-614, §4.17.2 item 2. Do: write a blob's row and a commit's, read them back, and read hostile payloads: cut, an
 /// unknown type, a byte left over, a commit's part after a blob's type; then order keys. Expect: each row as written;
 /// every hostile payload refused; every object row's key before every position row's, and position rows in order.

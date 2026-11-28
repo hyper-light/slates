@@ -171,6 +171,17 @@ pub(crate) mod test_store;
 pub fn chunk_window_storage(page: usize) -> Box<dyn slates_vcs::WindowStorage> {
   Box::new(vcs_store::arena_windows::ChunkWindows::new(page))
 }
+/// Derived: the most bytes a landed git object holds on its repository's shard by its rows (C5's `R`, main's ruling B
+/// of 2026-11-26): its object and position rows in the index (`slates_git::store::rows::held_bytes_per_object`) and its
+/// name in its push's names (`vcs_store::record_names::NAME_BYTES`, 41 bytes). For SHA-1, 246 bytes; SHA-256, 270; none
+/// for a format git does not name. Public for the git server's memory test (`crates/cli/tests/git_interop.rs`), whose
+/// held bound is `2N + O × R + W`; by the catalog's format, which that test's crate already names.
+pub fn git_held_bytes_per_object(format: slates_db::catalog::ObjectFormat) -> Option<u64> {
+  let name = u64::try_from(vcs_store::record_names::NAME_BYTES).unwrap_or(u64::MAX);
+  vcs_store::git_format(format)
+    .map(|format| slates_git::store::rows::held_bytes_per_object(format).saturating_add(name))
+}
+
 mod work_charge;
 pub mod work_files;
 mod work_log;
@@ -324,7 +335,7 @@ pub mod xshard;
 pub use config::{BootFault, BootFaultKind, DaemonConfig, DurabilityBound, FleetMembership};
 pub use daemon::{
   Daemon, DrainReport, HeldRecordView, HomingWindowReading, LeadershipHandoff, LinkAfter,
-  SegmentSource, SessionHold,
+  RepairWindowHolders, SegmentSource, SessionHold,
 };
 pub use deploy::{DeployError, FleetManifest, FleetNodeEntry, FleetPlan, NodeAddress};
 pub use dns::Resolver;

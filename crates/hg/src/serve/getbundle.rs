@@ -738,6 +738,7 @@ fn streamed_step(
   out: &mut Vec<u8>,
 ) -> Result<bool, Refusal> {
   let (index, content) = store.revlogs().ok_or(Refusal::Store { what: "a revlog" })?;
+  stream.set_step_bytes(store.text_bytes_a_step());
   if let Some(written) = head.as_mut() {
     match stream.counted() {
       crate::render::Counted::Counting => {

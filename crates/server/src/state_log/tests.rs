@@ -138,8 +138,9 @@ fn a_holder_holds_a_part_only_where_it_continues_its_copy_of_its_log() {
 /// first two parts' bytes; acknowledge the first names part by one of two remote candidates, then by both; then the
 /// phases part by every candidate, and let go of what a laptop's log (no remote candidate) holds. Expect: room before
 /// the second part and none after it; nothing let go while one candidate lacks the part; the first part let go, its
-/// bytes with it, once both hold it, the second still owed to both; the phases log forgotten once held everywhere; and
-/// nothing kept for no remote candidate.
+/// bytes with it, once both hold it, the second still owed to both; the phases log's one part kept once held everywhere,
+/// its newest (A-934: a candidate a change brings in is shipped it, and a settle counts who holds it); and nothing kept
+/// for no remote candidate.
 #[test]
 fn an_owner_keeps_each_part_until_every_candidate_holds_it_and_counts_its_bytes() {
   let repo = repository(9);
@@ -167,10 +168,18 @@ fn an_owner_keeps_each_part_until_every_candidate_holds_it_and_counts_its_bytes(
   assert_eq!(logs.bytes(), value_of(&two).len() + value_of(&phases).len());
   logs.acknowledged(phases_register, 1, &[b, c]);
   logs.let_go_held(phases_register, &[b, c]);
-  assert!(owed_positions(&logs, phases_register).is_empty());
+  assert_eq!(
+    owed_positions(&logs, phases_register),
+    vec![1],
+    "the newest part kept"
+  );
   logs.let_go_held(names_register, &[]);
   assert!(owed_positions(&logs, names_register).is_empty());
-  assert_eq!(logs.bytes(), 0, "a laptop keeps nothing");
+  assert_eq!(
+    logs.bytes(),
+    value_of(&phases).len(),
+    "a laptop's log keeps nothing; the phases log its newest part"
+  );
 }
 
 /// The positions `register`'s parts are owed at, in order.
@@ -378,8 +387,9 @@ fn a_part_let_go_before_any_publication_carried_it_leaves_no_change() {
 
 /// A-919 (C): an owner's committed floor rises over the parts it lets go, in order, each continuing the chain from the
 /// log's start, the digest one link a part over its register value, and is marked changed for the next delta. Do: hold
-/// names parts 0..2 and 2..3; both candidates acknowledge through 2, then through 3. Expect the floor at 2 with
-/// `H(0^32 || part one)`, then at 3 with the next link, each time marked changed; a publication clears the mark.
+/// names parts 0..2 and 2..3; both candidates acknowledge through 2, then through 3; then hold 3..4 and both acknowledge
+/// it. Expect the floor at 2 with `H(0^32 || part one)`, marked changed (a publication clears the mark); still at 2 once
+/// 3 is held everywhere, the log's newest part kept (A-934); then at 3 with the next link once 4 is.
 #[test]
 fn an_owners_committed_floor_rises_over_the_parts_it_lets_go_with_the_chains_digest() {
   use slates_db::register::{CHAIN_BASE, CommittedFloor, chain_digest};
@@ -411,6 +421,14 @@ fn an_owners_committed_floor_rises_over_the_parts_it_lets_go_with_the_chains_dig
   );
   logs.clear_changed();
   logs.acknowledged(register, 3, &[b, c]);
+  logs.let_go_held(register, &[b, c]);
+  assert_eq!(
+    logs.floor(register).map(|floor| floor.position),
+    Some(2),
+    "the newest part kept"
+  );
+  logs.hold(&part(repo, StateLog::Names, (3, 4)));
+  logs.acknowledged(register, 4, &[b, c]);
   logs.let_go_held(register, &[b, c]);
   assert_eq!(
     logs.floor(register),
@@ -468,4 +486,44 @@ fn a_part_at_or_below_its_logs_floor_is_refused() {
     logs.hold(&part(repo, StateLog::Names, (2, 3))),
     "the next position"
   );
+}
+
+/// A-934, the bound: a log kept for its newest part alone is one [`forget_unheld`] may forget once its repository is no
+/// longer held here, and only once every remote candidate holds that part, so a repository's last change still reaches
+/// its holders. Do: hold a names part and a phases part; both candidates acknowledge the names part, one the phases part;
+/// let both go, then forget each log [`StateLogs::held_everywhere`] names. Expect only the names log named, both parts
+/// kept by the let-go (each its log's newest), and the names part's bytes gone with its log.
+#[test]
+fn a_log_kept_for_its_newest_part_is_forgettable_only_once_every_candidate_holds_it() {
+  let repo = repository(14);
+  let (names, phases) = (
+    part(repo, StateLog::Names, (0, 1)),
+    part(repo, StateLog::Phases, (0, 1)),
+  );
+  let (names_register, phases_register) =
+    (names.log_name().register(), phases.log_name().register());
+  let (b, c) = (HostId(2), HostId(3));
+  let mut logs = StateLogs::default();
+  logs.hold(&names);
+  logs.hold(&phases);
+  logs.acknowledged(names_register, 1, &[b, c]);
+  logs.acknowledged(phases_register, 1, &[b]);
+  logs.let_go_held(names_register, &[b, c]);
+  logs.let_go_held(phases_register, &[b, c]);
+  assert_eq!(
+    logs.parts_past_newest(),
+    0,
+    "each log keeps its newest part"
+  );
+  let forgettable: Vec<ObjectId> = logs.held_everywhere(|_| vec![b, c]).collect();
+  assert_eq!(
+    forgettable,
+    vec![names_register],
+    "the phases part still owed to c"
+  );
+  for register in forgettable {
+    logs.forget(register);
+  }
+  assert!(owed_positions(&logs, names_register).is_empty());
+  assert_eq!(logs.bytes(), value_of(&phases).len());
 }
