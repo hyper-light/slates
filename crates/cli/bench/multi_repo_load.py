@@ -273,8 +273,11 @@ async def burst(
 
 
 # Format: the daemon's counters a step reports (A-724: where a starved push waits on the server): the HTTP edge's seats,
-# arrivals, overdue marks and reaps, and the share model's own.
-WATCHED_COUNTERS = re.compile(r"vcs_http|seat|arriv|overdue|reap|vcs_share|lane|turn|mem\.large")
+# arrivals, overdue marks and reaps, and the share model's own; and the owners' push judging and landing steps (A-658
+# 3c's measure: `git_push.judge_ns`, its most, `repository.push.landing_step_*`).
+WATCHED_COUNTERS = re.compile(
+    r"vcs_http|seat|arriv|overdue|reap|vcs_share|lane|turn|mem\.large|git_push\.judge|repository\.push\.landing_step"
+)
 
 
 def counters(daemon: Daemon) -> dict[str, int]:
@@ -518,6 +521,10 @@ def main():
                 print(f"  daemon's last words: {line[:300]}", flush=True)
         if seen:
             print("  counters: " + ", ".join(f"{k}={v}" for k, v in sorted(seen.items())), flush=True)
+        # A-658 3c's measure (main 01a20182's ruling of 2026-11-27 22:48): the pushes' answer times summed, beside the
+        # owners' judging (`git_push.judge_ns` above), so a step says what share of a push's time its verdicts took.
+        answered = sum(seconds for _, seconds, words in results if words == "ok")
+        print(f"  pushes' answer times summed: {answered:.3f} s", flush=True)
         print(f"R={repositories}: {total} pushes, wall {wall:.3f} s, rss {before / 1024:.0f} -> peak {peak / 1024:.0f} MiB, "
               f"refused {refused}, daemon {'alive' if alive else 'GONE'}", flush=True)
         # The fair-share ideal of each push: its repository's finish under processor sharing of the daemon's shards,
