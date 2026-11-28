@@ -863,3 +863,9 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - a921 closed (winfleet-7 32/32 both lanes; GAPS 89d56d639).
 - 3c: six-guard staging red written (uncommitted, lands with its fix). Classification table sent; main approved U0 -> U1 -> ... with split vs w-svn.
 - U0 (every read names its version: head_bound_tests) and U1 (head bump + accepted at publish_run; mode_history marks: publish_tests) green: merge lib 319, engine+changed_since_cost 50. Land after unit 1 (~02:15). Patch: ~/.local/state/w-shared/logs/a752-3c-u0-u1-wip.patch
+
+## 2026-11-28 03:10 PST: A-752 3c U0-U5 landed
+- 7a151f975: U0 (reads name their version) dc620e32b, U1 (head at publish, mode history) d5ee539c2, U2 (value histories) 1abd9836e, U3 (change index) b84612084, U4 (last-change maps aside, write-only Aside) 14781afdf; each built alone.
+- f50661a99: U5 (identity marks aside + drain-first) 3255f5458.
+- Six-guard staging red still uncommitted in my tree (patch ~/.local/state/w-shared/logs/a752-3c-red-tracked.patch + staging_tests.rs copy).
+- Owed: Dims fork (8 current maps; deletes drain-first), scalars at publish, content history with held chunks, wiring into repository::push.
