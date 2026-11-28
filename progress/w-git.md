@@ -918,3 +918,8 @@
   store as it was, every point held by A-614's oracle. Found: the stage's fork was dropped holding its tables on a
   refusal before adoption (397 bytes), now given back. NEXT, P2 in order: landed_runs over a several-move push's
   positions; the release's per-object map drops; a stale restage; then the clone's window peak; then P1 (bisect first).
+- 11-27 21:39 PST: LANDED P2 piece 2 (A-722 part 4i) d994aedeb, on main as 9b44036d0: a landing of several moves maps none of its
+  positions in its step (599 before). Its moves' brought sets are recorded; the shard's task maps them a slice a turn.
+  Earlier: main's lint fix b5ea7ecee took my two lib warnings; diag branch agents/w-git-p2-diag (f651a0913) plus
+  ~/.local/state/w-git-logs/v150.request for main's v4 part A A/B (~21:30). NEXT: P2 piece 3, the release's per-object
+  map drops; then the stale restage; then main's TSan turn-bound test; then the clone's window peak; then P1.
