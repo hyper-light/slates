@@ -3482,8 +3482,11 @@
 > records alone (one move over 1,000 greens of 20 versions: 3 records read, 22,021 before), its versions pushed and
 > its heads moved in place after its stage's adoption, the charge trued up to its whole recomputation; a commit refused
 > after its plan leaves the store as it was (found: the stage's fork was dropped holding its tables, 397 bytes a
-> refusal), held at every point by the store's oracle. OWED, each its own piece: `landed_runs` over a several-move
-> push's positions; the release's drops of the push's placed and positions maps; a stale stage restaged whole.
+> refusal), held at every point by the store's oracle. Piece 2 BUILT (A-722 part 4i): a landing of several moves
+> maps none of its positions in its step (599 before), its moves' brought sets recorded and mapped by the shard's task a
+> slice a turn. OWED, each its own piece: the release's drops of the push's placed and positions maps; a stale stage
+> restaged whole (with a stale stage's members positioned by id); a replayed store's landings of several moves mapped
+> before its next live commit.
 >
 > **A-722 part 4e (2026-11-20, w-git).** BUILT: an overtaken stage made again in the judge's turns; a stage giving no
 > position never overtaken; `Judge::ready` asked for every unrefused command (part 4c's turns now run live). Owed: the

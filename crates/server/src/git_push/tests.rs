@@ -749,6 +749,45 @@ fn t_a654_a_push_with_atomic_is_all_or_none_and_without_it_a_ref_at_a_time() {
   });
 }
 
+/// Shape: the turns the test yields at most while the shard's task maps a landing: far past the few its quantum needs.
+const MAPPING_TURNS: u32 = 10_000;
+
+/// P2 piece 2 (CLAUDE.md §3: a step over user-scaled data is bounded; the landing map, `Repository::bringer_of`). Do:
+/// push the fixtures' `create` pack with `atomic`, making `main` and `other` at its commit in one landing. Expect: both
+/// `ok`; the landing left to be mapped after its step, then mapped by the shard's task in its own turns (none left
+/// unsettled, the store's `landing_mapped` moved), its task's slot given back.
+#[test]
+fn a_landing_of_several_refs_is_mapped_by_the_shards_task_after_its_step() {
+  on_stored_shard_awaited(["settle"], |[repository]| async move {
+    let created = scenario!("create").request;
+    let pack = &created[created.windows(4).position(|four| four == b"PACK").unwrap()..];
+    let both = [
+      ("", FIRST, b"refs/heads/main".as_slice()),
+      ("", FIRST, b"refs/heads/other".as_slice()),
+    ];
+    let received = pushed_awaited(repository, &request(&both, ATOMIC, pack)).await;
+    assert_eq!(reasons(&received), [b"ok", b"ok"]);
+    let settled = |state: &mut ShardState| {
+      let store = state.vcs_stores.git_ref(repository).map(|(_, store)| store);
+      store.map(|store| {
+        (
+          store.repository.landings_unsettled(),
+          store.repository.counters().landing_mapped,
+        )
+      })
+    };
+    let mut turns = 0;
+    while on_state(settled).is_some_and(|(unsettled, _)| unsettled) {
+      turns += 1;
+      assert!(turns < MAPPING_TURNS, "the landing was never mapped");
+      slates_rt::futures::yield_now().await;
+    }
+    let (_, mapped) = on_state(settled).unwrap();
+    assert!(mapped > 0, "the task mapped no position");
+    assert!(on_state(|state| !state.vcs_stores.settles(repository)));
+  });
+}
+
 /// Format: the ref the atomic test's fixtures push as `copy`.
 const COPY_REF: &[u8] = b"refs/heads/copy";
 /// Format: the tag the atomic test's fixtures push.

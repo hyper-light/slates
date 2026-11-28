@@ -57050,6 +57050,32 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   made durable, `Unanswered`: Subversion's commit path, which this change does not touch); fmt clean (macOS arm64,
   this Mac, local).
 
+### A-722 part 4i — A landing of several moves is mapped by position after its step, a slice a turn (P2 piece 2, 2026-11-27, w-git; main 01a20182's order of 18:44)
+- **Why.** The landing map names the green and version that brought each position (A-722, `Repository::bringer_of`:
+  a fetch's offers and a hook view's bringer read it). A commit of several moves (an atomic push, a first push of
+  many refs) built it in its step. It filled a slot for each position the stage gave, from each move's brought set,
+  then joined them into runs. That is a walk of the push's objects in the landing step (CLAUDE.md §3), and, as the
+  objects are positioned by type and then id, as many runs as objects in the worst case. One push of 599 commits
+  fast-forwarding two greens mapped all 599 in its step (`StoreCounters::landing_mapped`, new).
+- **Change.** The map keeps one entry a landing, keyed by its first position (`Landed`). A landing of one move is one
+  run, as before. A landing of several is recorded as its commit leaves it: each move's brought set, taken from its
+  plan, whose value is already put and which nothing reads after, in the moves' order. A position none of them holds
+  goes to the first move, A-722's rule. That is O(moves) in the step and copies no set. A look-up reads the first set
+  that holds the position, until the shard's task (`vcs_store::settle_landings_sliced`, started by the commit) maps
+  the landing a position a unit under the step quantum (`Repository::settle_landings_turn`). The task then puts its
+  runs in place, the store's charge moved from the sets' bytes to the runs', the room lent for them
+  (`settle_room`). A refused charge leaves the landing answered by its sets for the next commit's task, counted
+  `vcs_store.landings.settle_refused`.
+- **Tests.** `slates-git` `store::tests::commit_walk::a_landing_of_several_moves_maps_none_of_its_positions_in_its_step`
+  (599 commits, two greens: 0 positions mapped in the step, red 599; every bringer as the line says before and after
+  the turns; all 599 mapped in more than one turn; the store empty once released). The refusal oracle's two-move push
+  holds the unsettled landing to its pre-commit state at every point. `slates-server`
+  `git_push::tests::a_landing_of_several_refs_is_mapped_by_the_shards_task_after_its_step` (an atomic two-ref create:
+  mapped by the task after its step, its slot given back; red with the task not started: never mapped).
+- **Owed.** A store made again from its records (a replay, a recovery) maps its landings of several moves only when
+  its next live commit starts the task; until then its look-ups read the sets. A move with no sets planned whose
+  stage went stale has its members positioned by id in the step, with the stale restage's piece.
+
 ### A-722 part 4h — A commit reads and charges its own greens' records alone (P2, 2026-11-27, w-git; main 01a20182's order of 18:44 and its condition of 19:22)
 - **Why.** CLAUDE.md §3 (bounded work): a push's landing step ran `Repository::commit` with passes that grew with the
   repository's life, not the push. Its charge summed every chain of every green (`footprint`, each chain's kept

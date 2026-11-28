@@ -353,6 +353,9 @@ pub(crate) struct VcsStores {
   /// Landed packs being let go a slice of windows a turn ([`LettingGo`]), and whether the task that turns them runs:
   /// bounded by the packs owed a let-go.
   letting_go: (std::collections::VecDeque<LettingGo>, bool),
+  /// The git repositories whose landings of several moves a task maps by position now ([`settle_landings_sliced`]):
+  /// bounded by the partition's repositories.
+  settling_landings: std::collections::BTreeSet<RepositoryId>,
   /// Each git repository's version being encoded as its fragments, between its turns ([`git_encode`], A-718): one a
   /// repository, so bounded by the partition's repositories.
   encodings: git_encode::Encodings,
@@ -2765,6 +2768,7 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   })?;
   sealed.objects = RecordWriter::default();
   sealed.homed_committed();
+  settle_landings_sliced(state, repository);
   // A synchronous audit shard's history can bring nothing back (a bring-back awaits the node's store), so its landed
   // packs stay resident ([`KEEP_LANDED`]); a daemon's edges and tasks, and every let-go test, let them go.
   #[cfg(test)]
@@ -2789,6 +2793,82 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   }
   Ok(())
 }
+
+/// Starts the task that maps repository `id`'s landings of several moves by position a slice a turn
+/// ([`slates_git::store::Repository::settle_landings_turn`], P2 piece 2), where it has any and no task maps them yet:
+/// never in the landing's step, whose commit records each move's brought set and maps no position. Unspawned, counted
+/// [`LANDINGS_UNSETTLED_UNSPAWNED`], they wait for the repository's next commit to start one; meanwhile a look-up reads
+/// the moves' sets.
+fn settle_landings_sliced(state: &mut ShardState, id: RepositoryId) {
+  let unsettled = state
+    .vcs_stores
+    .git_ref(id)
+    .is_some_and(|(_, store)| store.repository.landings_unsettled());
+  if !unsettled || !state.vcs_stores.settling_landings.insert(id) {
+    return;
+  }
+  let turns = async move {
+    loop {
+      // Each slice waits while a publication of the shard's image is owed past its bound (A-870 piece 2), as the
+      // landed let-go's do.
+      crate::content_holder::image_resumed().await;
+      if crate::state::with_state_counted(|state| settle_landings_turn(state, id)) != Some(false) {
+        break;
+      }
+      slates_rt::futures::yield_now().await;
+    }
+    let _ =
+      crate::state::with_state_counted(|state| state.vcs_stores.settling_landings.remove(&id));
+  };
+  let spawned = slates_rt::futures::spawn(turns).and_then(slates_rt::futures::detach);
+  if spawned.is_err() {
+    state.vcs_stores.settling_landings.remove(&id);
+    state.count(LANDINGS_UNSETTLED_UNSPAWNED, 1);
+  }
+}
+
+impl VcsStores {
+  /// Whether a task maps repository `id`'s landings of several moves now ([`settle_landings_sliced`]).
+  #[cfg(test)]
+  pub(crate) fn settles(&self, id: RepositoryId) -> bool {
+    self.settling_landings.contains(&id)
+  }
+}
+
+/// One turn of repository `id`'s landings mapped by position, for the shard's step quantum, a unit at least: whether
+/// they are all mapped, or its store gone. A refusal of the store's room for a landing's runs ends the task, counted
+/// [`LANDINGS_SETTLE_REFUSED`]: the landing stays answered by its moves' sets, for the next commit's task.
+fn settle_landings_turn(state: &mut ShardState, id: RepositoryId) -> bool {
+  let ns = state.config.step_quantum_ns();
+  let room = state
+    .vcs_stores
+    .git_ref(id)
+    .map_or(0, |(_, store)| store.repository.settle_room());
+  let settled = within_budget(state, room, |stores| {
+    let (content, store) = stores.git(id)?;
+    let mut clock = crate::git_push::ShardClock;
+    let quantum = slates_git::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns,
+    };
+    Some(store.repository.settle_landings_turn(content, quantum))
+  });
+  match settled {
+    Some(Ok(done)) => done,
+    None => true,
+    Some(Err(_)) => {
+      state.count(LANDINGS_SETTLE_REFUSED, 1);
+      true
+    }
+  }
+}
+
+/// Format: the status counter of the tasks to map a repository's landings of several moves that could not be spawned
+/// (`settle_landings_sliced`): the landings wait for the repository's next commit.
+pub(crate) const LANDINGS_UNSETTLED_UNSPAWNED: &str = "vcs_store.landings.unsettled_unspawned";
+
+/// Format: the status counter of the turns refused the store's room for a landing's runs (`settle_landings_turn`).
+pub(crate) const LANDINGS_SETTLE_REFUSED: &str = "vcs_store.landings.settle_refused";
 
 // The tests' switch, kept on the shard that serves the history, so a test's daemon alone meets it.
 #[cfg(test)]
