@@ -2819,6 +2819,160 @@ mod tests {
     );
   }
 
+  /// A shard whose arena's free bytes are filled with granule objects, published so the committed image names their
+  /// blocks, then let go so their frees are held, its charge trued up at a borrow's end. The objects' count.
+  fn arena_full_of_held_frees(state: &mut crate::state::ShardState) -> usize {
+    let mut put = granule_objects(state, (0, 1));
+    let granule = state.store.content.arena().granule();
+    let room = state.store.content.arena().free_bytes() / granule;
+    // Within a lend that asks no room, so no admission grows the arena first: the puts take its free blocks.
+    put.extend(crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().unwrap();
+      (1..=room)
+        .map(|at| {
+          let mut text = format!("a chunk's text filling the arena, number {at}\n").into_bytes();
+          text.resize(granule, b'f');
+          content.put_object(&text).unwrap()
+        })
+        .collect::<Vec<_>>()
+    }));
+    state.image_encoder.ask();
+    while !crate::content_holder::image_turn(state).caught_up {}
+    crate::verbs::publish_shard(state).unwrap();
+    let_go(state, &put);
+    crate::content_holder::borrow_closed(state);
+    put.len()
+  }
+
+  /// One granule object put within its room (`vcs_store::within_budget`): the content store's answer.
+  fn put_one_granule(
+    state: &mut crate::state::ShardState,
+    number: usize,
+  ) -> Result<slates_vcs::ContentId, slates_vcs::ContentRefused> {
+    let granule = state.store.content.arena().granule();
+    let need = u64::try_from(granule).unwrap();
+    crate::vcs_store::within_budget(state, need, |stores| {
+      let mut text =
+        format!("a chunk's text put past the held frees, number {number}\n").into_bytes();
+      text.resize(granule, b'p');
+      stores.content_mut().unwrap().put_object(&text)
+    })
+  }
+
+  /// §4.2 atomic admission (`physical_used` includes all resident copies: the frees held for an image are resident, the
+  /// arena's blocks still allocated). Do: on a shard, fill the arena's free bytes with granule objects, publish them and
+  /// let them go, so their frees are held; set the pressure debt to all its pool could give, so any growth must take it
+  /// on; put one granule object. Expect: the frees held, and the put refused by the content store's budget
+  /// (`ContentRefused::OverBudget`), the arena not grown. Failing first: the held frees were credited back, so
+  /// admission saw room the arena lacked, and the seal grew the arena from its pool past the debt.
+  #[test]
+  fn held_frees_count_against_admission_and_a_put_past_them_is_refused_not_grown() {
+    let (held, answer, grown) = crate::daemon::audit_on_shard(|state| {
+      let _objects = arena_full_of_held_frees(state);
+      let held = crate::content_holder::held_now(state);
+      let claimable = u64::try_from(state.store.content.arena().claimable()).unwrap();
+      let _ = state.store.budget.mark_room();
+      state.store.budget.set_pressure(0, claimable);
+      let before = state.store.content.arena().capacity();
+      println!(
+        "before the put: capacity {before}, free {}, deferred {}, claimable {claimable}, admittable {}",
+        state.store.content.arena().free_bytes(),
+        state.store.content.arena().deferred_bytes(),
+        state.store.admittable()
+      );
+      let answer = put_one_granule(state, 0);
+      let grown = state.store.content.arena().capacity() - before;
+      (held, answer, grown)
+    });
+    println!("held {held}; the put answered {answer:?}; the arena grew {grown}");
+    assert!(held > 0, "the let-go's frees held");
+    assert!(
+      matches!(answer, Err(slates_vcs::ContentRefused::OverBudget { .. })),
+      "the put past the held frees refused by the budget: {answer:?}"
+    );
+    assert_eq!(grown, 0, "the arena grew past the pressure debt");
+  }
+
+  /// Shape: what the split arena is grown by before it is filled: its half, let go, far past the operation headroom.
+  const SPLIT_ARENA_BYTES: u64 = 64 << 20;
+
+  /// A shard whose arena's free bytes are filled with granule objects and every other one let go before any
+  /// publication names them, so its free bytes lie in single granules, no block of two among them.
+  fn arena_in_single_granules(state: &mut crate::state::ShardState) {
+    let mut put = granule_objects(state, (0, 1));
+    // Grown by admission first, so the half let go is room past the operation headroom.
+    crate::vcs_store::within_budget(state, SPLIT_ARENA_BYTES, |_| ());
+    let granule = state.store.content.arena().granule();
+    let room = state.store.content.arena().free_bytes() / granule;
+    put.extend(crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().unwrap();
+      (1..=room)
+        .map(|at| {
+          let mut text = format!("a chunk's text splitting the arena, number {at}\n").into_bytes();
+          text.resize(granule, b'g');
+          content.put_object(&text).unwrap()
+        })
+        .collect::<Vec<_>>()
+    }));
+    let every_other: Vec<slates_vcs::ContentId> = put.iter().step_by(2).copied().collect();
+    let_go(state, &every_other);
+    crate::content_holder::borrow_closed(state);
+  }
+
+  /// [`a_put_the_arena_has_no_block_for_grows_it_only_as_admission_would`]'s arm: on a shard whose free bytes lie in
+  /// single granules, the pressure debt set to all its pool could give where `owed`, a put of two granules. The put's
+  /// answer, the arena's growth, and its free bytes before the put.
+  fn put_two_granules(owed: bool) -> (bool, usize, usize) {
+    crate::daemon::audit_on_shard(move |state| {
+      arena_in_single_granules(state);
+      let granule = state.store.content.arena().granule();
+      let free = state.store.content.arena().free_bytes();
+      let _ = state.store.budget.mark_room();
+      let debt = u64::try_from(state.store.content.arena().claimable()).unwrap();
+      state
+        .store
+        .budget
+        .set_pressure(0, if owed { debt } else { 0 });
+      let before = state.store.content.arena().capacity();
+      let need = u64::try_from(2 * granule).unwrap();
+      let answer = crate::vcs_store::within_budget(state, need, |stores| {
+        let mut text = b"a chunk's text two granules long\n".to_vec();
+        text.resize(2 * granule, b't');
+        stores.content_mut().unwrap().put_object(&text)
+      });
+      println!(
+        "owed {owed}: free {free} before, capacity {before}, headroom {}; the put {answer:?}",
+        state.store.budget.headroom()
+      );
+      (
+        answer.is_ok(),
+        state.store.content.arena().capacity() - before,
+        free,
+      )
+    })
+  }
+
+  /// §4.2 atomic admission, the seal's growth (`ChunkWindows::seal`: a put the arena has no block for grew it from its
+  /// pool, no deficit checked, no pressure hold or debt taken on: a second path around admission). Do: on a shard whose
+  /// free bytes lie in single granules (budget room, no block of two), put an object of two granules, once with the
+  /// pressure debt set to all the pool could give and once with none. Expect: with the debt, the put refused and the
+  /// arena not grown, since any growth must take the debt on and the pool cannot; with none, the put kept, the arena
+  /// grown from its pool as admission's rule allows. Failing first: grown past the debt as well, the put kept.
+  #[test]
+  fn a_put_the_arena_has_no_block_for_grows_it_only_as_admission_would() {
+    let (kept, grown, free) = put_two_granules(true);
+    assert!(free > 0, "the arena's free bytes lie in single granules");
+    assert!(
+      !kept && grown == 0,
+      "past the debt: kept {kept}, grown {grown}"
+    );
+    let (kept, grown, _) = put_two_granules(false);
+    assert!(
+      kept && grown > 0,
+      "with no debt: kept {kept}, grown {grown}"
+    );
+  }
+
   /// Shape: the granule objects the lent step lets go: past twice what the starved cut has left, so one slice ends it.
   const LENT_STEP_OBJECTS: usize = 256;
 

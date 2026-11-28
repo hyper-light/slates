@@ -1230,6 +1230,40 @@ async fn image_catch_up() {
 /// passed what it had left to encode ([`borrow_closed`]).
 pub(crate) const IMAGE_CUT_PAID_SLICES: &str = "vcs_store.image.cut_paid_slices";
 
+/// Format: the status counter of the bytes of held frees the shard's budget could not take ([`charge_held`]): where it
+/// had no unpromised capacity left for them, its admittable room already none.
+pub(crate) const IMAGE_HELD_CHARGE_SHORT: &str = "vcs_store.image.held_charge_short_bytes";
+
+/// The frees held for an image charged to the shard's budget, trued up to [`held_now`] (§4.2 atomic admission:
+/// `physical_used` includes every resident copy, and a held free's block is still allocated). Before 2026-11-28 they
+/// were credited back with their windows, so admission saw room the arena lacked, and a put the arena had no block for
+/// grew it from its pool (main's 57k on 3d24ec5b3, run 1: capacity 6,067,585,024 bytes). Taken from unpromised
+/// capacity as a reservation is (`ShardBudget::reserve`), apart from the snapshot-retained bytes the status reports:
+/// where that falls short, the most it can take, the rest counted ([`IMAGE_HELD_CHARGE_SHORT`]), so the shard admits
+/// nothing more until the frees are released.
+pub(crate) fn charge_held(state: &mut ShardState) {
+  let held = held_now(state);
+  let charged = state.vcs_stores.held_charged;
+  if held <= charged {
+    state.store.budget.release(slates_mem::budget::Reservation {
+      bytes: charged.saturating_sub(held),
+    });
+    state.vcs_stores.held_charged = held;
+    return;
+  }
+  let more = held.saturating_sub(charged);
+  let taken = more.min(state.store.budget.admittable());
+  if taken > 0
+    && let Ok(reserved) = state.store.budget.reserve(taken)
+  {
+    state.vcs_stores.held_charged = charged.saturating_add(reserved.bytes);
+  }
+  let short = more.saturating_sub(state.vcs_stores.held_charged.saturating_sub(charged));
+  if short > 0 {
+    state.count(IMAGE_HELD_CHARGE_SHORT, short);
+  }
+}
+
 /// A borrow of the shard's state closed (`state::try_with_state`): where a cut is in flight and the frees held for it
 /// have passed what it has left to encode, the step that freed past it pays for the cut here, one catch-up slice
 /// ([`image_catch_up_slice`]: the larger of a copy slice and that excess), counted ([`IMAGE_CUT_PAID_SLICES`]). The
@@ -1240,6 +1274,7 @@ pub(crate) const IMAGE_CUT_PAID_SLICES: &str = "vcs_store.image.cut_paid_slices"
 /// catch-up task's own slices run, never inside a step; and not inside a lend, since a publication reads the shard's
 /// own chunk store, a placeholder then.
 pub(crate) fn borrow_closed(state: &mut ShardState) {
+  charge_held(state);
   if !state.image_encoder.cut_is_in_flight() || state.vcs_stores.chunks_lent() {
     return;
   }

@@ -245,6 +245,10 @@ pub(crate) struct ChunkWindows {
   held_bytes: (u64, u64),
   /// The image cuts begun ([`ChunkWindows::begin_cut`]).
   cuts_begun: u64,
+  /// What a put the arena has no block for may grow it by from its pool during this lend (§4.2 atomic admission): the
+  /// pool's room less the pressure debt any growth takes on, set by the lend (`super::lend_chunks`), unbounded where no
+  /// lend set it (a test's windows over an arena of no pool).
+  growth_room: u64,
   /// The bytes of slabs sealed since the latest cut began whose frees were held all the same, for the cut in flight,
   /// owed to the next lend or deferred by the arena: what an uncapture would release ((ii); a reading, no rule).
   fresh_held: u64,
@@ -435,6 +439,7 @@ impl ChunkWindows {
       held_bytes: (0, 0),
       cuts_begun: 0,
       fresh_held: 0,
+      growth_room: u64::MAX,
     }
   }
 
@@ -455,6 +460,11 @@ impl ChunkWindows {
   pub(crate) fn begin_cut(&mut self) {
     self.cutting = true;
     self.cuts_begun = self.cuts_begun.saturating_add(1);
+  }
+
+  /// Sets what a put the arena has no block for may grow it by during this lend ([`ChunkWindows::growth_room`]).
+  pub(crate) fn set_growth_room(&mut self, bytes: u64) {
+    self.growth_room = bytes;
   }
 
   /// The bytes of slabs sealed since the latest cut began whose frees were held all the same
@@ -730,10 +740,17 @@ impl ChunkWindows {
       .open(0, want, Epoch(0), (false, slates_mem::Owner::VcsWindows))
     {
       Ok(open) => open,
-      Err(_) => {
-        // The arena holds no block for it: grown from its pool by the window, once; the lend's end extends the shard
-        // budget by what was grown (`super::Lent`), as `Store::make_room` does.
-        let _grown = self.chunks.arena_mut().grow(want);
+      Err(refused) => {
+        // The arena holds no block for it: grown from its pool by the window, once, within the room admission's pool
+        // rule gives the lend (`ChunkWindows::growth_room`: what the pool could give less the pressure debt any growth
+        // takes on, as `ChunkArena::make_room` asks); refused past it. The lend's end extends the shard budget by what
+        // was grown and takes the debt on (`super::Lent`), as `Store::make_room` does.
+        let room = self.growth_room;
+        if u64::try_from(want).map_or(true, |want| want > room) {
+          return Err(refused);
+        }
+        let grown = self.chunks.arena_mut().grow(want);
+        self.growth_room = room.saturating_sub(u64::try_from(grown).unwrap_or(u64::MAX));
         self
           .chunks
           .open(0, want, Epoch(0), (false, slates_mem::Owner::VcsWindows))?

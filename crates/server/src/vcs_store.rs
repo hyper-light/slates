@@ -263,6 +263,9 @@ pub(crate) struct VcsStores {
   replica_begun: BTreeMap<RepositoryId, u64>,
   /// What the content store holds of the shard's budget, charged as retention.
   charged: u64,
+  /// What the frees held for an image hold of the shard's budget, taken as a reservation is
+  /// (`content_holder::charge_held`): at most the held frees, their blocks still allocated.
+  pub(crate) held_charged: u64,
   /// The last generation a Mercurial store's index was given ([`HgStore::generation`]); counts up.
   generations: u64,
   /// The Mercurial repositories whose stores are being made again from their records a step at a time ([`rebuild`],
@@ -1686,6 +1689,8 @@ pub(crate) fn within_budget<T>(
   bytes: u64,
   step: impl FnOnce(&mut VcsStores) -> T,
 ) -> T {
+  // The frees held for an image counted before the room is lent (§4.2: their blocks are resident).
+  crate::content_holder::charge_held(state);
   if bytes > 0 && state.vcs_stores.chunks_lent {
     state.count(ROOM_OUT_OF_REACH, 1);
   }
@@ -1802,7 +1807,7 @@ impl<'a> Lent<'a> {
     let Store {
       content, budget, ..
     } = store;
-    let took = lend_chunks(content, stores);
+    let took = lend_chunks(content, stores, budget.debt());
     Lent {
       chunks: content,
       budget,
@@ -1826,7 +1831,12 @@ pub(crate) struct Taken(Option<usize>);
 /// Lends the shard's chunk store to its content store for a caller that holds the state across a serving call whose
 /// reads are `&self` (`lfs::ShardObjects`): handed back by [`give_chunks`].
 pub(crate) fn take_chunks(state: &mut ShardState) -> Taken {
-  Taken(lend_chunks(&mut state.store.content, &mut state.vcs_stores))
+  let debt = state.store.budget.debt();
+  Taken(lend_chunks(
+    &mut state.store.content,
+    &mut state.vcs_stores,
+    debt,
+  ))
 }
 
 /// Hands back what [`take_chunks`] took, the shard budget extended by the arena's growth.
@@ -1837,16 +1847,26 @@ pub(crate) fn give_chunks(state: &mut ShardState, taken: Taken) {
   hand_chunks_back(&mut store.content, &mut store.budget, vcs_stores, taken.0);
 }
 
-/// Lends `chunks` to `stores`: the arena's capacity then, if taken.
+/// Lends `chunks` to `stores`: the arena's capacity then, if taken. A put the arena has no block for may grow it during
+/// the lend by what its pool could give less the pressure `debt` any growth takes on (§4.2 atomic admission,
+/// `ChunkArena::make_room`'s rule; `arena_windows::ChunkWindows::set_growth_room`).
 fn lend_chunks(
   chunks: &mut slates_vfs::content::ChunkStore,
   stores: &mut VcsStores,
+  debt: u64,
 ) -> Option<usize> {
   let capacity = chunks.arena().capacity();
-  stores.lend_in(chunks).then_some(capacity)
+  let room = u64::try_from(chunks.arena().claimable())
+    .unwrap_or(u64::MAX)
+    .saturating_sub(debt);
+  let took = stores.lend_in(chunks);
+  if took && let Some(windows) = chunk_windows_mut(stores) {
+    windows.set_growth_room(room);
+  }
+  took.then_some(capacity)
 }
 
-/// Hands back what [`lend_chunks`] took, `budget` extended by what the arena grew meanwhile.
+/// Hands back what [`lend_chunks`] took, `budget` extended by what the arena grew meanwhile, the debt taken on.
 fn hand_chunks_back(
   chunks: &mut slates_vfs::content::ChunkStore,
   budget: &mut slates_mem::budget::ShardBudget,
@@ -1859,7 +1879,9 @@ fn hand_chunks_back(
   stores.hand_back(chunks);
   let grown = chunks.arena().capacity().saturating_sub(before);
   if grown > 0 {
+    // As `ChunkArena::make_room` does: the growth extends the budget and takes the pressure debt on as hold.
     budget.extend(u64::try_from(grown).unwrap_or(u64::MAX));
+    budget.absorb_debt();
   }
 }
 
@@ -1896,7 +1918,8 @@ pub(crate) fn with_room<T>(state: &mut ShardState, read: impl FnOnce(&ShardState
 /// grows nothing and reads no volume chunk; [`lend`] runs before it, and room asked within it (a [`within_budget`] of
 /// any byte) is refused `ContentRefused::OutOfReach` at its first put, since the pool went with the chunks.
 pub(crate) fn lent_state<T>(state: &mut ShardState, step: impl FnOnce(&mut ShardState) -> T) -> T {
-  let took = lend_chunks(&mut state.store.content, &mut state.vcs_stores);
+  let debt = state.store.budget.debt();
+  let took = lend_chunks(&mut state.store.content, &mut state.vcs_stores, debt);
   let answer = step(state);
   let ShardState {
     store, vcs_stores, ..
