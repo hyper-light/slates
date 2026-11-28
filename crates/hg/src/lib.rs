@@ -81,6 +81,7 @@ pub mod delta;
 pub mod file_index;
 pub mod filerev;
 pub mod framing;
+pub mod gather_probe;
 pub mod heads;
 pub mod http;
 pub mod import;
