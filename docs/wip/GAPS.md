@@ -399,6 +399,14 @@
 >   each log's newest part stays owed while it has remote candidates, so the owed-part ship re-ships it to a candidate a
 >   change brings in, and the settle waits for it on `f + 1` of the new cohort, naming the log it waits for. Bounded:
 >   one part a state log of a repository the partition holds (design A-934).
+> - **OPEN, being logged (w-shared; main 01a20182's ruling of 2026-11-27 17:05): a live node's own HTTP edge refused a
+>   connect at 0 ms.** 2816da877's a914 run 3: the first death's push failed "Failed to connect to 127.0.0.1 port 55009
+>   after 0 ms: Couldn't connect to server" on a's own `vcs_http_port` while a was alive, and no "the HTTP edge
+>   stopped" line was logged. Most likely a refused connect, with nothing listening on the port at that instant
+>   (inferred from the 0 ms). The edge now logs its listener's bind and its close, however `serve` ends (its own refusal
+>   or its task dropped), with the process's monotonic time. A fleet test's git client that fails to connect logs the
+>   port, that time and an immediate probe connect, so the next such run says which it was: not yet bound, closed, or
+>   bound with the connect refused.
 > - **OPEN, a design question (main 01a20182's ruling of 2026-11-27 15:51, item 3; not now): may a newcomer adopt a live,
 >   never-restarted owner's chain on its report alone?** In run 7 above, after the second death the owner was the one
 >   live holder of the green's chain and the names log above its floor; the newcomer's reads were past tolerance, so

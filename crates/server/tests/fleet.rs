@@ -37249,7 +37249,9 @@ fn push_on_top_at_edge(
     ],
   );
   if !cloned.status.success() {
-    return Err(String::from_utf8_lossy(&cloned.stderr).into_owned());
+    let refused = String::from_utf8_lossy(&cloned.stderr).into_owned();
+    note_unreachable_edge(port, &refused);
+    return Err(refused);
   }
   commit_in(&dir, "copy", (file, bytes));
   let work = format!("{}/copy", dir.path);
@@ -37261,8 +37263,34 @@ fn push_on_top_at_edge(
   if pushed.status.success() {
     Ok(())
   } else {
-    Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
+    let refused = String::from_utf8_lossy(&pushed.stderr).into_owned();
+    note_unreachable_edge(port, &refused);
+    Err(refused)
   }
+}
+
+/// Where a git client's `refused` says it could not connect to the edge at `port` (main 01a20182's ask of 2026-11-27
+/// 17:05: a914's run 3, refused at 0 ms on a live node's own port): logs, on the fleet trace and stderr, the process's
+/// monotonic time, the port, and whether a connect to it made at once from here is accepted, so the edge's own
+/// "listens on" and "closed" lines (`vcs_http`) place the refusal: before the bind, after a close, or with the listener
+/// bound.
+fn note_unreachable_edge(port: u16, refused: &str) {
+  if !refused.contains("Failed to connect") {
+    return;
+  }
+  let at = slates_machine::clock::monotonic_ns();
+  let probe = std::net::TcpStream::connect_timeout(
+    &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+    Duration::from_secs(1),
+  )
+  .map(|_| ())
+  .map_err(|error| format!("{:?}: {error}", error.kind()));
+  common::trace::record(format_args!(
+    "edge unreachable: port {port} refused at {at} ns; a connect from here at once {probe:?}"
+  ));
+  eprintln!(
+    "edge unreachable: port {port} refused at {at} ns; a connect from here at once {probe:?}"
+  );
 }
 
 /// Counter: home exchanges a node was asked, counted as each arrives (`vcs_store::homes::REMOTE_ASKED`).
@@ -38147,6 +38175,13 @@ const CREATION_WATCH_PERIODS: u64 = 20;
 /// nothing. Killing c then is a second failure inside the first's repair window, more than `f = 1` promises, and the
 /// push's `unable to commit` is the typed answer (41aa47870 run 7: the green placed at 2 of 3, the newcomer behind,
 /// `merge.behind.heard` 9). A precondition that never holds fails here, before the second death, named.
+///
+/// A refused push during the first death fails the run at once, named, with the verdict the precondition would give 400 s
+/// later ([`first_death_push_refused`], main 01a20182's ruling of 2026-11-27 17:12, its (d2)): that push's new version is,
+/// until GAP-A9-7's record half re-ships a green's placed version, the one way the newcomer reaches the green's chain (it
+/// reads it on `Behind`, A-918 B); A-934 re-ships the state logs' parts alone. Its homing's `retry` is A-914 (c)'s prior,
+/// OPEN; any other refusal (2816da877's run 3: a's own HTTP port refusing the connection at 0 ms) is unexpected. Once
+/// the green's re-ship lands, a `retry` goes on to the precondition, which then proves the repair needs no traffic.
 #[test]
 fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_first() {
   let _serial = serialize_fleet_tests();
@@ -38160,6 +38195,10 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
   );
   let first = fleet.push(0, ("first.txt", b"main before any death\n"));
   let at_d = stretched_death(&mut fleet, 3, "after-d.txt");
+  if let Err(refused) = &at_d.1 {
+    fleet.stop();
+    first_death_push_refused(refused);
+  }
   let (repaired, holders) = repair_window_closed(&fleet);
   let during = [at_d, stretched_death(&mut fleet, 2, "after-c.txt")];
   fleet.stop();
@@ -38210,6 +38249,18 @@ fn a914_a_second_stretched_deaths_homing_window_is_the_silence_learned_at_the_fi
 
 /// A node's homing window as read from its status, or why it could not be ([`stretched_death`]'s readings).
 type WindowRead = Result<HomingWindowReading, ObserveError>;
+
+/// Fails A-914 (a)'s test at the first death's refused push (its doc, main's (d2)), naming which: the homing's `retry`,
+/// told by the words the server answers it in ([`slates_server::HOMED_SHORT`]), or any other refusal, unexpected.
+fn first_death_push_refused(refused: &str) -> ! {
+  if refused.contains(slates_server::HOMED_SHORT) {
+    panic!(
+      "the first death's push refused retry (A-914 (c)'s prior, OPEN; until the green sibling lands, the newcomer reaches \
+       the green's chain only through a new version): {refused}"
+    );
+  }
+  panic!("the first death's push refused, unexpected: {refused}");
+}
 
 /// What [`repair_window_closed`] last read: a's count of its repository's holders ([`RepairWindowHolders`]) and each
 /// survivor's names-log positions but a's, or why either could not be read.
