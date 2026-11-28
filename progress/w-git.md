@@ -953,3 +953,8 @@
   (w-bugs', read_objects), after a check that it is still open on today's main.
 - 11-28 01:17 PST: deepen's bad pack checked on today's main: the matrix row's sequence (tag pushed and deleted, then deepen 100)
   answers whole through the edge; guard test landed. Stock git's row and its seconds added to main's v2.0.0 run request.
+- 11-28 01:21 PST: the shared wait slot read by use (main's ruling of 01:19): no loss today, every owner takes its note in the poll
+  its read set it; GAPS entry now LATENT with the per-owner scope recorded as hardening (c0782bf20, docs). Read
+  packed::Recent for the 772-787 MiB entry: budget the largest pack, charged, given back at idle (A-860); the question
+  for main's figure is whether the test reads before or after the idle give-back. WAITING: main's v2.0.0 run (encode
+  spin, deepen row) and the resident figure.
