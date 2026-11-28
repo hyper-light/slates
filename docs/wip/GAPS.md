@@ -494,10 +494,16 @@
 >     `Behind { held }` and every push was refused. The parts owed now ride the shard's recovery image (image 36, delta
 >     14), are owed again at a warm start to every candidate, and are persisted before they ship. Red first, made
 >     deterministic (a holds its parts off the old holder). "held 1" is measured: every newcomer position at or above
->     a's restarted hold start. FIXED 2026-11-27 (w-perf; main's ruling of 13:42): a part's change mark toggled at its
->     let-go, so a part the last publication carried, let go, held again at its position and let go again kept its
->     piece in the next delta (the held-delta fold's proptest, w-svn's seed and diag 11's windows-latest). The mark now
->     records whether that publication carried the position; red the seed in `daemon.proptest-regressions`.
+>     a's restarted hold start. REVERTED 2026-11-27 (w-perf; main's ruling of 16:02): 43a8563a2 made a part's change
+>     mark record whether the last publication carried its position, so a let-go of a carried, marked part removed its
+>     piece in the next delta, where the toggle had left it. main's a914 bisect put a rise in its reds on it
+>     (c4d1c1bc0 3 of 6, 5fe9d8d0e 4 of 6 with a new "names log at Some(4), acknowledged []"; 41aa47870 13 of 16).
+>     The barrier's refusal is greens owed (v2 placed Some(1), a holder's replica building at 0), not the names log,
+>     which a forgotten log reads committed. Suspected mechanism, unproven: the piece the toggle left let a warm restart
+>     restore a let-go part and owe it again to every candidate, which fed a holder still building its replica; the
+>     correct removal took that away. OWED (w-shared, main's ruling of 16:06): a red, and a real path by which a lagging
+>     candidate gets the state-log parts it lacks; then the mark fix again. The fold's proptest stays seeded; under
+>     A-919 (C)'s floor its generator never holds a let-go position again, so the seed no longer reaches the toggle.
 >   - **FIXED, A-921's second mode's (2) (A-921 part 4, w-shared, 2026-11-27):** a's replay re-derived the green's
 >     pending v2 with a checkpoint floor of 0 where the old holder held 1, refused `ConflictingPosition` (19 a run, then
 >     uncounted on the merge path) so v2 never placed and every push was refused. A holder now joins a record differing

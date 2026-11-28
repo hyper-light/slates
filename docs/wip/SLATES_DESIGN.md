@@ -66031,15 +66031,6 @@ Applied in the same change to:
   (found looking at the 57k hg push's hang, of which part 3 is cleared: a push at ca78de951, which contains it,
   finished). Red first: `state_log::tests::a_part_let_go_before_any_publication_carried_it_leaves_no_change` (4 marks,
   now 0).
-- **Amended 2026-11-27 (w-perf; main's ruling of 13:42):** a mark remembers whether the last committed publication
-  carried its position. The let-go above toggled the mark, so a part the publication carried, let go, held again at
-  its position and let go again lost its mark, and the next delta kept its piece (w-svn's seed, also diag 11's
-  windows-latest: the fold held a part the shard no longer held). Now a let-go drops only a mark for a position no
-  publication carried; one carried is marked for removal however often it is held again. Red: the seed in
-  `crates/server/src/daemon.proptest-regressions` for
-  `daemon::tests::folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds`.
-  Production never holds a part again at a let-go position (a part's positions are its register's growing log
-  positions, w-shared); the generator's start at the floor follows with A-921's (C).
 - **Amended by A-921 part 4** (2026-11-27): (2) is fixed. Its cause was not shipping: the record a warm start
   re-derives differs from the one shipped, which a holder joins now.
 
