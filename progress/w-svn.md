@@ -860,3 +860,10 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - 5633c5d1f: SimHost open copies nothing (probe 18's move begin was the sim's dump copy).
 - Earlier: c5d77ed2c A-764 retried enrollment; git-2000 fixture rebuilt (sha e005db1c...).
 - Next: copy's landing.prepare off-CPU encode (probes in ~/.local/state/w-svn/patches/73-prepare-probes.patch); put_whole callers item.
+
+## 2026-11-27 22:55 — A-920 off-CPU measures, holds fix (main at 23af655a5)
+- ff8edd3e4 measures (LANDING_OFF_CPU_MOST_NS + test-only page-return log); 9982ab2c4 assert out until the fix (main's 22:16).
+- 574f26c3d greens owed holds as two queues; name_holds no longer copies the owed list each step (22.4 GB churn).
+- 87914fc2f ptrie removal label match (latent); f9762faba BENCHMARKS writing session win.
+- Open: ~50 MB page return in landing steps (arena piece, ruled (ii)); siblings Importing::consume and sent_piece drains; svnsync gap.
+- Probes saved: ~/.local/state/w-svn/patches/100-alloc-probes.patch (counting allocator, field drops, frees by phase).
