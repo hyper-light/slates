@@ -1189,8 +1189,14 @@ pub(crate) fn image_committed(state: &mut ShardState, carried: bool) {
     }
     if !next {
       // Nothing changed since the cut's moment (or none was in flight): the image is the shard's now, so every window
-      // kept before this publication is in it.
-      crate::vcs_store::homes::publication_committed();
+      // kept before this publication is in it. Changes since the moment whose cut is not due (A-930's cadence: the
+      // catch-up's chain stops there, plan (a)) are not in it, so no ticket is published past them: theirs wait for
+      // the cut the next publication asks for, or the sweep's.
+      if state.image_encoder.deferred() {
+        state.count(IMAGE_CHAIN_STOPPED, 1);
+      } else {
+        crate::vcs_store::homes::publication_committed();
+      }
       return;
     }
   } else {
@@ -1220,13 +1226,56 @@ async fn image_catch_up() {
   }
 }
 
+/// Format: the status counter of catch-up slices a closing borrow ran because the frees held for the cut in flight had
+/// passed what it had left to encode ([`borrow_closed`]).
+pub(crate) const IMAGE_CUT_PAID_SLICES: &str = "vcs_store.image.cut_paid_slices";
+
+/// A borrow of the shard's state closed (`state::try_with_state`): where a cut is in flight and the frees held for it
+/// have passed what it has left to encode, the step that freed past it pays for the cut here, one catch-up slice
+/// ([`image_catch_up_slice`]: the larger of a copy slice and that excess), counted ([`IMAGE_CUT_PAID_SLICES`]). The
+/// slice ends the cut, its publication with it, once the held frees reach twice what it has left. So the frees held
+/// for a cut stay within twice its cost and one borrow's frees, whatever time the scheduler gives the catch-up task
+/// (CLAUDE.md section 2 item 8; main's 57k of 2026-11-28, run 1 at load 82-91: 3.68 GB held for one cut nothing
+/// turned, since both the held frees' bound and the pause's lag were counted in turns). At a borrow's end, as the
+/// catch-up task's own slices run, never inside a step; and not inside a lend, since a publication reads the shard's
+/// own chunk store, a placeholder then.
+pub(crate) fn borrow_closed(state: &mut ShardState) {
+  if !state.image_encoder.cut_is_in_flight() || state.vcs_stores.chunks_lent() {
+    return;
+  }
+  let held = held_now(state);
+  let left = state
+    .image_encoder
+    .in_flight_left(u64::try_from(page_bytes(state)).unwrap_or(u64::MAX));
+  if held <= left {
+    return;
+  }
+  state.count(IMAGE_CUT_PAID_SLICES, 1);
+  let _ended = image_catch_up_slice(state);
+}
+
 /// One wake of the catch-up ([`image_catch_up`]): its steps until it ends or a copy slice's bytes are spent
 /// (`DaemonConfig::copy_slice_bytes`: the measured memcpy rate times half the step quantum, the share copy-bound work
 /// takes of a step). A turn spends the paged families' page size, which a test sets far below the slice, so the slice,
 /// not the turn, is what a wake spends: the shard's own owed work, a step's share of it a yield, whatever the page size
 /// (main 01a20182's ruling (a) of 2026-11-23 19:16). Whether it ended.
+///
+/// A wake spends more once the frees held for the committed image pass what the cut in flight has left to encode
+/// (A-930's cadence; main's 57k of 2026-11-27: a long cut held its window frees, 4.7 GB, until it committed): the
+/// larger of a copy slice and that excess. So once they pass the cut's cost a wake encodes at least as much as they
+/// passed it by, and once they pass twice the cut's cost the cut ends in that wake. The bound: the frees held while a
+/// cut is in flight are at most twice its cost and one wake's frees, and the next cut is then due at once, its held
+/// frees counted ([`held_now`], `Encoder::due`), so what is held is at most the free rate times a cut's duration and
+/// the commit gap, both kept bounded so.
 pub(crate) fn image_catch_up_slice(state: &mut ShardState) -> bool {
-  let slice = state.config.copy_slice_bytes();
+  let held = held_now(state);
+  let left = state
+    .image_encoder
+    .in_flight_left(u64::try_from(page_bytes(state)).unwrap_or(u64::MAX));
+  let slice = state
+    .config
+    .copy_slice_bytes()
+    .max(held.saturating_sub(left));
   let mut spent = 0u64;
   loop {
     let (ended, bytes) = image_catch_up_step(state);
@@ -1275,6 +1324,198 @@ pub(crate) const IMAGE_LONGEST_CUT_STEP_BYTES: &str = "vcs_store.image.longest_c
 pub(crate) const IMAGE_CUT_LEFT: &str = "vcs_store.image.cut_left";
 /// Format: the status counter of publications that carried no paged page, a change not yet encoded (A-870 piece 2).
 pub(crate) const IMAGE_SKIPPED: &str = "vcs_store.image.publications_skipped";
+/// Format: the status counter of cuts whose commit began no next cut, changes since its moment waiting for a cut not
+/// yet due (A-930's cadence, plan (a) of 2026-11-27: the byte rule gates only the catch-up's chain; every publication
+/// asks, so none defers).
+pub(crate) const IMAGE_CHAIN_STOPPED: &str = "vcs_store.image.chain_stopped";
+/// The bytes the shard holds freed for the committed image: the content arena's deferred frees (A-64), and the window
+/// chunks its repository content store holds outside them, freed while a cut in flight may name them or owed a free at
+/// the next lend (`arena_windows::ChunkWindows::held_outside_the_arena`). Before 2026-11-27 only the first was counted,
+/// so a long cut's held chunks (main's 57k: 4.7 GB) were seen only when the next lend freed them into the arena. The
+/// arena is read from the lent chunk store inside a lend, the shard's own store being a placeholder then.
+pub(crate) fn held_now(state: &ShardState) -> u64 {
+  let (deferred, for_cut, owed) = held_parts(state);
+  deferred.saturating_add(for_cut).saturating_add(owed)
+}
+
+/// [`held_now`] by where each byte is held: the arena's deferred frees, the window chunks held for the cut in flight,
+/// and those owed a free at the next lend (`ChunkWindows::held_outside_parts`).
+pub(crate) fn held_parts(state: &ShardState) -> (u64, u64, u64) {
+  let windows = crate::vcs_store::chunk_windows(&state.vcs_stores);
+  let arena = windows
+    .map(crate::vcs_store::arena_windows::ChunkWindows::lent_chunks)
+    .filter(|chunks| chunks.arena().capacity() > 0)
+    .unwrap_or(&state.store.content)
+    .arena();
+  let (for_cut, owed) = windows.map_or(
+    (0, 0),
+    crate::vcs_store::arena_windows::ChunkWindows::held_outside_parts,
+  );
+  (
+    u64::try_from(arena.deferred_bytes()).unwrap_or(u64::MAX),
+    for_cut,
+    owed,
+  )
+}
+
+/// [`held_now`] read through a content store its shard's chunk store is lent to: inside a lend, where the shard's own
+/// store is a placeholder and the state is borrowed by the step (`hg_push`'s intake slice).
+pub(crate) fn held_lent(content: &slates_vcs::ContentStore) -> u64 {
+  content
+    .storage()
+    .as_any()
+    .and_then(|any| any.downcast_ref::<crate::vcs_store::arena_windows::ChunkWindows>())
+    .map_or(0, |windows| {
+      u64::try_from(windows.lent_chunks().arena().deferred_bytes())
+        .unwrap_or(u64::MAX)
+        .saturating_add(windows.held_outside_the_arena())
+    })
+}
+
+/// The bytes of slabs sealed since the latest cut began whose frees the shard's windows saw held all the same
+/// (`ChunkWindows::fresh_held`, (ii)'s reading of an uncapture's reach), read through `content` as [`held_lent`] reads.
+pub(crate) fn fresh_held_lent(content: &slates_vcs::ContentStore) -> u64 {
+  content
+    .storage()
+    .as_any()
+    .and_then(|any| any.downcast_ref::<crate::vcs_store::arena_windows::ChunkWindows>())
+    .map_or(0, crate::vcs_store::arena_windows::ChunkWindows::fresh_held)
+}
+
+/// [`fresh_held_lent`] read from the shard's state.
+fn fresh_held_now(state: &ShardState) -> u64 {
+  crate::vcs_store::chunk_windows(&state.vcs_stores)
+    .map_or(0, crate::vcs_store::arena_windows::ChunkWindows::fresh_held)
+}
+
+/// Format: the status counter of the most bytes one borrow of the shard's state freed into the frees the arena holds
+/// for the committed image ([`note_borrow_held`]).
+pub(crate) const IMAGE_HELD_BORROW_MOST: &str = "vcs_store.image.held_borrow_most_bytes";
+
+/// Notes what one borrow of the shard's state, at `site`, freed into the frees the content arena holds for the
+/// committed image, `before` bytes when it began (main's 57k at 1361cd1b6, 2026-11-27 18:27: each run's held peak was
+/// reached inside one borrow, 190 to 290 MB, which no look at a borrow's close can bound). The most any borrow freed
+/// is counted ([`IMAGE_HELD_BORROW_MOST`]), and each doubling of it past a copy slice logged with the borrow's site,
+/// so the borrow that frees without bound is named. One subtraction a borrow, none past it where nothing was freed.
+pub(crate) fn note_borrow_held(
+  state: &mut ShardState,
+  before: BorrowArena,
+  site: &'static std::panic::Location<'static>,
+) {
+  let after = held_now(state);
+  note_held_at_borrow(state, after);
+  let freed = after.saturating_sub(before.deferred);
+  if freed == 0 {
+    return;
+  }
+  let most = state
+    .refusals
+    .get(IMAGE_HELD_BORROW_MOST)
+    .copied()
+    .unwrap_or(0);
+  if freed > most.saturating_mul(2) && freed > state.config.copy_slice_bytes() {
+    // What the arena was at the borrow's two ends, and the process's memory, read only for a line: so a count past
+    // what the arena could hold (main's 57k, 4,715,147,264 bytes in one borrow with 843 MB resident) shows whether
+    // the arena held it, or the borrow began over another store (a lent chunk store's placeholder holds none).
+    let now = BorrowArena::read(state);
+    slates_machine::log_line!(
+      "slates-server: partition {}: one borrow at {site} freed {freed} bytes into the frees held for the committed \
+       image ({after} held now; the most one borrow freed before, {most}), {} of them slabs sealed since the latest \
+       cut began; held before (the arena's deferred, for the cut, owed) {:?} and after {:?}; the arena before and \
+       after: capacity \
+       {} and {}, mapped {} and {}, allocations {} and {}; the process's footprint {:?}, resident {:?}",
+      state.partition,
+      now.fresh.saturating_sub(before.fresh),
+      before.parts,
+      now.parts,
+      before.capacity,
+      now.capacity,
+      before.mapped,
+      now.mapped,
+      before.allocations,
+      now.allocations,
+      slates_machine::facts::Facts::footprint_now(),
+      slates_machine::facts::Facts::resident_now(),
+    );
+  }
+  state.count_max(IMAGE_HELD_BORROW_MOST, freed);
+}
+
+/// Format: the status counter of the most bytes held for the committed image at a borrow's end
+/// ([`note_held_at_borrow`]).
+pub(crate) const IMAGE_HELD_AT_BORROW_PEAK: &str = "vcs_store.image.held_at_borrow_peak_bytes";
+
+/// `held` bytes held for the committed image at a borrow's end ([`note_borrow_held`]): the most counted
+/// ([`IMAGE_HELD_AT_BORROW_PEAK`]), and at each doubling of it past a copy slice a line with the catch-up's state
+/// (`Encoder::catch_up_reading`) and the time since the encoder last turned. Main's 57k of 2026-11-28, run 1: no drain
+/// ran while held went from about 313 MB to 3.68 GB, so the drain's own line said nothing of why the cut in flight
+/// was not turned; a borrow ends many times a turn. A line a doubling, so at most the bits of a byte count.
+fn note_held_at_borrow(state: &mut ShardState, held: u64) {
+  let peak = state
+    .refusals
+    .get(IMAGE_HELD_AT_BORROW_PEAK)
+    .copied()
+    .unwrap_or(0);
+  let floor = state.config.copy_slice_bytes();
+  if state
+    .image_encoder
+    .held_log_due(crate::image_pages::HeldLine::Borrow, held, floor)
+  {
+    let (catching_up, owed, since_begun, turns) = state.image_encoder.catch_up_reading();
+    let idle_ns = slates_rt::futures::now_ns().saturating_sub(state.image_encoder.turned_ns());
+    slates_machine::log_line!(
+      "slates-server: partition {}: {held} bytes held for the committed image at a borrow's end (the most before, \
+       {peak}): a catch-up running {catching_up}, a publication owed {owed}, the cut in flight begun {since_begun:?} \
+       turns ago, {turns} turns run, the last {idle_ns} ns ago",
+      state.partition
+    );
+  }
+  state.count_max(IMAGE_HELD_AT_BORROW_PEAK, held);
+}
+
+/// The shard's content arena as a borrow of its state begins ([`note_borrow_held`]): its held frees, and what tells
+/// whether it is the arena itself (its capacity, mapped bytes and allocations).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BorrowArena {
+  /// The frees held for the committed image ([`held_now`]).
+  deferred: u64,
+  /// Of all frees held so far, the bytes of slabs sealed since the latest cut began ([`fresh_held_now`]).
+  fresh: u64,
+  /// The held frees by where they are held ([`held_parts`]).
+  parts: (u64, u64, u64),
+  /// The arena's capacity.
+  capacity: usize,
+  /// Its mapped bytes.
+  mapped: usize,
+  /// Its allocations so far.
+  allocations: u64,
+}
+
+impl BorrowArena {
+  /// The shard's content arena now.
+  pub(crate) fn read(state: &ShardState) -> Self {
+    let arena = state.store.content.arena();
+    let parts = held_parts(state);
+    Self {
+      deferred: parts.0.saturating_add(parts.1).saturating_add(parts.2),
+      fresh: fresh_held_now(state),
+      parts,
+      capacity: arena.capacity(),
+      mapped: arena.mapped_bytes(),
+      allocations: arena.allocations(),
+    }
+  }
+}
+
+/// Format: the status counter of cuts begun because the shard went idle with changes waiting for a cut not yet due.
+pub(crate) const IMAGE_IDLE_CUTS: &str = "vcs_store.image.idle_cuts";
+/// Format: the status counter of cuts a sweep pass began because the changes waiting, with the arena's held frees, had
+/// come to the cut's cost while nothing published (A-930's cadence, plan (a)).
+pub(crate) const IMAGE_SWEEP_CUTS: &str = "vcs_store.image.sweep_cuts";
+/// Format: the status counter of the most bytes the content arena held freed for the committed cut at a drain since
+/// start (A-930's cadence: a deferred cut holds no more than it would cost, so this stays within a cut's cost and one
+/// change's frees).
+pub(crate) const IMAGE_HELD_PEAK: &str = "vcs_store.image.held_deferred_peak_bytes";
 /// Format: the status counter of the longest a publication of the paged families was owed, in encoder turns.
 pub(crate) const IMAGE_LONGEST_LAG: &str = "vcs_store.image.longest_lag_turns";
 /// Format: the status counter of elective changes paused while a publication was owed past its bound.
@@ -1338,7 +1579,9 @@ fn catch_up_publication(state: &mut ShardState) -> Result<(), slates_vfs::VfsErr
   }) {
     return Err(slates_vfs::VfsError::RecoveryIncomplete);
   }
-  crate::verbs::publish_shard(state).map(drop)
+  // The catch-up's own publication asks for no cut: the next begins at its commit only once it is due (A-930's
+  // cadence, plan (a)).
+  crate::verbs::publish_shard_unasked(state).map(drop)
 }
 
 #[cfg(test)]
@@ -1352,6 +1595,29 @@ thread_local! {
 /// catch-up begun again, counted; a spawn refused again is counted and left for the next sweep. Whether one is owed, so
 /// the sweep does not settle the shard while it is.
 pub(crate) fn image_retry_owed(state: &mut ShardState) -> bool {
+  // Changes waiting for a cut not yet due (A-930's cadence), taken first so the pass sees what no publication drained
+  // (the arena's held frees with them): begun where they and the held frees have come to the cut's cost, or asked for
+  // where the shard has settled idle, nothing allocated since the last pass's give-back; then owed, so the shard is
+  // not settled until it is published. Before, a pass looked without taking the changes and saw nothing waiting, so a
+  // push that published nothing held its frees until a ticket (main's 57k at 81950e77c: a held peak of 161,943,552
+  // bytes, one idle cut a run).
+  image_drain(state);
+  let idle = state.image_encoder.deferred()
+    && state.store.content.arena().allocations() == state.purge_seen_allocations;
+  if idle {
+    state.image_encoder.ask();
+  }
+  if state.image_encoder.can_begin() && image_begin(state) {
+    let _ = state.image_encoder.skipped();
+    state.count(
+      if idle {
+        IMAGE_IDLE_CUTS
+      } else {
+        IMAGE_SWEEP_CUTS
+      },
+      1,
+    );
+  }
   if !state.image_encoder.owed() {
     return false;
   }
@@ -1383,6 +1649,24 @@ pub(crate) fn image_drain(state: &mut ShardState) {
   }
   crate::vcs_store::homes::region_changes_committed();
   crate::vcs_store::homes::landed_changes_committed();
+  // What a deferred cut keeps in memory (A-930's cadence): the frees the arena holds for the committed cut.
+  let held = held_now(state);
+  state.image_encoder.hold(held);
+  // Each doubling of the held peak said with the cadence's state (main's 57k of 2026-11-27: a 357,847,040-byte peak to
+  // explain), a line a doubling, so at most the bits of a byte count.
+  let peak = state.refusals.get(IMAGE_HELD_PEAK).copied().unwrap_or(0);
+  if state
+    .image_encoder
+    .held_log_due(crate::image_pages::HeldLine::Drain, held, 1 << 20)
+  {
+    let (in_flight, dirty, cost, changed, held_now, due) = state.image_encoder.cadence_reading();
+    slates_machine::log_line!(
+      "slates-server: partition {}: {held_now} bytes held freed for the committed image (the peak was {peak}): cut in \
+       flight {in_flight}, {dirty} pages dirty, the next cut costs {cost}, {changed} bytes changed, due {due}",
+      state.partition
+    );
+  }
+  state.count_max(IMAGE_HELD_PEAK, held);
 }
 
 /// Begins an image cut where none is in flight and a page is dirty (F2): the changes taken first, so the cut is this
@@ -1502,6 +1786,7 @@ pub(crate) fn image_turn(state: &mut ShardState) -> crate::image_pages::Turned {
     ),
     &mut encoded,
   );
+  encoder.note_turned(slates_rt::futures::now_ns());
   state.image_encoder = encoder;
   for (family, page) in encoded {
     cut_page_frozen(state, family, (page.start, page.last()), false);

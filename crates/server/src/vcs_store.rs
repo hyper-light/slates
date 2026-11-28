@@ -1745,6 +1745,11 @@ impl VcsStores {
     Ok(())
   }
 
+  /// Whether the shard's chunk store is lent to the content store now ([`Lent`]): inside a step's lend.
+  pub(crate) fn chunks_lent(&self) -> bool {
+    self.chunks_lent
+  }
+
   /// Lends `chunks` to the content store's windows, or to the storage a content store not made yet will keep them in,
   /// so a store made inside the step finds it lent (`Lent`): whether it took them.
   fn lend_in(&mut self, chunks: &mut slates_vfs::content::ChunkStore) -> bool {
@@ -3129,6 +3134,9 @@ pub(crate) struct LettingGo {
   layout: Option<(Vec<(slates_vcs::ContentId, u64)>, u64)>,
   /// The next window to let go.
   next: usize,
+  /// Whether the pack's names are released once its every window is let go: a landed Mercurial push segment's
+  /// sections, which its push held until they landed (`hg_run::give_back_sections`).
+  release: bool,
 }
 
 /// Counter: slices of landed packs' let-go run ([`let_go_turn`]): its non-vacuity, a large pack taking many. Format: a
@@ -3142,6 +3150,18 @@ pub(crate) const LET_GO_PAST_QUANTUM: &str = "vcs_store.landed.let_go_past_quant
 /// the home here queued with it, another shard's told to queue its own. The task that turns them is started where none
 /// runs.
 fn let_go_sliced(state: &mut ShardState, pack: slates_vcs::ContentId) {
+  let_go_sliced_releasing(state, pack, false);
+}
+
+/// Queues `pack`'s let-go a slice a turn as [`let_go_sliced`] does, its names released once every window is let go: a
+/// landed Mercurial push segment's section, which its push gives back (`hg_run::give_back_sections`; main's 57k of
+/// 2026-11-27 19:00: given back whole in one borrow, 264.5 MB into the frees held for the committed image).
+pub(crate) fn let_go_sliced_then_release(state: &mut ShardState, pack: slates_vcs::ContentId) {
+  let_go_sliced_releasing(state, pack, true);
+}
+
+/// [`let_go_sliced`], the owner's share releasing the pack's names at its end where `release`.
+fn let_go_sliced_releasing(state: &mut ShardState, pack: slates_vcs::ContentId, release: bool) {
   let shard = state.shard;
   let home = homes::home_of(&state.shards, &pack);
   if let Some(other) = home.filter(|home| *home != shard) {
@@ -3150,7 +3170,7 @@ fn let_go_sliced(state: &mut ShardState, pack: slates_vcs::ContentId) {
       let _ = crate::xshard::call_in_shard_time(
         shard,
         other,
-        move |state| queue_let_go(state, pack, (true, false)),
+        move |state| queue_let_go(state, pack, (true, false, false)),
         budget_ns,
       )
       .await;
@@ -3160,12 +3180,16 @@ fn let_go_sliced(state: &mut ShardState, pack: slates_vcs::ContentId) {
       state.count(LANDED_HOME_UNTOLD, 1);
     }
   }
-  queue_let_go(state, pack, (home == Some(shard), true));
+  queue_let_go(state, pack, (home == Some(shard), true, release));
 }
 
 /// Queues `pack`'s let-go here, as its home and as its owner where each is true, and starts the task that turns the
 /// queue where none runs. A home's share is queued only where the region holds the pack here.
-fn queue_let_go(state: &mut ShardState, pack: slates_vcs::ContentId, (home, owner): (bool, bool)) {
+fn queue_let_go(
+  state: &mut ShardState,
+  pack: slates_vcs::ContentId,
+  (home, owner, release): (bool, bool, bool),
+) {
   let home = home && homes::region_holds_here(&pack) > 0;
   if !home && !owner {
     return;
@@ -3176,6 +3200,7 @@ fn queue_let_go(state: &mut ShardState, pack: slates_vcs::ContentId, (home, owne
     owner,
     layout: None,
     next: 0,
+    release: release && owner,
   });
   if state.vcs_stores.letting_go.1 {
     return;
@@ -3274,9 +3299,14 @@ fn let_go_slice(state: &mut ShardState, (started_ns, quantum_ns): (u64, u64)) ->
     return Some(true);
   };
   let mut longest_ns = 0;
+  // The bytes a slice may free into the frees held for the committed image: a copy slice, what a step moves at the
+  // measured memcpy rate in half its quantum (`DaemonConfig::copy_slice_bytes`). A window's let-go costs the same
+  // whatever its length, so a quantum alone let one slice free hundreds of MB (main's 57k of 2026-11-27 19:00).
+  let budget = state.config.copy_slice_bytes();
+  let mut freed = 0u64;
   while let Some((window, offset)) = layout.get(letting.next).copied() {
     let before_ns = slates_rt::futures::now_ns();
-    let_go_window(state, &letting, (window, offset, len));
+    freed = freed.saturating_add(let_go_window(state, &letting, (window, offset, len)));
     letting.next = letting.next.saturating_add(1);
     let now_ns = slates_rt::futures::now_ns();
     longest_ns = longest_ns.max(now_ns.saturating_sub(before_ns));
@@ -3289,14 +3319,18 @@ fn let_go_slice(state: &mut ShardState, (started_ns, quantum_ns): (u64, u64)) ->
         ));
       }
     });
-    // The next window taken only where it ends within the quantum, at the slice's longest so far.
-    if now_ns.saturating_sub(started_ns).saturating_add(longest_ns) > quantum_ns {
+    // The next window taken only where it ends within the quantum, at the slice's longest so far, and the slice has
+    // not freed its bytes.
+    if now_ns.saturating_sub(started_ns).saturating_add(longest_ns) > quantum_ns || freed >= budget
+    {
       break;
     }
   }
   if letting.next < layout.len() {
     letting.layout = Some((layout, len));
     state.vcs_stores.letting_go.0.push_front(letting);
+  } else if letting.release {
+    release_names(state, &letting.pack);
   }
   Some(!state.vcs_stores.letting_go.0.is_empty())
 }
@@ -3307,10 +3341,10 @@ fn let_go_window(
   state: &mut ShardState,
   letting: &LettingGo,
   (window, offset, len): (slates_vcs::ContentId, u64, u64),
-) {
+) -> u64 {
   // A window owed at its image number is the owed let-go's to let go there ([`owed_at_its_number`]).
   if owed_at_its_number(state, &window) {
-    return;
+    return 0;
   }
   if letting.home {
     let at = homes::LandedAt {
@@ -3321,7 +3355,7 @@ fn let_go_window(
     homes::record_landed_here(state, &[(window, at)]);
   }
   if !letting.owner {
-    return;
+    return 0;
   }
   let pin = landed_pin(&window);
   let freed = within_budget(state, 0, |stores| {
@@ -3334,9 +3368,15 @@ fn let_go_window(
     content.let_go_landed(&window, pin)
   });
   match freed {
-    Ok(bytes) if bytes > 0 => state.count(LANDED_LET_GO_BYTES, bytes),
-    Err(slates_vcs::LetGoRefused::Pinned { .. }) => state.count(LANDED_PINNED, 1),
-    _ => {}
+    Ok(bytes) if bytes > 0 => {
+      state.count(LANDED_LET_GO_BYTES, bytes);
+      bytes
+    }
+    Err(slates_vcs::LetGoRefused::Pinned { .. }) => {
+      state.count(LANDED_PINNED, 1);
+      0
+    }
+    _ => 0,
   }
 }
 

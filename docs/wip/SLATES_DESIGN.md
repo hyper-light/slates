@@ -66481,6 +66481,46 @@ Applied in the same change to:
   carries a page's piece whole; the copy only replaced the encoding. OWED: the 57k's cut count from the rerun with
   these counters, and main's ruling on carrying a piece in parts (the committed bytes by reference), which would take
   the copy out.
+- **Part 3, the cadence, under plan (a)** (2026-11-27, w-perf; main's rulings (ii), of 07:19 on the held term, and of
+  08:54 on plan (a), after 7acfd685c was reverted for losing a Subversion named text across a restart). A cut moves its
+  dirty pages' committed bytes whole however few entries changed, and at 894a1e111 a 57k push began 3,291 cuts copying
+  697,376,174 bytes: nearly all were the catch-up's chain, each cut's commit beginning the next at once, since the push
+  publishes almost nothing itself. The encoder keeps the bytes changed since the last cut began (`Encoder::changed`)
+  and the frees the content arena holds for the committed cut (`Encoder::hold`), and a cut is due (`Encoder::due`)
+  when asked, or when the two come to its cost, the dirty pages' committed bytes (`Encoder::cut_cost`).
+  - **Every publication asks** (`verbs::publish_shard`): every caller is a barrier something waits behind (a FUSE
+    close, an NFS reply, a landing, a relief, a homes ticket, a test's `publish_every_shard`), so a change made before
+    the call is in the image once its catch-up ends, as before the cadence. 7acfd685c had let a publication defer its
+    cut, and the barriers other than a ticket's wait lost what they persisted.
+  - **Only the chain is gated**: the catch-up's own publication asks for nothing (`verbs::publish_shard_unasked`), so a
+    cut's commit begins the next only once it is due, and otherwise the chain stops (counted
+    `vcs_store.image.chain_stopped`) and its changes wait for the next publication or the sweep.
+  - **The sweep takes the changes first** (`content_holder::image_retry_owed`): it drains what no publication drained,
+    begins the cut where it is due by bytes (counted `vcs_store.image.sweep_cuts`), and asks for it where the shard
+    has settled idle, nothing allocated since the last pass's give-back (`vcs_store.image.idle_cuts`). At 81950e77c it
+    looked before draining, saw nothing waiting, and a push that published nothing held a peak of 161,943,552 bytes of
+    frees until its ticket. `vcs_store.image.held_deferred_peak_bytes` is the most held at a drain since start.
+  - **Reds**: `a_publication_carries_every_change_made_before_it_once_its_cut_is_caught_up` (red at 7acfd685c: the
+    publication deferred its cut) with w-svn's two Subversion restart tests; `a_cut_nobody_waits_on_begins_once_its_
+    changes_come_to_its_cost` (the chain: let-goes while cuts are encoded, a cut at each commit asked against the
+    cadence: 132 cuts and 1,884,475 bytes copied and encoded against 2 and 171,629);
+    `a_deferred_cut_holds_no_more_freed_bytes_than_it_would_cost` (a busy shard's sweep bounds the held frees: 5 cuts
+    before idle, at most a cut's cost and one let-go's frees held; red without the held term);
+    `a_settled_sweep_pass_cuts_the_changes_no_publication_drained` (red at 81950e77c: no cut). The oracle's catch-up
+    publishes unasked, as the task does, and asserts some commit stopped the chain.
+  - **The sweep looks early when frees pile up** (main's 57k of 2026-11-27 16:55 on 8974631df: 3 of 3 good, 104 to
+    124 s, but a held peak of 357,847,040 bytes in run 3, against 81950e77c's 148 to 162 MB). The sweep looked once an
+    interval (the liveness budget, seconds), so the cut's cost was measured only that often and a push that freed
+    faster held an interval's frees before each look. Now each drain sets a look (`Encoder::hold`): the waiting cut's
+    cost, or twice the frees held then, whichever is more; and every borrow's close compares the arena's deferred
+    bytes with it, one gauge against one threshold, bringing the pass forward to now (`idle_sweep::arm_now`) where no
+    cut is in flight and the frees have passed it (`Encoder::held_past_look`). Past the cost that is at most one look
+    a doubling, log2(held / cost) and one. Each doubling of the held peak is logged with the cadence's state. Reds:
+    `frees_held_past_the_waiting_cuts_cost_bring_the_sweep_forward` (163,840 bytes held against a cut costing 26,885:
+    the pass armed for now; an interval on without the look) and its twin
+    `frees_no_cut_gives_back_ask_one_look_a_doubling` (nothing dirty, frees rising a byte at a time to 65,536: 17
+    looks).
+  - OWED: main's 57k round with samplers on this tip (cuts, copied bytes, held peak well under 149 MB, wall time).
 - **Applied in the same change to:** `crates/server/src/image_pages.rs` (the encoder's lasts and least changes,
   `append_page`, `entry_ends`, `CommittedPiece`, `Encoder::appends`, `append`, `split_appended`, `dirty_whole`); the
   goal 93 line in GAPS (A-923's entry). Part 2: `image_pages.rs` (`Marked`, `EntryCoordinate`, `Changed`, `PieceCut`,

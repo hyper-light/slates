@@ -782,6 +782,20 @@
 > diff reversed both pass, 2 of 2. Its 57k effect, measured before the revert (main's a930-57k run 1 at 81950e77c, load
 > 62-66): cuts 3,291 to 5, bytes copied 697,376,174 to 7,084,213, held-deferred peak 148,221,952 bytes, resident after
 > the push 845,504 KiB (834,960 at 894a1e111). Re-lands with the restart's red first (w-perf).
+> **Part 3 RE-LAND BUILT, not landed (w-perf, 2026-11-27; main's plan (a) of 08:54):** every publication asks for its
+> cut, so no barrier defers one; the byte rule gates only the catch-up's chain (`verbs::publish_shard_unasked`); the
+> sweep drains before it looks, begins a due cut while busy and asks for one once idle. Reds: the restart rule
+> (image-level and w-svn's two tests), the chain, the held bound under a busy sweep, the sweep's look. HELD for main's
+> 57k round with samplers (it reverted once on persistence). Its first round (8974631df): 3 of 3 good at 104 to 124 s,
+> but a held peak of 357,847,040 bytes, the sweep looking an interval apart; the pass now comes forward once the frees
+> pass the waiting cut's cost (at most a look a doubling). Then (2026-11-27 evening): the peaks "inside one borrow"
+> were window chunks held for an in-flight cut (`arena_windows::ChunkWindows::held_for_cut`), owed at its commit and
+> freed at the next lend, which no gauge counted; one gauge counts them now (`content_holder::held_now`, 864cb01c4),
+> and a catch-up wake spends the held frees past what its cut has left (676907166's successor): red, a wake held to a
+> copy slice, 2,887,680 bytes held over 15 wakes for a cut spending 797,914; now 389,120 over 5 for 750,734. A cut's
+> cost read at its begin undercounts (a fresh page is split as it is encoded); `due()` and the early look read the
+> same committed bytes, so both begin cuts and looks sooner, never later. OWED: main's 57k on the true gauge, then on
+> the per-wake spend.
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through

@@ -84,6 +84,9 @@ pub(crate) struct Made {
   pub(crate) text: Vec<u8>,
   pub(crate) manifest: (Node, Node, Vec<u8>),
   pub(crate) file: (Vec<u8>, Node, Vec<u8>),
+  /// The file's revision it changes and that revision's text, where it changes a file its parent holds ([`edited`]):
+  /// what a changegroup sends its file revision as a delta over. None for a file it adds.
+  pub(crate) file_base: Option<(Node, Vec<u8>)>,
 }
 
 /// The fixtures' repository rebuilt from its texts as 7.2's `commit` writes them (§4.17.3 decision 7's fields).
@@ -123,10 +126,66 @@ pub(crate) fn history_of(commits: &[Commit]) -> Vec<Made> {
       text: changeset,
       manifest: (manifest, parent_manifest, text),
       file: (path.as_bytes().to_vec(), file, bytes.to_vec()),
+      file_base: None,
     });
     manifests.push(entries);
   }
   made
+}
+
+/// A changeset on `made[parent]` that changes `path`, a file the parent's manifest holds, to `bytes`, described
+/// `description`, on `default`: its file revision's first parent the parent's revision of `path`, so a changegroup
+/// sends it as a delta over that revision's text, `base` ([`changegroup`]), as most real pushes carry their files:
+/// what a push's intake meets as a delta on a base that may have landed and been let go (A-767 C1).
+pub(crate) fn edited(
+  made: &[Made],
+  parent: usize,
+  (path, bytes, base): (&str, &[u8], &[u8]),
+  description: &str,
+) -> Made {
+  let at = &made[parent];
+  let mut entries = manifest_entries(&at.manifest.2);
+  let held = entries
+    .iter()
+    .position(|(name, _)| name.as_slice() == path.as_bytes())
+    .expect("the parent's manifest holds the path");
+  let base_node = entries[held].1;
+  let file = node::compute(&base_node, &NULL_NODE, bytes).unwrap();
+  entries[held].1 = file;
+  let text: Vec<u8> = entries
+    .iter()
+    .flat_map(|(path, node)| [path.as_slice(), b"\0", hex(node).as_bytes(), b"\n"].concat())
+    .collect();
+  let manifest = node::compute(&at.manifest.0, &NULL_NODE, &text).unwrap();
+  let changeset = format!("{}\ntest\n0 0\n{path}\n\n{description}", hex(&manifest)).into_bytes();
+  Made {
+    node: node::compute(&at.node, &NULL_NODE, &changeset).unwrap(),
+    p1: at.node,
+    text: changeset,
+    manifest: (manifest, at.manifest.0, text),
+    file: (path.as_bytes().to_vec(), file, bytes.to_vec()),
+    file_base: Some((base_node, base.to_vec())),
+  }
+}
+
+/// A manifest's text as its entries, each a path and its file node, in its order.
+fn manifest_entries(text: &[u8]) -> Vec<(Vec<u8>, Node)> {
+  text
+    .split(|byte| *byte == b'\n')
+    .filter(|line| !line.is_empty())
+    .map(|line| {
+      let split = line
+        .iter()
+        .position(|byte| *byte == 0)
+        .expect("a manifest line names its path");
+      let digits = std::str::from_utf8(&line[split + 1..]).expect("its node in hex");
+      let mut node = [0u8; 20];
+      for (at, byte) in node.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&digits[2 * at..2 * at + 2], 16).expect("a hex digit pair");
+      }
+      (line[..split].to_vec(), node)
+    })
+    .collect()
 }
 
 /// A revision sent as its full text against the null node, its second parent none.
@@ -145,13 +204,20 @@ fn full_text(node: Node, p1: Node, link: Node, data: &[u8]) -> Revision<'_> {
   }
 }
 
-/// A changegroup 03 of the changesets `which`, every revision a full text against the null node.
+/// A changegroup 03 of the changesets `which`, every revision a full text against the null node but a file revision
+/// that changes a file its parent holds ([`Made::file_base`]), sent as a delta over that base.
 pub(crate) fn changegroup(made: &[Made], which: &[usize]) -> ChangegroupPart {
   let mut deltas: Vec<Vec<u8>> = Vec::new();
   for at in which {
-    for text in [&made[*at].text, &made[*at].manifest.2, &made[*at].file.2] {
+    for (kind, text) in [&made[*at].text, &made[*at].manifest.2, &made[*at].file.2]
+      .into_iter()
+      .enumerate()
+    {
       let mut encoded = Vec::new();
-      delta::encode_full_text(text, &mut encoded).unwrap();
+      match (&made[*at].file_base, kind) {
+        (Some((_, base)), 2) => delta::encode_lines(base, text, &mut encoded).unwrap(),
+        _ => delta::encode_full_text(text, &mut encoded).unwrap(),
+      }
       deltas.push(encoded);
     }
   }
@@ -173,12 +239,12 @@ pub(crate) fn changegroup(made: &[Made], which: &[usize]) -> ChangegroupPart {
   for (index, at) in which.iter().enumerate() {
     let made = &made[*at];
     let start = revisions.len();
-    revisions.push(full_text(
-      made.file.1,
-      NULL_NODE,
-      made.node,
-      &deltas[3 * index + 2],
-    ));
+    let mut revision = full_text(made.file.1, NULL_NODE, made.node, &deltas[3 * index + 2]);
+    if let Some((base, _)) = &made.file_base {
+      revision.p1 = *base;
+      revision.base = *base;
+    }
+    revisions.push(revision);
     files.push(Group {
       name: made.file.0.as_slice(),
       revisions: start..start + 1,
@@ -957,6 +1023,83 @@ fn a_pushs_landed_segments_are_counted_by_section() {
       "each section counted: {counted:?}"
     );
   });
+}
+
+/// Shape: the files [`a_push_of_deltas_over_bases_a_push_before_let_go_brings_each_base_back`] pushes and then changes.
+const DELTA_FILES: usize = 8;
+
+/// A-767 C1, the delta fixture's use ([`edited`]): most real pushes carry a file changed as a delta over the revision a
+/// push before landed. Do: push [`DELTA_FILES`] files of a window each (their texts let go once their segments are
+/// durable), then a push changing each by a line, sent as deltas over those revisions. Expect both pushes accepted and
+/// every base brought back from the node's store (`vcs.hg.push_base_store_reads`).
+#[test]
+fn a_push_of_deltas_over_bases_a_push_before_let_go_brings_each_base_back() {
+  let (added, changed, brought) = crate::test_store::run_on_stored_shard(|| async move {
+    let hg = Hg::made("deltas").await;
+    let window =
+      crate::repository::svn_commit::tests::on(|state| state.store.content.chunk_bytes());
+    let text = |file: usize, changed: bool| -> Vec<u8> {
+      let mut text = Vec::new();
+      let mut line = 0usize;
+      while text.len() < window {
+        let edit = if changed && line == 0 { " changed" } else { "" };
+        text.extend_from_slice(format!("file {file} line {line}{edit}\n").as_bytes());
+        line += 1;
+      }
+      text
+    };
+    let commits: Vec<Commit> = (0..DELTA_FILES)
+      .map(|at| -> Commit {
+        let path: &'static str = Box::leak(format!("file-{at}").into_boxed_str());
+        let bytes: &'static [u8] = Box::leak(text(at, false).into_boxed_slice());
+        ("add", path, bytes, at.checked_sub(1), "default")
+      })
+      .collect();
+    let mut made = history_of(&commits);
+    let first: Vec<usize> = (0..DELTA_FILES).collect();
+    let added = pushed_bytes_to(
+      hg.repository,
+      &crate::vcs_http::daemon_edge_tests::history_bundle(&made, &first),
+    )
+    .await;
+    for at in 0..DELTA_FILES {
+      let parent = made.len() - 1;
+      let next = edited(
+        &made,
+        parent,
+        (&format!("file-{at}"), &text(at, true), &text(at, false)),
+        "change",
+      );
+      made.push(next);
+    }
+    let second: Vec<usize> = (DELTA_FILES..2 * DELTA_FILES).collect();
+    let changed = pushed_bytes_to(
+      hg.repository,
+      &crate::vcs_http::daemon_edge_tests::history_bundle(&made, &second),
+    )
+    .await;
+    let brought = crate::repository::svn_commit::tests::on(|state| {
+      state
+        .refusals
+        .get(super::BASE_STORE_READS)
+        .copied()
+        .unwrap_or(0)
+    });
+    (added, changed, brought)
+  });
+  assert!(
+    matches!(added, Outcome::Accepted(_)),
+    "the first push: {added:?}"
+  );
+  assert!(
+    matches!(changed, Outcome::Accepted(_)),
+    "the second push: {changed:?}"
+  );
+  assert_eq!(
+    brought,
+    u64::try_from(DELTA_FILES).unwrap(),
+    "every base brought back from the node's store"
+  );
 }
 
 /// Bookmark `mark` pushed to repository `id` at `node` alone (a `bookmarks` part, as `hg push -B` sends one for a

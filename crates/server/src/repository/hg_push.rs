@@ -1980,6 +1980,31 @@ async fn bring_back_named(
 /// its windows let go once its segment was durable (A-887). Format: a counter name in the status report.
 pub(crate) const PUSHED_TEXTS_BROUGHT_BACK: &str = "vcs.hg.pushed_texts_brought_back";
 
+/// The shard's content arena and repository content store as a push's planning reads them ([`built_works`]): the
+/// arena's held frees, capacity, mapped, allocated bytes and allocations, then the content store's used bytes, objects
+/// and windows kept, for a log line.
+fn planning_reading(state: &ShardState) -> String {
+  // Inside a lend the shard's chunk store is the windows' (`vcs_store::lent_state`), the shard's a placeholder.
+  let arena = vcs_store::chunk_windows(&state.vcs_stores)
+    .map(vcs_store::arena_windows::ChunkWindows::lent_chunks)
+    .filter(|chunks| chunks.arena().capacity() > 0)
+    .unwrap_or(&state.store.content)
+    .arena();
+  let census = state
+    .vcs_stores
+    .content()
+    .map(slates_vcs::ContentStore::census);
+  format!(
+    "(arena held {} capacity {} mapped {} allocated {} allocations {}; content {:?})",
+    arena.deferred_bytes(),
+    arena.capacity(),
+    arena.mapped_bytes(),
+    arena.allocated_bytes(),
+    arena.allocations(),
+    census.map(|census| (census.used, census.objects, census.stored)),
+  )
+}
+
 /// The works `forked`'s push makes, built before its landing a unit a turn (A-767 C1, the push spin; main's ruling (1)
 /// of 2026-11-21 13:26): its moves planned as the landing will judge them ([`Works::Planning`], within a copy of
 /// `room`), each one's trees laid out in a turn of its own (`tree::begin_work`), then its builder advanced a turn at a
@@ -1998,16 +2023,30 @@ async fn built_works(
   let mut plan = Vec::new();
   let mut planning_room = *room;
   let planned = crate::state::with_state(|state| {
-    vcs_store::lent_state(state, |state| {
-      judged_over(
+    // What the planning holds and frees, read at its four points (main's 57k of 2026-11-27 19:57: one planning borrow
+    // freed 4,708,360,192 bytes into the frees held for the committed image, the arena's capacity and allocations
+    // unchanged across it): a line a push.
+    let before = planning_reading(state);
+    let (planned, (lent, judged)) = vcs_store::lent_state(state, |state| {
+      let lent = planning_reading(state);
+      let planned = judged_over(
         state,
         repository,
         (principal, name),
         unbundle,
         forked,
         (&mut Works::Planning(&mut plan), &mut planning_room),
-      )
-    })
+      );
+      (planned, (lent, planning_reading(state)))
+    });
+    slates_machine::log_line!(
+      "slates-server: partition {}: a push's planning ({} moves planned): before the lend {before}; lent {lent}; \
+       judged {judged}; handed back {}",
+      state.partition,
+      plan.len(),
+      planning_reading(state)
+    );
+    planned
   })
   .flatten()?;
   if let Err(outcome) = planned {
@@ -2866,7 +2905,7 @@ fn landed_segment(
   (run, segment): (&mut super::hg_run::Run, &PushSegment),
   (entry, ok): (slates_hg::import::record::SegmentEntry, bool),
   counted: Option<&mut slates_hg::push::pins::Counted>,
-) -> Result<(), PushOutcome> {
+) -> Result<u64, PushOutcome> {
   if !ok {
     state.count(super::hg_run::SEGMENTS_UNLANDED, 1);
     return Err(PushOutcome::refused(&abort(UNLANDED.to_vec())));
@@ -2886,17 +2925,8 @@ fn landed_segment(
         .map(|content| counted.count_out(content, &segment.contents))
     });
   }
-  // An elective change: none while a publication of the shard's image is owed past its bound (A-870 piece 2, main's
-  // progress rule); the texts then stay until the run commits, whose let-go waits for the pause to end.
-  let freed = if crate::content_holder::image_paused(state) {
-    0
-  } else {
-    super::hg_run::let_go_landed(state, None, &segment.contents)
-  };
-  let (held, texts) = run.texts_landed((kept, freed));
-  state.count_max(PUSH_HELD_HIGH_BYTES, held);
-  state.count_max(PUSH_TEXTS_HIGH_BYTES, texts);
-  Ok(())
+  // Its texts let go a slice a borrow by its caller (`segment_let_go`), which notes the high-water after.
+  Ok(kept)
 }
 
 /// Counter: the most a push held at once, bytes (goal 93, the 410 MiB bar; main's ruling of 2026-11-23): its admission
@@ -2957,6 +2987,55 @@ pub(crate) struct Taking {
   sized: Vec<slates_hg::push::sized::Landed>,
 }
 
+/// The intake's stages by name, as `slates_hg::push::intake::Intake::stage_kind` names them: the slots of a slice's
+/// reading of what it freed ([`note_slice_held`]).
+const INTAKE_STAGES: [&str; 6] = [
+  "changelog",
+  "manifests",
+  "files",
+  "manifests present",
+  "files present",
+  "done",
+];
+
+/// Counter: the most bytes one intake slice freed into the frees held for the committed image (`Taking::slice`;
+/// main's 57k of 2026-11-27: 42.0 MB in one slice). Format: a counter name in the status report.
+pub(crate) const INTAKE_SLICE_HELD_MOST: &str = "vcs.hg.intake_slice_held_most";
+
+/// Notes what one intake slice freed into the frees held for the committed image, `freed` by stage
+/// ([`INTAKE_STAGES`]), `fresh` of it bytes of slabs sealed since the latest cut began (no image names them; (ii)'s
+/// reading of an uncapture's reach): the most any slice freed counted ([`INTAKE_SLICE_HELD_MOST`]), and at each
+/// doubling of it past a copy slice a line naming each stage's share, so the kind of a slice that frees without bound
+/// is named.
+fn note_slice_held(state: &mut ShardState, (freed, fresh): (&[u64; INTAKE_STAGES.len()], u64)) {
+  let total = freed
+    .iter()
+    .fold(0u64, |total, bytes| total.saturating_add(*bytes));
+  if total == 0 {
+    return;
+  }
+  let most = state
+    .refusals
+    .get(INTAKE_SLICE_HELD_MOST)
+    .copied()
+    .unwrap_or(0);
+  if total > most.saturating_mul(2) && total > state.config.copy_slice_bytes() {
+    let shares: Vec<(&str, u64)> = INTAKE_STAGES
+      .iter()
+      .copied()
+      .zip(freed.iter().copied())
+      .filter(|(_, bytes)| *bytes > 0)
+      .collect();
+    slates_machine::log_line!(
+      "slates-server: partition {}: one intake slice freed {total} bytes into the frees held for the committed image \
+       (the most one slice freed before, {most}), by stage {shares:?}; {fresh} bytes held of slabs sealed since the \
+       latest cut began",
+      state.partition
+    );
+  }
+  state.count_max(INTAKE_SLICE_HELD_MOST, total);
+}
+
 impl Taking {
   /// One slice: units taken until the intake is done or the shard's quantum is spent, within the room `lend` gives the
   /// stores; none when the content store is gone.
@@ -2975,13 +3054,28 @@ impl Taking {
     let costs = &mut self.costs;
     let counted = &mut self.counted;
     let mut most = slates_hg::push::pins::PinLook::default();
+    // What the slice's steps freed into the frees held for the committed image, by the stage each took (main's 57k of
+    // 2026-11-27 19:00: one slice freed 42.0 MB, its kind unknown): a reading, no bound.
+    let mut freed = [0u64; INTAKE_STAGES.len()];
+    let mut fresh = 0u64;
     let sliced = vcs_store::within_budget(state, lend, |stores| {
       let content = stores.content_mut()?;
+      let fresh_before = crate::content_holder::fresh_held_lent(content);
       let stepped = loop {
         if !paced.more(vcs_store::ANSWER_STEP, costs) {
           break Ok(Stepped::More);
         }
+        let kind = intake.stage_kind();
+        let held_before = crate::content_holder::held_lent(content);
         let step = intake.step(payload.as_slice(), content, room);
+        let grown = crate::content_holder::held_lent(content).saturating_sub(held_before);
+        if let Some(slot) = INTAKE_STAGES
+          .iter()
+          .position(|stage| *stage == kind)
+          .and_then(|at| freed.get_mut(at))
+        {
+          *slot = slot.saturating_add(grown);
+        }
         // What the step kept pins the windows it names until its own segment lands (goal 93, main's ruling of
         // 2026-11-24): a pin past the bound refused typed, never grown. Pinned within the step, so the pace measures it
         // as the step's own (main's A/B at 608930048: one slice's pins, after its steps, took 3,646 revisions at once).
@@ -3003,9 +3097,11 @@ impl Taking {
           other => break other,
         }
       };
+      fresh = crate::content_holder::fresh_held_lent(content).saturating_sub(fresh_before);
       Some(stepped)
     });
     paced.close(slates_rt::futures::now_ns(), costs);
+    note_slice_held(state, (&freed, fresh));
     state.count(INTAKE_SLICES, 1);
     state.count_max(PIN_REVISIONS_STEP_MOST, most.revisions);
     state.count_max(PIN_WINDOWS_STEP_MOST, most.windows);
@@ -3353,20 +3449,57 @@ async fn segment_landed(
     let source = crate::vcs_store::homes::HomeSource::Held(identity, len);
     let (homed, _) = super::hg_run::homed_for(run, source).await?;
     if let Err(refused) = homed {
-      crate::state::with_state(|state| held.given_back(state, (false, &[])))?;
+      crate::state::with_state(|state| held.given_back(state, false))?;
       return Some(Err(PushOutcome::refused(&abort(
         unhomed_words(&refused).to_vec(),
       ))));
     }
   }
   let ok = held.landed().await.is_ok();
-  crate::state::with_state(|state| {
-    let shards = state.shards.clone();
-    held.given_back(state, (ok, &shards));
+  let kept = crate::state::with_state(|state| {
+    held.given_back(state, ok);
     if ok {
       super::hg_run::count_landed(state, held.section_bytes());
     }
     landed_segment(state, (run, segment), (held.entry(), ok), Some(counted))
+  })?;
+  match kept {
+    Ok(kept) => segment_let_go(run, segment, kept).await.map(Ok),
+    Err(outcome) => Some(Err(outcome)),
+  }
+}
+
+/// Lets go of a landed segment's file texts a slice a borrow, yielding between (`hg_run::let_go_landed_slice`: a copy
+/// slice of bytes, a revision at least, within half the step quantum), then notes the push's high-water with what they
+/// held, `kept` bytes, and what was let go. Before (main's 57k of 2026-11-27 19:57) they were let go whole inside the
+/// landing's borrow: 357.6 MB into the frees held for the committed image in one borrow. None where the shard's state
+/// went away. A publication owed past its bound stops it: the rest stays until the run commits, whose let-go waits for
+/// the pause to end (A-870 piece 2, main's progress rule).
+async fn segment_let_go(
+  run: &mut super::hg_run::Run,
+  segment: &PushSegment,
+  kept: u64,
+) -> Option<()> {
+  let mut freed = 0u64;
+  let mut at = 0usize;
+  while let Some(rest) = segment.contents.get(at..).filter(|rest| !rest.is_empty()) {
+    let step = crate::state::with_state(|state| {
+      if crate::content_holder::image_paused(state) {
+        return None;
+      }
+      Some(super::hg_run::let_go_landed_slice(state, rest))
+    })?;
+    let Some((more, taken)) = step else {
+      break;
+    };
+    freed = freed.saturating_add(more);
+    at = at.saturating_add(taken.max(1));
+    slates_rt::futures::yield_now().await;
+  }
+  crate::state::with_state(|state| {
+    let (held, texts) = run.texts_landed((kept, freed));
+    state.count_max(PUSH_HELD_HIGH_BYTES, held);
+    state.count_max(PUSH_TEXTS_HIGH_BYTES, texts);
   })
 }
 

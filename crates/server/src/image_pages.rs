@@ -726,6 +726,10 @@ pub(crate) struct Encoder {
   turns: u64,
   /// Whether a task is encoding on to publish once caught up (`content_holder::image_catch_up`).
   catching_up: bool,
+  /// When the encoder last turned, on the host's monotonic clock ([`Encoder::note_turned`]): the catch-up's reading.
+  turned_ns: u64,
+  /// The held frees each doubling line last logged ([`HeldLine`], [`Encoder::held_log_due`]).
+  held_logged: HeldLogged,
   /// The tasks whose elective changes wait while paused ([`Encoder::paused`]), each once (`Waker::will_wake`), woken by
   /// the publication that carries the cut ([`Encoder::committed`]). Bound: the let-go tasks live on the shard (a landed
   /// pack's queue, one; a committed hg run's or import's, one each).
@@ -737,6 +741,19 @@ pub(crate) struct Encoder {
   /// twice a page's bytes in entries ([`Encoder::read_cap`]); a page of one coordinate read whole may grow it past that
   /// for its turn, which shrinks it back before it is kept.
   scratch: Vec<Entry>,
+  /// Whether a cut was asked for since the last began: a ticket's wait (`homes::PublishedHere`), or the shard settling
+  /// idle ([`Encoder::ask`]). Such a cut begins whatever its cost (A-930's cadence, main's ruling (ii) of 2026-11-27).
+  asked: bool,
+  /// The bytes changed since the last cut began, as their pages' committed pieces measure them: a change's coordinate
+  /// counted once, at its page's mean committed entry ([`Encoder::mark`]).
+  changed: u64,
+  /// The bytes the content arena holds freed for the committed cut, which may name them ([`Encoder::hold`]): what not
+  /// cutting costs in memory, counted with the changes, so a cut deferred never holds more than it would cost.
+  held: u64,
+  /// The held frees past which the shard's sweep looks at once rather than an interval on
+  /// ([`Encoder::held_past_look`]): the waiting cut's cost at the last drain, or twice what was held then, whichever
+  /// is more.
+  look_at: u64,
 }
 
 /// An image cut in flight (F2): the pages dirty at its moment not yet re-encoded, and its
@@ -749,9 +766,29 @@ struct Cut {
   marked: BTreeMap<(Family, Page), Marked>,
   /// Its generation in homes' tickets.
   generation: u64,
+  /// The encoder's turns as it began ([`Encoder::catch_up_reading`]).
+  begun_at: u64,
   /// Test support (F2's oracle): its pages at its moment, which bound its pre-images.
   #[cfg(test)]
   frozen: Vec<(Family, Page)>,
+}
+
+/// A line that logs the held frees at each doubling (`content_holder`): at a drain, or at a borrow's end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeldLine {
+  /// `content_holder::image_drain`'s, with the cadence's state.
+  Drain,
+  /// `content_holder::note_held_at_borrow`'s, with the catch-up's state.
+  Borrow,
+}
+
+/// The held frees each [`HeldLine`] last logged: the drain's and the borrow end's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HeldLogged {
+  /// The drain line's.
+  drain: u64,
+  /// The borrow end's.
+  borrow: u64,
 }
 
 /// What a turn of the encoder did: the bytes it encoded, and whether the cut in flight is wholly encoded after it.
@@ -763,7 +800,9 @@ pub(crate) struct Turned {
   /// Of the bytes spent, those copied from committed pieces into the pages appended to, cut or split from them, encoding
   /// none of them (A-930): what a publication's page costs past what it encodes.
   pub(crate) copied: u64,
-  /// Whether the cut in flight is wholly encoded, or none is and nothing is dirty: a publication carries it.
+  /// Whether the cut in flight is wholly encoded, or none is and nothing is dirty (a publication carries it); or none
+  /// is and none is due, the changes waiting for it (A-930's cadence: a publication carries the committed cut again and
+  /// owes nothing).
   pub(crate) caught_up: bool,
   /// Whether the turn ran while paused.
   pub(crate) paused: bool,
@@ -833,13 +872,20 @@ impl Encoder {
     }
     let paused = self.paused();
     for (page, at) in pages {
+      let entry = self.committed_entry_bytes((family, page));
       let marked = self
         .dirty_marks
         .entry((family, page))
         .or_insert_with(|| Marked::At(BTreeSet::new()));
+      let mut fresh = 0u64;
       if let Marked::At(marks) = marked {
-        marks.extend(at);
+        for coordinate in at {
+          if marks.insert(coordinate) {
+            fresh = fresh.saturating_add(1);
+          }
+        }
       }
+      self.changed = self.changed.saturating_add(fresh.saturating_mul(entry));
       if self.dirty.insert((family, page)) && paused {
         self.dirtied_paused.insert((family, page));
       }
@@ -854,9 +900,109 @@ impl Encoder {
     }
   }
 
-  /// Whether a cut may begin: none in flight, and a page dirty.
+  /// Whether a cut may begin: none in flight, a page dirty, and the cut due ([`Encoder::due`]).
   pub(crate) fn can_begin(&self) -> bool {
-    self.cut.is_none() && !self.dirty.is_empty()
+    self.cut.is_none() && !self.dirty.is_empty() && self.due()
+  }
+
+  /// Whether the next cut is due (A-930's cadence; main's ruling (ii) of 2026-11-27): asked for ([`Encoder::ask`]), or
+  /// the bytes changed since the last cut have come to what the cut costs, its dirty pages' committed bytes
+  /// ([`Encoder::cut_cost`]), the changes counted with the freed bytes the arena holds for the committed cut
+  /// ([`Encoder::hold`]). A cut's cost is its dirty pages whole however they are moved, so begun at that pace the cuts'
+  /// whole work is about the changes' own bytes, whatever a turn costs, and a cut deferred never holds more memory than
+  /// it would cost; until then a publication carries the committed cut again and nothing is owed
+  /// ([`Encoder::deferred`]).
+  pub(crate) fn due(&self) -> bool {
+    self.asked || self.changed.saturating_add(self.held) >= self.cut_cost()
+  }
+
+  /// Notes the bytes the content arena holds freed for the committed cut (A-64's deferred frees): the memory a deferred
+  /// cut keeps, which its cadence counts with the changes ([`Encoder::due`]).
+  pub(crate) fn hold(&mut self, bytes: u64) {
+    self.held = bytes;
+    self.look_at = self.cut_cost().max(bytes.saturating_mul(2)).max(1);
+  }
+
+  /// Whether the arena's held frees, `held` bytes now, call for the sweep's look at once (A-930's cadence; main's 57k
+  /// of 2026-11-27 16:55 on 8974631df: a sweep an interval apart let 357,847,040 bytes pile up between its looks): no
+  /// cut in flight, whose commit gives them back, and `held` past the look the last drain set (`look_at`). So a
+  /// push that frees faster than an interval has its waiting cut looked at, begun where due ([`Encoder::due`]), as
+  /// soon as its frees pass its cost, and frees no cut can give back (none of a paged change) ask a look only at each
+  /// doubling.
+  ///
+  /// Its bound: each look sets the next at twice the frees held then or the cut's cost, whichever is more
+  /// ([`Encoder::hold`]), so past the cost the held frees ask at most one look a doubling, at most log2(held / cost)
+  /// and one looks however long they rise. Its cost at each borrow's close: one gauge, the arena's deferred bytes (a
+  /// sum of the count each of its regions keeps, no walk of blocks or pages), against one threshold kept here.
+  pub(crate) fn held_past_look(&self, held: u64) -> bool {
+    self.cut.is_none() && held > 0 && held >= self.look_at
+  }
+
+  /// What the cut in flight has left to encode: each page left its committed piece's bytes, a page's `page_bytes` at
+  /// least (a page no cut committed is still encoded, up to a page); none where no cut is in flight. What the
+  /// catch-up's wake weighs the held frees against (`content_holder::image_catch_up_slice`).
+  pub(crate) fn in_flight_left(&self, page_bytes: u64) -> u64 {
+    self.cut.as_ref().map_or(0, |cut| {
+      cut.remaining.iter().fold(0u64, |left, page| {
+        let committed = self
+          .committed
+          .get(page)
+          .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        left.saturating_add(committed.max(page_bytes))
+      })
+    })
+  }
+
+  /// The cadence's state for a log line: a cut in flight, the pages dirty, the next cut's cost, the bytes changed and
+  /// held, and whether it is due.
+  pub(crate) fn cadence_reading(&self) -> (bool, usize, u64, u64, u64, bool) {
+    (
+      self.cut.is_some(),
+      self.dirty.len(),
+      self.cut_cost(),
+      self.changed,
+      self.held,
+      self.due(),
+    )
+  }
+
+  /// What the next cut costs: the committed bytes of the pages dirty now (a page no cut has committed costs nothing).
+  fn cut_cost(&self) -> u64 {
+    self.dirty.iter().fold(0u64, |cost, page| {
+      cost.saturating_add(
+        self
+          .committed
+          .get(page)
+          .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+      )
+    })
+  }
+
+  /// The mean bytes of an entry of `page`'s committed piece (its bytes over its count), none for a page no cut
+  /// committed: what one change there is counted as ([`Encoder::changed`]).
+  fn committed_entry_bytes(&self, page: (Family, Page)) -> u64 {
+    let Some(bytes) = self.committed.get(&page) else {
+      return 0;
+    };
+    let count = bytes
+      .get(1..PAGE_HEAD)
+      .and_then(|count| count.try_into().ok())
+      .map_or(0, u32::from_le_bytes);
+    u64::try_from(bytes.len())
+      .unwrap_or(u64::MAX)
+      .checked_div(u64::from(count))
+      .unwrap_or(0)
+  }
+
+  /// Whether pages are dirty and no cut is in flight or due: a publication now carries the committed cut again, and
+  /// owes nothing (the changes wait for the cut that is due, asked, or the shard's idle).
+  pub(crate) fn deferred(&self) -> bool {
+    self.cut.is_none() && !self.dirty.is_empty() && !self.due()
+  }
+
+  /// Asks for the next cut whatever its cost: a ticket's wait for its window's publication, or the shard settling idle.
+  pub(crate) fn ask(&mut self) {
+    self.asked = true;
   }
 
   /// Begins a cut of the pages dirty now, of `generation` in homes' tickets, where one may ([`Encoder::can_begin`]): the
@@ -867,10 +1013,13 @@ impl Encoder {
     }
     let remaining = core::mem::take(&mut self.dirty);
     let pages: Vec<(Family, Page)> = remaining.iter().copied().collect();
+    self.asked = false;
+    self.changed = 0;
     self.cut = Some(Cut {
       remaining,
       marked: core::mem::take(&mut self.dirty_marks),
       generation,
+      begun_at: self.turns,
       #[cfg(test)]
       frozen: pages.clone(),
     });
@@ -880,6 +1029,46 @@ impl Encoder {
   /// Whether a cut is in flight: begun, its publication not yet committed.
   pub(crate) fn cut_is_in_flight(&self) -> bool {
     self.cut.is_some()
+  }
+
+  /// Whether the line `line` logs `held` held frees: past `floor` and past twice what it last logged, its mark then
+  /// moved to `held`. So a slow climb logs once a doubling. A mark moved by every reading, as the status counter's
+  /// most is, never logs a climb of under twice a reading (main's 57k of 2026-11-28: held rose to 4,703,485,952 bytes
+  /// about 2 MB a borrow, and the borrow end's line went silent past 1,126,400).
+  pub(crate) fn held_log_due(&mut self, line: HeldLine, held: u64, floor: u64) -> bool {
+    let mark = match line {
+      HeldLine::Drain => &mut self.held_logged.drain,
+      HeldLine::Borrow => &mut self.held_logged.borrow,
+    };
+    let due = held > floor && held > mark.saturating_mul(2);
+    if due {
+      *mark = held;
+    }
+    due
+  }
+
+  /// Notes a turn at `now_ns` on the host's monotonic clock (`content_holder::image_turn`).
+  pub(crate) fn note_turned(&mut self, now_ns: u64) {
+    self.turned_ns = now_ns;
+  }
+
+  /// When the encoder last turned ([`Encoder::note_turned`]), none before its first.
+  pub(crate) fn turned_ns(&self) -> u64 {
+    self.turned_ns
+  }
+
+  /// The catch-up's state, for the held frees' reading (`content_holder::note_held_at_borrow`): whether a task encodes
+  /// on, whether a publication is owed, the turns since the cut in flight began (none without one), and the turns run.
+  pub(crate) fn catch_up_reading(&self) -> (bool, bool, Option<u64>, u64) {
+    (
+      self.catching_up,
+      self.owed.is_some(),
+      self
+        .cut
+        .as_ref()
+        .map(|cut| self.turns.saturating_sub(cut.begun_at)),
+      self.turns,
+    )
   }
 
   /// Test support (F2's oracle): the cut in flight's generation and its pages at its moment.
@@ -978,7 +1167,7 @@ impl Encoder {
     Turned {
       bytes: u64::try_from(spent).unwrap_or(u64::MAX),
       copied: u64::try_from(copied).unwrap_or(u64::MAX),
-      caught_up: self.complete(),
+      caught_up: self.complete() || self.deferred(),
       paused,
       imposed: u64::try_from(imposed).unwrap_or(u64::MAX),
       split: split_at_stop.0,
@@ -1680,6 +1869,8 @@ mod tests {
       };
       let ids = put_landed(state, (0, KEPT));
       crate::content_holder::image_drain(state);
+      // A cut asked for, as every publication asks (A-930's cadence begins none before it is due).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
       let (image, carried) = crate::content_holder::held_image_paged(state);
       crate::content_holder::held_committed(state, crate::content_holder::whole_of(&image), true);
@@ -1737,6 +1928,1031 @@ mod tests {
     assert!(
       encoded <= u64::try_from(PAGE).unwrap(),
       "{LET_GO} let-goes encoded {encoded} windows bytes, past a page"
+    );
+  }
+
+  /// [`a_cut_nobody_waits_on_begins_once_its_changes_come_to_its_cost`]'s flow on a shard: objects let go and a cut of
+  /// them begun, then [`CADENCE_APPENDS`] landed records noted (paged changes that free nothing), each followed by a
+  /// catch-up turn and no publication, the next cut asked at each commit where `ask_each` (as every commit began one
+  /// before A-930's cadence), then the shard settled idle (`content_holder::image_retry_owed`). The cuts begun and the
+  /// bytes they copied and encoded after the checkpoint, and whether the committed image is then the shard's entries.
+  fn cadenced(ask_each: bool) -> (u64, u64, bool) {
+    crate::daemon::audit_on_shard(move |state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(CADENCE_PAGE));
+      let counted = |state: &crate::state::ShardState| {
+        let of = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        (
+          of(crate::content_holder::IMAGE_CUTS),
+          of(crate::content_holder::IMAGE_COPIED_BYTES)
+            + of(crate::content_holder::IMAGE_ENCODED_BYTES),
+        )
+      };
+      let caught_up_owed = |state: &mut crate::state::ShardState| {
+        while state.image_encoder.owed() {
+          let _ = crate::content_holder::image_catch_up_step(state);
+        }
+      };
+      let _ = let_go_and_note(state, (0, ENTRIES / 10));
+      let before = counted(state);
+      // One publication begins a cut of them all, then the let-goes arrive while the catch-up encodes, a turn after
+      // each, as a push lets go while its cuts are encoded: each cut's commit begins the next (the catch-up's chain),
+      // asked at every commit where `ask_each`, as every commit began one before A-930's cadence.
+      crate::verbs::publish_shard(state).unwrap();
+      for at in 0..CADENCE_APPENDS {
+        // A paged change that frees nothing (a landed record noted): this flow weighs change bytes against a cut's
+        // cost; frees held for a cut are the held tests'
+        // (`a_deferred_cut_holds_no_more_freed_bytes_than_it_would_cost`).
+        let record = slates_vcs::ContentId::of(
+          format!("a landed record noted in the chain, number {at}").as_bytes(),
+        );
+        crate::vcs_store::homes::note_landed(
+          record,
+          crate::vcs_store::homes::Landed::Pack(crate::vcs_store::homes::LandedAt {
+            pack: record,
+            len: 1 << 20,
+            offset: at,
+          }),
+        );
+        if ask_each {
+          state.image_encoder.ask();
+        }
+        if state.image_encoder.owed() {
+          let _ = crate::content_holder::image_catch_up_step(state);
+        }
+      }
+      settled_idle(state);
+      caught_up_owed(state);
+      let committed = crate::verbs::committed_held(state)
+        .map(|held| crate::content_holder::paged_entries_of(&held));
+      let caught_up = committed == Some(crate::content_holder::paged_entries_now(state));
+      let after = counted(state);
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (after.0 - before.0, after.1 - before.1, caught_up)
+    })
+  }
+
+  /// The shard's sweep pass while it is busy, the arena having allocated since the last pass's give-back
+  /// (`content_holder::image_retry_owed`, which then begins a cut only where it is due).
+  fn busy_pass(state: &mut crate::state::ShardState) {
+    state.purge_seen_allocations = state.store.content.arena().allocations().wrapping_sub(1);
+    let _ = crate::content_holder::image_retry_owed(state);
+  }
+
+  /// The shard's sweep pass once it has settled idle, nothing allocated since the last pass's give-back
+  /// (`content_holder::image_retry_owed`, which then asks for the cut waiting).
+  fn settled_idle(state: &mut crate::state::ShardState) {
+    state.purge_seen_allocations = state.store.content.arena().allocations();
+    let _ = crate::content_holder::image_retry_owed(state);
+  }
+
+  /// Shape: the page [`cadenced`] pins.
+  const CADENCE_PAGE: usize = 4096;
+  /// Shape: the let-goes [`cadenced`] makes, a catch-up turn after each.
+  const CADENCE_APPENDS: u64 = 300;
+
+  /// Goal 93, A-930's cadence (main's rulings (ii) and (a) of 2026-11-27; the 57k at 894a1e111: 3,291 cuts copied
+  /// 697,376,174 bytes, the catch-up's chain beginning a cut at each commit). Do: run [`cadenced`]'s let-goes, each
+  /// followed by a catch-up turn and no publication, once with the next cut asked at every commit (as every commit
+  /// began one before) and once as the cadence gates the chain, then the shard settled idle. Expect, with the cadence,
+  /// at most a tenth of the cuts and at most half the bytes copied and encoded, and once idle the committed image the
+  /// shard's entries both ways. Red before: the two the same, a cut at each commit.
+  #[test]
+  fn a_cut_nobody_waits_on_begins_once_its_changes_come_to_its_cost() {
+    let each = cadenced(true);
+    let paced = cadenced(false);
+    println!(
+      "a cut asked at each commit: {} cuts, {} bytes copied and encoded; the cadence: {} cuts, {} bytes ({} \
+       let-goes, a turn after each, a page of {CADENCE_PAGE})",
+      each.0, each.1, paced.0, paced.1, CADENCE_APPENDS
+    );
+    assert!(
+      each.2 && paced.2,
+      "once idle, the committed image is the shard's entries"
+    );
+    assert!(
+      paced.0 * 10 <= each.0,
+      "{} cuts with the cadence against {} a cut each publication",
+      paced.0,
+      each.0
+    );
+    assert!(
+      paced.1 * 2 <= each.1,
+      "{} bytes copied and encoded with the cadence against {}",
+      paced.1,
+      each.1
+    );
+  }
+
+  /// What [`held_flow`] read: each publication's arena deferred bytes, next cut's cost and whether a cut was deferred;
+  /// the cuts begun before idle, the publications deferred, the held-bytes peak and the granule; and whether, once
+  /// idle, the committed image is the shard's entries.
+  type HeldFlow = (Vec<(u64, u64, bool)>, (u64, u64, u64, u64), bool);
+
+  /// [`a_deferred_cut_holds_no_more_freed_bytes_than_it_would_cost`]'s flow on a shard, its page pinned at
+  /// [`HELD_PAGE_GRANULES`] of the arena's granule: [`HELD_OBJECTS`] objects of a granule each (a chunk each, never a
+  /// slab's slot), then [`HELD_FILL`] small ones after them, so the large ones' entries share a page, all published and
+  /// caught up, so the committed image names their blocks; then each large object let go with nothing published, as a
+  /// let-go-heavy push with no ticket waiting lets go, and the shard's sweep pass run as a busy shard's
+  /// ([`busy_pass`]), with the catch-up it owes. After each pass and its catch-up: the arena's deferred bytes, the next
+  /// cut's cost, and whether a cut is waiting. Then the cuts begun before idle, the passes that left a cut waiting, the
+  /// held-bytes peak gauge, the granule, and whether once idle the committed image is the shard's entries.
+  fn held_flow() -> HeldFlow {
+    crate::daemon::audit_on_shard(move |state| {
+      let granule = state.store.content.arena().granule();
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(granule * HELD_PAGE_GRANULES));
+      let of = |state: &crate::state::ShardState, name: &str| {
+        state.refusals.get(name).copied().unwrap_or(0)
+      };
+      let caught_up_owed = |state: &mut crate::state::ShardState| {
+        while state.image_encoder.owed() {
+          let _ = crate::content_holder::image_catch_up_step(state);
+        }
+      };
+      let window = state.store.content.chunk_bytes();
+      state.vcs_stores.content_made(window).unwrap();
+      let texts: Vec<Vec<u8>> = (0..HELD_OBJECTS)
+        .map(|at| {
+          let mut text =
+            format!("a chunk's text let go after its image named it, number {at}\n").into_bytes();
+          text.resize(granule, b'h');
+          text
+        })
+        .chain(
+          (0..HELD_FILL)
+            .map(|at| format!("a small text kept beside them, number {at}\n").into_bytes()),
+        )
+        .collect();
+      let need: u64 = texts.iter().map(|text| text.len() as u64).sum();
+      let ids: Vec<slates_vcs::ContentId> =
+        crate::vcs_store::within_budget(state, need, |stores| {
+          let content = stores.content_mut().unwrap();
+          texts
+            .iter()
+            .take(HELD_OBJECTS)
+            .map(|text| {
+              let id = content.put_object(text).unwrap();
+              assert!(content.mark_landed(&id));
+              id
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .chain(
+              texts
+                .iter()
+                .skip(HELD_OBJECTS)
+                .map(|text| content.put_object(text).unwrap()),
+            )
+            .collect()
+        });
+      crate::verbs::publish_shard(state).unwrap();
+      caught_up_owed(state);
+      let cuts_before = of(state, crate::content_holder::IMAGE_CUTS);
+      let mut steps = Vec::new();
+      for (at, id) in ids.iter().take(HELD_OBJECTS).enumerate() {
+        crate::vcs_store::within_budget(state, 0, |stores| {
+          stores
+            .content_mut()
+            .unwrap()
+            .let_go_landed(id, None)
+            .unwrap();
+        });
+        crate::vcs_store::homes::note_landed(
+          *id,
+          crate::vcs_store::homes::Landed::Pack(crate::vcs_store::homes::LandedAt {
+            pack: *id,
+            len: 1 << 20,
+            offset: u64::try_from(at).unwrap(),
+          }),
+        );
+        busy_pass(state);
+        caught_up_owed(state);
+        steps.push((
+          u64::try_from(state.store.content.arena().deferred_bytes()).unwrap(),
+          state.image_encoder.cut_cost(),
+          state.image_encoder.deferred(),
+        ));
+      }
+      let counted = (
+        of(state, crate::content_holder::IMAGE_CUTS) - cuts_before,
+        u64::try_from(steps.iter().filter(|(_, _, waiting)| *waiting).count()).unwrap(),
+        of(state, crate::content_holder::IMAGE_HELD_PEAK),
+        u64::try_from(granule).unwrap(),
+      );
+      settled_idle(state);
+      caught_up_owed(state);
+      let committed = crate::verbs::committed_held(state)
+        .map(|held| crate::content_holder::paged_entries_of(&held));
+      let caught_up = committed == Some(crate::content_holder::paged_entries_now(state));
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (steps, counted, caught_up)
+    })
+  }
+
+  /// Shape: the page [`held_flow`] pins, in the arena's granules: a page's entries cost several of the granule
+  /// objects' frees, so a cut is deferred over a few let-goes before their held bytes come to its cost.
+  const HELD_PAGE_GRANULES: usize = 8;
+  /// Shape: the granule objects [`held_flow`] lets go one a publication.
+  const HELD_OBJECTS: usize = 40;
+  /// Shape: the small objects [`held_flow`] keeps after the granule objects, filling their page.
+  const HELD_FILL: usize = 2_000;
+
+  /// Goal 93, A-930's cadence's held term (main's ruling of 2026-11-27 07:19, §2 item 8: a deferred cut's held memory
+  /// bounded by a derived number; main's plan (a) of 2026-11-27: the sweep looks at what no publication drained). Do:
+  /// run [`held_flow`], granule objects the committed image names let go one a sweep pass, nothing published and the
+  /// shard busy. Expect some passes leaving a cut waiting and cuts begun before idle; after every pass that leaves a
+  /// cut waiting, the arena's deferred bytes under that cut's cost; the held peak gauge the most the arena held at a
+  /// pass, within a cut's cost and one let-go's frees; and once idle the committed image the shard's entries. Red
+  /// with the held term taken out of `Encoder::due`, and red with the pass looking before it drains (81950e77c's,
+  /// whose 57k push held a peak of 161,943,552 bytes): no cut before idle, every let-go's frees held.
+  #[test]
+  fn a_deferred_cut_holds_no_more_freed_bytes_than_it_would_cost() {
+    let (steps, (cuts, deferred, peak, granule), caught_up) = held_flow();
+    for (at, (held, cost, waiting)) in steps.iter().enumerate() {
+      println!(
+        "let-go {at}: {held} bytes held freed, the next cut costs {cost}, deferred {waiting}"
+      );
+    }
+    println!(
+      "{cuts} cuts before idle, {deferred} passes left a cut waiting, the held peak gauge {peak} bytes"
+    );
+    assert!(
+      caught_up,
+      "once idle, the committed image is the shard's entries"
+    );
+    assert!(deferred > 0, "some pass left its cut waiting");
+    assert!(cuts > 0, "a cut began before idle, nothing asking");
+    for (at, (held, cost, waiting)) in steps.iter().enumerate() {
+      assert!(
+        !waiting || held < cost,
+        "let-go {at}: {held} bytes held freed while the cut costing {cost} is deferred"
+      );
+    }
+    let most_held = steps.iter().map(|(held, _, _)| *held).max().unwrap_or(0);
+    let most_cost = steps.iter().map(|(_, cost, _)| *cost).max().unwrap_or(0);
+    assert!(
+      peak >= most_held,
+      "the gauge {peak} under the {most_held} bytes held at a publication"
+    );
+    assert!(
+      peak <= most_cost + granule,
+      "the held peak {peak} past a cut's cost {most_cost} and one let-go's frees"
+    );
+  }
+
+  /// A shard whose committed image names [`LET_GO_KEPT`] objects (put, landed, published and caught up), then
+  /// [`LET_GO_AFTER`] of them let go with nothing published, so their changes lie in pages the image committed, far
+  /// under a cut's cost; then `then` run on the shard. Whether the committed image is then the shard's entries, and the
+  /// cuts `then` began.
+  fn let_go_after_its_image(then: fn(&mut crate::state::ShardState)) -> (bool, u64) {
+    crate::daemon::audit_on_shard(move |state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(CADENCE_PAGE));
+      let cuts = |state: &crate::state::ShardState| {
+        let of = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        of(crate::content_holder::IMAGE_CUTS)
+      };
+      let window = state.store.content.chunk_bytes();
+      state.vcs_stores.content_made(window).unwrap();
+      let ids: Vec<slates_vcs::ContentId> =
+        crate::vcs_store::within_budget(state, 1 << 20, |stores| {
+          let content = stores.content_mut().unwrap();
+          (0..LET_GO_KEPT)
+            .map(|at| {
+              let text = format!("a text the image named, then let go, number {at}\n");
+              let id = content.put_object(text.as_bytes()).unwrap();
+              assert!(content.mark_landed(&id));
+              id
+            })
+            .collect()
+        });
+      crate::verbs::publish_shard(state).unwrap();
+      while state.image_encoder.owed() {
+        let _ = crate::content_holder::image_catch_up_step(state);
+      }
+      let before = cuts(state);
+      crate::vcs_store::within_budget(state, 0, |stores| {
+        let content = stores.content_mut().unwrap();
+        for id in ids.iter().take(LET_GO_AFTER) {
+          content.let_go_landed(id, None).unwrap();
+        }
+      });
+      then(state);
+      while state.image_encoder.owed() {
+        let _ = crate::content_holder::image_catch_up_step(state);
+      }
+      let committed = crate::verbs::committed_held(state)
+        .map(|held| crate::content_holder::paged_entries_of(&held));
+      let whole = committed == Some(crate::content_holder::paged_entries_now(state));
+      let begun = cuts(state) - before;
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (whole, begun)
+    })
+  }
+
+  /// Shape: the objects [`let_go_after_its_image`]'s image names: pages of them at [`CADENCE_PAGE`].
+  const LET_GO_KEPT: usize = 600;
+  /// Shape: the objects [`let_go_after_its_image`] lets go after the image: a few entries against pages of hundreds.
+  const LET_GO_AFTER: usize = 3;
+
+  /// A-930's cadence and persistence before reply (main's revert of 2026-11-27 08:44: w-svn's restart tests read a
+  /// named text as none after a reboot at 7acfd685c; plan (a)). A publication is the barrier every path waits behind
+  /// (a FUSE close, an NFS reply, a landing, a relief, a test's `publish_every_shard`), so whatever it was made after
+  /// is in the image once its catch-up ends. Do: run [`let_go_after_its_image`] with one `verbs::publish_shard` and
+  /// nothing else asking. Expect the committed image the shard's entries, by one cut. Red at 7acfd685c: the publication
+  /// deferred its cut, its changes far under its cost, owed nothing, and the image lacked the let-goes.
+  #[test]
+  fn a_publication_carries_every_change_made_before_it_once_its_cut_is_caught_up() {
+    let (whole, cuts) = let_go_after_its_image(|state| {
+      crate::verbs::publish_shard(state).unwrap();
+    });
+    assert!(
+      whole,
+      "the committed image holds every let-go before the publication"
+    );
+    assert_eq!(cuts, 1, "the publication began one cut");
+  }
+
+  /// A-930's cadence (main's plan (a) of 2026-11-27, its 57k at 81950e77c: one idle cut a run and a held peak of
+  /// 161,943,552 bytes). Do: run [`let_go_after_its_image`] with only the shard's sweep pass once it settled idle,
+  /// nothing published, so no publication drained the changes. Expect the pass to take the changes and begin their cut,
+  /// counted an idle cut, and the committed image then the shard's entries. Red at 81950e77c: the pass looked before
+  /// it drained, saw nothing waiting, and began no cut.
+  #[test]
+  fn a_settled_sweep_pass_cuts_the_changes_no_publication_drained() {
+    let (whole, cuts) = let_go_after_its_image(settled_idle);
+    assert_eq!(cuts, 1, "the pass began the waiting cut");
+    assert!(
+      whole,
+      "the committed image holds the let-goes once its cut is caught up"
+    );
+  }
+
+  /// [`frees_held_past_the_waiting_cuts_cost_bring_the_sweep_forward`]'s scene on a shard, its page pinned at
+  /// [`HELD_PAGE_GRANULES`] granules: [`HELD_OBJECTS`] granule objects and [`HELD_FILL`] small ones published and
+  /// caught up, then every granule object let go with nothing published, then a borrow closed as every step closes
+  /// one (`idle_sweep::after_borrow`). The frees held, the waiting cut's cost, when the sweep's pass is armed, and now.
+  fn held_past_the_look() -> (u64, u64, Option<u64>, u64) {
+    use slates_vfs::clock::Clock;
+    crate::daemon::audit_on_shard(move |state| {
+      let granule = state.store.content.arena().granule();
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(granule * HELD_PAGE_GRANULES));
+      let window = state.store.content.chunk_bytes();
+      state.vcs_stores.content_made(window).unwrap();
+      let big = |at: usize| {
+        let mut text = format!("a chunk's text the image named, number {at}\n").into_bytes();
+        text.resize(granule, b'h');
+        text
+      };
+      let ids: Vec<slates_vcs::ContentId> =
+        crate::vcs_store::within_budget(state, 1 << 24, |stores| {
+          let content = stores.content_mut().unwrap();
+          let ids: Vec<slates_vcs::ContentId> = (0..HELD_OBJECTS)
+            .map(|at| {
+              let id = content.put_object(&big(at)).unwrap();
+              assert!(content.mark_landed(&id));
+              id
+            })
+            .collect();
+          for at in 0..HELD_FILL {
+            let _ =
+              content.put_object(format!("a small text beside them, number {at}\n").as_bytes());
+          }
+          ids
+        });
+      crate::verbs::publish_shard(state).unwrap();
+      while state.image_encoder.owed() {
+        let _ = crate::content_holder::image_catch_up_step(state);
+      }
+      crate::vcs_store::within_budget(state, 0, |stores| {
+        let content = stores.content_mut().unwrap();
+        for id in &ids {
+          content.let_go_landed(id, None).unwrap();
+        }
+      });
+      // The borrow closes over the frees as they piled up since the last drain, the catch-up's publication; the drain
+      // after it only reads the waiting cut's cost for the expectation.
+      crate::idle_sweep::after_borrow(state);
+      let armed = state.idle_sweep_at;
+      let held = u64::try_from(state.store.content.arena().deferred_bytes()).unwrap();
+      crate::content_holder::image_drain(state);
+      let cost = state.image_encoder.cut_cost();
+      let now = state.clock.monotonic_ns();
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (held, cost, armed, now)
+    })
+  }
+
+  /// A-930's cadence (main's 57k of 2026-11-27 16:55 on 8974631df: a held peak of 357,847,040 bytes, the sweep looking
+  /// an interval apart, so a push freeing faster than that held whatever it freed between looks). Do: run
+  /// [`held_past_the_look`]. Expect the frees held past the waiting cut's cost, and the sweep's pass armed for now.
+  /// Red before: armed an interval on (or left armed for later), as for any free deferred.
+  #[test]
+  fn frees_held_past_the_waiting_cuts_cost_bring_the_sweep_forward() {
+    let (held, cost, armed, now) = held_past_the_look();
+    println!(
+      "{held} bytes held freed against a waiting cut costing {cost}; the pass armed at {armed:?}, now {now}"
+    );
+    assert!(
+      held >= cost && held > 0,
+      "the frees held past the waiting cut's cost"
+    );
+    assert!(
+      armed.is_some_and(|at| at <= now),
+      "the sweep's pass armed for now: {armed:?} against {now}"
+    );
+  }
+
+  /// Shape: how far [`frees_no_cut_gives_back_ask_one_look_a_doubling`] raises the held frees, a byte at a time.
+  const RISING_HELD: u64 = 1 << 16;
+
+  /// A-930's cadence, the twin of [`frees_held_past_the_waiting_cuts_cost_bring_the_sweep_forward`] (main's ruling of
+  /// 2026-11-27 16:59: the looks stay one a doubling). Do: on an encoder with nothing dirty, so no cut can give back
+  /// what is held, raise the held frees a byte at a time from one to [`RISING_HELD`], as a borrow's close reads them,
+  /// and look (a drain's `Encoder::hold`) wherever `Encoder::held_past_look` asks. Expect one look a doubling: log2 of
+  /// the rise and one, never a look a borrow.
+  #[test]
+  fn frees_no_cut_gives_back_ask_one_look_a_doubling() {
+    let mut encoder = Encoder::default();
+    let mut looks = 0u32;
+    for held in 1..=RISING_HELD {
+      if encoder.held_past_look(held) {
+        looks += 1;
+        encoder.hold(held);
+      }
+    }
+    println!("{looks} looks as the held frees rose a byte at a time to {RISING_HELD}");
+    assert_eq!(
+      looks,
+      RISING_HELD.ilog2() + 1,
+      "one look a doubling of the held frees"
+    );
+  }
+
+  /// Shape: the held frees' slow climb, a hundredth a step, from a megabyte to past [`CLIMB_DOUBLINGS`] doublings of it.
+  const CLIMB_DOUBLINGS: u32 = 12;
+
+  /// The doubling lines (main's 57k of 2026-11-28: held rose to 4,703,485,952 bytes about 2 MB a borrow, the borrow
+  /// end's line silent past 1,126,400, since it compared against a most moved by every reading). Do: raise the held
+  /// frees a hundredth a step from a megabyte past [`CLIMB_DOUBLINGS`] doublings of it, asking each line whether it
+  /// logs. Expect: each line logs once a doubling, every doubling counted, never once a step. Failing first (a mark
+  /// moved by every reading): one line each.
+  #[test]
+  fn a_slow_climb_of_the_held_frees_logs_once_a_doubling() {
+    let mut encoder = Encoder::default();
+    let start = 1u64 << 20;
+    let end = start << CLIMB_DOUBLINGS;
+    let mut held = start;
+    let mut logged = (0u32, 0u32);
+    while held < end {
+      held += held.div_ceil(100);
+      logged.0 += u32::from(encoder.held_log_due(HeldLine::Drain, held, 0));
+      logged.1 += u32::from(encoder.held_log_due(HeldLine::Borrow, held, 0));
+    }
+    println!("a climb of {CLIMB_DOUBLINGS} doublings logged {logged:?}");
+    let doublings = CLIMB_DOUBLINGS..=CLIMB_DOUBLINGS + 1;
+    assert!(
+      doublings.contains(&logged.0),
+      "the drain's line {} times",
+      logged.0
+    );
+    assert!(
+      doublings.contains(&logged.1),
+      "the borrow end's line {} times",
+      logged.1
+    );
+  }
+
+  /// Item 2's reading of main's 57k of 2026-11-28 (run 1: a cut in flight nothing turned while 3.68 GB were held). Do:
+  /// read a fresh encoder's catch-up state; mark a page, ask for a cut and begin it, note a catch-up task and an owed
+  /// publication, and read it again. Expect: nothing running, nothing owed, no cut in flight at first; then a catch-up
+  /// running, a publication owed, and the cut begun no turns ago.
+  #[test]
+  fn the_catch_up_reading_names_the_cut_in_flight_and_its_task() {
+    let mut encoder = Encoder::default();
+    assert_eq!(encoder.catch_up_reading(), (false, false, None, 0));
+    encoder.mark(Family::Windows, [7u64]);
+    encoder.ask();
+    assert!(encoder.begin(1).is_some(), "a cut begun");
+    assert!(encoder.start_catching_up(), "a catch-up noted");
+    let _lag = encoder.skipped();
+    assert_eq!(encoder.catch_up_reading(), (true, true, Some(0), 0));
+  }
+
+  /// The held frees at a borrow's end counted (`content_holder::note_held_at_borrow`, item 2's reading). Do: on a
+  /// shard, put objects and publish them, so a committed image names their windows; read the shard's arena as a borrow
+  /// begins; let the objects go, so their frees are held; then close the borrow's reading
+  /// (`content_holder::note_borrow_held`). Expect: frees held, and the most held at a borrow's end counted at them.
+  #[test]
+  fn a_borrows_end_counts_the_frees_held_then() {
+    let (held, counted) = crate::daemon::audit_on_shard(|state| {
+      let ids = put_objects(state, (0, 64));
+      state.image_encoder.ask();
+      while !crate::content_holder::image_turn(state).caught_up {}
+      crate::verbs::publish_shard(state).unwrap();
+      let before = crate::content_holder::BorrowArena::read(state);
+      let_go(state, &ids);
+      crate::content_holder::note_borrow_held(state, before, std::panic::Location::caller());
+      let counted = state
+        .refusals
+        .get(crate::content_holder::IMAGE_HELD_AT_BORROW_PEAK)
+        .copied()
+        .unwrap_or(0);
+      (crate::content_holder::held_now(state), counted)
+    });
+    assert!(held > 0, "the let-go's frees held");
+    assert_eq!(counted, held, "the most held at a borrow's end counted");
+  }
+
+  /// [`a_landed_segments_give_back_frees_at_most_a_copy_slice_a_borrow`]'s scene on a shard: one object of
+  /// [`GIVEN_BACK_SLICES`] copy slices put and published, so the committed image names its windows, then given back as
+  /// a landed push segment's section (`hg_run::give_back_sections`) and its let-go turned to its end
+  /// (`vcs_store::let_go_turn`). The frees the give-back's own borrow held, the most one turn held, the bytes let go in
+  /// all, the copy slice and a window's bytes, and whether the object is still held.
+  fn given_back_sliced() -> (u64, u64, u64, (u64, u64), bool) {
+    crate::daemon::audit_on_shard(move |state| {
+      let window = state.store.content.chunk_bytes();
+      state.vcs_stores.content_made(window).unwrap();
+      let slice = state.config.copy_slice_bytes();
+      let len = usize::try_from(slice.saturating_mul(GIVEN_BACK_SLICES))
+        .unwrap()
+        .max(window * 4);
+      let bytes: Vec<u8> = (0..len).map(|at| u8::try_from(at % 251).unwrap()).collect();
+      let id = crate::vcs_store::within_budget(state, u64::try_from(len).unwrap(), |stores| {
+        stores.content_mut().unwrap().put_object(&bytes).unwrap()
+      });
+      crate::verbs::publish_shard(state).unwrap();
+      while state.image_encoder.owed() {
+        let _ = crate::content_holder::image_catch_up_step(state);
+      }
+      let held = |state: &crate::state::ShardState| {
+        u64::try_from(state.store.content.arena().deferred_bytes()).unwrap()
+      };
+      let before = held(state);
+      crate::repository::hg_run::give_back_sections(state, [id], true);
+      let in_its_borrow = held(state).saturating_sub(before);
+      let (mut most, mut turned) = (0u64, before.saturating_add(in_its_borrow));
+      while crate::vcs_store::let_go_turn(state) {
+        let now = held(state);
+        most = most.max(now.saturating_sub(turned));
+        turned = now;
+      }
+      let now = held(state);
+      most = most.max(now.saturating_sub(turned));
+      let let_go = now.saturating_sub(before);
+      let still = state
+        .vcs_stores
+        .content()
+        .is_some_and(|content| content.contains(&id));
+      (
+        in_its_borrow,
+        most,
+        let_go,
+        (slice, u64::try_from(window).unwrap()),
+        still,
+      )
+    })
+  }
+
+  /// Shape: the copy slices [`given_back_sliced`]'s object holds, so its let-go takes several turns.
+  const GIVEN_BACK_SLICES: u64 = 8;
+
+  /// Goal 93, A-930's held bound (main's 57k of 2026-11-27 19:00 on 4a281d25b: in every run the held peak was one
+  /// borrow's, `hg_push`'s give-back of its landed segment's held set, 264.5 MB in one borrow). Do: run
+  /// [`given_back_sliced`]. Expect the give-back's own borrow to hold no frees, each turn of its let-go at most a copy
+  /// slice and one window, the object let go whole in all and its names released. Red before: the give-back let the
+  /// sections go whole in its own borrow.
+  #[test]
+  fn a_landed_segments_give_back_frees_at_most_a_copy_slice_a_borrow() {
+    let (in_its_borrow, most, let_go, (slice, window), still) = given_back_sliced();
+    println!(
+      "the give-back's borrow held {in_its_borrow} bytes; a turn at most {most} (a copy slice {slice}, a window \
+       {window}); {let_go} let go in all"
+    );
+    assert!(
+      in_its_borrow <= slice,
+      "the give-back's own borrow held {in_its_borrow} bytes, past a copy slice of {slice}"
+    );
+    assert!(
+      most <= slice + window,
+      "a turn held {most} bytes, past a copy slice of {slice} and a window of {window}"
+    );
+    assert!(
+      let_go >= slice,
+      "the object was let go: {let_go} bytes held in all"
+    );
+    assert!(!still, "the section's names released once its let-go ended");
+  }
+
+  /// [`a_landed_segments_texts_let_go_a_copy_slice_a_borrow`]'s scene on a shard: [`SEGMENT_REVISIONS`] file texts of a
+  /// window each put and published, so the committed image names them, then one slice of their let-go as a landed
+  /// segment's (`hg_run::let_go_landed_slice`). The bytes that slice freed and the revisions it took, the frees it
+  /// held, the copy slice and a window.
+  fn segment_slice() -> (u64, usize, u64, (u64, u64)) {
+    crate::daemon::audit_on_shard(move |state| {
+      let window = state.store.content.chunk_bytes();
+      state.vcs_stores.content_made(window).unwrap();
+      let need = u64::try_from(window * SEGMENT_REVISIONS).unwrap();
+      let files: Vec<slates_hg::filerev::FileContents> =
+        crate::vcs_store::within_budget(state, need, |stores| {
+          let content = stores.content_mut().unwrap();
+          (0..SEGMENT_REVISIONS)
+            .map(|at| {
+              let mut text = format!("a file revision's text, number {at}\n").into_bytes();
+              text.resize(window, b't');
+              slates_hg::filerev::FileContents {
+                path: format!("file-{at}").into_bytes(),
+                node: [0; 20],
+                bytes: content.put_object(&text).unwrap(),
+                block: None,
+              }
+            })
+            .collect()
+        });
+      crate::verbs::publish_shard(state).unwrap();
+      while state.image_encoder.owed() {
+        let _ = crate::content_holder::image_catch_up_step(state);
+      }
+      let held = |state: &crate::state::ShardState| {
+        u64::try_from(state.store.content.arena().deferred_bytes()).unwrap()
+      };
+      let before = held(state);
+      let (freed, taken) = crate::repository::hg_run::let_go_landed_slice(state, &files);
+      let slice = state.config.copy_slice_bytes();
+      (
+        freed,
+        taken,
+        held(state).saturating_sub(before),
+        (slice, u64::try_from(window).unwrap()),
+      )
+    })
+  }
+
+  /// Shape: the file revisions [`segment_slice`]'s segment lands, so a slice takes some of them, not all.
+  const SEGMENT_REVISIONS: usize = 16;
+
+  /// Goal 93, A-930's held bound (main's 57k of 2026-11-27 19:57 on a6477ec16: 357.6 MB into the frees held for the
+  /// committed image in the landing's one borrow, `hg_push`'s `landed_segment` letting a segment's texts go whole).
+  /// Do: run [`segment_slice`]. Expect one slice to free and hold at most a copy slice and one revision's window, and
+  /// to take fewer than the segment's revisions. Red before: the landing let every revision go in its one borrow.
+  #[test]
+  fn a_landed_segments_texts_let_go_a_copy_slice_a_borrow() {
+    let (freed, taken, held, (slice, window)) = segment_slice();
+    println!(
+      "one slice let go {freed} bytes of {taken} of {SEGMENT_REVISIONS} revisions, holding {held} (a copy slice \
+       {slice}, a window {window})"
+    );
+    assert!(
+      freed <= slice + window,
+      "one slice freed {freed} bytes, past a copy slice and a window"
+    );
+    assert!(
+      held <= slice + window,
+      "one slice held {held} bytes, past a copy slice and a window"
+    );
+    assert!(
+      taken < SEGMENT_REVISIONS && taken > 0,
+      "one slice took {taken} of {SEGMENT_REVISIONS} revisions"
+    );
+  }
+
+  /// [`windows_freed_while_a_cut_is_in_flight_are_counted_held`]'s scene on a shard, its page pinned at
+  /// [`LOADED_PAGE`]: [`HELD_OBJECTS`] objects of a granule each (a chunk each) put and published, then a cut begun
+  /// over [`ENTRIES`] let-goes' pages and left in flight (a turn of it encoded, its catch-up owed), then every granule
+  /// object released while it is: their chunks held for the cut. The bytes released, the held gauge (`held_now`),
+  /// the arena's deferred bytes alone, and whether the cut was still in flight.
+  fn freed_during_a_cut() -> (u64, u64, u64, bool) {
+    crate::daemon::audit_on_shard(move |state| {
+      let granule = state.store.content.arena().granule();
+      let window = state.store.content.chunk_bytes();
+      state.vcs_stores.content_made(window).unwrap();
+      let ids: Vec<slates_vcs::ContentId> =
+        crate::vcs_store::within_budget(state, 1 << 24, |stores| {
+          let content = stores.content_mut().unwrap();
+          (0..HELD_OBJECTS)
+            .map(|at| {
+              let mut text =
+                format!("a chunk's text freed while a cut is in flight, number {at}\n")
+                  .into_bytes();
+              text.resize(granule, b'c');
+              content.put_object(&text).unwrap()
+            })
+            .collect()
+        });
+      crate::verbs::publish_shard(state).unwrap();
+      while state.image_encoder.owed() {
+        let _ = crate::content_holder::image_catch_up_step(state);
+      }
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(LOADED_PAGE));
+      let _ = let_go_and_note(state, (0, ENTRIES));
+      crate::verbs::publish_shard(state).unwrap();
+      let in_flight = state.image_encoder.cut_is_in_flight();
+      let deferred_before = state.store.content.arena().deferred_bytes();
+      crate::vcs_store::within_budget(state, 0, |stores| {
+        let content = stores.content_mut().unwrap();
+        for id in &ids {
+          let _ = content.release(id);
+        }
+      });
+      let released = u64::try_from(granule * HELD_OBJECTS).unwrap();
+      let held = crate::content_holder::held_now(state);
+      let deferred = u64::try_from(
+        state
+          .store
+          .content
+          .arena()
+          .deferred_bytes()
+          .saturating_sub(deferred_before),
+      )
+      .unwrap();
+      while state.image_encoder.owed() {
+        let _ = crate::content_holder::image_catch_up_step(state);
+      }
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (released, held, deferred, in_flight)
+    })
+  }
+
+  /// Goal 93, A-930's held count (main's 57k of 2026-11-27 20:41: a long cut's held window chunks, 4.7 GB, unseen by
+  /// the held gauge until the next lend freed them into the arena). Do: run [`freed_during_a_cut`]. Expect the cut
+  /// still in flight as the objects go, and the held gauge counting every released chunk, which the arena's deferred
+  /// frees alone do not. Red before: the gauge was the arena's deferred bytes, none of them.
+  #[test]
+  fn windows_freed_while_a_cut_is_in_flight_are_counted_held() {
+    let (released, held, deferred, in_flight) = freed_during_a_cut();
+    println!(
+      "{released} bytes released while a cut was in flight: held {held}, the arena's deferred alone {deferred}"
+    );
+    assert!(in_flight, "the cut was in flight as the objects went");
+    assert!(
+      held >= released,
+      "the held gauge counts the {released} bytes held for the cut: {held}"
+    );
+  }
+
+  /// [`a_cut_in_flight_keeps_its_held_frees_within_twice_what_it_spends`]'s scene on a shard, its page pinned at
+  /// [`LOADED_PAGE`]: granule objects put and published, a cut begun over [`ENTRIES`] let-goes' pages, then a wake of
+  /// its catch-up after each batch of four copy slices' worth of the objects released, until that cut commits. The most
+  /// held after a wake, the bytes the cut spent (copied and encoded), one batch's bytes, and the wakes.
+  fn a_stretched_cut() -> (u64, u64, u64, u64) {
+    crate::daemon::audit_on_shard(move |state| {
+      let granule = state.store.content.arena().granule();
+      let slice = usize::try_from(state.config.copy_slice_bytes()).unwrap();
+      let batch = (4 * slice).div_ceil(granule).max(1);
+      let objects = batch * STRETCHED_BATCHES;
+      let window = state.store.content.chunk_bytes();
+      state.vcs_stores.content_made(window).unwrap();
+      let need = u64::try_from(objects * granule).unwrap();
+      let ids: Vec<slates_vcs::ContentId> =
+        crate::vcs_store::within_budget(state, need, |stores| {
+          let content = stores.content_mut().unwrap();
+          (0..objects)
+            .map(|at| {
+              let mut text =
+                format!("a chunk's text freed while its cut stretches, number {at}\n").into_bytes();
+              text.resize(granule, b's');
+              content.put_object(&text).unwrap()
+            })
+            .collect()
+        });
+      crate::verbs::publish_shard(state).unwrap();
+      while state.image_encoder.owed() {
+        let _ = crate::content_holder::image_catch_up_step(state);
+      }
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(LOADED_PAGE));
+      let _ = let_go_and_note(state, (0, ENTRIES));
+      let spent = |state: &crate::state::ShardState| {
+        let of = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        of(crate::content_holder::IMAGE_COPIED_BYTES)
+          + of(crate::content_holder::IMAGE_ENCODED_BYTES)
+      };
+      let spent_before = spent(state);
+      crate::verbs::publish_shard(state).unwrap();
+      let begun = state
+        .image_encoder
+        .cut_in_flight()
+        .map(|(generation, _)| generation);
+      let (mut most, mut wakes) = (0u64, 0u64);
+      for released in ids.chunks(batch) {
+        // This cut's wakes alone: its commit begins the next, which is another's.
+        if state
+          .image_encoder
+          .cut_in_flight()
+          .map(|(generation, _)| generation)
+          != begun
+        {
+          break;
+        }
+        crate::vcs_store::within_budget(state, 0, |stores| {
+          let content = stores.content_mut().unwrap();
+          for id in released {
+            let _ = content.release(id);
+          }
+        });
+        most = most.max(crate::content_holder::held_now(state));
+        let _ = crate::content_holder::image_catch_up_slice(state);
+        wakes += 1;
+      }
+      let cut = spent(state).saturating_sub(spent_before);
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (most, cut, u64::try_from(batch * granule).unwrap(), wakes)
+    })
+  }
+
+  /// Shape: the starved scene's borrows, each letting go one batch of granule objects and putting the next: far past
+  /// what the bound lets a cut hold, so the red holds every batch.
+  const STARVED_BORROWS: usize = 64;
+  /// Shape: the granule objects a starved borrow lets go.
+  const STARVED_BATCH: usize = 8;
+  /// Shape: the starved scene's page: small, so the cut in flight has many pages left.
+  const STARVED_PAGE: usize = 512;
+
+  /// Puts `count` objects of one granule each, numbered from `from`: a chunk each, so each let-go frees one.
+  fn granule_objects(
+    state: &mut crate::state::ShardState,
+    (from, count): (usize, usize),
+  ) -> Vec<slates_vcs::ContentId> {
+    let window = state.store.content.chunk_bytes();
+    state.vcs_stores.content_made(window).unwrap();
+    let granule = state.store.content.arena().granule();
+    let need = u64::try_from(count * granule).unwrap();
+    crate::vcs_store::within_budget(state, need, |stores| {
+      let content = stores.content_mut().unwrap();
+      (from..from + count)
+        .map(|at| {
+          let mut text =
+            format!("a chunk's text freed while its cut is starved, number {at}\n").into_bytes();
+          text.resize(granule, b's');
+          content.put_object(&text).unwrap()
+        })
+        .collect()
+    })
+  }
+
+  /// Item 2's bound (CLAUDE.md section 2 item 8; main's 57k of 2026-11-28, run 1 at load 82-91: one cut in flight and
+  /// nothing turning it, 3.68 GB held outside the arena while the push let go 4,553,787,722 B). A cut's held frees were
+  /// bounded in turns (a turn's frees times the turns it lasts), and the pause's lag counted in turns too, which bound
+  /// nothing in time when no turn runs. Do: on a shard whose pages are small, put and carry [`ENTRIES`] objects, let
+  /// every other go and publish, so a cut of many pages is in flight; read what it has left to encode; then run
+  /// [`STARVED_BORROWS`] borrows, each putting a batch of granule objects and letting the last batch go, each closed as
+  /// a borrow of the shard's state closes (`content_holder::borrow_closed`), and never run the catch-up task: inside
+  /// one closure the shard's other tasks never run, the most a loaded shard can starve them. Expect: the frees held at
+  /// every borrow's end at most twice the cut's cost, twice a batch's bytes and a copy slice, whatever the borrows'
+  /// count, and the cut that was in flight committed. Failing first: held grows by a batch a borrow, the cut never
+  /// ending.
+  #[test]
+  fn a_cut_starved_of_its_catch_up_holds_its_frees_within_its_cost() {
+    let (most, bound, ended) = crate::daemon::audit_on_shard(|state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(STARVED_PAGE));
+      let outcome = starved_scene(state);
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      outcome
+    });
+    println!(
+      "held at most {most} bytes at a borrow's end against {bound}; the cut in flight ended {ended}"
+    );
+    assert!(
+      ended,
+      "the cut in flight never committed while its catch-up was starved ({most} bytes held, the bound {bound})"
+    );
+    assert!(
+      most <= bound,
+      "{most} bytes held at a borrow's end while the catch-up was starved, past {bound}"
+    );
+  }
+
+  /// Shape: the granule objects the lent step lets go: past twice what the starved cut has left, so one slice ends it.
+  const LENT_STEP_OBJECTS: usize = 256;
+
+  /// Item 2's bound across a lend (main 02:14: the slice skipped while the shard's chunk store is lent, since a
+  /// publication reads the shard's own store, a placeholder then). Do: on a shard whose pages are small, a cut of many
+  /// pages in flight; inside one `vcs_store::lent_state` step, let [`LENT_STEP_OBJECTS`] granule objects go and close a
+  /// borrow there (`content_holder::borrow_closed`); then close the outer borrow. Expect: nothing paid inside the lend,
+  /// the cut still in flight there; the outer borrow's end paying for it, the cut ended, and the frees held after it
+  /// within twice the cut's cost, the step's frees and a copy slice.
+  #[test]
+  fn a_lent_steps_frees_are_paid_at_its_outer_borrows_end() {
+    let (inside, outside, (held, bound)) = crate::daemon::audit_on_shard(|state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(STARVED_PAGE));
+      let outcome = lent_step_scene(state);
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      outcome
+    });
+    assert_eq!(
+      inside,
+      (0, false),
+      "nothing paid inside the lend, the cut still in flight"
+    );
+    assert!(
+      outside.0 > 0 && outside.1,
+      "the outer borrow's end paid, the cut ended: {outside:?}"
+    );
+    assert!(
+      held <= bound,
+      "{held} bytes held after the outer borrow's end, past {bound}"
+    );
+  }
+
+  /// What [`lent_step_scene`] read: the slices paid and whether the cut ended, inside the lend and after the outer
+  /// borrow's end, then the frees held and their bound.
+  type LentStepOutcome = ((u64, bool), (u64, bool), (u64, u64));
+
+  /// [`a_lent_steps_frees_are_paid_at_its_outer_borrows_end`]'s scene: the slices paid and whether the cut ended, inside
+  /// the lend and after the outer borrow's end; the frees held then, and their bound.
+  fn lent_step_scene(state: &mut crate::state::ShardState) -> LentStepOutcome {
+    let begun = starved_cut(state);
+    let cost = state
+      .image_encoder
+      .in_flight_left(u64::try_from(STARVED_PAGE).unwrap());
+    let objects = granule_objects(state, (ENTRIES, LENT_STEP_OBJECTS));
+    let granule = state.store.content.arena().granule();
+    let freed = u64::try_from(granule * LENT_STEP_OBJECTS).unwrap();
+    let bound = 2 * cost + freed + state.config.copy_slice_bytes();
+    let read = |state: &crate::state::ShardState| {
+      let paid = state
+        .refusals
+        .get(crate::content_holder::IMAGE_CUT_PAID_SLICES)
+        .copied()
+        .unwrap_or(0);
+      let now = state
+        .image_encoder
+        .cut_in_flight()
+        .map(|(generation, _)| generation);
+      (paid, begun.is_some() && now != begun)
+    };
+    let inside = crate::vcs_store::lent_state(state, |state| {
+      let_go(state, &objects);
+      crate::content_holder::borrow_closed(state);
+      read(state)
+    });
+    crate::content_holder::borrow_closed(state);
+    (
+      inside,
+      read(state),
+      (crate::content_holder::held_now(state), bound),
+    )
+  }
+
+  /// [`a_cut_starved_of_its_catch_up_holds_its_frees_within_its_cost`]'s cut in flight: objects put and carried, every
+  /// other one let go and published. Its generation.
+  fn starved_cut(state: &mut crate::state::ShardState) -> Option<u64> {
+    let ids = put_objects(state, (0, ENTRIES));
+    state.image_encoder.ask();
+    while !crate::content_holder::image_turn(state).caught_up {}
+    state.image_encoder.ask();
+    crate::verbs::publish_shard(state).unwrap();
+    let every_other: Vec<slates_vcs::ContentId> = ids.iter().step_by(2).copied().collect();
+    let_go(state, &every_other);
+    state.image_encoder.ask();
+    crate::verbs::publish_shard(state).unwrap();
+    state
+      .image_encoder
+      .cut_in_flight()
+      .map(|(generation, _)| generation)
+  }
+
+  /// The starved scene: the most held at a borrow's end, the bound, and whether the cut in flight at its start ended.
+  fn starved_scene(state: &mut crate::state::ShardState) -> (u64, u64, bool) {
+    let begun = starved_cut(state);
+    let cost = state
+      .image_encoder
+      .in_flight_left(u64::try_from(STARVED_PAGE).unwrap());
+    let granule = state.store.content.arena().granule();
+    let batch_bytes = u64::try_from(granule * STARVED_BATCH).unwrap();
+    let bound = 2 * cost + 2 * batch_bytes + state.config.copy_slice_bytes();
+    let mut kept = granule_objects(state, (ENTRIES, STARVED_BATCH));
+    crate::content_holder::borrow_closed(state);
+    let mut most = 0u64;
+    for at in 1..=STARVED_BORROWS {
+      let next = granule_objects(state, (ENTRIES + at * STARVED_BATCH, STARVED_BATCH));
+      let_go(state, &kept);
+      crate::content_holder::borrow_closed(state);
+      kept = next;
+      most = most.max(crate::content_holder::held_now(state));
+    }
+    let now = state
+      .image_encoder
+      .cut_in_flight()
+      .map(|(generation, _)| generation);
+    (most, bound, begun.is_some() && now != begun)
+  }
+
+  /// Shape: the batches [`a_stretched_cut`] can release, past the wakes its cut lasts at a copy slice each.
+  const STRETCHED_BATCHES: usize = 16;
+
+  /// Goal 93, A-930's cadence on the true held (main's 57k of 2026-11-27 20:41: a long cut held its window frees until
+  /// it committed). Do: run [`a_stretched_cut`], four copy slices' worth of chunks freed before each wake of the cut's
+  /// catch-up. Expect the most held at most twice what the cut really spent (copied and encoded) and a batch. Red on
+  /// the tree with a wake held to a copy slice, as before (reverted, never kept): 2,887,680 bytes held over 15 wakes,
+  /// the cut spending 797,914, a batch 192,512; now 389,120 over 5 wakes, the cut spending 750,734, a batch 77,824.
+  #[test]
+  fn a_cut_in_flight_keeps_its_held_frees_within_twice_what_it_spends() {
+    let (most, cut, batch, wakes) = a_stretched_cut();
+    println!(
+      "{most} bytes held at most over {wakes} wakes, the cut spending {cut}; a batch {batch} bytes"
+    );
+    assert!(cut > 0, "a cut was in flight and spent");
+    assert!(
+      most <= 2 * cut + batch,
+      "{most} bytes held while the cut was in flight, past twice what it spent ({cut}) and a batch ({batch})"
     );
   }
 
@@ -1834,6 +3050,8 @@ mod tests {
           let _ = let_go_and_note(state, (0, ENTRIES));
           // Since piece 2 a checkpoint carries the encoder's cut once its turns have caught up, else the committed one.
           crate::content_holder::image_drain(state);
+          // A cut asked for, as every publication asks (A-930's cadence begins none before it is due).
+          state.image_encoder.ask();
           while !crate::content_holder::image_turn(state).caught_up {}
           let image = crate::content_holder::held_image(state);
           let page = crate::content_holder::image_page_bytes(state);
@@ -1881,6 +3099,8 @@ mod tests {
       // turns to the end, so it carries the cut of that moment.
       let encode_up = |state: &mut crate::state::ShardState| {
         crate::content_holder::image_drain(state);
+        // A cut asked for, as every publication asks (A-930's cadence begins none before it is due).
+        state.image_encoder.ask();
         while !crate::content_holder::image_turn(state).caught_up {}
       };
       let ids = let_go_and_note(state, (0, ENTRIES));
@@ -2023,6 +3243,8 @@ mod tests {
   /// [`publish_up`]'s body.
   fn publish_up_counted(state: &mut crate::state::ShardState) {
     crate::content_holder::image_drain(state);
+    // A cut asked for, as every publication asks (A-930's cadence begins none before it is due).
+    state.image_encoder.ask();
     while !crate::content_holder::image_turn(state).caught_up {}
     let changes = crate::content_holder::held_changes_carried(state);
     assert!(changes.image_carried, "the delta carries the encoder's cut");
@@ -2052,6 +3274,8 @@ mod tests {
       };
       let _ = let_go_and_note(state, (0, ENTRIES / 10));
       crate::content_holder::image_drain(state);
+      // A cut asked for, as every publication asks (A-930's cadence begins none before it is due).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
       let (image, carried) = crate::content_holder::held_image_paged(state);
       crate::content_holder::held_committed(state, crate::content_holder::whole_of(&image), true);
@@ -2136,8 +3360,10 @@ mod tests {
         state.refusals.get(name).copied().unwrap_or(0)
       };
       let _ = let_go_and_note(state, (0, ENTRIES));
+      state.image_encoder.ask();
       let _ = crate::verbs::publish_shard(state);
       let _ = let_go_and_note(state, (ENTRIES, ENTRIES));
+      state.image_encoder.ask();
       let _ = crate::verbs::publish_shard(state);
       let mut longest = 0u64;
       let mut discarded = 0u64;
@@ -2270,7 +3496,10 @@ mod tests {
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
       let ids = put_objects(state, (0, ENTRIES));
       crate::content_holder::image_drain(state);
+      // A cut asked for, as every publication asks (A-930's cadence begins none before it is due).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let counted = |state: &crate::state::ShardState, name: &str| {
         state.refusals.get(name).copied().unwrap_or(0)
@@ -2294,7 +3523,10 @@ mod tests {
       let at_cut = crate::content_holder::paged_entries_now(state);
       let old = counted(state, crate::content_holder::IMAGE_CUT_PREIMAGES_OLD);
       let_go(state, &[gone]);
+      // A cut asked for, as every publication asks (A-930's cadence begins none before it is due).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let restored =
         crate::content_holder::paged_entries_of(&crate::verbs::committed_held(state).unwrap());
@@ -2387,7 +3619,10 @@ mod tests {
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
       let ids = put_objects(state, (0, ENTRIES));
       crate::content_holder::image_drain(state);
+      // A cut asked for, as every publication asks (A-930's cadence begins none before it is due).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let counted = |state: &crate::state::ShardState, name: &str| {
         state.refusals.get(name).copied().unwrap_or(0)
@@ -2397,6 +3632,8 @@ mod tests {
       let allocated = counted(state, crate::content_holder::IMAGE_READ_ALLOCATED_BYTES);
       let encoded = counted(state, crate::content_holder::IMAGE_ENCODED_BYTES);
       crate::content_holder::image_drain(state);
+      // A cut asked for, as every publication asks (A-930's cadence begins none before it is due).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
       let allocated = counted(state, crate::content_holder::IMAGE_READ_ALLOCATED_BYTES) - allocated;
       let encoded = counted(state, crate::content_holder::IMAGE_ENCODED_BYTES) - encoded;
@@ -2439,13 +3676,19 @@ mod tests {
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
       let ids = put_objects(state, (0, ENTRIES));
       crate::content_holder::image_drain(state);
+      // A cut asked for, as every publication asks (A-930's cadence begins none before it is due).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let halved: Vec<slates_vcs::ContentId> = ids.iter().step_by(2).copied().collect();
       let_go(state, &halved);
       let before = encoded_of(state, Family::Aways);
       crate::content_holder::image_drain(state);
+      // A cut asked for, as every publication asks (A-930's cadence begins none before it is due).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let held = encoded_of(state, Family::Aways) - before;
       let spread = ENTRIES / PUSH_LET_GOES;
@@ -2454,6 +3697,8 @@ mod tests {
       let_go(state, &pushed);
       let before = encoded_of(state, Family::Aways);
       crate::content_holder::image_drain(state);
+      // A cut asked for, as every publication asks (A-930's cadence begins none before it is due).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
       let pushed = encoded_of(state, Family::Aways) - before;
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
@@ -2593,10 +3838,14 @@ mod tests {
           + counted(state, crate::content_holder::IMAGE_COPIED_BYTES)
       };
       let ids = put_objects(state, (0, ENTRIES));
+      // A cut asked for, as every publication asks (A-930's cadence begins none before it is due).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let every_other: Vec<slates_vcs::ContentId> = ids.iter().step_by(2).copied().collect();
       let_go(state, &every_other);
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let slice = state.config.copy_slice_bytes();
       let turns = counted(state, crate::content_holder::IMAGE_TURNS);
@@ -2636,10 +3885,14 @@ mod tests {
     let outcome = crate::daemon::audit_on_shard(|state| {
       crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
       let ids = put_objects(state, (0, ENTRIES));
+      // A cut asked for, as every publication asks (A-930's cadence begins none before it is due).
+      state.image_encoder.ask();
       while !crate::content_holder::image_turn(state).caught_up {}
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let every_other: Vec<slates_vcs::ContentId> = ids.iter().step_by(2).copied().collect();
       let_go(state, &every_other);
+      state.image_encoder.ask();
       crate::verbs::publish_shard(state).unwrap();
       let (_, _, owed) = state.image_encoder.progress();
       assert!(owed.is_some(), "a cut owed");
@@ -2722,6 +3975,8 @@ mod tests {
     most_a_turn: (u64, u64),
     /// The most chunks the windows held for one cut.
     held_most: usize,
+    /// The most blocks the cut in flight named at a check of the blocks kept (that check is never vacuous).
+    in_flight_named: usize,
     /// What the checks found.
     found: Vec<String>,
   }
@@ -2833,6 +4088,33 @@ mod tests {
       }
     }
 
+    /// The blocks an image may name kept allocated (A-64, F2; (ii)'s naming proof): every slot the committed cut's
+    /// windows name, and every slot the cut in flight's windows named at its moment, lies in the arena's held runs
+    /// (a block deferred is held), whatever the windows freed since. Checked after every change, turn and
+    /// publication, so a block released early is caught as it is released, before any window reuses it.
+    fn check_named_kept(&mut self, state: &crate::state::ShardState, step: usize) {
+      let runs = state.store.content.arena().held_runs();
+      let in_flight = self
+        .begun
+        .as_ref()
+        .map_or(&[][..], |begun| begun.entries.as_slice());
+      let committed = crate::content_holder::window_blocks(&self.cut);
+      let named_in_flight = crate::content_holder::window_blocks(in_flight);
+      self.in_flight_named = self.in_flight_named.max(named_in_flight.len());
+      for (image, named) in [
+        ("the committed cut", committed),
+        ("the cut in flight", named_in_flight),
+      ] {
+        for (_, region, offset, len) in named {
+          if !within_runs(&runs, (region, offset, len)) {
+            self.found.push(format!(
+              "step {step}: the block at {region}:{offset} {image} names was released"
+            ));
+          }
+        }
+      }
+    }
+
     /// A cut carried (F2): its pre-images within E + I, old values at most the entries in its pages at its moment and
     /// absent markers at most a turn's inserts times its pages.
     fn check_carried(&mut self, state: &crate::state::ShardState, begun: &Begun, step: usize) {
@@ -2918,20 +4200,36 @@ mod tests {
     /// A publication (`verbs::publish_shard`), noting the cut where it carried the encoder's (F2: the shard's entries at
     /// the cut's moment, or now where it began and was carried in this one publication), then the checks.
     fn publish(&mut self, state: &mut crate::state::ShardState, step: usize) {
-      let skipped = Self::counted(state, crate::content_holder::IMAGE_SKIPPED);
+      self.publish_as(state, step, false);
+    }
+
+    /// [`Oracle::publish`], or where `catch_up` the catch-up task's own publication, which asks for no cut
+    /// (`verbs::publish_shard_unasked`), so its commit begins the next only once it is due (A-930's cadence, plan (a)).
+    fn publish_as(&mut self, state: &mut crate::state::ShardState, step: usize, catch_up: bool) {
+      // A publication that carried the committed cut again: one a change not yet encoded skipped. Every publication
+      // asks for its cut (A-930's cadence, plan (a)); the byte rule gates only the chain a commit begins.
+      let carried_again = |state: &crate::state::ShardState| {
+        Self::counted(state, crate::content_holder::IMAGE_SKIPPED)
+      };
+      let skipped = carried_again(state);
       let in_flight = state
         .image_encoder
         .cut_in_flight()
         .map(|(generation, _)| generation);
       self.turning();
       let now_before = crate::content_holder::paged_entries_now(state);
-      if crate::verbs::publish_shard(state).is_err() {
+      let published = if catch_up {
+        crate::verbs::publish_shard_unasked(state).map(drop)
+      } else {
+        crate::verbs::publish_shard(state).map(drop)
+      };
+      if published.is_err() {
         self
           .found
           .push(format!("step {step}: the publication refused"));
         return;
       }
-      if Self::counted(state, crate::content_holder::IMAGE_SKIPPED) == skipped {
+      if carried_again(state) == skipped {
         let begun = self.begun.take();
         match begun {
           Some(begun) if Some(begun.generation) == in_flight => {
@@ -2944,6 +4242,7 @@ mod tests {
       }
       self.note_cut(state);
       self.check_held(state, step);
+      self.check_named_kept(state, step);
       self.check(state, step);
     }
 
@@ -2953,8 +4252,9 @@ mod tests {
         self.turning();
         let turned = crate::content_holder::image_turn(state);
         self.note_cut(state);
+        self.check_named_kept(state, step);
         if turned.caught_up && state.image_encoder.owed() {
-          self.publish(state, step);
+          self.publish_as(state, step, true);
         }
       }
     }
@@ -3002,6 +4302,7 @@ mod tests {
         + landed;
       self.since_turn.1 += (after.freed - before.freed) + (after.let_go - before.let_go);
       self.check_held(state, 0);
+      self.check_named_kept(state, 0);
     }
 
     /// The change itself ([`Oracle::change`]).
@@ -3063,6 +4364,21 @@ mod tests {
     }
   }
 
+  /// Whether the bytes `(region, offset, len)` lie inside one of `runs`, the arena's held runs
+  /// (`slates_mem::arena::ChunkArena::held_runs`: by region, then offset, adjacent blocks joined).
+  fn within_runs(runs: &[(u16, usize, usize)], (region, offset, len): (u16, u64, u64)) -> bool {
+    let (Ok(offset), Ok(len)) = (usize::try_from(offset), usize::try_from(len)) else {
+      return false;
+    };
+    let after = runs.partition_point(|&(id, start, _)| (id, start) <= (region, offset));
+    after
+      .checked_sub(1)
+      .and_then(|at| runs.get(at))
+      .is_some_and(|&(id, start, run)| {
+        id == region && offset.saturating_add(len) <= start.saturating_add(run)
+      })
+  }
+
   /// What one oracle history found, and its non-vacuity counts.
   struct Found {
     /// What its checks found.
@@ -3073,6 +4389,10 @@ mod tests {
     preimages: (u64, u64),
     /// The most chunks the windows held for one cut.
     held_most: usize,
+    /// The most blocks a cut in flight named at a check of the blocks kept.
+    in_flight_named: usize,
+    /// The publications that carried the committed cut again because the next was not due (A-930's cadence).
+    deferred: u64,
   }
 
   /// One oracle history on a shard (the oracle's test docs): `seed` 0 the continuous one.
@@ -3107,6 +4427,9 @@ mod tests {
     // The last steps' changes taken first, so the pages left are all of them: a turn encodes one at least.
     // F2: the cut in flight first, then the next of the pages left, each at most doubled by a split.
     crate::content_holder::image_drain(state);
+    // Quiet: the shard settles idle, which asks for a cut whatever its cost (A-930's cadence: changes not yet due wait
+    // for it; `content_holder::image_retry_owed`'s ask).
+    state.image_encoder.ask();
     let left = state.image_encoder.progress().1 as u64;
     oracle.turns(state, (STEPS + 1, 2 * left + 2));
     oracle.publish(state, STEPS + 1);
@@ -3166,6 +4489,8 @@ mod tests {
         counted(crate::content_holder::IMAGE_CUT_PREIMAGES_ABSENT),
       ),
       held_most: oracle.held_most,
+      in_flight_named: oracle.in_flight_named,
+      deferred: counted(crate::content_holder::IMAGE_CHAIN_STOPPED),
     }
   }
 
@@ -3176,15 +4501,21 @@ mod tests {
   /// the encoder pauses them, as the shard's let-go sites hold theirs. Expect, at every publication and crash: the image a
   /// restart reads equal, entry for entry, to the shard's entries at the moment the last carried cut began (one moment,
   /// never a mix of two, whatever changed while it was encoded); no window that image names with its chunk's block held
-  /// now by another window (the arena reused none); the owed publication's lag within its bound; each carried cut's old
+  /// now by another window (the arena reused none); after every change, turn and publication, every slot the committed
+  /// cut's windows name and every slot the cut in flight's named at its moment still allocated in the arena (none
+  /// released early, (ii)'s naming proof); the owed publication's lag within its bound; each carried cut's old
   /// values at most the entries in its pages at its moment (E) and its absent markers at most a turn's inserts times its
   /// pages (I); the chunks held for a cut at most a turn's frees times its pages; no ticket stranded and no pre-image left
   /// at a cut's end; and, the changes stopped, the cut caught up with the shard. Non-vacuous: the cuts kept old values
-  /// and absent markers, the windows held a chunk for a cut, and the images named windows.
+  /// and absent markers, the windows held a chunk for a cut, the images named windows, a cut in flight named blocks at a
+  /// check of the blocks kept, and some cut's commit began no next one (A-930's cadence, plan (a): every publication asks
+  /// for its cut, the chain a commit begins waits for its changes' bytes, and the shard asks once quiet, as its idle
+  /// does).
   #[test]
   fn generated_histories_restore_one_committed_cut_reuse_no_named_block_and_keep_their_lag_bound() {
     const PAGE: usize = 4096;
-    let (mut old, mut absent, mut held, mut named) = (0, 0, 0, 0);
+    let (mut old, mut absent, mut held, mut named, mut deferred) = (0, 0, 0, 0, 0);
+    let mut in_flight_named = 0;
     for seed in 0..HISTORIES {
       let found = crate::daemon::audit_on_shard(move |state| {
         crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
@@ -3197,6 +4528,8 @@ mod tests {
       absent += found.preimages.1;
       held = held.max(found.held_most);
       named = named.max(found.named);
+      in_flight_named = in_flight_named.max(found.in_flight_named);
+      deferred += found.deferred;
     }
     assert!(
       old > 0 && absent > 0,
@@ -3204,5 +4537,13 @@ mod tests {
     );
     assert!(held > 0, "no chunk was held for a cut");
     assert!(named > 0, "no restored image named a window");
+    assert!(
+      in_flight_named > 0,
+      "no cut in flight named a block at a check of the blocks kept"
+    );
+    assert!(
+      deferred > 0,
+      "no cut's commit stopped the chain: A-930's cadence never ran"
+    );
   }
 }

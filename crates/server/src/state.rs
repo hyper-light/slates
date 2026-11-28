@@ -1783,7 +1783,11 @@ impl std::fmt::Display for StateAccess {
 /// Borrows the state, naming the refusal when it cannot: the calling thread has no state, the state is
 /// already borrowed (a nested borrow is a bug, counted by the caller), the shard is fenced, or the
 /// retention check that closes every borrow refused (the borrow ran; its result is discarded).
+#[track_caller]
 pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, StateAccess> {
+  // The borrow's site, for what it frees into the frees held for the committed image
+  // (`content_holder::note_borrow_held`).
+  let site = std::panic::Location::caller();
   // Through `try_with`: a shard's state stays installed until its thread ends, so its values drop in the thread's
   // local storage teardown, and one whose `Drop` borrows the state then (a landing turn giving itself back) finds it
   // `Absent`, never a panic in a destructor (CLAUDE.md section 2 item 6).
@@ -1793,7 +1797,11 @@ pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, Stat
     if state.consensus_failure.is_some() {
       return Err(StateAccess::Fenced);
     }
+    let held_before = crate::content_holder::BorrowArena::read(state);
     let result = f(state);
+    crate::content_holder::note_borrow_held(state, held_before, site);
+    // A cut whose held frees passed what it has left is paid for by the borrow that freed past it (item 2's bound).
+    crate::content_holder::borrow_closed(state);
     // A deadline the borrow set before the one the shard's keeper sleeps for wakes it, whichever path set it (A-536).
     crate::deadlines::after_borrow(state);
     // A volume owed a hint drain whose host a landing gave back wakes the hint watcher (A-709).
@@ -1825,6 +1833,7 @@ pub(crate) fn with_state_at_shutdown<R>(f: impl FnOnce(&mut ShardState) -> R) ->
 
 /// Borrows the state; `None` for any refusal [`try_with_state`] names — the form for a caller that
 /// acts the same whichever it was.
+#[track_caller]
 pub fn with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
   try_with_state(f).ok()
 }
@@ -1849,6 +1858,7 @@ pub struct LostSteps {
 /// 2026-10-07 discarded it at 57 sites: the refusals that lose a step are counted on this thread ([`lost_steps`],
 /// reported in status as `state.borrow_refused` and `state.retention_refused`). A thread with no state, or a fenced
 /// shard, is not a lost step: there is nothing to do there.
+#[track_caller]
 pub fn with_state_counted<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
   let refusal = match try_with_state(f) {
     Ok(result) => return Some(result),

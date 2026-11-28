@@ -303,6 +303,8 @@ impl core::future::Future for PublishedHere {
     let generation = self.generation;
     if !self.asked && !published_here(generation) {
       self.asked = true;
+      // The publication asks for the cut its window waits for whatever its cost (`verbs::publish_shard`, A-930's
+      // cadence): persistence before reply.
       if crate::state::with_state(|state| crate::verbs::publish_shard(state).is_ok()) == Some(true)
       {
         crate::state::with_state(|state| state.count(HOME_PUBLISHED, 1));
