@@ -33,3 +33,9 @@ A 600-changeset run confirming the per-revision scaling is going now.
 `Index::iter_range` (slates-vcs) plus `HgIndex::numbers_from`. `rows_held` now gathers each log's numbers in one range
 walk, and the index stage writes from them with no lookups. 0.37 index reads a revision, from 4.47. The kept rendered
 length (cut 1 above) is next, with an oracle, a recovery story and a typed stale refusal.
+
+## 2026-11-27 21:14 PST: cut 1 of my list (the kept rendered length) landed, A-937, 8731c3fc5
+Each revision's chunk length is kept where it lands, in HgIndex sized rows (S + log number + rev) with the head's totals
+on the index. A stream names its head with no walk. A rebuild recounts in slices (vcs_store::hg_sized), and the stream
+answers 1\n until the recount ends. Your intake paths: a push sizes its fork in hg_push::land after any re-base, and its
+segments' chunk lengths ride Taking -> Forked -> Rebasing (Forked::sized).
