@@ -1785,8 +1785,9 @@ impl Repository {
   }
 
   /// Adopts the stage's `fork` into the index ([`Index::adopt`]). In a test that asks to refuse a commit at its
-  /// adoption ([`REFUSE_COMMIT_AT`]) it is refused as a stale fork is, since a current fork's adoption seals no tail
-  /// and charges nothing a budget could refuse, and the commit's give-back after it must still be exercised.
+  /// adoption (the test-only `REFUSE_COMMIT_AT`) it is refused as a stale fork is, since a current fork's adoption
+  /// seals no tail and charges nothing a budget could refuse, and the commit's give-back after it must still be
+  /// exercised.
   fn adopted(
     &mut self,
     store: &mut ContentStore,

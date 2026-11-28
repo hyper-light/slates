@@ -37112,6 +37112,49 @@ fn a_region_read_whose_first_home_died_unseen_is_answered_by_the_next_within_the
   );
 }
 
+/// Shape: the part of a region read's budget a read whose first home is dead and not yet suspected must answer within
+/// once hedged: before, it spent that home's whole share, half the budget with two homes; hedged, it spends that home's
+/// path tail and two round trips to the next, milliseconds on loopback, far under a quarter.
+const HEDGED_READ_PART_OF_BUDGET: u64 = 4;
+
+/// A-936's hedged region read (main 01a20182's ruling of 2026-11-27 20:11; Dean and Barroso, "The Tail at Scale"): a read
+/// asks its first home only until that home's path tail, then the next. Do: on a three-node `f = 1` git fleet, home from a
+/// an object whose two homes are b and c; stop its first-ranked home and read the object back from a at once, before
+/// anything suspects it. Expect the bytes within a [`HEDGED_READ_PART_OF_BUDGET`]th of the read's budget, and the read
+/// counted hedged. Red before: it spent the stopped home's whole share, half the budget, before it asked the next.
+#[test]
+fn a_region_read_whose_first_home_died_unseen_is_hedged_to_the_next_within_its_path_tail() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = git_fleet("hedged-read");
+  let (bytes, identity, homes, budget_ns) = object_homed_away_from(&fleet, 0, "hedged-read");
+  let first = homes.first().copied().expect("a first home");
+  let at = fleet
+    .hosts
+    .iter()
+    .position(|host| *host == first)
+    .expect("the first home a member");
+  fleet.daemons.remove(at).stop();
+  let read = fleet.daemons[0].read_from_region(identity);
+  let hedged = move_counter(&fleet.daemons[0], "vcs_store.homes.reads_hedged");
+  fleet.stop();
+  eprintln!(
+    "hedged-read: homes {homes:?}, the first stopped; read {:?} of budget {budget_ns} ns; hedged {hedged:?}",
+    read
+      .as_ref()
+      .map(|(bytes, took)| (bytes.as_ref().map(Vec::len), took))
+  );
+  let (got, took) = read.expect("the read observed");
+  assert_eq!(got, Some(bytes), "read back from the live home");
+  assert!(
+    took < budget_ns / HEDGED_READ_PART_OF_BUDGET,
+    "read within its first home's path tail and the next's round trips: {took} ns of {budget_ns}"
+  );
+  assert!(
+    hedged.as_ref().is_ok_and(|hedged| *hedged >= 1),
+    "the read was hedged: {hedged:?}"
+  );
+}
+
 /// The twin of [`a_region_read_whose_first_home_died_unseen_is_answered_by_the_next_within_the_budget`] (main's ruling of
 /// 12:37): a first home alive but slower than its share. Do: as there, but make the first-ranked home hold each home
 /// message a whole live budget before it answers (`Daemon::delay_home_answers`) instead of stopping it; read from a;

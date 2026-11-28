@@ -282,9 +282,9 @@ async fn until_done(mut step: impl FnMut(&mut ShardState) -> bool) -> Option<()>
 }
 
 /// One step of a landing's section, its time off its thread's CPU kept the most of ([`LANDING_OFF_CPU_MOST_NS`]), and in
-/// tests whether the allocator handed pages back to the system during it ([`returned`]). Release probe 18 read copy's
-/// prepare at 2.0 ms of wall on 47 µs of CPU; debug logs put it in steps where one free returned about 40 MB of pages
-/// (1.7-2.5 ms off the CPU; main's ruling of 2026-11-27 20:31). Whether the section is done.
+/// tests whether the allocator handed pages back to the system during it (the test-only module `returned`). Release
+/// probe 18 read copy's prepare at 2.0 ms of wall on 47 µs of CPU; debug logs put it in steps where one free returned
+/// about 40 MB of pages (1.7-2.5 ms off the CPU; main's ruling of 2026-11-27 20:31). Whether the section is done.
 fn step_off_cpu_kept(
   state: &mut ShardState,
   step: &mut impl FnMut(&mut ShardState) -> bool,

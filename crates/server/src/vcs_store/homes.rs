@@ -4054,19 +4054,24 @@ async fn read_remote(
 ) -> Option<Vec<u8>> {
   let began = slates_rt::futures::now_ns();
   let whole = budget.max_deadline_ns();
-  let count = homes.len();
-  for (asked, home) in homes.iter().enumerate() {
+  let asks = hedged_asks(&homes);
+  let count = asks.len();
+  for (asked, (home, hedge_ns)) in asks.iter().enumerate() {
     let left = whole.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
     let share = share_of(left, count.saturating_sub(asked))?;
+    let within = hedge_ns.map_or(share, |hedge| hedge.min(share));
     let asked_at = slates_rt::futures::now_ns();
-    if let Some(bytes) = read_in_parts(*home, identity, (share, budget.poll_interval_ns)).await {
+    if let Some(bytes) = read_in_parts(*home, identity, (within, budget.poll_interval_ns)).await {
       return Some(bytes);
+    }
+    if hedge_ns.is_some() {
+      let _ = crate::state::with_state(|state| state.count(READS_HEDGED, 1));
     }
     // Logged, the replica build's stall's evidence (main 01a20182's order of 2026-11-27 18:08): each home that gave no
     // bytes, its share and how long it was waited, so a read that waited out a dead home shows which.
     slates_machine::log_line!(
-      "slates-server: a region read of {identity:?} got nothing from {home:?} (home {} of {count}) in {} ns of its \
-       {share} ns share, at {} ns",
+      "slates-server: a region read of {identity:?} got nothing from {home:?} (ask {} of {count}) in {} ns of its \
+       {within} ns share, at {} ns",
       asked.saturating_add(1),
       slates_rt::futures::now_ns().saturating_sub(asked_at),
       slates_rt::futures::now_ns()
@@ -4078,6 +4083,51 @@ async fn read_remote(
   );
   None
 }
+
+/// The asks a region read of `homes` makes, in order, each with its hedge delay where it has one (A-936's hedged read,
+/// main 01a20182's ruling of 2026-11-27 20:11; Dean and Barroso, "The Tail at Scale", CACM 2013, hedged requests): with
+/// two homes or more, the first is asked only until its hedge delay ([`hedge_delay_ns`]), then the next ones in turn,
+/// each its share of what is left, and the first again with the rest. A home dead and not yet suspected, or slower
+/// than its path, costs the read its hedge delay, not a whole share (a914 at 69fbc8de0 run 2: two names, each a whole
+/// share, 1 s, on a home just dead, so a replica build's replay took 2 s). One home, or a first home with no measured
+/// path, is asked as before. Fan-out stays within the identity's homes; the first home's late answer, past its hedge, is
+/// dropped as its exchange's straggler, its session given back ([`exchange`]), and counted [`READS_HEDGED`].
+fn hedged_asks(homes: &[slates_db::HostId]) -> Vec<(slates_db::HostId, Option<u64>)> {
+  let hedge = homes
+    .first()
+    .filter(|_| homes.len() > 1)
+    .and_then(|first| hedge_delay_ns(*first));
+  let Some(hedge) = hedge else {
+    return homes.iter().map(|home| (*home, None)).collect();
+  };
+  let mut asks: Vec<(slates_db::HostId, Option<u64>)> =
+    Vec::with_capacity(homes.len().saturating_add(1));
+  for (index, home) in homes.iter().enumerate() {
+    asks.push((*home, (index == 0).then_some(hedge)));
+  }
+  if let Some(first) = homes.first() {
+    asks.push((*first, None));
+  }
+  asks
+}
+
+/// Derived: how long a region read asks its first home before it asks the next ([`hedged_asks`]): that home's measured
+/// path tail (`slates_cluster::timing::PathRtt::tail_ns`, `smoothed + max(4 · rttvar, granularity)`, RFC 9002's probe
+/// timeout), the bound a live home's answer comes within, since a home answers a read of a part it holds within its
+/// step. `None` with no round trip to it measured yet: then it is asked its whole share, as before.
+fn hedge_delay_ns(home: slates_db::HostId) -> Option<u64> {
+  crate::state::with_state(|state| {
+    state
+      .peer_paths
+      .get(&home)
+      .and_then(slates_cluster::timing::PathRtt::tail_ns)
+  })
+  .flatten()
+}
+
+/// Counter: a region read whose first home gave nothing within its hedge delay, so the next home was asked
+/// ([`hedged_asks`]). Format: a counter name in the daemon's status report.
+const READS_HEDGED: &str = "vcs_store.homes.reads_hedged";
 
 /// Derived: one home's share of `left` nanoseconds of a read's budget with `homes` still to ask (its own turn among
 /// them): `left` divided over them, so the last home asked gets all that is left and the shares never sum past the
