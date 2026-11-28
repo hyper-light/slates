@@ -275,6 +275,21 @@ pub struct RepairWindowHolders {
   pub names_head: Option<u64>,
 }
 
+/// What a node's routing of an object reads when it holds no copy of it (`Daemon::route_view`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RouteView {
+  /// The regional configuration's version.
+  pub version: u64,
+  /// The object's first owner: its moved owner, else its creator.
+  pub first: slates_db::HostId,
+  /// Whether the configuration keeps the first owner's retirement.
+  pub retired: bool,
+  /// Whether the configuration keeps the first owner's completed takeover.
+  pub completed: bool,
+  /// The owner this node's own routing names, from the records it accepted.
+  pub routed: Option<slates_db::HostId>,
+}
+
 /// A node's homing window as its control shard last derived it, with its terms (A-914, `Daemon::homing_window`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HomingWindowReading {
@@ -3011,6 +3026,30 @@ impl Daemon {
   ) -> Result<Option<slates_db::HostId>, ObserveError> {
     self.observe(self.shards.first().copied(), move |s| {
       crate::owner_location::home_query(s, object).known_owner(s, None)
+    })
+  }
+
+  /// Test support (main 01a20182's order of 2026-11-27 20:35, diag 12's a921 red): what this node's routing of `object`
+  /// reads when it holds no copy of it (`owner_location`'s `known_owner`): its configuration's version, the object's first
+  /// owner (moved, else its creator), whether the configuration keeps that owner's retirement and its completed
+  /// takeover, and the owner this node's own routing names. A one-shot control-shard question.
+  pub fn route_view(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<RouteView, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let configuration = s.council.configuration();
+      let first = configuration
+        .moved
+        .get(&object.placement_key())
+        .map_or_else(|| object.creator(), |moved| moved.owner);
+      RouteView {
+        version: configuration.version,
+        first,
+        retired: configuration.retired.contains_key(&first),
+        completed: configuration.completed.contains_key(&first),
+        routed: s.fleet.object_owner(object),
+      }
     })
   }
 

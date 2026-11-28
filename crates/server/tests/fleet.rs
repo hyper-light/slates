@@ -38584,6 +38584,12 @@ fn poll_taken_over_and_unseated(survivors: &[Daemon], gone: HostId) -> bool {
     })
 }
 
+/// Shape: the coordinator periods A-934's test watches a's neighbourhood change not settle while the hold stands: its
+/// red settled within seconds of x's takeover and unseating (a settle is reported each period once all is placed), so
+/// this is that many times over, and leaves the test far inside CI's per-test cap, which the poll's whole budget (4,000
+/// periods) passed on Windows (diag 12, 289 s).
+const SETTLE_WATCH_PERIODS: u64 = 150;
+
 /// A-934 (main 01a20182's ruling of 2026-11-27 15:51, its item 2: §4.8's settle and the state logs). Do: on a four-node
 /// `f = 1` git fleet with a repository on a, push `main`; hold a's state-log parts off y, one of its two remote
 /// candidates (`Daemon::hold_state_log_shipping_from`), and push on top, so the names log's newest part is held by a and
@@ -38609,13 +38615,13 @@ fn a934_a_neighbourhood_change_waits_for_its_state_logs_newest_part_on_the_new_c
   let (x, y) = remote_candidates(&fleet);
   let second = push_with_part_held_from(&mut fleet, y);
   let taken = stop_and_take_over(&mut fleet, x);
-  let while_held = settled_within(&fleet, x);
+  let while_held = settled_within(&fleet, x, SETTLE_WATCH_PERIODS);
   let held = (
     names_positions(&fleet),
     fleet.daemons[0].repair_window_holders(fleet.repository),
   );
   fleet.daemons[0].hold_state_log_shipping(false).unwrap();
-  let lifted = settled_within(&fleet, x);
+  let lifted = settled_within(&fleet, x, PERIOD_BUDGET);
   let after = names_positions(&fleet);
   fleet.stop();
   eprintln!(
@@ -38679,10 +38685,10 @@ fn stop_and_take_over(fleet: &mut GitFleet, gone: HostId) -> bool {
 /// Whether a's neighbourhood change away from `gone` settles within [`RETIREMENT_DEADLINE`] (A-934's test): its placement
 /// neighbourhood without `gone`, and the council's settled neighbourhood for a fixed at its current one's version
 /// (`Daemon::council_settlement`).
-fn settled_within(fleet: &GitFleet, gone: HostId) -> bool {
+fn settled_within(fleet: &GitFleet, gone: HostId, periods: u64) -> bool {
   let observed: Vec<&Daemon> = fleet.daemons.iter().collect();
   let own = fleet.hosts[0];
-  poll_until(&observed, RETIREMENT_DEADLINE, || {
+  poll_for_periods(&observed, RETIREMENT_DEADLINE, periods, || {
     let moved = !fleet.daemons[0].placement_neighbourhood()?.contains(&gone);
     let settlement = fleet.daemons[0].council_settlement(own)?;
     Ok(moved && settlement.is_some_and(|(settled, current)| settled == current))
@@ -39808,6 +39814,7 @@ fn a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it
     });
   // What the node holding none of it would try first: never a, the stale creator (the skip); before, a.
   let tried_first = daemons[stranger].known_owner(object);
+  let route_view = daemons[stranger].route_view(object);
   let asked_a_before = summed_count(&daemons[0], "fleet.forward.refused.not_owner_here");
   let mut forwarded = Client::connect(daemons[stranger].instance());
   let served = poll_until(&observed, RETIREMENT_DEADLINE, || {
@@ -39824,7 +39831,8 @@ fn a921_a_false_death_victims_old_volume_is_forwarded_to_its_adopter_never_to_it
   }
   eprintln!(
     "victims-volume: holders {holders:?}, stranger {stranger}; cut {cut} taken {taken} healed {healed} readmitted \
-     {readmitted}; served {served}; a asked {asked_a}; the stranger's claims {claims}; tried first {tried_first:?}"
+     {readmitted}; served {served}; a asked {asked_a}; the stranger's claims {claims}; tried first {tried_first:?}, \
+     the stranger's route view then {route_view:?}"
   );
   assert!(
     placed && taken && readmitted,
