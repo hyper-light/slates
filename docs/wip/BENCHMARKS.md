@@ -19596,6 +19596,44 @@ What it says:
   24× to 2.1×, and the dump stays about 3×: both w-svn's.
 - **svnsync's row overlapped another round on the box,** so its times are not comparable with the rest of the table.
 
+## The svn writing session with git-2000: slates ahead of stock svnserve, HTTP 1.49× and svn:// 1.21× faster (goal 93; main 01a20182's round, 2026-11-27, b5ea7ecee)
+
+- **What.** The use test's writing session, measured a phase at a time by `an_svn_writing_session_measured`
+  (`crates/cli/tests/svn_interop.rs`, w-svn's be16a2521). Each leg imports git-2000.dump, then runs stock `svn` 1.15:
+  a checkout `--depth immediates`, a commit adding a file, a copy of the root, a merge (update, add, commit, update,
+  `merge -c HEAD`, status, `revert -R`) and a revision-property set. Stock svnserve (`svnserve -t` over the dump loaded
+  by `svnadmin`) runs the same session in the same run. The use test's `merge -c HEAD` and its hookless revprop change
+  fail on all three servers alike, so their seconds are each server's refusal.
+- **Machine, date, load, build.** This Mac (M-series, 18 cores, 128 GB), 2026-11-27 21:17:57-21:23:51 PST, load
+  45.10 / 37.29 / 35.13 at its start, release at b5ea7ecee (exe aa7e16be2150), stock Subversion 1.15. One run, so no
+  best. Its git-2000 fixture is the rebuilt `git_to_svn_dump.py src.git f7de81456940dd6f3274e461149bba12965de609 2000`,
+  sha256 e005db1c373feb5bd8d6a42052c27f8ba582181619ec9dfc6c7d82ccee8aa8c3, checked against this file's figures.
+- **Command.** `SLATES_SVN_WRITES_DUMP=<git-2000.dump> cargo test --release -p slates-cli --test svn_interop --
+  --ignored an_svn_writing_session_measured --nocapture`. Log: main 01a20182's
+  `~/.local/state/main-01a20182/rounds/svn-rel/an_svn_writing_session_measured.log`.
+
+Seconds per phase:
+
+| phase | stock svnserve | slates HTTP | slates svn:// |
+|---|---|---|---|
+| checkout | 0.98 | 0.37 | 0.76 |
+| commit | 1.07 | 0.37 | 0.99 |
+| copy | 0.53 | 0.04 | 0.12 |
+| merge | 4.07 | 3.89 | 3.71 |
+| propset | 0.36 | 0.02 | 0.22 |
+| **session** | **7.01** | **4.69 (1.49× faster)** | **5.80 (1.21× faster)** |
+
+What it says:
+- **The 11-24 row is closed, with slates ahead.** That round had the writing session at 14.2 s against stock's 6.8 s,
+  2.1× slower (the section above). Since then the import's slicing (A-920) and its r593 fix (912d891c9, which let
+  git-2000 import at all on this binary) are in.
+- **Most of the session is the `svn` client's own work.** The merge phase is about 3.7-4.1 s on every server; it is
+  mostly the client's local verbs (update, status, `revert -R`).
+- **The import against `svnadmin load`:** slates imported the dump in 8-10 s a leg against stock's 309.5 s load in the
+  same run.
+- **Debug, the day before the fix, for comparison (w-svn):** on the local 300-revision history the session was HTTP
+  5.75 s, svn:// 5.51 s, stock 7.50 s; on git-2000 in debug, HTTP 5.42 s, svn:// 5.82 s, stock 5.82 s.
+
 ## A Subversion repository's bytes on the changeset store against FSFS's: git-2000, 9.2 times (goal 93 perf; main 01a20182's order, 2026-11-24)
 
 - **What, and why.** Item 4 of main's note of 11-21 21:50: the storage half of "an order of magnitude faster", taken as a
