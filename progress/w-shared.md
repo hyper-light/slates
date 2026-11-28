@@ -783,3 +783,9 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 - c1228d298: PendingGreen::release_held keeps each green's newest version pending, so the retarget ships it to a newcomer with no push; a935 red to green; a914 back to (d).
 - Focused: merge_service:: 33/33, fleet 8/8, a914 green once on (d).
 - Next: A-914 (c), red first (the homing window before any death is learned is short under load); then run 10's stalled replica build, logs first.
+
+## 2026-11-27 18:21 PST: A-914 (c) landed (slates e188ebc8f)
+- badd04ec0: the homing deadline follows the live window (live_deadline_ns, install_within_live_deadline); period samples clamped at WINDOW_CEILING_NS; the window held to homing_window_ceiling (1,550 s at four members).
+- a914c red to green (pushes until one homing waits); a914 asserts the first-death push landed (r2).
+- Focused: failover:: 16/16, server units 17/17, fleet 6/6.
+- Next: run 10's replica-build stall, logs first (each build turn's waited object and homes; whether a refused push's partly homed objects are homed again or released).
