@@ -218,6 +218,46 @@ pub(crate) fn stream_spanned(ns: u64) {
 /// Counter: the steps a fetch's streamed answer took in its turns, summed (each an index entry, a data chunk, a count
 /// of a log, a file's head): against [`STREAM_TURN_NS`], a step's cost. Format: a counter name in the status report.
 pub(crate) const STREAM_STEPS: &str = "vcs_store.hg_stream_steps";
+/// Counters: a stream clone's steps by the stage they were taken in (`slates_hg::render::StageTally`; goal 93, hg's
+/// whole-history gap, main 01a20182's ruling of 2026-11-27 16:23): the count walk's (a row a step, sizing the head), the
+/// index rows', the data chunks', the rest's. Against the revisions streamed, the steps a revision costs by stage.
+/// Format: counter names in the status report.
+pub(crate) const STREAM_STEPS_BY_STAGE: [&str; 4] = [
+  "vcs_store.hg_stream_steps.count",
+  "vcs_store.hg_stream_steps.index",
+  "vcs_store.hg_stream_steps.data",
+  "vcs_store.hg_stream_steps.other",
+];
+/// Counters: the content store's reads during those steps, by the same stages (`ContentStore::reads`). Format: counter
+/// names in the status report.
+pub(crate) const STREAM_READS_BY_STAGE: [&str; 4] = [
+  "vcs_store.hg_stream_reads.count",
+  "vcs_store.hg_stream_reads.index",
+  "vcs_store.hg_stream_reads.data",
+  "vcs_store.hg_stream_reads.other",
+];
+
+/// Counts a stream clone's steps and reads by stage taken over a turn ([`STREAM_STEPS_BY_STAGE`],
+/// [`STREAM_READS_BY_STAGE`]); nothing off a shard, or for an answer that streams no files.
+pub(crate) fn stage_tallied(tally: Option<slates_hg::render::StageTally>) {
+  let Some(tally) = tally else {
+    return;
+  };
+  let _ = crate::state::with_state(|state| {
+    for (at, stage) in [tally.count, tally.index, tally.data, tally.other]
+      .iter()
+      .enumerate()
+    {
+      if let (Some(steps), Some(reads)) =
+        (STREAM_STEPS_BY_STAGE.get(at), STREAM_READS_BY_STAGE.get(at))
+      {
+        state.count(*steps, stage.steps);
+        state.count(*reads, stage.reads);
+      }
+    }
+  });
+}
+
 /// Counter: the turns of a fetch's streamed answer that stopped at the pace's ceiling, no one waiting on the shard: a
 /// turn as long as the ceiling allows, its work, not a wait. Format: a counter name in the status report.
 pub(crate) const STREAM_TURNS_AT_CEILING: &str = "vcs_store.hg_stream_turns_at_ceiling";

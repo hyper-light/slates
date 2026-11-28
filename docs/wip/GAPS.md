@@ -4957,6 +4957,18 @@
 > the MacBook at a debug build: 18 clients, every client's check passed on every server. Owed: Gitaly (an install,
 > Ada's yes) and the Linux kernel dataset (a multi-GB download).
 >
+> **OPEN (w-interop, 2026-11-27; main 01a20182's rulings of 15:29 and 16:23, taken from w-hg while it is blocked):
+> hg's stream clone is 8.82× slower than `hg serve`'s (round 3: 3.571 s against 0.405 s).** It walks every revlog row
+> twice: a count walk only to size the answer's head (`<files> <bytes>`), then the index rows, each a step of its own,
+> each reading the index from the content store. Stock sends its store files in one pass. Counted by stage since
+> 2026-11-27 (`slates_hg::render::StageTally`, `vcs_store.hg_stream_steps.{count,index,data,other}` and
+> `vcs_store.hg_stream_reads.*`): one debug stream clone of a local history of 600 changesets (2,418 revisions) took
+> 2,502 count steps reading the content store 4,018 times, 2,503 index steps reading it 10,054 times (4.2 a revision,
+> rising with the logs: 4.9 to 6.4 reads a revision as the history doubled), and 601 data steps. The cuts, in main's
+> order, each red first: the index rows written a run a step with one index lend a run (the per-row reads, the
+> superlinear term); then each log's rendered length kept where its revisions land, so the count walk goes, with an
+> oracle over generated landing histories, a recovery story, and a stale length refused typed, never sent. The
+> whole-history push (5.60×) waits until these land.
 > **A stock git command's wait, judged by progress (2026-11-23, w-git; main 01a20182's ruling after r229):** each git
 > command of `crates/cli/tests/git_interop.rs` was killed past a fixed 120 s (`PATIENCE`), and git/git's whole-repository
 > session failed correct but slow steps (80-100 s of single-shard CPU, git's own index-pack among it). Now each waits

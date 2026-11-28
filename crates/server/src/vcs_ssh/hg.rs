@@ -255,6 +255,7 @@ async fn streamed_turn<S: HgStores>(
   paced.close(slates_rt::futures::now_ns(), costs);
   step_ran(began);
   crate::vcs_store::hg_view::turn_taken();
+  crate::vcs_store::hg_view::stage_tallied(stdio.take_stream_tally());
   // A-724 piece 3d: what the turn wrote, learned as the fetch's demand once its answer ends.
   stores.wrote(
     generation,
