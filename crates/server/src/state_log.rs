@@ -721,6 +721,7 @@ pub(crate) fn push_progress(
       crate::merge_service::placed_version(state, object)
         .unwrap_or(0)
         .saturating_add(crate::merge_service::replica_builds_done(state, object))
+        .saturating_add(crate::merge_service::catching_up_heard(state, object))
     })
     .fold(0u64, u64::saturating_add);
   let register = slates_db::catalog::LogName::State {

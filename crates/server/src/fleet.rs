@@ -1870,7 +1870,8 @@ async fn serve_peer_records(
                   .learned_members
                   .get(&peer_anchor)
                   .map_or(seed, |learned| learned.host);
-                accept_held_record(s, local, peer_host, &record)
+                catching_up_answer(s, (local, peer_host), &record)
+                  .unwrap_or_else(|| accept_held_record(s, local, peer_host, &record))
               })
             })
             .unwrap_or_default(),
@@ -2408,6 +2409,70 @@ fn serve_content_request(
   )
 }
 
+/// A holder's answer to `record`, which `peer` sent, before it is judged (A-936, main 01a20182's rulings of 2026-11-27
+/// 19:09 and 19:31): where `peer` is a council member and the record's owner and the record names a newer configuration
+/// than this node's council or its installed placement has, the holder is behind, not the record stale, and answers
+/// `ContentMessage::CatchingUp` at once (a learner's fetch asked for, `config_refresh_wanted`); its council and install
+/// catch up off the session, and the owner's next reship is judged. Its owner counts the answer as movement on the
+/// pending version (`merge_service::record_catching_up`). Before, it was refused `ForeignGeneration`, and every reship
+/// had to win a race against the next configuration step: a death makes several in a row (takeover, settles,
+/// confirmations, seat), and a holder one behind on each never acknowledged the version (the replica-build stall).
+/// Never a wait: the peer's session serves one request at a time, and the council's appends a wait would want ride it.
+/// Where only this copy's authority lags (the install's walk, A-398), the copy is installed now and the record judged
+/// ([`install_on_copy_ahead`]). An older record is judged, and refused as the fence intends. D-14 holds: a record names
+/// a newer configuration only after a membership or takeover change committed, never on a quiet write's path, where
+/// this answers nothing. Counted [`CATCHING_UP_ANSWERED`].
+fn catching_up_answer(
+  s: &mut ShardState,
+  (local, peer): (HostId, HostId),
+  record: &Record,
+) -> Option<Vec<u8>> {
+  if record.owner != peer || !s.council.configuration().members.contains(&peer) {
+    return None;
+  }
+  let generation = record.generation;
+  if generation > s.council.configuration().version || generation > s.fleet.configuration().version
+  {
+    s.config_refresh_wanted = true;
+    s.count(CATCHING_UP_ANSWERED, 1);
+    return Some(
+      slates_cluster::content::ContentMessage::CatchingUp {
+        object: record.object,
+        sequence: record.sequence,
+        generation,
+      }
+      .encode(),
+    );
+  }
+  install_on_copy_ahead(s, local, record.object);
+  None
+}
+
+/// Counter: a record answered `CatchingUp`, its configuration newer than this holder's ([`catching_up_answer`],
+/// A-936). Format: a counter name in the daemon's status report.
+const CATCHING_UP_ANSWERED: &str = "fleet.record.catching_up_answered";
+
+/// Installs this node's placement on its copy of `object` now where the install's walk has not reached it yet
+/// ([`install_on_copy`], the walk's own step for one copy, which it then finds done): a record of this node's installed
+/// configuration is judged against the authority that configuration names (A-936), not refused `ForeignGeneration` by a
+/// copy the walk has not reached. Counted [`COPY_INSTALLED_AHEAD`].
+fn install_on_copy_ahead(s: &mut ShardState, local: HostId, object: ObjectId) {
+  let installed = s.fleet.configuration().version;
+  if s
+    .holder_records
+    .get(&object)
+    .is_some_and(|acceptor| acceptor.authority().generation < installed)
+  {
+    let regional = s.council.configuration().clone();
+    install_on_copy(s, local, &regional, installed, object);
+    s.count(COPY_INSTALLED_AHEAD, 1);
+  }
+}
+
+/// Counter: a copy a caught-up record's judgement installed the placement on ahead of the install's walk
+/// ([`install_on_copy_ahead`], A-936). Format: a counter name in the daemon's status report.
+const COPY_INSTALLED_AHEAD: &str = "fleet.record.copy_installed_ahead";
+
 /// Serves a merge shipment (§4.16 "Commit" in one exchange a version): its content frames — the offer of the record's
 /// inputs, then their chunks — through the content plane's own path, then the record. The record is accepted only if
 /// its inputs are held by then (`merge_service::accept_merge_record`), so a refused or partial placement answers no
@@ -2433,6 +2498,9 @@ pub(crate) fn serve_merge_shipment(
   let Ok(record) = Record::decode(record) else {
     return Vec::new();
   };
+  if let Some(answer) = catching_up_answer(s, (local, peer_host), &record) {
+    return answer;
+  }
   crate::merge_service::hold_replacing_record(s, local, peer_host, &record);
   if !content.is_empty() {
     s.count(crate::merge_service::INPUTS_CARRIED, 1);

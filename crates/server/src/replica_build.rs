@@ -98,7 +98,16 @@ enum Turned {
 /// counted [`VERSIONS_WAITED`].
 pub(crate) fn wanted(state: &mut ShardState, green: ObjectId) {
   state.count(VERSIONS_WAITED, 1);
-  if state.replica_builds.building.contains_key(&green) {
+  if let Some(under) = state.replica_builds.building.get(&green) {
+    // Logged once a build has run a turn and still owes, never per record (main 01a20182's order of 2026-11-27 18:08):
+    // a build begun and never turned shows here as the turns it has at the record that waits.
+    if under.slices_done == 0 {
+      slates_machine::log_line!(
+        "slates-server: partition {}: a record of {green:?} waits on a replica build begun {} ns ago that has run no turn",
+        state.partition,
+        slates_rt::futures::now_ns().saturating_sub(under.began_ns)
+      );
+    }
     return;
   }
   let Some(record) = repository_of(state, green) else {
@@ -145,7 +154,14 @@ pub(crate) fn begin(state: &mut ShardState, green: ObjectId, repository: Reposit
     },
   );
   match slates_rt::futures::spawn(drive(green)).and_then(slates_rt::futures::detach) {
-    Ok(()) => state.count(BEGUN, 1),
+    Ok(()) => {
+      state.count(BEGUN, 1);
+      slates_machine::log_line!(
+        "slates-server: partition {}: a replica build of {green:?} begun at {} ns",
+        state.partition,
+        slates_rt::futures::now_ns()
+      );
+    }
     Err(_) => {
       // No task to run it: the next record that finds the replica owing begins it again.
       state.replica_builds.building.remove(&green);
@@ -206,7 +222,16 @@ async fn drive(green: ObjectId) {
       Some(Turned::Done) | None => break,
     }
   }
-  let _ = crate::state::with_state_counted(|state| state.replica_builds.building.remove(&green));
+  let _ = crate::state::with_state_counted(|state| {
+    if let Some(under) = state.replica_builds.building.remove(&green) {
+      slates_machine::log_line!(
+        "slates-server: partition {}: a replica build of {green:?} ended after {} turns at {} ns",
+        state.partition,
+        under.slices_done,
+        slates_rt::futures::now_ns()
+      );
+    }
+  });
   brought.let_go();
 }
 
@@ -391,12 +416,18 @@ fn turn(state: &mut ShardState, green: ObjectId) -> Turned {
       match made {
         Some(Ok(_)) => {
           state.count(MADE, 1);
-          let began = state
+          let (began, turns) = state
             .replica_builds
             .building
             .get(&green)
-            .map_or(0, |under| under.began_ns);
-          state.count_max(MADE_NS, slates_rt::futures::now_ns().saturating_sub(began));
+            .map_or((0, 0), |under| (under.began_ns, under.slices_done));
+          let took = slates_rt::futures::now_ns().saturating_sub(began);
+          state.count_max(MADE_NS, took);
+          // Logged, the build against a holder's configuration lag (main 01a20182's ruling of 2026-11-27 19:09).
+          slates_machine::log_line!(
+            "slates-server: partition {}: a replica of {green:?} was made in {turns} turns, {took} ns after its build began",
+            state.partition
+          );
         }
         other => {
           slates_machine::log_line!(

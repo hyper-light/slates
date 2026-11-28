@@ -35,6 +35,10 @@ use crate::greens::Preview;
 use crate::repository::push::{AppendRefused, EntryParts};
 use crate::state::ShardState;
 
+/// Shape: the most paths of each list a refused revision's log names ([`ImportBatch::refusal_logged`]), so a wide
+/// directory's refusal stays a line a reader takes in; each list's whole length is logged beside it.
+const REFUSAL_LOGGED_PATHS: usize = 12;
+
 /// Counter: a revision staged into an import's batch. Format: a counter name in the daemon's status report.
 pub(crate) const STAGED: &str = "repository.import_batch.staged";
 /// Counter: an import's batch committed as one entry. Format: a counter name.
@@ -662,10 +666,12 @@ impl ImportBatch {
     mut work: Increment,
     (judged, head): (Result<StagedVerdict, StageRefused>, u64),
   ) -> Result<u64, StageRefused> {
+    let judged_at = work.base;
     work.base = head;
     let (outcome, applied, identity, reserved, entry) = judged?;
     let (Outcome::Accepted { .. } | Outcome::Identical { .. }, Some(applied)) = (&outcome, applied)
     else {
+      self.refusal_logged(state, (&work, head, judged_at), &outcome);
       return Err(StageRefused::NotAccepted(outcome));
     };
     self.reserved = self
@@ -680,6 +686,108 @@ impl ImportBatch {
     });
     state.count(STAGED, 1);
     Ok(head.saturating_add(1))
+  }
+
+  /// Logs why the batch's scratch member refused `work`, based at `head` (the git-2000 import's r593, main's order of
+  /// 2026-11-27 17:50: a revision's own removals refused as `DeleteModify`): the windows' count, and for each of the
+  /// first [`REFUSAL_LOGGED_PATHS`] distinct paths they name a line ([`ImportBatch::window_logged`]), so a stale base, a
+  /// change the work did not make and a count the member keeps wrong are told apart.
+  fn refusal_logged(
+    &self,
+    state: &mut ShardState,
+    (work, head, judged_at): (&Increment, u64, u64),
+    outcome: &Outcome,
+  ) {
+    let Outcome::Conflict { windows } = outcome else {
+      return;
+    };
+    let paths: std::collections::BTreeSet<&str> =
+      windows.iter().map(|window| window.path.as_str()).collect();
+    slates_machine::log_line!(
+      "slates-server: green {}: a staged revision refused at {head} with {} conflict windows on {} paths",
+      crate::verbs::hex_of(&self.green.bytes),
+      windows.len(),
+      paths.len()
+    );
+    let mut logged = std::collections::BTreeSet::new();
+    for window in windows {
+      if logged.len() >= REFUSAL_LOGGED_PATHS {
+        break;
+      }
+      if logged.insert(window.path.as_str()) {
+        self.window_logged(state, (work, judged_at), window);
+      }
+    }
+  }
+
+  /// One refused window's line ([`ImportBatch::refusal_logged`]): the batch's base and staged count, the scratch
+  /// member's head and the base the work was judged at, then what the member holds at or under the window's path,
+  /// walked (`Green::head_under`) and as its maps count it (`Green::counted_under`), each path's last change
+  /// (`Green::last_changed`), and the work's operations there. Each list at most [`REFUSAL_LOGGED_PATHS`] long, with its
+  /// length.
+  fn window_logged(
+    &self,
+    state: &mut ShardState,
+    (work, judged_at): (&Increment, u64),
+    window: &slates_merge::engine::ConflictWindow,
+  ) {
+    let Some(preview) = self.preview.as_ref() else {
+      return;
+    };
+    let held = state.greens.with_preview(preview, |engine| {
+      let under = engine.head_under(&window.path);
+      let last: Vec<(String, u64)> = std::iter::once(window.path.clone())
+        .chain(under.files.iter().map(|(path, _)| path.clone()))
+        .chain(under.dirs.iter().cloned())
+        .take(REFUSAL_LOGGED_PATHS)
+        .map(|path| {
+          let at = engine.last_changed(&path);
+          (path, at)
+        })
+        .collect();
+      (
+        engine.head(),
+        under,
+        (engine.counted_under(&window.path), last),
+      )
+    });
+    let Ok((member_head, under, (counted, last))) = held else {
+      return;
+    };
+    let prefix = format!("{}/", window.path);
+    let ops: Vec<String> = work
+      .doc
+      .ops
+      .iter()
+      .filter_map(|op| {
+        let path = work.doc.paths.path(op.path)?;
+        (path == window.path || path.starts_with(&prefix)).then(|| format!("{:?} {path}", op.kind))
+      })
+      .collect();
+    let first = |paths: &mut dyn Iterator<Item = &str>| -> Vec<String> {
+      paths
+        .take(REFUSAL_LOGGED_PATHS)
+        .map(str::to_owned)
+        .collect()
+    };
+    slates_machine::log_line!(
+      "slates-server: green {}: refused at {} ({:?}): batch base {}, {} staged, the member's head {member_head}, the \
+       work judged at {judged_at}; the member holds under it {} files {:?}, {} dirs {:?}, {} symlinks, {} specials; its \
+       maps count under it {counted:?}; each path's last change {last:?}; the work's {} ops there: {:?}",
+      crate::verbs::hex_of(&self.green.bytes),
+      window.path,
+      window.class,
+      self.base,
+      self.staged.len(),
+      under.files.len(),
+      first(&mut under.files.iter().map(|(path, _)| path.as_str())),
+      under.dirs.len(),
+      first(&mut under.dirs.iter().map(String::as_str)),
+      under.symlinks.len(),
+      under.specials.len(),
+      ops.len(),
+      first(&mut ops.iter().map(String::as_str))
+    );
   }
 
   /// Commits the staged revisions with `parts` (the import's changeset reference, w-svn's) as one entry of
