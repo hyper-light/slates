@@ -504,3 +504,33 @@ fn read_back_in_slots(
   }
   assert!(restored.hand_back(successor));
 }
+
+/// (ii)'s reading of an uncapture's reach. Do: lend a shard chunk store to windows; put a window of a whole page (a
+/// chunk of its own), begin a cut, put a second, then release the first and the second. Expect: both frees held for the
+/// cut; the bytes held of slabs sealed since the latest cut began none after the first (sealed before the cut began,
+/// the cut names it), the second's block after the second. Failing first (no slab counted fresh): none after both.
+#[test]
+fn a_slab_sealed_after_the_cut_began_counts_its_held_free_as_fresh() {
+  use slates_vcs::WindowStorage;
+  let mut chunks = shard_chunks(8);
+  let mut windows = ChunkWindows::new(PAGE);
+  assert!(windows.lend_in(&mut chunks));
+  let sealed_before = windows.put(&window_bytes(0, WINDOW)).unwrap();
+  windows.begin_cut();
+  let sealed_after = windows.put(&window_bytes(1, WINDOW)).unwrap();
+  windows.release(sealed_before);
+  assert_eq!(
+    windows.fresh_held(),
+    0,
+    "a slab sealed before the cut began is named by it"
+  );
+  windows.release(sealed_after);
+  assert_eq!(windows.held_for_cut(), 2, "both frees held for the cut");
+  assert_eq!(
+    windows.fresh_held(),
+    u64::try_from(PAGE).unwrap(),
+    "the slab sealed after the cut began held all the same"
+  );
+  let _left = windows.end_cut();
+  assert!(windows.hand_back(&mut chunks));
+}

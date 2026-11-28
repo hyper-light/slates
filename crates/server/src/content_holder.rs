@@ -1334,6 +1334,22 @@ pub(crate) fn held_lent(content: &slates_vcs::ContentStore) -> u64 {
     })
 }
 
+/// The bytes of slabs sealed since the latest cut began whose frees the shard's windows saw held all the same
+/// (`ChunkWindows::fresh_held`, (ii)'s reading of an uncapture's reach), read through `content` as [`held_lent`] reads.
+pub(crate) fn fresh_held_lent(content: &slates_vcs::ContentStore) -> u64 {
+  content
+    .storage()
+    .as_any()
+    .and_then(|any| any.downcast_ref::<crate::vcs_store::arena_windows::ChunkWindows>())
+    .map_or(0, crate::vcs_store::arena_windows::ChunkWindows::fresh_held)
+}
+
+/// [`fresh_held_lent`] read from the shard's state.
+fn fresh_held_now(state: &ShardState) -> u64 {
+  crate::vcs_store::chunk_windows(&state.vcs_stores)
+    .map_or(0, crate::vcs_store::arena_windows::ChunkWindows::fresh_held)
+}
+
 /// Format: the status counter of the most bytes one borrow of the shard's state freed into the frees the arena holds
 /// for the committed image ([`note_borrow_held`]).
 pub(crate) const IMAGE_HELD_BORROW_MOST: &str = "vcs_store.image.held_borrow_most_bytes";
@@ -1365,9 +1381,11 @@ pub(crate) fn note_borrow_held(
     let now = BorrowArena::read(state);
     slates_machine::log_line!(
       "slates-server: partition {}: one borrow at {site} freed {freed} bytes into the frees held for the committed \
-       image ({after} held now; the most one borrow freed before, {most}); the arena before and after: capacity \
+       image ({after} held now; the most one borrow freed before, {most}), {} of them slabs sealed since the latest \
+       cut began; the arena before and after: capacity \
        {} and {}, mapped {} and {}, allocations {} and {}; the process's footprint {:?}, resident {:?}",
       state.partition,
+      now.fresh.saturating_sub(before.fresh),
       before.capacity,
       now.capacity,
       before.mapped,
@@ -1387,6 +1405,8 @@ pub(crate) fn note_borrow_held(
 pub(crate) struct BorrowArena {
   /// The frees held for the committed image ([`held_now`]).
   deferred: u64,
+  /// Of all frees held so far, the bytes of slabs sealed since the latest cut began ([`fresh_held_now`]).
+  fresh: u64,
   /// The arena's capacity.
   capacity: usize,
   /// Its mapped bytes.
@@ -1401,6 +1421,7 @@ impl BorrowArena {
     let arena = state.store.content.arena();
     Self {
       deferred: held_now(state),
+      fresh: fresh_held_now(state),
       capacity: arena.capacity(),
       mapped: arena.mapped_bytes(),
       allocations: arena.allocations(),

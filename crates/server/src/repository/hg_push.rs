@@ -3003,9 +3003,11 @@ const INTAKE_STAGES: [&str; 6] = [
 pub(crate) const INTAKE_SLICE_HELD_MOST: &str = "vcs.hg.intake_slice_held_most";
 
 /// Notes what one intake slice freed into the frees held for the committed image, `freed` by stage
-/// ([`INTAKE_STAGES`]): the most any slice freed counted ([`INTAKE_SLICE_HELD_MOST`]), and at each doubling of it past
-/// a copy slice a line naming each stage's share, so the kind of a slice that frees without bound is named.
-fn note_slice_held(state: &mut ShardState, freed: &[u64; INTAKE_STAGES.len()]) {
+/// ([`INTAKE_STAGES`]), `fresh` of it bytes of slabs sealed since the latest cut began (no image names them; (ii)'s
+/// reading of an uncapture's reach): the most any slice freed counted ([`INTAKE_SLICE_HELD_MOST`]), and at each
+/// doubling of it past a copy slice a line naming each stage's share, so the kind of a slice that frees without bound
+/// is named.
+fn note_slice_held(state: &mut ShardState, (freed, fresh): (&[u64; INTAKE_STAGES.len()], u64)) {
   let total = freed
     .iter()
     .fold(0u64, |total, bytes| total.saturating_add(*bytes));
@@ -3026,7 +3028,8 @@ fn note_slice_held(state: &mut ShardState, freed: &[u64; INTAKE_STAGES.len()]) {
       .collect();
     slates_machine::log_line!(
       "slates-server: partition {}: one intake slice freed {total} bytes into the frees held for the committed image \
-       (the most one slice freed before, {most}), by stage {shares:?}",
+       (the most one slice freed before, {most}), by stage {shares:?}; {fresh} bytes held of slabs sealed since the \
+       latest cut began",
       state.partition
     );
   }
@@ -3054,8 +3057,10 @@ impl Taking {
     // What the slice's steps freed into the frees held for the committed image, by the stage each took (main's 57k of
     // 2026-11-27 19:00: one slice freed 42.0 MB, its kind unknown): a reading, no bound.
     let mut freed = [0u64; INTAKE_STAGES.len()];
+    let mut fresh = 0u64;
     let sliced = vcs_store::within_budget(state, lend, |stores| {
       let content = stores.content_mut()?;
+      let fresh_before = crate::content_holder::fresh_held_lent(content);
       let stepped = loop {
         if !paced.more(vcs_store::ANSWER_STEP, costs) {
           break Ok(Stepped::More);
@@ -3092,10 +3097,11 @@ impl Taking {
           other => break other,
         }
       };
+      fresh = crate::content_holder::fresh_held_lent(content).saturating_sub(fresh_before);
       Some(stepped)
     });
     paced.close(slates_rt::futures::now_ns(), costs);
-    note_slice_held(state, &freed);
+    note_slice_held(state, (&freed, fresh));
     state.count(INTAKE_SLICES, 1);
     state.count_max(PIN_REVISIONS_STEP_MOST, most.revisions);
     state.count_max(PIN_WINDOWS_STEP_MOST, most.windows);

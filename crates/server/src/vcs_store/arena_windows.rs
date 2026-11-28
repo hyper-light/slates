@@ -123,6 +123,9 @@ struct Slab {
   asked: usize,
   /// Windows let go from it while it is held, and their bytes.
   freed: (u64, u64),
+  /// The cuts begun before it was sealed ([`ChunkWindows::cuts_begun`]), none for a slab a restart restored: while no
+  /// cut has begun since, no image names its block ((ii)'s naming proof: a cut's pages all freeze as it begins).
+  sealed_after: Option<u64>,
 }
 
 /// The slabs' census for the memory status (goal 93): slabs held, windows let go from slabs still held, their bytes.
@@ -229,6 +232,11 @@ pub(crate) struct ChunkWindows {
   /// the committed image that the arena does not count as deferred, still allocated (main's 57k of 2026-11-27 20:41:
   /// held for a long cut, then surfacing in one lend, 4.7 GB).
   held_bytes: (u64, u64),
+  /// The image cuts begun ([`ChunkWindows::begin_cut`]).
+  cuts_begun: u64,
+  /// The bytes of slabs sealed since the latest cut began whose frees were held all the same, for the cut in flight,
+  /// owed to the next lend or deferred by the arena: what an uncapture would release ((ii); a reading, no rule).
+  fresh_held: u64,
 }
 
 impl std::fmt::Debug for ChunkWindows {
@@ -414,6 +422,8 @@ impl ChunkWindows {
       cutting: false,
       held_for_cut: Vec::new(),
       held_bytes: (0, 0),
+      cuts_begun: 0,
+      fresh_held: 0,
     }
   }
 
@@ -433,6 +443,13 @@ impl ChunkWindows {
   /// An image cut begins (A-870 piece 2, F2): a chunk freed from now until its publication commits is held for it.
   pub(crate) fn begin_cut(&mut self) {
     self.cutting = true;
+    self.cuts_begun = self.cuts_begun.saturating_add(1);
+  }
+
+  /// The bytes of slabs sealed since the latest cut began whose frees were held all the same
+  /// ([`ChunkWindows::fresh_held`]), since this storage was made.
+  pub(crate) fn fresh_held(&self) -> u64 {
+    self.fresh_held
   }
 
   /// Freezes the handles `lo..=hi`, a windows page of the cut.
@@ -540,6 +557,7 @@ impl ChunkWindows {
         live: 1,
         asked: bytes.len(),
         freed: (0, 0),
+        sealed_after: Some(self.cuts_begun),
       },
     );
     if shares {
@@ -653,18 +671,35 @@ impl ChunkWindows {
     }
   }
 
-  /// Frees a chunk now when the store is lent, at the next lend otherwise.
-  fn free_or_owe(&mut self, (chunk, block): (Handle<Chunk>, u64)) {
-    if self.cutting {
-      self.held_for_cut.push(chunk);
-      self.held_bytes.0 = self.held_bytes.0.saturating_add(block);
-    } else if self.lent {
-      // A chunk the store cannot free stays held until the arena goes; the content store's own counts are settled.
-      // A block a committed image names is not reused before a newer one commits: the arena defers it (A-64).
-      let _freed = self.chunks.free_chunk(chunk);
-    } else {
-      self.owed.push(chunk);
-      self.held_bytes.1 = self.held_bytes.1.saturating_add(block);
+  /// Frees a chunk now when the store is lent, at the next lend otherwise; `fresh` where its slab was sealed since the
+  /// latest cut began, its bytes counted where they are held all the same ([`ChunkWindows::fresh_held`]).
+  fn free_or_owe(&mut self, (chunk, block, fresh): (Handle<Chunk>, u64, bool)) {
+    if self.cutting || !self.lent {
+      if fresh {
+        self.fresh_held = self.fresh_held.saturating_add(block);
+      }
+      if self.cutting {
+        self.held_for_cut.push(chunk);
+        self.held_bytes.0 = self.held_bytes.0.saturating_add(block);
+      } else {
+        self.owed.push(chunk);
+        self.held_bytes.1 = self.held_bytes.1.saturating_add(block);
+      }
+      return;
+    }
+    // A chunk the store cannot free stays held until the arena goes; the content store's own counts are settled.
+    // A block a committed image names is not reused before a newer one commits: the arena defers it (A-64).
+    let deferred = fresh.then(|| self.chunks.arena().deferred_bytes());
+    let _freed = self.chunks.free_chunk(chunk);
+    if let Some(deferred) = deferred {
+      let grown = self
+        .chunks
+        .arena()
+        .deferred_bytes()
+        .saturating_sub(deferred);
+      self.fresh_held = self
+        .fresh_held
+        .saturating_add(u64::try_from(grown).unwrap_or(u64::MAX));
     }
   }
 
@@ -874,6 +909,7 @@ impl ChunkWindows {
         live,
         asked,
         freed: (0, 0),
+        sealed_after: None,
       },
     );
     Ok(())
@@ -1015,6 +1051,7 @@ impl WindowStorage for ChunkWindows {
     let chunk = slab.chunk;
     let block = slab.block;
     let freed = slab.freed;
+    let fresh = slab.sealed_after == Some(self.cuts_begun);
     self.slabs.remove(&key);
     self.reask_owed.remove(&key);
     self.freed_kept = (
@@ -1024,7 +1061,7 @@ impl WindowStorage for ChunkWindows {
     if self.filling.is_some_and(|(filling, _, _)| filling == key) {
       self.filling = None;
     }
-    self.free_or_owe((chunk, block));
+    self.free_or_owe((chunk, block, fresh));
   }
 
   fn lend_in(&mut self, lent: &mut dyn Any) -> bool {
